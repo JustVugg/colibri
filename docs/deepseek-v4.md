@@ -505,7 +505,13 @@ claim. Validate representative prompts against the single-device configuration.
 
 Linux backend lifecycle check (requires at least two GPUs; exercises all listed
 devices, duplicate-list refusal, active-context protection, and reopen with a
-different KV owner):
+different KV owner). Run the whole CUDA unit set with:
+
+```bash
+make -C c -f Makefile.deepseek-v4 dsv4-cuda-tests CUDA=1 CUDA_ARCH=sm_120 DSV4_TEST_DEVICES=0,1
+```
+
+or one test directly:
 
 ```bash
 make -C c -f Makefile.deepseek-v4 tests/test_dsv4_multigpu_cuda CUDA=1 CUDA_ARCH=sm_120
@@ -584,6 +590,14 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `DSV4_CUDA_RESIDENT_EXPERTS` (auto) | `auto` loads every routed expert when the budget fits and keeps the LRU cache on a budget refusal; `1` requires residency (a budget refusal or hard failure rejects engine open); `0` keeps the cache |
 | `DSV4_CUDA_RESIDENT_ROUTE` (1) | device-side routing/MoE for a complete 256-expert table; `0` host routing |
 | `DSV4_CUDA_BATCHED` (1) | batched BF16 routing path; `0` legacy |
+| `DSV4_CUDA_HEAD` (1) | exact vocabulary head on the GPU; `0` keeps it on the CPU |
+| `DSV4_CUDA_HEAD_BATCH` (1) | batched exact head; `0` per-token |
+| `DSV4_HEAD_VERIFY` (0) | `1` checks the batched head against the per-token path (diagnostic) |
+| `DSV4_CUDA_RESIDENT_INDEXER` (1) | upload indexer query weights once per layer; `0` per call |
+| `DSV4_CUDA_INDEXER_HEADS` (1) | indexer score heads on the device; `0` the block kernel |
+| `DSV4_CUDA_INDEXER_PREP` (1) | indexer preparation on the device; `0` host path |
+| `DSV4_CUDA_WO_DECODE` (1) | output projection's decode intermediates on the device; `0` host |
+| `DSV4_CUDA_COMPRESSOR` (1) | compressor projection on the device; `0` host |
 | `V4_MTP_GPU_MIRRORS` (16) | separate mirror cache for the MTP drafter |
 | `DSV4_CUDA_PIN_HOST` (1, `.cu`) | page-lock expert-cache slabs for DMA uploads |
 | `DSV4_CUDA_MOE_GROUPED` (1, `.cu`) | expert-grouped MoE GEMM rows; `0` = legacy replicated |
@@ -806,3 +820,24 @@ covers exact kernel parity, six-device default selection, single-device budget
 fallback, and the remaining Attention bottleneck. Measured short-request decode
 remains around 6.1–6.2 token/s; the route-only comparison is too small to claim a
 stable throughput gain.
+
+### Native quantization and resident indexer projections
+
+The generic CUDA path uses native E4M3 conversion instead of searching 255
+codes per activation, and bit decoding for E2M1. Ties-to-even, positive zero
+from the old encoder, and the existing activation scaling remain unchanged.
+SM89+ uses hardware E4M3 decoding; older targets use the equivalent bit layout.
+Resident routing uses the existing warp Top-6 kernel, retaining the original
+expert-ID tie break and sequential normalization of the six selected weights.
+
+With batched CUDA attention enabled, indexer query weights now upload once
+during layer loading. These mirrors preserve the original rows8/row-major
+layout, float scales, and exact reference reduction order; they are not generic
+FP8 GEMM mirrors. They count toward dense residency before full expert budget
+checks and are released with their owning layer on the assigned device.
+`DSV4_CUDA_RESIDENT_INDEXER=0` retains per-call weight uploads. Missing optional
+DLL exports or unavailable mirrors retain that original fallback.
+
+These changes are default behavior for the applicable CUDA paths. They do not
+enable speculation, tensor parallelism, or a device-only Attention pipeline.
+See the [Naruto comparison and measurements](experiments/dsv4-naruto-gap-2026-09-28.md).
