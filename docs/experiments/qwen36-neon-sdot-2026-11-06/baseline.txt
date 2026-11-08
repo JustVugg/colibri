@@ -1,0 +1,348 @@
+===== base1-1 =====
+--- stderr ---
+[OMP] qwen36: 4 physical-core threads instead of 8 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+== qwen36 Phase-2 engine | cache=2/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248069) from ~/models/qwen36_i4_gs64/tokenizer.json
+[enc] prompt tokens: 5 | generating 16 new tokens
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[qwen36] embedding: rows read in place from the checkpoint, COLI_EMBED_MMAP=0 builds the f32 table
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 5.0s | RSS after load: 1.31 GB
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+Generated (16 new tokens):
+Text : [qwen36] KV cache: float16, 0.02 GiB at 1024 positions (half of float32; Q36_KV=f32 keeps float32)
+[qwen36] int4 packed weights detected — kept int4, repacked planar for expert_ffn.h
+
+TTFT: 3.891 s (time to first token)
+[qwen36 spec gate] run: T(1) 693.7 ms, rows, rho 0.50, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen36 lookup] run: 1.00 tokens/forward (15 forwards per 15 tokens) | acceptance 0.0% (0/0 drafts in 0 verifies) | gate on, 2 declined, 0 probes
+[timers] decode: 15 tokens  (shared/router are subsets of moe_total)
+[timers]   deltanet       712.3 ms     47.49 ms/token
+[timers]   attention      172.5 ms     11.50 ms/token
+[timers]   moe_total     9304.5 ms    620.30 ms/token
+[timers]   (shared)       101.9 ms      6.79 ms/token
+[timers]   (router)        22.3 ms      1.48 ms/token
+[timers]   lm_head        178.1 ms     11.87 ms/token
+[timers]   TOTAL        10367.4 ms    691.16 ms/token
+[timers]   step() total: 691.6 ms/token (outside the phases: 0.5)
+[timers]   dn-sub: proj 29.8 | conv 1.6 | l2n+rec 5.2 | norm+out 10.7 ms/token
+[timers]   expert kernel: fetch 196.66 | compute 414.66 ms/token
+[timers] prefill: 5 tokens  dn=137 attn=29 moe=3664(sh=19 rt=5) head=52 ms
+
+PEAK RSS: 2.28 GB
+Expert cache hit rate: 0.8% (hit=54 miss=6346)
+Speed: 1.12 tok/s (14.3s for 16 tokens)
+       19.43 real        38.98 user         5.91 sys
+          2448179200  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              758085  page reclaims
+                  46  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                6469  voluntary context switches
+              191743  involuntary context switches
+        240929857192  instructions retired
+        133935672119  cycles elapsed
+          4025584832  peak memory footprint
+
+--- stdout ---
+ red, blue, and yellow. When two primary colors are mixed, they produce
+===== base1-2 =====
+--- stderr ---
+[OMP] qwen36: 4 physical-core threads instead of 8 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+== qwen36 Phase-2 engine | cache=2/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248069) from ~/models/qwen36_i4_gs64/tokenizer.json
+[enc] prompt tokens: 5 | generating 16 new tokens
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[qwen36] embedding: rows read in place from the checkpoint, COLI_EMBED_MMAP=0 builds the f32 table
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 4.8s | RSS after load: 2.20 GB
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+Generated (16 new tokens):
+Text : [qwen36] KV cache: float16, 0.02 GiB at 1024 positions (half of float32; Q36_KV=f32 keeps float32)
+[qwen36] int4 packed weights detected — kept int4, repacked planar for expert_ffn.h
+
+TTFT: 3.932 s (time to first token)
+[qwen36 spec gate] run: T(1) 693.9 ms, rows, rho 0.50, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen36 lookup] run: 1.00 tokens/forward (15 forwards per 15 tokens) | acceptance 0.0% (0/0 drafts in 0 verifies) | gate on, 2 declined, 0 probes
+[timers] decode: 15 tokens  (shared/router are subsets of moe_total)
+[timers]   deltanet       782.5 ms     52.16 ms/token
+[timers]   attention      191.1 ms     12.74 ms/token
+[timers]   moe_total     9307.8 ms    620.52 ms/token
+[timers]   (shared)       115.1 ms      7.67 ms/token
+[timers]   (router)        23.6 ms      1.58 ms/token
+[timers]   lm_head        182.6 ms     12.17 ms/token
+[timers]   TOTAL        10464.0 ms    697.60 ms/token
+[timers]   step() total: 698.1 ms/token (outside the phases: 0.5)
+[timers]   dn-sub: proj 32.7 | conv 1.7 | l2n+rec 5.5 | norm+out 12.1 ms/token
+[timers]   expert kernel: fetch 195.68 | compute 414.92 ms/token
+[timers] prefill: 5 tokens  dn=137 attn=33 moe=3698(sh=20 rt=4) head=53 ms
+
+PEAK RSS: 2.24 GB
+Expert cache hit rate: 0.8% (hit=54 miss=6346)
+Speed: 1.11 tok/s (14.4s for 16 tokens)
+       19.40 real        38.98 user         6.05 sys
+          2403516416  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              763406  page reclaims
+                 101  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                6541  voluntary context switches
+              188518  involuntary context switches
+        241051893231  instructions retired
+        134310279364  cycles elapsed
+          3927067768  peak memory footprint
+
+--- stdout ---
+ red, blue, and yellow. When two primary colors are mixed, they produce
+===== base1-3 =====
+--- stderr ---
+[OMP] qwen36: 4 physical-core threads instead of 8 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+== qwen36 Phase-2 engine | cache=2/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248069) from ~/models/qwen36_i4_gs64/tokenizer.json
+[enc] prompt tokens: 5 | generating 16 new tokens
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[qwen36] embedding: rows read in place from the checkpoint, COLI_EMBED_MMAP=0 builds the f32 table
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 4.8s | RSS after load: 2.21 GB
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+Generated (16 new tokens):
+Text : [qwen36] KV cache: float16, 0.02 GiB at 1024 positions (half of float32; Q36_KV=f32 keeps float32)
+[qwen36] int4 packed weights detected — kept int4, repacked planar for expert_ffn.h
+
+TTFT: 3.741 s (time to first token)
+[qwen36 spec gate] run: T(1) 644.0 ms, rows, rho 0.50, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen36 lookup] run: 1.00 tokens/forward (15 forwards per 15 tokens) | acceptance 0.0% (0/0 drafts in 0 verifies) | gate on, 2 declined, 0 probes
+[timers] decode: 15 tokens  (shared/router are subsets of moe_total)
+[timers]   deltanet       570.9 ms     38.06 ms/token
+[timers]   attention      140.7 ms      9.38 ms/token
+[timers]   moe_total     8957.0 ms    597.13 ms/token
+[timers]   (shared)        92.0 ms      6.14 ms/token
+[timers]   (router)        19.8 ms      1.32 ms/token
+[timers]   lm_head        163.1 ms     10.88 ms/token
+[timers]   TOTAL         9831.7 ms    655.45 ms/token
+[timers]   step() total: 655.8 ms/token (outside the phases: 0.4)
+[timers]   dn-sub: proj 23.0 | conv 1.5 | l2n+rec 4.1 | norm+out 9.3 ms/token
+[timers]   expert kernel: fetch 177.73 | compute 411.25 ms/token
+[timers] prefill: 5 tokens  dn=104 attn=27 moe=3555(sh=19 rt=4) head=49 ms
+
+PEAK RSS: 2.32 GB
+Expert cache hit rate: 0.8% (hit=54 miss=6346)
+Speed: 1.18 tok/s (13.6s for 16 tokens)
+       18.55 real        38.92 user         4.80 sys
+          2490974208  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              637289  page reclaims
+                  99  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                6338  voluntary context switches
+              172076  involuntary context switches
+        238939423831  instructions retired
+        130609221488  cycles elapsed
+          4182805816  peak memory footprint
+
+--- stdout ---
+ red, blue, and yellow. When two primary colors are mixed, they produce
+===== base2-1 =====
+--- stderr ---
+[OMP] qwen36: 4 physical-core threads instead of 8 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+== qwen36 Phase-2 engine | cache=2/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248069) from ~/models/qwen36_i4_gs64/tokenizer.json
+[enc] prompt tokens: 5 | generating 16 new tokens
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[qwen36] embedding: rows read in place from the checkpoint, COLI_EMBED_MMAP=0 builds the f32 table
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 4.5s | RSS after load: 2.80 GB
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+Generated (16 new tokens):
+Text : [qwen36] KV cache: float16, 0.02 GiB at 1024 positions (half of float32; Q36_KV=f32 keeps float32)
+[qwen36] int4 packed weights detected — kept int4, repacked planar for expert_ffn.h
+
+TTFT: 5.079 s (time to first token)
+[qwen36 spec gate] run: T(1) 654.9 ms, rows, rho 0.50, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen36 lookup] run: 1.00 tokens/forward (15 forwards per 15 tokens) | acceptance 0.0% (0/0 drafts in 0 verifies) | gate on, 2 declined, 0 probes
+[timers] decode: 15 tokens  (shared/router are subsets of moe_total)
+[timers]   deltanet       626.3 ms     41.76 ms/token
+[timers]   attention      149.9 ms      9.99 ms/token
+[timers]   moe_total     9098.0 ms    606.54 ms/token
+[timers]   (shared)       102.2 ms      6.81 ms/token
+[timers]   (router)        21.6 ms      1.44 ms/token
+[timers]   lm_head        169.4 ms     11.29 ms/token
+[timers]   TOTAL        10043.6 ms    669.57 ms/token
+[timers]   step() total: 669.9 ms/token (outside the phases: 0.3)
+[timers]   dn-sub: proj 26.3 | conv 1.5 | l2n+rec 3.3 | norm+out 10.5 ms/token
+[timers]   expert kernel: fetch 180.31 | compute 417.27 ms/token
+[timers] prefill: 5 tokens  dn=167 attn=45 moe=4802(sh=27 rt=5) head=59 ms
+
+PEAK RSS: 2.80 GB
+Expert cache hit rate: 0.8% (hit=54 miss=6346)
+Speed: 1.06 tok/s (15.1s for 16 tokens)
+       19.84 real        39.87 user         5.58 sys
+          3007823872  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              625051  page reclaims
+                 138  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                6344  voluntary context switches
+              328433  involuntary context switches
+        240642036882  instructions retired
+        132825994466  cycles elapsed
+          4618030680  peak memory footprint
+
+--- stdout ---
+ red, blue, and yellow. When two primary colors are mixed, they produce
+===== base2-2 =====
+--- stderr ---
+[OMP] qwen36: 4 physical-core threads instead of 8 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+== qwen36 Phase-2 engine | cache=2/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248069) from ~/models/qwen36_i4_gs64/tokenizer.json
+[enc] prompt tokens: 5 | generating 16 new tokens
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[qwen36] embedding: rows read in place from the checkpoint, COLI_EMBED_MMAP=0 builds the f32 table
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 4.6s | RSS after load: 2.59 GB
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+Generated (16 new tokens):
+Text : [qwen36] KV cache: float16, 0.02 GiB at 1024 positions (half of float32; Q36_KV=f32 keeps float32)
+[qwen36] int4 packed weights detected — kept int4, repacked planar for expert_ffn.h
+
+TTFT: 3.747 s (time to first token)
+[qwen36 spec gate] run: T(1) 651.7 ms, rows, rho 0.50, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen36 lookup] run: 1.00 tokens/forward (15 forwards per 15 tokens) | acceptance 0.0% (0/0 drafts in 0 verifies) | gate on, 2 declined, 0 probes
+[timers] decode: 15 tokens  (shared/router are subsets of moe_total)
+[timers]   deltanet       606.5 ms     40.44 ms/token
+[timers]   attention      140.5 ms      9.36 ms/token
+[timers]   moe_total     8990.8 ms    599.39 ms/token
+[timers]   (shared)        92.7 ms      6.18 ms/token
+[timers]   (router)        20.5 ms      1.37 ms/token
+[timers]   lm_head        162.5 ms     10.83 ms/token
+[timers]   TOTAL         9900.3 ms    660.02 ms/token
+[timers]   step() total: 660.4 ms/token (outside the phases: 0.4)
+[timers]   dn-sub: proj 24.6 | conv 1.6 | l2n+rec 4.7 | norm+out 9.4 ms/token
+[timers]   expert kernel: fetch 179.52 | compute 411.62 ms/token
+[timers] prefill: 5 tokens  dn=113 attn=26 moe=3559(sh=19 rt=4) head=44 ms
+
+PEAK RSS: 2.59 GB
+Expert cache hit rate: 0.8% (hit=54 miss=6346)
+Speed: 1.17 tok/s (13.7s for 16 tokens)
+       18.44 real        38.95 user         4.79 sys
+          2782642176  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              641342  page reclaims
+                  95  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                6378  voluntary context switches
+              169515  involuntary context switches
+        238917260075  instructions retired
+        130451617343  cycles elapsed
+          4272278936  peak memory footprint
+
+--- stdout ---
+ red, blue, and yellow. When two primary colors are mixed, they produce
+===== base2-3 =====
+--- stderr ---
+[OMP] qwen36: 4 physical-core threads instead of 8 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+== qwen36 Phase-2 engine | cache=2/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248044 pieces (max id 248069) from ~/models/qwen36_i4_gs64/tokenizer.json
+[enc] prompt tokens: 5 | generating 16 new tokens
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[qwen36] embedding: rows read in place from the checkpoint, COLI_EMBED_MMAP=0 builds the f32 table
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 4.6s | RSS after load: 2.42 GB
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+Generated (16 new tokens):
+Text : [qwen36] KV cache: float16, 0.02 GiB at 1024 positions (half of float32; Q36_KV=f32 keeps float32)
+[qwen36] int4 packed weights detected — kept int4, repacked planar for expert_ffn.h
+
+TTFT: 3.704 s (time to first token)
+[qwen36 spec gate] run: T(1) 641.0 ms, rows, rho 0.50, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen36 lookup] run: 1.00 tokens/forward (15 forwards per 15 tokens) | acceptance 0.0% (0/0 drafts in 0 verifies) | gate on, 2 declined, 0 probes
+[timers] decode: 15 tokens  (shared/router are subsets of moe_total)
+[timers]   deltanet       498.0 ms     33.20 ms/token
+[timers]   attention      119.4 ms      7.96 ms/token
+[timers]   moe_total     8962.7 ms    597.51 ms/token
+[timers]   (shared)        84.1 ms      5.61 ms/token
+[timers]   (router)        18.3 ms      1.22 ms/token
+[timers]   lm_head        198.5 ms     13.23 ms/token
+[timers]   TOTAL         9778.5 ms    651.90 ms/token
+[timers]   step() total: 652.6 ms/token (outside the phases: 0.7)
+[timers]   dn-sub: proj 20.6 | conv 1.4 | l2n+rec 3.2 | norm+out 7.8 ms/token
+[timers]   expert kernel: fetch 178.21 | compute 411.77 ms/token
+[timers] prefill: 5 tokens  dn=109 attn=22 moe=3522(sh=19 rt=4) head=47 ms
+
+PEAK RSS: 2.42 GB
+Expert cache hit rate: 0.8% (hit=54 miss=6346)
+Speed: 1.19 tok/s (13.5s for 16 tokens)
+       18.28 real        38.90 user         4.41 sys
+          2600402944  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              619773  page reclaims
+                  20  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                6103  voluntary context switches
+              170243  involuntary context switches
+        238605180446  instructions retired
+        129282627190  cycles elapsed
+          4433628640  peak memory footprint
+
+--- stdout ---
+ red, blue, and yellow. When two primary colors are mixed, they produce

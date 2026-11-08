@@ -340,8 +340,11 @@ NVCCFLAGS ?= -O3 -std=$(NVCC_STD) -ftz=false $(CUDA_GENCODE) -Xcompiler=-Wall,-W
 # under C++17 (noexcept is part of the function type since C++17). Force-include
 # a compat header that strips __THROW from the host pass; see
 # glibc_c23_math_compat.h. MSVC never sees glibc headers, so Linux-only.
+CUDA_GLIBC_MATH_COMPAT ?= 1
 ifneq ($(LINUX),)
+ifeq ($(CUDA_GLIBC_MATH_COMPAT),1)
 NVCCFLAGS += -Xcompiler=-include,$(CURDIR)/glibc_c23_math_compat.h
+endif
 endif
 endif
 # CUDA 13.1 host_config.h accepts only Visual Studio 2019-2022 and refuses
@@ -544,7 +547,7 @@ TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_frami
 	test_e8x4g64_loader test_qwenimage_vae test_vk_tier \
 	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract test_idot_ssse3 \
 	test_ggml_quants test_gguf_c test_gq_dot
-TEST_EXCLUDE += test_vk_chain test_vk_memtype test_glm53_vk_f32
+TEST_EXCLUDE += test_vk_chain test_vk_memtype test_glm53_vk_f32 test_vk_dev2_window
 # needs a CUDA device and the CUDA objects: make tests/test_cu_tier CUDA=1
 TEST_EXCLUDE += test_cu_tier
 # takes a fixture and the CPU build's logits on its command line (ci.yml, the int4 gs64 A/B step)
@@ -898,7 +901,7 @@ glm: colibri$(EXE)
 # rewrite it ONLY when they change (evaluated here at parse time, so the file's
 # timestamp moves exactly when the config moves). The binary and CUDA/loader objects depend
 # on it, so they relink on a config change and stay put otherwise. (#306)
-BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)|HIP=$(HIP)|HIP_DLL=$(HIP_DLL)|HIP_ARCH=$(HIP_ARCH)|VK=$(VK)|XDNA=$(XDNA)
+BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|CUDA_GLIBC_MATH_COMPAT=$(CUDA_GLIBC_MATH_COMPAT)|METAL=$(METAL)|HIP=$(HIP)|HIP_DLL=$(HIP_DLL)|HIP_ARCH=$(HIP_ARCH)|VK=$(VK)|XDNA=$(XDNA)
 BUILD_CONFIG_OLD := $(shell cat .build-config 2>/dev/null)
 ifneq "$(BUILD_CONFIG)" "$(BUILD_CONFIG_OLD)"
 # $(file ...) writes via make's own primitive (GNU Make >= 4.0, 2013), NOT by
@@ -2359,6 +2362,9 @@ tests/test_tile16$(EXE): tests/test_tile16.c
 tests/test_idot_r16$(EXE): tests/test_idot_r16.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_glm_serve_framing$(EXE): tests/test_glm_serve_framing.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
 tests/test_logprob_status$(EXE): tests/test_logprob_status.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
@@ -2579,6 +2585,9 @@ tests/test_stop_ids$(EXE): tests/test_stop_ids.c
 tests/test_sparse_attn$(EXE): tests/test_sparse_attn.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_index_topk$(EXE): tests/test_index_topk.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_expert_ffn$(EXE): tests/test_expert_ffn.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 # int4-g64 rows interleaved by 16 (expert_ffn.h xf16_*) against their reference.
@@ -2616,6 +2625,11 @@ tests/test_vk_alloc$(EXE): tests/test_vk_alloc.c
 tests/test_cu_tier$(EXE): tests/test_cu_tier.c $(CUDA_OBJ)
 	@case "$(CUDA_OBJ)" in *cu_tier.o*) ;; *) echo "tests/test_cu_tier needs CUDA=1 (or HIP=1)" >&2; exit 1 ;; esac
 	$(CC) $(CFLAGS) $< $(CUDA_OBJ) -o $@ $(LDFLAGS)
+# A second logical device exercises its own window probe (Lavapipe suffices).
+tests/test_vk_dev2_window$(EXE): tests/test_vk_dev2_window.c backend_vulkan.c shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/rmsnorm.spv shaders/attention_absorb.spv
+	@[ "$(VK)" = 1 ] || { echo "tests/test_vk_dev2_window needs VK=1" >&2; exit 1; }
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_vk_tier$(EXE): tests/test_vk_tier.c $(VK_OBJ) $(VK_SPV)
 	@[ "$(VK)" = 1 ] || { echo "tests/test_vk_tier needs VK=1" >&2; exit 1; }
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
@@ -2624,7 +2638,8 @@ tests/bench_host_pairs$(EXE): tests/bench_host_pairs.c $(VK_OBJ)
 	@[ "$(VK)" = 1 ] || { echo "tests/bench_host_pairs needs VK=1" >&2; exit 1; }
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 .PHONY: vk-tier-check
-vk-tier-check: tests/test_vk_tier$(EXE)
+vk-tier-check: tests/test_vk_tier$(EXE) tests/test_vk_dev2_window$(EXE)
+	./tests/test_vk_dev2_window$(EXE) shaders/qmatmul.spv
 	./tests/test_vk_tier$(EXE) shaders/qmatmul.spv
 	./tests/test_vk_tier$(EXE) shaders/qmatmul.spv host-pairs
 

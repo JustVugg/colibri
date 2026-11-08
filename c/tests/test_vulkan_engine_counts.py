@@ -23,8 +23,13 @@ BASH = _find_bash()
 SCRIPT = Path(__file__).with_name("vulkan_engines.sh").read_text()
 # Load only these production helpers: sourcing the full script runs a family.
 HELPERS = re.search(r"^fail\(\).*?$", SCRIPT, re.M).group() + "\n"
-for name in ("vk_count", "need_gpu"):
+for name in ("vk_count", "need_gpu", "need_int8"):
     HELPERS += re.search(rf"^{name}\(\).*?^\}}", SCRIPT, re.M | re.S).group() + "\n"
+# qwen36's per-matrix report (vk_report) and its dense chain's, as the int8 arm reads them.
+Q36_REPORT = ("[VK] qwen36: {n} matmuls on the GPU (73 matrices resident, 1.0 MiB; "
+              "placed int8 {i8}, int4 0, f32 3)\n")
+Q36_CHAIN = ("[VK] qwen36 chain: 16 forwards, 311 frames (2176 ops, 1168 matmuls, "
+             "0 tiled GEMM), timings\n")
 
 
 @unittest.skipUnless(BASH, "the Vulkan harness requires bash")
@@ -77,6 +82,30 @@ class VulkanEngineCounts(unittest.TestCase):
             with self.subTest(log=log):
                 self.assertEqual(self.run_helper(log).stdout.strip(), "0")
                 self.assertNotEqual(self.run_helper(log, helper="need_gpu").returncode, 0)
+
+    def test_int8_gate_counts_the_chain(self):
+        # #1862: with the dense chain on (a discrete GPU's default) the per-matrix count
+        # is 0; the chain's matmuls and its int8 uploads must satisfy the gate.
+        for log in (Q36_REPORT.format(n=0, i8=70) + Q36_CHAIN,
+                    Q36_REPORT.format(n=7, i8=70)):
+            with self.subTest(log=log):
+                result = self.run_helper(log, helper="need_int8")
+                self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_int8_gate_still_needs_int8_rows_and_matmuls(self):
+        for log, why in ((Q36_REPORT.format(n=0, i8=0) + Q36_CHAIN, "no int8 matrix placed"),
+                         (Q36_CHAIN, "no int8 matrix placed"),
+                         (Q36_REPORT.format(n=0, i8=70), "no matmul ran on the device"),
+                         ("", "no matmul ran on the device"),
+                         # only the engine's own report line counts, as in vk_count: one that
+                         # starts mid-line, or has no matmul count, is not that report
+                         ("note: " + Q36_REPORT.format(n=0, i8=70) + Q36_CHAIN,
+                          "no int8 matrix placed"),
+                         (Q36_REPORT.format(n="", i8=70) + Q36_CHAIN, "no int8 matrix placed")):
+            with self.subTest(log=log):
+                result = self.run_helper(log, helper="need_int8")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"FAIL: regression: {why}", result.stdout)
 
 
 if __name__ == "__main__":

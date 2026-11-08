@@ -249,6 +249,23 @@ static void test_chunk_rows(void) {
 }
 
 /* ---- attention ---------------------------------------------------------------------- */
+/* chain_attnb's pipelines with the head dims fixed (by default with Xe2 under ANV and on
+ * Lavapipe, anywhere with COLI_VK_ATTN_BLOCK_FIXED=1) give its generic pipeline's bits:
+ * fixed_off() switches to the generic one for a rerun (0 when the variable keeps them off:
+ * nothing to compare), and fixed_back() restores the setting. */
+static int g_fixed_set;
+static int fixed_off(void) {
+    const char *e = getenv("COLI_VK_ATTN_BLOCK_FIXED");
+    if (e && *e && strcmp(e, "1")) return 0;
+    g_fixed_set = e && *e;
+    setenv("COLI_VK_ATTN_BLOCK_FIXED", "0", 1);
+    return 1;
+}
+static void fixed_back(void) {
+    if (g_fixed_set) setenv("COLI_VK_ATTN_BLOCK_FIXED", "1", 1);
+    else unsetenv("COLI_VK_ATTN_BLOCK_FIXED");
+}
+
 /* a verify's S rows: each the bits of a decode step of that row alone (chain_attn_dec.comp's
  * blocks from each row's own positions, the rows before VKC_ATTN_DEC_MIN as theirs run) */
 static void test_attn_rows_bits(int S, int pos_base, int H, int KVH, int hd) {
@@ -317,6 +334,16 @@ static void test_attn_hk(int S, int pos_base, int H, int KVH, int hd, int use_li
     double tol = fl > 0 && S >= fl && !use_list && hd % 64 == 0 && 64 % (H / KVH) == 0 ? 2e-3 : 2e-5;
     CHECK(ok && e < tol, "attn S %d pos %d H %d/%d hd %d list %d (block from %d, flash from %d): err %.2e", S, pos_base, H, KVH, hd,
           use_list, vkc_attn_block_rows(), fl, e);
+    if (S >= 16 && fixed_off()) {
+        size_t bytes = (size_t)S * H * hd * sizeof(float);
+        float *was = malloc(bytes); memcpy(was, o, bytes);
+        vkc_begin(); ok = vkc_attn(qb, kb, vb, ob, qb, lb, &p);
+        ok = vkc_submit(1) && ok;
+        fixed_back();
+        CHECK(ok && memcmp(was, vkc_ptr(ob), bytes) == 0, "attn S %d pos %d H %d/%d hd %d list %d: the generic blocked pipeline "
+              "changed bytes", S, pos_base, H, KVH, hd, use_list);
+        free(was);
+    }
     vkc_free(qb); vkc_free(kb); vkc_free(vb); vkc_free(ob); vkc_free(lb);
     free(q); free(kc); free(vc); free(sel); free(ref);
 }
@@ -457,33 +484,86 @@ static void test_attn_win(int S, int pos_base, int H, int KVH, int hd, int vd, i
         ok = vkc_submit(1) && ok;
         CHECK(ok && memcmp(whole, vkc_ptr(ob), bytes) == 0,
               "attention slices changed bytes S %d H %d/%d win %d sink %d", S, H, KVH, win, sink);
-        unsetenv("COLI_VK_ATTN_SLICE"); free(whole);
+        unsetenv("COLI_VK_ATTN_SLICE");
+        if (fixed_off()) {
+            vkc_begin(); ok = vkc_attn_w(qb, kb, vb, ob, NULL, NULL, sink ? sb : NULL, &p);
+            ok = vkc_submit(1) && ok;
+            fixed_back();
+            CHECK(ok && memcmp(whole, vkc_ptr(ob), bytes) == 0, "attention's generic blocked pipeline changed bytes S %d hd %d vd %d "
+                  "win %d ring %d sink %d pm %d", S, hd, vd, win, ring, sink, kv_pm);
+        }
+        free(whole);
     }
     vkc_free(qb); vkc_free(kb); vkc_free(vb); vkc_free(sb); vkc_free(ob);
     free(q); free(kc); free(vc); free(snk); free(ref);
 }
+/* COLI_VK_ATTN_SLICE_WG as the run has it (NULL: unset), saved by a case that sets it and
+ * given back after, so the slice cases after it run as the run asked */
+static char *slice_wg_save(void) { const char *e = getenv("COLI_VK_ATTN_SLICE_WG"); return e ? strdup(e) : NULL; }
+static void slice_wg_back(char *was) {
+    if (was) setenv("COLI_VK_ATTN_SLICE_WG", was, 1);
+    else unsetenv("COLI_VK_ATTN_SLICE_WG");
+    free(was);
+}
+/* The slice rule (COLI_VK_ATTN_SLICE_WG, `wg`; NULL: the default): a slice of the blocked
+ * attention is cut to keep that many workgroups, as far as 4x the budget, a chunk's rows in
+ * slices of one size; the bytes of one dispatch every time. Qwen3.6's heads (16 over 2, hd 256:
+ * a workgroup a KV head and 4 rows), 72 rows after 7 positions, the budget `per` rows' work. */
+static void test_attn_slice_wg(int per, const char *wg, unsigned long long want) {
+    char *wg_was = slice_wg_save();
+    const int S = 72, pb = 7, H = 16, KVH = 2, hd = 256, T = pb + S;
+    size_t qn = (size_t)S * H * hd, kn = (size_t)KVH * T * hd, bytes = qn * 4;
+    float *q = fvec(qn, 1.f), *kc = fvec(kn, 1.f), *vc = fvec(kn, 1.f);
+    VkcBuf *qb = up(q, qn), *kb = up(kc, kn), *vb = up(vc, kn), *o1 = vkc_buf(bytes, VKC_DOWN), *o2 = vkc_buf(bytes, VKC_DOWN);
+    VkcAttn p = {S, H, KVH, hd, pb, T, 0, H * hd, hd, 0, 0, 0, 0, 0, H * hd, 0, 0, 1.f / 16, 0, 0};
+    char b[32];
+    snprintf(b, sizeof b, "%lld", (long long)per * T * H * hd);
+    setenv("COLI_VK_ATTN_SLICE", "0", 1);
+    vkc_begin(); int ok = vkc_attn(qb, kb, vb, o1, NULL, NULL, &p); ok = vkc_submit(1) && ok;
+    setenv("COLI_VK_ATTN_SLICE", b, 1);
+    if (wg) setenv("COLI_VK_ATTN_SLICE_WG", wg, 1);
+    else unsetenv("COLI_VK_ATTN_SLICE_WG");
+    VkcStats s0, s1; vkc_stats(&s0);
+    vkc_begin(); ok = vkc_attn(qb, kb, vb, o2, NULL, NULL, &p) && ok; ok = vkc_submit(1) && ok;
+    vkc_stats(&s1);
+    int same = !memcmp(vkc_ptr(o1), vkc_ptr(o2), bytes);
+    CHECK(ok && same && s1.attn_slices - s0.attn_slices == want && s1.attn_blocked > s0.attn_blocked,
+          "attn slices: a budget of %d rows, COLI_VK_ATTN_SLICE_WG %s: %llu extra submissions (%llu wanted), the bytes of one dispatch %d",
+          per, wg ? wg : "unset", s1.attn_slices - s0.attn_slices, want, same);
+    unsetenv("COLI_VK_ATTN_SLICE"); slice_wg_back(wg_was);
+    vkc_free(qb); vkc_free(kb); vkc_free(vb); vkc_free(o1); vkc_free(o2);
+    free(q); free(kc); free(vc);
+}
 
 /* A float16 KV cache (vkc_attn_wh): K and V of float16 values in halves give the bits of a
- * float32 cache of the same values, on the path the call takes (the counters say which) */
-static void test_attn_kvh(int S, int pos_base, int H, int KVH, int hd, int win, int ring, int sink) {
+ * float32 cache of the same values, on the path the call takes (the counters say which); V's
+ * head dim vd (the output's too) */
+static void test_attn_kvh(int S, int pos_base, int H, int KVH, int hd, int vd, int win, int ring, int sink) {
     int rows = ring ? ring : pos_base + S + 3, koff = 32, voff = 16;
-    size_t kn = (size_t)koff + (size_t)rows * KVH * hd, vn = (size_t)voff + (size_t)rows * KVH * hd;
+    size_t kn = (size_t)koff + (size_t)rows * KVH * hd, vn = (size_t)voff + (size_t)rows * KVH * vd;
     float *q = fvec((size_t)S * H * hd, 1.f), *kc = fvec(kn, 1.f), *vc = fvec(vn, 1.f), *snk = fvec(H + 5, 2.f);
     kv16_round(kc, (int64_t)kn); kv16_round(vc, (int64_t)vn);
     uint16_t *kh = malloc(kn * 2), *vh = malloc(vn * 2);
     kv16_pack(kh, kc, (int64_t)kn); kv16_pack(vh, vc, (int64_t)vn);
     VkcBuf *qb = up(q, (size_t)S * H * hd), *kb = up(kc, kn), *vb = up(vc, vn), *sb = up(snk, H + 5);
     VkcBuf *khb = vkc_buf(kn * 2, VKC_DEV), *vhb = vkc_buf(vn * 2, VKC_DEV);
-    VkcBuf *o32 = vkc_buf((size_t)S * H * hd * 4, VKC_DOWN), *o16 = vkc_buf((size_t)S * H * hd * 4, VKC_DOWN);
+    VkcBuf *o32 = vkc_buf((size_t)S * H * vd * 4, VKC_DOWN), *o16 = vkc_buf((size_t)S * H * vd * 4, VKC_DOWN);
     vkc_begin(); vkc_write(khb, 0, kh, kn * 2); vkc_write(vhb, 0, vh, vn * 2); vkc_submit(1);
-    VkcAttnW p = {{S, H, KVH, hd, pos_base, rows, 0, H * hd, hd, 0, 0, 0, 0, 0, H * hd, 0, 0, 1.f / sqrtf((float)hd), koff, voff},
-                  win, ring, hd, 0, sink, 5};
+    VkcAttnW p = {{S, H, KVH, hd, pos_base, rows, 0, H * hd, hd, 0, 0, 0, 0, 0, H * vd, 0, 0, 1.f / sqrtf((float)hd), koff, voff},
+                  win, ring, vd, 0, sink, 5};
     vkc_begin();
     int ok = vkc_attn_w(qb, kb, vb, o32, NULL, NULL, sink ? sb : NULL, &p) && vkc_attn_wh(qb, khb, vhb, o16, NULL, NULL, sink ? sb : NULL, &p);
     ok = vkc_submit(1) && ok;
-    size_t bytes = (size_t)S * H * hd * 4;
-    CHECK(ok && memcmp(vkc_ptr(o32), vkc_ptr(o16), bytes) == 0, "attn float16 cache S %d pos %d H %d/%d hd %d win %d ring %d sink %d: "
-          "a float32 cache's bits", S, pos_base, H, KVH, hd, win, ring, sink);
+    size_t bytes = (size_t)S * H * vd * 4;
+    CHECK(ok && memcmp(vkc_ptr(o32), vkc_ptr(o16), bytes) == 0, "attn float16 cache S %d pos %d H %d/%d hd %d vd %d win %d ring %d "
+          "sink %d: a float32 cache's bits", S, pos_base, H, KVH, hd, vd, win, ring, sink);
+    if (S >= 16 && fixed_off()) {   /* and the generic blocked pipeline's, a half a load */
+        vkc_begin(); ok = vkc_attn_wh(qb, khb, vhb, o32, NULL, NULL, sink ? sb : NULL, &p);
+        ok = vkc_submit(1) && ok;
+        fixed_back();
+        CHECK(ok && memcmp(vkc_ptr(o32), vkc_ptr(o16), bytes) == 0, "attn float16 cache S %d pos %d H %d/%d hd %d vd %d win %d "
+              "ring %d sink %d: the generic blocked pipeline's bits", S, pos_base, H, KVH, hd, vd, win, ring, sink);
+    }
     vkc_free(qb); vkc_free(kb); vkc_free(vb); vkc_free(sb); vkc_free(khb); vkc_free(vhb); vkc_free(o32); vkc_free(o16);
     free(q); free(kc); free(vc); free(snk); free(kh); free(vh);
 }
@@ -2946,6 +3026,26 @@ static void test_kvs_cold(void) {
     test_kvs_gqa(50, 2, 4, 2, 256, 256, 4, 16, 0, 0, 0, 1, 1, 1);
     test_kvs_gqa(60, 2, 4, 2, 32, 24, 4, 16, 20, 1, 1, 0, 0, 0);
     test_kvs_gqa(48, 12, 4, 2, 32, 32, 4, 40, 0, 0, 0, 1, 0, 0);
+    {   /* the host's part through chain_attnb's part mode (attn_part_rec), with V's head dim apart:
+         * its pipeline with the head dims fixed (where that is the default) gives the generic
+         * one's bytes */
+        const int Tp = 70, Hp = 4, vdp = 32;
+        size_t n = (size_t)Tp * Hp * vdp;
+        float *fx = calloc(n, sizeof(float)), *gn = calloc(n, sizeof(float));
+        kvs_keep_row = (size_t)Hp * vdp;
+        VkcStats p0, p1, p2; vkc_stats(&p0);
+        kvs_keep = fx; test_kvs_gqa(Tp, 7, Hp, 2, 48, vdp, 8, 32, 0, 1, 1, 0, 0, 0);
+        vkc_stats(&p1);
+        if (fixed_off()) {
+            kvs_keep = gn; test_kvs_gqa(Tp, 7, Hp, 2, 48, vdp, 8, 32, 0, 1, 1, 0, 0, 0);
+            fixed_back();
+            vkc_stats(&p2);
+            CHECK(p1.attn_blocked > p0.attn_blocked && p2.attn_blocked > p1.attn_blocked && !memcmp(fx, gn, n * sizeof(float)),
+                  "kvs cold: the part mode's generic pipeline changed bytes (%llu and %llu calls in blocks)",
+                  p1.attn_blocked - p0.attn_blocked, p2.attn_blocked - p1.attn_blocked);
+        }
+        kvs_keep = NULL; free(fx); free(gn);
+    }
     /* T step H K R B rows kv_start lists */
     test_kvs_mla(40, 1, 4, 32, 8, 4, 12, 0, 0);
     test_kvs_mla(90, 5, 2, 64, 16, 8, 40, 0, 1);
@@ -4250,10 +4350,12 @@ int main(int argc, char **argv) {
     { VkcStats st; vkc_stats(&st); CHECK(st.attn_blocked >= 9, "attn: %llu calls took the blocked attention", st.attn_blocked);
       printf("  blocked attention: %llu calls\n", st.attn_blocked); }
     /* a long attention cut over several submissions (COLI_VK_ATTN_SLICE): the same cases,
-     * the blocked attention and chain_attn, slices of a few rows each */
+     * the blocked attention and chain_attn, slices of a few rows each (the budget alone) */
     {
         VkcStats s0; vkc_stats(&s0);
+        char *wg_was = slice_wg_save();
         setenv("COLI_VK_ATTN_SLICE", "60000", 1);
+        setenv("COLI_VK_ATTN_SLICE_WG", "0", 1);
         for (int pass = 0; pass < 2; pass++) {
             setenv("COLI_VK_ATTN_BLOCK", pass ? "0" : "16", 1);
             test_attn_hk(40, 7, 16, 2, 256, 0); test_attn_hk(37, 5, 16, 2, 128, 1); test_attn_hk(64, 100, 4, 4, 32, 0);
@@ -4263,7 +4365,16 @@ int main(int argc, char **argv) {
         VkcStats s1; vkc_stats(&s1);
         CHECK(s1.attn_slices > s0.attn_slices + 10, "attn: %llu slices", s1.attn_slices - s0.attn_slices);
         printf("  attention in slices: %llu extra submissions\n", s1.attn_slices - s0.attn_slices);
-        unsetenv("COLI_VK_ATTN_SLICE");
+        unsetenv("COLI_VK_ATTN_SLICE"); slice_wg_back(wg_was);
+    }
+    {   /* the slice rule's floor (COLI_VK_ATTN_SLICE_WG; the random stream as before it) */
+        unsigned rng_was = rng;
+        test_attn_slice_wg(7, "0", 17);   /* the budget alone: 18 slices of 4 rows */
+        test_attn_slice_wg(7, "64", 2);   /* 64 workgroups as far as 4x the budget, 28 rows: 3 slices of 24 */
+        test_attn_slice_wg(7, NULL, coli_vk_device_integrated() ? 17 : 2);   /* the default: 64, 0 on an integrated GPU */
+        test_attn_slice_wg(7, "8", 4);    /* 8 workgroups, 16 rows: 5 slices */
+        test_attn_slice_wg(20, "64", 0);  /* 4x the budget, 80 rows, takes the 72 whole */
+        rng = rng_was;
     }
     unsetenv("COLI_VK_CHAIN_FLASH");
     /* a decode's or a verify's rows over many positions (chain_attn_dec.comp's blocks, where a prompt of
@@ -4275,24 +4386,49 @@ int main(int argc, char **argv) {
         test_attn_win(4, 900, 8, 2, 128, 128, 0, 0, 1, 0); test_attn_win(1, 2000, 4, 2, 64, 64, 512, 512, 0, 1);
         test_attn_win(2, 3000, 16, 4, 64, 96, 0, 0, 0, 0);
         /* Flint's: full layers with a sink, a window with a sink, linear and in a ring; in blocks
-         * where the device has the matrix units */
+         * where the device has the matrix units, and on any device under COLI_VK_ATTN_DEC=2 set for
+         * the run (read as the engine reads it: a leading '0' is off, and COLI_VK_CHAIN_FLASH=0
+         * turns it off with the rest of attn_dec's rule) */
         VkcStats f0; vkc_stats(&f0);
         test_attn_win(1, 17000, 32, 4, 128, 128, 0, 0, 1, 0); test_attn_win(3, 5000, 32, 4, 128, 128, 128, 0, 1, 0);
         test_attn_win(1, 4000, 32, 4, 128, 128, 200, 236, 1, 0); test_attn_win(4, 2000, 16, 2, 256, 256, 0, 0, 1, 0);
         VkcStats f1; vkc_stats(&f1);
-        if (f1.attn_flash > 0) {
+        const char *adv = getenv("COLI_VK_ATTN_DEC");
+        const int optin = adv && *adv != '0' && atoi(adv) == 2 && vkc_attn_flash_rows() > 0;
+        const char *ge = getenv("COLI_VK_ATTN_DEC_GQA");
+        const int gqa = !(ge && *ge == '0');
+        if (f1.attn_flash > 0 || optin) {
             CHECK(f1.attn_dec >= f0.attn_dec + 4, "attn: a window's or a sink's decode in blocks (%llu of 4)", f1.attn_dec - f0.attn_dec);
-            const char *ge = getenv("COLI_VK_ATTN_DEC_GQA");
-            if (!(ge && *ge == '0'))
+            if (gqa)
                 CHECK(f1.attn_dec_gqa >= f0.attn_dec_gqa + 4, "attn: %llu of 4 decodes a KV head's query heads a workgroup",
                       f1.attn_dec_gqa - f0.attn_dec_gqa);
+        }
+        /* two of them again under COLI_VK_ATTN_DEC=2, which the chain reads on each call: in
+         * blocks on any device, one without the flash module too (the CI's Lavapipe, Xe2); the
+         * random stream and the variable as before them */
+        {
+            unsigned rng_dec = rng;
+            char was[32];
+            const int had = adv != NULL;
+            if (had) snprintf(was, sizeof was, "%s", adv);
+            setenv("COLI_VK_ATTN_DEC", "2", 1);
+            VkcStats d0; vkc_stats(&d0);
+            test_attn_win(1, 17000, 32, 4, 128, 128, 0, 0, 1, 0); test_attn_win(4, 2000, 16, 2, 256, 256, 0, 0, 1, 0);
+            VkcStats d1; vkc_stats(&d1);
+            if (had) setenv("COLI_VK_ATTN_DEC", was, 1);
+            else unsetenv("COLI_VK_ATTN_DEC");
+            CHECK(d1.attn_dec >= d0.attn_dec + 2, "attn: COLI_VK_ATTN_DEC=2: %llu of 2 decodes in blocks", d1.attn_dec - d0.attn_dec);
+            if (gqa)   /* the head dims of 128 at least: their grouped pipeline's 14.5 KiB of shared memory fits any device */
+                CHECK(d1.attn_dec_gqa >= d0.attn_dec_gqa + 1, "attn: COLI_VK_ATTN_DEC=2: %llu of 2 decodes a KV head's query heads a "
+                      "workgroup", d1.attn_dec_gqa - d0.attn_dec_gqa);
+            rng = rng_dec;
         }
         /* OLMoE's: one query head a KV head, by KV head too (mode 2 at a GQ of 1) */
         VkcStats o0; vkc_stats(&o0);
         test_attn_hk(1, 299, 16, 16, 128, 0); test_attn_hk(3, 250, 16, 16, 128, 0);
         test_attn_win(2, 3000, 16, 16, 128, 128, 0, 0, 0, 0);
         VkcStats o1; vkc_stats(&o1);
-        if (o1.attn_flash > 0 && !(getenv("COLI_VK_ATTN_DEC_GQA") && *getenv("COLI_VK_ATTN_DEC_GQA") == '0'))
+        if ((o1.attn_flash > 0 || optin) && !(getenv("COLI_VK_ATTN_DEC_GQA") && *getenv("COLI_VK_ATTN_DEC_GQA") == '0'))
             CHECK(o1.attn_dec_gqa >= o0.attn_dec_gqa + 3, "attn: %llu of 3 decodes of one query head a KV head by KV head",
                   o1.attn_dec_gqa - o0.attn_dec_gqa);
         test_attn_rows_bits(6, 700, 16, 16, 128);
@@ -4304,16 +4440,18 @@ int main(int argc, char **argv) {
     }
     /* a float16 KV cache on every path: chain_attn (a few rows over few positions), the decode's
      * blocks a head and by KV head, the matrix units and the blocked shader for a prompt chunk,
-     * a window and sinks, linear and in a ring */
+     * a window and sinks, linear and in a ring, and V's head dim apart from K's */
     if (vkc_kvh_ready()) {
         unsigned rng_was = rng;
         VkcStats k0; vkc_stats(&k0);
-        test_attn_kvh(2, 50, 16, 2, 256, 0, 0, 0); test_attn_kvh(3, 2500, 16, 2, 256, 0, 0, 0); test_attn_kvh(2, 700, 8, 8, 128, 0, 0, 0);
-        test_attn_kvh(70, 33, 16, 2, 256, 0, 0, 0); test_attn_kvh(40, 300, 32, 4, 128, 129, 0, 1); test_attn_kvh(1, 4000, 32, 4, 128, 200, 236, 1);
-        test_attn_kvh(90, 900, 32, 4, 128, 129, 230, 1);
+        test_attn_kvh(2, 50, 16, 2, 256, 256, 0, 0, 0); test_attn_kvh(3, 2500, 16, 2, 256, 256, 0, 0, 0);
+        test_attn_kvh(2, 700, 8, 8, 128, 128, 0, 0, 0); test_attn_kvh(70, 33, 16, 2, 256, 256, 0, 0, 0);
+        test_attn_kvh(40, 300, 32, 4, 128, 128, 129, 0, 1); test_attn_kvh(1, 4000, 32, 4, 128, 128, 200, 236, 1);
+        test_attn_kvh(90, 900, 32, 4, 128, 128, 129, 230, 1);
         setenv("COLI_VK_CHAIN_FLASH", "0", 1);
-        test_attn_kvh(40, 300, 16, 2, 256, 0, 0, 0); test_attn_kvh(33, 20, 32, 4, 128, 16, 0, 1);
+        test_attn_kvh(40, 300, 16, 2, 256, 256, 0, 0, 0); test_attn_kvh(33, 20, 32, 4, 128, 128, 16, 0, 1);
         unsetenv("COLI_VK_CHAIN_FLASH");
+        test_attn_kvh(40, 100, 8, 2, 64, 48, 0, 0, 0);   /* the blocked shader's uvec4 loads with V's head dim apart */
         test_copy_regions_h();
         VkcStats k1; vkc_stats(&k1);
         printf("  a float16 cache: %llu on the matrix units, %llu blocked, %llu decodes in blocks\n", k1.attn_flash - k0.attn_flash,

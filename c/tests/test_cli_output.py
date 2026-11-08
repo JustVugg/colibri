@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -7,6 +8,7 @@ import sys
 import tempfile
 import types
 import unittest
+from contextlib import redirect_stderr
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from unittest import mock
@@ -432,14 +434,165 @@ class OmpThreadsForEveryEngineTest(unittest.TestCase):
         --vram are no longer refused up front as "CPU only". On a CPU-only
         binary they fail the way every accelerated engine's do: by asking for
         the CUDA build. cuda_binary() is mocked so the test does not depend on
-        what happens to be built next to it."""
-        with mock.patch.object(self.coli, "cuda_binary", return_value=None):
+        what happens to be built next to it; vulkan_binary() too, since a VK=1
+        build takes --gpu (#2127)."""
+        with mock.patch.object(self.coli, "cuda_binary", return_value=None), \
+             mock.patch.object(self.coli, "vulkan_binary", return_value=False):
             gpu_args = self.args();gpu_args.gpu="0";gpu_args.vram=0
-            with self.assertRaisesRegex(SystemExit, "--gpu needs the CUDA build"):
+            with self.assertRaisesRegex(SystemExit, "--gpu needs a GPU build:.*no CUDA or Vulkan backend"):
                 self.coli.env_for_engine(gpu_args, "qwen38")
             vram_args = self.args();vram_args.gpu=None;vram_args.vram=4
-            with self.assertRaisesRegex(SystemExit, "--vram needs the CUDA build"):
+            with self.assertRaisesRegex(SystemExit, "--vram needs the CUDA build:.*CPU-only"):
                 self.coli.env_for_engine(vram_args, "qwen38")
+
+    def vulkan_engine(self):
+        """A VK=1 engine without CUDA: the Vulkan loader's names compiled in (what
+        doctor.cuda_linkage reads, #2081), no CUDA runtime or backend DLL."""
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        engine = Path(directory.name, "engine.exe")
+        engine.write_bytes(b"MZ ... [VK] ... vulkan-1.dll ... libvulkan.so.1 ...")
+        return str(engine)
+
+    def vulkan_env(self, arch, gpu, environ=None, **fields):
+        """env_for_engine for that engine (the GLM path through env_for)."""
+        a = self.args(); a.gpu = gpu; a.vram = 0
+        for key, value in fields.items(): setattr(a, key, value)
+        engine = self.vulkan_engine()
+        with mock.patch.dict(os.environ, environ or {}, clear=True), \
+             mock.patch("resource_plan.physical_cpu_count", return_value=6), \
+             mock.patch("resource_plan.performance_core_count", return_value=None), \
+             mock.patch("doctor.vulkan_loader_present", return_value=True), \
+             mock.patch.object(self.coli, "engine_for", return_value=engine), \
+             mock.patch.object(self.coli, "GLM", engine):
+            return self.coli.env_for_engine(a, arch)
+
+    def test_gpu_on_a_vulkan_build_selects_the_vulkan_device(self):
+        """#2127: a VK=1 engine without CUDA refused `--gpu 1` as "the engine binary
+        is CPU-only", so the only way to the second card was COLI_VK_DEV=1 by hand.
+        --gpu now selects the Vulkan device (a second index: COLI_VK_DEV2) and sets
+        none of the CUDA variables; --gpu none turns Vulkan off as well."""
+        glm = dict(policy="quality", topp=0, topk=0, repin=0, auto_tier=False)
+        for arch, fields in (("qwen36", {}), ("glm", glm)):
+            with self.subTest(arch=arch):
+                one = self.vulkan_env(arch, "1", **fields)
+                self.assertEqual((one["COLI_VULKAN"], one["COLI_VK_DEV"]), ("1", "1"))
+                for key in ("COLI_VK_DEV2", "COLI_CUDA", "COLI_GPUS", "CUDA_DENSE"):
+                    self.assertNotIn(key, one)
+                two = self.vulkan_env(arch, "1,0", {"COLI_VK_DEV": "0"}, **fields)
+                self.assertEqual((two["COLI_VK_DEV"], two["COLI_VK_DEV2"]), ("1", "0"))
+                auto = self.vulkan_env(arch, "auto", {"COLI_VK_DEV": "0", "COLI_VK_DEV2": "auto"}, **fields)
+                self.assertEqual(auto["COLI_VULKAN"], "1")
+                self.assertNotIn("COLI_VK_DEV", auto)
+                self.assertNotIn("COLI_VK_DEV2", auto)
+                off = self.vulkan_env(arch, "none", {"COLI_VULKAN": "1"}, **fields)
+                self.assertEqual((off["COLI_VULKAN"], off["COLI_CUDA"]), ("0", "0"))
+                with self.assertRaisesRegex(SystemExit, "one or two device indices"):
+                    self.vulkan_env(arch, "0,1,2", **fields)
+                with self.assertRaisesRegex(SystemExit, "second device must differ"):
+                    self.vulkan_env(arch, "0,0", **fields)
+                with self.assertRaisesRegex(SystemExit, "--vram needs the CUDA build:.*COLI_VK_TIER_GB"):
+                    self.vulkan_env(arch, None, vram=4, **fields)
+
+    def test_glm_auto_tier_on_a_vulkan_build(self):
+        """#2127, GLM with --auto-tier: --vram set CUDA_EXPERT_GB, which a Vulkan engine
+        never reads, where the same flag without --auto-tier is refused; and the plan line
+        said "CPU" while --gpu ran the expert tier on the Vulkan card."""
+        glm = dict(policy="quality", topp=0, topk=0, repin=0, auto_tier=True,
+                   no_tune_profile=True, kv_slots=1)
+        with self.assertRaisesRegex(SystemExit, "--vram needs the CUDA build:.*COLI_VK_TIER_GB"):
+            self.vulkan_env("glm", "0", vram=4, **glm)
+        # a device without a name (a vulkaninfo record with none) reads "device"
+        for name, label in (("Test GPU", "· Vulkan Test GPU"), (None, "· Vulkan device")):
+            plan = {"vulkan": {"name": name, "type": "discrete"},
+                    "tiers": {"ram": {"budget_bytes": 8 << 30, "cache_slots_per_layer": 8},
+                              "vram": {"devices": [], "budget_bytes": 0}}}
+            err = io.StringIO()
+            with mock.patch.object(self.coli, "resource_request", return_value=(0, 4096, [0], 0)), \
+                 mock.patch("resource_plan.build_plan", return_value=plan), \
+                 mock.patch("resource_plan.environment_for_plan", side_effect=lambda p, e, *x, **k: e), \
+                 redirect_stderr(err):
+                env = self.vulkan_env("glm", "0", **glm)
+            self.assertEqual((env["COLI_VULKAN"], env["COLI_VK_DEV"]), ("1", "0"))
+            self.assertNotIn("CUDA_EXPERT_GB", env)
+            self.assertIn(label, err.getvalue())
+
+    def test_a_cuda_vulkan_build_without_its_dll_takes_gpu_on_vulkan(self):
+        """A Windows VK=1 engine that also loads a CUDA backend DLL runs on Vulkan when
+        that DLL is missing, but --gpu refused it: a CUDA_DLL=1 VK=1 build without
+        coli_cuda.dll ("no CUDA or Vulkan backend"), and the main archive's
+        deepseek_v4.exe without coli_cuda_dsv4*.dll ("build coli_cuda_dsv4.dll")."""
+        for arch, image in (("qwen36", b"MZ ... coli_cuda.dll ... [VK] ... vulkan-1.dll ..."),
+                            ("deepseek_v4", b"MZ ... [DSV4 CUDA] ... [VK] ... vulkan-1.dll ...")):
+            with self.subTest(arch=arch):
+                directory = tempfile.TemporaryDirectory()
+                self.addCleanup(directory.cleanup)
+                engine = Path(directory.name, "engine.exe")
+                engine.write_bytes(image)
+                a = self.args(); a.gpu = "0"; a.vram = 0
+                with mock.patch("sys.platform", "win32"), \
+                     mock.patch.dict(os.environ, {}, clear=True), \
+                     mock.patch("resource_plan.physical_cpu_count", return_value=6), \
+                     mock.patch("resource_plan.performance_core_count", return_value=None), \
+                     mock.patch("doctor.vulkan_loader_present", return_value=True), \
+                     mock.patch.object(self.coli, "engine_for", return_value=str(engine)):
+                    self.assertFalse(self.coli.cuda_binary(str(engine)))
+                    self.assertTrue(self.coli.vulkan_binary(str(engine)))
+                    env = self.coli.env_for_engine(a, arch)
+                    # --vram names the Vulkan tier's budget, not the CUDA build
+                    vram_args = self.args(); vram_args.gpu = None; vram_args.vram = 4
+                    with self.assertRaisesRegex(SystemExit, "--vram needs the CUDA build:.*COLI_VK_TIER_GB"):
+                        self.coli.env_for_engine(vram_args, arch)
+                self.assertEqual((env["COLI_VULKAN"], env["COLI_VK_DEV"]), ("1", "0"))
+                self.assertNotIn("COLI_CUDA", env)
+        # the image fallback is Windows only: on Linux a CUDA build without its runtime
+        # does not start at all, so it stays refused
+        with mock.patch("sys.platform", "linux"), \
+             mock.patch("doctor._runtime_linkage", return_value={"linked": False, "missing": True}):
+            self.assertFalse(self.coli.vulkan_binary(str(engine)))
+
+    def test_auto_tier_plans_the_vulkan_device_gpu_selects(self):
+        """#2127: the plan behind --auto-tier sized the first discrete Vulkan card and
+        a CUDA tier on nvidia-smi's index 1; it sizes COLI_VK_DEV's device, no CUDA tier."""
+        seen = []
+        def plan(*args, **kwargs):
+            seen.append((args[3], kwargs.get("env") or {}))
+            return {}
+        fields = dict(auto_tier=True, no_tune_profile=True, policy="quality", kv_slots=1)
+        with mock.patch.object(self.coli, "resource_request", return_value=(0, 4096, [1], 0)), \
+             mock.patch("resource_plan.build_plan", side_effect=plan), \
+             mock.patch("resource_plan.environment_for_plan", side_effect=lambda p, e, **k: e):
+            env = self.vulkan_env("qwen36", "1", {"COLI_VULKAN": "1"}, **fields)
+            self.vulkan_env("qwen36", "none", {"COLI_VULKAN": "1"}, **fields)
+        self.assertEqual(env["COLI_VK_DEV"], "1")
+        (devices, plan_env), (_, off_env) = seen
+        self.assertEqual(devices, [])
+        self.assertEqual((plan_env["COLI_VULKAN"], plan_env["COLI_VK_DEV"]), ("1", "1"))
+        self.assertEqual(off_env["COLI_VULKAN"], "0")
+
+    def test_tune_plans_the_vulkan_device_gpu_selects(self):
+        """#2127: `coli tune --gpu 1` built its plan before the launch environment,
+        from the CUDA inventory and the first discrete Vulkan card."""
+        seen = []
+        def plan(*args, **kwargs):
+            seen.append((args[3], kwargs.get("env") or {}))
+            raise ValueError("planned")
+        with tempfile.TemporaryDirectory() as model:
+            Path(model, "config.json").write_text(json.dumps({"model_type": "qwen3_5_text"}),
+                                                  encoding="utf-8")
+            a = types.SimpleNamespace(model=model, gpu="1", vram=0, ram=0, ctx=0, policy="quality",
+                                      kv_slots=1, tokens=16, timeout=900, min_gain=0.03)
+            with mock.patch.dict(os.environ, {}, clear=True), \
+                 mock.patch.object(self.coli, "need_model"), \
+                 mock.patch.object(self.coli, "resource_request", return_value=(0, 4096, [1], 0)), \
+                 mock.patch("doctor.vulkan_loader_present", return_value=True), \
+                 mock.patch.object(self.coli, "engine_for", return_value=self.vulkan_engine()), \
+                 mock.patch("resource_plan.build_plan", side_effect=plan):
+                with self.assertRaisesRegex(SystemExit, "cannot create tuning plan.*planned"):
+                    self.coli.cmd_tune(a)
+        [(devices, plan_env)] = seen
+        self.assertEqual(devices, [])
+        self.assertEqual((plan_env["COLI_VULKAN"], plan_env["COLI_VK_DEV"]), ("1", "1"))
 
 
 class ServerRestartingTest(unittest.TestCase):

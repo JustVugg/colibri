@@ -367,8 +367,8 @@ engines build with `make <engine> CUDA=1`. On
 Windows the CUDA engine is a separate DLL ([windows.md](docs/windows.md)), and
 every release ships it built: `colibri-<version>-windows-x86_64-cuda.zip` has
 `coli_cuda.dll` (cards of compute capability 8.0 and newer) and the colibri,
-qwen36 and kimi_k3 engines that load it, with DeepSeek V4's own CUDA DLLs. Unpack it
-over the main archive and the setup picks CUDA.
+glm53, qwen36 and kimi_k3 engines that load it, with DeepSeek V4's own CUDA DLLs.
+Unpack it over the main archive and the setup picks CUDA.
 
 - **Every layer on the card** for Qwen3.6, Qwen3.8 and OLMoE: the dense layers,
   the attention and the routed experts the card holds run as one chain, and the

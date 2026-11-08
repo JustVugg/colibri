@@ -80,6 +80,7 @@
 #include "ggml_view.h"
 #include "quant.h"
 #include "sparse_attn.h"
+#include "index_topk.h"
 #include "omp_tune.h"
 #include "kv_prefix.h"
 #include "park.h"   /* a short request keeps the conversation aside (COLI_PARK) */
@@ -2744,6 +2745,7 @@ static void indexer_run(Model *m, int layer, const float *x, const float *qr, in
     float *qblk = xmalloc((size_t)block * nh * ihd * sizeof(float), "indexer queries");
     float *wblk = xmalloc((size_t)block * nh * sizeof(float), "indexer weights");
     float *score = xmalloc((size_t)compress_len * sizeof(float), "indexer scores");
+    uint64_t *work = xmalloc((size_t)(compress_len > 0 ? compress_len : 1) * 2 * sizeof(uint64_t), "indexer order");
     float scale = (1.0f / sqrtf((float)ihd)) * (1.0f / sqrtf((float)nh));
 
     for (int t = 0; t < n; t++) {
@@ -2773,8 +2775,12 @@ static void indexer_run(Model *m, int layer, const float *x, const float *qr, in
          * before its own position, which is one expression for prefill and decode
          * alike -- and, for a speculative step, per row rather than per step */
         int lens = (start_pos + t + 1) / ratio;
-        for (int j = 0; j < compress_len; j++) {
-            if (j >= lens) { score[j] = -INFINITY; continue; }
+        /* each position's score is its own sum over the heads, in head order, so splitting
+         * the reachable positions across threads gives the same bits */
+        const int reach = lens < compress_len ? lens : compress_len;
+        for (int j = reach; j < compress_len; j++) score[j] = -INFINITY;
+        #pragma omp parallel for schedule(static) if (reach >= 256)
+        for (int j = 0; j < reach; j++) {
             float total = 0.0f;
             for (int h = 0; h < nh; h++) {
                 const float *qh = q + (size_t)h * ihd;
@@ -2802,27 +2808,11 @@ static void indexer_run(Model *m, int layer, const float *x, const float *qr, in
          * independently, but keeping them sorted makes the concatenated index list
          * readable and matches the reference's `.sort()`. */
         int *row = out + (size_t)t * stride;   /* the compressed half of this query's list */
-        for (int k = 0; k < topk; k++) row[k] = -1;
-        int taken = 0;
-        for (int k = 0; k < topk; k++) {
-            int best = -1;
-            for (int j = 0; j < compress_len; j++) {
-                if (score[j] == -INFINITY) continue;
-                int already = 0;
-                for (int u = 0; u < taken; u++) if (row[u] == j) { already = 1; break; }
-                if (already) continue;
-                if (best < 0 || score[j] > score[best]) best = j;
-            }
-            if (best < 0) break;
-            row[taken++] = best;
-        }
-        for (int a = 0; a < taken; a++)          /* insertion sort: taken <= index_topk */
-            for (int b = a + 1; b < taken; b++)
-                if (row[b] < row[a]) { int swap = row[a]; row[a] = row[b]; row[b] = swap; }
+        int taken = coli_index_topk(score, compress_len, topk, row, work);   /* index_topk.h */
         for (int k = 0; k < topk; k++)
             row[k] = (k < taken && row[k] < lens) ? row[k] + offset : -1;
     }
-    free(qblk); free(wblk); free(score);
+    free(qblk); free(wblk); free(score); free(work);
 }
 
 /* wo_a is block diagonal over o_groups: each group projects only its own heads, and

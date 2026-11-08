@@ -80,6 +80,7 @@
 #include "lora.h"                                 /* ADAPTER=<dir>: LoRA residual on frozen base */
 #include "schema_gbnf.h"                          /* SCHEMA=: JSON-Schema -> GBNF for method F */
 #include "decode_batch.h"
+#include "serve_codec.h"
 #include "pin_pool.h"   /* piu scatti annidati dello stato */
 #include "park.h"       /* a short request keeps the one slot's conversation aside (COLI_PARK) */
 #include "prompt_break.h"   /* a served prompt that a STOP or CANCEL stops between two layers */
@@ -11224,14 +11225,15 @@ static int logprob_tail(char *dst, size_t cap, const float *lo, int V, int token
  * paired with requests that never opt in, so it never sees the extended form. */
 static void mux_data(Tok *T, unsigned long long id, int token,
                      const float *lo, int V, int topk){
-    char out[256]; int n=tok_decode(T,&token,1,out,sizeof(out));
+    char out[256], request_id[32], tail[1024];
+    int n=tok_decode(T,&token,1,out,sizeof(out));
+    snprintf(request_id,sizeof(request_id),"%llu",id);
+    const char *numeric=NULL;
     if(topk>0 && lo){
-        char tail[1024]; logprob_tail(tail,sizeof(tail),lo,V,token,topk);
-        printf("DATA %llu %d%s\n",id,n,tail);
-    } else
-        printf("DATA %llu %d\n",id,n);
-    if(n>0) fwrite(out,1,(size_t)n,stdout); putchar('\n');
-    fflush(stdout);
+        logprob_tail(tail,sizeof(tail),lo,V,token,topk);
+        numeric=tail;
+    }
+    coli_serve_write_data_lp(stdout,request_id,out,(size_t)n,numeric);
 }
 
 /* Echoed-prompt read-out frame (U7a, opt-in only): "ECHO <id> <n> <pos> <lp>
@@ -11241,11 +11243,11 @@ static void mux_data(Tok *T, unsigned long long id, int token,
  * the request set SUBMIT logprobs=k, so an old server can never receive one. */
 static void mux_echo(Tok *T, unsigned long long id, int pos, int token,
                      const float *lo, int V, int topk){
-    char out[256]; int n=tok_decode(T,&token,1,out,sizeof(out));
-    char tail[1024]; logprob_tail(tail,sizeof(tail),lo,V,token,topk);
-    printf("ECHO %llu %d %d%s\n",id,n,pos,tail);
-    if(n>0) fwrite(out,1,(size_t)n,stdout); putchar('\n');
-    fflush(stdout);
+    char out[256], request_id[32], tail[1024];
+    int n=tok_decode(T,&token,1,out,sizeof(out));
+    snprintf(request_id,sizeof(request_id),"%llu",id);
+    logprob_tail(tail,sizeof(tail),lo,V,token,topk);
+    coli_serve_write_echo_lp(stdout,request_id,out,(size_t)n,pos,tail);
 }
 
 /* Opt-in prefill read-out (U7a, SUBMIT logprobs=k): one full-prompt forward
@@ -11600,21 +11602,21 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
     }
     char *raw=malloc((size_t)sub.bytes+1);
     if(!raw){ fprintf(stderr,"OOM multiplex payload\n"); exit(1); }
-    if(fread(raw,1,(size_t)sub.bytes,stdin)!=(size_t)sub.bytes){ free(raw); free(line); return -1; }
     char *gtxt=NULL;                     /* optional per-request grammar/schema text */
     if(sub.gbytes){
         gtxt=malloc((size_t)sub.gbytes+1);
         if(!gtxt){ fprintf(stderr,"OOM multiplex payload\n"); exit(1); }
-        if(fread(gtxt,1,(size_t)sub.gbytes,stdin)!=(size_t)sub.gbytes){
-            free(gtxt); free(raw); free(line); return -1; }
-        gtxt[sub.gbytes]=0;
     }
-    int delim=fgetc(stdin);
-    if(delim!='\n'){
-        printf("ERROR %llu BAD_FRAME\n",sub.id); fflush(stdout);
+    ColiServeReadResult body=coli_serve_read_submit_body(
+        stdin,raw,(size_t)sub.bytes,gtxt,(size_t)sub.gbytes,1);
+    if(body!=COLI_SERVE_READ_OK){
+        if(body==COLI_SERVE_READ_BAD_FRAME){
+            printf("ERROR %llu BAD_FRAME\n",sub.id); fflush(stdout);
+        }
         free(gtxt); free(raw); free(line); return -1;
     }
     raw[sub.bytes]=0;
+    if(gtxt) gtxt[sub.gbytes]=0;
     if(sub.slot>=nctx || memchr(raw,0,(size_t)sub.bytes)){
         printf("ERROR %llu BAD_REQUEST\n",sub.id); fflush(stdout); free(gtxt); free(raw); free(line); return 0;
     }
@@ -14943,6 +14945,12 @@ int main(int argc, char **argv){
      * OMP-parallel pin warmup already streams from both drives. */
     mirror_setup(&m);
     gguf_experts_random(&m);
+    /* The expert-usage history: COLI_USAGE names it, as in the sibling engines (glm53.c,
+     * qwen36.c), default <SNAP>/.coli_usage. Resolved before PIN=auto, which seeds from it;
+     * the load, AUTOPIN and every usage_save() below use the same path (#1078). */
+    { const char *up=getenv("COLI_USAGE");
+      if(up&&*up) snprintf(g_usage_path,sizeof(g_usage_path),"%s",up);
+      else        snprintf(g_usage_path,sizeof(g_usage_path),"%s/.coli_usage",snap); }
     /* HOT-STORE: PIN=<statsfile> [PIN_GB=g] -> top expert per frequenza fissi in RAM.
      * Va PRIMA di cap_for_ram: i pinnati contano nel residente. */
     if(getenv("PIN")){
@@ -14955,14 +14963,14 @@ int main(int argc, char **argv){
              * nessuno dei due -> nessun pin (AUTOPIN piu' sotto resta escluso: PIN e' settato).
              * EN: prefer the live usage history over the frozen one-shot profile, so each
              * reload's pin placement follows the accumulated real workload. */
-            snprintf(pauto,sizeof(pauto),"%s/.coli_usage",snap);
+            snprintf(pauto,sizeof(pauto),"%s",g_usage_path);
             FILE *pf=fopen(pauto,"rb"); long psz=0;
             if(pf){ fseek(pf,0,SEEK_END); psz=ftell(pf); fclose(pf); }
             if(psz<=0){ snprintf(pauto,sizeof(pauto),"%s/stats.txt",snap);
                 pf=fopen(pauto,"rb"); psz=0;
                 if(pf){ fseek(pf,0,SEEK_END); psz=ftell(pf); fclose(pf); } }
             if(psz>0){ pin=pauto; fprintf(stderr,"[PIN] auto: seeding from %s\n",pauto); }
-            else { pin=NULL; fprintf(stderr,"[PIN] auto: no .coli_usage or stats.txt in %s yet (no pin this run)\n",snap); }
+            else { pin=NULL; fprintf(stderr,"[PIN] auto: no %s or stats.txt in %s yet (no pin this run)\n",g_usage_path,snap); }
         }
         if(pin){
             const char *pin_gb=getenv("PIN_GB");
@@ -14988,7 +14996,6 @@ int main(int argc, char **argv){
      * conosce la TUA storia, la LRU si adatta alla sessione). AUTOPIN=0 disattiva. */
     { double ram_env = getenv("RAM_GB")?atof(getenv("RAM_GB")):0.0;
       int est_ctx = getenv("CTX")?atoi(getenv("CTX")):4096;   /* stesso default di run_serve */
-      snprintf(g_usage_path,sizeof(g_usage_path),"%s/.coli_usage",snap);
       /* An integrated GPU's expert tier is RAM too. It is not reserved here: the shared
        * tier (vk_tier_start, at the end of init) sizes itself from what MemAvailable has
        * left once this LRU has grown to its cap (VktConfig.ram_reserve). */
@@ -15022,17 +15029,25 @@ int main(int argc, char **argv){
            * plan    = 0.5 * budget * confidence(history), the autopin quota
            * reserve = cap * per-row width, held back for the adaptive LRU (#815)
            * max_pin = budget - reserve, the ceiling the plan is clamped to
+           * pinning = the RAM pin quota pin_load() gets below: min(plan, max_pin),
+           *           or 0 under the 0.5 GB floor (#1078: it printed the unfloored one)
            *
            * A reserve near the budget means the pin is being starved by a
            * reservation the LRU may never claim, since the LRU is demand-filled
            * and only allocates on a miss. That is visible here at a glance. */
+          double pin_gb=pin_bytes/1e9;
+          /* whole MB, rounded down: a 0.499 GB pin must not read as the 0.5 GB floor itself */
+          char under_floor[96]="";
+          if(pin_bytes>0.0&&pin_gb<0.5)
+            snprintf(under_floor,sizeof under_floor,"  [a %.0f MB pin is under the 0.5 GB floor: no RAM pin]",
+                     floor(pin_bytes/1e6));
           fprintf(stderr,"[PIN] auto: budget %.1f GB | plan %.1f GB (conf %.2f, %lld selections) | "
-              "LRU reserve %.1f GB (cap %d/layer x %.1f MB/row-set) | max_pin %.1f GB -> pinning %.1f GB%s\n",
+              "LRU reserve %.1f GB (cap %d/layer x %.1f MB/row-set) | max_pin %.1f GB -> pinning %.1f GB%s%s\n",
               expert_available/1e9, planned_pin/1e9, conf, (long long)hist,
               lru_reserve/1e9, preserved_cap, expert_cache_bytes_per_slot(&m,ebits)/1e6,
-              (expert_available-lru_reserve)/1e9, pin_bytes/1e9,
-              pin_bytes+1.0<planned_pin ? "  [CAPPED by the LRU reserve]" : "");
-          double pin_gb=pin_bytes/1e9;
+              (expert_available-lru_reserve)/1e9, pin_gb>=0.5 ? pin_gb : 0.0,
+              pin_bytes+1.0<planned_pin ? "  [CAPPED by the LRU reserve]" : "",
+              under_floor);
           /* #1409: the VRAM prefix is loaded by the same pin_load, priced against
            * the VRAM budget (CUDA_RELEASE_HOST). A RAM pin under the 0.5 GB floor
            * used to skip the call, and with it the whole VRAM tier. */

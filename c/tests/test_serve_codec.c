@@ -101,6 +101,45 @@ static void test_submit_and_controls(void)
     fclose(input);
 }
 
+static void test_extension_combinations(void)
+{
+    ColiServeWireProfile extended = profile;
+    extended.allow_extension_bytes = 1;
+    extended.allow_prefix_hint = 1;
+    extended.max_extension_bytes = 4;
+    const char *frames[] = {
+        "SUBMIT req 0 3 4 0 1 4 2 logprobs=2 pin=1\nabcWXYZ\nSTOP req\n",
+        "SUBMIT req 0 3 4 0 1 4 2 ids=0 pin=1 logprobs=2\nabcWXYZ\nSTOP req\n",
+    };
+    for (size_t i=0; i<sizeof(frames)/sizeof(*frames); i++) {
+        FILE *input=bytes_input(frames[i], strlen(frames[i]));
+        ColiServeCommand command;
+        assert(coli_serve_read_command(input,&extended,&command)==COLI_SERVE_READ_OK);
+        assert(command.pin==1 && command.logprobs==2 && command.prefix_bytes==2);
+        assert(!memcmp(command.payload,"abc",3));
+        assert(!memcmp(coli_serve_command_extension(&command),"WXYZ",4));
+        coli_serve_command_dispose(&command);
+        assert(coli_serve_read_command(input,&extended,&command)==COLI_SERVE_READ_OK);
+        assert(command.kind==COLI_SERVE_COMMAND_STOP);
+        coli_serve_command_dispose(&command);
+        fclose(input);
+    }
+}
+
+static void test_token_ids_rejected_without_losing_frame_boundary(void)
+{
+    const char frame[]="SUBMIT ids 0 3 4 0 1 ids=1\n1 2\nSTOP ids\n";
+    FILE *input=bytes_input(frame,sizeof(frame)-1);
+    ColiServeCommand command;
+    assert(coli_serve_read_command(input,&profile,&command)==COLI_SERVE_READ_BAD_REQUEST);
+    assert(command.kind==COLI_SERVE_COMMAND_SUBMIT && !strcmp(command.id,"ids"));
+    assert(command.payload==NULL);
+    assert(coli_serve_read_command(input,&profile,&command)==COLI_SERVE_READ_OK);
+    assert(command.kind==COLI_SERVE_COMMAND_STOP && !strcmp(command.id,"ids"));
+    coli_serve_command_dispose(&command);
+    fclose(input);
+}
+
 static void test_invalid_headers_and_bodies(void)
 {
     static const char *invalid[] = {
@@ -329,6 +368,8 @@ static void test_load_fail_kinds_and_line(void)
 int main(void)
 {
     test_submit_and_controls();
+    test_token_ids_rejected_without_losing_frame_boundary();
+    test_extension_combinations();
     test_invalid_headers_and_bodies();
     test_writer_golden_bytes();
     test_ready_caps_golden_bytes();

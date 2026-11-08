@@ -1,0 +1,117 @@
+{
+  "version": 1,
+  "hypothesis": "Without the flash module (Xe2's cooperative matrices are 8 rows tall), a decode step's attention runs on chain_attn.comp with one workgroup per head, 16 for Qwen3.6, so decode after a 16K-token prompt falls to about 5 tok/s. COLI_VK_ATTN_DEC=2 lets chain_attn_dec run without the flash module, which restores decode at long contexts; the greedy answers of these prompts stay the same.",
+  "commit": "e24cd51afd44b480c1e41ba82e20a28bac76c34f",
+  "model": "Qwen/Qwen3.6-35B-A3B in colibri's int4-gs64 container (expert_gs=64, ~22 GB; base_model Qwen/Qwen3.6-35B-A3B in its README), at /models/qwen36-35b-a3b (config.json sha256 7606939241b64e82308369b308af8abe85d24e70846704c41ed4e0b59687a674)",
+  "command": "Build, both trees: docker run --rm -v <tree>:/src -w /src colibri-builder:xe2 nice -n 19 make -C c colibri qwen36 VK=1 ARCH=x86-64-v3 -j8 (0 warnings); c/colibri, c/qwen36 and c/shaders/ copied over colibri-vulkan:ubuntu26-qwen (Mesa 26.0.8, main 0a5504a1's Python gateway). Engine: docker compose up -d with the measuring host's compose.yaml (coli serve --model /models/qwen36-35b-a3b --ram 32; COLI_VK_TIER_GB=18, COLI_VK_DEV2= (GPU 0 only), OMP_NUM_THREADS=16) and an override with the arm's image and variables. Measured with colibench: python3 experiments/pr_manifests.py attndec (streamed OpenAI API requests to the engine, temperature 0); this folder made by experiments/make_manifests.py from its records.",
+  "prompt_hash": "884fd1648c49f708645744b230c8a9736bc98826d98966bb3dab9da15b8a9fec",
+  "hardware": {
+    "cpu": "Proxmox VE 9.2 VM on an HP Z6 G4: 32 vCPUs of an Intel Xeon Gold 6254 @ 3.10GHz (1 socket, 1 thread per core in the guest); GPU 0 = an Intel Arc Pro B60 (Xe2, BMG G21, 24 GB) as an SR-IOV VF (0000:01:00.0), factory clocks, nothing else running on it",
+    "ram": "247 GiB in the guest",
+    "storage": "the model on a CIFS share (//172.25.0.253/public/models), bind-mounted read-only; the expert tier warm-starts every expert into GPU 0's memory (18 GiB) at each engine start",
+    "os": "Ubuntu 26.04.1 LTS guest, kernel 7.0.0-42-generic, xe kernel driver (SR-IOV VF: a GPU job is killed after 5 s); engine image Ubuntu 26.04 with Mesa ANV 26.0.8 (mesa-vulkan-drivers 26.0.8-1ubuntu0.3); engine compiled with gcc 15.2.0 (Ubuntu 15.2.0-16ubuntu1) in the colibri-builder:xe2 container (ubuntu:26.04): -O3 -march=x86-64-v3, VK=1"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "COLI_VK_ATTN_DEC"
+  ],
+  "baseline": {
+    "config": {
+      "model": "Qwen3.6-35B-A3B int4-gs64 (/models/qwen36-35b-a3b)",
+      "gpu": "Arc Pro B60 VF, GPU 0 only, 18 GiB tier",
+      "mesa": "26.0.8-1ubuntu0.3",
+      "OMP_NUM_THREADS": "16",
+      "COLI_VK_TIER_GB": "18",
+      "COLI_VK_DEV2": "unset",
+      "COLI_VK_SUBGROUP": "16",
+      "anv_enable_buffer_comp": "true",
+      "COLI_VK_ATTN_SLICE": "unset",
+      "COLI_VK_ATTN_DEC": "unset",
+      "INTEL_MEASURE": "unset",
+      "engine_build": "dev e24cd51a + this change (qwen36 sha256 0a740f03b5f9da96)"
+    },
+    "samples": {
+      "tok_s": [
+        4.45,
+        4.45,
+        4.46
+      ],
+      "ttft_16k_s": [
+        118.86,
+        118.32,
+        118.39
+      ],
+      "decode_short_tok_s": [
+        36.928,
+        36.95,
+        37.128,
+        36.97
+      ],
+      "ttft_3k_s": [
+        7.271,
+        7.174,
+        7.195,
+        7.159
+      ]
+    },
+    "median_tok_s": 4.45,
+    "quality": {
+      "method": "greedy answers to 3 fixed prompts (160 tokens), every character, against dev e24cd51a with the chain on (driver option, subgroup 16), 2026-11-06: 3/3 identical",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/vulkan-attn-dec-optin-2026-11-07/runs.txt",
+      "sha256": "66cc12b9636ccc711658b9e99c36edee54c2f29a5d11cd05bbcabdd5090c137d"
+    }
+  },
+  "trial": {
+    "config": {
+      "model": "Qwen3.6-35B-A3B int4-gs64 (/models/qwen36-35b-a3b)",
+      "gpu": "Arc Pro B60 VF, GPU 0 only, 18 GiB tier",
+      "mesa": "26.0.8-1ubuntu0.3",
+      "OMP_NUM_THREADS": "16",
+      "COLI_VK_TIER_GB": "18",
+      "COLI_VK_DEV2": "unset",
+      "COLI_VK_SUBGROUP": "16",
+      "anv_enable_buffer_comp": "true",
+      "COLI_VK_ATTN_SLICE": "unset",
+      "COLI_VK_ATTN_DEC": "2",
+      "INTEL_MEASURE": "unset",
+      "engine_build": "dev e24cd51a + this change (qwen36 sha256 0a740f03b5f9da96)"
+    },
+    "samples": {
+      "tok_s": [
+        27.83,
+        28.11,
+        27.92
+      ],
+      "ttft_16k_s": [
+        118.79,
+        118.12,
+        118.45
+      ],
+      "decode_short_tok_s": [
+        37.987,
+        38.012,
+        37.98,
+        37.785
+      ],
+      "ttft_3k_s": [
+        7.273,
+        7.159,
+        7.16,
+        7.163
+      ]
+    },
+    "median_tok_s": 27.92,
+    "quality": {
+      "method": "greedy answers to 3 fixed prompts (160 tokens), every character, against dev e24cd51a with the chain on (driver option, subgroup 16), 2026-11-06: 3/3 identical",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/vulkan-attn-dec-optin-2026-11-07/runs.txt",
+      "sha256": "66cc12b9636ccc711658b9e99c36edee54c2f29a5d11cd05bbcabdd5090c137d"
+    }
+  },
+  "outcome": "improvement"
+}

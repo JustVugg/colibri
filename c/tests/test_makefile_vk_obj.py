@@ -89,8 +89,13 @@ def _link_rules():
 
 
 def _backend_api():
+    """What backend_vulkan.o provides: the functions backend_vulkan.h names,
+    less the ones it defines itself. A static inline helper such as
+    coli_vk_gv_lanes is in every unit that includes the header, so calling it
+    needs no object; a test that includes backend_vulkan.c whole
+    (test_vk_dev2_window) calls it from there and defines the rest."""
     text = (C_DIR / "backend_vulkan.h").read_text(encoding="utf-8")
-    return set(re.findall(r"\bcoli_vk_\w+", text))
+    return set(re.findall(r"\bcoli_vk_\w+", text)) - set(DEF_RE.findall(text))
 
 
 def _make(*args):
@@ -123,7 +128,8 @@ def _unresolved(words, api):
         if r.returncode != 0:
             return None
         # Keep only this tree's own code: system headers cannot call the
-        # backend, and backend_vulkan.h only declares it.
+        # backend, and backend_vulkan.h declares it (what it defines is
+        # not in the API at all).
         kept, keep, own = [], True, {}
         for line in r.stdout.splitlines():
             marker = LINEMARKER_RE.match(line)
