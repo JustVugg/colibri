@@ -250,7 +250,7 @@ static void test_chunk_rows(void) {
 
 /* ---- attention ---------------------------------------------------------------------- */
 /* chain_attnb's pipelines with the head dims fixed (by default with Xe2 under ANV and on
- * Lavapipe, anywhere with COLI_VK_ATTN_BLOCK_FIXED=1) give its generic pipeline's bits:
+ * Lavapipe, anywhere with COLI_VK_ATTN_BLOCK_FIXED=1) agree with its generic pipeline:
  * fixed_off() switches to the generic one for a rerun (0 when the variable keeps them off:
  * nothing to compare), and fixed_back() restores the setting. */
 static int g_fixed_set;
@@ -264,6 +264,18 @@ static int fixed_off(void) {
 static void fixed_back(void) {
     if (g_fixed_set) setenv("COLI_VK_ATTN_BLOCK_FIXED", "1", 1);
     else unsetenv("COLI_VK_ATTN_BLOCK_FIXED");
+}
+
+/* Mesa 26.0.8's Lavapipe gives identical bytes, but 26.2.6 rounds the specialized
+ * and generic shaders differently. Keep the exact comparison first, then the
+ * float32 attention reference's 2e-5 bound. Reject nonfinite values explicitly:
+ * relerr alone would ignore a NaN difference. Other byte-identity tests stay exact. */
+static int fixed_equivalent(const float *a, const float *b, size_t n) {
+    if (bad(a, n) || bad(b, n)) return 0;
+    if (!memcmp(a, b, n * sizeof(float))) return 1;
+    double e = relerr(a, b, n, 1e-3);
+    printf("  fixed/generic attention: rounded, relative error %.3e (limit 2e-5)\n", e);
+    return e < 2e-5;
 }
 
 /* a verify's S rows: each the bits of a decode step of that row alone (chain_attn_dec.comp's
@@ -340,8 +352,8 @@ static void test_attn_hk(int S, int pos_base, int H, int KVH, int hd, int use_li
         vkc_begin(); ok = vkc_attn(qb, kb, vb, ob, qb, lb, &p);
         ok = vkc_submit(1) && ok;
         fixed_back();
-        CHECK(ok && memcmp(was, vkc_ptr(ob), bytes) == 0, "attn S %d pos %d H %d/%d hd %d list %d: the generic blocked pipeline "
-              "changed bytes", S, pos_base, H, KVH, hd, use_list);
+        CHECK(ok && fixed_equivalent(was, vkc_ptr(ob), bytes / sizeof(float)), "attn S %d pos %d H %d/%d hd %d list %d: "
+              "fixed/generic blocked pipelines disagree", S, pos_base, H, KVH, hd, use_list);
         free(was);
     }
     vkc_free(qb); vkc_free(kb); vkc_free(vb); vkc_free(ob); vkc_free(lb);
@@ -489,7 +501,7 @@ static void test_attn_win(int S, int pos_base, int H, int KVH, int hd, int vd, i
             vkc_begin(); ok = vkc_attn_w(qb, kb, vb, ob, NULL, NULL, sink ? sb : NULL, &p);
             ok = vkc_submit(1) && ok;
             fixed_back();
-            CHECK(ok && memcmp(whole, vkc_ptr(ob), bytes) == 0, "attention's generic blocked pipeline changed bytes S %d hd %d vd %d "
+            CHECK(ok && fixed_equivalent(whole, vkc_ptr(ob), bytes / sizeof(float)), "attention's fixed/generic blocked pipelines disagree S %d hd %d vd %d "
                   "win %d ring %d sink %d pm %d", S, hd, vd, win, ring, sink, kv_pm);
         }
         free(whole);
@@ -524,8 +536,8 @@ static void test_attn_kvh(int S, int pos_base, int H, int KVH, int hd, int vd, i
         vkc_begin(); ok = vkc_attn_wh(qb, khb, vhb, o32, NULL, NULL, sink ? sb : NULL, &p);
         ok = vkc_submit(1) && ok;
         fixed_back();
-        CHECK(ok && memcmp(vkc_ptr(o32), vkc_ptr(o16), bytes) == 0, "attn float16 cache S %d pos %d H %d/%d hd %d vd %d win %d "
-              "ring %d sink %d: the generic blocked pipeline's bits", S, pos_base, H, KVH, hd, vd, win, ring, sink);
+        CHECK(ok && fixed_equivalent(vkc_ptr(o32), vkc_ptr(o16), bytes / sizeof(float)), "attn float16 cache S %d pos %d H %d/%d hd %d vd %d win %d "
+              "ring %d sink %d: fixed/generic blocked pipelines disagree", S, pos_base, H, KVH, hd, vd, win, ring, sink);
     }
     vkc_free(qb); vkc_free(kb); vkc_free(vb); vkc_free(sb); vkc_free(khb); vkc_free(vhb); vkc_free(o32); vkc_free(o16);
     free(q); free(kc); free(vc); free(snk); free(kh); free(vh);
@@ -2978,8 +2990,8 @@ static void test_kvs_cold(void) {
     test_kvs_gqa(60, 2, 4, 2, 32, 24, 4, 16, 20, 1, 1, 0, 0, 0);
     test_kvs_gqa(48, 12, 4, 2, 32, 32, 4, 40, 0, 0, 0, 1, 0, 0);
     {   /* the host's part through chain_attnb's part mode (attn_part_rec), with V's head dim apart:
-         * its pipeline with the head dims fixed (where that is the default) gives the generic
-         * one's bytes */
+         * its pipeline with the head dims fixed (where that is the default) agrees with
+         * the generic one within the float32 attention bound */
         const int Tp = 70, Hp = 4, vdp = 32;
         size_t n = (size_t)Tp * Hp * vdp;
         float *fx = calloc(n, sizeof(float)), *gn = calloc(n, sizeof(float));
@@ -2991,8 +3003,8 @@ static void test_kvs_cold(void) {
             kvs_keep = gn; test_kvs_gqa(Tp, 7, Hp, 2, 48, vdp, 8, 32, 0, 1, 1, 0, 0, 0);
             fixed_back();
             vkc_stats(&p2);
-            CHECK(p1.attn_blocked > p0.attn_blocked && p2.attn_blocked > p1.attn_blocked && !memcmp(fx, gn, n * sizeof(float)),
-                  "kvs cold: the part mode's generic pipeline changed bytes (%llu and %llu calls in blocks)",
+            CHECK(p1.attn_blocked > p0.attn_blocked && p2.attn_blocked > p1.attn_blocked && fixed_equivalent(fx, gn, n),
+                  "kvs cold: the part mode's fixed/generic pipelines disagree (%llu and %llu calls in blocks)",
                   p1.attn_blocked - p0.attn_blocked, p2.attn_blocked - p1.attn_blocked);
         }
         kvs_keep = NULL; free(fx); free(gn);
