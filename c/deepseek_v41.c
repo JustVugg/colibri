@@ -4965,10 +4965,7 @@ static void forward_full(Model *m, const int *ids, int n, float *logits, int spe
     if (image_rows || image_mask) kv_prefix_taint(&m->kvp);
     kv_prefix_record(&m->kvp, ids, start_all, n_all);
 
-    if (image_rows || image_mask) kv_prefix_taint(&m->kvp);
-    kv_prefix_record(&m->kvp, ids, start_all, n_all);
-
-    if (getenv("V41_STATE_PROBE")) {   /* TEMPORARY probe: the state a turn left */
+    if (getenv("V41_STATE_PROBE") && !v41_host_kvq(&m->c)) {   /* diagnostic: the state a turn left; fp32 rows only */
         unsigned long long sw = 0, sc = 0, si = 0;
         for (int i = 0; i < m->c.n_layers; i++) {
             Layer *l = &m->L[i];
