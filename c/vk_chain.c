@@ -788,9 +788,13 @@ static long chain_spin_us(void) {
 }
 static int frame_wait(VkcFrame *f) {
     if (!f->inflight) return 1;
-    if (g_hyb_flush) g_hyb_flush();   /* a hybrid step's host part the frame may wait for */
+    /* A hybrid step's host part, which a frame still running may wait for. Only then: vkc_begin
+     * waits here for the ring slot it recycles, a frame long done, and flushing there ran the
+     * newest step's pairs before its frame B was even recorded, the device idle through them
+     * (Qwen3.8-Flash-Next-FP8 on an Arc Pro B60: 1.4 ms of pairs, then frame B, a layer). */
+    VkResult r = vkGetFenceStatus(KC.dev, f->fence);
+    if (r == VK_NOT_READY && g_hyb_flush) g_hyb_flush();
     double t0 = vkc_now_ms();
-    VkResult r = VK_NOT_READY;
     for (long spin = chain_spin_us(); spin > 0 && r == VK_NOT_READY && (vkc_now_ms() - t0) * 1000.0 < spin; )
         r = vkGetFenceStatus(KC.dev, f->fence);
     if (r == VK_NOT_READY) r = vkWaitForFences(KC.dev, 1, &f->fence, VK_TRUE, KC.fence_ns);
@@ -880,6 +884,10 @@ int vkc_begin(void) {
 int vkc_submit(int wait) {
     if (KC.cur < 0) return vkc_ready();
     VkcFrame *f = &KC.fr[KC.cur];
+    /* a frame that waits for the host's value goes off once the host has signalled it: its pairs
+     * now (they run while the frame B before computes the device's experts), never a frame
+     * submitted before the value it waits for */
+    if (f->wait_h && g_hyb_flush) g_hyb_flush();
     barrier_now(f->cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
     vkEndCommandBuffer(f->cmd);
     f->open = 0; KC.cur = -1;
@@ -947,6 +955,7 @@ int vkc_split_layers(void) {
 int vkc_layer_recorded(int *layers) {
     const int every = vkc_split_layers();
     if (every < 1 || ++*layers < every) return 1;
+    if (KC.cur >= 0 && KC.fr[KC.cur].wait_h) return 1;   /* a frame C goes off with the next layer's step */
     *layers = 0;
     return vkc_submit(0) && vkc_begin();
 }

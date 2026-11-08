@@ -2473,6 +2473,18 @@ Beside an Arc Pro B60 with every routed expert in the host pool, decode went fro
 7.4 tok/s, with greedy answers identical ([the
 experiment](experiments/vulkan-fp8-host-pairs-2026-11-07/manifest.json)).
 
+On the timeline path, recycling a frame whose fence is already signalled does not
+flush the pending host pairs: frame B must be recorded and submitted first so the
+CPU can compute those pairs while the device computes its resident experts. Waiting
+for an unfinished frame still flushes the host work, and submitting a frame that
+waits on the host timeline flushes it before submission. A layer-count split also
+keeps frame C with the next layer's step. On an Arc Pro B60 (Xe2, Mesa ANV 26.2.6)
+beside a Xeon Gold 6254, Qwen3.8-Flash-Next-FP8 decode improved from 7.38 to 10.41
+tok/s with identical greedy answers. Both measured arms include the companion FP8
+CPU kernel (#2697) and the same prompt settings; this scheduling change is independent
+of that kernel. Samples, configuration and logs:
+[`vulkan-hybrid-overlap-2026-11-07`](experiments/vulkan-hybrid-overlap-2026-11-07/manifest.json).
+
 Where the device has events (every device), a step stays inside its frame, as the CUDA
 chain's does with its host flags: `vkCmdSetEvent` once the route and the rows are down
 (the host polls `vkGetEventStatus`), the device's experts, `vkCmdWaitEvents` on the event
