@@ -51,7 +51,7 @@ Both are lossless: the same blocks, the same tokens.
 
   | Engine | Switch |
   |---|---|
-  | qwen36 | `Q36_ILV16=0` |
+  | qwen36 | `Q36_ILV16=0` (also our container's int4 trunk, `COLI_DENSE_BITS=4`) |
   | qwen38 | `Q38_ILV16=0` |
   | deepseek_v4 | `COLI_V4_ROWS16=0` |
   | deepseek_v41 | `V41_ILV16=0` |

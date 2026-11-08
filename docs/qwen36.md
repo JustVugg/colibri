@@ -470,6 +470,20 @@ Through the gateway (`coli serve`), greedy decode ran at 2.1 tok/s in int8 and
 3.45 tok/s with everything in int4, after a load of 73 and 114 s; the answers
 to the same English, Italian and Turkish questions were the same but for a word.
 
+With the trunk in int4 the CPU interleaves its matrices by 16 rows at load
+(`[qwen36] trunk: 401 int4 matrices interleaved by 16`), so one integer
+dot product advances sixteen rows and a group of 64 needs no sum of its own
+for every row; the answers keep their bits (`Q36_ILV16=0` keeps the
+grouped layout). On a Ryzen 7 8700GE (16 threads), every matrix in int4, a
+1000-token prompt and 300 tokens of decode through `coli serve`:
+
+| build | prompt before | prompt now | decode before | decode now |
+|---|---|---|---|---|
+| x86-64-v3 (the release's) | 9.5 tok/s | 22.4 tok/s | 3.8 tok/s | 4.0 tok/s |
+| native (AVX-512 VNNI) | 9.2 tok/s | 41.1 tok/s | 3.7 tok/s | 4.0 tok/s |
+
+The int8 trunk's prompt on the same CPU is 43.6 tok/s, its decode 2.3.
+
 The MLP is 17 of the 27 billion parameters, so int4 on the MLP and the LM head
 keeps most of the saving at half the loss. With a matrix in int4 the engine
 no longer keeps its int8 copy (`COLI_DENSE_KEEP_I8=1` does); that is what

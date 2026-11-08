@@ -44,6 +44,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **Qwen3.8-27B with its trunk in int4 on the CPU: the prompt 2.4x to 4.5x faster.** The grouped
+  kernel (`COLI_DENSE_BITS=4`) summed every group of 64 inputs across the vector for every row and
+  every prompt row, more work than the products themselves. The matrices now load interleaved by 16
+  rows (`idot.h` `matmul_i4p_gidot_r16`): one integer dot product advances sixteen rows, and a
+  group's scale goes into each row's sum with the fused multiply-add the kernel had, so the same
+  bits (`tests/test_i4r16.c`; `make i4r16-check` adds the AVX-512 VNNI and AVX-VNNI kernels). Ryzen
+  7 8700GE, a 1000-token prompt: 9.5 -> 22.4 tok/s at the release's x86-64-v3, 9.2 -> 41.1 built
+  native; decode 3.8 -> 4.0, the same answers. `Q36_ILV16=0` keeps the grouped layout.
 - **Qwen3.8-27B from unsloth's GGUFs on CUDA: the chain runs the trunk.** The CUDA placement
   fused a DeltaNet layer's qkv and z rows into one tensor of one type, and these mixes give the
   two different types in about half the layers, so those layers' in_proj stayed on the CPU and

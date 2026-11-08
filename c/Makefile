@@ -2488,6 +2488,20 @@ qwen36-canonical$(EXE): tools/qwen36_canonical.c qwen36.c qwen36_dense_file.h $(
 tests/test_idot$(EXE): tests/test_idot.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
+# The int4 sets of 16 (idot.h matmul_i4p_gidot_r16) against the K1b kernel, with the build's
+# flags (a gate); i4r16-check also runs the AVX-512 VNNI and AVX-VNNI kernels, on a CPU that
+# has them (not gates: CI's runners may lack them, and a binary built for them stops there).
+tests/test_i4r16$(EXE): tests/test_i4r16.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+tests/i4r16_avx512$(EXE): tests/test_i4r16.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) -mavx512f -mavx512bw -mavx512vl -mavx512vnni $< $(VK_OBJ) -o $@ $(LDFLAGS)
+tests/i4r16_avxvnni$(EXE): tests/test_i4r16.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) -mavxvnni $< $(VK_OBJ) -o $@ $(LDFLAGS)
+i4r16-check: tests/test_i4r16$(EXE) tests/i4r16_avx512$(EXE) tests/i4r16_avxvnni$(EXE)
+	./tests/test_i4r16$(EXE)
+	@if grep -qw avx512_vnni /proc/cpuinfo 2>/dev/null; then ./tests/i4r16_avx512$(EXE); else echo "i4r16-check: no AVX-512 VNNI here"; fi
+	@if grep -qw avx_vnni /proc/cpuinfo 2>/dev/null; then ./tests/i4r16_avxvnni$(EXE); else echo "i4r16-check: no AVX-VNNI here"; fi
+
 # Force the idot integer-dot kernels onto the SSSE3 tier even on an AVX2 host
 # (mirrors the forced-SSE4.1 grouped-int4 gates): pre-AVX2 x86-64 CPUs take
 # this branch instead of scalar, so it must remain a gate, not dead code.
