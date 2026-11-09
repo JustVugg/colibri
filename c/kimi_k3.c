@@ -186,8 +186,8 @@ typedef struct {                          /* gated MLA layer */
     W qa, qb, kva, kvb, o, g;
     float *qa_ln, *kva_ln;
     /* DSA indexer (full layers only, optional) */
-    W      wk, wq, wp;                    /* [index_hd x {hidden, q_lora, index_hd}] */
-    float  *knw, *knb;                    /* key layernorm [index_hd] */
+    W      wk, wq, wp;                    /* [index_hd x hidden], [index_nh*index_hd x q_lora], [index_nh x hidden] */
+    float  *knw, *knb;                    /* the key's LayerNorm [index_hd] */
     float  *Ic;                           /* indexer cache [max_t * index_hd] */
 } Mla;
 
@@ -342,71 +342,69 @@ static void rmsnorm_(float *out, const float *x, const float *w, int D, float ep
     for(int i=0;i<D;i++) out[i]=x[i]*r*w[i];
 }
 
-/* ---------- DSA (Dictionary Sparse Attention) CPU helpers ---------- */
-/* L'indexer DSA e' COSTRUITO ma non COLLEGATO (#1333): l'unica funzione che
- * leggerebbe la cache Ic per scegliere le posizioni top-K, dsa_score_single qui
- * sotto, non ha nessun chiamante -- una grep su tutto il repo trova solo la sua
- * definizione.
- *
- * Finche' resta cosi' l'attenzione e' densa e il sottosistema e' lavoro pagato e
- * mai letto: CINQUE tensori dal disco per ogni layer DSA (w_k, w_q, w_p, kn_w,
- * kn_b -- e w_q, w_p, kn_b non sono toccati nemmeno dal codice morto), la cache
- * Ic da [max_t * index_hd] float per layer, e per ogni token un matmul piu'
- * rmsnorm piu' rope.
- *
- * Spento di default, non cancellato: quel che manca e' collegare
- * dsa_score_single, e chi lo fara' ha bisogno di questi pesi. KIMI_DSA_INDEXER=1
- * li ricarica. Avvertenza per chi ci mettera' mano: collegarlo CAMBIA le uscite
- * -- l'attenzione diventa sparsa dove oggi e' densa -- quindi va fatto contro
- * l'oracolo token-exact, non a occhio. */
-static int k3_dsa_indexer_on(void){
+/* ---------- DSA: Kimi K3.1's indexer (Gated DSA on its full-attention layers) ----------
+ * K3.1 is K3 with DeepSeek Sparse Attention on the gated MLA layers (text_config.dsa_config;
+ * K3 has none, and its full layers attend densely). Per position s a layer keeps the key
+ * k_s = LayerNorm(W_k x_s) (weight and bias, eps 1e-6) in Ic; per token the queries
+ * q_h = W_qb qa (qa: the q_lora latent after its RMSNorm, the one q_b reads) and the head
+ * weights w_h = W_p x score every position of the context as
+ *     I_s = sum_h w_h * ReLU(q_h . k_s / sqrt(index_head_dim)) / sqrt(index_num_heads),
+ * and the token attends to the index_topk best positions instead of all of them (on a tie,
+ * the earlier position). A token whose context holds no more than index_topk positions keeps
+ * every one: its attention is K3's dense one, bit for bit. The definition is GLM-5.2's DSA
+ * (colibri.c) with no rotary part (index_rope_dim 0: K3's MLA carries no position either).
+ * KIMI_DSA_INDEXER=0 keeps the attention dense past index_topk: a comparison, not the model. */
+static int k3_dsa_off(void){
     static int cached = -1;
-    if(cached < 0){ const char *e = getenv("KIMI_DSA_INDEXER"); cached = e && *e=='1'; }
+    if(cached < 0){ const char *e = getenv("KIMI_DSA_INDEXER"); cached = e && *e=='0'; }
     return cached;
 }
-
-static void dsa_rope(float *v, int pos, int qk_rope, float base_theta){
-    int half = qk_rope/2;
-    if(qk_rope > 256){ fprintf(stderr,"qk_rope=%d exceeds rope buffer (256)\n",qk_rope); exit(1); }
-    float in[256]; memcpy(in,v,qk_rope*sizeof(float));
-    for(int j=0;j<half;j++){
-        float inv=powf(base_theta,-2.0f*j/qk_rope), ang=pos*inv;
-        float cs=cosf(ang), sn=sinf(ang);
-        float a=in[2*j], b=in[2*j+1];
-        v[j]      = a*cs - b*sn;
-        v[half+j] = b*cs + a*sn;
+static void layernorm_(float *v, const float *w, const float *b, int n, float eps){
+    double mu=0; for(int i=0;i<n;i++) mu+=v[i]; mu/=n;
+    double var=0; for(int i=0;i<n;i++){ double d=v[i]-mu; var+=d*d; } var/=n;
+    float r=1.f/sqrtf((float)var+eps);
+    for(int i=0;i<n;i++) v[i]=((float)(v[i]-mu))*r*w[i]+b[i];
+}
+/* The k-th largest of a[0..n), 1 <= k <= n (Wirth's selection, descending); a is reordered. */
+static float dsa_kth_largest(float *a, int n, int k){
+    int l=0, r=n-1; const int kk=k-1;
+    while(l<r){
+        const float x=a[kk]; int i=l, j=r;
+        do{
+            while(a[i]>x) i++;
+            while(x>a[j]) j--;
+            if(i<=j){ float t=a[i]; a[i]=a[j]; a[j]=t; i++; j--; }
+        }while(i<=j);
+        if(j<kk) l=i;
+        if(kk<i) r=j;
     }
+    return a[kk];
 }
-
-typedef struct { float sc; int idx; } DsaEntry;
-static int dsa_entry_cmp_desc(const void *a,const void *b){
-    float d=((const DsaEntry*)b)->sc-((const DsaEntry*)a)->sc;
-    return d>0?1:d<0?-1:0;
-}
-
-/* dsa_score: multi-head cosine distance + ReLU + weight + top-K select.
- * qi: [nh * index_hd] — per-head indexer query (post-RoPE, post-projection)
- * Ic: [nk * index_hd] — indexer cache rows
- * w32: [nh] — weight scalars from P projection
- * nk: number of cache rows in context
- * sel: output buffer of maxsel ints (sorted desc by score)
- * Returns actual count of selected indices. Caller supplies token-local DsaEntry array. */
-static int dsa_score_single(int *sel, int maxsel, const float *qi, const float *Ic, int index_hd,
-                            const float *w32, int nh, int nk, DsaEntry *entries){
-    if(nk <= 0 || maxsel <= 0) return 0;
+/* The positions one token attends to, in position order: the min(topk, nk) best of its nk by
+ * I_s, a tie to the earlier position. qi [nh * hd], w [nh], Ic [nk * hd]; isc and tmp hold
+ * nk floats each. Returns how many it kept. */
+static int dsa_select(int *sel, int topk, const float *qi, const float *w, const float *Ic,
+                      int nh, int hd, int nk, float *isc, float *tmp){
+    const float wsc=1.f/sqrtf((float)nh), rs=1.f/sqrtf((float)hd);
+    #pragma omp parallel for schedule(static) if(nk >= 4096)
     for(int t=0;t<nk;t++){
-        float s = 0;
+        const float *kt=Ic+(int64_t)t*hd; float a=0;
         for(int h=0;h<nh;h++){
-            float d=0;
-            for(int i=0;i<index_hd;i++) d += qi[(int64_t)h*index_hd+i] * Ic[(int64_t)t*index_hd+i];
-            s += w32[h]*(d>0?d:0); /* ReLU per-head */
+            const float *q=qi+(int64_t)h*hd; float d=0;
+            for(int i=0;i<hd;i++) d+=q[i]*kt[i];
+            d*=rs; if(d>0) a+=w[h]*d;            /* ReLU on the head's score, then its weight */
         }
-        entries[t]=(DsaEntry){s/sqrtf((float)nh), t};
+        isc[t]=a*wsc;
     }
-    int K = nk < maxsel ? nk : maxsel;
-    qsort(entries, nk, sizeof(DsaEntry), dsa_entry_cmp_desc);
-    for(int k=0;k<K;k++) sel[k]=entries[k].idx;
-    return K;
+    const int keep = nk<topk ? nk : topk;
+    if(keep==nk){ for(int t=0;t<nk;t++) sel[t]=t; return nk; }
+    memcpy(tmp,isc,(size_t)nk*sizeof(float));
+    const float thr=dsa_kth_largest(tmp,nk,keep);
+    int above=0; for(int t=0;t<nk;t++) above+=isc[t]>thr;
+    int ties=keep-above, n=0;
+    for(int t=0;t<nk;t++)
+        if(isc[t]>thr || (isc[t]==thr && ties-- > 0)) sel[n++]=t;
+    return n;
 }
 
 /* ---------- W: load-time quantization + matvec ---------- */
@@ -920,7 +918,7 @@ static size_t k3_dho_f32_bytes(const Model *m){
 static int k3c_fit_now(Model *m, int tier_on, int cuda_on);   /* kimi_k3_chain.h */
 static void k3_dho_decide(Model *m, int tier_on, int cuda_on){
     if(!g_k3_vk) return;
-    int chain=!cuda_on&&!k3_dsa_indexer_on()&&coli_vk_chain_decide(NULL,tier_on,COLI_VK_CHAIN_UNMEASURED)!=COLI_VK_CHAIN_OFF;
+    int chain=!cuda_on&&coli_vk_chain_decide(NULL,tier_on,COLI_VK_CHAIN_UNMEASURED)!=COLI_VK_CHAIN_OFF;
     int dense_on=coli_vk_dense()||chain;
     if(k3c_fit_now(m,tier_on,cuda_on)){   /* a partial chain: its layers, and the head with the tail */
         g_k3_dho_layers=g_k3_fit.n; g_k3_dho_head=g_k3_fit.n==m->c.n_layers&&g_k3_fit.tail;
@@ -999,26 +997,34 @@ static void load_cfg(Cfg *c, const char *snap){
     if(!kl||kl->t!=J_ARR){ fprintf(stderr,"config.json: missing kda_layers\n"); exit(1); }
     for(int i=0;i<kl->len;i++){ int v=(int)kl->kids[i]->num;      /* 1-indexed */
         if(v>=1&&v<=c->n_layers) c->is_kda[v-1]=1; }
-    /* DSA indexer (optional — if absent in config, DSA is disabled) */
-    { jval *jn=json_get(tc,"index_hd");   c->index_hd   = jn&&jn->t==J_NUM ? (int)jn->num : 0; }
-    { jval *jn=json_get(tc,"index_nh");   c->index_nh   = jn&&jn->t==J_NUM ? (int)jn->num : 0; }
-    { jval *jn=json_get(tc,"index_topk"); c->index_topk = jn&&jn->t==J_NUM ? (int)jn->num : 0; }
-    if(c->index_hd > 0){
-        /* Default: all MLA layers are "full" DSA layers (compute own Ic + top-K) */
-        for(int i=0;i<c->n_layers;i++) if(!c->is_kda[i]) c->idx_type[i]=1;
-        jval *il=json_get(tc,"index_layers");
-        if(il && il->t==J_ARR){
-            /* Override: explicit list of 1-indexed full DSA layers */
-            memset(c->idx_type, 0, sizeof(c->idx_type));
-            for(int i=0;i<il->len;i++){ int v=(int)il->kids[i]->num;
-                if(v>=1&&v<=c->n_layers) c->idx_type[v-1]=1; }
-        }
-    }
-    /* the DSA indexer ropes the first qk_rope_head_dim floats of each of its index_hd-long
-     * rows (dsa_rope) */
-    if(c->index_hd > 0 && c->index_hd < c->qk_rope){
-        fprintf(stderr,"config.json: index_hd=%d is shorter than qk_rope_head_dim=%d, which the "
-                       "indexer ropes in each of its rows\n",c->index_hd,c->qk_rope); exit(1); }
+    /* DSA (Kimi K3.1): text_config.dsa_config. K3 has none: its full layers attend densely */
+    { jval *dc=json_get(tc,"dsa_config");
+      if(dc && dc->t==J_OBJ && !k3_dsa_off()){
+        jval *jh=json_get(dc,"index_head_dim"), *jn=json_get(dc,"index_num_heads"), *jk=json_get(dc,"index_topk"),
+             *jr=json_get(dc,"index_rope_dim"), *jf=json_get(dc,"index_topk_freq"),
+             *jt=json_get(dc,"index_k_norm_type"), *jl=json_get(dc,"dsa_layers");
+        c->index_hd   = jh&&jh->t==J_NUM ? (int)jh->num : 0;
+        c->index_nh   = jn&&jn->t==J_NUM ? (int)jn->num : 0;
+        c->index_topk = jk&&jk->t==J_NUM ? (int)jk->num : 0;
+        if(c->index_hd<1||c->index_hd>512||c->index_nh<1||c->index_nh>256||c->index_topk<1){
+            fprintf(stderr,"config.json: dsa_config wants index_head_dim 1..512, index_num_heads 1..256 "
+                           "and index_topk >= 1\n"); exit(1); }
+        if(jr && jr->t==J_NUM && jr->num!=0){
+            fprintf(stderr,"config.json: dsa_config.index_rope_dim=%d: this engine's indexer has no rotary "
+                           "part (Kimi K3.1's is 0)\n",(int)jr->num); exit(1); }
+        if(jf && jf->t==J_NUM && jf->num!=1){
+            fprintf(stderr,"config.json: dsa_config.index_topk_freq=%d: this engine runs every DSA layer's "
+                           "own selection (1)\n",(int)jf->num); exit(1); }
+        if(jt && jt->t==J_STR && jt->str && strcmp(jt->str,"layernorm")){
+            fprintf(stderr,"config.json: dsa_config.index_k_norm_type=%s: the indexer's key norm here is a "
+                           "LayerNorm\n",jt->str); exit(1); }
+        if(jl && jl->t==J_ARR){
+            for(int i=0;i<jl->len;i++){ int v=(int)jl->kids[i]->num;      /* 1-indexed */
+                if(v<1||v>c->n_layers||c->is_kda[v-1]){
+                    fprintf(stderr,"config.json: dsa_layers names layer %d, not a full-attention one\n",v); exit(1); }
+                c->idx_type[v-1]=1; }
+        } else for(int i=0;i<c->n_layers;i++) if(!c->is_kda[i]) c->idx_type[i]=1;
+      } }
     jval *b=json_get(root,"bos_token_id"); if(!b) b=json_get(tc,"bos_token_id");
     c->bos = b&&b->t==J_NUM ? (int)b->num : -1;
     jval *e=json_get(root,"eos_token_id"); if(!e) e=json_get(tc,"eos_token_id");
@@ -1293,13 +1299,15 @@ static void model_init_range(Model *m, const char *snap, int layer_begin,
             w_load(m,&a->g,NM("model.layers.%d.self_attn.g_proj.weight",i),c->n_heads*c->v_head,c->hidden,mbits);
             a->qa_ln =f32_load(m,NM("model.layers.%d.self_attn.q_a_layernorm.weight",i),c->q_lora);
             a->kva_ln=f32_load(m,NM("model.layers.%d.self_attn.kv_a_layernorm.weight",i),c->kv_lora);
-            /* DSA indexer weights – only for "full" layers (idx_type=1) */
-            if(c->index_hd > 0 && c->idx_type[i] && k3_dsa_indexer_on()){
-                w_load(m,&a->wk,NM("model.layers.%d.self_attn.w_k.weight",i),(int64_t)c->index_hd,c->hidden,mbits);
-                w_load(m,&a->wq,NM("model.layers.%d.self_attn.w_q.weight",i),(int64_t)c->index_hd,c->q_lora,mbits);
-                w_load(m,&a->wp,NM("model.layers.%d.self_attn.w_p.weight",i),(int64_t)c->index_hd,c->hidden,mbits);
-                a->knw=f32_load(m,NM("model.layers.%d.self_attn.kn_w",i),(int64_t)c->index_hd);
-                a->knb=f32_load(m,NM("model.layers.%d.self_attn.kn_b",i),(int64_t)c->index_hd);
+            /* the DSA indexer of K3.1's dsa_layers */
+            if(c->index_hd > 0 && c->idx_type[i]){
+                w_load(m,&a->wq,NM("model.layers.%d.self_attn.indexer.wq_b.weight",i),
+                       (int64_t)c->index_nh*c->index_hd,c->q_lora,mbits);
+                w_load(m,&a->wk,NM("model.layers.%d.self_attn.indexer.wk.weight",i),(int64_t)c->index_hd,c->hidden,mbits);
+                w_load(m,&a->wp,NM("model.layers.%d.self_attn.indexer.weights_proj.weight",i),
+                       (int64_t)c->index_nh,c->hidden,mbits);
+                a->knw=f32_load(m,NM("model.layers.%d.self_attn.indexer.k_norm.weight",i),(int64_t)c->index_hd);
+                a->knb=f32_load(m,NM("model.layers.%d.self_attn.indexer.k_norm.bias",i),(int64_t)c->index_hd);
             }
         }
         if(l->sparse){
@@ -1812,21 +1820,34 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
         rmsnorm_(Lrow, cv, a->kva_ln, kvl, c->eps);
         memcpy(Rrow, cv + kvl, qr * sizeof(float));
     }
-    /* DSA indexer: prefill — write K portion for full layers */
-    if(c->index_hd > 0 && c->idx_type[li] && k3_dsa_indexer_on()){
-        /* the chunk's keys in one call ([C, index_hd] from [C, hidden], rows contiguous
-         * in Ic; every kernel computes a row as the one-row call does), then per row */
+    /* DSA (K3.1): the chunk's indexer keys into Ic, in one call ([C, index_hd] from [C, hidden],
+     * rows contiguous in Ic; every kernel computes a row as the one-row call does), then each
+     * row's LayerNorm */
+    const int dsa = c->index_hd > 0 && c->idx_type[li];
+    const int64_t IQ = (int64_t)c->index_nh * c->index_hd;
+    if(dsa){
         float *ikb = mr ? falloc((int64_t)C * c->index_hd) : a->Ic + (int64_t)pos0 * c->index_hd;
         w_matmul(ikb, x, &a->wk, C);
         for(int t=0;t<C;t++){
             int pt = mr ? mr[t].pos : pos0 + t;
             float *ikd = mr ? mr[t].seq->Ic[li] + (int64_t)pt * c->index_hd : a->Ic + (int64_t)pt * c->index_hd;
             if (mr) memcpy(ikd, ikb + (int64_t)t * c->index_hd, (size_t)c->index_hd * sizeof(float));
-            rmsnorm_(ikd, ikd, a->knw, c->index_hd, c->eps);
-            if(c->qk_rope > 0)
-                dsa_rope(ikd, pt, c->qk_rope, c->theta);   /* in-place on first qk_rope dims */
+            layernorm_(ikd, a->knw, a->knb, c->index_hd, 1e-6f);
         }
         if (mr) free(ikb);
+    }
+    /* the rows whose context passes index_topk attend to the positions the indexer picks
+     * (dsa_select); the others, and every row of a K3, to all of theirs */
+    float *iq=NULL, *iw=NULL, *isc=NULL, *itmp=NULL; int *isel=NULL;
+    if(dsa){
+        int maxnt=0;
+        for(int tt=0;tt<C;tt++){ int nt=(mr?mr[tt].pos:pos0+tt)+1; if(nt>maxnt) maxnt=nt; }
+        if(maxnt > c->index_topk){
+            iq=falloc((int64_t)C*IQ); iw=falloc((int64_t)C*c->index_nh);
+            w_matmul(iq,qa,&a->wq,C); w_matmul(iw,x,&a->wp,C);
+            isc=falloc(maxnt); itmp=falloc(maxnt); isel=malloc((size_t)c->index_topk*sizeof(int));
+            if(!isel){ fprintf(stderr,"OOM dsa selection\n"); exit(1); }
+        }
     }
     w_matmul(gv,x,&a->g,C);
 #ifdef COLI_VULKAN
@@ -1837,23 +1858,30 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
         const float *Lc_=mr?mr[tt].seq->Lc[li]:m->Lc[li], *Rc_=mr?mr[tt].seq->Rc[li]:m->Rc[li];
         const float *qvt=qv+(int64_t)tt*H*qh, *gvt=gv+(int64_t)tt*H*vh;
         float *ctxt=ctx+(int64_t)tt*H*vh;
+        const int *sel=NULL; int ns=nt;          /* the positions it attends to: sel[0..ns), or 0..nt */
+        if(isel && nt > c->index_topk){
+            ns=dsa_select(isel,c->index_topk,iq+(int64_t)tt*IQ,iw+(int64_t)tt*c->index_nh,
+                          mr?mr[tt].seq->Ic[li]:a->Ic,c->index_nh,c->index_hd,nt,isc,itmp);
+            sel=isel;
+        }
         #pragma omp parallel for schedule(static)
         for(int h=0;h<H;h++){
             const float *qp=qvt+(int64_t)h*qh, *qrp=qp+c->qk_nope;
             int rbase=h*(c->qk_nope+vh);
             float qabs[4096]; memset(qabs,0,kvl*sizeof(float));
             for(int d=0;d<c->qk_nope;d++) w_addrow(&a->kvb,rbase+d,qp[d],qabs);
-            float *sc=falloc(nt);
-            for(int t=0;t<nt;t++){
+            float *sc=falloc(ns);
+            for(int j=0;j<ns;j++){
+                const int t=sel?sel[j]:j;
                 const float *Lt=Lc_+(int64_t)t*kvl, *Rt=Rc_+(int64_t)t*qr;
                 float s2=0; for(int i=0;i<kvl;i++) s2+=qabs[i]*Lt[i];
                 for(int i=0;i<qr;i++) s2+=qrp[i]*Rt[i];
-                sc[t]=s2*c->attn_scale;
+                sc[j]=s2*c->attn_scale;
             }
-            softmax_(sc,nt);
+            softmax_(sc,ns);
             float clat[4096]; memset(clat,0,kvl*sizeof(float));
-            for(int t=0;t<nt;t++){
-                const float *Lt=Lc_+(int64_t)t*kvl; float s2=sc[t];
+            for(int j=0;j<ns;j++){
+                const float *Lt=Lc_+(int64_t)(sel?sel[j]:j)*kvl; float s2=sc[j];
                 for(int i=0;i<kvl;i++) clat[i]+=s2*Lt[i];
             }
             free(sc);
@@ -1864,6 +1892,7 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
     }
     w_matmul(out,ctx,&a->o,C);
     free(qa);free(qv);free(ckv);free(gv);free(ctx);
+    free(iq);free(iw);free(isc);free(itmp);free(isel);
 }
 
 /* ---------- routed experts: LRU + pread from the shards ----------
@@ -2398,7 +2427,8 @@ static const char *k3_vk_gguf_forms(const Model *m, VktFmt *gu, VktFmt *dn, VktF
 /* The routed-expert tier's start on its device (XT: Vulkan's, or CUDA's after xt_use_cuda):
  * the experts' forms, the RAM the cache may still take, the hooks, and the warm start from
  * the history. lgu/ldn are freed here. 1 = the tier is on. */
-static int k3_tier_open(Model *m, VktFmt gu, VktFmt dn, VktFmt *lgu, VktFmt *ldn, int cap, int nmoe, size_t dense_bytes){
+static int k3_tier_open(Model *m, VktFmt gu, VktFmt dn, VktFmt *lgu, VktFmt *ldn, int cap, int nmoe, size_t dense_bytes,
+                        size_t chain_bytes){
     Cfg *c=&m->c;
     g_k3_vk_slot_bytes=(size_t)(m->e_slot+8192);
     VktConfig vc={.engine="kimi_k3",.layers=c->n_layers,.experts=c->n_experts,
@@ -2409,7 +2439,7 @@ static int k3_tier_open(Model *m, VktFmt gu, VktFmt dn, VktFmt *lgu, VktFmt *ldn
                   .ram_reserve=(size_t)(m->e_slot+8192)*(size_t)cap*(size_t)nmoe,
                   .ram_floor=(size_t)(m->e_slot+8192)*(size_t)c->topk*(size_t)nmoe,.ram_given=k3_vk_ram_given,
                   .ram_later=(size_t)g_k3_ram_later,
-                  .dense_bytes=dense_bytes,
+                  .dense_bytes=dense_bytes,.chain_bytes=chain_bytes,
                   .in_ram=k3_vk_in_ram,.ram_ctx=m,
                   .load=k3_vk_load,.release=k3_vk_unhold,.load_ctx=m,.load_batch=k3_vk_load_batch};
     const int tier_on=XT(init)(&vc,rt_counts_all());
@@ -2459,6 +2489,12 @@ static size_t k3_cu_dense_bytes(const Model *m){
  * matrices on the same device as far as its budget goes (cu_dense.h), which the tier's budget
  * leaves them. Once it is on, the per-call path (cuda_expert_apply, which uploads every routed
  * MXFP4 expert at every call) stays off: the experts the tier has not taken run on the CPU. */
+/* the CUDA chain (kimi_k3_cuchain.h, included before step_chunk_ex) */
+static int k3u_wanted(const Model *m);
+static size_t k3u_plan_bytes(const Model *m, int ctx);
+static void k3u_start(Model *m);
+static void k3u_report(void);
+static int g_k3u_on;
 static void k3_cu_tier_start(Model *m){
     Cfg *c=&m->c;
     int nmoe=0, cap=0;
@@ -2469,13 +2505,21 @@ static void k3_cu_tier_start(Model *m){
     VktFmt gu={VKT_SRC_MXFP4_E8M0,32}, dn=gu, *lgu=NULL, *ldn=NULL;
     const char *gno=m->gx?k3_vk_gguf_forms(m,&gu,&dn,&lgu,&ldn):NULL;
     if(gno){ fprintf(stderr,"[CUDA] tier kimi_k3: the GGUF's experts: %s; the tier stays off\n",gno); xt_use_cuda(0); return; }
-    const size_t dense=cud_open("kimi_k3",coli_cuda_device_at(0),k3_cu_dense_bytes(m));
-    if(k3_tier_open(m,gu,dn,lgu,ldn,cap,nmoe,dense)) g_k3_cuda=0;
+    /* the chain's layers want every dense matrix on the card: all of it with the chain's own
+     * bytes where they fit, else cu_dense.h's half of the free memory, which the chain's first
+     * layers take (kimi_k3_cuchain.h); the tier leaves the room for both */
+    const int dev=coli_cuda_device_at(0), want=k3u_wanted(m);
+    const size_t cb=want?k3u_plan_bytes(m,m->max_t>0?m->max_t:4096):0;
+    size_t dense=want?cud_open_whole("kimi_k3",dev,k3_cu_dense_bytes(m),cb):0;
+    if(!dense) dense=cud_open("kimi_k3",dev,k3_cu_dense_bytes(m));
+    if(want&&dense) k3u_start(m);
+    if(k3_tier_open(m,gu,dn,lgu,ldn,cap,nmoe,dense,g_k3u_on?cb:0)) g_k3_cuda=0;
     else { xt_use_cuda(0); g_cud.on=0; }
 }
 static void k3_cu_report(const Model *m, const char *scope){
     if(xt_cuda()) cut_report(scope,m->hits,m->miss);
     cud_report("kimi_k3");
+    k3u_report();              /* the CUDA chain's line, when it ran */
 }
 #endif
 #endif
@@ -2587,7 +2631,7 @@ static void k3_vk_tier_start(Model *m){
     else if(nmoe&&vkt_wanted()){
         atexit(coli_vk_shutdown);   /* before the tier's start, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */
         k3_tier_open(m,gu,dn,lgu,ldn,cap,nmoe,
-                     coli_vk_dense()&&!g_k3c_on&&!g_k3_dho&&!g_k3_partial?k3_vk_dense_bytes(m):0);   /* the chain's are there already; a partial chain: nothing more goes up */
+                     coli_vk_dense()&&!g_k3c_on&&!g_k3_dho&&!g_k3_partial?k3_vk_dense_bytes(m):0,0);   /* the chain's are there already; a partial chain: nothing more goes up */
     }
     if(!vkt_ready()&&!coli_vk_dense()) coli_vk_dense_decide("kimi_k3",0,1);   /* no tier after all */
     if(coli_vk_dense()){
@@ -3067,6 +3111,9 @@ static void k3_embed(Model *m, const int *ids, int pos0, int C, float *hidden){
 #ifdef COLI_VULKAN
 #include "kimi_k3_chain.h"   /* COLI_VK_CHAIN: every layer's dense chain on the device */
 #endif
+#ifdef COLI_CUDA
+#include "kimi_k3_cuchain.h" /* COLI_CUDA_CHAIN: the first layers on the CUDA device */
+#endif
 
 static float *step_chunk_ex(Model *m, const int *ids, int pos0, int C,
                             K3CancelPoll poll_cancel, void *cancel_context,
@@ -3094,6 +3141,14 @@ static float *step_chunk_ex(Model *m, const int *ids, int pos0, int C,
         if(!chain) k3c_cpu_step(m,pos0);
     }
     from=chain;
+#endif
+#ifdef COLI_CUDA
+    /* the CUDA chain's first layers (kimi_k3_cuchain.h): each row's AttnRes state after them
+     * comes back in hidden, bres and nb, and the CPU runs the rest and the head from there */
+    if(!from&&g_k3u_on){
+        from=k3u_forward(m,hidden,bres,&nb,pos0,C,poll_cancel,cancel_context,cancelled);
+        if(!from) k3u_cpu_step(m,pos0);
+    }
 #endif
     if(from<c->n_layers&&!(cancelled&&*cancelled))
         k3_layers_forward_range(m,hidden,bres,&nb,pos0,C,from,c->n_layers,
@@ -3240,11 +3295,13 @@ static void kv_alloc(Model *m, int max_t){
 
     /* the record describes those same positions, so it survives with them */
     if(!kv_prefix_grow(&m->kvp,max_t,keep)) kv_prefix_clear(&m->kvp);
-    /* DSA indexer cache — only for full layers (idx_type=1) */
+    /* the DSA indexer's keys (K3.1's dsa_layers) grow the same way: the positions kept stay */
     for(int i=0;i<c->n_layers;i++){
         Mla *a=&m->L[i].m;
-        if(c->index_hd > 0 && c->idx_type[i] && k3_dsa_indexer_on()){
-            a->Ic = falloc((int64_t)max_t * c->index_hd);
+        if(c->index_hd > 0 && c->idx_type[i]){
+            float *ic = falloc((int64_t)max_t * c->index_hd);
+            if(keep && a->Ic) memcpy(ic, a->Ic, (size_t)keep*c->index_hd*sizeof(float));
+            free(a->Ic); a->Ic = ic;
         }
     }
 }
@@ -3568,6 +3625,9 @@ static void model_state_reset(Model *m){
 #ifdef COLI_VULKAN
     k3c_host_wrote(m,1);        /* the dense chain's copy is zeros too, its MLA rows gone */
 #endif
+#ifdef COLI_CUDA
+    k3u_host_wrote(m,1);        /* the CUDA chain's too */
+#endif
     for(int i=0;i<c->n_layers;i++){
         if(m->L[i].kda){
             memset(m->kstate[i],0,(size_t)c->kda_heads*c->kda_hd*c->kda_hd*sizeof(float));
@@ -3597,7 +3657,7 @@ static void model_state_reset(Model *m){
             if(m->Lc && m->Lc[i]) free(m->Lc[i]);
             if(m->Rc && m->Rc[i]) free(m->Rc[i]);
             Mla *a=&m->L[i].m;
-            if(c->index_hd > 0 && c->idx_type[i] && a->Ic) free(a->Ic);
+            if(c->index_hd > 0 && c->idx_type[i] && a->Ic){ free(a->Ic); a->Ic=NULL; }   /* kv_alloc grows it */
         }
         if(m->Lc) free(m->Lc);
         if(m->Rc) free(m->Rc);
@@ -3666,6 +3726,9 @@ static void k3_ckpt_copy(float *blob, Model *m, int to_blob){
     Cfg *c=&m->c; size_t o=0;
 #ifdef COLI_VULKAN
     if(to_blob) k3c_sync_host(m);   /* the dense chain may hold the newest state */
+#endif
+#ifdef COLI_CUDA
+    if(to_blob) k3u_sync_host(m);   /* the CUDA chain may */
 #endif
     size_t ks=(size_t)c->kda_heads*c->kda_hd*c->kda_hd;
     size_t cw=(size_t)c->kda_proj*c->conv_k;
@@ -3830,6 +3893,9 @@ static int k3_ckpt_restore_best(Model *m, const int *ids, int np){
 #ifdef COLI_VULKAN
     k3c_host_wrote(m,0);      /* the dense chain's copy goes up again */
 #endif
+#ifdef COLI_CUDA
+    k3u_host_wrote(m,0);
+#endif
     g_k3_restored_logit=k->logit;
     k->used=++g_k3_ckpt_clock;
     if(getenv("K3_PREFIX_LOG"))
@@ -3873,6 +3939,9 @@ static int k3_park(Model *m, int np, int max_t){
 #ifdef COLI_VULKAN
     k3c_sync_host(m);    /* the dense chain may hold the newest recurrent state */
 #endif
+#ifdef COLI_CUDA
+    k3u_sync_host(m);
+#endif
     ColiParkPart *p=k3_park_parts(m,&k);
     int ok=p&&coli_park_save(&g_k3_park,&m->kvp,m->kvp.len,p,k,n);
     free(p);
@@ -3881,6 +3950,9 @@ static int k3_park(Model *m, int np, int max_t){
     kv_prefix_clear(&m->kvp);
 #ifdef COLI_VULKAN
     k3c_host_wrote(m,1);
+#endif
+#ifdef COLI_CUDA
+    k3u_host_wrote(m,1);
 #endif
     for(int i=0;i<c->n_layers;i++) if(m->L[i].kda){
         memset(m->kstate[i],0,(size_t)c->kda_heads*c->kda_hd*c->kda_hd*sizeof(float));
@@ -3897,6 +3969,9 @@ static void k3_unpark(Model *m){
     if(p&&coli_park_restore(&g_k3_park,&m->kvp,&len,m->kvp.len,K3_PARK_SPEC,p,k)){
 #ifdef COLI_VULKAN
         k3c_host_rewrote(m);
+#endif
+#ifdef COLI_CUDA
+        k3u_host_rewrote(m);
 #endif
     } else coli_park_free(&g_k3_park);
     free(p);
@@ -4159,6 +4234,9 @@ static int k3_serve_start(Model *m, Tok *T, ServeReq *q, int **ids_out, int *np_
     if(chunk<1) chunk=1; if(chunk>512) chunk=512;
 #ifdef COLI_VULKAN
     { int r=k3c_prefill_rows(m); if(r>0 && !g_lfp) chunk=r; }   /* the chain's chunk from the budget: big MoE steps */
+#endif
+#ifdef COLI_CUDA
+    { int r=k3u_prefill_rows(m); if(r>0 && !g_lfp) chunk=r; }   /* the CUDA chain's */
 #endif
     clk->t0=now_s(); clk->a0=m->t_attn; clk->e0=m->t_moe; clk->d0=m->t_eload; clk->h0=m->t_head;
     clk->hit0=m->hits; clk->miss0=m->miss;
@@ -4630,6 +4708,9 @@ int main(int argc, char **argv){
     if(chunk>512) chunk=512;
 #ifdef COLI_VULKAN
     { int r=k3c_prefill_rows(&m); if(r>0 && !g_lfp) chunk=r; }   /* the chain's chunk from the budget: big MoE steps */
+#endif
+#ifdef COLI_CUDA
+    { int r=k3u_prefill_rows(&m); if(r>0 && !g_lfp) chunk=r; }   /* the CUDA chain's */
 #endif
     if(m.trace && chunk>1){
         chunk=1;                       /* trace rows are token-major by contract */

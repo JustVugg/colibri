@@ -15,6 +15,13 @@ int coli_cuda_device_at(int index) { return 0; }
 int coli_cuda_matmul(ColiCudaTensor **tensor, float *y, const float *x, const void *weights, const float *scales,
                      int fmt, int S, int I, int O, int device, int gs) { return 0; }
 void coli_cuda_tensor_free(ColiCudaTensor *tensor) {}
+/* the CUDA chain's (kimi_k3_cuchain.h), never reached: no chain table on this backend */
+const ColiCudaChainOps *coli_cuda_chain_ops(void) { return NULL; }
+int coli_cuda_tensor_upload(ColiCudaTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O, int device) {
+    return 0;
+}
+int coli_cuda_tensor_upload_g(ColiCudaTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O, int device,
+                              int gs) { return 0; }
 int coli_cuda_expert_mxfp4(float *y, const float *x,
         const unsigned char *gw, const unsigned char *gs,
         const unsigned char *uw, const unsigned char *us,

@@ -153,6 +153,26 @@ class Qwen38PrefixServeTest(PromptCancelContract, unittest.TestCase):
         self.assertEqual((total, source), (len(second), "the live state"), log)
         self.assertGreater(n, len(self.OPENING), "the parked conversation's answer was read again\n" + log)
 
+    def test_a_new_shorter_conversation_keeps_its_own_state(self):
+        """#2703: a new conversation shorter than the last parked the old one at every turn and
+        got it back after every turn, so each of its turns read everything again. The next
+        request decides instead: from its second turn on it continues from its own state, and
+        answers as a cold engine does."""
+        new = b"5*5=25; 6*6="
+        with mock.patch.dict(os.environ, {"COLI_PARK_MIN": "16"}):
+            warm = self.spawn()
+        warm.ask("1", self.OPENING, max_tok=8)
+        reply = warm.ask("2", new, max_tok=8)
+        second = new + reply + b" 7*7="
+        got = warm.ask("3", second, max_tok=8)
+        log = warm.close()
+        self.assertIn("conversation parked for a %d-token request" % len(new), log)
+        self.assertNotIn("conversation is back", log, "the old conversation came back after the new one's turn:\n" + log)
+        self.assertEqual(got, self.cold(second), "the new conversation's second turn answered otherwise")
+        n, total, source = self.reuses(log)[-1]
+        self.assertEqual((total, source), (len(second), "the live state"), log)
+        self.assertGreater(n, len(new), "the new conversation's first turn was read again\n" + log)
+
     # a system prompt of the fixture's bytes, its markers set by Q38_HEAD_PIN_MARKS
     SYSTEM = b"(" + b"12+34=46; 7*8=56; 9-3=6; 5*5=25; 3+3=6; " * 2 + b")"
     HEAD_PIN = {"COLI_HEAD_PIN_MIN": "8", "Q38_HEAD_PIN_MARKS": "(|)"}

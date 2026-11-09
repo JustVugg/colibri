@@ -257,6 +257,11 @@ typedef struct { int S, pos_base, IH, ID, topk, pool, q_off, q_row, w_off, w_row
  * key cache (k_off, ID floats a position) in position order, colibri.c's selection; sel's row is a
  * count then the positions, -1 for a row whose context is not past topk (force: always a list) */
 typedef struct { int S, pos_base, IH, ID, topk, force, q_off, q_row, w_off, w_row, k_off, sc_row, sel_row; float rs, wsc; } CcDsaSel;
+/* Kimi K3's residual mix and activation (cuda_k3c.cuh), the Vulkan chain's vkc_ares_mix and
+ * vkc_situ with the same fields in the same order (vk_chain.h has their contract; the mix's dot
+ * and squares in double, as kimi_k3.c's res_mix). nb <= 15, y apart from x and blk. */
+typedef struct { int S, D, nb, x_off, x_row, b_off, b_row, w_off, y_off, y_row; float eps; } CcAres;
+typedef struct { int n, g_off, u_off, y_off; float b1, b2; } CcSitu;
 
 typedef struct ColiCudaChainOps {
     size_t size;
@@ -423,6 +428,9 @@ typedef struct ColiCudaChainOps {
     int  (*dsa_select)(CcBuf *iq, CcBuf *hw, CcBuf *keys, CcBuf *sc, CcBuf *sel, const CcDsaSel *p);
     /* mla_hgemv's rows on a GGUF's Q8_0 rows as the file has them, w_off in bytes */
     int  (*mla_hgemv_q8)(CcBuf *w, CcBuf *x, CcBuf *y, const CcHgemv *p);
+    /* Kimi K3's (cuda_k3c.cuh) */
+    int  (*ares_mix)(CcBuf *x, CcBuf *blk, CcBuf *prm, CcBuf *y, const CcAres *p);
+    int  (*situ)(CcBuf *g, CcBuf *u, CcBuf *y, const CcSitu *p);
 } ColiCudaChainOps;
 /* the table's size without the optional ops: a backend at least this big has the chain */
 #define CC_OPS_BASE_SIZE (offsetof(ColiCudaChainOps, route))
@@ -587,6 +595,15 @@ static inline int cc_dsa_select(CcBuf *iq, CcBuf *hw, CcBuf *keys, CcBuf *sc, Cc
 static inline int cc_mla_hgemv_q8(CcBuf *w, CcBuf *x, CcBuf *y, const CcHgemv *p) {
     return cc_glmdsa_ready() ? cc_ops()->mla_hgemv_q8(w, x, y, p) : 0;
 }
+/* Kimi K3's ops: the module has them (and GLM-5.2's and GLM-5.3's, which its chain runs with) */
+static inline int cc_k3_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return cc_glmdsa_ready() && t->size >= offsetof(ColiCudaChainOps, situ) + sizeof t->situ && t->ares_mix && t->situ;
+}
+static inline int cc_ares_mix(CcBuf *x, CcBuf *blk, CcBuf *prm, CcBuf *y, const CcAres *p) {
+    return cc_k3_ready() ? cc_ops()->ares_mix(x, blk, prm, y, p) : 0;
+}
+static inline int cc_situ(CcBuf *g, CcBuf *u, CcBuf *y, const CcSitu *p) { return cc_k3_ready() ? cc_ops()->situ(g, u, y, p) : 0; }
 /* the chain's and the backend's kernels loaded now where the backend can (an older one loads them
  * at their first launch) */
 static inline int cc_preload(void) {

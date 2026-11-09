@@ -685,6 +685,29 @@ class TemplateTest(unittest.TestCase):
         self.assertIn("\ntool-choiceThe system is invoked with `tool_choice=required`.", prompt)
         self.assertTrue(prompt.endswith("G 0\n"))
 
+    def test_kimi_renders_the_thinking_effort_as_the_reference_does(self):
+        """K3 and K3.1's template: a thinking-effort system message after the tools, its
+        values low, high and max; nothing without thinking or without an effort."""
+        body = ("`thinking_effort` guides on how much to think in your thinking channel "
+                "(not including the response channel), supported values include `low`, "
+                "`medium`, `high`, and `max`.\n"
+                "Now the system is invoked with `thinking_effort=max`.")
+        prompt = render_chat_kimi([{"role": "user", "content": "Hi"}], True, "max")
+        self.assertEqual(prompt, "K3CHAT1\n"
+                         f"Y 15 {len(body.encode('utf-8'))}\nthinking-effort{body}"
+                         "M user 2\nHiG 1\n")
+        for asked, sent in (("minimal", "low"), ("low", "low"), ("medium", "high"),
+                            ("high", "high"), ("xhigh", "max")):
+            self.assertIn(f"`thinking_effort={sent}`.", render_chat_kimi(
+                [{"role": "user", "content": "Hi"}], True, asked))
+        for thinking, effort in ((False, "max"), (True, None), (True, "none"), (True, "bogus")):
+            self.assertNotIn("thinking-effort", render_chat_kimi(
+                [{"role": "user", "content": "Hi"}], thinking, effort))
+        tools = [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]
+        prompt = render_chat_kimi([{"role": "user", "content": "Hi"}], True, "low", tools)
+        self.assertLess(prompt.index("tool-declare"), prompt.index("thinking-effort"))
+        self.assertLess(prompt.index("thinking-effort"), prompt.index("M user"))
+
     def test_kimi_renders_tool_calls_and_results(self):
         messages = [
             {"role": "user", "content": "Weather in Rome?"},

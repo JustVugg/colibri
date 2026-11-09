@@ -7,6 +7,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### New
 
+- **Kimi K3.1 Pro** (`coli pull kimi-k3.1-pro`): the checkpoint as it ships, on the Kimi K3
+  engine. K3.1 is K3's weights plus DeepSeek Sparse Attention on its 24 gated MLA layers: a
+  token whose context passes 2048 positions attends to the 2048 its indexer picks, and up to
+  2048 the attention is K3's, bit for bit. The indexer follows GLM-5.2's definition with no
+  rotary part; Moonshot ships no K3.1 modeling code, so `tools/k3_ref.py` implements it apart
+  from the engine and `make kimi-k3-tiny-check` checks a tiny K3.1 against it. The chat and the
+  tokenizer are K3's, and a thinking request's `reasoning_effort` now reaches both models as
+  their template's thinking effort (low, high, max). Both GPU chains run the indexer: the
+  Vulkan chain with GLM-5.2's selection on the device, and a new CUDA chain for Kimi K3 and
+  K3.1 (`kimi_k3_cuchain.h`, `K3_CUDA=1`): the first layers the card holds, the rest on the CPU.
+
 - **K1b's grouped planar IDOT on pre-AVX2 x86 CPUs** (`IDOT_GS=1`, #2694): a build with SSSE3 and
   without AVX2 (Sandy and Ivy Bridge) now planarizes gs64 `fmt=4` tensors and takes the integer
   kernel's SSSE3 arms; `fmt=2` keeps the pair layout there, and with `IDOT_GS` unset nothing

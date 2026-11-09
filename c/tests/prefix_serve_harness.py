@@ -325,6 +325,37 @@ class PrefixReuseContract:
         self.assertTrue(reused and held and reused[-1] >= held,
                         "the next turn read the parked conversation again:\n" + log)
 
+    # An engine that decides a parked conversation's fate at the next request rather than when
+    # the request that parked it ends (#2703) sets this, and the scenario below holds it to it.
+    PARK_DECIDES_NEXT = False
+
+    def test_a_new_shorter_conversation_keeps_its_own_state(self):
+        """#2703: an agent runs one task after another on one slot. A new conversation shorter
+        than the last parked the old one at every turn and got it back after every turn, so its
+        own state never stayed and each of its turns read everything again. From its second turn
+        on it continues from its own state, and answers as a cold engine does."""
+        if not self.PARK_DECIDES_NEXT:
+            self.skipTest("this engine brings a parked conversation back when the request ends")
+        old = (b"The capital of France is Paris, the capital of Italy is Rome, the capital of Spain is "
+               b"Madrid, the capital of Germany is Berlin, and the capital of")
+        new = b"Five times five is twenty-five, and six times six is"
+        new2 = new + b" thirty-six. Seven times seven is"
+        with mock.patch.dict(os.environ, {"COLI_PARK_MIN": "16"}):
+            warm = self.spawn()
+        warm.ask("1", old)
+        warm.ask("2", new)
+        got = warm.ask("3", new2, max_tok=8)
+        log = warm.close()
+        cold = self.spawn(log_prefix=False)
+        want = cold.ask("1", new2, max_tok=8)
+        cold.close()
+        self.assertIn("conversation parked for a", log, "the shorter conversation did not park the old one:\n" + log)
+        self.assertNotIn("conversation is back", log, "the old conversation came back after the new one's turn:\n" + log)
+        self.assertEqual(got, want, "the new conversation's second turn answered otherwise")
+        reused = [int(n) for n in re.findall(r"\[PREFIX\] reusing (\d+) of", log)]
+        self.assertTrue(reused and reused[-1] >= len(new) // 2,
+                        "the new conversation's second turn read its own first turn again:\n" + log)
+
     # An engine whose state is attention alone resumes where a prompt leaves what it holds
     # (kv_prefix_common); it sets this, and the scenario below holds it to it.
     RESUMES_MIDWAY = False

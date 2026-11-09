@@ -58,9 +58,12 @@
  * from its input rows (the chain never writes them), and the CPU runs from there.
  * COLI_VK_CHAIN_FAULT=n fakes the loss at the n-th frame.
  *
+ * Kimi K3.1's DSA layers keep their index keys on the device too (whole, even under the
+ * split; the host's copy canonical like the latent rows): past index_topk positions a
+ * row's indexer picks the positions its core reads (vkc_dsa_select, the CPU's order).
+ *
  * The chain declines (the CPU path runs, the state synced first): under the CUDA expert
- * tier, with KIMI_DSA_INDEXER=1 (its index cache is filled on the CPU), for the
- * validation dumps that read every layer on the host (K3_TRACE, K3_VALIDATE_LAYER,
+ * tier, for the validation dumps that read every layer on the host (K3_TRACE, K3_VALIDATE_LAYER,
  * K3_DEBUG_OUT), without a head (K3_LAYERS), and for a geometry past the ops' limits
  * (a KDA head above 128 floats, kv_lora above 1024, qk_rope above 128 or odd).
  *
@@ -90,8 +93,12 @@ typedef struct {
     int lo, d;                                /* its layers start at lo, on device d (vkc_device) */
     VkcBuf *prm;                              /* every norm, AttnRes weight, conv tap and KDA parameter */
     size_t *o_in, *o_post, *o_asw, *o_msw, *o_qn, *o_kn, *o_conv, *o_kda, *o_latn, o_osw, o_final;
+    size_t *o_ikw, *o_ikb;                    /* a DSA layer's (K3.1) indexer key LayerNorm: weight, bias */
     K3cKda *kda; K3cFfn *ffn; VkcMla *mla; ColiVkTensor **mg, *head;
     VkcMlaCache *kv; VkcBuf **win, **st;
+    ColiVkTensor **iwq, **iwk, **iwp;         /* a DSA layer's indexer: wq_b, wk, weights_proj */
+    VkcBuf **ik;                              /* its index keys [cap][index_hd], whole even under the split */
+    VkcBuf *ikd, *iq, *ihw, *isc, *sel;       /* the selection's scratch: new keys, queries, head weights, scores, lists */
     int *kv_valid, *mla_ord, n_mla;
     int dev_rows;                             /* device latent/rope rows a layer: cap, or the split's */
     VkcKvSplit ks;                            /* the split past the device's budget (ks.on) */
@@ -329,8 +336,11 @@ static const char *k3c_unsupported(const Model *m) {
     if (any_mla && (c->kv_lora > 1024 || c->qk_rope > 128 || (c->qk_rope & 1) || c->qk_nope > 1024 || c->q_lora < 1))
         return "an attention geometry its shaders do not take";
     if (nbmax > 15) return "more AttnRes blocks than its shader takes";
+    if (c->index_hd > 0 && (c->index_nh > 64 || c->index_nh * c->index_hd > 4096)) return "an indexer its shaders do not take";
     return NULL;
 }
+/* layer i selects with a DSA indexer (Kimi K3.1's dsa_layers) */
+static int k3c_dsa(const Model *m, int i) { return m->c.index_hd > 0 && m->c.idx_type[i] && !m->L[i].kda; }
 /* a W as k3c_w puts it on the device: its bytes there and its payload (a GGUF's blocks too) */
 static void k3c_fit_w(const W *w, size_t *b, size_t *mm) {
     int fmt = k3_vk_dev_fmt(w);
@@ -365,6 +375,11 @@ static size_t k3c_layer_bytes(const Model *m, int i, int rows, size_t *mat) {
         b += vkc_fit_buf((size_t)rows * c->kv_lora * sizeof(float)) +
              (c->qk_rope > 0 ? vkc_fit_buf((size_t)rows * c->qk_rope * sizeof(float)) : 0);
         f += (size_t)c->q_lora + c->kv_lora + (size_t)rows * (c->kv_lora + c->qk_rope);
+        if (k3c_dsa(m, i)) {   /* the indexer's matrices, its keys, its norm, its rows of the down buffer */
+            k3c_fit_w(&q->wq, &b, &mm); k3c_fit_w(&q->wk, &b, &mm); k3c_fit_w(&q->wp, &b, &mm);
+            b += vkc_fit_buf((size_t)rows * c->index_hd * sizeof(float));
+            f += 2 * (size_t)c->index_hd + (size_t)rows * c->index_hd;
+        }
     }
     if (l->sparse) {
         const Moe *o = &l->moe;
@@ -398,7 +413,7 @@ static size_t k3c_fixed_bytes(Model *m, int rows) {
 static int k3c_fit_now(Model *m, int tier_on, int cuda_on) {
     if (g_k3_fit_done) return g_k3_fit.L > 0;
     g_k3_fit_done = 1;
-    if (!g_k3_vk || cuda_on || k3_dsa_indexer_on() || k3c_unsupported(m)) return 0;
+    if (!g_k3_vk || cuda_on || k3c_unsupported(m)) return 0;
     if (coli_vk_chain_decide(NULL, tier_on, COLI_VK_CHAIN_UNMEASURED) == COLI_VK_CHAIN_OFF) return 0;
     const Cfg *c = &m->c;
     int L = c->n_layers, rows = vkc_fit_rows(256);
@@ -444,7 +459,8 @@ static int k3c_layer_up(K3Chain *ch, Model *m, int i, const char **why) {
                       c->attn_scale, VKC_ROPE_HALF, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
                       ch->prm, ch->o_qn[i], ch->o_kn[i], 0};
         ok = k3c_w(&q->qa, &t->q_a) && k3c_w(&q->qb, &t->q_b) && k3c_w(&q->kva, &t->kv_a) && k3c_w(&q->kvb, &t->kv_b) &&
-             k3c_w(&q->o, &t->o) && k3c_w(&q->g, &ch->mg[i]);
+             k3c_w(&q->o, &t->o) && k3c_w(&q->g, &ch->mg[i]) &&
+             (!k3c_dsa(m, i) || (k3c_w(&q->wq, &ch->iwq[i]) && k3c_w(&q->wk, &ch->iwk[i]) && k3c_w(&q->wp, &ch->iwp[i])));
     }
     K3cFfn *f = &ch->ffn[i];
     if (ok && l->sparse) {
@@ -482,6 +498,7 @@ static void k3c_layer_free(K3Chain *ch, Model *m, int i) {
     } else {
         k3c_drop_w(&l->m.qa, &t->q_a); k3c_drop_w(&l->m.qb, &t->q_b); k3c_drop_w(&l->m.kva, &t->kv_a);
         k3c_drop_w(&l->m.kvb, &t->kv_b); k3c_drop_w(&l->m.o, &t->o); k3c_drop_w(&l->m.g, &ch->mg[i]);
+        k3c_drop_w(&l->m.wq, &ch->iwq[i]); k3c_drop_w(&l->m.wk, &ch->iwk[i]); k3c_drop_w(&l->m.wp, &ch->iwp[i]);
     }
     if (l->sparse) {
         k3c_drop_w(NULL, &f->router); k3c_drop_w(&l->moe.lat_down, &f->down); k3c_drop_w(&l->moe.lat_up, &f->up);
@@ -516,13 +533,17 @@ static int k3c_setup_dev(Model *m, int d) {
     K3Chain *ch = calloc(1, sizeof *ch);
     if (!ch) return 0;
     ch->d = d; ch->lo = lo;
-    size_t **offs[] = {&ch->o_in, &ch->o_post, &ch->o_asw, &ch->o_msw, &ch->o_qn, &ch->o_kn, &ch->o_conv, &ch->o_kda, &ch->o_latn};
+    size_t **offs[] = {&ch->o_in, &ch->o_post, &ch->o_asw, &ch->o_msw, &ch->o_qn, &ch->o_kn, &ch->o_conv, &ch->o_kda, &ch->o_latn,
+                       &ch->o_ikw, &ch->o_ikb};
     for (size_t k = 0; k < sizeof offs / sizeof *offs; k++) if (!(*offs[k] = calloc(L, sizeof(size_t)))) return 0;
     ch->kda = calloc(L, sizeof(K3cKda)); ch->ffn = calloc(L, sizeof(K3cFfn)); ch->mla = calloc(L, sizeof(VkcMla));
     ch->mg = calloc(L, sizeof(void *)); ch->kv = calloc(L, sizeof(VkcMlaCache));
     ch->win = calloc(L, sizeof(void *)); ch->st = calloc(L, sizeof(void *));
     ch->kv_valid = calloc(L, sizeof(int)); ch->mla_ord = calloc(L, sizeof(int));
-    if (!ch->kda || !ch->ffn || !ch->mla || !ch->mg || !ch->kv || !ch->win || !ch->st || !ch->kv_valid || !ch->mla_ord) return 0;
+    ch->iwq = calloc(L, sizeof(void *)); ch->iwk = calloc(L, sizeof(void *)); ch->iwp = calloc(L, sizeof(void *));
+    ch->ik = calloc(L, sizeof(void *));
+    if (!ch->kda || !ch->ffn || !ch->mla || !ch->mg || !ch->kv || !ch->win || !ch->st || !ch->kv_valid || !ch->mla_ord ||
+        !ch->iwq || !ch->iwk || !ch->iwp || !ch->ik) return 0;
     ch->m = m; ch->nbmax = nbmax; ch->n = N;
     if (d) g_k3c2 = ch; else g_k3c = ch;
     /* the parameter arena: offsets for the chain's layers and the output mix, then one upload */
@@ -535,6 +556,7 @@ static int k3c_setup_dev(Model *m, int d) {
             ch->o_kda[i] = n; n += (size_t)c->kda_heads + P + c->kda_hd;
         } else {
             ch->o_qn[i] = n; n += c->q_lora; ch->o_kn[i] = n; n += c->kv_lora;
+            if (k3c_dsa(m, i)) { ch->o_ikw[i] = n; n += c->index_hd; ch->o_ikb[i] = n; n += c->index_hd; }
         }
         if (l->sparse) { ch->o_latn[i] = n; n += LT; }
     }
@@ -572,6 +594,10 @@ static int k3c_setup_dev(Model *m, int d) {
         } else {
             memcpy(a + ch->o_qn[i], l->m.qa_ln, c->q_lora * sizeof(float));
             memcpy(a + ch->o_kn[i], l->m.kva_ln, c->kv_lora * sizeof(float));
+            if (k3c_dsa(m, i)) {
+                memcpy(a + ch->o_ikw[i], l->m.knw, c->index_hd * sizeof(float));
+                memcpy(a + ch->o_ikb[i], l->m.knb, c->index_hd * sizeof(float));
+            }
         }
         if (l->sparse) memcpy(a + ch->o_latn[i], l->moe.lat_norm, LT * sizeof(float));
     }
@@ -626,8 +652,10 @@ static int k3c_scratch(K3Chain *ch, const Model *m, int rows) {
     int D = c->hidden, P = c->kda_proj, H = c->kda_heads, LT = c->latent, E = c->n_experts, R = c->qk_rope;
     int SI = c->moe_inter * c->n_shared, MI = SI > c->dense_inter ? SI : c->dense_inter;
     int mfull = -1; for (int i = ch->lo; i < ch->lo + ch->n; i++) if (!m->L[i].kda) { mfull = i; break; }   /* the chain's layers */
+    int dsa = 0; for (int i = ch->lo; i < ch->lo + ch->n; i++) dsa |= k3c_dsa(m, i);
+    const int IH = c->index_nh, ID = c->index_hd, ctx = m->max_t > c->index_topk ? m->max_t : c->index_topk + 1;
     size_t r = (size_t)rows;
-    ch->kvd_layer = r * (c->kv_lora + R);
+    ch->kvd_layer = r * (c->kv_lora + R + (dsa ? ID : 0));
     int ok = (mfull < 0 || g_k3c_count >= 0 || vkc_mla_scratch(&ch->sc, &ch->mla[mfull], rows)) &&
              k3c_res(&ch->x, r * D, VKC_DEV) && k3c_res(&ch->bres, r * ch->nbmax * D, VKC_DEV) &&
              k3c_res(&ch->hm, r * D, VKC_DEV) && k3c_res(&ch->nrm, r * D, VKC_DEV) && k3c_res(&ch->att, r * D, VKC_DEV) &&
@@ -641,11 +669,15 @@ static int k3c_scratch(K3Chain *ch, const Model *m, int rows) {
              k3c_res(&ch->lgd, r * E, VKC_DOWN) && k3c_res(&ch->zd, r * LT, VKC_DOWN) &&
              k3c_res(&ch->kvd, (size_t)(ch->n_mla ? ch->n_mla : 1) * ch->kvd_layer, VKC_DOWN) &&
              k3c_res(&ch->find, r * D, VKC_DOWN) && k3c_res(&ch->outd, c->vocab, VKC_DOWN) &&
-             k3c_res(&ch->routed, r * LT, VKC_UP);
+             k3c_res(&ch->routed, r * LT, VKC_UP) &&
+             (!dsa || (k3c_res(&ch->ikd, r * ID, VKC_DEV) && k3c_res(&ch->iq, r * IH * ID, VKC_DEV) &&
+                       k3c_res(&ch->ihw, r * IH, VKC_DEV) && k3c_res(&ch->isc, r * (size_t)ctx, VKC_DEV) &&
+                       k3c_res(&ch->sel, r * (1 + (size_t)c->index_topk), VKC_DEV)));
     if (g_k3c_count >= 0) {   /* count the split without allocating or changing capacities */
         if (ch->ks.on && mfull >= 0)
             g_k3c_count += (long long)r * (3LL * c->n_heads * (c->kv_lora + 2) +
-                              (long long)c->n_heads * (c->kv_lora + R) + c->kv_lora + R) * sizeof(float);
+                              (long long)c->n_heads * (c->kv_lora + R) + c->kv_lora + R +
+                              (dsa ? 1 + c->index_topk : 0)) * sizeof(float);
         return ok && (R <= 0 || k3c_res(&ch->cs, r * R, VKC_UP));
     }
     if (ok && R > 0) {   /* NoPE: the rope parts pass through a rotation by angle 0 */
@@ -684,8 +716,8 @@ static int k3c_mirror(K3Chain *ch, const Model *m, int rows) {
     int dr = ch->ks.on ? ch->ks.rows : m->max_t;
     for (int i = ch->lo; i < ch->lo + ch->n; i++) {
         if (m->L[i].kda) continue;
-        vkc_free(ch->kv[i].lat); vkc_free(ch->kv[i].rope);
-        ch->kv[i] = (VkcMlaCache){NULL, NULL, 0};
+        vkc_free(ch->kv[i].lat); vkc_free(ch->kv[i].rope); vkc_free(ch->ik[i]);
+        ch->kv[i] = (VkcMlaCache){NULL, NULL, 0}; ch->ik[i] = NULL;
         ch->kv_valid[i] = 0;
     }
     ch->cap = 0; ch->dev_rows = 0;
@@ -694,7 +726,8 @@ static int k3c_mirror(K3Chain *ch, const Model *m, int rows) {
         ch->kv[i].lat = vkc_buf((size_t)dr * c->kv_lora * sizeof(float), VKC_DEV);
         if (c->qk_rope > 0) ch->kv[i].rope = vkc_buf((size_t)dr * c->qk_rope * sizeof(float), VKC_DEV);
         ch->kv[i].cap = dr;
-        if (!ch->kv[i].lat || (c->qk_rope > 0 && !ch->kv[i].rope)) return 0;
+        if (k3c_dsa(m, i)) ch->ik[i] = vkc_buf((size_t)m->max_t * c->index_hd * sizeof(float), VKC_DEV);
+        if (!ch->kv[i].lat || (c->qk_rope > 0 && !ch->kv[i].rope) || (k3c_dsa(m, i) && !ch->ik[i])) return 0;
     }
     ch->cap = m->max_t; ch->dev_rows = dr;
     return 1;
@@ -717,17 +750,23 @@ static int k3c_push(K3Chain *ch, const Model *m, int pb, int n_rows) {
         ch->where = K3C_BOTH; ch->host_pos = pb;
     }
     for (int i = ch->lo; i < ch->lo + ch->n && ok; i++) {
+        const int ID = c->index_hd;
         if (!m->L[i].kda && ch->ks.on) {   /* the split: the window placed, its rows below pb uploaded */
             VkcKvPart pt[2] = {{1, K, m->Lc[i], 0, ch->kv[i].lat, 0, 0}, {1, R, m->Rc[i], 0, ch->kv[i].rope, 0, 0}};
             vkc_kv_place(&ch->ks, ch->mla_ord[i], pb, n_rows);
             ok = vkc_kv_push(&ch->ks, ch->mla_ord[i], pt, R ? 2 : 1, pb);
+            int t0 = ch->kv_valid[i], n = pb - t0;   /* the index keys stay whole */
+            if (ok && n > 0 && k3c_dsa(m, i))
+                ok = vkc_write(ch->ik[i], (size_t)t0 * ID, m->L[i].m.Ic + (size_t)t0 * ID, (size_t)n * ID * sizeof(float));
             ch->kv_valid[i] = pb;
             continue;
         }
         if (m->L[i].kda || ch->kv_valid[i] >= pb) continue;
         int t0 = ch->kv_valid[i], n = pb - t0;
         ok = vkc_write(ch->kv[i].lat, (size_t)t0 * K, m->Lc[i] + (size_t)t0 * K, (size_t)n * K * sizeof(float)) &&
-             (R == 0 || vkc_write(ch->kv[i].rope, (size_t)t0 * R, m->Rc[i] + (size_t)t0 * R, (size_t)n * R * sizeof(float)));
+             (R == 0 || vkc_write(ch->kv[i].rope, (size_t)t0 * R, m->Rc[i] + (size_t)t0 * R, (size_t)n * R * sizeof(float))) &&
+             (!k3c_dsa(m, i) ||
+              vkc_write(ch->ik[i], (size_t)t0 * ID, m->L[i].m.Ic + (size_t)t0 * ID, (size_t)n * ID * sizeof(float)));
         ch->kv_valid[i] = pb;
     }
     return ok;
@@ -740,6 +779,8 @@ static void k3c_pull(K3Chain *ch, Model *m, int from, int to, int pb, int n) {
         const float *kv = (const float *)vkc_ptr(ch->kvd) + (size_t)ch->mla_ord[i] * ch->kvd_layer;
         memcpy(m->Lc[i] + (size_t)pb * K, kv, (size_t)n * K * sizeof(float));
         if (R) memcpy(m->Rc[i] + (size_t)pb * R, kv + (size_t)n * K, (size_t)n * R * sizeof(float));
+        if (k3c_dsa(m, i))   /* the new index keys, after the latent and rope rows */
+            memcpy(m->L[i].m.Ic + (size_t)pb * c->index_hd, kv + (size_t)n * (K + R), (size_t)n * c->index_hd * sizeof(float));
     }
 }
 
@@ -765,17 +806,37 @@ static int k3c_kda(K3Chain *ch, const Model *m, int i, int n) {
            vkc_kda_rec_flags(hd, ch->cm, ch->kf, ch->kb, ch->kg, ch->prm, ch->st[i], ch->ky, &rp, VKC_KDA_EXP_A | VKC_KDA_K3) &&
            vkc_matmul(t->o, ch->ky, 0, ch->att, 0, n);
 }
+/* Kimi K3.1's indexer on a DSA layer, after the queries (sc.qa: the normalized q latent): the
+ * rows' index keys (LayerNorm(wk(x)), no rotary part) into the device's keys and the host's
+ * copy, then, when a row's context passes index_topk, every row's selection (the CPU's
+ * dsa_select, in its order). *active: sel holds this layer's lists. */
+static int k3c_dsa_select(K3Chain *ch, const Model *m, int i, int n, int pb, size_t ko, int *active) {
+    const Cfg *c = &m->c; const int IH = c->index_nh, ID = c->index_hd;
+    VkcMlaRow ln = {n, 1, 0, ID, 0, 0, ID, 0, pb * ID, ID, 0, 0, 0, (int)ch->o_ikw[i], (int)ch->o_ikb[i], 1, 1e-6f};
+    int ok = vkc_matmul(ch->iwk[i], ch->nrm, 0, ch->ikd, 0, n) && vkc_mla_lnorm(ch->ikd, ch->prm, ch->ik[i], &ln) &&
+             vkc_copy(ch->kvd, ko + (size_t)n * (c->kv_lora + c->qk_rope), ch->ik[i], (size_t)pb * ID, (size_t)n * ID);
+    *active = pb + n > c->index_topk;
+    if (!ok || !*active) return ok;
+    VkcDsa ds = {n, pb, IH, ID, c->index_topk, 0, 0, IH * ID, 0, IH, 0, ID, pb + n, 1 + c->index_topk,
+                 1.f / sqrtf((float)ID), 1.f / sqrtf((float)IH)};
+    return vkc_matmul(ch->iwq[i], ch->sc.qa, 0, ch->iq, 0, n) && vkc_matmul(ch->iwp[i], ch->nrm, 0, ch->ihw, 0, n) &&
+           vkc_dsa_select(ch->iq, ch->ihw, ch->ik[i], ch->isc, ch->sel, &ds);
+}
 static int k3c_mla(K3Chain *ch, const Model *m, int i, int n, int pb) {
     size_t ko = (size_t)ch->mla_ord[i] * ch->kvd_layer;
+    int active = 0, sr = 1 + m->c.index_topk;
     if (ch->ks.on)   /* the split: the new rows into their slots, the core in two parts */
         return vkc_kv_mla_qkv(&ch->ks, ch->mla_ord[i], &ch->mla[i], &ch->sc, ch->nrm, 0, n, pb, m->c.qk_rope > 0 ? ch->cs : NULL,
                               &ch->kv[i], &ch->kvtmp, ch->kvd, ko) &&
                vkc_matmul(ch->mg[i], ch->nrm, 0, ch->gate, 0, n) &&
-               vkc_kv_mla_attn(&ch->ks, ch->mla_ord[i], &ch->mla[i], &ch->sc, n, pb, 0, &ch->kv[i], NULL, 0, 0, ch->gate, 0,
-                               ch->att, 0, m->Lc[i], m->Rc[i]);
+               (!k3c_dsa(m, i) || k3c_dsa_select(ch, m, i, n, pb, ko, &active)) &&
+               vkc_kv_mla_attn(&ch->ks, ch->mla_ord[i], &ch->mla[i], &ch->sc, n, pb, 0, &ch->kv[i], active ? ch->sel : NULL, 0,
+                               active ? sr : 0, ch->gate, 0, ch->att, 0, m->Lc[i], m->Rc[i]);
     return vkc_mla_qkv(&ch->mla[i], &ch->sc, ch->nrm, 0, n, pb, m->c.qk_rope > 0 ? ch->cs : NULL, &ch->kv[i], ch->kvd, ko) &&
            vkc_matmul(ch->mg[i], ch->nrm, 0, ch->gate, 0, n) &&
-           vkc_mla_attn(&ch->mla[i], &ch->sc, n, pb, 0, &ch->kv[i], NULL, 0, 0, ch->gate, 0, ch->att, 0);
+           (!k3c_dsa(m, i) || k3c_dsa_select(ch, m, i, n, pb, ko, &active)) &&
+           vkc_mla_attn(&ch->mla[i], &ch->sc, n, pb, 0, &ch->kv[i], active ? ch->sel : NULL, 0, active ? sr : 0, ch->gate, 0,
+                        ch->att, 0);
 }
 /* SiTU-GLU MLP of nrm into out: gate, up, the activation, down */
 static int k3c_glu(K3Chain *ch, const Model *m, ColiVkTensor *g, ColiVkTensor *u, ColiVkTensor *d, int inter, VkcBuf *out, int n) {
@@ -1060,7 +1121,6 @@ static void k3c_start(Model *m, int tier_on) {
 #ifdef COLI_CUDA
         if (g_k3_cuda) no = "the CUDA expert tier is on and keeps its priority";
 #endif
-        if (!no && k3_dsa_indexer_on()) no = "KIMI_DSA_INDEXER=1 fills its index cache on the CPU";
         if (!no && g_k3_mux_slots > 1) no = "several conversations at once (KV_SLOTS): it keeps one conversation's state on the device";
         if (!no && g_k3_fit.L > 0 && g_k3_fit.n < 1) {   /* the fit's line said so: nothing of the chain on the device */
             vkc_fit_placed("kimi_k3", &g_k3_fit);
