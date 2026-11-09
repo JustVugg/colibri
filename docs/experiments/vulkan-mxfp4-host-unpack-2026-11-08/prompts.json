@@ -1,0 +1,51 @@
+[
+  {
+    "workload": "warmup",
+    "repetition": 1,
+    "warmup": true,
+    "prompt": "Benchmark f6734185f687174a warmup 1.\nReply OK.",
+    "max_tokens": 16
+  },
+  {
+    "workload": "decode_short",
+    "repetition": 1,
+    "warmup": false,
+    "prompt": "Benchmark f6734185f687174a decode_short 1.\nWrite a long numbered list of computer performance tips. Continue until the output limit. Do not conclude.",
+    "max_tokens": 128
+  },
+  {
+    "workload": "prefill_short",
+    "repetition": 1,
+    "warmup": false,
+    "prompt": "Benchmark f6734185f687174a prefill_short 1.\nReply OK.",
+    "max_tokens": 1
+  },
+  {
+    "workload": "decode_short",
+    "repetition": 2,
+    "warmup": false,
+    "prompt": "Benchmark f6734185f687174a decode_short 2.\nWrite a long numbered list of computer performance tips. Continue until the output limit. Do not conclude.",
+    "max_tokens": 128
+  },
+  {
+    "workload": "prefill_short",
+    "repetition": 2,
+    "warmup": false,
+    "prompt": "Benchmark f6734185f687174a prefill_short 2.\nReply OK.",
+    "max_tokens": 1
+  },
+  {
+    "workload": "prefill_short",
+    "repetition": 3,
+    "warmup": false,
+    "prompt": "Benchmark f6734185f687174a prefill_short 3.\nReply OK.",
+    "max_tokens": 1
+  },
+  {
+    "workload": "decode_short",
+    "repetition": 3,
+    "warmup": false,
+    "prompt": "Benchmark f6734185f687174a decode_short 3.\nWrite a long numbered list of computer performance tips. Continue until the output limit. Do not conclude.",
+    "max_tokens": 128
+  }
+]

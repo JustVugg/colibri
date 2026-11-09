@@ -1,0 +1,648 @@
+{
+  "sources": {
+    "base": {
+      "c/vk_tier.c": "b2f64c067b1791dac04fb568fd99dcd35901485706553324766e1ead94be97c8",
+      "c/tests/bench_host_pairs.c": "a2e46525f8a3df50895d3ce0d417efef00be7b2895e15858aa70cc51e55d94db",
+      "commit": "f5d65566de468c8e7ac285a5e8c7257bf4d06856"
+    },
+    "candidate": {
+      "c/vk_tier.c": "b2720941ceb73591197c7e0942c8be01cfaa9eeeacab2654b96b5bb4db443cb2",
+      "c/tests/bench_host_pairs.c": "a2e46525f8a3df50895d3ce0d417efef00be7b2895e15858aa70cc51e55d94db",
+      "commit": "f5d65566de468c8e7ac285a5e8c7257bf4d06856"
+    }
+  },
+  "micro": [
+    {
+      "arm": "base1",
+      "np": 1,
+      "threads": 16,
+      "rep": 1,
+      "warmup": true,
+      "us_per_pair": 1592.548281,
+      "calls": 160,
+      "output_hash": "362bf110c83924eb"
+    },
+    {
+      "arm": "base1",
+      "np": 1,
+      "threads": 16,
+      "rep": 2,
+      "warmup": true,
+      "us_per_pair": 1058.884444,
+      "calls": 160,
+      "output_hash": "4bd0497e857d11b0"
+    },
+    {
+      "arm": "base1",
+      "np": 1,
+      "threads": 16,
+      "rep": 3,
+      "warmup": false,
+      "us_per_pair": 1036.519769,
+      "calls": 160,
+      "output_hash": "362bf110c83924eb"
+    },
+    {
+      "arm": "base1",
+      "np": 1,
+      "threads": 16,
+      "rep": 4,
+      "warmup": false,
+      "us_per_pair": 1021.199875,
+      "calls": 160,
+      "output_hash": "4bd0497e857d11b0"
+    },
+    {
+      "arm": "base1",
+      "np": 1,
+      "threads": 16,
+      "rep": 5,
+      "warmup": false,
+      "us_per_pair": 1088.277112,
+      "calls": 160,
+      "output_hash": "362bf110c83924eb"
+    },
+    {
+      "arm": "base1",
+      "np": 1,
+      "threads": 16,
+      "rep": 6,
+      "warmup": false,
+      "us_per_pair": 1182.021188,
+      "calls": 160,
+      "output_hash": "4bd0497e857d11b0"
+    },
+    {
+      "arm": "base1",
+      "np": 1,
+      "threads": 16,
+      "rep": 7,
+      "warmup": false,
+      "us_per_pair": 1053.289812,
+      "calls": 160,
+      "output_hash": "362bf110c83924eb"
+    },
+    {
+      "arm": "base1",
+      "np": 2,
+      "threads": 16,
+      "rep": 1,
+      "warmup": true,
+      "us_per_pair": 1024.374819,
+      "calls": 80,
+      "output_hash": "279fb3632842d57c"
+    },
+    {
+      "arm": "base1",
+      "np": 2,
+      "threads": 16,
+      "rep": 2,
+      "warmup": true,
+      "us_per_pair": 1040.139587,
+      "calls": 80,
+      "output_hash": "8fbdb44485e09ecd"
+    },
+    {
+      "arm": "base1",
+      "np": 2,
+      "threads": 16,
+      "rep": 3,
+      "warmup": false,
+      "us_per_pair": 1019.454056,
+      "calls": 80,
+      "output_hash": "279fb3632842d57c"
+    },
+    {
+      "arm": "base1",
+      "np": 2,
+      "threads": 16,
+      "rep": 4,
+      "warmup": false,
+      "us_per_pair": 1029.724475,
+      "calls": 80,
+      "output_hash": "8fbdb44485e09ecd"
+    },
+    {
+      "arm": "base1",
+      "np": 2,
+      "threads": 16,
+      "rep": 5,
+      "warmup": false,
+      "us_per_pair": 1021.566425,
+      "calls": 80,
+      "output_hash": "279fb3632842d57c"
+    },
+    {
+      "arm": "base1",
+      "np": 2,
+      "threads": 16,
+      "rep": 6,
+      "warmup": false,
+      "us_per_pair": 1026.086356,
+      "calls": 80,
+      "output_hash": "8fbdb44485e09ecd"
+    },
+    {
+      "arm": "base1",
+      "np": 2,
+      "threads": 16,
+      "rep": 7,
+      "warmup": false,
+      "us_per_pair": 1067.352187,
+      "calls": 80,
+      "output_hash": "279fb3632842d57c"
+    },
+    {
+      "arm": "base1",
+      "np": 8,
+      "threads": 16,
+      "rep": 1,
+      "warmup": true,
+      "us_per_pair": 1016.651713,
+      "calls": 20,
+      "output_hash": "96a6e8d90351032a"
+    },
+    {
+      "arm": "base1",
+      "np": 8,
+      "threads": 16,
+      "rep": 2,
+      "warmup": true,
+      "us_per_pair": 1019.138919,
+      "calls": 20,
+      "output_hash": "d7ea9c22024a98f4"
+    },
+    {
+      "arm": "base1",
+      "np": 8,
+      "threads": 16,
+      "rep": 3,
+      "warmup": false,
+      "us_per_pair": 1014.470925,
+      "calls": 20,
+      "output_hash": "96a6e8d90351032a"
+    },
+    {
+      "arm": "base1",
+      "np": 8,
+      "threads": 16,
+      "rep": 4,
+      "warmup": false,
+      "us_per_pair": 1010.843262,
+      "calls": 20,
+      "output_hash": "d7ea9c22024a98f4"
+    },
+    {
+      "arm": "base1",
+      "np": 8,
+      "threads": 16,
+      "rep": 5,
+      "warmup": false,
+      "us_per_pair": 1010.596744,
+      "calls": 20,
+      "output_hash": "96a6e8d90351032a"
+    },
+    {
+      "arm": "base1",
+      "np": 8,
+      "threads": 16,
+      "rep": 6,
+      "warmup": false,
+      "us_per_pair": 1014.493844,
+      "calls": 20,
+      "output_hash": "d7ea9c22024a98f4"
+    },
+    {
+      "arm": "base1",
+      "np": 8,
+      "threads": 16,
+      "rep": 7,
+      "warmup": false,
+      "us_per_pair": 1010.699425,
+      "calls": 20,
+      "output_hash": "96a6e8d90351032a"
+    },
+    {
+      "arm": "candidate",
+      "np": 1,
+      "threads": 16,
+      "rep": 1,
+      "warmup": true,
+      "us_per_pair": 530.210062,
+      "calls": 160,
+      "output_hash": "362bf110c83924eb"
+    },
+    {
+      "arm": "candidate",
+      "np": 1,
+      "threads": 16,
+      "rep": 2,
+      "warmup": true,
+      "us_per_pair": 391.929463,
+      "calls": 160,
+      "output_hash": "4bd0497e857d11b0"
+    },
+    {
+      "arm": "candidate",
+      "np": 1,
+      "threads": 16,
+      "rep": 3,
+      "warmup": false,
+      "us_per_pair": 390.541244,
+      "calls": 160,
+      "output_hash": "362bf110c83924eb"
+    },
+    {
+      "arm": "candidate",
+      "np": 1,
+      "threads": 16,
+      "rep": 4,
+      "warmup": false,
+      "us_per_pair": 389.106931,
+      "calls": 160,
+      "output_hash": "4bd0497e857d11b0"
+    },
+    {
+      "arm": "candidate",
+      "np": 1,
+      "threads": 16,
+      "rep": 5,
+      "warmup": false,
+      "us_per_pair": 390.792894,
+      "calls": 160,
+      "output_hash": "362bf110c83924eb"
+    },
+    {
+      "arm": "candidate",
+      "np": 1,
+      "threads": 16,
+      "rep": 6,
+      "warmup": false,
+      "us_per_pair": 391.378556,
+      "calls": 160,
+      "output_hash": "4bd0497e857d11b0"
+    },
+    {
+      "arm": "candidate",
+      "np": 1,
+      "threads": 16,
+      "rep": 7,
+      "warmup": false,
+      "us_per_pair": 391.196606,
+      "calls": 160,
+      "output_hash": "362bf110c83924eb"
+    },
+    {
+      "arm": "candidate",
+      "np": 2,
+      "threads": 16,
+      "rep": 1,
+      "warmup": true,
+      "us_per_pair": 374.032994,
+      "calls": 80,
+      "output_hash": "279fb3632842d57c"
+    },
+    {
+      "arm": "candidate",
+      "np": 2,
+      "threads": 16,
+      "rep": 2,
+      "warmup": true,
+      "us_per_pair": 383.036525,
+      "calls": 80,
+      "output_hash": "8fbdb44485e09ecd"
+    },
+    {
+      "arm": "candidate",
+      "np": 2,
+      "threads": 16,
+      "rep": 3,
+      "warmup": false,
+      "us_per_pair": 377.52325,
+      "calls": 80,
+      "output_hash": "279fb3632842d57c"
+    },
+    {
+      "arm": "candidate",
+      "np": 2,
+      "threads": 16,
+      "rep": 4,
+      "warmup": false,
+      "us_per_pair": 379.5948,
+      "calls": 80,
+      "output_hash": "8fbdb44485e09ecd"
+    },
+    {
+      "arm": "candidate",
+      "np": 2,
+      "threads": 16,
+      "rep": 5,
+      "warmup": false,
+      "us_per_pair": 375.879256,
+      "calls": 80,
+      "output_hash": "279fb3632842d57c"
+    },
+    {
+      "arm": "candidate",
+      "np": 2,
+      "threads": 16,
+      "rep": 6,
+      "warmup": false,
+      "us_per_pair": 378.252444,
+      "calls": 80,
+      "output_hash": "8fbdb44485e09ecd"
+    },
+    {
+      "arm": "candidate",
+      "np": 2,
+      "threads": 16,
+      "rep": 7,
+      "warmup": false,
+      "us_per_pair": 377.269788,
+      "calls": 80,
+      "output_hash": "279fb3632842d57c"
+    },
+    {
+      "arm": "candidate",
+      "np": 8,
+      "threads": 16,
+      "rep": 1,
+      "warmup": true,
+      "us_per_pair": 384.070269,
+      "calls": 20,
+      "output_hash": "96a6e8d90351032a"
+    },
+    {
+      "arm": "candidate",
+      "np": 8,
+      "threads": 16,
+      "rep": 2,
+      "warmup": true,
+      "us_per_pair": 383.447475,
+      "calls": 20,
+      "output_hash": "d7ea9c22024a98f4"
+    },
+    {
+      "arm": "candidate",
+      "np": 8,
+      "threads": 16,
+      "rep": 3,
+      "warmup": false,
+      "us_per_pair": 383.224519,
+      "calls": 20,
+      "output_hash": "96a6e8d90351032a"
+    },
+    {
+      "arm": "candidate",
+      "np": 8,
+      "threads": 16,
+      "rep": 4,
+      "warmup": false,
+      "us_per_pair": 383.21525,
+      "calls": 20,
+      "output_hash": "d7ea9c22024a98f4"
+    },
+    {
+      "arm": "candidate",
+      "np": 8,
+      "threads": 16,
+      "rep": 5,
+      "warmup": false,
+      "us_per_pair": 379.097706,
+      "calls": 20,
+      "output_hash": "96a6e8d90351032a"
+    },
+    {
+      "arm": "candidate",
+      "np": 8,
+      "threads": 16,
+      "rep": 6,
+      "warmup": false,
+      "us_per_pair": 382.397063,
+      "calls": 20,
+      "output_hash": "d7ea9c22024a98f4"
+    },
+    {
+      "arm": "candidate",
+      "np": 8,
+      "threads": 16,
+      "rep": 7,
+      "warmup": false,
+      "us_per_pair": 382.745056,
+      "calls": 20,
+      "output_hash": "96a6e8d90351032a"
+    },
+    {
+      "arm": "base2",
+      "np": 1,
+      "threads": 16,
+      "rep": 1,
+      "warmup": true,
+      "us_per_pair": 1232.529906,
+      "calls": 160,
+      "output_hash": "362bf110c83924eb"
+    },
+    {
+      "arm": "base2",
+      "np": 1,
+      "threads": 16,
+      "rep": 2,
+      "warmup": true,
+      "us_per_pair": 1023.542025,
+      "calls": 160,
+      "output_hash": "4bd0497e857d11b0"
+    },
+    {
+      "arm": "base2",
+      "np": 1,
+      "threads": 16,
+      "rep": 3,
+      "warmup": false,
+      "us_per_pair": 1028.368306,
+      "calls": 160,
+      "output_hash": "362bf110c83924eb"
+    },
+    {
+      "arm": "base2",
+      "np": 1,
+      "threads": 16,
+      "rep": 4,
+      "warmup": false,
+      "us_per_pair": 1028.145756,
+      "calls": 160,
+      "output_hash": "4bd0497e857d11b0"
+    },
+    {
+      "arm": "base2",
+      "np": 1,
+      "threads": 16,
+      "rep": 5,
+      "warmup": false,
+      "us_per_pair": 1203.3078,
+      "calls": 160,
+      "output_hash": "362bf110c83924eb"
+    },
+    {
+      "arm": "base2",
+      "np": 1,
+      "threads": 16,
+      "rep": 6,
+      "warmup": false,
+      "us_per_pair": 1126.83475,
+      "calls": 160,
+      "output_hash": "4bd0497e857d11b0"
+    },
+    {
+      "arm": "base2",
+      "np": 1,
+      "threads": 16,
+      "rep": 7,
+      "warmup": false,
+      "us_per_pair": 1031.362794,
+      "calls": 160,
+      "output_hash": "362bf110c83924eb"
+    },
+    {
+      "arm": "base2",
+      "np": 2,
+      "threads": 16,
+      "rep": 1,
+      "warmup": true,
+      "us_per_pair": 1125.535181,
+      "calls": 80,
+      "output_hash": "279fb3632842d57c"
+    },
+    {
+      "arm": "base2",
+      "np": 2,
+      "threads": 16,
+      "rep": 2,
+      "warmup": true,
+      "us_per_pair": 1023.9649,
+      "calls": 80,
+      "output_hash": "8fbdb44485e09ecd"
+    },
+    {
+      "arm": "base2",
+      "np": 2,
+      "threads": 16,
+      "rep": 3,
+      "warmup": false,
+      "us_per_pair": 1137.5358,
+      "calls": 80,
+      "output_hash": "279fb3632842d57c"
+    },
+    {
+      "arm": "base2",
+      "np": 2,
+      "threads": 16,
+      "rep": 4,
+      "warmup": false,
+      "us_per_pair": 1049.856037,
+      "calls": 80,
+      "output_hash": "8fbdb44485e09ecd"
+    },
+    {
+      "arm": "base2",
+      "np": 2,
+      "threads": 16,
+      "rep": 5,
+      "warmup": false,
+      "us_per_pair": 1039.260838,
+      "calls": 80,
+      "output_hash": "279fb3632842d57c"
+    },
+    {
+      "arm": "base2",
+      "np": 2,
+      "threads": 16,
+      "rep": 6,
+      "warmup": false,
+      "us_per_pair": 1052.464356,
+      "calls": 80,
+      "output_hash": "8fbdb44485e09ecd"
+    },
+    {
+      "arm": "base2",
+      "np": 2,
+      "threads": 16,
+      "rep": 7,
+      "warmup": false,
+      "us_per_pair": 1055.980231,
+      "calls": 80,
+      "output_hash": "279fb3632842d57c"
+    },
+    {
+      "arm": "base2",
+      "np": 8,
+      "threads": 16,
+      "rep": 1,
+      "warmup": true,
+      "us_per_pair": 1019.973694,
+      "calls": 20,
+      "output_hash": "96a6e8d90351032a"
+    },
+    {
+      "arm": "base2",
+      "np": 8,
+      "threads": 16,
+      "rep": 2,
+      "warmup": true,
+      "us_per_pair": 1026.099675,
+      "calls": 20,
+      "output_hash": "d7ea9c22024a98f4"
+    },
+    {
+      "arm": "base2",
+      "np": 8,
+      "threads": 16,
+      "rep": 3,
+      "warmup": false,
+      "us_per_pair": 1026.411881,
+      "calls": 20,
+      "output_hash": "96a6e8d90351032a"
+    },
+    {
+      "arm": "base2",
+      "np": 8,
+      "threads": 16,
+      "rep": 4,
+      "warmup": false,
+      "us_per_pair": 1036.718062,
+      "calls": 20,
+      "output_hash": "d7ea9c22024a98f4"
+    },
+    {
+      "arm": "base2",
+      "np": 8,
+      "threads": 16,
+      "rep": 5,
+      "warmup": false,
+      "us_per_pair": 996.667256,
+      "calls": 20,
+      "output_hash": "96a6e8d90351032a"
+    },
+    {
+      "arm": "base2",
+      "np": 8,
+      "threads": 16,
+      "rep": 6,
+      "warmup": false,
+      "us_per_pair": 995.774912,
+      "calls": 20,
+      "output_hash": "d7ea9c22024a98f4"
+    },
+    {
+      "arm": "base2",
+      "np": 8,
+      "threads": 16,
+      "rep": 7,
+      "warmup": false,
+      "us_per_pair": 1007.570719,
+      "calls": 20,
+      "output_hash": "96a6e8d90351032a"
+    }
+  ],
+  "micro_outputs_exact": true,
+  "status": "passed"
+}

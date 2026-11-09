@@ -1,0 +1,278 @@
+CPU MXFP4 host-pairs A/B/A, 2026-11-08
+Measured source base e24cd51a; source patches and immutable build identity recorded below.
+D=4096 I=2048; fmt=7, group=32; 64 synthetic experts; 160 pairs per repetition; two warmups + five measured repetitions per np/thread setting.
+CPU set 16-31, OMP_PROC_BIND=close, OMP_PLACES=cores. No GPU devices.
+Bench timing excludes output fingerprint calculation.
+
+machine.json
+{
+  "builder_image_id": "sha256:9870b4336aef63498ea3e844361bb75c7a85b9f307df2e30854e45746ff0e2cf",
+  "cpu_set": "16-31",
+  "cpu_model": "Intel(R) Xeon(R) Gold 6254 CPU @ 3.10GHz",
+  "kernel": "7.0.0-42-generic"
+}
+
+
+pr-fp4host-source.json
+{
+  "base": "e24cd51afd44b480c1e41ba82e20a28bac76c34f",
+  "patch_sha256": "6c4740f2a10665d168e8b1aedb0d80002b97b1eb70b44552263a08aea665e9f3"
+}
+
+
+pr-fp4host-base-source.json
+{
+  "base": "e24cd51afd44b480c1e41ba82e20a28bac76c34f",
+  "patch_sha256": "1b6cbf594e794975dd2edcbe9884352837a16dd213a3df60ad3ccc34c39c1ca4"
+}
+
+
+base1-micro-nt1.log
+fmt 7 D 4096 I 2048, 12.58 MB a pair
+sample np 1 nt 1 rep 1 warmup 1: 14250.159956 us a pair (160 calls), output 362bf110c83924eb
+sample np 1 nt 1 rep 2 warmup 1: 14208.050500 us a pair (160 calls), output 4bd0497e857d11b0
+sample np 1 nt 1 rep 3 warmup 0: 14243.969000 us a pair (160 calls), output 362bf110c83924eb
+sample np 1 nt 1 rep 4 warmup 0: 14241.052913 us a pair (160 calls), output 4bd0497e857d11b0
+sample np 1 nt 1 rep 5 warmup 0: 14268.526275 us a pair (160 calls), output 362bf110c83924eb
+sample np 1 nt 1 rep 6 warmup 0: 14178.701481 us a pair (160 calls), output 4bd0497e857d11b0
+sample np 1 nt 1 rep 7 warmup 0: 14240.231650 us a pair (160 calls), output 362bf110c83924eb
+np 1 nt  1: 14178.7 us a call, 14178.7 us a pair (best; mean 14234.5),   0.9 GB/s
+sample np 2 nt 1 rep 1 warmup 1: 14236.074119 us a pair (80 calls), output 279fb3632842d57c
+sample np 2 nt 1 rep 2 warmup 1: 14299.104594 us a pair (80 calls), output 8fbdb44485e09ecd
+sample np 2 nt 1 rep 3 warmup 0: 14262.532238 us a pair (80 calls), output 279fb3632842d57c
+sample np 2 nt 1 rep 4 warmup 0: 14260.098394 us a pair (80 calls), output 8fbdb44485e09ecd
+sample np 2 nt 1 rep 5 warmup 0: 14367.181319 us a pair (80 calls), output 279fb3632842d57c
+sample np 2 nt 1 rep 6 warmup 0: 14260.944469 us a pair (80 calls), output 8fbdb44485e09ecd
+sample np 2 nt 1 rep 7 warmup 0: 14280.715269 us a pair (80 calls), output 279fb3632842d57c
+np 2 nt  1: 28520.2 us a call, 14260.1 us a pair (best; mean 14286.3),   0.9 GB/s
+sample np 8 nt 1 rep 1 warmup 1: 14231.322744 us a pair (20 calls), output 96a6e8d90351032a
+sample np 8 nt 1 rep 2 warmup 1: 14294.620731 us a pair (20 calls), output d7ea9c22024a98f4
+sample np 8 nt 1 rep 3 warmup 0: 14317.067838 us a pair (20 calls), output 96a6e8d90351032a
+sample np 8 nt 1 rep 4 warmup 0: 14338.522556 us a pair (20 calls), output d7ea9c22024a98f4
+sample np 8 nt 1 rep 5 warmup 0: 14326.025612 us a pair (20 calls), output 96a6e8d90351032a
+sample np 8 nt 1 rep 6 warmup 0: 14343.861962 us a pair (20 calls), output d7ea9c22024a98f4
+sample np 8 nt 1 rep 7 warmup 0: 14254.734538 us a pair (20 calls), output 96a6e8d90351032a
+np 8 nt  1: 114037.9 us a call, 14254.7 us a pair (best; mean 14316.0),   0.9 GB/s
+
+
+base1-micro-nt16.log
+fmt 7 D 4096 I 2048, 12.58 MB a pair
+sample np 1 nt 16 rep 1 warmup 1: 1578.860775 us a pair (160 calls), output 362bf110c83924eb
+sample np 1 nt 16 rep 2 warmup 1: 1025.638531 us a pair (160 calls), output 4bd0497e857d11b0
+sample np 1 nt 16 rep 3 warmup 0: 1017.891156 us a pair (160 calls), output 362bf110c83924eb
+sample np 1 nt 16 rep 4 warmup 0: 1107.746769 us a pair (160 calls), output 4bd0497e857d11b0
+sample np 1 nt 16 rep 5 warmup 0: 1022.485181 us a pair (160 calls), output 362bf110c83924eb
+sample np 1 nt 16 rep 6 warmup 0: 1049.685113 us a pair (160 calls), output 4bd0497e857d11b0
+sample np 1 nt 16 rep 7 warmup 0: 1017.907506 us a pair (160 calls), output 362bf110c83924eb
+np 1 nt 16:  1017.9 us a call, 1017.9 us a pair (best; mean 1043.1),  12.4 GB/s
+sample np 2 nt 16 rep 1 warmup 1: 1052.239500 us a pair (80 calls), output 279fb3632842d57c
+sample np 2 nt 16 rep 2 warmup 1: 1020.783869 us a pair (80 calls), output 8fbdb44485e09ecd
+sample np 2 nt 16 rep 3 warmup 0: 1057.193519 us a pair (80 calls), output 279fb3632842d57c
+sample np 2 nt 16 rep 4 warmup 0: 1015.603312 us a pair (80 calls), output 8fbdb44485e09ecd
+sample np 2 nt 16 rep 5 warmup 0: 1013.803612 us a pair (80 calls), output 279fb3632842d57c
+sample np 2 nt 16 rep 6 warmup 0: 1015.174725 us a pair (80 calls), output 8fbdb44485e09ecd
+sample np 2 nt 16 rep 7 warmup 0: 1006.354750 us a pair (80 calls), output 279fb3632842d57c
+np 2 nt 16:  2012.7 us a call, 1006.4 us a pair (best; mean 1021.6),  12.5 GB/s
+sample np 8 nt 16 rep 1 warmup 1: 986.957375 us a pair (20 calls), output 96a6e8d90351032a
+sample np 8 nt 16 rep 2 warmup 1: 979.025125 us a pair (20 calls), output d7ea9c22024a98f4
+sample np 8 nt 16 rep 3 warmup 0: 975.443438 us a pair (20 calls), output 96a6e8d90351032a
+sample np 8 nt 16 rep 4 warmup 0: 1011.795912 us a pair (20 calls), output d7ea9c22024a98f4
+sample np 8 nt 16 rep 5 warmup 0: 980.416156 us a pair (20 calls), output 96a6e8d90351032a
+sample np 8 nt 16 rep 6 warmup 0: 978.306625 us a pair (20 calls), output d7ea9c22024a98f4
+sample np 8 nt 16 rep 7 warmup 0: 981.306037 us a pair (20 calls), output 96a6e8d90351032a
+np 8 nt 16:  7803.5 us a call,  975.4 us a pair (best; mean  985.5),  12.9 GB/s
+
+
+candidate-micro-nt1.log
+fmt 7 D 4096 I 2048, 12.58 MB a pair
+sample np 1 nt 1 rep 1 warmup 1: 4175.026600 us a pair (160 calls), output 362bf110c83924eb
+sample np 1 nt 1 rep 2 warmup 1: 4157.132169 us a pair (160 calls), output 4bd0497e857d11b0
+sample np 1 nt 1 rep 3 warmup 0: 4185.959156 us a pair (160 calls), output 362bf110c83924eb
+sample np 1 nt 1 rep 4 warmup 0: 4186.712419 us a pair (160 calls), output 4bd0497e857d11b0
+sample np 1 nt 1 rep 5 warmup 0: 4186.066331 us a pair (160 calls), output 362bf110c83924eb
+sample np 1 nt 1 rep 6 warmup 0: 4167.408175 us a pair (160 calls), output 4bd0497e857d11b0
+sample np 1 nt 1 rep 7 warmup 0: 4169.064350 us a pair (160 calls), output 362bf110c83924eb
+np 1 nt  1:  4167.4 us a call, 4167.4 us a pair (best; mean 4179.0),   3.0 GB/s
+sample np 2 nt 1 rep 1 warmup 1: 4171.006619 us a pair (80 calls), output 279fb3632842d57c
+sample np 2 nt 1 rep 2 warmup 1: 4158.110931 us a pair (80 calls), output 8fbdb44485e09ecd
+sample np 2 nt 1 rep 3 warmup 0: 4162.649888 us a pair (80 calls), output 279fb3632842d57c
+sample np 2 nt 1 rep 4 warmup 0: 4153.881063 us a pair (80 calls), output 8fbdb44485e09ecd
+sample np 2 nt 1 rep 5 warmup 0: 4178.276738 us a pair (80 calls), output 279fb3632842d57c
+sample np 2 nt 1 rep 6 warmup 0: 4186.266000 us a pair (80 calls), output 8fbdb44485e09ecd
+sample np 2 nt 1 rep 7 warmup 0: 4156.612756 us a pair (80 calls), output 279fb3632842d57c
+np 2 nt  1:  8307.8 us a call, 4153.9 us a pair (best; mean 4167.5),   3.0 GB/s
+sample np 8 nt 1 rep 1 warmup 1: 4239.492312 us a pair (20 calls), output 96a6e8d90351032a
+sample np 8 nt 1 rep 2 warmup 1: 4259.125931 us a pair (20 calls), output d7ea9c22024a98f4
+sample np 8 nt 1 rep 3 warmup 0: 4282.612256 us a pair (20 calls), output 96a6e8d90351032a
+sample np 8 nt 1 rep 4 warmup 0: 4300.746450 us a pair (20 calls), output d7ea9c22024a98f4
+sample np 8 nt 1 rep 5 warmup 0: 4269.851025 us a pair (20 calls), output 96a6e8d90351032a
+sample np 8 nt 1 rep 6 warmup 0: 4279.196431 us a pair (20 calls), output d7ea9c22024a98f4
+sample np 8 nt 1 rep 7 warmup 0: 4271.773369 us a pair (20 calls), output 96a6e8d90351032a
+np 8 nt  1: 34158.8 us a call, 4269.9 us a pair (best; mean 4280.8),   2.9 GB/s
+
+
+candidate-micro-nt16.log
+fmt 7 D 4096 I 2048, 12.58 MB a pair
+sample np 1 nt 16 rep 1 warmup 1: 480.104050 us a pair (160 calls), output 362bf110c83924eb
+sample np 1 nt 16 rep 2 warmup 1: 464.464100 us a pair (160 calls), output 4bd0497e857d11b0
+sample np 1 nt 16 rep 3 warmup 0: 464.568150 us a pair (160 calls), output 362bf110c83924eb
+sample np 1 nt 16 rep 4 warmup 0: 427.413125 us a pair (160 calls), output 4bd0497e857d11b0
+sample np 1 nt 16 rep 5 warmup 0: 360.204037 us a pair (160 calls), output 362bf110c83924eb
+sample np 1 nt 16 rep 6 warmup 0: 399.063931 us a pair (160 calls), output 4bd0497e857d11b0
+sample np 1 nt 16 rep 7 warmup 0: 371.519625 us a pair (160 calls), output 362bf110c83924eb
+np 1 nt 16:   360.2 us a call,  360.2 us a pair (best; mean  404.6),  34.9 GB/s
+sample np 2 nt 16 rep 1 warmup 1: 353.949319 us a pair (80 calls), output 279fb3632842d57c
+sample np 2 nt 16 rep 2 warmup 1: 343.528963 us a pair (80 calls), output 8fbdb44485e09ecd
+sample np 2 nt 16 rep 3 warmup 0: 347.499600 us a pair (80 calls), output 279fb3632842d57c
+sample np 2 nt 16 rep 4 warmup 0: 432.532037 us a pair (80 calls), output 8fbdb44485e09ecd
+sample np 2 nt 16 rep 5 warmup 0: 440.296431 us a pair (80 calls), output 279fb3632842d57c
+sample np 2 nt 16 rep 6 warmup 0: 373.097256 us a pair (80 calls), output 8fbdb44485e09ecd
+sample np 2 nt 16 rep 7 warmup 0: 348.965756 us a pair (80 calls), output 279fb3632842d57c
+np 2 nt 16:   695.0 us a call,  347.5 us a pair (best; mean  388.5),  36.2 GB/s
+sample np 8 nt 16 rep 1 warmup 1: 351.569906 us a pair (20 calls), output 96a6e8d90351032a
+sample np 8 nt 16 rep 2 warmup 1: 350.013619 us a pair (20 calls), output d7ea9c22024a98f4
+sample np 8 nt 16 rep 3 warmup 0: 353.398469 us a pair (20 calls), output 96a6e8d90351032a
+sample np 8 nt 16 rep 4 warmup 0: 350.074706 us a pair (20 calls), output d7ea9c22024a98f4
+sample np 8 nt 16 rep 5 warmup 0: 348.032350 us a pair (20 calls), output 96a6e8d90351032a
+sample np 8 nt 16 rep 6 warmup 0: 354.771775 us a pair (20 calls), output d7ea9c22024a98f4
+sample np 8 nt 16 rep 7 warmup 0: 346.997938 us a pair (20 calls), output 96a6e8d90351032a
+np 8 nt 16:  2776.0 us a call,  347.0 us a pair (best; mean  350.7),  36.3 GB/s
+
+
+base2-micro-nt1.log
+fmt 7 D 4096 I 2048, 12.58 MB a pair
+sample np 1 nt 1 rep 1 warmup 1: 14165.345619 us a pair (160 calls), output 362bf110c83924eb
+sample np 1 nt 1 rep 2 warmup 1: 14036.100500 us a pair (160 calls), output 4bd0497e857d11b0
+sample np 1 nt 1 rep 3 warmup 0: 14128.096269 us a pair (160 calls), output 362bf110c83924eb
+sample np 1 nt 1 rep 4 warmup 0: 14020.856269 us a pair (160 calls), output 4bd0497e857d11b0
+sample np 1 nt 1 rep 5 warmup 0: 14052.498494 us a pair (160 calls), output 362bf110c83924eb
+sample np 1 nt 1 rep 6 warmup 0: 14055.753681 us a pair (160 calls), output 4bd0497e857d11b0
+sample np 1 nt 1 rep 7 warmup 0: 14023.682212 us a pair (160 calls), output 362bf110c83924eb
+np 1 nt  1: 14020.9 us a call, 14020.9 us a pair (best; mean 14056.2),   0.9 GB/s
+sample np 2 nt 1 rep 1 warmup 1: 14014.889488 us a pair (80 calls), output 279fb3632842d57c
+sample np 2 nt 1 rep 2 warmup 1: 13895.793594 us a pair (80 calls), output 8fbdb44485e09ecd
+sample np 2 nt 1 rep 3 warmup 0: 14032.106019 us a pair (80 calls), output 279fb3632842d57c
+sample np 2 nt 1 rep 4 warmup 0: 14067.294569 us a pair (80 calls), output 8fbdb44485e09ecd
+sample np 2 nt 1 rep 5 warmup 0: 13971.752219 us a pair (80 calls), output 279fb3632842d57c
+sample np 2 nt 1 rep 6 warmup 0: 13956.286025 us a pair (80 calls), output 8fbdb44485e09ecd
+sample np 2 nt 1 rep 7 warmup 0: 14004.732950 us a pair (80 calls), output 279fb3632842d57c
+np 2 nt  1: 27912.6 us a call, 13956.3 us a pair (best; mean 14006.4),   0.9 GB/s
+sample np 8 nt 1 rep 1 warmup 1: 13939.180950 us a pair (20 calls), output 96a6e8d90351032a
+sample np 8 nt 1 rep 2 warmup 1: 13948.429906 us a pair (20 calls), output d7ea9c22024a98f4
+sample np 8 nt 1 rep 3 warmup 0: 13963.851800 us a pair (20 calls), output 96a6e8d90351032a
+sample np 8 nt 1 rep 4 warmup 0: 13998.675906 us a pair (20 calls), output d7ea9c22024a98f4
+sample np 8 nt 1 rep 5 warmup 0: 14029.308506 us a pair (20 calls), output 96a6e8d90351032a
+sample np 8 nt 1 rep 6 warmup 0: 13975.430563 us a pair (20 calls), output d7ea9c22024a98f4
+sample np 8 nt 1 rep 7 warmup 0: 14223.754350 us a pair (20 calls), output 96a6e8d90351032a
+np 8 nt  1: 111710.8 us a call, 13963.9 us a pair (best; mean 14038.2),   0.9 GB/s
+
+
+base2-micro-nt16.log
+fmt 7 D 4096 I 2048, 12.58 MB a pair
+sample np 1 nt 16 rep 1 warmup 1: 1199.491019 us a pair (160 calls), output 362bf110c83924eb
+sample np 1 nt 16 rep 2 warmup 1: 1029.408663 us a pair (160 calls), output 4bd0497e857d11b0
+sample np 1 nt 16 rep 3 warmup 0: 1022.889600 us a pair (160 calls), output 362bf110c83924eb
+sample np 1 nt 16 rep 4 warmup 0: 1023.021956 us a pair (160 calls), output 4bd0497e857d11b0
+sample np 1 nt 16 rep 5 warmup 0: 1023.095000 us a pair (160 calls), output 362bf110c83924eb
+sample np 1 nt 16 rep 6 warmup 0: 1020.342962 us a pair (160 calls), output 4bd0497e857d11b0
+sample np 1 nt 16 rep 7 warmup 0: 1056.896188 us a pair (160 calls), output 362bf110c83924eb
+np 1 nt 16:  1020.3 us a call, 1020.3 us a pair (best; mean 1029.2),  12.3 GB/s
+sample np 2 nt 16 rep 1 warmup 1: 1025.588106 us a pair (80 calls), output 279fb3632842d57c
+sample np 2 nt 16 rep 2 warmup 1: 1025.145112 us a pair (80 calls), output 8fbdb44485e09ecd
+sample np 2 nt 16 rep 3 warmup 0: 1016.629300 us a pair (80 calls), output 279fb3632842d57c
+sample np 2 nt 16 rep 4 warmup 0: 1143.155288 us a pair (80 calls), output 8fbdb44485e09ecd
+sample np 2 nt 16 rep 5 warmup 0: 1015.846619 us a pair (80 calls), output 279fb3632842d57c
+sample np 2 nt 16 rep 6 warmup 0: 1042.930881 us a pair (80 calls), output 8fbdb44485e09ecd
+sample np 2 nt 16 rep 7 warmup 0: 1018.997275 us a pair (80 calls), output 279fb3632842d57c
+np 2 nt 16:  2031.7 us a call, 1015.8 us a pair (best; mean 1047.5),  12.4 GB/s
+sample np 8 nt 16 rep 1 warmup 1: 1015.716919 us a pair (20 calls), output 96a6e8d90351032a
+sample np 8 nt 16 rep 2 warmup 1: 1013.971869 us a pair (20 calls), output d7ea9c22024a98f4
+sample np 8 nt 16 rep 3 warmup 0: 1039.918444 us a pair (20 calls), output 96a6e8d90351032a
+sample np 8 nt 16 rep 4 warmup 0: 1013.459956 us a pair (20 calls), output d7ea9c22024a98f4
+sample np 8 nt 16 rep 5 warmup 0: 1009.000194 us a pair (20 calls), output 96a6e8d90351032a
+sample np 8 nt 16 rep 6 warmup 0: 1006.208969 us a pair (20 calls), output d7ea9c22024a98f4
+sample np 8 nt 16 rep 7 warmup 0: 1034.270637 us a pair (20 calls), output 96a6e8d90351032a
+np 8 nt 16:  8049.7 us a call, 1006.2 us a pair (best; mean 1020.6),  12.5 GB/s
+
+
+base-unpack-x86-64-v3.log
+PASS 147712 cases, 10272768 exact E2M1 values; unaligned input/output, signed zero, all codes, vector/tail boundaries, guards and input preservation
+
+
+base-unpack-x86-64.log
+PASS 147712 cases, 10272768 exact E2M1 values; unaligned input/output, signed zero, all codes, vector/tail boundaries, guards and input preservation
+
+
+base-host-pairs.log
+host pairs, the integer form:
+  Q4_K/Q6_K        12 pairs of 3 experts: grouped the same bits as one by one, worst relative error 1.72e-02 against the float reference
+  IQ2_XXS/IQ3_XXS  12 pairs of 3 experts: grouped the same bits as one by one, worst relative error 1.41e-02 against the float reference
+  int4-g64 pairs   12 pairs of 3 experts: grouped the same bits as one by one, worst relative error 1.72e-02 against the float reference
+  int8 a row       12 pairs of 3 experts: grouped the same bits as one by one, worst relative error 1.27e-02 against the float reference
+  int3-g64         12 pairs of 3 experts: grouped the same bits as one by one, worst relative error 1.08e-02 against the float reference
+  MXFP4 g32        12 pairs of 3 experts: grouped the same bits as one by one, worst relative error 1.30e-02 against the float reference
+  FP8 g128         12 pairs of 3 experts: grouped the same bits as one by one, worst relative error 1.07e-06 against the float reference
+PASS
+
+
+candidate-unpack-x86-64-v3.log
+PASS 147712 cases, 10272768 exact E2M1 values; unaligned input/output, signed zero, all codes, vector/tail boundaries, guards and input preservation
+
+
+candidate-unpack-x86-64.log
+PASS 147712 cases, 10272768 exact E2M1 values; unaligned input/output, signed zero, all codes, vector/tail boundaries, guards and input preservation
+
+
+candidate-host-pairs.log
+host pairs, the integer form:
+  Q4_K/Q6_K        12 pairs of 3 experts: grouped the same bits as one by one, worst relative error 1.72e-02 against the float reference
+  IQ2_XXS/IQ3_XXS  12 pairs of 3 experts: grouped the same bits as one by one, worst relative error 1.41e-02 against the float reference
+  int4-g64 pairs   12 pairs of 3 experts: grouped the same bits as one by one, worst relative error 1.72e-02 against the float reference
+  int8 a row       12 pairs of 3 experts: grouped the same bits as one by one, worst relative error 1.27e-02 against the float reference
+  int3-g64         12 pairs of 3 experts: grouped the same bits as one by one, worst relative error 1.08e-02 against the float reference
+  MXFP4 g32        12 pairs of 3 experts: grouped the same bits as one by one, worst relative error 1.30e-02 against the float reference
+  FP8 g128         12 pairs of 3 experts: grouped the same bits as one by one, worst relative error 1.07e-06 against the float reference
+PASS
+
+
+Original-base general gate: C checks completed; Python suite initially failed 3 thread-default subtests because the wrapper exported OMP_NUM_THREADS=16.
+Initial make-check log SHA256: 8cfb9cb1e26839f19429210a7ac1d8e1bfbcd2411846598a1d53167190002756
+Corrected full Python rerun, with OMP variables unset:
+.......................................................s.....................
+----------------------------------------------------------------------
+Ran 3020 tests in 311.351s
+
+OK (skipped=394)
+Corrected Python log SHA256: 83b134a49d8b7983298776d27216084f47f3af4a8f62fd6d5b86a1668713326b
+{
+  "command": [
+    "docker",
+    "run",
+    "--rm",
+    "--name",
+    "colibri-fp4-python-recheck",
+    "--user",
+    "1001:1001",
+    "--cpuset-cpus",
+    "16-31",
+    "-e",
+    "HOME=/tmp",
+    "-v",
+    "/opt/colibri/pr-fp4host:/src",
+    "-w",
+    "/src/c",
+    "colibri-builder:xe2",
+    "env",
+    "-u",
+    "OMP_NUM_THREADS",
+    "-u",
+    "OMP_PROC_BIND",
+    "-u",
+    "OMP_PLACES",
+    "make",
+    "test-python",
+    "-j8"
+  ],
+  "exit_code": 0,
+  "elapsed_s": 312.9975697994232
+}
