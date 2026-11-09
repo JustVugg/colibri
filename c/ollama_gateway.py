@@ -26,8 +26,11 @@ end to end against Open WebUI (docs/openwebui.md).
 
 One model at a time: a request for another model stops the child and starts the next,
 and waits until its /health answers; the RAM of this machine's models (60 GB and more)
-leaves no room for two. `keep_alive: 0` unloads, as Ollama's does; any other value is
-read and ignored (the model stays loaded until another is asked for).
+leaves no room for two. `keep_alive` works as Ollama's: `0` unloads, a duration ("20m",
+"1h", seconds as a number) unloads the model once it has sat idle that long after the
+request, `-1` keeps it; a request that says nothing takes the model's `keep_alive` from
+gateway.json, else `--keep-alive` (COLI_KEEP_ALIVE; the default `-1` keeps the model until
+another is asked for, as before). A model unloads only between requests, never under one.
 """
 import argparse
 import base64
@@ -510,9 +513,12 @@ def tags_entry(entry):
             "size": int(entry.get("size") or 0), "digest": entry.get("digest", ""), "details": model_details(entry)}
 
 
-def ps_entry(entry, context_tokens=None, since=None):
+def ps_entry(entry, context_tokens=None, since=None, expires_at=None):
     out = tags_entry(entry)
-    out.update({"expires_at": "0001-01-01T00:00:00Z", "size_vram": int(entry.get("size_vram") or 0),
+    expires = "0001-01-01T00:00:00Z"
+    if expires_at is not None:
+        expires = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(expires_at)) + ".000000000Z"
+    out.update({"expires_at": expires, "size_vram": int(entry.get("size_vram") or 0),
                 "context_length": int(context_tokens or 0)})
     return out
 
@@ -656,6 +662,7 @@ class ModelRegistry:
         (an edited ctx or think is taken by the next load, no restart of the gateway)."""
         return {"params": spec.get("params"), "args": list(spec.get("args") or []), "env": dict(spec.get("env") or {}),
                 "context_length": spec.get("ctx"), "kv_slots": spec.get("kv_slots"), "think": spec.get("think"),
+                "keep_alive": spec.get("keep_alive"),
                 "license": spec.get("license", "")}
 
     def refresh(self):
@@ -733,14 +740,45 @@ class ModelRegistry:
 # ---------------------------------------------------------------------------------------
 # the child: coli serve on the engine port
 # ---------------------------------------------------------------------------------------
+def parse_keep_alive(value, default=-1.0):
+    """Ollama's keep_alive to seconds: a number is seconds (negative: keep forever), a string
+    a Go-style duration ("20m", "1h30m", "90s", "300"); 0 means unload now; None or an
+    unreadable value gives `default`."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        return -1.0 if value < 0 else float(value)
+    if not isinstance(value, str):
+        return default
+    text = value.strip().lower()
+    if not text:
+        return default
+    try:
+        number = float(text)
+        return -1.0 if number < 0 else number
+    except ValueError:
+        pass
+    total = 0.0
+    for amount, unit in re.findall(r"(\d+(?:\.\d+)?)\s*(h|m|s|ms)", text):
+        total += float(amount) * {"h": 3600.0, "m": 60.0, "s": 1.0, "ms": 0.001}[unit]
+    if total <= 0 and not re.fullmatch(r"\s*0\s*(h|m|s|ms)?\s*", text):
+        return default
+    return total
+
+
 class EngineManager:
     """One `coli serve` at a time. ensure(name) starts it for that model (stopping the one
     before) and returns when its /health answers; attached mode (engine_url given) proxies
     to a serve already running and never spawns."""
 
     def __init__(self, coli, engine_port, api_key=None, kv_slots=1, load_timeout=900.0,
-                 engine_url=None, engine_model=None, log_dir=None, extra_args=()):
+                 engine_url=None, engine_model=None, log_dir=None, extra_args=(), keep_alive=-1.0):
         self.coli = coli
+        self.keep_alive = keep_alive      # seconds a model stays loaded after its last request; < 0 forever
+        self.expires_at = None            # when the loaded model goes, None while busy or kept forever
+        self.busy = 0                     # requests under way (a model never unloads under one)
         self.engine_port = engine_port
         self.api_key = api_key
         self.kv_slots = kv_slots
@@ -800,6 +838,56 @@ class EngineManager:
             if not self.attached:
                 self._stop_locked()
 
+    # ---- keep_alive: Ollama's idle unload
+    def ttl_for(self, entry=None, request_value=None):
+        """The seconds the model stays after a request: the request's keep_alive, else the model
+        entry's, else the gateway's; < 0 means forever."""
+        if request_value is not None:
+            return parse_keep_alive(request_value, default=self.keep_alive)
+        if entry and entry.get("keep_alive") is not None:
+            return parse_keep_alive(entry["keep_alive"], default=self.keep_alive)
+        return self.keep_alive
+
+    def begin(self):
+        with self.lock:
+            self.busy += 1
+            if self.busy == 1:
+                self._expiry_before = self.expires_at   # a request that never names a model leaves the timer as it was
+            self.expires_at = None
+
+    def end(self, entry=None, request_value=None, now=None):
+        """A request ended: arm the idle timer from its keep_alive (or the model's / the gateway's)."""
+        ttl = self.ttl_for(entry, request_value)
+        with self.lock:
+            self.busy = max(0, self.busy - 1)
+            if self.busy or not self.current or self.state != "ready":
+                return
+            if entry is None and request_value is None:
+                self.expires_at = getattr(self, "_expiry_before", None)   # /api/show, /api/tags: not a use of the model
+                return
+            self.expires_at = None if ttl < 0 else (now if now is not None else time.time()) + ttl
+
+    def arm(self, entry=None, now=None):
+        """The idle timer after a load that no request asked for (the preload)."""
+        ttl = self.ttl_for(entry)
+        with self.lock:
+            if self.busy == 0 and self.current and self.state == "ready":
+                self.expires_at = None if ttl < 0 else (now if now is not None else time.time()) + ttl
+
+    def idle_check(self, now=None):
+        """Between accepts: the loaded model's keep_alive ran out with no request under way -> unload.
+        Returns the name unloaded, or None."""
+        now = time.time() if now is None else now
+        with self.lock:
+            if (self.attached or self.busy or self.expires_at is None or now < self.expires_at
+                    or not self.current or self.state != "ready"):
+                return None
+            name = self.current
+            print(f"[gateway] {name} idle for its keep_alive: unloading", file=sys.stderr, flush=True)
+            self.expires_at = None
+            self._stop_locked()
+            return name
+
     def _start_locked(self, entry):
         self.state = "loading"
         self.error = None
@@ -843,6 +931,7 @@ class EngineManager:
                 self.current = entry["name"]
                 self.state = "ready"
                 self.loaded_at = time.time()
+                self.expires_at = None
                 self.load_seconds = self.loaded_at - started
                 print(f"[gateway] {entry['name']} ready in {self.load_seconds:.1f} s", file=sys.stderr, flush=True)
                 return
@@ -981,6 +1070,9 @@ class Gateway(ThreadingHTTPServer):
         """Between accepts (serve_forever's poll): a `coli stop --port <gateway port>` left its stop
         file -- consume it (that is the acknowledgement coli stop waits for) and shut down, the
         engine child with us."""
+        unloaded = self.manager.idle_check()
+        if unloaded:
+            print(f"[gateway] {unloaded} unloaded (keep_alive)", file=sys.stderr, flush=True)
         path = self.stopfile
         if path and os.path.exists(path):
             try:
@@ -1097,7 +1189,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     if e.get("path"):
                         self.server.registry.size(e)
                     ctx = (m.health or {}).get("context_tokens")
-                    models.append(ps_entry(e, ctx))
+                    models.append(ps_entry(e, ctx, expires_at=m.expires_at))
                 return self._send(200, {"models": models})
             if path == "/api/gateway":
                 m = self.server.manager
@@ -1149,6 +1241,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
         started = time.time()
         path = urlsplit(self.path).path
         extra = ""
+        self._keep = None      # the request's keep_alive and model entry, for the idle timer
+        self._entry = None
+        m = self.server.manager
+        m.begin()
         try:
             if path in ("/api/embed", "/api/embeddings"):
                 return self._error(501, "colibri serves no embedding model; Open WebUI's own embedding engine "
@@ -1178,6 +1274,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             extra = "client gone"
         finally:
+            m.end(self._entry, self._keep)
             self._log("", started, extra or "")
 
     def _show(self, body):
@@ -1216,6 +1313,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         entry = self._model_entry(body)
         m = self.server.manager
         keep = body.get("keep_alive")
+        self._keep, self._entry = keep, entry
         if generate and not body.get("prompt") and not body.get("images"):
             # Ollama's load / unload request: an empty prompt
             if keep in (0, "0", "0s", "0m"):
@@ -1311,6 +1409,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if isinstance(body, dict):
                 try:
                     entry = self._model_entry(body)
+                    self._keep, self._entry = body.pop("keep_alive", None), entry
                     m.ensure(entry)
                 except GatewayError as error:
                     code = "model_not_found" if error.status == 404 else "model_not_loaded"
@@ -1394,6 +1493,9 @@ def main(argv=None):
     ap.add_argument("--think-in-content", action="store_true", help="reasoning as <think>...</think> in content (clients before Ollama 0.9)")
     ap.add_argument("--serve-arg", action="append", default=[], help="an extra argument for every coli serve (repeat)")
     ap.add_argument("--no-preload", action="store_true", help="do not load the default model at start")
+    ap.add_argument("--keep-alive", default=os.environ.get("COLI_KEEP_ALIVE", "-1"), metavar="DURATION",
+                    help="unload a model idle this long after its last request, as Ollama's keep_alive "
+                         "(\"20m\", \"1h\", seconds; -1 keeps it, the default); a request's or gateway.json's keep_alive wins")
     ap.add_argument("--coli", default=os.path.join(here, "coli"))
     a = ap.parse_args(argv)
     if a.host not in ("127.0.0.1", "localhost", "::1") and not a.api_key and os.environ.get("COLI_ALLOW_INSECURE_BIND") != "1":
@@ -1408,7 +1510,8 @@ def main(argv=None):
                                             "args": [], "env": {}, "context_length": None, "kv_slots": None, "license": "", "pinned": True}
     manager = EngineManager(a.coli, a.engine_port, api_key=a.api_key, kv_slots=a.kv_slots, load_timeout=a.load_timeout,
                             engine_url=a.engine_url, engine_model=a.engine_model,
-                            log_dir=os.path.join(default_home, "logs"), extra_args=a.serve_arg)
+                            log_dir=os.path.join(default_home, "logs"), extra_args=a.serve_arg,
+                            keep_alive=parse_keep_alive(a.keep_alive))
     puller = Puller(a.coli, a.models_dir, setup_home=None)
     server = Gateway((a.host, a.port), registry, manager, puller, default_model=default_model or a.engine_model,
                      api_key=a.api_key, think_in_content=a.think_in_content)
@@ -1440,6 +1543,7 @@ def main(argv=None):
             sys.exit(f"--default {default_model!r} is not a known model; known: {names}")
         try:
             manager.ensure(entry)
+            manager.arm(entry)
         except GatewayError as error:
             print(f"[gateway] {error.message}", file=sys.stderr, flush=True)
     try:
