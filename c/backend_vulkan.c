@@ -916,7 +916,8 @@ static void vk_window_decide(VkUp *u, VkPhysicalDevice phys, uint32_t memtype, i
     free(blk);
     if (got >= want) {
         fprintf(stderr, "[VK] %smemory: mapped weights, the host-visible device-local memory gave the %d GiB asked (%s, "
-                "less if its budget leaves less), found in %.1f s%s\n", tag, got, ask, ms / 1000.0, by);        vk_window_mapped(u);
+                "less if its budget leaves less), found in %.1f s%s\n", tag, got, ask, ms / 1000.0, by);
+        vk_window_mapped(u);
         return;
     }
     u->on = 1;
@@ -924,13 +925,15 @@ static void vk_window_decide(VkUp *u, VkPhysicalDevice phys, uint32_t memtype, i
              "less if its budget leaves less), found in %.1f s%s", got, want, ask, ms / 1000.0, by);
 }
 /* Trunk-first placement (the deepseek_v41 engine): the engine's dense trunk is placed on the device BEFORE the
- * mapped-weights window is asked. The chain fit that sizes the trunk then reads the device's real free memory —
- * asking first, 9/10 of the heap in blocks that go back, left a driver that reports the budget only once they
- * are back showing the fit a few hundred MiB, and the trunk stayed on the CPU while the tier filled the window
- * — and the ask (vk_window_decide above, trunk_first) leaves what the heap has beside the trunk. The engine
- * calls coli_vk_window_trunk_first before coli_vk_init (the deferral is decided there) and the ask,
- * coli_vk_window_trunk_ask, once its trunk is placed; an engine that never asks it keeps the mapped path, as a
- * probe that said yes does. Other engines are untouched: nothing of this runs without the opt-in. */
+ * mapped-weights window is asked. The chain fit that sizes the trunk then reads the device's real free memory (on
+ * a card left mapped with the small host-visible window of vk_mem_window, that window's cap, set at the device's
+ * start, is what it reads) — asking first, 9/10 of the heap in blocks that go back, left a driver that reports
+ * the budget only once they are back showing the fit a few hundred MiB, and the trunk stayed on the CPU while
+ * the tier filled the window — and the ask (vk_window_decide above, trunk_first) leaves what the heap has
+ * beside the trunk. The engine calls coli_vk_window_trunk_first before coli_vk_init (the deferral is decided
+ * there) and the ask, coli_vk_window_trunk_ask, once its trunk is placed; an engine that never asks it keeps
+ * the mapped path, as a probe that said yes does. Other engines are untouched: nothing of this runs without
+ * the opt-in. */
 static int g_win_trunk_first, g_win_trunk_deferred;   /* the engine asked; the ask was deferred (owed until it runs) */
 static void vk_window_up_decided(void);   /* after up_destroy, below */
 void coli_vk_window_trunk_first(void) { g_win_trunk_first = 1; }
@@ -1039,9 +1042,12 @@ static void up_destroy(VkUp *u) {
     for (int s = 0; s < VK_UP_SLOTS; s++) { u->fence[s] = VK_NULL_HANDLE; u->cmd[s] = VK_NULL_HANDLE; u->pending[s] = 0; }
     u->open = 0; u->used = 0; u->cur = 0; u->failed = u->lost = 0; u->what = NULL;
 }
+/* vk_mem_window ran (its cap is the mapped window, not COLI_VK_DEVICE_CAP_MB): see vk_window_up_decided. */
+static int g_win_window_once;
 /* The window's decision is made (vk_window_decide): the uploader's own pieces when it took the staged path, the
- * host memory it can copy straight from, and — on a device that stayed mapped — the Resizable-BAR sanity
- * warnings (#523: on discrete cards the weight tiers want HOST_VISIBLE|DEVICE_LOCAL; with ReBAR disabled that
+ * host memory it can copy straight from, and — on a device that stayed mapped — the mapped window's cap
+ * (vk_mem_window) and the Resizable-BAR sanity warnings (#523: on discrete cards the weight tiers want
+ * HOST_VISIBLE|DEVICE_LOCAL; with ReBAR disabled that
  * combination exists only in a ~256 MB BAR window (or not at all), so tier allocations silently land in system
  * RAM and every access crosses PCIe — measurably slower than the CPU path while the resident-experts log still
  * reports an apparently healthy VRAM tier; staged uploads (VkUp) are the answer, the warnings are for a device
@@ -1054,8 +1060,13 @@ static void vk_window_up_decided(void) {
         g_up[0].on = g_up[0].shared = 0;
     }
     up_import_init(&g_up[0], G.phys, G.has_hostmem, "");
-    /* a card left on the mapped path without Resizable BAR plans with its window (vk_mem_window) */
-    const uint64_t window = g_up[0].on ? 0 : vk_mem_window(0, G.phys, G.memtype);
+    /* A discrete card left on the mapped path whose host-visible device-local heap is under a quarter of the
+     * card holds its resident data in that window, which becomes the device's cap (see vk_mem_window). Once
+     * only: a trunk-first ask runs this function a second time (coli_vk_window_trunk_ask), and vk_mem_window
+     * tells a COLI_VK_DEVICE_CAP_MB cap from the one it set itself by cap[0] != 0 — a second run would read its
+     * own cap as the user's, skip the window's type mask and its recount, and print its line again. */
+    const uint64_t window = g_up[0].on || g_win_window_once ? 0 : vk_mem_window(0, G.phys, G.memtype);
+    if (window) g_win_window_once = 1;
     VkPhysicalDeviceMemoryProperties mp;
     vkGetPhysicalDeviceMemoryProperties(G.phys, &mp);
     VkDeviceSize dl_max = 0;
@@ -1077,7 +1088,7 @@ static void vk_window_up_decided(void) {
                 "will live in system RAM and every access crosses PCIe (expect slower than "
                 "CPU-only). On a discrete card, enable Resizable BAR in the BIOS or leave "
                 "COLI_VK_STAGED unset.\n");
-    else if (dl_max && !integrated && hv_dl * 4 < dl_max && !window)
+    else if (dl_max && !integrated && hv_dl * 4 < dl_max && !window && !g_win_window_once)
         fprintf(stderr, "[VK] warning: only %llu of %llu MB VRAM is host-visible (Resizable BAR "
                 "appears disabled). Enable Resizable BAR / Smart Access Memory in the BIOS, "
                 "or leave COLI_VK_STAGED unset.\n",
