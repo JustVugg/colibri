@@ -561,8 +561,9 @@ a forward (mode 14), so the host's state stays fp32 holding the dequantized valu
 rollback, prefix reuse and a lost device still rebuild nothing.
 
 The arithmetic at the released geometry, per token across the layers: about **6,400 B
-of mirror a position today against about 890 B quantized** (528 for the window plus the
-compressed rows' and index keys' 288 and 68 over each layer's compression ratio) — the
+of mirror a position today against about 890 B quantized** (the compressed rows and
+index keys alone: 2.5 rows a position over the layers' compression ratios × (288 + 68) B;
+the window rings are the planner's fixed term, not a per-position cost) — the
 figures of the prefill-VRAM analysis
 ([dsv41-prefill-vram-2026-11-06](experiments/dsv41-prefill-vram-2026-11-06.md), whose
 §10 parked this as the lever that scales with context: 0.31 GiB of mirrors at 64K
@@ -620,8 +621,8 @@ so `=2` does not rescue them. The defensible wins are the guard margin at ≥64K
 4x longer (the quantized mirror crosses the ~1 GiB reserve near 640K of ckv/ikey
 against fp32's 160K), and -- only through an explicit `COLI_VK_TIER_GB` raise, since
 the tier's budget is fixed before the mirrors exist -- more device experts (at 128K:
-+35 of 167). The 34-touchpoint map of every site that moved is in the implementation
-notes for #2701's follow-up (`track_D-A_host_kv_map.md` in the session artifacts).
++35 of 167). The 34 touchpoints — every writer, read path, boundary and planner price that moved —
+are itemized in #2701's follow-up.
 
 ### Where the VRAM goes at a turn's end
 
