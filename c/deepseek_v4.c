@@ -12671,9 +12671,9 @@ void coli_v4_gpu_head_upload(ColiV4Engine *engine) {
     if (rows < 1 || rows % 32 || cols < 1 || cols % 8 ||
         engine->head_cache.bytes != (uint64_t)rows * cols * 2) return;
     long long reserve = v4_gpu_resident_reserve_mb();
-    long long need = ((long long)rows * cols * 4 + 1048575) / 1048576;
+    long long need = ((long long)rows * cols * 2 + 1024LL * cols * 2 + 1048575) / 1048576;
     /* After expert preloading: never displace complete banks to fit the head.
-     * Packing temporarily needs both copies; final residency retains one.
+     * The upload packs through a staging buffer of at most 1024 rows: the head plus that.
      * Prefer the owning (last) device, then any other with room, rather than
      * always pinning the head to device 0. */
     int count = engine->gpu.device_count > 0 ? engine->gpu.device_count : 1;
