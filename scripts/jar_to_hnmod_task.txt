@@ -1,0 +1,49 @@
+TASK: Write a single-file Python 3 program `jar_to_hnmod.py` that converts ANY Minecraft mod `.jar` into a `.hnmod` native-mod package.
+
+You must NOT read, open, or reference any existing `.hnmod` file. The `.hnmod` format is defined ONLY by the spec below (designed from first principles). Implement exactly this spec.
+
+CLI:
+    python jar_to_hnmod.py INPUT.jar [-o OUTPUT.hnmod]
+Default OUTPUT = INPUT basename with extension replaced by `.hnmod`, written next to CWD or as given by -o. Exit code 0 on success, non-zero on failure. Use only the Python standard library.
+
+=== .hnmod v1 SPEC ===
+A `.hnmod` is a ZIP archive (ZIP_DEFLATED) containing exactly these member groups (no directory entries needed):
+
+1. `hnmod.json` — UTF-8 JSON manifest with keys:
+   {
+     "format": "hnmod",
+     "format_version": 1,
+     "id": <mod id>,
+     "name": <display name>,
+     "version": <version string>,
+     "description": <string>,
+     "authors": [<string>, ...],
+     "license": <string>,
+     "source_loader": one of "neoforge" | "forge" | "fabric" | "quilt" | "unknown",
+     "source_file": <basename of the input jar>,
+     "dependencies": [ {"id": <str>, "type": <str>, "version_range": <str>} , ...],
+     "counts": {"assets": <int>, "data": <int>, "classes": <int>, "resources": <int>}
+   }
+
+2. `assets/<path>` — every FILE entry of the jar under `assets/`, stored at the SAME path, byte-identical.
+3. `data/<path>`   — every FILE entry of the jar under `data/`, stored at the SAME path, byte-identical.
+4. `code/<path>`   — every FILE entry of the jar whose name ends with `.class`, stored under `code/` + its original full path (e.g. `code/appeng/Foo.class`), byte-identical.
+5. `resources/<path>` — every remaining FILE entry that is NOT under `assets/`, NOT under `data/`, and does NOT end with `.class` (this includes root files like `pack.mcmeta`, `logo.png`, `*.mixins.json` AND nested files like `META-INF/*`), stored under `resources/` + original full path, byte-identical.
+
+Metadata extraction (pick the FIRST present, in this order):
+- `META-INF/neoforge.mods.toml`  -> source_loader "neoforge"; read first [[mods]] table: modId, version, displayName, description, authors, license; dependencies from [[dependencies.<modId>]] (modId, type, versionRange).
+- `META-INF/mods.toml`           -> source_loader "forge"; same TOML layout as neoforge.
+- `fabric.mod.json`              -> source_loader "fabric"; JSON: id, name, version, description, authors (list of str or {name}), license; dependencies = keys of "depends" (type "required", version_range = value).
+- `quilt.mod.json`               -> source_loader "quilt"; JSON under "quilt_loader": id, version; metadata under "metadata": name, description, authors, license.
+- `mcmod.info`                   -> source_loader "forge"; JSON list, first element: modid, name, version, description, authorList, credits.
+- none present                   -> source_loader "unknown"; id = input jar basename without extension; name = id; version = "0.0.0"; description ""; authors []; license ""; dependencies [].
+
+Rules:
+- Skip ZIP directory entries (names ending in '/').
+- `counts` must equal the actual number of FILE members written in each of assets/data/classes/resources.
+- authors always a list of strings (split a TOML authors string on ',' if needed; flatten fabric {name} objects).
+- Missing optional manifest fields default to "" (strings) or [] (lists); never omit a required key.
+- Byte-identical means the stored bytes equal the jar entry bytes exactly.
+- The program must not crash on jars lacking metadata, and must not require network access.
+
+Deliver ONLY the complete Python source of jar_to_hnmod.py (no explanations).
