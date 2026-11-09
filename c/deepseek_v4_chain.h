@@ -1488,10 +1488,11 @@ static void v4c_report(void) {
         if (!ch || !ch->ok || !ch->forwards) continue;
         int was = vkc_device(d);
         VkcStats st; vkc_stats(&st);
-        fprintf(stderr, "[VK] %s chain: %llu forwards, %llu frames (%llu ops, %llu matmuls, %llu tiled GEMM), "
-                        "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %.1f MiB on the device\n",
-                v4c_name(ch), ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, st.wait_ms, ch->host_ms,
-                st.dev_bytes / 1048576.0);
+        fprintf(stderr, "[VK] %s chain: %llu forwards, %llu frames (%llu ops, %llu matmuls, %llu tiled GEMM, "
+                        "%llu indexer tiles), %.1f ms waiting for the device, %.1f ms of routed experts on "
+                        "the host, %.1f MiB on the device\n",
+                v4c_name(ch), ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, st.dsa_tiled, st.wait_ms,
+                ch->host_ms, st.dev_bytes / 1048576.0);
         vkc_kv_report(&ch->ks);
         vkc_prof_print();
         vkc_device(was);

@@ -69,6 +69,7 @@
 
 #include "cpu_check.h"   /* the processor runs what this build assumes, or it says so (#1979) */
 #include "compat.h"
+#include "coli_env.h"
 #include "json.h"
 #include "st.h"
 #include "qwen38_nfc.h"
@@ -1761,6 +1762,8 @@ static int run_split(const char *path)
 
 int main(int argc, char **argv)
 {
+    coli_env_check(CE_GLINER, "gliner_decide");
+    coli_env_dump(CE_GLINER, "gliner_decide");
     const char *model = NULL, *records = NULL, *tokenize = NULL, *split = NULL;
     int dump_ids = 0;
     for (int i = 1; i < argc; i++) {

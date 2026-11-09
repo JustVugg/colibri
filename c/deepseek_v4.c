@@ -12,6 +12,8 @@
  * anything larger falls back to malloc exactly like before this change. */
 #define COLI_V4_ROUTE_STACK_EXPERTS 512
 
+#include "coli_env.h"
+
 #ifdef COLI_V4_UNIT_ST
 /* Shared st.h adapter and V4 tensor materialization helpers. */
 #include "deepseek_v4_internal.h"
@@ -2246,6 +2248,16 @@ static int decode_bf16(float *output, const void *data, size_t count) {
     return 0;
 }
 
+/* V4_ATTN_BATCH_PROJ (opt-in, default 0): wq_a and wkv in one device round trip. */
+static int v4_attn_batch_proj_on(void) {
+    static int wanted = -1;
+    if (wanted < 0) {
+        const char *env = getenv("V4_ATTN_BATCH_PROJ");
+        wanted = env && *env == '1';
+    }
+    return wanted;
+}
+
 static int attention_token_impl(float *output,
                                 ColiDeepSeekV4WindowAttentionState *state,
                                 const ColiDeepSeekV4LayerWeights *weights,
@@ -2300,7 +2312,19 @@ static int attention_token_impl(float *output,
     int result = (!input_act || !input_act_scales ||
                   coli_fp8_activation_qdq_ref(input_act, input_act_scales, input,
                                               (size_t)wq_a.columns, 128)) ? -1 : 0;
-    if (!result) result = coli_fp8_matvec_pre(qa, &wq_a, input, input_act);
+    /* V4_ATTN_BATCH_PROJ: wq_a and wkv read the raw input on the GPU (the same
+     * matvec as coli_fp8_matvec_pre's GPU path), so one round trip writes both. */
+    int pj_done = 0;
+#ifdef COLI_V4_GPU_TIER
+    if (!result && v4_attn_batch_proj_on() && coli_v4_gpu_attn_batch_wanted() &&
+        wq_a.gpu && wkv.gpu) {
+        void *tens[2] = {wq_a.gpu, wkv.gpu};
+        int rows[2] = {q_rank, head_dim};
+        float *outs[2] = {qa, kv};
+        pj_done = coli_v4_gpu_proj_batch(tens, rows, outs, 2, input) == 0;
+    }
+#endif
+    if (!result && !pj_done) result = coli_fp8_matvec_pre(qa, &wq_a, input, input_act);
     coli_bf16_round_array(qa, (size_t)q_rank);
     const void *q_norm = layer_data(weights, "attn.q_norm.weight", NULL);
     if (!result && (!q_norm || decode_bf16(norm_weight, q_norm, (size_t)q_rank) ||
@@ -2350,7 +2374,7 @@ static int attention_token_impl(float *output,
         for (int i = 0; i < head_dim; i++) values[i] = coli_bf16_round(values[i] * scale);
     }
 
-    if (!result) result = coli_fp8_matvec_pre(kv, &wkv, input, input_act);
+    if (!result && !pj_done) result = coli_fp8_matvec_pre(kv, &wkv, input, input_act);
     if (!result) coli_bf16_round_array(kv, (size_t)head_dim);
     const void *kv_norm = layer_data(weights, "attn.kv_norm.weight", NULL);
     if (!result && (!kv_norm || decode_bf16(norm_weight, kv_norm, (size_t)head_dim) ||
@@ -2489,17 +2513,24 @@ static int attention_token_impl(float *output,
         coli_bf16_round_array(rope, (size_t)rope_dim);
     }
 
+    int output_done = 0;
+#ifdef COLI_V4_GPU_TIER
+    if (!result && !coli_v4_gpu_wo_decode(&wo_a, &wo_b, output, attended, groups))
+        output_done = 1;
+#endif
     int heads_per_group = heads / groups;
     int group_width = heads_per_group * head_dim;
     int scale_columns = (group_width + 127) / 128;
     int scale_rows_per_group = (o_rank + 127) / 128;
-    if (!result) {
+    if (!result && !output_done) {
+        int grouped_on_gpu = 0;
 #ifdef COLI_V4_GPU_TIER
-        if (wo_a.gpu) {
-            result = coli_v4_gpu_matvec_grouped(&wo_a, oa, attended, groups);
-        } else
+        /* A refusal (CUDA lost after a sticky fault, F18) falls through to
+         * the CPU groups below, like coli_fp8_matvec_ref's own fallback. */
+        grouped_on_gpu = wo_a.gpu &&
+            coli_v4_gpu_matvec_grouped(&wo_a, oa, attended, groups) == 0;
 #endif
-        for (int group = 0; group < groups; group++) {
+        for (int group = 0; !grouped_on_gpu && group < groups; group++) {
             ColiTensorView group_view = wo_a;
             group_view.rows = o_rank;
             group_view.columns = group_width;
@@ -2521,9 +2552,9 @@ static int attention_token_impl(float *output,
                                          attended + (size_t)group * group_width);
         }
     }
-    if (!result) coli_bf16_round_array(oa, (size_t)groups * o_rank);
-    if (!result) result = coli_fp8_matvec_ref(output, &wo_b, oa);
-    if (!result) coli_bf16_round_array(output, (size_t)hidden);
+    if (!result && !output_done) coli_bf16_round_array(oa, (size_t)groups * o_rank);
+    if (!result && !output_done) result = coli_fp8_matvec_ref(output, &wo_b, oa);
+    if (!result && !output_done) coli_bf16_round_array(output, (size_t)hidden);
 
     free(compressed_indices);
     free(sines); free(cosines); free(norm_weight); free(oa);
@@ -2935,17 +2966,24 @@ static int attention_token_impl(float *output,
         coli_bf16_round_array(rope, (size_t)rope_dim);
     }
 
+    int output_done = 0;
+#ifdef COLI_V4_GPU_TIER
+    if (!result && !coli_v4_gpu_wo_decode(&wo_a, &wo_b, output, attended, groups))
+        output_done = 1;
+#endif
     int heads_per_group = heads / groups;
     int group_width = heads_per_group * head_dim;
     int scale_columns = (group_width + 127) / 128;
     int scale_rows_per_group = (o_rank + 127) / 128;
-    if (!result) {
+    if (!result && !output_done) {
+        int grouped_on_gpu = 0;
 #ifdef COLI_V4_GPU_TIER
-        if (wo_a.gpu) {
-            result = coli_v4_gpu_matvec_grouped(&wo_a, oa, attended, groups);
-        } else
+        /* A refusal (CUDA lost after a sticky fault, F18) falls through to
+         * the CPU groups below, like coli_fp8_matvec_ref's own fallback. */
+        grouped_on_gpu = wo_a.gpu &&
+            coli_v4_gpu_matvec_grouped(&wo_a, oa, attended, groups) == 0;
 #endif
-        for (int group = 0; group < groups; group++) {
+        for (int group = 0; !grouped_on_gpu && group < groups; group++) {
             ColiTensorView group_view = wo_a;
             group_view.rows = o_rank;
             group_view.columns = group_width;
@@ -2967,9 +3005,9 @@ static int attention_token_impl(float *output,
                                          attended + (size_t)group * group_width);
         }
     }
-    if (!result) coli_bf16_round_array(oa, (size_t)groups * o_rank);
-    if (!result) result = coli_fp8_matvec_ref(output, &wo_b, oa);
-    if (!result) coli_bf16_round_array(output, (size_t)hidden);
+    if (!result && !output_done) coli_bf16_round_array(oa, (size_t)groups * o_rank);
+    if (!result && !output_done) result = coli_fp8_matvec_ref(output, &wo_b, oa);
+    if (!result && !output_done) coli_bf16_round_array(output, (size_t)hidden);
 
     free(compressed_indices);
     free(sines); free(cosines); free(norm_weight); free(oa);
@@ -3734,6 +3772,15 @@ int coli_v4_compressor_step(ColiDeepSeekV4CompressorState *state,
                                             error, error_size);
         }
     }
+#ifdef COLI_V4_GPU_TIER
+    if (!coli_v4_gpu_compressor_project(state->weights, state->prefix,
+                                         kv_row, score_row, input)) {
+        for (int row = 0; row < projection; row++)
+            score_row[row] += ape[(size_t)slot * projection + row];
+        return compressor_pool_and_emit(state, output, produced, position,
+                                         error, error_size);
+    }
+#endif
 #ifdef COLI_VULKAN
     /* wkv and wgate on the Vulkan device (bf16, fmt 11) when it takes both; the
      * ape bias is added here exactly as the loop below adds it. */
@@ -3912,6 +3959,10 @@ int coli_v4_compressor_view(ColiDeepSeekV4CompressorState *state,
 #ifdef COLI_V4_UNIT_INDEXER
 /* ######## deepseek_v4_indexer.c ######## */
 #include "deepseek_v4_internal.h"
+#include "v4_topk.h"
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include <math.h>
 #include <stdarg.h>
@@ -4100,6 +4151,20 @@ static int indexer_identity_wanted(void) {
     return wanted;
 }
 
+/* V4_IDX_FAST (default 0, opt-in): the selection's top-k runs v4_topk_desc (exact
+ * radix sort, same indices in the same order as the qsort, which stays for NaN rows),
+ * in parallel across the scored tokens of a chunk, and a decode step prepares its
+ * query heads in parallel. 1 = on; 0 = the sequential qsort path. CPU only: the
+ * GPU scoring and projection paths are untouched. */
+static int indexer_fast_wanted(void) {
+    static int wanted = -1;
+    if (wanted < 0) {
+        const char *env = getenv("V4_IDX_FAST");
+        wanted = env && *env == '1';
+    }
+    return wanted;
+}
+
 /* Advance the indexer's compressor by one position (no scoring). Returns the
  * candidate count visible to this position, or -1. */
 static int indexer_advance(ColiDeepSeekV4Indexer *state, const float *input,
@@ -4147,23 +4212,40 @@ int coli_v4_indexer_advance(ColiDeepSeekV4Indexer *state, const float *input,
 /* Prepare one token's scoring queries in place: bf16 round, RoPE, per-head
  * hadamard + fp4 round trip. queries holds heads*dimension floats fresh from
  * the wq_b projection. */
+/* One head's share of the prep: hadamard + fp4 round trip, in place. Heads are
+ * independent, so the decode path runs them on the team (V4_IDX_FAST). */
+static int indexer_prepare_query_head(float *query, uint8_t *scales, float *qdq,
+                                      int dimension) {
+    int result = coli_hadamard_bf16_ref(query, (size_t)dimension);
+    if (!result) result = coli_fp4_activation_qdq_ref(
+        qdq, scales, query, (size_t)dimension, 32);
+    if (!result) {
+        memcpy(query, qdq, (size_t)dimension * sizeof(*query));
+        coli_bf16_round_array(query, (size_t)dimension);
+    }
+    return result;
+}
+
 static int indexer_prepare_queries(float *queries, uint8_t *scales, float *qdq,
                                    const ColiDeepSeekV4Config *config,
                                    int position) {
     int dimension = config->index_head_dim, heads = config->index_n_heads;
     coli_bf16_round_array(queries, (size_t)heads * dimension);
     int result = apply_position_rope(queries, config, position);
-    for (int head = 0; !result && head < heads; head++) {
-        float *query = queries + (size_t)head * dimension;
-        result = coli_hadamard_bf16_ref(query, (size_t)dimension);
-        if (!result) result = coli_fp4_activation_qdq_ref(
-            qdq, scales, query, (size_t)dimension, 32);
-        if (!result) {
-            memcpy(query, qdq, (size_t)dimension * sizeof(*query));
-            coli_bf16_round_array(query, (size_t)dimension);
-        }
-    }
+    for (int head = 0; !result && head < heads; head++)
+        result = indexer_prepare_query_head(
+            queries + (size_t)head * dimension, scales, qdq, dimension);
     return result;
+}
+
+/* One head's weight: a sequential sum over the hidden columns. The serial loop
+ * and the decode path's head-parallel loop both call it (same order, same bits). */
+static float indexer_head_weight(const uint16_t *row, const float *input,
+                                 int hidden, float weight_scale) {
+    float sum = 0.0f;
+    for (int column = 0; column < hidden; column++)
+        sum += coli_bf16_decode(row[column]) * input[column];
+    return sum * weight_scale;
 }
 
 static void indexer_head_weights(float *head_weights, const uint16_t *raw,
@@ -4171,13 +4253,10 @@ static void indexer_head_weights(float *head_weights, const uint16_t *raw,
                                  const ColiDeepSeekV4Config *config) {
     int heads = config->index_n_heads, dimension = config->index_head_dim;
     float weight_scale = 1.0f / sqrtf((float)(dimension * heads));
-    for (int head = 0; head < heads; head++) {
-        float sum = 0.0f;
-        const uint16_t *row = raw + (size_t)head * config->hidden_size;
-        for (int column = 0; column < config->hidden_size; column++)
-            sum += coli_bf16_decode(row[column]) * input[column];
-        head_weights[head] = sum * weight_scale;
-    }
+    for (int head = 0; head < heads; head++)
+        head_weights[head] = indexer_head_weight(
+            raw + (size_t)head * config->hidden_size, input,
+            config->hidden_size, weight_scale);
 }
 
 static float indexer_score_one(const float *q, const float *key,
@@ -4256,7 +4335,15 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
     size_t sz_scounts = ALIGN32((size_t)need * sizeof(int));
     size_t sz_stoken = ALIGN32((size_t)need * sizeof(int));
     size_t sz_scores = ALIGN32((size_t)need * max_count * sizeof(float));
-    size_t sz_ranked = ALIGN32((size_t)max_count * sizeof(IndexScore));
+    /* One sort workspace per thread: v4_topk_desc needs 2*max_count uint64 keys;
+     * the qsort fallback (NaN rows, V4_IDX_FAST=0) uses max_count IndexScore. */
+    int sort_threads = 1;
+#ifdef _OPENMP
+    if (need > 1 && indexer_fast_wanted()) sort_threads = omp_get_max_threads();
+    if (sort_threads < 1) sort_threads = 1;
+#endif
+    size_t sort_stride = (size_t)max_count * 2 * sizeof(uint64_t);
+    size_t sz_ranked = ALIGN32((size_t)sort_threads * sort_stride);
 #ifdef COLI_V4_GPU_TIER
     size_t sz_xq = (need <= 1024) ? ALIGN32((size_t)need * cols * sizeof(float)) : 0;
     size_t sz_yq = (need <= 1024) ? ALIGN32((size_t)need * qn * sizeof(float)) : 0;
@@ -4282,6 +4369,7 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
     int *scounts = (int *)scratch_ptr; scratch_ptr += sz_scounts;
     int *stoken = (int *)scratch_ptr; scratch_ptr += sz_stoken;
     float *scores = (float *)scratch_ptr; scratch_ptr += sz_scores;
+    char *sort_work = scratch_ptr;
     IndexScore *ranked = (IndexScore *)scratch_ptr; scratch_ptr += sz_ranked;
     int result = 0;
 
@@ -4399,7 +4487,50 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
         stoken[s] = t;
         s++;
     }
-    if (!result) {
+    int prepared = 0;
+#ifdef COLI_V4_GPU_TIER
+    if (!result && batch == 1 && need == 1 &&
+        coli_v4_layer_gpu(state->weights, "attn.indexer.weights_proj")) {
+        memcpy(sq, queries, qn * sizeof(*sq));
+        coli_bf16_round_array(sq, qn);
+        if (!apply_position_rope(sq, config, start_position) &&
+            !coli_v4_gpu_indexer_prepare(state->weights, inputs, sq,
+                                          head_weights, dimension))
+            prepared = 1;
+    }
+#endif
+    if (!result && !prepared && need == 1 && indexer_fast_wanted()) {
+        /* A decode step scores one token: its per-head work (hadamard + fp4 per
+         * head, one weight sum per head) ran on one thread. RoPE stays on this
+         * thread, the heads go to the team; each head keeps its own order. */
+        int t = stoken[0];
+        float *q = queries + (size_t)t * qn;
+        const float *input = inputs + (size_t)t * config->hidden_size;
+        int hidden = config->hidden_size;
+        float weight_scale = 1.0f / sqrtf((float)(dimension * heads));
+        coli_bf16_round_array(q, qn);
+        if (dimension > 512 || apply_position_rope(q, config, start_position + t))
+            result = set_error(error, error_size, "indexer query prep failed");
+        int head_failed = 0;
+        if (!result) {
+            #pragma omp parallel for schedule(static)
+            for (int head = 0; head < heads; head++) {
+                float tqdq[512];
+                uint8_t tscales[16];
+                if (indexer_prepare_query_head(q + (size_t)head * dimension,
+                                               tscales, tqdq, dimension)) {
+                    #pragma omp atomic write
+                    head_failed = 1;
+                }
+                head_weights[head] = indexer_head_weight(
+                    raw_weights + (size_t)head * hidden, input, hidden,
+                    weight_scale);
+            }
+            if (head_failed)
+                result = set_error(error, error_size, "indexer query prep failed");
+        }
+        if (!result) memcpy(sq, q, qn * sizeof(*sq));
+    } else if (!result && !prepared) {
         int prep_failed = 0;
         #pragma omp parallel for schedule(dynamic, 1)
         for (int i = 0; i < need; i++) {
@@ -4421,6 +4552,35 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
         }
         if (prep_failed)
             result = set_error(error, error_size, "indexer query prep failed");
+    }
+    if (!result && prepared && verify) {
+        float *reference = malloc(qn * sizeof(*reference));
+        float *reference_hw = malloc((size_t)heads * sizeof(*reference_hw));
+        float qdq[512];
+        uint8_t scales[16];
+        if (!reference || !reference_hw) result = -1;
+        if (!result) {
+            memcpy(reference, queries, qn * sizeof(*reference));
+            result = indexer_prepare_queries(reference, scales, qdq, config,
+                                               start_position);
+            indexer_head_weights(reference_hw, raw_weights, inputs, config);
+        }
+        size_t query_bad = 0, head_bad = 0;
+        if (!result) {
+            for (size_t i = 0; i < qn; i++) query_bad += reference[i] != sq[i];
+            for (int i = 0; i < heads; i++) {
+                if (reference_hw[i] == head_weights[i]) continue;
+                head_bad++;
+                fprintf(stderr, "idxprepdetail layer=%d head=%d cpu=%a gpu=%a\n",
+                        state->layer, i, (double)reference_hw[i], (double)head_weights[i]);
+            }
+            fprintf(stderr, "idxprepverify layer=%d start=%d query-mismatches=%zu head-mismatches=%zu\n",
+                    state->layer, start_position, query_bad, head_bad);
+            if (query_bad || head_bad)
+                result = set_error(error, error_size, "indexer GPU preparation differs from CPU reference");
+        }
+        free(reference_hw);
+        free(reference);
     }
     IDX_PROF_MARK(t_prep);
     int gpu_scored = 0;
@@ -4456,7 +4616,33 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
         fprintf(stderr, "idxverify layer=%d start=%d scored=%d mismatches=%lld max=%g\n",
                 state->layer, start_position, need, bad, worst);
     }
-    for (int i = 0; !result && i < need; i++) {
+    if (!result && indexer_fast_wanted()) {
+        /* v4_topk_desc: exact radix top-k, indices and order equal to the qsort
+         * below; a NaN row (refused with -1) takes the qsort. */
+        int limit = topk < index_capacity ? topk : index_capacity;
+        #pragma omp parallel for schedule(dynamic, 1) num_threads(sort_threads) if (sort_threads > 1)
+        for (int i = 0; i < need; i++) {
+            int thread = 0;
+#ifdef _OPENMP
+            thread = omp_get_thread_num();
+#endif
+            char *work = sort_work + (size_t)thread * sort_stride;
+            int t = stoken[i];
+            const float *row = scores + (size_t)i * max_count;
+            int *out = indices + (size_t)t * index_capacity;
+            int n = v4_topk_desc(out, row, scounts[i], limit, (uint64_t *)work);
+            if (n < 0) {
+                IndexScore *own = (IndexScore *)work;
+                for (int candidate = 0; candidate < scounts[i]; candidate++)
+                    own[candidate] = (IndexScore){row[candidate], candidate};
+                qsort(own, (size_t)scounts[i], sizeof(*own), descending_score);
+                n = scounts[i] < limit ? scounts[i] : limit;
+                for (int k = 0; k < n; k++) out[k] = own[k].index;
+            }
+            selected[t] = n;
+        }
+    }
+    for (int i = 0; !result && !indexer_fast_wanted() && i < need; i++) {
         int t = stoken[i];
         const float *row = scores + (size_t)i * max_count;
         for (int candidate = 0; candidate < scounts[i]; candidate++)
@@ -4472,7 +4658,7 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
     IDX_PROF_MARK(t_sort);
     if (prof)
         fprintf(stderr, "idxprof layer=%d start=%d scored=%d cand=%d "
-                "proj=%.0f prep=%.0f score=%.0f sort=%.0f ms%s\n",
+                "proj=%.3f prep=%.3f score=%.3f sort=%.3f ms%s\n",
                 state->layer, start_position, need, max_count, t_proj * 1e3,
                 t_prep * 1e3, t_score * 1e3, t_sort * 1e3,
                 gpu_scored ? "" : " (cpu-score)");
@@ -4989,20 +5175,28 @@ static int block_token_impl(float *output_hc,
         return set_error(error, error_size, "out of memory in block");
     }
     memcpy(residual, input_hc, hd * sizeof(*residual));
+    /* the stage that failed, for the error (the request's only report) */
+    const char *stage = "attention hyper-connection";
+    if (error && error_size) error[0] = 0;
     int result = normalized_hc_pre(reduced, post, comb, normalized, input_hc,
                                    weights, config, "attn", "attn_norm.weight");
+    if (!result) stage = "attention";
     if (!result) result = attention
         ? coli_v4_attention_window_token_ref(branch, attention, weights, config,
                                              normalized, position, error, error_size)
         : coli_v4_attention_token_ref(branch, weights, config, normalized,
                                       position, error, error_size);
+    if (!result) stage = "attention hyper-connection post";
     if (!result) result = coli_v4_hc_post(state, branch, residual, post, comb, hc, d);
     if (!result) coli_bf16_round_array(state, hd);
 
     if (!result) memcpy(residual, state, hd * sizeof(*residual));
+    if (!result) stage = "FFN hyper-connection";
     if (!result) result = normalized_hc_pre(reduced, post, comb, normalized, state,
                                             weights, config, "ffn", "ffn_norm.weight");
+    if (!result) stage = "MoE";
     if (!result) result = moe_token(branch, weights, config, experts, normalized, token);
+    if (!result) stage = "FFN hyper-connection post";
     if (!result) result = coli_v4_hc_post(output_hc, branch, residual, post, comb, hc, d);
     if (!result) coli_bf16_round_array(output_hc, hd);
 
@@ -5012,7 +5206,14 @@ static int block_token_impl(float *output_hc,
     if (moe_reason()[0])
         return set_error(error, error_size, "block computation failed in MoE: %s",
                          moe_reason());
-    return set_error(error, error_size, "block computation failed");
+    if (error && error_size && error[0]) {
+        char inner[256];
+        snprintf(inner, sizeof inner, "%s", error);
+        return set_error(error, error_size, "block computation failed in %s, layer %d: %s",
+                         stage, weights->plan.layer, inner);
+    }
+    return set_error(error, error_size, "block computation failed in %s, layer %d",
+                     stage, weights->plan.layer);
 }
 
 int coli_v4_block_token_ref(float *output_hc,
@@ -5065,6 +5266,20 @@ static int expert_prefetch_enabled(void) {
         enabled = text && *text && atoi(text) != 0;
     }
     return enabled;
+}
+
+/* Tell the store which experts of `layer` it is about to be asked for:
+ * expert_ids[pick[i]] (expert_ids[i] without pick), count of them. */
+static void v4_expert_prefetch(ColiExpertStore *store, int layer,
+                               const int *expert_ids, const int *pick,
+                               int count) {
+    if (count < 1 || !expert_prefetch_enabled() || !store->ops->prefetch) return;
+    ColiExpertKey *keys = malloc((size_t)count * sizeof(*keys));
+    if (!keys) return;
+    for (int i = 0; i < count; i++)
+        keys[i] = (ColiExpertKey){layer, expert_ids[pick ? pick[i] : i]};
+    store->ops->prefetch(store, keys, (size_t)count);
+    free(keys);
 }
 #endif
 
@@ -5577,7 +5792,50 @@ static void v4_vk_token_free(V4VkToken *vk) {
 }
 #endif
 
+/* Decode MoE counters (V4_SERVE_STATS_LOG; deepseek_v4_internal.h). */
+int g_v4_dec_counting;
+unsigned long long g_v4_dec_calls, g_v4_dec_uploads;
+double g_v4_dec_total_s, g_v4_dec_fetch_s, g_v4_dec_attach_s, g_v4_dec_gpu_s;
+unsigned long long g_v4_gpu_first_hits, g_v4_dec_store_fetches;
+
+#ifdef COLI_V4_GPU_TIER
+/* VRAM-first decode (V4_GPU_RESIDENT_FIRST=1): a routed expert already
+ * mirrored in VRAM is computed from the mirror without asking the expert
+ * store. The store still records the routing (coli_v4_expert_store_note_vram)
+ * and its RAM pin ranking leaves mirrored experts out
+ * (coli_v4_expert_store_vram_held), so their RAM slots age out of the LRU and
+ * the RAM tier holds experts that are not in VRAM: VRAM mirrors ADD to the
+ * cache instead of duplicating RAM residents. */
+int coli_v4_gpu_resident_first(void) {
 #ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
+    static int on = -1;
+    if (on < 0) {
+        const char *setting = getenv("V4_GPU_RESIDENT_FIRST");
+        on = setting && atoi(setting) != 0;
+    }
+    return on;
+#else
+    /* only the dual-loader pipeline has VRAM-first lookups: without it every
+     * routed expert is still looked up, so its RAM pins must stay */
+    return 0;
+#endif
+}
+#endif
+
+#ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
+/* Hand `key` to loader lane `slot`; its job reads -1 until the lane has run. */
+static int v4_lane_start(ExpertLoadJob *jobs, ExpertLoadHandle *loaders,
+                         int *loader_active, int slot, ColiExpertStore *store,
+                         ColiExpertKey key) {
+    memset(&jobs[slot], 0, sizeof(jobs[slot]));
+    jobs[slot].store = store;
+    jobs[slot].key = key;
+    jobs[slot].result = -1;
+    if (profiled_expert_load_start(&loaders[slot], &jobs[slot]) != 0) return -1;
+    loader_active[slot] = 1;
+    return 0;
+}
+
 /* Finish every lane still reading and give back what it leased. Every exit of
  * a fetch pass runs this, errors included: a lane left running would write
  * its result into the caller's jobs[] after that frame is gone. */
@@ -5593,13 +5851,90 @@ static void v4_lanes_finish(ColiExpertStore *store, ExpertLoadJob *jobs,
 }
 #endif
 
+#if defined(COLI_V4_GPU_TIER) && defined(COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER)
+/* A mirror-only view (leased[i] == 0: VRAM-first computed it from its mirror)
+ * has no host data. Fetch those experts from the store through the loader
+ * lanes, like the misses: preload up to dual_loader_lanes() reads, finish
+ * them in order, start the next one in the freed lane, and finish every lane
+ * on every exit. Their GPU handles are kept, so every CPU path sees complete
+ * views. fetch is scratch for the view indices; the lanes are idle on entry
+ * and again on return. */
+static int v4_views_fetch_host(ColiExpertStore *store, ColiExpertView *views,
+                               unsigned char *leased, int selected, int layer,
+                               int *fetch, ExpertLoadJob *jobs,
+                               ExpertLoadHandle *loaders, int *loader_active,
+                               int dec) {
+    int lanes = dual_loader_lanes(), nlazy = 0, result = 0;
+    for (int i = 0; i < selected; i++)
+        if (!leased[i]) fetch[nlazy++] = i;
+    if (dec) g_v4_dec_store_fetches += (unsigned long long)nlazy;
+    for (int f = 0; f < nlazy && f < lanes; f++)
+        if (v4_lane_start(jobs, loaders, loader_active, f, store,
+                          views[fetch[f]].key) != 0) {
+            result = moe_fail("layer %d: could not start reading expert %d",
+                              layer, views[fetch[f]].key.expert);
+            break;
+        }
+    for (int f = 0; !result && f < nlazy; f++) {
+        int current = fetch[f];
+        int slot = f % lanes;
+        double fw0 = v4_wait_clock();
+        int finish_failed = !loader_active[slot] ||
+            profiled_expert_load_finish(&loaders[slot]) != 0;
+        if (dec) g_v4_dec_fetch_s += v4_wait_clock() - fw0;
+        if (finish_failed) {
+            result = moe_fail("layer %d: the read of expert %d did not complete",
+                              layer, jobs[slot].key.expert);
+            break;
+        }
+        loader_active[slot] = 0;
+        if (jobs[slot].result) {
+            result = moe_fail("layer %d: reading expert %d from the expert store failed",
+                              layer, jobs[slot].key.expert);
+            break;
+        }
+        /* the host data, the mirror kept */
+        void *g = views[current].gate.gpu, *u = views[current].up.gpu;
+        void *dn = views[current].down.gpu;
+        views[current] = jobs[slot].view;
+        views[current].gate.gpu = g; views[current].up.gpu = u;
+        views[current].down.gpu = dn;
+        leased[current] = 1;
+        int next = f + lanes;
+        if (next < nlazy &&
+            v4_lane_start(jobs, loaders, loader_active, slot, store,
+                          views[fetch[next]].key) != 0)
+            result = moe_fail("layer %d: could not start reading expert %d",
+                              layer, views[fetch[next]].key.expert);
+    }
+    v4_lanes_finish(store, jobs, loaders, loader_active);
+    return result;
+}
+#endif
+
 static int moe_token_pipeline(float *output,
                               const ColiDeepSeekV4LayerWeights *weights,
                               const ColiDeepSeekV4Config *config,
                               ColiExpertStore *store,
                               const float *input, int token) {
+    moe_reason_clear();
 #ifdef COLI_V4_EXPERIMENTAL_BLOCK_OTHER_PROFILE
     double profile_moe_began = coli_v4_block_profile_now();
+#endif
+#if defined(COLI_V4_GPU_TIER) && !defined(COLI_V4_DISABLE_BF16_ROUTE)
+    int device_moe = coli_v4_gpu_resident_route(output, weights, config, store, input, token);
+    if (device_moe) {
+#ifdef COLI_V4_EXPERIMENTAL_BLOCK_OTHER_PROFILE
+        coli_v4_block_profile_add(COLI_V4_BLOCK_PROFILE_MOE_TOTAL,
+                                  coli_v4_block_profile_now() - profile_moe_began);
+#endif
+        return device_moe > 0 ? 0 : moe_fail("resident device routing failed");
+    }
+#endif
+#ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
+    /* decode MoE counters (deepseek_v4_internal.h): the routing included */
+    int dec = g_v4_dec_counting;
+    double dec_t0 = v4_wait_clock();
 #endif
     int d = config->hidden_size;
     int n = config->n_routed_experts;
@@ -5638,7 +5973,6 @@ static int moe_token_pipeline(float *output,
 #endif
     const int64_t *table = value(weights, "ffn.gate.tid2eid", NULL);
     const float *bias = value(weights, "ffn.gate.bias", NULL);
-    moe_reason_clear();
     int result = token < 0 || token >= config->vocab_size;
     if (result) moe_fail("layer %d: token %d is outside the vocabulary of %d",
                          weights->plan.layer, token, config->vocab_size);
@@ -5697,16 +6031,28 @@ static int moe_token_pipeline(float *output,
                           expert_ids, expert_weights, &selected);
 #endif
 
-#ifdef COLI_V4_EXPERIMENTAL_PREFETCH
-    if (!result && expert_prefetch_enabled() && store->ops->prefetch) {
-        ColiExpertKey *keys = malloc((size_t)selected * sizeof(*keys));
-        if (keys) {
-            for (int i = 0; i < selected; i++)
-                keys[i] = (ColiExpertKey){weights->plan.layer, expert_ids[i]};
-            store->ops->prefetch(store, keys, (size_t)selected);
-            free(keys);
+#if defined(COLI_V4_GPU_TIER) && defined(COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER)
+    if (!result && store->gpu) {
+        void *sg = coli_v4_layer_gpu(weights, "ffn.shared_experts.w1");
+        void *su = coli_v4_layer_gpu(weights, "ffn.shared_experts.w3");
+        void *sd = coli_v4_layer_gpu(weights, "ffn.shared_experts.w2");
+        int resident = coli_v4_gpu_moe_resident(store, weights->plan.layer,
+            expert_ids, expert_weights, selected, sg, su, sd,
+            config->swiglu_limit, output, input);
+        if (resident) {
+            if (resident < 0)
+                result = moe_fail("layer %d: resident GPU MoE failed", weights->plan.layer);
+            else
+                for (int i = 0; i < d; i++) output[i] = coli_bf16_round(output[i]);
+            goto moe_done;
         }
     }
+#endif
+
+#if defined(COLI_V4_EXPERIMENTAL_PREFETCH) && \
+    !defined(COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER)
+    if (!result)
+        v4_expert_prefetch(store, weights->plan.layer, expert_ids, NULL, selected);
 #endif
 
 
@@ -5714,19 +6060,46 @@ static int moe_token_pipeline(float *output,
     ExpertLoadJob jobs[DUAL_EXPERT_LOADER_MAX] = {{0}};
     ExpertLoadHandle loaders[DUAL_EXPERT_LOADER_MAX] = {{0}};
     int loader_active[DUAL_EXPERT_LOADER_MAX] = {0};
+    /* views[i] belongs to expert_ids[i]; fetch[] lists the experts the store
+     * must provide (all of them unless VRAM-first finds mirrors); leased[i]
+     * marks views holding a store lease, the only ones released at the end. */
+    int alloc_n = selected ? selected : 1;
+    ColiExpertView *views = malloc((size_t)alloc_n * sizeof(*views));
+    unsigned char *leased = calloc((size_t)alloc_n, 1);
+    int *fetch = malloc((size_t)alloc_n * sizeof(*fetch));
+    int nfetch = 0;
+    if (!result && (!views || !leased || !fetch))
+        result = moe_fail("layer %d: out of memory for %d expert views",
+                          weights->plan.layer, selected);
     if (!result) {
-        int preload = selected < dual_loader_lanes()
-            ? selected : dual_loader_lanes();
-        for (int i = 0; i < preload; i++) {
-            jobs[i].store = store;
-            jobs[i].key = (ColiExpertKey){weights->plan.layer, expert_ids[i]};
-            jobs[i].result = -1;
-            if (profiled_expert_load_start(&loaders[i], &jobs[i]) != 0) {
+        memset(views, 0, (size_t)alloc_n * sizeof(*views));
+#ifdef COLI_V4_GPU_TIER
+        int first = store->gpu && coli_v4_gpu_resident_first() &&
+                    !coli_v4_hybrid_enabled();
+#endif
+        for (int i = 0; i < selected; i++) {
+            views[i].key = (ColiExpertKey){weights->plan.layer, expert_ids[i]};
+#ifdef COLI_V4_GPU_TIER
+            if (first && coli_v4_gpu_expert_peek(store, &views[i]) == 0)
+                continue;
+            views[i].gate.gpu = views[i].up.gpu = views[i].down.gpu = NULL;
+#endif
+            fetch[nfetch++] = i;
+        }
+        if (dec) g_v4_dec_store_fetches += (unsigned long long)nfetch;
+#ifdef COLI_V4_EXPERIMENTAL_PREFETCH
+        /* only what the store will be asked for: a mirrored expert is not */
+        v4_expert_prefetch(store, weights->plan.layer, expert_ids, fetch, nfetch);
+#endif
+        int preload = nfetch < dual_loader_lanes()
+            ? nfetch : dual_loader_lanes();
+        for (int f = 0; f < preload; f++) {
+            if (v4_lane_start(jobs, loaders, loader_active, f, store,
+                              views[fetch[f]].key) != 0) {
                 result = moe_fail("layer %d: could not start reading expert %d",
-                                  weights->plan.layer, expert_ids[i]);
+                                  weights->plan.layer, expert_ids[fetch[f]]);
                 break;
             }
-            loader_active[i] = 1;
         }
     }
 #else
@@ -5757,22 +6130,21 @@ static int moe_token_pipeline(float *output,
     if (!result) memset(output, 0, (size_t)d * sizeof(*output));
 
 #ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
-    /* Zeroed up front: every exit releases the views below, and one that
-     * fails before the fetch pass fills them must find no lease there. */
-    ColiExpertView *views = calloc((size_t)(selected ? selected : 1), sizeof(*views));
 #ifdef COLI_V4_GPU_TIER
     int gpu_compute = 0;
 #endif
-    if (!views) result = moe_fail("layer %d: out of memory for %d expert views",
-                                  weights->plan.layer, selected);
     if (!result) {
 #ifdef COLI_V4_GPU_TIER
         gpu_compute = selected > 0;   /* none left (a tier took them all): the CPU adds the shared expert */
 #endif
-        for (int current = 0; !result && current < selected; current++) {
-            int slot = current % dual_loader_lanes();
-            if (!loader_active[slot] ||
-                profiled_expert_load_finish(&loaders[slot]) != 0) {
+        for (int f = 0; !result && f < nfetch; f++) {
+            int current = fetch[f];
+            int slot = f % dual_loader_lanes();
+            double fw0 = v4_wait_clock();
+            int finish_failed = !loader_active[slot] ||
+                profiled_expert_load_finish(&loaders[slot]) != 0;
+            if (dec) g_v4_dec_fetch_s += v4_wait_clock() - fw0;
+            if (finish_failed) {
                 result = moe_fail("layer %d: the read of expert %d did not complete",
                                   weights->plan.layer, jobs[slot].key.expert);
                 break;
@@ -5784,14 +6156,22 @@ static int moe_token_pipeline(float *output,
                 break;
             }
             views[current] = jobs[slot].view;
+            leased[current] = 1;
 #ifdef COLI_V4_GPU_TIER
             if (store->gpu) {
                 if (coli_v4_hybrid_enabled())
                     /* peek only: uploads are decided once the token's full
                      * miss count is known, by the q* pass below */
                     coli_v4_gpu_expert_peek(store, &views[current]);
-                else
+                else {
+                    double at0 = v4_wait_clock();
+                    unsigned long long uploads = coli_v4_gpu_expert_uploads();
                     coli_v4_gpu_expert_attach(store, &views[current]);
+                    if (dec) {
+                        g_v4_dec_attach_s += v4_wait_clock() - at0;
+                        g_v4_dec_uploads += coli_v4_gpu_expert_uploads() - uploads;
+                    }
+                }
             }
 #endif
 #ifdef COLI_V4_GPU_TIER
@@ -5800,24 +6180,22 @@ static int moe_token_pipeline(float *output,
                 gpu_compute = 0;
 #endif
 
-            int next = current + dual_loader_lanes();
-            if (next < selected) {
-                memset(&jobs[slot], 0, sizeof(jobs[slot]));
-                jobs[slot].store = store;
-                jobs[slot].key = (ColiExpertKey){weights->plan.layer,
-                                                expert_ids[next]};
-                jobs[slot].result = -1;
-                if (profiled_expert_load_start(&loaders[slot],
-                                               &jobs[slot]) != 0)
-                    result = moe_fail("layer %d: could not start reading expert %d",
-                                      weights->plan.layer, expert_ids[next]);
-                else
-                    loader_active[slot] = 1;
-            }
+            int next = f + dual_loader_lanes();
+            if (next < nfetch &&
+                v4_lane_start(jobs, loaders, loader_active, slot, store,
+                              views[fetch[next]].key) != 0)
+                result = moe_fail("layer %d: could not start reading expert %d",
+                                  weights->plan.layer, expert_ids[fetch[next]]);
         }
     }
     v4_lanes_finish(store, jobs, loaders, loader_active);
 #ifdef COLI_V4_GPU_TIER
+    /* If the token cannot take the fused GPU path after all (an attach
+     * failed), its mirror-only views need their host data now. */
+    if (!result && !gpu_compute)
+        result = v4_views_fetch_host(store, views, leased, selected,
+                                     weights->plan.layer, fetch, jobs,
+                                     loaders, loader_active, dec);
     int hybrid_gpu_count = 0;
     int hybrid_pending_drain = 0;   /* async DMA enqueued, not yet drained */
     int hybrid_uploads = 0;
@@ -5877,6 +6255,7 @@ static int moe_token_pipeline(float *output,
             gpu_compute = 1;    /* every expert made it: use the fused path */
     }
     if (!result && gpu_compute && store->gpu) {
+        double gpu_t0 = v4_wait_clock();
         void *sg = coli_v4_layer_gpu(weights, "ffn.shared_experts.w1");
         void *su = coli_v4_layer_gpu(weights, "ffn.shared_experts.w3");
         void *sd = coli_v4_layer_gpu(weights, "ffn.shared_experts.w2");
@@ -5893,6 +6272,8 @@ static int moe_token_pipeline(float *output,
                 ups[i] = views[i].up.gpu;
                 downs[i] = views[i].down.gpu;
             }
+            int peer_up = coli_v4_gpu_peer_pool_up();
+            extern int dsv4_cuda_lost(void);
             if (moe_ok) {
                 extern int dsv4_cuda_moe(
                     void *const *gate, void *const *up, void *const *down,
@@ -5903,7 +6284,32 @@ static int moe_token_pipeline(float *output,
                     selected, sg, su, sd, config->swiglu_limit,
                     expert_output, input)) moe_ok = 0;
             }
-            if (!moe_ok) {
+            if (!moe_ok && ((peer_up && !coli_v4_gpu_peer_pool_up()) || dsv4_cuda_lost())) {
+                /* The peer GPU failed under this call and its memory is no
+                 * longer read (when it still could be, dsv4_cuda_moe already
+                 * recomputed those experts on the primary and succeeded), or
+                 * a sticky fault took CUDA itself (dsv4_cuda_lost): compute
+                 * the routed experts from host data on the CPU, as the path
+                 * without GPU compute does. Their mirrors are misses from
+                 * the next lookup on. The views drop their mirror handles:
+                 * coli_v4_expert_forward_ref would otherwise hand them back
+                 * to the backend's matvec. */
+                result = v4_views_fetch_host(store, views, leased, selected,
+                                             weights->plan.layer, fetch,
+                                             jobs, loaders, loader_active, dec);
+                for (int current = 0; !result && current < selected; current++) {
+                    views[current].gate.gpu = views[current].up.gpu =
+                        views[current].down.gpu = NULL;
+                    result = coli_v4_expert_forward_ref(
+                        expert_output, &views[current], input,
+                        expert_weights[current], config->swiglu_limit);
+                    if (!result)
+                        for (int i = 0; i < d; i++) output[i] += expert_output[i];
+                }
+                if (!result)
+                    for (int i = 0; i < d; i++)
+                        expert_output[i] = output[i] + shared_output[i];
+            } else if (!moe_ok) {
                 extern int dsv4_cuda_expert_group(
                     void *const *gate, void *const *up, void *const *down,
                     const float *weights, int count, float limit,
@@ -5924,6 +6330,7 @@ static int moe_token_pipeline(float *output,
                     output[i] = coli_bf16_round(expert_output[i]);
         }
         free(gates); free(ups); free(downs);
+        if (dec) g_v4_dec_gpu_s += v4_wait_clock() - gpu_t0;
     } else if (!result && hybrid_gpu_count > 0 && store->gpu) {
         /* Hybrid split: the GPU computes the resident subset as one weighted
          * group while the CPU computes the rest; the two partial sums merge
@@ -6060,10 +6467,27 @@ static int moe_token_pipeline(float *output,
      * copies read from. (The fused kernels sync internally, so this is only
      * ever a wait on already-finished work — never a correctness gamble.) */
     if (hybrid_pending_drain) coli_v4_gpu_expert_drain(store);
+    /* A view still without a lease was computed from VRAM (VRAM-first): its
+     * routing never reached the store, which counts it here, once per
+     * token-layer (fetch[] is free again: it carries the expert ids). */
+    if (!result) {
+        int nvram = 0;
+        for (int i = 0; i < selected; i++)
+            if (!leased[i]) fetch[nvram++] = expert_ids[i];
+        if (nvram)
+            coli_v4_expert_store_note_vram(store, weights->plan.layer, fetch, nvram);
+        if (dec) g_v4_gpu_first_hits += (unsigned long long)nvram;
+    }
 #endif
-    for (int current = 0; views && current < selected; current++)
-        coli_expert_release(store, &views[current]);
-    free(views);
+    if (views)
+        for (int current = 0; current < selected; current++)
+            if (leased && leased[current])
+                coli_expert_release(store, &views[current]);
+    free(views); free(leased); free(fetch);
+    if (dec) {
+        g_v4_dec_total_s += v4_wait_clock() - dec_t0;
+        g_v4_dec_calls++;
+    }
 #if defined(COLI_VULKAN) || defined(COLI_CUDA)
     v4_vk_token_free(&vk_step);
 #endif
@@ -6114,6 +6538,9 @@ static int moe_token_pipeline(float *output,
             coli_expert_release(store, &job.view);
     }
 #endif
+#if defined(COLI_V4_GPU_TIER) && defined(COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER)
+moe_done:
+#endif
     free(shared_output); free(expert_output); free(expert_weights);
     free(expert_ids); free(indices); free(route_weights); free(gate);
 #ifdef COLI_V4_EXPERIMENTAL_BLOCK_OTHER_PROFILE
@@ -6161,26 +6588,34 @@ static int block_token_pipeline(float *output_hc,
     }
 #define DP_MARK(acc) do { if (dprof) { clock_gettime(CLOCK_MONOTONIC, &dp1); acc += (dp1.tv_sec - dp0.tv_sec) + (dp1.tv_nsec - dp0.tv_nsec) * 1e-9; dp0 = dp1; } } while (0)
     if (dprof) clock_gettime(CLOCK_MONOTONIC, &dp0);
+    /* the stage that failed, for the error (the request's only report) */
+    const char *stage = "attention hyper-connection";
+    if (error && error_size) error[0] = 0;
     int result = normalized_hc_pre(reduced, post, comb, normalized, input_hc,
                                    weights, config, "attn", "attn_norm.weight");
     DP_MARK(dp_hc);
+    if (!result) stage = "attention";
     if (!result) result = attention
         ? coli_v4_attention_window_token_ref(branch, attention, weights, config,
                                              normalized, position, error, error_size)
         : coli_v4_attention_token_ref(branch, weights, config, normalized,
                                       position, error, error_size);
     DP_MARK(dp_attn);
+    if (!result) stage = "attention hyper-connection post";
     if (!result) result = coli_v4_hc_post(state, branch, residual,
                                           post, comb, hc, d);
     if (!result) coli_bf16_round_array(state, hd);
     if (!result) memcpy(residual, state, hd * sizeof(*residual));
+    if (!result) stage = "FFN hyper-connection";
     if (!result) result = normalized_hc_pre(reduced, post, comb, normalized, state,
                                             weights, config, "ffn",
                                             "ffn_norm.weight");
     DP_MARK(dp_hc);
+    if (!result) stage = "MoE";
     if (!result) result = moe_token_pipeline(branch, weights, config, experts,
                                              normalized, token);
     DP_MARK(dp_moe);
+    if (!result) stage = "FFN hyper-connection post";
     if (!result) result = coli_v4_hc_post(output_hc, branch, residual,
                                           post, comb, hc, d);
     if (!result) coli_bf16_round_array(output_hc, hd);
@@ -6193,7 +6628,14 @@ static int block_token_pipeline(float *output_hc,
     if (moe_reason()[0])
         return set_error(error, error_size, "block computation failed in MoE: %s",
                          moe_reason());
-    return set_error(error, error_size, "block computation failed");
+    if (error && error_size && error[0]) {
+        char inner[256];
+        snprintf(inner, sizeof inner, "%s", error);
+        return set_error(error, error_size, "block computation failed in %s, layer %d: %s",
+                         stage, weights->plan.layer, inner);
+    }
+    return set_error(error, error_size, "block computation failed in %s, layer %d",
+                     stage, weights->plan.layer);
 }
 
 int coli_v4_block_token_ref(float *output_hc,
@@ -6875,7 +7317,11 @@ int coli_v4_block_window_batch_ref(
         coli_bf16_round_array(ffn_branch, (size_t)batch * d);
     else
 #endif
-    if (!result && batch > 1 && v4_expert_union_enabled())
+    if (!result && batch > 1 && v4_expert_union_enabled()
+#ifdef COLI_V4_GPU_TIER
+        && !coli_v4_gpu_experts_resident(experts, weights->plan.layer)
+#endif
+        )
         result = v4_moe_batch_union(
             ffn_branch, weights, config, experts,
             ffn_normalized, tokens, batch);
@@ -7192,6 +7638,15 @@ int coli_v4_compressor_step(ColiDeepSeekV4CompressorState *state,
                                             error, error_size);
         }
     }
+#ifdef COLI_V4_GPU_TIER
+    if (!coli_v4_gpu_compressor_project(state->weights, state->prefix,
+                                         kv_row, score_row, input)) {
+        for (int row = 0; row < projection; row++)
+            score_row[row] += ape[(size_t)slot * projection + row];
+        return compressor_pool_and_emit(state, output, produced, position,
+                                         error, error_size);
+    }
+#endif
 #ifdef COLI_VULKAN
     /* wkv and wgate on the Vulkan device (bf16, fmt 11) when it takes both; the
      * ape bias is added here exactly as the loop below adds it. */
@@ -8197,17 +8652,24 @@ static int attention_token_impl(float *output,
         coli_bf16_round_array(rope, (size_t)rope_dim);
     }
 
+    int output_done = 0;
+#ifdef COLI_V4_GPU_TIER
+    if (!result && !coli_v4_gpu_wo_decode(&wo_a, &wo_b, output, attended, groups))
+        output_done = 1;
+#endif
     int heads_per_group = heads / groups;
     int group_width = heads_per_group * head_dim;
     int scale_columns = (group_width + 127) / 128;
     int scale_rows_per_group = (o_rank + 127) / 128;
-    if (!result) {
+    if (!result && !output_done) {
+        int grouped_on_gpu = 0;
 #ifdef COLI_V4_GPU_TIER
-        if (wo_a.gpu) {
-            result = coli_v4_gpu_matvec_grouped(&wo_a, oa, attended, groups);
-        } else
+        /* A refusal (CUDA lost after a sticky fault, F18) falls through to
+         * the CPU groups below, like coli_fp8_matvec_ref's own fallback. */
+        grouped_on_gpu = wo_a.gpu &&
+            coli_v4_gpu_matvec_grouped(&wo_a, oa, attended, groups) == 0;
 #endif
-        for (int group = 0; group < groups; group++) {
+        for (int group = 0; !grouped_on_gpu && group < groups; group++) {
             ColiTensorView group_view = wo_a;
             group_view.rows = o_rank;
             group_view.columns = group_width;
@@ -8229,9 +8691,9 @@ static int attention_token_impl(float *output,
                                          attended + (size_t)group * group_width);
         }
     }
-    if (!result) coli_bf16_round_array(oa, (size_t)groups * o_rank);
-    if (!result) result = coli_fp8_matvec_ref(output, &wo_b, oa);
-    if (!result) coli_bf16_round_array(output, (size_t)hidden);
+    if (!result && !output_done) coli_bf16_round_array(oa, (size_t)groups * o_rank);
+    if (!result && !output_done) result = coli_fp8_matvec_ref(output, &wo_b, oa);
+    if (!result && !output_done) coli_bf16_round_array(output, (size_t)hidden);
 
     free(compressed_indices);
     free(sines); free(cosines); free(norm_weight); free(oa);
@@ -9864,19 +10326,29 @@ static void hot_repin_locked(V4HotPolicy *policy, V4ExpertStoreState *state,
     uint64_t *usage = policy->usage +
         (size_t)layer * state->experts_per_layer;
     int *pins = policy->pins + (size_t)layer * policy->pin_count;
+    /* VRAM-first decode computes a mirrored expert without asking the store:
+     * its RAM slot is left out of the ranking, so it is neither pinned nor
+     * refreshed here and ages out of the LRU (coli_v4_expert_store_vram_held;
+     * on allocation failure, rank as before). */
+    unsigned char *in_vram = NULL;
+    if (coli_v4_expert_store_vram_held &&
+        (in_vram = calloc((size_t)state->experts_per_layer, 1)))
+        coli_v4_expert_store_vram_held(policy->store, layer, in_vram,
+                                       state->experts_per_layer);
     for (int rank = 0; rank < policy->pin_count; rank++) {
         int best = -1;
         for (int expert = 0; expert < state->experts_per_layer; expert++) {
             int already = 0;
             for (int prior = 0; prior < rank; prior++)
                 if (pins[prior] == expert) { already = 1; break; }
-            if (!already && usage[expert] &&
+            if (!already && usage[expert] && !(in_vram && in_vram[expert]) &&
                 (best < 0 || usage[expert] > usage[best] ||
                  (usage[expert] == usage[best] && expert < best)))
                 best = expert;
         }
         pins[rank] = best;
     }
+    free(in_vram);
     for (int rank = 0; rank < policy->pin_count; rank++) {
         int expert = pins[rank];
         if (expert < 0) continue;
@@ -9981,19 +10453,29 @@ static V4ExpertSlot *hot_oldest_pool_victim(
     return last_resort;
 }
 
+/* state->mutex held. The dashboard's view of one routing of the expert at
+ * `index` (layer * experts_per_layer + expert): its HITS for the turn and its
+ * heat, capped at 63. Every routing the store records keeps it, one that
+ * hot_count_locked counts and one VRAM-first decode served from a mirror
+ * (coli_v4_expert_store_note_vram) alike. */
+static void hot_heat_locked(V4ExpertStoreState *state, size_t index) {
+    if (!state->ehit) return;
+    state->ehit[index] = 1;
+    if (state->eheat && state->eheat[index] < 63) state->eheat[index]++;
+}
+
 /* state->mutex held. The books one routing of `key` keeps: the pin ranking's
  * usage and its per-layer request clock (the pin ramp, the repin cadence, the
  * usage decay), the dashboard's HITS and heat, and the .coli_usage history.
  * Every lookup_hot counts one; so do the routings computed elsewhere
- * (coli_v4_expert_store_note_routed, coli_v4_expert_store_note_union). */
+ * (coli_v4_expert_store_note_routed, coli_v4_expert_store_note_union). A
+ * routing VRAM-first decode serves from a mirror keeps only the HITS, heat and
+ * history (coli_v4_expert_store_note_vram). */
 static void hot_count_locked(V4HotPolicy *policy, V4ExpertStoreState *state,
                              ColiExpertKey key) {
     size_t index = (size_t)key.layer * state->experts_per_layer + key.expert;
     policy->usage[index]++;
-    if (state->ehit) {
-        state->ehit[index] = 1;
-        if (state->eheat && state->eheat[index] < 63) state->eheat[index]++;
-    }
+    hot_heat_locked(state, index);
     rt_count(key.layer, &key.expert, 1);   /* selection history, shared format (#700) */
     uint64_t layer_requests = ++policy->layer_requests[key.layer];
     if (policy->repin_interval &&
@@ -10188,6 +10670,17 @@ int coli_v4_test_expert_books(ColiExpertStore *store, int layer,
     return policy->pin_count;
 }
 
+/* 1 when the hot policy pins {layer, expert} in RAM now, -1 without one. */
+int coli_v4_test_expert_pinned(ColiExpertStore *store, ColiExpertKey key) {
+    V4HotPolicy *policy = store && store->state ? hot_find(store) : NULL;
+    if (!policy) return -1;
+    V4ExpertStoreState *state = store->state;
+    pthread_mutex_lock(&state->mutex);
+    int pinned = hot_is_pinned(policy, key.layer, key.expert);
+    pthread_mutex_unlock(&state->mutex);
+    return pinned;
+}
+
 void coli_v4_test_reset_direct_io_stats(void) {
     __atomic_store_n(&v4_direct_reads, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&v4_direct_flock_reads, 0, __ATOMIC_RELAXED);
@@ -10304,6 +10797,36 @@ void coli_v4_expert_store_note_union(ColiExpertStore *store, int layer,
 
 int (*coli_v4_expert_store_ram_first)(int layer, int expert);   /* exclusive RAM/VRAM: NULL unless a Vulkan tier sets it */
 void (*coli_v4_expert_store_ram_gave)(void);
+/* VRAM-first decode (deepseek_v4_internal.h): NULL unless the CUDA tier sets it */
+void (*coli_v4_expert_store_vram_held)(ColiExpertStore *store, int layer,
+                                       unsigned char *held, int experts);
+
+/* The routings VRAM-first decode served from VRAM, one call per token-layer.
+ * They keep the HITS, heat and history a lookup keeps (hot_heat_locked,
+ * rt_count), so the dashboard and the saved history see every routing. The
+ * rest of hot_count_locked's books, usage and layer_requests, is left alone
+ * so that the experts decode computes from VRAM neither rank nor pace the RAM
+ * pins (a pin would hold a RAM slot decode never reads); the request, hit and
+ * miss counters describe the RAM cache's traffic and are not touched either.
+ * A batched prefill keeps the full books for every routed expert, the books
+ * a CPU-union prefill leaves decode: the expert union's lookups and the GPU
+ * bank's note_union count each one, and neither reads the mirrors. With
+ * V4_EXPERT_UNION=0 a chunk the bank does not take runs token by token
+ * through moe_token_pipeline, so its mirrored experts are counted here, as
+ * in decode. */
+void coli_v4_expert_store_note_vram(ColiExpertStore *store, int layer,
+                                    const int *experts, int count) {
+    if (!store || !store->state || !experts || count < 1 || !hot_find(store)) return;
+    V4ExpertStoreState *state = store->state;
+    if (layer < 0 || layer >= state->layers) return;
+    pthread_mutex_lock(&state->mutex);
+    for (int i = 0; i < count; i++)
+        if (experts[i] >= 0 && experts[i] < state->experts_per_layer)
+            hot_heat_locked(state, (size_t)layer * state->experts_per_layer +
+                                   experts[i]);
+    rt_count(layer, experts, count);   /* skips ids outside the layer */
+    pthread_mutex_unlock(&state->mutex);
+}
 
 #if defined(COLI_VULKAN) || defined(COLI_CUDA)
 /* The Vulkan routed-expert tier's side of the store (deepseek_v4_internal.h). A
@@ -11466,7 +11989,15 @@ int coli_v4_engine_open(ColiV4Engine **output,
     engine->summary.expert_cache_bytes =
         engine->runtime.target_expert_cache_bytes;
 #ifdef COLI_V4_GPU_TIER
-    coli_v4_gpu_engine_open(engine);
+    if (coli_v4_gpu_engine_open(engine)) {
+        if (error && error_size)
+            snprintf(error, error_size, "cannot initialize requested CUDA devices");
+        goto fail;
+    }
+#endif
+#ifdef COLI_V4_GPU_TIER
+    if (coli_v4_gpu_experts_init(engine, error, error_size)) goto fail;
+    coli_v4_gpu_head_upload(engine);
 #endif
     *output = engine;
     return 0;
@@ -11493,6 +12024,7 @@ fail:
 #include "deepseek_v4_internal.h"
 #include "backend_cuda_dsv4.h"
 #include "deepseek_v4_bank_pair.h"
+#include "deepseek_v4_gpu_devices.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -11509,6 +12041,15 @@ static int v4_gpu_wanted(void) {
 }
 
 typedef struct V4GpuExpertMirrorCache V4GpuExpertMirrorCache;
+/* Peer mirror pool (DSV4_CUDA_PEER_DEVICE): a second cache on another GPU.
+ * The fused MoE runs its experts on that GPU (peer compute) or reads them in
+ * place over P2P/NVLink (dsv4_cuda_peer_compute says which). */
+static V4GpuExpertMirrorCache *g_v4_peer_mirrors;
+static int v4_peer_mirrors_capacity(void);
+static V4GpuExpertMirrorCache *v4_peer_mirrors_create(int device, int primary,
+                                                      int capacity);
+static void v4_gpu_expert_vram_held(ColiExpertStore *store, int layer,
+                                    unsigned char *held, int experts);
 static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create_capacity(
     int device, int capacity);
 static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create(int device,
@@ -11518,8 +12059,26 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
                                           ColiExpertView *view, int sync);
 static void v4_gpu_mirror_reserve_size(const ColiDeepSeekV4Config *config,
                                        int bank_possible);
-static long long v4_gpu_mirror_reserve_mb(int live);
-static long long v4_gpu_mirror_reserve_margin_mb(int live);
+static long long v4_gpu_mirror_reserve_mb(int live, long long *margin_mb);
+
+static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create_devices(
+    const int *devices, int count, int layers);
+
+/* Retained router input per device (V4_GPU_ROUTE_REUSE=1). Single generation
+ * thread, matching the backend's per-device scratch contract. */
+#define V4_GPU_ROUTE_MAX_DEV 16
+static struct V4GpuRouteScratch {
+    Dsv4CudaActivation *input;
+    long long capacity;
+} v4_gpu_route_scratch[V4_GPU_ROUTE_MAX_DEV];
+
+static void v4_gpu_route_scratch_clear(void) {
+    for (int device = 0; device < V4_GPU_ROUTE_MAX_DEV; device++) {
+        if (v4_gpu_route_scratch[device].input)
+            dsv4_cuda_activation_free(v4_gpu_route_scratch[device].input);
+        v4_gpu_route_scratch[device] = (struct V4GpuRouteScratch){0};
+    }
+}
 
 int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     if (!engine) return -1;
@@ -11545,45 +12104,143 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
         }
     }
 #endif
-    const char *device_setting = getenv("DSV4_CUDA_DEVICE");
-    int device = device_setting ? atoi(device_setting) : 0;
-    if (!dsv4_cuda_init(&device, 1)) {
+    /* #1766: DSV4_CUDA_DEVICES places contiguous layer ranges on several
+     * GPUs; without it DSV4_CUDA_DEVICE names the one device. */
+    const char *setting = getenv("DSV4_CUDA_DEVICES");
+    int count = 1;
+    if (setting) {
+        count = coli_v4_gpu_devices_parse(setting, engine->gpu.devices);
+    } else {
+        const char *device_setting = getenv("DSV4_CUDA_DEVICE");
+        engine->gpu.devices[0] = device_setting ? atoi(device_setting) : 0;
+    }
+    if (count < 1 || count > engine->config.num_hidden_layers) {
+        fprintf(stderr, "v4_gpu invalid device list (use distinct CUDA ordinals, at most one per layer)\n");
+        return -1;
+    }
+    int device = engine->gpu.devices[0];
+    int devices[2] = {device, -1};
+    int ndevices = 1;
+    int peer = -1;
+    int peer_capacity = 0;
+    const char *peer_setting = getenv("DSV4_CUDA_PEER_DEVICE");
+    if (count > 1 && peer_setting && *peer_setting) {
+        fprintf(stderr, "v4_gpu: DSV4_CUDA_DEVICES and DSV4_CUDA_PEER_DEVICE are mutually exclusive "
+                        "(layer placement and the peer mirror pool both claim the other cards)\n");
+        return -1;
+    }
+    if (count == 1) {
+        /* PR #2: one primary card plus a peer mirror pool. Layer placement
+         * over several cards and the peer pool both claim the other cards,
+         * so the pool is for the one-device layout only. */
+        peer = peer_setting && *peer_setting ? atoi(peer_setting) : -1;
+        devices[1] = peer;
+        if (peer >= 0) {
+            /* Settle the peer pool BEFORE any init: a peer that gets no pool is
+             * never initialised (no context, streams or buffers held on it for
+             * the whole run). */
+            char why[320];
+            if (peer != device && coli_v4_hybrid_enabled()) {
+                static int hybrid_said;
+                if (!hybrid_said) {
+                    hybrid_said = 1;
+                    fprintf(stderr, "v4_gpu warning=peer mirror pool off: DSV4_HYBRID=1 "
+                                    "uploads decode misses into device %d's mirrors only "
+                                    "(and keeps V4_GPU_RESIDENT_FIRST off), so a pool on "
+                                    "device %d would stay empty; device %d left unused\n",
+                            device, peer, peer);
+                }
+            } else if (!(peer_capacity = v4_peer_mirrors_capacity())) {
+                /* v4_peer_mirrors_capacity said why */
+            } else if (!dsv4_cuda_peer_probe(device, peer, why, (int)sizeof why)) {
+                fprintf(stderr, "v4_gpu warning=peer mirror pool off: %s\n", why);
+            } else {
+                ndevices = 2;
+            }
+        }
+        /* A failed two-device init released everything it set up, dropped the
+         * peer's context and named the device that failed. The backend's peer
+         * access is best-effort, so verify it actually latched before using
+         * the pool; a peer with no access keeps its context but is not used. */
+        if (ndevices == 2 && !dsv4_cuda_init(devices, 2)) {
+            fprintf(stderr, "v4_gpu warning=two-device init failed; peer mirror pool "
+                            "off, retrying device %d alone\n", device);
+            ndevices = 1;
+        } else if (ndevices == 2 && !dsv4_cuda_peer_access(device, peer)) {
+            fprintf(stderr, "v4_gpu warning=peer access %d<->%d was not enabled; "
+                            "peer mirror pool off, primary continues\n", device, peer);
+            ndevices = 1;
+        }
+    }
+    if (count == 1 && ndevices == 1 && !dsv4_cuda_init(&device, 1)) {
         fprintf(stderr, "v4_gpu warning=backend-unavailable; continuing-CPU\n");
         return 0;
     }
-    /* A build whose kernels cannot run on this device (a DeepGEMM sm_120a
-     * binary on an older card — Linux links one flavour, no DLL selection)
-     * says so once here instead of failing kernel by kernel. */
-    if (!dsv4_cuda_backend_arch_ok(device)) {
-        fprintf(stderr, "v4_gpu warning=backend %s does not support device %d; "
-                        "continuing-CPU (rebuild without DEEPGEMM for sm_80+)\n",
-                dsv4_cuda_backend_name(), device);
-        dsv4_cuda_shutdown();
-        return 0;
+    if (count > 1) {
+        dsv4_cuda_set_peer_best_effort(1);
+        int split_ok = dsv4_cuda_init(engine->gpu.devices, count);
+        dsv4_cuda_set_peer_best_effort(0);
+        if (!split_ok) {
+            fprintf(stderr, "v4_gpu warning=backend-unavailable\n");
+            return -1;
+        }
     }
+    /* A build whose kernels cannot run on a device (a DeepGEMM sm_120a
+     * binary on an older card -- Linux links one flavour, no DLL selection)
+     * says so once here instead of failing kernel by kernel. */
+    for (int i = 0; i < count; i++) {
+        if (!dsv4_cuda_backend_arch_ok(engine->gpu.devices[i])) {
+            fprintf(stderr, "v4_gpu warning=backend %s does not support device %d; "
+                            "continuing-CPU (rebuild without DEEPGEMM for sm_80+)\n",
+                    dsv4_cuda_backend_name(), engine->gpu.devices[i]);
+            dsv4_cuda_shutdown();
+            return count > 1 ? -1 : 0;
+        }
+    }
+    engine->gpu.device_count = count;
     engine->gpu.enabled = 1;
     engine->gpu.device = device;
     g_v4_gpu_open_device = device;
     v4_gpu_mirror_reserve_size(&engine->config,
                                !coli_v4_index_gguf(engine->target_index));
-    /* Routed-expert fp4 mirror cache hangs off the expert store; attach it at
-     * open so moe_token_pipeline can mirror expert weights on demand. Default
-     * capacity covers the pinned (hot) experts per layer so autopin never
-     * forces a mirror eviction mid-generation; override with
-     * DSV4_CUDA_EXPERT_MIRRORS. */
-    int mirror_suggested = engine->config.num_hidden_layers *
-                           COLI_V4_MAX_PIN_SLOTS_PER_LAYER;
-    if (mirror_suggested < 128) mirror_suggested = 128;
-    if (mirror_suggested > 2048) mirror_suggested = 2048;
-    /* The cache grows only while the VRAM reserve stays free (growth guard
-     * in v4_gpu_expert_attach_cached), so the capacity is an upper bound
-     * that free VRAM sizes at run time; a generous default lets bigger cards
-     * fill up. A mirror is 12.75 MiB (gate, up, down: fp4 + UE8M0 scales). */
-    mirror_suggested = 4096;
-    if (engine->experts && !engine->experts->gpu)
-        engine->experts->gpu =
-            v4_gpu_expert_mirrors_create(device, mirror_suggested);
-    fprintf(stderr, "v4_gpu tier=dense-matvec device=%d\n", device);
+    /* Routed-expert fp4 mirror caches hang off the expert store, one per
+     * device and layer range (#1766); with one device a single cache covers
+     * every layer, as before. Each grows only while its card's VRAM reserve
+     * stays free. */
+    if (engine->experts && !engine->experts->gpu) {
+        engine->experts->gpu = v4_gpu_expert_mirrors_create_devices(
+            engine->gpu.devices, count, engine->config.num_hidden_layers);
+        if (!engine->experts->gpu) {
+            coli_v4_gpu_engine_close(engine);
+            return -1;
+        }
+    }
+    /* VRAM-first decode never asks the store for a mirrored expert: its RAM
+     * pin ranking leaves them out (the peer pool's too, once there is one). */
+    if (engine->experts && engine->experts->gpu &&
+        coli_v4_gpu_resident_first() && !coli_v4_hybrid_enabled())
+        coli_v4_expert_store_vram_held = v4_gpu_expert_vram_held;
+    if (ndevices == 2 && engine->experts && engine->experts->gpu && !g_v4_peer_mirrors) {
+        if (dsv4_cuda_peer_access(device, peer)) {
+            g_v4_peer_mirrors =
+                v4_peer_mirrors_create(peer, device, peer_capacity);
+        } else {
+            fprintf(stderr, "v4_gpu warning=no peer access %d<->%d; peer mirror "
+                            "pool off\n", device, peer);
+        }
+    }
+    if (count > 1) {
+        fprintf(stderr, "v4_gpu tier=dense-matvec device=%d devices=%d placement=contiguous-layers\n",
+                device, count);
+        for (int i = 0; i < count; i++)
+            fprintf(stderr, "v4_gpu device=%d layers=%d..%d\n", engine->gpu.devices[i],
+                    coli_v4_gpu_layer_begin(i, count, engine->config.num_hidden_layers),
+                    coli_v4_gpu_layer_begin(i + 1, count, engine->config.num_hidden_layers) - 1);
+    } else {
+        fprintf(stderr, "v4_gpu tier=dense-matvec device=%d\n", device);
+        if (ndevices == 2)
+            fprintf(stderr, "v4_gpu peer=%d peer-mirrors=%d\n", peer, peer_capacity);
+    }
     return 0;
 }
 
@@ -11595,6 +12252,7 @@ void coli_v4_gpu_engine_close(ColiV4Engine *engine) {
      * banks. Callers outside generate() (oracle, teacher forcing, Segment
      * runs) never release them themselves. */
     coli_v4_gpu_moe_batch_release();
+    dsv4_cuda_proj_batch_release();
     for (int layer = 0; layer < COLI_V4_RESIDENT_MAX_LAYERS; layer++) {
         if (!engine->gpu.layer_ready[layer]) continue;
         ColiDeepSeekV4LayerWeights *weights =
@@ -11607,16 +12265,24 @@ void coli_v4_gpu_engine_close(ColiV4Engine *engine) {
         }
         engine->gpu.layer_ready[layer] = 0;
     }
+    coli_v4_expert_store_vram_held = NULL;   /* it scans the caches freed here */
     if (engine->experts && engine->experts->gpu) {
         v4_gpu_expert_mirrors_free(
             (V4GpuExpertMirrorCache *)engine->experts->gpu);
         engine->experts->gpu = NULL;
+    }
+    if (g_v4_peer_mirrors) {
+        v4_gpu_expert_mirrors_free(g_v4_peer_mirrors);
+        g_v4_peer_mirrors = NULL;
     }
     if (engine->gpu.dspark_mirrors) {
         v4_gpu_expert_mirrors_free(
             (V4GpuExpertMirrorCache *)engine->gpu.dspark_mirrors);
         engine->gpu.dspark_mirrors = NULL;
     }
+    dsv4_cuda_tensor_free((Dsv4CudaTensor *)engine->gpu.head);
+    engine->gpu.head = NULL;
+    v4_gpu_route_scratch_clear();
     dsv4_cuda_shutdown();
     engine->gpu.enabled = 0;
     engine->gpu.uploaded_bytes = 0;
@@ -11700,6 +12366,33 @@ static void *v4_gpu_upload_fp8(ColiDeepSeekV4LayerWeights *weights, int device,
     return v4_gpu_upload_fp8_fmt(weights, device, prefix, bytes, 0);
 }
 
+static void *v4_gpu_upload_indexer(ColiDeepSeekV4LayerWeights *weights,
+                                   int device, long long *bytes) {
+    const char *mode = getenv("DSV4_CUDA_RESIDENT_INDEXER");
+    if (mode && !atoi(mode)) return NULL;
+    char name[COLI_V4_MAX_TENSOR_NAME];
+    const ColiDeepSeekV4TensorSpec *spec = NULL, *scale_spec = NULL;
+    snprintf(name, sizeof(name), "layers.%d.attn.indexer.wq_b.weight", weights->plan.layer);
+    const void *data = coli_v4_layer_data(weights, name, &spec);
+    snprintf(name, sizeof(name), "layers.%d.attn.indexer.wq_b.scale", weights->plan.layer);
+    const float *scales = coli_v4_layer_data(weights, name, &scale_spec);
+    if (!data || !scales || !spec || !scale_spec || spec->rank != 2 ||
+        spec->dtype != COLI_ST_F8_E4M3 || scale_spec->dtype != COLI_ST_F8_E8M0 ||
+        spec->shape[0] < 1 || spec->shape[0] > INT_MAX ||
+        spec->shape[1] < 1 || spec->shape[1] > INT_MAX ||
+        scale_spec->rank != 2 || scale_spec->shape[0] != (spec->shape[0] + 127) / 128 ||
+        scale_spec->shape[1] != (spec->shape[1] + 127) / 128) return NULL;
+    Dsv4CudaTensor *tensor = NULL;
+    /* Preserve the resident rows8 layout and decoded float scales. Generic
+     * FP8 mirrors change reduction order and can change indexer Top-k. */
+    if (!dsv4_cuda_upload_fp8_ref(&tensor, data, scales, (int)spec->shape[0],
+                                  (int)spec->shape[1], spec->packed_rows8, device)) return NULL;
+    *bytes += dsv4_cuda_tensor_bytes(tensor);
+    fprintf(stderr, "v4_gpu indexer-resident=on device=%d layer=%d bytes=%lld\n",
+            device, weights->plan.layer, dsv4_cuda_tensor_bytes(tensor));
+    return tensor;
+}
+
 /* f32 mirror with element-count validation (mHC fn/scale/base tensors). */
 static void *v4_gpu_upload_f32_tensor(ColiDeepSeekV4LayerWeights *weights,
                                       int device, const char *key,
@@ -11748,12 +12441,22 @@ static void *v4_gpu_upload_norm_f32(ColiDeepSeekV4LayerWeights *weights,
     return tensor;
 }
 
+static int v4_gpu_indexer_prepare_wanted(void) {
+    const char *setting = getenv("DSV4_CUDA_INDEXER_PREP");
+    return !setting || atoi(setting) != 0;
+}
+
+static int v4_gpu_compressor_wanted(void) {
+    const char *setting = getenv("DSV4_CUDA_COMPRESSOR");
+    return !setting || atoi(setting) != 0;
+}
+
 /* bf16 projection mirror (compressor / indexer-compressor wkv & wgate).
  * Shape-checked here so the batched projection can trust the mirror. */
 static void *v4_gpu_upload_bf16_matrix(ColiDeepSeekV4LayerWeights *weights,
                                        int device, const char *prefix,
                                        int expected_rows, int expected_columns,
-                                       long long *bytes) {
+                                       int packed_decode, long long *bytes) {
     char name[COLI_V4_MAX_TENSOR_NAME];
     const ColiDeepSeekV4TensorSpec *spec = NULL;
     snprintf(name, sizeof(name), "layers.%d.%s.weight", weights->plan.layer,
@@ -11763,8 +12466,11 @@ static void *v4_gpu_upload_bf16_matrix(ColiDeepSeekV4LayerWeights *weights,
         spec->shape[0] != expected_rows || spec->shape[1] != expected_columns)
         return NULL;
     Dsv4CudaTensor *tensor = NULL;
-    if (!dsv4_cuda_upload_bf16(&tensor, (const uint16_t *)data,
-                               expected_rows, expected_columns, device))
+    if (packed_decode)
+        dsv4_cuda_upload_compressor(&tensor, data, expected_rows,
+                                    expected_columns, device);
+    if (!tensor && !dsv4_cuda_upload_bf16(&tensor, data, expected_rows,
+                                         expected_columns, device))
         return NULL;
     if (bytes) *bytes += dsv4_cuda_tensor_bytes(tensor);
     return tensor;
@@ -11821,6 +12527,10 @@ static void *v4_gpu_upload_gate_bias(ColiDeepSeekV4LayerWeights *weights,
 int coli_v4_gpu_layer_upload(ColiV4Engine *engine, int layer,
                              ColiDeepSeekV4LayerWeights *weights) {
     if (!engine || !weights || !engine->gpu.enabled) return 0;
+    int owner = coli_v4_gpu_layer_owner(layer, engine->gpu.device_count,
+                                         engine->config.num_hidden_layers);
+    if (owner < 0) return -1;
+    int device = engine->gpu.devices[owner];
     if (layer < 0 || layer >= COLI_V4_RESIDENT_MAX_LAYERS) return 0;
     if (engine->gpu.layer_ready[layer]) return 0;
     static const char *const tensors[] = {
@@ -11836,7 +12546,7 @@ int coli_v4_gpu_layer_upload(ColiV4Engine *engine, int layer,
          * grouped matvec keeps its historical fmt-8 numerics. */
         int bf16_rounded = coli_v4_gpu_attn_batch_wanted() &&
                            strcmp(tensors[i], "attn.wo_a") == 0;
-        void *handle = v4_gpu_upload_fp8_fmt(weights, engine->gpu.device,
+        void *handle = v4_gpu_upload_fp8_fmt(weights, device,
                                              tensors[i], &bytes, bf16_rounded);
         if (!handle) continue;
         if (coli_v4_layer_gpu_set(weights, tensors[i], handle)) {
@@ -11844,40 +12554,53 @@ int coli_v4_gpu_layer_upload(ColiV4Engine *engine, int layer,
             continue;
         }
     }
-    /* Compressor / indexer-compressor projection mirrors for the batched
-     * attention path (COLI_CUDA_ATTN_BATCH=1). Missing tensors (layers
-     * without compression) simply leave the mirror NULL. */
-    if (coli_v4_gpu_attn_batch_wanted()) {
+    /* Decode compressor projections are resident by default. The CPU owns
+     * their sliding state; missing mirrors retain the reference fallback. */
+    if (coli_v4_gpu_attn_batch_wanted() || v4_gpu_compressor_wanted() ||
+        v4_gpu_indexer_prepare_wanted()) {
         const ColiDeepSeekV4Config *config = coli_v4_engine_config(engine);
+        void *indexer = coli_v4_gpu_attn_batch_wanted()
+            ? v4_gpu_upload_indexer(weights, device, &bytes) : NULL;
+        if (indexer && coli_v4_layer_gpu_set(weights, "attn.indexer.wq_b", indexer))
+            dsv4_cuda_tensor_free((Dsv4CudaTensor *)indexer);
         int ratio = weights->plan.compression_ratio;
-        if (config && ratio) {
+        if (config && ratio &&
+            (coli_v4_gpu_attn_batch_wanted() || v4_gpu_compressor_wanted())) {
             int comp_rows = (ratio == 4 ? 2 : 1) * config->head_dim;
             static const char *const comp_keys[2] =
                 {"attn.compressor.wkv", "attn.compressor.wgate"};
             for (int k = 0; k < 2; k++) {
                 void *handle = v4_gpu_upload_bf16_matrix(
-                    weights, engine->gpu.device, comp_keys[k], comp_rows,
-                    config->hidden_size, &bytes);
+                    weights, device, comp_keys[k], comp_rows,
+                    config->hidden_size, v4_gpu_compressor_wanted(), &bytes);
                 if (handle && coli_v4_layer_gpu_set(weights, comp_keys[k],
                                                     handle))
                     dsv4_cuda_tensor_free((Dsv4CudaTensor *)handle);
             }
         }
-        if (config && weights->plan.has_indexer) {
+        if (config && weights->plan.has_indexer &&
+            (coli_v4_gpu_attn_batch_wanted() || v4_gpu_compressor_wanted())) {
             int idx_rows = 2 * config->index_head_dim;
             static const char *const idx_keys[2] =
                 {"attn.indexer.compressor.wkv", "attn.indexer.compressor.wgate"};
             for (int k = 0; k < 2; k++) {
                 void *handle = v4_gpu_upload_bf16_matrix(
-                    weights, engine->gpu.device, idx_keys[k], idx_rows,
-                    config->hidden_size, &bytes);
+                    weights, device, idx_keys[k], idx_rows,
+                    config->hidden_size, v4_gpu_compressor_wanted(), &bytes);
                 if (handle && coli_v4_layer_gpu_set(weights, idx_keys[k],
                                                     handle))
                     dsv4_cuda_tensor_free((Dsv4CudaTensor *)handle);
             }
         }
+        if (config && weights->plan.has_indexer && v4_gpu_indexer_prepare_wanted()) {
+            const char *key = "attn.indexer.weights_proj";
+            void *handle = v4_gpu_upload_bf16_matrix(weights, device, key,
+                config->index_n_heads, config->hidden_size, 1, &bytes);
+            if (handle && coli_v4_layer_gpu_set(weights, key, handle))
+                dsv4_cuda_tensor_free(handle);
+        }
         /* mHC mixing weights + branch norms for the batched mHC kernels. */
-        if (config && config->hc_mult == 4) {
+        if (coli_v4_gpu_attn_batch_wanted() && config && config->hc_mult == 4) {
             int hc = config->hc_mult, d = config->hidden_size;
             int mix_rows = (2 + hc) * hc;
             static const char *const hc_keys[2][3] = {
@@ -11887,21 +12610,21 @@ int coli_v4_gpu_layer_upload(ColiV4Engine *engine, int layer,
             static const char *const norm_keys[2] = {"attn_norm", "ffn_norm"};
             for (int b = 0; b < 2; b++) {
                 void *fn = v4_gpu_upload_f32_tensor(
-                    weights, engine->gpu.device, hc_keys[b][0], mix_rows,
+                    weights, device, hc_keys[b][0], mix_rows,
                     hc * d, &bytes);
                 if (fn && coli_v4_layer_gpu_set(weights, hc_keys[b][0], fn))
                     dsv4_cuda_tensor_free((Dsv4CudaTensor *)fn);
                 void *sc = v4_gpu_upload_f32_tensor(
-                    weights, engine->gpu.device, hc_keys[b][1], 3, 1, &bytes);
+                    weights, device, hc_keys[b][1], 3, 1, &bytes);
                 if (sc && coli_v4_layer_gpu_set(weights, hc_keys[b][1], sc))
                     dsv4_cuda_tensor_free((Dsv4CudaTensor *)sc);
                 void *bs = v4_gpu_upload_f32_tensor(
-                    weights, engine->gpu.device, hc_keys[b][2], mix_rows, 1,
+                    weights, device, hc_keys[b][2], mix_rows, 1,
                     &bytes);
                 if (bs && coli_v4_layer_gpu_set(weights, hc_keys[b][2], bs))
                     dsv4_cuda_tensor_free((Dsv4CudaTensor *)bs);
                 void *nm = v4_gpu_upload_norm_f32(
-                    weights, engine->gpu.device, norm_keys[b], d, &bytes);
+                    weights, device, norm_keys[b], d, &bytes);
                 if (nm && coli_v4_layer_gpu_set(weights, norm_keys[b], nm))
                     dsv4_cuda_tensor_free((Dsv4CudaTensor *)nm);
             }
@@ -11909,12 +12632,12 @@ int coli_v4_gpu_layer_upload(ColiV4Engine *engine, int layer,
     }
     /* Router mirrors (gate f32, bias f32). Missing/shape-mismatched uploads
      * leave the mirror NULL and moe_token_pipeline falls back to the CPU route. */
-    void *gate = v4_gpu_upload_gate(weights, engine->gpu.device, &bytes);
+    void *gate = v4_gpu_upload_gate(weights, device, &bytes);
     if (gate && coli_v4_layer_gpu_set(weights, "ffn.gate", gate)) {
         dsv4_cuda_tensor_free((Dsv4CudaTensor *)gate);
         gate = NULL;
     }
-    void *bias = v4_gpu_upload_gate_bias(weights, engine->gpu.device, &bytes);
+    void *bias = v4_gpu_upload_gate_bias(weights, device, &bytes);
     if (bias && coli_v4_layer_gpu_set(weights, "ffn.gate.bias", bias)) {
         dsv4_cuda_tensor_free((Dsv4CudaTensor *)bias);
         bias = NULL;
@@ -11929,11 +12652,129 @@ int coli_v4_gpu_layer_upload(ColiV4Engine *engine, int layer,
     return 0;
 }
 
+/* VRAM kept free while resident experts preload and the exact head uploads.
+ * This is deliberately separate from DSV4_CUDA_VRAM_RESERVE_MB: that one is
+ * the decode mirror cache's bank-aware growth reserve, while the preload needs
+ * room for the whole expert table and its packing copy. */
+static long long v4_gpu_resident_reserve_mb(void) {
+    const char *setting = getenv("DSV4_CUDA_RESIDENT_RESERVE_MB");
+    long long reserve = setting ? atoll(setting) : 2800;
+    return reserve < 256 ? 256 : reserve;
+}
+
+void coli_v4_gpu_head_upload(ColiV4Engine *engine) {
+#if defined(__AVX2__)
+    const char *enabled = getenv("DSV4_CUDA_HEAD");
+    if (!engine || !engine->gpu.enabled || engine->gpu.head ||
+        !engine->head_cache.data || (enabled && !atoi(enabled))) return;
+    int rows = engine->config.vocab_size, cols = engine->config.hidden_size;
+    if (rows < 1 || rows % 32 || cols < 1 || cols % 8 ||
+        engine->head_cache.bytes != (uint64_t)rows * cols * 2) return;
+    long long reserve = v4_gpu_resident_reserve_mb();
+    long long need = ((long long)rows * cols * 4 + 1048575) / 1048576;
+    /* After expert preloading: never displace complete banks to fit the head.
+     * Packing temporarily needs both copies; final residency retains one.
+     * Prefer the owning (last) device, then any other with room, rather than
+     * always pinning the head to device 0. */
+    int count = engine->gpu.device_count > 0 ? engine->gpu.device_count : 1;
+    int first = engine->gpu.device_count > 0 ? engine->gpu.devices[0] : engine->gpu.device;
+    const char *forced_setting = getenv("DSV4_CUDA_HEAD_DEVICE");
+    int forced = forced_setting && *forced_setting ? atoi(forced_setting) : -1;
+    int order[COLI_V4_GPU_MAX_DEVICES], n = 0;
+    if (forced >= 0) {
+        for (int i = 0; i < count; i++) {
+            int d = engine->gpu.device_count > 0 ? engine->gpu.devices[i] : engine->gpu.device;
+            if (d == forced) { order[n++] = d; break; }
+        }
+    }
+    for (int i = count - 1; i >= 0; i--) {
+        int d = engine->gpu.device_count > 0 ? engine->gpu.devices[i] : engine->gpu.device;
+        if (d == forced) continue;
+        order[n++] = d;
+    }
+    Dsv4CudaTensor *head = NULL;
+    int device = -1;
+    for (int k = 0; k < n; k++) {
+        int candidate = order[k];
+        if (dsv4_cuda_mem_free_mb(candidate) < reserve + need) continue;
+        if (dsv4_cuda_upload_head_exact(&head, (const uint16_t *)engine->head_cache.data,
+                                        rows, cols, candidate)) {
+            device = candidate;
+            break;
+        }
+        if (head) {
+            dsv4_cuda_tensor_free(head);
+            head = NULL;
+        }
+    }
+    if (!head) {
+        fprintf(stderr, "v4_gpu head=cpu-fallback device=%d free-MiB=%lld need-MiB=%lld reserve-MiB=%lld\n",
+                first, dsv4_cuda_mem_free_mb(first), need, reserve);
+        return;
+    }
+    engine->gpu.head = head;
+    long long bytes = dsv4_cuda_tensor_bytes(head);
+    engine->gpu.uploaded_bytes += bytes;
+    fprintf(stderr, "v4_gpu head=resident device=%d bytes=%lld arithmetic=separate-mul-add\n", device, bytes);
+#else
+    (void)engine;
+#endif
+}
+
+int coli_v4_gpu_head_scores(ColiV4Engine *engine,const float *input,float *scores) {
+    if (!engine || !engine->gpu.enabled || !engine->gpu.head) return -1;
+    return dsv4_cuda_head_scores_exact(engine->gpu.head, input, scores) ? 0 : -1;
+}
+
+int coli_v4_gpu_head_batch(ColiV4Engine *engine,const float *input,int batch,
+                           float *scores,int *ids,float *values) {
+    const char *enabled = getenv("DSV4_CUDA_HEAD_BATCH");
+    if ((enabled && !atoi(enabled)) || !engine || !engine->gpu.enabled ||
+        !engine->gpu.head || !input || batch < 1 || batch > 128) return -1;
+    if (scores)
+        return dsv4_cuda_head_scores_batch_exact(engine->gpu.head, input, batch, scores) ? 0 : -1;
+    return dsv4_cuda_head_argmax_batch_exact(engine->gpu.head, input, batch, ids, values) ? 0 : -1;
+}
+
 int coli_v4_gpu_fp8_matvec(const ColiTensorView *w, float *output,
                            const float *input) {
     Dsv4CudaTensor *tensor = (Dsv4CudaTensor *)w->gpu;
     if (!tensor) return -1;
     return dsv4_cuda_matvec(tensor, output, (float *)input) ? 0 : -1;
+}
+
+int coli_v4_gpu_wo_decode(const ColiTensorView *a, const ColiTensorView *b,
+                           float *output, const float *input, int groups) {
+    const char *enabled = getenv("DSV4_CUDA_WO_DECODE");
+    if ((enabled && !atoi(enabled)) || !a->gpu || !b->gpu) return -1;
+    return dsv4_cuda_wo_decode(a->gpu, b->gpu, groups, output, input) ? 0 : -1;
+}
+
+/* V4_ATTN_BATCH_PROJ (opt-in): the decode input projections of one token in one device
+ * round trip (dsv4_cuda_proj_batch). The host stage is kept for the process lifetime
+ * (a few KB to a few hundred KB).
+ * shortcut: stage is never freed, its size is bounded by 6 projections, upgrade: free it on engine close. */
+int coli_v4_gpu_proj_batch(void *const *tensors, const int *rows, float **outs,
+                           int n, const float *input) {
+    static float *stage;
+    static size_t stage_floats;
+    if (n < 1 || n > 6 || !tensors || !rows || !outs || !input) return -1;
+    size_t total = 0;
+    for (int i = 0; i < n; i++) total += (size_t)rows[i];
+    if (total > stage_floats) {
+        float *grown = realloc(stage, total * sizeof(*grown));
+        if (!grown) return -1;
+        stage = grown;
+        stage_floats = total;
+    }
+    if (dsv4_cuda_proj_batch(n, (Dsv4CudaTensor *const *)tensors, rows, input, stage) != 1)
+        return -1;
+    size_t off = 0;
+    for (int i = 0; i < n; i++) {
+        memcpy(outs[i], stage + off, (size_t)rows[i] * sizeof(float));
+        off += (size_t)rows[i];
+    }
+    return 0;
 }
 
 int coli_v4_gpu_matvec_grouped(const ColiTensorView *w, float *output,
@@ -11987,6 +12828,52 @@ int coli_v4_gpu_fp8_matmul_batch(const ColiTensorView *w, float *outputs,
     return 0;
 }
 
+/* The route on resolved gate / bias tensors (bias may be NULL). Shared by
+ * coli_v4_gpu_route and the test hooks, so the test drives the same code. */
+static int v4_gpu_route_mirrors(float *route_weights, int *indices, const float *input,
+                                Dsv4CudaTensor *gate, Dsv4CudaTensor *bias_t,
+                                const int *forced_indices, int dimension, float route_scale) {
+    int device = dsv4_cuda_tensor_device(gate);
+    if (device < 0) return -1;
+    /* V4_GPU_ROUTE_REUSE=1: one retained input buffer per device, grown on demand,
+     * instead of a cudaMalloc/cudaFree pair per call. Opt-in: default is the old path. */
+    const char *reuse_env = getenv("V4_GPU_ROUTE_REUSE");
+    int reuse = reuse_env && atoi(reuse_env) != 0 && device < V4_GPU_ROUTE_MAX_DEV;
+    Dsv4CudaActivation *act = NULL;
+    if (reuse) {
+        /* the retained capacity may exceed this call's logical input: refuse a gate
+         * wider than the input, or the backend would read past what was uploaded */
+        if (dsv4_cuda_tensor_bytes(gate) > (long long)256 * dimension * (long long)sizeof(float))
+            return -1;
+        struct V4GpuRouteScratch *scratch = v4_gpu_route_scratch + device;
+        if (scratch->capacity < dimension) {
+            if (scratch->input) dsv4_cuda_activation_free(scratch->input);
+            scratch->input = dsv4_cuda_activation_create(device, dimension);
+            scratch->capacity = scratch->input ? dimension : 0;
+        }
+        act = scratch->input;
+    } else {
+        act = dsv4_cuda_activation_create(device, dimension);
+    }
+    if (!act) return -1;
+    int ok = dsv4_cuda_activation_upload(act, input, dimension);
+    int ids[6];
+    float wts[6];
+    if (ok) ok = dsv4_cuda_route(act, gate, bias_t,
+                                 forced_indices, route_scale, ids, wts);
+    if (!reuse) {
+        dsv4_cuda_activation_free(act);
+    } else if (!ok) {
+        dsv4_cuda_activation_sync(act);   /* drain queued work before the next reuse */
+    }
+    if (!ok) return -1;
+    for (int k = 0; k < 6; k++) {
+        indices[k] = ids[k];
+        route_weights[k] = wts[k];
+    }
+    return 0;
+}
+
 int coli_v4_gpu_route(float *route_weights, int *indices, const float *input,
                       const ColiDeepSeekV4LayerWeights *weights,
                       const float *bias, const int *forced_indices,
@@ -11997,23 +12884,22 @@ int coli_v4_gpu_route(float *route_weights, int *indices, const float *input,
     Dsv4CudaTensor *gate = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "ffn.gate");
     Dsv4CudaTensor *bias_t = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "ffn.gate.bias");
     if (!gate || (bias && !bias_t)) return -1;
-    int device = dsv4_cuda_tensor_device(gate);
-    if (device < 0) return -1;
-    Dsv4CudaActivation *act = dsv4_cuda_activation_create(device, dimension);
-    if (!act) return -1;
-    int ok = dsv4_cuda_activation_upload(act, input, dimension);
-    int ids[6];
-    float wts[6];
-    if (ok) ok = dsv4_cuda_route(act, gate, bias ? bias_t : NULL,
-                                 forced_indices, route_scale, ids, wts);
-    dsv4_cuda_activation_free(act);
-    if (!ok) return -1;
-    for (int k = 0; k < topk; k++) {
-        indices[k] = ids[k];
-        route_weights[k] = wts[k];
-    }
-    return 0;
+    return v4_gpu_route_mirrors(route_weights, indices, input, gate,
+                                bias ? bias_t : NULL, forced_indices, dimension, route_scale);
 }
+
+#ifdef COLI_V4_TEST_HOOKS
+int coli_v4_test_gpu_route_mirrors(float *route_weights, int *indices, const float *input,
+                                   void *gate, void *bias, const int *forced_indices,
+                                   int dimension, float route_scale) {
+    return v4_gpu_route_mirrors(route_weights, indices, input, (Dsv4CudaTensor *)gate,
+                                (Dsv4CudaTensor *)bias, forced_indices, dimension, route_scale);
+}
+void coli_v4_test_gpu_route_scratch_clear(void) { v4_gpu_route_scratch_clear(); }
+long long coli_v4_test_gpu_route_scratch_capacity(int device) {
+    return device >= 0 && device < V4_GPU_ROUTE_MAX_DEV ? v4_gpu_route_scratch[device].capacity : 0;
+}
+#endif
 
 /* ---- routed-expert fp4 mirrors ---------------------------------------
  * The 256-expert bank is fp4 in the same packed-nibble + per-row UE8M0
@@ -12032,14 +12918,64 @@ typedef struct {
     uint64_t clock;
 } V4GpuExpertMirror;
 
+/* Every entry in [0, count) holds a live mirror (gate, up and down): a
+ * failed upload rolls its slot back instead of leaving a dead entry. */
 struct V4GpuExpertMirrorCache {
     V4GpuExpertMirror *entries;
     int capacity;
     int count;
-    uint64_t clock;
     int device;
+    int first_layer, end_layer;
+    int experts_per_layer; /* nonzero: immutable, directly indexed resident table */
+    Dsv4CudaExpertSet **route_sets; /* borrowed weights, owned descriptor tables */
+    int route_announced;
+    struct V4GpuExpertMirrorCache *next;
     pthread_mutex_t mutex;
+    /* growth guard state, per cache (a peer pool on another card has its own
+     * free VRAM and its own, smaller reserve). reserve_mb < 0 = the bank-sized
+     * default of the primary card (v4_gpu_mirror_reserve_mb, per miss).
+     * last_free_mb is the last free-VRAM probe, grown_bytes the mirrors this
+     * cache has uploaded since; upload_failed: last_free_mb is the 0 a
+     * failed upload left, not a probe's answer. */
+    long long reserve_mb;
+    long long last_free_mb;
+    long long grown_bytes;
+    unsigned probes;
+    int unified;
+    const char *reserve_env;   /* the variable that sets reserve_mb */
+    int frozen_warned;
+    int upload_failed;
 };
+/* A layer attaches its 6 routed experts before computing them, and a slot is
+ * recycled in place: a cache with fewer live mirrors than this would recycle
+ * one an earlier view of the same token still references (measured:
+ * DSV4_CUDA_EXPERT_MIRRORS=1 produces garbage, #1538). Below it a cache only
+ * grows, and the tiered attach never picks it as the victim. */
+#define V4_MIRROR_RECYCLE_MIN 8
+/* One LRU clock for every mirror cache, so the peer pool and the primary
+ * cache can compare their victims' ages. */
+static uint64_t g_v4_mirror_clock;
+static uint64_t v4_mirror_tick(void) {
+    return __atomic_add_fetch(&g_v4_mirror_clock, 1, __ATOMIC_RELAXED);
+}
+/* Mirror uploads, every cache (coli_v4_gpu_expert_uploads). Uploads happen on
+ * the generation thread only. */
+static unsigned long long g_v4_mirror_uploads;
+unsigned long long coli_v4_gpu_expert_uploads(void) {
+    return g_v4_mirror_uploads;
+}
+/* The peer pool while its device is healthy. Once a peer-side CUDA failure
+ * has latched the device off (dsv4_cuda_peer_healthy) the pool counts as
+ * absent: its mirrors are misses and decode goes on with the primary. The
+ * pool itself, and its VRAM on that GPU, stays allocated until
+ * coli_v4_gpu_engine_close: freeing it here would pull mirrors out from
+ * under views and lookups still holding them, and on a lost device the
+ * frees fail anyway. */
+static V4GpuExpertMirrorCache *v4_peer_pool(void) {
+    V4GpuExpertMirrorCache *peer = g_v4_peer_mirrors;
+    return peer && dsv4_cuda_peer_healthy(peer->device) ? peer : NULL;
+}
+int coli_v4_gpu_peer_pool_up(void) { return v4_peer_pool() != NULL; }
 
 static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create_capacity(
     int device, int capacity) {
@@ -12052,7 +12988,59 @@ static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create_capacity(
     }
     cache->capacity = capacity;
     cache->device = device;
+    cache->reserve_mb = -1;
+    cache->last_free_mb = -1;
+    cache->unified = -1;
+    cache->reserve_env = "DSV4_CUDA_VRAM_RESERVE_MB";
     pthread_mutex_init(&cache->mutex, NULL);
+    return cache;
+}
+
+/* The peer pool's capacity, DSV4_CUDA_PEER_MIRRORS (4096), asked by engine
+ * open before the peer is initialised. A capacity below V4_MIRROR_RECYCLE_MIN
+ * could never recycle and would only take misses from the primary cache, so
+ * it (or a value that is not a number) leaves the pool off: 0, with one
+ * warning line. */
+static int v4_peer_mirrors_capacity(void) {
+    const char *cap = getenv("DSV4_CUDA_PEER_MIRRORS");
+    long long capacity = 4096;
+    if (cap && *cap) {
+        char *end = NULL;
+        capacity = strtoll(cap, &end, 10);
+        if (*end || capacity < V4_MIRROR_RECYCLE_MIN || capacity > INT_MAX) {
+            fprintf(stderr, "v4_gpu warning=DSV4_CUDA_PEER_MIRRORS=%s is not a "
+                            "capacity of %d or more; peer mirror pool off\n",
+                    cap, V4_MIRROR_RECYCLE_MIN);
+            return 0;
+        }
+    }
+    return (int)capacity;
+}
+
+/* The peer pool: `capacity` mirrors (v4_peer_mirrors_capacity), its own VRAM
+ * reserve DSV4_CUDA_PEER_RESERVE_MB (1024: no dense weights or prefill bank
+ * live on the peer card). */
+static V4GpuExpertMirrorCache *v4_peer_mirrors_create(int device, int primary,
+                                                      int capacity) {
+    if (capacity < V4_MIRROR_RECYCLE_MIN) return NULL;
+    V4GpuExpertMirrorCache *cache =
+        v4_gpu_expert_mirrors_create_capacity(device, capacity);
+    if (!cache) return NULL;
+    cache->reserve_env = "DSV4_CUDA_PEER_RESERVE_MB";
+    const char *res = getenv("DSV4_CUDA_PEER_RESERVE_MB");
+    cache->reserve_mb = res ? atoll(res) : 1024;
+    if (cache->reserve_mb < 256) cache->reserve_mb = 256;
+    /* mode=compute: the fused MoE runs the pool's experts on the peer GPU;
+     * p2p-read: the primary reads them in place (DSV4_CUDA_PEER_COMPUTE=0,
+     * DSV4_CUDA_BATCHED=0, or GPUs of different SM versions). */
+    if (dsv4_cuda_peer_compute(primary, device))
+        fprintf(stderr, "v4_gpu peer-mirrors device=%d reserve=%lldMB mode=compute "
+                        "(the decode MoE runs these experts on device %d)\n",
+                device, cache->reserve_mb, device);
+    else
+        fprintf(stderr, "v4_gpu peer-mirrors device=%d reserve=%lldMB mode=p2p-read "
+                        "(device %d reads these experts in place over P2P)\n",
+                device, cache->reserve_mb, primary);
     return cache;
 }
 
@@ -12066,6 +13054,12 @@ static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create(int device,
 
 static void v4_gpu_expert_mirrors_free(V4GpuExpertMirrorCache *cache) {
     if (!cache) return;
+    v4_gpu_expert_mirrors_free(cache->next);
+    if (cache->route_sets) {
+        for (int i = 0; i < cache->end_layer - cache->first_layer; i++)
+            dsv4_cuda_expert_set_free(cache->route_sets[i]);
+        free(cache->route_sets);
+    }
     for (int i = 0; i < cache->count; i++) {
         if (cache->entries[i].gate)
             dsv4_cuda_tensor_free(cache->entries[i].gate);
@@ -12079,20 +13073,204 @@ static void v4_gpu_expert_mirrors_free(V4GpuExpertMirrorCache *cache) {
     free(cache);
 }
 
+static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create_devices(
+    const int *devices, int count, int layers) {
+    V4GpuExpertMirrorCache *head = NULL, **tail = &head;
+    for (int i = 0; i < count; i++) {
+        *tail = v4_gpu_expert_mirrors_create(devices[i], 4096);
+        if (!*tail) {
+            v4_gpu_expert_mirrors_free(head);
+            return NULL;
+        }
+        (*tail)->first_layer = coli_v4_gpu_layer_begin(i, count, layers);
+        (*tail)->end_layer = coli_v4_gpu_layer_begin(i + 1, count, layers);
+        tail = &(*tail)->next;
+    }
+    return head;
+}
+
+static V4GpuExpertMirrorCache *v4_gpu_expert_cache(ColiExpertStore *store,
+                                                 int layer) {
+    for (V4GpuExpertMirrorCache *c = store ? store->gpu : NULL; c; c = c->next)
+        if (layer >= c->first_layer && layer < c->end_layer) return c;
+    return NULL;
+}
+
+static V4GpuExpertMirror *v4_gpu_expert_find(V4GpuExpertMirrorCache *cache,
+                                             int layer, int expert) {
+    if (!cache) return NULL;
+    if (cache->experts_per_layer) {
+        if (layer < cache->first_layer || layer >= cache->end_layer ||
+            expert < 0 || expert >= cache->experts_per_layer) return NULL;
+        return &cache->entries[(layer - cache->first_layer) *
+                              cache->experts_per_layer + expert];
+    }
+    for (int i = 0; i < cache->count; i++)
+        if (cache->entries[i].layer == layer && cache->entries[i].expert == expert)
+            return &cache->entries[i];
+    return NULL;
+}
+
+int coli_v4_gpu_experts_resident(ColiExpertStore *store, int layer) {
+    V4GpuExpertMirrorCache *cache = v4_gpu_expert_cache(store, layer);
+    return cache && cache->experts_per_layer;
+}
+
+/* Populate a private table. It is only published after every device succeeds. */
+static int v4_gpu_experts_load(V4GpuExpertMirrorCache *cache,
+                                ColiExpertStore *store, int experts,
+                                int hidden, int intermediate) {
+    for (int layer = cache->first_layer; layer < cache->end_layer; layer++) {
+        for (int expert = 0; expert < experts; expert++) {
+            ColiExpertView view = {0};
+            if (coli_expert_lookup(store, (ColiExpertKey){layer, expert}, &view))
+                return -1;
+            V4GpuExpertMirror *entry = &cache->entries[cache->count++];
+            entry->layer = layer;
+            entry->expert = expert;
+            int ok = view.gate.rows == intermediate && view.gate.columns == hidden &&
+                view.up.rows == intermediate && view.up.columns == hidden &&
+                view.down.rows == hidden && view.down.columns == intermediate &&
+                view.gate.block_rows == 1 && view.up.block_rows == 1 &&
+                view.down.block_rows == 1 &&
+                view.gate.data && view.gate.scales && view.up.data &&
+                view.up.scales && view.down.data && view.down.scales &&
+                dsv4_cuda_upload_fp4(&entry->gate, view.gate.data, view.gate.scales,
+                    view.gate.rows, view.gate.columns, cache->device) &&
+                dsv4_cuda_upload_fp4(&entry->up, view.up.data, view.up.scales,
+                    view.up.rows, view.up.columns, cache->device) &&
+                dsv4_cuda_upload_fp4(&entry->down, view.down.data, view.down.scales,
+                    view.down.rows, view.down.columns, cache->device);
+            coli_expert_release(store, &view);
+            if (!ok) return -1;
+        }
+        fprintf(stderr, "v4_gpu resident-experts device=%d layer=%d experts=%d\n",
+                cache->device, layer, experts);
+    }
+    cache->experts_per_layer = experts;
+    return 0;
+}
+
+int coli_v4_gpu_experts_init(ColiV4Engine *engine, char *error, size_t error_size) {
+    const char *resident_experts = getenv("DSV4_CUDA_RESIDENT_EXPERTS");
+    int resident_auto = !resident_experts || strcmp(resident_experts, "auto") == 0;
+    if (resident_auto || atoi(resident_experts)) {
+        int preload = coli_v4_gpu_experts_preload(engine, error, error_size);
+        /* preload < 0 is a hard load failure (missing shared mirror, layer
+         * load, allocation or table load): reject the engine even under auto.
+         * preload > 0 is only a budget refusal, where auto keeps the cache. */
+        if (preload < 0) return -1;
+        if (preload > 0) {
+            if (!resident_auto) return -1;
+            if (engine->gpu.enabled)
+                fprintf(stderr, "v4_gpu resident-experts=cache-fallback (%s)\n",
+                        error && error_size ? error : "insufficient budget");
+            if (error && error_size) error[0] = '\0';
+        }
+    }
+    return 0;
+}
+
+int coli_v4_gpu_experts_preload(ColiV4Engine *engine, char *error, size_t size) {
+    struct timespec started;
+    clock_gettime(CLOCK_MONOTONIC, &started);
+    if (error && size) snprintf(error, size, "cannot preload resident CUDA experts");
+    if (!engine || !engine->gpu.enabled || !engine->experts ||
+        !engine->runtime.dense_resident) return 1;
+    int layers = engine->config.num_hidden_layers;
+    int experts = engine->config.n_routed_experts;
+    int hidden = engine->config.hidden_size;
+    int intermediate = engine->config.moe_intermediate_size;
+    if (layers < 1 || layers > COLI_V4_RESIDENT_MAX_LAYERS ||
+        engine->gpu.device_count < 1 || engine->gpu.device_count > layers ||
+        experts < 1 || hidden < 1 || intermediate < 1) return -1;
+    if (hidden % 32 || intermediate % 32) return 1;
+    /* Allocate dense mirrors first, so their footprint is in the VRAM check. */
+    for (int layer = 0; layer < layers; layer++) {
+        ColiDeepSeekV4LayerWeights weights;
+        if (coli_v4_layer_load(engine, &weights, &engine->config,
+                engine->target_index, layer, error, size)) return -1;
+        if (!coli_v4_layer_gpu(&weights, "ffn.shared_experts.w1") ||
+            !coli_v4_layer_gpu(&weights, "ffn.shared_experts.w3") ||
+            !coli_v4_layer_gpu(&weights, "ffn.shared_experts.w2")) return -1;
+    }
+    long long reserve = v4_gpu_resident_reserve_mb();
+    uint64_t bytes = (uint64_t)hidden * intermediate * 3 / 32 * 17;
+    V4GpuExpertMirrorCache *head = NULL, **tail = &head;
+    for (int i = 0; i < engine->gpu.device_count; i++) {
+        int first = coli_v4_gpu_layer_begin(i, engine->gpu.device_count, layers);
+        int end = coli_v4_gpu_layer_begin(i + 1, engine->gpu.device_count, layers);
+        uint64_t slots = (uint64_t)(end - first) * experts;
+        long long free_mb = dsv4_cuda_mem_free_mb(engine->gpu.devices[i]);
+        if (slots > INT_MAX || bytes > UINT64_MAX / slots || free_mb < reserve ||
+            bytes * slots / (1024 * 1024) + 1 > (uint64_t)(free_mb - reserve)) {
+            if (error && size) snprintf(error, size,
+                "resident experts exceed device %d budget (free=%lld MiB reserve=%lld MiB)",
+                engine->gpu.devices[i], free_mb, reserve);
+            v4_gpu_expert_mirrors_free(head);
+            return 1;
+        }
+        fprintf(stderr, "v4_gpu resident-budget device=%d experts=%llu bytes=%llu free-MiB=%lld reserve-MiB=%lld\n",
+                engine->gpu.devices[i], (unsigned long long)slots,
+                (unsigned long long)(bytes * slots), free_mb, reserve);
+        *tail = v4_gpu_expert_mirrors_create_capacity(engine->gpu.devices[i], (int)slots);
+        if (!*tail) goto fail;
+        (*tail)->first_layer = first;
+        (*tail)->end_layer = end;
+        tail = &(*tail)->next;
+    }
+    for (V4GpuExpertMirrorCache *cache = head; cache; cache = cache->next)
+        if (v4_gpu_experts_load(cache, engine->experts, experts, hidden, intermediate)) goto fail;
+    v4_gpu_expert_mirrors_free(engine->experts->gpu);
+    engine->experts->gpu = head;
+    struct timespec finished;
+    clock_gettime(CLOCK_MONOTONIC, &finished);
+    double seconds = finished.tv_sec - started.tv_sec +
+                     (finished.tv_nsec - started.tv_nsec) * 1e-9;
+    fprintf(stderr, "v4_gpu resident-experts=ready layers=%d experts-per-layer=%d preload-seconds=%.3f\n",
+            layers, experts, seconds);
+    return 0;
+fail:
+    v4_gpu_expert_mirrors_free(head);
+    return -1;
+}
+
+/* Once per cache: it cannot grow and holds too few live mirrors to recycle
+ * one, named by its card and the variable that sets its reserve. */
+static void v4_mirror_warn_frozen(V4GpuExpertMirrorCache *cache,
+                                  long long reserve_mb) {
+    if (cache->frozen_warned) return;
+    cache->frozen_warned = 1;
+    fprintf(stderr, "v4_gpu mirror-cache: device %d frozen below its %lld MiB "
+                    "VRAM reserve with %d live entries; a layer attaches up to "
+                    "%d before computing, so this cache takes no new experts "
+                    "until it can grow (free VRAM on device %d or lower %s)\n",
+            cache->device, reserve_mb, cache->count, V4_MIRROR_RECYCLE_MIN,
+            cache->device, cache->reserve_env);
+}
+
+/* grow_only: return -2 instead of recycling an entry when this cache cannot
+ * grow (the tiered attach then tries the next cache), also when the upload
+ * of a new mirror failed. -1 = this cache cannot take the expert at all. */
+static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
+                                            ColiExpertView *view, int sync,
+                                            int grow_only);
 static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
                                           ColiExpertView *view, int sync) {
-    if (!cache || !view) return -1;
+    return v4_gpu_expert_attach_cached_mode(cache, view, sync, 0);
+}
+static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
+                                            ColiExpertView *view, int sync,
+                                            int grow_only) {
+    if (!cache || !view || dsv4_cuda_lost()) return -1;   /* no mirror after a sticky CUDA fault */
     if (view->gate.block_rows != 1 || view->up.block_rows != 1 ||
         view->down.block_rows != 1)
         return -1;
     if (view->gate.format != COLI_TENSOR_FP4_NATIVE_BLOCK || view->up.format != COLI_TENSOR_FP4_NATIVE_BLOCK ||
         view->down.format != COLI_TENSOR_FP4_NATIVE_BLOCK)
         return -1;   /* a GGUF expert in another ggml type: the CPU's */
-    /* A layer attaches its 6 routed experts before computing them; a cache
-     * smaller than that would recycle a slot still referenced by an earlier
-     * view of the same token (measured: DSV4_CUDA_EXPERT_MIRRORS=1 produces
-     * garbage). Below 8 entries, stay on the CPU. */
-    if (cache->capacity < 8) return -1;
+    /* Below V4_MIRROR_RECYCLE_MIN entries, stay on the CPU. */
+    if (cache->capacity < V4_MIRROR_RECYCLE_MIN) return -1;
     pthread_mutex_lock(&cache->mutex);
     int found = -1;
     for (int i = 0; i < cache->count; i++) {
@@ -12103,6 +13281,16 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
             found = i;
             break;
         }
+    }
+    if (found < 0 && (cache->experts_per_layer ||
+        !view->gate.data || !view->gate.scales || view->gate.rows < 1 ||
+         view->gate.columns < 1 || !view->up.data || !view->up.scales ||
+         view->up.rows < 1 || view->up.columns < 1 || !view->down.data ||
+         !view->down.scales || view->down.rows < 1 || view->down.columns < 1)) {
+        /* no host copy to upload, or a resident table with no slot: neither a
+         * reason to recycle a victim nor a sign of a full card */
+        pthread_mutex_unlock(&cache->mutex);
+        return -1;
     }
     if (found < 0) {
         /* Growth guard: new mirrors may only claim VRAM while a reserve
@@ -12116,87 +13304,83 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
                              (long long)view->up.rows * view->up.columns +
                              (long long)view->down.rows * view->down.columns;
         long long mirror_bytes = elements / 2 + elements / 32;
-        /* The default reserve is sized from the model's bank at engine open,
-         * covers the COLI_CUDA_MOE_DOUBLE second bank while that is on, and
-         * is only the attention headroom until the cache holds a minimum
-         * working set (v4_gpu_mirror_reserve_mb); DSV4_CUDA_VRAM_RESERVE_MB
-         * overrides. margin_mb is how far the cache may grow past it between
-         * two probes (below): the bank-sized default carries
-         * COLI_V4_MIRROR_PROBE_EVERY mirrors of margin; an explicit reserve
-         * and the headroom-only default carry none. */
-        long long reserve_mb = v4_gpu_mirror_reserve_mb(cache->count);
-        long long margin_mb = v4_gpu_mirror_reserve_margin_mb(cache->count);
+        /* The primary cache's default reserve is sized from the model's bank
+         * at engine open, covers the COLI_CUDA_MOE_DOUBLE second bank while
+         * that is on, and is only the attention headroom until the cache
+         * holds a minimum working set (v4_gpu_mirror_reserve_mb, evaluated
+         * per miss); DSV4_CUDA_VRAM_RESERVE_MB overrides. A cache with its
+         * own reserve (the peer pool: no dense weights or prefill bank live
+         * on that card) keeps it in reserve_mb instead. */
+        long long margin_mb = 0;
+        long long reserve_mb = cache->reserve_mb >= 0
+            ? cache->reserve_mb
+            : v4_gpu_mirror_reserve_mb(cache->count, &margin_mb);
         /* cudaMemGetInfo is a driver round trip; with a large capacity the
          * guard is consulted on every miss (hundreds per token), so re-check
          * free VRAM only every 64 misses and reuse the last answer between.
-         * The answer must clear the reserve and, from 8 live mirrors on, so
-         * must the answer less the mirrors grown since (this one included),
-         * less the reserve's margin. Without that second test the cache grew
-         * up to 64 mirrors (816 MiB) past an explicit reserve or the 600 MiB
-         * headroom, past the card's free VRAM: the compressed-KV buffer and
-         * the prefill's attention buffers then failed to allocate and their
-         * layers' attention ran on the CPU, which changes greedy texts. Below
-         * 8 live mirrors only the first test applies, so a reserve just under
-         * the card's free VRAM still leaves the cache a set it can recycle. */
+         * The last answer must clear the reserve and, from
+         * V4_MIRROR_RECYCLE_MIN live mirrors on, the last answer less the
+         * mirrors grown since (this one included) must clear the reserve
+         * less its probe margin. Below that the cache may overshoot the
+         * reserve by a few mirrors (~100 MiB), so a reserve just under the
+         * card's free VRAM still leaves it a set it can recycle instead of
+         * freezing it. The bank-sized default carries 64 mirrors of margin,
+         * also below 32 live mirrors where it is only the headroom, so the
+         * second test never binds for it (on a card too small for the bank
+         * its first 32 mirrors may still overshoot the headroom); an
+         * explicit reserve, the default without a bank and the peer pool's
+         * carry none, and without the second test were overshot by up to 64
+         * mirrors (816 MiB), past the card's free VRAM. A failed upload
+         * counts as a full card until the next probe (the guard then covers
+         * an empty cache too). */
         /* On unified memory (GB10, Jetson) cudaMemGetInfo's free is the
          * system's MemFree, which the page cache holding the model keeps
          * near zero; measured against a VRAM reserve it froze this cache at
          * a handful of entries on a 130 GB box (#1538). There is no separate
          * card to keep headroom on, so the guard does not apply; the
          * capacity (DSV4_CUDA_EXPERT_MIRRORS) bounds the cache instead. */
-        static int unified = -1;
-        if (unified < 0) {
-            unified = dsv4_cuda_device_unified(cache->device) ? 1 : 0;
-            if (unified)
+        if (cache->unified < 0) {
+            cache->unified = dsv4_cuda_device_unified(cache->device) ? 1 : 0;
+            if (cache->unified)
                 fprintf(stderr, "v4_gpu mirror-cache: unified memory, VRAM reserve "
                                 "guard off (free memory is the system's, not a "
                                 "card's); capacity %d bounds the cache\n",
                         cache->capacity);
         }
-        /* After a failed upload (upload_failed) last_free_mb is 0 until the
-         * next probe: the card counts as full, also for an empty cache. */
-        static long long last_free_mb = -1;
-        static long long grown_bytes;   /* mirrors appended since the last probe */
-        static unsigned probes;
-        static int upload_failed;
-        if (grow && !unified && (cache->count > 0 || upload_failed)) {
-            if (last_free_mb < 0 ||
-                (probes++ % COLI_V4_MIRROR_PROBE_EVERY) == 0) {
-                last_free_mb = dsv4_cuda_mem_free_mb(cache->device);
-                upload_failed = 0;
-                grown_bytes = 0;
+        if (grow && !cache->unified &&
+            (cache->count > 0 || cache->upload_failed || cache->last_free_mb >= 0)) {
+            if (cache->last_free_mb < 0 ||
+                (cache->probes++ % COLI_V4_MIRROR_PROBE_EVERY) == 0) {
+                cache->last_free_mb = dsv4_cuda_mem_free_mb(cache->device);
+                cache->grown_bytes = 0;
+                cache->upload_failed = 0;
             }
-            long long grown_mb = (grown_bytes + mirror_bytes + (1LL << 20) - 1) >> 20;
-            if (last_free_mb >= 0 &&
-                (last_free_mb < reserve_mb ||
-                 (cache->count >= 8 && last_free_mb - grown_mb < reserve_mb - margin_mb)))
+            long long grown_mb =
+                (cache->grown_bytes + mirror_bytes + (1LL << 20) - 1) >> 20;
+            if (cache->last_free_mb >= 0 &&
+                (cache->last_free_mb < reserve_mb ||
+                 (cache->count >= V4_MIRROR_RECYCLE_MIN &&
+                  cache->last_free_mb - grown_mb < reserve_mb - margin_mb)))
                 grow = 0;
         }
-        if (!grow && cache->count == 0) {
-            pthread_mutex_unlock(&cache->mutex);
-            return -1;
-        }
-        /* The "fewer than 8" rule above is about LIVE entries, not the
-         * configured capacity: a cache frozen by the reserve with two or
+        /* The V4_MIRROR_RECYCLE_MIN rule above is about LIVE entries, not
+         * the configured capacity: a cache frozen by the reserve with two or
          * three mirrors would recycle in place a slot the current token's
          * earlier view still references, and the output is garbage with no
-         * error (#1538). Stay on the CPU for this expert until it can grow.
-         * After a failed upload the reserve is not the cause (the backend has
-         * reported the CUDA error), so only a probe below the reserve warns. */
-        if (!grow && cache->count < 8) {
-            static int warned;
-            if (!warned && !upload_failed) {
-                warned = 1;
-                fprintf(stderr, "v4_gpu mirror-cache: frozen below the VRAM reserve "
-                                "with %d live entries; a layer attaches up to 8 "
-                                "before computing, so experts stay on the CPU until "
-                                "the cache can grow (raise capacity or lower "
-                                "DSV4_CUDA_VRAM_RESERVE_MB)\n", cache->count);
-            }
+         * error (#1538). Leave this expert to the CPU (or the other cache)
+         * until this one can grow. After a failed upload (the backend
+         * reports the CUDA error) the reserve is not the cause, so only a
+         * probe below the reserve warns. */
+        if (!grow && cache->count < V4_MIRROR_RECYCLE_MIN) {
+            if (!cache->upload_failed) v4_mirror_warn_frozen(cache, reserve_mb);
             pthread_mutex_unlock(&cache->mutex);
-            return -1;
+            return grow_only ? -2 : -1;
         }
-        int appended = 0;   /* a new slot, not a recycled one (grown_bytes) */
+        if (grow_only && !grow) {
+            pthread_mutex_unlock(&cache->mutex);
+            return -2;
+        }
+        int appended = 0;
         if (!grow || cache->count >= cache->capacity) {
             found = 0;
             for (int i = 1; i < cache->count; i++)
@@ -12226,7 +13410,8 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
                     (int)view->down.columns, sync)) {
                 cache->entries[found].layer = view->key.layer;
                 cache->entries[found].expert = view->key.expert;
-                cache->entries[found].clock = ++cache->clock;
+                cache->entries[found].clock = v4_mirror_tick();
+                g_v4_mirror_uploads++;
                 view->gate.gpu = cache->entries[found].gate;
                 view->up.gpu = cache->entries[found].up;
                 view->down.gpu = cache->entries[found].down;
@@ -12275,30 +13460,27 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
             if (gate) dsv4_cuda_tensor_free(gate);
             if (up) dsv4_cuda_tensor_free(up);
             if (down) dsv4_cuda_tensor_free(down);
-            /* Roll the slot back, so that every entry in [0, count) holds a
-             * live mirror: an appended slot is dropped, a recycled one (its
-             * tensors are already freed) takes the last entry. Left in
-             * place, an entry keyed to this expert without tensors would
-             * answer its later attaches with no mirror (so it is never
-             * uploaded again), or win the LRU pick and make the recycle
-             * allocate on the full card again. The card counts as full
-             * until the next probe. */
-            if (found == cache->count - 1)
-                cache->count--;
-            else
-                cache->entries[found] = cache->entries[--cache->count];
-            last_free_mb = 0;
-            upload_failed = 1;
-            grown_bytes = 0;
+            /* Roll the slot back so no entry is left without tensors: a dead
+             * entry would match its expert with NULL mirrors, look like the
+             * oldest LRU victim (clock 0) and need a fresh cudaMalloc on
+             * every recycle. An appended slot is dropped; a recycled one
+             * (its old mirror already freed) takes the last entry. Until the
+             * next probe the card counts as full. */
+            if (appended) cache->count--;
+            else cache->entries[found] = cache->entries[--cache->count];
+            cache->last_free_mb = 0;
+            cache->grown_bytes = 0;
+            cache->upload_failed = 1;
             pthread_mutex_unlock(&cache->mutex);
-            return -1;
+            return grow_only ? -2 : -1;
         }
-        if (appended) grown_bytes += mirror_bytes;
         cache->entries[found].gate = gate;
         cache->entries[found].up = up;
         cache->entries[found].down = down;
+        if (appended) cache->grown_bytes += mirror_bytes;
+        g_v4_mirror_uploads++;
     }
-    cache->entries[found].clock = ++cache->clock;
+    cache->entries[found].clock = v4_mirror_tick();
     view->gate.gpu = cache->entries[found].gate;
     view->up.gpu = cache->entries[found].up;
     view->down.gpu = cache->entries[found].down;
@@ -12306,10 +13488,99 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
     return 0;
 }
 
+/* Touch-and-return a mirror of {layer, expert} in one cache (no upload). */
+static int v4_mirror_peek_cache(V4GpuExpertMirrorCache *cache, ColiExpertView *view) {
+    if (!cache) return -1;
+    pthread_mutex_lock(&cache->mutex);
+    for (int i = 0; i < cache->count; i++) {
+        if (cache->entries[i].layer == view->key.layer &&
+            cache->entries[i].expert == view->key.expert &&
+            cache->entries[i].gate && cache->entries[i].up &&
+            cache->entries[i].down) {
+            cache->entries[i].clock = v4_mirror_tick();
+            view->gate.gpu = cache->entries[i].gate;
+            view->up.gpu = cache->entries[i].up;
+            view->down.gpu = cache->entries[i].down;
+            pthread_mutex_unlock(&cache->mutex);
+            return 0;
+        }
+    }
+    pthread_mutex_unlock(&cache->mutex);
+    return -1;
+}
+/* coli_v4_expert_store_vram_held (VRAM-first decode): the experts of `layer`
+ * with a live mirror in the store's cache or in the peer pool (while its
+ * device is healthy: v4_peer_pool, like peek). It runs on any thread that
+ * looks an expert up, with the store's lock held, and takes only the caches'
+ * own locks; nothing that holds one of those calls the store. */
+static void v4_gpu_expert_vram_held(ColiExpertStore *store, int layer,
+                                    unsigned char *held, int experts) {
+    if (!store || !store->gpu || !held) return;
+    V4GpuExpertMirrorCache *caches[2] = {
+        v4_gpu_expert_cache(store, layer), v4_peer_pool()};
+    for (int c = 0; c < 2; c++) {
+        V4GpuExpertMirrorCache *cache = caches[c];
+        if (!cache) continue;
+        pthread_mutex_lock(&cache->mutex);
+        for (int i = 0; i < cache->count; i++) {
+            const V4GpuExpertMirror *entry = &cache->entries[i];
+            if (entry->layer == layer && entry->expert >= 0 &&
+                entry->expert < experts &&
+                entry->gate && entry->up && entry->down)
+                held[entry->expert] = 1;
+        }
+        pthread_mutex_unlock(&cache->mutex);
+    }
+}
+/* The LRU stamp of the mirror a recycle in this cache would replace, or
+ * UINT64_MAX when the cache cannot recycle: fewer than V4_MIRROR_RECYCLE_MIN
+ * live mirrors (frozen small by its reserve, or a small capacity). */
+static uint64_t v4_mirror_lru_clock(V4GpuExpertMirrorCache *cache) {
+    uint64_t oldest = UINT64_MAX;
+    int live = 0;
+    pthread_mutex_lock(&cache->mutex);
+    for (int i = 0; i < cache->count; i++) {
+        if (!cache->entries[i].gate || !cache->entries[i].up ||
+            !cache->entries[i].down)
+            continue;
+        live++;
+        if (cache->entries[i].clock < oldest) oldest = cache->entries[i].clock;
+    }
+    pthread_mutex_unlock(&cache->mutex);
+    return live >= V4_MIRROR_RECYCLE_MIN ? oldest : UINT64_MAX;
+}
+/* With a peer pool: an expert mirrored in either cache is used in place;
+ * otherwise grow the primary cache, then the peer pool, and once neither can
+ * grow recycle whichever cache holds the older LRU entry, then the other one
+ * if that fails. A cache that cannot recycle, or that refused this expert
+ * outright (-1 from its grow_only attach), is never the victim, so a small,
+ * VRAM-starved or failing pool cannot send to the CPU an expert the primary
+ * cache alone would have taken. */
+static int v4_gpu_expert_attach_tiered(V4GpuExpertMirrorCache *primary,
+                                       ColiExpertView *view, int sync) {
+    V4GpuExpertMirrorCache *peer = v4_peer_pool();   /* the only read here */
+    if (!peer || !primary) return v4_gpu_expert_attach_cached_ex(primary, view, sync);
+    if (v4_mirror_peek_cache(primary, view) == 0 ||
+        v4_mirror_peek_cache(peer, view) == 0) return 0;
+    int primary_r = v4_gpu_expert_attach_cached_mode(primary, view, sync, 1);
+    if (primary_r == 0) return 0;
+    int r = v4_gpu_expert_attach_cached_mode(peer, view, sync, 1);
+    if (r == 0) return 0;
+    /* the LRU scans only once neither cache could grow */
+    uint64_t primary_lru =
+        primary_r == -2 ? v4_mirror_lru_clock(primary) : UINT64_MAX;
+    uint64_t peer_lru = r == -2 ? v4_mirror_lru_clock(peer) : UINT64_MAX;
+    if (primary_lru == UINT64_MAX && peer_lru == UINT64_MAX) return -1;
+    int peer_first = peer_lru < primary_lru;
+    r = v4_gpu_expert_attach_cached_ex(peer_first ? peer : primary, view, sync);
+    if (r == 0 || (peer_first ? primary_lru : peer_lru) == UINT64_MAX) return r;
+    return v4_gpu_expert_attach_cached_ex(peer_first ? primary : peer, view, sync);
+}
+
 int coli_v4_gpu_expert_attach(ColiExpertStore *store, ColiExpertView *view) {
     if (!store || !view) return -1;
-    return v4_gpu_expert_attach_cached_ex(
-        (V4GpuExpertMirrorCache *)store->gpu, view, 1);
+    return v4_gpu_expert_attach_tiered(
+        v4_gpu_expert_cache(store, view->key.layer), view, 1);
 }
 
 /* Async twin: the upload is ENQUEUED on the device stream and may still be
@@ -12321,40 +13592,129 @@ int coli_v4_gpu_expert_attach_async(ColiExpertStore *store,
                                     ColiExpertView *view) {
     if (!store || !view) return -1;
     return v4_gpu_expert_attach_cached_ex(
-        (V4GpuExpertMirrorCache *)store->gpu, view, 0);
+        v4_gpu_expert_cache(store, view->key.layer), view, 0);
 }
 
 extern int dsv4_cuda_stream_drain(int device);
 int coli_v4_gpu_expert_drain(ColiExpertStore *store) {
     if (!store || !store->gpu) return 0;
-    V4GpuExpertMirrorCache *cache = (V4GpuExpertMirrorCache *)store->gpu;
-    return dsv4_cuda_stream_drain(cache->device) ? 0 : -1;
+    int failed = 0;
+    for (V4GpuExpertMirrorCache *cache = store->gpu; cache; cache = cache->next)
+        if (!dsv4_cuda_stream_drain(cache->device)) failed = 1;
+    return failed ? -1 : 0;
 }
 
 /* Lookup-only twin of attach: report whether {layer, expert} is already
  * mirrored, touching its LRU stamp, but NEVER uploading on a miss. The
  * hybrid decode split peeks the whole token first and decides its uploads
  * afterwards with the q* policy, instead of paying a blocking PCIe copy per
- * miss the moment it is discovered. */
+ * miss the moment it is discovered. The primary cache is scanned once; the
+ * peer pool only on a primary miss. */
 int coli_v4_gpu_expert_peek(ColiExpertStore *store, ColiExpertView *view) {
-    if (!store || !view || !store->gpu) return -1;
-    V4GpuExpertMirrorCache *cache = (V4GpuExpertMirrorCache *)store->gpu;
+    V4GpuExpertMirrorCache *peer = v4_peer_pool();   /* the only read here */
+    /* after a sticky CUDA fault no mirror is readable: every expert is a miss
+     * and the token takes host copies (dsv4_cuda_lost) */
+    if (!store || !view || !store->gpu || dsv4_cuda_lost()) return -1;
+    if (v4_mirror_peek_cache(v4_gpu_expert_cache(store, view->key.layer),
+                             view) == 0)
+        return 0;
+    return v4_mirror_peek_cache(peer, view);
+}
+
+/* Reuse resident device weights before starting any host expert loads.
+ * Hold the cache lock through the synchronous kernel so refill cannot
+ * invalidate a selected tensor. A partial hit leaves the normal loader intact. */
+int coli_v4_gpu_moe_resident(ColiExpertStore *store, int layer,
+    const int *ids, const float *weights, int count,
+    void *shared_gate, void *shared_up, void *shared_down,
+    float limit, float *output, const float *input) {
+    V4GpuExpertMirrorCache *cache = v4_gpu_expert_cache(store, layer);
+    if (!cache || count < 1 || count > 16 || !ids || !weights ||
+        !shared_gate || !shared_up || !shared_down || !output || !input)
+        return cache && cache->experts_per_layer ? -1 : 0;
+    Dsv4CudaTensor *gates[16], *ups[16], *downs[16];
     pthread_mutex_lock(&cache->mutex);
-    for (int i = 0; i < cache->count; i++) {
-        if (cache->entries[i].layer == view->key.layer &&
-            cache->entries[i].expert == view->key.expert &&
-            cache->entries[i].gate && cache->entries[i].up &&
-            cache->entries[i].down) {
-            cache->entries[i].clock = ++cache->clock;
-            view->gate.gpu = cache->entries[i].gate;
-            view->up.gpu = cache->entries[i].up;
-            view->down.gpu = cache->entries[i].down;
+    for (int k = 0; k < count; k++) {
+        V4GpuExpertMirror *entry = v4_gpu_expert_find(cache, layer, ids[k]);
+        if (!entry || !entry->gate || !entry->up || !entry->down) {
             pthread_mutex_unlock(&cache->mutex);
-            return 0;
+            return cache->experts_per_layer ? -1 : 0;
         }
+        gates[k] = entry->gate;
+        ups[k] = entry->up;
+        downs[k] = entry->down;
+        entry->clock = v4_mirror_tick();
+    }
+    int ok = dsv4_cuda_moe(gates, ups, downs, weights, count,
+        shared_gate, shared_up, shared_down, limit, output, input);
+    pthread_mutex_unlock(&cache->mutex);
+    /* Older backends may decline fusion; let the existing loader/group
+     * fallback handle that case, including overwriting any partial output. */
+    return ok ? 1 : cache->experts_per_layer ? -1 : 0;
+}
+
+/* Keep routing, sorted expert descriptors and MoE on the same device stream. */
+int coli_v4_gpu_resident_route(float *output,
+    const ColiDeepSeekV4LayerWeights *weights, const ColiDeepSeekV4Config *config,
+    ColiExpertStore *store, const float *input, int token) {
+    const char *setting = getenv("DSV4_CUDA_RESIDENT_ROUTE");
+    if ((setting && !atoi(setting)) || !weights || !config || !output || !input)
+        return 0;
+    const char *batched = getenv("DSV4_CUDA_BATCHED");
+    if (batched && !atoi(batched)) return 0;
+    V4GpuExpertMirrorCache *cache = v4_gpu_expert_cache(store, weights->plan.layer);
+    if (!cache || cache->experts_per_layer != 256 || config->num_experts_per_tok != 6)
+        return 0;
+    if (token < 0 || token >= config->vocab_size) return -1;
+    Dsv4CudaTensor *gate = coli_v4_layer_gpu(weights, "ffn.gate");
+    Dsv4CudaTensor *bias = coli_v4_layer_gpu(weights, "ffn.gate.bias");
+    Dsv4CudaTensor *sg = coli_v4_layer_gpu(weights, "ffn.shared_experts.w1");
+    Dsv4CudaTensor *su = coli_v4_layer_gpu(weights, "ffn.shared_experts.w3");
+    Dsv4CudaTensor *sd = coli_v4_layer_gpu(weights, "ffn.shared_experts.w2");
+    if (!gate || !sg || !su || !sd) return 0;
+    int fixed[6], *forced = NULL;
+    if (weights->plan.uses_hash_router) {
+        char key[96];
+        snprintf(key, sizeof(key), "layers.%d.ffn.gate.tid2eid", weights->plan.layer);
+        const int64_t *map = coli_v4_layer_data(weights, key, NULL);
+        if (!map) return -1;
+        for (int k = 0; k < 6; k++) {
+            int64_t id = map[(size_t)token * 6 + k];
+            if (id < 0 || id >= 256) return -1;
+            fixed[k] = (int)id;
+        }
+        forced = fixed;
+    } else if (!bias) return 0;
+    int layer = weights->plan.layer - cache->first_layer;
+    pthread_mutex_lock(&cache->mutex);
+    if (!cache->route_sets)
+        cache->route_sets = calloc((size_t)(cache->end_layer - cache->first_layer),
+                                   sizeof(*cache->route_sets));
+    if (!cache->route_sets) { pthread_mutex_unlock(&cache->mutex); return -1; }
+    if (!cache->route_sets[layer]) {
+        Dsv4CudaTensor *g[256], *u[256], *d[256];
+        for (int e = 0; e < 256; e++) {
+            V4GpuExpertMirror *entry = v4_gpu_expert_find(cache, weights->plan.layer, e);
+            if (!entry || !entry->gate || !entry->up || !entry->down) {
+                pthread_mutex_unlock(&cache->mutex);
+                fprintf(stderr, "v4_gpu resident-route: incomplete expert %d at layer %d\n",
+                        e, weights->plan.layer);
+                return -1;
+            }
+            g[e] = entry->gate; u[e] = entry->up; d[e] = entry->down;
+        }
+        cache->route_sets[layer] = dsv4_cuda_expert_set_create(g, u, d, 256, sg, su, sd);
+    }
+    int ok = cache->route_sets[layer] && dsv4_cuda_resident_route_moe(
+        cache->route_sets[layer], gate, bias, forced, config->routed_scaling_factor,
+        config->swiglu_limit, output, input);
+    if (ok && !cache->route_announced) {
+        fprintf(stderr, "v4_gpu resident-route=on device=%d\n", cache->device);
+        cache->route_announced = 1;
     }
     pthread_mutex_unlock(&cache->mutex);
-    return -1;
+    /* An older DLL can decline the new optional entry point. */
+    return ok ? 1 : 0;
 }
 
 int coli_v4_gpu_dspark_expert_attach(void *cache, ColiExpertView *view) {
@@ -12441,6 +13801,8 @@ int coli_v4_route_bf16_logits(float *weights, int *indices, const float *hidden,
  * prefill re-creates and re-fills it (per-layer refill cost only, on prompts
  * that already run tens of seconds). */
 static Dsv4CudaExpertSet *v4_moe_bank;
+static int v4_moe_bank_device = -1;
+static Dsv4CudaActivation *v4_moe_in, *v4_moe_out;
 static int v4_moe_bank_layer = -1;
 static int v4_moe_bank_hash_layer = -1;
 static unsigned char v4_moe_bank_valid[256];
@@ -12512,7 +13874,7 @@ static void v4_gpu_mirror_reserve_size(const ColiDeepSeekV4Config *config,
         fprintf(stderr, "v4_gpu mirror-reserve=%lldMiB (%d-slot bank %.0fMiB "
                         "x%d + %dMiB headroom + %d mirrors; "
                         "DSV4_CUDA_VRAM_RESERVE_MB overrides)\n",
-                v4_gpu_mirror_reserve_mb(COLI_V4_MIRROR_MIN_LIVE), slots,
+                v4_gpu_mirror_reserve_mb(COLI_V4_MIRROR_MIN_LIVE, NULL), slots,
                 v4_reserve_bank_bytes / 1048576.0,
                 v4_bank_double_usable() ? 2 : 1, COLI_V4_RESERVE_HEADROOM_MB,
                 COLI_V4_MIRROR_PROBE_EVERY);
@@ -12522,36 +13884,30 @@ static void v4_gpu_mirror_reserve_size(const ColiDeepSeekV4Config *config,
  * (the growth guard in v4_gpu_expert_attach_cached_ex): the explicit
  * DSV4_CUDA_VRAM_RESERVE_MB as given, else the bank-sized default
  * (deepseek_v4_bank_pair.h), whose second bank drops out once
- * COLI_CUDA_MOE_DOUBLE has latched off (v4_bank_double_usable). */
-/* DSV4_CUDA_VRAM_RESERVE_MB (at least 256), or -1 when it is not set. */
-static long long v4_gpu_mirror_reserve_explicit_mb(void) {
+ * COLI_CUDA_MOE_DOUBLE has latched off (v4_bank_double_usable). *margin_mb
+ * (when not NULL) receives how far the cache may grow past it between two
+ * free-VRAM probes: COLI_V4_MIRROR_PROBE_EVERY mirrors (rounded up) for the
+ * bank-sized default, in both of its phases — from COLI_V4_MIRROR_MIN_LIVE
+ * live mirrors on the reserve includes them, and below that the cache must
+ * still reach a working set on a card too small for the bank — none
+ * otherwise. */
+static long long v4_gpu_mirror_reserve_mb(int live, long long *margin_mb) {
     static long long explicit_mb = -2;
+    if (margin_mb) *margin_mb = 0;
     if (explicit_mb == -2) {
         const char *env = getenv("DSV4_CUDA_VRAM_RESERVE_MB");
         explicit_mb = env ? atoll(env) : -1;
         if (env && explicit_mb < 256) explicit_mb = 256;
     }
-    return explicit_mb;
-}
-
-static long long v4_gpu_mirror_reserve_mb(int live) {
-    long long explicit_mb = v4_gpu_mirror_reserve_explicit_mb();
     if (explicit_mb >= 0) return explicit_mb;
-    return coli_v4_mirror_reserve_mb(
+    long long reserve_mb = coli_v4_mirror_reserve_mb(
         v4_reserve_bank_bytes,
         v4_bank_double_usable() ? 2 : 1,
         v4_reserve_mirror_bytes, live);
-}
-
-/* The part of v4_gpu_mirror_reserve_mb(live) the cache may grow into between
- * two probes: the COLI_V4_MIRROR_PROBE_EVERY mirrors the bank-sized default
- * carries (rounded down), 0 for an explicit reserve or the headroom alone
- * (no bank, or fewer than COLI_V4_MIRROR_MIN_LIVE live mirrors). */
-static long long v4_gpu_mirror_reserve_margin_mb(int live) {
-    if (v4_gpu_mirror_reserve_explicit_mb() >= 0 ||
-        v4_gpu_mirror_reserve_mb(live) <= COLI_V4_RESERVE_HEADROOM_MB)
-        return 0;
-    return ((long long)COLI_V4_MIRROR_PROBE_EVERY * v4_reserve_mirror_bytes) >> 20;
+    if (margin_mb && v4_reserve_bank_bytes > 0)
+        *margin_mb = (COLI_V4_MIRROR_PROBE_EVERY * v4_reserve_mirror_bytes +
+                      (1LL << 20) - 1) >> 20;
+    return reserve_mb;
 }
 
 static void *v4_bank2_worker(void *argument) {
@@ -12625,6 +13981,10 @@ void coli_v4_gpu_moe_batch_release(void) {
     v4_moe_bank_failed = 0;
     v4_bank2_alloc_failed = 0;
     v4_bank2_join();
+    dsv4_cuda_activation_free(v4_moe_in);
+    dsv4_cuda_activation_free(v4_moe_out);
+    v4_moe_in = v4_moe_out = NULL;
+    v4_moe_bank_device = -1;
     if (v4_bank2_swaps || v4_bank2_prefetched)
         fprintf(stderr, "v4_gpu moe-double swaps=%llu prefetched=%llu\n",
                 v4_bank2_swaps, v4_bank2_prefetched);
@@ -12655,7 +14015,8 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
 #define bank_layer v4_moe_bank_layer
 #define hash_layer v4_moe_bank_hash_layer
 #define bank_valid v4_moe_bank_valid
-    static Dsv4CudaActivation *in_mirror, *out_mirror;
+#define in_mirror v4_moe_in
+#define out_mirror v4_moe_out
     static int diagnosed;
 #define bank_failed v4_moe_bank_failed
 #define V4_MOE_BATCH_REFUSE(why) do { \
@@ -12665,6 +14026,9 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
         } \
         return -1; \
     } while (0)
+    /* Resident tables use the token pipeline, without a second streaming bank. */
+    if (store && weights && coli_v4_gpu_experts_resident(store, weights->plan.layer))
+        return -1;
     if (!coli_v4_gpu_moe_batch_wanted() || bank_failed) return -1;
     /* Decode never touches the bank (and so never starts a second-bank
      * prefetch either): see v4_gpu_moe_batch_in_prefill. */
@@ -12702,6 +14066,8 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
 #undef V4_MOE_BATCH_REFUSE
     int device = dsv4_cuda_tensor_device(gate ? gate : sg);
     if (device < 0) return -1;
+    if (v4_moe_bank_device != device) coli_v4_gpu_moe_batch_release();
+    v4_moe_bank_device = device;
     if (!bank) {
         bank = dsv4_cuda_expert_bank_create(
             dsv4_cuda_expert_bank_slots(config->n_routed_experts), 4096, 2048,
@@ -12760,7 +14126,8 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
         if (double_on) {
             int next = coli_v4_bank_pair_prefetch_target(
                 1, bank_layer, config->num_hidden_layers);
-            if (next >= 0) {
+            V4GpuExpertMirrorCache *next_cache = v4_gpu_expert_cache(store, next);
+            if (next_cache && next_cache->device == device) {
                 if (!v4_moe_bank2) {
                     v4_moe_bank2 = dsv4_cuda_expert_bank_create(
                         dsv4_cuda_expert_bank_slots(config->n_routed_experts),
@@ -13141,6 +14508,8 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
     coli_v4_expert_store_note_union(store, weights->plan.layer, ids,
                                     batch * topk);
     return 0;
+#undef in_mirror
+#undef out_mirror
 #undef bank
 #undef bank_layer
 #undef hash_layer
@@ -13177,6 +14546,25 @@ int coli_v4_gpu_attn_batch_wanted(void) {
         setting = e && *e ? atoi(e) != 0 : -1;
     }
     return setting >= 0 ? setting : coli_v4_gpu_attn_default;
+}
+
+int coli_v4_gpu_indexer_prepare(const ColiDeepSeekV4LayerWeights *weights,
+    const float *input, float *queries, float *head_weights, int dimension) {
+    if (!weights || !v4_gpu_indexer_prepare_wanted()) return -1;
+    Dsv4CudaTensor *w = coli_v4_layer_gpu(weights, "attn.indexer.weights_proj");
+    return dsv4_cuda_indexer_prepare(w, input, queries, head_weights, dimension) ? 0 : -1;
+}
+
+int coli_v4_gpu_compressor_project(
+    const ColiDeepSeekV4LayerWeights *weights, const char *prefix,
+    float *kv, float *gate, const float *input) {
+    if (!v4_gpu_compressor_wanted() || !weights || !prefix) return -1;
+    char key[128];
+    snprintf(key, sizeof(key), "%s.wkv", prefix);
+    Dsv4CudaTensor *wkv = coli_v4_layer_gpu(weights, key);
+    snprintf(key, sizeof(key), "%s.wgate", prefix);
+    Dsv4CudaTensor *wgate = coli_v4_layer_gpu(weights, key);
+    return dsv4_cuda_compressor_project(wkv, wgate, input, kv, gate) ? 0 : -1;
 }
 
 int coli_v4_gpu_compressor_project_batch(
@@ -13355,7 +14743,12 @@ int coli_v4_gpu_fp8_ref_matmul(const ColiDeepSeekV4LayerWeights *weights,
         w->scale_format != COLI_SCALE_F32 ||
         (w->block_rows != 128 && w->block_rows != 8) ||
         w->block_columns != 128 || w->columns % 128) return -1;
-    int device = v4_gpu_layer_device(weights);
+    if (w->gpu && dsv4_cuda_fp8_ref_matmul_resident(
+                      (Dsv4CudaTensor *)w->gpu, x_qdq, tokens, y)) return 0;
+    Dsv4CudaTensor *anchor =
+        (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "attn.wq_a");
+    if (!anchor) return -1;
+    int device = dsv4_cuda_tensor_device(anchor);
     if (device < 0) return -1;
     return dsv4_cuda_fp8_ref_matmul(device, (const uint8_t *)w->data,
                                     (const float *)w->scales, (int)w->rows,
@@ -14447,6 +15840,7 @@ static int v4_dho_place(ColiV4Engine *engine, int layer) {
 #endif
 
 #ifdef COLI_CUDA
+#include "deepseek_v4_gpu_devices.h"   /* DSV4_CUDA_DEVICES's parser, for v4_cu_open's line about a GGUF (its own unit's copy) */
 /* ---- the routed-expert tier on a CUDA device (cu_tier.h: vk_tier.c over the CUDA backend) ----
  * COLI_CUDA=1 with no Vulkan tier running: the CUDA device opens for the experts the tier
  * holds, and the tier is the Vulkan one's code (XT): the same history, warm start, promotions
@@ -14491,6 +15885,13 @@ static void v4_cu_open(const ColiV4Engine *engine) {
     if (coli_v4_vk_tier || !(cu && atoi(cu)) || !engine->experts ||
         (engine->experts->gpu && !coli_v4_index_gguf(engine->target_index))) return;
     int dev = 0;
+    if (coli_v4_index_gguf(engine->target_index)) {
+        const char *dense_devices = getenv("DSV4_CUDA_DEVICES");
+        int dense_list[COLI_V4_GPU_MAX_DEVICES];
+        if (dense_devices && coli_v4_gpu_devices_parse(dense_devices, dense_list) > 1)
+            fprintf(stderr, "[CUDA] deepseek_v4: a GGUF keeps its dense matrices on device 0; "
+                            "DSV4_CUDA_DEVICES does not spread them\n");
+    }
     if (!coli_cuda_init(&dev, 1)) {
         fprintf(stderr, "[CUDA] deepseek_v4: no CUDA device, the experts stay on the CPU\n");
         return;
@@ -14752,20 +16153,33 @@ static int head_scores_impl(ColiV4Engine *engine, const float *hidden,
      * Each row retains the same scalar accumulation order and the final scan
      * retains vocabulary order, so logits/tie-breaking do not change. */
     if (resident) {
+        int gpu_done = 0;
+#ifdef COLI_V4_GPU_TIER
+        gpu_done = !coli_v4_gpu_head_scores(engine, hidden, scores);
+        const char *verify = getenv("DSV4_HEAD_VERIFY");
+        if (gpu_done && (!verify || !atoi(verify))) {
+            V4_DUMP_LOGITS(scores, (size_t)vocab);
+            return 0;
+        }
+#endif
 #ifdef COLI_VULKAN
-        if (coli_v4_vk_matmul &&
+        if (!gpu_done && coli_v4_vk_matmul &&
             coli_v4_vk_matmul(11, resident, NULL, 0, vocab, d, scores, hidden, 1) == 0) {
             V4_DUMP_LOGITS(scores, (size_t)vocab);
             return 0;
         }
 #endif
-        #pragma omp parallel for schedule(static)
+        int mismatches = 0;
+        #pragma omp parallel for schedule(static) reduction(+:mismatches)
         for (int row = 0; row < vocab; row++) {
             const uint16_t *weight = resident + (size_t)row * d;
-            scores[row] = head_bf16_dot(weight, hidden, d);
+            float value = head_bf16_dot(weight, hidden, d);
+            if (gpu_done) mismatches += memcmp(&value, scores + row, sizeof(value)) != 0;
+            else scores[row] = value;
         }
+        if (gpu_done) fprintf(stderr, "headverify rows=%d mismatches=%d\n", vocab, mismatches);
         V4_DUMP_LOGITS(scores, (size_t)vocab);
-        return 0;
+        return mismatches ? -1 : 0;
     }
     /* Low-memory fallback: stream small row tiles exactly as before. */
     enum { ROWS = 64 };
@@ -14827,14 +16241,14 @@ static int head_scores(ColiV4Engine *engine, const float *hidden,
     g_v4_prof_head_s += spec_now() - t0;
     return result;
 }
-static int head_argmax_batch(ColiV4Engine *engine, const float *hidden,
+static int head_argmax_batch_impl(ColiV4Engine *engine, const float *hidden,
                              const ColiSafetensorsIndex *index,
                              const ColiDeepSeekV4Config *config, int batch,
                              int *best_tokens, float *best_logits) {
     if (!engine || !hidden || !index || !config || batch < 1 ||
         !best_tokens || !best_logits) return -1;
     if (batch == 1)
-        return head_argmax(engine, hidden, index, config, best_tokens,
+        return head_argmax_impl(engine, hidden, index, config, best_tokens,
                            best_logits);
     const ColiSafetensorsTensor *head = coli_st_find(index, "head.weight");
     int d = config->hidden_size, vocab = config->vocab_size;
@@ -14847,48 +16261,81 @@ static int head_argmax_batch(ColiV4Engine *engine, const float *hidden,
         free(scores);
         return result ? -1 : 0;
     }
-    if (!head || head->dtype != COLI_ST_BF16) return -1;
+    if (!head || head->dtype != COLI_ST_BF16 || d < 1 || vocab < 1) return -1;
     int shard = coli_st_tensor_shard(index, head);
     const uint16_t *resident = coli_v4_head_cache_data(
         engine, shard, (uint64_t)head->off,
         (size_t)vocab * d * sizeof(uint16_t));
     if (!resident) {
         for (int item = 0; item < batch; item++)
-            if (head_argmax(engine, hidden + (size_t)item * d, index, config,
+            if (head_argmax_impl(engine, hidden + (size_t)item * d, index, config,
                             &best_tokens[item], &best_logits[item])) return -1;
         return 0;
     }
+#ifdef COLI_V4_GPU_TIER
+    const char *verify = getenv("DSV4_HEAD_VERIFY");
+    int verifying = verify && atoi(verify);
+    if (!verifying && !coli_v4_gpu_head_batch(engine, hidden, batch, NULL,
+                                              best_tokens, best_logits)) {
+        for (int item = 0; item < batch; item++)
+            if (best_tokens[item] < 0) return -1;
+        return 0;
+    }
+#endif
     float *scores = malloc((size_t)vocab * batch * sizeof(*scores));
     if (!scores) return -1;
+    int gpu_done = 0, mismatches = 0;
+#ifdef COLI_V4_GPU_TIER
+    if (verifying)
+        gpu_done = !coli_v4_gpu_head_batch(engine, hidden, batch, scores, NULL, NULL);
+#endif
 #ifdef COLI_VULKAN
     /* scores is [batch][vocab], which is the device's y[S, O]. */
-    int on_device = coli_v4_vk_matmul &&
+    int on_device = !gpu_done && coli_v4_vk_matmul &&
                     coli_v4_vk_matmul(11, resident, NULL, 0, vocab, d, scores,
                                       hidden, batch) == 0;
     if (!on_device)
 #endif
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) reduction(+:mismatches)
     for (int row = 0; row < vocab; row++) {
         const uint16_t *weight = resident + (size_t)row * d;
-        for (int item = 0; item < batch; item++)
-            scores[(size_t)item * vocab + row] = head_bf16_dot(
+        for (int item = 0; item < batch; item++) {
+            float value = head_bf16_dot(
                 weight, hidden + (size_t)item * d, d);
+            float *score = scores + (size_t)item * vocab + row;
+            if (gpu_done) mismatches += memcmp(&value, score, sizeof(value)) != 0;
+            else *score = value;
+        }
     }
+    if (gpu_done) fprintf(stderr, "headverify batch=%d rows=%d mismatches=%d\n", batch, vocab, mismatches);
     V4_DUMP_LOGITS(scores, (size_t)batch * vocab);
-    for (int item = 0; item < batch; item++) {
-        int winner = -1;
-        float maximum = -FLT_MAX;
-        const float *item_scores = scores + (size_t)item * vocab;
-        for (int row = 0; row < vocab; row++)
-            if (item_scores[row] > maximum) {
-                maximum = item_scores[row];
-                winner = row;
-            }
-        best_tokens[item] = winner;
-        best_logits[item] = maximum;
+    int result = mismatches ? -1 : 0;
+    for (int item = 0; !result && item < batch; item++)
+        result = head_scores_argmax(scores + (size_t)item * vocab, vocab,
+                                    best_tokens + item, best_logits + item);
+#ifdef COLI_V4_GPU_TIER
+    if (!result && gpu_done) {
+        int ids[128]; float values[128];
+        result = coli_v4_gpu_head_batch(engine, hidden, batch, NULL, ids, values);
+        for (int item = 0; !result && item < batch; item++)
+            if (ids[item] != best_tokens[item] ||
+                memcmp(values + item, best_logits + item, sizeof(float))) result = -1;
+        fprintf(stderr, "headverify batch=%d compact=%s\n", batch, result ? "failed" : "exact");
     }
+#endif
     free(scores);
-    return 0;
+    return result;
+}
+
+static int head_argmax_batch(ColiV4Engine *engine, const float *hidden,
+                             const ColiSafetensorsIndex *index,
+                             const ColiDeepSeekV4Config *config, int batch,
+                             int *best_tokens, float *best_logits) {
+    double t0 = spec_now();
+    int result = head_argmax_batch_impl(engine, hidden, index, config, batch,
+                                       best_tokens, best_logits);
+    g_v4_prof_head_s += spec_now() - t0;
+    return result;
 }
 
 static int dspark_markov_argmax(const ColiV4Engine *engine, int token,
@@ -14937,6 +16384,8 @@ static int has_sentence_end(const char *text, int length) {
 }
 
 int main(int argc, char **argv) {
+    coli_env_check(CE_DSV4, "deepseek-v4");
+    coli_env_dump(CE_DSV4, "deepseek-v4");
     if (argc < 3 || argc > 6) {
         fprintf(stderr, "usage: %s MODEL_DIR INPUT_TOKEN_ID [TOKEN_COUNT]\n"
                         "       %s MODEL_DIR --prompt TEXT [MAX_NEW_TOKENS] [--stop-sentence]\n",
@@ -15330,8 +16779,10 @@ static int target_token(ColiV4Engine *engine, float **state_ptr, float **next_pt
                         ColiExpertStore *experts, int token, int position,
                         char *error, size_t error_size) {
     double t0 = spec_now();
+    g_v4_dec_counting = 1;   /* the decode MoE counters: decode forwards only */
     int result = target_token_impl(engine, state_ptr, next_ptr, attention, index, config,
                                    experts, token, position, error, error_size);
+    g_v4_dec_counting = 0;
     g_v4_prof_block_s += spec_now() - t0;
     g_v4_prof_forwards += 1;
     return result;
@@ -17718,6 +19169,34 @@ static void v4_serve_finish(ColiV4Engine *engine, ColiV4Session *session,
      * they exceeded the wall on a cold tiny run (0.073 s of disk in a 0.034 s turn). */
     double attention_s = (g_v4_prof_block_s - marks->block) - expert_matmul_s - expert_wait_s;
     if (attention_s < 0.0) attention_s = 0.0;
+    {   /* V4_SERVE_STATS_LOG=1: the turn's DONE/PROF numbers on stderr too (the
+         * gateway consumes stdout), for decode benchmarking from the serve log.
+         * v4_dec_moe: process totals of the single-token decode MoE
+         * (deepseek_v4_internal.h). v4_serve_turn: decode_s and tok_s are the
+         * decode's, hit% and the expert and attention seconds the whole turn's,
+         * prefill included (as DONE/PROF), and *_total are process totals of
+         * the decode experts computed from VRAM without a store lookup
+         * (V4_GPU_RESIDENT_FIRST) and of those fetched from the store. */
+        static int stats_log = -1;
+        if (stats_log < 0) {
+            const char *setting = getenv("V4_SERVE_STATS_LOG");
+            stats_log = setting && atoi(setting) > 0;
+        }
+        if (stats_log)
+            fprintf(stderr, "v4_dec_moe calls=%llu total_s=%.2f fetch_wait_s=%.2f "
+                    "attach_s=%.2f uploads=%llu gpu_s=%.2f (cumulative)\n",
+                    g_v4_dec_calls, g_v4_dec_total_s, g_v4_dec_fetch_s,
+                    g_v4_dec_attach_s, g_v4_dec_uploads, g_v4_dec_gpu_s);
+        if (stats_log)
+            fprintf(stderr, "v4_serve_turn prompt=%d completion=%d decode_s=%.2f "
+                    "tok_s=%.3f hit=%.1f%% expert_disk_s=%.2f expert_wait_s=%.2f "
+                    "expert_matmul_s=%.2f attention_s=%.2f rss_gb=%.1f "
+                    "vram_first_hits_total=%llu store_fetches_total=%llu\n",
+                    prompt_tokens, completion, decode,
+                    decode > 0.0 ? completion / decode : 0.0, hit_rate,
+                    expert_disk_s, expert_wait_s, expert_matmul_s, attention_s,
+                    v4_serve_rss_gb(), g_v4_gpu_first_hits, g_v4_dec_store_fetches);
+    }
     v4_prof_emit(elapsed, prompt_tokens, completion,
                  expert_disk_s, expert_wait_s, expert_matmul_s, attention_s,
                  g_v4_prof_head_s - marks->head, g_v4_prof_forwards - marks->forwards);
@@ -18126,6 +19605,8 @@ static int v4_gguf_check(const char *dir) {
 
 int main(int argc, char **argv) {
     if (getenv("GGUF_CHECK") && argc >= 2) return v4_gguf_check(argv[1]);
+    coli_env_check(CE_DSV4, "deepseek-v4");
+    coli_env_dump(CE_DSV4, "deepseek-v4");
 #ifdef _OPENMP
     if (!v4_omp_reserve_loader_cpus())
         fprintf(stderr, "[OMP] deepseek-v4: effective team size %d\n",

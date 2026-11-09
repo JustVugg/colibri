@@ -116,6 +116,15 @@ they stay on the CPU while the tier is on). Each run ends with
 [vulkan.md](vulkan.md#glm-52-and-glm-53-flash-on-the-tier). Measured on Lavapipe for
 correctness only: no GPU has run the real weights on it yet.
 
+**CUDA.** In a `make glm53 CUDA=1` build (Linux), or `make glm53.exe CUDA_DLL=1` next to
+`coli_cuda.dll` on Windows ([windows.md](windows.md)), `COLI_CUDA=1` puts the routed
+experts on the CUDA expert tier (`cu_tier.h`) and the resident matrices on the card as
+far as their budget goes (`cu_dense.h`); `coli chat --gpu 0` sets it (`--gpu` takes
+`auto`, `none` or a device list). The Windows release's `windows-x86_64-cuda.zip`
+carries this build from the release after v2.1.0. A build with Vulkan too, as that one
+is, runs on Vulkan on the same card unless `COLI_VULKAN=0`. The disk floor above holds
+either way.
+
 ## Vision
 
 Reachable from every surface: a path pasted in `coli chat` (read by the client,

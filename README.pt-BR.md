@@ -380,9 +380,9 @@ Qwen3.8-Flash-Next, e Qwen3.6 com os modelos que ele roda; o OLMoE e os motores
 de decisão compilam com `make <motor> CUDA=1`. No Windows o motor CUDA é uma DLL
 separada ([windows.md](docs/windows.md)), e toda release a traz compilada:
 `colibri-<versão>-windows-x86_64-cuda.zip` tem a `coli_cuda.dll` (placas de
-compute capability 8.0 ou mais nova) e os motores colibri, qwen36 e kimi_k3 que
-a carregam, com as DLLs CUDA do DeepSeek V4. Descompacte por cima do arquivo
-principal e o setup escolhe CUDA.
+compute capability 8.0 ou mais nova) e os motores colibri, glm53, qwen36 e
+kimi_k3 que a carregam, com as DLLs CUDA do DeepSeek V4. Descompacte por cima
+do arquivo principal e o setup escolhe CUDA.
 
 - **Todas as camadas na placa** para Qwen3.6, Qwen3.8 e OLMoE: as camadas
   densas, a atenção e os especialistas que a placa guarda rodam como uma só

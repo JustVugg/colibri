@@ -289,6 +289,14 @@ class BackendChoice(unittest.TestCase):
         self.assertEqual(decision["backend"], "cuda")
         self.assertEqual(decision["gpu"], card["name"])
         self.assertIn("the release's CUDA backend (windows-x86_64-cuda.zip)", decision["reason"])
+        # #2541: GLM-5.3-Flash too, from the release after v2.1.0, whose package has
+        # glm53.exe; v2.1.0's has none, and there it stays on Vulkan, as before
+        for version, backend in (("2.2.0", "cuda"), ("2.1.0", "vulkan")):
+            with mock.patch.object(setup_flow, "current_version", return_value=version):
+                decision = self.choose(hw_report(vulkan=DGPU, nvidia=[card]), family="glm53", tc=tc,
+                                       platform="win32")
+            self.assertEqual(decision["backend"], backend, version)
+        self.assertEqual(decision["missing"], [])
         old = dict(RTX, name="NVIDIA GeForce RTX 2070", compute_cap="7.5")
         decision = self.choose(hw_report(vulkan=DGPU, nvidia=[old]), family="kimi", tc=tc, platform="win32")
         self.assertEqual(decision["backend"], "vulkan")
@@ -302,6 +310,33 @@ class BackendChoice(unittest.TestCase):
         # and on Linux the release has no CUDA backend to fetch
         decision = self.choose(hw_report(vulkan=DGPU, nvidia=[card]), family="kimi", tc=tc)
         self.assertNotEqual(decision["backend"], "cuda")
+
+    def test_glm53_with_a_package_from_before_it(self):
+        # #2541: v2.1.0's windows-x86_64-cuda.zip has no glm53.exe, so with v2.1.0 the
+        # setup does not tell a GLM-5.3-Flash user to unpack it: not in a source checkout
+        # with a compiler, nor where it is unpacked over the Vulkan glm53.exe already
+        hw = hw_report(vulkan=DGPU, nvidia=[dict(RTX, compute_cap="8.9")])
+        release = dict(TC_ALL, source_checkout=False, make=None, cc=None, can_build=False,
+                       can_build_vulkan=False, can_build_cuda=False)
+        with mock.patch.object(setup_flow, "current_version", return_value="2.1.0"):
+            decision = self.choose(hw, family="glm53", platform="win32")
+            self.assertEqual(decision["backend"], "vulkan")
+            self.assertEqual(decision["missing"], [])
+            with tempfile.TemporaryDirectory() as here:
+                self.windows_cuda_here(here)
+                Path(here, "glm53.exe").write_bytes(b"MZ vulkan-1.dll")
+                decision = self.choose(hw, family="glm53", tc=release, platform="win32", here=here)
+                self.assertEqual(decision["backend"], "vulkan")
+                self.assertEqual(decision["missing"], [])
+                # a glm53.exe built with CUDA_DLL=1 beside the DLL runs CUDA
+                Path(here, "glm53.exe").write_bytes(b"MZ coli_cuda.dll vulkan-1.dll")
+                decision = self.choose(hw, family="glm53", tc=release, platform="win32", here=here)
+                self.assertEqual(decision["backend"], "cuda")
+                self.assertIn("coli_cuda.dll beside the engine", decision["reason"])
+        # with the release after it, the hint the other three engines get
+        with mock.patch.object(setup_flow, "current_version", return_value="2.2.0"):
+            decision = self.choose(hw, family="glm53", platform="win32")
+        self.assertEqual(decision["missing"], [("cuda", setup_flow.TEXT_HINTS["cuda-win32-release"])])
 
     def test_no_compiler_counts_on_the_release_vulkan_engine(self):
         # nothing here builds and no engine is here: resolve_engine downloads the
@@ -623,6 +658,54 @@ class CudaEngineTable(unittest.TestCase):
                 self.assertNotIn("min_toolkit", entry, family_id)
 
 
+class WindowsCudaPackage(unittest.TestCase):
+    """WINDOWS_CUDA_ENGINES says which engines the release's windows-x86_64-cuda.zip
+    carries; this reads the same list from release.yml's cuda-windows job, which builds,
+    packs and checks them, and from ci.yml's windows-cuda-build, which links them on every
+    commit. GLM-5.3-Flash had a CUDA tier and no place in either (#2541)."""
+
+    def job(self, workflow, name):
+        text = (C_DIR.parent / ".github" / "workflows" / workflow).read_text(encoding="utf-8")
+        match = re.search(rf"(?m)^  {re.escape(name)}:\n(.*?)(?=^  \S|\Z)", text, re.S)
+        self.assertIsNotNone(match, f"{workflow}: no {name} job")
+        return match.group(1)
+
+    def test_the_package_carries_the_engines_the_setup_counts_on(self):
+        expected = {family_by_id(fid).engine_artifact for fid in setup_flow.WINDOWS_CUDA_ENGINES}
+        self.assertIn("glm53", expected)
+        for fid in setup_flow.WINDOWS_CUDA_ENGINES:      # the tier coli_cuda.dll's loader serves
+            self.assertEqual(setup_flow.CUDA_ENGINES[fid]["object"], "backend_cuda.o", fid)
+        def exes(text):
+            return {name[:-len(".exe")] for name in re.findall(r"[a-z0-9_]+\.exe", text)}
+
+        release = self.job("release.yml", "cuda-windows")
+        for what, pattern in (("built", r"for t in [a-z0-9_. ]+; do make \$t CUDA_DLL=1"),
+                              ("listed", r"ls -l coli_cuda\.dll[^\n]*"),
+                              ("packed", r"cp c/coli_cuda\.dll[^\n]*dist/pkg/"),
+                              ("checked to be in the package", r"for f in coli_cuda\.dll[^\n]*; do")):
+            with self.subTest(what=what):
+                found = re.search(pattern, release)
+                self.assertIsNotNone(found, f"release.yml, cuda-windows: no line for what is {what}")
+                self.assertEqual(exes(found.group(0)), expected)
+        readme = re.search(r"printf '%s\\r\\n'(.*?)> dist/pkg/README-CUDA\.txt", release, re.S)
+        self.assertIsNotNone(readme)
+        objdump = re.search(r"for e in ([a-z0-9_ ]+); do\n\s*deps=\$\(objdump", release)
+        self.assertIsNotNone(objdump)
+        python = re.search(r"for e in \(([^)]*)\):", release)
+        self.assertIsNotNone(python)
+        ci = self.job("ci.yml", "windows-cuda-build")
+        linked = re.findall(r"(?m)^\s*make ([a-z0-9_.]+) CUDA_DLL=1\s*$", ci)
+        uploaded = re.findall(r"(?m)^\s*c/([a-z0-9_]+)\.exe\s*$", ci)
+        for artifact in sorted(expected):
+            with self.subTest(engine=artifact):
+                self.assertIn(f"{artifact}.exe", readme.group(1))
+                self.assertIn(artifact, objdump.group(1).split())
+                self.assertIn(f'"{artifact}"', python.group(1))
+                self.assertIn(artifact, [t[:-len(".exe")] if t.endswith(".exe") else t for t in linked])
+                self.assertIn(artifact, uploaded)
+                self.assertIn(artifact, setup_flow.TEXT_HINTS["cuda-win32-release"])
+
+
 class PackageHints(unittest.TestCase):
     def test_one_command_per_system(self):
         hint = setup_flow.package_hint
@@ -939,12 +1022,14 @@ class Releases(HomeTestCase):
     LAYOUTS = {"linux": ("linux-x86_64.tar.gz", ("coli", "qwen36")),
                "win32": ("windows-x86_64.zip", ("coli", "coli.cmd", "qwen36.exe"))}
 
-    def make_archive(self, os_name, vulkan=False):
-        """A release archive; `vulkan`, one since 2.0: Vulkan engines and their shaders."""
+    def make_archive(self, os_name, vulkan=False, extra=()):
+        """A release archive; `vulkan`, one since 2.0: Vulkan engines and their shaders;
+        `extra`, the files of more engines than qwen36."""
         suffix, binaries = self.LAYOUTS[os_name]
         engine = (b"engine vulkan-1.dll" if os_name == "win32" else b"engine libvulkan.so.1") \
             if vulkan else b"engine"
         members = [(name, engine if name.startswith("qwen36") else b"# launcher") for name in binaries]
+        members += [(name, engine) for name in extra]
         members += [("web/dist/index.html", b"<html></html>"), ("tools/k3_tokenizer.py", b"")]
         if vulkan:
             members.append(("shaders/qmatmul.spv", b"\x03\x02\x23\x07"))
@@ -1003,23 +1088,24 @@ class Releases(HomeTestCase):
                                           {"backend": "cpu", "missing": []}, tc, out=out.append)
             self.assertIn("predates", str(caught.exception))
 
-    def cuda_archive(self, tag):
+    def cuda_archive(self, tag, engines=("qwen36.exe",)):
         """The release's windows-x86_64-cuda.zip: the engines again, built to load
         coli_cuda.dll, the DLL and its runtime."""
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w") as zf:
-            zf.writestr("qwen36.exe", b"engine coli_cuda.dll vulkan-1.dll")
+            for name in engines:
+                zf.writestr(name, b"engine coli_cuda.dll vulkan-1.dll")
             zf.writestr("coli_cuda.dll", b"MZ")
             zf.writestr("cudart64_12.dll", b"MZ")
             zf.writestr("README-CUDA.txt", f"colibri {tag}: the CUDA backend for Windows")
         return buffer.getvalue()
 
-    def windows_release(self, tag, folder, cuda=True):
+    def windows_release(self, tag, folder, cuda=True, extra=(), cuda_engines=("qwen36.exe",)):
         """The Windows release over HTTP, with its CUDA backend or (an older one) without."""
         name = f"colibri-{tag}-windows-x86_64.zip"
-        files = {name: self.make_archive("win32", vulkan=True)}
+        files = {name: self.make_archive("win32", vulkan=True, extra=extra)}
         if cuda:
-            files[f"colibri-{tag}-windows-x86_64-cuda.zip"] = self.cuda_archive(tag)
+            files[f"colibri-{tag}-windows-x86_64-cuda.zip"] = self.cuda_archive(tag, cuda_engines)
         files["SHA256SUMS.txt"] = "".join(f"{hashlib.sha256(data).hexdigest()}  {n}\n"
                                           for n, data in files.items()).encode()
         urls = self.serve_release(files, folder=folder)
@@ -1051,6 +1137,34 @@ class Releases(HomeTestCase):
                     else:   # a release from before the backend: its Vulkan engines
                         self.assertEqual(info["backend"], "vulkan")
                         self.assertIn("release v2.1.0 has no windows-x86_64-cuda.zip: using Vulkan", said)
+
+    def test_a_package_from_before_glm53_leaves_its_vulkan_build(self):
+        # #2541: v2.1.0's windows-x86_64-cuda.zip has no glm53.exe. A CUDA choice for
+        # GLM-5.3-Flash with that release runs the main archive's Vulkan build, as with
+        # no package at all, and downloads no package; before, the engine fell to the
+        # CPU ("no cuda build"). The package of a later release has glm53.exe
+        tc = dict(TC_ALL, source_checkout=False, can_build=False, can_build_vulkan=False)
+        for tag, carried in (("v2.1.0", False), ("v2.2.0", True)):
+            with self.subTest(tag=tag):
+                empty = os.path.join(self.tmp.name, f"nothing-here-{tag}")
+                os.makedirs(empty)
+                getter = self.windows_release(tag, f"release-{tag}", extra=("glm53.exe",),
+                                              cuda_engines=("qwen36.exe", "glm53.exe") if carried
+                                              else ("qwen36.exe",))
+                with modeled("win32"), mock.patch.object(setup_flow, "HERE", empty), \
+                     mock.patch.dict(os.environ, {"COLI_SETUP_HOME": os.path.join(self.tmp.name, f"h-{tag}")}), \
+                     mock.patch.object(setup_flow, "_api_get", side_effect=getter):
+                    out = []
+                    info = setup_flow.resolve_engine(family_by_id("glm53"), None,
+                                                     {"backend": "cuda", "missing": []}, tc, out=out.append)
+                said = "\n".join(out)
+                self.assertEqual(os.path.basename(info["engine"]), "glm53.exe")
+                self.assertEqual(info["backend"], "cuda" if carried else "vulkan")
+                self.assertEqual("downloading the CUDA backend" in said, carried)
+                self.assertEqual(os.path.isfile(os.path.join(info["launcher_dir"], "coli_cuda.dll")), carried)
+                if not carried:
+                    self.assertIn("the windows-x86_64-cuda.zip of release v2.1.0 has no CUDA build of "
+                                  "glm53: using Vulkan", said)
 
     def test_advertised_release_checksums_cannot_be_skipped(self):
         name = "colibri-v1.12.1-fixture.tar.gz"
@@ -2261,6 +2375,39 @@ class ConfiguredCuda(Releases):
         self.assertEqual(getter.call_count, asked)
         self.assertEqual(setup_flow.load_config()["backend"], "vulkan")
 
+    def test_a_package_without_the_engine_leaves_it_on_vulkan(self):
+        # #2541: v2.1.0's package has no glm53.exe. A GLM-5.3-Flash setup on that
+        # release's Vulkan engine stays on it, and the package is not downloaded
+        runtime = os.path.join(self.home, "runtime", "colibri-v2.1.0")
+        self.windows_engines(runtime, dll=False)
+        Path(runtime, "glm53.exe").write_bytes(b"engine vulkan-1.dll")
+        self.configured(runtime, family="glm53")
+        getter = mock.Mock(side_effect=self.windows_release("v2.1.0", "release", extra=("glm53.exe",)))
+        with modeled("win32"), mock.patch.object(setup_flow, "_api_get", getter):
+            said = self.rerun()
+        self.assertNotIn("fetching it", said)
+        self.assertNotIn("CUDA from now on", said)
+        self.assertEqual(getter.call_count, 0)
+        self.assertFalse(os.path.isfile(os.path.join(runtime, "coli_cuda.dll")))
+        cfg = setup_flow.load_config()
+        self.assertEqual(cfg["backend"], "vulkan")
+        self.assertEqual(cfg["env"]["COLI_VULKAN"], "1")
+
+    def test_a_later_package_puts_glm53_on_cuda(self):
+        # #2541: the package of a release after v2.1.0 has glm53.exe
+        runtime = os.path.join(self.home, "runtime", "colibri-v2.2.0")
+        self.windows_engines(runtime, dll=False)
+        Path(runtime, "glm53.exe").write_bytes(b"engine vulkan-1.dll")
+        self.configured(runtime, family="glm53")
+        getter = self.windows_release("v2.2.0", "release", extra=("glm53.exe",),
+                                      cuda_engines=("qwen36.exe", "glm53.exe"))
+        with modeled("win32"), mock.patch.object(setup_flow, "_api_get", side_effect=getter):
+            said = self.rerun()
+        self.assertIn("Release v2.2.0 has a CUDA backend for the NVIDIA card: fetching it.", said)
+        cfg = setup_flow.load_config()
+        self.assertEqual(cfg["backend"], "cuda")
+        self.assertNotIn("COLI_VULKAN", cfg["env"])
+
     def test_an_unreachable_release_is_asked_again_and_the_setup_goes_on(self):
         runtime = os.path.join(self.home, "runtime", "colibri-v2.1.0")
         self.windows_engines(runtime, dll=False)
@@ -2384,6 +2531,24 @@ class WindowsToolchainTests(unittest.TestCase):
 
     def test_msys2_build_packages_include_libgomp(self):
         self.assertIn("mingw-w64-ucrt-x86_64-libgomp", setup_flow.PACKAGES["msys2"][1]["build"])
+
+    def fake_gcc(self, answer):
+        """A stand-in gcc whose -print-file-name=libgomp.a says `answer`."""
+        path = os.path.join(self.tmp.name, "fake-gcc-" + str(abs(hash(answer))))
+        with open(path, "w") as f:
+            f.write(f'#!/bin/sh\necho "{answer}"\n')
+        os.chmod(path, 0o755)
+        return path
+
+    @unittest.skipIf(sys.platform == "win32", "the stand-in compiler is a shell script")
+    def test_a_gcc_without_libgomp_a_is_noticed(self):
+        # gcc 16 on MSYS2 has no libgomp.a until its libgomp package is installed (#2612);
+        # -print-file-name then echoes the bare name back.
+        self.assertTrue(setup_flow._cc_lacks_static_openmp(self.fake_gcc("libgomp.a")))
+        self.assertFalse(setup_flow._cc_lacks_static_openmp(self.fake_gcc("/ucrt64/lib/libgomp.a")))
+
+    def test_a_compiler_that_cannot_be_asked_is_not_blamed(self):
+        self.assertFalse(setup_flow._cc_lacks_static_openmp(os.path.join(self.tmp.name, "no-such-gcc")))
 
 
 

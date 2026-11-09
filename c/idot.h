@@ -925,6 +925,27 @@ static void matmul_i4p_gidot_amx(float *y, const int8_t *xq, const float *sx,
  * brought to the grouped family — the prefill batch-union and the serve mux
  * deliver exactly these multi-row calls). Integer group dots in any lane
  * order are exact, and each row keeps its own ascending-g fmaf chain. */
+/* K1b's per-group step, fmaf(d, scale, a), on a CPU without FMA: libm's software fmaf took 85 ns
+ * a call with glibc 2.39 (1.8 ns with 2.43), and a gs64 matrix calls it I/64 times an output, past
+ * the whole gain of the integer dot on a Sandy Bridge. The same bits without it: the product of two
+ * floats is exact in double, their sum with the third is rounded to odd in double (Knuth's TwoSum,
+ * then the even neighbour moved one ulp toward the error), and that rounds to the float fmaf gives,
+ * as 53 >= 2 * 24 + 2 bits. With FMA (x86-64-v3, ARM) it is fmaf, one instruction. */
+static inline float i4p_fmaf(float x, float y, float z){
+#if defined(__FMA__) || defined(__FMA4__) || defined(__ARM_FEATURE_FMA) || defined(__aarch64__) || !(defined(__x86_64__) || defined(_M_X64))
+    return fmaf(x,y,z);
+#else
+    const double a=(double)x*(double)y, b=(double)z, s=a+b;
+    const double a1=s-b, b1=s-a1, err=(a-a1)+(b-b1);   /* s + err == a + b exactly */
+    double r=s;
+    if(err!=0.0 && isfinite(s)){
+        uint64_t u; memcpy(&u,&r,sizeof u);
+        if(!(u&1)) u+=((err>0.0)==(s>0.0)) ? 1u : (uint64_t)-1;
+        memcpy(&r,&u,sizeof r);
+    }
+    return (float)r;
+#endif
+}
 static void i4p_gidot_rows(float *y, const int8_t *xq, const float *sx,
                            const int32_t *xsg, const uint8_t *q4,
                            const float *scale, int S, int I, int O, int gs,
@@ -1034,10 +1055,10 @@ static void i4p_gidot_rows(float *y, const int8_t *xq, const float *sx,
                     }
                 }
 #endif
-                a0=fmaf((float)(d0-8*g0[g]),scl[g],a0);
-                a1=fmaf((float)(d1-8*g1[g]),scl[g],a1);
-                a2=fmaf((float)(d2-8*g2[g]),scl[g],a2);
-                a3=fmaf((float)(d3-8*g3[g]),scl[g],a3);
+                a0=i4p_fmaf((float)(d0-8*g0[g]),scl[g],a0);
+                a1=i4p_fmaf((float)(d1-8*g1[g]),scl[g],a1);
+                a2=i4p_fmaf((float)(d2-8*g2[g]),scl[g],a2);
+                a3=i4p_fmaf((float)(d3-8*g3[g]),scl[g],a3);
             }
             if(g*gs<I){                                  /* coda: gruppo parziale, nibble a coppie */
                 int32_t d0=0,d1=0,d2=0,d3=0;
@@ -1046,10 +1067,10 @@ static void i4p_gidot_rows(float *y, const int8_t *xq, const float *sx,
                     int32_t u=(int32_t)((i&1)?(byte>>4):(byte&0xF));
                     d0+=u*x0[i]; d1+=u*x1[i]; d2+=u*x2[i]; d3+=u*x3[i];
                 }
-                a0=fmaf((float)(d0-8*g0[g]),scl[g],a0);
-                a1=fmaf((float)(d1-8*g1[g]),scl[g],a1);
-                a2=fmaf((float)(d2-8*g2[g]),scl[g],a2);
-                a3=fmaf((float)(d3-8*g3[g]),scl[g],a3);
+                a0=i4p_fmaf((float)(d0-8*g0[g]),scl[g],a0);
+                a1=i4p_fmaf((float)(d1-8*g1[g]),scl[g],a1);
+                a2=i4p_fmaf((float)(d2-8*g2[g]),scl[g],a2);
+                a3=i4p_fmaf((float)(d3-8*g3[g]),scl[g],a3);
             }
             y[(int64_t)s*O+o]    =a0*sx[s];
             y[(int64_t)(s+1)*O+o]=a1*sx[s+1];
@@ -1109,7 +1130,7 @@ static void i4p_gidot_rows(float *y, const int8_t *xq, const float *sx,
 #endif
                 }
 #endif
-                a=fmaf((float)(d-8*xg[g]),scl[g],a);
+                a=i4p_fmaf((float)(d-8*xg[g]),scl[g],a);
             }
             if(g*gs<I){                                  /* coda: gruppo parziale, nibble a coppie */
                 int32_t d=0;
@@ -1117,7 +1138,7 @@ static void i4p_gidot_rows(float *y, const int8_t *xq, const float *sx,
                     uint8_t byte=w[i>>1];
                     d+=(int32_t)((i&1)?(byte>>4):(byte&0xF))*xr[i];
                 }
-                a=fmaf((float)(d-8*xg[g]),scl[g],a);
+                a=i4p_fmaf((float)(d-8*xg[g]),scl[g],a);
             }
             y[(int64_t)s*O+o]=a*sx[s];
         }
@@ -1289,10 +1310,10 @@ static inline __attribute__((always_inline)) void i8r16_group(float *y, int O, c
 static inline __attribute__((always_inline)) void i8r16_group2(float *y, int O, const int8_t *grp, const float *sc,
                                                               const int8_t *xq, const float *sx, const int32_t *xsum,
                                                               int I, const int n){
-    __m512i p[8], q[8]; const int8_t *grp2=grp+(size_t)16*I;
+    __m512i p[8], q[8]; const int8_t *grpb=grp+(size_t)16*I;   /* not grp2: <dlgs.h>, in a full <windows.h>, #defines it (#2611) */
     for(int s=0;s<n;s++){ p[s]=_mm512_setzero_si512(); q[s]=_mm512_setzero_si512(); }
     for(int j=0;j<I/4;j++){
-        const __m512i c=_mm512_loadu_si512((const void*)(grp+64*(size_t)j)), c2=_mm512_loadu_si512((const void*)(grp2+64*(size_t)j));
+        const __m512i c=_mm512_loadu_si512((const void*)(grp+64*(size_t)j)), c2=_mm512_loadu_si512((const void*)(grpb+64*(size_t)j));
         for(int s=0;s<n;s++){
             const __m512i x=_mm512_set1_epi32(i8r16_ld32(xq+(size_t)s*I+4*j));
             p[s]=_mm512_dpbusd_epi32(p[s],c,x); q[s]=_mm512_dpbusd_epi32(q[s],c2,x);
@@ -1374,6 +1395,139 @@ static void matmul_q_idot_rows_r16(float *y, const int8_t *xq, float sx, const i
         }
         free(row);
     }
+}
+#endif
+
+/* ---- int4 groups of 64 interleaved by 16 (COLI_DENSE_BITS=4's trunk on the CPU) ---------
+ * The K1b grouped kernel's matrix (planar blocks of 64, a scale per row and group: byte p of a
+ * group holds input p in its low nibble and input 32 + p in its high), 16 rows to a set: for
+ * every 64 inputs eight 64-byte blocks, block k's lane r (bytes 4r..4r+3) row r's inputs
+ * 8k..8k+3 in the low nibbles and 8k+4..8k+7 in the high. One vpdpbusd against an activation
+ * row's broadcast quad advances the 16 rows, so a group needs no horizontal sum a (row,
+ * activation row), the K1b kernel's cost at a prompt's rows; its (d - 8 * xsg) * scale goes
+ * into each row's float sum by one fused multiply-add, the K1b kernel's fmaf in its order:
+ * the same bits. The scales move with the rows: [set of 16][group][16]. In place (the same
+ * bytes, the same floats); O % 16 == 0, I % 64 == 0. Built where the fused multiply-add is
+ * the hardware's (FMA), as the K1b kernel's fmaf then is. */
+#if defined(__AVX2__) && defined(__FMA__)
+#define IDOT_I4R16 1
+/* the nibble of input i (0..63) of a planar group's 32 bytes */
+static inline uint8_t i4r16_nib(const uint8_t *g32, int i){ return i < 32 ? (uint8_t)(g32[i] & 15) : (uint8_t)(g32[i - 32] >> 4); }
+/* one set of 16 rows (rb = I / 2 bytes each) and its scales (16 rows of ng), with scratch
+ * tmp of 16 * rb bytes and tsc of 16 * ng floats */
+static inline void i4r16_pack_set(uint8_t *rows, float *sc, int I, uint8_t *tmp, float *tsc){
+    const int rb = I / 2, ng = I / 64;
+    for(int g = 0; g < ng; g++)
+        for(int k = 0; k < 8; k++)
+            for(int r = 0; r < 16; r++)
+                for(int e = 0; e < 4; e++){
+                    const uint8_t *g32 = rows + (size_t)r * rb + (size_t)g * 32;
+                    tmp[((size_t)g * 8 + k) * 64 + 4 * r + e] = (uint8_t)(i4r16_nib(g32, 8 * k + e) | (i4r16_nib(g32, 8 * k + 4 + e) << 4));
+                }
+    for(int g = 0; g < ng; g++) for(int r = 0; r < 16; r++) tsc[(size_t)g * 16 + r] = sc[(size_t)r * ng + g];
+    memcpy(rows, tmp, (size_t)16 * rb); memcpy(sc, tsc, (size_t)16 * ng * sizeof(float));
+}
+/* row `id`'s planar bytes and scales back from packed sets (tests, a row read alone) */
+static inline void i4r16_row(uint8_t *row, float *rsc, const uint8_t *q4, const float *sg, int id, int I){
+    const int rb = I / 2, ng = I / 64, r = id % 16;
+    const uint8_t *set = q4 + (size_t)(id / 16) * 16 * rb;
+    for(int g = 0; g < ng; g++){
+        uint8_t nib[64];
+        for(int k = 0; k < 8; k++)
+            for(int e = 0; e < 4; e++){
+                const uint8_t b = set[((size_t)g * 8 + k) * 64 + 4 * r + e];
+                nib[8 * k + e] = b & 15; nib[8 * k + 4 + e] = b >> 4;
+            }
+        for(int p = 0; p < 32; p++) row[(size_t)g * 32 + p] = (uint8_t)(nib[p] | (nib[32 + p] << 4));
+        rsc[g] = sg[((size_t)(id / 16) * ng + g) * 16 + r];
+    }
+}
+/* one set (grp, its scales sc[ng][16]) against n activation rows (xq rows of I, their scales
+ * sx and their groups' byte sums xsg rows of ng): y[s * O + r] */
+static inline __attribute__((always_inline)) void i4r16_set(float *y, int O, const uint8_t *grp, const float *sc,
+                                                           const int8_t *xq, const float *sx, const int32_t *xsg,
+                                                           int I, const int n){
+    const int ng = I / 64;
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+    const __m512i m4 = _mm512_set1_epi8(0x0F);
+    __m512 a[8];
+    for(int s = 0; s < n; s++) a[s] = _mm512_setzero_ps();
+    for(int g = 0; g < ng; g++){
+        __m512i p[8];
+        for(int s = 0; s < n; s++) p[s] = _mm512_setzero_si512();
+        const uint8_t *b = grp + (size_t)g * 512;
+        for(int k = 0; k < 8; k++){
+            const __m512i c = _mm512_loadu_si512((const void *)(b + 64 * k));
+            const __m512i lo = _mm512_and_si512(c, m4), hi = _mm512_and_si512(_mm512_srli_epi16(c, 4), m4);
+            const int8_t *xo = xq + (size_t)g * 64 + 8 * k;
+            for(int s = 0; s < n; s++){
+                p[s] = _mm512_dpbusd_epi32(p[s], lo, _mm512_set1_epi32(i8r16_ld32(xo + (size_t)s * I)));
+                p[s] = _mm512_dpbusd_epi32(p[s], hi, _mm512_set1_epi32(i8r16_ld32(xo + (size_t)s * I + 4)));
+            }
+        }
+        const __m512 scv = _mm512_loadu_ps(sc + (size_t)g * 16);
+        for(int s = 0; s < n; s++)
+            a[s] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_sub_epi32(p[s], _mm512_set1_epi32(8 * xsg[(size_t)s * ng + g]))), scv, a[s]);
+    }
+    for(int s = 0; s < n; s++) _mm512_storeu_ps(y + (size_t)s * O, _mm512_mul_ps(a[s], _mm512_set1_ps(sx[s])));
+#else
+    const __m256i m4 = _mm256_set1_epi8(0x0F);
+    for(int h = 0; h < 2; h++){
+        __m256 a[8];
+        for(int s = 0; s < n; s++) a[s] = _mm256_setzero_ps();
+        for(int g = 0; g < ng; g++){
+            __m256i p[8];
+            for(int s = 0; s < n; s++) p[s] = _mm256_setzero_si256();
+            const uint8_t *b = grp + (size_t)g * 512 + 32 * h;
+            for(int k = 0; k < 8; k++){
+                const __m256i c = _mm256_loadu_si256((const __m256i *)(b + 64 * k));
+                const __m256i lo = _mm256_and_si256(c, m4), hi = _mm256_and_si256(_mm256_srli_epi16(c, 4), m4);
+                const int8_t *xo = xq + (size_t)g * 64 + 8 * k;
+                for(int s = 0; s < n; s++){
+                    const __m256i x0 = _mm256_set1_epi32(i8r16_ld32(xo + (size_t)s * I)), x1 = _mm256_set1_epi32(i8r16_ld32(xo + (size_t)s * I + 4));
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+                    p[s] = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(p[s], lo, x0), hi, x1);
+#elif defined(__AVXVNNI__)
+                    p[s] = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(p[s], lo, x0), hi, x1);
+#else
+                    /* u8 nibbles (<= 15) times s8 (|x| <= 127): a pair's sum fits int16 */
+                    const __m256i ones = _mm256_set1_epi16(1);
+                    p[s] = _mm256_add_epi32(p[s], _mm256_add_epi32(_mm256_madd_epi16(_mm256_maddubs_epi16(lo, x0), ones),
+                                                                    _mm256_madd_epi16(_mm256_maddubs_epi16(hi, x1), ones)));
+#endif
+                }
+            }
+            const __m256 scv = _mm256_loadu_ps(sc + (size_t)g * 16 + 8 * h);
+            for(int s = 0; s < n; s++)
+                a[s] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(p[s], _mm256_set1_epi32(8 * xsg[(size_t)s * ng + g]))), scv, a[s]);
+        }
+        for(int s = 0; s < n; s++) _mm256_storeu_ps(y + (size_t)s * O + 8 * h, _mm256_mul_ps(a[s], _mm256_set1_ps(sx[s])));
+    }
+#endif
+}
+/* matmul_i4p_grouped_idot (gs 64) on sets packed by i4r16_pack_set: the same bits */
+static void matmul_i4p_gidot_r16(float *y, const int8_t *xq, const float *sx, const int32_t *xsg,
+                                 const uint8_t *q4, const float *sg, int S, int I, int O){
+    const int ng = I / 64, sets = O / 16;
+    #define I4R16_RUN(N) i4r16_set(ys, O, grp, sc, xq + (size_t)s0 * I, sx + s0, xsg + (size_t)s0 * ng, I, N)
+    #define I4R16_SETS() \
+        const uint8_t *grp = q4 + (size_t)t * 16 * (I / 2); const float *sc = sg + (size_t)t * 16 * ng; \
+        for(int s0 = 0; s0 < S; s0 += 8){ \
+            const int n = S - s0 < 8 ? S - s0 : 8; float *ys = y + (size_t)s0 * O + 16 * t; \
+            switch(n){ case 1: I4R16_RUN(1); break; case 2: I4R16_RUN(2); break; case 3: I4R16_RUN(3); break; \
+                       case 4: I4R16_RUN(4); break; case 8: I4R16_RUN(8); break; default: I4R16_RUN(n); break; } \
+        }
+    /* a prompt's rows: sets handed out one at a time (a hybrid CPU's fast cores do not wait on
+     * the slow ones; a set is one thread's, the same bits); decode: the static split */
+    if(S >= 4){
+        #pragma omp parallel for schedule(dynamic, 1)
+        for(int t = 0; t < sets; t++){ I4R16_SETS() }
+    } else {
+        #pragma omp parallel for schedule(static)
+        for(int t = 0; t < sets; t++){ I4R16_SETS() }
+    }
+    #undef I4R16_SETS
+    #undef I4R16_RUN
 }
 #endif
 

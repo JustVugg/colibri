@@ -1,0 +1,107 @@
+{
+ "version": 1,
+ "hypothesis": "On a Xeon Gold 6254 beside an Arc Pro B60 (Vulkan dense chain, every routed expert in the tier's host pool), Qwen3.8-Flash-Next-FP8's hybrid decode steps compute the host pool's FP8 pairs on the CPU through dev_dequant: an ldexpf and an integer division per weight, then a scalar sum; 41 ms a layer step, about 2 s a token with the GPU idle 95% of the time. Decoding the codes through binary16 (F16C) or a table with AVX2, each 128-column group's scale applied once, computes the same pairs about 30x faster: decode several times faster, greedy answers identical.",
+ "commit": "e24cd51afd44b480c1e41ba82e20a28bac76c34f",
+ "model": "Qwen/Qwen3.8-Flash-Next-FP8 (the release's FP8 e4m3 experts, 128x128 block scales; 185.5 GB), at /models/qwen38-flash-next (config.json sha256 99c11efba4012d0f760f4e4831a8d6cafd845044e21d0aa9e6d9e70a15a90a8d)",
+ "command": "Build, both trees: docker run --rm -v <tree>:/src -w /src colibri-builder:xe2 nice -n 19 make -C c colibri qwen36 qwen38 VK=1 ARCH=x86-64-v3 (0 warnings); the binaries, c/*.py, c/tools and c/shaders over the same runtime image (Ubuntu 26.04, Mesa 26.2.6). Engine: docker compose up -d of a compose file with coli serve --model /models/qwen38-flash-next --cap 64, COLI_ENGINE=/app/qwen38, COLI_VULKAN=1, only GPU 1's render node mapped, cpuset 16-31, OMP_NUM_THREADS=16, COLI_USAGE= the shipped c/profiles/qwen38-flash-next.coli_usage with USAGE_SAVE=0, and an override with the arm's image and variables. Measured with colibench, a local benchmark harness (not part of this repository): python3 colibench.py run --profile light --micro off --repetitions 3 --warmups 1 --workloads decode_short,prefill_short,prefill_long --timeout 1800, COLIBENCH_REASONING_EFFORT=none (streamed OpenAI API requests, temperature 0); answers: experiments/outputs_check.py.",
+ "prompt_hash": "d8763306dccc29100d666f6bdcfa3cff852a0a0eaa2336e2eb46a74ed8eeb2d1",
+ "hardware": {
+  "cpu": "Proxmox VE 9.2 VM on an HP Z6 G4: 32 vCPUs of an Intel Xeon Gold 6254 @ 3.10GHz (1 socket, 1 thread per core in the guest), the engine container on CPUs 16-31 with 16 OpenMP threads; GPU 1 = an Intel Arc Pro B60 (Xe2, BMG G21, 24 GB) as an SR-IOV VF (0000:02:00.0, PCIe Gen3 x8 to the host), the engine's only device; another engine idle on GPU 0 and CPUs 0-15",
+  "ram": "247 GiB in the guest; the tier's host pool holds every routed expert (118.25 GiB) in system RAM",
+  "storage": "a local copy of the model on the guest's virtual disk (/srv/models/qwen38-flash-next, read-only bind; sha256 of every file equal to the release's); the expert tier warm-starts every expert at each start (64 s)",
+  "os": "Ubuntu 26.04.1 LTS guest, kernel 7.0.0-42-generic, xe kernel driver (SR-IOV VF: a GPU job is killed after 5 s); engine image Ubuntu 26.04 with Mesa ANV 26.2.6 (mesa-vulkan-drivers 26.2.6~kisak1); engine compiled with gcc 15.2.0 in the colibri-builder:xe2 container (ubuntu:26.04): -O3 -march=x86-64-v3, VK=1"
+ },
+ "warmup_runs": 1,
+ "changed_variables": [
+  "engine_build"
+ ],
+ "baseline": {
+  "config": {
+   "model": "Qwen3.8-Flash-Next-FP8 (/models/qwen38-flash-next)",
+   "gpu": "Arc Pro B60 VF, GPU 1 only",
+   "mesa": "26.2.6~kisak1",
+   "COLI_VK_HYBRID_BIG_ROWS": "unset (2)",
+   "COLI_VK_CHAIN_ROWS": "unset (by free memory)",
+   "Q38_MAXT": "65536",
+   "experts": "FP8 (no int4 sidecar used)",
+   "cap": "64",
+   "OMP_NUM_THREADS": "16",
+   "engine_build": "dev e24cd51a + the Xe2 fixes of #2685-#2689 (the chain needs #2685 on the B60) (qwen38 sha256 9fb3258e55b49d3a)"
+  },
+  "samples": {
+   "tok_s": [
+    0.6725,
+    0.7656,
+    0.6704
+   ],
+   "ttft_short_s": [
+    15.1348,
+    16.5086,
+    16.639
+   ],
+   "ttft_3k_s": [
+    152.3405,
+    154.067,
+    152.5804
+   ]
+  },
+  "median_tok_s": 0.6725,
+  "quality": {
+   "method": "the greedy reference itself (3 fixed prompts, 160 tokens, thinking off; q38-base recorded on this dev engine) and 7 of 7 known-answer questions right on it",
+   "passed": true
+  },
+  "evidence": {
+   "uri": "docs/experiments/vulkan-fp8-host-pairs-2026-11-07/runs.txt",
+   "sha256": "367f256ec17e9b944d075faea8babf01643cd68c41e485f5592da6a217c21e54"
+  }
+ },
+ "trial": {
+  "config": {
+   "model": "Qwen3.8-Flash-Next-FP8 (/models/qwen38-flash-next)",
+   "gpu": "Arc Pro B60 VF, GPU 1 only",
+   "mesa": "26.2.6~kisak1",
+   "COLI_VK_HYBRID_BIG_ROWS": "unset (2)",
+   "COLI_VK_CHAIN_ROWS": "unset (by free memory)",
+   "Q38_MAXT": "65536",
+   "experts": "FP8 (no int4 sidecar used)",
+   "cap": "64",
+   "OMP_NUM_THREADS": "16",
+   "engine_build": "the same + this change (qwen38 sha256 fbd70cc4996c3727)"
+  },
+  "samples": {
+   "tok_s": [
+    6.6571,
+    7.6931,
+    7.4259
+   ],
+   "ttft_short_s": [
+    8.3612,
+    8.371,
+    9.3841
+   ],
+   "ttft_3k_s": [
+    143.1146,
+    138.7868,
+    139.0209
+   ]
+  },
+  "median_tok_s": 7.4259,
+  "quality": {
+   "method": "greedy answers to 3 fixed prompts (160 tokens, thinking off) against q38-base: 3/3 identical",
+   "passed": true
+  },
+  "evidence": {
+   "uri": "docs/experiments/vulkan-fp8-host-pairs-2026-11-07/runs.txt",
+   "sha256": "367f256ec17e9b944d075faea8babf01643cd68c41e485f5592da6a217c21e54"
+  }
+ },
+ "outcome": "improvement",
+ "logs": {
+  "uri": "docs/experiments/vulkan-fp8-host-pairs-2026-11-07/logs.txt",
+  "sha256": "fb1e20e7ccbeb1dabb94522f7684cd7dc3623eac4d5cd999d53821a58feaf0cd"
+ },
+ "kernel_checks": {
+  "uri": "docs/experiments/vulkan-fp8-host-pairs-2026-11-07/kernel-checks.txt",
+  "sha256": "b3f61d71206439b02a9967724bcc04b8566a4029daf835f0689966c1a276a85d"
+ }
+}

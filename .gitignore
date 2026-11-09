@@ -77,6 +77,8 @@ c/tests/tmp_*
 # bench_* and fuzz_* build to extensionless binaries in the same directory and
 # were not covered here, which is how c/tests/bench_omp_grain reached the tree.
 c/tests/bench_*
+# the int4 sets' kernel test built for AVX-512 VNNI and AVX-VNNI (make i4r16-check)
+c/tests/i4r16_*
 !c/tests/bench_*.c
 !c/tests/bench_*.cu
 !c/tests/bench_*.mm

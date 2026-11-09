@@ -1,0 +1,152 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+// DeepSeek V4.1 Flash's and DeepSeek V4's indexer scores (vk_chain.h: vkc_dsv4_score,
+// mode 11): mode 10 of chain_dsv4.comp's contract, in tiles of 16 rows x 32 candidates.
+// One workgroup holds a tile: the candidate keys staged once in shared memory (32 columns
+// x 128 dims) and the queries of one head pair at a time (2 heads x 16 rows x 128 dims),
+// 32 KB of it in all. That is why this is a module of its own: Vulkan sizes workgroup
+// storage a module, and 32 KB inside chain_dsv4.comp would drop every one of its modes to
+// two workgroups a compute unit. vk_chain.c loads it beside chain_dsv4.spv and dispatches
+// it for a grid of tiles; without it (or under COLI_VK_DSA_TILED=0) mode 10 runs.
+//
+// The bits are mode 10's: score[s][j] = sum_h relu( sum_i q[s,h,i] * k[j,i] ) * (w[s,h] *
+// wscale), i ascending and h ascending, the weight times wscale rounded once, so a choice
+// between the two modes never changes a selection (tests/test_vk_chain.c holds it to
+// memcmp). Dead columns (j >= lens[s], masked, or j >= width) score -inf and columns >=
+// width are not written; the queries read where they are (mode 10 reads them from memory
+// too when IH * ID > 4096), the keys through the tile.
+//
+// ID is 128 (a host gate): the tile's key stage is 32 x 128 floats. The grid is
+// ceil(width/32) tiles across and ceil(S/16) down.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer B0 { float b0[]; };   // q rows
+layout(std430, binding = 1) readonly buffer B1 { float b1[]; };   // hw rows
+layout(std430, binding = 2) readonly buffer B2 { float b2[]; };   // index keys
+layout(std430, binding = 3) readonly buffer L3 { int l3[]; };     // candidate mask, one bit a column (packed words)
+layout(std430, binding = 5) buffer Y5 { float y5[]; };            // score rows
+
+layout(push_constant) uniform P { int v[32]; } p;   // v[0]=mode, then VkcDsScore's fields (as mode 10)
+
+#define NEG_INF uintBitsToFloat(0xff800000u)
+
+const int T_WG = 16, C_WG = 32, TR = 2, CR = 1;   // (T_WG/TR) rows x (C_WG/CR) columns = 8 x 32 threads
+const int DIMC = 128, DIM4 = DIMC / 4;
+const int TG = T_WG / TR, CG = C_WG / CR;
+
+// the mask is one bit a column (mode 10: bit j & 31 of the word at mb + row*mr + (j >> 5)),
+// mb the row's first word, as the packed rows' (chain_dsv4.comp's mbit)
+bool mset(int mb, int mr, int row, int j) { return mr <= 0 || ((uint(l3[mb + row * mr + (j >> 5)]) >> uint(j & 31)) & 1u) != 0u; }
+
+shared vec4 ks[DIM4 * C_WG];        // [v4][candidate] 16 KB, staged once a workgroup
+shared vec4 qs[2 * DIM4 * T_WG];    // [head of the pair][v4][row] 16 KB, one pair at a time
+
+void main() {
+    int S = p.v[1], IH = p.v[4], width = p.v[6];
+    int s_base = int(gl_WorkGroupID.y) * T_WG, j_base = int(gl_WorkGroupID.x) * C_WG;
+    if (s_base >= S || j_base >= width) return;
+    int tid = int(gl_LocalInvocationID.x);
+    int kr = p.v[12], mr = p.v[13];
+    float wscale = intBitsToFloat(p.v[15]);
+    int sb0 = p.v[16] + s_base * p.v[14], mb0 = p.v[17] + s_base * mr;
+
+    int lens[T_WG];                                 // each row's reach, as mode 10's
+    for (int i = 0; i < T_WG; ++i) {
+        int s = s_base + i;
+        lens[i] = s < S ? (p.v[2] + s + 1) / p.v[3] : 0;
+    }
+    /* past every row's reach: the whole tile is -inf, no keys staged */
+    int lens_max = 0;
+    for (int i = 0; i < T_WG; ++i) lens_max = lens_max < lens[i] ? lens[i] : lens_max;
+    if (j_base >= lens_max) {
+        for (int i = tid; i < T_WG * C_WG; i += 256) {
+            int row = i / C_WG, s = s_base + row, j = j_base + i % C_WG;
+            if (s < S && j < width) y5[sb0 + row * p.v[14] + j] = NEG_INF;
+        }
+        return;
+    }
+
+    /* the key tile once: [v4][candidate], consecutive threads take consecutive candidates */
+    for (int i = tid; i < C_WG * DIM4; i += 256) {
+        int cand = i % C_WG, v4 = i / C_WG, j = j_base + cand;
+        if (j < width) {
+            int b = p.v[11] + j * kr + v4 * 4;
+            ks[v4 * C_WG + cand] = vec4(b2[b], b2[b + 1], b2[b + 2], b2[b + 3]);
+        } else ks[v4 * C_WG + cand] = vec4(0.0);
+    }
+    barrier();
+
+    int t0 = s_base + (tid % TG) * TR, c0 = j_base + (tid / TG) * CR;
+    bool live[TR][CR];
+    float score[TR][CR];
+    [[unroll]] for (int ti = 0; ti < TR; ++ti)
+        [[unroll]] for (int cj = 0; cj < CR; ++cj) {
+            int s = t0 + ti, j = c0 + cj;
+            live[ti][cj] = s < S && j < width && j < lens[t0 - s_base + ti] && mset(mb0, mr, t0 - s_base + ti, j);
+            score[ti][cj] = 0.0;
+        }
+
+    for (int hh = 0; hh < IH; hh += 2) {
+        bool two = (hh + 1) < IH;
+        int h1 = two ? hh + 1 : hh;
+        barrier();                                  // the pair before done with qs
+        for (int pass = 0; pass < 2; ++pass) {
+            int hh2 = pass == 0 ? hh : h1;
+            for (int i = tid; i < T_WG * DIM4; i += 256) {
+                int row = i % T_WG, v4 = i / T_WG, s = s_base + row;
+                vec4 val = vec4(0.0);
+                if (s < S) {
+                    int b = p.v[7] + s * p.v[8] + hh2 * DIMC + v4 * 4;
+                    val = vec4(b0[b], b0[b + 1], b0[b + 2], b0[b + 3]);
+                }
+                qs[(pass * DIM4 + v4) * T_WG + row] = val;
+            }
+        }
+        barrier();
+
+        float dot[TR][CR][2];
+        [[unroll]] for (int ti = 0; ti < TR; ++ti)
+            [[unroll]] for (int cj = 0; cj < CR; ++cj) { dot[ti][cj][0] = 0.0; dot[ti][cj][1] = 0.0; }
+
+        /* i ascending a vec4 at a time, the products and sums in mode 10's order */
+        [[unroll]] for (int v4 = 0; v4 < DIM4; ++v4) {
+            vec4 kv[CR];
+            [[unroll]] for (int cj = 0; cj < CR; ++cj) kv[cj] = ks[v4 * C_WG + (tid / TG) * CR + cj];
+            [[unroll]] for (int hloc = 0; hloc < 2; ++hloc) {
+                [[unroll]] for (int ti = 0; ti < TR; ++ti) {
+                    vec4 qv = qs[(hloc * DIM4 + v4) * T_WG + (tid % TG) * TR + ti];
+                    [[unroll]] for (int cj = 0; cj < CR; ++cj) {
+                        if (!live[ti][cj]) continue;
+                        vec4 pr = qv * kv[cj];
+                        float d = dot[ti][cj][hloc];
+                        d = d + pr.x; d = d + pr.y; d = d + pr.z; d = d + pr.w;
+                        dot[ti][cj][hloc] = d;
+                    }
+                }
+            }
+        }
+        /* relu, weight, and the head joined in order (hh then hh + 1), as mode 10's
+         * thread a column does; the weight's wscale mul rounds once */
+        [[unroll]] for (int ti = 0; ti < TR; ++ti) {
+            int s = t0 + ti;
+            float w0 = s < S ? b1[p.v[9] + s * p.v[10] + hh] * wscale : 0.0f;
+            float w1 = s < S ? b1[p.v[9] + s * p.v[10] + h1] * wscale : 0.0f;
+            [[unroll]] for (int cj = 0; cj < CR; ++cj) {
+                if (!live[ti][cj]) continue;
+                score[ti][cj] = score[ti][cj] + max(dot[ti][cj][0], 0.0) * w0;
+                if (two)
+                    score[ti][cj] = score[ti][cj] + max(dot[ti][cj][1], 0.0) * w1;
+            }
+        }
+    }
+
+    [[unroll]] for (int ti = 0; ti < TR; ++ti) {
+        int s = t0 + ti;
+        if (s >= S) continue;
+        [[unroll]] for (int cj = 0; cj < CR; ++cj) {
+            int j = c0 + cj;
+            if (j < width)
+                y5[sb0 + (s - s_base) * p.v[14] + j] = live[ti][cj] ? score[ti][cj] : NEG_INF;
+        }
+    }
+}

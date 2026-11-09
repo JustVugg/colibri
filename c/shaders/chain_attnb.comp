@@ -33,8 +33,21 @@
 // decode row's thousands of positions over many workgroups; the chunks are fixed by
 // position, so the bits still are the row's own).
 // Limits: hd, vd <= 256.
+// HDC and VDC (constants 1 and 2; 0: the push constants') fix K's and V's head dims in the
+// pipeline (vk_chain.c's kab_pipe, a pipeline a shape): a lane's loops over its dims then
+// stop where its dims do, without testing each dim against p.hd (on an Arc Pro B60 each
+// tested term was a shared-memory read of its own: 45 spills, and a 255-row chunk of
+// Qwen3.6 at 16K positions took 185.1 ms; fixed, 3 spills and 25.7 ms). The q.k partial is
+// then summed as fused multiply-adds in order (precise), the arithmetic the tested sum
+// compiles to on ANV and Lavapipe: left to the compiler, the untested sum rounded otherwise
+// on ANV (825,758 of 1,044,480 outputs differed in their last bits). VEC (constant 3)
+// stages K and V a uvec4 (8 halves) a load, every load of a tile before its stores: a
+// float16 cache, head-major, no ring and no list, k_off, v_off, HDC and VDC multiples of 8.
 layout(local_size_x = 256) in;
 layout(constant_id = 0) const int BC = 8;
+layout(constant_id = 1) const int HDC = 0;
+layout(constant_id = 2) const int VDC = 0;
+layout(constant_id = 3) const bool VEC = false;
 
 layout(std430, binding = 0) readonly buffer QB { float q[]; };
 layout(std430, binding = 1) readonly buffer KB { float kc[]; };
@@ -42,6 +55,8 @@ layout(std430, binding = 2) readonly buffer VB { float vc[]; };
 layout(constant_id = 7) const bool KV16 = false;   // K and V float16, two a word (vk_chain.c's vkc_attn_h)
 layout(std430, binding = 1) readonly buffer KBH { uint kch[]; };
 layout(std430, binding = 2) readonly buffer VBH { uint vch[]; };
+layout(std430, binding = 1) readonly buffer KB4 { uvec4 kc4[]; };   // VEC
+layout(std430, binding = 2) readonly buffer VB4 { uvec4 vc4[]; };
 float kf(int i) { return KV16 ? unpackHalf2x16(kch[i >> 1])[i & 1] : kc[i]; }
 float vf(int i) { return KV16 ? unpackHalf2x16(vch[i >> 1])[i & 1] : vc[i]; }
 layout(std430, binding = 3) buffer OB { float o[]; };
@@ -71,6 +86,7 @@ shared int   tpos[BC];            // the tile's positions (-1: none)
 void main() {
     int tid = int(gl_LocalInvocationID.x);
     int pair = tid >> 3, lane = tid & 7;
+    int HD = HDC > 0 ? HDC : p.hd, VD = VDC > 0 ? VDC : p.vd;
     int kvh = int(gl_WorkGroupID.x);
     int G = p.H / p.KVH;
     int s0 = int(gl_WorkGroupID.y) * p.br;
@@ -82,7 +98,7 @@ void main() {
     int qb = p.q_off + s * p.q_row + h * p.q_seg;
     for (int i = 0; i < 32; i++) {
         int d = lane + 8 * i;
-        qv[i] = live && d < p.hd ? q[qb + d] : 0.0;
+        qv[i] = live && d < HD ? q[qb + d] : 0.0;
         av[i] = 0.0;
     }
     // the block's positions: the union of its rows' ranges, or the one row's list
@@ -119,32 +135,69 @@ void main() {
         }
         barrier();
         // the tile's keys and values into shared memory, once for every pair
-        for (int x = tid; x < BC * p.hd; x += 256) {
-            int j = x / p.hd, d = x - j * p.hd, t = tpos[j];
-            float kv = 0.0;
-            if (t >= 0) {
-                int rr = p.ring > 0 ? t % p.ring : t;
-                kv = kf(p.k_off + (p.kv_pm != 0 ? rr * p.KVH + kvh : kbase + rr) * p.hd + d);
+        if (VEC) {   // the tile's positions are bfirst + t0 + j, its rows whole uvec4s
+            const int NW = (BC * 32 + 255) / 256;
+            int K8 = HD / 8, V8 = VD / 8;
+            uvec4 kw[NW], vw[NW];
+            for (int c = 0; c < NW; c++) {
+                int x = tid + 256 * c, j = x / K8, d8 = x - j * K8;
+                kw[c] = uvec4(0);
+                if (x < BC * K8 && t0 + j < n) kw[c] = kc4[(p.k_off + (kbase + bfirst + t0 + j) * HD) / 8 + d8];
+                j = x / V8; d8 = x - j * V8;
+                vw[c] = uvec4(0);
+                if (x < BC * V8 && t0 + j < n) vw[c] = vc4[(p.v_off + (kbase + bfirst + t0 + j) * VD) / 8 + d8];
             }
-            ks[j * 256 + d] = kv;
-        }
-        for (int x = tid; x < BC * p.vd; x += 256) {
-            int j = x / p.vd, d = x - j * p.vd, t = tpos[j];
-            float vv = 0.0;
-            if (t >= 0) {
-                int rr = p.ring > 0 ? t % p.ring : t;
-                vv = vf(p.v_off + (p.kv_pm != 0 ? rr * p.KVH + kvh : kbase + rr) * p.vd + d);
+            for (int c = 0; c < NW; c++) {
+                int x = tid + 256 * c, j = x / K8, d8 = x - j * K8;
+                if (x < BC * K8) {
+                    int o = j * 256 + d8 * 8;
+                    vec2 a0 = unpackHalf2x16(kw[c].x), a1 = unpackHalf2x16(kw[c].y), a2 = unpackHalf2x16(kw[c].z), a3 = unpackHalf2x16(kw[c].w);
+                    ks[o] = a0.x; ks[o + 1] = a0.y; ks[o + 2] = a1.x; ks[o + 3] = a1.y;
+                    ks[o + 4] = a2.x; ks[o + 5] = a2.y; ks[o + 6] = a3.x; ks[o + 7] = a3.y;
+                }
+                j = x / V8; d8 = x - j * V8;
+                if (x < BC * V8) {
+                    int o = j * 256 + d8 * 8;
+                    vec2 a0 = unpackHalf2x16(vw[c].x), a1 = unpackHalf2x16(vw[c].y), a2 = unpackHalf2x16(vw[c].z), a3 = unpackHalf2x16(vw[c].w);
+                    vs[o] = a0.x; vs[o + 1] = a0.y; vs[o + 2] = a1.x; vs[o + 3] = a1.y;
+                    vs[o + 4] = a2.x; vs[o + 5] = a2.y; vs[o + 6] = a3.x; vs[o + 7] = a3.y;
+                }
             }
-            vs[j * 256 + d] = vv;
+        } else {
+            for (int x = tid; x < BC * HD; x += 256) {
+                int j = x / HD, d = x - j * HD, t = tpos[j];
+                float kv = 0.0;
+                if (t >= 0) {
+                    int rr = p.ring > 0 ? t % p.ring : t;
+                    kv = kf(p.k_off + (p.kv_pm != 0 ? rr * p.KVH + kvh : kbase + rr) * HD + d);
+                }
+                ks[j * 256 + d] = kv;
+            }
+            for (int x = tid; x < BC * VD; x += 256) {
+                int j = x / VD, d = x - j * VD, t = tpos[j];
+                float vv = 0.0;
+                if (t >= 0) {
+                    int rr = p.ring > 0 ? t % p.ring : t;
+                    vv = vf(p.v_off + (p.kv_pm != 0 ? rr * p.KVH + kvh : kbase + rr) * VD + d);
+                }
+                vs[j * 256 + d] = vv;
+            }
         }
         barrier();
-        // the partial dot products of this lane's query dims with the tile's keys
+        // the partial dot products of this lane's query dims with the tile's keys (HDC: in
+        // order, a fused multiply-add a term, as the tested sum compiles on ANV)
         for (int j = 0; j < BC; j++) {
             float a = 0.0;
-            for (int i = 0; i < 32; i++) {
-                int d = lane + 8 * i;
-                if (d < p.hd) a += qv[i] * ks[j * 256 + d];
-            }
+            if (HDC > 0) {
+                precise float f = 0.0;
+                for (int i = 0; i < 32; i++)
+                    if (HDC % 8 == 0 ? 8 * i < HDC : lane + 8 * i < HDC) f = fma(qv[i], ks[j * 256 + lane + 8 * i], f);
+                a = f;
+            } else
+                for (int i = 0; i < 32; i++) {
+                    int d = lane + 8 * i;
+                    if (d < p.hd) a += qv[i] * ks[j * 256 + d];
+                }
             part[(pair * 8 + lane) * BC + j] = a;
         }
         barrier();
@@ -172,7 +225,7 @@ void main() {
             sum += w;
             for (int i = 0; i < 32; i++) {
                 int d = lane + 8 * i;
-                if (d < p.vd) av[i] += w * vs[j * 256 + d];
+                if (VDC % 8 == 0 && VDC > 0 ? 8 * i < VDC : d < VD) av[i] += w * vs[j * 256 + d];
             }
         }
         l = l * corr + sum;
@@ -180,13 +233,13 @@ void main() {
         barrier();
     }
     if (!live) return;
-    int ob = p.o_off + s * p.o_row + h * p.vd;
+    int ob = p.o_off + s * p.o_row + h * VD;
     if (p.part != 0) {   // the part (a chunk's, with g_off), for the merge (or the join)
         int z = p.g_off > 0 ? int(gl_WorkGroupID.z) : 0;
         int obz = ob + z * p.g_row, sb = p.st_off + z * p.g_seg + (s * p.H + h) * 2;
         for (int i = 0; i < 32; i++) {
             int d = lane + 8 * i;
-            if (d >= p.vd) break;
+            if (d >= VD) break;
             o[obz + d] = av[i];
         }
         if (lane == 0) { o[sb] = m; o[sb + 1] = l; }
@@ -196,7 +249,7 @@ void main() {
     int gb = p.g_off + s * p.g_row + h * p.g_seg;
     for (int i = 0; i < 32; i++) {
         int d = lane + 8 * i;
-        if (d >= p.vd) break;
+        if (d >= VD) break;
         float v = av[i] * inv;
         if (p.has_gate != 0) v *= 1.0 / (1.0 + exp(-gt[gb + d]));
         o[ob + d] = v;

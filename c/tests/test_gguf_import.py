@@ -50,7 +50,7 @@ def blocks(name, shape, rng, std=0.02):
     return raw.reshape(*shape[:-1], nb * size)
 
 
-def write_model(path, rng, dense=False, same_gate_up=False, token=None, ollama=False):
+def write_model(path, rng, dense=False, same_gate_up=False, token=None, ollama=False, dn_types=None):
     """dense: llama.cpp's qwen35 (a dense model of the family): an MLP per layer instead of the
     experts, and no output.weight (the head tied to token_embd), as the small checkpoints ship.
     same_gate_up: every layer's expert up in its gate's type (layer 0 IQ2_XXS, the others
@@ -59,7 +59,9 @@ def write_model(path, rng, dense=False, same_gate_up=False, token=None, ollama=F
     an array per layer (0 on the DeltaNet layers), rope.dimension_sections of three, the flags
     ssm.v_head_reordered and rope.mrope_interleaved, the DeltaNet's dt bias named ssm_dt, the
     shared expert's gate as F16 of shape [H, 1], and the MTP head (mtp.*) and the vision tower
-    (v.*) in the model's file. The same weights as without."""
+    (v.*) in the model's file. The same weights as without.
+    dn_types: {layer: (qkv's type, the gate's)} for DeltaNet layers, Q8_0 for both elsewhere: a
+    layer of two types is how unsloth's dynamic mixes ship about half of Qwen3.8-27B's."""
     arch = "qwen35" if dense else "qwen35moe"
     w = gguf.GGUFWriter(str(path), arch)
     p = arch + "."
@@ -114,7 +116,8 @@ def write_model(path, rng, dense=False, same_gate_up=False, token=None, ollama=F
             q(b + "attn_v.weight", (KVH * HD, H), "Q8_0"); q(b + "attn_output.weight", (H, QH * HD), "Q8_0")
             w.add_tensor(b + "attn_q_norm.weight", np.ones(HD, np.float32)); w.add_tensor(b + "attn_k_norm.weight", np.ones(HD, np.float32))
         else:
-            q(b + "attn_qkv.weight", (conv, H), "Q8_0"); q(b + "attn_gate.weight", (VH * KD, H), "Q8_0")
+            qkv_t, gate_t = (dn_types or {}).get(L, ("Q8_0", "Q8_0"))
+            q(b + "attn_qkv.weight", (conv, H), qkv_t); q(b + "attn_gate.weight", (VH * KD, H), gate_t)
             w.add_tensor(b + "ssm_a", -np.exp(rng.standard_normal(VH).astype(np.float32) * 0.1))
             f32(b + "ssm_alpha.weight", (VH, H)); f32(b + "ssm_beta.weight", (VH, H))
             f32(b + "ssm_conv1d.weight", (conv, 4)); w.add_tensor(b + ("ssm_dt" if ollama else "ssm_dt.bias"), np.zeros(VH, np.float32))
@@ -177,11 +180,13 @@ def write_mimo2(path, rng, types=None):
     w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
 
 
-def write_glmdsa(path, rng):
+def write_glmdsa(path, rng, copies=()):
     """llama.cpp's glm-dsa (GLM-5.2), small: a dense first layer, then MoE layers with a shared
     expert; MLA with kv_b split as k_b and v_b in Q8_0 (the colibri engine keeps them as the
     file's blocks), the DSA indexer, experts in Q4_K and IQ2_XXS with Q5_K and Q6_K down, a
-    Q4_K and Q8_0 trunk, the head Q6_K and the embedding Q8_0 (colibri's GGUF chain gates)."""
+    Q4_K and Q8_0 trunk, the head Q6_K and the embedding Q8_0 (colibri's GGUF chain gates).
+    copies: the layers whose indexer is the layer before's, byte for byte (unsloth's GLM-5.3
+    holds a shared layer's so)."""
     w = gguf.GGUFWriter(str(path), "glm-dsa")
     p = "glm-dsa."
     layers, h, mi, e, k, heads, ql, kvl, nope, rope, vd, ih, idh = 4, 256, 256, 8, 2, 4, 64, 32, 32, 8, 32, 2, 16
@@ -211,8 +216,12 @@ def write_glmdsa(path, rng):
         q(b + "attn_kv_a_mqa.weight", (kvl + rope, h), "Q4_K"); ones(b + "attn_kv_a_norm.weight", kvl)
         q(b + "attn_k_b.weight", (heads * kvl, nope), "Q8_0"); q(b + "attn_v_b.weight", (heads * vd, kvl), "Q8_0")
         q(b + "attn_output.weight", (h, heads * vd), "Q8_0")
-        q(b + "indexer.attn_q_b.weight", (ih * idh, ql), "Q8_0"); q(b + "indexer.attn_k.weight", (idh, h), "Q8_0")
-        f32(b + "indexer.proj.weight", (ih, h)); ones(b + "indexer.k_norm.weight", idh)
+        if L not in copies:
+            ix = (blocks("Q8_0", (ih * idh, ql), rng), blocks("Q8_0", (idh, h), rng),
+                  (rng.standard_normal((ih, h)) * 0.02).astype(np.float32))
+        w.add_tensor(b + "indexer.attn_q_b.weight", ix[0], raw_dtype=QT["Q8_0"])
+        w.add_tensor(b + "indexer.attn_k.weight", ix[1], raw_dtype=QT["Q8_0"])
+        w.add_tensor(b + "indexer.proj.weight", ix[2]); ones(b + "indexer.k_norm.weight", idh)
         w.add_tensor(b + "indexer.k_norm.bias", np.zeros(idh, np.float32))
         if L == 0:
             q(b + "ffn_gate.weight", (256, h), "Q4_K"); q(b + "ffn_up.weight", (256, h), "Q4_K"); q(b + "ffn_down.weight", (h, 256), "Q6_K")
@@ -895,6 +904,59 @@ class GlmDsaConfig(unittest.TestCase):
         self.assertFalse(cfg["tie_word_embeddings"])
         del tensors["blk.78.nextn.eh_proj.weight"]   # a file without its NextN block: every block a layer
         self.assertEqual(gi.glmdsa_config(meta, tensors)[1], 79)
+
+
+COLIBRI = HERE / ("colibri.exe" if sys.platform == "win32" else "colibri")
+
+
+@unittest.skipUnless(np is not None and gguf is not None, "numpy and gguf-py are needed")
+class GlmDsaSharedIndexer(unittest.TestCase):
+    """unsloth's GLM-5.3 holds a shared indexer layer's weights as a copy of the full layer's it
+    reuses: the import reads such a layer as shared, and the engine, given a folder imported
+    before (every layer full), finds the copies and computes what the shared folder does, the
+    DSA selection on past the fourth position (DSA_TOPK=4)."""
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory(); d = Path(cls.tmp.name)
+        cls.src = d / "glm.gguf"
+        write_glmdsa(cls.src, np.random.default_rng(9), copies=(2, 3))
+        cls.dir = d / "glm"
+        p = subprocess.run([sys.executable, str(HERE / "tools" / "gguf_import.py"), str(cls.src), str(cls.dir)],
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        assert p.returncode == 0, p.stdout.decode(errors="replace")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_import_reads_the_copies_as_shared(self):
+        cfg = json.loads((self.dir / "config.json").read_text())
+        self.assertEqual(cfg["indexer_types"], ["full", "full", "shared", "shared"])
+
+    @unittest.skipUnless(COLIBRI.is_file(), "colibri is not built")
+    def test_engine_finds_the_copies_in_an_older_folder(self):
+        import shutil
+        old = Path(self.tmp.name) / "glm_old"
+        shutil.copytree(self.dir, old)
+        cfg = json.loads((old / "config.json").read_text())
+        cfg["indexer_types"] = ["full"] * 4
+        (old / "config.json").write_text(json.dumps(cfg))
+        ref = Path(self.tmp.name) / "ref.json"
+        ref.write_text(json.dumps({"prompt_ids": [5, 6, 7, 8, 20, 21, 22, 23],
+                                   "full_ids": [5, 6, 7, 8, 20, 21, 22, 23, 1, 2, 3, 4, 5, 6, 7, 8]}))
+        out = {}
+        for tag, snap in (("new", self.dir), ("old", old)):
+            dump = Path(self.tmp.name) / f"{tag}.f32"
+            p = subprocess.run([str(COLIBRI), "64", "16", "16"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               env=dict(os.environ, SNAP=str(snap), REF=str(ref), DSA_TOPK="4", DUMP=str(dump), USAGE_SAVE="0",
+                                        COLI_USAGE=str(Path(self.tmp.name) / f"{tag}.usage"), OMP_NUM_THREADS="2",
+                                        COLI_NO_OMP_TUNE="1", COLI_SPEC_GATE="0"))
+            text = p.stdout.decode(errors="replace")
+            out[tag] = (text, dump.read_bytes() if dump.is_file() else b"")
+        self.assertNotIn("hold the indexer of the layer before", out["new"][0])
+        self.assertIn("[DSA] 2 layers hold the indexer of the layer before as a copy", out["old"][0])
+        self.assertTrue(out["new"][1])
+        self.assertEqual(out["new"][1], out["old"][1])
 
 
 class Mimo2Config(unittest.TestCase):

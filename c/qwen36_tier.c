@@ -160,7 +160,7 @@ static size_t qt_pad256(size_t b){ return (b + 255) / 256 * 256; }
  * of the largest layer's left Flint UD-Q3_K_XL's average expert 18 % of it unused, UD-Q4_K_XL's
  * 28 % (2.45 MB slots for 1.91 MB): on an RTX PRO 4000 the card held 8140 of its 12032 experts.
  * The budget counts each expert at its slot (qt_ebytes); a swap pairs slots of one size. The
- * qwen38 chain reads the arena as slots of one size (qt_chain_arena): it does not ask for it. */
+ * qwen38 chain takes the arena over by qt_chain_arena_exact and pairs its promotions by size class. */
 static int G_exact_want, G_exact;
 static size_t *G_lsl, *G_lou, *G_lod, G_lsl_min, G_abump;
 static int *G_lcls, G_ncls;                 /* a layer's size class, of G_ncls */
@@ -540,7 +540,8 @@ static int qt_place_named(const char *component){
 /* One fused qkv++z tensor per DeltaNet layer. Indexed by model layer index,
  * so the array is n_layers wide and the attention slots stay empty. */
 #define QT_DN_MAX_LAYERS 128
-static struct { ColiCudaTensor *t; int dev, on, fmt; } G_dnp[QT_DN_MAX_LAYERS];
+static struct { ColiCudaTensor *t; int dev, on, fmt, O; } G_dnp[QT_DN_MAX_LAYERS],
+    G_dnz[QT_DN_MAX_LAYERS];   /* z's rows when a GGUF gives them another type than qkv's (qt_dnproj_z_init_fmt) */
 static int G_home_layer;                          /* QT_HOME=layer */
 static uint8_t G_layer_dev[QT_DN_MAX_LAYERS];     /* device INDEX per layer in that mode */
 static int home(int eid){ return eid % G.ndev; }   /* the expert-index mapping (tests read it too) */
@@ -702,6 +703,15 @@ void qt_reserve(size_t bytes){ G_reserve = bytes; }
  * the card would hold memory for nothing) */
 static size_t G_reserve_short, G_short_experts;
 void qt_reserve_short(size_t bytes, size_t experts){ G_reserve_short = bytes; G_short_experts = experts; }
+/* qt_reserve_stage: the qwen38 chain's prompt staging past the `base` bytes its own reserve holds,
+ * toward `full` (every expert of its largest layer): what the layer's experts off the card would
+ * take, a fifth more for a layer the card holds fewer of than the average, at most a sixteenth of
+ * the expert budget (one device). Unsloth's UD-IQ2_XS on an RTX PRO 4000 (13.95 GB of experts): a
+ * 4220-token prompt 318-371 tok/s with 512 MiB, 719-729 with 800 and 726-728 with 1100, its decode
+ * the same with 800 and 2-4 tok/s down with 1100 (the card's 8647 experts 8471 and 8313) */
+static size_t G_stage_base, G_stage_full, G_stage_extra;
+void qt_reserve_stage(size_t base, size_t full){ G_stage_base = base; G_stage_full = full; G_stage_extra = 0; }
+size_t qt_stage_extra(void){ return G_stage_extra; }
 void qt_experts_withdraw(const char *why){
     const char *bg = getenv("CUDA_EXPERT_GB");
     if(!G.on || G_trunk_only || (bg && strcmp(bg,"auto") && atof(bg) > 0)) return;
@@ -1191,6 +1201,20 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
             fprintf(stderr,"[qtier] dev %d: %.2f GB kept for a prompt chunk's experts from the host pool (fewer than all %zu fit)\n",
                     G.dev[i], G_reserve_short/1073741824.0, G_short_experts);
         }
+        G_stage_extra = 0;
+        if(G_stage_full > G_stage_base && G.ndev == 1 && G.budget[i] && per && G.nl > 0 && G.ne > 0){
+            double all = (double)per * G.nl * G.ne, on = (double)G.budget[i] / all;
+            if(on > 1) on = 1;
+            size_t want = (size_t)((double)G_stage_full * (1.0 - on) * 1.2), cap = G.budget[i] / 16;
+            if(want > G_stage_full) want = G_stage_full;
+            if(want > cap) want = cap;
+            if(want > G_stage_base){
+                G_stage_extra = (want - G_stage_base + 255) / 256 * 256;
+                G.budget[i] -= G_stage_extra;
+                fprintf(stderr,"[qtier] dev %d: %.0f MiB more for a prompt's staging of the experts off the card (%.0f MiB in all; a layer's every expert %.0f MiB)\n",
+                        G.dev[i], G_stage_extra/1048576.0, (G_stage_base+G_stage_extra)/1048576.0, G_stage_full/1048576.0);
+            }
+        }
         fprintf(stderr,"[qtier] dev %d: budget %.2f GB for experts (~%zu experts)%s\n",
                 G.dev[i], G.budget[i]/1073741824.0, G.budget[i]/per,
                 trunk ? " after trunk" : "");
@@ -1279,8 +1303,23 @@ int qt_dnproj_init_fmt(int layer, const void *w, const float *sc, int fmt,
         fprintf(stderr,"[dnp] layer %d upload failed -> stays on CPU\n", layer);
         return 0;
     }
-    G_dnp[layer].dev = device; G_dnp[layer].on = 1; G_dnp[layer].fmt = fmt;
+    G_dnp[layer].dev = device; G_dnp[layer].on = 1; G_dnp[layer].fmt = fmt; G_dnp[layer].O = O;
     return 1;
+}
+int qt_dnproj_z_init_fmt(int layer, const void *w, int fmt, int I, int O, int device){
+    if(layer < 0 || layer >= QT_DN_MAX_LAYERS || !G_dnp[layer].on || G_dnp[layer].dev != device || !w || fmt < 100) return 0;
+    if(!coli_cuda_tensor_upload(&G_dnz[layer].t, w, NULL, fmt, I, O, device)){
+        fprintf(stderr,"[dnp] layer %d: z's upload failed -> the in_proj stays on CPU\n", layer);
+        coli_cuda_tensor_free(G_dnp[layer].t); G_dnp[layer].t = NULL; G_dnp[layer].on = 0;
+        return 0;
+    }
+    G_dnz[layer].dev = device; G_dnz[layer].on = 1; G_dnz[layer].fmt = fmt; G_dnz[layer].O = O;
+    return 1;
+}
+ColiCudaTensor *qt_dnproj_z_tensor(int layer, int *dev){
+    if(layer < 0 || layer >= QT_DN_MAX_LAYERS || !G_dnp[layer].on || !G_dnz[layer].on || !G_dnz[layer].t) return NULL;
+    if(dev) *dev = G_dnz[layer].dev;
+    return G_dnz[layer].t;
 }
 int qt_dnproj_init(int layer, const int8_t *q, const float *sc,
                    int I, int O, int device){ return qt_dnproj_init_fmt(layer, q, sc, 1, I, O, device); }
@@ -1339,6 +1378,25 @@ int qt_dnproj_ready(int layer){
 }
 int qt_dnproj_matmul_batch(int layer, float *y, const float *x, int S, int I, int O){
     if(!qt_dnproj_ready(layer) || S <= 0) return 0;
+    if(G_dnz[layer].on){   /* two tensors: qkv's rows then z's, each row of y qkv ++ z as one tensor gives it */
+        const int Oq = G_dnp[layer].O, Oz = G_dnz[layer].O;
+        if(Oq + Oz != O) return 0;
+        float *yq = S == 1 ? y : malloc((size_t)S * Oq * sizeof(float)), *yz = S == 1 ? y + Oq : malloc((size_t)S * Oz * sizeof(float));
+        int ok = yq && yz &&
+                 coli_cuda_matmul(&G_dnp[layer].t,yq,x,NULL,NULL,G_dnp[layer].fmt,S,I,Oq,G_dnp[layer].dev,0) &&
+                 coli_cuda_matmul(&G_dnz[layer].t,yz,x,NULL,NULL,G_dnz[layer].fmt,S,I,Oz,G_dnz[layer].dev,0);
+        if(ok && S > 1)
+            for(int s = 0; s < S; s++){
+                memcpy(y + (size_t)s * O, yq + (size_t)s * Oq, (size_t)Oq * sizeof(float));
+                memcpy(y + (size_t)s * O + Oq, yz + (size_t)s * Oz, (size_t)Oz * sizeof(float));
+            }
+        if(S > 1){ free(yq); free(yz); }
+        if(ok) return 1;
+        if(!yq || !yz) return 0;   /* no host memory: this call on the CPU, the tensors stay */
+        fprintf(stderr,"[dnp] layer %d GPU matmul failed; CPU from here on\n", layer);
+        G_dnp[layer].on = 0; G_dnz[layer].on = 0;
+        return 0;
+    }
     if(coli_cuda_matmul(&G_dnp[layer].t,y,x,NULL,NULL,G_dnp[layer].fmt,S,I,O,G_dnp[layer].dev,0))
         return 1;
     fprintf(stderr,"[dnp] layer %d GPU matmul failed; CPU from here on\n", layer);
@@ -1359,7 +1417,7 @@ int qt_dn_gpu_init(int layer, int vh, int vk, int kdim, int vdim, int conv_dim, 
     ColiCudaDn *d = coli_cuda_dn_create(G_dnp[layer].dev, vh, vk, kdim, vdim, conv_dim, convk, hidden, conv_w, norm_w, eps, 0);
     if(!d) return 0;                                                    /* older backend or no memory: CPU path stands */
     G_dn[layer].d = d; G_dn[layer].dev = G_dnp[layer].dev; G_dn[layer].on = 1;
-    G_dn[layer].proj = G_dnp[layer].t; G_dn[layer].projz = NULL; G_dn[layer].outp = G_dense[h].t;
+    G_dn[layer].proj = G_dnp[layer].t; G_dn[layer].projz = G_dnz[layer].on ? G_dnz[layer].t : NULL; G_dn[layer].outp = G_dense[h].t;
     return 1;
 }
 /* The same layer from three dense handles (qwen38: dnqkv, dnz, dnout as the
@@ -1694,6 +1752,13 @@ uint64_t qt_chain_promoted(void){ return G.on ? G.promo_done : 0; }
 int qt_chain_arena(void **base,size_t *slot,size_t *off_u,size_t *off_d,int *nslots){
     if(!G.on || G.ndev!=1 || G.wfmt!=QT_GGUF || !G_arena_on || !G_arena[0] || G_exact) return 0;   /* slots of one size only */
     *base=G_arena[0]; *slot=G_aslot; *off_u=G_aoff_u; *off_d=G_aoff_d; *nslots=G_aslots[0];
+    return 1;
+}
+int qt_chain_arena_exact(QtChainArena *a){
+    if(!G.on || G.ndev!=1 || G.wfmt!=QT_GGUF || !G_arena_on || !G_arena[0] || !G_exact || !a) return 0;
+    a->base=G_arena[0]; a->bytes=(size_t)G_aslots[0]*256u; a->bump=G_abump; a->nl=G.nl; a->ncls=G_ncls;
+    a->lsl=G_lsl; a->lou=G_lou; a->lod=G_lod; a->lcls=G_lcls;
+    a->cfree=(const size_t *const *)G_cfree; a->cnfree=G_cnfree;
     return 1;
 }
 int qt_chain_slot(int layer,int eid){

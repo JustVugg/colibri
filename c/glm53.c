@@ -107,6 +107,7 @@ static int g_g53_cu = 0;    /* COLI_CUDA=1 and the device opened for the tier */
 static size_t g_g53_cud;    /* the room the dense matrices take there (cud_open) */
 #endif
 #include "compat.h"
+#include "coli_env.h"
 #include "serve_poll.h"          /* CANCEL a meta' turno (#1332) */
 #include "route_trace.h"
 #include "decode_batch.h"   /* coli_submit_ext, coli_logprob_tail: canale logprobs */
@@ -783,6 +784,16 @@ typedef struct {
 } GModel;
 #if defined(COLI_VULKAN) || defined(COLI_CUDA)
 static void glm53_vk_report(const GModel *m, const char *scope);   /* the tier's lines of a run or turn */
+#endif
+#ifdef COLI_CUDA
+/* the CUDA chain (glm53_cuchain.h): the session's KDA state between the host and the device */
+static void g53u_sync_host(const GModel *m, const GSession *s);
+static void g53u_host_wrote(const GSession *s);
+static void g53u_session_gone(const GSession *s);
+static int g53u_prefill_rows(GModel *m);
+static void g53u_report(void);
+static size_t g53u_plan_bytes(const GModel *m, int ctx);
+static int g53u_wanted(const GModel *m);
 #endif
 #ifdef COLI_VULKAN
 /* the dense chain (glm53_chain.h): the session's KDA state between the host and the device */
@@ -1575,12 +1586,28 @@ typedef struct {
     uint8_t *piece[GLM53_EXPERT_PIECES];
     uint8_t *own;
     size_t own_len;
+    int own_al;                           /* own came from posix_memalign: compat_aligned_free */
     int metal_registered;
     uint64_t used;
     uint8_t *vk_rows;                     /* a GGUF expert held interleaved: the file's rows for the
                                            * Vulkan tier while it reads them (glm53_slot_src) */
 } Slot;
 typedef struct LCache { Slot *s; int n, cap; } LCache;
+static void g53_slot_free(Slot *s) {
+    if (s->own_al) compat_aligned_free(s->own); else free(s->own);
+    s->own = NULL; s->own_al = 0;
+}
+/* O_DIRECT for the routed experts' reads (G53_DIRECT=0: through the page cache, as before).
+ * An expert read from the disk is wanted once, and a buffered read is copied into the page
+ * cache and out again. With the RAM given to the tier's host pool the cache has no room to
+ * keep it either: GLM-5.3-Flash UD-IQ2_XXS on 62 GB, a 128-token turn read 22.5 GB, kswapd
+ * reclaimed 23 GB of it and 21 GB came back as refaults, and the compaction this keeps up
+ * migrated the engine's pages under its threads (a TLB shootdown on every core each time). */
+static int g53_direct(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("G53_DIRECT"); on = e && *e ? atoi(e) != 0 : 1; }
+    return on;
+}
 
 /* Lunghezze e posizioni dei sei pezzi dentro allo slot. Gate e up sono
  * [moe_inter, hidden], down e' [hidden, moe_inter]: stessi byte, forme
@@ -2086,12 +2113,20 @@ static void expert_read(GModel *m, int layer, int eid, Slot *slot) {
 
     /* Fallback/Metal path: write into memory owned by the slot. Metal requires
      * page alignment and a page-multiple registration length. The base stays
-     * stable across LRU reuse, so registration happens only on first allocation. */
+     * stable across LRU reuse, so registration happens only on first allocation.
+     * The direct reads (g53_direct) put each piece on a window of its own that
+     * starts at an aligned address, ST_DIRECT_ALIGN slack before it and after. */
+    const int direct = !metal_slot && g53_direct();
     if (!slot->own) {
         size_t need = ((size_t)m->e_slot + 16383u) & ~(size_t)16383u;
         void *p = NULL;
         if (metal_slot) {
             if (posix_memalign(&p, 16384, need) != 0) p = NULL;
+            slot->own_al = 1;
+        } else if (direct) {
+            need = (size_t)m->e_slot + 2u * GLM53_EXPERT_PIECES * ST_DIRECT_ALIGN;
+            if (posix_memalign(&p, ST_DIRECT_ALIGN, need) != 0) p = NULL;
+            slot->own_al = 1;
         } else {
             p = malloc((size_t)m->e_slot);
             need = (size_t)m->e_slot;
@@ -2112,12 +2147,29 @@ static void expert_read(GModel *m, int layer, int eid, Slot *slot) {
 #endif
     }
 
-    for (int p = 0; p < GLM53_EXPERT_PIECES; p++)
-        slot->piece[p] = slot->own + m->e_at[p];
+    if (!direct)
+        for (int p = 0; p < GLM53_EXPERT_PIECES; p++)
+            slot->piece[p] = slot->own + m->e_at[p];
+    else if (ref->contig) {   /* one window: the six pieces after the first one's offset in its block */
+        const int64_t pad = ref->off[0] % ST_DIRECT_ALIGN;
+        for (int p = 0; p < GLM53_EXPERT_PIECES; p++) slot->piece[p] = slot->own + pad + m->e_at[p];
+    } else {   /* a window a piece, each at an aligned address plus its offset's remainder */
+        int64_t at = 0;
+        for (int p = 0; p < GLM53_EXPERT_PIECES; p++) {
+            const int64_t w = (at + ST_DIRECT_ALIGN - 1) & ~(int64_t)(ST_DIRECT_ALIGN - 1);
+            const int64_t pad = e_len_at(m, layer, p) ? ref->off[p] % ST_DIRECT_ALIGN : 0;
+            slot->piece[p] = slot->own + w + pad;
+            at = w + pad + m->e_len[p];   /* the slot's room for the piece, the file's or the interleaved form */
+        }
+    }
 
     if (ref->contig) {
-        int fd = rep > 0 ? st_fd_rep(&m->S, ref->fd[0], rep) : ref->fd[0];
-        st_pread_full(fd, slot->own, m->e_slot, ref->off[0], "expert");
+        if (direct)
+            st_read_range_rep(&m->S, ref->fd[0], rep, ref->off[0], m->e_slot, slot->piece[0], m->e_slot, 0, 1, "expert");
+        else {
+            int fd = rep > 0 ? st_fd_rep(&m->S, ref->fd[0], rep) : ref->fd[0];
+            st_pread_full(fd, slot->own, m->e_slot, ref->off[0], "expert");
+        }
     } else {
         for (int p = 0; p < GLM53_EXPERT_PIECES; p++) {
             if (!e_len_at(m, layer, p)) continue;
@@ -2125,22 +2177,29 @@ static void expert_read(GModel *m, int layer, int eid, Slot *slot) {
             const int k = p / 2;
             if (m->gx && m->gx_h[3 * layer + k] != m->gx_t[3 * layer + k]) {   /* through a copy, interleaved */
                 static __thread uint8_t *raw; static __thread int64_t raw_n;
-                const int64_t n = e_len_at(m, layer, p);
-                if (raw_n < n) {
-                    free(raw); raw = malloc((size_t)n); raw_n = raw ? n : 0;
-                    if (!raw) { fprintf(stderr, "OOM reading a GGUF expert\n"); exit(1); }
+                const int64_t n = e_len_at(m, layer, p), pad = direct ? ref->off[p] % ST_DIRECT_ALIGN : 0;
+                if (raw_n < n + 2 * ST_DIRECT_ALIGN) {   /* aligned, with the direct read's slack */
+                    compat_aligned_free(raw); raw = NULL; raw_n = 0;
+                    if (posix_memalign((void **)&raw, ST_DIRECT_ALIGN, (size_t)(n + 2 * ST_DIRECT_ALIGN)) != 0 || !raw) {
+                        fprintf(stderr, "OOM reading a GGUF expert\n"); exit(1); }
+                    raw_n = n + 2 * ST_DIRECT_ALIGN;
                 }
-                st_pread_full(fd, raw, n, ref->off[p], "expert piece");
+                if (direct) st_read_range_rep(&m->S, ref->fd[p], rep, ref->off[p], n, raw + pad, n, 0, 1, "expert piece");
+                else st_pread_full(fd, raw, n, ref->off[p], "expert piece");
                 const int rows = k == 2 ? m->c.hidden : m->c.moe_inter, cols = k == 2 ? m->c.moe_inter : m->c.hidden;
-                gq_r16_pack(m->gx_h[3 * layer + k], slot->own + m->e_at[p], raw, rows, cols);
+                gq_r16_pack(m->gx_h[3 * layer + k], slot->piece[p], raw + pad, rows, cols);
                 continue;
             }
 
-            st_pread_full(fd,
-                          slot->own + m->e_at[p],
-                          e_len_at(m, layer, p),
-                          ref->off[p],
-                          "expert piece");
+            if (direct)
+                st_read_range_rep(&m->S, ref->fd[p], rep, ref->off[p], e_len_at(m, layer, p), slot->piece[p],
+                                  e_len_at(m, layer, p), 0, 1, "expert piece");
+            else
+                st_pread_full(fd,
+                              slot->own + m->e_at[p],
+                              e_len_at(m, layer, p),
+                              ref->off[p],
+                              "expert piece");
         }
     }
 
@@ -3871,6 +3930,9 @@ static GSession *session_open(const GModel *m, int cap) {
 
 static void session_close(const GModel *m, GSession *s) {
     if (!s) return;
+#ifdef COLI_CUDA
+    g53u_session_gone(s);   /* the CUDA chain's copy of its state goes with it */
+#endif
 #ifdef COLI_VULKAN
     g53c_session_gone(s);   /* the dense chain's copy of its state goes with it */
 #endif
@@ -3895,6 +3957,10 @@ static void session_close(const GModel *m, GSession *s) {
 static int g53c_forward(GModel *m, GSession *s, float *streams, int n, int start);
 static void g53c_cpu_step(const GModel *m, const GSession *s, int start);
 static int g_vk_chain;
+#endif
+#ifdef COLI_CUDA
+static int g53u_forward(GModel *m, GSession *s, float *streams, int n, int start);
+static void g53u_cpu_step(const GModel *m, const GSession *s, int start);
 #endif
 /* la ricorrenza KDA di uno scatto: stato e finestra di ogni strato lineare */
 typedef struct { float **state, **window; int n_layers; } Glm53PinState;
@@ -3934,6 +4000,16 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
         if (done >= c->n_layers) return streams;
         if (!done) g53c_cpu_step(m, s, start);
         begin = done;
+    }
+#endif
+#ifdef COLI_CUDA
+    /* every layer on the CUDA chain (glm53_cuchain.h); 0: the CPU below, its state current first;
+     * -1: g_layer_halt stopped it between layers */
+    if (begin == 0 && end == c->n_layers && g53u_wanted(m)) {
+        const int done = g53u_forward(m, s, streams, n, start);
+        if (done < 0) return NULL;
+        if (done >= c->n_layers) return streams;
+        if (!done) g53u_cpu_step(m, s, start);
     }
 #endif
     float *collapsed = malloc((size_t)n * D * sizeof(float));
@@ -3992,6 +4068,9 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
 #ifdef COLI_VULKAN
 #include "glm53_chain.h"   /* COLI_VK_CHAIN: every layer's dense chain on the device */
 #endif
+#ifdef COLI_CUDA
+#include "glm53_cuchain.h"   /* COLI_CUDA_CHAIN: every layer on the CUDA chain, the experts on the CUDA tier */
+#endif
 
 /* Rilascio completo del modello.
  *
@@ -4043,7 +4122,7 @@ static void model_release(GModel *m) {
     if (m->ecache) {
         for (int i = 0; i < m->c.n_layers; i++) {
             LCache *cache = &m->ecache[i];
-            for (int j = 0; j < cache->cap; j++) free(cache->s[j].own);
+            for (int j = 0; j < cache->cap; j++) g53_slot_free(&cache->s[j]);
             free(cache->s);
         }
         free(m->ecache);
@@ -4199,8 +4278,8 @@ static float *forward_span_rows(GModel *m, GSession *s, const int *tokens, int n
     if (need < 1 || need > n) need = n;
     mm(logits + (size_t)(n - need) * c->vocab, &m->head, normed + (size_t)(n - need) * D, need);
     m->t_head += now_s() - t_head0;
-#ifdef COLI_VULKAN
-    {   /* DUMP=<path> (VK=1 builds): every logits row computed, raw f32, for the Vulkan gates */
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
+    {   /* DUMP=<path> (VK=1 and CUDA=1 builds): every logits row computed, raw f32, for the chains' gates */
         static FILE *dump; static int said;
         if (!said) { said = 1; const char *p = getenv("DUMP"); if (p && *p) dump = fopen(p, "wb"); }
         if (dump) { fwrite(logits + (size_t)(n - need) * c->vocab, sizeof(float), (size_t)need * c->vocab, dump); fflush(dump); }
@@ -4249,6 +4328,10 @@ static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
     /* the dense chain with a chunk from the budget: blocks of its chunk, so a long
      * prompt's MoE steps are big ones the tier can stream */
     if (!setting && !(g_echo_k > 0 && g_echo_id)) { int r = g53c_prefill_rows(m, s, n); if (r > 0) chunk = r; }
+#endif
+#ifdef COLI_CUDA
+    /* the CUDA chain's chunk: a long prompt's MoE steps big ones the tier can stream */
+    if (!setting && !(g_echo_k > 0 && g_echo_id)) { int r = g53u_prefill_rows(m); if (r > 0) chunk = r; }
 #endif
     if (chunk < 1) chunk = 1;
 #if !defined(_WIN32)
@@ -4438,6 +4521,17 @@ static float g_temp = 0.0f, g_topp = 1.0f;
 
 /* Confronto per qsort. Una funzione annidata sarebbe piu' comoda ma e'
  * un'estensione GCC, e questo file deve compilare anche con MSVC. */
+#include "glm53_exact_nucleus.h"
+/* Opt-in until target-platform full-model qualification is available.
+ * The fallback retains the original qsort input, including its tie behavior. */
+static int g_glm53_nucleus = -1;
+static int glm53_nucleus_enabled(void) {
+    if (g_glm53_nucleus < 0) {
+        const char *value = getenv("GLM53_NUCLEUS");
+        g_glm53_nucleus = value && !strcmp(value, "1");
+    }
+    return g_glm53_nucleus;
+}
 static const float *g_sort_key = NULL;
 static int compare_by_probability(const void *a, const void *b) {
     const int x = *(const int *)a, y = *(const int *)b;
@@ -4473,12 +4567,17 @@ static int sample_token(const float *logits, int vocab) {
      * top_p. Con vocab 154880 l'ordinamento pieno costa, ma succede una volta
      * per token e il token costa incomparabilmente di piu'. */
     g_sort_key = probability;
-    qsort(order, (size_t)vocab, sizeof(int), compare_by_probability);
     double cumulative = 0.0;
     int keep = vocab;
-    for (int i = 0; i < vocab; i++) {
-        cumulative += probability[order[i]];
-        if (cumulative >= g_topp) { keep = i + 1; break; }
+    if (glm53_nucleus_enabled()) {
+        g53_nucleus_order(probability, vocab, g_topp, order,
+                          &keep, &cumulative, compare_by_probability);
+    } else {
+        qsort(order, (size_t)vocab, sizeof(int), compare_by_probability);
+        for (int i = 0; i < vocab; i++) {
+            cumulative += probability[order[i]];
+            if (cumulative >= g_topp) { keep = i + 1; break; }
+        }
     }
     double pick = ((double)rand() / ((double)RAND_MAX + 1.0)) * cumulative;
     double walk = 0.0;
@@ -4582,6 +4681,9 @@ static int slot_pin_save(const GModel *m, KVSlot *slot, const int *tokens, int n
     /* Sessione nuova: gli scatti vecchi parlano di righe DSA che non esistono
      * piu, e rimetterli risponderebbe da posizioni inventate, in silenzio. */
     if (slot->pin_session != slot->session) slot_pin_drop(m, slot);
+#ifdef COLI_CUDA
+    g53u_sync_host(m, slot->session);   /* the CUDA chain may hold the newest state */
+#endif
 #ifdef COLI_VULKAN
     g53c_sync_host(m, slot->session);   /* the dense chain may hold the newest state */
 #endif
@@ -4648,6 +4750,9 @@ static int slot_pin_restore(const GModel *m, KVSlot *slot, const int *tokens, in
                 memcpy(ls->kda_state,  st->state[i],  ns * sizeof(float));
                 memcpy(ls->kda_window, st->window[i], nw * sizeof(float));
             }
+#ifdef COLI_CUDA
+            g53u_host_wrote(slot->session);   /* the CUDA chain's copy goes up again */
+#endif
 #ifdef COLI_VULKAN
             g53c_host_wrote(slot->session);   /* the dense chain's copy goes up again */
 #endif
@@ -4676,6 +4781,9 @@ static int slot_pin_for_request(const GModel *m, KVSlot *slot, const int *tokens
  * 64x128x128 piu' la finestra della convoluzione. */
 static int glm53_state_capture(const GModel *m, Glm53PinState **into, const GSession *s) {
     const Cfg *c = &m->c;
+#ifdef COLI_CUDA
+    g53u_sync_host(m, s);   /* the CUDA chain may hold the newest state */
+#endif
 #ifdef COLI_VULKAN
     g53c_sync_host(m, s);   /* the dense chain may hold the newest state */
 #endif
@@ -4707,6 +4815,9 @@ static int glm53_state_capture(const GModel *m, Glm53PinState **into, const GSes
 
 static void glm53_state_restore(const GModel *m, const Glm53PinState *st, GSession *s) {
     const Cfg *c = &m->c;
+#ifdef COLI_CUDA
+    g53u_host_wrote(s);   /* the CUDA chain's copy goes up again */
+#endif
 #ifdef COLI_VULKAN
     g53c_host_wrote(s);   /* the dense chain's copy goes up again */
 #endif
@@ -5353,6 +5464,9 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
 #if defined(COLI_VULKAN) || defined(COLI_CUDA)
     glm53_vk_report(m, "turn");
 #endif
+#ifdef COLI_CUDA
+    g53u_report();
+#endif
 #ifdef COLI_VULKAN
     g53c_report();   /* the dense chain's line, when it ran */
 #endif
@@ -5625,6 +5739,10 @@ static void glm53_vk_tier_start(GModel *m) {
                         /* a partial chain: nothing more of the trunk goes up, but the chain's first
                          * forward allocates its scratch and the N layers' MLA caches */
                         .dense_bytes = g53_tier_dense_bytes(m),
+#ifdef COLI_CUDA
+                        /* the CUDA chain's own room past the dense matrices (glm53_cuchain.h) */
+                        .chain_bytes = xt_cuda() && g53u_wanted(m) ? g53u_plan_bytes(m, getenv("GLM53_MAXT") ? atoi(getenv("GLM53_MAXT")) : 8192) : 0,
+#endif
                         .in_ram = glm53_in_ram, .ram_ctx = m,
                         .load = glm53_vk_load, .release = glm53_vk_unhold, .load_ctx = m,
                         .load_batch = glm53_vk_load_batch};
@@ -5651,7 +5769,7 @@ static void glm53_vk_tier_start(GModel *m) {
                     expert_read(m, pl[i], pe[i], &tmp);
                     VktExpertSrc src = glm53_slot_src(m, pl[i], &tmp);
                     XT(put)(pl[i], pe[i], &src);
-                    free(tmp.own); free(tmp.vk_rows);
+                    g53_slot_free(&tmp); free(tmp.vk_rows);
                 }
                 XT(put_done)();
                 m->hits = hits; m->miss = miss; m->ebytes = eb;
@@ -5764,6 +5882,8 @@ int main(int argc, char **argv) {
         }
     }
 #endif
+    coli_env_check(CE_GLM53, "glm53");
+    coli_env_dump(CE_GLM53, "glm53");
     /* Physical-core team sizing, the same shared helper colibri/inkling/
      * kimi_k3/olmoe/deepseek-v41 call. This engine has no OpenMP sizing of its
      * own, so on an SMT host it ran one thread per logical CPU; #718 measured
@@ -5987,6 +6107,9 @@ int main(int argc, char **argv) {
                model.hits, model.miss, (unsigned long long)model.ebytes);
 #if defined(COLI_VULKAN) || defined(COLI_CUDA)
     glm53_vk_report(&model, "run");
+#endif
+#ifdef COLI_CUDA
+    g53u_report();
 #endif
 #ifdef COLI_VULKAN
     g53c_report();

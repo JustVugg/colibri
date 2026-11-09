@@ -35,7 +35,8 @@
  *
  * Header-only, all static, pure compute: no Model, no I/O, no allocation
  * beyond what the caller hands in. AVX2/FMA, AVX-VNNI or AVX512-VNNI where built,
- * an SSE2 i8 kernel where AVX2+FMA are not, with a scalar fallback that defines
+ * an SSE2 i8 kernel where AVX2+FMA are not, an AArch64 dotprod i8 kernel,
+ * with a scalar fallback that defines
  * the numerics every SIMD path must reproduce (f32 paths: same per-lane
  * accumulation order; i8 paths: exact integer sums and the same fmaf per lane
  * and block, so identical by construction; the SSE2 one makes that fmaf in
@@ -47,6 +48,7 @@
 #include <stddef.h>
 #include <string.h>
 #include <math.h>
+#include "fma_compat.h"
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
 #include <immintrin.h>
@@ -154,7 +156,12 @@ static inline float xf_act_i8(const float *x, int I, int8_t *xq, float *xsum) {
 /* f32: per block, 8 lanes l=0..7 accumulate elements l, l+8, ..., l+56 in
  * order with fma; the 8 lane sums are scaled by the block scale into 8 lane
  * accumulators; the row ends with the fixed 8->1 tree of xf_hsum8. The SIMD
- * paths reproduce exactly this. */
+ * paths reproduce exactly this. The fma is coli_fmaf (fma_compat.h): fmaf where
+ * the CPU fuses, the build every SIMD path needs; without FMA this is the only
+ * f32 path (QWEN_EXPERT_ACT=f32, Qwen3.8's int4 experts), and there fmaf is
+ * glibc's software emulation, one call an element, where coli_fmaf rounds the
+ * exact double sum (#2606): Qwen3.6 with QWEN_EXPERT_ACT=f32 built for Sandy
+ * Bridge, glibc's fmaf in software, 0.59 -> 2.9 tok/s. */
 static inline float xf_hsum8_scalar(const float *l) {
     float a0 = l[0] + l[4], a1 = l[1] + l[5], a2 = l[2] + l[6], a3 = l[3] + l[7];
     float b0 = a0 + a2, b1 = a1 + a3;
@@ -168,9 +175,9 @@ static inline float xf_dot_f32_ref(const uint8_t *w, const float *sc, const floa
         float lane[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         for (int i = 0; i < XF_BLOCK; i++) {
             int v = (i < 32 ? (blk[i] & 0xF) : (blk[i - 32] >> 4)) - 8;
-            lane[i & 7] = fmaf((float)v, xb[i], lane[i & 7]);
+            lane[i & 7] = coli_fmaf((float)v, xb[i], lane[i & 7]);
         }
-        for (int l = 0; l < 8; l++) acc[l] = fmaf(lane[l], sc[g], acc[l]);
+        for (int l = 0; l < 8; l++) acc[l] = coli_fmaf(lane[l], sc[g], acc[l]);
     }
     return xf_hsum8_scalar(acc);
 }
@@ -270,6 +277,41 @@ static inline float xf_dot_i8_avx2(const uint8_t *w, const float *sc, const int8
     return (xf_hsum8(acc) - 8.f * c) * sx;
 }
 #endif /* AVX2 */
+
+#if !defined(XF_HAVE_AVX2) && defined(__ARM_NEON) && defined(__aarch64__) && defined(__ARM_FEATURE_DOTPROD)
+#define XF_HAVE_NEON_DOT 1
+/* i8 row dot with SDOT (Apple silicon, Armv8.2+ dotprod). A nibble (<= 15) is
+ * a valid int8, so vdotq_s32 of nibbles and activations gives the reference's
+ * integer lane sums exactly: lanes 0-3 from bytes 0..15 (elements 4l..4l+3
+ * and 32+4l..32+4l+3), lanes 4-7 from bytes 16..31. The f32 part is the
+ * reference's per-lane fma, its correction and its 8->1 tree, in the same
+ * order, so the result is the same bits as xf_dot_i8_ref. */
+static inline float xf_dot_i8_neon(const uint8_t *w, const float *sc, const int8_t *xq, const float *xsum, float sx, int I) {
+    const uint8x16_t m4 = vdupq_n_u8(0x0F);
+    const int32x4_t z = vdupq_n_s32(0);
+    float32x4_t acc0 = vdupq_n_f32(0.f), acc1 = vdupq_n_f32(0.f);
+    int ng = I / XF_BLOCK, g = 0;
+    for (; g < ng; g++) {
+        const uint8_t *blk = w + (size_t)g * XF_BLOCK_BYTES;
+        const int8_t *xb = xq + g * XF_BLOCK;
+        uint8x16_t b0 = vld1q_u8(blk), b1 = vld1q_u8(blk + 16);
+        int8x16_t lo0 = vreinterpretq_s8_u8(vandq_u8(b0, m4)), hi0 = vreinterpretq_s8_u8(vshrq_n_u8(b0, 4));
+        int8x16_t lo1 = vreinterpretq_s8_u8(vandq_u8(b1, m4)), hi1 = vreinterpretq_s8_u8(vshrq_n_u8(b1, 4));
+        int32x4_t d0 = vdotq_s32(vdotq_s32(z, lo0, vld1q_s8(xb)),      hi0, vld1q_s8(xb + 32));
+        int32x4_t d1 = vdotq_s32(vdotq_s32(z, lo1, vld1q_s8(xb + 16)), hi1, vld1q_s8(xb + 48));
+        float32x4_t s = vdupq_n_f32(sc[g]);
+        acc0 = vfmaq_f32(acc0, vcvtq_f32_s32(d0), s);
+        acc1 = vfmaq_f32(acc1, vcvtq_f32_s32(d1), s);
+    }
+    /* corr = sum_g sc[g]*xsum[g] in the scalar reference's order (sequential fma) */
+    float c = 0.f;
+    for (g = 0; g < ng; g++) c = fmaf(sc[g], xsum[g], c);
+    float32x4_t a = vaddq_f32(acc0, acc1);                         /* l+l+4 */
+    float32x2_t b = vadd_f32(vget_low_f32(a), vget_high_f32(a));   /* (0+4)+(2+6), (1+5)+(3+7) */
+    float h = vget_lane_f32(b, 0) + vget_lane_f32(b, 1);
+    return (h - 8.f * c) * sx;
+}
+#endif /* NEON dotprod */
 
 /* ---- SSE2 i8 kernel (PMADDWD, exact fmaf emulation) -----------------------
  * Builds without AVX2+FMA on x86-64 (no -mavx2 -mfma: Ivy Bridge, Sandy Bridge, a
@@ -435,6 +477,8 @@ static inline void xf_dot_f32_rows(float *y, int ystride, const uint8_t *w, cons
 static inline float xf_dot_i8(const uint8_t *w, const float *sc, const int8_t *xq, const float *xsum, float sx, int I) {
 #ifdef XF_HAVE_AVX2
     return xf_dot_i8_avx2(w, sc, xq, xsum, sx, I);
+#elif defined(XF_HAVE_NEON_DOT)
+    return xf_dot_i8_neon(w, sc, xq, xsum, sx, I);
 #elif defined(XF_HAVE_SSE2_INT16)
     /* RC (rounding control), FTZ (flush to zero), DAZ (denormals are zero).
      * Preserve the reference's behavior outside the emulation's assumptions. */

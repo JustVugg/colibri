@@ -4,6 +4,7 @@
 #include <cuda_profiler_api.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include "backend_cuda_dsv4_quant.cuh"
 #if !defined(COLI_DSV4_NO_TC)
 #include <cublasLt.h>
 #endif
@@ -12,6 +13,7 @@
 #include <cstring>
 #include <climits>
 #include <algorithm>
+#include <cfloat>
 #include <vector>
 #ifndef _WIN32
 #include <unistd.h>
@@ -54,7 +56,7 @@ struct Dsv4CudaExpertSet { ExpertPtr *table;int64_t *hash;Dsv4CudaTensor *sg,*su
 #if COLI_DSV4_TC
 struct TcPlan {int O,I,ok;cublasLtMatmulDesc_t op;cublasLtMatrixLayout_t a,b,c,d;cublasLtMatmulHeuristicResult_t algo;};
 #endif
-struct Dev { int id,sms; cudaStream_t stream,aux; cudaEvent_t ready,fork,join;float *dx,*dy,*p1,*p2,*p3,*p4,*aux1,*aux2,*aux3; size_t xcap,ycap,p1cap,p2cap,p3cap,p4cap,aux1cap,aux2cap,aux3cap; float *hx,*hy;
+struct Dev { int id,sms,sm; cudaStream_t stream,aux; cudaEvent_t ready,fork,join;float *dx,*dy,*p1,*p2,*p3,*p4,*aux1,*aux2,*aux3; size_t xcap,ycap,p1cap,p2cap,p3cap,p4cap,aux1cap,aux2cap,aux3cap; float *hx,*hy;
 #ifdef COLI_DSV4_NCCL
     ncclComm_t ep_comm;
 #endif
@@ -62,6 +64,9 @@ struct Dev { int id,sms; cudaStream_t stream,aux; cudaEvent_t ready,fork,join;fl
     MvDesc *mvdesc;size_t mvdesccap;float *expert_weights;size_t expert_weightscap;int *expert_ids;size_t expert_idcap;
     int *emaj;size_t emajcap;float *emv1,*emv2,*emv4;size_t emv1cap,emv2cap,emv4cap;unsigned long long *emcount; /* expert-major MoE */
     float *mmv;size_t mmvcap;unsigned long long *mmvcount; /* DSV4_MM_WARP_VERIFY */
+    float *v4fact,*v4fparts;unsigned char *v4fbar; /* fused decode MoE (DSV4_CUDA_MOE_FUSED6) */
+    float *sa_score,*sa_w,*sa_den,*sa_out;long long *sa_rows; /* V4_SPARSE_FAST */
+    size_t sa_score_cap,sa_w_cap,sa_den_cap,sa_out_cap,sa_rows_cap;
 #if COLI_DSV4_TC
     cublasLtHandle_t lt;TcPlan plans[2];
 #endif
@@ -71,8 +76,35 @@ struct Dev { int id,sms; cudaStream_t stream,aux; cudaEvent_t ready,fork,join;fl
 #endif
 };
 static Dev g[16];static int ng;
-static Dev *ctx(int d){for(int i=0;i<ng;i++)if(g[i].id==d)return g+i;return nullptr;}
-static int ok(cudaError_t e,const char *s){if(e==cudaSuccess)return 1;fprintf(stderr,"[DSV4 CUDA] %s: %s\n",s,cudaGetErrorString(e));return 0;}
+/* g_peer[a][b]: device a's kernels may read device b's memory (peer access
+ * enabled by dsv4_cuda_init, e.g. over NVLink). g_peer_lost[d]: a peer-side
+ * failure in the decode MoE latched device d off (dsv4_cuda_peer_healthy);
+ * after the call that latched it (whose recompute on the primary may still
+ * read its mirrors in place), no kernel reads its memory from another device
+ * again. The latch outlives dsv4_cuda_shutdown on purpose: a sticky fault
+ * stays in the device's context for the life of the process. */
+static unsigned char g_peer[16][16],g_peer_lost[16];
+static int g_peer_best_effort;   /* layer placement: P2P is optional */
+static bool dev_lost(int d){return d>=0&&d<16&&g_peer_lost[d];}
+static int g_cuda_lost;   /* see cuda_lost */
+static bool dev_ok(int a,int b){return !g_cuda_lost&&(a==b||(a>=0&&a<16&&b>=0&&b<16&&g_peer[a][b]&&!g_peer_lost[a]&&!g_peer_lost[b]));}
+/* A sticky error (a kernel fault: launch failure, illegal address, trap, ...)
+ * leaves the CUDA context unusable for the rest of the process, and with peer
+ * access between the GPUs a fault on one takes the others with it: measured
+ * on two RTX 3090s with NVLink, a __trap() on the peer made device 0's next
+ * calls fail too, whether device 0's stream or the host waited for the peer
+ * (the F18 probe). g_cuda_lost latches on the first one: from then on ctx()
+ * answers no device, so every entry point refuses without touching CUDA and
+ * the engine takes its host paths (dsv4_cuda_lost) until the process ends. */
+static bool sticky(cudaError_t e){switch(e){case cudaErrorIllegalAddress:case cudaErrorLaunchFailure:case cudaErrorHardwareStackError:
+    case cudaErrorIllegalInstruction:case cudaErrorMisalignedAddress:case cudaErrorInvalidAddressSpace:case cudaErrorInvalidPc:
+    case cudaErrorAssert:case cudaErrorLaunchTimeout:case cudaErrorECCUncorrectable:return true;default:return false;}}
+static void cuda_lost(const char*s,cudaError_t e){if(g_cuda_lost)return;g_cuda_lost=1;
+    fprintf(stderr,"[DSV4 CUDA] %s: %s is a sticky fault: CUDA is lost for this process, on every device; the GPU paths "
+                   "stay off and the engine runs on the host until the server restarts\n",s,cudaGetErrorString(e));}
+extern "C" int dsv4_cuda_lost(void){return g_cuda_lost;}
+static Dev *ctx(int d){if(g_cuda_lost)return nullptr;for(int i=0;i<ng;i++)if(g[i].id==d)return g+i;return nullptr;}
+static int ok(cudaError_t e,const char *s){if(e==cudaSuccess)return 1;fprintf(stderr,"[DSV4 CUDA] %s: %s\n",s,cudaGetErrorString(e));if(sticky(e))cuda_lost(s,e);return 0;}
 #if COLI_DSV4_TC
 static int bok(cublasStatus_t e,const char*s){if(e==CUBLAS_STATUS_SUCCESS)return 1;fprintf(stderr,"[DSV4 CUDA] %s: cuBLAS status %d\n",s,(int)e);return 0;}
 #endif
@@ -89,11 +121,7 @@ static int buf(void **p,size_t *cap,size_t n){if(*cap>=n)return 1;if(*p)cudaFree
 
 __constant__ float e8_table[256];
 __global__ void set_decode_state(int*state,int token,int position){if(!threadIdx.x){state[0]=token;state[1]=position;}}
-__device__ float e4m3(uint8_t b){int sign=b>>7,e=(b>>3)&15,m=b&7;float v;
-    if(!e)v=ldexpf((float)m,-9);else if(e==15)v=m==7?NAN:ldexpf(1.f+m/8.f,8);else v=ldexpf(1.f+m/8.f,e-7);
-    return sign?-v:v;}
 __device__ float e8(uint8_t b){return e8_table[b];}
-__device__ float f4(uint8_t q){const float a[8]={0,.5f,1,1.5f,2,3,4,6};return q&8?-a[q&7]:a[q];}
 template<int F> __global__ void mv(const uint8_t *w,const uint8_t *sc,const float *x,float *y,int O,int I,int groups){
     int o=blockIdx.x;if(o>=O)return;float sum=0;
     const float *xi=x+(long long)(o/(O/groups))*I;for(int i=threadIdx.x;i<I;i+=blockDim.x){float v;
@@ -320,7 +348,6 @@ static void run_mm_batch(Dsv4CudaTensor*t,const float*x,float*y,int T,cudaStream
 }
 #endif
 __device__ int tc_sf_off(int outer,int inner,int sf_inner_dim){int base=((inner/4)*4+(outer/128)*sf_inner_dim)*128,o=outer&127;return base+(o%32)*16+(o/32)*4+(inner&3);}
-__device__ uint8_t e4m3_code(float x){int best=0;float bd=INFINITY;for(int v=0;v<255;v++){float z=e4m3((uint8_t)v),d=fabsf(z-x);if(d<bd||(d==bd&&!(v&1)&&(best&1))){bd=d;best=v;}}return (uint8_t)best;}
 __global__ void tc_expand(const uint8_t*q4,const uint8_t*src,uint8_t*q8,uint8_t*dst,int O,int I){
     const uint8_t lut[16]={0x00,0x30,0x38,0x3c,0x40,0x44,0x48,0x4c,0x80,0xb0,0xb8,0xbc,0xc0,0xc4,0xc8,0xcc};long long n=(long long)O*I;
     for(long long p=(long long)blockIdx.x*blockDim.x+threadIdx.x;p<n;p+=(long long)gridDim.x*blockDim.x){uint8_t b=q4[p>>1];q8[p]=lut[(p&1)?b>>4:b&15];}
@@ -370,8 +397,6 @@ __global__ void expert_act_grouped(float *a,const float *g,const float *u,const 
     int p=blockIdx.x*blockDim.x+threadIdx.x;if(p<rows*n){int row=p/n;float gg=fminf(__bfloat162float(__float2bfloat16(g[p])),limit);
         float uu=fmaxf(-limit,fminf(__bfloat162float(__float2bfloat16(u[p])),limit));
         a[p]=__bfloat162float(__float2bfloat16(weight[row]*(gg/(1.f+expf(-gg)))*uu));}}
-__device__ float e4m3_round(float x){int best=0;float bd=INFINITY;for(int v=0;v<255;v++){float q=e4m3((uint8_t)v);if(isnan(q))continue;
-    float d=fabsf(q-x);if(d<bd||(d==bd&&!(v&1)&&(best&1))){bd=d;best=v;}}return e4m3((uint8_t)best);}
 __global__ void fp8_sim(float *x,int rows,int n){int row=blockIdx.x/((n+127)/128),b=blockIdx.x%((n+127)/128),i=b*128+threadIdx.x;if(row>=rows)return;
     float v=i<n?fabsf(x[(long long)row*n+i]):0.f;__shared__ float mx[128];mx[threadIdx.x]=v;__syncthreads();
     for(int k=64;k;k>>=1){if(threadIdx.x<k&&mx[threadIdx.x+k]>mx[threadIdx.x])mx[threadIdx.x]=mx[threadIdx.x+k];__syncthreads();}
@@ -826,6 +851,18 @@ static float *g_kv_ring[DSV4_KV_CACHE_LAYERS];
 static int g_kv_ring_rows[DSV4_KV_CACHE_LAYERS];
 static float *g_kv_comp[DSV4_KV_CACHE_LAYERS];
 static int g_kv_comp_cap[DSV4_KV_CACHE_LAYERS];
+static int g_kv_device[DSV4_KV_CACHE_LAYERS];
+
+/* A KV ring/comp buffer belongs to one device; refuse a different owner
+ * instead of writing through a pointer allocated on another device. */
+static int kv_device_ok(int layer, int device) {
+    if ((g_kv_ring[layer] || g_kv_comp[layer]) && g_kv_device[layer] != device) {
+        fprintf(stderr, "[DSV4 CUDA] kv layer %d is on device %d, not %d; refusing append\n",
+                layer, g_kv_device[layer], device);
+        return 0;
+    }
+    return 1;
+}
 
 /* Which GPUs this build's kernels can run on. The DeepGEMM build carries
  * sm_120a-only block-scaled MMA kernels. The generic build is a portable fat
@@ -868,6 +905,7 @@ extern "C" const char *dsv4_cuda_backend_name(void){
 }
 
 extern "C" long long dsv4_cuda_mem_free_mb(int device){
+    if(g_cuda_lost)return -1;
     if(!ok(cudaSetDevice(device),"select meminfo device"))return -1;
     size_t free_b=0,total_b=0;
     if(!ok(cudaMemGetInfo(&free_b,&total_b),"device meminfo"))return -1;
@@ -890,6 +928,8 @@ extern "C" int dsv4_cuda_kv_ring_append(int device,int layer,const float*rows,
     Dev*c=ctx(device);
     if(!c||layer<0||layer>=DSV4_KV_CACHE_LAYERS||!rows||start_pos<0||count<1||
        window<1||dim<1||!ok(cudaSetDevice(device),"select kv ring device"))return 0;
+    if(!kv_device_ok(layer,device))return 0;
+    g_kv_device[layer]=device;
     if(g_kv_ring[layer]&&g_kv_ring_rows[layer]!=window){cudaFree(g_kv_ring[layer]);g_kv_ring[layer]=NULL;}
     if(!g_kv_ring[layer]){
         if(!alloc_ok(cudaMalloc((void**)&g_kv_ring[layer],(size_t)window*dim*4),"kv ring allocation"))return 0;
@@ -911,6 +951,8 @@ extern "C" int dsv4_cuda_kv_comp_append(int device,int layer,const float*rows,
     Dev*c=ctx(device);
     if(!c||layer<0||layer>=DSV4_KV_CACHE_LAYERS||!rows||start_idx<0||count<1||dim<1||
        !ok(cudaSetDevice(device),"select kv comp device"))return 0;
+    if(!kv_device_ok(layer,device))return 0;
+    g_kv_device[layer]=device;
     int need=start_idx+count;
     if(g_kv_comp_cap[layer]<need){
         int cap=g_kv_comp_cap[layer]?g_kv_comp_cap[layer]:512;
@@ -968,6 +1010,15 @@ __global__ void sparse_attn_batch_cached_kernel(float*out,const float*q,const fl
     }
 }
 
+/* V4_SPARSE_FAST (decode, tokens == 1): defined after the indexed kernel below. */
+struct SaOld{float*out;const float*q;const float*win;const float*chunk;const float*comp;
+    const float*sink;const int*meta;const int*sel;int selstride,abs_base,chunk_start,window,heads,dim;float scale;size_t sm;};
+static int sa_fast_decode(Dev*c,int layer,const int*dsel,const int*meta,int abs_base,int chunk_start,
+        int window,int heads,int dim,float scale,float*out,size_t qb,
+        void(*old_launch)(Dev*,void*),void*old_arg);
+static void sa_old_plain(Dev*c,void*p);
+static void sa_old_idx(Dev*c,void*p);
+
 extern "C" int dsv4_cuda_sparse_attn_batch_cached(int device,int layer,const float*q,
         const float*chunk,int chunk_start,const float*sinks,const int*meta,int abs_base,
         int comp_limit,int heads,int dim,int tokens,float scale,float*out){
@@ -993,6 +1044,12 @@ extern "C" int dsv4_cuda_sparse_attn_batch_cached(int device,int layer,const flo
        !ok(cudaMemcpyAsync(c->p3,chunk,cb,cudaMemcpyHostToDevice,c->stream),"cached attention chunk upload")||
        !ok(cudaMemcpyAsync(c->aux1,sinks,sb,cudaMemcpyHostToDevice,c->stream),"cached attention sink upload")||
        !ok(cudaMemcpyAsync(c->aux2,meta,mb,cudaMemcpyHostToDevice,c->stream),"cached attention meta upload"))return 0;
+    if(tokens==1){
+        SaOld a={c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,nullptr,0,
+                 abs_base,chunk_start,window,heads,dim,scale,sm};
+        int r=sa_fast_decode(c,layer,nullptr,meta,abs_base,chunk_start,window,heads,dim,scale,out,qb,sa_old_plain,&a);
+        if(r)return r>0;
+    }
     sparse_attn_batch_cached_kernel<<<dim3(heads,tokens),256,sm,c->stream>>>(
         c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,
         abs_base,chunk_start,window,heads,dim,scale);
@@ -1067,6 +1124,12 @@ extern "C" int dsv4_cuda_sparse_attn_batch_cached_idx(int device,int layer,const
        !ok(cudaMemcpyAsync(c->aux1,sinks,sb,cudaMemcpyHostToDevice,c->stream),"cached idx attention sink upload")||
        !ok(cudaMemcpyAsync(c->aux2,meta,mb,cudaMemcpyHostToDevice,c->stream),"cached idx attention meta upload")||
        !ok(cudaMemcpyAsync(c->aux3,sel,ib,cudaMemcpyHostToDevice,c->stream),"cached idx attention index upload"))return 0;
+    if(tokens==1){
+        SaOld a={c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,(int*)c->aux3,selstride,
+                 abs_base,chunk_start,window,heads,dim,scale,sm};
+        int r=sa_fast_decode(c,layer,(int*)c->aux3,meta,abs_base,chunk_start,window,heads,dim,scale,out,qb,sa_old_idx,&a);
+        if(r)return r>0;
+    }
     sparse_attn_batch_cached_idx_kernel<<<dim3(heads,tokens),256,sm,c->stream>>>(
         c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,(int*)c->aux3,
         selstride,abs_base,chunk_start,window,heads,dim,scale);
@@ -1074,6 +1137,198 @@ extern "C" int dsv4_cuda_sparse_attn_batch_cached_idx(int device,int layer,const
            ok(cudaMemcpyAsync(out,c->p4,qb,cudaMemcpyDeviceToHost,c->stream),"cached idx attention download")&&
            ok(cudaStreamSynchronize(c->stream),"cached idx sparse attention sync");
 }
+
+/* ---- V4_SPARSE_FAST (opt-in): the decode step (tokens == 1) of both cached sparse
+ * attention wrappers in three wider kernels, bitwise equal to the kernels above.
+ * Those kernels, as nvcc compiles them by default (FMA contraction on), compute:
+ *  - score of (head, item): lane l runs z = fma(q[d], v[d], z) over d = l, l+32, ...
+ *    in order, then the __shfl_down tree (16, 8, 4, 2, 1) with plain adds, then z*scale;
+ *  - softmax: the max (exact in any order); a_i = expf(score_i - m); the denominator
+ *    starts at expf(sink - m) and adds a_0, a_1, ... in item order on one thread; the
+ *    stored weight is bf16(a_i);
+ *  - output dim d: sum = fma(w_i, v_i[d], sum) over the items in order (window items,
+ *    then compressed items), then bf16(sum / den).
+ * The replica spells each step with __fmaf_rn / __fadd_rn / __fmul_rn / __fdiv_rn in
+ * the same operand order. The old kernels run one block per head, the softmax on one
+ * thread of it and the output over every item per dim; these spread items and heads
+ * over more blocks and compute each row's address once.
+ * V4_SPARSE_VERIFY=1 runs both and byte-compares the outputs (the old one is returned;
+ * mismatches are counted on stderr). Shapes other than dim 512 and heads % 8 == 0 keep
+ * the old kernels. */
+static int sa_env(int *cache,const char *name){
+    if(*cache<0){const char*e=getenv(name);*cache=e&&*e&&atoi(e)!=0;}
+    return *cache;
+}
+static int sa_fast_on(void){static int v=-1;return sa_env(&v,"V4_SPARSE_FAST");}
+static int sa_verify_on(void){static int v=-1;return sa_env(&v,"V4_SPARSE_VERIFY");}
+enum { SA_DJ = 16, SA_HG = 8, SA_ITEMS = 32, SA_HB = 8, SA_DT = 128, SA_TILE = 1024 };
+static long long g_sa_checks,g_sa_bad;
+/* Row of item i as an element offset: >= 0 is a window-ring row or (high bit set) a
+ * compressed row; -1 - k is row k of this step's chunk. */
+__device__ __forceinline__ long long sa_row(int i,int wo,int wn,const int*sel,int abs_base,
+        int chunk_start,int window,int dim){
+    if(i<wn){int ap=abs_base+wo+i;
+        if(ap>=chunk_start)return -1-(long long)(ap-chunk_start);
+        return (long long)(ap%window)*dim;}
+    int o=sel?sel[i-wn]:i-wn;
+    return ((long long)1<<62)|((long long)o*dim);
+}
+__device__ __forceinline__ float sa_load(long long r,int d,const float*win,
+        const float*comp,const float*chunk,int dim){
+    if(r<0)return chunk[(-1-r)*dim+d];
+    if(r&((long long)1<<62))return comp[(r&~((long long)1<<62))+d];
+    return win[r+d];
+}
+__global__ void sa_rows_kernel(long long*rows,const int*sel,int wo,int wn,int total,int abs_base,
+        int chunk_start,int window,int dim){
+    int i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<total)rows[i]=sa_row(i,wo,wn,sel,abs_base,chunk_start,window,dim);
+}
+/* grid (ceil(total/SA_ITEMS), heads/SA_HG), 256 threads; dim == 32*SA_DJ. */
+__global__ void sa_fast_scores(float*score,const float*q,const long long*rows,
+        const float*win,const float*comp,const float*chunk,int total,int dim,float scale){
+    __shared__ float qs[SA_HG*32*SA_DJ];
+    int h0=blockIdx.y*SA_HG;
+    for(int i=threadIdx.x;i<SA_HG*dim;i+=blockDim.x)qs[i]=q[(long long)h0*dim+i];
+    __syncthreads();
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    for(int k=warp;k<SA_ITEMS;k+=blockDim.x/32){
+        int item=blockIdx.x*SA_ITEMS+k;
+        if(item>=total)break;
+        long long r=rows[item];
+        float v[SA_DJ];
+#pragma unroll
+        for(int j=0;j<SA_DJ;j++)v[j]=sa_load(r,lane+32*j,win,comp,chunk,dim);
+#pragma unroll
+        for(int hh=0;hh<SA_HG;hh++){
+            const float*qh=qs+hh*dim;
+            float z=0;
+#pragma unroll
+            for(int j=0;j<SA_DJ;j++)z=__fmaf_rn(qh[lane+32*j],v[j],z);
+            for(int n=16;n;n>>=1)z=__fadd_rn(z,__shfl_down_sync(0xffffffff,z,n));
+            if(!lane)score[(long long)(h0+hh)*total+item]=__fmul_rn(z,scale);
+        }
+    }
+}
+/* grid heads, 256 threads; dynamic smem total floats. Writes w = bf16(a) and den. */
+__global__ void sa_fast_softmax(float*w,float*den,const float*score,const float*sink,int total){
+    extern __shared__ float a[];
+    __shared__ float red[256];
+    int h=blockIdx.x;
+    const float*s=score+(long long)h*total;
+    float m=-INFINITY;
+    for(int i=threadIdx.x;i<total;i+=blockDim.x)m=fmaxf(m,s[i]);
+    red[threadIdx.x]=m;__syncthreads();
+    for(int n=blockDim.x/2;n;n>>=1){if(threadIdx.x<n)red[threadIdx.x]=fmaxf(red[threadIdx.x],red[threadIdx.x+n]);__syncthreads();}
+    m=red[0];
+    for(int i=threadIdx.x;i<total;i+=blockDim.x){float e=expf(s[i]-m);a[i]=e;
+        w[(long long)h*total+i]=__bfloat162float(__float2bfloat16(e));}
+    __syncthreads();
+    if(!threadIdx.x){float d0=expf(sink[h]-m);for(int i=0;i<total;i++)d0=__fadd_rn(d0,a[i]);den[h]=d0;}
+}
+/* grid (dim/SA_DT, heads/SA_HB), SA_DT threads; items in tiles of SA_TILE. */
+__global__ void sa_fast_out(float*out,const float*w,const float*den,const long long*rows,
+        const float*win,const float*comp,const float*chunk,int total,int dim){
+    __shared__ float ws[SA_HB*SA_TILE];
+    __shared__ long long rs[SA_TILE];
+    int d=blockIdx.x*SA_DT+threadIdx.x,h0=blockIdx.y*SA_HB;
+    float sum[SA_HB];
+#pragma unroll
+    for(int hh=0;hh<SA_HB;hh++)sum[hh]=0;
+    for(int base=0;base<total;base+=SA_TILE){
+        int n=total-base<SA_TILE?total-base:SA_TILE;
+        __syncthreads();
+        for(int i=threadIdx.x;i<n;i+=blockDim.x){
+            rs[i]=rows[base+i];
+#pragma unroll
+            for(int hh=0;hh<SA_HB;hh++)ws[hh*SA_TILE+i]=w[(long long)(h0+hh)*total+base+i];
+        }
+        __syncthreads();
+        if(d<dim){
+            int i=0;
+            for(;i+4<=n;i+=4){
+                float v0=sa_load(rs[i],d,win,comp,chunk,dim),v1=sa_load(rs[i+1],d,win,comp,chunk,dim),
+                      v2=sa_load(rs[i+2],d,win,comp,chunk,dim),v3=sa_load(rs[i+3],d,win,comp,chunk,dim);
+#pragma unroll
+                for(int hh=0;hh<SA_HB;hh++){
+                    const float*wh=ws+hh*SA_TILE+i;
+                    float acc=sum[hh];
+                    acc=__fmaf_rn(wh[0],v0,acc);acc=__fmaf_rn(wh[1],v1,acc);
+                    acc=__fmaf_rn(wh[2],v2,acc);acc=__fmaf_rn(wh[3],v3,acc);
+                    sum[hh]=acc;
+                }
+            }
+            for(;i<n;i++){
+                float v=sa_load(rs[i],d,win,comp,chunk,dim);
+#pragma unroll
+                for(int hh=0;hh<SA_HB;hh++)sum[hh]=__fmaf_rn(ws[hh*SA_TILE+i],v,sum[hh]);
+            }
+        }
+    }
+    if(d<dim){
+#pragma unroll
+        for(int hh=0;hh<SA_HB;hh++)
+            out[(long long)(h0+hh)*dim+d]=__bfloat162float(__float2bfloat16(__fdiv_rn(sum[hh],den[h0+hh])));
+    }
+}
+/* The fast path on c->stream: device q, chunk, sinks and sel (or null) are already
+ * uploaded; output into dout. Returns 0 for an unsupported shape (old kernel runs). */
+static int sa_fast_launch(Dev*c,int layer,const float*dq,const float*dchunk,const float*dsinks,
+        const int*dsel,int wo,int wn,int cn,int abs_base,
+        int chunk_start,int window,int heads,int dim,float scale,float*dout){
+    int total=wn+cn;
+    if(dim!=32*SA_DJ||heads%SA_HG||heads%SA_HB||dim%SA_DT||total<1||(size_t)total*4>96*1024)return 0;
+    size_t sb=(size_t)heads*total*4;
+    if(!buf((void**)&c->sa_score,&c->sa_score_cap,sb)||!buf((void**)&c->sa_w,&c->sa_w_cap,sb)||
+       !buf((void**)&c->sa_den,&c->sa_den_cap,(size_t)heads*4)||
+       !buf((void**)&c->sa_rows,&c->sa_rows_cap,(size_t)total*sizeof(long long)))return 0;
+    size_t sm=(size_t)total*4;
+    if(sm>48*1024&&cudaFuncSetAttribute(sa_fast_softmax,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sm)!=cudaSuccess){
+        cudaGetLastError();return 0;}
+    sa_rows_kernel<<<(total+255)/256,256,0,c->stream>>>(c->sa_rows,dsel,wo,wn,total,abs_base,chunk_start,window,dim);
+    sa_fast_scores<<<dim3((total+SA_ITEMS-1)/SA_ITEMS,heads/SA_HG),256,0,c->stream>>>(
+        c->sa_score,dq,c->sa_rows,g_kv_ring[layer],g_kv_comp[layer],dchunk,total,dim,scale);
+    sa_fast_softmax<<<heads,256,sm,c->stream>>>(c->sa_w,c->sa_den,c->sa_score,dsinks,total);
+    sa_fast_out<<<dim3(dim/SA_DT,heads/SA_HB),SA_DT,0,c->stream>>>(
+        dout,c->sa_w,c->sa_den,c->sa_rows,g_kv_ring[layer],g_kv_comp[layer],dchunk,total,dim);
+    return ok(cudaGetLastError(),"fast sparse attention launch");
+}
+/* Fast path for both wrappers (tokens == 1, uploads queued). 1: the output is in `out`
+ * and the stream synced; 0: run the old kernel; -1: a CUDA error. */
+static int sa_fast_decode(Dev*c,int layer,const int*dsel,const int*meta,int abs_base,int chunk_start,
+        int window,int heads,int dim,float scale,float*out,size_t qb,
+        void(*old_launch)(Dev*,void*),void*old_arg){
+    if(!sa_fast_on())return 0;
+    int verify=sa_verify_on();
+    if(verify&&!buf((void**)&c->sa_out,&c->sa_out_cap,qb))return 0;
+    float*dout=verify?c->sa_out:c->p4;
+    if(!sa_fast_launch(c,layer,c->p2,c->p3,c->aux1,dsel,meta[0],meta[1],meta[2],abs_base,chunk_start,
+                       window,heads,dim,scale,dout))
+        return 0;
+    if(!verify)
+        return ok(cudaMemcpyAsync(out,c->p4,qb,cudaMemcpyDeviceToHost,c->stream),"fast attention download")&&
+               ok(cudaStreamSynchronize(c->stream),"fast sparse attention sync")?1:-1;
+    old_launch(c,old_arg);
+    float*hfast=(float*)malloc(qb);
+    int okk=hfast&&ok(cudaGetLastError(),"verify old sparse launch")&&
+            ok(cudaMemcpyAsync(out,c->p4,qb,cudaMemcpyDeviceToHost,c->stream),"verify old download")&&
+            ok(cudaMemcpyAsync(hfast,c->sa_out,qb,cudaMemcpyDeviceToHost,c->stream),"verify fast download")&&
+            ok(cudaStreamSynchronize(c->stream),"verify sparse sync");
+    if(!okk){free(hfast);return -1;}
+    g_sa_checks++;
+    int same=memcmp(out,hfast,qb)==0;
+    free(hfast);
+    if(!same&&++g_sa_bad<=16)fprintf(stderr,"v4_sparse_verify MISMATCH layer=%d total=%d\n",layer,meta[1]+meta[2]);
+    if(g_sa_checks%2048==0||(!same&&g_sa_bad<=1))
+        fprintf(stderr,"v4_sparse_verify checks=%lld mismatches=%lld\n",g_sa_checks,g_sa_bad);
+    return 1;
+}
+static void sa_old_plain(Dev*c,void*p){SaOld*a=(SaOld*)p;
+    sparse_attn_batch_cached_kernel<<<dim3(a->heads,1),256,a->sm,c->stream>>>(a->out,a->q,a->win,a->chunk,a->comp,
+        a->sink,a->meta,a->abs_base,a->chunk_start,a->window,a->heads,a->dim,a->scale);}
+static void sa_old_idx(Dev*c,void*p){SaOld*a=(SaOld*)p;
+    sparse_attn_batch_cached_idx_kernel<<<dim3(a->heads,1),256,a->sm,c->stream>>>(a->out,a->q,a->win,a->chunk,a->comp,
+        a->sink,a->meta,a->sel,a->selstride,a->abs_base,a->chunk_start,a->window,a->heads,a->dim,a->scale);}
 
 /* Batched indexer scoring for prefill. One thread per (token, candidate):
  * score = sum_h relu(q_h . k) * w_h with the SAME sequential fp32 order as the
@@ -1105,6 +1360,32 @@ __global__ void indexer_score_kernel(float*scores,const float*queries,const floa
     scores[(long long)t*count+c]=score;
 }
 
+/* Naruto's indexer tiles keys transposed and splits work across heads.
+ * Store individual head terms here, then fold them in the original order. */
+__global__ void indexer_score_heads(float *scores,const float *queries,const float *keys,
+        const float *head_w,const int *counts,int heads,int dim,int count){
+    constexpr int tile=8;
+    int candidate=blockIdx.x*tile+threadIdx.x%tile,head=threadIdx.x/tile,t=blockIdx.y;
+    extern __shared__ float scratch[];
+    float *ks=scratch,*partial=ks+dim*(tile+1);
+    for(int i=threadIdx.x;i<dim*tile;i+=blockDim.x){
+        int row=i/dim,col=i%dim,idx=blockIdx.x*tile+row;
+        ks[col*(tile+1)+row]=idx<count?keys[(long long)idx*dim+col]:0.f;
+    }
+    __syncthreads();
+    float dot=0.f;
+    if(candidate<count&&candidate<counts[t]){
+        const float *q=queries+((long long)t*heads+head)*dim;
+        for(int d=0;d<dim;d++)dot=__fadd_rn(dot,__fmul_rn(q[d],ks[d*(tile+1)+threadIdx.x%tile]));
+    }
+    partial[head*tile+threadIdx.x%tile]=__fmul_rn(fmaxf(dot,0.f),head_w[(long long)t*heads+head]);
+    __syncthreads();
+    if(head==0&&candidate<count){
+        float score=0.f;
+        if(candidate<counts[t])for(int h=0;h<heads;h++)score=__fadd_rn(score,partial[h*tile+threadIdx.x%tile]);
+        scores[(long long)t*count+candidate]=score;
+    }
+}
 extern "C" int dsv4_cuda_indexer_score_batch(int device,const float*queries,const float*keys,
         const float*head_w,const int*counts,int tokens,int heads,int dim,int count,
         float*scores){
@@ -1121,9 +1402,16 @@ extern "C" int dsv4_cuda_indexer_score_batch(int device,const float*queries,cons
        !ok(cudaMemcpyAsync(c->p3,keys,kb,cudaMemcpyHostToDevice,c->stream),"indexer key upload")||
        !ok(cudaMemcpyAsync(c->aux1,head_w,wb,cudaMemcpyHostToDevice,c->stream),"indexer head weight upload")||
        !ok(cudaMemcpyAsync(c->aux2,counts,cb,cudaMemcpyHostToDevice,c->stream),"indexer count upload"))return 0;
-    if(sm>48*1024&&cudaFuncSetAttribute(indexer_score_kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sm)!=cudaSuccess)return 0;
-    indexer_score_kernel<<<dim3((count+127)/128,tokens),128,sm,c->stream>>>(
-        c->p4,c->p2,c->p3,c->aux1,(int*)c->aux2,heads,dim,count);
+    const char *parallel=getenv("DSV4_CUDA_INDEXER_HEADS");
+    if((!parallel||atoi(parallel))&&heads<=128&&dim<=512){
+        size_t shared=(size_t)(dim*9+heads*8)*4;
+        indexer_score_heads<<<dim3((count+7)/8,tokens),heads*8,shared,c->stream>>>(
+            c->p4,c->p2,c->p3,c->aux1,(int*)c->aux2,heads,dim,count);
+    }else{
+        if(sm>48*1024&&cudaFuncSetAttribute(indexer_score_kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sm)!=cudaSuccess)return 0;
+        indexer_score_kernel<<<dim3((count+127)/128,tokens),128,sm,c->stream>>>(
+            c->p4,c->p2,c->p3,c->aux1,(int*)c->aux2,heads,dim,count);
+    }
     return ok(cudaGetLastError(),"indexer score launch")&&
            ok(cudaMemcpyAsync(scores,c->p4,sb,cudaMemcpyDeviceToHost,c->stream),"indexer score download")&&
            ok(cudaStreamSynchronize(c->stream),"indexer score sync");
@@ -1137,12 +1425,7 @@ extern "C" int dsv4_cuda_indexer_score_batch(int device,const float*queries,cons
  * One thread per (row, token); tokens are the fast dimension so the 64
  * threads of a token block broadcast-read the same weight bytes. */
 __device__ __forceinline__ float e4m3_dev(uint8_t b){
-    int s=b>>7,e=(b>>3)&15,m=b&7;
-    float v;
-    if(e==15&&m==7)v=__int_as_float(0x7fc00000);          /* nan */
-    else if(e==0)v=ldexpf((float)m/8.f,-6);
-    else v=ldexpf(1.f+(float)m/8.f,e-7);
-    return s?-v:v;
+    return e4m3(b);
 }
 __global__ void fp8_ref_matmul_kernel(float*y,const uint8_t*w,const float*bscale,
         const float*x,int rows,int cols,int tokens){
@@ -1183,6 +1466,23 @@ __global__ void fp8_ref_matmul_rows8_kernel(float*y,const uint8_t*w,const float*
         }
     }
     y[(long long)t*rows+o]=sum;
+}
+
+extern "C" int dsv4_cuda_fp8_ref_matmul_resident(Dsv4CudaTensor*t,const float*x,int tokens,float*y){
+    Dev*c=t?ctx(t->device):nullptr;
+    if(!c||!x||!y||tokens<1||tokens>1024||(t->fmt!=10&&t->fmt!=11))return 0;
+    size_t xb=(size_t)tokens*t->I*sizeof(float),yb=(size_t)tokens*t->O*sizeof(float);
+    if(!ok(cudaSetDevice(t->device),"select resident fp8 ref device")||
+       !buf((void**)&c->p2,&c->p2cap,xb)||!buf((void**)&c->p4,&c->p4cap,yb)||
+       !ok(cudaMemcpyAsync(c->p2,x,xb,cudaMemcpyHostToDevice,c->stream),"resident fp8 ref activation upload"))return 0;
+    int threads=tokens<32?32:((tokens+31)/32)*32;
+    if(t->fmt==11)
+        fp8_ref_matmul_rows8_kernel<<<t->O,threads,0,c->stream>>>(c->p4,(const uint8_t*)t->w,(const float*)t->scale,c->p2,t->O,t->I,tokens);
+    else
+        fp8_ref_matmul_kernel<<<t->O,threads,0,c->stream>>>(c->p4,(const uint8_t*)t->w,(const float*)t->scale,c->p2,t->O,t->I,tokens);
+    return ok(cudaGetLastError(),"resident fp8 ref launch")&&
+           ok(cudaMemcpyAsync(y,c->p4,yb,cudaMemcpyDeviceToHost,c->stream),"resident fp8 ref download")&&
+           ok(cudaStreamSynchronize(c->stream),"resident fp8 ref sync");
 }
 
 extern "C" int dsv4_cuda_fp8_ref_matmul(int device,const uint8_t*w,const float*bscale,
@@ -1280,6 +1580,84 @@ __global__ void mm_bf16_batch(const __nv_bfloat16*w,const float*x,float*y,int O,
         #pragma unroll
         for(int t=0;t<16;t++)s[t][threadIdx.x]+=s[t][threadIdx.x+n];}__syncthreads();}
     if(!threadIdx.x)for(int t=0;t<tcount;t++)y[(long long)(tbase+t)*O+o]=s[t][0];
+}
+/* One lane owns one output row, preserving the decode reference's column
+ * order and fused fp32 accumulation. Rows32 packing coalesces weight reads. */
+__global__ void compressor_project_exact(const __nv_bfloat16 *kv,const __nv_bfloat16 *gate,
+                                         const float *x,float *out,int O,int I){
+    int row=blockIdx.x*32+threadIdx.x;
+    const __nv_bfloat16 *w=blockIdx.y?gate:kv;
+    float sum=0.f;
+    for(int i=0;i<I;i++)
+        sum=__fmaf_rn(__bfloat162float(w[((long long)blockIdx.x*I+i)*32+threadIdx.x]),x[i],sum);
+    out[(long long)blockIdx.y*O+row]=sum;
+}
+__global__ void indexer_head_project(const __nv_bfloat16 *w,const float *x,float *out,int I,float scale){
+    int row=blockIdx.x*32+threadIdx.x;float sum=0.f;
+    /* Unlike the compressor pair, the reference indexer head projection
+     * rounds the product before adding it to the sequential accumulator. */
+    for(int i=0;i<I;i++)sum=__fadd_rn(sum,__fmul_rn(__bfloat162float(w[((long long)blockIdx.x*I+i)*32+threadIdx.x]),x[i]));
+    out[row]=__fmul_rn(sum,scale);
+}
+/* Keep the CPU butterfly order and its FP4 tie rule (first code wins). */
+__global__ void indexer_hadamard_fp4(float *q,int dim,float norm){
+    extern __shared__ float values[];
+    int d=threadIdx.x;float v=q[(long long)blockIdx.x*dim+d];values[d]=v;
+    __syncthreads();
+    for(int width=1;width<dim;width*=2){
+        float peer=values[d^width];v=values[d];
+        v=(d&width)?__fsub_rn(peer,v):__fadd_rn(v,peer);
+        __syncthreads();values[d]=v;__syncthreads();
+    }
+    v=__bfloat162float(__float2bfloat16(__fmul_rn(v,norm)));
+    float mx=fabsf(v);
+    for(int offset=16;offset;offset>>=1)mx=fmaxf(mx,__shfl_xor_sync(0xffffffff,mx,offset));
+    mx=fmaxf(mx,6.f*0x1p-126f);
+    int exponent;float fraction=frexpf(__fdiv_rn(mx,6.f),&exponent);
+    if(fraction==.5f)--exponent;
+    exponent=max(-127,min(127,exponent));float scale=ldexpf(1.f,exponent);
+    float x=fmaxf(-6.f,fminf(6.f,__fdiv_rn(v,scale)));
+    int best=0;float distance=fabsf(x);
+    #pragma unroll
+    for(int code=1;code<16;code++){float candidate=fabsf(__fsub_rn(x,f4(code)));if(candidate<distance){best=code;distance=candidate;}}
+    q[(long long)blockIdx.x*dim+d]=__bfloat162float(__float2bfloat16(__fmul_rn(f4(best),scale)));
+}
+extern "C" int dsv4_cuda_indexer_prepare(Dsv4CudaTensor *weights,const float *input,
+                                         float *queries,float *head_weights,int dim){
+    Dev *c=weights?ctx(weights->device):nullptr;
+    if(!c||!input||!queries||!head_weights||weights->fmt!=16||!weights->bf16_cache||
+       weights->O%32||dim<32||dim>512||(dim&(dim-1))||
+       !ok(cudaSetDevice(weights->device),"select indexer prepare device"))return 0;
+    int heads=weights->O;size_t xb=(size_t)weights->I*4,qb=(size_t)heads*dim*4,wb=(size_t)heads*4;
+    if(!buf((void**)&c->dx,&c->xcap,xb)||!buf((void**)&c->dy,&c->ycap,wb)||
+       !buf((void**)&c->p1,&c->p1cap,qb))return 0;
+    if(!ok(cudaMemcpyAsync(c->dx,input,xb,cudaMemcpyHostToDevice,c->stream),"indexer hidden upload")||
+       !ok(cudaMemcpyAsync(c->p1,queries,qb,cudaMemcpyHostToDevice,c->stream),"indexer prepare upload"))return 0;
+    indexer_head_project<<<heads/32,32,0,c->stream>>>((const __nv_bfloat16*)weights->bf16_cache,c->dx,c->dy,weights->I,1.f/sqrtf((float)(heads*dim)));
+    indexer_hadamard_fp4<<<heads,dim,dim*4,c->stream>>>(c->p1,dim,1.f/sqrtf((float)dim));
+    int good=ok(cudaGetLastError(),"indexer prepare launch")&&
+        ok(cudaMemcpyAsync(queries,c->p1,qb,cudaMemcpyDeviceToHost,c->stream),"indexer prepare download")&&
+        ok(cudaMemcpyAsync(head_weights,c->dy,wb,cudaMemcpyDeviceToHost,c->stream),"indexer head weights download");
+    int synced=ok(cudaStreamSynchronize(c->stream),"indexer prepare sync");return good&&synced;
+}
+extern "C" int dsv4_cuda_compressor_project(Dsv4CudaTensor *kv,Dsv4CudaTensor *gate,
+                                            const float *x,float *v,float *scores){
+    Dev *c=kv?ctx(kv->device):nullptr;
+    if(!c||!gate||!x||!v||!scores||kv->fmt!=16||gate->fmt!=16||
+       kv->device!=gate->device||kv->O!=gate->O||kv->I!=gate->I||
+       !kv->bf16_cache||!gate->bf16_cache||kv->O%32||
+       !ok(cudaSetDevice(kv->device),"select compressor device"))return 0;
+    size_t xb=(size_t)kv->I*4,yb=(size_t)kv->O*4;
+    if(!buf((void**)&c->dx,&c->xcap,xb)||!buf((void**)&c->dy,&c->ycap,2*yb))return 0;
+    if(!ok(cudaMemcpyAsync(c->dx,x,xb,cudaMemcpyHostToDevice,c->stream),"compressor input upload"))return 0;
+    compressor_project_exact<<<dim3(kv->O/32,2),32,0,c->stream>>>(
+        (const __nv_bfloat16*)kv->bf16_cache,(const __nv_bfloat16*)gate->bf16_cache,c->dx,c->dy,kv->O,kv->I);
+    int good=ok(cudaGetLastError(),"compressor projection launch")&&
+        ok(cudaMemcpyAsync(v,c->dy,yb,cudaMemcpyDeviceToHost,c->stream),"compressor values download")&&
+        ok(cudaMemcpyAsync(scores,c->dy+kv->O,yb,cudaMemcpyDeviceToHost,c->stream),"compressor scores download");
+    /* Drain any issued download before the caller overwrites CPU state on fallback. */
+    int synced=ok(cudaStreamSynchronize(c->stream),"compressor projection sync");
+    return good&&synced;
 }
 extern "C" int dsv4_cuda_matmul_bf16_batch(Dsv4CudaTensor*t,const float*x,int tokens,float*y){
     Dev*c=t?ctx(t->device):nullptr;
@@ -1386,10 +1764,73 @@ static int tc_dev_init(Dev*c){return bok(cublasLtCreate(&c->lt),"cuBLASLt create
 #else
 static int tc_dev_init(Dev*){return 1;}
 #endif
-extern "C" int dsv4_cuda_init(const int *dev,int n){if(n<1||n>16)return 0;float scale[256];for(int b=0;b<256;b++)scale[b]=b?ldexpf(1.f,b-127):ldexpf(1.f,-127);ng=0;for(int i=0;i<n;i++){cudaDeviceProp p{};if(!ok(cudaSetDevice(dev[i]),"select device")||!ok(cudaMemcpyToSymbol(e8_table,scale,sizeof(scale)),"scale table upload")||!ok(cudaGetDeviceProperties(&p,dev[i]),"device properties")||!ok(cudaStreamCreateWithFlags(&g[i].stream,cudaStreamNonBlocking),"stream")||!ok(cudaStreamCreateWithFlags(&g[i].aux,cudaStreamNonBlocking),"aux stream")||!ok(cudaEventCreateWithFlags(&g[i].ready,cudaEventDisableTiming),"device event")||!ok(cudaEventCreateWithFlags(&g[i].fork,cudaEventDisableTiming),"fork event")||!ok(cudaEventCreateWithFlags(&g[i].join,cudaEventDisableTiming),"join event")||!tc_dev_init(&g[i])||!ok(cudaMalloc(&g[i].decode_state,2*sizeof(int)),"decode state allocation"))return 0;g[i].id=dev[i];g[i].sms=p.multiProcessorCount;ng++;fprintf(stderr,"[DSV4 CUDA] device %d: %s %.1f GB sm_%d%d\n",dev[i],p.name,p.totalGlobalMem/1e9,p.major,p.minor);}for(int i=0;i<n;i++)for(int j=0;j<n;j++)if(i!=j){int can=0;if(!ok(cudaDeviceCanAccessPeer(&can,dev[i],dev[j]),"peer query"))return 0;if(can){if(!ok(cudaSetDevice(dev[i]),"select peer device"))return 0;cudaError_t e=cudaDeviceEnablePeerAccess(dev[j],0);if(e!=cudaSuccess&&e!=cudaErrorPeerAccessAlreadyEnabled)return ok(e,"enable peer access");}}
-#ifdef COLI_DSV4_NCCL
-    if(n==6)for(int pair=0;pair<3;pair++){int ids[2]={dev[2*pair],dev[2*pair+1]};ncclComm_t comm[2];if(!nok(ncclCommInitAll(comm,2,ids),"EP2 communicator init"))return 0;g[2*pair].ep_comm=comm[0];g[2*pair+1].ep_comm=comm[1];}
+extern "C" int dsv4_cuda_peer_access(int a,int b){return a!=b&&dev_ok(a,b)&&dev_ok(b,a);}
+/* #1766 layer placement does not need P2P; #2405's peer mirror pool does.
+ * The engine sets this to 1 only around the multi-device layer-split init. */
+extern "C" void dsv4_cuda_set_peer_best_effort(int on){g_peer_best_effort=on?1:0;}
+extern "C" int dsv4_cuda_peer_healthy(int device){return !dev_lost(device);}
+/* DSV4_CUDA_BATCHED (1): the fused decode MoE runs its routed experts as
+ * grouped launches; 0 = one launch chain per expert, no peer compute. */
+static bool moe_batched(){static int on=-1;if(on<0){const char*v=getenv("DSV4_CUDA_BATCHED");on=v?atoi(v)!=0:1;}return on;}
+/* Peer compute (DSV4_CUDA_PEER_COMPUTE, default 1, batched kernels only):
+ * the fused decode MoE on device a runs the experts mirrored on device b ON
+ * b. b must be another initialised, healthy device, each must reach the
+ * other's memory (b's down-projection writes a's reduce buffer), and both
+ * must be the same SM version, so the two run the same machine code and the
+ * result stays bit-identical. Otherwise a reads b's mirrors in place. */
+static bool peer_runs(int a,int b){
+    static int on=-1;if(on<0){const char*v=getenv("DSV4_CUDA_PEER_COMPUTE");on=v?atoi(v)!=0:1;}
+    Dev*p=ctx(a),*q=ctx(b);return on&&moe_batched()&&a!=b&&p&&q&&p->sm==q->sm&&dev_ok(a,b)&&dev_ok(b,a);}
+extern "C" int dsv4_cuda_peer_compute(int device,int peer){return peer_runs(device,peer);}
+/* Asked BEFORE dsv4_cuda_init (DSV4_CUDA_PEER_DEVICE), so a peer that is
+ * refused is never initialised: both ordinals visible, distinct and < 16 (the
+ * size of g_peer), a peer not latched off by an earlier failure
+ * (dsv4_cuda_peer_healthy), a compute capability this build accepts for each
+ * (dsv4_cuda_backend_arch_ok), peer access in both directions, and a kernel
+ * image in this binary for each (cudaFuncGetAttributes: "no kernel image" or
+ * "invalid device function" otherwise -- the only errors the reason pairs
+ * with a rebuild hint). The primary is checked first: one the build cannot
+ * run fails its own init anyway, and its peer must not be left holding a
+ * context for a CPU-only run. Only the kernel-image check makes a
+ * context: the primary's is the one its init creates; the peer's is destroyed
+ * again on refusal unless the backend already holds a device. 1 = usable;
+ * 0 = refused, the reason in why. */
+extern "C" int dsv4_cuda_peer_probe(int device,int peer,char *why,int why_size){
+    char none[1];if(!why||why_size<1){why=none;why_size=1;}why[0]=0;
+    int count=0;cudaError_t e=cudaGetDeviceCount(&count);
+    if(e!=cudaSuccess){cudaGetLastError();snprintf(why,why_size,"no CUDA device (%s)",cudaGetErrorString(e));return 0;}
+    if(peer==device){snprintf(why,why_size,"peer device %d is the primary device",peer);return 0;}
+    for(int k=0;k<2;k++){int d=k?peer:device;
+        if(d<0||d>=count){snprintf(why,why_size,"device %d is not a visible CUDA device (%d visible)",d,count);return 0;}
+        if(d>=16){snprintf(why,why_size,"device %d: peer access is tracked for devices 0-15 only",d);return 0;}}
+    if(dev_lost(peer)){snprintf(why,why_size,"peer device %d failed in the decode MoE earlier in this process and stays latched off",peer);return 0;}
+    cudaDeviceProp p[2]{};const char *role[2]={"primary","peer"};
+    for(int k=0;k<2;k++){int d=k?peer:device;
+        if((e=cudaGetDeviceProperties(&p[k],d))!=cudaSuccess){cudaGetLastError();snprintf(why,why_size,"%s device %d: %s",role[k],d,cudaGetErrorString(e));return 0;}
+        if(!dsv4_cuda_backend_arch_ok(d)){
+#ifdef COLI_DSV4_DEEPGEMM
+            snprintf(why,why_size,"%s device %d (%s, sm_%d%d): the %s backend runs on sm_120 only (pair other cards with the generic build: no DEEPGEMM)",role[k],d,p[k].name,p[k].major,p[k].minor,dsv4_cuda_backend_name());
+#else
+            snprintf(why,why_size,"%s device %d (%s, sm_%d%d): the generic kernels need sm_60 or newer",role[k],d,p[k].name,p[k].major,p[k].minor);
 #endif
+            return 0;}}
+    int ab=0,ba=0;
+    if((e=cudaDeviceCanAccessPeer(&ab,device,peer))!=cudaSuccess||(e=cudaDeviceCanAccessPeer(&ba,peer,device))!=cudaSuccess){cudaGetLastError();snprintf(why,why_size,"peer query %d<->%d: %s",device,peer,cudaGetErrorString(e));return 0;}
+    if(!ab||!ba){snprintf(why,why_size,"no peer access %d%s%d (P2P needs NVLink or a P2P-capable PCIe path; nvidia-smi topo -p2p r shows it)",ab?peer:device,!ab&&!ba?"<->":"->",ab?device:peer);return 0;}
+    for(int k=0;k<2;k++){int d=k?peer:device,set=(e=cudaSetDevice(d))==cudaSuccess;
+        if(set){cudaFuncAttributes fa;e=cudaFuncGetAttributes(&fa,(const void*)mv_fp4_grouped<4>);}
+        if(e==cudaSuccess)continue;
+        cudaGetLastError();if(k&&!ng&&cudaSetDevice(peer)==cudaSuccess)cudaDeviceReset();cudaGetLastError();
+        /* only these two mean "no code for this device"; a GPU that is full,
+         * held by an exclusive-process job or faulting gets no rebuild advice */
+        if(e!=cudaErrorNoKernelImageForDevice&&e!=cudaErrorInvalidDeviceFunction){
+            snprintf(why,why_size,"%s device %d (%s, sm_%d%d): cannot be used: %s: %s",role[k],d,p[k].name,p[k].major,p[k].minor,set?"kernel-image check":"cudaSetDevice",cudaGetErrorString(e));return 0;}
+#ifdef COLI_DSV4_DEEPGEMM
+        snprintf(why,why_size,"%s device %d (%s, sm_%d%d): %s (this %s build carries sm_120a code only; pair other cards with the generic build: no DEEPGEMM)",role[k],d,p[k].name,p[k].major,p[k].minor,cudaGetErrorString(e),dsv4_cuda_backend_name());
+#else
+        snprintf(why,why_size,"%s device %d (%s, sm_%d%d): %s (this build has no code for it; rebuild with a CUDA_ARCH that covers sm_%d%d, e.g. CUDA_ARCH=%s)",role[k],d,p[k].name,p[k].major,p[k].minor,cudaGetErrorString(e),p[k].major,p[k].minor,p[k].major<8?"portable-pre-ampere NO_TC=1":"portable");
+#endif
+        return 0;}
     return 1;}
 #if COLI_DSV4_TC
 static void plan_free(TcPlan*p){if(p->d)cublasLtMatrixLayoutDestroy(p->d);if(p->c)cublasLtMatrixLayoutDestroy(p->c);if(p->b)cublasLtMatrixLayoutDestroy(p->b);if(p->a)cublasLtMatrixLayoutDestroy(p->a);if(p->op)cublasLtMatmulDescDestroy(p->op);memset(p,0,sizeof(*p));}
@@ -1397,21 +1838,74 @@ static void tc_dev_free(Dev*c){for(int p=0;p<2;p++)plan_free(&c->plans[p]);if(c-
 #else
 static void tc_dev_free(Dev*){}
 #endif
-extern "C" void dsv4_cuda_shutdown(void){
-    for(int i=0;i<ng;i++){cudaSetDevice(g[i].id);if(g[i].decode_state)cudaFree(g[i].decode_state);
+/* Frees what g[0..n) holds -- a live backend, or whatever a failed init had
+ * set up when it stopped (a stream or handle it never created is 0) -- and
+ * zeroes the slots. */
+static void dev_release(int n){
+    for(int i=0;i<n;i++){cudaSetDevice(g[i].id);if(g[i].decode_state)cudaFree(g[i].decode_state);
 #ifdef COLI_DSV4_NCCL
         if(g[i].ep_comm)ncclCommDestroy(g[i].ep_comm);
 #endif
     }
-    for(int i=0;i<ng;i++){cudaSetDevice(g[i].id);if(g[i].dx)cudaFree(g[i].dx);if(g[i].dy)cudaFree(g[i].dy);if(g[i].p1)cudaFree(g[i].p1);if(g[i].p2)cudaFree(g[i].p2);if(g[i].p3)cudaFree(g[i].p3);if(g[i].p4)cudaFree(g[i].p4);if(g[i].aux1)cudaFree(g[i].aux1);if(g[i].aux2)cudaFree(g[i].aux2);if(g[i].aux3)cudaFree(g[i].aux3);if(g[i].mvdesc)cudaFree(g[i].mvdesc);if(g[i].expert_weights)cudaFree(g[i].expert_weights);if(g[i].expert_ids)cudaFree(g[i].expert_ids);if(g[i].tcw)cudaFree(g[i].tcw);if(g[i].tcs)cudaFree(g[i].tcs);if(g[i].tcx)cudaFree(g[i].tcx);if(g[i].tcxs)cudaFree(g[i].tcxs);if(g[i].tc_workspace)cudaFree(g[i].tc_workspace);
-        if(g[i].emaj)cudaFree(g[i].emaj);if(g[i].emv1)cudaFree(g[i].emv1);if(g[i].emv2)cudaFree(g[i].emv2);if(g[i].emv4)cudaFree(g[i].emv4);if(g[i].emcount)cudaFree(g[i].emcount);if(g[i].mmv)cudaFree(g[i].mmv);if(g[i].mmvcount)cudaFree(g[i].mmvcount);
+    for(int i=0;i<n;i++){cudaSetDevice(g[i].id);if(g[i].dx)cudaFree(g[i].dx);if(g[i].dy)cudaFree(g[i].dy);if(g[i].p1)cudaFree(g[i].p1);if(g[i].p2)cudaFree(g[i].p2);if(g[i].p3)cudaFree(g[i].p3);if(g[i].p4)cudaFree(g[i].p4);if(g[i].aux1)cudaFree(g[i].aux1);if(g[i].aux2)cudaFree(g[i].aux2);if(g[i].aux3)cudaFree(g[i].aux3);if(g[i].mvdesc)cudaFree(g[i].mvdesc);if(g[i].expert_weights)cudaFree(g[i].expert_weights);if(g[i].expert_ids)cudaFree(g[i].expert_ids);if(g[i].tcw)cudaFree(g[i].tcw);if(g[i].tcs)cudaFree(g[i].tcs);if(g[i].tcx)cudaFree(g[i].tcx);if(g[i].tcxs)cudaFree(g[i].tcxs);if(g[i].tc_workspace)cudaFree(g[i].tc_workspace);
+        if(g[i].emaj)cudaFree(g[i].emaj);if(g[i].emv1)cudaFree(g[i].emv1);if(g[i].emv2)cudaFree(g[i].emv2);if(g[i].emv4)cudaFree(g[i].emv4);if(g[i].emcount)cudaFree(g[i].emcount);if(g[i].mmv)cudaFree(g[i].mmv);if(g[i].mmvcount)cudaFree(g[i].mmvcount);if(g[i].v4fact)cudaFree(g[i].v4fact);if(g[i].v4fparts)cudaFree(g[i].v4fparts);if(g[i].v4fbar)cudaFree(g[i].v4fbar);
+        if(g[i].sa_score)cudaFree(g[i].sa_score);if(g[i].sa_w)cudaFree(g[i].sa_w);if(g[i].sa_den)cudaFree(g[i].sa_den);if(g[i].sa_out)cudaFree(g[i].sa_out);if(g[i].sa_rows)cudaFree(g[i].sa_rows);
 #ifdef COLI_DSV4_DEEPGEMM
         if(g[i].dga1)cudaFree(g[i].dga1);if(g[i].dga2)cudaFree(g[i].dga2);if(g[i].dgsfa1)cudaFree(g[i].dgsfa1);if(g[i].dgsfa2)cudaFree(g[i].dgsfa2);if(g[i].dglayout)cudaFree(g[i].dglayout);if(g[i].dgrowmap)cudaFree(g[i].dgrowmap);if(g[i].dgmm1)cudaFree(g[i].dgmm1);if(g[i].dgmm2)cudaFree(g[i].dgmm2);if(g[i].dgref)cudaFree(g[i].dgref);if(g[i].dgdensews)cudaFree(g[i].dgdensews);
 #endif
-        tc_dev_free(&g[i]);if(g[i].hx)cudaFreeHost(g[i].hx);if(g[i].hy)cudaFreeHost(g[i].hy);if(g[i].ready)cudaEventDestroy(g[i].ready);if(g[i].fork)cudaEventDestroy(g[i].fork);if(g[i].join)cudaEventDestroy(g[i].join);cudaStreamDestroy(g[i].aux);cudaStreamDestroy(g[i].stream);
+        tc_dev_free(&g[i]);if(g[i].hx)cudaFreeHost(g[i].hx);if(g[i].hy)cudaFreeHost(g[i].hy);if(g[i].ready)cudaEventDestroy(g[i].ready);if(g[i].fork)cudaEventDestroy(g[i].fork);if(g[i].join)cudaEventDestroy(g[i].join);if(g[i].aux)cudaStreamDestroy(g[i].aux);if(g[i].stream)cudaStreamDestroy(g[i].stream);
         /* zero the slot: every buffer above is grown lazily through buf(), which
          * would cudaFree a stale pointer (and trust its cap) after a re-init */
-        memset(&g[i],0,sizeof g[i]);}ng=0;}
+        memset(&g[i],0,sizeof g[i]);}ng=0;
+    /* peer access ends with the contexts; a re-init records it afresh */
+    memset(g_peer,0,sizeof g_peer);}
+/* A failed init releases every device it touched (streams, events, cuBLASLt
+ * handles, buffers, peer records) and clears the runtime's last error, so a
+ * retry with fewer devices -- the engine's two-GPU fallback -- starts clean
+ * instead of leaking the first attempt and failing on its stale error. With
+ * several devices it names the one that failed (b < 0) or the link a -> b,
+ * and it also destroys the contexts of dev[1..n) (made by this init or by
+ * dsv4_cuda_peer_probe, holding nothing now): the fallback runs on dev[0]
+ * alone, or on the CPU, so those GPUs would otherwise keep ~0.3 GiB each for
+ * the whole run. dev[0]'s context stays for the retry. */
+static int init_fail(const int *dev,int n,int touched,int a,int b){
+    if(n>1&&a>=0){if(b<0)fprintf(stderr,"[DSV4 CUDA] device %d did not initialise\n",a);
+        else fprintf(stderr,"[DSV4 CUDA] peer access %d -> %d failed\n",a,b);}
+    dev_release(touched);
+    for(int i=1;i<n;i++)if(dev[i]!=dev[0]&&cudaSetDevice(dev[i])==cudaSuccess)cudaDeviceReset();
+    cudaGetLastError();return 0;}
+extern "C" int dsv4_cuda_init(const int *dev,int n){if(!dev||n<1||n>16||g_cuda_lost||ng)return 0;
+    for(int i=0;i<n;i++){
+        cudaDeviceProp p{};
+        /* name the refused device, and leave no stale error for the caller's next call */
+        if(!ok(cudaGetDeviceProperties(&p,dev[i]),"validate device")){
+            if(n>1)fprintf(stderr,"[DSV4 CUDA] device %d did not initialise\n",dev[i]);
+            cudaGetLastError();return 0;}
+        for(int j=0;j<i;j++)if(dev[j]==dev[i])return 0;
+    }
+    float scale[256];for(int b=0;b<256;b++)scale[b]=b?ldexpf(1.f,b-127):ldexpf(1.f,-127);ng=0;for(int i=0;i<n;i++){cudaDeviceProp p{};g[i].id=dev[i];if(!ok(cudaSetDevice(dev[i]),"select device")||!ok(cudaMemcpyToSymbol(e8_table,scale,sizeof(scale)),"scale table upload")||!ok(cudaGetDeviceProperties(&p,dev[i]),"device properties")||!ok(cudaStreamCreateWithFlags(&g[i].stream,cudaStreamNonBlocking),"stream")||!ok(cudaStreamCreateWithFlags(&g[i].aux,cudaStreamNonBlocking),"aux stream")||!ok(cudaEventCreateWithFlags(&g[i].ready,cudaEventDisableTiming),"device event")||!ok(cudaEventCreateWithFlags(&g[i].fork,cudaEventDisableTiming),"fork event")||!ok(cudaEventCreateWithFlags(&g[i].join,cudaEventDisableTiming),"join event")||!tc_dev_init(&g[i])||!ok(cudaMalloc(&g[i].decode_state,2*sizeof(int)),"decode state allocation"))return init_fail(dev,n,i+1,dev[i],-1);g[i].sms=p.multiProcessorCount;g[i].sm=p.major*10+p.minor;ng++;fprintf(stderr,"[DSV4 CUDA] device %d: %s %.1f GB sm_%d%d\n",dev[i],p.name,p.totalGlobalMem/1e9,p.major,p.minor);}for(int i=0;i<n;i++)for(int j=0;j<n;j++)if(i!=j){
+    int can=0;cudaError_t q=cudaDeviceCanAccessPeer(&can,dev[i],dev[j]);
+    if(q!=cudaSuccess){if(!g_peer_best_effort)return init_fail(dev,n,n,dev[i],dev[j]);const char*why=cudaGetErrorString(q);cudaGetLastError();fprintf(stderr,"[DSV4 CUDA] peer query %d -> %d unavailable (%s); continuing without peer access\n",dev[i],dev[j],why);continue;}
+    if(!can)continue;
+    if(!ok(cudaSetDevice(dev[i]),"select peer device"))return init_fail(dev,n,n,dev[i],dev[j]);
+    cudaError_t e=cudaDeviceEnablePeerAccess(dev[j],0);
+    if(e!=cudaSuccess&&e!=cudaErrorPeerAccessAlreadyEnabled){if(!g_peer_best_effort)return init_fail(dev,n,n,dev[i],dev[j]);const char*why=cudaGetErrorString(e);cudaGetLastError();fprintf(stderr,"[DSV4 CUDA] peer access %d -> %d unavailable (%s); continuing without it\n",dev[i],dev[j],why);}
+    else {if(e==cudaErrorPeerAccessAlreadyEnabled)cudaGetLastError();if(dev[i]>=0&&dev[i]<16&&dev[j]>=0&&dev[j]<16)g_peer[dev[i]][dev[j]]=1;}
+}
+#ifdef COLI_DSV4_NCCL
+    if(n==6)for(int pair=0;pair<3;pair++){int ids[2]={dev[2*pair],dev[2*pair+1]};ncclComm_t comm[2];if(!nok(ncclCommInitAll(comm,2,ids),"EP2 communicator init"))return init_fail(dev,n,n,-1,-1);g[2*pair].ep_comm=comm[0];g[2*pair+1].ep_comm=comm[1];}
+#endif
+    return 1;}
+extern "C" void dsv4_cuda_shutdown(void){
+    for(int layer=0;layer<DSV4_KV_CACHE_LAYERS;layer++){
+        if(!g_kv_ring[layer]&&!g_kv_comp[layer])continue;
+        cudaSetDevice(g_kv_device[layer]);
+        if(g_kv_ring[layer])cudaFree(g_kv_ring[layer]);
+        if(g_kv_comp[layer])cudaFree(g_kv_comp[layer]);
+        g_kv_ring[layer]=g_kv_comp[layer]=nullptr;
+        g_kv_ring_rows[layer]=g_kv_comp_cap[layer]=0;
+    }
+    dev_release(ng);}
 extern "C" Dsv4CudaActivation *dsv4_cuda_activation_create(int device,long long elements){Dev*c=ctx(device);if(!c||elements<1||!ok(cudaSetDevice(device),"select activation device"))return nullptr;Dsv4CudaActivation*a=(Dsv4CudaActivation*)calloc(1,sizeof(*a));if(!a)return nullptr;a->device=device;a->elements=elements;if(!alloc_ok(cudaMalloc(&a->data,(size_t)elements*sizeof(float)),"activation allocation")){free(a);return nullptr;}return a;}
 extern "C" void dsv4_cuda_activation_free(Dsv4CudaActivation*a){if(!a)return;cudaSetDevice(a->device);cudaFree(a->data);free(a);}
 extern "C" int dsv4_cuda_activation_upload(Dsv4CudaActivation*a,const float*x,long long n){Dev*c=a?ctx(a->device):nullptr;if(!c||!x||n<0||n>a->elements||!ok(cudaSetDevice(a->device),"select activation upload device"))return 0;return ok(cudaMemcpyAsync(a->data,x,(size_t)n*sizeof(float),cudaMemcpyHostToDevice,c->stream),"activation upload");}
@@ -1448,8 +1942,9 @@ extern "C" void dsv4_cuda_graph_free(Dsv4CudaGraph*g){if(!g)return;cudaSetDevice
  * c->stream does not wait for, and from pageable memory it may return before
  * the DMA has landed: a kernel queued on c->stream right after could read a
  * half-written decode mirror, and decode output then drifted with the mirror
- * cache's recycling timing (expert slabs past the 20 GiB page-lock cap,
- * or with DSV4_CUDA_PIN_HOST=0, are pageable). Same blocking contract for the caller as cudaMemcpy. */
+ * cache's recycling timing (expert slabs past DSV4_CUDA_PIN_CAP_GB, or all of
+ * them with DSV4_CUDA_PIN_HOST=0, are pageable). Same blocking contract for
+ * the caller as cudaMemcpy. */
 static int h2d(Dev*c,void*dst,const void*src,size_t n,const char*what){
     return ok(cudaMemcpyAsync(dst,src,n,cudaMemcpyHostToDevice,c->stream),what)&&ok(cudaStreamSynchronize(c->stream),what);}
 static int upload(Dsv4CudaTensor **pt,const void *w,size_t wb,const uint8_t *sc,size_t sb,int O,int I,int d,int fmt){if(*pt)return 1;Dev *c=ctx(d);if(!c||!ok(cudaSetDevice(d),"select upload device"))return 0;Dsv4CudaTensor *t=(Dsv4CudaTensor*)calloc(1,sizeof(*t));t->O=O;t->I=I;t->device=d;t->fmt=fmt;t->bytes=wb+sb;
@@ -1463,6 +1958,10 @@ static int upload(Dsv4CudaTensor **pt,const void *w,size_t wb,const uint8_t *sc,
 #endif
     *pt=t;return 1;}
 extern "C" int dsv4_cuda_upload_fp8(Dsv4CudaTensor **t,const uint8_t*w,const uint8_t*s,int O,int I,int d){return upload(t,w,(size_t)O*I,s,(size_t)((O+127)/128)*((I+127)/128),O,I,d,8);}
+extern "C" int dsv4_cuda_upload_fp8_ref(Dsv4CudaTensor **t,const uint8_t*w,const float*s,int O,int I,int packed,int d){
+    if(!t||!w||!s||O<1||I<1||I%128||(packed!=0&&packed!=1)||(packed&&O%8))return 0;
+    return upload(t,w,(size_t)O*I,(const uint8_t*)s,(size_t)((O+127)/128)*(I/128)*sizeof(float),O,I,d,packed?11:10);
+}
 extern "C" int dsv4_cuda_upload_fp8_bf16(Dsv4CudaTensor **t,const uint8_t*w,const uint8_t*s,int O,int I,int d){return upload(t,w,(size_t)O*I,s,(size_t)((O+127)/128)*((I+127)/128),O,I,d,9);}
 extern "C" int dsv4_cuda_upload_fp4(Dsv4CudaTensor **t,const uint8_t*w,const uint8_t*s,int O,int I,int d){if(!upload(t,w,(size_t)O*I/2,s,(size_t)O*I/32,O,I,d,4))return 0;
     return 1;}
@@ -1484,6 +1983,138 @@ extern "C" int dsv4_cuda_tensor_refill_fp4(Dsv4CudaTensor *t,const uint8_t*w,con
     return 1;
 }
 extern "C" int dsv4_cuda_upload_bf16(Dsv4CudaTensor **t,const uint16_t*w,int O,int I,int d){return upload(t,w,(size_t)O*I*2,nullptr,0,O,I,d,16);}
+__global__ void pack_bf16_rows32(uint16_t *out,const uint16_t *in,int O,int I){
+    long long p=(long long)blockIdx.x*blockDim.x+threadIdx.x;
+    if(p<(long long)O*I){int lane=p%32,col=(p/32)%I,row=(p/(32LL*I))*32+lane;out[p]=in[(long long)row*I+col];}
+}
+extern "C" int dsv4_cuda_upload_compressor(Dsv4CudaTensor **pt,const uint16_t *w,int O,int I,int device){
+    if(!pt||!w||O<1||I<1||O%32)return 0;
+    if(*pt)return (*pt)->fmt==16&&(*pt)->bf16_cache&&(*pt)->O==O&&(*pt)->I==I&&(*pt)->device==device;
+    Dsv4CudaTensor *t=nullptr;
+    if(!dsv4_cuda_upload_bf16(&t,w,O,I,device))return 0;
+    Dev *c=ctx(device);size_t bytes=(size_t)O*I*2;
+    /* upload() uses the default stream; packing runs on a nonblocking stream. */
+    if(!ok(cudaStreamSynchronize(nullptr),"compressor source upload sync")||
+       !ok(cudaMalloc(&t->bf16_cache,bytes),"compressor packed allocation")){dsv4_cuda_tensor_free(t);return 0;}
+    pack_bf16_rows32<<<((long long)O*I+255)/256,256,0,c->stream>>>((uint16_t*)t->bf16_cache,(const uint16_t*)t->w,O,I);
+    if(!ok(cudaGetLastError(),"compressor packing launch")||!ok(cudaStreamSynchronize(c->stream),"compressor packing sync")){dsv4_cuda_tensor_free(t);return 0;}
+    const char *verify=getenv("DSV4_IDX_VERIFY");
+    if(verify&&*verify&&*verify!='0'){
+        std::vector<uint16_t> packed((size_t)O*I);
+        if(!ok(cudaMemcpy(packed.data(),t->bf16_cache,bytes,cudaMemcpyDeviceToHost),"packed verification download")){dsv4_cuda_tensor_free(t);return 0;}
+        for(int row=0;row<O;row++)for(int col=0;col<I;col++)
+            if(packed[((size_t)(row/32)*I+col)*32+row%32]!=w[(size_t)row*I+col]){
+                fprintf(stderr,"packed verification mismatch device=%d O=%d I=%d row=%d col=%d\n",device,O,I,row,col);
+                dsv4_cuda_tensor_free(t);return 0;
+            }
+    }
+    t->bytes+=bytes;*pt=t;return 1;
+}
+
+extern "C" int dsv4_cuda_upload_head_exact(Dsv4CudaTensor **pt,const uint16_t *w,int O,int I,int device){
+    if(!pt||*pt||I<1||I%8)return 0;
+    Dsv4CudaTensor *t=nullptr;
+    if(!dsv4_cuda_upload_compressor(&t,w,O,I,device))return 0;
+    // The head only consumes the packed copy; discard the upload source.
+    if(!ok(cudaFree(t->w),"head source release")){dsv4_cuda_tensor_free(t);return 0;}
+    t->w=t->bf16_cache;t->bf16_cache=nullptr;t->fmt=12;t->bytes=(long long)O*I*2;
+    *pt=t;return 1;
+}
+__global__ void head_scores_exact(const __nv_bfloat16 *w,const float *x,float *out,int O,int I){
+    int row=blockIdx.x*blockDim.x+threadIdx.x;if(row>=O)return;
+    float sum=0.f;long long base=(long long)(row/32)*I*32+row%32;
+    for(int i=0;i<I;i++)sum=__fadd_rn(sum,__fmul_rn(__bfloat162float(w[base+(long long)i*32]),x[i]));
+    out[row]=sum;
+}
+extern "C" int dsv4_cuda_head_scores_exact(Dsv4CudaTensor *t,const float *input,float *scores){
+    Dev *c=t?ctx(t->device):nullptr;
+    if(!c||t->fmt!=12||!input||!scores||!ok(cudaSetDevice(t->device),"select head device"))return 0;
+    size_t xb=(size_t)t->I*sizeof(float),yb=(size_t)t->O*sizeof(float);
+    if(!buf((void**)&c->dx,&c->xcap,xb)||!buf((void**)&c->dy,&c->ycap,yb))return 0;
+    int success=ok(cudaMemcpyAsync(c->dx,input,xb,cudaMemcpyHostToDevice,c->stream),"head input upload");
+    if(success){
+        head_scores_exact<<<(t->O+127)/128,128,0,c->stream>>>((__nv_bfloat16*)t->w,c->dx,c->dy,t->O,t->I);
+        success=ok(cudaGetLastError(),"head scores launch")&&
+            ok(cudaMemcpyAsync(scores,c->dy,yb,cudaMemcpyDeviceToHost,c->stream),"head scores download");
+    }
+    int drained=ok(cudaStreamSynchronize(c->stream),"head scores sync");
+    return success&&drained;
+}
+
+// Four independent sums reuse each weight without changing column order.
+__global__ void head_scores_batch_exact(const __nv_bfloat16 *w,const float *x,float *out,int O,int I,int batch){
+    int row=blockIdx.x*blockDim.x+threadIdx.x,first=blockIdx.y*4;
+    if(row>=O)return;
+    float sums[4]={0.f,0.f,0.f,0.f};
+    long long base=(long long)(row/32)*I*32+row%32;
+    for(int i=0;i<I;i++){
+        float weight=__bfloat162float(w[base+(long long)i*32]);
+        #pragma unroll
+        for(int j=0;j<4;j++)if(first+j<batch)
+            sums[j]=__fadd_rn(sums[j],__fmul_rn(weight,x[(size_t)(first+j)*I+i]));
+    }
+    #pragma unroll
+    for(int j=0;j<4;j++)if(first+j<batch)out[(size_t)(first+j)*O+row]=sums[j];
+}
+
+__global__ void head_first_argmax(const float *scores,int vocab,int *ids,float *values){
+    __shared__ float maxima[256];
+    __shared__ int winners[256];
+    int lane=threadIdx.x,winner=-1;
+    float maximum=-FLT_MAX;
+    for(int row=lane;row<vocab;row+=blockDim.x){
+        float value=scores[(size_t)blockIdx.x*vocab+row];
+        if(value>maximum){maximum=value;winner=row;}
+    }
+    maxima[lane]=maximum;winners[lane]=winner;
+    __syncthreads();
+    for(int stride=128;stride;stride/=2){
+        if(lane<stride){
+            float other=maxima[lane+stride];int id=winners[lane+stride];
+            if(id>=0&&(other>maxima[lane]||
+               (other==maxima[lane]&&(winners[lane]<0||id<winners[lane])))){
+                maxima[lane]=other;winners[lane]=id;
+            }
+        }
+        __syncthreads();
+    }
+    if(!lane){ids[blockIdx.x]=winners[0];values[blockIdx.x]=maxima[0];}
+}
+
+static int head_batch_exact(Dsv4CudaTensor *t,const float *input,int batch,
+                            float *scores,int *ids,float *values){
+    if(!t||t->fmt!=12||!input||batch<1||batch>128||
+       (!scores&&(!ids||!values)))return 0;
+    Dev *c=ctx(t->device);
+    if(!c||!ok(cudaSetDevice(t->device),"select batched head device"))return 0;
+    size_t xb=(size_t)batch*t->I*sizeof(float),yb=(size_t)batch*t->O*sizeof(float);
+    if(!buf((void**)&c->dx,&c->xcap,xb)||!buf((void**)&c->dy,&c->ycap,yb))return 0;
+    if(!scores&&(!buf((void**)&c->p1,&c->p1cap,(size_t)batch*sizeof(int))||
+                !buf((void**)&c->p2,&c->p2cap,(size_t)batch*sizeof(float))))return 0;
+    int success=ok(cudaMemcpyAsync(c->dx,input,xb,cudaMemcpyHostToDevice,c->stream),"batch head input upload");
+    if(success){
+        head_scores_batch_exact<<<dim3((t->O+127)/128,(batch+3)/4),128,0,c->stream>>>(
+            (const __nv_bfloat16*)t->w,c->dx,c->dy,t->O,t->I,batch);
+        success=ok(cudaGetLastError(),"batch head scores launch");
+    }
+    if(success&&scores)
+        success=ok(cudaMemcpyAsync(scores,c->dy,yb,cudaMemcpyDeviceToHost,c->stream),"batch head scores download");
+    else if(success){
+        head_first_argmax<<<batch,256,0,c->stream>>>(c->dy,t->O,(int*)c->p1,c->p2);
+        success=ok(cudaGetLastError(),"batch head argmax launch")&&
+            ok(cudaMemcpyAsync(ids,c->p1,(size_t)batch*sizeof(int),cudaMemcpyDeviceToHost,c->stream),"batch head ids download")&&
+            ok(cudaMemcpyAsync(values,c->p2,(size_t)batch*sizeof(float),cudaMemcpyDeviceToHost,c->stream),"batch head values download");
+    }
+    int drained=ok(cudaStreamSynchronize(c->stream),"batch head drain");
+    return success&&drained;
+}
+extern "C" int dsv4_cuda_head_scores_batch_exact(Dsv4CudaTensor *t,const float *input,int batch,float *scores){
+    return scores&&head_batch_exact(t,input,batch,scores,nullptr,nullptr);
+}
+extern "C" int dsv4_cuda_head_argmax_batch_exact(Dsv4CudaTensor *t,const float *input,int batch,int *ids,float *values){
+    return head_batch_exact(t,input,batch,nullptr,ids,values);
+}
+
 extern "C" int dsv4_cuda_upload_f32(Dsv4CudaTensor **t,const float*w,int O,int I,int d){return upload(t,w,(size_t)O*I*4,nullptr,0,O,I,d,32);}
 extern "C" int dsv4_cuda_mhc_pre(const Dsv4CudaActivation*r,Dsv4CudaTensor*fn,Dsv4CudaTensor*scale,Dsv4CudaTensor*base,int M,int H,float rms_eps,float pre_eps,float sink_eps,float post_mult,int sink_iters,Dsv4CudaActivation*state,Dsv4CudaActivation*input){
     int N=2*M+M*M,MH=M*H;Dev*c=r?ctx(r->device):nullptr;if(!c||!fn||!scale||!base||!state||!input||fn->fmt!=32||scale->fmt!=32||base->fmt!=32||fn->device!=r->device||scale->device!=r->device||base->device!=r->device||state->device!=r->device||input->device!=r->device||r->elements<MH||fn->O!=N||fn->I!=MH||scale->O*scale->I<3||base->O*base->I<N||state->elements<M+M*M+M||input->elements<H||!ok(cudaSetDevice(r->device),"select mHC device")||!buf((void**)&c->p1,&c->p1cap,(size_t)N*4))return 0;
@@ -1815,7 +2446,11 @@ extern "C" int dsv4_cuda_route(const Dsv4CudaActivation*input,Dsv4CudaTensor*gat
     Dev*c=input?ctx(input->device):nullptr;if(!c||!gate||!ids||!weights||gate->fmt!=32||gate->O!=256||gate->I>input->elements||gate->device!=input->device||(bias&&(bias->fmt!=32||bias->O*bias->I<256||bias->device!=input->device))||!ok(cudaSetDevice(input->device),"select router device")||!buf((void**)&c->p1,&c->p1cap,256*4)||!buf((void**)&c->expert_weights,&c->expert_weightscap,6*4)||!buf((void**)&c->expert_ids,&c->expert_idcap,6*sizeof(int)))return 0;
     mv_f32<<<256,256,0,c->stream>>>((float*)gate->w,input->data,c->p1,256,gate->I);if(!ok(cudaMemsetAsync(c->expert_ids,0,6*sizeof(int),c->stream),"router ids clear")||(fixed&&!ok(cudaMemcpyAsync(c->expert_ids,fixed,6*sizeof(int),cudaMemcpyHostToDevice,c->stream),"router fixed ids upload")))return 0;route_top6_serial<<<1,1,0,c->stream>>>(c->expert_ids,c->expert_weights,bias?(float*)bias->w:nullptr,c->p1,fixed!=nullptr,scale);
     return ok(cudaGetLastError(),"router launch")&&ok(cudaMemcpyAsync(ids,c->expert_ids,6*sizeof(int),cudaMemcpyDeviceToHost,c->stream),"router ids download")&&ok(cudaMemcpyAsync(weights,c->expert_weights,6*sizeof(float),cudaMemcpyDeviceToHost,c->stream),"router weights download")&&ok(cudaStreamSynchronize(c->stream),"router sync");}
-extern "C" int dsv4_cuda_matvec_grouped(Dsv4CudaTensor *t,float *y,const float*x,int groups){Dev*c=t?ctx(t->device):nullptr;if(!c||groups<1||t->O%groups||!ok(cudaSetDevice(t->device),"select matvec device"))return 0;size_t xb=(size_t)t->I*groups*4,yb=(size_t)t->O*4;
+/* A tensor on a latched-off peer is refused before any CUDA call (the CPU
+ * reference takes over), so no work lands on that device and no error is
+ * left behind for the next call on the primary. */
+extern "C" int dsv4_cuda_matvec_grouped(Dsv4CudaTensor *t,float *y,const float*x,int groups){Dev*c=t?ctx(t->device):nullptr;if(!c||dev_lost(t->device)||groups<1||t->O%groups||!ok(cudaSetDevice(t->device),"select matvec device"))return 0;size_t xb=(size_t)t->I*groups*4,yb=(size_t)t->O*4;
+    if(t->fmt!=4&&t->fmt!=8&&t->fmt!=9&&t->fmt!=16&&t->fmt!=32)return 0;
     if(!buf((void**)&c->dx,&c->xcap,xb)||!buf((void**)&c->dy,&c->ycap,yb))return 0;
     if(!ok(cudaMemcpyAsync(c->dx,x,xb,cudaMemcpyHostToDevice,c->stream),"activation upload"))return 0;
     if(t->fmt==8)run_mv<8>((uint8_t*)t->w,t->scale,c->dx,c->dy,t->O,t->I,groups,c->stream);
@@ -1824,7 +2459,74 @@ extern "C" int dsv4_cuda_matvec_grouped(Dsv4CudaTensor *t,float *y,const float*x
     else if(t->fmt==32)mv_f32<<<t->O,256,0,c->stream>>>((float*)t->w,c->dx,c->dy,t->O,t->I);
     else mv_bf16<<<t->O,256,0,c->stream>>>((__nv_bfloat16*)t->w,c->dx,c->dy,t->O,t->I);
     return ok(cudaGetLastError(),"matvec launch")&&ok(cudaMemcpyAsync(y,c->dy,yb,cudaMemcpyDeviceToHost,c->stream),"result download")&&ok(cudaStreamSynchronize(c->stream),"matvec sync");}
+extern "C" int dsv4_cuda_wo_decode(Dsv4CudaTensor *wa,Dsv4CudaTensor *wb,int groups,float *out,const float *context){
+    Dev *c=wa?ctx(wa->device):nullptr;
+    if(!c||!wb||!out||!context||groups<1||wa->O<1||wa->I<1||wb->O<1||wa->O%groups||
+       (wa->fmt!=8&&wa->fmt!=9)||wb->fmt!=8||wb->device!=wa->device||wb->I!=wa->O||
+       !ok(cudaSetDevice(wa->device),"select decode output device"))return 0;
+    size_t cb=(size_t)wa->I*groups*sizeof(float),rb=(size_t)wa->O*sizeof(float),hb=(size_t)wb->O*sizeof(float);
+    if(!buf((void**)&c->dx,&c->xcap,cb)||!buf((void**)&c->p1,&c->p1cap,rb)||
+       !buf((void**)&c->dy,&c->ycap,hb))return 0;
+    int success=ok(cudaMemcpyAsync(c->dx,context,cb,cudaMemcpyHostToDevice,c->stream),"decode output upload");
+    if(success){
+        if(wa->fmt==9)run_mv<9>((uint8_t*)wa->w,wa->scale,c->dx,c->p1,wa->O,wa->I,groups,c->stream);
+        else run_mv<8>((uint8_t*)wa->w,wa->scale,c->dx,c->p1,wa->O,wa->I,groups,c->stream);
+        bf16_round<<<(wa->O+255)/256,256,0,c->stream>>>(c->p1,wa->O);
+        run_mv<8>((uint8_t*)wb->w,wb->scale,c->p1,c->dy,wb->O,wb->I,1,c->stream);
+        bf16_round<<<(wb->O+255)/256,256,0,c->stream>>>(c->dy,wb->O);
+        success=ok(cudaGetLastError(),"decode output launch")&&
+            ok(cudaMemcpyAsync(out,c->dy,hb,cudaMemcpyDeviceToHost,c->stream),"decode output download");
+    }
+    // Drain even on failure before the caller reuses host input/output in fallback.
+    int drained=ok(cudaStreamSynchronize(c->stream),"decode output sync");
+    return success&&drained;
+}
 extern "C" int dsv4_cuda_matvec(Dsv4CudaTensor*t,float*y,const float*x){return dsv4_cuda_matvec_grouped(t,y,x,1);}
+/* V4_ATTN_BATCH_PROJ (optional export): up to 6 decode fp8 matvecs over the same input x
+ * in ONE device round trip: one x upload, one run_mv<8> per tensor (the kernel
+ * dsv4_cuda_matvec uses, groups=1), one D2H of all outputs into stage (output i at
+ * the sum of rows[0..i-1]), one sync. Each output is therefore bit-identical to the
+ * per-call dsv4_cuda_matvec. Refuses (0) anything else; the caller then runs the
+ * per-call path. Output buffers are per device (index = position in g). */
+static float *pj_out[16];static size_t pj_cap[16];
+extern "C" int dsv4_cuda_proj_batch(int n,Dsv4CudaTensor*const*t,const int*rows,const float*x,float*stage){
+    if(n<1||n>6||!t||!rows||!x||!stage||!t[0])return 0;
+    int d=t[0]->device,I=t[0]->I;size_t total=0;
+    if(I<1)return 0;
+    for(int i=0;i<n;i++){
+        if(!t[i]||t[i]->device!=d||t[i]->I!=I||t[i]->O!=rows[i]||rows[i]<1||t[i]->fmt!=8)return 0;
+        total+=(size_t)rows[i];
+    }
+    Dev*c=ctx(d);if(!c||!ok(cudaSetDevice(d),"select proj batch device"))return 0;
+    int gi=(int)(c-g);
+    size_t need=total*sizeof(float);
+    if(pj_cap[gi]<need){
+        if(pj_out[gi]&&!ok(cudaFree(pj_out[gi]),"proj batch free"))return 0;
+        pj_out[gi]=nullptr;pj_cap[gi]=0;
+        if(!alloc_ok(cudaMalloc((void**)&pj_out[gi],need),"proj batch buffer"))return 0;
+        pj_cap[gi]=need;
+    }
+    float *out=pj_out[gi];
+    if(!buf((void**)&c->dx,&c->xcap,(size_t)I*sizeof(float)))return 0;
+    int good=ok(cudaMemcpyAsync(c->dx,x,(size_t)I*sizeof(float),cudaMemcpyHostToDevice,c->stream),"proj batch upload");
+    size_t off=0;
+    for(int i=0;good&&i<n;i++){
+        run_mv<8>((uint8_t*)t[i]->w,t[i]->scale,c->dx,out+off,t[i]->O,I,1,c->stream);
+        off+=(size_t)rows[i];
+    }
+    good=good&&ok(cudaGetLastError(),"proj batch launch")&&
+         ok(cudaMemcpyAsync(stage,out,need,cudaMemcpyDeviceToHost,c->stream),"proj batch download");
+    int drained=ok(cudaStreamSynchronize(c->stream),"proj batch sync");
+    return good&&drained;
+}
+/* Engine close: frees the per-device proj batch output buffers (each on its own device). */
+extern "C" void dsv4_cuda_proj_batch_release(void){
+    for(int i=0;i<16;i++){
+        if(!pj_out[i])continue;
+        cudaSetDevice(g[i].id);cudaFree(pj_out[i]);
+        pj_out[i]=nullptr;pj_cap[i]=0;
+    }
+}
 extern "C" int dsv4_cuda_matmul_batch(Dsv4CudaTensor*t,const Dsv4CudaActivation*input,int tokens,Dsv4CudaActivation*output){
     Dev*c=t?ctx(t->device):nullptr;if(!c||!input||!output||tokens<1||input->device!=t->device||output->device!=t->device||
        input->elements<(long long)tokens*t->I||output->elements<(long long)tokens*t->O||!ok(cudaSetDevice(t->device),"select batched dense device"))return 0;
@@ -1901,8 +2603,8 @@ static int tc_fp4_matvec(Dev*c,Dsv4CudaTensor*t,float*y){int O=t->O,I=t->I;size_
 extern "C" int dsv4_cuda_expert_group(Dsv4CudaTensor *const *gate,Dsv4CudaTensor *const *up,Dsv4CudaTensor *const *down,
         const float *weights,int count,float limit,float *y,const float *x){
     if(count<1||count>16||!gate||!up||!down)return 0;Dsv4CudaTensor *t=gate[0];Dev*c=t?ctx(t->device):nullptr;
-    if(!c||t->fmt!=4||!ok(cudaSetDevice(t->device),"select expert-group device"))return 0;int H=t->I,I=t->O;
-    for(int e=0;e<count;e++)if(!gate[e]||!up[e]||!down[e]||gate[e]->device!=t->device||up[e]->device!=t->device||down[e]->device!=t->device||gate[e]->fmt!=4||up[e]->fmt!=4||down[e]->fmt!=4||gate[e]->I!=H||gate[e]->O!=I||up[e]->I!=H||up[e]->O!=I||down[e]->I!=I||down[e]->O!=H)return 0;
+    if(!c||dev_lost(t->device)||t->fmt!=4||!ok(cudaSetDevice(t->device),"select expert-group device"))return 0;int H=t->I,I=t->O;
+    for(int e=0;e<count;e++)if(!gate[e]||!up[e]||!down[e]||!dev_ok(t->device,gate[e]->device)||!dev_ok(t->device,up[e]->device)||!dev_ok(t->device,down[e]->device)||gate[e]->fmt!=4||up[e]->fmt!=4||down[e]->fmt!=4||gate[e]->I!=H||gate[e]->O!=I||up[e]->I!=H||up[e]->O!=I||down[e]->I!=I||down[e]->O!=H)return 0;
     size_t xb=(size_t)H*4,ib=(size_t)count*I*4,hb=(size_t)count*H*4;
     if(!buf((void**)&c->dx,&c->xcap,xb)||!buf((void**)&c->dy,&c->ycap,(size_t)H*4)||
        !buf((void**)&c->p1,&c->p1cap,ib)||!buf((void**)&c->p2,&c->p2cap,ib)||
@@ -1956,29 +2658,291 @@ extern "C" int dsv4_cuda_expert_fp8(Dsv4CudaTensor *gate,Dsv4CudaTensor *up,Dsv4
     expert_reduce<<<(H+255)/256,256,0,c->stream>>>(c->dy,c->p4,1,H);
     return ok(cudaGetLastError(),"shared-expert launch")&&ok(cudaMemcpyAsync(y,c->dy,hb,cudaMemcpyDeviceToHost,c->stream),"shared-expert result download")&&ok(cudaStreamSynchronize(c->stream),"shared-expert sync");
 }
-extern "C" int dsv4_cuda_moe(Dsv4CudaTensor *const *gate,Dsv4CudaTensor *const *up,Dsv4CudaTensor *const *down,
-        const float *weights,int count,Dsv4CudaTensor *sg,Dsv4CudaTensor *su,Dsv4CudaTensor *sd,float limit,float *y,const float *x){
-    if(count<1||count>16||!gate||!up||!down||!sg||!su||!sd)return 0;Dsv4CudaTensor*t=gate[0];Dev*c=t?ctx(t->device):nullptr;
-    if(!c||t->fmt!=4||sg->device!=t->device||su->device!=t->device||sd->device!=t->device||sg->fmt!=8||su->fmt!=8||sd->fmt!=8||!ok(cudaSetDevice(t->device),"select MoE device"))return 0;
-    int H=t->I,I=t->O;if(sg->I!=H||sg->O!=I||su->I!=H||su->O!=I||sd->I!=I||sd->O!=H)return 0;
-    for(int e=0;e<count;e++)if(!gate[e]||!up[e]||!down[e]||gate[e]->device!=t->device||up[e]->device!=t->device||down[e]->device!=t->device||gate[e]->fmt!=4||up[e]->fmt!=4||down[e]->fmt!=4)return 0;
+/* Fused decode MoE (DSV4_CUDA_MOE_FUSED6=1, opt-in): when the six routed FP4 experts
+ * and the FP8 shared expert of a layer are device mirrors of the decode shape
+ * (6 experts, H=4096, I=2048), one cooperative launch over every SM does gate/up,
+ * SwiGLU with the clamp, the fp8 activation round trip, down and the combine, with
+ * two grid barriers between the phases, instead of dsv4_cuda_moe's launch sequence.
+ * Each output keeps the launch sequence's arithmetic and order (tests/
+ * test_dsv4_fused6_cuda.cu compares the two bit for bit). Any other shape, or a
+ * device without cooperative launch, takes the launch sequence. */
+struct V4FBar { unsigned arrive; unsigned pad0[31]; unsigned gen; unsigned pad1[31]; };
+/* Grid barrier for a cooperative launch: the last block to arrive bumps the generation. */
+__device__ __forceinline__ void v4f_bar_sync(V4FBar* b,unsigned n){
+    __syncthreads();
+    if(threadIdx.x==0){ volatile unsigned* vg=&b->gen; unsigned g=*vg; __threadfence();
+        if(atomicAdd(&b->arrive,1u)==n-1u){ atomicExch(&b->arrive,0u); __threadfence(); atomicAdd(&b->gen,1u); }
+        else { while(*vg==g){} }
+        __threadfence(); }
+    __syncthreads();
+}
+__device__ __forceinline__ float v4f_bfr(float v){ return __bfloat162float(__float2bfloat16(v)); }
+__device__ __forceinline__ float v4f_act_fn(float g,float u,float w,float limit){ float gg=fminf(v4f_bfr(g),limit); float uu=fmaxf(-limit,fminf(v4f_bfr(u),limit));
+    return v4f_bfr(w*(gg/(1.f+expf(-gg)))*uu); }
+__device__ __forceinline__ float v4f_e8f(unsigned b){ return b? __uint_as_float(b<<23) : __uint_as_float(0x00400000u); }
+/* A warp's row dot in the order of the launch sequence's 256-thread matvecs
+ * (mv_fp4_grouped for the routed experts, mv<8> for the shared one): partial j sums
+ * i = j, j+256, ... in order, then the shared-memory tree s[j] += s[j+n] for
+ * n = 128, 64, ..., 1. Lane l holds the partials j = 8l .. 8l+7, so each step m reads
+ * the eight contiguous weights m + 8l .. m + 8l + 7 with one vector load. The tree's
+ * steps 128..8 pair the same register of lanes l and l + n/8 (shuffles), 4, 2, 1 pair
+ * registers inside lane 0. Every output gets the same operands in the same order. */
+__device__ __forceinline__ float v4f_tree(float p[8]){
+    #pragma unroll
+    for(int k=16;k;k>>=1){
+        #pragma unroll
+        for(int r=0;r<8;r++)p[r]=__fadd_rn(p[r],__shfl_down_sync(0xffffffffu,p[r],k));}
+    p[0]=__fadd_rn(p[0],p[4]);p[1]=__fadd_rn(p[1],p[5]);p[2]=__fadd_rn(p[2],p[6]);p[3]=__fadd_rn(p[3],p[7]);
+    p[0]=__fadd_rn(p[0],p[2]);p[1]=__fadd_rn(p[1],p[3]);
+    return __fadd_rn(p[0],p[1]);}
+/* The decodes give the same values as e4m3() and e8_table: the hardware e4m3
+ * conversion is exact, and the scale is 2^(b-127) (2^-127 for b = 0) from its bits. */
+__device__ __forceinline__ float v4f_e4m3(unsigned b){
+    __half_raw r=__nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)(b&0xFFu),__NV_E4M3);return __half2float(__half(r));}
+/* fp8 e4m3 row, 128x128 UE8M0 blocks (srow: the row's block-row of scales): mv<8>'s
+ * sum += x * (e4m3 * e8), which nvcc contracts to one fma. */
+__device__ __forceinline__ float v4f_dot_fp8(const uint8_t* __restrict__ w,const uint8_t* __restrict__ srow,const float* xs,int I,int lane){
+    float p[8]={0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+    for(int m=0;m<I;m+=256){
+        int i=m+8*lane;
+        uint2 u=__ldcs((const uint2*)(w+i));
+        float sc=v4f_e8f(__ldg(srow+(i>>7)));
+        const float4 *xp=(const float4*)(xs+i); float4 xa=xp[0],xb=xp[1];
+        const float xv[8]={xa.x,xa.y,xa.z,xa.w,xb.x,xb.y,xb.z,xb.w};
+        #pragma unroll
+        for(int r=0;r<8;r++){unsigned byte=(r<4?u.x:u.y)>>(8*(r&3));
+            p[r]=__fmaf_rn(xv[r],__fmul_rn(v4f_e4m3(byte),sc),p[r]);}}
+    return v4f_tree(p);}
+/* fp4 row, a UE8M0 scale per 32 weights (srow: the row's scales): mv_fp4_grouped's
+ * sum += x * f4 * e8, i.e. (x * f4) rounded, then times the power of two (exact).
+ * lut holds f4()'s sixteen values (code 8 is -0) in shared memory. */
+__device__ __forceinline__ float v4f_dot_fp4(const uint8_t* __restrict__ w,const uint8_t* __restrict__ srow,const float* xs,const float* lut,int I,int lane){
+    float p[8]={0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+    for(int m=0;m<I;m+=256){
+        int i=m+8*lane;
+        unsigned u=__ldcs((const unsigned*)(w+(i>>1)));
+        float sc=v4f_e8f(__ldg(srow+(i>>5)));
+        const float4 *xp=(const float4*)(xs+i); float4 xa=xp[0],xb=xp[1];
+        const float xv[8]={xa.x,xa.y,xa.z,xa.w,xb.x,xb.y,xb.z,xb.w};
+        #pragma unroll
+        for(int r=0;r<8;r++)p[r]=__fadd_rn(p[r],__fmul_rn(__fmul_rn(xv[r],lut[(u>>(4*r))&15]),sc));}
+    return v4f_tree(p);}
+/* one block's quantization of a 2048-row like fp8_sim (RNE e4m3 incl. ties, == e4m3_round) */
+__device__ void v4f_block_fp8_sim(const float* src,float* dst,float* scl){
+    const int lane=threadIdx.x&31, wid=threadIdx.x>>5;
+    for(int i=threadIdx.x;i<2048;i+=blockDim.x) dst[i]=__ldcg(src+i);
+    __syncthreads();
+    if(wid<16){ float m=0.f; for(int j=lane;j<128;j+=32) m=fmaxf(m,fabsf(dst[wid*128+j]));
+        #pragma unroll
+        for(int o=16;o;o>>=1) m=fmaxf(m,__shfl_xor_sync(0xffffffffu,m,o));
+        if(!lane){ m=fmaxf(m,1e-4f); float raw=m/448.f; int e; frexpf(raw,&e); float sc=ldexpf(1.f,e-1); if(sc<raw) sc*=2.f; scl[wid]=sc; } }
+    __syncthreads();
+    for(int i=threadIdx.x;i<2048;i+=blockDim.x){ float sc=scl[i>>7]; float q=fmaxf(-448.f,fminf(448.f,dst[i]/sc));
+        __nv_fp8_storage_t c=__nv_cvt_float_to_fp8(q,__NV_SATFINITE,__NV_E4M3); __half_raw hr=__nv_cvt_fp8_to_halfraw(c,__NV_E4M3); __half h(hr);
+        dst[i]=v4f_bfr(__half2float(h)*sc); }
+    __syncthreads();
+}
+struct V4FMoeExp { const uint8_t *w1,*s1,*w3,*s3,*w2,*s2; float weight; int fp8; };
+struct V4FMoeArgs { V4FMoeExp e[7]; const float* x; float* act; float* parts; float* y; V4FBar* bar; float limit; };
+/* e[0..5]: routed FP4 experts, e[6]: the FP8 shared expert. Work is split evenly over
+ * every warp of the grid; a shared-expert row counts twice (an fp8 row reads twice the
+ * bytes of an fp4 row), so the odd units of its range are skipped. */
+__global__ void __launch_bounds__(1024,1) v4f_moe_kernel(V4FMoeArgs a){
+    __shared__ __align__(16) float xs[4096]; __shared__ __align__(16) float aq[2][2048]; __shared__ float lut[16]; __shared__ float scl[16];
+    const int lane=threadIdx.x&31, wid=threadIdx.x>>5, nw=1024/32; const int nb=gridDim.x, b=blockIdx.x;
+    if(threadIdx.x<16){ const float t[16]={0,.5f,1,1.5f,2,3,4,6,-0.f,-.5f,-1,-1.5f,-2,-3,-4,-6}; lut[threadIdx.x]=t[threadIdx.x]; }
+    for(int i=threadIdx.x*4;i<4096;i+=1024*4) *(float4*)(xs+i)=__ldg((const float4*)(a.x+i));
+    __syncthreads();
+    auto gate_up=[&](int k,int o){ const V4FMoeExp& E=a.e[k]; float g,u;
+        if(E.fp8){ g=v4f_dot_fp8(E.w1+(size_t)o*4096,E.s1+(o/128)*32,xs,4096,lane); u=v4f_dot_fp8(E.w3+(size_t)o*4096,E.s3+(o/128)*32,xs,4096,lane); }
+        else { g=v4f_dot_fp4(E.w1+(size_t)o*2048,E.s1+(size_t)o*128,xs,lut,4096,lane); u=v4f_dot_fp4(E.w3+(size_t)o*2048,E.s3+(size_t)o*128,xs,lut,4096,lane); }
+        if(!lane) a.act[k*2048+o]=v4f_act_fn(g,u,E.weight,a.limit); };
+    auto down=[&](int k,int o,const float* aqk){ const V4FMoeExp& E=a.e[k]; float p;
+        if(E.fp8) p=v4f_dot_fp8(E.w2+(size_t)o*2048,E.s2+(o/128)*16,aqk,2048,lane);
+        else p=v4f_dot_fp4(E.w2+(size_t)o*1024,E.s2+(size_t)o*64,aqk,lut,2048,lane);
+        if(!lane) a.parts[k*4096+o]=p; };
+    const int W=nb*nw, gw=b*nw+wid;
+    { const int C=8*2048; const int u0=(int)((long long)C*gw/W), u1=(int)((long long)C*(gw+1)/W);
+      for(int u=u0;u<u1;u++){ if(u<12288) gate_up(u>>11,u&2047); else { int v=u-12288; if(!(v&1)) gate_up(6,v>>1); } } }
+    v4f_bar_sync(a.bar,(unsigned)nb);
+    /* A block's warps span at most two experts' down rows: quantize those activations once. */
+    { const int C=8*4096; const int bu0=(int)((long long)C*(b*nw)/W), bu1=(int)((long long)C*((b+1)*nw)/W);
+      auto kof=[](int u){ return u<24576? (u>>12) : 6; };
+      const int k0=kof(bu0), k1=kof(bu1>bu0? bu1-1 : bu0);
+      v4f_block_fp8_sim(a.act+k0*2048,aq[0],scl); if(k1!=k0) v4f_block_fp8_sim(a.act+k1*2048,aq[1],scl);
+      const int u0=(int)((long long)C*gw/W), u1=(int)((long long)C*(gw+1)/W);
+      for(int u=u0;u<u1;u++){ int k,o; if(u<24576){ k=u>>12; o=u&4095; } else { int v=u-24576; if(v&1) continue; o=v>>1; k=6; }
+        down(k,o,k==k0? aq[0] : aq[1]); } }
+    v4f_bar_sync(a.bar,(unsigned)nb);
+    for(int o=b*1024+threadIdx.x;o<4096;o+=nb*1024){ float v=0.f;
+        #pragma unroll
+        for(int k=0;k<6;k++) v+=v4f_bfr(__ldcg(a.parts+k*4096+o));
+        a.y[o]=v4f_bfr(v+v4f_bfr(__ldcg(a.parts+6*4096+o))); }
+}
+
+/* Peer-compute failures. pstep keeps a peer step's first error; peer_fail
+ * drains the peer and peer_latch reports the error once, with the device, as
+ * it latches the peer off. peer_drain waits out what was queued on the peer,
+ * so no peer kernel still writes this device's p4 when it is reused, and
+ * clears the error the step left. */
+static bool pstep(cudaError_t e,const char*s,const char**why,cudaError_t*err){if(e==cudaSuccess)return true;if(!*why){*why=s;*err=e;}return false;}
+static bool peer_drain(Dev*pc,int home){bool fine=cudaSetDevice(pc->id)==cudaSuccess&&cudaStreamSynchronize(pc->stream)==cudaSuccess;cudaSetDevice(home);cudaGetLastError();return fine;}
+/* DSV4_CUDA_PEER_FAULT=n[:lost|:sticky] (tests): the n-th peer-compute pass
+ * fails at its join, after the peer's kernels ran. By default with an error
+ * the devices survive (a launch out of resources), so the peer is latched off
+ * and the call recomputes on the primary; with :lost the peer also counts as
+ * unreadable; with :sticky the error is a kernel fault's (a launch failure),
+ * which latches CUDA off for the whole process (cuda_lost), as a real one
+ * does, without a fault on the device. One stderr line says when it fired. */
+static bool peer_fault(bool*lost,cudaError_t*err){
+    static long at=-1,n;static bool gone,stk;
+    if(at<0){const char*e=getenv("DSV4_CUDA_PEER_FAULT");at=e&&*e?atol(e):0;gone=e&&strstr(e,":lost");stk=e&&strstr(e,":sticky");}
+    if(at<=0||++n!=at)return false;*lost=gone||stk;*err=stk?cudaErrorLaunchFailure:cudaErrorLaunchOutOfResources;
+    fprintf(stderr,"[DSV4 CUDA] DSV4_CUDA_PEER_FAULT: peer-compute pass #%ld fails%s\n",at,stk?", a sticky fault":gone?", device lost":"");return true;}
+/* Latch the peer off; peer_latch is for a peer already drained (alive: it
+ * drained). -1: it still answers (an allocation or launch failure), so its
+ * mirrors are readable and the caller computes their experts here, reading
+ * them in place; 0: a sticky fault, its memory is not read again and the
+ * caller must fall back to host copies. */
+static int peer_latch(Dev*pc,int home,const char*why,cudaError_t err,bool alive){int d=pc->id;
+    if(d>=0&&d<16&&!g_peer_lost[d]){g_peer_lost[d]=1;
+        if(sticky(err))
+            fprintf(stderr,"[DSV4 CUDA] peer device %d failed in the decode MoE (%s: %s); latched off. The fault is sticky, "
+                           "so device %d's context is lost with it: see the next line\n",d,why?why:"peer step",cudaGetErrorString(err),home);
+        else
+            fprintf(stderr,"[DSV4 CUDA] peer device %d failed in the decode MoE (%s: %s); latched off, decode continues on device %d%s\n",
+                    d,why?why:"peer step",cudaGetErrorString(err),home,alive?"":" (its memory is no longer read)");}
+    if(sticky(err))cuda_lost(why?why:"peer step",err);
+    return alive?-1:0;}
+static int peer_fail(Dev*pc,int home,const char*why,cudaError_t err,bool lost){return peer_latch(pc,home,why,err,peer_drain(pc,home)&&!lost);}
+/* One pass of dsv4_cuda_moe on c. With peer, experts mirrored on a device
+ * peer_runs() accepts run there. 1 = done, 0 = failed, -1 = the peer failed
+ * but still answers: run again without peer, which computes its experts here
+ * from the same mirrors (bit-identical). Every exit after peer work was
+ * queued drains the peer first. */
+
+static int moe_once(Dsv4CudaTensor *const *gate,Dsv4CudaTensor *const *up,Dsv4CudaTensor *const *down,const float *weights,int count,
+        Dsv4CudaTensor *sg,Dsv4CudaTensor *su,Dsv4CudaTensor *sd,float limit,float *y,const float *x,Dev*c,int H,int I,bool peer){
     size_t hb=(size_t)H*4,ib=(size_t)count*I*4,parts=(size_t)count*H*4;
     if(!buf((void**)&c->dx,&c->xcap,hb)||!buf((void**)&c->dy,&c->ycap,hb)||!buf((void**)&c->p1,&c->p1cap,ib)||
        !buf((void**)&c->p2,&c->p2cap,ib)||!buf((void**)&c->p3,&c->p3cap,ib)||!buf((void**)&c->p4,&c->p4cap,parts)||
        !ok(cudaMemcpyAsync(c->dx,x,hb,cudaMemcpyHostToDevice,c->stream),"MoE activation upload"))return 0;
-    static int batched=-1;if(batched<0)batched=getenv("DSV4_CUDA_BATCHED")?atoi(getenv("DSV4_CUDA_BATCHED")):1;
-    if(batched){MvDesc hd[32];for(int e=0;e<count;e++){hd[2*e]={(uint8_t*)gate[e]->w,gate[e]->scale,c->dx,c->p1+(long long)e*I};hd[2*e+1]={(uint8_t*)up[e]->w,up[e]->scale,c->dx,c->p2+(long long)e*I};}
-        if(!buf((void**)&c->mvdesc,&c->mvdesccap,(size_t)2*count*sizeof(*hd))||!buf((void**)&c->expert_weights,&c->expert_weightscap,(size_t)count*sizeof(float))||
-           !ok(cudaMemcpyAsync(c->mvdesc,hd,(size_t)2*count*sizeof(*hd),cudaMemcpyHostToDevice,c->stream),"MoE descriptors upload")||!ok(cudaMemcpyAsync(c->expert_weights,weights,(size_t)count*sizeof(float),cudaMemcpyHostToDevice,c->stream),"MoE weights upload"))return 0;
-        mv_fp4_grouped<4><<<dim3((I+3)/4,2*count),256,0,c->stream>>>(c->mvdesc,2*count,I,H);expert_act_grouped<<<(count*I+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,c->expert_weights,limit,count,I);fp8_sim<<<count*((I+127)/128),128,0,c->stream>>>(c->p3,count,I);
-        for(int e=0;e<count;e++)hd[e]={(uint8_t*)down[e]->w,down[e]->scale,c->p3+(long long)e*I,c->p4+(long long)e*H};if(!ok(cudaMemcpyAsync(c->mvdesc,hd,(size_t)count*sizeof(*hd),cudaMemcpyHostToDevice,c->stream),"MoE down descriptors upload"))return 0;
-        mv_fp4_grouped<4><<<dim3((H+3)/4,count),256,0,c->stream>>>(c->mvdesc,count,H,I);
+    bool all_local=true;
+    for(int e=0;e<count;e++)
+        if(gate[e]->device!=sg->device||up[e]->device!=sg->device||down[e]->device!=sg->device){all_local=false;break;}
+    /* DSV4_CUDA_MOE_FUSED6=1 (opt-in, read on every call): the decode shape as one
+     * cooperative v4f_moe_kernel launch. fnb = co-resident blocks per SM, probed once;
+     * 0 once the device has no cooperative launch, a buffer failed or a launch was
+     * refused: from then on the launch sequence below. The grid needs >= 8 blocks so
+     * that one block's down rows span at most two experts (the kernel's aq[2]). */
+    static int fnb=-1;
+    const char*fused_env=getenv("DSV4_CUDA_MOE_FUSED6");
+    if(fused_env&&atoi(fused_env)&&fnb<0){int coop=0;cudaDeviceGetAttribute(&coop,cudaDevAttrCooperativeLaunch,sg->device);
+        if(!coop){fnb=0;fprintf(stderr,"[DSV4 CUDA] cooperative launch unsupported: fused MoE stays off\n");}
+        else{int nbb=0;if(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nbb,v4f_moe_kernel,1024,0)!=cudaSuccess){cudaGetLastError();nbb=0;}fnb=nbb;}}
+    if(fused_env&&atoi(fused_env)&&all_local&&count==6&&H==4096&&I==2048&&fnb>0&&c->sms*fnb>=8){
+        if((!c->v4fact&&!alloc_ok(cudaMalloc(&c->v4fact,7*2048*sizeof(float)),"fused act"))||
+           (!c->v4fparts&&!alloc_ok(cudaMalloc(&c->v4fparts,7*4096*sizeof(float)),"fused parts"))||
+           (!c->v4fbar&&!alloc_ok(cudaMalloc(&c->v4fbar,sizeof(V4FBar)),"fused barrier"))){
+            fnb=0;fprintf(stderr,"[DSV4 CUDA] fused MoE buffers unavailable: launch sequence from now on\n");
+        }else{
+            V4FMoeArgs ma{};
+            for(int k=0;k<6;k++)ma.e[k]={(uint8_t*)gate[k]->w,gate[k]->scale,(uint8_t*)up[k]->w,up[k]->scale,
+                                          (uint8_t*)down[k]->w,down[k]->scale,weights[k],0};
+            ma.e[6]={(uint8_t*)sg->w,sg->scale,(uint8_t*)su->w,su->scale,(uint8_t*)sd->w,sd->scale,1.f,1};
+            ma.x=c->dx;ma.act=c->v4fact;ma.parts=c->v4fparts;ma.y=c->dy;ma.bar=(V4FBar*)c->v4fbar;ma.limit=limit;
+            if(!ok(cudaMemsetAsync(c->v4fbar,0,sizeof(V4FBar),c->stream),"fused barrier clear"))return 0;
+            void* kargs[]={&ma};
+            cudaError_t rco=cudaLaunchCooperativeKernel((void*)v4f_moe_kernel,dim3(c->sms*fnb),dim3(1024),kargs,0,c->stream);
+            if(rco!=cudaSuccess){cudaGetLastError();fnb=0;
+                fprintf(stderr,"[DSV4 CUDA] fused MoE cooperative launch refused (code %d): launch sequence from now on\n",(int)rco);}
+            else return ok(cudaGetLastError(),"fused MoE")&&
+                   ok(cudaMemcpyAsync(y,c->dy,hb,cudaMemcpyDeviceToHost,c->stream),"MoE result download")&&
+                   ok(cudaStreamSynchronize(c->stream),"MoE sync");
+        }
+    }
+
+    Dev*pc=nullptr;
+    if(moe_batched()){
+        /* Peer compute (peer_runs): routed experts whose mirrors live on a
+         * peer device run THERE on local weights, concurrently with this
+         * device's experts. The token's input goes over P2P and each
+         * expert's down-projection row lands straight in this device's p4
+         * slot, so the reduce below is unchanged. Same kernels, same slots,
+         * same order: bit-identical to computing every expert here. */
+        int pdev=-1;unsigned char on_peer[16]={0};
+        for(int e=0;e<count;e++){int d=gate[e]->device;
+            if(peer&&d!=sg->device&&up[e]->device==d&&down[e]->device==d&&(pdev<0||pdev==d)&&peer_runs(sg->device,d)){pdev=d;on_peer[e]=1;}}
+        pc=pdev>=0?ctx(pdev):nullptr;
+        if(!buf((void**)&c->mvdesc,&c->mvdesccap,(size_t)2*count*sizeof(MvDesc))||!buf((void**)&c->expert_weights,&c->expert_weightscap,(size_t)count*sizeof(float))||
+           !ok(cudaMemcpyAsync(c->expert_weights,weights,(size_t)count*sizeof(float),cudaMemcpyHostToDevice,c->stream),"MoE weights upload"))return 0;
+        if(pc){
+            /* A stale error must not be blamed on the peer's launches below.
+             * The fork is recorded on this device: its failure is ours. */
+            cudaGetLastError();
+            if(!ok(cudaEventRecord(c->fork,c->stream),"MoE fork record"))return 0;
+            MvDesc pd[32];int k=0;const char*why=nullptr;cudaError_t err=cudaSuccess;
+            bool fine=pstep(cudaSetDevice(pdev),"device select",&why,&err)&&
+               pstep(buf((void**)&pc->dx,&pc->xcap,hb)&&buf((void**)&pc->p1,&pc->p1cap,ib)&&buf((void**)&pc->p2,&pc->p2cap,ib)&&buf((void**)&pc->p3,&pc->p3cap,ib)&&
+                     buf((void**)&pc->mvdesc,&pc->mvdesccap,(size_t)2*count*sizeof(MvDesc))&&buf((void**)&pc->expert_weights,&pc->expert_weightscap,(size_t)count*sizeof(float))
+                     ?cudaSuccess:cudaErrorMemoryAllocation,"buffer allocation",&why,&err)&&
+               pstep(cudaStreamWaitEvent(pc->stream,c->fork,0),"fork wait",&why,&err)&&
+               pstep(cudaMemcpyPeerAsync(pc->dx,pdev,c->dx,sg->device,hb,pc->stream),"activation copy",&why,&err)&&
+               pstep(cudaMemcpyAsync(pc->expert_weights,weights,(size_t)count*sizeof(float),cudaMemcpyHostToDevice,pc->stream),"weights upload",&why,&err);
+            if(fine){for(int e=0;e<count;e++)if(on_peer[e]){pd[k++]={(uint8_t*)gate[e]->w,gate[e]->scale,pc->dx,pc->p1+(long long)e*I};pd[k++]={(uint8_t*)up[e]->w,up[e]->scale,pc->dx,pc->p2+(long long)e*I};}
+                fine=pstep(cudaMemcpyAsync(pc->mvdesc,pd,(size_t)k*sizeof(MvDesc),cudaMemcpyHostToDevice,pc->stream),"descriptors upload",&why,&err);}
+            if(fine){mv_fp4_grouped<4><<<dim3((I+3)/4,k),256,0,pc->stream>>>(pc->mvdesc,k,I,H);
+                expert_act_grouped<<<(count*I+255)/256,256,0,pc->stream>>>(pc->p3,pc->p1,pc->p2,pc->expert_weights,limit,count,I);fp8_sim<<<count*((I+127)/128),128,0,pc->stream>>>(pc->p3,count,I);
+                k=0;for(int e=0;e<count;e++)if(on_peer[e])pd[k++]={(uint8_t*)down[e]->w,down[e]->scale,pc->p3+(long long)e*I,c->p4+(long long)e*H};
+                fine=pstep(cudaMemcpyAsync(pc->mvdesc,pd,(size_t)k*sizeof(MvDesc),cudaMemcpyHostToDevice,pc->stream),"down descriptors upload",&why,&err);}
+            if(fine){mv_fp4_grouped<4><<<dim3((H+3)/4,k),256,0,pc->stream>>>(pc->mvdesc,k,H,I);
+                fine=pstep(cudaGetLastError(),"launch",&why,&err)&&pstep(cudaEventRecord(pc->join,pc->stream),"join record",&why,&err);}
+            if(!fine)return peer_fail(pc,sg->device,why,err,false);
+            if(!ok(cudaSetDevice(sg->device),"select MoE device")){peer_drain(pc,sg->device);return 0;}
+        }
+        MvDesc hd[32];int k=0;
+        for(int e=0;e<count;e++)if(!on_peer[e]){hd[k++]={(uint8_t*)gate[e]->w,gate[e]->scale,c->dx,c->p1+(long long)e*I};hd[k++]={(uint8_t*)up[e]->w,up[e]->scale,c->dx,c->p2+(long long)e*I};}
+        if(k){if(!ok(cudaMemcpyAsync(c->mvdesc,hd,(size_t)k*sizeof(*hd),cudaMemcpyHostToDevice,c->stream),"MoE descriptors upload")){if(pc)peer_drain(pc,sg->device);return 0;}
+            mv_fp4_grouped<4><<<dim3((I+3)/4,k),256,0,c->stream>>>(c->mvdesc,k,I,H);}
+        expert_act_grouped<<<(count*I+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,c->expert_weights,limit,count,I);fp8_sim<<<count*((I+127)/128),128,0,c->stream>>>(c->p3,count,I);
+        k=0;for(int e=0;e<count;e++)if(!on_peer[e])hd[k++]={(uint8_t*)down[e]->w,down[e]->scale,c->p3+(long long)e*I,c->p4+(long long)e*H};
+        if(k){if(!ok(cudaMemcpyAsync(c->mvdesc,hd,(size_t)k*sizeof(*hd),cudaMemcpyHostToDevice,c->stream),"MoE down descriptors upload")){if(pc)peer_drain(pc,sg->device);return 0;}
+            mv_fp4_grouped<4><<<dim3((H+3)/4,k),256,0,c->stream>>>(c->mvdesc,k,H,I);}
+        /* The join wait is queued on this device: the peer is to blame only
+         * if it does not drain. */
+        if(pc){cudaError_t e=cudaStreamWaitEvent(c->stream,pc->join,0);
+            if(e!=cudaSuccess){if(!peer_drain(pc,sg->device))return peer_latch(pc,sg->device,"join wait",e,false);ok(e,"MoE join wait");return 0;}}
     }else for(int e=0;e<count;e++){run_mv<4>((uint8_t*)gate[e]->w,gate[e]->scale,c->dx,c->p1+(long long)e*I,I,H,1,c->stream);run_mv<4>((uint8_t*)up[e]->w,up[e]->scale,c->dx,c->p2+(long long)e*I,I,H,1,c->stream);expert_act<<<(I+255)/256,256,0,c->stream>>>(c->p3+(long long)e*I,c->p1+(long long)e*I,c->p2+(long long)e*I,weights[e],limit,I);fp8_sim<<<(I+127)/128,128,0,c->stream>>>(c->p3+(long long)e*I,1,I);run_mv<4>((uint8_t*)down[e]->w,down[e]->scale,c->p3+(long long)e*I,c->p4+(long long)e*H,H,I,1,c->stream);}
     expert_reduce<<<(H+255)/256,256,0,c->stream>>>(c->dy,c->p4,count,H);
     run_mv<8>((uint8_t*)sg->w,sg->scale,c->dx,c->p1,I,H,1,c->stream);run_mv<8>((uint8_t*)su->w,su->scale,c->dx,c->p2,I,H,1,c->stream);
     expert_act<<<(I+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,1.f,limit,I);fp8_sim<<<(I+127)/128,128,0,c->stream>>>(c->p3,1,I);run_mv<8>((uint8_t*)sd->w,sd->scale,c->p3,c->p4,H,I,1,c->stream);
     moe_combine<<<(H+255)/256,256,0,c->stream>>>(c->dy,c->p4,H);
-    return ok(cudaGetLastError(),"MoE launch")&&ok(cudaMemcpyAsync(y,c->dy,hb,cudaMemcpyDeviceToHost,c->stream),"MoE result download")&&ok(cudaStreamSynchronize(c->stream),"MoE sync");
+    int r=ok(cudaGetLastError(),"MoE launch")&&ok(cudaMemcpyAsync(y,c->dy,hb,cudaMemcpyDeviceToHost,c->stream),"MoE result download")&&ok(cudaStreamSynchronize(c->stream),"MoE sync");
+    if(pc){
+        /* This stream waited on the join, so the peer's work is done, unless
+         * the peer faulted after it was queued: an asynchronous error there
+         * does not show on this device, and y could hold stale peer rows.
+         * Not covered: a faulted peer that never releases this stream's wait
+         * on the join leaves the MoE sync above blocked. */
+        bool lost=false;cudaError_t e=cudaEventSynchronize(pc->join);
+        if(e==cudaSuccess)peer_fault(&lost,&e);
+        if(e!=cudaSuccess)return peer_fail(pc,sg->device,"join",e,lost);
+    }
+    return r;
+}
+extern "C" int dsv4_cuda_moe(Dsv4CudaTensor *const *gate,Dsv4CudaTensor *const *up,Dsv4CudaTensor *const *down,
+        const float *weights,int count,Dsv4CudaTensor *sg,Dsv4CudaTensor *su,Dsv4CudaTensor *sd,float limit,float *y,const float *x){
+    /* Runs on the shared expert's device. Routed experts may live on a peer
+     * device (peer mirror pool): they run there (peer_runs), or this device
+     * reads them in place over P2P/NVLink with DSV4_CUDA_PEER_COMPUTE=0,
+     * DSV4_CUDA_BATCHED=0, a peer of another SM version, and for the rest of
+     * a call whose peer failed. A latched-off peer's tensors are refused. */
+    if(count<1||count>16||!gate||!up||!down||!sg||!su||!sd)return 0;Dsv4CudaTensor*t=gate[0];Dev*c=ctx(sg->device);
+    if(!c||!t||dev_lost(sg->device)||t->fmt!=4||su->device!=sg->device||sd->device!=sg->device||sg->fmt!=8||su->fmt!=8||sd->fmt!=8||!ok(cudaSetDevice(sg->device),"select MoE device"))return 0;
+    int H=t->I,I=t->O;if(sg->I!=H||sg->O!=I||su->I!=H||su->O!=I||sd->I!=I||sd->O!=H)return 0;
+    for(int e=0;e<count;e++)if(!gate[e]||!up[e]||!down[e]||!dev_ok(sg->device,gate[e]->device)||!dev_ok(sg->device,up[e]->device)||!dev_ok(sg->device,down[e]->device)||gate[e]->fmt!=4||up[e]->fmt!=4||down[e]->fmt!=4)return 0;
+    int r=moe_once(gate,up,down,weights,count,sg,su,sd,limit,y,x,c,H,I,true);
+    return r<0?moe_once(gate,up,down,weights,count,sg,su,sd,limit,y,x,c,H,I,false):r;
 }
 extern "C" int dsv4_cuda_rmsnorm(Dsv4CudaActivation*x,Dsv4CudaTensor*w,float eps,int elements){
     Dev*c=x?ctx(x->device):nullptr;
@@ -2081,7 +3045,7 @@ extern "C" Dsv4CudaExpertSet *dsv4_cuda_expert_bank_create(int count,int H,int I
     int shared=sg||su||sd,J=sg?sg->O:0;
     if(count<1||H<1||I<1||(shared&&(!sg||!su||!sd))||(shared&&(sg->device!=device||su->device!=device||sd->device!=device||
        sg->fmt!=8||su->fmt!=8||sd->fmt!=8||sg->I!=H||su->I!=H||su->O!=J||sd->I!=J||sd->O!=H))||
-       !ok(cudaSetDevice(device),"select expert bank device"))return nullptr;
+       g_cuda_lost||!ok(cudaSetDevice(device),"select expert bank device"))return nullptr;
     Dsv4CudaExpertSet*set=(Dsv4CudaExpertSet*)calloc(1,sizeof(*set));if(!set)return nullptr;
     set->count=count;set->device=device;set->H=H;set->I=I;set->sg=sg;set->su=su;set->sd=sd;
     size_t fc1_w=(size_t)count*I*H,fc1_s=(size_t)count*2*I*(H/32);
@@ -2115,6 +3079,16 @@ struct PinRegion{uintptr_t base;size_t size;};
 static std::vector<PinRegion> g_pin_regions,g_pin_failed;
 static size_t g_pin_bytes;
 static int g_pin_enabled=-1;
+/* DSV4_CUDA_PIN_CAP_GB (20): total page-locked expert-slab bytes, in GiB. The
+ * RAM expert cache can exceed 20 GB (--ram 40 -> ~32 GB of slabs); slabs past
+ * the cap upload through pageable staging at roughly half the PCIe rate.
+ * Unset, empty, unparsable or NaN: 20; negative: 0 (nothing pinned); inf or
+ * anything above 1 PiB: 1 PiB, i.e. no cap (the size_t conversion of a larger
+ * double is undefined). */
+static size_t pin_cap_bytes(){
+    const char*e=getenv("DSV4_CUDA_PIN_CAP_GB");char*end=nullptr;double gb=e&&*e?strtod(e,&end):20.0;
+    if(e&&*e&&(end==e||gb!=gb))gb=20.0;if(gb<0)gb=0;if(gb>1048576.0)gb=1048576.0;
+    return (size_t)(gb*(double)(1ULL<<30));}
 static bool host_pinned(const void*p,size_t len){
     if(g_pin_enabled<0){const char*e=getenv("DSV4_CUDA_PIN_HOST");g_pin_enabled=!(e&&*e=='0');}
     if(!g_pin_enabled||!p||!len)return false;
@@ -2126,7 +3100,7 @@ static bool host_pinned(const void*p,size_t len){
     if(!VirtualQuery(p,&mbi,sizeof mbi)||mbi.State!=MEM_COMMIT)return false;
     uintptr_t base=(uintptr_t)mbi.BaseAddress;size_t size=mbi.RegionSize;
     if(a<base||a+len>base+size)return false;
-    static const size_t cap=(size_t)20<<30;
+    static const size_t cap=pin_cap_bytes();
     if(g_pin_bytes+size>cap){g_pin_failed.push_back({base,size});return false;}
     cudaError_t err=cudaHostRegister((void*)base,size,cudaHostRegisterPortable);
     if(err==cudaErrorHostMemoryAlreadyRegistered){cudaGetLastError();g_pin_regions.push_back({base,size});return true;}
@@ -2146,7 +3120,7 @@ static bool host_pinned(const void*p,size_t len){
     long page=sysconf(_SC_PAGESIZE);if(page<=0)page=4096;
     uintptr_t base=a&~((uintptr_t)page-1);
     size_t size=((a+len+page-1)&~((uintptr_t)page-1))-base;
-    static const size_t cap=(size_t)20<<30;
+    static const size_t cap=pin_cap_bytes();
     if(g_pin_bytes+size>cap){g_pin_failed.push_back({base,size});return false;}
     cudaError_t err=cudaHostRegister((void*)base,size,cudaHostRegisterPortable);
     if(err==cudaErrorHostMemoryAlreadyRegistered){cudaGetLastError();g_pin_regions.push_back({base,size});return true;}
@@ -2261,6 +3235,46 @@ extern "C" int dsv4_cuda_expert_set_upload_hash(Dsv4CudaExpertSet*set,const int6
     Dev*hc=ctx(set->device);if(!hc||!ok(cudaMalloc(&set->hash,bytes),"hash router allocation")||!h2d(hc,set->hash,map,bytes,"hash router upload"))return 0;
     set->vocab=vocab;set->topk=topk;return 1;
 }
+/* The host-routed resident path's exact operation/rounding order, with routes
+ * and descriptors retained on device. One activation upload and one download. */
+extern "C" int dsv4_cuda_resident_route_moe(Dsv4CudaExpertSet *set,
+        Dsv4CudaTensor *gate,Dsv4CudaTensor *bias,const int *fixed,
+        float scale,float limit,float *out,const float *in){
+    Dev *c=set?ctx(set->device):nullptr;
+    if(!c||!gate||!in||!out||set->count!=256||!set->table||!set->sg||!set->su||!set->sd||
+       gate->device!=set->device||gate->fmt!=32||gate->O!=256||gate->I!=set->H||
+       (bias&&(bias->device!=set->device||bias->fmt!=32||bias->O*bias->I<256)))return 0;
+    if(fixed)for(int k=0;k<6;k++)if(fixed[k]<0||fixed[k]>=256)return 0;
+    if(!ok(cudaSetDevice(set->device),"select resident route device"))return 0;
+    int H=set->H,I=set->I,K=6;size_t hb=(size_t)H*4,ib=(size_t)K*I*4;
+    if(!buf((void**)&c->dx,&c->xcap,hb)||!buf((void**)&c->dy,&c->ycap,H>256?hb:256*4)||
+       !buf((void**)&c->p1,&c->p1cap,ib)||!buf((void**)&c->p2,&c->p2cap,ib)||
+       !buf((void**)&c->p3,&c->p3cap,ib)||!buf((void**)&c->p4,&c->p4cap,(size_t)K*H*4)||
+       !buf((void**)&c->mvdesc,&c->mvdesccap,(size_t)3*K*sizeof(MvDesc))||
+       !buf((void**)&c->expert_weights,&c->expert_weightscap,K*sizeof(float))||
+       !buf((void**)&c->expert_ids,&c->expert_idcap,K*sizeof(int))||
+       !ok(cudaMemcpyAsync(c->dx,in,hb,cudaMemcpyHostToDevice,c->stream),"resident MoE input"))return 0;
+    mv_f32<<<256,256,0,c->stream>>>((float*)gate->w,c->dx,c->dy,256,H);
+    if(fixed&&!ok(cudaMemcpyAsync(c->expert_ids,fixed,K*sizeof(int),cudaMemcpyHostToDevice,c->stream),"resident fixed routes"))return 0;
+    route_top6<<<1,32,0,c->stream>>>(c->expert_ids,c->expert_weights,bias?(float*)bias->w:nullptr,c->dy,fixed!=nullptr,scale);
+    sort_routes6<<<1,1,0,c->stream>>>(c->expert_ids,c->expert_weights);
+    build_moe_desc<<<1,K,0,c->stream>>>(c->mvdesc,set->table,c->expert_ids,c->dx,c->p1,c->p2,c->p3,c->p4,K,256,H,I);
+    mv_fp4_grouped<4><<<dim3((I+3)/4,2*K),256,0,c->stream>>>(c->mvdesc,2*K,I,H);
+    expert_act_grouped<<<(K*I+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,c->expert_weights,limit,K,I);
+    fp8_sim<<<K*((I+127)/128),128,0,c->stream>>>(c->p3,K,I);
+    mv_fp4_grouped<4><<<dim3((H+3)/4,K),256,0,c->stream>>>(c->mvdesc+2*K,K,H,I);
+    expert_reduce<<<(H+255)/256,256,0,c->stream>>>(c->dy,c->p4,K,H);
+    run_mv<8>((uint8_t*)set->sg->w,set->sg->scale,c->dx,c->p1,I,H,1,c->stream);
+    run_mv<8>((uint8_t*)set->su->w,set->su->scale,c->dx,c->p2,I,H,1,c->stream);
+    expert_act<<<(I+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,1.f,limit,I);
+    fp8_sim<<<(I+127)/128,128,0,c->stream>>>(c->p3,1,I);
+    run_mv<8>((uint8_t*)set->sd->w,set->sd->scale,c->p3,c->p4,H,I,1,c->stream);
+    moe_combine<<<(H+255)/256,256,0,c->stream>>>(c->dy,c->p4,H);
+    return ok(cudaGetLastError(),"resident MoE launch")&&
+        ok(cudaMemcpyAsync(out,c->dy,hb,cudaMemcpyDeviceToHost,c->stream),"resident MoE output")&&
+        ok(cudaStreamSynchronize(c->stream),"resident MoE sync");
+}
+
 extern "C" int dsv4_cuda_route_moe(const Dsv4CudaActivation*input,Dsv4CudaTensor*gate,Dsv4CudaTensor*bias,
         int token,float scale,Dsv4CudaExpertSet*set,float limit,Dsv4CudaActivation*output){
     Dev*c=input?ctx(input->device):nullptr;if(!c||!gate||!set||!output||set->device!=input->device||output->device!=input->device||
@@ -2647,6 +3661,8 @@ extern "C" int dsv4_cuda_wo(Dsv4CudaTensor *wa,Dsv4CudaTensor *wb,int groups,flo
     bf16_round<<<(H+255)/256,256,0,c->stream>>>(c->p2,H);
     return ok(cudaGetLastError(),"wo launch")&&ok(cudaMemcpyAsync(out,c->p2,hb,cudaMemcpyDeviceToHost,c->stream),"wo result download")&&ok(cudaStreamSynchronize(c->stream),"wo sync");
 }
-extern "C" void dsv4_cuda_tensor_free(Dsv4CudaTensor*t){if(!t)return;cudaSetDevice(t->device);if(t->own_w&&t->w)cudaFree(t->w);if(t->bf16_cache)cudaFree(t->bf16_cache);if(t->own_scale&&t->scale)cudaFree(t->scale);if(t->own_dg_scale&&t->dg_scale)cudaFree(t->dg_scale);free(t);}
+/* A latched-off peer's context may refuse the frees (sticky fault): read the
+ * error so the next launch check does not report it. */
+extern "C" void dsv4_cuda_tensor_free(Dsv4CudaTensor*t){if(!t)return;cudaSetDevice(t->device);if(t->own_w&&t->w)cudaFree(t->w);if(t->bf16_cache)cudaFree(t->bf16_cache);if(t->own_scale&&t->scale)cudaFree(t->scale);if(t->own_dg_scale&&t->dg_scale)cudaFree(t->dg_scale);if(dev_lost(t->device))cudaGetLastError();free(t);}
 extern "C" long long dsv4_cuda_tensor_bytes(const Dsv4CudaTensor*t){return t?t->bytes:0;}
 extern "C" int dsv4_cuda_tensor_device(const Dsv4CudaTensor*t){return t?t->device:-1;}

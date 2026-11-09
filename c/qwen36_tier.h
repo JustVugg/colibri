@@ -88,8 +88,12 @@ void qt_experts_withdraw(const char *why);
  * router, b|a and gate rows), kept out of the automatic allowance. Call before qt_init. */
 void qt_reserve(size_t bytes);
 void qt_reserve_short(size_t bytes, size_t experts);   /* out of the expert budget only when fewer than `experts` fit */
-/* A GGUF's arena slots at each layer's own size (one device; not for a chain that reads the arena
- * as slots of one size, qt_chain_arena). Call before qt_init_gguf. */
+/* a chain's prompt staging past the `base` bytes of its reserve, toward `full` (qwen36_tier.c's
+ * rule); qt_stage_extra: the bytes the budget gave it. Call before qt_init_gguf. */
+void   qt_reserve_stage(size_t base, size_t full);
+size_t qt_stage_extra(void);
+/* A GGUF's arena slots at each layer's own size (one device; a chain takes them over through
+ * qt_chain_arena_exact, not qt_chain_arena). Call before qt_init_gguf. */
 void qt_gguf_exact_slots(int on);
 
 /* DeltaNet input projections, qkv ++ z fused into one resident tensor per
@@ -132,6 +136,11 @@ int  qt_dense_init(const int8_t *q, const float *sc, int I, int O, int device);
 int  qt_dense_init_fmt(const void *w, const float *sc, int fmt, int I, int O, int device);
 int  qt_lmhead_init_fmt(const void *w, const float *sc, int fmt, int I, int O);
 int  qt_dnproj_init_fmt(int layer, const void *w, const float *sc, int fmt, int I, int O, int device);
+/* A GGUF whose qkv and z rows have different ggml types (unsloth's dynamic mixes, in about
+ * half of a Qwen3.8-27B's DeltaNet layers): qt_dnproj_init_fmt takes qkv's rows alone and this
+ * z's, each in its own type, on the same device; qt_dnproj_matmul_batch still answers qkv ++ z.
+ * A failure takes the layer's qkv off the device too: one without the other is no projection. */
+int  qt_dnproj_z_init_fmt(int layer, const void *w, int fmt, int I, int O, int device);
 int  qt_dense_matmul(int handle, float *y, const float *x, int I, int O);
 /* Row-major x[S,I] -> y[S,O], using the same resident int8 tensor. */
 int  qt_dense_matmul_batch(int handle, float *y, const float *x, int S, int I, int O);
@@ -140,6 +149,8 @@ int  qt_dense_count(void);
  * the backend's object and the CUDA ordinal it lives on; NULL when nothing is placed. */
 struct ColiCudaTensor *qt_dense_tensor(int handle, int *dev);
 struct ColiCudaTensor *qt_dnproj_tensor(int layer, int *dev);
+/* z's tensor of a layer whose in_proj is two (qt_dnproj_z_init_fmt); NULL when it is one */
+struct ColiCudaTensor *qt_dnproj_z_tensor(int layer, int *dev);
 struct ColiCudaTensor *qt_lmhead_tensor(int *dev);
 
 /* fp8 streaming mode (Qwen3.8): experts arrive as e4m3 bytes with 128x128
@@ -253,6 +264,16 @@ int  qt_chain_format(int *fmt, int *gs);
 int  qt_chain_layer_format(int layer, int *fmt, int *fmt_d);
 /* a GGUF's arena for a chain that moves the experts itself (qwen36_tier.c's comment) */
 int  qt_chain_arena(void **base, size_t *slot, size_t *off_u, size_t *off_d, int *nslots);
+/* the exact arena (qt_gguf_exact_slots) for such a chain: one allocation of `bytes`, `bump` of them
+ * carved into the residents' slots and the freed ones (qt_chain_slot: a resident's offset in
+ * 256-byte units); each layer's slot bytes, gate/up/down offsets in it and size class, a class's
+ * freed slots (byte offsets). 0: not that arena */
+typedef struct {
+    void *base; size_t bytes, bump; int nl, ncls;
+    const size_t *lsl, *lou, *lod; const int *lcls;
+    const size_t *const *cfree; const int *cnfree;
+} QtChainArena;
+int  qt_chain_arena_exact(QtChainArena *a);
 int  qt_chain_slot(int layer, int eid);
 void qt_chain_own(void);
 /* copy mode: 1 when a qt_note of the expert now would copy it (convert the bytes only then);
@@ -305,6 +326,8 @@ static inline void qt_trunk_withdraw(const char*a){(void)a;}
 static inline void qt_experts_withdraw(const char*a){(void)a;}
 static inline void qt_reserve(size_t b){(void)b;}
 static inline void qt_reserve_short(size_t b,size_t e){(void)b;(void)e;}
+static inline void qt_reserve_stage(size_t a,size_t b){(void)a;(void)b;}
+static inline size_t qt_stage_extra(void){return 0;}
 static inline void qt_gguf_exact_slots(int on){(void)on;}
 static inline int  qt_dnproj_init(int a,const int8_t*b,const float*c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
 static inline int  qt_dnproj_matmul(int a,float*b,const float*c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
@@ -320,11 +343,13 @@ static inline int  qt_dense_init(const int8_t*a,const float*b,int c,int d,int e)
 static inline int  qt_dense_init_fmt(const void*a,const float*b,int c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return -1;}
 static inline int  qt_lmhead_init_fmt(const void*a,const float*b,int c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
 static inline int  qt_dnproj_init_fmt(int a,const void*b,const float*c,int d,int e,int f,int g){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
+static inline int  qt_dnproj_z_init_fmt(int a,const void*b,int c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
 static inline int  qt_dense_matmul(int a,float*b,const float*c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
 static inline int  qt_dense_matmul_batch(int a,float*b,const float*c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
 static inline int  qt_dense_count(void){return 0;}
 static inline void *qt_dense_tensor(int a,int*b){(void)a;(void)b;return NULL;}
 static inline void *qt_dnproj_tensor(int a,int*b){(void)a;(void)b;return NULL;}
+static inline void *qt_dnproj_z_tensor(int a,int*b){(void)a;(void)b;return NULL;}
 static inline void *qt_lmhead_tensor(int*b){(void)b;return NULL;}
 static inline int  qt_ready(void){return 0;}
 static inline unsigned qt_chain_epoch(void){return 0;}
@@ -335,6 +360,9 @@ static inline void qt_chain_count(int a,const int*b,int c){(void)a;(void)b;(void
 static inline int  qt_chain_format(int*a,int*b){(void)a;(void)b;return 0;}
 static inline int  qt_chain_layer_format(int a,int*b,int*c){(void)a;(void)b;(void)c;return 0;}
 static inline int  qt_chain_arena(void**a,size_t*b,size_t*c,size_t*d,int*e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
+typedef struct { void *base; size_t bytes, bump; int nl, ncls; const size_t *lsl, *lou, *lod; const int *lcls;
+                 const size_t *const *cfree; const int *cnfree; } QtChainArena;
+static inline int  qt_chain_arena_exact(QtChainArena*a){(void)a;return 0;}
 static inline int  qt_chain_slot(int a,int b){(void)a;(void)b;return -1;}
 static inline void qt_chain_own(void){}
 static inline void qt_heat_order(uint32_t*const*a,int b,int c){(void)a;(void)b;(void)c;}

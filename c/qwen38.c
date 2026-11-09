@@ -69,6 +69,7 @@ static int qwen38_max_ctx(void) {
 #include "tok_unicode.h"
 #include "tok_unicode_o200k.h"
 #include "qwen38_nfc.h"
+#include "coli_env.h"
 /* quant.h owns Colibri's authoritative E4M3 table.  This engine retains the
  * Qwen sibling's established dense kernels, so rename quant.h's two generic
  * helpers while including it; every format-specific symbol keeps its shared
@@ -2031,15 +2032,22 @@ static float *q38_serve_prefill(Model *m,const int *ids,int from,int np,ColiProm
         /* the state at the segment's start (from the device too, for a chain), so a stop inside
          * the segment can put it back; none where the CUDA chain takes it in one chunk, which a
          * stop finds before it starts or not at all (a 470-token prompt's copy of the DeltaNet
-         * state from the card took 10 ms before its first layer) */
+         * state from the card took 10 ms before its first layer). At the prompt's start it is the
+         * empty state both callers reset to, which a stop puts back by resetting again: no copy
+         * (Qwen3.8-Flash-Next's 118 MB into fresh pages, 30 ms of a 4180-token prompt) */
         int one=0;
 #ifdef COLI_CUDA
         one=q38cc_one_chunk(m,n);
 #endif
-        if(!one&&q38_pin_state_copy(m,&st,1))g_coli_prompt_break=ctl;
+        const int empty=!one&&at==0;
+        if(!one&&(empty||q38_pin_state_copy(m,&st,1)))g_coli_prompt_break=ctl;
         float *next=step(m,ids+at,n,at);
         g_coli_prompt_break=NULL;
-        if(!next){q38_pin_state_copy(m,&st,0);free(lo);lo=NULL;break;}
+        if(!next){
+            if(empty)reset_recurrent(m);
+            else q38_pin_state_copy(m,&st,0);
+            free(lo);lo=NULL;break;
+        }
         free(lo);lo=next;at+=n;
     }
     q38_pin_state_free(st);
@@ -2760,6 +2768,12 @@ static void serve_loop(Model *m){
     if(g_q38_mux_slots>1&&!q38_mux_alloc(m)){
         fprintf(stderr,"[serve] unable to allocate the state of %d conversations (KV_SLOTS)\n",g_q38_mux_slots);return;
     }
+    /* the recurrent state's first zeros here: a first prompt's reset otherwise touched 118 MB of
+     * Qwen3.8-Flash-Next's DeltaNet state for the first time, 25 ms of page faults against 10 */
+    reset_recurrent(m);
+#ifdef COLI_CUDA
+    q38cc_prewarm(m);   /* the CUDA chain's buffers for a chunk, before the first request */
+#endif
     fputs("\x01\x01READY\x01\x01\n",stdout);
     /* between READY and STAT: the gateway reads it in the handshake, so it knows
      * the served modalities before the first request (docs/serve_protocol.md) */
@@ -2822,6 +2836,8 @@ static void q38_dho_start(Model *m) {
 
 #ifndef QWEN38_TEST_SERVE
 int main(int argc, char **argv) {
+    coli_env_check(CE_QWEN38, "qwen38");
+    coli_env_dump(CE_QWEN38, "qwen38");
     /* Physical-core team sizing, as colibri/inkling/kimi_k3/olmoe/deepseek-v41
      * do. Without it this engine takes one thread per logical CPU, which on an
      * SMT host doubles the team for no arithmetic and pays a barrier per tiny

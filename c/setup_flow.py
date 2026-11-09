@@ -291,6 +291,22 @@ def _cc_finds_vulkan_h(cc):
         return False
 
 
+def _cc_lacks_static_openmp(cc):
+    """True when `cc` is a gcc that has no libgomp.a to link -fopenmp -static with.
+
+    MSYS2's gcc 16 no longer pulls its OpenMP runtime in (#1900): the archive lives in
+    mingw-w64-ucrt-x86_64-libgomp, and without it the Windows link stops on a bare
+    "cannot find -lgomp" (#2612). gcc answers -print-file-name with the bare name when it
+    cannot find the file. Any other outcome (no gcc, a timeout, an odd answer) says
+    nothing, so it counts as "not missing" and never blocks a build that might work."""
+    try:
+        r = subprocess.run([cc, "-print-file-name=libgomp.a"], capture_output=True,
+                           text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0 and r.stdout.strip() == "libgomp.a"
+
+
 def toolchain(here=None):
     """What can be built here, and with what."""
     here = here or HERE
@@ -334,6 +350,11 @@ def toolchain(here=None):
         tc["vulkan_headers"] = any(os.path.isfile(os.path.join(p, "vulkan", "vulkan.h"))
                                    for p in ("/usr/include", "/usr/local/include")) or _cc_finds_vulkan_h(tc["cc"])
     tc["can_build"] = bool(tc["source_checkout"] and tc["make"] and tc["cc"])
+    # A Windows gcc without libgomp.a cannot link the engine, so say "needs the build
+    # packages" and let package_hint print the libgomp one (#2612).
+    if tc["can_build"] and sys.platform == "win32" and _cc_lacks_static_openmp(tc["cc"]):
+        tc["can_build"] = False
+        tc["libgomp_missing"] = True
     tc["can_build_vulkan"] = bool(tc["can_build"] and tc["glslc"] and tc["vulkan_headers"])
     tc["can_build_cuda"] = bool(tc["can_build"] and tc["nvcc"] and sys.platform.startswith("linux"))
     # A toolkit is not enough: CUDA 13 cannot build for a V100 (#1852).
@@ -379,7 +400,7 @@ TEXT_HINTS = {
     "cuda": "install the CUDA Toolkit from https://developer.nvidia.com/cuda-downloads",
     "cuda-win32": "the Windows CUDA build needs the CUDA Toolkit and MSVC: see docs/windows.md",
     "cuda-win32-release": ("unpack the release's windows-x86_64-cuda.zip next to the engines "
-                           "(coli_cuda.dll and the CUDA builds of colibri, qwen36 and kimi_k3)"),
+                           "(coli_cuda.dll and the CUDA builds of colibri, glm53, qwen36 and kimi_k3)"),
     "build-other": "install gcc (with OpenMP) and make from your distribution",
     "vulkan-other": ("install the Vulkan loader development files, glslc (shaderc) and the "
                      "Mesa Vulkan drivers from your distribution"),
@@ -569,7 +590,7 @@ def choose_backend(hw, family, tc, requested="auto", exclude=()):
                               f"newer, and the {card['name']} is "
                               + (f"compute {card['compute_cap']}" if sm is not None else "of unknown compute"),
                        "fix": ""}
-        elif win_cuda:
+        elif win_cuda and not release_cuda_lacks(family.id, current_version()):
             decision["missing"].append(("cuda", TEXT_HINTS["cuda-win32-release"]))
         elif cuda_engine and tc.get("can_build_cuda"):
             blocked = cuda_problem(nvidia, family, tc)
@@ -687,9 +708,12 @@ RELEASE_VULKAN = ("linux-x86_64.tar.gz", "windows-x86_64.zip")
 #: The engines the release's windows-x86_64-cuda.zip (RELEASE_CUDA_WIN32) carries, built against
 #: coli_cuda.dll (release.yml, the cuda-windows job), and the oldest card its DLL
 #: runs on: CUDA_ARCH=portable is SASS for sm_80 and newer plus compute_120 PTX.
-WINDOWS_CUDA_ENGINES = ("glm", "qwen36", "kimi")
+WINDOWS_CUDA_ENGINES = ("glm", "glm53", "qwen36", "kimi")
 WINDOWS_CUDA_FLOOR = 80
 RELEASE_CUDA_WIN32 = "windows-x86_64-cuda.zip"
+#: The engines the package got later, each with the last release whose package lacks it:
+#: v2.1.0's has no glm53.exe (#2541). With such a release the engine stays on Vulkan.
+WINDOWS_CUDA_LATER = {"glm53": "2.1.0"}
 
 
 def prebuilt_vulkan(family, tc):
@@ -703,12 +727,21 @@ def prebuilt_vulkan(family, tc):
 
 def release_cuda(family, tc):
     """Whether resolve_engine takes this engine from the Windows release, where the
-    CUDA backend comes with it (fetch_release_cuda): no engine here and nothing here
-    builds one. Before, the setup fetched only the main archive, whose engines run
+    CUDA backend comes with it (fetch_release_cuda): no engine here, nothing here
+    builds one, and the package of this version has its CUDA build (release_cuda_lacks).
+    Before, the setup fetched only the main archive, whose engines run
     Vulkan, and an NVIDIA card ran Vulkan with no word that CUDA was one zip away (#2091)."""
     return (host_os() == "win32" and family.id in WINDOWS_CUDA_ENGINES
             and not os.path.isfile(engine_path(HERE, family)) and not tc.get("can_build")
-            and release_asset_suffix() == "windows-x86_64.zip")
+            and release_asset_suffix() == "windows-x86_64.zip"
+            and not release_cuda_lacks(family.id, current_version()))
+
+
+def release_cuda_lacks(family_id, tag):
+    """Whether release `tag`'s windows-x86_64-cuda.zip came before this engine's CUDA
+    build joined it (WINDOWS_CUDA_LATER)."""
+    last = WINDOWS_CUDA_LATER.get(family_id)
+    return last is not None and setup_catalog.version_tuple(tag) <= setup_catalog.version_tuple(last)
 
 
 def engine_path(directory, family):
@@ -1060,6 +1093,11 @@ def resolve_engine(family, entry, decision, tc, out=print, allow_prebuilt=True):
     backend = decision["backend"]
     if backend == "cuda" and host_os() == "win32":
         try:
+            # a package without this engine (v2.1.0's has no glm53.exe): the release's
+            # Vulkan engine, as when there is no package, and nothing downloaded for it
+            if release_cuda_lacks(family.id, tag):
+                raise SetupError(f"the {RELEASE_CUDA_WIN32} of release {tag} has no CUDA build "
+                                 f"of {family.engine_artifact}")
             if not fetch_release_cuda(runtime, tag, out=out):
                 raise SetupError(f"release {tag} has no {RELEASE_CUDA_WIN32}")
         except SetupError as error:
@@ -1965,7 +2003,8 @@ def release_cuda_missing(cfg):
     """The release tag whose CUDA backend the configured engine is missing, or None:
     the engine is the Windows release's (fetch_release_archive, in runtime/colibri-<tag>)
     without coli_cuda.dll, on a card that backend runs on, with the backend left to the
-    setup. A setup from before the backend came with the release left it so (#2091)."""
+    setup, and that release's package has this engine (release_cuda_lacks). A setup from
+    before the backend came with the release left it so (#2091)."""
     if host_os() != "win32" or cfg.get("backend") == "cuda" or \
             (cfg.get("requested_backend") or "auto") != "auto":
         return None
@@ -1977,7 +2016,8 @@ def release_cuda_missing(cfg):
         return None
     cards = cfg.get("nvidia") or []
     sm = setup_hw.compute_cap_sm(cards[0].get("compute_cap")) if cards else None
-    if cfg.get("family") not in WINDOWS_CUDA_ENGINES or sm is None or sm < WINDOWS_CUDA_FLOOR:
+    if cfg.get("family") not in WINDOWS_CUDA_ENGINES or release_cuda_lacks(cfg.get("family"), tag) \
+            or sm is None or sm < WINDOWS_CUDA_FLOOR:
         return None
     return tag
 

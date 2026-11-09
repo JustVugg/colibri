@@ -1333,12 +1333,14 @@ static unsigned long long hy_pairs(const char *line) {
     p = strstr(p, "steps, ");
     return p ? strtoull(p + 7, NULL, 10) : ~0ull;
 }
-/* vkt_host_pairs alone: 12 pairs of three experts over five rows, all at once (an expert's
- * pairs grouped, its rows read once) and one by one; the same bits, and the float reference
- * within tol (the float form's or the integer form's error, whichever vk_tier.c computes) */
+/* vkt_host_pairs alone: 12 pairs of three experts over eight rows, all at once (an expert's
+ * pairs grouped, its rows read once: 7, 3 and 2 rows, so a kernel's paths for one to four rows
+ * and past four run) and one by one; the same bits, and the float reference within tol (the
+ * float form's or the integer form's error, whichever vk_tier.c computes; FP8 has only the float
+ * form, so 1e-5 for it) */
 static void host_pairs_case(double tol) {
-    enum { HP = 512, FP = 256, NE = 3, NR = 5, NP = 12 };
-    static const int pe[NP] = {0, 1, 2, 0, 1, 0, 2, 1, 0, 2, 2, 1}, pr[NP] = {0, 0, 0, 1, 1, 2, 2, 3, 3, 3, 4, 4};
+    enum { HP = 512, FP = 256, NE = 3, NR = 8, NP = 12 };
+    static const int pe[NP] = {0, 1, 2, 0, 1, 0, 2, 0, 0, 1, 0, 0}, pr[NP] = {0, 0, 1, 1, 2, 2, 3, 3, 4, 5, 6, 7};
     /* a GGUF's block types, and colibri's int4-g64 pairs (fmt 4) and int8 a row (fmt 1), the
      * host pool's layouts of VKT_SRC_I4U_PAIRS_GS and VKT_SRC_I8_ROW */
     static const int ty[7][2] = {{GQ_Q4_K, GQ_Q6_K}, {GQ_IQ2_XXS, GQ_IQ3_XXS}, {-4, -4}, {-1, -1}, {-5, -5}, {-7, -7}, {-12, -12}};
@@ -1388,7 +1390,7 @@ static void host_pairs_case(double tol) {
         printf("  %-16s %d pairs of %d experts: grouped %s one by one, worst relative error %.2e against the float reference\n",
                nm[c], NP, NE, diff ? "DIFFERS from" : "the same bits as", worst);
         CHECK(!diff, "host pairs %s: the grouped pairs are not the bits of each on its own", nm[c]);
-        CHECK(worst < tol, "host pairs %s: relative error %.3g", nm[c], worst);
+        CHECK(worst < (ty[c][0] == -12 && tol > 1e-5 ? 1e-5 : tol), "host pairs %s: relative error %.3g", nm[c], worst);
         free(x); free(gs); free(hs); free(all); free(one); free(hr);
         for (int e = 0; e < NE; e++) { mat_free(&xe[e].g); mat_free(&xe[e].u); mat_free(&xe[e].d); }
     }

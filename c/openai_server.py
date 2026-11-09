@@ -2,6 +2,7 @@
 """Dependency-free OpenAI-compatible HTTP gateway for the colibri engine."""
 
 import argparse
+import ast
 import codecs
 import collections
 import contextlib
@@ -21,6 +22,7 @@ import sys
 import threading
 import time
 import uuid
+import warnings
 
 import v4_dsml                      # vendored DeepSeek V4 DSML reference primitives
 import v41_dsml                     # ...and V4.1's, whose tag names differ by a space
@@ -668,17 +670,72 @@ def _tool_param_types(tools):
     return out
 
 
-def _coerce_arg(value, declared):
+# A model can write a list or a dict the way Python prints one rather than as JSON:
+# [7, 'x,y', None], a trailing comma. Where the schema declares an array or an object, such
+# text is read as a Python literal, JSON's null/true/false taken too, and kept only when it
+# is that container made of JSON values throughout (str keys; str, finite number, bool, None,
+# list, dict). The text is parsed, never run, and only below _LITERAL_MAX characters.
+_LITERAL_MAX = 1 << 18
+_LITERAL_NAMES = {"null": None, "true": True, "false": False}
+
+
+class _JsonNames(ast.NodeTransformer):
+    def visit_Name(self, node):
+        if node.id in _LITERAL_NAMES:
+            return ast.copy_location(ast.Constant(_LITERAL_NAMES[node.id]), node)
+        return node
+
+
+def _json_shaped(value):
+    if value is None or isinstance(value, (str, int)):
+        return True
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if isinstance(value, list):
+        return all(_json_shaped(v) for v in value)
+    if isinstance(value, dict):
+        return all(isinstance(k, str) and _json_shaped(v) for k, v in value.items())
+    return False
+
+
+def _literal_container(raw, kinds):
+    """The list (when `kinds` has "array") or dict (when it has "object") that a parameter's
+    text spells as a Python literal, or None."""
+    want = tuple(t for k, t in (("array", list), ("object", dict)) if k in kinds)
+    if not want or not isinstance(raw, str) or len(raw) > _LITERAL_MAX:
+        return None
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")      # an escape Python does not know is a warning
+            tree = _JsonNames().visit(ast.parse(raw.strip(), mode="eval"))
+            value = ast.literal_eval(tree)
+    except (SyntaxError, ValueError, TypeError, MemoryError, RecursionError):
+        return None
+    try:
+        if not isinstance(value, want) or not _json_shaped(value):
+            return None
+    except RecursionError:
+        return None
+    sys.stderr.write("[api] tool call: an %s argument written as a Python literal, read as one\n"
+                     % ("array" if isinstance(value, list) else "object"))
+    sys.stderr.flush()
+    return value
+
+
+def _coerce_arg(value, declared, literal=True):
     """Decode a raw <arg_value> according to the declared schema type.
 
     A string-typed parameter is kept verbatim -- never parsed as JSON. Everything else keeps
-    the previous permissive behaviour (parse if it parses, otherwise leave as text)."""
+    the previous permissive behaviour (parse if it parses, otherwise leave as text), except
+    that a declared array or object written as a Python literal is read as one unless
+    `literal` is False (the strict parser)."""
     if declared == "string":
         return value
     try:
         parsed = json.loads(value)
     except (json.JSONDecodeError, TypeError):
-        return value
+        container = _literal_container(value, (declared,)) if literal else None
+        return value if container is None else container
     if declared in ("integer", "number") and isinstance(parsed, bool):
         return value                              # `true` is not a number
     if declared and declared not in ("integer", "number", "boolean", "object", "array"):
@@ -810,7 +867,7 @@ def parse_glm_tool_calls_strict(reply, tools):
             declared_type = spec.get("type")
             if isinstance(declared_type, list):
                 declared_type = next((item for item in declared_type if item != "null"), None)
-            parsed = _coerce_arg(value, declared_type)
+            parsed = _coerce_arg(value, declared_type, literal=False)
             valid = (declared_type in (None, "string") or
                      (declared_type == "integer" and type(parsed) is int) or
                      (declared_type == "number" and type(parsed) in (int, float)) or
@@ -942,6 +999,26 @@ def _dsv4_tool_calls(tool_calls):
     return v4_dsml.render_tool_calls(tool_calls)
 
 
+def _dsml_arguments(calls):
+    """The vendored DSML decoders put a parameter marked string="false" into `arguments` as
+    the model wrote it, so a list in single quotes made the call's arguments text that is
+    not JSON. Such arguments are read as a Python literal dict of JSON values and carried as
+    JSON; arguments that are JSON already, or that read as nothing, stay as they were."""
+    for call in calls:
+        fn = call.get("function") if isinstance(call, dict) else None
+        if not isinstance(fn, dict) or not isinstance(fn.get("arguments"), str):
+            continue
+        try:
+            json.loads(fn["arguments"])
+            continue
+        except ValueError:
+            pass
+        container = _literal_container(fn["arguments"], ("object",))
+        if container is not None:
+            fn["arguments"] = json.dumps(container, ensure_ascii=False)
+    return calls
+
+
 def parse_dsv4_tool_calls(reply):
     """Parse DeepSeek V4 DSML tool calls out of one assistant reply.
 
@@ -952,6 +1029,7 @@ def parse_dsv4_tool_calls(reply):
     and any thinking/eos markers around the block are scrubbed.
     """
     content, calls = v4_dsml.parse_completion_text(reply)
+    calls = _dsml_arguments(calls)
     if not calls:
         cut = len(content)
         for marker in ("<" + DSV4_DSML + "tool_calls", "<" + DSV4_DSML + "invoke"):
@@ -1013,7 +1091,8 @@ def parse_k3_tool_calls(reply, tools=None):
                         try:
                             args[key] = json.loads(val)
                         except (json.JSONDecodeError, ValueError):
-                            args[key] = val
+                            container = _literal_container(val, (typ,))
+                            args[key] = val if container is None else container
                 arguments = json.dumps(args, ensure_ascii=False)
             calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
                           "function": {"name": name, "arguments": arguments}})
@@ -1039,6 +1118,7 @@ def parse_dsv41_tool_calls(reply):
     its token budget.
     """
     content, calls = v41_dsml.parse_completion_text(reply)
+    calls = _dsml_arguments(calls)
     if not calls:
         cut = len(content)
         for marker in (v41_dsml.TOOL_CALLS_PREFIX, v41_dsml.TOOL_CALL_PREFIX):
@@ -1148,6 +1228,18 @@ def detect_chat_flavor(family_id, model_dir):
             config = {}
         if isinstance(config, dict) and config.get("model_type") == "mistral_large4":
             return "mistral_large4"
+        # GLM-5.2 and the full GLM-5.3 share glm_moe_dsa. Their trained
+        # template, not the folder name or weight architecture, distinguishes
+        # the always-open GLM-5.3 reasoning contract (#2540).
+        for name in ("chat_template.jinja", "tokenizer_config.json"):
+            try:
+                text = (Path(model_dir) / name).read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            if ("[gMASK]<sop>" in text and
+                    "effective_reasoning_effort = reasoning_effort if reasoning_effort is defined" in text and
+                    "enable_thinking" not in text):
+                return "glm53_full"
         return None
     if family_id != "qwen36" or not model_dir:
         return None
@@ -2618,7 +2710,8 @@ def _muse_value(raw, schema):
         json.dumps(parsed, allow_nan=False)
         return parsed
     except ValueError:
-        return raw
+        container = _literal_container(raw, kinds)
+        return raw if container is None else container
 
 
 def parse_muse_tool_calls(reply, tools):
@@ -2912,7 +3005,12 @@ def _qwen_argument(raw, declared):
         return raw
     if "boolean" in kinds and value.lower() in ("true", "false"):
         return value.lower() == "true"
-    parsed = json.loads(raw)
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        parsed = _literal_container(raw, kinds)
+        if parsed is None:
+            raise
     numeric = type(parsed) in (int, float)
     finite = numeric and (type(parsed) is int or math.isfinite(parsed))
     if (("array" in kinds and isinstance(parsed, list)) or
@@ -4021,9 +4119,38 @@ def _glm53_tool_calls(calls):
     return "\n" + "".join(out) + "\n" if out else ""
 
 
+def _glm53_full_order_tool_results(messages):
+    """The full model's template orders an unambiguous tool run by call ID."""
+    result, i = list(messages), 0
+    while i < len(messages):
+        if not isinstance(messages[i], dict) or messages[i].get("role") != "tool":
+            i += 1
+            continue
+        end = i
+        while end < len(messages) and isinstance(messages[end], dict) and messages[end].get("role") == "tool":
+            end += 1
+        previous = messages[i - 1] if i else {}
+        calls = previous.get("tool_calls") if isinstance(previous, dict) and previous.get("role") == "assistant" else None
+        if isinstance(calls, list):
+            ids = [(call.get("tool_call_id") or call.get("id")) if isinstance(call, dict) else None for call in calls]
+            run = messages[i:end]
+            replies = [message.get("tool_call_id") or message.get("id") for message in run]
+            if (all(isinstance(value, str) and value for value in ids + replies)
+                    and len(set(ids)) == len(ids) and len(set(replies)) == len(replies)
+                    and all(value in ids for value in replies)):
+                order = {value: pos for pos, value in enumerate(ids)}
+                result[i:end] = sorted(run, key=lambda message: order[message.get("tool_call_id") or message.get("id")])
+        i = end
+    return result
+
+
 def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, tools=None,
-                      tool_choice=None, add_generation_prompt=True):
+                      tool_choice=None, add_generation_prompt=True, *, full_model=False):
     """Render the text-only subset of the official GLM-5.3-Flash chat template.
+
+    The full GLM-5.3 uses this text/tool subset too (`full_model=True`),
+    retaining its template's leading tool-call newline and grouped, ID-ordered
+    tool results. The Flash-only cache optimization below stays Flash-only.
 
     Not a variant of the GLM-5.2 renderer above, and the differences are not
     cosmetic. GLM-5.3 emits the reasoning-effort system line ALWAYS, because its
@@ -4042,6 +4169,9 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
     """
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
+
+    if full_model:
+        messages = _glm53_full_order_tool_results(messages)
 
     forced = None
     if isinstance(tool_choice, dict):
@@ -4112,7 +4242,8 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
         elif role == "system":
             prompt.append(f"<|system|>{content}")
         elif role == "tool":
-            prompt.append(f"<|observation|><tool_response>{content}</tool_response>")
+            prefix = "" if full_model and index > 0 and messages[index - 1].get("role") == "tool" else "<|observation|>"
+            prompt.append(f"{prefix}<tool_response>{content}</tool_response>")
         elif role == "assistant":
             reasoning = message.get("reasoning_content")
             if not isinstance(reasoning, str) and "</think>" in content:
@@ -4132,7 +4263,7 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
             # model's own trailing newline is stripped by .strip() and put back
             # by the renderer, so the tokens already line up, and changing that
             # case would break the one that works today.
-            if calls and not body:
+            if calls and not body and not full_model:
                 calls = calls.lstrip("\n")
             prompt.append(f"<|assistant|>{opened}{body}{calls}")
         else:
@@ -4786,12 +4917,30 @@ def resolve_generation_prompt(messages, body):
     return False
 
 
+CHAT_TEMPLATE_KWARGS = ("enable_thinking", "preserve_thinking", "reasoning_effort")
+
+
+def lift_chat_template_kwargs(body):
+    """A chat request's `chat_template_kwargs` (the template's own arguments, as several
+    OpenAI-compatible servers take them: {"enable_thinking": false} is how many clients turn a
+    Qwen model's thinking off) for the keys this gateway reads at the top of the body, where the
+    body does not set them itself. Before, they were ignored: a Qwen3.8 request that asked for no
+    thinking this way reasoned at xhigh. Their values go through the same checks there."""
+    kwargs = body.get("chat_template_kwargs")
+    if kwargs is None:
+        return body
+    if not isinstance(kwargs, dict):
+        raise APIError(400, "`chat_template_kwargs` must be an object.", "chat_template_kwargs")
+    lifted = {k: kwargs[k] for k in CHAT_TEMPLATE_KWARGS if k in kwargs and k not in body}
+    return dict(body, **lifted) if lifted else body
+
+
 def default_reasoning_effort():
     """The reasoning_effort of a chat request that names neither reasoning_effort nor
-    enable_thinking: Qwen3.8's and Muse Spark's templates think at xhigh unless told,
-    MiMo-V2.6's and LFM3's think too; the other families keep the older opt-in default
-    (none), which COLI_THINK=1 turns on for all of them."""
-    if chat_flavor() in ("qwen38", "muse"):
+    enable_thinking: Qwen3.8's, Muse Spark's and the full GLM-5.3's templates think at their
+    maximum unless told, MiMo-V2.6's and LFM3's think too; the other families keep the older
+    opt-in default (none), which COLI_THINK=1 turns on for all of them."""
+    if chat_flavor() in ("qwen38", "muse", "glm53_full"):
         return "xhigh"
     if ARCH == "mimo" or chat_flavor() == "lfm3" or os.environ.get("COLI_THINK", "0") == "1":
         return "high"
@@ -4858,6 +5007,10 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
     if ARCH == "qwen36":
         return render_chat_qwen(messages, enable_thinking, reasoning_effort, tools,
                                 tool_choice, add_generation_prompt, preserve_thinking)
+    if chat_flavor() == "glm53_full":
+        effort = {"minimal": "low", "low": "low", "medium": "high", "high": "high", "xhigh": "xhigh"}.get(
+            reasoning_effort, "xhigh" if enable_thinking else "low")
+        return render_chat_glm53(messages, True, effort, tools, tool_choice, add_generation_prompt, full_model=True)
     if chat_flavor() == "mistral_large4":
         return render_chat_mistral_large4(messages, enable_thinking, reasoning_effort, tools,
                                           tool_choice, add_generation_prompt)
@@ -4923,7 +5076,7 @@ def starts_in_reasoning(enable_thinking, add_generation_prompt=True):
         return False
     if chat_flavor() == "mistral_large4":   # its answer opens [THINK] itself (read as <think>)
         return False
-    return (enable_thinking or ARCH == "glm53") and add_generation_prompt
+    return (enable_thinking or ARCH == "glm53" or chat_flavor() == "glm53_full") and add_generation_prompt
 
 
 class ThinkingStreamSplit:
@@ -9720,6 +9873,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 "total_tokens": prompt + completion}
 
     def chat_completion(self, body, request_id):
+        body = lift_chat_template_kwargs(body)
         strict_tools = body.get("strict_tool_calls", False)
         if not isinstance(strict_tools, bool):
             raise APIError(400, "`strict_tool_calls` must be a boolean.", "strict_tool_calls")

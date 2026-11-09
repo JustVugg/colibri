@@ -1,0 +1,348 @@
+# Qwen3.8-Flash-Next on a Colab A100, mapped path: origin/dev against the change that remembers a refused block (2026-10-27)
+#
+# Question (written before the runs): on this card origin/dev's mapped path holds 13,784 of Qwen3.8's 24,576 int4 experts and the
+#   pool is refused the blocks for the other 10,792 ("failed 10792 refused by the pool" in the logs), each time it is asked again.
+#   With the change, are the experts on the card, the nll and the speed what origin/dev gives, and what happens to the tier's warm
+#   start? PPL=1, A B B A, 60 s of rest.
+# Hardware: a Colab A100 high-mem VM: NVIDIA A100-SXM4-80GB (81920 MiB, 0 MiB used before), driver 580.82.07, 12 threads (nproc),
+#   167 GiB of RAM, no swap; Vulkan through the driver's EGL library (an ICD json on libEGL_nvidia.so.0); the model on the VM's local
+#   NVMe (/mnt/local-scratch).
+# Model: Qwen/Qwen3.8-Flash-Next-FP8 at 236dfdf285828023ca3bcd3f37366c58a3469b13, routed experts int4-g64 from
+#   CerSov0k/Qwen3.8-Flash-Next-FP8-colibri-experts-int4g64 (experts-int4g64/).
+# Engines, cloned and built on the VM with make -C c qwen38 CUDA=1 VK=1 CUDA_ARCH=sm_80:
+#   A (dev2)  origin/dev c1c06ac6fcb32157e4da130fd96775a32a757052, qwen38 sha256 263f979c0c7e5b9dbf6c726ea1ae174bca6ff8f63a70b6afac94df23eafcc4b5
+#   B (lat)   the same tree with lat.patch (sha256 fd852f317a40e990eea47a072a995beb41ba301139245fe7ad724cd2707f687c; its engine code is the committed diff's but for two comments; checks.txt has lat.patch itself), qwen38 sha256 8393201da901d3ee2ec635d9b6ea066d904ae22bcb1db72582fae07cc3317125
+# Input: ref.json (sha256 366b41db5e1801932a1b7d82ffdd47967b7f730ed8bc83556be6a3c818dd63ae). PPL=1 reads it as a teacher-forced test: 64 prompt tokens, then 256 scored tokens, one decode
+#   step each, the same tokens on both sides (the first 320 ids of the first 20000 characters of a plain-text "I promessi sposi",
+#   sha256 f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f, encoded with the release's tokenizer.json).
+# Each run, a new process from the tree's root:
+#   cp /content/storia2.coli <model>/.coli_usage          (sha256 18c1b48a3383925054e9001f2369424095923411127deb3d4be8e49e4931debf; the history the VM's warm-up wrote; not kept here)
+#   env PPL=1 Q38_EXPERT_INT4=1 COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto COLI_TIMERS=1 OMP_NUM_THREADS=5 OMP_WAIT_POLICY=ACTIVE \
+#     OMP_PROC_BIND=close SNAP=<model> N_NEW=200 /usr/bin/time -v ./c/qwen38 512 8 ref.json
+#   with nvidia-smi every 2 s beside it and the VmRSS lines of /proc/<pid>/status every 2 s (not kept here).
+#   The path is the default of origin/dev on this card (mapped: no COLI_VK_STAGED).
+# Runs, in order: s1-dev2, s2-lat, s3-lat, s4-dev2.
+# s1-dev2  dev2  warm start  146.3 s  resident  13784  nll 2.4087   19.92 tok/s  wall 3:06.00  peak RSS 11.78 GB
+# s2-lat   lat   warm start   93.3 s  resident  13784  nll 2.4087   19.70 tok/s  wall 2:13.32  peak RSS 11.78 GB
+# s3-lat   lat   warm start   91.7 s  resident  13784  nll 2.4087   19.69 tok/s  wall 2:11.42  peak RSS 11.78 GB
+# s4-dev2  dev2  warm start  142.7 s  resident  13784  nll 2.4087   19.90 tok/s  wall 3:02.20  peak RSS 11.78 GB
+
+===== s1-dev2.log (sha256 b6bff92b9ea914b4ed26ef5a58c2f60d8bdd36a0e34f75a3942059e1851496ff): dev2 (whole log)
+== Qwen3.8-Flash-Next native text engine | cache=512/layer | CPU ==
+[tok] loaded 248044 base pieces + 33 added tokens (max id 248076) from /mnt/local-scratch/q38/tokenizer.json
+[qwen38] vision tower: 27 blocks, hidden 1152, 16 heads, patch 16, merge 2
+[qwen38] native text weights: prefix=model.language_model, 48 layers, PLE=1, cache=512/layer, FP8=native, BF16=native (resident matrices 10.88 GiB)
+[qwen38] MTP head mtp.*: wiring b (a norm per stream, fc_hidden per stream), RoPE base 1e+07, 172.66 MiB resident; routed experts F8_E4M3 from the snapshot (the int4-g64 sidecar covers the model's layers), cache 512 (Q38_MTP_CAP) x 4.69 MiB = 2.34 GiB full
+[qwen38] MTP norm weights, mean: embedding -0.7642, hidden -0.3284, mixer 3.7881 (q38_rms0 scales by 1+w; a plain norm's weights would sit near 1)
+[qtier] qwen38: the expert tier streams native FP8 experts only; the int4-g64 experts go to the Vulkan tier, the same card (COLI_VULKAN=0 keeps them on the CPU)
+[qwen38] trunk: 570 matrices int8 on the CPU (4.06 GiB, 8.10 GiB of BF16 released) in 6.0s; Q38_TRUNK_CPU_INT8=0 keeps BF16
+[qwen38] routed experts: int4-g64 from experts-int4g64/, 2764800 bytes (2.64 MiB) per expert (the snapshot's native FP8: 4915200 bytes); cache 512/layer x 48 layers = 63.28 GiB full; 167.7 GB available now holds 512/layer
+[VK] VRAM pressure-proofing: memory_priority on, memory_budget on
+[VK] ready: NVIDIA A100-SXM4-80GB, compute qfam 0, memtype 5, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096 (cooperative matrix)
+[VK] qwen38: device ready, dense matrices on the device (default)
+[VK] qwen38: dense chain on (a discrete GPU, beside the expert tier)
+[VK] qwen38 chain fit: free 85031190528 B, reserve 1073741824 B, fixed 643868928 B (the engine's 157329664 B, the pools' 486539264 B), tail 740634880 B, layers 84633216 151193728 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 B, matrices 77848084 143384092 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 B
+[VK] qwen38 chain: 48 of 48 layers on the device (3.72 GiB), 0 on the CPU (free 79.19 GiB, reserve 1.00 GiB)
+[qwen38] speculative decoding with the MTP head: off (the dense chain runs every layer on the device; Q38_MTP=1 drafts, the head's layer on the device too)
+[VK] chain: chain_gemv2 stages x in 48 KiB of shared memory, the device's limit
+[VK] qwen38 chain: 48 of 48 layers placed: 3721517928 B of matrices on the device (the fit counted 3721517928 B for these layers), chain buffers 263081728 B, device memory held 4093640704 B
+[VK] qwen38 chain: 48 layers on the device (12 QSA), 773 matrices resident, 9.8 MiB of parameters
+[VK] chain: 19 pipelines made before the expert tier, in 0.0 s (COLI_VK_CHAIN_PREWARM=0: at first use)
+[VK] qwen38: dense weights on the device only (a discrete GPU with room for them: 3.48 of 73.72 GiB free; COLI_VK_DENSE_HOST=1 keeps the host copy)
+[VK] qwen38: 724 dense matrices on the device only, 3.48 GiB of host RAM given back; kept on the host: the embedding (its rows are gathered on the CPU), the lm_head's int8 rows (the MTP draft list is scored from them), the vision tower, norms; RSS now 7.972 GiB
+[USAGE] expert history: 153120 selections (/mnt/local-scratch/q38/.coli_usage)
+[qwen38 MTP] draft vocabulary: top 16000 + 3/4 rule + conversation, counts from /mnt/local-scratch/q38/.coli_vocab (0 tokens, 0 distinct)
+[VK] tier qwen38: on, NVIDIA A100-SXM4-80GB, budget 72.98 GiB = 24576 experts of 2.6 MiB (fmt 4 gs 64, down fmt 4 gs 64; 749.0 MiB left for the dense chain's KV mirror and a prompt chunk), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[VK] tier qwen38: warm start, 24576 experts in 146.3s (9844 from the history, 14732 more to fill the device: every expert of the model)
+resident weights loaded in 16.0s | RSS after load: 11.78 GB
+[VK] qwen38 chain: prompt chunks of up to 8192 rows (982 KiB a row; 39.20 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+[VK] tier qwen38: no device memory for the streaming slots, cold experts stay on the CPU
+[VK] qwen38: 0 matmuls on the GPU (774 matrices resident, 4168.9 MiB; placed int8 553, bf16 172, f32 0)
+[VK] qwen38 chain: 256 forwards, 25067 frames (393527 ops, 197888 matmuls, 556 tiled GEMM), 5293.5 ms waiting for the device, 5038.1 ms of routed experts on the host, 0 layer steps with the routed experts in the frame (0 of them a prompt chunk's, 0 in the integer form), 325.8 MiB on the device
+[VK] tier qwen38 run: device 152986 of 153120 routed experts (99.9%; this run 152986 of 153120) | CPU RAM hits 5, disk loads 129 | resident 13784 (budget 13784, 35.49 GiB of 72.98 GiB, 142 blocks, frag 0.81) | uploads 13784 (31.55 GiB, 13784 warm), evictions 0, skipped 0 queue + 0 rate, failed 10792 | device 849.3 ms, CPU share 701.0 ms, waited 2941.0 ms (0% of device time hidden) | failed: 10792 refused by the pool, 0 copies to the device, 0 not taken by the batch | balance: device share 1.00, 0 rows handed to the CPU | exclusive: 0 RAM copies of device experts given up first
+[STATS] 306240 selections across 10015 distinct experts -> /mnt/local-scratch/q38/.coli_usage
+[STATS] 0 tokens across 0 distinct -> /mnt/local-scratch/q38/.coli_vocab
+TF-NLL: 2.4087 nats/token over 256 tokens | ppl = 11.12
+Expert cache hit rate: 3.7% (hit=5 miss=129)
+Speed: 19.92 tok/s (12.9s for 256 tokens) | PEAK RSS: 11.78 GB
+[VK] qwen38: dense weights at exit: 724 matrices on the device only (3.48 GiB of host copies dropped), 0 read back from disk for the CPU (0.0 MiB); RSS 6.289 GiB
+	Command being timed: "./c/qwen38 512 8 /content/ref.json"
+	User time (seconds): 173.67
+	System time (seconds): 141.03
+	Percent of CPU this job got: 169%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 3:06.00
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 12350044
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 3794830
+	Voluntary context switches: 68432
+	Involuntary context switches: 8028
+	Swaps: 0
+	File system inputs: 157021656
+	File system outputs: 240
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+
+===== s2-lat.log (sha256 82d05b9d4a11d6721a16bc86a5aa1bfa956ca19cf43be6c56106519a19dfc198): lat (whole log)
+== Qwen3.8-Flash-Next native text engine | cache=512/layer | CPU ==
+[tok] loaded 248044 base pieces + 33 added tokens (max id 248076) from /mnt/local-scratch/q38/tokenizer.json
+[qwen38] vision tower: 27 blocks, hidden 1152, 16 heads, patch 16, merge 2
+[qwen38] native text weights: prefix=model.language_model, 48 layers, PLE=1, cache=512/layer, FP8=native, BF16=native (resident matrices 10.88 GiB)
+[qwen38] MTP head mtp.*: wiring b (a norm per stream, fc_hidden per stream), RoPE base 1e+07, 172.66 MiB resident; routed experts F8_E4M3 from the snapshot (the int4-g64 sidecar covers the model's layers), cache 512 (Q38_MTP_CAP) x 4.69 MiB = 2.34 GiB full
+[qwen38] MTP norm weights, mean: embedding -0.7642, hidden -0.3284, mixer 3.7881 (q38_rms0 scales by 1+w; a plain norm's weights would sit near 1)
+[qtier] qwen38: the expert tier streams native FP8 experts only; the int4-g64 experts go to the Vulkan tier, the same card (COLI_VULKAN=0 keeps them on the CPU)
+[qwen38] trunk: 570 matrices int8 on the CPU (4.06 GiB, 8.10 GiB of BF16 released) in 5.9s; Q38_TRUNK_CPU_INT8=0 keeps BF16
+[qwen38] routed experts: int4-g64 from experts-int4g64/, 2764800 bytes (2.64 MiB) per expert (the snapshot's native FP8: 4915200 bytes); cache 512/layer x 48 layers = 63.28 GiB full; 167.7 GB available now holds 512/layer
+[VK] VRAM pressure-proofing: memory_priority on, memory_budget on
+[VK] ready: NVIDIA A100-SXM4-80GB, compute qfam 0, memtype 5, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096 (cooperative matrix)
+[VK] qwen38: device ready, dense matrices on the device (default)
+[VK] qwen38: dense chain on (a discrete GPU, beside the expert tier)
+[VK] qwen38 chain fit: free 85031190528 B, reserve 1073741824 B, fixed 643868928 B (the engine's 157329664 B, the pools' 486539264 B), tail 740634880 B, layers 84633216 151193728 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 B, matrices 77848084 143384092 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 B
+[VK] qwen38 chain: 48 of 48 layers on the device (3.72 GiB), 0 on the CPU (free 79.19 GiB, reserve 1.00 GiB)
+[qwen38] speculative decoding with the MTP head: off (the dense chain runs every layer on the device; Q38_MTP=1 drafts, the head's layer on the device too)
+[VK] chain: chain_gemv2 stages x in 48 KiB of shared memory, the device's limit
+[VK] qwen38 chain: 48 of 48 layers placed: 3721517928 B of matrices on the device (the fit counted 3721517928 B for these layers), chain buffers 263081728 B, device memory held 4093640704 B
+[VK] qwen38 chain: 48 layers on the device (12 QSA), 773 matrices resident, 9.8 MiB of parameters
+[VK] chain: 19 pipelines made before the expert tier, in 0.2 s (COLI_VK_CHAIN_PREWARM=0: at first use)
+[VK] qwen38: dense weights on the device only (a discrete GPU with room for them: 3.48 of 73.72 GiB free; COLI_VK_DENSE_HOST=1 keeps the host copy)
+[VK] qwen38: 724 dense matrices on the device only, 3.48 GiB of host RAM given back; kept on the host: the embedding (its rows are gathered on the CPU), the lm_head's int8 rows (the MTP draft list is scored from them), the vision tower, norms; RSS now 7.985 GiB
+[USAGE] expert history: 153120 selections (/mnt/local-scratch/q38/.coli_usage)
+[qwen38 MTP] draft vocabulary: top 16000 + 3/4 rule + conversation, counts from /mnt/local-scratch/q38/.coli_vocab (0 tokens, 0 distinct)
+[VK] tier qwen38: on, NVIDIA A100-SXM4-80GB, budget 72.98 GiB = 24576 experts of 2.6 MiB (fmt 4 gs 64, down fmt 4 gs 64; 749.0 MiB left for the dense chain's KV mirror and a prompt chunk), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[VK] tier qwen38: warm start, 24576 experts in 93.3s (9844 from the history, 14732 more to fill the device: every expert of the model)
+resident weights loaded in 16.0s | RSS after load: 11.78 GB
+[VK] qwen38 chain: prompt chunks of up to 8192 rows (982 KiB a row; 39.20 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+[VK] tier qwen38: no device memory for the streaming slots, cold experts stay on the CPU
+[VK] qwen38: 0 matmuls on the GPU (774 matrices resident, 4168.9 MiB; placed int8 553, bf16 172, f32 0)
+[VK] qwen38 chain: 256 forwards, 25067 frames (393527 ops, 197888 matmuls, 556 tiled GEMM), 5434.5 ms waiting for the device, 5074.0 ms of routed experts on the host, 0 layer steps with the routed experts in the frame (0 of them a prompt chunk's, 0 in the integer form), 325.8 MiB on the device
+[VK] tier qwen38 run: device 152986 of 153120 routed experts (99.9%; this run 152986 of 153120) | CPU RAM hits 5, disk loads 129 | resident 13784 (budget 13784, 35.49 GiB of 72.98 GiB, 142 blocks, frag 0.88) | uploads 13784 (31.55 GiB, 13784 warm), evictions 0, skipped 0 queue + 0 rate, failed 10792 | device 924.8 ms, CPU share 676.4 ms, waited 3017.3 ms (0% of device time hidden) | failed: 10792 refused by the pool, 0 copies to the device, 0 not taken by the batch | balance: device share 1.00, 0 rows handed to the CPU | exclusive: 0 RAM copies of device experts given up first
+[STATS] 306240 selections across 10015 distinct experts -> /mnt/local-scratch/q38/.coli_usage
+[STATS] 0 tokens across 0 distinct -> /mnt/local-scratch/q38/.coli_vocab
+TF-NLL: 2.4087 nats/token over 256 tokens | ppl = 11.12
+Expert cache hit rate: 3.7% (hit=5 miss=129)
+Speed: 19.70 tok/s (13.0s for 256 tokens) | PEAK RSS: 11.78 GB
+[VK] qwen38: dense weights at exit: 724 matrices on the device only (3.48 GiB of host copies dropped), 0 read back from disk for the CPU (0.0 MiB); RSS 6.289 GiB
+	Command being timed: "./c/qwen38 512 8 /content/ref.json"
+	User time (seconds): 190.38
+	System time (seconds): 49.15
+	Percent of CPU this job got: 179%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 2:13.32
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 12349944
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 3795256
+	Voluntary context switches: 46740
+	Involuntary context switches: 5828
+	Swaps: 0
+	File system inputs: 156805184
+	File system outputs: 392
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+
+===== s3-lat.log (sha256 13847025972336d50db3a3ebce1e2753a4477aca0f8618b16decae9f731d7dca): lat (whole log)
+== Qwen3.8-Flash-Next native text engine | cache=512/layer | CPU ==
+[tok] loaded 248044 base pieces + 33 added tokens (max id 248076) from /mnt/local-scratch/q38/tokenizer.json
+[qwen38] vision tower: 27 blocks, hidden 1152, 16 heads, patch 16, merge 2
+[qwen38] native text weights: prefix=model.language_model, 48 layers, PLE=1, cache=512/layer, FP8=native, BF16=native (resident matrices 10.88 GiB)
+[qwen38] MTP head mtp.*: wiring b (a norm per stream, fc_hidden per stream), RoPE base 1e+07, 172.66 MiB resident; routed experts F8_E4M3 from the snapshot (the int4-g64 sidecar covers the model's layers), cache 512 (Q38_MTP_CAP) x 4.69 MiB = 2.34 GiB full
+[qwen38] MTP norm weights, mean: embedding -0.7642, hidden -0.3284, mixer 3.7881 (q38_rms0 scales by 1+w; a plain norm's weights would sit near 1)
+[qtier] qwen38: the expert tier streams native FP8 experts only; the int4-g64 experts go to the Vulkan tier, the same card (COLI_VULKAN=0 keeps them on the CPU)
+[qwen38] trunk: 570 matrices int8 on the CPU (4.06 GiB, 8.10 GiB of BF16 released) in 5.9s; Q38_TRUNK_CPU_INT8=0 keeps BF16
+[qwen38] routed experts: int4-g64 from experts-int4g64/, 2764800 bytes (2.64 MiB) per expert (the snapshot's native FP8: 4915200 bytes); cache 512/layer x 48 layers = 63.28 GiB full; 167.7 GB available now holds 512/layer
+[VK] VRAM pressure-proofing: memory_priority on, memory_budget on
+[VK] ready: NVIDIA A100-SXM4-80GB, compute qfam 0, memtype 5, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096 (cooperative matrix)
+[VK] qwen38: device ready, dense matrices on the device (default)
+[VK] qwen38: dense chain on (a discrete GPU, beside the expert tier)
+[VK] qwen38 chain fit: free 85031190528 B, reserve 1073741824 B, fixed 643868928 B (the engine's 157329664 B, the pools' 486539264 B), tail 740634880 B, layers 84633216 151193728 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 B, matrices 77848084 143384092 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 B
+[VK] qwen38 chain: 48 of 48 layers on the device (3.72 GiB), 0 on the CPU (free 79.19 GiB, reserve 1.00 GiB)
+[qwen38] speculative decoding with the MTP head: off (the dense chain runs every layer on the device; Q38_MTP=1 drafts, the head's layer on the device too)
+[VK] chain: chain_gemv2 stages x in 48 KiB of shared memory, the device's limit
+[VK] qwen38 chain: 48 of 48 layers placed: 3721517928 B of matrices on the device (the fit counted 3721517928 B for these layers), chain buffers 263081728 B, device memory held 4093640704 B
+[VK] qwen38 chain: 48 layers on the device (12 QSA), 773 matrices resident, 9.8 MiB of parameters
+[VK] chain: 19 pipelines made before the expert tier, in 0.0 s (COLI_VK_CHAIN_PREWARM=0: at first use)
+[VK] qwen38: dense weights on the device only (a discrete GPU with room for them: 3.48 of 73.72 GiB free; COLI_VK_DENSE_HOST=1 keeps the host copy)
+[VK] qwen38: 724 dense matrices on the device only, 3.48 GiB of host RAM given back; kept on the host: the embedding (its rows are gathered on the CPU), the lm_head's int8 rows (the MTP draft list is scored from them), the vision tower, norms; RSS now 7.972 GiB
+[USAGE] expert history: 153120 selections (/mnt/local-scratch/q38/.coli_usage)
+[qwen38 MTP] draft vocabulary: top 16000 + 3/4 rule + conversation, counts from /mnt/local-scratch/q38/.coli_vocab (0 tokens, 0 distinct)
+[VK] tier qwen38: on, NVIDIA A100-SXM4-80GB, budget 72.98 GiB = 24576 experts of 2.6 MiB (fmt 4 gs 64, down fmt 4 gs 64; 749.0 MiB left for the dense chain's KV mirror and a prompt chunk), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[VK] tier qwen38: warm start, 24576 experts in 91.7s (9844 from the history, 14732 more to fill the device: every expert of the model)
+resident weights loaded in 16.0s | RSS after load: 11.78 GB
+[VK] qwen38 chain: prompt chunks of up to 8192 rows (982 KiB a row; 39.20 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+[VK] tier qwen38: no device memory for the streaming slots, cold experts stay on the CPU
+[VK] qwen38: 0 matmuls on the GPU (774 matrices resident, 4168.9 MiB; placed int8 553, bf16 172, f32 0)
+[VK] qwen38 chain: 256 forwards, 25067 frames (393527 ops, 197888 matmuls, 556 tiled GEMM), 5456.4 ms waiting for the device, 5085.5 ms of routed experts on the host, 0 layer steps with the routed experts in the frame (0 of them a prompt chunk's, 0 in the integer form), 325.8 MiB on the device
+[VK] tier qwen38 run: device 152986 of 153120 routed experts (99.9%; this run 152986 of 153120) | CPU RAM hits 5, disk loads 129 | resident 13784 (budget 13784, 35.49 GiB of 72.98 GiB, 142 blocks, frag 0.81) | uploads 13784 (31.55 GiB, 13784 warm), evictions 0, skipped 0 queue + 0 rate, failed 10792 | device 935.3 ms, CPU share 676.8 ms, waited 3028.0 ms (0% of device time hidden) | failed: 10792 refused by the pool, 0 copies to the device, 0 not taken by the batch | balance: device share 1.00, 0 rows handed to the CPU | exclusive: 0 RAM copies of device experts given up first
+[STATS] 306240 selections across 10015 distinct experts -> /mnt/local-scratch/q38/.coli_usage
+[STATS] 0 tokens across 0 distinct -> /mnt/local-scratch/q38/.coli_vocab
+TF-NLL: 2.4087 nats/token over 256 tokens | ppl = 11.12
+Expert cache hit rate: 3.7% (hit=5 miss=129)
+Speed: 19.69 tok/s (13.0s for 256 tokens) | PEAK RSS: 11.78 GB
+[VK] qwen38: dense weights at exit: 724 matrices on the device only (3.48 GiB of host copies dropped), 0 read back from disk for the CPU (0.0 MiB); RSS 6.289 GiB
+	Command being timed: "./c/qwen38 512 8 /content/ref.json"
+	User time (seconds): 188.92
+	System time (seconds): 50.12
+	Percent of CPU this job got: 181%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 2:11.42
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 12350076
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 3794812
+	Voluntary context switches: 45196
+	Involuntary context switches: 5750
+	Swaps: 0
+	File system inputs: 154532808
+	File system outputs: 248
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+
+===== s4-dev2.log (sha256 fe1559896f8e9726344c9544a68346d3e7a02bf621dfb71e6f7f30314d129543): dev2 (whole log)
+== Qwen3.8-Flash-Next native text engine | cache=512/layer | CPU ==
+[tok] loaded 248044 base pieces + 33 added tokens (max id 248076) from /mnt/local-scratch/q38/tokenizer.json
+[qwen38] vision tower: 27 blocks, hidden 1152, 16 heads, patch 16, merge 2
+[qwen38] native text weights: prefix=model.language_model, 48 layers, PLE=1, cache=512/layer, FP8=native, BF16=native (resident matrices 10.88 GiB)
+[qwen38] MTP head mtp.*: wiring b (a norm per stream, fc_hidden per stream), RoPE base 1e+07, 172.66 MiB resident; routed experts F8_E4M3 from the snapshot (the int4-g64 sidecar covers the model's layers), cache 512 (Q38_MTP_CAP) x 4.69 MiB = 2.34 GiB full
+[qwen38] MTP norm weights, mean: embedding -0.7642, hidden -0.3284, mixer 3.7881 (q38_rms0 scales by 1+w; a plain norm's weights would sit near 1)
+[qtier] qwen38: the expert tier streams native FP8 experts only; the int4-g64 experts go to the Vulkan tier, the same card (COLI_VULKAN=0 keeps them on the CPU)
+[qwen38] trunk: 570 matrices int8 on the CPU (4.06 GiB, 8.10 GiB of BF16 released) in 5.9s; Q38_TRUNK_CPU_INT8=0 keeps BF16
+[qwen38] routed experts: int4-g64 from experts-int4g64/, 2764800 bytes (2.64 MiB) per expert (the snapshot's native FP8: 4915200 bytes); cache 512/layer x 48 layers = 63.28 GiB full; 167.7 GB available now holds 512/layer
+[VK] VRAM pressure-proofing: memory_priority on, memory_budget on
+[VK] ready: NVIDIA A100-SXM4-80GB, compute qfam 0, memtype 5, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096 (cooperative matrix)
+[VK] qwen38: device ready, dense matrices on the device (default)
+[VK] qwen38: dense chain on (a discrete GPU, beside the expert tier)
+[VK] qwen38 chain fit: free 85031190528 B, reserve 1073741824 B, fixed 643868928 B (the engine's 157329664 B, the pools' 486539264 B), tail 740634880 B, layers 84633216 151193728 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 84633216 84633216 84633216 73296128 B, matrices 77848084 143384092 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 77848084 77848084 77848084 71120908 B
+[VK] qwen38 chain: 48 of 48 layers on the device (3.72 GiB), 0 on the CPU (free 79.19 GiB, reserve 1.00 GiB)
+[qwen38] speculative decoding with the MTP head: off (the dense chain runs every layer on the device; Q38_MTP=1 drafts, the head's layer on the device too)
+[VK] chain: chain_gemv2 stages x in 48 KiB of shared memory, the device's limit
+[VK] qwen38 chain: 48 of 48 layers placed: 3721517928 B of matrices on the device (the fit counted 3721517928 B for these layers), chain buffers 263081728 B, device memory held 4093640704 B
+[VK] qwen38 chain: 48 layers on the device (12 QSA), 773 matrices resident, 9.8 MiB of parameters
+[VK] chain: 19 pipelines made before the expert tier, in 0.0 s (COLI_VK_CHAIN_PREWARM=0: at first use)
+[VK] qwen38: dense weights on the device only (a discrete GPU with room for them: 3.48 of 73.72 GiB free; COLI_VK_DENSE_HOST=1 keeps the host copy)
+[VK] qwen38: 724 dense matrices on the device only, 3.48 GiB of host RAM given back; kept on the host: the embedding (its rows are gathered on the CPU), the lm_head's int8 rows (the MTP draft list is scored from them), the vision tower, norms; RSS now 7.972 GiB
+[USAGE] expert history: 153120 selections (/mnt/local-scratch/q38/.coli_usage)
+[qwen38 MTP] draft vocabulary: top 16000 + 3/4 rule + conversation, counts from /mnt/local-scratch/q38/.coli_vocab (0 tokens, 0 distinct)
+[VK] tier qwen38: on, NVIDIA A100-SXM4-80GB, budget 72.98 GiB = 24576 experts of 2.6 MiB (fmt 4 gs 64, down fmt 4 gs 64; 749.0 MiB left for the dense chain's KV mirror and a prompt chunk), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[VK] tier qwen38: warm start, 24576 experts in 142.7s (9844 from the history, 14732 more to fill the device: every expert of the model)
+resident weights loaded in 16.0s | RSS after load: 11.78 GB
+[VK] qwen38 chain: prompt chunks of up to 8192 rows (982 KiB a row; 39.20 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+[VK] tier qwen38: no device memory for the streaming slots, cold experts stay on the CPU
+[VK] qwen38: 0 matmuls on the GPU (774 matrices resident, 4168.9 MiB; placed int8 553, bf16 172, f32 0)
+[VK] qwen38 chain: 256 forwards, 25067 frames (393527 ops, 197888 matmuls, 556 tiled GEMM), 5314.6 ms waiting for the device, 5049.4 ms of routed experts on the host, 0 layer steps with the routed experts in the frame (0 of them a prompt chunk's, 0 in the integer form), 325.8 MiB on the device
+[VK] tier qwen38 run: device 152986 of 153120 routed experts (99.9%; this run 152986 of 153120) | CPU RAM hits 5, disk loads 129 | resident 13784 (budget 13784, 35.49 GiB of 72.98 GiB, 142 blocks, frag 0.81) | uploads 13784 (31.55 GiB, 13784 warm), evictions 0, skipped 0 queue + 0 rate, failed 10792 | device 855.7 ms, CPU share 672.4 ms, waited 2966.3 ms (0% of device time hidden) | failed: 10792 refused by the pool, 0 copies to the device, 0 not taken by the batch | balance: device share 1.00, 0 rows handed to the CPU | exclusive: 0 RAM copies of device experts given up first
+[STATS] 306240 selections across 10015 distinct experts -> /mnt/local-scratch/q38/.coli_usage
+[STATS] 0 tokens across 0 distinct -> /mnt/local-scratch/q38/.coli_vocab
+TF-NLL: 2.4087 nats/token over 256 tokens | ppl = 11.12
+Expert cache hit rate: 3.7% (hit=5 miss=129)
+Speed: 19.90 tok/s (12.9s for 256 tokens) | PEAK RSS: 11.78 GB
+[VK] qwen38: dense weights at exit: 724 matrices on the device only (3.48 GiB of host copies dropped), 0 read back from disk for the CPU (0.0 MiB); RSS 6.289 GiB
+	Command being timed: "./c/qwen38 512 8 /content/ref.json"
+	User time (seconds): 170.99
+	System time (seconds): 143.20
+	Percent of CPU this job got: 172%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 3:02.20
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 12350040
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 3794826
+	Voluntary context switches: 57825
+	Involuntary context switches: 8396
+	Swaps: 0
+	File system inputs: 155051968
+	File system outputs: 240
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+
+===== n1-apt.log (sha256 5544b524166f9395cf801447a5b6500d510652de33b78389d9e54983ed1b6cd2): the VM: nvidia-smi (name, driver, memory), nproc, free -g, the disks, and the start of vulkaninfo (whole log)
+W: Skipping acquire of configured file 'main/source/Sources' as repository 'https://r2u.stat.illinois.edu/ubuntu noble InRelease' does not seem to provide it (sources.list entry misspelt?)
+name, driver_version, memory.total [MiB], memory.used [MiB]
+NVIDIA A100-SXM4-80GB, 580.82.07, 81920 MiB, 0 MiB
+0
+12
+               total        used        free      shared  buff/cache   available
+Mem:             167           2         161           0           4         164
+Swap:              0           0           0
+/dev/nvme0n1    369G   28K  350G   1% /mnt/local-scratch
+overlay         236G   43G  194G  19% /
+	deviceName        = NVIDIA A100-SXM4-80GB
+	queueProperties[0]:
+		queueCount                  = 16
+		queueFlags                  = QUEUE_GRAPHICS_BIT | QUEUE_COMPUTE_BIT | QUEUE_TRANSFER_BIT | QUEUE_SPARSE_BINDING_BIT
+	queueProperties[1]:
+		queueCount                  = 2
+		queueFlags                  = QUEUE_TRANSFER_BIT | QUEUE_SPARSE_BINDING_BIT
+	queueProperties[2]:
+		queueCount                  = 8
+		queueFlags                  = QUEUE_COMPUTE_BIT | QUEUE_TRANSFER_BIT | QUEUE_SPARSE_BINDING_BIT
+	queueProperties[3]:
+		queueCount                  = 5
+		queueFlags                  = QUEUE_TRANSFER_BIT | QUEUE_SPARSE_BINDING_BIT | QUEUE_VIDEO_DECODE_BIT_KHR
+	queueProperties[4]:
+		queueCount                  = 1
+		queueFlags                  = QUEUE_TRANSFER_BIT | QUEUE_SPARSE_BINDING_BIT | QUEUE_OPTICAL_FLOW_BIT_NV
+
+===== nll.sh (sha256 787d96b624a5be1f99a524a6e3a4876c9714b90309e2f1de5c4f2c773111a6c1): excerpt, the lines matching /REV=|HFX=|hf download/. a script of the session (not in the repository) that prepared this VM before lat3.sh ran: the revision and the experts it fetched
+DEV=c1c06ac6fcb32157e4da130fd96775a32a757052 REV=236dfdf285828023ca3bcd3f37366c58a3469b13
+HFX=CerSov0k/Qwen3.8-Flash-Next-FP8-colibri-experts-int4g64
+( s n3-model "hf download Qwen/Qwen3.8-Flash-Next-FP8 --revision $REV --local-dir $M > /dev/null && du -sh $M &&
+  hf download $HFX --include 'experts-int4g64/*' --local-dir $M > /dev/null &&
+  hf download $HFX README.md --local-dir /content/hfx > /dev/null && cd $M &&
+
+===== lat3.log (sha256 eca8b1a47de93709b27ee9e5fe8d355604006520044b7ee6cba329e4534ea390): the chain: each step with its time and exit code, then the summary lines (whole log)
+[09:33:29] l1-git
+[09:33:30] l1-git rc=0 1 s
+[09:33:30] l2-build
+[09:35:00] l2-build rc=0 90 s
+[09:35:00] l3-test
+[09:35:41] l3-test rc=0 41 s
+[09:35:41] c1-cpu
+[09:37:21] c1-cpu rc=0 100 s
+[09:38:21] s1-dev2
+[09:41:27] s1-dev2 rc=0 186 s
+[09:42:27] s2-lat
+[09:44:40] s2-lat rc=0 133 s
+[09:45:40] s3-lat
+[09:47:51] s3-lat rc=0 131 s
+[09:48:51] s4-dev2
+[09:51:54] s4-dev2 rc=0 183 s
+/content/logs/c1-cpu.log:TF-NLL: 2.3834 nats/token over 256 tokens | ppl = 10.84
+/content/logs/c1-cpu.log:Speed: 3.36 tok/s (76.1s for 256 tokens) | PEAK RSS: 34.66 GB
+/content/logs/s1-dev2.log:[VK] tier qwen38 run: device 152986 of 153120 routed experts (99.9%; this run 152986 of 153120) | CPU RAM hits 5, disk loads 129 | resident 13784 (budget 13784, 35.49 GiB of 72.98 GiB, 142 blocks, frag 0.81) | uploads 13784 (31.55 GiB
+/content/logs/s1-dev2.log:TF-NLL: 2.4087 nats/token over 256 tokens | ppl = 11.12
+/content/logs/s1-dev2.log:Speed: 19.92 tok/s (12.9s for 256 tokens) | PEAK RSS: 11.78 GB
+/content/logs/s2-lat.log:[VK] tier qwen38 run: device 152986 of 153120 routed experts (99.9%; this run 152986 of 153120) | CPU RAM hits 5, disk loads 129 | resident 13784 (budget 13784, 35.49 GiB of 72.98 GiB, 142 blocks, frag 0.88) | uploads 13784 (31.55 GiB,
+/content/logs/s2-lat.log:TF-NLL: 2.4087 nats/token over 256 tokens | ppl = 11.12
+/content/logs/s2-lat.log:Speed: 19.70 tok/s (13.0s for 256 tokens) | PEAK RSS: 11.78 GB
+/content/logs/s3-lat.log:[VK] tier qwen38 run: device 152986 of 153120 routed experts (99.9%; this run 152986 of 153120) | CPU RAM hits 5, disk loads 129 | resident 13784 (budget 13784, 35.49 GiB of 72.98 GiB, 142 blocks, frag 0.81) | uploads 13784 (31.55 GiB,
+/content/logs/s3-lat.log:TF-NLL: 2.4087 nats/token over 256 tokens | ppl = 11.12
+/content/logs/s3-lat.log:Speed: 19.69 tok/s (13.0s for 256 tokens) | PEAK RSS: 11.78 GB
+/content/logs/s4-dev2.log:[VK] tier qwen38 run: device 152986 of 153120 routed experts (99.9%; this run 152986 of 153120) | CPU RAM hits 5, disk loads 129 | resident 13784 (budget 13784, 35.49 GiB of 72.98 GiB, 142 blocks, frag 0.81) | uploads 13784 (31.55 GiB
+/content/logs/s4-dev2.log:TF-NLL: 2.4087 nats/token over 256 tokens | ppl = 11.12
+/content/logs/s4-dev2.log:Speed: 19.90 tok/s (12.9s for 256 tokens) | PEAK RSS: 11.78 GB
+

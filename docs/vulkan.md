@@ -810,12 +810,25 @@ one of each.
 
 ### A second device (`COLI_VK_DEV2`)
 
+Both devices independently probe the host-visible device-local allocation window
+before choosing mapped or staged expert uploads. A driver can report a large heap
+while refusing mapped allocations well below that size; the secondary now uses
+the same probe as the primary. `COLI_VK_STAGED=0` or `1` still overrides the
+automatic decision on both devices. The secondary's startup log identifies its
+choice with `dev2 memory`.
+
+This addresses the missing secondary-device probe investigated in #2556. It does
+not guarantee a dual-GPU speedup: the secondary's execution path and host/device
+placement still need measurements on the actual pair of cards.
+
+
 The dense chain can put layers there too: [Layers on two devices](#layers-on-two-devices).
 
 A machine with two GPUs (a V100 beside a GTX 1070, an RX 9070 beside an RX 580) can
 give the tier the memory of both. `COLI_VK_DEV2=auto` takes the best GPU that is not the
 primary device (a discrete card before an integrated one); `COLI_VK_DEV2=<index>` takes
-that entry of the Vulkan enumeration (`COLI_VK_DEV` picks the primary one the same way).
+that entry of the Vulkan enumeration (`COLI_VK_DEV` picks the primary one the same way;
+on a Vulkan build without CUDA, `coli chat --gpu 1,0` sets both).
 Every engine on the tier gets it, with nothing else to set:
 
 - **What goes where.** The primary device keeps its budget as before. The second
@@ -1303,13 +1316,13 @@ f32 throughout, as the CPU's f32 path.
 | `COLI_VK_CHAIN_GEMV` | on | `0`: the decode matrices take `qmatmul.comp`'s GEMV instead of `chain_gemv.comp`'s. |
 | `COLI_VK_CHAIN_GEMV_NR` | on | `1`: a speculative verify's rows take `chain_gemv.comp` a workgroup a row, each reading every weight, instead of up to four sharing every weight load ([the dense chain](#the-dense-chain-vk_chainc)). |
 | `COLI_VK_DNREC_ROWS` | on | A prompt chunk's DeltaNet recurrence (from 8 rows) on `chain_dnrec_rows.comp`: per block of up to 16 rows the q and k norms, beta and decay in parallel, then the rows in order with no barrier (the column's parts joined by shuffles), then the outputs' gated norm in parallel: three barriers a block where `chain_dnrec.comp` takes four a row. On an RTX PRO 4000 (Qwen3.6 int4-g64, 467-token prompt) the prefill went from 1501-1579 to 1758-1873 tok/s, the decode unchanged (76.4-77.3); Qwen3.8 IQ2_S/Q2_0 with 19 GiB in the host pool 143.7-144.9 to 147.1-148.5. `0`: `chain_dnrec.comp` for every row count. |
-| `COLI_VK_ATTN_DEC` | on | A decode step's or a verify's attention (up to 4 rows, no selection list) over 128 positions or more on `chain_attn_dec.comp`: the positions in blocks of 64 (more while the blocks would pass 1024 workgroups), a workgroup a (head, block, row) for the block's scores (a subgroup a position), max, sum and weighted values, then a pass that joins the blocks (the sink's logit with them) and applies the gate. `chain_attn.comp` gives a head one workgroup that walks every position: Qwen3.6's 16 heads left an RTX PRO 4000 all but idle, about 160 us a layer at 700 positions. Decode Qwen3.6 int4-g64 76.5-77.6 -> 85.3-86.3 tok/s; Qwen3.8's QSA layers (a selection list) keep `chain_attn.comp`. Only where a prompt chunk of the same attention takes `chain_attn_flash.comp` (f16, so a row's bits already depend on how a forward is cut into steps; windows, rings and sinks too since it takes them: Flint's decode after a 17K-token prompt read its sink layers a workgroup a head, 15.4 tok/s): elsewhere (a position-major cache, a device without the matrix units) `chain_attnb.comp` gives a prompt's row the bits `chain_attn.comp` gives it alone, and a prefix resumed must answer to the last digit as the prompt recomputed does (`tests/test_brio_serve.py`, OLMoE and MiMo on Lavapipe). `0`: `chain_attn.comp` always. |
+| `COLI_VK_ATTN_DEC` | on | A decode step's or a verify's attention (up to 8 rows, no selection list) over 128 positions or more on `chain_attn_dec.comp`: the positions in blocks of 64 (more while the blocks would pass 1024 workgroups), a workgroup a (head, block, row) for the block's scores (a subgroup a position), max, sum and weighted values, then a pass that joins the blocks (the sink's logit with them) and applies the gate. `chain_attn.comp` gives a head one workgroup that walks every position: Qwen3.6's 16 heads left an RTX PRO 4000 all but idle, about 160 us a layer at 700 positions. Decode Qwen3.6 int4-g64 76.5-77.6 -> 85.3-86.3 tok/s; Qwen3.8's QSA layers (a selection list) keep `chain_attn.comp`. Only where a prompt chunk of the same attention takes `chain_attn_flash.comp` (f16, so a row's bits already depend on how a forward is cut into steps; windows, rings and sinks too since it takes them: Flint's decode after a 17K-token prompt read its sink layers a workgroup a head, 15.4 tok/s): elsewhere (a position-major cache, a device without the matrix units) `chain_attnb.comp` gives a prompt's row the bits `chain_attn.comp` gives it alone, and a prefix resumed must answer to the last digit as the prompt recomputed does (`tests/test_brio_serve.py`, OLMoE and MiMo on Lavapipe). `2` (opt-in; this variable's value, not `chain_attn_dec.comp`'s mode 2) gives that up on a device without the flash module, as if it had it (the same attentions; `chain_attn_dec.comp` takes no matrix units): every call of up to 8 rows over 128 positions or more (a decode step, a verify, or a prompt chunk that short, such as an option scored after a `pin=1` snapshot) then has `chain_attn_dec.comp`'s bits while longer chunks keep `chain_attnb.comp`'s, so a resumed prefix and snapshot scoring (`logprobs` after `pin=1`) may differ in the last digits from a cold recompute. `COLI_VK_CHAIN_FLASH=0` turns it off with the rest of the rule, and a split KV cache (`chain_kvs.comp`) never takes it. An Arc Pro B60 (Xe2; an SR-IOV VF, Mesa ANV 26.0.8, the chain on at subgroups of 16) decoded Qwen3.6 after a 16K-token prompt at 5.03 tok/s and at 35.52 with `2` (32K: 2.71 -> 33.88; after a short prompt 37.21 -> 38.00), its prompts as fast, the same greedy answers; a `[VK] chain: COLI_VK_ATTN_DEC=2 ...` line at its first use says it took effect. `0`: `chain_attn.comp` always. |
 | `COLI_VK_ATTN_DEC_GQA` | on | `chain_attn_dec.comp`'s mode 2: a workgroup a (KV head, block, row) for all of its query heads, 1 to 16 (a pipeline a head dim and grouping, spec constants GQ, HDQ and TPP), each K and V row read once for them. OLMoE's one query head a KV head took mode 0 before: its decode after 2.7K tokens 148.6-148.9 -> 161.1-161.3 tok/s. The scores a thread a position (two at head dims of 256: `COLI_VK_ATTN_DEC_TPP`), eight values a load against the q rows in shared memory, the max on the way; V a column of eight values a thread with the positions over groups of threads, the same groups for a float16 or a float32 cache. The join (mode 1) takes each block's weight once into shared memory, not once a value. The blocks' rule counts four workgroups a KV head. One layer after 18K positions in float16 on an RTX PRO 4000: Qwen3.6's 181 -> 122 us (a K row over a subgroup's lanes, five shuffles a head a position, before), Flint's 32/4 heads of 128 229 -> 131; after 60K 573 -> 372. Decode after an 18K-token prompt: Qwen3.6 UD-Q4_K_M 74.5-75.7 -> 79.3-79.8 tok/s, Flint UD-Q3_K_XL 70.7-71.0 -> 80.5-80.8 (92.1-92.2 after 1K, from 88.6-88.9). `0`: mode 0, a workgroup a head. |
 | `COLI_VK_ATTN_DEC_TPP` | `2` at head dims of 256, `1` below | Threads a position for mode 2's scores, adjacent lanes taking a K row's loads in turn, their sums joined by a shuffle. A Radeon 780M's 64 lanes reading 64 rows of 512 bytes at once overflowed its cache: one layer of Qwen3.6 after 18K positions 1216-1303 us before, 1463-1627 at one thread a position, 1025-1094 at two; Flint's heads of 128 1241-1406 at one, 1452-1495 at two. RTX PRO 4000: 125.5 -> 121.8 us at two (heads of 256). |
 | `COLI_VK_KV16` | on | qwen36's chain keeps its KV mirrors in float16 where the host's cache is float16 (the default; `Q36_KV=f32` keeps both float32), and olmoe's where its host's values are float16's (`KV16`, [OLMoE and Inkling](#olmoe-and-inkling)): every attention shader (`chain_attn`, `chain_attnb`, `chain_attn_flash`, `chain_attn_dec`) has a twin with its specialization constant 7 (KV16) that reads K and V two halves a word (`vkc_attn_h`, `vkc_attn_wh`), and a step's rows go in through `chain_copy2d.comp`'s H16 twin (`vkc_copy_regions_h`), which rounds by kv16.h's integer arithmetic before it packs: `packHalf2x16` rounds toward zero on RADV (a Radeon 780M), where the copy's halves differed from the host's. The values are the host's, so every path gives a float32 mirror's bits (`tests/test_vk_chain.c`), in half the memory and half the reads. One conversation's chain only (`KV_SLOTS` places share buffers with it) and while the mirror does not split (`chain_kvs.comp` reads float32: a plan that splits takes the mirrors back to float32). RTX PRO 4000, after an 18K-token prompt: Qwen3.6 UD-Q4_K_M decode 60.0 -> 63.1 tok/s, prompt 1706 -> 1774; Flint UD-Q3_K_XL decode 64.2 -> 67.0, prompt 1735 -> 1874; the same greedy answers. `0`: float32 mirrors. |
 | `COLI_VK_MLA_DEC` | on | The same for the MLA core (`vkc_mla_core`: GLM-5.2/5.3, Kimi K3, DeepSeek V4.1): a decode's or a verify's rows (up to 4) over 128 positions or more on `chain_mla_dec.comp`, the positions (or a selection list's entries) in blocks of 64 (more while the blocks would pass 4096 workgroups), then joined. `chain_mla.comp`'s core walks every position in a workgroup a head with about twenty barriers a tile, and its time did not change from 64 heads to 128: at 2000 positions 1747 -> 323 us a layer, at 8000 11058 -> 1758 (RTX PRO 4000, a 512-float latent and a 64-float rope). A decode row's bits then differ in the last digits from the same row inside a prompt chunk (the prompt keeps `chain_mla.comp`'s core). `0`: `chain_mla.comp` always. |
 | `COLI_VK_CHAIN_MOE` | on where supported | A decode step's (or a short verify's) MoE layer whose experts the tier holds all of runs its routing and experts in the frame, with no host step, and a GGUF's prompt chunk too on qwen36 and qwen38 ([below](#the-routed-experts-in-the-frame-vk_dmoeh)); `0`: the host routes as before. |
-| `COLI_VK_SUBGROUP` | on where the size varies | Every chain pipeline requires the subgroup size the device reports (`VK_EXT_subgroup_size_control`), where the device has more than one. Without it an Intel Iris Xe (Windows driver 101.7076) compiled the chain's GEMVs at another size than the shaders read: Qwen3.6 answered garbage with the chain on and correctly with it off. `0`: the driver's choice. `n` (a power of two the device allows): pin `n` instead, here and on the GEMV and expert-batch pipelines that take the same size; on Intel Meteor Lake (Mesa 26.2) the reported 32 left `chain_moe.spv` compiling for over 38 minutes, 16 takes 72-195 s and `test_vk_chain` passes. |
+| `COLI_VK_SUBGROUP` | on where the size varies | Every chain pipeline requires the subgroup size the device reports (`VK_EXT_subgroup_size_control`), where the device has more than one. Without it an Intel Iris Xe (Windows driver 101.7076) compiled the chain's GEMVs at another size than the shaders read: Qwen3.6 answered garbage with the chain on and correctly with it off. `0`: the driver's choice. `n` (a power of two the device allows): pin `n` instead, here and on the GEMV and expert-batch pipelines that take the same size; on Intel Meteor Lake (Mesa 26.2) the reported 32 left `chain_moe.spv` compiling for over 38 minutes, 16 takes 72-195 s and `test_vk_chain` passes. Unset on Intel's Xe2 (16 is its smallest subgroup: Battlemage, Lunar Lake) it pins 16: at the reported 32 an Arc Pro B60 failed 44 of `test_vk_chain`'s routed-expert checks (relative errors up to 1.0) and ran Qwen3.6's chain at 13.1 tok/s with other answers than the CPU's; at 16 the test passes, and the chain runs at 37.1 tok/s with the CPU's answers. |
 | `COLI_VK_CHAIN_GEMV2` | on where supported | `0`: the int8 decode matrices keep `chain_gemv.comp` instead of `chain_gemv2.comp` (rows a workgroup by the matrix's length). On a Radeon 8060S (Qwen3.6, a 256-token answer, int8 trunk) decode went from 36.8 to 39.0 tok/s; at int4 (`COLI_DENSE_BITS=4`) it measured slower, so it takes int8 only. It stages x in the device's shared memory, up to 64 KiB (#1998). On NVIDIA it takes only a matrix of few long rows (Qwen3.8's 320 x 10240 hyper-connection mixer) and `chain_gemv.comp` the rest, which an RTX PRO 4000 ran faster (decode Qwen3.8 IQ2_XS 39.5/44.4 to 45.5/45.6 tok/s, Qwen3.6's int8 trunk 62.2/61.9 to 65.2/65.0); `1` gives it every int8 matrix there too. |
 | `COLI_VK_CHAIN_SPIN_US` | `50000` on a discrete card, `2000` elsewhere | How long a wait on a chain frame polls the fence before blocking (whose wake-up costs 50 to 150 us). At 2 ms a decode step's host slept through its last frames and woke after the device had run dry, about 1 ms a token: Qwen3.6 UD-Q4_K_M on an RTX PRO 4000 decoded 76.5 tok/s, 83.7 at 5 ms, 90.6 from 10 ms (a step's time) on; Flint UD-Q3_K_XL 86 -> 89.6. An integrated GPU shares the package's power with the cores and keeps 2 ms. |
 | `COLI_VK_CHAIN_PROF` | off | `1`: one `[VK] chain profile` line of device time per kind of op (timestamps). |
@@ -2449,6 +2462,29 @@ computes the ones it holds:
   (1.4 pool pairs a step) a step took 789 us with 12 threads and 328 with 2, the same
   pairs alone 50 us.
 
+A release's FP8 experts (fmt 12: e4m3 with a float scale per 128 columns,
+Qwen3.8-Flash-Next-FP8's) have no integer form there. Their pairs decode the codes through
+binary16 with F16C (from a table of the 256 values without it), multiply the float rows
+with FMA, and scale each group's sum once (`vk_tier.c`'s `fp8_rows` and, for a decode
+step's one row, `fp8_rows4_s1`): within 3e-7 of a double-precision sum. `GQ_EXACT=1` keeps
+the float reference, which decoded every weight through `ldexpf`. On a Xeon Gold 6254 with
+16 threads, a pair of Qwen3.8's experts (2560 x 640) went from 4.4 ms to 133-145 us.
+Beside an Arc Pro B60 with every routed expert in the host pool, decode went from 0.7 to
+7.4 tok/s, with greedy answers identical ([the
+experiment](experiments/vulkan-fp8-host-pairs-2026-11-07/manifest.json)).
+
+On the timeline path, recycling a frame whose fence is already signalled does not
+flush the pending host pairs: frame B must be recorded and submitted first so the
+CPU can compute those pairs while the device computes its resident experts. Waiting
+for an unfinished frame still flushes the host work, and submitting a frame that
+waits on the host timeline flushes it before submission. A layer-count split also
+keeps frame C with the next layer's step. On an Arc Pro B60 (Xe2, Mesa ANV 26.2.6)
+beside a Xeon Gold 6254, Qwen3.8-Flash-Next-FP8 decode improved from 7.38 to 10.41
+tok/s with identical greedy answers. Both measured arms include the companion FP8
+CPU kernel (#2697) and the same prompt settings; this scheduling change is independent
+of that kernel. Samples, configuration and logs:
+[`vulkan-hybrid-overlap-2026-11-07`](experiments/vulkan-hybrid-overlap-2026-11-07/manifest.json).
+
 Where the device has events (every device), a step stays inside its frame, as the CUDA
 chain's does with its host flags: `vkCmdSetEvent` once the route and the rows are down
 (the host polls `vkGetEventStatus`), the device's experts, `vkCmdWaitEvents` on the event
@@ -2799,6 +2835,21 @@ DeepSeek V4/V4.1's indexer scores (`chain_dsv4`, modes 3 and 9) take the same gr
 (mode 10, the queries in shared memory or read where they are as modes 3 and 9 do): its 64
 heads of 128 over 2000 compressed columns 8.1 ms -> 141 us, over 8000 31.6 ms -> 470 us.
 `COLI_VK_DSA_GRID=0` keeps every row's scores in its own workgroup.
+A prompt chunk's scores are not one row but hundreds, and there the grid reads a row's keys
+once a row: mode 11 (`chain_dsv4_idx.comp`, `vkc_dsv4_score` from 16 rows, 32 columns, 128
+dims and an even head count) takes a tile of 16 rows x 32 compressed columns a workgroup,
+stages the tile's keys in shared memory once and each head pair's queries (2 x 16 x 128
+floats) after them, 32 KB in all. It is a module of its own because Vulkan sizes a module's
+workgroup memory: those 32 KB inside `chain_dsv4.comp` would leave every mode of it two
+workgroups a compute unit, and a device offering less than 32 KiB a workgroup keeps mode
+10's grid. The sums are in mode 10's order (i ascending, the heads ascending, the relu and
+the weight in order), so the two paths' scores are equal bit for bit and a selection cannot
+differ (`tests/test_vk_chain.c` holds it to memcmp). On an RX 6900 XT at V4.1 Flash's 32
+heads of 128: a 256-row chunk over 8192 unmasked 46.70 -> 3.56 ms (13.10x), 256 rows over
+65536 unmasked 445.42 -> 31.93 ms (13.95x), 2048 rows over 65536 with a candidate mask
+1633.09 -> 212.61 ms (7.68x); a tile of 16 rows over 65536 columns 23.31 -> 1.76 ms (13.26x). Below 16 rows (decode, a verify's few)
+the grid keeps its one-workgroup-a-row columns: at one row the tile costs more than it
+saves. `COLI_VK_DSA_TILED=0` keeps the grid for every row count.
 
 `make vk-chain-check VK=1` runs them against double-precision references of colibri.c's
 absorbed attention: every weight format both ways through the per-head blocks, RoPE in
@@ -2827,7 +2878,7 @@ of their own (`chain_dsv4.comp`), optional like the MLA ones:
 | `vkc_dsv4_attn` | the sparse attention of `sparse_attn.h`: per row a list of window rows, compressed rows and skipped entries; the sink in the denominator only, the value sum and the denominator in list order; optionally DeepSeek V4's roundings (the weights and the output to bf16) |
 | `vkc_dsv4_rope` | RoPE on interleaved pairs in place from a host table, forward or inverse (the attention output's un-rotation) |
 | `vkc_dsv4_compress` | the compressor's rolling group: each row's kv and score rows into the ring slot of its position, the per-channel softmax pooling when a group completes; DeepSeek V4's overlapping form (two halves, a position bias per slot) too |
-| `vkc_dsv4_score` | the indexer's scores: the relu-gated, head-weighted dot of each reachable compressed row, a candidate mask, -inf past the row's reach |
+| `vkc_dsv4_score` | the indexer's scores: the relu-gated, head-weighted dot of each reachable compressed row, a candidate mask, -inf past the row's reach; a chunk's rows in tiles of 16 x 32 (`chain_dsv4_idx`, mode 11) with the tile's keys staged once |
 | `vkc_dsv4_cand` | DeepSeek V4.1's candidate blocks: each block's best score, the newest block pinned, the best blocks kept whole |
 | `vkc_dsv4_topk` | the top-k of the CPU's selection (ties to the lower column), in column order (V4.1) or by rank (V4), padded with skipped entries |
 | `vkc_dsv4_engram` | DeepSeek V4.1's engram gate on the residual streams |
@@ -2838,7 +2889,11 @@ compressed rows with skipped entries and a row with none (within 1.1e-6 of the l
 output on Lavapipe), RoPE both ways, the compressor over three calls with its ring
 carried (ratios 1 to 4, the overlapping form with its bias, within 2e-6), the scores,
 the candidate mask and the top-k list slot for slot on scores exact in float on both
-sides, ties included, with and without a mask, and the engram gate (within 2e-6).
+sides, ties included, with and without a mask, and the engram gate (within 2e-6). The
+scores' two paths run on random floats at a tile's shapes (a tile, partial row and column
+tiles, V4's 64 heads, the fallbacks below 16 rows or 32 columns) and their buffers are
+`memcmp` for equal: the selection compares their bits, so a tolerance there would be a
+wrong pick.
 
 ## Big prompt chunks and expert streaming
 
@@ -2876,6 +2931,12 @@ took:
 ```
 [VK] qwen36 chain: prompt chunks of up to 8192 rows (325 KiB a row; 7.30 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
 ```
+
+qwen36's KV mirror grows with the context and takes what the device lacks from the expert
+tier, whole blocks of its device memory for the rest of the process (`vkt_give_back`); with
+`VK_EXT_memory_budget`, a first prompt's mirror past 8192 positions that fits in the half of
+the free memory a chunk leaves takes that memory instead, the chunk decided before it and only
+its scratch, the tier's staging room and 256 MiB kept free.
 
 On qwen38 the tier also leaves what the chain allocates at its first forward: the KV
 mirror whole at the context's capacity (at most a quarter of the device's free memory;
@@ -2922,7 +2983,14 @@ dispatches over rows stay within the device limits at 8192. Two things did not s
   dim), `vkc_attn`, `vkc_attn_w`, `vkc_mla_core` and `vkc_relattn` record their rows in
   slices. Each slice ends its frame, submitted and not waited for, and the next starts a
   new one, which its first barrier orders after the slice. A slice starts on a multiple
-  of the blocked attention's rows, so no row's arithmetic changes.
+  of the blocked attention's rows, so no row's arithmetic changes. The budget alone
+  starved a big GPU: Qwen3.6's 16K prompt ran in slices of 64 rows, 32 workgroups of
+  `chain_attnb`, on an Arc Pro B60 that keeps 80 resident and runs 2 to 40 of them in
+  the same time (raising the budget to 2^36 took its first token from 118.5 to 74.4-75.7 s).
+  So a slice is cut to keep `COLI_VK_ATTN_SLICE_WG` workgroups (64; 0, the budget alone,
+  on an integrated GPU) as far as 4x the budget's work, then a chunk's slices are made
+  one size on the blocks, so some, and the last, may keep fewer. One layer of that
+  prompt replayed on the B60: 16K 9.31 -> 6.04 s of attention, 32K 69.0 -> 24.2 s.
 
 ### Streaming (`vk_tier.c`)
 
@@ -3083,10 +3151,12 @@ experts came from the host pool (`135 streamed (135 of them copied from the host
 | `COLI_VK_CHAIN_ROWS` | from the budget, up to 8192 | Prompt rows per chain chunk; `auto` as unset. Set, it also keeps the engines' own prompt blocks (above). |
 | `COLI_VK_CHAIN_ROWS_MAX` | `8192` | The most rows the budget's chunk takes. |
 | `COLI_VK_ATTN_BLOCK` | `16` | Rows from which the chain's attention takes `chain_attnb.comp`; `0` never. |
+| `COLI_VK_ATTN_BLOCK_FIXED` | on with Xe2 under ANV, and Lavapipe | `chain_attnb.comp` with the head dims fixed in its pipeline, one a head dim, V's head dim and cache type: no test of each dim against the push constants, and a float16 cache's K and V staged 8 halves a load. Its q.k sums are the fused multiply-adds in order, what the generic pipeline's compile to on those drivers, and not one output bit moved there (an Arc Pro B60 with Mesa ANV 26.0.8, and Lavapipe, at tiles of 8 positions; `tests/test_vk_chain.c` reruns the blocked cases on the generic pipeline). Mesa 26.2.6 Lavapipe rounds the specialized and generic paths differently: the test checks exact bytes first, then finite outputs within the existing float32 attention relative-error bound of `2e-5` (maximum observed `5.509e-7` across 33 rounded comparisons); Mesa 26.0.8 remains byte-identical. Other Intel GPUs under ANV, and tiles of 16 (64 KiB of shared memory), were not measured and keep the generic pipeline. Arc Pro B60 at subgroups of 16, Qwen3.6 over 16K positions with a float16 cache: a 255-row chunk 185.1 -> 25.7 ms (in 2^32 slices at the reported 32: 485.4 -> 130.0), 4096 rows 2.32 -> 0.32 s (32K: 5.66 -> 0.78 s); a float32 cache about 3 times faster. `1`: on any driver (validate against `0` there first: `COLI_VK_ATTN_BLOCK_FIXED=1 ./tests/test_vk_chain shaders/qmatmul.spv` reruns its blocked cases on the generic pipeline, which must be finite and agree within that bound); `0`: the generic pipeline. |
 | `COLI_VK_CHAIN_GEMM` | on where supported | The chain's int8/int4 prompt matmuls (`I % 64`, `O % 128`) on `chain_gemm.comp` (cooperative matrices at subgroup size 64 or 32, x rounded to f16 once, 128 outputs x 64 rows a workgroup); `0` keeps the fp32 GEMM. On a Radeon 8060S (Qwen3.6, 1011-token prompt): 517-546 -> 282-287 ms of tiled GEMM, the first token 2.08 -> 1.85 s, perplexity unchanged (7.65). On an RTX PRO 4000 (Qwen3.6 int4-g64, 467-token prompt): an 8192 x 2048 GEMM of 1024 rows 3.64 -> 1.53 ms, the prefill 734-756 -> 865-889 tok/s. |
 | `COLI_VK_GEMM_WIDE` | on where supported | A GGUF's dense prompt matmuls from 128 rows on `qmatmul_gemm_bdcw.comp` (128 outputs x 128 rows a workgroup) instead of `qmatmul_gemm_bdc.comp`'s 64, for the types with no IQ grid in shared memory. RTX PRO 4000: a 4096 x 2048 Q4_K matrix against 4096 rows 3.30 -> 1.97 ms; Qwen3.6 UD-Q4_K_M's prompt at 4K tokens 1960-1979 -> 2344-2358 tok/s. `0`: the 64 tile. |
 | `COLI_VK_GRP_WIDE` | `32` | A prompt chunk's GGUF experts on `qmatmul_grp_bdcw.comp` (64 rows by 128 decoded rows an item) when the chunk's rows give each expert this many on average, both passes on the matrix units. One layer of Qwen3.6's Q4_K experts: 1024 rows 4.40 -> 3.69 ms, 512 rows 2.90 -> 3.28 (so the threshold); its prompt at 4K tokens 2366-2371 -> 2621-2637 tok/s. `0`: never. |
 | `COLI_VK_ATTN_SLICE` | `4294967296` | Rows x positions x heads x head dim past which an attention is cut over several submissions; `0` never. The matrix units' attention (`chain_attn_flash.comp`) counts a unit as a sixteenth: it runs one 8.5 to 13 times faster than `chain_attnb`. |
+| `COLI_VK_ATTN_SLICE_WG` | `64`; `0` on an integrated GPU | The workgroups a slice is cut to keep, as far as 4x `COLI_VK_ATTN_SLICE`'s work (up to 7x the budget-only slice where that one rounds down to one block); a chunk's slices are then made one size on the blocked attention's blocks (the same bits), so some, and the last, may keep fewer. `0`: the budget alone. |
 | `COLI_VK_TIER_STREAM` | on | `0`: no streaming; the tier takes a prompt step in the engine's usual blocks and leaves the cold experts to the CPU, as before. |
 | `COLI_VK_TIER_STREAM_SLOTS` | `48` | Staging slots (experts) for streaming, reserved before the chunk is sized. |
 | `COLI_VK_TIER_STREAM_MIN` | `2` | The least rows a cold expert streams at; under the tiled GEMM's 16 rows the per-row GEMV runs and beats the CPU from 2 rows up. |
@@ -3398,6 +3468,14 @@ launch VBIOS the backend warned "only 246 of 8192 MB VRAM is host-visible", plac
 matrix, every tier upload failed and the chain stopped at its first matrix. RADV places
 them in system RAM instead, where every access crosses PCIe.
 
+**A refused block.** The pool that is refused a block remembers its size (`VkWPool.refused`) and does not
+ask for one that large again until a block of its own goes back to the driver, its budget is set again
+or it is destroyed; what does not fit stays on the CPU, as for any full card. Before, every tensor
+that did not fit asked again with the pool's lock held across `vkAllocateMemory`. On a Colab L4
+(NVIDIA's 580 driver), where the host-visible device-local type gives 9.75 GiB of 22.5, a refusal took
+about 0.6 s, and the start-up of Qwen3.6's expert tier (10,240 experts, more than half of them without
+room) had not finished after 5 minutes.
+
 **Memory types by use.** The backend chooses the memory type of a buffer by what the buffer
 is used for: only the GPU uses it, the CPU writes it, or the CPU reads it back. A discrete
 GPU and Lavapipe get device-local memory where the use allows it, and a host-cached type
@@ -3405,7 +3483,17 @@ for what the CPU reads back. An integrated GPU with a heap of system memory gets
 host-visible system memory for all three uses, so no buffer is placed in the VRAM
 carve-out reserved by the BIOS. An allocation that runs out of memory there is retried in a
 device-local type. `COLI_VK_DEVICE_CAP_MB`, the budget and the expert batch count the
-device memory: the device-local heaps, and every heap of an integrated GPU.
+device memory: the device-local heaps, and every heap of an integrated GPU. Each type is
+chosen among those the device's buffers take (the memoryTypeBits of a probe buffer with every
+usage the backend's and the chain's buffers have), the tier's host pool and an integrated
+GPU's retry type too: on an Arc Pro B60, Mesa's ANV (26.0.8) lists first a device-local type
+it keeps for images (CCS-compressed; the driconf `anv_enable_buffer_comp=true` lets buffers
+have it). Chosen from the properties alone it was the GPU-only type, the chain's buffers
+refused it, and the chain stayed off without a line.
+`[VK] memory: GPU-only buffers in type N ...` says where a choice moved; a buffer given a
+type it does not take is bound to the first it takes with that type's properties, in that
+type's heap first (`[VK] memory: a buffer does not take memory type ...`); and every way out
+of the chain's setup prints `[VK] chain: <reason>, the chain stays off`.
 
 **Staged uploads** put resident data in a DEVICE_LOCAL memory type the host does not map
 and copy it there from a host staging buffer with `vkCmdCopyBuffer`.
@@ -3438,6 +3526,18 @@ host-visible on the largest device-local heap (else that heap's device-local typ
 Lavapipe has one type for everything); the staging type is host-visible and coherent and
 not device-local where one exists, so staging never takes the window. Vendor types
 (AMD's uncached and device-coherent ones) are passed over.
+
+**`COLI_VK_STAGED=0` on such a card.** The resident data then lives in the window, and
+nothing past it spills: a discrete card refuses the block (only an integrated GPU's
+allocations are retried in another type). The window is the device's memory from then on
+(`vk_mem_window`): the books count that heap's types against it as a
+`COLI_VK_DEVICE_CAP_MB` cap would, the pools' blocks fit in it, the engines plan with the
+free bytes it leaves, and what does not fit stays on the CPU. A line on each device says
+so. Before, every planner read the whole card and nothing reached it, while the warm start
+counted the tier's experts as placed: on an RTX PRO 4000 (246 of 24467 MiB host-visible),
+Qwen3.6 Q4_K_M read 5048 experts from the disk in its first turn and answered at 12.9
+tok/s; now it plans with the 246 MiB, keeps its reserves, runs on the CPU and answers at
+13.1, as with `COLI_VULKAN=0` (13.1). Left unset, the same card stages and answers at 90.
 
 **A window smaller than the card.** A card whose host-visible device-local type is as big as its
 heap can still be given less of it. On a Colab A100 80 GB (NVIDIA's 580 driver) the engine's device is

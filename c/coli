@@ -663,27 +663,36 @@ def env_for_engine(a, arch, plan=None):
             sys.exit(f"{C.yel}{family.display_name} currently supports CPU only; --gpu is unavailable{C.r}")
         if vram and gpu!="none":
             sys.exit(f"{C.yel}{family.display_name} currently supports CPU only; --vram is unavailable{C.r}")
+    vulkan = vulkan_gpu(a, arch)
     if gpu is not None:
         env.pop("COLI_GPU", None); env.pop("COLI_GPUS", None)
         if gpu == "none":
             env["COLI_CUDA"] = "0"
+            env["COLI_VULKAN"] = "0"   # a Vulkan build's device too: a saved COLI_VULKAN=1 kept it (#2127)
             env.pop("CUDA_EXPERT_GB", None); env.pop("CUDA_DENSE", None)
+        elif vulkan:
+            vulkan_gpu_env(env, gpu)
         else:
             if arch == "deepseek_v4":
                 if not dsv4_cuda_available(a.model):
                     sys.exit(f"{C.yel}--gpu needs the CUDA build:{C.r} {dsv4_cuda_build_hint()}")
             elif not cuda_binary(engine_for_gpu_check(a)):
-                sys.exit(f"{C.yel}--gpu needs the CUDA build:{C.r} the engine binary is CPU-only")
+                sys.exit(f"{C.yel}--gpu needs a GPU build:{C.r} the engine binary has no CUDA or Vulkan backend")
             env["COLI_CUDA"] = "1"
             if gpu != "auto":
                 env["COLI_GPUS"] = gpu
             env.setdefault("CUDA_DENSE", "1")
     if vram and gpu != "none":
+        vulkan_tier_hint = "a Vulkan build sizes its expert tier with COLI_VK_TIER_GB"
         if arch == "deepseek_v4":
             if not dsv4_cuda_available(a.model):
-                sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} {dsv4_cuda_build_hint()}")
+                sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} " +
+                         (vulkan_tier_hint if vulkan_binary(engine_for_gpu_check(a))
+                          else dsv4_cuda_build_hint()))
         elif not cuda_binary(engine_for_gpu_check(a)):
-            sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} the engine binary is CPU-only")
+            sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} " +
+                     (vulkan_tier_hint if vulkan_binary(engine_for_gpu_check(a))
+                      else "the engine binary is CPU-only"))
         env["COLI_CUDA"] = "1"
         env["CUDA_EXPERT_GB"] = str(vram)
     if getattr(a, "auto_tier", False) and family.modality in ("image", "decision"):
@@ -700,8 +709,10 @@ def env_for_engine(a, arch, plan=None):
         try:
             if plan is None:
                 ram,ctx,devices,vram=resource_request(a,env)
-                plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy,
-                                kv_slots=requested_kv_slots(a,env))
+                # --gpu on a Vulkan build names Vulkan devices: no CUDA tier, and the
+                # plan sizes the device the engine opens
+                plan=build_plan(a.model,ram,ctx,[] if vulkan else devices,vram,policy=a.policy,
+                                kv_slots=requested_kv_slots(a,env),env=vulkan_plan_env(a,vulkan))
             plan_must_not_choose_omp=("OMP_NUM_THREADS" not in env
                                       and (arch == "deepseek_v4"
                                            or env.get("COLI_NO_OMP_TUNE")))
@@ -826,6 +837,61 @@ def cuda_binary(engine=None):
         if not expected: return False
         return os.path.exists(os.path.join(os.path.dirname(engine),expected))
     return False
+
+def vulkan_binary(engine=None):
+    """Was `engine` (default: the GLM binary) built with the Vulkan backend (VK=1)?
+    It links no GPU runtime, so cuda_binary() calls it CPU-only; the names of the
+    loader it opens are compiled into it (doctor's cuda_linkage, #2081). A missing
+    loader is the engine's own [VK] line. On Windows a VK=1 build that also loads a CUDA
+    backend DLL at run time still runs on Vulkan when that DLL is missing, but cuda_linkage
+    reports the missing DLL first: read the loader names from the image for that case. That
+    is a CUDA_DLL=1 VK=1 engine without coli_cuda.dll, and the main archive's
+    deepseek_v4.exe without coli_cuda_dsv4*.dll (on Linux the latter already read as Vulkan)."""
+    from doctor import cuda_linkage, _VULKAN_LOADER_NAMES
+    engine = engine or GLM
+    linkage = cuda_linkage(engine)
+    if linkage.get("vulkan"): return True
+    if sys.platform != "win32" or not linkage.get("missing"): return False
+    try:
+        with open(engine,"rb") as f: image=f.read()
+    except OSError: return False
+    return any(name in image for name in _VULKAN_LOADER_NAMES)
+
+def vulkan_gpu(a, arch):
+    """Does --gpu (auto or devices) go to a Vulkan device? Yes on a Vulkan build
+    without the CUDA backend: it was refused there as CPU-only (#2127)."""
+    if getattr(a, "gpu", None) in (None, "none"): return False
+    engine = engine_for_gpu_check(a)
+    cuda = dsv4_cuda_available(a.model) if arch == "deepseek_v4" else cuda_binary(engine)
+    return not cuda and vulkan_binary(engine)
+
+def vulkan_gpu_env(e, gpu):
+    """--gpu on a Vulkan build: COLI_VULKAN=1, the first index as the primary device
+    (COLI_VK_DEV, numbered as the engine enumerates them: vulkaninfo --summary's GPU0,
+    GPU1, ...) and a second one as COLI_VK_DEV2 (the expert tier's and the dense
+    chain's second device). auto leaves the pick to the engine. Like COLI_GPU(S) for
+    CUDA, the flag replaces the device choice in the environment."""
+    e.pop("COLI_VK_DEV",None); e.pop("COLI_VK_DEV2",None)
+    e["COLI_VULKAN"]="1"
+    if gpu=="auto": return e
+    devices=[part.strip() for part in gpu.split(",")]
+    if len(devices)>2 or not all(re.fullmatch(r"[0-9]+",part) for part in devices):
+        sys.exit(f"{C.yel}--gpu {gpu}:{C.r} a Vulkan build takes auto, none, or one or two "
+                 f"device indices such as 1 or 1,0 (the order vulkaninfo --summary lists)")
+    if len(devices)==2 and int(devices[0])==int(devices[1]):
+        sys.exit(f"{C.yel}--gpu {gpu}:{C.r} the second device must differ from the first "
+                 f"(the same device twice is the engine's COLI_VK_DEV2 test mode, set by hand)")
+    e["COLI_VK_DEV"]=devices[0]
+    if len(devices)==2: e["COLI_VK_DEV2"]=devices[1]
+    return e
+
+def vulkan_plan_env(a, vulkan):
+    """os.environ with the Vulkan choice of --gpu: what build_plan sizes a launch
+    with, so the plan's Vulkan device is the one the engine opens (#2127)."""
+    env=dict(os.environ)
+    if getattr(a,"gpu",None)=="none": env["COLI_VULKAN"]="0"
+    elif vulkan: vulkan_gpu_env(env,a.gpu)
+    return env
 
 def resource_request(a, env):
     from family_registry import default_context
@@ -1000,19 +1066,26 @@ def env_for(a):
     if a.ctx: e["CTX"]=str(a.ctx)
     if a.auto_tier:
         from resource_plan import build_plan, environment_for_plan, format_bytes
+        vulkan=vulkan_gpu(a,"glm")
         if a.gpu is not None:
             e.pop("COLI_GPU",None); e.pop("COLI_GPUS",None)
             if a.gpu=="none":
-                e["COLI_CUDA"]="0"; e.pop("CUDA_EXPERT_GB",None); e.pop("CUDA_DENSE",None)
+                e["COLI_CUDA"]="0"; e["COLI_VULKAN"]="0"; e.pop("CUDA_EXPERT_GB",None); e.pop("CUDA_DENSE",None)
+            elif vulkan: vulkan_gpu_env(e,a.gpu)
             else: e.pop("COLI_CUDA",None)
         elif e.get("COLI_CUDA")=="0":
             e.pop("COLI_GPU",None); e.pop("COLI_GPUS",None)
             e.pop("CUDA_EXPERT_GB",None); e.pop("CUDA_DENSE",None)
-        if a.vram and a.gpu!="none": e["CUDA_EXPERT_GB"]=str(a.vram)
+        if a.vram and a.gpu!="none":
+            # a Vulkan engine never reads CUDA_EXPERT_GB, as below without --auto-tier
+            if not cuda_binary() and vulkan_binary():
+                sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} "
+                         "a Vulkan build sizes its expert tier with COLI_VK_TIER_GB")
+            e["CUDA_EXPERT_GB"]=str(a.vram)
         try:
             ram,ctx,devices,vram=resource_request(a,e)
-            plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy,
-                            kv_slots=requested_kv_slots(a,e))
+            plan=build_plan(a.model,ram,ctx,[] if vulkan else devices,vram,policy=a.policy,
+                            kv_slots=requested_kv_slots(a,e),env=vulkan_plan_env(a,vulkan))
         except (OSError,ValueError,json.JSONDecodeError) as error:
             sys.exit(f"{C.yel}invalid resource plan:{C.r} {error}")
         has_cuda=cuda_binary()
@@ -1030,9 +1103,11 @@ def env_for(a):
         # Apple Silicon it printed " · CPU" even when the calibration child
         # processes ran on Metal (COLI_METAL is inherited through env_for and
         # environment_for_plan, so the measurements are real). Report the
-        # active backend: CUDA VRAM first, then Metal, then CPU.
+        # active backend: CUDA VRAM first, then Vulkan, then Metal, then CPU.
         if has_cuda and vt["devices"]:
             gpu=f" · VRAM {format_bytes(vt['budget_bytes'])}"
+        elif str(e.get("COLI_VULKAN","")).strip() not in ("","0") and plan.get("vulkan"):
+            gpu=f" · Vulkan {plan['vulkan'].get('name') or 'device'}"
         elif str(e.get("COLI_METAL","")).strip() not in ("","0"):
             gpu=" · Metal (unified memory)"
         else:
@@ -1121,16 +1196,20 @@ def env_for(a):
         if a.gpu is not None:
             e.pop("COLI_GPU",None); e.pop("COLI_GPUS",None)
             if a.gpu=="none":
-                e["COLI_CUDA"]="0"; e.pop("CUDA_EXPERT_GB",None); e.pop("CUDA_DENSE",None)
+                e["COLI_CUDA"]="0"; e["COLI_VULKAN"]="0"; e.pop("CUDA_EXPERT_GB",None); e.pop("CUDA_DENSE",None)
+            elif vulkan_gpu(a,"glm"):
+                vulkan_gpu_env(e,a.gpu)
             else:
                 if not cuda_binary():
-                    sys.exit(f"{C.yel}--gpu needs the CUDA build:{C.r} make colibri CUDA=1 (this binary is CPU-only)")
+                    sys.exit(f"{C.yel}--gpu needs a GPU build:{C.r} make colibri CUDA=1 or VK=1 (this binary is CPU-only)")
                 e["COLI_CUDA"]="1"
                 if a.gpu!="auto": e["COLI_GPUS"]=a.gpu
                 e.setdefault("CUDA_DENSE","1")
         if a.vram and a.gpu!="none":
             if not cuda_binary():
-                sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} make colibri CUDA=1 (this binary is CPU-only)")
+                sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} " +
+                         ("a Vulkan build sizes its expert tier with COLI_VK_TIER_GB" if vulkan_binary()
+                          else "make colibri CUDA=1 (this binary is CPU-only)"))
             e["COLI_CUDA"]="1"; e["CUDA_EXPERT_GB"]=str(a.vram)
     return e
 
@@ -1617,8 +1696,11 @@ def cmd_tune(a):
     from resource_plan import build_plan
     try:
         ram,ctx,devices,vram=resource_request(a,os.environ)
-        plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy,
-                        kv_slots=requested_kv_slots(a,os.environ))
+        # --gpu on a Vulkan build names Vulkan devices: no CUDA tier, and the plan
+        # sizes the device env_for_engine/env_for open
+        vulkan=vulkan_gpu(a,resolve_model(a.model).descriptor.id)
+        plan=build_plan(a.model,ram,ctx,[] if vulkan else devices,vram,policy=a.policy,
+                        kv_slots=requested_kv_slots(a,os.environ),env=vulkan_plan_env(a,vulkan))
     except (OSError,ValueError,json.JSONDecodeError) as error:
         sys.exit(f"{C.yel}cannot create tuning plan:{C.r} {error}")
     a.auto_tier=True
@@ -3792,10 +3874,11 @@ def cmd_ui(a):
     """the chat UI (ui/server.py) against a running gateway (`coli serve`), the browser
     opened on it once it answers"""
     cands = [os.path.join(HERE, "ui", "server.py"),
-             os.path.join(os.path.dirname(os.path.abspath(HERE)), "ui", "server.py")]
+             os.path.join(os.path.dirname(os.path.abspath(HERE)), "ui", "server.py"),
+             os.path.join(_LIBEXEC, "ui", "server.py")]
     server = next((c for c in cands if os.path.exists(c)), None)
     if server is None:
-        sys.exit(f"{C.yel}the chat UI is not in this tree{C.r} (ui/server.py next to coli or one level up)")
+        sys.exit(f"{C.yel}the chat UI is not in this tree{C.r} (ui/server.py next to coli, one level up, or in libexec)")
     shown = "127.0.0.1" if a.host in ("0.0.0.0", "") else a.host
     url = f"http://{shown}:{a.port}/"
     print(f"  {C.dim}the chat UI on {url}, the gateway at {a.backend} "

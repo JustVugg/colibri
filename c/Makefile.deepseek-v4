@@ -264,6 +264,14 @@ REGISTRY_OBJ = expert_store_registry.o
 V4_SERVE_TEST := tests/test_v4_serve_framing$(if $(IS_WIN),.exe,)
 V4_SERVE_TEST_OBJS := $(filter-out COLI_V4_UNIT_GENERATE_STATS.o,$(V4_OBJS))
 
+# Include every C object, even when its backend is disabled in this invocation.
+V4_C_DEP_OBJS = $(sort $(TARGET_OBJS) $(TEST_UNIT_OBJS) $(REGISTRY_OBJ) \
+    $(V4_HOT_TEST_OBJ) $(V4_BATCH_TEST_OBJ) backend_loader_dsv4.o \
+    backend_vulkan_v4.o vk_tier_v4.o vk_chain_v4.o)
+V4_C_DEPS = $(V4_C_DEP_OBJS:.o=.d)
+V4_DEPFLAGS = -MMD -MP -MF $(@:.o=.d)
+
+
 # The objects are named after the unit, not after the flags they were built
 # with, and three builds share them: this engine (CUDA=1 adds
 # -DCOLI_V4_GPU_TIER), the parent's test-c (no GPU tier) and its test-asan
@@ -305,7 +313,7 @@ $(V4_CUDA_FLAGS_STAMP): FORCE
 	fi
 
 .PHONY: deepseek-v4 deepseek-v4-objs deepseek-v4-clean deepseek-v4-test-objs \
-	deepseek-v4-test-registry print-v4-objs FORCE
+	deepseek-v4-test-registry dsv4-cuda-tests print-v4-objs FORCE
 deepseek-v4: $(V4_BINARY)
 
 # Build just the amalgamation unit + registry objects (no link). External
@@ -318,16 +326,24 @@ deepseek-v4-objs: $(V4_OBJS)
 print-v4-objs:
 	@echo $(V4_OBJS)
 
-$(V4_BINARY): $(V4_OBJS) $(V4_VK_SPV)
+V4_LINK_STAMP = deepseek_v4.ldflags
+V4_TRACK_LINK = $(subst ','\'',$(CC) $(V4_OBJS) $(LDFLAGS))
+$(V4_LINK_STAMP): FORCE
+	@flags='$(V4_TRACK_LINK)'; \
+	if test x"$$flags" != x"`cat $@ 2>/dev/null`"; then \
+		echo "$$flags" > $@; \
+	fi
+
+$(V4_BINARY): $(V4_OBJS) $(V4_VK_SPV) $(V4_LINK_STAMP)
 	$(CC) $(V4_OBJS) -o $@ $(LDFLAGS)
 
 # VK=1: the Vulkan backend compiled with this engine's flags, and the shaders.
 backend_vulkan_v4.o: backend_vulkan.c backend_vulkan.h $(V4_FLAGS_STAMP)
-	$(CC) $(CFLAGS) -c backend_vulkan.c -o $@
+	$(CC) $(CFLAGS) $(V4_DEPFLAGS) -c backend_vulkan.c -o $@
 vk_tier_v4.o: vk_tier.c vk_tier.h backend_vulkan.h tier.h ggml_quants.h ggml_grids.h $(V4_FLAGS_STAMP)
-	$(CC) $(CFLAGS) -c vk_tier.c -o $@
+	$(CC) $(CFLAGS) $(V4_DEPFLAGS) -c vk_tier.c -o $@
 vk_chain_v4.o: vk_chain.c vk_chain.h vk_alloc.h shaders/chain_qsa.h backend_vulkan.h $(V4_FLAGS_STAMP)
-	$(CC) $(CFLAGS) -c vk_chain.c -o $@
+	$(CC) $(CFLAGS) $(V4_DEPFLAGS) -c vk_chain.c -o $@
 shaders/%.spv: shaders/%.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 $< -o $@
@@ -342,42 +358,57 @@ shaders/qmatmul_coop.spv: shaders/qmatmul_coop.comp
 # Linked into the binary so the engine can dispatch COLI_EXPERT_STORE backends.
 $(REGISTRY_OBJ): expert_store_registry.c expert_store_registry.h expert_store.h \
 	$(V4_FLAGS_STAMP)
-	$(CC) $(CFLAGS) -c expert_store_registry.c -o $@
+	$(CC) $(CFLAGS) $(V4_DEPFLAGS) -c expert_store_registry.c -o $@
 
-$(TARGET_OBJS) $(TEST_UNIT_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
-	deepseek_v4_internal.h deepseek_v4_dspark.inc st.h json.h compat.h tensor.h quant.h fp8_format.h sse41_kernels.h \
+$(TARGET_OBJS) $(TEST_UNIT_OBJS): %.o: deepseek_v4.c coli_env.h deepseek_v4.h \
+	deepseek_v4_internal.h deepseek_v4_gpu_devices.h deepseek_v4_dspark.inc st.h json.h compat.h tensor.h quant.h fp8_format.h sse41_kernels.h \
 	route_trace.h vk_tier.h deepseek_v4_chain.h vk_chain.h \
 	native_quant.h native_quant_batch.h native_quant_dual.h \
-	native_quant_fp4_rows16.h expert_store_registry.h $(V4_FLAGS_STAMP)
-	$(CC) $(CFLAGS) -D$* -c deepseek_v4.c -o $@
+	native_quant_fp4_rows16.h expert_store_registry.h v4_topk.h $(V4_FLAGS_STAMP)
+	$(CC) $(CFLAGS) $(V4_DEPFLAGS) -D$* -c deepseek_v4.c -o $@
 
-$(V4_HOT_TEST_OBJ): deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h \
+$(V4_HOT_TEST_OBJ): deepseek_v4.c coli_env.h deepseek_v4.h deepseek_v4_internal.h \
 		st.h json.h compat.h tensor.h quant.h fp8_format.h route_trace.h sse41_kernels.h \
 		native_quant.h native_quant_fp4_rows16.h expert_store_registry.h $(V4_FLAGS_STAMP)
-	$(CC) $(CFLAGS) -DCOLI_V4_TEST_HOOKS \
+	$(CC) $(CFLAGS) $(V4_DEPFLAGS) -DCOLI_V4_TEST_HOOKS \
 		-DCOLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16 -c deepseek_v4.c -o $@
 
-$(V4_BATCH_TEST_OBJ): deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h \
+$(V4_BATCH_TEST_OBJ): deepseek_v4.c coli_env.h deepseek_v4.h deepseek_v4_internal.h \
 		tensor.h quant.h fp8_format.h native_quant.h native_quant_batch.h $(V4_FLAGS_STAMP) sse41_kernels.h
-	$(CC) $(CFLAGS) -DCOLI_V4_TEST_HOOKS \
+	$(CC) $(CFLAGS) $(V4_DEPFLAGS) -DCOLI_V4_TEST_HOOKS \
 		-DCOLI_V4_UNIT_NATIVE_QUANT_BATCH -c deepseek_v4.c -o $@
+
+# The GPU unit with the router test hooks (tests/test_v4_route_scratch_cuda.c).
+COLI_V4_UNIT_GPU_HOOK.o: deepseek_v4.c deepseek_v4.h deepseek_v4_internal.h compat.h $(V4_FLAGS_STAMP)
+	$(CC) $(CFLAGS) -DCOLI_V4_TEST_HOOKS -DCOLI_V4_UNIT_GPU -c deepseek_v4.c -o $@
 
 COLI_V4_UNIT_GENERATE_STATS.o: serve_codec.h
 
-$(V4_SERVE_TEST): tests/test_v4_serve_framing.c deepseek_v4.c deepseek_v4.h \
+$(V4_SERVE_TEST): tests/test_v4_serve_framing.c deepseek_v4.c coli_env.h deepseek_v4.h \
 		deepseek_v4_internal.h serve_codec.h $(V4_SERVE_TEST_OBJS)
+	$(CC) $(CFLAGS) $< $(V4_SERVE_TEST_OBJS) -o $@ $(LDFLAGS)
+
+tools/bench_dsv4_head_batch: tools/bench_dsv4_head_batch.c deepseek_v4.c deepseek_v4.h \
+		deepseek_v4_internal.h deepseek_v4_dspark.inc serve_codec.h $(V4_SERVE_TEST_OBJS)
 	$(CC) $(CFLAGS) $< $(V4_SERVE_TEST_OBJS) -o $@ $(LDFLAGS)
 
 # The CUDA tier loader object. Compiled only on Windows, where it is appended
 # to V4_OBJS and resolves the MSVC-built coli_cuda_dsv4.dll at runtime. On
 # Linux it is empty so the engine links without it.
 backend_loader_dsv4.o: backend_loader_dsv4.c backend_cuda_dsv4.h $(V4_FLAGS_STAMP)
-	$(CC) $(CFLAGS) -c backend_loader_dsv4.c -o $@
+	$(CC) $(CFLAGS) $(V4_DEPFLAGS) -c backend_loader_dsv4.c -o $@
 
 # Linux/macOS CUDA=1: the tier compiled straight into the engine.
-backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h $(V4_DEEPGEMM_DEP) \
+backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h backend_cuda_dsv4_quant.cuh $(V4_DEEPGEMM_DEP) \
 	$(V4_CUDA_FLAGS_STAMP)
-	"$(NVCC)" $(V4_NVCCFLAGS) -c backend_cuda_dsv4.cu -o $@
+ifneq ($(NO_TC),1)
+	@release=$$("$(NVCC)" --version | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p'); \
+	if ! printf '%s\n' "$$release" | awk -F. 'NF == 2 && ($$1 > 12 || ($$1 == 12 && $$2 >= 8)) { ok=1 } END { exit !ok }'; then \
+		echo "DeepSeek V4: cuBLASLt block scaling requires CUDA toolkit >= 12.8 (detected: $${release:-unknown}). Select a compatible NVCC or use NO_TC=1." >&2; \
+		exit 1; \
+	fi
+endif
+	"$(NVCC)" $(V4_NVCCFLAGS) -MMD -MP -MF backend_cuda_dsv4.d -c backend_cuda_dsv4.cu -o $@
 
 ifneq ($(DEEPGEMM_STAMP),)
 $(DEEPGEMM_STAMP):
@@ -394,8 +425,82 @@ test_expert_store_registry: test_expert_store_registry.c expert_store_registry.c
 	expert_store_registry.h expert_store.h compat.h
 	$(CC) -O2 -Wall -Wextra -D_FILE_OFFSET_BITS=64 test_expert_store_registry.c expert_store_registry.c -o $@
 
+ifeq ($(CUDA),1)
+ifeq ($(IS_WIN),)
+tests/test_dsv4_indexer_prepare_cuda: tests/test_dsv4_indexer_prepare_cuda.cpp \
+        backend_cuda_dsv4.h native_quant.h COLI_V4_UNIT_NATIVE_QUANT.o backend_cuda_dsv4.o
+	$(CXX) -O3 -std=c++20 $< COLI_V4_UNIT_NATIVE_QUANT.o backend_cuda_dsv4.o -o $@ $(LDFLAGS)
+
+tests/test_dsv4_head_cuda: tests/test_dsv4_head_cuda.c backend_cuda_dsv4.h backend_cuda_dsv4.o
+	$(CC) $(CFLAGS) $< backend_cuda_dsv4.o -o $@ $(LDFLAGS)
+
+tests/test_dsv4_wo_decode_cuda: tests/test_dsv4_wo_decode_cuda.cpp \
+        backend_cuda_dsv4.h backend_cuda_dsv4.o
+	$(CXX) -I$(CUDA_HOME)/include -O3 -std=c++20 $< backend_cuda_dsv4.o -o $@ $(LDFLAGS)
+
+tests/test_dsv4_compressor_cuda: tests/test_dsv4_compressor_cuda.cpp \
+        backend_cuda_dsv4.h backend_cuda_dsv4.o
+	$(CXX) -O3 -std=c++20 $< backend_cuda_dsv4.o -o $@ $(LDFLAGS)
+
+tests/test_dsv4_compressor_state_cuda: tests/test_dsv4_compressor_state_cuda.c \
+        deepseek_v4.c deepseek_v4_internal.h backend_cuda_dsv4.h \
+        COLI_V4_UNIT_NATIVE_QUANT.o COLI_V4_UNIT_MATH.o backend_cuda_dsv4.o
+	$(CC) $(CFLAGS) $< COLI_V4_UNIT_NATIVE_QUANT.o COLI_V4_UNIT_MATH.o \
+		backend_cuda_dsv4.o -o $@ $(LDFLAGS)
+
+tests/test_dsv4_multigpu_cuda: tests/test_dsv4_multigpu_cuda.c \
+		backend_cuda_dsv4.h deepseek_v4_gpu_devices.h backend_cuda_dsv4.o
+	$(CC) $(CFLAGS) $< backend_cuda_dsv4.o -o $@ $(LDFLAGS)
+
+tests/test_dsv4_quant_cuda: tests/test_dsv4_quant_cuda.cu \
+		backend_cuda_dsv4_quant.cuh backend_cuda_dsv4.h tests/dsv4_test_devices.h backend_cuda_dsv4.o
+	$(NVCC) $(V4_NVCCFLAGS) $< backend_cuda_dsv4.o -o $@ \
+		-L$(CUDA_HOME)/lib64 -L$(CUDA_HOME)/lib64/stubs -lcudart -lcuda -lcublasLt
+
+tests/test_dsv4_resident_route: tests/test_dsv4_resident_route.cpp \
+		backend_cuda_dsv4.h tests/dsv4_test_devices.h backend_cuda_dsv4.o
+	$(CXX) -O3 -std=c++20 $(V4_DEEPGEMM_FLAGS) $< backend_cuda_dsv4.o -o $@ $(LDFLAGS)
+
+tests/test_dsv4_resident_indexer: tests/test_dsv4_resident_indexer.cpp \
+		backend_cuda_dsv4.h tests/dsv4_test_devices.h backend_cuda_dsv4.o
+	$(CXX) -O3 -std=c++20 $(V4_DEEPGEMM_FLAGS) $< backend_cuda_dsv4.o -o $@ $(LDFLAGS)
+
+DSV4_TEST_DEVICES ?= 0,1
+DSV4_CUDA_TESTS := tests/test_dsv4_head_cuda tests/test_dsv4_wo_decode_cuda \
+	tests/test_dsv4_compressor_cuda tests/test_dsv4_compressor_state_cuda \
+	tests/test_dsv4_indexer_prepare_cuda tests/test_dsv4_multigpu_cuda \
+	tests/test_dsv4_quant_cuda tests/test_dsv4_resident_route tests/test_dsv4_resident_indexer
+
+# All nine CUDA unit tests on two devices. A GPU is required (CI has none);
+# set DSV4_TEST_DEVICES="a,b" to pick the ordinals, e.g. 2,3.
+dsv4-cuda-tests: $(DSV4_CUDA_TESTS)
+	@set -e; for t in $(DSV4_CUDA_TESTS); do \
+		echo "== $$t"; \
+		case $$t in \
+		*multigpu*) DSV4_TEST_DEVICES=$(DSV4_TEST_DEVICES) ./$$t $(DSV4_TEST_DEVICES) ;; \
+		*) DSV4_TEST_DEVICES=$(DSV4_TEST_DEVICES) ./$$t ;; \
+		esac; \
+	done
+endif
+endif
+
 deepseek-v4-clean:
-	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS) $(V4_HOT_TEST_OBJ) \
+	rm -f deepseek_v4 deepseek_v4.exe $(V4_OBJS) $(V4_C_DEP_OBJS) $(V4_C_DEPS) $(V4_LINK_STAMP) \
 		$(V4_BATCH_TEST_OBJ) \
-		$(V4_SERVE_TEST) test_expert_store_registry $(V4_FLAGS_STAMP) \
-		$(V4_CUDA_FLAGS_STAMP) backend_vulkan_v4.o vk_tier_v4.o vk_chain_v4.o
+		tools/bench_dsv4_head_batch \
+		$(V4_SERVE_TEST) tests/test_dsv4_multigpu_cuda \
+		tests/test_dsv4_compressor_cuda tests/test_dsv4_compressor_state_cuda \
+		tests/test_dsv4_indexer_prepare_cuda tests/test_dsv4_wo_decode_cuda tests/test_dsv4_head_cuda \
+		tests/test_dsv4_quant_cuda tests/test_dsv4_resident_route tests/test_dsv4_resident_indexer \
+		test_expert_store_registry $(V4_FLAGS_STAMP) \
+		$(V4_CUDA_FLAGS_STAMP) backend_cuda_dsv4.o backend_cuda_dsv4.d backend_vulkan_v4.o vk_tier_v4.o vk_chain_v4.o
+
+# Bootstrap old objects and recover dependency files removed independently.
+$(foreach obj,$(V4_C_DEP_OBJS),$(eval $(obj): $(obj:.o=.d)))
+$(V4_C_DEPS): ;
+-include $(wildcard $(V4_C_DEPS))
+# The CUDA object's, written by nvcc (-MMD -MP -MF backend_cuda_dsv4.d): bootstrapped and
+# regenerated the same way.
+backend_cuda_dsv4.o: backend_cuda_dsv4.d
+backend_cuda_dsv4.d: ;
+-include $(wildcard backend_cuda_dsv4.d)

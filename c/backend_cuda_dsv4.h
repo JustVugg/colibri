@@ -50,6 +50,11 @@ int dsv4_cuda_sparse_attn_batch_cached_idx(int device,int layer,const float *q,
                                            const int *sel,int selstride,int abs_base,
                                            int comp_limit,int heads,int dim,int tokens,
                                            float scale,float *out);
+/* V4_ATTN_BATCH_PROJ (optional export; the caller falls back when a DLL predates it):
+ * n <= 6 fp8 (fmt 8) decode matvecs over one input, one device round trip. stage holds
+ * sum(rows) floats, output i at the sum of rows[0..i-1]. Bit-identical to dsv4_cuda_matvec. */
+int dsv4_cuda_proj_batch(int n,Dsv4CudaTensor *const *t,const int *rows,const float *x,float *stage);
+void dsv4_cuda_proj_batch_release(void);
 /* Batched indexer scoring: scores[t][c] = sum_h relu(q_th . k_c) * w_th for
  * c < counts[t] (else 0), sequential fp32 order identical to the CPU loop. */
 int dsv4_cuda_indexer_score_batch(int device,const float *queries,const float *keys,
@@ -60,6 +65,18 @@ int dsv4_cuda_indexer_score_batch(int device,const float *queries,const float *k
 int dsv4_cuda_fp8_ref_matmul(int device,const uint8_t *w,const float *bscale,
                              int rows,int cols,int packed_rows8,const float *x,
                              int tokens,float *y);
+int dsv4_cuda_upload_fp8_ref(Dsv4CudaTensor **tensor,const uint8_t *w,
+                            const float *scales,int rows,int cols,int packed_rows8,int device);
+int dsv4_cuda_fp8_ref_matmul_resident(Dsv4CudaTensor *tensor,const float *x,
+                                     int tokens,float *y);
+/* Resident BF16 compressor pair; decode preserves sequential fused sums. */
+int dsv4_cuda_upload_compressor(Dsv4CudaTensor **tensor,const uint16_t *w,
+                                int rows,int cols,int device);
+int dsv4_cuda_compressor_project(Dsv4CudaTensor *kv,Dsv4CudaTensor *gate,
+                                 const float *x,float *values,float *scores);
+/* In-place post-RoPE Hadamard/FP4 queries plus resident BF16 head weights. */
+int dsv4_cuda_indexer_prepare(Dsv4CudaTensor *weights,const float *input,
+                              float *queries,float *head_weights,int dimension);
 /* Build/GPU compatibility (loader DLL selection). */
 int dsv4_cuda_backend_arch_ok(int device);
 const char *dsv4_cuda_backend_name(void);
@@ -76,11 +93,22 @@ int dsv4_cuda_kv_ring_append(int device,int layer,const float *rows,int start_po
                              int count,int window,int dim);
 int dsv4_cuda_kv_comp_append(int device,int layer,const float *rows,int start_idx,
                              int count,int dim);
+/* Packed BF16 vocabulary head, sequential separately rounded mul/add logits. */
+int dsv4_cuda_upload_head_exact(Dsv4CudaTensor **t,const uint16_t *w,int rows,int cols,int device);
+int dsv4_cuda_head_scores_exact(Dsv4CudaTensor *t,const float *input,float *scores);
+/* Batch-major inputs/scores, 1..128 rows. Greedy returns only batch candidates;
+ * ties (including signed zero) retain the first vocabulary index. */
+int dsv4_cuda_head_scores_batch_exact(Dsv4CudaTensor *t,const float *input,int batch,float *scores);
+int dsv4_cuda_head_argmax_batch_exact(Dsv4CudaTensor *t,const float *input,int batch,int *ids,float *values);
 int dsv4_cuda_head_argmax(Dsv4CudaTensor *t,const float *x,int *id,float *value);
 int dsv4_cuda_final_argmax(const Dsv4CudaActivation *residual,Dsv4CudaTensor *fn,Dsv4CudaTensor *scale,
                            Dsv4CudaTensor *base,Dsv4CudaTensor *norm,Dsv4CudaTensor *head,
                            int M,int H,float eps,float pre_eps,int *id,float *value);
 int dsv4_cuda_matvec_grouped(Dsv4CudaTensor *t,float *y,const float *x,int groups);
+/* Decode wo_a -> BF16 -> wo_b -> BF16, preserving raw-input matvec arithmetic.
+ * Unlike dsv4_cuda_wo, this does not FP8-quantize the intermediate activation. */
+int dsv4_cuda_wo_decode(Dsv4CudaTensor *wa,Dsv4CudaTensor *wb,int groups,
+                        float *out,const float *context);
 int dsv4_cuda_expert_group(Dsv4CudaTensor *const *gate,Dsv4CudaTensor *const *up,
                            Dsv4CudaTensor *const *down,const float *weights,int count,
                            float limit,float *y,const float *x);
@@ -194,6 +222,29 @@ Dsv4CudaExpertSet *dsv4_cuda_expert_set_create(Dsv4CudaTensor *const *gate,Dsv4C
 int dsv4_cuda_expert_bank_slots(int experts);
 /* Device bytes one slot of an expert bank of this geometry takes. */
 long long dsv4_cuda_expert_bank_slot_bytes(int hidden,int intermediate);
+int dsv4_cuda_peer_access(int a,int b);
+/* 1 around the layer-split init: P2P is optional there. 0 (default) keeps
+ * dsv4_cuda_init strict for the peer mirror pool. */
+void dsv4_cuda_set_peer_best_effort(int on);
+/* Before dsv4_cuda_init: can `peer` carry `device`'s peer mirror pool (both
+ * visible and distinct, the peer not latched off by dsv4_cuda_peer_healthy,
+ * both of an architecture and with a kernel image this build runs -- the
+ * primary checked first --, peer access both ways)? 1 = yes; 0 = no, the
+ * reason in why (truncated to why_size). A refused peer is left
+ * uninitialised. */
+int dsv4_cuda_peer_probe(int device,int peer,char *why,int why_size);
+/* 1 when the decode MoE on device runs the experts mirrored on peer ON peer
+ * (DSV4_CUDA_PEER_COMPUTE), 0 when device reads them in place over P2P. */
+int dsv4_cuda_peer_compute(int device,int peer);
+/* 0 once a peer-side CUDA failure in the decode MoE has latched this device
+ * off for the rest of the process (after the call that latched it, no kernel
+ * reads its memory from another device again), else 1. */
+int dsv4_cuda_peer_healthy(int device);
+/* 1 once a sticky CUDA error (a kernel fault) has latched CUDA off for the
+ * whole process: with peer access a fault on one GPU takes the others' contexts
+ * with it, and no context recovers in-process. From then on every entry point
+ * refuses without touching CUDA; the engine takes its host paths. */
+int dsv4_cuda_lost(void);
 Dsv4CudaExpertSet *dsv4_cuda_expert_bank_create(int count,int hidden,int intermediate,int device,
                                                  Dsv4CudaTensor *shared_gate,Dsv4CudaTensor *shared_up,
                                                  Dsv4CudaTensor *shared_down);
@@ -216,6 +267,9 @@ int dsv4_cuda_expert_bank_upload_tp2(Dsv4CudaExpertSet *set,int expert,int rank,
                                      const uint8_t *down_weight,const uint8_t *down_scale);
 void dsv4_cuda_expert_set_free(Dsv4CudaExpertSet *set);
 int dsv4_cuda_expert_set_upload_hash(Dsv4CudaExpertSet *set,const int64_t *map,int vocab,int topk);
+int dsv4_cuda_resident_route_moe(Dsv4CudaExpertSet *experts,
+    Dsv4CudaTensor *gate,Dsv4CudaTensor *bias,const int *fixed,
+    float routed_scale,float limit,float *output,const float *input);
 int dsv4_cuda_route_moe(const Dsv4CudaActivation *input,Dsv4CudaTensor *gate,Dsv4CudaTensor *bias,
                         int token,float routed_scale,Dsv4CudaExpertSet *experts,
                         float limit,Dsv4CudaActivation *output);

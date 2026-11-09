@@ -179,7 +179,10 @@ long long vkc_attn_slice_budget(void);   /* COLI_VK_ATTN_SLICE below: rows x pos
  * x heads x head dim pass COLI_VK_ATTN_SLICE (2^32; 0 = never) record their rows in slices,
  * each ending its frame (submitted, not waited for) and the next in a new one: no single
  * submission of a big prompt chunk runs for seconds (a driver resets a job past its
- * timeout: amdgpu 10 s, Windows 2 s). The rows' arithmetic does not change. */
+ * timeout: amdgpu 10 s, Windows 2 s). A slice is cut to keep COLI_VK_ATTN_SLICE_WG workgroups
+ * (64; 0, the budget alone, on an integrated GPU) as far as 4x the budget's work, then a
+ * chunk's slices are made one size on the blocks, so some, and the last, may keep fewer. The
+ * rows' arithmetic does not change. */
 /* chain_dnconv.comp (order 0, 1: Gated DeltaNet's, the sum's two orders; 2: LFM3's gated
  * convolution, input rows B | C | x of CD channels, out = C * conv(B * x), no activation) */
 typedef struct { int S, CD, CK, in_off, in_row, out_off, out_row, snap_row, order, w_off, ring_off, snap_off; } VkcDnConv;
@@ -586,6 +589,9 @@ int vkc_situ(VkcBuf *g, VkcBuf *u, VkcBuf *y, const VkcSitu *p);
  *                     key[j]; every other j < width scores -inf; into sc[sc_off + s*sc_row
  *                     + j]. IH <= 4096; IH <= 64 and IH*ID <= 4096 stage the queries in
  *                     shared memory, larger ones read them from memory (the same sums).
+ *                     Rows from 16 (chain_dsv4_idx.comp, mode 11) take tiles of 16 rows x
+ *                     32 columns when ID is 128 and IH is even: the tile's keys staged
+ *                     once, the same bits (tests/test_vk_chain.c compares them).
  *   vkc_dsv4_cand     the candidate blocks: per row, each block's best score, the block of
  *                     column lens - 1 pinned, then the best min(topb, blocks) blocks (the
  *                     lower on a tie), their columns kept whole and every other column
@@ -921,6 +927,7 @@ typedef struct {
     unsigned long long moe_gv;         /* routed-expert decode steps in our formats on chain_moe_gv.comp */
     unsigned long long tile_wide;      /* of the tile GEMMs, a GGUF's on 128 x 128 tiles (qmatmul_gemm_bdcw.comp) */
     unsigned long long grp_wide;       /* of the grouped expert GEMMs, those at the wider item (qmatmul_grp*_bdcw.comp) */
+    unsigned long long dsa_tiled;      /* DeepSeek V4's indexer scores in tiles of rows (chain_dsv4_idx.comp, mode 11) */
 } VkcStats;
 void vkc_stats(VkcStats *st);
 /* One of the chain's three pools (VKC_DEV, VKC_UP, VKC_DOWN): the blocks it holds on the

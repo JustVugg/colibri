@@ -115,6 +115,7 @@
 #include "cu_dense.h"      /* the dense matrices on the CUDA tier's device, a matrix at a time */
 #endif
 #include "omp_tune.h"
+#include "coli_env.h"
 #include "route_trace.h"
 #include "vk_tier.h"       /* the shared Vulkan routed-expert tier (COLI_VULKAN=1; stubs without VK=1) */
 #include "xtier.h"         /* that tier on the CUDA device too (cu_tier.h): XT(f) */
@@ -4470,6 +4471,11 @@ static void serve_loop(Model *m, Tok *T){
 #ifndef KIMI_K3_NO_MAIN
 int main(int argc, char **argv){
     coli_omp_tune_threads("kimi_k3");   /* squadra sui core fisici, niente spin-wait: vedi omp_tune.h */
+    /* Registry check: an unknown or wrong-engine variable is silently ignored
+     * otherwise, and the run then reports a plausible number for the WRONG
+     * configuration. See coli_env.h. */
+    coli_env_check(CE_KIMI, "kimi_k3");
+    coli_env_dump(CE_KIMI, "kimi_k3");
     int serving=getenv("SERVE")&&getenv("SERVE")[0]=='1';
     if(serving){   /* KV_SLOTS: the conversations a serve decodes at once */
         const char *ks=getenv("KV_SLOTS");
