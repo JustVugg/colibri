@@ -6,6 +6,8 @@ measured warm and published as cold. These tests run on any host by
 mocking sys.platform and the two win32 probes.
 """
 import ctypes
+import contextlib
+import io
 import os
 import subprocess
 import sys
@@ -70,6 +72,16 @@ class MachineInfoWin32Test(unittest.TestCase):
 
 
 class IOBenchDatapointTest(unittest.TestCase):
+    def test_missing_iobench_omits_result_without_losing_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            missing = str(Path(directory) / "missing-iobench")
+            error = io.StringIO()
+            with contextlib.redirect_stderr(error):
+                result = datapoint.run_iobench(missing, "shard.safetensors", 1)
+        self.assertIsNone(result)
+        self.assertIn("iobench", error.getvalue())
+        self.assertIn("disk result omitted", error.getvalue())
+
     def test_direct_result_is_reported_as_cold_disk_throughput(self):
         result = subprocess.CompletedProcess(
             args=["iobench"], returncode=0,
