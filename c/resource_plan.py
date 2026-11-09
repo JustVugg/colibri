@@ -1209,8 +1209,11 @@ def _v41_chain_layout(info, env, vulkan):
     ew = next(iter(engram.values()))[1] if engram else 1
     T = targets if targets > 0 else 1
     wcap, n = W + rows, rows
+    # isc and the candidate mask: the scores stay fp32 a column, the mask has been one bit
+    # a column since it packed (v41c_mask_words, 12b2908a) -- a row is ceil(wcap/32) words
     counts = [n * HD, n * HD, n * nm, n * hr, n * hr, n * D, n * D, n * QL, n * QL, n * nh * hd, n * hd,
-              n * nh * hd, n * og * ol, n * D, n * hd, n * hd, n * IH * ID, n * IH, n * wcap, n * wcap,
+              n * nh * hd, n * og * ol, n * D, n * hd, n * hd, n * IH * ID, n * IH, n * wcap,
+              n * ((wcap + 31) // 32),
               n * (W + K), (n + rmax) * 2 * rd, n * ew, n * D * (H + 1), n * inter, n * inter, n * inter,
               n * D, n * D, n * T * D, n * HD, n * hr, n * D]
     fixed = sum(4 * (x if x else 1) for x in counts)

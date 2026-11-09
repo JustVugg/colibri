@@ -2044,9 +2044,11 @@ family_qwen_chain() {
     COLI_USAGE=$PWD/chain.usage $PY -m unittest tests.test_qwen36_vision_serve
   # the routed experts in the frame (vk_dmoe.h): every layer's (the warm start fills the
   # tier), some layers' (a budget of 60 experts of 64, filled round the layers: four whole,
-  # the rest on the host, an eviction that changes the table mid-run), none
+  # the rest on the host, an eviction that changes the table mid-run), none. 0.00070 GiB
+  # buys those 60 beside the streaming slots' 48 (their default since c615cca4; the 0.00077
+  # the slots' old 64 carved to 60 now holds every expert of the model, none on the host)
   dmoe_gate qwen36 "chain qwen36 the routed experts in the frame" all COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
-  dmoe_gate qwen36 "chain qwen36 the routed experts in the frame, some layers" some COLI_VK_TIER_GB=0.00077 COLI_DENSE_I8=0 \
+  dmoe_gate qwen36 "chain qwen36 the routed experts in the frame, some layers" some COLI_VK_TIER_GB=0.00070 COLI_DENSE_I8=0 \
     SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
   dmoe_gate qwen36 "chain qwen36 the host's routing (COLI_VK_CHAIN_MOE=0)" none COLI_VK_CHAIN_MOE=0 COLI_DENSE_I8=0 \
     SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
@@ -2054,7 +2056,7 @@ family_qwen_chain() {
   # host's RAM too): the experts the device leaves in system RAM the CPU computes in place
   # (the hybrid frame, its float form: GQ_EXACT=1, which the CPU run's int4 does not read),
   # every layer's routed experts in the frame again
-  dmoe_gate qwen36 "chain qwen36 the host pool" all COLI_VK_TIER_GB=0.00077 COLI_VK_TIER_HOST=1 GQ_EXACT=1 COLI_DENSE_I8=0 \
+  dmoe_gate qwen36 "chain qwen36 the host pool" all COLI_VK_TIER_GB=0.00070 COLI_VK_TIER_HOST=1 GQ_EXACT=1 COLI_DENSE_I8=0 \
     SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
   grep -q "host pool on, [1-9]" vk.log || { cat vk.log; fail "chain qwen36 the host pool: no expert in the host pool"; }
   grep -q "hybrid layer steps\( ([^)]*)\)\{0,1\}, [1-9][0-9]* host pool pairs on the CPU" vk.log || { cat vk.log; fail "chain qwen36 the host pool: no int4 pair on the CPU"; }

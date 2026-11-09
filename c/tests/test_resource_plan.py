@@ -2776,17 +2776,18 @@ class VulkanPartialChainDskTest(unittest.TestCase):
 
     def test_deepseek_v41_layout_is_the_engines(self):
         # "[VK] deepseek_v41 chain fit: ... fixed ... (the engine's E B, ...), tail T B, layers
-        # b0 .. B" for dsv41_tiny on Lavapipe, per configuration
+        # b0 .. B" for dsv41_tiny on Lavapipe, per configuration (the fixed pins carry the
+        # candidate mask packed to a bit a column, 12b2908a: 1030144 B less at 512 rows)
         from resource_plan import vk_chain_fit, vk_fit_pools
         info = self.write_v41()
         cpu = {"type": "cpu", "budget_bytes": 64 * GB}
         on = {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1"}
         for env, layers, fixed, tail in (
-                (on, [318696, 634472, 318696, 571752, 471528, 318696], 12124416, 0),
-                (dict(on, COLI_VK_DENSE="1"), [318696, 634472, 318696, 571752, 471528, 318696], 12124416, 79616),
+                (on, [318696, 634472, 318696, 571752, 471528, 318696], 11094272, 0),
+                (dict(on, COLI_VK_DENSE="1"), [318696, 634472, 318696, 571752, 471528, 318696], 11094272, 79616),
                 # prompts only, device only: wo_a per output group as well; chunks of 7 rows
                 (dict(on, COLI_VK_CHAIN="2", COLI_VK_DENSE_HOST="0", COLI_VK_CHAIN_ROWS="7"),
-                 [198376, 417000, 198376, 257512, 351208, 198376], 137736, 0)):
+                 [198376, 417000, 198376, 257512, 351208, 198376], 137344, 0)):
             with self.subTest(env=env):
                 fit = vk_chain_fit(info, "deepseek_v41", env, cpu)
                 self.assertEqual(fit["layers"], layers)
