@@ -57,7 +57,7 @@ def train(args):
     cfg = SFTConfig(
         output_dir=str(ADAPTER), per_device_train_batch_size=1,
         gradient_accumulation_steps=8, num_train_epochs=args.epochs,
-        learning_rate=2e-4, lr_scheduler_type="cosine", warmup_ratio=0.05,
+        learning_rate=2e-4, lr_scheduler_type="cosine", warmup_steps=2,  # transformers 5.x removed warmup_ratio
         logging_steps=5, save_strategy="epoch", bf16=True,
         gradient_checkpointing=True, gradient_checkpointing_kwargs={"use_reentrant": False},
         optim="paged_adamw_8bit", max_length=1024, report_to=[],
