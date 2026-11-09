@@ -11,9 +11,13 @@
  *
  * The scale of a group is the ceil power of two covering amax/quant_max for ue8m0
  * (exponent = ((bits(amax/quant_max) - 1) >> 23) + 1, decoded 2^(b-127) exactly), or
- * e4m3-RNE of min(clamped_amax/6, 448) whose DECODED value scales the group (the fp4 main
- * cache); the amax margins floor the scale away from zero (FP8 1e-4, FP4 6*2^-126, the
- * e4m3-scale path 2^-9 * 6). Values are rounded to nearest, ties to the even code (RNE),
+ * e4m3-RNE of min(clamped_amax/6, 448) whose DECODED value scales the group (the fp4
+ * main cache); where that scale would leave the group's scaled amax at the e2m1 top tie
+ * or below it, the packer steps it down a code (kvq_pack_ckv's note) so a dequantized
+ * row re-packs to itself -- the one place colibri's ckv bytes differ from DI's, which
+ * never re-packs a row. The amax margins floor the scale away from zero (FP8 1e-4,
+ * FP4 6*2^-126, the e4m3-scale path 2^-9 * 6). Values are rounded to nearest, ties to
+ * the even code (RNE),
  * the e4m3 codes as dsv4_quant.h's dsv4_e4m3_round picks them. The host keeps its state
  * fp32 holding the DEQUANTIZED rows (a pull's write-back and a re-upload's source), so the
  * reference here is what the device's pack (chain_dsv4.comp mode 13) must reproduce bit
@@ -122,6 +126,20 @@ static inline void kvq_pack_ckv(uint8_t dst[KVQ_CKV_BYTES], const float *x) {
         if (sff > 448.0f) sff = 448.0f;
         uint8_t sf = kvq_e4m3_code(sff);
         float inv = kvq_e4m3_inv(sf);   /* the group quantizes with the scale as stored */
+        if (cl * inv <= 5.0f) {   /* the near-dead band's demote: with the scaled amax at
+         * the e2m1 top tie or under it (a group amax in [9*2^-9, 10*2^-9]: sf 0x02, the
+         * amax element 4.5-5.0 -> grid 4 -> 8*2^-9), the pull's dequantize-and-re-pack
+         * cycle would re-pick sf 0x01 and hop the group's large elements once (8*2^-9 ->
+         * 6*2^-9) -- a pack(unpack(pack)) value fixpoint needs the smaller scale up front.
+         * Only a subnormal sf >= 0x02 can trip it (a normal sf keeps the scaled amax
+         * above 5.6, and 0x01's groups sit at >= 6 by the clamp floor), and the demoted
+         * scale puts the scaled amax at 9-10, the 6-grid: the re-pack re-picks it. The
+         * first-pack cost in the band is the amax decoding to 6*2^-9, 33-40% low against
+         * 11-20% had sf 0x02 kept -- near-dead groups only, and DI never re-packs, so
+         * outside the band the bytes are DI's */
+            sf--;
+            inv = kvq_e4m3_inv(sf);
+        }
         for (int i = 0; i < 8; i++)   /* 16 elements, two nibbles a byte */
             dst[g * 8 + i] = (uint8_t)(kvq_e2m1_code(p[2 * i] * inv) | (kvq_e2m1_code(p[2 * i + 1] * inv) << 4));
         dst[256 + g] = sf;

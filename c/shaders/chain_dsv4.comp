@@ -754,8 +754,10 @@ void quantize() {
         if (tid < 64) {
             int g = tid >> 1;  float mx = 0.0;
             for (int i = g * 16; i < g * 16 + 16; i++) mx = max(mx, abs(b0[sb + i]));
-            uint sfb = e4m3c(min(max(mx, 0.01171875) * (1.0 / 6.0), 448.0)), word = 0u;
+            float cl = max(mx, 0.01171875);
+            uint sfb = e4m3c(min(cl * (1.0 / 6.0), 448.0)), word = 0u;
             float inv = e4m3i(sfb);
+            if (cl * inv <= 5.0) { sfb--; inv = e4m3i(sfb); }   // the near-dead band's demote, kvq_pack_ckv
             for (int k = 7; k >= 0; k--) word = (word << 4) | e2m1c(b0[sb + tid * 8 + k] * inv);
             i6[w + tid] = int(word);
         } else if (tid < 72) {
@@ -764,7 +766,10 @@ void quantize() {
             for (int g = 3; g >= 0; g--) {
                 float mx = 0.0;
                 for (int i = (gb + g) * 16; i < (gb + g + 1) * 16; i++) mx = max(mx, abs(b0[sb + i]));
-                word = (word << 8) | e4m3c(min(max(mx, 0.01171875) * (1.0 / 6.0), 448.0));
+                float cl = max(mx, 0.01171875);
+                uint sfb = e4m3c(min(cl * (1.0 / 6.0), 448.0));
+                if (cl * e4m3i(sfb) <= 5.0) sfb--;   // the demote, as the data threads above
+                word = (word << 8) | sfb;
             }
             i6[w + tid] = int(word);
         }

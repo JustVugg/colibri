@@ -16,8 +16,10 @@
  *            approximate mode costs
  * The edge rows: an amax of zero (all-zero, -0 and denormal rows), an amax exactly a
  * power of two times the format's max (448 and 896 for the window, 6 and 12 for the FP4
- * rows), the e4m3-scale clamp floor (an all-zero compressed row) and the RNE ties on
- * both grids. Skips (exit 0) when no Vulkan device or the shader is missing. */
+ * rows), the e4m3-scale clamp floor (an all-zero compressed row), the RNE ties on both
+ * grids, and the ckv subnormal-scale band [9*2^-9, 10*2^-9] with its edges -- the slice
+ * kvq_pack_ckv's demote buys the re-pack fixpoint in. Skips (exit 0) when no Vulkan
+ * device or the shader is missing. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -69,6 +71,16 @@ static void fill_rows(float *x, int R, int hd, int e4m3) {
     EDGE((i & 3) * (i & 4 ? -0.25f : 0.25f) + 0.5f * (i & 1));   /* the FP4 tie ladder */
     EDGE((float)((i % 16) - 8) / 16.0f);                    /* the e4m3 mantissa's ties */
     EDGE(0.0f);                                             /* a second zero row: the e4m3-scale floor */
+    /* the ckv subnormal-scale band and its edges (kvq_pack_ckv's demote note): a group
+     * amax in [9*2^-9, 10*2^-9] picks sf 0x02 whose scaled amax sits at the e2m1 top tie
+     * or under it -- the demote steps it to 0x01 -- and 15*2^-9 with the outsides 8.9
+     * and 11 hold their code; every group of these rows carries the edge amax exactly */
+    EDGE((i & 1 ? -1.0f : 1.0f) * ldexpf(9.0f, -9));        /* the band's left edge: the tie rounds to sf 0x02 */
+    EDGE((i & 1 ? -1.0f : 1.0f) * ldexpf(9.5f, -9));        /* inside the band */
+    EDGE((i & 1 ? -1.0f : 1.0f) * ldexpf(10.0f, -9));       /* the right edge: the scaled amax is the 5.0 tie */
+    EDGE((i & 1 ? -1.0f : 1.0f) * ldexpf(15.0f, -9));       /* the sf 0x03 tie point: even, so 0x02 holds */
+    EDGE((i & 1 ? -1.0f : 1.0f) * ldexpf(8.9f, -9));        /* just under the band: sf 0x01 */
+    EDGE((i & 1 ? -1.0f : 1.0f) * ldexpf(11.0f, -9));       /* just over it: sf 0x02 at a scaled amax over the tie */
 #undef EDGE
 }
 
@@ -127,7 +139,7 @@ done:
 /* the index keys' round trip in their block-wide sections (a row packs into a mirror at
  * a token, not to contiguous bytes), tokens 5..44 crossing the 32-token block boundary */
 static void codec_ikey(void) {
-    const int R = 40, hd = 128, tok = 5, cap = tok + R;
+    const int R = 48, hd = 128, tok = 5, cap = tok + R;
     const size_t mb = kvq_ikey_mirror_bytes((size_t)cap);   /* the blocks are whole */
     float *x = malloc((size_t)R * hd * sizeof(float));
     uint8_t *hp = calloc(mb, 1), *again = calloc(KVQ_IKEY_BLOCK * KVQ_IKEY_BYTES, 1);
@@ -357,8 +369,8 @@ int main(void) {
     if (!vkc_init() || !vkc_dsv4_ready()) {
         fprintf(stderr, "vk-kv-quant: the chain_dsv4 shader is missing -- skipped\n"); coli_vk_shutdown(); return 0;
     }
-    codec("win (the ring scattered)", 0, 1, 16, 512, KVQ_WIN_BYTES, 16, 13, kvq_pack_win, kvq_unpack_win);
-    codec("ckv (from token 7)", 1, 0, 16, 512, KVQ_CKV_BYTES, 23, 7, kvq_pack_ckv, kvq_unpack_ckv);
+    codec("win (the ring scattered)", 0, 1, 24, 512, KVQ_WIN_BYTES, 24, 13, kvq_pack_win, kvq_unpack_win);
+    codec("ckv (from token 7)", 1, 0, 24, 512, KVQ_CKV_BYTES, 31, 7, kvq_pack_ckv, kvq_unpack_ckv);
     codec_ikey();
     score_case(3, 512, 8);    /* a wide table: mode 10's grid arm (dsa_grid default-on
                               * takes IH<=256 there; mode 9's quantized reader is the
