@@ -686,6 +686,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"OPENAI",                           CE_STR   , CE_QWEN | CE_QWEN38                             , 0             , NULL},
     {"ORACLE_STRICT", CE_BOOL, CE_COLIBRI, 0, NULL},
     {"ORACLE_TF_MAX_MISMATCHES",          CE_INT   , CE_COLIBRI, 0             , NULL},
+    {"PAR_LOAD",                         CE_INT   , CE_OLMOE                                        , 0             , NULL},
     {"PILOT",                            CE_INT   , CE_COLIBRI | CE_OLMOE | CE_QWEN                 , 0             , NULL},
     {"PILOT_EVICT_GUARD",                CE_INT   , CE_COLIBRI | CE_OLMOE                           , 0             , NULL},
     {"PILOT_K",                          CE_INT   , CE_COLIBRI                                      , 0             , NULL},
