@@ -75,7 +75,11 @@ to the gateway's own). `think` is the model's thinking when a request says nothi
 at the highest effort on every question (one answer in a test ran to 5930 tokens);
 `"think": "low"` keeps the reasoning short. Qwen3.8 wants `"kv_slots": 1`: with two slots the engine keeps its
 Vulkan dense chain off (one conversation's state on the device), and decode fell from 15
-to 6 tok/s on the RTX 3070; Qwen3.6's chain serves two slots. `default` is the model loaded at
+to 6 tok/s on the RTX 3070. Qwen3.6's chain serves two slots, but on an 8 GB card the second
+conversation's KV mirror does not fit beside the first once a prompt is long (the log says so),
+and its attention goes through the host: a 12.7k-token context decoded at 10.5 tok/s with two
+slots and at 36 with one, a 20.6k one at 7.8 and 34, and the tier's memory the mirror took did
+not come back after the conversation; `"kv_slots": 1` there too. `default` is the model loaded at
 start (`--no-preload` skips that) and the one used when a request names none. Models
 found under `--models-dir` need no entry; an entry adds names and settings to one.
 
