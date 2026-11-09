@@ -17,7 +17,7 @@ with neither it answers 404 and the page says the feature is not available.
 Streams (chat in SSE) are passed through chunk by chunk. A confirmed client reset
 or failed response write closes upstream. A client that only closes its request
 write side can still read its response."""
-import argparse, http.client, json, os, sys, urllib.parse
+import argparse, json, os, sys, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -105,7 +105,7 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length) if length else None
         headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP and k.lower() != "origin"}
-        conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=3600)
+        conn = responses_shim.gateway_connection(u)
 
         def unavailable(error):
             msg = ('{"error":{"message":"colibri non risponde su %s: %s"}}' % (u.netloc, error)).encode()

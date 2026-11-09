@@ -1,8 +1,8 @@
 /* bench_host_pairs: vkt_host_pairs (the hybrid steps' CPU pairs) alone, on colibri's int4 rows
- * (fmt 2 a row's scale, fmt 4 groups of 64), int8 (fmt 1) and FP8 e4m3 (fmt 12, groups of 128),
+ * (fmt 2 a row's scale, fmt 4 groups of 64), int8 (fmt 1), MXFP4 (fmt 7, groups of 32), and FP8 e4m3 (fmt 12, groups of 128),
  * the shapes of Qwen3.6-35B-A3B's expert (D 2048, I 512) or those given (Qwen3.8-Flash-Next:
  * 12 2560 640). No device: the host pool's rows are malloc'd here.
- *   ./tests/bench_host_pairs [fmt] [D] [I] */
+ *   ./tests/bench_host_pairs [fmt] [D] [I] [threads] [calls] */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,7 +12,7 @@
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
 static float frnd(void) { return (float)rand() / RAND_MAX * 2.f - 1.f; }
 typedef struct { uint8_t *g, *u, *d; float *sg, *su, *sd; } Ex;
-/* rows of O x I in fmt (1 int8, 2 int4 pairs v+8, 4 int4 pairs gs 64, 12 FP8 e4m3 gs 128); scales per row or per group */
+/* rows of O x I in fmt (1 int8, 2 int4 pairs v+8, 4 int4 pairs gs 64, 7 MXFP4 gs 32, 12 FP8 e4m3 gs 128); scales per row or per group */
 static uint8_t *mk(int fmt, int O, int I, int gs, float **sc) {
     size_t rb = fmt == 1 || fmt == 12 ? (size_t)I : (size_t)I / 2, ns = gs ? (size_t)O * (((size_t)I + gs - 1) / gs) : (size_t)O;   /* a row's last group may be partial */
     uint8_t *r = malloc(rb * O); *sc = malloc(ns * sizeof(float));
@@ -22,11 +22,16 @@ static uint8_t *mk(int fmt, int O, int I, int gs, float **sc) {
 }
 int main(int argc, char **argv) {
     int fmt = argc > 1 ? atoi(argv[1]) : 2, D = argc > 2 ? atoi(argv[2]) : 2048, I = argc > 3 ? atoi(argv[3]) : 512, NE = 64;
-    int gs = fmt == 4 ? 64 : fmt == 12 ? 128 : 0;
+    int gs = fmt == 4 ? 64 : fmt == 7 ? 32 : fmt == 12 ? 128 : 0;
     const int byte_rows = fmt == 1 || fmt == 12;   /* a byte a weight */
     int nps[] = {1, 2, 8}; int nts[] = {1, 2, 4, 12, 24}, nnt = 5;
     if (argc > 4) { nts[0] = atoi(argv[4]); nnt = 1; }   /* one thread count: [fmt] [D] [I] [threads] [calls] */
     const int calls = argc > 5 ? atoi(argv[5]) : 400;
+    if ((fmt != 1 && fmt != 2 && fmt != 4 && fmt != 7 && fmt != 12) || D <= 0 || I <= 0 ||
+        D % 32 || I % 32 || (gs && fmt != 12 && (D % gs || I % gs)) || nts[0] < 1 || calls < 1) {
+        fputs("fmt must be 1,2,4,7,12; D/I must be positive multiples of 32 and the packed group size; threads and calls must be positive\n", stderr);
+        return 2;
+    }
     Ex *ex = malloc((size_t)NE * sizeof *ex); VktHostExpert *hv = malloc((size_t)NE * sizeof *hv);
     for (int e = 0; e < NE; e++) {
         ex[e].g = mk(fmt, I, D, gs, &ex[e].sg); ex[e].u = mk(fmt, I, D, gs, &ex[e].su); ex[e].d = mk(fmt, D, I, gs, &ex[e].sd);
@@ -49,6 +54,12 @@ int main(int argc, char **argv) {
                 if (!vkt_host_pairs(hp, xp, np, D, I, 0.f, nt, gu, hh, dn)) { printf("failed\n"); return 1; }
             }
             double t = (now() - t0) / reps;
+            uint64_t hash = UINT64_C(14695981039346656037);
+            const unsigned char *out = (const unsigned char *)dn;
+            for (size_t j = 0; j < (size_t)np * D * sizeof(float); j++)
+                hash = (hash ^ out[j]) * UINT64_C(1099511628211);
+            printf("sample np %d nt %d rep %d warmup %d: %.6f us a pair (%d calls), output %016llx\n",
+                   np, nt, r + 3, r < 0, t * 1e3 / np, reps, (unsigned long long)hash);
             if (r >= 0) { if (t < best) best = t; tot += t; }
         }
         printf("np %d nt %2d: %7.1f us a call, %6.1f us a pair (best; mean %6.1f), %5.1f GB/s\n", np, nt, best * 1e3, best * 1e3 / np,

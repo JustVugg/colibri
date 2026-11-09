@@ -1,0 +1,77 @@
+{
+  "created_utc": "2026-11-08T14:36:51.322292+00:00",
+  "artifacts": {
+    "model-audit.json": {
+      "original_sha256": "ea061b495b93bd2f14a119b3ae3735ecaa0244dbb348e431dbc6800fa5ef75d5",
+      "archive_sha256": "ea061b495b93bd2f14a119b3ae3735ecaa0244dbb348e431dbc6800fa5ef75d5"
+    },
+    "full-check.json": {
+      "original_sha256": "46cc8feb5bbc3e154dbea6fef553e02f81ca09eef2bf9dbd7fec117fac7af4d3",
+      "archive_sha256": "46cc8feb5bbc3e154dbea6fef553e02f81ca09eef2bf9dbd7fec117fac7af4d3"
+    },
+    "full-check.log.gz": {
+      "original_sha256": "1a3dd10444f8fc4aaf2801ca0937d1f86552ff415cf48ca377035fe03633f3c0",
+      "archive_sha256": "8028e43584c1b7939d798dbc9295cd8e52f5b5dee9374b54bb854196d67ae4bf"
+    },
+    "runtime-artifacts.json": {
+      "original_sha256": "f2b374ddf079f4c90a939dfdef793366e5cba475ecccb1f0ef4b551c9259556f",
+      "archive_sha256": "f2b374ddf079f4c90a939dfdef793366e5cba475ecccb1f0ef4b551c9259556f"
+    },
+    "reference.json": {
+      "original_sha256": "3670793f898d5a87d5d9c9e2c779602c41fd115ab3cecf0567c0e82318699b45",
+      "archive_sha256": "3670793f898d5a87d5d9c9e2c779602c41fd115ab3cecf0567c0e82318699b45"
+    },
+    "local-model-manifest.json": {
+      "original_sha256": "ceeea0081cb3a7d2f4b46530fc006b4ae8c26c14ef264cdafc46267527c58fde",
+      "archive_sha256": "ceeea0081cb3a7d2f4b46530fc006b4ae8c26c14ef264cdafc46267527c58fde"
+    },
+    "shared-runtime.patch.gz": {
+      "original_sha256": "08a76a38c78e5a841608d6969dcf5152d879ce1002e1f5e3cf0e3e1772baf2d1",
+      "archive_sha256": "16040a6b9902f9992c2ba42b440db0a31757214e48ff823048b169e34782663c"
+    },
+    "end-to-end-original.json": {
+      "original_sha256": "c427b43563433dd77607e13779355f11de2cb7ec9aceb3dcde7e92769f4a49bd",
+      "archive_sha256": "c427b43563433dd77607e13779355f11de2cb7ec9aceb3dcde7e92769f4a49bd"
+    },
+    "original-session.json": {
+      "original_sha256": "0a994bf9b8960a67523f40ca6c2517335462dac7d04ccb8de74d8174423b00ef",
+      "archive_sha256": "0a994bf9b8960a67523f40ca6c2517335462dac7d04ccb8de74d8174423b00ef"
+    },
+    "original-engine.log.gz": {
+      "original_sha256": "a5c705e2a5ce2ef4b090b8679c075360c6ad7d57bcc878d7ca6007b9150d0ef8",
+      "archive_sha256": "0206a7d8fc29f483bb6a2b5e8158f49cc38fa068eb014c0393e7977832a96562"
+    },
+    "end-to-end-candidate.json": {
+      "original_sha256": "04dd8ec69f29ae386708ec72b2e2ae9019eff35024bb3baae9da9810accbd2bf",
+      "archive_sha256": "04dd8ec69f29ae386708ec72b2e2ae9019eff35024bb3baae9da9810accbd2bf"
+    },
+    "candidate-session.json": {
+      "original_sha256": "dcb41f0febcdc5e1f67e07ffea5dab9168d2e219c5a58788583bc001b0a265c2",
+      "archive_sha256": "dcb41f0febcdc5e1f67e07ffea5dab9168d2e219c5a58788583bc001b0a265c2"
+    },
+    "candidate-engine.log.gz": {
+      "original_sha256": "a66150e9ec9c8d5e7d324f428496b2c1ff86883b37ac692e4070cc453ef46016",
+      "archive_sha256": "080bca1a03f942d1d3d3d5488bc339cf1f10b2c13604c16a719b5637cbe8d397"
+    },
+    "prompts.json": {
+      "original_sha256": "bda98661fddb0b5e34b2b112b57d6289b0f596810d3ba1e0e22394dc5aadaec9",
+      "archive_sha256": "bda98661fddb0b5e34b2b112b57d6289b0f596810d3ba1e0e22394dc5aadaec9"
+    },
+    "replay.py": {
+      "original_sha256": "32205bb785651993afe3c842c58b6ceb4ae8e430c9cbea409a6171c687e23725",
+      "archive_sha256": "32205bb785651993afe3c842c58b6ceb4ae8e430c9cbea409a6171c687e23725"
+    },
+    "runtime-build.log.gz": {
+      "original_sha256": "56ed5fa634c96d507aa11fe1b910318d5074b02e88160470f71c08165909b2cd",
+      "archive_sha256": "49955a84e9a04422f8d3ab9a3db0be960a535bf1a5d67d18a8ad39b63cb69fdc"
+    },
+    "Dockerfile.models": {
+      "original_sha256": "1db230b9451807e3c3f4cea5b1d416b02574678e415d59f4753033b48be7c7e6",
+      "archive_sha256": "1db230b9451807e3c3f4cea5b1d416b02574678e415d59f4753033b48be7c7e6"
+    },
+    "compiler.json": {
+      "original_sha256": "879c53493b6b7af742cd108ba4e80d4aa1348120eab102f2f81adbd57299beb0",
+      "archive_sha256": "879c53493b6b7af742cd108ba4e80d4aa1348120eab102f2f81adbd57299beb0"
+    }
+  }
+}

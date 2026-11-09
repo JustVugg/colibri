@@ -1610,7 +1610,7 @@ static int join_big(const float **rows) {
 /* layer's likely streamed experts into the free slots, while the device runs its attention */
 int vkt_stream_prefetch(int layer, int S) {
     if (!T.on || !T.st_ok || T.inflight || layer < 0 || layer >= T.main_layers || S < T.gemm_rows) return 0;
-    if (!coli_vk_xb_ready() || !st_alloc()) return 0;
+    if (!coli_vk_xb_ready()) return 0;
     const int E = T.c.experts, K = T.c.topk;
     int R = stream_min_rows();
     /* the slots a step before left filled are free again */
@@ -1637,6 +1637,10 @@ int vkt_stream_prefetch(int layer, int S) {
             while (at > 0 && est[cand[at - 1]] < est[e]) { cand[at] = cand[at - 1]; at--; }
             cand[at] = e;
         }
+    /* With every expert resident (in VRAM or the host pool), nothing needs a
+     * streaming slot. Keep the budget/resident set, but allocate slots only
+     * after finding a candidate: an empty prefetch must not consume VRAM. */
+    if (nc && !st_alloc()) { free(est); free(cand); return 0; }
     int got = 0, used = 0;
     if (nc > T.st_n) nc = T.st_n;
     while (used < nc) {   /* groups of a sub-batch's worth, into the slots in order */
@@ -1754,7 +1758,21 @@ static void dev_codes3(uint8_t *u, const uint8_t *row, int I) {
 /* an MXFP4 row's values times 2, as int8 (e2m1: 0, 0.5, 1, 1.5, 2, 3, 4, 6 and the sign) */
 static void dev_codes_fp4(int8_t *w, const uint8_t *row, int I) {
     static const int8_t v2[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
-    for (int j = 0; j < I / 2; j++) { w[2 * j] = v2[row[j] & 15]; w[2 * j + 1] = v2[row[j] >> 4]; }
+    int j = 0;
+#if defined(__AVX2__)
+    /* The scalar table lookup, 16 packed bytes at a time. The two shuffles
+     * produce exactly the same signed int8 codes; arithmetic is unchanged. */
+    const __m128i lut = _mm_loadu_si128((const __m128i *)v2);
+    const __m128i mask = _mm_set1_epi8(15);
+    for (; j + 16 <= I / 2; j += 16) {
+        const __m128i b = _mm_loadu_si128((const __m128i *)(row + j));
+        const __m128i lo = _mm_shuffle_epi8(lut, _mm_and_si128(b, mask));
+        const __m128i hi = _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(b, 4), mask));
+        _mm_storeu_si128((__m128i *)(w + 2 * j), _mm_unpacklo_epi8(lo, hi));
+        _mm_storeu_si128((__m128i *)(w + 2 * j + 16), _mm_unpackhi_epi8(lo, hi));
+    }
+#endif
+    for (; j < I / 2; j++) { w[2 * j] = v2[row[j] & 15]; w[2 * j + 1] = v2[row[j] >> 4]; }
 }
 static float dev_fp8(uint8_t b) {   /* e4m3 as the backend decodes it */
     const int e = (b >> 3) & 15, m = b & 7;

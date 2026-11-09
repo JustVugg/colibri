@@ -214,6 +214,13 @@ static volatile unsigned pilot_r = 0, pilot_w = 0;
 static Model *pilot_m = NULL;
 static int g_pilot = 0;
 static int g_wide  = 1;  /* IMPROVEMENT 4: top-K * g_wide candidates prefetched */
+/* PAR_LOAD=n (opt-in, default 0 = off): at decode, acquire a token's K routed
+ * experts before computing them, the cache misses with up to n threads, so their
+ * disk reads overlap instead of running one at a time. The experts are still
+ * computed one by one in routing order, so the output is the same bits; only
+ * the fetch overlaps. Used only when a layer's cache holds at least 2*K slots,
+ * so the K leases a token holds can never starve eviction. */
+static int g_par_load = 0;
 static int g_pilot_evict_guard = 1; /* PILOT_EVICT_GUARD=0 to disable LFRU prefetch eviction guard */
 static int g_expert_drop = 0;       /* EXPERT_DROP=1 restores fadvise(DONTNEED) after expert reads */
 #if defined(__AVX2__) || !defined(OLMOE_NO_MAIN)
@@ -1500,6 +1507,30 @@ static void olmoe_expert_acquire(ColiExpertStore *store, int layer, int expert,
         exit(1);
     }
 }
+/* PAR_LOAD: acquire a decode token's K routed experts up front, the resident
+ * ones first (no disk, and so the loads below cannot evict them), then the
+ * misses with up to g_par_load threads through the same thread-safe lookup the
+ * PILOT worker uses. Returns 0 with nothing acquired when fewer than two of the
+ * K are misses: a token whose experts are all resident pays no thread start-up,
+ * and the caller acquires them one at a time as before. */
+static int olmoe_acquire_parallel(Model *m, ColiExpertStore *store, int layer,
+                                  const int *idx, int K, ColiExpertView *views) {
+    int miss[64], is_miss[64], nm = 0;
+    pthread_mutex_lock(&g_pilot_mx);
+    for (int k = 0; k < K; k++) {
+        is_miss[k] = slot_indexed(m, layer, idx[k]) == NULL;
+        if (is_miss[k]) miss[nm++] = k;
+    }
+    pthread_mutex_unlock(&g_pilot_mx);
+    if (nm < 2) return 0;
+    for (int k = 0; k < K; k++)
+        if (!is_miss[k]) olmoe_expert_acquire(store, layer, idx[k], &views[k]);
+    int nt = nm < g_par_load ? nm : g_par_load;
+    #pragma omp parallel for num_threads(nt) schedule(dynamic, 1)
+    for (int j = 0; j < nm; j++)
+        olmoe_expert_acquire(store, layer, idx[miss[j]], &views[miss[j]]);
+    return 1;
+}
 
 /* The bytes the KV's pages reach once `positions` are written: K and V of
  * every layer hold n_heads rows of max_t * head_dim floats, each written from
@@ -1976,13 +2007,17 @@ static void moe_routed(Model *m, int layer, float *x, int S, float *logits, floa
     }
     ColiExpertStore store = olmoe_expert_store(m);
     float *g = falloc(I), *u = falloc(I), *hh = falloc(D);
+    int par_ok = g_par_load > 1 && K <= 64 && m->cache[layer].cap >= 2 * K;
     for (int s = 0; s < S; s++) {
         int idx[64]; float val[64];
         moe_route_row(m, layer, s, logits + (int64_t)s*E, idx, val);
         const float *xs = x + (int64_t)s*D;
+        ColiExpertView pre[64];
+        int par = par_ok && olmoe_acquire_parallel(m, &store, layer, idx, K, pre);
         for (int kk = 0; kk < K; kk++) {
             ColiExpertView view;
-            olmoe_expert_acquire(&store, layer, idx[kk], &view);
+            if (par) view = pre[kk];
+            else olmoe_expert_acquire(&store, layer, idx[kk], &view);
             moe_expert_row(m, &view, xs, g, u, hh);
             coli_expert_release(&store, &view);
             float w = val[kk];
@@ -3419,6 +3454,9 @@ int main(int argc, char **argv) {
     if (!snap) { coli_print_launcher_help("OLMoE", "SNAP=<model directory> ./olmoe ..."); return 1; }
     g_pilot = getenv("PILOT") ? atoi(getenv("PILOT")) : 0;
     g_wide  = getenv("WIDE")  ? atoi(getenv("WIDE"))  : 1;
+    g_par_load = getenv("PAR_LOAD") ? atoi(getenv("PAR_LOAD")) : 0;
+    if (g_par_load < 0) g_par_load = 0;
+    if (g_par_load > 16) g_par_load = 16;
     g_pilot_evict_guard = getenv("PILOT_EVICT_GUARD") ? atoi(getenv("PILOT_EVICT_GUARD")) : 1;
     g_expert_drop = getenv("EXPERT_DROP") ? atoi(getenv("EXPERT_DROP")) : 0;
     g_fused3     = getenv("FUSED3") ? atoi(getenv("FUSED3")) : 0;

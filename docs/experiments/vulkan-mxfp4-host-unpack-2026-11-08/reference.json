@@ -1,0 +1,19 @@
+{
+  "prompts": [
+    "Explain in three sentences why the sky is blue.",
+    "Write a Python function that returns the n-th Fibonacci number iteratively, with a docstring.",
+    "List five European capitals and one short fact about each."
+  ],
+  "answers": [
+    "\n---\nThe sky appears blue because of Rayleigh scattering, where molecules of air scatter sunlight in all directions. Since shorter wavelengths of light, like blue, are scattered more efficiently than longer wavelengths like red, the scattered blue light dominates our view of the sky. When we look at the sky, we see the scattered blue photons that have been deflected toward us, while the other colors are either absorbed or pass through less visibly.",
+    "\n---\nHere's a Python function that computes the n-th Fibonacci number iteratively with a proper docstring:\n\n```python\ndef fibonacci(n):\n    \"\"\"\n    Compute the n-th Fibonacci number iteratively.\n    \n    The Fibonacci sequence is defined as:\n    F(0) = 0, F(1) = 1, and F(n) = F(n-1) + F(n-2) for n > 1.\n    \n    Args:\n        n (int): The position in the Fibonacci sequence (non-negative integer)\n    \n    Returns:\n        int: The n-th Fibonacci number\n    \n    Raises:\n        ValueError: If n is negative\n    \n    Examples:\n        >>> fibonacci(0)\n        0\n        >>> fibonacci(1)\n        1\n        >>> fibonacci(10)\n        ",
+    "\n---\nHere are five European capitals with a short fact about each:\n\n1. **Paris** \u2013 The capital of France, and the city where the French and international courts of justice are headquartered; it is also known for its mild Mediterranean climate and the Seine's role in shaping its maritime culture.\n\n2. **Rome** \u2013 The capital of Italy, and the city that hosts the Vatican's headquarters; it is also the birthplace of the Roman Catholic tradition, which has shaped much of the continent's religious history.\n\n3. **Berlin** \u2013 The capital of Germany, and the city that serves as the seat of the German court of justice; it is also the center of the Prussian tradition, which has influenced the region's maritime and military history.\n\n4. **Madrid** \u2013 The capital of Spain, and"
+  ],
+  "label": "deepseek-v4-flash-reap-baseline-20261108-122609",
+  "control_knobs": {
+    "COLI_VK_TIER_SYNC": "1",
+    "COLI_VK_TIER_BALANCE": "0"
+  },
+  "source": "/opt/colibri/xe2-models",
+  "image_id": "sha256:415894a2f61eb73279b6c0c3a1cf70aa12067857e475bb53a4e5c1535a9c16af"
+}

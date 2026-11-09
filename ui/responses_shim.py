@@ -320,6 +320,14 @@ def _cancel_on_disconnect(h, conn):
         watcher.join()
 
 
+def gateway_connection(backend, timeout=3600):
+    """A connection to the gateway at `backend` (a parsed URL): TLS for an https:// one (a TLS
+    front for the gateway), with the scheme's own port when the URL names none."""
+    if backend.scheme == "https":
+        return http.client.HTTPSConnection(backend.hostname, backend.port or 443, timeout=timeout)
+    return http.client.HTTPConnection(backend.hostname, backend.port or 80, timeout=timeout)
+
+
 def serve(h, backend):
     """POST /v1/responses on handler h, against the colibri gateway at `backend` (a parsed URL)"""
     n = int(h.headers.get("Content-Length") or 0)
@@ -333,7 +341,7 @@ def serve(h, backend):
     headers = {"Content-Type": "application/json"}
     if h.headers.get("Authorization"):
         headers["Authorization"] = h.headers["Authorization"]
-    conn = http.client.HTTPConnection(backend.hostname, backend.port or 80, timeout=3600)
+    conn = gateway_connection(backend)
     try:
         conn.request("POST", "/v1/chat/completions", body=json.dumps(chat), headers=headers)
     except OSError as e:

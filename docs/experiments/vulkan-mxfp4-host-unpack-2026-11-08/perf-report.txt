@@ -1,0 +1,31 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 81K of event 'cpu-clock'
+# Event count (approx.): 408979848375
+#
+# Overhead  Command      Shared Object         Symbol
+# ........  ...........  ....................  ...................................................
+#
+    60.79%  deepseek_v4  deepseek_v4           [.] host_rows
+     5.24%  deepseek_v4  libgomp.so.1.0.0      [.] 0x0000000000026a86
+     5.06%  deepseek_v4  libgomp.so.1.0.0      [.] 0x0000000000026a82
+     4.05%  deepseek_v4  libgomp.so.1.0.0      [.] 0x0000000000026c76
+     3.74%  deepseek_v4  libgomp.so.1.0.0      [.] 0x0000000000026c72
+     3.71%  deepseek_v4  libgomp.so.1.0.0      [.] 0x0000000000026a80
+     2.65%  deepseek_v4  libgomp.so.1.0.0      [.] 0x0000000000026c70
+     2.08%  deepseek_v4  libgomp.so.1.0.0      [.] 0x0000000000026a8b
+     1.52%  deepseek_v4  libgomp.so.1.0.0      [.] 0x0000000000026c7b
+     0.97%  deepseek_v4  libc.so.6             [.] 0x00000000001a7c6d
+     0.84%  deepseek_v4  libc.so.6             [.] 0x00000000001a8513
+     0.76%  deepseek_v4  [kernel.kallsyms]     [k] _raw_spin_unlock_irqrestore
+     0.59%  deepseek_v4  [kernel.kallsyms]     [k] do_syscall_64
+     0.56%  deepseek_v4  deepseek_v4           [.] host_pairs._omp_fn.0.lto_priv.0
+     0.51%  deepseek_v4  [kernel.kallsyms]     [k] __kmalloc_noprof
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

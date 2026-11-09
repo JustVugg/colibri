@@ -1,0 +1,3699 @@
+ Percent |	Source code & Disassembly of deepseek_v4 for cpu-clock (49475 samples, percent: local period)
+-------------------------------------------------------------------------------------------------------------
+         :
+         :
+         :
+         : 3      Disassembly of section .text:
+         :
+         : 5      0000000000233560 <host_rows>:
+    0.02 :   233560: push   %r13
+    0.00 :   233562: lea    0x10(%rsp),%r13
+    0.00 :   233567: and    $0xffffffffffffffe0,%rsp
+    0.01 :   23356b: push   -0x8(%r13)
+    0.03 :   23356f: push   %rbp
+    0.00 :   233570: mov    %rsp,%rbp
+    0.02 :   233573: push   %r15
+    0.01 :   233575: push   %r14
+    0.00 :   233577: push   %r13
+    0.01 :   233579: push   %r12
+    0.01 :   23357b: push   %rbx
+    0.00 :   23357c: sub    $0x1000,%rsp
+    0.01 :   233583: orq    $0x0,(%rsp)
+    0.07 :   233588: sub    $0x1000,%rsp
+    0.00 :   23358f: orq    $0x0,(%rsp)
+    0.13 :   233594: sub    $0xc8,%rsp
+    0.00 :   23359b: vxorps %xmm4,%xmm4,%xmm4
+    0.00 :   23359f: mov    %r13,%r11
+    0.00 :   2335a2: mov    %rdi,-0x2060(%rbp)
+    0.02 :   2335a9: mov    %rcx,%r15
+    0.00 :   2335ac: mov    %rdx,%rbx
+    0.00 :   2335af: mov    0x18(%r11),%rax
+    0.00 :   2335b3: movslq (%r11),%r10
+    0.01 :   2335b6: mov    %esi,-0x2090(%rbp)
+    0.00 :   2335bc: mov    %r9,%r13
+    0.00 :   2335bf: mov    0x8(%r11),%r12d
+    0.00 :   2335c3: mov    0x10(%r11),%rcx
+    0.01 :   2335c7: mov    %rax,-0x2058(%rbp)
+    0.00 :   2335ce: mov    0xc3914(%rip),%edi        # 2f6ee8 <v.3.lto_priv.0>
+    0.00 :   2335d4: mov    %fs:0x28,%rsi
+    0.00 :   2335dd: mov    %rsi,-0x38(%rbp)
+    0.01 :   2335e1: mov    0x20(%r11),%esi
+    0.00 :   2335e5: cmp    $0xfffffff4,%r10d
+    0.00 :   2335e9: je     2336a3 <host_rows+0x143>
+    0.00 :   2335ef: cmp    $0xfffffff9,%r10d
+    0.00 :   2335f3: je     233646 <host_rows+0xe6>
+    0.00 :   2335f5: test   %r10d,%r10d
+    0.00 :   2335f8: js     233657 <host_rows+0xf7>
+    0.00 :   2335fa: test   %edi,%edi
+    0.00 :   2335fc: js     2339fd <host_rows+0x49d>
+    0.00 :   233602: je     233a6f <host_rows+0x50f>
+    0.00 :   233608: test   %r10d,%r10d
+    0.00 :   23360b: je     233b5b <host_rows+0x5fb>
+    0.00 :   233611: movslq %r12d,%rax
+    0.00 :   233614: cmp    $0x1,%r10d
+    0.00 :   233618: je     233b87 <host_rows+0x627>
+    0.00 :   23361e: cmp    $0x1e,%r10d
+    0.00 :   233622: je     233bc4 <host_rows+0x664>
+    0.00 :   233628: cmp    $0x2a,%r10d
+    0.00 :   23362c: ja     2336c0 <host_rows+0x160>
+    0.00 :   233632: lea    0x7e687(%rip),%rsi        # 2b1cc0 <GGML_KSIGNS_PM1+0x600>
+    0.00 :   233639: mov    %r10d,%edx
+    0.00 :   23363c: movslq (%rsi,%rdx,4),%rdx
+    0.00 :   233640: add    %rsi,%rdx
+    0.00 :   233643: notrack jmp *%rdx
+    0.00 :   233646: mov    %r12d,%eax
+    0.02 :   233649: cltd
+    0.00 :   23364a: idiv   %esi
+    0.05 :   23364c: cmp    $0x800,%eax
+    0.00 :   233651: jg     233ac1 <host_rows+0x561>
+    0.02 :   233657: test   %edi,%edi
+    0.00 :   233659: js     2338bb <host_rows+0x35b>
+    0.00 :   23365f: test   %edi,%edi
+    0.00 :   233661: jne    237378 <host_rows+0x3e18>
+    0.00 :   233667: mov    %r10d,%eax
+    0.00 :   23366a: and    $0xfffffffd,%eax
+    0.01 :   23366d: cmp    $0xfffffffc,%eax
+    0.00 :   233670: jne    233684 <host_rows+0x124>
+    0.00 :   233672: test   %r15,%r15
+    0.00 :   233675: je     233684 <host_rows+0x124>
+    0.00 :   233677: mov    0x18(%rbx),%eax
+    0.00 :   23367a: cmp    %eax,0x18(%r15)
+    0.00 :   23367e: je     235e6e <host_rows+0x290e>
+    0.00 :   233684: cmp    $0xfffffff3,%r10d
+    0.00 :   233688: jb     233d4e <host_rows+0x7ee>
+    0.00 :   23368e: lea    0x7e6d7(%rip),%rdx        # 2b1d6c <GGML_KSIGNS_PM1+0x6ac>
+    0.00 :   233695: lea    0xd(%r10),%eax
+    0.01 :   233699: movslq (%rdx,%rax,4),%rax
+    0.00 :   23369d: add    %rdx,%rax
+    0.00 :   2336a0: notrack jmp *%rax
+    0.00 :   2336a3: test   %edi,%edi
+    0.00 :   2336a5: js     233927 <host_rows+0x3c7>
+    0.00 :   2336ab: je     234373 <host_rows+0xe13>
+    0.00 :   2336b1: test   %r12d,%r12d
+    0.00 :   2336b4: jg     233992 <host_rows+0x432>
+    0.00 :   2336ba: nopw   0x0(%rax,%rax,1)
+    0.00 :   2336c0: movslq 0x18(%rbx),%rax
+    0.00 :   2336c4: test   %eax,%eax
+    0.00 :   2336c6: jle    233869 <host_rows+0x309>
+    0.00 :   2336cc: movslq -0x2090(%rbp),%r10
+    0.00 :   2336d3: mov    %r12d,%esi
+    0.00 :   2336d6: lea    (%r8,%rax,8),%r11
+    0.00 :   2336da: lea    -0x1(%r12),%ebx
+    0.00 :   2336df: shr    $0x3,%esi
+    0.00 :   2336e2: mov    -0x2060(%rbp),%r9
+    0.00 :   2336e9: shl    $0x2,%r10
+    0.00 :   2336ed: shl    $0x5,%rsi
+    0.00 :   2336f1: test   %r12d,%r12d
+    0.00 :   2336f4: jle    233894 <host_rows+0x334>
+    0.00 :   2336fa: nopw   0x0(%rax,%rax,1)
+    0.00 :   233700: mov    (%r8),%rdx
+    0.00 :   233703: cmp    $0x6,%ebx
+    0.00 :   233706: jbe    2339f0 <host_rows+0x490>
+    0.00 :   23370c: xor    %eax,%eax
+    0.00 :   23370e: vxorpd %xmm2,%xmm2,%xmm2
+    0.00 :   233712: nopl   (%rax)
+    0.00 :   233715: data16 cs nopw 0x0(%rax,%rax,1)
+    0.00 :   233720: vmovups (%rcx,%rax,1),%ymm3
+    0.00 :   233725: vmovups (%rdx,%rax,1),%ymm1
+    0.00 :   23372a: add    $0x20,%rax
+    0.00 :   23372e: vcvtps2pd %xmm1,%ymm0
+    0.00 :   233732: vcvtps2pd %xmm3,%ymm5
+    0.00 :   233736: vmulpd %ymm5,%ymm0,%ymm0
+    0.00 :   23373a: vextractf128 $0x1,%ymm1,%xmm1
+    0.00 :   233740: vextractf128 $0x1,%ymm3,%xmm3
+    0.00 :   233746: vcvtps2pd %xmm1,%ymm1
+    0.00 :   23374a: vcvtps2pd %xmm3,%ymm3
+    0.00 :   23374e: vmulpd %ymm3,%ymm1,%ymm1
+    0.00 :   233752: vaddsd %xmm2,%xmm0,%xmm2
+    0.00 :   233756: vunpckhpd %xmm0,%xmm0,%xmm3
+    0.00 :   23375a: vextractf128 $0x1,%ymm0,%xmm0
+    0.00 :   233760: vaddsd %xmm2,%xmm3,%xmm3
+    0.00 :   233764: vaddsd %xmm3,%xmm0,%xmm2
+    0.00 :   233768: vunpckhpd %xmm0,%xmm0,%xmm0
+    0.00 :   23376c: vaddsd %xmm2,%xmm0,%xmm0
+    0.00 :   233770: vunpckhpd %xmm1,%xmm1,%xmm2
+    0.00 :   233774: vaddsd %xmm0,%xmm1,%xmm0
+    0.00 :   233778: vaddsd %xmm0,%xmm2,%xmm2
+    0.00 :   23377c: vextractf128 $0x1,%ymm1,%xmm0
+    0.00 :   233782: vaddsd %xmm2,%xmm0,%xmm2
+    0.00 :   233786: vunpckhpd %xmm0,%xmm0,%xmm0
+    0.00 :   23378a: vaddsd %xmm0,%xmm2,%xmm2
+    0.00 :   23378e: cmp    %rsi,%rax
+    0.00 :   233791: jne    233720 <host_rows+0x1c0>
+    0.00 :   233793: mov    %r12d,%eax
+    0.00 :   233796: and    $0xfffffff8,%eax
+    0.00 :   233799: mov    %eax,%edi
+    0.00 :   23379b: cmp    %r12d,%eax
+    0.00 :   23379e: je     233850 <host_rows+0x2f0>
+    0.00 :   2337a4: mov    %r12d,%r13d
+    0.00 :   2337a7: sub    %edi,%r13d
+    0.00 :   2337aa: lea    -0x1(%r13),%r14d
+    0.00 :   2337ae: cmp    $0x2,%r14d
+    0.00 :   2337b2: jbe    23380b <host_rows+0x2ab>
+    0.00 :   2337b4: vmovups (%rdx,%rdi,4),%xmm3
+    0.00 :   2337b9: vmovups (%rcx,%rdi,4),%xmm5
+    0.00 :   2337be: vcvtps2pd %xmm3,%xmm1
+    0.00 :   2337c2: vcvtps2pd %xmm5,%xmm0
+    0.00 :   2337c6: vmulpd %xmm0,%xmm1,%xmm1
+    0.00 :   2337ca: vxorps %xmm0,%xmm0,%xmm0
+    0.00 :   2337ce: vmovhlps %xmm3,%xmm0,%xmm0
+    0.00 :   2337d2: vxorps %xmm3,%xmm3,%xmm3
+    0.00 :   2337d6: vcvtps2pd %xmm0,%xmm0
+    0.00 :   2337da: vmovhlps %xmm5,%xmm3,%xmm3
+    0.00 :   2337de: vcvtps2pd %xmm3,%xmm3
+    0.00 :   2337e2: vmulpd %xmm3,%xmm0,%xmm0
+    0.00 :   2337e6: vaddsd %xmm2,%xmm1,%xmm2
+    0.00 :   2337ea: vunpckhpd %xmm1,%xmm1,%xmm1
+    0.00 :   2337ee: vaddsd %xmm2,%xmm1,%xmm1
+    0.00 :   2337f2: vaddsd %xmm1,%xmm0,%xmm2
+    0.00 :   2337f6: vunpckhpd %xmm0,%xmm0,%xmm0
+    0.00 :   2337fa: vaddsd %xmm0,%xmm2,%xmm2
+    0.00 :   2337fe: test   $0x3,%r13b
+    0.00 :   233802: je     233850 <host_rows+0x2f0>
+    0.00 :   233804: and    $0xfffffffc,%r13d
+    0.00 :   233808: add    %r13d,%eax
+    0.00 :   23380b: movslq %eax,%rdi
+    0.00 :   23380e: lea    0x1(%rax),%r13d
+    0.00 :   233812: vcvtss2sd (%rdx,%rdi,4),%xmm4,%xmm1
+    0.00 :   233817: vcvtss2sd (%rcx,%rdi,4),%xmm4,%xmm0
+    0.00 :   23381c: vfmadd231sd %xmm0,%xmm1,%xmm2
+    0.00 :   233821: cmp    %r13d,%r12d
+    0.00 :   233824: jle    233850 <host_rows+0x2f0>
+    0.00 :   233826: add    $0x2,%eax
+    0.00 :   233829: vcvtss2sd 0x4(%rdx,%rdi,4),%xmm4,%xmm1
+    0.00 :   23382f: vcvtss2sd 0x4(%rcx,%rdi,4),%xmm4,%xmm0
+    0.00 :   233835: vfmadd231sd %xmm0,%xmm1,%xmm2
+    0.00 :   23383a: cmp    %eax,%r12d
+    0.00 :   23383d: jle    233850 <host_rows+0x2f0>
+    0.00 :   23383f: vcvtss2sd 0x8(%rdx,%rdi,4),%xmm4,%xmm1
+    0.00 :   233845: vcvtss2sd 0x8(%rcx,%rdi,4),%xmm4,%xmm0
+    0.00 :   23384b: vfmadd231sd %xmm0,%xmm1,%xmm2
+    0.00 :   233850: add    $0x8,%r8
+    0.00 :   233854: vcvtsd2ss %xmm2,%xmm2,%xmm2
+    0.00 :   233858: vmovss %xmm2,(%r9)
+    0.00 :   23385d: add    %r10,%r9
+    0.00 :   233860: cmp    %r11,%r8
+    0.00 :   233863: jne    233700 <host_rows+0x1a0>
+    0.00 :   233869: vzeroupper
+    0.01 :   23386c: mov    -0x38(%rbp),%rax
+    0.01 :   233870: sub    %fs:0x28,%rax
+    0.00 :   233879: jne    2374e4 <host_rows+0x3f84>
+    0.00 :   23387f: lea    -0x28(%rbp),%rsp
+    0.00 :   233883: pop    %rbx
+    0.00 :   233884: pop    %r12
+    0.02 :   233886: pop    %r13
+    0.00 :   233888: pop    %r14
+    0.00 :   23388a: pop    %r15
+    0.00 :   23388c: pop    %rbp
+    0.01 :   23388d: lea    -0x10(%r13),%rsp
+    0.00 :   233891: pop    %r13
+    0.00 :   233893: ret
+    0.00 :   233894: lea    0x8(%r8),%rax
+    0.00 :   233898: movl   $0x0,(%r9)
+    0.00 :   23389f: cmp    %rax,%r11
+    0.00 :   2338a2: je     233869 <host_rows+0x309>
+    0.00 :   2338a4: add    $0x10,%r8
+    0.00 :   2338a8: movl   $0x0,(%r9,%r10,1)
+    0.00 :   2338b0: lea    (%r9,%r10,2),%r9
+    0.00 :   2338b4: cmp    %r11,%r8
+    0.00 :   2338b7: jne    233894 <host_rows+0x334>
+    0.00 :   2338b9: jmp    233869 <host_rows+0x309>
+    0.00 :   2338bb: lea    0x23303(%rip),%rdi        # 256bc5 <_IO_stdin_used+0xbc5>
+    0.00 :   2338c2: mov    %r8,-0x20a0(%rbp)
+    0.00 :   2338c9: mov    %esi,-0x2098(%rbp)
+    0.00 :   2338cf: mov    %rcx,-0x2070(%rbp)
+    0.00 :   2338d6: mov    %r10d,-0x2068(%rbp)
+    0.00 :   2338dd: call   8e80 <getenv@plt>
+    0.00 :   2338e2: mov    -0x2068(%rbp),%r10d
+    0.00 :   2338e9: vxorps %xmm4,%xmm4,%xmm4
+    0.00 :   2338ed: mov    -0x2070(%rbp),%rcx
+    0.00 :   2338f4: test   %rax,%rax
+    0.00 :   2338f7: mov    -0x2098(%rbp),%esi
+    0.00 :   2338fd: mov    -0x20a0(%rbp),%r8
+    0.00 :   233904: je     235939 <host_rows+0x23d9>
+    0.00 :   23390a: movzbl (%rax),%eax
+    0.00 :   23390d: test   %al,%al
+    0.00 :   23390f: setne  %dl
+    0.00 :   233912: xor    %edi,%edi
+    0.00 :   233914: cmp    $0x30,%al
+    0.00 :   233916: setne  %dil
+    0.00 :   23391a: and    %edx,%edi
+    0.00 :   23391c: mov    %edi,0xc35c6(%rip)        # 2f6ee8 <v.3.lto_priv.0>
+    0.00 :   233922: jmp    23365f <host_rows+0xff>
+    0.00 :   233927: lea    0x23297(%rip),%rdi        # 256bc5 <_IO_stdin_used+0xbc5>
+    0.00 :   23392e: mov    %r8,-0x2098(%rbp)
+    0.00 :   233935: mov    %esi,-0x2070(%rbp)
+    0.00 :   23393b: mov    %rcx,-0x2068(%rbp)
+    0.00 :   233942: call   8e80 <getenv@plt>
+    0.00 :   233947: mov    -0x2068(%rbp),%rcx
+    0.00 :   23394e: mov    -0x2070(%rbp),%esi
+    0.00 :   233954: test   %rax,%rax
+    0.00 :   233957: mov    -0x2098(%rbp),%r8
+    0.00 :   23395e: je     234369 <host_rows+0xe09>
+    0.00 :   233964: movzbl (%rax),%edx
+    0.00 :   233967: test   %dl,%dl
+    0.00 :   233969: setne  %al
+    0.00 :   23396c: cmp    $0x30,%dl
+    0.00 :   23396f: setne  %dl
+    0.00 :   233972: and    %edx,%eax
+    0.00 :   233974: movzbl %al,%edx
+    0.00 :   233977: mov    %edx,0xc356b(%rip)        # 2f6ee8 <v.3.lto_priv.0>
+    0.00 :   23397d: test   %al,%al
+    0.00 :   23397f: je     234373 <host_rows+0xe13>
+    0.00 :   233985: test   %r12d,%r12d
+    0.00 :   233988: vxorps %xmm4,%xmm4,%xmm4
+    0.00 :   23398c: jle    2336c0 <host_rows+0x160>
+    0.00 :   233992: movslq %r12d,%r14
+    0.00 :   233995: xor    %r15d,%r15d
+    0.00 :   233998: movzbl 0x0(%r13,%r15,1),%eax
+    0.00 :   23399e: mov    %eax,%edx
+    0.00 :   2339a0: mov    %eax,%edi
+    0.00 :   2339a2: and    $0x7,%edi
+    0.00 :   2339a5: shr    $0x3,%dl
+    0.00 :   2339a8: vcvtsi2ss %edi,%xmm4,%xmm0
+    0.00 :   2339ac: and    $0xf,%edx
+    0.00 :   2339af: jne    236d4a <host_rows+0x37ea>
+    0.00 :   2339b5: vmulss 0x2267f(%rip),%xmm0,%xmm0        # 25603c <_IO_stdin_used+0x3c>
+    0.00 :   2339bd: test   %al,%al
+    0.00 :   2339bf: jns    2339c9 <host_rows+0x469>
+    0.00 :   2339c1: vxorps 0x396c7(%rip),%xmm0,%xmm0        # 26d090 <CSWTCH.257+0xa530>
+    0.00 :   2339c9: test   %esi,%esi
+    0.00 :   2339cb: jne    234d27 <host_rows+0x17c7>
+    0.00 :   2339d1: mov    -0x2058(%rbp),%rax
+    0.00 :   2339d8: vmulss (%rax),%xmm0,%xmm0
+    0.00 :   2339dc: vmovss %xmm0,(%rcx,%r15,4)
+    0.00 :   2339e2: add    $0x1,%r15
+    0.00 :   2339e6: cmp    %r14,%r15
+    0.00 :   2339e9: jne    233998 <host_rows+0x438>
+    0.00 :   2339eb: jmp    2336c0 <host_rows+0x160>
+    0.00 :   2339f0: xor    %edi,%edi
+    0.00 :   2339f2: xor    %eax,%eax
+    0.00 :   2339f4: vxorpd %xmm2,%xmm2,%xmm2
+    0.00 :   2339f8: jmp    2337a4 <host_rows+0x244>
+    0.00 :   2339fd: lea    0x231c1(%rip),%rdi        # 256bc5 <_IO_stdin_used+0xbc5>
+    0.00 :   233a04: mov    %r11,-0x2068(%rbp)
+    0.00 :   233a0b: mov    %r10d,-0x2058(%rbp)
+    0.00 :   233a12: mov    %r8,-0x2098(%rbp)
+    0.00 :   233a19: mov    %rcx,-0x2070(%rbp)
+    0.00 :   233a20: call   8e80 <getenv@plt>
+    0.00 :   233a25: movslq -0x2058(%rbp),%r10
+    0.00 :   233a2c: mov    -0x2068(%rbp),%r11
+    0.00 :   233a33: test   %rax,%rax
+    0.00 :   233a36: je     23585f <host_rows+0x22ff>
+    0.00 :   233a3c: movzbl (%rax),%edx
+    0.00 :   233a3f: mov    -0x2070(%rbp),%rcx
+    0.00 :   233a46: vxorps %xmm4,%xmm4,%xmm4
+    0.00 :   233a4a: mov    -0x2098(%rbp),%r8
+    0.00 :   233a51: test   %dl,%dl
+    0.00 :   233a53: setne  %al
+    0.00 :   233a56: cmp    $0x30,%dl
+    0.00 :   233a59: setne  %dl
+    0.00 :   233a5c: and    %edx,%eax
+    0.00 :   233a5e: movzbl %al,%edx
+    0.00 :   233a61: test   %al,%al
+    0.00 :   233a63: mov    %edx,0xc347f(%rip)        # 2f6ee8 <v.3.lto_priv.0>
+    0.00 :   233a69: jne    233608 <host_rows+0xa8>
+    0.00 :   233a6f: mov    0x18(%rbx),%edx
+    0.00 :   233a72: cmp    $0x8,%r10d
+    0.00 :   233a76: je     23586e <host_rows+0x230e>
+    0.00 :   233a7c: cmp    $0x4,%edx
+    0.00 :   233a7f: jg     23481f <host_rows+0x12bf>
+    0.00 :   233a85: cmp    $0x27,%r10d
+    0.00 :   233a89: ja     233e3a <host_rows+0x8da>
+    0.00 :   233a8f: movabs $0x80001000cc,%rax
+    0.00 :   233a99: bt     %r10,%rax
+    0.00 :   233a9d: jb     235e19 <host_rows+0x28b9>
+    0.00 :   233aa3: lea    -0x10(%r10),%eax
+    0.00 :   233aa7: cmp    $0xd,%eax
+    0.00 :   233aaa: ja     233e3a <host_rows+0x8da>
+    0.00 :   233ab0: lea    0x7e2e9(%rip),%rcx        # 2b1da0 <GGML_KSIGNS_PM1+0x6e0>
+    0.00 :   233ab7: movslq (%rcx,%rax,4),%rax
+    0.00 :   233abb: add    %rcx,%rax
+    0.00 :   233abe: notrack jmp *%rax
+    0.00 :   233ac1: test   %edi,%edi
+    0.00 :   233ac3: js     235948 <host_rows+0x23e8>
+    0.00 :   233ac9: test   %edi,%edi
+    0.00 :   233acb: je     2359ba <host_rows+0x245a>
+    0.00 :   233ad1: test   %r12d,%r12d
+    0.00 :   233ad4: jle    2336c0 <host_rows+0x160>
+    0.00 :   233ada: movslq %r12d,%r9
+    0.00 :   233add: xor    %edi,%edi
+    0.00 :   233adf: nop
+    0.00 :   233ae0: mov    %edi,%edx
+    0.00 :   233ae2: mov    %edi,%eax
+    0.00 :   233ae4: sar    $1,%edx
+    0.00 :   233ae6: movslq %edx,%rdx
+    0.00 :   233ae9: movzbl 0x0(%r13,%rdx,1),%edx
+    0.00 :   233aef: mov    %edx,%r11d
+    0.00 :   233af2: shr    $0x4,%dl
+    0.00 :   233af5: and    $0xf,%r11d
+    0.00 :   233af9: test   $0x1,%dil
+    0.00 :   233afd: cmove  %r11d,%edx
+    0.00 :   233b01: cmp    $0xfffffff9,%r10d
+    0.00 :   233b05: je     235835 <host_rows+0x22d5>
+    0.00 :   233b0b: movzbl %dl,%edx
+    0.00 :   233b0e: sub    $0x8,%edx
+    0.00 :   233b11: vcvtsi2ss %edx,%xmm4,%xmm0
+    0.00 :   233b15: test   %esi,%esi
+    0.00 :   233b17: jne    233b37 <host_rows+0x5d7>
+    0.00 :   233b19: mov    -0x2058(%rbp),%rax
+    0.00 :   233b20: vmulss (%rax),%xmm0,%xmm0
+    0.00 :   233b24: vmovss %xmm0,(%rcx,%rdi,4)
+    0.00 :   233b29: add    $0x1,%rdi
+    0.00 :   233b2d: cmp    %r9,%rdi
+    0.00 :   233b30: jne    233ae0 <host_rows+0x580>
+    0.00 :   233b32: jmp    2336c0 <host_rows+0x160>
+    0.00 :   233b37: cltd
+    0.00 :   233b38: idiv   %esi
+    0.00 :   233b3a: mov    -0x2058(%rbp),%rdx
+    0.00 :   233b41: cltq
+    0.00 :   233b43: vmulss (%rdx,%rax,4),%xmm0,%xmm0
+    0.00 :   233b48: vmovss %xmm0,(%rcx,%rdi,4)
+    0.00 :   233b4d: add    $0x1,%rdi
+    0.00 :   233b51: cmp    %r9,%rdi
+    0.00 :   233b54: jne    233ae0 <host_rows+0x580>
+    0.00 :   233b56: jmp    2336c0 <host_rows+0x160>
+    0.00 :   233b5b: movslq %r12d,%rdx
+    0.00 :   233b5e: mov    %rcx,%rdi
+    0.00 :   233b61: mov    %r13,%rsi
+    0.00 :   233b64: mov    %r8,-0x2058(%rbp)
+    0.00 :   233b6b: shl    $0x2,%rdx
+    0.00 :   233b6f: call   9120 <memcpy@plt>
+    0.00 :   233b74: mov    -0x2058(%rbp),%r8
+    0.00 :   233b7b: vxorps %xmm4,%xmm4,%xmm4
+    0.00 :   233b7f: mov    %rax,%rcx
+    0.00 :   233b82: jmp    2336c0 <host_rows+0x160>
+    0.00 :   233b87: test   %rax,%rax
+    0.00 :   233b8a: jle    2336c0 <host_rows+0x160>
+    0.00 :   233b90: xor    %edx,%edx
+    0.00 :   233b92: nopl   (%rax)
+    0.00 :   233b95: data16 cs nopw 0x0(%rax,%rax,1)
+    0.00 :   233ba0: vpxor  %xmm7,%xmm7,%xmm7
+    0.00 :   233ba4: vpinsrw $0x0,0x0(%r13,%rdx,2),%xmm7,%xmm0
+    0.00 :   233bac: vcvtph2ps %xmm0,%xmm0
+    0.00 :   233bb1: vmovss %xmm0,(%rcx,%rdx,4)
+    0.00 :   233bb6: add    $0x1,%rdx
+    0.00 :   233bba: cmp    %rdx,%rax
+    0.00 :   233bbd: jne    233ba0 <host_rows+0x640>
+    0.00 :   233bbf: jmp    2336c0 <host_rows+0x160>
+    0.00 :   233bc4: test   %rax,%rax
+    0.00 :   233bc7: jle    2336c0 <host_rows+0x160>
+    0.00 :   233bcd: lea    -0x1(%rax),%rdx
+    0.00 :   233bd1: mov    %rax,%rsi
+    0.00 :   233bd4: cmp    $0x6,%rdx
+    0.00 :   233bd8: jbe    236e10 <host_rows+0x38b0>
+    0.00 :   233bde: lea    (%rcx,%rax,4),%rdi
+    0.00 :   233be2: cmp    %rdi,%r13
+    0.00 :   233be5: jae    233bf5 <host_rows+0x695>
+    0.00 :   233be7: lea    0x0(%r13,%rax,2),%rdi
+    0.00 :   233bec: cmp    %rdi,%rcx
+    0.00 :   233bef: jb     236e10 <host_rows+0x38b0>
+    0.00 :   233bf5: cmp    $0xe,%rdx
+    0.00 :   233bf9: jbe    236e96 <host_rows+0x3936>
+    0.00 :   233bff: mov    %rax,%rsi
+    0.00 :   233c02: xor    %edx,%edx
+    0.00 :   233c04: shr    $0x4,%rsi
+    0.00 :   233c08: shl    $0x5,%rsi
+    0.00 :   233c0c: vmovdqu 0x0(%r13,%rdx,1),%ymm0
+    0.00 :   233c13: vpmovzxwd %xmm0,%ymm1
+    0.00 :   233c18: vextracti128 $0x1,%ymm0,%xmm0
+    0.00 :   233c1e: vpmovzxwd %xmm0,%ymm0
+    0.00 :   233c23: vpslld $0x10,%ymm1,%ymm1
+    0.00 :   233c28: vpslld $0x10,%ymm0,%ymm0
+    0.00 :   233c2d: vmovups %ymm1,(%rcx,%rdx,2)
+    0.00 :   233c32: vmovups %ymm0,0x20(%rcx,%rdx,2)
+    0.00 :   233c38: add    $0x20,%rdx
+    0.00 :   233c3c: cmp    %rsi,%rdx
+    0.00 :   233c3f: jne    233c0c <host_rows+0x6ac>
+    0.00 :   233c41: test   $0xf,%r12b
+    0.00 :   233c45: je     2336c0 <host_rows+0x160>
+    0.00 :   233c4b: mov    %rax,%rdi
+    0.00 :   233c4e: mov    %rax,%rsi
+    0.00 :   233c51: and    $0xfffffffffffffff0,%rdi
+    0.00 :   233c55: sub    %rdi,%rsi
+    0.00 :   233c58: mov    %rdi,%rdx
+    0.00 :   233c5b: lea    -0x1(%rsi),%r9
+    0.00 :   233c5f: cmp    $0x6,%r9
+    0.00 :   233c63: jbe    233ca1 <host_rows+0x741>
+    0.00 :   233c65: vmovdqu 0x0(%r13,%rdi,2),%xmm0
+    0.00 :   233c6c: vpmovzxwd %xmm0,%xmm1
+    0.00 :   233c71: vpsrldq $0x8,%xmm0,%xmm0
+    0.00 :   233c76: vpmovzxwd %xmm0,%xmm0
+    0.00 :   233c7b: vpslld $0x10,%xmm1,%xmm1
+    0.00 :   233c80: vpslld $0x10,%xmm0,%xmm0
+    0.00 :   233c85: vmovups %xmm1,(%rcx,%rdi,4)
+    0.00 :   233c8a: vmovups %xmm0,0x10(%rcx,%rdi,4)
+    0.00 :   233c90: test   $0x7,%sil
+    0.00 :   233c94: je     2336c0 <host_rows+0x160>
+    0.00 :   233c9a: and    $0xfffffffffffffff8,%rsi
+    0.00 :   233c9e: add    %rsi,%rdx
+    0.00 :   233ca1: movzwl 0x0(%r13,%rdx,2),%esi
+    0.00 :   233ca7: shl    $0x10,%esi
+    0.00 :   233caa: mov    %esi,(%rcx,%rdx,4)
+    0.00 :   233cad: lea    0x1(%rdx),%rsi
+    0.00 :   233cb1: cmp    %rsi,%rax
+    0.00 :   233cb4: jle    2336c0 <host_rows+0x160>
+    0.00 :   233cba: movzwl 0x2(%r13,%rdx,2),%esi
+    0.00 :   233cc0: shl    $0x10,%esi
+    0.00 :   233cc3: mov    %esi,0x4(%rcx,%rdx,4)
+    0.00 :   233cc7: lea    0x2(%rdx),%rsi
+    0.00 :   233ccb: cmp    %rsi,%rax
+    0.00 :   233cce: jle    2336c0 <host_rows+0x160>
+    0.00 :   233cd4: movzwl 0x4(%r13,%rdx,2),%esi
+    0.00 :   233cda: shl    $0x10,%esi
+    0.00 :   233cdd: mov    %esi,0x8(%rcx,%rdx,4)
+    0.00 :   233ce1: lea    0x3(%rdx),%rsi
+    0.00 :   233ce5: cmp    %rsi,%rax
+    0.00 :   233ce8: jle    2336c0 <host_rows+0x160>
+    0.00 :   233cee: movzwl 0x6(%r13,%rdx,2),%esi
+    0.00 :   233cf4: shl    $0x10,%esi
+    0.00 :   233cf7: mov    %esi,0xc(%rcx,%rdx,4)
+    0.00 :   233cfb: lea    0x4(%rdx),%rsi
+    0.00 :   233cff: cmp    %rsi,%rax
+    0.00 :   233d02: jle    2336c0 <host_rows+0x160>
+    0.00 :   233d08: movzwl 0x8(%r13,%rdx,2),%esi
+    0.00 :   233d0e: shl    $0x10,%esi
+    0.00 :   233d11: mov    %esi,0x10(%rcx,%rdx,4)
+    0.00 :   233d15: lea    0x5(%rdx),%rsi
+    0.00 :   233d19: cmp    %rsi,%rax
+    0.00 :   233d1c: jle    2336c0 <host_rows+0x160>
+    0.00 :   233d22: movzwl 0xa(%r13,%rdx,2),%esi
+    0.00 :   233d28: shl    $0x10,%esi
+    0.00 :   233d2b: mov    %esi,0x14(%rcx,%rdx,4)
+    0.00 :   233d2f: lea    0x6(%rdx),%rsi
+    0.00 :   233d33: cmp    %rsi,%rax
+    0.00 :   233d36: jle    2336c0 <host_rows+0x160>
+    0.00 :   233d3c: movzwl 0xc(%r13,%rdx,2),%eax
+    0.00 :   233d42: shl    $0x10,%eax
+    0.00 :   233d45: mov    %eax,0x18(%rcx,%rdx,4)
+    0.00 :   233d49: jmp    2336c0 <host_rows+0x160>
+    0.00 :   233d4e: mov    0x18(%rbx),%r15d
+    0.00 :   233d52: test   %r15d,%r15d
+    0.00 :   233d55: jle    23386c <host_rows+0x30c>
+    0.00 :   233d5b: test   %r12d,%r12d
+    0.00 :   233d5e: lea    0x1f(%r12),%r10d
+    0.00 :   233d63: mov    0x8(%rbx),%r9
+    0.00 :   233d67: mov    (%rbx),%r8
+    0.00 :   233d6a: cmovns %r12d,%r10d
+    0.00 :   233d6e: movslq -0x2090(%rbp),%rdi
+    0.00 :   233d75: movslq %r12d,%rbx
+    0.00 :   233d78: sar    $0x5,%r10d
+    0.00 :   233d7c: movslq %r10d,%rax
+    0.01 :   233d7f: shl    $0x2,%rdi
+    0.00 :   233d83: test   %esi,%esi
+    0.00 :   233d85: jne    235bc0 <host_rows+0x2660>
+    0.00 :   233d8b: vpcmpeqd %ymm3,%ymm3,%ymm3
+    0.00 :   233d8f: mov    -0x2060(%rbp),%r11
+    0.00 :   233d96: mov    -0x2058(%rbp),%r14
+    0.00 :   233d9d: shl    $0x2,%rax
+    0.00 :   233da1: vpsrlw $0xf,%ymm3,%ymm3
+    0.00 :   233da6: cmp    $0x1f,%r12d
+    0.00 :   233daa: jle    235bb7 <host_rows+0x2657>
+    0.00 :   233db0: xor    %ecx,%ecx
+    0.00 :   233db2: xor    %edx,%edx
+    0.00 :   233db4: vxorps %xmm2,%xmm2,%xmm2
+    0.00 :   233db8: nopl   0x0(%rax,%rax,1)
+    0.00 :   233dc0: vmovdqu 0x0(%r13,%rcx,1),%ymm0
+    0.00 :   233dc7: vmovdqu (%r8,%rcx,1),%ymm1
+    0.00 :   233dcd: add    $0x20,%rcx
+    0.00 :   233dd1: vpsignb %ymm0,%ymm1,%ymm1
+    0.00 :   233dd6: vpsignb %ymm0,%ymm0,%ymm0
+    0.00 :   233ddb: vpmaddubsw %ymm1,%ymm0,%ymm0
+    0.00 :   233de0: vbroadcastss (%r9,%rdx,4),%ymm1
+    0.00 :   233de6: add    $0x1,%rdx
+    0.00 :   233dea: vpmaddwd %ymm3,%ymm0,%ymm0
+    0.00 :   233dee: vcvtdq2ps %ymm0,%ymm0
+    0.00 :   233df2: vfmadd231ps %ymm1,%ymm0,%ymm2
+    0.00 :   233df7: cmp    %edx,%r10d
+    0.00 :   233dfa: jg     233dc0 <host_rows+0x860>
+    0.00 :   233dfc: vextractf128 $0x1,%ymm2,%xmm1
+    0.00 :   233e02: add    $0x1,%esi
+    0.00 :   233e05: add    %rax,%r9
+    0.00 :   233e08: add    %rbx,%r8
+    0.00 :   233e0b: vaddps %xmm1,%xmm2,%xmm0
+    0.00 :   233e0f: vmovhlps %xmm0,%xmm0,%xmm1
+    0.00 :   233e13: vaddps %xmm0,%xmm1,%xmm0
+    0.00 :   233e17: vmovshdup %xmm0,%xmm1
+    0.00 :   233e1b: vaddss %xmm1,%xmm0,%xmm0
+    0.00 :   233e1f: vmulss (%r14),%xmm0,%xmm0
+    0.00 :   233e24: vmovss %xmm0,(%r11)
+    0.00 :   233e29: add    %rdi,%r11
+    0.00 :   233e2c: cmp    %esi,%r15d
+    0.00 :   233e2f: jne    233da6 <host_rows+0x846>
+    0.00 :   233e35: jmp    233869 <host_rows+0x309>
+    0.00 :   233e3a: lea    -0xb(%r10),%eax
+    0.00 :   233e3e: cmp    $0x1f,%eax
+    0.00 :   233e41: ja     23481f <host_rows+0x12bf>
+    0.00 :   233e47: lea    0x7df8a(%rip),%rcx        # 2b1dd8 <GGML_KSIGNS_PM1+0x718>
+    0.00 :   233e4e: movslq (%rcx,%rax,4),%rax
+    0.00 :   233e52: add    %rcx,%rax
+    0.00 :   233e55: notrack jmp *%rax
+    0.00 :   233e58: mov    %r12d,%edx
+    0.00 :   233e5b: movslq %r12d,%rax
+    0.00 :   233e5e: shr    $0x1f,%edx
+    0.00 :   233e61: mov    %rax,-0x2068(%rbp)
+    0.00 :   233e68: lea    (%rcx,%rax,4),%r10
+    0.00 :   233e6c: add    %r12d,%edx
+    0.00 :   233e6f: sar    $1,%edx
+    0.00 :   233e71: cmp    $0x1f,%r12d
+    0.00 :   233e75: jle    236e2c <host_rows+0x38cc>
+    0.00 :   233e7b: mov    $0xf0f0f0f,%edi
+    0.00 :   233e80: xor    %eax,%eax
+    0.00 :   233e82: vmovd  %edi,%xmm2
+    0.00 :   233e86: vpbroadcastd %xmm2,%xmm2
+    0.00 :   233e8b: vmovdqu 0x0(%r13,%rax,1),%xmm0
+    0.00 :   233e92: vpsrlw $0x4,%xmm0,%xmm1
+    0.00 :   233e97: vpand  %xmm2,%xmm0,%xmm0
+    0.00 :   233e9b: vpand  %xmm2,%xmm1,%xmm1
+    0.00 :   233e9f: vpunpcklbw %xmm1,%xmm0,%xmm3
+    0.00 :   233ea3: vpunpckhbw %xmm1,%xmm0,%xmm0
+    0.00 :   233ea7: vmovdqu %xmm3,(%r10,%rax,2)
+    0.00 :   233ead: vmovdqu %xmm0,0x10(%r10,%rax,2)
+    0.00 :   233eb4: add    $0x10,%rax
+    0.00 :   233eb8: lea    0xf(%rax),%edi
+    0.00 :   233ebb: cmp    %edi,%edx
+    0.00 :   233ebd: jg     233e8b <host_rows+0x92b>
+    0.00 :   233ebf: lea    -0x10(%rdx),%eax
+    0.00 :   233ec2: and    $0xfffffff0,%eax
+    0.00 :   233ec5: add    $0x10,%eax
+    0.00 :   233ec8: cmp    %eax,%edx
+    0.00 :   233eca: jle    234063 <host_rows+0xb03>
+    0.00 :   233ed0: mov    %edx,%r9d
+    0.00 :   233ed3: movslq %eax,%r11
+    0.00 :   233ed6: sub    %eax,%r9d
+    0.00 :   233ed9: lea    -0x1(%r9),%edi
+    0.00 :   233edd: mov    %edi,-0x2098(%rbp)
+    0.00 :   233ee3: cmp    $0x2,%edi
+    0.00 :   233ee6: jbe    23705b <host_rows+0x3afb>
+    0.00 :   233eec: mov    -0x2068(%rbp),%rdi
+    0.00 :   233ef3: lea    0x0(%r13,%r11,1),%r15
+    0.00 :   233ef8: mov    %r15,-0x2070(%rbp)
+    0.00 :   233eff: lea    (%r11,%rdi,2),%r14
+    0.00 :   233f03: mov    %r9d,%edi
+    0.00 :   233f06: lea    (%rdi,%r14,1),%r8
+    0.00 :   233f0a: lea    (%rcx,%r14,2),%r15
+    0.00 :   233f0e: lea    (%rcx,%r8,2),%r8
+    0.00 :   233f12: cmp    %r8,-0x2070(%rbp)
+    0.00 :   233f19: jae    233f2a <host_rows+0x9ca>
+    0.00 :   233f1b: add    %r11,%rdi
+    0.00 :   233f1e: add    %r13,%rdi
+    0.00 :   233f21: cmp    %rdi,%r15
+    0.00 :   233f24: jb     23705b <host_rows+0x3afb>
+    0.00 :   233f2a: cmpl   $0x6,-0x2098(%rbp)
+    0.00 :   233f31: jbe    23704c <host_rows+0x3aec>
+    0.00 :   233f37: mov    -0x2070(%rbp),%rdi
+    0.00 :   233f3e: vmovq  0x3955a(%rip),%xmm1        # 26d4a0 <CSWTCH.257+0xa940>
+    0.00 :   233f46: vmovdqa 0x39132(%rip),%xmm2        # 26d080 <CSWTCH.257+0xa520>
+    0.00 :   233f4e: vmovq  (%rdi),%xmm0
+    0.00 :   233f52: vpand  %xmm1,%xmm0,%xmm1
+    0.00 :   233f56: vpmovzxbw %xmm0,%xmm0
+    0.00 :   233f5b: vpsrlw $0x4,%xmm0,%xmm0
+    0.00 :   233f60: vpshufb %xmm2,%xmm0,%xmm0
+    0.00 :   233f65: vpunpcklbw %xmm0,%xmm1,%xmm3
+    0.00 :   233f69: vpunpcklbw %xmm0,%xmm1,%xmm1
+    0.00 :   233f6d: vpshufd $0x4e,%xmm1,%xmm1
+    0.00 :   233f72: vmovq  %xmm3,(%r15)
+    0.00 :   233f77: vmovq  %xmm1,0x8(%r15)
+    0.00 :   233f7d: test   $0x7,%r9b
+    0.00 :   233f81: je     234063 <host_rows+0xb03>
+    0.00 :   233f87: mov    %r9d,%edi
+    0.00 :   233f8a: and    $0xfffffff8,%edi
+    0.00 :   233f8d: sub    %edi,%r9d
+    0.00 :   233f90: add    %edi,%eax
+    0.00 :   233f92: lea    -0x1(%r9),%r8d
+    0.00 :   233f96: cmp    $0x2,%r8d
+    0.00 :   233f9a: jbe    233feb <host_rows+0xa8b>
+    0.00 :   233f9c: lea    (%rdi,%r14,1),%r8
+    0.00 :   233fa0: add    %r13,%rdi
+    0.00 :   233fa3: vmovd  0x394f5(%rip),%xmm7        # 26d4a0 <CSWTCH.257+0xa940>
+    0.00 :   233fab: vmovd  (%rdi,%r11,1),%xmm0
+    0.00 :   233fb1: vpand  %xmm7,%xmm0,%xmm1
+    0.00 :   233fb5: vpmovzxbw %xmm0,%xmm0
+    0.00 :   233fba: vpsrlw $0x4,%xmm0,%xmm0
+    0.00 :   233fbf: vpshufb %xmm2,%xmm0,%xmm0
+    0.00 :   233fc4: vpunpcklbw %xmm0,%xmm1,%xmm2
+    0.00 :   233fc8: vpunpcklbw %xmm0,%xmm1,%xmm1
+    0.00 :   233fcc: vpshufd $0x41,%xmm1,%xmm1
+    0.00 :   233fd1: vmovd  %xmm2,(%rcx,%r8,2)
+    0.00 :   233fd7: vmovd  %xmm1,0x4(%rcx,%r8,2)
+    0.00 :   233fde: test   $0x3,%r9b
+    0.00 :   233fe2: je     234063 <host_rows+0xb03>
+    0.00 :   233fe4: and    $0xfffffffc,%r9d
+    0.00 :   233fe8: add    %r9d,%eax
+    0.00 :   233feb: movslq %eax,%rdi
+    0.00 :   233fee: lea    (%rax,%rax,1),%ecx
+    0.00 :   233ff1: add    %r13,%rdi
+    0.00 :   233ff4: movslq %ecx,%r9
+    0.00 :   233ff7: movzbl (%rdi),%r8d
+    0.00 :   233ffb: and    $0xf,%r8d
+    0.00 :   233fff: mov    %r8b,(%r10,%r9,1)
+    0.00 :   234003: movzbl (%rdi),%edi
+    0.00 :   234006: shr    $0x4,%dil
+    0.00 :   23400a: mov    %dil,0x1(%r10,%r9,1)
+    0.00 :   23400f: lea    0x1(%rax),%edi
+    0.00 :   234012: cmp    %edx,%edi
+    0.00 :   234014: jge    234063 <host_rows+0xb03>
+    0.00 :   234016: movslq %edi,%rdi
+    0.00 :   234019: lea    0x2(%rcx),%r8d
+    0.00 :   23401d: add    $0x2,%eax
+    0.00 :   234020: add    %r13,%rdi
+    0.00 :   234023: movslq %r8d,%r8
+    0.00 :   234026: movzbl (%rdi),%r9d
+    0.00 :   23402a: and    $0xf,%r9d
+    0.00 :   23402e: mov    %r9b,(%r10,%r8,1)
+    0.00 :   234032: movzbl (%rdi),%edi
+    0.00 :   234035: shr    $0x4,%dil
+    0.00 :   234039: mov    %dil,0x1(%r10,%r8,1)
+    0.00 :   23403e: cmp    %edx,%eax
+    0.00 :   234040: jge    234063 <host_rows+0xb03>
+    0.00 :   234042: cltq
+    0.00 :   234044: lea    0x0(%r13,%rax,1),%rdx
+    0.00 :   234049: lea    0x4(%rcx),%eax
+    0.00 :   23404c: movzbl (%rdx),%ecx
+    0.00 :   23404f: cltq
+    0.00 :   234051: and    $0xf,%ecx
+    0.00 :   234054: mov    %cl,(%r10,%rax,1)
+    0.00 :   234058: movzbl (%rdx),%edx
+    0.00 :   23405b: shr    $0x4,%dl
+    0.00 :   23405e: mov    %dl,0x1(%r10,%rax,1)
+    0.00 :   234063: mov    $0x8,%eax
+    0.00 :   234068: mov    0x18(%rbx),%r13d
+    0.00 :   23406c: test   %r13d,%r13d
+    0.00 :   23406f: jle    23386c <host_rows+0x30c>
+    0.00 :   234075: test   %r12d,%r12d
+    0.00 :   234078: lea    0x1f(%r12),%r11d
+    0.00 :   23407d: mov    (%rbx),%r9
+    0.00 :   234080: mov    0x10(%rbx),%r8
+    0.00 :   234084: cmovns %r12d,%r11d
+    0.00 :   234088: vcvtsi2ss %eax,%xmm4,%xmm0
+    0.00 :   23408c: vpcmpeqd %ymm6,%ymm6,%ymm6
+    0.00 :   234090: mov    0x8(%rbx),%rbx
+    0.00 :   234094: movslq -0x2090(%rbp),%rdx
+    0.00 :   23409b: mov    -0x2060(%rbp),%r14
+    0.00 :   2340a2: vpsrlw $0xf,%ymm6,%ymm6
+    0.00 :   2340a7: sar    $0x5,%r11d
+    0.00 :   2340ab: test   %r12d,%r12d
+    0.00 :   2340ae: lea    0x0(,%rdx,4),%rdi
+    0.00 :   2340b6: lea    0xf(%r12),%edx
+    0.00 :   2340bb: cmovns %r12d,%edx
+    0.00 :   2340bf: mov    %rdi,-0x2070(%rbp)
+    0.00 :   2340c6: xor    %r15d,%r15d
+    0.00 :   2340c9: sar    $0x4,%edx
+    0.00 :   2340cc: movslq %edx,%rdx
+    0.00 :   2340cf: lea    0x0(,%rdx,4),%rdi
+    0.00 :   2340d7: movslq %r11d,%rdx
+    0.00 :   2340da: mov    %rdi,-0x2090(%rbp)
+    0.00 :   2340e1: lea    0x0(,%rdx,4),%rdi
+    0.00 :   2340e9: mov    %r12d,%edx
+    0.00 :   2340ec: mov    -0x2058(%rbp),%r12
+    0.00 :   2340f3: mov    %rdi,-0x2060(%rbp)
+    0.00 :   2340fa: nopw   0x0(%rax,%rax,1)
+    0.00 :   234100: cmp    $0x1f,%edx
+    0.00 :   234103: jle    234d53 <host_rows+0x17f3>
+    0.00 :   234109: mov    %r15d,-0x2058(%rbp)
+    0.00 :   234110: xor    %edi,%edi
+    0.00 :   234112: xor    %ecx,%ecx
+    0.00 :   234114: vxorps %xmm7,%xmm7,%xmm7
+    0.00 :   234118: vxorps %xmm5,%xmm5,%xmm5
+    0.00 :   23411c: mov    %edx,%r15d
+    0.00 :   23411f: nop
+    0.00 :   234120: vmovss (%rbx,%rcx,4),%xmm2
+    0.00 :   234125: test   %esi,%esi
+    0.00 :   234127: je     234136 <host_rows+0xbd6>
+    0.00 :   234129: mov    %edi,%eax
+    0.00 :   23412b: cltd
+    0.00 :   23412c: idiv   %esi
+    0.00 :   23412e: cltq
+    0.00 :   234130: vmulss (%r12,%rax,4),%xmm2,%xmm2
+    0.00 :   234136: mov    0x4(%r8,%rcx,8),%eax
+    0.00 :   23413b: add    (%r8,%rcx,8),%eax
+    0.00 :   23413f: add    $0x1,%rcx
+    0.00 :   234143: vcvtsi2ss %eax,%xmm4,%xmm3
+    0.00 :   234147: vmovdqu (%r10,%rdi,1),%ymm1
+    0.00 :   23414d: vpmaddubsw (%r9,%rdi,1),%ymm1,%ymm1
+    0.00 :   234153: add    $0x20,%rdi
+    0.00 :   234157: vpmaddwd %ymm6,%ymm1,%ymm1
+    0.00 :   23415b: vcvtdq2ps %ymm1,%ymm1
+    0.00 :   23415f: vfmadd231ss %xmm2,%xmm3,%xmm5
+    0.00 :   234164: vbroadcastss %xmm2,%ymm2
+    0.00 :   234169: vfmadd231ps %ymm2,%ymm1,%ymm7
+    0.00 :   23416e: cmp    %ecx,%r11d
+    0.00 :   234171: jg     234120 <host_rows+0xbc0>
+    0.00 :   234173: mov    %r15d,%edx
+    0.00 :   234176: mov    -0x2058(%rbp),%r15d
+    0.00 :   23417d: vextractf128 $0x1,%ymm7,%xmm1
+    0.00 :   234183: vaddps %xmm7,%xmm1,%xmm1
+    0.00 :   234187: vmovhlps %xmm1,%xmm1,%xmm2
+    0.00 :   23418b: vaddps %xmm2,%xmm1,%xmm1
+    0.00 :   23418f: vmovshdup %xmm1,%xmm2
+    0.00 :   234193: vaddss %xmm2,%xmm1,%xmm1
+    0.00 :   234197: vfnmadd132ss %xmm0,%xmm1,%xmm5
+    0.00 :   23419c: test   %esi,%esi
+    0.00 :   23419e: jne    234d10 <host_rows+0x17b0>
+    0.00 :   2341a4: vmulss (%r12),%xmm5,%xmm5
+    0.00 :   2341aa: add    $0x1,%r15d
+    0.00 :   2341ae: vmovss %xmm5,(%r14)
+    0.00 :   2341b3: cmp    %r13d,%r15d
+    0.00 :   2341b6: je     233869 <host_rows+0x309>
+    0.00 :   2341bc: add    -0x2070(%rbp),%r14
+    0.00 :   2341c3: add    -0x2068(%rbp),%r9
+    0.00 :   2341ca: add    -0x2090(%rbp),%r8
+    0.00 :   2341d1: add    -0x2060(%rbp),%rbx
+    0.00 :   2341d8: jmp    234100 <host_rows+0xba0>
+    0.00 :   2341dd: mov    0x18(%rbx),%r15d
+    0.00 :   2341e1: test   %r15d,%r15d
+    0.00 :   2341e4: jle    23386c <host_rows+0x30c>
+    0.00 :   2341ea: movslq 0x1c(%rbx),%rax
+    0.00 :   2341ee: mov    0x8(%rbx),%r8
+    0.00 :   2341f2: mov    (%rbx),%rdi
+    0.00 :   2341f5: movslq -0x2090(%rbp),%r12
+    0.00 :   2341fc: test   %eax,%eax
+    0.00 :   2341fe: lea    0x1f(%rax),%r10d
+    0.00 :   234202: mov    %rax,-0x2068(%rbp)
+    0.00 :   234209: mov    %rax,%r11
+    0.00 :   23420c: cmovns %eax,%r10d
+    0.00 :   234210: mov    %r8,-0x2070(%rbp)
+    0.00 :   234217: sar    $0x5,%r10d
+    0.00 :   23421b: movslq %r10d,%rdx
+    0.00 :   23421e: test   %esi,%esi
+    0.00 :   234220: jne    235caa <host_rows+0x274a>
+    0.00 :   234226: vpcmpeqd %ymm2,%ymm2,%ymm2
+    0.00 :   23422a: mov    -0x2060(%rbp),%rbx
+    0.00 :   234231: shl    $0x2,%r12
+    0.00 :   234235: mov    -0x2058(%rbp),%r14
+    0.00 :   23423c: lea    0x0(,%rdx,4),%r9
+    0.00 :   234244: vpsrlw $0xf,%ymm2,%ymm2
+    0.00 :   234249: vxorps %xmm3,%xmm3,%xmm3
+    0.00 :   23424d: vmovaps %ymm3,-0x2030(%rbp)
+    0.00 :   234255: vmovaps %ymm3,-0x2010(%rbp)
+    0.00 :   23425d: vmovaps %ymm3,-0x1ff0(%rbp)
+    0.00 :   234265: cmp    $0x1f,%r11d
+    0.00 :   234269: jle    235bae <host_rows+0x264e>
+    0.00 :   23426f: vmovdqu 0x0(%r13),%ymm0
+    0.00 :   234275: vmovdqu (%rdi),%ymm1
+    0.00 :   234279: vpsignb %ymm0,%ymm1,%ymm1
+    0.00 :   23427e: vpsignb %ymm0,%ymm0,%ymm0
+    0.00 :   234283: vpmaddubsw %ymm1,%ymm0,%ymm0
+    0.00 :   234288: vbroadcastss (%r8),%ymm1
+    0.00 :   23428d: vpmaddwd %ymm2,%ymm0,%ymm0
+    0.00 :   234291: vcvtdq2ps %ymm0,%ymm0
+    0.00 :   234295: vfmadd132ps %ymm1,%ymm3,%ymm0
+    0.00 :   23429a: vmovaps %ymm0,-0x2050(%rbp)
+    0.00 :   2342a2: cmp    $0x3f,%r11d
+    0.00 :   2342a6: jle    234304 <host_rows+0xda4>
+    0.00 :   2342a8: xor    %ecx,%ecx
+    0.00 :   2342aa: mov    $0x1,%eax
+    0.00 :   2342af: nop
+    0.00 :   2342b0: vmovdqu 0x20(%r13,%rcx,1),%ymm0
+    0.00 :   2342b7: vmovdqu 0x20(%rdi,%rcx,1),%ymm1
+    0.00 :   2342bd: mov    %rax,%rdx
+    0.00 :   2342c0: add    $0x20,%rcx
+    0.00 :   2342c4: and    $0x3,%edx
+    0.00 :   2342c7: vpsignb %ymm0,%ymm1,%ymm1
+    0.00 :   2342cc: vpsignb %ymm0,%ymm0,%ymm0
+    0.00 :   2342d1: shl    $0x5,%rdx
+    0.00 :   2342d5: vpmaddubsw %ymm1,%ymm0,%ymm0
+    0.00 :   2342da: vbroadcastss (%r8,%rax,4),%ymm1
+    0.00 :   2342e0: add    $0x1,%rax
+    0.00 :   2342e4: vpmaddwd %ymm2,%ymm0,%ymm0
+    0.00 :   2342e8: vcvtdq2ps %ymm0,%ymm0
+    0.00 :   2342ec: vfmadd213ps -0x2050(%rbp,%rdx,1),%ymm1,%ymm0
+    0.00 :   2342f6: vmovaps %ymm0,-0x2050(%rbp,%rdx,1)
+    0.00 :   2342ff: cmp    %eax,%r10d
+    0.00 :   234302: jg     2342b0 <host_rows+0xd50>
+    0.00 :   234304: vmovaps -0x2050(%rbp),%ymm0
+    0.00 :   23430c: vmovaps -0x2010(%rbp),%ymm1
+    0.00 :   234314: vaddps -0x2030(%rbp),%ymm0,%ymm0
+    0.00 :   23431c: vaddps -0x1ff0(%rbp),%ymm1,%ymm1
+    0.00 :   234324: vaddps %ymm1,%ymm0,%ymm0
+    0.00 :   234328: vextractf128 $0x1,%ymm0,%xmm1
+    0.00 :   23432e: add    $0x1,%esi
+    0.00 :   234331: add    -0x2068(%rbp),%rdi
+    0.00 :   234338: add    %r9,%r8
+    0.00 :   23433b: vaddps %xmm1,%xmm0,%xmm1
+    0.00 :   23433f: vmovhlps %xmm1,%xmm1,%xmm0
+    0.00 :   234343: vaddps %xmm1,%xmm0,%xmm0
+    0.00 :   234347: vmovshdup %xmm0,%xmm1
+    0.00 :   23434b: vaddss %xmm1,%xmm0,%xmm0
+    0.00 :   23434f: vmulss (%r14),%xmm0,%xmm0
+    0.00 :   234354: vmovss %xmm0,(%rbx)
+    0.00 :   234358: add    %r12,%rbx
+    0.00 :   23435b: cmp    %esi,%r15d
+    0.00 :   23435e: jne    23424d <host_rows+0xced>
+    0.00 :   234364: jmp    233869 <host_rows+0x309>
+    0.00 :   234369: movl   $0x0,0xc2b75(%rip)        # 2f6ee8 <v.3.lto_priv.0>
+    0.00 :   234373: mov    0x18(%rbx),%edx
+    0.00 :   234376: cmp    $0x4,%edx
+    0.00 :   234379: jg     235fc8 <host_rows+0x2a68>
+    0.00 :   23437f: test   %edx,%edx
+    0.00 :   234381: jle    23386c <host_rows+0x30c>
+    0.00 :   234387: test   %esi,%esi
+    0.00 :   234389: movslq -0x2090(%rbp),%rcx
+    0.00 :   234390: cmovle %r12d,%esi
+    0.00 :   234394: cmp    $0x2,%edx
+    0.00 :   234397: je     234d60 <host_rows+0x1800>
+    0.00 :   23439d: cmp    $0x3,%edx
+    0.00 :   2343a0: je     23547c <host_rows+0x1f1c>
+    0.00 :   2343a6: cmp    $0x1,%edx
+    0.00 :   2343a9: jne    235033 <host_rows+0x1ad3>
+    0.00 :   2343af: test   %r12d,%r12d
+    0.00 :   2343b2: jle    236e5f <host_rows+0x38ff>
+    0.00 :   2343b8: mov    $0xbf80bf80,%eax
+    0.00 :   2343bd: movslq %esi,%r14
+    0.00 :   2343c0: vxorps %xmm6,%xmm6,%xmm6
+    0.00 :   2343c4: xor    %edi,%edi
+    0.00 :   2343c6: vmovd  %eax,%xmm3
+    0.00 :   2343ca: vxorps %xmm8,%xmm8,%xmm8
+    0.00 :   2343cf: vpxor  %xmm4,%xmm4,%xmm4
+    0.00 :   2343d3: vbroadcastss 0x21c50(%rip),%ymm5        # 25602c <_IO_stdin_used+0x2c>
+    0.00 :   2343dc: vpbroadcastd %xmm3,%xmm3
+    0.00 :   2343e1: lea    0x7da98(%rip),%r10        # 2b1e80 <fp8_e4m3>
+    0.00 :   2343e8: nopl   0x0(%rax,%rax,1)
+    0.00 :   2343f0: lea    (%rsi,%rdi,1),%ecx
+    0.00 :   2343f3: mov    %edi,%eax
+    0.00 :   2343f5: mov    -0x2058(%rbp),%rbx
+    0.00 :   2343fc: mov    %edi,%r9d
+    0.00 :   2343ff: cmp    %r12d,%ecx
+    0.00 :   234402: mov    %edi,%r11d
+    0.00 :   234405: cmovg  %r12d,%ecx
+    0.00 :   234409: cltd
+    0.00 :   23440a: idiv   %esi
+    0.00 :   23440c: cltq
+    0.00 :   23440e: vmovss (%rbx,%rax,4),%xmm7
+    0.00 :   234413: lea    0xf(%rdi),%eax
+    0.00 :   234416: cmp    %eax,%ecx
+    0.00 :   234418: jle    235817 <host_rows+0x22b7>
+    0.00 :   23441e: mov    $0xfffffff0,%ebx
+    0.00 :   234423: mov    (%r8),%rdx
+    0.00 :   234426: vxorps %xmm0,%xmm0,%xmm0
+    0.00 :   23442a: sub    %edi,%ebx
+    0.00 :   23442c: add    %ecx,%ebx
+    0.00 :   23442e: mov    %ebx,%eax
+    0.00 :   234430: shr    $0x4,%eax
+    0.00 :   234433: shl    $0x4,%rax
+    0.00 :   234437: lea    0x10(%rdi,%rax,1),%r11
+    0.00 :   23443c: mov    %rdi,%rax
+    0.00 :   23443f: nop
+    0.00 :   234440: vmovdqu 0x0(%r13,%rax,1),%xmm1
+    0.00 :   234447: vpunpcklbw %xmm1,%xmm4,%xmm2
+    0.00 :   23444b: vpunpckhbw %xmm1,%xmm4,%xmm1
+    0.00 :   23444f: vpsraw $0x1,%xmm2,%xmm2
+    0.00 :   234454: vpsraw $0x1,%xmm1,%xmm1
+    0.00 :   234459: vpand  %xmm3,%xmm2,%xmm2
+    0.00 :   23445d: vpand  %xmm3,%xmm1,%xmm1
+    0.00 :   234461: vcvtph2ps %xmm2,%ymm2
+    0.00 :   234466: vmulps %ymm5,%ymm2,%ymm2
+    0.00 :   23446a: vcvtph2ps %xmm1,%ymm1
+    0.00 :   23446f: vmulps %ymm5,%ymm1,%ymm1
+    0.00 :   234473: vfmadd231ps (%rdx,%rax,4),%ymm2,%ymm0
+    0.00 :   234479: vfmadd231ps 0x20(%rdx,%rax,4),%ymm1,%ymm0
+    0.00 :   234480: add    $0x10,%rax
+    0.00 :   234484: cmp    %rax,%r11
+    0.00 :   234487: jne    234440 <host_rows+0xee0>
+    0.00 :   234489: and    $0xfffffff0,%ebx
+    0.00 :   23448c: lea    0x10(%r9,%rbx,1),%r11d
+    0.00 :   234491: lea    0x7(%r11),%eax
+    0.00 :   234495: cmp    %eax,%ecx
+    0.00 :   234497: jle    2344c6 <host_rows+0xf66>
+    0.00 :   234499: movslq %r11d,%rax
+    0.00 :   23449c: mov    (%r8),%rdx
+    0.00 :   23449f: add    $0x8,%r11d
+    0.00 :   2344a3: vmovq  0x0(%r13,%rax,1),%xmm1
+    0.00 :   2344aa: vpunpcklbw %xmm1,%xmm4,%xmm1
+    0.00 :   2344ae: vpsraw $0x1,%xmm1,%xmm1
+    0.00 :   2344b3: vpand  %xmm3,%xmm1,%xmm1
+    0.00 :   2344b7: vcvtph2ps %xmm1,%ymm1
+    0.00 :   2344bc: vmulps %ymm5,%ymm1,%ymm1
+    0.00 :   2344c0: vfmadd231ps (%rdx,%rax,4),%ymm1,%ymm0
+    0.00 :   2344c6: vbroadcastss %xmm7,%ymm1
+    0.00 :   2344cb: vfmadd231ps %ymm1,%ymm0,%ymm8
+    0.00 :   2344d0: cmp    %r11d,%ecx
+    0.00 :   2344d3: jle    2345b3 <host_rows+0x1053>
+    0.00 :   2344d9: movslq %r11d,%rax
+    0.00 :   2344dc: mov    (%r8),%rdx
+    0.00 :   2344df: movzbl 0x0(%r13,%rax,1),%r9d
+    0.00 :   2344e5: vmulss (%r10,%r9,4),%xmm7,%xmm0
+    0.00 :   2344eb: lea    0x1(%r11),%r9d
+    0.00 :   2344ef: vfmadd231ss (%rdx,%rax,4),%xmm0,%xmm6
+    0.00 :   2344f5: cmp    %r9d,%ecx
+    0.00 :   2344f8: jle    2345b3 <host_rows+0x1053>
+    0.00 :   2344fe: movslq %r9d,%r9
+    0.00 :   234501: movzbl 0x0(%r13,%r9,1),%r9d
+    0.00 :   234507: vmulss (%r10,%r9,4),%xmm7,%xmm0
+    0.00 :   23450d: lea    0x2(%r11),%r9d
+    0.00 :   234511: vfmadd231ss 0x4(%rdx,%rax,4),%xmm0,%xmm6
+    0.00 :   234518: cmp    %r9d,%ecx
+    0.00 :   23451b: jle    2345b3 <host_rows+0x1053>
+    0.00 :   234521: movslq %r9d,%r9
+    0.00 :   234524: movzbl 0x0(%r13,%r9,1),%r9d
+    0.00 :   23452a: vmulss (%r10,%r9,4),%xmm7,%xmm0
+    0.00 :   234530: lea    0x3(%r11),%r9d
+    0.00 :   234534: vfmadd231ss 0x8(%rdx,%rax,4),%xmm0,%xmm6
+    0.00 :   23453b: cmp    %r9d,%ecx
+    0.00 :   23453e: jle    2345b3 <host_rows+0x1053>
+    0.00 :   234540: movslq %r9d,%r9
+    0.00 :   234543: movzbl 0x0(%r13,%r9,1),%r9d
+    0.00 :   234549: vmulss (%r10,%r9,4),%xmm7,%xmm0
+    0.00 :   23454f: lea    0x4(%r11),%r9d
+    0.00 :   234553: vfmadd231ss 0xc(%rdx,%rax,4),%xmm0,%xmm6
+    0.00 :   23455a: cmp    %r9d,%ecx
+    0.00 :   23455d: jle    2345b3 <host_rows+0x1053>
+    0.00 :   23455f: movslq %r9d,%r9
+    0.00 :   234562: movzbl 0x0(%r13,%r9,1),%r9d
+    0.00 :   234568: vmulss (%r10,%r9,4),%xmm7,%xmm0
+    0.00 :   23456e: lea    0x5(%r11),%r9d
+    0.00 :   234572: vfmadd231ss 0x10(%rdx,%rax,4),%xmm0,%xmm6
+    0.00 :   234579: cmp    %r9d,%ecx
+    0.00 :   23457c: jle    2345b3 <host_rows+0x1053>
+    0.00 :   23457e: movslq %r9d,%r9
+    0.00 :   234581: add    $0x6,%r11d
+    0.00 :   234585: movzbl 0x0(%r13,%r9,1),%r9d
+    0.00 :   23458b: vmulss (%r10,%r9,4),%xmm7,%xmm0
+    0.00 :   234591: vfmadd231ss 0x14(%rdx,%rax,4),%xmm0,%xmm6
+    0.00 :   234598: cmp    %r11d,%ecx
+    0.00 :   23459b: jle    2345b3 <host_rows+0x1053>
+    0.00 :   23459d: movslq %r11d,%r11
+    0.00 :   2345a0: movzbl 0x0(%r13,%r11,1),%ecx
+    0.00 :   2345a6: vmulss (%r10,%rcx,4),%xmm7,%xmm7
+    0.00 :   2345ac: vfmadd231ss 0x18(%rdx,%rax,4),%xmm7,%xmm6
+    0.00 :   2345b3: add    %r14,%rdi
+    0.00 :   2345b6: cmp    %edi,%r12d
+    0.00 :   2345b9: jg     2343f0 <host_rows+0xe90>
+    0.00 :   2345bf: vextractf128 $0x1,%ymm8,%xmm0
+    0.00 :   2345c5: mov    -0x2060(%rbp),%rax
+    0.00 :   2345cc: vaddps %xmm8,%xmm0,%xmm0
+    0.00 :   2345d1: vmovhlps %xmm0,%xmm0,%xmm1
+    0.00 :   2345d5: vaddps %xmm1,%xmm0,%xmm0
+    0.00 :   2345d9: vmovshdup %xmm0,%xmm1
+    0.00 :   2345dd: vaddss %xmm1,%xmm0,%xmm0
+    0.00 :   2345e1: vaddss %xmm6,%xmm0,%xmm0
+    0.00 :   2345e5: vmovss %xmm0,(%rax)
+    0.00 :   2345e9: vzeroupper
+    0.00 :   2345ec: jmp    23386c <host_rows+0x30c>
+    0.00 :   2345f1: movslq %r12d,%rax
+    0.00 :   2345f4: mov    %rax,-0x2068(%rbp)
+    0.00 :   2345fb: lea    (%rcx,%rax,4),%r10
+    0.00 :   2345ff: cmp    $0x3f,%r12d
+    0.00 :   234603: jle    23467f <host_rows+0x111f>
+    0.00 :   234605: mov    %r12d,%r9d
+    0.00 :   234608: mov    %r10,%r8
+    0.00 :   23460b: xor    %r11d,%r11d
+    0.00 :   23460e: sar    $0x6,%r9d
+    0.00 :   234612: xor    %edx,%edx
+    0.00 :   234614: nop
+    0.00 :   234615: data16 cs nopw 0x0(%rax,%rax,1)
+    0.00 :   234620: mov    %edx,%eax
+    0.00 :   234622: mov    %edx,%ecx
+    0.00 :   234624: mov    %edx,%edi
+    0.00 :   234626: sar    $0x3,%eax
+    0.00 :   234629: and    $0x7,%ecx
+    0.00 :   23462c: and    $0x3,%edi
+    0.00 :   23462f: add    $0x10,%eax
+    0.00 :   234632: add    %edi,%edi
+    0.00 :   234634: cltq
+    0.00 :   234636: movzbl 0x0(%r13,%rax,1),%eax
+    0.00 :   23463c: sarx   %ecx,%eax,%eax
+    0.00 :   234641: shl    $0x2,%eax
+    0.00 :   234644: and    $0x4,%eax
+    0.00 :   234647: mov    %eax,%ecx
+    0.00 :   234649: mov    %edx,%eax
+    0.00 :   23464b: sar    $0x2,%eax
+    0.00 :   23464e: cltq
+    0.00 :   234650: movzbl 0x0(%r13,%rax,1),%eax
+    0.00 :   234656: sarx   %edi,%eax,%eax
+    0.00 :   23465b: and    $0x3,%eax
+    0.00 :   23465e: or     %ecx,%eax
+    0.00 :   234660: mov    %al,(%r8,%rdx,1)
+    0.00 :   234664: add    $0x1,%rdx
+    0.00 :   234668: cmp    $0x40,%rdx
+    0.00 :   23466c: jne    234620 <host_rows+0x10c0>
+    0.00 :   23466e: add    $0x1,%r11
+    0.00 :   234672: add    $0x18,%r13
+    0.00 :   234676: add    $0x40,%r8
+    0.00 :   23467a: cmp    %r11d,%r9d
+    0.00 :   23467d: jg     234612 <host_rows+0x10b2>
+    0.00 :   23467f: mov    $0x4,%eax
+    0.00 :   234684: jmp    234068 <host_rows+0xb08>
+    0.01 :   234689: movslq %r12d,%rax
+    0.02 :   23468c: mov    %rax,-0x2068(%rbp)
+    0.00 :   234693: lea    (%rcx,%rax,4),%rcx
+    0.00 :   234697: cmp    $0x1,%r12d
+    0.00 :   23469b: jle    2346d9 <host_rows+0x1179>
+    0.00 :   23469d: mov    %r12d,%r8d
+    0.01 :   2346a0: xor    %eax,%eax
+    0.00 :   2346a2: lea    0x25f87(%rip),%rdi        # 25a630 <GGML_KVALUES_MXFP4.lto_priv.0>
+    0.00 :   2346a9: sar    $1,%r8d
+    3.09 :   2346ac: movzbl 0x0(%r13,%rax,1),%edx
+    5.08 :   2346b2: and    $0xf,%edx
+   13.12 :   2346b5: movzbl (%rdi,%rdx,1),%edx
+    6.20 :   2346b9: mov    %dl,(%rcx,%rax,2)
+    6.14 :   2346bc: movzbl 0x0(%r13,%rax,1),%edx
+    1.86 :   2346c2: shr    $0x4,%dl
+   11.01 :   2346c5: and    $0xf,%edx
+    4.74 :   2346c8: movzbl (%rdi,%rdx,1),%edx
+    6.18 :   2346cc: mov    %dl,0x1(%rcx,%rax,2)
+   16.91 :   2346d0: add    $0x1,%rax
+    4.82 :   2346d4: cmp    %eax,%r8d
+    0.00 :   2346d7: jg     2346ac <host_rows+0x114c>
+    0.01 :   2346d9: mov    %r12d,%eax
+    0.00 :   2346dc: cltd
+    0.03 :   2346dd: idiv   %esi
+    0.44 :   2346df: test   %eax,%eax
+    0.00 :   2346e1: jle    2347d4 <host_rows+0x1274>
+    0.02 :   2346e7: lea    -0x1(%rax),%edx
+    0.00 :   2346ea: cmp    $0x6,%edx
+    0.00 :   2346ed: jbe    236e33 <host_rows+0x38d3>
+    0.01 :   2346f3: mov    %eax,%r8d
+    0.29 :   2346f6: mov    -0x2058(%rbp),%r15
+    0.06 :   2346fd: vbroadcastss 0x218fe(%rip),%ymm1        # 256004 <_IO_stdin_used+0x4>
+    0.03 :   234706: lea    -0x2050(%rbp),%rdi
+    0.01 :   23470d: shr    $0x3,%r8d
+    0.00 :   234711: shl    $0x5,%r8
+    0.01 :   234715: mov    %r15,%rdx
+    0.00 :   234718: add    %r15,%r8
+    0.20 :   23471b: vmulps (%rdx),%ymm1,%ymm0
+    1.21 :   23471f: add    $0x20,%rdx
+    0.03 :   234723: add    $0x20,%rdi
+    0.05 :   234727: vmovaps %ymm0,-0x20(%rdi)
+    0.08 :   23472c: cmp    %rdx,%r8
+    0.00 :   23472f: jne    23471b <host_rows+0x11bb>
+    0.01 :   234731: mov    %eax,%edx
+    0.01 :   234733: and    $0xfffffff8,%edx
+    0.00 :   234736: mov    %edx,%edi
+    0.00 :   234738: cmp    %eax,%edx
+    0.00 :   23473a: je     2347d4 <host_rows+0x1274>
+    0.00 :   234740: mov    %eax,%r8d
+    0.00 :   234743: sub    %edi,%r8d
+    0.00 :   234746: lea    -0x1(%r8),%r9d
+    0.00 :   23474a: cmp    $0x2,%r9d
+    0.00 :   23474e: jbe    23477c <host_rows+0x121c>
+    0.00 :   234750: vbroadcastss 0x218ab(%rip),%xmm0        # 256004 <_IO_stdin_used+0x4>
+    0.00 :   234759: mov    -0x2058(%rbp),%r15
+    0.00 :   234760: vmulps (%r15,%rdi,4),%xmm0,%xmm0
+    0.00 :   234766: vmovaps %xmm0,-0x2050(%rbp,%rdi,4)
+    0.00 :   23476f: test   $0x3,%r8b
+    0.00 :   234773: je     2347d4 <host_rows+0x1274>
+    0.00 :   234775: and    $0xfffffffc,%r8d
+    0.00 :   234779: add    %r8d,%edx
+    0.00 :   23477c: mov    -0x2058(%rbp),%r15
+    0.00 :   234783: movslq %edx,%rdi
+    0.00 :   234786: vmovss 0x21876(%rip),%xmm0        # 256004 <_IO_stdin_used+0x4>
+    0.00 :   23478e: lea    0x1(%rdx),%r8d
+    0.00 :   234792: vmulss (%r15,%rdi,4),%xmm0,%xmm1
+    0.00 :   234798: vmovss %xmm1,-0x2050(%rbp,%rdi,4)
+    0.00 :   2347a1: cmp    %eax,%r8d
+    0.00 :   2347a4: jge    2347d4 <host_rows+0x1274>
+    0.00 :   2347a6: vmulss 0x4(%r15,%rdi,4),%xmm0,%xmm1
+    0.00 :   2347ad: movslq %r8d,%r8
+    0.00 :   2347b0: add    $0x2,%edx
+    0.00 :   2347b3: vmovss %xmm1,-0x2050(%rbp,%r8,4)
+    0.00 :   2347bd: cmp    %eax,%edx
+    0.00 :   2347bf: jge    2347d4 <host_rows+0x1274>
+    0.00 :   2347c1: vmulss 0x8(%r15,%rdi,4),%xmm0,%xmm0
+    0.00 :   2347c8: movslq %edx,%rdx
+    0.00 :   2347cb: vmovss %xmm0,-0x2050(%rbp,%rdx,4)
+    0.00 :   2347d4: mov    0x18(%rbx),%r15d
+    0.02 :   2347d8: test   %r15d,%r15d
+    0.00 :   2347db: jle    233869 <host_rows+0x309>
+    0.01 :   2347e1: test   %r12d,%r12d
+    0.01 :   2347e4: lea    0x1f(%r12),%r10d
+    0.00 :   2347e9: mov    %rcx,%r13
+    0.00 :   2347ec: mov    0x8(%rbx),%r9
+    0.01 :   2347f0: cmovns %r12d,%r10d
+    0.01 :   2347f4: lea    -0x2050(%rbp),%rcx
+    0.00 :   2347fb: mov    (%rbx),%r8
+    0.01 :   2347fe: movslq -0x2090(%rbp),%rdi
+    0.00 :   234805: mov    %rcx,-0x2058(%rbp)
+    0.00 :   23480c: mov    -0x2068(%rbp),%rbx
+    0.00 :   234813: sar    $0x5,%r10d
+    0.01 :   234817: movslq %r10d,%rax
+    0.00 :   23481a: jmp    233d7f <host_rows+0x81f>
+    0.00 :   23481f: cmp    %fs:0xffffffffffffffe0,%r12d
+    0.00 :   234828: jg     235ed3 <host_rows+0x2973>
+    0.00 :   23482e: movslq %r12d,%rax
+    0.00 :   234831: mov    %rax,-0x2068(%rbp)
+    0.00 :   234838: mov    %fs:0xfffffffffffffff8,%rax
+    0.00 :   234841: mov    %rax,-0x2058(%rbp)
+    0.00 :   234848: mov    %fs:0xfffffffffffffff0,%rax
+    0.00 :   234851: mov    %rax,-0x2070(%rbp)
+    0.00 :   234858: mov    %fs:0xffffffffffffffe8,%rax
+    0.00 :   234861: mov    %rax,-0x2098(%rbp)
+    0.00 :   234868: cmp    $0x2a,%r10d
+    0.00 :   23486c: ja     23736a <host_rows+0x3e0a>
+    0.00 :   234872: movabs $0x78c20ff7ccc,%rax
+    0.00 :   23487c: movslq %r10d,%rdi
+    0.00 :   23487f: bt     %r10,%rax
+    0.00 :   234883: jae    23498e <host_rows+0x142e>
+    0.00 :   234889: lea    (%rdi,%rdi,2),%rax
+    0.00 :   23488d: lea    0x8e82c(%rip),%rdx        # 2c30c0 <GQ_TYPES.lto_priv.0.lto_priv.0>
+    0.00 :   234894: lea    (%rdx,%rax,8),%rsi
+    0.00 :   234898: mov    -0x2068(%rbp),%rax
+    0.00 :   23489f: movslq 0x8(%rsi),%r15
+    0.00 :   2348a3: cqto
+    0.00 :   2348a5: idiv   %r15
+    0.00 :   2348a8: mov    %r15,-0x20b8(%rbp)
+    0.00 :   2348af: mov    %r15,%rcx
+    0.00 :   2348b2: mov    %rax,-0x20c0(%rbp)
+    0.00 :   2348b9: mov    %rdx,%r15
+    0.00 :   2348bc: test   %rdx,%rdx
+    0.00 :   2348bf: jne    23498e <host_rows+0x142e>
+    0.00 :   2348c5: test   %rax,%rax
+    0.00 :   2348c8: jle    23498e <host_rows+0x142e>
+    0.00 :   2348ce: movslq 0xc(%rsi),%rax
+    0.00 :   2348d2: test   %ecx,%ecx
+    0.00 :   2348d4: mov    %r13,%rsi
+    0.00 :   2348d7: mov    -0x2058(%rbp),%r14
+    0.00 :   2348de: mov    -0x2098(%rbp),%rdx
+    0.00 :   2348e5: mov    %rdi,-0x20c8(%rbp)
+    0.00 :   2348ec: mov    %rax,-0x20b0(%rbp)
+    0.00 :   2348f3: lea    0xf(%rcx),%eax
+    0.00 :   2348f6: cmovs  %eax,%ecx
+    0.00 :   2348f9: mov    %r10d,-0x20a8(%rbp)
+    0.00 :   234900: mov    -0x2070(%rbp),%rax
+    0.00 :   234907: mov    %r12d,-0x20cc(%rbp)
+    0.00 :   23490e: mov    %rdx,%r12
+    0.00 :   234911: mov    %ecx,%r13d
+    0.00 :   234914: mov    %rbx,-0x20d8(%rbp)
+    0.00 :   23491b: mov    %r15,%rbx
+    0.00 :   23491e: mov    %r14,%r15
+    0.00 :   234921: sar    $0x4,%r13d
+    0.00 :   234925: mov    %rax,%r14
+    0.00 :   234928: movslq %r13d,%r13
+    0.00 :   23492b: shl    $0x2,%r13
+    0.00 :   23492f: mov    -0x20a8(%rbp),%edi
+    0.00 :   234935: mov    %r15,%r8
+    0.00 :   234938: mov    %r14,%rcx
+    0.00 :   23493b: mov    %r12,%rdx
+    0.00 :   23493e: mov    %rsi,-0x20a0(%rbp)
+    0.00 :   234945: add    $0x1,%rbx
+    0.00 :   234949: add    %r13,%r14
+    0.00 :   23494c: add    %r13,%r15
+    0.00 :   23494f: call   1f3170 <gq_ublk.lto_priv.5>
+    0.00 :   234954: mov    -0x20a0(%rbp),%rsi
+    0.00 :   23495b: add    -0x20b8(%rbp),%r12
+    0.00 :   234962: add    -0x20b0(%rbp),%rsi
+    0.00 :   234969: cmp    %rbx,-0x20c0(%rbp)
+    0.00 :   234970: jne    23492f <host_rows+0x13cf>
+    0.00 :   234972: mov    -0x20c8(%rbp),%rdi
+    0.00 :   234979: mov    -0x20a8(%rbp),%r10d
+    0.00 :   234980: mov    -0x20cc(%rbp),%r12d
+    0.00 :   234987: mov    -0x20d8(%rbp),%rbx
+    0.00 :   23498e: cmp    $0xd,%r10d
+    0.00 :   234992: ja     23736a <host_rows+0x3e0a>
+    0.00 :   234998: mov    $0x3488,%eax
+    0.00 :   23499d: xor    %edx,%edx
+    0.00 :   23499f: bt     %rdi,%rax
+    0.00 :   2349a3: setb   %dl
+    0.00 :   2349a6: mov    0x18(%rbx),%ecx
+    0.00 :   2349a9: test   %ecx,%ecx
+    0.00 :   2349ab: jle    23386c <host_rows+0x30c>
+    0.00 :   2349b1: test   %r12d,%r12d
+    0.00 :   2349b4: lea    0x1f(%r12),%r13d
+    0.00 :   2349b9: lea    0xf(%r12),%eax
+    0.00 :   2349be: mov    (%rbx),%r8
+    0.00 :   2349c1: cmovns %r12d,%r13d
+    0.00 :   2349c5: mov    0x8(%rbx),%r15
+    0.00 :   2349c9: mov    %edx,-0x20a8(%rbp)
+    0.00 :   2349cf: mov    %r8,%r14
+    0.00 :   2349d2: sar    $0x5,%r13d
+    0.00 :   2349d6: movslq %r13d,%r13
+    0.00 :   2349d9: shl    $0x2,%r13
+    0.00 :   2349dd: test   %r12d,%r12d
+    0.00 :   2349e0: cmovs  %eax,%r12d
+    0.00 :   2349e4: mov    %r13,-0x20b0(%rbp)
+    0.00 :   2349eb: xor    %r13d,%r13d
+    0.00 :   2349ee: sar    $0x4,%r12d
+    0.00 :   2349f2: movslq %r12d,%r12
+    0.00 :   2349f5: lea    0x0(,%r12,4),%rax
+    0.00 :   2349fd: mov    0x10(%rbx),%r12
+    0.00 :   234a01: movslq -0x2090(%rbp),%rbx
+    0.00 :   234a08: mov    %rax,-0x20a0(%rbp)
+    0.00 :   234a0f: lea    0x0(,%rbx,4),%rax
+    0.00 :   234a17: mov    -0x2060(%rbp),%rbx
+    0.00 :   234a1e: mov    %ecx,-0x2060(%rbp)
+    0.00 :   234a24: mov    %rax,-0x2090(%rbp)
+    0.00 :   234a2b: mov    %r12,%rax
+    0.00 :   234a2e: mov    %r15,%r12
+    0.00 :   234a31: mov    %rax,%r15
+    0.00 :   234a34: push   -0x2068(%rbp)
+    0.00 :   234a3a: mov    %r12,%r9
+    0.00 :   234a3d: mov    %r14,%r8
+    0.00 :   234a40: add    $0x1,%r13d
+    0.00 :   234a44: push   %r15
+    0.00 :   234a46: mov    -0x2058(%rbp),%rdx
+    0.00 :   234a4d: mov    -0x20a8(%rbp),%ecx
+    0.00 :   234a53: mov    -0x2070(%rbp),%rsi
+    0.00 :   234a5a: mov    -0x2098(%rbp),%rdi
+    0.00 :   234a61: call   32ff0 <gq_dot_i8.lto_priv.0.lto_priv.0>
+    0.00 :   234a66: pop    %rax
+    0.00 :   234a67: pop    %rdx
+    0.00 :   234a68: add    -0x2068(%rbp),%r14
+    0.00 :   234a6f: vmovss %xmm0,(%rbx)
+    0.00 :   234a73: add    -0x20b0(%rbp),%r12
+    0.00 :   234a7a: add    -0x20a0(%rbp),%r15
+    0.00 :   234a81: add    -0x2090(%rbp),%rbx
+    0.00 :   234a88: cmp    %r13d,-0x2060(%rbp)
+    0.00 :   234a8f: jne    234a34 <host_rows+0x14d4>
+    0.00 :   234a91: jmp    23386c <host_rows+0x30c>
+    0.00 :   234a96: lea    -0x42c7d(%rip),%rax        # 1f1e20 <gq_dot_iq1_m.lto_priv.5>
+    0.00 :   234a9d: mov    -0x38(%rbp),%rcx
+    0.00 :   234aa1: sub    %fs:0x28,%rcx
+    0.00 :   234aaa: jne    2374e4 <host_rows+0x3f84>
+    0.00 :   234ab0: mov    0x8(%rbx),%r8
+    0.00 :   234ab4: mov    (%rbx),%rcx
+    0.00 :   234ab7: mov    %edx,(%r11)
+    0.00 :   234aba: mov    %r12d,%r9d
+    0.00 :   234abd: mov    -0x2090(%rbp),%esi
+    0.00 :   234ac3: mov    -0x2060(%rbp),%rdi
+    0.00 :   234aca: mov    %r13,%rdx
+    0.00 :   234acd: lea    -0x28(%rbp),%rsp
+    0.00 :   234ad1: pop    %rbx
+    0.00 :   234ad2: pop    %r12
+    0.00 :   234ad4: pop    %r13
+    0.00 :   234ad6: pop    %r14
+    0.00 :   234ad8: pop    %r15
+    0.00 :   234ada: pop    %rbp
+    0.00 :   234adb: lea    -0x10(%r13),%rsp
+    0.00 :   234adf: pop    %r13
+    0.00 :   234ae1: jmp    *%rax
+    0.00 :   234ae3: lea    -0x47b6a(%rip),%rax        # 1ecf80 <gq_dot_iq4_xs.lto_priv.5>
+    0.00 :   234aea: jmp    234a9d <host_rows+0x153d>
+    0.00 :   234aec: lea    -0x45f73(%rip),%rax        # 1eeb80 <gq_dot_iq2_s.lto_priv.5>
+    0.00 :   234af3: jmp    234a9d <host_rows+0x153d>
+    0.00 :   234af5: lea    -0x443cc(%rip),%rax        # 1f0730 <gq_dot_iq3_s.lto_priv.5>
+    0.00 :   234afc: jmp    234a9d <host_rows+0x153d>
+    0.00 :   234afe: lea    -0x438b5(%rip),%rax        # 1f1250 <gq_dot_iq1_s.lto_priv.5>
+    0.00 :   234b05: jmp    234a9d <host_rows+0x153d>
+    0.00 :   234b07: lea    -0x4524e(%rip),%rax        # 1ef8c0 <gq_dot_iq3_xxs.lto_priv.5>
+    0.00 :   234b0e: jmp    234a9d <host_rows+0x153d>
+    0.00 :   234b10: lea    -0x4e617(%rip),%rsi        # 1e6500 <gq_blk_q5_0.lto_priv.6>
+    0.00 :   234b17: lea    (%r10,%r10,2),%rdi
+    0.00 :   234b1b: lea    0x8e59e(%rip),%rdx        # 2c30c0 <GQ_TYPES.lto_priv.0.lto_priv.0>
+    0.00 :   234b22: lea    (%rdx,%rdi,8),%r9
+    0.00 :   234b26: cqto
+    0.00 :   234b28: movslq 0x8(%r9),%rdi
+    0.00 :   234b2c: idiv   %rdi
+    0.00 :   234b2f: mov    %rdx,%r14
+    0.00 :   234b32: test   %rdx,%rdx
+    0.00 :   234b35: jne    2336c0 <host_rows+0x160>
+    0.00 :   234b3b: test   %rax,%rax
+    0.00 :   234b3e: jle    2336c0 <host_rows+0x160>
+    0.00 :   234b44: movslq 0xc(%r9),%rdx
+    0.00 :   234b48: shl    $0x2,%rdi
+    0.00 :   234b4c: mov    %rcx,-0x2098(%rbp)
+    0.00 :   234b53: mov    %rax,%r15
+    0.00 :   234b56: mov    %rdi,-0x2058(%rbp)
+    0.00 :   234b5d: mov    %rdx,-0x2068(%rbp)
+    0.00 :   234b64: mov    %r8,-0x20a8(%rbp)
+    0.00 :   234b6b: mov    %r12d,-0x2070(%rbp)
+    0.00 :   234b72: mov    %r14,%r12
+    0.00 :   234b75: mov    %r13,%r14
+    0.00 :   234b78: mov    %rsi,%r13
+    0.00 :   234b7b: mov    %rbx,-0x20a0(%rbp)
+    0.00 :   234b82: mov    %rcx,%rbx
+    0.00 :   234b85: data16 cs nopw 0x0(%rax,%rax,1)
+    0.00 :   234b90: add    $0x1,%r12
+    0.00 :   234b94: mov    %rbx,%rsi
+    0.00 :   234b97: mov    %r14,%rdi
+    0.00 :   234b9a: call   *%r13
+    0.00 :   234b9d: add    -0x2068(%rbp),%r14
+    0.00 :   234ba4: add    -0x2058(%rbp),%rbx
+    0.00 :   234bab: cmp    %r12,%r15
+    0.00 :   234bae: vxorps %xmm4,%xmm4,%xmm4
+    0.00 :   234bb2: jne    234b90 <host_rows+0x1630>
+    0.00 :   234bb4: mov    -0x2070(%rbp),%r12d
+    0.00 :   234bbb: mov    -0x2098(%rbp),%rcx
+    0.00 :   234bc2: mov    -0x20a0(%rbp),%rbx
+    0.00 :   234bc9: mov    -0x20a8(%rbp),%r8
+    0.00 :   234bd0: jmp    2336c0 <host_rows+0x160>
+    0.00 :   234bd5: lea    -0x4e75c(%rip),%rsi        # 1e6480 <gq_blk_q2_0.lto_priv.6>
+    0.00 :   234bdc: jmp    234b17 <host_rows+0x15b7>
+    0.00 :   234be1: lea    -0x4e7d8(%rip),%rsi        # 1e6410 <gq_blk_q1_0.lto_priv.6>
+    0.00 :   234be8: jmp    234b17 <host_rows+0x15b7>
+    0.00 :   234bed: lea    -0x4e664(%rip),%rsi        # 1e6590 <gq_blk_nvfp4.lto_priv.5>
+    0.00 :   234bf4: jmp    234b17 <host_rows+0x15b7>
+    0.00 :   234bf9: lea    -0x56590(%rip),%rsi        # 1de670 <gq_blk_mxfp4.lto_priv.6>
+    0.00 :   234c00: jmp    234b17 <host_rows+0x15b7>
+    0.00 :   234c05: lea    -0x4e86c(%rip),%rsi        # 1e63a0 <gq_blk_tq2_0.lto_priv.6>
+    0.00 :   234c0c: jmp    234b17 <host_rows+0x15b7>
+    0.00 :   234c11: lea    -0x4e698(%rip),%rsi        # 1e6580 <gq_blk_tq1_0.lto_priv.6>
+    0.00 :   234c18: jmp    234b17 <host_rows+0x15b7>
+    0.00 :   234c1d: lea    -0x4f884(%rip),%rsi        # 1e53a0 <gq_blk_iq2_xxs.lto_priv.5>
+    0.00 :   234c24: jmp    234b17 <host_rows+0x15b7>
+    0.00 :   234c29: lea    -0x4e6d0(%rip),%rsi        # 1e6560 <gq_blk_q6_k.lto_priv.6>
+    0.00 :   234c30: jmp    234b17 <host_rows+0x15b7>
+    0.00 :   234c35: lea    -0x4e6ec(%rip),%rsi        # 1e6550 <gq_blk_q5_k.lto_priv.6>
+    0.00 :   234c3c: jmp    234b17 <host_rows+0x15b7>
+    0.00 :   234c41: lea    -0x4e708(%rip),%rsi        # 1e6540 <gq_blk_q4_k.lto_priv.6>
+    0.00 :   234c48: jmp    234b17 <host_rows+0x15b7>
+    0.00 :   234c4d: lea    -0x4e724(%rip),%rsi        # 1e6530 <gq_blk_q3_k.lto_priv.6>
+    0.00 :   234c54: jmp    234b17 <host_rows+0x15b7>
+    0.00 :   234c59: lea    -0x4e740(%rip),%rsi        # 1e6520 <gq_blk_q2_k.lto_priv.6>
+    0.00 :   234c60: jmp    234b17 <host_rows+0x15b7>
+    0.00 :   234c65: lea    -0x4f9ac(%rip),%rsi        # 1e52c0 <gq_blk_q8_0.lto_priv.6>
+    0.00 :   234c6c: jmp    234b17 <host_rows+0x15b7>
+    0.00 :   234c71: lea    -0x4e768(%rip),%rsi        # 1e6510 <gq_blk_q5_1.lto_priv.6>
+    0.00 :   234c78: jmp    234b17 <host_rows+0x15b7>
+    0.00 :   234c7d: lea    -0x4ee44(%rip),%rsi        # 1e5e40 <gq_blk_iq1_m.lto_priv.5>
+    0.00 :   234c84: jmp    234b17 <host_rows+0x15b7>
+    0.00 :   234c89: lea    -0x4e720(%rip),%rsi        # 1e6570 <gq_blk_iq4_xs.lto_priv.6>
+    0.00 :   234c90: jmp    234b17 <host_rows+0x15b7>
+    0.00 :   234c95: lea    -0x4f53c(%rip),%rsi        # 1e5760 <gq_blk_iq2_s.lto_priv.5>
+    0.00 :   234c9c: jmp    234b17 <host_rows+0x15b7>
+    0.00 :   234ca1: lea    -0x4f198(%rip),%rsi        # 1e5b10 <gq_blk_iq3_s.lto_priv.5>
+    0.00 :   234ca8: jmp    234b17 <host_rows+0x15b7>
+    0.00 :   234cad: lea    -0x4ec64(%rip),%rsi        # 1e6050 <gq_blk_iq4_nl.lto_priv.6>
+    0.00 :   234cb4: jmp    234b17 <host_rows+0x15b7>
+    0.00 :   234cb9: lea    -0x4f040(%rip),%rsi        # 1e5c80 <gq_blk_iq1_s.lto_priv.5>
+    0.00 :   234cc0: jmp    234b17 <host_rows+0x15b7>
+    0.00 :   234cc5: lea    -0x4f39c(%rip),%rsi        # 1e5930 <gq_blk_iq3_xxs.lto_priv.5>
+    0.00 :   234ccc: jmp    234b17 <host_rows+0x15b7>
+    0.00 :   234cd1: lea    -0x4f738(%rip),%rsi        # 1e55a0 <gq_blk_iq2_xs.lto_priv.5>
+    0.00 :   234cd8: jmp    234b17 <host_rows+0x15b7>
+    0.00 :   234cdd: lea    -0x4feb4(%rip),%rsi        # 1e4e30 <gq_blk_q4_1.lto_priv.6>
+    0.00 :   234ce4: jmp    234b17 <host_rows+0x15b7>
+    0.00 :   234ce9: lea    -0x50310(%rip),%rsi        # 1e49e0 <gq_blk_q4_0.lto_priv.6>
+    0.00 :   234cf0: jmp    234b17 <host_rows+0x15b7>
+    0.00 :   234cf5: lea    -0x470dc(%rip),%rax        # 1edc20 <gq_dot_iq2_xs.lto_priv.5>
+    0.00 :   234cfc: jmp    234a9d <host_rows+0x153d>
+    0.00 :   234d01: lea    -0x47d78(%rip),%rax        # 1ecf90 <gq_dot_iq2_xxs.lto_priv.5>
+    0.00 :   234d08: jmp    234a9d <host_rows+0x153d>
+    0.00 :   234d0d: nopl   (%rax)
+    0.00 :   234d10: add    $0x1,%r15d
+    0.00 :   234d14: vmovss %xmm5,(%r14)
+    0.00 :   234d19: cmp    %r13d,%r15d
+    0.00 :   234d1c: jne    2341bc <host_rows+0xc5c>
+    0.00 :   234d22: jmp    233869 <host_rows+0x309>
+    0.00 :   234d27: mov    %r15d,%eax
+    0.00 :   234d2a: mov    -0x2058(%rbp),%rdi
+    0.00 :   234d31: cltd
+    0.00 :   234d32: idiv   %esi
+    0.00 :   234d34: cltq
+    0.00 :   234d36: vmulss (%rdi,%rax,4),%xmm0,%xmm0
+    0.00 :   234d3b: vmovss %xmm0,(%rcx,%r15,4)
+    0.00 :   234d41: add    $0x1,%r15
+    0.00 :   234d45: cmp    %r14,%r15
+    0.00 :   234d48: jne    233998 <host_rows+0x438>
+    0.00 :   234d4e: jmp    2336c0 <host_rows+0x160>
+    0.00 :   234d53: vxorps %xmm7,%xmm7,%xmm7
+    0.00 :   234d57: vxorps %xmm5,%xmm5,%xmm5
+    0.00 :   234d5b: jmp    23417d <host_rows+0xc1d>
+    0.00 :   234d60: test   %r12d,%r12d
+    0.00 :   234d63: jle    237353 <host_rows+0x3df3>
+    0.00 :   234d69: mov    $0xbf80bf80,%eax
+    0.00 :   234d6e: vxorps %xmm7,%xmm7,%xmm7
+    0.00 :   234d72: vxorps %xmm10,%xmm10,%xmm10
+    0.00 :   234d77: movslq %esi,%r15
+    0.00 :   234d7a: vmovd  %eax,%xmm4
+    0.00 :   234d7e: vmovaps %xmm7,%xmm8
+    0.00 :   234d82: vmovaps %ymm10,%ymm11
+    0.00 :   234d87: xor    %r9d,%r9d
+    0.00 :   234d8a: mov    %rcx,-0x2090(%rbp)
+    0.00 :   234d91: vpxor  %xmm5,%xmm5,%xmm5
+    0.00 :   234d95: vbroadcastss 0x2128e(%rip),%ymm6        # 25602c <_IO_stdin_used+0x2c>
+    0.00 :   234d9e: vpbroadcastd %xmm4,%xmm4
+    0.00 :   234da3: lea    0x7d0d6(%rip),%r11        # 2b1e80 <fp8_e4m3>
+    0.00 :   234daa: nopw   0x0(%rax,%rax,1)
+    0.00 :   234db0: lea    (%rsi,%r9,1),%edi
+    0.00 :   234db4: mov    %r9d,%eax
+    0.00 :   234db7: mov    %r9d,%r10d
+    0.00 :   234dba: mov    %r9d,%ecx
+    0.00 :   234dbd: cmp    %r12d,%edi
+    0.00 :   234dc0: mov    -0x2058(%rbp),%rbx
+    0.00 :   234dc7: cmovg  %r12d,%edi
+    0.00 :   234dcb: cltd
+    0.00 :   234dcc: idiv   %esi
+    0.00 :   234dce: cltq
+    0.00 :   234dd0: vmovss (%rbx,%rax,4),%xmm9
+    0.00 :   234dd5: lea    0xf(%r9),%eax
+    0.00 :   234dd9: cmp    %eax,%edi
+    0.00 :   234ddb: jle    23580a <host_rows+0x22aa>
+    0.00 :   234de1: mov    $0xfffffff0,%r14d
+    0.00 :   234de7: vxorps %xmm2,%xmm2,%xmm2
+    0.00 :   234deb: mov    (%r8),%rcx
+    0.00 :   234dee: mov    0x8(%r8),%rdx
+    0.00 :   234df2: sub    %r9d,%r14d
+    0.00 :   234df5: vmovaps %ymm2,%ymm3
+    0.00 :   234df9: add    %edi,%r14d
+    0.00 :   234dfc: mov    %r14d,%eax
+    0.00 :   234dff: shr    $0x4,%eax
+    0.00 :   234e02: shl    $0x4,%rax
+    0.00 :   234e06: lea    0x10(%r9,%rax,1),%rbx
+    0.00 :   234e0b: mov    %r9,%rax
+    0.00 :   234e0e: xchg   %ax,%ax
+    0.00 :   234e10: vmovdqu 0x0(%r13,%rax,1),%xmm1
+    0.00 :   234e17: vpunpcklbw %xmm1,%xmm5,%xmm0
+    0.00 :   234e1b: vpunpckhbw %xmm1,%xmm5,%xmm1
+    0.00 :   234e1f: vpsraw $0x1,%xmm0,%xmm0
+    0.00 :   234e24: vpsraw $0x1,%xmm1,%xmm1
+    0.00 :   234e29: vpand  %xmm4,%xmm0,%xmm0
+    0.00 :   234e2d: vpand  %xmm4,%xmm1,%xmm1
+    0.00 :   234e31: vcvtph2ps %xmm0,%ymm0
+    0.00 :   234e36: vmulps %ymm6,%ymm0,%ymm0
+    0.00 :   234e3a: vcvtph2ps %xmm1,%ymm1
+    0.00 :   234e3f: vfmadd231ps (%rcx,%rax,4),%ymm0,%ymm3
+    0.00 :   234e45: vfmadd231ps (%rdx,%rax,4),%ymm0,%ymm2
+    0.00 :   234e4b: vmulps %ymm6,%ymm1,%ymm1
+    0.00 :   234e4f: vfmadd231ps 0x20(%rcx,%rax,4),%ymm1,%ymm3
+    0.00 :   234e56: vfmadd231ps 0x20(%rdx,%rax,4),%ymm1,%ymm2
+    0.00 :   234e5d: add    $0x10,%rax
+    0.00 :   234e61: cmp    %rax,%rbx
+    0.00 :   234e64: jne    234e10 <host_rows+0x18b0>
+    0.00 :   234e66: and    $0xfffffff0,%r14d
+    0.00 :   234e6a: lea    0x10(%r10,%r14,1),%ecx
+    0.00 :   234e6f: lea    0x7(%rcx),%eax
+    0.00 :   234e72: cmp    %eax,%edi
+    0.00 :   234e74: jle    234eac <host_rows+0x194c>
+    0.00 :   234e76: movslq %ecx,%rax
+    0.00 :   234e79: mov    (%r8),%rdx
+    0.00 :   234e7c: add    $0x8,%ecx
+    0.00 :   234e7f: vmovq  0x0(%r13,%rax,1),%xmm0
+    0.00 :   234e86: vpunpcklbw %xmm0,%xmm5,%xmm0
+    0.00 :   234e8a: vpsraw $0x1,%xmm0,%xmm0
+    0.00 :   234e8f: vpand  %xmm4,%xmm0,%xmm0
+    0.00 :   234e93: vcvtph2ps %xmm0,%ymm0
+    0.00 :   234e98: vmulps %ymm6,%ymm0,%ymm0
+    0.00 :   234e9c: vfmadd231ps (%rdx,%rax,4),%ymm0,%ymm3
+    0.00 :   234ea2: mov    0x8(%r8),%rdx
+    0.00 :   234ea6: vfmadd231ps (%rdx,%rax,4),%ymm0,%ymm2
+    0.00 :   234eac: vbroadcastss %xmm9,%ymm0
+    0.00 :   234eb1: vfmadd231ps %ymm0,%ymm3,%ymm11
+    0.00 :   234eb6: vfmadd231ps %ymm0,%ymm2,%ymm10
+    0.00 :   234ebb: cmp    %ecx,%edi
+    0.00 :   234ebd: jle    234fc9 <host_rows+0x1a69>
+    0.00 :   234ec3: movslq %ecx,%rax
+    0.00 :   234ec6: mov    (%r8),%r10
+    0.00 :   234ec9: mov    0x8(%r8),%rdx
+    0.00 :   234ecd: movzbl 0x0(%r13,%rax,1),%ebx
+    0.00 :   234ed3: vmulss (%r11,%rbx,4),%xmm9,%xmm0
+    0.00 :   234ed9: lea    0x1(%rcx),%ebx
+    0.00 :   234edc: vfmadd231ss (%r10,%rax,4),%xmm0,%xmm8
+    0.00 :   234ee2: vfmadd231ss (%rdx,%rax,4),%xmm0,%xmm7
+    0.00 :   234ee8: cmp    %ebx,%edi
+    0.00 :   234eea: jle    234fc9 <host_rows+0x1a69>
+    0.00 :   234ef0: movslq %ebx,%rbx
+    0.00 :   234ef3: movzbl 0x0(%r13,%rbx,1),%ebx
+    0.00 :   234ef9: vmulss (%r11,%rbx,4),%xmm9,%xmm0
+    0.00 :   234eff: lea    0x2(%rcx),%ebx
+    0.00 :   234f02: vfmadd231ss 0x4(%r10,%rax,4),%xmm0,%xmm8
+    0.00 :   234f09: vfmadd231ss 0x4(%rdx,%rax,4),%xmm0,%xmm7
+    0.00 :   234f10: cmp    %ebx,%edi
+    0.00 :   234f12: jle    234fc9 <host_rows+0x1a69>
+    0.00 :   234f18: movslq %ebx,%rbx
+    0.00 :   234f1b: movzbl 0x0(%r13,%rbx,1),%ebx
+    0.00 :   234f21: vmulss (%r11,%rbx,4),%xmm9,%xmm0
+    0.00 :   234f27: lea    0x3(%rcx),%ebx
+    0.00 :   234f2a: vfmadd231ss 0x8(%r10,%rax,4),%xmm0,%xmm8
+    0.00 :   234f31: vfmadd231ss 0x8(%rdx,%rax,4),%xmm0,%xmm7
+    0.00 :   234f38: cmp    %ebx,%edi
+    0.00 :   234f3a: jle    234fc9 <host_rows+0x1a69>
+    0.00 :   234f40: movslq %ebx,%rbx
+    0.00 :   234f43: movzbl 0x0(%r13,%rbx,1),%ebx
+    0.00 :   234f49: vmulss (%r11,%rbx,4),%xmm9,%xmm0
+    0.00 :   234f4f: lea    0x4(%rcx),%ebx
+    0.00 :   234f52: vfmadd231ss 0xc(%r10,%rax,4),%xmm0,%xmm8
+    0.00 :   234f59: vfmadd231ss 0xc(%rdx,%rax,4),%xmm0,%xmm7
+    0.00 :   234f60: cmp    %ebx,%edi
+    0.00 :   234f62: jle    234fc9 <host_rows+0x1a69>
+    0.00 :   234f64: movslq %ebx,%rbx
+    0.00 :   234f67: movzbl 0x0(%r13,%rbx,1),%ebx
+    0.00 :   234f6d: vmulss (%r11,%rbx,4),%xmm9,%xmm0
+    0.00 :   234f73: lea    0x5(%rcx),%ebx
+    0.00 :   234f76: vfmadd231ss 0x10(%r10,%rax,4),%xmm0,%xmm8
+    0.00 :   234f7d: vfmadd231ss 0x10(%rdx,%rax,4),%xmm0,%xmm7
+    0.00 :   234f84: cmp    %ebx,%edi
+    0.00 :   234f86: jle    234fc9 <host_rows+0x1a69>
+    0.00 :   234f88: movslq %ebx,%rbx
+    0.00 :   234f8b: add    $0x6,%ecx
+    0.00 :   234f8e: movzbl 0x0(%r13,%rbx,1),%ebx
+    0.00 :   234f94: vmulss (%r11,%rbx,4),%xmm9,%xmm0
+    0.00 :   234f9a: vfmadd231ss 0x14(%r10,%rax,4),%xmm0,%xmm8
+    0.00 :   234fa1: vfmadd231ss 0x14(%rdx,%rax,4),%xmm0,%xmm7
+    0.00 :   234fa8: cmp    %ecx,%edi
+    0.00 :   234faa: jle    234fc9 <host_rows+0x1a69>
+    0.00 :   234fac: movslq %ecx,%rcx
+    0.00 :   234faf: movzbl 0x0(%r13,%rcx,1),%ecx
+    0.00 :   234fb5: vmulss (%r11,%rcx,4),%xmm9,%xmm9
+    0.00 :   234fbb: vfmadd231ss 0x18(%r10,%rax,4),%xmm9,%xmm8
+    0.00 :   234fc2: vfmadd231ss 0x18(%rdx,%rax,4),%xmm9,%xmm7
+    0.00 :   234fc9: add    %r15,%r9
+    0.00 :   234fcc: cmp    %r9d,%r12d
+    0.00 :   234fcf: jg     234db0 <host_rows+0x1850>
+    0.00 :   234fd5: mov    -0x2090(%rbp),%rcx
+    0.00 :   234fdc: vextractf128 $0x1,%ymm11,%xmm0
+    0.00 :   234fe2: mov    -0x2060(%rbp),%rax
+    0.00 :   234fe9: vaddps %xmm11,%xmm0,%xmm0
+    0.00 :   234fee: vmovhlps %xmm0,%xmm0,%xmm1
+    0.00 :   234ff2: vaddps %xmm1,%xmm0,%xmm0
+    0.00 :   234ff6: vmovshdup %xmm0,%xmm1
+    0.00 :   234ffa: vaddss %xmm1,%xmm0,%xmm0
+    0.00 :   234ffe: vaddss %xmm8,%xmm0,%xmm0
+    0.00 :   235003: vmovss %xmm0,(%rax)
+    0.00 :   235007: vextractf128 $0x1,%ymm10,%xmm0
+    0.00 :   23500d: vaddps %xmm10,%xmm0,%xmm0
+    0.00 :   235012: vmovhlps %xmm0,%xmm0,%xmm1
+    0.00 :   235016: vaddps %xmm1,%xmm0,%xmm0
+    0.00 :   23501a: vmovshdup %xmm0,%xmm1
+    0.00 :   23501e: vaddss %xmm1,%xmm0,%xmm0
+    0.00 :   235022: vaddss %xmm7,%xmm0,%xmm0
+    0.00 :   235026: vmovss %xmm0,(%rax,%rcx,4)
+    0.00 :   23502b: vzeroupper
+    0.00 :   23502e: jmp    23386c <host_rows+0x30c>
+    0.00 :   235033: test   %r12d,%r12d
+    0.00 :   235036: jle    236e6d <host_rows+0x390d>
+    0.00 :   23503c: movslq %esi,%rax
+    0.00 :   23503f: mov    %rcx,-0x2098(%rbp)
+    0.00 :   235046: vxorps %xmm0,%xmm0,%xmm0
+    0.00 :   23504a: mov    %esi,%ebx
+    0.00 :   23504c: vxorps %xmm9,%xmm9,%xmm9
+    0.00 :   235051: vmovaps %ymm0,%ymm15
+    0.00 :   235055: vmovaps %ymm0,%ymm14
+    0.00 :   235059: xor    %r14d,%r14d
+    0.00 :   23505c: mov    %rax,-0x2070(%rbp)
+    0.00 :   235063: vmovaps %xmm9,%xmm10
+    0.00 :   235068: vmovaps %xmm9,%xmm11
+    0.00 :   23506d: vmovaps %xmm9,%xmm12
+    0.00 :   235072: mov    $0xbf80bf80,%eax
+    0.00 :   235077: vpxor  %xmm7,%xmm7,%xmm7
+    0.00 :   23507b: vmovaps %ymm0,%ymm1
+    0.00 :   23507f: vbroadcastss 0x20fa4(%rip),%ymm8        # 25602c <_IO_stdin_used+0x2c>
+    0.00 :   235088: vmovd  %eax,%xmm6
+    0.00 :   23508c: vmovaps %ymm0,-0x2090(%rbp)
+    0.00 :   235094: vpbroadcastd %xmm6,%xmm6
+    0.00 :   235099: nopl   0x0(%rax)
+    0.00 :   2350a0: lea    (%rbx,%r14,1),%r9d
+    0.00 :   2350a4: mov    %r14d,%eax
+    0.00 :   2350a7: mov    %r14d,%r11d
+    0.00 :   2350aa: mov    %r14d,%ecx
+    0.00 :   2350ad: cmp    %r12d,%r9d
+    0.00 :   2350b0: mov    -0x2058(%rbp),%rsi
+    0.00 :   2350b7: cmovg  %r12d,%r9d
+    0.00 :   2350bb: cltd
+    0.00 :   2350bc: idiv   %ebx
+    0.00 :   2350be: cltq
+    0.00 :   2350c0: vmovss (%rsi,%rax,4),%xmm0
+    0.00 :   2350c5: lea    0xf(%r14),%eax
+    0.00 :   2350c9: cmp    %eax,%r9d
+    0.00 :   2350cc: jle    235820 <host_rows+0x22c0>
+    0.00 :   2350d2: mov    $0xfffffff0,%r15d
+    0.00 :   2350d8: vxorps %xmm3,%xmm3,%xmm3
+    0.00 :   2350dc: mov    (%r8),%rdi
+    0.00 :   2350df: mov    0x8(%r8),%rsi
+    0.00 :   2350e3: sub    %r14d,%r15d
+    0.00 :   2350e6: mov    0x10(%r8),%rcx
+    0.00 :   2350ea: mov    0x18(%r8),%rdx
+    0.00 :   2350ee: vmovaps %ymm3,%ymm4
+    0.00 :   2350f2: add    %r9d,%r15d
+    0.00 :   2350f5: vmovaps %ymm3,%ymm5
+    0.00 :   2350f9: vmovaps %ymm3,%ymm13
+    0.00 :   2350fd: vmovss %xmm9,-0x2068(%rbp)
+    0.00 :   235105: mov    %r15d,%eax
+    0.00 :   235108: shr    $0x4,%eax
+    0.00 :   23510b: shl    $0x4,%rax
+    0.00 :   23510f: lea    0x10(%r14,%rax,1),%r10
+    0.00 :   235114: mov    %r14,%rax
+    0.00 :   235117: nopw   0x0(%rax,%rax,1)
+    0.00 :   235120: vmovdqu 0x0(%r13,%rax,1),%xmm2
+    0.00 :   235127: vpunpcklbw %xmm2,%xmm7,%xmm9
+    0.00 :   23512b: vpunpckhbw %xmm2,%xmm7,%xmm2
+    0.00 :   23512f: vpsraw $0x1,%xmm2,%xmm2
+    0.00 :   235134: vpsraw $0x1,%xmm9,%xmm9
+    0.00 :   23513a: vpand  %xmm6,%xmm2,%xmm2
+    0.00 :   23513e: vpand  %xmm6,%xmm9,%xmm9
+    0.00 :   235142: vcvtph2ps %xmm2,%ymm2
+    0.00 :   235147: vmulps %ymm8,%ymm2,%ymm2
+    0.00 :   23514c: vcvtph2ps %xmm9,%ymm9
+    0.00 :   235151: vmulps %ymm8,%ymm9,%ymm9
+    0.00 :   235156: vfmadd231ps (%rdi,%rax,4),%ymm9,%ymm13
+    0.00 :   23515c: vfmadd231ps (%rsi,%rax,4),%ymm9,%ymm5
+    0.00 :   235162: vfmadd231ps (%rcx,%rax,4),%ymm9,%ymm4
+    0.00 :   235168: vfmadd132ps (%rdx,%rax,4),%ymm3,%ymm9
+    0.00 :   23516e: vfmadd231ps 0x20(%rdi,%rax,4),%ymm2,%ymm13
+    0.00 :   235175: vfmadd231ps 0x20(%rsi,%rax,4),%ymm2,%ymm5
+    0.00 :   23517c: vfmadd231ps 0x20(%rcx,%rax,4),%ymm2,%ymm4
+    0.00 :   235183: vmovaps %ymm2,%ymm3
+    0.00 :   235187: vfmadd132ps 0x20(%rdx,%rax,4),%ymm9,%ymm3
+    0.00 :   23518e: add    $0x10,%rax
+    0.00 :   235192: cmp    %rax,%r10
+    0.00 :   235195: jne    235120 <host_rows+0x1bc0>
+    0.00 :   235197: and    $0xfffffff0,%r15d
+    0.00 :   23519b: vmovss -0x2068(%rbp),%xmm9
+    0.00 :   2351a3: lea    0x10(%r11,%r15,1),%ecx
+    0.00 :   2351a8: lea    0x7(%rcx),%eax
+    0.00 :   2351ab: cmp    %eax,%r9d
+    0.00 :   2351ae: jle    2351fb <host_rows+0x1c9b>
+    0.00 :   2351b0: movslq %ecx,%rax
+    0.00 :   2351b3: mov    (%r8),%rdx
+    0.00 :   2351b6: add    $0x8,%ecx
+    0.00 :   2351b9: vmovq  0x0(%r13,%rax,1),%xmm2
+    0.00 :   2351c0: vpunpcklbw %xmm2,%xmm7,%xmm2
+    0.00 :   2351c4: vpsraw $0x1,%xmm2,%xmm2
+    0.00 :   2351c9: vpand  %xmm6,%xmm2,%xmm2
+    0.00 :   2351cd: vcvtph2ps %xmm2,%ymm2
+    0.00 :   2351d2: vmulps %ymm8,%ymm2,%ymm2
+    0.00 :   2351d7: vfmadd231ps (%rdx,%rax,4),%ymm2,%ymm13
+    0.00 :   2351dd: mov    0x8(%r8),%rdx
+    0.00 :   2351e1: vfmadd231ps (%rdx,%rax,4),%ymm2,%ymm5
+    0.00 :   2351e7: mov    0x10(%r8),%rdx
+    0.00 :   2351eb: vfmadd231ps (%rdx,%rax,4),%ymm2,%ymm4
+    0.00 :   2351f1: mov    0x18(%r8),%rdx
+    0.00 :   2351f5: vfmadd231ps (%rdx,%rax,4),%ymm2,%ymm3
+    0.00 :   2351fb: vbroadcastss %xmm0,%ymm2
+    0.00 :   235200: vfmadd213ps -0x2090(%rbp),%ymm2,%ymm3
+    0.00 :   235209: vfmadd231ps %ymm2,%ymm13,%ymm1
+    0.00 :   23520e: vfmadd231ps %ymm2,%ymm5,%ymm14
+    0.00 :   235213: vfmadd231ps %ymm2,%ymm4,%ymm15
+    0.00 :   235218: vmovaps %ymm3,-0x2090(%rbp)
+    0.00 :   235220: cmp    %ecx,%r9d
+    0.00 :   235223: jle    2353ad <host_rows+0x1e4d>
+    0.00 :   235229: movslq %ecx,%rax
+    0.00 :   23522c: mov    (%r8),%r10
+    0.00 :   23522f: mov    0x8(%r8),%rdi
+    0.00 :   235233: lea    0x7cc46(%rip),%r15        # 2b1e80 <fp8_e4m3>
+    0.00 :   23523a: movzbl 0x0(%r13,%rax,1),%r11d
+    0.00 :   235240: mov    0x10(%r8),%rsi
+    0.00 :   235244: mov    0x18(%r8),%rdx
+    0.00 :   235248: vmulss (%r15,%r11,4),%xmm0,%xmm2
+    0.00 :   23524e: lea    0x1(%rcx),%r11d
+    0.00 :   235252: vfmadd231ss (%r10,%rax,4),%xmm2,%xmm12
+    0.00 :   235258: vfmadd231ss (%rdi,%rax,4),%xmm2,%xmm11
+    0.00 :   23525e: vfmadd231ss (%rsi,%rax,4),%xmm2,%xmm10
+    0.00 :   235264: vfmadd231ss (%rdx,%rax,4),%xmm2,%xmm9
+    0.00 :   23526a: cmp    %r11d,%r9d
+    0.00 :   23526d: jle    2353ad <host_rows+0x1e4d>
+    0.00 :   235273: movslq %r11d,%r11
+    0.00 :   235276: movzbl 0x0(%r13,%r11,1),%r11d
+    0.00 :   23527c: vmulss (%r15,%r11,4),%xmm0,%xmm2
+    0.00 :   235282: lea    0x2(%rcx),%r11d
+    0.00 :   235286: vfmadd231ss 0x4(%r10,%rax,4),%xmm2,%xmm12
+    0.00 :   23528d: vfmadd231ss 0x4(%rdi,%rax,4),%xmm2,%xmm11
+    0.00 :   235294: vfmadd231ss 0x4(%rsi,%rax,4),%xmm2,%xmm10
+    0.00 :   23529b: vfmadd231ss 0x4(%rdx,%rax,4),%xmm2,%xmm9
+    0.00 :   2352a2: cmp    %r11d,%r9d
+    0.00 :   2352a5: jle    2353ad <host_rows+0x1e4d>
+    0.00 :   2352ab: movslq %r11d,%r11
+    0.00 :   2352ae: movzbl 0x0(%r13,%r11,1),%r11d
+    0.00 :   2352b4: vmulss (%r15,%r11,4),%xmm0,%xmm2
+    0.00 :   2352ba: lea    0x3(%rcx),%r11d
+    0.00 :   2352be: vfmadd231ss 0x8(%r10,%rax,4),%xmm2,%xmm12
+    0.00 :   2352c5: vfmadd231ss 0x8(%rdi,%rax,4),%xmm2,%xmm11
+    0.00 :   2352cc: vfmadd231ss 0x8(%rsi,%rax,4),%xmm2,%xmm10
+    0.00 :   2352d3: vfmadd231ss 0x8(%rdx,%rax,4),%xmm2,%xmm9
+    0.00 :   2352da: cmp    %r11d,%r9d
+    0.00 :   2352dd: jle    2353ad <host_rows+0x1e4d>
+    0.00 :   2352e3: movslq %r11d,%r11
+    0.00 :   2352e6: movzbl 0x0(%r13,%r11,1),%r11d
+    0.00 :   2352ec: vmulss (%r15,%r11,4),%xmm0,%xmm2
+    0.00 :   2352f2: lea    0x4(%rcx),%r11d
+    0.00 :   2352f6: vfmadd231ss 0xc(%r10,%rax,4),%xmm2,%xmm12
+    0.00 :   2352fd: vfmadd231ss 0xc(%rdi,%rax,4),%xmm2,%xmm11
+    0.00 :   235304: vfmadd231ss 0xc(%rsi,%rax,4),%xmm2,%xmm10
+    0.00 :   23530b: vfmadd231ss 0xc(%rdx,%rax,4),%xmm2,%xmm9
+    0.00 :   235312: cmp    %r11d,%r9d
+    0.00 :   235315: jle    2353ad <host_rows+0x1e4d>
+    0.00 :   23531b: movslq %r11d,%r11
+    0.00 :   23531e: movzbl 0x0(%r13,%r11,1),%r11d
+    0.00 :   235324: vmulss (%r15,%r11,4),%xmm0,%xmm2
+    0.00 :   23532a: lea    0x5(%rcx),%r11d
+    0.00 :   23532e: vfmadd231ss 0x10(%r10,%rax,4),%xmm2,%xmm12
+    0.00 :   235335: vfmadd231ss 0x10(%rdi,%rax,4),%xmm2,%xmm11
+    0.00 :   23533c: vfmadd231ss 0x10(%rsi,%rax,4),%xmm2,%xmm10
+    0.00 :   235343: vfmadd231ss 0x10(%rdx,%rax,4),%xmm2,%xmm9
+    0.00 :   23534a: cmp    %r11d,%r9d
+    0.00 :   23534d: jle    2353ad <host_rows+0x1e4d>
+    0.00 :   23534f: movslq %r11d,%r11
+    0.00 :   235352: add    $0x6,%ecx
+    0.00 :   235355: movzbl 0x0(%r13,%r11,1),%r11d
+    0.00 :   23535b: vmulss (%r15,%r11,4),%xmm0,%xmm2
+    0.00 :   235361: vfmadd231ss 0x14(%r10,%rax,4),%xmm2,%xmm12
+    0.00 :   235368: vfmadd231ss 0x14(%rdi,%rax,4),%xmm2,%xmm11
+    0.00 :   23536f: vfmadd231ss 0x14(%rsi,%rax,4),%xmm2,%xmm10
+    0.00 :   235376: vfmadd231ss 0x14(%rdx,%rax,4),%xmm2,%xmm9
+    0.00 :   23537d: cmp    %ecx,%r9d
+    0.00 :   235380: jle    2353ad <host_rows+0x1e4d>
+    0.00 :   235382: movslq %ecx,%rcx
+    0.00 :   235385: movzbl 0x0(%r13,%rcx,1),%ecx
+    0.00 :   23538b: vmulss (%r15,%rcx,4),%xmm0,%xmm2
+    0.00 :   235391: vfmadd231ss 0x18(%r10,%rax,4),%xmm2,%xmm12
+    0.00 :   235398: vfmadd231ss 0x18(%rdi,%rax,4),%xmm2,%xmm11
+    0.00 :   23539f: vfmadd231ss 0x18(%rsi,%rax,4),%xmm2,%xmm10
+    0.00 :   2353a6: vfmadd231ss 0x18(%rdx,%rax,4),%xmm2,%xmm9
+    0.00 :   2353ad: add    -0x2070(%rbp),%r14
+    0.00 :   2353b4: cmp    %r14d,%r12d
+    0.00 :   2353b7: jg     2350a0 <host_rows+0x1b40>
+    0.00 :   2353bd: mov    -0x2098(%rbp),%rcx
+    0.00 :   2353c4: vmovaps -0x2090(%rbp),%ymm0
+    0.00 :   2353cc: vmovaps %ymm1,%ymm13
+    0.00 :   2353d0: vextractf128 $0x1,%ymm13,%xmm1
+    0.00 :   2353d6: mov    -0x2060(%rbp),%rax
+    0.00 :   2353dd: lea    0x0(,%rcx,4),%rdx
+    0.00 :   2353e5: vaddps %xmm13,%xmm1,%xmm1
+    0.00 :   2353ea: vmovhlps %xmm1,%xmm1,%xmm2
+    0.00 :   2353ee: vaddps %xmm2,%xmm1,%xmm1
+    0.00 :   2353f2: vmovshdup %xmm1,%xmm2
+    0.00 :   2353f6: vaddss %xmm2,%xmm1,%xmm1
+    0.00 :   2353fa: vaddss %xmm12,%xmm1,%xmm1
+    0.00 :   2353ff: vmovss %xmm1,(%rax)
+    0.00 :   235403: vextractf128 $0x1,%ymm14,%xmm1
+    0.00 :   235409: vaddps %xmm14,%xmm1,%xmm1
+    0.00 :   23540e: vmovhlps %xmm1,%xmm1,%xmm2
+    0.00 :   235412: vaddps %xmm2,%xmm1,%xmm1
+    0.00 :   235416: vmovshdup %xmm1,%xmm2
+    0.00 :   23541a: vaddss %xmm2,%xmm1,%xmm1
+    0.00 :   23541e: vaddss %xmm11,%xmm1,%xmm1
+    0.00 :   235423: vmovss %xmm1,(%rax,%rdx,1)
+    0.00 :   235428: vextractf128 $0x1,%ymm15,%xmm1
+    0.00 :   23542e: lea    (%rax,%rdx,2),%rax
+    0.00 :   235432: vaddps %xmm15,%xmm1,%xmm1
+    0.00 :   235437: vmovhlps %xmm1,%xmm1,%xmm2
+    0.00 :   23543b: vaddps %xmm2,%xmm1,%xmm1
+    0.00 :   23543f: vmovshdup %xmm1,%xmm2
+    0.00 :   235443: vaddss %xmm2,%xmm1,%xmm1
+    0.00 :   235447: vaddss %xmm10,%xmm1,%xmm1
+    0.00 :   23544c: vmovss %xmm1,(%rax)
+    0.00 :   235450: vextractf128 $0x1,%ymm0,%xmm1
+    0.00 :   235456: vaddps %xmm0,%xmm1,%xmm0
+    0.00 :   23545a: vmovhlps %xmm0,%xmm0,%xmm1
+    0.00 :   23545e: vaddps %xmm1,%xmm0,%xmm0
+    0.00 :   235462: vmovshdup %xmm0,%xmm1
+    0.00 :   235466: vaddss %xmm1,%xmm0,%xmm0
+    0.00 :   23546a: vaddss %xmm9,%xmm0,%xmm0
+    0.00 :   23546f: vmovss %xmm0,(%rax,%rcx,4)
+    0.00 :   235474: vzeroupper
+    0.00 :   235477: jmp    23386c <host_rows+0x30c>
+    0.00 :   23547c: test   %r12d,%r12d
+    0.00 :   23547f: jle    236e3c <host_rows+0x38dc>
+    0.00 :   235485: movslq %esi,%rax
+    0.00 :   235488: vxorps %xmm8,%xmm8,%xmm8
+    0.00 :   23548d: vxorps %xmm12,%xmm12,%xmm12
+    0.00 :   235492: xor    %r10d,%r10d
+    0.00 :   235495: mov    %rax,-0x2090(%rbp)
+    0.00 :   23549c: vmovaps %xmm8,%xmm9
+    0.00 :   2354a1: vmovaps %xmm8,%xmm10
+    0.00 :   2354a6: vmovaps %ymm12,%ymm13
+    0.00 :   2354ab: mov    $0xbf80bf80,%eax
+    0.00 :   2354b0: mov    %rcx,-0x2068(%rbp)
+    0.00 :   2354b7: vmovaps %ymm12,%ymm14
+    0.00 :   2354bc: vbroadcastss 0x20b67(%rip),%ymm7        # 25602c <_IO_stdin_used+0x2c>
+    0.00 :   2354c5: vmovd  %eax,%xmm5
+    0.00 :   2354c9: vpxor  %xmm6,%xmm6,%xmm6
+    0.00 :   2354cd: lea    0x7c9ac(%rip),%rbx        # 2b1e80 <fp8_e4m3>
+    0.00 :   2354d4: vpbroadcastd %xmm5,%xmm5
+    0.00 :   2354d9: nopl   0x0(%rax)
+    0.00 :   2354e0: lea    (%rsi,%r10,1),%r9d
+    0.00 :   2354e4: mov    %r10d,%eax
+    0.00 :   2354e7: mov    %r10d,%r11d
+    0.00 :   2354ea: mov    %r10d,%ecx
+    0.00 :   2354ed: cmp    %r12d,%r9d
+    0.00 :   2354f0: mov    -0x2058(%rbp),%rdi
+    0.00 :   2354f7: cmovg  %r12d,%r9d
+    0.00 :   2354fb: cltd
+    0.00 :   2354fc: idiv   %esi
+    0.00 :   2354fe: cltq
+    0.00 :   235500: vmovss (%rdi,%rax,4),%xmm11
+    0.00 :   235505: lea    0xf(%r10),%eax
+    0.00 :   235509: cmp    %eax,%r9d
+    0.00 :   23550c: jle    2357f9 <host_rows+0x2299>
+    0.00 :   235512: mov    $0xfffffff0,%r15d
+    0.00 :   235518: vxorps %xmm2,%xmm2,%xmm2
+    0.00 :   23551c: mov    (%r8),%rdi
+    0.00 :   23551f: mov    0x8(%r8),%rcx
+    0.00 :   235523: sub    %r10d,%r15d
+    0.00 :   235526: mov    0x10(%r8),%rdx
+    0.00 :   23552a: vmovaps %ymm2,%ymm3
+    0.00 :   23552e: vmovaps %ymm2,%ymm4
+    0.00 :   235532: add    %r9d,%r15d
+    0.00 :   235535: mov    %r15d,%eax
+    0.00 :   235538: shr    $0x4,%eax
+    0.00 :   23553b: shl    $0x4,%rax
+    0.00 :   23553f: lea    0x10(%r10,%rax,1),%r14
+    0.00 :   235544: mov    %r10,%rax
+    0.00 :   235547: nopw   0x0(%rax,%rax,1)
+    0.00 :   235550: vmovdqu 0x0(%r13,%rax,1),%xmm1
+    0.00 :   235557: vpunpcklbw %xmm1,%xmm6,%xmm0
+    0.00 :   23555b: vpunpckhbw %xmm1,%xmm6,%xmm1
+    0.00 :   23555f: vpsraw $0x1,%xmm0,%xmm0
+    0.00 :   235564: vpsraw $0x1,%xmm1,%xmm1
+    0.00 :   235569: vpand  %xmm5,%xmm0,%xmm0
+    0.00 :   23556d: vpand  %xmm5,%xmm1,%xmm1
+    0.00 :   235571: vcvtph2ps %xmm0,%ymm0
+    0.00 :   235576: vmulps %ymm7,%ymm0,%ymm0
+    0.00 :   23557a: vcvtph2ps %xmm1,%ymm1
+    0.00 :   23557f: vfmadd231ps (%rdi,%rax,4),%ymm0,%ymm4
+    0.00 :   235585: vfmadd231ps (%rcx,%rax,4),%ymm0,%ymm3
+    0.00 :   23558b: vmulps %ymm7,%ymm1,%ymm1
+    0.00 :   23558f: vfmadd231ps (%rdx,%rax,4),%ymm0,%ymm2
+    0.00 :   235595: vfmadd231ps 0x20(%rdi,%rax,4),%ymm1,%ymm4
+    0.00 :   23559c: vfmadd231ps 0x20(%rcx,%rax,4),%ymm1,%ymm3
+    0.00 :   2355a3: vfmadd231ps 0x20(%rdx,%rax,4),%ymm1,%ymm2
+    0.00 :   2355aa: add    $0x10,%rax
+    0.00 :   2355ae: cmp    %rax,%r14
+    0.00 :   2355b1: jne    235550 <host_rows+0x1ff0>
+    0.00 :   2355b3: and    $0xfffffff0,%r15d
+    0.00 :   2355b7: lea    0x10(%r11,%r15,1),%ecx
+    0.00 :   2355bc: lea    0x7(%rcx),%eax
+    0.00 :   2355bf: cmp    %eax,%r9d
+    0.00 :   2355c2: jle    235604 <host_rows+0x20a4>
+    0.00 :   2355c4: movslq %ecx,%rax
+    0.00 :   2355c7: mov    (%r8),%rdx
+    0.00 :   2355ca: add    $0x8,%ecx
+    0.00 :   2355cd: vmovq  0x0(%r13,%rax,1),%xmm0
+    0.00 :   2355d4: vpunpcklbw %xmm0,%xmm6,%xmm0
+    0.00 :   2355d8: vpsraw $0x1,%xmm0,%xmm0
+    0.00 :   2355dd: vpand  %xmm5,%xmm0,%xmm0
+    0.00 :   2355e1: vcvtph2ps %xmm0,%ymm0
+    0.00 :   2355e6: vmulps %ymm7,%ymm0,%ymm0
+    0.00 :   2355ea: vfmadd231ps (%rdx,%rax,4),%ymm0,%ymm4
+    0.00 :   2355f0: mov    0x8(%r8),%rdx
+    0.00 :   2355f4: vfmadd231ps (%rdx,%rax,4),%ymm0,%ymm3
+    0.00 :   2355fa: mov    0x10(%r8),%rdx
+    0.00 :   2355fe: vfmadd231ps (%rdx,%rax,4),%ymm0,%ymm2
+    0.00 :   235604: vbroadcastss %xmm11,%ymm0
+    0.00 :   235609: vfmadd231ps %ymm0,%ymm4,%ymm14
+    0.00 :   23560e: vfmadd231ps %ymm0,%ymm3,%ymm13
+    0.00 :   235613: vfmadd231ps %ymm0,%ymm2,%ymm12
+    0.00 :   235618: cmp    %ecx,%r9d
+    0.00 :   23561b: jle    235765 <host_rows+0x2205>
+    0.00 :   235621: movslq %ecx,%rax
+    0.00 :   235624: mov    (%r8),%r11
+    0.00 :   235627: mov    0x8(%r8),%rdi
+    0.00 :   23562b: movzbl 0x0(%r13,%rax,1),%r14d
+    0.00 :   235631: mov    0x10(%r8),%rdx
+    0.00 :   235635: vmulss (%rbx,%r14,4),%xmm11,%xmm0
+    0.00 :   23563b: lea    0x1(%rcx),%r14d
+    0.00 :   23563f: vfmadd231ss (%r11,%rax,4),%xmm0,%xmm10
+    0.00 :   235645: vfmadd231ss (%rdi,%rax,4),%xmm0,%xmm9
+    0.00 :   23564b: vfmadd231ss (%rdx,%rax,4),%xmm0,%xmm8
+    0.00 :   235651: cmp    %r14d,%r9d
+    0.00 :   235654: jle    235765 <host_rows+0x2205>
+    0.00 :   23565a: movslq %r14d,%r14
+    0.00 :   23565d: movzbl 0x0(%r13,%r14,1),%r14d
+    0.00 :   235663: vmulss (%rbx,%r14,4),%xmm11,%xmm0
+    0.00 :   235669: lea    0x2(%rcx),%r14d
+    0.00 :   23566d: vfmadd231ss 0x4(%r11,%rax,4),%xmm0,%xmm10
+    0.00 :   235674: vfmadd231ss 0x4(%rdi,%rax,4),%xmm0,%xmm9
+    0.00 :   23567b: vfmadd231ss 0x4(%rdx,%rax,4),%xmm0,%xmm8
+    0.00 :   235682: cmp    %r14d,%r9d
+    0.00 :   235685: jle    235765 <host_rows+0x2205>
+    0.00 :   23568b: movslq %r14d,%r14
+    0.00 :   23568e: movzbl 0x0(%r13,%r14,1),%r14d
+    0.00 :   235694: vmulss (%rbx,%r14,4),%xmm11,%xmm0
+    0.00 :   23569a: lea    0x3(%rcx),%r14d
+    0.00 :   23569e: vfmadd231ss 0x8(%r11,%rax,4),%xmm0,%xmm10
+    0.00 :   2356a5: vfmadd231ss 0x8(%rdi,%rax,4),%xmm0,%xmm9
+    0.00 :   2356ac: vfmadd231ss 0x8(%rdx,%rax,4),%xmm0,%xmm8
+    0.00 :   2356b3: cmp    %r14d,%r9d
+    0.00 :   2356b6: jle    235765 <host_rows+0x2205>
+    0.00 :   2356bc: movslq %r14d,%r14
+    0.00 :   2356bf: movzbl 0x0(%r13,%r14,1),%r14d
+    0.00 :   2356c5: vmulss (%rbx,%r14,4),%xmm11,%xmm0
+    0.00 :   2356cb: lea    0x4(%rcx),%r14d
+    0.00 :   2356cf: vfmadd231ss 0xc(%r11,%rax,4),%xmm0,%xmm10
+    0.00 :   2356d6: vfmadd231ss 0xc(%rdi,%rax,4),%xmm0,%xmm9
+    0.00 :   2356dd: vfmadd231ss 0xc(%rdx,%rax,4),%xmm0,%xmm8
+    0.00 :   2356e4: cmp    %r14d,%r9d
+    0.00 :   2356e7: jle    235765 <host_rows+0x2205>
+    0.00 :   2356e9: movslq %r14d,%r14
+    0.00 :   2356ec: movzbl 0x0(%r13,%r14,1),%r14d
+    0.00 :   2356f2: vmulss (%rbx,%r14,4),%xmm11,%xmm0
+    0.00 :   2356f8: lea    0x5(%rcx),%r14d
+    0.00 :   2356fc: vfmadd231ss 0x10(%r11,%rax,4),%xmm0,%xmm10
+    0.00 :   235703: vfmadd231ss 0x10(%rdi,%rax,4),%xmm0,%xmm9
+    0.00 :   23570a: vfmadd231ss 0x10(%rdx,%rax,4),%xmm0,%xmm8
+    0.00 :   235711: cmp    %r14d,%r9d
+    0.00 :   235714: jle    235765 <host_rows+0x2205>
+    0.00 :   235716: movslq %r14d,%r14
+    0.00 :   235719: add    $0x6,%ecx
+    0.00 :   23571c: movzbl 0x0(%r13,%r14,1),%r14d
+    0.00 :   235722: vmulss (%rbx,%r14,4),%xmm11,%xmm0
+    0.00 :   235728: vfmadd231ss 0x14(%r11,%rax,4),%xmm0,%xmm10
+    0.00 :   23572f: vfmadd231ss 0x14(%rdi,%rax,4),%xmm0,%xmm9
+    0.00 :   235736: vfmadd231ss 0x14(%rdx,%rax,4),%xmm0,%xmm8
+    0.00 :   23573d: cmp    %ecx,%r9d
+    0.00 :   235740: jle    235765 <host_rows+0x2205>
+    0.00 :   235742: movslq %ecx,%rcx
+    0.00 :   235745: movzbl 0x0(%r13,%rcx,1),%ecx
+    0.00 :   23574b: vmulss (%rbx,%rcx,4),%xmm11,%xmm11
+    0.00 :   235750: vfmadd231ss 0x18(%r11,%rax,4),%xmm11,%xmm10
+    0.00 :   235757: vfmadd231ss 0x18(%rdi,%rax,4),%xmm11,%xmm9
+    0.00 :   23575e: vfmadd231ss 0x18(%rdx,%rax,4),%xmm11,%xmm8
+    0.00 :   235765: add    -0x2090(%rbp),%r10
+    0.00 :   23576c: cmp    %r10d,%r12d
+    0.00 :   23576f: jg     2354e0 <host_rows+0x1f80>
+    0.00 :   235775: mov    -0x2068(%rbp),%rcx
+    0.00 :   23577c: vextractf128 $0x1,%ymm14,%xmm0
+    0.00 :   235782: mov    -0x2060(%rbp),%rax
+    0.00 :   235789: vaddps %xmm14,%xmm0,%xmm0
+    0.00 :   23578e: vmovhlps %xmm0,%xmm0,%xmm1
+    0.00 :   235792: vaddps %xmm1,%xmm0,%xmm0
+    0.00 :   235796: vmovshdup %xmm0,%xmm1
+    0.00 :   23579a: vaddss %xmm1,%xmm0,%xmm0
+    0.00 :   23579e: vaddss %xmm10,%xmm0,%xmm0
+    0.00 :   2357a3: vmovss %xmm0,(%rax)
+    0.00 :   2357a7: vextractf128 $0x1,%ymm13,%xmm0
+    0.00 :   2357ad: vaddps %xmm13,%xmm0,%xmm0
+    0.00 :   2357b2: vmovhlps %xmm0,%xmm0,%xmm1
+    0.00 :   2357b6: vaddps %xmm1,%xmm0,%xmm0
+    0.00 :   2357ba: vmovshdup %xmm0,%xmm1
+    0.00 :   2357be: vaddss %xmm1,%xmm0,%xmm0
+    0.00 :   2357c2: vaddss %xmm9,%xmm0,%xmm0
+    0.00 :   2357c7: vmovss %xmm0,(%rax,%rcx,4)
+    0.00 :   2357cc: vextractf128 $0x1,%ymm12,%xmm0
+    0.00 :   2357d2: vaddps %xmm12,%xmm0,%xmm0
+    0.00 :   2357d7: vmovhlps %xmm0,%xmm0,%xmm1
+    0.00 :   2357db: vaddps %xmm1,%xmm0,%xmm0
+    0.00 :   2357df: vmovshdup %xmm0,%xmm1
+    0.00 :   2357e3: vaddss %xmm1,%xmm0,%xmm0
+    0.00 :   2357e7: vaddss %xmm8,%xmm0,%xmm0
+    0.00 :   2357ec: vmovss %xmm0,(%rax,%rcx,8)
+    0.00 :   2357f1: vzeroupper
+    0.00 :   2357f4: jmp    23386c <host_rows+0x30c>
+    0.00 :   2357f9: vxorps %xmm2,%xmm2,%xmm2
+    0.00 :   2357fd: vmovaps %ymm2,%ymm3
+    0.00 :   235801: vmovaps %ymm2,%ymm4
+    0.00 :   235805: jmp    2355bc <host_rows+0x205c>
+    0.00 :   23580a: vxorps %xmm2,%xmm2,%xmm2
+    0.00 :   23580e: vmovaps %ymm2,%ymm3
+    0.00 :   235812: jmp    234e6f <host_rows+0x190f>
+    0.00 :   235817: vxorps %xmm0,%xmm0,%xmm0
+    0.00 :   23581b: jmp    234491 <host_rows+0xf31>
+    0.00 :   235820: vxorps %xmm3,%xmm3,%xmm3
+    0.00 :   235824: vmovaps %ymm3,%ymm4
+    0.00 :   235828: vmovaps %ymm3,%ymm5
+    0.00 :   23582c: vmovaps %ymm3,%ymm13
+    0.00 :   235830: jmp    2351a8 <host_rows+0x1c48>
+    0.00 :   235835: mov    %rdx,%r14
+    0.00 :   235838: lea    0x7ca41(%rip),%r11        # 2b2280 <e2m1.4>
+    0.00 :   23583f: and    $0x7,%r14d
+    0.00 :   235843: and    $0x8,%edx
+    0.00 :   235846: vmovss (%r11,%r14,4),%xmm0
+    0.00 :   23584c: je     233b15 <host_rows+0x5b5>
+    0.00 :   235852: vxorps 0x37836(%rip),%xmm0,%xmm0        # 26d090 <CSWTCH.257+0xa530>
+    0.00 :   23585a: jmp    233b15 <host_rows+0x5b5>
+    0.00 :   23585f: movl   $0x0,0xc167f(%rip)        # 2f6ee8 <v.3.lto_priv.0>
+    0.00 :   235869: jmp    233a6f <host_rows+0x50f>
+    0.00 :   23586e: test   %edx,%edx
+    0.00 :   235870: jle    23386c <host_rows+0x30c>
+    0.00 :   235876: test   %r12d,%r12d
+    0.00 :   235879: lea    0x1f(%r12),%eax
+    0.00 :   23587e: mov    %rbx,%r15
+    0.00 :   235881: mov    -0x2060(%rbp),%rdi
+    0.00 :   235888: cmovns %r12d,%eax
+    0.00 :   23588c: mov    %r13,-0x2060(%rbp)
+    0.00 :   235893: xor    %r14d,%r14d
+    0.00 :   235896: xor    %r13d,%r13d
+    0.00 :   235899: mov    %r12d,-0x2098(%rbp)
+    0.00 :   2358a0: xor    %ebx,%ebx
+    0.00 :   2358a2: sar    $0x5,%eax
+    0.00 :   2358a5: cltq
+    0.00 :   2358a7: shl    $0x4,%rax
+    0.00 :   2358ab: mov    %rax,-0x2068(%rbp)
+    0.00 :   2358b2: movslq %r12d,%rax
+    0.00 :   2358b5: mov    %rdi,%r12
+    0.00 :   2358b8: shl    $0x2,%rax
+    0.00 :   2358bc: mov    %rax,-0x2058(%rbp)
+    0.00 :   2358c3: movslq -0x2090(%rbp),%rax
+    0.00 :   2358ca: shl    $0x4,%rax
+    0.00 :   2358ce: mov    %rax,-0x2070(%rbp)
+    0.00 :   2358d5: mov    (%r15),%rcx
+    0.00 :   2358d8: sub    %r14d,%edx
+    0.00 :   2358db: mov    $0x4,%esi
+    0.00 :   2358e0: sub    $0x8,%rsp
+    0.00 :   2358e4: mov    %r12,%rdi
+    0.00 :   2358e7: add    %rbx,%rcx
+    0.00 :   2358ea: cmp    %esi,%edx
+    0.00 :   2358ec: cmovg  %esi,%edx
+    0.00 :   2358ef: add    $0x4,%r14d
+    0.00 :   2358f3: push   %rdx
+    0.00 :   2358f4: mov    0x8(%r15),%r8
+    0.00 :   2358f8: mov    -0x2060(%rbp),%rdx
+    0.00 :   2358ff: mov    -0x2090(%rbp),%esi
+    0.00 :   235905: mov    -0x2098(%rbp),%r9d
+    0.00 :   23590c: add    %r13,%r8
+    0.00 :   23590f: call   35e10 <gq_dot_q8_0_rows.lto_priv.0.lto_priv.0>
+    0.00 :   235914: mov    0x18(%r15),%edx
+    0.00 :   235918: pop    %rcx
+    0.00 :   235919: add    -0x2068(%rbp),%r13
+    0.00 :   235920: add    -0x2058(%rbp),%rbx
+    0.00 :   235927: add    -0x2070(%rbp),%r12
+    0.00 :   23592e: pop    %rsi
+    0.00 :   23592f: cmp    %r14d,%edx
+    0.00 :   235932: jg     2358d5 <host_rows+0x2375>
+    0.00 :   235934: jmp    23386c <host_rows+0x30c>
+    0.00 :   235939: movl   $0x0,0xc15a5(%rip)        # 2f6ee8 <v.3.lto_priv.0>
+    0.00 :   235943: jmp    233667 <host_rows+0x107>
+    0.00 :   235948: lea    0x21276(%rip),%rdi        # 256bc5 <_IO_stdin_used+0xbc5>
+    0.00 :   23594f: mov    %r8,-0x20a0(%rbp)
+    0.00 :   235956: mov    %esi,-0x2098(%rbp)
+    0.00 :   23595c: mov    %rcx,-0x2070(%rbp)
+    0.00 :   235963: mov    %r10d,-0x2068(%rbp)
+    0.00 :   23596a: call   8e80 <getenv@plt>
+    0.00 :   23596f: mov    -0x2068(%rbp),%r10d
+    0.00 :   235976: vxorps %xmm4,%xmm4,%xmm4
+    0.00 :   23597a: mov    -0x2070(%rbp),%rcx
+    0.00 :   235981: test   %rax,%rax
+    0.00 :   235984: mov    -0x2098(%rbp),%esi
+    0.00 :   23598a: mov    -0x20a0(%rbp),%r8
+    0.00 :   235991: je     2359b0 <host_rows+0x2450>
+    0.00 :   235993: movzbl (%rax),%eax
+    0.00 :   235996: test   %al,%al
+    0.00 :   235998: setne  %dl
+    0.00 :   23599b: xor    %edi,%edi
+    0.00 :   23599d: cmp    $0x30,%al
+    0.00 :   23599f: setne  %dil
+    0.00 :   2359a3: and    %edx,%edi
+    0.00 :   2359a5: mov    %edi,0xc153d(%rip)        # 2f6ee8 <v.3.lto_priv.0>
+    0.00 :   2359ab: jmp    233ac9 <host_rows+0x569>
+    0.00 :   2359b0: movl   $0x0,0xc152e(%rip)        # 2f6ee8 <v.3.lto_priv.0>
+    0.00 :   2359ba: test   %r12d,%r12d
+    0.00 :   2359bd: jle    235a22 <host_rows+0x24c2>
+    0.00 :   2359bf: test   %esi,%esi
+    0.00 :   2359c1: jne    236da4 <host_rows+0x3844>
+    0.00 :   2359c7: mov    -0x2058(%rbp),%rdi
+    0.00 :   2359ce: movslq %r12d,%rsi
+    0.00 :   2359d1: xor    %edx,%edx
+    0.00 :   2359d3: lea    0x7c8a6(%rip),%r10        # 2b2280 <e2m1.4>
+    0.00 :   2359da: mov    %edx,%eax
+    0.00 :   2359dc: sar    $1,%eax
+    0.00 :   2359de: cltq
+    0.00 :   2359e0: movzbl 0x0(%r13,%rax,1),%eax
+    0.00 :   2359e6: mov    %eax,%r9d
+    0.00 :   2359e9: shr    $0x4,%al
+    0.00 :   2359ec: and    $0xf,%r9d
+    0.00 :   2359f0: test   $0x1,%dl
+    0.00 :   2359f3: cmove  %r9d,%eax
+    0.00 :   2359f7: mov    %rax,%r9
+    0.00 :   2359fa: and    $0x7,%r9d
+    0.00 :   2359fe: vmovss (%r10,%r9,4),%xmm0
+    0.00 :   235a04: test   $0x8,%al
+    0.00 :   235a06: je     235a10 <host_rows+0x24b0>
+    0.00 :   235a08: vxorps 0x37680(%rip),%xmm0,%xmm0        # 26d090 <CSWTCH.257+0xa530>
+    0.00 :   235a10: vmulss (%rdi),%xmm0,%xmm0
+    0.00 :   235a14: vmovss %xmm0,(%rcx,%rdx,4)
+    0.00 :   235a19: add    $0x1,%rdx
+    0.00 :   235a1d: cmp    %rdx,%rsi
+    0.00 :   235a20: jne    2359da <host_rows+0x247a>
+    0.00 :   235a22: movslq 0x18(%rbx),%rax
+    0.00 :   235a26: test   %eax,%eax
+    0.00 :   235a28: jle    23386c <host_rows+0x30c>
+    0.00 :   235a2e: movslq -0x2090(%rbp),%r10
+    0.00 :   235a35: mov    %r12d,%esi
+    0.00 :   235a38: lea    (%r8,%rax,8),%r11
+    0.00 :   235a3c: lea    -0x1(%r12),%ebx
+    0.00 :   235a41: shr    $0x3,%esi
+    0.00 :   235a44: mov    -0x2060(%rbp),%rdi
+    0.00 :   235a4b: shl    $0x2,%r10
+    0.00 :   235a4f: shl    $0x5,%rsi
+    0.00 :   235a53: test   %r12d,%r12d
+    0.00 :   235a56: jle    235b73 <host_rows+0x2613>
+    0.00 :   235a5c: mov    (%r8),%rdx
+    0.00 :   235a5f: cmp    $0x6,%ebx
+    0.00 :   235a62: jbe    235ba0 <host_rows+0x2640>
+    0.00 :   235a68: xor    %eax,%eax
+    0.00 :   235a6a: vxorps %xmm2,%xmm2,%xmm2
+    0.00 :   235a6e: xchg   %ax,%ax
+    0.00 :   235a70: vmovups (%rcx,%rax,1),%ymm0
+    0.00 :   235a75: vmulps (%rdx,%rax,1),%ymm0,%ymm0
+    0.00 :   235a7a: add    $0x20,%rax
+    0.00 :   235a7e: vaddss %xmm2,%xmm0,%xmm2
+    0.00 :   235a82: vshufps $0x55,%xmm0,%xmm0,%xmm3
+    0.00 :   235a87: vshufps $0xff,%xmm0,%xmm0,%xmm1
+    0.00 :   235a8c: vaddss %xmm2,%xmm3,%xmm3
+    0.00 :   235a90: vunpckhps %xmm0,%xmm0,%xmm2
+    0.00 :   235a94: vextractf128 $0x1,%ymm0,%xmm0
+    0.00 :   235a9a: vaddss %xmm3,%xmm2,%xmm2
+    0.00 :   235a9e: vaddss %xmm2,%xmm1,%xmm1
+    0.00 :   235aa2: vaddss %xmm1,%xmm0,%xmm2
+    0.00 :   235aa6: vshufps $0x55,%xmm0,%xmm0,%xmm1
+    0.00 :   235aab: vaddss %xmm2,%xmm1,%xmm1
+    0.00 :   235aaf: vunpckhps %xmm0,%xmm0,%xmm2
+    0.00 :   235ab3: vshufps $0xff,%xmm0,%xmm0,%xmm0
+    0.00 :   235ab8: vaddss %xmm1,%xmm2,%xmm2
+    0.00 :   235abc: vaddss %xmm0,%xmm2,%xmm2
+    0.00 :   235ac0: cmp    %rsi,%rax
+    0.00 :   235ac3: jne    235a70 <host_rows+0x2510>
+    0.00 :   235ac5: mov    %r12d,%eax
+    0.00 :   235ac8: and    $0xfffffff8,%eax
+    0.00 :   235acb: mov    %eax,%r9d
+    0.00 :   235ace: cmp    %r12d,%eax
+    0.00 :   235ad1: je     235b5a <host_rows+0x25fa>
+    0.00 :   235ad7: mov    %r12d,%r13d
+    0.00 :   235ada: sub    %r9d,%r13d
+    0.00 :   235add: lea    -0x1(%r13),%r14d
+    0.00 :   235ae1: cmp    $0x2,%r14d
+    0.00 :   235ae5: jbe    235b1e <host_rows+0x25be>
+    0.00 :   235ae7: vmovups (%rcx,%r9,4),%xmm0
+    0.00 :   235aed: vmulps (%rdx,%r9,4),%xmm0,%xmm0
+    0.00 :   235af3: vaddss %xmm2,%xmm0,%xmm2
+    0.00 :   235af7: vshufps $0x55,%xmm0,%xmm0,%xmm1
+    0.00 :   235afc: vaddss %xmm2,%xmm1,%xmm1
+    0.00 :   235b00: vunpckhps %xmm0,%xmm0,%xmm2
+    0.00 :   235b04: vshufps $0xff,%xmm0,%xmm0,%xmm0
+    0.00 :   235b09: vaddss %xmm1,%xmm2,%xmm2
+    0.00 :   235b0d: vaddss %xmm0,%xmm2,%xmm2
+    0.00 :   235b11: test   $0x3,%r13b
+    0.00 :   235b15: je     235b5a <host_rows+0x25fa>
+    0.00 :   235b17: and    $0xfffffffc,%r13d
+    0.00 :   235b1b: add    %r13d,%eax
+    0.00 :   235b1e: movslq %eax,%r9
+    0.00 :   235b21: lea    0x1(%rax),%r13d
+    0.00 :   235b25: vmovss (%rdx,%r9,4),%xmm7
+    0.00 :   235b2b: vfmadd231ss (%rcx,%r9,4),%xmm7,%xmm2
+    0.00 :   235b31: cmp    %r13d,%r12d
+    0.00 :   235b34: jle    235b5a <host_rows+0x25fa>
+    0.00 :   235b36: add    $0x2,%eax
+    0.00 :   235b39: vmovss 0x4(%rdx,%r9,4),%xmm7
+    0.00 :   235b40: vfmadd231ss 0x4(%rcx,%r9,4),%xmm7,%xmm2
+    0.00 :   235b47: cmp    %eax,%r12d
+    0.00 :   235b4a: jle    235b5a <host_rows+0x25fa>
+    0.00 :   235b4c: vmovss 0x8(%rdx,%r9,4),%xmm7
+    0.00 :   235b53: vfmadd231ss 0x8(%rcx,%r9,4),%xmm7,%xmm2
+    0.00 :   235b5a: add    $0x8,%r8
+    0.00 :   235b5e: vmovss %xmm2,(%rdi)
+    0.00 :   235b62: add    %r10,%rdi
+    0.00 :   235b65: cmp    %r8,%r11
+    0.00 :   235b68: jne    235a5c <host_rows+0x24fc>
+    0.00 :   235b6e: jmp    233869 <host_rows+0x309>
+    0.00 :   235b73: lea    0x8(%r8),%rax
+    0.00 :   235b77: movl   $0x0,(%rdi)
+    0.00 :   235b7d: cmp    %r11,%rax
+    0.00 :   235b80: je     23386c <host_rows+0x30c>
+    0.00 :   235b86: add    $0x10,%r8
+    0.00 :   235b8a: movl   $0x0,(%rdi,%r10,1)
+    0.00 :   235b92: lea    (%rdi,%r10,2),%rdi
+    0.00 :   235b96: cmp    %r8,%r11
+    0.00 :   235b99: jne    235b73 <host_rows+0x2613>
+    0.00 :   235b9b: jmp    23386c <host_rows+0x30c>
+    0.00 :   235ba0: xor    %r9d,%r9d
+    0.00 :   235ba3: vxorps %xmm2,%xmm2,%xmm2
+    0.00 :   235ba7: xor    %eax,%eax
+    0.00 :   235ba9: jmp    235ad7 <host_rows+0x2577>
+    0.00 :   235bae: vxorps %xmm0,%xmm0,%xmm0
+    0.00 :   235bb2: jmp    234328 <host_rows+0xdc8>
+    0.00 :   235bb7: vxorps %xmm2,%xmm2,%xmm2
+    0.00 :   235bbb: jmp    233dfc <host_rows+0x89c>
+    0.01 :   235bc0: shl    $0x2,%rax
+    0.00 :   235bc4: mov    %rdi,-0x2068(%rbp)
+    0.01 :   235bcb: vpcmpeqd %ymm4,%ymm4,%ymm4
+    0.00 :   235bcf: xor    %r11d,%r11d
+    0.01 :   235bd2: mov    %rax,-0x2090(%rbp)
+    0.00 :   235bd9: mov    -0x2060(%rbp),%r14
+    0.00 :   235be0: vpsrlw $0xf,%ymm4,%ymm4
+    0.00 :   235be5: mov    %r15d,-0x2060(%rbp)
+    0.02 :   235bec: mov    -0x2058(%rbp),%r15
+    0.00 :   235bf3: cmp    $0x1f,%r12d
+    0.00 :   235bf7: jle    235ca4 <host_rows+0x2744>
+    0.00 :   235bfd: xor    %ecx,%ecx
+    0.00 :   235bff: xor    %edi,%edi
+    0.01 :   235c01: vxorps %xmm3,%xmm3,%xmm3
+    0.00 :   235c05: data16 cs nopw 0x0(%rax,%rax,1)
+    0.00 :   235c10: mov    %ecx,%eax
+    0.00 :   235c12: vmovdqu 0x0(%r13,%rcx,1),%ymm0
+    0.03 :   235c19: vmovdqu (%r8,%rcx,1),%ymm2
+    1.39 :   235c1f: add    $0x20,%rcx
+    0.00 :   235c23: cltd
+    0.00 :   235c24: idiv   %esi
+    4.58 :   235c26: vpsignb %ymm0,%ymm2,%ymm2
+    0.00 :   235c2b: vpsignb %ymm0,%ymm0,%ymm0
+    0.00 :   235c30: vpmaddubsw %ymm2,%ymm0,%ymm0
+    0.02 :   235c35: vpmaddwd %ymm4,%ymm0,%ymm0
+    1.49 :   235c39: vcvtdq2ps %ymm0,%ymm0
+    0.03 :   235c3d: cltq
+    0.04 :   235c3f: vmovss (%r15,%rax,4),%xmm1
+    0.22 :   235c45: vmulss (%r9,%rdi,4),%xmm1,%xmm1
+    2.08 :   235c4b: add    $0x1,%rdi
+    0.00 :   235c4f: vbroadcastss %xmm1,%ymm1
+    1.89 :   235c54: vfmadd231ps %ymm1,%ymm0,%ymm3
+    5.50 :   235c59: cmp    %edi,%r10d
+    0.00 :   235c5c: jg     235c10 <host_rows+0x26b0>
+    0.00 :   235c5e: vextractf128 $0x1,%ymm3,%xmm1
+    0.05 :   235c64: add    $0x1,%r11d
+    0.00 :   235c68: add    -0x2090(%rbp),%r9
+    0.00 :   235c6f: add    %rbx,%r8
+    0.00 :   235c72: vaddps %xmm1,%xmm3,%xmm0
+    0.08 :   235c76: vmovhlps %xmm0,%xmm0,%xmm1
+    0.00 :   235c7a: vaddps %xmm0,%xmm1,%xmm0
+    0.03 :   235c7e: vmovshdup %xmm0,%xmm1
+    0.03 :   235c82: vaddss %xmm1,%xmm0,%xmm0
+    0.07 :   235c86: vmovss %xmm0,(%r14)
+    0.03 :   235c8b: add    -0x2068(%rbp),%r14
+    0.00 :   235c92: cmp    %r11d,-0x2060(%rbp)
+    0.00 :   235c99: jne    235bf3 <host_rows+0x2693>
+    0.00 :   235c9f: jmp    233869 <host_rows+0x309>
+    0.00 :   235ca4: vxorps %xmm3,%xmm3,%xmm3
+    0.00 :   235ca8: jmp    235c5e <host_rows+0x26fe>
+    0.00 :   235caa: lea    0x0(,%r12,4),%rax
+    0.00 :   235cb2: mov    %rdi,%r9
+    0.00 :   235cb5: xor    %r14d,%r14d
+    0.00 :   235cb8: xor    %ebx,%ebx
+    0.00 :   235cba: mov    %rax,-0x2090(%rbp)
+    0.00 :   235cc1: mov    -0x2060(%rbp),%r12
+    0.00 :   235cc8: vpcmpeqd %ymm3,%ymm3,%ymm3
+    0.00 :   235ccc: vxorps %xmm4,%xmm4,%xmm4
+    0.00 :   235cd0: mov    %r11d,-0x2060(%rbp)
+    0.00 :   235cd7: mov    -0x2058(%rbp),%r11
+    0.00 :   235cde: vpsrlw $0xf,%ymm3,%ymm3
+    0.00 :   235ce3: vmovaps %ymm4,-0x2050(%rbp)
+    0.00 :   235ceb: vmovaps %ymm4,-0x2030(%rbp)
+    0.00 :   235cf3: vmovaps %ymm4,-0x2010(%rbp)
+    0.00 :   235cfb: vmovaps %ymm4,-0x1ff0(%rbp)
+    0.00 :   235d03: cmpl   $0x1f,-0x2060(%rbp)
+    0.00 :   235d0a: jle    235e13 <host_rows+0x28b3>
+    0.00 :   235d10: mov    -0x2070(%rbp),%rax
+    0.00 :   235d17: xor    %ecx,%ecx
+    0.00 :   235d19: vxorps %xmm1,%xmm1,%xmm1
+    0.00 :   235d1d: xor    %edi,%edi
+    0.00 :   235d1f: mov    %ebx,-0x2058(%rbp)
+    0.00 :   235d25: mov    %rdx,%rbx
+    0.00 :   235d28: lea    (%rax,%r14,4),%r8
+    0.00 :   235d2c: jmp    235d4a <host_rows+0x27ea>
+    0.00 :   235d2e: xchg   %ax,%ax
+    0.00 :   235d30: mov    %edi,%eax
+    0.00 :   235d32: add    $0x4,%r8
+    0.00 :   235d36: add    $0x20,%rcx
+    0.00 :   235d3a: and    $0x3,%eax
+    0.00 :   235d3d: shl    $0x5,%rax
+    0.00 :   235d41: vmovaps -0x2050(%rbp,%rax,1),%ymm1
+    0.00 :   235d4a: mov    %ecx,%eax
+    0.00 :   235d4c: vmovdqu 0x0(%r13,%rcx,1),%ymm0
+    0.00 :   235d53: vmovdqu (%r9,%rcx,1),%ymm2
+    0.00 :   235d59: cltd
+    0.00 :   235d5a: idiv   %esi
+    0.00 :   235d5c: vpsignb %ymm0,%ymm2,%ymm2
+    0.00 :   235d61: vpsignb %ymm0,%ymm0,%ymm0
+    0.00 :   235d66: vpmaddubsw %ymm2,%ymm0,%ymm0
+    0.00 :   235d6b: vpmaddwd %ymm3,%ymm0,%ymm0
+    0.00 :   235d6f: vcvtdq2ps %ymm0,%ymm0
+    0.00 :   235d73: cltq
+    0.00 :   235d75: vmovss (%r11,%rax,4),%xmm2
+    0.00 :   235d7b: vmulss (%r8),%xmm2,%xmm2
+    0.00 :   235d80: mov    %edi,%eax
+    0.00 :   235d82: add    $0x1,%edi
+    0.00 :   235d85: and    $0x3,%eax
+    0.00 :   235d88: shl    $0x5,%rax
+    0.00 :   235d8c: vbroadcastss %xmm2,%ymm2
+    0.00 :   235d91: vfmadd132ps %ymm2,%ymm1,%ymm0
+    0.00 :   235d96: vmovaps %ymm0,-0x2050(%rbp,%rax,1)
+    0.00 :   235d9f: cmp    %edi,%r10d
+    0.00 :   235da2: jg     235d30 <host_rows+0x27d0>
+    0.00 :   235da4: vmovaps -0x1ff0(%rbp),%ymm1
+    0.00 :   235dac: vmovaps -0x2030(%rbp),%ymm0
+    0.00 :   235db4: mov    %rbx,%rdx
+    0.00 :   235db7: vaddps -0x2010(%rbp),%ymm1,%ymm1
+    0.00 :   235dbf: vaddps -0x2050(%rbp),%ymm0,%ymm0
+    0.00 :   235dc7: mov    -0x2058(%rbp),%ebx
+    0.00 :   235dcd: vaddps %ymm0,%ymm1,%ymm1
+    0.00 :   235dd1: vextractf128 $0x1,%ymm1,%xmm0
+    0.00 :   235dd7: add    $0x1,%ebx
+    0.00 :   235dda: add    -0x2068(%rbp),%r9
+    0.00 :   235de1: add    %rdx,%r14
+    0.00 :   235de4: vaddps %xmm1,%xmm0,%xmm0
+    0.00 :   235de8: vmovhlps %xmm0,%xmm0,%xmm1
+    0.00 :   235dec: vaddps %xmm1,%xmm0,%xmm0
+    0.00 :   235df0: vmovshdup %xmm0,%xmm1
+    0.00 :   235df4: vaddss %xmm1,%xmm0,%xmm0
+    0.00 :   235df8: vmovss %xmm0,(%r12)
+    0.00 :   235dfe: add    -0x2090(%rbp),%r12
+    0.00 :   235e05: cmp    %r15d,%ebx
+    0.00 :   235e08: jne    235ce3 <host_rows+0x2783>
+    0.00 :   235e0e: jmp    233869 <host_rows+0x309>
+    0.00 :   235e13: vxorps %xmm1,%xmm1,%xmm1
+    0.00 :   235e17: jmp    235dd1 <host_rows+0x2871>
+    0.00 :   235e19: mov    -0x38(%rbp),%rax
+    0.00 :   235e1d: sub    %fs:0x28,%rax
+    0.00 :   235e26: jne    2374e4 <host_rows+0x3f84>
+    0.00 :   235e2c: mov    0x8(%rbx),%r9
+    0.00 :   235e30: mov    (%rbx),%r8
+    0.00 :   235e33: mov    %edx,0x10(%r11)
+    0.00 :   235e37: mov    %r13,%rcx
+    0.00 :   235e3a: mov    %r12d,0x8(%r11)
+    0.00 :   235e3e: mov    0x10(%rbx),%rax
+    0.00 :   235e42: mov    %r10d,%edi
+    0.00 :   235e45: mov    %rax,(%r11)
+    0.00 :   235e48: mov    -0x2090(%rbp),%edx
+    0.00 :   235e4e: mov    -0x2060(%rbp),%rsi
+    0.00 :   235e55: lea    -0x28(%rbp),%rsp
+    0.00 :   235e59: pop    %rbx
+    0.00 :   235e5a: pop    %r12
+    0.00 :   235e5c: pop    %r13
+    0.00 :   235e5e: pop    %r14
+    0.00 :   235e60: pop    %r15
+    0.00 :   235e62: pop    %rbp
+    0.00 :   235e63: lea    -0x10(%r13),%rsp
+    0.00 :   235e67: pop    %r13
+    0.00 :   235e69: jmp    34440 <gq_dot_b32.lto_priv.0.lto_priv.0>
+    0.00 :   235e6e: test   %eax,%eax
+    0.00 :   235e70: jle    23386c <host_rows+0x30c>
+    0.00 :   235e76: movslq -0x2090(%rbp),%rbx
+    0.00 :   235e7d: mov    -0x2060(%rbp),%r14
+    0.00 :   235e84: mov    %esi,-0x2060(%rbp)
+    0.00 :   235e8a: xor    %r12d,%r12d
+    0.00 :   235e8d: mov    %r13,-0x2090(%rbp)
+    0.00 :   235e94: lea    0x0(,%rbx,4),%r13
+    0.00 :   235e9c: mov    %eax,%ebx
+    0.00 :   235e9e: mov    -0x2060(%rbp),%edx
+    0.00 :   235ea4: mov    -0x2058(%rbp),%rsi
+    0.00 :   235eab: mov    %r12d,%r8d
+    0.00 :   235eae: mov    %r15,%rcx
+    0.00 :   235eb1: mov    -0x2090(%rbp),%rdi
+    0.00 :   235eb8: add    $0x1,%r12d
+    0.00 :   235ebc: call   2297e0 <hy_dot4.lto_priv.0>
+    0.00 :   235ec1: vmovss %xmm0,(%r14)
+    0.00 :   235ec6: add    %r13,%r14
+    0.00 :   235ec9: cmp    %r12d,%ebx
+    0.00 :   235ecc: jne    235e9e <host_rows+0x293e>
+    0.00 :   235ece: jmp    23386c <host_rows+0x30c>
+    0.00 :   235ed3: mov    %r10d,-0x2070(%rbp)
+    0.00 :   235eda: mov    %fs:0xfffffffffffffff0,%r15
+    0.00 :   235ee3: mov    %fs:0xffffffffffffffe8,%rdi
+    0.00 :   235eec: mov    %fs:0xfffffffffffffff8,%r14
+    0.00 :   235ef5: call   8c70 <free@plt>
+    0.00 :   235efa: mov    %r15,%rdi
+    0.00 :   235efd: lea    0xf(%r12),%r15d
+    0.00 :   235f02: call   8c70 <free@plt>
+    0.00 :   235f07: mov    %r14,%rdi
+    0.00 :   235f0a: call   8c70 <free@plt>
+    0.00 :   235f0f: movslq %r12d,%rax
+    0.00 :   235f12: mov    %rax,%rdi
+    0.00 :   235f15: mov    %rax,-0x2068(%rbp)
+    0.00 :   235f1c: call   8b10 <malloc@plt>
+    0.00 :   235f21: test   %r12d,%r12d
+    0.00 :   235f24: mov    %rax,%fs:0xffffffffffffffe8
+    0.00 :   235f2d: cmovns %r12d,%r15d
+    0.00 :   235f31: mov    %rax,-0x2058(%rbp)
+    0.00 :   235f38: sar    $0x4,%r15d
+    0.00 :   235f3c: add    $0x1,%r15d
+    0.00 :   235f40: movslq %r15d,%r15
+    0.00 :   235f43: lea    0x0(,%r15,4),%rdi
+    0.00 :   235f4b: call   8b10 <malloc@plt>
+    0.00 :   235f50: lea    0x0(,%r15,4),%rdi
+    0.00 :   235f58: mov    %rax,%fs:0xfffffffffffffff0
+    0.00 :   235f61: mov    %rax,%r14
+    0.00 :   235f64: call   8b10 <malloc@plt>
+    0.00 :   235f69: mov    %rax,%fs:0xfffffffffffffff8
+    0.00 :   235f72: mov    -0x2070(%rbp),%r10d
+    0.00 :   235f79: cmpq   $0x0,-0x2058(%rbp)
+    0.00 :   235f81: setne  %sil
+    0.00 :   235f85: test   %r14,%r14
+    0.00 :   235f88: setne  %dl
+    0.00 :   235f8b: test   %dl,%sil
+    0.00 :   235f8e: je     235fa8 <host_rows+0x2a48>
+    0.00 :   235f90: test   %rax,%rax
+    0.00 :   235f93: je     235fa8 <host_rows+0x2a48>
+    0.00 :   235f95: mov    %r12d,%fs:0xffffffffffffffe0
+    0.00 :   235f9e: jmp    234838 <host_rows+0x12d8>
+    0.00 :   235fa3: nopl   0x0(%rax,%rax,1)
+    0.00 :   235fa8: movl   $0x0,%fs:0xffffffffffffffe0
+    0.00 :   235fb4: test   %r12d,%r12d
+    0.00 :   235fb7: jg     23386c <host_rows+0x30c>
+    0.00 :   235fbd: jmp    234838 <host_rows+0x12d8>
+    0.00 :   235fc2: nopw   0x0(%rax,%rax,1)
+    0.00 :   235fc8: cmp    $0xf,%r12d
+    0.00 :   235fcc: jle    237371 <host_rows+0x3e11>
+    0.00 :   235fd2: mov    %r12d,%edi
+    0.00 :   235fd5: mov    $0xbf80bf80,%ebx
+    0.00 :   235fda: lea    -0x10(%r12),%r9d
+    0.00 :   235fdf: xor    %eax,%eax
+    0.00 :   235fe1: shr    $0x4,%edi
+    0.00 :   235fe4: vmovd  %ebx,%xmm2
+    0.00 :   235fe8: vpxor  %xmm3,%xmm3,%xmm3
+    0.00 :   235fec: vbroadcastss 0x20037(%rip),%ymm4        # 25602c <_IO_stdin_used+0x2c>
+    0.00 :   235ff5: shl    $0x4,%rdi
+    0.00 :   235ff9: vpbroadcastd %xmm2,%xmm2
+    0.00 :   235ffe: vmovdqu 0x0(%r13,%rax,1),%xmm0
+    0.00 :   236005: vpunpcklbw %xmm0,%xmm3,%xmm1
+    0.00 :   236009: vpunpckhbw %xmm0,%xmm3,%xmm0
+    0.00 :   23600d: vpsraw $0x1,%xmm1,%xmm1
+    0.00 :   236012: vpsraw $0x1,%xmm0,%xmm0
+    0.00 :   236017: vpand  %xmm2,%xmm1,%xmm1
+    0.00 :   23601b: vpand  %xmm2,%xmm0,%xmm0
+    0.00 :   23601f: vcvtph2ps %xmm1,%ymm1
+    0.00 :   236024: vcvtph2ps %xmm0,%ymm0
+    0.00 :   236029: vmulps %ymm4,%ymm1,%ymm1
+    0.00 :   23602d: vmulps %ymm4,%ymm0,%ymm0
+    0.00 :   236031: vmovups %ymm1,(%rcx,%rax,4)
+    0.00 :   236036: vmovups %ymm0,0x20(%rcx,%rax,4)
+    0.00 :   23603c: add    $0x10,%rax
+    0.00 :   236040: cmp    %rax,%rdi
+    0.00 :   236043: jne    235ffe <host_rows+0x2a9e>
+    0.00 :   236045: mov    %r9d,%eax
+    0.00 :   236048: and    $0xfffffff0,%eax
+    0.00 :   23604b: add    $0x10,%eax
+    0.00 :   23604e: cmp    %eax,%r12d
+    0.00 :   236051: jle    23623c <host_rows+0x2cdc>
+    0.00 :   236057: movslq %eax,%rdi
+    0.00 :   23605a: lea    0x7be1f(%rip),%r9        # 2b1e80 <fp8_e4m3>
+    0.00 :   236061: movzbl 0x0(%r13,%rdi,1),%r10d
+    0.00 :   236067: vmovss (%r9,%r10,4),%xmm0
+    0.00 :   23606d: lea    0x1(%rax),%r10d
+    0.00 :   236071: vmovss %xmm0,(%rcx,%rdi,4)
+    0.00 :   236076: cmp    %r10d,%r12d
+    0.00 :   236079: jle    23623c <host_rows+0x2cdc>
+    0.00 :   23607f: movslq %r10d,%r10
+    0.00 :   236082: movzbl 0x0(%r13,%r10,1),%r10d
+    0.00 :   236088: vmovss (%r9,%r10,4),%xmm0
+    0.00 :   23608e: lea    0x2(%rax),%r10d
+    0.00 :   236092: vmovss %xmm0,0x4(%rcx,%rdi,4)
+    0.00 :   236098: cmp    %r10d,%r12d
+    0.00 :   23609b: jle    23623c <host_rows+0x2cdc>
+    0.00 :   2360a1: movslq %r10d,%r10
+    0.00 :   2360a4: movzbl 0x0(%r13,%r10,1),%r10d
+    0.00 :   2360aa: vmovss (%r9,%r10,4),%xmm0
+    0.00 :   2360b0: lea    0x3(%rax),%r10d
+    0.00 :   2360b4: vmovss %xmm0,0x8(%rcx,%rdi,4)
+    0.00 :   2360ba: cmp    %r10d,%r12d
+    0.00 :   2360bd: jle    23623c <host_rows+0x2cdc>
+    0.00 :   2360c3: movslq %r10d,%r10
+    0.00 :   2360c6: movzbl 0x0(%r13,%r10,1),%r10d
+    0.00 :   2360cc: vmovss (%r9,%r10,4),%xmm0
+    0.00 :   2360d2: lea    0x4(%rax),%r10d
+    0.00 :   2360d6: vmovss %xmm0,0xc(%rcx,%rdi,4)
+    0.00 :   2360dc: cmp    %r10d,%r12d
+    0.00 :   2360df: jle    23623c <host_rows+0x2cdc>
+    0.00 :   2360e5: movslq %r10d,%r10
+    0.00 :   2360e8: movzbl 0x0(%r13,%r10,1),%r10d
+    0.00 :   2360ee: vmovss (%r9,%r10,4),%xmm0
+    0.00 :   2360f4: lea    0x5(%rax),%r10d
+    0.00 :   2360f8: vmovss %xmm0,0x10(%rcx,%rdi,4)
+    0.00 :   2360fe: cmp    %r10d,%r12d
+    0.00 :   236101: jle    23623c <host_rows+0x2cdc>
+    0.00 :   236107: movslq %r10d,%r10
+    0.00 :   23610a: movzbl 0x0(%r13,%r10,1),%r10d
+    0.00 :   236110: vmovss (%r9,%r10,4),%xmm0
+    0.00 :   236116: lea    0x6(%rax),%r10d
+    0.00 :   23611a: vmovss %xmm0,0x14(%rcx,%rdi,4)
+    0.00 :   236120: cmp    %r10d,%r12d
+    0.00 :   236123: jle    23623c <host_rows+0x2cdc>
+    0.00 :   236129: movslq %r10d,%r10
+    0.00 :   23612c: movzbl 0x0(%r13,%r10,1),%r10d
+    0.00 :   236132: vmovss (%r9,%r10,4),%xmm0
+    0.00 :   236138: lea    0x7(%rax),%r10d
+    0.00 :   23613c: vmovss %xmm0,0x18(%rcx,%rdi,4)
+    0.00 :   236142: cmp    %r10d,%r12d
+    0.00 :   236145: jle    23623c <host_rows+0x2cdc>
+    0.00 :   23614b: movslq %r10d,%r10
+    0.00 :   23614e: movzbl 0x0(%r13,%r10,1),%r10d
+    0.00 :   236154: vmovss (%r9,%r10,4),%xmm0
+    0.00 :   23615a: lea    0x8(%rax),%r10d
+    0.00 :   23615e: vmovss %xmm0,0x1c(%rcx,%rdi,4)
+    0.00 :   236164: cmp    %r10d,%r12d
+    0.00 :   236167: jle    23623c <host_rows+0x2cdc>
+    0.00 :   23616d: movslq %r10d,%r10
+    0.00 :   236170: movzbl 0x0(%r13,%r10,1),%r10d
+    0.00 :   236176: vmovss (%r9,%r10,4),%xmm0
+    0.00 :   23617c: lea    0x9(%rax),%r10d
+    0.00 :   236180: vmovss %xmm0,0x20(%rcx,%rdi,4)
+    0.00 :   236186: cmp    %r10d,%r12d
+    0.00 :   236189: jle    23623c <host_rows+0x2cdc>
+    0.00 :   23618f: movslq %r10d,%r10
+    0.00 :   236192: movzbl 0x0(%r13,%r10,1),%r10d
+    0.00 :   236198: vmovss (%r9,%r10,4),%xmm0
+    0.00 :   23619e: lea    0xa(%rax),%r10d
+    0.00 :   2361a2: vmovss %xmm0,0x24(%rcx,%rdi,4)
+    0.00 :   2361a8: cmp    %r10d,%r12d
+    0.00 :   2361ab: jle    23623c <host_rows+0x2cdc>
+    0.00 :   2361b1: movslq %r10d,%r10
+    0.00 :   2361b4: movzbl 0x0(%r13,%r10,1),%r10d
+    0.00 :   2361ba: vmovss (%r9,%r10,4),%xmm0
+    0.00 :   2361c0: lea    0xb(%rax),%r10d
+    0.00 :   2361c4: vmovss %xmm0,0x28(%rcx,%rdi,4)
+    0.00 :   2361ca: cmp    %r10d,%r12d
+    0.00 :   2361cd: jle    23623c <host_rows+0x2cdc>
+    0.00 :   2361cf: movslq %r10d,%r10
+    0.00 :   2361d2: movzbl 0x0(%r13,%r10,1),%r10d
+    0.00 :   2361d8: vmovss (%r9,%r10,4),%xmm0
+    0.00 :   2361de: lea    0xc(%rax),%r10d
+    0.00 :   2361e2: vmovss %xmm0,0x2c(%rcx,%rdi,4)
+    0.00 :   2361e8: cmp    %r10d,%r12d
+    0.00 :   2361eb: jle    23623c <host_rows+0x2cdc>
+    0.00 :   2361ed: movslq %r10d,%r10
+    0.00 :   2361f0: movzbl 0x0(%r13,%r10,1),%r10d
+    0.00 :   2361f6: vmovss (%r9,%r10,4),%xmm0
+    0.00 :   2361fc: lea    0xd(%rax),%r10d
+    0.00 :   236200: vmovss %xmm0,0x30(%rcx,%rdi,4)
+    0.00 :   236206: cmp    %r10d,%r12d
+    0.00 :   236209: jle    23623c <host_rows+0x2cdc>
+    0.00 :   23620b: movslq %r10d,%r10
+    0.00 :   23620e: add    $0xe,%eax
+    0.00 :   236211: movzbl 0x0(%r13,%r10,1),%r10d
+    0.00 :   236217: vmovss (%r9,%r10,4),%xmm0
+    0.00 :   23621d: vmovss %xmm0,0x34(%rcx,%rdi,4)
+    0.00 :   236223: cmp    %eax,%r12d
+    0.00 :   236226: jle    23623c <host_rows+0x2cdc>
+    0.00 :   236228: cltq
+    0.00 :   23622a: movzbl 0x0(%r13,%rax,1),%eax
+    0.00 :   236230: vmovss (%r9,%rax,4),%xmm0
+    0.00 :   236236: vmovss %xmm0,0x38(%rcx,%rdi,4)
+    0.00 :   23623c: test   %esi,%esi
+    0.00 :   23623e: mov    %edx,%r10d
+    0.00 :   236241: movslq -0x2090(%rbp),%r13
+    0.00 :   236248: mov    -0x2060(%rbp),%r9
+    0.00 :   23624f: cmovle %r12d,%esi
+    0.00 :   236253: lea    -0x1(%r10),%eax
+    0.00 :   236257: lea    -0x4(%rdx),%edx
+    0.00 :   23625a: and    $0xfffffffc,%eax
+    0.00 :   23625d: lea    (%r9,%r13,8),%rbx
+    0.00 :   236261: mov    %r13,%r11
+    0.00 :   236264: mov    %r13,-0x2068(%rbp)
+    0.00 :   23626b: sub    %eax,%edx
+    0.00 :   23626d: movslq %esi,%rax
+    0.00 :   236270: mov    %rbx,-0x2060(%rbp)
+    0.00 :   236277: shl    $0x4,%r11
+    0.00 :   23627b: mov    %rax,-0x2090(%rbp)
+    0.00 :   236282: mov    %esi,%r15d
+    0.00 :   236285: mov    %r11,%r13
+    0.00 :   236288: mov    %edx,-0x2070(%rbp)
+    0.00 :   23628e: cmp    $0x2,%r10d
+    0.00 :   236292: je     236ae9 <host_rows+0x3589>
+    0.00 :   236298: cmp    $0x3,%r10d
+    0.00 :   23629c: je     2367e3 <host_rows+0x3283>
+    0.00 :   2362a2: cmp    $0x1,%r10d
+    0.00 :   2362a6: jne    23647b <host_rows+0x2f1b>
+    0.00 :   2362ac: test   %r12d,%r12d
+    0.00 :   2362af: jle    23703f <host_rows+0x3adf>
+    0.00 :   2362b5: mov    %r9,-0x2098(%rbp)
+    0.00 :   2362bc: xor    %edi,%edi
+    0.00 :   2362be: vxorps %xmm1,%xmm1,%xmm1
+    0.00 :   2362c2: vxorps %xmm3,%xmm3,%xmm3
+    0.00 :   2362c6: mov    %r10d,-0x20a0(%rbp)
+    0.00 :   2362cd: mov    -0x2058(%rbp),%r9
+    0.00 :   2362d4: mov    -0x2090(%rbp),%r10
+    0.00 :   2362db: lea    (%r15,%rdi,1),%esi
+    0.00 :   2362df: mov    %edi,%eax
+    0.00 :   2362e1: mov    %edi,%r11d
+    0.00 :   2362e4: mov    %edi,%ebx
+    0.00 :   2362e6: cmp    %r12d,%esi
+    0.00 :   2362e9: cmovg  %r12d,%esi
+    0.00 :   2362ed: cltd
+    0.00 :   2362ee: idiv   %r15d
+    0.00 :   2362f1: cltq
+    0.00 :   2362f3: vmovss (%r9,%rax,4),%xmm2
+    0.00 :   2362f9: lea    0x7(%rdi),%eax
+    0.00 :   2362fc: cmp    %eax,%esi
+    0.00 :   2362fe: jle    236472 <host_rows+0x2f12>
+    0.00 :   236304: mov    $0xfffffff8,%r14d
+    0.00 :   23630a: mov    (%r8),%rbx
+    0.00 :   23630d: vxorps %xmm0,%xmm0,%xmm0
+    0.00 :   236311: sub    %edi,%r14d
+    0.00 :   236314: add    %esi,%r14d
+    0.00 :   236317: mov    %r14d,%eax
+    0.00 :   23631a: shr    $0x3,%eax
+    0.00 :   23631d: lea    0x0(,%rax,8),%eax
+    0.00 :   236324: lea    0x8(%rdi,%rax,1),%rdx
+    0.00 :   236329: mov    %rdi,%rax
+    0.00 :   23632c: nopw   0x0(%rax,%rax,1)
+    0.00 :   236335: data16 cs nopw 0x0(%rax,%rax,1)
+    0.00 :   236340: vmovups (%rcx,%rax,4),%ymm6
+    0.00 :   236345: vfmadd231ps (%rbx,%rax,4),%ymm6,%ymm0
+    0.00 :   23634b: add    $0x8,%rax
+    0.00 :   23634f: cmp    %rax,%rdx
+    0.00 :   236352: jne    236340 <host_rows+0x2de0>
+    0.00 :   236354: and    $0xfffffff8,%r14d
+    0.00 :   236358: lea    0x8(%r11,%r14,1),%ebx
+    0.00 :   23635d: vbroadcastss %xmm2,%ymm4
+    0.00 :   236362: vfmadd231ps %ymm4,%ymm0,%ymm3
+    0.00 :   236367: cmp    %ebx,%esi
+    0.00 :   236369: jle    236411 <host_rows+0x2eb1>
+    0.00 :   23636f: sub    %ebx,%esi
+    0.00 :   236371: mov    (%r8),%rdx
+    0.00 :   236374: lea    -0x1(%rsi),%eax
+    0.00 :   236377: cmp    $0x2,%eax
+    0.00 :   23637a: jbe    236d40 <host_rows+0x37e0>
+    0.00 :   236380: movslq %ebx,%rax
+    0.00 :   236383: vbroadcastss %xmm2,%xmm0
+    0.00 :   236388: vmulps (%rcx,%rax,4),%xmm0,%xmm0
+    0.00 :   23638d: vmulps (%rdx,%rax,4),%xmm0,%xmm0
+    0.00 :   236392: vaddss %xmm0,%xmm1,%xmm1
+    0.00 :   236396: vshufps $0x55,%xmm0,%xmm0,%xmm4
+    0.00 :   23639b: vaddss %xmm1,%xmm4,%xmm4
+    0.00 :   23639f: vunpckhps %xmm0,%xmm0,%xmm1
+    0.00 :   2363a3: vshufps $0xff,%xmm0,%xmm0,%xmm0
+    0.00 :   2363a8: vaddss %xmm4,%xmm1,%xmm1
+    0.00 :   2363ac: vaddss %xmm0,%xmm1,%xmm1
+    0.00 :   2363b0: test   $0x3,%sil
+    0.00 :   2363b4: je     236411 <host_rows+0x2eb1>
+    0.00 :   2363b6: mov    %esi,%eax
+    0.00 :   2363b8: and    $0xfffffffc,%eax
+    0.00 :   2363bb: lea    (%rax,%rbx,1),%r11d
+    0.00 :   2363bf: sub    %eax,%esi
+    0.00 :   2363c1: cmp    $0x1,%esi
+    0.00 :   2363c4: je     236402 <host_rows+0x2ea2>
+    0.00 :   2363c6: vmovsldup %xmm2,%xmm4
+    0.00 :   2363ca: movslq %ebx,%rbx
+    0.00 :   2363cd: add    %rbx,%rax
+    0.00 :   2363d0: vmovq  (%rcx,%rax,4),%xmm0
+    0.00 :   2363d5: vmovq  %xmm4,%xmm4
+    0.00 :   2363d9: vmulps %xmm4,%xmm0,%xmm0
+    0.00 :   2363dd: vmovq  (%rdx,%rax,4),%xmm4
+    0.00 :   2363e2: vmovq  %xmm0,%xmm0
+    0.00 :   2363e6: vmulps %xmm4,%xmm0,%xmm0
+    0.00 :   2363ea: vaddss %xmm1,%xmm0,%xmm1
+    0.00 :   2363ee: vmovshdup %xmm0,%xmm0
+    0.00 :   2363f2: vaddss %xmm0,%xmm1,%xmm1
+    0.00 :   2363f6: test   $0x1,%sil
+    0.00 :   2363fa: je     236411 <host_rows+0x2eb1>
+    0.00 :   2363fc: and    $0xfffffffe,%esi
+    0.00 :   2363ff: add    %esi,%r11d
+    0.00 :   236402: movslq %r11d,%r11
+    0.00 :   236405: vmulss (%rcx,%r11,4),%xmm2,%xmm2
+    0.00 :   23640b: vfmadd231ss (%rdx,%r11,4),%xmm2,%xmm1
+    0.00 :   236411: add    %r10,%rdi
+    0.00 :   236414: cmp    %edi,%r12d
+    0.00 :   236417: jg     2362db <host_rows+0x2d7b>
+    0.00 :   23641d: mov    -0x2098(%rbp),%r9
+    0.00 :   236424: mov    -0x20a0(%rbp),%r10d
+    0.00 :   23642b: vextractf128 $0x1,%ymm3,%xmm0
+    0.00 :   236431: vaddps %xmm3,%xmm0,%xmm0
+    0.00 :   236435: vmovhlps %xmm0,%xmm0,%xmm2
+    0.00 :   236439: vaddps %xmm2,%xmm0,%xmm0
+    0.00 :   23643d: vmovshdup %xmm0,%xmm2
+    0.00 :   236441: vaddss %xmm2,%xmm0,%xmm0
+    0.00 :   236445: vaddss %xmm1,%xmm0,%xmm0
+    0.00 :   236449: vmovss %xmm0,(%r9)
+    0.00 :   23644e: add    %r13,-0x2060(%rbp)
+    0.00 :   236455: sub    $0x4,%r10d
+    0.00 :   236459: add    %r13,%r9
+    0.00 :   23645c: add    $0x20,%r8
+    0.00 :   236460: cmp    %r10d,-0x2070(%rbp)
+    0.00 :   236467: jne    23628e <host_rows+0x2d2e>
+    0.00 :   23646d: jmp    233869 <host_rows+0x309>
+    0.00 :   236472: vxorps %xmm0,%xmm0,%xmm0
+    0.00 :   236476: jmp    23635d <host_rows+0x2dfd>
+    0.00 :   23647b: test   %r12d,%r12d
+    0.00 :   23647e: jle    237016 <host_rows+0x3ab6>
+    0.00 :   236484: mov    %r13,-0x2098(%rbp)
+    0.00 :   23648b: vxorps %xmm5,%xmm5,%xmm5
+    0.00 :   23648f: vxorps %xmm11,%xmm11,%xmm11
+    0.00 :   236494: xor    %edi,%edi
+    0.00 :   236496: mov    %r9,-0x20a0(%rbp)
+    0.00 :   23649d: vmovaps %xmm5,%xmm6
+    0.00 :   2364a1: vmovaps %xmm5,%xmm7
+    0.00 :   2364a5: vmovaps %xmm5,%xmm8
+    0.00 :   2364a9: mov    %r10d,-0x20a8(%rbp)
+    0.00 :   2364b0: vmovaps %ymm11,%ymm12
+    0.00 :   2364b5: vmovaps %ymm11,%ymm10
+    0.00 :   2364ba: vmovaps %ymm11,%ymm13
+    0.00 :   2364bf: lea    (%r15,%rdi,1),%esi
+    0.00 :   2364c3: mov    %edi,%eax
+    0.00 :   2364c5: mov    %edi,%ebx
+    0.00 :   2364c7: mov    %edi,%r9d
+    0.00 :   2364ca: cmp    %r12d,%esi
+    0.00 :   2364cd: cmovg  %r12d,%esi
+    0.00 :   2364d1: cltd
+    0.00 :   2364d2: idiv   %r15d
+    0.00 :   2364d5: mov    -0x2058(%rbp),%rdx
+    0.00 :   2364dc: cltq
+    0.00 :   2364de: vmovss (%rdx,%rax,4),%xmm9
+    0.00 :   2364e3: lea    0x7(%rdi),%eax
+    0.00 :   2364e6: cmp    %eax,%esi
+    0.00 :   2364e8: jle    2367ce <host_rows+0x326e>
+    0.00 :   2364ee: mov    $0xfffffff8,%r14d
+    0.00 :   2364f4: vxorps %xmm1,%xmm1,%xmm1
+    0.00 :   2364f8: mov    (%r8),%r13
+    0.00 :   2364fb: mov    0x8(%r8),%r11
+    0.00 :   2364ff: sub    %edi,%r14d
+    0.00 :   236502: mov    0x10(%r8),%r10
+    0.00 :   236506: mov    0x18(%r8),%r9
+    0.00 :   23650a: vmovaps %ymm1,%ymm2
+    0.00 :   23650e: add    %esi,%r14d
+    0.00 :   236511: vmovaps %ymm1,%ymm3
+    0.00 :   236515: vmovaps %ymm1,%ymm4
+    0.00 :   236519: mov    %r14d,%eax
+    0.00 :   23651c: shr    $0x3,%eax
+    0.00 :   23651f: lea    0x0(,%rax,8),%eax
+    0.00 :   236526: lea    0x8(%rdi,%rax,1),%rdx
+    0.00 :   23652b: mov    %rdi,%rax
+    0.00 :   23652e: nopl   0x0(%rax)
+    0.00 :   236535: data16 cs nopw 0x0(%rax,%rax,1)
+    0.00 :   236540: vmovups (%rcx,%rax,4),%ymm0
+    0.00 :   236545: vfmadd231ps 0x0(%r13,%rax,4),%ymm0,%ymm4
+    0.00 :   23654c: vfmadd231ps (%r11,%rax,4),%ymm0,%ymm3
+    0.00 :   236552: vfmadd231ps (%r10,%rax,4),%ymm0,%ymm2
+    0.00 :   236558: vfmadd231ps (%r9,%rax,4),%ymm0,%ymm1
+    0.00 :   23655e: add    $0x8,%rax
+    0.00 :   236562: cmp    %rax,%rdx
+    0.00 :   236565: jne    236540 <host_rows+0x2fe0>
+    0.00 :   236567: and    $0xfffffff8,%r14d
+    0.00 :   23656b: lea    0x8(%rbx,%r14,1),%r9d
+    0.00 :   236570: vbroadcastss %xmm9,%ymm0
+    0.00 :   236575: vfmadd231ps %ymm0,%ymm4,%ymm13
+    0.00 :   23657a: vfmadd231ps %ymm0,%ymm3,%ymm10
+    0.00 :   23657f: vfmadd231ps %ymm0,%ymm2,%ymm12
+    0.00 :   236584: vfmadd231ps %ymm0,%ymm1,%ymm11
+    0.00 :   236589: cmp    %r9d,%esi
+    0.00 :   23658c: jle    236706 <host_rows+0x31a6>
+    0.00 :   236592: sub    %r9d,%esi
+    0.00 :   236595: mov    (%r8),%rbx
+    0.00 :   236598: mov    0x8(%r8),%r11
+    0.00 :   23659c: lea    -0x1(%rsi),%eax
+    0.00 :   23659f: mov    0x10(%r8),%r10
+    0.00 :   2365a3: mov    0x18(%r8),%rdx
+    0.00 :   2365a7: cmp    $0x2,%eax
+    0.00 :   2365aa: jbe    236d36 <host_rows+0x37d6>
+    0.00 :   2365b0: movslq %r9d,%rax
+    0.00 :   2365b3: vbroadcastss %xmm9,%xmm0
+    0.00 :   2365b8: vmulps (%rcx,%rax,4),%xmm0,%xmm0
+    0.00 :   2365bd: vmulps (%rbx,%rax,4),%xmm0,%xmm1
+    0.00 :   2365c2: vaddss %xmm1,%xmm8,%xmm8
+    0.00 :   2365c6: vshufps $0x55,%xmm1,%xmm1,%xmm2
+    0.00 :   2365cb: vaddss %xmm8,%xmm2,%xmm2
+    0.00 :   2365d0: vunpckhps %xmm1,%xmm1,%xmm8
+    0.00 :   2365d4: vshufps $0xff,%xmm1,%xmm1,%xmm1
+    0.00 :   2365d9: vaddss %xmm2,%xmm8,%xmm8
+    0.00 :   2365dd: vaddss %xmm1,%xmm8,%xmm8
+    0.00 :   2365e1: vmulps (%r11,%rax,4),%xmm0,%xmm1
+    0.00 :   2365e7: vaddss %xmm1,%xmm7,%xmm7
+    0.00 :   2365eb: vshufps $0x55,%xmm1,%xmm1,%xmm2
+    0.00 :   2365f0: vaddss %xmm7,%xmm2,%xmm2
+    0.00 :   2365f4: vunpckhps %xmm1,%xmm1,%xmm7
+    0.00 :   2365f8: vshufps $0xff,%xmm1,%xmm1,%xmm1
+    0.00 :   2365fd: vaddss %xmm2,%xmm7,%xmm7
+    0.00 :   236601: vaddss %xmm1,%xmm7,%xmm7
+    0.00 :   236605: vmulps (%r10,%rax,4),%xmm0,%xmm1
+    0.00 :   23660b: vmulps (%rdx,%rax,4),%xmm0,%xmm0
+    0.00 :   236610: vaddss %xmm1,%xmm6,%xmm6
+    0.00 :   236614: vshufps $0x55,%xmm1,%xmm1,%xmm2
+    0.00 :   236619: vaddss %xmm0,%xmm5,%xmm5
+    0.00 :   23661d: vaddss %xmm6,%xmm2,%xmm2
+    0.00 :   236621: vunpckhps %xmm1,%xmm1,%xmm6
+    0.00 :   236625: vshufps $0xff,%xmm1,%xmm1,%xmm1
+    0.00 :   23662a: vaddss %xmm2,%xmm6,%xmm6
+    0.00 :   23662e: vaddss %xmm1,%xmm6,%xmm6
+    0.00 :   236632: vshufps $0x55,%xmm0,%xmm0,%xmm1
+    0.00 :   236637: vaddss %xmm5,%xmm1,%xmm1
+    0.00 :   23663b: vunpckhps %xmm0,%xmm0,%xmm5
+    0.00 :   23663f: vshufps $0xff,%xmm0,%xmm0,%xmm0
+    0.00 :   236644: vaddss %xmm1,%xmm5,%xmm5
+    0.00 :   236648: vaddss %xmm0,%xmm5,%xmm5
+    0.00 :   23664c: test   $0x3,%sil
+    0.00 :   236650: je     236706 <host_rows+0x31a6>
+    0.00 :   236656: mov    %esi,%eax
+    0.00 :   236658: and    $0xfffffffc,%eax
+    0.00 :   23665b: lea    (%rax,%r9,1),%r13d
+    0.00 :   23665f: sub    %eax,%esi
+    0.00 :   236661: cmp    $0x1,%esi
+    0.00 :   236664: je     2366e5 <host_rows+0x3185>
+    0.00 :   236666: vmovsldup %xmm9,%xmm1
+    0.00 :   23666b: movslq %r9d,%r9
+    0.00 :   23666e: add    %r9,%rax
+    0.00 :   236671: vmovq  (%rcx,%rax,4),%xmm0
+    0.00 :   236676: vmovq  %xmm1,%xmm1
+    0.00 :   23667a: vmulps %xmm1,%xmm0,%xmm0
+    0.00 :   23667e: vmovq  (%rbx,%rax,4),%xmm1
+    0.00 :   236683: vmovq  %xmm0,%xmm0
+    0.00 :   236687: vmulps %xmm0,%xmm1,%xmm1
+    0.00 :   23668b: vaddss %xmm8,%xmm1,%xmm8
+    0.00 :   236690: vmovshdup %xmm1,%xmm1
+    0.00 :   236694: vaddss %xmm1,%xmm8,%xmm8
+    0.00 :   236698: vmovq  (%r11,%rax,4),%xmm1
+    0.00 :   23669e: vmulps %xmm0,%xmm1,%xmm1
+    0.00 :   2366a2: vaddss %xmm1,%xmm7,%xmm7
+    0.00 :   2366a6: vmovshdup %xmm1,%xmm1
+    0.00 :   2366aa: vaddss %xmm1,%xmm7,%xmm7
+    0.00 :   2366ae: vmovq  (%r10,%rax,4),%xmm1
+    0.00 :   2366b4: vmulps %xmm0,%xmm1,%xmm1
+    0.00 :   2366b8: vaddss %xmm1,%xmm6,%xmm6
+    0.00 :   2366bc: vmovshdup %xmm1,%xmm1
+    0.00 :   2366c0: vaddss %xmm1,%xmm6,%xmm6
+    0.00 :   2366c4: vmovq  (%rdx,%rax,4),%xmm1
+    0.00 :   2366c9: vmulps %xmm0,%xmm1,%xmm0
+    0.00 :   2366cd: vaddss %xmm0,%xmm5,%xmm5
+    0.00 :   2366d1: vmovshdup %xmm0,%xmm0
+    0.00 :   2366d5: vaddss %xmm0,%xmm5,%xmm5
+    0.00 :   2366d9: test   $0x1,%sil
+    0.00 :   2366dd: je     236706 <host_rows+0x31a6>
+    0.00 :   2366df: and    $0xfffffffe,%esi
+    0.00 :   2366e2: add    %esi,%r13d
+    0.00 :   2366e5: movslq %r13d,%r13
+    0.00 :   2366e8: vmulss (%rcx,%r13,4),%xmm9,%xmm9
+    0.00 :   2366ee: vfmadd231ss (%rbx,%r13,4),%xmm9,%xmm8
+    0.00 :   2366f4: vfmadd231ss (%r11,%r13,4),%xmm9,%xmm7
+    0.00 :   2366fa: vfmadd231ss (%r10,%r13,4),%xmm9,%xmm6
+    0.00 :   236700: vfmadd231ss (%rdx,%r13,4),%xmm9,%xmm5
+    0.00 :   236706: add    -0x2090(%rbp),%rdi
+    0.00 :   23670d: cmp    %edi,%r12d
+    0.00 :   236710: jg     2364bf <host_rows+0x2f5f>
+    0.00 :   236716: mov    -0x2098(%rbp),%r13
+    0.00 :   23671d: mov    -0x20a0(%rbp),%r9
+    0.00 :   236724: mov    -0x20a8(%rbp),%r10d
+    0.00 :   23672b: vextractf128 $0x1,%ymm13,%xmm1
+    0.00 :   236731: mov    -0x2068(%rbp),%rax
+    0.00 :   236738: mov    -0x2060(%rbp),%rbx
+    0.00 :   23673f: vaddps %xmm13,%xmm1,%xmm1
+    0.00 :   236744: vmovhlps %xmm1,%xmm1,%xmm0
+    0.00 :   236748: vaddps %xmm1,%xmm0,%xmm0
+    0.00 :   23674c: vmovshdup %xmm0,%xmm1
+    0.00 :   236750: vaddss %xmm1,%xmm0,%xmm0
+    0.00 :   236754: vextractf128 $0x1,%ymm10,%xmm1
+    0.00 :   23675a: vaddss %xmm8,%xmm0,%xmm0
+    0.00 :   23675f: vmovss %xmm0,(%r9)
+    0.00 :   236764: vaddps %xmm1,%xmm10,%xmm0
+    0.00 :   236768: vmovhlps %xmm0,%xmm0,%xmm1
+    0.00 :   23676c: vaddps %xmm0,%xmm1,%xmm0
+    0.00 :   236770: vmovshdup %xmm0,%xmm1
+    0.00 :   236774: vaddss %xmm1,%xmm0,%xmm0
+    0.00 :   236778: vaddss %xmm7,%xmm0,%xmm0
+    0.00 :   23677c: vmovss %xmm0,(%r9,%rax,4)
+    0.00 :   236782: vextractf128 $0x1,%ymm12,%xmm0
+    0.00 :   236788: vaddps %xmm12,%xmm0,%xmm0
+    0.00 :   23678d: vmovhlps %xmm0,%xmm0,%xmm1
+    0.00 :   236791: vaddps %xmm1,%xmm0,%xmm0
+    0.00 :   236795: vmovshdup %xmm0,%xmm1
+    0.00 :   236799: vaddss %xmm1,%xmm0,%xmm0
+    0.00 :   23679d: vextractf128 $0x1,%ymm11,%xmm1
+    0.00 :   2367a3: vaddps %xmm11,%xmm1,%xmm1
+    0.00 :   2367a8: vaddss %xmm6,%xmm0,%xmm0
+    0.00 :   2367ac: vmovss %xmm0,(%rbx)
+    0.00 :   2367b0: vmovhlps %xmm1,%xmm1,%xmm0
+    0.00 :   2367b4: vaddps %xmm1,%xmm0,%xmm0
+    0.00 :   2367b8: vmovshdup %xmm0,%xmm1
+    0.00 :   2367bc: vaddss %xmm1,%xmm0,%xmm0
+    0.00 :   2367c0: vaddss %xmm5,%xmm0,%xmm0
+    0.00 :   2367c4: vmovss %xmm0,(%rbx,%rax,4)
+    0.00 :   2367c9: jmp    23644e <host_rows+0x2eee>
+    0.00 :   2367ce: vxorps %xmm1,%xmm1,%xmm1
+    0.00 :   2367d2: vmovaps %ymm1,%ymm2
+    0.00 :   2367d6: vmovaps %ymm1,%ymm3
+    0.00 :   2367da: vmovaps %ymm1,%ymm4
+    0.00 :   2367de: jmp    236570 <host_rows+0x3010>
+    0.00 :   2367e3: test   %r12d,%r12d
+    0.00 :   2367e6: jle    237333 <host_rows+0x3dd3>
+    0.00 :   2367ec: mov    %r13,-0x2098(%rbp)
+    0.00 :   2367f3: vxorps %xmm4,%xmm4,%xmm4
+    0.00 :   2367f7: vxorps %xmm8,%xmm8,%xmm8
+    0.00 :   2367fc: xor    %edi,%edi
+    0.00 :   2367fe: mov    %r9,-0x20a0(%rbp)
+    0.00 :   236805: vmovaps %xmm4,%xmm5
+    0.00 :   236809: vmovaps %xmm4,%xmm6
+    0.00 :   23680d: vmovaps %ymm8,%ymm9
+    0.00 :   236812: mov    %r10d,-0x20a8(%rbp)
+    0.00 :   236819: mov    -0x2058(%rbp),%r10
+    0.00 :   236820: vmovaps %ymm8,%ymm10
+    0.00 :   236825: lea    (%r15,%rdi,1),%esi
+    0.00 :   236829: mov    %edi,%eax
+    0.00 :   23682b: mov    %edi,%ebx
+    0.00 :   23682d: mov    %edi,%r9d
+    0.00 :   236830: cmp    %r12d,%esi
+    0.00 :   236833: cmovg  %r12d,%esi
+    0.00 :   236837: cltd
+    0.00 :   236838: idiv   %r15d
+    0.00 :   23683b: cltq
+    0.00 :   23683d: vmovss (%r10,%rax,4),%xmm7
+    0.00 :   236843: lea    0x7(%rdi),%eax
+    0.00 :   236846: cmp    %eax,%esi
+    0.00 :   236848: jle    236ad8 <host_rows+0x3578>
+    0.00 :   23684e: mov    $0xfffffff8,%r14d
+    0.00 :   236854: vxorps %xmm1,%xmm1,%xmm1
+    0.00 :   236858: mov    (%r8),%r13
+    0.00 :   23685b: mov    0x8(%r8),%r11
+    0.00 :   23685f: sub    %edi,%r14d
+    0.00 :   236862: mov    0x10(%r8),%r9
+    0.00 :   236866: vmovaps %ymm1,%ymm2
+    0.00 :   23686a: vmovaps %ymm1,%ymm3
+    0.00 :   23686e: add    %esi,%r14d
+    0.00 :   236871: mov    %r14d,%eax
+    0.00 :   236874: shr    $0x3,%eax
+    0.00 :   236877: lea    0x0(,%rax,8),%eax
+    0.00 :   23687e: lea    0x8(%rdi,%rax,1),%rdx
+    0.00 :   236883: mov    %rdi,%rax
+    0.00 :   236886: nopl   (%rax)
+    0.00 :   236889: data16 cs nopw 0x0(%rax,%rax,1)
+    0.00 :   236894: data16 cs nopw 0x0(%rax,%rax,1)
+    0.00 :   23689f: data16 cs nopw 0x0(%rax,%rax,1)
+    0.00 :   2368aa: data16 cs nopw 0x0(%rax,%rax,1)
+    0.00 :   2368b5: data16 cs nopw 0x0(%rax,%rax,1)
+    0.00 :   2368c0: vmovups (%rcx,%rax,4),%ymm0
+    0.00 :   2368c5: vfmadd231ps 0x0(%r13,%rax,4),%ymm0,%ymm3
+    0.00 :   2368cc: vfmadd231ps (%r11,%rax,4),%ymm0,%ymm2
+    0.00 :   2368d2: vfmadd231ps (%r9,%rax,4),%ymm0,%ymm1
+    0.00 :   2368d8: add    $0x8,%rax
+    0.00 :   2368dc: cmp    %rax,%rdx
+    0.00 :   2368df: jne    2368c0 <host_rows+0x3360>
+    0.00 :   2368e1: and    $0xfffffff8,%r14d
+    0.00 :   2368e5: lea    0x8(%rbx,%r14,1),%r9d
+    0.00 :   2368ea: vbroadcastss %xmm7,%ymm0
+    0.00 :   2368ef: vfmadd231ps %ymm0,%ymm3,%ymm10
+    0.00 :   2368f4: vfmadd231ps %ymm0,%ymm2,%ymm9
+    0.00 :   2368f9: vfmadd231ps %ymm0,%ymm1,%ymm8
+    0.00 :   2368fe: cmp    %r9d,%esi
+    0.00 :   236901: jle    236a34 <host_rows+0x34d4>
+    0.00 :   236907: sub    %r9d,%esi
+    0.00 :   23690a: mov    (%r8),%rbx
+    0.00 :   23690d: mov    0x8(%r8),%r11
+    0.00 :   236911: lea    -0x1(%rsi),%eax
+    0.00 :   236914: mov    0x10(%r8),%rdx
+    0.00 :   236918: cmp    $0x2,%eax
+    0.00 :   23691b: jbe    236d2c <host_rows+0x37cc>
+    0.00 :   236921: movslq %r9d,%rax
+    0.00 :   236924: vbroadcastss %xmm7,%xmm0
+    0.00 :   236929: vmulps (%rcx,%rax,4),%xmm0,%xmm0
+    0.00 :   23692e: vmulps (%rbx,%rax,4),%xmm0,%xmm1
+    0.00 :   236933: vaddss %xmm1,%xmm6,%xmm6
+    0.00 :   236937: vshufps $0x55,%xmm1,%xmm1,%xmm2
+    0.00 :   23693c: vaddss %xmm6,%xmm2,%xmm2
+    0.00 :   236940: vunpckhps %xmm1,%xmm1,%xmm6
+    0.00 :   236944: vshufps $0xff,%xmm1,%xmm1,%xmm1
+    0.00 :   236949: vaddss %xmm2,%xmm6,%xmm6
+    0.00 :   23694d: vaddss %xmm1,%xmm6,%xmm6
+    0.00 :   236951: vmulps (%r11,%rax,4),%xmm0,%xmm1
+    0.00 :   236957: vmulps (%rdx,%rax,4),%xmm0,%xmm0
+    0.00 :   23695c: vaddss %xmm1,%xmm5,%xmm5
+    0.00 :   236960: vshufps $0x55,%xmm1,%xmm1,%xmm2
+    0.00 :   236965: vaddss %xmm0,%xmm4,%xmm4
+    0.00 :   236969: vaddss %xmm5,%xmm2,%xmm2
+    0.00 :   23696d: vunpckhps %xmm1,%xmm1,%xmm5
+    0.00 :   236971: vshufps $0xff,%xmm1,%xmm1,%xmm1
+    0.00 :   236976: vaddss %xmm2,%xmm5,%xmm5
+    0.00 :   23697a: vaddss %xmm1,%xmm5,%xmm5
+    0.00 :   23697e: vshufps $0x55,%xmm0,%xmm0,%xmm1
+    0.00 :   236983: vaddss %xmm4,%xmm1,%xmm1
+    0.00 :   236987: vunpckhps %xmm0,%xmm0,%xmm4
+    0.00 :   23698b: vshufps $0xff,%xmm0,%xmm0,%xmm0
+    0.00 :   236990: vaddss %xmm1,%xmm4,%xmm4
+    0.00 :   236994: vaddss %xmm0,%xmm4,%xmm4
+    0.00 :   236998: test   $0x3,%sil
+    0.00 :   23699c: je     236a34 <host_rows+0x34d4>
+    0.00 :   2369a2: mov    %esi,%eax
+    0.00 :   2369a4: and    $0xfffffffc,%eax
+    0.00 :   2369a7: lea    (%rax,%r9,1),%r13d
+    0.00 :   2369ab: sub    %eax,%esi
+    0.00 :   2369ad: cmp    $0x1,%esi
+    0.00 :   2369b0: je     236a19 <host_rows+0x34b9>
+    0.00 :   2369b2: vmovsldup %xmm7,%xmm1
+    0.00 :   2369b6: movslq %r9d,%r9
+    0.00 :   2369b9: add    %r9,%rax
+    0.00 :   2369bc: vmovq  (%rcx,%rax,4),%xmm0
+    0.00 :   2369c1: vmovq  %xmm1,%xmm1
+    0.00 :   2369c5: vmulps %xmm1,%xmm0,%xmm0
+    0.00 :   2369c9: vmovq  (%rbx,%rax,4),%xmm1
+    0.00 :   2369ce: vmovq  %xmm0,%xmm0
+    0.00 :   2369d2: vmulps %xmm0,%xmm1,%xmm1
+    0.00 :   2369d6: vaddss %xmm6,%xmm1,%xmm6
+    0.00 :   2369da: vmovshdup %xmm1,%xmm1
+    0.00 :   2369de: vaddss %xmm1,%xmm6,%xmm6
+    0.00 :   2369e2: vmovq  (%r11,%rax,4),%xmm1
+    0.00 :   2369e8: vmulps %xmm0,%xmm1,%xmm1
+    0.00 :   2369ec: vaddss %xmm5,%xmm1,%xmm5
+    0.00 :   2369f0: vmovshdup %xmm1,%xmm1
+    0.00 :   2369f4: vaddss %xmm1,%xmm5,%xmm5
+    0.00 :   2369f8: vmovq  (%rdx,%rax,4),%xmm1
+    0.00 :   2369fd: vmulps %xmm0,%xmm1,%xmm0
+    0.00 :   236a01: vaddss %xmm4,%xmm0,%xmm4
+    0.00 :   236a05: vmovshdup %xmm0,%xmm0
+    0.00 :   236a09: vaddss %xmm0,%xmm4,%xmm4
+    0.00 :   236a0d: test   $0x1,%sil
+    0.00 :   236a11: je     236a34 <host_rows+0x34d4>
+    0.00 :   236a13: and    $0xfffffffe,%esi
+    0.00 :   236a16: add    %esi,%r13d
+    0.00 :   236a19: movslq %r13d,%r13
+    0.00 :   236a1c: vmulss (%rcx,%r13,4),%xmm7,%xmm7
+    0.00 :   236a22: vfmadd231ss (%rbx,%r13,4),%xmm7,%xmm6
+    0.00 :   236a28: vfmadd231ss (%r11,%r13,4),%xmm7,%xmm5
+    0.00 :   236a2e: vfmadd231ss (%rdx,%r13,4),%xmm7,%xmm4
+    0.00 :   236a34: add    -0x2090(%rbp),%rdi
+    0.00 :   236a3b: cmp    %edi,%r12d
+    0.00 :   236a3e: jg     236825 <host_rows+0x32c5>
+    0.00 :   236a44: mov    -0x2098(%rbp),%r13
+    0.00 :   236a4b: mov    -0x20a0(%rbp),%r9
+    0.00 :   236a52: mov    -0x20a8(%rbp),%r10d
+    0.00 :   236a59: vextractf128 $0x1,%ymm10,%xmm0
+    0.00 :   236a5f: mov    -0x2068(%rbp),%rax
+    0.00 :   236a66: vaddps %xmm10,%xmm0,%xmm0
+    0.00 :   236a6b: vmovhlps %xmm0,%xmm0,%xmm1
+    0.00 :   236a6f: vaddps %xmm1,%xmm0,%xmm0
+    0.00 :   236a73: vmovshdup %xmm0,%xmm1
+    0.00 :   236a77: vaddss %xmm1,%xmm0,%xmm0
+    0.00 :   236a7b: vaddss %xmm6,%xmm0,%xmm0
+    0.00 :   236a7f: vmovss %xmm0,(%r9)
+    0.00 :   236a84: vextractf128 $0x1,%ymm9,%xmm0
+    0.00 :   236a8a: vaddps %xmm9,%xmm0,%xmm0
+    0.00 :   236a8f: vmovhlps %xmm0,%xmm0,%xmm1
+    0.00 :   236a93: vaddps %xmm1,%xmm0,%xmm0
+    0.00 :   236a97: vmovshdup %xmm0,%xmm1
+    0.00 :   236a9b: vaddss %xmm1,%xmm0,%xmm0
+    0.00 :   236a9f: vaddss %xmm5,%xmm0,%xmm0
+    0.00 :   236aa3: vmovss %xmm0,(%r9,%rax,4)
+    0.00 :   236aa9: vextractf128 $0x1,%ymm8,%xmm0
+    0.00 :   236aaf: mov    -0x2060(%rbp),%rax
+    0.00 :   236ab6: vaddps %xmm8,%xmm0,%xmm0
+    0.00 :   236abb: vmovhlps %xmm0,%xmm0,%xmm1
+    0.00 :   236abf: vaddps %xmm1,%xmm0,%xmm0
+    0.00 :   236ac3: vmovshdup %xmm0,%xmm1
+    0.00 :   236ac7: vaddss %xmm1,%xmm0,%xmm0
+    0.00 :   236acb: vaddss %xmm4,%xmm0,%xmm0
+    0.00 :   236acf: vmovss %xmm0,(%rax)
+    0.00 :   236ad3: jmp    23644e <host_rows+0x2eee>
+    0.00 :   236ad8: vxorps %xmm1,%xmm1,%xmm1
+    0.00 :   236adc: vmovaps %ymm1,%ymm2
+    0.00 :   236ae0: vmovaps %ymm1,%ymm3
+    0.00 :   236ae4: jmp    2368ea <host_rows+0x338a>
+    0.00 :   236ae9: test   %r12d,%r12d
+    0.00 :   236aec: jle    23731e <host_rows+0x3dbe>
+    0.00 :   236af2: mov    %r13,-0x2098(%rbp)
+    0.00 :   236af9: vxorps %xmm3,%xmm3,%xmm3
+    0.00 :   236afd: vxorps %xmm6,%xmm6,%xmm6
+    0.00 :   236b01: xor    %edi,%edi
+    0.00 :   236b03: mov    %r9,-0x20a0(%rbp)
+    0.00 :   236b0a: mov    -0x2058(%rbp),%r9
+    0.00 :   236b11: vmovaps %xmm3,%xmm4
+    0.00 :   236b15: vmovaps %ymm6,%ymm7
+    0.00 :   236b19: mov    %r10d,-0x20a8(%rbp)
+    0.00 :   236b20: mov    -0x2090(%rbp),%r10
+    0.00 :   236b27: lea    (%r15,%rdi,1),%esi
+    0.00 :   236b2b: mov    %edi,%eax
+    0.00 :   236b2d: mov    %edi,%ebx
+    0.00 :   236b2f: mov    %edi,%r11d
+    0.00 :   236b32: cmp    %r12d,%esi
+    0.00 :   236b35: cmovg  %r12d,%esi
+    0.00 :   236b39: cltd
+    0.00 :   236b3a: idiv   %r15d
+    0.00 :   236b3d: cltq
+    0.00 :   236b3f: vmovss (%r9,%rax,4),%xmm5
+    0.00 :   236b45: lea    0x7(%rdi),%eax
+    0.00 :   236b48: cmp    %eax,%esi
+    0.00 :   236b4a: jle    236d15 <host_rows+0x37b5>
+    0.00 :   236b50: mov    $0xfffffff8,%r14d
+    0.00 :   236b56: vxorps %xmm1,%xmm1,%xmm1
+    0.00 :   236b5a: mov    (%r8),%r13
+    0.00 :   236b5d: mov    0x8(%r8),%r11
+    0.00 :   236b61: sub    %edi,%r14d
+    0.00 :   236b64: vmovaps %ymm1,%ymm2
+    0.00 :   236b68: add    %esi,%r14d
+    0.00 :   236b6b: mov    %r14d,%eax
+    0.00 :   236b6e: shr    $0x3,%eax
+    0.00 :   236b71: lea    0x0(,%rax,8),%eax
+    0.00 :   236b78: lea    0x8(%rdi,%rax,1),%rdx
+    0.00 :   236b7d: mov    %rdi,%rax
+    0.00 :   236b80: vmovups (%rcx,%rax,4),%ymm0
+    0.00 :   236b85: vfmadd231ps 0x0(%r13,%rax,4),%ymm0,%ymm2
+    0.00 :   236b8c: vfmadd231ps (%r11,%rax,4),%ymm0,%ymm1
+    0.00 :   236b92: add    $0x8,%rax
+    0.00 :   236b96: cmp    %rax,%rdx
+    0.00 :   236b99: jne    236b80 <host_rows+0x3620>
+    0.00 :   236b9b: and    $0xfffffff8,%r14d
+    0.00 :   236b9f: lea    0x8(%rbx,%r14,1),%r11d
+    0.00 :   236ba4: vbroadcastss %xmm5,%ymm0
+    0.00 :   236ba9: vfmadd231ps %ymm0,%ymm2,%ymm7
+    0.00 :   236bae: vfmadd231ps %ymm0,%ymm1,%ymm6
+    0.00 :   236bb3: cmp    %r11d,%esi
+    0.00 :   236bb6: jle    236ca1 <host_rows+0x3741>
+    0.00 :   236bbc: sub    %r11d,%esi
+    0.00 :   236bbf: mov    (%r8),%rbx
+    0.00 :   236bc2: mov    0x8(%r8),%rdx
+    0.00 :   236bc6: lea    -0x1(%rsi),%eax
+    0.00 :   236bc9: cmp    $0x2,%eax
+    0.00 :   236bcc: jbe    236d22 <host_rows+0x37c2>
+    0.00 :   236bd2: movslq %r11d,%rax
+    0.00 :   236bd5: vbroadcastss %xmm5,%xmm0
+    0.00 :   236bda: vmulps (%rcx,%rax,4),%xmm0,%xmm0
+    0.00 :   236bdf: vmulps (%rbx,%rax,4),%xmm0,%xmm1
+    0.00 :   236be4: vmulps (%rdx,%rax,4),%xmm0,%xmm0
+    0.00 :   236be9: vaddss %xmm1,%xmm4,%xmm4
+    0.00 :   236bed: vshufps $0x55,%xmm1,%xmm1,%xmm2
+    0.00 :   236bf2: vaddss %xmm0,%xmm3,%xmm3
+    0.00 :   236bf6: vaddss %xmm4,%xmm2,%xmm2
+    0.00 :   236bfa: vunpckhps %xmm1,%xmm1,%xmm4
+    0.00 :   236bfe: vshufps $0xff,%xmm1,%xmm1,%xmm1
+    0.00 :   236c03: vaddss %xmm2,%xmm4,%xmm4
+    0.00 :   236c07: vaddss %xmm1,%xmm4,%xmm4
+    0.00 :   236c0b: vshufps $0x55,%xmm0,%xmm0,%xmm1
+    0.00 :   236c10: vaddss %xmm3,%xmm1,%xmm1
+    0.00 :   236c14: vunpckhps %xmm0,%xmm0,%xmm3
+    0.00 :   236c18: vshufps $0xff,%xmm0,%xmm0,%xmm0
+    0.00 :   236c1d: vaddss %xmm1,%xmm3,%xmm3
+    0.00 :   236c21: vaddss %xmm0,%xmm3,%xmm3
+    0.00 :   236c25: test   $0x3,%sil
+    0.00 :   236c29: je     236ca1 <host_rows+0x3741>
+    0.00 :   236c2b: mov    %esi,%eax
+    0.00 :   236c2d: and    $0xfffffffc,%eax
+    0.00 :   236c30: lea    (%rax,%r11,1),%r13d
+    0.00 :   236c34: sub    %eax,%esi
+    0.00 :   236c36: cmp    $0x1,%esi
+    0.00 :   236c39: je     236c8c <host_rows+0x372c>
+    0.00 :   236c3b: vmovsldup %xmm5,%xmm0
+    0.00 :   236c3f: movslq %r11d,%r11
+    0.00 :   236c42: add    %r11,%rax
+    0.00 :   236c45: vmovq  (%rcx,%rax,4),%xmm1
+    0.00 :   236c4a: vmovq  %xmm0,%xmm0
+    0.00 :   236c4e: vmulps %xmm0,%xmm1,%xmm1
+    0.00 :   236c52: vmovq  (%rbx,%rax,4),%xmm0
+    0.00 :   236c57: vmovq  %xmm1,%xmm1
+    0.00 :   236c5b: vmulps %xmm1,%xmm0,%xmm0
+    0.00 :   236c5f: vaddss %xmm4,%xmm0,%xmm4
+    0.00 :   236c63: vmovshdup %xmm0,%xmm0
+    0.00 :   236c67: vaddss %xmm0,%xmm4,%xmm4
+    0.00 :   236c6b: vmovq  (%rdx,%rax,4),%xmm0
+    0.00 :   236c70: vmulps %xmm1,%xmm0,%xmm0
+    0.00 :   236c74: vaddss %xmm3,%xmm0,%xmm3
+    0.00 :   236c78: vmovshdup %xmm0,%xmm0
+    0.00 :   236c7c: vaddss %xmm0,%xmm3,%xmm3
+    0.00 :   236c80: test   $0x1,%sil
+    0.00 :   236c84: je     236ca1 <host_rows+0x3741>
+    0.00 :   236c86: and    $0xfffffffe,%esi
+    0.00 :   236c89: add    %esi,%r13d
+    0.00 :   236c8c: movslq %r13d,%r13
+    0.00 :   236c8f: vmulss (%rcx,%r13,4),%xmm5,%xmm5
+    0.00 :   236c95: vfmadd231ss (%rbx,%r13,4),%xmm5,%xmm4
+    0.00 :   236c9b: vfmadd231ss (%rdx,%r13,4),%xmm5,%xmm3
+    0.00 :   236ca1: add    %r10,%rdi
+    0.00 :   236ca4: cmp    %edi,%r12d
+    0.00 :   236ca7: jg     236b27 <host_rows+0x35c7>
+    0.00 :   236cad: mov    -0x2098(%rbp),%r13
+    0.00 :   236cb4: mov    -0x20a0(%rbp),%r9
+    0.00 :   236cbb: mov    -0x20a8(%rbp),%r10d
+    0.00 :   236cc2: vextractf128 $0x1,%ymm7,%xmm0
+    0.00 :   236cc8: mov    -0x2068(%rbp),%rax
+    0.00 :   236ccf: vaddps %xmm7,%xmm0,%xmm0
+    0.00 :   236cd3: vmovhlps %xmm0,%xmm0,%xmm1
+    0.00 :   236cd7: vaddps %xmm1,%xmm0,%xmm0
+    0.00 :   236cdb: vmovshdup %xmm0,%xmm1
+    0.00 :   236cdf: vaddss %xmm1,%xmm0,%xmm0
+    0.00 :   236ce3: vaddss %xmm4,%xmm0,%xmm0
+    0.00 :   236ce7: vmovss %xmm0,(%r9)
+    0.00 :   236cec: vextractf128 $0x1,%ymm6,%xmm0
+    0.00 :   236cf2: vaddps %xmm6,%xmm0,%xmm0
+    0.00 :   236cf6: vmovhlps %xmm0,%xmm0,%xmm1
+    0.00 :   236cfa: vaddps %xmm1,%xmm0,%xmm0
+    0.00 :   236cfe: vmovshdup %xmm0,%xmm1
+    0.00 :   236d02: vaddss %xmm1,%xmm0,%xmm0
+    0.00 :   236d06: vaddss %xmm3,%xmm0,%xmm0
+    0.00 :   236d0a: vmovss %xmm0,(%r9,%rax,4)
+    0.00 :   236d10: jmp    23644e <host_rows+0x2eee>
+    0.00 :   236d15: vxorps %xmm1,%xmm1,%xmm1
+    0.00 :   236d19: vmovaps %ymm1,%ymm2
+    0.00 :   236d1d: jmp    236ba4 <host_rows+0x3644>
+    0.00 :   236d22: mov    %r11d,%r13d
+    0.00 :   236d25: xor    %eax,%eax
+    0.00 :   236d27: jmp    236c34 <host_rows+0x36d4>
+    0.00 :   236d2c: mov    %r9d,%r13d
+    0.00 :   236d2f: xor    %eax,%eax
+    0.00 :   236d31: jmp    2369ab <host_rows+0x344b>
+    0.00 :   236d36: mov    %r9d,%r13d
+    0.00 :   236d39: xor    %eax,%eax
+    0.00 :   236d3b: jmp    23665f <host_rows+0x30ff>
+    0.00 :   236d40: mov    %ebx,%r11d
+    0.00 :   236d43: xor    %eax,%eax
+    0.00 :   236d45: jmp    2363bf <host_rows+0x2e5f>
+    0.00 :   236d4a: vmovss 0x1f2c6(%rip),%xmm7        # 256018 <_IO_stdin_used+0x18>
+    0.00 :   236d52: movzbl %dl,%edx
+    0.00 :   236d55: vfmadd132ss 0x1f2b2(%rip),%xmm7,%xmm0        # 256010 <_IO_stdin_used+0x10>
+    0.00 :   236d5e: mov    %r8,-0x20a0(%rbp)
+    0.00 :   236d65: lea    -0x7(%rdx),%edi
+    0.00 :   236d68: mov    %esi,-0x2098(%rbp)
+    0.00 :   236d6e: mov    %rcx,-0x2070(%rbp)
+    0.00 :   236d75: mov    %al,-0x2068(%rbp)
+    0.00 :   236d7b: call   8c80 <ldexpf@plt>
+    0.00 :   236d80: movzbl -0x2068(%rbp),%eax
+    0.00 :   236d87: vxorps %xmm4,%xmm4,%xmm4
+    0.00 :   236d8b: mov    -0x2070(%rbp),%rcx
+    0.00 :   236d92: mov    -0x2098(%rbp),%esi
+    0.00 :   236d98: mov    -0x20a0(%rbp),%r8
+    0.00 :   236d9f: jmp    2339bd <host_rows+0x45d>
+    0.00 :   236da4: mov    -0x2058(%rbp),%r11
+    0.00 :   236dab: movslq %r12d,%r9
+    0.00 :   236dae: xor    %edi,%edi
+    0.00 :   236db0: lea    0x7b4c9(%rip),%r10        # 2b2280 <e2m1.4>
+    0.00 :   236db7: mov    %edi,%edx
+    0.00 :   236db9: mov    %edi,%eax
+    0.00 :   236dbb: sar    $1,%edx
+    0.00 :   236dbd: movslq %edx,%rdx
+    0.00 :   236dc0: movzbl 0x0(%r13,%rdx,1),%edx
+    0.00 :   236dc6: mov    %edx,%r14d
+    0.00 :   236dc9: and    $0xf,%edx
+    0.00 :   236dcc: shr    $0x4,%r14b
+    0.00 :   236dd0: test   $0x1,%dil
+    0.00 :   236dd4: cmovne %r14d,%edx
+    0.00 :   236dd8: mov    %rdx,%r14
+    0.00 :   236ddb: and    $0x7,%r14d
+    0.00 :   236ddf: and    $0x8,%edx
+    0.00 :   236de2: vmovss (%r10,%r14,4),%xmm0
+    0.00 :   236de8: je     236df2 <host_rows+0x3892>
+    0.00 :   236dea: vxorps 0x3629e(%rip),%xmm0,%xmm0        # 26d090 <CSWTCH.257+0xa530>
+    0.00 :   236df2: cltd
+    0.00 :   236df3: idiv   %esi
+    0.00 :   236df5: cltq
+    0.00 :   236df7: vmulss (%r11,%rax,4),%xmm0,%xmm0
+    0.00 :   236dfd: vmovss %xmm0,(%rcx,%rdi,4)
+    0.00 :   236e02: add    $0x1,%rdi
+    0.00 :   236e06: cmp    %r9,%rdi
+    0.00 :   236e09: jne    236db7 <host_rows+0x3857>
+    0.00 :   236e0b: jmp    235a22 <host_rows+0x24c2>
+    0.00 :   236e10: xor    %edx,%edx
+    0.00 :   236e12: movzwl 0x0(%r13,%rdx,2),%esi
+    0.00 :   236e18: shl    $0x10,%esi
+    0.00 :   236e1b: mov    %esi,(%rcx,%rdx,4)
+    0.00 :   236e1e: add    $0x1,%rdx
+    0.00 :   236e22: cmp    %rdx,%rax
+    0.00 :   236e25: jne    236e12 <host_rows+0x38b2>
+    0.00 :   236e27: jmp    2336c0 <host_rows+0x160>
+    0.00 :   236e2c: xor    %eax,%eax
+    0.00 :   236e2e: jmp    233ec8 <host_rows+0x968>
+    0.00 :   236e33: xor    %edi,%edi
+    0.00 :   236e35: xor    %edx,%edx
+    0.00 :   236e37: jmp    234740 <host_rows+0x11e0>
+    0.00 :   236e3c: vxorps %xmm8,%xmm8,%xmm8
+    0.00 :   236e41: vxorps %xmm12,%xmm12,%xmm12
+    0.00 :   236e46: vmovaps %xmm8,%xmm9
+    0.00 :   236e4b: vmovaps %xmm8,%xmm10
+    0.00 :   236e50: vmovaps %ymm12,%ymm13
+    0.00 :   236e55: vmovaps %ymm12,%ymm14
+    0.00 :   236e5a: jmp    23577c <host_rows+0x221c>
+    0.00 :   236e5f: vxorps %xmm6,%xmm6,%xmm6
+    0.00 :   236e63: vxorps %xmm8,%xmm8,%xmm8
+    0.00 :   236e68: jmp    2345bf <host_rows+0x105f>
+    0.00 :   236e6d: vxorps %xmm9,%xmm9,%xmm9
+    0.00 :   236e72: vxorps %xmm0,%xmm0,%xmm0
+    0.00 :   236e76: vmovaps %xmm9,%xmm10
+    0.00 :   236e7b: vmovaps %xmm9,%xmm11
+    0.00 :   236e80: vmovaps %xmm9,%xmm12
+    0.00 :   236e85: vmovaps %ymm0,%ymm15
+    0.00 :   236e89: vmovaps %ymm0,%ymm14
+    0.00 :   236e8d: vmovaps %ymm0,%ymm13
+    0.00 :   236e91: jmp    2353d0 <host_rows+0x1e70>
+    0.00 :   236e96: xor    %edx,%edx
+    0.00 :   236e98: xor    %edi,%edi
+    0.00 :   236e9a: jmp    233c65 <host_rows+0x705>
+    0.00 :   236e9f: mov    -0x38(%rbp),%rax
+    0.00 :   236ea3: sub    %fs:0x28,%rax
+    0.00 :   236eac: jne    2374e4 <host_rows+0x3f84>
+    0.00 :   236eb2: mov    0x8(%rbx),%r8
+    0.00 :   236eb6: mov    (%rbx),%rcx
+    0.00 :   236eb9: mov    %edx,(%r11)
+    0.00 :   236ebc: mov    %r12d,%r9d
+    0.00 :   236ebf: mov    -0x2090(%rbp),%esi
+    0.00 :   236ec5: mov    -0x2060(%rbp),%rdi
+    0.00 :   236ecc: mov    %r13,%rdx
+    0.00 :   236ecf: lea    -0x28(%rbp),%rsp
+    0.00 :   236ed3: pop    %rbx
+    0.00 :   236ed4: pop    %r12
+    0.00 :   236ed6: pop    %r13
+    0.00 :   236ed8: pop    %r14
+    0.00 :   236eda: pop    %r15
+    0.00 :   236edc: pop    %rbp
+    0.00 :   236edd: lea    -0x10(%r13),%rsp
+    0.00 :   236ee1: pop    %r13
+    0.00 :   236ee3: jmp    33800 <gq_dot_q2_0.lto_priv.0.lto_priv.0>
+    0.00 :   236ee8: mov    -0x38(%rbp),%rax
+    0.00 :   236eec: sub    %fs:0x28,%rax
+    0.00 :   236ef5: jne    2374e4 <host_rows+0x3f84>
+    0.00 :   236efb: mov    0x8(%rbx),%r8
+    0.00 :   236eff: mov    (%rbx),%rcx
+    0.00 :   236f02: mov    %edx,(%r11)
+    0.00 :   236f05: mov    %r12d,%r9d
+    0.00 :   236f08: mov    -0x2090(%rbp),%esi
+    0.00 :   236f0e: mov    -0x2060(%rbp),%rdi
+    0.00 :   236f15: mov    %r13,%rdx
+    0.00 :   236f18: lea    -0x28(%rbp),%rsp
+    0.00 :   236f1c: pop    %rbx
+    0.00 :   236f1d: pop    %r12
+    0.00 :   236f1f: pop    %r13
+    0.00 :   236f21: pop    %r14
+    0.00 :   236f23: pop    %r15
+    0.00 :   236f25: pop    %rbp
+    0.00 :   236f26: lea    -0x10(%r13),%rsp
+    0.00 :   236f2a: pop    %r13
+    0.00 :   236f2c: jmp    40390 <gq_dot_q6_k.isra.0>
+    0.00 :   236f31: mov    -0x38(%rbp),%rax
+    0.00 :   236f35: sub    %fs:0x28,%rax
+    0.00 :   236f3e: jne    2374e4 <host_rows+0x3f84>
+    0.00 :   236f44: mov    0x10(%rbx),%r9
+    0.00 :   236f48: mov    0x8(%rbx),%r8
+    0.00 :   236f4c: mov    (%rbx),%rcx
+    0.00 :   236f4f: mov    %edx,0x8(%r11)
+    0.00 :   236f53: mov    %r13,%rdx
+    0.00 :   236f56: mov    %r12d,(%r11)
+    0.00 :   236f59: mov    -0x2090(%rbp),%esi
+    0.00 :   236f5f: mov    -0x2060(%rbp),%rdi
+    0.00 :   236f66: lea    -0x28(%rbp),%rsp
+    0.00 :   236f6a: pop    %rbx
+    0.00 :   236f6b: pop    %r12
+    0.00 :   236f6d: pop    %r13
+    0.00 :   236f6f: pop    %r14
+    0.00 :   236f71: pop    %r15
+    0.00 :   236f73: pop    %rbp
+    0.00 :   236f74: lea    -0x10(%r13),%rsp
+    0.00 :   236f78: pop    %r13
+    0.00 :   236f7a: jmp    3ea00 <gq_dot_q5_k.lto_priv.0.lto_priv.0>
+    0.00 :   236f7f: mov    -0x38(%rbp),%rax
+    0.00 :   236f83: sub    %fs:0x28,%rax
+    0.00 :   236f8c: jne    2374e4 <host_rows+0x3f84>
+    0.00 :   236f92: mov    0x10(%rbx),%r9
+    0.00 :   236f96: mov    0x8(%rbx),%r8
+    0.00 :   236f9a: mov    (%rbx),%rcx
+    0.00 :   236f9d: mov    %edx,0x8(%r11)
+    0.00 :   236fa1: mov    %r13,%rdx
+    0.00 :   236fa4: mov    %r12d,(%r11)
+    0.00 :   236fa7: mov    -0x2090(%rbp),%esi
+    0.00 :   236fad: mov    -0x2060(%rbp),%rdi
+    0.00 :   236fb4: lea    -0x28(%rbp),%rsp
+    0.00 :   236fb8: pop    %rbx
+    0.00 :   236fb9: pop    %r12
+    0.00 :   236fbb: pop    %r13
+    0.00 :   236fbd: pop    %r14
+    0.00 :   236fbf: pop    %r15
+    0.00 :   236fc1: pop    %rbp
+    0.00 :   236fc2: lea    -0x10(%r13),%rsp
+    0.00 :   236fc6: pop    %r13
+    0.00 :   236fc8: jmp    3d400 <gq_dot_q4_k.lto_priv.0.lto_priv.0>
+    0.00 :   236fcd: mov    -0x38(%rbp),%rax
+    0.00 :   236fd1: sub    %fs:0x28,%rax
+    0.00 :   236fda: jne    2374e4 <host_rows+0x3f84>
+    0.00 :   236fe0: mov    0x8(%rbx),%r8
+    0.00 :   236fe4: mov    (%rbx),%rcx
+    0.00 :   236fe7: mov    %edx,(%r11)
+    0.00 :   236fea: mov    %r12d,%r9d
+    0.00 :   236fed: mov    -0x2090(%rbp),%esi
+    0.00 :   236ff3: mov    -0x2060(%rbp),%rdi
+    0.00 :   236ffa: mov    %r13,%rdx
+    0.00 :   236ffd: lea    -0x28(%rbp),%rsp
+    0.00 :   237001: pop    %rbx
+    0.00 :   237002: pop    %r12
+    0.00 :   237004: pop    %r13
+    0.00 :   237006: pop    %r14
+    0.00 :   237008: pop    %r15
+    0.00 :   23700a: pop    %rbp
+    0.00 :   23700b: lea    -0x10(%r13),%rsp
+    0.00 :   23700f: pop    %r13
+    0.00 :   237011: jmp    41060 <gq_dot_q3_k.isra.0>
+    0.00 :   237016: vxorps %xmm5,%xmm5,%xmm5
+    0.00 :   23701a: vxorps %xmm11,%xmm11,%xmm11
+    0.00 :   23701f: vmovaps %xmm5,%xmm6
+    0.00 :   237023: vmovaps %xmm5,%xmm7
+    0.00 :   237027: vmovaps %xmm5,%xmm8
+    0.00 :   23702b: vmovaps %ymm11,%ymm12
+    0.00 :   237030: vmovaps %ymm11,%ymm10
+    0.00 :   237035: vmovaps %ymm11,%ymm13
+    0.00 :   23703a: jmp    23672b <host_rows+0x31cb>
+    0.00 :   23703f: vxorps %xmm1,%xmm1,%xmm1
+    0.00 :   237043: vxorps %xmm3,%xmm3,%xmm3
+    0.00 :   237047: jmp    23642b <host_rows+0x2ecb>
+    0.00 :   23704c: vmovdqa 0x3602c(%rip),%xmm2        # 26d080 <CSWTCH.257+0xa520>
+    0.00 :   237054: xor    %edi,%edi
+    0.00 :   237056: jmp    233f9c <host_rows+0xa3c>
+    0.00 :   23705b: lea    0x0(%r13,%r11,1),%rdi
+    0.00 :   237060: lea    (%rax,%rax,1),%ecx
+    0.00 :   237063: movzbl (%rdi),%r8d
+    0.00 :   237067: movslq %ecx,%r9
+    0.00 :   23706a: and    $0xf,%r8d
+    0.00 :   23706e: mov    %r8b,(%r10,%r9,1)
+    0.00 :   237072: movzbl (%rdi),%edi
+    0.00 :   237075: shr    $0x4,%dil
+    0.00 :   237079: mov    %dil,0x1(%r10,%r9,1)
+    0.00 :   23707e: lea    0x1(%rax),%edi
+    0.00 :   237081: cmp    %edx,%edi
+    0.00 :   237083: jge    234063 <host_rows+0xb03>
+    0.00 :   237089: movslq %edi,%rdi
+    0.00 :   23708c: lea    0x2(%rcx),%r8d
+    0.00 :   237090: add    %r13,%rdi
+    0.00 :   237093: movslq %r8d,%r8
+    0.00 :   237096: movzbl (%rdi),%r9d
+    0.00 :   23709a: and    $0xf,%r9d
+    0.00 :   23709e: mov    %r9b,(%r10,%r8,1)
+    0.00 :   2370a2: movzbl (%rdi),%edi
+    0.00 :   2370a5: shr    $0x4,%dil
+    0.00 :   2370a9: mov    %dil,0x1(%r10,%r8,1)
+    0.00 :   2370ae: lea    0x2(%rax),%edi
+    0.00 :   2370b1: cmp    %edx,%edi
+    0.00 :   2370b3: jge    234063 <host_rows+0xb03>
+    0.00 :   2370b9: movslq %edi,%rdi
+    0.00 :   2370bc: lea    0x4(%rcx),%r8d
+    0.00 :   2370c0: add    %r13,%rdi
+    0.00 :   2370c3: movslq %r8d,%r8
+    0.00 :   2370c6: movzbl (%rdi),%r9d
+    0.00 :   2370ca: and    $0xf,%r9d
+    0.00 :   2370ce: mov    %r9b,(%r10,%r8,1)
+    0.00 :   2370d2: movzbl (%rdi),%edi
+    0.00 :   2370d5: shr    $0x4,%dil
+    0.00 :   2370d9: mov    %dil,0x1(%r10,%r8,1)
+    0.00 :   2370de: lea    0x3(%rax),%edi
+    0.00 :   2370e1: cmp    %edx,%edi
+    0.00 :   2370e3: jge    234063 <host_rows+0xb03>
+    0.00 :   2370e9: movslq %edi,%rdi
+    0.00 :   2370ec: lea    0x6(%rcx),%r8d
+    0.00 :   2370f0: add    %r13,%rdi
+    0.00 :   2370f3: movslq %r8d,%r8
+    0.00 :   2370f6: movzbl (%rdi),%r9d
+    0.00 :   2370fa: and    $0xf,%r9d
+    0.00 :   2370fe: mov    %r9b,(%r10,%r8,1)
+    0.00 :   237102: movzbl (%rdi),%edi
+    0.00 :   237105: shr    $0x4,%dil
+    0.00 :   237109: mov    %dil,0x1(%r10,%r8,1)
+    0.00 :   23710e: lea    0x4(%rax),%edi
+    0.00 :   237111: cmp    %edx,%edi
+    0.00 :   237113: jge    234063 <host_rows+0xb03>
+    0.00 :   237119: movslq %edi,%rdi
+    0.00 :   23711c: lea    0x8(%rcx),%r8d
+    0.00 :   237120: add    %r13,%rdi
+    0.00 :   237123: movslq %r8d,%r8
+    0.00 :   237126: movzbl (%rdi),%r9d
+    0.00 :   23712a: and    $0xf,%r9d
+    0.00 :   23712e: mov    %r9b,(%r10,%r8,1)
+    0.00 :   237132: movzbl (%rdi),%edi
+    0.00 :   237135: shr    $0x4,%dil
+    0.00 :   237139: mov    %dil,0x1(%r10,%r8,1)
+    0.00 :   23713e: lea    0x5(%rax),%edi
+    0.00 :   237141: cmp    %edx,%edi
+    0.00 :   237143: jge    234063 <host_rows+0xb03>
+    0.00 :   237149: movslq %edi,%rdi
+    0.00 :   23714c: lea    0xa(%rcx),%r8d
+    0.00 :   237150: add    %r13,%rdi
+    0.00 :   237153: movslq %r8d,%r8
+    0.00 :   237156: movzbl (%rdi),%r9d
+    0.00 :   23715a: and    $0xf,%r9d
+    0.00 :   23715e: mov    %r9b,(%r10,%r8,1)
+    0.00 :   237162: movzbl (%rdi),%edi
+    0.00 :   237165: shr    $0x4,%dil
+    0.00 :   237169: mov    %dil,0x1(%r10,%r8,1)
+    0.00 :   23716e: lea    0x6(%rax),%edi
+    0.00 :   237171: cmp    %edx,%edi
+    0.00 :   237173: jge    234063 <host_rows+0xb03>
+    0.00 :   237179: movslq %edi,%rdi
+    0.00 :   23717c: lea    0xc(%rcx),%r8d
+    0.00 :   237180: add    %r13,%rdi
+    0.00 :   237183: movslq %r8d,%r8
+    0.00 :   237186: movzbl (%rdi),%r9d
+    0.00 :   23718a: and    $0xf,%r9d
+    0.00 :   23718e: mov    %r9b,(%r10,%r8,1)
+    0.00 :   237192: movzbl (%rdi),%edi
+    0.00 :   237195: shr    $0x4,%dil
+    0.00 :   237199: mov    %dil,0x1(%r10,%r8,1)
+    0.00 :   23719e: lea    0x7(%rax),%edi
+    0.00 :   2371a1: cmp    %edx,%edi
+    0.00 :   2371a3: jge    234063 <host_rows+0xb03>
+    0.00 :   2371a9: movslq %edi,%rdi
+    0.00 :   2371ac: lea    0xe(%rcx),%r8d
+    0.00 :   2371b0: add    %r13,%rdi
+    0.00 :   2371b3: movslq %r8d,%r8
+    0.00 :   2371b6: movzbl (%rdi),%r9d
+    0.00 :   2371ba: and    $0xf,%r9d
+    0.00 :   2371be: mov    %r9b,(%r10,%r8,1)
+    0.00 :   2371c2: movzbl (%rdi),%edi
+    0.00 :   2371c5: shr    $0x4,%dil
+    0.00 :   2371c9: mov    %dil,0x1(%r10,%r8,1)
+    0.00 :   2371ce: lea    0x8(%rax),%edi
+    0.00 :   2371d1: cmp    %edx,%edi
+    0.00 :   2371d3: jge    234063 <host_rows+0xb03>
+    0.00 :   2371d9: movslq %edi,%rdi
+    0.00 :   2371dc: lea    0x10(%rcx),%r8d
+    0.00 :   2371e0: add    %r13,%rdi
+    0.00 :   2371e3: movslq %r8d,%r8
+    0.00 :   2371e6: movzbl (%rdi),%r9d
+    0.00 :   2371ea: and    $0xf,%r9d
+    0.00 :   2371ee: mov    %r9b,(%r10,%r8,1)
+    0.00 :   2371f2: movzbl (%rdi),%edi
+    0.00 :   2371f5: shr    $0x4,%dil
+    0.00 :   2371f9: mov    %dil,0x1(%r10,%r8,1)
+    0.00 :   2371fe: lea    0x9(%rax),%edi
+    0.00 :   237201: cmp    %edx,%edi
+    0.00 :   237203: jge    234063 <host_rows+0xb03>
+    0.00 :   237209: movslq %edi,%rdi
+    0.00 :   23720c: lea    0x12(%rcx),%r8d
+    0.00 :   237210: add    %r13,%rdi
+    0.00 :   237213: movslq %r8d,%r8
+    0.00 :   237216: movzbl (%rdi),%r9d
+    0.00 :   23721a: and    $0xf,%r9d
+    0.00 :   23721e: mov    %r9b,(%r10,%r8,1)
+    0.00 :   237222: movzbl (%rdi),%edi
+    0.00 :   237225: shr    $0x4,%dil
+    0.00 :   237229: mov    %dil,0x1(%r10,%r8,1)
+    0.00 :   23722e: lea    0xa(%rax),%edi
+    0.00 :   237231: cmp    %edx,%edi
+    0.00 :   237233: jge    234063 <host_rows+0xb03>
+    0.00 :   237239: movslq %edi,%rdi
+    0.00 :   23723c: lea    0x14(%rcx),%r8d
+    0.00 :   237240: add    %r13,%rdi
+    0.00 :   237243: movslq %r8d,%r8
+    0.00 :   237246: movzbl (%rdi),%r9d
+    0.00 :   23724a: and    $0xf,%r9d
+    0.00 :   23724e: mov    %r9b,(%r10,%r8,1)
+    0.00 :   237252: movzbl (%rdi),%edi
+    0.00 :   237255: shr    $0x4,%dil
+    0.00 :   237259: mov    %dil,0x1(%r10,%r8,1)
+    0.00 :   23725e: lea    0xb(%rax),%edi
+    0.00 :   237261: cmp    %edx,%edi
+    0.00 :   237263: jge    234063 <host_rows+0xb03>
+    0.00 :   237269: movslq %edi,%rdi
+    0.00 :   23726c: lea    0x16(%rcx),%r8d
+    0.00 :   237270: add    %r13,%rdi
+    0.00 :   237273: movslq %r8d,%r8
+    0.00 :   237276: movzbl (%rdi),%r9d
+    0.00 :   23727a: and    $0xf,%r9d
+    0.00 :   23727e: mov    %r9b,(%r10,%r8,1)
+    0.00 :   237282: movzbl (%rdi),%edi
+    0.00 :   237285: shr    $0x4,%dil
+    0.00 :   237289: mov    %dil,0x1(%r10,%r8,1)
+    0.00 :   23728e: lea    0xc(%rax),%edi
+    0.00 :   237291: cmp    %edx,%edi
+    0.00 :   237293: jge    234063 <host_rows+0xb03>
+    0.00 :   237299: movslq %edi,%rdi
+    0.00 :   23729c: lea    0x18(%rcx),%r8d
+    0.00 :   2372a0: add    %r13,%rdi
+    0.00 :   2372a3: movslq %r8d,%r8
+    0.00 :   2372a6: movzbl (%rdi),%r9d
+    0.00 :   2372aa: and    $0xf,%r9d
+    0.00 :   2372ae: mov    %r9b,(%r10,%r8,1)
+    0.00 :   2372b2: movzbl (%rdi),%edi
+    0.00 :   2372b5: shr    $0x4,%dil
+    0.00 :   2372b9: mov    %dil,0x1(%r10,%r8,1)
+    0.00 :   2372be: lea    0xd(%rax),%edi
+    0.00 :   2372c1: cmp    %edx,%edi
+    0.00 :   2372c3: jge    234063 <host_rows+0xb03>
+    0.00 :   2372c9: movslq %edi,%rdi
+    0.00 :   2372cc: lea    0x1a(%rcx),%r8d
+    0.00 :   2372d0: add    $0xe,%eax
+    0.00 :   2372d3: add    %r13,%rdi
+    0.00 :   2372d6: movslq %r8d,%r8
+    0.00 :   2372d9: movzbl (%rdi),%r9d
+    0.00 :   2372dd: and    $0xf,%r9d
+    0.00 :   2372e1: mov    %r9b,(%r10,%r8,1)
+    0.00 :   2372e5: movzbl (%rdi),%edi
+    0.00 :   2372e8: shr    $0x4,%dil
+    0.00 :   2372ec: mov    %dil,0x1(%r10,%r8,1)
+    0.00 :   2372f1: cmp    %edx,%eax
+    0.00 :   2372f3: jge    234063 <host_rows+0xb03>
+    0.00 :   2372f9: cltq
+    0.00 :   2372fb: lea    0x1c(%rcx),%edx
+    0.00 :   2372fe: add    %r13,%rax
+    0.00 :   237301: movslq %edx,%rdx
+    0.00 :   237304: movzbl (%rax),%ecx
+    0.00 :   237307: and    $0xf,%ecx
+    0.00 :   23730a: mov    %cl,(%r10,%rdx,1)
+    0.00 :   23730e: movzbl (%rax),%eax
+    0.00 :   237311: shr    $0x4,%al
+    0.00 :   237314: mov    %al,0x1(%r10,%rdx,1)
+    0.00 :   237319: jmp    234063 <host_rows+0xb03>
+    0.00 :   23731e: vxorps %xmm3,%xmm3,%xmm3
+    0.00 :   237322: vxorps %xmm6,%xmm6,%xmm6
+    0.00 :   237326: vmovaps %xmm3,%xmm4
+    0.00 :   23732a: vmovaps %ymm6,%ymm7
+    0.00 :   23732e: jmp    236cc2 <host_rows+0x3762>
+    0.00 :   237333: vxorps %xmm4,%xmm4,%xmm4
+    0.00 :   237337: vxorps %xmm8,%xmm8,%xmm8
+    0.00 :   23733c: vmovaps %xmm4,%xmm5
+    0.00 :   237340: vmovaps %xmm4,%xmm6
+    0.00 :   237344: vmovaps %ymm8,%ymm9
+    0.00 :   237349: vmovaps %ymm8,%ymm10
+    0.00 :   23734e: jmp    236a59 <host_rows+0x34f9>
+    0.00 :   237353: vxorps %xmm7,%xmm7,%xmm7
+    0.00 :   237357: vxorps %xmm10,%xmm10,%xmm10
+    0.00 :   23735c: vmovaps %xmm7,%xmm8
+    0.00 :   237360: vmovaps %ymm10,%ymm11
+    0.00 :   237365: jmp    234fdc <host_rows+0x1a7c>
+    0.00 :   23736a: xor    %edx,%edx
+    0.00 :   23736c: jmp    2349a6 <host_rows+0x1446>
+    0.00 :   237371: xor    %eax,%eax
+    0.00 :   237373: jmp    23604e <host_rows+0x2aee>
+    0.00 :   237378: test   %r12d,%r12d
+    0.00 :   23737b: jle    2336c0 <host_rows+0x160>
+    0.00 :   237381: cmp    $0xffffffff,%r10d
+    0.00 :   237385: je     237391 <host_rows+0x3e31>
+    0.00 :   237387: cmp    $0xfffffff3,%r10d
+    0.00 :   23738b: jne    237421 <host_rows+0x3ec1>
+    0.00 :   237391: movsbl 0x0(%r13),%eax
+    0.00 :   237396: movslq %r12d,%r9
+    0.00 :   237399: vcvtsi2ss %eax,%xmm4,%xmm0
+    0.00 :   23739d: xor    %eax,%eax
+    0.00 :   23739f: test   %esi,%esi
+    0.00 :   2373a1: je     2373ea <host_rows+0x3e8a>
+    0.00 :   2373a3: mov    -0x2058(%rbp),%r10
+    0.00 :   2373aa: xor    %edi,%edi
+    0.00 :   2373ac: jmp    2373cc <host_rows+0x3e6c>
+    0.00 :   2373ae: nopl   0x0(%rax)
+    0.00 :   2373b5: data16 cs nopw 0x0(%rax,%rax,1)
+    0.00 :   2373c0: movsbl 0x0(%r13,%rdi,1),%edx
+    0.00 :   2373c6: mov    %edi,%eax
+    0.00 :   2373c8: vcvtsi2ss %edx,%xmm4,%xmm0
+    0.00 :   2373cc: cltd
+    0.00 :   2373cd: idiv   %esi
+    0.00 :   2373cf: cltq
+    0.00 :   2373d1: vmulss (%r10,%rax,4),%xmm0,%xmm0
+    0.00 :   2373d7: vmovss %xmm0,(%rcx,%rdi,4)
+    0.00 :   2373dc: add    $0x1,%rdi
+    0.00 :   2373e0: cmp    %rdi,%r9
+    0.00 :   2373e3: jne    2373c0 <host_rows+0x3e60>
+    0.00 :   2373e5: jmp    2336c0 <host_rows+0x160>
+    0.00 :   2373ea: mov    -0x2058(%rbp),%rsi
+    0.00 :   2373f1: jmp    23740a <host_rows+0x3eaa>
+    0.00 :   2373f3: xchg   %ax,%ax
+    0.00 :   2373f5: data16 cs nopw 0x0(%rax,%rax,1)
+    0.00 :   237400: movsbl 0x0(%r13,%rax,1),%edx
+    0.00 :   237406: vcvtsi2ss %edx,%xmm4,%xmm0
+    0.00 :   23740a: vmulss (%rsi),%xmm0,%xmm0
+    0.00 :   23740e: vmovss %xmm0,(%rcx,%rax,4)
+    0.00 :   237413: add    $0x1,%rax
+    0.00 :   237417: cmp    %r9,%rax
+    0.00 :   23741a: jne    237400 <host_rows+0x3ea0>
+    0.00 :   23741c: jmp    2336c0 <host_rows+0x160>
+    0.00 :   237421: movslq %r12d,%r11
+    0.00 :   237424: xor    %edi,%edi
+    0.00 :   237426: cmp    $0xfffffffb,%r10d
+    0.00 :   23742a: jne    233ada <host_rows+0x57a>
+    0.00 :   237430: mov    %edi,%edx
+    0.00 :   237432: mov    %edi,%r14d
+    0.00 :   237435: mov    %edi,%eax
+    0.00 :   237437: sar    $0x6,%edx
+    0.00 :   23743a: and    $0x7,%r14d
+    0.00 :   23743e: movslq %edx,%rdx
+    0.00 :   237441: lea    (%rdx,%rdx,2),%rdx
+    0.00 :   237445: lea    0x0(%r13,%rdx,8),%r10
+    0.00 :   23744a: mov    %edi,%edx
+    0.00 :   23744c: and    $0x3f,%edx
+    0.00 :   23744f: mov    %edx,%r9d
+    0.00 :   237452: sar    $0x2,%edx
+    0.00 :   237455: sar    $0x3,%r9d
+    0.00 :   237459: movslq %edx,%rdx
+    0.00 :   23745c: add    $0x10,%r9d
+    0.00 :   237460: movzbl (%r10,%rdx,1),%edx
+    0.00 :   237465: movslq %r9d,%r9
+    0.00 :   237468: movzbl (%r10,%r9,1),%r9d
+    0.00 :   23746d: mov    %edi,%r10d
+    0.00 :   237470: and    $0x3,%r10d
+    0.00 :   237474: add    %r10d,%r10d
+    0.00 :   237477: sarx   %r14d,%r9d,%r9d
+    0.00 :   23747c: shl    $0x2,%r9d
+    0.00 :   237480: and    $0x4,%r9d
+    0.00 :   237484: sarx   %r10d,%edx,%edx
+    0.00 :   237489: and    $0x3,%edx
+    0.00 :   23748c: or     %r9d,%edx
+    0.00 :   23748f: sub    $0x4,%edx
+    0.00 :   237492: vcvtsi2ss %edx,%xmm4,%xmm0
+    0.00 :   237496: test   %esi,%esi
+    0.00 :   237498: je     2374c2 <host_rows+0x3f62>
+    0.00 :   23749a: cltd
+    0.00 :   23749b: idiv   %esi
+    0.00 :   23749d: mov    -0x2058(%rbp),%rdx
+    0.00 :   2374a4: cltq
+    0.00 :   2374a6: vmulss (%rdx,%rax,4),%xmm0,%xmm0
+    0.00 :   2374ab: vmovss %xmm0,(%rcx,%rdi,4)
+    0.00 :   2374b0: add    $0x1,%rdi
+    0.00 :   2374b4: cmp    %rdi,%r11
+    0.00 :   2374b7: jne    237430 <host_rows+0x3ed0>
+    0.00 :   2374bd: jmp    2336c0 <host_rows+0x160>
+    0.00 :   2374c2: mov    -0x2058(%rbp),%rax
+    0.00 :   2374c9: vmulss (%rax),%xmm0,%xmm0
+    0.00 :   2374cd: vmovss %xmm0,(%rcx,%rdi,4)
+    0.00 :   2374d2: add    $0x1,%rdi
+    0.00 :   2374d6: cmp    %rdi,%r11
+    0.00 :   2374d9: jne    237430 <host_rows+0x3ed0>
+    0.00 :   2374df: jmp    2336c0 <host_rows+0x160>
+    0.00 :   2374e4: call   8ed0 <__stack_chk_fail@plt>
