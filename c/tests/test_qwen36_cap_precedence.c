@@ -22,6 +22,15 @@ static int fails = 0;
 enum { HIDDEN = 2048, INTER = 512, N_EXPERTS = 256 };
 
 int main(void) {
+    /* Hybrid expert residency is budgeted as a per-layer count, capped by both
+     * the cache capacity and the model's expert count. */
+    CHECK(qwen36_hybrid_hot_count(1.0, 100000000, 10, 20, 256) == 1);
+    CHECK(qwen36_hybrid_hot_count(0.01, 100000000, 10, 20, 256) == 0);
+    CHECK(qwen36_hybrid_hot_count(100.0, 100000000, 10, 4, 256) == 4);
+    CHECK(qwen36_hybrid_hot_count(100.0, 100000000, 10, 20, 8) == 8);
+    CHECK(qwen36_hybrid_hot_count(1e300, 100000000, 10, 20, 256) == 20);
+    CHECK(qwen36_hybrid_hot_count(1.0, 0, 10, 20, 256) == 0);
+
     /* RAM_GB override wins over the resident+avail*0.88 computed budget:
      * same resident/avail, only the override differs -> different cap. The
      * outparams (slot_gb, budget_gb) are threaded through rather than

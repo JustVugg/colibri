@@ -1349,6 +1349,7 @@ typedef struct {
     double dense_load_s;
     uint32_t *freq;
     int freq_token_count, hot_pinned, hot_n, warmup_tokens, token_count;
+    int hybrid_hot_n;           /* Q36_HYBRID_GB: top routed GGUF experts copied into RAM per layer */
     float *momentum_logits;
     float pilot_smooth, pilot_conf_limit;
     uint8_t *is_pinned;
@@ -1466,6 +1467,8 @@ static int qwen36_resolved_cap(int cap, const LCache *cache, int n_layers) {
     return cache[0].cap;
 }
 
+static int qwen36_hybrid_hot_count(double budget_gb, int64_t expert_bytes,
+                                    int active_layers, int cap, int n_experts);
 static int qwen36_cap_for_ram(double resident_gb, double avail_gb, double ram_gb_override,
                                int hidden, int inter, int n_experts, int n_active_layers,
                                int is_int4, double *slot_gb_out, double *budget_gb_out);
@@ -4537,7 +4540,18 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     m->freq = calloc((size_t)c->n_layers * c->n_experts, sizeof(uint32_t));
     m->hot_pinned = 0; m->freq_token_count = 0;
     m->hot_n         = getenv("HOT")    ? atoi(getenv("HOT"))    : 0;
-    m->warmup_tokens = getenv("WARMUP") ? atoi(getenv("WARMUP")) : 5;
+    m->hybrid_hot_n  = 0;
+    const char *hybrid_env = getenv("Q36_HYBRID_GB");
+    double hybrid_gb = hybrid_env ? atof(hybrid_env) : 0.0;
+    if (g_gguf && hybrid_gb > 0.0 && m->gqe_max > 0) {
+        int active_layers = layer_end - layer_begin;
+        m->hybrid_hot_n = qwen36_hybrid_hot_count(hybrid_gb, m->gqe_max,
+                                                   active_layers, cap, c->n_experts);
+        if (m->hybrid_hot_n > 0 && m->hot_n <= 0) m->hot_n = 1; /* start collecting routes */
+        fprintf(stderr, "[qwen36] hybrid expert copies: budget %.2f GB, up to %d hot experts/layer; cold experts remain mapped\n",
+                hybrid_gb, m->hybrid_hot_n);
+    }
+    m->warmup_tokens = getenv("WARMUP")    ? atoi(getenv("WARMUP"))    : 5;
     m->token_count = 0;
     m->momentum_logits = calloc((size_t)c->n_layers * c->n_experts, sizeof(float));
     float sv = getenv("SMOOTH") ? (float)atof(getenv("SMOOTH")) : 0.3f;
@@ -4573,6 +4587,17 @@ static int64_t scale_count_d (const Cfg *c){ int gs = down_gs_of(c); return gs ?
  * partial-model layer-range builds. Approximates the scale-float block the
  * same way olmoe.c does (ignores expert_gs grouping precision) -- this is a
  * budget estimate under a safety margin, not exact accounting. */
+static int qwen36_hybrid_hot_count(double budget_gb, int64_t expert_bytes,
+                                    int active_layers, int cap, int n_experts) {
+    if (!(budget_gb > 0.0) || expert_bytes <= 0 || active_layers <= 0 || cap <= 0 || n_experts <= 0)
+        return 0;
+    int max_hot = cap < n_experts ? cap : n_experts;
+    double per_expert_gb = (double)expert_bytes / 1e9;
+    double requested = budget_gb / (per_expert_gb * active_layers);
+    if (!(requested > 0.0)) return 0;
+    return requested >= max_hot ? max_hot : (int)requested;
+}
+
 static int qwen36_cap_for_ram(double resident_gb, double avail_gb, double ram_gb_override,
                                int hidden, int inter, int n_experts, int n_active_layers,
                                int is_int4, double *slot_gb_out, double *budget_gb_out) {
@@ -4716,7 +4741,9 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
         /* three reads, one per fused tensor: expert eid's gate, up, down rows */
         const GqExp *x = &m->gqx[layer]; const int ilv = gguf_expert_ilv(x);
         gguf_zc_init();
-        if (g_zc > 0 && !ilv) {   /* C3: the file already holds the expert; point, don't copy */
+        const int hybrid_copy = m->hybrid_hot_n > 0 && m->is_pinned &&
+                                m->is_pinned[layer * m->c.n_experts + eid];
+        if (g_zc > 0 && !ilv && !hybrid_copy) {   /* C3: cold experts stay file-backed */
             const gguf_tensor *t[3] = { x->g, x->u, x->d };
             const int64_t eb[3] = { x->eb_g, x->eb_u, x->eb_d };
             /* the slot's previous expert leaves the page cache the way the copied
@@ -4734,6 +4761,7 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
                 s->zcg = b8; s->zcu = b8 + eb[0]; s->zcd = b8 + eb[0] + eb[1];
             }
             if (s->zcg) {
+                if (s->gqe) slot_gqe_free(s);
                 for (int k = 0; k < 3; k++) {
                     const uint8_t *nw = k == 0 ? s->zcg : k == 1 ? s->zcu : s->zcd;
                     const int file = x->packed ? x->packed->file : t[k]->file;
@@ -4745,7 +4773,16 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
                 s->is_int4 = 0; q36_slot_i8_stale(s); return;   /* the pointers are the load */
             }
         }
+        if (hybrid_copy) {
+            if (!s->gqe) {
+                if (q36_iq2_metal_enabled()) s->gqe = q36_iq2_gq_alloc((size_t)m->gqe_max, &s->gqe_metal_len);
+                else s->gqe = malloc((size_t)m->gqe_max);
+                if (!s->gqe) { fprintf(stderr, "OOM allocating hybrid expert copy\n"); exit(1); }
+            }
+            s->zcg = s->zcu = s->zcd = NULL;
+        }
         uint8_t *b = s->gqe;
+        if (!b) { fprintf(stderr, "qwen36: expert slot has no backing storage\n"); exit(1); }
         if (ilv) {   /* read beside, interleave into the slot (each loader thread its buffer) */
             static _Thread_local uint8_t *raw; static _Thread_local int64_t cap;
             const int64_t need = x->eb_g + x->eb_u + x->eb_d;
@@ -5070,11 +5107,43 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) { expert_fetch(
  * it stays resident until slot_release. */
 static Slot *expert_hold(Model *m, int layer, int eid) { Slot *s; expert_fetch(m, layer, eid, &s, 1); return s; }
 
+/* Promote a pinned mmap-backed expert to an owned RAM copy without holding the
+ * global cache mutex during the weight copy. The caller's slot remains indexed;
+ * the mmap bytes are immutable and remain valid for readers that already captured
+ * their pointers. Publication is rechecked under the mutex after the copy. */
+static void q36_hybrid_promote(Model *m, int layer, int eid, Slot *s) {
+    if (!m || !s || !m->gqx || !m->is_pinned) return;
+    const GqExp *x = &m->gqx[layer];
+    if (gguf_expert_ilv(x)) return;
+    const uint8_t *src[3] = { s->zcg, s->zcu, s->zcd };
+    if (!src[0] || !src[1] || !src[2]) return;
+    const int64_t off[3] = { 0, x->hb_g, x->hb_g + x->hb_u };
+    const int64_t len[3] = { x->hb_g, x->hb_u, x->hb_d };
+    size_t registered_len = 0;
+    uint8_t *copy = q36_iq2_metal_enabled()
+        ? q36_iq2_gq_alloc((size_t)m->gqe_max, &registered_len)
+        : malloc((size_t)m->gqe_max);
+    if (!copy) return; /* retain mmap mode on allocation pressure */
+    for (int k = 0; k < 3; k++) memcpy(copy + off[k], src[k], (size_t)len[k]);
+    pthread_mutex_lock(&g_pilot_mx);
+    if (slot_indexed(m, layer, eid) == s && s->zcg == src[0] && s->zcu == src[1] && s->zcd == src[2]) {
+        s->gqe = copy;
+        s->gqe_metal_len = registered_len;
+        s->zcg = s->zcu = s->zcd = NULL;
+        s->is_int4 = 0;
+        q36_slot_i8_stale(s);
+        copy = NULL;
+    }
+    pthread_mutex_unlock(&g_pilot_mx);
+    q36_iq2_gq_free(copy, registered_len);
+}
+
 static void pin_hot_experts(Model *m) {
     Cfg *c = &m->c;
-    if (m->hot_n <= 0 || m->hot_pinned) return;
+    if ((m->hot_n <= 0 && m->hybrid_hot_n <= 0) || m->hot_pinned) return;
     m->hot_pinned = 1;
-    int is_dynamic = (m->hot_n >= 100);
+    int is_hybrid = m->hybrid_hot_n > 0;
+    int is_dynamic = !is_hybrid && (m->hot_n >= 100);
     double thresh = is_dynamic ? (double)m->hot_n / 1000.0 : 0.0;
     int pinned_total = 0;
     for (int l = 0; l < c->n_layers; l++) {
@@ -5083,7 +5152,10 @@ static void pin_hot_experts(Model *m) {
         for (int e = 0; e < c->n_experts; e++) layer_total += freq_l[e];
         if (layer_total == 0) continue;
         int max_pin = m->cache[l].cap - 8; if (max_pin < 4) max_pin = 4;
-        int hn = is_dynamic ? max_pin : (m->hot_n < c->n_experts ? m->hot_n : c->n_experts);
+        int hn = is_hybrid ? m->hybrid_hot_n :
+                 is_dynamic ? max_pin : (m->hot_n < c->n_experts ? m->hot_n : c->n_experts);
+        if (is_hybrid && hn > m->cache[l].cap) hn = m->cache[l].cap;
+        if (hn > c->n_experts) hn = c->n_experts;
         if (hn > 256) hn = 256;
         int hot_eids[256], actual_hn = 0;
         for (int k = 0; k < hn; k++) {
@@ -5101,10 +5173,21 @@ static void pin_hot_experts(Model *m) {
             int eid = hot_eids[k];
             m->is_pinned[l * c->n_experts + eid] = 1;
             int found = 0;
+            Slot *promote = NULL;
             pthread_mutex_lock(&g_pilot_mx);
             Slot *resident = slot_indexed(m, l, eid);
-            if (resident) { resident->pinned = 1; found = 1; }
+            if (resident) {
+                resident->pinned = 1; found = 1;
+                if (is_hybrid && resident->zcg && !slot_busy(resident)) {
+                    promote = resident;
+                    slot_hold(resident);
+                }
+            }
             pthread_mutex_unlock(&g_pilot_mx);
+            if (promote) {
+                q36_hybrid_promote(m, l, eid, promote);
+                slot_release(promote);
+            }
             if (!found && g_pilot > 0) {
                 ensure_pilot_worker_started(m);
                 unsigned w = __atomic_load_n(&pilot_w, __ATOMIC_RELAXED);
