@@ -4152,7 +4152,9 @@ class HTTPTest(unittest.TestCase):
                 with patch("openai_server.ARCH", arch):
                     with self.request("/v1/chat/completions", request("this")) as response:
                         self.assertEqual(response.status, 200)
-                self.assertIn("look at this", self.engine.calls[-1][0])
+                # V4.1 joins content blocks on a blank line, as its encoding.py does
+                joined = "look at \n\nthis" if arch == "deepseek_v41" else "look at this"
+                self.assertIn(joined, self.engine.calls[-1][0])
 
 class ClientHangupTest(unittest.TestCase):
     """A client that disconnects mid-response must not print a traceback.

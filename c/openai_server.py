@@ -4034,7 +4034,9 @@ def expand_dsv41_images(messages, model_dir, max_tokens=None):
                 pieces.append(DSV41_IMAGE_PLACEHOLDER * span)
             else:
                 raise APIError(400, f"unsupported content part {kind!r}.", "messages")
-        rewritten.append({**message, "content": "".join(pieces)})
+        # encoding.py process_image_messages: each text part and each image is its own
+        # block, and the blocks join on a blank line
+        rewritten.append({**message, "content": "\n\n".join(pieces)})
     return rewritten, images
 
 
