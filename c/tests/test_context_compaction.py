@@ -3,6 +3,7 @@
 The end-to-end path (the gateway, a mock engine, HTTP) is test_context_compaction_e2e.py.
 """
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -160,22 +161,38 @@ class ChatContextTest(unittest.TestCase):
         self.assertEqual(gateway.chat_context_env(env, family, self.model), 12000)
 
     def test_a_cache_the_plan_sizes_keeps_room_for_the_prompt(self):
-        # V4.1's state is 6.4 KB a token; its prompt's workspace is priced at one prompt
-        # chunk (200 KiB a row of 1280 rows = 0.25 GB), because the prefill reads a prompt
-        # in bounded chunks and never holds the whole context's buffers at once. So the
-        # state decides and the workspace is a constant: 65536 on 8 GB (0.7 GB, inside
-        # the quarter share that applies up to 64k tokens -- 131072's 1.1 GB would be
-        # 13.8% and the share above 64k is a tenth), 131072 on 16 GB (1.1 GB, 6.9%), and
-        # the ladder's 262144 ceiling from 64 GB (2.0 GB, 3.1%). Priced at the whole
-        # context the same table read 16384 (16 GB) / 65536 (64 GB) / 131072 (512 GB):
-        # at 262144 tokens the plan reserved 53.7 GB of workspace, gave the expert cache
-        # no slot, and the server refused to start.
+        # V4.1's state is 890 B a token at the kv-quant default (COLI_VK_KV_QUANT unset
+        # runs =2: the packed code rows, 86% less than fp32's 6.4 KB), and the default is
+        # what a user who set nothing gets, so the ladder below asserts it. The prompt's
+        # workspace is priced at one prompt chunk (200 KiB a row of 1280 rows = 0.25 GB),
+        # because the prefill reads a prompt in bounded chunks and never holds the whole
+        # context's buffers at once. So the state decides and the workspace is a
+        # constant: the packed state is small enough that every box in the table holds
+        # the ladder's 262144 ceiling (262144's state+workspace = 0.47 GB, 5.9% of 8 GB,
+        # inside the tenth share that applies above 64k). Priced fp32 (COLI_VK_KV_QUANT=0,
+        # the exact opt-out) the same table read 65536 / 131072 / 262144: at 8 GB the
+        # fp32 131072 (1.1 GB) missed the tenth share, and at 262144 the whole-context
+        # workspace mispricing of the Track C regression reserved 53.7 GB, gave the
+        # expert cache no slot, and the server refused to start.
         (Path(self.tmp.name) / "config.json").write_text(json.dumps(DSV41_FLASH_CONFIG))
-        for available, expected in ((8 * GB, 65536), (16 * GB, 131072), (64 * GB, 262144),
+        for available, expected in ((8 * GB, 262144), (16 * GB, 262144), (64 * GB, 262144),
                                     (256 * GB, 262144), (512 * GB, 262144),
                                     (1024 * GB, 262144)):
             with self.subTest(gb=available / GB):
-                context, why = chat_context(self.model, {}, available=available)
+                with patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop("COLI_VK_KV_QUANT", None)   # the default: nothing set
+                    context, why = chat_context(self.model, {}, available=available)
+                self.assertEqual(context, expected)
+                if context:
+                    self.assertIn("GB of prompt workspace", why)
+        # the fp32 arm, pinned: =0 is the exact opt-out, and its ladder must stay the
+        # fp32 math's (the =0 seam test_dsv41_kvq_host_plan pins the price itself)
+        for available, expected in ((8 * GB, 65536), (16 * GB, 131072), (64 * GB, 262144),
+                                    (256 * GB, 262144), (512 * GB, 262144),
+                                    (1024 * GB, 262144)):
+            with self.subTest(gb=available / GB, flag="0"):
+                with patch.dict("os.environ", {"COLI_VK_KV_QUANT": "0"}):
+                    context, why = chat_context(self.model, {}, available=available)
                 self.assertEqual(context, expected)
                 if context:
                     self.assertIn("GB of prompt workspace", why)

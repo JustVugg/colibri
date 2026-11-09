@@ -892,9 +892,11 @@ def _dsv4_geometry(config, context, _model_dir):
 
 def _host_kv_quant(head_dim, index_hd):
     """COLI_VK_KV_QUANT=2 engaged on the host (the engine's v41_host_kvq, mirrored):
-    the flag set AND the geometry the formats are defined at. Anything else keeps the
-    fp32 host layout, and the planner prices fp32."""
-    return os.environ.get("COLI_VK_KV_QUANT") == "2" and head_dim == 512 and index_hd == 128
+    the flag's default (=2, unset) or the flag set to 2, AND the geometry the formats
+    are defined at. `0` is the exact fp32 opt-out and `1` the device mirrors only;
+    both keep the fp32 host layout, and the planner prices fp32."""
+    flag = os.environ.get("COLI_VK_KV_QUANT") or "2"
+    return flag == "2" and head_dim == 512 and index_hd == 128
 
 
 def _dsv41_geometry(config, context, _model_dir):

@@ -543,9 +543,10 @@ stages: the token embedding is never on the device, see below).
 ### Quantized KV mirrors (`COLI_VK_KV_QUANT`)
 
 The only VRAM item that grows with the conversation is the chain's KV mirrors, and the
-checkpoint's own cache already stores that state quantized. `COLI_VK_KV_QUANT=1` keeps
+checkpoint's own cache already stores that state quantized. `COLI_VK_KV_QUANT` keeps
 the mirrors in those formats — the same layouts DeepInfer's paged cache defines
-(`c/dsv41_kvq.h`):
+(`c/dsv41_kvq.h`) — and does so BY DEFAULT (`2`/unset; `1` is the device mirrors only,
+`0` the exact fp32 opt-out):
 
 | mirror | format | bytes a row | was (fp32) |
 |---|---|---|---|
@@ -557,11 +558,12 @@ The compressor's `ring` stays fp32 (it is the pooling accumulator, not a mirror)
 `isc`, the masks and the engram buffers. A row is quantized once, after its last fp32
 reader (`chain_dsv4.comp` mode 13), and dequantized where it is read — the attention and
 the indexer's scores decode inline (modes 0, 3, 9, 10) — and on the write-back that ends
-a forward (mode 14), so the host's state stays fp32 holding the dequantized values and
-rollback, prefix reuse and a lost device still rebuild nothing.
+a forward (mode 14), so the host's state stays the canonical copy — under `=1` fp32 rows
+holding the dequantized values, under the default's `=2` the codes themselves (below) —
+and rollback, prefix reuse and a lost device still rebuild nothing.
 
 The arithmetic at the released geometry, per token across the layers: about **6,400 B
-of mirror a position today against about 890 B quantized** (the compressed rows and
+of mirror a position at `=0` against about 890 B quantized** (the compressed rows and
 index keys alone: 2.5 rows a position over the layers' compression ratios × (288 + 68) B;
 the window rings are the planner's fixed term, not a per-position cost) — the
 figures of the prefill-VRAM analysis
@@ -574,30 +576,34 @@ as totals; the corrected basis is 6,400/890 B a position — the same math
 the kv-quant test family pins on the ledger line, which reports `(quantized)` when the
 mirrors are (a second device's mirrors are not in that line — the pre-existing gap).
 
-It is an **approximate mode**, off by default, and the flag-off path is byte for byte
-what it was (the flag branches only at the mirrors' widths and stores; a run's mirrors
-are summed against the flag's widths at the first forward, so a missed branch fails
-loudly). The FP4 index keys can move a top-k pick, so the logits drift a little — the
-`kv-quant-deepseek` family gates a documented tolerance instead of bit-identity, the
-way `V41_PREFILL_TAIL`'s tests accept the tail's own approximation — and the pull's
-write-back returns dequantized rows (a quantize→dequant hop the pack's idempotence
-bounds: re-packing a dequantized row reproduces its values, which the unit test pins).
-The flag needs `head_dim` 512 and `index_head_dim` 128, and it does not re-price the
-planner: the KV split decides exactly as before, and when it arms the mirrors go back to
-fp32 whole (`v41c_kvq_give_way`), re-mirrored from the host.
+It is an **approximate mode** — and the default — while `COLI_VK_KV_QUANT=0` is the exact
+fp32 opt-out, byte for byte what the engine ran before the default flipped (the flag
+branches only at the mirrors' widths and stores; a run's mirrors are summed against the
+flag's widths at the first forward, so a missed branch fails loudly). The FP4 index keys
+can move a top-k pick, so the logits drift a little — the `kv-quant-deepseek` family gates
+a documented tolerance instead of bit-identity, the way `V41_PREFILL_TAIL`'s tests accept
+the tail's own approximation — and the pull's write-back returns dequantized rows (a
+quantize→dequant hop the pack's idempotence bounds: re-packing a dequantized row
+reproduces its values, which the unit test pins). The flag needs `head_dim` 512 and
+`index_head_dim` 128: at any other geometry the flag declines — the default exactly like
+a set value, one line on stderr — and the mirrors stay fp32, so models at other KV
+geometries are untouched by the default. It does not re-price the planner beyond the
+host state below: the KV split decides exactly as before, and when it arms the mirrors go
+back to fp32 whole (`v41c_kvq_give_way`), re-mirrored from the host.
 
-### The host's state in the same formats (`COLI_VK_KV_QUANT=2`)
+### The host's state in the same formats (`COLI_VK_KV_QUANT=2`, the default)
 
-`COLI_VK_KV_QUANT=2` holds the HOST's own KV arrays -- the window rings, the compressed
-rows, the index keys -- in the same cache formats the mirrors use, where the flag-off
-engine keeps dequantized fp32 rows: the host state drops from 6,400 B to 890 B a
-position at the released geometry (86.1% less). Writers pack at their stores (rms and
+`COLI_VK_KV_QUANT=2` — the flag's default, what an unset environment runs — holds the
+HOST's own KV arrays -- the window rings, the compressed rows, the index keys -- in the
+same cache formats the mirrors use, where `=0` keeps dequantized fp32 rows: the host
+state drops from 6,400 B to 890 B a position at the released geometry (86.1% less). Writers pack at their stores (rms and
 the rope tail stage in a scratch row, never in place inside a code row), the read paths
 dequantize on read -- the kv_all build and the indexer decode into per-forward scratch,
 `V41_STATS` breaks that cost out as its own `kv read` line -- and the boundaries (the
 pull, park, reset, rollback, the swap between conversations) move code rows as bytes,
 with the index keys' block-wide sections never touched by a linear copy but a
-whole-buffer or whole-block one. The planner re-prices the state under the flag (the
+whole-buffer or whole-block one. The planner re-prices the state whenever the flag
+engages -- the default included (the
 host layout never gives way to the KV split -- only the device mirrors do, and the
 split's paths read the codes), and the turn-end ledger gains a `host kv` term so the
 savings are visible at all.

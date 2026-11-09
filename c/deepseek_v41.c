@@ -1490,11 +1490,14 @@ static int g_v41_mux_slots = 1;   /* KV_SLOTS: the conversations a serve decodes
 
 /* COLI_VK_KV_QUANT=2: the host's own KV arrays (the window rings, the compressed rows,
  * the index keys) held in the checkpoint's cache formats too -- c/dsv41_kvq.h's 528/288/
- * 68-byte rows where today they hold dequantized fp32 rows. Parsed once here, before
- * model_load allocates a byte; the same geometry guard as the device flag's (the formats
- * are defined at head_dim 512 and index_head_dim 128), and with the geometry wrong the
- * flag falls back to today's fp32 host and says so once. The device side parses its own
- * copy in deepseek_v41_chain.h (flag 1 = the device mirrors only, 2 = both).
+ * 68-byte rows where =0 keeps dequantized fp32 rows. Parsed once here, before
+ * model_load allocates a byte; 2/unset is the DEFAULT (DeepInfer parity), 1 the device
+ * mirrors only, 0 the explicit exact fp32 opt-out, and a set value always wins over the
+ * default. The same geometry guard as the device flag's (the formats are defined at
+ * head_dim 512 and index_head_dim 128): with the geometry wrong the default declines
+ * exactly like a set value (one line) and the host keeps today's fp32 layout. The device
+ * side parses its own copy in deepseek_v41_chain.h (flag 1 = the device mirrors only,
+ * 2 = both).
  *
  * THE INVARIANT THE PLANNER AND THE SPLIT RELY ON: once this returns 1 the HOST layout
  * is packed and stays packed for the process's life -- the KV split's give-way
@@ -1504,14 +1507,17 @@ static int g_v41_host_kvq = -1;
 static int v41_host_kvq(const Cfg *c) {
     if (g_v41_host_kvq < 0) {
         const char *e = getenv("COLI_VK_KV_QUANT");
-        g_v41_host_kvq = e && *e == '2' && c->head_dim == 512 && c->index_head_dim == 128;
-        if (e && *e == '2' && g_v41_host_kvq)
-            fprintf(stderr, "[v41] COLI_VK_KV_QUANT=2: the host's KV state in the cache formats too -- a window row "
+        int dflt = !(e && *e);            /* unset/empty: the default, 2 */
+        int want2 = dflt || *e == '2';
+        g_v41_host_kvq = want2 && c->head_dim == 512 && c->index_head_dim == 128;
+        if (g_v41_host_kvq)
+            fprintf(stderr, "[v41] COLI_VK_KV_QUANT=2%s: the host's KV state in the cache formats too -- a window row "
                             "528 B, a compressed row 288 B, an index key 68 B in block-wide sections, dequantized on read "
-                            "(approximate like the mirrors, and it does NOT give way to the KV split: the split reads the codes)\n");
-        if (e && *e == '2' && !g_v41_host_kvq)
-            fprintf(stderr, "[v41] COLI_VK_KV_QUANT=2 wants head_dim 512 and index_head_dim 128; "
-                            "the host's KV state stays fp32\n");
+                            "(approximate like the mirrors, and it does NOT give way to the KV split: the split reads the codes)\n",
+                    dflt ? " (the default)" : "");
+        if (want2 && !g_v41_host_kvq)
+            fprintf(stderr, "[v41] COLI_VK_KV_QUANT%s wants head_dim 512 and index_head_dim 128; "
+                            "the host's KV state stays fp32\n", dflt ? " (its default, 2)" : "=2");
     }
     return g_v41_host_kvq;
 }

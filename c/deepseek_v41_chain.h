@@ -118,23 +118,30 @@ static const char *v41c_name(const V41Chain *ch) { return ch && ch->d ? "deepsee
 static int v41c_dev2_wanted(void) { const char *e = getenv("COLI_VK_CHAIN_DEV2"); return !(e && *e == '0'); }
 static int v41c_own(const V41Chain *ch, int i) { return i >= ch->lo && i < ch->lo + ch->n; }
 
-/* COLI_VK_KV_QUANT (0/unset = off, parsed once here at the setup's start): the device KV
+/* COLI_VK_KV_QUANT (2/unset = the default, parsed once here at the setup's start): the device KV
  * mirrors in the checkpoint's quantized formats (c/dsv41_kvq.h, DeepInfer's cache) instead
  * of fp32 -- approximate (a row quantized at its store, dequantized where read and on the
  * pull's write-back), and it gives way to the KV split: when the split arms the mirrors are
- * fp32 again. =2 also holds the HOST's own arrays in the formats (v41_host_kvq,
+ * fp32 again. 1 = the device mirrors only, 0 = the explicit exact fp32 opt-out (byte for
+ * byte the pre-default path), and a set value always wins over the default. =2 also holds
+ * the HOST's own arrays in the formats (v41_host_kvq,
  * deepseek_v41.c -- the codes on the host, dequantized on read there); the host layout never
- * gives way to the split, only these mirrors do. The three row widths below are the ONLY
- * widths the mirrors are ever allocated at, so a missed branch shows up as bytes that do
- * not add up (v41c_kvq_check, once a forward). */
+ * gives way to the split, only these mirrors do. The geometry guard applies to the default
+ * as to a set value: at any other head_dim/index_head_dim the flag declines (one line) and
+ * the mirrors stay fp32, so non-512/128 models are untouched by the default. The three row
+ * widths below are the ONLY widths the mirrors are ever allocated at, so a missed branch
+ * shows up as bytes that do not add up (v41c_kvq_check, once a forward). */
 static int g_v41c_kvq = -1;
 static int v41c_kvq_on(const Cfg *c) {
     if (g_v41c_kvq < 0) {
         const char *e = getenv("COLI_VK_KV_QUANT");
-        g_v41c_kvq = e && (*e == '1' || *e == '2') && c->head_dim == 512 && c->index_head_dim == 128;
-        if (e && (*e == '1' || *e == '2') && !g_v41c_kvq)
-            fprintf(stderr, "[VK] deepseek_v41 chain: COLI_VK_KV_QUANT wants head_dim 512 and index_head_dim 128; "
-                            "the mirrors stay fp32\n");
+        int dflt = !(e && *e);            /* unset/empty: the default, 2 */
+        int want = dflt ? 2 : *e - '0';
+        int ok = (want == 1 || want == 2) && c->head_dim == 512 && c->index_head_dim == 128;
+        g_v41c_kvq = ok ? want : 0;       /* the level itself: the setup print and the host read both ask */
+        if ((want == 1 || want == 2) && !ok)
+            fprintf(stderr, "[VK] deepseek_v41 chain: COLI_VK_KV_QUANT%s wants head_dim 512 and index_head_dim 128; "
+                            "the mirrors stay fp32\n", dflt ? " (its default, 2)" : "");
     }
     return g_v41c_kvq;
 }

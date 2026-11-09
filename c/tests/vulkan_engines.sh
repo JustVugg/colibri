@@ -4804,18 +4804,21 @@ family_kv_split_deepseek_sanitize() {
 
 # COLI_VK_KV_QUANT (docs/deepseek-v41.md): DeepSeek V4.1's device KV mirrors in the
 # checkpoint's cache formats -- the window ring MXFP8 (528 B a row), the compressed rows
-# FP4 (288 B), the index keys FP4 in block-wide sections (68 B). An approximate mode, so
-# its gate is not the bit-exact oracle the other families use: the flag-off run is the
-# exactness proof (the deepseek-chain family keeps it byte for byte), and under the flag
-# the first decode row -- the one input the two runs share -- keeps its argmax with drift
-# within that row's own largest |logit| (the FP4 index keys move the top-k selection; past
-# that row a flipped pick feeds the model its own choice, so only the shared row gates), the token stream is reported (a drift count, not a gate -- a greedy
-# pick may legitimately flip), and the ledger's kv-mirror line must be the quantized
-# widths' math (derived in v41_kvq_ledger below). The codec itself IS exact and gated bit
-# for bit by tests/test_vk_kv_quant first. The fixture is the tiny one at the released KV
-# geometry (--kv-quant-dims: head_dim 512, index_head_dim 128), because the formats are
-# defined at those widths; at the stock tiny geometry (64/32) the flag stays off by its
-# own dimension check.
+# FP4 (288 B), the index keys FP4 in block-wide sections (68 B). An approximate mode, and
+# since the packed-cache default it is the DEFAULT (=2 unset), so this family is also the
+# default's own evidence. Its gate is not the bit-exact oracle the other families use: the
+# =0-pinned run is the exactness proof (the exact opt-out, byte for byte the old default;
+# the deepseek-chain family keeps the unset path byte for byte at the stock geometry, where
+# the flag's dimension check declines the default), and under the flag the first decode
+# row -- the one input the two runs share -- keeps its argmax with drift within that row's
+# own largest |logit| (the FP4 index keys move the top-k selection; past that row a flipped
+# pick feeds the model its own choice, so only the shared row gates), the token stream is
+# reported (a drift count, not a gate -- a greedy pick may legitimately flip), and the
+# ledger's kv-mirror line must be the quantized widths' math (derived in v41_kvq_ledger
+# below). The codec itself IS exact and gated bit for bit by tests/test_vk_kv_quant first.
+# The fixture is the tiny one at the released KV geometry (--kv-quant-dims: head_dim 512,
+# index_head_dim 128), because the formats are defined at those widths; at the stock tiny
+# geometry (64/32) the flag stays off by its own dimension check.
 family_kv_quant_deepseek() {
   export OMP_NUM_THREADS=2
   make deepseek_v41 tests/test_vk_kv_quant VK=1
@@ -4829,30 +4832,36 @@ family_kv_quant_deepseek() {
   v41_kvq "prompt in chunks of 3" SNAP=dsv41_kvq_long COLI_VK_CHAIN_ROWS=3 -- 8 dsv41_kvq_long/ref.json
   v41_kvq "the per-row GEMV" SNAP=dsv41_kvq_tiny COLI_VK_CHAIN_GEMV=0 -- 8 dsv41_kvq_tiny/ref.json
   # COLI_VK_KV_QUANT=2: the host's own rows are the codes too -- the same tolerance gate
-  # (the flag-off run is the exactness side, the on-run may drift a token with a count),
+  # (the =0 run is the exactness side, the on-run may drift a token with a count),
   # the pull now staging codes and the re-upload raw. The DSpark arm drives the spec
   # verify's ring_save and rollback through the code rows, which no flag-1 arm does.
   KVQ_FLAG=2 v41_kvq "cap=2 host" SNAP=dsv41_kvq_tiny -- 2 dsv41_kvq_tiny/ref.json
   KVQ_FLAG=2 v41_kvq "40-token prompt cap=8 host" SNAP=dsv41_kvq_long -- 8 dsv41_kvq_long/ref.json
   KVQ_FLAG=2 v41_kvq "prompt in chunks of 3 host" SNAP=dsv41_kvq_long COLI_VK_CHAIN_ROWS=3 -- 8 dsv41_kvq_long/ref.json
   KVQ_FLAG=2 v41_kvq "DSpark spec=1 host" SNAP=dsv41_kvq_long V41_DSPARK=1 V41_SPEC_FORCE=1 -- 8 dsv41_kvq_long/ref.json
+  # The DEFAULT itself: the var UNSET must run as =2 (the packed mirrors AND the host
+  # codes, the engage line saying so) with no flag anywhere in the environment -- the
+  # same tolerance gate against the =0 run, and the ledger's default probe below.
+  KVQ_FLAG=default v41_kvq "cap=8 default, the var unset" SNAP=dsv41_kvq_tiny -- 8 dsv41_kvq_tiny/ref.json
+  KVQ_FLAG=default v41_kvq "40-token prompt cap=8 default, the var unset" SNAP=dsv41_kvq_long -- 8 dsv41_kvq_long/ref.json
   v41_kvq_host_split
   unset OMP_NUM_THREADS
 }
 # COLI_VK_KV_QUANT=2 under the KV split: the split arms (its whole fp32 mirrors win, the
 # give-way line says so) and the HOST stays codes -- the split's four read paths dequantize
 # on read, the per-chunk write-back packs into the codes. Not an oracle gate (the host's
-# quantize hop is approximate): the split-armed flag-off run is the exactness side, the
-# flag-2 run may drift, and must show the split AND the give-way AND the host codes.
+# quantize hop is approximate): the split-armed =0 run is the exactness side (the flag's
+# default would make it a =2 run now), the flag-2 run may drift, and must show the split
+# AND the give-way AND the host codes.
 v41_kvq_host_split() {
   local rcq=0
   rm -f off.f32 on.f32
-  # NB: the split on the KV-QUANT fixture is inexact at flag-off TOO (a combination
+  # NB: the split on the KV-QUANT fixture is inexact at =0 TOO (a combination
   # nothing ran before -- the kv-split family walks the stock-dims fixtures, and the
   # base branch mismatches the oracle here the same way), so the oracle cannot be this
-  # arm's exactness side. The off run's own first decode row is: the same split, the
+  # arm's exactness side. The =0 run's own first decode row is: the same split, the
   # same fixture, the only difference the host's codes.
-  env SNAP=dsv41_kvq_long COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=2 DUMP=off.f32 COLI_USAGE=chain.usage       COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 ./deepseek_v41 8 dsv41_kvq_long/ref.json       > off.txt 2> off.log || true
+  env SNAP=dsv41_kvq_long COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=2 COLI_VK_KV_QUANT=0 DUMP=off.f32 COLI_USAGE=chain.usage       COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 ./deepseek_v41 8 dsv41_kvq_long/ref.json       > off.txt 2> off.log || true
   grep -q 'KV cache split\|the KV split' off.log || { cat off.log; fail "kv-quant host split: the split never armed"; }
   env SNAP=dsv41_kvq_long COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=2 COLI_VK_KV_QUANT=2 DUMP=on.f32       COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1       ./deepseek_v41 8 dsv41_kvq_long/ref.json > on.txt 2> on.log || rcq=$?
   { [ "$rcq" = 0 ] || grep -q '\[mismatch\]' on.log; } || { tail -20 on.log; fail "kv-quant host split: exit $rcq without a token drift to show for it"; }
@@ -4875,11 +4884,15 @@ PYTOL
   then fail "kv-quant host split: the first decode row beyond the row's own scale"; fi
   echo "OK kv-quant host split: $lg, $(token_diff off.txt on.txt), the split armed with the host codes held"
 }
-# <tag> <env...> -- <argv...>: the same Vulkan chain run with COLI_VK_KV_QUANT off (the
-# exactness side) and on. The off run must keep the reference's own oracle (exit 0, the
+# <tag> <env...> -- <argv...>: the same Vulkan chain run with COLI_VK_KV_QUANT=0 (the
+# exact opt-out, the exactness side -- the flag's default is 2 now, so "off" must be
+# asked for) and on. The =0 run must keep the reference's own oracle (exit 0, the
 # chain's tokens = the reference's); the on run may drift a token (exit 1 with a
 # [mismatch] line is accepted, the count printed) but must quantize (its own log line),
 # run the chain, and keep the FIRST decode row's logits within the documented tolerance.
+# KVQ_FLAG picks the on side: 1 = the device mirrors (the family's default), 2 = the host
+# state in the codes too, `default` = the var scrubbed from the environment entirely --
+# the run must engage as =2 by default (its own log line says so), the default's own arm.
 # That row is the one input the two runs share: past it a flipped greedy pick feeds the
 # model its own choice, and the rows are no longer the same computation. The tiny
 # fixture's random weights leave logit gaps a few hundredths wide where the unit test
@@ -4892,16 +4905,23 @@ PYTOL
 v41_kvq() {
   local tag=$1; shift
   local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
-  local flag=${KVQ_FLAG:-1}   # 1 = the device mirrors, 2 = the host state in the codes too
+  local flag=${KVQ_FLAG:-1}   # 1 = the device mirrors, 2 = the host state in the codes too, default = the var unset
   local rc=0 rcq=0
   rm -f off.f32 on.f32
-  env "${envs[@]}" DUMP=off.f32 COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 \
+  env "${envs[@]}" COLI_VK_KV_QUANT=0 DUMP=off.f32 COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 \
       COLI_VK_CHAIN=1 ./deepseek_v41 "$@" > off.txt 2> off.log || rc=$?
-  [ "$rc" = 0 ] || { tail -20 off.log; fail "kv-quant $tag: the flag-off run left the oracle (exit $rc)"; }
-  env "${envs[@]}" COLI_VK_KV_QUANT=$flag DUMP=on.f32 COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 \
-      COLI_VULKAN=1 COLI_VK_CHAIN=1 ./deepseek_v41 "$@" > on.txt 2> on.log || rcq=$?
-  { [ "$rcq" = 0 ] || grep -q '\[mismatch\]' on.log; } || { tail -20 on.log; fail "kv-quant $tag: exit $rcq without a token drift to show for it"; }
-  grep -q "COLI_VK_KV_QUANT=$flag" on.log || { cat on.log; fail "kv-quant $tag: the mirrors did not quantize"; }
+  [ "$rc" = 0 ] || { tail -20 off.log; fail "kv-quant $tag: the =0 run left the oracle (exit $rc)"; }
+  if [ "$flag" = default ]; then   # the var scrubbed: the default must engage on its own
+    env -u COLI_VK_KV_QUANT "${envs[@]}" DUMP=on.f32 COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 \
+        COLI_VULKAN=1 COLI_VK_CHAIN=1 ./deepseek_v41 "$@" > on.txt 2> on.log || rcq=$?
+    { [ "$rcq" = 0 ] || grep -q '\[mismatch\]' on.log; } || { tail -20 on.log; fail "kv-quant $tag: exit $rcq without a token drift to show for it"; }
+    grep -q 'COLI_VK_KV_QUANT=2 (the default)' on.log || { cat on.log; fail "kv-quant $tag: the default never engaged as =2"; }
+  else
+    env "${envs[@]}" COLI_VK_KV_QUANT=$flag DUMP=on.f32 COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 \
+        COLI_VULKAN=1 COLI_VK_CHAIN=1 ./deepseek_v41 "$@" > on.txt 2> on.log || rcq=$?
+    { [ "$rcq" = 0 ] || grep -q '\[mismatch\]' on.log; } || { tail -20 on.log; fail "kv-quant $tag: exit $rcq without a token drift to show for it"; }
+    grep -q "COLI_VK_KV_QUANT=$flag" on.log || { cat on.log; fail "kv-quant $tag: the mirrors did not quantize"; }
+  fi
   [ "$(chain_count deepseek_v41 on.log)" -gt 0 ] || { cat on.log; fail "kv-quant $tag: the chain never ran"; }
   local lg; lg=$(logits_first off.f32 on.f32 1.0 256) || { echo "$lg"; fail "kv-quant $tag: the first decode row beyond the documented tolerance"; }
   echo "OK kv-quant $tag: $lg, $(chain_count deepseek_v41 on.log) chain forwards, $(token_diff off.txt on.txt)$(grep -q 'Matching tokens:' on.log && grep -a -o 'Matching tokens: [0-9]*/[0-9]*' on.log | tail -1 | sed 's/^/, the reference: /')"
@@ -4913,14 +4933,14 @@ v41_kvq() {
 # of layers 1 and 3 (ratios 2 and 1) capped at 64 tokens, layer 1's ratio-2 compressor
 # ring 8192 B of fp32 either way (the index-key mirror rounds to whole blocks, 2 of them).
 # So:
-#   off: 6*520*2048 + 8192 + 2*64*2048 + 2*64*512        = 6 725 632 B = 6.41 MiB
-#   on:  6*520*528  + 8192 + 2*64*288  + 2*(2*2176)     = 1 701 120 B = 1.62 MiB
+#   =0: 6*520*2048 + 8192 + 2*64*2048 + 2*64*512        = 6 725 632 B = 6.41 MiB
+#   =1:  6*520*528  + 8192 + 2*64*288  + 2*(2*2176)     = 1 701 120 B = 1.62 MiB
 v41_kvq_ledger() {
   local off on
   off=$(KVQ_LEDGER_RUN=0 v41_kvq_serve "$1")
   on=$(KVQ_LEDGER_RUN=1 v41_kvq_serve "$1")
   [ -n "$off" ] && [ -n "$on" ] || { fail "kv-quant $1: no kv-mirror line from the serve turn"; }
-  awk -v v="$off" 'BEGIN{exit !(v > 6.36 && v < 6.46)}' || fail "kv-quant $1: the flag-off mirrors $off MiB, not the fp32 math's 6.41"
+  awk -v v="$off" 'BEGIN{exit !(v > 6.36 && v < 6.46)}' || fail "kv-quant $1: the =0 mirrors $off MiB, not the fp32 math's 6.41"
   awk -v v="$on" 'BEGIN{exit !(v > 1.58 && v < 1.68)}' || fail "kv-quant $1: the quantized mirrors $on MiB, not the 528/288/68 math's 1.63"
   case "$on" in *"("*")"*) ;; *) fail "kv-quant $1: no (quantized) annotation";; esac
   echo "OK kv-quant $1 ledger: kv mirror $off -> $on (the 528/288/68 B math, whole blocks)"
@@ -4933,17 +4953,34 @@ v41_kvq_ledger() {
   [ -n "$host2" ] || { fail "kv-quant $1: no host-kv term on the =2 line"; }
   awk -v v="$host2" 'BEGIN{exit !(v > 0.15 && v < 0.25)}' || fail "kv-quant $1: the packed host holds $host2 MiB, not the codes' math's 0.175"
   echo "OK kv-quant $1 ledger: host kv $host2 MiB (packed) under =2"
+  # the default's own line (the default arms above, KVQ_FLAG=default): the var scrubbed
+  # from the serve's environment must price and report exactly as =2 -- the packed mirror
+  # widths AND the host kv term, no flag anywhere
+  if [ "${KVQ_FLAG:-}" = default ]; then
+    local dflt_out dflt dflt_host
+    dflt_out=$(KVQ_LEDGER_RUN=default v41_kvq_serve "$1")
+    dflt=$(printf '%s\n' "$dflt_out" | sed -n '1p')
+    dflt_host=$(printf '%s\n' "$dflt_out" | sed -n 's/^host kv \([0-9.]*\) MiB.*/\1/p')
+    [ -n "$dflt" ] && [ -n "$dflt_host" ] || { fail "kv-quant $1: no kv-mirror or host-kv line from the default's serve turn"; }
+    awk -v v="$dflt" 'BEGIN{exit !(v > 1.58 && v < 1.68)}' || fail "kv-quant $1: the default's mirrors $dflt MiB, not the 528/288/68 math's 1.63"
+    case "$dflt" in *"("*")"*) ;; *) fail "kv-quant $1: the default's line has no (quantized) annotation";; esac
+    awk -v v="$dflt_host" 'BEGIN{exit !(v > 0.15 && v < 0.25)}' || fail "kv-quant $1: the default's packed host holds $dflt_host MiB, not the codes' math's 0.175"
+    echo "OK kv-quant $1 ledger: the var unset gives $dflt and host kv $dflt_host MiB (packed), as =2"
+  fi
 }
-# one serve turn of the engine (the ledger ends a turn), <quant 0|1> in KVQ_LEDGER_RUN:
-# prints the kv-mirror line's tail (the MiB and, when on, the annotation). The protocol
-# as vulkan_chain_serve.py drives it: wait for READY, one SUBMIT, drain to DONE.
+# one serve turn of the engine (the ledger ends a turn), <quant 0|1|2|default> in
+# KVQ_LEDGER_RUN: prints the kv-mirror line's tail (the MiB and, when on, the annotation)
+# and, under =2/default, the host kv line's. The protocol as vulkan_chain_serve.py drives
+# it: wait for READY, one SUBMIT, drain to DONE. `default` scrubs COLI_VK_KV_QUANT from
+# the environment entirely -- what a user who set nothing runs.
 v41_kvq_serve() {
   $PY - "$1" <<'PYSERVE'
 import os, subprocess, sys, threading
 quant = os.environ.get("KVQ_LEDGER_RUN", "0")
 env = dict(os.environ, SERVE="1", COLI_VK_LEDGER="1", COLI_VULKAN="1", COLI_VK_CHAIN="1",
            COLI_VK_TIER_SYNC="1", COLI_USAGE=os.path.abspath("chain.usage"), SNAP="dsv41_kvq_tiny")
-if quant in ("1", "2"): env["COLI_VK_KV_QUANT"] = quant
+if quant in ("0", "1", "2"): env["COLI_VK_KV_QUANT"] = quant
+elif quant == "default": env.pop("COLI_VK_KV_QUANT", None)
 p = subprocess.Popen(["./deepseek_v41", "2", "dsv41_kvq_tiny/ref.json"], env=env,
                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 err = []

@@ -1,5 +1,7 @@
-"""COLI_VK_KV_QUANT=2's planner re-price (family_registry._dsv41_geometry): the host's
-KV state priced as the cache's packed code rows while the flag engages, fp32 otherwise.
+"""COLI_VK_KV_QUANT's planner re-price (family_registry._dsv41_geometry): the host's
+KV state priced as the cache's packed code rows while the flag engages (2 IS the
+default now -- unset runs packed), fp32 under =0 (the exact opt-out) and =1 (the
+device mirrors only).
 
 What is pinned here is the SEAM -- the per-row width swap and its guard, at the released
 geometry's config and the three context lengths whose slot deltas the memory model
@@ -43,9 +45,11 @@ def _config(**over):
 
 
 def _state(context, flag, **over):
+    """The context state bytes at a flag setting. flag None: the var UNSET -- the
+    default (=2, packed); 0/1/2: set explicitly."""
     env = dict(os.environ)
     env.pop("COLI_VK_KV_QUANT", None)
-    if flag:
+    if flag is not None:
         env["COLI_VK_KV_QUANT"] = str(flag)
     old = os.environ
     try:
@@ -56,11 +60,13 @@ def _state(context, flag, **over):
 
 
 class Dsv41KvqHostPlanTest(unittest.TestCase):
-    def test_the_packed_price_and_the_fp32_one(self):
-        # a position costs 2.5 compressed rows: 6400 B fp32, 890 B packed
+    def test_the_packed_price_the_fp32_one_and_the_default(self):
+        # a position costs 2.5 compressed rows: 6400 B fp32, 890 B packed -- and the
+        # var unset IS the packed price (the engine's default, mirrored here)
         for ctx in (65536, 131072, 262144):
             self.assertEqual(_state(ctx, 0), 6400 * ctx, f"fp32 state at ctx {ctx}")
             self.assertEqual(_state(ctx, 2), 890 * ctx, f"packed state at ctx {ctx}")
+            self.assertEqual(_state(ctx, None), 890 * ctx, f"the default's packed state at ctx {ctx}")
 
     def test_the_freed_ram_against_the_slot_it_buys(self):
         # 5510 B a position freed. The slot a freed budget BUYS is the floor of the whole
@@ -79,7 +85,10 @@ class Dsv41KvqHostPlanTest(unittest.TestCase):
     def test_the_geometry_guard_keeps_the_fp32_price(self):
         # the formats are defined at head_dim 512 / index_head_dim 128: at any other
         # geometry the engine keeps the fp32 host, and the planner must price fp32 there
+        # -- the guard declines a set =2 exactly as it declines the default
         self.assertEqual(_state(4096, 2, head_dim=64, index_head_dim=32),
+                         (2048 + 2048 + 2048 + 4096) * (64 + 32) * 4)
+        self.assertEqual(_state(4096, None, head_dim=64, index_head_dim=32),
                          (2048 + 2048 + 2048 + 4096) * (64 + 32) * 4)
 
     def test_flag_one_prices_fp32(self):
