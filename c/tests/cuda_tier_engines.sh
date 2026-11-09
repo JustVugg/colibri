@@ -54,6 +54,11 @@ write_glmdsa("glm_gguf_sh.gguf", np.random.default_rng(9), copies=(2, 3))
 PY
   $PY tools/gguf_import.py glm_gguf_sh.gguf glm_gguf_sh > /dev/null || exit 1
 fi
+if [ ! -f glm_c4r/ref_glm.json ]; then   # the official converter's GLM-5.2 container: int4 with one scale a row, embedding and head int8
+  rm -rf glm_fp8_c4r glm_c4r && mkdir -p glm_fp8_c4r && (cd glm_fp8_c4r && $PY ../tools/make_glm_oracle.py --fp8 > /dev/null) &&
+    $PY tools/convert_fp8_to_int4.py --indir glm_fp8_c4r/glm_tiny --outdir glm_c4r --ebits 4 --io-bits 8 \
+      --n-layers 5 --min-free-gb 0 --group-size 0 > /dev/null && cp glm_fp8_c4r/ref_glm.json glm_c4r/ || exit 1
+fi
 fails=0
 ok() { echo "OK $*"; }
 bad() { echo "FAIL $*"; fails=$((fails + 1)); }
@@ -229,6 +234,33 @@ for v in "chain decode|1e-4|COLI_CUDA_TC_GEMM=0|64 16 16|ref" \
   else bad "colibri GGUF $tag (${fw:-0} chain forwards, device $d, $lg)"; diff a.tok b.tok | head -4; tail -3 gl-cu.log; fi
 done
 rm -f gl.usage
+
+# colibri (GLM-5.2) from the official converter's container, int4 with one scale a row: the format of the published
+# GLM-5.2 colibri containers (#2716). The dense matrices on the card (CUDA_DENSE=1, which `coli run --gpu` sets), then
+# every expert too (an empty pin list, filled), against the CPU with float activations (IDOT=0) and a float32 KV
+# cache: the CPU's tokens, the logits within 1e-5 of the largest with the dense part alone (float kernels), 1e-3 with
+# the experts on the card as well (their tiles round the activations to half precision). A 12-token prompt and a
+# 40-token one.
+: > glm_c4r/empty.stats
+$PY -c "import json; r=json.load(open('glm_c4r/ref_glm.json')); p=[(i*37+5)%250+2 for i in range(40)]; print(json.dumps({'prompt_ids': p, 'full_ids': p + r['full_ids'][len(r['prompt_ids']):]}))" > glm_c4r/ref40.json
+for v in "dense on the card|1e-5|CUDA_DENSE=1|ref_glm" "dense on the card, 40-token prompt|1e-5|CUDA_DENSE=1|ref40" \
+         "dense and every expert on the card|1e-3|CUDA_DENSE=1 CUDA_EXPERT_GB=1 PIN=glm_c4r/empty.stats PIN_GB=1 PIN_FILL=1|ref_glm" \
+         "dense and every expert on the card, 40-token prompt|1e-3|CUDA_DENSE=1 CUDA_EXPERT_GB=1 PIN=glm_c4r/empty.stats PIN_GB=1 PIN_FILL=1|ref40"; do
+  IFS='|' read -r tag tol envs ref <<< "$v"
+  G="SNAP=glm_c4r REF=glm_c4r/$ref.json IDOT=0 KV16=0 DRAFT=0 COLI_SPEC_GATE=0 USAGE_SAVE=0"
+  rm -f c4-cpu.f32 c4-cu.f32 glm_c4r/.coli_usage
+  env $G COLI_CUDA=0 DUMP=c4-cpu.f32 ./colibri 64 16 16 > c4-cpu.log 2>&1
+  env $G $X $envs DUMP=c4-cu.f32 ./colibri 64 16 16 > c4-cu.log 2>&1
+  gltok c4-cpu.log > a.tok; gltok c4-cu.log > b.tok
+  nt=$(sed -n 's/^\[CUDA\] resident set: \([0-9][0-9]*\) tensors.*/\1/p' c4-cu.log | tail -1)
+  ng=$(sed -n 's/^\[CUDA\] expert groups: \([0-9][0-9]*\) call.*/\1/p' c4-cu.log | tail -1)
+  case "$envs" in *PIN=*) want=${ng:-0};; *) want=1;; esac
+  lg=$(lclose c4-cpu.f32 c4-cu.f32 "$tol"); lok=$?
+  if [ -s a.tok ] && cmp -s a.tok b.tok && [ "${nt:-0}" -gt 0 ] && [ "$want" -gt 0 ] && [ $lok = 0 ]; then
+    ok "colibri int4 container $tag: tokens = CPU, $lg, ${nt} tensors on the card, ${ng:-0} expert group calls"
+  else bad "colibri int4 container $tag (${nt:-0} tensors, ${ng:-0} expert group calls, $lg)"; diff a.tok b.tok | head -4; tail -3 c4-cu.log; fi
+done
+rm -f c4-cpu.f32 c4-cu.f32 glm_c4r/.coli_usage
 
 # mimo: the greedy tokens, MXFP4 experts with an f32 trunk and with the release's
 for bits in 32 0; do
