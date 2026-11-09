@@ -7073,8 +7073,13 @@ static int v4_moe_batch_union(
     ExpertLoadJob jobs[DUAL_EXPERT_LOADER_MAX] = {{0}};
     ExpertLoadHandle loaders[DUAL_EXPERT_LOADER_MAX] = {{0}};
     int active[DUAL_EXPERT_LOADER_MAX] = {0};
-    int preload = key_count < dual_loader_lanes()
-        ? key_count : dual_loader_lanes();
+    /* Every lane holds a cache lease, and so does the expert being computed:
+     * with lanes + 1 > the layer's slots (no prefill pool) the last lookups
+     * found no free slot and the union failed. */
+    int lanes = dual_loader_lanes();
+    int lease_capacity = coli_v4_expert_store_lease_capacity(store, weights->plan.layer);
+    if (lease_capacity > 1 && lanes >= lease_capacity) lanes = lease_capacity - 1;
+    int preload = key_count < lanes ? key_count : lanes;
     for (int current = 0; !result && current < preload; current++) {
         jobs[current].store = store;
         jobs[current].key = keys[current];
@@ -7086,7 +7091,7 @@ static int v4_moe_batch_union(
             active[current] = 1;
     }
     for (int current = 0; !result && current < key_count; current++) {
-        int slot = current % dual_loader_lanes();
+        int slot = current % lanes;
         if (!active[slot] || profiled_expert_load_finish(&loaders[slot]) ||
             jobs[slot].result) {
             result = moe_fail("layer %d: reading expert %d from the expert store failed",
@@ -7095,7 +7100,7 @@ static int v4_moe_batch_union(
         }
         active[slot] = 0;
         ColiExpertView view = jobs[slot].view;
-        int next = current + dual_loader_lanes();
+        int next = current + lanes;
         if (next < key_count) {
             memset(&jobs[slot], 0, sizeof(jobs[slot]));
             jobs[slot].store = store;
@@ -7124,7 +7129,7 @@ static int v4_moe_batch_union(
                 expert_batch_capacity);
         coli_expert_release(store, &view);
     }
-    for (int slot = 0; slot < dual_loader_lanes(); slot++)
+    for (int slot = 0; slot < lanes; slot++)
         if (active[slot]) {
             profiled_expert_load_finish(&loaders[slot]);
             if (!jobs[slot].result) coli_expert_release(store, &jobs[slot].view);
@@ -10729,6 +10734,16 @@ void coli_v4_expert_store_prefill_pool(ColiExpertStore *store, int layer) {
     pthread_mutex_lock(&state->mutex);
     state->pool_layer = layer;
     pthread_mutex_unlock(&state->mutex);
+}
+
+int coli_v4_expert_store_lease_capacity(ColiExpertStore *store, int layer) {
+    if (!store || !store->state || !hot_find(store)) return 0;
+    V4ExpertStoreState *state = store->state;
+    pthread_mutex_lock(&state->mutex);
+    int capacity = state->pool_layer >= 0 && state->pool_layer == layer
+        ? state->layers * state->slots_per_layer : state->slots_per_layer;
+    pthread_mutex_unlock(&state->mutex);
+    return capacity;
 }
 
 /* The CUDA expert bank's side of the store (COLI_V4_UNIT_GPU,

@@ -738,6 +738,10 @@ int coli_deepseek_v4_expert_store_open_base(
  * Alternative registered ExpertStore backends safely ignore the request. */
 void coli_v4_expert_store_prefill_pool(ColiExpertStore *store, int layer);
 
+/* How many expert leases `layer` can hold at once: its slots, or every slot
+ * while the prefill pool lends them to it. 0 for an alternative backend. */
+int coli_v4_expert_store_lease_capacity(ColiExpertStore *store, int layer);
+
 /* The CUDA expert bank (COLI_CUDA_MOE_BATCH=1 prefill) reads through
  * lookup_uncounted, a lookup that leaves the routing books alone, and keeps the
  * books for one chunk's routing on `layer` (`count` expert ids, each token's
