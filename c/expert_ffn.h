@@ -157,11 +157,11 @@ static inline float xf_act_i8(const float *x, int I, int8_t *xq, float *xsum) {
  * order with fma; the 8 lane sums are scaled by the block scale into 8 lane
  * accumulators; the row ends with the fixed 8->1 tree of xf_hsum8. The SIMD
  * paths reproduce exactly this. The fma is coli_fmaf (fma_compat.h): fmaf where
- * the CPU fuses, the build every SIMD path needs; without FMA this is the only
- * f32 path (QWEN_EXPERT_ACT=f32, Qwen3.8's int4 experts), and there fmaf is
- * glibc's software emulation, one call an element, where coli_fmaf rounds the
- * exact double sum (#2606): Qwen3.6 with QWEN_EXPERT_ACT=f32 built for Sandy
- * Bridge, glibc's fmaf in software, 0.59 -> 2.9 tok/s. */
+ * the CPU fuses, the build the AVX2 path needs; without FMA (QWEN_EXPERT_ACT=f32,
+ * Qwen3.8's int4 experts) fmaf is glibc's software emulation, one call an
+ * element, where coli_fmaf rounds the exact double sum (#2606): Qwen3.6 with
+ * QWEN_EXPERT_ACT=f32 built for Sandy Bridge, glibc's fmaf in software, 0.59 ->
+ * 2.9 tok/s. There xf_dot_f32_dbl_rows below makes those operations in vectors. */
 static inline float xf_hsum8_scalar(const float *l) {
     float a0 = l[0] + l[4], a1 = l[1] + l[5], a2 = l[2] + l[6], a3 = l[3] + l[7];
     float b0 = a0 + a2, b1 = a1 + a3;
@@ -419,11 +419,144 @@ static inline float xf_dot_i8_sse2_int16(const uint8_t *w, const float *sc, cons
 }
 #endif /* SSE2 i8 */
 
+/* f32, x86 without FMA (Sandy Bridge, Ivy Bridge, the x86-64 baseline and v2). There coli_fmaf is
+ * (float)((double)a * b + c) (fma_compat.h): the product is exact in double, the sum rounds once in
+ * double and once to float. The reference makes that one element at a time, a code widened to float
+ * and the operation in scalar registers; this kernel makes the very same operations lane by lane,
+ * the 8 lanes of a block in two AVX double vectors (four SSE2 ones without AVX), the 64 codes of a
+ * block widened once for every activation row it serves, so its bits are xf_dot_f32_ref's
+ * (tests/test_xf_f32_nofma). Qwen3.8's int4-g64 experts on a Xeon E5-2690 v1 took 427 ms a forward
+ * in the reference against 173 for the FP8 experts they replace, though they read 44% fewer bytes
+ * (#2715). */
+#if !defined(XF_HAVE_AVX2) && !defined(__FMA__) && !defined(__FAST_MATH__) && defined(__SSE2__) && \
+    (defined(__x86_64__) || defined(__SSE2_MATH__)) && !defined(FP_FAST_FMAF) && !defined(__FP_FAST_FMAF)
+#define XF_HAVE_F32_DBL 1
+#define XF_F32_ROWS_DBL 4   /* rows a call: xf_dot_f32_rows' chunk */
+/* the 64 codes of a block as int32 v - 8, element order: e[j] holds elements 4j..4j+3 */
+static inline void xf_blk_i32_sse2(const uint8_t *blk, __m128i e[16]) {
+    const __m128i m4 = _mm_set1_epi8(0x0F), e8 = _mm_set1_epi16(8), z = _mm_setzero_si128();
+    const __m128i b0 = _mm_loadu_si128((const __m128i *)blk), b1 = _mm_loadu_si128((const __m128i *)(blk + 16));
+    const __m128i n[4] = { _mm_and_si128(b0, m4), _mm_and_si128(b1, m4),                        /* elements 0..15, 16..31 */
+                           _mm_and_si128(_mm_srli_epi16(b0, 4), m4), _mm_and_si128(_mm_srli_epi16(b1, 4), m4) };   /* 32..63 */
+    for (int q = 0; q < 4; q++) {
+        const __m128i lo = _mm_sub_epi16(_mm_unpacklo_epi8(n[q], z), e8), hi = _mm_sub_epi16(_mm_unpackhi_epi8(n[q], z), e8);
+        e[4 * q + 0] = _mm_srai_epi32(_mm_unpacklo_epi16(lo, lo), 16);
+        e[4 * q + 1] = _mm_srai_epi32(_mm_unpackhi_epi16(lo, lo), 16);
+        e[4 * q + 2] = _mm_srai_epi32(_mm_unpacklo_epi16(hi, hi), 16);
+        e[4 * q + 3] = _mm_srai_epi32(_mm_unpackhi_epi16(hi, hi), 16);
+    }
+}
+#ifdef __AVX__
+/* coli_fmaf in four lanes: p exact (a product of two floats), c a float held in a double */
+#define XF_DFMA4(p, c) _mm256_cvtps_pd(_mm256_cvtpd_ps(_mm256_add_pd((p), (c))))
+/* one block's step k for one row: lanes 0..3 and 4..7 (wd its 16 code vectors, xb its 64 activations) */
+#define XF_DSTEP4(l0, l1, wd, xb, k) \
+    (l0 = XF_DFMA4(_mm256_mul_pd((wd)[2 * (k)],     _mm256_cvtps_pd(_mm_loadu_ps((xb) + 8 * (k)))),     l0), \
+     l1 = XF_DFMA4(_mm256_mul_pd((wd)[2 * (k) + 1], _mm256_cvtps_pd(_mm_loadu_ps((xb) + 8 * (k) + 4))), l1))
+static inline void xf_blk_dbl_avx(const uint8_t *blk, __m256d wd[16]) {
+    __m128i e[16]; xf_blk_i32_sse2(blk, e);
+    for (int j = 0; j < 16; j++) wd[j] = _mm256_cvtepi32_pd(e[j]);
+}
+static inline void xf_dot_f32_dbl_rows(float *y, int ystride, const uint8_t *w, const float *sc,
+                                       const float *const *x, int I, int S) {
+    __m256d acc[XF_F32_ROWS_DBL][2];
+    for (int s = 0; s < S; s++) acc[s][0] = acc[s][1] = _mm256_setzero_pd();
+    const int ng = I / XF_BLOCK;
+    int g = 0;
+    /* Four blocks at a time: a block's lanes start from zero, so the four are independent chains
+     * (each rounds to float at every step, the latency the single chain waited on) until each joins
+     * the row's accumulators, in block order. */
+    for (; g + 4 <= ng; g += 4) {
+        __m256d wd[4][16];
+        for (int b = 0; b < 4; b++) xf_blk_dbl_avx(w + (size_t)(g + b) * XF_BLOCK_BYTES, wd[b]);
+        for (int s = 0; s < S; s++) {
+            const float *xb = x[s] + g * XF_BLOCK;
+            __m256d a0 = _mm256_setzero_pd(), a1 = a0, b0 = a0, b1 = a0, c0 = a0, c1 = a0, d0 = a0, d1 = a0;
+            for (int k = 0; k < 8; k++) {
+                XF_DSTEP4(a0, a1, wd[0], xb, k);
+                XF_DSTEP4(b0, b1, wd[1], xb + XF_BLOCK, k);
+                XF_DSTEP4(c0, c1, wd[2], xb + 2 * XF_BLOCK, k);
+                XF_DSTEP4(d0, d1, wd[3], xb + 3 * XF_BLOCK, k);
+            }
+            __m256d sd = _mm256_set1_pd((double)sc[g]);
+            acc[s][0] = XF_DFMA4(_mm256_mul_pd(a0, sd), acc[s][0]); acc[s][1] = XF_DFMA4(_mm256_mul_pd(a1, sd), acc[s][1]);
+            sd = _mm256_set1_pd((double)sc[g + 1]);
+            acc[s][0] = XF_DFMA4(_mm256_mul_pd(b0, sd), acc[s][0]); acc[s][1] = XF_DFMA4(_mm256_mul_pd(b1, sd), acc[s][1]);
+            sd = _mm256_set1_pd((double)sc[g + 2]);
+            acc[s][0] = XF_DFMA4(_mm256_mul_pd(c0, sd), acc[s][0]); acc[s][1] = XF_DFMA4(_mm256_mul_pd(c1, sd), acc[s][1]);
+            sd = _mm256_set1_pd((double)sc[g + 3]);
+            acc[s][0] = XF_DFMA4(_mm256_mul_pd(d0, sd), acc[s][0]); acc[s][1] = XF_DFMA4(_mm256_mul_pd(d1, sd), acc[s][1]);
+        }
+    }
+    for (; g < ng; g++) {
+        __m256d wd[16]; xf_blk_dbl_avx(w + (size_t)g * XF_BLOCK_BYTES, wd);
+        const __m256d scd = _mm256_set1_pd((double)sc[g]);
+        for (int s = 0; s < S; s++) {
+            const float *xb = x[s] + g * XF_BLOCK;
+            __m256d l0 = _mm256_setzero_pd(), l1 = _mm256_setzero_pd();   /* lanes 0..3, 4..7 */
+            for (int k = 0; k < 8; k++) XF_DSTEP4(l0, l1, wd, xb, k);
+            acc[s][0] = XF_DFMA4(_mm256_mul_pd(l0, scd), acc[s][0]);
+            acc[s][1] = XF_DFMA4(_mm256_mul_pd(l1, scd), acc[s][1]);
+        }
+    }
+    for (int s = 0; s < S; s++) {
+        float a[8];
+        _mm_storeu_ps(a, _mm256_cvtpd_ps(acc[s][0])); _mm_storeu_ps(a + 4, _mm256_cvtpd_ps(acc[s][1]));
+        y[(size_t)s * ystride] = xf_hsum8_scalar(a);
+    }
+}
+#else
+#define XF_DFMA2(p, c) _mm_cvtps_pd(_mm_cvtpd_ps(_mm_add_pd((p), (c))))
+static inline void xf_dot_f32_dbl_rows(float *y, int ystride, const uint8_t *w, const float *sc,
+                                       const float *const *x, int I, int S) {
+    __m128d acc[XF_F32_ROWS_DBL][4];
+    for (int s = 0; s < S; s++) acc[s][0] = acc[s][1] = acc[s][2] = acc[s][3] = _mm_setzero_pd();
+    const int ng = I / XF_BLOCK;
+    /* two blocks at a time, as the AVX form's four: independent chains until each joins acc in block order */
+    for (int g = 0; g < ng; g += 2) {
+        const int nb = ng - g < 2 ? ng - g : 2;
+        __m128d wd[2][32];   /* elements 2j, 2j+1 */
+        for (int b = 0; b < nb; b++) {
+            __m128i e[16]; xf_blk_i32_sse2(w + (size_t)(g + b) * XF_BLOCK_BYTES, e);
+            for (int j = 0; j < 16; j++) { wd[b][2 * j] = _mm_cvtepi32_pd(e[j]); wd[b][2 * j + 1] = _mm_cvtepi32_pd(_mm_shuffle_epi32(e[j], _MM_SHUFFLE(1, 0, 3, 2))); }
+        }
+        for (int s = 0; s < S; s++) {
+            __m128d l[2][4];   /* a block's lanes 0-1, 2-3, 4-5, 6-7 */
+            for (int b = 0; b < 2; b++) for (int q = 0; q < 4; q++) l[b][q] = _mm_setzero_pd();
+            for (int k = 0; k < 8; k++)
+                for (int b = 0; b < nb; b++) {
+                    const float *xb = x[s] + (g + b) * XF_BLOCK;
+                    const __m128 x0 = _mm_loadu_ps(xb + 8 * k), x1 = _mm_loadu_ps(xb + 8 * k + 4);
+                    l[b][0] = XF_DFMA2(_mm_mul_pd(wd[b][4 * k],     _mm_cvtps_pd(x0)),                    l[b][0]);
+                    l[b][1] = XF_DFMA2(_mm_mul_pd(wd[b][4 * k + 1], _mm_cvtps_pd(_mm_movehl_ps(x0, x0))), l[b][1]);
+                    l[b][2] = XF_DFMA2(_mm_mul_pd(wd[b][4 * k + 2], _mm_cvtps_pd(x1)),                    l[b][2]);
+                    l[b][3] = XF_DFMA2(_mm_mul_pd(wd[b][4 * k + 3], _mm_cvtps_pd(_mm_movehl_ps(x1, x1))), l[b][3]);
+                }
+            for (int b = 0; b < nb; b++) {
+                const __m128d scd = _mm_set1_pd((double)sc[g + b]);
+                for (int q = 0; q < 4; q++) acc[s][q] = XF_DFMA2(_mm_mul_pd(l[b][q], scd), acc[s][q]);
+            }
+        }
+    }
+    for (int s = 0; s < S; s++) {
+        float a[8];
+        _mm_storeu_ps(a,     _mm_movelh_ps(_mm_cvtpd_ps(acc[s][0]), _mm_cvtpd_ps(acc[s][1])));
+        _mm_storeu_ps(a + 4, _mm_movelh_ps(_mm_cvtpd_ps(acc[s][2]), _mm_cvtpd_ps(acc[s][3])));
+        y[(size_t)s * ystride] = xf_hsum8_scalar(a);
+    }
+}
+#endif
+#endif /* f32 without FMA */
+
 /* ---- dispatch -------------------------------------------------------------- */
 
 static inline float xf_dot_f32(const uint8_t *w, const float *sc, const float *x, int I) {
 #ifdef XF_HAVE_AVX2
     return xf_dot_f32_avx2(w, sc, x, I);
+#elif defined(XF_HAVE_F32_DBL)
+    float y; const float *xs[1] = { x };
+    xf_dot_f32_dbl_rows(&y, 1, w, sc, xs, I, 1);
+    return y;
 #else
     return xf_dot_f32_ref(w, sc, x, I);
 #endif
@@ -469,6 +602,8 @@ static inline void xf_dot_f32_rows(float *y, int ystride, const uint8_t *w, cons
         case 3: xf_dot_f32_rows_body(y + (size_t)s0 * ystride, ystride, w, sc, x + s0, I, 3); break;
         default: xf_dot_f32_rows_body(y + (size_t)s0 * ystride, ystride, w, sc, x + s0, I, 4); break;
         }
+#elif defined(XF_HAVE_F32_DBL)
+        xf_dot_f32_dbl_rows(y + (size_t)s0 * ystride, ystride, w, sc, x + s0, I, n);
 #else
         for (int s = 0; s < n; s++) y[(size_t)(s0 + s) * ystride] = xf_dot_f32_ref(w, sc, x[s0 + s], I);
 #endif
