@@ -55,6 +55,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **CPU without FMA: FP8 and int4-g64 experts read once for a prompt's rows** (#2715). On a
+  CPU without AVX2 or FMA (Sandy and Ivy Bridge, a build for the x86-64 baseline or v2),
+  quant.h's FP8 kernel decoded every weight again for each row and waited on one chain of adds:
+  a Xeon E5-2690 v1 spent ~150 ms a prompt token in Qwen3.8's FP8 experts, about a decode step.
+  Two rows or more now go into the lanes of a vector (8 with AVX, 4 with SSE2) with four output
+  rows a pass, and a single row runs four output rows a pass. expert_ffn.h's int4-g64 f32
+  kernel, the `experts-int4g64/` sidecar's, made its double-rounded multiply-adds one element
+  at a time; it now makes them in double vectors, a block's codes widened once for every row and
+  four blocks in flight. Every result keeps its bits: each row's sums are the scalar kernels'
+  own operations in their order (`tests/test_nofma_kernels.c`, built for the x86-64 baseline
+  and for Sandy Bridge). Qwen3.8's expert shapes on a Ryzen 7 PRO 8700GE built for Sandy Bridge,
+  one thread: FP8 2.4x for a decode row, 7.7x for 4 rows, 15x for 8 or more; int4-g64 2.6-2.9x
+  for a row, 3.8-4.1x for 4 or more (16 threads: FP8 1.5x and 7.5-9.6x, int4-g64 2.9-3.1x and
+  4.3-6.1x). DeepSeek V4's and GLM's FP8 matrices take the same kernel.
 - **CPU: qwen36 holds a GGUF's dense IQ3_S matrices as 4-bit codes** (#2704). IQ3_S packs four
   values into a 9-bit index of a 512-row grid, and the CPU gathered a grid row for every four
   values: those matrices read at a third of the RAM's speed on a Zen 4, about half of a token's
