@@ -138,23 +138,30 @@ static const gq_type_info GQ_TYPES[GQ_TYPE_MAX] = {
  * after block, its 16 rows' blocks as one group block (gq_r16_group_bytes: 16 blocks' bytes,
  * a little more for the K-quants, whose scales it keeps decoded). */
 enum { GQ_Q2_0_R16 = 64, GQ_Q4_K_R16, GQ_Q5_K_R16, GQ_Q6_K_R16, GQ_Q3_K_R16, GQ_IQ4_XS_R16,
-       GQ_Q8_0_R16, GQ_Q4_0_R16, GQ_IQ4_NL_R16, GQ_R16_END };
+       GQ_Q8_0_R16, GQ_Q4_0_R16, GQ_IQ4_NL_R16, GQ_IQ3_S_R16, GQ_R16_END };
 static inline int gq_r16_base(int t) {
-    static const int8_t base[] = { GQ_Q2_0, GQ_Q4_K, GQ_Q5_K, GQ_Q6_K, GQ_Q3_K, GQ_IQ4_XS, GQ_Q8_0, GQ_Q4_0, GQ_IQ4_NL };
+    static const int8_t base[] = { GQ_Q2_0, GQ_Q4_K, GQ_Q5_K, GQ_Q6_K, GQ_Q3_K, GQ_IQ4_XS, GQ_Q8_0, GQ_Q4_0, GQ_IQ4_NL, GQ_IQ3_S };
     return t >= GQ_Q2_0_R16 && t < GQ_R16_END ? base[t - GQ_Q2_0_R16] : -1;
 }
 static inline int gq_r16_group_bytes(int t) {
-    static const int16_t gb[] = { 288, 2368, 2880, 3360, 1824, 2208, 544, 288, 288 };
+    static const int16_t gb[] = { 288, 2368, 2880, 3360, 1824, 2208, 544, 288, 288, 2208 };
     return t >= GQ_Q2_0_R16 && t < GQ_R16_END ? gb[t - GQ_Q2_0_R16] : -1;
 }
 /* the interleaved form of block type t, or -1 */
+/* the forms that take more bytes than the rows they come from: IQ3_S's, its 9-bit grid indices
+ * and sign bits as one 4-bit code a value (sign and level, the grid's byte (2 level + 1)), IQ4_XS's
+ * layout, a quarter more bytes. gq_r16_of never names them, so no engine holds its experts
+ * larger without asking: gq_r16_of_grown does, for matrices an engine keeps resident. */
+static inline int gq_r16_grown(int r) { return r == GQ_IQ3_S_R16; }
 static inline int gq_r16_of(int t) {
-    for (int r = GQ_Q2_0_R16; r < GQ_R16_END; r++) if (gq_r16_base(r) == t) return r;
+    for (int r = GQ_Q2_0_R16; r < GQ_R16_END; r++) if (gq_r16_base(r) == t && !gq_r16_grown(r)) return r;
     return -1;
 }
+/* the interleaved form of t that takes more bytes, or -1 (gq_r16_grown) */
+static inline int gq_r16_of_grown(int t) { return t == GQ_IQ3_S ? GQ_IQ3_S_R16 : -1; }
 static inline int gq_type_ok(int t) { return t >= 0 && t < GQ_TYPE_MAX && GQ_TYPES[t].blck > 0 && GQ_TYPES[t].supported; }
 static inline const char *gq_type_name(int t) {
-    static const char *r16[] = { "Q2_0r16", "Q4_Kr16", "Q5_Kr16", "Q6_Kr16", "Q3_Kr16", "IQ4_XSr16", "Q8_0r16", "Q4_0r16", "IQ4_NLr16" };
+    static const char *r16[] = { "Q2_0r16", "Q4_Kr16", "Q5_Kr16", "Q6_Kr16", "Q3_Kr16", "IQ4_XSr16", "Q8_0r16", "Q4_0r16", "IQ4_NLr16", "IQ3_Sr16" };
     if (gq_r16_base(t) >= 0) return r16[t - GQ_Q2_0_R16];
     return (t >= 0 && t < GQ_TYPE_MAX && GQ_TYPES[t].name) ? GQ_TYPES[t].name : "?";
 }
@@ -1971,6 +1978,27 @@ static inline void gq_r16_t2(uint8_t *out, const uint8_t *in) {
     memcpy(out, &v, 4);
 }
 /* one group block from the 16 rows' blocks b[r] */
+/* IQ3_S's grid as its levels: the index of four levels ((byte - 1) / 2, three bits each, the
+ * first lowest), -1 where no grid row has them; built once, by the first caller */
+static inline const int16_t *gq_iq3s_rev(void) {
+    static int16_t rev[4096];
+    static int state;   /* 0 unbuilt, 1 building, 2 built */
+    if (__atomic_load_n(&state, __ATOMIC_ACQUIRE) == 2) return rev;
+    int zero = 0;
+    if (__atomic_compare_exchange_n(&state, &zero, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        for (int i = 0; i < 4096; i++) rev[i] = -1;
+        for (int i = 0; i < 512; i++) {
+            int key = 0;
+            for (int j = 0; j < 4; j++) key |= ((GGML_IQ3S_GRID[4 * i + j] - 1) >> 1) << (3 * j);
+            rev[key] = (int16_t)i;
+        }
+        __atomic_store_n(&state, 2, __ATOMIC_RELEASE);
+    } else
+        while (__atomic_load_n(&state, __ATOMIC_ACQUIRE) != 2) { }
+    return rev;
+}
+/* IQ3_S_R16's codes as values: (sign << 3) | level, level -> 2 level + 1 */
+static const int8_t GQ_IQ3S_CODES[16] __attribute__((aligned(16))) = { 1, 3, 5, 7, 9, 11, 13, 15, -1, -3, -5, -7, -9, -11, -13, -15 };
 static void gq_r16_pack_blk(int t, uint8_t *o, const uint8_t *const *b) {
     for (int r = 0; r < 16; r++) {
         const uint8_t *s = b[r];
@@ -2020,6 +2048,23 @@ static void gq_r16_pack_blk(int t, uint8_t *o, const uint8_t *const *b) {
             memcpy(o + 2 * r, s, 2);
             for (int q = 0; q < 4; q++) memcpy(o + 32 + 64 * q + 4 * r, s + 2 + 4 * q, 4);
             break;
+        case GQ_IQ3_S_R16: {   /* IQ4_XS_R16's layout: d, the scales 1 + 2 v, the codes (sign << 3 | level) */
+            const uint8_t *qs = s + 2, *qh = s + 66, *sg = s + 74, *sc = s + 106;
+            memcpy(o + 2 * r, s, 2);
+            for (int ib = 0; ib < 8; ib++) {
+                o[32 + 16 * ib + r] = (uint8_t)(1 + 2 * ((sc[ib >> 1] >> (4 * (ib & 1))) & 15));
+                uint8_t nb[16] = {0};   /* element k at byte k % 16, the low nibble for k < 16 */
+                for (int g4 = 0; g4 < 8; g4++) {   /* a grid row: four elements */
+                    const uint8_t *g = GGML_IQ3S_GRID + 4 * (qs[8 * ib + g4] | (((qh[ib] >> g4) & 1) << 8));
+                    const int sb = sg[4 * ib + g4 / 2] >> (4 * (g4 & 1));
+                    for (int j = 0; j < 4; j++) {
+                        const int k = 4 * g4 + j;
+                        nb[k & 15] |= (uint8_t)((((sb >> j) & 1) << 3 | (g[j] - 1) >> 1) << (k < 16 ? 0 : 4));
+                    }
+                }
+                for (int q = 0; q < 4; q++) memcpy(o + 160 + (4 * ib + q) * 64 + 4 * r, nb + 4 * q, 4);
+            }
+            break; }
         }
     }
 }
@@ -2074,6 +2119,27 @@ static void gq_r16_unpack_blk(int t, const uint8_t *o, int r, uint8_t *s) {
         memcpy(s, o + 2 * r, 2);
         for (int j = 0; j < 8; j++) for (int e = 0; e < 4; e++) s[2 + 4 * j + e] = o[32 + 64 * j + 4 * r + e] ^ 0x80;
         break;
+    case GQ_IQ3_S_R16: {   /* the grid index back from each four levels (gq_iq3s_rev) */
+        const int16_t *rev = gq_iq3s_rev();
+        uint8_t *qs = s + 2, *qh = s + 66, *sg = s + 74, *sc = s + 106;
+        memset(s, 0, 110); memcpy(s, o + 2 * r, 2);
+        for (int ib = 0; ib < 8; ib++) {
+            sc[ib >> 1] |= (uint8_t)((((int)o[32 + 16 * ib + r] - 1) >> 1) << (4 * (ib & 1)));
+            uint8_t nb[16];
+            for (int q = 0; q < 4; q++) memcpy(nb + 4 * q, o + 160 + (4 * ib + q) * 64 + 4 * r, 4);
+            for (int g4 = 0; g4 < 8; g4++) {
+                int key = 0;
+                for (int j = 0; j < 4; j++) {
+                    const int k = 4 * g4 + j, c = (nb[k & 15] >> (k < 16 ? 0 : 4)) & 15;
+                    key |= (c & 7) << (3 * j);
+                    if (c & 8) sg[4 * ib + k / 8] |= (uint8_t)(1 << (k & 7));
+                }
+                const int idx = rev[key] < 0 ? 0 : rev[key];
+                qs[8 * ib + g4] = (uint8_t)(idx & 255);
+                qh[ib] |= (uint8_t)((idx >> 8) << g4);
+            }
+        }
+        break; }
     case GQ_Q4_0_R16: case GQ_IQ4_NL_R16:
         memcpy(s, o + 2 * r, 2);
         for (int q = 0; q < 4; q++) memcpy(s + 2 + 4 * q, o + 32 + 64 * q + 4 * r, 4);
@@ -2255,9 +2321,9 @@ GQ_R16_FN gq_r16_q3_k(GQ_R16_ARGS) {
 }
 /* IQ4_XS: d, the eight sub-block scales (int8, -32 applied), then per sub-block four quads of
  * bytes: low nibbles quads 0-3, high nibbles 4-7, looked up as value + 128 */
-GQ_R16_FN gq_r16_iq4_xs(GQ_R16_ARGS) {
+GQ_R16_FN gq_r16_iq4_xs_tab(GQ_R16_ARGS, const void *values) {
     const __m512i m4 = _mm512_set1_epi8(0x0F);
-    const __m512i tab = _mm512_broadcast_i32x4(_mm_xor_si128(_mm_loadu_si128((const __m128i *)GGML_KVALUES_IQ4NL), _mm_set1_epi8((char)0x80)));
+    const __m512i tab = _mm512_broadcast_i32x4(_mm_xor_si128(_mm_loadu_si128((const __m128i *)values), _mm_set1_epi8((char)0x80)));
     GQ_R16_ZERO
     for (int b = 0; b < I / 256; b++) {
         const uint8_t *o = grp + (int64_t)b * 2208;
@@ -2276,6 +2342,9 @@ GQ_R16_FN gq_r16_iq4_xs(GQ_R16_ARGS) {
     }
     GQ_R16_STORE
 }
+GQ_R16_FN gq_r16_iq4_xs(GQ_R16_ARGS) { gq_r16_iq4_xs_tab(y, ystride, grp, xq, dx, xs, I, S, GGML_KVALUES_IQ4NL); }
+/* IQ3_S held as codes: IQ4_XS's kernel, the codes' values for the IQ4 table */
+GQ_R16_FN gq_r16_iq3_s(GQ_R16_ARGS) { gq_r16_iq4_xs_tab(y, ystride, grp, xq, dx, xs, I, S, GQ_IQ3S_CODES); }
 /* Q8_0: d, then the 32 bytes ^ 0x80 (w + 128) as 8 quads */
 GQ_R16_FN gq_r16_q8_0(GQ_R16_ARGS) {
     GQ_R16_ZERO
@@ -2329,6 +2398,7 @@ static void gq_r16_rows(int t, float *y, int ystride, const uint8_t *grp, const 
         case GQ_Q8_0_R16: GQ_R16_N(gq_r16_q8_0); break;
         case GQ_Q4_0_R16: GQ_R16_N(gq_r16_q4_0); break;
         case GQ_IQ4_NL_R16: GQ_R16_N(gq_r16_iq4_nl); break;
+        case GQ_IQ3_S_R16: GQ_R16_N(gq_r16_iq3_s); break;
         }
     }
 }
@@ -2510,12 +2580,13 @@ GQ_R16H_FN gq_r16h_q3_k(GQ_R16H_ARGS) {
     GQ_R16H_STORE
 }
 /* the IQ4 values as the codes the products take: + 128 with VNNI, signed without */
-static inline __m256i gq_r16h_iq4_tab(void) {
-    const __m128i t = _mm_loadu_si128((const __m128i *)GGML_KVALUES_IQ4NL);
+static inline __m256i gq_r16h_values_tab(const void *values) {
+    const __m128i t = _mm_loadu_si128((const __m128i *)values);
     return _mm256_broadcastsi128_si256(GQ_R16_BIGBIAS ? _mm_xor_si128(t, _mm_set1_epi8((char)0x80)) : t);
 }
-GQ_R16H_FN gq_r16h_iq4_xs(GQ_R16H_ARGS) {
-    const __m256i m4 = _mm256_set1_epi8(0x0F), tab = gq_r16h_iq4_tab();
+static inline __m256i gq_r16h_iq4_tab(void) { return gq_r16h_values_tab(GGML_KVALUES_IQ4NL); }
+GQ_R16H_FN gq_r16h_iq4_xs_tab(GQ_R16H_ARGS, const void *values) {
+    const __m256i m4 = _mm256_set1_epi8(0x0F), tab = gq_r16h_values_tab(values);
     GQ_R16H_ZERO
     for (int b = 0; b < I / 256; b++) {
         const uint8_t *o = grp + (int64_t)b * 2208;
@@ -2534,6 +2605,8 @@ GQ_R16H_FN gq_r16h_iq4_xs(GQ_R16H_ARGS) {
     }
     GQ_R16H_STORE
 }
+GQ_R16H_FN gq_r16h_iq4_xs(GQ_R16H_ARGS) { gq_r16h_iq4_xs_tab(y, ystride, grp, xq, dx, xs, I, S, h, GGML_KVALUES_IQ4NL); }
+GQ_R16H_FN gq_r16h_iq3_s(GQ_R16H_ARGS) { gq_r16h_iq4_xs_tab(y, ystride, grp, xq, dx, xs, I, S, h, GQ_IQ3S_CODES); }
 GQ_R16H_FN gq_r16h_q8_0(GQ_R16H_ARGS) {
     const __m256i flip = _mm256_set1_epi8(GQ_R16_BIGBIAS ? 0 : (char)0x80);   /* without VNNI: the bytes back to w */
     GQ_R16H_ZERO
@@ -2626,6 +2699,7 @@ static void gq_r16_rows(int t, float *y, int ystride, const uint8_t *grp, const 
             case GQ_Q8_0_R16: GQ_R16H_N(gq_r16h_q8_0); break;
             case GQ_Q4_0_R16: GQ_R16H_N(gq_r16h_q4_0); break;
             case GQ_IQ4_NL_R16: GQ_R16H_N(gq_r16h_iq4_nl); break;
+            case GQ_IQ3_S_R16: GQ_R16H_N(gq_r16h_iq3_s); break;
             }
     }
 }

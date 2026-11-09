@@ -98,6 +98,7 @@ namespace nvcuda { namespace wmma = ::rocwmma; }
 #define cudaEventRecord          hipEventRecord
 #define cudaEventSynchronize     hipEventSynchronize
 #define cudaEventQuery           hipEventQuery
+#define cudaStreamQuery          hipStreamQuery       /* cuda_chain.cu: a signal's flush */
 #define cudaEventElapsedTime     hipEventElapsedTime
 #define cudaMallocHost           hipHostMalloc
 #define cudaFreeHost             hipHostFree

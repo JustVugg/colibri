@@ -2515,8 +2515,9 @@ static int mimo_prompt_poll(ColiPromptBreak *b) {
 }
 
 /* A short request between two turns of the conversation the lone serve holds (park.h): every
- * layer's first K and V rows (a sliding layer's ring rows) and their positions, back when the
- * next request arrives; the host's caches stay canonical, the chains' watermarks come down. */
+ * layer's first K and V rows (a sliding layer's ring rows) and their positions; the next request
+ * brings them back, keeps them parked or drops them (mimo_park_decide). The host's caches stay
+ * canonical, the chains' watermarks come down. */
 static ColiPark g_mimo_park;
 static ColiParkPart *mimo_park_parts(Model *m, int *n_out) {
     Cfg *c = &m->c; int n = 0;
@@ -2549,6 +2550,13 @@ static void mimo_unpark(Model *m) {
 #endif
     } else coli_park_free(&g_mimo_park);
     free(p);
+}
+/* the next request decides a conversation the last one parked (park.h, #2703): back, kept or
+ * dropped; an image's request takes the state from its start, so it drops it */
+static void mimo_park_decide(Model *m, const int *ids, int np, int max_tok, int image) {
+    int d = image ? (g_mimo_park.on ? -1 : 0) : coli_park_decide(&g_mimo_park, &m->kvp, ids, np, max_tok, 16);
+    if (d > 0) mimo_unpark(m);
+    else if (d < 0) coli_park_free(&g_mimo_park);
 }
 
 static int mimo_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int *ids, float *logits,
@@ -2603,6 +2611,8 @@ static int mimo_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int
      * that would leave the first option token without its predictor.
      *
      * An image refuses both: the pad ids do not describe the picture. */
+    if (lone) mimo_park_decide(m, ids, n_prompt, cmd->max_tokens, *pending != NULL);   /* back, kept or dropped */
+    else coli_park_free(&g_mimo_park);
     int prefix_on = env_int("COLI_KV_PREFIX", 1) != 0;
     int reuse = 0;
     const float *pin_logit = NULL;
@@ -2621,9 +2631,10 @@ static int mimo_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int
         fflush(stderr);
     }
     if (!reuse) {
-        /* a short request keeps the conversation (mimo_unpark): only the rows it reaches start over */
+        /* a short request keeps the conversation (mimo_park_decide): only the rows it reaches start
+         * over, the rows kept apart when the conversation stays parked from the last request */
         int parked = lone && !(*pending) ? mimo_park(m, n_prompt, cmd->max_tokens) : 0;
-        model_reset_rows(m, parked ? parked : -1);
+        model_reset_rows(m, parked ? parked : g_mimo_park.on ? g_mimo_park.n : -1);
     }
     coli_serve_write_accept(stdout, cmd->id, n_prompt);
     if ((*pending)) {
@@ -2869,7 +2880,6 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *dir) {
             continue;
         }
         MimoReq rq;
-        mimo_unpark(m);   /* a conversation the last request parked: back first */
         if (!mimo_serve_start(m, tokenizer, &command, ids, logits, &pending, &pending_h, &pending_w, &rq, 1)) continue;
         double started = rq.started;
         double disk0 = rq.disk0, expert0 = rq.expert0, attn0 = rq.attn0;

@@ -253,6 +253,75 @@ def check_short_request_parks(binary: Path, model: Path,
           f"request, answers identical to a cold engine")
 
 
+def check_new_conversation_keeps_its_state(binary: Path, model: Path,
+                                           case: dict[str, object]) -> None:
+    """#2703: an agent runs one task after another on one slot. A new conversation shorter than
+    the last parks the old one; the next request decides its fate, so the new conversation's
+    second turn continues from its own first turn instead of the old one brought back first,
+    and answers as a cold engine does."""
+    base = list(case["prompt_ids"])                 # type: ignore[arg-type]
+    first_ids = (base * (48 // len(base) + 1))[:48]
+    new_ids = [token + 2 for token in base[:6]]
+    new2_ids = new_ids + base[:3]
+    warm = Serve(binary, model, extra=dict(COLI_PARK_MIN="16", COLI_PREFIX_LOG="1"))
+    try:
+        out = [warm.submit(token_prompt(first_ids), 1), warm.submit(token_prompt(new_ids), 1),
+               warm.submit(token_prompt(new2_ids), 4)]
+    finally:
+        warm.close()
+    assert warm.process.stderr is not None
+    log = warm.process.stderr.read().decode("utf-8", "replace")
+    if "conversation parked for a" not in log:
+        raise AssertionError("the shorter conversation did not park the old one:\n" + log)
+    if "conversation is back" in log:
+        raise AssertionError("the old conversation came back before the new one's second turn:\n" + log)
+    (new2_text, new2_reuse) = out[2]
+    if new2_reuse < len(new_ids):
+        raise AssertionError(f"the new conversation's second turn reused {new2_reuse} tokens, not its "
+                             f"first turn's {len(new_ids)}:\n" + log)
+    cold = Serve(binary, model)
+    try:
+        cold_text, _ = cold.submit(token_prompt(new2_ids), 4)
+    finally:
+        cold.close()
+    if new2_text != cold_text:
+        raise AssertionError(f"the new conversation's second turn answered {new2_text!r}, {cold_text!r} cold")
+    print(f"PASS prefix park, new conversation: its second turn reused {new2_reuse} tokens, "
+          f"the old one dropped")
+
+
+def check_two_short_requests_keep_it_parked(binary: Path, model: Path,
+                                            case: dict[str, object]) -> None:
+    """A second short request beside a parked conversation keeps it parked (it starts over, as
+    any request that reuses nothing); the conversation's next turn brings it back whole."""
+    base = list(case["prompt_ids"])                 # type: ignore[arg-type]
+    first_ids = (base * (48 // len(base) + 1))[:48]
+    side_ids = [token + 1 for token in base[:4]]
+    side2_ids = side_ids[:3] + [base[0] + 3]        # its start is the first short request's
+    second_ids = first_ids + base[:2]
+    warm = Serve(binary, model, extra=dict(COLI_PARK_MIN="16", COLI_PREFIX_LOG="1"))
+    try:
+        out = [warm.submit(token_prompt(first_ids), 1), warm.submit(token_prompt(side_ids), 4),
+               warm.submit(token_prompt(side2_ids), 4), warm.submit(token_prompt(second_ids), 4)]
+    finally:
+        warm.close()
+    assert warm.process.stderr is not None
+    log = warm.process.stderr.read().decode("utf-8", "replace")
+    if "conversation stays parked" not in log or log.count("conversation is back") != 1:
+        raise AssertionError("the second short request did not keep the conversation parked:\n" + log)
+    if out[3][1] < len(first_ids):
+        raise AssertionError(f"the next turn reused {out[3][1]} tokens, not the parked {len(first_ids)}:\n" + log)
+    for name, ids, got in (("second short request", side2_ids, out[2][0]), ("next turn", second_ids, out[3][0])):
+        cold = Serve(binary, model)
+        try:
+            cold_text, _ = cold.submit(token_prompt(ids), 4)
+        finally:
+            cold.close()
+        if got != cold_text:
+            raise AssertionError(f"the {name} answered {got!r} after two short requests, {cold_text!r} cold")
+    print(f"PASS prefix park, two short requests: kept parked, the next turn reused {out[3][1]} tokens")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", required=True, type=Path)
@@ -266,6 +335,8 @@ def main() -> int:
     check_repeated_prompt(arguments.binary, arguments.fixture, case)
     check_divergent_prompt_resets(arguments.binary, arguments.fixture, case)
     check_short_request_parks(arguments.binary, arguments.fixture, case)
+    check_new_conversation_keeps_its_state(arguments.binary, arguments.fixture, case)
+    check_two_short_requests_keep_it_parked(arguments.binary, arguments.fixture, case)
     print("PASS DeepSeek V4 KV prefix reuse: all checks completed")
     return 0
 

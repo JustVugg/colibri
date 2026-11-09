@@ -3908,8 +3908,9 @@ static int k3_ckpt_restore_best(Model *m, const int *ids, int np){
  * whole, and the MLA rows and index keys of the positions the request may write. The MLA
  * arrays stay (grown first, keeping the conversation, when the request asks for more
  * positions): a query reads only the rows of positions at or before its own, so the
- * conversation's further rows wait untouched, and only the KDA state starts over. They come
- * back when the next request arrives; the chains read the state and the rows from the host. */
+ * conversation's further rows wait untouched, and only the KDA state starts over. The next
+ * request brings them back, keeps them parked or drops them (k3_park_decide); the chains read
+ * the state and the rows from the host. */
 #define K3_PARK_SPEC 16   /* the rows a verify writes past the tokens that stand */
 static ColiPark g_k3_park;
 static ColiParkPart *k3_park_parts(Model *m, int *n_out){
@@ -3931,6 +3932,25 @@ static ColiParkPart *k3_park_parts(Model *m, int *n_out){
     *n_out=n;
     return p;
 }
+/* A request beside a parked conversation starts over without freeing anything: the KDA state
+ * from zero, the record cleared, the chains told; the MLA rows past the ones kept apart are the
+ * conversation's, and a query reads only the rows of positions at or before its own */
+static void k3_park_start_over(Model *m){
+    Cfg *c=&m->c;
+    kv_prefix_clear(&m->kvp);
+#ifdef COLI_VULKAN
+    k3c_host_wrote(m,1);
+#endif
+#ifdef COLI_CUDA
+    k3u_host_wrote(m,1);
+#endif
+    for(int i=0;i<c->n_layers;i++) if(m->L[i].kda){
+        memset(m->kstate[i],0,(size_t)c->kda_heads*c->kda_hd*c->kda_hd*sizeof(float));
+        memset(m->cwq[i],0,(size_t)c->kda_proj*c->conv_k*sizeof(float));
+        memset(m->cwk[i],0,(size_t)c->kda_proj*c->conv_k*sizeof(float));
+        memset(m->cwv[i],0,(size_t)c->kda_proj*c->conv_k*sizeof(float));
+    }
+}
 /* 1 when the conversation is parked and only the KDA state started over */
 static int k3_park(Model *m, int np, int max_t){
     int n=g_k3_mux_slots==1&&m->Lc ? coli_park_rows_for(&g_k3_park,&m->kvp,m->kvp.len,np,max_t-np-8,K3_PARK_SPEC) : 0, k=0;
@@ -3946,20 +3966,7 @@ static int k3_park(Model *m, int np, int max_t){
     int ok=p&&coli_park_save(&g_k3_park,&m->kvp,m->kvp.len,p,k,n);
     free(p);
     if(!ok) return 0;
-    Cfg *c=&m->c;
-    kv_prefix_clear(&m->kvp);
-#ifdef COLI_VULKAN
-    k3c_host_wrote(m,1);
-#endif
-#ifdef COLI_CUDA
-    k3u_host_wrote(m,1);
-#endif
-    for(int i=0;i<c->n_layers;i++) if(m->L[i].kda){
-        memset(m->kstate[i],0,(size_t)c->kda_heads*c->kda_hd*c->kda_hd*sizeof(float));
-        memset(m->cwq[i],0,(size_t)c->kda_proj*c->conv_k*sizeof(float));
-        memset(m->cwk[i],0,(size_t)c->kda_proj*c->conv_k*sizeof(float));
-        memset(m->cwv[i],0,(size_t)c->kda_proj*c->conv_k*sizeof(float));
-    }
+    k3_park_start_over(m);
     return 1;
 }
 static void k3_unpark(Model *m){
@@ -3976,6 +3983,13 @@ static void k3_unpark(Model *m){
     } else coli_park_free(&g_k3_park);
     free(p);
 }
+/* the next request decides a conversation the last one parked (park.h, #2703): back, kept or
+ * dropped, before prepare_request_state grows or frees the arrays */
+static void k3_park_decide(Model *m, const int *ids, int np, int max_t){
+    int d=coli_park_decide(&g_k3_park,&m->kvp,ids,np,max_t-np-8,K3_PARK_SPEC);
+    if(d>0) k3_unpark(m);
+    else if(d<0) coli_park_free(&g_k3_park);
+}
 
 /* Decide reuse before changing the state it describes. A miss discards the
  * old recurrent/KV state first and allocates a fresh target; a hit grows the
@@ -3987,7 +4001,10 @@ static int prepare_request_state(Model *m, const int *ids, int np, int max_t){
     /* Divergent prompt: before surrendering to a full reset, try the
      * checkpoint pool (a no-op unless COLI_K3_CKPT enabled it). */
     if(!reuse) reuse=k3_ckpt_restore_best(m,ids,np);
-    if(!reuse && !k3_park(m,np,max_t)) model_state_reset(m);   /* a short request keeps the conversation (k3_unpark) */
+    if(!reuse){
+        if(g_k3_park.on){ kv_alloc(m,max_t); k3_park_start_over(m); }   /* kept parked from the last request */
+        else if(!k3_park(m,np,max_t)) model_state_reset(m);   /* a short request keeps the conversation (k3_park_decide) */
+    }
     kv_alloc(m,max_t);
     return reuse;
 }
@@ -4202,6 +4219,7 @@ static int k3_serve_start(Model *m, Tok *T, ServeReq *q, int **ids_out, int *np_
         fprintf(stderr,"[PIN] %d scatti dello stato ricorrente accesi su richiesta (%.2f GB)\n",
                 n,k3_ckpt_reserve_gb(m,n));
     }
+    k3_park_decide(m,ids,np,np+q->max_tok+8);   /* a conversation the last request parked: back, kept or dropped */
     int reuse=prepare_request_state(m,ids,np,np+q->max_tok+8);
     /* Il riporto per il primo token fresco: i logit salvati con la foto che si
      * e appena rimessa. Senza foto resta spento e la prima posizione esce con
@@ -4268,7 +4286,6 @@ static int k3_serve_start(Model *m, Tok *T, ServeReq *q, int **ids_out, int *np_
 static int serve_one(Model *m, Tok *T, ServeReq *q){
     int *ids=NULL, np=0; float *lo=NULL; K3ReqClock clk; K3ReqChat ci;
     K3ServePoll poll={q->id,0};
-    k3_unpark(m);   /* a conversation the last request parked: back first */
     int started=k3_serve_start(m,T,q,&ids,&np,&lo,&clk,&ci,&poll);
     if(started<=0) return started;
     int chat=ci.chat, thinking=ci.thinking, *sp=ci.sp;

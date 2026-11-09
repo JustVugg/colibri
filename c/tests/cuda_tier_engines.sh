@@ -136,7 +136,8 @@ done
 # qwen36's hybrid steps on the CUDA chain (a tier too small for the experts: the host computes the slots the device
 # lacks while the device waits for its word), from a small qwen35moe GGUF; then the host's word of the second hybrid
 # step never written (COLI_CUDA_HOST_WAIT_FAULT=2): the device stops waiting after COLI_CUDA_HOST_WAIT_S=1, the frame is
-# lost and the CPU goes on (#2696: the card spun on that word with the answer stopped). The tokens are the CPU's.
+# lost and the CPU goes on (#2696: the card spun on that word with the answer stopped). Between them the same steps
+# with every signal sent to the card at once (COLI_CUDA_FLUSH=1, Windows' default without TCC). The tokens are the CPU's.
 if [ ! -d q35m_gguf_tiny ]; then
   $PY - <<'PY' || exit 1
 import sys, numpy as np
@@ -152,12 +153,15 @@ env SNAP=q35m_gguf_tiny OMP_NUM_THREADS=2 COLI_NO_OMP_TUNE=1 USAGE_SAVE=0 ./qwen
 cputok=$(grep -a '^C engine' q35m-cpu.log | tail -1 | sed 's/^C engine : //; s/ *Text .*//' | tr -s ' ' | sed 's/ *$//; s/ /, /g')
 printf '{"prompt_ids": [5, 6, 7, 8], "full_ids": [5, 6, 7, 8, %s]}' "$cputok" > q35m_gguf_tiny/ref.json
 q36hyb() { sed -n 's/^\[chain\] qwen36: [0-9]* layer steps with the routed experts in the frame, \([0-9]*\) of them hybrid.*/\1/p' "$1" | tail -1; }
-for v in "hybrid steps|" "the host's word lost|COLI_CUDA_HOST_WAIT_FAULT=2 COLI_CUDA_HOST_WAIT_S=1"; do
+for v in "hybrid steps|" "hybrid steps, each signal sent at once|COLI_CUDA_FLUSH=1" \
+         "the host's word lost|COLI_CUDA_HOST_WAIT_FAULT=2 COLI_CUDA_HOST_WAIT_S=1"; do
   IFS='|' read -r tag envs <<< "$v"
   env SNAP=q35m_gguf_tiny OMP_NUM_THREADS=2 COLI_NO_OMP_TUNE=1 USAGE_SAVE=0 ./qwen36 2 8 q35m_gguf_tiny/ref.json > q35m-cpu.log 2>&1
   env $envs $X CUDA_EXPERT_GB=0.005 SNAP=q35m_gguf_tiny OMP_NUM_THREADS=2 COLI_NO_OMP_TUNE=1 USAGE_SAVE=0 timeout 120 ./qwen36 2 8 q35m_gguf_tiny/ref.json > q35m-cu.log 2>&1; rc=$?
   a=$(grep -a '^C engine' q35m-cpu.log | tail -1); b=$(grep -a '^C engine' q35m-cu.log | tail -1); h=$(q36hyb q35m-cu.log)
-  if [ -z "$envs" ]; then good=$([ "${h:-0}" -gt 0 ] && echo 1)
+  if [ -z "$envs" ]; then good=$([ "${h:-0}" -gt 0 ] && ! grep -qa "a signal for the host goes to the device at once" q35m-cu.log && echo 1)
+  elif [ "$envs" = COLI_CUDA_FLUSH=1 ]; then
+    good=$([ "${h:-0}" -gt 0 ] && grep -qa "a signal for the host goes to the device at once (COLI_CUDA_FLUSH" q35m-cu.log && echo 1)
   else good=$(grep -qa "the device waited 1 s for the host's share of hybrid step" q35m-cu.log && echo 1); fi
   if [ $rc = 0 ] && [ -n "$a" ] && [ "$a" = "$b" ] && [ "$good" = 1 ]; then ok "qwen36 GGUF $tag: tokens = CPU (${h:-0} hybrid layer steps)"
   else bad "qwen36 GGUF $tag (rc $rc, ${h:-0} hybrid layer steps)"; echo "cpu: $a"; echo "cu:  $b"; grep -aE '^\[(chain|qtier|CUDA)\]' q35m-cu.log | tail -5; fi
