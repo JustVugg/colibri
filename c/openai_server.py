@@ -6852,7 +6852,7 @@ class Engine:
         # process group (the graceful stop, handled as SIGBREAK above) must
         # not reach the engine — the C runtime's default would kill it
         # before its stdin-EOF teardown (atexit -> HEAT_FILE save) can run.
-        spawn_flags = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
+        spawn_flags = (subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)
         self.process = subprocess.Popen(
             [str(executable), str(resolved_cap)], env=child_env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0,

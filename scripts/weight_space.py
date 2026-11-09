@@ -1,10 +1,10 @@
 import argparse, json, os, shutil, time
 from collections import defaultdict
 
-RESULTS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)), "results"))
+RESULTS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "results")
 
 import torch
-from safetensors.torch import safe_open, safe_torch_save
+from safetensors.torch import safe_open, save_file
 
 
 def shard_paths(repo):
@@ -143,7 +143,7 @@ def apply_patch(shard_path, plan, out_path=None, dry_run=False):
     log_lines.append("edits_applied=%d / planned=%d" % (edits_applied, len(plan.get("edits", []))))
 
     if not dry_run:
-        safe_torch_save(sd, out_path)
+        save_file(sd, out_path)
         log_lines.append("WROTE %s" % out_path)
 
     log_path = os.path.join(RESULTS, "patch_dryrun.log")
