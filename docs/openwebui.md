@@ -68,7 +68,7 @@ go in `~/.local/share/colibri/gateway.json` (`--config` for another path):
 context the serve starts with (`--ctx`; unset, the serve takes what the RAM allows, which
 on a 94 GB box was 65536 tokens and 7 GB of state taken from Qwen3.8's host pool),
 `kv_slots` the conversations served at once (`--kv-slots`, the gateway's `--kv-slots` when
-unset), `args` extra `coli serve` arguments, `env` the environment of that engine (added
+unset), `keep_alive` how long the model stays loaded after its last request (`"20m"`; the gateway's `--keep-alive` when unset, `-1` = until another model is asked for), `args` extra `coli serve` arguments, `env` the environment of that engine (added
 to the gateway's own). `think` is the model's thinking when a request says nothing about it (Open WebUI sends no
 `think` unless its reasoning toggle is used): `"low"`, `"medium"`, `"high"`, `true` or
 `false`; a request's own `think` wins. Without it Qwen3.8 follows its template and thinks
@@ -121,6 +121,7 @@ connection's key, or `COLI_ALLOW_INSECURE_BIND=1`).
 | `options.num_predict`, `temperature`, `top_p`, `stop`, `presence_penalty`, `frequency_penalty` | the OpenAI fields |
 | `options.seed`, `top_k`, `num_ctx`, `repeat_penalty`, ... | dropped (listed once in the gateway's log) |
 | `keep_alive: 0` with an empty prompt | unloads the engine; a non-empty prompt loads it |
+| `keep_alive` on a request (`"20m"`, `"1h"`, seconds, `-1`) | as Ollama's: the model unloads once it has sat idle that long after the request (never under one); unset, the model's `keep_alive` in gateway.json, else the gateway's `--keep-alive` (COLI_KEEP_ALIVE; default `-1`, loaded until another model is asked for). `/api/ps` shows `expires_at` |
 | `prompt_eval_count`, `eval_count`, `eval_duration`, `load_duration` | from the usage block `coli serve` streams last |
 | `/api/pull` | `coli setup --model ID` as a child, its download progress as Ollama's status lines (the ids are the setup catalog's) |
 | `/api/delete` | removes a model directory under `--models-dir` (nothing elsewhere) |

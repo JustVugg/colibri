@@ -499,3 +499,73 @@ class StopFile(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class KeepAlive(unittest.TestCase):
+    """Ollama's keep_alive: durations, and the idle unload between requests."""
+
+    def test_parse(self):
+        p = gw.parse_keep_alive
+        self.assertEqual(p(None, default=-1.0), -1.0)
+        self.assertEqual(p("20m"), 1200.0)
+        self.assertEqual(p("1h30m"), 5400.0)
+        self.assertEqual(p("90s"), 90.0)
+        self.assertEqual(p("300"), 300.0)
+        self.assertEqual(p(300), 300.0)
+        self.assertEqual(p(0), 0.0)
+        self.assertEqual(p("0"), 0.0)
+        self.assertEqual(p("0m"), 0.0)
+        self.assertEqual(p(-1), -1.0)
+        self.assertEqual(p("-1"), -1.0)
+        self.assertEqual(p("forever", default=1200.0), 1200.0)
+        self.assertEqual(p(True, default=5.0), 5.0)
+
+    def _manager(self, keep_alive):
+        m = gw.EngineManager("coli", 0, keep_alive=keep_alive)
+        m.current, m.state = "m", "ready"
+        m.stopped = []
+        m._stop_locked = lambda: (m.stopped.append(m.current), setattr(m, "current", None), setattr(m, "state", "stopped"))
+        return m
+
+    def test_idle_unload_after_the_request(self):
+        m = self._manager(1200.0)
+        entry = {"name": "m"}
+        m.begin(); m.end(entry, None, now=1000.0)
+        self.assertEqual(m.expires_at, 2200.0)
+        self.assertIsNone(m.idle_check(now=2199.0))
+        self.assertEqual(m.idle_check(now=2200.0), "m")
+        self.assertEqual(m.stopped, ["m"]); self.assertEqual(m.state, "stopped")
+
+    def test_request_keep_alive_wins_then_the_entry_then_the_gateway(self):
+        m = self._manager(1200.0)
+        m.begin(); m.end({"name": "m", "keep_alive": "5m"}, "1h", now=0.0)
+        self.assertEqual(m.expires_at, 3600.0)
+        m.begin(); m.end({"name": "m", "keep_alive": "5m"}, None, now=0.0)
+        self.assertEqual(m.expires_at, 300.0)
+        m.begin(); m.end({"name": "m"}, None, now=0.0)
+        self.assertEqual(m.expires_at, 1200.0)
+        m.begin(); m.end({"name": "m"}, -1, now=0.0)
+        self.assertIsNone(m.expires_at)
+        self.assertIsNone(m.idle_check(now=1e9))
+
+    def test_never_under_a_request_and_not_attached(self):
+        m = self._manager(10.0)
+        m.begin(); m.end({"name": "m"}, None, now=0.0)
+        m.begin()                                   # a second request runs
+        self.assertIsNone(m.idle_check(now=100.0))  # busy: stays
+        m.end({"name": "m"}, None, now=100.0)
+        self.assertEqual(m.idle_check(now=110.0), "m")
+        a = gw.EngineManager("coli", 0, engine_url="http://127.0.0.1:1", engine_model="m", keep_alive=1.0)
+        a.begin(); a.end({"name": "m"}, None, now=0.0)
+        self.assertIsNone(a.idle_check(now=1e9))    # attached: never spawned, never stopped
+
+    def test_a_request_without_a_model_leaves_the_timer(self):
+        m = self._manager(1200.0)
+        m.begin(); m.end({"name": "m"}, None, now=0.0)
+        m.begin(); m.end(None, None, now=1000.0)    # /api/show
+        self.assertEqual(m.expires_at, 1200.0)
+
+    def test_ps_shows_the_expiry(self):
+        out = gw.ps_entry({"name": "m", "path": ""}, 0, expires_at=0.0)
+        self.assertEqual(out["expires_at"], "1970-01-01T00:00:00.000000000Z")
+        self.assertEqual(gw.ps_entry({"name": "m", "path": ""}, 0)["expires_at"], "0001-01-01T00:00:00Z")
