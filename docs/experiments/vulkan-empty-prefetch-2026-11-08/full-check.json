@@ -1,0 +1,43 @@
+{
+  "tree": "pr-lazy-stream",
+  "command": [
+    "docker",
+    "run",
+    "--rm",
+    "--name",
+    "colibri-model-code-check",
+    "--user",
+    "1001:1001",
+    "--label",
+    "colibench.validation=20261108-132222",
+    "--cpuset-cpus",
+    "16-31",
+    "-e",
+    "HOME=/tmp",
+    "-v",
+    "/opt/colibri/pr-lazy-stream:/src",
+    "-w",
+    "/src",
+    "colibri-builder:xe2",
+    "env",
+    "-u",
+    "OMP_NUM_THREADS",
+    "-u",
+    "OMP_PROC_BIND",
+    "-u",
+    "OMP_PLACES",
+    "make",
+    "check",
+    "-j16"
+  ],
+  "commit": "f5d65566de468c8e7ac285a5e8c7257bf4d06856",
+  "patch_sha256": "4b441f77f340b3fa1deb961ab16b738a37afa985a353ff6c35200439121dfbb7",
+  "exit_code": 0,
+  "status": "passed",
+  "warning_count": 66,
+  "python_summary": [
+    "Ran 3089 tests in 316.839s",
+    "OK (skipped=397)"
+  ],
+  "log_sha256": "1a3dd10444f8fc4aaf2801ca0937d1f86552ff415cf48ca377035fe03633f3c0"
+}
