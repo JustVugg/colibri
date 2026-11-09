@@ -26,17 +26,38 @@ MODEL_ID = "bge-base-en-v1.5-int8-npu"
 
 class Embedder:
     def __init__(self, device):
+        import openvino as ov
+        core = ov.Core()
+        self.devices = list(core.available_devices)
+        self.requested = device
+        self.fallback = False
+        self.npu_name = ""
+        if "NPU" in self.devices:
+            try:
+                self.npu_name = core.get_property("NPU", "FULL_DEVICE_NAME")
+            except Exception:
+                self.npu_name = "NPU"
         self.device = device
         t0 = time.time()
         try:
             self.pipe = g.TextEmbeddingPipeline(MODEL, device)
-        except Exception:
+        except Exception as e:
+            self.fallback = True
+            self.error = str(e)[:300]
             self.device = "CPU"
             self.pipe = g.TextEmbeddingPipeline(MODEL, "CPU")
-        self.load_s = time.time() - t0
+        self.load_s = round(time.time() - t0, 2)
+        self.calls = 0
+        self.texts = 0
+        self.last_ms = None
 
     def one(self, text):
-        return np.asarray(self.pipe.embed_documents([text])[0], dtype=np.float32)
+        t0 = time.time()
+        v = np.asarray(self.pipe.embed_documents([text])[0], dtype=np.float32)
+        self.calls += 1
+        self.texts += 1
+        self.last_ms = round((time.time() - t0) * 1000, 1)
+        return v
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -54,10 +75,18 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path.rstrip("/") in ("/v1/models", "/models"):
+        path = self.path.rstrip("/")
+        if path in ("/v1/models", "/models"):
             self._send(200, {"object": "list", "data": [
                 {"id": MODEL_ID, "object": "model", "owned_by": "intel-npu",
                  "device": self.embedder.device}]})
+        elif path == "/health":
+            e = self.embedder
+            self._send(200, {"status": "ok", "device": e.device, "fallback": e.fallback,
+                             "npu_name": e.npu_name, "devices": e.devices,
+                             "load_s": e.load_s, "calls": e.calls, "texts": e.texts,
+                             "last_ms": e.last_ms,
+                             "error": getattr(e, "error", None)})
         else:
             self._send(404, {"error": "not found"})
 
