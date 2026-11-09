@@ -358,6 +358,66 @@ static void prompt_rows_one_pass_long(void) {
     T->free(qb); T->free(kb); T->free(vb); T->free(ob);
 }
 
+/* cc_attn_fk's 16-byte staging (cc_fa_stage16), where cc_attn_fk takes a prompt chunk: sm_70,
+ * or COLI_CUDA_CHAIN_FLASH2=0 from sm_75 (cc_attn_f2 takes it otherwise, and this says so).
+ * The same chunk as above: K and V 16-byte aligned take the staging, the same K and V one
+ * element further on take the scalar loop, and the two give the same bits, from a float32
+ * cache (four floats a load, rounded: values that are not float16 numbers, so the rounding
+ * shows) and from a float16 one (eight halves a load, copied). Four rows against the
+ * reference. (The float16 cache against the float32 one, on this path too: the test above.) */
+static void prompt_rows_16byte_staging(void) {
+#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
+    printf("  (16-byte staging: no cc_attn_fk on HIP)\n");
+#else
+    int dev = 0, ma = 0, mi = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&ma, cudaDevAttrComputeCapabilityMajor, dev);
+    cudaDeviceGetAttribute(&mi, cudaDevAttrComputeCapabilityMinor, dev);
+    const char *f2 = getenv("COLI_CUDA_CHAIN_FLASH2");
+    if (ma < 7 || (ma * 10 + mi >= 75 && !(f2 && *f2 == '0'))) {
+        printf("  (16-byte staging: no cc_attn_fk for a prompt chunk on sm_%d%d; COLI_CUDA_CHAIN_FLASH2=0 runs it from sm_75)\n", ma, mi);
+        return;
+    }
+    const int H = 16, KV = 2, hd = 256, S = 2043, pos = 6144, cap = 8384, qdim = 2 * hd, k_off = 32;
+    const size_t nkv = (size_t)k_off + 1 + (size_t)KV * cap * hd, n = (size_t)S * H * hd;
+    std::vector<float> q = rnd((size_t)S * H * qdim, 71), kc = rnd(nkv, 72), vc = rnd(nkv, 73), kc1(nkv), vc1(nkv);
+    memcpy(kc1.data() + 1, kc.data(), (nkv - 1) * 4); memcpy(vc1.data() + 1, vc.data(), (nkv - 1) * 4);   /* one element on */
+    CcAttn p = {S, H, KV, hd, pos, cap, 0, H * qdim, qdim, hd, H * qdim, qdim, 1, 0, H * hd, 0, 0, 1.f / sqrtf((float)hd), k_off, k_off};
+    CcAttn p1 = p; p1.k_off = p1.v_off = k_off + 1;
+    auto finite = [](const std::vector<float> &v) { for (float x : v) if (!std::isfinite(x)) return false; return true; };
+    CcBuf *qb = up(q), *kb = up(kc), *vb = up(vc), *kb1 = up(kc1), *vb1 = up(vc1);
+    CcBuf *ob = T->buf(n * 4, CC_DEV), *ob1 = T->buf(n * 4, CC_DEV);
+    int ran = T->begin() && T->attn(qb, kb, vb, ob, qb, NULL, &p) && T->attn(qb, kb1, vb1, ob1, qb, NULL, &p1) && T->submit(1);
+    std::vector<float> o = down(ob, n), o1 = down(ob1, n);
+    ck(ran && finite(o) && !memcmp(o.data(), o1.data(), n * 4),
+       "16-byte staging, a float32 cache: H 16 KV 2 hd 256, 2043 rows after 6144: the scalar loop's bits");
+    double d = 0;
+    for (int r : {0, 1, 1024, 2042}) {   /* a row alone: one position more each */
+        CcAttn pr = p; pr.S = 1; pr.pos_base = pos + r; pr.q_off = r * p.q_row; pr.g_off = p.g_off + r * p.g_row; pr.o_off = 0;
+        std::vector<float> ref((size_t)H * hd);
+        ref_attn(q.data(), kc.data(), vc.data(), ref.data(), q.data(), NULL, &pr);
+        d = fmax(d, maxdiff(o.data() + (size_t)r * H * hd, ref.data(), ref.size()));
+    }
+    ck(ran && finite(o) && d < 1e-4, "and rows 0, 1, 1024 and 2042 within 1e-4 of the reference");
+    printf("  16-byte staging, rows 0, 1, 1024 and 2042: max |diff| %.2e\n", d);
+    if (T->size < offsetof(ColiCudaChainOps, copy_regions_h) + sizeof T->copy_regions_h || !T->kvh()) printf("  (no float16 cache here)\n");
+    else {
+        std::vector<uint16_t> kh(nkv), vh(nkv), kh1(nkv), vh1(nkv);
+        kv16_pack(kh.data(), kc.data(), (int64_t)nkv); kv16_pack(vh.data(), vc.data(), (int64_t)nkv);
+        kv16_pack(kh1.data(), kc1.data(), (int64_t)nkv); kv16_pack(vh1.data(), vc1.data(), (int64_t)nkv);
+        CcBuf *khb = T->buf(nkv * 2, CC_DEV), *vhb = T->buf(nkv * 2, CC_DEV), *khb1 = T->buf(nkv * 2, CC_DEV), *vhb1 = T->buf(nkv * 2, CC_DEV);
+        CcBuf *oh = T->buf(n * 4, CC_DEV), *oh1 = T->buf(n * 4, CC_DEV);
+        int ok = ran && khb && vhb && khb1 && vhb1 && oh && oh1 && T->begin() && T->write(khb, 0, kh.data(), nkv * 2) &&
+                 T->write(vhb, 0, vh.data(), nkv * 2) && T->write(khb1, 0, kh1.data(), nkv * 2) && T->write(vhb1, 0, vh1.data(), nkv * 2) &&
+                 T->attn_h(qb, khb, vhb, oh, qb, NULL, &p) && T->attn_h(qb, khb1, vhb1, oh1, qb, NULL, &p1) && T->submit(1);
+        std::vector<float> h = down(oh, n), h1 = down(oh1, n);
+        ck(ok && finite(h) && !memcmp(h.data(), h1.data(), n * 4), "16-byte staging, a float16 cache: the scalar loop's bits");
+        T->free(khb); T->free(vhb); T->free(khb1); T->free(vhb1); T->free(oh); T->free(oh1);
+    }
+    T->free(qb); T->free(kb); T->free(vb); T->free(kb1); T->free(vb1); T->free(ob); T->free(ob1);
+#endif
+}
+
 /* the router's pick (chain_route.comp's rules: the lower expert on a tie, groups by their two best) */
 static void ref_route(const float *l, const float *bias, int *ids, float *w, const CcRoute *p) {
     std::vector<float> sc(p->E), pk(p->E);
@@ -1101,6 +1161,7 @@ int main(void) {
         }
     }
     prompt_rows_one_pass_long();
+    prompt_rows_16byte_staging();
     {   /* a float16 KV cache (kvh: attn_h, attn_wh, copy_regions_h): K and V of float16 values give
          * attn's bits from a float32 cache of the same values on every path: a decode's blocks by KV
          * head and by head, a prompt chunk on the tensor cores, a window with sinks, linear and in a ring */
