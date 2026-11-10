@@ -699,7 +699,12 @@ a layer's non-resident experts into VRAM and runs them with the residents:
   f16 GEMMs read directly (`CcExpert.planar`: in each 64 weights' 32 bytes, byte k holds
   weight k low and k + 32 high, both v + 8). No second copy in RAM, no conversion. On when
   the RAM holds every expert (no slot is ever recycled), one card, int4-g64 and the f16
-  GEMMs (`coli_cuda_planar_rows`).
+  GEMMs (`coli_cuda_planar_rows`). A per-row int4 container (or int4 per group with
+  `QWEN_EXPERT_KERNEL=0`) keeps the packed pairs beside its int8 copy: the very bytes the
+  residents' tensors hold (`CcExpert.planar` 0), gate, up and down in one block with the
+  row scales, so the pool takes them as they are and every GEMM reads them as it reads a
+  resident's. Where the pool stays off and not every expert is on the card, the warm start
+  says why (`[qtier] no host pool (...)`).
 - The pool follows the residents (`qt_chain_host_follow`). The chain's promotions and the
   tier's LFRU swaps move experts between the card and the RAM after the warm start; before a
   prompt chunk of 128 rows or more (`Q36CC_FOLLOW_ROWS`), the experts that left the card are

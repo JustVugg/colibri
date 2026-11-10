@@ -1485,18 +1485,36 @@ static void qt_lfru_tick_locked(void);
  * the copies as it is, page-locked here (a copy at the bus's full rate, no second copy in RAM).
  * A decode step's slots stay the CPU's. On when the RAM holds every expert (no slot is ever
  * recycled), one device, and the RAM copy is a layout the device's GEMMs read: expert_ffn.h's
- * planar int4 per 64 (coli_cuda_planar_rows), or a GGUF's rows as the file has them (gate, up
- * and down back to back, no scales; the engine holds them so when this tier takes a GGUF's
- * experts). COLI_CUDA_HOST_POOL=0 off. */
+ * planar int4 per 64 (coli_cuda_planar_rows), int4 in pairs (a per-row container, or per group
+ * off the shared kernel: the bytes the residents' tensors hold, gate, up and down in one block),
+ * or a GGUF's rows as the file has them (gate, up and down back to back, no scales; the engine
+ * holds them so when this tier takes a GGUF's experts). A per-row container had none: its
+ * 12.7K-token prompt ran the experts outside VRAM on the CPU (#2734). COLI_CUDA_HOST_POOL=0 off. */
 static int G_host_on = -1;
 static unsigned long long G_host_n, G_host_bytes;
 static int host_pool_on(void){
     if(G_host_on >= 0) return G_host_on;
     const char *e = getenv("COLI_CUDA_HOST_POOL");
     G_host_on = !(e && *e == '0') && G.on && !G_stream && !G_trunk_only && G.ndev == 1 &&
-                ((G_src_planar && G.wfmt == 4 && G.egs == 64 && coli_cuda_planar_rows(G.dev[0], G.D, G.Ih)) || G.wfmt == QT_GGUF);
+                ((G_src_planar && G.wfmt == 4 && G.egs == 64 && coli_cuda_planar_rows(G.dev[0], G.D, G.Ih)) ||
+                 (!G_src_planar && G.wfmt == 4) || G.wfmt == QT_GGUF);
     return G_host_on;
 }
+/* Why the host pool is off, NULL when it is on (or the tier is): the startup says it, since a
+ * prompt chunk's experts outside VRAM then take the host's step, a long prompt ten times slower. */
+const char *qt_chain_host_off(void){
+    if(!G.on || G_trunk_only || host_pool_on()) return NULL;
+    const char *e = getenv("COLI_CUDA_HOST_POOL");
+    if(e && *e == '0') return "COLI_CUDA_HOST_POOL=0";
+    if(G_stream) return "the RAM holds fewer than every expert";
+    if(G.ndev != 1) return "more than one device";
+    if(G.wfmt == 1) return "int8 experts";
+    if(G.wfmt == 8) return "fp8 experts";
+    if(G.wfmt == 4 && G_src_planar) return "planar int4 the device's GEMMs do not read at these widths";
+    return "the experts' format";
+}
+/* the host pool's int4 in expert_ffn.h's planar blocks (else in pairs, as the residents hold it) */
+int qt_chain_host_planar(void){ return G.on && G_host_on > 0 && G.wfmt == 4 && G_src_planar; }
 /* a host pool expert's bytes: its matrices (three of mb, a GGUF's gate, up and down) and scales */
 static size_t host_w_bytes(int layer){ return G.wfmt == QT_GGUF ? 2*G_gmb[layer] + G_gmbd[layer] : 3*((size_t)G.D*G.Ih/2); }
 static size_t host_s_bytes(void){ return G.wfmt == QT_GGUF ? 0 : (2*G.sc_gu + G.sc_d)*sizeof(float); }
@@ -1743,6 +1761,50 @@ int qt_chain_changes(int *idx,int max,int *overflow){
     return n;
 }
 uint64_t qt_chain_promoted(void){ return G.on ? G.promo_done : 0; }
+/* Device memory back from the tier for the chain's KV mirrors (#2734): the coldest residents (by
+ * this conversation's routes and the heat) leave the card, their buffers freed, and the budget
+ * comes down by as much, so neither the swaps nor the promotions fill it again. Under
+ * CUDA_EXPERT_GB=auto the tier fills the card, and a long prompt's mirrors then took what the
+ * chain's scratch and the driver needed: a 20.6K-token prompt on an 8 GB card ran out of memory
+ * mid-frame and every later step went to the CPU. The experts given back compute on the CPU from
+ * their RAM copy (qt_evicted_take: an int4 container's int8 again), and join the host pool before
+ * the next large prompt chunk (qt_chain_host_follow). Between the chain's forwards (no group,
+ * no forward, no upload in flight); the chain reads the moves at its next step (qt_chain_epoch).
+ * A GGUF's arena keeps its one allocation: nothing back. Returns the bytes freed. */
+size_t qt_chain_give_back(size_t bytes){
+    if(!G.on || G_trunk_only || G_arena_on || G.ndev != 1 || !bytes) return 0;
+    size_t n = (size_t)G.nl*G.ne;
+    int *cand = malloc(n*sizeof(int));
+    ColiCudaTensor **ft = malloc(3*n*sizeof *ft);
+    if(!cand || !ft){ free(cand); free(ft); return 0; }
+    pthread_mutex_lock(&G.mx);
+    while((G.issue_open || G.chain_hold || G.uploading) && !G.th_stop) wait_take_locked();
+    int nc = 0, nf = 0, out = 0;
+    size_t freed = 0;
+    if(!G.th_stop){
+        for(size_t i = 0; i < n; i++){
+            const QSlot *x = &G.slot[i];
+            if(x->resident && !x->queued && x->tg && x->tu && x->td) cand[nc++] = (int)i;
+        }
+        qsort(cand, (size_t)nc, sizeof(int), cmp_pm);   /* the hottest first: taken from the end */
+        for(int k = nc - 1; k >= 0 && freed < bytes; k--){
+            QSlot *x = &G.slot[cand[k]];
+            ft[nf++] = x->tg; ft[nf++] = x->tu; ft[nf++] = x->td; x->tg = x->tu = x->td = NULL;
+            res_set(x, 0); evict_note_locked(cand[k]);
+            size_t eb = qt_ebytes(cand[k] / G.ne);
+            G.used[0] = G.used[0] > eb ? G.used[0] - eb : 0;
+            freed += eb; out++;
+        }
+        G.budget[0] = G.budget[0] > freed ? G.budget[0] - freed : 0;
+        if(G.budget[0] < G.used[0]) G.budget[0] = G.used[0];
+    }
+    pthread_mutex_unlock(&G.mx);
+    for(int k = 0; k < nf; k++) coli_cuda_tensor_free(ft[k]);
+    free(cand); free(ft);
+    if(out) fprintf(stderr, "[qtier] dev %d: %.2f GiB back from the experts for the chain's KV mirrors (%d experts to the CPU; "
+                            "the tier's budget now %.2f GB)\n", G.dev[0], freed/1073741824.0, out, G.budget[0]/1073741824.0);
+    return freed;
+}
 /* The arena of a GGUF's experts on the tier's one device, for a chain that takes it over
  * (qt_chain_own): its base, a slot's bytes, the up and down rows' offsets in a slot (gate at
  * 0), its slots; 0 without an arena. qt_chain_slot: the slot expert eid of layer holds, -1

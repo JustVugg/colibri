@@ -6,8 +6,11 @@
  * a prompt chunk's layer holding it went to the host's step whole (q36cc_stage_table). Here a
  * warm start as the engine's, three promotions (one copy failed), then the follow: the pool is
  * the non-residents again, nothing else; a page-lock refused, whole or for the scales only,
- * leaves nothing locked; every page-lock undone at the exit. Fake CUDA backend (its page-locks
- * counted), no GPU, no toolkit. */
+ * leaves nothing locked; every page-lock undone at the exit. A per-row int4 container's slots
+ * (pairs, gate, up and down in one block, a scale a row) join the pool as they are (#2734), a slot
+ * whose matrices lie apart does not; why the pool is off is named. Fake CUDA backend (its
+ * page-locks counted), no GPU, no toolkit. The tier gives the chain's KV mirrors memory back
+ * from its coldest residents (qt_chain_give_back). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -144,11 +147,85 @@ int main(void) {
     for (int k = 0; k < np; k++) qt_chain_promote_done(pr[k].ci, pr[k].vi, 1);
     check(qt_chain_host_follow(&j, &l) == 0 && j == 0 && l == 0 && qt_chain_host_count() == 0 && fake_host_regs == regs,
           "COLI_CUDA_HOST_POOL=0: nothing page-locked, before or after");
+    check(qt_chain_host_off() && !strcmp(qt_chain_host_off(), "COLI_CUDA_HOST_POOL=0"), "COLI_CUDA_HOST_POOL=0: the startup names it");
     qt_source_planar(0);
     qt_shutdown();
     setenv("COLI_CUDA_HOST_POOL", "", 1);
 
+    /* a per-row int4 container (#2734): the slot's pairs as the residents' tensors hold them, gate, up and
+     * down in one block, a scale a row (IH, IH, D); the pool takes them as they are, not planar */
+    check(qt_init(NL, NE, D, IH, NE, TOPK, 0, 1), "tier starts (int4 per row, pairs)");
+    for (int e = 0; e < NE; e++) for (int l = 0; l < NL; l++) note(l, e, 0);
+    qt_fill_wait();
+    regs = fake_host_regs;
+    for (int l = 0; l < NL; l++) for (int e = 0; e < NE; e++)
+        if (!resident(l, e)) { const unsigned char *g = pw[l][e]; qt_note_host(l, e, g, g + MB, g + 2 * MB, sc[l][e], sc[l][e] + IH, sc[l][e] + 2 * IH); }
+    {
+        const void *w; const float *s; size_t a = 0, b = 0; int lo = -1, eo = -1;
+        for (int l = 0; l < NL && lo < 0; l++) for (int e = 0; e < NE; e++) if (!resident(l, e)) { lo = l; eo = e; break; }
+        check(qt_chain_host_count() == 8 && fake_host_regs == regs + 16 && pool_is_rest(),
+              "per row: the eight experts off the card page-locked, the pool the non-residents");
+        check(lo >= 0 && qt_chain_host(lo, eo, &w, &a, &s, &b) && w == pw[lo][eo] && a == 3 * MB && s == sc[lo][eo] &&
+              b == (2 * IH + D) * sizeof(float), "per row: an expert's block and its row scales (2 IH + D), as the slot holds them");
+        check(!qt_chain_host_planar() && !qt_chain_host_off(), "per row: the pool is on, its int4 in pairs");
+    }
+    qt_shutdown();
+    check(fake_host_unregs == fake_host_regs, "per row: the exit releases every page-lock");
+
+    /* the three matrices apart (the slot's old layout): each such expert is refused */
+    check(qt_init(NL, NE, D, IH, NE, TOPK, 0, 1), "tier starts again (per row)");
+    for (int e = 0; e < NE; e++) for (int l = 0; l < NL; l++) note(l, e, 0);
+    qt_fill_wait();
+    regs = fake_host_regs;
+    static unsigned char apart[3][MB];   /* up after down: not the block the pool copies */
+    for (int l = 0; l < NL; l++) for (int e = 0; e < NE; e++)
+        if (!resident(l, e)) qt_note_host(l, e, apart[0], apart[2], apart[1], sc[l][e], sc[l][e] + IH, sc[l][e] + 2 * IH);
+    check(qt_chain_host_count() == 0 && fake_host_regs == regs, "gate, up and down in three allocations: nothing page-locked");
+    qt_shutdown();
+
+    /* memory back for the chain's KV mirrors (qt_chain_give_back, #2734): the coldest residents
+     * leave the card, their tensors freed, the budget down by as much; the CPU's rebuild list has
+     * them, the chain sees the move, and the next follow takes them into the pool */
+    qt_source_planar(1);
+    check(qt_init(NL, NE, D, IH, NE, TOPK, 64, 1), "tier starts (planar), for the give-back");
+    warm();
+    {
+        int hot[2], nh = 0;
+        for (int e = 0; e < NE && nh < 2; e++) if (resident(0, e)) hot[nh++] = e;
+        for (int t = 0; t < 4; t++) step(0, hot[0], hot[1]);   /* this conversation's routes */
+        int frees = fake_tensor_frees, res0 = 0, res1 = 0;
+        unsigned ep = qt_chain_epoch();
+        size_t bud = G.budget[0], used = G.used[0], eb = G.exp_bytes;
+        for (int l = 0; l < NL; l++) for (int e = 0; e < NE; e++) res0 += resident(l, e);
+        size_t got = qt_chain_give_back(2 * eb - 1);
+        for (int l = 0; l < NL; l++) for (int e = 0; e < NE; e++) res1 += resident(l, e);
+        check(got == 2 * eb && res1 == res0 - 2 && fake_tensor_frees == frees + 6,
+              "give back two experts' bytes less one: two residents leave, their three tensors freed");
+        check(resident(0, hot[0]) && resident(0, hot[1]), "the conversation's experts stay on the card");
+        check(G.used[0] == used - 2 * eb && G.budget[0] == bud - 2 * eb, "used and budget down by what left");
+        check(qt_chain_epoch() != ep, "the chain sees the residents moved");
+        int el[8], ee[8];
+        check(qt_evicted_take(el, ee, 8) == 2 && !resident(el[0], ee[0]) && !resident(el[1], ee[1]),
+              "the CPU's rebuild list has the two");
+        check(!pooled(el[0], ee[0]) && qt_chain_host_follow(&j, &l) == 1 && j == 2 && pool_is_rest(),
+              "the next follow takes them into the host pool");
+        check(qt_chain_give_back(0) == 0 && fake_tensor_frees == frees + 6, "nothing asked, nothing back");
+    }
+    qt_shutdown();
+    qt_source_planar(0);
+
+    /* a planar container's pool says so; the RAM short of every expert turns it off, by name */
+    qt_source_planar(1);
+    check(qt_init(NL, NE, D, IH, NE, TOPK, 64, 1), "tier starts (planar)");
+    warm();
+    check(qt_chain_host_count() == 8 && qt_chain_host_planar() && !qt_chain_host_off(), "planar: the pool is on, its int4 planar");
+    qt_shutdown();
+    check(qt_init(NL, NE, D, IH, NE / 2, TOPK, 64, 1), "tier starts with the RAM holding half of a layer's experts");
+    check(qt_chain_host_off() && !strcmp(qt_chain_host_off(), "the RAM holds fewer than every expert"), "the RAM short: the startup names it");
+    qt_source_planar(0);
+    qt_shutdown();
+
     if (fails) { printf("test_qwen36_tier_host_pool: %d failure(s)\n", fails); return 1; }
-    printf("OK test_qwen36_tier_host_pool: after promotions the host pool is the non-residents again, every page-lock released at the exit\n");
+    printf("OK test_qwen36_tier_host_pool: after promotions the host pool is the non-residents again, every page-lock released at the exit; a per-row container's pairs join it; memory back from the coldest residents\n");
     return 0;
 }

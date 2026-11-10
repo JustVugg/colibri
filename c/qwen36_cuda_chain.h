@@ -1535,10 +1535,22 @@ static int q36cc_stage_table_gguf(Q36CChain *ch, Model *m) {
     }
     return cc_begin() && cc_write(ch->dm_tabb, 0, ch->dm_hostb, ne * sizeof(CcExpert)) && cc_submit(1);
 }
+/* An int4 expert in the host pool (fmt 4 per group, fmt 2 per row): each matrix's mb bytes, the
+ * scales of gate and of up ngu each, of down nd. */
+static void q36cc_i4_dims(const Q36CChain *ch, const Model *m, size_t *mb, size_t *ngu, size_t *nd) {
+    const int D = m->c.hidden, I = m->c.inter, gs = ch->dm_fmt == 4 ? ch->dm_gs : 0;
+    *mb = (size_t)D * I / 2;
+    *ngu = gs > 0 ? (size_t)I * ((D + gs - 1) / gs) : (size_t)I;
+    *nd = gs > 0 ? (size_t)D * ((I + gs - 1) / gs) : (size_t)D;
+}
 static int q36cc_stage_table(Q36CChain *ch, Model *m) {
     if (ch->dm_fmt >= 100) return q36cc_stage_table_gguf(ch, m);
-    Cfg *c = &m->c; int L = c->n_layers, E = c->n_experts, D = c->hidden, I = c->inter;
-    size_t ne = (size_t)L * E, mb = (size_t)D * I / 2, nsc = (size_t)I * (D / ch->dm_gs), wb = 3 * mb, sb = 3 * nsc * sizeof(float);
+    if (ch->dm_fmt != 2 && ch->dm_fmt != 4) return 0;
+    Cfg *c = &m->c; int L = c->n_layers, E = c->n_experts;
+    size_t mb, nsc, nsd;
+    q36cc_i4_dims(ch, m, &mb, &nsc, &nsd);
+    const int planar = qt_chain_host_planar();   /* planar blocks (the shared kernel's RAM), else the residents' pairs */
+    size_t ne = (size_t)L * E, wb = 3 * mb, sb = (2 * nsc + nsd) * sizeof(float);
     size_t wa = (wb + 255) / 256 * 256, stride = wa + (sb + 255) / 256 * 256;
     int hmax = 0, tot = 0;
     for (int i = 0; i < L; i++) {
@@ -1579,7 +1591,7 @@ static int q36cc_stage_table(Q36CChain *ch, Model *m) {
             const char *g = base + (size_t)h * stride;
             x->g = g; x->u = g + mb; x->d = g + 2 * mb;
             x->gs = (const float *)(g + wa); x->us = x->gs + nsc; x->ds = x->gs + 2 * nsc;
-            x->planar = 1;
+            x->planar = planar;
             fr[k++] = (CcFetch){w, (size_t)h * stride, wb};
             fr[k++] = (CcFetch){sc, (size_t)h * stride + wa, sb};
             h++;
@@ -1693,7 +1705,8 @@ static int q36cc_dm_layer(Q36CChain *ch, Model *m, Layer *l, int i, int n, unsig
     CcRoute rp = {n, E, K, c->router_sigmoid ? 1 : 0, 0, E + ch->rgf[i], 0, 0, io, K, io, K, ng, ng > 1 ? c->topk_group : 1, 1, 1.f, 1.f, 0.f};
     int part;
     CcBuf *tab = q36cc_dm_tab(ch, i, n, &part);
-    CcMoe mp = {n, K, D, I, ch->dm_fmt, ch->dm_gs, 0, 1, i * E, 0, D, io, K, io, K, 0, D, -1, E, tab == ch->dm_tabb && ch->dm_fmt < 100, 0, 0, 0};
+    CcMoe mp = {n, K, D, I, ch->dm_fmt, ch->dm_gs, 0, 1, i * E, 0, D, io, K, io, K, 0, D, -1, E,
+                tab == ch->dm_tabb && ch->dm_fmt < 100 && qt_chain_host_planar(), 0, 0, 0};
     if (ch->dm_fmt >= 100) qt_chain_layer_format(i, &mp.fmt, &mp.fmt_d);   /* a GGUF's types change from layer to layer */
     int stg = q36cc_stages(ch, tab, i);
     int ok = cc_matmul(ch->t_gate[i], ch->h2, 0, ch->lg, 0, n) && cc_route(ch->lg, NULL, ch->dm_ids, ch->dm_w, &rp);
@@ -1767,21 +1780,30 @@ static void q36cc_dm_books(Q36CChain *ch, Model *m, int n, int pb) {
  * every routed expert's weights once, the host pool's over the bus: the more rows, the fewer
  * reads (q36c on an RTX PRO 4000, 1727 tokens: 256 rows 1704 tok/s, 1024 2270; the experts
  * past 8 GB in the host pool: 215 against 1036 at 2048). */
+/* a prompt row's device bytes: q36cc_bufs' rows and the routed experts' (q36cc_dm_begin) */
+static size_t q36cc_row_bytes(const Model *m) {
+    const Cfg *c = &m->c; int D = c->hidden, I = c->inter, L = c->n_layers, K = c->topk > 0 ? c->topk : 1;
+    int E = c->n_experts > 0 ? c->n_experts : 1, SI = c->shared_inter > 0 ? c->shared_inter : 1;
+    if (c->dense_layer && c->dense_inter > SI) SI = c->dense_inter;   /* Flint's dense layers: a wider MLP */
+    int qo = c->q_heads * c->q_head_dim, kvo = c->kv_heads * c->k_head_dim, vd = c->dn_vheads * c->dn_vdim;
+    return ((size_t)6 * D + qo + 2 * kvo + (size_t)c->q_heads * c->head_dim + 2 * (size_t)c->dn_conv_dim + 2 * vd +
+            2 * c->dn_vheads + E + 3 * SI + 1 + (size_t)K * (I + D) + 2 * (size_t)L * K + 4 * K) * sizeof(float);
+}
+/* the host pool's staging at its most: a layer's every expert (0 without a pool) */
+static size_t q36cc_stage_est(Q36CChain *ch, Model *m) {
+    const Cfg *c = &m->c;
+    if (c->n_experts <= 0 || qt_chain_host_count() <= 0) return 0;
+    if (ch->dm_fmt >= 100) return q36cc_gguf_stage_bytes(m);
+    if (ch->dm_fmt != 2 && ch->dm_fmt != 4) return 0;
+    size_t mb, ngu, nd;
+    q36cc_i4_dims(ch, m, &mb, &ngu, &nd);
+    return (size_t)c->n_experts * (3 * mb + (2 * ngu + nd) * sizeof(float) + 512);
+}
 static int q36cc_rows_max(Q36CChain *ch, Model *m) {
     if (ch->rows_max) return ch->rows_max;
     int env = q36cc_rows_env();
     if (env) return ch->rows_max = env;
-    Cfg *c = &m->c; int D = c->hidden, I = c->inter, L = c->n_layers, K = c->topk > 0 ? c->topk : 1;
-    int E = c->n_experts > 0 ? c->n_experts : 1, SI = c->shared_inter > 0 ? c->shared_inter : 1;
-    if (c->dense_layer && c->dense_inter > SI) SI = c->dense_inter;   /* Flint's dense layers: a wider MLP */
-    int qo = c->q_heads * c->q_head_dim, kvo = c->kv_heads * c->k_head_dim, vd = c->dn_vheads * c->dn_vdim;
-    /* q36cc_bufs' device rows and the routed experts' (q36cc_dm_begin), per row */
-    size_t row = ((size_t)6 * D + qo + 2 * kvo + (size_t)c->q_heads * c->head_dim + 2 * (size_t)c->dn_conv_dim + 2 * vd +
-                  2 * c->dn_vheads + E + 3 * SI + 1 + (size_t)K * (I + D) + 2 * (size_t)L * K + 4 * K) * sizeof(float);
-    size_t fr = 0, tot = 0, stage = 0;
-    if (c->n_experts > 0 && qt_chain_host_count() > 0 && ch->dm_fmt >= 100) stage = q36cc_gguf_stage_bytes(m);
-    else if (c->n_experts > 0 && qt_chain_host_count() > 0 && ch->dm_gs > 0)
-        stage = (size_t)c->n_experts * (3 * ((size_t)D * I / 2) + 3 * ((size_t)D * I / ch->dm_gs) * sizeof(float) + 512);
+    size_t row = q36cc_row_bytes(m), fr = 0, tot = 0, stage = q36cc_stage_est(ch, m);
     coli_cuda_mem_info(ch->dev, &fr, &tot);
     size_t room = fr > stage ? (fr - stage) / 2 : 0;
     int r = 4096;
@@ -1789,6 +1811,24 @@ static int q36cc_rows_max(Q36CChain *ch, Model *m) {
     fprintf(stderr, "[chain] qwen36: %d rows per prompt chunk (%.0f KiB a row, %.1f GB free on the device; COLI_CUDA_CHAIN_ROWS sets it)\n",
             r, row / 1024.0, fr / 1073741824.0);
     return ch->rows_max = r;
+}
+
+/* Room for the KV mirrors at cap positions, and beside them for a prompt chunk: its scratch where
+ * not yet allocated, the host pool's staging where not yet allocated, and Q36CC_KV_MARGIN for the
+ * driver (a kernel's first launch loads its code into device memory). Where the device lacks it,
+ * the expert tier gives memory back (qt_chain_give_back). Under CUDA_EXPERT_GB=auto the tier filled
+ * an 8 GB card and left the mirrors the half of the free memory a chunk's scratch did not take: a
+ * 20.6K-token prompt's ran a frame out of memory and every later step went to the CPU (#2734). */
+#define Q36CC_KV_MARGIN ((size_t)256 << 20)
+static void q36cc_mirror_room(Q36CChain *ch, Model *m, int cap, size_t held) {
+    const size_t want = q36cc_conv_kv_bytes(m, cap);
+    if (want <= held) return;
+    const int CH = q36cc_rows_max(ch, m);
+    size_t need = want - held + Q36CC_KV_MARGIN;
+    if (CH > ch->rows) need += (size_t)(CH - ch->rows) * q36cc_row_bytes(m);
+    if (!ch->dm_stage && !ch->dm_stage_off) need += q36cc_stage_est(ch, m);
+    const size_t fr = q36cc_free_bytes(ch);
+    if (fr < need) qt_chain_give_back(need - fr);
 }
 
 /* Every layer for S rows from host rows xh, the last nlogits rows' logits into `logit`;
@@ -1820,6 +1860,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
         }
         if (!mirror_ok) { q36cc_pool_off(ch, m); mirror_ok = q36cc_mirror(ch, m); }
     } else if (!ch->mx_rows) {
+        if (ch->cap != m->kv_cap) q36cc_mirror_room(ch, m, m->kv_cap, q36cc_mirror_held(ch, m));
         mirror_ok = q36cc_mirror(ch, m);
         if (!mirror_ok && q36cc_stage_drop(ch)) mirror_ok = q36cc_mirror(ch, m);   /* the staging's memory to the mirrors */
     }
