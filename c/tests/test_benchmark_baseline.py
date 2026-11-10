@@ -44,7 +44,13 @@ class BaselineTest(unittest.TestCase):
     def fake_run(**kwargs):
         rows = [dict(index=i, success=True, start_seconds=0, duration_seconds=2,
                      first_output_seconds=.5, completion_tokens=4, finish_reason='stop',
-                     error=None, http_status=200)
+                     error=None, http_status=200,
+                     server_timings={"engine_ttft_s": .4, "prefill_s": 1.0,
+                                     "decode_tokens_per_sec": 8.0, "prompt_tokens": 12,
+                                     "reused_prompt_tokens": 8, "tokenize_s": .02,
+                                     "prefill_attention_s": .25, "prefill_moe_s": .5,
+                                     "first_sample_s": .003,
+                                     "first_emit_after_prefill_s": .01})
                 for i in range(len(kwargs['workload']) * kwargs['repeats'])]
         return rows, http.summarize(rows, 3, kwargs.get('slo_first_output'), kwargs.get('slo_duration'))
 
@@ -101,6 +107,15 @@ class BaselineTest(unittest.TestCase):
         self.assertEqual(cell['aggregate_completion_tokens_per_second']['median'], 8 / 3)
         self.assertEqual(cell['reported_output_tokens']['count'], 4)
         self.assertEqual(cell['slo_goodput_requests_per_second']['median'], 2 / 3)
+        self.assertEqual(cell['server_ttft_p50_seconds']['median'], .4)
+        self.assertEqual(cell['server_prefill_p50_seconds']['median'], 1.0)
+        self.assertEqual(cell['server_tokenize_p50_seconds']['median'], .02)
+        self.assertEqual(cell['server_prefill_attention_p50_seconds']['median'], .25)
+        self.assertEqual(cell['server_prefill_moe_p50_seconds']['median'], .5)
+        self.assertEqual(cell['server_first_sample_p50_seconds']['median'], .003)
+        self.assertEqual(cell['server_first_emit_after_prefill_p50_seconds']['median'], .01)
+        self.assertEqual(cell['server_decode_tokens_per_second_p50']['median'], 8.0)
+        self.assertEqual(cell['server_prefix_reuse_fraction_p50']['median'], 2 / 3)
 
     def test_missing_cell_is_not_dropped(self):
         self.collect_all()

@@ -103,12 +103,61 @@ def has_output(delta):
     return output
 
 
+def parse_server_timings(chunk):
+    """Return server-side timings from the final OpenAI chunk when present.
+
+    Colibri emits a `timings` object in the terminal SSE event, which contains
+    engine-side TTFT/throughput measurements distinct from the client-observed
+    latency recorded here. We keep those values alongside the request result so
+    a benchmark can compare server timing to client timing without logging the
+    prompt contents or other sensitive payload data.
+    """
+    if not isinstance(chunk, dict):
+        return None
+    choices = chunk.get("choices")
+    candidates = [chunk]
+    if isinstance(choices, list):
+        candidates.extend(choices)
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        timings = candidate.get("timings")
+        if not isinstance(timings, dict):
+            continue
+        cleaned = {}
+        for name, value in timings.items():
+            if name in ("prefix_reuse_source", "prefix_reuse_miss"):
+                allowed = {
+                    "prefix_reuse_source": ("live_state", "pin_snapshot", "disk_snapshot", "none"),
+                    "prefix_reuse_miss": (
+                        "disabled", "tainted_state", "no_live_state", "prompt_not_longer",
+                        "divergent_prefix", "state_not_reusable", "ring_window_unavailable",
+                        "logprobs_requires_full_prompt", "no_matching_disk_snapshot",
+                    ),
+                }
+                if value in allowed[name]:
+                    cleaned[name] = value
+                continue
+            if isinstance(value, bool):
+                continue
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(numeric):
+                continue
+            cleaned[name] = numeric
+        if cleaned:
+            return cleaned
+    return None
+
+
 def request_one(url, payload, key, timeout, index, origin):
     start = time.perf_counter()
     result = {"index": index, "start_seconds": start - origin,
               "success": False, "http_status": None, "error": None,
               "first_output_seconds": None, "completion_tokens": None,
-              "finish_reason": None}
+              "finish_reason": None, "server_timings": None}
     headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
     if key:
         headers["Authorization"] = "Bearer " + key
@@ -129,6 +178,9 @@ def request_one(url, payload, key, timeout, index, origin):
                     raise StreamError("invalid_chunk")
                 if "error" in chunk:
                     raise StreamError("stream_error")
+                timings = parse_server_timings(chunk)
+                if timings:
+                    result["server_timings"] = timings
                 choices = chunk.get("choices", [])
                 if not isinstance(choices, list) or len(choices) > 1:
                     raise StreamError("invalid_choices")
@@ -197,6 +249,60 @@ def summarize(results, elapsed, slo_first_output=None, slo_duration=None):
             "successful_duration_seconds": distribution([r["duration_seconds"] for r in successful]),
             "successful_first_output_seconds": distribution([
                 r["first_output_seconds"] for r in successful if r["first_output_seconds"] is not None])}
+    timing_fields = (
+        ("successful_server_ttft_seconds", ("ttft_s", "engine_ttft_s")),
+        ("successful_server_total_seconds", ("total_s", "request_to_engine_done_s")),
+        ("successful_server_tokens_per_second", ("tokens_per_sec", "decode_tokens_per_sec")),
+        ("successful_server_prepare_seconds", ("request_prepare_s",)),
+        ("successful_server_queue_wait_seconds", ("queue_wait_s",)),
+        ("successful_server_submit_to_accept_seconds", ("engine_submit_to_accept_s",)),
+        ("successful_server_accept_to_first_output_seconds", ("accept_to_first_output_s",)),
+        ("successful_server_engine_call_seconds", ("engine_call_s",)),
+        ("successful_server_prefill_seconds", ("prefill_s",)),
+        ("successful_server_tokenize_seconds", ("tokenize_s",)),
+        ("successful_server_prefix_match_seconds", ("prefix_match_s",)),
+        ("successful_server_snapshot_restore_seconds", ("snapshot_restore_s",)),
+        ("successful_server_prefill_deltanet_seconds", ("prefill_deltanet_s",)),
+        ("successful_server_prefill_attention_seconds", ("prefill_attention_s",)),
+        ("successful_server_prefill_moe_seconds", ("prefill_moe_s",)),
+        ("successful_server_prefill_shared_seconds", ("prefill_shared_s",)),
+        ("successful_server_prefill_router_seconds", ("prefill_router_s",)),
+        ("successful_server_prefill_lm_head_seconds", ("prefill_lm_head_s",)),
+        ("successful_server_first_sample_seconds", ("first_sample_s",)),
+        ("successful_server_first_emit_after_prefill_seconds", ("first_emit_after_prefill_s",)),
+        ("successful_server_prompt_tokens", ("prompt_tokens",)),
+        ("successful_server_reused_prompt_tokens", ("reused_prompt_tokens",)),
+    )
+    prefix_reuse_fractions = []
+    for field, keys in timing_fields:
+        values = []
+        for row in successful:
+            timings = row.get("server_timings") or {}
+            value = next((timings[key] for key in keys if timings.get(key) is not None), None)
+            if value is not None:
+                values.append(value)
+        if values:
+            summary[field] = distribution(values)
+    for row in successful:
+        timings = row.get("server_timings") or {}
+        prompt_tokens = timings.get("prompt_tokens")
+        reused_tokens = timings.get("reused_prompt_tokens")
+        if (isinstance(prompt_tokens, (int, float)) and not isinstance(prompt_tokens, bool)
+                and isinstance(reused_tokens, (int, float)) and not isinstance(reused_tokens, bool)
+                and prompt_tokens > 0 and 0 <= reused_tokens <= prompt_tokens):
+            prefix_reuse_fractions.append(reused_tokens / prompt_tokens)
+    if prefix_reuse_fractions:
+        summary["successful_server_prefix_reuse_fraction"] = distribution(prefix_reuse_fractions)
+    for timing_key, summary_key in (
+            ("prefix_reuse_source", "successful_server_prefix_reuse_sources"),
+            ("prefix_reuse_miss", "successful_server_prefix_reuse_misses")):
+        counts = {}
+        for row in successful:
+            value = (row.get("server_timings") or {}).get(timing_key)
+            if value is not None:
+                counts[value] = counts.get(value, 0) + 1
+        if counts:
+            summary[summary_key] = counts
 
     paced = all(row.get("scheduled_seconds") is not None for row in results)
     summary["arrival_timing"] = None

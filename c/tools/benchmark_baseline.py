@@ -190,9 +190,9 @@ def compare(spec, workload, workload_hash, directory):
                      for r in range(1, spec["matrix"]["rounds"] + 1)]
             summaries = [cell["summary"] if cell else None for cell in cells]
             def metric(field, percentile=None):
-                values = [s[field] if s else None for s in summaries]
+                values = [s.get(field) if s else None for s in summaries]
                 if percentile:
-                    values = [v[percentile] if v else None for v in values]
+                    values = [v.get(percentile) if v else None for v in values]
                 return spread(values)
             measured = [cell for cell in cells if cell and cell["summary"]]
             lengths = [row["completion_tokens"] for cell in measured for row in cell["requests"]
@@ -203,6 +203,34 @@ def compare(spec, workload, workload_hash, directory):
                           "first_output_p50_seconds": metric("successful_first_output_seconds", "p50"),
                           "first_output_p95_seconds": metric("successful_first_output_seconds", "p95"),
                           "first_output_p99_seconds": metric("successful_first_output_seconds", "p99"),
+                          "server_ttft_p50_seconds": metric("successful_server_ttft_seconds", "p50"),
+                          "server_prefill_p50_seconds": metric("successful_server_prefill_seconds", "p50"),
+                          "server_tokenize_p50_seconds": metric(
+                              "successful_server_tokenize_seconds", "p50"),
+                          "server_prefix_match_p50_seconds": metric(
+                              "successful_server_prefix_match_seconds", "p50"),
+                          "server_snapshot_restore_p50_seconds": metric(
+                              "successful_server_snapshot_restore_seconds", "p50"),
+                          "server_prefill_deltanet_p50_seconds": metric(
+                              "successful_server_prefill_deltanet_seconds", "p50"),
+                          "server_prefill_attention_p50_seconds": metric(
+                              "successful_server_prefill_attention_seconds", "p50"),
+                          "server_prefill_moe_p50_seconds": metric(
+                              "successful_server_prefill_moe_seconds", "p50"),
+                          "server_prefill_shared_p50_seconds": metric(
+                              "successful_server_prefill_shared_seconds", "p50"),
+                          "server_prefill_router_p50_seconds": metric(
+                              "successful_server_prefill_router_seconds", "p50"),
+                          "server_prefill_lm_head_p50_seconds": metric(
+                              "successful_server_prefill_lm_head_seconds", "p50"),
+                          "server_first_sample_p50_seconds": metric(
+                              "successful_server_first_sample_seconds", "p50"),
+                          "server_first_emit_after_prefill_p50_seconds": metric(
+                              "successful_server_first_emit_after_prefill_seconds", "p50"),
+                          "server_decode_tokens_per_second_p50": metric(
+                              "successful_server_tokens_per_second", "p50"),
+                          "server_prefix_reuse_fraction_p50": metric(
+                              "successful_server_prefix_reuse_fraction", "p50"),
                           "duration_p95_seconds": metric("successful_duration_seconds", "p95"),
                           "failure_rate": metric("failure_rate"),
                           "slo_goodput_requests_per_second": metric("latency_slo", "goodput_requests_per_second"),

@@ -116,6 +116,39 @@ Request bodies must fit within 4 MiB and the running Python JSON parser's
 limits. An integer or nesting depth the runtime cannot parse receives HTTP
 400 before engine work; the gateway preserves the runtime's limits.
 
+### Response timing metadata
+
+Chat and completion responses include a `timings` object for separating request
+preparation, queueing, prompt processing and generation. Non-streaming responses
+place it at the top level; streaming responses put it on the final choice in the
+last completion chunk. The standard `usage` object is unchanged.
+
+| Field | Meaning |
+|---|---|
+| `request_prepare_s` | HTTP request receipt through gateway preparation and admission, excluding queue wait. Includes body intake, validation and prompt rendering. |
+| `queue_wait_s` | Time waiting for an inference slot. |
+| `engine_submit_to_accept_s` | Engine submission through its `ACCEPT` event. Includes engine-side tokenization and validation when the engine emits `ACCEPT` after those stages. |
+| `accept_to_first_output_s` | `ACCEPT` through the first nonempty generated text or tool callback. Includes prompt prefill and first-token generation; it is not a prefill-only measurement. |
+| `engine_ttft_s` | Engine-call start through the first nonempty generated text or tool callback. |
+| `engine_call_s` | Engine-call duration, including callback processing. |
+| `request_to_engine_done_s` | HTTP request receipt through completion of the engine call. |
+| `decode_tokens_per_sec` | Completion tokens divided by the time from first output to engine-call completion. |
+| `prefill_s` | Engine-reported prompt-forward time, excluding reused prefix positions. Currently reported by Qwen3.6. |
+| `prompt_tokens`, `reused_prompt_tokens` | Prompt length and, when supported, the exact number of prompt positions reused from existing model state. |
+| `tokenize_s`, `prefix_match_s`, `snapshot_restore_s` | Qwen3.6 tokenization, live-prefix validation, and pin/disk snapshot lookup or restore durations. |
+| `prefill_deltanet_s`, `prefill_attention_s`, `prefill_moe_s`, `prefill_lm_head_s` | Qwen3.6 accumulated operation timers during the fresh prompt forward. These operation timers can overlap or omit scheduling/transfer overhead and should not be summed as wall time. |
+| `prefill_shared_s`, `prefill_router_s` | Qwen3.6 shared-expert and router portions, included within `prefill_moe_s` (subsets, not additive categories). |
+| `first_sample_s` | Qwen3.6 time spent sampling the first generated token. |
+| `first_emit_after_prefill_s` | Qwen3.6 elapsed time from completion of fresh prefill and cache handling to the first non-empty text frame; may include sampling, decoding and UTF-8 buffering. |
+
+These are gateway wall-clock measurements, not kernel timings; callback output
+does not necessarily correspond one-to-one with tokens. Fields that cannot be
+measured for an engine or request are `null` or absent. `prefill_s` is a
+model-engine measurement, not a gateway estimate. The streaming benchmark
+records these separately from client-observed first-output latency and
+load-level completion-token throughput, and reports prefix reuse fraction when
+both prompt and reused-token counts are available.
+
 The hosted-platform bookkeeping fields `store`, `metadata`, `service_tier`,
 `user`, `safety_identifier`, `parallel_tool_calls`, `prompt_cache_key`,
 `verbosity`, `web_search_options`, `moderation`, and

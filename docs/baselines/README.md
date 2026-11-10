@@ -106,16 +106,24 @@ For each engine/concurrency it reports min/median/max **across rounds** for:
 
 - Aggregate successful completion tokens per full batch wall second.
 - Client first-output P50/P95/P99 and completion-duration P95.
+- Server TTFT P50, Qwen3.6 tokenization/prefix/snapshot timings, aggregate and operation-level prefill P50, first-sample and post-prefill first-emission P50, decode tokens/second P50, and prefix-reuse fraction P50 when the engine reports those timings.
 - Failure rate and latency-SLO request goodput.
 - It also reports actual server-reported output-length distribution across rounds.
 
 Round percentiles are not pooled percentiles. Throughput is aggregate, never
 per-user decode speed, and includes HTTP, queueing and prefill. First output is
-the first nonempty content/reasoning/tool delta, not an instrumented first token.
-SSE chunk gaps are **not ITL**, and no token-latency/TPOT estimate is manufactured.
-Instrument the engines or use their native benchmarks for token timestamps;
-report those separately with their definitions. The underlying HTTP timing,
-usage and socket-timeout boundaries are documented in [benchmarking.md](../benchmarking.md).
+the first nonempty content/reasoning/tool delta, not a hardware token timestamp.
+Colibri's response timing metadata separates gateway request preparation, queue
+wait, engine acceptance, first output, Qwen3.6 tokenization and prefix/snapshot
+handling, aggregate prefill wall time, operation-level prefill timers,
+first-token sampling, first text emission after prefill, decode rate, and prefix
+reuse when available; other engines may leave server metrics absent. The
+post-prefill emission interval can include sampling, decoding and UTF-8 buffering.
+Operation timers are diagnostic accumulators, not disjoint wall-time
+shares: shared-expert/router are subsets of MoE, and accelerator work may overlap
+or omit scheduling/transfer overhead. SSE chunk gaps are **not ITL**, and no
+token-latency/TPOT estimate is manufactured. The underlying HTTP timing, usage
+and socket-timeout boundaries are documented in [benchmarking.md](../benchmarking.md).
 
 `protocol_complete` means the matrix completed without those protocol/data gaps.
 It does **not** mean quality passed, outputs have equivalent lengths, SLOs were

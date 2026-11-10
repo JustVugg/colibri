@@ -6331,6 +6331,44 @@ def _cluster_stats(fields):
     return out
 
 
+def _engine_timing_stats(fields):
+    """Optional request-level timing fields appended to a generation STAT line."""
+    out = {}
+    seconds_fields = {
+        "prefill_s", "tokenize_s", "prefix_match_s", "snapshot_restore_s",
+        "prefill_deltanet_s", "prefill_attention_s", "prefill_moe_s",
+        "prefill_shared_s", "prefill_router_s", "prefill_lm_head_s",
+        "first_sample_s", "first_emit_after_prefill_s",
+    }
+    for entry in fields[7:]:
+        key, sep, value = entry.partition("=")
+        if not sep:
+            continue
+        if key in seconds_fields:
+            seconds = float(value)
+            if not math.isfinite(seconds) or seconds < 0:
+                raise ValueError(f"invalid engine timing: {key}")
+            out[key] = seconds
+        elif key == "reused_prompt_tokens":
+            tokens = int(value)
+            if tokens < 0:
+                raise ValueError("invalid reused prompt token count")
+            out[key] = tokens
+        elif key == "prefix_reuse_source":
+            if value not in ("live_state", "pin_snapshot", "disk_snapshot", "none"):
+                raise ValueError("invalid prefix reuse source")
+            out[key] = value
+        elif key == "prefix_reuse_miss":
+            if value not in ("disabled", "tainted_state", "no_live_state",
+                             "prompt_not_longer", "divergent_prefix",
+                             "state_not_reusable", "ring_window_unavailable",
+                             "logprobs_requires_full_prompt",
+                             "no_matching_disk_snapshot"):
+                raise ValueError("invalid prefix reuse miss reason")
+            out[key] = value
+    return out
+
+
 def read_engine_turn(stream, sentinel, on_bytes, caps=None):
     pending = b""
     while True:
@@ -6372,6 +6410,7 @@ def read_engine_turn(stream, sentinel, on_bytes, caps=None):
         "prompt_tokens": int(fields[5]) if len(fields) > 5 else 0,
         "length_limited": bool(int(fields[6])) if len(fields) > 6 else False,
         **_cluster_stats(fields),
+        **_engine_timing_stats(fields),
     }
 
 
@@ -7026,6 +7065,7 @@ class Engine:
             "prompt_tokens": int(fields[5]) if len(fields) > 5 else 0,
             "length_limited": bool(int(fields[6])) if len(fields) > 6 else False,
             **_cluster_stats(fields),
+            **_engine_timing_stats(fields),
         }
 
     def _fail_pending(self, error):
@@ -8522,6 +8562,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         request_id = "req_" + uuid.uuid4().hex
+        self._request_started = time.monotonic()
         try:
             self._check_host()
             self.require_auth()
@@ -9297,6 +9338,69 @@ class APIHandler(BaseHTTPRequestHandler):
         with self.server.scheduler.admit(self.client_disconnected, cache_slot) as admission, \
                 contextlib.ExitStack() as stream_cleanup:
             queue_wait, cache_slot = admission
+            request_started = getattr(self, "_request_started", time.monotonic())
+            generation_started = time.monotonic()
+            engine_accepted_at = [None]
+            first_output_at = [None]
+            stream_accept = None
+
+            def measure_accept(info):
+                if engine_accepted_at[0] is None:
+                    engine_accepted_at[0] = time.monotonic()
+                if stream_accept is not None:
+                    stream_accept(info)
+
+            def measure_output(callback):
+                def feed(text):
+                    if text and first_output_at[0] is None:
+                        first_output_at[0] = time.monotonic()
+                    return callback(text)
+                return feed
+
+            def with_timings(stats):
+                finished = time.monotonic()
+                accepted = engine_accepted_at[0]
+                first_output = first_output_at[0]
+                engine_ttft = (first_output - generation_started
+                               if first_output is not None else None)
+                accepted_to_output = (first_output - accepted
+                                      if accepted is not None and first_output is not None else None)
+                decode_seconds = (finished - first_output
+                                  if first_output is not None else None)
+                completion_tokens = stats.get("completion_tokens", 0)
+                timings = {
+                    "request_prepare_s": max(0.0, generation_started - request_started - queue_wait),
+                    "queue_wait_s": queue_wait,
+                    "engine_submit_to_accept_s": (
+                        accepted - generation_started if accepted is not None else None),
+                    "accept_to_first_output_s": accepted_to_output,
+                    "engine_ttft_s": engine_ttft,
+                    "engine_call_s": finished - generation_started,
+                    "request_to_engine_done_s": finished - request_started,
+                    "decode_tokens_per_sec": (
+                        completion_tokens / decode_seconds
+                        if decode_seconds is not None and decode_seconds > 1e-6
+                        and isinstance(completion_tokens, int) and not isinstance(completion_tokens, bool)
+                        else None),
+                }
+                for name in (
+                    "prefill_s", "prompt_tokens", "reused_prompt_tokens",
+                    "tokenize_s", "prefix_match_s", "snapshot_restore_s",
+                    "prefill_deltanet_s", "prefill_attention_s", "prefill_moe_s",
+                    "prefill_shared_s", "prefill_router_s", "prefill_lm_head_s",
+                    "first_sample_s", "first_emit_after_prefill_s",
+                ):
+                    value = stats.get(name)
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        timings[name] = value
+                for name in ("prefix_reuse_source", "prefix_reuse_miss"):
+                    value = stats.get(name)
+                    if isinstance(value, str):
+                        timings[name] = value
+                result = dict(stats)
+                result["timings"] = timings
+                return result
+
             queue_headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000))}
             if compaction:
                 # the conversation ran on a summary of its first messages (context_compaction)
@@ -9316,13 +9420,16 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 channels = chat_channels(stop_filter.feed) if chat else None   # Muse Spark's messages first
                 stats = self.server.generate(
-                    prompt, maximum, temperature, top_p, (channels.feed if channels else stop_filter.feed), cache_slot,
+                    prompt, maximum, temperature, top_p,
+                    measure_output(channels.feed if channels else stop_filter.feed), cache_slot,
                     self.client_disconnected, grammar=grammar, stopped=generation_stopped,
-                    **({"on_tool": sideband.feed} if sideband.enabled else {}),
+                    on_accept=measure_accept,
+                    **({"on_tool": measure_output(sideband.feed)} if sideband.enabled else {}),
                     **({"audio": audio} if audio else {}),
                     **({"image": image} if image is not None else {}),
                     **({"on_echo": prompt_echoes.append} if engine_k and echo else {}),
                     **_engine_extension_args(engine_k))
+                stats = with_timings(stats)
                 if channels:
                     channels.finish()
                 stop_filter.finish()
@@ -9395,7 +9502,8 @@ class APIHandler(BaseHTTPRequestHandler):
                               {"index": 0, "text": text, "logprobs": logprobs_obj,
                                "finish_reason": length_finish})
                 reply = {"id": completion_id, "object": object_name, "created": created,
-                         "model": self.server.model_id, "choices": [choice], "usage": self.usage(stats)}
+                         "model": self.server.model_id, "choices": [choice], "usage": self.usage(stats),
+                         "timings": stats["timings"]}
                 if compaction:
                     reply["compaction"] = compaction
                 self.send_json(200, reply, request_id, queue_headers)
@@ -9512,6 +9620,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 ka_thread[0].start()
                 stream_cleanup.callback(ka_thread[0].join, timeout=2)
                 stream_cleanup.callback(ka_stop.set)
+            stream_accept = start_stream
             if chat and tools:
                 # Suppress tool-call markers from the streamed content and parse the authoritative
                 # calls from the FULL reply after generation. Hold back a marker-length tail so a
@@ -9563,12 +9672,14 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 channels = chat_channels(stop_filter.feed) if chat else None   # Muse Spark's messages first
                 stats = self.server.generate(
-                    prompt, maximum, temperature, top_p, (channels.feed if channels else stop_filter.feed), cache_slot,
+                    prompt, maximum, temperature, top_p,
+                    measure_output(channels.feed if channels else stop_filter.feed), cache_slot,
                     self.client_disconnected, grammar=grammar, stopped=generation_stopped,
-                    **({"on_tool": sideband.feed} if sideband.enabled else {}),
-                    on_accept=start_stream, **({"audio": audio} if audio else {}),
+                    **({"on_tool": measure_output(sideband.feed)} if sideband.enabled else {}),
+                    on_accept=measure_accept, **({"audio": audio} if audio else {}),
                     **({"image": image} if image is not None else {}),
                     **_engine_extension_args(engine_k))
+                stats = with_timings(stats)
                 if channels:
                     channels.finish()
                 stop_filter.finish()
@@ -9605,11 +9716,13 @@ class APIHandler(BaseHTTPRequestHandler):
                 stop_filter = StopFilter(stop_sequences, emit_plain, ignore_leading_stop)
                 channels = chat_channels(stop_filter.feed) if chat else None   # Muse Spark's messages first
                 stats = self.server.generate(
-                    prompt, maximum, temperature, top_p, (channels.feed if channels else stop_filter.feed), cache_slot,
+                    prompt, maximum, temperature, top_p,
+                    measure_output(channels.feed if channels else stop_filter.feed), cache_slot,
                     self.client_disconnected, grammar=grammar, stopped=stop_filter.stopped,
-                    on_accept=start_stream, **({"audio": audio} if audio else {}),
+                    on_accept=measure_accept, **({"audio": audio} if audio else {}),
                     **({"image": image} if image is not None else {}),
                     **_engine_extension_args(engine_k))
+                stats = with_timings(stats)
                 if channels:
                     channels.finish()
                 stop_filter.finish()
@@ -9624,6 +9737,7 @@ class APIHandler(BaseHTTPRequestHandler):
             final_choice = ({"index": 0, "delta": {}, "logprobs": None, "finish_reason": finish}
                             if chat else {"index": 0, "text": "", "logprobs": None,
                                           "finish_reason": finish})
+            final_choice["timings"] = stats["timings"]
             event([final_choice])
             if include_usage:
                 event([], self.usage(stats))

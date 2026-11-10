@@ -9281,7 +9281,16 @@ static int qwen36_serve_budget(int np, int max_tok, int max_ctx, int read_only){
 }
 
 /* The counters when a request's decoding began: PROF and DONE report its share. */
-typedef struct { double s_disk, s_attn, s_moe, s_head, t0; uint64_t hits, miss; } Q36ReqClock;
+typedef struct {
+    double s_disk, s_attn, s_moe, s_head, t0, prefill_s;
+    double tokenize_s, prefix_match_s, snapshot_restore_s;
+    double prefill_deltanet_s, prefill_attention_s, prefill_moe_s;
+    double prefill_shared_s, prefill_router_s, prefill_lm_head_s;
+    double first_sample_s, first_emit_after_prefill_s;
+    int reused_prompt_tokens;
+    const char *prefix_reuse_source, *prefix_reuse_miss;
+    uint64_t hits, miss;
+} Q36ReqClock;
 /* the expert cache's hit rate over a request's decoding, for DONE (it said 0.0, and
  * tools/datapoint.py read a 0% hit rate for every qwen36 run, #2081) */
 static double q36_turn_hit(const Model *m, const Q36ReqClock *c) {
@@ -9296,7 +9305,9 @@ static double q36_turn_hit(const Model *m, const Q36ReqClock *c) {
 static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, float **lo_out,
                            Q36ReqClock *clk){
     int *ids=NULL, np=0;
+    double tokenize_started = now_s();
     encode_text(q->payload, &ids, &np);          /* payload is raw prompt text; qwen36 adds no BOS */
+    clk->tokenize_s = now_s() - tokenize_started;
     if(g_pending_image.present){
         Cfg *vc = &m->c;
         if(!m->vis_ready){
@@ -9340,9 +9351,26 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
      * off for an A/B; COLI_PREFIX_LOG=1 reports the decision and its reason,
      * because "it did not get faster" is otherwise indistinguishable from
      * "reuse is not wired up". */
+    double prefix_match_started = now_s();
     int reuse = kv_prefix_off() ? 0 : kv_prefix_reuse(&m->kvp, ids, np);
+    const char *reuse_source = reuse ? "live_state" : "none";
+    const char *reuse_miss = NULL;
+    if (!reuse) {
+        if (kv_prefix_off()) reuse_miss = "disabled";
+        else if (m->kvp.tainted) reuse_miss = "tainted_state";
+        else if (m->kvp.len <= 0 || !m->kvp.fed) reuse_miss = "no_live_state";
+        else if (m->kvp.len >= np) reuse_miss = "prompt_not_longer";
+        else if (memcmp(m->kvp.fed, ids, (size_t)m->kvp.len * sizeof(int)) != 0)
+            reuse_miss = "divergent_prefix";
+        else reuse_miss = "state_not_reusable";
+    }
     /* the sliding layers' rings must still hold the window before the first fresh token */
-    if (reuse && !q36_ring_holds(m->ring_pos, m->kv_ring, reuse - m->c.window + 1, reuse)) reuse = 0;
+    if (reuse && !q36_ring_holds(m->ring_pos, m->kv_ring, reuse - m->c.window + 1, reuse)) {
+        reuse = 0;
+        reuse_source = "none";
+        reuse_miss = "ring_window_unavailable";
+    }
+    clk->prefix_match_s = now_s() - prefix_match_started;
     if (getenv("COLI_PREFIX_LOG")) {
         if (reuse)
             fprintf(stderr, "[PREFIX] reusing %d of %d prompt tokens (%.0f%%)\n",
@@ -9364,9 +9392,15 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
      * suo primo token senza logprob: proprio il token che serve. Rimetterla
      * quando lo stato e gia quello costa una memcpy, non un prefill. */
     g_pin_use_logit = 0;
+    double snapshot_restore_started = now_s();
     {
         int pinned = pin_restore(m, ids, np);
-        if (pinned) { reuse = pinned; g_pin_use_logit = 1; }
+        if (pinned) {
+            reuse = pinned;
+            reuse_source = "pin_snapshot";
+            reuse_miss = NULL;
+            g_pin_use_logit = 1;
+        }
     }
     g_echo_k = q->logprobs; g_echo_id = q->id;
     /* The read-out promises a frame for EVERY prompt position, starting at 0. A live
@@ -9376,7 +9410,11 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
      * resumes one: it is a scoring request, not a chat turn, and it pays a full prefill.
      * The pin path above is untouched -- a photograph carries the logits for the position
      * that follows it, so it still resumes. */
-    if (g_echo_k > 0 && !g_pin_use_logit) reuse = 0;
+    if (g_echo_k > 0 && !g_pin_use_logit) {
+        reuse = 0;
+        reuse_source = "none";
+        reuse_miss = "logprobs_requires_full_prompt";
+    }
     /* The disk prompt cache, deepest stored prefix first: no live record and
      * no pin took this request, so check whether one of the saved snapshots
      * holds the state of a strict prefix of these ids. An v1 optimisation
@@ -9385,8 +9423,15 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     if (!reuse && g_pc_dir[0] && g_echo_k == 0 && !q->pin && !m->kvp.tainted &&
         g_q36_mux_slots == 1 && q36_pcache_on()) {
         int pr = q36_pcache_restore(m, ids, np);
-        if (pr > 0) reuse = pr;   /* the state is the ids[0..pr)'s: the reset below is skipped */
+        if (pr > 0) {
+            reuse = pr;   /* the state is the ids[0..pr)'s: the reset below is skipped */
+            reuse_source = "disk_snapshot";
+            reuse_miss = NULL;
+        } else {
+            reuse_miss = "no_matching_disk_snapshot";
+        }
     }
+    clk->snapshot_restore_s = now_s() - snapshot_restore_started;
     if (!reuse) {
         q36_park(m, np, q->max_tok);   /* a short request keeps the conversation (q36_unpark) */
         reset_recurrent(m); m->kv_len = 0;
@@ -9415,11 +9460,21 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     Q36StepControl control = {serve_prefill_poll, q->id, Q36_CONTROL_NONE};
     int prefill_control = g_q36_mux_slots == 1 ? serve_control_pending(q->id) : Q36_CONTROL_NONE;
     float *lo = NULL;
+    double prefill_started = now_s();
+    double prefill_tm_start[6];
+    memcpy(prefill_tm_start, g_tm_pre, sizeof prefill_tm_start);
     if (!prefill_control) {
         lo = step_ex_control(m, ids + reuse, np - reuse, reuse, 1,
                              interruptible ? &control : NULL);
         prefill_control = control.result;
     }
+    double prefill_s = now_s() - prefill_started;
+    clk->prefill_deltanet_s = (g_tm_pre[0] - prefill_tm_start[0]) / 1000.0;
+    clk->prefill_attention_s = (g_tm_pre[1] - prefill_tm_start[1]) / 1000.0;
+    clk->prefill_moe_s = (g_tm_pre[2] - prefill_tm_start[2]) / 1000.0;
+    clk->prefill_shared_s = (g_tm_pre[3] - prefill_tm_start[3]) / 1000.0;
+    clk->prefill_router_s = (g_tm_pre[4] - prefill_tm_start[4]) / 1000.0;
+    clk->prefill_lm_head_s = (g_tm_pre[5] - prefill_tm_start[5]) / 1000.0;
     /* Also honor a control arriving during the final projection before DATA.
      * In that case the fully completed prefix is still safe to reuse. */
     if(g_q36_mux_slots == 1 && !prefill_control) prefill_control = serve_control_pending(q->id);
@@ -9444,6 +9499,8 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
         q36_pcache_store(m, ids, np, lo);
     clk->s_disk=m->t_disk; clk->s_attn=tm_sum(0)+tm_sum(1); clk->s_moe=tm_sum(2); clk->s_head=tm_sum(5);
     clk->hits=m->hits; clk->miss=m->miss;
+    clk->prefill_s=prefill_s; clk->reused_prompt_tokens=reuse;
+    clk->prefix_reuse_source=reuse_source; clk->prefix_reuse_miss=reuse_miss;
     clk->t0=now_s();
     g_echo_k = 0; g_echo_id = NULL;   /* la lettura riguarda il prefill, non la decodifica */
     g_q36_mtp.voc_reuse = reuse;
@@ -9454,6 +9511,7 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
 static void serve_one_turn(Model *m, ServeReq *q){
     int *ids=NULL, np=0; float *lo=NULL; Q36ReqClock clk;
     if(!q36_serve_start(m,q,&ids,&np,&lo,&clk)) return;
+    clk.first_sample_s=-1.0; clk.first_emit_after_prefill_s=-1.0;
     int gen=0, limited=1, forwards=1;   /* il prefill e' il primo forward */
     const double s_disk=clk.s_disk, s_attn=clk.s_attn, s_moe=clk.s_moe, s_head=clk.s_head;
     int eos_ids[Q36_MAX_EOS + 4]; int n_eos=serve_eos_ids(eos_ids,Q36_MAX_EOS + 4);
@@ -9461,7 +9519,9 @@ static void serve_one_turn(Model *m, ServeReq *q){
     unsigned char sbuf[16]; int sbn=0;
     Q36Spec spec; q36_spec_begin(m, &spec, ids, np);   /* COLI_LOOKUP=1: drafts, every token still sampled from the exact logits */
     for(int s=0;s<q->max_tok;s++){
+        double sample_started=now_s();
         int tk = serve_sample(lo, m->c.vocab, q->temp, q->top_p);
+        if(gen==0) clk.first_sample_s=now_s()-sample_started;
         /* La coda si calcola PRIMA della free: dopo, lo non c'e piu. */
         char lptail[1024]; lptail[0]=0;
         if(q->logprobs>0) coli_logprob_tail(lptail,sizeof lptail,lo,m->c.vocab,tk,q->logprobs);
@@ -9470,10 +9530,15 @@ static void serve_one_turn(Model *m, ServeReq *q){
         if(is_eos){ limited=0; break; }
         unsigned char tmp[256]; int tn=0; decode_id_to_bytes(tk, tmp, &tn);
         if(q->logprobs>0){
+            if(tn>0 && clk.first_emit_after_prefill_s<0)
+                clk.first_emit_after_prefill_s=now_s()-clk.t0;
             serve_data_lp(q->id,(char*)tmp,tn,lptail);
         } else {
             unsigned char chunk[256]; int cn=0; utf8_drain(sbuf,&sbn,tmp,tn,chunk,&cn);
-            if(cn>0) serve_data(q->id,(char*)chunk,cn);
+            if(cn>0){
+                if(clk.first_emit_after_prefill_s<0) clk.first_emit_after_prefill_s=now_s()-clk.t0;
+                serve_data(q->id,(char*)chunk,cn);
+            }
         }
         gen++;
         /* #1332: una guardata a stdin per token. Il costo e' una select con
@@ -9497,7 +9562,10 @@ static void serve_one_turn(Model *m, ServeReq *q){
     }
     q36_spec_end(m, &spec);
     forwards += (int)spec.forwards;
-    if(sbn>0) serve_data(q->id,(char*)sbuf,sbn);   /* flush trailing partial UTF-8 */
+    if(sbn>0) {
+        if(clk.first_emit_after_prefill_s<0) clk.first_emit_after_prefill_s=now_s()-clk.t0;
+        serve_data(q->id,(char*)sbuf,sbn);   /* flush trailing partial UTF-8 */
+    }
     free(lo); free(ids);
     double dt=now_s()-t0;
     hits_emit(m);
@@ -9511,8 +9579,25 @@ static void serve_one_turn(Model *m, ServeReq *q){
                (unsigned long long)forwards);   /* contati, non dedotti: l'ultimo token non ne fa uno */
         fflush(stdout);
     }
-    printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n",q->id,gen,
-           dt>0?gen/dt:0.0,q36_turn_hit(m,&clk),rss_gb(),np,limited);
+    printf("DONE %s STAT %d %.3f %.1f %.2f %d %d prefill_s=%.6f reused_prompt_tokens=%d"
+           " tokenize_s=%.6f prefix_match_s=%.6f snapshot_restore_s=%.6f"
+           " prefill_deltanet_s=%.6f prefill_attention_s=%.6f prefill_moe_s=%.6f"
+           " prefill_shared_s=%.6f prefill_router_s=%.6f prefill_lm_head_s=%.6f"
+           " prefix_reuse_source=%s",
+           q->id,gen,
+           dt>0?gen/dt:0.0,q36_turn_hit(m,&clk),rss_gb(),np,limited,
+           clk.prefill_s,clk.reused_prompt_tokens,
+           clk.tokenize_s,clk.prefix_match_s,clk.snapshot_restore_s,
+           clk.prefill_deltanet_s,clk.prefill_attention_s,clk.prefill_moe_s,
+           clk.prefill_shared_s,clk.prefill_router_s,clk.prefill_lm_head_s,
+           clk.prefix_reuse_source ? clk.prefix_reuse_source : "none");
+    if (clk.prefix_reuse_miss)
+        printf(" prefix_reuse_miss=%s", clk.prefix_reuse_miss);
+    if (clk.first_sample_s >= 0)
+        printf(" first_sample_s=%.6f", clk.first_sample_s);
+    if (clk.first_emit_after_prefill_s >= 0)
+        printf(" first_emit_after_prefill_s=%.6f", clk.first_emit_after_prefill_s);
+    putchar('\n');
     fflush(stdout);
     {char scope[96]; snprintf(scope, sizeof scope, "turn %s", q->id); q36_spec_report(&spec, scope);}
     q36_spec_free(&spec);

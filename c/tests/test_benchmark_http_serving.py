@@ -90,6 +90,70 @@ class BenchmarkTest(unittest.TestCase):
                 self.assertEqual(row["completion_tokens"], 3)
                 self.assertLessEqual(row["first_output_seconds"], row["duration_seconds"])
 
+    def test_server_timings_are_extracted_and_reported(self):
+        payload = {"choices": [{"index": 0, "delta": {"content": "hello"},
+                               "finish_reason": "stop",
+                               "timings": {"ttft_s": 0.2, "total_s": 1.5, "tokens_per_sec": 7.5,
+                                           "prefill_s": 1.1, "prompt_tokens": 100,
+                                           "reused_prompt_tokens": 75,
+                                           "prefix_reuse_source": "live_state",
+                                           "tokenize_s": 0.02, "prefix_match_s": 0.01,
+                                           "snapshot_restore_s": 0.03,
+                                           "prefill_deltanet_s": 0.4,
+                                           "prefill_attention_s": 0.2,
+                                           "prefill_moe_s": 1.0,
+                                           "prefill_shared_s": 0.1,
+                                           "prefill_router_s": 0.05,
+                                           "prefill_lm_head_s": 0.15,
+                                           "first_sample_s": 0.004,
+                                           "first_emit_after_prefill_s": 0.012}}]}
+        self.server.body = (event(payload) + event("[DONE]")).encode()
+        row = self.request()
+        self.assertEqual(row["server_timings"], {"ttft_s": 0.2, "total_s": 1.5, "tokens_per_sec": 7.5,
+                                                 "prefill_s": 1.1, "prompt_tokens": 100.0,
+                                                 "reused_prompt_tokens": 75.0,
+                                                 "prefix_reuse_source": "live_state",
+                                                 "tokenize_s": 0.02, "prefix_match_s": 0.01,
+                                                 "snapshot_restore_s": 0.03,
+                                                 "prefill_deltanet_s": 0.4,
+                                                 "prefill_attention_s": 0.2,
+                                                 "prefill_moe_s": 1.0,
+                                                 "prefill_shared_s": 0.1,
+                                                 "prefill_router_s": 0.05,
+                                                 "prefill_lm_head_s": 0.15,
+                                                 "first_sample_s": 0.004,
+                                                 "first_emit_after_prefill_s": 0.012})
+        summary = bench.summarize([row], 1)
+        self.assertEqual(summary["successful_server_ttft_seconds"]["count"], 1)
+        self.assertEqual(summary["successful_server_ttft_seconds"]["p50"], 0.2)
+        self.assertEqual(summary["successful_server_total_seconds"]["p50"], 1.5)
+        self.assertEqual(summary["successful_server_tokens_per_second"]["p50"], 7.5)
+        self.assertEqual(summary["successful_server_prefill_seconds"]["p50"], 1.1)
+        self.assertEqual(summary["successful_server_tokenize_seconds"]["p50"], 0.02)
+        self.assertEqual(summary["successful_server_prefix_match_seconds"]["p50"], 0.01)
+        self.assertEqual(summary["successful_server_snapshot_restore_seconds"]["p50"], 0.03)
+        self.assertEqual(summary["successful_server_prefill_deltanet_seconds"]["p50"], 0.4)
+        self.assertEqual(summary["successful_server_prefill_attention_seconds"]["p50"], 0.2)
+        self.assertEqual(summary["successful_server_prefill_moe_seconds"]["p50"], 1.0)
+        self.assertEqual(summary["successful_server_prefill_lm_head_seconds"]["p50"], 0.15)
+        self.assertEqual(summary["successful_server_first_sample_seconds"]["p50"], 0.004)
+        self.assertEqual(summary["successful_server_first_emit_after_prefill_seconds"]["p50"], 0.012)
+        self.assertEqual(summary["successful_server_prefix_reuse_fraction"]["p50"], 0.75)
+        self.assertEqual(summary["successful_server_prefix_reuse_sources"], {"live_state": 1})
+        missed = bench.parse_server_timings({
+            "choices": [{"timings": {"prefix_reuse_source": "none",
+                                      "prefix_reuse_miss": "divergent_prefix"}}]})
+        self.assertEqual(missed, {"prefix_reuse_source": "none",
+                                  "prefix_reuse_miss": "divergent_prefix"})
+        accepted = {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop",
+                                 "timings": {"engine_submit_to_accept_s": 0.1,
+                                             "accept_to_first_output_s": 0.3,
+                                             "queue_wait_s": 0.04}}]}
+        parsed = bench.parse_server_timings(accepted)
+        self.assertEqual(parsed["engine_submit_to_accept_s"], 0.1)
+        self.assertEqual(parsed["accept_to_first_output_s"], 0.3)
+        self.assertEqual(parsed["queue_wait_s"], 0.04)
+
     def test_legacy_function_call_output_and_validation(self):
         for function, valid, output in (({"name": "lookup"}, True, True),
                                         ({"arguments": "{}"}, True, True),
@@ -358,6 +422,16 @@ class ColibriIntegrationTest(unittest.TestCase):
             self.assertEqual(summary["succeeded"], 2, rows)
             self.assertEqual(summary["reported_successful_completion_tokens"], 2)
             self.assertEqual(summary["successful_first_output_seconds"]["count"], 2)
+            self.assertIn("engine_ttft_s", rows[0]["server_timings"])
+            self.assertIn("request_to_engine_done_s", rows[0]["server_timings"])
+            self.assertIn("queue_wait_s", rows[0]["server_timings"])
+            self.assertIn("engine_submit_to_accept_s", rows[0]["server_timings"])
+            self.assertIn("accept_to_first_output_s", rows[0]["server_timings"])
+            self.assertEqual(summary["successful_server_ttft_seconds"]["count"], 2)
+            self.assertEqual(summary["successful_server_total_seconds"]["count"], 2)
+            self.assertEqual(summary["successful_server_tokens_per_second"]["count"], 2)
+            self.assertEqual(summary["successful_server_submit_to_accept_seconds"]["count"], 2)
+            self.assertEqual(summary["successful_server_accept_to_first_output_seconds"]["count"], 2)
             self.assertNotIn("test-secret", json.dumps(rows))
             server.engine.fail = True
             failed = bench.request_one(

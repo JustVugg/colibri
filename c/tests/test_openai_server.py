@@ -2431,6 +2431,39 @@ class DispatcherTest(unittest.TestCase):
         self.assertEqual(stats["cluster_rx_kb"], 170.7)
         self.assertNotIn("17", stats)
 
+    def test_done_stat_prefill_metrics_are_reported(self):
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"DATA " + request_id + b" 2\nok\n")
+            process.stdout.feed(
+                b"DONE " + request_id +
+                b" STAT 1 4.8 0 1.0 100 0 prefill_s=2.375000 reused_prompt_tokens=75"
+                b" tokenize_s=0.010000 prefix_match_s=0.002000 snapshot_restore_s=0.030000"
+                b" prefill_deltanet_s=0.4 prefill_attention_s=0.2 prefill_moe_s=1.1"
+                b" prefill_shared_s=0.2 prefill_router_s=0.1 prefill_lm_head_s=0.3"
+                b" prefix_reuse_source=live_state first_sample_s=0.004000"
+                b" first_emit_after_prefill_s=0.012000\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("qwen36", "model")
+        stats = engine.generate("hello", 16, 0.7, 0.9, lambda _: None)
+        engine.close()
+        self.assertEqual(stats["prefill_s"], 2.375)
+        self.assertEqual(stats["reused_prompt_tokens"], 75)
+        self.assertEqual(stats["tokenize_s"], 0.01)
+        self.assertEqual(stats["prefix_match_s"], 0.002)
+        self.assertEqual(stats["snapshot_restore_s"], 0.03)
+        self.assertEqual(stats["prefill_deltanet_s"], 0.4)
+        self.assertEqual(stats["prefill_attention_s"], 0.2)
+        self.assertEqual(stats["prefill_moe_s"], 1.1)
+        self.assertEqual(stats["prefill_shared_s"], 0.2)
+        self.assertEqual(stats["prefill_router_s"], 0.1)
+        self.assertEqual(stats["prefill_lm_head_s"], 0.3)
+        self.assertEqual(stats["prefix_reuse_source"], "live_state")
+        self.assertEqual(stats["first_sample_s"], 0.004)
+        self.assertEqual(stats["first_emit_after_prefill_s"], 0.012)
+
     def test_accepts_u7a_echo_and_extended_data_frames(self):
         # U7a forward-compat: the engine's opt-in per-token numeric channel --
         # ECHO frames for echoed prompt positions and DATA frames extended
