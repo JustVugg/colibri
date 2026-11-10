@@ -1816,7 +1816,7 @@ __global__ static void __launch_bounds__(256) cc_pick_k(const float *__restrict_
     __shared__ int ri[8];
     int tid = threadIdx.x, lane = tid & 31, sg = tid >> 5;
     int be = tid < n ? tid : 0x7fffffff;
-    float bv = tid < n ? lg[tid] : -INFINITY;
+    float bv = tid < n ? lg[tid] : -__int_as_float(0x7f800000);
     for (int i = tid + 256; i < n; i += 256) {
         float v = lg[i];
         if (v > bv) { bv = v; be = i; }
@@ -1860,7 +1860,7 @@ __global__ static void __launch_bounds__(256) cc_matmul_rows_i8_k(float *__restr
     int j = (int)blockIdx.x * 8 + warp;
     if (j >= n) return;
     int o = ids[j];
-    if (o < 0 || o >= O) { if (lane == 0) y[j] = -INFINITY; return; }
+    if (o < 0 || o >= O) { if (lane == 0) y[j] = -__int_as_float(0x7f800000); return; }
     const int4 *wr = reinterpret_cast<const int4 *>(w + (size_t)o * I);
     float acc = 0.f;
     for (int i = lane; i < I16; i += 32) {
@@ -1883,7 +1883,7 @@ __global__ static void __launch_bounds__(256) cc_matmul_rows_k(float *__restrict
     int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, j = (int)blockIdx.x * 8 + warp;
     if (j >= n) return;
     int o = ids[j];
-    if (o < 0 || o >= O) { if (lane == 0) y[j] = -INFINITY; return; }
+    if (o < 0 || o >= O) { if (lane == 0) y[j] = -__int_as_float(0x7f800000); return; }
     float acc = 0.f;
     if (fmt == 1) {
         const int8_t *wr = (const int8_t *)w + (size_t)o * I;

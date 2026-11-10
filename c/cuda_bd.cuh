@@ -1010,7 +1010,7 @@ __global__ static void __launch_bounds__(256) bd_gemv_rows_i8_k(float *__restric
         if (live) for (int q = ln; q < steps; q += lpr) bdi_step<T, 1>(Wr, (bd_u32)q, X, 1, tb, acc);
         float v = acc[0];
         for (int off = lpr / 2; off > 0; off >>= 1) v += bd_shfl_xor(v, off);
-        if (ln == 0 && j < n) y[j] = live ? v : -INFINITY;
+        if (ln == 0 && j < n) y[j] = live ? v : -__int_as_float(0x7f800000);  /* not -INFINITY: the Windows SDK UCRT spells it (float)1e+300, nvcc warning #221 */
     }
 }
 

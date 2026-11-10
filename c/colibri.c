@@ -777,7 +777,9 @@ static int g_cuda_expert_auto;
 static int g_cuda_dense;
 static int g_cuda_release_host;
 static double g_cuda_reserve_gb;   /* CUDA_RESERVE_GB: VRAM headroom kept free of expert tier (default 2 GB) */
+#ifdef COLI_ANS   /* read and set only under COLI_ANS: unguarded, a CUDA build warns -Wunused-variable */
 static int g_cuda_raw_experts=-1;   /* experimental ANS tier: keep this global hot prefix raw */
+#endif
 static int g_cuda_devices[COLI_CUDA_MAX_DEVICES], g_cuda_ndev, g_cuda_rr;
 static int64_t g_cuda_dense_projected[COLI_CUDA_MAX_DEVICES];
 static void qt_cuda_reset(QT *t){
