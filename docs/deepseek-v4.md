@@ -125,6 +125,7 @@ picks at start-up by GPU:
 |---|---|---|---|
 | `coli_cuda_dsv4_dg.dll` | `make cuda-dsv4-dg-dll` (from a vcvars64 shell; fetches the pinned DeepGEMM headers on first use) | DeepGEMM tensor-core prefill paths + generic kernels | compute capability 12.x (RTX 50-series) |
 | `coli_cuda_dsv4.dll` | `make cuda-dsv4-dll CUDA_ARCH=portable` | generic CUDA kernels only (fp32 compute from fp8/fp4 decode) | any sm_80+ (RTX 30/40/50, A/H series) |
+| `coli_cuda_dsv4.dll` | `make cuda-dsv4-dll CUDA_ARCH=portable-pre-ampere NO_TC=1` | the same generic kernels, plus sm_61/sm_75 code (see [GPU coverage](#gpu-coverage)) | Pascal and Turing too (GTX 10/16, RTX 20) |
 
 The release's Windows CUDA package (`colibri-<tag>-windows-x86_64-cuda.zip`)
 carries both, built with `DSV4_TC=0`: that leaves out the opt-in cuBLASLt

@@ -328,6 +328,14 @@ ifeq ($(shell printf '%s\n' 12.9 $(NVCC_RELEASE) | sort -V 2>/dev/null | head -1
 CUDA_GENCODE += -gencode arch=compute_121,code=sm_121
 endif
 endif
+else ifeq ($(CUDA_ARCH),portable-pre-ampere)
+# DeepSeek V4's Pascal/Turing preset, the same list as Makefile.deepseek-v4's
+# (see the reasoning there): the Windows coli_cuda_dsv4.dll is built here, and
+# the loader's "no usable backend" message names this preset with NO_TC=1.
+CUDA_GENCODE = -gencode arch=compute_61,code=sm_61 -gencode arch=compute_75,code=sm_75 \
+               -gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 \
+               -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=sm_90 \
+               -gencode arch=compute_90,code=compute_90
 else
 CUDA_GENCODE = -arch=$(CUDA_ARCH)
 endif
@@ -1162,14 +1170,19 @@ deepgemm-fetch $(DEEPGEMM_STAMP):
 # backend_loader.c / coli_cuda.dll split. Run from a vcvars64 shell, like
 # cuda-dll. Two flavours ship side by side and the loader picks at runtime by
 # compute capability: coli_cuda_dsv4.dll is the GENERIC build (plain CUDA
-# kernels, any sm_80+ card; CUDA_ARCH=portable for a fat binary) and
+# kernels, any sm_80+ card; CUDA_ARCH=portable for a fat binary,
+# CUDA_ARCH=portable-pre-ampere NO_TC=1 adds Pascal and Turing) and
 # coli_cuda_dsv4_dg.dll the DeepGEMM sm_120a build (tensor-core prefill paths;
 # needs the sm120 DeepGEMM checkout at DEEPGEMM_HOME, see
 # patches-deepgemm-sm120-msvc.patch). Both need -lcuda for the TMA driver API.
 # DSV4_TC=0 leaves out the opt-in cuBLASLt MXFP8 path (DSV4_CUDA_TC=1 at run
 # time): the DLL then links no cuBLASLt and needs only cudart64_12.dll beside it
 # and the NVIDIA driver -- the form the Windows CUDA package ships (#2047):
-# cublasLt64_12.dll alone is hundreds of MB.
+# cublasLt64_12.dll alone is hundreds of MB. NO_TC=1, the name
+# Makefile.deepseek-v4 and the loader's advice use, means the same here.
+ifeq ($(NO_TC),1)
+DSV4_TC ?= 0
+endif
 DSV4_TC ?= 1
 ifeq ($(DSV4_TC),0)
 DSV4_DLL_TC = -DCOLI_DSV4_NO_TC

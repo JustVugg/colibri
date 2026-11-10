@@ -111,6 +111,19 @@ class MakefilePlatformTests(unittest.TestCase):
         self.assertNotIn(missing_libomp, result.stdout)
         self.assertNotIn("-fopenmp", result.stdout)
 
+    def test_dsv4_dll_takes_the_pre_ampere_preset_and_no_tc(self):
+        # The loader tells Pascal/Turing users to build with
+        # CUDA_ARCH=portable-pre-ampere NO_TC=1; cuda-dsv4-dll is the Windows build.
+        out = self._dry_run("cuda-dsv4-dll", "x86_64-w64-mingw32",
+                            CUDA_ARCH="portable-pre-ampere", NO_TC=1).stdout
+        self.assertIn("-o coli_cuda_dsv4.dll", out)
+        self.assertNotIn("-arch=portable-pre-ampere", out)
+        for sm in ("61", "75", "80", "86", "89", "90"):
+            self.assertIn(f"arch=compute_{sm},code=sm_{sm}", out)
+        self.assertIn("arch=compute_90,code=compute_90", out)
+        self.assertIn("-DCOLI_DSV4_NO_TC", out)
+        self.assertNotIn("-lcublasLt", out)
+
 
 if __name__ == "__main__":
     unittest.main()
