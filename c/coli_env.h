@@ -409,6 +409,9 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_VK_KV_DEVICE_ROWS", CE_INT, CE_COLIBRI | CE_KIMI | CE_INKLING | CE_OLMOE | CE_DSV4 | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_QWENIMAGE | CE_MIMO, 0, NULL},
     {"COLI_VK_KV_FP32", CE_BOOL, CE_DSV41, 0, NULL},
     {"COLI_VK_KV_PIN", CE_INT, CE_COLIBRI | CE_KIMI | CE_INKLING | CE_OLMOE | CE_DSV4 | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_QWENIMAGE | CE_MIMO, 0, NULL},
+    /* retired: read once only to say so (v41_host_kvq's one line, the inverted meaning
+     * included), so it takes no moved default and no deprecated-name rewrite here */
+    {"COLI_VK_KV_QUANT", CE_STR, CE_DSV41, 0, NULL},
     {"COLI_VK_KV_SLICE", CE_INT, CE_COLIBRI | CE_KIMI | CE_INKLING | CE_OLMOE | CE_DSV4 | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_QWENIMAGE | CE_MIMO, 0, NULL},
     {"COLI_VK_KV_SPLIT", CE_INT, CE_COLIBRI | CE_KIMI | CE_INKLING | CE_OLMOE | CE_DSV4 | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_QWENIMAGE | CE_MIMO, 0, NULL},
     {"COLI_VK_LEDGER", CE_INT, CE_DSV41, 0, NULL},

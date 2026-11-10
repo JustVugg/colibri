@@ -44,8 +44,8 @@ def _config(**over):
     return {"text_config": cfg}
 
 
-def _state(context, fp32, **over):
-    """The context state bytes at a flag setting. fp32 True: COLI_VK_KV_FP32=1 (the
+def _geometry(context, fp32, **over):
+    """The planner's geometry at a flag setting. fp32 True: COLI_VK_KV_FP32=1 (the
     exact opt-out); False: the var UNSET -- the default, packed."""
     env = dict(os.environ)
     env.pop("COLI_VK_KV_FP32", None)
@@ -54,9 +54,13 @@ def _state(context, fp32, **over):
     old = os.environ
     try:
         os.environ = env
-        return fr._dsv41_geometry(_config(**over), context, None).context_state_bytes
+        return fr._dsv41_geometry(_config(**over), context, None)
     finally:
         os.environ = old
+
+
+def _state(context, fp32, **over):
+    return _geometry(context, fp32, **over).context_state_bytes
 
 
 class Dsv41KvqHostPlanTest(unittest.TestCase):
@@ -66,6 +70,17 @@ class Dsv41KvqHostPlanTest(unittest.TestCase):
         for ctx in (65536, 131072, 262144):
             self.assertEqual(_state(ctx, True), 6400 * ctx, f"fp32 state at ctx {ctx}")
             self.assertEqual(_state(ctx, False), 890 * ctx, f"packed state at ctx {ctx}")
+
+    def test_the_window_rings_are_priced_at_the_row_the_host_holds(self):
+        # The rings are (layers + stages) * window rows of the HOST's own row width, so
+        # the packed default's 528-byte row is the ring's price too: 43 * 128 * 528 =
+        # 2 906 112 B against the fp32 layout's 43 * 128 * 2048 = 11 272 192 B -- the
+        # 8 366 080 B (7.98 MiB) the old fixed term over-reserved for a host that holds
+        # codes. At any other geometry the guard declines and the rings are fp32.
+        self.assertEqual(_geometry(0, True).fixed_state_bytes, 43 * 128 * 2048)
+        self.assertEqual(_geometry(0, False).fixed_state_bytes, 43 * 128 * 528)
+        self.assertEqual(_geometry(0, True).fixed_state_bytes - _geometry(0, False).fixed_state_bytes, 8366080)
+        self.assertEqual(_geometry(0, False, head_dim=64, index_head_dim=32).fixed_state_bytes, 43 * 128 * 64 * 4)
 
     def test_the_freed_ram_against_the_slot_it_buys(self):
         # 5510 B a position freed. The slot a freed budget BUYS is the floor of the whole

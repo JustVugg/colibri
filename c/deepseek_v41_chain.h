@@ -146,6 +146,8 @@ static int v41c_kvq_on(const Cfg *c) {
         if (!fp32 && !ok)
             fprintf(stderr, "[VK] deepseek_v41 chain: COLI_VK_KV_FP32%s wants head_dim 512 and index_head_dim 128; "
                             "the mirrors stay fp32\n", g_v41c_kvq_unset ? " (the packed default)" : "=0");
+        /* the retired COLI_VK_KV_QUANT's one warning is v41_host_kvq's (deepseek_v41.c): the
+         * host parses at every model_load, so it has said so before this runs */
     }
     return g_v41c_kvq;
 }
@@ -656,6 +658,15 @@ static V41Chain *v41c_alloc_dev(Model *m, int d) {
     if (!ch->fna || !ch->fnf || !ch->win || !ch->ckv || !ch->ikey || !ch->ring || !ch->kv_valid || !ch->ccap || !ch->sli) return NULL;
     ch->n = d ? g_v41c_fit2.n : g_v41_fit.L > 0 ? g_v41_fit.n : L;
     ch->kvq = v41c_kvq_on(c);
+    /* THE invariant the single flag rests on: the device mirrors pack only beside a packed
+     * host (v41_host_kvq, deepseek_v41.c). The pull's write-back, the re-upload and the
+     * dequant-on-read paths all assume the host's rows ARE the codes; a setup where the
+     * two disagree would read one layout as the other. */
+    if (ch->kvq && !v41_host_kvq(c)) {
+        fprintf(stderr, "[VK] %s chain: COLI_VK_KV_FP32 assertion failed: the KV mirrors are packed and the "
+                        "host's rows are not -- the one flag cannot pick sides\n", v41c_name(ch));
+        abort();
+    }
     ch->W = c->window; ch->K = c->index_topk > 0 ? c->index_topk : 0; ch->rmax = 1;
     for (int i = 0; i < L; i++) if (c->kv_source[i] && c->compress_ratio[i] > ch->rmax) ch->rmax = c->compress_ratio[i];
     ch->Wd = ch->W + v41c_rows();
@@ -868,9 +879,10 @@ static int v41c_chunk_rows(V41Chain *ch, Model *m, int ctx) {
     size_t row = (size_t)(b2 - b1) + (size_t)ch->n * c->head_dim * sizeof(float) +
                  (size_t)(2 * c->n_activated + 1) * c->dim * sizeof(float);
     /* The CPU expert path gathers one expert's rows and keeps its gate/up and
-     * output beside the rank-order contribution buffer. */
+     * output beside the rank-order contribution buffer. The index list is already in the
+     * per-row count above (v41c_scratch reserves r * (W + K) floats a chunk for it), so
+     * charging (W + K) * sizeof(int) again here would count it twice. */
     row += 2 * ((size_t)c->dim + c->moe_inter) * sizeof(float);
-    if (ch->ks.on) row += (size_t)(ch->W + ch->K) * sizeof(int);
     return vkc_chunk_rows(v41c_name(ch), row);
 }
 /* The window rings for chunks of `rows`: W + rows rows each (a chunk never overwrites a

@@ -901,12 +901,20 @@ def _host_kv_packed(head_dim, index_hd):
     return head_dim == 512 and index_hd == 128
 
 
+# The packed host's row widths, in bytes (c/dsv41_kvq.h: KVQ_WIN_BYTES, KVQ_CKV_BYTES,
+# KVQ_IKEY_BYTES), which the engine's host arrays hold a row while the cache is packed.
+_KVQ_WIN_BYTES = 528
+_KVQ_CKV_BYTES = 288
+_KVQ_IKEY_BYTES = 68
+
+
 def _dsv41_geometry(config, context, _model_dir):
     """DeepSeek V4.1 Flash: window ring, compressed KV and index keys, engram rows.
 
     What the engine keeps resident per layer (deepseek_v41.c model_load):
 
-        window ring   n_layers * window_size * head_dim * 4      (fixed)
+        window ring   n_layers * window_size * head_dim * 4      (fixed; 528 B a token
+                                                                  while the host is packed)
         compressed KV ceil(context / ratio) * head_dim * 4       (per kv source)
         index keys    ceil(context / ratio) * index_head_dim * 4 (per kv source)
 
@@ -946,7 +954,19 @@ def _dsv41_geometry(config, context, _model_dir):
     stages = section.get("n_mtp_layers") or 0
     if not isinstance(stages, int) or isinstance(stages, bool) or stages < 0:
         raise ValueError("deepseek_v41: n_mtp_layers must be a non-negative integer")
-    fixed = (layers + stages) * window * head_dim * 4
+    # The packed cache (COLI_VK_KV_FP32 unset) prices the packed host layout: the window
+    # ring, the compressed rows and the index keys are the cache's own code rows (528,
+    # 288 and 68 B, c/dsv41_kvq.h) instead of head_dim * 4, (head_dim + index_head_dim) *
+    # 4 fp32 bytes -- 356 B against 2560 B a row at the released geometry, 86.1% less.
+    # THE INVARIANT this rests on, and the engine's v41_host_kvq states: under the flag the
+    # HOST layout is packed and STAYS packed for the process's life -- the KV split's
+    # give-way reverts the device mirrors to fp32 whole, never the host (the split's paths
+    # read the codes), so the re-price holds whenever the flag engages, split or not. The
+    # same geometry guard as the engine's (the formats are defined at head_dim 512 /
+    # index_head_dim 128): at any other geometry the engine keeps the fp32 host and the
+    # fp32 price is the honest one.
+    kvq_host = _host_kv_packed(head_dim, index_hd)
+    fixed = (layers + stages) * window * (_KVQ_WIN_BYTES if kvq_host else head_dim * 4)
     state = 0
     for layer in sources:
         if not isinstance(layer, int) or isinstance(layer, bool) or not 0 <= layer < layers:
@@ -955,19 +975,7 @@ def _dsv41_geometry(config, context, _model_dir):
         if not isinstance(ratio, int) or isinstance(ratio, bool) or ratio < 1:
             raise ValueError("deepseek_v41: a kv source layer must compress")
         compressed = (context + ratio - 1) // ratio
-        # The packed cache (COLI_VK_KV_FP32 unset) prices the packed host layout: the
-        # compressed rows and the index keys are the cache's own code rows (288 + 68 B,
-        # c/dsv41_kvq.h) instead of (head_dim + index_head_dim) * 4 fp32 bytes -- 356 B
-        # against 2560 B a row at the released geometry, 86.1% less. THE INVARIANT this
-        # rests on, and the engine's v41_host_kvq states: under the flag the HOST layout is
-        # packed and STAYS packed for the process's life -- the KV split's give-way reverts
-        # the device mirrors to fp32 whole, never the host (the split's paths read the
-        # codes), so the re-price holds whenever the flag engages, split or not. The same
-        # geometry guard as the engine's (the formats are defined at head_dim 512 /
-        # index_head_dim 128): at any other geometry the engine keeps the fp32 host and the
-        # fp32 price is the honest one.
-        kvq_host = (_host_kv_packed(head_dim, index_hd))
-        state += compressed * ((288 + 68) if kvq_host else (head_dim + index_hd) * 4)
+        state += compressed * ((_KVQ_CKV_BYTES + _KVQ_IKEY_BYTES) if kvq_host else (head_dim + index_hd) * 4)
 
     # Price the workspace at one prompt chunk, not the whole context (deepseek_v41.c
     # prefill: default 1280 rows; COLI_VK_CHAIN_ROWS and COLI_PROMPT_SEGMENT change

@@ -1511,6 +1511,11 @@ static int v41_host_kvq(const Cfg *c) {
         int fp32 = e && *e && *e != '0' && strcmp(e, "false") && strcmp(e, "off") && strcmp(e, "no");
         g_v41_host_kvq_unset = !(e && *e);
         g_v41_host_kvq = !fp32 && c->head_dim == 512 && c->index_head_dim == 128;
+        const char *gone = getenv("COLI_VK_KV_QUANT");   /* the retired name: said once, never fatal */
+        if (gone && *gone)
+            fprintf(stderr, "[v41] COLI_VK_KV_QUANT=%s is retired and IGNORED: the cache has one flag, and "
+                            "COLI_VK_KV_FP32=1 is its exact fp32 opt-out -- the old =0 meant fp32, while unset/0 "
+                            "on the new name is the packed default\n", gone);
         if (g_v41_host_kvq)
             fprintf(stderr, "[v41] COLI_VK_KV_FP32%s: the host's KV state in the cache formats too -- a window row "
                             "528 B, a compressed row 288 B, an index key 68 B in block-wide sections, dequantized on read "
@@ -6482,10 +6487,11 @@ static size_t v41_state_later(const Model *m) {
     for (int i = 0; i < c->n_layers; i++) {
         b += (size_t)c->window * v41_row_win(c);
         if (c->kv_source[i]) {
-            int ratio = c->compress_ratio[i];
-            /* the packed cache: a parked conversation's sets hold the code rows too
-             * (the arrays are the Model's own, swapped whole) */
-            b += (size_t)(c->max_positions / (ratio > 0 ? ratio : 1)) * (v41_row_ckv(c) + v41_row_ikey(c));
+            int ratio = c->compress_ratio[i], slots = c->max_positions / (ratio > 0 ? ratio : 1);
+            /* the packed cache: a parked conversation's sets hold the code rows too (the
+             * arrays are the Model's own, swapped whole), and the index keys' mirror is
+             * whole 32-token blocks (v41_ikey_bytes), not slots * 68 */
+            b += (size_t)slots * v41_row_ckv(c) + v41_ikey_bytes(c, slots);
         }
     }
     return b * (size_t)(g_v41_mux_slots > 1 ? g_v41_mux_slots - 1 : 0);
