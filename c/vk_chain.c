@@ -4080,7 +4080,7 @@ int vkc_dsv4_swiglu(VkcBuf *a, VkcBuf *b, VkcBuf *y, const VkcDsSwiglu *p) {
     VkcBind bd[6] = {B(a, 0), B(b, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(y, 1)};
     return dsv4_rec(PK_EW, 8, p, sizeof *p, bd, 6, gx, gy);
 }
-/* COLI_VK_KV_QUANT's pack/unpack (chain_dsv4.comp modes 13/14; c/dsv41_kvq.h the
+/* the packed cache's pack/unpack (chain_dsv4.comp modes 13/14; c/dsv41_kvq.h the
  * reference). The quantized rows are written as whole 32-bit words, so a pack never
  * races; the formats' widths (528/288/68 B) are what the kinds below hardcode. */
 int vkc_dsv4_quant(VkcBuf *dst, VkcBuf *src, const VkcDsQuant *p) {

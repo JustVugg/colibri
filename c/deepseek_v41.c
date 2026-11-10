@@ -86,7 +86,7 @@
 #include "omp_tune.h"
 #include "kv_prefix.h"
 #include "park.h"   /* a short request keeps the conversation aside (COLI_PARK) */
-#include "dsv41_kvq.h"   /* COLI_VK_KV_QUANT=2: the host's KV rows in the cache formats */
+#include "dsv41_kvq.h"   /* the packed cache (COLI_VK_KV_FP32): the host's KV rows in the cache formats */
 #include "prompt_break.h"   /* a served prompt that a STOP or CANCEL stops between two layers */
 #include "pin_pool.h"   /* riuso del prefisso tra turni (shared) */
 #include "spec_draft.h" /* the verify depth from DSpark's confidence (SpecGate) */
@@ -1316,7 +1316,7 @@ typedef struct {
     WF eng_q, eng_k;
     int engram_index;           /* which table, -1 when this layer has none */
     /* per-layer state */
-    uint8_t *window;            /* [window_size, head_dim] ring of raw KV -- fp32 rows, or COLI_VK_KV_QUANT=2's 528 B code rows */
+    uint8_t *window;            /* [window_size, head_dim] ring of raw KV -- fp32 rows, or the packed cache's 528 B code rows */
     /* Which position each ring slot holds, -1 when it holds nothing yet. A single
      * decode step needs only "slot i is position i until the ring wraps", but a
      * speculative step writes several positions at once and then keeps only some of
@@ -1488,36 +1488,37 @@ typedef struct {
 } V41Seq;
 static int g_v41_mux_slots = 1;   /* KV_SLOTS: the conversations a serve decodes at once */
 
-/* COLI_VK_KV_QUANT=2: the host's own KV arrays (the window rings, the compressed rows,
- * the index keys) held in the checkpoint's cache formats too -- c/dsv41_kvq.h's 528/288/
- * 68-byte rows where =0 keeps dequantized fp32 rows. Parsed once here, before
- * model_load allocates a byte; 2/unset is the DEFAULT (DeepInfer parity), 1 the device
- * mirrors only, 0 the explicit exact fp32 opt-out, and a set value always wins over the
- * default. The same geometry guard as the device flag's (the formats are defined at
- * head_dim 512 and index_head_dim 128): with the geometry wrong the default declines
- * exactly like a set value (one line) and the host keeps today's fp32 layout. The device
- * side parses its own copy in deepseek_v41_chain.h (flag 1 = the device mirrors only,
- * 2 = both).
+/* COLI_VK_KV_FP32 (the packed cache's one flag, the chain's v41c_kvq_on in
+ * deepseek_v41_chain.h reads the same variable): unset/0 holds the host's own KV arrays
+ * (the window rings, the compressed rows, the index keys) in the checkpoint's cache
+ * formats -- c/dsv41_kvq.h's 528/288/68-byte rows -- where 1/true keeps dequantized fp32
+ * rows (the exact opt-out, which also takes the device mirrors). Parsed once here, before
+ * model_load allocates a byte; the host is packed exactly when the mirrors are (one
+ * condition, no in-between setting), so the separate =1 level is gone. The same geometry
+ * guard as the device flag's (the formats are defined at head_dim 512 and
+ * index_head_dim 128): with the geometry wrong the default declines exactly like an
+ * explicit 0 (one line) and the host keeps today's fp32 layout.
  *
  * THE INVARIANT THE PLANNER AND THE SPLIT RELY ON: once this returns 1 the HOST layout
  * is packed and stays packed for the process's life -- the KV split's give-way
  * (v41c_kvq_give_way) reverts the DEVICE mirrors to fp32 whole, never the host, so the
  * split's paths read the codes (dequant on read) instead of the host reverting. */
 static int g_v41_host_kvq = -1;
+static int g_v41_host_kvq_unset = 1;
 static int v41_host_kvq(const Cfg *c) {
     if (g_v41_host_kvq < 0) {
-        const char *e = getenv("COLI_VK_KV_QUANT");
-        int dflt = !(e && *e);            /* unset/empty: the default, 2 */
-        int want2 = dflt || *e == '2';
-        g_v41_host_kvq = want2 && c->head_dim == 512 && c->index_head_dim == 128;
+        const char *e = getenv("COLI_VK_KV_FP32");
+        int fp32 = e && *e && *e != '0' && strcmp(e, "false") && strcmp(e, "off") && strcmp(e, "no");
+        g_v41_host_kvq_unset = !(e && *e);
+        g_v41_host_kvq = !fp32 && c->head_dim == 512 && c->index_head_dim == 128;
         if (g_v41_host_kvq)
-            fprintf(stderr, "[v41] COLI_VK_KV_QUANT=2%s: the host's KV state in the cache formats too -- a window row "
+            fprintf(stderr, "[v41] COLI_VK_KV_FP32%s: the host's KV state in the cache formats too -- a window row "
                             "528 B, a compressed row 288 B, an index key 68 B in block-wide sections, dequantized on read "
                             "(approximate like the mirrors, and it does NOT give way to the KV split: the split reads the codes)\n",
-                    dflt ? " (the default)" : "");
-        if (want2 && !g_v41_host_kvq)
-            fprintf(stderr, "[v41] COLI_VK_KV_QUANT%s wants head_dim 512 and index_head_dim 128; "
-                            "the host's KV state stays fp32\n", dflt ? " (its default, 2)" : "=2");
+                    g_v41_host_kvq_unset ? " unset" : "=0");
+        if (!fp32 && !g_v41_host_kvq)
+            fprintf(stderr, "[v41] COLI_VK_KV_FP32%s wants head_dim 512 and index_head_dim 128; "
+                            "the host's KV state stays fp32\n", g_v41_host_kvq_unset ? " (the packed default)" : "=0");
     }
     return g_v41_host_kvq;
 }
@@ -1566,9 +1567,9 @@ static void v41_host_kv_check(const Model *m, const char *where) {
     exp += (size_t)(m->spec.active ? c->n_mtp : 0) * (size_t)c->window * v41_row_win(c);
     size_t act = v41_host_kv_bytes(m);
     if (act != exp) {
-        fprintf(stderr, "[v41] %s: COLI_VK_KV_QUANT=%d assertion failed: the host's KV arrays hold %zu B where the "
+        fprintf(stderr, "[v41] %s: COLI_VK_KV_FP32=%d assertion failed: the host's KV arrays hold %zu B where the "
                         "flag's widths say %zu B -- a width a branch missed\n",
-                where, v41_host_kvq(c), act, exp);
+                where, v41_host_kvq(c) ? 0 : 1, act, exp);
         abort();
     }
 }
@@ -6215,7 +6216,7 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
         }
 #endif
         serve_hits(m);
-        if (m->t_kvall > rq.kvall0)   /* COLI_VK_KV_QUANT=2's read side, its own line */
+        if (m->t_kvall > rq.kvall0)   /* the packed cache's read side, its own line */
             fprintf(stderr, "[v41] kv read: %.2fs decoding the host's code rows into kv_all (turn)\n",
                     m->t_kvall - rq.kvall0);
         serve_emap(m);
@@ -6482,7 +6483,7 @@ static size_t v41_state_later(const Model *m) {
         b += (size_t)c->window * v41_row_win(c);
         if (c->kv_source[i]) {
             int ratio = c->compress_ratio[i];
-            /* COLI_VK_KV_QUANT=2: a parked conversation's sets hold the code rows too
+            /* the packed cache: a parked conversation's sets hold the code rows too
              * (the arrays are the Model's own, swapped whole) */
             b += (size_t)(c->max_positions / (ratio > 0 ? ratio : 1)) * (v41_row_ckv(c) + v41_row_ikey(c));
         }
@@ -6892,7 +6893,7 @@ int main(int argc, char **argv) {
                     "expert matmul %.2fs, attention %.2fs, engram %.2fs\n",
             (unsigned long long)m.hits, (unsigned long long)m.miss,
             m.expert_bytes / 1e6, m.t_disk, m.t_expert, m.t_attn, m.t_engram);
-    /* COLI_VK_KV_QUANT=2's read side: the ring decode and the kv_all build, broken out of
+    /* the packed cache's read side: the ring decode and the kv_all build, broken out of
      * t_attn so the dequantize-on-read cost is a lookup and not a subtraction (the
      * indexer's decode stays inside attention -- it is not the dominator) */
     if (m.t_kvall > 0.0)

@@ -1,4 +1,4 @@
-/* COLI_VK_KV_QUANT's codec (chain_dsv4.comp modes 13 and 14, and the quantized readers
+/* The packed cache's codec (chain_dsv4.comp modes 13 and 14, and the quantized readers
  * of modes 0's attention / 3, 9, 10's index scores) against c/dsv41_kvq.h's reference,
  * the formats DeepInfer's cache defines (a window row 528 B of MXFP8, a compressed row
  * 288 B of FP4, an index key 68 B of FP4 in block-wide sections):
@@ -286,7 +286,7 @@ done:
     free(q); free(w); free(k); free(kd); free(km); free(ref); free(ref0); free(refc); free(ref0c); free(top1); free(top0);
 }
 
-/* The host-side block rules, no device needed (COLI_VK_KV_QUANT=2, the host arrays in
+/* The host-side block rules, no device needed (the packed cache, the host arrays in
  * these formats):
  *   staging  a mirror's rows through 68-byte linear staging and back, bit for bit --
  *            the pull's write-back and a raw index-key upload go through these

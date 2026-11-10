@@ -78,7 +78,7 @@ typedef struct {
  * position t at host + h*host_seg + t*seglen, in elements: floats, or float16 with kv16 (a
  * cache kept in float16, kv16.h; the device's copy is float32 either way). The device's:
  * segment h of row r at dev_off + (h*rows + r)*seglen in dev. kvq (DeepSeek V4.1 under
- * COLI_VK_KV_QUANT=2, its own rows only): the host's rows are 288-byte code rows of
+ * the packed cache, its own rows only): the host's rows are 288-byte code rows of
  * seglen/2 bytes (a compressed row, dsv41_kvq.h), unpacked to floats on their way up. */
 typedef struct {
     int nseg, seglen;
@@ -1159,7 +1159,7 @@ typedef struct {
     int S, H, hd, cnt, l_off, l_row, nwin, w_off, q_off, q_row, sink_off, v4, o_off, o_row, n_cmp;
     float scale;
     const uint8_t *Ch;   /* the layer's compressed rows: fp32 floats, or 288 B code rows (kvq) */
-    int kvq;             /* COLI_VK_KV_QUANT=2: Ch holds codes, unpacked a staged row at a time */
+    int kvq;             /* the packed cache: Ch holds codes, unpacked a staged row at a time */
 } VkcKvDs;
 /* Sparse scratch grows exactly, without vkc_reserve's geometric over-allocation.
  * Include the existing allocation when checking the driver budget before replacement. */

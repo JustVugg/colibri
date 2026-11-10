@@ -540,13 +540,18 @@ beside a trunk the whole prompt pays for on every token. `COLI_VK_TIER_RESERVE_G
 2.1 GiB the trunk still uploads after that fit (the lm head, the 40 routers, the DSpark
 stages: the token embedding is never on the device, see below).
 
-### Quantized KV mirrors (`COLI_VK_KV_QUANT`)
+### Quantized KV mirrors (`COLI_VK_KV_FP32`)
 
 The only VRAM item that grows with the conversation is the chain's KV mirrors, and the
-checkpoint's own cache already stores that state quantized. `COLI_VK_KV_QUANT` keeps
-the mirrors in those formats — the same layouts DeepInfer's paged cache defines
-(`c/dsv41_kvq.h`) — and does so BY DEFAULT (`2`/unset; `1` is the device mirrors only,
-`0` the exact fp32 opt-out):
+checkpoint's own cache already stores that state quantized. The packed cache keeps the
+mirrors in those formats — the same layouts DeepInfer's paged cache defines
+(`c/dsv41_kvq.h`) — and does so BY DEFAULT: `COLI_VK_KV_FP32` unset (or `0`) runs
+packed, and `1` is the exact fp32 opt-out. There is no half-packed setting: the host's
+arrays are packed exactly when the mirrors are (`v41_host_kvq` reads the same flag), and
+the old middle level that kept the host fp32 while the mirrors packed measured
+byte-identical to the packed host on the 12-prompt battery (at 16K only the packed host
+was ever needed), so it cost the dequant→re-pack round trip the ckv subnormal-scale fix
+had to repair and bought nothing measurable.
 
 | mirror | format | bytes a row | was (fp32) |
 |---|---|---|---|
@@ -558,12 +563,13 @@ The compressor's `ring` stays fp32 (it is the pooling accumulator, not a mirror)
 `isc`, the masks and the engram buffers. A row is quantized once, after its last fp32
 reader (`chain_dsv4.comp` mode 13), and dequantized where it is read — the attention and
 the indexer's scores decode inline (modes 0, 3, 9, 10) — and on the write-back that ends
-a forward (mode 14), so the host's state stays the canonical copy — under `=1` fp32 rows
-holding the dequantized values, under the default's `=2` the codes themselves (below) —
-and rollback, prefix reuse and a lost device still rebuild nothing.
+a forward (mode 14), so the host's state stays the canonical copy — under
+`COLI_VK_KV_FP32=1` fp32 rows holding the dequantized values, under the packed default
+the codes themselves (below) — and rollback, prefix reuse and a lost device still
+rebuild nothing.
 
 The arithmetic at the released geometry, per token across the layers: about **6,400 B
-of mirror a position at `=0` against about 890 B quantized** (the compressed rows and
+of mirror a position under `COLI_VK_KV_FP32=1` against about 890 B packed** (the compressed rows and
 index keys alone: 2.5 rows a position over the layers' compression ratios × (288 + 68) B;
 the window rings are the planner's fixed term, not a per-position cost) — the
 figures of the prefill-VRAM analysis
@@ -576,26 +582,28 @@ as totals; the corrected basis is 6,400/890 B a position — the same math
 the kv-quant test family pins on the ledger line, which reports `(quantized)` when the
 mirrors are (a second device's mirrors are not in that line — the pre-existing gap).
 
-It is an **approximate mode** — and the default — while `COLI_VK_KV_QUANT=0` is the exact
+It is an **approximate mode** — and the default — while `COLI_VK_KV_FP32=1` is the exact
 fp32 opt-out, byte for byte what the engine ran before the default flipped (the flag
 branches only at the mirrors' widths and stores; a run's mirrors are summed against the
 flag's widths at the first forward, so a missed branch fails loudly). The FP4 index keys
 can move a top-k pick, so the logits drift a little — the `kv-quant-deepseek` family gates
 a documented tolerance instead of bit-identity, the way `V41_PREFILL_TAIL`'s tests accept
-the tail's own approximation — and the pull's write-back returns dequantized rows (a
-quantize→dequant hop the pack's idempotence bounds: re-packing a dequantized row
-reproduces its values, which the unit test pins). The flag needs `head_dim` 512 and
+the tail's own approximation — and the pull's write-back moves the code rows as bytes;
+under the KV split's give-way, where the host's codes dequantize up into the fp32 mirrors,
+the write-back packs again (a quantize→dequant hop the pack's idempotence bounds:
+re-packing a dequantized row reproduces its values, which the unit test pins). The flag
+needs `head_dim` 512 and
 `index_head_dim` 128: at any other geometry the flag declines — the default exactly like
 a set value, one line on stderr — and the mirrors stay fp32, so models at other KV
 geometries are untouched by the default. It does not re-price the planner beyond the
 host state below: the KV split decides exactly as before, and when it arms the mirrors go
 back to fp32 whole (`v41c_kvq_give_way`), re-mirrored from the host.
 
-### The host's state in the same formats (`COLI_VK_KV_QUANT=2`, the default)
+### The host's state in the same formats (the default)
 
-`COLI_VK_KV_QUANT=2` — the flag's default, what an unset environment runs — holds the
+`COLI_VK_KV_FP32` unset — the default, what an unset environment runs — holds the
 HOST's own KV arrays -- the window rings, the compressed rows, the index keys -- in the
-same cache formats the mirrors use, where `=0` keeps dequantized fp32 rows: the host
+same cache formats the mirrors use, where `1` keeps dequantized fp32 rows: the host
 state drops from 6,400 B to 890 B a position at the released geometry (86.1% less). Writers pack at their stores (rms and
 the rope tail stage in a scratch row, never in place inside a code row), the read paths
 dequantize on read -- the kv_all build and the indexer decode into per-forward scratch,
@@ -622,7 +630,7 @@ projection tagged by the audit's regime):
 The honest ceiling, from the ladder's completed arm: in the measured 16K regime
 nothing moves -- prefill is disk-bound and decode is CPU/disk-bound -- and the past-32K
 walls (the MemAvailable guard, an unattributed end-of-prefill spike) are not KV-sized,
-so `=2` does not rescue them. The defensible wins are the guard margin at ≥64K, the
+so the packed host does not rescue them. The defensible wins are the guard margin at ≥64K, the
 `--ram` equivalence growing linearly with context, the KV split staying unarmed about
 4x longer (the quantized mirror crosses the ~1 GiB reserve near 640K of ckv/ikey
 against fp32's 160K), and -- only through an explicit `COLI_VK_TIER_GB` raise, since

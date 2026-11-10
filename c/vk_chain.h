@@ -567,7 +567,8 @@ int vkc_situ(VkcBuf *g, VkcBuf *u, VkcBuf *y, const VkcSitu *p);
  *                     denominator only, the value sum and the denominator in list order.
  *                     flags 1: the weights round to bf16 before the value sum and the
  *                     output to bf16 (DeepSeek V4). flags 2: the KV buffers hold
- *                     COLI_VK_KV_QUANT's quantized rows (deepseek_v41_chain.h; the
+ *                     the packed cache's quantized rows (COLI_VK_KV_FP32 unset;
+ *                     deepseek_v41_chain.h; the
  *                     reader dequantizes inline). THE ROW STRIDE CHANGES WITH THEM: a
  *                     window row is 528 B (132 floats) and a compressed row 288 B (72),
  *                     both read out of the float buffers' little-endian word lanes; hd
@@ -620,7 +621,7 @@ typedef struct { int S, pos_base, ratio, P, D, overlap, kv_off, kv_row, sc_off, 
 int vkc_dsv4_compress(VkcBuf *kv, VkcBuf *sc, VkcBuf *ring, VkcBuf *prm, VkcBuf *out, const VkcDsComp *p);
 typedef struct { int S, pos_base, ratio, IH, ID, width, q_off, q_row, w_off, w_row, k_off, k_row, mask_row, sc_row;
                  float wscale; int sc_off, mask_off, quant; } VkcDsScore;   /* mask_row: words a row (32 columns each);
-                 quant: 1 = the keys hold COLI_VK_KV_QUANT's 68 B block-sections rows, k_off still token 0's float
+                 quant: 1 = the keys hold the packed cache's 68 B block-sections rows, k_off still token 0's float
                  offset but a key's stride becomes a 2176 B block (64 B of data + 4 packed-int32 scales a token) */
 int vkc_dsv4_score(VkcBuf *iq, VkcBuf *hw, VkcBuf *keys, VkcBuf *mask, VkcBuf *sc, const VkcDsScore *p);
 typedef struct { int S, pos_base, ratio, width, block, topb, sc_row, mask_row; } VkcDsCand;   /* mask_row: words a row */
@@ -652,7 +653,7 @@ typedef struct { int kind, nseg, per_row, len, block, flags, x_off, x_row, x_seg
 int vkc_dsv4_round(VkcBuf *x, VkcBuf *y, const VkcDsRound *p);
 typedef struct { int n, a_off, b_off, y_off; float lim; } VkcDsSwiglu;
 int vkc_dsv4_swiglu(VkcBuf *a, VkcBuf *b, VkcBuf *y, const VkcDsSwiglu *p);
-/* COLI_VK_KV_QUANT's mirrors (deepseek_v41_chain.h; the formats and the scale math are
+/* the packed cache's mirrors (COLI_VK_KV_FP32 unset; deepseek_v41_chain.h; the formats and the scale math are
  * c/dsv41_kvq.h's, DeepInfer's cache): a row quantized at its store and dequantized where
  * it is read (vkc_dsv4_attn's flags 2, vkc_dsv4_score's quant) or on the pull's write-back.
  *   vkc_dsv4_quant    S fp32 rows of hd floats (src at src_off + s*src_row) into dst's

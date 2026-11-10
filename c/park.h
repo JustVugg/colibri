@@ -39,8 +39,8 @@
  * ring) keeps its rows [0, n) apart, all of them when it has fewer; a compressed one (a row
  * for `per` positions) the rows of positions [0, n); a block saved whole is one row of its
  * size. `block` (0 = none) rounds what a park keeps to whole `block`-row blocks: a cache
- * whose rows sit in block-wide sections (DeepSeek V4.1's index keys under
- * COLI_VK_KV_QUANT=2 -- a row's scales at its block's 2048-byte mark) must not have a
+ * whose rows sit in block-wide sections (DeepSeek V4.1's index keys under the packed
+ * cache, COLI_VK_KV_FP32 unset -- a row's scales at its block's 2048-byte mark) must not have a
  * block cut in half, and its `rows` is the mirror's block-rounded capacity. */
 typedef struct { void *base; size_t row; int rows, heads; size_t head_stride; int per, block; } ColiParkPart;
 

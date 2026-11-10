@@ -1,14 +1,14 @@
-"""COLI_VK_KV_QUANT's planner re-price (family_registry._dsv41_geometry): the host's
-KV state priced as the cache's packed code rows while the flag engages (2 IS the
-default now -- unset runs packed), fp32 under =0 (the exact opt-out) and =1 (the
-device mirrors only).
+"""The packed cache's planner re-price (family_registry._dsv41_geometry): the host's
+KV state priced as the cache's packed code rows while COLI_VK_KV_FP32 is unset (the
+default now -- unset runs packed, mirrors and host alike), fp32 under =1 (the exact
+opt-out, which takes the device mirrors with it).
 
 What is pinned here is the SEAM -- the per-row width swap and its guard, at the released
 geometry's config and the three context lengths whose slot deltas the memory model
 predicted (+1/+1/+2 at 64K/128K/256K against per_cap 771.14 MiB). The slot arithmetic
 itself (cache_bytes // per_cap) needs the checkpoint's own tensors for per_cap, so its
-end-to-end evidence is the serve smoke's "[v41] RAM plan" line, flag 0 against flag 2 --
-the same line the ladder reproduced for every measured context.
+end-to-end evidence is the serve smoke's "[v41] RAM plan" line, the packed default
+against FP32=1 -- the same line the ladder reproduced for every measured context.
 """
 import importlib.util
 import os
@@ -44,13 +44,13 @@ def _config(**over):
     return {"text_config": cfg}
 
 
-def _state(context, flag, **over):
-    """The context state bytes at a flag setting. flag None: the var UNSET -- the
-    default (=2, packed); 0/1/2: set explicitly."""
+def _state(context, fp32, **over):
+    """The context state bytes at a flag setting. fp32 True: COLI_VK_KV_FP32=1 (the
+    exact opt-out); False: the var UNSET -- the default, packed."""
     env = dict(os.environ)
-    env.pop("COLI_VK_KV_QUANT", None)
-    if flag is not None:
-        env["COLI_VK_KV_QUANT"] = str(flag)
+    env.pop("COLI_VK_KV_FP32", None)
+    if fp32:
+        env["COLI_VK_KV_FP32"] = "1"
     old = os.environ
     try:
         os.environ = env
@@ -64,9 +64,8 @@ class Dsv41KvqHostPlanTest(unittest.TestCase):
         # a position costs 2.5 compressed rows: 6400 B fp32, 890 B packed -- and the
         # var unset IS the packed price (the engine's default, mirrored here)
         for ctx in (65536, 131072, 262144):
-            self.assertEqual(_state(ctx, 0), 6400 * ctx, f"fp32 state at ctx {ctx}")
-            self.assertEqual(_state(ctx, 2), 890 * ctx, f"packed state at ctx {ctx}")
-            self.assertEqual(_state(ctx, None), 890 * ctx, f"the default's packed state at ctx {ctx}")
+            self.assertEqual(_state(ctx, True), 6400 * ctx, f"fp32 state at ctx {ctx}")
+            self.assertEqual(_state(ctx, False), 890 * ctx, f"packed state at ctx {ctx}")
 
     def test_the_freed_ram_against_the_slot_it_buys(self):
         # 5510 B a position freed. The slot a freed budget BUYS is the floor of the whole
@@ -77,7 +76,7 @@ class Dsv41KvqHostPlanTest(unittest.TestCase):
         # share of a slot (0.45/0.90/1.79 of one expert-per-layer slot at the three ctxs)
         per_cap = int(771.14 * 1024 * 1024)
         for ctx, share in ((65536, 0.44), (131072, 0.89), (262144, 1.78)):
-            freed = _state(ctx, 0) - _state(ctx, 2)
+            freed = _state(ctx, True) - _state(ctx, False)
             self.assertEqual(freed, 5510 * ctx, f"freed at ctx {ctx}")
             self.assertGreater(freed / per_cap, share, f"the freed share of a slot at ctx {ctx}")
             self.assertLess(freed / per_cap, share + 0.02, f"the freed share of a slot at ctx {ctx}")
@@ -85,15 +84,11 @@ class Dsv41KvqHostPlanTest(unittest.TestCase):
     def test_the_geometry_guard_keeps_the_fp32_price(self):
         # the formats are defined at head_dim 512 / index_head_dim 128: at any other
         # geometry the engine keeps the fp32 host, and the planner must price fp32 there
-        # -- the guard declines a set =2 exactly as it declines the default
-        self.assertEqual(_state(4096, 2, head_dim=64, index_head_dim=32),
+        # -- the guard declines the packed default exactly as it declines an explicit 0
+        self.assertEqual(_state(4096, True, head_dim=64, index_head_dim=32),
                          (2048 + 2048 + 2048 + 4096) * (64 + 32) * 4)
-        self.assertEqual(_state(4096, None, head_dim=64, index_head_dim=32),
+        self.assertEqual(_state(4096, False, head_dim=64, index_head_dim=32),
                          (2048 + 2048 + 2048 + 4096) * (64 + 32) * 4)
-
-    def test_flag_one_prices_fp32(self):
-        # =1 is the device mirrors only: the host stays fp32 and so does the price
-        self.assertEqual(_state(65536, 1), 6400 * 65536)
 
 
 if __name__ == "__main__":

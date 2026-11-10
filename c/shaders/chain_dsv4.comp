@@ -76,7 +76,7 @@
 //   bits). Limit: IH <= 4096.
 // mode 10, modes 3 and 9 on a grid (its comment below).
 //
-// COLI_VK_KV_QUANT (c/dsv41_kvq.h, DeepInfer's cache formats): modes 0, 3, 9 and 10 gain
+// the packed cache, COLI_VK_KV_FP32 unset (c/dsv41_kvq.h, DeepInfer's cache formats): modes 0, 3, 9 and 10 gain
 // a quantized read of their KV buffers, and modes 13/14 pack and unpack the mirrors:
 //   win  e4m3 + a ue8m0 scale per 32, [data | scales] a token: a 528 B row (132 words)
 //   ckv  e2m1 + an e4m3 scale per 16, [data | scales] a token: a 288 B row (72 words)
@@ -167,7 +167,7 @@ uint wscan(uint v, int tid) {   // exclusive, in thread order
     return incl - v;
 }
 
-// ---- the KV-quant codec (the header's COLI_VK_KV_QUANT paragraph; c/dsv41_kvq.h is the
+// ---- the KV-quant codec (the header's COLI_VK_KV_FP32 paragraph; c/dsv41_kvq.h is the
 // host reference -- the same bits). A byte of a float buffer is a lane of its word; the
 // mirrors' rows are whole words, so the loads stay aligned. ------------------------
 float ue8m0d(uint u) { return uintBitsToFloat((u & 0xffu) << 23); }   // 2^(b-127), DI's decode
@@ -250,7 +250,7 @@ void attend() {
     int qb = p.v[10] + s * p.v[11] + h * hd, ob = p.v[12] + s * p.v[13] + h * hd;
     float sink = b4[p.v[14] + h];
     int flags = p.v[15];
-    int quant = (flags >> 1) & 1;   // COLI_VK_KV_QUANT: a row's stride is its byte width / 4
+    int quant = (flags >> 1) & 1;   // the packed cache: a row's stride is its byte width / 4
     float scale = intBitsToFloat(p.v[16]);
     for (int i = tid; i < hd; i += 256) sm[i] = b0[qb + i];
     barrier();
@@ -380,7 +380,7 @@ void score() {
     int qb = p.v[7] + s * p.v[8], wb = p.v[9] + s * p.v[10];
     int ko = p.v[11], kr = p.v[12], mr = p.v[13], sb = p.v[16] + s * p.v[14], mb = p.v[17] + s * mr;
     float wscale = intBitsToFloat(p.v[15]);
-    int quant = p.v[18];   // COLI_VK_KV_QUANT: the keys in the block-sections layout
+    int quant = p.v[18];   // the packed cache: the keys in the block-sections layout
     for (int i = tid; i < IH * ID; i += 256) sm[i] = b0[qb + i];
     for (int h = tid; h < IH; h += 256) sm[4096 + h] = b1[wb + h] * wscale;
     barrier();
@@ -718,7 +718,7 @@ void swiglu_v4() {
 }
 
 // ---- mode 13 -----------------------------------------------------------------------
-// COLI_VK_KV_QUANT's pack (the header's paragraph): one workgroup a source row s of hd
+// the packed cache's pack (the header's paragraph): one workgroup a source row s of hd
 // (p.v[3]) floats at src_off + s*src_row (b0, fp32), its 32-bit words written whole to i6.
 // kind 0 a window row of 528 B into ring slot (dst_tok + s) % Wd: a thread < 128 the data
 // word tid (4 e4m3 bytes of the group tid >> 3), the threads 128..131 a scale word (4
@@ -795,7 +795,7 @@ void quantize() {
 }
 
 // ---- mode 14 -----------------------------------------------------------------------
-// COLI_VK_KV_QUANT's unpack: one workgroup a row, its floats to y5 at dst_off +
+// the packed cache's unpack: one workgroup a row, its floats to y5 at dst_off +
 // s*dst_row. kind 0 reads ring slot (src_tok + s) % Wd, kind 1 compressed token src_tok
 // + s, kind 2 the index-key token src_tok + s out of its block sections (b0 the mirror).
 void dequant() {

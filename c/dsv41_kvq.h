@@ -1,6 +1,6 @@
 #ifndef DSV41_KVQ_H
 #define DSV41_KVQ_H
-/* COLI_VK_KV_QUANT's codec: the DeepSeek V4.1 device KV mirrors in the checkpoint's
+/* The packed cache's codec (COLI_VK_KV_FP32 unset): the DeepSeek V4.1 device KV mirrors in the checkpoint's
  * quantized formats, as DeepInfer's cache defines them (model_executor/layers/
  * tilelang_ops/cache_common.py) and quantizes them (asc/kv_quant.py, compute_scale):
  *
@@ -178,7 +178,7 @@ static inline void kvq_unpack_ikey(float *x, const uint8_t *mirror, int t) {
     }
 }
 
-/* The host's own block rules (COLI_VK_KV_QUANT=2, the host arrays held in these
+/* The host's own block rules (the packed cache, the host arrays held in these
  * formats): a mirror's blocks are whole and pack from byte 0, so the whole blocks
  * covering rows [0, rows) are exactly the linear prefix kvq_ikey_mirror_bytes(rows)
  * long -- a park, a reset or a zero-fill that rounds its row count up to whole blocks

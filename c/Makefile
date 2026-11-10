@@ -2710,7 +2710,7 @@ tests/test_vk_chain$(EXE): tests/test_vk_chain.c $(VK_OBJ) $(VK_SPV)
 vk-chain-check: tests/test_vk_chain$(EXE)
 	./tests/test_vk_chain$(EXE) shaders/qmatmul.spv
 
-# COLI_VK_KV_QUANT's codec (needs VK=1): the chain's quantized KV mirrors
+# The packed cache's codec (needs VK=1): the chain's quantized KV mirrors
 # (chain_dsv4.comp modes 13/14 and the quant readers) against c/dsv41_kvq.h's reference,
 # DeepInfer's cache formats -- the device's pack bit for bit, its unpack, a re-upload's
 # lanes, the pack's idempotence and the index scores' top-k overlap. Like the chain test

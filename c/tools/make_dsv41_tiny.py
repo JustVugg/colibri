@@ -536,7 +536,7 @@ def main() -> int:
     ap.add_argument("--prompt-len", type=int, default=12)
     ap.add_argument("--kv-quant-dims", action="store_true",
                     help="the released KV geometry (head_dim 512, index_head_dim 128): "
-                         "COLI_VK_KV_QUANT's mirror formats (528/288/68 B a row) are "
+                         "the packed cache's mirror formats (528/288/68 B a row, COLI_VK_KV_FP32) are "
                          "defined at those widths, so the kv-quant tests' fixture uses them")
     args = ap.parse_args()
     cfg = tiny_config()

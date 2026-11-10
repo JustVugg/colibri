@@ -890,13 +890,15 @@ def _dsv4_geometry(config, context, _model_dir):
     return PlannerGeometry(state, fixed, workspace, experts)
 
 
-def _host_kv_quant(head_dim, index_hd):
-    """COLI_VK_KV_QUANT=2 engaged on the host (the engine's v41_host_kvq, mirrored):
-    the flag's default (=2, unset) or the flag set to 2, AND the geometry the formats
-    are defined at. `0` is the exact fp32 opt-out and `1` the device mirrors only;
-    both keep the fp32 host layout, and the planner prices fp32."""
-    flag = os.environ.get("COLI_VK_KV_QUANT") or "2"
-    return flag == "2" and head_dim == 512 and index_hd == 128
+def _host_kv_packed(head_dim, index_hd):
+    """The packed cache engaged on the host (the engine's v41_host_kvq, mirrored):
+    COLI_VK_KV_FP32 unset/0 -- the default, which packs the host's KV state exactly when
+    it packs the device mirrors -- AND the geometry the formats are defined at. `1`
+    (or true/false's kin) is the exact fp32 opt-out: the fp32 layout, priced fp32."""
+    flag = os.environ.get("COLI_VK_KV_FP32")
+    if flag and flag not in ("0", "false", "off", "no"):
+        return False
+    return head_dim == 512 and index_hd == 128
 
 
 def _dsv41_geometry(config, context, _model_dir):
@@ -953,17 +955,18 @@ def _dsv41_geometry(config, context, _model_dir):
         if not isinstance(ratio, int) or isinstance(ratio, bool) or ratio < 1:
             raise ValueError("deepseek_v41: a kv source layer must compress")
         compressed = (context + ratio - 1) // ratio
-        # COLI_VK_KV_QUANT=2 prices the packed host layout: the compressed rows and the
-        # index keys are the cache's own code rows (288 + 68 B, c/dsv41_kvq.h) instead of
-        # (head_dim + index_head_dim) * 4 fp32 bytes -- 356 B against 2560 B a row at the
-        # released geometry, 86.1% less. THE INVARIANT this rests on, and the engine's
-        # v41_host_kvq states: under =2 the HOST layout is packed and STAYS packed for the
-        # process's life -- the KV split's give-way reverts the device mirrors to fp32
-        # whole, never the host (the split's paths read the codes), so the re-price holds
-        # whenever the flag engages, split or not. The same geometry guard as the engine's
-        # (the formats are defined at head_dim 512 / index_head_dim 128): at any other
-        # geometry the engine keeps the fp32 host and the fp32 price is the honest one.
-        kvq_host = (_host_kv_quant(head_dim, index_hd))
+        # The packed cache (COLI_VK_KV_FP32 unset) prices the packed host layout: the
+        # compressed rows and the index keys are the cache's own code rows (288 + 68 B,
+        # c/dsv41_kvq.h) instead of (head_dim + index_head_dim) * 4 fp32 bytes -- 356 B
+        # against 2560 B a row at the released geometry, 86.1% less. THE INVARIANT this
+        # rests on, and the engine's v41_host_kvq states: under the flag the HOST layout is
+        # packed and STAYS packed for the process's life -- the KV split's give-way reverts
+        # the device mirrors to fp32 whole, never the host (the split's paths read the
+        # codes), so the re-price holds whenever the flag engages, split or not. The same
+        # geometry guard as the engine's (the formats are defined at head_dim 512 /
+        # index_head_dim 128): at any other geometry the engine keeps the fp32 host and the
+        # fp32 price is the honest one.
+        kvq_host = (_host_kv_packed(head_dim, index_hd))
         state += compressed * ((288 + 68) if kvq_host else (head_dim + index_hd) * 4)
 
     # Price the workspace at one prompt chunk, not the whole context (deepseek_v41.c
