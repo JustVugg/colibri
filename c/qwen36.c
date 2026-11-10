@@ -1333,6 +1333,11 @@ static int q36_ring_for(const Cfg *c, int max_t) {
 static inline int q36_kv_rows(const Model *m, int layer) {
     return m->kv_ring && m->c.win_layer && m->c.win_layer[layer] ? m->kv_ring : m->max_t;
 }
+/* the first attention layer that keeps a ring, -1 when none does */
+static int q36_first_ring_layer(const Model *m) {
+    for (int i = 0; i < m->c.n_layers; i++) if (m->c.is_attn[i] && q36_kv_rows(m, i) != m->max_t) return i;
+    return -1;
+}
 /* where position t of KV head h starts in layer `layer`'s K or V, in elements (q36_kv_es) */
 static inline int64_t q36_kv_at(const Model *m, int layer, int h, int t) {
     int R = q36_kv_rows(m, layer);
@@ -5036,8 +5041,13 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             q36_kv_put(Kl, q36_kv_at(m, layer, kvh, t), k + (int64_t)s*KV*kvd + kvh*kvd, kvd);
             q36_kv_put(Vl, q36_kv_at(m, layer, kvh, t), vv + (int64_t)s*KV*kvd + kvh*kvd, kvd);
         }
-    else
-        for (int s = 0; s < (mr ? S : 1); s++) {   /* the rows before the step's: still in the ring */
+    /* The rows before the step's: still in the ring. ring_pos is every sliding layer's, and the
+     * first one writes the step's rows into it after its scores: a step longer than the spare
+     * rows has overwritten there the window before pos_base, which the next sliding layers still
+     * hold, unwritten, in their own buffers. So a step's own check is the first sliding layer's;
+     * a multiplexed row's is its own position, a few rows of one conversation at most. */
+    else if (mr || layer == q36_first_ring_layer(m))
+        for (int s = 0; s < (mr ? S : 1); s++) {
             int p = mr ? mr[s].pos : pos_base;
             if (!q36_ring_holds(mr ? mr[s].seq->ring_pos : m->ring_pos, ring, p - win + 1, p)) {
                 fprintf(stderr, "[qwen36] layer %d: the KV ring no longer holds the window before position %d "
