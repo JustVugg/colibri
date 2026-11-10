@@ -4082,10 +4082,18 @@ def cmd_import(a):
     out = os.path.abspath(os.path.expanduser(out))
     tool = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools", "gguf_import.py")
     extra = ["--no-mtp"] if a.no_mtp else (["--mtp", os.path.abspath(os.path.expanduser(a.mtp))] if a.mtp else [])
+    for flag, value in (("--text-encoder", a.text_encoder), ("--vae", a.vae)):
+        if value:
+            extra += [flag, os.path.abspath(os.path.expanduser(value))]
+    if a.variant != "auto":
+        extra += ["--variant", a.variant]
     rc = subprocess.call([sys.executable, tool, src, out, "--mode", a.mode] + extra)
     if rc:
         sys.exit(rc)
-    print(f"\n  {C.grn}ready{C.r}: coli chat --model {out}   (or coli serve / coli web)")
+    if os.path.isfile(os.path.join(out, "model_index.json")):   # an image model (Qwen-Image)
+        print(f"\n  {C.grn}ready{C.r}: coli run \"a prompt\" --model {out}   (or coli chat / coli serve / coli web)")
+    else:
+        print(f"\n  {C.grn}ready{C.r}: coli chat --model {out}   (or coli serve / coli web)")
 
 
 def cmd_convert(a):
@@ -4411,6 +4419,14 @@ def main():
                      help="Qwen3.8: the MTP head's GGUF (mtp-*.gguf); unset, one next to the model is found "
                           "(its folder, the parent, an MTP/ folder)")
     pim.add_argument("--no-mtp", action="store_true", help="Qwen3.8: decode without the MTP head")
+    pim.add_argument("--text-encoder", default=None,
+                     help="Qwen-Image: the text encoder, a Qwen3-VL-8B-Instruct GGUF or an official Qwen-Image-2.1 "
+                          "folder (unset: one next to the denoiser)")
+    pim.add_argument("--vae", default=None,
+                     help="Qwen-Image: qwen_image_2.1_vae_bf16.safetensors or an official Qwen-Image-2.1 folder "
+                          "(unset: one next to the denoiser)")
+    pim.add_argument("--variant", choices=("auto", "base", "turbo"), default="auto",
+                     help="Qwen-Image: the denoiser's schedule (auto: from the file name)")
     pc=sub.add_parser("convert", parents=[common])
     pc.add_argument("--repo",default=None,
                     help="HF repo to download and convert (default zai-org/GLM-5.2-FP8). "

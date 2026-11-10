@@ -158,6 +158,15 @@ CATALOG = (
         modality="image", summary="text to image (pictures, not chat)",
         license_note="Qwen Research License: non-commercial use only",
         prebuilt_since="2.0.0", doc="docs/qwen-image.md"),
+    CatalogModel(
+        id="qwen-image-2.1-turbo", family="qwen_image", name="Qwen-Image-2.1-Turbo",
+        repo="Qwen/Qwen-Image-2.1-Turbo", disk_gb=32.5,
+        # the base model's text encoder (byte for byte) and the same DiT shapes, so the
+        # same RAM; its VAE is the bf16 one (0.7 GB on disk, f32 in RAM as the base's)
+        ram_min_gb=12, ram_good_gb=18, dense_gb=8.5, rank=1, size_class="small",
+        modality="image", summary="text to image in 8 steps (Qwen-Image-2.1 distilled)",
+        license_note="Qwen Research License: non-commercial use only",
+        prebuilt_since="2.1.1", doc="docs/qwen-image.md#turbo"),
 )
 
 
