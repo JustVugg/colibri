@@ -102,7 +102,7 @@ class ServeEngine:
                 return
         raise RuntimeError("engine never reported READY")
 
-    def ask(self, rid, prompt, max_tok=1):
+    def ask(self, rid, prompt, max_tok=1, slot=0):
         """Returns the generated payload as BYTES.
 
         Never as str: a random-init fixture emits arbitrary byte sequences that
@@ -110,7 +110,7 @@ class ServeEngine:
         re-encoding yields entirely different bytes.
         """
         assert isinstance(prompt, bytes), "prompts stay bytes end to end"
-        header = f"SUBMIT {rid} 0 {len(prompt)} {max_tok} 0 1{self.header_tail}\n".encode()
+        header = f"SUBMIT {rid} {slot} {len(prompt)} {max_tok} 0 1{self.header_tail}\n".encode()
         self.p.stdin.write(header + prompt + b"\n")
         self.p.stdin.flush()
         chunks = []

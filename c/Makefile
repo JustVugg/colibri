@@ -2452,6 +2452,9 @@ tests/test_decode_batch$(EXE): tests/test_decode_batch.c
 tests/test_pin_pool$(EXE): tests/test_pin_pool.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_prefix_store$(EXE): tests/test_prefix_store.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_serve_codec$(EXE): tests/test_serve_codec.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 

@@ -7548,6 +7548,185 @@ static void q36_park_decide(Model *m, const int *ids, int np, int max_tok) {
     q36_park_free(m);
 }
 
+/* ---- every prompt read, kept by content for later requests (prefix_store.h) -----------------
+ * An agent starts each task as a new conversation on the same system prompt and tools; the
+ * DeltaNet state the slot holds cannot be wound back to where the new conversation parts from the
+ * old one, so the new one read its whole prompt again: 9,736 of 9,757 tokens shared, 2.9 s on an
+ * RTX PRO 4000 with the model on the card, minutes where the experts stream. With two slots a
+ * conversation sent back to the other slot read everything too. The store keeps the full layers'
+ * K/V rows in blocks named by their tokens, shared by every prompt that starts with them, and
+ * checkpoints of the rest (the DeltaNet recurrences and conv windows, a sliding layer's ring, the
+ * rings' positions) where a prompt's messages start and where a turn ends. A request takes the
+ * deepest checkpoint its prompt starts with when it reaches further than what the slot holds
+ * (a model without recurrences or rings may take whole blocks alone). COLI_PREFIX_STORE=0 off;
+ * COLI_PREFIX_STORE_MB its budget (unset: a quarter of the RAM free at the first request, at most
+ * 4096); COLI_PREFIX_STORE_BLOCK the tokens a block (256). Off with the MTP head (its rows live on
+ * its device), for a picture's prompt (its placeholder tokens are the same for every picture) and
+ * for a read-out (logprobs: every position's frame). */
+#include "prefix_store.h"
+static ColiPrefixStore g_q36_ps;
+static int g_q36_ps_init;
+#define Q36_PS_MIN_GAIN 64   /* fewer positions than this over what the slot holds: not worth a load */
+static int q36_ps_on(const Model *m) {
+    if (!g_q36_ps_init) {
+        g_q36_ps_init = 1;
+        const char *e = getenv("COLI_PREFIX_STORE"), *mb = getenv("COLI_PREFIX_STORE_MB"), *bk = getenv("COLI_PREFIX_STORE_BLOCK");
+        size_t budget = 0;
+        if (!(e && *e == '0') && !kv_prefix_off()) {
+            double avail = compat_mem_available_gb() * 1024.0, want = avail > 0 ? avail / 4 : 1024.0;
+            if (want > 4096.0) want = 4096.0;
+            budget = mb && *mb ? (size_t)atoll(mb) << 20 : (size_t)want << 20;
+        }
+        int B = bk && atoi(bk) >= 16 ? atoi(bk) : 256;
+        coli_ps_init(&g_q36_ps, B, budget);
+        if (g_q36_ps.on)
+            fprintf(stderr, "[PREFIX] store: up to %zu MiB of the prompts read, kept by content for any later request "
+                            "(blocks of %d tokens; COLI_PREFIX_STORE=0 off)\n", budget >> 20, B);
+    }
+    return g_q36_ps.on && !g_q36_mtp.on && !m->vis_rows_n && !m->mpos && !m->rope_delta;
+}
+/* whether a checkpoint needs more than rows by position: a recurrence, a ring */
+static int q36_ps_needs_state(const Model *m) {
+    for (int i = 0; i < m->c.n_layers; i++) if (!m->c.is_attn[i] || (m->kv_ring && m->c.win_layer && m->c.win_layer[i])) return 1;
+    return 0;
+}
+static int q36_ps_ring(const Model *m, int i) { return m->kv_ring && m->c.win_layer && m->c.win_layer[i]; }
+/* the full layers' K and V rows, by position */
+static int q36_ps_parts(const Model *m, ColiPsPart *parts) {
+    const Cfg *c = &m->c; int n = 0;
+    const size_t row = (size_t)c->k_head_dim * q36_kv_es();
+    for (int i = 0; i < c->n_layers; i++) {
+        if (!c->is_attn[i] || q36_ps_ring(m, i) || !m->K[i] || !m->V[i]) continue;
+        const int R = q36_kv_rows(m, i);
+        parts[n++] = (ColiPsPart){m->K[i], row, R, c->kv_heads, (size_t)R * row};
+        parts[n++] = (ColiPsPart){m->V[i], row, R, c->kv_heads, (size_t)R * row};
+    }
+    return n;
+}
+/* a checkpoint's state: the DeltaNet layers' (a pin's), every ring's rows and positions */
+typedef struct { Q36PinState *st; void **rk, **rv; int *ring_pos; int R, n_layers; } Q36PsState;
+static void q36_ps_state_free(void *v) {
+    Q36PsState *x = (Q36PsState *)v;
+    if (!x) return;
+    q36_pin_state_free(x->st);
+    for (int i = 0; i < x->n_layers; i++) { if (x->rk) free(x->rk[i]); if (x->rv) free(x->rv[i]); }
+    free(x->rk); free(x->rv); free(x->ring_pos); free(x);
+}
+static Q36PsState *q36_ps_state_save(Model *m, size_t *bytes) {
+    const Cfg *c = &m->c;
+    Q36PsState *x = (Q36PsState *)calloc(1, sizeof *x);
+    if (!x) return NULL;
+    x->n_layers = c->n_layers; x->R = m->kv_ring;
+    x->st = q36_pin_state_save(m, NULL);   /* the devices' newest state comes to the host first */
+    int ok = x->st != NULL;
+    *bytes = 0;
+    for (int i = 0; i < c->n_layers; i++) if (!c->is_attn[i]) *bytes += (q36_rec_cells(c) + (size_t)c->dn_conv_dim * (c->dn_convk - 1)) * sizeof(float);
+    if (ok && m->kv_ring && m->ring_pos) {
+        const size_t rb = (size_t)c->kv_heads * m->kv_ring * c->k_head_dim * q36_kv_es();
+        ok = (x->rk = (void **)calloc((size_t)c->n_layers, sizeof(void *))) && (x->rv = (void **)calloc((size_t)c->n_layers, sizeof(void *))) &&
+             (x->ring_pos = (int *)malloc((size_t)m->kv_ring * sizeof(int)));
+        for (int i = 0; ok && i < c->n_layers; i++) {
+            if (!c->is_attn[i] || !q36_ps_ring(m, i)) continue;
+            ok = (x->rk[i] = malloc(rb)) && (x->rv[i] = malloc(rb));
+            if (ok) { memcpy(x->rk[i], m->K[i], rb); memcpy(x->rv[i], m->V[i], rb); *bytes += 2 * rb; }
+        }
+        if (ok) memcpy(x->ring_pos, m->ring_pos, (size_t)m->kv_ring * sizeof(int));
+    }
+    if (!ok) { q36_ps_state_free(x); return NULL; }
+    return x;
+}
+/* kept for later requests: ids[0, P) as the Model holds them now, with its state at P (with_state) */
+static void q36_ps_save(Model *m, const int *ids, int P, int with_state) {
+    if (!q36_ps_on(m) || P < g_q36_ps.B || m->kvp.tainted || m->kv_len != P) return;
+    if (!with_state && q36_ps_needs_state(m)) return;   /* blocks alone serve nothing here */
+    ColiPsPart *parts = (ColiPsPart *)malloc((size_t)2 * m->c.n_layers * sizeof *parts);
+    if (!parts) return;
+    int np = q36_ps_parts(m, parts);
+    void *st = NULL; size_t sb = 0;
+    if (with_state && q36_ps_needs_state(m) && !(st = q36_ps_state_save(m, &sb))) { free(parts); return; }
+    coli_ps_save(&g_q36_ps, ids, P, parts, np, st, sb, q36_ps_state_free, compat_mem_available_gb() * 1024.0);
+    free(parts);
+}
+/* The deepest prefix the store holds of ids[0, np), when it reaches past `held` positions: its rows
+ * and state put back, the record and the chains told. The positions now held; 0 when nothing. */
+static int q36_ps_take(Model *m, const int *ids, int np, int held) {
+    if (!q36_ps_on(m) || np < 2) return 0;
+    const Cfg *c = &m->c;
+    ColiPsPart *parts = (ColiPsPart *)malloc((size_t)2 * c->n_layers * sizeof *parts);
+    if (!parts) return 0;
+    int nparts = q36_ps_parts(m, parts);
+    coli_ps_layout(&g_q36_ps, parts, nparts);
+    ColiPsHit h;
+    int P = coli_ps_lookup(&g_q36_ps, ids, np, np - 1, q36_ps_needs_state(m), &h);
+    if (P <= held + Q36_PS_MIN_GAIN || !coli_ps_parts_hold(parts, nparts, P)) { coli_ps_hit_free(&h); free(parts); return 0; }
+    if (h.ck >= 0) {
+        const Q36PsState *x = (const Q36PsState *)g_q36_ps.ck[h.ck].state;
+        if (!x || x->R != m->kv_ring || x->n_layers != c->n_layers || (m->kv_ring && (!x->ring_pos || !m->ring_pos))) {
+            coli_ps_hit_free(&h); free(parts); return 0;   /* rings of another size: the checkpoint is no state here */
+        }
+    }
+    const Q36PsState *x = (const Q36PsState *)coli_ps_load(&g_q36_ps, &h, parts, nparts);
+    free(parts);
+    if (x) {
+        q36_pin_state_put(m, x->st);
+        if (x->ring_pos) {
+            const size_t rb = (size_t)c->kv_heads * m->kv_ring * c->k_head_dim * q36_kv_es();
+            for (int i = 0; i < c->n_layers; i++)
+                if (c->is_attn[i] && q36_ps_ring(m, i) && x->rk[i]) { memcpy(m->K[i], x->rk[i], rb); memcpy(m->V[i], x->rv[i], rb); }
+            memcpy(m->ring_pos, x->ring_pos, (size_t)m->kv_ring * sizeof(int));
+        }
+    }
+    m->kv_len = P;
+    kv_prefix_clear(&m->kvp);
+    kv_prefix_record(&m->kvp, ids, 0, P);
+#ifdef COLI_VULKAN
+    q36c_rollback(m, -1, 0);   /* every mirror's watermark to 0: the rows go up again from the host */
+#endif
+#ifdef COLI_CUDA
+    q36cc_rollback(m, -1, 0);
+#endif
+    if (getenv("COLI_PREFIX_LOG")) {
+        fprintf(stderr, "[PREFIX] %d of %d prompt tokens from the store (%d blocks of %d%s; the slot held %d)\n",
+                P, np, h.depth, g_q36_ps.B, h.ck >= 0 ? " and a checkpoint" : "", held);
+        fflush(stderr);
+    }
+    coli_ps_hit_free(&h);
+    return P;
+}
+/* Where a prompt read from `from` keeps checkpoints: where its messages start (the token that
+ * opens one), the first such past `from` (after a new conversation's system prompt, where the next
+ * one on the same prompt parts from it) and the last but the reply's (where the last message
+ * starts: a retry, an edited or a returning turn parts there), each at least a block on. */
+static int q36_ps_marks(const Model *m, const int *ids, int np, int from, int *marks) {
+    static int start_id = -2;
+    if (start_id == -2) {   /* the special token that opens a message, from the tokenizer's added tokens */
+        start_id = -1;
+        static const char *opens[] = {"<|im_start|>", "<start_of_turn>", "<|start_header_id|>", "<|turn_start|>"};
+        for (size_t o = 0; o < sizeof opens / sizeof *opens && start_id < 0; o++)
+            for (int k = 0; k < g_nspecial && g_sp_str && start_id < 0; k++) if (!strcmp(g_sp_str[k], opens[o])) start_id = g_sp_id[k];
+    }
+    if (start_id < 0 || !q36_ps_on(m)) return 0;
+    const int B = g_q36_ps.B;
+    int first = -1, last = -1, prev = -1;
+    for (int p = from + 1; p < np; p++) {
+        if (ids[p] != start_id) continue;
+        if (np - p <= 16) break;              /* the reply's own opening: nothing past it to keep */
+        if (first < 0 && p - from >= B) first = p;
+        prev = p;
+    }
+    last = prev;
+    int n = 0;
+    if (first > 0) marks[n++] = first;
+    if (last > 0 && last - (first > 0 ? first : from) >= B) marks[n++] = last;
+    return n;
+}
+static void q36_ps_report(void) {
+    if (!g_q36_ps.on || !g_q36_ps.lookups) return;
+    fprintf(stderr, "[PREFIX] store: %llu lookups, %llu from the store (%llu prompt tokens not read again); %.1f MiB in %d blocks "
+                    "and %d checkpoints, %llu evicted\n", g_q36_ps.lookups, g_q36_ps.hits, g_q36_ps.hit_tokens,
+            g_q36_ps.bytes / 1048576.0, coli_ps_live_blocks(&g_q36_ps), coli_ps_live_ckpts(&g_q36_ps), g_q36_ps.evicted);
+}
+
 /* The prompt-end snapshot (#2589), qwen38's g_q38_prefix in qwen36's terms: the DeltaNet
  * state, the ids and the first token's logits as the last prompt read to its end left them.
  * A client that retries a reply it cancelled sends a prompt SHORTER than the state (the
@@ -8604,6 +8783,12 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
             fflush(stderr);
         }
     }
+    /* the prompt the store holds further than the slot does: another conversation's on the same
+     * system prompt, or this one's before another took the slot (q36_ps_take) */
+    if (q->logprobs == 0 && !pes_logit) {
+        int got = q36_ps_take(m, ids, np, reuse > rewind ? reuse : rewind);
+        if (got) { reuse = got; rewind = 0; g_pin_use_logit = 0; }
+    }
     g_echo_k = q->logprobs; g_echo_id = q->id;
     /* The read-out promises a frame for EVERY prompt position, starting at 0. A live
      * prefix is not recomputed, so its positions would carry no frame at all -- the hole
@@ -8651,9 +8836,18 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
         lo = falloc(m->c.vocab);
         memcpy(lo, pes_logit, (size_t)m->c.vocab * sizeof(float));
     } else if (!prefill_control) {
-        lo = step_ex_control(m, ids + reuse, np - reuse, reuse, 1,
-                             interruptible ? &control : NULL);
-        prefill_control = control.result;
+        /* read in pieces where the prompt's messages start, the state there kept for later requests */
+        int marks[2], nm = q->logprobs == 0 ? q36_ps_marks(m, ids, np, reuse, marks) : 0, at = reuse;
+        for (int k = 0; k < nm && !prefill_control; k++) {
+            free(step_ex_control(m, ids + at, marks[k] - at, at, 1, interruptible ? &control : NULL));
+            prefill_control = control.result;
+            if (!prefill_control) { q36_ps_save(m, ids, marks[k], 1); at = marks[k]; }
+        }
+        if (!prefill_control) {
+            lo = step_ex_control(m, ids + at, np - at, at, 1,
+                                 interruptible ? &control : NULL);
+            prefill_control = control.result;
+        }
     }
     /* Also honor a control arriving during the final projection before DATA.
      * In that case the fully completed prefix is still safe to reuse. */
@@ -8752,6 +8946,13 @@ static void serve_one_turn(Model *m, ServeReq *q){
     printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n",q->id,gen,
            dt>0?gen/dt:0.0,q36_turn_hit(m,&clk),rss_gb(),np,limited);
     fflush(stdout);
+    /* the conversation as the turn left it, for its next turn after another took the slot (one as
+     * long as a parked one at least: COLI_PARK_MIN) */
+    {
+        const char *mn = getenv("COLI_PARK_MIN");
+        const int least = mn && atoi(mn) > 0 ? atoi(mn) : Q36_PARK_MIN;
+        if (m->kv_len >= least && m->kvp.len == m->kv_len) q36_ps_save(m, m->kvp.fed, m->kv_len, 1);
+    }
     {char scope[96]; snprintf(scope, sizeof scope, "turn %s", q->id); q36_spec_report(&spec, scope);}
     q36_spec_free(&spec);
 #ifdef COLI_CUDA
@@ -9294,11 +9495,11 @@ static void serve_loop(Model *m){
     fflush(stdout);
     emap_emit(m);          /* dopo READY e STAT: il boot reader legge STAT dopo il sentinel */
     fflush(stdout);
-    if(g_q36_mux_slots>1){ serve_mux(m); return; }
+    if(g_q36_mux_slots>1){ serve_mux(m); q36_ps_report(); return; }
     for(;;){
         ServeReq q={0}; int r;
         do r=serve_read_req(&q); while(r==0||r==4||r==5);
-        if(r<0){ q36_mtp_vocab_save(); return; }
+        if(r<0){ q36_mtp_vocab_save(); q36_ps_report(); return; }
         /* Resend the grid after EVERY turn, not only after READY: at boot the
          * expert cache is empty by definition, and that cold snapshot stayed
          * the only one the dashboard ever saw -- all grey, RAM 0, everything

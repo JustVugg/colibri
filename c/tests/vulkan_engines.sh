@@ -2081,6 +2081,9 @@ family_qwen_chain() {
   # places close, and the next conversation that enters opens them again (#2733); the text the CPU's
   CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_PAIRS=1 CHAIN_SERVE_LONG=2600 CHAIN_SERVE_EXPECT='places open again' \
     $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 KV_SLOTS=2 COLI_VK_TEST_CONV_ROOM_MB=0
+  # the prefix store on the chain: a new conversation on the same system prompt, a conversation back
+  # after another, two slots; the logits of a fresh read on the same chain (the rows go up again)
+  QWEN36_TINY=qwen36_tiny_c QWEN36_PS_BACKEND=vulkan $PY -m unittest tests.test_qwen36_prefix_store
   for k in 0 1; do
     CHAIN_SERVE_SLOTS=3 CHAIN_SERVE_PAIRS=1 CHAIN_SERVE_EXPECT='on the device, [1-9][0-9]* handed over' \
       $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 KV_SLOTS=3 COLI_VK_CHAIN_MUX=$k
