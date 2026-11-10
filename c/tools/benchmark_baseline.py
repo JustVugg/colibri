@@ -211,6 +211,8 @@ def compare(spec, workload, workload_hash, directory):
                               "successful_server_prefix_match_seconds", "p50"),
                           "server_snapshot_restore_p50_seconds": metric(
                               "successful_server_snapshot_restore_seconds", "p50"),
+                          "server_snapshot_store_p50_seconds": metric(
+                              "successful_server_snapshot_store_seconds", "p50"),
                           "server_prefill_deltanet_p50_seconds": metric(
                               "successful_server_prefill_deltanet_seconds", "p50"),
                           "server_prefill_attention_p50_seconds": metric(

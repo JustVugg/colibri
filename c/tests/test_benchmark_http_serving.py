@@ -99,6 +99,7 @@ class BenchmarkTest(unittest.TestCase):
                                            "prefix_reuse_source": "live_state",
                                            "tokenize_s": 0.02, "prefix_match_s": 0.01,
                                            "snapshot_restore_s": 0.03,
+                                           "snapshot_store_s": 0.04,
                                            "prefill_deltanet_s": 0.4,
                                            "prefill_attention_s": 0.2,
                                            "prefill_moe_s": 1.0,
@@ -115,6 +116,7 @@ class BenchmarkTest(unittest.TestCase):
                                                  "prefix_reuse_source": "live_state",
                                                  "tokenize_s": 0.02, "prefix_match_s": 0.01,
                                                  "snapshot_restore_s": 0.03,
+                                                 "snapshot_store_s": 0.04,
                                                  "prefill_deltanet_s": 0.4,
                                                  "prefill_attention_s": 0.2,
                                                  "prefill_moe_s": 1.0,
@@ -132,6 +134,7 @@ class BenchmarkTest(unittest.TestCase):
         self.assertEqual(summary["successful_server_tokenize_seconds"]["p50"], 0.02)
         self.assertEqual(summary["successful_server_prefix_match_seconds"]["p50"], 0.01)
         self.assertEqual(summary["successful_server_snapshot_restore_seconds"]["p50"], 0.03)
+        self.assertEqual(summary["successful_server_snapshot_store_seconds"]["p50"], 0.04)
         self.assertEqual(summary["successful_server_prefill_deltanet_seconds"]["p50"], 0.4)
         self.assertEqual(summary["successful_server_prefill_attention_seconds"]["p50"], 0.2)
         self.assertEqual(summary["successful_server_prefill_moe_seconds"]["p50"], 1.0)

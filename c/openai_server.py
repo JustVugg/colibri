@@ -6336,6 +6336,7 @@ def _engine_timing_stats(fields):
     out = {}
     seconds_fields = {
         "prefill_s", "tokenize_s", "prefix_match_s", "snapshot_restore_s",
+        "snapshot_store_s",
         "prefill_deltanet_s", "prefill_attention_s", "prefill_moe_s",
         "prefill_shared_s", "prefill_router_s", "prefill_lm_head_s",
         "first_sample_s", "first_emit_after_prefill_s",
@@ -9385,7 +9386,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 }
                 for name in (
                     "prefill_s", "prompt_tokens", "reused_prompt_tokens",
-                    "tokenize_s", "prefix_match_s", "snapshot_restore_s",
+                    "tokenize_s", "prefix_match_s", "snapshot_restore_s", "snapshot_store_s",
                     "prefill_deltanet_s", "prefill_attention_s", "prefill_moe_s",
                     "prefill_shared_s", "prefill_router_s", "prefill_lm_head_s",
                     "first_sample_s", "first_emit_after_prefill_s",

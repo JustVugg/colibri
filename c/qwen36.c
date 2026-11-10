@@ -9283,7 +9283,7 @@ static int qwen36_serve_budget(int np, int max_tok, int max_ctx, int read_only){
 /* The counters when a request's decoding began: PROF and DONE report its share. */
 typedef struct {
     double s_disk, s_attn, s_moe, s_head, t0, prefill_s;
-    double tokenize_s, prefix_match_s, snapshot_restore_s;
+    double tokenize_s, prefix_match_s, snapshot_restore_s, snapshot_store_s;
     double prefill_deltanet_s, prefill_attention_s, prefill_moe_s;
     double prefill_shared_s, prefill_router_s, prefill_lm_head_s;
     double first_sample_s, first_emit_after_prefill_s;
@@ -9305,6 +9305,7 @@ static double q36_turn_hit(const Model *m, const Q36ReqClock *c) {
 static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, float **lo_out,
                            Q36ReqClock *clk){
     int *ids=NULL, np=0;
+    clk->snapshot_store_s = 0.0;
     double tokenize_started = now_s();
     encode_text(q->payload, &ids, &np);          /* payload is raw prompt text; qwen36 adds no BOS */
     clk->tokenize_s = now_s() - tokenize_started;
@@ -9495,8 +9496,11 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
      * ids[0..np) again, so a deeper file for the same conversation gets
      * written here too. */
     if (g_pc_dir[0] && !q->pin && g_echo_k == 0 && !m->kvp.tainted &&
-        g_q36_mux_slots == 1 && np >= q36_pcache_min() && q36_pcache_on())
+        g_q36_mux_slots == 1 && np >= q36_pcache_min() && q36_pcache_on()) {
+        double snapshot_store_started = now_s();
         q36_pcache_store(m, ids, np, lo);
+        clk->snapshot_store_s = now_s() - snapshot_store_started;
+    }
     clk->s_disk=m->t_disk; clk->s_attn=tm_sum(0)+tm_sum(1); clk->s_moe=tm_sum(2); clk->s_head=tm_sum(5);
     clk->hits=m->hits; clk->miss=m->miss;
     clk->prefill_s=prefill_s; clk->reused_prompt_tokens=reuse;
@@ -9580,14 +9584,14 @@ static void serve_one_turn(Model *m, ServeReq *q){
         fflush(stdout);
     }
     printf("DONE %s STAT %d %.3f %.1f %.2f %d %d prefill_s=%.6f reused_prompt_tokens=%d"
-           " tokenize_s=%.6f prefix_match_s=%.6f snapshot_restore_s=%.6f"
+           " tokenize_s=%.6f prefix_match_s=%.6f snapshot_restore_s=%.6f snapshot_store_s=%.6f"
            " prefill_deltanet_s=%.6f prefill_attention_s=%.6f prefill_moe_s=%.6f"
            " prefill_shared_s=%.6f prefill_router_s=%.6f prefill_lm_head_s=%.6f"
            " prefix_reuse_source=%s",
            q->id,gen,
            dt>0?gen/dt:0.0,q36_turn_hit(m,&clk),rss_gb(),np,limited,
            clk.prefill_s,clk.reused_prompt_tokens,
-           clk.tokenize_s,clk.prefix_match_s,clk.snapshot_restore_s,
+           clk.tokenize_s,clk.prefix_match_s,clk.snapshot_restore_s,clk.snapshot_store_s,
            clk.prefill_deltanet_s,clk.prefill_attention_s,clk.prefill_moe_s,
            clk.prefill_shared_s,clk.prefill_router_s,clk.prefill_lm_head_s,
            clk.prefix_reuse_source ? clk.prefix_reuse_source : "none");

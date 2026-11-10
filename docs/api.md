@@ -135,7 +135,7 @@ last completion chunk. The standard `usage` object is unchanged.
 | `decode_tokens_per_sec` | Completion tokens divided by the time from first output to engine-call completion. |
 | `prefill_s` | Engine-reported prompt-forward time, excluding reused prefix positions. Currently reported by Qwen3.6. |
 | `prompt_tokens`, `reused_prompt_tokens` | Prompt length and, when supported, the exact number of prompt positions reused from existing model state. |
-| `tokenize_s`, `prefix_match_s`, `snapshot_restore_s` | Qwen3.6 tokenization, live-prefix validation, and pin/disk snapshot lookup or restore durations. |
+| `tokenize_s`, `prefix_match_s`, `snapshot_restore_s`, `snapshot_store_s` | Qwen3.6 tokenization, live-prefix validation, pin/disk snapshot lookup or restore durations, and prompt snapshot write duration. Snapshot storage happens after prefill but before the first output; it contributes to end-to-end TTFT while remaining separate from `prefill_s`. |
 | `prefill_deltanet_s`, `prefill_attention_s`, `prefill_moe_s`, `prefill_lm_head_s` | Qwen3.6 accumulated operation timers during the fresh prompt forward. These operation timers can overlap or omit scheduling/transfer overhead and should not be summed as wall time. |
 | `prefill_shared_s`, `prefill_router_s` | Qwen3.6 shared-expert and router portions, included within `prefill_moe_s` (subsets, not additive categories). |
 | `first_sample_s` | Qwen3.6 time spent sampling the first generated token. |

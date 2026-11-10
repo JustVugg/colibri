@@ -2439,6 +2439,7 @@ class DispatcherTest(unittest.TestCase):
                 b"DONE " + request_id +
                 b" STAT 1 4.8 0 1.0 100 0 prefill_s=2.375000 reused_prompt_tokens=75"
                 b" tokenize_s=0.010000 prefix_match_s=0.002000 snapshot_restore_s=0.030000"
+                b" snapshot_store_s=0.040000"
                 b" prefill_deltanet_s=0.4 prefill_attention_s=0.2 prefill_moe_s=1.1"
                 b" prefill_shared_s=0.2 prefill_router_s=0.1 prefill_lm_head_s=0.3"
                 b" prefix_reuse_source=live_state first_sample_s=0.004000"
@@ -2454,6 +2455,7 @@ class DispatcherTest(unittest.TestCase):
         self.assertEqual(stats["tokenize_s"], 0.01)
         self.assertEqual(stats["prefix_match_s"], 0.002)
         self.assertEqual(stats["snapshot_restore_s"], 0.03)
+        self.assertEqual(stats["snapshot_store_s"], 0.04)
         self.assertEqual(stats["prefill_deltanet_s"], 0.4)
         self.assertEqual(stats["prefill_attention_s"], 0.2)
         self.assertEqual(stats["prefill_moe_s"], 1.1)

@@ -262,6 +262,7 @@ def summarize(results, elapsed, slo_first_output=None, slo_duration=None):
         ("successful_server_tokenize_seconds", ("tokenize_s",)),
         ("successful_server_prefix_match_seconds", ("prefix_match_s",)),
         ("successful_server_snapshot_restore_seconds", ("snapshot_restore_s",)),
+        ("successful_server_snapshot_store_seconds", ("snapshot_store_s",)),
         ("successful_server_prefill_deltanet_seconds", ("prefill_deltanet_s",)),
         ("successful_server_prefill_attention_seconds", ("prefill_attention_s",)),
         ("successful_server_prefill_moe_seconds", ("prefill_moe_s",)),
