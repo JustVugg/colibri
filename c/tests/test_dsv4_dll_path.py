@@ -135,6 +135,15 @@ class Dsv4DllPath(unittest.TestCase):
         self.assertIn(f"tried {BINARY.parent / self.dll.name}", log)
         self.assertIn("v4_gpu warning=backend-unavailable; continuing-CPU", log)
 
+    def test_relative_path_stays_under_engine(self):
+        # a relative path resolves against the engine's folder, as before, never the CWD
+        sub = self.installed.parent / "sub"
+        sub.mkdir(exist_ok=True)
+        shutil.copyfile(self.dll, sub / self.dll.name)
+        log = self.run_engine("sub\\" + self.dll.name, binary=self.installed)
+        self.assertIn(f"path={sub / self.dll.name}", log)
+        self.assertNotIn("backend-unavailable", log)
+
 
 if __name__ == "__main__":
     unittest.main()

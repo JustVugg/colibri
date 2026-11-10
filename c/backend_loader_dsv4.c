@@ -388,9 +388,10 @@ static struct {
 
 /* One-shot loader: mirror of coli_cuda_load(). A bare name is loaded from the
  * engine's OWN directory by absolute path, never from the CWD (classic DLL
- * hijacking). A name with a path in it (COLI_DSV4_DLL=C:\x\coli_cuda_dsv4_dg.dll
- * or C:/x/...) is the user's explicit choice: that file is loaded, never glued
- * onto the engine's folder. Either way its imports (the CUDA runtime) resolve
+ * hijacking); so is a relative path (sub\x.dll), as before. An absolute path
+ * (COLI_DSV4_DLL=C:\x\coli_cuda_dsv4_dg.dll, C:/x/..., \\server\share\...) is
+ * the user's explicit choice: that file is loaded, never glued onto the
+ * engine's folder. Either way its imports (the CUDA runtime) resolve
  * from the DLL's own folder, System32 and PATH, never the CWD: dsv4_cuda_load
  * takes the CWD out of the search order first (SetDllDirectoryA("")). */
 /* *present: whether the file exists at all, so a failure can say "not there"
@@ -400,7 +401,10 @@ static HMODULE dsv4_load_one(const char *name, int *present, char *dllpath, DWOR
     HMODULE dll = NULL;
     *present = 0;
     snprintf(dllpath, size, "%s", name);
-    if(strpbrk(name, "\\/:")){
+    /* absolute: a drive letter and a separator, or a UNC / \\?\ prefix; never CWD-relative */
+    int absolute = (name[0] && name[1] == ':' && (name[2] == '\\' || name[2] == '/'))
+                || ((name[0] == '\\' || name[0] == '/') && (name[1] == '\\' || name[1] == '/'));
+    if(absolute){
         /* GetFullPathNameA also turns '/' into '\', which LOAD_WITH_ALTERED_SEARCH_PATH needs */
         DWORD n = GetFullPathNameA(name, size, dllpath, NULL);
         if(n == 0 || n >= size){
