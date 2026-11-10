@@ -259,6 +259,18 @@ def load_scheduler(model_dir: Path):
     return FlowMatchEulerDiscreteScheduler.from_pretrained(str(model_dir / "scheduler"))
 
 
+def sample_sigmas(model_dir: Path, steps: int):
+    """A distilled checkpoint's own schedule (model_index.json "sample_sigmas", Qwen-Image-2.1-Turbo's
+    eight), passed to the pipeline as its sigmas at that many steps: the engine's rule
+    (qwenimage.c sched_sigmas). None otherwise: the scheduler's own linear spacing."""
+    try:
+        idx = json.loads((model_dir / "model_index.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    s = idx.get("sample_sigmas") if isinstance(idx, dict) else None
+    return [float(v) for v in s] if isinstance(s, list) and len(s) == steps else None
+
+
 def make_pipeline(model_dir: Path, processor, text_encoder=None, transformer=None, vae=None):
     from diffusers import QwenImage21Pipeline
 
@@ -523,6 +535,7 @@ def denoise(model_dir: Path, runs: list[dict], dtype: torch.dtype, dump: bool, r
                 final = pipe(prompt_embeds=run["prompt_embeds"][None].to(dtype),
                              latents=run["latents_init"][None].to(dtype),
                              width=width, height=height, num_inference_steps=steps, true_cfg_scale=1.0,
+                             sigmas=sample_sigmas(model_dir, steps),
                              output_type="latent", callback_on_step_end=rec.on_step_end,
                              return_dict=False)[0]
         finally:

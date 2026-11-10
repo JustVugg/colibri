@@ -955,6 +955,28 @@ d = [abs(x - y) for x, y in zip(a, b)]
 assert len(a) == len(b) and max(d) <= 2 and sum(t > 0 for t in d) <= len(d) // 1000, (max(d), sum(t > 0 for t in d))
 print(f"OK qwenimage chain picture: {sum(t > 0 for t in d)} of {len(d)} bytes differ from the CPU's, max {max(d)}")
 QIPY
+  # GGUFs (tools/make_qwenimage_gguf_tiny.py: unsloth's layout of the denoiser, K-quant types,
+  # a Qwen3-VL text encoder): the blocks' matrices go up as the file's blocks (fmt 100 + the
+  # ggml type, the chain's block GEMM), the picture against the CPU's
+  $PY tools/make_qwenimage_gguf_tiny.py qwenimage_tiny qwenimage_gguf_tiny
+  rm -rf qwenimage_gguf_tiny/gg
+  $PY tools/gguf_import.py qwenimage_gguf_tiny/dit.gguf qwenimage_gguf_tiny/gg --text-encoder qwenimage_gguf_tiny/te.gguf \
+    --vae qwenimage_tiny
+  COLI_IMG_ACT8=0 ./qwenimage --model qwenimage_gguf_tiny/gg --prompt "a red fox in the snow" \
+    --width 256 --height 256 --steps 2 --seed 1 --out qi-cpu.png
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_IMG_ACT8=0 ./qwenimage --model qwenimage_gguf_tiny/gg --prompt "a red fox in the snow" \
+    --width 256 --height 256 --steps 2 --seed 1 --out qi-vk.png 2> qi-vk-gen.err
+  grep -qa "matrices in the GGUF's blocks" qi-vk-gen.err || { cat qi-vk-gen.err; fail "qwenimage GGUF chain: no matrix kept in the file's blocks"; }
+  grep -qa 'qwenimage chain: [0-9]* steps' qi-vk-gen.err || { cat qi-vk-gen.err; fail "qwenimage GGUF chain: the chain never ran"; }
+  $PY - <<'QIPY'
+import sys; sys.path.insert(0, ".")
+import image_engine as e
+_, _, _, a = e.decode_png(open("qi-cpu.png", "rb").read())
+_, _, _, b = e.decode_png(open("qi-vk.png", "rb").read())
+d = [abs(x - y) for x, y in zip(a, b)]
+assert len(a) == len(b) and max(d) <= 2 and sum(t > 0 for t in d) <= len(d) // 1000, (max(d), sum(t > 0 for t in d))
+print(f"OK qwenimage GGUF chain picture: {sum(t > 0 for t in d)} of {len(d)} bytes differ from the CPU's, max {max(d)}")
+QIPY
 }
 
 family_deepseek() {
