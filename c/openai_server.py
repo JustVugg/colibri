@@ -7082,11 +7082,11 @@ class _Pending:
     keeps holding it until the engine says the turn is over. Dropping the entry instead
     would free the admission while the engine is still generating, and the next request
     would submit into a pipe nobody is reading."""
-    __slots__ = ("events", "logprob_channel", "failed", "progress_at", "decoding", "cancel_at")
+    __slots__ = ("events", "logprob_channel", "failed", "progress_at", "decoding_at", "cancel_at")
 
     def __init__(self, logprob_channel=False):
         self.progress_at = time.monotonic()
-        self.decoding = False   # a DATA frame came: the prompt is read, tokens follow
+        self.decoding_at = None   # the first DATA frame: the prompt is read, tokens follow
         self.cancel_at = None
         self.events = queue.Queue()
         self.logprob_channel = logprob_channel
@@ -7257,21 +7257,25 @@ class Engine:
 
     def stalled_reason(self):
         """A request with no frame for stall_timeout (decode_stall_timeout once it is
-        decoding), or no terminal frame cancel_timeout after CANCEL/STOP. Timed here, not
-        on stdout, so a blocked pipe write counts too."""
+        decoding), or no terminal frame cancel_timeout after CANCEL/STOP once it is
+        decoding. Before the first DATA frame an engine may read a CANCEL only when the
+        prompt is done, so the cancel deadline starts there. Timed here, not on stdout,
+        so a blocked pipe write counts too."""
         with self.pending_lock:
             if self._stall_error is not None:
                 return self._stall_error
             now = time.monotonic()
             for request_id, entry in self.pending.items():
-                if entry.cancel_at is not None and now - entry.cancel_at >= self.cancel_timeout:
+                decoding = entry.decoding_at is not None
+                if (entry.cancel_at is not None and decoding
+                        and now - max(entry.cancel_at, entry.decoding_at) >= self.cancel_timeout):
                     self._stall_error = f"engine cancellation timed out for request {request_id}"
                     return self._stall_error
-                limit = self.decode_stall_timeout if entry.decoding else self.stall_timeout
+                limit = self.decode_stall_timeout if decoding else self.stall_timeout
                 if limit and now - entry.progress_at >= limit:
                     self._stall_error = (f"engine sent nothing for request {request_id} "
                                          f"in {limit:g} s while "
-                                         f"{'decoding' if entry.decoding else 'reading the prompt'}")
+                                         f"{'decoding' if decoding else 'reading the prompt'}")
                     return self._stall_error
         return None
 
@@ -7410,7 +7414,8 @@ class Engine:
             entry = self.pending.get(request_id)
             if entry is not None:
                 entry.progress_at = time.monotonic()
-                entry.decoding = entry.decoding or decoding
+                if decoding and entry.decoding_at is None:
+                    entry.decoding_at = entry.progress_at
 
     def _dispatch_stdout(self):
         try:

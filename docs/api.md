@@ -828,8 +828,10 @@ sends one, a second or two apart on the slowest models. From then on
 turns it off), so an engine that freezes mid-answer while `/health` keeps
 answering is retired without any setting. Queue waiting is governed separately by
 `--queue-timeout`. `COLI_ENGINE_CANCEL_TIMEOUT` bounds the wait for a terminal frame
-after CANCEL or STOP (default `30` seconds, must be positive). All three settings
-must be finite.
+after CANCEL or STOP once the request is decoding (default `30` seconds, must be
+positive): from the first DATA frame on, every engine reads commands between
+tokens, while before it some read a CANCEL only when the prompt is done. All three
+settings must be finite.
 
 On expiry, admission pauses and the old process is killed and reaped before a
 replacement is loaded. All requests on that process fail; they are not replayed.
