@@ -684,7 +684,18 @@ static int q38cc_kv_up(const Q38CChain *ch, CcBuf *dst, size_t at, const float *
     free(h);
     return ok;
 }
-/* the K/V, index-key and pooled-key mirrors at the host's capacity */
+/* every attention layer's mirrors off the card (the host's K/V rows stay canonical) */
+static void q38cc_mirror_free(Q38CChain *ch, const Cfg *c) {
+    for (int i = 0; i < c->layers + (ch->mtp_on ? 1 : 0); i++) {
+        if (!q38cc_attn_at(c, i)) continue;
+        cc_free(ch->kc[i]); cc_free(ch->vc[i]); cc_free(ch->ik[i]); cc_free(ch->pk[i]);
+        ch->kc[i] = ch->vc[i] = ch->ik[i] = ch->pk[i] = NULL;
+        ch->kv_valid[i] = ch->pk_valid[i] = 0;
+    }
+    ch->cap = 0;
+}
+/* the K/V, index-key and pooled-key mirrors at the host's capacity, every layer's or none: a
+ * refused one frees the layers already placed, which the chain, off from then on, never uses */
 static int q38cc_mirror(Q38CChain *ch, Model *m) {
     Cfg *c = &m->c; int kvo = c->kv_heads * c->head_dim;
     int nbmax = m->kv_cap / (c->idx_ratio > 0 ? c->idx_ratio : 1) + 1;
@@ -697,7 +708,7 @@ static int q38cc_mirror(Q38CChain *ch, Model *m) {
             ch->vc[i] = cc_buf((size_t)kvo * m->kv_cap * (ch->kvh ? 2 : 4), CC_DEV);
             ch->ik[i] = cc_buf((size_t)c->idx_dim * m->kv_cap * 4, CC_DEV);
             ch->pk[i] = cc_buf((size_t)c->idx_dim * nbmax * 4, CC_DEV);
-            if (!ch->kc[i] || !ch->vc[i] || !ch->ik[i] || !ch->pk[i]) { ch->cap = 0; return 0; }
+            if (!ch->kc[i] || !ch->vc[i] || !ch->ik[i] || !ch->pk[i]) { q38cc_mirror_free(ch, c); return 0; }
         }
         ch->cap = m->kv_cap;
     }
@@ -3369,6 +3380,7 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
         (nlogits > 2 && !cc_reserve(&ch->outd, (size_t)nlogits * V * 4, CC_DOWN)) ||
         (mixed_h && !cc_reserve(&ch->find, (size_t)rows * H * 4, CC_DOWN))) {
         fprintf(stderr, "[chain] qwen38: device memory for %d rows refused; the per-matrix path\n", rows);
+        q38cc_mirror_free(ch, c);   /* the chain stays off (failed): its mirrors would hold the card until the process ends */
         ch->failed = 1;
         return 0;
     }
