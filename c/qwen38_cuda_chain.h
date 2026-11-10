@@ -322,7 +322,8 @@ static int q38cc_mats(Model *m, int i, Q38Weight **w, const char **nm) {
     return n;
 }
 /* The device memory the chain takes after the tier sized its experts, which q38_tier_start
- * offers the placer as a component of its own ("chain") so a GGUF's arena leaves it: the
+ * offers the placer as a component of its own ("chain", q38_tier_offer_chain) so the expert
+ * budget leaves it, a GGUF's arena and the FP8 tier's promotions alike: the
  * K/V, index-key and pooled-key mirrors at the context's capacity, the DeltaNet state and a
  * verify's copy of it, a chunk's scratch (q38cc_bufs) and the read-backs, and the matrices
  * the chain uploads itself (those the trunk's table does not offer: below its floor), a
