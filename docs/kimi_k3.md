@@ -314,6 +314,20 @@ slots in RAM, or parked on disk with `COLI_K3_CKPT_DIR`): an edited or follow-up
 prompt restores the deepest surviving checkpoint and re-prefills only the tail,
 instead of replaying the whole conversation through the SSM layers.
 
+Those checkpoints keep the recurrent state only: their rows must still be in the slot. The prefix
+store (`prefix_store.h`, on unless `COLI_PREFIX_STORE=0` or `COLI_KV_PREFIX=0`) keeps every prompt
+read with its rows: the MLA layers' latent and rope rows and indexer keys in blocks of 256 tokens
+named by their tokens, shared by every prompt that starts with them, and checkpoints of the KDA
+layers' states and convolution windows (about 434 MB each on the released checkpoint) where a
+prompt's messages start (the token after a `<|end_of_msg|>`) and where a turn ends. A new
+conversation on the same system prompt, or a conversation back after another took the slot or on
+another slot, reads only what follows the deepest place it starts with. The budget
+(`COLI_PREFIX_STORE_MB`, a quarter of the free RAM up to 4 GiB) and a floor of free RAM decide how
+many checkpoints stay. `tests/test_kimi_k3_prefix_store.py` (in `make kimi-k3-tiny-check`, K3 and
+K3.1) holds every request that took the store to a fresh engine reading the same prompt with the
+store off, each step's top five logits to the last digit; `K3_PS_BACKEND=vulkan` the same on the
+dense chain. The released checkpoint has not run it: it does not fit the machines here.
+
 ## Vulkan (`make VK=1 kimi_k3`)
 
 Run with `COLI_VULKAN=1`, a `VK=1` build puts the routed experts on the shared Vulkan

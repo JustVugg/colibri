@@ -621,6 +621,7 @@ static float g_k3_topp=0.f;              /* K3_TOPP: routed-expert top-p pruning
 enum { K3_CKPT_MAX = 8 };
 static size_t k3_ckpt_blob_floats(const Model *m); /* def. with the ckpt block */
 static double k3_ckpt_reserve_gb(const Model *m, int slots);
+static size_t k3_ps_plan(void);           /* the prefix store's budget (prefix_store.h), planned with the RAM */
 static double g_k3_ram_later;            /* the KV cache and checkpoints the serve allocates after the plan (bytes) */
 static int g_k3_ckpt_slots=0;            /* COLI_K3_CKPT: recurrent-state checkpoint
                                           * slots. STRICTLY OPT-IN, 0 = off (default,
@@ -2438,7 +2439,7 @@ static int k3_tier_open(Model *m, VktFmt gu, VktFmt dn, VktFmt *lgu, VktFmt *ldn
                   .max_rows=K3_VK_ROWS*c->topk,
                   .ram_reserve=(size_t)(m->e_slot+8192)*(size_t)cap*(size_t)nmoe,
                   .ram_floor=(size_t)(m->e_slot+8192)*(size_t)c->topk*(size_t)nmoe,.ram_given=k3_vk_ram_given,
-                  .ram_later=(size_t)g_k3_ram_later,
+                  .ram_later=(size_t)g_k3_ram_later+k3_ps_plan(),
                   .dense_bytes=dense_bytes,.chain_bytes=chain_bytes,
                   .in_ram=k3_vk_in_ram,.ram_ctx=m,
                   .load=k3_vk_load,.release=k3_vk_unhold,.load_ctx=m,.load_batch=k3_vk_load_batch};
@@ -3315,7 +3316,23 @@ static int sample_prob_desc(const void *a,const void *b){
     float d=((const SampleProb*)b)->p-((const SampleProb*)a)->p;
     return d>0?1:d<0?-1:0;
 }
+/* COLI_LOGIT_DUMP=1: each served step's top five id:logit to stderr, as sample.h's pick_tok writes them
+ * (comparing two configurations on the same context: a stored prefix against a fresh read) */
+static void serve_logit_dump(const float *lo, int V){
+    static int dump=-1;
+    if(dump<0) dump=getenv("COLI_LOGIT_DUMP")?1:0;
+    if(!dump) return;
+    int id[5]={-1,-1,-1,-1,-1}; float v[5]={-3e38f,-3e38f,-3e38f,-3e38f,-3e38f};
+    for(int t=0;t<V;t++){
+        const float x=lo[t];
+        for(int k=0;k<5;k++) if(x>v[k]){ for(int j=4;j>k;j--){ v[j]=v[j-1]; id[j]=id[j-1]; } v[k]=x; id[k]=t; break; }
+    }
+    fprintf(stderr,"[LOGITS]");
+    for(int k=0;k<5;k++) fprintf(stderr," %d:%.6f",id[k],v[k]);
+    fprintf(stderr,"\n");
+}
 static int sample_tok(const float *lo, int V, float temp, float top_p){
+    serve_logit_dump(lo, V);
     if(temp<=0.f) return argmax_first(lo, V);
     SampleProb *rank=malloc((size_t)V*sizeof(SampleProb)); float mx=lo[0];
     if(!rank){ fprintf(stderr,"OOM sampling\n"); exit(1); }
@@ -4142,6 +4159,143 @@ typedef struct { int chat, thinking, sp[4]; } K3ReqChat;
  * read-out. 1 with the prompt's ids and the logits after it; 0 when the request ended
  * here, its ERROR written; -1 when the input is gone. poll: read CANCEL during the
  * prefill (a lone serve), NULL to leave every command for later (serve_mux). */
+/* ---- every prompt read, kept by content for later requests (prefix_store.h) -----------------
+ * The KDA recurrence cannot be wound back: the slot resumes only from the end of what it holds, or
+ * (COLI_K3_CKPT) from a photo of the state whose rows must still be in the slot. An agent's new
+ * conversation on the same system prompt read its whole prompt again; so did a conversation back
+ * after another took the slot, or on another slot. The store keeps the MLA layers' latent and rope
+ * rows and indexer keys in blocks named by their tokens, shared by every prompt that starts with
+ * them, and checkpoints of the KDA layers' states and convolution windows (about 434 MB on the
+ * released checkpoint) where a prompt's messages start (after a <|end_of_msg|>) and where a turn
+ * ends. A request takes the deepest checkpoint its prompt starts
+ * with when it reaches further than the slot. COLI_PREFIX_STORE=0 or COLI_KV_PREFIX=0 off;
+ * COLI_PREFIX_STORE_MB, COLI_PREFIX_STORE_BLOCK as on qwen36. Not for a pin or a read-out. */
+#include "prefix_store.h"
+static ColiPrefixStore g_k3_ps;
+static int g_k3_ps_init;
+static int k3_ps_on(void){
+    if(!g_k3_ps_init){
+        const char *e=getenv("COLI_KV_PREFIX");
+        g_k3_ps_init=1;
+        coli_ps_init_env(&g_k3_ps,e&&*e=='0',k3_mem_avail()*1024.0);
+    }
+    return g_k3_ps.on;
+}
+/* the store's budget, decided when the engine plans its RAM: a tier's host pool leaves it (ram_later) */
+static size_t k3_ps_plan(void){ k3_ps_on(); return g_k3_ps.on?g_k3_ps.budget:0; }
+/* the MLA layers' latent and rope rows and indexer keys, by position */
+static int k3_ps_parts(Model *m, ColiPsPart *parts){
+    Cfg *c=&m->c; int n=0;
+    for(int i=0;i<c->n_layers;i++){
+        if(m->L[i].kda) continue;
+        parts[n++]=(ColiPsPart){m->Lc?m->Lc[i]:NULL,(size_t)c->kv_lora*sizeof(float),m->max_t,1,0,1};
+        parts[n++]=(ColiPsPart){m->Rc?m->Rc[i]:NULL,(size_t)c->qk_rope*sizeof(float),m->max_t,1,0,1};
+        if(c->index_hd>0&&c->idx_type[i])
+            parts[n++]=(ColiPsPart){m->L[i].m.Ic,(size_t)c->index_hd*sizeof(float),m->max_t,1,0,1};
+    }
+    return n;
+}
+typedef struct { float **ks, **cq, **ck, **cv; int n_layers; } K3PsState;
+static void k3_ps_state_free(void *v){
+    K3PsState *x=(K3PsState*)v;
+    if(!x) return;
+    for(int i=0;i<x->n_layers;i++){
+        if(x->ks) free(x->ks[i]); if(x->cq) free(x->cq[i]);
+        if(x->ck) free(x->ck[i]); if(x->cv) free(x->cv[i]);
+    }
+    free(x->ks); free(x->cq); free(x->ck); free(x->cv); free(x);
+}
+/* the KDA layers' states and convolution windows, between the Model and a checkpoint */
+static K3PsState *k3_ps_state_save(Model *m, size_t *bytes){
+    Cfg *c=&m->c; const int L=c->n_layers;
+    const size_t ks=(size_t)c->kda_heads*c->kda_hd*c->kda_hd*sizeof(float), cw=(size_t)c->kda_proj*c->conv_k*sizeof(float);
+    K3PsState *x=(K3PsState*)calloc(1,sizeof *x);
+    if(!x) return NULL;
+    x->n_layers=L;
+    int ok=(x->ks=(float**)calloc((size_t)L,sizeof(float*)))&&(x->cq=(float**)calloc((size_t)L,sizeof(float*)))&&
+           (x->ck=(float**)calloc((size_t)L,sizeof(float*)))&&(x->cv=(float**)calloc((size_t)L,sizeof(float*)));
+    *bytes=sizeof *x;
+    for(int i=0;ok&&i<L;i++){
+        if(!m->L[i].kda) continue;
+        ok=(x->ks[i]=(float*)malloc(ks))&&(x->cq[i]=(float*)malloc(cw))&&(x->ck[i]=(float*)malloc(cw))&&(x->cv[i]=(float*)malloc(cw));
+        if(!ok) break;
+        memcpy(x->ks[i],m->kstate[i],ks); memcpy(x->cq[i],m->cwq[i],cw);
+        memcpy(x->ck[i],m->cwk[i],cw);    memcpy(x->cv[i],m->cwv[i],cw);
+        *bytes+=ks+3*cw;
+    }
+    if(!ok){ k3_ps_state_free(x); return NULL; }
+    return x;
+}
+/* ids[0, P) as the Model holds them now, with its KDA state (the chains' newest first) */
+static void k3_ps_save(Model *m, const int *ids, int P){
+    if(!k3_ps_on()||P<g_k3_ps.B||m->kvp.tainted||m->kvp.len!=P||!m->Lc) return;
+#ifdef COLI_VULKAN
+    k3c_sync_host(m);
+#endif
+#ifdef COLI_CUDA
+    k3u_sync_host(m);
+#endif
+    ColiPsPart *parts=(ColiPsPart*)malloc((size_t)3*m->c.n_layers*sizeof *parts+1);
+    if(!parts) return;
+    const int np=k3_ps_parts(m,parts);
+    size_t sb=0;
+    K3PsState *st=k3_ps_state_save(m,&sb);
+    if(st) coli_ps_save(&g_k3_ps,ids,P,parts,np,st,sb,k3_ps_state_free,k3_mem_avail()*1024.0);
+    free(parts);
+}
+/* The deepest prefix the store holds of ids[0, np), when it reaches past `held` positions: its rows
+ * and state put back, the record and the chains told (the caches already sized for the request).
+ * The positions now held; 0 when nothing. */
+static int k3_ps_take(Model *m, const int *ids, int np, int held){
+    if(!k3_ps_on()||np<2||!m->Lc) return 0;
+    Cfg *c=&m->c;
+    ColiPsPart *parts=(ColiPsPart*)malloc((size_t)3*c->n_layers*sizeof *parts+1);
+    if(!parts) return 0;
+    const int nparts=k3_ps_parts(m,parts);
+    if(!coli_ps_layout(&g_k3_ps,parts,nparts)){ free(parts); return 0; }
+    ColiPsHit h;
+    const int P=coli_ps_lookup(&g_k3_ps,ids,np,np-1,1,&h);
+    const K3PsState *x=P>0&&h.ck>=0?(const K3PsState*)g_k3_ps.ck[h.ck].state:NULL;
+    if(P<=held+coli_ps_min_gain(&g_k3_ps)||!x||x->n_layers!=c->n_layers||!coli_ps_parts_hold(parts,nparts,P)){
+        coli_ps_hit_free(&h); free(parts); return 0;
+    }
+    coli_ps_load(&g_k3_ps,&h,parts,nparts);
+    free(parts);
+    const size_t ks=(size_t)c->kda_heads*c->kda_hd*c->kda_hd*sizeof(float), cw=(size_t)c->kda_proj*c->conv_k*sizeof(float);
+    for(int i=0;i<c->n_layers;i++){
+        if(!m->L[i].kda||!x->ks[i]) continue;
+        memcpy(m->kstate[i],x->ks[i],ks); memcpy(m->cwq[i],x->cq[i],cw);
+        memcpy(m->cwk[i],x->ck[i],cw);    memcpy(m->cwv[i],x->cv[i],cw);
+    }
+    kv_prefix_clear(&m->kvp);
+    kv_prefix_record(&m->kvp,ids,0,P);
+#ifdef COLI_VULKAN
+    k3c_host_rewrote(m);   /* the host's rows and state are the conversation's: the chains read them again */
+#endif
+#ifdef COLI_CUDA
+    k3u_host_rewrote(m);
+#endif
+    if(getenv("K3_PREFIX_LOG")||getenv("COLI_PREFIX_LOG")){
+        fprintf(stderr,"[PREFIX] %d of %d prompt tokens from the store (%d blocks of %d and a checkpoint; the slot held %d)\n",
+                P,np,h.depth,g_k3_ps.B,held);
+        fflush(stderr);
+    }
+    coli_ps_hit_free(&h);
+    return P;
+}
+/* where a prompt read from `from` keeps checkpoints (coli_ps_marks_ex): where its messages start,
+ * the token after one's <|end_of_msg|> (XTML opens tags inside a message too) */
+static int k3_ps_marks(const Tok *T, const int *ids, int np, int from, int *marks){
+    static int eom=-2;
+    if(eom==-2){
+        eom=-1;
+        for(int k=0;k<T->nsp&&eom<0;k++)
+            if(T->sp[k].len==14&&!memcmp(T->sp[k].str,"<|end_of_msg|>",14)) eom=T->sp[k].id;
+    }
+    if(eom<0||!k3_ps_on()) return 0;
+    return coli_ps_marks_ex(ids,np,from,g_k3_ps.B,&eom,1,1,marks);
+}
+
 static int k3_serve_start(Model *m, Tok *T, ServeReq *q, int **ids_out, int *np_out, float **lo_out,
                           K3ReqClock *clk, K3ReqChat *chatinfo, K3ServePoll *poll){
     int cap=65536, *ids=malloc((size_t)cap*sizeof(int)), np=0;
@@ -4221,6 +4375,10 @@ static int k3_serve_start(Model *m, Tok *T, ServeReq *q, int **ids_out, int *np_
     }
     k3_park_decide(m,ids,np,np+q->max_tok+8);   /* a conversation the last request parked: back, kept or dropped */
     int reuse=prepare_request_state(m,ids,np,np+q->max_tok+8);
+    /* the prompt the store holds further than the slot does: another conversation's on the same
+     * system prompt, this one's before another took the slot or on another slot (k3_ps_take) */
+    int ps_got=0;
+    if(q->logprobs==0&&!q->pin){ ps_got=k3_ps_take(m,ids,np,reuse); if(ps_got){ reuse=ps_got; g_k3_restored_logit=NULL; } }
     /* Il riporto per il primo token fresco: i logit salvati con la foto che si
      * e appena rimessa. Senza foto resta spento e la prima posizione esce con
      * " nan 0", come deve. */
@@ -4235,7 +4393,7 @@ static int k3_serve_start(Model *m, Tok *T, ServeReq *q, int **ids_out, int *np_
             g_echo_carry_ok=1;
         }
     }
-    if(getenv("K3_PREFIX_LOG")){
+    if(getenv("K3_PREFIX_LOG")&&!ps_got){
         /* Report the decision either way, with the state behind a "no".
          * "It did not get faster" is otherwise the same observation as
          * "reuse is not wired up" — for a user as much as for a test. */
@@ -4262,11 +4420,16 @@ static int k3_serve_start(Model *m, Tok *T, ServeReq *q, int **ids_out, int *np_
     /* `i` is the ABSOLUTE position: attention and the MLA Lc/Rc slots are
      * position-indexed, so the loop starts at `reuse`, not at 0. */
     int prefill_cancelled=0;
-    for(int i=reuse;i<np;i+=chunk){
-        int C=np-i<chunk?np-i:chunk;
+    /* in pieces where its messages start, the state there kept for later requests (k3_ps_save) */
+    int marks[2], nm=q->logprobs==0&&!q->pin?k3_ps_marks(T,ids,np,reuse,marks):0, mk=0;
+    for(int i=reuse;i<np;){
+        const int end=mk<nm?marks[mk]:np;
+        int C=end-i<chunk?end-i:chunk;
         free(lo); lo=step_chunk_ex(m,ids+i,i,C,poll?k3_serve_poll_cancel:NULL,poll,
                                    &prefill_cancelled);
         if(prefill_cancelled) break;
+        i+=C;
+        if(mk<nm&&i==marks[mk]){ k3_ps_save(m,ids,i); mk++; }
     }
     if(prefill_cancelled){
         free(lo); k3_cancel_unpublished_state(m); free(ids);
@@ -4348,10 +4511,17 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
         if(s+1<q->max_tok){ lo=step_chunk(m,&tk,np+s,1); forwards++; }
     }
     if(poll.fatal){ free(lo); free(ids); return -1; }
-    free(lo); free(ids);
     /* End of the reply: the next turn's transcript extends THIS state, and an
      * edited retry of this turn restores the prompt-boundary photo above. */
     k3_ckpt_save(m, NULL);
+    /* the conversation as the turn left it, for its next turn after another took the slot (one of
+     * COLI_PARK_MIN tokens at least) */
+    if(q->logprobs==0&&!q->pin){
+        const char *mn=getenv("COLI_PARK_MIN");
+        const int least=mn&&atoi(mn)>0?atoi(mn):1024;
+        if(m->kvp.len>=least) k3_ps_save(m,m->kvp.fed,m->kvp.len);
+    }
+    free(lo); free(ids);
     double dt=now_s()-t0, decode=now_s()-tg;
     uint64_t hits=m->hits-hit0, misses=m->miss-miss0, total=hits+misses;
     ColiServeDone done={gen,decode>0?gen/decode:0.0,
@@ -4410,6 +4580,11 @@ static void k3_mux_finish(Model *m, K3MuxReq *r, int slot){
     if(r->cancel) r->limited=0;
     /* the end of the reply: the next turn extends THIS state (a photo when they are on) */
     k3_mux_bind(m,slot); k3_ckpt_save(m,NULL);
+    if(r->q.logprobs==0&&!r->q.pin){   /* the slot's conversation as the turn left it (k3_ps_save) */
+        const char *mn=getenv("COLI_PARK_MIN");
+        const int least=mn&&atoi(mn)>0?atoi(mn):1024;
+        if(m->kvp.len>=least) k3_ps_save(m,m->kvp.fed,m->kvp.len);
+    }
     double dt=now_s()-r->clk.t0, decode=now_s()-r->tg;
     uint64_t hits=m->hits-r->clk.hit0, misses=m->miss-r->clk.miss0, total=hits+misses;
     ColiServeDone done={r->gen,decode>0?r->gen/decode:0.0,total?100.0*hits/total:0.0,rss_gb(),r->np,r->limited};
@@ -4554,12 +4729,12 @@ static void serve_loop(Model *m, Tok *T){
     coli_serve_stdio_init();
     coli_serve_write_ready(stdout,rss_gb());
     serve_emap(m);                        /* after READY and STAT: the boot reader discards what precedes them */
-    if(g_k3_mux_slots>1){ serve_mux(m,T); return; }
+    if(g_k3_mux_slots>1){ serve_mux(m,T); coli_ps_report(&g_k3_ps); return; }
     for(;;){
         ServeReq q={0}; int r;
         do r=serve_read_req(stdin,stdout,&q,NULL); while(r==0);
-        if(r<0) return;
-        if(r==2){ int fatal=serve_one(m,T,&q); free(q.payload); if(fatal<0) return; serve_emap(m); }
+        if(r<0){ coli_ps_report(&g_k3_ps); return; }
+        if(r==2){ int fatal=serve_one(m,T,&q); free(q.payload); if(fatal<0){ coli_ps_report(&g_k3_ps); return; } serve_emap(m); }
     }
 }
 

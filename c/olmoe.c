@@ -2919,6 +2919,106 @@ static int olm_prompt_poll(ColiPromptBreak *b) {
     return b->control;
 }
 
+/* ---- every prompt read, kept by content for later requests (prefix_store.h) -----------------
+ * Attention alone resumes where a prompt leaves the slot's state, but only from what that one slot
+ * holds: an agent with two system prompts wrote one over the other, and a conversation the gateway
+ * sends to another slot read everything. The store keeps every layer's K/V rows in blocks named by
+ * their tokens, shared by every prompt that starts with them, and the rows past a prompt's last
+ * whole block where its messages start (<|system|>, <|user|>, <|assistant|>) and where a turn
+ * ends. A request takes the deepest prefix the store holds when it reaches further than its slot.
+ * COLI_PREFIX_STORE=0 or COLI_KV_PREFIX=0 off; COLI_PREFIX_STORE_MB, COLI_PREFIX_STORE_BLOCK as on
+ * qwen36. Not for a read-out (logprobs) or a pin, and not while a chain runs the layers. */
+#include "prefix_store.h"
+static ColiPrefixStore g_olm_ps;
+static int g_olm_ps_init;
+/* Not while a chain runs the layers: OLMoE-1B-7B on the CUDA chain reads a 1,856-token prompt in
+ * 0.15 s, and the store's copies of its float rows (256 KB a token) to the host and back cost more
+ * (a new conversation 0.15 -> 0.31 s, a prompt that keeps checkpoints 0.15 -> 0.43 s, RTX PRO 4000);
+ * on the CPU, where the same prompt takes 10.2 s, it is 0.73 s from the store. */
+static int olm_ps_chain(void) {
+    int chain = 0;
+#ifdef COLI_VULKAN
+    chain |= g_vk_chain != 0;
+#endif
+#ifdef COLI_CUDA
+    chain |= g_occ && g_occ->ok && !g_occ->failed;
+#endif
+    return chain;
+}
+static int olm_ps_on(void) {
+    if (!g_olm_ps_init) { g_olm_ps_init = 1; coli_ps_init_env(&g_olm_ps, kv_prefix_off() || olm_ps_chain(), compat_mem_available_gb() * 1024.0); }
+    return g_olm_ps.on && !olm_ps_chain();
+}
+static int olm_ps_parts(Model *m, ColiPsPart *parts) {
+    Cfg *c = &m->c; const size_t row = (size_t)c->head_dim * sizeof(float), hs = (size_t)m->max_t * row;
+    int n = 0;
+    for (int i = 0; i < c->n_layers; i++) {
+        parts[n++] = (ColiPsPart){m->K[i], row, m->max_t, c->n_heads, hs, 1};
+        parts[n++] = (ColiPsPart){m->V[i], row, m->max_t, c->n_heads, hs, 1};
+    }
+    return n;
+}
+static void olm_ps_none(void *v) { free(v); }
+/* ids[0, P) as the Model holds them now (the chains' rows to the host first); a checkpoint with no
+ * state keeps the rows past the last whole block */
+static void olm_ps_save(Model *m, const int *ids, int P) {
+    if (!olm_ps_on() || P < g_olm_ps.B || m->kvp.tainted || m->kv_len != P || !m->K || !m->V) return;
+#ifdef COLI_VULKAN
+    olc_host_all(m, m->kv_len);
+#endif
+#ifdef COLI_CUDA
+    occ_host_all(m, m->kv_len);
+#endif
+    ColiPsPart *parts = (ColiPsPart *)malloc((size_t)2 * m->c.n_layers * sizeof *parts + 1);
+    void *mark = malloc(1);
+    if (parts && mark) coli_ps_save(&g_olm_ps, ids, P, parts, olm_ps_parts(m, parts), mark, 1, olm_ps_none, compat_mem_available_gb() * 1024.0);
+    else free(mark);
+    free(parts);
+}
+/* The deepest prefix the store holds of ids[0, np), when it reaches past `held` positions: its rows
+ * put back, the record and the chains told. The positions now held; 0 when nothing. */
+static int olm_ps_take(Model *m, const int *ids, int np, int held) {
+    if (!olm_ps_on() || np < 2 || !m->K || !m->V) return 0;
+    ColiPsPart *parts = (ColiPsPart *)malloc((size_t)2 * m->c.n_layers * sizeof *parts + 1);
+    if (!parts) return 0;
+    const int nparts = olm_ps_parts(m, parts);
+    if (!coli_ps_layout(&g_olm_ps, parts, nparts)) { free(parts); return 0; }
+    ColiPsHit h;
+    const int P = coli_ps_lookup(&g_olm_ps, ids, np, np - 1, 0, &h);
+    if (P <= held + coli_ps_min_gain(&g_olm_ps) || !coli_ps_parts_hold(parts, nparts, P)) { coli_ps_hit_free(&h); free(parts); return 0; }
+    coli_ps_load(&g_olm_ps, &h, parts, nparts);
+    free(parts);
+    m->kv_len = P;
+    kv_prefix_clear(&m->kvp);
+    kv_prefix_record(&m->kvp, ids, 0, P);
+#ifdef COLI_VULKAN
+    olc_host_wrote(m, ids, P);   /* the host's rows are canonical below P: every mirror goes up again */
+#endif
+#ifdef COLI_CUDA
+    occ_host_wrote(m, ids, P);
+#endif
+    if (getenv("COLI_PREFIX_LOG")) {
+        fprintf(stderr, "[PREFIX] %d of %d prompt tokens from the store (%d blocks of %d%s; the slot held %d)\n",
+                P, np, h.depth, g_olm_ps.B, h.ck >= 0 ? " and the rows past them" : "", held);
+        fflush(stderr);
+    }
+    coli_ps_hit_free(&h);
+    return P;
+}
+/* where a prompt read from `from` keeps checkpoints (coli_ps_marks): where its messages start */
+static int olm_ps_marks(const Tok *T, const int *ids, int np, int from, int *marks) {
+    static int opens[3], nopen = -1;
+    if (nopen < 0) {
+        static const char *names[] = {"<|system|>", "<|user|>", "<|assistant|>"};
+        nopen = 0;
+        for (size_t o = 0; o < sizeof names / sizeof *names; o++)
+            for (int k = 0; k < T->nsp; k++)
+                if (T->sp[k].len == (int)strlen(names[o]) && !memcmp(T->sp[k].str, names[o], (size_t)T->sp[k].len)) { opens[nopen++] = T->sp[k].id; break; }
+    }
+    if (!nopen || !olm_ps_on()) return 0;
+    return coli_ps_marks(ids, np, from, g_olm_ps.B, opens, nopen, marks);
+}
+
 static int olm_serve_start(Model *m, Tok *T, SReq *q, int ctx_cap, int **ids_out, int *np_out,
                            float **logit_out, OlmReqClock *clk, int lone) {
     Cfg *c = &m->c;
@@ -2999,6 +3099,10 @@ static int olm_serve_start(Model *m, Tok *T, SReq *q, int ctx_cap, int **ids_out
             m->kv_len = d; reuse = d; partial = 1;
         }
     }
+    /* the prompt the store holds further than the slot does: another system prompt's, another
+     * slot's (olm_ps_take) */
+    const int ps_plain = q->logprobs == 0 && !q->pin && !kv_prefix_off();
+    if (ps_plain) { int got = olm_ps_take(m, ids, np, reuse); if (got) { reuse = got; partial = 0; g_pin_use_logit = 0; } }
     if (!reuse) kv_prefix_clear(&m->kvp);
     if (getenv("COLI_PREFIX_LOG")) {
         if (reuse)
@@ -3030,15 +3134,29 @@ static int olm_serve_start(Model *m, Tok *T, SReq *q, int ctx_cap, int **ids_out
         /* a chain is not stopped inside its forward: the prompt goes in segments, checked
          * between them, each a whole step (kv_len and the record follow it) */
         int seg = coli_prompt_segment_rows(2048);
+        int marks[2], nm = ps_plain ? olm_ps_marks(T, ids, np, reuse, marks) : 0, mk = 0;   /* each kept (olm_ps_save) */
         for (int at = reuse; at < np; ) {
             if (coli_prompt_poll(&brk)) { free(logit); logit = NULL; break; }
-            int n = np - at < seg ? np - at : seg;
+            if (mk < nm && at == marks[mk]) { olm_ps_save(m, ids, at); mk++; }
+            const int end = mk < nm ? marks[mk] : np;
+            int n = end - at < seg ? end - at : seg;
             float *next = step(m, ids + at, n, at);
             free(logit); logit = next; at += n;
         }
     } else {
         if (lone && q->logprobs == 0) g_coli_prompt_break = &brk;
-        logit = step(m, ids + reuse, np - reuse, reuse);
+        int at = reuse;
+        if (ps_plain) {   /* in pieces where its messages start, each kept (olm_ps_save) */
+            int marks[2], nm = olm_ps_marks(T, ids, np, reuse, marks);
+            for (int k = 0; k < nm && at >= 0; k++) {
+                float *lo = step(m, ids + at, marks[k] - at, at);
+                if (!lo) { at = -1; break; }
+                free(lo);
+                at = marks[k];
+                olm_ps_save(m, ids, at);
+            }
+        }
+        logit = at < 0 ? NULL : step(m, ids + at, np - at, at);
         g_coli_prompt_break = NULL;
     }
     if (!logit) {
@@ -3116,6 +3234,13 @@ static int serve_one_turn(Model *m, Tok *T, SReq *q, int ctx_cap) {
     printf("PROF %.6f %d %d %.6f 0.0 %.6f %.6f %.6f %lld\n", dt, np, gen, disk_s, matmul_s,
            g_prof_attn_s - attn0, g_prof_head_s - head0, g_prof_forwards - fwd0);
     fflush(stdout);
+    /* the conversation as the turn left it, for its next turn after another took the slot (one of
+     * COLI_PARK_MIN tokens at least) */
+    if (q->logprobs == 0 && !q->pin) {
+        const char *mn = getenv("COLI_PARK_MIN");
+        const int least = mn && atoi(mn) > 0 ? atoi(mn) : 1024;
+        if (m->kv_len >= least && m->kvp.len == m->kv_len) olm_ps_save(m, m->kvp.fed, m->kv_len);
+    }
 #ifdef COLI_VULKAN
     olmoe_vk_report(); vkt_report("turn", m->hits, m->miss); olc_report(m);
 #endif
@@ -3369,14 +3494,14 @@ static void serve_loop(Model *m, Tok *T, int ctx_cap) {
     coli_serve_write_ready(stdout, rss_gb());
     serve_hwinfo(m);
     serve_tiers_emap(m);
-    if (g_olm_mux_slots > 1) { serve_mux(m, T, ctx_cap); return; }
+    if (g_olm_mux_slots > 1) { serve_mux(m, T, ctx_cap); coli_ps_report(&g_olm_ps); return; }
     for (;;) {
-        while (!g_qn) if (serve_read_cmd(stdin, stdout, NULL) < 0) return;
+        while (!g_qn) if (serve_read_cmd(stdin, stdout, NULL) < 0) { coli_ps_report(&g_olm_ps); return; }
         SReq q = g_q[0];
         memmove(g_q, g_q + 1, (size_t)(--g_qn) * sizeof(SReq));
         int fatal = serve_one(m, T, &q, ctx_cap);
         free(q.payload);
-        if (fatal < 0) return;
+        if (fatal < 0) { coli_ps_report(&g_olm_ps); return; }
         /* Resend the grid after EVERY turn, not only after READY: at boot the
          * expert cache is empty by definition, and that cold snapshot stayed
          * the only one the dashboard ever saw -- all grey, RAM 0, everything
