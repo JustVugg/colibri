@@ -709,6 +709,21 @@ static size_t q36cc_conv_avail(Q36CChain *ch) {
     const size_t fr = q36cc_free_bytes(ch);
     return cap >= 0 && fr > ((size_t)cap << 20) ? (size_t)cap << 20 : fr;
 }
+/* a tensor's device address, for the tier's give-back by page */
+static int q36cc_tensor_addr(const ColiCudaTensor *t, uintptr_t *at) {
+    const void *w; const float *sc;
+    if (!cc_tensor_dev(t, &w, &sc, NULL) || !w) return 0;
+    *at = (uintptr_t)w;
+    return 1;
+}
+/* the device's free memory up to `need`, from the expert tier where it lacks: what the driver
+ * releases is measured again after each give-back (a few rounds, while each frees something) */
+static void q36cc_room_from_tier(Q36CChain *ch, size_t need) {
+    for (int round = 0; round < 4; round++) {
+        const size_t fr = q36cc_free_bytes(ch);
+        if (fr >= need || !qt_chain_give_back(need - fr, q36cc_tensor_addr)) return;
+    }
+}
 /* room for `bytes` more (and 512 MiB): the least recently used places' KV mirrors go first */
 static int q36cc_conv_room(Q36CChain *ch, Model *m, int keep, size_t bytes) {
     const size_t margin = (size_t)512 << 20;
@@ -719,9 +734,9 @@ static int q36cc_conv_room(Q36CChain *ch, Model *m, int keep, size_t bytes) {
             if (j == keep || v->used == ch->conv_clock || !v->cap || j == ch->conv_cur) continue;
             if (k < 0 || v->used < ch->conv[k].used) k = j;
         }
-        if (k < 0) {   /* no other place's mirrors left to take: the expert tier's memory, once */
-            const size_t fr = q36cc_conv_avail(ch);
-            return fr >= bytes + margin || (qt_chain_give_back(bytes + margin - fr) && q36cc_conv_avail(ch) >= bytes + margin);
+        if (k < 0) {   /* no other place's mirrors left to take: the expert tier's memory */
+            if (q36cc_conv_avail(ch) < bytes + margin) q36cc_room_from_tier(ch, bytes + margin);
+            return q36cc_conv_avail(ch) >= bytes + margin;
         }
         Q36ccConv *v = &ch->conv[k];
         for (int i = 0; i < m->c.n_layers; i++) {
@@ -1863,8 +1878,7 @@ static void q36cc_mirror_room(Q36CChain *ch, Model *m, int cap, size_t held) {
     size_t need = want - held + Q36CC_KV_MARGIN;
     if (CH > ch->rows) need += (size_t)(CH - ch->rows) * q36cc_row_bytes(m);
     if (!ch->dm_stage && !ch->dm_stage_off) need += q36cc_stage_est(ch, m);
-    const size_t fr = q36cc_free_bytes(ch);
-    if (fr < need) qt_chain_give_back(need - fr);
+    q36cc_room_from_tier(ch, need);
 }
 
 /* Every layer for S rows from host rows xh, the last nlogits rows' logits into `logit`;

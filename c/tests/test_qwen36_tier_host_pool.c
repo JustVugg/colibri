@@ -10,7 +10,8 @@
  * (pairs, gate, up and down in one block, a scale a row) join the pool as they are (#2734), a slot
  * whose matrices lie apart does not; why the pool is off is named. Fake CUDA backend (its
  * page-locks counted), no GPU, no toolkit. The tier gives the chain's KV mirrors memory back
- * from its coldest residents (qt_chain_give_back). */
+ * (qt_chain_give_back): its coldest residents, or with their addresses the residents of its
+ * coldest pages, whole. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,6 +35,17 @@ static int resident(int l, int e) { int r; pthread_mutex_lock(&G.mx); r = qs(l, 
 static int pool_is_rest(void) {
     for (int l = 0; l < NL; l++) for (int e = 0; e < NE; e++) if (pooled(l, e) == resident(l, e)) return 0;
     return 1;
+}
+/* a synthetic device address for each resident's matrices (gate, up, down of slot i back to back,
+ * 512 KiB each: four to a 2 MiB page), as the chain's cc_tensor_dev gives the tier */
+static uintptr_t slot_page(int i, int j) { return ((uintptr_t)0x10000000 + ((uintptr_t)i * 3 + (uintptr_t)j) * 0x80000) >> 21; }
+static int page_addr(const struct ColiCudaTensor *t, uintptr_t *at) {
+    for (int i = 0; i < NL * NE; i++) {
+        const QSlot *x = &G.slot[i];
+        const struct ColiCudaTensor *m3[3] = {x->tg, x->tu, x->td};
+        for (int j = 0; j < 3; j++) if (t && m3[j] == t) { *at = (uintptr_t)0x10000000 + ((uintptr_t)i * 3 + (uintptr_t)j) * 0x80000; return 1; }
+    }
+    return 0;
 }
 static void note(int l, int e, int host) {
     const unsigned char *g = pw[l][e];
@@ -197,7 +209,7 @@ int main(void) {
         unsigned ep = qt_chain_epoch();
         size_t bud = G.budget[0], used = G.used[0], eb = G.exp_bytes;
         for (int l = 0; l < NL; l++) for (int e = 0; e < NE; e++) res0 += resident(l, e);
-        size_t got = qt_chain_give_back(2 * eb - 1);
+        size_t got = qt_chain_give_back(2 * eb - 1, NULL);
         for (int l = 0; l < NL; l++) for (int e = 0; e < NE; e++) res1 += resident(l, e);
         check(got == 2 * eb && res1 == res0 - 2 && fake_tensor_frees == frees + 6,
               "give back two experts' bytes less one: two residents leave, their three tensors freed");
@@ -209,7 +221,43 @@ int main(void) {
               "the CPU's rebuild list has the two");
         check(!pooled(el[0], ee[0]) && qt_chain_host_follow(&j, &l) == 1 && j == 2 && pool_is_rest(),
               "the next follow takes them into the host pool");
-        check(qt_chain_give_back(0) == 0 && fake_tensor_frees == frees + 6, "nothing asked, nothing back");
+        check(qt_chain_give_back(0, NULL) == 0 && fake_tensor_frees == frees + 6, "nothing asked, nothing back");
+    }
+    qt_shutdown();
+
+    /* by page (an address for each matrix): the driver packs the 512 KiB matrices four to a 2 MiB
+     * page and releases a page only when it is empty, so the residents go by page: every resident
+     * with a matrix in the picked page, and no other; the conversation's experts stay */
+    check(qt_init(NL, NE, D, IH, NE, TOPK, 64, 1), "tier starts (planar), for the give-back by page");
+    warm();
+    {
+        int hot[2], nh = 0;
+        for (int e = 0; e < NE && nh < 2; e++) if (resident(1, e)) hot[nh++] = e;
+        for (int t = 0; t < 4; t++) step(1, hot[0], hot[1]);
+        int frees = fake_tensor_frees, res0 = 0, res1 = 0;
+        for (int l = 0; l < NL; l++) for (int e = 0; e < NE; e++) res0 += resident(l, e);
+        uint8_t was[NL * NE];
+        for (int i = 0; i < NL * NE; i++) was[i] = (uint8_t)resident(i / NE, i % NE);
+        size_t got = qt_chain_give_back(1, page_addr);
+        for (int l = 0; l < NL; l++) for (int e = 0; e < NE; e++) res1 += resident(l, e);
+        int out = res0 - res1;
+        uintptr_t pgs[3 * NL * NE]; int npg = 0, ok_page = out > 0;
+        for (int i = 0; i < NL * NE; i++) if (was[i] && !resident(i / NE, i % NE))
+            for (int j = 0; j < 3; j++) pgs[npg++] = slot_page(i, j);
+        /* one page every resident that left has a matrix in */
+        uintptr_t common = 0; int found = 0;
+        for (int a = 0; a < npg && !found; a++) {
+            int all = 1;
+            for (int i = 0; i < NL * NE && all; i++) if (was[i] && !resident(i / NE, i % NE))
+                all = slot_page(i, 0) == pgs[a] || slot_page(i, 1) == pgs[a] || slot_page(i, 2) == pgs[a];
+            if (all) { common = pgs[a]; found = 1; }
+        }
+        ok_page = ok_page && found;
+        for (int i = 0; i < NL * NE && ok_page; i++)   /* nothing left on the card with a matrix there */
+            if (resident(i / NE, i % NE)) for (int j = 0; j < 3; j++) ok_page = ok_page && slot_page(i, j) != common;
+        check(ok_page && got == (size_t)out * G.exp_bytes && fake_tensor_frees == frees + 3 * out,
+              "by page: the residents of one page leave, all of them and no other, their tensors freed");
+        check(resident(1, hot[0]) && resident(1, hot[1]), "by page: the conversation's experts stay on the card");
     }
     qt_shutdown();
     qt_source_planar(0);
@@ -226,6 +274,6 @@ int main(void) {
     qt_shutdown();
 
     if (fails) { printf("test_qwen36_tier_host_pool: %d failure(s)\n", fails); return 1; }
-    printf("OK test_qwen36_tier_host_pool: after promotions the host pool is the non-residents again, every page-lock released at the exit; a per-row container's pairs join it; memory back from the coldest residents\n");
+    printf("OK test_qwen36_tier_host_pool: after promotions the host pool is the non-residents again, every page-lock released at the exit; a per-row container's pairs join it; memory back from the coldest residents, or by page\n");
     return 0;
 }
