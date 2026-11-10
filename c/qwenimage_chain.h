@@ -68,9 +68,8 @@ static unsigned g_qi_gen;        /* a new prompt prefix or step layout takes the
 static ColiVkTensor *qic_tensor(Lin *l) {
     if (l->vk) return (ColiVkTensor *)l->vk;
     if (l->m.ld) return NULL;
-    int fmt = l->m.fmt == QI_I8 ? 1 : l->m.fmt == QI_BF16 ? 11 : 10;
-    return coli_vk_tensor_ensure((ColiVkTensor **)&l->vk, l->m.w, l->m.fmt == QI_I8 ? l->m.sc : NULL, fmt,
-                                 l->m.K, l->m.N, 0) ? (ColiVkTensor *)l->vk : NULL;
+    return coli_vk_tensor_ensure((ColiVkTensor **)&l->vk, qi_vk_weights(l), l->m.fmt == QI_I8 ? l->m.sc : NULL,
+                                 qi_vk_fmt(l), l->m.K, l->m.N, 0) ? (ColiVkTensor *)l->vk : NULL;
 }
 
 static void qic_off(const char *why) {
@@ -85,8 +84,7 @@ static size_t qic_block_bytes(DitBlock *B) {
     Lin *m[7]; qic_block_mats(B, m);
     size_t b = 0;
     for (int k = 0; k < 7; k++) {
-        int fmt = m[k]->m.fmt == QI_I8 ? 1 : m[k]->m.fmt == QI_BF16 ? 11 : 10;
-        b += coli_vk_tensor_payload(fmt, m[k]->m.K, m[k]->m.N, 0) + coli_vk_buffer_alignment();
+        b += coli_vk_tensor_payload(qi_vk_fmt(m[k]), m[k]->m.K, m[k]->m.N, 0) + coli_vk_buffer_alignment();
     }
     return b;
 }

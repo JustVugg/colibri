@@ -65,6 +65,36 @@ static int check_act8(int M, int N, int K){
 #endif
 }
 
+/* QI_GG: rows the caller's decoder unpacks while a panel is packed (a GGUF's blocks in the
+ * engine). Here the "blocks" are f32 rows and the decoder a copy, so the f32 product must be
+ * QI_F32's bytes, and the int8 x int8 one (the decoded rows quantized with the load's scales)
+ * QI_I8's bytes. */
+static int gg_copy(int type, const uint8_t *src, float *dst, int64_t n){ (void)type; memcpy(dst, src, (size_t)n * 4); return 0; }
+static int check_gg(int M, int N, int K){
+    uint32_t s = 4242u + (uint32_t)(M * 31 + N * 7 + K);
+    float *X = malloc(sizeof(float) * (size_t)M * K), *Wf = malloc(sizeof(float) * (size_t)N * K);
+    float *Y0 = malloc(sizeof(float) * (size_t)M * N), *Y1 = malloc(sizeof(float) * (size_t)M * N);
+    int8_t *q = malloc((size_t)N * K); float *sc = malloc(sizeof(float) * N);
+    for (size_t i = 0; i < (size_t)M * K; i++) X[i] = frand(&s);
+    for (size_t i = 0; i < (size_t)N * K; i++) Wf[i] = frand(&s) * 0.1f;
+    qi_quantize_i8(Wf, N, K, q, sc);
+    QiGG g = { (const uint8_t *)Wf, (int64_t)K * 4, 0, gg_copy };
+    QiMat G = { QI_GG, N, K, &g, sc, 0 }, F = { QI_F32, N, K, Wf, NULL, 0 }, I = { QI_I8, N, K, q, sc, 0 };
+    qi_gemm(Y0, X, M, &F, NULL);
+    qi_gemm(Y1, X, M, &G, NULL);
+    int ok = !memcmp(Y0, Y1, sizeof(float) * (size_t)M * N);
+    printf("%s gg f32 M=%d N=%d K=%d\n", ok ? "ok  " : "FAIL", M, N, K);
+#ifdef QI_HAVE_VNNI
+    qi_gemm_act8(Y0, N, X, K, M, &I, NULL);
+    qi_gemm_act8(Y1, N, X, K, M, &G, NULL);
+    int ok8 = !memcmp(Y0, Y1, sizeof(float) * (size_t)M * N);
+    printf("%s gg act8 M=%d N=%d K=%d\n", ok8 ? "ok  " : "FAIL", M, N, K);
+    ok &= ok8;
+#endif
+    free(X); free(Wf); free(Y0); free(Y1); free(q); free(sc);
+    return ok;
+}
+
 int main(int argc, char **argv){
     if (argc > 1 && !strcmp(argv[1], "bench")) {
         int M = argc > 2 ? atoi(argv[2]) : 1296, N = argc > 3 ? atoi(argv[3]) : 12288, K = argc > 4 ? atoi(argv[4]) : 4096;
@@ -91,6 +121,10 @@ int main(int argc, char **argv){
     int act_shapes[][3] = { {1,1,1}, {7,31,257}, {6,16,256}, {193,40,522}, {13,100,64},
                             {193,2065,260}, {385,4096,130}, {201,3073,130} };
     for (unsigned i = 0; i < sizeof act_shapes / sizeof act_shapes[0]; i++) ok &= check_act8(act_shapes[i][0], act_shapes[i][1], act_shapes[i][2]);
+    /* whole 256-column panels (qi_gg_ok); narrow and wide N (the act8 pack per tile, and
+     * hoisted out of the m-loop), several m-blocks, a ragged n-panel */
+    int gg_shapes[][3] = { {1, 1, 256}, {7, 31, 512}, {193, 40, 768}, {385, 2065, 256}, {64, 17, 1024} };
+    for (unsigned i = 0; i < sizeof gg_shapes / sizeof gg_shapes[0]; i++) ok &= check_gg(gg_shapes[i][0], gg_shapes[i][1], gg_shapes[i][2]);
     printf(ok ? "qi_gemm: all ok\n" : "qi_gemm: FAILED\n");
     return !ok;
 }

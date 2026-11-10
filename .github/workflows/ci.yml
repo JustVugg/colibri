@@ -1633,6 +1633,18 @@ jobs:
           make qwenimage tests/test_qi_gemm tests/test_qwenimage_vae
           tests/test_qi_gemm
           COLI_IMG_BITS=16 COLI_IMG_ACT8=0 ./qwenimage --model qwenimage_tiny --ref qwenimage_tiny/ref
+      - name: "Turbo's schedule (a static shift, model_index.json's sample_sigmas) against diffusers"
+        run: |
+          cd c
+          # at 8 steps its own eight sigmas, at 3 the scheduler's linear spacing
+          python3 tools/make_qwenimage_tiny.py qwenimage_tiny_turbo --turbo --steps 8
+          COLI_IMG_BITS=16 COLI_IMG_ACT8=0 ./qwenimage --model qwenimage_tiny_turbo --ref qwenimage_tiny_turbo/ref
+          python3 tools/make_qwenimage_tiny.py qwenimage_tiny_turbo3 --turbo --steps 3
+          COLI_IMG_BITS=16 COLI_IMG_ACT8=0 ./qwenimage --model qwenimage_tiny_turbo3 --ref qwenimage_tiny_turbo3/ref
+      - name: "GGUFs: unsloth's denoiser layout and a Qwen3-VL text encoder, against the checkpoint path"
+        run: |
+          cd c
+          QWENIMAGE_TINY=qwenimage_tiny python3 -m unittest -v tests.test_qwenimage_gguf_tiny tests.test_qwenimage_gguf_import
       - name: "The VAE alone: tiny decoder at two latent shapes"
         run: |
           cd c
@@ -1656,6 +1668,14 @@ jobs:
           export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=2
           COLI_IMG_BITS=16 COLI_IMG_ACT8=0 ./qwenimage --model qwenimage_tiny --ref qwenimage_tiny/ref > qwenimage-san.log 2>&1 || true
           QWENIMAGE_TINY=qwenimage_tiny python3 -m unittest tests.test_qwenimage_engine_serve >> qwenimage-san.log 2>&1 || true
+          # the GGUF path: the file's blocks packed for the f32 and the int8 x int8 products
+          python3 tools/make_qwenimage_gguf_tiny.py qwenimage_tiny qwenimage_gguf_tiny
+          python3 tools/gguf_import.py qwenimage_gguf_tiny/dit.gguf qwenimage_gguf_tiny/gg \
+                  --text-encoder qwenimage_gguf_tiny/te.gguf --vae qwenimage_tiny
+          for act8 in 0 1; do
+            COLI_IMG_ACT8=$act8 ./qwenimage --model qwenimage_gguf_tiny/gg --prompt "a red fox in the snow" \
+                        --width 256 --height 256 --steps 2 --seed 1 --out gguf-san.png >> qwenimage-san.log 2>&1 || true
+          done
           if grep -qE "ERROR: AddressSanitizer|runtime error:" qwenimage-san.log; then
             cat qwenimage-san.log
             exit 1

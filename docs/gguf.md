@@ -35,6 +35,7 @@ colibri runs the GGUF files people already have on disk. The ggml blocks are com
 | `mimo2` | MiMo-V2.6 | mimo |
 | `olmoe` | OLMoE | olmoe |
 | `kimi-k3` | Kimi K3 | kimi_k3 |
+| none (recognised by its tensors) | Qwen-Image-2.1 and Qwen-Image-2.1-Turbo, unsloth's transformer GGUFs, with `qwen3vl` (Qwen3-VL-8B-Instruct) as the text encoder ([qwen-image.md](qwen-image.md#gguf-unsloth)) | qwenimage |
 
 A GGUF of another architecture is refused by `coli import` with the list above.
 
