@@ -958,6 +958,28 @@ d = [abs(x - y) for x, y in zip(a, b)]
 assert len(a) == len(b) and max(d) <= 2 and sum(t > 0 for t in d) <= len(d) // 1000, (max(d), sum(t > 0 for t in d))
 print(f"OK qwenimage chain picture: {sum(t > 0 for t in d)} of {len(d)} bytes differ from the CPU's, max {max(d)}")
 QIPY
+  # GGUFs (tools/make_qwenimage_gguf_tiny.py: unsloth's layout of the denoiser, K-quant types,
+  # a Qwen3-VL text encoder): the blocks' matrices go up as the file's blocks (fmt 100 + the
+  # ggml type, the chain's block GEMM), the picture against the CPU's
+  $PY tools/make_qwenimage_gguf_tiny.py qwenimage_tiny qwenimage_gguf_tiny
+  rm -rf qwenimage_gguf_tiny/gg
+  $PY tools/gguf_import.py qwenimage_gguf_tiny/dit.gguf qwenimage_gguf_tiny/gg --text-encoder qwenimage_gguf_tiny/te.gguf \
+    --vae qwenimage_tiny
+  COLI_IMG_ACT8=0 ./qwenimage --model qwenimage_gguf_tiny/gg --prompt "a red fox in the snow" \
+    --width 256 --height 256 --steps 2 --seed 1 --out qi-cpu.png
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_IMG_ACT8=0 ./qwenimage --model qwenimage_gguf_tiny/gg --prompt "a red fox in the snow" \
+    --width 256 --height 256 --steps 2 --seed 1 --out qi-vk.png 2> qi-vk-gen.err
+  grep -qa "matrices in the GGUF's blocks" qi-vk-gen.err || { cat qi-vk-gen.err; fail "qwenimage GGUF chain: no matrix kept in the file's blocks"; }
+  grep -qa 'qwenimage chain: [0-9]* steps' qi-vk-gen.err || { cat qi-vk-gen.err; fail "qwenimage GGUF chain: the chain never ran"; }
+  $PY - <<'QIPY'
+import sys; sys.path.insert(0, ".")
+import image_engine as e
+_, _, _, a = e.decode_png(open("qi-cpu.png", "rb").read())
+_, _, _, b = e.decode_png(open("qi-vk.png", "rb").read())
+d = [abs(x - y) for x, y in zip(a, b)]
+assert len(a) == len(b) and max(d) <= 2 and sum(t > 0 for t in d) <= len(d) // 1000, (max(d), sum(t > 0 for t in d))
+print(f"OK qwenimage GGUF chain picture: {sum(t > 0 for t in d)} of {len(d)} bytes differ from the CPU's, max {max(d)}")
+QIPY
 }
 
 family_deepseek() {
@@ -2089,6 +2111,22 @@ family_qwen_chain() {
   # one conversation past the places' first 2048 rows: its mirrors grow, the others' stay
   CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_PAIRS=1 CHAIN_SERVE_LONG=2600 CHAIN_SERVE_EXPECT='decode steps of several conversations in the chain \([0-9]* rows, [1-9]' \
     $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 KV_SLOTS=2
+  # one slot: a conversation past twice the mirror's start, then shorter ones: the mirror cut to
+  # them, what it held past that back to the expert tier (#2733)
+  CHAIN_SERVE_LONG=17000 CHAIN_SERVE_EXPECT='KV mirror cut to a shorter conversation [1-9]' \
+    $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 Q36_MAXT=32768
+  # a long conversation, then shorter ones in its slot: the place's mirrors cut to them, what they
+  # held past that back to the expert tier (#2733)
+  CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_PAIRS=1 CHAIN_SERVE_LONG=4500 CHAIN_SERVE_LONG_ONCE=1 \
+    CHAIN_SERVE_EXPECT="[1-9][0-9]* places' mirrors cut to a shorter conversation" \
+    $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 KV_SLOTS=2
+  # a place that cannot grow (COLI_VK_TEST_CONV_ROOM_MB=0: no room past the first 2048 rows): the
+  # places close, and the next conversation that enters opens them again (#2733); the text the CPU's
+  CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_PAIRS=1 CHAIN_SERVE_LONG=2600 CHAIN_SERVE_EXPECT='places open again' \
+    $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 KV_SLOTS=2 COLI_VK_TEST_CONV_ROOM_MB=0
+  # the prefix store on the chain: a new conversation on the same system prompt, a conversation back
+  # after another, two slots; the logits of a fresh read on the same chain (the rows go up again)
+  QWEN36_TINY=qwen36_tiny_c QWEN36_PS_BACKEND=vulkan $PY -m unittest tests.test_qwen36_prefix_store
   for k in 0 1; do
     CHAIN_SERVE_SLOTS=3 CHAIN_SERVE_PAIRS=1 CHAIN_SERVE_EXPECT='on the device, [1-9][0-9]* handed over' \
       $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 KV_SLOTS=3 COLI_VK_CHAIN_MUX=$k
@@ -2998,6 +3036,30 @@ family_kimi_chain() {
   # in chain chunks of 5 rows (seven chunks a 32-row forward), the loss in the third
   # chunk of the second forward: the state its first chunks advanced is not used
   K3C_CASES=long FAULT_BACK=124 REBUILD=1 k3c_gate "chain kimi_k3 device lost inside a chunked forward" $O COLI_VK_CHAIN_ROWS=5
+  # Kimi K3.1: the DSA indexer on the chain (a top 4, so a 30-token prompt selects in every
+  # MLA layer): its test with the chain on, then the chain's tokens against the CPU's in
+  # chunks of 3 rows, a token at a time, a partial chain, quantized trunks and the KV split
+  $PY tools/make_kimi_k3_tiny.py --output ./kimi_k31_tiny --force --k31
+  COLI_USAGE=$PWD/k3c.usage USAGE_SAVE=0 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 \
+    $PY tests/kimi_k31_tiny_harness.py --binary ./kimi_k3 --fixture ./kimi_k31_tiny
+  local k31ids="5 7 9 11 13 17 19 23 29 31 37 41 43 47 53 59 61 67 71 73 79 83 89 97 101 103 107 109 113 127" k31cpu k31vk v q
+  for q in "$O" "K3_BITS=8 K3_MLA_BITS=8 K3_HEAD_BITS=8 K3_IDOT=0 COLI_TEMP=0" "K3_BITS=4 K3_IDOT=0 COLI_TEMP=0"; do
+    # shellcheck disable=SC2086
+    k31cpu=$(env $q USAGE_SAVE=0 ./kimi_k3 kimi_k31_tiny --ids "$k31ids" --ngen 12 2>/dev/null | sed 's/ *TUNE.*//')
+    for v in COLI_VK_CHAIN_ROWS=32 COLI_VK_CHAIN_ROWS=3 K3_CHUNK=1 COLI_VK_CHAIN_LAYERS=3 \
+             "COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4 COLI_VK_CHAIN_ROWS=3"; do
+      # shellcheck disable=SC2086
+      k31vk=$(env $q $v USAGE_SAVE=0 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 \
+              ./kimi_k3 kimi_k31_tiny --ids "$k31ids" --ngen 12 2> vk.log | sed 's/ *TUNE.*//')
+      grep -q 'kimi_k3: dense chain on' vk.log || { cat vk.log; fail "chain kimi_k3.1 ($q, $v): the chain did not run"; }
+      [ "$k31vk" = "$k31cpu" ] || fail "chain kimi_k3.1 ($q, $v): $k31vk, the CPU $k31cpu"
+    done
+  done
+  # shellcheck disable=SC2086
+  [ "$(env $O KIMI_DSA_INDEXER=0 USAGE_SAVE=0 COLI_VULKAN=1 COLI_VK_CHAIN=1 ./kimi_k3 kimi_k31_tiny --ids "$k31ids" --ngen 12 \
+       2>/dev/null | sed 's/ *TUNE.*//')" != "$(env $O USAGE_SAVE=0 ./kimi_k3 kimi_k31_tiny --ids "$k31ids" --ngen 12 \
+       2>/dev/null | sed 's/ *TUNE.*//')" ] || fail "chain kimi_k3.1: the dense attention gives the selection's tokens"
+  echo "OK chain kimi_k3.1: the indexer's selection on the device, the CPU's tokens"
   # a GGUF's blocks: the trunk on the chain, the experts in the tier, as the file has them
   k3_gguf_tiny
   local G="GQ_EXACT=1 COLI_VK_IDOT=0 COLI_VK_CHAIN_GEMM=0 K3_MLA_BITS=32 COLI_TEMP=0"

@@ -108,6 +108,57 @@ measurements and what they leave out are in
 9.94 tok/s against the CPU's 6.01 and the 512-token prompt 9.5 s
 ([vulkan.md](vulkan.md#the-chain-on-a-radeon-780m)).
 
+## The prefix store
+
+An agent starts every task as a new conversation on the same system prompt and tools, thousands
+of tokens, then a question of its own. Three of every four layers here are DeltaNet, whose
+recurrence cannot be wound back: the state a slot holds is the last conversation's end, not the
+point where the new one parts from it, so the new conversation read its whole prompt again. The
+store (`prefix_store.h`, `COLI_PREFIX_STORE`, on) keeps every prompt read by content:
+
+- the full attention layers' K/V rows in blocks of 256 tokens, each named by its tokens and the
+  block before it, so every prompt that starts with the same tokens shares them;
+- checkpoints of the rest (the DeltaNet recurrences and conv windows, a sliding layer's ring and
+  its positions) where a prompt's messages start (the prompt is read in pieces there: after the
+  system prompt, where a new conversation on it parts, and where the last message starts) and
+  where a turn ends.
+
+A request takes the deepest checkpoint its prompt starts with, when it reaches further than what
+its slot holds: the rows go back into the slot's cache, the state into the layers, and only what
+follows is read. Any slot takes any prefix, so a conversation the gateway sends back to the other
+slot reads only what is new. The budget is a quarter of the free RAM at the first request, at most
+4 GiB (`COLI_PREFIX_STORE_MB`); the least recently used entries nothing follows go first, and an
+entry that would leave less than 1.5 GiB free goes only when older ones make the room. Off with the
+MTP head (its rows live on its device), for a picture's prompt and for a read-out.
+
+A request from the store gets the logits a fresh read gives: on Qwen3.6-35B-A3B the 12 steps
+after a 9,757-token prompt, every step's top five logits to six decimals, the same on the CUDA
+chain and on the Vulkan chain as with the prompt read whole (`tests/test_qwen36_prefix_store.py`
+holds the tiny fixture to it on the CPU, and fails when the state or the rows are not put back).
+
+Measured with a 9.7K-token system prompt (time to the first token; A1 and A2 one conversation,
+B1 and C1 new ones on the same system prompt, A3 the first one again):
+
+| | A1 | A2 | B1 | A3 | C1 |
+|---|---|---|---|---|---|
+| CUDA chain, RTX PRO 4000, one slot, before | 2.88 s | 0.08 | 2.88 | 0.05 | 2.83 |
+| CUDA chain, one slot, the store | 3.03 | 0.10 | 0.15 | 0.16 | 0.15 |
+| CUDA chain, two slots, before | 2.92 | 0.09 | 2.83 | 2.88 | 2.90 |
+| CUDA chain, two slots, the store | 3.04 | 0.08 | 0.14 | 0.15 | 0.18 |
+| Vulkan chain, one slot, before | 4.30 | 0.09 | 4.17 | 0.05 | 4.18 |
+| Vulkan chain, one slot, the store | 4.43 | 0.10 | 0.24 | 0.26 | 0.25 |
+| the CPU alone, 16 Zen 4 cores, 4.9K-token system prompt, before | 44.0 | 0.35 | 34.4 | 0.02 | 34.3 |
+| the CPU alone, the store | 42.7 | 0.39 | 0.38 | 0.31 | 0.31 |
+
+The first conversation pays its prompt read in two pieces and the checkpoint's copy (380 MiB of
+rows, the DeltaNet state): 0.1 s on the CUDA chain. A3 on one slot came back from the parked
+conversation before (0.05 s) and comes from the store now (0.16 s: the rows go up to the device
+again). With two slots A3 was read whole before: the gateway had sent it to the slot B held.
+
+The rows stay in the KV cache's float16. What block formats (8-bit and 4-bit, with scales every 16
+or 32 values) would cost this model's rows is measured in
+[experiments/kv-formats-2026-11-10.md](experiments/kv-formats-2026-11-10.md).
+
 ## Prompt-lookup drafts (on by default, `COLI_LOOKUP=0` turns them off)
 
 When the recent tokens repeat an n-gram of the prompt or the output (a code edit, a

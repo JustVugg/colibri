@@ -1,0 +1,156 @@
+{
+  "run_ids": [
+    "20261108-123123",
+    "20261108-124254",
+    "20261108-125349"
+  ],
+  "request_comparisons": [
+    {
+      "workload": "warmup",
+      "repetition": 1,
+      "prompts_identical": true,
+      "output_identical": true
+    },
+    {
+      "workload": "decode_short",
+      "repetition": 1,
+      "prompts_identical": true,
+      "output_identical": true
+    },
+    {
+      "workload": "prefill_short",
+      "repetition": 1,
+      "prompts_identical": true,
+      "output_identical": true
+    },
+    {
+      "workload": "decode_short",
+      "repetition": 2,
+      "prompts_identical": true,
+      "output_identical": true
+    },
+    {
+      "workload": "prefill_short",
+      "repetition": 2,
+      "prompts_identical": true,
+      "output_identical": true
+    },
+    {
+      "workload": "prefill_short",
+      "repetition": 3,
+      "prompts_identical": true,
+      "output_identical": true
+    },
+    {
+      "workload": "decode_short",
+      "repetition": 3,
+      "prompts_identical": true,
+      "output_identical": true
+    }
+  ],
+  "reference_answers_identical": true,
+  "reference": "deterministic-v1",
+  "serving_adoption_approved": false,
+  "metrics": {
+    "20261108-123123": {
+      "decode": [
+        {
+          "repetition": 1,
+          "decode_tps": 1.8735325995345193,
+          "cores_busy": 6.798395541247293,
+          "approx_core_seconds_per_token": 3.6286507867204234
+        },
+        {
+          "repetition": 2,
+          "decode_tps": 2.063554836031104,
+          "cores_busy": 6.628884658593096,
+          "approx_core_seconds_per_token": 3.2123617666214415
+        },
+        {
+          "repetition": 3,
+          "decode_tps": 2.225329643098312,
+          "cores_busy": 6.877792275637551,
+          "approx_core_seconds_per_token": 3.0906846978686926
+        }
+      ],
+      "ttft_short_s": [
+        11.434885258000577,
+        9.722034747013822,
+        9.809958586993162
+      ],
+      "mean_decode_tps": 2.0541390262213115,
+      "median_decode_tps": 2.063554836031104,
+      "mean_ttft_short_s": 10.32229286400252
+    },
+    "20261108-124254": {
+      "decode": [
+        {
+          "repetition": 1,
+          "decode_tps": 3.0317376037588746,
+          "cores_busy": 5.895263100934121,
+          "approx_core_seconds_per_token": 1.9445162713372453
+        },
+        {
+          "repetition": 2,
+          "decode_tps": 3.267190135549336,
+          "cores_busy": 5.748339822721284,
+          "approx_core_seconds_per_token": 1.759413925799814
+        },
+        {
+          "repetition": 3,
+          "decode_tps": 3.261262830529385,
+          "cores_busy": 5.717494360317137,
+          "approx_core_seconds_per_token": 1.7531535044628843
+        }
+      ],
+      "ttft_short_s": [
+        11.332329188007861,
+        9.643630513019161,
+        9.77330280901515
+      ],
+      "mean_decode_tps": 3.186730189945865,
+      "median_decode_tps": 3.261262830529385,
+      "mean_ttft_short_s": 10.249754170014057
+    },
+    "20261108-125349": {
+      "decode": [
+        {
+          "repetition": 1,
+          "decode_tps": 1.8338106868517314,
+          "cores_busy": 6.720171653303459,
+          "approx_core_seconds_per_token": 3.6645940071603493
+        },
+        {
+          "repetition": 2,
+          "decode_tps": 2.1246460083914043,
+          "cores_busy": 6.743264903661399,
+          "approx_core_seconds_per_token": 3.17382984131404
+        },
+        {
+          "repetition": 3,
+          "decode_tps": 2.235572081259412,
+          "cores_busy": 6.934443591228551,
+          "approx_core_seconds_per_token": 3.101865356684015
+        }
+      ],
+      "ttft_short_s": [
+        11.363491463998798,
+        9.683080100017833,
+        9.83745882299263
+      ],
+      "mean_decode_tps": 2.0646762588341825,
+      "median_decode_tps": 2.1246460083914043,
+      "mean_ttft_short_s": 10.294676795669753
+    }
+  },
+  "combined_control_mean": 2.059407642527747,
+  "combined_control_median": 2.094100422211254,
+  "mean_gain_pct": 54.74013615072466,
+  "median_gain_pct": 55.73574198918656,
+  "status": "A/B/A complete; exact matched outputs; no serving adoption",
+  "raw_results_sha256": {
+    "20261108-123123": "efb2fd796cbc468c0efa97c88306db9bc715e598a9f0b0cd0d3a4673d1227b4d",
+    "20261108-124254": "3a8618a0c16ac4ac1ee2e5131982792c25ba9d98ed43d866b9643a2605c5c8d4",
+    "20261108-125349": "3b80cded63c6faeb356d2542ee2ac2498ebfe4ea9c94f7ded88cba7d95a33d91"
+  }
+}

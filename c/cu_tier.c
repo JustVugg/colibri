@@ -136,6 +136,7 @@ static const CuTierOps *cut_ops(void) {
 #define vkt_stage_room cut_stage_room
 #define vkt_step_rows cut_step_rows
 #define vkt_stream_prefetch cut_stream_prefetch
+#define vkt_take_back cut_take_back
 #define vkt_vram cut_vram
 #define vkt_wanted cut_wanted
 #define vkt_wants cut_wants

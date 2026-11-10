@@ -44,6 +44,106 @@ Keep the layout as downloaded: coli recognises the model from
 there to add. `coli info --model ~/Models/Qwen-Image-2.1` lists the parts it
 found and their size on disk.
 
+### Turbo
+
+[`Qwen/Qwen-Image-2.1-Turbo`](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo) is
+the same pipeline distilled to 8 steps, and runs from its folder as downloaded
+(`coli setup` offers it as `qwen-image-2.1-turbo`). Its scheduler has a static
+shift instead of the base model's dynamic one, and its `model_index.json` names
+the eight sigmas it was distilled on (`sample_sigmas`): at 8 steps, the default,
+those are the schedule; at another count the scheduler's own linear spacing, as
+diffusers does when no sigmas are passed. Its text encoder is the base model's
+byte for byte, and its VAE is the bf16 copy unsloth also publishes.
+
+```sh
+hf download Qwen/Qwen-Image-2.1-Turbo --local-dir ~/Models/Qwen-Image-2.1-Turbo
+```
+
+## GGUF (unsloth)
+
+[`unsloth/Qwen-Image-2.1-GGUF`](https://huggingface.co/unsloth/Qwen-Image-2.1-GGUF)
+and [`unsloth/Qwen-Image-2.1-Turbo-GGUF`](https://huggingface.co/unsloth/Qwen-Image-2.1-Turbo-GGUF)
+hold the diffusion transformer alone, in twelve sizes each, from Q2_K (2.5 GB)
+to F16 (14.2 GB). Their README names the other two parts: the text encoder as a
+Qwen3-VL-8B-Instruct GGUF (whose language model is Qwen-Image-2.1's text
+encoder byte for byte) and the VAE in bf16. Put the three files in one folder
+and import the transformer:
+
+```sh
+hf download unsloth/Qwen-Image-2.1-GGUF qwen-image-2.1-Q4_K_M.gguf --local-dir ~/Models/qimg
+hf download unsloth/Qwen3-VL-8B-Instruct-GGUF Qwen3-VL-8B-Instruct-UD-Q4_K_XL.gguf --local-dir ~/Models/qimg
+hf download unsloth/Qwen-Image-2.1-FP8 vae/qwen_image_2.1_vae_bf16.safetensors --local-dir ~/Models/qimg
+coli import ~/Models/qimg/qwen-image-2.1-Q4_K_M.gguf
+coli run --model ~/Models/qimg/qwen-image-2.1-Q4_K_M.colibri "a red fox in the snow, photograph"
+```
+
+The import writes a folder in the checkpoint's layout (`model_index.json`, each
+part's config, the tokenizer from the text encoder's GGUF) whose transformer
+and text encoder point at the GGUFs where they are; the VAE (0.7 GB) is
+hard-linked, or copied when it is on another drive. It finds a Qwen3-VL-8B GGUF
+and the VAE next to the transformer (its folder, then the parent, a `vae/`
+folder in either); `--text-encoder` and `--vae` name them, and either may also
+be an official Qwen-Image-2.1 folder, whose part is then read where it is. The
+files carry no metadata at all: the import recognises the transformer by its
+tensors, and a Turbo one by `turbo` in its name (`--variant turbo|base` when the
+name does not say). ComfyUI's copy of the VAE (Comfy-Org) is laid out otherwise
+and is refused with the name of the one to use.
+
+The transformer's and the text encoder's matrices stay in the file's blocks
+(Q2_K to Q6_K, IQ4_XS and the others under 8 bits a weight) and are decoded
+while the products run, so in RAM they weigh what they weigh on disk; Q8_0, F16
+and BF16 matrices become int8 rows, as the checkpoint's bf16 ones do (smaller
+than Q8_0's 8.5 bits a weight, and nothing to decode). `COLI_IMG_NATIVE=0`
+makes every type int8 rows.
+
+### What the files give
+
+Measured on the 8 Zen 4 cores of the timings below, 512x512, 8 steps, seed 42,
+two prompts (a fox in the snow, a photograph; a neon sign that reads "QWEN IMAGE
+2.1"), the engine's defaults (int8 activations in the transformer's blocks). Each
+picture against the same model's bf16 path (`COLI_IMG_BITS=16 COLI_IMG_ACT8=0`,
+which agrees with diffusers to a part in a million), PSNR in dB; the official
+text encoder and VAE, so only the transformer differs. One seed per prompt: the
+numbers rank the files, they do not grade them (unsloth's README gives LPIPS
+over 16 prompts). The RAM is the transformer's once loaded.
+
+| transformer | on disk | in RAM | base: fox | base: sign | Turbo: fox | Turbo: sign |
+|---|---|---|---|---|---|---|
+| the official checkpoint (int8 rows) | 14.2 GB | 7.09 GB | 36.3 | 31.6 | 29.5 | 26.3 |
+| F16 (int8 rows) | 14.2 GB | 7.09 GB | 35.2 | 29.6 | 30.9 | 28.1 |
+| Q8_0 (int8 rows) | 7.6 GB | 7.09 GB | 38.0 | 31.5 | 31.6 | 28.0 |
+| Q6_K_XL | 6.7 GB | 6.40 GB | 31.2 | 31.5 | 31.5 | 22.2 |
+| Q6_K | 6.3 GB | 6.07 GB | 32.2 | 31.3 | 30.1 | 26.9 |
+| Q5_K_M | 5.4 GB | 5.26 GB | 36.6 | 26.8 | 33.7 | 27.4 |
+| Q5_K_S | 4.5 GB | 4.38 GB | 31.2 | 25.6 | 31.2 | 19.4 |
+| Q4_K_M | 4.2 GB | 4.08 GB | 30.9 | 23.0 | 27.1 | 19.4 |
+| Q4_K_S | 3.9 GB | 3.79 GB | 24.9 | 24.3 | 27.6 | 15.9 |
+| Q3_K_XL | 3.6 GB | 3.50 GB | 24.5 | 20.7 | 27.6 | 17.7 |
+| Q3_K_M | 3.2 GB | 3.05 GB | 23.9 | 17.8 | 20.8 | 14.5 |
+| Q3_K_S | 2.7 GB | 2.61 GB | 20.9 | 18.4 | 16.7 | 13.8 |
+| Q2_K | 2.5 GB | 2.35 GB | 24.2 | 19.9 | 17.7 | 13.6 |
+
+- The F16 file computed in bf16 against the checkpoint: 90.1 and 89.2 dB. The
+  file is the checkpoint, the fused gate and proj read as the checkpoint has them.
+- Below Q4 the sign's letters go first; Q4_K_M keeps them readable on Turbo at
+  1024x1024 (the GPU picture below), the base model wants more steps for text
+  anyway (16 rather than 8).
+- The text encoder, with the official transformer and VAE: Qwen3-VL-8B-Instruct's
+  BF16 GGUF gives the checkpoint's picture byte for byte (it is the same model);
+  Q8_0 30.7 and 33.0 dB (7.39 GB of RAM), UD-Q4_K_XL 35.2 and 20.9 (4.29 GB, the
+  sign drawn larger but readable), against the official encoder's 6.95 GB.
+- The bf16 VAE against the official f32 one: 58.4 and 57.8 dB.
+- The README's set (Q4_K_M, UD-Q4_K_XL, the bf16 VAE): 10 GB on disk against
+  33, a `coli run` peak of 5.9 GB against 8.8.
+
+On the CPU the file's blocks cost 1 to 3% of a step against int8 rows of the same
+file (`COLI_IMG_NATIVE=0`), measured interleaved at 8 and 16 threads on Q4_K_M,
+Q2_K and Q6_K (a step 8.3 to 9.4 s either way), for 1.6 to 4.7 GB less RAM. On
+the GPU they are faster: the Vulkan chain decodes them in its tiled GEMM. An RTX
+PRO 4000 (Blackwell, 24 GB) with the README's set, 8 steps: 0.57 s a step at
+512x512, and at 1024x1024 4.24 to 4.34 s a step against 6.04 to 6.22 with int8
+rows, 5.7 GB of RAM against 8.8.
+
 ## RAM
 
 The text encoder's language model and the transformer are held as int8 with

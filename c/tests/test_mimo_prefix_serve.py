@@ -32,10 +32,13 @@ every ECHO frame (the log-probability of the token and the whole top-k):
 
 Needs the built engine and the fixture: `make mimo mimo-tiny-generate`.
 """
+import atexit
 import json
 import math
 import re
+import shutil
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -120,12 +123,45 @@ class MimoPrefixServeTest(PrefixReuseContract, PromptCancelContract, unittest.Te
     REPLAY_REUSES = False
     # a short request between two turns parks the conversation (park.h)
     PARKS = True
+    PARK_DECIDES_NEXT = True
     # MiMo checks between prompt blocks: blocks of 8 rows give the cancelled prompt several,
     # so the cancel can land after some of them are read (and kept)
     CANCEL_ENV = dict(PromptCancelContract.CANCEL_ENV, MIMO_CHUNK="8")
 
     def spawn(self, log_prefix=True, reuse=True):
         return ServeEngine(fixture.ENGINE, ["8"], fixture.engine_env(),
+                           log_prefix=log_prefix, reuse=reuse)
+
+
+_wide = None
+
+
+def wide_window_fixture():
+    """The served copy with a window of 64: wider than the rows a short request keeps apart,
+    so a parked conversation's ring has slots past them (built on first use)."""
+    global _wide
+    if _wide is None:
+        root = Path(tempfile.mkdtemp(prefix="mimo-wide-"))
+        atexit.register(shutil.rmtree, root, True)
+        _wide = root / "fixture"
+        shutil.copytree(fixture.served_fixture(), _wide)
+        config = json.loads((_wide / "config.json").read_text())
+        config["sliding_window"] = config["sliding_window_size"] = 64
+        (_wide / "config.json").write_text(json.dumps(config))
+    return _wide
+
+
+@unittest.skipUnless(fixture.available(),
+                     "mimo is not built or the tiny MiMo fixture is absent "
+                     "(make mimo mimo-tiny-generate)")
+class MimoWideWindowParkTest(MimoPrefixServeTest):
+    """The contract again with the window wider than the rows kept apart (#2703): a second
+    short request beside a parked conversation starts over on those rows alone; reset whole,
+    the ring's other slots lost their positions and the conversation's next turn stopped on
+    "window ring lost position"."""
+
+    def spawn(self, log_prefix=True, reuse=True):
+        return ServeEngine(fixture.ENGINE, ["8"], fixture.engine_env(SNAP=str(wide_window_fixture())),
                            log_prefix=log_prefix, reuse=reuse)
 
 

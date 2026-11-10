@@ -511,8 +511,13 @@ def run_fresh_engine(engine, snap, prompt, max_new, runs, cap, bits, memory_gb=N
 
 
 def run_iobench(iobench, shard, mode):
-    proc = subprocess.run([iobench, shard, "19", "64", "8", str(mode)],
-                          capture_output=True, text=True)
+    try:
+        proc = subprocess.run([iobench, shard, "19", "64", "8", str(mode)],
+                              capture_output=True, text=True)
+    except OSError as error:
+        print(f"[datapoint] could not start iobench ({error}); disk result omitted",
+              file=sys.stderr)
+        return None
     if proc.returncode:
         print(f"[datapoint] iobench exited {proc.returncode}; disk result omitted",
               file=sys.stderr)

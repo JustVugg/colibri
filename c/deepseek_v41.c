@@ -5570,9 +5570,10 @@ static int v41_prompt_poll(ColiPromptBreak *b) {
  * layer's window ring rows and their positions, the compressed rows and index keys of the
  * positions the request may write (a row for `ratio` of them), the compressor's partial
  * group, the engram history's first entries, and what crosses forwards (the index keys
- * published last, the shared top-k list, the candidate mask); back when the next request
- * arrives. The host's state stays canonical: the chains' watermarks come down to 0. The draft
- * head's windows are not kept: no prompt resets them either, and a draft is only verified. */
+ * published last, the shared top-k list, the candidate mask); the next request brings them
+ * back, keeps them parked or drops them (v41_park_decide). The host's state stays canonical:
+ * the chains' watermarks come down to 0. The draft head's windows are not kept: no prompt
+ * resets them either, and a draft is only verified. */
 #define V41_PARK_SPEC 16   /* the rows a verify writes past the tokens that stand */
 static ColiPark g_v41_park;
 static struct { int history_len, published_layer, topk_rows, topk_width, cand_width, cand_rows;
@@ -5649,6 +5650,17 @@ static void v41_unpark(Model *m) {
     memset(&g_v41_park_x, 0, sizeof g_v41_park_x);
     free(p);
 }
+/* the next request decides a conversation the last one parked (park.h, #2703): back, kept or
+ * dropped; an image's request takes the state from its start, so it drops it */
+static void v41_park_decide(Model *m, const int *ids, int np, int max_tok, int image) {
+    int d = image ? (g_v41_park.on ? -1 : 0) : coli_park_decide(&g_v41_park, &m->kvp, ids, np, max_tok, V41_PARK_SPEC);
+    if (d > 0) v41_unpark(m);
+    else if (d < 0) {
+        coli_park_free(&g_v41_park);
+        free(g_v41_park_x.topk); free(g_v41_park_x.cand);
+        memset(&g_v41_park_x, 0, sizeof g_v41_park_x);
+    }
+}
 
 static int v41_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int *ids, float *logits,
                            float **pending_image, int *pending_h, int *pending_w, V41Req *rq, int lone) {
@@ -5679,6 +5691,8 @@ static int v41_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int 
         fprintf(stderr, "[serve] max_tokens %d clamped to %d (context %d - prompt %d); "
                         "raise CTX for longer answers\n",
                 cmd->max_tokens, budget, c->max_positions, n_prompt);
+    if (lone) v41_park_decide(m, ids, n_prompt, cmd->max_tokens, *pending_image != NULL);   /* back, kept or dropped */
+    else if (g_v41_park.on) v41_park_decide(m, ids, n_prompt, cmd->max_tokens, 1);
     /* Decided BEFORE the reset, because the reset is what it decides about.
      * A chat client resends the whole transcript every turn; if this prompt
      * begins with the ids the state was built from, that state already IS
@@ -5727,9 +5741,10 @@ static int v41_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int 
     }
     if (!reuse && getenv("COLI_PREFIX_LOG")) { g_v41_log_tok = tokenizer; kv_prefix_miss_log(&m->kvp, ids, n_prompt, v41_decode_one); }
     if (!reuse) {
-        /* a short request keeps the conversation (v41_unpark): only the rows it reaches start over */
+        /* a short request keeps the conversation (v41_park_decide): only the rows it reaches start
+         * over, the rows kept apart when the conversation stays parked from the last request */
         int parked = lone && !(*pending_image) ? v41_park(m, n_prompt, cmd->max_tokens) : 0;
-        model_reset_rows(m, parked ? parked : -1);
+        model_reset_rows(m, parked ? parked : g_v41_park.on ? g_v41_park.n : -1);
     }
     coli_serve_write_accept(stdout, cmd->id, n_prompt);
     float *aligned = NULL;
@@ -6028,7 +6043,6 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
             continue;
         }
         V41Req rq;
-        v41_unpark(m);   /* a conversation the last request parked: back first */
         if (!v41_serve_start(m, tokenizer, &command, ids, logits, &pending_image, &pending_h, &pending_w, &rq, 1)) continue;
         double turn_started = rq.turn_started;
         double disk0 = rq.disk0, expert0 = rq.expert0, attn0 = rq.attn0, engram0 = rq.engram0;

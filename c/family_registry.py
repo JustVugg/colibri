@@ -633,6 +633,19 @@ def _kimi_geometry(config, context, _model_dir):
     qh = qk_nope + qk_rope
     ws_mla = context * (q_lora + heads * qh + kv_lora + qk_rope +
                         2 * heads * v_head) * 4
+    # Kimi K3.1 (dsa_config): every DSA layer keeps an indexer key a position
+    # (index_head_dim floats, kimi_k3.c's Ic), and a chunk's selection reads its
+    # queries and weights (C x index_num_heads x (index_head_dim + 1)) and two
+    # score rows of the context
+    dsa = config.get("dsa_config")
+    if isinstance(dsa, dict):
+        idx_hd = _required_int(dsa, "index_head_dim", "kimi_k3")
+        idx_nh = _required_int(dsa, "index_num_heads", "kimi_k3")
+        dsa_list = dsa.get("dsa_layers")
+        n_dsa = (sum(1 for v in dsa_list if isinstance(v, int) and 1 <= v <= layers)
+                 if isinstance(dsa_list, list) else n_mla)
+        state += n_dsa * context * idx_hd * 4
+        ws_mla += context * (idx_nh * (idx_hd + 1) + 2) * 4
     workspace = max(ws_kda, ws_mla)
     return PlannerGeometry(state, fixed, workspace, experts)
 
@@ -1497,7 +1510,9 @@ FAMILIES = (
         # (the real checkpoint's text_config carries it; the root "kimi_k3"
         # belongs to the vision wrapper). A text-only export -- the tiny
         # fixture included -- is therefore kimi_linear at top level.
-        model_types=("kimi_k3", "kimi_linear"),
+        # "kimi_k31" is Kimi K3.1 Pro's root: K3 with DeepSeek Sparse Attention on
+        # its gated MLA layers (text_config.dsa_config), the same engine.
+        model_types=("kimi_k3", "kimi_linear", "kimi_k31"),
         display_name="Kimi K3",
         display_scale="2.8T",
         engine_artifact="kimi_k3",
@@ -1508,6 +1523,13 @@ FAMILIES = (
         build_target="kimi_k3",
         process_names=("kimi_k3",),
         default_model_id="kimi-k3-colibri",
+        # K3 and K3.1 have the same geometry and text_config model_type: the root's
+        # model_type names them (_variant_matches)
+        display_variants=(
+            DisplayVariant((("model_type", "kimi_k31"),), "Kimi K3.1 Pro", "2.8T", model_id="kimi-k3.1-colibri"),
+            DisplayVariant((("model_type", "kimi_k3"),), "Kimi K3", "2.8T"),
+            DisplayVariant((("model_type", "kimi_linear"),), "Kimi K3", "2.8T"),
+        ),
         cli_adapter="kimi",
         gateway_adapter="kimi",
         planner_id="kimi_hybrid",
@@ -2207,7 +2229,7 @@ def default_model_id(resolved):
         return head.model_id
     matched = False
     for variant in family.display_variants:
-        if all(config.get(key) == value for key, value in variant.geometry):
+        if _variant_matches(variant, resolved):
             if variant.model_id:
                 return variant.model_id
             matched = True
@@ -2217,6 +2239,15 @@ def default_model_id(resolved):
     if slug and family.display_variants and not matched:   # one-model families keep their id
         return slug + "-colibri"
     return family.default_model_id
+
+
+def _variant_matches(variant, resolved):
+    """A display variant's geometry against the family config; a model_type it names,
+    against the checkpoint's own as well. Kimi reads text_config, whose model_type is
+    kimi_linear for K3 and K3.1 alike; the root's says which of the two it is."""
+    config = resolved.family_config
+    return all(config.get(key) == value or (key == "model_type" and resolved.model_type == value)
+               for key, value in variant.geometry)
 
 
 def display_for(resolved):
@@ -2240,7 +2271,7 @@ def display_for(resolved):
     if not family.display_variants:   # an imported GGUF says which model it is (Inkling-Small)
         return (name, size) if name else (family.display_name, family.display_scale)
     for variant in family.display_variants:
-        if all(config.get(key) == value for key, value in variant.geometry):
+        if _variant_matches(variant, resolved):
             return variant.display_name, variant.display_scale
     if name:   # an imported GGUF: the name its file gives
         return name, size

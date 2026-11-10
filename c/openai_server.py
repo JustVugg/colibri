@@ -1684,6 +1684,10 @@ def _k3_order_tool_results(messages):
     return out
 
 
+_K3_THINKING_EFFORT = {"minimal": "low", "low": "low", "medium": "high", "high": "high",
+                       "xhigh": "max", "max": "max"}
+
+
 def render_chat_kimi(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                      tool_choice=None, add_generation_prompt=True):
     """Validated multi-turn K3 payload for the C engine.
@@ -1715,6 +1719,17 @@ def render_chat_kimi(messages, enable_thinking=False, reasoning_effort=None, too
                 "```json\n" + json.dumps(tools, ensure_ascii=False, separators=(",", ":"),
                                          sort_keys=True) + "\n```")
         parts.append(f"Y 12 {len(body.encode('utf-8'))}\ntool-declare{body}")
+    # The thinking effort (Kimi K3 and K3.1: low, high, max), as the reference template
+    # renders it: a system message of its own after the tools. OpenAI's medium is high
+    # here, xhigh is max; with no effort named the model thinks at its own default.
+    effort = (_K3_THINKING_EFFORT.get(reasoning_effort) if isinstance(reasoning_effort, str)
+              else None) if enable_thinking else None
+    if effort:
+        body = ("`thinking_effort` guides on how much to think in your thinking channel "
+                "(not including the response channel), supported values include `low`, "
+                "`medium`, `high`, and `max`.\n"
+                f"Now the system is invoked with `thinking_effort={effort}`.")
+        parts.append(f"Y 15 {len(body.encode('utf-8'))}\nthinking-effort{body}")
     tool_index = 0
     last_calls = []
     for index, message in enumerate(messages):

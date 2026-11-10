@@ -52,6 +52,7 @@ def cpu_prefill_engine(cap, dense, slots):
                      "tiny qwen36 container is absent (tools/convert_qwen36.py)")
 class Qwen36PrefixServeTest(PrefixReuseContract, unittest.TestCase):
     PARKS = True
+    PARK_DECIDES_NEXT = True
 
     @classmethod
     def setUpClass(cls):
@@ -220,6 +221,7 @@ class Qwen3CoderPrefixServeTest(PrefixReuseContract, unittest.TestCase):
     starts a new task on the same system prompt and tools reads only what follows them;
     a side request that shares nothing still parks the conversation."""
     PARKS = True
+    PARK_DECIDES_NEXT = True
     RESUMES_MIDWAY = True
 
     @classmethod

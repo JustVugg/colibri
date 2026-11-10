@@ -823,7 +823,8 @@ endif
 
 all: colibri$(EXE)
 
-# Tiny Kimi K3 fixture + vendor oracle.  The generator is numpy-only and
+# Tiny Kimi K3 fixture + vendor oracle (and K3.1's, the same weights plus the DSA
+# indexer, checked against tools/k3_ref.py: Moonshot ships no K3.1 modeling code).  The generator is numpy-only and
 # deterministic; ref.json is committed and comes from Moonshot's own modeling
 # code (tools/make_kimi_k3_ref.py, maintainer-run, SHA-256-pinned), so CI
 # needs neither torch nor network.  kimi_k3 builds on every platform, so
@@ -831,6 +832,7 @@ all: colibri$(EXE)
 .PHONY: kimi-k3-tiny-generate kimi-k3-tiny-check
 kimi-k3-tiny-generate:
 	$(PYTHON) tools/make_kimi_k3_tiny.py --output ./kimi_k3_tiny --force
+	$(PYTHON) tools/make_kimi_k3_tiny.py --output ./kimi_k31_tiny --force --k31
 
 kimi-k3-tiny-check: kimi-k3-tiny-generate kimi_k3$(EXE)
 	$(PYTHON) tests/test_kimi_k3_tiny.py \
@@ -845,6 +847,22 @@ kimi-k3-tiny-check: kimi-k3-tiny-generate kimi_k3$(EXE)
 	$(PYTHON) tests/test_kimi_k3_dashboard.py \
 		--binary ./kimi_k3$(EXE) \
 		--fixture ./kimi_k3_tiny
+	$(PYTHON) tests/kimi_k31_tiny_harness.py \
+		--binary ./kimi_k3$(EXE) \
+		--fixture ./kimi_k31_tiny
+	$(PYTHON) tests/test_kimi_k3_ckpt.py \
+		--binary ./kimi_k3$(EXE) \
+		--fixture ./kimi_k31_tiny
+	$(PYTHON) tests/kimi_k3_park_harness.py \
+		--binary ./kimi_k3$(EXE) \
+		--fixture ./kimi_k31_tiny
+
+# Kimi K3's CUDA chain (kimi_k3_cuchain.h) against the CPU on the tiny K3 and K3.1, on a machine
+# with a card: make CUDA=1 kimi-k3-cuda-chain-check
+.PHONY: kimi-k3-cuda-chain-check
+kimi-k3-cuda-chain-check: kimi-k3-tiny-generate kimi_k3$(EXE)
+	$(PYTHON) tests/kimi_k3_cuda_chain_harness.py --binary ./kimi_k3$(EXE) \
+		--k3 ./kimi_k3_tiny --k31 ./kimi_k31_tiny
 
 .PHONY: deepseek-v4 deepseek-v4-oracle deepseek-v4-tiny-generate \
 	deepseek-v4-tiny-check deepseek-v4-clean
@@ -1112,7 +1130,7 @@ backend_cuda.o: backend_cuda.cu backend_cuda.h cuda_bd.cuh cuda_chain.h fp8_form
 
 # The dense chain on a CUDA device (cuda_chain.h): the backend's twin of vk_chain.c,
 # built into the same backend (one table export, coli_cuda_chain_ops).
-cuda_chain.o: cuda_chain.cu cuda_chain.h cuda_dsv4c.cuh cuda_glm53c.cuh backend_cuda.h backend_gpu_compat.h .build-config
+cuda_chain.o: cuda_chain.cu cuda_chain.h cuda_dsv4c.cuh cuda_glm53c.cuh cuda_k3c.cuh backend_cuda.h backend_gpu_compat.h .build-config
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) -c cuda_chain.cu -o $@
 
@@ -1436,6 +1454,7 @@ cuda-chain-check: backend_cuda.o cuda_chain.o
 	./cuda_chain_test$(EXE)
 	$(MAKE) cuda-dsv4c-check
 	$(MAKE) cuda-glm53c-check
+	$(MAKE) cuda-k3c-check
 # DeepSeek V4.1's layer ops on the CUDA chain (cuda_dsv4c.cuh) against the CPU's references.
 cuda-dsv4c-check: backend_cuda.o cuda_chain.o
 	$(CC) $(filter-out -MMD -MP -fopenmp,$(CFLAGS)) -c tests/cuda_dsv4c_ref.c -o tests/cuda_dsv4c_ref.o
@@ -1447,6 +1466,11 @@ cuda-glm53c-check: backend_cuda.o cuda_chain.o
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu cuda_chain.cu tests/test_cuda_glm53c.cu $(if $(filter 1,$(HIP)),-x none) tests/cuda_glm53c_ref.o -o cuda_glm53c_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	./cuda_glm53c_test$(EXE)
 
+# Kimi K3's residual mix and activation on the CUDA chain (cuda_k3c.cuh) against kimi_k3.c's arithmetic.
+cuda-k3c-check: backend_cuda.o cuda_chain.o
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu cuda_chain.cu tests/test_cuda_k3c.cu -o cuda_k3c_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	./cuda_k3c_test$(EXE)
+
 hip-test:
 	$(MAKE) cuda-test HIP=1
 
@@ -1454,7 +1478,7 @@ hip-test:
 # host code. An ARM host with a card (DGX Spark, GH200, Jetson) builds it without the x86
 # SIMD kernels, so a name those alone define breaks only there; CI runs this at
 # ARCH=x86-64 (no AVX2) to see it on an x86 runner.
-CUDA_HOST_SRC = qwen38.c qwen36.c olmoe.c qwen36_tier.c backend_loader.c glm53.c deepseek_v41.c colibri.c
+CUDA_HOST_SRC = qwen38.c qwen36.c olmoe.c qwen36_tier.c backend_loader.c glm53.c deepseek_v41.c colibri.c kimi_k3.c
 cuda-host-syntax:
 	for f in $(CUDA_HOST_SRC); do $(CC) $(filter-out -MMD -MP,$(CFLAGS)) -fsyntax-only -DCOLI_CUDA $$f || exit 1; done
 
@@ -1466,6 +1490,7 @@ gpu-compile: backend_cuda.o cuda_chain.o
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu cuda_chain.cu tests/test_cuda_dsv4c.cu $(if $(filter 1,$(HIP)),-x none) tests/cuda_dsv4c_ref.o -o cuda_dsv4c_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	$(CC) $(filter-out -MMD -MP -fopenmp,$(CFLAGS)) -ffp-contract=off -c tests/cuda_glm53c_ref.c -o tests/cuda_glm53c_ref.o
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu cuda_chain.cu tests/test_cuda_glm53c.cu $(if $(filter 1,$(HIP)),-x none) tests/cuda_glm53c_ref.o -o cuda_glm53c_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu cuda_chain.cu tests/test_cuda_k3c.cu -o cuda_k3c_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_ragged_attention.cu -o ragged_attention_test$(EXE) $(GPU_TEST_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_absorb_determinism.cu -o absorb_determinism_test$(EXE) $(GPU_TEST_LIBS)
@@ -2427,6 +2452,9 @@ tests/test_decode_batch$(EXE): tests/test_decode_batch.c
 tests/test_pin_pool$(EXE): tests/test_pin_pool.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_prefix_store$(EXE): tests/test_prefix_store.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_serve_codec$(EXE): tests/test_serve_codec.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -2653,6 +2681,13 @@ tests/test_xf16$(EXE): tests/test_xf16.c
 # the SSE2 i8 expert kernel (no AVX2+FMA) against xf_dot_i8_ref, bit for bit.
 tests/test_xf_sse2_int16$(EXE): tests/test_xf_sse2_int16.c
 	$(CC) $(if $(X86_64),$(filter-out -march=% -mavx% -mfma%,$(CFLAGS)) -march=x86-64 -mno-avx -mno-avx2 -mno-fma -ffp-contract=off,$(CFLAGS)) $< -o $@ $(LDFLAGS)
+# the kernels a build without FMA takes (quant.h's FP8 rows in lanes, expert_ffn.h's int4-g64 f32 in
+# doubles, #2715) against the references they reproduce, bit for bit: one source built for the x86-64
+# baseline (SSE2) and for Sandy Bridge (AVX); on another architecture, what its dispatch gives.
+tests/test_nofma_sse2$(EXE): tests/test_nofma_kernels.c
+	$(CC) $(if $(X86_64),$(filter-out -march=% -mavx% -mfma%,$(CFLAGS)) -march=x86-64 -mno-avx -mno-avx2 -mno-fma,$(CFLAGS)) $< -o $@ $(LDFLAGS)
+tests/test_nofma_avx$(EXE): tests/test_nofma_kernels.c
+	$(CC) $(if $(X86_64),$(filter-out -march=% -mavx% -mfma%,$(CFLAGS)) -march=sandybridge -mno-avx2 -mno-fma,$(CFLAGS)) $< -o $@ $(LDFLAGS)
 
 tests/test_int2_g32$(EXE): tests/test_int2_g32.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)

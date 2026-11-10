@@ -817,6 +817,56 @@ def _component_files(directory):
         return []
 
 
+def _part_dir(root, index, name):
+    """A part's folder: model_index.json's "colibri_parts" may name it elsewhere (a GGUF import
+    reading an official checkpoint's text encoder or VAE where it is), else root/name."""
+    parts = index.get("colibri_parts")
+    where = parts.get(name) if isinstance(parts, dict) else None
+    if isinstance(where, str) and where:
+        path = Path(where).expanduser()
+        return path if path.is_absolute() else root / path
+    return root / name
+
+
+def _gguf_reader():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("gguf_reader", Path(__file__).resolve().parent / "tools" / "gguf_reader.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _gguf_component(directory, name):
+    """A part tools/gguf_import.py points at a GGUF (gguf.json): its file, parameters, types and
+    what the engine holds of it. A matrix of a type under 8 bits a weight with whole 256-column
+    panels stays in the file's blocks (plus a scale a row); any other matrix becomes int8 rows;
+    a vector f32. The text encoder's output head is never loaded and its embedding rows are read
+    from the file per token."""
+    link = json.loads((directory / "gguf.json").read_text(encoding="utf-8"))
+    path = Path(link["gguf"]).expanduser()
+    if not path.is_absolute():
+        path = directory / path
+    reader = _gguf_reader().GGUFReader(str(path), header_only=bool(os.environ.get("GGUF_CHECK")))
+    params = resident = 0
+    types = set()
+    try:
+        for tensor in reader.tensors:
+            dims, numel = tensor["dims"], tensor["numel"]
+            params += numel
+            types.add(tensor["type_name"])
+            if name == "text_encoder" and tensor["name"] in ("output.weight", "token_embd.weight"):
+                continue
+            if len(dims) == 2:
+                cols, rows = dims[0], dims[1]
+                native = tensor["nbytes"] < numel and cols % 256 == 0 and tensor["type_name"] not in ("F32", "F16", "BF16")
+                resident += (tensor["nbytes"] if native else numel) + rows * 4
+            else:
+                resident += numel * 4
+    finally:
+        reader.close()
+    return path, params, sorted(types), resident
+
+
 def inspect_image_model(model_dir):
     """What is on disk, per component, and what each will weigh in RAM.
 
@@ -832,7 +882,7 @@ def inspect_image_model(model_dir):
         raise ValueError(f"{INDEX_FILE} is not a JSON object")
     components = {}
     for name in COMPONENTS:
-        directory = root / name
+        directory = _part_dir(root, index, name)
         declared = index.get(name)
         files = _component_files(directory)
         weights = [p for p in files if p.suffix == ".safetensors"]
@@ -841,6 +891,13 @@ def inspect_image_model(model_dir):
                  "disk_bytes": sum(p.stat().st_size for p in files),
                  "weight_files": len(weights), "params": 0, "dtypes": [],
                  "resident_bytes": 0, "precision": None}
+        if name in ("text_encoder", "transformer") and (directory / "gguf.json").is_file():
+            gguf, params, types, resident = _gguf_component(directory, name)
+            entry.update(weight_files=1, params=params, dtypes=types, resident_bytes=resident, gguf=str(gguf),
+                         disk_bytes=entry["disk_bytes"] + gguf.stat().st_size,
+                         precision="gguf" if any(t not in ("F32", "F16", "BF16", "Q8_0") for t in types) else "int8")
+            components[name] = entry
+            continue
         dtypes = set()
         params = 0
         resident = 0
@@ -870,15 +927,17 @@ def inspect_image_model(model_dir):
         elif name == "vae":
             entry["precision"] = "f32" if dtypes else None
         components[name] = entry
-    tokenizer = root / TOKENIZER_FILE
+    tokenizer = _part_dir(root, index, "processor") / "tokenizer.json"
     license_text = ""
     try:
         license_text = (root / "LICENSE").read_text(encoding="utf-8", errors="replace")[:400]
     except OSError:
         pass
+    imported = index.get("colibri_gguf") if isinstance(index.get("colibri_gguf"), dict) else {}
     return {"path": str(root), "class": index.get("_class_name"), "components": components,
             "tokenizer": tokenizer.is_file(),
-            "research_license": "RESEARCH LICENSE" in license_text.upper(),
+            "research_license": "RESEARCH LICENSE" in license_text.upper() or
+                                "research license" in str(imported.get("license", "")).lower(),
             "disk_bytes": sum(c["disk_bytes"] for c in components.values())}
 
 
@@ -946,7 +1005,7 @@ def format_image_plan(plan):
     for comp in plan["components"]:
         if comp["name"] not in ("text_encoder", "transformer", "vae"):
             continue
-        disk_dtype = "/".join(d.lower() for d in comp["dtypes"]) or "?"
+        disk_dtype = "gguf" if comp.get("gguf") else "/".join(d.lower() for d in comp["dtypes"]) or "?"
         disk = f"{_gb(comp['disk_bytes'])} {disk_dtype}"
         ram = f"{_gb(comp['resident_bytes'])} {comp['precision'] or '?'}"
         lines.append(f"{names[comp['name']]:15}{disk:>18}{ram:>18}")

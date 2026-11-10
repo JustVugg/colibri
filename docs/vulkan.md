@@ -161,7 +161,7 @@ the shared expert tier ([below](#the-routed-expert-tier-vk_tierc)).
 | deepseek_v41 | the trunk, vision included; routed experts on the expert tier | fp8 in 32x32 ue8m0 tiles, bf16; experts MXFP4 (fp4, a ue8m0 scale per 32) | the DSpark stages (their experts on the tier on a discrete GPU), the experts the tier does not hold |
 | deepseek_v4 | resident dense layers, head, router, compressors; routed experts on the expert tier | fp8 in 128x128 blocks, bf16; experts MXFP4 (fp4, a ue8m0 scale per 32) with [an activation of its own](#deepseek-v4s-activation) | the indexer's `weights_proj`, DSpark stages, the `--oracle` path's dense layers, the experts the tier does not hold |
 | glm53 (GLM-5.3 Flash) | the resident matrices (an f32 checkpoint's experts among them); the streaming container's routed experts on the expert tier | int8 and int4-g64 (`GLM53_BITS`); experts int4-gs64 | f32 matrices (`GLM53_BITS=32`), the streamed experts the tier does not hold, all of them when `swiglu_limit` is 0 |
-| qwenimage | the DiT: every block of a step on the chain (`qwenimage_chain.h`), or its matrices one by one | int8, bf16, f32 (`COLI_IMG_BITS`) | text encoder, VAE |
+| qwenimage | the DiT: every block of a step on the chain (`qwenimage_chain.h`), or its matrices one by one | int8, bf16, f32 (`COLI_IMG_BITS`); a GGUF's block types as the file has them, on the chain only (the block GEMM) | text encoder, VAE; a GGUF's block matrices off the chain |
 | laya (Laya) | the whole forward: encoder and decision head layers ([below](#the-decision-engines)); with `COLI_VK_CHAIN=0` their matrices | f16 (fmt 14, the release's F16 values), f32 | the scorer and the act head on the marker rows, the tokenizer |
 | gliner_decide (GLiNER2.5-Decide) | the whole encoder ([below](#the-decision-engines)); with `COLI_VK_CHAIN=0` its matrices | f32 | the classifier on the `[L]` rows, the tokenizer |
 
@@ -1160,7 +1160,9 @@ chain's copy of the trunk would take the expert tier's budget (on an 8 GB RTX 40
 Laptop with qwen38, disk-bound, the tier got 1.87 GiB instead of 6.00 and decode went
 from 0.84 to 0.64 tok/s, #1900). olmoe and inkling run it as well ([OLMoE and Inkling](#olmoe-and-inkling)).
 colibri (GLM-5.2), glm53 (GLM-5.3 Flash) and kimi_k3 run it too, with the MLA,
-KDA and hyper-connection ops ([below](#glm-52-and-glm-53-flash-on-the-chain)), and
+KDA and hyper-connection ops ([below](#glm-52-and-glm-53-flash-on-the-chain)); kimi_k3
+runs Kimi K3.1 Pro's DSA layers there too, its index keys on the device and, past
+2048 positions, each row's selection by `vkc_dsa_select` ([kimi_k3.md](kimi_k3.md#kimi-k31-pro)); and
 deepseek_v41 and deepseek_v4 with DeepSeek's own ([below](#deepseek-v41-flash-and-deepseek-v4-on-the-chain)).
 
 **What runs where, per layer** (S rows: one at decode, a prompt chunk at prefill):
@@ -1848,9 +1850,43 @@ conversation has no place runs on the host's path. A device lost mid-step rebuil
 conversation's state that was on the device from its prefix record, on the CPU. The end
 of a turn prints `[VK] qwen36 chain: KV_SLOTS=n: s decode steps of several conversations
 in the chain (r rows, ... a step), h on the host's path; p conversations' state on the
-device, e handed over`. The second device's chain, a partial chain and the KV split keep
-the older way: the chain runs each conversation's prompts, its state handed over through
-the host when the conversation changes, and the decode steps run on the host's path.
+device, e handed over, c places' mirrors cut to a shorter conversation`. The second device's
+chain, a partial chain and the KV split keep the older way: the chain runs each
+conversation's prompts, its state handed over through the host when the conversation
+changes, and the decode steps run on the host's path.
+
+A place's mirrors grow with its conversation: first into the free memory, then into the
+mirrors of the places used least recently, then into the expert tier's memory
+(`vkt_give_back`), as one conversation's mirror does. A conversation that needs less than
+half of its place's mirrors has them cut to its length, and what they held past that goes
+back to the tier (`vkt_take_back`: its places, budget and pool limit up again, the routes
+filling them); one slot's mirror is cut the same way. Where even the tier's memory is not
+enough the places close (`a prompt's KV mirror does not fit beside the other conversations'
+state`), and the next conversation that enters opens them again. Before (#2733), a place
+asked the tier nothing: on an 8 GB card's room (an RTX PRO 4000 with 16 GB held by another
+process, the per-row Qwen3.6-35B-A3B, `--ctx 65536`, a new conversation each request,
+decode tok/s):
+
+| two slots | before | after |
+|---|---|---|
+| short prompts, at the start | 76-93 | 77-90 |
+| after an 11,850-token document | 17.8 | 73.4 |
+| after 19,387 tokens | 12.1 | 47.5 |
+| 43,913 tokens | past 25 minutes, cancelled | 79 s, 33.2 |
+| short prompts after it | 26-27 | 70-87 |
+
+One slot's 44K-token prompt took the 498 MiB its mirror lacked from the tier, then split the
+mirror past the device (the plan holds it to four fifths of the free memory), its rows past
+the device's read over the bus in float32, and ran past 25 minutes; the mirror now asks the
+tier for the plan's room whole, a margin more where it could split:
+
+| one slot | before | after |
+|---|---|---|
+| short prompts, at the start | 76-90 | 76-91 |
+| after 11,850 tokens | 74.8 | 75.1 |
+| after 19,387 tokens | 64.5 | 65.7 |
+| 43,913 tokens | past 25 minutes, cancelled | 67.8 s, 50.9 |
+| short prompts after it | 58-63 | 72-83 |
 
 **Several conversations at once (the other engines).** qwen38, OLMoE, Inkling,
 Kimi K3, MiMo, DeepSeek V4 and V4.1 decode `KV_SLOTS`' conversations together too, but

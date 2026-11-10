@@ -102,7 +102,7 @@ class ServeEngine:
                 return
         raise RuntimeError("engine never reported READY")
 
-    def ask(self, rid, prompt, max_tok=1):
+    def ask(self, rid, prompt, max_tok=1, slot=0):
         """Returns the generated payload as BYTES.
 
         Never as str: a random-init fixture emits arbitrary byte sequences that
@@ -110,7 +110,7 @@ class ServeEngine:
         re-encoding yields entirely different bytes.
         """
         assert isinstance(prompt, bytes), "prompts stay bytes end to end"
-        header = f"SUBMIT {rid} 0 {len(prompt)} {max_tok} 0 1{self.header_tail}\n".encode()
+        header = f"SUBMIT {rid} {slot} {len(prompt)} {max_tok} 0 1{self.header_tail}\n".encode()
         self.p.stdin.write(header + prompt + b"\n")
         self.p.stdin.flush()
         chunks = []
@@ -320,6 +320,72 @@ class PrefixReuseContract:
         reused = [int(n) for n in re.findall(r"\[PREFIX\] reusing (\d+) of", log)]
         # the opening's tokens, from the first request's line ("no reuse: held=0 cap=C prompt=N" or
         # "no reuse, 0 of N prompt tokens", as the engines say it)
+        first = re.search(r"\[PREFIX\] no reuse(?:: held=\d+ cap=\d+ prompt=(\d+)|, \d+ of (\d+) prompt tokens)", log)
+        held = int(first.group(1) or first.group(2)) if first else None
+        self.assertTrue(reused and held and reused[-1] >= held,
+                        "the next turn read the parked conversation again:\n" + log)
+
+    # An engine that decides a parked conversation's fate at the next request rather than when
+    # the request that parked it ends (#2703) sets this, and the scenario below holds it to it.
+    PARK_DECIDES_NEXT = False
+
+    def test_a_new_shorter_conversation_keeps_its_own_state(self):
+        """#2703: an agent runs one task after another on one slot. A new conversation shorter
+        than the last parked the old one at every turn and got it back after every turn, so its
+        own state never stayed and each of its turns read everything again. From its second turn
+        on it continues from its own state, and answers as a cold engine does."""
+        if not self.PARK_DECIDES_NEXT:
+            self.skipTest("this engine brings a parked conversation back when the request ends")
+        old = (b"The capital of France is Paris, the capital of Italy is Rome, the capital of Spain is "
+               b"Madrid, the capital of Germany is Berlin, and the capital of")
+        new = b"Five times five is twenty-five, and six times six is"
+        new2 = new + b" thirty-six. Seven times seven is"
+        with mock.patch.dict(os.environ, {"COLI_PARK_MIN": "16"}):
+            warm = self.spawn()
+        warm.ask("1", old)
+        warm.ask("2", new)
+        got = warm.ask("3", new2, max_tok=8)
+        log = warm.close()
+        cold = self.spawn(log_prefix=False)
+        want = cold.ask("1", new2, max_tok=8)
+        cold.close()
+        self.assertIn("conversation parked for a", log, "the shorter conversation did not park the old one:\n" + log)
+        self.assertNotIn("conversation is back", log, "the old conversation came back after the new one's turn:\n" + log)
+        self.assertEqual(got, want, "the new conversation's second turn answered otherwise")
+        reused = [int(n) for n in re.findall(r"\[PREFIX\] reusing (\d+) of", log)]
+        self.assertTrue(reused and reused[-1] >= len(new) // 2,
+                        "the new conversation's second turn read its own first turn again:\n" + log)
+
+    def test_two_short_requests_between_two_turns_keep_the_conversation(self):
+        """With the fate decided at the next request (#2703), a second short request that fits the
+        rows kept apart leaves the conversation parked: the rows past them are the conversation's
+        while it runs, so it starts over on those rows alone. The conversation's next turn brings it
+        back whole, continues from it and answers as a cold engine does."""
+        if not (self.PARKS and self.PARK_DECIDES_NEXT):
+            self.skipTest("this engine brings a parked conversation back when the request ends")
+        opening = (b"The capital of France is Paris, the capital of Italy is Rome, the capital of Spain is "
+                   b"Madrid, the capital of Germany is Berlin, and the capital of")
+        # the second shares its start with the first and nothing with the conversation: it follows
+        # the state held now further than the parked one
+        side, side2 = b"Five times five is", b"Five plus five is"
+        second = opening + b" Austria is Vienna. The capital of Poland is"
+        with mock.patch.dict(os.environ, {"COLI_PARK_MIN": "16"}):
+            warm = self.spawn()
+        warm.ask("1", opening)
+        warm.ask("2", side, max_tok=8)
+        aside = warm.ask("3", side2, max_tok=8)
+        got = warm.ask("4", second, max_tok=8)
+        log = warm.close()
+        answers = []
+        for prompt in (side2, second):
+            cold = self.spawn(log_prefix=False)
+            answers.append(cold.ask("1", prompt, max_tok=8))
+            cold.close()
+        self.assertIn("conversation stays parked", log, "the second short request did not keep it parked:\n" + log)
+        self.assertEqual(log.count("conversation is back"), 1, "the conversation did not come back once:\n" + log)
+        self.assertEqual(aside, answers[0], "the second short request answered otherwise beside a parked conversation")
+        self.assertEqual(got, answers[1], "the conversation answered otherwise after two short requests")
+        reused = [int(n) for n in re.findall(r"\[PREFIX\] reusing (\d+) of", log)]
         first = re.search(r"\[PREFIX\] no reuse(?:: held=\d+ cap=\d+ prompt=(\d+)|, \d+ of (\d+) prompt tokens)", log)
         held = int(first.group(1) or first.group(2)) if first else None
         self.assertTrue(reused and held and reused[-1] >= held,

@@ -735,6 +735,13 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `DSV4_CUDA_COMPRESSOR` (1) | compressor projection on the device; `0` host |
 | `DSV4_CUDA_RESIDENT_ROUTE` (1) | device-side routing/MoE for a complete 256-expert table; `0` host routing |
 | `DSV4_CUDA_BATCHED` (1) | batched BF16 routing path; `0` legacy |
+| `DSV4_CUDA_HEAD` (1) | exact vocabulary head on the GPU; `0` keeps it on the CPU |
+| `DSV4_CUDA_HEAD_BATCH` (1) | batched exact head; `0` per-token |
+| `DSV4_HEAD_VERIFY` (0) | `1` checks the batched head against the per-token path (diagnostic) |
+| `DSV4_CUDA_RESIDENT_INDEXER` (1) | upload indexer query weights once per layer; `0` per call |
+| `DSV4_CUDA_INDEXER_HEADS` (1) | indexer score heads on the device; `0` the block kernel |
+| `DSV4_CUDA_INDEXER_PREP` (1) | indexer preparation on the device; `0` host path |
+| `DSV4_CUDA_WO_DECODE` (1) | output projection's decode intermediates on the device; `0` host |
 | `V4_MTP_GPU_MIRRORS` (16) | separate mirror cache for the MTP drafter |
 | `DSV4_CUDA_PIN_HOST` (1, `.cu`) | page-lock expert-cache slabs for DMA uploads |
 | `DSV4_CUDA_MOE_GROUPED` (1, `.cu`) | expert-grouped MoE GEMM rows; `0` = legacy replicated |

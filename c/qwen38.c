@@ -2143,6 +2143,28 @@ static void q38_unpark(Model *m){
     if(getenv("COLI_PREFIX_LOG"))fprintf(stderr,"[PREFIX] the %d-token conversation is back\n",g_q38_park.len);
     q38_park_free_rows();
 }
+/* the next request decides a parked conversation's fate (#2703, qwen36.c's q36_park_decide): a
+ * prompt that follows it further than the state held now brings it back; one whose rows stay
+ * within the rows kept apart keeps it parked; any other drops it, with its prompt-end snapshot */
+static void q38_park_decide(Model *m,const int *ids,int np,int max_tok){
+    if(!g_q38_park.on)return;
+    int a=0;const int top=g_q38_park.len<np-1?g_q38_park.len:np-1;
+    while(a<top&&g_q38_park.fed[a]==ids[a])a++;
+    const int b=kv_prefix_common(&m->kvp,ids,np);
+    if(a>b){q38_unpark(m);return;}
+    const int gen=max_tok<Q38_PARK_GEN?max_tok:Q38_PARK_GEN,n=np+gen+Q38_SPEC_ROWS;
+    if(n<=g_q38_park.rows){
+        if(getenv("COLI_PREFIX_LOG"))
+            fprintf(stderr,"[PREFIX] the %d-token conversation stays parked: this request's %d rows fit the %d kept apart\n",
+                    g_q38_park.len,n,g_q38_park.rows);
+        return;
+    }
+    if(getenv("COLI_PREFIX_LOG"))
+        fprintf(stderr,"[PREFIX] the parked %d-token conversation is dropped: this request follows the state held now "
+                       "(%d of its tokens against the parked one's %d)\n",g_q38_park.len,b,a);
+    q38_prefix_cache_dispose(&g_q38_park.snap);memset(&g_q38_park.snap,0,sizeof g_q38_park.snap);
+    q38_park_free_rows();
+}
 
 /* Where a chat prompt's answer starts: past its last "<|im_start|>assistant\n", when only the
  * template's opening of the answer follows it (a few tokens: Qwen3.8's "<think>\n"); -1 when
@@ -2307,6 +2329,7 @@ static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
         q->max_tok = budget;
     }
     printf("ACCEPT %s %d\n",q->id,np); fflush(stdout);
+    if(lone)q38_park_decide(m,ids,np,q->max_tok);   /* a conversation parked by the last request: back, kept or dropped */
     clk->started=now_s(); clk->hits=m->hits; clk->misses=m->miss; clk->timers=m->timers;
     /* Prima gli scatti CHIESTI, e il piu profondo: sono punti di ritorno che
      * il client ha dichiarato, e battono la cache automatica, che insegue solo
@@ -2433,11 +2456,9 @@ static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
 }
 
 static int serve_one_turn(Model *m, ServeReq *q);
-/* one request; a conversation parked for it (q38_park) comes back when it ends, however it ends */
+/* one request; a conversation parked for it (q38_park) waits for the next request (q38_park_decide) */
 static int serve_one(Model *m, ServeReq *q){
-    int r=serve_one_turn(m,q);
-    q38_unpark(m);
-    return r;
+    return serve_one_turn(m,q);
 }
 static int serve_one_turn(Model *m, ServeReq *q){
     int *ids=NULL, np=0; float *lo=NULL; Q38ReqClock clk;

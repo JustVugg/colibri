@@ -228,6 +228,12 @@ Since routing, expert selection, and scheduling already exist on CPU/Vulkan, Pha
 
 ### Phase 7b — Port DSA indexer (Ic + k_idx) [2026-07-31] ✅ DONE
 
+> **Superseded (2026-11-08).** The keys and tensor names below were written before any
+> checkpoint had an indexer. Kimi K3.1 Pro's are `text_config.dsa_config` and
+> `self_attn.indexer.{wq_b, wk, k_norm.weight, k_norm.bias, weights_proj}`, with a
+> LayerNorm key and no rotary part; the CPU engine reads those and selects with them
+> ([kimi_k3.md](kimi_k3.md#kimi-k31-pro)). The Metal path does not run K3.1's indexer.
+
 DSA (Dictionary Sparse Attention) selects a top-K subset of cache rows per decode step,
 so that only the most relevant context positions participate in the attention scoring of
 Phase 8. It operates on a separate "indexer" cache of dimension `index_hd` (typically 64–256),

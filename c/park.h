@@ -9,9 +9,10 @@
  *
  * THE IDEA. Such a request writes only the first rows of each cache: its prompt and its answer,
  * a few hundred positions. Before it runs, the conversation's copy of those rows goes aside
- * with its tokens and the state that is not rows (a recurrence, a convolution's window); when
- * the request's turn ends, all of it goes back, and the record says the conversation again.
- * Its next turn continues from where it was and reads only what is new.
+ * with its tokens and the state that is not rows (a recurrence, a convolution's window). The
+ * next request decides (coli_park_decide, #2703): the conversation's next turn brings all of it
+ * back, and the record says the conversation again, so it continues from where it was and reads
+ * only what is new; another short request leaves it parked; a new conversation drops it.
  *
  * WHAT THIS FILE KNOWS AND WHAT IT DOES NOT. An engine describes its state as parts (below):
  * a cache of rows by position, a ring of rows by position modulo its size, a block saved whole.
@@ -147,6 +148,38 @@ static inline int coli_park_restore(ColiPark *p, kv_prefix *kvp, int *kv_len, in
     if (getenv("COLI_PREFIX_LOG")) fprintf(stderr, "[PREFIX] the %d-token conversation is back\n", p->len);
     coli_park_free(p);
     return 1;
+}
+
+/* The next request decides a parked conversation's fate (#2703), before its cache grows, so the
+ * rows come back in the layout they were kept in. An agent that runs one task after another on
+ * one slot sends a new conversation shorter than the last: brought back when the request that
+ * parked it ended (or first thing at the next request), the old conversation took the state at
+ * every turn and each of the new one's turns read everything again.
+ *   1   back: the request follows the parked conversation further than the state held now
+ *       (that conversation's next turn); the engine restores it (coli_park_restore).
+ *   0   kept parked: the request's rows (its prompt, up to COLI_PARK_GEN of its answer, spec a
+ *       verify's) fit the rows kept apart; a request that starts over resets only those (p->n),
+ *       the conversation's rows past them stay where they are.
+ *  -1   dropped (coli_park_free): any other request, a new conversation; the state the last
+ *       request left is the one it reads. */
+static inline int coli_park_decide(const ColiPark *p, const kv_prefix *kvp, const int *ids, int np, int max_tok, int spec) {
+    if (!p->on) return 0;
+    int a = 0;
+    const int top = p->len < np - 1 ? p->len : np - 1;
+    while (a < top && p->fed[a] == ids[a]) a++;
+    const int b = kv_prefix_common(kvp, ids, np);
+    if (a > b) return 1;
+    const int gen = max_tok < COLI_PARK_GEN ? max_tok : COLI_PARK_GEN, n = np + (gen > 0 ? gen : 0) + spec;
+    if (n <= p->n) {
+        if (getenv("COLI_PREFIX_LOG"))
+            fprintf(stderr, "[PREFIX] the %d-token conversation stays parked: this request's %d rows fit the %d kept apart\n",
+                    p->len, n, p->n);
+        return 0;
+    }
+    if (getenv("COLI_PREFIX_LOG"))
+        fprintf(stderr, "[PREFIX] the parked %d-token conversation is dropped: this request follows the state held now "
+                        "(%d of its tokens against the parked one's %d)\n", p->len, b, a);
+    return -1;
 }
 
 #endif /* COLI_PARK_H */

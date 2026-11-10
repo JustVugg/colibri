@@ -397,6 +397,10 @@ int  vkt_score(int layer, uint64_t *score);
  * out of the tier; the tier then holds that much less. Between steps, on the engine's
  * thread. The bytes released, 0 when none could be. */
 size_t vkt_give_back(size_t bytes);
+/* The engine's device memory back to the tier (a long conversation's KV mirror freed): up to
+ * what vkt_give_back took and has not had back, the tier's places, budget and pool limit up
+ * again; the routes fill them. The bytes returned. */
+size_t vkt_take_back(size_t bytes);
 #else
 static inline int vkt_host_pool_on(void){return 0;}
 static inline size_t vkt_stage_room(void){return 0;}
@@ -406,6 +410,7 @@ static inline void vkt_vram(VktVram *o){o->res_used=o->res_total=o->slot_bytes=o
 static inline int vkt_dev_host(int l,uint8_t *h){(void)l;(void)h;return -1;}
 static inline int vkt_score(int l,uint64_t *s){(void)l;(void)s;return -1;}
 static inline size_t vkt_give_back(size_t b){(void)b;return 0;}
+static inline size_t vkt_take_back(size_t b){(void)b;return 0;}
 typedef struct { const uint8_t *g, *u, *d; int tg, td; size_t rgu, rd; const float *sg, *su, *sd; int gsgu, gsd; } VktHostExpert;
 static inline int vkt_dev_table_hybrid(int l,uint32_t *e,VktHostExpert *h){(void)l;(void)e;(void)h;return -1;}
 static inline int vkt_dev_entry(int l,int e,uint32_t *t,uint32_t *th,VktHostExpert *h,uint8_t *o){(void)l;(void)e;(void)t;(void)th;(void)h;(void)o;return -1;}

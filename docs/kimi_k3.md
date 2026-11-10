@@ -14,6 +14,70 @@ make kimi_k3
 `model-*-of-000096.safetensors`) or a repacked container (below). Text-only:
 the vision tower (shards 95–96) is never read.
 
+## Kimi K3.1 Pro
+
+[Kimi K3.1 Pro](https://huggingface.co/moonshotai/Kimi-K3.1-Pro) runs on this
+engine as it ships: the same 96 shards as K3 (1,561 GB, of which the MXFP4
+routed experts are 1,446.5 GB), read straight from the HF snapshot
+(`coli pull kimi-k3.1-pro`). Every K3 tensor is there under its name, dtype and
+shape; the 120 tensors more are the indexer of DeepSeek Sparse Attention on the
+24 gated MLA layers (`self_attn.indexer.{wq_b, wk, k_norm.weight, k_norm.bias,
+weights_proj}`, BF16, 0.36 GB in all). `config.json` says `kimi_k31` and
+carries `text_config.dsa_config` (32 heads of 128, top 2048, no rotary part).
+
+- **Gated DSA.** Each position keeps a key `k = LayerNorm(W_k x)`; a token's
+  queries `q_h = W_qb qa` (the q_lora latent after its RMSNorm) and weights
+  `w = W_p x` score every position of its context as
+  `sum_h w_h ReLU(q_h . k / sqrt(128)) / sqrt(32)`, and it attends to the
+  2048 best (a tie: the earlier position) instead of all of them. Up to 2048
+  positions it keeps every one: its attention is K3's, bit for bit.
+  `KIMI_DSA_INDEXER=0` keeps the attention dense past 2048, for a comparison.
+- **Chat.** Its `encoding_k3.py` is K3's code (only its comments and layout
+  differ) and its `tiktoken.model` K3's file, so the chat, the tools and the
+  tokenizer are K3's. A request that thinks may name `reasoning_effort`: low,
+  high and max are the model's (OpenAI's medium is high here, xhigh max).
+- **Validation.** Moonshot ships no modeling code for K3.1. `tools/k3_ref.py`
+  implements the indexer from the definition, apart from the C engine;
+  `make kimi-k3-tiny-check` builds `kimi_k31_tiny` (K3's tiny weights plus an
+  indexer with a top 4) and checks every layer against it past index_topk, the
+  dense bits within it, chunked prefill, two conversations decoded at once,
+  photos and the parked conversation. The indexer's names, dtypes and shapes
+  were read from the real checkpoint's shard headers; the whole model has not
+  run here yet (no host of ours holds 1.6 TB).
+- **On the GPU.** The Vulkan chain runs K3.1's layers as K3's, the indexer
+  included: each DSA layer keeps its index keys on the device (whole, also when
+  the latent cache is split between the device and the host), and past 2048
+  positions a row's selection (`vkc_dsa_select`, the CPU's order) is the list
+  its attention core reads. `make` `kimi-chain` in `tests/vulkan_engines.sh`
+  checks the chain's tokens against the CPU's on the tiny K3.1, whole, partial,
+  in small chunks, quantized and split. With `K3_CUDA=1` the CUDA chain does
+  the same (`kimi_k3_cuchain.h`, below).
+
+## CUDA (`make CUDA=1 kimi_k3`, `K3_CUDA=1`)
+
+The routed experts run in the CUDA expert tier (`cu_tier.h`) and the dense
+matrices on the same card (`cu_dense.h`). The first layers run there as one
+chain (`kimi_k3_cuchain.h`), the Vulkan chain's layout on the CUDA chain's ops:
+GLM-5.3's KDA (K3's form) and MLA pieces, GLM-5.2's indexer selection for
+K3.1's DSA layers, and K3's residual mix and SiTU-GLU (`cuda_k3c.cuh`). Per
+sparse layer the host gets the router logits and the latent rows, runs the
+routed experts and sends their sum back; after the chain's last layer each
+row's AttnRes state comes back and the CPU runs the rest and the head. The
+layers on the card are the first ones the dense budget holds (every dense
+matrix where they fit with the chain's own bytes), or `COLI_CUDA_CHAIN_LAYERS`
+of them; `COLI_CUDA_CHAIN=0` keeps the CPU's layers.
+
+A prompt chunk's matrices go through the tensor cores (TF32 or f16 inputs,
+about 1e-3 relative, as every CUDA chain's); `COLI_CUDA_TC_GEMM=0` keeps them on
+the exact kernel. `make CUDA=1 kimi-k3-cuda-chain-check` checks, on the tiny K3
+and K3.1, every trunk (f32, int8, int4) and placement (every layer, chunks of 3
+rows, a token at a time, the first 3 layers, the first one) against the CPU's
+tokens with the exact kernel, the first token with the tensor cores, then K3.1's
+test and K3's vendor oracle with the chain on; `make CUDA=1 cuda-k3c-check` the
+two ops against `kimi_k3.c`'s arithmetic. The chain declines for the validation
+dumps, several conversations at once (`KV_SLOTS`) and a GGUF's blocks, which the
+Vulkan chain runs.
+
 ## Architecture notes
 
 K3 is not a DeepSeek-shaped model; four pieces are new relative to everything
@@ -187,6 +251,7 @@ Judge quantization choices on real-text logits, not synthetic-vector norms.
 | `K3_LAYERS` | all | truncate the stack (validation) |
 | `K3_TRACE` | — | dump f32 hidden state after every layer (validation) |
 | `K3_X0` | — | inject input rows, bypass embedding (validation) |
+| `KIMI_DSA_INDEXER` | on | `0`: K3.1's DSA layers attend densely past index_topk (a comparison, not the model) |
 | `COLI_TEMP` | 0 | 0 = greedy, else softmax temperature |
 
 ## Chunked prefill
@@ -308,7 +373,8 @@ short-term reuse (temporal locality), not with marginal expert heat.
 - Decode is single-token (no speculative decoding — K3 has no MTP head).
 - Tool declarations/calls and image content are not exposed through the shared
   gateway yet; unsupported requests fail explicitly.
-- CPU + optional Vulkan (the shared expert tier; no CUDA/Metal).
+- CPU, Vulkan (the shared expert tier and the dense chain) and CUDA (the expert
+  tier, the dense matrices and the chain's first layers); no Metal.
 - The protocol, tokenizer, gateway, TUI, and Web client paths are locally
   testable without the 1.5 TB checkpoint. A release claim still requires one
   full-model multi-turn TUI/Web run on a host that owns the complete snapshot.

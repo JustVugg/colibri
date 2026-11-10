@@ -26,11 +26,15 @@ engine), lfm3 (LFM3-VL's text model -> qwen36 engine), qwen4exp (Qwen3.8-Flash-N
 Flash -> deepseek_v4 engine), inkling (Inkling -> inkling engine), glm5-next (GLM-5.3-Flash ->
 glm53 engine), glm-dsa (GLM-5.2 / GLM-5.3 -> colibri engine), mimo2 (MiMo-V2.6 -> mimo engine),
 deepseek41 (DeepSeek V4.1 Flash, files with the config whole and the published K-quant and IQ ones ->
-deepseek_v41 engine), olmoe (OLMoE -> olmoe engine).
+deepseek_v41 engine), olmoe (OLMoE -> olmoe engine). Qwen-Image-2.1's denoiser (unsloth's GGUFs, no
+metadata: recognized by its tensors -> qwenimage engine), with a Qwen3-VL-8B-Instruct GGUF as its
+text encoder (--text-encoder) and the VAE's safetensors (--vae).
 
 Usage:
   python3 tools/gguf_import.py MODEL.gguf OUT_DIR [--mode link|copy]
   (MODEL may be the first part of a split model: NAME-00001-of-000NN.gguf)
+  python3 tools/gguf_import.py qwen-image-2.1-Q4_K_M.gguf OUT_DIR \
+          [--text-encoder Qwen3-VL-8B-Instruct-UD-Q4_K_XL.gguf] [--vae qwen_image_2.1_vae_bf16.safetensors]
 """
 import argparse
 import json
@@ -1413,6 +1417,284 @@ def write_packed(parts, readers, meta, tensors, layers, out_path):
     return data0 + total
 
 
+# ------------------------------------------------------------- Qwen-Image-2.1
+# unsloth's Qwen-Image-2.1 denoisers (unsloth/Qwen-Image-2.1-GGUF and its Turbo) carry no
+# metadata at all: the file is recognized by its tensors (the checkpoint's names under
+# "model.diffusion_model.", each block's gate and proj fused in one img_mlp.gate_up). The
+# folder written around it is the diffusers pipeline's (model_index.json, each part's config),
+# the denoiser read from the GGUF in place (transformer/gguf.json, st_gguf.h's qwen_image map),
+# the text encoder from a Qwen3-VL-8B-Instruct GGUF (text_encoder/gguf.json, the qwen3vl map;
+# its language model is Qwen-Image-2.1's text encoder byte for byte) or from an official
+# checkpoint's folder, the VAE copied from its safetensors file or read from an official folder.
+QIMG_PREFIX = "model.diffusion_model."
+# Qwen/Qwen-Image-2.1-Turbo's model_index.json: the eight sigmas it was distilled on
+QIMG_TURBO_SIGMAS = [1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568]
+QIMG_SCHED = {"_class_name": "FlowMatchEulerDiscreteScheduler", "base_image_seq_len": 256, "base_shift": 0.5,
+              "invert_sigmas": False, "max_image_seq_len": 8192, "max_shift": 0.9, "num_train_timesteps": 1000,
+              "shift": 1.0, "shift_terminal": 0.02, "stochastic_sampling": False, "time_shift_type": "exponential",
+              "use_beta_sigmas": False, "use_dynamic_shifting": True, "use_exponential_sigmas": False,
+              "use_karras_sigmas": False}
+QIMG_SCHED_TURBO = dict(QIMG_SCHED, shift_terminal=None, use_dynamic_shifting=False)
+QIMG_VAE = {"_class_name": "AutoencoderKLQwenImage21", "attn_scales": [], "base_dim": 96, "decoder_base_dim": 144,
+            "dim_mult": [1, 2, 4, 8, 8], "dropout": 0.0, "in_channels": 4, "is_residual": True,
+            "latents_mean": [0.5126, 0.7721, -0.0631, 1.3506, -0.7855, -2.1025, -0.3458, 1.3722, 1.8873, -1.7177,
+                             -0.651, 0.2732, 0.7562, -0.6163, -1.0277, 3.8363, 2.021, 0.0472, 0.932, 2.0087, 2.4954,
+                             -0.1391, -1.4249, 1.8464, -0.5236, 1.2826, 3.7046, -1.3035, 2.7286, -1.4518, -1.9036,
+                             -1.9955, -0.0342, -1.0265, -0.7636, 3.0555, 0.0746, -3.0751, -0.1076, 1.7376, -1.0914,
+                             -1.9435, -0.2784, -1.368, 0.4809, -0.4433, 0.3764, 0.5729, -2.0595, 1.096, -1.326,
+                             -2.0211, -5.0179, 0.5275, 4.0162, 1.8505, 0.3026, 1.9373, 1.4937, 0.2632, 0.5547,
+                             -1.7121, -0.1562, 0.0304],
+            "latents_std": [3.2001, 3.2936, 3.4321, 3.0091, 3.1061, 4.0379, 4.0705, 3.791, 3.0785, 3.65, 3.9308,
+                            3.0904, 2.8778, 3.7675, 3.732, 5.0756, 3.2864, 4.0397, 3.1317, 4.0443, 2.9249, 3.9454,
+                            3.0988, 4.2489, 3.4896, 3.8513, 3.9323, 3.4719, 3.7498, 4.283, 3.5694, 4.2467, 3.9037,
+                            3.2947, 5.077, 3.5075, 3.27, 3.4767, 2.8063, 5.1125, 3.5327, 4.7833, 3.1286, 4.1819,
+                            3.8527, 3.8312, 3.5605, 4.3875, 3.9624, 4.0168, 3.5643, 4.055, 5.5614, 4.2963, 4.408,
+                            3.4959, 3.8747, 3.7608, 3.5735, 3.149, 3.7662, 3.6746, 3.4563, 3.8161],
+            "num_res_blocks": 2, "out_channels": 4, "patch_size": None, "scale_factor_spatial": 16,
+            "scale_factor_temporal": 8, "temperal_downsample": [False, True, True, True], "z_dim": 64}
+QIMG_PIPELINE = {"_class_name": "QwenImage21Pipeline", "processor": ["transformers", "Qwen3VLProcessor"],
+                 "scheduler": ["diffusers", "FlowMatchEulerDiscreteScheduler"],
+                 "text_encoder": ["transformers", "Qwen3VLForConditionalGeneration"],
+                 "transformer": ["diffusers", "QwenImage21Transformer2DModel"],
+                 "vae": ["diffusers", "AutoencoderKLQwenImage21"]}
+# Qwen-Image-2.1's processor/tokenizer.json: Qwen2's split (digits one at a time) and NFC
+QWEN2_PRE = {"type": "Sequence", "pretokenizers": [
+    {"type": "Split", "pattern": {"Regex": "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+"
+                                           "[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"},
+     "behavior": "Isolated", "invert": False},
+    {"type": "ByteLevel", "add_prefix_space": False, "trim_offsets": False, "use_regex": False}]}
+QIMG_TE_PREFERENCE = ("UD-Q4_K_XL", "Q4_K_M", "UD-Q5_K_XL", "Q5_K_M", "Q6_K", "UD-Q6_K_XL", "Q8_0", "BF16")
+
+
+def qimg_name(name):
+    return name[len(QIMG_PREFIX):] if name.startswith(QIMG_PREFIX) else name
+
+
+def qwen_image_blocks(tensors):
+    """The block count when the tensors are Qwen-Image-2.1's denoiser (unsloth's names, or the
+    checkpoint's), else 0."""
+    names = {qimg_name(n) for n in tensors}
+    if not {"img_in.weight", "txt_in.text_norm.weight", "proj_out.weight", "modulation.1.weight"} <= names:
+        return 0
+    blocks = {int(m.group(1)) for n in names if (m := re.match(r"transformer_blocks\.(\d+)\.", n))}
+    return len(blocks) if blocks and blocks == set(range(len(blocks))) else 0
+
+
+def qwen_image_dit_config(tensors):
+    """transformer/config.json from the tensors' shapes: the official checkpoint's values, the
+    shapes the engine checks (dit_config) checked here first."""
+    t = {qimg_name(n): v for n, v in tensors.items()}
+
+    def shape(n):   # rows first, as safetensors
+        if n not in t:
+            sys.exit(f"denoiser GGUF: no tensor {n}")
+        return list(reversed(t[n]["dims"]))
+    layers = qwen_image_blocks(tensors)
+    dim, in_ch = shape("img_in.weight")
+    hd = shape("transformer_blocks.0.attn.norm_q.weight")[0]
+    ctx = shape("txt_in.in_layer.weight")[1]
+    out_ch = shape("proj_out.weight")[0]
+    gu = "transformer_blocks.0.img_mlp.gate_up.weight"
+    mlp2 = shape(gu)[0] if gu in t else 2 * shape("transformer_blocks.0.img_mlp.gate_layer.weight")[0]
+    # the three RoPE axes (16, 56, 56) fill a head of 128: what the checkpoint was trained with
+    if hd != 128 or dim % hd or mlp2 % (2 * dim) or out_ch != in_ch:
+        sys.exit(f"denoiser GGUF: dim {dim}, head {hd}, mlp {mlp2 // 2}, channels {in_ch}/{out_ch}: "
+                 f"not Qwen-Image-2.1's shapes")
+    for n in ("transformer_blocks.0.attn.to_q.weight", "modulation.1.weight"):
+        if shape(n)[-1] != dim:
+            sys.exit(f"denoiser GGUF: {n} is {shape(n)}, the model's width is {dim}")
+    return {"_class_name": "QwenImage21Transformer2DModel", "attention_head_dim": hd, "axes_dims_rope": [16, 56, 56],
+            "causal_condition": True, "context_in_dim": ctx, "eps": 1e-06, "in_channels": in_ch,
+            "mlp_ratio": mlp2 // (2 * dim), "num_attention_heads": dim // hd, "num_layers": layers,
+            "out_channels": out_ch, "patch_size": 1}
+
+
+def qwen3vl_text_encoder(path, width):
+    """(config.json, tokenizer.json, tokenizer_config.json) of a Qwen3-VL GGUF as Qwen-Image's
+    text encoder, or exit saying why it is not one. width: the denoiser's context_in_dim."""
+    try:
+        with GGUFReader(str(path), header_only=bool(os.environ.get("GGUF_CHECK"))) as r:
+            meta, names = r.metadata, {t["name"]: t for t in r.tensors}
+    except (GGUFError, OSError) as e:
+        sys.exit(f"--text-encoder {path}: {e}")
+    if meta.get("general.architecture") != "qwen3vl":
+        sys.exit(f"--text-encoder {path}: architecture {meta.get('general.architecture')!r}, not qwen3vl "
+                 f"(Qwen3-VL-8B-Instruct's GGUF, unsloth/Qwen3-VL-8B-Instruct-GGUF)")
+    p = "qwen3vl."
+    try:
+        hidden, layers = int(meta[p + "embedding_length"]), int(meta[p + "block_count"])
+        heads, kv = int(meta[p + "attention.head_count"]), int(meta[p + "attention.head_count_kv"])
+        hd = int(meta.get(p + "attention.key_length", hidden // heads))
+        ff, theta = int(meta[p + "feed_forward_length"]), float(meta[p + "rope.freq_base"])
+        eps = float(meta[p + "attention.layer_norm_rms_epsilon"])
+    except KeyError as e:
+        sys.exit(f"--text-encoder {path}: no {e.args[0]} in its metadata")
+    if hidden != width:
+        sys.exit(f"--text-encoder {path}: {hidden} wide, the denoiser reads {width} (Qwen3-VL-8B-Instruct)")
+    emb = names.get("token_embd.weight")
+    if not emb or "blk.0.attn_q.weight" not in names:
+        sys.exit(f"--text-encoder {path}: no token_embd.weight / blk.0.attn_q.weight")
+    vocab = int(emb["dims"][1])
+    text = {"model_type": "qwen3_vl_text", "hidden_size": hidden, "num_hidden_layers": layers,
+            "num_attention_heads": heads, "num_key_value_heads": kv, "head_dim": hd, "intermediate_size": ff,
+            "vocab_size": vocab, "rms_norm_eps": float(f"{eps:.6g}"), "rope_theta": theta, "hidden_act": "silu"}
+    cfg = {"architectures": ["Qwen3VLForConditionalGeneration"], "model_type": "qwen3_vl", "text_config": text}
+    tok, tcfg, _ = tokenizer_files(meta)
+    tok["normalizer"] = {"type": "NFC"}
+    tok["pre_tokenizer"] = QWEN2_PRE
+    tok["decoder"] = {"type": "ByteLevel", "add_prefix_space": False, "trim_offsets": False, "use_regex": False}
+    tok["model"].update(continuing_subword_prefix="", end_of_word_suffix="", ignore_merges=False)
+    return cfg, tok, tcfg
+
+
+def qwen_image_te_candidates(src):
+    """Qwen3-VL-8B-Instruct GGUFs next to the denoiser (its folder, then the parent), best first."""
+    seen, found = set(), []
+    for d in (src.parent, src.parent.parent):
+        for f in sorted(d.glob("*.gguf")) if d.is_dir() else ():
+            if re.search(r"qwen3-vl-8b", f.name, re.I) and not f.name.lower().startswith("mmproj") and f.resolve() not in seen:
+                seen.add(f.resolve()); found.append(f)
+    rank = lambda f: next((i for i, tag in enumerate(QIMG_TE_PREFERENCE) if f.name.endswith(f"-{tag}.gguf")), len(QIMG_TE_PREFERENCE))
+    return sorted(found, key=rank)
+
+
+def qwen_image_vae_file(path):
+    """'' when path is the VAE as diffusers names it (unsloth/Qwen-Image-2.1-FP8's
+    qwen_image_2.1_vae_bf16.safetensors, the official checkpoint's vae/), else why not."""
+    try:
+        with open(path, "rb") as f:
+            n = struct.unpack("<Q", f.read(8))[0]
+            if n > 1 << 26:
+                return "not a safetensors file"
+            head = json.loads(f.read(n))
+    except (OSError, ValueError, struct.error) as e:
+        return str(e)
+    if "decoder.conv_in.weight" in head and "post_quant_conv.weight" in head:
+        z = head["post_quant_conv.weight"]["shape"][0]
+        return "" if z == 64 else f"z_dim {z}, not 64"
+    if "decoder.conv1.weight" in head:
+        return ("ComfyUI's layout of the VAE (Comfy-Org); this engine reads the diffusers one: "
+                "vae/qwen_image_2.1_vae_bf16.safetensors from unsloth/Qwen-Image-2.1-FP8")
+    return "not Qwen-Image-2.1's VAE"
+
+
+def qwen_image_vae_candidates(src):
+    found = []
+    for d in (src.parent, src.parent / "vae", src.parent.parent, src.parent.parent / "vae"):
+        for f in sorted(d.glob("*.safetensors")) if d.is_dir() else ():
+            if "vae" in f.name.lower() or d.name == "vae":
+                found.append(f)
+    return found
+
+
+def qwen_image_official(path):
+    """An official Qwen-Image-2.1 (or Turbo) diffusers folder: path, or None."""
+    p = Path(path)
+    try:
+        idx = json.loads((p / "model_index.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return p if isinstance(idx, dict) and idx.get("_class_name") == "QwenImage21Pipeline" and not (p / "gguf.json").exists() else None
+
+
+def import_qwen_image(args, src, parts, tensors):
+    layers = qwen_image_blocks(tensors)
+    dit = qwen_image_dit_config(tensors)
+    variant = args.variant if args.variant != "auto" else ("turbo" if "turbo" in src.name.lower() else "base")
+    out = args.out
+    if args.mode == "copy":
+        sys.exit("--mode copy: the image engine reads its GGUFs in place; --mode link (lossless, no copy) is the way")
+    for sub in ("transformer", "scheduler"):
+        (out / sub).mkdir(parents=True, exist_ok=True)
+    index = dict(QIMG_PIPELINE)
+    parts_map, notes = {}, {}
+    # the text encoder: a Qwen3-VL GGUF (given, or found next to the denoiser), or an official folder
+    te = args.text_encoder
+    official = None
+    if te is None:
+        te = next(iter(qwen_image_te_candidates(src)), None)
+    if te is not None and Path(te).is_dir():
+        official = qwen_image_official(te) or qwen_image_official(Path(te).parent)
+        if not official:
+            sys.exit(f"--text-encoder {te}: a folder must be an official Qwen-Image-2.1 checkpoint "
+                     f"(model_index.json, text_encoder/, processor/)")
+        parts_map["text_encoder"] = str((official / "text_encoder").resolve())
+        tok_dir = official / "processor" if (official / "processor" / "tokenizer.json").is_file() else official / "tokenizer"
+        parts_map["processor"] = str(tok_dir.resolve())
+        notes["text_encoder"] = str(official.resolve())
+    elif te is not None:
+        cfg, tok, tcfg = qwen3vl_text_encoder(te, dit["context_in_dim"])
+        (out / "text_encoder").mkdir(exist_ok=True)
+        (out / "processor").mkdir(exist_ok=True)
+        (out / "text_encoder" / "config.json").write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+        (out / "text_encoder" / "gguf.json").write_text(json.dumps(
+            {"format": "colibri-gguf-v1", "gguf": str(Path(te).resolve()), "mode": "link", "arch": "qwen3vl", "parts": 1,
+             "size": Path(te).stat().st_size}, indent=1), encoding="utf-8")
+        (out / "processor" / "tokenizer.json").write_text(json.dumps(tok, ensure_ascii=False), encoding="utf-8")
+        (out / "processor" / "tokenizer_config.json").write_text(json.dumps(tcfg, ensure_ascii=False, indent=1), encoding="utf-8")
+        notes["text_encoder"] = str(Path(te).resolve())
+    else:
+        sys.exit("no text encoder: pass --text-encoder with a Qwen3-VL-8B-Instruct GGUF (unsloth/Qwen3-VL-8B-Instruct-GGUF, "
+                 "the denoiser's README names Qwen3-VL-8B-Instruct-UD-Q4_K_XL.gguf) or an official Qwen-Image-2.1 folder; "
+                 "one next to the denoiser is found by itself")
+    # the VAE: a safetensors file (copied: 0.7 GB), or an official folder's vae/
+    vae = args.vae
+    if vae is None and official:
+        vae = official
+    if vae is None:
+        for cand in qwen_image_vae_candidates(src):
+            if not qwen_image_vae_file(cand):
+                vae = cand; break
+    if vae is not None and Path(vae).is_dir():
+        o = qwen_image_official(vae)
+        vd = (o / "vae") if o else Path(vae)
+        if not (vd / "config.json").is_file():
+            sys.exit(f"--vae {vae}: no vae/config.json (an official Qwen-Image-2.1 folder, or its vae/)")
+        parts_map["vae"] = str(vd.resolve())
+        notes["vae"] = str(vd.resolve())
+    elif vae is not None:
+        why = qwen_image_vae_file(vae)
+        if why:
+            sys.exit(f"--vae {vae}: {why}")
+        (out / "vae").mkdir(exist_ok=True)
+        dst = out / "vae" / "diffusion_pytorch_model.safetensors"
+        if dst.exists() or dst.is_symlink():
+            dst.unlink()
+        try:
+            os.link(vae, dst)   # the same drive: no copy
+        except OSError:
+            import shutil
+            shutil.copyfile(vae, dst)
+        (out / "vae" / "config.json").write_text(json.dumps(QIMG_VAE, indent=1), encoding="utf-8")
+        notes["vae"] = str(Path(vae).resolve())
+    else:
+        sys.exit("no VAE: pass --vae with vae/qwen_image_2.1_vae_bf16.safetensors from unsloth/Qwen-Image-2.1-FP8 "
+                 "(the denoiser's README) or an official Qwen-Image-2.1 folder; one next to the denoiser is found by itself")
+    (out / "transformer" / "config.json").write_text(json.dumps(dit, indent=1), encoding="utf-8")
+    (out / "transformer" / "gguf.json").write_text(json.dumps(
+        {"format": "colibri-gguf-v1", "gguf": str(src), "mode": "link", "arch": "qwen_image", "parts": len(parts),
+         "size": sum(p.stat().st_size for p in parts)}, indent=1), encoding="utf-8")
+    (out / "scheduler" / "scheduler_config.json").write_text(
+        json.dumps(QIMG_SCHED_TURBO if variant == "turbo" else QIMG_SCHED, indent=1), encoding="utf-8")
+    if variant == "turbo":
+        index["sample_sigmas"] = QIMG_TURBO_SIGMAS
+    if parts_map:
+        index["colibri_parts"] = parts_map
+    index["colibri_gguf"] = {"arch": "qwen_image", "mode": "link", "source": str(src), "variant": variant,
+                             "name": "Qwen-Image-2.1" + ("-Turbo" if variant == "turbo" else ""),
+                             "license": "Qwen Research License: non-commercial use", **notes}
+    (out / "model_index.json").write_text(json.dumps(index, indent=1), encoding="utf-8")
+    types = sorted({tensors[n]["type_name"] for n in tensors})
+    print(f"colibri model directory ready: {out}  (Qwen-Image-2.1{' Turbo' if variant == 'turbo' else ''}, "
+          f"{layers} blocks, {', '.join(types)}, mode link)")
+    print(f"  text encoder: {notes['text_encoder']}")
+    print(f"  VAE: {notes['vae']}")
+    if variant == "turbo":
+        print("  Turbo: its 8-step schedule at 8 steps (the default); other step counts take the scheduler's linear one")
+    elif "turbo" not in src.name.lower() and args.variant == "auto":
+        print("  the base model's schedule (a Turbo denoiser's file name says turbo; --variant turbo when it does not)")
+
+
 def model_name(meta):
     """What the file calls the model, {"name": "Qwen3-0.6B", "size": "0.6B"} from general.name
     (else basename and size label), {} without either: the banner and the API id of a model
@@ -1442,6 +1724,14 @@ def main():
                     help="lfm3, mistral-large4: the vision tower's GGUF (mmproj-*.gguf), unset one next to the model (its folder, "
                          "then the parent; BF16 and F16 first)")
     ap.add_argument("--no-mmproj", action="store_true", help="lfm3, mistral-large4: text only, no vision tower linked")
+    ap.add_argument("--text-encoder", type=Path, default=None,
+                    help="Qwen-Image: the text encoder, a Qwen3-VL-8B-Instruct GGUF or an official Qwen-Image-2.1 folder; "
+                         "unset, a Qwen3-VL-8B GGUF next to the denoiser (its folder, then the parent; UD-Q4_K_XL first)")
+    ap.add_argument("--vae", type=Path, default=None,
+                    help="Qwen-Image: the VAE, qwen_image_2.1_vae_bf16.safetensors (unsloth/Qwen-Image-2.1-FP8) or an "
+                         "official Qwen-Image-2.1 folder; unset, one next to the denoiser")
+    ap.add_argument("--variant", choices=("auto", "base", "turbo"), default="auto",
+                    help="Qwen-Image: the denoiser's schedule; auto reads the file name (turbo: Qwen-Image-2.1-Turbo's 8 steps)")
     ap.add_argument("--indexer-compress-ratio", type=int, default=0,
                     help="qwen4exp: when the GGUF's attention.compress_ratios are all 0 (a converter "
                          "that read the layers as qwen_sparse_attention)")
@@ -1451,6 +1741,14 @@ def main():
     # engine's check of it (no tensor is read)
     parts, readers, meta, tensors = open_model(src, header_only=bool(os.environ.get("GGUF_CHECK")))
     arch = meta.get("general.architecture")
+    if arch in (None, "qwen_image") and qwen_image_blocks(tensors):
+        for r in readers:
+            r.close()
+        args.out = args.out.resolve()
+        return import_qwen_image(args, src, parts, tensors)
+    if arch == "qwen3vl":
+        sys.exit("qwen3vl: Qwen3-VL's language model is read here as Qwen-Image-2.1's text encoder: import the "
+                 "Qwen-Image denoiser GGUF with --text-encoder pointing at this file")
     if arch not in ARCHES:
         sys.exit(f"architecture {arch!r} is not supported yet (supported: {', '.join(ARCHES)})")
     if args.mode == "copy" and arch in COPY_UNREAD:

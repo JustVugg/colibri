@@ -40,7 +40,23 @@ static int serve_sample_sorted(const float *lo, int V, float temp, float top_p){
     for(int i=0;i<n;i++){ acc+=rank[i].p; if(acc>=r){ pick=rank[i].id; break; } }
     free(rank); return pick;
 }
+/* COLI_LOGIT_DUMP=1: each step's top-5 id:logit to stderr, as sample.h's pick_tok writes them (comparing
+ * two configurations on the same context: a stored prefix against a fresh read, a backend against another) */
+static void serve_logit_dump(const float *lo, int V){
+    static int dump = -1;
+    if(dump < 0) dump = getenv("COLI_LOGIT_DUMP") ? 1 : 0;
+    if(!dump) return;
+    int id[5]={-1,-1,-1,-1,-1}; float v[5]={-3e38f,-3e38f,-3e38f,-3e38f,-3e38f};
+    for(int t=0;t<V;t++){
+        float x=lo[t];
+        for(int k=0;k<5;k++) if(x>v[k]){ for(int j=4;j>k;j--){ v[j]=v[j-1]; id[j]=id[j-1]; } v[k]=x; id[k]=t; break; }
+    }
+    fprintf(stderr,"[LOGITS]");
+    for(int k=0;k<5;k++) fprintf(stderr," %d:%.6f",id[k],v[k]);
+    fprintf(stderr,"\n");
+}
 static int serve_sample(const float *lo, int V, float temp, float top_p){
+    serve_logit_dump(lo, V);
     if(temp<=0.f) return argmax_first(lo, V);
     if(!(top_p>0.f&&top_p<1.f)) return serve_sample_sorted(lo,V,temp,top_p);   /* every token is in the nucleus */
     float *prob=malloc((size_t)V*sizeof(float)), mx=lo[0];

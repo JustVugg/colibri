@@ -29,6 +29,9 @@ class ResponsesUpstreamFailureTest(unittest.TestCase):
             body = b""
 
             def do_POST(self):
+                # Drain the request first: closing a socket with unread bytes sends RST,
+                # and on Windows a RST can discard the reply before the shim reads it.
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.end_headers()

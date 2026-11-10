@@ -138,8 +138,14 @@ static struct {
     pthread_t th; int th_on, stop;
     pthread_mutex_t mx; pthread_cond_t cv, cv_room, cv_done;
     int busy;                          /* the uploader is between taking an entry and push_done */
+    int giving;                        /* vkt_give_back waits for the queue: an upload refused for room gives up
+                                        * at once (the room it waits for only the engine thread makes, and that
+                                        * thread is the one waiting, #2705) */
     int sync;                          /* COLI_VK_TIER_SYNC=1: quiescent points wait for the uploader */
     int evict_pending;                 /* victims chosen and not freed yet (a batch is in flight) */
+    /* what vkt_give_back took from the primary device and vkt_take_back has not returned: places
+     * (dmax[0]), bytes of the budget and of the pool's limit */
+    int gb_owed; size_t gb_owed_bytes;
     VQ q[VKT_QCAP]; int qh, qn;
     VDone *done; int ndone, cdone;
     unsigned long room_gen;
@@ -185,6 +191,7 @@ static struct {
     /* failed, by what: the pool refused the expert (no room as it is laid out), the copy
      * to the device failed, or the batch could not take the uploaded expert's sets */
     unsigned long long f_pool, f_copy, f_sets;
+    unsigned long long gave_up;          /* uploads given up for a give-back (#2705): back on the CPU, not failed */
     int plan_hist;                        /* the last plan's experts from the history (vkt_plan) */
     double dev_ms, cpu_ms, wait_ms;
     unsigned long long rep_routed, rep_served;
@@ -430,14 +437,15 @@ static void promote_copy(const VQ *e) {
         if (!src[k] || frees >= 3 || waited >= 600 || T.sync) break;
         pthread_mutex_lock(&T.mx);
         unsigned long gen = T.room_gen;
-        while (T.room_gen == gen && !T.stop && waited < 600) {
+        while (T.room_gen == gen && !T.stop && !T.giving && waited < 600) {
             struct timespec until; clock_gettime(CLOCK_REALTIME, &until);
             until.tv_nsec += 100 * 1000000L; if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
             if (pthread_cond_timedwait(&T.cv_room, &T.mx, &until) == ETIMEDOUT) waited++;
         }
         if (T.room_gen != gen) frees++;
-        int stop = T.stop;
+        int stop = T.stop, gave = T.giving;
         pthread_mutex_unlock(&T.mx);
+        if (gave) { copy_failed = 2; break; }   /* given up for a give-back: no question of the budget */
         if (stop) break;
     }
     if (ok && !coli_vk_tensor_copy(t, src, 3)) {
@@ -484,7 +492,7 @@ static void *uploader(void *arg) {
         const uint8_t *g = b, *u = g + guc, *d = u + guc;
         const uint8_t *gs = d + dc, *us = gs + gus, *ds = us + gus;
         ColiVkTensor *t[3];
-        int ok = 0, r = 0;
+        int ok = 0, r = 0, gave = 0;
         /* Refused: the pool is at its budget until the engine thread frees the victim
          * this promotion displaced, at its next quiescent point (a join: every layer
          * in decode, after a chunk's CPU work in prefill). Wait for room to be made
@@ -499,19 +507,20 @@ static void *uploader(void *arg) {
             if (ok || r < 0 || frees >= 3 || waited >= 600 || T.sync) break;
             pthread_mutex_lock(&T.mx);
             unsigned long gen = T.room_gen;
-            while (T.room_gen == gen && !T.stop && waited < 600) {
+            while (T.room_gen == gen && !T.stop && !T.giving && waited < 600) {
                 struct timespec until; clock_gettime(CLOCK_REALTIME, &until);
                 until.tv_nsec += 100 * 1000000L; if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
                 if (pthread_cond_timedwait(&T.cv_room, &T.mx, &until) == ETIMEDOUT) waited++;
             }
             if (T.room_gen != gen) frees++;
             int stop = T.stop;
+            gave = T.giving;
             pthread_mutex_unlock(&T.mx);
-            if (stop) break;
+            if (stop || gave) break;
         }
         free(e.buf);
         if (!ok) t[0] = t[1] = t[2] = NULL;
-        push_done(e.layer, e.eid, ok, r < 0, t, NULL);
+        push_done(e.layer, e.eid, ok, gave && !ok ? 2 : r < 0, t, NULL);   /* 2: given up for a give-back */
     }
 }
 
@@ -606,6 +615,7 @@ static void quiesce(void) {
                 continue;
             }
             for (int k = 0; k < 3; k++) { ColiVkTensor *t = k == 0 ? d[i].g : k == 1 ? d[i].u : d[i].d; if (t) coli_vk_tensor_free(t); }
+            if (d[i].copy_failed == 2) { T.gave_up++; continue; }   /* for a give-back: it may come again, the budget stands */
             T.failed++;
             if (d[i].ok) T.f_sets++; else if (d[i].copy_failed) T.f_copy++; else T.f_pool++;
             if (!d[i].ok && !d[i].copy_failed && T.dmax[0] > T.dres[0] + T.dque[0]) {
@@ -630,6 +640,7 @@ static void quiesce(void) {
             for (int k = 0; k < 3; k++) { ColiVkTensor *t = k == 0 ? d[i].g : k == 1 ? d[i].u : d[i].d; if (t) coli_vk_tensor_free(t); }
             v->state = VS_NONE; set_place(v, 0);
             if (dv && !T.d2) continue;
+            if (d[i].copy_failed == 2) { T.gave_up++; continue; }   /* for a give-back: it may come again, the budget stands */
             T.failed++;
             if (d[i].ok) T.f_sets++; else if (d[i].copy_failed) T.f_copy++; else T.f_pool++;
             /* refused: the budget holds fewer than the count said (fragmentation, or the
@@ -1605,7 +1616,7 @@ static int join_big(const float **rows) {
 /* layer's likely streamed experts into the free slots, while the device runs its attention */
 int vkt_stream_prefetch(int layer, int S) {
     if (!T.on || !T.st_ok || T.inflight || layer < 0 || layer >= T.main_layers || S < T.gemm_rows) return 0;
-    if (!coli_vk_xb_ready() || !st_alloc()) return 0;
+    if (!coli_vk_xb_ready()) return 0;
     const int E = T.c.experts, K = T.c.topk;
     int R = stream_min_rows();
     /* the slots a step before left filled are free again */
@@ -1632,6 +1643,10 @@ int vkt_stream_prefetch(int layer, int S) {
             while (at > 0 && est[cand[at - 1]] < est[e]) { cand[at] = cand[at - 1]; at--; }
             cand[at] = e;
         }
+    /* With every expert resident (in VRAM or the host pool), nothing needs a
+     * streaming slot. Keep the budget/resident set, but allocate slots only
+     * after finding a candidate: an empty prefetch must not consume VRAM. */
+    if (nc && !st_alloc()) { free(est); free(cand); return 0; }
     int got = 0, used = 0;
     if (nc > T.st_n) nc = T.st_n;
     while (used < nc) {   /* groups of a sub-batch's worth, into the slots in order */
@@ -1749,7 +1764,21 @@ static void dev_codes3(uint8_t *u, const uint8_t *row, int I) {
 /* an MXFP4 row's values times 2, as int8 (e2m1: 0, 0.5, 1, 1.5, 2, 3, 4, 6 and the sign) */
 static void dev_codes_fp4(int8_t *w, const uint8_t *row, int I) {
     static const int8_t v2[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
-    for (int j = 0; j < I / 2; j++) { w[2 * j] = v2[row[j] & 15]; w[2 * j + 1] = v2[row[j] >> 4]; }
+    int j = 0;
+#if defined(__AVX2__)
+    /* The scalar table lookup, 16 packed bytes at a time. The two shuffles
+     * produce exactly the same signed int8 codes; arithmetic is unchanged. */
+    const __m128i lut = _mm_loadu_si128((const __m128i *)v2);
+    const __m128i mask = _mm_set1_epi8(15);
+    for (; j + 16 <= I / 2; j += 16) {
+        const __m128i b = _mm_loadu_si128((const __m128i *)(row + j));
+        const __m128i lo = _mm_shuffle_epi8(lut, _mm_and_si128(b, mask));
+        const __m128i hi = _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(b, 4), mask));
+        _mm_storeu_si128((__m128i *)(w + 2 * j), _mm_unpacklo_epi8(lo, hi));
+        _mm_storeu_si128((__m128i *)(w + 2 * j + 16), _mm_unpackhi_epi8(lo, hi));
+    }
+#endif
+    for (; j < I / 2; j++) { w[2 * j] = v2[row[j] & 15]; w[2 * j + 1] = v2[row[j] >> 4]; }
 }
 static float dev_fp8(uint8_t b) {   /* e4m3 as the backend decodes it */
     const int e = (b >> 3) & 15, m = b & 7;
@@ -3060,8 +3089,13 @@ size_t vkt_give_back(size_t bytes) {
     (void)bytes; return 0;
 #else
     if (!T.on || !bytes || T.inflight) return 0;
+    /* the uploader's queue drains first; an upload refused for room would wait (a minute an
+     * entry) for a free only this thread makes, at a quiescent point it cannot reach while it
+     * waits here (#2705): told so, it gives such an upload up at once, its expert back on the CPU */
     pthread_mutex_lock(&T.mx);
+    T.giving = 1; pthread_cond_broadcast(&T.cv_room);
     while ((T.qn || T.busy) && T.th_on && !T.stop) pthread_cond_wait(&T.cv_done, &T.mx);
+    T.giving = 0;
     pthread_mutex_unlock(&T.mx);
     quiesce();
     if (T.inflight || T.nevict || T.ndfree) return 0;
@@ -3112,7 +3146,7 @@ size_t vkt_give_back(size_t bytes) {
     }
     free(hp);
     const int drop = T.dmax[0] - (T.dres[0] + T.dque[0]);
-    if (drop > 0) { T.dmax[0] -= drop; T.max_resident -= drop; }
+    if (drop > 0) { T.dmax[0] -= drop; T.max_resident -= drop; T.gb_owed += drop; }
     pthread_mutex_lock(&T.mx); T.evict_pending = T.nevict + T.ndfree; pthread_mutex_unlock(&T.mx);
     quiesce();   /* nothing in flight: the device copies freed, the changes published */
     ColiVkPoolStats st; coli_vk_pool_stats(1, &st);
@@ -3122,12 +3156,43 @@ size_t vkt_give_back(size_t bytes) {
     if (now) { coli_vk_tier_pool_blocks(now, nb); for (int k = 0; k < nb; k++) if (pick[k] && !now[k]) gave += bb[k]; }
     free(now); free(pick); free(bb);
     T.budget = T.budget > gave ? T.budget - (size_t)gave : 0;
+    T.gb_owed_bytes += (size_t)gave;
     coli_vk_pool_stats(1, &st);
     char hb[32], hc[32];
     fprintf(stderr, VKT_TAG " tier %s: %s of device memory back for the dense chain (%d experts to the host pool, %d out of the tier; "
             "the tier's pool now %s in %d blocks)\n", T.engine, human((double)gave, hb, sizeof hb), moved, out,
             human((double)st.total, hc, sizeof hc), st.blocks);
     return (size_t)gave;
+#endif
+}
+
+/* vkt_take_back: device memory the dense chain freed for good back to the tier, up to what
+ * vkt_give_back took and has not had back: the places on the primary device (dmax), the budget
+ * and the pool's limit go up by it again, and the routes fill the room (promote, or an upload
+ * into a free place). Before, what a long conversation's KV mirror took stayed the chain's for
+ * the rest of the process: 2799 places came down to 967 after one 44K-token conversation on an
+ * 8 GB card, and every later short conversation decoded with them (#2733). */
+size_t vkt_take_back(size_t bytes) {
+#ifdef VKT_NO_GIVE_BACK
+    (void)bytes; return 0;
+#else
+    if (!T.on || !bytes || T.gb_owed <= 0 || !T.gb_owed_bytes) return 0;
+    const size_t per = T.gb_owed_bytes / (size_t)T.gb_owed;   /* the bytes a place given back held */
+    int ex = per ? (int)(bytes / per) : 0;
+    if (ex > T.gb_owed) ex = T.gb_owed;
+    if (ex < 1) return 0;
+    const size_t b = ex == T.gb_owed ? T.gb_owed_bytes : (size_t)ex * per;
+    pthread_mutex_lock(&T.mx);
+    T.dmax[0] += ex; T.max_resident += ex; T.budget += b;
+    T.gb_owed -= ex; T.gb_owed_bytes -= b;
+    pthread_mutex_unlock(&T.mx);
+    ColiVkPoolStats st; coli_vk_pool_stats(1, &st);
+    const uint64_t base = st.limit ? st.limit : st.total;
+    coli_vk_tier_pool_limit((size_t)(base + b));
+    char hb[32];
+    fprintf(stderr, VKT_TAG " tier %s: %s of device memory back from the dense chain (%d more places for experts, %d on the "
+            "device now)\n", T.engine, human((double)b, hb, sizeof hb), ex, T.dmax[0]);
+    return b;
 #endif
 }
 
@@ -3435,6 +3500,7 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
     if (T.failed)
         fprintf(stderr, " | failed: %llu refused by the pool, %llu copies to the device, %llu not taken by the batch",
                 T.f_pool, T.f_copy, T.f_sets);
+    if (T.gave_up) fprintf(stderr, " | %llu uploads given up for room the engine gave back", T.gave_up);
     if (T.balance) fprintf(stderr, " | balance: device share %.2f, %llu rows handed to the CPU", T.share, T.handed);
     if (T.chain_served) fprintf(stderr, " | in the dense chain: %llu routed experts with no host step", T.chain_served);
     if (T.hy_steps || T.hyb_steps) {

@@ -7,6 +7,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### New
 
+- **Kimi K3.1 Pro** (`coli pull kimi-k3.1-pro`): the checkpoint as it ships, on the Kimi K3
+  engine. K3.1 is K3's weights plus DeepSeek Sparse Attention on its 24 gated MLA layers: a
+  token whose context passes 2048 positions attends to the 2048 its indexer picks, and up to
+  2048 the attention is K3's, bit for bit. The indexer follows GLM-5.2's definition with no
+  rotary part; Moonshot ships no K3.1 modeling code, so `tools/k3_ref.py` implements it apart
+  from the engine and `make kimi-k3-tiny-check` checks a tiny K3.1 against it. The chat and the
+  tokenizer are K3's, and a thinking request's `reasoning_effort` now reaches both models as
+  their template's thinking effort (low, high, max). Both GPU chains run the indexer: the
+  Vulkan chain with GLM-5.2's selection on the device, and a new CUDA chain for Kimi K3 and
+  K3.1 (`kimi_k3_cuchain.h`, `K3_CUDA=1`): the first layers the card holds, the rest on the CPU.
+
 - **K1b's grouped planar IDOT on pre-AVX2 x86 CPUs** (`IDOT_GS=1`, #2694): a build with SSSE3 and
   without AVX2 (Sandy and Ivy Bridge) now planarizes gs64 `fmt=4` tensors and takes the integer
   kernel's SSSE3 arms; `fmt=2` keeps the pair layout there, and with `IDOT_GS` unset nothing
@@ -44,6 +55,36 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **CPU without FMA: FP8 and int4-g64 experts read once for a prompt's rows** (#2715). On a
+  CPU without AVX2 or FMA (Sandy and Ivy Bridge, a build for the x86-64 baseline or v2),
+  quant.h's FP8 kernel decoded every weight again for each row and waited on one chain of adds:
+  a Xeon E5-2690 v1 spent ~150 ms a prompt token in Qwen3.8's FP8 experts, about a decode step.
+  Two rows or more now go into the lanes of a vector (8 with AVX, 4 with SSE2) with four output
+  rows a pass, and a single row runs four output rows a pass. expert_ffn.h's int4-g64 f32
+  kernel, the `experts-int4g64/` sidecar's, made its double-rounded multiply-adds one element
+  at a time; it now makes them in double vectors, a block's codes widened once for every row and
+  four blocks in flight. Every result keeps its bits: each row's sums are the scalar kernels'
+  own operations in their order (`tests/test_nofma_kernels.c`, built for the x86-64 baseline
+  and for Sandy Bridge). Qwen3.8's expert shapes on a Ryzen 7 PRO 8700GE built for Sandy Bridge,
+  one thread: FP8 2.4x for a decode row, 7.7x for 4 rows, 15x for 8 or more; int4-g64 2.6-2.9x
+  for a row, 3.8-4.1x for 4 or more (16 threads: FP8 1.5x and 7.5-9.6x, int4-g64 2.9-3.1x and
+  4.3-6.1x). DeepSeek V4's and GLM's FP8 matrices take the same kernel.
+- **CPU: qwen36 holds a GGUF's dense IQ3_S matrices as 4-bit codes** (#2704). IQ3_S packs four
+  values into a 9-bit index of a 512-row grid, and the CPU gathered a grid row for every four
+  values: those matrices read at a third of the RAM's speed on a Zen 4, about half of a token's
+  time for Qwen3.8-27B UD-Q3_K_XL (27% of its bytes IQ3_S). qwen36 now holds them as one code a
+  value (sign and level) in IQ4_XS's 16-row interleaved layout (`GQ_IQ3_S_R16`), read by its
+  kernels with the codes' values for the IQ4 table: a quarter more bytes for those matrices, the
+  same integer products. On a Ryzen 7 PRO 8700GE's CPU the 27B decodes at 2.82 tok/s instead of
+  2.35 with the release's x86-64-v3 build (3.04 instead of 2.38 built native), RSS 12.3 -> 13.1 GB;
+  an i5-13500, whose P-cores read the file's rows near their RAM's speed already, 2.4 -> 2.5. Only
+  dense matrices, each at its first product on the CPU (a matrix a device holds keeps the file's
+  rows: the 27B on a card that holds it all starts and takes RAM as before), only when the RAM free
+  then holds that quarter and 2 GB to spare (the engine says which), `Q36_IQ3S_CODES=0` to keep the
+  file's rows; experts and every other engine keep theirs. `tests/test_gq_r16` checks the form
+  (round trip exact, the kernels to the bit against their reference), and
+  `tests/test_qwen36_iq3s_codes.py` a small qwen35 GGUF with IQ3_S matrices: the same tokens, the
+  layers' residuals within 1e-4.
 - **CPU: the grid IQ types' dot product with the signs on the activation.** IQ2_XXS, IQ2_XS,
   IQ2_S, IQ3_XXS and IQ3_S applied their sign bits to the decoded weights, and the integer dot
   product took them off again to multiply by the activation. The grid rows now go in as they are
@@ -483,6 +524,33 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **CUDA on Windows: the answer stopped a few tokens in with the card at 100%** (#2696). Windows'
+  WDDM driver model, which WSL2 drives the card through too, holds CUDA launches back and sends
+  them in batches. A hybrid step (a layer whose experts are partly in RAM) has the card signal the
+  host and wait for the host's rows; the host spun on the signal with no CUDA call that would send
+  the batch, so the signal never left it. After 60 s the host gave up and synchronised, which sent
+  the batch, and the card then spun on the wait for rows that would not come. A hybrid step's
+  signal now sends the frame recorded so far at once (a stream query), on Windows without the TCC
+  driver and in WSL2 (`COLI_CUDA_FLUSH`, the engine says so at start), in qwen36's and qwen38's
+  chains. On Linux nothing changes; forced on there, the tokens and the speed are the same.
+- **A new conversation shorter than the last read its whole history at every turn** (#2703).
+  With one slot, a request that does not continue the held conversation and fits below it parks
+  that conversation (park.h), and the conversation came back when the request ended or first
+  thing at the next one. An agent running one task after another sends a new conversation
+  shorter than the last: the old one took the state back after every turn, and each of the new
+  one's turns read everything again (115 s a turn instead of 8 in the report). The next request
+  now decides: a prompt that follows the parked conversation further than the state held now
+  brings it back, one whose rows fit the rows kept apart leaves it parked, any other drops it.
+  qwen36 and qwen38 came first; olmoe, MiMo, DeepSeek V4.1, Inkling, Kimi K3 and K3.1, GLM-5.2
+  (colibri) and DeepSeek V4 decide the same way now, each with the scenario in its tests, and a
+  second short request beside a parked conversation resets only the rows kept apart (MiMo's and
+  V4.1's windows wider than them stopped on a lost ring position or answered otherwise).
+- **Vulkan: a turn stalled in `vkt_give_back` while the uploader waited for room** (#2705). A
+  give-back waited for the uploader's queue to empty, and an upload the pool refused for room
+  waited for a free only the engine thread makes, the thread waiting in the give-back. An upload
+  or promotion refused for room now gives up while a give-back waits: the expert stays where it
+  was, nothing is counted failed and the budget stands. The tier test's case: 0.00 s against
+  179.7 s and three failed uploads.
 - **Vulkan: `COLI_VK_STAGED=0` on a card without Resizable BAR planned with the whole card.**
   The resident data stays in the host-visible window there (246 of 24467 MiB on an RTX PRO
   4000), and nothing past it spills. The dense chain placed 40 of 40 layers and had its first

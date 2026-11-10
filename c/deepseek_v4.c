@@ -17626,8 +17626,8 @@ static void v4_ckpt_store(ColiV4Session *session, int len, int kind) {
 /* A short request between two turns of the session's conversation (park.h's conditions):
  * every layer's whole attention state, the snapshots a speculative verify already
  * round-trips (the window, the compressed rows, the compressor, the indexer), with the
- * conversation's ids; back when the session's next prompt arrives. One conversation at a
- * time (KV_SLOTS=1); COLI_PARK=0 never parks. */
+ * conversation's ids; the session's next prompt brings them back, keeps them parked or drops
+ * them (v4_park_decide). One conversation at a time (KV_SLOTS=1); COLI_PARK=0 never parks. */
 static struct { ColiV4Session *session; ColiV4AttentionSnapshot **snap; int layers, len; int *ids; } g_v4_park;
 static void v4_park(ColiV4Session *session, int prompt_count, int max_new) {
     ColiPark none = {0};
@@ -17660,6 +17660,34 @@ static void v4_unpark(ColiV4Session *session) {
 #endif
         kv_prefix_clear(&session->fed);
     }
+    spec_attention_free(g_v4_park.snap, g_v4_park.layers);
+    free(g_v4_park.ids);
+    memset(&g_v4_park, 0, sizeof g_v4_park);
+}
+/* The session's next prompt decides a conversation the last request parked (#2703): back when
+ * it follows the parked conversation further than the state held now (its next turn); kept
+ * parked when it is short beside it (park.h's measure: its prompt, up to COLI_PARK_GEN of its
+ * answer and a verify's rows before the conversation's end; the snapshot is the whole state, so
+ * such a request starts over as any other); dropped otherwise, the state the last request left
+ * being the one it reads. An agent's new conversation shorter than the last used to find the old
+ * one brought back first and read its own again at every turn. */
+static void v4_park_decide(ColiV4Session *session, const int *ids, int np, int max_new) {
+    if (!g_v4_park.snap || g_v4_park.session != session) return;
+    int a = 0;
+    const int top = g_v4_park.len < np - 1 ? g_v4_park.len : np - 1;
+    while (a < top && g_v4_park.ids[a] == ids[a]) a++;
+    const int b = kv_prefix_common(&session->fed, ids, np);
+    if (a > b) { v4_unpark(session); return; }
+    const int gen = max_new < COLI_PARK_GEN ? max_new : COLI_PARK_GEN, n = np + (gen > 0 ? gen : 0) + 16;
+    if (n < g_v4_park.len) {
+        if (getenv("COLI_PREFIX_LOG"))
+            fprintf(stderr, "[PREFIX] the %d-token conversation stays parked: this request's %d rows fit before its end\n",
+                    g_v4_park.len, n);
+        return;
+    }
+    if (getenv("COLI_PREFIX_LOG"))
+        fprintf(stderr, "[PREFIX] the parked %d-token conversation is dropped: this request follows the state held now "
+                        "(%d of its tokens against the parked one's %d)\n", g_v4_park.len, b, a);
     spec_attention_free(g_v4_park.snap, g_v4_park.layers);
     free(g_v4_park.ids);
     memset(&g_v4_park, 0, sizeof g_v4_park);
@@ -17733,7 +17761,7 @@ static int session_generate_impl(ColiV4Session *session,
      * tail is prefilled at start=reuse, so the logits are the ones a cold run
      * would have produced.
      * ------------------------------------------------------------------- */
-    v4_unpark(session);   /* a conversation the last request parked: back first */
+    v4_park_decide(session, session->prompt_ids, prompt_count, max_new);   /* the last request's: back, kept or dropped */
     int reuse = kv_prefix_reuse(&session->fed, session->prompt_ids, prompt_count);
     int ckpt_at = 0;
     if (!reuse) {
@@ -17750,7 +17778,7 @@ static int session_generate_impl(ColiV4Session *session,
         }
     }
     if (!reuse) {
-        v4_park(session, prompt_count, max_new);   /* a short request keeps the conversation (v4_unpark) */
+        v4_park(session, prompt_count, max_new);   /* a short request keeps the conversation (v4_park_decide) */
 #ifdef COLI_V4_GPU_TIER
         coli_v4_gpu_kv_cache_invalidate_all();
 #endif
