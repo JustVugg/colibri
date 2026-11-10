@@ -4822,7 +4822,9 @@ family_kv_split_deepseek_sanitize() {
 # codec itself IS exact and gated bit for bit by tests/test_vk_kv_quant first. The fixture
 # is the tiny one at the released KV geometry (--kv-quant-dims: head_dim 512,
 # index_head_dim 128), because the formats are defined at those widths; at the stock tiny
-# geometry (64/32) the flag declines by its own dimension check.
+# geometry (64/32) the flag declines by its own dimension check. The last arm (v41_kvq_cpu_host)
+# runs the packed HOST with no Vulkan at all -- the CPU's dequant-on-read paths, what a user
+# without a capable GPU runs.
 family_kv_quant_deepseek() {
   export OMP_NUM_THREADS=2
   make deepseek_v41 tests/test_vk_kv_quant VK=1
@@ -4844,6 +4846,7 @@ family_kv_quant_deepseek() {
   v41_kvq "the per-row GEMV" SNAP=dsv41_kvq_tiny COLI_VK_CHAIN_GEMV=0 -- 8 dsv41_kvq_tiny/ref.json
   v41_kvq "DSpark spec=1" SNAP=dsv41_kvq_long V41_DSPARK=1 V41_SPEC_FORCE=1 -- 8 dsv41_kvq_long/ref.json
   v41_kvq_host_split
+  v41_kvq_cpu_host
   unset OMP_NUM_THREADS
 }
 # The packed cache under the KV split: the split arms (its whole fp32 mirrors win, the
@@ -4884,6 +4887,29 @@ sys.exit(0 if diff <= m else 1)
 PYTOL
   then fail "kv-quant host split: the first decode row beyond the row's own scale"; fi
   echo "OK kv-quant host split: $lg, $(token_diff off.txt on.txt), the split armed with the host codes held"
+}
+# The packed HOST with no Vulkan at all (COLI_VK_CHAIN=0, the device never opened): what a
+# user without a capable GPU runs, and the arm nothing else here covers -- the CPU's
+# dequant-on-read paths (the window ring decoded per forward, the compressed rows and the
+# index keys decoded where read, the row a chunk's write-back packs). The exactness side
+# is the CPU on the fp32 host (COLI_VK_KV_FP32=1, COLI_VULKAN unset: the reference's own
+# oracle, 8/8 tokens); the packed run must engage (its host line), keep the chain off, and
+# hold the FIRST decode row to the tolerance the arms above use -- that row is the one
+# input the two runs share.
+v41_kvq_cpu_host() {
+  local rc=0 rcq=0
+  rm -f off.f32 on.f32
+  env -u COLI_VULKAN COLI_VK_KV_FP32=1 COLI_VK_CHAIN=0 SNAP=dsv41_kvq_tiny DUMP=off.f32 COLI_USAGE=chain.usage \
+      ./deepseek_v41 8 dsv41_kvq_tiny/ref.json > off.txt 2> off.log || rc=$?
+  [ "$rc" = 0 ] || { tail -20 off.log; fail "kv-quant CPU host: the FP32=1 CPU run left the oracle (exit $rc)"; }
+  env -u COLI_VK_KV_FP32 -u COLI_VK_KV_QUANT -u COLI_VULKAN COLI_VK_CHAIN=0 SNAP=dsv41_kvq_tiny DUMP=on.f32 \
+      COLI_USAGE=chain.usage ./deepseek_v41 8 dsv41_kvq_tiny/ref.json > on.txt 2> on.log || rcq=$?
+  { [ "$rcq" = 0 ] || grep -q '\[mismatch\]' on.log; } || { tail -20 on.log; fail "kv-quant CPU host: exit $rcq without a token drift to show for it"; }
+  grep -q 'COLI_VK_KV_FP32 unset' on.log || { cat on.log; fail "kv-quant CPU host: the packed host never engaged"; }
+  grep -q "decoding the host's code rows into kv_all" on.log || { tail -20 on.log; fail "kv-quant CPU host: the CPU never read the host's codes"; }
+  [ "$(chain_count deepseek_v41 on.log)" = 0 ] || { tail -20 on.log; fail "kv-quant CPU host: the chain ran with COLI_VK_CHAIN=0"; }
+  local lg; lg=$(logits_first off.f32 on.f32 1.0 256) || { echo "$lg"; fail "kv-quant CPU host: the first decode row beyond the documented tolerance"; }
+  echo "OK kv-quant CPU host: $lg, $(token_diff off.txt on.txt), the chain off and the host's codes read on the CPU"
 }
 # <tag> <env...> -- <argv...>: the same Vulkan chain run with COLI_VK_KV_FP32=1 (the
 # exact opt-out, the exactness side) and with THE DEFAULT (the var unset: the packed

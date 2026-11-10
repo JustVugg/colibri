@@ -18,8 +18,8 @@
  * power of two times the format's max (448 and 896 for the window, 6 and 12 for the FP4
  * rows), the e4m3-scale clamp floor (an all-zero compressed row), the RNE ties on both
  * grids, and the ckv subnormal-scale band [9*2^-9, 10*2^-9] with its edges -- the slice
- * kvq_pack_ckv's demote buys the re-pack fixpoint in. Skips (exit 0) when no Vulkan
- * device or the shader is missing. */
+ * kvq_pack_ckv's demote buys the re-pack fixpoint in. Skips (exit 0, the host half's
+ * verdict aside) when no Vulkan device or the shader is missing. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,6 +43,13 @@ static void *grab(VkcBuf *b, size_t bytes) {
     void *p = malloc(bytes);
     if (!p || !vkc_read(b, 0, p, bytes)) { free(p); return NULL; }
     return p;
+}
+/* the device half never runs: the host half's verdict stands, so a host failure is not
+ * swallowed by the skip (the gate reads the last line, this prints FAIL there) */
+static int skip(const char *why) {
+    fprintf(stderr, "vk-kv-quant: %s -- skipped\n", why);
+    if (fails) { printf("FAIL: kv-quant (%d)\n", fails); return 1; }
+    return 0;
 }
 static double rel_l2(const float *a, const float *b, int n) {
     double num = 0, den = 0;
@@ -293,7 +300,11 @@ done:
  *   prefix   the whole blocks covering rows [0, n) are the linear prefix
  *            kvq_ikey_mirror_bytes(n) -- park/reset/zero keep whole blocks
  *   slide    a window ring's two-arm slide (the prefill chunk copy) is the same bytes
- *            at 528-byte rows: the ring stays linear, only its row changed width */
+ *            at 528-byte rows: the ring stays linear, only its row changed width
+ *   re-pack  a compressed row dequantized and packed again decodes to itself, on
+ *            fill_rows' rows (its six band edges are where kvq_pack_ckv's demote does
+ *            the work), here so a device-less box runs it (the codec's CHECK needs the
+ *            device) */
 static void host_block_tests(void) {
     enum { R = 70, BLK = KVQ_IKEY_BLOCK, IKB = BLK * KVQ_IKEY_BYTES };   /* 3 blocks, a partial last */
     const size_t mb = kvq_ikey_mirror_bytes(R);
@@ -343,6 +354,34 @@ static void host_block_tests(void) {
               "park: %d positions keep %zu B, not the whole-block %zu", pk[i].n,
               coli_park_part_bytes(&p, pk[i].n), pk[i].want);
     }
+    /* the ckv re-pack fixpoint on the host: pack, dequantize, pack again, dequantize --
+     * the two decodes must be the same values, which is what the pull's write-back and a
+     * later re-upload rely on (the codec's CHECK needs a device; this one does not).
+     * fill_rows puts its edges first, so its six band-edge rows are rows 9-14, and they
+     * are where kvq_pack_ckv's demote does the work: without it 9, 9.5 and 10*2^-9 pick
+     * sf 0x02, decode 8*2^-9, and re-pack to sf 0x01, hopping their large elements to
+     * 6*2^-9 -- this CHECK fails on three rows. */
+    {
+        enum { BR = 24, BHD = 512 };   /* the codec's ckv rows: 15 edges (6 of them the band), 9 random */
+        float *bx = malloc((size_t)BR * BHD * sizeof(float)), *bu = malloc((size_t)BHD * sizeof(float)),
+              *bu2 = malloc((size_t)BHD * sizeof(float));
+        uint8_t brow[KVQ_CKV_BYTES];
+        int hop = 0;
+        CHECK(bx && bu && bu2, "ckv: out of memory");
+        if (bx && bu && bu2) {
+            fill_rows(bx, BR, BHD, 1);   /* the codec's ckv rows, bit for bit */
+            for (int r = 0; r < BR; r++) {
+                kvq_pack_ckv(brow, bx + (size_t)r * BHD);
+                kvq_unpack_ckv(bu, brow);
+                kvq_pack_ckv(brow, bu);
+                kvq_unpack_ckv(bu2, brow);
+                hop += memcmp(bu, bu2, (size_t)BHD * sizeof(float)) != 0;
+            }
+            CHECK(hop == 0, "ckv: %d of %d rows (the band edges 9-14 among them) do not re-pack to their own values",
+                  hop, BR);
+        }
+        free(bx); free(bu); free(bu2);
+    }
     /* the window ring's slide: the last W of N rows in, position p to slot p % win.
      * The fp32 code's two memcpy arms land there; the packed writer (a pack a row from
      * the fp32 scratch) must land on the same slots -- the ring stays linear, only its
@@ -357,17 +396,17 @@ static void host_block_tests(void) {
     memset(ring, 0, sizeof ring);
     for (int p = N - W; p < N; p++) kvq_pack_win(ring + (size_t)(p % W) * KVQ_WIN_BYTES, kv + (size_t)p * 512);
     CHECK(memcmp(ring, ref, sizeof ring) == 0, "slide: the packed tail is not the per-position pack");
-    printf("OK kv-quant host blocks: staging bit for bit, the prefix whole, park rounded, the slide linear\n");
+    printf("OK kv-quant host blocks: staging bit for bit, the prefix whole, park rounded, the slide linear, "
+           "the re-pack a fixpoint on the host\n");
 }
 
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);   /* a crash's prints must not sit in the buffer */
-    host_block_tests();   /* no device needed */
-    if (!coli_vk_init("shaders/chain_dsv4.spv") || !coli_vk_available()) {
-        fprintf(stderr, "vk-kv-quant: no Vulkan device -- skipped\n"); return 0;
-    }
+    host_block_tests();   /* no device needed -- and its failures are not a skip */
+    if (!coli_vk_init("shaders/chain_dsv4.spv") || !coli_vk_available()) return skip("no Vulkan device");
     if (!vkc_init() || !vkc_dsv4_ready()) {
-        fprintf(stderr, "vk-kv-quant: the chain_dsv4 shader is missing -- skipped\n"); coli_vk_shutdown(); return 0;
+        coli_vk_shutdown();
+        return skip("the chain_dsv4 shader is missing");
     }
     codec("win (the ring scattered)", 0, 1, 24, 512, KVQ_WIN_BYTES, 24, 13, kvq_pack_win, kvq_unpack_win);
     codec("ckv (from token 7)", 1, 0, 24, 512, KVQ_CKV_BYTES, 31, 7, kvq_pack_ckv, kvq_unpack_ckv);
