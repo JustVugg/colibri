@@ -264,6 +264,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_IMG_ACT8", CE_BOOL, CE_QWENIMAGE, 0, NULL},
     {"COLI_IMG_BITS", CE_INT, CE_QWENIMAGE, 0, NULL},
     {"COLI_IMG_LOAD_THREADS", CE_INT, CE_QWENIMAGE, 0, NULL},
+    {"COLI_IMG_NATIVE", CE_BOOL, CE_QWENIMAGE, 0, NULL},
     {"COLI_IMG_TE", CE_STR, CE_QWENIMAGE, 0, NULL},
     {"COLI_K3_CKPT",                     CE_STR   , CE_KIMI                                         , 0             , NULL},
     {"COLI_K3_CKPT_DIR",                 CE_STR   , CE_KIMI                                         , 0             , NULL},

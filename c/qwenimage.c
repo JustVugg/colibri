@@ -17,6 +17,14 @@
  * int8 with one scale per row by default (COLI_IMG_BITS=16 keeps bf16, 32 f32).
  * Activations stay f32. Every matrix product runs through qi_gemm.h.
  *
+ * A GGUF in place of a part (tools/gguf_import.py writes the folder: the denoiser from
+ * unsloth/Qwen-Image-2.1-GGUF or its Turbo, the text encoder from a Qwen3-VL-8B-Instruct
+ * GGUF; st_gguf.h reads them under the checkpoint's names): a matrix of a type under 8 bits
+ * a weight stays in the file's blocks, decoded while qi_gemm.h packs it (QI_GG); the others
+ * (Q8_0, F16, BF16) become int8 rows as the checkpoint's bf16 do. COLI_IMG_NATIVE=0 makes
+ * every block type int8 rows. model_index.json may name a part's folder elsewhere
+ * ("colibri_parts"), and a distilled checkpoint's "sample_sigmas" are its schedule.
+ *
  * Usage:
  *   qwenimage --model DIR --prompt "..." [--width W] [--height H] [--steps N]
  *             (sides: multiples of 32, as the pipeline snaps them; default 768x512)
@@ -39,6 +47,7 @@
 #endif
 #include "cpu_check.h"   /* the processor runs what this build assumes, or it says so (#1979) */
 #include "coli_env.h"
+#define ST_GGUF   /* a gguf_import folder (gguf.json) reads as the checkpoint (st_gguf.h) */
 #include "st.h"
 #include "json.h"
 #include "tok.h"
@@ -96,9 +105,45 @@ static int jbool(jval *o, const char *k, int def){
     return v && v->t == J_BOOL ? v->boolean : def;
 }
 
+/* ---- the pipeline's parts ------------------------------------------------------ */
+
+/* model_index.json "colibri_parts": {"text_encoder": DIR, ...} names a part's folder
+ * elsewhere (relative to the model's folder when not absolute): tools/gguf_import.py
+ * writes it when the text encoder or the VAE is an official checkpoint's folder, read
+ * where it is. Without it a part is MODEL/part. */
+#define QI_MAX_PARTS 8
+static char g_part_name[QI_MAX_PARTS][32], g_part_dir[QI_MAX_PARTS][2048];
+static int g_nparts;
+static void qi_parts_init(const char *model){
+    char path[2100]; snprintf(path, sizeof path, "%s/model_index.json", model);
+    char *text = read_file(path);
+    if (!text) return;
+    char *arena = NULL;
+    jval *root = json_parse(text, &arena);
+    free(text);
+    jval *p = root ? json_get(root, "colibri_parts") : NULL;
+    for (int i = 0; p && p->t == J_OBJ && i < p->len && g_nparts < QI_MAX_PARTS; i++) {
+        jval *v = p->kids[i];
+        if (v->t != J_STR || !*v->str || strlen(p->keys[i]) >= sizeof g_part_name[0]) continue;
+        snprintf(g_part_name[g_nparts], sizeof g_part_name[0], "%s", p->keys[i]);
+        int abs = v->str[0] == '/' || v->str[0] == '\\' || (v->str[0] && v->str[1] == ':');
+        if (abs) snprintf(g_part_dir[g_nparts], sizeof g_part_dir[0], "%s", v->str);
+        else snprintf(g_part_dir[g_nparts], sizeof g_part_dir[0], "%s/%s", model, v->str);
+        g_nparts++;
+    }
+    if (root) json_free(root);
+    free(arena);
+}
+static void qi_part(const char *model, const char *part, char *out, size_t n){
+    for (int i = 0; i < g_nparts; i++)
+        if (!strcmp(g_part_name[i], part)) { snprintf(out, n, "%s", g_part_dir[i]); return; }
+    snprintf(out, n, "%s/%s", model, part);
+}
+
 /* ---- weights ------------------------------------------------------------ */
 
 static int g_bits = 8;   /* COLI_IMG_BITS: storage of the big matrices */
+static int g_native = 1; /* COLI_IMG_NATIVE=0: a GGUF's block types become int8 rows at load */
 static int g_act8 = 1;   /* COLI_IMG_ACT8=0 turns off the int8 activations of the DiT blocks (VNNI) */
 
 /* act8: this matrix may take int8 activations (COLI_IMG_ACT8). Only the DiT's
@@ -111,6 +156,7 @@ typedef struct {
     int gpu;        /* may run on the GPU (COLI_VULKAN): the DiT's matrices */
     void *vk;       /* its device copy, made on first use */
     int vk_off;     /* the upload failed: this one stays on the CPU */
+    QiGG gg;        /* QI_GG: the file's rows (m.w points here) */
 } Lin;
 
 static st_tensor *need_tensor(shards *S, const char *name, int64_t n0, int64_t n1){
@@ -141,24 +187,9 @@ static int qi_load_threads(void){
     return n;
 }
 
-/* bits: 8 = int8 rows, 16 = bf16, 32 = f32. Small matrices ask for 32. */
-static void lin_load(shards *S, const char *name, int N, int K, int bits, Lin *out){
-    st_tensor *t = need_tensor(S, name, N, K);
-    if (bits == 8 && t->dtype == 0 && t->nbytes == (int64_t)N * K * 2) {
-        /* bf16 rows straight to int8 rows: the same values as through an f32 copy */
-        uint16_t *raw = xmalloc((size_t)N * K * 2);
-        st_read_raw_cap(S, name, raw, (int64_t)N * K * 2, 1);
-        memset(out, 0, sizeof *out);
-        out->m.N = N; out->m.K = K;
-        int8_t *q = xmalloc((size_t)N * K);
-        float *sc = fmalloc(N);
-        qi_quantize_i8_bf16(raw, N, K, q, sc);
-        free(raw);
-        out->m.fmt = QI_I8; out->m.w = out->own = q; out->m.sc = out->own_sc = sc;
-        return;
-    }
-    float *tmp = fmalloc((size_t)N * K);
-    st_read_f32_cap(S, name, tmp, (int64_t)N * K, 1);
+/* An f32 matrix into the storage bits asks for (8 = int8 rows, 16 = bf16, 32 = f32);
+ * tmp becomes the matrix's or is freed. */
+static void lin_from_f32(Lin *out, float *tmp, int N, int K, int bits){
     memset(out, 0, sizeof *out);
     out->m.N = N; out->m.K = K;
     if (bits == 32) {
@@ -180,6 +211,114 @@ static void lin_load(shards *S, const char *name, int N, int K, int bits, Lin *o
         out->m.fmt = QI_I8; out->m.w = out->own = q; out->m.sc = out->own_sc = sc;
     }
 }
+
+/* n elements of a GGUF block row as f32, from a block boundary: QI_GG's decoder, run for
+ * every panel a product packs. The type's integer form (gq_unpack_row: int8 values, a
+ * scale and a min per 16) rebuilt as sw * w8 - mw eight at a time, two roundings as the
+ * decoders make them: bit for bit gq_dequant_row (checked on every block type, 3000 random
+ * rows each), and several times faster where those decoders are scalar (an i7-1355U, a
+ * 12288-wide row: Q2_K 1.46 -> 0.12 ns a weight, Q3_K 1.36 -> 0.18, Q6_K 1.78 -> 0.16,
+ * IQ4_XS 0.43 -> 0.14, Q4_K 0.16 -> 0.14). */
+GQ_EXACT_FN static int qi_gg_decode(int t, const uint8_t *src, float *dst, int64_t n){
+    GQ_EXACT_BEGIN
+#if defined(__AVX2__)
+    if (gq_has_int(t) && gq_r16_base(t) < 0 && n % GQ_TYPES[t].blck == 0) {
+        int8_t w8[256]; float sw[16], mw[16];
+        const int64_t bl = GQ_TYPES[t].blck, by = GQ_TYPES[t].bytes;
+        for (int64_t done = 0; done < n; ) {
+            const int64_t c = n - done < 256 ? n - done : 256;   /* whole blocks: 256 is a multiple of each */
+            gq_unpack_row(t, src + done / bl * by, c, w8, sw, mw);
+            for (int g = 0; g < c / 16; g++) {
+                const __m256 s = _mm256_set1_ps(sw[g]), m = _mm256_set1_ps(mw[g]);
+                const __m128i b = _mm_loadu_si128((const __m128i *)(w8 + 16 * g));
+                const __m256 a0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(b));
+                const __m256 a1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(b, 8)));
+                _mm256_storeu_ps(dst + done + 16 * g, _mm256_sub_ps(_mm256_mul_ps(s, a0), m));
+                _mm256_storeu_ps(dst + done + 16 * g + 8, _mm256_sub_ps(_mm256_mul_ps(s, a1), m));
+            }
+            done += c;
+        }
+        return 0;
+    }
+#endif
+    return gq_dequant_row(t, src, dst, n);
+}
+
+/* A GGUF type kept in the file's blocks: under 8 bits a weight (Q8_0 is 8.5: int8 rows
+ * are smaller and need no decoding) and whole panels of columns. */
+static int qi_gg_keep(int gt, int K){
+    return gt >= 0 && gt < GQ_TYPE_MAX && gq_blk_decoder(gt) && GQ_TYPES[gt].bytes < GQ_TYPES[gt].blck &&
+           qi_gg_ok(K) && K % GQ_TYPES[gt].blck == 0;
+}
+static int g_lin_gg, g_lin_conv;   /* matrices kept in the file's blocks, and converted (the load's line) */
+
+/* bits: 8 = int8 rows, 16 = bf16, 32 = f32. Small matrices ask for 32. */
+static void lin_load(shards *S, const char *name, int N, int K, int bits, Lin *out){
+    st_tensor *t = need_tensor(S, name, N, K);
+    if (st_is_ggml(t->dtype)) {
+        const int gt = st_ggml_type(t->dtype);
+        const int64_t rb = gq_row_bytes(gt, K);
+        if (gt >= GQ_TYPE_MAX || rb <= 0 || rb * N != t->nbytes || !gq_blk_decoder(gt)) {
+            fprintf(stderr, "[qwenimage] %s: GGUF type %d (%s) is not one this engine decodes for %d x %d\n",
+                    name, gt, gt < GQ_TYPE_MAX ? gq_type_name(gt) : "?", N, K);
+            exit(1);
+        }
+        uint8_t *raw = xmalloc((size_t)t->nbytes);
+        st_read_raw_cap(S, name, raw, t->nbytes, 1);
+        if (bits == 8 && g_native && qi_gg_keep(gt, K)) {
+            /* the file's rows, and the int8 scale of each decoded row (qi_quantize_i8's) */
+            float *sc = fmalloc(N), *row = fmalloc(K);
+            for (int n = 0; n < N; n++) {
+                qi_gg_decode(gt, raw + (int64_t)n * rb, row, K);
+                float am = 0.f;
+                for (int k = 0; k < K; k++) { float a = row[k] < 0 ? -row[k] : row[k]; if (a > am) am = a; }
+                sc[n] = am > 1e-12f ? am / 127.f : 1.f;
+            }
+            free(row);
+            memset(out, 0, sizeof *out);
+            out->m.N = N; out->m.K = K; out->m.fmt = QI_GG;
+            out->gg = (QiGG){ raw, rb, gt, qi_gg_decode };
+            out->m.w = &out->gg; out->own = raw; out->m.sc = out->own_sc = sc;
+            #pragma omp atomic
+            g_lin_gg++;
+            return;
+        }
+        float *tmp = fmalloc((size_t)N * K);
+        for (int n = 0; n < N; n++) qi_gg_decode(gt, raw + (int64_t)n * rb, tmp + (int64_t)n * K, K);
+        free(raw);
+        lin_from_f32(out, tmp, N, K, bits);
+        #pragma omp atomic
+        g_lin_conv++;
+        return;
+    }
+    if (bits == 8 && t->dtype == 0 && t->nbytes == (int64_t)N * K * 2) {
+        /* bf16 rows straight to int8 rows: the same values as through an f32 copy */
+        uint16_t *raw = xmalloc((size_t)N * K * 2);
+        st_read_raw_cap(S, name, raw, (int64_t)N * K * 2, 1);
+        memset(out, 0, sizeof *out);
+        out->m.N = N; out->m.K = K;
+        int8_t *q = xmalloc((size_t)N * K);
+        float *sc = fmalloc(N);
+        qi_quantize_i8_bf16(raw, N, K, q, sc);
+        free(raw);
+        out->m.fmt = QI_I8; out->m.w = out->own = q; out->m.sc = out->own_sc = sc;
+        return;
+    }
+    float *tmp = fmalloc((size_t)N * K);
+    st_read_f32_cap(S, name, tmp, (int64_t)N * K, 1);
+    lin_from_f32(out, tmp, N, K, bits);
+}
+/* The load's line: the storage of the matrices just loaded (and the counters reset). */
+static const char *qi_storage(int bits){
+    static char b[96];
+    const char *base = bits == 8 ? "int8" : bits == 16 ? "bf16" : "f32";
+    if (g_lin_gg && g_lin_conv) snprintf(b, sizeof b, "%d matrices in the GGUF's blocks, %d as %s", g_lin_gg, g_lin_conv, base);
+    else if (g_lin_gg) snprintf(b, sizeof b, "%d matrices in the GGUF's blocks", g_lin_gg);
+    else snprintf(b, sizeof b, "%s", base);
+    g_lin_gg = g_lin_conv = 0;
+    return b;
+}
+
 static void lin_free(Lin *l){
 #ifdef COLI_VULKAN
     if (l->vk) coli_vk_tensor_free((ColiVkTensor *)l->vk);
@@ -188,7 +327,8 @@ static void lin_free(Lin *l){
 }
 static size_t lin_bytes(const Lin *l){
     size_t e = l->m.fmt == QI_F32 ? 4 : l->m.fmt == QI_BF16 ? 2 : 1;
-    return (size_t)l->m.N * l->m.K * e + (l->own_sc ? (size_t)l->m.N * 4 : 0);
+    size_t w = l->m.fmt == QI_GG ? (size_t)l->m.N * (size_t)l->gg.rb : (size_t)l->m.N * l->m.K * e;
+    return w + (l->own_sc ? (size_t)l->m.N * 4 : 0);
 }
 static float *vec_load(shards *S, const char *name, int n){
     need_tensor(S, name, n, 1);
@@ -196,20 +336,27 @@ static float *vec_load(shards *S, const char *name, int n){
     st_read_f32_cap(S, name, v, n, 1);
     return v;
 }
-/* Y[M][N] = X . W^T on the GPU, for every row of X in one call. Each storage
- * format is one of the shader's as it is stored: QI_I8 is fmt 1 (int8 [N][K],
- * one f32 scale per row), QI_BF16 fmt 11, QI_F32 fmt 10. The activations stay
- * f32, so the result is the CPU's f32-activation product up to summation
- * order. COLI_IMG_ACT8 is a CPU kernel: a matrix the GPU takes does not
- * quantize its activations. 0 when the product stays on the CPU. */
+/* The device's format for a matrix as it is stored: QI_I8 is fmt 1 (int8 [N][K], one f32
+ * scale per row), QI_BF16 fmt 11, QI_F32 fmt 10, QI_GG 100 + its ggml type (the block
+ * formats the chain's GEMM decodes, vk_chain.c matmul_bd). */
+static int qi_vk_fmt(const Lin *l){
+    return l->m.fmt == QI_I8 ? 1 : l->m.fmt == QI_BF16 ? 11 : l->m.fmt == QI_F32 ? 10 : 100 + l->gg.gt;
+}
+static const void *qi_vk_weights(const Lin *l){ return l->m.fmt == QI_GG ? (const void *)l->gg.data : l->m.w; }
+
+/* Y[M][N] = X . W^T on the GPU, for every row of X in one call (qi_vk_fmt). The
+ * activations stay f32, so the result is the CPU's f32-activation product up to summation
+ * order. COLI_IMG_ACT8 is a CPU kernel: a matrix the GPU takes does not quantize its
+ * activations. A block format has no shader on this path (coli_vk_matmul): only the
+ * chain's takes it. 0 when the product stays on the CPU. */
 static int qi_vk_linear(float *y, const float *x, int M, const Lin *l){
 #ifdef COLI_VULKAN
     if (!g_vk_ready || !coli_vk_dense() || !l->gpu || l->vk_off || l->m.ld || M < 1) return 0;
 #ifdef _OPENMP
     if (omp_in_parallel()) return 0;
 #endif
-    int fmt = l->m.fmt == QI_I8 ? 1 : l->m.fmt == QI_BF16 ? 11 : l->m.fmt == QI_F32 ? 10 : -1;
-    if (fmt < 0) return 0;
+    int fmt = qi_vk_fmt(l);
+    if (fmt >= 100) return 0;
     Lin *dev = (Lin *)l;    /* the device copy is a cache inside a read-only matrix */
     if (coli_vk_matmul((ColiVkTensor **)&dev->vk, y, x, l->m.w, fmt == 1 ? l->m.sc : NULL, fmt,
                        M, l->m.K, l->m.N, 0)) return 1;
@@ -224,7 +371,7 @@ static int g_prof; static double g_t_lin, g_t_att;
 static inline void linear(float *y, const float *x, int M, const Lin *l){
     double t0 = g_prof ? now_s() : 0;
     if (!qi_vk_linear(y, x, M, l)) {
-        if (g_act8 && l->act8 && l->m.fmt == QI_I8) qi_gemm_act8(y, l->m.N, x, l->m.K, M, &l->m, NULL);
+        if (g_act8 && l->act8 && (l->m.fmt == QI_I8 || l->m.fmt == QI_GG)) qi_gemm_act8(y, l->m.N, x, l->m.K, M, &l->m, NULL);
         else qi_gemm(y, x, M, &l->m, NULL);
     }
     if (g_prof) g_t_lin += now_s() - t0;
@@ -314,7 +461,7 @@ typedef struct {
 } Te;
 
 static void te_config(Te *te, const char *model){
-    char dir[2048]; snprintf(dir, sizeof dir, "%s/text_encoder", model);
+    char dir[2048]; qi_part(model, "text_encoder", dir, sizeof dir);
     char *arena = NULL;
     jval *root = read_json(dir, "config.json", &arena);
     jval *c = json_get(root, "text_config"); if (!c) c = root;
@@ -345,13 +492,17 @@ static void te_config(Te *te, const char *model){
 
 static void te_open(Te *te, const char *model){
     if (te->open) return;
-    char dir[2048]; snprintf(dir, sizeof dir, "%s/text_encoder", model);
+    char dir[2048]; qi_part(model, "text_encoder", dir, sizeof dir);
     memset(&te->S, 0, sizeof te->S);
     st_init(&te->S, dir);
     te->open = 1;
     te->embed = need_tensor(&te->S, "model.language_model.embed_tokens.weight", te->vocab, te->hidden);
-    if (te->embed->dtype != 0 && te->embed->dtype != 2) {
-        fprintf(stderr, "[qwenimage] embed_tokens must be bf16 or f32\n"); exit(1);
+    /* bf16, f16, f32, or a GGUF's block type: one row is decoded per token */
+    const int et = st_ggml_type_any(te->embed->dtype);
+    const int64_t rb = et >= 0 ? gq_row_bytes(et, te->hidden) : -1;
+    if (rb <= 0 || rb * te->vocab != te->embed->nbytes ||
+        (et != GQ_F32 && et != GQ_F16 && et != GQ_BF16 && !gq_blk_decoder(et))) {
+        fprintf(stderr, "[qwenimage] embed_tokens: a type this engine does not decode\n"); exit(1);
     }
 }
 
@@ -385,7 +536,7 @@ static void te_load(Te *te, const char *model){
     }
     te->loaded = 1;
     fprintf(stderr, "[qwenimage] text encoder: %d layers, %.2f GB resident (%s), %.1f s\n",
-            te->layers, bytes / 1e9, g_bits == 8 ? "int8" : g_bits == 16 ? "bf16" : "f32", now_s() - t0);
+            te->layers, bytes / 1e9, qi_storage(g_bits), now_s() - t0);
 }
 
 static void te_unload(Te *te){
@@ -401,9 +552,11 @@ static void te_unload(Te *te){
 
 static void te_tokenizer(Te *te, const char *model){
     if (te->tok_loaded) return;
-    char path[2048]; snprintf(path, sizeof path, "%s/processor/tokenizer.json", model);
+    char dir[2048], path[2100];
+    qi_part(model, "processor", dir, sizeof dir);
+    snprintf(path, sizeof path, "%s/tokenizer.json", dir);
     FILE *f = fopen(path, "rb");
-    if (!f) snprintf(path, sizeof path, "%s/tokenizer/tokenizer.json", model);
+    if (!f) { qi_part(model, "tokenizer", dir, sizeof dir); snprintf(path, sizeof path, "%s/tokenizer.json", dir); }
     else fclose(f);
     memset(&te->tok, 0, sizeof te->tok);
     tok_load(&te->tok, path);
@@ -465,14 +618,13 @@ static float *te_forward(Te *te, const int *ids, int T){
     float *x = fmalloc((size_t)T * H), *h = fmalloc((size_t)T * H);
     float *q = fmalloc((size_t)T * qd), *k = fmalloc((size_t)T * kd), *v = fmalloc((size_t)T * kd);
     float *a = fmalloc((size_t)T * qd), *g = fmalloc((size_t)T * I), *u = fmalloc((size_t)T * I);
-    int esz = te->embed->dtype == 0 ? 2 : 4;
-    void *row = xmalloc((size_t)H * esz);
+    const int et = st_ggml_type_any(te->embed->dtype);
+    const int64_t rb = gq_row_bytes(et, H);
+    uint8_t *row = xmalloc((size_t)rb);
     for (int t = 0; t < T; t++) {
         if (ids[t] < 0 || ids[t] >= te->vocab) { fprintf(stderr, "[qwenimage] token id %d out of range\n", ids[t]); exit(1); }
-        st_pread_full(te->embed->fd, row, (int64_t)H * esz, te->embed->off + (int64_t)ids[t] * H * esz, "embed row");
-        float *dst = x + (int64_t)t * H;
-        if (esz == 2) for (int i = 0; i < H; i++) dst[i] = qi_bf16(((uint16_t *)row)[i]);
-        else memcpy(dst, row, (size_t)H * 4);
+        st_pread_full(te->embed->fd, row, rb, te->embed->off + (int64_t)ids[t] * rb, "embed row");
+        gq_dequant_row(et, row, x + (int64_t)t * H, H);
     }
     free(row);
     for (int l = 0; l < te->layers; l++) {
@@ -511,7 +663,7 @@ typedef struct {
 } Dit;
 
 static void dit_config(Dit *d, const char *model){
-    char dir[2048]; snprintf(dir, sizeof dir, "%s/transformer", model);
+    char dir[2048]; qi_part(model, "transformer", dir, sizeof dir);
     char *arena = NULL;
     jval *c = read_json(dir, "config.json", &arena);
     d->layers = (int)jnum(c, "num_layers", 0);
@@ -548,7 +700,7 @@ static void qic_plan(Dit *d);   /* qwenimage_chain.h: the blocks the device keep
 #endif
 static void dit_load(Dit *d, const char *model){
     if (d->loaded) return;
-    char dir[2048]; snprintf(dir, sizeof dir, "%s/transformer", model);
+    char dir[2048]; qi_part(model, "transformer", dir, sizeof dir);
     shards S; memset(&S, 0, sizeof S);
     st_init(&S, dir);
     double t0 = now_s();
@@ -588,9 +740,9 @@ static void dit_load(Dit *d, const char *model){
     d->img_in.gpu = d->t1.gpu = d->t2.gpu = d->mod.gpu = d->norm_out.gpu = d->proj_out.gpu = 1;
     d->txt1.gpu = d->txt2.gpu = 1;
     d->loaded = 1;
-    fprintf(stderr, "[qwenimage] transformer: %d blocks, %.2f GB resident, %.1f s\n",
+    fprintf(stderr, "[qwenimage] transformer: %d blocks, %.2f GB resident (%s), %.1f s\n",
             d->layers, (bytes + lin_bytes(&d->mod) + lin_bytes(&d->txt1) + lin_bytes(&d->txt2)) / 1e9,
-            now_s() - t0);
+            qi_storage(g_bits), now_s() - t0);
 #ifdef COLI_VULKAN
     /* after the DiT's weights, once: a missing device costs one line */
     if (!g_vk_tried) {
@@ -804,10 +956,20 @@ static void dit_forward(Dit *d, const Prefix *p, DitStep *s, const float *lat, f
 
 /* ---- scheduler ------------------------------------------------------------- */
 
-typedef struct { double base_seq, max_seq, base_shift, max_shift, shift_terminal; int dynamic, exponential; } Sched;
+/* FlowMatchEulerDiscreteScheduler: the dynamic shift (Qwen-Image-2.1, mu from the image's
+ * token count) or a static one (Turbo: shift 1). A distilled checkpoint names its own
+ * sigmas in model_index.json ("sample_sigmas", Turbo's eight): at that many steps they are
+ * the schedule, as its pipeline passes them (sigmas=...), shifted as the scheduler shifts
+ * any sigmas it is given; at another count the scheduler's own linear spacing. */
+#define QI_MAX_SAMPLE 64
+typedef struct {
+    double base_seq, max_seq, base_shift, max_shift, shift_terminal, shift;
+    int dynamic, exponential;
+    int nsample; float sample[QI_MAX_SAMPLE];
+} Sched;
 
 static void sched_config(Sched *s, const char *model){
-    char dir[2048]; snprintf(dir, sizeof dir, "%s/scheduler", model);
+    char dir[2048]; qi_part(model, "scheduler", dir, sizeof dir);
     char *arena = NULL;
     jval *c = read_json(dir, "scheduler_config.json", &arena);
     s->base_seq = jnum(c, "base_image_seq_len", 256);
@@ -819,13 +981,34 @@ static void sched_config(Sched *s, const char *model){
     s->dynamic = jbool(c, "use_dynamic_shifting", 1);
     jval *ty = json_get(c, "time_shift_type");
     s->exponential = !(ty && ty->t == J_STR && !strcmp(ty->str, "linear"));
-    int shift_one = jnum(c, "shift", 1.0) == 1.0;
+    s->shift = jnum(c, "shift", 1.0);
     int odd = jbool(c, "use_karras_sigmas", 0) || jbool(c, "use_exponential_sigmas", 0) ||
               jbool(c, "use_beta_sigmas", 0) || jbool(c, "invert_sigmas", 0) || jbool(c, "stochastic_sampling", 0);
     json_free(c); free(arena);
-    if (!s->dynamic || odd || !shift_one) {
-        fprintf(stderr, "[qwenimage] scheduler_config.json: only the dynamic-shift Euler schedule is implemented\n");
+    /* the dynamic shift replaces the static one: diffusers applies one or the other */
+    if (odd || (s->dynamic && s->shift != 1.0) || !(s->shift > 0 && s->shift < 1000) ||
+        s->shift_terminal < 0 || s->shift_terminal >= 1) {
+        fprintf(stderr, "[qwenimage] scheduler_config.json: only the Euler schedule with a dynamic or a static shift "
+                        "is implemented\n");
         exit(1);
+    }
+    s->nsample = 0;
+    char path[2100]; snprintf(path, sizeof path, "%s/model_index.json", model);
+    char *text = read_file(path);
+    if (text) {
+        char *ar = NULL;
+        jval *root = json_parse(text, &ar), *sv = root ? json_get(root, "sample_sigmas") : NULL;
+        free(text);
+        int ok = sv && sv->t == J_ARR && sv->len >= 2 && sv->len <= QI_MAX_SAMPLE;
+        for (int i = 0; ok && i < sv->len; i++) {
+            ok = sv->kids[i]->t == J_NUM && sv->kids[i]->num > 0 && sv->kids[i]->num <= 1 &&
+                 (i == 0 || sv->kids[i]->num < sv->kids[i - 1]->num);
+            if (ok) s->sample[i] = (float)sv->kids[i]->num;
+        }
+        if (sv && !ok) { fprintf(stderr, "[qwenimage] model_index.json: sample_sigmas must fall from at most 1 above 0\n"); exit(1); }
+        if (ok) s->nsample = sv->len;
+        if (root) json_free(root);
+        free(ar);
     }
 }
 
@@ -834,11 +1017,12 @@ static void sched_config(Sched *s, const char *model){
 static void sched_sigmas(const Sched *s, int steps, int seq_len, float *sig, float *ts, double *mu_out){
     double m = (s->max_shift - s->base_shift) / (s->max_seq - s->base_seq);
     double mu = seq_len * m + (s->base_shift - m * s->base_seq);
-    float e = (float)exp(mu);
+    float e = (float)exp(mu), sh = (float)s->shift;
     for (int i = 0; i < steps; i++) {
         double lin = steps == 1 ? 1.0 : 1.0 + (1.0 / steps - 1.0) * i / (steps - 1);
-        float t = (float)lin;
-        sig[i] = s->exponential ? e / (e + (1.f / t - 1.f)) : (float)mu / ((float)mu + (1.f / t - 1.f));
+        float t = steps == s->nsample ? s->sample[i] : (float)lin;
+        if (s->dynamic) sig[i] = s->exponential ? e / (e + (1.f / t - 1.f)) : (float)mu / ((float)mu + (1.f / t - 1.f));
+        else sig[i] = sh * t / (1.f + (sh - 1.f) * t);
     }
     if (s->shift_terminal > 0) {
         float scale = (1.f - sig[steps - 1]) / (float)(1.0 - s->shift_terminal);
@@ -977,6 +1161,7 @@ static void emit_progress(const Progress *pg, const char *stage, int step, int s
 static void engine_init(Engine *e, const char *model){
     memset(e, 0, sizeof *e);
     snprintf(e->model, sizeof e->model, "%s", model);
+    qi_parts_init(model);
     te_config(&e->te, model);
     dit_config(&e->dit, model);
     sched_config(&e->sch, model);
@@ -989,7 +1174,7 @@ static void engine_init(Engine *e, const char *model){
      * checked now, so a VAE that does not fit the DiT (latent channels, 16x
      * upsampling, which the image buffers are sized from) fails at start-up
      * and not after a whole denoise. */
-    char dir[2100]; snprintf(dir, sizeof dir, "%s/vae", model);
+    char dir[2100]; qi_part(model, "vae", dir, sizeof dir);
     char *arena = NULL;
     jval *v = read_json(dir, "config.json", &arena);
     jval *dm = json_get(v, "dim_mult");
@@ -1007,7 +1192,7 @@ static void engine_init(Engine *e, const char *model){
 #ifdef QI_HAVE_VAE
 /* qiv_load plus the same geometry check, against the weights actually loaded. */
 static QiVae *engine_vae(Engine *e, char *msg, size_t msgn){
-    char dir[2100]; snprintf(dir, sizeof dir, "%s/vae", e->model);
+    char dir[2100]; qi_part(e->model, "vae", dir, sizeof dir);
     QiVae *v = qiv_load(dir);
     if (!v) { snprintf(msg, msgn, "cannot load the VAE"); return NULL; }
     if (v->scale != 16 || v->z_dim != e->dit.in_ch) {
@@ -1468,6 +1653,7 @@ static void usage(void){
         "       qwenimage --model DIR --ref REFDIR\n"
         "env:   COLI_IMG_BITS=8|16|32 weight storage (default 8: int8 rows)\n"
         "       COLI_IMG_ACT8=0  f32 activations in the DiT (default where VNNI exists: int8, about 2x per step)\n"
+        "       COLI_IMG_NATIVE=0  a GGUF's block types (Q2_K..Q6_K, IQ*) as int8 rows too (default: the file's blocks)\n"
         "       COLI_IMG_TE=resident|stage  keep the text encoder loaded between prompts (serve default: resident)\n"
         "       COLI_IMG_LOAD_THREADS=n  layers loaded at once (default 4)\n"
         "       COLI_VK_QI_RESIDENT=n  transformer blocks kept on the GPU (default: what its free memory holds)\n"
@@ -1506,6 +1692,8 @@ int main(int argc, char **argv){
     if (!model || (!serve && !ref && !getenv("QWENIMAGE_PRINT_TOKENS") && (!prompt || !out))) { usage(); return 2; }
     const char *b = getenv("COLI_IMG_BITS");
     if (b && *b) { g_bits = atoi(b); if (g_bits != 8 && g_bits != 16 && g_bits != 32) { usage(); return 2; } }
+    const char *nv = getenv("COLI_IMG_NATIVE");
+    g_native = !(nv && *nv == '0');
     /* On by default where VNNI exists: measured 2x on the step (768x512: 34.3 -> 18.3 s
      * per step on 8 Zen 4 cores) with pictures that cannot be told apart by eye
      * (fox and neon-sign prompts; 30.1 dB against the f32 reference, 35.6 without). */

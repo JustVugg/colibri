@@ -15,7 +15,11 @@
  * reads the same way: every expert's three matrices are entries at their place in the slot.
  *
  * Opt-in: an engine defines ST_GGUF before including st.h; without it st.h is unchanged.
- * A GGUF tensor without a counterpart in the map keeps its GGUF name. */
+ * A GGUF tensor without a counterpart in the map keeps its GGUF name (less the map's strip
+ * prefix, when it has one).
+ *
+ * A file without general.architecture (unsloth's Qwen-Image denoisers carry no metadata at
+ * all) is read under the "arch" gguf.json names: the importer recognized it by its tensors. */
 #ifndef ST_GGUF_H
 #define ST_GGUF_H
 
@@ -36,7 +40,10 @@ typedef struct {
     const char *arch;
     const char *layer_fmt;          /* the checkpoint's layer prefix, "%d" = the layer */
     const st_gg_name *globals;      /* whole names */
-    const st_gg_name *layer;        /* after "blk.N." -> after the layer prefix; a "%d" in hf = per expert */
+    const st_gg_name *layer;        /* after "blk.N." -> after the layer prefix; a "%d" in hf = per expert,
+                                     * "a+b" = the tensor's rows cut in equal parts, the first part a */
+    const char *strip;              /* a prefix every GGUF name carries, dropped first (NULL: none) */
+    const char *gg_layer;           /* the GGUF's layer prefix as sscanf reads it (NULL: "blk.%d.%n") */
 } st_gg_map;
 
 /* DeepSeek V4 (deepseek4): conversion/deepseek.py, DeepseekV4Model._map_dsv4_tensor_name. */
@@ -324,17 +331,47 @@ static const st_gg_name st_gg_olmoe_layer[] = {
     {"ffn_down_exps.weight", "mlp.experts.%d.down_proj.weight"},
     {NULL, NULL}};
 
+/* Qwen-Image-2.1's denoiser (qwen_image): unsloth's GGUFs keep the diffusers checkpoint's names
+ * under "model.diffusion_model.", as ComfyUI loads them, with one tensor of their own: each
+ * block's img_mlp.gate_up [2 * mlp][dim], the rows of gate_layer then those of proj (checked on
+ * the F16 file against the checkpoint: proj's rows bit for bit, gate_layer's to the bf16 -> f16
+ * rounding). Every other name is the checkpoint's as it is. */
+static const st_gg_name st_gg_qimg_glob[] = {{NULL, NULL}};
+static const st_gg_name st_gg_qimg_layer[] = {
+    {"img_mlp.gate_up.weight", "img_mlp.gate_layer.weight+img_mlp.proj.weight"},
+    {NULL, NULL}};
+
+/* Qwen3-VL's language model (qwen3vl), as Qwen-Image-2.1's text encoder reads it: the
+ * checkpoint's model.language_model names (the file of Qwen3-VL-8B-Instruct, whose language
+ * model is Qwen-Image-2.1's text encoder byte for byte). q and k as the checkpoint has them
+ * (the converter permutes nothing for Qwen3: checked on the BF16 file, byte for byte). */
+static const st_gg_name st_gg_q3vl_glob[] = {
+    {"token_embd.weight", "model.language_model.embed_tokens.weight"},
+    {"output_norm.weight", "model.language_model.norm.weight"}, {"output.weight", "lm_head.weight"},
+    {NULL, NULL}};
+static const st_gg_name st_gg_q3vl_layer[] = {
+    {"attn_norm.weight", "input_layernorm.weight"}, {"ffn_norm.weight", "post_attention_layernorm.weight"},
+    {"attn_q.weight", "self_attn.q_proj.weight"}, {"attn_k.weight", "self_attn.k_proj.weight"},
+    {"attn_v.weight", "self_attn.v_proj.weight"}, {"attn_output.weight", "self_attn.o_proj.weight"},
+    {"attn_q_norm.weight", "self_attn.q_norm.weight"}, {"attn_k_norm.weight", "self_attn.k_norm.weight"},
+    {"ffn_gate.weight", "mlp.gate_proj.weight"}, {"ffn_up.weight", "mlp.up_proj.weight"},
+    {"ffn_down.weight", "mlp.down_proj.weight"},
+    {NULL, NULL}};
+
 static const st_gg_map st_gguf_maps[] = {
-    {"olmoe", "model.layers.%d.", st_gg_olmoe_glob, st_gg_olmoe_layer},
-    {"mimo2", "model.layers.%d.", st_gg_mimo_glob, st_gg_mimo_layer},
-    {"glm-dsa", "model.layers.%d.", st_gg_gdsa_glob, st_gg_gdsa_layer},
-    {"mistral-large4", "model.layers.%d.", st_gg_ml4_glob, st_gg_ml4_layer},
-    {"glm5-next", "model.language_model.layers.%d.", st_gg_g5n_glob, st_gg_g5n_layer},
-    {"deepseek4", "layers.%d.", st_gg_dsv4_glob, st_gg_dsv4_layer},
-    {"deepseek41", "layers.%d.", st_gg_dsv41_glob, st_gg_dsv41_layer},
-    {"dflash", "mtp.%d.", st_gg_dflash_glob, st_gg_dsv41_layer},
-    {"kimi-k3", "model.layers.%d.", st_gg_k3_glob, st_gg_k3_layer},
-    {"inkling", "model.layers.%d.", st_gg_ink_glob, st_gg_ink_layer},
+    {"olmoe", "model.layers.%d.", st_gg_olmoe_glob, st_gg_olmoe_layer, NULL, NULL},
+    {"mimo2", "model.layers.%d.", st_gg_mimo_glob, st_gg_mimo_layer, NULL, NULL},
+    {"glm-dsa", "model.layers.%d.", st_gg_gdsa_glob, st_gg_gdsa_layer, NULL, NULL},
+    {"mistral-large4", "model.layers.%d.", st_gg_ml4_glob, st_gg_ml4_layer, NULL, NULL},
+    {"glm5-next", "model.language_model.layers.%d.", st_gg_g5n_glob, st_gg_g5n_layer, NULL, NULL},
+    {"deepseek4", "layers.%d.", st_gg_dsv4_glob, st_gg_dsv4_layer, NULL, NULL},
+    {"deepseek41", "layers.%d.", st_gg_dsv41_glob, st_gg_dsv41_layer, NULL, NULL},
+    {"dflash", "mtp.%d.", st_gg_dflash_glob, st_gg_dsv41_layer, NULL, NULL},
+    {"kimi-k3", "model.layers.%d.", st_gg_k3_glob, st_gg_k3_layer, NULL, NULL},
+    {"inkling", "model.layers.%d.", st_gg_ink_glob, st_gg_ink_layer, NULL, NULL},
+    {"qwen_image", "transformer_blocks.%d.", st_gg_qimg_glob, st_gg_qimg_layer,
+     "model.diffusion_model.", "transformer_blocks.%d.%n"},
+    {"qwen3vl", "model.language_model.layers.%d.", st_gg_q3vl_glob, st_gg_q3vl_layer, NULL, NULL},
 };
 
 static const st_gg_map *st_gguf_map(const char *arch) {
@@ -440,9 +477,33 @@ static int st_gguf_index(shards *S, const gguf_ctx *G, const st_gg_map *map, con
             }
             continue;
         }
-        for (const st_gg_name *e = map->globals; e->gg && !hf; e++) if (!strcmp(t->name, e->gg)) hf = e->hf;
-        if (!hf && sscanf(t->name, "blk.%d.%n", &L, &off) == 1 && L >= 0 && off)
-            for (const st_gg_name *e = map->layer; e->gg && !hf; e++) if (!strcmp(t->name + off, e->gg)) hf = e->hf;
+        const size_t sl = map->strip ? strlen(map->strip) : 0;
+        const char *base = sl && !strncmp(t->name, map->strip, sl) ? t->name + sl : t->name;
+        for (const st_gg_name *e = map->globals; e->gg && !hf; e++) if (!strcmp(base, e->gg)) hf = e->hf;
+        if (!hf && sscanf(base, map->gg_layer ? map->gg_layer : "blk.%d.%n", &L, &off) == 1 && L >= 0 && off)
+            for (const st_gg_name *e = map->layer; e->gg && !hf; e++) if (!strcmp(base + off, e->gg)) hf = e->hf;
+        if (hf && strchr(hf, '+')) {
+            /* "a+b": the rows in equal parts, each its contiguous slice of the file (a row of any
+             * ggml type is whole blocks) */
+            char parts[256]; snprintf(parts, sizeof parts, "%s", hf);
+            int k = 1; for (const char *c = parts; *c; c++) k += *c == '+';
+            if (t->n_dims != 2 || t->ne[1] % k || t->nbytes % k)
+                coli_load_fail(COLI_LOAD_FAIL_FORMAT, "GGUF %s: %lld rows do not split in %d", t->name, (long long)t->ne[1], k);
+            const int64_t slice = t->nbytes / k, rows = t->ne[1] / k;
+            char *p = parts;
+            for (int x = 0; x < k; x++) {
+                char *plus = strchr(p, '+'); if (plus) *plus = 0;
+                if (L >= 0) { char pre[64]; snprintf(pre, sizeof pre, map->layer_fmt, L); snprintf(nm, sizeof nm, "%s%s", pre, p); }
+                else snprintf(nm, sizeof nm, "%s", p);
+                st_tensor *s = st_gguf_add(S, nm);
+                s->fd = fds[t->file]; s->off = (int64_t)t->off + slice * x; s->nbytes = slice;
+                s->dtype = st_gguf_dtype(t->type);
+                s->rank = 2; s->shape[0] = rows; s->shape[1] = t->ne[0]; s->numel = rows * t->ne[0];
+                p = plus ? plus + 1 : p;
+            }
+            renamed++;
+            continue;
+        }
         char alias[256];   /* "a|b": the tensor under each name (st_gg_ink_layer's ffn_gscale) */
         const char *rest_names = NULL;
         if (hf && strchr(hf, '|')) {
@@ -459,7 +520,7 @@ again:;
         if (per_expert && (t->n_dims != 3 || t->nbytes % E)) coli_load_fail(COLI_LOAD_FAIL_FORMAT, "GGUF %s: not [experts][rows][cols]", t->name);
         const int64_t slice = t->nbytes / E;
         for (int x = 0; x < E; x++) {
-            if (!hf) snprintf(nm, sizeof nm, "%s", t->name);
+            if (!hf) snprintf(nm, sizeof nm, "%s", base);
             else {
                 char rest[256];
                 if (per_expert) snprintf(rest, sizeof rest, hf, x); else snprintf(rest, sizeof rest, "%s", hf);
@@ -496,9 +557,11 @@ static int st_init_gguf(shards *S, const char *snap_dir) {
     char buf[16384]; size_t nb = fread(buf, 1, sizeof buf - 1, f); fclose(f); buf[nb] = 0;
     char *arena = NULL; jval *root = json_parse(buf, &arena);
     jval *gv = root ? json_get(root, "gguf") : NULL, *hv = root ? json_get(root, "dspark") : NULL;
+    jval *av = root ? json_get(root, "arch") : NULL;
     const char *g = gv && gv->t == J_STR ? gv->str : NULL;
     if (!g || !*g) coli_load_fail(COLI_LOAD_FAIL_FORMAT, "%s: no \"gguf\" path", gj);
-    char path[4096], hpath[4096] = "";
+    char path[4096], hpath[4096] = "", jarch[64] = "";
+    if (av && av->t == J_STR) snprintf(jarch, sizeof jarch, "%s", av->str);
     gguf_path_join(path, sizeof path, snap_dir, g);
     if (hv && hv->t == J_STR && hv->str[0]) gguf_path_join(hpath, sizeof hpath, snap_dir, hv->str);
     free(arena);
@@ -506,6 +569,7 @@ static int st_init_gguf(shards *S, const char *snap_dir) {
     gguf_ctx *G = &st_gguf_meta;
     if (gguf_open(G, path)) coli_load_fail(COLI_LOAD_FAIL_FORMAT, "GGUF: %s", G->err);
     const char *arch = gguf_get_str(G, "general.architecture");
+    if (!arch && jarch[0]) arch = jarch;   /* a file without metadata: what the importer recognized */
     const st_gg_map *map = st_gguf_map(arch);
     if (!map) coli_load_fail(COLI_LOAD_FAIL_UNSUPPORTED, "%s: GGUF architecture '%s' has no tensor map in st_gguf.h", path, arch ? arch : "?");
     S->cap = G->n_tensors + 16; S->t = (st_tensor *)calloc((size_t)S->cap, sizeof(st_tensor));
