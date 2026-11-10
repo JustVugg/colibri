@@ -3947,8 +3947,7 @@ static void q38_dho_count(Q38Weight *w,size_t *bytes,int *n) {
 
 /* after qt_init: quantize and upload what the placer accepted */
 static void q38_trunk_place_all(Model *m) {
-    (void)m;
-    int placed=0,offered=g_trunk_n; size_t placed_bytes=0; double t0=now_s();
+    int placed=0,offered=g_trunk_n,release=q38_trunk_cpu_int8_wanted(); size_t placed_bytes=0,released=0; double t0=now_s();
     for(int i=0;i<g_trunk_n;i++){
         Q38TrunkItem *it=&g_trunk[i]; Q38Weight *w=it->w;
         if(it->cpu_only){offered--;continue;}
@@ -3981,10 +3980,18 @@ static void q38_trunk_place_all(Model *m) {
             free(x);free(yg);free(yc);
         }
         if(h>=0){ w->gpu=h+1; placed++; placed_bytes+=(size_t)O*I; }
+        /* Every CPU read of a placed matrix goes through q8 now, so its BF16 rows go here
+         * rather than in q38_trunk_cpu_int8 after the tier is up: the load no longer holds the
+         * whole BF16 trunk beside the placed matrices' int8 (Q38_TRUNK_CPU_INT8=0 keeps BF16). */
+        if(h>=0&&release&&w->owns_data&&w->data){
+            uint64_t was=q38_weight_bytes(w);
+            free(w->data); w->data=NULL; w->owns_data=0; released+=was;
+            m->resident_weight_bytes-=was; m->resident_weight_bytes+=(size_t)O*I+(size_t)O*sizeof(float);
+        }
     }
     if(g_trunk_n)
-        fprintf(stderr,"[qtier] qwen38 trunk: %d of %d offered matrices resident (int8, a GGUF's blocks as they are; %.2f GiB) in %.1fs; the rest answers from the CPU\n",
-                placed,offered,placed_bytes/1073741824.0,now_s()-t0);
+        fprintf(stderr,"[qtier] qwen38 trunk: %d of %d offered matrices resident (int8, a GGUF's blocks as they are; %.2f GiB; %.2f GiB of BF16 released) in %.1fs; the rest answers from the CPU\n",
+                placed,offered,placed_bytes/1073741824.0,released/1073741824.0,now_s()-t0);
 }
 
 /* Start the tier after the model is loaded. COLI_CUDA=1 turns it on (the
