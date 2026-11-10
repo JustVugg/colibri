@@ -81,8 +81,10 @@ int coli_cuda_tensor_upload_g(ColiCudaTensor **t, const void *w, const float *s,
                               int fmt, int I, int O, int device, int gs) {
     return upload_common(t, w, s, fmt, I, O, device, gs);
 }
+static int fake_tensor_frees;   /* tensors freed (a tier giving memory back) */
 void coli_cuda_tensor_free(ColiCudaTensor *t) {
     if (t && fake_dense_compute && t->fmt == 1) { free((void *)t->w); free((void *)t->sc); }
+    fake_tensor_frees += t != NULL;
     free(t);
 }
 /* no bus to copy host memory over: the tier keeps the host's step for those experts. A test of

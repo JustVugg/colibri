@@ -4384,6 +4384,8 @@ static int qwen36_cap_for_ram(double resident_gb, double avail_gb, double ram_gb
     return derived;
 }
 
+/* A slot's packed int4 (the CUDA tier's source): one block, u4 and d4 inside it. */
+static void slot_free_i4(Slot *s) { free(s->g4); s->g4 = s->u4 = s->d4 = NULL; }
 static void slot_ensure_allocated(Model *m, Slot *s) {
     if (s->g || s->pw || s->gqe) return;
     Cfg *c = &m->c;
@@ -4567,7 +4569,7 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
         memcpy(s->d, raw + ng, (size_t)nd);
         free(raw);
         s->is_int4 = 0;
-        free(s->g4); free(s->u4); free(s->d4); s->g4 = s->u4 = s->d4 = NULL;
+        slot_free_i4(s);
         st_read_f32(&m->S, qsnm, s->gs, 0);
         return;
     }
@@ -4628,7 +4630,7 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
         unpack_int4_to_int8(s->g, raw, want_w);
         s->is_int4 = 1;
         /* Free any previous occupant first (LRU slot reuse). */
-        free(s->g4); free(s->u4); free(s->d4); s->g4 = s->u4 = s->d4 = NULL;
+        slot_free_i4(s);
         /* Keep the packed int4 bytes alongside the unpacked int8 copy only when
          * the CUDA tier is actually running: they are its upload source, and
          * they let slot_ensure_int8() rematerialize an evicted expert whose
@@ -4637,18 +4639,17 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
          * recommended gs64 container -- so qt_ready() gates the allocation.
          * Under CUDA=0 that is an inline `return 0` and this costs nothing. */
         if (qt_ready() && qt_experts_on()) {
+            /* one block, gate | up | down as the container has them: the host pool page-locks it
+             * whole and a prompt chunk copies it as it is (qt_note_host) */
             int64_t gp = ng / 2, up = ng / 2, dp = nd / 2;   /* gate/up/down packed sizes */
-            s->g4 = (uint8_t *)malloc((size_t)gp);
-            s->u4 = (uint8_t *)malloc((size_t)up);
-            s->d4 = (uint8_t *)malloc((size_t)dp);
-            if (!s->g4 || !s->u4 || !s->d4) { fprintf(stderr, "OOM int4-packed %s\n", nm); exit(1); }
-            memcpy(s->g4, raw,           (size_t)gp);
-            memcpy(s->u4, raw + gp,      (size_t)up);
-            memcpy(s->d4, raw + gp + up, (size_t)dp);
+            s->g4 = (uint8_t *)malloc((size_t)(gp + up + dp));
+            if (!s->g4) { fprintf(stderr, "OOM int4-packed %s\n", nm); exit(1); }
+            s->u4 = s->g4 + gp; s->d4 = s->u4 + up;
+            memcpy(s->g4, raw, (size_t)(gp + up + dp));
         }
     } else {
         s->is_int4 = 0;
-        free(s->g4); free(s->u4); free(s->d4); s->g4 = s->u4 = s->d4 = NULL;
+        slot_free_i4(s);
         st_read_raw(&m->S, nm, s->g, 1);
     }
     st_read_f32(&m->S, qsnm, s->gs, 0);
@@ -9355,7 +9356,7 @@ static void tier_warmstart(Model *m, int expert_is_int4) {
                 tier_src(m, wpl[i], &tmp, expert_is_int4, &wg, &wu, &wd);
                 qt_note_planned(wpl[i], wpe[i], wg, wu, wd, tmp.gs, tmp.us, tmp.ds);
             }
-            free(tmp.pw); free(tmp.g); free(tmp.gs); free(tmp.g4); free(tmp.u4); free(tmp.d4);
+            free(tmp.pw); free(tmp.g); free(tmp.gs); slot_free_i4(&tmp);
             free(tmp.gqe); free(tmp.t8);
         }
         qt_fill_wait();
@@ -9415,6 +9416,10 @@ static void tier_warmstart(Model *m, int expert_is_int4) {
     if (qt_chain_host_count())
         fprintf(stderr, "[qtier] host pool: %d experts of the RAM cache page-locked for the device to copy a prompt chunk's "
                         "experts from (COLI_CUDA_HOST_POOL=0 off)\n", qt_chain_host_count());
+#ifdef COLI_CUDA
+    else if (g_cuda_chain && wn < cap_total && qt_chain_host_off())
+        fprintf(stderr, "[qtier] no host pool (%s): a prompt chunk's experts outside VRAM take the CPU's step\n", qt_chain_host_off());
+#endif
     free(wpl); free(wpe); free(planned);
     /* The parenthesis used to read "int8 only for non-residents", which was
      * true only while the int8 copy of every resident was freed. Since #1341
@@ -9643,7 +9648,7 @@ static void vk_tier_start(Model *m, const char *snap, int cap, int expert_is_int
             load_expert_merged(m, pl[i], pe[i], &tmp);
             VktExpertSrc src = vk_slot_src(m, pl[i], &tmp);
             vkt_put(pl[i], pe[i], &src);
-            free(tmp.pw); free(tmp.g); free(tmp.gs); free(tmp.g4); free(tmp.u4); free(tmp.d4);
+            free(tmp.pw); free(tmp.g); free(tmp.gs); slot_free_i4(&tmp);
             free(tmp.gqe); free(tmp.t8); free(tmp.t8s);
         }
         vkt_put_done();
@@ -10404,9 +10409,7 @@ static void qwen36_segment_model_destroy(Qwen36SegmentEngine *engine) {
             free(cache->slots[slot].pw);
             free(cache->slots[slot].gqe); free(cache->slots[slot].t8); free(cache->slots[slot].t8s);
             free(cache->slots[slot].gs);
-            free(cache->slots[slot].g4);
-            free(cache->slots[slot].u4);
-            free(cache->slots[slot].d4);
+            slot_free_i4(&cache->slots[slot]);
         }
         free(cache->slot_by_expert); free(cache->slots);
     }

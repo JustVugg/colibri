@@ -699,7 +699,12 @@ a layer's non-resident experts into VRAM and runs them with the residents:
   f16 GEMMs read directly (`CcExpert.planar`: in each 64 weights' 32 bytes, byte k holds
   weight k low and k + 32 high, both v + 8). No second copy in RAM, no conversion. On when
   the RAM holds every expert (no slot is ever recycled), one card, int4-g64 and the f16
-  GEMMs (`coli_cuda_planar_rows`).
+  GEMMs (`coli_cuda_planar_rows`). A per-row int4 container (or int4 per group with
+  `QWEN_EXPERT_KERNEL=0`) keeps the packed pairs beside its int8 copy: the very bytes the
+  residents' tensors hold (`CcExpert.planar` 0), gate, up and down in one block with the
+  row scales, so the pool takes them as they are and every GEMM reads them as it reads a
+  resident's. Where the pool stays off and not every expert is on the card, the warm start
+  says why (`[qtier] no host pool (...)`).
 - The pool follows the residents (`qt_chain_host_follow`). The chain's promotions and the
   tier's LFRU swaps move experts between the card and the RAM after the warm start; before a
   prompt chunk of 128 rows or more (`Q36CC_FOLLOW_ROWS`), the experts that left the card are
@@ -804,6 +809,56 @@ engine on the same card in the last column):
 
 Decode is the same: 111.5 against 111.3 tok/s on the whole card, and 50.9 against 53.3
 with 7 GiB free.
+
+**A per-row int4 container** (#2734) had no host pool: its 12.7K-token prompt ran the experts
+outside VRAM on the CPU, 134 s on an RTX 3070 against 10.4 s with the gs64 container. On an
+RTX PRO 4000 at `CUDA_EXPERT_GB=6` (4.2 GB of experts, an 8 GB card's `auto` budget), an
+11,852-token prompt, three runs each:
+
+| Qwen3.6-35B-A3B | prompt | decode after |
+|---|---|---|
+| per-row int4, before | 235 / 160 / 130 s | 37-50 tok/s |
+| per-row int4, the host pool | 4.2 / 4.4 / 4.4 s | 37-49 tok/s |
+| int4-g64 (unchanged) | 4.8 / 4.9 / 4.8 s | 54-66 tok/s |
+
+The first token's top-20 logprobs with 7585 experts staged from RAM are the bits it has with
+every expert on the card.
+
+### The KV mirrors' room under `CUDA_EXPERT_GB=auto`
+
+`auto` fills the card with experts, and the chain's KV mirrors grow with the conversation
+into what is left. The chunk's rows take half the free memory at the first prompt and leave
+the other half to the mirrors (`q36cc_rows_max`); on an 8 GB card at `--ctx 65536` a long
+conversation outgrew it: the mirrors first took the host pool's staging for the rest of the
+process, then the memory a frame needed, and every later step went to the CPU (#2734). Before
+the mirrors grow, the chain now makes room for them, a chunk's scratch and staging where not
+yet allocated, and 256 MiB for the driver (a kernel's first launch loads its code into device
+memory), out of the expert tier where the card lacks it (`q36cc_mirror_room`,
+`qt_chain_give_back`): residents leave the card, the tier's budget comes down by as much, the
+CPU computes them from their RAM copy and the host pool takes them at its next follow.
+
+The driver packs allocations under 2 MiB into 2 MiB pages and releases a page only when
+nothing in it is left. The 35B's expert matrices are 512 KiB each, so the coldest residents,
+spread over the card, freed no memory at all (142 MB of experts, the free memory where it
+was). The tier takes them by page instead, with their device addresses from the chain: pages
+its matrices fill before any other, each pick the page whose release costs the fewest
+residents still on the card (one each plus its routes and heat), and the chain measures the
+free memory again after each give-back (`q36cc_room_from_tier`). One conversation's place
+under `KV_SLOTS` > 1 grows the same way once the other places' mirrors are gone.
+
+Measured on an RTX PRO 4000 with 16 GB held by another process (the 7.2 GB left an 8 GB
+card's), `CUDA_EXPERT_GB=auto` (4.16 GB of experts, 1024 rows a chunk), `--ctx 65536`, the
+gs64 container, prompts of growing length in one server (tok/s):
+
+| prompt | before | after | decode after, before / after |
+|---|---|---|---|
+| 3,750 tokens | 740 | 740 | 58.3 / 57.4 |
+| 11,850 | 766 | 770 | 69.6 / 69.2 |
+| 19,387 | 796 | 786 | 68.0 / 66.6 |
+| 29,962 | 147 (the staging dropped) | 754 | 66.4 / 60.8 |
+| 43,913 | out of memory, the CPU (more than 900 s) | 725 | - / 55.3 |
+
+603 experts given back in all, one give-back a growth past 19K tokens.
 
 ### A GGUF's experts at their own size (`COLI_CUDA_EXACT_SLOTS`, on by default)
 

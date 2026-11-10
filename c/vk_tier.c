@@ -143,6 +143,9 @@ static struct {
                                         * thread is the one waiting, #2705) */
     int sync;                          /* COLI_VK_TIER_SYNC=1: quiescent points wait for the uploader */
     int evict_pending;                 /* victims chosen and not freed yet (a batch is in flight) */
+    /* what vkt_give_back took from the primary device and vkt_take_back has not returned: places
+     * (dmax[0]), bytes of the budget and of the pool's limit */
+    int gb_owed; size_t gb_owed_bytes;
     VQ q[VKT_QCAP]; int qh, qn;
     VDone *done; int ndone, cdone;
     unsigned long room_gen;
@@ -3113,7 +3116,7 @@ size_t vkt_give_back(size_t bytes) {
     }
     free(hp);
     const int drop = T.dmax[0] - (T.dres[0] + T.dque[0]);
-    if (drop > 0) { T.dmax[0] -= drop; T.max_resident -= drop; }
+    if (drop > 0) { T.dmax[0] -= drop; T.max_resident -= drop; T.gb_owed += drop; }
     pthread_mutex_lock(&T.mx); T.evict_pending = T.nevict + T.ndfree; pthread_mutex_unlock(&T.mx);
     quiesce();   /* nothing in flight: the device copies freed, the changes published */
     ColiVkPoolStats st; coli_vk_pool_stats(1, &st);
@@ -3123,12 +3126,43 @@ size_t vkt_give_back(size_t bytes) {
     if (now) { coli_vk_tier_pool_blocks(now, nb); for (int k = 0; k < nb; k++) if (pick[k] && !now[k]) gave += bb[k]; }
     free(now); free(pick); free(bb);
     T.budget = T.budget > gave ? T.budget - (size_t)gave : 0;
+    T.gb_owed_bytes += (size_t)gave;
     coli_vk_pool_stats(1, &st);
     char hb[32], hc[32];
     fprintf(stderr, VKT_TAG " tier %s: %s of device memory back for the dense chain (%d experts to the host pool, %d out of the tier; "
             "the tier's pool now %s in %d blocks)\n", T.engine, human((double)gave, hb, sizeof hb), moved, out,
             human((double)st.total, hc, sizeof hc), st.blocks);
     return (size_t)gave;
+#endif
+}
+
+/* vkt_take_back: device memory the dense chain freed for good back to the tier, up to what
+ * vkt_give_back took and has not had back: the places on the primary device (dmax), the budget
+ * and the pool's limit go up by it again, and the routes fill the room (promote, or an upload
+ * into a free place). Before, what a long conversation's KV mirror took stayed the chain's for
+ * the rest of the process: 2799 places came down to 967 after one 44K-token conversation on an
+ * 8 GB card, and every later short conversation decoded with them (#2733). */
+size_t vkt_take_back(size_t bytes) {
+#ifdef VKT_NO_GIVE_BACK
+    (void)bytes; return 0;
+#else
+    if (!T.on || !bytes || T.gb_owed <= 0 || !T.gb_owed_bytes) return 0;
+    const size_t per = T.gb_owed_bytes / (size_t)T.gb_owed;   /* the bytes a place given back held */
+    int ex = per ? (int)(bytes / per) : 0;
+    if (ex > T.gb_owed) ex = T.gb_owed;
+    if (ex < 1) return 0;
+    const size_t b = ex == T.gb_owed ? T.gb_owed_bytes : (size_t)ex * per;
+    pthread_mutex_lock(&T.mx);
+    T.dmax[0] += ex; T.max_resident += ex; T.budget += b;
+    T.gb_owed -= ex; T.gb_owed_bytes -= b;
+    pthread_mutex_unlock(&T.mx);
+    ColiVkPoolStats st; coli_vk_pool_stats(1, &st);
+    const uint64_t base = st.limit ? st.limit : st.total;
+    coli_vk_tier_pool_limit((size_t)(base + b));
+    char hb[32];
+    fprintf(stderr, VKT_TAG " tier %s: %s of device memory back from the dense chain (%d more places for experts, %d on the "
+            "device now)\n", T.engine, human((double)b, hb, sizeof hb), ex, T.dmax[0]);
+    return b;
 #endif
 }
 

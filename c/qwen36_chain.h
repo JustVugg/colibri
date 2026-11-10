@@ -128,7 +128,8 @@ typedef struct {
      * arrays the fields above point at), and a multiplexed decode step's rows while it
      * runs (q36c_mux_step: mx_rows set, each row's conversation in mx_conv) */
     Q36cConv *conv; int nconv, conv_cur, conv_full;
-    unsigned long long conv_clock, conv_handed, mux_steps, mux_rows, mux_host_steps;
+    int pool_closed;   /* q36c_pool_off closed the places: a conversation that enters opens them again (q36c_pool_reopen) */
+    unsigned long long conv_clock, conv_handed, mux_steps, mux_rows, mux_host_steps, pool_reopens, conv_shrinks, mirror_cuts;
     const Q36Row *mx_rows; Q36cConv **mx_conv;
 } Q36Chain;
 
@@ -741,6 +742,23 @@ static int q36c_mirror(Q36Chain *ch, Model *m, int need) {
     /* the positions a step can reach: the mirror's rows follow them, not the host's capacity,
      * which grows request by request (its rows keep their positions when it does) */
     const int top = qwen36_max_ctx() > m->kv_cap ? qwen36_max_ctx() : m->kv_cap;
+    /* A conversation that needs less than half of the mirror (one slot: the next one after a long
+     * one): the mirror goes, the next sized to it (its rows from the host again, as any growth's),
+     * and what the old held past that back to the expert tier (vkt_take_back). Before, the
+     * mirror and the tier kept the longest conversation's room: after a 44K-token one on an 8 GB
+     * card's room a short conversation decoded at 61-71 tok/s against 75-91 before it (#2733). One
+     * device, the chain's whole stack (the tier's room is the primary's). */
+    size_t owed = 0;
+    if (ch->cap > 0 && ch->d == 0 && !q36c_of(m, 1) && ch->cap > 2 * (need > Q36C_KV_START ? need : Q36C_KV_START)) {
+        for (int i = ch->lo; i < ch->lo + ch->n; i++) {
+            if (!c->is_attn[i]) continue;
+            owed += vkc_bytes(ch->kc[i]) + vkc_bytes(ch->vc[i]);
+            vkc_free(ch->kc[i]); vkc_free(ch->vc[i]); ch->kc[i] = ch->vc[i] = NULL; ch->kv_valid[i] = 0; ch->kv_rows[i] = -1;
+        }
+        if (ch->ks.on) vkc_kv_free(&ch->ks);
+        ch->kvh_set = 0;   /* every mirror went: float16 again where a split had made them float32 */
+        ch->cap = 0; ch->dev_rows = 0; ch->mirror_cuts++;
+    }
     int cap = ch->cap;
     if (cap >= need) {
         if (ch->host_cap == m->kv_cap) return 1;
@@ -802,14 +820,20 @@ static int q36c_mirror(Q36Chain *ch, Model *m, int need) {
         const int rmax = q36c_chunk_rows(ch, m);
         keep = (rmax > ch->rows ? (size_t)(rmax - ch->rows) * q36c_chunk_row_bytes(ch, m) : 0) + Q36C_KV_MARGIN;
     }
-    /* a mirror that cannot split (a sliding window, sinks: Flint) must fit the plan's room
-     * whole (vkc_kv_plan_need: four fifths of the free memory and what the mirror holds):
-     * past it the chain stops, and the prompt's rest takes the per-matrix path (Flint with
-     * 7 GiB free, a 17K-token prompt: 16256 of 17408 positions fit, 32.8 tok/s) */
+    /* the mirror fits the plan's room whole (vkc_kv_plan_need: four fifths of the free memory
+     * and what the mirror holds) where the tier can give it: a mirror that cannot split (a
+     * sliding window, sinks: Flint) stops the chain past it, and the prompt's rest takes the
+     * per-matrix path (Flint with 7 GiB free, a 17K-token prompt: 16256 of 17408 positions fit,
+     * 32.8 tok/s); any other splits, its rows past the device's read over the bus, in float32:
+     * Qwen3.6 on an 8 GB card's room, a 44K-token prompt took the 498 MiB the mirror lacked
+     * from the tier, split, and ran past 25 minutes (#2733) */
     size_t target = more + keep;
-    if (c->attn_sinks || c->win_layer) {
+    {
         const size_t whole = (size_t)leq * cap * row / 8 * 10 + ((size_t)1 << 20);
-        if (whole > held && whole - held > target) target = whole - held;
+        /* one that can split asks a margin more: asked to the plan's edge, the tier's 498 MiB left
+         * the free memory the driver then reported short of it, and the mirror split anyway */
+        const size_t slack = c->attn_sinks || c->win_layer ? 0 : Q36C_KV_MARGIN;
+        if (whole > held && whole - held + slack > target) target = whole - held + slack;
     }
     size_t took = 0;
     const size_t av0 = vkc_dev_avail();
@@ -845,6 +869,11 @@ static int q36c_mirror(Q36Chain *ch, Model *m, int need) {
         if (!ch->kc[i] || !ch->vc[i]) { ch->cap = 0; return 0; }
     }
     ch->cap = cap; ch->host_cap = m->kv_cap;
+    if (owed) {
+        size_t now = 0;
+        for (int i = ch->lo; i < ch->lo + ch->n; i++) if (c->is_attn[i]) now += vkc_bytes(ch->kc[i]) + vkc_bytes(ch->vc[i]);
+        if (owed > now) vkt_take_back(owed - now);
+    }
     return 1;
 }
 
@@ -965,19 +994,34 @@ static size_t q36c_conv_kv_bytes(Model *m, Q36Chain *ch, int cap) {
         if (c->is_attn[i]) b += 2 * (size_t)c->kv_heads * (q36c_ring(m, i) ? m->kv_ring : cap) * c->k_head_dim * sizeof(float);
     return b;
 }
+/* the device's free memory as the places see it: COLI_VK_TEST_CONV_ROOM_MB=n holds it at n MiB
+ * (tests: a place that cannot grow, the places closing and opening again) */
+static size_t q36c_conv_avail(void) {
+    static long long cap = -2;
+    if (cap == -2) { const char *e = getenv("COLI_VK_TEST_CONV_ROOM_MB"); cap = e && *e ? atoll(e) : -1; }
+    const size_t av = vkc_dev_avail();
+    return cap >= 0 && av > ((size_t)cap << 20) ? (size_t)cap << 20 : av;
+}
 /* Room on the device for `bytes` more (and 512 MiB besides): the KV mirrors of the places
  * used least recently go first, not place `keep`'s nor this step's. Their DeltaNet state
- * stays; their KV rows are the host's, uploaded again when they run. */
+ * stays; their KV rows are the host's, uploaded again when they run. Then the expert tier's
+ * memory (vkt_give_back), as one conversation's mirror takes it (q36c_mirror). Without it a
+ * place that outgrew the room left its decode steps to the host's path, every step (12.7K
+ * tokens on an 8 GB card: 10.5 tok/s against 36 with one slot), or closed the places for the
+ * rest of the process (#2733). */
 static int q36c_conv_room(Q36Chain *ch, Model *m, int keep, size_t bytes) {
     const size_t margin = (size_t)512 << 20;
-    while (vkc_dev_avail() < bytes + margin) {
+    while (q36c_conv_avail() < bytes + margin) {
         int k = -1;
         for (int j = 0; j < ch->nconv; j++) {
             Q36cConv *v = &ch->conv[j];
             if (j == keep || v->used == ch->conv_clock || !v->cap || j == ch->conv_cur) continue;
             if (k < 0 || v->used < ch->conv[k].used) k = j;
         }
-        if (k < 0) return 0;
+        if (k < 0) {
+            const size_t av = q36c_conv_avail();
+            return vkt_give_back(bytes + margin - av) > 0 && q36c_conv_avail() >= bytes + margin;
+        }
         Q36cConv *v = &ch->conv[k];
         for (int i = ch->lo; i < ch->lo + ch->n; i++) {
             if (!m->c.is_attn[i] || q36c_ring(m, i)) continue;
@@ -1012,6 +1056,25 @@ static int q36c_conv_grow(Q36Chain *ch, Model *m, int k, int need) {
     }
     v->cap = cap;
     return 1;
+}
+/* Place k's full layers' mirrors hold more than twice what its conversation needs (a shorter one
+ * took the slot): freed, the next growth (q36c_conv_grow) sizes them to this conversation, and
+ * what they held past that goes back to the expert tier (vkt_take_back). Before, a place kept
+ * the mirrors of the longest conversation it ever held, and the tier the room that one left it. */
+static void q36c_conv_shrink(Q36Chain *ch, Model *m, int k, int need) {
+    Q36cConv *v = &ch->conv[k];
+    const int keep = need > Q36C_CONV_ROWS ? need : Q36C_CONV_ROWS;
+    if (!v->cap || v->cap <= 2 * keep) return;
+    Cfg *c = &m->c;
+    size_t freed = 0, again = 0;
+    for (int i = ch->lo; i < ch->lo + ch->n; i++) {
+        if (!c->is_attn[i] || q36c_ring(m, i)) continue;
+        freed += vkc_bytes(v->kc[i]) + vkc_bytes(v->vc[i]);
+        again += 2 * (size_t)c->kv_heads * ((keep + 1023) / 1024 * 1024) * c->k_head_dim * sizeof(float);
+        vkc_free(v->kc[i]); vkc_free(v->vc[i]); v->kc[i] = v->vc[i] = NULL; v->kv_valid[i] = 0; v->kv_rows[i] = 0;
+    }
+    v->cap = 0; ch->conv_shrinks++;
+    if (freed > again) vkt_take_back(freed - again);
 }
 /* One more place, when the device has the room for its DeltaNet state and its first mirrors */
 static int q36c_conv_new(Q36Chain *ch, Model *m) {
@@ -1119,9 +1182,47 @@ static void q36c_mux_drop(Model *m) {
 static void q36c_pool_off(Q36Chain *ch, Model *m) {
     q36c_mux_drop(m);
     for (int k = 0; k < ch->nconv; k++) if (k != ch->conv_cur) q36c_conv_free(m, &ch->conv[k]);
-    free(ch->conv); ch->conv = NULL; ch->nconv = 0; ch->conv_cur = -1;
+    free(ch->conv); ch->conv = NULL; ch->nconv = 0; ch->conv_cur = -1; ch->pool_closed = 1;
     fprintf(stderr, "[VK] qwen36 chain: a prompt's KV mirror does not fit beside the other conversations' state: "
                     "each conversation's state goes through the host from here on\n");
+}
+/* A conversation enters the chain whose places closed (q36c_pool_off): its mirror, sized (or
+ * split past the device) for the longer conversation that closed them, is freed when it holds
+ * more than twice what this one needs (its rows come from the host again anyway; q36c_mirror
+ * sizes the next at this conversation's length), and where the chain then takes places
+ * (q36c_pool_ok) they open again, this conversation in the first. Before, they stayed closed:
+ * after one 44K-token conversation every decode step of every conversation took the host's
+ * path until the engine restarted (14 against 37.6 tok/s on an 8 GB card, #2733). */
+static void q36c_pool_reopen(Model *m, int slot) {
+    Q36Chain *ch = q36c_of(m, 0);
+    if (!ch || !ch->ok || ch->failed || !ch->pool_closed || ch->conv || slot < 0 || g_q36_mux_slots < 2 || q36c_of(m, 1)) return;
+    Cfg *c = &m->c;
+    const int need = m->kv_len > Q36C_CONV_ROWS ? m->kv_len : Q36C_CONV_ROWS;
+    /* nothing on the device is this conversation's yet (q36c_mux_enter's closed branch) */
+    ch->dn_where = Q36C_HOST; ch->host_zero = 0; ch->snap_valid = 0;
+    for (int i = ch->lo; i < ch->lo + ch->n; i++) {
+        ch->kv_valid[i] = 0;
+        if (c->is_attn[i]) vkc_kv_lower(&ch->ks, ch->attn_ord[i], 0);
+    }
+    if (ch->ks.on || ch->cap > 2 * need) {
+        size_t freed = 0;
+        for (int i = ch->lo; i < ch->lo + ch->n; i++) {
+            if (!c->is_attn[i]) continue;
+            freed += vkc_bytes(ch->kc[i]) + vkc_bytes(ch->vc[i]);
+            vkc_free(ch->kc[i]); vkc_free(ch->vc[i]); ch->kc[i] = ch->vc[i] = NULL; ch->kv_valid[i] = 0; ch->kv_rows[i] = -1;
+        }
+        if (ch->ks.on) vkc_kv_free(&ch->ks);
+        ch->cap = 0; ch->dev_rows = 0;
+        const size_t again = q36c_conv_kv_bytes(m, ch, need);   /* what this conversation's place takes */
+        if (freed > again) vkt_take_back(freed - again);
+    }
+    if (!q36c_pool_ok(ch, m) || !(ch->conv = calloc((size_t)g_q36_mux_slots, sizeof *ch->conv))) return;
+    for (int k = 0; k < g_q36_mux_slots; k++) ch->conv[k].slot = -1;
+    ch->nconv = 1; ch->conv_cur = 0; ch->conv_full = 0; ch->pool_closed = 0; ch->pool_reopens++;
+    q36c_conv_save(ch);
+    ch->conv[0].slot = slot;
+    fprintf(stderr, "[VK] qwen36 chain: the conversations' places open again (a conversation of %d positions enters); "
+                    "each conversation's state stays on the device while there is room\n", m->kv_len);
 }
 static void q36c_mux_leave(Model *m) {
     Q36Chain *ch = q36c_of(m, 0);
@@ -1132,6 +1233,7 @@ static void q36c_mux_leave(Model *m) {
  * counts as its own */
 static void q36c_mux_enter(Model *m, int slot) {
     Q36Chain *ch = q36c_of(m, 0);
+    if (ch && !ch->conv && ch->pool_closed) q36c_pool_reopen(m, slot);
     if (ch && ch->conv && q36c_pool_ok(ch, m)) {
         if (slot < 0) return;
         ch->conv_clock++;   /* a new turn of the clock: no place is a step's now, any may be handed over */
@@ -1640,6 +1742,7 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
     if (ch->mx_rows) mirror_ok = 1;
     else if (ch->conv && ch->conv_cur >= 0) {
         q36c_conv_save(ch);
+        q36c_conv_shrink(ch, m, ch->conv_cur, pos_base + S);
         mirror_ok = q36c_conv_grow(ch, m, ch->conv_cur, pos_base + S);
         q36c_conv_load(ch, ch->conv_cur);
         if (!mirror_ok) { q36c_pool_off(ch, m); mirror_ok = q36c_mirror(ch, m, pos_base + S); }
@@ -1936,10 +2039,17 @@ static void q36c_report(Model *m) {
                 ch->dm.steps, ch->dm.big_steps, st.moe_i8, st.dev_bytes / 1048576.0);
         if (ch->conv)
             fprintf(stderr, "[VK] %s chain: KV_SLOTS=%d: %llu decode steps of several conversations in the chain (%llu rows, "
-                            "%.2f a step), %llu on the host's path; %d conversation%s state on the device, %llu handed over\n",
+                            "%.2f a step), %llu on the host's path; %d conversation%s state on the device, %llu handed over, "
+                            "%llu places' mirrors cut to a shorter conversation\n",
                     q36c_name(ch), g_q36_mux_slots, ch->mux_steps, ch->mux_rows,
                     ch->mux_steps ? (double)ch->mux_rows / (double)ch->mux_steps : 0.0, ch->mux_host_steps,
-                    ch->nconv, ch->nconv == 1 ? "'s" : "s'", ch->conv_handed);
+                    ch->nconv, ch->nconv == 1 ? "'s" : "s'", ch->conv_handed, ch->conv_shrinks);
+        if (ch->pool_reopens)
+            fprintf(stderr, "[VK] %s chain: the conversations' places opened again %llu time%s after a mirror that did not fit closed them\n",
+                    q36c_name(ch), ch->pool_reopens, ch->pool_reopens == 1 ? "" : "s");
+        if (ch->mirror_cuts)
+            fprintf(stderr, "[VK] %s chain: the KV mirror cut to a shorter conversation %llu time%s, the rest back to the expert tier\n",
+                    q36c_name(ch), ch->mirror_cuts, ch->mirror_cuts == 1 ? "" : "s");
         vkc_kv_report(&ch->ks);
         vkc_dmoe_hyb_report(q36c_name(ch), &ch->dm);
         vkc_prof_print();
