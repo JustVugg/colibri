@@ -53,7 +53,9 @@ def chat(*turns, system=SYSTEM):
 
 
 def ntok(prompt):
-    return len(prompt) - prompt.count(USER) * (len(USER) - 1) - prompt.count(ASSISTANT) * (len(ASSISTANT) - 1)
+    """tokens of a prompt: a byte each, a message's opening and an id past the bytes (<|tNNN|>) one"""
+    fill = sum(len(f) - 1 for f in re.findall(rb"<\|t\d+\|>", prompt))
+    return len(prompt) - prompt.count(USER) * (len(USER) - 1) - prompt.count(ASSISTANT) * (len(ASSISTANT) - 1) - fill
 
 
 def logits(log, k=None):
@@ -85,6 +87,14 @@ class Glm53PrefixStoreTest(unittest.TestCase):
         for text, tid in (("<|user|>", 1), ("<|assistant|>", 3)):
             vocab[text] = tid
             added.append({"id": tid, "content": text, "special": True})
+        # every id past the bytes gets a text of its own, so any reply comes back as the same ids
+        # (CI's fixture has 281: a reply with an id past 127 left the next turn without it)
+        cfg = json.loads((FIXTURE / "config.json").read_text())
+        n_vocab = cfg.get("text_config", cfg).get("vocab_size", 128)
+        for tid in range(128, n_vocab):
+            text = f"<|t{tid}|>"
+            vocab[text] = tid
+            added.append({"id": tid, "content": text, "special": False})
         (cls.dir / "tokenizer.json").write_text(json.dumps({
             "version": "1.0", "added_tokens": added,
             "model": {"type": "BPE", "vocab": vocab, "merges": []},

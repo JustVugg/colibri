@@ -61,10 +61,15 @@ class Qwen36PrefixStoreTest(unittest.TestCase):
         for f in FIXTURE.iterdir():
             if f.name != "tokenizer.json":
                 os.symlink(f.resolve(), cls.dir / f.name)
+        # every id past the bytes gets a text of its own, so a reply sent back is the same ids
+        vocab, added = byte_level_vocab(256), []
+        for tid in range(256, 320):
+            text = "<|im_start|>" if tid == 300 else f"<|t{tid}|>"
+            vocab[text] = tid
+            added.append({"id": tid, "content": text, "special": tid == 300})
         (cls.dir / "tokenizer.json").write_text(json.dumps({
-            "version": "1.0",
-            "added_tokens": [{"id": 300, "content": "<|im_start|>", "special": True}],
-            "model": {"type": "BPE", "vocab": byte_level_vocab(256), "merges": []},
+            "version": "1.0", "added_tokens": added,
+            "model": {"type": "BPE", "vocab": vocab, "merges": []},
         }), encoding="utf-8")
 
     @classmethod
