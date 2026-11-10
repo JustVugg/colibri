@@ -1648,6 +1648,7 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
     vkc_gemm_rows(g_q36_rowwise || ch->mx_rows ? 0 : -1);
     int snapped = 0, dmoe = q36c_dmoe(ch, m, rows);
     for (int c0 = 0; c0 < S; c0 += rows) {
+        double chunk_started = now_s();
         int n = S - c0 < rows ? S - c0 : rows, pb = pos_base + c0;
         if (c0 > 0 && q36_chunk_control()) {   /* a STOP or CANCEL between two prompt chunks */
             for (int i = lo; i < hi; i++) {   /* the rows past pos_base were this prompt's */
@@ -1801,6 +1802,7 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
             ch->dn_where = Q36C_DEV; ch->host_zero = 0;
         }
         if (last && !part) memcpy(logit, vkc_ptr(ch->outd), (size_t)nlogits * c->vocab * sizeof(float));
+        q36_prefill_chunk_record(now_s() - chunk_started);
     }
     if (lf) fwrite(vkc_ptr(ch->lfd), sizeof(float), (size_t)L * 3 * D, lf);
     ch->snap_valid = snapped;

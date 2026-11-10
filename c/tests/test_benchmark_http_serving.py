@@ -100,6 +100,10 @@ class BenchmarkTest(unittest.TestCase):
                                            "tokenize_s": 0.02, "prefix_match_s": 0.01,
                                            "snapshot_restore_s": 0.03,
                                            "snapshot_store_s": 0.04,
+                                           "prefill_embedding_s": 0.015,
+                                           "prefill_chunk_count": 3,
+                                           "prefill_chunk_avg_s": 0.5,
+                                           "prefill_chunk_max_s": 0.7,
                                            "prefill_deltanet_s": 0.4,
                                            "prefill_attention_s": 0.2,
                                            "prefill_moe_s": 1.0,
@@ -117,6 +121,10 @@ class BenchmarkTest(unittest.TestCase):
                                                  "tokenize_s": 0.02, "prefix_match_s": 0.01,
                                                  "snapshot_restore_s": 0.03,
                                                  "snapshot_store_s": 0.04,
+                                                 "prefill_embedding_s": 0.015,
+                                                 "prefill_chunk_count": 3,
+                                                 "prefill_chunk_avg_s": 0.5,
+                                                 "prefill_chunk_max_s": 0.7,
                                                  "prefill_deltanet_s": 0.4,
                                                  "prefill_attention_s": 0.2,
                                                  "prefill_moe_s": 1.0,
@@ -135,6 +143,10 @@ class BenchmarkTest(unittest.TestCase):
         self.assertEqual(summary["successful_server_prefix_match_seconds"]["p50"], 0.01)
         self.assertEqual(summary["successful_server_snapshot_restore_seconds"]["p50"], 0.03)
         self.assertEqual(summary["successful_server_snapshot_store_seconds"]["p50"], 0.04)
+        self.assertEqual(summary["successful_server_prefill_embedding_seconds"]["p50"], 0.015)
+        self.assertEqual(summary["successful_server_prefill_chunk_count"]["p50"], 3)
+        self.assertEqual(summary["successful_server_prefill_chunk_average_seconds"]["p50"], 0.5)
+        self.assertEqual(summary["successful_server_prefill_chunk_max_seconds"]["p50"], 0.7)
         self.assertEqual(summary["successful_server_prefill_deltanet_seconds"]["p50"], 0.4)
         self.assertEqual(summary["successful_server_prefill_attention_seconds"]["p50"], 0.2)
         self.assertEqual(summary["successful_server_prefill_moe_seconds"]["p50"], 1.0)

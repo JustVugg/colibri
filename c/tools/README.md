@@ -57,6 +57,20 @@ not runtime dependencies of the C engine.
 - `benchmark_cuda_fixture.py`, `eval_glm.py`, `fetch_benchmarks.py`: benchmarks
 - `gen_unicode.py`: tokenizer table generation
 
+`benchmark_long_prompts.py` runs prepared 32K and 64K JSONL workloads
+sequentially through `benchmark_http_serving.py`, writing separate
+`prompt-32k.json` and `prompt-64k.json` reports. Prepare the workloads with the
+target model's tokenizer; the report's server-reported prompt-token distribution
+is authoritative. Run this when the server and machine are available for the
+longer sequential tests:
+
+```sh
+python3 tools/benchmark_long_prompts.py \
+  --base-url http://127.0.0.1:8001/v1 --model qwen36 \
+  --workload-32k /path/to/32k.jsonl --workload-64k /path/to/64k.jsonl \
+  --output-dir /path/to/reports --timeout 14400
+```
+
 Run them from `c/`, for example:
 
 ```sh

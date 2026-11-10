@@ -106,7 +106,7 @@ For each engine/concurrency it reports min/median/max **across rounds** for:
 
 - Aggregate successful completion tokens per full batch wall second.
 - Client first-output P50/P95/P99 and completion-duration P95.
-- Server TTFT P50, Qwen3.6 tokenization/prefix/snapshot lookup, restore and store timings, aggregate and operation-level prefill P50, first-sample and post-prefill first-emission P50, decode tokens/second P50, and prefix-reuse fraction P50 when the engine reports those timings.
+- Server TTFT P50, Qwen3.6 tokenization/prefix/snapshot lookup, restore and store timings, embedding preparation, backend prefill chunk count/average/maximum duration, aggregate and operation-level prefill P50, first-sample and post-prefill first-emission P50, decode tokens/second P50, and prefix-reuse fraction P50 when the engine reports those timings.
 - Failure rate and latency-SLO request goodput.
 - It also reports actual server-reported output-length distribution across rounds.
 

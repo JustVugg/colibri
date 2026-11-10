@@ -49,6 +49,10 @@ class BaselineTest(unittest.TestCase):
                                      "decode_tokens_per_sec": 8.0, "prompt_tokens": 12,
                                      "reused_prompt_tokens": 8, "tokenize_s": .02,
                                      "snapshot_store_s": .04,
+                                     "prefill_embedding_s": .01,
+                                     "prefill_chunk_count": 2,
+                                     "prefill_chunk_avg_s": .4,
+                                     "prefill_chunk_max_s": .6,
                                      "prefill_attention_s": .25, "prefill_moe_s": .5,
                                      "first_sample_s": .003,
                                      "first_emit_after_prefill_s": .01})
@@ -112,6 +116,10 @@ class BaselineTest(unittest.TestCase):
         self.assertEqual(cell['server_prefill_p50_seconds']['median'], 1.0)
         self.assertEqual(cell['server_tokenize_p50_seconds']['median'], .02)
         self.assertEqual(cell['server_snapshot_store_p50_seconds']['median'], .04)
+        self.assertEqual(cell['server_prefill_embedding_p50_seconds']['median'], .01)
+        self.assertEqual(cell['server_prefill_chunk_count_p50']['median'], 2)
+        self.assertEqual(cell['server_prefill_chunk_average_p50_seconds']['median'], .4)
+        self.assertEqual(cell['server_prefill_chunk_max_p50_seconds']['median'], .6)
         self.assertEqual(cell['server_prefill_attention_p50_seconds']['median'], .25)
         self.assertEqual(cell['server_prefill_moe_p50_seconds']['median'], .5)
         self.assertEqual(cell['server_first_sample_p50_seconds']['median'], .003)

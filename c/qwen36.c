@@ -7067,6 +7067,19 @@ typedef struct {
     int result;
 } Q36StepControl;
 
+typedef struct {
+    double embedding_s, chunk_total_s, chunk_max_s;
+    int chunk_count;
+} Q36PrefillTiming;
+static Q36PrefillTiming *g_q36_prefill_timing;
+static void q36_prefill_chunk_record(double seconds) {
+    Q36PrefillTiming *timing = g_q36_prefill_timing;
+    if (!timing || seconds < 0.0) return;
+    timing->chunk_count++;
+    timing->chunk_total_s += seconds;
+    if (seconds > timing->chunk_max_s) timing->chunk_max_s = seconds;
+}
+
 /* The prompt's control for the chains (qwen36_chain.h, qwen36_cuda_chain.h): set by
  * step_ex_control around their forward, polled between two prompt chunks. A chain that
  * sees a STOP or CANCEL there returns 0 with control->result set: the chunks before it
@@ -7319,8 +7332,11 @@ static float *step_ex_control(Model *m, const int *ids, int S, int pos_base, int
     }
     /* a prompt's rows over the team: each decoded from the file's blocks on its own (LFM3's
      * Q6_K table, 2048 a row: on one thread the prompt waited for them before the device) */
+    double embedding_started = now_s();
     #pragma omp parallel for schedule(static) if (S >= 16)
     for (int s = 0; s < S; s++) q36_embed_row(m, ids[s], pos_base + s, x + (int64_t)s*D);
+    if (g_q36_prefill_timing)
+        g_q36_prefill_timing->embedding_s += now_s() - embedding_started;
     tier_rebuild_evicted(m);
     int chain_n = 0;   /* layers the chain ran (a partial chain: the CPU runs the rest) */
     float *chain_logit = NULL;   /* the Vulkan or the CUDA chain ran the final norm and lm_head */
@@ -7347,8 +7363,11 @@ static float *step_ex_control(Model *m, const int *ids, int S, int pos_base, int
             q36c_cpu_step(m, pos_base);
             /* Earlier chunks may have returned their final rows for Clef or
              * prompt logprobs. A failed forward replays every row on the CPU. */
+            embedding_started = now_s();
             for (int s = 0; s < S; s++)
                 q36_embed_row(m, ids[s], pos_base + s, x + (int64_t)s*D);
+            if (g_q36_prefill_timing)
+                g_q36_prefill_timing->embedding_s += now_s() - embedding_started;
         } else if (rows_only) { free(chain_logit); chain_logit = NULL; }
     }
 #endif
@@ -7369,19 +7388,32 @@ static float *step_ex_control(Model *m, const int *ids, int S, int pos_base, int
         } else if (!chain_n) {
             free(chain_logit); chain_logit = NULL;
             q36cc_cpu_step(m, pos_base);
+            embedding_started = now_s();
             for (int s = 0; s < S; s++)
                 q36_embed_row(m, ids[s], pos_base + s, x + (int64_t)s*D);
+            if (g_q36_prefill_timing)
+                g_q36_prefill_timing->embedding_s += now_s() - embedding_started;
         } else if (rows_only) { free(chain_logit); chain_logit = NULL; }
     }
 #endif
-    if (stopped || (!chain_logit && layers_forward_control(m, x, S, pos_base, chain_n,
-                                                           c->n_layers, 1, lf, control))) {
+    if (stopped) {
         /* Some layers (or a chain's first chunks) may have advanced, others not. Neither
          * the previous prefix nor a partially processed prompt describes this state. */
         q36_prefill_abort(m);
         free(x);
         if (lf) fclose(lf);
         return NULL;
+    }
+    if (!chain_logit) {
+        double chunk_started = now_s();
+        if (layers_forward_control(m, x, S, pos_base, chain_n,
+                                   c->n_layers, 1, lf, control)) {
+            q36_prefill_abort(m);
+            free(x);
+            if (lf) fclose(lf);
+            return NULL;
+        }
+        q36_prefill_chunk_record(now_s() - chunk_started);
     }
     if (g_q36_mtp.on) q36_mtp_feed(m, ids, S, pos_base, x);   /* either chain brought every row back */
     if (g_hidden_sink) {
@@ -9284,10 +9316,11 @@ static int qwen36_serve_budget(int np, int max_tok, int max_ctx, int read_only){
 typedef struct {
     double s_disk, s_attn, s_moe, s_head, t0, prefill_s;
     double tokenize_s, prefix_match_s, snapshot_restore_s, snapshot_store_s;
+    double prefill_embedding_s, prefill_chunk_avg_s, prefill_chunk_max_s;
     double prefill_deltanet_s, prefill_attention_s, prefill_moe_s;
     double prefill_shared_s, prefill_router_s, prefill_lm_head_s;
     double first_sample_s, first_emit_after_prefill_s;
-    int reused_prompt_tokens;
+    int reused_prompt_tokens, prefill_chunk_count;
     const char *prefix_reuse_source, *prefix_reuse_miss;
     uint64_t hits, miss;
 } Q36ReqClock;
@@ -9463,12 +9496,15 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     float *lo = NULL;
     double prefill_started = now_s();
     double prefill_tm_start[6];
+    Q36PrefillTiming prefill_timing = {0};
     memcpy(prefill_tm_start, g_tm_pre, sizeof prefill_tm_start);
+    g_q36_prefill_timing = &prefill_timing;
     if (!prefill_control) {
         lo = step_ex_control(m, ids + reuse, np - reuse, reuse, 1,
                              interruptible ? &control : NULL);
         prefill_control = control.result;
     }
+    g_q36_prefill_timing = NULL;
     double prefill_s = now_s() - prefill_started;
     clk->prefill_deltanet_s = (g_tm_pre[0] - prefill_tm_start[0]) / 1000.0;
     clk->prefill_attention_s = (g_tm_pre[1] - prefill_tm_start[1]) / 1000.0;
@@ -9504,6 +9540,11 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     clk->s_disk=m->t_disk; clk->s_attn=tm_sum(0)+tm_sum(1); clk->s_moe=tm_sum(2); clk->s_head=tm_sum(5);
     clk->hits=m->hits; clk->miss=m->miss;
     clk->prefill_s=prefill_s; clk->reused_prompt_tokens=reuse;
+    clk->prefill_embedding_s=prefill_timing.embedding_s;
+    clk->prefill_chunk_count=prefill_timing.chunk_count;
+    clk->prefill_chunk_avg_s=prefill_timing.chunk_count
+        ? prefill_timing.chunk_total_s / prefill_timing.chunk_count : 0.0;
+    clk->prefill_chunk_max_s=prefill_timing.chunk_max_s;
     clk->prefix_reuse_source=reuse_source; clk->prefix_reuse_miss=reuse_miss;
     clk->t0=now_s();
     g_echo_k = 0; g_echo_id = NULL;   /* la lettura riguarda il prefill, non la decodifica */
@@ -9585,6 +9626,8 @@ static void serve_one_turn(Model *m, ServeReq *q){
     }
     printf("DONE %s STAT %d %.3f %.1f %.2f %d %d prefill_s=%.6f reused_prompt_tokens=%d"
            " tokenize_s=%.6f prefix_match_s=%.6f snapshot_restore_s=%.6f snapshot_store_s=%.6f"
+           " prefill_embedding_s=%.6f prefill_chunk_count=%d prefill_chunk_avg_s=%.6f"
+           " prefill_chunk_max_s=%.6f"
            " prefill_deltanet_s=%.6f prefill_attention_s=%.6f prefill_moe_s=%.6f"
            " prefill_shared_s=%.6f prefill_router_s=%.6f prefill_lm_head_s=%.6f"
            " prefix_reuse_source=%s",
@@ -9592,6 +9635,8 @@ static void serve_one_turn(Model *m, ServeReq *q){
            dt>0?gen/dt:0.0,q36_turn_hit(m,&clk),rss_gb(),np,limited,
            clk.prefill_s,clk.reused_prompt_tokens,
            clk.tokenize_s,clk.prefix_match_s,clk.snapshot_restore_s,clk.snapshot_store_s,
+           clk.prefill_embedding_s,clk.prefill_chunk_count,clk.prefill_chunk_avg_s,
+           clk.prefill_chunk_max_s,
            clk.prefill_deltanet_s,clk.prefill_attention_s,clk.prefill_moe_s,
            clk.prefill_shared_s,clk.prefill_router_s,clk.prefill_lm_head_s,
            clk.prefix_reuse_source ? clk.prefix_reuse_source : "none");
@@ -10004,7 +10049,11 @@ static void q36_mux_finish(Model *m, Q36MuxReq *r){
     if (g_q36_mux_cur != r->q.slot) q36_mux_bind(m, r->q.slot);
     /* an image turn's rope positions go with the turn, as q36_vision_detach drops them */
     free(m->mpos); m->mpos = NULL; m->mpos_len = m->rope_delta = 0;
-    if (r->sbn > 0) serve_data(r->q.id, (char *)r->sbuf, r->sbn);   /* the trailing partial UTF-8 */
+    if (r->sbn > 0) {
+        if (r->clk.first_emit_after_prefill_s < 0)
+            r->clk.first_emit_after_prefill_s = now_s() - r->clk.t0;
+        serve_data(r->q.id, (char *)r->sbuf, r->sbn);   /* the trailing partial UTF-8 */
+    }
     if (r->cancel) { printf("ERROR %s CANCELLED\n", r->q.id); fflush(stdout); return; }
     double dt = now_s() - r->clk.t0;
     hits_emit(m);
@@ -10015,8 +10064,29 @@ static void q36_mux_finish(Model *m, Q36MuxReq *r){
                tm_sum(5) - r->clk.s_head, (unsigned long long)r->forwards);
         fflush(stdout);
     }
-    printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n", r->q.id, r->gen,
-           dt > 0 ? r->gen / dt : 0.0, q36_turn_hit(m, &r->clk), rss_gb(), r->np, r->limited);
+    printf("DONE %s STAT %d %.3f %.1f %.2f %d %d prefill_s=%.6f reused_prompt_tokens=%d"
+           " tokenize_s=%.6f prefix_match_s=%.6f snapshot_restore_s=%.6f snapshot_store_s=%.6f"
+           " prefill_embedding_s=%.6f prefill_chunk_count=%d prefill_chunk_avg_s=%.6f"
+           " prefill_chunk_max_s=%.6f"
+           " prefill_deltanet_s=%.6f prefill_attention_s=%.6f prefill_moe_s=%.6f"
+           " prefill_shared_s=%.6f prefill_router_s=%.6f prefill_lm_head_s=%.6f"
+           " prefix_reuse_source=%s",
+           r->q.id, r->gen,
+           dt > 0 ? r->gen / dt : 0.0, q36_turn_hit(m, &r->clk), rss_gb(), r->np, r->limited,
+           r->clk.prefill_s, r->clk.reused_prompt_tokens,
+           r->clk.tokenize_s, r->clk.prefix_match_s, r->clk.snapshot_restore_s,
+           r->clk.snapshot_store_s, r->clk.prefill_embedding_s, r->clk.prefill_chunk_count,
+           r->clk.prefill_chunk_avg_s, r->clk.prefill_chunk_max_s,
+           r->clk.prefill_deltanet_s, r->clk.prefill_attention_s, r->clk.prefill_moe_s,
+           r->clk.prefill_shared_s, r->clk.prefill_router_s, r->clk.prefill_lm_head_s,
+           r->clk.prefix_reuse_source ? r->clk.prefix_reuse_source : "none");
+    if (r->clk.prefix_reuse_miss)
+        printf(" prefix_reuse_miss=%s", r->clk.prefix_reuse_miss);
+    if (r->clk.first_sample_s >= 0)
+        printf(" first_sample_s=%.6f", r->clk.first_sample_s);
+    if (r->clk.first_emit_after_prefill_s >= 0)
+        printf(" first_emit_after_prefill_s=%.6f", r->clk.first_emit_after_prefill_s);
+    putchar('\n');
     fflush(stdout);
 }
 
@@ -10025,16 +10095,26 @@ static void q36_mux_finish(Model *m, Q36MuxReq *r){
 static int q36_mux_pick(Model *m, Q36MuxReq *r, const int *eos_ids, int n_eos, int *tk_out){
     if (r->stop) r->limited = 0;
     if (r->cancel || r->stop || r->gen >= r->q.max_tok) { q36_mux_finish(m, r); return 0; }
+    double sample_started = now_s();
     int tk = serve_sample(r->lo, m->c.vocab, r->q.temp, r->q.top_p);
+    if (r->gen == 0) r->clk.first_sample_s = now_s() - sample_started;
     char lptail[1024]; lptail[0] = 0;
     if (r->q.logprobs > 0) coli_logprob_tail(lptail, sizeof lptail, r->lo, m->c.vocab, tk, r->q.logprobs);
     free(r->lo); r->lo = NULL;
     for (int e = 0; e < n_eos; e++) if (tk == eos_ids[e]) { r->limited = 0; q36_mux_finish(m, r); return 0; }
     unsigned char tmp[256]; int tn = 0; decode_id_to_bytes(tk, tmp, &tn);
-    if (r->q.logprobs > 0) serve_data_lp(r->q.id, (char *)tmp, tn, lptail);
+    if (r->q.logprobs > 0) {
+        if (tn > 0 && r->clk.first_emit_after_prefill_s < 0)
+            r->clk.first_emit_after_prefill_s = now_s() - r->clk.t0;
+        serve_data_lp(r->q.id, (char *)tmp, tn, lptail);
+    }
     else {
         unsigned char chunk[256]; int cn = 0; utf8_drain(r->sbuf, &r->sbn, tmp, tn, chunk, &cn);
-        if (cn > 0) serve_data(r->q.id, (char *)chunk, cn);
+        if (cn > 0) {
+            if (r->clk.first_emit_after_prefill_s < 0)
+                r->clk.first_emit_after_prefill_s = now_s() - r->clk.t0;
+            serve_data(r->q.id, (char *)chunk, cn);
+        }
     }
     r->gen++;
     /* the next logits are not needed after the last requested token (serve_one) */
@@ -10084,7 +10164,11 @@ static void serve_mux(Model *m){
                      * positions stay with the conversation until the turn ends */
                     free(m->vis_rows); free(m->vis_map); m->vis_rows = NULL; m->vis_map = NULL;
                     m->vis_rows_n = m->vis_map_len = 0;
-                    if (ok) { t->active = 1; t->limited = 1; t->forwards = 1; }
+                    if (ok) {
+                        t->clk.first_sample_s = -1.0;
+                        t->clk.first_emit_after_prefill_s = -1.0;
+                        t->active = 1; t->limited = 1; t->forwards = 1;
+                    }
                     else { free(m->mpos); m->mpos = NULL; m->mpos_len = m->rope_delta = 0; }
                     free(t->q.payload); t->q.payload = NULL;
                     if (ok) emap_emit(m);

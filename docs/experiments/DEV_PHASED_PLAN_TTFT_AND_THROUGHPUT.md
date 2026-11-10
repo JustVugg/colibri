@@ -68,7 +68,7 @@ The following are historical observations in `logs/DEV_PLAN_10TO15_TOKS.md`, not
 
 ### C12 — TTFT instrumentation and long-prompt baseline
 
-**Priority:** P0 · **Status:** Gateway and Qwen3.6 stage timings implemented; representative workload matrix and real-model baseline collection pending
+**Priority:** P0 · **Status:** Gateway and Qwen3.6 stage timings implemented; one-request real-model pilots completed at 1K, 4K and 12K; repeated representative baselines and 32K remain pending
 
 **Goal:** Identify where time is spent between request arrival and the first streamed token.
 
@@ -252,8 +252,24 @@ The logged T(1) component ranges from about 62 ms to 344 ms as turns progress. I
 - Colibri chat/completion responses now report request preparation, scheduler queue wait, engine submission-to-acceptance, acceptance-to-first-output, engine-call duration, request-to-engine-done, and decode tokens/sec. Streaming metrics are attached to the final completion chunk; non-streaming metrics are top-level.
 - Qwen3.6 reports tokenization, live-prefix matching, snapshot lookup/restore/store, fresh-prefill wall time and prompt/reused-token counts. Snapshot-store duration is measured separately because storage happens after prefill and before engine TTFT timing starts. Fresh-prefill operation accumulators cover DeltaNet, attention, MoE, shared/router subsets and LM head; the first sampling call is timed independently, and elapsed time to first non-empty text emission after prefill is reported. The emission interval can include sampling, decoding and UTF-8 buffering. Operation accumulators are diagnostic, not additive wall-time parts.
 - Benchmark summaries and baseline comparisons expose client and server timings separately, including snapshot-store, first-sample and post-prefill emission distributions. API and baseline documentation describe their measurement boundaries.
-- Embedding/input preparation and explicit per-prefill-chunk timing are not yet separately exposed; confirm whether the serving path splits prompts into multiple measured chunks and add those fields if applicable.
-- Focused validation passed: `cd c && make qwen36`; `cd c && PYTHONPATH=. python3 -m pytest tests/test_openai_server.py tests/test_benchmark_http_serving.py tests/test_benchmark_baseline.py tests/test_qwen36_prefix_serve.py -q` (517 passed, 646 subtests, 12 fixture-dependent skipped); and `git diff --check`. A real-model inference has not validated the new engine timing values, and no speed improvement has been measured.
+- The engine embeds the prompt rows before its layer forward. The CPU path processes the fresh prompt in one host pass; Vulkan/CUDA paths split rows into backend chunks. The follow-up instrumentation now reports embedding duration and chunk count plus average/maximum chunk duration.
+- Qwen3.6 `KV_SLOTS>1` multiplexed serving now emits the same stage timing fields as single-slot serving, including first-sample and first-text-emission timings. Focused validation passed after this change: `cd c && make qwen36` (CPU build); `cd c && PYTHONPATH=. python3 -m pytest tests/test_openai_server.py tests/test_benchmark_http_serving.py tests/test_benchmark_baseline.py tests/test_qwen36_prefix_serve.py -q` (517 passed, 646 subtests, 12 fixture-dependent skipped); and `git diff --check`. Multiplexed runtime behavior was not independently exercised by the available fixture; Vulkan/CUDA chunk instrumentation has not been compiled or exercised on this host.
+
+### 2026-11-10 — C12 first real-model timing pilot
+
+- Ran the built serving stack with Qwen3.6-35B-A3B IQ2_XXS, `OMP_NUM_THREADS=6`, context 66K, concurrency 1, greedy sampling, and 128 generated tokens. The API was bound to loopback; `COLI_PROMPT_CACHE=0` prevented this matrix from restoring or writing prompt snapshots. The 1K request was the first inference after server startup; 4K and 12K followed in the same process. Prompt text was synthetic, length-controlled, and not a representative coding-agent session. Qwen3.6 speculative lookup remained at its default setting, so these are exploratory observations, not the clean baseline.
+- One request per size completed successfully. Actual token counts differ slightly from the target labels:
+
+  | Target | Prompt tokens | Client first output (s) | Engine TTFT (s) | Prefill (s) | Decode (tok/s) |
+  |---:|---:|---:|---:|---:|---:|
+  | 1K | 1,045 | 34.326 | 34.313 | 34.304 | 14.30 |
+  | 4K | 4,105 | 172.503 | 172.489 | 172.475 | 9.43 |
+  | 12K | 12,231 | 785.007 | 784.993 | 784.941 | 6.92 |
+
+- Client-observed first output exceeded engine TTFT by 12–14 ms across these three requests. Prefill dominated TTFT; the operation diagnostics reported MoE as the largest component at 1K/4K, while attention rose to 263 s at 12K. Operation timers overlap and are not additive. Engine decode rate was measured over 128 output tokens; it is a single-request observation, not a repeated sustained-throughput distribution.
+- After adding embedding/chunk timing, one more 1,045-token request ran with `COLI_LOOKUP=0`: client first output 35.212 s, engine TTFT 35.201 s, prefill 35.191 s, embedding preparation 0.000565 s, one CPU layer chunk averaging/maxing 35.160 s, and decode 14.01 tok/s. This validates the new fields through a real CPU-path response; it is one observation and not an instrumentation-overhead comparison.
+- The 12K request took 13.4 minutes. Its attention timer reached about 263 s, making attention a plausible long-prompt investigation target, but one synthetic run cannot select a specific optimization: operation timers overlap, and there is no controlled repeated baseline or request-aligned memory capture. A helper now runs prepared 32K and 64K workloads sequentially into separate reports; those lengthy runs are deferred, not prerequisites for identifying this initial direction.
+- No speedup is established. Remaining C12 work: controlled repeated p50/p95/p99 runs, a representative prompt set, GPU chunk-field verification where applicable, optional 32K/64K scaling reports, cold/warm/restored-prefix separation, memory aligned to TTFT/decode, and instrumentation-overhead measurement. Preserve the JSON reports and hashed workloads in session artifacts; they are not checked into the repository.
 
 ### 2026-11-10 — C13 prefix telemetry in progress
 
@@ -265,15 +281,15 @@ The logged T(1) component ranges from about 62 ms to 344 ms as turns progress. I
 
 1. Finish deterministic multi-turn C13 prefix telemetry validation, including source and correctness for stable, appended and divergent prefixes.
 2. Measure cold, warm and restored-prefix requests independently, including prompt/reused-token counts, snapshot restore/store time, TTFT and correctness against cold-prefill references.
-3. Run the deterministic 1K/4K/12K/32K prompt matrix (66K only where supported), reporting client TTFT p50/p95/p99, server TTFT, prefill stages and sustained decode throughput.
-4. Measure memory alongside TTFT and sustained decode for the same runs; verify timing reconciliation and instrumentation overhead, and separately expose embedding/input-preparation and per-prefill-chunk timings if the execution path needs them.
+3. Repeat the 1K/4K/12K prompt matrix with controlled settings and representative workloads; run 32K if safe, reporting client TTFT p50/p95/p99, server TTFT, prefill stages and sustained decode throughput.
+4. Measure memory alongside TTFT and sustained decode for the same runs; verify timing reconciliation and GPU chunk summaries where applicable, and measure instrumentation overhead.
 5. Only after these measurements choose a C14 residency or C15 kernel/chunk experiment. Preserve the same prompts, sampling, output limit and environment across comparisons.
 
 ## 7. Priority summary
 
 | Phase | Focus | Priority | Gate | Status / evidence |
 |---|---|---:|---|---|
-| C12 | TTFT instrumentation and baselines | P0 | Identify bottleneck | **Stage instrumentation implemented:** gateway reports request/engine timings and decode rate; Qwen3.6 reports tokenization, prefix matching, snapshot restore/store, aggregate and operation-level prefill, first sampling and first text emission. Tests: Qwen3.6 build passed; targeted suites passed (517 tests, 646 subtests, 12 fixture-dependent skips); diff check passed. **Pending:** real-model protocol verification; deterministic multi-turn prefix correctness; separate cold/warm/restored-prefix runs; 1K–66K prompt matrix; joint memory/TTFT/decode measurement; timing reconciliation and instrumentation-overhead measurement. No real-model speed improvement measured. |
+| C12 | TTFT instrumentation and baselines | P0 | Identify bottleneck | **Instrumentation:** gateway/Qwen3.6 stage timings plus embedding and backend chunk summaries; single-slot and multiplexed STAT paths include first-sample and first-text-emission timings. CPU build and focused suites passed (521 tests, 646 subtests, 12 fixture-dependent skips); multiplexed runtime behavior and Vulkan/CUDA chunk fields remain unverified. A real 1,045-token request verified the CPU fields (embedding 0.000565 s; one 35.160 s chunk). **Real-model pilot:** 1,045/4,105/12,231-token prompts produced 34.313/172.489/784.993 s engine TTFT and 14.30/9.43/6.92 tok/s over 128 output tokens; client/server first-output delta was 12–14 ms. One synthetic sample per size, speculation default-on, no peak-memory capture; these are not baseline distributions or a speedup. A helper is ready to run prepared 32K/64K workloads into separate reports; those runs remain deferred. **Pending:** representative repeated runs, speculation-off baseline, cold/warm/restored-prefix separation, GPU chunk verification, memory correlation, instrumentation overhead and C13 prefix correctness. |
 | C13 | Prefix reuse validation | P0 | Correct reuse and measurable savings | **Telemetry implemented:** Qwen3.6 records reuse source, token count, and bounded miss reason; benchmark reports reuse fraction and categories. **Pending:** real multi-turn correctness/performance validation; tiny converted fixture unavailable (12 tests skipped). Existing log showed one disk restore of 1,265/8,411 tokens, but no controlled time-saved or speedup measurement. |
 | C14 | Hybrid RAM residency | P1 | Better end-to-end performance without pressure | Existing opt-in `Q36_HYBRID_GB` implementation; no budget sweep or memory-pressure validation recorded here. **Pending:** 0/1/2/3/5 GB repeated workload tests, including decode and TTFT. No speed or memory result established. |
 | C15 | Long-prompt prefill acceleration | P1 | Profile-guided improvement | Not started; waiting on C12 operation-level profile. No tests or speed improvements measured. |

@@ -6336,7 +6336,8 @@ def _engine_timing_stats(fields):
     out = {}
     seconds_fields = {
         "prefill_s", "tokenize_s", "prefix_match_s", "snapshot_restore_s",
-        "snapshot_store_s",
+        "snapshot_store_s", "prefill_embedding_s", "prefill_chunk_avg_s",
+        "prefill_chunk_max_s",
         "prefill_deltanet_s", "prefill_attention_s", "prefill_moe_s",
         "prefill_shared_s", "prefill_router_s", "prefill_lm_head_s",
         "first_sample_s", "first_emit_after_prefill_s",
@@ -6355,6 +6356,11 @@ def _engine_timing_stats(fields):
             if tokens < 0:
                 raise ValueError("invalid reused prompt token count")
             out[key] = tokens
+        elif key == "prefill_chunk_count":
+            count = int(value)
+            if count < 0:
+                raise ValueError("invalid prefill chunk count")
+            out[key] = count
         elif key == "prefix_reuse_source":
             if value not in ("live_state", "pin_snapshot", "disk_snapshot", "none"):
                 raise ValueError("invalid prefix reuse source")
@@ -9387,6 +9393,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 for name in (
                     "prefill_s", "prompt_tokens", "reused_prompt_tokens",
                     "tokenize_s", "prefix_match_s", "snapshot_restore_s", "snapshot_store_s",
+                    "prefill_embedding_s", "prefill_chunk_count", "prefill_chunk_avg_s",
+                    "prefill_chunk_max_s",
                     "prefill_deltanet_s", "prefill_attention_s", "prefill_moe_s",
                     "prefill_shared_s", "prefill_router_s", "prefill_lm_head_s",
                     "first_sample_s", "first_emit_after_prefill_s",

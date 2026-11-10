@@ -1823,6 +1823,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
     int snapped = 0;
     double w0 = ch->wait_ms, h0 = ch->host_ms;
     for (int c0 = 0; c0 < S; c0 += rows) {
+        double chunk_started = now_s();
         int n = S - c0 < rows ? S - c0 : rows, pb = pos_base + c0;
         if (c0 > 0 && q36_chunk_control()) {   /* a STOP or CANCEL between two prompt chunks */
             q36cc_dm_end(ch);
@@ -2016,6 +2017,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
             ch->dn_where = Q36CC_DEV; ch->host_zero = 0;
         }
         if (last) memcpy(logit, cc_ptr(ch->outd), (size_t)nlogits * c->vocab * sizeof(float));
+        q36_prefill_chunk_record(now_s() - chunk_started);
     }
     q36cc_dm_end(ch);
     if (lf) fwrite(cc_ptr(ch->lfd), sizeof(float), (size_t)L * 3 * D, lf);

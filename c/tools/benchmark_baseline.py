@@ -213,6 +213,14 @@ def compare(spec, workload, workload_hash, directory):
                               "successful_server_snapshot_restore_seconds", "p50"),
                           "server_snapshot_store_p50_seconds": metric(
                               "successful_server_snapshot_store_seconds", "p50"),
+                          "server_prefill_embedding_p50_seconds": metric(
+                              "successful_server_prefill_embedding_seconds", "p50"),
+                          "server_prefill_chunk_count_p50": metric(
+                              "successful_server_prefill_chunk_count", "p50"),
+                          "server_prefill_chunk_average_p50_seconds": metric(
+                              "successful_server_prefill_chunk_average_seconds", "p50"),
+                          "server_prefill_chunk_max_p50_seconds": metric(
+                              "successful_server_prefill_chunk_max_seconds", "p50"),
                           "server_prefill_deltanet_p50_seconds": metric(
                               "successful_server_prefill_deltanet_seconds", "p50"),
                           "server_prefill_attention_p50_seconds": metric(
