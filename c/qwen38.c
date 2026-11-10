@@ -3428,9 +3428,10 @@ int main(int argc, char **argv) {
 #endif /* QWEN38_TEST_SERVE */
 #endif /* !QWEN38_NO_MAIN || QWEN38_TEST_SERVE */
 #if defined(QWEN38_NO_MAIN) && !defined(QWEN38_TEST_SERVE)
-/* q38_state_later (above) counts what a serve allocates once it runs; a test build has no
- * serve, and the tier's start (below) still asks */
+/* q38_state_later and q38_ps_plan (above) count what a serve allocates once it runs; a test
+ * build has no serve, and the tier's start (below) still asks */
 static size_t q38_state_later(Model *m){ (void)m; return 0; }
+static size_t q38_ps_plan(const Model *m){ (void)m; return 0; }
 #endif
 
 static int q38_u64_mul(uint64_t left,uint64_t right,uint64_t *out){
