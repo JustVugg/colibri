@@ -20,6 +20,7 @@ from family_registry import (
     PlannerUnsupportedError,
     _build_registry,
     display_for,
+    default_model_id,
     expert_contributions,
     fixed_resident_contribution,
     family_for_config,
@@ -1554,6 +1555,34 @@ class FamilyRegistryTest(unittest.TestCase):
         shipped = {path.name for path in pack_python.needed(repo / "c")}
         self.assertIn("family_registry.py", shipped,
                       "l'archivio non spedirebbe family_registry.py")
+
+
+class Glm47FlashFamilyTest(unittest.TestCase):
+    def test_glm47_is_distinct_but_uses_colibri_mla_family(self):
+        config = {"model_type": "glm47_moe", "hidden_size": 2048,
+                  "num_hidden_layers": 47, "num_attention_heads": 20,
+                  "num_nextn_predict_layers": 1,
+                  "n_routed_experts": 64, "num_experts_per_tok": 4,
+                  "moe_intermediate_size": 1536,
+                  "first_k_dense_replace": 1, "q_lora_rank": 768,
+                  "kv_lora_rank": 512, "qk_nope_head_dim": 192,
+                  "qk_rope_head_dim": 64, "v_head_dim": 256,
+                  "index_topk": 0, "index_n_heads": 0, "index_head_dim": 0,
+                  "indexer_types": [], "max_position_embeddings": 202752,
+                  "rms_norm_eps": 1e-5, "rope_parameters": {"rope_theta": 1e6}}
+        family = family_for_config(config)
+        self.assertEqual((family.id, family.engine_artifact, family.planner_id),
+                         ("glm", "colibri", "glm_mla"))
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": ".", "decision_head": None,
+                                   "config": {"colibri_gguf": {
+                                       "name": "GLM-4.7-Flash", "size": "64x2.6B"}}})()
+        self.assertEqual(display_for(resolved), ("GLM-4.7-Flash", "31B"))
+        self.assertEqual(default_model_id(resolved), "glm-4.7-flash-colibri")
+        self.assertEqual(planner_geometry(resolved, 4096).configured_experts, 64)
+        self.assertEqual(expert_contributions(
+            resolved, "model.layers.1.mlp.experts.7.gate_proj.weight", 1234, "GGUF_Q4_K"),
+            ((1, 7, 1234),))
 
 
 class GlmFamilyNamesBothModelsTest(unittest.TestCase):

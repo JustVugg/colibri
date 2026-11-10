@@ -862,6 +862,67 @@ class InklingConfig(unittest.TestCase):
         self.assertEqual((cfg["unpadded_vocab_size"], cfg["eos_token_id"]), (200058, 200006))
 
 
+class Glm47Config(unittest.TestCase):
+    """GLM-4.7-Flash's deepseek2 GGUF: MLA, one dense FFN layer, sigmoid MoE after it,
+    no DSA indexer in the tensor inventory."""
+    def test_deepseek2_metadata(self):
+        import tools.gguf_import as gi
+        p = "deepseek2."
+        meta = {p + k: v for k, v in {
+            "block_count": 4, "context_length": 4096, "embedding_length": 256,
+            "feed_forward_length": 1024, "attention.head_count": 4, "attention.head_count_kv": 1,
+            "rope.freq_base": 1000000.0, "attention.layer_norm_rms_epsilon": 1e-5,
+            "expert_count": 8, "expert_used_count": 2, "expert_group_count": 1,
+            "expert_gating_func": 2, "attention.key_length": 576, "attention.value_length": 512,
+            "attention.key_length_mla": 256, "attention.value_length_mla": 256,
+            "attention.q_lora_rank": 64, "attention.kv_lora_rank": 32,
+            "expert_feed_forward_length": 128, "expert_shared_count": 1,
+            "expert_weights_scale": 1.8, "expert_weights_norm": True,
+            "leading_dense_block_count": 1, "rope.dimension_count": 64,
+            "vocab_size": 259}.items()}
+        meta["tokenizer.ggml.bos_token_id"] = 256
+        meta["tokenizer.ggml.eos_token_id"] = 257
+        tensors = {"token_embd.weight": {"dims": [256, 259]},
+                   "output.weight": {"dims": [256, 259]}}
+        for layer in range(4):
+            b = f"blk.{layer}."
+            for name in ("attn_q_a.weight", "attn_q_a_norm.weight", "attn_q_b.weight",
+                         "attn_kv_a_mqa.weight", "attn_kv_a_norm.weight", "attn_k_b.weight",
+                         "attn_v_b.weight", "attn_output.weight"):
+                tensors[b + name] = {}
+            if layer == 0:
+                for name in ("ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"):
+                    tensors[b + name] = {}
+            else:
+                for name in ("ffn_gate_inp.weight", "ffn_gate_shexp.weight", "ffn_up_shexp.weight",
+                             "ffn_down_shexp.weight", "ffn_gate_exps.weight", "ffn_up_exps.weight",
+                             "ffn_down_exps.weight"):
+                    tensors[b + name] = {}
+        cfg, layers = gi.glm47_config(meta, tensors)
+        self.assertEqual((layers, cfg["model_type"], cfg["first_k_dense_replace"]),
+                         (4, "glm47_moe", 1))
+        self.assertEqual((cfg["q_lora_rank"], cfg["kv_lora_rank"], cfg["qk_rope_head_dim"]), (64, 32, 64))
+        self.assertEqual((cfg["qk_nope_head_dim"], cfg["v_head_dim"]), (192, 256))
+        self.assertEqual((cfg["n_routed_experts"], cfg["num_experts_per_tok"],
+                          cfg["routed_scaling_factor"]), (8, 2, 1.8))
+        self.assertEqual((cfg["index_topk"], cfg["index_head_dim"], cfg["bos_token_id"], cfg["eos_token_id"]),
+                         (0, 0, 256, 257))
+        self.assertEqual(cfg["max_position_embeddings"], 4096)
+
+    def test_refuses_incomplete_layer_and_unsupported_router(self):
+        import tools.gguf_import as gi
+        meta = {"deepseek2.block_count": 1, "deepseek2.leading_dense_block_count": 0,
+                "deepseek2.expert_group_count": 1, "deepseek2.expert_gating_func": 2}
+        with self.assertRaisesRegex(SystemExit, "metadata lacks"):
+            gi.glm47_config(meta, {})
+        meta.update({"deepseek2.block_count": 1, "deepseek2.embedding_length": 256,
+                     "deepseek2.attention.head_count": 4, "deepseek2.rope.dimension_count": 64,
+                     "deepseek2.vocab_size": 259, "deepseek2.expert_group_count": 1,
+                     "deepseek2.expert_gating_func": 1})
+        with self.assertRaisesRegex(SystemExit, "sigmoid expert gating"):
+            gi.glm47_config(meta, {"token_embd.weight": {"dims": [256, 259]}})
+
+
 class GlmDsaConfig(unittest.TestCase):
     """llama.cpp's glm-dsa as the colibri engine's config.json, from unsloth's GLM-5.3 header:
     MLA's head dims from the _mla lengths, the NextN block past the model's layers, every

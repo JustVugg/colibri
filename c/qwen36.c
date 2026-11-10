@@ -4752,6 +4752,9 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
              * cf. compat_fadvise), NOT madvise: WILLNEED on the mapping pages the
              * range in synchronously and that cost showed up in the profile */
             const uint8_t *old[3] = { s->zcg, s->zcu, s->zcd };
+            /* Clear/free the old backing before publishing the replacement
+             * views: slot_gqe_free also clears zcg/zcu/zcd. */
+            slot_gqe_free(s);
             if (!x->packed && t[0] && t[1] && t[2]) {
                 s->zcg = g_zc_base[t[0]->file] + t[0]->off + (int64_t)eid * eb[0];
                 s->zcu = g_zc_base[t[1]->file] + t[1]->off + (int64_t)eid * eb[1];
@@ -4761,7 +4764,11 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
                 s->zcg = b8; s->zcu = b8 + eb[0]; s->zcd = b8 + eb[0] + eb[1];
             }
             if (s->zcg) {
-                if (s->gqe) slot_gqe_free(s);
+                if (!s->zcu || !s->zcd) {
+                    fprintf(stderr, "qwen36: incomplete zero-copy expert mapping at layer %d expert %d\n",
+                            layer, eid);
+                    exit(1);
+                }
                 for (int k = 0; k < 3; k++) {
                     const uint8_t *nw = k == 0 ? s->zcg : k == 1 ? s->zcu : s->zcd;
                     const int file = x->packed ? x->packed->file : t[k]->file;
@@ -5048,12 +5055,19 @@ static void ehit_mark(Model *m, int layer, int eid){
 static void expert_fetch(Model *m, int layer, int eid, Slot **out, int hold) {
     ehit_mark(m, layer, eid);   /* tocca solo m->ehit[layer][eid] */
     LCache *lc = &m->cache[layer];
+    const int qidx = layer * m->c.n_experts + eid;
+retry:
     pthread_mutex_lock(&g_pilot_mx);
     Slot *hit = slot_indexed(m, layer, eid);
     if (hit) {
         m->hits++; hit->used = ++m->clock; *out = hit;
         if (hold) slot_hold(hit);
         pthread_mutex_unlock(&g_pilot_mx); return;
+    }
+    if (m->is_queued[qidx]) {
+        pthread_mutex_unlock(&g_pilot_mx);
+        sleep_ms(1);
+        goto retry;
     }
     m->miss++;
     Cfg *c = &m->c; Slot *s;
@@ -5987,8 +6001,8 @@ static void moe_vk_run(Model *m, Layer *l, int layer, const float *x, int S, flo
 
 /* GGUF mode: the routed experts of S tokens, one expert at a time. Each expert
  * is fetched once and its rows unpacked once for every token routed to it
- * (prefill), and an expert is only referenced while it is being computed, so
- * any cache capacity works. out += sum_k val * expert(x). */
+ * (prefill). The slot stays held through its computation so prefetch cannot
+ * recycle the backing bytes. out += sum_k val * expert(x). */
 /* Decode (one token, cache can hold all K at once): every routed expert's
  * gate and up rows in ONE parallel region, then every down row in another,
  * instead of two regions per expert. Returns 0, or -1 to take the general path. */
@@ -6030,11 +6044,12 @@ static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const 
     if (u == 16 && (I % 16 || D % 16)) return -1;
     Slot *sl[64]; int ids[64]; float w[64]; int n = 0;
     for (int k = 0; k < K; k++) if (idx[k] >= 0) { ids[n] = idx[k]; w[n] = val[k]; n++; }
-    for (int k = 0; k < n; k++) expert_get(m, layer, ids[k], &sl[k]);
-    for (int k = 0; k < n; k++) if (sl[k]->eid != ids[k]) {   /* evicted while fetching the others */
-        for (int j = 0; j < n; j++) expert_get(m, layer, ids[j], &sl[j]);
-        for (int j = 0; j < n; j++) if (sl[j]->eid != ids[j]) return -1;
-        break;
+    for (int k = 0; k < n; k++) sl[k] = expert_hold(m, layer, ids[k]);
+    for (int k = 0; k < n; k++) if (sl[k]->eid != ids[k]) {
+        fprintf(stderr, "qwen36: held expert slot changed while fetching layer %d expert %d\n",
+                layer, ids[k]);
+        for (int j = 0; j < n; j++) slot_release(sl[j]);
+        return -1;
     }
     /* moe() runs on the engine's thread; the worker threads get these through
      * the local pointers below (thread-local storage here would hand each
@@ -6064,7 +6079,10 @@ static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const 
                 : (float)dot_i8i8(sl[k]->ui8 + (int64_t)(o - I) * D, AQ8_s, D) * sl[k]->rui8[o - I] * sxr;
         }
     } else {
-    if (gq_act_set(pax, x, 1, D)) return -1;
+    if (gq_act_set(pax, x, 1, D)) {
+        for (int k = 0; k < n; k++) slot_release(sl[k]);
+        return -1;
+    }
 #ifdef COLI_METAL
     int metal_gu = gx->hg==GQ_IQ2_XXS && gx->hu==GQ_IQ2_XXS && q36_iq2_metal_enabled();
     if (metal_gu) {
@@ -6101,7 +6119,10 @@ static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const 
             Y[j] = (float)dot_i8i8(sl[k]->di8 + (int64_t)o * I, HQ8_s + (int64_t)k * I, I) * sl[k]->rdi8[o] * hxs[k];
         }
     } else {
-    if (gq_act_set(pah, H, n, I)) return -1;   /* row k of ah is expert k's hidden */
+    if (gq_act_set(pah, H, n, I)) {
+        for (int k = 0; k < n; k++) slot_release(sl[k]);
+        return -1;
+    }   /* row k of ah is expert k's hidden */
 #ifdef COLI_METAL
     int metal_down = gx->hd==GQ_IQ2_XXS && q36_iq2_metal_enabled();
     if (metal_down) {
@@ -6136,6 +6157,7 @@ static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const 
         if (m->L[layer].post_en) rmsnorm_scaled(ys, ys, m->L[layer].post_en, D, c->post_eps);   /* Muse Spark */
         for (int d = 0; d < D; d++) out[d] += w[k] * ys[d];
     }
+    for (int k = 0; k < n; k++) slot_release(sl[k]);
     return 0;
 }
 
@@ -6159,7 +6181,7 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
     for (int e = 0; e < E; e++) {
         int n = cnt[e + 1] - cnt[e]; if (!n) continue;
         const int *tl = tok + cnt[e]; const float *wl = wt + cnt[e];
-        Slot *sl; expert_get(m, layer, e, &sl);
+        Slot *sl = expert_hold(m, layer, e);
         for (int r = 0; r < n; r++) memcpy(X + (int64_t)r * D, x + (int64_t)tl[r] * D, sizeof(float) * (size_t)D);
         if (q36_exp_i8_on()) {   /* C10b: this expert as the idot contract, the rows' activations quantized per matmul input */
             q36_slot_i8(m, layer, sl);
@@ -6194,6 +6216,7 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
             float *os = out + (int64_t)tl[r] * D; const float *ys = Y + (int64_t)r * D; const float w = wl[r];
             for (int d = 0; d < D; d++) os[d] += w * ys[d];
         }
+        slot_release(sl);
     }
     gq_act_free(&act);
     free(cnt); free(tok); free(wt); free(fill); free(X); free(G); free(U); free(Y); free(AQ); free(HQ); free(AS);
@@ -7612,13 +7635,17 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S) {
     if (lnext < 0 || lnext >= m->c.n_layers || m->c.n_experts == 0) return;
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts;
     ensure_pilot_worker_started(m);
-    float *logits = falloc((int64_t)S * E);
+    const int samples = S < 8 ? S : 8;
+    float *logits = falloc((int64_t)samples * E);
     Layer *l = &m->L[lnext];
-    float *nrm_x = falloc((int64_t)S * D);
-    for (int s = 0; s < S; s++) rmsnorm_row(nrm_x + (int64_t)s*D, x + (int64_t)s*D, l->post_ln, D, c->eps);
-    matmul_d(logits, nrm_x, &l->gate, S, D, E);   /* int8 copy (f32 may be freed) */
+    float *nrm_x = falloc((int64_t)samples * D);
+    for (int s = 0; s < samples; s++) {
+        int row = samples == S ? s : samples == 1 ? S - 1 : (int)((int64_t)s * (S - 1) / (samples - 1));
+        rmsnorm_row(nrm_x + (int64_t)s*D, x + (int64_t)row*D, l->post_ln, D, c->eps);
+    }
+    matmul_d(logits, nrm_x, &l->gate, samples, D, E);   /* int8 copy (f32 may be freed) */
     free(nrm_x);
-    for (int s = 0; s < S; s++) {
+    for (int s = 0; s < samples; s++) {
         float *pr = logits + (int64_t)s*E;
         float *blended = pr;
         float *ema = m->momentum_logits + (int64_t)lnext*E;
@@ -7983,6 +8010,388 @@ static void q36_unpark(Model *m) {
     q36_park_free(m);
 }
 
+/* ---- the disk prompt cache (COLI_PROMPT_CACHE) -------------------------
+ * What park/unpark and the pin pool do for ONE parked conversation in RAM,
+ * this does on disk for every conversation that ever finished a prefill: a
+ * photograph of the state at the prompt's end (the KV rows of every touched
+ * position, the DeltaNet recurrence and conv windows, the MTP pending row)
+ * keyed by the token prefix that produced it.
+ *
+ * Why keying by ids is the whole safety story: like kv_prefix.h, the snapshot
+ * claims "the state under this prefix of ids". Verifying that claim is a
+ * memcmp of the stored ids against the NEW request's own ids, after reading
+ * back a header that names every dimension the bytes depend on. The photo is
+ * taken right after a prefill and before any decoding, so it is exactly the
+ * state "after consuming these ids through the prefill"; a fresh run computes
+ * the same state at the same position, so the tail prefill of a longer prompt
+ * continues from what a full prefill would have built. On every other case --
+ * different ids, a foreign geometry, a truncated or corrupted file -- the
+ * snapshot is skipped whole, never partially applied: the RAM paths
+ * (kv_prefix_reuse, park/unpark, pins) stay in charge. A partially applied
+ * one is still safe: the only buffers touched (KV rows, the DeltaNet layers'
+ * state) are exactly what a cold turn rewrites, and the caller's `!reuse`
+ * branch does rewrite them.
+ *
+ * The file: magic "Q36PC01", 12 int32, the model key, the payload hash --
+ * then ids, per attention layer K and V (positions [0..len), t-major
+ * [t][head][dim]; the live arrays keep their h-major stride and q36_kv_at is
+ * the translator, so a restore assumes nothing about a future kv_cap), one
+ * rec + one conv row per DeltaNet layer, the vocab logits row (kept so the
+ * format matches the pin photo; the tail prefill produces fresh ones), and
+ * the MTP pending row when its header says it was valid.
+ *
+ * What it pays for. 2026-11-09, the 35B-A3B on this host: an agent's first
+ * prompt on a 1.8k-token transcript prefills for ~66 s -- routed experts
+ * stream off disk and attention is quadratic in the transcript. A restore
+ * replaces that with one file read and a prefill of just the tail. RAM holds
+ * two conversations (serve_one parks one beside the active one), so an agent
+ * bouncing between three-plus talks re-prefilled from zero at every switch,
+ * and a process restart threw both away; the disk holds every finished
+ * conversation's boundary instead.
+ *
+ * Scope, v1: single-slot serve, generation requests (a logprobs request still
+ * pays a full prefill, the rule reuse itself follows), no vision payloads
+ * (vis_map is set) and no sliding-window models (a ring's rows are per-turn
+ * scratch in a stride a snapshot cannot assume). Eviction keeps MAX files and
+ * deletes the deepest stored length first: what survives an agent restart is
+ * the short shared head -- system prompt plus tools, re-sent by every talk --
+ * while a deep transcript's state serves only the conversation it came from. */
+
+#include <dirent.h>
+#include <sys/stat.h>
+
+static char g_pc_dir[4096];   /* SNAP/.promptcache or COLI_PROMPT_CACHE_DIR; set in main */
+static int  g_pc_state = -1;  /* tri-state: -1 until first consulted */
+
+static int q36_pcache_on(void) {
+    if (g_pc_state >= 0) return g_pc_state;
+    const char *e = getenv("COLI_PROMPT_CACHE");
+    const char *srv = getenv("SERVE");
+    /* default: on while serving, off for a one-shot CLI run unless forced */
+    g_pc_state = (e && *e == '0') ? 0 : ((e && *e) || (srv && *srv == '1') ? 1 : 0);
+    return g_pc_state;
+}
+static int q36_pcache_min(void) {   /* store only prompts of at least this many tokens */
+    const char *e = getenv("COLI_PROMPT_CACHE_MIN");
+    int v = e && *e ? atoi(e) : 1024;
+    return v < 64 ? 64 : v;
+}
+static int q36_pcache_dbg(void) {   /* COLI_PCACHE_LOG=1: the probe's decisions */
+    static int d = -1;
+    if (d < 0) { const char *e = getenv("COLI_PCACHE_LOG"); d = e && *e; }
+    return d;
+}
+static int q36_pcache_max_files(void) {   /* files kept in the directory; 0 = never prune */
+    const char *e = getenv("COLI_PROMPT_CACHE_MAX");
+    int v = e && *e ? atoi(e) : 8;
+    return v < 0 ? 0 : v > 64 ? 64 : v;
+}
+
+static uint64_t q36_fnv64a(uint64_t h, const void *p, size_t n) {
+    const uint8_t *b = (const uint8_t *)p;
+    for (size_t i = 0; i < n; i++) { h ^= (uint64_t)b[i]; h *= 0x100000001b3ull; }
+    return h;
+}
+
+/* The snapshot's identity, so a file from another geometry can never apply:
+ * the family tag plus every shape the payload's byte layout depends on. */
+static uint64_t q36_pcache_key(const Model *m) {
+    static const char tag[] = "qwen36-pcache-v1";
+    const Cfg *c = &m->c;
+    uint64_t h = q36_fnv64a(0xcbf29ce484222325ull, tag, sizeof tag);
+    int32_t g[10] = { c->n_layers, c->n_experts, c->hidden, c->k_head_dim, c->kv_heads,
+                      c->vocab, c->topk, c->dn_conv_dim, c->dn_convk,
+                      (int32_t)q36_rec_cells(c) };
+    return q36_fnv64a(h, g, sizeof g);
+}
+
+static void q36_pcache_path(const int *ids, int np, char *out, size_t cap) {
+    uint64_t h1 = q36_fnv64a(0xcbf29ce484222325ull, ids, (size_t)np * sizeof(int));
+    uint64_t h2 = q36_fnv64a(0xfeedbeefcafe600dull, ids, (size_t)np * sizeof(int));
+    snprintf(out, cap, "%s/pfx_%016llx%016llx.bin", g_pc_dir,
+             (unsigned long long)h1, (unsigned long long)h2);
+}
+
+static void q36_pcache_mkdir(void) {
+#if defined(_WIN32) || defined(__MINGW32__)
+    _mkdir(g_pc_dir);
+#else
+    mkdir(g_pc_dir, 0755);   /* EEXIST is fine; any other failure keeps save() from writing */
+#endif
+}
+
+/* Newest-MAX eviction, deepest first: keep the short shared heads, drop the
+ * boundaries only one conversation ever returns to. `keep_path` survives. */
+static void q36_pcache_prune(const char *keep_path) {
+    int maxf = q36_pcache_max_files();
+    if (maxf <= 0) return;
+    DIR *d = opendir(g_pc_dir);
+    if (!d) return;
+    struct dirent *de;
+    char name[64][512]; int len[64], n = 0;
+    while ((de = readdir(d)) != NULL && n < 64) {
+        if (strncmp(de->d_name, "pfx_", 4) != 0 || !strstr(de->d_name, ".bin")) continue;
+        char full[4352]; snprintf(full, sizeof full, "%s/%s", g_pc_dir, de->d_name);
+        if (!strcmp(full, keep_path)) continue;   /* the one just written stays */
+        FILE *g = fopen(full, "rb"); int llen = -1;
+        if (g) {
+            char magic[8]; int32_t hdr[12];
+            if (fread(magic, 1, 8, g) == 8 && !memcmp(magic, "Q36PC01", 8) &&
+                fread(hdr, sizeof hdr, 1, g) == 1) llen = hdr[0];
+            fclose(g);
+        }
+        if (llen < 0) { remove(full); continue; }   /* not a snapshot this engine wrote: gone */
+        snprintf(name[n], sizeof name[0], "%s", full); len[n] = llen; n++;
+    }
+    closedir(d);
+    int count = n + 1;                          /* the candidates + the file just written */
+    for (int kills = count - maxf; kills > 0; kills--) {
+        int wi = -1;
+        for (int j = 0; j < n; j++)
+            if (len[j] >= 0 && (wi < 0 || len[j] > len[wi])) wi = j;
+        if (wi < 0) break;                      /* fewer stored than the cap wants gone */
+        remove(name[wi]);
+        len[wi] = -1;
+    }
+}
+
+/* Store: photograph the state right after a prefill, write tmp, rename. The
+ * KV blobs hold positions [0..np) laid out t-major -- the live arrays keep
+ * their h-major stride, q36_kv_at() is the translator -- so a restore needs
+ * no guess about the reading process's future kv_cap. One blob at a time
+ * through the staging buffer: a per-row fwrite would be tens of thousands of
+ * locked calls for what is here one sequential write. Failure modes match the
+ * pin pool's: the fast path stays off and the request is never the worse. */
+static void q36_pcache_store(Model *m, const int *ids, int np, const float *logit) {
+    const Cfg *c = &m->c;
+    if (c->window > 0 || m->vis_map) return;   /* no ring layout, no token-opaque payload */
+    uint64_t mk = q36_pcache_key(m);
+    char path[4352], tmp[4352 + 8];
+    q36_pcache_path(ids, np, path, sizeof path);
+    struct stat sb;
+    if (stat(path, &sb) == 0 && sb.st_size > 0) return;   /* same prefix, already saved */
+    /* q36_pin_state_save also pulls the device's newest bytes into the host
+     * copies the K/V rows below read (and the DeltaNet state it photographs). */
+    Q36PinState *st = q36_pin_state_save(m, NULL);
+    if (!st) return;
+    q36_pcache_mkdir();
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE *f = fopen(tmp, "wb");
+    if (!f) { q36_pin_state_free(st); return; }
+    const int es = (int)q36_kv_es();
+    const size_t kv_b = (size_t)c->k_head_dim * es;      /* one head at one position */
+    const size_t rec_f = q36_rec_cells(c);
+    const size_t conv_f = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
+    int n_attn = 0, n_linear = 0;
+    for (int i = 0; i < c->n_layers; i++)
+        if (c->is_attn[i]) n_attn++; else n_linear++;
+    int32_t hdr[12] = { np, c->n_layers, n_attn, es, c->hidden, c->vocab,
+                        (int32_t)rec_f, (int32_t)conv_f, st->mtp_valid, st->mtp_len,
+                        c->topk, n_linear };
+    uint64_t hsh = q36_fnv64a(0xcbf29ce484222325ull, hdr, sizeof hdr);
+    hsh = q36_fnv64a(hsh, &mk, 8);
+    int ok = fwrite("Q36PC01", 1, 8, f) == 8 &&
+             fwrite(hdr, 1, sizeof hdr, f) == sizeof hdr &&
+             fwrite(&mk, 8, 1, f) == 1;
+    uint64_t zero = 0;
+    ok = ok && fwrite(&zero, 8, 1, f) == 1;   /* the hash slot, filled after the payload */
+    ok = ok && fwrite(ids, sizeof(int), (size_t)np, f) == (size_t)np;
+    if (ok) hsh = q36_fnv64a(hsh, ids, (size_t)np * sizeof(int));
+    char *blob = ok ? (char *)malloc((size_t)np * c->kv_heads * kv_b) : NULL;
+    if (ok && !blob) ok = 0;
+    for (int i = 0; ok && i < c->n_layers; i++) {   /* K then V of every attention layer */
+        if (!c->is_attn[i]) continue;
+        if (!m->K[i] || !m->V[i]) { ok = 0; break; }   /* half a layer is no layer */
+        for (int kv = 0; ok && kv < 2; kv++) {
+            const char *base = (const char *)(kv ? m->V[i] : m->K[i]);
+            for (int t = 0; t < np; t++)
+                for (int h = 0; h < c->kv_heads; h++)
+                    memcpy(blob + ((size_t)t * c->kv_heads + h) * kv_b,
+                           q36_kv_ptr((void *)base, q36_kv_at(m, i, h, t)), kv_b);
+            size_t bytes = (size_t)np * kv_b * c->kv_heads;
+            ok = fwrite(blob, 1, bytes, f) == bytes;
+            if (ok) hsh = q36_fnv64a(hsh, blob, bytes);
+        }
+    }
+    for (int i = 0; ok && i < c->n_layers; i++) {   /* the DeltaNet state, layer by layer */
+        if (c->is_attn[i]) continue;
+        ok = fwrite(st->rec[i], sizeof(float), rec_f, f) == rec_f &&
+             fwrite(st->conv[i], sizeof(float), conv_f, f) == conv_f;
+        if (ok) { hsh = q36_fnv64a(hsh, st->rec[i], rec_f * sizeof(float));
+                  hsh = q36_fnv64a(hsh, st->conv[i], conv_f * sizeof(float)); }
+    }
+    ok = ok && fwrite(logit, sizeof(float), (size_t)c->vocab, f) == (size_t)c->vocab;
+    if (ok) hsh = q36_fnv64a(hsh, logit, (size_t)c->vocab * sizeof(float));
+    if (ok && st->mtp_valid)
+        ok = fwrite(st->mtp_pend, sizeof(float), (size_t)c->hidden, f) == (size_t)c->hidden;
+    if (ok) hsh = q36_fnv64a(hsh, st->mtp_pend, st->mtp_valid ? (size_t)c->hidden : 0);
+    free(blob);
+    if (ok) {   /* the payload's own hash rides the header's last slot (offset 64) */
+        ok = fseek(f, 64, SEEK_SET) == 0 && fwrite(&hsh, 8, 1, f) == 1;
+    }
+    if (fclose(f) != 0) ok = 0;
+    if (!ok) { remove(tmp); q36_pin_state_free(st); return; }
+    if (rename(tmp, path) != 0) { remove(tmp); q36_pin_state_free(st); return; }
+    fprintf(stderr, "[PCACHE] saved %d tokens\n", np);
+    fflush(stderr);
+    q36_pin_state_free(st);
+    q36_pcache_prune(path);
+}
+
+/* Restore the DEEPEST stored prefix of `ids` and return its length, 0 when
+ * nothing applies. Two passes, because the deepest candidate is unknown until
+ * all are probed: probe headers + ids across the directory, then replay the
+ * winner's bytes. Replay verifies the payload hash BEFORE deciding the state
+ * is the ids'; by then the only buffers touched (KV rows, the DeltaNet state)
+ * are exactly what a cold turn rewrites, and that is what the caller's `!reuse`
+ * branch does. */
+static int q36_pcache_restore(Model *m, const int *ids, int np) {
+    const Cfg *c = &m->c;
+    if (c->window > 0 || m->vis_map) return 0;
+    uint64_t mk = q36_pcache_key(m);
+    DIR *d = opendir(g_pc_dir);
+    if (!d) return 0;
+    int best_len = 0; char best_path[4352]; best_path[0] = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strncmp(de->d_name, "pfx_", 4) != 0 || !strstr(de->d_name, ".bin")) continue;
+        char full[4352]; snprintf(full, sizeof full, "%s/%s", g_pc_dir, de->d_name);
+        FILE *g = fopen(full, "rb");
+        if (!g) continue;
+        char magic[8]; int32_t hdr[12]; uint64_t mk2, hslot;
+        if (fread(magic, 1, 8, g) != 8 || memcmp(magic, "Q36PC01", 8) != 0 ||
+            fread(hdr, sizeof hdr, 1, g) != 1 || fread(&mk2, 8, 1, g) != 1 ||
+            fread(&hslot, 8, 1, g) != 1 || mk2 != mk) { fclose(g); continue; }
+        int len = hdr[0];
+        /* the ids decide everything else, so the cheap checks come first */
+        if (len < 64 || len >= np || len > m->max_t || len > qwen36_max_ctx() ||
+            hdr[1] != c->n_layers ||
+            hdr[3] != (int)q36_kv_es() || hdr[4] != c->hidden || hdr[5] != c->vocab ||
+            (int)q36_rec_cells(c) != hdr[6] ||
+            (int)((size_t)c->dn_conv_dim * (c->dn_convk - 1)) != hdr[7] ||
+            hdr[10] != c->topk) {
+            if (q36_pcache_dbg())
+                fprintf(stderr, "[PCACHE] gate: len=%d np=%d max_t=%d hdr={%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d} "
+                        "cfg={L%d es%d h%d V%d rec%d conv%d top%d\n", len, np, m->max_t,
+                        hdr[0], hdr[1], hdr[2], hdr[3], hdr[4], hdr[5], hdr[6], hdr[7],
+                        hdr[8], hdr[9], hdr[10], hdr[11],
+                        c->n_layers, (int)q36_kv_es(), c->hidden, c->vocab,
+                        (int)q36_rec_cells(c), (int)((size_t)c->dn_conv_dim * (c->dn_convk - 1)), c->topk);
+            fclose(g); continue;
+        }
+        int *sid = (int *)malloc((size_t)len * sizeof(int));
+        if (!sid) { fclose(g); continue; }
+        if (fread(sid, sizeof(int), (size_t)len, g) != (size_t)len ||
+            memcmp(sid, ids, (size_t)len * sizeof(int)) != 0) {
+            if (q36_pcache_dbg()) {
+                for (int t = 0; t < len; t++)
+                    if (sid[t] != ids[t]) { fprintf(stderr, "[PCACHE] ids diverge at %d: file %d run %d\n", t, sid[t], ids[t]); break; }
+            }
+            free(sid); fclose(g); continue;
+        }
+        free(sid);
+        if (len > best_len) {   /* strictly deeper only: the first one seen keeps the crown */
+            best_len = len;
+            snprintf(best_path, sizeof best_path, "%s", full);
+        }
+        fclose(g);
+    }
+    closedir(d);
+    if (best_len < 64) return 0;
+
+    FILE *g = fopen(best_path, "rb");
+    if (!g) { if (q36_pcache_dbg()) fprintf(stderr, "[PCACHE] reopen failed: %s\n", best_path); return 0; }
+    char magic[8]; int32_t hdr[12]; uint64_t fkey, hsh_file;
+    if (fread(magic, 1, 8, g) != 8 || memcmp(magic, "Q36PC01", 8) != 0 ||
+        fread(hdr, sizeof hdr, 1, g) != 1 || fread(&fkey, 8, 1, g) != 1 ||
+        fread(&hsh_file, 8, 1, g) != 1) { if (q36_pcache_dbg()) fprintf(stderr, "[PCACHE] header reread failed\n"); fclose(g); return 0; }
+    const int len = hdr[0];
+    const size_t es = q36_kv_es();
+    const size_t rb = (size_t)c->k_head_dim * es;             /* one head at one position */
+    const size_t blob_b = (size_t)len * c->kv_heads * rb;     /* one layer's K or V */
+    const size_t rec_f = (size_t)hdr[6], conv_f = (size_t)hdr[7];
+    uint64_t hsh = q36_fnv64a(0xcbf29ce484222325ull, hdr, sizeof hdr);
+    hsh = q36_fnv64a(hsh, &fkey, 8);
+    int *ids_r = (int *)malloc((size_t)len * sizeof(int));
+    char *blob = (char *)malloc(blob_b);
+    if (!ids_r || !blob) { free(ids_r); free(blob); fclose(g); return 0; }
+    int ok = fread(ids_r, sizeof(int), (size_t)len, g) == (size_t)len &&
+             memcmp(ids_r, ids, (size_t)len * sizeof(int)) == 0;
+    if (ok) hsh = q36_fnv64a(hsh, ids_r, (size_t)len * sizeof(int));
+    if (!ok && q36_pcache_dbg()) fprintf(stderr, "[PCACHE] apply: ids reread/mismatch\n");
+    free(ids_r);
+    if (ok) for (int i = 0; ok && i < c->n_layers; i++) {   /* K/V back into the h-major stride */
+        if (!c->is_attn[i]) continue;
+        if (!m->K[i] || !m->V[i]) { ok = 0; break; }
+        for (int kv = 0; ok && kv < 2; kv++) {
+            if (fread(blob, 1, blob_b, g) != blob_b) { ok = 0; break; }
+            hsh = q36_fnv64a(hsh, blob, blob_b);
+            char *arr = (char *)(kv ? m->V[i] : m->K[i]);
+            for (int t = 0; t < len; t++)
+                for (int h = 0; h < c->kv_heads; h++)
+                    memcpy(q36_kv_ptr(arr, q36_kv_at(m, i, h, t)),
+                           blob + ((size_t)t * c->kv_heads + h) * rb, rb);
+        }
+    }
+    /* the DeltaNet layers, straight into the Model's rows: a hash failure
+     * would dirty K/V rows and the recurrence -- the caller's `!reuse` branch
+     * (reset_recurrent, kv_len 0, a full prefill) rewrites both */
+    for (int i = 0; ok && i < c->n_layers; i++) {
+        if (c->is_attn[i]) continue;
+        if (!m->DN_rec[i] || !m->DN_conv[i]) { ok = 0; break; }
+        if (fread(m->DN_rec[i], sizeof(float), rec_f, g) != rec_f ||
+            fread(m->DN_conv[i], sizeof(float), conv_f, g) != conv_f) { ok = 0; break; }
+        hsh = q36_fnv64a(hsh, m->DN_rec[i], rec_f * sizeof(float));
+        hsh = q36_fnv64a(hsh, m->DN_conv[i], conv_f * sizeof(float));
+    }
+    /* the logits row: read, hash, drop -- the tail prefill produces fresh ones */
+    if (ok) {
+        float *lo = (float *)malloc((size_t)c->vocab * sizeof(float));
+        if (!lo) ok = 0;
+        else { ok = fread(lo, sizeof(float), (size_t)c->vocab, g) == (size_t)c->vocab;
+               if (ok) hsh = q36_fnv64a(hsh, lo, (size_t)c->vocab * sizeof(float));
+               free(lo); }
+    }
+    /* the MTP pending row through a small temp; q36_pin_state_put installs it */
+    Q36PinState put; memset(&put, 0, sizeof put);
+    put.n_layers = c->n_layers;
+    put.rec  = (float **)calloc((size_t)c->n_layers, sizeof(float *));   /* entries NULL: */
+    put.conv = (float **)calloc((size_t)c->n_layers, sizeof(float *));   /* put's row copies skip */
+    ok = ok && put.rec && put.conv;
+    if (ok && hdr[8]) {
+        put.mtp_valid = 1; put.mtp_len = hdr[9];
+        put.mtp_pend = (float *)malloc((size_t)c->hidden * sizeof(float));
+        if (!put.mtp_pend) ok = 0;
+        else { ok = fread(put.mtp_pend, sizeof(float), (size_t)c->hidden, g) == (size_t)c->hidden;
+               if (ok) hsh = q36_fnv64a(hsh, put.mtp_pend, (size_t)c->hidden * sizeof(float)); }
+    }
+    /* every byte agrees with the header's promise? then the state installs */
+    if (ok && hsh == hsh_file) {
+        q36_pin_state_put(m, &put);
+        m->kv_len = len;
+        kv_prefix_clear(&m->kvp);
+        kv_prefix_record(&m->kvp, ids, 0, len);   /* pin_restore's exact bookkeeping */
+#ifdef COLI_VULKAN
+        q36c_rollback(m, -1, 0);   /* every mirror's watermark to 0: rows re-upload (q36_unpark) */
+#endif
+#ifdef COLI_CUDA
+        q36cc_rollback(m, -1, 0);
+#endif
+        fprintf(stderr, "[PCACHE] restored %d of %d prompt tokens\n", len, np);
+        fflush(stderr);
+    } else {
+        ok = 0;
+        if (q36_pcache_dbg())
+            fprintf(stderr, "[PCACHE] apply rejected: %s (file hash %016llx, computed %016llx)\n",
+                    ok ? "hash mismatch" : "payload truncated or ids mismatch",
+                    (unsigned long long)hsh_file, (unsigned long long)hsh);
+    }
+    free(blob);
+    free(put.rec); free(put.conv); free(put.mtp_pend);
+    fclose(g);
+    return ok ? len : 0;
+}
+
 /* Allocate (once) or reuse the KV cache across requests. Grows only when a
  * longer context is needed; never shrinks. Frees the previous buffers on
  * growth so the server doesn't leak KV memory across requests. */
@@ -8082,10 +8491,9 @@ static void ensure_kv(Model *m){
         for (int i = 0; i < c->n_layers; i++){ if (oldK[i]) free(oldK[i]); if (oldV[i]) free(oldV[i]); }
         free(oldK); free(oldV);
     }
-    /* Attention scores: one row per thread, indexed by absolute position, so
-     * each row must hold max_t entries. Sized here rather than in attention()
-     * because it grows with the context exactly like the KV cache does, and
-     * because a per-call allocation would run 10x per token. */
+    /* Attention scores: one query tile per thread, indexed by absolute
+     * position. Sized with the KV cache so long-context calls do not allocate
+     * scratch per attention layer. */
     free(m->attn_sc);
     m->attn_sc_thr = 1;
 #ifdef _OPENMP
@@ -8514,12 +8922,26 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
         exit(1);
     }
     m->max_t = np + n_new;
-    reset_recurrent(m);
     ensure_kv(m);
-    m->kv_len = 0;
+    /* The disk prompt cache covers a one-shot CLI run too (COLI_PROMPT_CACHE=1
+     * forces it on): restore the deepest stored prefix of the prompt and read
+     * only the tail, or start cold. */
+    int pc = (g_pc_dir[0] && !m->kvp.tainted && q36_pcache_on())
+           ? q36_pcache_restore(m, prompt, np) : 0;
+    if (pc > 0) {
+        m->kv_len = pc;   /* restore wrote rows [0..pc), the DeltaNet state and the record */
+    } else {
+        reset_recurrent(m);
+        m->kv_len = 0;
+    }
     for (int i = 0; i < np; i++) out[i] = prompt[i];
-    float *logit = step(m, prompt, np, 0);
+    float *logit = step(m, prompt + pc, np - pc, pc);
     qt_stats_mark();   /* [qtier] stats also report the hit rate from here on */
+    /* The state photograph of THIS prompt's end: the tail the restore left
+     * has just been prefilled, so the state is again "after consuming
+     * ids[0..np)" and the file it saves serves the next, longer turn. */
+    if (g_pc_dir[0] && np >= q36_pcache_min() && !m->kvp.tainted && q36_pcache_on())
+        q36_pcache_store(m, prompt, np, logit);
     int len = np;
     Q36Spec *sp = &g_q36_run_spec;
     q36_spec_begin(m, sp, prompt, np);   /* COLI_LOOKUP=1: drafts, every token still the argmax below */
@@ -8955,6 +9377,16 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
      * The pin path above is untouched -- a photograph carries the logits for the position
      * that follows it, so it still resumes. */
     if (g_echo_k > 0 && !g_pin_use_logit) reuse = 0;
+    /* The disk prompt cache, deepest stored prefix first: no live record and
+     * no pin took this request, so check whether one of the saved snapshots
+     * holds the state of a strict prefix of these ids. An v1 optimisation
+     * like every other fast path here: on failure the request pays the full
+     * prefill it was always going to. */
+    if (!reuse && g_pc_dir[0] && g_echo_k == 0 && !q->pin && !m->kvp.tainted &&
+        g_q36_mux_slots == 1 && q36_pcache_on()) {
+        int pr = q36_pcache_restore(m, ids, np);
+        if (pr > 0) reuse = pr;   /* the state is the ids[0..pr)'s: the reset below is skipped */
+    }
     if (!reuse) {
         q36_park(m, np, q->max_tok);   /* a short request keeps the conversation (q36_unpark) */
         reset_recurrent(m); m->kv_len = 0;
@@ -9002,6 +9434,14 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     }
     qt_stats_mark();
     if (q->pin) pin_save(m, ids, np, lo);
+    /* The disk prompt cache's store end: this prompt's state photograph, no
+     * pin asked for one and the prompt is long enough to be worth a file.
+     * After a pc-restored turn the tail's prefill has brought the state to
+     * ids[0..np) again, so a deeper file for the same conversation gets
+     * written here too. */
+    if (g_pc_dir[0] && !q->pin && g_echo_k == 0 && !m->kvp.tainted &&
+        g_q36_mux_slots == 1 && np >= q36_pcache_min() && q36_pcache_on())
+        q36_pcache_store(m, ids, np, lo);
     clk->s_disk=m->t_disk; clk->s_attn=tm_sum(0)+tm_sum(1); clk->s_moe=tm_sum(2); clk->s_head=tm_sum(5);
     clk->hits=m->hits; clk->miss=m->miss;
     clk->t0=now_s();
@@ -9988,6 +10428,13 @@ int main(int argc, char **argv) {
     coli_omp_tune_threads("qwen36");
     const char *snap = getenv("SNAP");
     if (!snap) { coli_print_launcher_help("Qwen3.6", "SNAP=<model directory> ./qwen36 ..."); return 1; }
+    {   /* the disk prompt cache's directory, beside the snapshot (or wherever
+         * COLI_PROMPT_CACHE_DIR says: a shared cache across snapshots). The
+         * gates themselves lie with the prefill (q36_pcache_* in qwen36.c). */
+        const char *pc = getenv("COLI_PROMPT_CACHE_DIR");
+        if (pc && *pc) snprintf(g_pc_dir, sizeof g_pc_dir, "%s", pc);
+        else snprintf(g_pc_dir, sizeof g_pc_dir, "%s/.promptcache", snap);
+    }
     static char gguf_path[4096], mmproj_path[4096]; int gguf_dir = 0;
     {   /* a model directory made by tools/gguf_import.py: gguf.json names the file */
         char gj[4096]; snprintf(gj, sizeof gj, "%s/gguf.json", snap);

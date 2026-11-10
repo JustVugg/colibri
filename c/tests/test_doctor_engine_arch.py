@@ -64,6 +64,14 @@ class DoctorEngineArchTest(unittest.TestCase):
                     f"{model_type}: doctor inspected {path!r}, expected the "
                     f"{expected} engine")
 
+    def test_glm47_arch_uses_glm_engine(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            model = Path(tmp) / "glm47"
+            write_model(model, "glm47_moe")
+            check = self.engine_check(self.doctor(model))
+            path = check.get("details", {}).get("path", "")
+            self.assertTrue(Path(path).name.startswith("colibri"), path)
+
     def test_two_arches_do_not_resolve_to_the_same_engine(self):
         """The regression this guards: every arch mapping to the GLM binary."""
         with tempfile.TemporaryDirectory() as tmp:

@@ -26,7 +26,7 @@ engine), lfm3 (LFM3-VL's text model -> qwen36 engine), qwen4exp (Qwen3.8-Flash-N
 Flash -> deepseek_v4 engine), inkling (Inkling -> inkling engine), glm5-next (GLM-5.3-Flash ->
 glm53 engine), glm-dsa (GLM-5.2 / GLM-5.3 -> colibri engine), mimo2 (MiMo-V2.6 -> mimo engine),
 deepseek41 (DeepSeek V4.1 Flash, files with the config whole and the published K-quant and IQ ones ->
-deepseek_v41 engine), olmoe (OLMoE -> olmoe engine).
+deepseek_v41 engine), deepseek2 (GLM-4.7-Flash -> colibri GLM MLA/MoE engine), olmoe (OLMoE -> olmoe engine).
 
 Usage:
   python3 tools/gguf_import.py MODEL.gguf OUT_DIR [--mode link|copy]
@@ -588,7 +588,77 @@ def glmdsa_config(meta, tensors, overrides=None):
         "indexer_types": ["full" if f"blk.{i}.indexer.attn_q_b.weight" in tensors else "shared" for i in range(layers)],
         "num_nextn_predict_layers": nextn if has_mtp else 0,
         "tie_word_embeddings": "output.weight" not in tensors,
+        "indexer": False,
+        "num_nextn_predict_layers": 1,  # engine/planner reserves one extra KV/cache row; no draft head is loaded
         "bos_token_id": meta.get("tokenizer.ggml.bos_token_id"), "eos_token_id": meta.get("tokenizer.ggml.eos_token_id"),
+    }
+    return cfg, layers
+
+
+def glm47_config(meta, tensors, overrides=None):
+    """GLM-4.7-Flash (llama.cpp's deepseek2 GGUF) as GLM MLA/MoE config.
+
+    This export has DeepSeek-V2-style MLA and shared/routed experts but no DSA
+    indexer tensors. Keep its model_type distinct from GLM-5.2/5.3 so the
+    gateway identity and planner do not claim those checkpoints are identical.
+    """
+    p = "deepseek2."
+    need = lambda k: meta[p + k] if (p + k) in meta else sys.exit(f"GGUF metadata lacks {p + k}")
+    layers = int(need("block_count"))
+    dense = int(meta.get(p + "leading_dense_block_count", 0))
+    heads = int(need("attention.head_count"))
+    rope = int(need("rope.dimension_count"))
+    emb = tensors.get("token_embd.weight") or sys.exit("GGUF has no token_embd.weight")
+    if int(meta.get(p + "expert_group_count", 1)) != 1:
+        sys.exit("deepseek2: expert groups other than 1 are unsupported")
+    if int(meta.get(p + "expert_gating_func", 2)) != 2:
+        sys.exit("deepseek2: only sigmoid expert gating (expert_gating_func 2) is supported")
+    if dense < 0 or dense >= layers:
+        sys.exit(f"deepseek2: leading_dense_block_count {dense} is outside the layer range")
+    for layer in range(layers):
+        required = ("attn_q_a.weight", "attn_q_a_norm.weight", "attn_q_b.weight",
+                    "attn_kv_a_mqa.weight", "attn_kv_a_norm.weight", "attn_k_b.weight",
+                    "attn_v_b.weight", "attn_output.weight")
+        missing = [f"blk.{layer}.{name}" for name in required if f"blk.{layer}.{name}" not in tensors]
+        if missing:
+            sys.exit(f"deepseek2: layer {layer} lacks MLA tensors: {', '.join(missing)}")
+        if layer < dense:
+            names = ("ffn_gate.weight", "ffn_up.weight", "ffn_down.weight")
+        else:
+            names = ("ffn_gate_inp.weight", "ffn_gate_shexp.weight", "ffn_up_shexp.weight",
+                     "ffn_down_shexp.weight", "ffn_gate_exps.weight", "ffn_up_exps.weight",
+                     "ffn_down_exps.weight")
+        missing = [f"blk.{layer}.{name}" for name in names if f"blk.{layer}.{name}" not in tensors]
+        if missing:
+            sys.exit(f"deepseek2: layer {layer} lacks FFN tensors: {', '.join(missing)}")
+    cfg = {
+        "architectures": ["Glm47ForCausalLM"], "model_type": "glm47_moe",
+        "vocab_size": int(meta.get(p + "vocab_size", emb["dims"][1])),
+        "hidden_size": int(need("embedding_length")),
+        "intermediate_size": int(need("feed_forward_length")),
+        "moe_intermediate_size": int(need("expert_feed_forward_length")),
+        "num_hidden_layers": layers, "num_attention_heads": heads,
+        "num_key_value_heads": int(meta.get(p + "attention.head_count_kv", 1)),
+        "n_routed_experts": int(need("expert_count")),
+        "num_experts_per_tok": int(need("expert_used_count")),
+        "n_shared_experts": int(meta.get(p + "expert_shared_count", 1)),
+        "first_k_dense_replace": dense,
+        "q_lora_rank": int(need("attention.q_lora_rank")),
+        "kv_lora_rank": int(need("attention.kv_lora_rank")),
+        "qk_rope_head_dim": rope,
+        "qk_nope_head_dim": int(need("attention.key_length_mla")) - rope,
+        "v_head_dim": int(need("attention.value_length_mla")),
+        "n_group": 1, "topk_group": 1, "topk_method": "noaux_tc", "scoring_func": "sigmoid",
+        "norm_topk_prob": bool(meta.get(p + "expert_weights_norm", True)),
+        "routed_scaling_factor": float(meta.get(p + "expert_weights_scale", 1.0)),
+        "rms_norm_eps": float(meta.get(p + "attention.layer_norm_rms_epsilon", 1e-5)),
+        "rope_parameters": {"rope_type": "default", "rope_theta": float(meta.get(p + "rope.freq_base", 10000.0))},
+        "max_position_embeddings": int(meta.get(p + "context_length", 202752)),
+        "index_topk": 0, "index_n_heads": 0, "index_head_dim": 0, "indexer_types": [],
+        "num_nextn_predict_layers": 1,  # reserved extra KV/cache row; no MTP head in this file
+        "tie_word_embeddings": "output.weight" not in tensors,
+        "bos_token_id": meta.get("tokenizer.ggml.bos_token_id"),
+        "eos_token_id": meta.get("tokenizer.ggml.eos_token_id"),
     }
     return cfg, layers
 
@@ -1027,7 +1097,7 @@ def qwen4exp_config(meta, tensors, overrides=None):
 
 
 COPY_UNREAD = {"qwen4exp"}   # their engine does not read the colibri container (copy mode)
-ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen3moe": qwen3moe_config, "qwen3": qwen3_config, "flint": flint_config, "muse-spark": muse_config, "lfm3": lfm3_config, "deepseek4": deepseek4_config, "inkling": inkling_config, "glm5-next": glm5next_config, "glm-dsa": glmdsa_config, "mistral-large4": mistral_large4_config, "mimo2": mimo2_config, "deepseek41": deepseek41_config, "kimi-k3": kimik3_config, "olmoe": olmoe_config, "qwen4exp": qwen4exp_config}
+ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen3moe": qwen3moe_config, "qwen3": qwen3_config, "flint": flint_config, "muse-spark": muse_config, "lfm3": lfm3_config, "deepseek4": deepseek4_config, "inkling": inkling_config, "glm5-next": glm5next_config, "glm-dsa": glmdsa_config, "deepseek2": glm47_config, "mistral-large4": mistral_large4_config, "mimo2": mimo2_config, "deepseek41": deepseek41_config, "kimi-k3": kimik3_config, "olmoe": olmoe_config, "qwen4exp": qwen4exp_config}
 
 # unsloth ships Qwen3.8-Flash-Next's MTP head apart, in an MTP/ folder of the repository:
 # shared-* borrow token_embd and output from the model (the engine always does), the

@@ -277,17 +277,31 @@ def _optional_int(config, key, default=0, minimum=0):
     return value
 
 
-def _glm_geometry(config, context, _model_dir):
-    layers = _required_int(config, "num_hidden_layers", "glm") + 1
-    experts = _required_int(config, "n_routed_experts", "glm")
-    kv_lora = _required_int(config, "kv_lora_rank", "glm")
-    rope = _required_int(config, "qk_rope_head_dim", "glm")
-    heads = _required_int(config, "num_attention_heads", "glm")
-    nope = _required_int(config, "qk_nope_head_dim", "glm")
-    value = _required_int(config, "v_head_dim", "glm")
+def _glm_geometry(config, context, model_dir):
+    family_name = "glm47" if config.get("model_type") == "glm47_moe" else "glm"
+    model_context = config.get("max_position_embeddings")
+    if (isinstance(model_context, int) and not isinstance(model_context, bool) and
+            model_context > 0 and context > model_context):
+        raise ValueError(f"{family_name}: context {context} exceeds model maximum {model_context}")
+    layers = (_required_int(config, "num_hidden_layers", family_name) +
+              _optional_int(config, "num_nextn_predict_layers", 1))
+    experts = _required_int(config, "n_routed_experts", family_name)
+    kv_lora = _required_int(config, "kv_lora_rank", family_name)
+    rope = _required_int(config, "qk_rope_head_dim", family_name)
+    heads = _required_int(config, "num_attention_heads", family_name)
+    nope = _required_int(config, "qk_nope_head_dim", family_name)
+    value = _required_int(config, "v_head_dim", family_name)
+    if config.get("model_type") == "glm47_moe":
+        # GLM-4.7-Flash uses per-expert GGUF slices in the existing GLM engine;
+        # use its actual GGUF expert inventory rather than the 744B GLM estimate.
+        return PlannerGeometry(layers * context * (kv_lora + rope) * 4,
+                               0, context * heads * (nope + value) * 4, experts)
     state = layers * context * (kv_lora + rope) * 4
     index_dim = _optional_int(config, "index_head_dim", 0)
-    if index_dim and config.get("_colibri_indexer_present", False):
+    has_indexer = config.get("_colibri_indexer_present", False)
+    if model_dir:
+        has_indexer = has_indexer or os.path.isfile(os.path.join(model_dir, "indexer.json"))
+    if index_dim and has_indexer:
         kinds = config.get("indexer_types")
         if isinstance(kinds, list):
             active = sum(kind == "full" for kind in kinds[:layers - 1])
@@ -1351,7 +1365,9 @@ FAMILIES = (
     ),
     FamilyDescriptor(
         id="glm",
-        model_types=("glm_moe_dsa", "glm5_moe", "glm", "mistral_large4"),
+        model_types=("glm_moe_dsa", "glm5_moe", "glm", "mistral_large4", "glm47_moe"),
+        # GLM-4.7-Flash is named by its separate GGUF architecture/model_type;
+        # it reuses the MLA/MoE implementation but has no DSA indexer.
         # Two model names, one family, and that is not a shortcut. Z.ai state
         # it on GLM-5.3's own card: "GLM-5.3 uses the same base model as
         # GLM-5.2 -- every gain comes from post-training." The checkpoints
@@ -1378,6 +1394,8 @@ FAMILIES = (
             DisplayVariant((("model_type", "glm"),), "GLM-5.2/5.3", "744B"),
             DisplayVariant((("model_type", "mistral_large4"),), "Mistral-Large-4-1T-A52B", "1T",
                            model_id="mistral-large-4-colibri"),
+            DisplayVariant((("model_type", "glm47_moe"),), "GLM-4.7-Flash", "31B",
+                           model_id="glm-4.7-flash-colibri"),
         ),
         converter="convert_fp8_to_int4.py",
         converter_accepts=("ebits", "io_bits", "xbits", "group_size"),
