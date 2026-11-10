@@ -162,6 +162,16 @@ int main(void) {
         fake_chain_dev_cap = 0;
         tk(q38cc_forward(&rm, NULL, 1, 0, 1, NULL, 0, NULL, NULL) == 0 && fake_chain_dev_bytes == b0,
            "the chain stays off: a later forward takes nothing from the card");
+        /* a growth to 64 positions with room for the first layer's new mirrors only: the last
+         * layer's old ones, which dev kept, go too */
+        const size_t lay64 = 2 * (2 * 8 * 64 * 2) + 4 * 64 * 4 + 4 * (64 / 4 + 1) * 4;
+        int placed = q38cc_mirror(&rc, &rm) && rc.cap == 32 && fake_chain_dev_bytes == b0 + 3 * lay;
+        rm.kv_cap = 64; fake_chain_dev_cap = b0 + 2 * lay + lay64;
+        int r4 = q38cc_mirror(&rc, &rm);
+        none = 1;
+        for (int i = 0; i < 4; i++) none = none && !kc[i] && !vc[i] && !ik[i] && !pk[i];
+        tk(placed && r4 == 0 && rc.cap == 0 && none && fake_chain_dev_bytes == b0, "a refused growth leaves no mirror on the card");
+        fake_chain_dev_cap = 0; rm.kv_cap = 32;
         g_cuda_chain = chain0;
     }
 
