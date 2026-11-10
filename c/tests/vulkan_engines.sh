@@ -2068,6 +2068,10 @@ family_qwen_chain() {
   # one conversation past the places' first 2048 rows: its mirrors grow, the others' stay
   CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_PAIRS=1 CHAIN_SERVE_LONG=2600 CHAIN_SERVE_EXPECT='decode steps of several conversations in the chain \([0-9]* rows, [1-9]' \
     $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 KV_SLOTS=2
+  # a place that cannot grow (COLI_VK_TEST_CONV_ROOM_MB=0: no room past the first 2048 rows): the
+  # places close, and the next conversation that enters opens them again (#2733); the text the CPU's
+  CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_PAIRS=1 CHAIN_SERVE_LONG=2600 CHAIN_SERVE_EXPECT='places open again' \
+    $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 KV_SLOTS=2 COLI_VK_TEST_CONV_ROOM_MB=0
   for k in 0 1; do
     CHAIN_SERVE_SLOTS=3 CHAIN_SERVE_PAIRS=1 CHAIN_SERVE_EXPECT='on the device, [1-9][0-9]* handed over' \
       $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 KV_SLOTS=3 COLI_VK_CHAIN_MUX=$k

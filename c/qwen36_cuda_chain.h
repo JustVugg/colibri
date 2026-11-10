@@ -131,7 +131,8 @@ typedef struct {
     double wait_ms, host_ms, dec_wait_ms, dec_host_ms;      /* and their shares of the waits and the host's experts */
     /* KV_SLOTS > 1: the conversations' states, and a multiplexed step's rows while it runs */
     Q36ccConv *conv; int nconv, conv_cur, conv_full;
-    unsigned long long conv_clock, conv_handed, mux_steps, mux_rows, mux_host_steps;
+    int pool_closed;   /* q36cc_pool_off closed the places: a conversation that enters opens them again */
+    unsigned long long conv_clock, conv_handed, mux_steps, mux_rows, mux_host_steps, pool_reopens;
     const Q36Row *mx_rows; Q36ccConv **mx_conv;
 } Q36CChain;
 
@@ -701,17 +702,27 @@ static size_t q36cc_conv_kv_bytes(Model *m, int cap) {
     return b;
 }
 static size_t q36cc_free_bytes(Q36CChain *ch) { size_t fr = 0, tot = 0; coli_cuda_mem_info(ch->dev, &fr, &tot); return fr; }
+/* the free memory as a growing place sees it: COLI_CUDA_TEST_CONV_ROOM_MB=n holds it at n MiB (tests) */
+static size_t q36cc_conv_avail(Q36CChain *ch) {
+    static long long cap = -2;
+    if (cap == -2) { const char *e = getenv("COLI_CUDA_TEST_CONV_ROOM_MB"); cap = e && *e ? atoll(e) : -1; }
+    const size_t fr = q36cc_free_bytes(ch);
+    return cap >= 0 && fr > ((size_t)cap << 20) ? (size_t)cap << 20 : fr;
+}
 /* room for `bytes` more (and 512 MiB): the least recently used places' KV mirrors go first */
 static int q36cc_conv_room(Q36CChain *ch, Model *m, int keep, size_t bytes) {
     const size_t margin = (size_t)512 << 20;
-    while (q36cc_free_bytes(ch) < bytes + margin) {
+    while (q36cc_conv_avail(ch) < bytes + margin) {
         int k = -1;
         for (int j = 0; j < ch->nconv; j++) {
             Q36ccConv *v = &ch->conv[j];
             if (j == keep || v->used == ch->conv_clock || !v->cap || j == ch->conv_cur) continue;
             if (k < 0 || v->used < ch->conv[k].used) k = j;
         }
-        if (k < 0) return 0;
+        if (k < 0) {   /* no other place's mirrors left to take: the expert tier's memory, once */
+            const size_t fr = q36cc_conv_avail(ch);
+            return fr >= bytes + margin || (qt_chain_give_back(bytes + margin - fr) && q36cc_conv_avail(ch) >= bytes + margin);
+        }
         Q36ccConv *v = &ch->conv[k];
         for (int i = 0; i < m->c.n_layers; i++) {
             if (!m->c.is_attn[i] || q36cc_ring(m, i)) continue;
@@ -833,9 +844,33 @@ static void q36cc_mux_drop(Model *m) {
 static void q36cc_pool_off(Q36CChain *ch, Model *m) {
     q36cc_mux_drop(m);
     for (int k = 0; k < ch->nconv; k++) if (k != ch->conv_cur) q36cc_conv_free(m, &ch->conv[k]);
-    free(ch->conv); ch->conv = NULL; ch->nconv = 0; ch->conv_cur = -1;
+    free(ch->conv); ch->conv = NULL; ch->nconv = 0; ch->conv_cur = -1; ch->pool_closed = 1;
     fprintf(stderr, "[chain] qwen36: a prompt's KV mirror does not fit beside the other conversations' state: "
                     "each conversation's state goes through the host from here on\n");
+}
+/* q36c_pool_reopen's twin: a conversation that enters after the places closed opens them again,
+ * its mirror freed when it holds more than twice what this conversation needs */
+static void q36cc_pool_reopen(Model *m, int slot) {
+    Q36CChain *ch = q36cc_of(m);
+    if (!ch || !ch->ok || ch->failed || !ch->pool_closed || ch->conv || slot < 0 || g_q36_mux_slots < 2) return;
+    Cfg *c = &m->c;
+    const int need = m->kv_len > Q36CC_CONV_ROWS ? m->kv_len : Q36CC_CONV_ROWS;
+    ch->dn_where = Q36CC_HOST; ch->host_zero = 0; ch->snap_valid = 0;
+    for (int i = 0; i < c->n_layers; i++) ch->kv_valid[i] = 0;
+    if (ch->cap > 2 * need) {
+        for (int i = 0; i < c->n_layers; i++) {
+            if (!c->is_attn[i]) continue;
+            cc_free(ch->kc[i]); cc_free(ch->vc[i]); ch->kc[i] = ch->vc[i] = NULL; ch->kv_rows[i] = 0;
+        }
+        ch->cap = 0;
+    }
+    if (!q36cc_pool_ok(ch) || !(ch->conv = calloc((size_t)g_q36_mux_slots, sizeof *ch->conv))) return;
+    for (int k = 0; k < g_q36_mux_slots; k++) ch->conv[k].slot = -1;
+    ch->nconv = 1; ch->conv_cur = 0; ch->conv_full = 0; ch->pool_closed = 0; ch->pool_reopens++;
+    q36cc_conv_save(ch);
+    ch->conv[0].slot = slot;
+    fprintf(stderr, "[chain] qwen36: the conversations' places open again (a conversation of %d positions enters); "
+                    "each conversation's state stays on the device while there is room\n", m->kv_len);
 }
 static void q36cc_mux_leave(Model *m) {
     Q36CChain *ch = q36cc_of(m);
@@ -845,6 +880,7 @@ static void q36cc_mux_leave(Model *m) {
 static void q36cc_mux_enter(Model *m, int slot) {
     Q36CChain *ch = q36cc_of(m);
     if (!ch || !ch->ok) return;
+    if (!ch->conv && ch->pool_closed) q36cc_pool_reopen(m, slot);
     if (ch->conv && q36cc_pool_ok(ch)) {
         if (slot < 0) return;
         ch->conv_clock++;
@@ -2135,6 +2171,9 @@ static void q36cc_report(Model *m) {
                         "%.2f a step), %llu on the host's path; %d conversation%s state on the device, %llu handed over\n",
                 g_q36_mux_slots, ch->mux_steps, ch->mux_rows, ch->mux_steps ? (double)ch->mux_rows / (double)ch->mux_steps : 0.0,
                 ch->mux_host_steps, ch->nconv, ch->nconv == 1 ? "'s" : "s'", ch->conv_handed);
+    if (ch->pool_reopens)
+        fprintf(stderr, "[chain] qwen36: the conversations' places opened again %llu time%s after a mirror that did not fit closed them\n",
+                ch->pool_reopens, ch->pool_reopens == 1 ? "" : "s");
     if (ch->dm_steps)
         fprintf(stderr, "[chain] qwen36: %llu layer steps with the routed experts in the frame, %llu of them hybrid "
                         "(%llu slots on the host in %.1f ms, %.1f ms waiting for the device's routes)\n",
