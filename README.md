@@ -244,7 +244,7 @@ a fast NVMe drive helps most)
 directory beside it; `--model` that directory, as any other ([gguf.md](docs/gguf.md)). Nothing is
 converted or quantized again: the blocks run as the file holds them, from IQ1_S to Q8_0, F16, BF16
 and MXFP4. The engines of every chat model above read GGUFs too
-([the architectures](docs/gguf.md#supported-architectures)); these four models come as GGUFs:
+([the architectures](docs/gguf.md#supported-architectures)); these models come as GGUFs:
 
 | Model | GGUF | GPU | Measured |
 |---|---|---|---|
@@ -252,6 +252,7 @@ and MXFP4. The engines of every chat model above read GGUFs too
 | **Muse Spark Open** (816B, 42B active): text and tools, under Meta's licence agreement | unsloth, UD-IQ1_S 176 GB to UD-Q4_K_XL 505 GB | CUDA, Vulkan | 1.55-1.58 tok/s with Vulkan, 1.34-1.40 with CUDA, 0.83-0.89 on the CPU (D) |
 | **Flint** (40B, 2.5B active): text and tools, Apache 2.0 | unsloth, UD-IQ1_M 11.4 GB to BF16 79.6 GB | CUDA, Vulkan | UD-Q4_K_XL: 77.4 tok/s with CUDA, 77.7 with Vulkan, 15.8 on the CPU (D) |
 | **LFM3-VL-2B**: text, pictures and tools, LFM Open License | LiquidAI, QAD-Q4_0 to BF16 (or the checkpoint, converted) | CUDA, Vulkan | Q4_K_M: 235.1 tok/s with CUDA, 214.1 with Vulkan, 34.5 on the CPU (D) |
+| **Qwen-Image-2.1** and its **Turbo**: text to picture, non-commercial licence ([qwen-image.md](docs/qwen-image.md#gguf-unsloth)) | unsloth, Q2_K 2.5 GB to F16 14.2 GB, with a Qwen3-VL-8B-Instruct GGUF as the text encoder | Vulkan | Turbo Q4_K_M, 1024x1024 in 8 steps: 37 s of denoising with Vulkan (D); at 512x512 8.4-9.3 s a step on the CPU (A) |
 
 The larger models of the tables above from their GGUFs, on the same machine: [Benchmarks](#large-models-on-the-same-machine).
 
