@@ -898,6 +898,13 @@ deepseek-v4-tiny-check: deepseek-v4-tiny-generate
 		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
 		--fixture $(CURDIR)/deepseek_v4_tiny
 
+# Windows + GPU: COLI_DSV4_DLL as a path loads a backend outside the engine's folder with
+# the CUDA runtime only on PATH. DSV4_DLL names a built coli_cuda_dsv4*.dll (copied, never changed).
+.PHONY: dsv4-dll-path-check
+dsv4-dll-path-check: deepseek-v4
+	@test -n "$(DSV4_DLL)" || { echo "usage: make dsv4-dll-path-check DSV4_DLL=C:/path/coli_cuda_dsv4.dll" >&2; exit 2; }
+	DSV4_TEST_DLL="$(DSV4_DLL)" $(PYTHON) tests/test_dsv4_dll_path.py -v
+
 deepseek-v4-oracle: deepseek-v4
 	@test -n "$(MODEL)" || { echo "usage: make deepseek-v4-oracle MODEL=/path/to/checkpoint" >&2; exit 2; }
 	$(PYTHON) tools/make_deepseek_v4_oracle.py --model "$(MODEL)" \
