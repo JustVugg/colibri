@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  <a href="https://hackergit.org/r/JustVugg/colibri"><img src="https://hackergit.org/badge/JustVugg/colibri.svg?style=card" alt="Hacker News points via HackerGit" width="250" height="55"></a>
+  <a href="https://news.ycombinator.com/item?id=48842459"><img src="https://hackergit.org/badge/JustVugg/colibri.svg?style=card" alt="Hacker News points via HackerGit" width="250" height="55"></a>
 </p>
 
 <p align="center">
