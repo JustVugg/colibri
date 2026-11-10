@@ -244,10 +244,19 @@ GQ_EXACT_FN static int qi_gg_decode(int t, const uint8_t *src, float *dst, int64
     return gq_dequant_row(t, src, dst, n);
 }
 
-/* A GGUF type kept in the file's blocks: under 8 bits a weight (Q8_0 is 8.5: int8 rows
- * are smaller and need no decoding) and whole panels of columns. */
+/* Whether the matrices being loaded multiply f32 activations (the text encoder's, the DiT's
+ * outside its blocks, the blocks' without COLI_IMG_ACT8): lin_load's callers set it. */
+static int g_lin_f32act = 1;
+
+/* A GGUF type kept in the file's blocks, whole panels of columns: under 8 bits a weight
+ * always; Q8_0 (8.5 bits) only where the activations are f32, whose product then has the
+ * file's weights exactly. Where they are int8 the int8 x int8 product packs int8 rows
+ * either way, and the int8 rows are smaller and need no decoding. Measured on the real
+ * model, the text encoder from Qwen3-VL-8B-Instruct-Q8_0.gguf, two prompts at 512x512 and
+ * 8 steps against the bf16 reference: as int8 rows 30.8 and 30.0 dB, in its blocks 30.7 and
+ * 33.0, for 7.39 GB of RAM instead of 6.95. */
 static int qi_gg_keep(int gt, int K){
-    return gt >= 0 && gt < GQ_TYPE_MAX && gq_blk_decoder(gt) && GQ_TYPES[gt].bytes < GQ_TYPES[gt].blck &&
+    return gt >= 0 && gt < GQ_TYPE_MAX && gq_blk_decoder(gt) && (GQ_TYPES[gt].bytes < GQ_TYPES[gt].blck || g_lin_f32act) &&
            qi_gg_ok(K) && K % GQ_TYPES[gt].blck == 0;
 }
 static int g_lin_gg, g_lin_conv;   /* matrices kept in the file's blocks, and converted (the load's line) */
@@ -512,6 +521,7 @@ static void te_load(Te *te, const char *model){
     double t0 = now_s();
     te->L = calloc(te->layers, sizeof(TeLayer));
     int H = te->hidden, qd = te->heads * te->hd, kd = te->kv * te->hd;
+    g_lin_f32act = 1;   /* the text encoder never takes int8 activations */
     size_t bytes = 0;
     /* a few layers at once: each reads and quantizes its own matrices (COLI_IMG_LOAD_THREADS) */
     #pragma omp parallel for schedule(dynamic, 1) num_threads(qi_load_threads()) reduction(+:bytes)
@@ -705,6 +715,7 @@ static void dit_load(Dit *d, const char *model){
     st_init(&S, dir);
     double t0 = now_s();
     int D = d->dim;
+    g_lin_f32act = 1;   /* outside the blocks the activations stay f32 */
     lin_load(&S, "img_in.weight", D, d->in_ch, 32, &d->img_in);
     lin_load(&S, "time_text_embed.timestep_embedder.linear_1.weight", D, 256, 32, &d->t1);
     lin_load(&S, "time_text_embed.timestep_embedder.linear_2.weight", D, D, 32, &d->t2);
@@ -716,6 +727,7 @@ static void dit_load(Dit *d, const char *model){
     d->txt_norm = vec_load(&S, "txt_in.text_norm.weight", d->ctx);
     d->B = calloc(d->layers, sizeof(DitBlock));
     size_t bytes = 0;
+    g_lin_f32act = !g_act8;   /* the blocks' products take int8 activations where VNNI is on */
     #pragma omp parallel for schedule(dynamic, 1) num_threads(qi_load_threads()) reduction(+:bytes)
     for (int l = 0; l < d->layers; l++) {
         DitBlock *B = &d->B[l];
@@ -737,6 +749,7 @@ static void dit_load(Dit *d, const char *model){
                  lin_bytes(&B->gate) + lin_bytes(&B->proj) + lin_bytes(&B->out);
     }
     st_destroy(&S);
+    g_lin_f32act = 1;
     d->img_in.gpu = d->t1.gpu = d->t2.gpu = d->mod.gpu = d->norm_out.gpu = d->proj_out.gpu = 1;
     d->txt1.gpu = d->txt2.gpu = 1;
     d->loaded = 1;

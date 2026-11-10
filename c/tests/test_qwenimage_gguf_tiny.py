@@ -68,9 +68,9 @@ class QwenImageGgufTiny(unittest.TestCase):
         p = subprocess.run(imp, capture_output=True, text=True)
         assert p.returncode == 0, p.stdout + p.stderr
         cls.import_log = p.stdout
-        # the denoiser whose txt_in and modulation are Q8_0 (int8 rows either way), with the
+        # the denoiser whose txt_in and modulation are BF16 (int8 rows either way), with the
         # reference's text encoder (an official folder's, unchanged by COLI_IMG_NATIVE)
-        p = subprocess.run([sys.executable, str(HERE / "tools" / "gguf_import.py"), str(d / "src" / "dit_q8.gguf"),
+        p = subprocess.run([sys.executable, str(HERE / "tools" / "gguf_import.py"), str(d / "src" / "dit_io16.gguf"),
                             str(d / "gg_te"), "--text-encoder", str(d / "src" / "ref"), "--vae", TINY]
                            + (["--variant", "turbo"] if cls.TURBO else []), capture_output=True, text=True)
         assert p.returncode == 0, p.stdout + p.stderr

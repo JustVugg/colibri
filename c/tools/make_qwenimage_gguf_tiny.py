@@ -10,7 +10,7 @@ TINY is a fixture written by make_qwenimage_tiny.py: its tokenizer (processor/) 
              name under "model.diffusion_model.", each block's gate_layer and proj fused in
              one img_mlp.gate_up, the types of a K-quant file (Q2_K to Q6_K, Q8_0, F16, BF16,
              F32). 256 wide, so every block type fills whole 256-wide blocks.
-  dit_q8.gguf another one whose txt_in and modulation are Q8_0 (int8 rows at load, kept or
+  dit_io16.gguf another one whose txt_in and modulation are BF16 (int8 rows at load, kept or
              not): there only the blocks' matrices differ between the file's blocks and int8
              rows, and the int8 x int8 product must give the same bytes both ways.
   te.gguf    a random text encoder as llama.cpp writes Qwen3-VL's language model (arch
@@ -125,8 +125,8 @@ def write_safetensors(path, named):
             f.write(b)
 
 
-def denoiser(rng, q8_io=False):
-    """(GGUF tensors, f32 checkpoint tensors). q8_io: txt_in and modulation as Q8_0."""
+def denoiser(rng, io16=False):
+    """(GGUF tensors, f32 checkpoint tensors). io16: txt_in and modulation as BF16."""
     D, M = DIM, DIM * MLP_RATIO
     gg, ref = [], {}
 
@@ -142,11 +142,11 @@ def denoiser(rng, q8_io=False):
     ref["img_in.weight"] = add("img_in.weight", (D, IN_CH), "BF16", 0.2)
     ref["time_text_embed.timestep_embedder.linear_1.weight"] = add("time_text_embed.timestep_embedder.linear_1.weight", (D, 256), "Q8_0", 0.05)
     ref["time_text_embed.timestep_embedder.linear_2.weight"] = add("time_text_embed.timestep_embedder.linear_2.weight", (D, D), "Q8_0", 0.05)
-    ref["modulation.1.weight"] = add("modulation.1.weight", (4 * D, D), "Q8_0" if q8_io else "Q5_K", 0.05)
+    ref["modulation.1.weight"] = add("modulation.1.weight", (4 * D, D), "BF16" if io16 else "Q5_K", 0.05)
     ref["norm_out.linear.weight"] = add("norm_out.linear.weight", (D, D), "F16", 0.05)
     ref["proj_out.weight"] = add("proj_out.weight", (IN_CH, D), "Q8_0", 0.05)
-    ref["txt_in.in_layer.weight"] = add("txt_in.in_layer.weight", (D, TE_H), "Q8_0" if q8_io else "Q6_K", 0.05)
-    ref["txt_in.out_layer.weight"] = add("txt_in.out_layer.weight", (D, D), "Q8_0" if q8_io else "Q4_K", 0.05)
+    ref["txt_in.in_layer.weight"] = add("txt_in.in_layer.weight", (D, TE_H), "BF16" if io16 else "Q6_K", 0.05)
+    ref["txt_in.out_layer.weight"] = add("txt_in.out_layer.weight", (D, D), "BF16" if io16 else "Q8_0", 0.05)
     ref["txt_in.text_norm.weight"] = add("txt_in.text_norm.weight", (TE_H,), "BF16", ones=True)
     kinds = [("Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q4_K"), ("Q4_K", "Q5_K", "Q6_K", "Q3_K", "Q2_K", "Q5_K")]
     for l in range(LAYERS):
@@ -181,7 +181,7 @@ def text_encoder(rng, vocab):
     add("token_embd.weight", p + "embed_tokens.weight", (vocab, H), "Q4_K", 0.5)
     add("output_norm.weight", p + "norm.weight", (H,), "F32", ones=True)
     add("output.weight", None, (vocab, H), "Q6_K")
-    kinds = [("Q4_K", "Q5_K", "Q6_K", "Q3_K", "Q2_K", "Q4_K", "Q5_K"), ("Q5_K", "Q6_K", "Q4_K", "Q2_K", "Q3_K", "Q6_K", "Q4_K")]
+    kinds = [("Q4_K", "Q5_K", "Q6_K", "Q3_K", "Q2_K", "Q4_K", "Q5_K"), ("Q5_K", "Q6_K", "Q8_0", "Q2_K", "Q3_K", "Q6_K", "Q4_K")]
     for l in range(TE_LAYERS):
         g, h = f"blk.{l}.", f"{p}layers.{l}."
         a, b, c, d, e, f, gd = kinds[l % 2]
@@ -232,7 +232,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     gg, dit_ref = denoiser(rng)
     write_gguf(out / "dit.gguf", [], gg)
-    write_gguf(out / "dit_q8.gguf", [], denoiser(np.random.default_rng(args.seed + 1), q8_io=True)[0])
+    write_gguf(out / "dit_io16.gguf", [], denoiser(np.random.default_rng(args.seed + 1), io16=True)[0])
     tg, te_ref = text_encoder(rng, vocab)
     p = "qwen3vl."
     kv = [("general.architecture", 8, "qwen3vl"), ("general.name", 8, "tiny Qwen3-VL"),
