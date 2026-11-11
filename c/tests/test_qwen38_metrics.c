@@ -49,6 +49,25 @@ int main(void){
     volatile size_t short_capacity=8;
     CHECK(q38_format_prof(line,short_capacity,2.0,7,3,&profile)<0);
 
-    puts("qwen38 metrics: request deltas, TPOT rate, PROF schema: ok");
+    QtCounters at={10,20,5,1,0},mid={12,23,9,1,2},end={15,24,9,3,2};
+    QtCounters tier[2]={q38_qt_delta(&mid,&at),q38_qt_delta(&end,&mid)};
+    CHECK(tier[0].hits==2&&tier[0].miss==3&&tier[0].uploads==4&&tier[0].q_full_skips==2);
+    CHECK(tier[1].hits==3&&tier[1].miss==1&&tier[1].uploads==0&&tier[1].swaps==2);
+    uint64_t ram_hits[2]={7,1},ram_misses[2]={4,0};
+    char split[512];
+    CHECK(q38_format_expert_split(split,sizeof split,"r1",ram_hits,ram_misses,0,tier)==84);
+    CHECK(!strcmp(split,"[qwen38] request r1 experts: prefill RAM 7 hits, 4 disk | decode RAM 1 hits, 0 disk\n"));
+    CHECK(q38_format_expert_split(split,sizeof split,"r1",ram_hits,ram_misses,1,tier)>0);
+    CHECK(!strcmp(split,"[qwen38] request r1 experts: prefill RAM 7 hits, 4 disk | decode RAM 1 hits, 0 disk"
+                        " | VRAM hit rate: prefill 40.0 % (2 hits, 3 CPU), decode 75.0 % (3 hits, 1 CPU)"
+                        " | uploads 4, swaps 2, q_skips 2\n"));
+    /* no room for the tier part; room for the RAM part's text but not its newline; just room */
+    volatile size_t split_short=64,split_no_newline=84,split_exact=85;
+    CHECK(q38_format_expert_split(split,split_short,"r1",ram_hits,ram_misses,1,tier)<0);
+    CHECK(q38_format_expert_split(split,split_no_newline,"r1",ram_hits,ram_misses,0,tier)<0);
+    CHECK(q38_format_expert_split(split,split_exact,"r1",ram_hits,ram_misses,0,tier)==84);
+    CHECK(strlen(split)==84&&split[83]=='\n');
+
+    puts("qwen38 metrics: request deltas, TPOT rate, PROF schema, expert split: ok");
     return 0;
 }

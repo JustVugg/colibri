@@ -21,6 +21,10 @@
 #define QWEN36_TIER_H
 #include <stdint.h>
 
+/* The tier's running counters (qt_counters): hits = routed experts computed on the card, miss =
+ * routed experts the CPU computed instead. A request's share is the difference of two reads. */
+typedef struct { uint64_t hits, miss, uploads, swaps, q_full_skips; } QtCounters;
+
 #ifdef COLI_CUDA
 
 /* Init after model load. Returns 1 when the tier is active.
@@ -237,6 +241,8 @@ int  qt_evicted_take(int *layers, int *eids, int max);
 /* Snapshot the hit/miss counters; qt_stats then also reports the hit rate
  * from this point on (the engine marks the prefill/decode boundary). */
 void qt_stats_mark(void);
+/* The counters now; 0 (all zero) when the tier is off. */
+int  qt_counters(QtCounters *out);
 
 /* One telemetry block on stderr: residency, hits/misses, uploads per device. */
 void qt_stats(void);
@@ -406,6 +412,7 @@ static inline void qt_fill_wait(void){}
 static inline int  qt_replan(int l,const uint32_t*a,int b){(void)l;(void)a;(void)b;return 0;}
 static inline int  qt_evicted_take(int*a,int*b,int c){(void)a;(void)b;(void)c;return 0;}
 static inline void qt_stats_mark(void){}
+static inline int  qt_counters(QtCounters *out){QtCounters z={0,0,0,0,0};*out=z;return 0;}
 static inline void qt_stats(void){}
 
 #endif /* COLI_CUDA */
