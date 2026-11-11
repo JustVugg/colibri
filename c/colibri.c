@@ -8847,7 +8847,7 @@ static int mlv_vk_mm(MvMat *w, float *y, const float *x, int S){
     return ok;
 }
 #endif
-static struct { float *patches; unsigned long long bytes; int gh, gw, present; } g_mlv_pending;
+static struct { float *patches; unsigned long long bytes, id; int gh, gw, present; } g_mlv_pending;   /* id: its IMAGE frame's */
 static float *g_vis_rows; static int *g_vis_map, g_vis_map_len;
 static void vis_apply(Model *m, float *x, int S, int pos_base){
     if(!g_vis_map) return;
@@ -11573,7 +11573,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
         if(g_mlv_pending.present) fprintf(stderr,"[ml4] a second picture came before its SUBMIT; the first is dropped\n");
         mlv_pending_clear();
         g_mlv_pending.patches=(float*)buf; g_mlv_pending.bytes=bytes;
-        g_mlv_pending.gh=gh; g_mlv_pending.gw=gw; g_mlv_pending.present=1;
+        g_mlv_pending.gh=gh; g_mlv_pending.gw=gw; g_mlv_pending.id=iid; g_mlv_pending.present=1;
         free(line); return 0;
     }
     if(!strncmp(line,"STOP ",5)){
@@ -11699,6 +11699,12 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
         fflush(stdout); return 0;
     }
     int vis_first=-1;   /* the prompt's first [IMG], when an IMAGE frame came before it */
+    if(g_mlv_pending.present && g_mlv_pending.id!=sub.id){
+        /* its own SUBMIT was refused before this point (CONTEXT_EXCEEDED, EMPTY_PROMPT, SLOT_BUSY, ...) */
+        fprintf(stderr,"[ml4] the picture of request %llu was not used; request %llu goes without it\n",
+                g_mlv_pending.id,sub.id);
+        mlv_pending_clear();
+    }
     if(g_mlv_pending.present){
         int bad=mlv_attach(m,T,tmp,nt,&vis_first);
         mlv_pending_clear();

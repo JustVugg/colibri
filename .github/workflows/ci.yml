@@ -1819,6 +1819,8 @@ jobs:
           python3 tools/make_mistral_vision_tiny.py --out /tmp/ml4fv --same-as /tmp/ml4f/coli/mmproj.gguf
           served=$(SERVE=1 SNAP=/tmp/ml4f/coli ./colibri 8 < /dev/null 2>&1 || true)
           echo "$served" | grep "vision tower (mmproj): 2 layers"
+          # a picture announced for a request refused before the tower does not go to the next one
+          COLI_ML4_FIXTURE=/tmp/ml4/coli ML4_MMPROJ=/tmp/ml4fv/mmproj.gguf python3 -m unittest -v tests.test_ml4_pending_picture
           # The published GGUFs' types, layer by layer as their headers have them (MIXES): these
           # six hold all fourteen (BF16, Q8_0, Q3_K-Q6_K, IQ1_S, IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_XS
           # beside F32). The float path (GQ_EXACT=1) against the reference on the blocks' own
