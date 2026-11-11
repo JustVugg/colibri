@@ -1360,6 +1360,11 @@ __global__ static void __launch_bounds__(32 * NG) bd_mmg_k(float *__restrict__ y
             }
         }
         const int quad = lane & ~3;
+        /* the super-block's x side, every step's, loaded before its weights are decoded: its codes (this
+         * thread's B words), its blocks' scales and its groups' code sums (the C rows'), so the loads
+         * overlap instead of waiting at each step */
+        constexpr bool XH = T == 12 || T == 13, XS = T == 10 || T == 12 || T == 13 || T == 14;
+        bd_u32 pb0[8][NT], pb1[8][NT]; float pdl[8][NT][2], pdh[XH ? 8 : 1][NT][2]; int psl[XS ? 8 : 1][NT][2], psh[XS ? 8 : 1][NT][2];
         #pragma unroll
         for (int jj = 0; jj < 8; jj++) {
             const int q = 8 * sb + jj;
@@ -1368,6 +1373,21 @@ __global__ static void __launch_bounds__(32 * NG) bd_mmg_k(float *__restrict__ y
                 const int e = sb * 64 + ((jj >> 1) & 3) * 16 + (jj & 1) * 4;
                 kx0 = e >> 2; kx1 = kx0 + 2; gx0 = kx0; gx1 = kx0 + 2; dx0 = gx0 >> 1; dx1 = gx1 >> 1;
             } else { kx0 = 2 * q; kx1 = 2 * q + 1; gx0 = 2 * q; gx1 = 2 * q + 1; dx0 = dx1 = q; }
+            #pragma unroll
+            for (int n = 0; n < NT; n++) {
+                pb0[jj][n] = bl[n] ? __ldg(xb[n] + 4 * bd_x4(kx0)) : 0u; pb1[jj][n] = bl[n] ? __ldg(xb[n] + 4 * bd_x4(kx1)) : 0u;
+                #pragma unroll
+                for (int j = 0; j < 2; j++) {
+                    pdl[jj][n][j] = __ldg(xd[n][j] + dx0);
+                    if (XH) pdh[XH ? jj : 0][n][j] = __ldg(xd[n][j] + dx1);
+                    if (XS) { psl[XS ? jj : 0][n][j] = __ldg(xsum[n][j] + gx0); psh[XS ? jj : 0][n][j] = __ldg(xsum[n][j] + gx1); }
+                }
+            }
+            (void)dx1; (void)gx1;
+        }
+        #pragma unroll
+        for (int jj = 0; jj < 8; jj++) {
+            const int q = 8 * sb + jj;
             BdMqStep st;
             if (bd_mq_own(T)) { bd_mmq_own<T, true>(Wa, q, t, tb, st.A0a, st.A1a, st.pa); bd_mmq_own<T, true>(Wb, q, t, tb, st.A0b, st.A1b, st.pb); }
             else bd_mmq_a<T, true, false>(Wa, Wb, q, t, st);
@@ -1386,26 +1406,25 @@ __global__ static void __launch_bounds__(32 * NG) bd_mmg_k(float *__restrict__ y
             }
             #pragma unroll
             for (int n = 0; n < NT; n++) {
-                bd_u32 b0 = 0u, b1 = 0u;
-                if (bl[n]) { b0 = __ldg(xb[n] + 4 * bd_x4(kx0)); b1 = __ldg(xb[n] + 4 * bd_x4(kx1)); }
+                const bd_u32 b0 = pb0[jj][n], b1 = pb1[jj][n];
                 int c0[4] = {0, 0, 0, 0}, c1[4] = {0, 0, 0, 0};
                 if (bd_mq_two(T)) { bd_mma16(c0, st.A0a, st.A0b, b0); bd_mma16(c1, st.A1a, st.A1b, b1); }
                 else bd_mma32(c0, st.A0a, st.A0b, st.A1a, st.A1b, b0, b1);
                 #pragma unroll
                 for (int j = 0; j < 2; j++) {
                     if (!live[n][j]) continue;   /* a column past the rows of x: never written */
-                    const float dl = __ldg(xd[n][j] + dx0);
+                    const float dl = pdl[jj][n][j];
                     if (T == 12 || T == 13) {
-                        const float dh = __ldg(xd[n][j] + dx1);
-                        const int xl = __ldg(xsum[n][j] + gx0), xh = __ldg(xsum[n][j] + gx1);
+                        const float dh = pdh[XH ? jj : 0][n][j];
+                        const int xl = psl[XS ? jj : 0][n][j], xh = psh[XS ? jj : 0][n][j];
                         acc[jj][n][j] = bdi_upd_k45(acc[jj][n][j], dl, dh, st.pa[0], st.pa[1], st.pa[2], st.pa[3], c0[j], c1[j], xl, xh);
                         acc[jj][n][2 + j] = bdi_upd_k45(acc[jj][n][2 + j], dl, dh, st.pb[0], st.pb[1], st.pb[2], st.pb[3], c0[2 + j], c1[2 + j], xl, xh);
                     } else if (T == 14) {
-                        const int xl = 32 * __ldg(xsum[n][j] + gx0), xh = 32 * __ldg(xsum[n][j] + gx1);
+                        const int xl = 32 * psl[XS ? jj : 0][n][j], xh = 32 * psh[XS ? jj : 0][n][j];
                         acc[jj][n][j] = bdi_upd_2(acc[jj][n][j], dl, st.pa[0], st.pa[1], c0[j] - xl, c1[j] - xh);
                         acc[jj][n][2 + j] = bdi_upd_2(acc[jj][n][2 + j], dl, st.pb[0], st.pb[1], c0[2 + j] - xl, c1[2 + j] - xh);
                     } else if (T == 10) {   /* Q2_K: bdi_step's, the scale and min of each 16 */
-                        const int xl = __ldg(xsum[n][j] + gx0), xh = __ldg(xsum[n][j] + gx1);
+                        const int xl = psl[XS ? jj : 0][n][j], xh = psh[XS ? jj : 0][n][j];
                         acc[jj][n][j] = bdi_upd_k45(acc[jj][n][j], dl, dl, st.pa[0], st.pa[1], st.pa[2], st.pa[3], c0[j], c1[j], xl, xh);
                         acc[jj][n][2 + j] = bdi_upd_k45(acc[jj][n][2 + j], dl, dl, st.pb[0], st.pb[1], st.pb[2], st.pb[3], c0[2 + j], c1[2 + j], xl, xh);
                     } else if (bd_mq_two(T)) {   /* Q3_K, IQ2_XS, IQ2_S, IQ1_S: a scale each 16 */
@@ -1417,7 +1436,6 @@ __global__ static void __launch_bounds__(32 * NG) bd_mmg_k(float *__restrict__ y
                     }
                 }
             }
-            (void)dx1; (void)gx1;
         }
     }
     __syncthreads();   /* every warp done with its stages: the room takes the classes' sums */
