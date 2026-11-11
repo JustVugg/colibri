@@ -50,7 +50,7 @@ def blocks(name, shape, rng, std=0.02):
     return raw.reshape(*shape[:-1], nb * size)
 
 
-def write_model(path, rng, dense=False, same_gate_up=False, token=None, ollama=False, dn_types=None, mtp=False):
+def write_model(path, rng, dense=False, same_gate_up=False, token=None, ollama=False, dn_types=None, mtp=False, mtp_file=None):
     """dense: llama.cpp's qwen35 (a dense model of the family): an MLP per layer instead of the
     experts, and no output.weight (the head tied to token_embd), as the small checkpoints ship.
     same_gate_up: every layer's expert up in its gate's type (layer 0 IQ2_XXS, the others
@@ -64,21 +64,29 @@ def write_model(path, rng, dense=False, same_gate_up=False, token=None, ollama=F
     layer of two types is how unsloth's dynamic mixes ship about half of Qwen3.8-27B's.
     mtp (dense): the checkpoint's MTP head as llama.cpp writes it, one more layer (blk.LAYERS) with
     nextn_predict_layers 1: a full-attention layer with its MLP, nextn.eh_proj and the nextn
-    norms, in the types unsloth's Qwen3.8-27B files give them (norms stored as 1 + w)."""
+    norms, in the types unsloth's Qwen3.8-27B files give them (norms stored as 1 + w).
+    mtp_file (with mtp): that head in a file of its own instead, as unsloth's Dynamic v3.1 files ship
+    it (MTP/mtp-*.gguf: the same architecture, block_count one more and nextn_predict_layers 1, the
+    layer's tensors only); the model's file then has neither the layer nor the key. The same
+    weights as with the head inside."""
     arch = "qwen35" if dense else "qwen35moe"
     w = gguf.GGUFWriter(str(path), arch)
+    hw = gguf.GGUFWriter(str(mtp_file), arch) if mtp and mtp_file else None
     p = arch + "."
     moe = (("feed_forward_length", I),) if dense else \
         (("expert_count", E), ("expert_used_count", TOPK), ("expert_feed_forward_length", I), ("expert_shared_feed_forward_length", I))
-    if mtp:
-        w.add_uint32(p + "nextn_predict_layers", 1)
-    for k, v in (("block_count", LAYERS + (1 if mtp else 0)), ("embedding_length", H), ("attention.head_count", QH),
-                 *(() if ollama else (("attention.head_count_kv", KVH),)), ("attention.key_length", HD), ("attention.value_length", HD),
-                 *moe, ("full_attention_interval", 4),
-                 ("rope.dimension_count", HD // 4), ("ssm.conv_kernel", 4), ("ssm.state_size", KD),
-                 ("ssm.group_count", KH), ("ssm.time_step_rank", VH), ("ssm.inner_size", VH * KD),
-                 ("context_length", 4096)):
-        w.add_uint32(p + k, v)
+    for wr, inside in ((w, mtp and hw is None), (hw, True)):
+        if wr is None:
+            continue
+        if inside:
+            wr.add_uint32(p + "nextn_predict_layers", 1)
+        for k, v in (("block_count", LAYERS + (1 if inside else 0)), ("embedding_length", H), ("attention.head_count", QH),
+                     *(() if ollama else (("attention.head_count_kv", KVH),)), ("attention.key_length", HD), ("attention.value_length", HD),
+                     *moe, ("full_attention_interval", 4),
+                     ("rope.dimension_count", HD // 4), ("ssm.conv_kernel", 4), ("ssm.state_size", KD),
+                     ("ssm.group_count", KH), ("ssm.time_step_rank", VH), ("ssm.inner_size", VH * KD),
+                     ("context_length", 4096)):
+            wr.add_uint32(p + k, v)
     if ollama:
         w.add_array(p + "attention.head_count_kv", [KVH if (L + 1) % 4 == 0 else 0 for L in range(LAYERS)])
         w.add_array(p + "rope.dimension_sections", [HD // 16, HD // 16, HD // 8])
@@ -130,14 +138,18 @@ def write_model(path, rng, dense=False, same_gate_up=False, token=None, ollama=F
             q(b + "ssm_out.weight", (H, VH * KD), "Q8_0")
     if mtp:   # llama.cpp's nextn layer
         b = f"blk.{LAYERS}."
-        def norm(name, n): w.add_tensor(name, (1 + rng.standard_normal(n) * 0.1).astype(np.float32))
+        o = hw or w
+        def norm(name, n): o.add_tensor(name, (1 + rng.standard_normal(n) * 0.1).astype(np.float32))
+        def qh(name, shape, t): o.add_tensor(name, blocks(t, shape, rng), raw_dtype=QT[t])
         norm(b + "attn_norm.weight", H); norm(b + "post_attention_norm.weight", H)
         norm(b + "attn_q_norm.weight", HD); norm(b + "attn_k_norm.weight", HD)
-        q(b + "attn_q.weight", (QH * HD * 2, H), "Q6_K"); q(b + "attn_k.weight", (KVH * HD, H), "Q8_0")
-        q(b + "attn_v.weight", (KVH * HD, H), "Q8_0"); q(b + "attn_output.weight", (H, QH * HD), "Q6_K")
-        q(b + "ffn_gate.weight", (I, H), "Q6_K"); q(b + "ffn_up.weight", (I, H), "Q6_K"); q(b + "ffn_down.weight", (H, I), "Q6_K")
-        q(b + "nextn.eh_proj.weight", (H, 2 * H), "Q6_K")
+        qh(b + "attn_q.weight", (QH * HD * 2, H), "Q6_K"); qh(b + "attn_k.weight", (KVH * HD, H), "Q8_0")
+        qh(b + "attn_v.weight", (KVH * HD, H), "Q8_0"); qh(b + "attn_output.weight", (H, QH * HD), "Q6_K")
+        qh(b + "ffn_gate.weight", (I, H), "Q6_K"); qh(b + "ffn_up.weight", (I, H), "Q6_K"); qh(b + "ffn_down.weight", (H, I), "Q6_K")
+        qh(b + "nextn.eh_proj.weight", (H, 2 * H), "Q6_K")
         norm(b + "nextn.enorm.weight", H); norm(b + "nextn.hnorm.weight", H); norm(b + "nextn.shared_head_norm.weight", H)
+        if hw is not None:
+            hw.write_header_to_file(); hw.write_kv_data_to_file(); hw.write_tensors_to_file(); hw.close()
     if ollama:   # the MTP head and the vision tower, in the model's file
         f32("mtp.fc.weight", (H, 2 * H)); f32("mtp.layers.0.attn_norm.weight", (H,)); f32("mtp.layers.0.ffn_gate_inp.weight", (E, H))
         f32("v.blk.0.attn_q.weight", (H, H)); f32("v.blk.0.attn_q.bias", (H,)); f32("v.patch_embd.weight", (H, 3, 2, 2))

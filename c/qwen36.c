@@ -144,6 +144,12 @@ static void q36_wfree(void *p){
  * Undoing the last one would mean permuting columns inside quantized blocks,
  * which is not lossless; reading in the file's order is. */
 static gguf_ctx g_gg;
+/* the MTP head's own GGUF (unsloth's mtp-*.gguf, gguf.json "mtp"): a tensor the model's file lacks is
+ * read from it, so its own copies of token_embd and output stay unread */
+static gguf_ctx g_gg_mtp; static int g_gg_mtp_open;
+static const gguf_ctx *gg_ctx_of(const gguf_tensor *t) {
+    return g_gg_mtp_open && t >= g_gg_mtp.t && t < g_gg_mtp.t + g_gg_mtp.n_tensors ? &g_gg_mtp : &g_gg;
+}
 static gguf_ctx g_mmproj; static int g_mmproj_open;   /* a GGUF's vision tower, its own file (gguf.json "mmproj") */
 static int   g_gguf = 0;
 static int   g_gguf_dry = 0;       /* GGUF_CHECK=1: validate every tensor the loader wants, read none */
@@ -2967,6 +2973,7 @@ static const gguf_tensor *gg_tensor(const char *hf) {
     if (g && !strcmp(g, "output.weight") && !gguf_find(&g_gg, g)) g = "token_embd.weight";
     /* Ollama's converter names the DeltaNet's dt bias blk.N.ssm_dt (the same values) */
     if (g && !gguf_find(&g_gg, g)) { size_t L = strlen(g); if (L > 12 && !strcmp(g + L - 12, ".ssm_dt.bias")) { nm[L - 5] = 0; g = nm; } }
+    if (g && g_gg_mtp_open && !gguf_find(&g_gg, g) && gguf_find(&g_gg_mtp, g)) return gguf_mark(&g_gg_mtp, g);
     return g ? gguf_mark(&g_gg, g) : NULL;
 }
 static int64_t gg_numel(const gguf_tensor *t) { return t->ne[0] * t->ne[1] * t->ne[2] * t->ne[3]; }
@@ -2978,11 +2985,11 @@ static int gg_scale(const gguf_tensor *w, int64_t n, float *out) {
     char nm[256]; size_t L = strlen(w->name);
     if (L < 8 || strcmp(w->name + L - 7, ".weight") || L + 1 > sizeof nm) return 0;
     snprintf(nm, sizeof nm, "%.*s.scale", (int)(L - 7), w->name);
-    const gguf_tensor *t = gguf_mark(&g_gg, nm);
+    const gguf_tensor *t = gguf_mark(gg_ctx_of(w), nm);
     if (!t) return 0;
     if (t->type != GQ_F32 || gg_numel(t) != n) { fprintf(stderr, "GGUF %s: expected %lld F32 values, found %lld of %s\n", nm, (long long)n, (long long)gg_numel(t), gq_type_name(t->type)); exit(1); }
     if (g_gguf_dry || !out) return 1;
-    if (gguf_read(&g_gg, t, out, 0, n * 4)) { fprintf(stderr, "GGUF %s: read failed\n", nm); exit(1); }
+    if (gguf_read(gg_ctx_of(w), t, out, 0, n * 4)) { fprintf(stderr, "GGUF %s: read failed\n", nm); exit(1); }
     return 1;
 }
 /* st_has / st_read_f32 for either source. */
@@ -3003,7 +3010,7 @@ static float *load_t_n(Model *m, const char *name, int64_t want) {
         int has_s = gg_scale(t, 1, &s1);
         if (g_gguf_dry) return NULL;
         float *p = falloc(n);
-        if (gguf_read_f32(&g_gg, t, p)) { fprintf(stderr, "GGUF %s: read failed (type %s)\n", t->name, gq_type_name(t->type)); exit(1); }
+        if (gguf_read_f32(gg_ctx_of(t), t, p)) { fprintf(stderr, "GGUF %s: read failed (type %s)\n", t->name, gq_type_name(t->type)); exit(1); }
         if (has_s) for (int64_t i = 0; i < n; i++) p[i] *= s1;
         return p;
     }
@@ -3294,7 +3301,7 @@ static void load_tq(Model *m, const char *name, int I, int O, int quantize, cons
         if (!gg_scale(t, 1, &out->gs)) out->gs = 1.f;
         if (g_gguf_dry) { out->gq_type = t->type; return; }
         out->gq = malloc((size_t)t->nbytes); out->gq_type = t->type;
-        if (!out->gq || gguf_read(&g_gg, t, out->gq, 0, t->nbytes)) { fprintf(stderr, "GGUF %s: read failed\n", t->name); exit(1); }
+        if (!out->gq || gguf_read(gg_ctx_of(t), t, out->gq, 0, t->nbytes)) { fprintf(stderr, "GGUF %s: read failed\n", t->name); exit(1); }
         if (rheads) q36_rope_unpermute(out->gq, (size_t)gq_row_bytes(t->type, I), rheads, O / rheads);
         const int ht = q36_gq_held(t->type, O, I);   /* IQ3_S: its codes at its first product on the CPU (q36_codes_now) */
         if (ht != t->type) {   /* interleaved by 16 for the CPU's kernels */
@@ -3709,7 +3716,7 @@ static void gguf_load_cfg(Cfg *c) {
     memset(c, 0, sizeof *c);
     int n_mtp = (int)gguf_get_int(g, GK("nextn_predict_layers"), 0);
     c->n_layers = (int)gguf_get_int(g, GK("block_count"), 0) - n_mtp;
-    g_gg_mtp_layer = n_mtp > 0 ? c->n_layers : -1;   /* the head (Q36_MTP=1) reads blk.<n_layers> */
+    g_gg_mtp_layer = n_mtp > 0 || g_gg_mtp_open ? c->n_layers : -1;   /* the head (Q36_MTP=1) reads blk.<n_layers>, here or in its own file */
     c->hidden   = (int)gguf_get_int(g, GK("embedding_length"), 0);
     c->q_heads  = (int)gguf_get_int(g, GK("attention.head_count"), 0);
     c->kv_heads = (int)gguf_get_int(g, GK("attention.head_count_kv"), 0);
@@ -10038,7 +10045,7 @@ int main(int argc, char **argv) {
     coli_omp_tune_threads("qwen36");
     const char *snap = getenv("SNAP");
     if (!snap) { coli_print_launcher_help("Qwen3.6", "SNAP=<model directory> ./qwen36 ..."); return 1; }
-    static char gguf_path[4096], mmproj_path[4096]; int gguf_dir = 0;
+    static char gguf_path[4096], mmproj_path[4096], mtp_path[4096]; int gguf_dir = 0;
     {   /* a model directory made by tools/gguf_import.py: gguf.json names the file */
         char gj[4096]; snprintf(gj, sizeof gj, "%s/gguf.json", snap);
         FILE *f = fopen(gj, "rb");
@@ -10050,6 +10057,8 @@ int main(int argc, char **argv) {
             gguf_path_join(gguf_path, sizeof gguf_path, snap, g);
             const char *mp = jstr(r, "mmproj");   /* a vision tower's file (LFM3-VL's) */
             if (mp && *mp) gguf_path_join(mmproj_path, sizeof mmproj_path, snap, mp);
+            const char *mt = jstr(r, "mtp");   /* the MTP head's own GGUF (unsloth's mtp-*.gguf) */
+            if (mt && *mt) gguf_path_join(mtp_path, sizeof mtp_path, snap, mt);
             free(arena); gguf_dir = 1;
         }
     }
@@ -10065,6 +10074,18 @@ int main(int argc, char **argv) {
         }
         if (getenv("GGUF_CHECK")) gguf_header_only = 1;
         if (gguf_open(&g_gg, gp)) { fprintf(stderr, "GGUF: %s\n", g_gg.err); return 1; }
+        if (mtp_path[0]) {   /* a head of the same architecture with one nextn layer */
+            if (gguf_open(&g_gg_mtp, mtp_path)) { fprintf(stderr, "GGUF (MTP head): %s\n", g_gg_mtp.err); return 1; }
+            const char *ma = gguf_get_str(&g_gg_mtp, "general.architecture"), *mm = gguf_get_str(&g_gg, "general.architecture");
+            char nk[96]; snprintf(nk, sizeof nk, "%s.nextn_predict_layers", ma ? ma : "");
+            if (!ma || !mm || strcmp(ma, mm) || gguf_get_int(&g_gg_mtp, nk, 0) != 1) {
+                fprintf(stderr, "GGUF %s: not this model's MTP head (architecture %s, one nextn layer: %s)\n", mtp_path,
+                        ma ? ma : "(none)", gguf_get_int(&g_gg_mtp, nk, 0) == 1 ? "yes" : "no");
+                return 1;
+            }
+            g_gg_mtp_open = 1;
+            fprintf(stderr, "[gguf] MTP head %s: %d tensors\n", mtp_path, g_gg_mtp.n_tensors);
+        }
         if (getenv("GGUF_CHECK")) {
             /* everything the engine would load, checked against the header alone */
             g_gguf = 1; g_gguf_dry = 1; g_ssm_a_direct = 1; g_dn_tiled = 1;

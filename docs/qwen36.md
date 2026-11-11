@@ -201,14 +201,21 @@ norms (each stored as 1 + w, as the trunk's are). `Q36_MTP=1` reads it from the
 file the container links; its MLP is the layer's dense gate, up and down with no
 router and no gate. On the CUDA chain it runs on the card, its matrices placed
 as the trunk's. unsloth's UD-Q3_K_XL and UD-Q4_K_XL files carry the head; their
-UD-IQ2_XXS does not. Measured on the 27B, greedy, thinking off, every text
-identical to plain decoding:
+UD-IQ2_XXS does not. Their Dynamic v3.1 files ship the head apart too, in
+`MTP/mtp-Qwen3.8-27B-Q4_0.gguf` (the same architecture, `block_count` one more,
+the layer's tensors only): `tools/gguf_import.py` links the `mtp-*.gguf` it finds
+beside the model (its folder, the parent, an `MTP/` folder in either; `--mtp`
+names one) when its architecture, its dimensions and its layer match, and the
+engine reads the head's tensors from that file and the rest from the model's.
+Measured on the 27B, greedy, thinking off, every text identical to plain decoding:
 
 | | code | prose |
 |---|---|---|
 | CPU (Ryzen 7 8700GE, UD-Q3_K_XL): plain / one draft / three | 3.27 / 4.99 / 6.02 tok/s | 3.40 / 4.88 / 5.10 tok/s |
 | one draft, drafts accepted | 97.5 % | 80.7 % |
 | RTX PRO 4000 SFF (UD-Q4_K_XL, whole card): plain / two drafts / three | 20.7 / 43.4 / 45.0 tok/s | 20.6 / 30.9 / 30.0 tok/s |
+| RTX PRO 4000 SFF, v3.1 UD-Q4_K_XL (head inside): plain / three drafts | 20.3 / 47.1 tok/s | 20.3 / 31.1 tok/s |
+| RTX PRO 4000 SFF, v3.1 UD-IQ2_XXS with `MTP/mtp-Qwen3.8-27B-Q4_0.gguf`: plain / three drafts | 30.5 / 55.8 tok/s | 30.2 / 41.2 tok/s |
 
 **A verify's rows on the tensor cores.** On the CUDA chain (sm_80 on) a verify of 4 to 8
 rows, and several conversations' decode rows, go to the tensor cores' integer steps
