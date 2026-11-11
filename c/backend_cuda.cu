@@ -1786,6 +1786,15 @@ static inline int bd_mmq_min(const ColiCudaTensor *t) {
     static int v = -2;
     if (v == -2) { const char *e = std::getenv("COLI_CUDA_BD_MMQ"); v = e && *e ? (std::atoi(e) > 0 ? std::atoi(e) : 0) : -1; }
     if (v >= 0) return v;
+    const int ty = t->fmt - 100;
+    /* the grid types (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S): the GEMV takes 4 rows a block, so from
+     * 5 rows it reads the weights twice; at 4 the tensor cores win only on long rows. Q2_K, Q3_K, IQ1_S: from 4.
+     * An RTX PRO 4000, us at 4 and 5 rows, GEMV / bd_mmg_k: IQ2_XXS 5120 x 17408 130 / 135, 180 / 140;
+     * 17408 x 5120 155 / 137; 6144 x 5120 50.4 / 50.5, 64 / 52; Q3_K 6144 x 5120 69 / 67, 104 / 69;
+     * the lm_head, Q3_K 5120 x 248320, 3166 / 3068, 5296 / 3150; IQ1_S (its grid in shared memory) from 4 on every
+     * shape, 5120 x 17408 143 / 128, 202 / 133 */
+    if (ty == 10 || ty == 11 || ty == 19) return 4;
+    if (ty >= 16 && ty <= 22) return t->I >= 16384 ? 4 : 5;
     const int big = t->I > t->O ? t->I : t->O;
     if (t->I >= 16384 || (t->O >= 16384 && (size_t)t->I * t->O < ((size_t)1 << 28))) return 4;
     return big >= 8192 ? 5 : 6;
@@ -1814,7 +1823,7 @@ static int bd_tensor_gemv(DeviceContext *ctx, ColiCudaTensor *t, float *y, const
     /* a verify's rows and several conversations' (bd_mmq_min to BD_MMQ_MAX_S): the tensor cores'
      * integer steps (bd_mmg_k), each row the GEMV's bits */
     if (!exact && bd_mmq_takes(ctx, t, S) &&
-        bd_mmg_launch(y, x, (const bd_u32 *)t->weights, t->fmt, t->I, t->O, t->row_words, S, st))
+        bd_mmg_launch(y, x, (const bd_u32 *)t->weights, t->fmt, t->I, t->O, t->row_words, S, st, tab))
         return cuda_ok(cudaGetLastError(), "block mmq launch");
 #endif
     if (!exact && S > BD_GEMV_MAX_S && bd_tensor_gemm(ctx, t, y, x, S, st)) return 1;

@@ -234,6 +234,19 @@ tok/s; the MTP and the two-conversation runs alternated with the GEMV alone,
 | three MTP drafts (whole vocabulary): code / prose / list | 40.5 / 33.4 / 35.7 | 42.8 / 33.4 / 35.9 |
 | `--kv-slots 8`, 2 / 8 conversations at once, together | 36.4 / 60.4 | 36.3 / 86.5 |
 
+The grid types (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S) and Q2_K and Q3_K take the same
+steps: each step's weights decoded from the grids (in shared memory) and signs as the GEMV
+decodes them, IQ1_S's and Q3_K's offsets folded into the weights (8 times the grid plus the
+delta's sign, the code less 4) so the integer dots are the GEMV's, and the GEMV's float update
+written out (`bdi_upd_*`) on both. unsloth's v3.1 UD-IQ2_XXS mixes all of them (its lm_head
+Q3_K). A verify of 4 rows went from 1.75 to 1.61 decode steps, of 8 from about 2.9 to 2.0;
+code / prose / list, tok/s, every text plain decoding's:
+
+| UD-IQ2_XXS v3.1 | GEMV | tensor cores |
+|---|---|---|
+| MTP, 3 drafts | 56.8 / 41.2 / 45.4 | 60.7 / 40.6 / 46.5 |
+| DFlash2 (`COLI_DFLASH`) | 54.4 / 36.8 / 38.7 | 65.2 / 38.9 / 40.7 |
+
 **Several conversations drafting (`--kv-slots` with `Q36_MTP=1`).** On the CUDA chain each
 conversation keeps an MTP head state of its own (its KV cache on the card, swapped as the
 trunk's), and a step's rows verify the greedy conversations' drafts as one conversation's

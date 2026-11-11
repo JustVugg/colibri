@@ -588,7 +588,7 @@ static void check_mmq(int t, int I, int O) {
         const int S = Ss[k];
         for (int rep = 0; rep < 2 && ok; rep++) {   /* twice: the scratch reused */
             cudaMemset(yd, 0, (size_t)SM * O * 4);
-            int okl = bd_mmg_launch(yd, xd, wd, fmt, I, O, rw, S, 0) && cudaDeviceSynchronize() == cudaSuccess;
+            int okl = bd_mmg_launch(yd, xd, wd, fmt, I, O, rw, S, 0, g_tab) && cudaDeviceSynchronize() == cudaSuccess;
             cudaMemcpy(got, yd, (size_t)S * O * 4, cudaMemcpyDeviceToHost);
             if (!okl || memcmp(got, one, (size_t)S * O * 4)) {
                 printf("FAIL %s [%d x %d]: %d rows on the tensor cores differ from the GEMV's rows alone (%s)\n", ref_name(t), O, I, S,
@@ -602,19 +602,19 @@ static void check_mmq(int t, int I, int O) {
          * codes' bits (the word is the caller's promise); without the word quantized again, the new x's
          * rows' bits; with it but another row count, quantized again as well */
         const int S = 7;
-        int okl = bd_mmg_launch(yd, xd, wd, fmt, I, O, rw, S, 0) && cudaDeviceSynchronize() == cudaSuccess;
+        int okl = bd_mmg_launch(yd, xd, wd, fmt, I, O, rw, S, 0, g_tab) && cudaDeviceSynchronize() == cudaSuccess;
         cudaMemcpy(xd, x2, (size_t)SM * I * 4, cudaMemcpyHostToDevice);
         cudaMemset(yd, 0, (size_t)SM * O * 4);
         g_bd_x_same = 1;
-        okl = okl && bd_mmg_launch(yd, xd, wd, fmt, I, O, rw, S, 0) && cudaDeviceSynchronize() == cudaSuccess;
+        okl = okl && bd_mmg_launch(yd, xd, wd, fmt, I, O, rw, S, 0, g_tab) && cudaDeviceSynchronize() == cudaSuccess;
         g_bd_x_same = 0;
         cudaMemcpy(got, yd, (size_t)S * O * 4, cudaMemcpyDeviceToHost);
         if (!okl || memcmp(got, one, (size_t)S * O * 4)) { printf("FAIL %s [%d x %d]: x's quantization not kept\n", ref_name(t), O, I); fails++; ok = 0; }
-        okl = bd_mmg_launch(yd, xd, wd, fmt, I, O, rw, S, 0) && cudaDeviceSynchronize() == cudaSuccess;
+        okl = bd_mmg_launch(yd, xd, wd, fmt, I, O, rw, S, 0, g_tab) && cudaDeviceSynchronize() == cudaSuccess;
         cudaMemcpy(got, yd, (size_t)S * O * 4, cudaMemcpyDeviceToHost);
         if (!okl || memcmp(got, two, (size_t)S * O * 4)) { printf("FAIL %s [%d x %d]: another x at the same address, not quantized again\n", ref_name(t), O, I); fails++; ok = 0; }
         g_bd_x_same = 1;
-        okl = bd_mmg_launch(yd, xd, wd, fmt, I, O, rw, 7, 0) && bd_mmg_launch(yd, xd, wd, fmt, I, O, rw, 4, 0) && cudaDeviceSynchronize() == cudaSuccess;
+        okl = bd_mmg_launch(yd, xd, wd, fmt, I, O, rw, 7, 0, g_tab) && bd_mmg_launch(yd, xd, wd, fmt, I, O, rw, 4, 0, g_tab) && cudaDeviceSynchronize() == cudaSuccess;
         g_bd_x_same = 0;
         cudaMemcpy(got, yd, (size_t)4 * O * 4, cudaMemcpyDeviceToHost);
         if (!okl || memcmp(got, two, (size_t)4 * O * 4)) { printf("FAIL %s [%d x %d]: the word with another row count, other bits\n", ref_name(t), O, I); fails++; ok = 0; }
@@ -728,7 +728,7 @@ int main(void) {
         if (major >= 8) {
             /* the GEMV's 16, 32, 32 and 8 classes (1, 4, 4 and 1 warps a block), part tiles of 16 outputs */
             const int mshape[][2] = {{2048, 300}, {5120, 1000}, {17408, 40}, {1024, 8200}};
-            for (int t : {8, 12, 13, 14, 20, 23}) for (auto &sh : mshape) check_mmq(t, sh[0], sh[1]);
+            for (int t : {8, 12, 13, 14, 20, 23, 10, 11, 16, 17, 18, 19, 21, 22}) for (auto &sh : mshape) check_mmq(t, sh[0], sh[1]);
             printf("mmq: %d types and shapes, 1 to 8 rows on the tensor cores, each the bits of the GEMV's row alone\n", g_mmq);
             check_xq_forget();
         } else printf("mmq: SKIP (compute capability %d, the tensor cores' integer steps need 8)\n", major);
