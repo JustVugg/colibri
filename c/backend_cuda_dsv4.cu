@@ -402,6 +402,16 @@ __global__ void fp8_sim(float *x,int rows,int n){int row=blockIdx.x/((n+127)/128
     for(int k=64;k;k>>=1){if(threadIdx.x<k&&mx[threadIdx.x+k]>mx[threadIdx.x])mx[threadIdx.x]=mx[threadIdx.x+k];__syncthreads();}
     if(i<n){float m=fmaxf(mx[0],1e-4f),raw=m/448.f;int e;frexpf(raw,&e);float scale=ldexpf(1.f,e-1);if(scale<raw)scale*=2.f;
         float q=fmaxf(-448.f,fminf(448.f,x[(long long)row*n+i]/scale));x[(long long)row*n+i]=__bfloat162float(__float2bfloat16(e4m3_round(q)*scale));}}
+/* The input of a 128-block fp8 matvec is rounded to e4m3 per 128 first: coli_fp8_matvec_ref
+ * does it on the CPU (coli_fp8_activation_qdq_ref) and the fused kernels run fp8_sim, but
+ * the engine hands the generic calls below the raw activation. act_quant_input rounds the
+ * device copy in place, rows of n (idempotent). DSV4_CUDA_ACT_QUANT=0 keeps the raw input,
+ * the behaviour before. The flag is a C++11 static, read once and thread-safe. */
+static bool act_quant_wanted(const Dsv4CudaTensor*t){
+    static const bool on=[]{const char*e=getenv("DSV4_CUDA_ACT_QUANT");return !e||!*e||atoi(e)!=0;}();
+    return on&&(t->fmt==8||t->fmt==9);}
+static void act_quant_input(const Dsv4CudaTensor*t,float*x,int rows,int n,cudaStream_t s){
+    if(act_quant_wanted(t))fp8_sim<<<rows*((n+127)/128),128,0,s>>>(x,rows,n);}
 __global__ void fp8_sim64(float *x,int n){int i=blockIdx.x*64+threadIdx.x;__shared__ float mx[64];float v=i<n?fabsf(x[i]):0;mx[threadIdx.x]=v;__syncthreads();
     for(int k=32;k;k>>=1){if(threadIdx.x<k&&mx[threadIdx.x+k]>mx[threadIdx.x])mx[threadIdx.x]=mx[threadIdx.x+k];__syncthreads();}if(i<n){float m=fmaxf(mx[0],1e-4f),raw=m/448.f;int e;frexpf(raw,&e);float scale=ldexpf(1.f,e-1);uint8_t q=__nv_cvt_float_to_fp8(fmaxf(-448.f,fminf(448.f,x[i]/scale)),__NV_SATFINITE,__NV_E4M3);x[i]=__bfloat162float(__float2bfloat16(e4m3(q)*scale));}}
 /* Batched router (generic CUDA; used by both builds). */
@@ -2453,6 +2463,7 @@ extern "C" int dsv4_cuda_matvec_grouped(Dsv4CudaTensor *t,float *y,const float*x
     if(t->fmt!=4&&t->fmt!=8&&t->fmt!=9&&t->fmt!=16&&t->fmt!=32)return 0;
     if(!buf((void**)&c->dx,&c->xcap,xb)||!buf((void**)&c->dy,&c->ycap,yb))return 0;
     if(!ok(cudaMemcpyAsync(c->dx,x,xb,cudaMemcpyHostToDevice,c->stream),"activation upload"))return 0;
+    act_quant_input(t,c->dx,groups,t->I,c->stream);   /* per group, as the CPU's group views */
     if(t->fmt==8)run_mv<8>((uint8_t*)t->w,t->scale,c->dx,c->dy,t->O,t->I,groups,c->stream);
     else if(t->fmt==9)run_mv<9>((uint8_t*)t->w,t->scale,c->dx,c->dy,t->O,t->I,groups,c->stream);
     else if(t->fmt==4)run_mv<4>((uint8_t*)t->w,t->scale,c->dx,c->dy,t->O,t->I,groups,c->stream);
@@ -2469,9 +2480,11 @@ extern "C" int dsv4_cuda_wo_decode(Dsv4CudaTensor *wa,Dsv4CudaTensor *wb,int gro
        !buf((void**)&c->dy,&c->ycap,hb))return 0;
     int success=ok(cudaMemcpyAsync(c->dx,context,cb,cudaMemcpyHostToDevice,c->stream),"decode output upload");
     if(success){
+        act_quant_input(wa,c->dx,groups,wa->I,c->stream);
         if(wa->fmt==9)run_mv<9>((uint8_t*)wa->w,wa->scale,c->dx,c->p1,wa->O,wa->I,groups,c->stream);
         else run_mv<8>((uint8_t*)wa->w,wa->scale,c->dx,c->p1,wa->O,wa->I,groups,c->stream);
         bf16_round<<<(wa->O+255)/256,256,0,c->stream>>>(c->p1,wa->O);
+        act_quant_input(wb,c->p1,1,wa->O,c->stream);
         run_mv<8>((uint8_t*)wb->w,wb->scale,c->p1,c->dy,wb->O,wb->I,1,c->stream);
         bf16_round<<<(wb->O+255)/256,256,0,c->stream>>>(c->dy,wb->O);
         success=ok(cudaGetLastError(),"decode output launch")&&
@@ -2509,6 +2522,7 @@ extern "C" int dsv4_cuda_proj_batch(int n,Dsv4CudaTensor*const*t,const int*rows,
     float *out=pj_out[gi];
     if(!buf((void**)&c->dx,&c->xcap,(size_t)I*sizeof(float)))return 0;
     int good=ok(cudaMemcpyAsync(c->dx,x,(size_t)I*sizeof(float),cudaMemcpyHostToDevice,c->stream),"proj batch upload");
+    if(good)act_quant_input(t[0],c->dx,1,I,c->stream);   /* all fp8 (checked above): one rounding for every tensor */
     size_t off=0;
     for(int i=0;good&&i<n;i++){
         run_mv<8>((uint8_t*)t[i]->w,t[i]->scale,c->dx,out+off,t[i]->O,I,1,c->stream);
@@ -2534,7 +2548,12 @@ extern "C" int dsv4_cuda_matmul_batch(Dsv4CudaTensor*t,const Dsv4CudaActivation*
     return dg_dense_batch_dispatch(c,t,input->data,output->data,tokens);
 #else
     if(t->fmt!=8&&t->fmt!=9&&t->fmt!=4)return 0;
-    run_mm_batch(t,input->data,output->data,tokens,c->stream);
+    const float*x=input->data;
+    if(act_quant_wanted(t)){   /* rounded in a copy: the caller's activation stays raw */
+        size_t xb=(size_t)tokens*t->I*sizeof(float);
+        if(!buf((void**)&c->dx,&c->xcap,xb)||!ok(cudaMemcpyAsync(c->dx,x,xb,cudaMemcpyDeviceToDevice,c->stream),"batched dense input copy"))return 0;
+        act_quant_input(t,c->dx,tokens,t->I,c->stream);x=c->dx;}
+    run_mm_batch(t,x,output->data,tokens,c->stream);
     return ok(cudaGetLastError(),"batched dense launch");
 #endif
 }
