@@ -50,7 +50,7 @@ def blocks(name, shape, rng, std=0.02):
     return raw.reshape(*shape[:-1], nb * size)
 
 
-def write_model(path, rng, dense=False, same_gate_up=False, token=None, ollama=False, dn_types=None):
+def write_model(path, rng, dense=False, same_gate_up=False, token=None, ollama=False, dn_types=None, mtp=False):
     """dense: llama.cpp's qwen35 (a dense model of the family): an MLP per layer instead of the
     experts, and no output.weight (the head tied to token_embd), as the small checkpoints ship.
     same_gate_up: every layer's expert up in its gate's type (layer 0 IQ2_XXS, the others
@@ -61,13 +61,18 @@ def write_model(path, rng, dense=False, same_gate_up=False, token=None, ollama=F
     shared expert's gate as F16 of shape [H, 1], and the MTP head (mtp.*) and the vision tower
     (v.*) in the model's file. The same weights as without.
     dn_types: {layer: (qkv's type, the gate's)} for DeltaNet layers, Q8_0 for both elsewhere: a
-    layer of two types is how unsloth's dynamic mixes ship about half of Qwen3.8-27B's."""
+    layer of two types is how unsloth's dynamic mixes ship about half of Qwen3.8-27B's.
+    mtp (dense): the checkpoint's MTP head as llama.cpp writes it, one more layer (blk.LAYERS) with
+    nextn_predict_layers 1: a full-attention layer with its MLP, nextn.eh_proj and the nextn
+    norms, in the types unsloth's Qwen3.8-27B files give them (norms stored as 1 + w)."""
     arch = "qwen35" if dense else "qwen35moe"
     w = gguf.GGUFWriter(str(path), arch)
     p = arch + "."
     moe = (("feed_forward_length", I),) if dense else \
         (("expert_count", E), ("expert_used_count", TOPK), ("expert_feed_forward_length", I), ("expert_shared_feed_forward_length", I))
-    for k, v in (("block_count", LAYERS), ("embedding_length", H), ("attention.head_count", QH),
+    if mtp:
+        w.add_uint32(p + "nextn_predict_layers", 1)
+    for k, v in (("block_count", LAYERS + (1 if mtp else 0)), ("embedding_length", H), ("attention.head_count", QH),
                  *(() if ollama else (("attention.head_count_kv", KVH),)), ("attention.key_length", HD), ("attention.value_length", HD),
                  *moe, ("full_attention_interval", 4),
                  ("rope.dimension_count", HD // 4), ("ssm.conv_kernel", 4), ("ssm.state_size", KD),
@@ -123,6 +128,16 @@ def write_model(path, rng, dense=False, same_gate_up=False, token=None, ollama=F
             f32(b + "ssm_conv1d.weight", (conv, 4)); w.add_tensor(b + ("ssm_dt" if ollama else "ssm_dt.bias"), np.zeros(VH, np.float32))
             w.add_tensor(b + "ssm_norm.weight", np.ones(KD, np.float32))
             q(b + "ssm_out.weight", (H, VH * KD), "Q8_0")
+    if mtp:   # llama.cpp's nextn layer
+        b = f"blk.{LAYERS}."
+        def norm(name, n): w.add_tensor(name, (1 + rng.standard_normal(n) * 0.1).astype(np.float32))
+        norm(b + "attn_norm.weight", H); norm(b + "post_attention_norm.weight", H)
+        norm(b + "attn_q_norm.weight", HD); norm(b + "attn_k_norm.weight", HD)
+        q(b + "attn_q.weight", (QH * HD * 2, H), "Q6_K"); q(b + "attn_k.weight", (KVH * HD, H), "Q8_0")
+        q(b + "attn_v.weight", (KVH * HD, H), "Q8_0"); q(b + "attn_output.weight", (H, QH * HD), "Q6_K")
+        q(b + "ffn_gate.weight", (I, H), "Q6_K"); q(b + "ffn_up.weight", (I, H), "Q6_K"); q(b + "ffn_down.weight", (H, I), "Q6_K")
+        q(b + "nextn.eh_proj.weight", (H, 2 * H), "Q6_K")
+        norm(b + "nextn.enorm.weight", H); norm(b + "nextn.hnorm.weight", H); norm(b + "nextn.shared_head_norm.weight", H)
     if ollama:   # the MTP head and the vision tower, in the model's file
         f32("mtp.fc.weight", (H, 2 * H)); f32("mtp.layers.0.attn_norm.weight", (H,)); f32("mtp.layers.0.ffn_gate_inp.weight", (E, H))
         f32("v.blk.0.attn_q.weight", (H, H)); f32("v.blk.0.attn_q.bias", (H,)); f32("v.patch_embd.weight", (H, 3, 2, 2))

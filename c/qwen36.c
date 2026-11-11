@@ -2886,7 +2886,21 @@ static float *load_t_affine(Model *m, const char *wname, int64_t want) {
  * already refuses a wrong size; this is the same discipline for the dense set. */
 /* GGUF mode: the llama.cpp name of a converter-named tensor (qwen35moe, qwen35).
  * NULL for a name the arch does not have. */
+/* The MTP head's layer in a GGUF (llama.cpp's nextn layer, blk.<n_layers>); -1 without one */
+static int g_gg_mtp_layer = -1;
 static const char *gg_name(const char *hf, char *out, size_t cap) {
+    /* the MTP head: llama.cpp writes it as one more layer, its own tensors under nextn. */
+    static const struct { const char *hf, *gg; } mtp[] = {
+        { "mtp.fc.weight", "nextn.eh_proj.weight" },
+        { "mtp.pre_fc_norm_embedding.weight", "nextn.enorm.weight" },
+        { "mtp.pre_fc_norm_hidden.weight", "nextn.hnorm.weight" },
+        { "mtp.norm.weight", "nextn.shared_head_norm.weight" },
+    };
+    if (!strncmp(hf, "mtp.", 4)) {
+        if (g_gg_mtp_layer < 0) return NULL;
+        for (size_t i = 0; i < sizeof mtp / sizeof *mtp; i++)
+            if (!strcmp(hf, mtp[i].hf)) { snprintf(out, cap, "blk.%d.%s", g_gg_mtp_layer, mtp[i].gg); return out; }
+    }
     static const struct { const char *hf, *gg; } glob[] = {
         { "model.embed_tokens.weight", "token_embd.weight" },
         { "lm_head.weight", "output.weight" },
@@ -2940,7 +2954,8 @@ static const char *gg_name(const char *hf, char *out, size_t cap) {
         { "post_operator_norm.weight", "post_attention_norm.weight" },
     };
     int L = -1, off = 0;
-    if (sscanf(hf, "model.layers.%d.%n", &L, &off) != 1 || L < 0 || !off) return NULL;
+    if (!strncmp(hf, "mtp.layers.0.", 13)) { L = g_gg_mtp_layer; off = 13; }   /* the head's decoder layer */
+    else if (sscanf(hf, "model.layers.%d.%n", &L, &off) != 1 || L < 0 || !off) return NULL;
     if (g_gguf_plain && !strcmp(hf + off, "post_attention_layernorm.weight")) { snprintf(out, cap, "blk.%d.ffn_norm.weight", L); return out; }
     for (size_t i = 0; i < sizeof lay / sizeof *lay; i++)
         if (!strcmp(hf + off, lay[i].hf)) { snprintf(out, cap, "blk.%d.%s", L, lay[i].gg); return out; }
@@ -3694,6 +3709,7 @@ static void gguf_load_cfg(Cfg *c) {
     memset(c, 0, sizeof *c);
     int n_mtp = (int)gguf_get_int(g, GK("nextn_predict_layers"), 0);
     c->n_layers = (int)gguf_get_int(g, GK("block_count"), 0) - n_mtp;
+    g_gg_mtp_layer = n_mtp > 0 ? c->n_layers : -1;   /* the head (Q36_MTP=1) reads blk.<n_layers> */
     c->hidden   = (int)gguf_get_int(g, GK("embedding_length"), 0);
     c->q_heads  = (int)gguf_get_int(g, GK("attention.head_count"), 0);
     c->kv_heads = (int)gguf_get_int(g, GK("attention.head_count_kv"), 0);

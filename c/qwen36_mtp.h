@@ -60,31 +60,10 @@ static void q36_mtp_expert_qw(QW *w, const int8_t *q, const float *sc,
         w->w = f;
     }
 }
-static int q36_mtp_load(Model *m) {
+/* A MoE head's router, its shared expert's gate and its routed experts, as the container keeps them */
+static void q36_mtp_load_experts(Model *m) {
     Cfg *c = &m->c; Q36Mtp *p = &g_q36_mtp;
-    int D = c->hidden, E = c->n_experts, I = c->inter, Ish = c->shared_inter;
-    if (!st_find(&m->S, "mtp.fc.weight")) return 0;
-    if (E <= 0 || E > 1024 || c->topk > 16 || Ish <= 0) {
-        fprintf(stderr, "[mtp] head requires a MoE model with shared expert\n"); return 0;
-    }
-    p->E = E; p->K = c->topk; p->I = I; p->ish = Ish;
-#define MN(field, name, n) p->field = load_norm_n(m, "mtp." name ".weight", n)
-    MN(enorm, "pre_fc_norm_embedding", D); MN(hnorm, "pre_fc_norm_hidden", D);
-    MN(head_norm, "norm", D); MN(L.in_ln, "layers.0.input_layernorm", D);
-    MN(L.post_ln, "layers.0.post_attention_layernorm", D);
-    MN(L.qn, "layers.0.self_attn.q_norm", c->head_dim);
-    MN(L.kn, "layers.0.self_attn.k_norm", c->k_head_dim);
-#undef MN
-#define MW(field, name, ni, no) load_tq(m, "mtp." name ".weight", ni, no, 1, "mtp", &p->field)
-    MW(eh, "fc", 2 * D, D);
-    MW(L.q, "layers.0.self_attn.q_proj", D, c->q_heads * c->q_head_dim);
-    MW(L.k, "layers.0.self_attn.k_proj", D, c->kv_heads * c->k_head_dim);
-    MW(L.v, "layers.0.self_attn.v_proj", D, c->kv_heads * c->v_head_dim);
-    MW(L.o, "layers.0.self_attn.o_proj", c->q_heads * c->head_dim, D);
-    MW(sh_g, "layers.0.mlp.shared_expert.gate_proj", D, Ish);
-    MW(sh_u, "layers.0.mlp.shared_expert.up_proj", D, Ish);
-    MW(sh_d, "layers.0.mlp.shared_expert.down_proj", Ish, D);
-#undef MW
+    int D = c->hidden, E = p->E, I = p->I;
     p->router = load_t_n(m, "mtp.layers.0.mlp.gate.weight", (int64_t)E * D);
     p->sh_gate = load_t_n(m, "mtp.layers.0.mlp.shared_expert_gate.weight", D);
     p->eg = calloc(E, sizeof(QW)); p->eu = calloc(E, sizeof(QW)); p->ed = calloc(E, sizeof(QW));
@@ -112,7 +91,45 @@ static int q36_mtp_load(Model *m) {
         q36_mtp_expert_qw(&p->ed[e], q+2*n, sc+2*ns, I, D, mixed ? g_expert_down_gs : g_expert_gs, packed);
         free(q); free(raw); free(sc);
     }
+}
+static int q36_mtp_load(Model *m) {
+    Cfg *c = &m->c; Q36Mtp *p = &g_q36_mtp;
+    int D = c->hidden, E = c->n_experts, I = c->inter, Ish = c->shared_inter;
+    if (!mt_has(m, "mtp.fc.weight")) return 0;
+    /* a dense model's head (Qwen3.8-27B): its layer's MLP, no router and no gate (the engine
+     * holds the model's own MLP the same way, a shared expert shared_inter wide) */
+    const int dense = E <= 0 && Ish > 0 && mt_has(m, "mtp.layers.0.mlp.gate_proj.weight");
+    if (!dense && (E <= 0 || E > 1024 || c->topk > 16 || Ish <= 0)) {
+        fprintf(stderr, "[mtp] head requires a MoE model with shared expert, or a dense model's MLP\n"); return 0;
+    }
+    if (dense) E = I = 0;
+    p->E = E; p->K = dense ? 0 : c->topk; p->I = I; p->ish = Ish;
+#define MN(field, name, n) p->field = load_norm_n(m, "mtp." name ".weight", n)
+    MN(enorm, "pre_fc_norm_embedding", D); MN(hnorm, "pre_fc_norm_hidden", D);
+    MN(head_norm, "norm", D); MN(L.in_ln, "layers.0.input_layernorm", D);
+    MN(L.post_ln, "layers.0.post_attention_layernorm", D);
+    MN(L.qn, "layers.0.self_attn.q_norm", c->head_dim);
+    MN(L.kn, "layers.0.self_attn.k_norm", c->k_head_dim);
+#undef MN
+#define MW(field, name, ni, no) load_tq(m, "mtp." name ".weight", ni, no, 1, "mtp", &p->field)
+    MW(eh, "fc", 2 * D, D);
+    MW(L.q, "layers.0.self_attn.q_proj", D, c->q_heads * c->q_head_dim);
+    MW(L.k, "layers.0.self_attn.k_proj", D, c->kv_heads * c->k_head_dim);
+    MW(L.v, "layers.0.self_attn.v_proj", D, c->kv_heads * c->v_head_dim);
+    MW(L.o, "layers.0.self_attn.o_proj", c->q_heads * c->head_dim, D);
+    if (dense) {
+        MW(sh_g, "layers.0.mlp.gate_proj", D, Ish);
+        MW(sh_u, "layers.0.mlp.up_proj", D, Ish);
+        MW(sh_d, "layers.0.mlp.down_proj", Ish, D);
+    } else {
+        MW(sh_g, "layers.0.mlp.shared_expert.gate_proj", D, Ish);
+        MW(sh_u, "layers.0.mlp.shared_expert.up_proj", D, Ish);
+        MW(sh_d, "layers.0.mlp.shared_expert.down_proj", Ish, D);
+    }
+#undef MW
+    if (!dense) q36_mtp_load_experts(m);
     const char *file = getenv("Q36_MTP_VOCAB_IDS");
+    if (file && *file && g_gguf) { fprintf(stderr, "Q36_MTP_VOCAB_IDS reads a safetensors lm_head, which a GGUF does not have\n"); exit(1); }
     if (file && *file) {
         FILE *f = fopen(file, "r");
         if (!f) { fprintf(stderr, "cannot read Q36_MTP_VOCAB_IDS %s\n", file); exit(1); }
@@ -201,7 +218,8 @@ static int q36_mtp_load(Model *m) {
         }
     }
     p->pend = falloc(D); p->on = 1;
-    fprintf(stderr, "[mtp] Qwen3.6 checkpoint head: %d experts\n", E);
+    if (dense) fprintf(stderr, "[mtp] the checkpoint's head: a dense MLP %d wide\n", Ish);
+    else fprintf(stderr, "[mtp] Qwen3.6 checkpoint head: %d experts\n", E);
     return 1;
 }
 
@@ -253,6 +271,14 @@ static void q36_mtp_route(float *l, int E, int K, int *idx, float *val) {
  * a prompt's rows grouped per expert, so its catch-up is a few batched matmuls */
 static void q36_mtp_moe(const float *x, int R, int D, float *out) {
     Q36Mtp *p = &g_q36_mtp; int E = p->E, K = p->K, I = p->I, Ish = p->ish;
+    if (!E) {   /* a dense model's head: its MLP, no router and no gate */
+        float *g = falloc((int64_t)R * Ish), *u = falloc((int64_t)R * Ish);
+        matmul_d(g, x, &p->sh_g, R, D, Ish); matmul_d(u, x, &p->sh_u, R, D, Ish);
+        for (int64_t i = 0; i < (int64_t)R * Ish; i++) g[i] = g[i] / (1.f + expf(-g[i])) * u[i];
+        matmul_d(out, g, &p->sh_d, R, Ish, D);
+        free(g); free(u);
+        return;
+    }
     int *idx = malloc(sizeof(int) * (size_t)R * K); float *val = falloc((int64_t)R * K), *lg = falloc((int64_t)R * E);
     /* the router's logits: every (row, expert) dot apart */
     #pragma omp parallel for schedule(static)
@@ -373,7 +399,8 @@ static int q36_mg_init(Model *m) {
     if (g->on) return 1;
     if (g->failed) return 0;
     const char *e = getenv("Q36_MTP_GPU");
-    if ((e && *e == '0') || !g_vk_chain || !vkc_ready() || m->mpos || m->rope_delta) { g->failed = 1; return 0; }
+    /* a dense model's head (no experts) runs on the CPU beside the Vulkan chain */
+    if ((e && *e == '0') || !g_vk_chain || !vkc_ready() || m->mpos || m->rope_delta || !p->E) { g->failed = 1; return 0; }
     int D = c->hidden, E = p->E, K = p->K, I = p->I, Ish = p->ish, hd = c->head_dim, kvd = c->k_head_dim;
     /* the norms' weights, one arena */
     size_t n = 0;
