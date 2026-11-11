@@ -7066,8 +7066,12 @@ static int q36_seq_alloc(Model *m, Q36Seq *q) {
  * projections, the routed experts and lm_head run once over the S rows; the
  * attention and DeltaNet read and write each row's own conversation (m->mux_rows).
  * The CPU kernels give a row the same bits whatever S is, so each conversation gets
- * the logits it would alone. Decode rows are never an image's. S rows of logits. */
-static float *q36_step_rows(Model *m, const Q36Row *rows, const int *ids, int S) {
+ * the logits it would alone. Decode rows are never an image's. S rows of logits.
+ * snap (NULL or S slots, -1 none): a verify's rows on the CUDA chain, row s's DeltaNet state copied
+ * to snapshot slot snap[s] for its conversation's rollback (q36cc_mux_rollback); NULL back when the
+ * chain did not take them (the caller runs the step again without drafts). hid (NULL or S rows of
+ * D): the rows' outputs after the final norm, the MTP head's. */
+static float *q36_step_rows(Model *m, const Q36Row *rows, const int *ids, int S, const int *snap, float *hid) {
     Cfg *c = &m->c; int D = c->hidden;
     if (g_pilot && m->token_count > 0) {
         pthread_mutex_lock(&g_pilot_mx);
@@ -7095,7 +7099,11 @@ static float *q36_step_rows(Model *m, const Q36Row *rows, const int *ids, int S)
 #ifdef COLI_CUDA
     if (!chain_logit && g_cuda_chain) {   /* the same on the CUDA chain */
         chain_logit = falloc((int64_t)S * c->vocab);
-        if (!q36cc_mux_step(m, rows, S, x, chain_logit)) { free(chain_logit); chain_logit = NULL; q36cc_mux_host(m, rows, S, 0); }
+        if (!q36cc_mux_step(m, rows, S, x, chain_logit, snap, hid != NULL)) {
+            free(chain_logit); chain_logit = NULL;
+            if (snap) { free(x); return NULL; }   /* nothing ran: the caller's step again, without its drafts */
+            q36cc_mux_host(m, rows, S, 0);
+        }
     }
 #endif
     if (!chain_logit) {
@@ -7114,6 +7122,9 @@ static float *q36_step_rows(Model *m, const Q36Row *rows, const int *ids, int S)
         kv_prefix_record(&q->kvp, ids + s, rows[s].pos, 1);
         q->kv_len = rows[s].pos + 1;
     }
+    if (hid)
+        #pragma omp parallel for schedule(static) if(S > 8)
+        for (int s = 0; s < S; s++) rmsnorm_row(hid + (int64_t)s * D, x + (int64_t)s * D, m->final_norm, D, c->eps);
     m->token_count += S; m->freq_token_count += S;
     if (!m->hot_pinned && m->hot_n > 0 && m->freq_token_count >= m->warmup_tokens) pin_hot_experts(m);
     if (chain_logit) {   /* the chain ran the final norm and lm_head */
@@ -9302,9 +9313,11 @@ static int q36_clef_test_modes(Model *m){
  * that slot's state: its prefix reuse and pins work as a lone serve's. Then every
  * step picks the next token of each active request and runs one forward over a row
  * of each (q36_step_rows): the matrices and the experts are read once for all of
- * them. A request's frames are a lone request's; they interleave by id. Nothing
- * drafts (speculation follows one conversation). STOP finishes with DONE; CANCEL
- * ends with ERROR CANCELLED, as in serve_one. A Clef DECIDE runs at once on its slot. */
+ * them. A request's frames are a lone request's; they interleave by id. With the MTP head
+ * on the CUDA chain's card, the greedy conversations draft within a budget of rows a step
+ * (q36_mux_budget); a step's rows verify them as one conversation's verify does, each row a
+ * decode step's bits, so every conversation's text is its plain decoding's. STOP finishes with
+ * DONE; CANCEL ends with ERROR CANCELLED, as in serve_one. A Clef DECIDE runs at once on its slot. */
 static Q36Seq *g_q36_mux_seq;   /* [slots]: the conversations the Model does not hold */
 static int g_q36_mux_cur;       /* the slot the Model holds, -1 when every one is parked */
 
@@ -9315,9 +9328,17 @@ typedef struct {
     float *lo;                  /* the logits the next pick reads */
     Q36ReqClock clk;
     unsigned char sbuf[16]; int sbn;
+    /* the last step's drafts (q36_mux_settle): d[0..dn) fed after tok0 at pos0, their rows' logits
+     * in ahead, acc of them accepted (picked from those logits next, before the next row's token) */
+    int d[Q36_SPEC_ROWS], dn, acc, tok0, pos0, snap0;
+    float *ahead;
+    unsigned long long drafts, accepted;
 } Q36MuxReq;
 
 static void q36_mux_bind(Model *m, int slot){
+#ifdef COLI_CUDA
+    if (slot >= 0 && g_q36_mcv) q36_mtp_conv_bind(m, slot);   /* the MTP head's state follows the conversation */
+#endif
     if (g_q36_mux_cur == slot) return;
     /* the chains' device state is the held conversation's: its DeltaNet state to the
      * host before it leaves, nothing on the device the next one's */
@@ -9352,6 +9373,7 @@ static int q36_mux_alloc(Model *m){
 /* A request's end, as serve_one ends one. */
 static void q36_mux_finish(Model *m, Q36MuxReq *r){
     free(r->lo); r->lo = NULL; free(r->ids); r->ids = NULL; r->active = 0;
+    free(r->ahead); r->ahead = NULL; r->dn = r->acc = 0;
     if (g_q36_mux_cur != r->q.slot) q36_mux_bind(m, r->q.slot);
     /* an image turn's rope positions go with the turn, as q36_vision_detach drops them */
     free(m->mpos); m->mpos = NULL; m->mpos_len = m->rope_delta = 0;
@@ -9393,17 +9415,84 @@ static int q36_mux_pick(Model *m, Q36MuxReq *r, const int *eos_ids, int n_eos, i
         if (cn > 0) serve_data(r->q.id, (char *)chunk, cn);
     }
     r->gen++;
+#ifdef COLI_CUDA
+    if (g_q36_mcv) q36_mtp_vocab_step(tk);   /* the draft vocabulary counts it, as a lone request's */
+#endif
     /* the next logits are not needed after the last requested token (serve_one) */
     if (r->gen >= r->q.max_tok) { q36_mux_finish(m, r); return 0; }
     *tk_out = tk; return 1;
 }
 
+#ifdef COLI_CUDA
+/* The drafts a step's rows verified for request r (mux slot `slot`), right after the step with every
+ * conversation parked: picked as the next tokens will be (greedy: serve_sample's argmax) while they
+ * match, the generation goes on and no end token comes; the rest undone (q36cc_mux_rollback: the state
+ * after the last standing row, the positions past it gone). Then the MTP head reads the standing rows
+ * (hid: the step's rows of r, after the final norm). */
+static void q36_mux_settle(Model *m, Q36MuxReq *r, int slot, const float *hid, const int *eos_ids, int n_eos) {
+    const int V = m->c.vocab;
+    int acc = 0;
+    if (r->dn) {
+        const float *row = r->lo;
+        while (acc < r->dn && !r->stop && !r->cancel && r->gen + acc + 1 < r->q.max_tok) {
+            const int t = serve_sample(row, V, r->q.temp, r->q.top_p);
+            int end = t != r->d[acc];
+            for (int e = 0; e < n_eos && !end; e++) end = t == eos_ids[e];
+            if (end) break;
+            row = r->ahead + (int64_t)acc * V; acc++;
+        }
+        if (acc < r->dn) {
+            Q36Seq *q = &g_q36_mux_seq[slot];
+            const int len = r->pos0 + acc + 1;
+            if (!q36cc_mux_rollback(m, slot, r->snap0 + acc, len)) {
+                fprintf(stderr, "[qwen36] KV_SLOTS: a verify's rejected drafts could not be undone on the device\n");
+                exit(1);
+            }
+            q->kv_len = len;
+            if (q->kvp.len > len) q->kvp.len = len;
+        }
+        r->drafts += (unsigned long long)r->dn; r->accepted += (unsigned long long)acc;
+    }
+    if (hid && q36_mtp_conv_bind(m, slot)) {
+        int ids[Q36_SPEC_ROWS];
+        ids[0] = r->tok0;
+        for (int j = 0; j < acc; j++) ids[j + 1] = r->d[j];
+        q36_mtp_feed_rows(m, ids, acc + 1, r->pos0, hid);
+    }
+    r->acc = acc; r->dn = 0;
+}
+/* Q36_MUX_ROWS (default 8): the rows a step holds, the conversations' own and their drafts. On an RTX
+ * PRO 4000 a step of 8 rows costs 1.2-1.4 decode steps on the tensor cores (bd_mmg_k) and 32 rows 4 to 5,
+ * more than their drafts bring: the drafts share what the conversations leave of 8. */
+static int q36_mux_budget(void) {
+    static int b = -1;
+    if (b < 0) { const char *e = getenv("Q36_MUX_ROWS"); b = e && *e ? atoi(e) : 8; if (b < 1) b = 1; if (b > Q36_SPEC_ROWS) b = Q36_SPEC_ROWS; }
+    return b;
+}
+#endif
+
 static void serve_mux(Model *m){
     int n = g_q36_mux_slots, V = m->c.vocab, input_eof = 0;
     Q36MuxReq *rq = calloc((size_t)n, sizeof *rq);
-    Q36Row *rows = malloc((size_t)n * sizeof *rows);
-    int *tok = malloc((size_t)n * sizeof(int)), *who = malloc((size_t)n * sizeof(int));
-    if (!rq || !rows || !tok || !who) { fprintf(stderr, "[serve] out of memory\n"); exit(1); }
+    const int R = n * Q36_SPEC_ROWS;   /* a step's rows, drafts too */
+    Q36Row *rows = malloc((size_t)R * sizeof *rows);
+    int *tok = malloc((size_t)R * sizeof(int)), *who = malloc((size_t)R * sizeof(int)), *snap = malloc((size_t)R * sizeof(int));
+    float *hid = NULL;
+    if (!rq || !rows || !tok || !who || !snap) { fprintf(stderr, "[serve] out of memory\n"); exit(1); }
+    int mux_drafts = 0;
+#ifdef COLI_CUDA
+    /* the conversations draft with the MTP head on the CUDA chain's card (its state a conversation each) */
+#ifdef COLI_VULKAN
+    const int vk_on = g_vk_chain;
+#else
+    const int vk_on = 0;
+#endif
+    if (g_q36_mtp.on && g_cuda_chain && !vk_on && q36_mtp_conv_init(m, n)) {
+        mux_drafts = 1; hid = falloc((int64_t)R * m->c.hidden);
+        fprintf(stderr, "[qwen36] KV_SLOTS=%d: the greedy conversations draft with the MTP head, %d rows a step at most "
+                        "(Q36_MUX_ROWS)\n", n, q36_mux_budget());
+    }
+#endif
     int eos_ids[Q36_MAX_EOS + 4]; int n_eos = serve_eos_ids(eos_ids, Q36_MAX_EOS + 4);
     unsigned long long steps = 0, nrows = 0;
     fprintf(stderr, "[qwen36] serving %d conversations at once (KV_SLOTS)\n", n);
@@ -9441,6 +9530,9 @@ static void serve_mux(Model *m){
                     free(m->vis_rows); free(m->vis_map); m->vis_rows = NULL; m->vis_map = NULL;
                     m->vis_rows_n = m->vis_map_len = 0;
                     if (ok) { t->active = 1; t->limited = 1; t->forwards = 1; }
+#ifdef COLI_CUDA
+                    if (ok && mux_drafts) q36_mtp_vocab_begin(t->ids, t->np);   /* the draft vocabulary, as a lone request's */
+#endif
                     else { free(m->mpos); m->mpos = NULL; m->mpos_len = m->rope_delta = 0; }
                     free(t->q.payload); t->q.payload = NULL;
                     if (ok) emap_emit(m);
@@ -9450,20 +9542,82 @@ static void serve_mux(Model *m){
         }
         active = 0; for (int i = 0; i < n; i++) active += rq[i].active;
         if (!active) { if (input_eof) break; continue; }
-        int S = 0, ended = 0;
+        int S = 0, ended = 0, N = 0, greedy = 0;
         for (int i = 0; i < n; i++) if (rq[i].active) {
-            int tk;
-            if (!q36_mux_pick(m, &rq[i], eos_ids, n_eos, &tk)) { ended = 1; continue; }
-            rows[S] = (Q36Row){&g_q36_mux_seq[i], rq[i].np + rq[i].gen - 1}; tok[S] = tk; who[S] = i; S++;
+            Q36MuxReq *r = &rq[i];
+            int tk = -1, alive = 1;
+            /* the drafts the last step accepted first, each picked from its own row's logits */
+            for (int j = 0; j <= r->acc && alive; j++) {
+                alive = q36_mux_pick(m, r, eos_ids, n_eos, &tk);
+                if (alive && j < r->acc) { r->lo = falloc(V); memcpy(r->lo, r->ahead + (int64_t)j * V, (size_t)V * sizeof(float)); }
+            }
+            free(r->ahead); r->ahead = NULL; r->acc = 0;
+            if (!alive) { ended = 1; continue; }
+            r->tok0 = tk; r->pos0 = r->np + r->gen - 1; r->dn = 0;
+            N++; greedy += r->q.temp <= 0.f;
+        }
+        int kd = 0;   /* each greedy conversation's drafts this step */
+#ifdef COLI_CUDA
+        if (mux_drafts && greedy) {
+            const char *de = getenv("Q36_MTP_DRAFTS");   /* each conversation's most, as one conversation's (3 unset) */
+            const int left = q36_mux_budget() - N, kmax = de && *de && atoi(de) > 0 ? atoi(de) : 3;
+            kd = left > 0 ? left / greedy : 0;
+            if (kd > kmax) kd = kmax;
+            if (kd > Q36_SPEC_ROWS - 1) kd = Q36_SPEC_ROWS - 1;
+        }
+#endif
+        /* the head reads the rows only in the steps that draft: a step with no room for drafts (as
+         * many conversations as the budget's rows) leaves it, and a conversation's head waits for its
+         * next prompt (q36_mtp_ready); the head's rows cost 3 % at 8 conversations */
+        const int head_on = mux_drafts && kd > 0;
+        int snapc = 0, any_snap = 0;
+        for (int i = 0; i < n; i++) if (rq[i].active) {
+            Q36MuxReq *r = &rq[i];
+            int k = 0;
+#ifdef COLI_CUDA
+            if (kd > 0 && r->q.temp <= 0.f && r->pos0 + kd < m->kv_cap && q36_mtp_conv_bind(m, i) && q36_mtp_ready(r->pos0)) {
+                float *hd = falloc(m->c.hidden);
+                r->d[0] = q36_mtp_draft(m, r->tok0, r->pos0, hd);
+                for (k = 1; k < kd; k++) r->d[k] = q36_mtp_draft_more(m, hd, r->d[k - 1], r->pos0 + k);
+                free(hd);
+            }
+#endif
+            r->dn = k; r->snap0 = snapc;
+            rows[S] = (Q36Row){&g_q36_mux_seq[i], r->pos0}; tok[S] = r->tok0; who[S] = i; snap[S] = k ? snapc++ : -1; S++;
+            for (int j = 0; j < k; j++) {
+                rows[S] = (Q36Row){&g_q36_mux_seq[i], r->pos0 + 1 + j}; tok[S] = r->d[j]; who[S] = i;
+                snap[S] = j + 1 < k ? snapc++ : -1; S++;
+            }
+            any_snap |= k > 0;
         }
         if (S) {
             /* every conversation parked: the rows read theirs from g_q36_mux_seq */
             q36_mux_bind(m, -1);
-            float *lo = q36_step_rows(m, rows, tok, S);
+            float *lo = q36_step_rows(m, rows, tok, S, any_snap ? snap : NULL, head_on ? hid : NULL);
+#ifdef COLI_CUDA
+            if (!lo) {   /* the chain did not take the verify's rows: the step again without drafts, and no more */
+                fprintf(stderr, "[qwen36] KV_SLOTS: the CUDA chain did not take a step's drafts; the conversations stop drafting\n");
+                mux_drafts = 0;
+                int S1 = 0;
+                for (int s = 0; s < S; s++)
+                    if (s == 0 || who[s] != who[s - 1]) { rows[S1] = rows[s]; tok[S1] = tok[s]; who[S1] = who[s]; S1++; }
+                S = S1;
+                for (int i = 0; i < n; i++) rq[i].dn = 0;
+                lo = q36_step_rows(m, rows, tok, S, NULL, NULL);
+            }
+#endif
             steps++; nrows += (unsigned long long)S;
             for (int s = 0; s < S; s++) {
+                if (s > 0 && who[s] == who[s - 1]) continue;   /* a draft's row: its conversation's below */
                 Q36MuxReq *t = &rq[who[s]];
                 t->lo = falloc(V); memcpy(t->lo, lo + (int64_t)s * V, (size_t)V * sizeof(float));
+                if (t->dn) {
+                    t->ahead = falloc((int64_t)t->dn * V);
+                    memcpy(t->ahead, lo + (int64_t)(s + 1) * V, (size_t)t->dn * V * sizeof(float));
+                }
+#ifdef COLI_CUDA
+                if (head_on || t->dn) q36_mux_settle(m, t, who[s], head_on && mux_drafts ? hid + (int64_t)s * m->c.hidden : NULL, eos_ids, n_eos);
+#endif
                 t->forwards++;
             }
             free(lo);
@@ -9483,7 +9637,12 @@ static void serve_mux(Model *m){
     fprintf(stderr, "[qwen36] KV_SLOTS=%d: %llu decode steps, %llu rows (%.2f a step)\n", n, steps, nrows,
             steps ? (double)nrows / (double)steps : 0.0);
     q36_mux_bind(m, 0);
-    free(rq); free(rows); free(tok); free(who);
+    {
+        unsigned long long dr = 0, ac = 0;
+        for (int i = 0; i < n; i++) { dr += rq[i].drafts; ac += rq[i].accepted; }
+        if (dr) fprintf(stderr, "[qwen36] KV_SLOTS=%d: %llu drafts, %llu accepted (%.1f%%)\n", n, dr, ac, 100.0 * (double)ac / (double)dr);
+    }
+    free(rq); free(rows); free(tok); free(who); free(snap); free(hid);
 }
 
 static void serve_loop(Model *m){
@@ -10021,8 +10180,8 @@ int main(int argc, char **argv) {
             if (end == ks || *end || v < 1 || v > 16) { fprintf(stderr, "KV_SLOTS must be between 1 and 16\n"); return 2; }
             g_q36_mux_slots = (int)v;
         }
-        if (g_q36_mux_slots > 1)
-            fprintf(stderr, "[qwen36] KV_SLOTS=%d: nothing drafts (speculation follows one conversation)\n", g_q36_mux_slots);
+        if (g_q36_mux_slots > 1 && !getenv("Q36_MTP"))
+            fprintf(stderr, "[qwen36] KV_SLOTS=%d: nothing drafts without the MTP head (Q36_MTP=1 on the CUDA chain)\n", g_q36_mux_slots);
     }
     if (getenv("CLEF_RECORDS") || getenv("CLEF_TOKENIZE")) serve_mode = 1;   /* Clef's test modes: no prompt */
 

@@ -134,6 +134,7 @@ typedef struct {
     int pool_closed;   /* q36cc_pool_off closed the places: a conversation that enters opens them again */
     unsigned long long conv_clock, conv_handed, mux_steps, mux_rows, mux_host_steps, pool_reopens;
     const Q36Row *mx_rows; Q36ccConv **mx_conv;
+    const int *mx_snap;   /* a multiplexed step's verify rows: row s's state copied to snapshot slot mx_snap[s] (-1: none) */
 } Q36CChain;
 
 static int g_cuda_chain = 0;     /* COLI_CUDA_CHAIN asked for it and the chain is up */
@@ -1133,8 +1134,9 @@ static int q36cc_shortconv_mx(Q36CChain *ch, Model *m, int i, int n, int c0) {
     Cfg *c = &m->c; int D = c->hidden;
     int ok = cc_matmul(ch->t_sci[i], ch->nrm, 0, ch->qkvz, 0, n);
     for (int s = 0; s < n && ok; s++) {
-        CcDnConv cp = {1, D, c->dn_convk, s * 3 * D, 3 * D, s * D, D, -1, 2, (int)ch->o_conv[i], 0, 0};
-        ok = cc_dnconv(ch->qkvz, ch->prm, ch->mx_conv[c0 + s]->ring[i], ch->cv, NULL, &cp);
+        const int sl = ch->mx_snap ? ch->mx_snap[c0 + s] : -1;
+        CcDnConv cp = {1, D, c->dn_convk, s * 3 * D, 3 * D, s * D, D, sl >= 0 ? 0 : -1, 2, (int)ch->o_conv[i], 0, 0};
+        ok = cc_dnconv(ch->qkvz, ch->prm, ch->mx_conv[c0 + s]->ring[i], ch->cv, sl >= 0 ? ch->ring_snap[sl][i] : NULL, &cp);
     }
     return ok && cc_matmul(ch->t_sco[i], ch->cv, 0, ch->tmp, 0, n);
 }
@@ -1198,13 +1200,15 @@ static int q36cc_deltanet_mx(Q36CChain *ch, Model *m, Layer *l, int i, int n, in
              cc_matmul(ch->t_ab[i], ch->nrm, 0, ch->ab, 0, n);
     for (int s = 0; s < n && ok; s++) {
         Q36ccConv *v = ch->mx_conv[c0 + s];
-        CcDnConv cp = {1, CD, c->dn_convk, s * qr, qr, s * CD, CD, -1, 0, (int)ch->o_conv[i], 0, 0};
+        /* a verify's row: the state after it copied to its snapshot slot (q36cc_mux_rollback) */
+        const int sl = ch->mx_snap ? ch->mx_snap[c0 + s] : -1, snap_row = sl >= 0 ? 0 : -1;
+        CcDnConv cp = {1, CD, c->dn_convk, s * qr, qr, s * CD, CD, snap_row, 0, (int)ch->o_conv[i], 0, 0};
         CcDnRec rp = {1, vh, c->dn_kheads, c->dn_vdim, c->dn_kheads * c->dn_kdim, s * CD, CD, s * 2 * vh, 2 * vh,
-                      vh + s * 2 * vh, 2 * vh, (int)z0 + s * zr, zr, s * vd, vd, -1,
+                      vh + s * 2 * vh, 2 * vh, (int)z0 + s * zr, zr, s * vd, vd, snap_row,
                       (g_ssm_a_direct ? 2 : 0) | (g_dn_tiled ? 4 : 0), c->eps,
                       1.f / sqrtf((float)c->dn_kdim), 0, 0, (int)ch->o_dn[i]};
-        ok = cc_dnconv(ch->qkvz, ch->prm, v->ring[i], ch->cv, NULL, &cp) &&
-             cc_dnrec(c->dn_kdim, ch->cv, ch->ab, ch->qkvz, v->rec[i], ch->prm, ch->dny, NULL, &rp);
+        ok = cc_dnconv(ch->qkvz, ch->prm, v->ring[i], ch->cv, sl >= 0 ? ch->ring_snap[sl][i] : NULL, &cp) &&
+             cc_dnrec(c->dn_kdim, ch->cv, ch->ab, ch->qkvz, v->rec[i], ch->prm, ch->dny, sl >= 0 ? ch->rec_snap[sl][i] : NULL, &rp);
     }
     return ok && cc_matmul(ch->t_dno[i], ch->dny, 0, ch->tmp, 0, n);
 }
@@ -2144,9 +2148,16 @@ lost:   /* a frame failed: the device is gone (or would not take a command); the
 }
 
 /* One decode step of several conversations on the CUDA chain (q36c_mux_step's twin) */
-static int q36cc_mux_step(Model *m, const Q36Row *rows, int S, float *xh, float *logit) {
+/* snap (may be NULL): row s's state copied to snapshot slot snap[s] for a rejected draft's rollback
+ * (q36cc_mux_rollback), -1 none; want_x: the rows' residuals back in xh (the MTP head's) */
+static int q36cc_mux_step(Model *m, const Q36Row *rows, int S, float *xh, float *logit, const int *snap, int want_x) {
     Q36CChain *ch = q36cc_of(m);
     if (!g_cuda_chain || !ch || !ch->conv || !q36cc_pool_ok(ch) || S < 1 || S > q36cc_rows_max(ch, m)) return 0;
+    if (snap) {
+        int slots = 0;
+        for (int s = 0; s < S; s++) if (snap[s] + 1 > slots) slots = snap[s] + 1;
+        if (slots > Q36_SPEC_SNAPS || (slots && !q36cc_spec_slots(ch, m, slots))) return 0;
+    }
     for (int s = 0; s < S; s++) if (rows[s].seq->mpos || rows[s].seq->rope_delta) return 0;
     Q36ccConv **e = malloc((size_t)S * sizeof *e);
     if (!e) return 0;
@@ -2160,9 +2171,9 @@ static int q36cc_mux_step(Model *m, const Q36Row *rows, int S, float *xh, float 
     for (int s = 0; s < S && ok; s++) ok = q36cc_conv_grow(ch, m, (int)(e[s] - ch->conv), rows[s].pos + 1);
     int n = 0, ro = 0, failed_before = ch->failed;
     if (ok) {
-        ch->mx_rows = rows; ch->mx_conv = e;
-        n = q36cc_forward(m, xh, S, 0, NULL, 0, S, logit, &ro);
-        ch->mx_rows = NULL; ch->mx_conv = NULL;
+        ch->mx_rows = rows; ch->mx_conv = e; ch->mx_snap = snap;
+        n = q36cc_forward(m, xh, S, 0, NULL, want_x, S, logit, &ro);
+        ch->mx_rows = NULL; ch->mx_conv = NULL; ch->mx_snap = NULL;
     }
     free(e);
     if (ch->failed && !failed_before) return 0;   /* lost: every place's state rebuilt on the host */
@@ -2170,6 +2181,27 @@ static int q36cc_mux_step(Model *m, const Q36Row *rows, int S, float *xh, float 
     if (n) { ch->mux_steps++; ch->mux_rows += (unsigned long long)S; }
     else ch->mux_host_steps++;
     return n > 0;
+}
+
+/* A multiplexed verify's rejected drafts (q36cc_mux_step's snap): the conversation of mux slot `slot`
+ * back to its state after the row copied to snapshot slot `snap` (-1: the state as the step left it),
+ * `len` positions standing */
+static int q36cc_mux_rollback(Model *m, int slot, int snap, int len) {
+    Q36CChain *ch = q36cc_of(m);
+    if (!ch || !ch->ok || !ch->conv) return 0;
+    int k = -1;
+    for (int j = 0; j < ch->nconv && k < 0; j++) if (ch->conv[j].slot == slot) k = j;
+    if (k < 0) return 0;
+    Q36ccConv *v = &ch->conv[k];
+    for (int i = 0; i < m->c.n_layers; i++) if (m->c.is_attn[i] && v->kv_valid[i] > len) v->kv_valid[i] = len;
+    if (snap < 0) return 1;
+    if (snap >= ch->snap_slots || v->dn_where != Q36CC_DEV) return 0;
+    for (int i = 0; i < m->c.n_layers; i++) {
+        if (m->c.is_attn[i]) continue;
+        CcBuf *t = v->rec[i]; v->rec[i] = ch->rec_snap[snap][i]; ch->rec_snap[snap][i] = t;
+        t = v->ring[i]; v->ring[i] = ch->ring_snap[snap][i]; ch->ring_snap[snap][i] = t;
+    }
+    return 1;
 }
 
 static void q36cc_report(Model *m) {

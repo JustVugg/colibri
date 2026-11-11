@@ -222,6 +222,21 @@ tok/s; the MTP and the two-conversation runs alternated with the GEMV alone,
 | three MTP drafts (whole vocabulary): code / prose / list | 40.5 / 33.4 / 35.7 | 42.8 / 33.4 / 35.9 |
 | `--kv-slots 8`, 2 / 8 conversations at once, together | 36.4 / 60.4 | 36.3 / 86.5 |
 
+**Several conversations drafting (`--kv-slots` with `Q36_MTP=1`).** On the CUDA chain each
+conversation keeps an MTP head state of its own (its KV cache on the card, swapped as the
+trunk's), and a step's rows verify the greedy conversations' drafts as one conversation's
+verify does: each draft row's DeltaNet state is copied for its rollback, a rejected draft's
+conversation goes back to the state after its last standing row, and the head reads the rows
+that stand. The drafts share a budget of rows a step (`Q36_MUX_ROWS`, 8): 8 rows cost 1.2 to
+1.4 decode steps on the tensor cores and 32 rows 4 to 5 on this card, so more conversations
+leave fewer drafts, and eight leave none. Code prompts, 256 tokens, each request on its own
+slot, tok/s together; every conversation's text is the same as without drafts:
+
+| conversations at once | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|
+| no drafts | 20.6 | 37.3 | 57.0 | 89.1 |
+| drafts within 8 rows | 48.6 | 70.3 | 80.8 | 88.2 |
+
 The computation follows Qwen's MTP module: at position p, concatenate the
 normalized embedding of token p+1 with the normalized backbone output h_p,
 then `mtp.fc`, one gated full-attention decoder layer with its own KV cache,
