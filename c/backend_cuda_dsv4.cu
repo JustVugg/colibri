@@ -2011,6 +2011,8 @@ extern "C" int dsv4_cuda_upload_compressor(Dsv4CudaTensor **pt,const uint16_t *w
     t->bytes+=bytes;*pt=t;return 1;
 }
 
+extern "C" int dsv4_cuda_head_exact_available(void){return 1;}
+
 extern "C" int dsv4_cuda_upload_head_exact(Dsv4CudaTensor **pt,const uint16_t *w,int O,int I,int device){
     if(!pt||*pt||I<1||I%8)return 0;
     Dsv4CudaTensor *t=nullptr;

@@ -173,6 +173,7 @@ typedef int             (*fn_fp8_ref_matmul)(int device, const uint8_t *w, const
 typedef int             (*fn_tensor_refill_fp4)(Dsv4CudaTensor *t, const uint8_t *w, const uint8_t *scale,
                                                 int O, int I, int sync);
 typedef int (*fn_head_scores_exact)(Dsv4CudaTensor*,const float*,float*);
+typedef int (*fn_head_exact_available)(void);
 typedef int (*fn_head_scores_batch_exact)(Dsv4CudaTensor*,const float*,int,float*);
 typedef int (*fn_head_argmax_batch_exact)(Dsv4CudaTensor*,const float*,int,int*,float*);
 typedef int (*fn_indexer_prepare)(Dsv4CudaTensor*,const float*,float*,float*,int);
@@ -335,6 +336,7 @@ static struct {
     fn_upload_compressor upload_compressor;
     fn_upload_compressor upload_head_exact;
     fn_head_scores_exact head_scores_exact;
+    fn_head_exact_available head_exact_available;   /* optional (older DLLs: 0) */
     fn_head_scores_batch_exact head_scores_batch_exact;
     fn_head_argmax_batch_exact head_argmax_batch_exact;
     fn_compressor_project compressor_project;
@@ -529,6 +531,7 @@ static int dsv4_cuda_resolve(const char *dllname){
     RESOLVE(fp8_ref_matmul, fn_fp8_ref_matmul);
     g_dsv4.upload_head_exact = (fn_upload_compressor)GetProcAddress(g_dsv4.dll, "dsv4_cuda_upload_head_exact");
     g_dsv4.head_scores_exact = (fn_head_scores_exact)GetProcAddress(g_dsv4.dll, "dsv4_cuda_head_scores_exact");
+    g_dsv4.head_exact_available = (fn_head_exact_available)GetProcAddress(g_dsv4.dll, "dsv4_cuda_head_exact_available");
     g_dsv4.head_scores_batch_exact = (fn_head_scores_batch_exact)GetProcAddress(g_dsv4.dll, "dsv4_cuda_head_scores_batch_exact");
     g_dsv4.head_argmax_batch_exact = (fn_head_argmax_batch_exact)GetProcAddress(g_dsv4.dll, "dsv4_cuda_head_argmax_batch_exact");
     g_dsv4.indexer_prepare = (fn_indexer_prepare)GetProcAddress(g_dsv4.dll, "dsv4_cuda_indexer_prepare");
@@ -930,6 +933,10 @@ int dsv4_cuda_fp8_ref_matmul(int device, const uint8_t *w, const float *bscale,
 int dsv4_cuda_upload_head_exact(Dsv4CudaTensor **t,const uint16_t *w,int rows,int cols,int device){
     return g_dsv4.available && g_dsv4.upload_head_exact && g_dsv4.head_scores_exact
         ? g_dsv4.upload_head_exact(t,w,rows,cols,device) : 0;
+}
+int dsv4_cuda_head_exact_available(void){
+    return g_dsv4.available && g_dsv4.head_exact_available && g_dsv4.upload_head_exact &&
+           g_dsv4.head_scores_exact ? g_dsv4.head_exact_available() : 0;
 }
 int dsv4_cuda_head_scores_exact(Dsv4CudaTensor *t,const float *input,float *scores){
     return g_dsv4.available && g_dsv4.head_scores_exact ? g_dsv4.head_scores_exact(t,input,scores) : 0;
