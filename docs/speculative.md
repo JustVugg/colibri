@@ -206,12 +206,17 @@ Measured on an RTX PRO 4000 SFF, greedy, thinking off, every text identical to p
 | unsloth v3.1 UD-Q4_K_XL | 20.3 / 20.3 / 20.0 | 48.8 / 32.7 / 35.3 | 61.1 / 32.1 / 36.9 |
 | unsloth v3.1 UD-IQ2_XXS (`MTP/mtp-*.gguf`) | 31.1 / 30.9 / 30.2 | 56.8 / 41.2 / 45.4 | 54.4 / 36.8 / 38.7 |
 
+With a verify's rows on the tensor cores for every type of those files (the later commits,
+[qwen36.md](qwen36.md)): UD-Q4_K_XL MTP 50.9 / 31.6 / 35.4, DFlash2 67.8 / 34.4 / 37.5;
+UD-IQ2_XXS MTP 63.8 / 41.7 / 46.3, DFlash2 73.0 / 40.8 / 42.5. DFlash2 leads on code on both
+files, the head on the IQ2_XXS file's prose and lists.
+
 A block costs 10.3 ms on the 27B (the layers 5.6, its `lm_head` rows 4.2, the selector 0.3)
 and carries 4.9 to 5.8 tokens a verify on code; a fixed depth of 7 (`Q36_MTP_PSTEP=0`) took
 code to 65.4 tok/s and prose down to 28.8. Offline, tokens a verify of 7 drafts (with the
 target's own): code 6.16, math 6.02, C++ 5.80, an essay 3.30, a list 2.95, Italian prose
-2.63. Where a verify's rows are dear the MTP head stays ahead: the IQ2_XXS file above, and
-Qwen3.8-Flash-Next IQ2_XS (a MoE: each row brings its experts), where the drafter's 3 drafts
+2.63. Where a verify's rows are dear the MTP head stays ahead: Qwen3.8-Flash-Next IQ2_XS (a MoE:
+each row brings its experts), where the drafter's 3 drafts
 gave 92.0 / 70.5 / 71.8 against the head's 91 to 97 / 70 to 71 / 80 to 90. `[dflash]` lines
 report the blocks and the context rows, `[qwen36 mtp]` / `[qwen38 dflash]` the acceptance.
 

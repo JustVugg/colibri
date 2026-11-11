@@ -63,7 +63,8 @@ __host__ __device__ constexpr int bd_ks_words(int t) { return t == 16 || t == 17
 __host__ __device__ constexpr int bd_kv_words(int t) { return 0; }   /* IQ4's values in registers (bdi_kv4) */
 __host__ __device__ constexpr int bd_tab_words(int t) { return (bd_grid_words(t) + bd_ks_words(t) + bd_kv_words(t) + 3) & ~3; }
 
-struct BdTabs { const bd_u32 *grid, *ks; const int *kvt; const bd_u32 *tab; };
+/* ksm (bd_mmg_k's): ksigns' sign masks, entry i's bdi_smask of its low and high 4 bits at 2i, 2i + 1 */
+struct BdTabs { const bd_u32 *grid, *ks; const int *kvt; const bd_u32 *tab; const bd_u32 *ksm; };
 /* type T's tables into shared memory at sm (bd_tab_words(T) words), by the block's threads */
 template <int T>
 __device__ __forceinline__ BdTabs bd_tables_fill(bd_u32 *sm, const bd_u32 *__restrict__ tab) {
@@ -178,10 +179,15 @@ __device__ __forceinline__ void bdx_step8(const BdX &X, int r, bd_u32 q, int *xw
  * sums are the same bits on either. Q4_K / Q5_K and Q2_K: two runs of 16, each a scale and a
  * min; two scales a step (Q6_K, Q3_K, IQ2_XS, IQ2_S, IQ1_S); one scale (Q8_0, IQ4_NL, IQ4_XS,
  * IQ2_XXS, IQ3_XXS, IQ3_S). */
+__device__ __forceinline__ float bdi_upd_k45f(float acc, float dxl, float dxh, float sl, float ml, float sh, float mh,
+                                              int il, int ih, float xsl, float xsh) {
+    const float a = __fmaf_rn(sl, (float)il, -__fmul_rn(ml, xsl)), b = __fmaf_rn(sh, (float)ih, -__fmul_rn(mh, xsh));
+    return __fadd_rn(acc, __fmaf_rn(dxl, a, __fmul_rn(dxh, b)));
+}
+/* the code sums as the x side holds them (ints: exact as floats, the same bits as bdi_upd_k45f's) */
 __device__ __forceinline__ float bdi_upd_k45(float acc, float dxl, float dxh, float sl, float ml, float sh, float mh,
                                              int il, int ih, int xsl, int xsh) {
-    const float a = __fmaf_rn(sl, (float)il, -__fmul_rn(ml, (float)xsl)), b = __fmaf_rn(sh, (float)ih, -__fmul_rn(mh, (float)xsh));
-    return __fadd_rn(acc, __fmaf_rn(dxl, a, __fmul_rn(dxh, b)));
+    return bdi_upd_k45f(acc, dxl, dxh, sl, ml, sh, mh, il, ih, (float)xsl, (float)xsh);
 }
 __device__ __forceinline__ float bdi_upd_2(float acc, float dx, float c0, float c1, int s0, int s1) {
     return __fmaf_rn(dx, __fmaf_rn(c0, (float)s0, __fmul_rn(c1, (float)s1)), acc);
@@ -1014,6 +1020,11 @@ __host__ __device__ constexpr bool bd_mmq_has(int t) {
 /* the types whose step bd_mmq_a decodes with its own scales (a grid's, or two runs' of 16): no staged
  * scales handed round the quad; two sums of 16 a step (bd_mma16 twice) for the two-scale ones */
 __host__ __device__ constexpr bool bd_mq_own(int t) { return t == 10 || t == 11 || (t >= 16 && t <= 19) || t == 21 || t == 22; }
+/* the one-scale grid types whose grid entry spans 8 weights (IQ2_XXS, IQ3_XXS): in bd_mmg_k thread t
+ * of a quad takes the step's weights 8t .. 8t + 7 (A0 the first 4, A1 the rest) and x's words 2t and
+ * 2t + 1 for them, one entry and one ksigns read where the k order of the fragments took two halves
+ * of two. The step's integer dot is a sum of the same products, exact in any order. */
+__host__ __device__ constexpr bool bd_mq_perm(int t) { return t == 16 || t == 18; }
 __host__ __device__ constexpr bool bd_mq_two(int t) { return t == 10 || t == 11 || t == 12 || t == 13 || t == 14 || t == 17 || t == 19 || t == 22; }
 __device__ __forceinline__ void bd_mma16(int *c, bd_u32 a0, bd_u32 a1, bd_u32 b0) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
@@ -1059,34 +1070,31 @@ __device__ __forceinline__ bd_u32 bdm_iq1(bd_u32 g, int sg) {
     return bd_add4((g & 0x1F1F1F1Fu) << 3, sg > 0 ? 0x01010101u : 0xFFFFFFFFu);
 }
 /* the A words (weights 4t .. 4t + 3 and 16 + 4t ..) and scales of one row for the grid and K types
- * (bd_mq_own): the decode of bdi_step for those 8 weights, the scales its expressions */
+ * (bd_mq_own): the decode of bdi_step for those 8 weights, the scales its expressions. base: the
+ * super-block's first byte in W, jj: the step in it (bd_mmg_k's are known when it compiles) */
 template <int T, bool SM>
-__device__ __forceinline__ void bd_mmq_own(const bd_u32 *__restrict__ W, int q, int t, const BdTabs &tb, bd_u32 &A0, bd_u32 &A1, float *p) {
-    const bd_u32 *tab = tb.tab;
-    const bd_u32 b = (bd_u32)q >> 3, ib = (bd_u32)q & 7u, l0 = (bd_u32)t >> 1, h = (bd_u32)t & 1u;
-    if (T == 16) {   /* IQ2_XXS */
-        const bd_u32 base = b * 66u, i0 = bdm_ldu<SM>(W, base + 2u + 8u * ib), i1 = bdm_ldu<SM>(W, base + 6u + 8u * ib);
-        const bd_u32 *gr = tb.grid, *ks = tb.ks;
-        #pragma unroll
-        for (int r = 0; r < 2; r++) {
-            const bd_u32 l = l0 + 2u * (bd_u32)r, idx = (i0 >> (8u * l)) & 255u, s8 = ks[(i1 >> (7u * l)) & 127u];
-            const bd_u32 v = bdi_neg(gr[2u * idx + h], s8 >> (4u * h));
-            if (r) A1 = v; else A0 = v;
-        }
+__device__ __forceinline__ void bd_mmq_own(const bd_u32 *__restrict__ W, bd_u32 base, int jj, int t, const BdTabs &tb, bd_u32 &A0, bd_u32 &A1, float *p) {
+    const bd_u32 ib = (bd_u32)jj, l0 = (bd_u32)t >> 1, h = (bd_u32)t & 1u;
+    if (T == 16) {   /* IQ2_XXS: the grid entry t, weights 8t .. 8t + 7 (bd_mq_perm) */
+        const bd_u32 i0 = bdm_ldu<SM>(W, base + 2u + 8u * ib), i1 = bdm_ldu<SM>(W, base + 6u + 8u * ib), u = (bd_u32)t;
+        const bd_u32 idx = __byte_perm(i0, 0u, 0x4440u | u);
+        const uint2 gw = *reinterpret_cast<const uint2 *>(tb.grid + 2u * idx), m = *reinterpret_cast<const uint2 *>(tb.ksm + 2u * ((i1 >> (7u * u)) & 127u));
+        A0 = (gw.x ^ m.x) + (m.x & 0x01010101u); A1 = (gw.y ^ m.y) + (m.y & 0x01010101u);   /* bdi_neg's */
+        (void)l0; (void)h;
         p[0] = bdm_f16at<SM>(W, base) * (0.5f + (float)(i1 >> 28)) * 0.25f;
     } else if (T == 17) {   /* IQ2_XS */
-        const bd_u32 base = b * 74u, i0 = bdm_ldu<SM>(W, base + 2u + 8u * ib), i1 = bdm_ldu<SM>(W, base + 6u + 8u * ib);
-        const bd_u32 scb = bdm_u8at<SM>(W, base + 66u + ib), *gr = tb.grid, *ks = tb.ks;
+        const bd_u32 i0 = bdm_ldu<SM>(W, base + 2u + 8u * ib), i1 = bdm_ldu<SM>(W, base + 6u + 8u * ib);
+        const bd_u32 scb = bdm_u8at<SM>(W, base + 66u + ib), *gr = tb.grid;
         #pragma unroll
         for (int r = 0; r < 2; r++) {
-            const bd_u32 l = l0 + 2u * (bd_u32)r, e = ((l < 2u ? i0 : i1) >> (16u * (l & 1u))) & 0xFFFFu, s8 = ks[e >> 9];
-            const bd_u32 v = bdi_neg(gr[2u * (e & 511u) + h], s8 >> (4u * h));
+            const bd_u32 l = l0 + 2u * (bd_u32)r, e = ((l < 2u ? i0 : i1) >> (16u * (l & 1u))) & 0xFFFFu, m = tb.ksm[2u * (e >> 9) + h];
+            const bd_u32 v = (gr[2u * (e & 511u) + h] ^ m) + (m & 0x01010101u);   /* bdi_neg's */
             if (r) A1 = v; else A0 = v;
         }
         const float d = bdm_f16at<SM>(W, base), sc0 = (float)(scb & 15u), sc1 = (float)(scb >> 4);
         p[0] = d * (0.5f + sc0) * 0.25f; p[1] = d * (0.5f + sc1) * 0.25f;
     } else if (T == 22) {   /* IQ2_S */
-        const bd_u32 base = b * 82u, ix = bdm_ldu<SM>(W, base + 2u + 4u * ib), sg = bdm_ldu<SM>(W, base + 34u + 4u * ib);
+        const bd_u32 ix = bdm_ldu<SM>(W, base + 2u + 4u * ib), sg = bdm_ldu<SM>(W, base + 34u + 4u * ib);
         const bd_u32 hb = bdm_u8at<SM>(W, base + 66u + ib), scb = bdm_u8at<SM>(W, base + 74u + ib), *gr = tb.grid;
         #pragma unroll
         for (int r = 0; r < 2; r++) {
@@ -1096,18 +1104,16 @@ __device__ __forceinline__ void bd_mmq_own(const bd_u32 *__restrict__ W, int q, 
         }
         const float d = bdm_f16at<SM>(W, base), sc0 = (float)(scb & 15u), sc1 = (float)(scb >> 4);
         p[0] = d * (0.5f + sc0) * 0.25f; p[1] = d * (0.5f + sc1) * 0.25f;
-    } else if (T == 18) {   /* IQ3_XXS: a grid row of 4 a word */
-        const bd_u32 base = b * 98u, g0 = bdm_ldu<SM>(W, base + 2u + 8u * ib), g1 = bdm_ldu<SM>(W, base + 6u + 8u * ib);
-        const bd_u32 a = bdm_ldu<SM>(W, base + 66u + 4u * ib), *gr = tb.grid, *ks = tb.ks;
-        #pragma unroll
-        for (int r = 0; r < 2; r++) {
-            const bd_u32 l = l0 + 2u * (bd_u32)r, gw = l < 2u ? g0 : g1, sh = 16u * (l & 1u), s8 = ks[(a >> (7u * l)) & 127u];
-            const bd_u32 v = bdi_neg(gr[(gw >> (sh + 8u * h)) & 255u], s8 >> (4u * h));
-            if (r) A1 = v; else A0 = v;
-        }
+    } else if (T == 18) {   /* IQ3_XXS: a grid row of 4 a word; the sign group t, weights 8t .. 8t + 7 (bd_mq_perm) */
+        const bd_u32 g0 = bdm_ldu<SM>(W, base + 2u + 8u * ib), g1 = bdm_ldu<SM>(W, base + 6u + 8u * ib);
+        const bd_u32 a = bdm_ldu<SM>(W, base + 66u + 4u * ib), *gr = tb.grid, u = (bd_u32)t;
+        const bd_u32 gw = u < 2u ? g0 : g1, sh = 16u * (u & 1u);
+        const uint2 m = *reinterpret_cast<const uint2 *>(tb.ksm + 2u * ((a >> (7u * u)) & 127u));
+        const bd_u32 v0 = gr[(gw >> sh) & 255u], v1 = gr[(gw >> (sh + 8u)) & 255u];
+        A0 = (v0 ^ m.x) + (m.x & 0x01010101u); A1 = (v1 ^ m.y) + (m.y & 0x01010101u);   /* bdi_neg's */
         p[0] = bdm_f16at<SM>(W, base) * (0.5f + (float)(a >> 28)) * 0.5f;
     } else if (T == 21) {   /* IQ3_S: weights 4l .. 4l + 3 a grid row */
-        const bd_u32 base = b * 110u, i0 = bdm_ldu<SM>(W, base + 2u + 8u * ib), i1 = bdm_ldu<SM>(W, base + 6u + 8u * ib);
+        const bd_u32 i0 = bdm_ldu<SM>(W, base + 2u + 8u * ib), i1 = bdm_ldu<SM>(W, base + 6u + 8u * ib);
         const bd_u32 hb = bdm_u8at<SM>(W, base + 66u + ib), sg = bdm_ldu<SM>(W, base + 74u + 4u * ib), *gr = tb.grid;
         const bd_u32 sc = (bdm_u8at<SM>(W, base + 106u + (ib >> 1)) >> (4u * (ib & 1u))) & 15u;
         #pragma unroll
@@ -1118,7 +1124,7 @@ __device__ __forceinline__ void bd_mmq_own(const bd_u32 *__restrict__ W, int q, 
         }
         p[0] = bdm_f16at<SM>(W, base) * (float)(1u + 2u * sc);
     } else if (T == 19) {   /* IQ1_S: 8 grid + the delta's sign (bdm_iq1) */
-        const bd_u32 base = b * 50u, qs = bdm_ldu<SM>(W, base + 2u + 4u * ib), qh = bdm_u16at<SM>(W, base + 34u + 2u * ib);
+        const bd_u32 qs = bdm_ldu<SM>(W, base + 2u + 4u * ib), qh = bdm_u16at<SM>(W, base + 34u + 2u * ib);
         const int sg = (qh & 0x8000u) != 0u ? -1 : 1;
         #pragma unroll
         for (int r = 0; r < 2; r++) {
@@ -1128,7 +1134,7 @@ __device__ __forceinline__ void bd_mmq_own(const bd_u32 *__restrict__ W, int q, 
         }
         p[0] = p[1] = bdm_f16at<SM>(W, base) * (float)(2u * ((qh >> 12) & 7u) + 1u) * 0.125f;
     } else if (T == 11) {   /* Q3_K: codes 0..7 less 4 (bdi_step's dot less 4 times the sum of x) */
-        const bd_u32 s = (bd_u32)q & 7u, base = b * 110u, sh = 2u * (s & 3u), qa = base + 32u + 32u * (s >> 2);
+        const bd_u32 s = ib, sh = 2u * (s & 3u), qa = base + 32u + 32u * (s >> 2);
         #pragma unroll
         for (int r = 0; r < 2; r++) {
             const bd_u32 k = (bd_u32)t + 4u * (bd_u32)r;
@@ -1144,7 +1150,7 @@ __device__ __forceinline__ void bd_mmq_own(const bd_u32 *__restrict__ W, int q, 
             p[hh2] = d * (float)((int)(l | (hh << 4)) - 32);
         }
     } else if (T == 10) {   /* Q2_K: codes 0..3, a scale and a min per 16 */
-        const bd_u32 s = (bd_u32)q & 7u, base = b * 84u, sh = 2u * (s & 3u), qa = base + 16u + 32u * (s >> 2);
+        const bd_u32 s = ib, sh = 2u * (s & 3u), qa = base + 16u + 32u * (s >> 2);
         A0 = (bdm_ldu<SM>(W, qa + 4u * (bd_u32)t) >> sh) & 0x03030303u;
         A1 = (bdm_ldu<SM>(W, qa + 4u * ((bd_u32)t + 4u)) >> sh) & 0x03030303u;
         const bd_u32 s0 = bdm_u8at<SM>(W, base + 2u * s), s1 = bdm_u8at<SM>(W, base + 2u * s + 1u), dmw = bdm_ldu<SM>(W, base + 80u);
@@ -1153,9 +1159,9 @@ __device__ __forceinline__ void bd_mmq_own(const bd_u32 *__restrict__ W, int q, 
     }
 }
 template <int T, bool SM = false, bool SC = true>
-__device__ __forceinline__ void bd_mmq_a(const bd_u32 *__restrict__ Wa, const bd_u32 *__restrict__ Wb, int q, int t, BdMqStep &st) {
+__device__ __forceinline__ void bd_mmq_a(const bd_u32 *__restrict__ Wa, const bd_u32 *__restrict__ Wb, bd_u32 base, int jj, int t, BdMqStep &st) {
     if (T == 12 || T == 13) {
-        const bd_u32 b = (bd_u32)q >> 3, c = ((bd_u32)q >> 1) & 3u, h = (bd_u32)q & 1u, base = b * (T == 12 ? 144u : 176u);
+        const bd_u32 c = ((bd_u32)jj >> 1) & 3u, h = (bd_u32)jj & 1u;
         if (SC) {
             const uint4 ha = bdm_w4<SM>(Wa, base >> 4), hb = bdm_w4<SM>(Wb, base >> 4);
             {
@@ -1178,7 +1184,7 @@ __device__ __forceinline__ void bd_mmq_a(const bd_u32 *__restrict__ Wa, const bd
             st.A0b |= (xb & 0x01010101u) << 4; st.A1b |= ((xb >> 1) & 0x01010101u) << 4;
         }
     } else if (T == 14) {
-        const bd_u32 b = (bd_u32)q >> 3, j = (bd_u32)q & 7u, n = j >> 2, m = j & 3u, base = b * 210u;
+        const bd_u32 j = (bd_u32)jj, n = j >> 2, m = j & 3u;
         const bd_u32 qlo = base + 64u * n + 32u * (m & 1u), qhi = base + 128u + 32u * n, sh = (m >> 1) * 4u, hs = 2u * m;
         if (SC) {
             const bd_u32 sa = bdm_ldu<SM>(Wa, base + 192u + 8u * n + 2u * m), sb = bdm_ldu<SM>(Wb, base + 192u + 8u * n + 2u * m);
@@ -1191,18 +1197,18 @@ __device__ __forceinline__ void bd_mmq_a(const bd_u32 *__restrict__ Wa, const bd
         st.A0b = ((bdm_ldu<SM>(Wb, qlo + k0) >> sh) & 0x0F0F0F0Fu) | (((bdm_ldu<SM>(Wb, qhi + k0) >> hs) & 0x03030303u) << 4);
         st.A1b = ((bdm_ldu<SM>(Wb, qlo + k1) >> sh) & 0x0F0F0F0Fu) | (((bdm_ldu<SM>(Wb, qhi + k1) >> hs) & 0x03030303u) << 4);
     } else if (T == 8) {
-        const bd_u32 base = (bd_u32)q * 34u;
+        base += (bd_u32)jj * 34u;
         if (SC) { st.pa[0] = bdm_f16at<SM>(Wa, base); st.pb[0] = bdm_f16at<SM>(Wb, base); }
         st.A0a = bdm_ldu<SM>(Wa, base + 2u + 4u * (bd_u32)t); st.A1a = bdm_ldu<SM>(Wa, base + 18u + 4u * (bd_u32)t);
         st.A0b = bdm_ldu<SM>(Wb, base + 2u + 4u * (bd_u32)t); st.A1b = bdm_ldu<SM>(Wb, base + 18u + 4u * (bd_u32)t);
     } else {   /* 20 IQ4_NL, 23 IQ4_XS: kvalues of the nibbles, A0 the low ones (weights 0..15), A1 the high */
         bd_u32 wa, wb;
         if (T == 20) {
-            const bd_u32 base = (bd_u32)q * 18u;
+            base += (bd_u32)jj * 18u;
             if (SC) { st.pa[0] = bdm_f16at<SM>(Wa, base); st.pb[0] = bdm_f16at<SM>(Wb, base); }
             wa = bdm_ldu<SM>(Wa, base + 2u + 4u * (bd_u32)t); wb = bdm_ldu<SM>(Wb, base + 2u + 4u * (bd_u32)t);
         } else {
-            const bd_u32 b = (bd_u32)q >> 3, ib = (bd_u32)q & 7u, base = b * 136u;
+            const bd_u32 ib = (bd_u32)jj;
             if (SC) {
                 const bd_u32 w0a = bdm_w<SM>(Wa, base >> 2), w2a = bdm_w<SM>(Wa, (base >> 2) + 1u), w0b = bdm_w<SM>(Wb, base >> 2), w2b = bdm_w<SM>(Wb, (base >> 2) + 1u);
                 const bd_u32 lsa = ((w2a >> (8u * (ib >> 1) + 4u * (ib & 1u))) & 15u) | (((w0a >> (16u + 2u * ib)) & 3u) << 4);
@@ -1253,24 +1259,148 @@ template <int N> __device__ __forceinline__ void bd_cp_wait() {
  * Q6_K the 16 d sc; IQ4_XS the 8 d (ls - 32); Q8_0 and IQ4_NL the 8 blocks' d. i: the item
  * (0 .. 15) this thread computes */
 template <int T>
-__device__ __forceinline__ float bd_mq_scale(const bd_u32 *__restrict__ Wr, int sb, int i) {
+__device__ __forceinline__ float bd_mq_scale(const bd_u32 *__restrict__ Wr, bd_u32 base, int i) {
     if (T == 12 || T == 13) {
-        const bd_u32 base = (bd_u32)sb * (T == 12 ? 144u : 176u);
         const uint4 hd = bdm_w4<true>(Wr, base >> 4);
         const uint2 v = bdi_k4sm(hd, (bd_u32)(i >> 1));
         return (i & 1) ? bd_h2f(hd.x >> 16) * (float)v.y : bd_h2f(hd.x) * (float)v.x;
     } else if (T == 14) {
-        const bd_u32 base = (bd_u32)sb * 210u;
         const float d = bdm_f16at<true>(Wr, base + 208u);
         return d * bd_sbyte(bdm_ldu<true>(Wr, base + 192u + (bd_u32)(i & ~1)), i & 1);
     } else if (T == 23) {
         if (i >= 8) return 0.f;
-        const bd_u32 base = (bd_u32)sb * 136u, ib = (bd_u32)i, w0 = bdm_w<true>(Wr, base >> 2), w2 = bdm_w<true>(Wr, (base >> 2) + 1u);
+        const bd_u32 ib = (bd_u32)i, w0 = bdm_w<true>(Wr, base >> 2), w2 = bdm_w<true>(Wr, (base >> 2) + 1u);
         const bd_u32 ls = ((w2 >> (8u * (ib >> 1) + 4u * (ib & 1u))) & 15u) | (((w0 >> (16u + 2u * ib)) & 3u) << 4);
         return bd_h2f(w0) * (float)((int)ls - 32);
     } else {
         if (i >= 8) return 0.f;
-        return bdm_f16at<true>(Wr, (bd_u32)(8 * sb + i) * (T == 8 ? 34u : 18u));
+        return bdm_f16at<true>(Wr, base + (bd_u32)i * (T == 8 ? 34u : 18u));
+    }
+}
+/* One super-block of a warp's in bd_mmg_k: its x side first (each step's B words, the C rows' block
+ * scales and group sums in vector loads, so the loads overlap and the steps find them), the K types'
+ * scales into the warp's table sct (thread t: groups 2t and 2t + 1 of rows g and g + 8; the steps read
+ * them back, the shuffles they took were 8 a step), then its 8 steps. MIS: the bytes of the stage
+ * before the super-block's first (0, or 2 for a super-block of a size the stage's granule does not
+ * divide), so that the decode's offsets are known when it compiles. A column past the rows of x reads
+ * the last row's and is never stored: the steps have no branch. */
+template <int T, int NT, int MIS>
+__device__ __forceinline__ void bd_mmg_sb(const bd_u32 *__restrict__ Wa, const bd_u32 *__restrict__ Wb, const BdTabs &tb, int t, int sb,
+                                          const bd_u32 *(&xb)[NT], const float *(&xd)[NT][2], const int *(&xsum)[NT][2],
+                                          float *__restrict__ sct, float (&acc)[8][NT][4]) {
+    constexpr bool K45 = T == 12 || T == 13, XS = T == 10 || T == 12 || T == 13 || T == 14, XF = T == 10 || K45;
+    const int lane = (int)threadIdx.x & 31, g = lane >> 2, quad = lane & ~3;
+    float sv[2][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
+    #pragma unroll
+    for (int r = 0; r < 2; r++) {
+        const bd_u32 *Wr = r ? Wb : Wa;
+        if (bd_mq_own(T)) { (void)Wr; }   /* bd_mmq_own's, a step at a time */
+        else if (K45) {
+            const uint4 hd = bdm_w4<true>(Wr, (bd_u32)MIS >> 4);
+            const float d = bd_h2f(hd.x), dm = bd_h2f(hd.x >> 16);
+            const uint2 v0 = bdi_k4sm(hd, 2u * (bd_u32)t), v1 = bdi_k4sm(hd, 2u * (bd_u32)t + 1u);
+            *reinterpret_cast<float4 *>(sct + (g + 8 * r) * 16 + 4 * t) = make_float4(d * (float)v0.x, dm * (float)v0.y, d * (float)v1.x, dm * (float)v1.y);
+        } else if (T == 14) {
+            #pragma unroll
+            for (int i = 0; i < 4; i++) sv[r][i] = bd_mq_scale<T>(Wr, (bd_u32)MIS, 4 * t + i);
+        } else {
+            sv[r][0] = bd_mq_scale<T>(Wr, (bd_u32)MIS, 2 * t); sv[r][1] = bd_mq_scale<T>(Wr, (bd_u32)MIS, 2 * t + 1);
+        }
+    }
+    if (K45) __syncwarp();
+    /* the x side: step jj's B words (the 16-code chunks i0 and i1 of the super-block: bd_x4 puts them at
+     * 18 sb + bd_x4(i)), the rows' 8 block scales and (XS) 16 group sums */
+    bd_u32 pb0[8][NT], pb1[8][NT];
+    float xdv[NT][2][8], xsf[XF ? NT : 1][2][XF ? 16 : 1];
+    int xsi[XS && !XF ? NT : 1][2][XS && !XF ? 16 : 1];
+    #pragma unroll
+    for (int n = 0; n < NT; n++) {
+        const bd_u32 *xbs = xb[n] + 72 * sb;
+        #pragma unroll
+        for (int jj = 0; jj < 8; jj++) {
+            if (bd_mq_perm(T)) {   /* words 2t and 2t + 1 of the step (xb: the row's + 4 (t / 2) + 2 (t % 2)) */
+                const uint2 v = __ldg(reinterpret_cast<const uint2 *>(xbs + 4 * bd_x4(2 * jj)));
+                pb0[jj][n] = v.x; pb1[jj][n] = v.y;
+                continue;
+            }
+            const int i0 = K45 ? ((jj >> 1) & 3) * 4 + (jj & 1) : 2 * jj, i1 = K45 ? i0 + 2 : i0 + 1;
+            pb0[jj][n] = __ldg(xbs + 4 * bd_x4(i0)); pb1[jj][n] = __ldg(xbs + 4 * bd_x4(i1));
+        }
+        #pragma unroll
+        for (int j = 0; j < 2; j++) {
+            const float4 *dp = reinterpret_cast<const float4 *>(xd[n][j] + 8 * sb);
+            const float4 d0 = __ldg(dp), d1 = __ldg(dp + 1);
+            xdv[n][j][0] = d0.x; xdv[n][j][1] = d0.y; xdv[n][j][2] = d0.z; xdv[n][j][3] = d0.w;
+            xdv[n][j][4] = d1.x; xdv[n][j][5] = d1.y; xdv[n][j][6] = d1.z; xdv[n][j][7] = d1.w;
+            if (XS) {
+                const int4 *sp = reinterpret_cast<const int4 *>(xsum[n][j] + 16 * sb);
+                #pragma unroll
+                for (int v = 0; v < 4; v++) {
+                    const int4 q4 = __ldg(sp + v);
+                    if (XF) {   /* exact: a sum of 16 codes */
+                        xsf[XF ? n : 0][j][XF ? 4 * v : 0] = (float)q4.x; xsf[XF ? n : 0][j][XF ? 4 * v + 1 : 0] = (float)q4.y;
+                        xsf[XF ? n : 0][j][XF ? 4 * v + 2 : 0] = (float)q4.z; xsf[XF ? n : 0][j][XF ? 4 * v + 3 : 0] = (float)q4.w;
+                    } else {
+                        xsi[XF ? 0 : n][j][XF ? 0 : 4 * v] = q4.x; xsi[XF ? 0 : n][j][XF ? 0 : 4 * v + 1] = q4.y;
+                        xsi[XF ? 0 : n][j][XF ? 0 : 4 * v + 2] = q4.z; xsi[XF ? 0 : n][j][XF ? 0 : 4 * v + 3] = q4.w;
+                    }
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (int jj = 0; jj < 8; jj++) {
+        BdMqStep st;
+        if (bd_mq_own(T)) {
+            bd_mmq_own<T, true>(Wa, (bd_u32)MIS, jj, t, tb, st.A0a, st.A1a, st.pa); bd_mmq_own<T, true>(Wb, (bd_u32)MIS, jj, t, tb, st.A0b, st.A1b, st.pb);
+        } else bd_mmq_a<T, true, false>(Wa, Wb, (bd_u32)MIS, jj, t, st);
+        const int c = (jj >> 1) & 3;
+        if (bd_mq_own(T)) {}
+        else if (K45) {   /* groups 2c and 2c + 1 */
+            const float4 a = *reinterpret_cast<const float4 *>(sct + g * 16 + 4 * c), b = *reinterpret_cast<const float4 *>(sct + (g + 8) * 16 + 4 * c);
+            st.pa[0] = a.x; st.pa[1] = a.y; st.pa[2] = a.z; st.pa[3] = a.w; st.pb[0] = b.x; st.pb[1] = b.y; st.pb[2] = b.z; st.pb[3] = b.w;
+        } else if (T == 14) {   /* items i and i + 1, i = 8 (jj / 4) + 2 (jj % 4): thread i / 4's, at i % 4 */
+            const int i = 8 * (jj >> 2) + 2 * (jj & 3), src = quad | (i >> 2), kk = i & 3;
+            st.pa[0] = __shfl_sync(0xffffffffu, sv[0][kk], src); st.pa[1] = __shfl_sync(0xffffffffu, sv[0][kk + 1], src);
+            st.pb[0] = __shfl_sync(0xffffffffu, sv[1][kk], src); st.pb[1] = __shfl_sync(0xffffffffu, sv[1][kk + 1], src);
+        } else {   /* item jj: thread jj / 2's, at jj % 2 */
+            const int src = quad | (jj >> 1), kk = jj & 1;
+            st.pa[0] = __shfl_sync(0xffffffffu, sv[0][kk], src); st.pb[0] = __shfl_sync(0xffffffffu, sv[1][kk], src);
+        }
+        #pragma unroll
+        for (int n = 0; n < NT; n++) {
+            const bd_u32 b0 = pb0[jj][n], b1 = pb1[jj][n];
+            int c0[4] = {0, 0, 0, 0}, c1[4] = {0, 0, 0, 0};
+            if (bd_mq_two(T)) { bd_mma16(c0, st.A0a, st.A0b, b0); bd_mma16(c1, st.A1a, st.A1b, b1); }
+            else bd_mma32(c0, st.A0a, st.A0b, st.A1a, st.A1b, b0, b1);
+            #pragma unroll
+            for (int j = 0; j < 2; j++) {
+                if (K45) {   /* blocks 2c and 2c + 1, groups 4c + h and 4c + h + 2 */
+                    const float dl = xdv[n][j][2 * c], dh = xdv[n][j][2 * c + 1];
+                    const float xl = xsf[XF ? n : 0][j][XF ? 4 * c + (jj & 1) : 0], xh = xsf[XF ? n : 0][j][XF ? 4 * c + (jj & 1) + 2 : 0];
+                    acc[jj][n][j] = bdi_upd_k45f(acc[jj][n][j], dl, dh, st.pa[0], st.pa[1], st.pa[2], st.pa[3], c0[j], c1[j], xl, xh);
+                    acc[jj][n][2 + j] = bdi_upd_k45f(acc[jj][n][2 + j], dl, dh, st.pb[0], st.pb[1], st.pb[2], st.pb[3], c0[2 + j], c1[2 + j], xl, xh);
+                } else if (T == 14) {
+                    const float dl = xdv[n][j][jj];
+                    const int xl = 32 * xsi[XF ? 0 : n][j][XF ? 0 : 2 * jj], xh = 32 * xsi[XF ? 0 : n][j][XF ? 0 : 2 * jj + 1];
+                    acc[jj][n][j] = bdi_upd_2(acc[jj][n][j], dl, st.pa[0], st.pa[1], c0[j] - xl, c1[j] - xh);
+                    acc[jj][n][2 + j] = bdi_upd_2(acc[jj][n][2 + j], dl, st.pb[0], st.pb[1], c0[2 + j] - xl, c1[2 + j] - xh);
+                } else if (T == 10) {   /* Q2_K: bdi_step's, the scale and min of each 16 */
+                    const float dl = xdv[n][j][jj];
+                    const float xl = xsf[XF ? n : 0][j][XF ? 2 * jj : 0], xh = xsf[XF ? n : 0][j][XF ? 2 * jj + 1 : 0];
+                    acc[jj][n][j] = bdi_upd_k45f(acc[jj][n][j], dl, dl, st.pa[0], st.pa[1], st.pa[2], st.pa[3], c0[j], c1[j], xl, xh);
+                    acc[jj][n][2 + j] = bdi_upd_k45f(acc[jj][n][2 + j], dl, dl, st.pb[0], st.pb[1], st.pb[2], st.pb[3], c0[2 + j], c1[2 + j], xl, xh);
+                } else if (bd_mq_two(T)) {   /* Q3_K, IQ2_XS, IQ2_S, IQ1_S: a scale each 16 */
+                    const float dl = xdv[n][j][jj];
+                    acc[jj][n][j] = bdi_upd_2(acc[jj][n][j], dl, st.pa[0], st.pa[1], c0[j], c1[j]);
+                    acc[jj][n][2 + j] = bdi_upd_2(acc[jj][n][2 + j], dl, st.pb[0], st.pb[1], c0[2 + j], c1[2 + j]);
+                } else {
+                    const float dl = xdv[n][j][jj];
+                    acc[jj][n][j] = bdi_upd_1(acc[jj][n][j], dl, st.pa[0], c0[j]);
+                    acc[jj][n][2 + j] = bdi_upd_1(acc[jj][n][2 + j], dl, st.pb[0], c0[2 + j]);
+                }
+            }
+        }
     }
 }
 /* A block: 16 outputs, NG = lpr / 8 warps. A super-block holds 8 consecutive steps, so classes
@@ -1287,27 +1417,38 @@ __global__ static void __launch_bounds__(32 * NG) bd_mmg_k(float *__restrict__ y
     COLI_PDL_WAIT();
     constexpr int SB = bd_mq_sb(T), RW = bd_mq_rw(T, G), CH = bd_mq_ch(T, G), LPR = 8 * NG, R = 8 * NT;
     constexpr int STW = 2 * 16 * RW, PW = LPR * R * 16, SMW = NG * STW > PW ? NG * STW : PW;
+    constexpr bool K45 = T == 12 || T == 13;
     __shared__ __align__(16) bd_u32 sm[SMW];   /* the warps' stages, then the classes' sums */
+    __shared__ __align__(16) float sct[K45 ? NG * 256 : 4];   /* the K types' scales, a table a warp (bd_mmg_sb) */
     /* the grid types' tables (bd_tables_fill; IQ1_S's grid of 2048 rows here only, the GEMV reads it from the table) */
-    constexpr int TW = T == 19 ? 4096 : bd_tab_words(T);
-    __shared__ __align__(16) bd_u32 tsm[TW > 0 ? TW : 4];
-    BdTabs tb = {nullptr, nullptr, nullptr, tab};
+    constexpr int TW = T == 19 ? 4096 : bd_tab_words(T), MW = bd_ks_words(T) ? 256 : 0;
+    __shared__ __align__(16) bd_u32 tsm[TW + MW > 0 ? TW + MW : 4];
+    BdTabs tb = {nullptr, nullptr, nullptr, tab, nullptr};
     if (T == 19) {
         for (int i = (int)threadIdx.x; i < TW; i += (int)blockDim.x) tsm[i] = __ldg(tab + BDT_IQ1S + i);
         tb.grid = tsm;
         __syncthreads();
-    } else if (TW > 0) { tb = bd_tables_fill<T>(tsm, tab); __syncthreads(); }
+    } else if (TW > 0) {
+        tb = bd_tables_fill<T>(tsm, tab);
+        if (MW) {   /* the ksigns' masks (BdTabs.ksm), each the bits bdi_neg's bdi_smask gives */
+            for (int i = (int)threadIdx.x; i < 128; i += (int)blockDim.x) {
+                const bd_u32 s8 = __ldg(tab + BDT_KSIGNS + i);
+                tsm[TW + 2 * i] = bdi_smask(s8 & 15u); tsm[TW + 2 * i + 1] = bdi_smask((s8 >> 4) & 15u);
+            }
+            tb.ksm = tsm + TW;
+        }
+        __syncthreads();
+    }
     const int lane = (int)threadIdx.x & 31, w = (int)threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
     const int nb = I / 32, qr = bd_xq_row(I), nsb = I / 256, o0 = (int)blockIdx.x * 16;
     const float *gdx = reinterpret_cast<const float *>(gq + (size_t)S * qr);
     const int *gxs = reinterpret_cast<const int *>(gdx + (size_t)S * nb);
-    /* x: each n tile's B row (column g) and this thread's two C rows (2t, 2t + 1) */
-    const bd_u32 *xb[NT]; const float *xd[NT][2]; const int *xsum[NT][2]; bool bl[NT], live[NT][2];
+    /* x: each n tile's B row (column g) and this thread's two C rows (2t, 2t + 1), the last row's past S */
+    const bd_u32 *xb[NT]; const float *xd[NT][2]; const int *xsum[NT][2]; bool live[NT][2];
     #pragma unroll
     for (int n = 0; n < NT; n++) {
         const int sx = 8 * n + g;
-        bl[n] = sx < S;
-        xb[n] = reinterpret_cast<const bd_u32 *>(gq + (size_t)min(sx, S - 1) * qr) + t;
+        xb[n] = reinterpret_cast<const bd_u32 *>(gq + (size_t)min(sx, S - 1) * qr) + (bd_mq_perm(T) ? 4 * (t >> 1) + 2 * (t & 1) : t);
         #pragma unroll
         for (int j = 0; j < 2; j++) {
             const int sr = 8 * n + 2 * t + j;
@@ -1335,108 +1476,12 @@ __global__ static void __launch_bounds__(32 * NG) bd_mmg_k(float *__restrict__ y
     int k = 0;
     for (int sb = w; sb < nsb; sb += NG, k++) {
         bd_cp_wait<0>();
-        __syncwarp();   /* stage k in for every lane; every lane done with stage k - 1, whose buffer stage k + 1 takes */
+        __syncwarp();   /* stage k in for every lane; every lane done with stage k - 1 (and the scales' table), whose buffer stage k + 1 takes */
         if (sb + NG < nsb) stage(sb + NG, (k + 1) & 1);
-        const int lo = (sb * SB) & ~(G - 1);
-        const bd_u32 *rows = stw + (k & 1) * 16 * RW - lo / 4;   /* row r's words, addressed as the row's */
+        const bd_u32 *rows = stw + (k & 1) * 16 * RW;   /* row r's stage at r RW, from its byte (sb SB) & ~(G - 1) */
         const bd_u32 *Wa = rows + g * RW, *Wb = rows + (g + 8) * RW;
-        /* the stage's scales of this thread's two rows, a quarter each thread of the quad (bd_mq_scale's
-         * items 4t .. 4t + 3), handed to the quad's others by shuffles as the steps need them */
-        float sv[2][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
-        #pragma unroll
-        for (int r = 0; r < 2; r++) {
-            const bd_u32 *Wr = r ? Wb : Wa;
-            if (bd_mq_own(T)) { (void)Wr; }   /* bd_mmq_own's, a step at a time */
-            else if (T == 12 || T == 13) {
-                const uint4 hd = bdm_w4<true>(Wr, (bd_u32)sb * (T == 12 ? 9u : 11u));
-                const float d = bd_h2f(hd.x), dm = bd_h2f(hd.x >> 16);
-                const uint2 v0 = bdi_k4sm(hd, 2u * (bd_u32)t), v1 = bdi_k4sm(hd, 2u * (bd_u32)t + 1u);
-                sv[r][0] = d * (float)v0.x; sv[r][1] = dm * (float)v0.y; sv[r][2] = d * (float)v1.x; sv[r][3] = dm * (float)v1.y;
-            } else if (T == 14) {
-                #pragma unroll
-                for (int i = 0; i < 4; i++) sv[r][i] = bd_mq_scale<T>(Wr, sb, 4 * t + i);
-            } else {
-                sv[r][0] = bd_mq_scale<T>(Wr, sb, 2 * t); sv[r][1] = bd_mq_scale<T>(Wr, sb, 2 * t + 1); sv[r][2] = sv[r][3] = 0.f;
-            }
-        }
-        const int quad = lane & ~3;
-        /* the super-block's x side, every step's, loaded before its weights are decoded: its codes (this
-         * thread's B words), its blocks' scales and its groups' code sums (the C rows'), so the loads
-         * overlap instead of waiting at each step */
-        constexpr bool XH = T == 12 || T == 13, XS = T == 10 || T == 12 || T == 13 || T == 14;
-        bd_u32 pb0[8][NT], pb1[8][NT]; float pdl[8][NT][2], pdh[XH ? 8 : 1][NT][2]; int psl[XS ? 8 : 1][NT][2], psh[XS ? 8 : 1][NT][2];
-        #pragma unroll
-        for (int jj = 0; jj < 8; jj++) {
-            const int q = 8 * sb + jj;
-            int kx0, kx1, gx0, gx1, dx0, dx1;
-            if (T == 12 || T == 13) {
-                const int e = sb * 64 + ((jj >> 1) & 3) * 16 + (jj & 1) * 4;
-                kx0 = e >> 2; kx1 = kx0 + 2; gx0 = kx0; gx1 = kx0 + 2; dx0 = gx0 >> 1; dx1 = gx1 >> 1;
-            } else { kx0 = 2 * q; kx1 = 2 * q + 1; gx0 = 2 * q; gx1 = 2 * q + 1; dx0 = dx1 = q; }
-            #pragma unroll
-            for (int n = 0; n < NT; n++) {
-                pb0[jj][n] = bl[n] ? __ldg(xb[n] + 4 * bd_x4(kx0)) : 0u; pb1[jj][n] = bl[n] ? __ldg(xb[n] + 4 * bd_x4(kx1)) : 0u;
-                #pragma unroll
-                for (int j = 0; j < 2; j++) {
-                    pdl[jj][n][j] = __ldg(xd[n][j] + dx0);
-                    if (XH) pdh[XH ? jj : 0][n][j] = __ldg(xd[n][j] + dx1);
-                    if (XS) { psl[XS ? jj : 0][n][j] = __ldg(xsum[n][j] + gx0); psh[XS ? jj : 0][n][j] = __ldg(xsum[n][j] + gx1); }
-                }
-            }
-            (void)dx1; (void)gx1;
-        }
-        #pragma unroll
-        for (int jj = 0; jj < 8; jj++) {
-            const int q = 8 * sb + jj;
-            BdMqStep st;
-            if (bd_mq_own(T)) { bd_mmq_own<T, true>(Wa, q, t, tb, st.A0a, st.A1a, st.pa); bd_mmq_own<T, true>(Wb, q, t, tb, st.A0b, st.A1b, st.pb); }
-            else bd_mmq_a<T, true, false>(Wa, Wb, q, t, st);
-            if (bd_mq_own(T)) {}
-            else if (T == 12 || T == 13) {   /* groups 2c and 2c + 1: thread c's */
-                const int src = quad | ((jj >> 1) & 3);
-                #pragma unroll
-                for (int i = 0; i < 4; i++) { st.pa[i] = __shfl_sync(0xffffffffu, sv[0][i], src); st.pb[i] = __shfl_sync(0xffffffffu, sv[1][i], src); }
-            } else if (T == 14) {   /* items i and i + 1, i = 8 (jj / 4) + 2 (jj % 4): thread i / 4's, at i % 4 */
-                const int i = 8 * (jj >> 2) + 2 * (jj & 3), src = quad | (i >> 2), kk = i & 3;
-                st.pa[0] = __shfl_sync(0xffffffffu, sv[0][kk], src); st.pa[1] = __shfl_sync(0xffffffffu, sv[0][kk + 1], src);
-                st.pb[0] = __shfl_sync(0xffffffffu, sv[1][kk], src); st.pb[1] = __shfl_sync(0xffffffffu, sv[1][kk + 1], src);
-            } else {   /* item jj: thread jj / 2's, at jj % 2 */
-                const int src = quad | (jj >> 1), kk = jj & 1;
-                st.pa[0] = __shfl_sync(0xffffffffu, sv[0][kk], src); st.pb[0] = __shfl_sync(0xffffffffu, sv[1][kk], src);
-            }
-            #pragma unroll
-            for (int n = 0; n < NT; n++) {
-                const bd_u32 b0 = pb0[jj][n], b1 = pb1[jj][n];
-                int c0[4] = {0, 0, 0, 0}, c1[4] = {0, 0, 0, 0};
-                if (bd_mq_two(T)) { bd_mma16(c0, st.A0a, st.A0b, b0); bd_mma16(c1, st.A1a, st.A1b, b1); }
-                else bd_mma32(c0, st.A0a, st.A0b, st.A1a, st.A1b, b0, b1);
-                #pragma unroll
-                for (int j = 0; j < 2; j++) {
-                    if (!live[n][j]) continue;   /* a column past the rows of x: never written */
-                    const float dl = pdl[jj][n][j];
-                    if (T == 12 || T == 13) {
-                        const float dh = pdh[XH ? jj : 0][n][j];
-                        const int xl = psl[XS ? jj : 0][n][j], xh = psh[XS ? jj : 0][n][j];
-                        acc[jj][n][j] = bdi_upd_k45(acc[jj][n][j], dl, dh, st.pa[0], st.pa[1], st.pa[2], st.pa[3], c0[j], c1[j], xl, xh);
-                        acc[jj][n][2 + j] = bdi_upd_k45(acc[jj][n][2 + j], dl, dh, st.pb[0], st.pb[1], st.pb[2], st.pb[3], c0[2 + j], c1[2 + j], xl, xh);
-                    } else if (T == 14) {
-                        const int xl = 32 * psl[XS ? jj : 0][n][j], xh = 32 * psh[XS ? jj : 0][n][j];
-                        acc[jj][n][j] = bdi_upd_2(acc[jj][n][j], dl, st.pa[0], st.pa[1], c0[j] - xl, c1[j] - xh);
-                        acc[jj][n][2 + j] = bdi_upd_2(acc[jj][n][2 + j], dl, st.pb[0], st.pb[1], c0[2 + j] - xl, c1[2 + j] - xh);
-                    } else if (T == 10) {   /* Q2_K: bdi_step's, the scale and min of each 16 */
-                        const int xl = psl[XS ? jj : 0][n][j], xh = psh[XS ? jj : 0][n][j];
-                        acc[jj][n][j] = bdi_upd_k45(acc[jj][n][j], dl, dl, st.pa[0], st.pa[1], st.pa[2], st.pa[3], c0[j], c1[j], xl, xh);
-                        acc[jj][n][2 + j] = bdi_upd_k45(acc[jj][n][2 + j], dl, dl, st.pb[0], st.pb[1], st.pb[2], st.pb[3], c0[2 + j], c1[2 + j], xl, xh);
-                    } else if (bd_mq_two(T)) {   /* Q3_K, IQ2_XS, IQ2_S, IQ1_S: a scale each 16 */
-                        acc[jj][n][j] = bdi_upd_2(acc[jj][n][j], dl, st.pa[0], st.pa[1], c0[j], c1[j]);
-                        acc[jj][n][2 + j] = bdi_upd_2(acc[jj][n][2 + j], dl, st.pb[0], st.pb[1], c0[2 + j], c1[2 + j]);
-                    } else {
-                        acc[jj][n][j] = bdi_upd_1(acc[jj][n][j], dl, st.pa[0], c0[j]);
-                        acc[jj][n][2 + j] = bdi_upd_1(acc[jj][n][2 + j], dl, st.pb[0], c0[2 + j]);
-                    }
-                }
-            }
-        }
+        if (SB % G != 0 && ((sb * SB) & (G - 1)) != 0) bd_mmg_sb<T, NT, 2>(Wa, Wb, tb, t, sb, xb, xd, xsum, sct + w * 256 * K45, acc);
+        else bd_mmg_sb<T, NT, 0>(Wa, Wb, tb, t, sb, xb, xd, xsum, sct + w * 256 * K45, acc);
     }
     __syncthreads();   /* every warp done with its stages: the room takes the classes' sums */
     float *ps = reinterpret_cast<float *>(sm);   /* class l, row s, output o at (l R + s) 16 + o */

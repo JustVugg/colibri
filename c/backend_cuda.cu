@@ -1775,29 +1775,34 @@ static int bd_tensor_upload(ColiCudaTensor **tensor, const void *weights, int fm
  * DeltaNet's alpha and beta, 48) has too few blocks for it, and stays on the GEMV for every row
  * count (a matrix's form is its shape's, never its rows': its rows keep the same bits) */
 #define BD_MMQ_MIN_O 2048
-/* the first row count bd_mmg_k takes for t, as quick as the GEMV from there (whose bits its are): 4 where
- * the inputs are 16384 or more, or the outputs and the matrix under 2^28 weights; 5 from 8192 of
- * either; else 6. An RTX PRO 4000, us at 4 and 8 rows, GEMV / bd_mmg_k: Q5_K 5120 x 17408 207 / 189,
- * 323 / 210; Q6_K 17408 x 5120 353 / 240, 639 / 265; Q5_K 5120 x 10240 105 / 124, 184 / 134 (5 rows
- * 144 / 128); Q5_K 6144 x 5120 68 / 88, 113 / 93 (6 rows 92 / 90); the lm_head, Q6_K 5120 x 248320,
- * 3517 / 3901, 6814 / 4327 (5 rows 6102 / 4034). COLI_CUDA_BD_MMQ=n: from n rows for every matrix, 0
+/* the first row count bd_mmg_k takes for t, as quick as the GEMV from there (whose bits its are), by
+ * type and shape from an RTX PRO 4000's measures (us at 1 / 2 / 3 / 4 rows, GEMV against bd_mmg_k):
+ * Q3_K from one row on every shape (5120 x 17408 133 / 119 at 1; the lm_head, 5120 x 248320, 2184 /
+ * 2013); Q6_K and Q8_0 from 2 (Q6_K 17408 x 5120 240 / 210 at 2), the lm_head and Q6_K's rows of 2560 or
+ * fewer inputs from 3 (Q6_K 5120 x 248320 3064 / 3160 at 2, 3288 / 3258 at 3), Q8_0's matrices under
+ * 2^24 weights from 3; Q4_K from 3 (5120 x 10240 82.9 / 83.3 at 3, 90.7 / 86.5 at 4); Q5_K from 3 where
+ * the outputs are 16384 or more, else 4 (17408 x 5120 170.6 / 177.6 at 3); IQ4_XS and IQ4_NL from 3,
+ * rows of 2560 or fewer inputs from 4 (2560 x 10240 42.0 / 43.9 at 3); IQ2_XXS and IQ1_S from 3,
+ * IQ2_XXS 2560 x 8192 or more from 5 (2560 x 10240 34.2 / 35.6 at 4); IQ2_XS, IQ2_S, IQ3_XXS, Q2_K
+ * from 4 (IQ2_XS 5120 x 17408 116.7 / 126.6 at 3, 135.6 / 129.8 at 4); IQ3_S from 4, rows of 2560
+ * inputs from 5 (2560 x 10240 40.7 / 43.1 at 4). COLI_CUDA_BD_MMQ=n: from n rows for every matrix, 0
  * never. */
 static inline int bd_mmq_min(const ColiCudaTensor *t) {
     static int v = -2;
     if (v == -2) { const char *e = std::getenv("COLI_CUDA_BD_MMQ"); v = e && *e ? (std::atoi(e) > 0 ? std::atoi(e) : 0) : -1; }
     if (v >= 0) return v;
     const int ty = t->fmt - 100;
-    /* the grid types (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S): the GEMV takes 4 rows a block, so from
-     * 5 rows it reads the weights twice; at 4 the tensor cores win only on long rows. Q2_K, Q3_K, IQ1_S: from 4.
-     * An RTX PRO 4000, us at 4 and 5 rows, GEMV / bd_mmg_k: IQ2_XXS 5120 x 17408 130 / 135, 180 / 140;
-     * 17408 x 5120 155 / 137; 6144 x 5120 50.4 / 50.5, 64 / 52; Q3_K 6144 x 5120 69 / 67, 104 / 69;
-     * the lm_head, Q3_K 5120 x 248320, 3166 / 3068, 5296 / 3150; IQ1_S (its grid in shared memory) from 4 on every
-     * shape, 5120 x 17408 143 / 128, 202 / 133 */
-    if (ty == 10 || ty == 11 || ty == 19) return 4;
-    if (ty >= 16 && ty <= 22) return t->I >= 16384 ? 4 : 5;
-    const int big = t->I > t->O ? t->I : t->O;
-    if (t->I >= 16384 || (t->O >= 16384 && (size_t)t->I * t->O < ((size_t)1 << 28))) return 4;
-    return big >= 8192 ? 5 : 6;
+    const size_t n = (size_t)t->I * t->O;
+    if (ty == 11) return 1;
+    if (ty == 19) return 3;
+    if (ty == 16) return t->I <= 2560 && t->O >= 8192 ? 5 : 3;
+    if (ty == 21) return t->I <= 2560 ? 5 : 4;
+    if (ty == 10 || ty == 17 || ty == 18 || ty == 22) return 4;
+    if (ty == 14) return t->O >= 131072 || t->I <= 2560 ? 3 : 2;
+    if (ty == 8) return t->O >= 131072 || n < ((size_t)1 << 24) ? 3 : 2;
+    if (ty == 13) return t->O >= 16384 ? 3 : 4;
+    if (ty == 12) return 3;
+    return t->I <= 2560 ? 4 : 3;   /* IQ4_XS, IQ4_NL */
 }
 /* whether bd_mmg_k takes S rows of t (sm_80 on): its types, the GEMV's classes 8 or more, 2048 outputs or
  * more (a smaller matrix has too few blocks for it and stays on the GEMV) */

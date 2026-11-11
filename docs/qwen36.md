@@ -247,6 +247,19 @@ code / prose / list, tok/s, every text plain decoding's:
 | MTP, 3 drafts | 56.8 / 41.2 / 45.4 | 60.7 / 40.6 / 46.5 |
 | DFlash2 (`COLI_DFLASH`) | 54.4 / 36.8 / 38.7 | 65.2 / 38.9 / 40.7 |
 
+A warp's super-block then took its x side in vector loads before the steps, the steps no
+branch, the decode offsets known when it compiles, Q4_K's and Q5_K's scales a table instead of
+shuffles, and IQ2_XXS and IQ3_XXS a k order where a thread holds a whole grid entry: at 8 rows
+Q4_K 5120 x 17408 177 -> 147 us (the GEMV's one row 128), Q6_K 17408 x 5120 282 -> 226 (217),
+IQ2_XXS 144 -> 117 (71), the same bits. The first row count it takes was measured again by
+type and shape (`COLI_CUDA_BD_MMQ` in [ENVIRONMENT.md](ENVIRONMENT.md)); Q3_K takes it from one
+row. Alternated with the kernel before, code / prose / list, tok/s, every text plain decoding's:
+
+| v3.1 | MTP, 3 drafts | DFlash2 |
+|---|---|---|
+| UD-Q4_K_XL | 47.9 / 31.0 / 34.9 -> 50.9 / 31.6 / 35.4 | 62.2 / 32.6 / 35.6 -> 67.8 / 34.4 / 37.5 |
+| UD-IQ2_XXS | 59.7 / 40.8 / 45.3 -> 63.8 / 41.7 / 46.3 | 64.7 / 38.1 / 40.2 -> 73.0 / 40.8 / 42.5 |
+
 **Several conversations drafting (`--kv-slots` with `Q36_MTP=1`).** On the CUDA chain each
 conversation keeps an MTP head state of its own (its KV cache on the card, swapped as the
 trunk's), and a step's rows verify the greedy conversations' drafts as one conversation's
