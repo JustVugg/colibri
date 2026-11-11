@@ -26,7 +26,9 @@ jobs:
     # make check built serially and took 23 minutes on 2026-10-17, then past 25 with two
     # more engines' GGUF code: the builds now use every core (make test runs the C and
     # Python suites one after the other, so only the compiling is parallel).
-    timeout-minutes: 35
+    # 2026-11-11: 30.0 minutes on #2750, then cancelled at 35 twice on #2759, which adds
+    # a GGUF MTP suite. 50.
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
       - name: make check
