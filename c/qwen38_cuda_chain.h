@@ -3021,6 +3021,20 @@ static int q38cc_moe_group_take(Q38CChain *ch, Model *m, Layer *l, int i, int o,
            cc_copy(ch->dm_idsd, io, ch->mg_ids, (size_t)o * K, (size_t)n * K) && cc_copy(ch->dm_wd, io, ch->mg_w, (size_t)o * K, (size_t)n * K);
 }
 /* 1 done, 0 declined before any layer ran, -1 lost */
+/* DFlash2's drafter (dflash_cuda.h) while it takes this forward's rows: the mean of the four streams
+ * after its target layers (their sum: its hidden_norm makes it the mean) */
+static DfDrafter *q38cc_df(Model *m) { return g_q38_df.on && !m->mux_rows ? &g_q38_df : NULL; }
+static void q38cc_df_tap(Model *m, Q38CChain *ch, int layer, int n, int row0) {
+    DfDrafter *df = q38cc_df(m);
+    int j = df ? df_tap_index(df, layer) : -1;
+    if (j >= 0 && !df_tap(df, q38cc_hb(ch), (size_t)q38cc_ho(ch, m->c.hc_width), m->c.hc_width, m->c.hc_count, n, j, row0)) {
+        fprintf(stderr, "[dflash] the drafter's rows failed: drafts off\n"); df->on = 0;
+    }
+}
+static void q38cc_df_ctx(Model *m, int n, int pos0) {
+    DfDrafter *df = q38cc_df(m);
+    if (df && !df_ctx(df, n, pos0)) { fprintf(stderr, "[dflash] the drafter's rows failed: drafts off\n"); df->on = 0; }
+}
 static int q38cc_forward_lm(Model *m, Q38CChain *ch, const int *ids, int S, int pos_base, int nlogits,
                             float *hyper_h, int want_streams, float *logit, int rows) {
     Cfg *c = &m->c; int H = c->hidden, W = c->hc_width, L = c->layers, E = c->experts, V = c->vocab, K = c->topk;
@@ -3083,6 +3097,7 @@ static int q38cc_forward_lm(Model *m, Q38CChain *ch, const int *ids, int S, int 
                 else ok = ok && q38cc_gr_read(ch, m, &l->mlp_gr, ch->o_mn[i], n, ch->inj_m) &&
                           q38cc_dm_layer_lm(ch, m, l, i, n, c0 == g0, c0 + n >= g0 + gn);
                 ok = ok && q38cc_moe_apply(ch, m, n, ch->dm_y);
+                if (ok) q38cc_df_tap(m, ch, i, n, c0 - g0);
                 if (ok && want_streams && i == L - 1) ok = cc_copy(ch->hypd, 0, ch->hyper_all, (size_t)(c0 - g0) * W, (size_t)n * W);   /* q38cc_forward reserved it */
                 int lo0 = S - nlogits > c0 ? S - nlogits - c0 : 0, lo_n = n - lo0;
                 if (ok && i == L - 1 && lo0 < n && c0 + n > S - nlogits) {
@@ -3107,6 +3122,12 @@ static int q38cc_forward_lm(Model *m, Q38CChain *ch, const int *ids, int S, int 
                 if (i == L - 1) nlast = n;
                 ch->dn_where = Q38CC_DEV; ch->host_zero = 0;
             }
+        }
+        if (q38cc_df(m)) {   /* the segment's rows into the drafter's cache */
+            if (!q38cc_frame_begin(ch)) { free(cs_all); return -1; }
+            ch->hyp = NULL; ch->hoff = 0;
+            q38cc_df_ctx(m, gn, pos_base + g0);
+            if (!cc_submit(0)) { free(cs_all); return -1; }
         }
     }
     free(cs_all);
@@ -3190,9 +3211,10 @@ static int q38cc_lane_ready(Q38CChain *ch, Model *m, int n) {
     return ok;
 }
 /* lane k's layer i up to its routes and shared expert (*v: its host word, 0 none); pending: the layer before left its sum in dm_y */
-static int q38cc_lane_a(Q38CChain *ch, Model *m, int i, int n, int c0, int pb, int pending, unsigned *v) {
+static int q38cc_lane_a(Q38CChain *ch, Model *m, int i, int n, int c0, int pb, int pending, unsigned *v, int r0) {
     Cfg *c = &m->c; Layer *l = &m->L[i];
     int ok = !pending || q38cc_moe_apply(ch, m, n, ch->dm_y);
+    if (ok && pending) q38cc_df_tap(m, ch, i - 1, n, r0);   /* DFlash2's drafter: layer i - 1's rows of this lane */
     if (ok && i == c->ple_layer) ok = q38cc_ple(ch, m, n, c0, 0);
     ok = ok && q38cc_gr_read(ch, m, &l->attn_gr, ch->o_an[i], n, ch->inj_a);
     ok = ok && (c->is_attn[i] ? q38cc_attention(ch, m, l, i, n, pb) : q38cc_deltanet(ch, m, l, i, n, c0, 0));
@@ -3301,7 +3323,7 @@ static int q38cc_chunk_lanes(Q38CChain *ch, Model *m, const int *ids, int c0, in
         if (c->ple_layer >= 0 && c->ple_layer < L) q38cc_ple_rows(m, ids, cl[k], nl[k], ch->host_emb);
         ok = q38cc_hyper_in(ch, hyper_h + (size_t)cl[k] * W, nl[k], W);
     }
-    for (int k = 0; k < 2 && ok; k++) { q38cc_lane_use(ch, k); ok = q38cc_lane_a(ch, m, 0, nl[k], cl[k], pl[k], 0, &v[k]); }
+    for (int k = 0; k < 2 && ok; k++) { q38cc_lane_use(ch, k); ok = q38cc_lane_a(ch, m, 0, nl[k], cl[k], pl[k], 0, &v[k], cl[k] - c0); }
     for (int i = 0; i < L && ok; i++)
         for (int k = 0; k < 2 && ok; k++) {
             q38cc_lane_use(ch, k);
@@ -3311,7 +3333,7 @@ static int q38cc_chunk_lanes(Q38CChain *ch, Model *m, const int *ids, int c0, in
             }
             if (ok && v[k]) ok = q38cc_dm_serve(ch, m, i, nl[k], v[k]);   /* the device runs the other lane meanwhile */
             ok = ok && q38cc_dm_sum(ch, m, i, nl[k], v[k], k ? ch->lane2.dm_hid : ch->dm_hid, n, cl[k] - c0);   /* lane A's hid: the chunk's */
-            if (ok && i + 1 < L) ok = q38cc_lane_a(ch, m, i + 1, nl[k], cl[k], pl[k], 1, &v[k]);
+            if (ok && i + 1 < L) ok = q38cc_lane_a(ch, m, i + 1, nl[k], cl[k], pl[k], 1, &v[k], cl[k] - c0);
         }
     for (int j = 0; j < ch->ls_n; j++) ch->ls_mark[ch->ls_e[j]] = 0;
     ch->ls_n = 0; ch->ls_i = -1;
@@ -3319,6 +3341,7 @@ static int q38cc_chunk_lanes(Q38CChain *ch, Model *m, const int *ids, int c0, in
         q38cc_lane_use(ch, k);
         const int r0 = cl[k] - c0, n1 = nl[k];
         ok = q38cc_moe_apply(ch, m, n1, ch->dm_y);
+        if (ok) q38cc_df_tap(m, ch, L - 1, n1, r0);
         if (ok && want_streams) ok = cc_copy(ch->hypd, (size_t)r0 * W, ch->hyper, 0, (size_t)n1 * W);
         int lo0 = S - nlogits > cl[k] ? S - nlogits - cl[k] : 0, lo_n = n1 - lo0;
         int need_final = mixed_h || (lo0 < n1 && cl[k] + n1 > S - nlogits);
@@ -3329,6 +3352,7 @@ static int q38cc_chunk_lanes(Q38CChain *ch, Model *m, const int *ids, int c0, in
             ok = cc_matmul(q38cc_t(ch, &m->lm_head), ch->mixed, (size_t)lo0 * H, ch->outd, (size_t)dst * V, lo_n);
         }
     }
+    if (ok) { q38cc_lane_use(ch, 0); q38cc_df_ctx(m, n, pb); }   /* both lanes' rows into the drafter's cache */
     ok = ok && cc_submit(0) && cc_finish();
     for (int k = 0; k < 2 && ok; k++) { q38cc_lane_use(ch, k); q38cc_dm_books(ch, m, nl[k], pl[k]); }
     q38cc_lane_use(ch, 0);
@@ -3403,6 +3427,11 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
     }
     int half = c->rotary_dim / 2;
     int snapped = 0;
+    if (q38cc_df(m)) {   /* DFlash2's drafter: a chunk's rows, or a layer-major segment's */
+        int need = rows;
+        if (S > rows && q38cc_layer_major()) { int SEG = (q38cc_lm_rows() / rows > 0 ? q38cc_lm_rows() / rows : 1) * rows; need = S < SEG ? S : SEG; }
+        if (!df_reserve(&g_q38_df, need, m->kv_cap)) { fprintf(stderr, "[dflash] device memory for the drafter's rows refused: drafts off\n"); g_q38_df.on = 0; }
+    }
     double w0 = ch->wait_ms, h0 = ch->host_ms;
     ch->pc_prompt = q38cc_pc_take(ch, m, S);   /* a short prompt's pooled experts on the CPU */
     if (S > Q38CC_DM_ROWS && ch->pool_of) { if (ch->pc_prompt) ch->pc_took++; else ch->pc_staged++; }
@@ -3467,6 +3496,7 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
         for (int i = 0; i < L && ok; i++) {
             Layer *l = &m->L[i];
             if (pending) ok = q38cc_moe_apply(ch, m, n, routed);
+            if (ok && pending) q38cc_df_tap(m, ch, i - 1, n, 0);   /* DFlash2's drafter: layer i - 1's rows */
             if (ok && i == c->ple_layer) ok = q38cc_ple(ch, m, n, c0, ns);
             ok = ok && q38cc_gr_read(ch, m, &l->attn_gr, ch->o_an[i], n, ch->inj_a);
             ok = ok && (c->is_attn[i] ? q38cc_attention(ch, m, l, i, n, pb) : q38cc_deltanet(ch, m, l, i, n, c0, ns));
@@ -3504,6 +3534,7 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
             routed = ch->routed; pending = 1;
         }
         if (ok) ok = q38cc_moe_apply(ch, m, n, routed);
+        if (ok) { q38cc_df_tap(m, ch, L - 1, n, 0); q38cc_df_ctx(m, n, pb); }
         if (ok && want_streams) ok = cc_copy(ch->hypd, 0, ch->hyper, 0, (size_t)n * W);
         int lo0 = S - nlogits > c0 ? S - nlogits - c0 : 0, lo_n = n - lo0;   /* this chunk's logit rows */
         int need_final = mixed_h || (lo0 < n && c0 + n > S - nlogits);

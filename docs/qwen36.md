@@ -217,6 +217,11 @@ Measured on the 27B, greedy, thinking off, every text identical to plain decodin
 | RTX PRO 4000 SFF, v3.1 UD-Q4_K_XL (head inside): plain / three drafts | 20.3 / 47.1 tok/s | 20.3 / 31.1 tok/s |
 | RTX PRO 4000 SFF, v3.1 UD-IQ2_XXS with `MTP/mtp-Qwen3.8-27B-Q4_0.gguf`: plain / three drafts | 30.5 / 55.8 tok/s | 30.2 / 41.2 tok/s |
 
+**DFlash2.** `COLI_DFLASH=<dir>` drafts with a DFlash2 drafter (`z-lab/Qwen3.8-27B-DFlash2`)
+in the head's place on the CUDA chain: a block of 7 drafts in one pass, its context the
+chain's own rows. On the v3.1 UD-Q4_K_XL file code went from 48.8 tok/s (MTP, 3 drafts) to
+61.1; see [speculative.md](speculative.md#dflash2).
+
 **A verify's rows on the tensor cores.** On the CUDA chain (sm_80 on) a verify of 4 to 8
 rows, and several conversations' decode rows, go to the tensor cores' integer steps
 (`bd_mmg_k`, `COLI_CUDA_BD_MMQ`) with each row the bits the GEMV gives it alone, so the

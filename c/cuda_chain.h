@@ -267,6 +267,16 @@ typedef struct { int S, pos_base, IH, ID, topk, force, q_off, q_row, w_off, w_ro
  * and squares in double, as kimi_k3.c's res_mix). nb <= 15, y apart from x and blk. */
 typedef struct { int S, D, nb, x_off, x_row, b_off, b_row, w_off, y_off, y_row; float eps; } CcAres;
 typedef struct { int n, g_off, u_off, y_off; float b1, b2; } CcSitu;
+/* DFlash2's two-tap dynamic depthwise convolution (cuda_dflash.cuh): y[r][c] = k0 x[r][c] + k1 x[r-1][c] over
+ * blocks of B rows (x[r-1] 0 at a block's first row), k_t = prm[b_off + t C + c] plus (flags 2: times 1 plus)
+ * kp[kp_off + r kp_row + t kp_tap + g kp_g], g = c / gs (flags 1: c % (C / gs)); y apart from x */
+typedef struct { int n, C, B, gs, x_off, x_row, kp_off, kp_row, kp_tap, kp_g, y_off, y_row, b_off, flags; } CcDfConv;
+/* the top K (<= 32) of R rows of V scores, best first, ties to the lower column: values at out[o_off + r o_row + j],
+ * their columns as ints at out[o_off + r o_row + K + j]; splits (1 to 256) slices of a row in the first pass, its
+ * candidates in sc (R splits 2K floats) (cuda_dflash.cuh) */
+typedef struct { int R, V, K, x_off, x_row, o_off, o_row, splits; } CcDfTopk;
+/* a target layer's rows as the drafter's context: y[y_off + r y_row + c] = sum over b < C of x[x_off + r x_row + b D + c] */
+typedef struct { int n, D, C, x_off, x_row, y_off, y_row; } CcDfTap;
 
 typedef struct ColiCudaChainOps {
     size_t size;
@@ -436,6 +446,11 @@ typedef struct ColiCudaChainOps {
     /* Kimi K3's (cuda_k3c.cuh) */
     int  (*ares_mix)(CcBuf *x, CcBuf *blk, CcBuf *prm, CcBuf *y, const CcAres *p);
     int  (*situ)(CcBuf *g, CcBuf *u, CcBuf *y, const CcSitu *p);
+    /* DFlash2's drafter (cuda_dflash.cuh): dflash() 1 when the module has its ops */
+    int  (*dflash)(void);
+    int  (*dfconv)(CcBuf *x, CcBuf *kp, CcBuf *prm, CcBuf *y, const CcDfConv *p);
+    int  (*dftopk)(CcBuf *x, CcBuf *sc, CcBuf *out, const CcDfTopk *p);
+    int  (*dftap)(CcBuf *x, CcBuf *y, const CcDfTap *p);
 } ColiCudaChainOps;
 /* the table's size without the optional ops: a backend at least this big has the chain */
 #define CC_OPS_BASE_SIZE (offsetof(ColiCudaChainOps, route))
@@ -610,6 +625,16 @@ static inline int cc_ares_mix(CcBuf *x, CcBuf *blk, CcBuf *prm, CcBuf *y, const 
     return cc_k3_ready() ? cc_ops()->ares_mix(x, blk, prm, y, p) : 0;
 }
 static inline int cc_situ(CcBuf *g, CcBuf *u, CcBuf *y, const CcSitu *p) { return cc_k3_ready() ? cc_ops()->situ(g, u, y, p) : 0; }
+/* DFlash2's drafter's op: the module has it */
+static inline int cc_dflash_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, dftap) + sizeof t->dftap && t->dflash && t->dfconv && t->dftopk && t->dftap && t->dflash();
+}
+static inline int cc_dftap(CcBuf *x, CcBuf *y, const CcDfTap *p) { return cc_dflash_ready() ? cc_ops()->dftap(x, y, p) : 0; }
+static inline int cc_dftopk(CcBuf *x, CcBuf *sc, CcBuf *out, const CcDfTopk *p) { return cc_dflash_ready() ? cc_ops()->dftopk(x, sc, out, p) : 0; }
+static inline int cc_dfconv(CcBuf *x, CcBuf *kp, CcBuf *prm, CcBuf *y, const CcDfConv *p) {
+    return cc_dflash_ready() ? cc_ops()->dfconv(x, kp, prm, y, p) : 0;
+}
 /* the chain's and the backend's kernels loaded now where the backend can (an older one loads them
  * at their first launch) */
 static inline int cc_preload(void) {

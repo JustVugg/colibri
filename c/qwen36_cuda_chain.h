@@ -1181,7 +1181,7 @@ static int q36cc_deltanet(Q36CChain *ch, Model *m, Layer *l, int i, int n, int c
         CcDnRec rp = {len, vh, c->dn_kheads, c->dn_vdim, c->dn_kheads * c->dn_kdim, s0 * CD, CD, s0 * 2 * vh, 2 * vh,
                       vh + s0 * 2 * vh, 2 * vh, (int)z0 + s0 * zr, zr, s0 * vd, vd, snap_row,
                       (g_ssm_a_direct ? 2 : 0) | (g_dn_tiled ? 4 : 0), c->eps,   /* a GGUF's layout (qwen36.c) */
-                      1.f / sqrtf((float)c->dn_kdim), 0, 0, (int)ch->o_dn[i]};
+                      1.f / sqrtf((float)c->dn_kdim), 0, one ? rec_off : 0, (int)ch->o_dn[i], one ? ns : 0};
         ok = cc_dnconv(ch->qkvz, ch->prm, ch->ring[i], ch->cv, cs, &cp) &&
              cc_dnrec(c->dn_kdim, ch->cv, ch->ab, ch->qkvz, ch->rec[i], ch->prm, ch->dny, rs, &rp);
     }
@@ -1957,6 +1957,12 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
         if (ch->conv) q36cc_mux_drop(m);   /* the conversations' states the device holds, to the host */
         return 0;
     }
+    /* DFlash2's drafter (dflash_cuda.h): the rows after its target layers, each chunk's keys and values */
+    DfDrafter *df = g_q36_df.on && !ch->mx_rows ? &g_q36_df : NULL;
+    if (df && !df_reserve(df, rows, m->kv_cap)) {
+        fprintf(stderr, "[dflash] device memory for the drafter's rows refused: drafts off\n");
+        df->on = 0; df = NULL;
+    }
     int snapped = 0;
     double w0 = ch->wait_ms, h0 = ch->host_ms;
     for (int c0 = 0; c0 < S; c0 += rows) {
@@ -2032,6 +2038,9 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
             if (pending) {
                 ok = ok && q36cc_combine(ch, m, i - 1, n, routed);
                 if (ok && lf) ok = cc_copy(ch->lfd, ((size_t)(i - 1) * 3 + 2) * D, ch->x, (size_t)(n - 1) * D, D);
+            }
+            if (ok && df && i > 0 && df_tap_index(df, i - 1) >= 0 && !df_tap(df, ch->x, 0, D, 1, n, df_tap_index(df, i - 1), 0)) {
+                df->on = 0; df = NULL;
             }
             if (!normed) ok = ok && q36cc_norm(ch->x, 0, ch->prm, ch->o_in[i], ch->nrm, 0, n, D, c->eps);
             if (ch->mx_rows) ok = ok && (c->is_attn[i] ? q36cc_attention_mx(ch, m, l, i, n, c0) :
@@ -2113,6 +2122,8 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
             pending = 1;
         }
         if (ok) ok = q36cc_combine(ch, m, L - 1, n, routed);
+        if (ok && df && df_tap_index(df, L - 1) >= 0 && !df_tap(df, ch->x, 0, D, 1, n, df_tap_index(df, L - 1), 0)) { df->on = 0; df = NULL; }
+        if (ok && df && !df_ctx(df, n, pb)) { fprintf(stderr, "[dflash] the drafter's rows failed: drafts off\n"); df->on = 0; df = NULL; }
         if (ok && dm_ids_defer) ok = cc_copy(ch->dm_idsd, 0, ch->dm_ids, 0, (size_t)L * n * c->topk);
         if (ok && lf) ok = cc_copy(ch->lfd, ((size_t)(L - 1) * 3 + 2) * D, ch->x, (size_t)(n - 1) * D, D);
         if (ok && want_x) ok = cc_copy(ch->xd, 0, ch->x, 0, (size_t)n * D);
@@ -2176,6 +2187,7 @@ lost:   /* a frame failed: the device is gone (or would not take a command); the
  * (q36cc_mux_rollback), -1 none; want_x: the rows' residuals back in xh (the MTP head's) */
 static int q36cc_mux_step(Model *m, const Q36Row *rows, int S, float *xh, float *logit, const int *snap, int want_x) {
     Q36CChain *ch = q36cc_of(m);
+    g_q36_df.len = 0;   /* DFlash2's drafter keeps one conversation's rows: several in a step leave it none */
     if (!g_cuda_chain || !ch || !ch->conv || !q36cc_pool_ok(ch) || S < 1 || S > q36cc_rows_max(ch, m)) return 0;
     if (snap) {
         int slots = 0;

@@ -6800,6 +6800,9 @@ static void q36_embed_row(Model *m, int id, int pos, float *row) {
 }
 
 #ifdef COLI_CUDA
+#include "cuda_chain.h"
+#include "dflash_cuda.h"        /* COLI_DFLASH: DFlash2's drafter on the CUDA chain's device */
+static DfDrafter g_q36_df;
 #include "qwen36_cuda_chain.h"  /* COLI_CUDA_CHAIN: every layer's dense chain on the CUDA device */
 /* The CUDA chain's prompt staging (q36cc_gguf_stage_bytes), out of the tier's expert budget when
  * the card holds fewer than every routed expert of a GGUF (qt_reserve_short): taken from the
@@ -6832,6 +6835,27 @@ static int q36_cuda_tier_drafts(Model *m) {
 }
 #ifdef COLI_CUDA
 #include "qwen36_mtp_cuda.h"   /* Q36_MTP: the head on the CUDA chain's device */
+static void q36_df_embed(void *ctx, int id, float *out) { q36_embed_row((Model *)ctx, id, 0, out); }
+/* COLI_DFLASH=<dir>: DFlash2's drafter (dflash_cuda.h) on the CUDA chain's device, its context the
+ * chain's rows after the drafter's target layers; it drafts in the MTP head's place (Q36_MTP's
+ * depth and gate) */
+static void q36_df_attach(Model *m) {
+    const char *dir = getenv("COLI_DFLASH");
+    if (!dir || !*dir) return;
+    Q36CChain *ch = q36cc_of(m);
+    if (!g_cuda_chain || !ch || !ch->ok || ch->failed || !ch->t_lm || m->mpos || m->rope_delta) {
+        fprintf(stderr, "[dflash] COLI_DFLASH: the drafter runs on the CUDA chain's device, which is not up here: off\n");
+        return;
+    }
+    if (getenv("Q36_MTP") && !strcmp(getenv("Q36_MTP"), "1"))
+        fprintf(stderr, "[dflash] COLI_DFLASH and Q36_MTP=1: the drafter drafts, the MTP head stays off\n");
+    df_load(&g_q36_df, dir, m->c.hidden, m->c.vocab, ch->dev, ch->t_lm, q36_df_embed, m);
+}
+static int q36_df_on(void) { return g_q36_df.on; }
+static int q36_draft_ready(int pos) { return g_q36_df.on ? df_ready(&g_q36_df, pos) : q36_mtp_ready(pos); }
+#else
+static int q36_df_on(void) { return 0; }
+static int q36_draft_ready(int pos) { return q36_mtp_ready(pos); }
 #endif
 
 /* The forward: ids[0..S) at pos_base through every layer, the final norm and
@@ -6937,6 +6961,10 @@ static float *step_ex_control(Model *m, const int *ids, int S, int pos_base, int
         for (int s = 0; s < S; s++)
             rmsnorm_row(g_hidden_sink + (int64_t)s*D, x + (int64_t)s*D, m->final_norm, D, c->eps);
     }
+#ifdef COLI_CUDA
+    /* DFlash2's drafter: the chain put this forward's rows in its cache when it ran every layer */
+    if (g_q36_df.on) df_note(&g_q36_df, ids, S, pos_base, m->kvp.fed, m->kvp.len);
+#endif
     /* Recorded HERE, where the tokens actually entered the state, rather than
      * derived from the caller's bookkeeping: the invariant that fed[0..len-1]
      * are the ids the state was built from is the whole safety argument. */
@@ -8041,6 +8069,10 @@ static void q36_spec_begin(Model *m, Q36Spec *sp, const int *prompt, int np) {
     sp->force = q36_spec_force_mode(getenv("COLI_LOOKUP_FORCE"), &sp->force_row);
     e = getenv("COLI_SPEC_GATE");
     spec_gate_init(&sp->gate, e && *e == '0');
+    /* DFlash2: a request's first step plain, so its deep verifies are priced with T(1) measured
+     * (SPEC_RHO0 makes eight rows cost 4.5 steps: the drafts were cut at about four, 56 tok/s on code
+     * against 65 at seven) */
+    if (q36_df_on() && !sp->gate.off) sp->gate.since_plain = SPEC_REFRESH;
     int tier_off = (qt_ready() || m->dn_dev) && !q36_cuda_tier_drafts(m);
     if (sp->lookup && (tier_off || g_cache_route || qq_active())) {
         static int said;
@@ -8054,11 +8086,12 @@ static void q36_spec_begin(Model *m, Q36Spec *sp, const int *prompt, int np) {
     }
     /* the MTP head (Q36_MTP) drafts under the same conditions as prompt lookup */
     sp->mtp_force = q36_spec_force_mode(getenv("Q36_MTP_FORCE"), &sp->mtp_force_row);
-    sp->mtp = g_q36_mtp.on && !(tier_off || g_cache_route || qq_active());
+    sp->mtp = (g_q36_mtp.on || q36_df_on()) && !(tier_off || g_cache_route || qq_active());
     /* one draft by default: deeper ones measured slower here (each costs a head row on
-     * the CPU and a verify row, more than their acceptance returns); "auto": the gate */
+     * the CPU and a verify row, more than their acceptance returns); "auto": the gate.
+     * DFlash2's drafter: its whole block (one pass makes every draft) */
     e = getenv("Q36_MTP_DRAFTS");
-    sp->mtp_depth = !e || !*e ? 1 : !strcmp(e, "auto") ? 0 : atoi(e);
+    sp->mtp_depth = !e || !*e ? (q36_df_on() ? Q36_SPEC_ROWS - 1 : 1) : !strcmp(e, "auto") ? 0 : atoi(e);
     if (sp->mtp_depth < 0 || sp->mtp_depth > Q36_SPEC_ROWS - 1) { fprintf(stderr, "Q36_MTP_DRAFTS must be 0 (auto) or 1..%d\n", Q36_SPEC_ROWS - 1); exit(1); }
     /* the depth a verify carries, from each step's drafts' probabilities (spec_gate_pick_p),
      * within a fixed depth above; Q36_MTP_PSTEP=0 keeps it whatever the drafts look like */
@@ -8195,16 +8228,39 @@ static float *q36_spec_step(Model *m, Q36Spec *sp, int tok, int pos, int more) {
         else n = spec_lookup(sp->hist, sp->hist_n, 2, 4, lr, d);
         if (n > 0) k = spec_gate_pick(&sp->gate, SPEC_SRC_LOOKUP, n, &vl);
         /* the head's drafts instead, when the gate values them more */
-        if (sp->mtp && !sp->force && q36_mtp_ready(pos)) {
+        if (sp->mtp && !sp->force && q36_draft_ready(pos)) {
             double vm = 0; int km = q36_mtp_depth(sp, room, &vm);
             if (km > 0 && (k == 0 || vm > vl)) k = -km;
         }
         if (k > 0 && !q36_spec_alloc(m, k)) k = 0;
-    } else if (sp->mtp && room > 0 && q36_mtp_ready(pos)) k = -q36_mtp_depth(sp, room, NULL);
+    } else if (sp->mtp && room > 0 && q36_draft_ready(pos)) k = -q36_mtp_depth(sp, room, NULL);
     if (k < 0) {   /* the MTP head's drafts: the first from the model's row, the deeper ones
                     * from the head's own row before */
         int km = -k;
         k = q36_spec_alloc(m, km) ? km : 0;
+#ifdef COLI_CUDA
+        if (k && g_q36_df.on) {   /* DFlash2's drafter: the block in one pass, its time the verify's */
+            float pr[Q36_SPEC_ROWS], *emb = falloc(c->hidden);
+            t_verify = now_s();
+            q36_embed_row(m, tok, pos, emb);
+            int n = df_draft(&g_q36_df, emb, tok, pos, k, d, pr);
+            free(emb);
+            if (n < k) k = n;
+            for (int j = 0; j < k; j++) sp->ahead_p[j] = pr[j];
+            if (sp->mtp_pstep && sp->mtp_depth && !sp->mtp_force && k > 1) {
+                int kp = spec_gate_pick_p(&sp->gate, SPEC_SRC_MTP, k, sp->ahead_p, NULL);
+                k = kp < 1 ? 1 : kp;
+            }
+            if (k && sp->mtp_force) {
+                Q36Spec forced = *sp; forced.force = sp->mtp_force; forced.force_row = sp->mtp_force_row;
+                for (int j = 1; j <= k; j++) {
+                    int t = q36_spec_forced(&forced, k, j, pos, V);
+                    if (t >= 0) d[j - 1] = t;
+                }
+            }
+            src = SPEC_SRC_MTP;
+        } else
+#endif
         if (k) {
             float *hd = falloc(c->hidden);
             t_verify = now_s();
@@ -8282,6 +8338,9 @@ static void q36_spec_report(const Q36Spec *sp, const char *scope) {
                 100.0 * sp->mtp_accepted / sp->mtp_drafts, (unsigned long long)sp->mtp_accepted,
                 (unsigned long long)sp->mtp_drafts, g);
         q36_mtp_report();
+#ifdef COLI_CUDA
+        df_report(&g_q36_df);
+#endif
     }
     if (!sp->lookup && !sp->verifies) return;
     if (!sp->gate.off) {
@@ -10611,6 +10670,10 @@ int main(int argc, char **argv) {
     }
     if (g_vk_chain && g_pilot) fprintf(stderr, "[VK] qwen36: PILOT prefetch reads the residual on the host: the dense chain stays off\n");
     if (g_vk_chain || g_q36c_fit_on) atexit(vkc_shutdown_all);   /* registered after the tier's: runs before the device goes */
+#endif
+#ifdef COLI_CUDA
+    q36_df_attach(&m);    /* COLI_DFLASH=<dir>: DFlash2's drafter, in the MTP head's place */
+    if (!g_q36_df.on)
 #endif
     q36_mtp_attach(&m);   /* Q36_MTP=1: the MTP head */
 

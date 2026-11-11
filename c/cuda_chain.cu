@@ -2817,6 +2817,7 @@ rows:
         default: return 0;
         }
     }
+one:
     switch (KD) {
     case 4:   coli_launch(cc_dnrec_k<4>, (unsigned)p->VH, 128, 0, c->stream, a, b, zz, s, pr, yy, sn, *p); break;
     case 8:   coli_launch(cc_dnrec_k<8>, (unsigned)p->VH, 128, 0, c->stream, a, b, zz, s, pr, yy, sn, *p); break;
@@ -3580,6 +3581,7 @@ static int cc_preload(void) {
 #include "cuda_dsv4c.cuh"   /* DeepSeek V4.1's layer ops */
 #include "cuda_glm53c.cuh"  /* GLM-5.3's layer ops */
 #include "cuda_k3c.cuh"     /* Kimi K3's residual mix and activation */
+#include "cuda_dflash.cuh"  /* DFlash2's drafter's convolution */
 static const ColiCudaChainOps g_cc_ops = {
     sizeof(ColiCudaChainOps),
     cc_init, cc_ready, cc_lost_, cc_shutdown, cc_device, cc_device_now,
@@ -3616,5 +3618,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_kda_conv, cc_kda_rec,
     cc_mla_core, cc_mla_rope, cc_mla_lnorm, cc_mla_hgemv, cc_dsa_pool_keys, cc_dsa_pool_select, cc_dsa_select, cc_mla_hgemv_q8,
     cc_ares_mix, cc_situ,
+    cc_dflash, cc_dfconv, cc_dftopk, cc_dftap,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }
