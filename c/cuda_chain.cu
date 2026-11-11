@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <chrono>
 #ifndef _WIN32
 #include <unistd.h>   /* access: WSL2's /dev/dxg (cc_flush_on) */
@@ -33,6 +34,9 @@
 extern "C" int coli_cuda_tensor_shape(const ColiCudaTensor *t, int *fmt, int *I, int *O);
 extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, const float *x_dev, int S, void *stream);
 extern "C" int coli_cuda_tensor_glu_async(ColiCudaTensor *tg, ColiCudaTensor *tu, float *y_dev, const float *x_dev, int S, void *stream);
+/* the caller's word for this thread's next matmul: x as it was at the stream's last one (its
+ * quantization kept) */
+extern "C" void coli_cuda_bd_x_same(int on);
 extern "C" int coli_cuda_tensor_gemv_rows_async(ColiCudaTensor *t, const int *ids_dev, float *y_dev, const float *x_dev, int n, void *stream);
 /* and the routed experts' kernels (cc_moe), on the same terms, and a resident tensor's device copy */
 extern "C" int coli_cuda_tensor_dev(const ColiCudaTensor *t, const void **w, const float **sc, int *gs);
@@ -80,8 +84,12 @@ double cc_now_ms(void) {
     using namespace std::chrono;
     return duration<double, std::milli>(steady_clock::now().time_since_epoch()).count();
 }
-CcCtx *cur(void) { return g_cur >= 0 ? &g_cc[g_cur] : nullptr; }
-CcCtx *ctx_of(int device) { for (int i = 0; i < g_ncc; i++) if (g_cc[i].device == device) return &g_cc[i]; return nullptr; }
+/* a count of the calls that reach a context (each op's first step): two matmuls with nothing
+ * between them see consecutive counts (cc_matmul: its input unchanged since the last) */
+static std::atomic<unsigned long long> g_cc_seq{0};
+static thread_local unsigned long long t_cc_seq = 0;   /* this thread's last count */
+CcCtx *cur(void) { t_cc_seq = ++g_cc_seq; return g_cur >= 0 ? &g_cc[g_cur] : nullptr; }
+CcCtx *ctx_of(int device) { t_cc_seq = ++g_cc_seq; for (int i = 0; i < g_ncc; i++) if (g_cc[i].device == device) return &g_cc[i]; return nullptr; }
 /* every call: the context's device current (the backend's other calls switch it) */
 CcCtx *live(void) {
     CcCtx *c = cur();
@@ -2222,7 +2230,15 @@ static int cc_matmul(ColiCudaTensor *t, CcBuf *x, size_t xo, CcBuf *y, size_t yo
     if (!coli_cuda_tensor_shape(t, &fmt, &I, &O) || coli_cuda_tensor_device(t) != c->device) return 0;
     if ((xo + (size_t)S * I) * 4 > x->bytes || (yo + (size_t)S * O) * 4 > y->bytes) return 0;
     g_st.matmuls++; g_st.ops++;
-    if (!coli_cuda_tensor_gemm_async(t, y->d + yo, x->d + xo, S, (void *)c->stream)) { c->lost = 1; return 0; }
+    /* the input of the last matmul, with no call to the chain between (q, k and v; gate and up): its
+     * quantization stays */
+    static thread_local struct { const float *x; int S, I; unsigned long long seq; cudaStream_t st; } last = {nullptr, 0, 0, 0, nullptr};
+    const float *xp = x->d + xo;
+    coli_cuda_bd_x_same(last.x == xp && last.S == S && last.I == I && last.st == c->stream && last.seq + 1 == t_cc_seq);
+    const int ok = coli_cuda_tensor_gemm_async(t, y->d + yo, xp, S, (void *)c->stream);
+    coli_cuda_bd_x_same(0);
+    last = {xp, S, I, t_cc_seq, c->stream};
+    if (!ok) { c->lost = 1; last.x = nullptr; return 0; }
     return 1;
 }
 static int cc_addnorm(CcBuf *x, CcBuf *t, CcBuf *w, CcBuf *y, const CcAddNorm *p) {

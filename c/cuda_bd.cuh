@@ -173,6 +173,20 @@ __device__ __forceinline__ uint2 bdi_k4sm(uint4 hd, bd_u32 g) {
 /* row r's codes: words 8q .. 8q + 7 (a step's 32 inputs) */
 __device__ __forceinline__ void bdx_step8(const BdX &X, int r, bd_u32 q, int *xw) { bdx_u4(X, r, 2 * q, xw); bdx_u4(X, r, 2 * q + 1, xw + 4); }
 
+/* A step's float sum into acc, rounded op by op (the intrinsics are never contracted nor
+ * reordered): bdi_step and the tensor cores' steps (bd_mmg_k) call the same ones, so a step's
+ * sums are the same bits on either. Q4_K / Q5_K: two runs of 16, each a scale and a min;
+ * two scales per 16 (Q6_K); one scale (Q8_0, IQ4_NL, IQ4_XS). */
+__device__ __forceinline__ float bdi_upd_k45(float acc, float dxl, float dxh, float sl, float ml, float sh, float mh,
+                                             int il, int ih, int xsl, int xsh) {
+    const float a = __fmaf_rn(sl, (float)il, -__fmul_rn(ml, (float)xsl)), b = __fmaf_rn(sh, (float)ih, -__fmul_rn(mh, (float)xsh));
+    return __fadd_rn(acc, __fmaf_rn(dxl, a, __fmul_rn(dxh, b)));
+}
+__device__ __forceinline__ float bdi_upd_2(float acc, float dx, float c0, float c1, int s0, int s1) {
+    return __fmaf_rn(dx, __fmaf_rn(c0, (float)s0, __fmul_rn(c1, (float)s1)), acc);
+}
+__device__ __forceinline__ float bdi_upd_1(float acc, float dx, float dq, int s) { return __fmaf_rn(__fmul_rn(dx, dq), (float)s, acc); }
+
 /* Step q (weights 32q .. 32q + 31 of the row W, ggml type T) for the rows r < nrow of X,
  * each adding its sum to acc[r]: bdstep_i8.glsl's bsi_step */
 template <int T, int NR>
@@ -204,7 +218,7 @@ __device__ __forceinline__ void bdi_step(const bd_u32 *__restrict__ W, bd_u32 q,
             #pragma unroll
             for (int k = 0; k < 4; k++) { sl = bd_dp4a(wl[k], xl[k], sl); sh = bd_dp4a(wh[k], xh[k], sh); }
             const float *dx = X.dx + r * X.nb; const int *xs = X.xs + r * 2 * X.nb;
-            acc[r] += dx[gl >> 1] * (sl0 * (float)sl - ml0 * (float)xs[gl]) + dx[gh >> 1] * (sh0 * (float)sh - mh0 * (float)xs[gh]);
+            acc[r] = bdi_upd_k45(acc[r], dx[gl >> 1], dx[gh >> 1], sl0, ml0, sh0, mh0, sl, sh, xs[gl], xs[gh]);
         }
         return;
     }
@@ -230,7 +244,7 @@ __device__ __forceinline__ void bdi_step(const bd_u32 *__restrict__ W, bd_u32 q,
             for (int k = 0; k < 4; k++) { s0 = bd_dp4a(w[k], xw[k], s0); s1 = bd_dp4a(w[k + 4], xw[k + 4], s1); }
             const int *xs = X.xs + r * 2 * X.nb;
             s0 -= 32 * xs[2u * q]; s1 -= 32 * xs[2u * q + 1u];
-            acc[r] += X.dx[r * X.nb + q] * (c0 * (float)s0 + c1 * (float)s1);
+            acc[r] = bdi_upd_2(acc[r], X.dx[r * X.nb + q], c0, c1, s0, s1);
         }
         return;
     }
@@ -440,7 +454,8 @@ __device__ __forceinline__ void bdi_step(const bd_u32 *__restrict__ W, bd_u32 q,
             s -= sub * sx;
             if (T == 7) { acc[r] += X.dx[r * X.nb + q] * (dq * (float)s + mq * (float)sx); continue; }
         }
-        acc[r] += X.dx[r * X.nb + q] * dq * (float)s;
+        if (T == 8 || T == 20 || T == 23) acc[r] = bdi_upd_1(acc[r], X.dx[r * X.nb + q], dq, s);   /* bd_mmg_k's types */
+        else acc[r] += X.dx[r * X.nb + q] * dq * (float)s;
     }
 }
 
@@ -982,6 +997,322 @@ __global__ static void __launch_bounds__(256) bd_gemv_i8_k(float *__restrict__ y
     }
 }
 
+/* ---- the integer steps on the tensor cores: bd_mmg_k --------------------------------------
+ * y = x W^T for a verify's rows or several conversations' decode rows (4 to 8 of them) with the
+ * weights read once for all of them, and each row the bits the GEMV gives it alone (bd_gemv_i8_k).
+ * A step (bdi_step's: 32 weights of a row) is a mma.sync of 16 outputs by 8 rows of x, int8, so its
+ * integer dots are exact, and its float sum goes in with bdi_step's helpers (bdi_upd_*). The GEMV's
+ * lane l of a row adds the steps l, l + lpr, l + 2 lpr ... (bd_lpr) and its lanes' sums add by the
+ * butterfly; here the steps of class l (q mod lpr) go to accumulator l in the same order, and the
+ * classes' sums add by the same tree. sm_80 and later; the types of bd_mmq_has. */
+__host__ __device__ constexpr bool bd_mmq_has(int t) { return t == 8 || t == 12 || t == 13 || t == 14 || t == 20 || t == 23; }
+__device__ __forceinline__ void bd_mma16(int *c, bd_u32 a0, bd_u32 a1, bd_u32 b0) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                 : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3]) : "r"(a0), "r"(a1), "r"(b0));
+#else
+    (void)c; (void)a0; (void)a1; (void)b0;
+#endif
+}
+__device__ __forceinline__ void bd_mma32(int *c, bd_u32 a0, bd_u32 a1, bd_u32 a2, bd_u32 a3, bd_u32 b0, bd_u32 b1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#else
+    (void)c; (void)a0; (void)a1; (void)a2; (void)a3; (void)b0; (void)b1;
+#endif
+}
+/* One step's A fragments for the output rows Wa (fragment row g) and Wb (g + 8): word t of its two
+ * runs of 16 codes (A0: the first 16 of the step's dot, A1: the rest) and the rows' scales (pa,
+ * pb: Q4/5_K sl ml sh mh, Q6_K c0 c1, one scale dq); the x side: the code chunks kx0 kx1, the
+ * groups of 16 gx0 gx1, the blocks of 32 dx0 dx1 */
+struct BdMqStep { bd_u32 A0a, A0b, A1a, A1b; float pa[4], pb[4]; };
+/* the words of a row the decode reads: from global memory (__ldg), or (SM) from the stage bd_mmg_k
+ * copied into shared memory, addressed as the row's (the copy's offsets are the row's) */
+template <bool SM> __device__ __forceinline__ bd_u32 bdm_w(const bd_u32 *W, bd_u32 i) { if (SM) return W[i]; return __ldg(W + i); }
+template <bool SM> __device__ __forceinline__ uint4 bdm_w4(const bd_u32 *W, bd_u32 i) {
+    if (SM) return reinterpret_cast<const uint4 *>(W)[i];
+    return __ldg(reinterpret_cast<const uint4 *>(W) + i);
+}
+template <bool SM> __device__ __forceinline__ bd_u32 bdm_ldu(const bd_u32 *W, bd_u32 b) {
+    bd_u32 a = b >> 2;
+    return (b & 2u) == 0u ? bdm_w<SM>(W, a) : (bdm_w<SM>(W, a) >> 16) | (bdm_w<SM>(W, a + 1u) << 16);
+}
+template <bool SM> __device__ __forceinline__ float bdm_f16at(const bd_u32 *W, bd_u32 b) { return bd_h2f(bdm_w<SM>(W, b >> 2) >> ((b & 2u) * 8u)); }
+template <int T, bool SM = false, bool SC = true>
+__device__ __forceinline__ void bd_mmq_a(const bd_u32 *__restrict__ Wa, const bd_u32 *__restrict__ Wb, int q, int t, BdMqStep &st) {
+    if (T == 12 || T == 13) {
+        const bd_u32 b = (bd_u32)q >> 3, c = ((bd_u32)q >> 1) & 3u, h = (bd_u32)q & 1u, base = b * (T == 12 ? 144u : 176u);
+        if (SC) {
+            const uint4 ha = bdm_w4<SM>(Wa, base >> 4), hb = bdm_w4<SM>(Wb, base >> 4);
+            {
+                const float dmx = bd_h2f(ha.x), dmy = bd_h2f(ha.x >> 16);
+                const uint2 lo = bdi_k4sm(ha, 2u * c), hi = bdi_k4sm(ha, 2u * c + 1u);
+                st.pa[0] = dmx * (float)lo.x; st.pa[1] = dmy * (float)lo.y; st.pa[2] = dmx * (float)hi.x; st.pa[3] = dmy * (float)hi.y;
+            }
+            {
+                const float dmx = bd_h2f(hb.x), dmy = bd_h2f(hb.x >> 16);
+                const uint2 lo = bdi_k4sm(hb, 2u * c), hi = bdi_k4sm(hb, 2u * c + 1u);
+                st.pb[0] = dmx * (float)lo.x; st.pb[1] = dmy * (float)lo.y; st.pb[2] = dmx * (float)hi.x; st.pb[3] = dmy * (float)hi.y;
+            }
+        }
+        const bd_u32 qo = ((base + (T == 12 ? 16u : 48u) + 32u * c + 16u * h) >> 2) + (bd_u32)t;
+        const bd_u32 wa = bdm_w<SM>(Wa, qo), wb = bdm_w<SM>(Wb, qo);
+        st.A0a = wa & 0x0F0F0F0Fu; st.A1a = (wa >> 4) & 0x0F0F0F0Fu; st.A0b = wb & 0x0F0F0F0Fu; st.A1b = (wb >> 4) & 0x0F0F0F0Fu;
+        if (T == 13) {
+            const bd_u32 ho = ((base + 16u + 16u * h) >> 2) + (bd_u32)t, xa = bdm_w<SM>(Wa, ho) >> (2u * c), xb = bdm_w<SM>(Wb, ho) >> (2u * c);
+            st.A0a |= (xa & 0x01010101u) << 4; st.A1a |= ((xa >> 1) & 0x01010101u) << 4;
+            st.A0b |= (xb & 0x01010101u) << 4; st.A1b |= ((xb >> 1) & 0x01010101u) << 4;
+        }
+    } else if (T == 14) {
+        const bd_u32 b = (bd_u32)q >> 3, j = (bd_u32)q & 7u, n = j >> 2, m = j & 3u, base = b * 210u;
+        const bd_u32 qlo = base + 64u * n + 32u * (m & 1u), qhi = base + 128u + 32u * n, sh = (m >> 1) * 4u, hs = 2u * m;
+        if (SC) {
+            const bd_u32 sa = bdm_ldu<SM>(Wa, base + 192u + 8u * n + 2u * m), sb = bdm_ldu<SM>(Wb, base + 192u + 8u * n + 2u * m);
+            const float da = bdm_f16at<SM>(Wa, base + 208u), db = bdm_f16at<SM>(Wb, base + 208u);
+            st.pa[0] = da * bd_sbyte(sa, 0); st.pa[1] = da * bd_sbyte(sa, 1); st.pb[0] = db * bd_sbyte(sb, 0); st.pb[1] = db * bd_sbyte(sb, 1);
+        }
+        const bd_u32 k0 = 4u * (bd_u32)t, k1 = 4u * ((bd_u32)t + 4u);
+        st.A0a = ((bdm_ldu<SM>(Wa, qlo + k0) >> sh) & 0x0F0F0F0Fu) | (((bdm_ldu<SM>(Wa, qhi + k0) >> hs) & 0x03030303u) << 4);
+        st.A1a = ((bdm_ldu<SM>(Wa, qlo + k1) >> sh) & 0x0F0F0F0Fu) | (((bdm_ldu<SM>(Wa, qhi + k1) >> hs) & 0x03030303u) << 4);
+        st.A0b = ((bdm_ldu<SM>(Wb, qlo + k0) >> sh) & 0x0F0F0F0Fu) | (((bdm_ldu<SM>(Wb, qhi + k0) >> hs) & 0x03030303u) << 4);
+        st.A1b = ((bdm_ldu<SM>(Wb, qlo + k1) >> sh) & 0x0F0F0F0Fu) | (((bdm_ldu<SM>(Wb, qhi + k1) >> hs) & 0x03030303u) << 4);
+    } else if (T == 8) {
+        const bd_u32 base = (bd_u32)q * 34u;
+        if (SC) { st.pa[0] = bdm_f16at<SM>(Wa, base); st.pb[0] = bdm_f16at<SM>(Wb, base); }
+        st.A0a = bdm_ldu<SM>(Wa, base + 2u + 4u * (bd_u32)t); st.A1a = bdm_ldu<SM>(Wa, base + 18u + 4u * (bd_u32)t);
+        st.A0b = bdm_ldu<SM>(Wb, base + 2u + 4u * (bd_u32)t); st.A1b = bdm_ldu<SM>(Wb, base + 18u + 4u * (bd_u32)t);
+    } else {   /* 20 IQ4_NL, 23 IQ4_XS: kvalues of the nibbles, A0 the low ones (weights 0..15), A1 the high */
+        bd_u32 wa, wb;
+        if (T == 20) {
+            const bd_u32 base = (bd_u32)q * 18u;
+            if (SC) { st.pa[0] = bdm_f16at<SM>(Wa, base); st.pb[0] = bdm_f16at<SM>(Wb, base); }
+            wa = bdm_ldu<SM>(Wa, base + 2u + 4u * (bd_u32)t); wb = bdm_ldu<SM>(Wb, base + 2u + 4u * (bd_u32)t);
+        } else {
+            const bd_u32 b = (bd_u32)q >> 3, ib = (bd_u32)q & 7u, base = b * 136u;
+            if (SC) {
+                const bd_u32 w0a = bdm_w<SM>(Wa, base >> 2), w2a = bdm_w<SM>(Wa, (base >> 2) + 1u), w0b = bdm_w<SM>(Wb, base >> 2), w2b = bdm_w<SM>(Wb, (base >> 2) + 1u);
+                const bd_u32 lsa = ((w2a >> (8u * (ib >> 1) + 4u * (ib & 1u))) & 15u) | (((w0a >> (16u + 2u * ib)) & 3u) << 4);
+                const bd_u32 lsb = ((w2b >> (8u * (ib >> 1) + 4u * (ib & 1u))) & 15u) | (((w0b >> (16u + 2u * ib)) & 3u) << 4);
+                st.pa[0] = bd_h2f(w0a) * (float)((int)lsa - 32); st.pb[0] = bd_h2f(w0b) * (float)((int)lsb - 32);
+            }
+            const bd_u32 qa = ((base + 8u + 16u * ib) >> 2) + (bd_u32)t;
+            wa = bdm_w<SM>(Wa, qa); wb = bdm_w<SM>(Wb, qa);
+        }
+        st.A0a = (bd_u32)bdi_kv4(wa, 0); st.A1a = (bd_u32)bdi_kv4(wa, 4); st.A0b = (bd_u32)bdi_kv4(wb, 0); st.A1b = (bd_u32)bdi_kv4(wb, 4);
+    }
+}
+/* A stage: 256 weights of a row (a super-block, or eight blocks of 32), copied to shared memory by
+ * cp.async in granules of G bytes (16 where the rows and the stages keep 16-byte alignment, else 4)
+ * from the stage's first byte rounded down to G; a staged row's words (bd_mq_rw: a multiple of 8
+ * plus 4, so the 8 rows a fragment reads fall in 8 distinct groups of 4 banks) */
+__host__ __device__ constexpr int bd_mq_sb(int T) { return T == 12 ? 144 : T == 13 ? 176 : T == 14 ? 210 : T == 8 ? 272 : T == 23 ? 136 : 144; }
+__host__ __device__ constexpr int bd_mq_rw4(int w) { return w % 8 == 4 ? w : (w + 3) / 8 * 8 + 4; }   /* w words, up to 8 k + 4 */
+/* granules a staged row: a stage of whole granules starts on one (SB a multiple of G), else (Q6_K's 210
+ * bytes in granules of 4) it starts at most 2 bytes past one */
+__host__ __device__ constexpr int bd_mq_ch(int T, int G) { return bd_mq_sb(T) % G == 0 ? bd_mq_sb(T) / G : (bd_mq_sb(T) + 2 + G - 1) / G; }
+__host__ __device__ constexpr int bd_mq_rw(int T, int G) { return bd_mq_rw4(bd_mq_ch(T, G) * G / 4); }
+__device__ __forceinline__ void bd_cp_async(void *dst, const void *src, int G) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+    const unsigned d = (unsigned)__cvta_generic_to_shared(dst);
+    if (G == 16) asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(d), "l"(src));
+    else if (G == 8) asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" :: "r"(d), "l"(src));
+    else asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" :: "r"(d), "l"(src));
+#else
+    (void)dst; (void)src; (void)G;
+#endif
+}
+__device__ __forceinline__ void bd_cp_commit() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+template <int N> __device__ __forceinline__ void bd_cp_wait() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+#endif
+}
+/* A staged row's scales for its stage, as bd_mmq_a computes them (the same operations, the same
+ * bits), into sc[16]: Q4/5_K group j's d sc and dmin m at 2j, 2j + 1 (j of the super-block's 8);
+ * Q6_K the 16 d sc; IQ4_XS the 8 d (ls - 32); Q8_0 and IQ4_NL the 8 blocks' d. i: the item
+ * (0 .. 15) this thread computes */
+template <int T>
+__device__ __forceinline__ float bd_mq_scale(const bd_u32 *__restrict__ Wr, int sb, int i) {
+    if (T == 12 || T == 13) {
+        const bd_u32 base = (bd_u32)sb * (T == 12 ? 144u : 176u);
+        const uint4 hd = bdm_w4<true>(Wr, base >> 4);
+        const uint2 v = bdi_k4sm(hd, (bd_u32)(i >> 1));
+        return (i & 1) ? bd_h2f(hd.x >> 16) * (float)v.y : bd_h2f(hd.x) * (float)v.x;
+    } else if (T == 14) {
+        const bd_u32 base = (bd_u32)sb * 210u;
+        const float d = bdm_f16at<true>(Wr, base + 208u);
+        return d * bd_sbyte(bdm_ldu<true>(Wr, base + 192u + (bd_u32)(i & ~1)), i & 1);
+    } else if (T == 23) {
+        if (i >= 8) return 0.f;
+        const bd_u32 base = (bd_u32)sb * 136u, ib = (bd_u32)i, w0 = bdm_w<true>(Wr, base >> 2), w2 = bdm_w<true>(Wr, (base >> 2) + 1u);
+        const bd_u32 ls = ((w2 >> (8u * (ib >> 1) + 4u * (ib & 1u))) & 15u) | (((w0 >> (16u + 2u * ib)) & 3u) << 4);
+        return bd_h2f(w0) * (float)((int)ls - 32);
+    } else {
+        if (i >= 8) return 0.f;
+        return bdm_f16at<true>(Wr, (bd_u32)(8 * sb + i) * (T == 8 ? 34u : 18u));
+    }
+}
+/* A block: 16 outputs, NG = lpr / 8 warps. A super-block holds 8 consecutive steps, so classes
+ * 8 (sb mod NG) .. + 7 of lpr = 8 NG: warp w takes the super-blocks w, w + NG, ... in order, its 8
+ * classes' sums in acc[j], each class's steps in the GEMV's order. Its stages go through its own
+ * shared memory twice buffered (cp.async by its lanes, a warp's barrier). Then the classes' sums
+ * meet in shared memory and each (row, output) adds them as the GEMV's butterfly does at lane 0:
+ * v[l] + v[l + off] for off = lpr / 2 .. 1. x in bdx_quant_k's global form at gq (S rows, up to 8 NT).
+ * Fragments: lane = 4 g + t; A rows g and g + 8, word t of their codes; B column g (x row g), word t
+ * of its codes; C (g, 2t + j) and (g + 8, 2t + j). */
+template <int T, int NT, int G, int NG>
+__global__ static void __launch_bounds__(32 * NG) bd_mmg_k(float *__restrict__ y, const bd_u32 *__restrict__ W, const uint4 *__restrict__ gq,
+                                                           int I, int O, int rowWords, int S) {
+    COLI_PDL_WAIT();
+    constexpr int SB = bd_mq_sb(T), RW = bd_mq_rw(T, G), CH = bd_mq_ch(T, G), LPR = 8 * NG, R = 8 * NT;
+    constexpr int STW = 2 * 16 * RW, PW = LPR * R * 16, SMW = NG * STW > PW ? NG * STW : PW;
+    __shared__ __align__(16) bd_u32 sm[SMW];   /* the warps' stages, then the classes' sums */
+    const int lane = (int)threadIdx.x & 31, w = (int)threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
+    const int nb = I / 32, qr = bd_xq_row(I), nsb = I / 256, o0 = (int)blockIdx.x * 16;
+    const float *gdx = reinterpret_cast<const float *>(gq + (size_t)S * qr);
+    const int *gxs = reinterpret_cast<const int *>(gdx + (size_t)S * nb);
+    /* x: each n tile's B row (column g) and this thread's two C rows (2t, 2t + 1) */
+    const bd_u32 *xb[NT]; const float *xd[NT][2]; const int *xsum[NT][2]; bool bl[NT], live[NT][2];
+    #pragma unroll
+    for (int n = 0; n < NT; n++) {
+        const int sx = 8 * n + g;
+        bl[n] = sx < S;
+        xb[n] = reinterpret_cast<const bd_u32 *>(gq + (size_t)min(sx, S - 1) * qr) + t;
+        #pragma unroll
+        for (int j = 0; j < 2; j++) {
+            const int sr = 8 * n + 2 * t + j;
+            live[n][j] = sr < S;
+            xd[n][j] = gdx + (size_t)min(sr, S - 1) * nb; xsum[n][j] = gxs + (size_t)min(sr, S - 1) * 2 * nb;
+        }
+    }
+    bd_u32 *stw = sm + w * STW;   /* this warp's two stages of its 16 rows */
+    auto stage = [&](int sb, int bf) {
+        const int lo = (sb * SB) & ~(G - 1);
+        #pragma unroll 1
+        for (int i = lane; i < 16 * CH; i += 32) {
+            const int r = i / CH, c = i - r * CH;
+            const char *src = reinterpret_cast<const char *>(W + (size_t)min(o0 + r, O - 1) * rowWords) + lo + c * G;
+            bd_cp_async(reinterpret_cast<char *>(stw + bf * 16 * RW + r * RW) + c * G, src, G);
+        }
+        bd_cp_commit();
+    };
+    float acc[8][NT][4];
+    #pragma unroll
+    for (int j = 0; j < 8; j++)
+        #pragma unroll
+        for (int n = 0; n < NT; n++) acc[j][n][0] = acc[j][n][1] = acc[j][n][2] = acc[j][n][3] = 0.f;
+    if (w < nsb) stage(w, 0);
+    int k = 0;
+    for (int sb = w; sb < nsb; sb += NG, k++) {
+        bd_cp_wait<0>();
+        __syncwarp();   /* stage k in for every lane; every lane done with stage k - 1, whose buffer stage k + 1 takes */
+        if (sb + NG < nsb) stage(sb + NG, (k + 1) & 1);
+        const int lo = (sb * SB) & ~(G - 1);
+        const bd_u32 *rows = stw + (k & 1) * 16 * RW - lo / 4;   /* row r's words, addressed as the row's */
+        const bd_u32 *Wa = rows + g * RW, *Wb = rows + (g + 8) * RW;
+        /* the stage's scales of this thread's two rows, a quarter each thread of the quad (bd_mq_scale's
+         * items 4t .. 4t + 3), handed to the quad's others by shuffles as the steps need them */
+        float sv[2][4];
+        #pragma unroll
+        for (int r = 0; r < 2; r++) {
+            const bd_u32 *Wr = r ? Wb : Wa;
+            if (T == 12 || T == 13) {
+                const uint4 hd = bdm_w4<true>(Wr, (bd_u32)sb * (T == 12 ? 9u : 11u));
+                const float d = bd_h2f(hd.x), dm = bd_h2f(hd.x >> 16);
+                const uint2 v0 = bdi_k4sm(hd, 2u * (bd_u32)t), v1 = bdi_k4sm(hd, 2u * (bd_u32)t + 1u);
+                sv[r][0] = d * (float)v0.x; sv[r][1] = dm * (float)v0.y; sv[r][2] = d * (float)v1.x; sv[r][3] = dm * (float)v1.y;
+            } else if (T == 14) {
+                #pragma unroll
+                for (int i = 0; i < 4; i++) sv[r][i] = bd_mq_scale<T>(Wr, sb, 4 * t + i);
+            } else {
+                sv[r][0] = bd_mq_scale<T>(Wr, sb, 2 * t); sv[r][1] = bd_mq_scale<T>(Wr, sb, 2 * t + 1); sv[r][2] = sv[r][3] = 0.f;
+            }
+        }
+        const int quad = lane & ~3;
+        #pragma unroll
+        for (int jj = 0; jj < 8; jj++) {
+            const int q = 8 * sb + jj;
+            int kx0, kx1, gx0, gx1, dx0, dx1;
+            if (T == 12 || T == 13) {
+                const int e = sb * 64 + ((jj >> 1) & 3) * 16 + (jj & 1) * 4;
+                kx0 = e >> 2; kx1 = kx0 + 2; gx0 = kx0; gx1 = kx0 + 2; dx0 = gx0 >> 1; dx1 = gx1 >> 1;
+            } else { kx0 = 2 * q; kx1 = 2 * q + 1; gx0 = 2 * q; gx1 = 2 * q + 1; dx0 = dx1 = q; }
+            BdMqStep st;
+            bd_mmq_a<T, true, false>(Wa, Wb, q, t, st);
+            if (T == 12 || T == 13) {   /* groups 2c and 2c + 1: thread c's */
+                const int src = quad | ((jj >> 1) & 3);
+                #pragma unroll
+                for (int i = 0; i < 4; i++) { st.pa[i] = __shfl_sync(0xffffffffu, sv[0][i], src); st.pb[i] = __shfl_sync(0xffffffffu, sv[1][i], src); }
+            } else if (T == 14) {   /* items i and i + 1, i = 8 (jj / 4) + 2 (jj % 4): thread i / 4's, at i % 4 */
+                const int i = 8 * (jj >> 2) + 2 * (jj & 3), src = quad | (i >> 2), kk = i & 3;
+                st.pa[0] = __shfl_sync(0xffffffffu, sv[0][kk], src); st.pa[1] = __shfl_sync(0xffffffffu, sv[0][kk + 1], src);
+                st.pb[0] = __shfl_sync(0xffffffffu, sv[1][kk], src); st.pb[1] = __shfl_sync(0xffffffffu, sv[1][kk + 1], src);
+            } else {   /* item jj: thread jj / 2's, at jj % 2 */
+                const int src = quad | (jj >> 1), kk = jj & 1;
+                st.pa[0] = __shfl_sync(0xffffffffu, sv[0][kk], src); st.pb[0] = __shfl_sync(0xffffffffu, sv[1][kk], src);
+            }
+            #pragma unroll
+            for (int n = 0; n < NT; n++) {
+                bd_u32 b0 = 0u, b1 = 0u;
+                if (bl[n]) { b0 = __ldg(xb[n] + 4 * bd_x4(kx0)); b1 = __ldg(xb[n] + 4 * bd_x4(kx1)); }
+                int c0[4] = {0, 0, 0, 0}, c1[4] = {0, 0, 0, 0};
+                if (T == 12 || T == 13 || T == 14) { bd_mma16(c0, st.A0a, st.A0b, b0); bd_mma16(c1, st.A1a, st.A1b, b1); }
+                else bd_mma32(c0, st.A0a, st.A0b, st.A1a, st.A1b, b0, b1);
+                #pragma unroll
+                for (int j = 0; j < 2; j++) {
+                    if (!live[n][j]) continue;   /* a column past the rows of x: never written */
+                    const float dl = __ldg(xd[n][j] + dx0);
+                    if (T == 12 || T == 13) {
+                        const float dh = __ldg(xd[n][j] + dx1);
+                        const int xl = __ldg(xsum[n][j] + gx0), xh = __ldg(xsum[n][j] + gx1);
+                        acc[jj][n][j] = bdi_upd_k45(acc[jj][n][j], dl, dh, st.pa[0], st.pa[1], st.pa[2], st.pa[3], c0[j], c1[j], xl, xh);
+                        acc[jj][n][2 + j] = bdi_upd_k45(acc[jj][n][2 + j], dl, dh, st.pb[0], st.pb[1], st.pb[2], st.pb[3], c0[2 + j], c1[2 + j], xl, xh);
+                    } else if (T == 14) {
+                        const int xl = 32 * __ldg(xsum[n][j] + gx0), xh = 32 * __ldg(xsum[n][j] + gx1);
+                        acc[jj][n][j] = bdi_upd_2(acc[jj][n][j], dl, st.pa[0], st.pa[1], c0[j] - xl, c1[j] - xh);
+                        acc[jj][n][2 + j] = bdi_upd_2(acc[jj][n][2 + j], dl, st.pb[0], st.pb[1], c0[2 + j] - xl, c1[2 + j] - xh);
+                    } else {
+                        acc[jj][n][j] = bdi_upd_1(acc[jj][n][j], dl, st.pa[0], c0[j]);
+                        acc[jj][n][2 + j] = bdi_upd_1(acc[jj][n][2 + j], dl, st.pb[0], c0[2 + j]);
+                    }
+                }
+            }
+            (void)dx1; (void)gx1;
+        }
+    }
+    __syncthreads();   /* every warp done with its stages: the room takes the classes' sums */
+    float *ps = reinterpret_cast<float *>(sm);   /* class l, row s, output o at (l R + s) 16 + o */
+    #pragma unroll
+    for (int jj = 0; jj < 8; jj++)
+        #pragma unroll
+        for (int n = 0; n < NT; n++)
+            #pragma unroll
+            for (int j = 0; j < 2; j++) {
+                if (!live[n][j]) continue;
+                float *pc = ps + ((size_t)(8 * w + jj) * R + 8 * n + 2 * t + j) * 16;
+                pc[g] = acc[jj][n][j]; pc[g + 8] = acc[jj][n][2 + j];
+            }
+    __syncthreads();
+    const int rows_live = S < R ? S : R;
+    for (int i = (int)threadIdx.x; i < rows_live * 16; i += 32 * NG) {
+        const int sr = i >> 4, o = i & 15;
+        if (o0 + o >= O) continue;
+        float v[LPR];
+        #pragma unroll
+        for (int l = 0; l < LPR; l++) v[l] = ps[((size_t)l * R + sr) * 16 + o];
+        #pragma unroll
+        for (int off = LPR / 2; off > 0; off >>= 1)
+            #pragma unroll
+            for (int l = 0; l < off; l++) v[l] = __fadd_rn(v[l], v[l + off]);
+        y[(size_t)sr * O + o0 + o] = v[0];
+    }
+}
+
 /* bd_gemv_i8_k's arithmetic for one row of x over a list of the matrix's rows (a draft's
  * vocabulary): y[j] = row ids[j] . x, each sum the bits the whole GEMV gives that row (the same
  * quantized x, lanes a row and steps); -inf for an id out of range */
@@ -1144,24 +1475,74 @@ static inline void bd_smem_raise(const void *k, size_t sm, size_t smem_max, unsi
 /* The global scratch x is quantized into once (bdx_quant_k), a buffer a stream and device: a
  * stream's kernels run in order and the next quantization waits for the GEMV before it (its PDL
  * wait), so one buffer serves every GEMV of the stream. NULL: none (the blocks quantize x). */
-static void *bd_xq_scratch(cudaStream_t st, size_t bytes) {
+/* what the scratch holds: x (S rows of I) at quantization, NULL when unknown */
+struct BdXqHeld { const float *x; int S, I; };
+/* bytes 0: no buffer asked for, the record alone (forgotten: bd_xq_forget) */
+static void *bd_xq_scratch(cudaStream_t st, size_t bytes, BdXqHeld **held = nullptr) {
     static std::mutex mu;
-    static struct { cudaStream_t st; int dev; void *p; size_t cap; } c[16];
+    static struct { cudaStream_t st; int dev; void *p; size_t cap; BdXqHeld h; } c[16];
     static int n;
     int dev = -1;
     if (cudaGetDevice(&dev) != cudaSuccess) { (void)cudaGetLastError(); return nullptr; }
     std::lock_guard<std::mutex> lk(mu);
     int i = 0;
     while (i < n && !(c[i].st == st && c[i].dev == dev)) i++;
-    if (i == n) { if (n == 16) return nullptr; c[n++] = {st, dev, nullptr, 0}; }
+    if (!bytes) { if (i < n) c[i].h = {nullptr, 0, 0}; return nullptr; }
+    if (i == n) { if (n == 16) return nullptr; c[n++] = {st, dev, nullptr, 0, {nullptr, 0, 0}}; }
     if (c[i].cap < bytes) {
         size_t cap = bytes < ((size_t)1 << 20) ? ((size_t)1 << 20) : bytes;   /* grown seldom: freeing waits for the device */
         if (c[i].p && cudaStreamSynchronize(st) == cudaSuccess) cudaFree(c[i].p);
-        c[i].p = nullptr; c[i].cap = 0;
+        c[i].p = nullptr; c[i].cap = 0; c[i].h = {nullptr, 0, 0};
         if (cudaMalloc(&c[i].p, cap) != cudaSuccess) { (void)cudaGetLastError(); c[i].p = nullptr; return nullptr; }
         c[i].cap = cap;
     }
+    if (held) *held = &c[i].h;
     return c[i].p;
+}
+/* the caller's word that x is as it was at the stream's last matmul (the chain: no op of its own
+ * between two matmuls of one input, q k v or gate and up), a thread's for its next launch. A matmul
+ * without it forgets what the scratch holds (bd_xq_forget): a quantization is kept only through
+ * matmuls each vouched for since it, whether or not they quantized */
+static thread_local int g_bd_x_same = 0;
+static void bd_xq_forget(cudaStream_t st) { (void)bd_xq_scratch(st, 0); }
+/* x (S rows of I, packed) in the stream's scratch quantized: once, and again only when the scratch
+ * held another x, or the caller did not vouch that x is unchanged since (g_bd_x_same). NULL: none */
+static const uint4 *bd_xq_quant(const float *x, int S, int I, cudaStream_t st) {
+    BdXqHeld *h = nullptr;
+    uint4 *gq = (uint4 *)bd_xq_scratch(st, bd_x_bytes(I, S), &h);
+    if (!gq) return nullptr;
+    if (!(g_bd_x_same && h->x == x && h->S == S && h->I == I)) {
+        bdx_quant_launch(x, S, I, I, gq, st);
+        *h = {x, S, I};
+    }
+    return gq;
+}
+
+/* y[S, O] = x W^T on the tensor cores (bd_mmg_k) for a type of bd_mmq_has, S of 1 to 8, each row the
+ * GEMV's bits: x quantized once into the stream's scratch; 16 outputs a block. 0 where it does not take
+ * it (another type, no scratch, a width whose GEMV classes are fewer than 8) and the caller's GEMV does */
+static inline int bd_mmg_launch(float *y, const float *x, const bd_u32 *W, int fmt, int I, int O, int rowWords, int S, cudaStream_t st) {
+    const int T = fmt - 100, lpr = bd_lpr(I);
+    if (!bd_mmq_has(T) || S < 1 || S > 8 || I % 256 || lpr < 8 || O < 1) return 0;
+    const uint4 *gq = bd_xq_quant(x, S, I, st);
+    if (!gq) return 0;
+    const int ng = lpr / 8;
+    const int SBy = bd_mq_sb(T), gr = rowWords % 4 == 0 && SBy % 16 == 0 ? 16 : rowWords % 2 == 0 && SBy % 8 == 0 ? 8 : 4;
+    const dim3 g((unsigned)((O + 15) / 16));
+#define BD_MG_K(T_, N_, G_, NG_) coli_launch(bd_mmg_k<T_, N_, G_, NG_>, g, 32 * NG_, 0, st, y, W, gq, I, O, rowWords, S)
+#define BD_MG_W(T_, N_, G_) do { if (ng == 1) BD_MG_K(T_, N_, G_, 1); else if (ng == 2) BD_MG_K(T_, N_, G_, 2); else BD_MG_K(T_, N_, G_, 4); } while (0)
+#define BD_MG_N(T_, G_) BD_MG_W(T_, 1, G_)
+#define BD_MG_GO(T_) do { if (gr == 16) BD_MG_N(T_, 16); else if (gr == 8) BD_MG_N(T_, 8); else BD_MG_N(T_, 4); } while (0)
+    switch (T) {
+        case 8: BD_MG_GO(8); break;   case 12: BD_MG_GO(12); break; case 13: BD_MG_GO(13); break;
+        case 14: BD_MG_GO(14); break; case 20: BD_MG_GO(20); break; case 23: BD_MG_GO(23); break;
+        default: return 0;
+    }
+#undef BD_MG_GO
+#undef BD_MG_N
+#undef BD_MG_W
+#undef BD_MG_K
+    return 1;
 }
 /* x quantized once for the GEMV's blocks (bdx_quant_k) where the rows' floats a block reads are
  * at least half its weights and 64 blocks or more would each quantize them: an RTX PRO 4000,
@@ -1218,11 +1599,8 @@ static int bd_gemv_i8_launch(float *y, const float *x, const bd_u32 *W, const bd
     const uint4 *gq = nullptr;
     const size_t block_bytes = (size_t)((O + bx - 1) / bx) * rowWords * 4;
     if (bd_gemv_preq(I, nr, bx, block_bytes)) {
-        gq = (const uint4 *)bd_xq_scratch(st, bd_x_bytes(I, S));
-        if (gq) {
-            bdx_quant_launch(x, S, I, I, (uint4 *)gq, st);
-            sm = (size_t)bd_tab_words(T) * 4;   /* the tables alone */
-        }
+        gq = bd_xq_quant(x, S, I, st);
+        if (gq) sm = (size_t)bd_tab_words(T) * 4;   /* the tables alone */
     }
     if (gq && nr > 1 && T != 12 && T != 13 && bd_gemv_xs(I, nr) && bd_gemv_i8_smem(T, I, nr) <= smem_max)   /* Q4_K, Q5_K: no gain */
         bd_gemv_i8_go<T, BD_GEMV_NR, true, true>(g, bd_gemv_i8_smem(T, I, nr), smem_max, st, y, x, W, tab, I, O, rowWords, S, nr, lpr, gq, Wu);

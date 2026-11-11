@@ -210,6 +210,18 @@ identical to plain decoding:
 | one draft, drafts accepted | 97.5 % | 80.7 % |
 | RTX PRO 4000 SFF (UD-Q4_K_XL, whole card): plain / two drafts / three | 20.7 / 43.4 / 45.0 tok/s | 20.6 / 30.9 / 30.0 tok/s |
 
+**A verify's rows on the tensor cores.** On the CUDA chain (sm_80 on) a verify of 4 to 8
+rows, and several conversations' decode rows, go to the tensor cores' integer steps
+(`bd_mmg_k`, `COLI_CUDA_BD_MMQ`) with each row the bits the GEMV gives it alone, so the
+texts do not change. The 27B on the RTX PRO 4000 SFF (UD-Q4_K_XL, greedy, thinking off,
+tok/s; the MTP and the two-conversation runs alternated with the GEMV alone,
+`COLI_CUDA_BD_MMQ=0`):
+
+| | GEMV alone | default |
+|---|---|---|
+| three MTP drafts (whole vocabulary): code / prose / list | 40.5 / 33.4 / 35.7 | 42.8 / 33.4 / 35.9 |
+| `--kv-slots 8`, 2 / 8 conversations at once, together | 36.4 / 60.4 | 36.3 / 86.5 |
+
 The computation follows Qwen's MTP module: at position p, concatenate the
 normalized embedding of token p+1 with the normalized backbone output h_p,
 then `mtp.fc`, one gated full-attention decoder layer with its own KV cache,
