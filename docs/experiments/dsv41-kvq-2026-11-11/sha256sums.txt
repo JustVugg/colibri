@@ -1,0 +1,12 @@
+# sha256sum of every data file in this directory (README.md and this file excluded).
+# verify: cd docs/experiments/dsv41-kvq-2026-11-11 && sha256sum -c sha256sums.txt
+342d9bbb9eb320423547a43b5874d3c9298daea40418c2a4d5e3507f1fa0bf2b  E12-answers.json
+b75640425be499d1d4fc07d85c3394d35ece3152f1a060089718b81859fc21bb  E13-answers.json
+dad33296fc96693efcead06630721ee65cffe06404d7e062723546a5a2c97d66  E14-compare.txt
+8ea415efcc2ffa2d36315004628cd9b4469ae22662b0ba09a34aa7fb025914b1  E14-drift-detail.txt
+3a89bc2e494fdeed63938a674fe8d50c749a4346a566695485dd5186b8c58248  E15-A-needle.json
+af2b945c5cc929ead95f842887bafbb6a1868aaa38b83bea9efceeac59d5c567  E15-A-needle.txt
+faad6b376302415d8a291a42353095782106fb44181d31169fba28852af1c37d  E15-B-needle.txt
+20565c15db6c6eb6f1764429a6dbdceb428c6345fb91ab2f4cc80ec725173510  plan-16384-fp32.json
+aa7a6e721818ee310c5fbe254ed28561c8d275017d4effbeccf28450589d132a  plan-16384-packed.json
+23abdf7677165224e252ae4e7895bb6163a3d0d99d29ba861a1a2c9d9dc3ffd5  ledger.txt
