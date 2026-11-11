@@ -461,7 +461,7 @@ static int dsv4_cuda_load(void){
     }
     fprintf(stderr, DSV4_VENDOR_TAG " no usable backend DLL (%s); GPU tier disabled (CPU path remains active). "
                     "The DLLs need an sm_80+ GPU (Ampere or newer); Pascal and Turing take a build with "
-                    "CUDA_ARCH=portable-pre-ampere NO_TC=1 (docs/deepseek-v4.md).\n",
+                    "CUDA_ARCH=portable-pre-ampere NO_TC=1 and CUDA <= 12.9 (docs/deepseek-v4.md).\n",
             wn ? why : DSV4_BACKEND_DLL_DG " / " DSV4_BACKEND_DLL);
     return 0;
 }

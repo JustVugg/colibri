@@ -2928,7 +2928,7 @@ def _discover_amd_gpus():
 #: The oldest compute capability an engine's CUDA tier is built for by default, and
 #: what reaches older cards (docs/deepseek-v4.md).
 CUDA_TIER_FLOOR = {
-    "deepseek_v4": ((8, 0), "a build with CUDA_ARCH=portable-pre-ampere NO_TC=1 runs on Pascal and Turing"),
+    "deepseek_v4": ((8, 0), "a build with CUDA_ARCH=portable-pre-ampere NO_TC=1 (CUDA <= 12.9) runs on Pascal and Turing"),
 }
 
 

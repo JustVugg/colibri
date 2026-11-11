@@ -566,8 +566,11 @@ build's two activation-quantise kernels (`fp8_sim64`, `fp8_sim64_dynamic`)
 do call `__nv_cvt_float_to_fp8`, but `cuda_fp8.h` resolves that to native
 `cvt` PTX only at `__CUDA_ARCH__ >= 890` and to its own software path
 below, so it builds and runs on older cards. All of it compiles unchanged
-for sm_61 and sm_75, so `CUDA_ARCH=portable-pre-ampere NO_TC=1` extends the
-generic tier to Pascal and Turing.
+for sm_61 and sm_75, so `CUDA_ARCH=portable-pre-ampere NO_TC=1`, built with
+CUDA <= 12.9, extends the generic tier to Pascal and Turing. CUDA 13 dropped
+`compute_61` (its `nvcc --list-gpu-arch` starts at `compute_75`), so nvcc
+stops at once with `Unsupported gpu architecture 'compute_61'`. With CUDA 13,
+a Turing card builds with `CUDA_ARCH=sm_75 NO_TC=1`.
 
 `NO_TC=1` is required because the opt-in `DSV4_CUDA_TC` path calls cuBLASLt
 block-scaling APIs (`CUBLASLT_MATMUL_DESC_A_SCALE_MODE` and friends) that need
@@ -587,7 +590,7 @@ is no software path to fall back to.
 |---|---|---|---|
 | CPU only (no DLL / `DSV4_CUDA=0` / Linux default) | — | CPU reference | CPU reference |
 | generic DLL / `CUDA=1` | any sm_80+ | GPU attention block, indexer, generic batched MoE on the VRAM bank | GPU attention, indexer, expert mirrors |
-| generic, pre-Ampere / `CUDA=1 CUDA_ARCH=portable-pre-ampere NO_TC=1` | sm_61 (Pascal), sm_75 (Turing) | as generic | as generic |
+| generic, pre-Ampere / `CUDA=1 CUDA_ARCH=portable-pre-ampere NO_TC=1`, CUDA <= 12.9 | sm_61 (Pascal), sm_75 (Turing) | as generic | as generic |
 | DeepGEMM DLL / `CUDA=1 DEEPGEMM=1` | compute 12.x | as generic + tensor-core dense/MoE GEMMs | same as generic |
 | multi-GPU layer placement | up to 16 visible CUDA devices | contiguous layer ranges, with dense mirrors and KV on the owning device | per-device expert caches; layers still execute sequentially |
 
