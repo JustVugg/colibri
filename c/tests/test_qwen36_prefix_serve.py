@@ -36,6 +36,7 @@ def cpu_prefill_engine(cap, dense, slots):
     return ServeEngine(ENGINE, [str(cap), "8"],
                        {"SNAP": str(FIXTURE), "SERVE": "1",
                         "COLI_DENSE_I8": dense, "KV_SLOTS": str(slots),
+                        "COLI_PROMPT_CACHE": "0",
                         "COLI_VULKAN": "0", "COLI_VK_CHAIN": "0",
                         "COLI_CUDA": "0", "COLI_CUDA_CHAIN": "0"})
 
@@ -57,7 +58,8 @@ class Qwen36PrefixServeTest(PrefixReuseContract, unittest.TestCase):
 
     def spawn(self, log_prefix=True, reuse=True):
         return ServeEngine(ENGINE, ["8", "8"],
-                           {"SNAP": str(FIXTURE), "SERVE": "1", "COLI_DENSE_I8": "0"},
+                           {"SNAP": str(FIXTURE), "SERVE": "1", "COLI_DENSE_I8": "0",
+                            "COLI_PROMPT_CACHE": "0"},
                            log_prefix=log_prefix, reuse=reuse)
 
     def watch(self, engine):
@@ -79,7 +81,8 @@ class Qwen36PrefixServeTest(PrefixReuseContract, unittest.TestCase):
         engine = ServeEngine(
             ENGINE,
             ["8", "8"],
-            {"SNAP": str(FIXTURE), "SERVE": "1", "COLI_DENSE_I8": "0"},
+            {"SNAP": str(FIXTURE), "SERVE": "1", "COLI_DENSE_I8": "0",
+             "COLI_PROMPT_CACHE": "0"},
             log_prefix=True,
         )
         self.watch(engine)
@@ -204,7 +207,8 @@ class Qwen36PrefixServeTest(PrefixReuseContract, unittest.TestCase):
             wire += f"SUBMIT {rid} {slot} {len(prompt)} 4 0 1\n".encode() + prompt + b"\n"
         result = subprocess.run([str(ENGINE), "8", "8"], input=wire, capture_output=True,
                                 timeout=30, env=dict(os.environ, SNAP=str(FIXTURE),
-                                SERVE="1", KV_SLOTS="2", COLI_DENSE_I8="0"))
+                                SERVE="1", KV_SLOTS="2", COLI_DENSE_I8="0",
+                                COLI_PROMPT_CACHE="0"))
         self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
         for rid in ("mux-a", "mux-b"):
             self.assertIn(f"DONE {rid} STAT".encode(), result.stdout)
