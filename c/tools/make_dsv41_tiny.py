@@ -406,6 +406,9 @@ def build(out: Path, cfg: dict, ref_path: Path | None, max_new: int, prompt_len:
     # rollback buffers from a stage count that is zero until the checkpoint is
     # probed for it.
     text = {k: v for k, v in cfg.items() if k not in ("max_seq_len", "n_mtp_layers")}
+    # ... but the stage count under the key the released checkpoint carries it as:
+    # dropping it entirely would leave the planner's stage term unexercised.
+    text["num_nextn_predict_layers"] = cfg["n_mtp_layers"]
     config = {
         "architectures": ["DeepseekV41ForCausalLM"],
         "model_type": "deepseek_v41",

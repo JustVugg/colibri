@@ -569,10 +569,10 @@ the codes themselves (below) — and rollback, prefix reuse and a lost device st
 rebuild nothing.
 
 The arithmetic at the released geometry, per token across the layers: about **6,400 B
-of mirror a position under `COLI_VK_KV_FP32=1` against about 890 B packed** (the compressed rows and
-index keys alone: 2.5 rows a position over the layers' compression ratios × (288 + 68) B;
-the window rings are the planner's fixed term, not a per-position cost) — the
-figures of the prefill-VRAM analysis
+of mirror a position under `COLI_VK_KV_FP32=1` against about 890 B packed** (the
+compressed rows and index keys alone: 2.5 rows a position over the layers' compression
+ratios × (288 + 68) B; the window rings and the rollback rows are the planner's fixed
+term, priced below, not a per-position cost) — the figures of the prefill-VRAM analysis
 ([dsv41-prefill-vram-2026-11-06](experiments/dsv41-prefill-vram-2026-11-06.md), whose
 §10 parked this as the lever that scales with context: 0.31 GiB of mirrors at 64K
 tokens, 0.62 at 128K, 4.7 at the 1M ceiling). Quantized, the mirrors' ~6,400 B a position
@@ -595,9 +595,20 @@ re-packing a dequantized row reproduces its values, which the unit test pins). T
 needs `head_dim` 512 and
 `index_head_dim` 128: at any other geometry the flag declines — the default exactly like
 a set value, one line on stderr — and the mirrors stay fp32, so models at other KV
-geometries are untouched by the default. It does not re-price the planner beyond the
-host state below: the KV split decides exactly as before, and when it arms the mirrors go
-back to fp32 whole (`v41c_kvq_give_way`), re-mirrored from the host.
+geometries are untouched by the default. The planner prices the state below, and the
+fixed term with it: the KV split decides exactly as before, and when it arms the mirrors
+go back to fp32 whole (`v41c_kvq_give_way`), re-mirrored from the host.
+
+The fixed term is not the per-position cost, and it is the engine's own
+`v41_host_kv_bytes`: **(layers + stages) window rings plus `(dspark_block_size + 1)`
+rollback rows a layer** — the ring rows a speculative verify parks and rolls back to —
+which at the released geometry is 43 rings (40 layers + 3 DSpark stages) and 240 rows
+(6 a layer, `dspark_block_size` 5), **3,032,832 B** packed against 11,763,712 B fp32.
+With 2.5 compressed rows a position on top, the planner prints the engine's
+**17,614,592 B at 16K** (116,621,312 B under `COLI_VK_KV_FP32=1`) — the `host kv`
+16.8 MiB the ledger prints. The stage count is read the way the checkpoint spells it,
+`num_nextn_predict_layers` (the released `config.json` carries no `n_mtp_layers`), which
+is also why the old planner priced 40 rings for a checkpoint whose engine keeps 43.
 
 ### The host's state in the same formats (the default)
 
@@ -622,10 +633,15 @@ projection tagged by the audit's regime):
 | ctx | freed host RAM | +expert slots | effective --ram | prefill | decode |
 |---|---|---|---|---|---|
 | 16K | 86 MiB | 0 | +0.09 | ~0 | ~0 |
-| 64K | 344 MiB | +1 | +0.34 | guard margin (not throughput) | ≤+2% |
+| 64K | 344 MiB | 0 | +0.34 | guard margin (not throughput) | ≤+2% |
 | 128K | 689 MiB | +1 | +0.67 | guard margin, the split stays unarmed ~4x longer | ≤+2% (+3-8% only with a `COLI_VK_TIER_GB` raise) |
 | 256K | 1,377 MiB | +2 | +1.34 | ≤2% | ≤+4% |
 | 1M | 5.4 GiB | +7 | +5.51 | unmeasured | up to +50% capacity, unmeasured |
+
+The 64K row is the plan's ±1 resolved to 0, and the reason is the floor: the 344 MiB
+freed there is below one expert of every layer (771.14 MiB), and the slot a freed
+budget buys is the whole cache's `cache_bytes // per_cap`, not the freed bytes' own
+quotient.
 
 The honest ceiling, from the ladder's completed arm: in the measured 16K regime
 nothing moves -- prefill is disk-bound and decode is CPU/disk-bound -- and the past-32K

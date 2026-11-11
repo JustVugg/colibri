@@ -208,7 +208,9 @@ the expert tier's section).
 
 **Status.** CI checks every engine above on Lavapipe (`tests/vulkan_engines.sh`, the
 `vulkan-engines` job): each configuration gives the CPU run's tokens, and its matmul
-count is above zero. That proves correctness, not speed.
+count is above zero. That proves correctness, not speed. The packed KV cache's family
+(`kv-quant-deepseek`, `COLI_VK_KV_FP32` unset — the default — plus the codec's own
+bit-for-bit test) is one of those legs.
 
 The first real GPU measured is an integrated Radeon 780M (RADV) in a Ryzen 7 PRO
 8700GE (16 threads, 61 GiB DDR5, NVMe): same binaries, cold page cache, load under 2.

@@ -924,12 +924,17 @@ _KVQ_IKEY_BYTES = 68
 def _dsv41_geometry(config, context, _model_dir):
     """DeepSeek V4.1 Flash: window ring, compressed KV and index keys, engram rows.
 
-    What the engine keeps resident per layer (deepseek_v41.c model_load):
+    What the engine keeps resident per layer (deepseek_v41.c model_load), the fixed term
+    being the engine's own v41_host_kv_bytes:
 
-        window ring   n_layers * window_size * head_dim * 4      (fixed; 528 B a token
-                                                                  while the host is packed)
-        compressed KV ceil(context / ratio) * head_dim * 4       (per kv source)
-        index keys    ceil(context / ratio) * index_head_dim * 4 (per kv source)
+        window ring     (n_layers + stages) * window_size * row        fixed
+        rollback rows   n_layers * (spec_block + 1) * row              fixed
+        compressed KV   ceil(context / ratio) * head_dim * 4           per kv source
+        index keys      ceil(context / ratio) * index_head_dim * 4     per kv source
+
+    The two fixed terms do not grow with the context: a window ring a layer and a DSpark
+    stage, plus the ring rows a speculative verify parks (spec_block + 1 a layer), at
+    528 B a row while the host is packed and head_dim * 4 otherwise.
 
     The engram tables are NOT in here on purpose: 203 GB of the released
     checkpoint is n-gram memory read row by row from disk (264 bytes per row,
@@ -963,10 +968,26 @@ def _dsv41_geometry(config, context, _model_dir):
         raise ValueError("deepseek_v41: kv_source_layer_ids must be a list")
 
     # The DSpark stages keep a window ring each, on the same terms as a layer: their
-    # attention is window-only, and the window holds the main stream's keys.
-    stages = section.get("n_mtp_layers") or 0
+    # attention is window-only, and the window holds the main stream's keys. The
+    # released config.json carries no n_mtp_layers -- it spells the count
+    # num_nextn_predict_layers -- so a planner reading only the vendor's
+    # inference/config.json spelling priced 40 rings for a checkpoint whose engine
+    # keeps 43.
+    if "n_mtp_layers" in section:
+        stages = section["n_mtp_layers"]
+    else:
+        stages = section.get("num_nextn_predict_layers", 0)
     if not isinstance(stages, int) or isinstance(stages, bool) or stages < 0:
-        raise ValueError("deepseek_v41: n_mtp_layers must be a non-negative integer")
+        raise ValueError("deepseek_v41: n_mtp_layers or num_nextn_predict_layers must be "
+                         "a non-negative integer")
+    # A speculative verify parks the ring keys it displaces: one row a layer, and
+    # spec_block + 1 of them (the batch plus the row it rolls back to), the engine's
+    # own `rows` in model_load and v41_host_kv_check. Sized from spec_block, never from
+    # the stage count: the block size is what bounds a batch.
+    spec_block = section.get("dspark_block_size", 0)
+    if not isinstance(spec_block, int) or isinstance(spec_block, bool) or spec_block < 0:
+        raise ValueError("deepseek_v41: dspark_block_size must be a non-negative integer")
+    rows = spec_block + 1 if spec_block > 0 else 1
     # The packed cache (COLI_VK_KV_FP32 unset) prices the packed host layout: the window
     # ring, the compressed rows and the index keys are the cache's own code rows (528,
     # 288 and 68 B, c/dsv41_kvq.h) instead of head_dim * 4, (head_dim + index_head_dim) *
@@ -979,7 +1000,8 @@ def _dsv41_geometry(config, context, _model_dir):
     # index_head_dim 128): at any other geometry the engine keeps the fp32 host and the
     # fp32 price is the honest one.
     kvq_host = _host_kv_packed(head_dim, index_hd)
-    fixed = (layers + stages) * window * (_KVQ_WIN_BYTES if kvq_host else head_dim * 4)
+    row = _KVQ_WIN_BYTES if kvq_host else head_dim * 4
+    fixed = ((layers + stages) * window + layers * rows) * row
     state = 0
     for layer in sources:
         if not isinstance(layer, int) or isinstance(layer, bool) or not 0 <= layer < layers:

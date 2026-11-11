@@ -4886,7 +4886,8 @@ family_kv_split_deepseek_sanitize() {
 # index_head_dim 128), because the formats are defined at those widths; at the stock tiny
 # geometry (64/32) the flag declines by its own dimension check. The last arm (v41_kvq_cpu_host)
 # runs the packed HOST with no Vulkan at all -- the CPU's dequant-on-read paths, what a user
-# without a capable GPU runs.
+# without a capable GPU runs. It closes with the kv-split family's two serve modules (prefix
+# reuse, DSpark's rollback) against the same packed fixture.
 family_kv_quant_deepseek() {
   export OMP_NUM_THREADS=2
   make deepseek_v41 tests/test_vk_kv_quant VK=1
@@ -4909,6 +4910,16 @@ family_kv_quant_deepseek() {
   v41_kvq "DSpark spec=1" SNAP=dsv41_kvq_long V41_DSPARK=1 V41_SPEC_FORCE=1 -- 8 dsv41_kvq_long/ref.json
   v41_kvq_host_split
   v41_kvq_cpu_host
+  # The two serve modules the kv-split family runs against the stock fixture, here against
+  # the packed one: prefix reuse and DSpark's rollback are self-consistency gates (a turn
+  # that replays its own reply must be identical, drafts on and off must agree), so the
+  # cache formats' noise cannot excuse a failure -- only a boundary that moved a code row
+  # wrong can.
+  env COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 COLI_USAGE=$PWD/chain.usage \
+    DSV41_TINY=$PWD/dsv41_kvq_tiny COLI_DSV41_FIXTURE=$PWD/dsv41_kvq_tiny \
+    $PY -m unittest tests.test_dsv41_prefix_serve tests.test_dsv41_dspark_serve
+  echo "OK kv-quant serve: prefix reuse and DSpark's rollback against the packed fixture"
+  rm -f chain.usage chain-serve.usage
   unset OMP_NUM_THREADS
 }
 # The packed cache under the KV split: the split arms (its whole fp32 mirrors win, the

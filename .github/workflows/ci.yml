@@ -430,6 +430,11 @@ jobs:
           - family: kv-split-deepseek-sanitize
             req: c/tools/requirements-deepseek-v4-tiny.txt
             extra: sympy pillow
+          # the packed KV cache (COLI_VK_KV_FP32 unset, the default): the codec
+          # bit-for-bit, the six chain arms, the KV split's give-way, the CPU host
+          - family: kv-quant-deepseek
+            req: c/tools/requirements-deepseek-v4-tiny.txt
+            extra: sympy pillow
           # the dense chain's layers on two devices (Lavapipe opened twice, COLI_VK_DEV2=0):
           # every chain engine against its CPU run, split at every kind of layer, the state
           # crossing between the devices, the second device lost; the same under ASan and
