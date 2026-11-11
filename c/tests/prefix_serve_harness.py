@@ -85,6 +85,7 @@ class ServeEngine:
         self.p = subprocess.Popen([str(engine)] + [str(a) for a in argv], env=env,
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, bufsize=0)
+        self.last_done = None
         # Drain stderr continuously: reading it only at close() loses whatever
         # the engine wrote after the pipe filled, and an empty capture is
         # indistinguishable from an engine that said nothing -- exactly the
@@ -125,6 +126,7 @@ class ServeEngine:
                 chunks.append(self.p.stdout.read(int(text.split()[2])))
                 self.p.stdout.readline()          # the newline after the payload
             elif kind in ("DONE", "END"):
+                self.last_done = text
                 return b"".join(chunks)
             elif kind == "ERROR":
                 raise RuntimeError(f"engine error: {text}")

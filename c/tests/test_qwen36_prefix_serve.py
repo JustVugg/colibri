@@ -14,6 +14,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import unittest
 from pathlib import Path
@@ -138,6 +139,63 @@ class Qwen36PrefixServeTest(PrefixReuseContract, unittest.TestCase):
                     finally:
                         polled.close()
                         whole.close()
+
+    def test_disk_snapshot_exact_repeat_matches_cold_and_preserves_miss_reason(self):
+        prompt = b"exact-repeat-cache-check " * 12  # 300 tokens, above the 256-token default
+        with tempfile.TemporaryDirectory(prefix="qwen36-pcache-") as cache_dir:
+            engine = self.watch(ServeEngine(
+                ENGINE, ["8", "8"],
+                {"SNAP": str(FIXTURE), "SERVE": "1", "COLI_DENSE_I8": "0",
+                 "COLI_PROMPT_CACHE": "1", "COLI_PROMPT_CACHE_MIN": "",
+                 "COLI_PROMPT_CACHE_DIR": cache_dir},
+                log_prefix=False,
+            ))
+            cold = self.watch(ServeEngine(
+                ENGINE, ["8", "8"],
+                {"SNAP": str(FIXTURE), "SERVE": "1", "COLI_DENSE_I8": "0",
+                 "COLI_PROMPT_CACHE": "0"},
+                log_prefix=False,
+            ))
+            try:
+                cold_reply = cold.ask("cold", prompt, max_tok=8)
+                first_reply = engine.ask("first", prompt, max_tok=8)
+                self.assertEqual(first_reply, cold_reply)
+                self.assertIn("snapshot_store_s=", engine.last_done)
+                self.assertTrue(list(Path(cache_dir).glob("pfx_*.bin")),
+                                "eligible prompt did not produce a disk snapshot")
+
+                repeated_reply = engine.ask("repeat", prompt, max_tok=8)
+                self.assertEqual(repeated_reply, cold_reply,
+                                 "exact-repeat restore changed greedy output")
+                self.assertIn("prefix_reuse_source=disk_snapshot", engine.last_done)
+                self.assertIn(f"reused_prompt_tokens={len(prompt)}", engine.last_done)
+
+                divergent = b"X" + prompt[1:]
+                engine.ask("miss", divergent, max_tok=2)
+                self.assertIn("prefix_reuse_miss=prompt_not_longer", engine.last_done,
+                              "disk-cache miss masked the informative live-state reason")
+            finally:
+                engine.close()
+                cold.close()
+
+    def test_disk_snapshot_default_minimum_is_256_tokens(self):
+        with tempfile.TemporaryDirectory(prefix="qwen36-pcache-min-") as cache_dir:
+            engine = self.watch(ServeEngine(
+                ENGINE, ["8", "8"],
+                {"SNAP": str(FIXTURE), "SERVE": "1", "COLI_DENSE_I8": "0",
+                 "COLI_PROMPT_CACHE": "1", "COLI_PROMPT_CACHE_MIN": "",
+                 "COLI_PROMPT_CACHE_DIR": cache_dir},
+                log_prefix=False,
+            ))
+            try:
+                engine.ask("short", b"s" * 200, max_tok=1)
+                self.assertFalse(list(Path(cache_dir).glob("pfx_*.bin")),
+                                 "prompt shorter than the default minimum was snapshotted")
+                engine.ask("threshold", b"t" * 256, max_tok=1)
+                self.assertTrue(list(Path(cache_dir).glob("pfx_*.bin")),
+                                "prompt at the default 256-token minimum was not snapshotted")
+            finally:
+                engine.close()
 
     def test_multiplexed_submissions_are_not_consumed_by_cancel_poll(self):
         wire = b""

@@ -94,6 +94,13 @@ static int qwen36_max_ctx(void) {
 #include <sys/resource.h>
 #include <unistd.h>
 #endif
+#if defined(_WIN32) || defined(__MINGW32__)
+#include <sys/utime.h>      /* _utime: restore touches the snapshot for LRU eviction */
+#define q36_pcache_touch(path) _utime((path), NULL)
+#else
+#include <utime.h>          /* restore touches the snapshot: LRU eviction */
+#define q36_pcache_touch(path) utime((path), NULL)
+#endif
 #include "cpu_check.h"   /* the processor runs what this build assumes, or it says so (#1979) */
 #include "serve_poll.h"       /* CANCEL a meta' turno (#1332) */
 #include "cli_args.h"
@@ -8085,9 +8092,10 @@ static void q36_unpark(Model *m) {
  * pays a full prefill, the rule reuse itself follows), no vision payloads
  * (vis_map is set) and no sliding-window models (a ring's rows are per-turn
  * scratch in a stride a snapshot cannot assume). Eviction keeps MAX files and
- * deletes the deepest stored length first: what survives an agent restart is
- * the short shared head -- system prompt plus tools, re-sent by every talk --
- * while a deep transcript's state serves only the conversation it came from. */
+ * evicts the least-recently-used snapshot by modification time (restore touches
+ * the file): recently reused deep conversations survive instead of always being
+ * displaced by the next longer prompt. File timestamps have platform resolution,
+ * so ties are possible. */
 
 #include <dirent.h>
 #include <sys/stat.h>
@@ -8105,7 +8113,7 @@ static int q36_pcache_on(void) {
 }
 static int q36_pcache_min(void) {   /* store only prompts of at least this many tokens */
     const char *e = getenv("COLI_PROMPT_CACHE_MIN");
-    int v = e && *e ? atoi(e) : 1024;
+    int v = e && *e ? atoi(e) : 256;
     return v < 64 ? 64 : v;
 }
 static int q36_pcache_dbg(void) {   /* COLI_PCACHE_LOG=1: the probe's decisions */
@@ -8152,19 +8160,20 @@ static void q36_pcache_mkdir(void) {
 #endif
 }
 
-/* Newest-MAX eviction, deepest first: keep the short shared heads, drop the
- * boundaries only one conversation ever returns to. `keep_path` survives. */
+/* LRU eviction: remove the oldest modification time first. `keep_path` survives;
+ * restored snapshots update their modification time to count as use. */
 static void q36_pcache_prune(const char *keep_path) {
     int maxf = q36_pcache_max_files();
     if (maxf <= 0) return;
     DIR *d = opendir(g_pc_dir);
     if (!d) return;
     struct dirent *de;
-    char name[64][512]; int len[64], n = 0;
+    char name[64][512]; double born[64]; int n = 0;
     while ((de = readdir(d)) != NULL && n < 64) {
         if (strncmp(de->d_name, "pfx_", 4) != 0 || !strstr(de->d_name, ".bin")) continue;
         char full[4352]; snprintf(full, sizeof full, "%s/%s", g_pc_dir, de->d_name);
         if (!strcmp(full, keep_path)) continue;   /* the one just written stays */
+        struct stat sb;
         FILE *g = fopen(full, "rb"); int llen = -1;
         if (g) {
             char magic[8]; int32_t hdr[12];
@@ -8173,17 +8182,18 @@ static void q36_pcache_prune(const char *keep_path) {
             fclose(g);
         }
         if (llen < 0) { remove(full); continue; }   /* not a snapshot this engine wrote: gone */
-        snprintf(name[n], sizeof name[0], "%s", full); len[n] = llen; n++;
+        if (stat(full, &sb) != 0) { remove(full); continue; }
+        snprintf(name[n], sizeof name[0], "%s", full); born[n] = sb.st_mtime; n++;
     }
     closedir(d);
     int count = n + 1;                          /* the candidates + the file just written */
     for (int kills = count - maxf; kills > 0; kills--) {
         int wi = -1;
         for (int j = 0; j < n; j++)
-            if (len[j] >= 0 && (wi < 0 || len[j] > len[wi])) wi = j;
+            if (born[j] >= 0 && (wi < 0 || born[j] < born[wi])) wi = j;
         if (wi < 0) break;                      /* fewer stored than the cap wants gone */
         remove(name[wi]);
-        len[wi] = -1;
+        born[wi] = -1;
     }
 }
 
@@ -8276,8 +8286,15 @@ static void q36_pcache_store(Model *m, const int *ids, int np, const float *logi
  * winner's bytes. Replay verifies the payload hash BEFORE deciding the state
  * is the ids'; by then the only buffers touched (KV rows, the DeltaNet state)
  * are exactly what a cold turn rewrites, and that is what the caller's `!reuse`
- * branch does. */
-static int q36_pcache_restore(Model *m, const int *ids, int np) {
+ * branch does.
+ *
+ * A FULL-length match (len == np) is accepted too, and only then `logit_out`
+ * (when non-NULL) receives the snapshot's logits row: the predictor of the
+ * first token AFTER the prompt. A tail prefill would produce fresh logits, so
+ * for a strict prefix it is read and dropped; for an exact repeat there is no
+ * tail, and that row is what lets the request resume with zero prefill. The
+ * caller owns the buffer (free() it after sampling). */
+static int q36_pcache_restore(Model *m, const int *ids, int np, float **logit_out) {
     const Cfg *c = &m->c;
     if (c->window > 0 || m->vis_map) return 0;
     uint64_t mk = q36_pcache_key(m);
@@ -8295,8 +8312,10 @@ static int q36_pcache_restore(Model *m, const int *ids, int np) {
             fread(hdr, sizeof hdr, 1, g) != 1 || fread(&mk2, 8, 1, g) != 1 ||
             fread(&hslot, 8, 1, g) != 1 || mk2 != mk) { fclose(g); continue; }
         int len = hdr[0];
-        /* the ids decide everything else, so the cheap checks come first */
-        if (len < 64 || len >= np || len > m->max_t || len > qwen36_max_ctx() ||
+        /* the ids decide everything else, so the cheap checks come first.
+         * len == np is allowed: the full-length match is the exact-repeat
+         * fast path (zero prefill, the snapshot's logits row resumes it). */
+        if (len < 64 || len > np || len > m->max_t || len > qwen36_max_ctx() ||
             hdr[1] != c->n_layers ||
             hdr[3] != (int)q36_kv_es() || hdr[4] != c->hidden || hdr[5] != c->vocab ||
             (int)q36_rec_cells(c) != hdr[6] ||
@@ -8376,13 +8395,15 @@ static int q36_pcache_restore(Model *m, const int *ids, int np) {
         hsh = q36_fnv64a(hsh, m->DN_rec[i], rec_f * sizeof(float));
         hsh = q36_fnv64a(hsh, m->DN_conv[i], conv_f * sizeof(float));
     }
-    /* the logits row: read, hash, drop -- the tail prefill produces fresh ones */
+    /* the logits row: read and hash. A strict prefix's tail prefill produces
+     * fresh ones, so it is dropped; a FULL match keeps it -- it is the first
+     * fresh token's predictor and the only thing an exact repeat needs. */
+    float *lo = NULL;
     if (ok) {
-        float *lo = (float *)malloc((size_t)c->vocab * sizeof(float));
+        lo = (float *)malloc((size_t)c->vocab * sizeof(float));
         if (!lo) ok = 0;
         else { ok = fread(lo, sizeof(float), (size_t)c->vocab, g) == (size_t)c->vocab;
-               if (ok) hsh = q36_fnv64a(hsh, lo, (size_t)c->vocab * sizeof(float));
-               free(lo); }
+               if (ok) hsh = q36_fnv64a(hsh, lo, (size_t)c->vocab * sizeof(float)); }
     }
     /* the MTP pending row through a small temp; q36_pin_state_put installs it */
     Q36PinState put; memset(&put, 0, sizeof put);
@@ -8403,14 +8424,22 @@ static int q36_pcache_restore(Model *m, const int *ids, int np) {
         m->kv_len = len;
         kv_prefix_clear(&m->kvp);
         kv_prefix_record(&m->kvp, ids, 0, len);   /* pin_restore's exact bookkeeping */
+        if (logit_out && len == np) { *logit_out = lo; lo = NULL; }   /* ownership passes */
+        else { free(lo); lo = NULL; }
+        /* touch the file: eviction is LRU (oldest written dies first), so a
+         * snapshot that keeps serving must keep looking recent -- exact
+         * repeats restore without rewriting anything, and would otherwise
+         * age out while hot. */
 #ifdef COLI_VULKAN
         q36c_rollback(m, -1, 0);   /* every mirror's watermark to 0: rows re-upload (q36_unpark) */
 #endif
 #ifdef COLI_CUDA
         q36cc_rollback(m, -1, 0);
 #endif
-        fprintf(stderr, "[PCACHE] restored %d of %d prompt tokens\n", len, np);
+        fprintf(stderr, "[PCACHE] restored %d of %d prompt tokens%s\n", len, np,
+                len == np ? " (full: no prefill)" : "");
         fflush(stderr);
+        q36_pcache_touch(best_path);   /* restore counts as use: eviction is oldest-first */
     } else {
         ok = 0;
         if (q36_pcache_dbg())
@@ -8420,6 +8449,7 @@ static int q36_pcache_restore(Model *m, const int *ids, int np) {
     }
     free(blob);
     free(put.rec); free(put.conv); free(put.mtp_pend);
+    free(lo);   /* NULL when the caller took ownership or nothing was read */
     fclose(g);
     return ok ? len : 0;
 }
@@ -8957,9 +8987,11 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     ensure_kv(m);
     /* The disk prompt cache covers a one-shot CLI run too (COLI_PROMPT_CACHE=1
      * forces it on): restore the deepest stored prefix of the prompt and read
-     * only the tail, or start cold. */
+     * only the tail, or start cold. A full-length match resumes with no
+     * prefill at all, on the snapshot's own logits row. */
+    float *pc_logit = NULL;
     int pc = (g_pc_dir[0] && !m->kvp.tainted && q36_pcache_on())
-           ? q36_pcache_restore(m, prompt, np) : 0;
+           ? q36_pcache_restore(m, prompt, np, &pc_logit) : 0;
     if (pc > 0) {
         m->kv_len = pc;   /* restore wrote rows [0..pc), the DeltaNet state and the record */
     } else {
@@ -8967,7 +8999,8 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
         m->kv_len = 0;
     }
     for (int i = 0; i < np; i++) out[i] = prompt[i];
-    float *logit = step(m, prompt + pc, np - pc, pc);
+    float *logit = (pc == np) ? pc_logit
+                              : step(m, prompt + pc, np - pc, pc);
     qt_stats_mark();   /* [qtier] stats also report the hit rate from here on */
     /* The state photograph of THIS prompt's end: the tail the restore left
      * has just been prefilled, so the state is again "after consuming
@@ -9449,19 +9482,27 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
         reuse_source = "none";
         reuse_miss = "logprobs_requires_full_prompt";
     }
-    /* The disk prompt cache, deepest stored prefix first: no live record and
-     * no pin took this request, so check whether one of the saved snapshots
-     * holds the state of a strict prefix of these ids. An v1 optimisation
-     * like every other fast path here: on failure the request pays the full
-     * prefill it was always going to. */
+    /* The disk prompt cache: no live record and no pin took this request, so
+     * check whether one of the saved snapshots holds the state of a prefix of
+     * these ids -- including the FULL prompt, in which case the snapshot's
+     * logits row lets the exact repeat resume with zero prefill. A v1
+     * optimisation like every other fast path here: on failure the request
+     * pays the full prefill it was always going to. */
+    float *pc_logit = NULL;   /* full-length restore: the first fresh token's predictor */
     if (!reuse && g_pc_dir[0] && g_echo_k == 0 && !q->pin && !m->kvp.tainted &&
         g_q36_mux_slots == 1 && q36_pcache_on()) {
-        int pr = q36_pcache_restore(m, ids, np);
+        int pr = q36_pcache_restore(m, ids, np, &pc_logit);
         if (pr > 0) {
             reuse = pr;   /* the state is the ids[0..pr)'s: the reset below is skipped */
             reuse_source = "disk_snapshot";
             reuse_miss = NULL;
-        } else {
+        } else if (!strcmp(reuse_miss, "no_live_state") ||
+                   !strcmp(reuse_miss, "state_not_reusable")) {
+            /* The live-state analysis had nothing to say about WHY (no state
+             * at all, or an unusable one): the disk lookup ran and failed, so
+             * that is the reportable reason. Informative live misses
+             * (prompt_not_longer, divergent_prefix, tainted_state, ...) stand,
+             * instead of being masked by this branch. */
             reuse_miss = "no_matching_disk_snapshot";
         }
     }
@@ -9494,12 +9535,16 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     Q36StepControl control = {serve_prefill_poll, q->id, Q36_CONTROL_NONE};
     int prefill_control = g_q36_mux_slots == 1 ? serve_control_pending(q->id) : Q36_CONTROL_NONE;
     float *lo = NULL;
+    if (reuse == np) {   /* full disk resume: nothing left to prefill */
+        lo = pc_logit;   /* the snapshot's logits row predicts the first fresh token */
+        pc_logit = NULL;
+    }
     double prefill_started = now_s();
     double prefill_tm_start[6];
     Q36PrefillTiming prefill_timing = {0};
     memcpy(prefill_tm_start, g_tm_pre, sizeof prefill_tm_start);
     g_q36_prefill_timing = &prefill_timing;
-    if (!prefill_control) {
+    if (!prefill_control && reuse < np) {
         lo = step_ex_control(m, ids + reuse, np - reuse, reuse, 1,
                              interruptible ? &control : NULL);
         prefill_control = control.result;
