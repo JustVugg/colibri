@@ -1197,6 +1197,44 @@ int main(void) {
         ck(T->begin() && T->dnrec(KD, cb, bb, zb, sb, pb, yb, NULL, &p2) && T->submit(1) && maxdiff(down(yb, y.size()).data(), ry.data(), y.size()) < 1e-4 && maxdiff(down(sb, st.size()).data(), rst.data(), st.size()) < 1e-4, "the sigmoid gate, from the carried state");
         T->free(cb); T->free(bb); T->free(zb); T->free(sb); T->free(pb); T->free(yb); T->free(nb);
     }
+    /* a verify's rows with a copy after each (snap_n, the copies' addresses in a mapped table): one
+     * dispatch of the convolution and one of the recurrence give the bits of a dispatch a row (each
+     * ending on its row, snap_row 0), outputs, the carried state and ring, and every copy */
+    if (T->size >= offsetof(ColiCudaChainOps, dev_addr) + sizeof T->dev_addr && T->dev_addr) {
+        printf("dnconv and dnrec: a verify's copies in one dispatch\n");
+        const int KD = 128, S = 8, NS = 7, VH = 4, KH = 2, VD = 128, Ktot = KH * KD, CD = 2 * Ktot + VH * VD, vd = VH * VD, CK = 4, nh = CK - 1;
+        std::vector<float> in = rnd((size_t)S * CD, 91), w = rnd((size_t)CD * CK, 92), ring = rnd((size_t)CD * nh, 93);
+        std::vector<float> ab = rnd((size_t)S * 2 * VH, 94), z = rnd((size_t)S * vd, 95), st = rnd((size_t)VH * KD * VD, 96, 0.1f);
+        std::vector<float> prm(2 * VH + VD); unsigned sd = 97; for (int h = 0; h < VH; h++) { prm[h] = -1.f + 0.5f * frand(&sd); prm[VH + h] = 0.2f * frand(&sd); } for (int v = 0; v < VD; v++) prm[2 * VH + v] = 1.f + 0.2f * frand(&sd);
+        std::vector<float> out[2], ys[2], sts[2], rings[2], rs[2][NS], cs[2][NS];
+        for (int one = 0; one < 2; one++) {
+            CcBuf *ib = up(in), *wb = up(w), *rb = up(ring), *ob = T->buf((size_t)S * CD * 4, CC_DEV), *bb = up(ab), *zb = up(z), *sb = up(st), *pb = up(prm);
+            CcBuf *yb = T->buf((size_t)S * vd * 4, CC_DEV), *rsb[NS], *csb[NS], *tab = T->buf((size_t)2 * NS * 8 + 16, CC_UP);
+            for (int r = 0; r < NS; r++) { rsb[r] = T->buf((size_t)VH * KD * VD * 4, CC_DEV); csb[r] = T->buf((size_t)CD * nh * 4, CC_DEV); }
+            int ok = tab != NULL && T->begin();
+            if (one) {
+                unsigned long long *t = (unsigned long long *)T->ptr(tab) + 1;   /* at float 2: an offset into the table */
+                for (int r = 0; r < NS; r++) { t[r] = (unsigned long long)(uintptr_t)T->dev_addr(rsb[r]); t[NS + r] = (unsigned long long)(uintptr_t)T->dev_addr(csb[r]); }
+                CcDnConv cp = {S, CD, CK, 0, CD, 0, CD, -1, 0, 0, 0, 2 + 2 * NS, NS};
+                CcDnRec rp = {S, VH, KH, VD, Ktot, 0, CD, 0, 2 * VH, VH, 2 * VH, 0, vd, 0, vd, -1, 0, 1e-6f, 1.f / sqrtf((float)KD), 0, 2, 0, NS};
+                ok = ok && T->dnconv(ib, wb, rb, ob, tab, &cp) && T->dnrec(KD, ob, bb, zb, sb, pb, yb, tab, &rp);
+            } else
+                for (int r = 0; r < NS && ok; r++) {   /* the engines' segments: a row each, the last the rest */
+                    int s0 = r, len = r < NS - 1 ? 1 : S - s0;
+                    CcDnConv cp = {len, CD, CK, s0 * CD, CD, s0 * CD, CD, 0, 0, 0, 0, 0};
+                    CcDnRec rp = {len, VH, KH, VD, Ktot, s0 * CD, CD, s0 * 2 * VH, 2 * VH, VH + s0 * 2 * VH, 2 * VH, s0 * vd, vd, s0 * vd, vd, 0, 0, 1e-6f, 1.f / sqrtf((float)KD), 0, 0, 0};
+                    ok = T->dnconv(ib, wb, rb, ob, csb[r], &cp) && T->dnrec(KD, ob, bb, zb, sb, pb, yb, rsb[r], &rp);
+                }
+            ck(ok && T->submit(1), one ? "one dispatch each, seven copies" : "a dispatch a copy");
+            out[one] = down(ob, (size_t)S * CD); ys[one] = down(yb, (size_t)S * vd); sts[one] = down(sb, st.size()); rings[one] = down(rb, ring.size());
+            for (int r = 0; r < NS; r++) { rs[one][r] = down(rsb[r], (size_t)VH * KD * VD); cs[one][r] = down(csb[r], (size_t)CD * nh); }
+            T->free(ib); T->free(wb); T->free(rb); T->free(ob); T->free(bb); T->free(zb); T->free(sb); T->free(pb); T->free(yb); T->free(tab);
+            for (int r = 0; r < NS; r++) { T->free(rsb[r]); T->free(csb[r]); }
+        }
+        int same = out[0] == out[1] && ys[0] == ys[1] && sts[0] == sts[1] && rings[0] == rings[1];
+        for (int r = 0; r < NS; r++) same = same && rs[0][r] == rs[1][r] && cs[0][r] == cs[1][r];
+        ck(same, "the same bits: outputs, the state and the ring carried, the seven states and rings copied");
+    }
     printf("ew\n");
     {
         const int R = 3, D = 40, C = 4, n = R * D;

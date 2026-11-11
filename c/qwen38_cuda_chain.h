@@ -74,6 +74,7 @@ typedef struct {
     ColiCudaTensor **t_sg;            /* the shared expert's gate row, f32 */
     CcBuf **rec, **ring, **kc, **vc, **ik, **pk;
     CcBuf **rec_snap[Q38_SPEC_SNAPS], **ring_snap[Q38_SPEC_SNAPS];   /* a verify's copies, slot r after row r */
+    CcBuf *snap_tab;   /* each layer's copies' device addresses (q38cc_snap_tab): a verify's rows in one dispatch */
     int snap_slots;
     CcBuf *ple_ring;                  /* [ple_nslots][W][SL]: current at ple_slot[0], the copy after row r at ple_slot[1+r] */
     int ple_slot[Q38_SPEC_ROWS], ple_nslots;
@@ -1024,22 +1025,43 @@ static int q38cc_attention(Q38CChain *ch, Model *m, Layer *l, int i, int n, int 
 /* ns: the chunk's rows whose state a verify copies (rows 0..ns-1, into slots c0..): the
  * convolution and the recurrence split into one dispatch per copy, each ending on its
  * row (the same bits). */
+/* qwen36_cuda_chain.h's q36cc_snap_tab: a verify's copies of layer i as their device addresses, so the
+ * convolution and the recurrence take the verify's rows in one dispatch each (COLI_CUDA_DN_SNAP_ONE=0:
+ * one a copy) */
+static int q38cc_snap_tab(Q38CChain *ch, Model *m, int i, int c0, int ns, int *rec_off, int *ring_off) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_CUDA_DN_SNAP_ONE"); on = !(e && *e == '0'); }
+    const int L = m->c.layers;
+    if (!on || ns < 2 || c0 + ns > Q38_SPEC_SNAPS || !cc_dev_addr_ready() ||
+        !cc_reserve(&ch->snap_tab, (size_t)L * 2 * Q38_SPEC_SNAPS * 2 * sizeof(float), CC_UP)) return 0;
+    unsigned long long *t = (unsigned long long *)cc_ptr(ch->snap_tab) + (size_t)i * 2 * Q38_SPEC_SNAPS;
+    for (int r = 0; r < ns; r++) {
+        const void *a = cc_dev_addr(ch->rec_snap[c0 + r][i]), *b = cc_dev_addr(ch->ring_snap[c0 + r][i]);
+        if (!a || !b) return 0;
+        t[r] = (unsigned long long)(uintptr_t)a; t[Q38_SPEC_SNAPS + r] = (unsigned long long)(uintptr_t)b;
+    }
+    *rec_off = i * 2 * Q38_SPEC_SNAPS * 2; *ring_off = *rec_off + Q38_SPEC_SNAPS * 2;
+    return 1;
+}
 static int q38cc_deltanet(Q38CChain *ch, Model *m, Layer *l, int i, int n, int c0, int ns) {
     Cfg *c = &m->c;
     int VH = c->dn_vheads, CD = c->dn_conv_dim, V = VH * c->dn_vdim;
     int ok = cc_matmul(q38cc_t(ch, &l->dn_qkv), ch->mixed, 0, ch->qkv, 0, n) && cc_matmul(q38cc_t(ch, &l->dn_z), ch->mixed, 0, ch->z, 0, n) &&
              cc_matmul(q38cc_t(ch, &l->dn_b), ch->mixed, 0, ch->ab, 0, n) &&
              cc_matmul(q38cc_t(ch, &l->dn_a), ch->mixed, 0, ch->ab, (size_t)ch->rows * VH, n);
-    int segs = ns > 1 ? ns : 1;
+    int rec_off = 0, ring_off = 0;
+    const int one = ns > 1 && q38cc_snap_tab(ch, m, i, c0, ns, &rec_off, &ring_off);
+    int segs = ns > 1 && !one ? ns : 1;
     for (int r = 0; r < segs && ok; r++) {
-        int s0 = ns > 1 ? r : 0, len = ns > 1 && r < ns - 1 ? 1 : n - s0, snap_row = ns ? 0 : -1, slot = ns ? c0 + r : 0;
-        CcDnConv cp = {len, CD, c->dn_convk, s0 * CD, CD, s0 * CD, CD, snap_row, 1, (int)ch->o_conv[i], 0, 0};
+        int s0 = ns > 1 ? r : 0, len = ns > 1 && r < ns - 1 ? 1 : n - s0, snap_row = ns && !one ? 0 : -1, slot = ns ? c0 + r : 0;
+        if (one) { s0 = 0; len = n; }
+        CcDnConv cp = {len, CD, c->dn_convk, s0 * CD, CD, s0 * CD, CD, snap_row, 1, (int)ch->o_conv[i], 0, one ? ring_off : 0, one ? ns : 0};
         CcDnRec rp = {len, VH, c->dn_kheads, c->dn_vdim, c->dn_kheads * c->dn_kdim, s0 * CD, CD, s0 * VH, VH,
                       ch->rows * VH + s0 * VH, VH, s0 * V, V, s0 * V, V, snap_row,
                       1 | (g_q38_a_direct ? 2 : 0) | (g_q38_dn_tiled ? 4 : 0), c->eps,   /* a GGUF's layout (qwen38_core.h) */
-                      1.f / sqrtf((float)c->dn_kdim), 0, 0, (int)ch->o_dn[i]};
-        ok = cc_dnconv(ch->qkv, ch->prm, ch->ring[i], ch->cv, ch->ring_snap[slot][i], &cp) &&
-             cc_dnrec(c->dn_kdim, ch->cv, ch->ab, ch->z, ch->rec[i], ch->prm, ch->dny, ch->rec_snap[slot][i], &rp);
+                      1.f / sqrtf((float)c->dn_kdim), 0, one ? rec_off : 0, (int)ch->o_dn[i], one ? ns : 0};
+        ok = cc_dnconv(ch->qkv, ch->prm, ch->ring[i], ch->cv, one ? ch->snap_tab : ch->ring_snap[slot][i], &cp) &&
+             cc_dnrec(c->dn_kdim, ch->cv, ch->ab, ch->z, ch->rec[i], ch->prm, ch->dny, one ? ch->snap_tab : ch->rec_snap[slot][i], &rp);
     }
     return ok && cc_matmul(q38cc_t(ch, &l->dn_out), ch->dny, 0, ch->blk, 0, n);
 }

@@ -1002,6 +1002,10 @@ __global__ static void cc_dnconv_k(const float *__restrict__ xin, const float *_
         for (int k = 0; k < 8; k++) if (k == nh - 1) hist[k] = cur;
         if (s == p.snap_row)
             for (int k = 0; k < 8; k++) if (k < nh) snap[p.snap_off + c * nh + k] = hist[k];
+        if (s < p.snap_n) {   /* a verify's row s: its own copy (the table's address s) */
+            float *dst = (float *)(uintptr_t)reinterpret_cast<const unsigned long long *>(snap + p.snap_off)[s];
+            for (int k = 0; k < 8; k++) if (k < nh) dst[c * nh + k] = hist[k];
+        }
     }
     for (int k = 0; k < 8; k++) if (k < nh) ring[p.ring_off + c * nh + k] = hist[k];
 }
@@ -1041,6 +1045,10 @@ __global__ static void cc_dnconv_ring_k(const float *__restrict__ xin, float *__
     float h[8];
     if (p.snap_row >= 0 && p.snap_row < p.S)   /* the ring after row snap_row */
         for (int k = 0; k < 8; k++) if (k < nh) snap[p.snap_off + c * nh + k] = cc_dnconv_val(xin, ring, c, p.snap_row + 1 - nh + k, nh, p);
+    for (int s = 0; s < p.snap_n && s < p.S; s++) {   /* a verify's rows: the ring after each, its own copy */
+        float *dst = (float *)(uintptr_t)reinterpret_cast<const unsigned long long *>(snap + p.snap_off)[s];
+        for (int k = 0; k < 8; k++) if (k < nh) dst[c * nh + k] = cc_dnconv_val(xin, ring, c, s + 1 - nh + k, nh, p);
+    }
     for (int k = 0; k < 8; k++) if (k < nh) h[k] = cc_dnconv_val(xin, ring, c, p.S - nh + k, nh, p);
     for (int k = 0; k < 8; k++) if (k < nh) ring[p.ring_off + c * nh + k] = h[k];
 }
@@ -1116,6 +1124,11 @@ __global__ static void __launch_bounds__(128) cc_dnrec_k(const float *__restrict
             if (s == p.snap_row) {
                 #pragma unroll
                 for (int k = 0; k < KD; k++) snap[nb + k * p.VD + v] = col[k];
+            }
+            if (s < p.snap_n) {   /* a verify's row s: its own copy (the table's address s) */
+                float *dst = (float *)(uintptr_t)reinterpret_cast<const unsigned long long *>(snap + p.snap_off)[s] + h * KD * p.VD;
+                #pragma unroll
+                for (int k = 0; k < KD; k++) dst[k * p.VD + v] = col[k];
             }
         }
         __syncthreads();
@@ -2738,7 +2751,8 @@ static int cc_attn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf 
 static int cc_dnconv(CcBuf *in, CcBuf *w, CcBuf *ring, CcBuf *out, CcBuf *snap, const CcDnConv *p) {
     CcCtx *c = live();
     if (!c || !in || !w || !ring || !out || !p || p->S < 1 || p->CD < 1 || p->CK < 2 || p->CK > 9) return 0;
-    if (p->snap_row >= 0 && !snap) return 0;
+    if ((p->snap_row >= 0 || p->snap_n > 0) && !snap) return 0;
+    if (p->snap_n > 0 && (p->snap_row >= 0 || p->snap_n > p->S || p->snap_off % 2 || ((size_t)p->snap_off + 2 * (size_t)p->snap_n) * 4 > snap->bytes)) return 0;
     if (p->S > 1 && p->S < 65536) {   /* a prompt's rows apart, then the ring past them */
         dim3 g((unsigned)((p->CD + 127) / 128), (unsigned)p->S);
         coli_launch(cc_dnconv_rows_k, g, 128, 0, c->stream, fp(in), fp(w), fp(ring), fpw(out), *p);
@@ -2752,9 +2766,11 @@ static int cc_dnrec(int KD, CcBuf *cv, CcBuf *ab, CcBuf *z, CcBuf *st, CcBuf *pr
     CcCtx *c = live();
     if (!c || !cv || !ab || !z || !st || !prm || !y || !p || p->S < 1 || p->VH < 1 || p->KH < 1 || p->VH % p->KH ||
         p->VD < 1 || p->VD > 128) return 0;
-    if (p->snap_row >= 0 && !snap) return 0;
+    if ((p->snap_row >= 0 || p->snap_n > 0) && !snap) return 0;
+    if (p->snap_n > 0 && (p->snap_row >= 0 || p->snap_n > p->S || p->snap_off % 2 || ((size_t)p->snap_off + 2 * (size_t)p->snap_n) * 4 > snap->bytes)) return 0;
     const float *a = fp(cv), *b = fp(ab), *zz = fp(z), *pr = fp(prm);
     float *s = fpw(st), *yy = fpw(y), *sn = fpw(snap);
+    if (p->snap_n > 0) goto one;   /* a verify's rows with their copies: one block a head, the rows in order */
     static int rows_on = -1;
     if (rows_on < 0) { const char *e = getenv("COLI_CUDA_DNREC_ROWS"); rows_on = !(e && *e == '0'); }
 #if !(defined(__HIP_PLATFORM_AMD__) || defined(__HIP__))   /* HIP keeps cc_dnrec_rows_k */

@@ -87,6 +87,7 @@ typedef struct {
     ColiCudaTensor **t_dnz;   /* z's rows where a GGUF gives them another type than qkv's (NULL: one in_proj) */
     CcBuf **rec, **ring, **kc, **vc;           /* per layer state */
     CcBuf **rec_snap[Q36_SPEC_SNAPS], **ring_snap[Q36_SPEC_SNAPS];   /* a verify's copies, slot r after row r */
+    CcBuf *snap_tab;   /* each layer's copies' device addresses (q36cc_snap_tab): a verify's rows in one dispatch */
     int snap_slots, snap_valid;
     int *kv_valid, *attn_ord, n_attn;
     int *kv_rows;                              /* per attention layer: its mirror's rows (a sliding layer's ring, else cap) */
@@ -1140,6 +1141,26 @@ static int q36cc_shortconv_mx(Q36CChain *ch, Model *m, int i, int n, int c0) {
     }
     return ok && cc_matmul(ch->t_sco[i], ch->cv, 0, ch->tmp, 0, n);
 }
+/* A verify's copies of layer i (rows 0..ns-1 into slots c0..) as a table of their device addresses in the
+ * mapped snap_tab: the recurrence's at float offset *rec_off, the ring's at *ring_off, so the convolution
+ * and the recurrence take the verify's rows in one dispatch each, the state read and written once (a
+ * dispatch a copy read and wrote Qwen3.8-27B's 151 MB of DeltaNet state once a draft). 0: not here (an
+ * older backend without device addresses, COLI_CUDA_DN_SNAP_ONE=0): one dispatch a copy. */
+static int q36cc_snap_tab(Q36CChain *ch, Model *m, int i, int c0, int ns, int *rec_off, int *ring_off) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_CUDA_DN_SNAP_ONE"); on = !(e && *e == '0'); }
+    const int L = m->c.n_layers;
+    if (!on || ns < 2 || c0 + ns > Q36_SPEC_SNAPS || !cc_dev_addr_ready() ||
+        !cc_reserve(&ch->snap_tab, (size_t)L * 2 * Q36_SPEC_SNAPS * 2 * sizeof(float), CC_UP)) return 0;
+    unsigned long long *t = (unsigned long long *)cc_ptr(ch->snap_tab) + (size_t)i * 2 * Q36_SPEC_SNAPS;
+    for (int r = 0; r < ns; r++) {
+        const void *a = cc_dev_addr(ch->rec_snap[c0 + r][i]), *b = cc_dev_addr(ch->ring_snap[c0 + r][i]);
+        if (!a || !b) return 0;
+        t[r] = (unsigned long long)(uintptr_t)a; t[Q36_SPEC_SNAPS + r] = (unsigned long long)(uintptr_t)b;
+    }
+    *rec_off = i * 2 * Q36_SPEC_SNAPS * 2; *ring_off = *rec_off + Q36_SPEC_SNAPS * 2;
+    return 1;
+}
 static int q36cc_deltanet(Q36CChain *ch, Model *m, Layer *l, int i, int n, int c0, int ns) {
     Cfg *c = &m->c; (void)l;
     int vh = c->dn_vheads, CD = c->dn_conv_dim, vd = vh * c->dn_vdim, PD = CD + vd;
@@ -1149,11 +1170,14 @@ static int q36cc_deltanet(Q36CChain *ch, Model *m, Layer *l, int i, int n, int c
     int ok = cc_matmul(ch->t_dnp[i], ch->nrm, 0, ch->qkvz, 0, n) &&
              (!two || cc_matmul(ch->t_dnz[i], ch->nrm, 0, ch->qkvz, z0, n)) &&
              cc_matmul(ch->t_ab[i], ch->nrm, 0, ch->ab, 0, n);
-    int segs = ns > 1 ? ns : 1;
+    int rec_off = 0, ring_off = 0;
+    const int one = ns > 1 && q36cc_snap_tab(ch, m, i, c0, ns, &rec_off, &ring_off);
+    int segs = ns > 1 && !one ? ns : 1;
     for (int r = 0; r < segs && ok; r++) {
-        int s0 = ns > 1 ? r : 0, len = ns > 1 && r < ns - 1 ? 1 : n - s0, snap_row = ns ? 0 : -1;
-        CcBuf *rs = ns ? ch->rec_snap[c0 + r][i] : NULL, *cs = ns ? ch->ring_snap[c0 + r][i] : NULL;
-        CcDnConv cp = {len, CD, c->dn_convk, s0 * qr, qr, s0 * CD, CD, snap_row, 0, (int)ch->o_conv[i], 0, 0};
+        int s0 = ns > 1 ? r : 0, len = ns > 1 && r < ns - 1 ? 1 : n - s0, snap_row = ns && !one ? 0 : -1;
+        if (one) { s0 = 0; len = n; }
+        CcBuf *rs = one ? ch->snap_tab : ns ? ch->rec_snap[c0 + r][i] : NULL, *cs = one ? ch->snap_tab : ns ? ch->ring_snap[c0 + r][i] : NULL;
+        CcDnConv cp = {len, CD, c->dn_convk, s0 * qr, qr, s0 * CD, CD, snap_row, 0, (int)ch->o_conv[i], 0, one ? ring_off : 0, one ? ns : 0};
         CcDnRec rp = {len, vh, c->dn_kheads, c->dn_vdim, c->dn_kheads * c->dn_kdim, s0 * CD, CD, s0 * 2 * vh, 2 * vh,
                       vh + s0 * 2 * vh, 2 * vh, (int)z0 + s0 * zr, zr, s0 * vd, vd, snap_row,
                       (g_ssm_a_direct ? 2 : 0) | (g_dn_tiled ? 4 : 0), c->eps,   /* a GGUF's layout (qwen36.c) */

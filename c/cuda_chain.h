@@ -80,12 +80,17 @@ typedef struct { CcAttn a; int win, sink, sink_off; } CcAttnW;
 /* chain_dnconv.comp */
 /* order 0, 1: Gated DeltaNet's (the sum's two orders); 2: LFM3's gated convolution, input rows B | C | x
  * of CD channels, out = C * conv(B * x), no activation (cc_lfm3_ready) */
-typedef struct { int S, CD, CK, in_off, in_row, out_off, out_row, snap_row, order, w_off, ring_off, snap_off; } CcDnConv;
+/* snap_n > 0 (a verify's rows in one dispatch): the ring after each row s < snap_n into the buffer at the device
+ * address snap holds at float snap_off + 2 s (a table of snap_n addresses, cc_dev_addr's; snap_row -1) */
+typedef struct { int S, CD, CK, in_off, in_row, out_off, out_row, snap_row, order, w_off, ring_off, snap_off; int snap_n; } CcDnConv;
 /* chain_dnrec.comp (KD a template parameter: 4, 8, 16, 32, 64, 128 or 256; VD <= 128). flags: 1 the gated
  * norm's gate a sigmoid (Qwen3.8), 2 the parameter A itself (a GGUF's, -exp(A_log)), 4 the value
  * heads tiled (a GGUF's: value head h reads key head h % KH) */
+/* snap_n > 0: the state after each row s < snap_n into the buffer at the device address snap holds at float
+ * snap_off + 2 s (CcDnConv's table; snap_row -1): a verify's copies in one dispatch, the state read and written
+ * once instead of once a row */
 typedef struct { int S, VH, KH, VD, Ktot, cv_off, cv_row, b_off, b_row, a_off, a_row, z_off, z_row,
-                 y_off, y_row, snap_row, flags; float eps, qscale; int st_off, snap_off, prm_off; } CcDnRec;
+                 y_off, y_row, snap_row, flags; float eps, qscale; int st_off, snap_off, prm_off; int snap_n; } CcDnRec;
 /* chain_ew.comp */
 #define CC_EW_ADD      0
 #define CC_EW_COMBINE  1
@@ -510,7 +515,8 @@ static inline int cc_fetch_ready(void) { const ColiCudaChainOps *t = cc_ops(); r
 static inline int cc_fetch(CcBuf *dst, const CcFetch *r, int n) { return cc_fetch_ready() ? cc_ops()->fetch(dst, r, n) : 0; }
 static inline int cc_fetch_wait(void) { return cc_fetch_ready() ? cc_ops()->fetch_wait() : 0; }
 static inline int cc_fetch_done(void) { return cc_fetch_ready() ? cc_ops()->fetch_done() : 0; }
-static inline const void *cc_dev_addr(const CcBuf *b) { return cc_fetch_ready() ? cc_ops()->dev_addr(b) : NULL; }
+static inline const void *cc_dev_addr(const CcBuf *b) { return cc_fetch_ready() && cc_ops()->dev_addr ? cc_ops()->dev_addr(b) : NULL; }
+static inline int cc_dev_addr_ready(void) { return cc_fetch_ready() && cc_ops()->dev_addr != NULL; }
 static inline int cc_host_up_ready(void) { const ColiCudaChainOps *t = cc_ops(); return t && t->size >= offsetof(ColiCudaChainOps, host_up_done) + sizeof t->host_up_done; }
 static inline int cc_host_up(void *dst, const void *src, size_t bytes, unsigned *ticket) { return cc_host_up_ready() ? cc_ops()->host_up(dst, src, bytes, ticket) : 0; }
 static inline int cc_host_up_done(unsigned ticket) { return cc_host_up_ready() ? cc_ops()->host_up_done(ticket) : 0; }
