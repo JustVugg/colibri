@@ -988,6 +988,14 @@ def _dsv41_geometry(config, context, _model_dir):
     if not isinstance(spec_block, int) or isinstance(spec_block, bool) or spec_block < 0:
         raise ValueError("deepseek_v41: dspark_block_size must be a non-negative integer")
     rows = spec_block + 1 if spec_block > 0 else 1
+    # The engine also zeroes the stage count when there is no block to draft with or no
+    # target layers to draft at (deepseek_v41.c: `if (spec_block <= 0 || n_spec_targets
+    # <= 0) n_mtp = 0`), so a config that spells a stage count without either loads no
+    # head and keeps no stage rings. The stage term otherwise assumes DSpark loaded (the
+    # default, one KV slot): V41_DSPARK=0 or a mux leaves the rings unallocated and this
+    # term still reserves them, which is conservative and named in docs/deepseek-v41.md.
+    if spec_block <= 0 or not section.get("dspark_target_layer_ids"):
+        stages = 0
     # The packed cache (COLI_VK_KV_FP32 unset) prices the packed host layout: the window
     # ring, the compressed rows and the index keys are the cache's own code rows (528,
     # 288 and 68 B, c/dsv41_kvq.h) instead of head_dim * 4, (head_dim + index_head_dim) *

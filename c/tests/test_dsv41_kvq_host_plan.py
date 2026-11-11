@@ -44,6 +44,7 @@ def _config(drop=(), **over):
         "kv_source_layer_ids": [2, 8, 14, 20],
         "num_nextn_predict_layers": 3,
         "dspark_block_size": 5,
+        "dspark_target_layer_ids": [37, 38, 39],
         "moe_inter_dim": 2048,
     }
     for key in drop:
@@ -122,6 +123,18 @@ class Dsv41KvqHostPlanTest(unittest.TestCase):
         self.assertEqual(legacy.fixed_state_bytes, 3032832)
         both = _geometry(0, False, n_mtp_layers=3, num_nextn_predict_layers=1)
         self.assertEqual(both.fixed_state_bytes, 3032832)
+
+    def test_a_stage_key_without_a_draft_block_prices_no_stage_rings(self):
+        # A stage key with no dspark_block_size: the engine zeroes n_mtp before it loads
+        # a head, so the planner must not price stage rings. The rollback rows stay: a
+        # layer allocates them whether or not anything drafts.
+        no_block = _geometry(0, False, drop=("dspark_block_size",))
+        self.assertEqual(no_block.fixed_state_bytes, 40 * 128 * 528 + 40 * 1 * 528)
+        zero_block = _geometry(0, False, dspark_block_size=0)
+        self.assertEqual(zero_block.fixed_state_bytes, 40 * 128 * 528 + 40 * 1 * 528)
+        # Same gate on the target layers: a block but nothing to draft at keeps no rings.
+        no_targets = _geometry(0, False, drop=("dspark_target_layer_ids",))
+        self.assertEqual(no_targets.fixed_state_bytes, 40 * 128 * 528 + 40 * 6 * 528)
 
     def test_a_config_with_no_stage_key_prices_the_rollback_rows_alone(self):
         # No stage key at all: 0 stages -- and still one rollback row a layer, not none.

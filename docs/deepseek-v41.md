@@ -606,7 +606,11 @@ which at the released geometry is 43 rings (40 layers + 3 DSpark stages) and 240
 (6 a layer, `dspark_block_size` 5), **3,032,832 B** packed against 11,763,712 B fp32.
 With 2.5 compressed rows a position on top, the planner prints the engine's
 **17,614,592 B at 16K** (116,621,312 B under `COLI_VK_KV_FP32=1`) — the `host kv`
-16.8 MiB the ledger prints. The stage count is read the way the checkpoint spells it,
+16.8 MiB the ledger prints. The figure assumes DSpark loaded — the default, and a
+single KV slot. `V41_DSPARK=0` (or `KV_SLOTS` > 1) leaves the three stage rings
+unallocated, so the planner reserves 202,752 B packed (786,432 B fp32) more than the
+engine holds; the rollback rows stay, because a layer allocates them whether or not
+anything drafts. The stage count is read the way the checkpoint spells it,
 `num_nextn_predict_layers` (the released `config.json` carries no `n_mtp_layers`), which
 is also why the old planner priced 40 rings for a checkpoint whose engine keeps 43.
 
