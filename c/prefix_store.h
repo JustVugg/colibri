@@ -44,8 +44,11 @@
 #define COLI_PS_RAM_FLOOR_MB 1536
 #endif
 
-/* Rows of a cache by position: row t of head h at base + h * head_stride + t * row, t < rows. */
-typedef struct { void *base; size_t row; int rows, heads; size_t head_stride; } ColiPsPart;
+/* Rows of a cache by position: row t of head h at base + h * head_stride + t * row, t < rows. A
+ * compressed cache keeps a row for `per` positions (0 or 1: a row a position): row j once the
+ * positions [j * per, (j + 1) * per) are read, the group still filling being the engine's state;
+ * the block's tokens must be a multiple of it. */
+typedef struct { void *base; size_t row; int rows, heads; size_t head_stride; int per; } ColiPsPart;
 
 typedef struct {
     int parent;                 /* the block before (-1: the prompt's first) */
@@ -73,7 +76,7 @@ typedef struct {
 typedef struct {
     int on, B;
     uint64_t sig;               /* the layout: parts' row sizes and heads */
-    size_t pos_bytes;           /* a position's rows over every part */
+    size_t blk_bytes;           /* a block's rows over every part */
     ColiPsBlock *blk; int nblk, cblk;
     ColiPsCkpt *ck; int nck, cck;
     int *ht; int htcap, htused;   /* block key -> index + 1 (0 empty, -1 removed) */
@@ -161,36 +164,49 @@ static inline void coli_ps_clear(ColiPrefixStore *s) {
     free(s->blk); free(s->ck); free(s->ht);
     s->blk = NULL; s->ck = NULL; s->ht = NULL;
     s->nblk = s->cblk = s->nck = s->cck = s->htcap = s->htused = 0;
-    s->bytes = 0; s->sig = 0; s->pos_bytes = 0;
+    s->bytes = 0; s->sig = 0; s->blk_bytes = 0;
 }
 
-/* the layout of the parts; a store kept for another one is emptied first */
-static inline void coli_ps_layout(ColiPrefixStore *s, const ColiPsPart *parts, int nparts) {
+static inline int coli_ps_per(const ColiPsPart *q) { return q->per > 1 ? q->per : 1; }
+/* the bytes of every part's rows for n positions from a block's start (a compressed part's whole
+ * groups) */
+static inline size_t coli_ps_span(const ColiPsPart *parts, int nparts, int n) {
+    size_t b = 0;
+    for (int p = 0; p < nparts; p++) b += (size_t)(n / coli_ps_per(&parts[p])) * parts[p].row * (size_t)parts[p].heads;
+    return b;
+}
+/* The layout of the parts; a store kept for another one is emptied first. 0 when a part's group
+ * does not divide the block: then nothing is kept or taken. */
+static inline int coli_ps_layout(ColiPrefixStore *s, const ColiPsPart *parts, int nparts) {
     uint64_t h = coli_ps_mix(coli_ps_root_key(), (uint64_t)nparts);
-    size_t pb = 0;
     for (int p = 0; p < nparts; p++) {
+        if (s->B % coli_ps_per(&parts[p])) return 0;
         h = coli_ps_mix(h, (uint64_t)parts[p].row);
         h = coli_ps_mix(h, (uint64_t)parts[p].heads);
-        pb += parts[p].row * (size_t)parts[p].heads;
+        h = coli_ps_mix(h, (uint64_t)coli_ps_per(&parts[p]));
     }
     if (s->sig && s->sig != h) coli_ps_clear(s);
-    s->sig = h; s->pos_bytes = pb;
+    s->sig = h; s->blk_bytes = coli_ps_span(parts, nparts, s->B);
+    return 1;
 }
 
-/* rows of positions [t0, t0 + n) of every part into buf (out) or from it (!out) */
+/* rows of positions [t0, t0 + n) of every part into buf (out) or from it (!out); t0 a block's
+ * start, so a compressed part's rows are its groups [t0 / per, (t0 + n) / per) */
 static inline void coli_ps_rows(const ColiPsPart *parts, int nparts, int t0, int n, char *buf, int out) {
     for (int p = 0; p < nparts; p++) {
         const ColiPsPart *q = &parts[p];
-        const size_t len = (size_t)n * q->row;
+        const int per = coli_ps_per(q);
+        const size_t len = (size_t)(n / per) * q->row;
+        if (!len) continue;
         for (int h = 0; h < q->heads; h++) {
-            char *a = (char *)q->base + (size_t)h * q->head_stride + (size_t)t0 * q->row;
+            char *a = (char *)q->base + (size_t)h * q->head_stride + (size_t)(t0 / per) * q->row;
             if (out) memcpy(buf, a, len); else memcpy(a, buf, len);
             buf += len;
         }
     }
 }
 static inline int coli_ps_parts_hold(const ColiPsPart *parts, int nparts, int n) {
-    for (int p = 0; p < nparts; p++) if (!parts[p].base || parts[p].rows < n) return 0;
+    for (int p = 0; p < nparts; p++) if (!parts[p].base || parts[p].rows < n / coli_ps_per(&parts[p])) return 0;
     return 1;
 }
 
@@ -216,6 +232,10 @@ static inline int coli_ps_room(ColiPrefixStore *s, size_t need, double avail_mb)
         if (over == 2) avail_mb += (double)(before - s->bytes) / 1048576.0;
     }
 }
+
+/* Fewer positions than this past what the slot holds are not worth a load (the rows of every
+ * position come back): 64, or a block when blocks are smaller. */
+static inline int coli_ps_min_gain(const ColiPrefixStore *s) { return s->B < 64 ? s->B : 64; }
 
 static inline void coli_ps_hit_free(ColiPsHit *h) { free(h->path); memset(h, 0, sizeof *h); h->ck = -1; }
 
@@ -256,15 +276,25 @@ static inline int coli_ps_lookup(ColiPrefixStore *s, const int *ids, int n, int 
     return bestP;
 }
 
-/* The rows of a hit into the parts (positions [0, P)); its checkpoint's state, NULL for blocks
- * alone. The parts must hold P rows. */
-static inline void *coli_ps_load(ColiPrefixStore *s, const ColiPsHit *h, const ColiPsPart *parts, int nparts) {
-    for (int k = 0; k < h->depth; k++) coli_ps_rows(parts, nparts, k * s->B, s->B, (char *)s->blk[h->path[k]].rows, 0);
+/* The rows of a hit into the parts (positions [0, P)), but the whole blocks below `keep`: the
+ * engine says the parts hold those positions' rows already (the slot's record shares them with the
+ * prompt). Its checkpoint's state, NULL for blocks alone. The parts must hold P rows. */
+static inline void *coli_ps_load_from(ColiPrefixStore *s, const ColiPsHit *h, const ColiPsPart *parts, int nparts, int keep) {
+    for (int k = keep > 0 ? keep / s->B : 0; k < h->depth; k++)
+        coli_ps_rows(parts, nparts, k * s->B, s->B, (char *)s->blk[h->path[k]].rows, 0);
     s->hits++; s->hit_tokens += (unsigned long long)h->P;
     if (h->ck < 0) return NULL;
     const ColiPsCkpt *c = &s->ck[h->ck];
     if (c->tail) coli_ps_rows(parts, nparts, c->depth * s->B, c->tail, (char *)c->trows, 0);
     return c->state;
+}
+static inline void *coli_ps_load(ColiPrefixStore *s, const ColiPsHit *h, const ColiPsPart *parts, int nparts) {
+    return coli_ps_load_from(s, h, parts, nparts, 0);
+}
+/* the positions a load from `keep` left in place: its whole blocks */
+static inline int coli_ps_kept(const ColiPrefixStore *s, const ColiPsHit *h, int keep) {
+    int k = keep > 0 ? keep / s->B : 0;
+    return (k < h->depth ? k : h->depth) * s->B;
 }
 
 /* Keep ids[0, P) with the parts' rows of those positions and, when state is not NULL, a checkpoint
@@ -273,10 +303,12 @@ static inline void *coli_ps_load(ColiPrefixStore *s, const ColiPsHit *h, const C
  * avail_mb: the system's free RAM in MiB (< 0: not known). */
 static inline int coli_ps_save(ColiPrefixStore *s, const int *ids, int P, const ColiPsPart *parts, int nparts,
                                void *state, size_t state_bytes, void (*state_free)(void *), double avail_mb) {
-    if (!s->on || P < 1 || !coli_ps_parts_hold(parts, nparts, P)) { if (state && state_free) state_free(state); return 0; }
-    coli_ps_layout(s, parts, nparts);
+    if (!s->on || P < 1 || !coli_ps_parts_hold(parts, nparts, P) || !coli_ps_layout(s, parts, nparts)) {
+        if (state && state_free) state_free(state);
+        return 0;
+    }
     const int B = s->B, nd = P / B, tail = P - nd * B;
-    const size_t bb = (size_t)B * s->pos_bytes;
+    const size_t bb = s->blk_bytes;
     uint64_t key = coli_ps_root_key(); int cur = -1, ok = 1;
     s->tick++;
     for (int d = 0; d < nd && ok; d++) {
@@ -319,7 +351,7 @@ static inline int coli_ps_save(ColiPrefixStore *s, const int *ids, int P, const 
         if (c->live && c->base == cur && c->depth == nd && c->tail == tail &&
             (!tail || !memcmp(c->ttok, ids + (size_t)nd * B, (size_t)tail * sizeof(int)))) coli_ps_ckpt_drop(s, i);
     }
-    const size_t tb = (size_t)tail * s->pos_bytes, need = tb + (size_t)tail * sizeof(int) + state_bytes;
+    const size_t tb = coli_ps_span(parts, nparts, tail), need = tb + (size_t)tail * sizeof(int) + state_bytes;
     if (cur >= 0) s->blk[cur].refs++;
     ok = coli_ps_room(s, need, avail_mb);
     if (cur >= 0) s->blk[cur].refs--;
@@ -350,5 +382,62 @@ static inline int coli_ps_save(ColiPrefixStore *s, const int *ids, int P, const 
 
 static inline int coli_ps_live_blocks(const ColiPrefixStore *s) { int n = 0; for (int i = 0; i < s->nblk; i++) n += s->blk[i].live; return n; }
 static inline int coli_ps_live_ckpts(const ColiPrefixStore *s) { int n = 0; for (int i = 0; i < s->nck; i++) n += s->ck[i].live; return n; }
+
+/* The store as every engine sets it up, at its first request: COLI_PREFIX_STORE=0 off,
+ * COLI_PREFIX_STORE_MB its budget (unset: a quarter of the RAM free now, avail_mb, at most 4096
+ * MiB), COLI_PREFIX_STORE_BLOCK the tokens a block (256). off: the engine keeps it off (its own
+ * prefix reuse turned off). */
+static inline void coli_ps_init_env(ColiPrefixStore *s, int off, double avail_mb) {
+    const char *e = getenv("COLI_PREFIX_STORE"), *mb = getenv("COLI_PREFIX_STORE_MB"), *bk = getenv("COLI_PREFIX_STORE_BLOCK");
+    size_t budget = 0;
+    if (!(e && *e == '0') && !off) {
+        double want = avail_mb > 0 ? avail_mb / 4 : 1024.0;
+        if (want > 4096.0) want = 4096.0;
+        budget = mb && *mb ? (size_t)atoll(mb) << 20 : (size_t)want << 20;
+    }
+    int B = bk && atoi(bk) >= 16 ? atoi(bk) : 256;
+    coli_ps_init(s, B, budget);
+    if (s->on)
+        fprintf(stderr, "[PREFIX] store: up to %zu MiB of the prompts read, kept by content for any later request "
+                        "(blocks of %d tokens; COLI_PREFIX_STORE=0 off)\n", budget >> 20, B);
+}
+
+/* Where a prompt read from `from` keeps checkpoints: where its messages start (a token of opens[]
+ * opens one; coli_ps_marks_ex with shift 1: the position after a token of toks[], which closes the
+ * message before), the reply's opening aside (the last start, a few tokens from the end: a short
+ * question just before it is still a start), the first such past `from` (after a new conversation's system prompt, where the next
+ * one on the same prompt parts from it) and the last but the reply's (where the last message
+ * starts: a retry, an edited or a returning turn parts there), each at least a block on. */
+static inline int coli_ps_marks_ex(const int *ids, int np, int from, int B, const int *toks, int ntok, int shift, int *marks) {
+    int first = -1, last = -1, prev = -1, top = -1;
+    for (int p = from + 1; p < np; p++) {   /* the prompt's last message start */
+        int open = 0;
+        for (int k = 0; k < ntok && !open && p - shift >= 0; k++) open = ids[p - shift] == toks[k];
+        if (open) top = p;
+    }
+    for (int p = from + 1; p < np; p++) {
+        int open = 0;
+        for (int k = 0; k < ntok && !open && p - shift >= 0; k++) open = ids[p - shift] == toks[k];
+        if (!open) continue;
+        if (p == top && np - p <= 16) break;   /* the reply's own opening: nothing past it to keep */
+        if (first < 0 && p - from >= B) first = p;
+        prev = p;
+    }
+    last = prev;
+    int n = 0;
+    if (first > 0) marks[n++] = first;
+    if (last > 0 && last - (first > 0 ? first : from) >= B) marks[n++] = last;
+    return n;
+}
+static inline int coli_ps_marks(const int *ids, int np, int from, int B, const int *opens, int nopen, int *marks) {
+    return coli_ps_marks_ex(ids, np, from, B, opens, nopen, 0, marks);
+}
+
+static inline void coli_ps_report(const ColiPrefixStore *s) {
+    if (!s->on || !s->lookups) return;
+    fprintf(stderr, "[PREFIX] store: %llu lookups, %llu from the store (%llu prompt tokens not read again); %.1f MiB in %d blocks "
+                    "and %d checkpoints, %llu evicted\n", s->lookups, s->hits, s->hit_tokens,
+            s->bytes / 1048576.0, coli_ps_live_blocks(s), coli_ps_live_ckpts(s), s->evicted);
+}
 
 #endif /* COLI_PREFIX_STORE_H */

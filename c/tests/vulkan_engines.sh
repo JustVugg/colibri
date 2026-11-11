@@ -1480,6 +1480,10 @@ family_mimo_chain() {
   # mirrors), compared bit for bit with a cold engine: the per-row GEMV and no tier, so
   # a resumed prompt's rows get the bits of the same rows computed cold
   COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER=0 COLI_VK_GEMM_MIN_S=0 COLI_VK_ATTN_BLOCK=0 $PY -m unittest tests.test_mimo_prefix_serve
+  # the prefix store on the chain: a new conversation on the same system prompt, a conversation back
+  # after another system prompt took the slot; the logits of a fresh read on the same chain
+  MIMO_PS_BACKEND=vulkan $PY -m unittest tests.test_mimo_prefix_store || fail "chain mimo: the prefix store"
+  echo "OK chain mimo the prefix store: a stored prefix's logits a fresh read's, the same top five within 1e-3"
   # a serve session against the CPU's, frame for frame, in both modes and with the
   # device lost mid-session. The fixture's logits run to 300 (its head is scaled for wide
   # greedy margins), so its logprobs compare within 1e-3: about 3e-6 of the largest logit
@@ -2148,6 +2152,13 @@ family_qwen_chain() {
   chain_gate qwen38 "chain qwen38 MTP, the same prompt chunk by chunk" 1 $V38LWM COLI_VK_CHAIN_LAYERWISE=0 -- 2 8 qwen38_tiny_mtp/ref.json
   cmp -s lw.f32 vk.f32 || fail "chain qwen38 MTP, a prompt layer by layer: other logits than chunk by chunk"
   grep -a "^\[qwen38 MTP\] .*acceptance" vk.log | cmp -s - lw.mtp || { cat lw.mtp; fail "chain qwen38 MTP, a prompt layer by layer: other drafts than chunk by chunk"; }
+  # the prefix store on the chain: a new conversation on the same system prompt, a conversation back
+  # after another system prompt took the slot, two slots, the MTP head on; the logits of a fresh read
+  # on the same chain (the rows go up again)
+  $PY tools/make_edge_tiny_tokenizer.py --vocab-size 64 ./qwen38_tiny
+  QWEN38_TINY=qwen38_tiny QWEN38_TINY_MTP=qwen38_tiny_mtp QWEN38_PS_BACKEND=vulkan $PY -m unittest tests.test_qwen38_prefix_store ||
+    fail "chain qwen38: the prefix store"
+  echo "OK chain qwen38 the prefix store: a stored prefix's logits a fresh read's, the same top five within 1e-4"
   # the device lost mid-decode, once between steps and once inside an MTP verify
   dmoe_gate qwen38 "chain qwen38 the routed experts in the frame" all OMP_NUM_THREADS=2 SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
   dmoe_gate qwen38 "chain qwen38 the host's routing (COLI_VK_CHAIN_MOE=0)" none COLI_VK_CHAIN_MOE=0 OMP_NUM_THREADS=2 \
@@ -2556,8 +2567,13 @@ family_inkling_olmoe_chain() {
   # the tier's GEMM once, so the tier keeps every expert below it here.)
   COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 COLI_VK_ATTN_BLOCK=0 INKLING_TINY=tiny_inkling \
     $PY -m unittest tests.test_inkling_prefix_serve tests.test_inkling_dashboard_hits
+  # the prefix store on the chain: the logits of a fresh read on the same chain, within 1e-4
+  INKLING_TINY=tiny_inkling INK_PS_BACKEND=vulkan $PY -m unittest tests.test_inkling_prefix_store ||
+    fail "chain inkling: the prefix store"
   COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 COLI_VK_ATTN_BLOCK=0 COLI_VK_TIER_GEMM_ROWS=1000 \
     OLMOE_TINY=olmoe_tiny_c $PY -m unittest tests.test_olmoe_prefix_serve tests.test_olmoe_dashboard_hits tests.test_brio_serve
+  OLMOE_TINY=olmoe_tiny_c OLMOE_PS_BACKEND=vulkan $PY -m unittest tests.test_olmoe_prefix_store ||
+    fail "chain olmoe: the prefix store"
 }
 
 # inkling's and olmoe's chain under ASan and UBSan: memory safety is the gate (a
@@ -2789,6 +2805,11 @@ family_glm_chain() {
   CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=4 COLI_VK_CHAIN_ROWS=3
   CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=32 KV_SLOTS=2
   COLI_VK_CHAIN=2 CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=32
+  # the prefix store on the chain: a new conversation on the same system prompt, a conversation back
+  # after another system prompt took the slot, two slots; the logits of a fresh read on the same chain
+  COLI_GLM53_FIXTURE=glm53_stream-i4 GLM53_PS_BACKEND=vulkan $PY -m unittest tests.test_glm53_prefix_store ||
+    fail "chain glm53: the prefix store"
+  echo "OK chain glm53 the prefix store: a stored prefix's logits a fresh read's, the same top five within 1e-4"
   # a pin restored over rows another branch rewrote: the KDA state goes up from the pin,
   # the MLA rows' watermark comes down (the tier off and the scores within 1e-5: two
   # engine processes, see vulkan_partial_glm.sh; the per-row GEMV for every prompt
@@ -3054,6 +3075,11 @@ family_kimi_chain() {
     $PY tests/test_kimi_k3_ckpt.py --binary ./kimi_k3 --fixture ./kimi_k3_tiny
   COLI_USAGE=$PWD/k3c.usage USAGE_SAVE=0 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 \
     $PY tests/test_kimi_k3_dashboard.py --binary ./kimi_k3 --fixture ./kimi_k3_tiny
+  # the prefix store on the chain: a new conversation on the same system prompt, a conversation back
+  # after another system prompt took the slot; the logits of a fresh read on the same chain
+  KIMI_K3_TINY=./kimi_k3_tiny K3_PS_BACKEND=vulkan $PY -m unittest tests.test_kimi_k3_prefix_store ||
+    fail "chain kimi_k3: the prefix store"
+  echo "OK chain kimi_k3 the prefix store: a stored prefix's logits a fresh read's, the same top five within 1e-4"
   unset OMP_NUM_THREADS
 }
 
@@ -3532,6 +3558,11 @@ family_deepseek_chain() {
   DSV41_CHAIN=1 DSV41_TINY=dsv41_tiny $PY -m unittest tests.test_dsv41_prefill_tail.PrefillTailChainTest ||
     fail "chain deepseek_v41: the prompt's tail"
   echo "OK chain deepseek_v41 the prompt's tail: the logits of every row's run, fewer ops"
+  # the prefix store (prefix_store.h): a new conversation on the same system prompt and a
+  # conversation's next turn take what an earlier prompt read, both engines on the chain
+  DSV41_PS_BACKEND=vulkan DSV41_TINY=dsv41_tiny $PY -m unittest tests.test_dsv41_prefix_store ||
+    fail "chain deepseek_v41: the prefix store"
+  echo "OK chain deepseek_v41 the prefix store: a stored prefix's logits a fresh read's, the same top five within 1e-4"
   FAULT_BACK=100 v41_gate "chain deepseek_v41 device lost in the prompt" SNAP=dsv41_long COLI_VK_CHAIN_ROWS=7 -- 8 dsv41_long/ref.json
   FAULT_BACK=8 v41_gate "chain deepseek_v41 device lost between drafts" SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=5 -- 8 dsv41_tiny/ref.json
   # a GGUF's block types: the trunk on the chain, the experts in the tier, as the file has them

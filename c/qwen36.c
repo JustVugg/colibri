@@ -1333,6 +1333,11 @@ static int q36_ring_for(const Cfg *c, int max_t) {
 static inline int q36_kv_rows(const Model *m, int layer) {
     return m->kv_ring && m->c.win_layer && m->c.win_layer[layer] ? m->kv_ring : m->max_t;
 }
+/* the first attention layer that keeps a ring, -1 when none does */
+static int q36_first_ring_layer(const Model *m) {
+    for (int i = 0; i < m->c.n_layers; i++) if (m->c.is_attn[i] && q36_kv_rows(m, i) != m->max_t) return i;
+    return -1;
+}
 /* where position t of KV head h starts in layer `layer`'s K or V, in elements (q36_kv_es) */
 static inline int64_t q36_kv_at(const Model *m, int layer, int h, int t) {
     int R = q36_kv_rows(m, layer);
@@ -5036,8 +5041,13 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             q36_kv_put(Kl, q36_kv_at(m, layer, kvh, t), k + (int64_t)s*KV*kvd + kvh*kvd, kvd);
             q36_kv_put(Vl, q36_kv_at(m, layer, kvh, t), vv + (int64_t)s*KV*kvd + kvh*kvd, kvd);
         }
-    else
-        for (int s = 0; s < (mr ? S : 1); s++) {   /* the rows before the step's: still in the ring */
+    /* The rows before the step's: still in the ring. ring_pos is every sliding layer's, and the
+     * first one writes the step's rows into it after its scores: a step longer than the spare
+     * rows has overwritten there the window before pos_base, which the next sliding layers still
+     * hold, unwritten, in their own buffers. So a step's own check is the first sliding layer's;
+     * a multiplexed row's is its own position, a few rows of one conversation at most. */
+    else if (mr || layer == q36_first_ring_layer(m))
+        for (int s = 0; s < (mr ? S : 1); s++) {
             int p = mr ? mr[s].pos : pos_base;
             if (!q36_ring_holds(mr ? mr[s].seq->ring_pos : m->ring_pos, ring, p - win + 1, p)) {
                 fprintf(stderr, "[qwen36] layer %d: the KV ring no longer holds the window before position %d "
@@ -7566,25 +7576,12 @@ static void q36_park_decide(Model *m, const int *ids, int np, int max_tok) {
 #include "prefix_store.h"
 static ColiPrefixStore g_q36_ps;
 static int g_q36_ps_init;
-#define Q36_PS_MIN_GAIN 64   /* fewer positions than this over what the slot holds: not worth a load */
 static int q36_ps_on(const Model *m) {
-    if (!g_q36_ps_init) {
-        g_q36_ps_init = 1;
-        const char *e = getenv("COLI_PREFIX_STORE"), *mb = getenv("COLI_PREFIX_STORE_MB"), *bk = getenv("COLI_PREFIX_STORE_BLOCK");
-        size_t budget = 0;
-        if (!(e && *e == '0') && !kv_prefix_off()) {
-            double avail = compat_mem_available_gb() * 1024.0, want = avail > 0 ? avail / 4 : 1024.0;
-            if (want > 4096.0) want = 4096.0;
-            budget = mb && *mb ? (size_t)atoll(mb) << 20 : (size_t)want << 20;
-        }
-        int B = bk && atoi(bk) >= 16 ? atoi(bk) : 256;
-        coli_ps_init(&g_q36_ps, B, budget);
-        if (g_q36_ps.on)
-            fprintf(stderr, "[PREFIX] store: up to %zu MiB of the prompts read, kept by content for any later request "
-                            "(blocks of %d tokens; COLI_PREFIX_STORE=0 off)\n", budget >> 20, B);
-    }
+    if (!g_q36_ps_init) { g_q36_ps_init = 1; coli_ps_init_env(&g_q36_ps, kv_prefix_off(), compat_mem_available_gb() * 1024.0); }
     return g_q36_ps.on && !g_q36_mtp.on && !m->vis_rows_n && !m->mpos && !m->rope_delta;
 }
+/* the store's budget, decided when the engine plans its RAM: a tier's host pool leaves it (ram_later) */
+static size_t q36_ps_plan(const Model *m) { q36_ps_on(m); return g_q36_ps.on ? g_q36_ps.budget : 0; }
 /* whether a checkpoint needs more than rows by position: a recurrence, a ring */
 static int q36_ps_needs_state(const Model *m) {
     for (int i = 0; i < m->c.n_layers; i++) if (!m->c.is_attn[i] || (m->kv_ring && m->c.win_layer && m->c.win_layer[i])) return 1;
@@ -7598,8 +7595,8 @@ static int q36_ps_parts(const Model *m, ColiPsPart *parts) {
     for (int i = 0; i < c->n_layers; i++) {
         if (!c->is_attn[i] || q36_ps_ring(m, i) || !m->K[i] || !m->V[i]) continue;
         const int R = q36_kv_rows(m, i);
-        parts[n++] = (ColiPsPart){m->K[i], row, R, c->kv_heads, (size_t)R * row};
-        parts[n++] = (ColiPsPart){m->V[i], row, R, c->kv_heads, (size_t)R * row};
+        parts[n++] = (ColiPsPart){m->K[i], row, R, c->kv_heads, (size_t)R * row, 1};
+        parts[n++] = (ColiPsPart){m->V[i], row, R, c->kv_heads, (size_t)R * row, 1};
     }
     return n;
 }
@@ -7655,17 +7652,22 @@ static int q36_ps_take(Model *m, const int *ids, int np, int held) {
     ColiPsPart *parts = (ColiPsPart *)malloc((size_t)2 * c->n_layers * sizeof *parts);
     if (!parts) return 0;
     int nparts = q36_ps_parts(m, parts);
-    coli_ps_layout(&g_q36_ps, parts, nparts);
+    if (!coli_ps_layout(&g_q36_ps, parts, nparts)) { free(parts); return 0; }
     ColiPsHit h;
     int P = coli_ps_lookup(&g_q36_ps, ids, np, np - 1, q36_ps_needs_state(m), &h);
-    if (P <= held + Q36_PS_MIN_GAIN || !coli_ps_parts_hold(parts, nparts, P)) { coli_ps_hit_free(&h); free(parts); return 0; }
+    if (P <= held + coli_ps_min_gain(&g_q36_ps) || !coli_ps_parts_hold(parts, nparts, P)) { coli_ps_hit_free(&h); free(parts); return 0; }
     if (h.ck >= 0) {
         const Q36PsState *x = (const Q36PsState *)g_q36_ps.ck[h.ck].state;
         if (!x || x->R != m->kv_ring || x->n_layers != c->n_layers || (m->kv_ring && (!x->ring_pos || !m->ring_pos))) {
             coli_ps_hit_free(&h); free(parts); return 0;   /* rings of another size: the checkpoint is no state here */
         }
     }
-    const Q36PsState *x = (const Q36PsState *)coli_ps_load(&g_q36_ps, &h, parts, nparts);
+    /* the whole blocks the slot holds already (its record shares them with the prompt) stay in
+     * place, on the host and in the mirrors */
+    int keep = kv_prefix_common(&m->kvp, ids, np);
+    if (keep > m->kv_len) keep = m->kv_len;
+    const Q36PsState *x = (const Q36PsState *)coli_ps_load_from(&g_q36_ps, &h, parts, nparts, keep);
+    keep = coli_ps_kept(&g_q36_ps, &h, keep);
     free(parts);
     if (x) {
         q36_pin_state_put(m, x->st);
@@ -7679,24 +7681,25 @@ static int q36_ps_take(Model *m, const int *ids, int np, int held) {
     m->kv_len = P;
     kv_prefix_clear(&m->kvp);
     kv_prefix_record(&m->kvp, ids, 0, P);
+    /* the mirrors' watermarks to what stayed, the rows past it going up again; a sliding layer's
+     * ring is the checkpoint's whole, so with rings everything goes up again */
+    const int kept_dev = m->kv_ring ? 0 : keep;
 #ifdef COLI_VULKAN
-    q36c_rollback(m, -1, 0);   /* every mirror's watermark to 0: the rows go up again from the host */
+    q36c_rollback(m, -1, kept_dev);
 #endif
 #ifdef COLI_CUDA
-    q36cc_rollback(m, -1, 0);
+    q36cc_rollback(m, -1, kept_dev);
 #endif
+    (void)kept_dev;
     if (getenv("COLI_PREFIX_LOG")) {
-        fprintf(stderr, "[PREFIX] %d of %d prompt tokens from the store (%d blocks of %d%s; the slot held %d)\n",
-                P, np, h.depth, g_q36_ps.B, h.ck >= 0 ? " and a checkpoint" : "", held);
+        fprintf(stderr, "[PREFIX] %d of %d prompt tokens from the store (%d blocks of %d%s, %d rows in place; the slot held %d)\n",
+                P, np, h.depth, g_q36_ps.B, h.ck >= 0 ? " and a checkpoint" : "", keep, held);
         fflush(stderr);
     }
     coli_ps_hit_free(&h);
     return P;
 }
-/* Where a prompt read from `from` keeps checkpoints: where its messages start (the token that
- * opens one), the first such past `from` (after a new conversation's system prompt, where the next
- * one on the same prompt parts from it) and the last but the reply's (where the last message
- * starts: a retry, an edited or a returning turn parts there), each at least a block on. */
+/* where a prompt read from `from` keeps checkpoints (coli_ps_marks): where its messages start */
 static int q36_ps_marks(const Model *m, const int *ids, int np, int from, int *marks) {
     static int start_id = -2;
     if (start_id == -2) {   /* the special token that opens a message, from the tokenizer's added tokens */
@@ -7706,26 +7709,9 @@ static int q36_ps_marks(const Model *m, const int *ids, int np, int from, int *m
             for (int k = 0; k < g_nspecial && g_sp_str && start_id < 0; k++) if (!strcmp(g_sp_str[k], opens[o])) start_id = g_sp_id[k];
     }
     if (start_id < 0 || !q36_ps_on(m)) return 0;
-    const int B = g_q36_ps.B;
-    int first = -1, last = -1, prev = -1;
-    for (int p = from + 1; p < np; p++) {
-        if (ids[p] != start_id) continue;
-        if (np - p <= 16) break;              /* the reply's own opening: nothing past it to keep */
-        if (first < 0 && p - from >= B) first = p;
-        prev = p;
-    }
-    last = prev;
-    int n = 0;
-    if (first > 0) marks[n++] = first;
-    if (last > 0 && last - (first > 0 ? first : from) >= B) marks[n++] = last;
-    return n;
+    return coli_ps_marks(ids, np, from, g_q36_ps.B, &start_id, 1, marks);
 }
-static void q36_ps_report(void) {
-    if (!g_q36_ps.on || !g_q36_ps.lookups) return;
-    fprintf(stderr, "[PREFIX] store: %llu lookups, %llu from the store (%llu prompt tokens not read again); %.1f MiB in %d blocks "
-                    "and %d checkpoints, %llu evicted\n", g_q36_ps.lookups, g_q36_ps.hits, g_q36_ps.hit_tokens,
-            g_q36_ps.bytes / 1048576.0, coli_ps_live_blocks(&g_q36_ps), coli_ps_live_ckpts(&g_q36_ps), g_q36_ps.evicted);
-}
+static void q36_ps_report(void) { coli_ps_report(&g_q36_ps); }
 
 /* The prompt-end snapshot (#2589), qwen38's g_q38_prefix in qwen36's terms: the DeltaNet
  * state, the ids and the first token's logits as the last prompt read to its end left them.
@@ -9367,6 +9353,11 @@ static void q36_mux_finish(Model *m, Q36MuxReq *r){
     printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n", r->q.id, r->gen,
            dt > 0 ? r->gen / dt : 0.0, q36_turn_hit(m, &r->clk), rss_gb(), r->np, r->limited);
     fflush(stdout);
+    /* the slot's conversation as the turn left it, for its next turn on another slot (one as long
+     * as a parked one at least: COLI_PARK_MIN) */
+    const char *mn = getenv("COLI_PARK_MIN");
+    const int least = mn && atoi(mn) > 0 ? atoi(mn) : Q36_PARK_MIN;
+    if (m->kv_len >= least && m->kvp.len == m->kv_len) q36_ps_save(m, m->kvp.fed, m->kv_len, 1);
 }
 
 /* The next token of an active request, as serve_one's loop picks and sends it: 1
@@ -9815,7 +9806,7 @@ static void vk_tier_start(Model *m, const char *snap, int cap, int expert_is_int
                     .max_rows = QWEN_VK_ROWS * c->topk,
                     .ram_reserve = slot * (size_t)cap * (size_t)c->n_layers,
                     .ram_floor = slot * (size_t)c->topk * (size_t)c->n_layers, .ram_given = vk_ram_given,
-                    .ram_later = q36_kv_later(m),
+                    .ram_later = q36_kv_later(m) + q36_ps_plan(m),
                     .dense_bytes = vk_dense_bytes(m), .stage = g_vk_chain,
                     .chain_bytes = g_vk_chain ? q36c_late_bytes(m, qwen36_max_ctx() < Q36C_KV_START ? qwen36_max_ctx() : Q36C_KV_START) : 0,
                     .in_ram = vk_in_ram, .ram_ctx = m,

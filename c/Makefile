@@ -856,6 +856,8 @@ kimi-k3-tiny-check: kimi-k3-tiny-generate kimi_k3$(EXE)
 	$(PYTHON) tests/kimi_k3_park_harness.py \
 		--binary ./kimi_k3$(EXE) \
 		--fixture ./kimi_k31_tiny
+	KIMI_K3_TINY=./kimi_k3_tiny $(PYTHON) -m unittest tests.test_kimi_k3_prefix_store
+	KIMI_K3_TINY=./kimi_k31_tiny $(PYTHON) -m unittest tests.test_kimi_k3_prefix_store
 
 # Kimi K3's CUDA chain (kimi_k3_cuchain.h) against the CPU on the tiny K3 and K3.1, on a machine
 # with a card: make CUDA=1 kimi-k3-cuda-chain-check
@@ -1714,7 +1716,7 @@ mimo-tiny-check: mimo-tiny-generate mimo$(EXE)
 # through the gateway. Every comparison is against a cold engine.
 .PHONY: mimo-tiny-serve-check
 mimo-tiny-serve-check: mimo-tiny-generate mimo$(EXE)
-	$(PYTHON) -m unittest -v tests.test_mimo_prefix_serve tests.test_brio_serve.MimoBrioServe \
+	$(PYTHON) -m unittest -v tests.test_mimo_prefix_serve tests.test_mimo_prefix_store tests.test_brio_serve.MimoBrioServe \
 		tests.test_systemone_api.MimoSystemOneEndToEnd
 
 # Qwen3.8-Flash-Next text-only sibling. qwen38.c owns the direct checkpoint

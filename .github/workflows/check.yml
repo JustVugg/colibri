@@ -174,6 +174,8 @@ jobs:
           COLI_GLM53_FIXTURE=/tmp/glm53_stream-i4 python -m unittest -v tests.test_glm53_hostile_weights
           COLI_GLM53_FIXTURE=/tmp/glm53_mm python -m unittest -v tests.test_glm53_hostile_weights.Glm53MatrixShapeTest
           COLI_GLM53_FIXTURE=/tmp/glm53_stream-i4 python -m unittest -v tests.test_glm53_cluster
+          # the prefix store: a stored prefix's logits a fresh read's (its own byte tokenizer)
+          COLI_GLM53_FIXTURE=/tmp/glm53_stream-i4 python -m unittest -v tests.test_glm53_prefix_store
       # The two stdlib-only oracles used to be argparse scripts that `make
       # test-python` collected as zero tests (#1700). They run here, on the
       # fixtures generated above, token-exact against transformers in f32.
@@ -213,6 +215,9 @@ jobs:
             COLI_CUDA=0 COLI_VULKAN=0 Q36_KV_RING_SPARE=9 SNAP=/tmp/flint_$experts/model.gguf ./qwen36 16 8 /tmp/flint_$experts/ref.json 2> ring.log
             grep -q 'sliding-window layers keep a ring of 14 rows' ring.log || { cat ring.log; exit 1; }
           done
+          # a step longer than the ring's spare rows past position 0: a long next message, and
+          # the prefix store reading a prompt in pieces (its own fixture, made with torch)
+          python tests/test_qwen36_ring_long_step.py -v
       # Muse Spark's layer (residual gates, the experts at their own width between two
       # projections, a norm on every expert's output, capped logits) against
       # tools/make_muse_tiny.py's reference, F32 experts and Q8_0 ones (the reference then

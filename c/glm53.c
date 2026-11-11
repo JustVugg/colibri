@@ -4541,7 +4541,23 @@ static int compare_by_probability(const void *a, const void *b) {
 }
 
 /* Temperatura piu' nucleus. Con temperatura nulla e' argmax e basta. */
+/* COLI_LOGIT_DUMP=1: each served step's top five id:logit to stderr, as sample.h's pick_tok writes them
+ * (comparing two configurations on the same context: a stored prefix against a fresh read) */
+static void serve_logit_dump(const float *lo, int V) {
+    static int dump = -1;
+    if (dump < 0) dump = getenv("COLI_LOGIT_DUMP") ? 1 : 0;
+    if (!dump) return;
+    int id[5] = {-1, -1, -1, -1, -1}; float v[5] = {-3e38f, -3e38f, -3e38f, -3e38f, -3e38f};
+    for (int t = 0; t < V; t++) {
+        const float x = lo[t];
+        for (int k = 0; k < 5; k++) if (x > v[k]) { for (int j = 4; j > k; j--) { v[j] = v[j - 1]; id[j] = id[j - 1]; } v[k] = x; id[k] = t; break; }
+    }
+    fprintf(stderr, "[LOGITS]");
+    for (int k = 0; k < 5; k++) fprintf(stderr, " %d:%.6f", id[k], v[k]);
+    fprintf(stderr, "\n");
+}
 static int sample_token(const float *logits, int vocab) {
+    serve_logit_dump(logits, vocab);
     if (g_temp <= 1e-4f) return argmax(logits, vocab);
     static float *probability = NULL;
     static int *order = NULL;
@@ -5120,6 +5136,102 @@ static int prefill_should_halt(void *arg) {
     return *w->ctl == SERVE_CTL_CANCEL;
 }
 
+/* ---- every prompt read, kept by content for later requests (prefix_store.h) -----------------
+ * The KDA recurrence cannot be wound back: a slot resumes only from the end of what it holds (or a
+ * pin of its own, whose rows must still be in the slot), so an agent's new conversation on the same
+ * system prompt and tools read its whole prompt again, and so did a conversation back after another
+ * took its slot or sent to another slot. The store keeps the full-attention layers' MLA latents and
+ * indexer keys and gates in blocks named by their tokens, shared by every prompt that starts with
+ * them, and checkpoints of the KDA layers' states and convolution windows where a prompt's messages
+ * start (<|system|>, <|user|>, <|assistant|>, <|observation|>) and where a turn ends. A request takes
+ * the deepest checkpoint its prompt starts with when it reaches further than its slot, in a fresh
+ * session (the chains take it from the host). COLI_PREFIX_STORE=0 off; COLI_PREFIX_STORE_MB,
+ * COLI_PREFIX_STORE_BLOCK as on qwen36. Not for a picture's prompt or a read-out (logprobs). */
+#include "prefix_store.h"
+static ColiPrefixStore g_glm_ps;
+static int g_glm_ps_init;
+static int glm53_ps_on(void) {
+    if (!g_glm_ps_init) { g_glm_ps_init = 1; coli_ps_init_env(&g_glm_ps, 0, compat_mem_available_gb() * 1024.0); }
+    return g_glm_ps.on;
+}
+/* the store's budget, decided when the engine plans its RAM: a tier's host pool leaves it (ram_later) */
+static size_t glm53_ps_plan(void) { glm53_ps_on(); return g_glm_ps.on ? g_glm_ps.budget : 0; }
+/* the full-attention layers' MLA latents, indexer keys and gates, by position; s NULL: the layout
+ * alone (a session's rows, no rows to copy) */
+static int glm53_ps_parts(const GModel *m, const GSession *s, ColiPsPart *parts) {
+    const Cfg *c = &m->c; int n = 0;
+    for (int i = 0; i < c->n_layers; i++) {
+        if (!c->is_full[i]) continue;
+        const GLayerState *st = s ? &s->layer[i] : NULL;
+        const int cap = s ? s->cap : g_slot_context;
+        parts[n++] = (ColiPsPart){st ? st->latent : NULL, (size_t)c->kv_lora * sizeof(float), cap, 1, 0, 1};
+        parts[n++] = (ColiPsPart){st ? st->ikeys : NULL, (size_t)c->index_hd * sizeof(float), cap, 1, 0, 1};
+        parts[n++] = (ColiPsPart){st ? st->igates : NULL, (size_t)c->index_hd * sizeof(float), cap, 1, 0, 1};
+    }
+    return n;
+}
+/* ids[0, P) as session s holds them now, with its KDA state (the chains' newest first) */
+static void glm53_ps_save(const GModel *m, const GSession *s, const int *ids, int P) {
+    if (!glm53_ps_on() || !s || P < g_glm_ps.B || s->filled != P) return;
+    ColiPsPart *parts = (ColiPsPart *)malloc((size_t)3 * m->c.n_layers * sizeof *parts + 1);
+    if (!parts) return;
+    const int np = glm53_ps_parts(m, s, parts);
+    Glm53PinState *st = NULL;
+    if (glm53_state_capture(m, &st, s)) {
+        const Cfg *c = &m->c;
+        size_t sb = sizeof *st;
+        for (int i = 0; i < c->n_layers; i++)
+            if (!c->is_full[i] && st->state[i])
+                sb += ((size_t)c->kda_heads * c->kda_hd * c->kda_hd + (size_t)3 * c->kda_proj * c->conv_k) * sizeof(float);
+        coli_ps_save(&g_glm_ps, ids, P, parts, np, st, sb, glm53_pin_state_free, compat_mem_available_gb() * 1024.0);
+    } else glm53_pin_state_free(st);
+    free(parts);
+}
+/* The deepest prefix the store holds of ids[0, n), when it reaches past `held` positions: the slot
+ * starts over on a fresh session that the rows and the state go into (its pins go, as a prompt the
+ * slot does not hold drops them). The positions the slot now holds; 0 when nothing. */
+static int glm53_ps_take(GModel *m, KVSlot *slot, const int *ids, const uint64_t *keys, int n, int held) {
+    if (!glm53_ps_on() || n < 2) return 0;
+    ColiPsPart *parts = (ColiPsPart *)malloc((size_t)3 * m->c.n_layers * sizeof *parts + 1);
+    if (!parts) return 0;
+    int nparts = glm53_ps_parts(m, NULL, parts);
+    if (!coli_ps_layout(&g_glm_ps, parts, nparts)) { free(parts); return 0; }
+    ColiPsHit h;
+    const int P = coli_ps_lookup(&g_glm_ps, ids, n, n - 1, 1, &h);
+    const Glm53PinState *st = P > 0 && h.ck >= 0 ? (const Glm53PinState *)g_glm_ps.ck[h.ck].state : NULL;
+    if (P <= held + coli_ps_min_gain(&g_glm_ps) || !st || st->n_layers != m->c.n_layers || P >= g_slot_context) {
+        coli_ps_hit_free(&h); free(parts); return 0;
+    }
+    slot_reset(m, slot);
+    slot->session = session_open(m, g_slot_context);
+    nparts = glm53_ps_parts(m, slot->session, parts);
+    coli_ps_load(&g_glm_ps, &h, parts, nparts);
+    free(parts);
+    glm53_state_restore(m, st, slot->session);
+    slot->session->filled = P;
+    slot_remember(slot, ids, keys, P);
+    if (getenv("COLI_PREFIX_LOG")) {
+        fprintf(stderr, "[PREFIX] %d of %d prompt tokens from the store (%d blocks of %d and a checkpoint; the slot held %d)\n",
+                P, n, h.depth, g_glm_ps.B, held);
+        fflush(stderr);
+    }
+    coli_ps_hit_free(&h);
+    return P;
+}
+/* where a prompt read from `from` keeps checkpoints (coli_ps_marks): where its messages start */
+static int glm53_ps_marks(const Tok *T, const int *ids, int np, int from, int *marks) {
+    static int opens[4], nopen = -1;
+    if (nopen < 0) {
+        static const char *names[] = {"<|system|>", "<|user|>", "<|assistant|>", "<|observation|>"};
+        nopen = 0;
+        for (size_t o = 0; o < sizeof names / sizeof *names; o++)
+            for (int k = 0; k < T->nsp; k++)
+                if (T->sp[k].len == (int)strlen(names[o]) && !memcmp(T->sp[k].str, names[o], (size_t)T->sp[k].len)) { opens[nopen++] = T->sp[k].id; break; }
+    }
+    if (!nopen || !glm53_ps_on()) return 0;
+    return coli_ps_marks(ids, np, from, g_glm_ps.B, opens, nopen, marks);
+}
+
 /* Genera per una richiesta e chiude col suo DONE.
  *
  * Ritorna -1 se stdin ha raggiunto EOF durante il turno, 0 altrimenti: il turno
@@ -5239,6 +5351,12 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
     int pinned = resume ? 0 : slot_pin_for_request(m, slot, sequence, total,
                                                   common, shared, !plain);
     if (pinned > 0) { shared = pinned; why = "pin"; }
+    /* the prompt the store holds further than the slot does: another conversation's on the same
+     * system prompt, this one's before another took the slot or on another slot (glm53_ps_take) */
+    if (plain && !resume) {
+        const int got = glm53_ps_take(m, slot, sequence, keys, total, shared);
+        if (got) { shared = got; pinned = 0; why = "store"; }
+    }
     if (shared <= 0) {
         slot_reset(m, slot);
         slot->session = session_open(m, room);
@@ -5281,10 +5399,25 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
     }
     int rows = 1, ctl = SERVE_CTL_NONE, input_eof = 0;
     PrefillWatch watch = { q->id, &ctl, &input_eof };
-    float *logits = resume ? resume
-                  : forward_prefill(m, slot->session, sequence + shared,
-                                    total - shared, vision_new, n_new, 0,
-                                    prefill_should_halt, &watch);
+    float *logits = resume;
+    if (!resume) {
+        int at = shared, halted = 0;
+        if (plain) {   /* in pieces where its messages start, the state there kept for later requests */
+            int marks[2], nm = glm53_ps_marks(tokenizer, sequence, total, shared, marks);
+            for (int k = 0; k < nm && !halted; k++) {
+                float *lo = forward_prefill(m, slot->session, sequence + at, marks[k] - at, NULL, 0, 0,
+                                            prefill_should_halt, &watch);
+                if (!lo) { halted = 1; break; }
+                free(lo);
+                at = marks[k];
+                glm53_ps_save(m, slot->session, sequence, at);
+            }
+        }
+        if (!halted)
+            logits = forward_prefill(m, slot->session, sequence + at,
+                                     total - at, vision_new, n_new, 0,
+                                     prefill_should_halt, &watch);
+    }
     g_echo_k = 0; g_echo_id = 0;   /* la lettura riguarda il prefill, non la decodifica */
     /* Interrotto a meta' prefill: la sessione ha macinato solo `filled` token,
      * e da qui in poi `total` dice quello, cosi' la storia che slot_remember
@@ -5389,6 +5522,13 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
     /* La sessione resta allo slot per il turno dopo, con la sequenza che ha
      * davvero macinato: prompt piu' quello che ha generato. */
     slot_remember(slot, sequence, keys, total);
+    /* the conversation as the turn left it, for its next turn after another took the slot or on
+     * another slot (one of COLI_PARK_MIN tokens at least, 1024 unset) */
+    if (plain && ctl != SERVE_CTL_CANCEL) {
+        const char *mn = getenv("COLI_PARK_MIN");
+        const int least = mn && atoi(mn) > 0 ? atoi(mn) : 1024;
+        if (session->filled >= least) glm53_ps_save(m, session, sequence, session->filled);
+    }
     /* Quanto prefisso lo slot ha risparmiato.
      *
      * Su STDERR, non nel protocollo. La specifica dice che un server ignora le
@@ -5735,7 +5875,7 @@ static void glm53_vk_tier_start(GModel *m) {
                         .max_rows = GLM53_VK_ROWS * c->topk,
                         .ram_reserve = (size_t)cap * (size_t)sparse * (size_t)m->e_slot,
                         .ram_floor = (size_t)c->topk * (size_t)sparse * (size_t)m->e_slot, .ram_given = glm53_ram_given,
-                        .ram_later = g53_state_later(m),
+                        .ram_later = g53_state_later(m) + glm53_ps_plan(),
                         /* a partial chain: nothing more of the trunk goes up, but the chain's first
                          * forward allocates its scratch and the N layers' MLA caches */
                         .dense_bytes = g53_tier_dense_bytes(m),
@@ -5865,6 +6005,7 @@ static void serve_loop(GModel *m, Tok *tokenizer) {
          * aspetti una risposta: il gateway manda STOP e poi continua a leggere
          * fino al DONE, non si mette in attesa di un ack. */
     }
+    coli_ps_report(&g_glm_ps);
 }
 
 #ifndef GLM53_NO_MAIN
