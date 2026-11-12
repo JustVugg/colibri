@@ -2731,7 +2731,7 @@ tests/test_vk_dev2_window$(EXE): tests/test_vk_dev2_window.c backend_vulkan.c sh
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 # The pipelines' cache on disk (vk_pcache.h): written, read, refused when not the device's.
-tests/test_vk_pcache$(EXE): tests/test_vk_pcache.c backend_vulkan.c vk_pcache.h shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/rmsnorm.spv shaders/attention_absorb.spv
+tests/test_vk_pcache$(EXE): tests/test_vk_pcache.c backend_vulkan.c shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/rmsnorm.spv shaders/attention_absorb.spv
 	@[ "$(VK)" = 1 ] || { echo "tests/test_vk_pcache needs VK=1" >&2; exit 1; }
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 .PHONY: vk-pcache-check
