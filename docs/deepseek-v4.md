@@ -291,6 +291,39 @@ GPU fill branch and the CPU branch using bandwidths measured at runtime, and
 layer's full expert set into a second VRAM bank while the current layer
 computes, falling back to the single bank when VRAM is short.
 
+### A decode mirror as two runs (`V4_MIRROR_BLOCK`, opt-in)
+
+A mirror in the per-device cache is three FP4 tensors (gate, up, down), each
+with a weight and a scale allocation: an upload, or a recycle in place, is six
+copies. The host record already keeps an expert's three scale tensors together
+and its three weight tensors together. `V4_MIRROR_BLOCK=1` gives a mirror one
+weight run and one scale run on the device, laid out as the record has them,
+and fills it with two copies. To everything that reads it (the expert group,
+the peer pool, the resident route) the entry is still three tensors; the cache,
+its growth guard, its LRU and its recycle in place are unchanged. An expert
+whose host tensors are not two contiguous runs, or whose weights would not
+start on a 16-byte offset inside the run, takes the three-tensor mirror in the
+same cache, and so does every expert under a DLL without the new exports. The
+exit line `v4_gpu mirror-block device= made= refills= three-tensor=` counts
+them. `V4_MIRROR_BLOCK_VERIFY=1` reads every fill back from the device and
+compares it with the host bytes (`verified= mismatches=` on the same line;
+slow, a diagnostic).
+
+Measured on the RTX 5080 (3,278-token prompt, 36 tokens, `--memory-gb 16`,
+`COLI_CUDA_MOE_BATCH=1 COLI_CUDA_MOE_DOUBLE=1`, three runs per row, medians;
+the text is the same in every run):
+
+| mirror reserve | mirrors | fills in the run | unset: 35 tokens (s), MoE (ms/token) | `V4_MIRROR_BLOCK=1` |
+|---|---|---|---|---|
+| the default (8329 MiB with two banks) | 32 | 8,998 | 22.84, 529.9 | 22.91, 532.2 |
+| `DSV4_CUDA_VRAM_RESERVE_MB=600` | 440 | 5,164 | 21.42, 489.2 | 21.05, 478.9 (+1.7 % tok/s) |
+
+With the default reserve the cache stays at its 32-mirror minimum on this card,
+every routed expert is an upload, and the two-copy mirror changes nothing that
+the timing can see. With room to grow it is 10 ms per token. The verifier read
+5,618 fills back with no difference. The record is in
+`docs/experiments/v4-mirror-block-2026-11-12/`.
+
 ### Expert-pruned checkpoints (REAP) and the generic kernels
 
 Expert-pruned checkpoints such as `puwaer/DeepSeek-V4-Flash-0731-reap-150b`
@@ -750,6 +783,8 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `DSV4_MOE_EM_TB` (auto, `.cu`) | routes per pass of the expert-major kernel: unset = 2 below 4 routes per routed expert in the chunk, else 4; `2`, `3`, `4` or `6` forces one (anything else is ignored with a warning) |
 | `DSV4_MM_WARP` (auto, `.cu`) | generic dense batch matmul, fp8 shapes whose I is a multiple of 256: warp-per-row kernel for I ≤ 1024 (unset, empty or `auto`), `1` = all of them, `0` = off; `DSV4_MM_WARP_VERIFY=1` compares bit for bit (keeps the old kernel's results, also with `0`) |
 | `V4_MOE_BATCH_PROF` (0) | `1` = one `moebprof` line per chunk-layer: switch (layer change: prefetch-worker wait, bank swap) / route / refill / compute ms |
+| `V4_MIRROR_BLOCK` (0) | `1` = a decode mirror is one weight run and one scale run on the device, uploaded and recycled with two copies instead of six; experts whose host tensors are not two contiguous runs keep three tensors (see [A decode mirror as two runs](#a-decode-mirror-as-two-runs-v4_mirror_block-opt-in)) |
+| `V4_MIRROR_BLOCK_VERIFY` (0) | `1` = read every two-run fill back and compare it with the host bytes (`verified= mismatches=` in the `v4_gpu mirror-block` exit line); slow |
 | `V4_GPU_RESIDENT_FIRST` (0) | `1` = decode computes VRAM-mirrored experts without an expert-store lookup, and the RAM pins skip them (VRAM adds to the RAM tier); off under `DSV4_HYBRID=1` |
 | `DSV4_CUDA_PEER_DEVICE` (unset) | second GPU for a decode mirror pool (peer access required; unused under `DSV4_HYBRID=1`) |
 | `DSV4_CUDA_PEER_COMPUTE` (1, `.cu`) | run the peer pool's experts on the peer GPU (both GPUs at the same SM version; `mode=` in the `peer-mirrors` line); `0` = read them in place over P2P; no effect with `DSV4_CUDA_BATCHED=0`, which reads them in place |
