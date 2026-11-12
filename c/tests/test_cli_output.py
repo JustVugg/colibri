@@ -415,6 +415,15 @@ class OmpThreadsForEveryEngineTest(unittest.TestCase):
         self.assertEqual(env.get("GOMP_SPINCOUNT"), "200000")
         self.assertEqual(env.get("OMP_DYNAMIC"), "FALSE")
 
+    def test_v4_libomp_team_sleeps_when_idle_on_windows(self):
+        # OMP_WAIT_POLICY=active alone makes LLVM's libomp spin forever (#341, #2286)
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(self.coli.sys, "platform", "win32"):
+            env = self.coli.env_for_engine(self.args(), "deepseek_v4")
+        self.assertEqual(env.get("OMP_WAIT_POLICY"), "active")
+        self.assertEqual(env.get("KMP_BLOCKTIME"), "200")
+        self.assertNotIn("OMP_PROC_BIND", env)
+
     def test_explicit_setting_still_wins(self):
         with mock.patch.dict(os.environ, {"OMP_NUM_THREADS": "3"}, clear=True), \
              mock.patch("resource_plan.physical_cpu_count",
@@ -425,7 +434,7 @@ class OmpThreadsForEveryEngineTest(unittest.TestCase):
     def test_kill_switch_is_honoured(self):
         with mock.patch.dict(os.environ, {"COLI_NO_OMP_TUNE": "1"}, clear=True):
             env = self.coli.env_for_engine(self.args(), "deepseek_v4")
-        for key in ("OMP_NUM_THREADS", "OMP_WAIT_POLICY", "GOMP_SPINCOUNT",
+        for key in ("OMP_NUM_THREADS", "OMP_WAIT_POLICY", "GOMP_SPINCOUNT", "KMP_BLOCKTIME",
                     "OMP_DYNAMIC", "OMP_PROC_BIND", "OMP_PLACES"):
             self.assertNotIn(key, env)
 

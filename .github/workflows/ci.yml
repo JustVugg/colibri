@@ -557,6 +557,8 @@ jobs:
             # time. XDNA=1 needs nothing installed on the runner: the lane's host
             # side links no XRT, and the helper is loaded at runtime on request.
             make_args: "XDNA=1"
+            # release.yml's DeepSeek V4: clang with LLVM's libomp (#2286)
+            v4_args: "CC=clang"
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -574,6 +576,13 @@ jobs:
             make
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-binutils
+            mingw-w64-ucrt-x86_64-clang
+      # the OpenMP package under either of its names, as in release.yml
+      - if: matrix.os == 'windows-latest'
+        run: |
+          omp=mingw-w64-ucrt-x86_64-llvm-openmp
+          pacman -Si $omp > /dev/null 2>&1 || omp=mingw-w64-ucrt-x86_64-openmp
+          pacman -S --needed --noconfirm $omp
       - if: matrix.os == 'macos-latest'
         run: brew install libomp
       # Keep the portable sibling list aligned with release packaging. DeepSeek
@@ -589,7 +598,9 @@ jobs:
           if [ "${{ matrix.v4 }}" = "1" ]; then ENGINES="$ENGINES deepseek-v4"; fi
           for t in $ENGINES; do
             echo "::group::$t"
-            make $t ${{ matrix.make_args }} || { echo "FAILED: $t"; rc=1; }
+            extra=""
+            [ "$t" = deepseek-v4 ] && extra="${{ matrix.v4_args }}"
+            make $t ${{ matrix.make_args }} $extra || { echo "FAILED: $t"; rc=1; }
             echo "::endgroup::"
           done
           exit $rc

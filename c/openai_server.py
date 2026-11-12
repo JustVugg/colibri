@@ -6786,6 +6786,9 @@ def tune_child_env(env, arch):
         # that runtime policy treat the launcher value as a user override.
         env.setdefault("OMP_WAIT_POLICY", "active")
         env.setdefault("GOMP_SPINCOUNT", "200000")
+        # LLVM's libomp (the Windows clang build, #2286) reads this, not GOMP_SPINCOUNT:
+        # with OMP_WAIT_POLICY=active alone its idle team never sleeps (#341)
+        env.setdefault("KMP_BLOCKTIME", "200")
         env.setdefault("OMP_DYNAMIC", "FALSE")
         if sys.platform != "win32":
             env.setdefault("OMP_PROC_BIND", "close")

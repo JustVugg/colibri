@@ -60,6 +60,9 @@ jobs:
             make_args: "XDNA=1 VK=1"
             vk: "1"
             v4: "1"
+            # DeepSeek V4 with clang and LLVM's libomp, linked in: MinGW's libgomp
+            # never spins at a barrier, whatever the launcher's wait policy (#2286)
+            v4_args: "CC=clang"
             # GitHub shells are format strings: 'msys2 {0}', never bare 'msys2'
             # (the v1.0.0 tag build failed on exactly this). Same as ci.yml.
             shell: "msys2 {0}"
@@ -84,6 +87,16 @@ jobs:
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-vulkan-headers
             mingw-w64-ucrt-x86_64-shaderc
+            mingw-w64-ucrt-x86_64-clang
+
+      # LLVM's OpenMP runtime for the clang build of DeepSeek V4. MSYS2 renamed the
+      # package openmp -> llvm-openmp; the runner's package list (update: false) may
+      # predate that, and a name pacman does not know installs nothing (6b091239).
+      - if: matrix.os == 'windows-latest'
+        run: |
+          omp=mingw-w64-ucrt-x86_64-llvm-openmp
+          pacman -Si $omp > /dev/null 2>&1 || omp=mingw-w64-ucrt-x86_64-openmp
+          pacman -S --needed --noconfirm $omp
 
       - if: matrix.os == 'macos-latest'
         run: brew install libomp
@@ -146,7 +159,7 @@ jobs:
         if: matrix.v4 == '1'
         run: |
           cd c
-          make deepseek-v4 ${{ matrix.make_args }}
+          make deepseek-v4 ${{ matrix.make_args }} ${{ matrix.v4_args }}
           ls -lh deepseek_v4${{ matrix.ext }}
 
       - uses: actions/setup-node@v4
@@ -274,6 +287,14 @@ jobs:
           for e in $SIBLINGS; do
             test -x $e${{ matrix.ext }} || { echo "FAIL: $e missing from archive"; ls -la; exit 1; }
           done
+          # Windows: deepseek_v4.exe carries LLVM's libomp (#2286), linked in, so it
+          # must import no MinGW runtime DLL: the archive ships none.
+          if [ "${{ matrix.v4 }}" = "1" ] && [ "${{ matrix.ext }}" = ".exe" ]; then
+            grep -aq KMP_BLOCKTIME deepseek_v4.exe || { echo "FAIL: deepseek_v4.exe is not a libomp build"; exit 1; }
+            if objdump -p deepseek_v4.exe | grep -i 'DLL Name: lib'; then
+              echo "FAIL: deepseek_v4.exe imports a DLL the archive does not carry"; exit 1
+            fi
+          fi
           # the TUI: present, and it runs (--version needs no terminal and no server)
           test -x colibri-tui${{ matrix.ext }} || { echo "FAIL: colibri-tui missing from archive"; ls -la; exit 1; }
           ./colibri-tui${{ matrix.ext }} --version | grep -q "^colibri-tui " \

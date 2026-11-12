@@ -100,6 +100,36 @@ class MakefilePlatformTests(unittest.TestCase):
                 self.assertNotIn("-lvulkan", link)
                 self.assertNotIn("-Bdynamic", link)
 
+    def test_clang_mingw_triple_builds_for_windows(self):
+        # clang names the MinGW target x86_64-w64-windows-gnu, gcc x86_64-w64-mingw32 (#2286)
+        result = self._dry_run("colibri", "x86_64-w64-windows-gnu")
+        link = next(
+            line for line in result.stdout.splitlines() if "-o colibri.exe " in line
+        )
+        self.assertEqual(link.split()[-2:], ["-static", "-lpsapi"])
+
+    def test_deepseek_v4_windows_link_per_compiler(self):
+        # clang links libomp.a: no -pthread (its driver adds winpthreads), no LTO by
+        # default (GNU ld lacks LLVM's plugin); gcc's line stays as it was (#2286)
+        cases = (
+            ("gcc", ["-static", "-pthread", "-flto"]),
+            ("clang", ["-lm", "-fopenmp", "-static"]),
+        )
+        for cc, tail in cases:
+            with self.subTest(cc=cc):
+                result = subprocess.run(
+                    [MAKE, "--no-print-directory", "-B", "-n", "-f",
+                     "Makefile.deepseek-v4", "deepseek-v4", "OS=Windows_NT",
+                     f"CC={cc}"],
+                    cwd=C_DIR, text=True, capture_output=True, check=True,
+                )
+                link = next(
+                    line for line in result.stdout.splitlines()
+                    if " -o deepseek_v4.exe " in line
+                )
+                self.assertEqual(link.split()[0], cc)
+                self.assertEqual(link.split()[-3:], tail)
+
     def test_darwin_portable_build_does_not_force_x86_architecture(self):
         missing_libomp = "/colibri-test/missing-libomp"
         result = self._dry_run(

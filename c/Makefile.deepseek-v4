@@ -57,6 +57,17 @@ CFLAGS = -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp \
 	-DCOLI_V4_GPU_TIER \
 	-DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
 LDFLAGS = -lm -fopenmp -static -pthread
+# CC=clang (MSYS2 UCRT64: mingw-w64-ucrt-x86_64-clang and -llvm-openmp) links LLVM's
+# libomp, statically from its libomp.a. MinGW's libgomp has no spin-wait: its barriers
+# sleep on a semaphore whatever OMP_WAIT_POLICY and GOMP_SPINCOUNT say, and a decode
+# step is hundreds of small parallel regions (#2286). clang's driver links winpthreads
+# by itself (-pthread only draws an unused-argument warning), and LTO is off unless
+# asked for: GNU ld needs LLVM's linker plugin for clang's LTO objects, which the
+# clang package does not install.
+ifneq ($(findstring clang,$(notdir $(CC))),)
+LDFLAGS = -lm -fopenmp -static
+LTO ?= 0
+endif
 V4_BINARY := deepseek_v4.exe
 V4_WIN_EXTRA_OBJS = backend_loader_dsv4.o
 else ifeq ($(UNAME_S),Darwin)
