@@ -117,9 +117,10 @@ On Windows, build it with clang (#2286). MSYS2's gcc links MinGW's libgomp,
 whose barriers always sleep on a semaphore: the `OMP_WAIT_POLICY=active` and
 `GOMP_SPINCOUNT` that `coli` sets for this engine change nothing there, and each
 of a token's many small parallel regions pays a thread wake-up. clang links LLVM's
-libomp, whose team spins between regions (`coli` also sets `KMP_BLOCKTIME=200`,
-so it sleeps 200 ms after the last one instead of spinning forever). The release
-builds it this way. From source, in the MSYS2 UCRT64 shell:
+libomp, whose team spins between regions (on Windows `coli` also sets
+`KMP_BLOCKTIME=200` with the active policy, so the team sleeps 200 ms after the
+last region instead of spinning forever; `OMP_WAIT_POLICY=passive` makes it sleep
+at once). The release builds it this way. From source, in the MSYS2 UCRT64 shell:
 
 ```bash
 pacman -S --needed mingw-w64-ucrt-x86_64-clang mingw-w64-ucrt-x86_64-llvm-openmp
@@ -127,10 +128,13 @@ make deepseek-v4 CC=clang   # libomp.a is linked in: no extra DLL beside the .ex
 ```
 
 (An MSYS2 whose package list predates the rename calls the second package
-`mingw-w64-ucrt-x86_64-openmp`.) The tokens are the same as the gcc build's.
-On a 4-core i7-7700HQ the tiny test model decodes 3.1x faster (500 to 1547
-tok/s, a 72-token prompt in 20 ms instead of 67); on the full model the issue
-measured 1.5x. LTO is off for clang (`LTO=1` needs LLVM's linker plugin).
+`mingw-w64-ucrt-x86_64-openmp`.) On the tiny test model the tokens are the same
+as the gcc build's, and it decodes 3.1x faster on a 4-core i7-7700HQ (500 to
+1547 tok/s, a 72-token prompt in 20 ms instead of 67); on the full model the
+issue measured 1.5x with a clang build that had LTO. LTO is off for clang here
+(`LTO=1` needs LLVM's linker plugin), and the two compilers can round
+differently, so a real checkpoint may pick another token where two are nearly
+tied.
 
 ### Windows CUDA tier
 

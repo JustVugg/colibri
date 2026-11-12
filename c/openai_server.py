@@ -6787,8 +6787,11 @@ def tune_child_env(env, arch):
         env.setdefault("OMP_WAIT_POLICY", "active")
         env.setdefault("GOMP_SPINCOUNT", "200000")
         # LLVM's libomp (the Windows clang build, #2286) reads this, not GOMP_SPINCOUNT:
-        # with OMP_WAIT_POLICY=active alone its idle team never sleeps (#341)
-        env.setdefault("KMP_BLOCKTIME", "200")
+        # with OMP_WAIT_POLICY=active alone its idle team never sleeps (#341). Only for
+        # active: under passive it would turn libomp's blocktime 0 into 200 ms of spinning.
+        # Windows only: Linux builds link libgomp, and macOS's libomp is left as it was (#707).
+        if sys.platform == "win32" and env["OMP_WAIT_POLICY"].strip().lower() == "active":
+            env.setdefault("KMP_BLOCKTIME", "200")
         env.setdefault("OMP_DYNAMIC", "FALSE")
         if sys.platform != "win32":
             env.setdefault("OMP_PROC_BIND", "close")

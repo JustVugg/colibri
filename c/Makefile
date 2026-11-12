@@ -155,8 +155,9 @@ ifneq ($(LIBGOMP_CHECK),0)
 ifneq ($(filter-out clean%,$(or $(MAKECMDGOALS),all)),)
 OMP_LIB := $(if $(findstring clang,$(notdir $(DETECT_CC))),omp,gomp)
 OMP_PKG := $(if $(findstring clang,$(notdir $(DETECT_CC))),llvm-openmp,libgomp)
+OMP_DOC := $(if $(findstring clang,$(notdir $(DETECT_CC))),docs/deepseek-v4.md,docs/windows.md)
 ifeq ($(shell $(DETECT_CC) -print-file-name=lib$(OMP_LIB).a 2>/dev/null),lib$(OMP_LIB).a)
-$(warning $(DETECT_CC) has no lib$(OMP_LIB).a, so the -static -fopenmp link will fail with "cannot find -l$(OMP_LIB)". In the "MSYS2 UCRT64" shell run: pacman -S --needed mingw-w64-ucrt-x86_64-$(OMP_PKG) (docs/windows.md))
+$(warning $(DETECT_CC) has no lib$(OMP_LIB).a, so the -static -fopenmp link will fail with "cannot find -l$(OMP_LIB)". In the "MSYS2 UCRT64" shell run: pacman -S --needed mingw-w64-ucrt-x86_64-$(OMP_PKG) ($(OMP_DOC)))
 endif
 endif
 endif

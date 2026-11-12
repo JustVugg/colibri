@@ -424,6 +424,17 @@ class OmpThreadsForEveryEngineTest(unittest.TestCase):
         self.assertEqual(env.get("KMP_BLOCKTIME"), "200")
         self.assertNotIn("OMP_PROC_BIND", env)
 
+    def test_v4_blocktime_only_for_an_active_team_on_windows(self):
+        # libomp gives passive its blocktime 0 only while KMP_BLOCKTIME is unset;
+        # macOS's libomp is left as it was (#707)
+        for platform, environ in (("win32", {"OMP_WAIT_POLICY": " Passive"}),
+                                  ("darwin", {}), ("linux", {})):
+            with self.subTest(platform=platform), \
+                 mock.patch.dict(os.environ, environ, clear=True), \
+                 mock.patch.object(self.coli.sys, "platform", platform):
+                env = self.coli.env_for_engine(self.args(), "deepseek_v4")
+                self.assertNotIn("KMP_BLOCKTIME", env)
+
     def test_explicit_setting_still_wins(self):
         with mock.patch.dict(os.environ, {"OMP_NUM_THREADS": "3"}, clear=True), \
              mock.patch("resource_plan.physical_cpu_count",

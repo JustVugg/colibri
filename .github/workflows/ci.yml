@@ -557,8 +557,9 @@ jobs:
             # time. XDNA=1 needs nothing installed on the runner: the lane's host
             # side links no XRT, and the helper is loaded at runtime on request.
             make_args: "XDNA=1"
-            # release.yml's DeepSeek V4: clang with LLVM's libomp (#2286)
-            v4_args: "CC=clang"
+            # release.yml's DeepSeek V4 (clang with LLVM's libomp, #2286, and VK=1),
+            # built after the default gcc one
+            v4_args: "CC=clang VK=1"
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -577,6 +578,8 @@ jobs:
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-binutils
             mingw-w64-ucrt-x86_64-clang
+            mingw-w64-ucrt-x86_64-vulkan-headers
+            mingw-w64-ucrt-x86_64-shaderc
       # the OpenMP package under either of its names, as in release.yml
       - if: matrix.os == 'windows-latest'
         run: |
@@ -598,11 +601,15 @@ jobs:
           if [ "${{ matrix.v4 }}" = "1" ]; then ENGINES="$ENGINES deepseek-v4"; fi
           for t in $ENGINES; do
             echo "::group::$t"
-            extra=""
-            [ "$t" = deepseek-v4 ] && extra="${{ matrix.v4_args }}"
-            make $t ${{ matrix.make_args }} $extra || { echo "FAILED: $t"; rc=1; }
+            make $t ${{ matrix.make_args }} || { echo "FAILED: $t"; rc=1; }
             echo "::endgroup::"
           done
+          # the release's DeepSeek V4 as well (the flags stamp rebuilds its units)
+          if [ -n "${{ matrix.v4_args }}" ]; then
+            echo "::group::deepseek-v4 ${{ matrix.v4_args }}"
+            make deepseek-v4 ${{ matrix.make_args }} ${{ matrix.v4_args }} || { echo "FAILED: deepseek-v4 ${{ matrix.v4_args }}"; rc=1; }
+            echo "::endgroup::"
+          fi
           exit $rc
       - if: matrix.os == 'windows-latest'
         name: "The release configuration is what got built (XDNA=1)"

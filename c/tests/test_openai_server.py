@@ -3107,13 +3107,21 @@ class CapSentinelShimTest(unittest.TestCase):
         # an idle served engine must not spin: OMP_WAIT_POLICY=active alone is
         # an infinite KMP_BLOCKTIME in LLVM's libomp (#341, #2286)
         env = {}
+        explicit = {"KMP_BLOCKTIME": "0"}
+        passive = {"OMP_WAIT_POLICY": "PASSIVE"}
         with patch("openai_server.sys.platform", "win32"):
-            tune_child_env(env, "deepseek_v4")
+            for e in (env, explicit, passive):
+                tune_child_env(e, "deepseek_v4")
         self.assertEqual(env["OMP_WAIT_POLICY"], "active")
         self.assertEqual(env["KMP_BLOCKTIME"], "200")
-        explicit = {"KMP_BLOCKTIME": "0"}
-        tune_child_env(explicit, "deepseek_v4")
         self.assertEqual(explicit["KMP_BLOCKTIME"], "0")
+        # libomp gives passive its blocktime 0 only while KMP_BLOCKTIME is unset
+        self.assertNotIn("KMP_BLOCKTIME", passive)
+        # macOS's libomp is left as it was (#707)
+        mac = {}
+        with patch("openai_server.sys.platform", "darwin"):
+            tune_child_env(mac, "deepseek_v4")
+        self.assertNotIn("KMP_BLOCKTIME", mac)
 
     def test_direct_v4_server_preserves_explicit_omp_threads(self):
         env = {"OMP_NUM_THREADS": "3"}
