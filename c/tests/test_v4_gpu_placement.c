@@ -44,7 +44,16 @@ int dsv4_cuda_expert_bank_slots(int experts) { (void)experts; return 0; }
 long long dsv4_cuda_expert_bank_slot_bytes(int hidden, int intermediate) { (void)hidden; (void)intermediate; return 0; }
 void dsv4_cuda_activation_free(Dsv4CudaActivation *a) { (void)a; }
 int dsv4_cuda_device_unified(int device) { (void)device; return 0; }
-long long dsv4_cuda_mem_free_mb(int device) { free_queries[device]++; return device == low_memory_device ? 0 : 32000; }
+/* fake_free_mb >= 0: a card with that much free, plus 13 MiB for every
+ * mirror (three tensors) freed since fake_free_tensors was taken */
+static long long fake_free_mb = -1;
+static int fake_free_tensors;
+long long dsv4_cuda_mem_free_mb(int device) {
+    free_queries[device]++;
+    if (fake_free_mb >= 0)
+        return fake_free_mb + 13LL * ((fake_free_tensors - live_tensors) / 3);
+    return device == low_memory_device ? 0 : 32000;
+}
 int dsv4_cuda_stream_drain(int device) { drained[device]++; return device != 3; }
 void dsv4_cuda_tensor_free(Dsv4CudaTensor *t) { if (t) { live_tensors--; free(t); } }
 void dsv4_cuda_proj_batch_release(void) {}
@@ -371,6 +380,72 @@ int dsv4_cuda_resident_route_moe(Dsv4CudaExpertSet *set,Dsv4CudaTensor *gate,
     if(route_ok)*out=*in;
     return route_ok;
 }
+/* V4_BANK_MAKE_ROOM: the reserve is the headroom, and a bank about to be
+ * created releases the oldest mirrors on its device until it fits. */
+static V4GpuExpertMirrorCache *room_cache(int device, int mirrors, uint64_t first_clock) {
+    V4GpuExpertMirrorCache *cache = v4_gpu_expert_mirrors_create_capacity(device, 16);
+    for (int i = 0; i < mirrors; i++) {
+        V4GpuExpertMirror *entry = &cache->entries[cache->count++];
+        entry->layer = 1; entry->expert = i; entry->clock = first_clock + (uint64_t)i;
+        entry->gate = calloc(1, sizeof(Dsv4CudaTensor));
+        entry->up = calloc(1, sizeof(Dsv4CudaTensor));
+        entry->down = calloc(1, sizeof(Dsv4CudaTensor));
+        assert(entry->gate && entry->up && entry->down); live_tensors += 3;
+    }
+    return cache;
+}
+static void test_bank_make_room(void) {
+    long long bank = v4_reserve_bank_bytes, mirror = v4_reserve_mirror_bytes;
+    int start_tensors = live_tensors;
+    v4_reserve_bank_bytes = 100LL << 20;      /* a 100 MiB bank */
+    v4_reserve_mirror_bytes = 13LL << 20;     /* 13 MiB mirrors */
+    long long margin = -1;
+    unsetenv("V4_BANK_MAKE_ROOM");
+    long long reserved = v4_gpu_mirror_reserve_mb(64, &margin);
+    assert(reserved > COLI_V4_RESERVE_HEADROOM_MB && margin > 0);
+    V4GpuExpertMirrorCache *cache = room_cache(0, 10, 100);
+    V4GpuExpertMirrorCache *other = room_cache(1, 4, 1);          /* another device */
+    V4GpuExpertMirrorCache *resident = room_cache(0, 4, 1);       /* an immutable table */
+    resident->experts_per_layer = 4; resident->first_layer = 1; resident->end_layer = 2;
+    cache->next = other; other->next = resident;
+    ColiExpertStore store = {.gpu = cache};
+    int tensors = live_tensors;
+    /* the card is 100 MiB short of the bank and the 600 MiB headroom */
+    fake_free_mb = 600; fake_free_tensors = live_tensors;
+    /* off: nothing is released */
+    assert(v4_gpu_mirrors_make_room(&store, 0) == 0 && live_tensors == tensors);
+    setenv("V4_BANK_MAKE_ROOM", "1", 1);
+    /* on: the reserve is the headroom alone */
+    margin = -1;
+    assert(v4_gpu_mirror_reserve_mb(64, &margin) == COLI_V4_RESERVE_HEADROOM_MB && margin == 0);
+    /* 100 MiB short at 13 MiB a mirror: the 8 oldest go, the 2 newest stay */
+    cache->last_free_mb = 1; cache->grown_bytes = 5; cache->upload_failed = 1;
+    assert(v4_gpu_mirrors_make_room(&store, 0) == 8);
+    assert(cache->count == 2 && live_tensors == tensors - 24);
+    assert(cache->entries[0].clock >= 108 && cache->entries[1].clock >= 108);
+    /* the growth guard asks the card again */
+    assert(cache->last_free_mb == -1 && !cache->grown_bytes && !cache->upload_failed);
+    /* the other device's cache and the resident table are untouched */
+    assert(other->count == 4 && resident->count == 4);
+    /* enough room already: nothing more goes */
+    assert(v4_gpu_mirrors_make_room(&store, 0) == 0 && cache->count == 2);
+    /* a bank on the other device takes that device's mirrors only */
+    fake_free_mb = 690; fake_free_tensors = live_tensors;
+    assert(v4_gpu_mirrors_make_room(&store, 1) == 1 && other->count == 3 && cache->count == 2);
+    /* a card that never has the room gives up every mirror and stops */
+    fake_free_mb = 0; fake_free_tensors = live_tensors;
+    assert(v4_gpu_mirrors_make_room(&store, 0) == 2 && cache->count == 0);
+    assert(resident->count == 4);
+    /* no bank for this model: nothing to make room for */
+    v4_reserve_bank_bytes = 0;
+    assert(v4_gpu_mirrors_make_room(&store, 1) == 0 && other->count == 3);
+    fake_free_mb = -1;
+    unsetenv("V4_BANK_MAKE_ROOM");
+    v4_reserve_bank_bytes = bank; v4_reserve_mirror_bytes = mirror;
+    v4_gpu_expert_mirrors_free(cache);   /* frees the chain */
+    assert(live_tensors == start_tensors);
+}
+
 static void test_resident_route(void) {
     V4GpuExpertMirrorCache *cache=v4_gpu_expert_mirrors_create_capacity(0,256);
     cache->first_layer=7; cache->end_layer=8; cache->experts_per_layer=256;
@@ -457,6 +532,7 @@ int main(void) {
     free(engine);
     test_preload();
     test_resident_route();
+    test_bank_make_room();
     test_wo_decode();
     test_head();
     puts("test_v4_gpu_placement: ok");

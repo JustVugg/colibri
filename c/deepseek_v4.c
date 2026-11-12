@@ -13853,6 +13853,21 @@ static int v4_bank_double_usable(void) {
  * open: the attach path that consults the reserve has no model config. */
 static long long v4_reserve_bank_bytes, v4_reserve_mirror_bytes;
 
+/* V4_BANK_MAKE_ROOM (0): the decode mirror cache may grow into the VRAM the
+ * prompt's expert bank needs, and a bank, when a prompt creates it,
+ * releases the least recently used mirrors until it fits
+ * (v4_gpu_mirrors_make_room). Without it the cache keeps the bank's room
+ * free at all times (two banks with COLI_CUDA_MOE_DOUBLE), which on a card
+ * that holds little beyond the dense weights leaves decode a few dozen
+ * mirrors: every routed expert is then uploaded for every token. With it a
+ * decode fills the card with mirrors and the next prompt pays for its bank
+ * by dropping the oldest. 0 = the bank-sized reserve. An explicit
+ * DSV4_CUDA_VRAM_RESERVE_MB still decides the reserve. */
+static int v4_bank_make_room_on(void) {
+    const char *setting = getenv("V4_BANK_MAKE_ROOM");
+    return setting && *setting && atoi(setting) != 0;
+}
+
 /* bank_possible = 0 for a GGUF: its FP8 specs are retyped to ggml, so the
  * shared experts are never mirrored and the bank always refuses ("no
  * shared-expert mirrors"); the reserve then holds no bank. */
@@ -13870,7 +13885,15 @@ static void v4_gpu_mirror_reserve_size(const ColiDeepSeekV4Config *config,
             ? slots * dsv4_cuda_expert_bank_slot_bytes((int)hidden,
                                                        (int)intermediate)
             : 0;
-    if (v4_reserve_bank_bytes > 0 && !getenv("DSV4_CUDA_VRAM_RESERVE_MB"))
+    if (v4_reserve_bank_bytes > 0 && !getenv("DSV4_CUDA_VRAM_RESERVE_MB") &&
+        v4_bank_make_room_on())
+        fprintf(stderr, "v4_gpu mirror-reserve=%dMiB headroom; the %d-slot bank "
+                        "(%.0fMiB x%d) releases the oldest decode mirrors when a "
+                        "prompt creates it (V4_BANK_MAKE_ROOM)\n",
+                COLI_V4_RESERVE_HEADROOM_MB, slots,
+                v4_reserve_bank_bytes / 1048576.0,
+                v4_bank_double_usable() ? 2 : 1);
+    else if (v4_reserve_bank_bytes > 0 && !getenv("DSV4_CUDA_VRAM_RESERVE_MB"))
         fprintf(stderr, "v4_gpu mirror-reserve=%lldMiB (%d-slot bank %.0fMiB "
                         "x%d + %dMiB headroom + %d mirrors; "
                         "DSV4_CUDA_VRAM_RESERVE_MB overrides)\n",
@@ -13900,6 +13923,10 @@ static long long v4_gpu_mirror_reserve_mb(int live, long long *margin_mb) {
         if (env && explicit_mb < 256) explicit_mb = 256;
     }
     if (explicit_mb >= 0) return explicit_mb;
+    /* V4_BANK_MAKE_ROOM: only the attention headroom is kept free; the bank
+     * makes its own room when it is created */
+    if (v4_reserve_bank_bytes > 0 && v4_bank_make_room_on())
+        return COLI_V4_RESERVE_HEADROOM_MB;
     long long reserve_mb = coli_v4_mirror_reserve_mb(
         v4_reserve_bank_bytes,
         v4_bank_double_usable() ? 2 : 1,
@@ -14005,6 +14032,61 @@ void coli_v4_gpu_moe_batch_release(void) {
 
 void coli_v4_expert_store_add_wait(ColiExpertStore *store, double sec);   /* #1852 */
 
+/* V4_BANK_MAKE_ROOM: a bank is about to be created on `device`. Release the
+ * least recently used decode mirrors of the caches on that device until the
+ * bank and the attention headroom are free. This runs where a prompt
+ * creates its bank, between tokens, when no view holds a mirror. A resident
+ * table (experts_per_layer) is never touched, nor is a cache on another
+ * device (a layer placed elsewhere, the peer pool): the bank is not there.
+ * Unified memory has no card to make room on. Returns the mirrors released. */
+static int v4_gpu_mirrors_make_room(ColiExpertStore *store, int device) {
+    if (!store || !store->gpu || v4_reserve_bank_bytes <= 0 || !v4_bank_make_room_on())
+        return 0;
+    long long need_mb = ((v4_reserve_bank_bytes + (1LL << 20) - 1) >> 20) +
+                        COLI_V4_RESERVE_HEADROOM_MB;
+    long long mirror_mb = (v4_reserve_mirror_bytes + (1LL << 20) - 1) >> 20;
+    if (mirror_mb < 1) mirror_mb = 1;
+    int released = 0, left = 0;
+    for (V4GpuExpertMirrorCache *cache = (V4GpuExpertMirrorCache *)store->gpu; cache;
+         cache = cache->next) {
+        if (cache->device != device || cache->experts_per_layer) continue;
+        pthread_mutex_lock(&cache->mutex);
+        if (cache->unified < 0)
+            cache->unified = dsv4_cuda_device_unified(cache->device) ? 1 : 0;
+        while (!cache->unified && cache->count > 0) {
+            long long free_mb = dsv4_cuda_mem_free_mb(device);
+            if (free_mb < 0 || free_mb >= need_mb) break;
+            /* as many as the shortfall is worth, then ask the card again */
+            long long drop = (need_mb - free_mb + mirror_mb - 1) / mirror_mb;
+            while (drop-- > 0 && cache->count > 0) {
+                int victim = 0;
+                for (int i = 1; i < cache->count; i++)
+                    if (cache->entries[i].clock < cache->entries[victim].clock)
+                        victim = i;
+                if (cache->entries[victim].gate)
+                    dsv4_cuda_tensor_free(cache->entries[victim].gate);
+                if (cache->entries[victim].up)
+                    dsv4_cuda_tensor_free(cache->entries[victim].up);
+                if (cache->entries[victim].down)
+                    dsv4_cuda_tensor_free(cache->entries[victim].down);
+                cache->entries[victim] = cache->entries[--cache->count];
+                released++;
+            }
+        }
+        /* the growth guard probes the card again before the next mirror */
+        cache->last_free_mb = -1;
+        cache->grown_bytes = 0;
+        cache->upload_failed = 0;
+        left += cache->count;
+        pthread_mutex_unlock(&cache->mutex);
+    }
+    if (released)
+        fprintf(stderr, "v4_gpu mirror-cache: released %d decode mirrors for the "
+                        "prompt's expert bank on device %d (%d left)\n",
+                released, device, left);
+    return released;
+}
+
 int coli_v4_gpu_moe_batch_union(float *outputs,
                                 const ColiDeepSeekV4LayerWeights *weights,
                                 const ColiDeepSeekV4Config *config,
@@ -14069,6 +14151,9 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
     if (v4_moe_bank_device != device) coli_v4_gpu_moe_batch_release();
     v4_moe_bank_device = device;
     if (!bank) {
+        /* the decode mirrors may have grown into this bank's VRAM since the
+         * last prompt (V4_BANK_MAKE_ROOM) */
+        v4_gpu_mirrors_make_room(store, device);
         bank = dsv4_cuda_expert_bank_create(
             dsv4_cuda_expert_bank_slots(config->n_routed_experts), 4096, 2048,
             device, sg, su, sd);
@@ -14129,6 +14214,7 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
             V4GpuExpertMirrorCache *next_cache = v4_gpu_expert_cache(store, next);
             if (next_cache && next_cache->device == device) {
                 if (!v4_moe_bank2) {
+                    v4_gpu_mirrors_make_room(store, device);
                     v4_moe_bank2 = dsv4_cuda_expert_bank_create(
                         dsv4_cuda_expert_bank_slots(config->n_routed_experts),
                         4096, 2048, device, sg, su, sd);
