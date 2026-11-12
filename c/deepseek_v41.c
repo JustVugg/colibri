@@ -3224,8 +3224,15 @@ static void attention_run(Model *m, int layer, const float *x, int n, int start_
                 memcpy(l->ring_save + (size_t)t * roww, l->window + (size_t)slot * roww, roww);
                 l->ring_save_pos[t] = l->window_pos[slot];
             }
-            if (hostq) kvq_pack_win(l->window + (size_t)slot * roww, kv + (size_t)t * hd);
-            else memcpy(l->window + (size_t)slot * roww, kv + (size_t)t * hd, (size_t)hd * sizeof(float));
+            if (hostq) {
+                kvq_pack_win(l->window + (size_t)slot * roww, kv + (size_t)t * hd);
+                /* The window half of a ratio-0 layer IS win_dec, decoded from the whole ring
+                 * before this loop: the slot just written still holds the row it EVICTED, so a
+                 * query that lists it reads a position it never had. Re-decode the slot from the
+                 * code row this step stored, before window_idxs lists it. A ratio layer reads
+                 * kv_all, which takes the same write from the scratch floats below. */
+                if (win_dec && !ratio) kvq_unpack_win(win_dec + (size_t)slot * hd, l->window + (size_t)slot * roww);
+            } else memcpy(l->window + (size_t)slot * roww, kv + (size_t)t * hd, (size_t)hd * sizeof(float));
             l->window_pos[slot] = pos;
             /* kv_all holds a copy of the ring, so it takes the same write -- from the
              * scratch row, which is the floats either way */
