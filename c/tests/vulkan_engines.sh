@@ -4931,9 +4931,10 @@ family_kv_split_deepseek_sanitize() {
 # codec itself IS exact and gated bit for bit by tests/test_vk_kv_quant first. The fixture
 # is the tiny one at the released KV geometry (--kv-quant-dims: head_dim 512,
 # index_head_dim 128), because the formats are defined at those widths; at the stock tiny
-# geometry (64/32) the flag declines by its own dimension check. The last arm (v41_kvq_cpu_host)
-# runs the packed HOST with no Vulkan at all -- the CPU's dequant-on-read paths, what a user
-# without a capable GPU runs. It closes with the kv-split family's two serve modules (prefix
+# geometry (64/32) the flag declines by its own dimension check. The last two arms
+# (v41_kvq_cpu_host, v41_kvq_dspark_self) run the packed HOST with no Vulkan at all -- the
+# CPU's dequant-on-read paths, what a user without a capable GPU runs. The family closes with
+# the kv-split family's two serve modules (prefix
 # reuse, DSpark's rollback) against the same packed fixture.
 family_kv_quant_deepseek() {
   export OMP_NUM_THREADS=2
@@ -4957,6 +4958,7 @@ family_kv_quant_deepseek() {
   v41_kvq "DSpark spec=1" SNAP=dsv41_kvq_long V41_DSPARK=1 V41_SPEC_FORCE=1 -- 8 dsv41_kvq_long/ref.json
   v41_kvq_host_split
   v41_kvq_cpu_host
+  v41_kvq_dspark_self
   # The two serve modules the kv-split family runs against the stock fixture, here against
   # the packed one: prefix reuse and DSpark's rollback are self-consistency gates (a turn
   # that replays its own reply must be identical, drafts on and off must agree), so the
@@ -5033,6 +5035,47 @@ v41_kvq_cpu_host() {
   local lg; lg=$(logits_first off.f32 on.f32 1.0 256) || { echo "$lg"; fail "kv-quant CPU host: the first decode row beyond the documented tolerance"; }
   local l1; l1=$(logits_row off.f32 on.f32 1 0.2 256) || { echo "$l1"; fail "kv-quant CPU host: decode row 1 beyond the documented tolerance -- the packed ring's snapshot reads the slot the step evicted"; }
   echo "OK kv-quant CPU host: $lg; $l1; $(token_diff off.txt on.txt), the chain off and the host's codes read on the CPU"
+}
+# The packed SPEC arm, self-referenced. V41_SPEC_FORCE drafts the REFERENCE's own next
+# tokens (deepseek_v41.c:7024-7030), so against the vendor ref.json the arm only proves
+# the reference's stream -- which the packed model does not reproduce (0 of 9 on this
+# fixture, before and after every fix here) -- and says nothing about the cache. This arm
+# takes the packed model's OWN stream as the reference: chain off, no Vulkan, the
+# configuration the bug reaches (with COLI_VULKAN=1 the fixture's six layers chain to the
+# device and attention_run's CPU path -- where a decode step's ring slot is written --
+# never runs, so that arm accepts every draft even unfixed), the plain stream T, then T
+# written into a ref file of its own and every draft forced. All of them must be
+# accepted, and the verified stream must be T token for token: a verify that reads a
+# different ring emits a different stream, and that is the whole claim.
+v41_kvq_dspark_self() {
+  local rc=0 rcf=0 acc prop
+  rm -f self.json plain.txt plain.log forced.txt forced.log
+  env -u COLI_VK_KV_FP32 -u COLI_VK_KV_QUANT -u COLI_VULKAN COLI_VK_CHAIN=0 SNAP=dsv41_kvq_long \
+      ./deepseek_v41 8 dsv41_kvq_long/ref.json > plain.txt 2> plain.log || rc=$?
+  { [ "$rc" = 0 ] || grep -q '\[mismatch\]' plain.log; } || { tail -20 plain.log; fail "kv-quant spec self: exit $rc without a token drift to show for it"; }
+  grep -q 'COLI_VK_KV_FP32 unset' plain.log || { cat plain.log; fail "kv-quant spec self: the packed host never engaged"; }
+  $PY - dsv41_kvq_long/ref.json self.json plain.txt <<'PY' || { cat plain.log; fail "kv-quant spec self: the plain run printed no tokens"; }
+import json, sys
+ids = [int(t) for t in open(sys.argv[3]).read().split()]
+if not ids: sys.exit(1)
+ref = json.load(open(sys.argv[1]))
+ref["output_ids"] = ids
+json.dump(ref, open(sys.argv[2], "w"))
+PY
+  env -u COLI_VK_KV_FP32 -u COLI_VK_KV_QUANT -u COLI_VULKAN COLI_VK_CHAIN=0 SNAP=dsv41_kvq_long \
+      V41_DSPARK=1 V41_SPEC_FORCE=1 ./deepseek_v41 8 self.json > forced.txt 2> forced.log || rcf=$?
+  grep -q 'COLI_VK_KV_FP32 unset' forced.log || { cat forced.log; fail "kv-quant spec self: the packed host never engaged under the spec arm"; }
+  ! grep -q 'NOT exercised' forced.log || { tail -20 forced.log; fail "kv-quant spec self: nothing was drafted, the verify path never ran"; }
+  acc=$(sed -n 's/.*DSpark: \([0-9]*\) of \([0-9]*\) forced drafts accepted.*/\1/p' forced.log | tail -1)
+  prop=$(sed -n 's/.*DSpark: \([0-9]*\) of \([0-9]*\) forced drafts accepted.*/\2/p' forced.log | tail -1)
+  [ -n "$acc" ] && [ -n "$prop" ] || { tail -20 forced.log; fail "kv-quant spec self: no forced-draft count to read"; }
+  [ "$prop" -ge 1 ] || { tail -20 forced.log; fail "kv-quant spec self: the spec arm proposed no draft"; }
+  [ "$acc" = "$prop" ] || { tail -40 forced.log; fail "kv-quant spec self: $acc of $prop forced drafts accepted -- the verify reads a different ring than the plain stream"; }
+  # the fixture also records the VENDOR's draft rounds, which this fixture's greedy stream does
+  # not reproduce, so exit 1 from that one comparison is expected; nothing else may cause it
+  [ "$rcf" = 0 ] || grep -q 'DSpark: checked .* MISMATCH' forced.log || { tail -20 forced.log; fail "kv-quant spec self: exit $rcf, not the recorded drafts' own mismatch"; }
+  cmp -s plain.txt forced.txt || { echo "plain:  $(cat plain.txt)"; echo "forced: $(cat forced.txt)"; fail "kv-quant spec self: the verified stream differs from the plain one"; }
+  echo "OK kv-quant spec self: $acc of $prop forced drafts accepted, the stream = the plain one ($(cat forced.txt))"
 }
 # <tag> <env...> -- <argv...>: the same Vulkan chain run with COLI_VK_KV_FP32=1 (the
 # exact opt-out, the exactness side) and with THE DEFAULT (the var unset: the packed
