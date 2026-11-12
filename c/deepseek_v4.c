@@ -1871,6 +1871,24 @@ int coli_v4_hc_post(float *output, const float *branch,
     return coli_hc_post(output, branch, residual, post, comb, hc, dimension);
 }
 
+/* the same two steps with the caller's choice of OpenMP team
+ * (hyper_connections.h: coli_hc_pre_team) */
+int coli_v4_hc_pre_team(float *output, float *post, float *comb,
+                        const float *input, const float *hc_fn,
+                        const float scale[3], const float *base,
+                        int hc, int dimension, int iterations,
+                        float norm_eps, float hc_eps, int team) {
+    return coli_hc_pre_team(output, post, comb, input, hc_fn, scale, base,
+                            hc, dimension, iterations, norm_eps, hc_eps, team);
+}
+
+int coli_v4_hc_post_team(float *output, const float *branch,
+                         const float *residual, const float *post,
+                         const float *comb, int hc, int dimension, int team) {
+    return coli_hc_post_team(output, branch, residual, post, comb, hc,
+                             dimension, team);
+}
+
 int coli_v4_rmsnorm(float *output, const float *input, const float *weight,
                     int dimension, float eps) {
     if (!output || !input || !weight || dimension < 1 || eps < 0.0f)
@@ -5007,11 +5025,35 @@ static void decode_bf16(float *output, const uint16_t *input, size_t count) {
     for (size_t i = 0; i < count; i++) output[i] = coli_bf16_decode(input[i]);
 }
 
-static int normalized_hc_pre(float *reduced, float *post, float *comb,
-                             float *normalized, const float *input_hc,
-                             const ColiDeepSeekV4LayerWeights *weights,
-                             const ColiDeepSeekV4Config *config,
-                             const char *branch, const char *norm_name) {
+/* V4_HC_TEAM: the OpenMP team of a decode token's hyper-connection steps
+ * (the pipeline block; the prompt's paths are not touched). Unset: 0 in a CPU
+ * run, the default team for every loop as before, and COLI_V4_HC_GPU_TEAM
+ * when the expert store has its GPU tier: the mix on that many threads and
+ * the column loops on the calling thread. There each layer's device work
+ * puts the team to sleep, and the four hyper-connection steps of a layer
+ * each woke and joined all of it. The results do not depend on the team
+ * (hyper_connections.h). Measured on a 5950X (a team of 16) beside an RTX
+ * 5080, decprof's hc per token: the default team 27 ms, 4 threads 18, 6
+ * threads 17, 8 threads 19, 12 threads 18, 16 threads 20, 1 thread 31 (the
+ * mix alone is ~0.3 ms of serial work per call). */
+#define COLI_V4_HC_GPU_TEAM 6
+static int v4_hc_decode_team(const ColiExpertStore *experts) {
+    static int setting = -2;
+    if (setting == -2) {
+        const char *text = getenv("V4_HC_TEAM");
+        setting = text && *text ? atoi(text) : -1;
+        if (setting < -1) setting = -1;
+    }
+    if (setting >= 0) return setting;
+    return experts && experts->gpu ? COLI_V4_HC_GPU_TEAM : 0;
+}
+
+static int normalized_hc_pre_team(float *reduced, float *post, float *comb,
+                                  float *normalized, const float *input_hc,
+                                  const ColiDeepSeekV4LayerWeights *weights,
+                                  const ColiDeepSeekV4Config *config,
+                                  const char *branch, const char *norm_name,
+                                  int team) {
     char name[64];
     snprintf(name, sizeof(name), "hc_%s_fn", branch);
     const float *function = value(weights, name, NULL);
@@ -5027,10 +5069,10 @@ static int normalized_hc_pre(float *reduced, float *post, float *comb,
         return -1;
     }
     decode_bf16(norm, raw_norm, (size_t)d);
-    int result = coli_v4_hc_pre(reduced, post, comb, input_hc, function,
-                                scale, base, config->hc_mult, d,
-                                config->hc_sinkhorn_iters,
-                                config->rms_norm_eps, config->hc_eps);
+    int result = coli_v4_hc_pre_team(reduced, post, comb, input_hc, function,
+                                     scale, base, config->hc_mult, d,
+                                     config->hc_sinkhorn_iters,
+                                     config->rms_norm_eps, config->hc_eps, team);
     if (!result) {
         coli_bf16_round_array(reduced, (size_t)d);
         result = coli_v4_rmsnorm(normalized, reduced, norm, d,
@@ -5039,6 +5081,15 @@ static int normalized_hc_pre(float *reduced, float *post, float *comb,
     }
     free(norm);
     return result;
+}
+
+static int normalized_hc_pre(float *reduced, float *post, float *comb,
+                             float *normalized, const float *input_hc,
+                             const ColiDeepSeekV4LayerWeights *weights,
+                             const ColiDeepSeekV4Config *config,
+                             const char *branch, const char *norm_name) {
+    return normalized_hc_pre_team(reduced, post, comb, normalized, input_hc,
+                                  weights, config, branch, norm_name, 0);
 }
 
 #ifndef COLI_V4_DISABLE_BF16_ROUTE
@@ -6591,8 +6642,10 @@ static int block_token_pipeline(float *output_hc,
     /* the stage that failed, for the error (the request's only report) */
     const char *stage = "attention hyper-connection";
     if (error && error_size) error[0] = 0;
-    int result = normalized_hc_pre(reduced, post, comb, normalized, input_hc,
-                                   weights, config, "attn", "attn_norm.weight");
+    int team = v4_hc_decode_team(experts);
+    int result = normalized_hc_pre_team(reduced, post, comb, normalized, input_hc,
+                                        weights, config, "attn", "attn_norm.weight",
+                                        team);
     DP_MARK(dp_hc);
     if (!result) stage = "attention";
     if (!result) result = attention
@@ -6602,22 +6655,22 @@ static int block_token_pipeline(float *output_hc,
                                       position, error, error_size);
     DP_MARK(dp_attn);
     if (!result) stage = "attention hyper-connection post";
-    if (!result) result = coli_v4_hc_post(state, branch, residual,
-                                          post, comb, hc, d);
+    if (!result) result = coli_v4_hc_post_team(state, branch, residual,
+                                               post, comb, hc, d, team);
     if (!result) coli_bf16_round_array(state, hd);
     if (!result) memcpy(residual, state, hd * sizeof(*residual));
     if (!result) stage = "FFN hyper-connection";
-    if (!result) result = normalized_hc_pre(reduced, post, comb, normalized, state,
-                                            weights, config, "ffn",
-                                            "ffn_norm.weight");
+    if (!result) result = normalized_hc_pre_team(reduced, post, comb, normalized, state,
+                                                 weights, config, "ffn",
+                                                 "ffn_norm.weight", team);
     DP_MARK(dp_hc);
     if (!result) stage = "MoE";
     if (!result) result = moe_token_pipeline(branch, weights, config, experts,
                                              normalized, token);
     DP_MARK(dp_moe);
     if (!result) stage = "FFN hyper-connection post";
-    if (!result) result = coli_v4_hc_post(output_hc, branch, residual,
-                                          post, comb, hc, d);
+    if (!result) result = coli_v4_hc_post_team(output_hc, branch, residual,
+                                               post, comb, hc, d, team);
     if (!result) coli_bf16_round_array(output_hc, hd);
     DP_MARK(dp_hc);
     if (dprof) dp_layers++;
@@ -11997,7 +12050,14 @@ int coli_v4_engine_open(ColiV4Engine **output,
 #endif
 #ifdef COLI_V4_GPU_TIER
     if (coli_v4_gpu_experts_init(engine, error, error_size)) goto fail;
-    coli_v4_gpu_head_upload(engine);
+    /* DSV4_CUDA_HEAD_LAZY (1): the exact head goes up at the first head call
+     * (coli_v4_gpu_head_ready), not here. At open nothing else is on the card
+     * yet, so the budget check passes, and the dense mirrors and the prefill
+     * bank that follow then find 1 GiB less (2 while the head packs): on a
+     * 16 GB card the prompt ran out of VRAM (`kv ring allocation: out of
+     * memory`). By the first head call the prompt is done and its bank
+     * released. 0 = upload here, as before. */
+    if (!coli_v4_gpu_head_lazy()) coli_v4_gpu_head_upload(engine);
 #endif
     *output = engine;
     return 0;
@@ -12282,6 +12342,7 @@ void coli_v4_gpu_engine_close(ColiV4Engine *engine) {
     }
     dsv4_cuda_tensor_free((Dsv4CudaTensor *)engine->gpu.head);
     engine->gpu.head = NULL;
+    engine->gpu.head_tried = 0;
     v4_gpu_route_scratch_clear();
     dsv4_cuda_shutdown();
     engine->gpu.enabled = 0;
@@ -12662,6 +12723,11 @@ static long long v4_gpu_resident_reserve_mb(void) {
     return reserve < 256 ? 256 : reserve;
 }
 
+int coli_v4_gpu_head_lazy(void) {
+    const char *setting = getenv("DSV4_CUDA_HEAD_LAZY");
+    return !setting || atoi(setting) != 0;
+}
+
 void coli_v4_gpu_head_upload(ColiV4Engine *engine) {
 #if defined(__AVX2__)
     const char *enabled = getenv("DSV4_CUDA_HEAD");
@@ -12721,16 +12787,28 @@ void coli_v4_gpu_head_upload(ColiV4Engine *engine) {
 #endif
 }
 
+/* The exact head, uploaded on first use under DSV4_CUDA_HEAD_LAZY: 1 when it
+ * is resident. One attempt per engine open: a refusal (the budget, a failed
+ * upload) keeps the CPU head for the run instead of probing every token. */
+int coli_v4_gpu_head_ready(ColiV4Engine *engine) {
+    if (!engine || !engine->gpu.enabled) return 0;
+    if (!engine->gpu.head && !engine->gpu.head_tried && coli_v4_gpu_head_lazy()) {
+        engine->gpu.head_tried = 1;
+        coli_v4_gpu_head_upload(engine);
+    }
+    return engine->gpu.head != NULL;
+}
+
 int coli_v4_gpu_head_scores(ColiV4Engine *engine,const float *input,float *scores) {
-    if (!engine || !engine->gpu.enabled || !engine->gpu.head) return -1;
+    if (!coli_v4_gpu_head_ready(engine)) return -1;
     return dsv4_cuda_head_scores_exact(engine->gpu.head, input, scores) ? 0 : -1;
 }
 
 int coli_v4_gpu_head_batch(ColiV4Engine *engine,const float *input,int batch,
                            float *scores,int *ids,float *values) {
     const char *enabled = getenv("DSV4_CUDA_HEAD_BATCH");
-    if ((enabled && !atoi(enabled)) || !engine || !engine->gpu.enabled ||
-        !engine->gpu.head || !input || batch < 1 || batch > 128) return -1;
+    if ((enabled && !atoi(enabled)) || !input || batch < 1 || batch > 128 ||
+        !coli_v4_gpu_head_ready(engine)) return -1;
     if (scores)
         return dsv4_cuda_head_scores_batch_exact(engine->gpu.head, input, batch, scores) ? 0 : -1;
     return dsv4_cuda_head_argmax_batch_exact(engine->gpu.head, input, batch, ids, values) ? 0 : -1;

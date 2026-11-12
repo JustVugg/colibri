@@ -147,6 +147,14 @@ int coli_v4_hc_pre(float *output, float *post, float *comb,
 int coli_v4_hc_post(float *output, const float *branch,
                     const float *residual, const float *post,
                     const float *comb, int hc, int dimension);
+int coli_v4_hc_pre_team(float *output, float *post, float *comb,
+                        const float *input, const float *hc_fn,
+                        const float scale[3], const float *base,
+                        int hc, int dimension, int iterations,
+                        float norm_eps, float hc_eps, int team);
+int coli_v4_hc_post_team(float *output, const float *branch,
+                         const float *residual, const float *post,
+                         const float *comb, int hc, int dimension, int team);
 
 int coli_v4_rmsnorm(float *output, const float *input, const float *weight,
                     int dimension, float eps);
@@ -1090,6 +1098,8 @@ int coli_v4_gpu_resident_route(float *output,
     const ColiDeepSeekV4LayerWeights *weights, const ColiDeepSeekV4Config *config,
     ColiExpertStore *store, const float *input, int token);
 void coli_v4_gpu_head_upload(ColiV4Engine *engine);
+int coli_v4_gpu_head_ready(ColiV4Engine *engine);
+int coli_v4_gpu_head_lazy(void);
 int coli_v4_gpu_head_scores(ColiV4Engine *engine,const float *input,float *scores);
 int coli_v4_gpu_head_batch(ColiV4Engine *engine,const float *input,int batch,
                            float *scores,int *ids,float *values);
@@ -1221,6 +1231,7 @@ struct ColiV4Engine {
          * unless V4_MTP_GPU=1 and the tier opened successfully. */
         void *dspark_mirrors;
         void *head; /* owned packed BF16 vocabulary mirror */
+        int head_tried; /* DSV4_CUDA_HEAD_LAZY: the first-use upload was attempted */
     } gpu;
     struct {
         uint16_t *markov_w1;

@@ -725,6 +725,8 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `DSV4_CUDA_RESIDENT_RESERVE_MB` (2800, min 256) | VRAM kept free while resident experts preload and the exact head uploads; separate from the mirror-growth reserve above |
 | `DSV4_CUDA_RESIDENT_EXPERTS` (auto) | `auto` loads every routed expert when the budget fits and keeps the LRU cache on a budget refusal; `1` requires residency (a budget refusal or hard failure rejects engine open); `0` keeps the cache |
 | `DSV4_CUDA_HEAD` (1) | exact vocabulary head on the GPU; `0` keeps it on the CPU |
+| `DSV4_CUDA_HEAD_LAZY` (1) | upload the exact head at the first head call, after the prompt, instead of at engine open, where its 1 GiB (2 while packing) is taken before the dense mirrors and the prefill bank are sized; `0` uploads at open |
+| `V4_HC_TEAM` (unset) | the OpenMP team of a decode token's hyper-connection steps: unset = the default team in a CPU run, and with the GPU tier on the mix on 6 threads and the column loops on the calling thread (the team sleeps through each layer's device work, and waking all of it four times a layer cost more than the loops); `0` = the default team everywhere, `N` = the mix on N threads. Same results whatever the team |
 | `DSV4_CUDA_HEAD_DEVICE` (unset) | exact-head device: unset tries the owning (last) device with room, then any other; set an ordinal to try that device first |
 | `DSV4_CUDA_HEAD_BATCH` (1) | batched exact head; `0` per-token |
 | `DSV4_HEAD_VERIFY` (0) | `1` checks the batched head against the per-token path (diagnostic) |
