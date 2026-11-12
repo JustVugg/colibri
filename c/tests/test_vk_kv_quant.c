@@ -198,8 +198,8 @@ done:
 /* the index scores over the quantized keys: bit for bit the scores over the rows the
  * pack decoded, and the original rows' top-k tracked (the overlap test_vk_chain's index
  * tests make bit for bit; the quantized keys cannot, so the overlap) */
-static void score_case(int S, int pos_base, int IH) {
-    const int ID = 128, ratio = 4, topk = 16;
+static void score_case(int S, int pos_base, int IH, int topk) {
+    const int ID = 128, ratio = 4;
     int width = (pos_base + S) / ratio;
     float wscale = 0.25f, scrow = width + 3;
     float *q = malloc((size_t)S * IH * ID * sizeof(float)), *w = malloc((size_t)S * IH * sizeof(float));
@@ -281,10 +281,14 @@ static void score_case(int S, int pos_base, int IH) {
     double ov = (double)over / (S * topk);
     CHECK(rel <= 1e-5, "scores (S %d pos %d IH %d): rel_l2 to the reference %.3e", S, pos_base, IH, rel);
     /* the drift against the ORIGINAL rows is the FP4 format's own noise on random data
-     * (a group's per-32 scale washes out its small values: 2-3 significant bits), which
-     * the overlap below shows does not move the selection much */
-    CHECK(rel0 <= 2e-1, "scores (S %d pos %d IH %d): rel_l2 to the original rows' scores %.3e", S, pos_base, IH, rel0);
-    CHECK(ov >= 0.7, "scores (S %d pos %d IH %d): the top-%d overlap %.0f%% is below 70%%", S, pos_base, IH, topk, ov * 100);
+     * (a group's per-32 scale washes out its small values: 2 significant bits), which
+     * the overlap below shows does not move the selection much. The thresholds are the
+     * measured band: 1.01-1.28e-1 / 89-100% for the five arms below, and 1.46-1.88e-1 /
+     * 81-92% with the scale rule floored instead of ceiled in BOTH the header and
+     * chain_dsv4.comp's ue8m0c (the mutation the old 2e-1 / 0.7 gates let through: the
+     * suite then printed PASS with all five arms in range) */
+    CHECK(rel0 <= 1.35e-1, "scores (S %d pos %d IH %d): rel_l2 to the original rows' scores %.3e", S, pos_base, IH, rel0);
+    CHECK(ov >= 0.80, "scores (S %d pos %d IH %d): the top-%d overlap %.0f%% is below 80%%", S, pos_base, IH, topk, ov * 100);
     printf("OK kv-quant scores (S %d pos %d IH %d): the decoded rows' bits, rel_l2 %.2e vs the reference and %.2e vs the original rows, top-%d overlap %.0f%%\n",
            S, pos_base, IH, rel, rel0, topk, ov * 100);
     free(g1); free(g2);
@@ -674,11 +678,15 @@ int main(void) {
     codec("win (the ring scattered)", 0, 1, 24, 512, KVQ_WIN_BYTES, 24, 13, kvq_pack_win, kvq_unpack_win);
     codec("ckv (from token 7)", 1, 0, 24, 512, KVQ_CKV_BYTES, 31, 7, kvq_pack_ckv, kvq_unpack_ckv);
     codec_ikey();
-    score_case(3, 512, 8);    /* a wide table: mode 10's grid arm (dsa_grid default-on
-                              * takes IH<=256 there; mode 9's quantized reader is the
-                              * same expression, exercised through mode 10 here) */
-    score_case(2, 64, 8);     /* a narrow one: mode 3 */
-    score_case(2, 512, 65);   /* the wide queries: mode 9 */
+    score_case(3, 512, 8, 16);      /* a wide table: mode 10's grid arm (dsa_grid default-on
+                                     * takes IH<=256 there; mode 9's quantized reader is the
+                                     * same expression, exercised through mode 10 here) */
+    score_case(2, 64, 8, 16);       /* a narrow one: mode 3 -- the only arm below VKC_DSA_GRID */
+    score_case(2, 512, 65, 16);     /* the wide queries: mode 10 */
+    score_case(2, 8190, 8, 16);     /* a pool ABOVE VKC_DSA_GRID (2048 keys, top-16: the
+                                     * selection can move) */
+    score_case(2, 32766, 8, 512);   /* the real geometry: 8192 keys, top-512 (index_topk,
+                                     * config.json:124) -- k/pool 6.25%, as on the checkpoint */
     {   /* mode 0's packed read and the indexer's, which test_vk_chain.c never takes: its
          * test_ds_attn runs flags 0 and 1 only (no packed cache) and its VkcDsScore
          * initializers leave quant 0, so the decode-on-read paths ship with no test that
