@@ -123,6 +123,7 @@ typedef struct {
     size_t smem_optin;      /* shared bytes a block may ask for (the block GEMVs past 48 KiB) */
     int sms;                /* multiprocessors (f32_gemm_launch's tile) */
     char *moe_stage; size_t moe_stage_slot; int moe_stage_n;   /* coli_cuda_moe_stage: a decode step's host experts' copies */
+    struct { cudaStream_t st; void *p; size_t cap; } skp[8];   /* HIP: gemv_i8_w4's split partials, a buffer a stream (gemv_sk_part) */
 #ifdef COLI_ANS
     void *ans_raw; size_t ans_raw_cap;
     void *ans_host; size_t ans_host_cap;
@@ -1601,6 +1602,7 @@ extern "C" void coli_cuda_shutdown(void) {
         if (ctx->qscale) cudaFree(ctx->qscale);
         if(ctx->aq)cudaFree(ctx->aq);if(ctx->al)cudaFree(ctx->al);if(ctx->ar)cudaFree(ctx->ar);if(ctx->ac)cudaFree(ctx->ac);
         for(int b=0;b<27;b++) if(ctx->pipe_buf[b]) cudaFree(ctx->pipe_buf[b]);
+        for(int b=0;b<8;b++) if(ctx->skp[b].p) cudaFree(ctx->skp[b].p);
         if (ctx->host_x) cudaFreeHost(ctx->host_x);
         if (ctx->host_y) cudaFreeHost(ctx->host_y);
         if (ctx->host_kv) cudaFreeHost(ctx->host_kv);
@@ -5065,6 +5067,31 @@ __global__ static void f32_few_k(float *__restrict__ y, const float *__restrict_
     if ((int)threadIdx.x < O) y[(size_t)s * O + threadIdx.x] = partial[threadIdx.x][0];
 }
 
+/* gemv_i8_w4's split partials on HIP: a buffer a stream that stays for the process, grown (the stream
+ * synchronized first) when a call needs more. The stream-ordered allocator gave each call its own
+ * (hipMallocAsync, hipFreeAsync after the sum) and, without CUDA's release threshold, every
+ * synchronization handed the memory back; an R9700 reported a memory fault in gemv_i8_w4<4> with
+ * the splits on (#2758), which this takes the allocator out of. On a stream past the eight it
+ * keeps, the allocator's as before (NULL). */
+#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
+static void *gemv_sk_part(DeviceContext *ctx, cudaStream_t st, size_t bytes) {
+    int k = -1;
+    for (int i = 0; i < 8 && k < 0; i++) if (ctx->skp[i].p && ctx->skp[i].st == st) k = i;
+    for (int i = 0; i < 8 && k < 0; i++) if (!ctx->skp[i].p) k = i;
+    if (k < 0) return NULL;
+    if (ctx->skp[k].p && ctx->skp[k].cap >= bytes) return ctx->skp[k].p;
+    if (ctx->skp[k].p) {
+        if (cudaStreamSynchronize(st) != cudaSuccess) { (void)cudaGetLastError(); return NULL; }
+        cudaFree(ctx->skp[k].p); ctx->skp[k].p = NULL; ctx->skp[k].cap = 0;
+    }
+    size_t cap = bytes < ((size_t)1 << 20) ? ((size_t)1 << 20) : bytes;
+    void *p = NULL;
+    if (cudaMalloc(&p, cap) != cudaSuccess) { (void)cudaGetLastError(); return NULL; }
+    ctx->skp[k].st = st; ctx->skp[k].p = p; ctx->skp[k].cap = cap;
+    return p;
+}
+#endif
+
 extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, const float *x_dev, int S, void *stream) {
     if (fault_injected()) return 0;
     if (!t || !y_dev || !x_dev || S < 1) return 0;
@@ -5090,14 +5117,18 @@ extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, cons
             int sr = S < GEMV_I8_NR ? S : GEMV_I8_NR;
             size_t xrow = (size_t)(gx4(kc / 4) + 1) * 16;
             while (sr > 1 && sr * xrow > 48 * 1024) sr--;
-            void *part = NULL;
-            if (sr * xrow <= 48 * 1024 && (kz == 1 || cudaMallocAsync(&part, (size_t)kz * S * t->O * sizeof(float), st) == cudaSuccess)) {
+            void *part = NULL; int own = 0;   /* own: the stream's buffer (HIP, gemv_sk_part), kept */
+            const size_t pb = (size_t)kz * S * t->O * sizeof(float);
+#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
+            if (sr * xrow <= 48 * 1024 && kz > 1) own = (part = gemv_sk_part(ctx, st, pb)) != NULL;
+#endif
+            if (sr * xrow <= 48 * 1024 && (kz == 1 || own || cudaMallocAsync(&part, pb, st) == cudaSuccess)) {
                 dim3 g(bw, (unsigned)kz, (unsigned)((S + sr - 1) / sr));
                 if (sr == 1) coli_launch(gemv_i8_w4<1>, g, 256, xrow, st, y_dev, (float *)part, x_dev, w, t->scales, t->I, t->O, S, 1, kc);
                 else coli_launch(gemv_i8_w4<GEMV_I8_NR>, g, 256, sr * xrow, st, y_dev, (float *)part, x_dev, w, t->scales, t->I, t->O, S, sr, kc);
                 if (part) {
                     coli_launch(gemv_i8_sk_sum, dim3((unsigned)((S * t->O + 255) / 256)), 256, 0, st, y_dev, (const float *)part, t->scales, t->O, S, kz);
-                    (void)cudaFreeAsync(part, st);
+                    if (!own) (void)cudaFreeAsync(part, st);
                 }
                 return cuda_ok(cudaGetLastError(), "chain gemv launch (four outputs a warp)");
             }
