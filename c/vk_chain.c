@@ -2780,7 +2780,9 @@ int vkc_prewarm(const VkcPrewarm *pw) {
         if (!npr && every) { ok = ok && vkc_moe(x, ids, rw, tab, hid, y, &p); n += ok; }
         /* our formats' pipelines of one format each (1, 2 and 4: what a container's experts are) */
         for (int f = 1; f <= 4 && ok && pw->moe == 1; f++) {
-            if (!moe_fi(f) || !(fm >> f & 1)) continue;
+            /* without the pipeline of every format, one the device refuses is skipped: the
+             * prewarms after this one still run */
+            if (!moe_fi(f) || !(fm >> f & 1) || (!every && !moe_pipe_f(0, mn, f, 0, 0))) continue;
             p.gfmt = p.dfmt = f;
             ok = vkc_moe(x, ids, rw, tab, hid, y, &p); n += ok;
             /* and chain_moe_gv.comp's at the layer's widths (its staging sized by them) */
