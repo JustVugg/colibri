@@ -291,6 +291,53 @@ GPU fill branch and the CPU branch using bandwidths measured at runtime, and
 layer's full expert set into a second VRAM bank while the current layer
 computes, falling back to the single bank when VRAM is short.
 
+### The decode mirror uploads on an uploader thread (`V4_UPLOAD_THREAD`, opt-in)
+
+A decode step reads its routed experts on the loader lanes and attaches each
+one to the mirror cache before it starts that lane's next read. A recycled
+mirror is the three tensors' copies and a wait for them on the compute stream,
+on the thread that feeds the lanes, so every upload delays a read.
+
+`V4_UPLOAD_THREAD=1` hands the expert to one uploader thread and starts the
+next read at once. The thread runs the same attach as the step would (the same
+caches, growth guard, LRU and recycle in place, the peer pool included), one
+expert at a time. Its copies go on the device's second stream and are only
+enqueued. When the step's reads are in, it joins the thread, records an event
+behind the copies and makes the compute stream wait for it, so the expert group
+runs after the copies on the device and the host waits for no transfer. Before
+the step releases the experts' leases it waits for the second stream.
+
+- `V4_UPLOAD_FENCE=0` keeps the thread and has it drain the second stream after
+  each mirror, with no event.
+- A backend without `dsv4_cuda_upload_fence` (an older DLL) is asked once; the
+  uploader then copies on the compute stream and drains it, as the attach on the
+  generation thread does.
+- A new mirror, while the cache still grows, is a synchronous upload in every
+  mode. `DSV4_HYBRID=1` keeps its own uploads.
+- The step makes no backend call between its first hand-over and the join, so
+  the backend is still entered by one thread at a time.
+
+The exit line `v4_gpu uploader: jobs= attached= avg= ms copies= fences=
+fence-drains=` counts the experts handed over (hits included), the time per
+expert on the thread, where the copies went, and the events recorded
+(`fence-drains` are events that failed and were replaced by a wait).
+
+Measured on the RTX 5080 (3,278-token prompt, 36 tokens, `--memory-gb 16`,
+`COLI_CUDA_MOE_BATCH=1 COLI_CUDA_MOE_DOUBLE=1`, three interleaved runs per
+cell, medians: seconds for the 35 tokens after the first, routed-expert ms per
+token; the text is the same in all fifteen runs):
+
+| mirror reserve | unset | `V4_UPLOAD_THREAD=1` | with `V4_UPLOAD_FENCE=0` |
+|---|---|---|---|
+| the default (8329 MiB with two banks) | 22.98, 533.8 | 21.62, 494.9 (+6.3 % tok/s) | not run |
+| `DSV4_CUDA_VRAM_RESERVE_MB=600` | 21.49, 490.4 | 20.34, 458.0 (+5.6 % tok/s) | 20.56, 464.2 (+4.5 % tok/s) |
+
+The uploader spent 0.78 ms per expert at the default reserve, where every
+routed expert is an upload, and 0.53 ms at 600 MiB. With the event the three
+runs took 20.31 to 20.66 s and with the drain 20.19 to 20.61 s: these runs do
+not separate the two. Not measured: a second card, the peer pool, Linux. The
+record is in `docs/experiments/v4-upload-thread-2026-11-12/`.
+
 ### Expert-pruned checkpoints (REAP) and the generic kernels
 
 Expert-pruned checkpoints such as `puwaer/DeepSeek-V4-Flash-0731-reap-150b`
@@ -750,6 +797,8 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `DSV4_MOE_EM_TB` (auto, `.cu`) | routes per pass of the expert-major kernel: unset = 2 below 4 routes per routed expert in the chunk, else 4; `2`, `3`, `4` or `6` forces one (anything else is ignored with a warning) |
 | `DSV4_MM_WARP` (auto, `.cu`) | generic dense batch matmul, fp8 shapes whose I is a multiple of 256: warp-per-row kernel for I ≤ 1024 (unset, empty or `auto`), `1` = all of them, `0` = off; `DSV4_MM_WARP_VERIFY=1` compares bit for bit (keeps the old kernel's results, also with `0`) |
 | `V4_MOE_BATCH_PROF` (0) | `1` = one `moebprof` line per chunk-layer: switch (layer change: prefetch-worker wait, bank swap) / route / refill / compute ms |
+| `V4_UPLOAD_THREAD` (0) | `1` = a decode step hands each mirror upload to an uploader thread and starts its lane's next read at once; the copies go on the device's second stream and the expert group is ordered after them by an event (see [The decode mirror uploads on an uploader thread](#the-decode-mirror-uploads-on-an-uploader-thread-v4_upload_thread-opt-in)) |
+| `V4_UPLOAD_FENCE` (1) | with `V4_UPLOAD_THREAD=1`: `0` = the uploader drains the second stream after each mirror instead of the event |
 | `V4_GPU_RESIDENT_FIRST` (0) | `1` = decode computes VRAM-mirrored experts without an expert-store lookup, and the RAM pins skip them (VRAM adds to the RAM tier); off under `DSV4_HYBRID=1` |
 | `DSV4_CUDA_PEER_DEVICE` (unset) | second GPU for a decode mirror pool (peer access required; unused under `DSV4_HYBRID=1`) |
 | `DSV4_CUDA_PEER_COMPUTE` (1, `.cu`) | run the peer pool's experts on the peer GPU (both GPUs at the same SM version; `mode=` in the `peer-mirrors` line); `0` = read them in place over P2P; no effect with `DSV4_CUDA_BATCHED=0`, which reads them in place |
