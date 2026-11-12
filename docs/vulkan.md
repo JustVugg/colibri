@@ -516,8 +516,26 @@ of them on the device the way a GPU-equipped PC should use its card:
   | Inkling-Small UD-IQ2_XXS (77 GB), before | 2375, 5431 | 99.8% | 186 | 7.87, 8.11 tok/s | 12.2, 22.8 tok/s |
   | the same, now | 3098, 7003 | 100.0% | 14 | 11.53, 10.92 tok/s | 15.1, 33.1 tok/s |
 
-  The startup line says `N layers in M forms other than most layers', their experts in
-  the room of the biggest of those, the rest at their own size`.
+- **Every form's experts in rooms of its own size.** That left one room for every
+  form but the most common, and a file may give most of its layers other forms than
+  that one: Flint 40B-A2.5B UD-Q4_K_XL has Q5_K experts on 16 of its 49 layers and six
+  other forms on the 33 others, each of those in the room of the biggest. The main
+  layers now fall in one class of rooms for each size their forms' tensors take (forms
+  of the same bytes share one), so no tensor sits in a bigger form's room. A newcomer
+  displaces a resident of its own class first, then one of a class whose rooms hold
+  it, the tightest first; a bigger form's never takes a smaller one's room. A file
+  with two sizes is held as before. Measured on a Radeon RX 9060 XT (16 GB) with 32 GB
+  of RAM, `COLI_VK_STAGED=1 COLI_VK_TIER_HOST=0`, each server on a copy of one history,
+  a 5899-token prompt and 128 tokens, three runs each, medians
+  ([the record](experiments/vk-tier-rooms-per-size-2026-11-12/)):
+
+  | model | experts in VRAM (12.11 GiB) | disk loads of the prompt | decode | prompt |
+  |---|---|---|---|---|
+  | Flint 40B-A2.5B UD-Q4_K_XL (25 GB), before | 5263 of 2.3 MiB | 16050 | 8.2 tok/s | 109.8 tok/s |
+  | the same, now | 6717 of 1.8 MiB | 8562 | 11.5 tok/s | 167.5 tok/s |
+
+  The startup line says `N layers in M forms other than most layers', every expert in
+  a room of its own form's size (K sizes)`.
 - **A fresh install starts warm.** A model downloaded a minute ago has no history,
   so its first runs would fill the tier one routing at a time. `coli setup` copies a
   starting history into the model folder when it has none, for the catalog models
