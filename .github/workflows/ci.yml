@@ -1554,9 +1554,9 @@ jobs:
             tests.test_qwen38_prefix_serve
           python3 tools/make_edge_tiny_tokenizer.py --vocab-size 64 qwen38_tiny_fp8
           QWEN38_TINY=qwen38_tiny_fp8 python3 -m unittest -v tests.test_qwen38_brio tests.test_qwen38_prefix_serve
-          # the prefix store: a stored prefix's logits a fresh read's, the MTP head's rows kept too
-          # (qwen38_tiny_mtp and its tokenizer: the MTP step above)
-          QWEN38_TINY=qwen38_tiny QWEN38_TINY_MTP=qwen38_tiny_mtp python3 -m unittest -v tests.test_qwen38_prefix_store
+          # the prefix store: a stored prefix's logits a fresh read's, the MTP head's rows kept too, and
+          # its checkpoints on disk across engine runs (qwen38_tiny_mtp and its tokenizer: the MTP step above)
+          QWEN38_TINY=qwen38_tiny QWEN38_TINY_MTP=qwen38_tiny_mtp python3 -m unittest -v tests.test_qwen38_prefix_store             tests.test_qwen38_prefix_disk
 
   laya-tiny-check:
     name: Laya tiny oracle (vs the laya package) and POST /v1/systemone end to end
