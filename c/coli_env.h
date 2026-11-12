@@ -516,6 +516,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"DSA_TOPK",                         CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"DSV4_ATTN_PROF",                   CE_STR   , CE_DSV4                                         , 0             , NULL},
     {"DSV4_CUDA",                        CE_STR   , CE_DSV4                                         , 0             , NULL},
+    {"DSV4_CUDA_ACT_QUANT",              CE_BOOL  , CE_DSV4                                         , 0             , NULL},
     {"DSV4_CUDA_ATTN_ASYNC",             CE_STR   , CE_DSV4                                         , 0             , NULL},
     {"DSV4_CUDA_ATTN_DG_AB",             CE_STR   , CE_DSV4                                         , 0             , NULL},
     {"DSV4_CUDA_BATCHED",                CE_STR   , CE_DSV4                                         , 0             , NULL},
