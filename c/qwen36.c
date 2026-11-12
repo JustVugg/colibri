@@ -8211,6 +8211,10 @@ static void q36_pcache_prune(const char *keep_path) {
         if (wi < 0) break;                      /* fewer stored than the caps want gone */
         total -= bytes[wi]; count--;
         remove(name[wi]);
+        if (q36_pcache_dbg())
+            fprintf(stderr, "[PCACHE] pruned %s (%.1f MB)%s\n",
+                    name[wi], bytes[wi] / 1048576.0,
+                    maxf > 0 && count > maxf ? " count cap" : " byte budget");
         born[wi] = -1;
     }
 }
