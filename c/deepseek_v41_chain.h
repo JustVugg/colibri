@@ -1352,13 +1352,15 @@ static int v41c_forward_seg(Model *m, V41Chain *ch, float *h, float *pre_mix, in
         v41c_off(ch);
         return 0;
     }
-    if (cand_out) {   /* the CPU's mask, as indexer_run sizes it */
+    if (cand_out) {   /* the CPU's candidate blocks, as indexer_run sizes them */
+        int topk = c->candidate_topk_blocks > 0 ? c->candidate_topk_blocks : 1;
         int width = E / c->compress_ratio[cs];
-        if (m->candidate_width != width || m->candidate_rows != n) {
+        if (m->candidate_topk != topk || m->candidate_rows != n) {
             free(m->candidates);
-            m->candidates = xmalloc((size_t)n * (width > 0 ? width : 1), "candidate mask");
-            m->candidate_width = width; m->candidate_rows = n;
+            m->candidates = xmalloc(v41_candidate_bytes(c, n), "candidate blocks");
+            m->candidate_topk = topk; m->candidate_rows = n;
         }
+        m->candidate_width = width;   /* the device mask's reach, the paint bound: refreshed, not sized on */
     }
     if (list_out >= 0 && (m->shared_topk_rows != n || m->shared_topk_width != list_w)) {   /* the CPU's list, as attention_run sizes it */
         free(m->shared_topk);
@@ -1441,13 +1443,19 @@ static int v41c_forward_seg(Model *m, V41Chain *ch, float *h, float *pre_mix, in
                 int r = c->compress_ratio[i], g0 = pb / r, np = (pb + nr) / r - g0;
                 if (np > 0) memcpy(l->ckv + (size_t)g0 * hd, vkc_ptr(ch->cdn), (size_t)np * hd * sizeof(float));
             }
-            if (cand_out && i == cs) {                     /* the candidate source's mask, for the CPU's readers */
+            if (cand_out && i == cs) {                     /* the candidate source's blocks, for the CPU's readers */
                 const int32_t *mk = (const int32_t *)vkc_ptr(ch->cmd);
                 int wc = (pb + nr) / c->compress_ratio[cs], wh = m->candidate_width;
+                /* the device's row, converted at its own reach `wc` and then read as blocks:
+                 * block-aligned, so the ids recover exactly the blocks it painted (P4) */
+                uint8_t *keep = xmalloc((size_t)(wh > 0 ? wh : 1), "candidate row");
                 for (int s = 0; s < nr; s++) {
-                    uint8_t *keep = m->candidates + (size_t)(c0 + s) * wh;
-                    for (int j = 0; j < wh; j++) keep[j] = j < wc && mk[(size_t)s * ch->wcap + j] != 0;
+                    const int32_t *mrow = mk + (size_t)s * ch->wcap;
+                    for (int j = 0; j < wh; j++) keep[j] = j < wc && mrow[j] != 0;
+                    candidate_row_ids(keep, c->candidate_block_size, wh, m->candidate_topk,
+                                      m->candidates + (size_t)(c0 + s) * m->candidate_topk);
                 }
+                free(keep);
             }
             /* A2: the shared expert, while the host computes the routed experts */
             ok = vkc_begin() && v41c_shared(ch, m, l, nr) && vkc_submit(0);
