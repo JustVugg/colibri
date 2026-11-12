@@ -50,7 +50,7 @@ def blocks(name, shape, rng, std=0.02):
     return raw.reshape(*shape[:-1], nb * size)
 
 
-def write_model(path, rng, dense=False, same_gate_up=False, token=None, ollama=False, dn_types=None, mtp=False):
+def write_model(path, rng, dense=False, same_gate_up=False, token=None, ollama=False, dn_types=None, mtp=False, mtp_file=None):
     """dense: llama.cpp's qwen35 (a dense model of the family): an MLP per layer instead of the
     experts, and no output.weight (the head tied to token_embd), as the small checkpoints ship.
     same_gate_up: every layer's expert up in its gate's type (layer 0 IQ2_XXS, the others
@@ -64,21 +64,29 @@ def write_model(path, rng, dense=False, same_gate_up=False, token=None, ollama=F
     layer of two types is how unsloth's dynamic mixes ship about half of Qwen3.8-27B's.
     mtp (dense): the checkpoint's MTP head as llama.cpp writes it, one more layer (blk.LAYERS) with
     nextn_predict_layers 1: a full-attention layer with its MLP, nextn.eh_proj and the nextn
-    norms, in the types unsloth's Qwen3.8-27B files give them (norms stored as 1 + w)."""
+    norms, in the types unsloth's Qwen3.8-27B files give them (norms stored as 1 + w).
+    mtp_file (with mtp): that head in a file of its own instead, as unsloth's Dynamic v3.1 files ship
+    it (MTP/mtp-*.gguf: the same architecture, block_count one more and nextn_predict_layers 1, the
+    layer's tensors only); the model's file then has neither the layer nor the key. The same
+    weights as with the head inside."""
     arch = "qwen35" if dense else "qwen35moe"
     w = gguf.GGUFWriter(str(path), arch)
+    hw = gguf.GGUFWriter(str(mtp_file), arch) if mtp and mtp_file else None
     p = arch + "."
     moe = (("feed_forward_length", I),) if dense else \
         (("expert_count", E), ("expert_used_count", TOPK), ("expert_feed_forward_length", I), ("expert_shared_feed_forward_length", I))
-    if mtp:
-        w.add_uint32(p + "nextn_predict_layers", 1)
-    for k, v in (("block_count", LAYERS + (1 if mtp else 0)), ("embedding_length", H), ("attention.head_count", QH),
-                 *(() if ollama else (("attention.head_count_kv", KVH),)), ("attention.key_length", HD), ("attention.value_length", HD),
-                 *moe, ("full_attention_interval", 4),
-                 ("rope.dimension_count", HD // 4), ("ssm.conv_kernel", 4), ("ssm.state_size", KD),
-                 ("ssm.group_count", KH), ("ssm.time_step_rank", VH), ("ssm.inner_size", VH * KD),
-                 ("context_length", 4096)):
-        w.add_uint32(p + k, v)
+    for wr, inside in ((w, mtp and hw is None), (hw, True)):
+        if wr is None:
+            continue
+        if inside:
+            wr.add_uint32(p + "nextn_predict_layers", 1)
+        for k, v in (("block_count", LAYERS + (1 if inside else 0)), ("embedding_length", H), ("attention.head_count", QH),
+                     *(() if ollama else (("attention.head_count_kv", KVH),)), ("attention.key_length", HD), ("attention.value_length", HD),
+                     *moe, ("full_attention_interval", 4),
+                     ("rope.dimension_count", HD // 4), ("ssm.conv_kernel", 4), ("ssm.state_size", KD),
+                     ("ssm.group_count", KH), ("ssm.time_step_rank", VH), ("ssm.inner_size", VH * KD),
+                     ("context_length", 4096)):
+            wr.add_uint32(p + k, v)
     if ollama:
         w.add_array(p + "attention.head_count_kv", [KVH if (L + 1) % 4 == 0 else 0 for L in range(LAYERS)])
         w.add_array(p + "rope.dimension_sections", [HD // 16, HD // 16, HD // 8])
@@ -130,14 +138,18 @@ def write_model(path, rng, dense=False, same_gate_up=False, token=None, ollama=F
             q(b + "ssm_out.weight", (H, VH * KD), "Q8_0")
     if mtp:   # llama.cpp's nextn layer
         b = f"blk.{LAYERS}."
-        def norm(name, n): w.add_tensor(name, (1 + rng.standard_normal(n) * 0.1).astype(np.float32))
+        o = hw or w
+        def norm(name, n): o.add_tensor(name, (1 + rng.standard_normal(n) * 0.1).astype(np.float32))
+        def qh(name, shape, t): o.add_tensor(name, blocks(t, shape, rng), raw_dtype=QT[t])
         norm(b + "attn_norm.weight", H); norm(b + "post_attention_norm.weight", H)
         norm(b + "attn_q_norm.weight", HD); norm(b + "attn_k_norm.weight", HD)
-        q(b + "attn_q.weight", (QH * HD * 2, H), "Q6_K"); q(b + "attn_k.weight", (KVH * HD, H), "Q8_0")
-        q(b + "attn_v.weight", (KVH * HD, H), "Q8_0"); q(b + "attn_output.weight", (H, QH * HD), "Q6_K")
-        q(b + "ffn_gate.weight", (I, H), "Q6_K"); q(b + "ffn_up.weight", (I, H), "Q6_K"); q(b + "ffn_down.weight", (H, I), "Q6_K")
-        q(b + "nextn.eh_proj.weight", (H, 2 * H), "Q6_K")
+        qh(b + "attn_q.weight", (QH * HD * 2, H), "Q6_K"); qh(b + "attn_k.weight", (KVH * HD, H), "Q8_0")
+        qh(b + "attn_v.weight", (KVH * HD, H), "Q8_0"); qh(b + "attn_output.weight", (H, QH * HD), "Q6_K")
+        qh(b + "ffn_gate.weight", (I, H), "Q6_K"); qh(b + "ffn_up.weight", (I, H), "Q6_K"); qh(b + "ffn_down.weight", (H, I), "Q6_K")
+        qh(b + "nextn.eh_proj.weight", (H, 2 * H), "Q6_K")
         norm(b + "nextn.enorm.weight", H); norm(b + "nextn.hnorm.weight", H); norm(b + "nextn.shared_head_norm.weight", H)
+        if hw is not None:
+            hw.write_header_to_file(); hw.write_kv_data_to_file(); hw.write_tensors_to_file(); hw.close()
     if ollama:   # the MTP head and the vision tower, in the model's file
         f32("mtp.fc.weight", (H, 2 * H)); f32("mtp.layers.0.attn_norm.weight", (H,)); f32("mtp.layers.0.ffn_gate_inp.weight", (E, H))
         f32("v.blk.0.attn_q.weight", (H, H)); f32("v.blk.0.attn_q.bias", (H,)); f32("v.patch_embd.weight", (H, 3, 2, 2))
@@ -250,13 +262,54 @@ def write_glmdsa(path, rng, copies=()):
     w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
 
 
-def write_deepseek41(path, rng):
+def _engram_exact(rows, ehd):
+    """A table both Q8_0 and MXFP8 (ggml type 43) hold exactly, each block's 32 values small integers
+    times a power of two: (the Q8_0 rows, the MXFP8 rows) as bytes. Its own generator, so the rest of
+    the file draws the same."""
+    erng = np.random.default_rng(11)
+    nb = ehd // 32
+    ints = erng.integers(-15, 16, (rows, nb, 32))
+    ex = erng.integers(122, 130, (rows, nb))                      # 2^-5 .. 2^2
+    code = {}
+    for x in range(256):                                          # E4M3: integers -15 .. 15 exactly
+        e, m = (x >> 3) & 15, x & 7
+        v = (m / 8 * 2 ** -6) if e == 0 else (1 + m / 8) * 2 ** (e - 7)
+        v = -v if x & 0x80 else v
+        if v == int(v) and abs(v) <= 15 and int(v) not in code and not (e == 15 and m == 7):
+            code[int(v)] = x
+    q8 = np.zeros((rows, nb, 34), np.uint8); mx = np.zeros((rows, nb, 33), np.uint8)
+    q8[:, :, 0:2] = np.ldexp(1.0, ex - 127).astype(np.float16)[..., None].view(np.uint8)
+    q8[:, :, 2:] = ints.astype(np.int8).view(np.uint8)
+    mx[:, :, 0] = ex
+    mx[:, :, 1:] = np.vectorize(code.get)(ints)
+    return q8.reshape(rows, nb * 34), mx.reshape(rows, nb * 33)
+
+
+def gguf_retype(path, name, ne0, ggml_type):
+    """A tensor's first dimension and type rewritten in a written GGUF's header (gguf-py has no type 43:
+    its rows go in as I8 of the same bytes)."""
+    with open(path, "rb") as f:
+        b = bytearray(f.read())
+    key = len(name).to_bytes(8, "little") + name.encode()
+    at = b.find(key)
+    assert at > 0 and b.find(key, at + 1) < 0, name
+    o = at + len(key)
+    nd = int.from_bytes(b[o:o + 4], "little")
+    b[o + 4:o + 12] = int(ne0).to_bytes(8, "little")
+    b[o + 4 + 8 * nd:o + 8 + 8 * nd] = int(ggml_type).to_bytes(4, "little")
+    with open(path, "wb") as f:
+        f.write(bytes(b))
+
+
+def write_deepseek41(path, rng, engram="IQ4_NL"):
     """A published deepseek41 GGUF (DeepSeek V4.1 Flash), small: no deepseek41.config, the
     config as keys; the compressors (KV sources 1 and 3, a gate where the ratio is 2) and
     the indexer (1, 3 and 4) in BF16; the experts in IQ1_S as the UD-IQ1_S file has them,
     with IQ2_XXS, Q4_K and Q5_K in other layers; the trunk in Q5_K, Q6_K and Q8_0; every
     engram table in one IQ4_NL per_layer_token_embd under global head offsets, and each
-    engram layer's gate as one engram_gate (deepseek_v41's GGUF gates)."""
+    engram layer's gate as one engram_gate (deepseek_v41's GGUF gates).
+    engram "Q8_0" or "MXFP8": the table in that type instead, the same values in both
+    (_engram_exact); MXFP8 is ggml type 43, as unsloth's UD-IQ3_S and larger files ship it."""
     w = gguf.GGUFWriter(str(path), "deepseek41")
     p = "deepseek41."
     VT = gguf.GGUFValueType
@@ -318,7 +371,12 @@ def write_deepseek41(path, rng):
     def q(name, shape, t): w.add_tensor(name, blocks(t, shape, rng), raw_dtype=QT[t])
     q("token_embd.weight", (VOCAB, h), "Q8_0"); q("output.weight", (VOCAB, h), "Q6_K")
     w.add_tensor("output_norm.weight", np.ones(h, np.float32))
-    q("per_layer_token_embd.weight", (sum(primes), ehd), "IQ4_NL")
+    if engram == "IQ4_NL":
+        q("per_layer_token_embd.weight", (sum(primes), ehd), "IQ4_NL")
+    else:
+        q8, mx = _engram_exact(sum(primes), ehd)
+        if engram == "Q8_0": w.add_tensor("per_layer_token_embd.weight", q8, raw_dtype=QT.Q8_0)
+        else: w.add_tensor("per_layer_token_embd.weight", mx.view(np.int8))
     mix = (2 + hc) * hc
     for L in range(layers):
         b = f"blk.{L}."
@@ -356,6 +414,8 @@ def write_deepseek41(path, rng):
             f32(b + "engram_gate.weight", (hc, h), 0.05, 1.0)
             q(b + "engram_kv.weight", (h * (hc + 1), (ngram - 1) * eh * ehd), "Q8_0")
     w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
+    if engram == "MXFP8":
+        gguf_retype(path, "per_layer_token_embd.weight", ehd, 43)
 
 
 def write_dflash(path, rng, targets=(3, 4, 5)):
@@ -1132,6 +1192,39 @@ class DeepSeek41Config(unittest.TestCase):
         self.assertEqual(resident("blk.1.engram_embd.weight", 10 ** 11, {}), 0)          # a GGUF's table
         self.assertEqual(resident("layers.1.engram.embed.weight", 10 ** 11, {}), 0)      # the checkpoint's
         self.assertEqual(resident("blk.1.engram_kv.weight", 1000, {}), 1000)             # its projection is resident
+
+
+V41 = HERE / ("deepseek_v41.exe" if sys.platform == "win32" else "deepseek_v41")
+
+
+@unittest.skipIf(gguf is None, "gguf-py (pip install gguf) is not installed")
+@unittest.skipUnless(V41.exists(), "deepseek_v41 is not built")
+class DeepSeek41EngramMXFP8(unittest.TestCase):
+    """unsloth's DeepSeek V4.1 UD-IQ3_S, UD-Q3_K_XL, UD-Q4_K_XL and UD-Q8_K_XL keep the Engram table
+    as ggml type 43 (MXFP8: an E8M0 exponent, 32 E4M3 values a block, the checkpoint's encoding),
+    which no reader took: the import and the engine stopped. The tiny model with its table as MXFP8
+    and as Q8_0 holding the same values: the import takes both, and the engine's tokens and last
+    logits are the same bits."""
+    def test_the_table_as_mxfp8_is_the_table_as_q8_0(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp); got = {}
+            for t in ("Q8_0", "MXFP8"):
+                gg, out = d / f"ds41-{t}.gguf", d / t
+                write_deepseek41(gg, np.random.default_rng(3), engram=t)
+                p = subprocess.run([sys.executable, str(HERE / "tools" / "gguf_import.py"), str(gg), str(out)],
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                self.assertEqual(p.returncode, 0, p.stdout.decode())
+                (out / "ref.json").write_text(json.dumps({"prompt_ids": [5, 6, 7, 8, 20, 21, 22, 23, 30, 31, 32, 33],
+                                                          "output_ids": [0] * 8}))
+                e = dict(os.environ, SNAP=str(out), GQ_EXACT="1", V41_DSPARK="0", OMP_NUM_THREADS="2", COLI_CUDA="0",
+                         COLI_VULKAN="0", USAGE_SAVE="0", DUMP=str(d / f"{t}.logits"))
+                r = subprocess.run([str(V41), "8", str(out / "ref.json")], env=e, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, timeout=600)
+                self.assertNotIn(b"no row reader", r.stderr)
+                self.assertTrue(r.stdout.strip(), r.stderr.decode()[-2000:])
+                got[t] = (r.stdout, (d / f"{t}.logits").read_bytes() if (d / f"{t}.logits").exists() else None)
+            self.assertEqual(got["MXFP8"][0], got["Q8_0"][0], "the tokens differ")
+            self.assertEqual(got["MXFP8"][1], got["Q8_0"][1], "the last logits differ")
 
 
 @unittest.skipIf(gguf is None, "gguf-py (pip install gguf) is not installed")

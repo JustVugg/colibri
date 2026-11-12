@@ -1197,6 +1197,44 @@ int main(void) {
         ck(T->begin() && T->dnrec(KD, cb, bb, zb, sb, pb, yb, NULL, &p2) && T->submit(1) && maxdiff(down(yb, y.size()).data(), ry.data(), y.size()) < 1e-4 && maxdiff(down(sb, st.size()).data(), rst.data(), st.size()) < 1e-4, "the sigmoid gate, from the carried state");
         T->free(cb); T->free(bb); T->free(zb); T->free(sb); T->free(pb); T->free(yb); T->free(nb);
     }
+    /* a verify's rows with a copy after each (snap_n, the copies' addresses in a mapped table): one
+     * dispatch of the convolution and one of the recurrence give the bits of a dispatch a row (each
+     * ending on its row, snap_row 0), outputs, the carried state and ring, and every copy */
+    if (T->size >= offsetof(ColiCudaChainOps, dev_addr) + sizeof T->dev_addr && T->dev_addr) {
+        printf("dnconv and dnrec: a verify's copies in one dispatch\n");
+        const int KD = 128, S = 8, NS = 7, VH = 4, KH = 2, VD = 128, Ktot = KH * KD, CD = 2 * Ktot + VH * VD, vd = VH * VD, CK = 4, nh = CK - 1;
+        std::vector<float> in = rnd((size_t)S * CD, 91), w = rnd((size_t)CD * CK, 92), ring = rnd((size_t)CD * nh, 93);
+        std::vector<float> ab = rnd((size_t)S * 2 * VH, 94), z = rnd((size_t)S * vd, 95), st = rnd((size_t)VH * KD * VD, 96, 0.1f);
+        std::vector<float> prm(2 * VH + VD); unsigned sd = 97; for (int h = 0; h < VH; h++) { prm[h] = -1.f + 0.5f * frand(&sd); prm[VH + h] = 0.2f * frand(&sd); } for (int v = 0; v < VD; v++) prm[2 * VH + v] = 1.f + 0.2f * frand(&sd);
+        std::vector<float> out[2], ys[2], sts[2], rings[2], rs[2][NS], cs[2][NS];
+        for (int one = 0; one < 2; one++) {
+            CcBuf *ib = up(in), *wb = up(w), *rb = up(ring), *ob = T->buf((size_t)S * CD * 4, CC_DEV), *bb = up(ab), *zb = up(z), *sb = up(st), *pb = up(prm);
+            CcBuf *yb = T->buf((size_t)S * vd * 4, CC_DEV), *rsb[NS], *csb[NS], *tab = T->buf((size_t)2 * NS * 8 + 16, CC_UP);
+            for (int r = 0; r < NS; r++) { rsb[r] = T->buf((size_t)VH * KD * VD * 4, CC_DEV); csb[r] = T->buf((size_t)CD * nh * 4, CC_DEV); }
+            int ok = tab != NULL && T->begin();
+            if (one) {
+                unsigned long long *t = (unsigned long long *)T->ptr(tab) + 1;   /* at float 2: an offset into the table */
+                for (int r = 0; r < NS; r++) { t[r] = (unsigned long long)(uintptr_t)T->dev_addr(rsb[r]); t[NS + r] = (unsigned long long)(uintptr_t)T->dev_addr(csb[r]); }
+                CcDnConv cp = {S, CD, CK, 0, CD, 0, CD, -1, 0, 0, 0, 2 + 2 * NS, NS};
+                CcDnRec rp = {S, VH, KH, VD, Ktot, 0, CD, 0, 2 * VH, VH, 2 * VH, 0, vd, 0, vd, -1, 0, 1e-6f, 1.f / sqrtf((float)KD), 0, 2, 0, NS};
+                ok = ok && T->dnconv(ib, wb, rb, ob, tab, &cp) && T->dnrec(KD, ob, bb, zb, sb, pb, yb, tab, &rp);
+            } else
+                for (int r = 0; r < NS && ok; r++) {   /* the engines' segments: a row each, the last the rest */
+                    int s0 = r, len = r < NS - 1 ? 1 : S - s0;
+                    CcDnConv cp = {len, CD, CK, s0 * CD, CD, s0 * CD, CD, 0, 0, 0, 0, 0};
+                    CcDnRec rp = {len, VH, KH, VD, Ktot, s0 * CD, CD, s0 * 2 * VH, 2 * VH, VH + s0 * 2 * VH, 2 * VH, s0 * vd, vd, s0 * vd, vd, 0, 0, 1e-6f, 1.f / sqrtf((float)KD), 0, 0, 0};
+                    ok = T->dnconv(ib, wb, rb, ob, csb[r], &cp) && T->dnrec(KD, ob, bb, zb, sb, pb, yb, rsb[r], &rp);
+                }
+            ck(ok && T->submit(1), one ? "one dispatch each, seven copies" : "a dispatch a copy");
+            out[one] = down(ob, (size_t)S * CD); ys[one] = down(yb, (size_t)S * vd); sts[one] = down(sb, st.size()); rings[one] = down(rb, ring.size());
+            for (int r = 0; r < NS; r++) { rs[one][r] = down(rsb[r], (size_t)VH * KD * VD); cs[one][r] = down(csb[r], (size_t)CD * nh); }
+            T->free(ib); T->free(wb); T->free(rb); T->free(ob); T->free(bb); T->free(zb); T->free(sb); T->free(pb); T->free(yb); T->free(tab);
+            for (int r = 0; r < NS; r++) { T->free(rsb[r]); T->free(csb[r]); }
+        }
+        int same = out[0] == out[1] && ys[0] == ys[1] && sts[0] == sts[1] && rings[0] == rings[1];
+        for (int r = 0; r < NS; r++) same = same && rs[0][r] == rs[1][r] && cs[0][r] == cs[1][r];
+        ck(same, "the same bits: outputs, the state and the ring carried, the seven states and rings copied");
+    }
     printf("ew\n");
     {
         const int R = 3, D = 40, C = 4, n = R * D;
@@ -1520,6 +1558,50 @@ int main(void) {
         for (int r = 0; r < 8; r++) for (int i = 0; i < 64; i++) same &= got[r * 64 + i] == (float)(r * 1000 + i);
         ck(ok && same, "eight rounds: each answer read after its word, before the next");
         T->free(df); T->free(hf); T->free(ans); T->free(dst);
+    }
+    printf("wait_host_if\n");
+    {
+        /* wait_host for a step whose host may have no slots: a table of eight experts, 6 and 7 the
+         * host's (no g); six rounds of four routes, the host's slots in rounds 1 and 4 only (an id
+         * of -1 and one past the table count as the device's). Without a slot the device zeroes
+         * the host's rows and goes on, the host writing nothing; with one it waits for the word */
+        const int E = 8, R = 6, NK = 4;
+        CcExpert tab[E]; memset(tab, 0, sizeof tab);
+        for (int e = 0; e < 6; e++) tab[e].g = tab[e].u = tab[e].d = (const void *)(uintptr_t)(64 * (e + 1));
+        static const int ids[R][NK] = {{0, 1, 2, 3}, {4, 6, 5, 0}, {5, -1, 2, 9}, {1, 1, 1, 1}, {7, 2, 3, 4}, {0, 5, 9, -1}};
+        const int host[R] = {0, 1, 0, 0, 1, 0};
+        CcBuf *tb = T->buf(sizeof tab, CC_DEV), *ib = T->buf(sizeof ids, CC_DEV), *df = T->buf(64, CC_DOWN), *hf = T->buf(64, CC_UP),
+              *hy = T->buf(64 * 4, CC_UP), *dst = T->buf((size_t)R * 64 * 4, CC_DEV);
+        volatile unsigned *dw = (volatile unsigned *)T->ptr(df), *hw = (volatile unsigned *)T->ptr(hf);
+        float *aw = (float *)T->ptr(hy);
+        int ok = T->wait_host_if && tb && ib && df && hf && hy && dst;
+        if (ok) { for (int i = 0; i < 64; i++) aw[i] = 7.f; hw[5] = 0; hw[6] = 0; }
+        ok = ok && T->begin() && T->write(tb, 0, tab, sizeof tab) && T->write(ib, 0, ids, sizeof ids);
+        for (int r = 0; r < R && ok; r++)
+            ok = T->signal(df, 3, 100 + r) && T->wait_host_if(hf, 5, 100 + r, tb, 0, ib, (size_t)r * NK, NK, E, hy, 64) &&
+                 T->copy(dst, (size_t)r * 64, hy, 0, 64);
+        const auto t0 = std::chrono::steady_clock::now();
+        ok = ok && T->submit(0);
+        std::thread hostt([&] {
+            for (int r = 0; r < R; r++) {
+                if (!host[r]) continue;   /* nothing written: a device that waited would wait for good */
+                while (dw[3] < (unsigned)(100 + r)) { }
+                for (int i = 0; i < 64; i++) aw[i] = (float)(r * 1000 + i);
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                hw[5] = 100 + r;
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                if (r < R - 1) while (dw[3] < (unsigned)(101 + r)) { }   /* the copy read it */
+            }
+        });
+        ok = ok && T->finish();
+        hostt.join();
+        const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::vector<float> gotv = down(dst, (size_t)R * 64); const float *got = gotv.data(); int same = 1;
+        for (int r = 0; r < R; r++) for (int i = 0; i < 64; i++) same &= got[r * 64 + i] == (host[r] ? (float)(r * 1000 + i) : 0.f);
+        ck(ok && same && hw[6] == 0 && el < 5.0, "without a slot of the host's: its rows zero, no wait; with one: its rows after its word");
+        ck(!T->wait_host_if(hf, 5, 1, tb, 0, ib, 0, NK, 16, hy, 64) && !T->wait_host_if(hf, 5, 1, tb, 0, ib, 0, NK, E, hy, 65) &&
+           !T->wait_host_if(df, 5, 1, tb, 0, ib, 0, NK, E, hy, 64), "wait_host_if past its buffers, or on a DOWN flag, refused");
+        T->free(tb); T->free(ib); T->free(df); T->free(hf); T->free(hy); T->free(dst);
     }
     printf("pick\n");
     {

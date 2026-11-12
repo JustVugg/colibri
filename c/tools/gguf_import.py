@@ -1078,20 +1078,24 @@ def mtp_candidates(src):
 
 
 def mtp_head_ok(path, meta, layers):
-    """'' when path is a qwen4exp MTP head for this model (one nextn layer at blk.<layers>), else why not."""
-    p = "qwen4exp."
+    """'' when path is an MTP head for this model (the model's architecture, qwen4exp, qwen35 or qwen35moe,
+    one nextn layer at blk.<layers>), else why not."""
+    arch = meta.get("general.architecture")
+    p = f"{arch}."
     try:
         r = GGUFReader(str(path))
     except (GGUFError, OSError) as e:
         return str(e)
     try:
         hm, names = r.metadata, {t["name"] for t in r.tensors}
-        if hm.get("general.architecture") != "qwen4exp":
-            return f"architecture {hm.get('general.architecture')!r}, not qwen4exp"
+        if hm.get("general.architecture") != arch:
+            return f"architecture {hm.get('general.architecture')!r}, not {arch}"
         if int(hm.get(p + "nextn_predict_layers", 0)) != 1:
             return "not one MTP layer (nextn_predict_layers)"
         for k in ("block_count", "embedding_length", "expert_count", "expert_feed_forward_length"):
-            want = int(meta[p + k]) + (1 if k == "block_count" else 0)
+            if p + k not in meta:   # a dense model has no experts
+                continue
+            want = int(meta[p + k]) + (1 - int(meta.get(p + "nextn_predict_layers", 0)) if k == "block_count" else 0)
             if int(hm.get(p + k, -1)) != want:
                 return f"{k} {hm.get(p + k)} does not match the model ({want})"
         if f"blk.{layers}.nextn.eh_proj.weight" not in names:
@@ -1756,7 +1760,7 @@ def main():
     cfg, layers = ARCHES[arch](meta, tensors, {"indexer_compress_ratio": args.indexer_compress_ratio,
                                                "readers": None if os.environ.get("GGUF_CHECK") else readers})
     mtp_file, mtp_where = None, None
-    if arch == "qwen4exp" and not args.no_mtp:
+    if arch in ("qwen4exp", "qwen35", "qwen35moe") and not args.no_mtp:
         if f"blk.{layers}.nextn.eh_proj.weight" in tensors:
             mtp_where = "in the model's GGUF"
         else:
@@ -1767,7 +1771,7 @@ def main():
                 if args.mtp:
                     sys.exit(f"--mtp {cand}: {why}")
                 print(f"  {cand.name}: not this model's MTP head ({why})")
-        if mtp_where:   # the head drafts; the engine reads the rest of it from the GGUF
+        if mtp_where and arch == "qwen4exp":   # the head drafts; the engine reads the rest of it from the GGUF
             cfg["mtp_num_hidden_layers"] = 1
             cfg["mtp"] = {"layer_types": ["full_attention"], "rope_theta": cfg["rope_parameters"]["rope_theta"]}
             cfg["mtp_use_dedicated_embeddings"] = False
@@ -1824,8 +1828,8 @@ def main():
     for r in readers:
         r.close()
     print(f"colibri model directory ready: {args.out}  ({arch}, {layers} layers, mode {args.mode})")
-    if arch in ("qwen4exp", "deepseek41"):
-        head = "MTP head" if arch == "qwen4exp" else "DSpark head"
+    if arch in ("qwen4exp", "qwen35", "qwen35moe", "deepseek41"):
+        head = "DSpark head" if arch == "deepseek41" else "MTP head"
         print(f"  {head}: {mtp_where or ('off (--no-mtp)' if args.no_mtp else 'none found: decoding without drafts (--mtp names one)')}")
 
 

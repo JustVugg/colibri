@@ -462,6 +462,13 @@ the context's n-grams), and a verify carries whichever proposal is worth more. T
 output stays that of plain decoding. Measured on the release with the int4-g64 sidecar: 4.94 tok/s at two drafts against 4.71 at one and 4.12 without MTP on the CPU (2.75 tokens per forward), 4.55 against 4.39 and 3.91 with the Vulkan tier and chain on a Radeon 780M, so two drafts is the default (one on an integrated GPU with 32 or more compute units, the tier and the chain on). The details, the settings and the
 tests are in [speculative.md](speculative.md).
 
+`COLI_DFLASH=<dir>` drafts with a DFlash2 drafter (`incoai/Qwen3.8-Flash-Next-DFlash2`) in
+the head's place on the CUDA chain, its context the four streams after its target layers
+(their sum). On Qwen3.8-Flash-Next IQ2_XS it is at the head's pace at best (3 drafts: 92.0 /
+70.5 / 71.8 tok/s code, prose, a list, the head 91 to 97 / 70 to 71 / 80 to 90): each verify
+row brings its own experts, so the head's cheaper drafts stay the default; see
+[speculative.md](speculative.md#dflash2).
+
 `make -C c qwen38-tiny-mtp-check` adds a head with random weights under the
 release's names to the three tiny fixtures and gates on the head's draft
 logits against a float32 reference of both wirings

@@ -1854,6 +1854,29 @@ class SchedulerTest(unittest.TestCase):
                 self.assertEqual(list(scheduler.queue), [older])
                 self.assertEqual(scheduler.snapshot()["rejected"], 1)
 
+    def test_preferred_slot_is_taken_when_free_and_left_when_busy(self):
+        # conversation_cache_slot's slot is a preference: free, it is the pick; busy with
+        # another conversation, a free slot is taken at once instead of waiting for it.
+        scheduler = GenerationScheduler(max_queue=0, queue_timeout=0.01, capacity=3)
+        with scheduler.admit(prefer=2) as (_, slot):
+            self.assertEqual(slot, 2)
+            with patch.object(scheduler.condition, "wait", side_effect=AssertionError("waited for a busy preferred slot")):
+                with scheduler.admit(prefer=2) as (_, other):
+                    self.assertEqual(other, 0)
+                    self.assertEqual(scheduler.snapshot()["active"], 2)
+        stats = scheduler.snapshot()
+        self.assertEqual((stats["rejected"], stats["timed_out"], stats["completed"]), (0, 0, 2))
+
+    def test_preference_does_not_bypass_older_any_slot_waiter(self):
+        scheduler = GenerationScheduler(max_queue=1, capacity=2)
+        older = (object(), None)
+        scheduler.queue.append(older)
+        with self.assertRaises(APIError) as caught:
+            with scheduler.admit(prefer=1):
+                self.fail("bypassed older waiter")
+        self.assertEqual(caught.exception.code, "queue_full")
+        self.assertEqual(list(scheduler.queue), [older])
+
     def test_zero_queue_rejects_busy_pinned_slot_with_spare_capacity(self):
         scheduler = GenerationScheduler(max_queue=0, queue_timeout=0.01, capacity=2)
         with scheduler.admit(slot=0):
