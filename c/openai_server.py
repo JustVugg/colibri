@@ -10583,6 +10583,9 @@ def keep_engine(server, start, stopping, watch=ENGINE_WATCH_S, delays=ENGINE_RES
             if not stopping.is_set():
                 server.engine, fresh = fresh, None
                 server.engine_restarts += 1
+                # its RAM plan ran again (chat_context_env), so the context it holds may differ
+                server.context_limit = getattr(server.engine, "context_limit", None)
+                server.max_tokens = getattr(server.engine, "max_tokens", None) or server.max_tokens
         if fresh is not None:     # the server stopped while it loaded
             fresh.close()
             return
