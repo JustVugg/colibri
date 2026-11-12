@@ -145,6 +145,9 @@ typedef struct {
     unsigned long long pc_took, pc_staged;
     unsigned long long dm_steps, dm_hyb, dm_pairs;   /* layer steps in the frame, the hybrid ones, slots the host computed */
     double dm_host_ms, dm_spin_ms;
+    /* a hybrid layer of a decode step without a slot of the host's: the device goes on without the
+     * host's word (q38cc_dm_skips; dm_skip_on: the backend has cc_wait_host_if), dm_skip such steps */
+    int dm_skip_on; unsigned long long dm_skip, sv_skips;
     /* the host pool (q38cc_pool_init): pool_n experts in pool_nb buffers of pool_per, pool_of[l*E+e] its slot or -1 */
     CcBuf **pool_buf; int pool_nb, pool_per, pool_n; size_t pool_stride; int32_t *pool_of;
     /* the pool packed at each layer's own expert size (NULL: places of the largest layer's): a
@@ -1780,6 +1783,8 @@ static void q38cc_pool_init(Model *m) {
                 ch->pool_n, left, pool_b / GiB, ta - t0, now_s() - ta);
     if (ch->pool_stage) fprintf(stderr, "[chain] qwen38: a step's pooled experts copied to the device first (%d places, %.1f MiB)\n",
                                 nst, (double)nst * stride / 1048576.0);
+    ch->dm_skip_on = cc_wait_host_if_ready();
+    { const char *e = getenv("COLI_CUDA_CHAIN_HOST_SKIP"); if (e && *e == '0') ch->dm_skip_on = 0; }
     if (ch->dm_stage) {
         int pmin = q38cc_stage_cap(ch, 0), pmax = pmin;
         for (int i = 1; i < L; i++) { int q = q38cc_stage_cap(ch, i); if (q < pmin) pmin = q; if (q > pmax) pmax = q; }
@@ -2047,6 +2052,10 @@ static int q38cc_pc_take(Q38CChain *ch, Model *m, int S) {
 }
 /* a step of n rows has the CPU compute its pooled slots: a decode step's, a short prompt's chunk's */
 static int q38cc_pc_step(Q38CChain *ch, int n) { return (n <= Q38CC_DM_ROWS || ch->pc_prompt) && ch->pool_cpu && ch->dm_tabd; }
+/* a hybrid layer of this step whose routes give the host no slot goes on without its word: a decode
+ * step's (a verify's) on the decode table, where both sides know the host's slots from the same
+ * residency (dm_res, the table's entries without g) */
+static int q38cc_dm_skips(Q38CChain *ch, int n, int lay_S) { return ch->dm_skip_on && n <= Q38CC_DM_ROWS && !lay_S && q38cc_pc_step(ch, n); }
 static CcBuf *q38cc_dm_tab(Q38CChain *ch, int n) {
     if (q38cc_pc_step(ch, n)) return ch->dm_tabd;   /* the pool's experts on the CPU */
     return n > Q38CC_DM_ROWS && ch->dm_stage && ch->dm_tabb ? ch->dm_tabb : ch->dm_tab;
@@ -2086,7 +2095,9 @@ static int q38cc_dm_sum(Q38CChain *ch, Model *m, int i, int n, unsigned v, CcBuf
     CcBuf *tab = q38cc_dm_tab(ch, n);
     CcMoe ms = {n, K, H, c->inter, ch->dm_fmt, ch->dm_gs, 0, 2, i * E, 0, H, io, K, io, K, 0, H, v ? 0 : -1, E, 0, 0, lay_S, lay_s0};
     if (ch->dm_fmt >= 100) qt_chain_layer_format(i, &ms.fmt, &ms.fmt_d);
-    int ok = !v || cc_wait_host(ch->dm_hfl, 0, v);
+    int ok = !v || (q38cc_dm_skips(ch, n, lay_S) ? cc_wait_host_if(ch->dm_hfl, 0, v, tab, (size_t)i * E, ch->dm_ids, (size_t)io, n * K, E,
+                                                                    ch->dm_hy, (size_t)n * H)
+                                                 : cc_wait_host(ch->dm_hfl, 0, v));
     ok = ok && cc_moe(tab, NULL, ch->dm_ids, ch->dm_w, hid, ch->dm_y, ch->dm_hy, &ms);
     ch->dm_steps++;
     return ok;
@@ -2327,6 +2338,7 @@ static int q38cc_dm_serve(Q38CChain *ch, Model *m, int i, int n, unsigned v) {
         if (!ch->dm_dev[a]) nmiss++;
         if (!ch->dm_dev[a] || pool) ch->dm_pairs++;
     }
+    if (!npc && !nmiss && q38cc_dm_skips(ch, n, 0)) { ch->dm_skip++; ch->dm_spin_ms += (t1 - t0) * 1e3; return 1; }   /* the device went on */
     if (nmiss && !q38_moe_decode_grouped(m, &m->L[i], i, x, n, ch->host_routed, NULL, 1, 0, ids, w, ch->dm_dev)) {
         fprintf(stderr, "[chain] qwen38: the host's step refused layer %d's experts\n", i);
         return 0;
@@ -2403,6 +2415,7 @@ typedef struct {
     int xs[Q38CC_DM_ROWS];                   /* a row's activation: 0 not made, 1 being made, 2 made (3 failed) */
     int gs[Q38CC_SRV_SLOTS], hs[Q38CC_SRV_SLOTS];   /* a group's input rows and its SwiGLU rows, the same states */
     long long t0;                            /* ns: the device's word first seen */
+    int skip, gone;                          /* skip: the device goes on where the job has no slot (q38cc_dm_skips); gone: counted so */
 } Q38CCJob;
 typedef struct Q38CCSrv Q38CCSrv;
 typedef const uint8_t *(*Q38CCWhere)(void *ctx, int k);
@@ -2421,6 +2434,7 @@ struct Q38CCSrv {
     gq_act ax[Q38CC_DM_ROWS];                /* a row's input */
     gq_act gx[Q38CC_SRV_SLOTS], ah[Q38CC_SRV_SLOTS];   /* a group's input rows, its SwiGLU rows */
     unsigned long long jobs, slots, groups, ns;   /* books (the last thread of a job) */
+    unsigned long long skips;                /* jobs without a slot the device did not wait for */
 };
 static inline void q38cc_relax(void) {
 #if defined(__x86_64__) || defined(__i386__)
@@ -2518,6 +2532,10 @@ static void q38cc_srv_job(Q38CCSrv *sv, Q38CCJob *J) {
     g0[0] = 0;
     for (int q = 0; q < ng; q++) g0[q + 1] = g0[q] + gn[q];
     for (int p = 0; p < np; p++) { const int q = at[p] / 8, r = at[p] % 8; at[p] = g0[q] + r; mem[at[p]] = pa[p]; }
+    if (!np && J->skip) {   /* the device went on without the host's word: nothing to write (a later job's rows may be there) */
+        if (!__atomic_exchange_n(&J->gone, 1, __ATOMIC_ACQ_REL)) Q38CC_ADD(&sv->skips, 1ULL);
+        return;
+    }
     const int64_t rg = gq_row_bytes(tg, H), rd = gq_row_bytes(td, I);
     const size_t pg = Q38CC_PAD(rg * I);
     const int cgu = (2 * I + 7) / 8, ngu = ng * cgu, cdn = (H + 7) / 8, f8g = gq_f8_ok(tg, H), f8d = gq_f8_ok(td, I);
@@ -2659,11 +2677,11 @@ static void q38cc_srv_open(Q38CCSrv *sv, const volatile unsigned *dfl, volatile 
 /* layer's pooled slots of a step of n rows, once the device's word reaches v (res: the layer's
  * experts, 2 or more where the pool holds them) */
 static void q38cc_srv_post(Q38CCSrv *sv, int layer, int n, unsigned v, int tg, int td, const int *ids, const float *w,
-                           const uint8_t *res) {
+                           const uint8_t *res, int skip) {
     unsigned k = sv->posted;
     Q38CCJob *J = &sv->job[k % Q38CC_SRV_RING];
     memset(J, 0, sizeof *J);
-    J->layer = layer; J->n = n; J->v = v; J->tg = tg; J->td = td; J->ids = ids; J->w = w; J->res = res;
+    J->layer = layer; J->n = n; J->v = v; J->tg = tg; J->td = td; J->ids = ids; J->w = w; J->res = res; J->skip = skip;
     Q38CC_ST(&sv->posted, k + 1);
 }
 /* the forward's end: every thread past every job (ok 0: they skip what is left and the host's
@@ -2866,7 +2884,8 @@ static Q38CCSrv *q38cc_srv_of(Q38CChain *ch, Model *m, int n) {
 }
 static void q38cc_srv_books(Q38CChain *ch) {
     Q38CCSrv *sv = ch->srv;
-    const unsigned long long j = Q38CC_LD(&sv->jobs), sl = Q38CC_LD(&sv->slots), ns = Q38CC_LD(&sv->ns);
+    const unsigned long long j = Q38CC_LD(&sv->jobs), sl = Q38CC_LD(&sv->slots), ns = Q38CC_LD(&sv->ns), sk = Q38CC_LD(&sv->skips);
+    ch->dm_skip += sk - ch->sv_skips; ch->sv_skips = sk;
     const double ms = (double)(ns - ch->sv_ns) / 1e6;
     ch->dm_hyb += j - ch->sv_jobs; ch->dm_pairs += sl - ch->sv_slots; ch->pc_pairs += sl - ch->sv_slots;
     ch->pc_ms += ms; ch->dm_host_ms += ms; ch->host_ms += ms;
@@ -3516,7 +3535,7 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
                 if (ok && v && sv && qt_chain_layer_format(i, &fg, &fd) && fg >= 100 && fd >= 100) {   /* the server's from here */
                     const size_t io = (size_t)i * ch->rows * c->topk;
                     q38cc_srv_post(sv, i, n, v, fg - 100, fd - 100, (const int *)cc_ptr(ch->dm_idsd) + io, (const float *)cc_ptr(ch->dm_wd) + io,
-                                   ch->dm_res + (size_t)i * E);
+                                   ch->dm_res + (size_t)i * E, q38cc_dm_skips(ch, n, 0));
                     v = 0;
                 }
                 if (ok && pend_v) ok = q38cc_dm_serve(ch, m, pend_i, n, pend_v);
@@ -3687,7 +3706,7 @@ static int q38cc_mtp_rows(Model *m, const float *streams, const int *next, int S
             ok = ok && cc_matmul(q38cc_t(ch, &l->router), ch->mixed, 0, ch->lg, 0, n) && cc_route(ch->lg, NULL, ch->hd_ids, ch->hd_w, &rp) &&
                  cc_copy(ch->hd_idsd, 0, ch->hd_ids, 0, nk) && cc_copy(ch->hd_wd, 0, ch->hd_w, 0, nk) &&
                  cc_copy(ch->mixd, 0, ch->mixed, 0, (size_t)n * H) && cc_signal(ch->dm_dfl, 0, v);
-            if (ok) q38cc_srv_post(sv, L, n, v, ch->hd_tg, ch->hd_td, (const int *)cc_ptr(ch->hd_idsd), (const float *)cc_ptr(ch->hd_wd), ch->hd_res);
+            if (ok) q38cc_srv_post(sv, L, n, v, ch->hd_tg, ch->hd_td, (const int *)cc_ptr(ch->hd_idsd), (const float *)cc_ptr(ch->hd_wd), ch->hd_res, 0);
             ok = ok && q38cc_shared(ch, m, l, L, n) && cc_wait_host(ch->dm_hfl, 0, v) && q38cc_moe_apply(ch, m, n, ch->dm_hy);
             ch->hd_rows += (unsigned long long)n;
         } else {
@@ -3745,6 +3764,9 @@ static void q38cc_report(Model *m) {
         fprintf(stderr, "[chain] qwen38: %llu layer steps with the routed experts in the frame, %llu of them hybrid "
                         "(%llu slots on the host in %.1f ms, %.1f ms waiting for the device's routes), %llu slots from the host pool\n",
                 ch->dm_steps, ch->dm_hyb, ch->dm_pairs, ch->dm_host_ms, ch->dm_spin_ms, ch->pool_reads);
+    if (ch->dm_skip)
+        fprintf(stderr, "[chain] qwen38: %llu hybrid layer steps without a slot of the host's: the device went on without its word "
+                        "(COLI_CUDA_CHAIN_HOST_SKIP=0: it waits)\n", ch->dm_skip);
     if (ch->dv_drafts) fprintf(stderr, "[chain] qwen38: %llu drafts from the draft list's lm_head rows on the card\n", ch->dv_drafts);
     if (ch->hd_rows) fprintf(stderr, "[chain] qwen38: %llu MTP head rows with their routed experts on the pool's server\n", ch->hd_rows);
     if (ch->hd_card_rows) fprintf(stderr, "[chain] qwen38: %llu MTP head rows with their routed experts on the card (Q2_0)\n", ch->hd_card_rows);

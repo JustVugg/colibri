@@ -233,7 +233,7 @@ int main(void) {
             q38cc_srv_open(sv, &dfl, &hfl, x, out);
             for (int rep = 0; rep < 2; rep++) for (int i = 0; i < L; i++) {
                 const int n = rep ? R : 1;   /* a decode step's row, a verify's five */
-                q38cc_srv_post(sv, i, n, ++v, tg, td, ids[i], w[i], res + i * NE);
+                q38cc_srv_post(sv, i, n, ++v, tg, td, ids[i], w[i], res + i * NE, 0);
                 /* q38cc_dm_serve's arithmetic for the same slots */
                 const uint8_t *gp[R * K]; const float *xp[R * K]; int pa[R * K], np = 0;
                 for (int a = 0; a < n * K; a++) {
@@ -269,14 +269,35 @@ int main(void) {
             if (!(cl && sv->jobs == 2 * L && (int)sv->slots == slots)) printf("       closed %d, jobs %llu, slots %llu of %d\n", cl, sv->jobs, sv->slots, slots);
             tk(cl && sv->jobs == 2 * L && (int)sv->slots == slots, "the forward closed, its jobs and slots in the books");
             q38cc_srv_open(sv, &dfl, &hfl, x, out);
-            q38cc_srv_post(sv, 0, 1, ++v, tg, td, ids[0], w[0], res + 0 * NE);
-            q38cc_srv_post(sv, 1, 1, ++v, tg, td, ids[1], w[1], res + 1 * NE);
+            q38cc_srv_post(sv, 0, 1, ++v, tg, td, ids[0], w[0], res + 0 * NE, 0);
+            q38cc_srv_post(sv, 1, 1, ++v, tg, td, ids[1], w[1], res + 1 * NE, 0);
             tk(q38cc_srv_close(sv, 0, v) && hfl == v, "a failed frame: the jobs skipped, the host's word past them");
             q38cc_srv_open(sv, &dfl, &hfl, x, out);
-            q38cc_srv_post(sv, 2, 1, ++v, tg, td, ids[2], w[2], res + 2 * NE);
+            q38cc_srv_post(sv, 2, 1, ++v, tg, td, ids[2], w[2], res + 2 * NE, 0);
             dfl = v;
             for (long spin = 0; hfl < v && spin < 2000000000L; spin++) q38cc_relax();
             tk(q38cc_srv_close(sv, 1, v) && hfl == v, "and the next forward served");
+            /* a job the device does not wait for (q38cc_dm_skips): without a pooled slot (experts 0
+             * and 1 are the card's, -1 off the table) it writes no rows and no word, a later job's
+             * rows may be there; with one it is served as before */
+            int idz[K]; float wz[K];
+            for (int a = 0; a < K; a++) { idz[a] = a % 3 == 2 ? -1 : a % 2; wz[a] = 0.5f; }
+            for (int k = 0; k < R * H; k++) out[k] = 7.f;
+            const unsigned long long sk0 = sv->skips, jb0 = sv->jobs; const unsigned h0 = hfl;
+            q38cc_srv_open(sv, &dfl, &hfl, x, out);
+            q38cc_srv_post(sv, 0, 1, ++v, tg, td, idz, wz, res + 0 * NE, 1);
+            dfl = v;
+            int cl3 = q38cc_srv_close(sv, 1, v), kept = 1;
+            for (int k = 0; k < R * H; k++) if (out[k] != 7.f) kept = 0;
+            tk(cl3 && hfl == h0 && kept && sv->skips == sk0 + 1 && sv->jobs == jb0, "a job without a pooled slot the device went on from: no rows, no word");
+            int np2 = 0;
+            for (int a = 0; a < K; a++) if (ids[2][a] >= 0 && res[2 * NE + ids[2][a]] >= 2) np2++;
+            q38cc_srv_open(sv, &dfl, &hfl, x, out);
+            q38cc_srv_post(sv, 2, 1, ++v, tg, td, ids[2], w[2], res + 2 * NE, 1);
+            dfl = v;
+            for (long spin = 0; hfl < v && spin < 2000000000L; spin++) q38cc_relax();
+            tk(np2 > 0 && q38cc_srv_close(sv, 1, v) && hfl == v && sv->skips == sk0 + 1 && sv->jobs == jb0 + 1,
+               "one with pooled slots: served, its word written");
             q38cc_srv_stop(sv);
         }
         free(pool); free(x); free(out); free(want);
