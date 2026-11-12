@@ -11997,7 +11997,14 @@ int coli_v4_engine_open(ColiV4Engine **output,
 #endif
 #ifdef COLI_V4_GPU_TIER
     if (coli_v4_gpu_experts_init(engine, error, error_size)) goto fail;
-    coli_v4_gpu_head_upload(engine);
+    /* DSV4_CUDA_HEAD_LAZY (1): the exact head goes up at the first head call
+     * (coli_v4_gpu_head_ready), not here. At open nothing else is on the card
+     * yet, so the budget check passes, and the dense mirrors and the prefill
+     * bank that follow then find 1 GiB less (2 while the head packs): on a
+     * 16 GB card the prompt ran out of VRAM (`kv ring allocation: out of
+     * memory`). By the first head call the prompt is done and its bank
+     * released. 0 = upload here, as before. */
+    if (!coli_v4_gpu_head_lazy()) coli_v4_gpu_head_upload(engine);
 #endif
     *output = engine;
     return 0;
@@ -12282,6 +12289,7 @@ void coli_v4_gpu_engine_close(ColiV4Engine *engine) {
     }
     dsv4_cuda_tensor_free((Dsv4CudaTensor *)engine->gpu.head);
     engine->gpu.head = NULL;
+    engine->gpu.head_tried = 0;
     v4_gpu_route_scratch_clear();
     dsv4_cuda_shutdown();
     engine->gpu.enabled = 0;
@@ -12662,6 +12670,11 @@ static long long v4_gpu_resident_reserve_mb(void) {
     return reserve < 256 ? 256 : reserve;
 }
 
+int coli_v4_gpu_head_lazy(void) {
+    const char *setting = getenv("DSV4_CUDA_HEAD_LAZY");
+    return !setting || atoi(setting) != 0;
+}
+
 void coli_v4_gpu_head_upload(ColiV4Engine *engine) {
 #if defined(__AVX2__)
     const char *enabled = getenv("DSV4_CUDA_HEAD");
@@ -12721,16 +12734,28 @@ void coli_v4_gpu_head_upload(ColiV4Engine *engine) {
 #endif
 }
 
+/* The exact head, uploaded on first use under DSV4_CUDA_HEAD_LAZY: 1 when it
+ * is resident. One attempt per engine open: a refusal (the budget, a failed
+ * upload) keeps the CPU head for the run instead of probing every token. */
+int coli_v4_gpu_head_ready(ColiV4Engine *engine) {
+    if (!engine || !engine->gpu.enabled) return 0;
+    if (!engine->gpu.head && !engine->gpu.head_tried && coli_v4_gpu_head_lazy()) {
+        engine->gpu.head_tried = 1;
+        coli_v4_gpu_head_upload(engine);
+    }
+    return engine->gpu.head != NULL;
+}
+
 int coli_v4_gpu_head_scores(ColiV4Engine *engine,const float *input,float *scores) {
-    if (!engine || !engine->gpu.enabled || !engine->gpu.head) return -1;
+    if (!coli_v4_gpu_head_ready(engine)) return -1;
     return dsv4_cuda_head_scores_exact(engine->gpu.head, input, scores) ? 0 : -1;
 }
 
 int coli_v4_gpu_head_batch(ColiV4Engine *engine,const float *input,int batch,
                            float *scores,int *ids,float *values) {
     const char *enabled = getenv("DSV4_CUDA_HEAD_BATCH");
-    if ((enabled && !atoi(enabled)) || !engine || !engine->gpu.enabled ||
-        !engine->gpu.head || !input || batch < 1 || batch > 128) return -1;
+    if ((enabled && !atoi(enabled)) || !input || batch < 1 || batch > 128 ||
+        !coli_v4_gpu_head_ready(engine)) return -1;
     if (scores)
         return dsv4_cuda_head_scores_batch_exact(engine->gpu.head, input, batch, scores) ? 0 : -1;
     return dsv4_cuda_head_argmax_batch_exact(engine->gpu.head, input, batch, ids, values) ? 0 : -1;

@@ -131,6 +131,28 @@ static void test_head(void) {
     assert(coli_v4_gpu_head_batch(engine, &input, 3, NULL, ids, values) == -1);
     unsetenv("DSV4_CUDA_HEAD_BATCH");
     coli_v4_gpu_engine_close(engine); assert(shutdowns == before + 1);
+    /* DSV4_CUDA_HEAD_LAZY (default): the first head call uploads; a refused
+     * upload is not retried within the same open; 0 leaves it to engine open. */
+    engine->gpu.enabled = 1; head_scores_ok = 1; head_upload_ok = 1;
+    int uploads = head_uploads;
+    assert(!coli_v4_gpu_head_scores(engine, &input, &scores) && scores == input);
+    assert(engine->gpu.head && head_uploads == uploads + 1 && engine->gpu.head_tried);
+    assert(!coli_v4_gpu_head_scores(engine, &input, &scores) && head_uploads == uploads + 1);
+    coli_v4_gpu_engine_close(engine);
+    assert(!engine->gpu.head && !engine->gpu.head_tried);
+    engine->gpu.enabled = 1; head_upload_ok = 0; uploads = head_uploads;
+    assert(coli_v4_gpu_head_scores(engine, &input, &scores) == -1);
+    assert(!engine->gpu.head && head_uploads == uploads + 1);
+    head_upload_ok = 1;
+    assert(coli_v4_gpu_head_batch(engine, &input, 3, NULL, ids, values) == -1);
+    assert(!engine->gpu.head && head_uploads == uploads + 1);
+    coli_v4_gpu_engine_close(engine);
+    setenv("DSV4_CUDA_HEAD_LAZY", "0", 1);
+    engine->gpu.enabled = 1; uploads = head_uploads;
+    assert(coli_v4_gpu_head_scores(engine, &input, &scores) == -1);
+    assert(!engine->gpu.head && head_uploads == uploads && !engine->gpu.head_tried);
+    unsetenv("DSV4_CUDA_HEAD_LAZY");
+    coli_v4_gpu_engine_close(engine);
     free(engine);
 #endif
 }

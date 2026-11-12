@@ -538,6 +538,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"DSV4_CUDA_HEAD", CE_BOOL, CE_DSV4, 0, NULL},
     {"DSV4_CUDA_HEAD_BATCH", CE_BOOL, CE_DSV4, 0, NULL},
     {"DSV4_CUDA_HEAD_DEVICE", CE_INT, CE_DSV4, 0, NULL},
+    {"DSV4_CUDA_HEAD_LAZY", CE_BOOL, CE_DSV4, 0, NULL},
     {"DSV4_CUDA_INDEXER_HEADS", CE_BOOL, CE_DSV4, 0, NULL},
     {"DSV4_CUDA_INDEXER_PREP", CE_BOOL, CE_DSV4, 0, NULL},
     {"DSV4_CUDA_MOE_CONTIGUOUS",         CE_STR   , CE_DSV4                                         , 0             , NULL},
