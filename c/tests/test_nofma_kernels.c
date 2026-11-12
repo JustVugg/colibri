@@ -7,7 +7,7 @@
  *          groups), widths on and off the 128-block grid, outputs off the four-row pass, weights
  *          with the NaN codes, activations of a full 24-bit mantissa (the products round); and
  *          matmul_fp8_nofma_part (qwen38's grouped MoE): a range of output rows, rows by pointer
- *   int4  expert_ffn.h's xf_dot_f32 and xf_dot_f32_rows (one to nine rows a call, a stride)
+ *   int4   expert_ffn.h's xf_dot_f32 and xf_dot_f32_rows (one to nine rows a call, a stride)
  *          against xf_dot_f32_ref: random codes and scales over wide exponent ranges, activations
  *          with zeros of both signs and subnormals, the all-0 and all-15 codes */
 #include <stdio.h>

@@ -713,7 +713,7 @@ static void matmul_fp8_neon(float *y, const float *x, const uint8_t *q8, const f
 
 /* x86 without FMA (Sandy Bridge, Ivy Bridge, a build for the x86-64 baseline or v2). There no
    compiler can fuse matmul_fp8_scalar's multiply-add: a row's block sum is a multiply and an add,
-   each rounded, one weight after the other, and the two kernels below do exactly those operations
+   each rounded, one weight after the other, and the kernels below do exactly those operations
    in that order, so their bits are matmul_fp8_scalar's (tests/test_fp8_nofma). That kernel decoded
    every weight again for every row and waited on one chain of adds: a Xeon E5-2690 v1 spent
    ~150 ms a prompt token in Qwen3.8's FP8 experts, about what a decode step costs (#2715).
@@ -721,7 +721,9 @@ static void matmul_fp8_neon(float *y, const float *x, const uint8_t *q8, const f
      - two rows or more (a prompt, a verify): the rows go into the lanes of a vector, 8 with AVX
        and 4 with SSE2 (the activations laid out row-interleaved once a call), and four output
        rows a pass share each load. Lane r of output o adds w[o][i] * x[r][i] for i in order:
-       the scalar kernel's sum for that row, a weight now read once for every 8 (or 4) rows. */
+       the scalar kernel's sum for that row, a weight now read once for every 8 (or 4) rows;
+     - matmul_fp8_nofma_part: the same two passes for a range of output rows of rows given by
+       pointers, with no parallel region of its own (qwen38's grouped MoE). */
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__)) && defined(__SSE2__) && !defined(__FMA__) && \
     !defined(__FAST_MATH__) && (defined(__x86_64__) || defined(__SSE2_MATH__))
 #define COLI_FP8_NOFMA_LANES 1

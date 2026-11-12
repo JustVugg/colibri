@@ -5184,10 +5184,11 @@ static void q38_moe_ex(Model *m,Layer *l,int layer,const float *x,int S,float *o
         if(group>Q38_GROUPED_ROWS)group=Q38_GROUPED_ROWS;
         if(group<1)group=1;
         int n0=S<group?S:group,base=0;
-        /* FP8 experts group more rows than one group only when the cache holds the whole layer:
-         * with a smaller cache, groups of cap/K rows would read more experts than the prefill
-         * MoE's chunks, which read each one once a chunk */
-        if((S<=group||m->cache[layer].cap>=E||!q38_layer_fp8_rows(m,layer))&&
+        /* FP8 experts with a cache smaller than the layer: a prompt keeps the prefill MoE when its
+         * chunks are wider than the cap/K-row groups here. Both read an expert once a chunk or a
+         * group, so the narrower of the two reads more */
+        if((S<=group||m->cache[layer].cap>=E||group>=q38_moe_prefill_rows(&m->c,S)||
+            !q38_layer_fp8_rows(m,layer))&&
            q38_moe_decode_grouped(m,l,layer,x,n0,out,logits_in,routed_only,0,NULL,NULL,NULL)){
             for(base=n0;base<S;base+=group){
                 int n=S-base<group?S-base:group;
