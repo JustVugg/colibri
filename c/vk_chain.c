@@ -3518,6 +3518,17 @@ int vkc_enc_rel(VkcBuf *x, VkcBuf *pt, VkcBuf *y, const VkcEncRel *p) {
 }
 
 void vkc_stats(VkcStats *st) { *st = KC.st; }
+int vkc_pool_bytes(int kind, VkcPoolBytes *o) {
+    if (!o || kind < 0 || kind > 2) return 0;
+    memset(o, 0, sizeof *o);
+    const VkcPool *P = &KC.pool[kind];
+    for (int k = 0; k < P->p.nb; k++) {
+        const VkaBlock *b = &P->p.b[k];
+        if (!b->present) continue;
+        o->blocks++; o->total += b->cap; o->used += b->used;
+    }
+    return 1;
+}
 
 /* ---- big prefill chunks ------------------------------------------------------------
  * The rows of a prompt chunk (vk_chain.h, vkc_chunk_rows). The free device memory is
@@ -3546,9 +3557,18 @@ int vkc_chunk_rows(const char *engine, size_t row_bytes) {
      * discrete device. Bound both memories, including Windows commit headroom. */
     double avail = compat_mem_available_gb() * 1e9;
     if (avail > 0 && avail < free_b) free_b = avail;
-    /* the room the tier's budget left for a chunk's host pool experts (vk_dmoe.h), not
-     * for rows: Qwen3.8's chunks took it and every prompt after the first read the pool */
-    if (g_kd == 0) free_b -= (double)vkt_stage_room();
+    /* The tier's own commitments, made after this chunk is sized, come out first: what its
+     * budget left for a chunk's host pool experts (vk_dmoe.h, not for rows: Qwen3.8's
+     * chunks took it and every prompt after the first read the pool), and the streaming
+     * slots the first streaming step will allocate (vkt_slot_reserve). Without them the
+     * chunk spends headroom the tier still needs, and the two fight over it at the turn
+     * boundary (the audit's ordering hazard: 1.35 GiB of slots made after a chunk sized
+     * from the same free memory). */
+    size_t reserved = 0;
+    if (g_kd == 0) {
+        reserved = vkt_stage_room() + vkt_slot_reserve();
+        free_b -= (double)reserved;
+    }
     if (free_b < 0) free_b = 0;
     double fit = row_bytes ? free_b / 2 / (double)row_bytes : cap;
     int rows = fit >= cap ? cap : (int)fit;
@@ -3558,9 +3578,10 @@ int vkc_chunk_rows(const char *engine, size_t row_bytes) {
         snprintf(said[nsaid], sizeof said[nsaid], "%s", engine ? engine : "");
         said_d[nsaid] = g_kd; rows_said[nsaid++] = rows;
         fprintf(stderr, "[VK] %s chain: prompt chunks of up to %d rows (%.0f KiB a row; %.2f GiB free on the device%s, "
-                "half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at %d)\n",
-                engine ? engine : "engine", rows, row_bytes / 1024.0, free_b / 1073741824.0,
-                avail > 0 ? " or in RAM" : "", cap);
+                "%.2f GiB of it the tier's slots and staging, half of the rest at most; COLI_VK_CHAIN_ROWS sets it, "
+                "COLI_VK_CHAIN_ROWS_MAX caps it at %d)\n",
+                engine ? engine : "engine", rows, row_bytes / 1024.0, (free_b + (double)reserved) / 1073741824.0,
+                avail > 0 ? " or in RAM" : "", (double)reserved / 1073741824.0, cap);
     }
     return rows;
 }
@@ -3937,7 +3958,9 @@ static VkcBuf *grow_scratch(VkcBuf **slot, size_t bytes) {
 #define VKC_DSV4_PA_MB 64
 static int dsv4_pa(VkcBuf *q, VkcBuf *win, VkcBuf *cmp, VkcBuf *list, VkcBuf *prm, VkcBuf *out, const VkcDsAttn *p) {
     const char *e = getenv("COLI_VK_DSV4_PA");
-    if ((e && *e == '0') || !D4.pa || p->S < VKC_DSV4_PA_MIN || p->hd % 64 || p->H > 65535 * 64) return 0;
+    /* flags 2: the quantized mirrors' rows are the format's widths, which this pass's
+     * reader does not decode -- mode 0's does */
+    if ((e && *e == '0') || (p->flags & 2) || !D4.pa || p->S < VKC_DSV4_PA_MIN || p->hd % 64 || p->H > 65535 * 64) return 0;
     const size_t per = (size_t)p->H * p->cnt * sizeof(float);
     int R = (int)(((size_t)VKC_DSV4_PA_MB << 20) / per);
     if (R < 1) R = 1;
@@ -3968,6 +3991,7 @@ static int dsv4_pa(VkcBuf *q, VkcBuf *win, VkcBuf *cmp, VkcBuf *list, VkcBuf *pr
 int vkc_dsv4_attn(VkcBuf *q, VkcBuf *win, VkcBuf *cmp, VkcBuf *list, VkcBuf *prm, VkcBuf *out, const VkcDsAttn *p) {
     if (p->S < 1 || p->S > 65535 || p->H < 1 || p->H > 65535 || p->hd < 1 || p->hd > 1024 || p->cnt < 0 || p->cnt > 3072)
         return 0;
+    if ((p->flags & 2) && p->hd != 512) return 0;   /* the quantized row widths are the format's (528/288 B) */
     if (p->cnt == 0) return 0;
     if (dsv4_pa(q, win, cmp, list, prm, out, p)) return 1;
     VkcBind bd[6] = {B(q, 0), B(win, 0), B(cmp ? cmp : win, 0), B(list, 0), B(prm, 0), B(out, 1)};
@@ -3992,12 +4016,15 @@ int vkc_dsv4_score(VkcBuf *iq, VkcBuf *hw, VkcBuf *keys, VkcBuf *mask, VkcBuf *s
     int wide = p->IH > 64 || p->IH * p->ID > 4096;
     if (p->S < 1 || p->S > 65535 || p->IH < 1 || p->IH > 4096 || p->ID < 1 || p->ratio < 1 ||
         p->width < 0 || p->sc_row < p->width || (p->mask_row > 0 && !mask)) return 0;
+    if (p->quant && p->ID != 128) return 0;   /* the quantized index keys are the format's 68 B rows */
     if (p->width == 0) return open_frame() && !KC.lost;
     VkcBind bd[6] = {B(iq, 0), B(hw, 0), B(keys, 0), B(p->mask_row > 0 ? mask : NULL, 0), B(NULL, 0), B(sc, 1)};
     /* rows to make a tile: the scores in tiles of 16 rows x 32 candidates (mode 11, the
-     * same bits as mode 10's grid), the keys staged once a tile instead of once a row */
+     * same bits as mode 10's grid), the keys staged once a tile instead of once a row.
+     * quant: the tiles read fp32 keys (chain_dsv4_idx.comp has no codec); the grid
+     * modes' readers decode the 68 B block-sections rows */
     if (dsa_grid_on() && dsa_tiled_on() && D4I.pipe && p->ID == 128 && !(p->IH & 1) && p->S >= 16 &&
-        p->width >= VKC_DSA_GRID) {
+        p->width >= VKC_DSA_GRID && !p->quant) {
         int ok = dsv4_rec_on(D4I.pipe, PK_DSA, 11, p, sizeof *p, bd, 6, (uint32_t)((p->width + 31) / 32),
                              (uint32_t)((p->S + 15) / 16));
         if (ok) KC.st.dsa_tiled++;
@@ -4011,8 +4038,9 @@ int vkc_dsv4_score(VkcBuf *iq, VkcBuf *hw, VkcBuf *keys, VkcBuf *mask, VkcBuf *s
     return dsv4_rec(PK_DSA, wide ? 9 : 3, p, sizeof *p, bd, 6, (uint32_t)p->S, 1);
 }
 int vkc_dsv4_cand(VkcBuf *sc, VkcBuf *mask, const VkcDsCand *p) {
+    /* the mask is one bit a column: mask_row is the row's stride in words */
     if (p->S < 1 || p->S > 65535 || p->block < 1 || p->ratio < 1 || p->width < 0 ||
-        (p->width + p->block - 1) / p->block > 4096 || p->mask_row < p->width) return 0;
+        (p->width + p->block - 1) / p->block > 4096 || p->mask_row < (p->width + 31) / 32) return 0;
     VkcBind bd[7] = {B(sc, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(mask, 1)};
     return dsv4_rec(PK_DSA, 4, p, sizeof *p, bd, 7, (uint32_t)p->S, 1);
 }
@@ -4051,6 +4079,26 @@ int vkc_dsv4_swiglu(VkcBuf *a, VkcBuf *b, VkcBuf *y, const VkcDsSwiglu *p) {
     uint32_t gx, gy; grid(((uint64_t)p->n + 255) / 256, &gx, &gy);
     VkcBind bd[6] = {B(a, 0), B(b, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(y, 1)};
     return dsv4_rec(PK_EW, 8, p, sizeof *p, bd, 6, gx, gy);
+}
+/* the packed cache's pack/unpack (chain_dsv4.comp modes 13/14; c/dsv41_kvq.h the
+ * reference). The quantized rows are written as whole 32-bit words, so a pack never
+ * races; the formats' widths (528/288/68 B) are what the kinds below hardcode. */
+int vkc_dsv4_quant(VkcBuf *dst, VkcBuf *src, const VkcDsQuant *p) {
+    if (p->kind < 0 || p->kind > 2 || p->S < 0 || (p->kind == 0 && p->Wd < 1) || !dst || !src) return 0;
+    if (p->kind == 0 && (p->hd != 512 || p->Wd < 1)) return 0;
+    if (p->kind == 1 && p->hd != 512) return 0;
+    if (p->kind == 2 && p->hd != 128) return 0;
+    if (p->S == 0) return open_frame() && !KC.lost;
+    VkcBind bd[7] = {B(src, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(dst, 1)};
+    return dsv4_rec(PK_DSA, 13, p, sizeof *p, bd, 7, (uint32_t)p->S, 1);
+}
+int vkc_dsv4_dequant(VkcBuf *dst, VkcBuf *src, const VkcDsDequant *p) {
+    if (p->kind < 0 || p->kind > 2 || p->S < 0 || (p->kind == 0 && p->Wd < 1) || !dst || !src) return 0;
+    if ((p->kind == 0 || p->kind == 1) && p->n != 512) return 0;
+    if (p->kind == 2 && p->n != 128) return 0;
+    if (p->S == 0) return open_frame() && !KC.lost;
+    VkcBind bd[6] = {B(src, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(dst, 1)};
+    return dsv4_rec(PK_DSA, 14, p, sizeof *p, bd, 6, (uint32_t)p->S, 1);
 }
 
 /* ---- a KV cache split between the device and the host (chain_kvs.comp) ------------

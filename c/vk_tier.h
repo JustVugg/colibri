@@ -370,6 +370,21 @@ int  vkt_host_pairs_w(const VktHostExpert *const *hx, const float *const *xr, in
 int  vkt_host_pool_on(void);
 /* the device memory the budget left for a prompt chunk's staging (VktConfig.stage), 0 none */
 size_t vkt_stage_room(void);
+/* The device bytes the tier will still allocate after a prompt chunk is sized: the streaming
+ * slots (COLI_VK_TIER_STREAM_SLOTS experts), made at the first step that streams, long after
+ * vkc_chunk_rows read the free memory. An engine's chunk sizing reserves them, so the chunk
+ * and the slots do not fight over the same headroom. 0 without streaming, or on the second
+ * device (the slots are the primary's). */
+size_t vkt_slot_reserve(void);
+/* What the tier holds on the device now, for the engines' VRAM ledger: its experts' pool
+ * (residents and streaming slots together), the slots' share of it, the extra layers' pool,
+ * and the streaming slot count. */
+typedef struct {
+    size_t res_used, res_total; int res_blocks;   /* pool 1: residents + slots, its blocks */
+    size_t slot_bytes; int slots, slots_max;      /* the slots' bytes and count (and the cap) */
+    size_t x_used, x_total; int x_blocks;         /* pool 4: the extra layers' experts */
+} VktVram;
+void vkt_vram(VktVram *o);
 /* host[e]: 1 where layer `layer`'s expert e is in vkt_dev_table's entries from the host pool
  * (a prompt chunk stages those into VRAM: vk_dmoe.h); returns how many, -1 when off */
 int  vkt_dev_host(int layer, uint8_t *host);
@@ -389,6 +404,9 @@ size_t vkt_take_back(size_t bytes);
 #else
 static inline int vkt_host_pool_on(void){return 0;}
 static inline size_t vkt_stage_room(void){return 0;}
+static inline size_t vkt_slot_reserve(void){return 0;}
+typedef struct { size_t res_used, res_total, slot_bytes, x_used, x_total; int res_blocks, slots, slots_max, x_blocks; } VktVram;
+static inline void vkt_vram(VktVram *o){o->res_used=o->res_total=o->slot_bytes=o->x_used=o->x_total=0;o->res_blocks=o->slots=o->slots_max=o->x_blocks=0;}
 static inline int vkt_dev_host(int l,uint8_t *h){(void)l;(void)h;return -1;}
 static inline int vkt_score(int l,uint64_t *s){(void)l;(void)s;return -1;}
 static inline size_t vkt_give_back(size_t b){(void)b;return 0;}

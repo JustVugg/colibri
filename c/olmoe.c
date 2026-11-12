@@ -2953,8 +2953,8 @@ static int olm_ps_parts(Model *m, ColiPsPart *parts) {
     Cfg *c = &m->c; const size_t row = (size_t)c->head_dim * sizeof(float), hs = (size_t)m->max_t * row;
     int n = 0;
     for (int i = 0; i < c->n_layers; i++) {
-        parts[n++] = (ColiPsPart){m->K[i], row, m->max_t, c->n_heads, hs, 1};
-        parts[n++] = (ColiPsPart){m->V[i], row, m->max_t, c->n_heads, hs, 1};
+        parts[n++] = (ColiPsPart){m->K[i], row, m->max_t, c->n_heads, hs, 1, 0};
+        parts[n++] = (ColiPsPart){m->V[i], row, m->max_t, c->n_heads, hs, 1, 0};
     }
     return n;
 }

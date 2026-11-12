@@ -7657,8 +7657,8 @@ static int q36_ps_parts(const Model *m, ColiPsPart *parts) {
     for (int i = 0; i < c->n_layers; i++) {
         if (!c->is_attn[i] || q36_ps_ring(m, i) || !m->K[i] || !m->V[i]) continue;
         const int R = q36_kv_rows(m, i);
-        parts[n++] = (ColiPsPart){m->K[i], row, R, c->kv_heads, (size_t)R * row, 1};
-        parts[n++] = (ColiPsPart){m->V[i], row, R, c->kv_heads, (size_t)R * row, 1};
+        parts[n++] = (ColiPsPart){m->K[i], row, R, c->kv_heads, (size_t)R * row, 1, 0};
+        parts[n++] = (ColiPsPart){m->V[i], row, R, c->kv_heads, (size_t)R * row, 1, 0};
     }
     return n;
 }

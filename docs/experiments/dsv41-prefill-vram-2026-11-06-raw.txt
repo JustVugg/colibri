@@ -1,0 +1,362 @@
+dsv41 prefill VRAM — raw evidence for dsv41-prefill-vram-2026-11-06.md
+=====================================================================
+
+Everything below is copied from a run's stdout/stderr or from the planner itself.
+The record (dsv41-prefill-vram-2026-11-06.md) is the analysis; this file is what it
+quoted. Where a number in the record is arithmetic rather than a copied line, the
+record says so and the formula is given there.
+
+Machine for every run in this file: Intel Core i9-12900K, 18 logical CPUs visible to
+the engine, 38 GiB RAM, one NVMe (f2fs), RADV (Vulkan 1.4.354) on an AMD Radeon
+RX 6900 XT 16 GiB with ReBAR, Arch Linux kernel 7.1.11, every run with the desktop
+compositor holding 2.5-3.5 GiB of the card. Model: deepseek-ai/DeepSeek-V4.1-Flash-1017
+(the released checkpoint, 48 shards, 510.3 GB, fp8 dense + fp4 experts, no conversion).
+Serve command, unless stated: COLI_VULKAN=1 V41_STATS=1 ./c/coli serve
+--model /root/Models/DeepSeek-V4.1-Flash-1017 --ram 28 --ctx <ctx> --host 127.0.0.1
+--port <port>, with the prompts of prefill-vram.py (the short one is 7-11 tokens; the
+"2600 words" one is 3107 tokens).
+
+Run tags used below are the scratch file names in the repository root:
+vram-c1-128k-short.{log,out,csv}, vram-c2-256k-short.{log,out,csv},
+vram-r1-base-a2.log, vram-r2-a1{e}.log, vram-r2-new-a2.log, vram-r3-ch256.log,
+vram-r4-tiergb2.log, vram-a3-16k-ch256.log. The .csv files are the 50 Hz sysfs VRAM
+samples (100 KB-2 MB each, ~1M rows for the two 24-minute arms); they are not
+committed — the tags above name them, and prefill-vram.py reproduces them.
+
+
+1. The RAM plan at long context, before and after the fix
+--------------------------------------------------------
+Python only, no serve: cap_for_arch() is the function `coli serve` calls to get the RAM
+expert cache's slot count, and it raises for deepseek_v41 when the plan holds no slot.
+Both arms ran against the same checkpoint and the same environment:
+
+  COLI_VULKAN=1 python3 - <<'PY'
+  import sys; sys.path.insert(0, "/root/Projects/colibri/c")
+  from openai_server import cap_for_arch
+  MODEL = "/root/Models/DeepSeek-V4.1-Flash-1017"
+  for ctx in (8192, 16384, 32768, 65536, 131072, 262144):
+      try:
+          print(f"ctx {ctx}: {cap_for_arch('deepseek_v41', None, {'RAM_GB': '28', 'CTX': str(ctx)}, MODEL)} slots/layer")
+      except Exception as e:
+          print(f"ctx {ctx}: {type(e).__name__}: {e}")
+  PY
+
+--- family_registry.py as 008a01bc's parent (05e2c6d7) priced it ---
+ctx 8192: 20 slots/layer
+ctx 16384: 18 slots/layer
+ctx 32768: 14 slots/layer
+ctx 65536: 5 slots/layer
+ctx 131072: ValueError: DeepSeek V4.1 Flash RAM budget cannot hold one expert slot per layer
+ctx 262144: ValueError: DeepSeek V4.1 Flash RAM budget cannot hold one expert slot per layer
+
+--- the merged tree (95083279) ---
+[v41] RAM plan: 21 expert cache slots/layer; --cap overrides        (the print inside cap_for_arch, 131072)
+[v41] RAM plan: 20 expert cache slots/layer; --cap overrides        (262144)
+[v41] RAM plan: 22 expert cache slots/layer; --cap overrides        (8192, 16384, 32768)
+[v41] RAM plan: 21 expert cache slots/layer; --cap overrides        (65536)
+ctx 8192: 22 slots/layer
+ctx 16384: 22 slots/layer
+ctx 32768: 22 slots/layer
+ctx 65536: 21 slots/layer
+ctx 131072: 21 slots/layer
+ctx 262144: 20 slots/layer
+
+The workspace term the two arms price (family_registry.py, _dsv41_geometry), from the
+checkpoint's hc_mult 4 and hidden 5120: 200.0 KiB a row of context, i.e. 3.125 GiB at
+16384, 25.0 GiB at 131072, 50.0 GiB at 262144 before; min(ctx, the 1280-row chunk) =
+250.0 MiB after.
+
+
+2. The 128K serve (vram-c1-128k-short.log)
+-----------------------------------------
+prefill-vram.py --ctx 131072 --turns 1 --tag vram-c1-128k-short --port 8031
+(1 turn, short prompt, max_tokens 4, temperature 0, stream)
+
+[v41] RAM plan: 21 expert cache slots/layer; --cap overrides
+[VK] ready: AMD Radeon RX 6900 XT (RADV NAVI21), compute qfam 0, memtype 3, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096
+[VK] deepseek_v41: dense chain on (a discrete GPU, beside the expert tier)
+[VK] deepseek_v41 chain fit: free 13529948160 B, reserve 1073741824 B, fixed 956867584 B (the engine's 470328320 B, the pools' 486539264 B), tail 1481124096 B, layers 187809752 364920792 205491672 187809752 187809752 187809752 187809752 187809752 205491672 187809752 187809752 187809752 187809752 187809752 382602712 187809752 187809752 187809752 187809752 187809752 200887512 187809752 187809752 187809752 194035928 187809752 187809752 187809752 194035928 187809752 187809752 187809752 194035928 187809752 187809752 187809752 194035928 187809752 187809752 187809752 B, matrices 186187784 363134984 203030552 186187784 186187784 186187784 186187784 186187784 203030552 186187784 186187784 186187784 186187784 186187784 379977752 186187784 186187784 186187784 186187784 186187784 197787668 186187784 186187784 186187784 192413708 186187784 186187784 186187784 192413708 186187784 186187784 186187784 192413708 186187784 186187784 186187784 192413708 186187784 186187784 186187784 B
+[VK] deepseek_v41 chain: 40 of 40 layers on the device (7.41 GiB), 0 on the CPU (free 12.60 GiB, reserve 1.00 GiB)
+[VK] deepseek_v41: dense weights on the device only (a discrete GPU with room for them: 6.40 of 11.60 GiB free; COLI_VK_DENSE_HOST=1 keeps the host copy)
+[v41] 40 layers, 384 experts/layer (6 routed), dim 5120, hc 4, window 128, engram on — loaded in 9.58s
+[VK] deepseek_v41: 349 dense matrices on the device only, 6.40 GiB of host RAM given back; kept on the host: the embedding, the head, the router, norms and mixers, DSpark's stages, the vision tower; RSS now 5.397 GiB
+[VK] deepseek_v41 chain: 40 layers on the device (4 compressing, 8 indexing, 2 engram), 4 streams, 2.2 MiB of parameters, 429 matrices (7523.0 MiB) on the device
+[VK] deepseek_v41 chain: 40 of 40 layers placed: 7888437644 B of matrices on the device (the fit counted 7888437644 B for these layers), chain buffers 58929856 B, device memory held 8187281408 B
+[VK] memory: mapped weights, the host-visible device-local memory gave the 4 GiB asked (its heap less the trunk's 7.62 GiB and the 1.00 GiB free reserve, less if its budget leaves less), found in 0.1 s
+[VK] tier deepseek_v41: on, AMD Radeon RX 6900 XT (RADV NAVI21), budget 2.59 GiB = 68 experts of 21.1 MiB (fmt 7 gs 32, down fmt 7 gs 32), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 48 slots; the extra layers' experts (3, fmt 7): 8 of 21.1 MiB in a pool of 168.8 MiB
+[VK] tier deepseek_v41: host pool off, the tier inside the mapped window beside the trunk; the experts it leaves come from the engine's RAM cache (COLI_VK_TIER_HOST=1 or COLI_VK_TIER_HOST_GB turns it on)
+[VK] tier deepseek_v41: warm start, 68 experts in 0.3s (68 from the history, 0 more to fill the device)
+OpenAI-compatible API listening on http://127.0.0.1:8031/v1
+[VK] deepseek_v41 chain: prompt chunks of up to 768 rows (1293 KiB a row; 3.46 GiB free on the device or in RAM, 0.99 GiB of it the tier's slots and staging, half of the rest at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+[v41] expert I/O: 1946 misses, 36586.0 MB in 13.26s (2.76 GB/s); prefill 27618.1 MB, disk 9.95s, matmul 1.93s, wall 12.99s
+[v41] DSpark: 2 of 2 drafts accepted this turn (2 written)
+[v41] DSpark gate: T(1) 1384.4 ms, rows 3:2.14, rho 0.53, acceptance by position 0.87 0.73 0.50 0.50 0.50; 0 rounds took a plain step
+[VK] tier deepseek_v41 turn: device 191 of 3645 routed experts (5.2%; this turn 191 of 3645) | CPU RAM hits 1508, disk loads 1946 | resident 68 (budget 68, 1.40 GiB of 2.59 GiB, 6 blocks, frag 0.21) | uploads 87 (1.43 GiB, 68 warm), evictions 11, skipped 0 queue + 0 rate, failed 0 | device 9.7 ms, CPU share 7923.9 ms, waited 0.8 ms (92% of device time hidden) | balance: device share 1.00, 0 rows handed to the CPU | extra layers (3): 0 of 45 routed experts on the device, resident 8 (budget 8) | exclusive: 4 RAM copies of device experts given up first
+[VK] deepseek_v41 chain: 3 forwards, 326 frames (3520 ops, 1167 matmuls, 297 tiled GEMM), 677.5 ms waiting for the device, 16029.0 ms of routed experts on the host, 75.4 MiB on the device
+[VK] deepseek_v41 vram: weights 9710.5 MiB in 34 blocks (9608.2 MiB of rows in 521 tensors) | chain 75.4 MiB (dev 64.0 in 1 blocks, down 64.0 in 1, up 64.0 in 1) | tier resident 1434.4 MiB + 0 slots 0.0 MiB = 1434.4 of 1536.0 in 6 blocks | extra layers 168.8 in 1 blocks | kv mirror 50.6 MiB | process 11.28 GiB of 11.34 GiB in pools (0.0 MiB outside) | device 14.67 GiB used of 15.98 (card2)
+[VK] deepseek_v41: 217 matmuls on the GPU
+[VK] deepseek_v41: 521 resident matrices on the device, 9608.2 MiB (fp8 as fmt 12, bf16 as fmt 11)
+[VK] deepseek_v41 chain: 3 forwards, 326 frames (3520 ops, 1167 matmuls, 297 tiled GEMM), 677.5 ms waiting for the device, 16029.0 ms of routed experts on the host, 75.4 MiB on the device
+[VK] deepseek_v41: dense weights at exit: 349 matrices on the device only (6.40 GiB of host copies dropped), 0 read back from disk for the CPU (0.0 MiB); RSS 20.364 GiB
+
+Harness summary (vram-c1.out):
+{
+ "tag": "vram-c1-128k-short",
+ "ctx": 131072,
+ "words": 0,
+ "env": [],
+ "peak_proc_vram_gib": 0.0,
+ "peak_sys_vram_gib": 14.669,
+ "base_sys_gib": 12.52,
+ "turns": [
+  {
+   "usage": null,
+   "streamed": 4,
+   "t0": 55070.778710585,
+   "ttft_s": 13.04,
+   "wall_s": 17.93,
+   "prompt_chars": 37
+  }
+ ],
+ "events": [
+  [
+   2.0,
+   "turn0"
+  ],
+  [
+   2.0,
+   "req"
+  ],
+  [
+   15.042,
+   "first"
+  ],
+  [
+   19.926,
+   "done"
+  ]
+ ]
+}
+
+
+3. The 256K serve (vram-c2-256k-short.log)
+-----------------------------------------
+prefill-vram.py --ctx 262144 --turns 1 --tag vram-c2-256k-short --port 8032
+(1 turn, short prompt, max_tokens 4, temperature 0, stream)
+
+[v41] RAM plan: 20 expert cache slots/layer; --cap overrides
+[VK] ready: AMD Radeon RX 6900 XT (RADV NAVI21), compute qfam 0, memtype 3, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096
+[VK] deepseek_v41: dense chain on (a discrete GPU, beside the expert tier)
+[VK] deepseek_v41 chain fit: free 13529948160 B, reserve 1073741824 B, fixed 956867584 B (the engine's 470328320 B, the pools' 486539264 B), tail 1481124096 B, layers 187809752 364920792 205491672 187809752 187809752 187809752 187809752 187809752 205491672 187809752 187809752 187809752 187809752 187809752 382602712 187809752 187809752 187809752 187809752 187809752 200887512 187809752 187809752 187809752 194035928 187809752 187809752 187809752 194035928 187809752 187809752 187809752 194035928 187809752 187809752 187809752 194035928 187809752 187809752 187809752 B, matrices 186187784 363134984 203030552 186187784 186187784 186187784 186187784 186187784 203030552 186187784 186187784 186187784 186187784 186187784 379977752 186187784 186187784 186187784 186187784 186187784 197787668 186187784 186187784 186187784 192413708 186187784 186187784 186187784 192413708 186187784 186187784 186187784 192413708 186187784 186187784 186187784 192413708 186187784 186187784 186187784 B
+[VK] deepseek_v41 chain: 40 of 40 layers on the device (7.41 GiB), 0 on the CPU (free 12.60 GiB, reserve 1.00 GiB)
+[VK] deepseek_v41: dense weights on the device only (a discrete GPU with room for them: 6.40 of 11.60 GiB free; COLI_VK_DENSE_HOST=1 keeps the host copy)
+[v41] 40 layers, 384 experts/layer (6 routed), dim 5120, hc 4, window 128, engram on — loaded in 10.40s
+[VK] deepseek_v41: 349 dense matrices on the device only, 6.40 GiB of host RAM given back; kept on the host: the embedding, the head, the router, norms and mixers, DSpark's stages, the vision tower; RSS now 6.342 GiB
+[VK] deepseek_v41 chain: 40 layers on the device (4 compressing, 8 indexing, 2 engram), 4 streams, 2.2 MiB of parameters, 429 matrices (7523.0 MiB) on the device
+[VK] deepseek_v41 chain: 40 of 40 layers placed: 7888437644 B of matrices on the device (the fit counted 7888437644 B for these layers), chain buffers 58929856 B, device memory held 8187281408 B
+[VK] memory: mapped weights, the host-visible device-local memory gave the 4 GiB asked (its heap less the trunk's 7.62 GiB and the 1.00 GiB free reserve, less if its budget leaves less), found in 0.1 s
+[VK] tier deepseek_v41: on, AMD Radeon RX 6900 XT (RADV NAVI21), budget 2.59 GiB = 68 experts of 21.1 MiB (fmt 7 gs 32, down fmt 7 gs 32), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 48 slots; the extra layers' experts (3, fmt 7): 8 of 21.1 MiB in a pool of 168.8 MiB
+[VK] tier deepseek_v41: host pool off, the tier inside the mapped window beside the trunk; the experts it leaves come from the engine's RAM cache (COLI_VK_TIER_HOST=1 or COLI_VK_TIER_HOST_GB turns it on)
+[VK] tier deepseek_v41: warm start, 68 experts in 0.3s (68 from the history, 0 more to fill the device)
+OpenAI-compatible API listening on http://127.0.0.1:8032/v1
+[VK] deepseek_v41 chain: prompt chunks of up to 768 rows (1293 KiB a row; 3.46 GiB free on the device or in RAM, 0.99 GiB of it the tier's slots and staging, half of the rest at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+[v41] expert I/O: 1956 misses, 36774.1 MB in 13.45s (2.74 GB/s); prefill 27618.1 MB, disk 10.07s, matmul 1.96s, wall 13.12s
+[v41] DSpark: 2 of 2 drafts accepted this turn (2 written)
+[v41] DSpark gate: T(1) 1411.8 ms, rows 3:2.12, rho 0.53, acceptance by position 0.87 0.73 0.50 0.50 0.50; 0 rounds took a plain step
+[VK] tier deepseek_v41 turn: device 191 of 3645 routed experts (5.2%; this turn 191 of 3645) | CPU RAM hits 1498, disk loads 1956 | resident 68 (budget 68, 1.40 GiB of 2.59 GiB, 6 blocks, frag 0.21) | uploads 87 (1.43 GiB, 68 warm), evictions 11, skipped 0 queue + 0 rate, failed 0 | device 9.8 ms, CPU share 8075.6 ms, waited 0.8 ms (92% of device time hidden) | balance: device share 1.00, 0 rows handed to the CPU | extra layers (3): 0 of 45 routed experts on the device, resident 8 (budget 8) | exclusive: 4 RAM copies of device experts given up first
+[VK] deepseek_v41 chain: 3 forwards, 326 frames (3520 ops, 1167 matmuls, 297 tiled GEMM), 678.1 ms waiting for the device, 16229.4 ms of routed experts on the host, 75.4 MiB on the device
+[VK] deepseek_v41 vram: weights 9710.5 MiB in 34 blocks (9608.2 MiB of rows in 521 tensors) | chain 75.4 MiB (dev 64.0 in 1 blocks, down 64.0 in 1, up 64.0 in 1) | tier resident 1434.4 MiB + 0 slots 0.0 MiB = 1434.4 of 1536.0 in 6 blocks | extra layers 168.8 in 1 blocks | kv mirror 50.6 MiB | process 11.28 GiB of 11.34 GiB in pools (0.0 MiB outside) | device 14.67 GiB used of 15.98 (card2)
+[VK] deepseek_v41: 217 matmuls on the GPU
+[VK] deepseek_v41: 521 resident matrices on the device, 9608.2 MiB (fp8 as fmt 12, bf16 as fmt 11)
+[VK] deepseek_v41 chain: 3 forwards, 326 frames (3520 ops, 1167 matmuls, 297 tiled GEMM), 678.1 ms waiting for the device, 16229.4 ms of routed experts on the host, 75.4 MiB on the device
+
+Harness summary (vram-c2.out):
+{
+ "tag": "vram-c2-256k-short",
+ "ctx": 262144,
+ "words": 0,
+ "env": [],
+ "peak_proc_vram_gib": 0.0,
+ "peak_sys_vram_gib": 14.669,
+ "base_sys_gib": 12.52,
+ "turns": [
+  {
+   "usage": null,
+   "streamed": 4,
+   "t0": 55195.249728393,
+   "ttft_s": 13.17,
+   "wall_s": 18.12,
+   "prompt_chars": 37
+  }
+ ],
+ "events": [
+  [
+   2.0,
+   "turn0"
+  ],
+  [
+   2.0,
+   "req"
+  ],
+  [
+   15.172,
+   "first"
+  ],
+  [
+   20.121,
+   "done"
+  ]
+ ]
+}
+
+
+4. Wave 2a: the ledger, the 48 slots and the chunk reserve (c615cca4)
+--------------------------------------------------------------------
+(a) vram-r1-base-a2.log -- the baseline arm (05e2c6d7 + the ledger being written):
+    2 turns, the 2600-word prompt, no slot reserve, the chunk still 1280 rows. The
+    ledger line does not exist in this arm; the numbers the record compares are the
+    "prompt chunks" line, the turn lines and the chain footprint.
+
+
+
+
+[v41] RAM plan: 18 expert cache slots/layer; --cap overrides
+[VK] tier deepseek_v41: on, AMD Radeon RX 6900 XT (RADV NAVI21), budget 3.46 GiB = 91 experts of 21.1 MiB (fmt 7 gs 32, down fmt 7 gs 32), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots; the extra layers' experts (3, fmt 7): 11 of 21.1 MiB in a pool of 232.0 MiB
+[VK] deepseek_v41 chain: prompt chunks of up to 1280 rows (1317 KiB a row; 3.84 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+[v41] expert I/O: 21339 misses, 401186.9 MB in 146.91s (2.73 GB/s); prefill 389229.6 MB, disk 142.55s, matmul 48.96s, wall 289.95s
+[VK] tier deepseek_v41 turn: device 687713 of 746685 routed experts (92.1%; this turn 687713 of 746685) | CPU RAM hits 47411, disk loads 21339 | resident 91 (budget 91, 3.19 GiB of 3.46 GiB, 13 blocks, frag 0.02) | uploads 102 (1.68 GiB, 91 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | device 7329.8 ms, CPU share 127754.3 ms, waited 3254.1 ms (56% of device time hidden) | balance: device share 1.00, 0 rows handed to the CPU | extra layers (3): 0 of 45 routed experts on the device, resident 11 (budget 11) | exclusive: 0 RAM copies of device experts given up first | stream: 120 steps, 9100 cold experts (201.42 GiB, 10.06 GB/s) and 553434 rows streamed in 575 sub-batches, prefetched 6994 (6316 used), 10947 cold experts (58101 rows) kept on the CPU
+[VK] deepseek_v41 chain: 3 forwards, 528 frames (5876 ops, 1945 matmuls, 1167 tiled GEMM), 66623.8 ms waiting for the device, 164719.5 ms of routed experts on the host, 1765.7 MiB on the device
+[v41] expert I/O: 21286 misses, 400190.4 MB in 146.44s (2.73 GB/s); prefill 388646.8 MB, disk 142.11s, matmul 48.66s, wall 289.19s
+[VK] tier deepseek_v41 turn: device 1375447 of 1493370 routed experts (92.1%; this turn 687734 of 746685) | CPU RAM hits 47523, disk loads 21286 | resident 91 (budget 91, 3.19 GiB of 3.46 GiB, 13 blocks, frag 0.02) | uploads 102 (1.68 GiB, 91 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | device 14720.0 ms, CPU share 255526.1 ms, waited 6433.1 ms (56% of device time hidden) | balance: device share 1.00, 0 rows handed to the CPU | extra layers (3): 21 of 90 routed experts on the device, resident 11 (budget 11) | exclusive: 0 RAM copies of device experts given up first | stream: 240 steps, 18200 cold experts (404.49 GiB, 10.07 GB/s) and 1106868 rows streamed in 1139 sub-batches, prefetched 14020 (12584 used), 21894 cold experts (116202 rows) kept on the CPU
+[VK] deepseek_v41 chain: 6 forwards, 933 frames (11752 ops, 3890 matmuls, 2334 tiled GEMM), 134138.5 ms waiting for the device, 329752.0 ms of routed experts on the host, 2133.7 MiB on the device
+[VK] deepseek_v41 chain: 6 forwards, 933 frames (11752 ops, 3890 matmuls, 2334 tiled GEMM), 134138.5 ms waiting for the device, 329752.0 ms of routed experts on the host, 2133.7 MiB on the device
+
+
+(b) vram-r2-new-a2.log -- the same prompt with the 48-slot reservation taken out of
+    the free memory before the chunk is sized: chain 2133.7 -> 2060.0 MiB at the turn
+    boundary, prefill 289.95 -> 295.60 s, the tier 3269.5 of 3310.9 MiB in 13 blocks
+    with 48 slots at 1012.5 MiB.
+
+
+
+
+[v41] RAM plan: 18 expert cache slots/layer; --cap overrides
+[VK] tier deepseek_v41: on, AMD Radeon RX 6900 XT (RADV NAVI21), budget 3.46 GiB = 107 experts of 21.1 MiB (fmt 7 gs 32, down fmt 7 gs 32), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 48 slots; the extra layers' experts (3, fmt 7): 11 of 21.1 MiB in a pool of 232.0 MiB
+[VK] deepseek_v41 chain: prompt chunks of up to 1024 rows (1317 KiB a row; 3.59 GiB free on the device or in RAM, 0.99 GiB of it the tier's slots and staging, half of the rest at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+[v41] expert I/O: 23868 misses, 448733.7 MB in 164.22s (2.73 GB/s); prefill 437208.9 MB, disk 160.01s, matmul 6.94s, wall 295.60s
+[VK] tier deepseek_v41 turn: device 741748 of 746685 routed experts (99.3%; this turn 741748 of 746685) | CPU RAM hits 248, disk loads 23868 | resident 107 (budget 107, 3.19 GiB of 3.46 GiB, 13 blocks, frag 0.19) | uploads 119 (1.96 GiB, 107 warm), evictions 1, skipped 0 queue + 0 rate, failed 0 | device 11496.9 ms, CPU share 38837.4 ms, waited 3657.0 ms (68% of device time hidden) | balance: device share 1.00, 0 rows handed to the CPU | extra layers (3): 0 of 45 routed experts on the device, resident 11 (budget 11) | exclusive: 1 RAM copies of device experts given up first | stream: 160 steps, 18959 cold experts (395.08 GiB, 9.95 GB/s) and 592249 rows streamed in 1047 sub-batches, prefetched 6719 (6499 used), 4079 cold experts (4079 rows) kept on the CPU
+[VK] deepseek_v41 chain: 3 forwards, 609 frames (7074 ops, 2334 matmuls, 1465 tiled GEMM), 74959.6 ms waiting for the device, 164037.9 ms of routed experts on the host, 1613.0 MiB on the device
+[VK] deepseek_v41 vram: chain 1613.0 MiB (dev 900.0 MiB in 11 blocks, down 208.0 in 3, up 576.0 in 6) | tier resident 2257.0 MiB, 48 slots 1012.5 MiB, together 3269.5 of 3310.9 MiB in 13 blocks | extra layers 232.0 in 1 blocks | kv mirror 115.0 MiB | weights 9710.5 MiB | process 14.87 GiB of 14.59 GiB (290.5 MiB outside the pools) | device 15.66 GiB used of 15.98 (card2
+[v41] expert I/O: 23858 misses, 448545.7 MB in 164.16s (2.73 GB/s); prefill 437453.3 MB, disk 160.11s, matmul 6.90s, wall 294.85s
+[VK] tier deepseek_v41 turn: device 1483518 of 1493370 routed experts (99.3%; this turn 741770 of 746685) | CPU RAM hits 336, disk loads 23858 | resident 107 (budget 107, 3.19 GiB of 3.46 GiB, 13 blocks, frag 0.19) | uploads 119 (1.96 GiB, 107 warm), evictions 1, skipped 0 queue + 0 rate, failed 0 | device 23280.3 ms, CPU share 77663.9 ms, waited 7179.4 ms (69% of device time hidden) | balance: device share 1.00, 0 rows handed to the CPU | extra layers (3): 21 of 90 routed experts on the device, resident 11 (budget 11) | exclusive: 1 RAM copies of device experts given up first | stream: 320 steps, 37918 cold experts (792.21 GiB, 9.94 GB/s) and 1184583 rows streamed in 2082 sub-batches, prefetched 13438 (12898 used), 8158 cold experts (8158 rows) kept on the CPU
+[VK] deepseek_v41 chain: 6 forwards, 1095 frames (14148 ops, 4668 matmuls, 2930 tiled GEMM), 150375.6 ms waiting for the device, 328712.9 ms of routed experts on the host, 2060.0 MiB on the device
+[VK] deepseek_v41 vram: chain 2060.0 MiB (dev 900.0 MiB in 11 blocks, down 208.0 in 3, up 1024.0 in 10) | tier resident 2257.0 MiB, 48 slots 1012.5 MiB, together 3269.5 of 3310.9 MiB in 13 blocks | extra layers 232.0 in 1 blocks | kv mirror 115.0 MiB | weights 9710.5 MiB | process 15.31 GiB of 15.02 GiB (290.5 MiB outside the pools) | device 15.91 GiB used of 15.98 (card2
+[VK] deepseek_v41 chain: 6 forwards, 1095 frames (14148 ops, 4668 matmuls, 2930 tiled GEMM), 150375.6 ms waiting for the device, 328712.9 ms of routed experts on the host, 2060.0 MiB on the device
+
+
+(c) vram-r2-a1e.log -- the short prompt, the ledger closing: the 2.14 GiB the audit
+    could not attribute, item by item. (vram-r2-a1.log and vram-r2-a1b.log are two
+    earlier runs of the same arm with the ledger's print still moving; vram-r2-a1c.log
+    is a run whose ledger line
+    was still wrong -- "tier resident 2257.0 MiB + 1 slots 0.0 MiB = 0.0 of 2257.0 in 0
+    blocks" -- and it is not quoted.)
+
+
+
+
+[v41] RAM plan: 18 expert cache slots/layer; --cap overrides
+[VK] tier deepseek_v41: on, AMD Radeon RX 6900 XT (RADV NAVI21), budget 3.46 GiB = 107 experts of 21.1 MiB (fmt 7 gs 32, down fmt 7 gs 32), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 48 slots; the extra layers' experts (3, fmt 7): 11 of 21.1 MiB in a pool of 232.0 MiB
+[VK] deepseek_v41 chain: prompt chunks of up to 1024 rows (1293 KiB a row; 3.59 GiB free on the device or in RAM, 0.99 GiB of it the tier's slots and staging, half of the rest at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+[v41] expert I/O: 1961 misses, 36868.1 MB in 22.98s (1.60 GB/s); prefill 27223.3 MB, disk 17.54s, matmul 3.35s, wall 21.99s
+[VK] tier deepseek_v41 turn: device 272 of 3645 routed experts (7.5%; this turn 272 of 3645) | CPU RAM hits 1412, disk loads 1961 | resident 107 (budget 107, 2.20 GiB of 3.46 GiB, 9 blocks, frag 0.46) | uploads 129 (2.13 GiB, 107 warm), evictions 11, skipped 0 queue + 0 rate, failed 0 | device 13.6 ms, CPU share 20245.1 ms, waited 1.3 ms (90% of device time hidden) | balance: device share 1.00, 0 rows handed to the CPU | extra layers (3): 0 of 45 routed experts on the device, resident 11 (budget 11) | exclusive: 1 RAM copies of device experts given up first
+[VK] deepseek_v41 chain: 3 forwards, 326 frames (3520 ops, 1167 matmuls, 297 tiled GEMM), 678.7 ms waiting for the device, 27867.3 ms of routed experts on the host, 75.4 MiB on the device
+[VK] deepseek_v41 vram: weights 9710.5 MiB in 34 blocks (9608.2 MiB of rows in 521 tensors) | chain 75.4 MiB (dev 64.0 in 1 blocks, down 64.0 in 1, up 64.0 in 1) | tier resident 2257.0 MiB + 0 slots 0.0 MiB = 2257.0 of 2304.0 in 9 blocks | extra layers 232.0 in 1 blocks | kv mirror 50.6 MiB | process 12.09 GiB of 12.15 GiB in pools (0.0 MiB outside) | device 14.58 GiB used of 15.98 (card2)
+[VK] deepseek_v41 chain: 3 forwards, 326 frames (3520 ops, 1167 matmuls, 297 tiled GEMM), 678.7 ms waiting for the device, 27867.3 ms of routed experts on the host, 75.4 MiB on the device
+
+
+(d) vram-r4-tiergb2.log -- COLI_VK_TIER_GB=2.0, the same prompt: the engine holds
+    1.46 GiB less and the card 0.19 GiB less, the desktop taking 1.27 GiB of it.
+
+
+
+
+[v41] RAM plan: 18 expert cache slots/layer; --cap overrides
+[VK] tier deepseek_v41: on, AMD Radeon RX 6900 XT (RADV NAVI21), budget 2.00 GiB = 45 experts of 21.1 MiB (fmt 7 gs 32, down fmt 7 gs 32), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 45 slots; the extra layers' experts (3, fmt 7): 6 of 21.1 MiB in a pool of 126.6 MiB
+[VK] deepseek_v41 chain: prompt chunks of up to 1024 rows (1317 KiB a row; 3.95 GiB free on the device or in RAM, 0.93 GiB of it the tier's slots and staging, half of the rest at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+[v41] expert I/O: 24115 misses, 453377.4 MB in 164.80s (2.75 GB/s); prefill 441232.2 MB, disk 160.38s, matmul 3.78s, wall 293.60s
+[VK] tier deepseek_v41 turn: device 741686 of 746685 routed experts (99.3%; this turn 741686 of 746685) | CPU RAM hits 277, disk loads 24115 | resident 45 (budget 45, 1.85 GiB of 2.00 GiB, 8 blocks, frag 0.02) | uploads 51 (860.6 MiB, 45 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | device 11497.0 ms, CPU share 33954.2 ms, waited 3460.6 ms (70% of device time hidden) | balance: device share 1.00, 0 rows handed to the CPU | extra layers (3): 0 of 45 routed experts on the device, resident 6 (budget 6) | exclusive: 0 RAM copies of device experts given up first | stream: 160 steps, 19207 cold experts (399.48 GiB, 10.45 GB/s) and 660133 rows streamed in 1110 sub-batches, prefetched 6421 (6235 used), 4079 cold experts (4079 rows) kept on the CPU
+[VK] deepseek_v41 chain: 3 forwards, 609 frames (7074 ops, 2334 matmuls, 1465 tiled GEMM), 78403.8 ms waiting for the device, 161300.7 ms of routed experts on the host, 1613.0 MiB on the device
+[VK] deepseek_v41 vram: weights 9710.5 MiB in 34 blocks (9608.2 MiB of rows in 521 tensors) | chain 1613.0 MiB (dev 900.0 in 11 blocks, down 208.0 in 3, up 576.0 in 6) | tier resident 949.2 MiB + 45 slots 949.2 MiB = 1898.4 of 1921.4 in 8 blocks | extra layers 126.6 in 1 blocks | kv mirror 115.0 MiB | process 13.41 GiB of 13.13 GiB in pools (290.5 MiB outside) | device 15.34 GiB used of 15.98 (card2)
+[v41] expert I/O: 24081 misses, 452738.2 MB in 165.09s (2.74 GB/s); prefill 441006.6 MB, disk 160.83s, matmul 3.79s, wall 293.58s
+[VK] tier deepseek_v41 turn: device 1483383 of 1493370 routed experts (99.3%; this turn 741697 of 746685) | CPU RAM hits 395, disk loads 24081 | resident 45 (budget 45, 1.85 GiB of 2.00 GiB, 8 blocks, frag 0.02) | uploads 51 (860.6 MiB, 45 warm), evictions 0, skipped 0 queue + 0 rate, failed 0 | device 23321.9 ms, CPU share 67950.1 ms, waited 6850.9 ms (71% of device time hidden) | balance: device share 1.00, 0 rows handed to the CPU | extra layers (3): 11 of 90 routed experts on the device, resident 6 (budget 6) | exclusive: 0 RAM copies of device experts given up first | stream: 320 steps, 38414 cold experts (800.92 GiB, 10.45 GB/s) and 1320266 rows streamed in 2207 sub-batches, prefetched 12842 (12375 used), 8158 cold experts (8158 rows) kept on the CPU
+[VK] deepseek_v41 chain: 6 forwards, 1095 frames (14148 ops, 4668 matmuls, 2930 tiled GEMM), 157547.8 ms waiting for the device, 323957.2 ms of routed experts on the host, 2060.0 MiB on the device
+[VK] deepseek_v41 vram: weights 9710.5 MiB in 34 blocks (9608.2 MiB of rows in 521 tensors) | chain 2060.0 MiB (dev 900.0 in 11 blocks, down 208.0 in 3, up 1024.0 in 10) | tier resident 949.2 MiB + 45 slots 949.2 MiB = 1898.4 of 1921.4 in 8 blocks | extra layers 126.6 in 1 blocks | kv mirror 115.0 MiB | process 13.85 GiB of 13.56 GiB in pools (290.5 MiB outside) | device 15.72 GiB used of 15.98 (card2)
+[VK] deepseek_v41 chain: 6 forwards, 1095 frames (14148 ops, 4668 matmuls, 2930 tiled GEMM), 157547.8 ms waiting for the device, 323957.2 ms of routed experts on the host, 2060.0 MiB on the device
+
+
+5. Wave 2b: the streaming threshold at 2 rows (c615cca4) and the tiny-budget pool (90959d61)
+--------------------------------------------------------------------------------------------
+(a) vram-a3-16k-ch256.log -- chunk 256, the threshold at its old 16 rows: what the
+    engine printed every step ("the GEMM's 16 rows: the upload and the CPU's rows not
+    measured yet") and what the turn cost.
+[VK] tier deepseek_v41 stream: a step of 256 rows; cold experts with 16 rows or more go to the device (the GEMM's 16 rows: the upload and the CPU's rows not measured yet); layer 0: 3 resident, 18 streamed (0 of them copied from the host pool), 134 kept on the CPU (702 rows)
+[VK] tier deepseek_v41 stream: a step of 256 rows; cold experts with 16 rows or more go to the device (an upload of 21.1 MiB at 10.1 GB/s takes 2.198 ms, the CPU 2.5192 ms a row; the GEMM from 16 rows); layer 0: 3 resident, 20 streamed (0 of them copied from the host pool), 105 kept on the CPU (643 rows)
+[v41] expert I/O: 61745 misses, 1160845.5 MB in 426.29s (2.72 GB/s); prefill 1149132.7 MB, disk 422.01s, matmul 205.73s, wall 704.38s
+[VK] tier deepseek_v41 turn: device 449896 of 688317 routed experts (65.4%; this turn 449896 of 688317) | CPU RAM hits 188304, disk loads 61745 | resident 90 (budget 91, 3.19 GiB of 3.46 GiB, 13 blocks, frag 0.63) | uploads 382 (6.30 GiB, 91 warm), evictions 281, skipped 0 queue + 112 rate, failed 0 | device 6945.3 ms, CPU share 549405.6 ms, waited 697.4 ms (90% of device time hidden) | balance: device share 1.00, 0 rows handed to the CPU | extra layers (3): 0 of 45 routed experts on the device, resident 11 (budget 11) | exclusive: 5 RAM copies of device experts given up first | stream: 478 steps, 10423 cold experts (239.53 GiB, 9.78 GB/s) and 376458 rows streamed in 484 sub-batches, prefetched 10068 (8863 used), 49725 cold experts (237528 rows) kept on the CPU
+[VK] deepseek_v41 chain: 3 forwards, 1222 frames (16344 ops, 5477 matmuls, 4608 tiled GEMM), 39250.3 ms waiting for the device, 578793.7 ms of routed experts on the host, 739.9 MiB on the device
+[v41] expert I/O: 61646 misses, 1158984.3 MB in 425.45s (2.72 GB/s); prefill 1148042.3 MB, disk 421.46s, matmul 207.30s, wall 704.79s
+[VK] tier deepseek_v41 turn: device 897512 of 1376634 routed experts (65.2%; this turn 447616 of 688317) | CPU RAM hits 190592, disk loads 61646 | resident 91 (budget 91, 3.19 GiB of 3.46 GiB, 13 blocks, frag 0.59) | uploads 398 (6.56 GiB, 91 warm), evictions 296, skipped 0 queue + 112 rate, failed 0 | device 13474.8 ms, CPU share 1102588.4 ms, waited 1390.5 ms (90% of device time hidden) | balance: device share 1.00, 0 rows handed to the CPU | extra layers (3): 21 of 90 routed experts on the device, resident 11 (budget 11) | exclusive: 5 RAM copies of device experts given up first | stream: 959 steps, 20448 cold experts (477.18 GiB, 9.79 GB/s) and 706805 rows streamed in 971 sub-batches, prefetched 20042 (17325 used), 99560 cold experts (477387 rows) kept on the CPU
+[VK] deepseek_v41 chain: 6 forwards, 2361 frames (32688 ops, 10954 matmuls, 9216 tiled GEMM), 80828.4 ms waiting for the device, 1157850.3 ms of routed experts on the host, 843.9 MiB on the device
+[VK] deepseek_v41 chain: 6 forwards, 2361 frames (32688 ops, 10954 matmuls, 9216 tiled GEMM), 80828.4 ms waiting for the device, 1157850.3 ms of routed experts on the host, 843.9 MiB on the device
+
+
+(b) vram-r3-ch256.log -- the same workload with COLI_VK_TIER_STREAM_MIN=2: 98.4% of
+    routed experts on the device against 65.4%, prefill 226.7 -> 178.0 ms a row, and
+    1.15 TB of expert reads a turn instead of 74.7 GB.
+[VK] tier deepseek_v41 stream: a step of 256 rows; cold experts with 2 rows or more go to the device (COLI_VK_TIER_STREAM_MIN's 2 rows: the upload and the CPU's rows not measured yet); layer 0: 3 resident, 128 streamed (0 of them copied from the host pool), 24 kept on the CPU (24 rows)
+[v41] expert I/O: 61061 misses, 1147985.9 MB in 427.83s (2.68 GB/s); prefill 1136310.7 MB, disk 421.11s, matmul 9.51s, wall 553.04s
+[VK] tier deepseek_v41 turn: device 677280 of 688317 routed experts (98.4%; this turn 677280 of 688317) | CPU RAM hits 256, disk loads 61061 | resident 97 (budget 97, 2.99 GiB of 3.23 GiB, 13 blocks, frag 0.58) | uploads 144 (2.37 GiB, 97 warm), evictions 37, skipped 0 queue + 0 rate, failed 0 | device 17952.0 ms, CPU share 84797.5 ms, waited 7910.0 ms (56% of device time hidden) | balance: device share 1.00, 0 rows handed to the CPU | extra layers (3): 0 of 45 routed experts on the device, resident 10 (budget 10) | exclusive: 4 RAM copies of device experts given up first | stream: 482 steps, 49830 cold experts (1035.74 GiB, 10.48 GB/s) and 551706 rows streamed in 2309 sub-batches, prefetched 22186 (21736 used), 10165 cold experts (10165 rows) kept on the CPU
+[VK] deepseek_v41 chain: 3 forwards, 1222 frames (16344 ops, 5477 matmuls, 4608 tiled GEMM), 598.9 ms waiting for the device, 357008.4 ms of routed experts on the host, 739.9 MiB on the device
+[VK] deepseek_v41 vram: weights 9710.5 MiB in 34 blocks (9608.2 MiB of rows in 521 tensors) | chain 739.9 MiB (dev 256.0 in 4 blocks, down 128.0 in 2, up 512.0 in 8) | tier resident 2046.1 MiB + 48 slots 1012.5 MiB = 3058.6 of 3096.0 in 13 blocks | extra layers 210.9 in 1 blocks | kv mirror 55.0 MiB | process 13.92 GiB of 13.59 GiB in pools (342.4 MiB outside) | device 15.61 GiB used of 15.98 (card2)
+[v41] expert I/O: 60855 misses, 1144112.9 MB in 419.47s (2.73 GB/s); prefill 1135201.4 MB, disk 416.22s, matmul 9.42s, wall 546.42s
+[VK] tier deepseek_v41 turn: device 1354594 of 1376394 routed experts (98.4%; this turn 677314 of 688077) | CPU RAM hits 267, disk loads 60855 | resident 97 (budget 97, 2.99 GiB of 3.23 GiB, 13 blocks, frag 0.58) | uploads 148 (2.44 GiB, 97 warm), evictions 41, skipped 0 queue + 0 rate, failed 0 | device 35984.4 ms, CPU share 165665.5 ms, waited 15765.7 ms (56% of device time hidden) | balance: device share 1.00, 0 rows handed to the CPU | extra layers (3): 20 of 90 routed experts on the device, resident 10 (budget 10) | exclusive: 6 RAM copies of device experts given up first | stream: 964 steps, 99519 cold experts (2073.10 GiB, 10.48 GB/s) and 1099458 rows streamed in 4618 sub-batches, prefetched 44367 (43247 used), 20278 cold experts (20278 rows) kept on the CPU
+[VK] deepseek_v41 chain: 6 forwards, 2361 frames (32685 ops, 10954 matmuls, 9216 tiled GEMM), 1086.7 ms waiting for the device, 707256.1 ms of routed experts on the host, 843.9 MiB on the device
+[VK] deepseek_v41 vram: weights 9710.5 MiB in 34 blocks (9608.2 MiB of rows in 521 tensors) | chain 843.9 MiB (dev 256.0 in 4 blocks, down 128.0 in 2, up 640.0 in 10) | tier resident 2046.1 MiB + 48 slots 1012.5 MiB = 3058.6 of 3096.0 in 13 blocks | extra layers 210.9 in 1 blocks | kv mirror 55.0 MiB | process 14.05 GiB of 13.71 GiB in pools (342.4 MiB outside) | device 15.66 GiB used of 15.98 (card2)
+[VK] deepseek_v41 chain: 6 forwards, 2361 frames (32685 ops, 10954 matmuls, 9216 tiled GEMM), 1086.7 ms waiting for the device, 707256.1 ms of routed experts on the host, 843.9 MiB on the device
+
+
+(c) The tier bench the threshold came from (tests/test_vk_chain.c, COLI_VK_CHAIN_BENCH=xbrows)
+    is not in this file: it prints one line a row count on the machine that runs it
+    (`make -C c vk-chain-check VK=1` runs the same kernels). The numbers the record
+    quotes (0.12 ms at 1 row, 0.21 at 2, 0.40 at 4, 0.76 at 16, a 2.2 ms upload, the
+    CPU at 2.05-2.52 ms a row) are from that run, quoted in c615cca4's message.
+
+(d) The tiny-budget pool case (COLI_VK_TIER_GB=0.00005, the three-expert tier) is quoted
+    from 90959d61's message: before, "failed 1 refused by the pool" with T.xmax 0 and the
+    extra layers on the CPU; after, "extra layers (2) 4 of 48 routed experts, resident 1
+    (budget 1), uploads 7, evictions 4, failed 0". Its default-budget serve line is
+    reproduced by every serve in section 2 and 3 above (tier resident 1434.4 MiB + 0
+    slots = 1434.4 of 1536.0 in 6 blocks, extra layers 168.8 MiB, process 11.28 of 11.34
+    GiB in pools, chunk 768 rows with the desktop's 3.46 GiB on the card).
+
+
+6. Not in this file, and how to get it
+--------------------------------------
+- The 50 Hz VRAM sample series (vram-*.csv), including the two runs above. Re-run
+  `python3 prefill-vram.py --ctx 131072 --turns 1 --tag vram-c1-128k-short --port 8031`
+  and it writes the .csv and .log beside the repository root again.
+- The packed candidate mask's own two runs (12b2908a, a6486c71: the tiny fixture at
+  20000 positions, the released checkpoint at E=1300 and E=3107) were made against
+  uncommitted builds in the wave-2b session and their stdout was not kept; the numbers
+  are quoted from those two commit messages and the arithmetic behind them is given in
+  the record (section 6). `bash c/tests/vulkan_engines.sh prefill-deepseek` and
+  `make -C c vk-chain-check VK=1` exercise the same code path.
+- The upload-attribution run (every first-use device upload printed: `head.w` the
+  1262.5 MiB `O=129280 I=5120` upload, `embed.w` absent, the routers 40 x 3932160 B,
+  the DSpark stages 673 MiB) and the drain-halves run (160 drains, 319 frames in
+  flight, 28095.1 ms the newest frame vs 0.5 ms the rest at chunk 1280) were made with
+  temporary instrumentation that was reverted the same session; their stdout was not
+  kept, and the numbers are quoted from the wave-2b report in the record (sections 5
+  and 7). The cross-check that closes without them: 7523.0 + 1262.5 + 150 + 673 =
+  9608.5 against the ledger's 9608.2 MiB of rows.
+

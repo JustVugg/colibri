@@ -1,0 +1,129 @@
+{
+ "meta": {
+  "experiment": "dsv41-kvq-throughput-2026-11-11: the packed KV cache's default vs COLI_VK_KV_FP32=1, short-context decode throughput",
+  "date": "2026-11-11T08:31:26Z..2026-11-11T08:56:50Z",
+  "commit": "382dfb456ef7563f4cb0665ff0db11ad16d5090f",
+  "commit_subject": "dsv41: the planner prices the DSpark stages and rollback rows; the packed family gets a CI leg",
+  "model": "/root/Models/DeepSeek-V4.1-Flash-1017 (48 shards, 510,296,708,312 B, 40 layers, DSpark 3 stages, released config.json: no n_mtp_layers, num_nextn_predict_layers 3, dspark_block_size 5)",
+  "server": {
+   "binary": "c/coli serve (c/deepseek_v41 built at this commit, VK=1)",
+   "command": "env -u COLI_VK_KV_QUANT COLI_VK_KV_FP32=<arm> VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_LEDGER=1 V41_STATS=1 OMP_NUM_THREADS=2 COLI_NO_OMP_TUNE=1 COLI_USAGE=<usage copy> ./c/coli serve --model /root/Models/DeepSeek-V4.1-Flash-1017 --ram 24 --ctx 4096 --gpu 0 --port 8061",
+   "arms": {
+    "baseline": "COLI_VK_KV_FP32=1 (fp32 host KV)",
+    "trial": "COLI_VK_KV_FP32=0 (the packed default, explicit)"
+   },
+   "identical_in_both_arms": [
+    "--model",
+    "--ram 24",
+    "--ctx 4096",
+    "--gpu 0",
+    "--port 8061",
+    "COLI_VULKAN=1",
+    "COLI_VK_CHAIN=1",
+    "COLI_VK_LEDGER=1",
+    "V41_STATS=1",
+    "OMP_NUM_THREADS=2",
+    "COLI_NO_OMP_TUNE=1",
+    "COLI_VK_KV_QUANT unset"
+   ],
+   "order": "baseline arm fully (serve, warmup, 3 turns, stop), then trial arm fully; not interleaved"
+  },
+  "endpoint": "/v1/chat/completions (one user message)",
+  "endpoint_note": "/v1/completions was the briefed path and returns HTTP 200 with empty text and usage.completion_tokens 0 on this checkpoint (the raw path is a text continuation, not the chat template): 4 turns, all empty, 71.2 s each. The supervisor approved /v1/chat/completions for this experiment on 2026-11-11; it is the same engine, server and decode loop, and the same path the 12-prompt A/B (E12/E13) used.",
+  "generation": {
+   "temperature": 0,
+   "max_tokens": 64,
+   "stream": false
+  },
+  "prompt": "Explain, for a reader who knows what a cache is but nothing about language models, how a transformer keeps its memory of the conversation so far. Start with why the attention layer cannot simply re-read the whole prompt every time it emits a token, then describe the key and value rows it stores instead, how those rows grow with each new token, and why their size is the product of the context length and a per-position cost. Then explain the two ways that memory is usually made cheaper: sharing one set of key and value rows across several query heads, and storing the rows in a lower precision format. Say what each of those trades away, and say which of the two a serving engine can apply without touching the weights at all. Finish with the reason a serving engine cares about the difference between the memory held on the accelerator and the memory held in host RAM, why a machine with a small accelerator may still serve a long context, and name the number a user should ask for when they want to know how much context they can afford on a machine of a given size. Write flowing prose, no bullet points, no headings, and do not stop before the last point.",
+  "prompt_sha256": "08f7c93c1d426662b9cb8008fdd91f6b4b49f150e21f91e88a1535af459bc46c",
+  "prompt_tokens_observed": 239,
+  "usage_history": {
+   "path": "/root/Projects/colibri-pr2712-testrun/scratch/usage-tput.txt (COLI_USAGE)",
+   "procedure": "reset byte-identical from a frozen base before each arm: cp usage-tput-base.txt usage-tput.txt",
+   "base_sha256": "91b8314f4d0a319f52caa1e39f9bab13cabaad68b8272c71c3ee524497439367",
+   "base_origin": "a copy of logs/usage-A.txt (a 48,108,936-selection expert history); identical bytes for both arms, so neither arm sees the other's learning"
+  },
+  "warmup_runs": 1,
+  "measured_runs": 3,
+  "tok_s_definition": "usage.completion_tokens / wall seconds of the HTTP request (prefill of 239 prompt tokens plus 64 decoded tokens), measured client-side with time.monotonic() around the request",
+  "median_tok_s": {
+   "baseline": 0.3515,
+   "trial": 0.3523
+  },
+  "spread_tok_s": {
+   "baseline": [
+    0.3513,
+    0.3534
+   ],
+   "trial": [
+    0.3508,
+    0.3538
+   ]
+  },
+  "host_kv_ledger": {
+   "baseline": "[VK] deepseek_v41 vram: ... | kv mirror 53.1 MiB | process 12.90 GiB of 12.70 GiB in pools (211.7 MiB outside) | device 15.37 GiB used of 15.98, gtt 1.80 GiB (card2)  -- no 'host kv' field: fp32 host rows",
+   "trial": "[VK] deepseek_v41 vram: ... | kv mirror 13.3 MiB (quantized; a second device's mirrors, when there are two, are not in this line) | host kv 6.4 MiB (packed) | ...  -- 890*4096 + 3,032,832 = 6,678,272 B = 6.37 MiB, the engine's closed form"
+  },
+  "serve_logs_not_committed": "/root/Projects/colibri-pr2712-testrun/logs/TPUT-{base,trial}-serve.log and TPUT-{base,trial}-turns.log (engine chatter, 2 MB an arm)",
+  "finished_text_length_chars": {
+   "baseline": 347,
+   "trial": [
+    326,
+    326,
+    326
+   ],
+   "note": "both arms answer the whole 64-token budget (finish_reason length); the texts are not byte-identical, which is the declared approximation and not a claim of this experiment"
+  }
+ },
+ "rows": [
+  {
+   "arm": "baseline",
+   "run": 1,
+   "prompt_tokens": 239,
+   "completion_tokens": 64,
+   "wall_s": 182.159,
+   "tok_s": 0.3513
+  },
+  {
+   "arm": "baseline",
+   "run": 2,
+   "prompt_tokens": 239,
+   "completion_tokens": 64,
+   "wall_s": 181.092,
+   "tok_s": 0.3534
+  },
+  {
+   "arm": "baseline",
+   "run": 3,
+   "prompt_tokens": 239,
+   "completion_tokens": 64,
+   "wall_s": 182.085,
+   "tok_s": 0.3515
+  },
+  {
+   "arm": "trial",
+   "run": 1,
+   "prompt_tokens": 239,
+   "completion_tokens": 64,
+   "wall_s": 182.419,
+   "tok_s": 0.3508
+  },
+  {
+   "arm": "trial",
+   "run": 2,
+   "prompt_tokens": 239,
+   "completion_tokens": 64,
+   "wall_s": 180.872,
+   "tok_s": 0.3538
+  },
+  {
+   "arm": "trial",
+   "run": 3,
+   "prompt_tokens": 239,
+   "completion_tokens": 64,
+   "wall_s": 181.649,
+   "tok_s": 0.3523
+  }
+ ]
+}

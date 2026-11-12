@@ -7,6 +7,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### New
 
+- **The packed KV cache is the default on DeepSeek V4.1 Flash** (`COLI_VK_KV_FP32` unset,
+  `1` is the exact fp32 opt-out): the chain's device KV mirrors *and* the host's own KV
+  arrays stay in the checkpoint's cache formats — MXFP8 window rings (528 B a row), FP4
+  compressed rows (288 B), FP4 index keys (68 B) — so the host state costs 890 B a position
+  against fp32's 6,400 (86.1% less at the released geometry), read paths dequantizing on
+  read and the boundaries (pull, park, reset, rollback) moving code rows. An approximate
+  mode: the logits drift a little and the `kv-quant-deepseek` family gates that documented
+  tolerance instead of bit-identity. The planner prices it — the host's window rings and
+  the `(dspark_block_size + 1)` rollback rows a layer included, 3,032,832 B packed against
+  11,763,712 B fp32, and 17,614,592 B at 16K, the engine's own `host kv` figure — reading
+  the stage count the way the released `config.json` spells it
+  (`num_nextn_predict_layers`, which it carries where `n_mtp_layers` is absent). New CI leg:
+  `kv-quant-deepseek` in the `vulkan-engines` job runs the codec bit-for-bit, the six chain
+  arms, the KV split's give-way and the CPU host
+  ([deepseek-v41.md](docs/deepseek-v41.md#quantized-kv-mirrors-coli_vk_kv_fp32)).
+
 - **Kimi K3.1 Pro** (`coli pull kimi-k3.1-pro`): the checkpoint as it ships, on the Kimi K3
   engine. K3.1 is K3's weights plus DeepSeek Sparse Attention on its 24 gated MLA layers: a
   token whose context passes 2048 positions attends to the 2048 its indexer picks, and up to

@@ -1416,7 +1416,7 @@ static int q36c_attention(Q36Chain *ch, Model *m, Layer *l, int i, int n, int pb
     if (!q36c_attn_qkv(ch, m, l, i, n)) return 0;
     size_t ko = (size_t)ch->attn_ord[i] * 2 * ch->rows * kvo;
     if (ch->ks.on) {   /* the split: the rows into their window slots, the attention in two parts */
-        VkcKvPart pk = {KV, kvd, m->K[i], (size_t)m->max_t * kvd, ch->kc[i], 0, q36_kv16()},
+        VkcKvPart pk = {KV, kvd, m->K[i], (size_t)m->max_t * kvd, ch->kc[i], 0, q36_kv16(), 0},
                   pv = {KV, kvd, m->V[i], (size_t)m->max_t * kvd, ch->vc[i], 0, q36_kv16()};
         VkcKvGqa a = {&ch->ks, ch->attn_ord[i], ch->q, ch->kc[i], ch->vc[i], ch->q, NULL, NULL, ch->ctx, n, H, KV, hd, kvd, pb, 0, 0, 0, 0,
                       qo, qdim, gate_dim > 0, hd, qo, qdim, H * hd, 0, 0, 1.f / sqrtf((float)hd),

@@ -1,0 +1,17 @@
+=== E14-compare start 2026-11-11T06:54:12Z cwd=/root/Projects/colibri-pr2712-testrun
+=== cmd: python3 /root/Projects/colibri-pr2712-testrun/scripts/compare.py /root/Projects/colibri-pr2712-testrun/logs/E12-answers.json /root/Projects/colibri-pr2712-testrun/logs/E13-answers.json
+=== env: 
+PROMPT 1 DIFFER at char 240
+PROMPT 2 identical
+PROMPT 3 identical
+PROMPT 4 identical
+PROMPT 5 identical
+PROMPT 6 DIFFER at char 146
+PROMPT 7 identical
+PROMPT 8 identical
+PROMPT 9 identical
+PROMPT 10 identical
+PROMPT 11 identical
+PROMPT 12 identical
+SUMMARY identical=10 differ=2
+=== E14-compare end 2026-11-11T06:54:12Z exit=3

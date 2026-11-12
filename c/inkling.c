@@ -3586,8 +3586,8 @@ static int ink_ps_parts(Model *m, ColiPsPart *parts) {
         if (!m->K || !m->V || rows != m->max_t) continue;   /* a ring: the checkpoint's */
         const int kv = L_KV(c, i), hd = L_HD(c, i);
         const size_t row = (size_t)hd * sizeof(float), hs = (size_t)rows * row;
-        parts[n++] = (ColiPsPart){m->K[i], row, rows, kv, hs, 1};
-        parts[n++] = (ColiPsPart){m->V[i], row, rows, kv, hs, 1};
+        parts[n++] = (ColiPsPart){m->K[i], row, rows, kv, hs, 1, 0};
+        parts[n++] = (ColiPsPart){m->V[i], row, rows, kv, hs, 1, 0};
     }
     return n;
 }

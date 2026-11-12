@@ -139,6 +139,16 @@ static size_t v41u_plan_bytes(const Model *m, int ctx) {
 static int v41u_wanted(Model *m) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("COLI_CUDA_CHAIN"); on = !(e && *e == '0'); }
+    /* The CUDA chain moves the host's KV arrays as fp32 rows; the packed cache holds 528/288/68 B
+     * code rows and the index keys in block-wide sections. A build that would pack falls back to
+     * the CPU's fp32-row path (the exact pre-packed path) with one line, once. */
+    if (on && v41_host_kvq(&m->c)) {
+        static int said;
+        if (!said++) fprintf(stderr, "[v41] CUDA chain: the host's KV rows are packed, which this "
+                            "chain does not read -- the prompt's layers stay on the CPU (COLI_VK_KV_FP32=1 "
+                            "gives this chain the fp32 rows it expects)\n");
+        return 0;
+    }
     return on && !g_v41u_off && g_v41_mux_slots <= 1 && xt_cuda() && g_cud.on && m->gguf && cc_available() && cc_dsv4_ready();
 }
 /* the struct, its device's context, the parameters, every layer's matrices and state: 0 =
@@ -454,15 +464,15 @@ static int v41u_state_up(V41U *ch, Model *m, int start, const int *need) {
         for (int i = 0; i < L && ok; i++) {
             const Layer *l = &m->L[i];
             if (l->window_pos[q % W] != q) continue;
-            ok = cc_write(ch->win[i], (size_t)(q % ch->Wd) * hd, l->window + (size_t)(q % W) * hd, (size_t)hd * sizeof(float));
+            ok = cc_write(ch->win[i], (size_t)(q % ch->Wd) * hd, l->window + (size_t)(q % W) * v41_row_win(c), (size_t)hd * sizeof(float));
         }
     }
     for (int i = 0; i < L && ok; i++) {
         if (!c->kv_source[i]) continue;
         const Layer *l = &m->L[i];
         const int r = c->compress_ratio[i], ihd = c->index_head_dim, t0 = ch->kv_valid[i], t1 = need[i];
-        if (t1 > t0) ok = cc_write(ch->ckv[i], (size_t)t0 * hd, l->ckv + (size_t)t0 * hd, (size_t)(t1 - t0) * hd * sizeof(float)) &&
-                          cc_write(ch->ikey[i], (size_t)t0 * ihd, l->ikey + (size_t)t0 * ihd, (size_t)(t1 - t0) * ihd * sizeof(float));
+        if (t1 > t0) ok = cc_write(ch->ckv[i], (size_t)t0 * hd, l->ckv + (size_t)t0 * v41_row_ckv(c), (size_t)(t1 - t0) * hd * sizeof(float)) &&
+                          cc_write(ch->ikey[i], (size_t)t0 * ihd, l->ikey + (size_t)t0 * v41_row_ikey(c), (size_t)(t1 - t0) * ihd * sizeof(float));
         if (ok && r > 1) ok = cc_write(ch->ring[i], 0, l->cstate_kv, (size_t)r * hd * sizeof(float)) &&
                               cc_write(ch->ring[i], (size_t)r * hd, l->cstate_score, (size_t)r * hd * sizeof(float));
     }
@@ -682,14 +692,14 @@ static int v41u_forward(Model *m, float *h, float *pre_mix, int n, int start, in
             for (int t = 0; t < n; t++) {
                 const int p = start + t, slot = p % W;
                 if (p < q0) continue;
-                memcpy(l->window + (size_t)slot * hd, pl + pc[i] + (size_t)(p - q0) * hd, (size_t)hd * sizeof(float));
+                memcpy(l->window + (size_t)slot * v41_row_win(c), pl + pc[i] + (size_t)(p - q0) * hd, (size_t)hd * sizeof(float));
                 l->window_pos[slot] = p;
             }
             if (!c->kv_source[i]) continue;
             const int r = c->compress_ratio[i], g0 = start / r, np = E / r - g0, ihd = c->index_head_dim;
             const float *src = pl + pc[i] + pw;
-            memcpy(l->ckv + (size_t)g0 * hd, src, (size_t)np * hd * sizeof(float));
-            memcpy(l->ikey + (size_t)g0 * ihd, src + (size_t)np * hd, (size_t)np * ihd * sizeof(float));
+            memcpy(l->ckv + (size_t)g0 * v41_row_ckv(c), src, (size_t)np * hd * sizeof(float));
+            memcpy(l->ikey + (size_t)g0 * v41_row_ikey(c), src + (size_t)np * hd, (size_t)np * ihd * sizeof(float));
             if (r <= 1) continue;
             const float *ring = src + (size_t)np * (hd + ihd);
             memcpy(l->cstate_kv, ring, (size_t)r * hd * sizeof(float));

@@ -23,7 +23,7 @@ layout(local_size_x = 256) in;
 layout(std430, binding = 0) readonly buffer B0 { float b0[]; };   // q rows
 layout(std430, binding = 1) readonly buffer B1 { float b1[]; };   // hw rows
 layout(std430, binding = 2) readonly buffer B2 { float b2[]; };   // index keys
-layout(std430, binding = 3) readonly buffer L3 { int l3[]; };     // candidate mask, a word a column
+layout(std430, binding = 3) readonly buffer L3 { int l3[]; };     // candidate mask, one bit a column (packed words)
 layout(std430, binding = 5) buffer Y5 { float y5[]; };            // score rows
 
 layout(push_constant) uniform P { int v[32]; } p;   // v[0]=mode, then VkcDsScore's fields (as mode 10)
@@ -34,8 +34,9 @@ const int T_WG = 16, C_WG = 32, TR = 2, CR = 1;   // (T_WG/TR) rows x (C_WG/CR) 
 const int DIMC = 128, DIM4 = DIMC / 4;
 const int TG = T_WG / TR, CG = C_WG / CR;
 
-// the mask is one int a column (mode 10: l3[mb + jt] != 0), mb the row's first word
-bool mset(int mb, int mr, int row, int j) { return mr <= 0 || l3[mb + row * mr + j] != 0; }
+// the mask is one bit a column (mode 10: bit j & 31 of the word at mb + row*mr + (j >> 5)),
+// mb the row's first word, as the packed rows' (chain_dsv4.comp's mbit)
+bool mset(int mb, int mr, int row, int j) { return mr <= 0 || ((uint(l3[mb + row * mr + (j >> 5)]) >> uint(j & 31)) & 1u) != 0u; }
 
 shared vec4 ks[DIM4 * C_WG];        // [v4][candidate] 16 KB, staged once a workgroup
 shared vec4 qs[2 * DIM4 * T_WG];    // [head of the pair][v4][row] 16 KB, one pair at a time

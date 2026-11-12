@@ -3068,13 +3068,33 @@ class CapSentinelShimTest(unittest.TestCase):
                                  expected)
                 planner.assert_not_called()
 
-    def test_v41_insufficient_ram_refuses_before_spawning(self):
+    def test_v41_an_empty_plan_starts_at_one_slot_not_a_refusal(self):
+        # #2712 review F2. The prompt workspace is priced at the CONTEXT -- what ONE
+        # forward of a context-long prompt allocates -- so a small box, or a CTX set
+        # past what the RAM holds, plans no expert slot at all. Raising there served
+        # nothing: the engine allocates the workspace at the PROMPT's rows, so the same
+        # box serves 4k-token prompts. The launch floor is one slot; the plan itself is
+        # untouched and still reports the short budget (coli plan, coli doctor).
         model = self._model("deepseek_v41")
+        plan = {"tiers": {"ram": {"cache_slots_per_layer": 0,
+                                  "workspace_bytes": 109148393472, "budget_bytes": 8 * 10**9}}}
+        err = io.StringIO()
+        with patch("resource_plan.build_plan", return_value=plan), \
+                contextlib.redirect_stderr(err):
+            self.assertEqual(self._spawn_argv("deepseek_v41", model,
+                                              env={"RAM_GB": "8"}), ["deepseek_v41", "1"])
+        self.assertIn("prompt workspace", err.getvalue())
+
+    def test_mimo_an_empty_plan_still_refuses_before_spawning(self):
+        # MiMo's workspace is priced at its 64-row block, not at the context: a plan that
+        # holds no slot there is a box that cannot hold one expert of every layer, and
+        # the refusal is the honest answer for it (unchanged by #2712).
+        model = self._model("mimo_v2")
         with patch("resource_plan.build_plan", return_value={
                 "tiers": {"ram": {"cache_slots_per_layer": 0}}}), \
                 patch("openai_server.subprocess.Popen") as popen:
             with self.assertRaisesRegex(ValueError, "one expert slot"):
-                Engine("deepseek_v41", model, env={"RAM_GB": "8"})
+                Engine("mimo_v2", model, env={"RAM_GB": "8"})
             popen.assert_not_called()
 
     def test_model_arch_reads_model_type(self):

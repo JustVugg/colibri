@@ -196,7 +196,7 @@ static struct {
     double dev_ms, cpu_ms, wait_ms;
     unsigned long long rep_routed, rep_served;
     /* streaming (big prefill steps; see "streaming" below) */
-    int st_ok, st_slots, st_n, st_per, st_half, st_rows_env, gemm_rows, st_par;
+    int st_ok, st_slots, st_n, st_per, st_half, st_rows_env, st_min, gemm_rows, st_par;
     VStage *st;
     double bw_up, cpu_row_ms;             /* measured: bytes per ms into a slot; CPU ms per (row, expert) */
     int big, big_fail, big_n, big_taken, said_fwd;
@@ -1030,19 +1030,22 @@ static int grow_rows(int need) {
  * buffering). An expert with more rows than a sub-batch holds is cut into parts.
  *
  * The rule, per cold expert of a step: stream it when it has at least R rows,
- *     R = max(G, ceil(upload / cpu_row)),
- * G the rows from which the device takes the tiled GEMM (COLI_VK_TIER_GEMM_ROWS, 16:
- * fewer rows would run the per-row GEMV), upload the time one expert takes to reach a
- * slot (its bytes at the bandwidth measured over the uploads so far), cpu_row the time
- * the CPU spent per (row, expert) pair it computed in the prefill steps so far (its share
- * of a step between issue and join, loads included). Below R the CPU keeps the expert:
- * its rows cost the CPU less than the upload. Until both are measured R = G.
+ *     R = max(st_min, ceil(upload / cpu_row)),
+ * st_min the rows from which the device is worth the upload (COLI_VK_TIER_STREAM_MIN, 2:
+ * the measured upload of one expert, 2.2 ms, against the CPU's 2.05-2.52 ms a row, so two
+ * rows already pay for the upload; the tiled GEMM's own rows, COLI_VK_TIER_GEMM_ROWS, are
+ * only the route below which an expert's rows run the per-row GEMV, and both routes give
+ * a row the same bits), upload the time one expert takes to reach a slot (its bytes at the
+ * bandwidth measured over the uploads so far), cpu_row the time the CPU spent per (row,
+ * expert) pair it computed in the prefill steps so far (its share of a step between issue
+ * and join, loads included). Below R the CPU keeps the expert: its rows cost the CPU less
+ * than the upload. Until both are measured R = st_min.
  * COLI_VK_TIER_STREAM_ROWS=n fixes R at n (tests). A [VK] line per forward says what the
  * rule gave, and the run's line how much streamed. */
 static double vkt_now_ms(void);
 static int stream_min_rows(void) {
     if (T.st_rows_env > 0) return T.st_rows_env;
-    int r = T.gemm_rows;
+    int r = T.st_min;
     if (T.bw_up > 0 && T.cpu_row_ms > 0) {
         double up = (double)T.exp_bytes / T.bw_up, need = up / T.cpu_row_ms;
         if (need > 1e6) need = 1e6;
@@ -1370,10 +1373,10 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
                 T.engine, S, R);
         if (T.st_rows_env > 0) fprintf(stderr, "COLI_VK_TIER_STREAM_ROWS");
         else if (T.bw_up > 0 && T.cpu_row_ms > 0)
-            fprintf(stderr, "an upload of %s at %.1f GB/s takes %.3f ms, the CPU %.4f ms a row; the GEMM from %d rows",
+            fprintf(stderr, "an upload of %s at %.1f GB/s takes %.3f ms, the CPU %.4f ms a row; COLI_VK_TIER_STREAM_MIN's %d rows",
                     human((double)T.exp_bytes, hb, sizeof hb), T.bw_up / 1e6, (double)T.exp_bytes / T.bw_up,
-                    T.cpu_row_ms, T.gemm_rows);
-        else fprintf(stderr, "the GEMM's %d rows: the upload and the CPU's rows not measured yet", T.gemm_rows);
+                    T.cpu_row_ms, T.st_min);
+        else fprintf(stderr, "COLI_VK_TIER_STREAM_MIN's %d rows: the upload and the CPU's rows not measured yet", T.st_min);
         fprintf(stderr, "); layer %d: %d resident, %d streamed (%d of them copied from the host pool), %d kept on the CPU (%d rows)",
                 layer, ndev, nst, npool, nkept, kept_rows);
         if (nhy) fprintf(stderr, ", %d of the host pool on the CPU in place (%d rows or fewer)", nhy, T.hy_big);
@@ -3041,6 +3044,33 @@ static void host_init(long long all) {
 
 int vkt_host_pool_on(void) { return T.on && T.dmax[2] > 0; }
 size_t vkt_stage_room(void) { return vkt_host_pool_on() ? T.stage_room : 0; }
+size_t vkt_slot_reserve(void) {
+    /* VKC_DEV's pool is the tier's on the primary device (pool 1); the slots are made into it
+     * at the first streaming step, after the chain has sized its chunk. The reservation is an
+     * optimisation of the chunk's size, never a claim on room the residents need: it is what the
+     * budget holds beside them, and nothing when the budget cannot hold the slots at all. */
+    if (!T.on || !T.st_ok || T.st_slots < 1) return 0;
+    size_t held = (size_t)T.dmax[0] * T.exp_bytes;   /* the residents the budget holds */
+    size_t spare = T.budget > held ? T.budget - held : 0;
+    size_t slots = (size_t)T.st_slots * T.exp_bytes;
+    return slots < spare ? slots : spare;
+}
+void vkt_vram(VktVram *o) {
+    memset(o, 0, sizeof *o);
+    if (!T.on) return;
+    ColiVkPoolStats p;
+    coli_vk_pool_stats(1, &p);
+    o->res_used = p.used; o->res_total = p.total; o->res_blocks = p.blocks;
+    o->slots = T.st_n; o->slots_max = T.st_slots;
+    if (T.st_n > 0) {   /* the slots are experts of the pool's own kind: their share of it */
+        o->slot_bytes = (size_t)T.st_n * T.exp_bytes;
+        if (o->slot_bytes > o->res_used) o->slot_bytes = o->res_used;
+    }
+    if (T.xmax) {
+        coli_vk_pool_stats(4, &p);
+        o->x_used = p.used; o->x_total = p.total; o->x_blocks = p.blocks;
+    }
+}
 
 /* vkt_give_back: whole blocks of the tier's pool on the primary device, the coldest first (the
  * scores of the residents with a range in each; an empty one first of all), until they hold
@@ -3312,14 +3342,19 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     }
     /* Streaming (big prefill steps, see "streaming" above): COLI_VK_TIER_STREAM=0 turns
      * it off; it needs the engine's load hook and the GEMM route. Its staging slots come
-     * out of the budget: the residents give up what the budget cannot hold beside them. */
+     * out of the budget: the residents give up what the budget cannot hold beside them.
+     * COLI_VK_TIER_STREAM_SLOTS (48): the slots are experts of the pool; a prompt step's
+     * sub-batches hold st_per = slots/2 experts each, so 48 streams 24 at a time in each
+     * of the two halves. It was 64 (1.35 GiB of 21.1 MiB experts made at the first
+     * streaming step); the measured runs used 44 of them at most, and the pool's 256 MiB
+     * blocks made the other 20 a block of their own (the audit's lever 2). */
     {
         ColiVkXbStats xs; coli_vk_xb_stats(&xs);
         T.gemm_rows = xs.gemm_rows;
         const char *se = getenv("COLI_VK_TIER_STREAM"), *sn = getenv("COLI_VK_TIER_STREAM_SLOTS");
-        const char *sr = getenv("COLI_VK_TIER_STREAM_ROWS");
+        const char *sr = getenv("COLI_VK_TIER_STREAM_ROWS"), *sm = getenv("COLI_VK_TIER_STREAM_MIN");
         int want_st = !(se && *se == '0') && T.c.load && T.c.release && T.gemm_rows > 0;
-        int slots = sn && *sn ? atoi(sn) : 64;
+        int slots = sn && *sn ? atoi(sn) : 48;
         if (slots > fit_raw / 2) slots = (int)(fit_raw / 2);
         if (want_st && slots >= 2) {
             if (fit > fit_raw - slots) fit = fit_raw - slots;
@@ -3329,6 +3364,8 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
         if (T.st_ok) {
             T.st_slots = slots;
             T.st_rows_env = sr && *sr ? atoi(sr) : 0;
+            T.st_min = sm && *sm ? atoi(sm) : 2;
+            if (T.st_min < 1) T.st_min = 1;
             /* a sub-batch's rows: its x rows within 32 MiB (a card without Resizable BAR
              * keeps them in its host-visible window) */
             long hr = (32L << 20) / ((long)T.c.hidden * 4);

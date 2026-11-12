@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import os
 import struct
@@ -206,6 +208,7 @@ class ResourcePlanTest(unittest.TestCase):
             "model_type": "deepseek_v41", "num_hidden_layers": 2,
             "n_routed_experts": 128, "hidden_size": 128, "head_dim": 64,
             "window_size": 8, "index_head_dim": 32, "hc_mult": 4,
+            "num_attention_heads": 4, "q_lora_rank": 64, "index_topk": 16,
             "compress_ratios": [0, 2], "kv_source_layers": [1],
         }))
         write_shard(self.model / "model.safetensors", [
@@ -222,6 +225,99 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertEqual(large, 128)
         self.assertEqual(automatic, 128)
         self.assertEqual(cap_for_arch("deepseek_v41", 4, {"RAM_GB": "12"}, self.model), 4)
+
+    def test_v41_long_context_still_plans_a_feasible_ram_cache(self):
+        """Track C regression: at --ram 28 a long ctx must keep >0 RAM expert slots.
+
+        The workspace is what ONE forward of the prompt allocates -- forward_full's
+        per-row buffers beside attention_run's, at the context, because deepseek_v41.c
+        prefills a prompt in one forward and has no chunk size to bound it. It therefore
+        GROWS with the context by design (this config: 7,440 B a row), and what keeps a
+        plan feasible is the auto ladder (chat_context), which prices the step beside the
+        state before it admits it; a context the operator sets past that is priced
+        honestly and leaves the cache the slots it can.
+        """
+        from openai_server import cap_for_arch
+        from family_registry import planner_geometry
+
+        (self.model / "config.json").write_text(json.dumps({
+            "model_type": "deepseek_v41", "num_hidden_layers": 2,
+            "n_routed_experts": 128, "hidden_size": 128, "head_dim": 64,
+            "window_size": 8, "index_head_dim": 32, "hc_mult": 4,
+            "num_attention_heads": 4, "q_lora_rank": 64, "index_topk": 16,
+            "compress_ratios": [0, 2], "kv_source_layers": [1],
+        }))
+        write_shard(self.model / "model.safetensors", [
+            ("embed.weight", GB),
+            *[(f"layers.{layer}.ffn.experts.{expert}.w1.weight", 16 * 1024**2)
+              for layer in range(2) for expert in range(128)],
+        ])
+        with mock.patch("resource_plan.memory_available") as memory:
+            memory.return_value = 32 * GB
+            from resource_plan import build_plan
+            from family_registry import resolve_model
+            resolved = resolve_model(self.model)
+            short = planner_geometry(resolved, 16384)
+            long_ = planner_geometry(resolved, 262144)
+            # the closed form, not a chunk: 2*hc*hidden + 3*hc + 2*hidden + hc*hc +
+            # 2*q_lora + heads*head_dim + 2*head_dim + window + 2*index_topk = 1,860
+            # floats a row (no DSpark head here: main_hidden is not allocated), plus the
+            # one `hidden` row the form always priced
+            for geo, ctx in ((short, 16384), (long_, 262144)):
+                self.assertEqual(geo.workspace_bytes, ctx * 1860 * 4 + 128 * 4)
+            # The failure itself: every tier must keep a positive expert cache.
+            for ctx in (131072, 262144):
+                cap = cap_for_arch("deepseek_v41", None, {"RAM_GB": "28"}, self.model)
+                self.assertGreaterEqual(cap, 1)
+                plan = build_plan(self.model, ram_gb=28.0, context=ctx,
+                                  available_memory=32 * GB, available_disk=100 * GB,
+                                  gpus=[], cpu_sockets=1)
+                self.assertGreaterEqual(
+                    plan["tiers"]["ram"]["cache_slots_per_layer"], 1)
+                self.assertFalse([w for w in plan["warnings"]
+                                  if "cannot hold one expert slot" in w])
+
+    def test_a_workspace_past_the_ram_starts_at_one_slot_instead_of_refusing(self):
+        """#2712 review F2: the plan stays honest, the LAUNCH does not refuse.
+
+        The workspace is priced at the context -- what ONE forward of a context-long
+        prompt allocates -- so at a context the operator set past what the RAM holds the
+        plan cannot keep one expert slot a layer, and cap_for_arch raised: a 64 GB box
+        with CTX=262144 served nothing at all, though the engine allocates the workspace
+        at the PROMPT's rows and serves 4k-token prompts there (1.71 GB, not 109.2). The
+        floor is one slot a layer; the plan and `coli doctor` keep reporting the budget
+        as short, which is why it lives at the launch seam and not in build_plan.
+        """
+        from openai_server import cap_for_arch
+
+        (self.model / "config.json").write_text(json.dumps({
+            "model_type": "deepseek_v41", "num_hidden_layers": 2,
+            "n_routed_experts": 128, "hidden_size": 128, "head_dim": 64,
+            "window_size": 8, "index_head_dim": 32, "hc_mult": 4,
+            "num_attention_heads": 4, "q_lora_rank": 64, "index_topk": 16,
+            "compress_ratios": [0, 2], "kv_source_layers": [1],
+        }))
+        write_shard(self.model / "model.safetensors", [
+            ("embed.weight", GB),
+            *[(f"layers.{layer}.ffn.experts.{expert}.w1.weight", 16 * 1024**2)
+              for layer in range(2) for expert in range(128)],
+        ])
+        with mock.patch("resource_plan.memory_available", return_value=6 * GB):
+            plan = build_plan(self.model, ram_gb=6.0, context=262144,
+                              available_memory=6 * GB, available_disk=100 * GB,
+                              gpus=[], cpu_sockets=1)
+        # the plan itself is unchanged and says what is true: no slot, and why
+        self.assertEqual(plan["tiers"]["ram"]["cache_slots_per_layer"], 0)
+        self.assertTrue([w for w in plan["warnings"]
+                         if "cannot hold one expert slot" in w],
+                        "the plan must still report the short budget")
+        err = io.StringIO()
+        with mock.patch("resource_plan.memory_available", return_value=6 * GB), \
+             contextlib.redirect_stderr(err):
+            cap = cap_for_arch("deepseek_v41", None, {"RAM_GB": "6", "CTX": "262144"}, self.model)
+        self.assertEqual(cap, 1, "the launch floor: one expert slot a layer")
+        self.assertIn("prompt workspace", err.getvalue())
+        self.assertIn("CTX=262144", err.getvalue())
 
     def test_sibling_plan_advises_no_colibri_knob(self):
         other = tempfile.TemporaryDirectory()
@@ -2729,17 +2825,18 @@ class VulkanPartialChainDskTest(unittest.TestCase):
 
     def test_deepseek_v41_layout_is_the_engines(self):
         # "[VK] deepseek_v41 chain fit: ... fixed ... (the engine's E B, ...), tail T B, layers
-        # b0 .. B" for dsv41_tiny on Lavapipe, per configuration
+        # b0 .. B" for dsv41_tiny on Lavapipe, per configuration (the fixed pins carry the
+        # candidate mask packed to a bit a column, 12b2908a: 1030144 B less at 512 rows)
         from resource_plan import vk_chain_fit, vk_fit_pools
         info = self.write_v41()
         cpu = {"type": "cpu", "budget_bytes": 64 * GB}
         on = {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1"}
         for env, layers, fixed, tail in (
-                (on, [318696, 634472, 318696, 571752, 471528, 318696], 12124416, 0),
-                (dict(on, COLI_VK_DENSE="1"), [318696, 634472, 318696, 571752, 471528, 318696], 12124416, 79616),
+                (on, [318696, 634472, 318696, 571752, 471528, 318696], 11094272, 0),
+                (dict(on, COLI_VK_DENSE="1"), [318696, 634472, 318696, 571752, 471528, 318696], 11094272, 79616),
                 # prompts only, device only: wo_a per output group as well; chunks of 7 rows
                 (dict(on, COLI_VK_CHAIN="2", COLI_VK_DENSE_HOST="0", COLI_VK_CHAIN_ROWS="7"),
-                 [198376, 417000, 198376, 257512, 351208, 198376], 137736, 0)):
+                 [198376, 417000, 198376, 257512, 351208, 198376], 137344, 0)):
             with self.subTest(env=env):
                 fit = vk_chain_fit(info, "deepseek_v41", env, cpu)
                 self.assertEqual(fit["layers"], layers)

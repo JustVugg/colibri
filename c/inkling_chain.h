@@ -714,8 +714,8 @@ static int inkc_push_state(InkChain *ch, Model *m, int pos_base, int n) {
     for (int i = ch->lo; i < ch->lo + ch->nl && ok; i++) {
         if (ch->ks.on && ch->kli[i] >= 0) {
             int KV = L_KV(c, i), hd = L_HD(c, i);
-            VkcKvPart pt[2] = {{KV, hd, m->K[i], (size_t)ch->cap[i] * hd, ch->kc[i], 0, 0},
-                               {KV, hd, m->V[i], (size_t)ch->cap[i] * hd, ch->vc[i], 0, 0}};
+            VkcKvPart pt[2] = {{KV, hd, m->K[i], (size_t)ch->cap[i] * hd, ch->kc[i], 0, 0, 0},
+                               {KV, hd, m->V[i], (size_t)ch->cap[i] * hd, ch->vc[i], 0, 0, 0}};
             vkc_kv_place(&ch->ks, ch->kli[i], pos_base, n);
             ok = vkc_kv_push(&ch->ks, ch->kli[i], pt, 2, pos_base);
             continue;
@@ -795,7 +795,7 @@ static int inkc_attention(InkChain *ch, Model *m, int i, int n, int pb) {
         /* the split: the step's rows into their window slots first (the window holds every
          * row of a step), then the attention over the device's rows and the host's */
         int li = ch->kli[i];
-        VkcKvPart pk = {KV, hd, m->K[i], (size_t)cap * hd, ch->kc[i], 0, 0}, pv = {KV, hd, m->V[i], (size_t)cap * hd, ch->vc[i], 0, 0};
+        VkcKvPart pk = {KV, hd, m->K[i], (size_t)cap * hd, ch->kc[i], 0, 0, 0}, pv = {KV, hd, m->V[i], (size_t)cap * hd, ch->vc[i], 0, 0, 0};
         size_t ko = (size_t)ch->slot[i] * 2 * ch->rows * ch->kvo_max;
         VkcKvRel a = {&ch->ks, li, ch->q, ch->kc[i], ch->vc[i], ch->r, ch->tau, ch->prm, ch->ctx, n, H, KV, hd, pb,
                       L_EXT(c, i), dr, H * hd, H * dr, (int)ch->o_relp[i], 0, H * hd, 1.f / (float)hd,

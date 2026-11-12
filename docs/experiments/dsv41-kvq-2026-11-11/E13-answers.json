@@ -1,0 +1,86 @@
+[
+ {
+  "i": 1,
+  "status": 200,
+  "text": "Let's go step-by-step.\n\nWe know:\n\n- 17 identical bolts cost $4.25.\n- We want the cost of **one** bolt.\n\n**Step 1: Set up the division**\n\nCost per bolt = Total cost \u00f7 Number of bolts  \n= \\( 4.25 \\div 17 \\)\n\n**Step 2: Perform the division**\n\n\\( 4.25 \\div 17 = 0.25 \\)\n\n**Step 3: Check**\n\n\\( 0.25 \\times 17 = 4.",
+  "prompt_tokens": 27,
+  "completion_tokens": 110
+ },
+ {
+  "i": 2,
+  "status": 200,
+  "text": "The proposal was rejected by the committee.",
+  "prompt_tokens": 16,
+  "completion_tokens": 8
+ },
+ {
+  "i": 3,
+  "status": 200,
+  "text": "893",
+  "prompt_tokens": 18,
+  "completion_tokens": 1
+ },
+ {
+  "i": 4,
+  "status": 200,
+  "text": "Canberra\nOttawa",
+  "prompt_tokens": 20,
+  "completion_tokens": 5
+ },
+ {
+  "i": 5,
+  "status": 200,
+  "text": "```python\ndef is_prime(n):\n    if n < 2:\n        return False\n    if n < 4:\n        return True\n    if n % 2 == 0 or n % 3 == 0:\n        return False\n    i = 5\n    while i * i <= n:\n        if n % i == 0 or n % (i + 2) == 0:\n            return False\n        i += 6\n    return True\n```",
+  "prompt_tokens": 15,
+  "completion_tokens": 102
+ },
+ {
+  "i": 6,
+  "status": 200,
+  "text": "# Bug Fix\n\nThe bug is the use of `=` (assignment) instead of `==` (comparison) in the `if` condition. In Python, `=` assigns a value, while `==` checks for equality.\n\n## Fixed Code\n\n```python\nfor i in range(len(x)):\n    if x[i] == 0:\n        x[i] = 1\n```\n\n## Explanation\n\n**Original (buggy):**\n```python\nif x[i] = 0:   # SyntaxError: invalid syntax\n```\n",
+  "prompt_tokens": 30,
+  "completion_tokens": 110
+ },
+ {
+  "i": 7,
+  "status": 200,
+  "text": "A cache storing KV rows in a packed 4-bit format reduces memory usage but introduces approximation. This trade-off means memory savings come at the cost of some precision in the stored values.",
+  "prompt_tokens": 30,
+  "completion_tokens": 37
+ },
+ {
+  "i": 8,
+  "status": 200,
+  "text": "Red, Green, Blue",
+  "prompt_tokens": 15,
+  "completion_tokens": 5
+ },
+ {
+  "i": 9,
+  "status": 200,
+  "text": "dog",
+  "prompt_tokens": 20,
+  "completion_tokens": 1
+ },
+ {
+  "i": 10,
+  "status": 200,
+  "text": "Friday",
+  "prompt_tokens": 24,
+  "completion_tokens": 1
+ },
+ {
+  "i": 11,
+  "status": 200,
+  "text": "Der KV-Cache ist standardm\u00e4\u00dfig ungef\u00e4hr.",
+  "prompt_tokens": 16,
+  "completion_tokens": 13
+ },
+ {
+  "i": 12,
+  "status": 200,
+  "text": "4",
+  "prompt_tokens": 18,
+  "completion_tokens": 1
+ }
+]

@@ -1209,8 +1209,11 @@ def _v41_chain_layout(info, env, vulkan):
     ew = next(iter(engram.values()))[1] if engram else 1
     T = targets if targets > 0 else 1
     wcap, n = W + rows, rows
+    # isc and the candidate mask: the scores stay fp32 a column, the mask has been one bit
+    # a column since it packed (v41c_mask_words, 12b2908a) -- a row is ceil(wcap/32) words
     counts = [n * HD, n * HD, n * nm, n * hr, n * hr, n * D, n * D, n * QL, n * QL, n * nh * hd, n * hd,
-              n * nh * hd, n * og * ol, n * D, n * hd, n * hd, n * IH * ID, n * IH, n * wcap, n * wcap,
+              n * nh * hd, n * og * ol, n * D, n * hd, n * hd, n * IH * ID, n * IH, n * wcap,
+              n * ((wcap + 31) // 32),
               n * (W + K), (n + rmax) * 2 * rd, n * ew, n * D * (H + 1), n * inter, n * inter, n * inter,
               n * D, n * D, n * T * D, n * HD, n * hr, n * D]
     fixed = sum(4 * (x if x else 1) for x in counts)
@@ -3351,8 +3354,11 @@ CHAT_CONTEXT_AGENT_SHARE = 0.25
 # The engines that size their expert cache from the plan and cannot start without a
 # slot a layer (cap_for_arch): the plan reserves their workspace at the full context,
 # so the step counts it beside the state. DeepSeek V4.1 prefills a prompt in one
-# forward, about 200 KB a token: on a 64 GB box the 262144 the state alone allowed
-# took 53.7 GB of workspace, left the cache no slot, and `coli serve` did not start.
+# forward -- there is no chunk size in deepseek_v41.c to bound it -- and the plan now
+# prices what that forward allocates: 416,368 B a row at the released geometry
+# (forward_full's buffers beside attention_run's), 101.65 GiB at 262144. A chunked
+# prefill is the follow-up that would let a 16 GB box keep a context; until then this
+# ladder is the engine's own ask.
 CHAT_CONTEXT_WORKSPACE = ("deepseek_v41", "mimo")
 
 

@@ -534,9 +534,236 @@ What that leaves the tier is smaller than the window itself. On the 16 GiB card 
 was measured on, the driver's budget exposes about 90% of the heap (13.3 of 14.4 GiB),
 the trunk holds 7.62 GiB once placed, and the window asks the remaining 5 GiB; the
 tier's own sizing then sets aside its 1 GiB reserve, the ~1.4 GiB of bf16 dense tail
-still to be uploaded lazily, and the 64 streaming slots (~1.35 GiB), leaving a 3.31 GiB
-resident budget — 84 experts of 21.1 MiB — beside a trunk the whole prompt pays for on
-every token. `COLI_VK_TIER_RESERVE_GB=0` and `COLI_VK_TIER_HOST` trade that back.
+still to be uploaded lazily, and the streaming slots (48, ~1 GiB: measured, each one's
+saving goes back to the residents), leaving a ~3.4 GiB budget — 107 experts of 21.1 MiB —
+beside a trunk the whole prompt pays for on every token. `COLI_VK_TIER_RESERVE_GB=0` and
+`COLI_VK_TIER_HOST` trade that back. The ledger below shows where it ends up, and the
+2.1 GiB the trunk still uploads after that fit (the lm head, the 40 routers, the DSpark
+stages: the token embedding is never on the device, see below).
+
+### Quantized KV mirrors (`COLI_VK_KV_FP32`)
+
+The only VRAM item that grows with the conversation is the chain's KV mirrors, and the
+checkpoint's own cache already stores that state quantized. The packed cache keeps the
+mirrors in those formats — the formats DeepInfer's paged cache defines and its store
+kernel writes (`deepseek-ai/DeepInfer@a679bb86`,
+`deepinfer/model_executor/layers/tilelang_ops/cache_common.py:109-137` and the layout
+at `:318-323`, the quantizer `.../tilelang_ops/cuda/store_kv_cache.py:117-184`, the
+dependency pinned `tile-kernels==2.1.0`) — and does so BY DEFAULT: `COLI_VK_KV_FP32`
+unset (or `0`) runs packed, and `1` is the exact fp32 opt-out. There is no half-packed
+setting: the host's arrays are packed exactly when the mirrors are (`v41_host_kvq` reads
+the same flag), and
+the old middle level that kept the host fp32 while the mirrors packed measured
+byte-identical to the packed host on the 12-prompt battery (at 16K only the packed host
+was ever needed), so it cost the dequant→re-pack round trip the ckv subnormal-scale fix
+had to repair and bought nothing measurable.
+
+One deliberate deviation from DeepInfer, in the packed state only: a compressed group
+whose amax falls in `[9,10)·2^-9` is packed one scale code down, because the give-way
+chain's dequantize→re-pack cycle needs `pack(unpack(pack))` to be a value fixpoint. The
+price is that the group's grid stops at `6·2^-9`, so every element above it saturates
+there where DeepInfer's grid holds `8·2^-9`: in that band the group's mean error is 15 %
+against DeepInfer's 10 %, and its top elements 25 % below DeepInfer's decoding (probe
+`proposals/w3-di-spec/di_ind.c`, T3). Everywhere else the rules and the bytes are
+DeepInfer's (band edges and the three formats: `di_parity.c` A-G). DeepInfer's own
+index-K blocks are `128 // compress_ratio` tokens (64 or 128), not this cache's 32: the
+same 64+4 bytes a token, a wider scale section, so the two byte streams are not
+comparable (`cache_engine.py:433`).
+
+| mirror | format | bytes a row | was (fp32) |
+|---|---|---|---|
+| window ring (`win`) | e4m3, a ue8m0 scale a group of 32, `[data \| scales]` a token | **528 B** | 2048 B |
+| compressed rows (`ckv`) | e2m1 nibbles, an e4m3 scale a group of 16 (the scale as stored scales the group) | **288 B** | 2048 B |
+| index keys (`ikey`) | e2m1, a ue8m0 scale a group of 32, block-wide sections (a block of 32 tokens: 2048 B of data, then 128 B of scales — a token's 4 scale bytes one packed int32) | **68 B** | 512 B |
+
+The compressor's `ring` stays fp32 (it is the pooling accumulator, not a mirror), as do
+`isc`, the masks and the engram buffers. A row is quantized once, after its last fp32
+reader (`chain_dsv4.comp` mode 13), and dequantized where it is read — the attention and
+the indexer's scores decode inline (modes 0, 3, 9, 10) — and on the write-back that ends
+a forward (mode 14), so the host's state stays the canonical copy — under
+`COLI_VK_KV_FP32=1` fp32 rows holding the dequantized values, under the packed default
+the codes themselves (below) — and rollback, prefix reuse and a lost device still
+rebuild nothing.
+
+The arithmetic at the released geometry, per token across the layers: about **6,400 B
+of mirror a position under `COLI_VK_KV_FP32=1` against about 890 B packed** (the
+compressed rows and index keys alone: 2.5 rows a position over the layers' compression
+ratios × (288 + 68) B; the window rings and the rollback rows are the planner's fixed
+term, priced below, not a per-position cost) — the figures of the prefill-VRAM analysis
+([dsv41-prefill-vram-2026-11-06](experiments/dsv41-prefill-vram-2026-11-06.md), whose
+§10 parked this as the lever that scales with context: 0.31 GiB of mirrors at 64K
+tokens, 0.62 at 128K, 4.7 at the 1M ceiling). Quantized, the mirrors' ~6,400 B a position
+become ~890: **0.78 → ~0.11 GiB at 128K (~690 MiB saved) and 6.25 → ~0.87 GiB at the 1M
+ceiling (~5.4 GiB saved)** — §10's 0.62/4.7 GiB figures were the audit's savings mislabeled
+as totals; the corrected basis is 6,400/890 B a position — the same math
+the kv-quant test family pins on the ledger line, which reports `(quantized)` when the
+mirrors are (a second device's mirrors are not in that line — the pre-existing gap).
+
+It is an **approximate mode** — and the default — while `COLI_VK_KV_FP32=1` is the exact
+fp32 opt-out, byte for byte what the engine ran before the default flipped (the flag
+branches only at the mirrors' widths and stores; a run's mirrors are summed against the
+flag's widths at the first forward, so a missed branch fails loudly). The FP4 index keys
+can move a top-k pick, so the logits drift a little — the `kv-quant-deepseek` family gates
+a documented tolerance instead of bit-identity, the way `V41_PREFILL_TAIL`'s tests accept
+the tail's own approximation — and the pull's write-back moves the code rows as bytes;
+under the KV split's give-way, where the host's codes dequantize up into the fp32 mirrors,
+the write-back packs again (a quantize→dequant hop the pack's idempotence bounds:
+re-packing a dequantized row reproduces its values, which the unit test pins). The flag
+needs `head_dim` 512 and
+`index_head_dim` 128: at any other geometry the flag declines — the default exactly like
+a set value, one line on stderr — and the mirrors stay fp32, so models at other KV
+geometries are untouched by the default. The planner prices the state below, and the
+fixed term with it: the KV split decides exactly as before, and when it arms the mirrors
+go back to fp32 whole (`v41c_kvq_give_way`), re-mirrored from the host.
+
+The fixed term is not the per-position cost, and it is the engine's own
+`v41_host_kv_bytes`: **(layers + stages) window rings plus `(dspark_block_size + 1)`
+rollback rows a layer** — the ring rows a speculative verify parks and rolls back to —
+which at the released geometry is 43 rings (40 layers + 3 DSpark stages) and 240 rows
+(6 a layer, `dspark_block_size` 5), **3,032,832 B** packed against 11,763,712 B fp32.
+With 2.5 compressed rows a position on top, the planner prints the engine's
+**17,614,592 B at 16K** (116,621,312 B under `COLI_VK_KV_FP32=1`) — the `host kv`
+16.8 MiB the ledger prints. The figure assumes DSpark loaded — the default, and a
+single KV slot. `V41_DSPARK=0` (or `KV_SLOTS` > 1) leaves the three stage rings
+unallocated, so the planner reserves 202,752 B packed (786,432 B fp32) more than the
+engine holds; the rollback rows stay, because a layer allocates them whether or not
+anything drafts. The stage count is read the way the checkpoint spells it,
+`num_nextn_predict_layers` (the released `config.json` carries no `n_mtp_layers`), which
+is also why the old planner priced 40 rings for a checkpoint whose engine keeps 43.
+
+### The host's state in the same formats (the default)
+
+`COLI_VK_KV_FP32` unset — the default, what an unset environment runs — holds the
+HOST's own KV arrays -- the window rings, the compressed rows, the index keys -- in the
+same cache formats the mirrors use, where `1` keeps dequantized fp32 rows: the host
+state drops from 6,400 B to 890 B a position at the released geometry (86.1% less). Writers pack at their stores (rms and
+the rope tail stage in a scratch row, never in place inside a code row), the read paths
+dequantize on read -- the kv_all build and the indexer decode into per-forward scratch,
+`V41_STATS` breaks that cost out as its own `kv read` line -- and the boundaries (the
+pull, park, reset, rollback, the swap between conversations) move code rows as bytes,
+with the index keys' block-wide sections never touched by a linear copy but a
+whole-buffer or whole-block one. The planner re-prices the state whenever the flag
+engages -- the default included (the
+host layout never gives way to the KV split -- only the device mirrors do, and the
+split's paths read the codes), and the turn-end ledger gains a `host kv` term so the
+savings are visible at all.
+
+What it buys, honestly measured (the memory ladder, --ram 28, kv_slots 1; every
+projection tagged by the audit's regime):
+
+| ctx | freed host RAM | +expert slots | effective --ram | prefill | decode |
+|---|---|---|---|---|---|
+| 16K | 86 MiB | 0 | +0.09 | ~0 | ~0 |
+| 64K | 344 MiB | 0 | +0.34 | guard margin (not throughput) | ≤+2% |
+| 128K | 689 MiB | +1 | +0.67 | guard margin, the split stays unarmed ~4x longer | ≤+2% (+3-8% only with a `COLI_VK_TIER_GB` raise) |
+| 256K | 1,377 MiB | +2 | +1.34 | ≤2% | ≤+4% |
+| 1M | 5.4 GiB | +7 | +5.51 | unmeasured | up to +50% capacity, unmeasured |
+
+The 64K row is the plan's ±1 resolved to 0, and the reason is the floor: the 344 MiB
+freed there is below one expert of every layer (771.14 MiB), and the slot a freed
+budget buys is the whole cache's `cache_bytes // per_cap`, not the freed bytes' own
+quotient.
+
+The honest ceiling, from the ladder's completed arm: in the measured 16K regime
+nothing moves -- prefill is disk-bound and decode is CPU/disk-bound -- and the past-32K
+walls (the MemAvailable guard, an unattributed end-of-prefill spike) are not KV-sized,
+so the packed host does not rescue them. The defensible wins are the guard margin at ≥64K, the
+`--ram` equivalence growing linearly with context, the KV split staying unarmed about
+4x longer (the quantized mirror crosses the ~1 GiB reserve near 640K of ckv/ikey
+against fp32's 160K), and -- only through an explicit `COLI_VK_TIER_GB` raise, since
+the tier's budget is fixed before the mirrors exist -- more device experts (at 128K:
++35 of 167). The 34 touchpoints — every writer, read path, boundary and planner price that moved —
+are itemized in #2701's follow-up.
+
+### Where the VRAM goes at a turn's end
+
+`V41_STATS=1` (or `COLI_VK_LEDGER=1`) ends every serve turn with one ledger line
+(`v41c_ledger`, `c/deepseek_v41_chain.h`), because nothing else printed the pieces
+that decide whether a prompt fits:
+
+```
+[VK] deepseek_v41 vram: weights 9710.5 MiB in 34 blocks (9608.2 MiB of rows in 521 tensors) |
+  chain 2060.0 MiB (dev 900.0 in 11 blocks, down 208.0 in 3, up 1024.0 in 10) | tier resident
+  2257.0 MiB + 48 slots 1012.5 MiB = 3269.5 of 3310.9 in 13 blocks | extra layers 232.0 in 1
+  blocks | kv mirror 115.0 MiB | process 15.31 GiB of 15.02 GiB in pools (290.5 MiB outside) |
+  device 15.91 GiB used of 15.98 (card2)
+```
+
+`weights` is the weight pool's blocks (the trunk's matrices *and* the ones the first
+forward still uploads: see below), `chain` the dense chain's live buffers and the three
+pools it allocates from, `tier` the expert pool — residents and streaming slots together,
+which is what its budget buys — `process` this engine's device bytes from
+`backend_vulkan.c`'s books, and `device` the card's live `mem_info_vram_used`.
+
+What it showed on the 16 GiB card, a 2-turn run with a 2600-word prompt:
+
+- **The audit's unattributed 2.14 GiB on a short-prompt run is not the tier.** On that
+  arm the tier's pools do not move after the warm start: the growth from the post-load
+  line (`device memory held 8187281408 B`, 7.63 GiB) to the turn's end is 1262.5 MiB of
+  the **lm head** (129280 x 5120 bf16) + 150 MiB of the 40 routers + 673 MiB of the
+  DSpark stages' matrices, all uploaded by the *first forward* and counted by neither the
+  chain's `dev_bytes` nor the tier's budget; 52 MiB is the KV mirrors. The weight pool
+  holds 9608.2 MiB of rows at the turn's end against the 7523.0 MiB the setup places.
+  The commit that added this line called the 1262.5 MiB the "token embedding"; that was
+  wrong and the correction is worth keeping, because it is a lever that does not exist.
+  The embedding has always lived on the **host**: `tie_word_embeddings` is false on this
+  checkpoint, the embedding and the head are two different `129280 x 5120` bf16 tensors,
+  and the embedding's only reader is `wb_row_f32` (`c/deepseek_v41.c`), which copies the
+  rows a step needs into the host's rows -- decode reads one row a token, a chunk reads a
+  row a position. A run instrumented at its first forward (every device upload printed)
+  shows `head.weight` going up as the 1262.5 MiB item and the embedding never touching
+  the device at all: the head is what the logits GEMV runs on the device, 662 million
+  multiply-adds a token, so it is hot and it stays. The routers' 150 MiB are the same
+  kind of item (a per-layer GEMV every forward). What is left of that 2.1 GiB is the
+  DSpark stages' 673 MiB, used whenever the draft head runs.
+- **The streaming slots cost one 256 MiB block, not 1.35 GiB.** The tier splits its
+  budget between residents and slots (`fit = fit_raw - slots`), so shrinking the slot
+  set does not by itself free anything: 64 slots and 91 residents fill the same 13 pool
+  blocks as 48 and 107. The slots are now 48 by default (`COLI_VK_TIER_STREAM_SLOTS`;
+  the measured runs used 44 of 64 at most), and the chunk's sizing reserves them before
+  it reads the free memory (`vkt_slot_reserve`), so a 1280-row chunk becomes 1024 at
+  default settings. Together that took the engine's own hold at the turn boundary from
+  15.53 to 15.26 GiB (chain 2133.7 -> 2060.0 MiB) with the prefill wall +2%.
+- **The card's sysfs peak does not measure the engine here.** It is pinned at the card's
+  ceiling because the desktop yields: with the tier forced to 2.0 GiB the engine held
+  1.46 GiB less and the sysfs peak fell 0.19 GiB, the compositor taking 1.27 GiB of what
+  was freed. Read `process` for the engine, not the card. (On a prompt small enough not
+  to press on the ceiling — the 11-token one — the two agree: peak = `process` + 2.49
+  GiB of desktop.)
+- **The candidate mask is one bit a column now, and the chunk it allows is twice as
+  tall.** The indexer's scores and its candidate mask are quadratic in the prompt (a row
+  of a chunk scores every compressed column below the prompt's end), and the mask was an
+  fp32 word a column that only ever meant "kept" or "not" -- read as `!= 0` by the score
+  kernel, by the host, and by the CPU's layers after a partial chain. `vkc_dsv4_cand`
+  writes it as a bit now (`c/shaders/chain_dsv4.comp`, modes 3/4/9/10), so a row costs
+  `4E` bytes of scores plus `E/8` of mask instead of `8E`, and the chunk's quadratic cap
+  (`v41c_forward_seg`) keeps the same 256 MiB pair budget for 1.94x the rows: at a
+  20000-position prompt a chunk was 1677 rows and is 3253, and the row cost the chunk
+  sizing prints fell from 181 to 105 KiB on the tiny fixture. On the released checkpoint,
+  where the mask was 4 bytes of every one of a row's E columns: 1303 -> 1298 KiB a row at
+  E=1300 (measured) and 1317 -> 1305 at E=3107 (the 1317 the audit prints; the mask's
+  12.1 KiB of it becomes 0.4). Nothing selects differently: the picked blocks are
+  still kept whole, and the same bits come out (`tests/test_vk_chain.c`'s indexer case
+  compares the mask column for column, through the single-row and the grid kernels).
+- **The per-layer drain is not what the chain waits for.** The audit's R4 asked for the
+  `vkc_finish()` once a layer (`c/deepseek_v41_chain.h`, after the attention frame) to
+  wait only the frames the host reads. Measured with both halves timed separately, a
+  1280-row chunk spends 28095 ms waiting for the frame it reads and **0.5 ms** waiting
+  for the rest: two frames are in flight at a time, and a single queue runs submissions
+  in order (every frame starts with a barrier on everything submitted before it), so the
+  frame holding the previous layer's shared expert is always through before this
+  layer's attention starts. The change was implemented, measured at 0.5 ms a chunk and
+  dropped: the wait that remains is the attention itself, which the host needs (the
+  routed experts' norm and, at the candidate layer, the mask). R4's own estimate
+  (2-8 ms a chunk) is right; nothing 60-second-sized hides in the drain -- the device is
+  idle during `moe_run_at` instead, and that is the pipelining the chain does not do.
+- **Streaming a cold expert pays from two rows, not sixteen.** `COLI_VK_TIER_STREAM_MIN`
+  is 2 now, from a measurement of one 21.1 MiB expert (`COLI_VK_CHAIN_BENCH=xbrows`): a
+  device step costs 0.12 ms at 1 row, 0.40 at 4 and 0.76 at 16 (the tiled GEMM from
+  there) against a 2.2 ms upload and the CPU's 2.05-2.52 ms a row. On the chunk-256
+  workload the CPU's share of expert-rows fell from 34.5% to 1.6% and the prefill from
+  226.7 to 175.9 ms a row; the device reads 2 TB of experts to do it, so it pays in disk
+  bandwidth, not in time.
 
 ## Reusing a turn, and why it is asked for rather than assumed
 
@@ -650,6 +877,15 @@ needed.
 The gateway is tested against the checkpoint's own encoding fixtures
 (`tests/test_openai_tools_v41_e2e.py`), and an image is followed all the way from an
 OpenAI request to a different answer in `tests/test_dsv41_image_serve.py`.
+
+The quantized mirrors have their own family: `tests/test_vk_kv_quant.c` holds the
+device's pack to `c/dsv41_kvq.h`'s reference bit for bit (the edge rows of the scale
+math included), the unpack, a re-upload's lanes and the pack's idempotence, and the
+index scores over quantized keys to the decoded rows' bits with the original rows'
+top-k overlap reported; `tests/vulkan_engines.sh kv-quant-deepseek` runs the tiny
+fixture at the released KV geometry under the flag against a documented logits
+tolerance (the approximate mode cannot be bit-exact; the flag-off run is the exactness
+proof) and checks the ledger's mirror math.
 
 ## Where this engine is not the vendor
 

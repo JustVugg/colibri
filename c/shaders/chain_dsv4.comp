@@ -28,15 +28,19 @@
 //   the first. The ring: kv rows at ring_off, score rows after them ((1+overlap)*ratio
 //   rows of P each).
 // mode 3, the indexer's scores (deepseek_v41.c indexer_run): one workgroup per row s,
-//   position pos = pos_base + s, lens = (pos + 1) / ratio. For j < width: j < lens (and
-//   mask[mask_off + s*mask_row + j] != 0 when mask_row > 0) scores sum_h [dot > 0] dot *
-//   w_h, dot = q_h . key[j] (k_off + j*k_row), w_h = hw[w_off + s*w_row + h] * wscale; any
-//   other j scores -inf. Into sc[sc_off + s*sc_row + j]. Limits: IH <= 64, IH*ID <= 4096.
+//   position pos = pos_base + s, lens = (pos + 1) / ratio. For j < width: j < lens (and,
+//   when mask_row > 0, column j of the candidate mask set: one bit a column, bit j & 31 of
+//   the int at mask_off + s*mask_row + (j >> 5), the row's stride in words) scores
+//   sum_h [dot > 0] dot * w_h, dot = q_h . key[j] (k_off + j*k_row), w_h =
+//   hw[w_off + s*w_row + h] * wscale; any other j scores -inf. Into sc[sc_off + s*sc_row
+//   + j]. Limits: IH <= 64, IH*ID <= 4096.
 // mode 4, the candidate blocks (model.py select_candidate_blocks): one workgroup per row
 //   s: the best score of each block of `block` columns of the row's first `width`, the
 //   block holding column lens - 1 pinned (+inf), then min(topb, blocks) times the best
-//   block above -inf (the lower block on a tie), each kept whole: mask[s*mask_row + j] =
-//   1 for its columns, 0 elsewhere. Limit: 4096 blocks.
+//   block above -inf (the lower block on a tie), each kept whole: column j of the mask is
+//   set for the chosen blocks' columns, cleared for every column below `width` -- one bit
+//   a column, bit j & 31 of the int at s*mask_row + (j >> 5) (the row's stride in words,
+//   the columns above `width` in the last word written 0). Limit: 4096 blocks.
 // mode 5, the top-k: one workgroup per row s: keep = min(topk, the scores above -inf);
 //   the keep largest, ties to the lower column (the CPU's selection), written as base + j
 //   to list[l_off + s*l_row + k], k < keep, in ascending column order (order 0) or by
@@ -70,17 +74,42 @@
 // mode 9, mode 3 for queries above 4096 floats (DeepSeek V4's 64 heads of 128): the
 //   queries read from memory instead of staged, the sums in mode 3's order (the same
 //   bits). Limit: IH <= 4096.
-// Offsets and strides in floats (ints for lists and masks).
+// mode 10, modes 3 and 9 on a grid (its comment below).
+//
+// the packed cache, COLI_VK_KV_FP32 unset (c/dsv41_kvq.h, DeepInfer's cache formats): modes 0, 3, 9 and 10 gain
+// a quantized read of their KV buffers, and modes 13/14 pack and unpack the mirrors:
+//   win  e4m3 + a ue8m0 scale per 32, [data | scales] a token: a 528 B row (132 words)
+//   ckv  e2m1 + an e4m3 scale per 16, [data | scales] a token: a 288 B row (72 words)
+//   ikey e2m1 + a ue8m0 scale per 32, block-wide sections, a block of 32 tokens: 2048 B
+//        of data then 128 B of scales, a token's 4 scale bytes one packed int32 (68 B/token)
+// mode 0 flags bit 1 (2) and VkcDsScore's `quant` field turn the reads on; the flags off
+// (and every DeepSeek V4 call) keep the code above, bit for bit. THE OFFSET FIELDS' MEANING
+// CHANGES WITH THEM: w_off/c_off/k_off stay float offsets of row/token 0, but a row's
+// stride becomes 528 B (win), 288 B (ckv) or a 2176 B block (ikey: token 64 B into the
+// data section, its scales 4 B into the scale one) instead of hd floats -- see vk_chain.h.
+// The bytes are read out of the float buffers as the little-endian lanes of their words
+// (byte b: lane b & 3 of floatBitsToUint(buf[b >> 2])); the host that fills them (vkc_write)
+// is little-endian, the assumption the kv-quant test's re-upload arm pins, and DI's cuda
+// loader reads the scales the same way (uint32 << 23).
+// mode 13 quantizes: one workgroup a source row, its 32-bit words written whole to i6 (a
+//   thread a data word: 4 e4m3 bytes or 8 e2m1 nibbles of one group; the threads past them
+//   a scale word), the scale math dsv41_kvq.h spells: the ceil-pow2 ue8m0 exponent of
+//   max(amax, margin)/quant_max, or e4m3-RNE of min(clamped/6, 448) decoded back, values
+//   RNE. kind 0 scatters the rows into win ring slots (dst_tok + s) % Wd, kind 1 packs ckv
+//   rows at token dst_tok + s, kind 2 ikey rows into their block sections.
+// mode 14 dequantizes the same rows to fp32 into y5 (the pull's write-back and the test).
+// Offsets and strides in floats (ints for lists, words for the packed candidate mask;
+// under the quant bits a KV row's stride is its byte width / 4, as above).
 #extension GL_KHR_shader_subgroup_basic : enable
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer B0 { float b0[]; };   // q, kv rows, iq, scores, engram kv
 layout(std430, binding = 1) readonly buffer B1 { float b1[]; };   // window ring, score rows, hw, prm
 layout(std430, binding = 2) readonly buffer B2 { float b2[]; };   // compressed rows, index keys
-layout(std430, binding = 3) readonly buffer L3 { int l3[]; };     // attention list, score mask
+layout(std430, binding = 3) readonly buffer L3 { int l3[]; };     // attention list, score mask (packed bits)
 layout(std430, binding = 4) readonly buffer B4 { float b4[]; };   // sinks, ape, cos/sin
 layout(std430, binding = 5) buffer Y5 { float y5[]; };            // outputs (in place for 1, 6)
-layout(std430, binding = 6) buffer I6 { int i6[]; };              // top-k list, candidate mask
+layout(std430, binding = 6) buffer I6 { int i6[]; };              // top-k list, candidate mask (packed bits)
 layout(std430, binding = 7) buffer R7 { float r7[]; };            // the compressor's ring
 
 layout(push_constant) uniform P { int v[32]; } p;
@@ -89,9 +118,14 @@ layout(push_constant) uniform P { int v[32]; } p;
 shared float sm[4160];
 shared float red[256];
 shared uint cnt[256];
+shared uint schosen[129];   // mode 4: the blocks picked, one bit each (<= 4096 blocks)
 
 #define NEG_INF uintBitsToFloat(0xff800000u)
 #define POS_INF uintBitsToFloat(0x7f800000u)
+
+// mode 3/9/10: is column j of the candidate mask row at mb (stride mr words) set? One bit a
+// column, and mr <= 0 when the row has no mask (an index source before the candidate one).
+bool mbit(int mb, int mr, int j) { return mr <= 0 || ((uint(l3[mb + (j >> 5)]) >> uint(j & 31)) & 1u) != 0u; }
 
 float bf16r(float f) {   // round to nearest even, as coli_bf16_round
     uint u = floatBitsToUint(f);
@@ -133,6 +167,80 @@ uint wscan(uint v, int tid) {   // exclusive, in thread order
     return incl - v;
 }
 
+// ---- the KV-quant codec (the header's COLI_VK_KV_FP32 paragraph; c/dsv41_kvq.h is the
+// host reference -- the same bits). A byte of a float buffer is a lane of its word; the
+// mirrors' rows are whole words, so the loads stay aligned. ------------------------
+float ue8m0d(uint u) { return uintBitsToFloat((u & 0xffu) << 23); }   // 2^(b-127), DI's decode
+float e4m3d(uint u) {
+    int e = int((u >> 3) & 15u), m = int(u & 7u);
+    float v = e != 0 ? ldexp(1.0 + float(m) * 0.125, e - 7) : ldexp(float(m), -9);
+    return (u & 0x80u) != 0u ? -v : v;
+}
+float e2m1d(uint u) {
+    const float g[8] = float[8](0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0);
+    float v = g[u & 7u];
+    return (u & 8u) != 0u ? -v : v;
+}
+uint b0b(int fb, int b) { return (floatBitsToUint(b0[fb + (b >> 2)]) >> ((b & 3) << 3)) & 0xffu; }
+uint b1b(int fb, int b) { return (floatBitsToUint(b1[fb + (b >> 2)]) >> ((b & 3) << 3)) & 0xffu; }
+uint b2b(int fb, int b) { return (floatBitsToUint(b2[fb + (b >> 2)]) >> ((b & 3) << 3)) & 0xffu; }
+// a 528 B window row at float base fb: e4m3 data, a ue8m0 scale a group of 32
+float winq(int fb, int i) { return e4m3d(b1b(fb, i)) * ue8m0d(b1b(fb, 512 + (i >> 5))); }
+// a 288 B compressed row at float base fb: e2m1 nibbles, an e4m3 scale a group of 16
+float ckvq(int fb, int i) {
+    uint nb = b2b(fb, i >> 1);
+    uint nib = (i & 1) != 0 ? (nb >> 4) : (nb & 15u);
+    return e2m1d(nib) * e4m3d(b2b(fb, 256 + (i >> 4)));
+}
+// an index-key row j out of its block sections (ko: token 0's float base in b2): the
+// token's 64 data bytes at 16 words into the block, its 4 ue8m0 bytes one word after them
+float ikeyq(int ko, int j, int i) {
+    int blk = ko + (j >> 5) * 544, tb = blk + (j & 31) * 16;
+    uint nb = b2b(tb, i >> 1);
+    uint nib = (i & 1) != 0 ? (nb >> 4) : (nb & 15u);
+    return e2m1d(nib) * ue8m0d(b2b(blk + 512 + (j & 31), i >> 5));
+}
+// the encoders, each dsv41_kvq.h's reference
+uint rne_int8(float f) {   // f in [0, 8]: the nearest integer, a tie to the even one
+    uint r = uint(f + 0.5);
+    if (fract(f) == 0.5) r = (uint(f) & 1u) != 0u ? uint(f) + 1u : uint(f);
+    return r;
+}
+uint e4m3c(float v) {      // RNE to e4m3, ties to the even code (kvq_e4m3_code)
+    float a = abs(v);
+    uint s = (floatBitsToUint(v) & 0x80000000u) != 0u ? 0x80u : 0u;
+    if (a >= 448.0) return s | 126u;                      // the nearest code of >= 448 is 448
+    uint u = floatBitsToUint(a), c;
+    if (a >= 0.015625) {                                  // 2^-6 up: the mantissa to 3 bits
+        u = (u + 0x7ffffu + ((u >> 20) & 1u)) & 0xfff00000u;
+        c = ((((u >> 23) & 0xffu) - 120u) << 3) | ((u >> 20) & 7u);
+    } else c = rne_int8(a * 512.0);                       // a subnormal: m * 2^-9, m in [0, 8]
+    return s | c;
+}
+uint e2m1c(float x) {      // the nearest of the grid, ties to the even code (kvq_e2m1_code)
+    float a = abs(x);
+    uint s = (floatBitsToUint(x) & 0x80000000u) != 0u ? 8u : 0u;
+    uint c = a <= 0.25 ? 0u : a < 0.75 ? 1u : a <= 1.25 ? 2u : a < 1.75 ? 3u
+           : a <= 2.5 ? 4u : a < 3.5 ? 5u : a <= 5.0 ? 6u : 7u;
+    return s | c;
+}
+uint ue8m0c(float amax, float qmax) {   // the ceil-pow2 exponent byte of amax/qmax
+    return ((floatBitsToUint(amax * (1.0 / qmax)) - 1u) >> 23) + 1u;   // a multiply, as the host's
+}
+/* the exact reciprocals, as bit math (a GPU's 1/x may be a fast reciprocal a couple of
+ * ulps low, and the codec must match dsv41_kvq.h's bits): the ue8m0 scale's inverse is
+ * (254 - b) << 23, DI's own formula; an e4m3 scale's is RNE(8/(8+m)) shifted by the
+ * exponent (DI's reciprocal LUT: scaling by a power of two is exact and keeps the tie
+ * parity), a subnormal sf (m * 2^-9) reciprocals to 512/m */
+float ue8m0i(uint b) { return uintBitsToFloat((254u - (b & 0xffu)) << 23); }
+float e4m3i(uint sf) {
+    int e = int((sf >> 3) & 15u), m = int(sf & 7u);
+    const uint rn[8] = uint[8](0x3f800000u, 0x3f638e39u, 0x3f4ccccdu, 0x3f3a2e8cu, 0x3f2aaaabu, 0x3f1d89d9u, 0x3f124925u, 0x3f088889u);
+    const uint rs[8] = uint[8](0x3f800000u, 0x44000000u, 0x43800000u, 0x432aaaabu, 0x43000000u, 0x42cccccdu, 0x42aaaaabu, 0x42924925u);
+    uint u = (e != 0 ? rn[m] + uint(7 - e) * 0x800000u : rs[m]) | ((sf & 0x80u) << 24);
+    return uintBitsToFloat(u);
+}
+
 // ---- mode 0 ------------------------------------------------------------------------
 void attend() {
     int h = int(gl_WorkGroupID.x), s = int(gl_WorkGroupID.y), tid = int(gl_LocalInvocationID.x);
@@ -142,6 +250,7 @@ void attend() {
     int qb = p.v[10] + s * p.v[11] + h * hd, ob = p.v[12] + s * p.v[13] + h * hd;
     float sink = b4[p.v[14] + h];
     int flags = p.v[15];
+    int quant = (flags >> 1) & 1;   // the packed cache: a row's stride is its byte width / 4
     float scale = intBitsToFloat(p.v[16]);
     for (int i = tid; i < hd; i += 256) sm[i] = b0[qb + i];
     barrier();
@@ -151,7 +260,10 @@ void attend() {
         float sc = NEG_INF;
         if (e >= 0) {
             float d = 0.0;
-            if (e < nwin) { int kb = woff + e * hd; for (int i = 0; i < hd; i++) d += sm[i] * b1[kb + i]; }
+            if (quant != 0) {
+                int kb = e < nwin ? woff + e * 132 : coff + (e - nwin) * 72;
+                for (int i = 0; i < hd; i++) d += sm[i] * (e < nwin ? winq(kb, i) : ckvq(kb, i));
+            } else if (e < nwin) { int kb = woff + e * hd; for (int i = 0; i < hd; i++) d += sm[i] * b1[kb + i]; }
             else { int kb = coff + (e - nwin) * hd; for (int i = 0; i < hd; i++) d += sm[i] * b2[kb + i]; }
             sc = d * scale;
             if (sc > best) best = sc;
@@ -185,7 +297,9 @@ void attend() {
             if (e < 0) continue;
             float w = sm[1024 + j];
             if ((flags & 1) != 0) w = bf16r(w);
-            float k = e < nwin ? b1[woff + e * hd + i] : b2[coff + (e - nwin) * hd + i];
+            float k;
+            if (quant != 0) k = e < nwin ? winq(woff + e * 132, i) : ckvq(coff + (e - nwin) * 72, i);
+            else k = e < nwin ? b1[woff + e * hd + i] : b2[coff + (e - nwin) * hd + i];
             acc += w * k;
         }
         float o = acc / den;
@@ -266,17 +380,19 @@ void score() {
     int qb = p.v[7] + s * p.v[8], wb = p.v[9] + s * p.v[10];
     int ko = p.v[11], kr = p.v[12], mr = p.v[13], sb = p.v[16] + s * p.v[14], mb = p.v[17] + s * mr;
     float wscale = intBitsToFloat(p.v[15]);
+    int quant = p.v[18];   // the packed cache: the keys in the block-sections layout
     for (int i = tid; i < IH * ID; i += 256) sm[i] = b0[qb + i];
     for (int h = tid; h < IH; h += 256) sm[4096 + h] = b1[wb + h] * wscale;
     barrier();
     for (int j = tid; j < width; j += 256) {
         float v = NEG_INF;
-        if (j < lens && (mr <= 0 || l3[mb + j] != 0)) {
+        if (j < lens && mbit(mb, mr, j)) {
             int kb = ko + j * kr;
             float tot = 0.0;
             for (int h = 0; h < IH; h++) {
                 float d = 0.0;
-                for (int i = 0; i < ID; i++) d += sm[h * ID + i] * b2[kb + i];
+                if (quant != 0) { for (int i = 0; i < ID; i++) d += sm[h * ID + i] * ikeyq(ko, j, i); }
+                else { for (int i = 0; i < ID; i++) d += sm[h * ID + i] * b2[kb + i]; }
                 if (d > 0.0) tot += d * sm[4096 + h];
             }
             v = tot;
@@ -290,13 +406,14 @@ void candidates() {
     int s = int(gl_WorkGroupID.x), tid = int(gl_LocalInvocationID.x);
     int pos = p.v[2] + s, lens = (pos + 1) / p.v[3];
     int width = p.v[4], blk = p.v[5], topb = p.v[6], sb = s * p.v[7], mb = s * p.v[8];
-    int blocks = (width + blk - 1) / blk;
+    int blocks = (width + blk - 1) / blk, words = (width + 31) >> 5;
     for (int b = tid; b < blocks; b += 256) {
         float top = NEG_INF;
         for (int i = b * blk; i < (b + 1) * blk && i < width; i++) { float v = b0[sb + i]; if (v > top) top = v; }
         sm[b] = top;
     }
-    for (int i = tid; i < width; i += 256) i6[mb + i] = 0;
+    for (int w = tid; w < words; w += 256) i6[mb + w] = 0;
+    for (int w = tid; w < (blocks + 31) >> 5; w += 256) schosen[w] = 0u;
     memoryBarrierBuffer();
     barrier();
     // C's (lens - 1) / block, which truncates toward zero
@@ -326,9 +443,18 @@ void candidates() {
         barrier();
         if (chosen == 0x7fffffffu) break;
         int cb = int(chosen);
-        for (int i = cb * blk + tid; i < (cb + 1) * blk && i < width; i += 256) i6[mb + i] = 1;
-        if (tid == 0) sm[cb] = NEG_INF;
+        if (tid == 0) { schosen[cb >> 5] |= 1u << uint(cb & 31); sm[cb] = NEG_INF; }
         barrier();
+    }
+    /* the row's words: column c is kept when its block was picked (each kept whole) */
+    barrier();
+    for (int w = tid; w < words; w += 256) {
+        uint v = 0u;
+        for (int t = 0; t < 32; t++) {
+            int c = (w << 5) + t;
+            if (c < width && ((schosen[(c / blk) >> 5] >> uint((c / blk) & 31)) & 1u) != 0u) v |= 1u << uint(t);
+        }
+        i6[mb + w] = int(v);
     }
 }
 
@@ -426,16 +552,18 @@ void score_wide() {
     int qb = p.v[7] + s * p.v[8], wb = p.v[9] + s * p.v[10];
     int ko = p.v[11], kr = p.v[12], mr = p.v[13], sb = p.v[16] + s * p.v[14], mb = p.v[17] + s * mr;
     float wscale = intBitsToFloat(p.v[15]);
+    int quant = p.v[18];
     for (int h = tid; h < IH; h += 256) sm[h] = b1[wb + h] * wscale;
     barrier();
     for (int j = tid; j < width; j += 256) {
         float v = NEG_INF;
-        if (j < lens && (mr <= 0 || l3[mb + j] != 0)) {
+        if (j < lens && mbit(mb, mr, j)) {
             int kb = ko + j * kr;
             float tot = 0.0;
             for (int h = 0; h < IH; h++) {
                 float d = 0.0;
-                for (int i = 0; i < ID; i++) d += b0[qb + h * ID + i] * b2[kb + i];
+                if (quant != 0) { for (int i = 0; i < ID; i++) d += b0[qb + h * ID + i] * ikeyq(ko, j, i); }
+                else { for (int i = 0; i < ID; i++) d += b0[qb + h * ID + i] * b2[kb + i]; }
                 if (d > 0.0) tot += d * sm[h];
             }
             v = tot;
@@ -457,6 +585,7 @@ void score_grid() {
     int qb = p.v[7] + s * p.v[8], wb = p.v[9] + s * p.v[10];
     int ko = p.v[11], kr = p.v[12], mr = p.v[13], sb = p.v[16] + s * p.v[14], mb = p.v[17] + s * mr;
     float wscale = intBitsToFloat(p.v[15]);
+    int quant = p.v[18];
     int P = max(1, 256 / IH), j0 = int(gl_WorkGroupID.x) * P;
     if (j0 >= width) return;   // uniform
     bool sh = IH <= 64 && IH * ID <= 4096;   // mode 3's queries in shared memory; else mode 9's from memory
@@ -465,10 +594,11 @@ void score_grid() {
     for (int h = tid; h < IH; h += 256) sm[wo + h] = b1[wb + h] * wscale;
     barrier();
     int jj = tid / IH, h = tid - jj * IH, j = j0 + jj;
-    if (jj < P && j < width && j < lens && (mr <= 0 || l3[mb + j] != 0)) {
+    if (jj < P && j < width && j < lens && mbit(mb, mr, j)) {
         int kb = ko + j * kr;
         float d = 0.0;
-        if (sh) for (int i = 0; i < ID; i++) d += sm[h * ID + i] * b2[kb + i];
+        if (quant != 0) { for (int i = 0; i < ID; i++) d += (sh ? sm[h * ID + i] : b0[qb + h * ID + i]) * ikeyq(ko, j, i); }
+        else if (sh) for (int i = 0; i < ID; i++) d += sm[h * ID + i] * b2[kb + i];
         else for (int i = 0; i < ID; i++) d += b0[qb + h * ID + i] * b2[kb + i];
         red[tid] = d;
     }
@@ -476,7 +606,7 @@ void score_grid() {
     int jt = j0 + tid;
     if (tid < P && jt < width) {
         float v = NEG_INF;
-        if (jt < lens && (mr <= 0 || l3[mb + jt] != 0)) {
+        if (jt < lens && mbit(mb, mr, jt)) {
             float tot = 0.0;
             for (int g = 0; g < IH; g++) { float d = red[tid * IH + g]; if (d > 0.0) tot += d * sm[wo + g]; }
             v = tot;
@@ -587,6 +717,111 @@ void swiglu_v4() {
     y5[p.v[4] + t] = bf16r(g * sig(g) * u);
 }
 
+// ---- mode 13 -----------------------------------------------------------------------
+// the packed cache's pack (the header's paragraph): one workgroup a source row s of hd
+// (p.v[3]) floats at src_off + s*src_row (b0, fp32), its 32-bit words written whole to i6.
+// kind 0 a window row of 528 B into ring slot (dst_tok + s) % Wd: a thread < 128 the data
+// word tid (4 e4m3 bytes of the group tid >> 3), the threads 128..131 a scale word (4
+// ue8m0 bytes). kind 1 a compressed row of 288 B at token dst_tok + s: a thread < 64 the
+// data word tid (8 e2m1 nibbles of the group tid >> 1), 64..71 a scale word (4 e4m3). kind
+// 2 an index-key row of 128 floats into its block sections: a thread < 16 the data word tid
+// (the group tid >> 2), thread 16 the token's 4 ue8m0 bytes. The scale math is dsv41_kvq.h's.
+void quantize() {
+    int s = int(gl_WorkGroupID.x), tid = int(gl_LocalInvocationID.x);
+    int kind = p.v[1], src_off = p.v[4], src_row = p.v[5], tok = p.v[6], Wd = p.v[7];
+    int sb = src_off + s * src_row;   // the row's first float
+    if (kind == 0) {   // win: 512 e4m3 bytes then 16 ue8m0, a group of 32
+        int w = ((tok + s) % Wd) * 132;
+        if (tid < 128) {
+            int g = tid >> 3;  float mx = 0.0;
+            for (int i = g * 32; i < g * 32 + 32; i++) mx = max(mx, abs(b0[sb + i]));
+            uint sfb = ue8m0c(max(mx, 1e-4), 448.0), word = 0u;
+            float inv = ue8m0i(sfb);
+            for (int k = 3; k >= 0; k--) word = (word << 8) | e4m3c(b0[sb + tid * 4 + k] * inv);
+            i6[w + tid] = int(word);
+        } else if (tid < 132) {
+            uint word = 0u;
+            int gb = (tid - 128) * 4;
+            for (int g = 3; g >= 0; g--) {
+                float mx = 0.0;
+                for (int i = (gb + g) * 32; i < (gb + g + 1) * 32; i++) mx = max(mx, abs(b0[sb + i]));
+                word = (word << 8) | ue8m0c(max(mx, 1e-4), 448.0);
+            }
+            i6[w + tid] = int(word);
+        }
+    } else if (kind == 1) {   // ckv: 256 e2m1 bytes then 32 e4m3, a group of 16
+        int w = (tok + s) * 72;
+        if (tid < 64) {
+            int g = tid >> 1;  float mx = 0.0;
+            for (int i = g * 16; i < g * 16 + 16; i++) mx = max(mx, abs(b0[sb + i]));
+            float cl = max(mx, 0.01171875);
+            uint sfb = e4m3c(min(cl * (1.0 / 6.0), 448.0)), word = 0u;
+            float inv = e4m3i(sfb);
+            if (cl * inv <= 5.0) { sfb--; inv = e4m3i(sfb); }   // the near-dead band's demote, kvq_pack_ckv
+            for (int k = 7; k >= 0; k--) word = (word << 4) | e2m1c(b0[sb + tid * 8 + k] * inv);
+            i6[w + tid] = int(word);
+        } else if (tid < 72) {
+            uint word = 0u;
+            int gb = (tid - 64) * 4;
+            for (int g = 3; g >= 0; g--) {
+                float mx = 0.0;
+                for (int i = (gb + g) * 16; i < (gb + g + 1) * 16; i++) mx = max(mx, abs(b0[sb + i]));
+                float cl = max(mx, 0.01171875);
+                uint sfb = e4m3c(min(cl * (1.0 / 6.0), 448.0));
+                if (cl * e4m3i(sfb) <= 5.0) sfb--;   // the demote, as the data threads above
+                word = (word << 8) | sfb;
+            }
+            i6[w + tid] = int(word);
+        }
+    } else {   // ikey: 64 data bytes then the token's 4 ue8m0, blocks of 32 tokens
+        int blk = ((tok + s) >> 5) * 544, t = (tok + s) & 31;
+        if (tid < 16) {
+            int g = tid >> 2;  float mx = 0.0;
+            for (int i = g * 32; i < g * 32 + 32; i++) mx = max(mx, abs(b0[sb + i]));
+            uint sfb = ue8m0c(max(mx, 7.0529661e-38), 6.0), word = 0u;   // the margin 6 * 2^-126
+            float inv = ue8m0i(sfb);
+            for (int k = 7; k >= 0; k--) word = (word << 4) | e2m1c(b0[sb + tid * 8 + k] * inv);
+            i6[blk + t * 16 + tid] = int(word);
+        } else if (tid == 16) {
+            uint word = 0u;
+            for (int g = 3; g >= 0; g--) {
+                float mx = 0.0;
+                for (int i = g * 32; i < g * 32 + 32; i++) mx = max(mx, abs(b0[sb + i]));
+                word = (word << 8) | ue8m0c(max(mx, 7.0529661e-38), 6.0);
+            }
+            i6[blk + 512 + t] = int(word);
+        }
+    }
+}
+
+// ---- mode 14 -----------------------------------------------------------------------
+// the packed cache's unpack: one workgroup a row, its floats to y5 at dst_off +
+// s*dst_row. kind 0 reads ring slot (src_tok + s) % Wd, kind 1 compressed token src_tok
+// + s, kind 2 the index-key token src_tok + s out of its block sections (b0 the mirror).
+void dequant() {
+    int s = int(gl_WorkGroupID.x), tid = int(gl_LocalInvocationID.x);
+    int kind = p.v[1], n = p.v[3], src_tok = p.v[4], Wd = p.v[5], dst_off = p.v[6], dst_row = p.v[7];
+    int db = dst_off + s * dst_row;
+    if (kind == 0) {
+        int fb = ((src_tok + s) % Wd) * 132;
+        for (int i = tid; i < n; i += 256) y5[db + i] = e4m3d(b0b(fb, i)) * ue8m0d(b0b(fb, 512 + (i >> 5)));
+    } else if (kind == 1) {
+        int fb = (src_tok + s) * 72;
+        for (int i = tid; i < n; i += 256) {
+            uint nb = b0b(fb, i >> 1);
+            uint nib = (i & 1) != 0 ? (nb >> 4) : (nb & 15u);
+            y5[db + i] = e2m1d(nib) * e4m3d(b0b(fb, 256 + (i >> 4)));
+        }
+    } else {
+        int blk = ((src_tok + s) >> 5) * 544, t = (src_tok + s) & 31, fb = blk + t * 16;
+        for (int i = tid; i < n; i += 256) {
+            uint nb = b0b(fb, i >> 1);
+            uint nib = (i & 1) != 0 ? (nb >> 4) : (nb & 15u);
+            y5[db + i] = e2m1d(nib) * ue8m0d(b0b(blk + 512 + t, i >> 5));
+        }
+    }
+}
+
 void main() {
     int m = MODE;
     if (m == 0) attend();
@@ -600,4 +835,6 @@ void main() {
     else if (m == 8) swiglu_v4();
     else if (m == 9) score_wide();
     else if (m == 10) score_grid();
+    else if (m == 13) quantize();
+    else if (m == 14) dequant();
 }

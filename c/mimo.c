@@ -2606,9 +2606,9 @@ static int mimo_ps_parts(Model *m, ColiPsPart *parts) {
     for (int li = 0; li < c->n_layers; li++) {
         Layer *l = &m->L[li]; const int k = c->swa[li];
         if (k) continue;
-        parts[n++] = (ColiPsPart){l->K, (size_t)c->kv_heads[k] * c->head_dim[k] * sizeof(float), l->rows, 1, 0, 1};
-        parts[n++] = (ColiPsPart){l->V, (size_t)c->kv_heads[k] * c->v_dim[k] * sizeof(float), l->rows, 1, 0, 1};
-        parts[n++] = (ColiPsPart){l->ring_pos, sizeof(int), l->rows, 1, 0, 1};
+        parts[n++] = (ColiPsPart){l->K, (size_t)c->kv_heads[k] * c->head_dim[k] * sizeof(float), l->rows, 1, 0, 1, 0};
+        parts[n++] = (ColiPsPart){l->V, (size_t)c->kv_heads[k] * c->v_dim[k] * sizeof(float), l->rows, 1, 0, 1, 0};
+        parts[n++] = (ColiPsPart){l->ring_pos, sizeof(int), l->rows, 1, 0, 1, 0};
     }
     return n;
 }

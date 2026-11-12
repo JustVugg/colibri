@@ -2243,9 +2243,9 @@ static int q38_ps_parts(const Model *m,ColiPsPart *parts){
     int n=0;
     for(int i=0;i<q38_layer_rows(m);i++){
         if(!m->K[i]||!m->V[i]||!m->IK[i])continue;
-        parts[n++]=(ColiPsPart){m->K[i],D,m->kv_cap,c->kv_heads,(size_t)m->kv_cap*D,1};
-        parts[n++]=(ColiPsPart){m->V[i],D,m->kv_cap,c->kv_heads,(size_t)m->kv_cap*D,1};
-        parts[n++]=(ColiPsPart){m->IK[i],ID,m->kv_cap,1,0,1};
+        parts[n++]=(ColiPsPart){m->K[i],D,m->kv_cap,c->kv_heads,(size_t)m->kv_cap*D,1, 0};
+        parts[n++]=(ColiPsPart){m->V[i],D,m->kv_cap,c->kv_heads,(size_t)m->kv_cap*D,1, 0};
+        parts[n++]=(ColiPsPart){m->IK[i],ID,m->kv_cap,1,0,1, 0};
     }
     return n;
 }

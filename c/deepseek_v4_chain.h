@@ -1003,7 +1003,7 @@ static int v4c_attention(V4Chain *ch, int i, const V4cFwd *f) {
         ok = v4c_compress(ch, f, ly->cwkv, ly->cwg, ch->craw, ch->cscr, ly->ring, ly->o_ape, sp ? ch->cnew : ly->ckv,
                           sp ? g0 : 0, r, hd, ly->o_cn, 0);
         if (ok && sp && np > 0) {   /* the split: into their slots, and down for the host's rows once the frame is through */
-            VkcKvPart pt = {1, hd, NULL, 0, ly->ckv, 0, 0};
+            VkcKvPart pt = {1, hd, NULL, 0, ly->ckv, 0, 0, 0};
             ok = vkc_kv_store(&ch->ks, li, &pt, ch->cnew, 0, (size_t)hd, 0, g0, np) && vkc_copy(ch->cdn, 0, ch->cnew, 0, (size_t)np * hd);
             vkc_kv_done(&ch->ks, li, g0 + np);
         }
@@ -1053,7 +1053,8 @@ static int v4c_attention(V4Chain *ch, int i, const V4cFwd *f) {
         ColiV4AttentionView v;
         ok = !coli_v4_attention_view(ch->attn[i], &v);
         VkcKvDs d = {&ch->ks, li, ch->q, ly->win, ly->ckv, ch->prm, ch->list, ch->heads, nr, nh, hd, cnt, a.l_off, a.l_row,
-                     ch->Wd, 0, 0, qrow, (int)ly->o_sink, 1, 0, qrow, (pb + nr) / ly->ratio, a.scale, ok ? v.compressed : NULL};
+                     ch->Wd, 0, 0, qrow, (int)ly->o_sink, 1, 0, qrow, (pb + nr) / ly->ratio, a.scale,
+                     (const uint8_t *)(const void *)(ok ? v.compressed : NULL), 0};   /* v4's host rows stay fp32 */
         ok = ok && vkc_kv_ds(&d);
     } else ok = ok && vkc_dsv4_attn(ch->q, ly->win, ly->ratio > 0 ? ly->ckv : NULL, ch->list, ch->prm, ch->heads, &a);
     ok = ok && v4c_rope(ch, ch->heads, nr * nh, nh, hd - rd, qrow, hd, tcs, rd, 1) &&
@@ -1278,7 +1279,7 @@ static int v4c_forward_seg(V4Chain *ch, ColiV4Engine *engine, float **state_ptr,
             ColiV4AttentionView v;
             if (coli_v4_attention_view(attention[i], &v)) goto lost;
             int r = ly->ratio, g0 = pb / r;
-            VkcKvPart pt = {1, hd, v.compressed, 0, ly->ckv, 0, 0};
+            VkcKvPart pt = {1, hd, v.compressed, 0, ly->ckv, 0, 0, 0};
             vkc_kv_place(&ch->ks, ch->sli[i], g0, (pb + nr) / r - g0);
             ok = vkc_kv_push(&ch->ks, ch->sli[i], &pt, 1, g0);
         }

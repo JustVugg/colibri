@@ -1,0 +1,10 @@
+=== PROMPT 1 A(tokens=110) vs B(tokens=110)
+--- common prefix (240 chars): ...'s  \n= \\( 4.25 \\div 17 \\)\n\n**Step 2: Perform the division**\n\n'
+--- A tail from 240: 'First, note that \\(4.25\\) dollars is \\(425\\) cents.\n\n\\(425 \\div 17\\):\n\n- \\(17 \\times 25 = 425\\).\n\nSo'
+--- B tail from 240: '\\( 4.25 \\div 17 = 0.25 \\)\n\n**Step 3: Check**\n\n\\( 0.25 \\times 17 = 4.'
+--- A endswith B? False; A len 340 B len 308
+=== PROMPT 6 A(tokens=110) vs B(tokens=110)
+--- common prefix (146 chars): ...'`if` condition. In Python, `=` assigns a value, while `==` c'
+--- A tail from 146: 'ompares values.\n\n## Fixed code:\n\n```python\nfor i in range(len(x)):\n    if x[i] == 0:\n        x[i] = 1\n```\n\n## Explanation\n\n- **`x[i] = 0`** — This is an assignment. It would set `x[i]` to `0'
+--- B tail from 146: 'hecks for equality.\n\n## Fixed Code\n\n```python\nfor i in range(len(x)):\n    if x[i] == 0:\n        x[i] = 1\n```\n\n## Explanation\n\n**Original (buggy):**\n```python\nif x[i] = 0:   # SyntaxError: invalid syntax\n```\n'
+--- A endswith B? False; A len 336 B len 353
