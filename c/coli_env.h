@@ -428,6 +428,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_VK_MLA_DEC", CE_STR, CE_COLIBRI | CE_KIMI | CE_INKLING | CE_OLMOE | CE_DSV4 | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_QWENIMAGE | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_VK_MOE_GV", CE_STR, CE_COLIBRI | CE_KIMI | CE_INKLING | CE_OLMOE | CE_DSV4 | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_QWENIMAGE | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_VK_MOE_GV_HQ", CE_STR, CE_COLIBRI | CE_KIMI | CE_INKLING | CE_OLMOE | CE_DSV4 | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_QWENIMAGE | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
+    {"COLI_VK_PIPELINE_CACHE", CE_STR, CE_COLIBRI | CE_KIMI | CE_INKLING | CE_OLMOE | CE_DSV4 | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_QWENIMAGE | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_VK_QI_ATTN", CE_STR, CE_QWENIMAGE, 0, NULL},
     {"COLI_VK_QI_RESIDENT", CE_INT, CE_QWENIMAGE, 0, NULL},
     {"COLI_VK_QPREP",                    CE_INT   , CE_COLIBRI                                      , 0             , NULL},
@@ -602,6 +603,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"GRAMMAR",                          CE_STR   , CE_COLIBRI                                      , 0             , NULL},
     {"GRAMMAR_DRAFT",                    CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"HEAT_FILE",                        CE_STR   , CE_QWEN | CE_QWEN38, 0             , NULL},
+    {"HOME", CE_STR, CE_COLIBRI | CE_KIMI | CE_INKLING | CE_OLMOE | CE_DSV4 | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_QWENIMAGE | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},   /* the system's: where the Vulkan pipeline cache goes (vk_pcache.h) */
     {"HOT",                              CE_INT   , CE_OLMOE | CE_QWEN                              , 0             , NULL},
     {"I3_AVX512",                        CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"I3_AVX512_TEST",                   CE_STR   , CE_COLIBRI                                      , 0             , NULL},
@@ -660,6 +662,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"KV_TQ_POLAR",                      CE_STR   , CE_COLIBRI                                      , 0             , NULL},
     {"LANG", CE_STR, 0, 0, NULL},
     {"LC_ALL", CE_STR, 0, 0, NULL},
+    {"LOCALAPPDATA", CE_STR, CE_COLIBRI | CE_KIMI | CE_INKLING | CE_OLMOE | CE_DSV4 | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_QWENIMAGE | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},   /* the system's: where the Vulkan pipeline cache goes (vk_pcache.h) */
     {"LOOKA",                            CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"LORA_UNSAFE", CE_STR, CE_COLIBRI, 0, NULL},
     {"MAX_NEW",                          CE_INT   , CE_OLMOE                                        , CE_LAUNCHER             , NULL},
@@ -889,6 +892,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"VK_PROF", CE_STR, CE_ALL | CE_DSV4 | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_QWENIMAGE | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"WARMUP",                           CE_INT   , CE_OLMOE | CE_QWEN                              , 0             , NULL},
     {"WIDE",                             CE_INT   , CE_OLMOE | CE_QWEN                              , 0             , NULL},
+    {"XDG_CACHE_HOME", CE_STR, CE_COLIBRI | CE_KIMI | CE_INKLING | CE_OLMOE | CE_DSV4 | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_QWENIMAGE | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},   /* the system's: where the Vulkan pipeline cache goes (vk_pcache.h) */
     {"XEXP",                             CE_INT   , CE_COLIBRI                                      , 0             , NULL},
 };
 #define COLI_ENV_N ((int)(sizeof(coli_env_table) / sizeof(coli_env_table[0])))

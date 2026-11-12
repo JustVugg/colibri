@@ -16,6 +16,7 @@
 #include "vk_tier.h"
 #include "vk_alloc.h"
 #include "vk_load.h"
+#include "vk_pcache.h"
 #include "shaders/chain_qsa.h"
 #include <stdarg.h>
 #include <stdio.h>
@@ -405,6 +406,25 @@ static size_t dir_prefix(const char *path) {
 #endif
     return sl ? (size_t)(sl - path) + 1 : 0;
 }
+/* the file each module came from (load_module), for the line a long build gives
+ * (vk_pcache.h); a handle the driver hands out again takes the new file */
+static struct { VkShaderModule m; char file[48]; } g_mod_file[128];
+static void mod_note(VkShaderModule m, const char *file) {
+    int i = 0, n = (int)(sizeof g_mod_file / sizeof *g_mod_file);
+    while (i < n && g_mod_file[i].m && g_mod_file[i].m != m) i++;
+    if (i == n) return;
+    g_mod_file[i].m = m;
+    snprintf(g_mod_file[i].file, sizeof g_mod_file[i].file, "%s", file);
+}
+static const char *mod_file(VkShaderModule m) {
+    for (size_t i = 0; m && i < sizeof g_mod_file / sizeof *g_mod_file && g_mod_file[i].m; i++)
+        if (g_mod_file[i].m == m) return g_mod_file[i].file;
+    return "a chain pipeline";
+}
+/* vkCreateComputePipelines of one pipeline, through the device's cache on disk */
+static VkResult chain_pipe(const VkComputePipelineCreateInfo *ci, VkPipeline *p) {
+    return coli_vk_pipe_create(KC.dev, ci, p, mod_file(ci->stage.module));
+}
 static VkShaderModule load_module(const char *dir_spv, const char *file) {
     char path[1200];
     size_t pre = dir_prefix(dir_spv);
@@ -422,6 +442,7 @@ static VkShaderModule load_module(const char *dir_spv, const char *file) {
     if (vkCreateShaderModule(KC.dev, &ci, NULL, &m) != VK_SUCCESS) m = VK_NULL_HANDLE;
     free(code);
     if (!m) fprintf(stderr, "[VK] chain: cannot load %s\n", path);
+    else mod_note(m, file);
     return m;
 }
 /* The chain's shaders size their work by gl_SubgroupSize and gl_SubgroupID, so each
@@ -446,7 +467,7 @@ static VkPipeline make_pipe(VkShaderModule m, const VkSpecializationInfo *si) {
                   .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main", .pSpecializationInfo = si},
         .layout = KC.pl};
     VkPipeline p = VK_NULL_HANDLE;
-    if (vkCreateComputePipelines(KC.dev, VK_NULL_HANDLE, 1, &ci, NULL, &p) != VK_SUCCESS) return VK_NULL_HANDLE;
+    if (chain_pipe(&ci, &p) != VK_SUCCESS) return VK_NULL_HANDLE;
     return p;
 }
 
@@ -465,7 +486,7 @@ static VkPipeline coop_pipe(VkShaderModule m, const VkSpecializationInfo *si) {
                   .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main", .pSpecializationInfo = si},
         .layout = KC.pl};
     VkPipeline p = VK_NULL_HANDLE;
-    if (vkCreateComputePipelines(KC.dev, VK_NULL_HANDLE, 1, &ci, NULL, &p) != VK_SUCCESS) return VK_NULL_HANDLE;
+    if (chain_pipe(&ci, &p) != VK_SUCCESS) return VK_NULL_HANDLE;
     return p;
 }
 /* COLI_VK_<name>=0 keeps a family of matrix-unit shaders off */
@@ -689,7 +710,7 @@ int vkc_init(void) {
                           .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = KC.mod_tg, .pName = "main",
                           .pSpecializationInfo = &si}, .layout = KC.pl};
             host_first();
-            if (vkCreateComputePipelines(KC.dev, VK_NULL_HANDLE, 1, &ci, NULL, &KC.tg) != VK_SUCCESS) KC.tg = VK_NULL_HANDLE;
+            if (chain_pipe(&ci, &KC.tg) != VK_SUCCESS) KC.tg = VK_NULL_HANDLE;
         }
     }
     /* the fp32 tiled GEMM at the backend's tiles; none = every S on the GEMV */
@@ -1810,7 +1831,7 @@ static VkPipeline fa_pipe(int hd, int gq, int sub) {
                   .pSpecializationInfo = &si}, .layout = KC.pl};
     VkPipeline p = VK_NULL_HANDLE;
     host_first();
-    if (vkCreateComputePipelines(KC.dev, VK_NULL_HANDLE, 1, &ci, NULL, &p) != VK_SUCCESS) {
+    if (chain_pipe(&ci, &p) != VK_SUCCESS) {
         vkDestroyShaderModule(KC.dev, KC.mod_fa, NULL); KC.mod_fa = VK_NULL_HANDLE;   /* not again */
         return VK_NULL_HANDLE;
     }
@@ -3415,7 +3436,7 @@ static VkPipeline kf_coop_pipe(int hd) {
                   .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = KF.cmod, .pName = "main",
                   .pSpecializationInfo = &si}, .layout = KC.pl};
     host_first();
-    if (vkCreateComputePipelines(KC.dev, VK_NULL_HANDLE, 1, &ci, NULL, &KF.cpipe[k]) != VK_SUCCESS) KF.cpipe[k] = VK_NULL_HANDLE;
+    if (chain_pipe(&ci, &KF.cpipe[k]) != VK_SUCCESS) KF.cpipe[k] = VK_NULL_HANDLE;
     return KF.cpipe[k];
 }
 int vkc_attn_full_coop(VkcBuf *qkv, VkcBuf *o, const VkcAttnFull *p) {
