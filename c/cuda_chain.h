@@ -451,6 +451,13 @@ typedef struct ColiCudaChainOps {
     int  (*dfconv)(CcBuf *x, CcBuf *kp, CcBuf *prm, CcBuf *y, const CcDfConv *p);
     int  (*dftopk)(CcBuf *x, CcBuf *sc, CcBuf *out, const CcDfTopk *p);
     int  (*dftap)(CcBuf *x, CcBuf *y, const CcDfTap *p);
+    /* wait_host_if: wait_host for a hybrid step whose host may have no slots this time. The device
+     * looks up the step's nk routes (ids from int i_off; an id outside 0..E-1 is the device's) in
+     * the table (CcExpert entries from entry t_off): where none is the host's (g NULL), it writes
+     * zeros into the first hn floats of hy (the rows the sum takes as the host's) and goes on
+     * without the host's word; else it waits for the word as wait_host does */
+    int  (*wait_host_if)(CcBuf *flag, size_t word, unsigned v, CcBuf *tab, size_t t_off, CcBuf *ids, size_t i_off,
+                         int nk, int E, CcBuf *hy, size_t hn);
 } ColiCudaChainOps;
 /* the table's size without the optional ops: a backend at least this big has the chain */
 #define CC_OPS_BASE_SIZE (offsetof(ColiCudaChainOps, route))
@@ -640,6 +647,14 @@ static inline int cc_dfconv(CcBuf *x, CcBuf *kp, CcBuf *prm, CcBuf *y, const CcD
 static inline int cc_preload(void) {
     const ColiCudaChainOps *t = cc_ops();
     return t && t->size >= offsetof(ColiCudaChainOps, preload) + sizeof t->preload && t->preload ? t->preload() : 0;
+}
+static inline int cc_wait_host_if_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return cc_moe_ready() && t->size >= offsetof(ColiCudaChainOps, wait_host_if) + sizeof t->wait_host_if && t->wait_host_if;
+}
+static inline int cc_wait_host_if(CcBuf *flag, size_t word, unsigned v, CcBuf *tab, size_t t_off, CcBuf *ids, size_t i_off,
+                                  int nk, int E, CcBuf *hy, size_t hn) {
+    return cc_wait_host_if_ready() ? cc_ops()->wait_host_if(flag, word, v, tab, t_off, ids, i_off, nk, E, hy, hn) : 0;
 }
 static inline int cc_moe_stage_ready(void) { const ColiCudaChainOps *t = cc_ops(); return t && t->size >= offsetof(ColiCudaChainOps, moe_stage) + sizeof t->moe_stage; }
 static inline int cc_moe_stage(CcBuf *b, size_t slot_bytes, int slots) { return cc_moe_stage_ready() ? cc_ops()->moe_stage(b, slot_bytes, slots) : 0; }

@@ -1827,6 +1827,39 @@ __global__ static void cc_wait_k(volatile unsigned *f, unsigned v, unsigned long
 #endif
     __threadfence_system();
 }
+/* cc_wait_k for a step whose host may have no slots (cc_wait_host_if): the step's nk routes
+ * looked up in the table; none the host's (an entry without g), hy's first hn floats to zero
+ * (the host's rows as its step without slots wrote them) and no wait; else thread 0 waits */
+__global__ static void __launch_bounds__(256) cc_wait_if_k(volatile unsigned *f, unsigned v, unsigned long long ns,
+        const CcExpert *__restrict__ tab, const int *__restrict__ ids, int nk, int E, float *hy, int hn) {
+    __shared__ int host;
+    if (threadIdx.x == 0) host = 0;
+    __syncthreads();
+    for (int j = threadIdx.x; j < nk; j += blockDim.x) {
+        const int e = ids[j];
+        if (e >= 0 && e < E && !tab[e].g) host = 1;
+    }
+    __syncthreads();
+    if (!host) {
+        for (int k = threadIdx.x; k < hn; k += blockDim.x) hy[k] = 0.f;
+        __threadfence_system();
+        return;
+    }
+    if (threadIdx.x) return;
+#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+    unsigned long long t0, t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+    for (unsigned k = 1; *f < v; k++) {
+        if (k & 1023u) continue;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+        if (t - t0 > ns) { f[1] = v; break; }
+    }
+#else
+    (void)ns;
+    while (*f < v) { }
+#endif
+    __threadfence_system();
+}
 /* one block of 256, two passes: the argmax of n logits (lowest index on a tie) into word 0
  * of out and its softmax probability (terms within 20 of the maximum) into word 1; a block a
  * row, the row's n logits and two words past the block before's (cc_pick_rows) */
@@ -2985,6 +3018,22 @@ static int cc_wait_host(CcBuf *flag, size_t word, unsigned v) {
     cc_wait_k<<<1, 1, 0, c->stream>>>((volatile unsigned *)flag->d + word, v, ns);
     return launched(c, "wait host");
 }
+static int cc_wait_host_if(CcBuf *flag, size_t word, unsigned v, CcBuf *tab, size_t t_off, CcBuf *ids, size_t i_off,
+                           int nk, int E, CcBuf *hy, size_t hn) {
+    CcCtx *c = live();
+    if (!c || !flag || flag->kind != CC_UP || (word + 2) * 4 > flag->bytes || !tab || !ids || !hy || nk < 0 || E < 1 ||
+        (t_off + (size_t)E) * sizeof(CcExpert) > tab->bytes || (i_off + (size_t)nk) * 4 > ids->bytes || hn * 4 > hy->bytes ||
+        hn > 0x7fffffffu) return 0;
+    static unsigned long long ns;
+    if (!ns) {
+        const char *e = getenv("COLI_CUDA_HOST_WAIT_S");
+        const double s = e && *e && atof(e) > 0 ? atof(e) : 30.0;
+        ns = (unsigned long long)(s * 1e9);
+    }
+    cc_wait_if_k<<<1, 256, 0, c->stream>>>((volatile unsigned *)flag->d + word, v, ns, (const CcExpert *)tab->d + t_off,
+                                           (const int *)ids->d + i_off, nk, E, (float *)hy->d, (int)hn);
+    return launched(c, "wait host if");
+}
 static int cc_moe_stage_op(CcBuf *b, size_t slot_bytes, int slots) {
     CcCtx *c = live();
     if (!c || (b && (b->kind != CC_DEV || slots < 1 || CC_MOE_STAGE_MAP + (size_t)slots * slot_bytes > b->bytes))) return 0;
@@ -3619,5 +3668,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_mla_core, cc_mla_rope, cc_mla_lnorm, cc_mla_hgemv, cc_dsa_pool_keys, cc_dsa_pool_select, cc_dsa_select, cc_mla_hgemv_q8,
     cc_ares_mix, cc_situ,
     cc_dflash, cc_dfconv, cc_dftopk, cc_dftap,
+    cc_wait_host_if,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }

@@ -233,7 +233,7 @@ int main(void) {
             q38cc_srv_open(sv, &dfl, &hfl, x, out);
             for (int rep = 0; rep < 2; rep++) for (int i = 0; i < L; i++) {
                 const int n = rep ? R : 1;   /* a decode step's row, a verify's five */
-                q38cc_srv_post(sv, i, n, ++v, tg, td, ids[i], w[i], res + i * NE);
+                q38cc_srv_post(sv, i, n, ++v, tg, td, ids[i], w[i], res + i * NE, 0);
                 /* q38cc_dm_serve's arithmetic for the same slots */
                 const uint8_t *gp[R * K]; const float *xp[R * K]; int pa[R * K], np = 0;
                 for (int a = 0; a < n * K; a++) {
@@ -269,17 +269,74 @@ int main(void) {
             if (!(cl && sv->jobs == 2 * L && (int)sv->slots == slots)) printf("       closed %d, jobs %llu, slots %llu of %d\n", cl, sv->jobs, sv->slots, slots);
             tk(cl && sv->jobs == 2 * L && (int)sv->slots == slots, "the forward closed, its jobs and slots in the books");
             q38cc_srv_open(sv, &dfl, &hfl, x, out);
-            q38cc_srv_post(sv, 0, 1, ++v, tg, td, ids[0], w[0], res + 0 * NE);
-            q38cc_srv_post(sv, 1, 1, ++v, tg, td, ids[1], w[1], res + 1 * NE);
+            q38cc_srv_post(sv, 0, 1, ++v, tg, td, ids[0], w[0], res + 0 * NE, 0);
+            q38cc_srv_post(sv, 1, 1, ++v, tg, td, ids[1], w[1], res + 1 * NE, 0);
             tk(q38cc_srv_close(sv, 0, v) && hfl == v, "a failed frame: the jobs skipped, the host's word past them");
             q38cc_srv_open(sv, &dfl, &hfl, x, out);
-            q38cc_srv_post(sv, 2, 1, ++v, tg, td, ids[2], w[2], res + 2 * NE);
+            q38cc_srv_post(sv, 2, 1, ++v, tg, td, ids[2], w[2], res + 2 * NE, 0);
             dfl = v;
             for (long spin = 0; hfl < v && spin < 2000000000L; spin++) q38cc_relax();
             tk(q38cc_srv_close(sv, 1, v) && hfl == v, "and the next forward served");
+            /* a job the device does not wait for (q38cc_dm_skips): without a pooled slot (experts 0
+             * and 1 are the card's, -1 off the table) it writes no rows and no word, a later job's
+             * rows may be there; with one it is served as before */
+            int idz[K]; float wz[K];
+            for (int a = 0; a < K; a++) { idz[a] = a % 3 == 2 ? -1 : a % 2; wz[a] = 0.5f; }
+            for (int k = 0; k < R * H; k++) out[k] = 7.f;
+            const unsigned long long sk0 = sv->skips, jb0 = sv->jobs; const unsigned h0 = hfl;
+            q38cc_srv_open(sv, &dfl, &hfl, x, out);
+            q38cc_srv_post(sv, 0, 1, ++v, tg, td, idz, wz, res + 0 * NE, 1);
+            dfl = v;
+            int cl3 = q38cc_srv_close(sv, 1, v), kept = 1;
+            for (int k = 0; k < R * H; k++) if (out[k] != 7.f) kept = 0;
+            tk(cl3 && hfl == h0 && kept && sv->skips == sk0 + 1 && sv->jobs == jb0, "a job without a pooled slot the device went on from: no rows, no word");
+            int np2 = 0;
+            for (int a = 0; a < K; a++) if (ids[2][a] >= 0 && res[2 * NE + ids[2][a]] >= 2) np2++;
+            q38cc_srv_open(sv, &dfl, &hfl, x, out);
+            q38cc_srv_post(sv, 2, 1, ++v, tg, td, ids[2], w[2], res + 2 * NE, 1);
+            dfl = v;
+            for (long spin = 0; hfl < v && spin < 2000000000L; spin++) q38cc_relax();
+            tk(np2 > 0 && q38cc_srv_close(sv, 1, v) && hfl == v && sv->skips == sk0 + 1 && sv->jobs == jb0 + 1,
+               "one with pooled slots: served, its word written");
             q38cc_srv_stop(sv);
         }
         free(pool); free(x); free(out); free(want);
+    }
+
+    printf(" a decode step's pooled experts: the CPU's or the bus's, measured (q38cc_pd_*)\n");
+    {   /* steps of one row at a time each path takes: the paths by turns in blocks of Q38CC_PD_BLK,
+         * the faster once both have Q38CC_PD_N, the bus only past the margin, a new round after
+         * Q38CC_PD_EVERY steps; q38cc_pc_step follows the forward's path */
+        static const double ms[4][2] = {{10.0, 11.0}, {11.0, 10.0}, {10.0, 9.9}, {10.0, 9.0}};
+        static const int want[4] = {0, 1, 0, 1};
+        int32_t pof = 0; CcBuf *tabd = (CcBuf *)&pof;
+        for (int c = 0; c < 4; c++) {
+            Q38CChain *ch = (Q38CChain *)calloc(1, sizeof *ch);
+            if (!ch) { tk(0, "the chain's struct"); break; }
+            ch->pool_of = &pof; ch->pool_cpu = 1; ch->dm_tabd = tabd;
+            int turns = 1, steps = 0, follows = 1;
+            while (!ch->pd_dec && steps < 1000) {
+                const int k = steps, pd = q38cc_pd_begin(ch, 1);
+                if (pd != (k / Q38CC_PD_BLK) % 2) turns = 0;
+                if (q38cc_pc_step(ch, 1) != !pd) follows = 0;
+                q38cc_pd_end(ch, 1, pd, ms[c][pd] / 1e3);
+                steps++;
+            }
+            tk(turns && follows, "the paths by turns, the decode table only on the CPU's");
+            tk(ch->pd_dec && ch->pd_bus == want[c] && steps == 2 * Q38CC_PD_N,   /* Q38CC_PD_N a multiple of Q38CC_PD_BLK: the bus's last at step 2 N */
+               c == 0 ? "the CPU faster: the CPU's" : c == 1 ? "the bus faster: the bus's" : c == 2 ? "the bus 1 % faster: still the CPU's" : "the bus 10 % faster: the bus's");
+            if (c == 3) {
+                int same = 1;
+                while (ch->pd_k < ch->pd_next) { const int pd = q38cc_pd_begin(ch, 1); if (pd != 1) same = 0; q38cc_pd_end(ch, 1, pd, 0.01); }
+                const int pd = q38cc_pd_begin(ch, 1);
+                tk(same && !ch->pd_dec && pd == 0 && ch->pd_n[0][1] == 0, "the decided path until the next round, which measures again");
+                q38cc_pd_end(ch, 1, pd, 0.01);
+                tk(q38cc_pd_begin(ch, Q38CC_DM_ROWS + 1) < 0 && !ch->pd_now, "a prompt's rows: not measured, the CPU's");
+                ch->pd_mode = 1;
+                tk(q38cc_pd_begin(ch, 1) < 0, "COLI_CUDA_CHAIN_POOL_READ=0: not measured");
+            }
+            free(ch);
+        }
     }
 
     printf(" the MTP head's experts in Q2_0 for the card (q38cc_q2_0_block)\n");
