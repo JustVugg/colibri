@@ -1921,7 +1921,7 @@ static void v41c_ledger(unsigned long long sys_used, unsigned long long sys_tota
      * mirrors are as quantized but not counted here (the pre-existing gap, noted) */
     const char *qa = ch->kvq ? " (quantized; a second device's mirrors, when there are two, are not in this line)" : "";
     char hk[96] = "";   /* the host's own arrays, only when they are packed (the savings) */
-    if (host_kv) snprintf(hk, sizeof hk, " | host kv %.1f MiB (packed)", host_kv / M);
+    if (host_kv) snprintf(hk, sizeof hk, " | host kv %zu B (packed)", host_kv);
     ColiVkPoolStats w; coli_vk_pool_stats(0, &w);
     VktVram tv; vkt_vram(&tv);
     size_t pools = w.total + dev.total + dn.total + up.total + tv.res_total + tv.x_total;

@@ -5123,7 +5123,7 @@ v41_kvq_ledger() {
   off=$(KVQ_LEDGER_RUN=fp32 v41_kvq_serve "$1")
   on_out=$(KVQ_LEDGER_RUN=packed v41_kvq_serve "$1")
   on=$(printf '%s\n' "$on_out" | sed -n '1p')
-  host=$(printf '%s\n' "$on_out" | sed -n 's/^host kv \([0-9.]*\) MiB.*/\1/p')
+  host=$(printf '%s\n' "$on_out" | sed -n 's/^host kv \([0-9]*\) B.*/\1/p')
   [ -n "$off" ] && [ -n "$on" ] || { fail "kv-quant $1: no kv-mirror line from the serve turn"; }
   awk -v v="$off" 'BEGIN{exit !(v > 6.36 && v < 6.46)}' || fail "kv-quant $1: the fp32 mirrors $off MiB, not the fp32 math's 6.41"
   awk -v v="$on" 'BEGIN{exit !(v > 1.58 && v < 1.68)}' || fail "kv-quant $1: the quantized mirrors $on MiB, not the 528/288/68 math's 1.63"
@@ -5133,10 +5133,11 @@ v41_kvq_ledger() {
   # (8 rows) and undo rows (4), the compressed rows 128 + 256 at 288 B (the two kv source
   # layers at ratios 2 and 1, max_positions 256), the index keys whole blocks (4 + 8 of
   # 2176 B) and the 2 DSpark stage rings: 6*(8+4)*528 + 128*288 + 256*288 + (4+8)*2176 +
-  # 2*8*528 = 183 168 B = 0.175 MiB (the line's one decimal prints it 0.2)
+  # 2*8*528 = 183 168 B, gated to +-2% (179 504 .. 186 831) -- the line's bytes exactly,
+  # not one decimal of a MiB
   [ -n "$host" ] || { fail "kv-quant $1: no host-kv term on the packed line"; }
-  awk -v v="$host" 'BEGIN{exit !(v > 0.15 && v < 0.25)}' || fail "kv-quant $1: the packed host holds $host MiB, not the codes' math's 0.175"
-  echo "OK kv-quant $1 ledger: host kv $host MiB (packed)"
+  awk -v v="$host" 'BEGIN{exit !(v >= 179504 && v <= 186831)}' || fail "kv-quant $1: the packed host holds $host B, not the codes' math's 183168 +-2%"
+  echo "OK kv-quant $1 ledger: host kv $host B (packed)"
 }
 # one serve turn of the engine (the ledger ends a turn), <fp32|packed> in KVQ_LEDGER_RUN:
 # prints the kv-mirror line's tail (the MiB and, when packed, the annotation) and, when
