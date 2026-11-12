@@ -3535,8 +3535,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     # selected capacity cannot overrun the model's actual allocation.
     # The base is colibri.c's slack (expert_avail: 1.2 + 2.5 GB and 64 experts in
     # flight). olmoe.c sets aside 0.5 GB of activations beside its resident dense
-    # (model_init_range); colibri's slack planned 0 slots on a 16 GB Mac where the
-    # engine sizes 42-64 itself, and --auto-tier hands it the plan's cap (#2785).
+    # (model_init_range, #2785).
     base_reserve = 0.5 * GB if family_id == "olmoe" else 1.2 * GB + 2.5 * GB + 64 * max_expert
     runtime_bytes = int(base_reserve +
                         info["expert_fixed_bytes"] + kv_bytes + kv_buffer + shared_dense_bytes)

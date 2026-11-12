@@ -75,6 +75,26 @@ def write_shard(path, tensors, f32_fill=None):
         stream.truncate(base + offset)
 
 
+def write_gguf(path, tensors, arch, blocks):
+    """A GGUF v3 file as tools/gguf_reader.py reads it: (name, ggml type, dims in ggml
+    order) tensors of type 0 (F32) or 8 (Q8_0), the payload extended as write_shard's."""
+    def text(value):
+        return struct.pack("<Q", len(value.encode())) + value.encode()
+    out = b"GGUF" + struct.pack("<IQQ", 3, len(tensors), 2)
+    out += text("general.architecture") + struct.pack("<I", 8) + text(arch)
+    out += text(f"{arch}.block_count") + struct.pack("<II", 4, blocks)
+    offset = 0
+    for name, kind, dims in tensors:
+        count = 1
+        for dim in dims:
+            count *= dim
+        out += text(name) + struct.pack(f"<I{len(dims)}QIQ", len(dims), *dims, kind, offset)
+        offset += -(-(count * 4 if kind == 0 else count // 32 * 34) // 32) * 32
+    with path.open("wb") as stream:
+        stream.write(out)
+        stream.truncate(-(-len(out) // 32) * 32 + offset)
+
+
 class ShardFixtureTest(unittest.TestCase):
     def test_extended_payload_preserves_header_offsets_size_and_zero_values(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -664,40 +684,58 @@ class ResourcePlanTest(unittest.TestCase):
             self.assertEqual(ram["fixed_state_bytes"], 0)
 
     def test_olmoe_plans_the_cache_olmoe_sizes_itself(self):
-        # #2785: --auto-tier hands olmoe the plan's RAM_GB and its cap (COLI_PLAN_CAP),
-        # so the plan reserves what olmoe.c reserves (model_init_range): 0.5 GB of
+        # #2785: the plan reserves what olmoe.c reserves (model_init_range): 0.5 GB of
         # activations beside the resident dense, not colibri.c's 1.2 + 2.5 GB and 64
-        # experts. The KV of the planned context stays on top: with a cap given, the
-        # engine does not take slots back as the KV grows (kv_room_fit). OLMoE-1B-7B's
-        # geometry; one expert per layer and the embedding stand in for the checkpoint.
-        hidden, inter, layers, experts = 2048, 1024, 16, 64
-        (self.model / "config.json").write_text(json.dumps({
+        # experts. The KV of the planned context stays on top: the engine's own cache
+        # gives that back as the KV grows (kv_room_fit). OLMoE-1B-7B's geometry, as
+        # convert_olmoe_merged.py writes it (int8, one expert per layer, the BF16
+        # embedding for the dense) and as `coli import` links a Q8_0 GGUF (two experts
+        # per layer, every dense tensor).
+        hidden, inter, layers, experts, vocab = 2048, 1024, 16, 64, 50304
+        config = json.dumps({
             "model_type": "olmoe", "num_hidden_layers": layers, "hidden_size": hidden,
             "num_attention_heads": 16, "num_key_value_heads": 16, "num_experts": experts,
-            "num_experts_per_tok": 8, "intermediate_size": inter, "vocab_size": 50304}))
-        tensors = [("model.embed_tokens.weight", 50304 * hidden * 2, "BF16", [50304, hidden])]
+            "num_experts_per_tok": 8, "intermediate_size": inter, "vocab_size": vocab})
+        merged, gguf = self.model / "merged", self.model / "gguf"
+        for folder in (merged, gguf):
+            folder.mkdir()
+            (folder / "config.json").write_text(config)
+        tensors = [("model.embed_tokens.weight", vocab * hidden * 2, "BF16", [vocab, hidden])]
         for i in range(layers):
             p = f"model.layers.{i}.mlp.experts.0."
             tensors += [(p + "merged_weight", 3 * inter * hidden, "I8", [3 * inter * hidden]),
                         (p + "qs", (2 * inter + hidden) * 4, "F32", [2 * inter + hidden])]
-        write_shard(self.model / "model.safetensors", tensors)
-        slot = hidden * inter * 3 + (inter * 2 + hidden) * 4      # olmoe.c slot_bytes()
+        write_shard(merged / "model.safetensors", tensors)
+        q8, f32 = 8, 0
+        tensors = [("token_embd.weight", q8, [hidden, vocab]), ("output.weight", q8, [hidden, vocab]),
+                   ("output_norm.weight", f32, [hidden])]
+        for i in range(layers):
+            tensors += [(f"blk.{i}.{name}.weight", q8, [hidden, hidden])
+                        for name in ("attn_q", "attn_k", "attn_v", "attn_output")]
+            tensors += [(f"blk.{i}.{name}.weight", f32, [hidden])
+                        for name in ("attn_norm", "attn_q_norm", "attn_k_norm", "ffn_norm")]
+            tensors += [(f"blk.{i}.ffn_gate_inp.weight", f32, [hidden, experts]),
+                        (f"blk.{i}.ffn_gate_exps.weight", q8, [hidden, inter, 2]),
+                        (f"blk.{i}.ffn_up_exps.weight", q8, [hidden, inter, 2]),
+                        (f"blk.{i}.ffn_down_exps.weight", q8, [inter, hidden, 2])]
+        write_gguf(gguf / "olmoe.gguf", tensors, arch="olmoe", blocks=layers)
+        (gguf / "gguf.json").write_text(json.dumps({"gguf": "olmoe.gguf"}))
+        slot = {merged: hidden * inter * 3 + (inter * 2 + hidden) * 4,   # olmoe.c slot_bytes()
+                gguf: 3 * hidden * inter // 32 * 34}                      # Q8_0 blocks
         # what _discover_metal_gpus reports for an M1 Pro: no placement budget
         metal = [{"index": 0, "name": "Apple M1 Pro", "total_bytes": 0, "free_bytes": None,
                   "unified_memory": True, "backend": "metal"}]
-        for available, planned, engine in ((8 * GB, 52, 62), (11 * GB, 64, 64)):
-            with self.subTest(available=available):
-                plan = build_plan(self.model, context=4096, available_memory=available,
+        for model, ram_gb, available, planned in ((merged, 0, 8 * GB, 52), (merged, 0, 11 * GB, 64),
+                                                  (gguf, 8, 8 * GB, 55), (gguf, 0, 8 * GB, 46)):
+            with self.subTest(model=model.name, ram_gb=ram_gb, available=available):
+                plan = build_plan(model, ram_gb=ram_gb, context=4096, available_memory=available,
                                   available_disk=1, gpus=metal, physical_cpus=8,
                                   cpu_sockets=1, env={})
                 ram = plan["tiers"]["ram"]
-                room = ram["budget_bytes"] - ram["dense_bytes"] - GB // 2
-                # olmoe.c at --ram <the plan's budget>: room / olm_slot_bytes / layers
-                self.assertEqual(min(experts, room // slot // layers), engine)
-                self.assertEqual(ram["cache_slots_per_layer"], min(
-                    experts, (room - ram["sequence_state_bytes"]) // (slot * layers)))
+                room = ram["budget_bytes"] - ram["dense_bytes"] - GB // 2 - ram["sequence_state_bytes"]
+                self.assertEqual(ram["cache_slots_per_layer"],
+                                 min(experts, room // (slot[model] * layers)))
                 self.assertEqual(ram["cache_slots_per_layer"], planned)
-                self.assertEqual(environment_for_plan(plan, {})["COLI_PLAN_CAP"], str(planned))
 
     def test_glm_dsa_state_is_charged_only_when_every_indexer_weight_exists(self):
         config = json.loads((self.model / "config.json").read_text())
