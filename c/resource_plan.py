@@ -2039,6 +2039,30 @@ def windows_available_bytes(avail_phys, avail_pagefile):
     return avail_phys
 
 
+def darwin_available_bytes(vm_stat_text):
+    """What macOS can take back without compressing or swapping, from vm_stat:
+    Pages free + File-backed pages + Pages purgeable. That is physical memory
+    less Activity Monitor's "Memory Used" (App + Wired + Compressed), and the
+    same figure compat_meminfo_gb computes from host_statistics64. None when
+    vm_stat printed none of the three.
+
+    Not "Pages inactive": that queue holds file pages, which macOS drops, and
+    anonymous pages, which it compresses and never drops. It missed a model's
+    file cache while that was still active (#2785: a 16 GB Mac planned 0 slots,
+    and the count grew as the pages aged), and it counted the inactive
+    anonymous memory of other apps (#1614: a 32 GiB cache compressed, then swapped)."""
+    text = vm_stat_text or ""
+    pages = 0
+    for key in ("Pages free", "File-backed pages", "Pages purgeable"):
+        match = re.search(rf"{key}:\s+(\d+)\.", text)
+        if match:
+            pages += int(match.group(1))
+    if not pages:
+        return None
+    page = re.search(r"page size of (\d+) bytes", text)
+    return pages * (int(page.group(1)) if page else os.sysconf("SC_PAGE_SIZE"))
+
+
 def _read_bounded_bytes(path, max_bytes, description):
     """Return ``(present, raw)`` for one small kernel pseudo-file.
 
@@ -2540,21 +2564,15 @@ def memory_available(*, meminfo_path=Path("/proc/meminfo"),
                 return total_kb.value * 1024
         except OSError:
             pass
-    # macOS: no /proc and not win32. Sum the reclaimable pages reported by vm_stat
-    # (free + inactive + speculative + purgeable) — the same "reclaimable without swapping"
-    # definition the C engine's compat_meminfo uses. Fall back to total RAM (never 0 on a Mac).
+    # macOS: no /proc and not win32. vm_stat's free + file-backed + purgeable pages
+    # (darwin_available_bytes), the definition the C engines' compat_meminfo_gb uses.
+    # Fall back to total RAM (never 0 on a Mac).
     if sys.platform == "darwin":
         try:
             out = subprocess.run(["vm_stat"], text=True, capture_output=True, timeout=5).stdout
-            page_match = re.search(r"page size of (\d+) bytes", out)
-            page = int(page_match.group(1)) if page_match else os.sysconf("SC_PAGE_SIZE")
-            pages = 0
-            for key in ("Pages free", "Pages inactive", "Pages speculative", "Pages purgeable"):
-                match = re.search(rf"{key}:\s+(\d+)\.", out)
-                if match:
-                    pages += int(match.group(1))
-            if pages:
-                return pages * page
+            available = darwin_available_bytes(out)
+            if available:
+                return available
         except (OSError, subprocess.SubprocessError, ValueError):
             pass
         try:

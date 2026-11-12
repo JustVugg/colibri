@@ -15,6 +15,7 @@ from resource_plan import (
     analyze_model,
     build_plan,
     cpu_socket_count,
+    darwin_available_bytes,
     discover_gpus,
     environment_for_plan,
     format_plan,
@@ -3215,3 +3216,79 @@ class WindowsCommitLimitTest(unittest.TestCase):
             "dwLength", "dwMemoryLoad", "ullTotalPhys", "ullAvailPhys",
             "ullTotalPageFile", "ullAvailPageFile", "ullTotalVirtual",
             "ullAvailVirtual", "ullAvailExtendedVirtual"])
+
+
+def vm_stat_output(free, active, inactive, speculative, wired, purgeable, file_backed,
+                   compressor, page=16384):
+    """vm_stat's output, in its order and its format (printf "%-30s %16llu.").
+    As on a Mac, the anonymous and the file-backed pages are the pages of the
+    active, inactive and speculative queues."""
+    anonymous = active + inactive + speculative - file_backed
+    rows = (("Pages free", free), ("Pages active", active), ("Pages inactive", inactive),
+            ("Pages speculative", speculative), ("Pages throttled", 0),
+            ("Pages wired down", wired), ("Pages purgeable", purgeable),
+            ('"Translation faults"', 412345678), ("Pages copy-on-write", 15071823),
+            ("Pages zero filled", 165834917), ("Pages reactivated", 4196520),
+            ("Pages purged", 2289932), ("File-backed pages", file_backed),
+            ("Anonymous pages", anonymous), ("Pages stored in compressor", 3 * compressor),
+            ("Pages occupied by compressor", compressor), ("Decompressions", 2973697),
+            ("Compressions", 4876563), ("Pageins", 5524149), ("Pageouts", 98286),
+            ("Swapins", 0), ("Swapouts", 0))
+    return (f"Mach Virtual Memory Statistics: (page size of {page} bytes)\n" +
+            "".join(f"{name + ':':<30} {count:>16}.\n" for name, count in rows))
+
+
+# #2785, a 16 GB M1 Pro (2^20 pages of 16 KiB) right after a run: 7 GB of the
+# model's file pages are still in the active queue.
+MAC16_AFTER_RUN = vm_stat_output(free=40000, active=577576, inactive=276000, speculative=15000,
+                                 wired=110000, purgeable=5000, file_backed=626387,
+                                 compressor=30000)
+# The same Mac minutes later: 400000 of those pages have aged into the inactive queue.
+MAC16_AGED = vm_stat_output(free=40000, active=177576, inactive=676000, speculative=15000,
+                            wired=110000, purgeable=5000, file_backed=626387, compressor=30000)
+# #1614 run 1, a 48 GB Mac with browsers open: 8.3 GiB in the compressor and
+# free + inactive 32.5 GiB, most of the inactive queue the browsers' anonymous pages.
+MAC48_DIRTY = vm_stat_output(free=300000, active=271728, inactive=1830000, speculative=20000,
+                             wired=180000, purgeable=10000, file_backed=450000,
+                             compressor=544000)
+
+
+class DarwinAvailableMemoryTest(unittest.TestCase):
+    """#2785, #1614: on macOS what can be planned is Pages free + File-backed
+    pages + Pages purgeable. The inactive queue mixes file pages, which macOS
+    drops, with anonymous pages, which it compresses."""
+
+    def available(self, vm_stat):
+        """memory_available() on a Mac: no /proc/meminfo, vm_stat's output."""
+        result = subprocess.CompletedProcess(args=["vm_stat"], returncode=0,
+                                             stdout=vm_stat, stderr="")
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(sys, "platform", "darwin"), \
+             mock.patch("resource_plan.subprocess.run", return_value=result) as run:
+            available = memory_available(meminfo_path=Path(tmp) / "meminfo")
+        self.assertEqual(run.call_args.args[0], ["vm_stat"])
+        return available
+
+    def test_free_file_backed_and_purgeable_pages(self):
+        self.assertEqual(darwin_available_bytes(MAC16_AFTER_RUN), (40000 + 626387 + 5000) * 16384)
+        self.assertEqual(darwin_available_bytes(MAC48_DIRTY), (300000 + 450000 + 10000) * 16384)
+        # an Intel Mac's 4 KiB pages; no vm_stat output is no measurement
+        self.assertEqual(darwin_available_bytes(vm_stat_output(1, 0, 0, 0, 0, 0, 0, 0, page=4096)),
+                         4096)
+        self.assertIsNone(darwin_available_bytes(""))
+
+    def test_a_model_cache_still_active_is_available(self):
+        # free + inactive + speculative + purgeable was 5.5 GB here: `coli plan`
+        # gave 0 expert slots on a Mac where the engine kept 42 to 64
+        self.assertEqual(self.available(MAC16_AFTER_RUN), 671387 * 16384)   # 11.0 GB
+
+    def test_pages_aging_into_inactive_do_not_move_it(self):
+        # the old sum went from 5.5 to 12.1 GB as the pages aged, and OLMoE's
+        # automatic cache from 42 to 64 slots within minutes
+        self.assertEqual(self.available(MAC16_AGED), self.available(MAC16_AFTER_RUN))
+
+    def test_anonymous_inactive_pages_are_not_available(self):
+        # #1614 run 1: 32.5 GiB of free + inactive accepted RAM_GB=32; the cache
+        # was compressed and then 3 GiB swapped
+        self.assertEqual(self.available(MAC48_DIRTY), 760000 * 16384)   # 11.6 GiB
+        self.assertLess(self.available(MAC48_DIRTY), 32 << 30)

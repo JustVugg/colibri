@@ -13343,8 +13343,8 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
 
 static double g_mem_avail_boot=0;   /* MemAvailable all'avvio, prima di caricare il modello */
 /* RAM disponibile ADESSO (GB): e' il tetto vero, non il totale. Linux: MemAvailable
- * da /proc/meminfo. macOS: pagine free+inactive+purgeable da host_statistics64
- * (stessa semantica: recuperabili senza swap). Senza questo ramo il fallback
+ * da /proc/meminfo. macOS: pagine free+file-backed+purgeable da host_statistics64
+ * (recuperabili senza comprimere ne' swappare, compat_meminfo_gb). Senza questo ramo il fallback
  * "assumo 8 GB" castrava la cache expert proprio sulle macchine con piu' RAM. */
 static double mem_available_gb(void){
     /* Era la sola copia giusta di questa misura; glm53.c ne aveva una che

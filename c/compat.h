@@ -647,7 +647,7 @@ static inline void coli_print_launcher_help(const char *engine, const char *by_h
 
 /* --- RAM disponibile ADESSO, in GB, per tutte le piattaforme ---------------
  * "Disponibile" = recuperabile senza swap: MemAvailable su Linux; free +
- * inactive + purgeable su macOS; su Windows ullAvailPhys MA limitata da
+ * file-backed + purgeable su macOS; su Windows ullAvailPhys MA limitata da
  * ullAvailPageFile, il commit ancora concedibile: e' quello che decide se
  * il prossimo malloc riesce, e su una macchina con pagefile piccolo puo'
  * essere molto meno della RAM fisica libera.
@@ -821,8 +821,16 @@ static inline void compat_meminfo_gb(double *total_gb, double *avail_gb){
     if(sysctlbyname("hw.memsize", &memsize, &len, NULL, 0) == 0) total = (double)memsize / 1e9;
     mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
     vm_statistics64_data_t vm;
+    /* What macOS takes back without compressing or swapping: free, file-backed
+     * (active or inactive: it drops them) and purgeable pages; physical memory
+     * less Activity Monitor's "Memory Used". Not inactive_count: its anonymous
+     * pages are compressed, never dropped (#1614), and a file page still active
+     * is missed (#2785). free_count includes the speculative pages, which are
+     * file-backed: counted once. resource_plan.darwin_available_bytes reads the
+     * same three lines from vm_stat. */
     if(host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vm, &cnt) == KERN_SUCCESS)
-        avail = ((double)vm.free_count + (double)vm.inactive_count + (double)vm.purgeable_count)
+        avail = ((double)vm.free_count - (double)vm.speculative_count
+                 + (double)vm.external_page_count + (double)vm.purgeable_count)
                 * (double)sysconf(_SC_PAGESIZE) / 1e9;
 #elif defined(_WIN32)
     MEMORYSTATUSEX msx = {0};

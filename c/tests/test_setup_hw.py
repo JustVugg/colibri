@@ -144,13 +144,17 @@ class MemoryParsing(unittest.TestCase):
         self.assertEqual(setup_hw.memory_from_windows_status(32 << 30, 20 << 30)["available"], 20 << 30)
 
     def test_darwin(self):
+        # free + file-backed + purgeable (resource_plan.darwin_available_bytes): not the
+        # inactive queue, and the speculative pages are already file-backed
         vm_stat = ("Mach Virtual Memory Statistics: (page size of 16384 bytes)\n"
                    "Pages free:                               10000.\n"
                    "Pages inactive:                           5000.\n"
-                   "Pages speculative:                        1000.\n")
+                   "Pages speculative:                        1000.\n"
+                   "Pages purgeable:                            500.\n"
+                   "File-backed pages:                         4000.\n")
         mem = setup_hw.memory_from_darwin("17179869184\n", vm_stat)
         self.assertEqual(mem["total"], 17179869184)
-        self.assertEqual(mem["available"], 16000 * 16384)
+        self.assertEqual(mem["available"], 14500 * 16384)
 
 
 class CpuParsing(unittest.TestCase):
