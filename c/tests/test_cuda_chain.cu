@@ -1559,6 +1559,50 @@ int main(void) {
         ck(ok && same, "eight rounds: each answer read after its word, before the next");
         T->free(df); T->free(hf); T->free(ans); T->free(dst);
     }
+    printf("wait_host_if\n");
+    {
+        /* wait_host for a step whose host may have no slots: a table of eight experts, 6 and 7 the
+         * host's (no g); six rounds of four routes, the host's slots in rounds 1 and 4 only (an id
+         * of -1 and one past the table count as the device's). Without a slot the device zeroes
+         * the host's rows and goes on, the host writing nothing; with one it waits for the word */
+        const int E = 8, R = 6, NK = 4;
+        CcExpert tab[E]; memset(tab, 0, sizeof tab);
+        for (int e = 0; e < 6; e++) tab[e].g = tab[e].u = tab[e].d = (const void *)(uintptr_t)(64 * (e + 1));
+        static const int ids[R][NK] = {{0, 1, 2, 3}, {4, 6, 5, 0}, {5, -1, 2, 9}, {1, 1, 1, 1}, {7, 2, 3, 4}, {0, 5, 9, -1}};
+        const int host[R] = {0, 1, 0, 0, 1, 0};
+        CcBuf *tb = T->buf(sizeof tab, CC_DEV), *ib = T->buf(sizeof ids, CC_DEV), *df = T->buf(64, CC_DOWN), *hf = T->buf(64, CC_UP),
+              *hy = T->buf(64 * 4, CC_UP), *dst = T->buf((size_t)R * 64 * 4, CC_DEV);
+        volatile unsigned *dw = (volatile unsigned *)T->ptr(df), *hw = (volatile unsigned *)T->ptr(hf);
+        float *aw = (float *)T->ptr(hy);
+        int ok = T->wait_host_if && tb && ib && df && hf && hy && dst;
+        if (ok) { for (int i = 0; i < 64; i++) aw[i] = 7.f; hw[5] = 0; hw[6] = 0; }
+        ok = ok && T->begin() && T->write(tb, 0, tab, sizeof tab) && T->write(ib, 0, ids, sizeof ids);
+        for (int r = 0; r < R && ok; r++)
+            ok = T->signal(df, 3, 100 + r) && T->wait_host_if(hf, 5, 100 + r, tb, 0, ib, (size_t)r * NK, NK, E, hy, 64) &&
+                 T->copy(dst, (size_t)r * 64, hy, 0, 64);
+        const auto t0 = std::chrono::steady_clock::now();
+        ok = ok && T->submit(0);
+        std::thread hostt([&] {
+            for (int r = 0; r < R; r++) {
+                if (!host[r]) continue;   /* nothing written: a device that waited would wait for good */
+                while (dw[3] < (unsigned)(100 + r)) { }
+                for (int i = 0; i < 64; i++) aw[i] = (float)(r * 1000 + i);
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                hw[5] = 100 + r;
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                if (r < R - 1) while (dw[3] < (unsigned)(101 + r)) { }   /* the copy read it */
+            }
+        });
+        ok = ok && T->finish();
+        hostt.join();
+        const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::vector<float> gotv = down(dst, (size_t)R * 64); const float *got = gotv.data(); int same = 1;
+        for (int r = 0; r < R; r++) for (int i = 0; i < 64; i++) same &= got[r * 64 + i] == (host[r] ? (float)(r * 1000 + i) : 0.f);
+        ck(ok && same && hw[6] == 0 && el < 5.0, "without a slot of the host's: its rows zero, no wait; with one: its rows after its word");
+        ck(!T->wait_host_if(hf, 5, 1, tb, 0, ib, 0, NK, 16, hy, 64) && !T->wait_host_if(hf, 5, 1, tb, 0, ib, 0, NK, E, hy, 65) &&
+           !T->wait_host_if(df, 5, 1, tb, 0, ib, 0, NK, E, hy, 64), "wait_host_if past its buffers, or on a DOWN flag, refused");
+        T->free(tb); T->free(ib); T->free(df); T->free(hf); T->free(hy); T->free(dst);
+    }
     printf("pick\n");
     {
         const int V = 248320;
