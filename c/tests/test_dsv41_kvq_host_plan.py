@@ -23,11 +23,12 @@ _SPEC.loader.exec_module(fr)
 
 # The released V4.1 Flash text config, the fields the geometry reads: 40 layers, 4 KV
 # sources at ratios 2/2/2/1 (sum 1/r = 2.5, so a position costs 2.5 compressed rows),
-# window 128, head_dim 512, index_head_dim 128, 3 DSpark stages of a 5-token block. The
-# stage count is spelled the way the checkpoint spells it -- num_nextn_predict_layers,
-# NOT n_mtp_layers, which the released config.json does not carry at all -- and
-# compress_ratios runs to the checkpoint's own length, 43 (the entries past the layers
-# are 0 and unread).
+# window 128, head_dim 512, index_head_dim 128, 3 DSpark stages of a 5-token block, and
+# the attention widths the per-row workspace closed form needs (hidden 5120, 64 heads of
+# 512, q_lora 1280, index_topk 512). The stage count is spelled the way the checkpoint
+# spells it -- num_nextn_predict_layers, NOT n_mtp_layers, which the released config.json
+# does not carry at all -- and compress_ratios runs to the checkpoint's own length, 43
+# (the entries past the layers are 0 and unread).
 def _config(drop=(), **over):
     ratios = [0] * 43
     for layer, ratio in ((2, 2), (8, 2), (14, 2), (20, 1)):
@@ -35,11 +36,14 @@ def _config(drop=(), **over):
     cfg = {
         "num_hidden_layers": 40,
         "n_routed_experts": 384,
-        "hidden_size": 2048,
+        "hidden_size": 5120,
         "head_dim": 512,
         "window_size": 128,
         "index_head_dim": 128,
         "hc_mult": 4,
+        "num_attention_heads": 64,
+        "q_lora_rank": 1280,
+        "index_topk": 512,
         "compress_ratios": ratios,
         "kv_source_layer_ids": [2, 8, 14, 20],
         "num_nextn_predict_layers": 3,
@@ -164,6 +168,26 @@ class Dsv41KvqHostPlanTest(unittest.TestCase):
             self.assertEqual(freed, 5510 * ctx, f"freed at ctx {ctx}")
             self.assertGreater(freed / per_cap, share, f"the freed share of a slot at ctx {ctx}")
             self.assertLess(freed / per_cap, share + 0.02, f"the freed share of a slot at ctx {ctx}")
+
+    def test_the_workspace_is_priced_at_what_a_forward_of_n_rows_allocates(self):
+        # forward_full's per-row buffers beside attention_run's, at the context: the
+        # engine prefills a prompt in ONE forward (deepseek_v41.c forward_with_image over
+        # n_prompt rows; there is no chunker in that file), so a forward of n rows is
+        # what the plan has to afford. 104,092 floats a row at this config:
+        #   forward_full   2*4*5120 + 3*4 + 2*5120 + 4*4 + 3*5120   = 66,588
+        #   attention_run  2*1280 + 64*512 + 2*512 + 128 + 2*512     = 37,504
+        #   plus the one `hidden` row the form always priced       = 416,368 B a row.
+        self.assertEqual(66588 + 37504, 104092)
+        for ctx in (16384, 262144):
+            self.assertEqual(_geometry(ctx, False).workspace_bytes, ctx * 416368 + 5120 * 4,
+                             f"packed workspace at ctx {ctx}")
+            # the packed cache moves the HOST's rows, not the prefill's buffers: the
+            # frame the forward allocates is the same under COLI_VK_KV_FP32=1
+            self.assertEqual(_geometry(ctx, True).workspace_bytes, ctx * 416368 + 5120 * 4,
+                             f"fp32 workspace at ctx {ctx}")
+        # a config with no DSpark head allocates no main_hidden, so three rows of 5120 go
+        self.assertEqual(_geometry(16384, False, drop=("dspark_target_layer_ids",)).workspace_bytes,
+                         16384 * (104092 - 3 * 5120) * 4 + 5120 * 4)
 
     def test_the_geometry_guard_keeps_the_fp32_price(self):
         # the formats are defined at head_dim 512 / index_head_dim 128: at any other

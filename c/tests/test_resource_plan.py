@@ -206,6 +206,7 @@ class ResourcePlanTest(unittest.TestCase):
             "model_type": "deepseek_v41", "num_hidden_layers": 2,
             "n_routed_experts": 128, "hidden_size": 128, "head_dim": 64,
             "window_size": 8, "index_head_dim": 32, "hc_mult": 4,
+            "num_attention_heads": 4, "q_lora_rank": 64, "index_topk": 16,
             "compress_ratios": [0, 2], "kv_source_layers": [1],
         }))
         write_shard(self.model / "model.safetensors", [
@@ -226,12 +227,13 @@ class ResourcePlanTest(unittest.TestCase):
     def test_v41_long_context_still_plans_a_feasible_ram_cache(self):
         """Track C regression: at --ram 28 a long ctx must keep >0 RAM expert slots.
 
-        deepseek_v41 prefill reads a prompt in bounded chunks (default 1280 rows), so
-        the planner prices the forward workspace at one chunk, not the whole context.
-        Pricing the full context made the --ram 28 / --ctx 131072 / 262144 plan come
-        out with a zero-byte expert cache and cap_for_arch() hard-failed with "RAM
-        budget cannot hold one expert slot per layer". The workspace must stay bounded
-        as the context grows so a feasible, honestly-admissive plan emerges instead.
+        The workspace is what ONE forward of the prompt allocates -- forward_full's
+        per-row buffers beside attention_run's, at the context, because deepseek_v41.c
+        prefills a prompt in one forward and has no chunk size to bound it. It therefore
+        GROWS with the context by design (this config: 7,440 B a row), and what keeps a
+        plan feasible is the auto ladder (chat_context), which prices the step beside the
+        state before it admits it; a context the operator sets past that is priced
+        honestly and leaves the cache the slots it can.
         """
         from openai_server import cap_for_arch
         from family_registry import planner_geometry
@@ -240,6 +242,7 @@ class ResourcePlanTest(unittest.TestCase):
             "model_type": "deepseek_v41", "num_hidden_layers": 2,
             "n_routed_experts": 128, "hidden_size": 128, "head_dim": 64,
             "window_size": 8, "index_head_dim": 32, "hc_mult": 4,
+            "num_attention_heads": 4, "q_lora_rank": 64, "index_topk": 16,
             "compress_ratios": [0, 2], "kv_source_layers": [1],
         }))
         write_shard(self.model / "model.safetensors", [
@@ -254,10 +257,12 @@ class ResourcePlanTest(unittest.TestCase):
             resolved = resolve_model(self.model)
             short = planner_geometry(resolved, 16384)
             long_ = planner_geometry(resolved, 262144)
-            # A chunk-bounded forward: more context grows the resident K/V, but the
-            # per-chunk workspace must not balloon with it.
-            self.assertLess(long_.workspace_bytes, 64 * (1024**2))
-            self.assertLess(long_.workspace_bytes - short.workspace_bytes, 8 * (1024**2))
+            # the closed form, not a chunk: 2*hc*hidden + 3*hc + 2*hidden + hc*hc +
+            # 2*q_lora + heads*head_dim + 2*head_dim + window + 2*index_topk = 1,860
+            # floats a row (no DSpark head here: main_hidden is not allocated), plus the
+            # one `hidden` row the form always priced
+            for geo, ctx in ((short, 16384), (long_, 262144)):
+                self.assertEqual(geo.workspace_bytes, ctx * 1860 * 4 + 128 * 4)
             # The failure itself: every tier must keep a positive expert cache.
             for ctx in (131072, 262144):
                 cap = cap_for_arch("deepseek_v41", None, {"RAM_GB": "28"}, self.model)

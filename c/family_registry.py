@@ -943,11 +943,11 @@ def _dsv41_geometry(config, context, _model_dir):
     Counting them as resident would tell a user with 128 GB that this model
     cannot be served, which is the opposite of true.
 
-    Workspace mirrors forward()'s per-chunk buffers: hc_mult residual copies plus
-    the sublayer scratch, at one prompt chunk rather than the whole context
-    (deepseek_v41.c prefill reads a prompt in chunks, default 1280 rows;
-    COLI_VK_CHAIN_ROWS / COLI_PROMPT_SEGMENT set the chunk size). Pricing the
-    full context over-reserves RAM and starves the experts at long ctx.
+    Workspace mirrors what ONE forward of n rows allocates: forward_full's per-row
+    buffers plus attention_run's, at the context (deepseek_v41.c prefill is one forward
+    over the prompt -- there is no chunk size to bound it), named term by term below.
+    Pricing a prompt chunk instead under-reserved it by the rows the engine actually
+    asks for (266x at 262144).
     """
     section = config.get("text_config", config)
     layers = _required_int(section, "num_hidden_layers", "deepseek_v41")
@@ -1020,24 +1020,41 @@ def _dsv41_geometry(config, context, _model_dir):
         compressed = (context + ratio - 1) // ratio
         state += compressed * ((_KVQ_CKV_BYTES + _KVQ_IKEY_BYTES) if kvq_host else (head_dim + index_hd) * 4)
 
-    # Price the workspace at one prompt chunk, not the whole context (deepseek_v41.c
-    # prefill: default 1280 rows; COLI_VK_CHAIN_ROWS and COLI_PROMPT_SEGMENT change
-    # the chunk size, matching the qwen38 convention). Full-context workspace
-    # starves the RAM expert cache at long ctx even though serve never holds those
-    # buffers at once.
-    try:
-        _chunk = int(os.environ.get("COLI_PROMPT_SEGMENT", "") or 0)
-    except (TypeError, ValueError):
-        _chunk = 0
-    if _chunk < 1:
-        try:
-            _chunk = int(os.environ.get("COLI_VK_CHAIN_ROWS", "") or 0)
-        except (TypeError, ValueError):
-            _chunk = 0
-        if _chunk < 1:
-            _chunk = 1280
-    ws_rows = min(context, _chunk)
-    workspace = (ws_rows * hc_mult * hidden * 2 + ws_rows * hidden * 2 + hidden) * 4
+    # Price the workspace at the CONTEXT, with the engine's own per-row closed form.
+    # A V4.1 prompt is prefilled in one forward -- deepseek_v41.c's forward_with_image is
+    # called once over n_prompt rows and there is no chunker to bound it (no
+    # coli_prompt_segment_rows, no 1280, no COLI_PROMPT_SEGMENT in that file) -- and
+    # forward_full allocates every buffer below at n rows (deepseek_v41.c:4816-4871):
+    #
+    #   forward_full    2 * hc_mult * hidden      the residual streams and their copy
+    #                   3 * hc_mult              pre_mix, pre, post
+    #                   2 * hidden               branch_in, branch_out
+    #                   hc_mult * hc_mult        comb
+    #                   targets * hidden         main_hidden, the DSpark stages' input
+    #   attention_run   2 * q_lora_rank          qr and the q projection's scratch
+    #                   n_heads * head_dim       the queries
+    #                   2 * head_dim             kv and kv_raw
+    #                   window + 2 * index_topk  idx and shared_topk, in ints
+    #
+    # 104,092 floats a row at the released geometry (hidden 5120, hc_mult 4, 3 DSpark
+    # targets of 5120, 64 heads of 512, q_lora 1280, window 128, index_topk 512): 416,368 B
+    # a row, 2.03x the 204,800 B/row this priced before, because the engine allocates at
+    # n: min(ctx, 1280) priced a chunk the engine does not have.
+    #
+    # Not per row, so named and unpriced: attention_run's `heads` (MV_ROWS_MAX * n_heads *
+    # head_dim * 4 = 4 MiB at 32 rows), its `head_score` (n_heads * (window + index_topk) *
+    # 4 = 163,840 B), and forward_full's `embedded` and `collapsed` rows (2 * hidden * 4).
+    # The single `hidden` row below is the one the old form priced.
+    q_lora = _required_int(section, "q_lora_rank", "deepseek_v41")
+    heads = _required_int(section, "num_attention_heads", "deepseek_v41")
+    index_topk = _required_int(section, "index_topk", "deepseek_v41")
+    # The engine reads at most eight target layers (deepseek_v41.c:299) and keeps
+    # main_hidden only when a draft head loaded, which is the same condition as `stages`.
+    targets = min(len(section["dspark_target_layer_ids"]), 8) if stages else 0
+    row_floats = (2 * hc_mult * hidden + 3 * hc_mult + 2 * hidden + hc_mult * hc_mult
+                  + targets * hidden + 2 * q_lora + heads * head_dim + 2 * head_dim
+                  + window + 2 * index_topk)
+    workspace = (context * row_floats + hidden) * 4
     return PlannerGeometry(state, fixed, workspace, experts)
 
 

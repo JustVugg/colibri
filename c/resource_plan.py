@@ -3354,8 +3354,11 @@ CHAT_CONTEXT_AGENT_SHARE = 0.25
 # The engines that size their expert cache from the plan and cannot start without a
 # slot a layer (cap_for_arch): the plan reserves their workspace at the full context,
 # so the step counts it beside the state. DeepSeek V4.1 prefills a prompt in one
-# forward, about 200 KB a token: on a 64 GB box the 262144 the state alone allowed
-# took 53.7 GB of workspace, left the cache no slot, and `coli serve` did not start.
+# forward -- there is no chunk size in deepseek_v41.c to bound it -- and the plan now
+# prices what that forward allocates: 416,368 B a row at the released geometry
+# (forward_full's buffers beside attention_run's), 101.65 GiB at 262144. A chunked
+# prefill is the follow-up that would let a 16 GB box keep a context; until then this
+# ladder is the engine's own ask.
 CHAT_CONTEXT_WORKSPACE = ("deepseek_v41", "mimo")
 
 
