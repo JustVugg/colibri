@@ -6600,11 +6600,18 @@ static size_t v41_cu_dense_bytes(const Model *m) {
 }
 #endif
 /* what a prompt's chain allocates on the tier's device: the CUDA chain's at most (a GGUF on the
- * CUDA tier, one conversation, COLI_CUDA_CHAIN not 0); the tier leaves it */
+ * CUDA tier, one conversation, COLI_CUDA_CHAIN not 0, and a host the chain will run on); the
+ * tier leaves it. The host condition is v41u_wanted's (deepseek_v41_cuchain.h): a PACKED host
+ * declines the chain, so reserving its bytes would hold device expert slots for a chain that
+ * never runs -- 1.74 GB at 262144 (its own v41u_plan_bytes: E*LR*4 for the candidates plus
+ * P*E/4, the mask). Only that condition is mirrored here: the rest of v41u_wanted reads state
+ * (g_cud.on, cc_ready) that is not up yet where the tier sizes itself. COLI_VK_KV_FP32=1
+ * restores the chain and the reservation together. */
 static size_t v41_tier_chain_bytes(Model *m) {
 #ifdef COLI_CUDA
     const char *e = getenv("COLI_CUDA_CHAIN");
-    if (xt_cuda() && m->gguf && !(e && *e == '0') && g_v41_mux_slots <= 1) return v41u_plan_bytes(m, m->c.max_positions);
+    if (xt_cuda() && m->gguf && !(e && *e == '0') && g_v41_mux_slots <= 1 &&
+        !v41_host_kvq(&m->c)) return v41u_plan_bytes(m, m->c.max_positions);
 #endif
     (void)m;
     return 0;
