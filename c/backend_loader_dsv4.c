@@ -185,6 +185,13 @@ typedef const char     *(*fn_backend_name)(void);
 typedef long long       (*fn_mem_free_mb)(int device);
 typedef int             (*fn_device_unified)(int device);
 typedef int             (*fn_stream_drain)(int device);
+typedef int             (*fn_mirror_alloc)(Dsv4CudaTensor **gate, Dsv4CudaTensor **up, Dsv4CudaTensor **down,
+                                           int Og, int Ig, int Od, int Id, int device);
+typedef int             (*fn_mirror_refill)(Dsv4CudaTensor *gate, Dsv4CudaTensor *up, Dsv4CudaTensor *down,
+                                            const uint8_t *scales, long long S, const long long *soff,
+                                            const uint8_t *weights, long long Wb, const long long *woff,
+                                            int sync);
+typedef long long       (*fn_mirror_check)(Dsv4CudaTensor *gate, int run, const uint8_t *src, long long len);
 typedef int             (*fn_kv_ring_append)(int device, int layer, const float *rows,
                                              int start_pos, int count, int window, int dim);
 typedef int             (*fn_kv_comp_append)(int device, int layer, const float *rows,
@@ -347,6 +354,9 @@ static struct {
     fn_mem_free_mb mem_free_mb;
     fn_device_unified device_unified;     /* optional: older DLLs answer 0 (discrete) */
     fn_stream_drain stream_drain;                /* optional (older DLLs) */
+    fn_mirror_alloc mirror_alloc;                /* optional: block mirrors (V4_MIRROR_BLOCK) */
+    fn_mirror_refill mirror_refill;
+    fn_mirror_check mirror_check;
     fn_kv_ring_append kv_ring_append;
     fn_kv_comp_append kv_comp_append;
     fn_head_argmax     head_argmax;
@@ -575,6 +585,9 @@ static int dsv4_cuda_resolve(const char *dllname){
     /* optional: an older DLL without the export keeps the whole tier alive;
      * the engine probes this and simply stays on synchronous attaches. */
     g_dsv4.stream_drain = (fn_stream_drain)GetProcAddress(g_dsv4.dll, "dsv4_cuda_stream_drain");
+    g_dsv4.mirror_alloc = (fn_mirror_alloc)GetProcAddress(g_dsv4.dll, "dsv4_cuda_mirror_alloc");
+    g_dsv4.mirror_refill = (fn_mirror_refill)GetProcAddress(g_dsv4.dll, "dsv4_cuda_mirror_refill");
+    g_dsv4.mirror_check = (fn_mirror_check)GetProcAddress(g_dsv4.dll, "dsv4_cuda_mirror_check");
     g_dsv4.expert_bank_upload_aux = (fn_expert_bank_upload_aux)GetProcAddress(g_dsv4.dll, "dsv4_cuda_expert_bank_upload_aux");
     g_dsv4.expert_bank_slots = (fn_expert_bank_slots)GetProcAddress(g_dsv4.dll, "dsv4_cuda_expert_bank_slots");
     g_dsv4.expert_bank_slot_bytes = (fn_expert_bank_slot_bytes)GetProcAddress(g_dsv4.dll, "dsv4_cuda_expert_bank_slot_bytes");
@@ -965,6 +978,23 @@ int dsv4_cuda_fp8_ref_matmul_resident(Dsv4CudaTensor *t,const float *x,int token
 int dsv4_cuda_tensor_refill_fp4(Dsv4CudaTensor *t, const uint8_t *w, const uint8_t *scale, int O, int I, int sync){
     if(!g_dsv4.available) return 0;
     return g_dsv4.tensor_refill_fp4(t, w, scale, O, I, sync);
+}
+
+/* V4_MIRROR_BLOCK: a DLL without these keeps the three-tensor mirrors */
+int dsv4_cuda_mirror_alloc(Dsv4CudaTensor **gate, Dsv4CudaTensor **up, Dsv4CudaTensor **down,
+                           int Og, int Ig, int Od, int Id, int device){
+    if(!g_dsv4.available||!g_dsv4.mirror_alloc||!g_dsv4.mirror_refill) return 0;
+    return g_dsv4.mirror_alloc(gate, up, down, Og, Ig, Od, Id, device);
+}
+int dsv4_cuda_mirror_refill(Dsv4CudaTensor *gate, Dsv4CudaTensor *up, Dsv4CudaTensor *down,
+                            const uint8_t *scales, long long S, const long long *soff,
+                            const uint8_t *weights, long long Wb, const long long *woff, int sync){
+    if(!g_dsv4.available||!g_dsv4.mirror_refill) return 0;
+    return g_dsv4.mirror_refill(gate, up, down, scales, S, soff, weights, Wb, woff, sync);
+}
+long long dsv4_cuda_mirror_check(Dsv4CudaTensor *gate, int run, const uint8_t *src, long long len){
+    if(!g_dsv4.available||!g_dsv4.mirror_check) return -2;
+    return g_dsv4.mirror_check(gate, run, src, len);
 }
 
 int dsv4_cuda_backend_arch_ok(int device){

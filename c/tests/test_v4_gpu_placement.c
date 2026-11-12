@@ -48,6 +48,7 @@ long long dsv4_cuda_mem_free_mb(int device) { free_queries[device]++; return dev
 int dsv4_cuda_stream_drain(int device) { drained[device]++; return device != 3; }
 void dsv4_cuda_tensor_free(Dsv4CudaTensor *t) { if (t) { live_tensors--; free(t); } }
 void dsv4_cuda_proj_batch_release(void) {}
+static int fp4_uploads, fp4_refills;
 int dsv4_cuda_upload_fp4(Dsv4CudaTensor **t, const uint8_t *w,
                           const uint8_t *scale, int rows, int cols, int device) {
     (void)w; (void)scale; (void)rows; (void)cols;
@@ -57,12 +58,52 @@ int dsv4_cuda_upload_fp4(Dsv4CudaTensor **t, const uint8_t *w,
     assert(*t);
     (*t)->device = device;
     live_tensors++;
+    fp4_uploads++;
     return 1;
 }
 int dsv4_cuda_tensor_refill_fp4(Dsv4CudaTensor *t, const uint8_t *w,
                                  const uint8_t *scale, int rows, int cols, int sync) {
     (void)t; (void)w; (void)scale; (void)rows; (void)cols; (void)sync;
+    fp4_refills++;
     return 1;
+}
+/* V4_MIRROR_BLOCK: one allocation call makes the three tensors, one refill
+ * call takes the record's two runs */
+static int mirror_allocs, mirror_refills, mirror_alloc_ok = 1, mirror_refill_ok = 1;
+static long long mirror_check_weights = -1;
+static const uint8_t *mirror_scales, *mirror_weights;
+static long long mirror_scale_bytes, mirror_weight_bytes, mirror_weight_offset[3];
+int dsv4_cuda_mirror_alloc(Dsv4CudaTensor **gate, Dsv4CudaTensor **up, Dsv4CudaTensor **down,
+                           int Og, int Ig, int Od, int Id, int device) {
+    assert(Og > 0 && Ig > 0 && Od > 0 && Id > 0);
+    if (!mirror_alloc_ok) return 0;
+    Dsv4CudaTensor **all[3] = {gate, up, down};
+    for (int k = 0; k < 3; k++) {
+        *all[k] = malloc(sizeof(**all[k]));
+        assert(*all[k]);
+        (*all[k])->device = device;
+        live_tensors++;
+    }
+    mirror_allocs++;
+    return 1;
+}
+int dsv4_cuda_mirror_refill(Dsv4CudaTensor *gate, Dsv4CudaTensor *up, Dsv4CudaTensor *down,
+                            const uint8_t *scales, long long S, const long long *soff,
+                            const uint8_t *weights, long long Wb, const long long *woff,
+                            int sync) {
+    (void)sync;
+    assert(gate && up && down && scales && weights && soff && woff);
+    if (!mirror_refill_ok) return 0;
+    mirror_scales = scales; mirror_weights = weights;
+    mirror_scale_bytes = S; mirror_weight_bytes = Wb;
+    for (int k = 0; k < 3; k++) mirror_weight_offset[k] = woff[k];
+    mirror_refills++;
+    return 1;
+}
+long long dsv4_cuda_mirror_check(Dsv4CudaTensor *gate, int run, const uint8_t *src,
+                                 long long len) {
+    assert(gate && src && len > 0);
+    return run ? mirror_check_weights : -1;
 }
 
 static int head_upload_ok = 1, head_scores_ok = 1, head_uploads;
@@ -371,6 +412,95 @@ int dsv4_cuda_resident_route_moe(Dsv4CudaExpertSet *set,Dsv4CudaTensor *gate,
     if(route_ok)*out=*in;
     return route_ok;
 }
+/* An expert record as the store keeps it: the three scale tensors together,
+ * then (16-byte aligned) the three weight tensors together, in the file's
+ * order, which here is up, gate, down. gate and up are 2 x 32, down 1 x 32. */
+static uint8_t block_record[256];
+static ColiExpertView block_view(int expert, int scattered) {
+    ColiExpertView view = {0};
+    view.key = (ColiExpertKey){3, expert};
+    view.gate.rows = view.up.rows = 2; view.down.rows = 1;
+    view.gate.columns = view.up.columns = view.down.columns = 32;
+    view.gate.block_rows = view.up.block_rows = view.down.block_rows = 1;
+    view.gate.format = view.up.format = view.down.format = COLI_TENSOR_FP4_NATIVE_BLOCK;
+    view.up.scales = block_record;            /* 2 bytes */
+    view.gate.scales = block_record + 2;      /* 2 bytes */
+    view.down.scales = block_record + 4;      /* 1 byte */
+    view.up.data = block_record + 16;         /* 32 bytes */
+    view.gate.data = block_record + 48;       /* 32 bytes */
+    view.down.data = block_record + (scattered ? 96 : 80);   /* 16 bytes; 96 leaves a gap */
+    return view;
+}
+static void test_mirror_block(void) {
+    V4GpuExpertMirrorCache *cache = v4_gpu_expert_mirrors_create_capacity(0, 8);
+    int tensors = live_tensors;
+    fp4_uploads = fp4_refills = mirror_allocs = mirror_refills = 0;
+    /* the switch unset: three tensors, as before */
+    unsetenv("V4_MIRROR_BLOCK");
+    ColiExpertView view = block_view(0, 0);
+    assert(v4_gpu_expert_attach_cached_ex(cache, &view, 1) == 0);
+    assert(fp4_uploads == 3 && !mirror_allocs && !cache->entries[0].block);
+    /* on: a block, filled with one call from the record's two runs */
+    setenv("V4_MIRROR_BLOCK", "1", 1);
+    view = block_view(1, 0);
+    assert(v4_gpu_expert_attach_cached_ex(cache, &view, 1) == 0);
+    assert(fp4_uploads == 3 && mirror_allocs == 1 && mirror_refills == 1);
+    assert(cache->entries[1].block && cache->block_made == 1);
+    assert(mirror_scales == block_record && mirror_scale_bytes == 5);
+    assert(mirror_weights == block_record + 16 && mirror_weight_bytes == 80);
+    /* gate, up, down, wherever the record put them */
+    assert(mirror_weight_offset[0] == 32 && mirror_weight_offset[1] == 0 &&
+           mirror_weight_offset[2] == 64);
+    assert(view.gate.gpu == cache->entries[1].gate && view.down.gpu == cache->entries[1].down);
+    /* a hit uploads nothing */
+    assert(v4_gpu_expert_attach_cached_ex(cache, &view, 1) == 0 && mirror_refills == 1);
+    for (int expert = 2; expert < 8; expert++) {
+        view = block_view(expert, 0);
+        assert(v4_gpu_expert_attach_cached_ex(cache, &view, 1) == 0);
+    }
+    assert(cache->count == 8 && mirror_allocs == 7 && mirror_refills == 7);
+    /* the cache is full. The oldest entry is the three-tensor one: a block
+     * replaces it (its tensors freed, one more allocation) */
+    view = block_view(8, 0);
+    assert(v4_gpu_expert_attach_cached_ex(cache, &view, 1) == 0);
+    assert(mirror_allocs == 8 && mirror_refills == 8 && !fp4_refills && fp4_uploads == 3);
+    assert(live_tensors == tensors + 24 && !cache->block_refills);
+    /* the next victim is a block: refilled in place, no allocation */
+    view = block_view(9, 0);
+    assert(v4_gpu_expert_attach_cached_ex(cache, &view, 1) == 0);
+    assert(mirror_allocs == 8 && mirror_refills == 9 && cache->block_refills == 1);
+    /* an expert whose tensors are not two runs takes three tensors, in the
+     * same cache, in a block victim's place */
+    view = block_view(10, 1);
+    assert(v4_gpu_expert_attach_cached_ex(cache, &view, 1) == 0);
+    assert(mirror_refills == 9 && fp4_uploads == 6 && cache->block_scattered == 1);
+    assert(live_tensors == tensors + 24);
+    int slot = -1;
+    for (int i = 0; i < cache->count; i++)
+        if (cache->entries[i].expert == 10) slot = i;
+    assert(slot >= 0 && !cache->entries[slot].block);
+    /* a refill the backend refuses falls back to a fresh mirror */
+    mirror_refill_ok = 0;
+    view = block_view(11, 0);
+    assert(v4_gpu_expert_attach_cached_ex(cache, &view, 1) == 0);
+    assert(fp4_uploads == 9 && live_tensors == tensors + 24);
+    mirror_refill_ok = 1;
+    /* V4_MIRROR_BLOCK_VERIFY: every fill read back, a difference counted */
+    setenv("V4_MIRROR_BLOCK_VERIFY", "1", 1);
+    view = block_view(12, 0);
+    assert(v4_gpu_expert_attach_cached_ex(cache, &view, 1) == 0);
+    assert(cache->block_verified == 1 && !cache->block_mismatches);
+    mirror_check_weights = 7;
+    view = block_view(13, 0);
+    assert(v4_gpu_expert_attach_cached_ex(cache, &view, 1) == 0);
+    assert(cache->block_verified == 2 && cache->block_mismatches == 1);
+    mirror_check_weights = -1;
+    unsetenv("V4_MIRROR_BLOCK_VERIFY");
+    unsetenv("V4_MIRROR_BLOCK");
+    v4_gpu_expert_mirrors_free(cache);
+    assert(live_tensors == tensors);
+}
+
 static void test_resident_route(void) {
     V4GpuExpertMirrorCache *cache=v4_gpu_expert_mirrors_create_capacity(0,256);
     cache->first_layer=7; cache->end_layer=8; cache->experts_per_layer=256;
@@ -456,6 +586,7 @@ int main(void) {
     assert(!store.gpu && shutdowns == 1);
     free(engine);
     test_preload();
+    test_mirror_block();
     test_resident_route();
     test_wo_decode();
     test_head();

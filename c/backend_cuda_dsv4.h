@@ -21,6 +21,17 @@ int dsv4_cuda_upload_fp4(Dsv4CudaTensor **t,const uint8_t *w,const uint8_t *scal
 int dsv4_cuda_upload_bf16(Dsv4CudaTensor **t,const uint16_t *w,int O,int I,int device);
 /* Same-shape in-place refill of an fp4 mirror (no realloc); sync=1 drains. */
 int dsv4_cuda_tensor_refill_fp4(Dsv4CudaTensor *t,const uint8_t *w,const uint8_t *scale,int O,int I,int sync);
+/* V4_MIRROR_BLOCK: a routed expert's three FP4 matrices in one weight run and
+ * one scale run, refilled with two copies of the host record's runs.
+ * soff/woff: where gate, up and down start in each run. check: a run read
+ * back against the host bytes (0 the scales, 1 the weights): the first
+ * differing offset, -1 when equal, -2 on error. */
+int dsv4_cuda_mirror_alloc(Dsv4CudaTensor **gate,Dsv4CudaTensor **up,Dsv4CudaTensor **down,
+                           int Og,int Ig,int Od,int Id,int device);
+int dsv4_cuda_mirror_refill(Dsv4CudaTensor *gate,Dsv4CudaTensor *up,Dsv4CudaTensor *down,
+                            const uint8_t *scales,long long S,const long long *soff,
+                            const uint8_t *weights,long long Wb,const long long *woff,int sync);
+long long dsv4_cuda_mirror_check(Dsv4CudaTensor *gate,int run,const uint8_t *src,long long len);
 int dsv4_cuda_upload_f32(Dsv4CudaTensor **t,const float *w,int O,int I,int device);
 int dsv4_cuda_matvec(Dsv4CudaTensor *t,float *y,const float *x);
 int dsv4_cuda_matmul_batch(Dsv4CudaTensor *t,const Dsv4CudaActivation *input,

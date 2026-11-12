@@ -865,6 +865,8 @@ static const ColiEnvVar coli_env_table[] = {
     {"V4_IDX_FAST", CE_BOOL, CE_DSV4, 0, NULL},
     {"V4_IDX_IDENTITY",                  CE_STR   , CE_DSV4                                         , 0             , NULL},
     {"V4_LOADER_LANES",                  CE_INT   , CE_DSV4                                         , 0             , NULL},
+    {"V4_MIRROR_BLOCK", CE_BOOL, CE_DSV4, 0, NULL},
+    {"V4_MIRROR_BLOCK_VERIFY", CE_BOOL, CE_DSV4, 0, NULL},
     {"V4_MOE_BANK_FULL",                 CE_STR   , CE_DSV4                                         , 0             , NULL},
     {"V4_MOE_BATCH_PROF", CE_INT, CE_DSV4, 0, NULL},
     {"V4_MOE_REFILL_GROUP",              CE_STR   , CE_DSV4                                         , 0             , NULL},

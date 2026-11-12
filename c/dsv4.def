@@ -54,6 +54,9 @@ EXPORTS
     dsv4_cuda_upload_fp8_ref
     dsv4_cuda_fp8_ref_matmul_resident
     dsv4_cuda_tensor_refill_fp4
+    dsv4_cuda_mirror_alloc
+    dsv4_cuda_mirror_refill
+    dsv4_cuda_mirror_check
     dsv4_cuda_backend_arch_ok
     dsv4_cuda_backend_name
     dsv4_cuda_kv_ring_append

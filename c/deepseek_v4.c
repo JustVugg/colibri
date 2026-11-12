@@ -12916,6 +12916,7 @@ typedef struct {
     Dsv4CudaTensor *up;
     Dsv4CudaTensor *down;
     uint64_t clock;
+    int block;   /* V4_MIRROR_BLOCK: the three tensors share one weight run and one scale run */
 } V4GpuExpertMirror;
 
 /* Every entry in [0, count) holds a live mirror (gate, up and down): a
@@ -12945,6 +12946,12 @@ struct V4GpuExpertMirrorCache {
     const char *reserve_env;   /* the variable that sets reserve_mb */
     int frozen_warned;
     int upload_failed;
+    /* V4_MIRROR_BLOCK: block mirrors made, refilled in place, and experts
+     * whose host record was not two runs (they took the three-tensor
+     * mirror); V4_MIRROR_BLOCK_VERIFY: fills read back, and those that
+     * differed */
+    unsigned long long block_made, block_refills, block_scattered;
+    unsigned long long block_verified, block_mismatches;
 };
 /* A layer attaches its 6 routed experts before computing them, and a slot is
  * recycled in place: a cache with fewer live mirrors than this would recycle
@@ -13067,6 +13074,15 @@ static void v4_gpu_expert_mirrors_free(V4GpuExpertMirrorCache *cache) {
             dsv4_cuda_tensor_free(cache->entries[i].up);
         if (cache->entries[i].down)
             dsv4_cuda_tensor_free(cache->entries[i].down);
+    }
+    if (cache->block_made || cache->block_scattered) {
+        fprintf(stderr, "v4_gpu mirror-block device=%d made=%llu refills=%llu "
+                        "three-tensor=%llu", cache->device, cache->block_made,
+                cache->block_refills, cache->block_scattered);
+        if (cache->block_verified)
+            fprintf(stderr, " verified=%llu mismatches=%llu", cache->block_verified,
+                    cache->block_mismatches);
+        fputc(10, stderr);
     }
     pthread_mutex_destroy(&cache->mutex);
     free(cache->entries);
@@ -13252,6 +13268,107 @@ static void v4_mirror_warn_frozen(V4GpuExpertMirrorCache *cache,
 /* grow_only: return -2 instead of recycling an entry when this cache cannot
  * grow (the tiered attach then tries the next cache), also when the upload
  * of a new mirror failed. -1 = this cache cannot take the expert at all. */
+/* V4_MIRROR_BLOCK (0): a routed expert's mirror as one weight run and one
+ * scale run on the device, laid out as the host record has them, so an
+ * upload is two copies instead of six (dsv4_cuda_mirror_refill). The entry
+ * is still three tensors to everything that reads it (the expert group, the
+ * peer pool, the resident route). An expert whose host tensors are not two
+ * contiguous runs (a GGUF expert, a read that scattered them) takes the
+ * three-tensor mirror as before, in the same cache. 0 = three tensors, six
+ * copies. V4_MIRROR_BLOCK_VERIFY=1 reads every fill back and compares it
+ * with the host bytes (`mirrorverify` on a difference, counts at exit). */
+static int v4_mirror_block_on(void) {
+    const char *setting = getenv("V4_MIRROR_BLOCK");
+    return setting && *setting && atoi(setting) != 0;
+}
+static int v4_mirror_block_verify_on(void) {
+    const char *setting = getenv("V4_MIRROR_BLOCK_VERIFY");
+    return setting && *setting && atoi(setting) != 0;
+}
+/* Three segments as one run: contiguous in some order, no gap and no
+ * overlap. The run's base and length, and each segment's offset in it. */
+static int v4_view_run(const unsigned char *const segment[3], const long long size[3],
+                       const unsigned char **base, long long *length, long long offset[3]) {
+    const unsigned char *low = NULL, *high = NULL;
+    long long sum = 0;
+    for (int k = 0; k < 3; k++) {
+        if (!segment[k] || size[k] <= 0) return 0;
+        if (!low || segment[k] < low) low = segment[k];
+        if (!high || segment[k] + size[k] > high) high = segment[k] + size[k];
+        sum += size[k];
+    }
+    if (sum != high - low) return 0;
+    for (int k = 0; k < 3; k++) offset[k] = segment[k] - low;
+    for (int a = 0; a < 3; a++)
+        for (int b = 0; b < 3; b++)
+            if (a != b && offset[a] < offset[b] + size[b] &&
+                offset[b] < offset[a] + size[a]) return 0;
+    *base = low;
+    *length = high - low;
+    return 1;
+}
+typedef struct {
+    const unsigned char *scales, *weights;
+    long long scale_bytes, weight_bytes, scale_offset[3], weight_offset[3];
+    int dims[4];   /* gate (and up) rows, columns; down rows, columns */
+} V4MirrorRuns;
+/* The view as a block mirror would hold it: gate and up of one shape, FP4
+ * with one scale per 32 weights, the three scale tensors one run and the
+ * three weight tensors one run, each weight tensor on a 16-byte offset. */
+static int v4_view_block_runs(const ColiExpertView *view, V4MirrorRuns *runs) {
+    const ColiTensorView *tensor[3] = {&view->gate, &view->up, &view->down};
+    const unsigned char *scale[3], *weight[3];
+    long long scale_size[3], weight_size[3];
+    if (view->up.rows != view->gate.rows || view->up.columns != view->gate.columns)
+        return 0;
+    for (int k = 0; k < 3; k++) {
+        long long elements = (long long)tensor[k]->rows * tensor[k]->columns;
+        if (tensor[k]->rows < 1 || tensor[k]->columns < 1 || tensor[k]->columns % 32 ||
+            tensor[k]->rows > INT_MAX || tensor[k]->columns > INT_MAX)
+            return 0;
+        scale[k] = (const unsigned char *)tensor[k]->scales;
+        weight[k] = (const unsigned char *)tensor[k]->data;
+        scale_size[k] = elements / 32;
+        weight_size[k] = elements / 2;
+    }
+    if (!v4_view_run(scale, scale_size, &runs->scales, &runs->scale_bytes,
+                     runs->scale_offset) ||
+        !v4_view_run(weight, weight_size, &runs->weights, &runs->weight_bytes,
+                     runs->weight_offset))
+        return 0;
+    for (int k = 0; k < 3; k++)
+        if (runs->weight_offset[k] & 15) return 0;
+    runs->dims[0] = (int)view->gate.rows; runs->dims[1] = (int)view->gate.columns;
+    runs->dims[2] = (int)view->down.rows; runs->dims[3] = (int)view->down.columns;
+    return 1;
+}
+/* Fill a block mirror from the view's two runs (the cache's lock held). */
+static int v4_mirror_block_fill(V4GpuExpertMirrorCache *cache, V4GpuExpertMirror *entry,
+                                const ColiExpertView *view, const V4MirrorRuns *runs,
+                                int sync) {
+    if (!dsv4_cuda_mirror_refill(entry->gate, entry->up, entry->down,
+                                 runs->scales, runs->scale_bytes, runs->scale_offset,
+                                 runs->weights, runs->weight_bytes, runs->weight_offset,
+                                 sync))
+        return 0;
+    if (v4_mirror_block_verify_on()) {
+        long long scale_bad = dsv4_cuda_mirror_check(entry->gate, 0, runs->scales,
+                                                     runs->scale_bytes);
+        long long weight_bad = dsv4_cuda_mirror_check(entry->gate, 1, runs->weights,
+                                                      runs->weight_bytes);
+        cache->block_verified++;
+        if (scale_bad != -1 || weight_bad != -1) {
+            cache->block_mismatches++;
+            fprintf(stderr, "mirrorverify device=%d layer=%d expert=%d scales=%lld "
+                            "weights=%lld (the first differing offset, -1 equal, "
+                            "-2 not read)\n",
+                    cache->device, view->key.layer, view->key.expert, scale_bad,
+                    weight_bad);
+        }
+    }
+    return 1;
+}
+
 static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
                                             ColiExpertView *view, int sync,
                                             int grow_only);
@@ -13291,6 +13408,12 @@ static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
          * reason to recycle a victim nor a sign of a full card */
         pthread_mutex_unlock(&cache->mutex);
         return -1;
+    }
+    V4MirrorRuns runs = {0};
+    int block_wanted = 0;
+    if (found < 0 && v4_mirror_block_on()) {
+        block_wanted = v4_view_block_runs(view, &runs);
+        if (!block_wanted) cache->block_scattered++;
     }
     if (found < 0) {
         /* Growth guard: new mirrors may only claim VRAM while a reserve
@@ -13391,7 +13514,18 @@ static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
              * cudaFree + cudaMalloc + pageable copy x3 — at long context
              * decode misses this cache for nearly every expert (~3 GB and
              * ~1500 driver calls per token). */
-            if (cache->entries[found].gate && cache->entries[found].up &&
+            /* V4_MIRROR_BLOCK: a block victim takes the record's two runs;
+             * a three-tensor victim is refilled as before unless this
+             * expert can have a block, which then replaces it below. */
+            int refilled = 0;
+            if (cache->entries[found].block)
+                refilled = block_wanted && cache->entries[found].gate &&
+                           cache->entries[found].up && cache->entries[found].down &&
+                           v4_mirror_block_fill(cache, &cache->entries[found], view,
+                                                &runs, sync);
+            if (refilled) cache->block_refills++;
+            else if (!cache->entries[found].block && !block_wanted &&
+                cache->entries[found].gate && cache->entries[found].up &&
                 cache->entries[found].down &&
                 view->gate.data && view->gate.scales &&
                 view->up.data && view->up.scales &&
@@ -13407,7 +13541,9 @@ static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
                 dsv4_cuda_tensor_refill_fp4(
                     cache->entries[found].down, (const uint8_t *)view->down.data,
                     (const uint8_t *)view->down.scales, (int)view->down.rows,
-                    (int)view->down.columns, sync)) {
+                    (int)view->down.columns, sync))
+                refilled = 1;
+            if (refilled) {
                 cache->entries[found].layer = view->key.layer;
                 cache->entries[found].expert = view->key.expert;
                 cache->entries[found].clock = v4_mirror_tick();
@@ -13433,22 +13569,40 @@ static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
         cache->entries[found].gate = NULL;
         cache->entries[found].up = NULL;
         cache->entries[found].down = NULL;
+        cache->entries[found].block = 0;
         Dsv4CudaTensor *gate = NULL, *up = NULL, *down = NULL;
-        int ok = (view->gate.data && view->gate.scales &&
+        int made_block = 0;
+        if (block_wanted &&
+            dsv4_cuda_mirror_alloc(&gate, &up, &down, runs.dims[0], runs.dims[1],
+                                   runs.dims[2], runs.dims[3], cache->device)) {
+            V4GpuExpertMirror fresh = {0};
+            fresh.gate = gate; fresh.up = up; fresh.down = down;
+            if (v4_mirror_block_fill(cache, &fresh, view, &runs, sync)) {
+                made_block = 1;
+                cache->block_made++;
+            } else {
+                dsv4_cuda_tensor_free(gate);
+                dsv4_cuda_tensor_free(up);
+                dsv4_cuda_tensor_free(down);
+                gate = up = down = NULL;
+            }
+        }
+        int ok = made_block ||
+                 (view->gate.data && view->gate.scales &&
                   view->gate.rows > 0 && view->gate.columns > 0 &&
                   dsv4_cuda_upload_fp4(
                       &gate, (const uint8_t *)view->gate.data,
                       (const uint8_t *)view->gate.scales,
                       (int)view->gate.rows, (int)view->gate.columns,
                       cache->device));
-        if (ok)
+        if (ok && !made_block)
             ok = (view->up.data && view->up.scales && view->up.rows > 0 &&
                   view->up.columns > 0 &&
                   dsv4_cuda_upload_fp4(
                       &up, (const uint8_t *)view->up.data,
                       (const uint8_t *)view->up.scales, (int)view->up.rows,
                       (int)view->up.columns, cache->device));
-        if (ok)
+        if (ok && !made_block)
             ok = (view->down.data && view->down.scales &&
                   view->down.rows > 0 && view->down.columns > 0 &&
                   dsv4_cuda_upload_fp4(
@@ -13477,6 +13631,7 @@ static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
         cache->entries[found].gate = gate;
         cache->entries[found].up = up;
         cache->entries[found].down = down;
+        cache->entries[found].block = made_block;
         if (appended) cache->grown_bytes += mirror_bytes;
         g_v4_mirror_uploads++;
     }

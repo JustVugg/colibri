@@ -46,7 +46,8 @@
 #else
 #define COLI_DSV4_TC 1
 #endif
-struct Dsv4CudaTensor { void *w,*bf16_cache; uint8_t *scale;int *dg_scale; int O,I,fmt,device,own_w,own_scale,own_dg_scale; long long bytes; };
+struct Dsv4CudaTensor { void *w,*bf16_cache; uint8_t *scale;int *dg_scale; int O,I,fmt,device,own_w,own_scale,own_dg_scale; long long bytes;
+    void *block,*block2; long long blockcap,block2cap; /* a block mirror's owner (dsv4_cuda_mirror_alloc): its weight run and its scale run */ };
 struct Dsv4CudaActivation { float *data; long long elements; int device; };
 struct Dsv4CudaGraph { cudaGraph_t graph;cudaGraphExec_t exec;int device; };
 struct Dsv4CudaKvCache { float *kv,*compressed,*comp_value,*comp_score,*rope_cos,*rope_sin,*comp_cos,*comp_sin;int *compressed_len;int device,window,dim,max_tokens,max_compressed,rope_pairs; };
@@ -1982,6 +1983,54 @@ extern "C" int dsv4_cuda_tensor_refill_fp4(Dsv4CudaTensor *t,const uint8_t*w,con
     if(sync&&!ok(cudaStreamSynchronize(c->stream),"refill drain"))return 0;
     return 1;
 }
+/* A block mirror of one routed expert (V4_MIRROR_BLOCK): its three FP4
+ * matrices in two device allocations, the weight run and the scale run, laid
+ * out as the host record has them. A refill is then TWO copies, the record's
+ * two runs, where dsv4_cuda_tensor_refill_fp4 on three tensors is six; under
+ * WDDM an enqueued cudaMemcpyAsync costs ~0.1 ms whatever its size. The three
+ * tensors are ordinary ones to every kernel (w and scale point into the
+ * runs); gate owns the allocations, up and down own nothing, so the three
+ * are freed as any other mirror's. Two allocations and not one: the weight
+ * run alone is a whole number of 2 MiB pages on V4 Flash, and scales and
+ * weights together took one page more per mirror. */
+extern "C" int dsv4_cuda_mirror_alloc(Dsv4CudaTensor**g,Dsv4CudaTensor**u,Dsv4CudaTensor**d,int Og,int Ig,int Od,int Id,int dev){
+    if(!g||!u||!d||Og<=0||Ig<=0||Od<=0||Id<=0||Ig%32||Id%32)return 0;Dev*c=ctx(dev);if(!c||!ok(cudaSetDevice(dev),"select mirror device"))return 0;
+    long long sg=(long long)Og*Ig/32,sd=(long long)Od*Id/32,wg=(long long)Og*Ig/2,wd=(long long)Od*Id/2,S=2*sg+sd,Wb=2*wg+wd;
+    void*wblock=nullptr,*sblock=nullptr;if(!alloc_ok(cudaMalloc(&wblock,(size_t)Wb),"mirror weight-run allocation"))return 0;
+    if(!alloc_ok(cudaMalloc(&sblock,(size_t)S),"mirror scale-run allocation")){cudaFree(wblock);return 0;}
+    Dsv4CudaTensor*t[3];
+    for(int k=0;k<3;k++){t[k]=(Dsv4CudaTensor*)calloc(1,sizeof(Dsv4CudaTensor));if(!t[k]){for(int j=0;j<k;j++)free(t[j]);cudaFree(wblock);cudaFree(sblock);return 0;}
+        t[k]->device=dev;t[k]->fmt=4;t[k]->O=k<2?Og:Od;t[k]->I=k<2?Ig:Id;
+        t[k]->scale=(uint8_t*)sblock+(k<2?k*sg:2*sg);t[k]->w=(uint8_t*)wblock+(k<2?k*wg:2*wg);}   /* provisional: a refill points them */
+    t[0]->block=wblock;t[0]->block2=sblock;t[0]->blockcap=Wb;t[0]->block2cap=S;t[0]->bytes=Wb+S;*g=t[0];*u=t[1];*d=t[2];return 1;}
+/* sc: the host scale run (S bytes), w: the host weight run (Wb bytes);
+ * soff/woff: where gate, up and down start in each. The weights start on a
+ * 16-byte boundary, as they do in their own allocations. sync as in
+ * dsv4_cuda_tensor_refill_fp4. */
+extern "C" int dsv4_cuda_mirror_refill(Dsv4CudaTensor*g,Dsv4CudaTensor*u,Dsv4CudaTensor*d,const uint8_t*sc,long long S,const long long*soff,const uint8_t*w,long long Wb,const long long*woff,int sync){
+    if(!g||!g->block||!g->block2||!u||!d||!sc||!w||!soff||!woff||S<=0||Wb<=0||S>g->block2cap||Wb>g->blockcap)return 0;
+    Dsv4CudaTensor*t[3]={g,u,d};
+    for(int k=0;k<3;k++){long long sb=(long long)t[k]->O*t[k]->I/32,wb=(long long)t[k]->O*t[k]->I/2;
+        if(soff[k]<0||soff[k]+sb>S||woff[k]<0||woff[k]+wb>Wb||(woff[k]&15))return 0;}
+    Dev*c=ctx(g->device);if(!c||!ok(cudaSetDevice(g->device),"select mirror refill device"))return 0;
+    if(host_pinned(w,(size_t)Wb))host_pinned(sc,(size_t)S);
+    if(!ok(cudaMemcpyAsync(g->block,w,(size_t)Wb,cudaMemcpyHostToDevice,c->stream),"mirror weights upload")||
+       !ok(cudaMemcpyAsync(g->block2,sc,(size_t)S,cudaMemcpyHostToDevice,c->stream),"mirror scales upload"))return 0;
+    if(sync&&!ok(cudaStreamSynchronize(c->stream),"mirror refill drain"))return 0;
+    for(int k=0;k<3;k++){t[k]->scale=(uint8_t*)g->block2+soff[k];t[k]->w=(uint8_t*)g->block+woff[k];}
+    return 1;}
+/* V4_MIRROR_BLOCK_VERIFY: a run of a block mirror (0 the scales, 1 the
+ * weights) read back and compared with the host bytes it was filled from.
+ * The first differing offset, -1 when equal, -2 on error. */
+extern "C" long long dsv4_cuda_mirror_check(Dsv4CudaTensor*g,int run,const uint8_t*src,long long len){
+    if(!g||!g->block||!g->block2||!src||len<=0||(run!=0&&run!=1))return -2;
+    if(len>(run?g->blockcap:g->block2cap))return -2;
+    Dev*c=ctx(g->device);if(!c||!ok(cudaSetDevice(g->device),"select mirror check device"))return -2;
+    if(!ok(cudaStreamSynchronize(c->stream),"mirror check drain"))return -2;
+    uint8_t*h=(uint8_t*)malloc((size_t)len);if(!h)return -2;
+    if(!ok(cudaMemcpy(h,run?g->block:g->block2,(size_t)len,cudaMemcpyDeviceToHost),"mirror check download")){free(h);return -2;}
+    long long bad=-1;for(long long i=0;i<len;i++)if(h[(size_t)i]!=src[i]){bad=i;break;}
+    free(h);return bad;}
 extern "C" int dsv4_cuda_upload_bf16(Dsv4CudaTensor **t,const uint16_t*w,int O,int I,int d){return upload(t,w,(size_t)O*I*2,nullptr,0,O,I,d,16);}
 __global__ void pack_bf16_rows32(uint16_t *out,const uint16_t *in,int O,int I){
     long long p=(long long)blockIdx.x*blockDim.x+threadIdx.x;
@@ -3663,6 +3712,6 @@ extern "C" int dsv4_cuda_wo(Dsv4CudaTensor *wa,Dsv4CudaTensor *wb,int groups,flo
 }
 /* A latched-off peer's context may refuse the frees (sticky fault): read the
  * error so the next launch check does not report it. */
-extern "C" void dsv4_cuda_tensor_free(Dsv4CudaTensor*t){if(!t)return;cudaSetDevice(t->device);if(t->own_w&&t->w)cudaFree(t->w);if(t->bf16_cache)cudaFree(t->bf16_cache);if(t->own_scale&&t->scale)cudaFree(t->scale);if(t->own_dg_scale&&t->dg_scale)cudaFree(t->dg_scale);if(dev_lost(t->device))cudaGetLastError();free(t);}
+extern "C" void dsv4_cuda_tensor_free(Dsv4CudaTensor*t){if(!t)return;cudaSetDevice(t->device);if(t->own_w&&t->w)cudaFree(t->w);if(t->bf16_cache)cudaFree(t->bf16_cache);if(t->own_scale&&t->scale)cudaFree(t->scale);if(t->own_dg_scale&&t->dg_scale)cudaFree(t->dg_scale);if(t->block)cudaFree(t->block);if(t->block2)cudaFree(t->block2);if(dev_lost(t->device))cudaGetLastError();free(t);}
 extern "C" long long dsv4_cuda_tensor_bytes(const Dsv4CudaTensor*t){return t?t->bytes:0;}
 extern "C" int dsv4_cuda_tensor_device(const Dsv4CudaTensor*t){return t?t->device:-1;}
