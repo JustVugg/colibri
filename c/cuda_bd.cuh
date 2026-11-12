@@ -923,8 +923,10 @@ __device__ __forceinline__ bool bd_dec16(int t, const bd_u32 *__restrict__ W, bd
 
 #if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
 #define bd_shfl_xor(v, o) __shfl_xor((v), (o), 32)
+#define bd_shfl(v, l) __shfl((v), (l), 32)
 #else
 #define bd_shfl_xor(v, o) __shfl_xor_sync(0xffffffffu, (v), (o), 32)
+#define bd_shfl(v, l) __shfl_sync(0xffffffffu, (v), (l), 32)
 #endif
 
 /* ---- the GEMVs: y[s, o] = sum_i x[s, i] * w[o, i] for a few rows of x ----------------------
@@ -1361,11 +1363,11 @@ __device__ __forceinline__ void bd_mmg_sb(const bd_u32 *__restrict__ Wa, const b
             st.pa[0] = a.x; st.pa[1] = a.y; st.pa[2] = a.z; st.pa[3] = a.w; st.pb[0] = b.x; st.pb[1] = b.y; st.pb[2] = b.z; st.pb[3] = b.w;
         } else if (T == 14) {   /* items i and i + 1, i = 8 (jj / 4) + 2 (jj % 4): thread i / 4's, at i % 4 */
             const int i = 8 * (jj >> 2) + 2 * (jj & 3), src = quad | (i >> 2), kk = i & 3;
-            st.pa[0] = __shfl_sync(0xffffffffu, sv[0][kk], src); st.pa[1] = __shfl_sync(0xffffffffu, sv[0][kk + 1], src);
-            st.pb[0] = __shfl_sync(0xffffffffu, sv[1][kk], src); st.pb[1] = __shfl_sync(0xffffffffu, sv[1][kk + 1], src);
+            st.pa[0] = bd_shfl(sv[0][kk], src); st.pa[1] = bd_shfl(sv[0][kk + 1], src);
+            st.pb[0] = bd_shfl(sv[1][kk], src); st.pb[1] = bd_shfl(sv[1][kk + 1], src);
         } else {   /* item jj: thread jj / 2's, at jj % 2 */
             const int src = quad | (jj >> 1), kk = jj & 1;
-            st.pa[0] = __shfl_sync(0xffffffffu, sv[0][kk], src); st.pb[0] = __shfl_sync(0xffffffffu, sv[1][kk], src);
+            st.pa[0] = bd_shfl(sv[0][kk], src); st.pb[0] = bd_shfl(sv[1][kk], src);
         }
         #pragma unroll
         for (int n = 0; n < NT; n++) {
