@@ -2277,8 +2277,11 @@ static void q38_ps_save(Model *m,const int *ids,int P){
         kept=coli_ps_save(&g_q38_ps,ids,P,parts,np,st,sb,q38_pin_state_free,avail);
     }else q38_pin_state_free(st);
     if(log){
-        fprintf(stderr,"[PREFIX] store: checkpoint at %d %s (%.0f MiB held in %d checkpoints; %.0f MiB of RAM free, %d kept free)\n",
-                P,kept?"kept":"not kept",g_q38_ps.bytes/1048576.0,coli_ps_live_ckpts(&g_q38_ps),avail,COLI_PS_RAM_FLOOR_MB);
+        char held[32];   /* bytes below a MiB: a small store does not read as an empty one */
+        if(g_q38_ps.bytes<1048576)snprintf(held,sizeof held,"%zu bytes",g_q38_ps.bytes);
+        else snprintf(held,sizeof held,"%.1f MiB",g_q38_ps.bytes/1048576.0);
+        fprintf(stderr,"[PREFIX] store: checkpoint at %d %s (%s held in %d checkpoints; %.0f MiB of RAM free, %d kept free)\n",
+                P,kept?"kept":"not kept",held,coli_ps_live_ckpts(&g_q38_ps),avail,COLI_PS_RAM_FLOOR_MB);
         fflush(stderr);
     }
     free(parts);
