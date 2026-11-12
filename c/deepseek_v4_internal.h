@@ -147,6 +147,14 @@ int coli_v4_hc_pre(float *output, float *post, float *comb,
 int coli_v4_hc_post(float *output, const float *branch,
                     const float *residual, const float *post,
                     const float *comb, int hc, int dimension);
+int coli_v4_hc_pre_team(float *output, float *post, float *comb,
+                        const float *input, const float *hc_fn,
+                        const float scale[3], const float *base,
+                        int hc, int dimension, int iterations,
+                        float norm_eps, float hc_eps, int team);
+int coli_v4_hc_post_team(float *output, const float *branch,
+                         const float *residual, const float *post,
+                         const float *comb, int hc, int dimension, int team);
 
 int coli_v4_rmsnorm(float *output, const float *input, const float *weight,
                     int dimension, float eps);
