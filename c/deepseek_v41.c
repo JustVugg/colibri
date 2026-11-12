@@ -3038,6 +3038,7 @@ static void attention_run(Model *m, int layer, const float *x, int n, int start_
     int ratio = c->compress_ratio[layer], owner = c->index_owner[layer];
     const float *rope = rope_for(m, layer);
     double started = now_s();
+    int hostq = v41_host_kvq(c);      /* the host's KV state in the cache's formats */
 
     float *qr = xmalloc((size_t)n * c->q_lora * sizeof(float), "q latent");
     float *q = xmalloc((size_t)n * nh * hd * sizeof(float), "queries");
@@ -3059,10 +3060,24 @@ static void attention_run(Model *m, int layer, const float *x, int n, int start_
             rope_apply(q + (size_t)t * nh * hd + (size_t)h * hd + hd - rd, rope, start_pos + t, rd, 0);
         rms_into(kv + (size_t)t * hd, kv_raw + (size_t)t * hd, l->kv_norm.w, hd, c->norm_eps);
         rope_apply(kv + (size_t)t * hd + hd - rd, rope, start_pos + t, rd, 0);
+        /* Under the flag a query never reads the floats this row was computed from: it reads
+         * the code row the store keeps, dequantized -- a decode step's refresh of the ring, a
+         * resumed forward's whole ring, and (below) the chunk's own rows in `kv_all`. So the
+         * row enters every read as the codec's value, pack then unpack in place, before this
+         * forward stores or attends to it. e4m3 re-packs a dequantized row to itself
+         * (dsv41_kvq.h's codec note, tests/test_kv_quant.c), so the code row the ring gets is
+         * the one a pack of the untouched floats would have written. Without this the SAME
+         * text answers differently prefilled at once and continued from its own stored state:
+         * every query of a prefill would read exact floats a resumed one can only read as
+         * codes (tests/test_dsv41_prefix_serve.py, 26 failures of 29). */
+        if (hostq) {
+            uint8_t code[KVQ_WIN_BYTES];
+            kvq_pack_win(code, kv + (size_t)t * hd);
+            kvq_unpack_win(kv + (size_t)t * hd, code);
+        }
     }
 
     /* the window half: prefill reads the chunk, decode reads the ring */
-    int hostq = v41_host_kvq(c);
     size_t roww = v41_row_win(c);
     float *win_dec = NULL;   /* the ring's rows as floats, under the flag (dequant on read) */
     const float *window_kv;
