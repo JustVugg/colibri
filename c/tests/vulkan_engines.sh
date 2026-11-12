@@ -18,9 +18,10 @@
 #   bash tests/vulkan_engines.sh kv-split | kv-split-sanitize   # the KV cache split between the device and
 #                                                  # the host past the device's budget, every chain engine
 #   bash tests/vulkan_engines.sh kv-split-deepseek | kv-split-deepseek-sanitize   # the same for DeepSeek's
-#   bash tests/vulkan_engines.sh kv-quant-deepseek   # the packed KV cache (COLI_VK_KV_FP32, the
-#                                                  # default): mirrors and host in the checkpoint's
-#                                                  # quantized formats, approximate
+#   bash tests/vulkan_engines.sh kv-quant-deepseek | kv-quant-deepseek-sanitize   # the packed KV
+#                                                  # cache (COLI_VK_KV_FP32, the default): mirrors
+#                                                  # and host in the checkpoint's quantized formats,
+#                                                  # approximate; sanitized under ASan and UBSan
 #   bash tests/vulkan_engines.sh staged    # staged uploads: the same bits as mapped memory, the decision
 #   bash tests/vulkan_engines.sh <family>-staged   # a family with COLI_VK_STAGED=1 (qwen-staged: and
 #                                                  # an engine under an emulated small window)
@@ -4938,9 +4939,23 @@ family_kv_split_deepseek_sanitize() {
 # reuse, DSpark's rollback) against the same packed fixture.
 family_kv_quant_deepseek() {
   export OMP_NUM_THREADS=2
-  make deepseek_v41 tests/test_vk_kv_quant VK=1
+  if [ "${SAN:-0}" = 1 ]; then
+    # The packed host arrays, the pull/re-upload and the block-wide index keys under ASan
+    # and UBSan: this family is the only one whose arms hold the host's rows as codes, and
+    # everything below runs on the sanitized build (the 64/32 fixture the other sanitized
+    # families walk declines the packed host by the geometry guard, so nothing else sees
+    # these arrays). ASAN_OPTIONS as every other sanitized family sets them.
+    local SANF="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+    make clean >/dev/null 2>&1 || true
+    make deepseek_v41 tests/test_vk_kv_quant VK=1 EXTRA_CFLAGS="$SANF" EXTRA_LDFLAGS="$SANF"
+    export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0
+    export UBSAN_OPTIONS=print_stacktrace=1
+  else
+    make deepseek_v41 tests/test_vk_kv_quant VK=1
+  fi
   ./tests/test_vk_kv_quant | tee vk_kv_quant.log
   tail -1 vk_kv_quant.log | grep -qx PASS || { cat vk_kv_quant.log; fail "kv-quant: the codec"; }
+  if san_diag vk_kv_quant.log; then cat vk_kv_quant.log; fail "kv-quant: sanitizer diagnostic in the codec"; fi
   [ -d dsv41_kvq_tiny ] || $PY tools/make_dsv41_tiny.py --out dsv41_kvq_tiny --kv-quant-dims --emit-ref dsv41_kvq_tiny/ref.json
   [ -d dsv41_kvq_long ] || $PY tools/make_dsv41_tiny.py --out dsv41_kvq_long --kv-quant-dims --emit-ref dsv41_kvq_long/ref.json --prompt-len 40 --max-new 6
   # Every arm runs THE DEFAULT: the var unset is the packed cache (the packed mirrors AND
@@ -4969,6 +4984,17 @@ family_kv_quant_deepseek() {
     $PY -m unittest tests.test_dsv41_prefix_serve tests.test_dsv41_dspark_serve
   echo "OK kv-quant serve: prefix reuse and DSpark's rollback against the packed fixture"
   rm -f chain.usage chain-serve.usage
+  if [ "${SAN:-0}" = 1 ]; then
+    # the arms' own gates read stdout; a sanitizer report lands on stderr, so every log
+    # this family wrote is swept here as well -- a heap overrun in a packed row can leave
+    # the tokens it printed untouched
+    for f in vk_kv_quant.log off.log on.log plain.log forced.log; do
+      [ -f "$f" ] || continue
+      if san_diag "$f"; then cat "$f"; fail "kv-quant sanitize: $f carries a sanitizer diagnostic"; fi
+    done
+    echo "OK kv-quant sanitize: no sanitizer diagnostic in any arm's log"
+    make clean >/dev/null 2>&1 || true
+  fi
   unset OMP_NUM_THREADS
 }
 # The packed cache under the KV split: the split arms (its whole fp32 mirrors win, the
@@ -5387,6 +5413,7 @@ case "${1:-}" in
   kv-split-deepseek) family_kv_split_deepseek ;;
   kv-split-deepseek-sanitize) family_kv_split_deepseek_sanitize ;;
   kv-quant-deepseek) family_kv_quant_deepseek ;;
+  kv-quant-deepseek-sanitize) SAN=1 family_kv_quant_deepseek ;;
   staged)         family_staged ;;
   *-staged)       # COLI_VK_STAGED unset for the window's run, then the whole family staged
                   if [ "$1" = qwen-staged ]; then env -u COLI_VK_STAGED bash tests/vulkan_engines.sh staged-window; fi
@@ -5409,5 +5436,5 @@ case "${1:-}" in
   partial-*)      g=${1#partial-}; fn=ptl_family_${g//-/_}
                   declare -F "$fn" >/dev/null || { echo "no partial-chain group ${g}" >&2; exit 2; }
                   "$fn" ;;
-  *) echo "usage: $0 mux|mux-sanitize|mux-deepseek|mux-deepseek-sanitize|decide|decide-sanitize|staged|<family>-staged|shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize|qwen-chain|qwen-chain-sanitize|qwen-spec|qwen-spec-sanitize|mimo-chain|mimo-chain-sanitize|inkling-olmoe-chain|inkling-olmoe-chain-sanitize|glm-chain|glm-chain-sanitize|kimi-chain|kimi-chain-sanitize|deepseek-chain|deepseek-chain-sanitize|dense-only-<group>[-sanitize]|partial-<group>[-sanitize]|prefill-qwen|prefill-qwen-sanitize|prefill-inkling-olmoe|prefill-mimo-kimi|prefill-glm|prefill-deepseek|kv-split|kv-split-sanitize|kv-split-cold|kv-split-cold-sanitize|layers-dev2[-mla|-deepseek][-sanitize]|layers-dev2-<engine>|kv-split-deepseek|kv-split-deepseek-sanitize|kv-quant-deepseek|dev2|dev2-deepseek-kimi-mimo|dev2-sanitize" >&2; exit 2 ;;
+  *) echo "usage: $0 mux|mux-sanitize|mux-deepseek|mux-deepseek-sanitize|decide|decide-sanitize|staged|<family>-staged|shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize|qwen-chain|qwen-chain-sanitize|qwen-spec|qwen-spec-sanitize|mimo-chain|mimo-chain-sanitize|inkling-olmoe-chain|inkling-olmoe-chain-sanitize|glm-chain|glm-chain-sanitize|kimi-chain|kimi-chain-sanitize|deepseek-chain|deepseek-chain-sanitize|dense-only-<group>[-sanitize]|partial-<group>[-sanitize]|prefill-qwen|prefill-qwen-sanitize|prefill-inkling-olmoe|prefill-mimo-kimi|prefill-glm|prefill-deepseek|kv-split|kv-split-sanitize|kv-split-cold|kv-split-cold-sanitize|layers-dev2[-mla|-deepseek][-sanitize]|layers-dev2-<engine>|kv-split-deepseek|kv-split-deepseek-sanitize|kv-quant-deepseek|kv-quant-deepseek-sanitize|dev2|dev2-deepseek-kimi-mimo|dev2-sanitize" >&2; exit 2 ;;
 esac
