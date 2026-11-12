@@ -663,6 +663,42 @@ class ResourcePlanTest(unittest.TestCase):
             self.assertEqual(ram["sequence_state_bytes"], 2 * 32 * 4 * 8 * 2 * 4)
             self.assertEqual(ram["fixed_state_bytes"], 0)
 
+    def test_olmoe_plans_the_cache_olmoe_sizes_itself(self):
+        # #2785: --auto-tier hands olmoe the plan's RAM_GB and its cap (COLI_PLAN_CAP),
+        # so the plan reserves what olmoe.c reserves (model_init_range): 0.5 GB of
+        # activations beside the resident dense, not colibri.c's 1.2 + 2.5 GB and 64
+        # experts. The KV of the planned context stays on top: with a cap given, the
+        # engine does not take slots back as the KV grows (kv_room_fit). OLMoE-1B-7B's
+        # geometry; one expert per layer and the embedding stand in for the checkpoint.
+        hidden, inter, layers, experts = 2048, 1024, 16, 64
+        (self.model / "config.json").write_text(json.dumps({
+            "model_type": "olmoe", "num_hidden_layers": layers, "hidden_size": hidden,
+            "num_attention_heads": 16, "num_key_value_heads": 16, "num_experts": experts,
+            "num_experts_per_tok": 8, "intermediate_size": inter, "vocab_size": 50304}))
+        tensors = [("model.embed_tokens.weight", 50304 * hidden * 2, "BF16", [50304, hidden])]
+        for i in range(layers):
+            p = f"model.layers.{i}.mlp.experts.0."
+            tensors += [(p + "merged_weight", 3 * inter * hidden, "I8", [3 * inter * hidden]),
+                        (p + "qs", (2 * inter + hidden) * 4, "F32", [2 * inter + hidden])]
+        write_shard(self.model / "model.safetensors", tensors)
+        slot = hidden * inter * 3 + (inter * 2 + hidden) * 4      # olmoe.c slot_bytes()
+        # what _discover_metal_gpus reports for an M1 Pro: no placement budget
+        metal = [{"index": 0, "name": "Apple M1 Pro", "total_bytes": 0, "free_bytes": None,
+                  "unified_memory": True, "backend": "metal"}]
+        for available, planned, engine in ((8 * GB, 52, 62), (11 * GB, 64, 64)):
+            with self.subTest(available=available):
+                plan = build_plan(self.model, context=4096, available_memory=available,
+                                  available_disk=1, gpus=metal, physical_cpus=8,
+                                  cpu_sockets=1, env={})
+                ram = plan["tiers"]["ram"]
+                room = ram["budget_bytes"] - ram["dense_bytes"] - GB // 2
+                # olmoe.c at --ram <the plan's budget>: room / olm_slot_bytes / layers
+                self.assertEqual(min(experts, room // slot // layers), engine)
+                self.assertEqual(ram["cache_slots_per_layer"], min(
+                    experts, (room - ram["sequence_state_bytes"]) // (slot * layers)))
+                self.assertEqual(ram["cache_slots_per_layer"], planned)
+                self.assertEqual(environment_for_plan(plan, {})["COLI_PLAN_CAP"], str(planned))
+
     def test_glm_dsa_state_is_charged_only_when_every_indexer_weight_exists(self):
         config = json.loads((self.model / "config.json").read_text())
         config.update({"index_head_dim": 16,
