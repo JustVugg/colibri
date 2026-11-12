@@ -400,6 +400,269 @@ static void host_block_tests(void) {
            "the re-pack a fixpoint on the host\n");
 }
 
+/* a row's attention as sparse_attn.h's formula (and chain_dsv4.comp's mode 0): the score
+ * (q . k) * scale with the sink in the denominator only, the weights exp(sc - best), the
+ * value sum and the denominator in list order, entry e < 0 skipped -- the dot over i
+ * ascending, as mode 0's one thread a (row, entry) does it. sc: cnt floats of scratch */
+static void attn_row(float *o, const float *q, const float *kv, const int *idx, int n, int hd, float sink, float scale,
+                     float *sc) {
+    float best = -1e30f;
+    for (int j = 0; j < n; j++) {
+        if (idx[j] < 0) { sc[j] = -INFINITY; continue; }
+        float d = 0;
+        for (int i = 0; i < hd; i++) d += q[i] * kv[(size_t)idx[j] * hd + i];
+        sc[j] = d * scale;
+        if (sc[j] > best) best = sc[j];
+    }
+    float den = expf(sink - best);
+    for (int i = 0; i < hd; i++) o[i] = 0;
+    for (int j = 0; j < n; j++) {
+        if (idx[j] < 0) continue;
+        float w = expf(sc[j] - best);
+        den += w;
+        for (int i = 0; i < hd; i++) o[i] += w * kv[(size_t)idx[j] * hd + i];
+    }
+    for (int i = 0; i < hd; i++) o[i] /= den;
+}
+
+/* mode 0 over the packed mirrors (vkc_dsv4_attn's flags 2) against two arms that differ
+ * from it in exactly one thing -- how the row's floats are produced:
+ *   fp32   mode 0 over the rows kvq_unpack_win/kvq_unpack_ckv decode from the SAME bytes
+ *          (a separate buffer), so the two runs are the same kernel on the same values and
+ *          their outputs must be equal BIT FOR BIT. A wrong code, scale offset or group
+ *          index in the shader's decoder breaks it; nothing else in the kernel differs.
+ *   scalar attn_row over those decoded rows: the formula, and the only tolerances are
+ *          expf's (libm against llvmpipe's exp) and a contracted fma -- 2e-5, as mode 0
+ *          against sparse_attn.h's kernel (tests/test_vk_chain.c's test_ds_attn).
+ * The list mixes window and compressed rows (row 0's walks every row of both -- a window
+ * ring of exactly nwin slots read whole), with duplicates and skipped entries.
+ * one: a single entry a row and the sink -inf, so the weight is exp(0) = 1, the denominator
+ * 1 and the output the value row's own floats, compared bit for bit.
+ * mut (VK_KV_QUANT_MUT=win|ckv): one scale byte of the packed mirror is changed by one
+ * code AFTER the fp32 arm's rows were decoded from the original bytes, and the packed arm
+ * must move -- the plain run's "the arms agree" is a test only if this run makes them
+ * differ, so a run with the variable set fails where the plain one passes. */
+static void attn_packed(const char *what, int S, int H, int nwin, int ncmp, int cnt, int one, int mut) {
+    const int hd = 512;
+    const size_t wby = (size_t)nwin * KVQ_WIN_BYTES, cby = (size_t)ncmp * KVQ_CKV_BYTES;
+    const size_t rowb = (size_t)H * hd * 4, allb = (size_t)S * rowb;
+    uint8_t *pw = malloc(wby), *pc = malloc(cby);
+    float *kw = malloc((size_t)nwin * hd * 4), *kc = malloc((size_t)ncmp * hd * 4);
+    float *kv = malloc((size_t)(nwin + ncmp) * hd * 4);
+    float *qq = malloc((size_t)S * H * hd * 4), *sk = malloc((size_t)H * 4);
+    float *ref = malloc(allb), *sc = malloc((size_t)(cnt > 0 ? cnt : 1) * 4);
+    int *li = malloc((size_t)S * cnt * 4);
+    VkcBuf *qd = NULL, *wd = NULL, *cd = NULL, *wf = NULL, *cf = NULL, *ld = NULL, *sd = NULL, *op = NULL, *of = NULL, *wm = NULL, *cd2 = NULL, *om = NULL;
+    if (!pw || !pc || !kw || !kc || !kv || !qq || !sk || !ref || !sc || !li) { CHECK(0, "%s: out of memory", what); goto done; }
+    srand(41);
+    for (int i = 0; i < nwin * hd; i++) kw[i] = (float)((rand() % 2001) - 1000) / 500.0f * ldexpf(1.f, rand() % 7 - 3);
+    for (int i = 0; i < ncmp * hd; i++) kc[i] = (float)((rand() % 2001) - 1000) / 500.0f * ldexpf(1.f, rand() % 7 - 3);
+    if (nwin > 2) for (int i = 0; i < hd; i++) { kw[hd + i] = 0.0f; kw[2 * hd + i] = (i & 1) ? -448.0f : 448.0f; }
+    if (ncmp > 1) for (int i = 0; i < hd; i++) kc[hd + i] = 0.0f;
+    srand(47);
+    for (int i = 0; i < S * H * hd; i++) qq[i] = (float)((rand() % 2001) - 1000) / 500.0f * ldexpf(1.f, rand() % 3 - 1);
+    srand(53);
+    for (int h = 0; h < H; h++) sk[h] = one ? -INFINITY : (float)((rand() % 9) - 4) * 0.5f;
+    srand(59);
+    for (int s = 0; s < S; s++)
+        for (int j = 0; j < cnt; j++) {
+            if (one) { li[(size_t)s * cnt + j] = j ? -1 : (int)(rand() % (unsigned)(nwin + ncmp)); continue; }
+            if (s == 0 && j < nwin + ncmp) { li[j] = j; continue; }   /* every row of both, in a row */
+            int r = rand() % 6;
+            li[(size_t)s * cnt + j] = r == 0 ? -1 : r < 3 ? (int)(rand() % (unsigned)nwin) : nwin + (int)(rand() % (unsigned)ncmp);
+        }
+    for (int r = 0; r < nwin; r++) kvq_pack_win(pw + (size_t)r * KVQ_WIN_BYTES, kw + (size_t)r * hd);
+    for (int r = 0; r < ncmp; r++) kvq_pack_ckv(pc + (size_t)r * KVQ_CKV_BYTES, kc + (size_t)r * hd);
+    for (int r = 0; r < nwin; r++) kvq_unpack_win(kv + (size_t)r * hd, pw + (size_t)r * KVQ_WIN_BYTES);
+    for (int r = 0; r < ncmp; r++) kvq_unpack_ckv(kv + (size_t)(nwin + r) * hd, pc + (size_t)r * KVQ_CKV_BYTES);
+    for (int s = 0; s < S; s++)
+        for (int h = 0; h < H; h++)
+            attn_row(ref + ((size_t)s * H + h) * hd, qq + ((size_t)s * H + h) * hd, kv, li + (size_t)s * cnt, cnt, hd,
+                     sk[h], 1.f / sqrtf((float)hd), sc);
+    if (!(qd = upf(qq, allb)) || !(wd = upf(pw, wby)) || !(cd = upf(pc, cby)) ||
+        !(wf = upf(kv, (size_t)nwin * hd * 4)) || !(cf = upf(kv + (size_t)nwin * hd, (size_t)ncmp * hd * 4)) ||
+        !(ld = upf(li, (size_t)S * cnt * 4)) || !(sd = upf(sk, (size_t)H * 4)) ||
+        !(op = vkc_buf(allb, VKC_DEV)) || !(of = vkc_buf(allb, VKC_DEV))) {
+        CHECK(0, "%s: device memory refused", what); goto done;
+    }
+    VkcDsAttn p2 = {S, H, hd, cnt, 0, cnt, nwin, 0, 0, 0, H * hd, 0, H * hd, 0, 2, 1.f / sqrtf((float)hd)};
+    VkcDsAttn p0 = p2; p0.flags = 0;   /* the same rows as fp32: w_off/c_off 0, hd the stride */
+    vkc_begin();
+    int ok = vkc_dsv4_attn(qd, wd, cd, ld, sd, op, &p2) && vkc_dsv4_attn(qd, wf, cf, ld, sd, of, &p0);
+    vkc_submit(1);
+    float *gp = grab(op, allb), *gf = grab(of, allb);
+    int same = gp && gf && !memcmp(gp, gf, allb);
+    double e = gp ? rel_l2(gp, ref, S * H * hd) : 1;
+    CHECK(ok && gp && gf, "%s: the dispatches were refused", what);
+    if (one) CHECK(same && gp && !memcmp(gp, ref, allb), "%s: a one-entry row is not its value row's bits", what);
+    else {
+        CHECK(same, "%s: the packed arm is not the fp32 arm's bits (the shader's decode is not dsv41_kvq.h's)", what);
+        CHECK(e <= 2e-5, "%s: rel_l2 %.3e to the scalar attention over the decoded rows", what, e);
+    }
+    if (mut) {   /* one scale code, only where the packed arm reads it */
+        VkcBuf *mw = wd, *mc = cd;   /* the mutated mirror, above the one the fp32 arm's rows came from */
+        if (mut == 1 && nwin) { pw[512] ^= 1u; if (!(wm = upf(pw, wby))) goto mutfail; mw = wm; }
+        else if (mut == 2 && ncmp) { pc[256] ^= 1u; if (!(cd2 = upf(pc, cby))) goto mutfail; mc = cd2; }
+        else { CHECK(0, "%s: the mutation needs a row", what); goto mutdone; }
+        if ((om = vkc_buf(allb, VKC_DEV))) {
+            vkc_begin(); int ok2 = vkc_dsv4_attn(qd, mw, mc, ld, sd, om, &p2); vkc_submit(1);
+            float *gm = grab(om, allb);
+            int moved = gm && gp && memcmp(gm, gp, allb) != 0;
+            CHECK(ok2 && moved, "%s: a one-code change in a %s scale moved nothing", what, mut == 1 ? "window" : "compressed");
+            if (ok2 && moved) printf("  %s: a one-code change in a %s scale moves the packed arm\n", what,
+                                     mut == 1 ? "window" : "compressed");
+            free(gm);
+            goto mutdone;
+        }
+    mutfail:
+        CHECK(0, "%s: device memory refused (the mutation)", what);
+    mutdone: ;
+    }
+    printf("OK kv-quant attn %s (S %d H %d nwin %d ncmp %d cnt %d): the packed arm's bits are the fp32 arm's, "
+           "rel_l2 %.2e to the scalar attention over kvq_unpack's rows\n", what, S, H, nwin, ncmp, cnt, e);
+    free(gp); free(gf);
+    done:
+    vkc_free(qd); vkc_free(wd); vkc_free(cd); vkc_free(wf); vkc_free(cf); vkc_free(ld); vkc_free(sd);
+    vkc_free(op); vkc_free(of); vkc_free(wm); vkc_free(cd2); vkc_free(om);
+    free(pw); free(pc); free(kw); free(kc); free(kv); free(qq); free(sk); free(ref); free(sc); free(li);
+}
+
+/* a row's top-k by repeated scan: the largest, then the next (ties to the lower column, as
+ * vkc_dsv4_topk); a column at -inf is never picked and a short row leaves -1s */
+static void topk_scan(const float *v, int width, int topk, int *row) {
+    float *c = malloc((size_t)width * 4);
+    if (!c) { for (int t = 0; t < topk; t++) row[t] = -1; return; }
+    memcpy(c, v, (size_t)width * 4);
+    for (int t = 0; t < topk; t++) {
+        int b = -1;
+        for (int j = 0; j < width; j++) if (b < 0 || c[j] > c[b]) b = j;
+        if (b < 0 || c[b] == -INFINITY) { for (int u = t; u < topk; u++) row[u] = -1; break; }
+        row[t] = b; c[b] = -INFINITY;
+    }
+    free(c);
+}
+
+/* the indexer's scores over the packed keys (vkc_dsv4_score's quant) against (a) the same
+ * call over the rows kvq_unpack_ikey decodes from the mirror -- bit for bit -- and (b) a
+ * scalar float sum in the shader's own order (a thread a column, its dot over i ascending,
+ * the heads ascending with the weight w * wscale precomputed, score/score_wide/
+ * score_grid), also bit for bit: the inputs are on a 0.25 grid with weights on 0.5, so
+ * every partial sum is exact in float whatever the order or an fma contraction does.
+ * The mode is the parameter's own (vkc_dsv4_score): width < 32 keeps mode 3 (IH <= 64 and
+ * IH * ID <= 4096) or mode 9 (IH > 64, the queries from memory); width >= 32 with IH <= 256
+ * takes mode 10's grid. width not a multiple of 32 leaves the mirror a partial last block.
+ * Reported: the top-k overlap (the checkpoint's index_topk, 512, on a pool wider than it)
+ * between the scores over the ORIGINAL fp32 rows and the packed keys' -- the format's own
+ * selection cost, which a decoding fault cannot hide behind.
+ * mut (VK_KV_QUANT_MUT=ikey): one scale byte of the mirror changes a code after the fp32
+ * arm was packed from the original bytes; the packed arm must move. */
+static void index_quant(const char *what, int S, int pos_base, int ratio, int IH, int width, int topk, int mut, int wide) {
+    const int ID = 128, qrow = IH * ID, wrow = IH, scrow = width + 3;
+    const float wscale = 0.25f;
+    const size_t mb = kvq_ikey_mirror_bytes((size_t)width), sn = (size_t)S * scrow;
+    float *q = malloc((size_t)S * qrow * 4), *w = malloc((size_t)S * wrow * 4);
+    float *k = malloc((size_t)width * ID * 4), *kd = malloc((size_t)width * ID * 4);
+    float *ref = calloc(sn, 4), *ref0 = calloc(sn, 4), *zero = calloc(sn, 4);
+    uint8_t *km = calloc(mb, 1);
+    int *t1 = malloc((size_t)topk * 4), *t0 = malloc((size_t)topk * 4);
+    VkcBuf *qb = NULL, *wb = NULL, *kq = NULL, *kmq = NULL, *s1 = NULL, *s2 = NULL, *kmut = NULL, *sm2 = NULL;
+    if (!q || !w || !k || !kd || !ref || !ref0 || !zero || !km || !t1 || !t0) { CHECK(0, "%s: out of memory", what); goto done; }
+    srand(61);
+    for (int i = 0; i < S * qrow; i++) q[i] = (float)((rand() % 9) - 4) * 0.25f;
+    for (int i = 0; i < S * wrow; i++) w[i] = (float)((rand() % 9) - 4) * 0.5f;
+    for (int i = 0; i < width * ID; i++)
+        k[i] = wide ? (float)((rand() % 33) - 16) / 16.0f * (float)(1 << (rand() % 7))   /* past FP4's grid */
+                    : (float)((rand() % 9) - 4) * 0.25f;
+    /* a power of two a token, cycling: the 32 tokens of a block then carry 32 different
+     * scale bytes, so a reader that takes a neighbouring token's scales (an off-by-one on
+     * the 4 scale bytes at block + 2048 + 4t) cannot agree by coincidence -- equal tokens
+     * would hide it. Every value stays a multiple of 1/16, so the sums below stay exact. */
+    for (int t = 0; t < width; t++) {
+        float f = ldexpf(1.f, t % 4 - 1);
+        for (int i = 0; i < ID; i++) k[(size_t)t * ID + i] *= f;
+    }
+    for (int t = 0; t < width; t++) { kvq_pack_ikey(km, t, k + (size_t)t * ID); kvq_unpack_ikey(kd + (size_t)t * ID, km, t); }
+    for (int s = 0; s < S; s++) {
+        int lens = (pos_base + s + 1) / ratio;
+        float wt[IH];
+        for (int h = 0; h < IH; h++) wt[h] = w[(size_t)s * wrow + h] * wscale;
+        for (int j = 0; j < width; j++) {
+            float t1v = -INFINITY, t0v = -INFINITY;
+            if (j < lens) {
+                t1v = 0; t0v = 0;
+                for (int h = 0; h < IH; h++) {
+                    float d1 = 0, d0 = 0;
+                    for (int i = 0; i < ID; i++) {
+                        d1 += q[(size_t)s * qrow + h * ID + i] * kd[(size_t)j * ID + i];
+                        d0 += q[(size_t)s * qrow + h * ID + i] * k[(size_t)j * ID + i];
+                    }
+                    if (d1 > 0) t1v += d1 * wt[h];
+                    if (d0 > 0) t0v += d0 * wt[h];
+                }
+            }
+            ref[(size_t)s * scrow + j] = t1v; ref0[(size_t)s * scrow + j] = t0v;
+        }
+    }
+    int over = 0;
+    double num0 = 0, den0 = 0;
+    for (int s = 0; s < S; s++) {
+        topk_scan(ref + (size_t)s * scrow, width, topk, t1);
+        topk_scan(ref0 + (size_t)s * scrow, width, topk, t0);
+        for (int a = 0; a < topk; a++) for (int b = 0; b < topk; b++) if (t1[a] >= 0 && t1[a] == t0[b]) { over++; break; }
+        for (int j = 0; j < width; j++) {
+            if (!isfinite(ref0[(size_t)s * scrow + j])) continue;
+            double d = (double)ref[(size_t)s * scrow + j] - ref0[(size_t)s * scrow + j];
+            num0 += d * d; den0 += (double)ref0[(size_t)s * scrow + j] * ref0[(size_t)s * scrow + j];
+        }
+    }
+    double ov = (double)over / ((double)S * topk), rel0 = sqrt(num0 / (den0 + 1e-30));
+    if (!(qb = upf(q, (size_t)S * qrow * 4)) || !(wb = upf(w, (size_t)S * wrow * 4)) ||
+        !(kq = upf(kd, (size_t)width * ID * 4)) || !(kmq = upf(km, mb)) ||
+        !(s1 = vkc_buf(sn * 4, VKC_DEV)) || !(s2 = vkc_buf(sn * 4, VKC_DEV))) {
+        CHECK(0, "%s: device memory refused", what); goto done;
+    }
+    vkc_begin(); vkc_write(s1, 0, zero, sn * 4); vkc_write(s2, 0, zero, sn * 4); vkc_submit(1);
+    VkcDsScore sp = {S, pos_base, ratio, IH, ID, width, 0, qrow, 0, wrow, 0, ID, 0, scrow, wscale, 0, 0, 0};
+    VkcDsScore sq = sp; sq.quant = 1;
+    vkc_begin();
+    int ok = vkc_dsv4_score(qb, wb, kq, NULL, s1, &sp) && vkc_dsv4_score(qb, wb, kmq, NULL, s2, &sq);
+    vkc_submit(1);
+    float *g1 = grab(s1, sn * 4), *g2 = grab(s2, sn * 4);
+    int bits = g1 && g2 && !memcmp(g1, g2, sn * 4), cbits = g1 && !memcmp(g1, ref, sn * 4);
+    double rnum = 0, rden = 0;   /* the -inf columns are equal on both sides but not subtractable */
+    if (g1) for (size_t i = 0; i < sn; i++) {
+        if (!isfinite(ref[i])) { if (g1[i] != ref[i]) rnum = INFINITY; continue; }
+        double d = (double)g1[i] - ref[i]; rnum += d * d; rden += (double)ref[i] * ref[i];
+    }
+    double relc = sqrt(rnum / (rden + 1e-30));
+    CHECK(ok && g1 && g2, "%s: the dispatches were refused", what);
+    CHECK(bits, "%s: the packed keys' scores are not the fp32 rows' bits", what);
+    /* exact grids: bit for bit; the wide rows' sums need more bits than float has at every
+     * partial, so there an order or an fma contraction may round the last place */
+    if (wide) CHECK(relc <= 1e-6, "%s: rel_l2 %.3e to the scalar sum over kvq_unpack_ikey's rows", what, relc);
+    else CHECK(cbits, "%s: the scores are not the scalar sum over kvq_unpack_ikey's rows, bit for bit", what);
+    CHECK(ov >= 0.80, "%s: the top-%d overlap %.1f%% is below 80%%", what, topk, ov * 100);
+    if (mut == 3) {
+        km[2048] ^= 1u;   /* token 0's first group scale, a code up */
+        if ((kmut = upf(km, mb)) && (sm2 = vkc_buf(sn * 4, VKC_DEV))) {
+            vkc_begin(); int ok2 = vkc_dsv4_score(qb, wb, kmut, NULL, sm2, &sq); vkc_submit(1);
+            float *gm = grab(sm2, sn * 4);
+            int moved = gm && g2 && memcmp(gm, g2, sn * 4) != 0;
+            CHECK(ok2 && moved, "%s: a one-code change in an index-key scale moved nothing", what);
+            if (ok2 && moved) printf("  %s: a one-code change in an index-key scale moves the packed scores\n", what);
+            free(gm);
+        } else CHECK(0, "%s: device memory refused (the mutation)", what);
+    }
+    printf("OK kv-quant index %s (S %d pos %d ratio %d IH %d width %d topk %d): the packed keys' scores are the fp32 "
+           "rows' bits%s, rel_l2 %.2e to the scalar sum over kvq_unpack_ikey's rows, top-%d overlap %.1f%% and rel_l2 "
+           "%.2e against the original rows' scores\n",
+           what, S, pos_base, ratio, IH, width, topk, cbits ? " and the scalar sum's" : "", relc, topk, ov * 100, rel0);
+    free(g1); free(g2);
+    done:
+    vkc_free(qb); vkc_free(wb); vkc_free(kq); vkc_free(kmq); vkc_free(s1); vkc_free(s2); vkc_free(kmut); vkc_free(sm2);
+    free(q); free(w); free(k); free(kd); free(ref); free(ref0); free(zero); free(km); free(t1); free(t0);
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);   /* a crash's prints must not sit in the buffer */
     host_block_tests();   /* no device needed -- and its failures are not a skip */
@@ -416,6 +679,25 @@ int main(void) {
                               * same expression, exercised through mode 10 here) */
     score_case(2, 64, 8);     /* a narrow one: mode 3 */
     score_case(2, 512, 65);   /* the wide queries: mode 9 */
+    {   /* mode 0's packed read and the indexer's, which test_vk_chain.c never takes: its
+         * test_ds_attn runs flags 0 and 1 only (no packed cache) and its VkcDsScore
+         * initializers leave quant 0, so the decode-on-read paths ship with no test that
+         * could fail. VK_KV_QUANT_MUT=win|ckv|ikey: the same run with one scale code
+         * changed under the packed arm, which must part from the others. */
+        const char *m = getenv("VK_KV_QUANT_MUT");
+        int mut = !m || !*m ? 0 : !strcmp(m, "win") ? 1 : !strcmp(m, "ckv") ? 2 : !strcmp(m, "ikey") ? 3 : -1;
+        CHECK(mut >= 0, "VK_KV_QUANT_MUT=%s: not win, ckv or ikey", m);
+        attn_packed("mixed rows, a window ring of exactly nwin", 2, 3, 8, 5, 16, 0, mut == 1 || mut == 2 ? mut : 0);
+        attn_packed("V4.1-Flash's 64 heads of 512", 2, 64, 8, 5, 13, 0, 0);
+        attn_packed("a list past the kernel's 256 threads", 2, 4, 8, 40, 300, 0, 0);
+        attn_packed("one entry a row and the sink -inf: the value's bits", 2, 2, 1, 1, 3, 1, 0);
+        index_quant("mode 3 (the default, 23 keys: a partial last block)", 1, 88, 4, 32, 23, 16, mut == 3 ? 3 : 0, 0);
+        index_quant("mode 9 (the wide queries, 65 heads)", 1, 92, 4, 65, 23, 16, 0, 0);
+        index_quant("mode 10 (the grid, 1005 keys)", 2, 4016, 4, 32, 1005, 512, 0, 0);
+        index_quant("mode 10 (the grid, 2048 keys, index_topk 512)", 1, 8191, 4, 32, 2048, 512, 0, 0);
+        index_quant("mode 10 (the grid, 8 heads, 64 keys)", 3, 252, 4, 8, 64, 16, 0, 0);
+        index_quant("mode 10 (the grid, 2048 keys off FP4's grid)", 1, 8191, 4, 32, 2048, 512, 0, 1);
+    }
     if (fails) { printf("FAIL: kv-quant (%d)\n", fails); coli_vk_shutdown(); return 1; }
     printf("PASS\n");   /* the plain word, as the gates grep for */
     coli_vk_shutdown();
