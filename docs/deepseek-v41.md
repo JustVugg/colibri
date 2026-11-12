@@ -545,14 +545,30 @@ stages: the token embedding is never on the device, see below).
 
 The only VRAM item that grows with the conversation is the chain's KV mirrors, and the
 checkpoint's own cache already stores that state quantized. The packed cache keeps the
-mirrors in those formats — the same layouts DeepInfer's paged cache defines
-(`c/dsv41_kvq.h`) — and does so BY DEFAULT: `COLI_VK_KV_FP32` unset (or `0`) runs
-packed, and `1` is the exact fp32 opt-out. There is no half-packed setting: the host's
-arrays are packed exactly when the mirrors are (`v41_host_kvq` reads the same flag), and
+mirrors in those formats — the formats DeepInfer's paged cache defines and its store
+kernel writes (`deepseek-ai/DeepInfer@a679bb86`,
+`deepinfer/model_executor/layers/tilelang_ops/cache_common.py:109-137` and the layout
+at `:318-323`, the quantizer `.../tilelang_ops/cuda/store_kv_cache.py:117-184`, the
+dependency pinned `tile-kernels==2.1.0`) — and does so BY DEFAULT: `COLI_VK_KV_FP32`
+unset (or `0`) runs packed, and `1` is the exact fp32 opt-out. There is no half-packed
+setting: the host's arrays are packed exactly when the mirrors are (`v41_host_kvq` reads
+the same flag), and
 the old middle level that kept the host fp32 while the mirrors packed measured
 byte-identical to the packed host on the 12-prompt battery (at 16K only the packed host
 was ever needed), so it cost the dequant→re-pack round trip the ckv subnormal-scale fix
 had to repair and bought nothing measurable.
+
+One deliberate deviation from DeepInfer, in the packed state only: a compressed group
+whose amax falls in `[9,10)·2^-9` is packed one scale code down, because the give-way
+chain's dequantize→re-pack cycle needs `pack(unpack(pack))` to be a value fixpoint. The
+price is that the group's grid stops at `6·2^-9`, so every element above it saturates
+there where DeepInfer's grid holds `8·2^-9`: in that band the group's mean error is 15 %
+against DeepInfer's 10 %, and its top elements 25 % below DeepInfer's decoding (probe
+`proposals/w3-di-spec/di_ind.c`, T3). Everywhere else the rules and the bytes are
+DeepInfer's (band edges and the three formats: `di_parity.c` A-G). DeepInfer's own
+index-K blocks are `128 // compress_ratio` tokens (64 or 128), not this cache's 32: the
+same 64+4 bytes a token, a wider scale section, so the two byte streams are not
+comparable (`cache_engine.py:433`).
 
 | mirror | format | bytes a row | was (fp32) |
 |---|---|---|---|

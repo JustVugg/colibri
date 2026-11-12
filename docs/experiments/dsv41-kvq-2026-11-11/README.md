@@ -73,7 +73,11 @@ fp32:  6400·ctx + (43·128 + 40·6)·2048  = 116,621,312 B at 16K
 ```
 
 43 rings = 40 layers + 3 DSpark stages; 40·6 = one rollback row a layer per
-(`dspark_block_size` 5 + 1). The copied plans ([`plan-16384-packed.json`](plan-16384-packed.json), [`plan-16384-fp32.json`](plan-16384-fp32.json)) are the **`d10c0a5a` planner's** output: 40
+(`dspark_block_size` 5 + 1). The copied plans ([`plan-16384-packed.json`](plan-16384-packed.json), [`plan-16384-fp32.json`](plan-16384-fp32.json)) are the **`d10c0a5a` planner's** output, and they predate the workspace re-price: their allocation
+field priced the prompt's workspace at min(ctx, 1280) rows, which was later corrected to
+what one forward of n rows allocates (416,368 B a row). The STATE figures below are what
+those plans were copied for and they stand; regenerate the plans before quoting their
+allocation. 40
 rings, no rollback rows, `fixed_state_bytes` 2,703,360 / 10,485,760 B, totals 17,285,120 /
 115,343,360 B. Part 1 fixed exactly that: at `382dfb45` the planner prints 3,032,832 /
 11,763,712 B and totals **17,614,592 / 116,621,312 B**, the engine's own numbers;

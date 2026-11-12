@@ -15,13 +15,18 @@
  * main cache); where that scale would leave the group's scaled amax at the e2m1 top tie
  * or below it, the packer steps it down a code (kvq_pack_ckv's note) so a dequantized
  * row re-packs to itself -- the one place colibri's ckv bytes differ from DI's, which
- * never re-packs a row. The amax margins floor the scale away from zero (FP8 1e-4,
+ * never re-packs a row (DI's own rows are bf16 too: cuda/store_kv_cache.py's channel and
+ * channel_amax fragments, so its bytes are comparable in the rules only).
+ * The amax margins floor the scale away from zero (FP8 1e-4,
  * FP4 6*2^-126, the e4m3-scale path 2^-9 * 6). Values are rounded to nearest, ties to
  * the even code (RNE),
- * the e4m3 codes as dsv4_quant.h's dsv4_e4m3_round picks them. The host keeps its state
- * fp32 holding the DEQUANTIZED rows (a pull's write-back and a re-upload's source), so the
- * reference here is what the device's pack (chain_dsv4.comp mode 13) must reproduce bit
- * for bit and its unpack (mode 14) reads back. */
+ * the e4m3 codes as dsv4_quant.h's dsv4_e4m3_round picks them. The host keeps its state in
+ * THESE FORMATS: since the packed cache is the default, `Layer.window/ckv/ikey` are
+ * `uint8_t *` arrays of 528/288/68 B code rows (deepseek_v41.c's v41_row_win/ckv/ikey --
+ * every offset into them is a byte stride through those), and COLI_VK_KV_FP32=1 is the
+ * fp32 opt-out that puts 4-byte floats back. So the reference here is what the device's
+ * pack (chain_dsv4.comp mode 13) must reproduce bit for bit and its unpack (mode 14)
+ * reads back -- and on the host the same functions are the store and the read. */
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -134,9 +139,12 @@ static inline void kvq_pack_ckv(uint8_t dst[KVQ_CKV_BYTES], const float *x) {
          * Only a subnormal sf >= 0x02 can trip it (a normal sf keeps the scaled amax
          * above 5.6, and 0x01's groups sit at >= 6 by the clamp floor), and the demoted
          * scale puts the scaled amax at 9-10, the 6-grid: the re-pack re-picks it. The
-         * first-pack cost in the band is the amax decoding to 6*2^-9, 33-40% low against
-         * 11-20% had sf 0x02 kept -- near-dead groups only, and DI never re-packs, so
-         * outside the band the bytes are DI's */
+         * first-pack cost in the band is not only the amax (33-40% low against 11-20% had
+         * sf 0x02 been kept): sf 0x01's grid tops out at 6*2^-9, so EVERY element above
+         * it saturates there where sf 0x02, DI's, stores 8*2^-9 -- the group's whole
+         * upper tail 25% low, its mean error 15% against DI's 10% in the band
+         * (proposals/w3-di-spec/di_ind.c, T3). Outside the band the bytes are DI's; DI
+         * never re-packs, so it never pays this */
             sf--;
             inv = kvq_e4m3_inv(sf);
         }
