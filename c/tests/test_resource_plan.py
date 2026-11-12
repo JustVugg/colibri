@@ -3238,16 +3238,22 @@ def vm_stat_output(free, active, inactive, speculative, wired, purgeable, file_b
             "".join(f"{name + ':':<30} {count:>16}.\n" for name, count in rows))
 
 
-# #2785, a 16 GB M1 Pro (2^20 pages of 16 KiB) right after a run: 7 GB of the
-# model's file pages are still in the active queue.
+# Synthetic fixtures: neither report posted vm_stat. From #2785: a 16 GB M1 Pro
+# (2^20 pages of 16 KiB), and a dev figure (5.5 GB, a 4.84 GB budget) inside the
+# 4.6-6.3 GB budget its `coli plan` saw. The rest is ours, chosen to show the
+# mechanism: right after a run, 7 GB of the model's file pages are still in the
+# active queue.
 MAC16_AFTER_RUN = vm_stat_output(free=40000, active=577576, inactive=276000, speculative=15000,
                                  wired=110000, purgeable=5000, file_backed=626387,
                                  compressor=30000)
-# The same Mac minutes later: 400000 of those pages have aged into the inactive queue.
+# The same synthetic Mac minutes later: 400000 of those pages have aged into the
+# inactive queue.
 MAC16_AGED = vm_stat_output(free=40000, active=177576, inactive=676000, speculative=15000,
                             wired=110000, purgeable=5000, file_backed=626387, compressor=30000)
-# #1614 run 1, a 48 GB Mac with browsers open: 8.3 GiB in the compressor and
-# free + inactive 32.5 GiB, most of the inactive queue the browsers' anonymous pages.
+# From #1614 run 1: 48 GB, browsers open, 8.3 GiB in the compressor, free +
+# inactive 32.5 GiB. The free/file-backed split is ours (the report has none):
+# here most of the inactive queue is anonymous. Were it file-backed, the new
+# figure would stay near 32 GiB.
 MAC48_DIRTY = vm_stat_output(free=300000, active=271728, inactive=1830000, speculative=20000,
                              wired=180000, purgeable=10000, file_backed=450000,
                              compressor=544000)
@@ -3256,7 +3262,7 @@ MAC48_DIRTY = vm_stat_output(free=300000, active=271728, inactive=1830000, specu
 class DarwinAvailableMemoryTest(unittest.TestCase):
     """#2785, #1614: on macOS what can be planned is Pages free + File-backed
     pages + Pages purgeable. The inactive queue mixes file pages, which macOS
-    drops, with anonymous pages, which it compresses."""
+    can drop, with anonymous pages, which it can only compress or swap."""
 
     def available(self, vm_stat):
         """memory_available() on a Mac: no /proc/meminfo, vm_stat's output."""
@@ -3278,17 +3284,20 @@ class DarwinAvailableMemoryTest(unittest.TestCase):
         self.assertIsNone(darwin_available_bytes(""))
 
     def test_a_model_cache_still_active_is_available(self):
-        # free + inactive + speculative + purgeable was 5.5 GB here: `coli plan`
-        # gave 0 expert slots on a Mac where the engine kept 42 to 64
+        # dev's free + inactive + speculative + purgeable reads 5.5 GB here, a
+        # budget in the range #2785's `coli plan` saw. Its 0 slots came mostly
+        # from the planner's runtime reserve; this fixture shows the active file
+        # pages the old sum leaves out (our assumption, not measured on that Mac)
         self.assertEqual(self.available(MAC16_AFTER_RUN), 671387 * 16384)   # 11.0 GB
 
     def test_pages_aging_into_inactive_do_not_move_it(self):
-        # the old sum went from 5.5 to 12.1 GB as the pages aged, and OLMoE's
-        # automatic cache from 42 to 64 slots within minutes
+        # the old sum goes from 5.5 to 12.1 GB as the pages age: our hypothesis
+        # for #2785's automatic OLMoE cache of 42, 60 and 64 slots within minutes
         self.assertEqual(self.available(MAC16_AGED), self.available(MAC16_AFTER_RUN))
 
     def test_anonymous_inactive_pages_are_not_available(self):
-        # #1614 run 1: 32.5 GiB of free + inactive accepted RAM_GB=32; the cache
-        # was compressed and then 3 GiB swapped
+        # #1614 run 1 accepted RAM_GB=32 at 32.5 GiB of free + inactive, then
+        # compressed and swapped 3 GiB. Below 32 GiB here only because this
+        # fixture's inactive queue is mostly anonymous; the report does not say
         self.assertEqual(self.available(MAC48_DIRTY), 760000 * 16384)   # 11.6 GiB
         self.assertLess(self.available(MAC48_DIRTY), 32 << 30)

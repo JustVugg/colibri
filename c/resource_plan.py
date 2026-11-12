@@ -2046,11 +2046,12 @@ def darwin_available_bytes(vm_stat_text):
     same figure compat_meminfo_gb computes from host_statistics64. None when
     vm_stat printed none of the three.
 
-    Not "Pages inactive": that queue holds file pages, which macOS drops, and
-    anonymous pages, which it compresses and never drops. It missed a model's
-    file cache while that was still active (#2785: a 16 GB Mac planned 0 slots,
-    and the count grew as the pages aged), and it counted the inactive
-    anonymous memory of other apps (#1614: a 32 GiB cache compressed, then swapped)."""
+    Not "Pages inactive": that queue holds file pages, which macOS can drop,
+    and anonymous pages, which it can only compress or swap. It leaves out file
+    pages still in the active queue, so it moves as they age (one possible
+    reason for #2785's drift), and it counts other apps' inactive anonymous
+    memory (#1614). Can, not will: the compressor is not modeled, and macOS
+    may compress before it drops."""
     text = vm_stat_text or ""
     pages = 0
     for key in ("Pages free", "File-backed pages", "Pages purgeable"):

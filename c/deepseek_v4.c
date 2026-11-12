@@ -1310,12 +1310,13 @@ uint64_t coli_v4_os_available_memory(void) {
         ? (uint64_t)status.ullAvailPageFile : (uint64_t)status.ullAvailPhys;
 #elif defined(__APPLE__)
     /* compat_meminfo_gb's rule, as every other engine and the planner: free +
-     * file-backed + purgeable pages, what macOS takes back without compressing
-     * or swapping. This used to be free + inactive. Its anonymous inactive pages
-     * are compressed, not dropped: on a 48 GB Mac with browsers open it offered
-     * 32 GiB, and the cache was compressed and then swapped (#1614). The rule
-     * still does not model the compressor: what it offers is room now, not a
-     * promise to stay resident. */
+     * file-backed + purgeable pages, what macOS can take back without
+     * compressing or swapping. This used to be free + inactive, which also
+     * counts inactive anonymous pages: on a 48 GB Mac with browsers open it
+     * offered 32.5 GiB, and a 32 GiB cache was compressed, then swapped (#1614).
+     * Still not modeled: the compressor. #1614 measured 32 GiB decoding slower
+     * than 16 GiB (0.96 vs 1.31 tok/s) with swap at zero; a fix needs
+     * vm.compressor_page_count (compressor_page_count in host_statistics64). */
     return (uint64_t)(compat_mem_available_gb() * 1e9);
 #else
     /* MemAvailable bounded by a container's cgroup (compat_mem_available_gb) */

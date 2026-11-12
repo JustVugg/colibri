@@ -800,9 +800,9 @@ static inline void compat_cg_bound(double *total, double *avail, uint64_t lim, u
  *
  * "Available" alone was consolidated here by #1375 because there were two
  * copies of it and one was wrong. "Total" is now in the same position: every
- * caller that wants it hand-rolls its own #ifdef ladder (telemetry.h uses
- * sysctl hw.memsize on macOS, olmoe.c uses sysconf(_SC_PHYS_PAGES), glm53.c
- * read /proc/meminfo unconditionally), and those definitions do not agree.
+ * caller that wants it hand-rolls its own #ifdef ladder (olmoe.c uses
+ * sysconf(_SC_PHYS_PAGES), glm53.c read /proc/meminfo unconditionally),
+ * and those definitions do not agree.
  * A budget computed from a total and an available that came from two
  * different definitions is not a budget, it is a coincidence.
  *
@@ -821,17 +821,20 @@ static inline void compat_meminfo_gb(double *total_gb, double *avail_gb){
     if(sysctlbyname("hw.memsize", &memsize, &len, NULL, 0) == 0) total = (double)memsize / 1e9;
     mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
     vm_statistics64_data_t vm;
-    /* What macOS takes back without compressing or swapping: free, file-backed
-     * (active or inactive: it drops them) and purgeable pages; physical memory
-     * less Activity Monitor's "Memory Used". Not inactive_count: its anonymous
-     * pages are compressed, never dropped (#1614), and a file page still active
-     * is missed (#2785). free_count includes the speculative pages, which are
-     * file-backed: counted once. resource_plan.darwin_available_bytes reads the
-     * same three lines from vm_stat. */
+    /* What macOS can take back without compressing or swapping: free pages,
+     * file-backed pages (clean ones can be dropped from either queue) and
+     * purgeable pages; physical memory less Activity Monitor's "Memory Used".
+     * Not inactive_count: that queue also holds anonymous pages, which can only
+     * be compressed or swapped, and it leaves out file pages still active
+     * (#1614, #2785). It can, not it will: the compressor is not modeled.
+     * free_count includes the speculative pages, which are file-backed: counted
+     * once. The counts are in kernel pages, so vm_kernel_page_size (vm_stat's),
+     * not the process's (4 KiB under Rosetta on a 16 KiB kernel).
+     * resource_plan.darwin_available_bytes reads the same three vm_stat lines. */
     if(host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vm, &cnt) == KERN_SUCCESS)
         avail = ((double)vm.free_count - (double)vm.speculative_count
                  + (double)vm.external_page_count + (double)vm.purgeable_count)
-                * (double)sysconf(_SC_PAGESIZE) / 1e9;
+                * (double)vm_kernel_page_size / 1e9;
 #elif defined(_WIN32)
     MEMORYSTATUSEX msx = {0};
     msx.dwLength = sizeof(msx);
