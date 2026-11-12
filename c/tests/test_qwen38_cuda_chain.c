@@ -303,6 +303,42 @@ int main(void) {
         free(pool); free(x); free(out); free(want);
     }
 
+    printf(" a decode step's pooled experts: the CPU's or the bus's, measured (q38cc_pd_*)\n");
+    {   /* steps of one row at a time each path takes: the paths by turns in blocks of Q38CC_PD_BLK,
+         * the faster once both have Q38CC_PD_N, the bus only past the margin, a new round after
+         * Q38CC_PD_EVERY steps; q38cc_pc_step follows the forward's path */
+        static const double ms[4][2] = {{10.0, 11.0}, {11.0, 10.0}, {10.0, 9.9}, {10.0, 9.0}};
+        static const int want[4] = {0, 1, 0, 1};
+        int32_t pof = 0; CcBuf *tabd = (CcBuf *)&pof;
+        for (int c = 0; c < 4; c++) {
+            Q38CChain *ch = (Q38CChain *)calloc(1, sizeof *ch);
+            if (!ch) { tk(0, "the chain's struct"); break; }
+            ch->pool_of = &pof; ch->pool_cpu = 1; ch->dm_tabd = tabd;
+            int turns = 1, steps = 0, follows = 1;
+            while (!ch->pd_dec && steps < 1000) {
+                const int k = steps, pd = q38cc_pd_begin(ch, 1);
+                if (pd != (k / Q38CC_PD_BLK) % 2) turns = 0;
+                if (q38cc_pc_step(ch, 1) != !pd) follows = 0;
+                q38cc_pd_end(ch, 1, pd, ms[c][pd] / 1e3);
+                steps++;
+            }
+            tk(turns && follows, "the paths by turns, the decode table only on the CPU's");
+            tk(ch->pd_dec && ch->pd_bus == want[c] && steps == 2 * Q38CC_PD_N,   /* Q38CC_PD_N a multiple of Q38CC_PD_BLK: the bus's last at step 2 N */
+               c == 0 ? "the CPU faster: the CPU's" : c == 1 ? "the bus faster: the bus's" : c == 2 ? "the bus 1 % faster: still the CPU's" : "the bus 10 % faster: the bus's");
+            if (c == 3) {
+                int same = 1;
+                while (ch->pd_k < ch->pd_next) { const int pd = q38cc_pd_begin(ch, 1); if (pd != 1) same = 0; q38cc_pd_end(ch, 1, pd, 0.01); }
+                const int pd = q38cc_pd_begin(ch, 1);
+                tk(same && !ch->pd_dec && pd == 0 && ch->pd_n[0][1] == 0, "the decided path until the next round, which measures again");
+                q38cc_pd_end(ch, 1, pd, 0.01);
+                tk(q38cc_pd_begin(ch, Q38CC_DM_ROWS + 1) < 0 && !ch->pd_now, "a prompt's rows: not measured, the CPU's");
+                ch->pd_mode = 1;
+                tk(q38cc_pd_begin(ch, 1) < 0, "COLI_CUDA_CHAIN_POOL_READ=0: not measured");
+            }
+            free(ch);
+        }
+    }
+
     printf(" the MTP head's experts in Q2_0 for the card (q38cc_q2_0_block)\n");
     {   /* blocks of weights as gq_blk_q2_0 decodes them back: within the 2-bit grid's error, which
          * on Gaussian weights is about 0.41 of their RMS; zeros stay zeros, a flat block is exact on
