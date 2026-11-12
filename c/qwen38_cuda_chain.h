@@ -1903,7 +1903,13 @@ static int q38cc_dm_begin(Q38CChain *ch, Model *m, int n) {
 }
 /* A prompt chunk's table: each layer's pooled experts (up to dm_stage_cap) at their places in
  * dm_stage, and the copies that put them there (dm_fr, dm_fro[i] and dm_frn[i] a layer's, the
- * runs of the pool's places a layer has side by side merged) */
+ * runs of the pool's places a layer has side by side merged). Only the layers a prompt chunk runs
+ * in the frame (dm_part 0: every expert on the card or in the pool): a layer that can miss takes
+ * the host's route, which waits for no copy and starts none, and the copies go from one framed
+ * layer to the next (q38cc_dm_card). A layer staged there and run on the host broke that chain:
+ * the next framed layer waited for its copy and read places nobody had copied to (#2764: a pool
+ * that held every non-resident expert of the first layers, the tier evicting some residents of
+ * those layers after a long prompt, and every later prompt read garbage there). */
 /* COLI_CUDA_CHAIN_STAGE_RING=0: every staged layer's places from the staging's start, its copy after the
  * layer before read its own */
 static int q38cc_ring_on(void) {
@@ -1932,7 +1938,7 @@ static int q38cc_stage_table(Q38CChain *ch, Model *m) {
     for (int i = 0; i < L; i++) {
         int h = 0; int64_t gb = 0, db = 0;
         ch->dm_fro[i] = k;
-        int typed = q38cc_pool_types(m, i, &gb, &db);
+        int typed = q38cc_pool_types(m, i, &gb, &db) && !ch->dm_part[i];   /* a layer that can miss: the host's in a chunk */
         const size_t st = q38cc_lstride(ch, i); const int cap = q38cc_stage_cap(ch, i);   /* places at the layer's size */
         if (!q38cc_ring_on()) pos = 0;
         size_t a0 = pos, end1 = 0, lim = S; int wrapped = 0;
