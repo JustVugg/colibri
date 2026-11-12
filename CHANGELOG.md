@@ -690,6 +690,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 - **The chat page's live expert map lights up on Qwen3.8.** The gateway serves the experts each decode step routed (`/experts?since=N`) from the engine's `HITL` lines, and no engine wrote them, so the map stayed dark while an answer was written and filled in only after the turn. qwen38 now writes one after the tokens of each step, the experts routed since the previous one (the CUDA chain's too). `COLI_HITS_LIVE=0` turns them off.
 - The chat page's first-run dialog waits for the models service to finish measuring the
   machine; on a fresh state it showed "- GB di RAM" and no model that fits.
+- **`TRUNK_RESIDENT_LAYERS` and `COLI_MMAP` map the shards on Windows** (#1764). GLM-5.2's two
+  weights-from-disk knobs mapped only on Linux, macOS and FreeBSD; on Windows they read the
+  weights into RAM as without them, and said nothing. They now map there too, and one `[MMAP]` line
+  says so when a shard cannot be mapped.
 
 ### Docs
 

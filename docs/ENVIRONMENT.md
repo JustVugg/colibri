@@ -195,8 +195,12 @@ engine hands the RAM they free to the expert cache; to lower the total, lower
 `RAM_GB` (`coli --ram`) or `CAP` too. For GLM-5.2 on a machine where not even
 the trunk fits: `TRUNK_RESIDENT_LAYERS=0 COLI_MMAP=1 RAM_GB=2`. On Windows the
 mapped pages the engine has read count in its working set, the figure
-`RSS_GUARD_GB` checks, so with the trunk mapped but not the experts the guard
-can trim the expert cache to make room for them; `RSS_GUARD_GB=0` turns it off.
+`RSS_GUARD_GB` checks. With the trunk mapped but not the experts, the guard can
+then trim the expert cache to make room for them. With `COLI_MMAP=1` it has no
+copies to free, but it still lowers the expert-cache cap, without a
+`[RAM-GUARD]` line. `RSS_GUARD_GB=0` turns the guard off in both cases. If a
+shard cannot be mapped, the engine says so in one `[MMAP]` line and reads those
+weights into RAM.
 
 ## The `.coli_ssd` probe cache
 

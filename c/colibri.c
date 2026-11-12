@@ -3268,6 +3268,8 @@ static void *map_of_fd(int fd){
         base=(void*)wp; g_maps[g_nmaps].fd=fd; g_maps[g_nmaps].base=base; g_maps[g_nmaps].len=wm.len; g_nmaps++;
     }
 #endif
+    if(!base){ static int warned;      /* under g_map_mtx: one line per process */
+        if(!warned){ warned=1; fprintf(stderr,"[MMAP] a model shard could not be mapped: TRUNK_RESIDENT_LAYERS / COLI_MMAP read its weights into RAM instead\n"); } }
     pthread_mutex_unlock(&g_map_mtx);
     return base;
 }
