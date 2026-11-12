@@ -255,6 +255,39 @@ its reserve; below 32 live mirrors it may still grow up to 64 mirrors past its
 600 MiB between two reads. A failed mirror upload counts as a full card until
 the next read.
 
+`V4_BANK_MAKE_ROOM=1` (opt-in) turns that order around. The cache keeps only
+the 600 MiB headroom free and grows into the bank's room while a decode runs;
+where a prompt creates a bank, the least recently used mirrors of that
+device's caches are released until the bank and the headroom are free
+(`v4_gpu mirror-cache: released N decode mirrors for the prompt's expert bank`),
+and the cache grows again once decode starts. A prompt too short for the bank
+creates none and releases nothing, so a chat's short turns keep their mirrors.
+A resident table, a cache on another device (a layer placed elsewhere, the
+peer pool) and unified memory are not touched, and an explicit
+`DSV4_CUDA_VRAM_RESERVE_MB` still sets the reserve. It matters on a card where
+the bank-sized reserve leaves few mirrors. On the 16 GB RTX 5080 with
+`COLI_CUDA_MOE_DOUBLE=1` that reserve is 8329 MiB and the cache stays at its
+32-mirror minimum, so every routed expert of every token is an upload:
+
+| 3,278-token prompt, 36 tokens, `--memory-gb 16`, three runs, medians | 35 tokens after the first (s) | MoE per token (ms) | tok/s |
+|---|---|---|---|
+| unset | 22.83 | 530.4 | 1.533 |
+| `V4_BANK_MAKE_ROOM=1` | 21.39 | 488.5 | 1.636 (+6.7 %) |
+
+Three such prompts in a row on one serve engine (`DSV4_CUDA_HEAD=0`, one run
+per row): with the switch on, the second and third prompt each released 528
+mirrors (278 for the first bank, 250 for the second), both banks were created,
+no allocation failed, and each turn printed the text it prints with the switch
+unset.
+
+| turn | unset: first token (s), 35 tokens (s) | `V4_BANK_MAKE_ROOM=1` |
+|---|---|---|
+| 1 | 67.5, 24.6 | 66.8, 23.7 |
+| 2 | 63.4, 24.9 | 64.0, 24.1 |
+| 3 | 63.4, 24.0 | 64.3, 23.1 |
+
+The record is in `docs/experiments/v4-bank-make-room-2026-11-12/`.
+
 | VRAM | dense mirrors | prefill bank | recommended env | expected |
 |---|---|---|---|---|
 | 6 GB | no (6.3 GB does not fit) | yes (3.2 GiB) | `CUDA_DENSE=0 COLI_CUDA_MOE_BATCH=1 COLI_CUDA_ATTN_BATCH=0` | GPU MoE prefill (generic kernels on non-RTX50), CPU attention/decode; ~90 mirrors between prefills |
@@ -745,6 +778,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_MTP_GPU_MIRRORS` (16) | separate mirror cache for the MTP drafter |
 | `DSV4_CUDA_PIN_HOST` (1, `.cu`) | page-lock expert-cache slabs for DMA uploads |
 | `DSV4_CUDA_MOE_GROUPED` (1, `.cu`) | expert-grouped MoE GEMM rows; `0` = legacy replicated |
+| `V4_BANK_MAKE_ROOM` (0) | `1` = the decode mirror cache keeps only the 600 MiB headroom free and uses the prompt bank's VRAM; a bank, when a prompt creates it, releases the least recently used mirrors it needs (see [VRAM budget](#vram-budget-and-per-card-settings)); an explicit `DSV4_CUDA_VRAM_RESERVE_MB` still sets the reserve |
 | `V4_MOE_BANK_FULL` (off) | `=N`: prefetch a whole layer's experts above N tokens (measured worse) |
 | `DSV4_MOE_EXPERT_MAJOR` (1, `.cu`) | generic batched MoE: expert-major fp4 kernel (weights read once per chunk); `0` = one matvec per route; `_VERIFY=1` compares both bit for bit (keeps the per-route results, also with `0`) |
 | `DSV4_MOE_EM_TB` (auto, `.cu`) | routes per pass of the expert-major kernel: unset = 2 below 4 routes per routed expert in the chunk, else 4; `2`, `3`, `4` or `6` forces one (anything else is ignored with a warning) |
