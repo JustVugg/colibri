@@ -78,9 +78,12 @@ class Qwen38PrefixDiskTest(unittest.TestCase):
 
     def test_another_model_or_layout_does_not_load(self):
         """The same directory under another identity: the weights' time changed (another download of
-        the model), another block size. Nothing is opened, the prompt is read whole."""
+        the model), another block size. Nothing is opened, the prompt is read whole, and the first
+        identity's file (by name: the other runs write theirs at the same P) stays as it was."""
         d = self.tmp()
         self.run1(d, chat(Q1))
+        mine = files(d)[ntok(SYSTEM)]
+        kept = (mine.read_bytes(), mine.stat().st_mtime_ns)
         other = self.tmp()
         for f in self.dirs["plain"].iterdir():
             shutil.copy2(f, other / f.name)
@@ -95,7 +98,10 @@ class Qwen38PrefixDiskTest(unittest.TestCase):
                 self.assertFalse(disk_hits(log), log[-3000:])
                 self.assertIn("[PREFIX] no reuse", log)
                 self.assertNotIn("dropped", log)   # never opened, so never judged
-                self.assertIn(ntok(SYSTEM), files(d), "another identity deleted a file")
+                self.assertTrue(mine.exists(), "another identity deleted a file")
+                self.assertEqual((mine.read_bytes(), mine.stat().st_mtime_ns), kept, "another identity touched a file")
+                self.assertIn(ntok(SYSTEM), written(log), log[-3000:])   # its own, under another name
+                self.assertEqual(len(list(d.glob("q38_*.bin"))), 2 if fixture == "other" else 3)
 
     def test_corrupt_or_truncated_file_is_dropped(self):
         for how in ("flip", "truncate"):

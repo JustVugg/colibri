@@ -2681,6 +2681,9 @@ static int q38_psd_restore(Model *m,const char *path,const int *ids,int P,int np
                  Q38_PSD_GET(st->mtp_pend_tok,sizeof st->mtp_pend_tok)&&
                  st->mtp_len>=0&&st->mtp_len<=P&&st->mtp_pend_n>=0&&st->mtp_pend_n<=Q38_SPEC_ROWS;
     ok=ok&&st->ple_len>=0&&st->ple_len<=2;   /* indices into the PLE history */
+    /* the token ids the state carries index the embeddings: in the vocabulary, as the segment adapter checks */
+    for(int j=0;ok&&j<st->ple_len;j++)ok=st->ple_hist[j]>=0&&st->ple_hist[j]<m->c.vocab;
+    for(int j=0;ok&&m->mtp&&j+1<st->mtp_pend_n;j++)ok=st->mtp_pend_tok[j]>=0&&st->mtp_pend_tok[j]<m->c.vocab;
     if(!ok){bad=1;goto out;}
     q38_prefix_settle(m);   /* the chain's prompt-end snapshot is the host's before the state moves */
     /* the rows, block by block as the store keeps them, then the tail: from here the slot changes */
