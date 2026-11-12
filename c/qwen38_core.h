@@ -4445,7 +4445,7 @@ static void q38_expert_row(Model *m,int layer,int eid,const float *xs,float *eg,
  * experts loaded as one batch, and one parallel region runs gate+up over (expert, row
  * block) items for all the rows each expert received, the hidden rows, then down.
  * Every output row comes from the per-row kernel q38_weight_matmul calls for that
- * matrix (q38_matmul_int4g64, x2_matmul, xl_matmul: a row's bits do not depend on how
+ * matrix (q38_matmul_int4g64, x2_matmul, xl_matmul, matmul_fp8 without FMA: a row's bits do not depend on how
  * many activation rows share the call), and each row's sum is added in rank order as
  * the decode loop adds it, so the output is the decode loop's to the bit.
  * Q38_MOE_GROUPED=0 keeps the decode loop. */
@@ -4462,6 +4462,9 @@ static int q38_rows_kind(const Q38Weight *w) {
     if(!w->data||w->q4||w->q8||w->gpu||w->act2)return Q38_ROWS_NONE;
     if(w->kind==Q38_WEIGHT_INT4G64&&w->r16)return Q38_ROWS_GQ;   /* xf16 rows take gq_act */
     if(w->kind==Q38_WEIGHT_INT4G64&&w->scales)return Q38_ROWS_F32;
+#ifdef COLI_FP8_NOFMA_LANES
+    if(w->kind==Q38_WEIGHT_FP8&&w->scales)return Q38_ROWS_F32;   /* quant.h matmul_fp8_nofma_part */
+#endif
     if((w->kind==Q38_WEIGHT_LOWBIT16||(w->kind==Q38_WEIGHT_VQ2&&w->vqb))&&w->r16)return Q38_ROWS_GQ;   /* xl16 / vq2r16 rows take gq_act */
     if((w->kind==Q38_WEIGHT_INT2G32||w->kind==Q38_WEIGHT_LOWBIT16)&&w->scales&&w->x2q)return Q38_ROWS_X2;
     if(w->kind==Q38_WEIGHT_VQ2&&w->scales&&w->x2q&&w->vqb)return Q38_ROWS_X2;
@@ -4469,10 +4472,26 @@ static int q38_rows_kind(const Q38Weight *w) {
     if(w->kind==Q38_WEIGHT_GGML&&gq_int_ok(w->gq_type,w->cols)&&gq_row_bytes(w->gq_type,w->cols)>0)return Q38_ROWS_GQ;
     return Q38_ROWS_NONE;
 }
+/* A layer of native FP8 experts on a build without FMA: q38_rows has their kernel there, quant.h's
+ * FP8 rows in lanes. Only with the parallel batch reads and the release's layout (the scale bank,
+ * gate/up adjacent), else the grouped path would run them a row at a time. With FMA (AVX2 and
+ * the others) they keep the per-expert paths. */
+static int q38_layer_fp8_rows(Model *m,int layer) {
+#ifdef COLI_FP8_NOFMA_LANES
+    st_tensor *w[3];
+    return m->expert_parallel_reads&&!q38_layer_int4(m,layer)&&!g_q38_gguf&&
+           q38_prepare_expert_scale_bank(m,layer)&&q38_native_fp8_expert_tensors(m,layer,0,w);
+#else
+    (void)m;(void)layer;return 0;
+#endif
+}
 /* rows [r0,r1) of w (O x I) for n activation rows: y[a*ys + o]; xr[a] the f32 rows,
  * xq/dx the int8-per-32 ones ([n][I], [n][I/32]), ga the GGUF types' (n rows) */
 static void q38_rows(float *y,int ys,const Q38Weight *w,int I,int r0,int r1,
                      const float *const *xr,const int8_t *xq,const float *dx,const gq_act *ga,int n) {
+#ifdef COLI_FP8_NOFMA_LANES
+    if(w->kind==Q38_WEIGHT_FP8){matmul_fp8_nofma_part(y,ys,(const uint8_t*)w->data,w->scales,I,r0,r1,xr,n);return;}
+#endif
 #ifdef XF16_ON
     if(w->kind==Q38_WEIGHT_INT4G64&&w->r16){q38_xf16_rows(y,ys,w,ga,r0,r1,n);return;}   /* whole groups, as below */
 #endif
@@ -4576,7 +4595,7 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
     static int on=-1;
     if(on<0){const char *e=getenv("Q38_MOE_GROUPED");on=!(e&&e[0]=='0');}
     Cfg *c=&m->c;const int H=c->hidden,E=c->experts,K=c->topk,I=c->inter,SI=c->shared_inter;
-    if(!on||S<1||S>Q38_GROUPED_ROWS||!(q38_layer_int4(m,layer)||g_q38_gguf)||H%32||I%32)return 0;
+    if(!on||S<1||S>Q38_GROUPED_ROWS||!(q38_layer_int4(m,layer)||g_q38_gguf||q38_layer_fp8_rows(m,layer))||H%32||I%32)return 0;
     /* every distinct expert of the rows in the cache at once, or the per-expert paths */
     if((S*K<E?S*K:E)>m->cache[layer].cap)return 0;   /* at most E distinct, however many rows */
     /* the device tiers take experts per row; the statistics hooks keep the loop's order. The
@@ -5165,7 +5184,11 @@ static void q38_moe_ex(Model *m,Layer *l,int layer,const float *x,int S,float *o
         if(group>Q38_GROUPED_ROWS)group=Q38_GROUPED_ROWS;
         if(group<1)group=1;
         int n0=S<group?S:group,base=0;
-        if(q38_moe_decode_grouped(m,l,layer,x,n0,out,logits_in,routed_only,0,NULL,NULL,NULL)){
+        /* FP8 experts group more rows than one group only when the cache holds the whole layer:
+         * with a smaller cache, groups of cap/K rows would read more experts than the prefill
+         * MoE's chunks, which read each one once a chunk */
+        if((S<=group||m->cache[layer].cap>=E||!q38_layer_fp8_rows(m,layer))&&
+           q38_moe_decode_grouped(m,l,layer,x,n0,out,logits_in,routed_only,0,NULL,NULL,NULL)){
             for(base=n0;base<S;base+=group){
                 int n=S-base<group?S-base:group;
                 if(!q38_moe_decode_grouped(m,l,layer,x+(int64_t)base*H,n,out+(int64_t)base*H,
