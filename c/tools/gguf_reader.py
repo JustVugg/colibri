@@ -62,6 +62,7 @@ GGML_TYPE_MXFP4 = 39
 GGML_TYPE_NVFP4 = 40
 GGML_TYPE_Q1_0 = 41
 GGML_TYPE_Q2_0 = 42
+GGML_TYPE_MXFP8 = 43   # blocks of 32: an E8M0 exponent, 32 E4M3 (unsloth's DeepSeek V4.1 Engram tables)
 
 GGML_TYPE_RAW = {
     GGML_TYPE_F32: ("F32", 4),
@@ -105,6 +106,7 @@ GGML_TYPE_BLOCK = {
     GGML_TYPE_NVFP4: ("NVFP4", 64, 36),     # the engine's ggml_quants.h tables, checked against gguf-py
     GGML_TYPE_Q1_0: ("Q1_0", 128, 18),
     GGML_TYPE_Q2_0: ("Q2_0", 64, 18),       # ISTA-DASLab's GSQ-RCO Qwen3.8 files: every routed expert
+    GGML_TYPE_MXFP8: ("MXFP8", 32, 33),
 }
 
 _GGML_TYPE_NAMES = {}

@@ -90,7 +90,7 @@ enum {
     GQ_IQ3_XXS = 18, GQ_IQ1_S = 19, GQ_IQ4_NL = 20, GQ_IQ3_S = 21, GQ_IQ2_S = 22,
     GQ_IQ4_XS = 23, GQ_I8 = 24, GQ_I16 = 25, GQ_I32 = 26, GQ_I64 = 27,
     GQ_F64 = 28, GQ_IQ1_M = 29, GQ_BF16 = 30, GQ_TQ1_0 = 34, GQ_TQ2_0 = 35,
-    GQ_MXFP4 = 39, GQ_NVFP4 = 40, GQ_Q1_0 = 41, GQ_Q2_0 = 42, GQ_TYPE_MAX = 43
+    GQ_MXFP4 = 39, GQ_NVFP4 = 40, GQ_Q1_0 = 41, GQ_Q2_0 = 42, GQ_MXFP8 = 43, GQ_TYPE_MAX = 44
 };
 
 typedef struct { const char *name; int blck; int bytes; int supported; } gq_type_info;
@@ -131,6 +131,7 @@ static const gq_type_info GQ_TYPES[GQ_TYPE_MAX] = {
     [GQ_NVFP4]   = { "NVFP4",   64,  36, 1 },
     [GQ_Q1_0]    = { "Q1_0",    128, 18, 1 },
     [GQ_Q2_0]    = { "Q2_0",    64,  18, 1 },
+    [GQ_MXFP8]   = { "MXFP8",   32,  33, 1 },   /* unsloth's DeepSeek V4.1 Engram tables (UD-IQ3_S, UD-Q3_K_XL and up) */
 };
 
 /* Not GGUF types: a block type's rows interleaved in groups of 16 (gq_r16_*, below), made by
@@ -508,6 +509,24 @@ GQ_EXACT_FN static void gq_blk_nvfp4(const uint8_t *b, float *y) {
         }
     }
 }
+/* MXFP8 (ggml type 43): blocks of 32, an E8M0 exponent byte, then 32 E4M3 values; each value is
+ * e4m3 * 2^(e - 127), the encoding of DeepSeek V4.1's own Engram table (fp8 with a ue8m0 scale per
+ * 32), so a GGUF's rows are the checkpoint's bits. E4M3: bias 7, 0x7F and 0xFF NaN; E8M0 0xFF NaN. */
+static inline float gq_e4m3(uint8_t x) {
+    const int e = (x >> 3) & 0xF, m = x & 7;
+    if (e == 15 && m == 7) return NAN;
+    const float v = e == 0 ? ldexpf((float)m, -9) : ldexpf((float)(8 + m), e - 10);
+    return (x & 0x80) ? -v : v;
+}
+static inline float gq_e8m0(uint8_t x) {
+    const uint32_t bits = x == 0 ? 0x00400000u : x == 255 ? 0x7FC00000u : (uint32_t)x << 23;
+    float r; memcpy(&r, &bits, 4); return r;
+}
+GQ_EXACT_FN static void gq_blk_mxfp8(const uint8_t *b, float *y) {
+    GQ_EXACT_BEGIN
+    const float d = gq_e8m0(b[0]);
+    for (int j = 0; j < 32; j++) y[j] = gq_e4m3(b[1 + j]) * d;
+}
 GQ_EXACT_FN static void gq_blk_q1_0(const uint8_t *b, float *y) {
     GQ_EXACT_BEGIN
     const float d = gq_f16(gq_rd16(b)), nd = -d; const uint8_t *qs = b + 2;
@@ -534,7 +553,7 @@ static inline gq_blk_fn gq_blk_decoder(int t) {
     case GQ_IQ4_XS: return gq_blk_iq4_xs; case GQ_MXFP4: return gq_blk_mxfp4;
     case GQ_TQ1_0: return gq_blk_tq1_0;   case GQ_TQ2_0: return gq_blk_tq2_0;
     case GQ_NVFP4: return gq_blk_nvfp4;   case GQ_Q1_0: return gq_blk_q1_0;
-    case GQ_Q2_0: return gq_blk_q2_0;
+    case GQ_Q2_0: return gq_blk_q2_0;     case GQ_MXFP8: return gq_blk_mxfp8;
     default: return NULL;
     }
 }
@@ -1231,7 +1250,9 @@ GQ_EXACT_FN static void gq_ublk(int t, const uint8_t *b, int8_t *w, float *sw, f
     }
 }
 /* 1 if type t has an integer form (every block type does; F32/F16/BF16 do not). */
-static inline int gq_has_int(int t) { return gq_blk_decoder(t) != NULL; }
+/* MXFP8's values carry their own exponents: no int8 form with a scale per 16 (its rows are read as floats,
+ * the Engram table's lookups) */
+static inline int gq_has_int(int t) { return gq_blk_decoder(t) != NULL && t != GQ_MXFP8; }
 /* Unpack n elements (whole blocks) of row src. 0, or -1 for a float/unknown type. */
 static int gq_unpack_row(int t, const uint8_t *src, int64_t n, int8_t *w8, float *sw, float *mw) {
     if (!gq_has_int(t) || n % GQ_TYPES[t].blck) return -1;

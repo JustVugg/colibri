@@ -318,6 +318,46 @@ int main(void) {
         tk(flat, "a flat block, positive or negative, decodes to itself");
     }
 
+    printf(" a prompt chunk's staging: the layers it runs in the frame\n");
+    {   /* four layers of four experts, experts 0 to 2 of each in the host pool, layers 1 and 3 able
+         * to miss (dm_part: a chunk takes the host's route there, which waits for no copy and starts
+         * none): their pooled experts get no places and no copies, so the copies go from one framed
+         * layer to the next (#2764) */
+        enum { L = 4, E = 4, H = 64, IN = 64 };
+        const size_t sz0 = fake_chain_table.size;
+        fake_chain_table.size = sizeof fake_chain_table;   /* the staging's device addresses */
+        fcc_init(0);
+        Model mm; memset(&mm, 0, sizeof mm);
+        mm.c.layers = L; mm.c.experts = E; mm.c.hidden = H; mm.c.inter = IN;
+        int gtg[L], gtd[L];
+        for (int i = 0; i < L; i++) gtg[i] = gtd[i] = GQ_Q8_0;
+        const int on0 = G.on, nl0 = G.nl, wf0 = G.wfmt; int *gtg0 = G_gtg, *gtd0 = G_gtd;
+        G.on = 1; G.nl = L; G.wfmt = QT_GGUF; G_gtg = gtg; G_gtd = gtd;
+        Q38CChain cc; memset(&cc, 0, sizeof cc);
+        int64_t gb = 0, db = 0;
+        const int typed = q38cc_pool_types(&mm, 0, &gb, &db);
+        const size_t st = 2 * Q38CC_PAD(gb) + Q38CC_PAD(db);
+        CcBuf *pool_b[1] = {cc_buf((size_t)L * E * st, CC_DOWN)};
+        cc.pool_buf = pool_b; cc.pool_nb = 1; cc.pool_per = L * E; cc.pool_stride = st;
+        cc.pool_of = (int32_t *)malloc((size_t)L * E * sizeof(int32_t)); cc.dm_host = (CcExpert *)calloc((size_t)L * E, sizeof(CcExpert));
+        cc.dm_res = (uint8_t *)calloc((size_t)L * E, 1); cc.dm_part = (int *)calloc(L, sizeof(int));
+        for (int j = 0; j < L * E; j++) { const int pooled = j % E < 3; cc.pool_of[j] = pooled ? j : -1; cc.dm_res[j] = pooled ? 2 : 1; }
+        cc.dm_part[1] = cc.dm_part[3] = 1;
+        cc.dm_stage = cc_buf(3 * st, CC_DEV); cc.dm_stage_size = 3 * st; cc.dm_stage_cap = 3;
+        const int ok = typed && pool_b[0] && cc.dm_stage && q38cc_stage_table(&cc, &mm);
+        tk(ok && cc.dm_frn[0] > 0 && cc.dm_frn[2] > 0, "the framed layers' pooled experts have their copies");
+        tk(ok && cc.dm_frn[1] == 0 && cc.dm_frn[3] == 0, "a layer that can miss: no places, no copies");
+        int kept = ok;
+        for (int i = 1; i < L && kept; i += 2)
+            for (int e = 0; e < E; e++) kept = kept && !memcmp(&cc.dm_hostb[i * E + e], &cc.dm_host[i * E + e], sizeof(CcExpert));
+        tk(kept, "its entries in the chunk's table the same as the decode's");
+        free(cc.pool_of); free(cc.dm_host); free(cc.dm_res); free(cc.dm_part);
+        free(cc.dm_hostb); free(cc.dm_fro); free(cc.dm_frn); free(cc.dm_fr); free(cc.dm_iv);
+        cc_free(cc.dm_tabb); cc_free(cc.dm_stage); cc_free(pool_b[0]);
+        G.on = on0; G.nl = nl0; G.wfmt = wf0; G_gtg = gtg0; G_gtd = gtd0;
+        fake_chain_table.size = sz0;
+    }
+
     if (t_fails) { printf("test_qwen38_cuda_chain: %d failure(s)\n", t_fails); return 1; }
     printf("OK test_qwen38_cuda_chain: Qwen3.8's chain on the card gives the oracle's tokens\n");
     return 0;

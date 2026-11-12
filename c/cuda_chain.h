@@ -80,12 +80,17 @@ typedef struct { CcAttn a; int win, sink, sink_off; } CcAttnW;
 /* chain_dnconv.comp */
 /* order 0, 1: Gated DeltaNet's (the sum's two orders); 2: LFM3's gated convolution, input rows B | C | x
  * of CD channels, out = C * conv(B * x), no activation (cc_lfm3_ready) */
-typedef struct { int S, CD, CK, in_off, in_row, out_off, out_row, snap_row, order, w_off, ring_off, snap_off; } CcDnConv;
+/* snap_n > 0 (a verify's rows in one dispatch): the ring after each row s < snap_n into the buffer at the device
+ * address snap holds at float snap_off + 2 s (a table of snap_n addresses, cc_dev_addr's; snap_row -1) */
+typedef struct { int S, CD, CK, in_off, in_row, out_off, out_row, snap_row, order, w_off, ring_off, snap_off; int snap_n; } CcDnConv;
 /* chain_dnrec.comp (KD a template parameter: 4, 8, 16, 32, 64, 128 or 256; VD <= 128). flags: 1 the gated
  * norm's gate a sigmoid (Qwen3.8), 2 the parameter A itself (a GGUF's, -exp(A_log)), 4 the value
  * heads tiled (a GGUF's: value head h reads key head h % KH) */
+/* snap_n > 0: the state after each row s < snap_n into the buffer at the device address snap holds at float
+ * snap_off + 2 s (CcDnConv's table; snap_row -1): a verify's copies in one dispatch, the state read and written
+ * once instead of once a row */
 typedef struct { int S, VH, KH, VD, Ktot, cv_off, cv_row, b_off, b_row, a_off, a_row, z_off, z_row,
-                 y_off, y_row, snap_row, flags; float eps, qscale; int st_off, snap_off, prm_off; } CcDnRec;
+                 y_off, y_row, snap_row, flags; float eps, qscale; int st_off, snap_off, prm_off; int snap_n; } CcDnRec;
 /* chain_ew.comp */
 #define CC_EW_ADD      0
 #define CC_EW_COMBINE  1
@@ -262,6 +267,16 @@ typedef struct { int S, pos_base, IH, ID, topk, force, q_off, q_row, w_off, w_ro
  * and squares in double, as kimi_k3.c's res_mix). nb <= 15, y apart from x and blk. */
 typedef struct { int S, D, nb, x_off, x_row, b_off, b_row, w_off, y_off, y_row; float eps; } CcAres;
 typedef struct { int n, g_off, u_off, y_off; float b1, b2; } CcSitu;
+/* DFlash2's two-tap dynamic depthwise convolution (cuda_dflash.cuh): y[r][c] = k0 x[r][c] + k1 x[r-1][c] over
+ * blocks of B rows (x[r-1] 0 at a block's first row), k_t = prm[b_off + t C + c] plus (flags 2: times 1 plus)
+ * kp[kp_off + r kp_row + t kp_tap + g kp_g], g = c / gs (flags 1: c % (C / gs)); y apart from x */
+typedef struct { int n, C, B, gs, x_off, x_row, kp_off, kp_row, kp_tap, kp_g, y_off, y_row, b_off, flags; } CcDfConv;
+/* the top K (<= 32) of R rows of V scores, best first, ties to the lower column: values at out[o_off + r o_row + j],
+ * their columns as ints at out[o_off + r o_row + K + j]; splits (1 to 256) slices of a row in the first pass, its
+ * candidates in sc (R splits 2K floats) (cuda_dflash.cuh) */
+typedef struct { int R, V, K, x_off, x_row, o_off, o_row, splits; } CcDfTopk;
+/* a target layer's rows as the drafter's context: y[y_off + r y_row + c] = sum over b < C of x[x_off + r x_row + b D + c] */
+typedef struct { int n, D, C, x_off, x_row, y_off, y_row; } CcDfTap;
 
 typedef struct ColiCudaChainOps {
     size_t size;
@@ -431,6 +446,11 @@ typedef struct ColiCudaChainOps {
     /* Kimi K3's (cuda_k3c.cuh) */
     int  (*ares_mix)(CcBuf *x, CcBuf *blk, CcBuf *prm, CcBuf *y, const CcAres *p);
     int  (*situ)(CcBuf *g, CcBuf *u, CcBuf *y, const CcSitu *p);
+    /* DFlash2's drafter (cuda_dflash.cuh): dflash() 1 when the module has its ops */
+    int  (*dflash)(void);
+    int  (*dfconv)(CcBuf *x, CcBuf *kp, CcBuf *prm, CcBuf *y, const CcDfConv *p);
+    int  (*dftopk)(CcBuf *x, CcBuf *sc, CcBuf *out, const CcDfTopk *p);
+    int  (*dftap)(CcBuf *x, CcBuf *y, const CcDfTap *p);
 } ColiCudaChainOps;
 /* the table's size without the optional ops: a backend at least this big has the chain */
 #define CC_OPS_BASE_SIZE (offsetof(ColiCudaChainOps, route))
@@ -510,7 +530,8 @@ static inline int cc_fetch_ready(void) { const ColiCudaChainOps *t = cc_ops(); r
 static inline int cc_fetch(CcBuf *dst, const CcFetch *r, int n) { return cc_fetch_ready() ? cc_ops()->fetch(dst, r, n) : 0; }
 static inline int cc_fetch_wait(void) { return cc_fetch_ready() ? cc_ops()->fetch_wait() : 0; }
 static inline int cc_fetch_done(void) { return cc_fetch_ready() ? cc_ops()->fetch_done() : 0; }
-static inline const void *cc_dev_addr(const CcBuf *b) { return cc_fetch_ready() ? cc_ops()->dev_addr(b) : NULL; }
+static inline const void *cc_dev_addr(const CcBuf *b) { return cc_fetch_ready() && cc_ops()->dev_addr ? cc_ops()->dev_addr(b) : NULL; }
+static inline int cc_dev_addr_ready(void) { return cc_fetch_ready() && cc_ops()->dev_addr != NULL; }
 static inline int cc_host_up_ready(void) { const ColiCudaChainOps *t = cc_ops(); return t && t->size >= offsetof(ColiCudaChainOps, host_up_done) + sizeof t->host_up_done; }
 static inline int cc_host_up(void *dst, const void *src, size_t bytes, unsigned *ticket) { return cc_host_up_ready() ? cc_ops()->host_up(dst, src, bytes, ticket) : 0; }
 static inline int cc_host_up_done(unsigned ticket) { return cc_host_up_ready() ? cc_ops()->host_up_done(ticket) : 0; }
@@ -604,6 +625,16 @@ static inline int cc_ares_mix(CcBuf *x, CcBuf *blk, CcBuf *prm, CcBuf *y, const 
     return cc_k3_ready() ? cc_ops()->ares_mix(x, blk, prm, y, p) : 0;
 }
 static inline int cc_situ(CcBuf *g, CcBuf *u, CcBuf *y, const CcSitu *p) { return cc_k3_ready() ? cc_ops()->situ(g, u, y, p) : 0; }
+/* DFlash2's drafter's op: the module has it */
+static inline int cc_dflash_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, dftap) + sizeof t->dftap && t->dflash && t->dfconv && t->dftopk && t->dftap && t->dflash();
+}
+static inline int cc_dftap(CcBuf *x, CcBuf *y, const CcDfTap *p) { return cc_dflash_ready() ? cc_ops()->dftap(x, y, p) : 0; }
+static inline int cc_dftopk(CcBuf *x, CcBuf *sc, CcBuf *out, const CcDfTopk *p) { return cc_dflash_ready() ? cc_ops()->dftopk(x, sc, out, p) : 0; }
+static inline int cc_dfconv(CcBuf *x, CcBuf *kp, CcBuf *prm, CcBuf *y, const CcDfConv *p) {
+    return cc_dflash_ready() ? cc_ops()->dfconv(x, kp, prm, y, p) : 0;
+}
 /* the chain's and the backend's kernels loaded now where the backend can (an older one loads them
  * at their first launch) */
 static inline int cc_preload(void) {

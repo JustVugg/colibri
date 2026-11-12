@@ -46,8 +46,9 @@ TYPES = {
     "IQ4_XS": (256, 136, [0]), "MXFP4": (32, 17, []), "TQ1_0": (256, 54, [52]),
     "TQ2_0": (256, 66, [64]),
     "NVFP4": (64, 36, []), "Q1_0": (128, 18, [0]), "Q2_0": (64, 18, [0]),
+    "MXFP8": (32, 33, []),
 }
-TYPE_ID = {"NVFP4": 40, "Q1_0": 41, "Q2_0": 42}
+TYPE_ID = {"NVFP4": 40, "Q1_0": 41, "Q2_0": 42, "MXFP8": 43}
 
 
 def ref_dequant(name, raw):
@@ -57,6 +58,15 @@ def ref_dequant(name, raw):
         d = raw[:, 0:2].copy().view(np.float16).astype(np.float32)
         bits = (raw[:, 2:18, None] >> np.arange(8, dtype=np.uint8)) & 1
         return np.where(bits.reshape(-1, 128) == 1, d, -d).astype(np.float32).reshape(-1)
+    if name == "MXFP8":   # unsloth's DeepSeek V4.1 Engram tables; gguf-py has no type 43
+        e4m3 = np.zeros(256, np.float32)
+        for x in range(256):
+            e, m = (x >> 3) & 15, x & 7
+            mag = np.ldexp(np.float32(m), -9) if e == 0 else np.ldexp(np.float32(8 + m), e - 10)
+            e4m3[x] = -mag if x & 0x80 else mag
+        e = raw[:, 0].astype(np.uint32)
+        d = np.where(e == 0, np.uint32(0x00400000), e << 23).astype(np.uint32).view(np.float32)
+        return (e4m3[raw[:, 1:33]] * d[:, None]).astype(np.float32).reshape(-1)
     if name == "Q2_0":
         d = raw[:, 0:2].copy().view(np.float16).astype(np.float32)
         q = (raw[:, 2:18, None] >> (np.arange(4, dtype=np.uint8) * 2)) & 3
@@ -77,6 +87,10 @@ def make_blocks(name, n_blocks, rng):
     raw = rng.integers(0, 256, (n_blocks, size), dtype=np.uint8)
     for off in f16:
         raw[:, off:off + 2] = finite_f16(rng, n_blocks).view(np.uint8).reshape(n_blocks, 2)
+    if name == "MXFP8":   # no NaN codes (E8M0 0xFF, E4M3 0x7F / 0xFF): their bits are not one NaN's
+        raw[:, 0] = np.minimum(raw[:, 0], 254)
+        q = raw[:, 1:33]
+        q[(q & 0x7F) == 0x7F] ^= 1
     if name == "IQ1_M":
         # the block scale is an fp16 spread over the top nibbles of four
         # uint16: clear its exponent's top bit (bit 14 of the last one) so

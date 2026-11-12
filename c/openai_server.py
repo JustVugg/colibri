@@ -214,7 +214,10 @@ class GenerationScheduler:
                                      "first_output_seconds", "engine_call_seconds")}
 
     @contextlib.contextmanager
-    def admit(self, cancelled=None, slot=None):
+    def admit(self, cancelled=None, slot=None, prefer=None):
+        """`slot` pins the request to that slot (a client's `cache_slot`); `prefer` only
+        ranks the free slots (conversation_cache_slot): taken when free, else any free
+        slot, so two conversations that hash alike run side by side instead of in turn."""
         ticket = object()
         entry = (ticket, slot)          # (#B2) remember each waiter's target slot for fair, per-slot admission
         queued_at = time.monotonic()
@@ -222,7 +225,7 @@ class GenerationScheduler:
             if self.closed:
                 raise APIError(503, "The inference scheduler is shutting down.", None,
                                "scheduler_closed", "server_error")
-            if (self.paused or self._available_slot(slot) is None) and len(self.queue) >= self.max_queue:
+            if (self.paused or self._available_slot(slot, prefer=prefer) is None) and len(self.queue) >= self.max_queue:
                 self.rejected += 1
                 raise APIError(429, "The inference queue is full.", None, "queue_full",
                                "rate_limit_error", {"Retry-After": "1"})
@@ -246,7 +249,7 @@ class GenerationScheduler:
                     self.condition.notify_all()
                     raise APIError(429, "Timed out waiting for the inference engine.", None,
                                    "queue_timeout", "rate_limit_error", {"Retry-After": "1"})
-                available = None if self.paused else self._available_slot(slot, ticket)
+                available = None if self.paused else self._available_slot(slot, ticket, prefer)
                 if available is not None:
                     break
                 self.condition.wait(min(remaining, 0.25))
@@ -281,9 +284,10 @@ class GenerationScheduler:
             self.paused = False
             self.condition.notify_all()
 
-    def _available_slot(self, slot, ticket=None):
+    def _available_slot(self, slot, ticket=None, prefer=None):
         # Caller holds the condition lock. Pinned waiters reserve only their
         # target; an older any-slot waiter has priority over every free slot.
+        # An any-slot waiter's preferred slot is its pick when free.
         candidates = self.free_slots.copy() if slot is None else self.free_slots & {slot}
         for earlier_ticket, earlier_slot in self.queue:
             if earlier_ticket is ticket:
@@ -291,6 +295,8 @@ class GenerationScheduler:
             if earlier_slot is None:
                 return None
             candidates.discard(earlier_slot)
+        if slot is None and prefer in candidates:
+            return prefer
         return min(candidates, default=None)
 
     def snapshot(self):
@@ -5472,7 +5478,9 @@ def conversation_cache_slot(messages, kv_slots):
     plus the first user message, which never change once the conversation has started —
     routes every turn of one conversation to the same slot. Distinct conversations
     spread across slots; when there are more live conversations than slots, colliding
-    ones degrade to the old re-prefill behaviour rather than to anything worse.
+    ones degrade to the old re-prefill behaviour rather than to anything worse. The slot
+    is a preference (GenerationScheduler.admit's `prefer`): a conversation whose slot is
+    busy with another one takes a free slot, its prefix read again, instead of waiting.
 
     Returns a slot in [0, kv_slots). Falls back to 0 when there is nothing to key on.
     """
@@ -8846,15 +8854,16 @@ class APIHandler(BaseHTTPRequestHandler):
         # fotografia del prefisso condiviso non le serve a niente. E' la stessa
         # regola di conversation_cache_slot per la chat, con la chiave presa
         # dalla parte che non cambia.
+        prefer_slot = None
         if cache_slot is None:
-            cache_slot = conversation_cache_slot(
+            prefer_slot = conversation_cache_slot(
                 [{"role": "system", "content": fixed or state or ""}], self.server.kv_slots)
         fixed_prefix = f"{fixed}\n\n" if fixed else ""
         state_prefix = fixed_prefix + (f"Context:\n{state}\n\n" if state else "")
         started = time.time()
         read_total = 0
         prompt_max = 0
-        with self.server.scheduler.admit(self.client_disconnected, cache_slot) as admission:
+        with self.server.scheduler.admit(self.client_disconnected, cache_slot, prefer_slot) as admission:
             queue_wait, cache_slot = admission
 
             def score(text, pin):
@@ -9211,11 +9220,12 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(502, f"The decision engine asks for a record form this server does not "
                                 f"write ({form!r}).", None, "engine_error", "server_error")
         record = systemone_decision_record(body, form)
+        prefer_slot = None
         if cache_slot is None:
-            cache_slot = conversation_cache_slot([{"role": "system", "content": record["state"]}],
-                                                 self.server.kv_slots)
+            prefer_slot = conversation_cache_slot([{"role": "system", "content": record["state"]}],
+                                                  self.server.kv_slots)
         started = time.time()
-        with self.server.scheduler.admit(self.client_disconnected, cache_slot) as admission:
+        with self.server.scheduler.admit(self.client_disconnected, cache_slot, prefer_slot) as admission:
             queue_wait, cache_slot = admission
             call = time.monotonic()
             try:
@@ -9499,13 +9509,17 @@ class APIHandler(BaseHTTPRequestHandler):
                  not 0 <= cache_slot < self.server.kv_slots)):
             raise APIError(400, f"`cache_slot` must be an integer between 0 and {self.server.kv_slots - 1}.",
                            "cache_slot")
+        prefer_slot = None
         if cache_slot is None and self.server.kv_slots > 1:
-            # #634: pin each conversation to a stable KV slot so multi-turn reuses its
+            # #634: each conversation prefers a stable KV slot so multi-turn reuses its
             # cached prefix instead of re-prefilling. Only when the request carries a
-            # conversation; raw /v1/completions keeps the scheduler's free-slot pick.
+            # conversation; raw /v1/completions keeps the scheduler's free-slot pick. A
+            # preference, not a pin: when that slot is busy with another conversation and
+            # another is free, the request takes the free one (its prefix read again)
+            # rather than waiting for the other conversation to end.
             conversation = body.get("messages")
             if isinstance(conversation, list) and conversation:
-                cache_slot = conversation_cache_slot(conversation, self.server.kv_slots)
+                prefer_slot = conversation_cache_slot(conversation, self.server.kv_slots)
         stream = body.get("stream", False)
         if not isinstance(stream, bool):
             raise APIError(400, "`stream` must be a boolean.", "stream")
@@ -9528,7 +9542,7 @@ class APIHandler(BaseHTTPRequestHandler):
         completion_id = id_prefix + uuid.uuid4().hex
         created = int(time.time())
 
-        with self.server.scheduler.admit(self.client_disconnected, cache_slot) as admission, \
+        with self.server.scheduler.admit(self.client_disconnected, cache_slot, prefer_slot) as admission, \
                 contextlib.ExitStack() as stream_cleanup:
             queue_wait, cache_slot = admission
             queue_headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000))}
@@ -10235,13 +10249,17 @@ class APIHandler(BaseHTTPRequestHandler):
                  not 0 <= cache_slot < self.server.kv_slots)):
             raise APIError(400, f"`cache_slot` must be an integer between 0 and {self.server.kv_slots - 1}.",
                            "cache_slot")
+        prefer_slot = None
         if cache_slot is None and self.server.kv_slots > 1:
-            # #634: pin each conversation to a stable KV slot so multi-turn reuses its
+            # #634: each conversation prefers a stable KV slot so multi-turn reuses its
             # cached prefix instead of re-prefilling. Only when the request carries a
-            # conversation; raw /v1/completions keeps the scheduler's free-slot pick.
+            # conversation; raw /v1/completions keeps the scheduler's free-slot pick. A
+            # preference, not a pin: when that slot is busy with another conversation and
+            # another is free, the request takes the free one (its prefix read again)
+            # rather than waiting for the other conversation to end.
             conversation = body.get("messages")
             if isinstance(conversation, list) and conversation:
-                cache_slot = conversation_cache_slot(conversation, self.server.kv_slots)
+                prefer_slot = conversation_cache_slot(conversation, self.server.kv_slots)
         stream = body.get("stream", False)
         if not isinstance(stream, bool):
             raise APIError(400, "`stream` must be a boolean.", "stream")
@@ -10282,7 +10300,7 @@ class APIHandler(BaseHTTPRequestHandler):
             reason = "tool_calls" if calls else ("length" if stats["length_limited"] else "stop")
             return content, self.ANTHROPIC_STOP[reason]
 
-        with self.server.scheduler.admit(self.client_disconnected, cache_slot) as admission, \
+        with self.server.scheduler.admit(self.client_disconnected, cache_slot, prefer_slot) as admission, \
                 contextlib.ExitStack() as stream_cleanup:
             queue_wait, cache_slot = admission
             queue_headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000))}

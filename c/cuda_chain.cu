@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <chrono>
 #ifndef _WIN32
 #include <unistd.h>   /* access: WSL2's /dev/dxg (cc_flush_on) */
@@ -33,6 +34,9 @@
 extern "C" int coli_cuda_tensor_shape(const ColiCudaTensor *t, int *fmt, int *I, int *O);
 extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, const float *x_dev, int S, void *stream);
 extern "C" int coli_cuda_tensor_glu_async(ColiCudaTensor *tg, ColiCudaTensor *tu, float *y_dev, const float *x_dev, int S, void *stream);
+/* the caller's word for this thread's next matmul: x as it was at the stream's last one (its
+ * quantization kept) */
+extern "C" void coli_cuda_bd_x_same(int on);
 extern "C" int coli_cuda_tensor_gemv_rows_async(ColiCudaTensor *t, const int *ids_dev, float *y_dev, const float *x_dev, int n, void *stream);
 /* and the routed experts' kernels (cc_moe), on the same terms, and a resident tensor's device copy */
 extern "C" int coli_cuda_tensor_dev(const ColiCudaTensor *t, const void **w, const float **sc, int *gs);
@@ -80,8 +84,12 @@ double cc_now_ms(void) {
     using namespace std::chrono;
     return duration<double, std::milli>(steady_clock::now().time_since_epoch()).count();
 }
-CcCtx *cur(void) { return g_cur >= 0 ? &g_cc[g_cur] : nullptr; }
-CcCtx *ctx_of(int device) { for (int i = 0; i < g_ncc; i++) if (g_cc[i].device == device) return &g_cc[i]; return nullptr; }
+/* a count of the calls that reach a context (each op's first step): two matmuls with nothing
+ * between them see consecutive counts (cc_matmul: its input unchanged since the last) */
+static std::atomic<unsigned long long> g_cc_seq{0};
+static thread_local unsigned long long t_cc_seq = 0;   /* this thread's last count */
+CcCtx *cur(void) { t_cc_seq = ++g_cc_seq; return g_cur >= 0 ? &g_cc[g_cur] : nullptr; }
+CcCtx *ctx_of(int device) { t_cc_seq = ++g_cc_seq; for (int i = 0; i < g_ncc; i++) if (g_cc[i].device == device) return &g_cc[i]; return nullptr; }
 /* every call: the context's device current (the backend's other calls switch it) */
 CcCtx *live(void) {
     CcCtx *c = cur();
@@ -994,6 +1002,10 @@ __global__ static void cc_dnconv_k(const float *__restrict__ xin, const float *_
         for (int k = 0; k < 8; k++) if (k == nh - 1) hist[k] = cur;
         if (s == p.snap_row)
             for (int k = 0; k < 8; k++) if (k < nh) snap[p.snap_off + c * nh + k] = hist[k];
+        if (s < p.snap_n) {   /* a verify's row s: its own copy (the table's address s) */
+            float *dst = (float *)(uintptr_t)reinterpret_cast<const unsigned long long *>(snap + p.snap_off)[s];
+            for (int k = 0; k < 8; k++) if (k < nh) dst[c * nh + k] = hist[k];
+        }
     }
     for (int k = 0; k < 8; k++) if (k < nh) ring[p.ring_off + c * nh + k] = hist[k];
 }
@@ -1033,6 +1045,10 @@ __global__ static void cc_dnconv_ring_k(const float *__restrict__ xin, float *__
     float h[8];
     if (p.snap_row >= 0 && p.snap_row < p.S)   /* the ring after row snap_row */
         for (int k = 0; k < 8; k++) if (k < nh) snap[p.snap_off + c * nh + k] = cc_dnconv_val(xin, ring, c, p.snap_row + 1 - nh + k, nh, p);
+    for (int s = 0; s < p.snap_n && s < p.S; s++) {   /* a verify's rows: the ring after each, its own copy */
+        float *dst = (float *)(uintptr_t)reinterpret_cast<const unsigned long long *>(snap + p.snap_off)[s];
+        for (int k = 0; k < 8; k++) if (k < nh) dst[c * nh + k] = cc_dnconv_val(xin, ring, c, s + 1 - nh + k, nh, p);
+    }
     for (int k = 0; k < 8; k++) if (k < nh) h[k] = cc_dnconv_val(xin, ring, c, p.S - nh + k, nh, p);
     for (int k = 0; k < 8; k++) if (k < nh) ring[p.ring_off + c * nh + k] = h[k];
 }
@@ -1108,6 +1124,11 @@ __global__ static void __launch_bounds__(128) cc_dnrec_k(const float *__restrict
             if (s == p.snap_row) {
                 #pragma unroll
                 for (int k = 0; k < KD; k++) snap[nb + k * p.VD + v] = col[k];
+            }
+            if (s < p.snap_n) {   /* a verify's row s: its own copy (the table's address s) */
+                float *dst = (float *)(uintptr_t)reinterpret_cast<const unsigned long long *>(snap + p.snap_off)[s] + h * KD * p.VD;
+                #pragma unroll
+                for (int k = 0; k < KD; k++) dst[k * p.VD + v] = col[k];
             }
         }
         __syncthreads();
@@ -2222,7 +2243,15 @@ static int cc_matmul(ColiCudaTensor *t, CcBuf *x, size_t xo, CcBuf *y, size_t yo
     if (!coli_cuda_tensor_shape(t, &fmt, &I, &O) || coli_cuda_tensor_device(t) != c->device) return 0;
     if ((xo + (size_t)S * I) * 4 > x->bytes || (yo + (size_t)S * O) * 4 > y->bytes) return 0;
     g_st.matmuls++; g_st.ops++;
-    if (!coli_cuda_tensor_gemm_async(t, y->d + yo, x->d + xo, S, (void *)c->stream)) { c->lost = 1; return 0; }
+    /* the input of the last matmul, with no call to the chain between (q, k and v; gate and up): its
+     * quantization stays */
+    static thread_local struct { const float *x; int S, I; unsigned long long seq; cudaStream_t st; } last = {nullptr, 0, 0, 0, nullptr};
+    const float *xp = x->d + xo;
+    coli_cuda_bd_x_same(last.x == xp && last.S == S && last.I == I && last.st == c->stream && last.seq + 1 == t_cc_seq);
+    const int ok = coli_cuda_tensor_gemm_async(t, y->d + yo, xp, S, (void *)c->stream);
+    coli_cuda_bd_x_same(0);
+    last = {xp, S, I, t_cc_seq, c->stream};
+    if (!ok) { c->lost = 1; last.x = nullptr; return 0; }
     return 1;
 }
 static int cc_addnorm(CcBuf *x, CcBuf *t, CcBuf *w, CcBuf *y, const CcAddNorm *p) {
@@ -2722,7 +2751,8 @@ static int cc_attn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf 
 static int cc_dnconv(CcBuf *in, CcBuf *w, CcBuf *ring, CcBuf *out, CcBuf *snap, const CcDnConv *p) {
     CcCtx *c = live();
     if (!c || !in || !w || !ring || !out || !p || p->S < 1 || p->CD < 1 || p->CK < 2 || p->CK > 9) return 0;
-    if (p->snap_row >= 0 && !snap) return 0;
+    if ((p->snap_row >= 0 || p->snap_n > 0) && !snap) return 0;
+    if (p->snap_n > 0 && (p->snap_row >= 0 || p->snap_n > p->S || p->snap_off % 2 || ((size_t)p->snap_off + 2 * (size_t)p->snap_n) * 4 > snap->bytes)) return 0;
     if (p->S > 1 && p->S < 65536) {   /* a prompt's rows apart, then the ring past them */
         dim3 g((unsigned)((p->CD + 127) / 128), (unsigned)p->S);
         coli_launch(cc_dnconv_rows_k, g, 128, 0, c->stream, fp(in), fp(w), fp(ring), fpw(out), *p);
@@ -2736,9 +2766,11 @@ static int cc_dnrec(int KD, CcBuf *cv, CcBuf *ab, CcBuf *z, CcBuf *st, CcBuf *pr
     CcCtx *c = live();
     if (!c || !cv || !ab || !z || !st || !prm || !y || !p || p->S < 1 || p->VH < 1 || p->KH < 1 || p->VH % p->KH ||
         p->VD < 1 || p->VD > 128) return 0;
-    if (p->snap_row >= 0 && !snap) return 0;
+    if ((p->snap_row >= 0 || p->snap_n > 0) && !snap) return 0;
+    if (p->snap_n > 0 && (p->snap_row >= 0 || p->snap_n > p->S || p->snap_off % 2 || ((size_t)p->snap_off + 2 * (size_t)p->snap_n) * 4 > snap->bytes)) return 0;
     const float *a = fp(cv), *b = fp(ab), *zz = fp(z), *pr = fp(prm);
     float *s = fpw(st), *yy = fpw(y), *sn = fpw(snap);
+    if (p->snap_n > 0) goto one;   /* a verify's rows with their copies: one block a head, the rows in order */
     static int rows_on = -1;
     if (rows_on < 0) { const char *e = getenv("COLI_CUDA_DNREC_ROWS"); rows_on = !(e && *e == '0'); }
 #if !(defined(__HIP_PLATFORM_AMD__) || defined(__HIP__))   /* HIP keeps cc_dnrec_rows_k */
@@ -2785,6 +2817,7 @@ rows:
         default: return 0;
         }
     }
+one:
     switch (KD) {
     case 4:   coli_launch(cc_dnrec_k<4>, (unsigned)p->VH, 128, 0, c->stream, a, b, zz, s, pr, yy, sn, *p); break;
     case 8:   coli_launch(cc_dnrec_k<8>, (unsigned)p->VH, 128, 0, c->stream, a, b, zz, s, pr, yy, sn, *p); break;
@@ -3548,6 +3581,7 @@ static int cc_preload(void) {
 #include "cuda_dsv4c.cuh"   /* DeepSeek V4.1's layer ops */
 #include "cuda_glm53c.cuh"  /* GLM-5.3's layer ops */
 #include "cuda_k3c.cuh"     /* Kimi K3's residual mix and activation */
+#include "cuda_dflash.cuh"  /* DFlash2's drafter's convolution */
 static const ColiCudaChainOps g_cc_ops = {
     sizeof(ColiCudaChainOps),
     cc_init, cc_ready, cc_lost_, cc_shutdown, cc_device, cc_device_now,
@@ -3584,5 +3618,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_kda_conv, cc_kda_rec,
     cc_mla_core, cc_mla_rope, cc_mla_lnorm, cc_mla_hgemv, cc_dsa_pool_keys, cc_dsa_pool_select, cc_dsa_select, cc_mla_hgemv_q8,
     cc_ares_mix, cc_situ,
+    cc_dflash, cc_dfconv, cc_dftopk, cc_dftap,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }

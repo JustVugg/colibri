@@ -1768,6 +1768,51 @@ static int bd_tensor_upload(ColiCudaTensor **tensor, const void *weights, int fm
  * BD_GEMV_MAX_S rows (a decode step, a verify's) on the GEMV, each row a decode step's bits;
  * more (a prompt chunk) through the tensor cores' tiles where the device has them (bd_tensor_gemm) */
 #define BD_GEMV_MAX_S 8
+/* bd_mmg_k up to this many rows: a verify's of up to 7 drafts, 8 conversations' (more on the GEMV's
+ * tiles, whose bits no GEMV row has) */
+#define BD_MMQ_MAX_S 8
+/* and for matrices of this many outputs or more: a smaller one (Qwen3.8-27B's k and v, 1024; its
+ * DeltaNet's alpha and beta, 48) has too few blocks for it, and stays on the GEMV for every row
+ * count (a matrix's form is its shape's, never its rows': its rows keep the same bits) */
+#define BD_MMQ_MIN_O 2048
+/* the first row count bd_mmg_k takes for t, as quick as the GEMV from there (whose bits its are), by
+ * type and shape from an RTX PRO 4000's measures (us at 1 / 2 / 3 / 4 rows, GEMV against bd_mmg_k):
+ * Q3_K from one row on every shape (5120 x 17408 133 / 119 at 1; the lm_head, 5120 x 248320, 2184 /
+ * 2013); Q6_K and Q8_0 from 2 (Q6_K 17408 x 5120 240 / 210 at 2), the lm_head and Q6_K's rows of 2560 or
+ * fewer inputs from 3 (Q6_K 5120 x 248320 3064 / 3160 at 2, 3288 / 3258 at 3), Q8_0's matrices under
+ * 2^24 weights from 3; Q4_K from 3 (5120 x 10240 82.9 / 83.3 at 3, 90.7 / 86.5 at 4); Q5_K from 3 where
+ * the outputs are 16384 or more, else 4 (17408 x 5120 170.6 / 177.6 at 3); IQ4_XS and IQ4_NL from 3,
+ * rows of 2560 or fewer inputs from 4 (2560 x 10240 42.0 / 43.9 at 3); IQ2_XXS and IQ1_S from 3,
+ * IQ2_XXS 2560 x 8192 or more from 5 (2560 x 10240 34.2 / 35.6 at 4); IQ2_XS, IQ2_S, IQ3_XXS, Q2_K
+ * from 4 (IQ2_XS 5120 x 17408 116.7 / 126.6 at 3, 135.6 / 129.8 at 4); IQ3_S from 4, rows of 2560
+ * inputs from 5 (2560 x 10240 40.7 / 43.1 at 4). COLI_CUDA_BD_MMQ=n: from n rows for every matrix, 0
+ * never. */
+static inline int bd_mmq_min(const ColiCudaTensor *t) {
+    static int v = -2;
+    if (v == -2) { const char *e = std::getenv("COLI_CUDA_BD_MMQ"); v = e && *e ? (std::atoi(e) > 0 ? std::atoi(e) : 0) : -1; }
+    if (v >= 0) return v;
+    const int ty = t->fmt - 100;
+    const size_t n = (size_t)t->I * t->O;
+    if (ty == 11) return 1;
+    if (ty == 19) return 3;
+    if (ty == 16) return t->I <= 2560 && t->O >= 8192 ? 5 : 3;
+    if (ty == 21) return t->I <= 2560 ? 5 : 4;
+    if (ty == 10 || ty == 17 || ty == 18 || ty == 22) return 4;
+    if (ty == 14) return t->O >= 131072 || t->I <= 2560 ? 3 : 2;
+    if (ty == 8) return t->O >= 131072 || n < ((size_t)1 << 24) ? 3 : 2;
+    if (ty == 13) return t->O >= 16384 ? 3 : 4;
+    if (ty == 12) return 3;
+    return t->I <= 2560 ? 4 : 3;   /* IQ4_XS, IQ4_NL */
+}
+/* whether bd_mmg_k takes S rows of t (sm_80 on): its types, the GEMV's classes 8 or more, 2048 outputs or
+ * more (a smaller matrix has too few blocks for it and stays on the GEMV) */
+static inline int bd_mmq_takes(const DeviceContext *ctx, const ColiCudaTensor *t, int S) {
+    const int m = bd_mmq_min(t);
+    return ctx && m > 0 && S >= m && S <= BD_MMQ_MAX_S && t->fmt >= 100 && bd_mmq_has(t->fmt - 100) && t->O >= BD_MMQ_MIN_O &&
+           t->I % 256 == 0 && bd_lpr(t->I) >= 8 && ctx->compute_major >= 8;
+}
+/* cuda_chain.cu's: x unchanged since this thread's last matmul on the stream (bd_xq_quant keeps its quantization) */
+extern "C" void coli_cuda_bd_x_same(int on) { g_bd_x_same = on; }
 static int bd_tensor_gemm(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float *x, int S, cudaStream_t st);
 static int bd_tensor_gemv(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float *x, int S, cudaStream_t st) {
     const bd_u32 *tab = bd_table(ctx);
@@ -1779,6 +1824,13 @@ static int bd_tensor_gemv(DeviceContext *ctx, ColiCudaTensor *t, float *y, const
         const char *e = std::getenv("COLI_CUDA_BD_FLOAT"), *q = std::getenv("GQ_EXACT");
         exact = (e && *e == '1') || (q && *q == '1');
     }
+#if !(defined(__HIP__) || defined(__HIP_PLATFORM_AMD__))
+    /* a verify's rows and several conversations' (bd_mmq_min to BD_MMQ_MAX_S): the tensor cores'
+     * integer steps (bd_mmg_k), each row the GEMV's bits */
+    if (!exact && bd_mmq_takes(ctx, t, S) &&
+        bd_mmg_launch(y, x, (const bd_u32 *)t->weights, t->fmt, t->I, t->O, t->row_words, S, st, tab))
+        return cuda_ok(cudaGetLastError(), "block mmq launch");
+#endif
     if (!exact && S > BD_GEMV_MAX_S && bd_tensor_gemm(ctx, t, y, x, S, st)) return 1;
     if (!bd_gemv_launch(y, x, (const bd_u32 *)t->weights, tab, t->fmt, t->I, t->O, t->row_words, S, ctx->smem_optin, exact, st)) return 0;
     return cuda_ok(cudaGetLastError(), "block gemv launch");
@@ -4949,6 +5001,10 @@ extern "C" int coli_cuda_tensor_glu_async(ColiCudaTensor *tg, ColiCudaTensor *tu
         on = dec && !(b && *b == '0');
     }
     if (fault_injected() || !tg || !tu || !y_dev || !x_dev || S < 1 || tg->fmt < 100 || ((uintptr_t)x_dev & 15)) return 0;
+#if !(defined(__HIP__) || defined(__HIP_PLATFORM_AMD__))
+    /* rows bd_mmg_k takes: the two matmuls apart on it (the caller's), the bits of the GEMVs and the product */
+    if (bd_mmq_takes(find_ctx(tg->device), tg, S) && bd_mmq_takes(find_ctx(tu->device), tu, S)) return 0;
+#endif
     if (S <= BD_GEMV_MAX_S) {
         if (!dec || tu->fmt != tg->fmt || tu->I != tg->I || tu->O != tg->O || tu->row_words != tg->row_words || tu->device != tg->device) return 0;
         DeviceContext *bc = find_ctx(tg->device);
@@ -5016,6 +5072,7 @@ extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, cons
     DeviceContext *ctx = find_ctx(t->device);
     if (!select_ctx(ctx)) return 0;
     cudaStream_t st = (cudaStream_t)stream;
+    if (!g_bd_x_same) bd_xq_forget(st);   /* x may have changed since the stream's quantization */
     if (t->fmt >= 100) return bd_tensor_gemv(ctx, t, y_dev, x_dev, S, st);   /* a GGUF's blocks: cuda_bd.cuh */
     if (t->fmt == 1 && S <= GEMV_I8_MAX_S && t->I % 16 == 0 && t->I <= 12288 && ((uintptr_t)x_dev & 15) == 0) {   /* x in float4 loads */
         unsigned bx = (unsigned)((t->O + GEMV_I8_ROWS - 1) / GEMV_I8_ROWS);

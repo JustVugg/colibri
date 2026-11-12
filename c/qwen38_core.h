@@ -5192,6 +5192,9 @@ static void q38_embed_row(Model *m,int id,int abs_pos,float *out);   /* below; t
 #include "qwen38_chain.h"  /* COLI_VK_CHAIN: every layer's dense chain on the device */
 #endif
 #ifdef COLI_CUDA
+#include "cuda_chain.h"
+#include "dflash_cuda.h"        /* COLI_DFLASH: DFlash2's drafter on the CUDA chain's device */
+static DfDrafter g_q38_df;
 #include "qwen38_cuda_chain.h"  /* COLI_CUDA_CHAIN: every layer's dense chain on the CUDA device */
 #endif
 
@@ -5390,6 +5393,10 @@ static float *q38_forward(Model *m,const int *ids,int S,int pos_base,int nlogits
     m->kv_len=pos_base+S;
     /* Rewinding and writing a shorter branch invalidates its old tail. */
     if(m->kvp.len>pos_base)m->kvp.len=pos_base;
+#ifdef COLI_CUDA
+    /* DFlash2's drafter: the chain put this forward's rows in its cache (df_ctx) when it ran them all */
+    if(g_q38_df.on)df_note(&g_q38_df,ids,S,pos_base,m->kvp.fed,m->kvp.len);
+#endif
     kv_prefix_record(&m->kvp,ids,pos_base,S);
     if(m->vis_map && m->vis_rows_n>0)kv_prefix_taint(&m->kvp);
     float *logit;
@@ -5482,6 +5489,9 @@ static void q38_seq_free(Model *m,Q38Seq *q) {
  * is (as a verify's rows, below), so each conversation gets the logits it would
  * alone. Decode rows are never an image's. S rows of logits come back. */
 static float *q38_forward_rows(Model *m,const Q38Row *rows,const int *ids,int S) {
+#ifdef COLI_CUDA
+    g_q38_df.len=0;   /* DFlash2's drafter keeps one conversation's rows: several in a step leave it none */
+#endif
     Cfg *c=&m->c;int H=c->hidden,W=c->hc_width,C=c->hc_count;
     m->timers.forwards++;
     m->mux_rows=rows;
@@ -6009,7 +6019,13 @@ static float *q38_spec_step(Model *m,Q38Spec *sp,int tok,int pos,int more) {
     if(pos+room>=m->kv_cap)room=m->kv_cap-1-pos;
     int d[Q38_SPEC_ROWS],k=0,src=SPEC_SRC_MTP,made=0;   /* made: the head's drafts before a trim */
     double t_verify=0.0;   /* when the verify's cost began (0: at its forward) */
+#ifdef COLI_CUDA
+    const int dfl=g_q38_df.on;   /* DFlash2's drafter drafts in the head's place: its whole block in one pass */
+    int head_ready=sp->on&&(dfl?df_ready(&g_q38_df,pos):m->mtp_pend_n&&m->mtp_len+m->mtp_pend_n==pos);
+#else
+    const int dfl=0;
     int head_ready=sp->on&&m->mtp_pend_n&&m->mtp_len+m->mtp_pend_n==pos;
+#endif
     if(room>0&&(head_ready||sp->lookup)){
         /* the lookup's proposal, gated; the forced mode proposes the oracle's tokens */
         int kl=0,dl[Q38_SPEC_ROWS];double vl=0.0;
@@ -6027,7 +6043,7 @@ static float *q38_spec_step(Model *m,Q38Spec *sp,int tok,int pos,int more) {
         /* the head's depth: fixed, or the gate's pick */
         int km=0;double vm=0.0;
         if(head_ready){
-            int maxm=room<3?room:3;
+            int maxm=dfl?room:room<3?room:3;
             if(sp->depth){
                 /* the plain step that keeps T(1) measured for the trim below (see q36_mtp_depth) */
                 if(sp->depth>1&&sp->pstep&&!sp->gate.off&&!sp->force&&sp->gate.since_plain>=SPEC_REFRESH){sp->gate.declined[SPEC_SRC_MTP]++;vm=1.0;}
@@ -6038,6 +6054,26 @@ static float *q38_spec_step(Model *m,Q38Spec *sp,int tok,int pos,int more) {
         if(kl>0&&(km==0||sp->lk_force||vl>vm||(vl==vm&&kl>km))){k=kl;src=SPEC_SRC_LOOKUP;memcpy(d,dl,(size_t)k*sizeof(int));}
         else if(km>0)k=km;
         if(k>0&&!q38_spec_alloc(m,k))k=0;   /* no memory for the copies: a plain step */
+#ifdef COLI_CUDA
+        if(k>0&&src==SPEC_SRC_MTP&&dfl){
+            float pr[Q38_SPEC_ROWS],*emb=falloc(c->hidden);
+            t_verify=now_s();   /* the block, then the verify: one cycle */
+            q38_embed_row(m,tok,pos,emb);
+            int n=df_draft(&g_q38_df,emb,tok,pos,k,d,pr);
+            free(emb);
+            if(n<k)k=n;
+            for(int j=0;j<k;j++)sp->ahead_p[j]=pr[j];
+            made=k;
+            if(sp->pstep&&sp->depth&&!sp->force&&k>1){
+                int kp=spec_gate_pick_p(&sp->gate,SPEC_SRC_MTP,k,sp->ahead_p,NULL);
+                k=kp<1?1:kp;
+            }
+            if(sp->force)for(int j=1;j<=k;j++){
+                int t=q38_spec_forced(sp->force,sp->force_row,(int)sp->verifies,k,j,pos,V);
+                if(t>=0)d[j-1]=t;
+            }
+        } else
+#endif
         if(k>0&&src==SPEC_SRC_MTP){
             float *hidden=falloc(c->hc_width);
             t_verify=now_s();   /* the head's first draft is the head pass a plain step makes too */
@@ -6095,7 +6131,7 @@ static float *q38_spec_step(Model *m,Q38Spec *sp,int tok,int pos,int more) {
      * Qwen3.8-Flash-Next's rows of a verify 827 -> 267 us on an i5-13500's NVMe */
     {
         int seq[Q38_SPEC_ROWS];seq[0]=tok;memcpy(seq+1,d,(size_t)k*sizeof(int));
-        int from=src!=SPEC_SRC_MTP?0:made==k?k:k+1;
+        int from=src!=SPEC_SRC_MTP||dfl?0:made==k?k:k+1;   /* DFlash2's block asked for none */
         q38_ple_advise(m,seq,k+1,from);
     }
     int S=k+1;

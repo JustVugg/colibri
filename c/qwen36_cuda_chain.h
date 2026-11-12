@@ -87,6 +87,7 @@ typedef struct {
     ColiCudaTensor **t_dnz;   /* z's rows where a GGUF gives them another type than qkv's (NULL: one in_proj) */
     CcBuf **rec, **ring, **kc, **vc;           /* per layer state */
     CcBuf **rec_snap[Q36_SPEC_SNAPS], **ring_snap[Q36_SPEC_SNAPS];   /* a verify's copies, slot r after row r */
+    CcBuf *snap_tab;   /* each layer's copies' device addresses (q36cc_snap_tab): a verify's rows in one dispatch */
     int snap_slots, snap_valid;
     int *kv_valid, *attn_ord, n_attn;
     int *kv_rows;                              /* per attention layer: its mirror's rows (a sliding layer's ring, else cap) */
@@ -134,6 +135,7 @@ typedef struct {
     int pool_closed;   /* q36cc_pool_off closed the places: a conversation that enters opens them again */
     unsigned long long conv_clock, conv_handed, mux_steps, mux_rows, mux_host_steps, pool_reopens;
     const Q36Row *mx_rows; Q36ccConv **mx_conv;
+    const int *mx_snap;   /* a multiplexed step's verify rows: row s's state copied to snapshot slot mx_snap[s] (-1: none) */
 } Q36CChain;
 
 static int g_cuda_chain = 0;     /* COLI_CUDA_CHAIN asked for it and the chain is up */
@@ -1133,10 +1135,31 @@ static int q36cc_shortconv_mx(Q36CChain *ch, Model *m, int i, int n, int c0) {
     Cfg *c = &m->c; int D = c->hidden;
     int ok = cc_matmul(ch->t_sci[i], ch->nrm, 0, ch->qkvz, 0, n);
     for (int s = 0; s < n && ok; s++) {
-        CcDnConv cp = {1, D, c->dn_convk, s * 3 * D, 3 * D, s * D, D, -1, 2, (int)ch->o_conv[i], 0, 0};
-        ok = cc_dnconv(ch->qkvz, ch->prm, ch->mx_conv[c0 + s]->ring[i], ch->cv, NULL, &cp);
+        const int sl = ch->mx_snap ? ch->mx_snap[c0 + s] : -1;
+        CcDnConv cp = {1, D, c->dn_convk, s * 3 * D, 3 * D, s * D, D, sl >= 0 ? 0 : -1, 2, (int)ch->o_conv[i], 0, 0};
+        ok = cc_dnconv(ch->qkvz, ch->prm, ch->mx_conv[c0 + s]->ring[i], ch->cv, sl >= 0 ? ch->ring_snap[sl][i] : NULL, &cp);
     }
     return ok && cc_matmul(ch->t_sco[i], ch->cv, 0, ch->tmp, 0, n);
+}
+/* A verify's copies of layer i (rows 0..ns-1 into slots c0..) as a table of their device addresses in the
+ * mapped snap_tab: the recurrence's at float offset *rec_off, the ring's at *ring_off, so the convolution
+ * and the recurrence take the verify's rows in one dispatch each, the state read and written once (a
+ * dispatch a copy read and wrote Qwen3.8-27B's 151 MB of DeltaNet state once a draft). 0: not here (an
+ * older backend without device addresses, COLI_CUDA_DN_SNAP_ONE=0): one dispatch a copy. */
+static int q36cc_snap_tab(Q36CChain *ch, Model *m, int i, int c0, int ns, int *rec_off, int *ring_off) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_CUDA_DN_SNAP_ONE"); on = !(e && *e == '0'); }
+    const int L = m->c.n_layers;
+    if (!on || ns < 2 || c0 + ns > Q36_SPEC_SNAPS || !cc_dev_addr_ready() ||
+        !cc_reserve(&ch->snap_tab, (size_t)L * 2 * Q36_SPEC_SNAPS * 2 * sizeof(float), CC_UP)) return 0;
+    unsigned long long *t = (unsigned long long *)cc_ptr(ch->snap_tab) + (size_t)i * 2 * Q36_SPEC_SNAPS;
+    for (int r = 0; r < ns; r++) {
+        const void *a = cc_dev_addr(ch->rec_snap[c0 + r][i]), *b = cc_dev_addr(ch->ring_snap[c0 + r][i]);
+        if (!a || !b) return 0;
+        t[r] = (unsigned long long)(uintptr_t)a; t[Q36_SPEC_SNAPS + r] = (unsigned long long)(uintptr_t)b;
+    }
+    *rec_off = i * 2 * Q36_SPEC_SNAPS * 2; *ring_off = *rec_off + Q36_SPEC_SNAPS * 2;
+    return 1;
 }
 static int q36cc_deltanet(Q36CChain *ch, Model *m, Layer *l, int i, int n, int c0, int ns) {
     Cfg *c = &m->c; (void)l;
@@ -1147,15 +1170,18 @@ static int q36cc_deltanet(Q36CChain *ch, Model *m, Layer *l, int i, int n, int c
     int ok = cc_matmul(ch->t_dnp[i], ch->nrm, 0, ch->qkvz, 0, n) &&
              (!two || cc_matmul(ch->t_dnz[i], ch->nrm, 0, ch->qkvz, z0, n)) &&
              cc_matmul(ch->t_ab[i], ch->nrm, 0, ch->ab, 0, n);
-    int segs = ns > 1 ? ns : 1;
+    int rec_off = 0, ring_off = 0;
+    const int one = ns > 1 && q36cc_snap_tab(ch, m, i, c0, ns, &rec_off, &ring_off);
+    int segs = ns > 1 && !one ? ns : 1;
     for (int r = 0; r < segs && ok; r++) {
-        int s0 = ns > 1 ? r : 0, len = ns > 1 && r < ns - 1 ? 1 : n - s0, snap_row = ns ? 0 : -1;
-        CcBuf *rs = ns ? ch->rec_snap[c0 + r][i] : NULL, *cs = ns ? ch->ring_snap[c0 + r][i] : NULL;
-        CcDnConv cp = {len, CD, c->dn_convk, s0 * qr, qr, s0 * CD, CD, snap_row, 0, (int)ch->o_conv[i], 0, 0};
+        int s0 = ns > 1 ? r : 0, len = ns > 1 && r < ns - 1 ? 1 : n - s0, snap_row = ns && !one ? 0 : -1;
+        if (one) { s0 = 0; len = n; }
+        CcBuf *rs = one ? ch->snap_tab : ns ? ch->rec_snap[c0 + r][i] : NULL, *cs = one ? ch->snap_tab : ns ? ch->ring_snap[c0 + r][i] : NULL;
+        CcDnConv cp = {len, CD, c->dn_convk, s0 * qr, qr, s0 * CD, CD, snap_row, 0, (int)ch->o_conv[i], 0, one ? ring_off : 0, one ? ns : 0};
         CcDnRec rp = {len, vh, c->dn_kheads, c->dn_vdim, c->dn_kheads * c->dn_kdim, s0 * CD, CD, s0 * 2 * vh, 2 * vh,
                       vh + s0 * 2 * vh, 2 * vh, (int)z0 + s0 * zr, zr, s0 * vd, vd, snap_row,
                       (g_ssm_a_direct ? 2 : 0) | (g_dn_tiled ? 4 : 0), c->eps,   /* a GGUF's layout (qwen36.c) */
-                      1.f / sqrtf((float)c->dn_kdim), 0, 0, (int)ch->o_dn[i]};
+                      1.f / sqrtf((float)c->dn_kdim), 0, one ? rec_off : 0, (int)ch->o_dn[i], one ? ns : 0};
         ok = cc_dnconv(ch->qkvz, ch->prm, ch->ring[i], ch->cv, cs, &cp) &&
              cc_dnrec(c->dn_kdim, ch->cv, ch->ab, ch->qkvz, ch->rec[i], ch->prm, ch->dny, rs, &rp);
     }
@@ -1198,13 +1224,15 @@ static int q36cc_deltanet_mx(Q36CChain *ch, Model *m, Layer *l, int i, int n, in
              cc_matmul(ch->t_ab[i], ch->nrm, 0, ch->ab, 0, n);
     for (int s = 0; s < n && ok; s++) {
         Q36ccConv *v = ch->mx_conv[c0 + s];
-        CcDnConv cp = {1, CD, c->dn_convk, s * qr, qr, s * CD, CD, -1, 0, (int)ch->o_conv[i], 0, 0};
+        /* a verify's row: the state after it copied to its snapshot slot (q36cc_mux_rollback) */
+        const int sl = ch->mx_snap ? ch->mx_snap[c0 + s] : -1, snap_row = sl >= 0 ? 0 : -1;
+        CcDnConv cp = {1, CD, c->dn_convk, s * qr, qr, s * CD, CD, snap_row, 0, (int)ch->o_conv[i], 0, 0};
         CcDnRec rp = {1, vh, c->dn_kheads, c->dn_vdim, c->dn_kheads * c->dn_kdim, s * CD, CD, s * 2 * vh, 2 * vh,
-                      vh + s * 2 * vh, 2 * vh, (int)z0 + s * zr, zr, s * vd, vd, -1,
+                      vh + s * 2 * vh, 2 * vh, (int)z0 + s * zr, zr, s * vd, vd, snap_row,
                       (g_ssm_a_direct ? 2 : 0) | (g_dn_tiled ? 4 : 0), c->eps,
                       1.f / sqrtf((float)c->dn_kdim), 0, 0, (int)ch->o_dn[i]};
-        ok = cc_dnconv(ch->qkvz, ch->prm, v->ring[i], ch->cv, NULL, &cp) &&
-             cc_dnrec(c->dn_kdim, ch->cv, ch->ab, ch->qkvz, v->rec[i], ch->prm, ch->dny, NULL, &rp);
+        ok = cc_dnconv(ch->qkvz, ch->prm, v->ring[i], ch->cv, sl >= 0 ? ch->ring_snap[sl][i] : NULL, &cp) &&
+             cc_dnrec(c->dn_kdim, ch->cv, ch->ab, ch->qkvz, v->rec[i], ch->prm, ch->dny, sl >= 0 ? ch->rec_snap[sl][i] : NULL, &rp);
     }
     return ok && cc_matmul(ch->t_dno[i], ch->dny, 0, ch->tmp, 0, n);
 }
@@ -1929,6 +1957,12 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
         if (ch->conv) q36cc_mux_drop(m);   /* the conversations' states the device holds, to the host */
         return 0;
     }
+    /* DFlash2's drafter (dflash_cuda.h): the rows after its target layers, each chunk's keys and values */
+    DfDrafter *df = g_q36_df.on && !ch->mx_rows ? &g_q36_df : NULL;
+    if (df && !df_reserve(df, rows, m->kv_cap)) {
+        fprintf(stderr, "[dflash] device memory for the drafter's rows refused: drafts off\n");
+        df->on = 0; df = NULL;
+    }
     int snapped = 0;
     double w0 = ch->wait_ms, h0 = ch->host_ms;
     for (int c0 = 0; c0 < S; c0 += rows) {
@@ -2004,6 +2038,9 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
             if (pending) {
                 ok = ok && q36cc_combine(ch, m, i - 1, n, routed);
                 if (ok && lf) ok = cc_copy(ch->lfd, ((size_t)(i - 1) * 3 + 2) * D, ch->x, (size_t)(n - 1) * D, D);
+            }
+            if (ok && df && i > 0 && df_tap_index(df, i - 1) >= 0 && !df_tap(df, ch->x, 0, D, 1, n, df_tap_index(df, i - 1), 0)) {
+                df->on = 0; df = NULL;
             }
             if (!normed) ok = ok && q36cc_norm(ch->x, 0, ch->prm, ch->o_in[i], ch->nrm, 0, n, D, c->eps);
             if (ch->mx_rows) ok = ok && (c->is_attn[i] ? q36cc_attention_mx(ch, m, l, i, n, c0) :
@@ -2085,6 +2122,8 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
             pending = 1;
         }
         if (ok) ok = q36cc_combine(ch, m, L - 1, n, routed);
+        if (ok && df && df_tap_index(df, L - 1) >= 0 && !df_tap(df, ch->x, 0, D, 1, n, df_tap_index(df, L - 1), 0)) { df->on = 0; df = NULL; }
+        if (ok && df && !df_ctx(df, n, pb)) { fprintf(stderr, "[dflash] the drafter's rows failed: drafts off\n"); df->on = 0; df = NULL; }
         if (ok && dm_ids_defer) ok = cc_copy(ch->dm_idsd, 0, ch->dm_ids, 0, (size_t)L * n * c->topk);
         if (ok && lf) ok = cc_copy(ch->lfd, ((size_t)(L - 1) * 3 + 2) * D, ch->x, (size_t)(n - 1) * D, D);
         if (ok && want_x) ok = cc_copy(ch->xd, 0, ch->x, 0, (size_t)n * D);
@@ -2144,9 +2183,17 @@ lost:   /* a frame failed: the device is gone (or would not take a command); the
 }
 
 /* One decode step of several conversations on the CUDA chain (q36c_mux_step's twin) */
-static int q36cc_mux_step(Model *m, const Q36Row *rows, int S, float *xh, float *logit) {
+/* snap (may be NULL): row s's state copied to snapshot slot snap[s] for a rejected draft's rollback
+ * (q36cc_mux_rollback), -1 none; want_x: the rows' residuals back in xh (the MTP head's) */
+static int q36cc_mux_step(Model *m, const Q36Row *rows, int S, float *xh, float *logit, const int *snap, int want_x) {
     Q36CChain *ch = q36cc_of(m);
+    g_q36_df.len = 0;   /* DFlash2's drafter keeps one conversation's rows: several in a step leave it none */
     if (!g_cuda_chain || !ch || !ch->conv || !q36cc_pool_ok(ch) || S < 1 || S > q36cc_rows_max(ch, m)) return 0;
+    if (snap) {
+        int slots = 0;
+        for (int s = 0; s < S; s++) if (snap[s] + 1 > slots) slots = snap[s] + 1;
+        if (slots > Q36_SPEC_SNAPS || (slots && !q36cc_spec_slots(ch, m, slots))) return 0;
+    }
     for (int s = 0; s < S; s++) if (rows[s].seq->mpos || rows[s].seq->rope_delta) return 0;
     Q36ccConv **e = malloc((size_t)S * sizeof *e);
     if (!e) return 0;
@@ -2160,9 +2207,9 @@ static int q36cc_mux_step(Model *m, const Q36Row *rows, int S, float *xh, float 
     for (int s = 0; s < S && ok; s++) ok = q36cc_conv_grow(ch, m, (int)(e[s] - ch->conv), rows[s].pos + 1);
     int n = 0, ro = 0, failed_before = ch->failed;
     if (ok) {
-        ch->mx_rows = rows; ch->mx_conv = e;
-        n = q36cc_forward(m, xh, S, 0, NULL, 0, S, logit, &ro);
-        ch->mx_rows = NULL; ch->mx_conv = NULL;
+        ch->mx_rows = rows; ch->mx_conv = e; ch->mx_snap = snap;
+        n = q36cc_forward(m, xh, S, 0, NULL, want_x, S, logit, &ro);
+        ch->mx_rows = NULL; ch->mx_conv = NULL; ch->mx_snap = NULL;
     }
     free(e);
     if (ch->failed && !failed_before) return 0;   /* lost: every place's state rebuilt on the host */
@@ -2170,6 +2217,27 @@ static int q36cc_mux_step(Model *m, const Q36Row *rows, int S, float *xh, float 
     if (n) { ch->mux_steps++; ch->mux_rows += (unsigned long long)S; }
     else ch->mux_host_steps++;
     return n > 0;
+}
+
+/* A multiplexed verify's rejected drafts (q36cc_mux_step's snap): the conversation of mux slot `slot`
+ * back to its state after the row copied to snapshot slot `snap` (-1: the state as the step left it),
+ * `len` positions standing */
+static int q36cc_mux_rollback(Model *m, int slot, int snap, int len) {
+    Q36CChain *ch = q36cc_of(m);
+    if (!ch || !ch->ok || !ch->conv) return 0;
+    int k = -1;
+    for (int j = 0; j < ch->nconv && k < 0; j++) if (ch->conv[j].slot == slot) k = j;
+    if (k < 0) return 0;
+    Q36ccConv *v = &ch->conv[k];
+    for (int i = 0; i < m->c.n_layers; i++) if (m->c.is_attn[i] && v->kv_valid[i] > len) v->kv_valid[i] = len;
+    if (snap < 0) return 1;
+    if (snap >= ch->snap_slots || v->dn_where != Q36CC_DEV) return 0;
+    for (int i = 0; i < m->c.n_layers; i++) {
+        if (m->c.is_attn[i]) continue;
+        CcBuf *t = v->rec[i]; v->rec[i] = ch->rec_snap[snap][i]; ch->rec_snap[snap][i] = t;
+        t = v->ring[i]; v->ring[i] = ch->ring_snap[snap][i]; ch->ring_snap[snap][i] = t;
+    }
+    return 1;
 }
 
 static void q36cc_report(Model *m) {
