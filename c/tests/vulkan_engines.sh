@@ -4981,8 +4981,8 @@ family_kv_quant_deepseek() {
   # wrong can.
   env COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 COLI_USAGE=$PWD/chain.usage \
     DSV41_TINY=$PWD/dsv41_kvq_tiny COLI_DSV41_FIXTURE=$PWD/dsv41_kvq_tiny \
-    $PY -m unittest tests.test_dsv41_prefix_serve tests.test_dsv41_dspark_serve
-  echo "OK kv-quant serve: prefix reuse and DSpark's rollback against the packed fixture"
+    $PY -m unittest tests.test_dsv41_prefix_serve tests.test_dsv41_dspark_serve tests.test_dsv41_prefix_store
+  echo "OK kv-quant serve: prefix reuse, DSpark's rollback and the prefix store against the packed fixture"
   rm -f chain.usage chain-serve.usage
   if [ "${SAN:-0}" = 1 ]; then
     # the arms' own gates read stdout; a sanitizer report lands on stderr, so every log
@@ -4992,7 +4992,17 @@ family_kv_quant_deepseek() {
       [ -f "$f" ] || continue
       if san_diag "$f"; then cat "$f"; fail "kv-quant sanitize: $f carries a sanitizer diagnostic"; fi
     done
-    echo "OK kv-quant sanitize: no sanitizer diagnostic in any arm's log"
+    # The prefix store's own save/load: the serve arms above never reach it, their prompts
+    # (about 90 tokens) being shorter than a block (256), so nothing kept a ring row and a
+    # row stride wrong by the flag's element width moved nothing under this leg. Blocks of
+    # 16 tokens put every prompt over one: the checkpoints' ring rows, compressed rows and
+    # index keys are saved and put back, which is where a stride read out of a 528 B ring
+    # as 2048 B runs past its end (heap-buffer-overflow, deepseek_v41.c's v41_ps_state_save).
+    env COLI_VULKAN=1 COLI_VK_CHAIN=1 DSV41_TINY=$PWD/dsv41_kvq_tiny COLI_PREFIX_STORE_BLOCK=16 \
+      $PY -m unittest tests.test_dsv41_prefix_serve tests.test_dsv41_prefix_store > san_ps.log 2>&1 \
+      || { cat san_ps.log; fail "kv-quant sanitize: the prefix store's save and load"; }
+    if san_diag san_ps.log; then cat san_ps.log; fail "kv-quant sanitize: san_ps.log carries a sanitizer diagnostic"; fi
+    echo "OK kv-quant sanitize: no sanitizer diagnostic in any arm's log, the prefix store's own included"
     make clean >/dev/null 2>&1 || true
   fi
   unset OMP_NUM_THREADS

@@ -4188,10 +4188,10 @@ static int k3_ps_parts(Model *m, ColiPsPart *parts){
     Cfg *c=&m->c; int n=0;
     for(int i=0;i<c->n_layers;i++){
         if(m->L[i].kda) continue;
-        parts[n++]=(ColiPsPart){m->Lc?m->Lc[i]:NULL,(size_t)c->kv_lora*sizeof(float),m->max_t,1,0,1};
-        parts[n++]=(ColiPsPart){m->Rc?m->Rc[i]:NULL,(size_t)c->qk_rope*sizeof(float),m->max_t,1,0,1};
+        parts[n++]=(ColiPsPart){m->Lc?m->Lc[i]:NULL,(size_t)c->kv_lora*sizeof(float),m->max_t,1,0,1, 0};
+        parts[n++]=(ColiPsPart){m->Rc?m->Rc[i]:NULL,(size_t)c->qk_rope*sizeof(float),m->max_t,1,0,1, 0};
         if(c->index_hd>0&&c->idx_type[i])
-            parts[n++]=(ColiPsPart){m->L[i].m.Ic,(size_t)c->index_hd*sizeof(float),m->max_t,1,0,1};
+            parts[n++]=(ColiPsPart){m->L[i].m.Ic,(size_t)c->index_hd*sizeof(float),m->max_t,1,0,1, 0};
     }
     return n;
 }

@@ -5732,21 +5732,44 @@ static int v41_ps_on(void) {
 }
 /* the store's budget, decided when the engine plans its RAM: a tier's host pool leaves it (ram_later) */
 static size_t v41_ps_plan(void) { v41_ps_on(); return g_v41_ps.on ? g_v41_ps.budget : 0; }
-/* the compressed rows and index keys, a row for `ratio` positions */
+/* the compressed rows and index keys, a row for `ratio` positions -- in BYTES, the widths the
+ * flag picked (v41_row_ckv/v41_row_ikey): the arrays are uint8_t* and hold 288/68 B code rows
+ * when it is on, so a stride of `head_dim * sizeof(float)` would hand the store four times the
+ * bytes a row holds and copy them over the next row's (and past the array's end) */
+static void v41_ikey_rows_io(void *base, int row0, int n, char *buf, int out) {
+    /* Rows of an index-key mirror are not one array: a block of 32 rows keeps its 32 data rows
+     * (64 B each) and then their scale words (4 B each), so row t + 1 does not start where row
+     * t ends (dsv41_kvq.h). These two move rows [row0, row0 + n) through the 68-byte staging a
+     * boundary writes through -- the block's data rows, then its scale words, per block. Both
+     * directions see the same (row0, n) for the same bytes (a block's, a checkpoint tail's), so
+     * the staging reads back as written. */
+    uint8_t *m = (uint8_t *)base;
+    while (n > 0) {
+        const int at = row0 % KVQ_IKEY_BLOCK;
+        const int take = KVQ_IKEY_BLOCK - at < n ? KVQ_IKEY_BLOCK - at : n;
+        uint8_t *blk = m + (size_t)(row0 / KVQ_IKEY_BLOCK) * (KVQ_IKEY_BLOCK * KVQ_IKEY_BYTES);
+        char *dat = (char *)(blk + (size_t)at * 64), *sca = (char *)(blk + 2048 + (size_t)at * 4);
+        if (out) { memcpy(buf, dat, (size_t)take * 64); memcpy(buf + (size_t)take * 64, sca, (size_t)take * 4); }
+        else { memcpy(dat, buf, (size_t)take * 64); memcpy(sca, buf + (size_t)take * 64, (size_t)take * 4); }
+        buf += (size_t)take * KVQ_IKEY_BYTES; row0 += take; n -= take;
+    }
+}
 static int v41_ps_parts(const Model *m, ColiPsPart *parts) {
     const Cfg *c = &m->c; int n = 0;
+    const int hostq = v41_host_kvq(c);
     for (int i = 0; i < c->n_layers; i++) {
         const Layer *l = &m->L[i]; const int r = c->compress_ratio[i] > 0 ? c->compress_ratio[i] : 1;
         if (!c->kv_source[i] || !l->ckv || !l->ikey) continue;
         const int slots = c->max_positions / r;
-        parts[n++] = (ColiPsPart){l->ckv, (size_t)c->head_dim * sizeof(float), slots, 1, 0, r};
-        parts[n++] = (ColiPsPart){l->ikey, (size_t)c->index_head_dim * sizeof(float), slots, 1, 0, r};
+        parts[n++] = (ColiPsPart){l->ckv, v41_row_ckv(c), slots, 1, 0, r, NULL};
+        parts[n++] = (ColiPsPart){l->ikey, v41_row_ikey(c), slots, 1, 0, r, hostq ? v41_ikey_rows_io : NULL};
     }
     return n;
 }
 typedef struct {
     int n_layers, window, pos, pub_layer;
-    float **win, **cs_kv, **cs_score; int **win_pos;
+    uint8_t **win;   /* the ring's rows as stored: 528 B code rows, or hd floats */
+    float **cs_kv, **cs_score; int **win_pos;
 } V41PsState;
 static void v41_ps_state_free(void *v) {
     V41PsState *x = (V41PsState *)v;
@@ -5766,13 +5789,13 @@ static V41PsState *v41_ps_state_save(const Model *m, size_t *bytes) {
     if (!x) return NULL;
     x->n_layers = L; x->window = W; x->pos = m->pos;
     x->pub_layer = m->published_index_k ? m->published_index_layer : -1;
-    int ok = (x->win = (float **)calloc((size_t)L, sizeof(float *))) && (x->win_pos = (int **)calloc((size_t)L, sizeof(int *))) &&
+    int ok = (x->win = (uint8_t **)calloc((size_t)L, sizeof(uint8_t *))) && (x->win_pos = (int **)calloc((size_t)L, sizeof(int *))) &&
              (x->cs_kv = (float **)calloc((size_t)L, sizeof(float *))) && (x->cs_score = (float **)calloc((size_t)L, sizeof(float *)));
     *bytes = sizeof *x;
     for (int i = 0; ok && i < L; i++) {
         const Layer *l = &m->L[i]; const int r = c->compress_ratio[i];
-        const size_t wb = (size_t)W * hd * sizeof(float);
-        ok = (x->win[i] = (float *)malloc(wb)) && (x->win_pos[i] = (int *)malloc((size_t)W * sizeof(int)));
+        const size_t wb = (size_t)W * v41_row_win(c);   /* a ring row is a code row under the flag */
+        ok = (x->win[i] = (uint8_t *)malloc(wb)) && (x->win_pos[i] = (int *)malloc((size_t)W * sizeof(int)));
         if (!ok) break;
         memcpy(x->win[i], l->window, wb); memcpy(x->win_pos[i], l->window_pos, (size_t)W * sizeof(int));
         *bytes += wb + (size_t)W * sizeof(int);
@@ -5818,7 +5841,7 @@ static int v41_ps_take(Model *m, const int *ids, int np, int held) {
     const int W = c->window, hd = c->head_dim;
     for (int i = 0; i < c->n_layers; i++) {
         Layer *l = &m->L[i]; const int r = c->compress_ratio[i];
-        memcpy(l->window, x->win[i], (size_t)W * hd * sizeof(float));
+        memcpy(l->window, x->win[i], (size_t)W * v41_row_win(c));
         memcpy(l->window_pos, x->win_pos[i], (size_t)W * sizeof(int));
         if (c->kv_source[i] && r > 1 && x->cs_kv[i]) {
             memcpy(l->cstate_kv, x->cs_kv[i], (size_t)r * hd * sizeof(float));

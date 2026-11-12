@@ -47,8 +47,13 @@
 /* Rows of a cache by position: row t of head h at base + h * head_stride + t * row, t < rows. A
  * compressed cache keeps a row for `per` positions (0 or 1: a row a position): row j once the
  * positions [j * per, (j + 1) * per) are read, the group still filling being the engine's state;
- * the block's tokens must be a multiple of it. */
-typedef struct { void *base; size_t row; int rows, heads; size_t head_stride; int per; } ColiPsPart;
+ * the block's tokens must be a multiple of it. A part whose rows are NOT one array says so with
+ * `rows_io`: rows [row0, row0 + n) then come from (or go to) `buf`, n * row bytes, through it
+ * (a mirror of block-wide sections, where a row's bytes are not 2048 B from its block's start
+ * as its neighbour's are). Then `row` is a row's STAGING width and `heads`/`head_stride` do
+ * not apply: the store copies what the part writes. */
+typedef void (*ColiPsRowsIo)(void *base, int row0, int n, char *buf, int out);
+typedef struct { void *base; size_t row; int rows, heads; size_t head_stride; int per; ColiPsRowsIo rows_io; } ColiPsPart;
 
 typedef struct {
     int parent;                 /* the block before (-1: the prompt's first) */
@@ -198,6 +203,11 @@ static inline void coli_ps_rows(const ColiPsPart *parts, int nparts, int t0, int
         const int per = coli_ps_per(q);
         const size_t len = (size_t)(n / per) * q->row;
         if (!len) continue;
+        if (q->rows_io) {   /* rows that are not one array: the part moves them itself */
+            q->rows_io(q->base, t0 / per, n / per, buf, out);
+            buf += len;
+            continue;
+        }
         for (int h = 0; h < q->heads; h++) {
             char *a = (char *)q->base + (size_t)h * q->head_stride + (size_t)(t0 / per) * q->row;
             if (out) memcpy(buf, a, len); else memcpy(a, buf, len);
