@@ -193,6 +193,23 @@ python3 c/tools/convert_qwen36.py --model /path/to/hf-checkpoint \
 SNAP=/path/to/converted-with-mtp Q36_MTP=1 ./c/qwen36 8 4 "Explain speculative decoding."
 ```
 
+**A dense model's GGUF (Qwen3.8-27B).** llama.cpp writes the head as one more
+layer, `blk.<n_layers>` with `nextn_predict_layers` 1: the decoder layer's
+tensors under their usual names and `nextn.eh_proj`, `nextn.enorm`,
+`nextn.hnorm` and `nextn.shared_head_norm` for `mtp.fc` and the three head
+norms (each stored as 1 + w, as the trunk's are). `Q36_MTP=1` reads it from the
+file the container links; its MLP is the layer's dense gate, up and down with no
+router and no gate. On the CUDA chain it runs on the card, its matrices placed
+as the trunk's. unsloth's UD-Q3_K_XL and UD-Q4_K_XL files carry the head; their
+UD-IQ2_XXS does not. Measured on the 27B, greedy, thinking off, every text
+identical to plain decoding:
+
+| | code | prose |
+|---|---|---|
+| CPU (Ryzen 7 8700GE, UD-Q3_K_XL): plain / one draft / three | 3.27 / 4.99 / 6.02 tok/s | 3.40 / 4.88 / 5.10 tok/s |
+| one draft, drafts accepted | 97.5 % | 80.7 % |
+| RTX PRO 4000 SFF (UD-Q4_K_XL, whole card): plain / two drafts / three | 20.7 / 43.4 / 45.0 tok/s | 20.6 / 30.9 / 30.0 tok/s |
+
 The computation follows Qwen's MTP module: at position p, concatenate the
 normalized embedding of token p+1 with the normalized backbone output h_p,
 then `mtp.fc`, one gated full-attention decoder layer with its own KV cache,

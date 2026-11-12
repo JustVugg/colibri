@@ -1328,6 +1328,8 @@ jobs:
           # the same prompt. Wrong reuse is silent, so the gate is the only
           # thing between it and a user.
           OLMOE_TINY=olmoe_tiny_c python3 -m unittest -v tests.test_olmoe_prefix_serve
+          # the prefix store: another system prompt's turn in between, another slot
+          OLMOE_TINY=olmoe_tiny_c python3 -m unittest -v tests.test_olmoe_prefix_store
       - name: "Brio over serve: snapshot scoring is exact, and invisible to chat"
         run: |
           cd c
@@ -1407,7 +1409,7 @@ jobs:
           SNAP=dsv41_tiny COLI_MODEL_MIRROR=dsv41_divergent ./deepseek_v41 8 dsv41_tiny/ref.json > divergent.txt 2>divergent.err
           cmp primary.txt divergent.txt
           grep -q "header differs from the primary copy" divergent.err
-      - name: KV prefix reuse (opt-in here) and the resumed-prefill exactness
+      - name: KV prefix reuse (opt-in here), the resumed-prefill exactness and the prefix store
         run: |
           cd c
           # Two gates in one file. The first is exactness and is ours: a prefill
@@ -1419,6 +1421,10 @@ jobs:
           DSV41_TINY=dsv41_tiny python3 -m unittest -v tests.test_dsv41_prefix_serve
           DSV41_TINY=dsv41_tiny python3 -m unittest -v tests.test_dsv41_prefill_tail
           DSV41_TINY=dsv41_tiny python3 -m unittest -v tests.test_dsv41_dspark_gate
+          # The prefix store: what a prompt read is kept by content, and a new conversation
+          # on the same system prompt or a conversation's next turn takes it with the
+          # logits a cold read gives, to the last digit.
+          DSV41_TINY=dsv41_tiny python3 -m unittest -v tests.test_dsv41_prefix_store
       - name: "A prompt longer than one block, so the block boundary is crossed"
         run: |
           cd c
@@ -1553,6 +1559,9 @@ jobs:
             tests.test_qwen38_prefix_serve
           python3 tools/make_edge_tiny_tokenizer.py --vocab-size 64 qwen38_tiny_fp8
           QWEN38_TINY=qwen38_tiny_fp8 python3 -m unittest -v tests.test_qwen38_brio tests.test_qwen38_prefix_serve
+          # the prefix store: a stored prefix's logits a fresh read's, the MTP head's rows kept too
+          # (qwen38_tiny_mtp and its tokenizer: the MTP step above)
+          QWEN38_TINY=qwen38_tiny QWEN38_TINY_MTP=qwen38_tiny_mtp python3 -m unittest -v tests.test_qwen38_prefix_store
 
   laya-tiny-check:
     name: Laya tiny oracle (vs the laya package) and POST /v1/systemone end to end
@@ -1724,6 +1733,10 @@ jobs:
           # the only gate that would catch it. Needs the fixture above, which is
           # why it runs here and not in `make check`.
           INKLING_TINY=tiny_inkling python3 -m unittest -v tests.test_inkling_prefix_serve
+          # the prefix store: a new conversation on the same system prompt and a conversation
+          # back after another took the slot take what an earlier prompt read, every step's
+          # logits a fresh read's
+          INKLING_TINY=tiny_inkling python3 -m unittest -v tests.test_inkling_prefix_store
       - name: "Brain tab: HITS after every turn, on the grid EMAP declared"
         run: |
           cd c
@@ -2194,7 +2207,7 @@ jobs:
       # rieseguiva un binario non strumentato. Uno di quei test era rosso da
       # settimane senza che nessuno potesse vederlo.
       - name: Build the engines those tests exercise
-        run: make -C c kimi_k3 inkling colibri olmoe qwen38 qwen36 deepseek_v41 qwenimage
+        run: make -C c kimi_k3 inkling colibri olmoe qwen38 qwen36 deepseek_v41 qwenimage glm53 mimo
       - name: Python test suite
         run: cd c && python3 -m unittest discover -s tests -p 'test_*.py'
 

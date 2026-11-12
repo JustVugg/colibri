@@ -445,7 +445,8 @@ and costs the contention. Anything that tries again has to start from that.
 
 | variable | default | what it does |
 |---|---|---|
-| `COLI_KV_PREFIX` | **off on this engine** | `1` reuses the previous turn's state when the new prompt begins with what that state was built from, instead of re-reading the transcript. Off by default here and on nowhere else: see "Reusing a turn" below for what it costs. |
+| `COLI_KV_PREFIX` | **off on this engine** | `1` reuses the previous turn's state when the new prompt begins with what that state was built from, instead of re-reading the transcript. Off by default here and on nowhere else: see "Reusing a turn" below for what it costs. `0` turns the prefix store off too. |
+| `COLI_PREFIX_STORE` | on | every prompt read is kept by content (see "The prefix store" below): a new conversation on the same system prompt, or a conversation's next turn, reads only what follows the deepest place an earlier prompt was kept, with the logits a cold read gives. `0` off; `COLI_PREFIX_STORE_MB` its budget, `COLI_PREFIX_STORE_BLOCK` its block ([ENVIRONMENT.md](ENVIRONMENT.md)). |
 | `V41_STATS` | off | per-turn accounting on stderr: the n-gram cache, the expert bytes and their rate, and how many drafts were accepted. Off by default because `coli chat` shows the engine's stderr next to the answer. |
 | `V41_READ_DEPTH` | 8 | expert tensors read at once when a step misses the cache (see above). `1` restores the serial read the engine used to do, for an A/B. |
 | `COLI_MODEL_MIRROR` | unset | `;`/`,`-separated read-only copies of the checkpoint on other drives; expert reads split across the primary and every replica (see above). `SNAP_MIRROR` is the legacy alias. |
@@ -791,6 +792,55 @@ forward past position 0, which a resumed prefill overflows; `spec_step` decided
 0, so a resumed prefill fell into the drafting path with no draft buffer; and the
 record follows the speculative rollback, so it never claims rows the caches gave
 back.
+
+## The prefix store: a new conversation, and the next turn, without reading again
+
+Resuming the live state is opt-in here (above), and nothing can wind back the window rings
+or the compressor's filling group: so every request read its whole prompt. An agent
+starts each task as a new conversation on the same system prompt and tools, and a chat
+client resends the conversation every turn, so most of what a request read had been read
+before. `prefix_store.h` keeps it (qwen36 does the same, [qwen36.md](qwen36.md#the-prefix-store)):
+
+- **What is kept.** The compressed rows and index keys in blocks of 256 tokens named by
+  their tokens and the block before them (a row for `ratio` positions: 64 a block at
+  ratio 4, 2 at ratio 128), shared by every prompt that starts with them; and
+  checkpoints of the rest, every layer's window ring and its positions, the
+  compressor's filling group and the layer whose index keys were published last. The
+  engram history is the prompt's ids again, so it is rebuilt rather than kept.
+- **Where.** A prompt is read in pieces where its messages start (`<｜User｜>`,
+  `<｜Assistant｜>`, `<｜System｜>`): at the first one past what the slot held (after a new
+  conversation's system prompt, where the next conversation parts from it) and at the
+  last one, and a checkpoint is kept after each piece and where the prompt ends.
+- **Only a prompt read's.** A request that started from nothing or from the store
+  keeps what it reads; one that resumed the live state (`COLI_KV_PREFIX=1`: a decoded
+  reply in it) or a photo keeps nothing. A request takes the deepest checkpoint its
+  prompt starts with when it reaches further than its slot, two positions short of the
+  prompt's end at most: a single position read alone would score its index keys against
+  the keys published last, as a decoded one does. So taking a checkpoint is a resumed
+  prefill, which is exact: the logits are the ones the same prompt read cold gives.
+- **What it serves.** A new conversation on the same system prompt reads only its own
+  message; a conversation's next turn reads from where its last prompt ended (the
+  reply and the new message; with a thinking-mode reply, whose opening `<think>` the
+  next prompt writes as `</think>`, from where its last message started); a
+  conversation sent back to the other slot the same.
+- **Not kept or taken** for a picture's prompt (its placeholders are the same for every
+  picture) or a read-out (`logprobs`: every position's frame).
+
+A prompt's top-k lists and candidate masks are not in a checkpoint: the rows read past
+it publish their own before any layer reads them (a decoded position would read the last
+forward's, and nothing here resumes one). Leaving out any of the window rings, the
+filling group, the rows or the engram history makes `tests/test_dsv41_prefix_store.py`
+fail; leaving out those lists does not.
+
+`tests/test_dsv41_prefix_store.py` holds every request that took the store to a fresh
+engine reading the same prompt with the store off, each step's top five logits to the
+last digit: a new conversation on the same system prompt, a conversation's next turn
+after another, two slots with the conversation on the other one, the speculative
+decoder on (the same bytes), a budget of nothing, the store off, a request that resumed
+the live state keeping nothing, a read-out reading everything. `DSV41_PS_BACKEND=vulkan`
+and `cuda` run both engines on that chain, the same top five within 1e-4: Lavapipe in
+`tests/vulkan_engines.sh` (the safetensors fixture and the GGUF one), the CUDA chain on
+an RTX PRO 4000 (a GGUF's).
 
 ## How it is tested
 

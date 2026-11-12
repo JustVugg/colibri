@@ -1467,7 +1467,23 @@ static int sample_prob_desc(const void *a, const void *b){
     if(x->p!=y->p) return x->p>y->p?-1:1;
     return (x->id>y->id)-(x->id<y->id);
 }
+/* COLI_LOGIT_DUMP=1: each served step's top five id:logit to stderr, as sample.h's pick_tok writes them
+ * (comparing two configurations on the same context: a stored prefix against a fresh read) */
+static void serve_logit_dump(const float *lo, int V){
+    static int dump=-1;
+    if(dump<0)dump=getenv("COLI_LOGIT_DUMP")?1:0;
+    if(!dump)return;
+    int id[5]={-1,-1,-1,-1,-1};float v[5]={-3e38f,-3e38f,-3e38f,-3e38f,-3e38f};
+    for(int t=0;t<V;t++){
+        const float x=lo[t];
+        for(int k=0;k<5;k++)if(x>v[k]){for(int j=4;j>k;j--){v[j]=v[j-1];id[j]=id[j-1];}v[k]=x;id[k]=t;break;}
+    }
+    fprintf(stderr,"[LOGITS]");
+    for(int k=0;k<5;k++)fprintf(stderr," %d:%.6f",id[k],v[k]);
+    fprintf(stderr,"\n");
+}
 static int serve_sample(const float *lo, int V, float temp, float top_p){
+    serve_logit_dump(lo, V);
     if(temp<=0.f) return argmax_first(lo, V);
     float *p=malloc((size_t)V*sizeof(float)); SampleProb *head=malloc((size_t)V*sizeof(SampleProb)); float mx=lo[0];
     if(!p||!head){ fprintf(stderr,"OOM sampling\n"); exit(1); }
@@ -2136,9 +2152,11 @@ static void q38_unpark(Model *m){
     m->kvp.len=g_q38_park.len;m->kvp.tainted=0;m->kv_len=g_q38_park.kv_len;
 #ifdef COLI_VULKAN
     q38c_rollback(m,-1,0);
+    q38c_mtp_host(m,0);   /* the MTP head's mirror held the request's rows */
 #endif
 #ifdef COLI_CUDA
     q38cc_rollback(m,-1,0);
+    q38cc_mtp_host(m,0);
 #endif
     if(getenv("COLI_PREFIX_LOG"))fprintf(stderr,"[PREFIX] the %d-token conversation is back\n",g_q38_park.len);
     q38_park_free_rows();
@@ -2164,6 +2182,114 @@ static void q38_park_decide(Model *m,const int *ids,int np,int max_tok){
                        "(%d of its tokens against the parked one's %d)\n",g_q38_park.len,b,a);
     q38_prefix_cache_dispose(&g_q38_park.snap);memset(&g_q38_park.snap,0,sizeof g_q38_park.snap);
     q38_park_free_rows();
+}
+
+/* ---- every prompt read, kept by content for later requests (prefix_store.h) -----------------
+ * The live state, the prompt-end snapshot, the system prompt's pin (q38_head_pin) and a parked
+ * conversation each hold one place, and the pins only the recurrent state: their rows must still be
+ * where they were. An agent that alternates two system prompts, a conversation that comes back
+ * after another took the slot, one the gateway sends to the other slot: each read its prompt
+ * again. The store keeps the attention layers' K/V and index rows (the MTP head's too) in blocks
+ * named by their tokens, shared by every prompt that starts with them, and checkpoints of the
+ * rest (the DeltaNet recurrences and conv windows, the PLE ring and history, the MTP head's
+ * place: a pin's state) where a prompt's messages start and where a turn ends. A request takes the
+ * deepest checkpoint its prompt starts with when it reaches further than what the slot holds, in
+ * any slot. The MTP head's rows stand below its own length: a checkpoint is kept only when its
+ * whole blocks hold every head row (a block other prompts share must be whole). COLI_PREFIX_STORE=0
+ * or COLI_KV_PREFIX=0 off; COLI_PREFIX_STORE_MB, COLI_PREFIX_STORE_BLOCK as on qwen36. Off for a
+ * picture's prompt and a read-out (logprobs). */
+#include "prefix_store.h"
+static ColiPrefixStore g_q38_ps;
+static int g_q38_ps_init;
+static int q38_ps_on(const Model *m){
+    if(!g_q38_ps_init){
+        const char *e=getenv("COLI_KV_PREFIX");
+        g_q38_ps_init=1;
+        coli_ps_init_env(&g_q38_ps,e&&*e=='0',compat_mem_available_gb()*1024.0);
+    }
+    return g_q38_ps.on&&!(m->vis_map&&m->vis_rows_n>0);
+}
+/* the store's budget, decided when the engine plans its RAM: a tier's host pool leaves it (ram_later) */
+static size_t q38_ps_plan(const Model *m){ q38_ps_on(m); return g_q38_ps.on?g_q38_ps.budget:0; }
+/* every attention layer's K and V rows (head by head) and index keys, the MTP head's with them */
+static int q38_ps_parts(const Model *m,ColiPsPart *parts){
+    const Cfg *c=&m->c;const size_t D=(size_t)c->head_dim*sizeof(float),ID=(size_t)c->idx_dim*sizeof(float);
+    int n=0;
+    for(int i=0;i<q38_layer_rows(m);i++){
+        if(!m->K[i]||!m->V[i]||!m->IK[i])continue;
+        parts[n++]=(ColiPsPart){m->K[i],D,m->kv_cap,c->kv_heads,(size_t)m->kv_cap*D,1};
+        parts[n++]=(ColiPsPart){m->V[i],D,m->kv_cap,c->kv_heads,(size_t)m->kv_cap*D,1};
+        parts[n++]=(ColiPsPart){m->IK[i],ID,m->kv_cap,1,0,1};
+    }
+    return n;
+}
+/* ids[0, P) as the Model holds them now, with its state at P (a pin's: the devices' newest first) */
+static void q38_ps_save(Model *m,const int *ids,int P){
+    if(!q38_ps_on(m)||P<g_q38_ps.B||m->kvp.tainted||m->kv_len!=P)return;
+    if(m->mtp&&m->mtp_len<P/g_q38_ps.B*g_q38_ps.B)return;   /* a whole block without its head rows */
+    ColiPsPart *parts=(ColiPsPart*)malloc((size_t)3*q38_layer_rows(m)*sizeof *parts+1);
+    if(!parts)return;
+    const int np=q38_ps_parts(m,parts);
+    Q38PinState *st=NULL;
+    size_t rec=0,conv=0,ple=0;
+    if(q38_prefix_geometry(m,&rec,&conv,&ple)&&q38_pin_state_copy(m,&st,1)){
+        size_t sb=sizeof *st+ple*sizeof(float);
+        for(int i=0;i<m->c.layers;i++)if(!m->c.is_attn[i])sb+=(rec+conv)*sizeof(float);
+        coli_ps_save(&g_q38_ps,ids,P,parts,np,st,sb,q38_pin_state_free,compat_mem_available_gb()*1024.0);
+    }else q38_pin_state_free(st);
+    free(parts);
+}
+/* The deepest prefix the store holds of ids[0, np), when it reaches past `held` positions: its rows
+ * and state put back, the record and the chains told. The positions now held; 0 when nothing. */
+static int q38_ps_take(Model *m,const int *ids,int np,int held){
+    if(!q38_ps_on(m)||np<2)return 0;
+    ColiPsPart *parts=(ColiPsPart*)malloc((size_t)3*q38_layer_rows(m)*sizeof *parts+1);
+    if(!parts)return 0;
+    const int nparts=q38_ps_parts(m,parts);
+    if(!coli_ps_layout(&g_q38_ps,parts,nparts)){free(parts);return 0;}
+    ColiPsHit h;
+    const int P=coli_ps_lookup(&g_q38_ps,ids,np,np-1,1,&h);
+    Q38PinState *st=P>0&&h.ck>=0?(Q38PinState*)g_q38_ps.ck[h.ck].state:NULL;
+    if(P<=held+coli_ps_min_gain(&g_q38_ps)||!st||st->n_layers!=m->c.layers||(m->mtp&&!st->mtp_pend)||P>m->kv_cap||
+       !coli_ps_parts_hold(parts,nparts,P)){coli_ps_hit_free(&h);free(parts);return 0;}
+    q38_prefix_settle(m);   /* the chain's prompt-end snapshot is the host's before the state moves */
+    /* the whole blocks the slot holds already (its record shares them with the prompt; the MTP
+     * head's rows stand below its own length) stay in place, on the host and in the mirrors */
+    int keep=kv_prefix_common(&m->kvp,ids,np);
+    if(keep>m->kv_len)keep=m->kv_len;
+    if(m->mtp&&keep>m->mtp_len)keep=m->mtp_len;
+    coli_ps_load_from(&g_q38_ps,&h,parts,nparts,keep);
+    keep=coli_ps_kept(&g_q38_ps,&h,keep);
+    free(parts);
+    q38_pin_state_copy(m,&st,0);
+    m->kv_len=P;
+    kv_prefix_clear(&m->kvp);
+    kv_prefix_record(&m->kvp,ids,0,P);
+#ifdef COLI_VULKAN
+    q38c_rollback(m,-1,keep);   /* the mirrors' watermarks to what stayed: the rows past it go up again */
+    q38c_mtp_host(m,keep);      /* the MTP head's layer too, which the rollback leaves */
+#endif
+#ifdef COLI_CUDA
+    q38cc_rollback(m,-1,keep);
+    q38cc_mtp_host(m,keep);
+#endif
+    if(getenv("COLI_PREFIX_LOG")){
+        fprintf(stderr,"[PREFIX] %d of %d prompt tokens from the store (%d blocks of %d and a checkpoint, %d rows in place; the slot held %d)\n",
+                P,np,h.depth,g_q38_ps.B,keep,held);
+        fflush(stderr);
+    }
+    coli_ps_hit_free(&h);
+    return P;
+}
+/* where a prompt read from `from` keeps checkpoints (coli_ps_marks): where its messages start */
+static int q38_ps_marks(const Model *m,const int *ids,int np,int from,int *marks){
+    static int start_id=-2;
+    if(start_id==-2){
+        start_id=-1;
+        for(int k=0;k<g_nspecial&&g_sp_str&&start_id<0;k++)if(!strcmp(g_sp_str[k],"<|im_start|>"))start_id=g_sp_id[k];
+    }
+    if(start_id<0||!q38_ps_on(m))return 0;
+    return coli_ps_marks(ids,np,from,g_q38_ps.B,&start_id,1,marks);
 }
 
 /* Where a chat prompt's answer starts: past its last "<|im_start|>assistant\n", when only the
@@ -2243,6 +2369,18 @@ static float *q38_serve_prefill_at(Model *m,const int *ids,int from,int np,ColiP
         q38_head_pin(m,ids,h,lo);
         free(lo);
         from=h;
+        q38_ps_save(m,ids,from);
+    }
+    if(snap_ok){   /* in pieces where its messages start, the state there kept for later requests (q38_ps_save) */
+        int marks[2],nm=q38_ps_marks(m,ids,np,from,marks);
+        for(int k=0;k<nm;k++){
+            if(marks[k]<=from)continue;
+            float *lo=q38_serve_prefill(m,ids,from,marks[k],ctl);
+            if(!lo)return NULL;
+            free(lo);
+            from=marks[k];
+            q38_ps_save(m,ids,from);
+        }
     }
     const int a=snap_ok?q38_answer_start(ids,np):-1;
     if(a<=from)return q38_serve_prefill(m,ids,from,np,ctl);
@@ -2376,6 +2514,12 @@ static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
         }
     }
     if(!reuse&&!prefix_off){ reuse=q38_prefix_restore(m,ids,np); reused_from="the prompt-end snapshot"; }
+    /* the prompt the store holds further than the slot does: another conversation's on the same
+     * system prompt, this one's before another took the slot or on the other slot (q38_ps_take) */
+    if(!q->logprobs&&!prefix_off&&!(m->vis_map&&m->vis_rows_n>0)){
+        int got=q38_ps_take(m,ids,np,reuse);
+        if(got){reuse=got;pin_lo=NULL;reused_from="the store";}
+    }
     if(getenv("COLI_PREFIX_LOG")){
         if(reuse)
             fprintf(stderr,"[PREFIX] reusing %d of %d prompt tokens (%.0f%%) from %s\n",
@@ -2549,6 +2693,13 @@ static int serve_one_turn(Model *m, ServeReq *q){
     if(profile_bytes>0)fwrite(profile,1,(size_t)profile_bytes,stdout);
     else fprintf(stderr,"[qwen38] internal error: PROF frame overflow\n");
     fflush(stdout);
+    /* the conversation as the turn left it, for its next turn after another took the slot (one as
+     * long as a parked one at least: COLI_PARK_MIN) */
+    {
+        const char *mn=getenv("COLI_PARK_MIN");
+        const int least=mn&&atoi(mn)>0?atoi(mn):Q38_PARK_MIN;
+        if(m->kv_len>=least&&m->kvp.len==m->kv_len)q38_ps_save(m,m->kvp.fed,m->kv_len);
+    }
     serve_hits(m);
     q38_tm_report_bank(&timers,"request");
     {char scope[96];snprintf(scope,sizeof scope,"turn %s",q->id);q38_spec_report(m,&spec,scope);q38_vocab_report(m,scope);}
@@ -2653,6 +2804,12 @@ static void q38_mux_finish(Model *m,Q38MuxReq *r){
     fflush(stdout);
     serve_hits(m);
     q38_tm_report_bank(&timers,"request");
+    /* the slot's conversation as the turn left it, for its next turn on another slot (one as long
+     * as a parked one at least: COLI_PARK_MIN) */
+    q38_mux_bind(m,r->q.slot);
+    const char *mn=getenv("COLI_PARK_MIN");
+    const int least=mn&&atoi(mn)>0?atoi(mn):Q38_PARK_MIN;
+    if(m->kv_len>=least&&m->kvp.len==m->kv_len)q38_ps_save(m,m->kvp.fed,m->kv_len);
 }
 
 /* The next token of an active request, as serve_one's loop picks and sends it: 1
@@ -2802,11 +2959,11 @@ static void serve_loop(Model *m){
     printf("STAT 0 0.00 0.0 %.2f\n",rss_gb());
     fflush(stdout);
     serve_emap(m);                       /* after READY and STAT: the boot reader discards what precedes them */
-    if(g_q38_mux_slots>1){serve_mux(m);q38_mux_free(m);return;}
+    if(g_q38_mux_slots>1){serve_mux(m);q38_mux_free(m);coli_ps_report(&g_q38_ps);return;}
     for(;;){
         ServeReq q={0}; int r;
         do r=serve_read_req(stdin,stdout,&q,NULL); while(r!=2&&r>=0);
-        if(r<0){q38_prefix_cache_release(m);return;}
+        if(r<0){q38_prefix_cache_release(m);coli_ps_report(&g_q38_ps);return;}
         if(r==2){
             int status=serve_one(m,&q);free(q.payload);
 #ifdef COLI_CUDA
@@ -2817,7 +2974,7 @@ static void serve_loop(Model *m){
             q38c_report(m);
             vkt_report("turn", m->hits, m->miss);
 #endif
-            if(status<0){q38_prefix_cache_release(m);return;}
+            if(status<0){q38_prefix_cache_release(m);coli_ps_report(&g_q38_ps);return;}
             serve_emap(m);
         }
     }
@@ -3271,9 +3428,10 @@ int main(int argc, char **argv) {
 #endif /* QWEN38_TEST_SERVE */
 #endif /* !QWEN38_NO_MAIN || QWEN38_TEST_SERVE */
 #if defined(QWEN38_NO_MAIN) && !defined(QWEN38_TEST_SERVE)
-/* q38_state_later (above) counts what a serve allocates once it runs; a test build has no
- * serve, and the tier's start (below) still asks */
+/* q38_state_later and q38_ps_plan (above) count what a serve allocates once it runs; a test
+ * build has no serve, and the tier's start (below) still asks */
 static size_t q38_state_later(Model *m){ (void)m; return 0; }
+static size_t q38_ps_plan(const Model *m){ (void)m; return 0; }
 #endif
 
 static int q38_u64_mul(uint64_t left,uint64_t right,uint64_t *out){
@@ -3732,7 +3890,7 @@ static void q38_vk_tier_start(Model *m,int cap){
                   .max_rows=q38_moe_prefill_rows(c,q38_prefill_batch_rows())*c->topk,
                   .ram_reserve=q38_vk_tier_ram_reserve(m,cap,ram_expert,igpu),
                   .ram_floor=q38_vk_tier_ram_reserve(m,c->topk,ram_expert,igpu),.ram_given=q38_vk_ram_given,
-                  .ram_later=q38_state_later(m),
+                  .ram_later=q38_state_later(m)+q38_ps_plan(m),
                   .dense_bytes=q38_vk_dense_bytes(m),
                   .chain_bytes=g_vk_chain?q38c_late_bytes(m,q38_vk_chain_ctx(m)):0,
                   .stage=g_vk_chain,   /* the chain stages a prompt chunk's host pool experts */

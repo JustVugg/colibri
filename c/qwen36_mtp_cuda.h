@@ -52,14 +52,27 @@ static ColiCudaTensor *q36_mc_expert(int dev, const QW *w, int *fmt) {
     return NULL;
 }
 
+/* A dense QW on the chain's device: a GGUF matrix as the tier places the trunk's (qdw_place, its
+ * ggml blocks), else q36cc_qw_tensor's int8 rows or f32 copy */
+static ColiCudaTensor *q36_mc_qw(int dev, const QW *w) {
+    if (w->gq) {
+        int h = qdw_place(w, dev), d = -1;
+        ColiCudaTensor *t = h ? qt_dense_tensor(h - 1, &d) : NULL;
+        return t && d == dev ? t : NULL;
+    }
+    return q36cc_qw_tensor(dev, w);
+}
+
 static int q36_mc_init(Model *m) {
     Q36MtpCuda *g = &g_q36_mc; Q36Mtp *p = &g_q36_mtp; Cfg *c = &m->c;
     if (g->on) return 1;
     if (g->failed) return 0;
     Q36CChain *ch = q36cc_of(m);
     const char *e = getenv("Q36_MTP_GPU");
-    if ((e && *e == '0') || !g_cuda_chain || !ch || !ch->ok || ch->failed || !cc_moe_ready() || m->mpos || m->rope_delta ||
-        p->E > CC_ROUTE_EMAX || p->K > CC_ROUTE_KMAX || p->I > CC_MOE_DIM_MAX || c->hidden > CC_MOE_DIM_MAX) { g->failed = 1; return 0; }
+    /* a dense model's head (E 0) has no router and no experts: its MLP is the shared expert's three matrices */
+    if ((e && *e == '0') || !g_cuda_chain || !ch || !ch->ok || ch->failed || m->mpos || m->rope_delta ||
+        (p->E && (!cc_moe_ready() || p->E > CC_ROUTE_EMAX || p->K > CC_ROUTE_KMAX || p->I > CC_MOE_DIM_MAX ||
+                  c->hidden > CC_MOE_DIM_MAX))) { g->failed = 1; return 0; }
     int dev = ch->dev, D = c->hidden, E = p->E, K = p->K, I = p->I, Ish = p->ish, hd = c->head_dim, kvd = c->k_head_dim;
     g->failed = 1;   /* until every piece is up */
     size_t n = 0;
@@ -72,19 +85,19 @@ static int q36_mc_init(Model *m) {
     int ok = q36_mc_res(&g->prm, n, CC_DEV) && cc_begin() && cc_write(g->prm, 0, w, n * 4) && cc_submit(1);
     free(w);
     /* the dense matrices as the chain places the trunk's; the router and the shared expert's gate f32 */
-    g->eh = ok ? q36cc_qw_tensor(dev, &p->eh) : NULL;
-    g->lq = g->eh ? q36cc_qw_tensor(dev, &p->L.q) : NULL; g->lk = g->lq ? q36cc_qw_tensor(dev, &p->L.k) : NULL;
-    g->lv = g->lk ? q36cc_qw_tensor(dev, &p->L.v) : NULL; g->lo = g->lv ? q36cc_qw_tensor(dev, &p->L.o) : NULL;
-    g->shg = g->lo ? q36cc_qw_tensor(dev, &p->sh_g) : NULL; g->shu = g->shg ? q36cc_qw_tensor(dev, &p->sh_u) : NULL;
-    g->shd = g->shu ? q36cc_qw_tensor(dev, &p->sh_d) : NULL;
-    g->rq = g->shd ? q36cc_f32_tensor(dev, p->router, D, E) : NULL;
+    g->eh = ok ? q36_mc_qw(dev, &p->eh) : NULL;
+    g->lq = g->eh ? q36_mc_qw(dev, &p->L.q) : NULL; g->lk = g->lq ? q36_mc_qw(dev, &p->L.k) : NULL;
+    g->lv = g->lk ? q36_mc_qw(dev, &p->L.v) : NULL; g->lo = g->lv ? q36_mc_qw(dev, &p->L.o) : NULL;
+    g->shg = g->lo ? q36_mc_qw(dev, &p->sh_g) : NULL; g->shu = g->shg ? q36_mc_qw(dev, &p->sh_u) : NULL;
+    g->shd = g->shu ? q36_mc_qw(dev, &p->sh_d) : NULL;
+    g->rq = g->shd && E ? q36cc_f32_tensor(dev, p->router, D, E) : NULL;
     g->sq = g->rq ? q36cc_f32_tensor(dev, p->sh_gate, D, 1) : NULL;
-    g->lm = !g->sq ? NULL : p->nvoc ? q36cc_qw_tensor(dev, &p->dvoc) : ch->t_lm;
+    g->lm = !(E ? g->sq : g->shd) ? NULL : p->nvoc ? q36_mc_qw(dev, &p->dvoc) : ch->t_lm;
     ok = g->lm != NULL;
     /* the routed experts, one format, and their table of device addresses */
-    g->ex = ok ? calloc((size_t)3 * E, sizeof *g->ex) : NULL;
-    CcExpert *tab = ok ? calloc((size_t)E, sizeof *tab) : NULL;
-    ok = ok && g->ex && tab;
+    g->ex = ok && E ? calloc((size_t)3 * E, sizeof *g->ex) : NULL;
+    CcExpert *tab = ok && E ? calloc((size_t)E, sizeof *tab) : NULL;
+    ok = ok && (!E || (g->ex && tab));
     g->fmt = 0;
     for (int x = 0; ok && x < E; x++) {
         const QW *qw[3] = {&p->eg[x], &p->eu[x], &p->ed[x]};
@@ -98,8 +111,8 @@ static int q36_mc_init(Model *m) {
              cc_tensor_dev(g->ex[3 * x + 2], &tab[x].d, &tab[x].ds, NULL);
     }
     g->gs = g->fmt == 4 ? 64 : 0;
-    ok = ok && cc_reserve(&g->tab, (size_t)E * sizeof(CcExpert), CC_DEV) && cc_begin() &&
-         cc_write(g->tab, 0, tab, (size_t)E * sizeof(CcExpert)) && cc_submit(1);
+    ok = ok && (!E || (cc_reserve(&g->tab, (size_t)E * sizeof(CcExpert), CC_DEV) && cc_begin() &&
+                       cc_write(g->tab, 0, tab, (size_t)E * sizeof(CcExpert)) && cc_submit(1)));
     free(tab);
     const char *dmp = getenv("Q36_MTP_DUMP");
     if (p->voc && !(cc_matmul_rows_ready() && cc_pick_ready())) {   /* an older backend: the whole vocabulary */
@@ -109,10 +122,11 @@ static int q36_mc_init(Model *m) {
     }
     g->pick_dev = !p->vid && !(dmp && *dmp) && cc_pick_ready();   /* the adaptive list too (never with a dump) */
     ok = ok && (!p->voc || q36_mc_res(&g->vids, c->vocab, CC_DEV)) &&
-         q36_mc_res(&g->lg, E, CC_DEV) && q36_mc_res(&g->gsb, Ish, CC_DEV) && q36_mc_res(&g->us, Ish, CC_DEV) &&
-         q36_mc_res(&g->hs, Ish, CC_DEV) && q36_mc_res(&g->sd, D, CC_DEV) && q36_mc_res(&g->sg, 1, CC_DEV) &&
-         q36_mc_res(&g->ids, K, CC_DEV) && q36_mc_res(&g->wt, K, CC_DEV) && q36_mc_res(&g->rt, D, CC_DEV) &&
-         q36_mc_res(&g->mh, cc_moe_hid_floats(1, K, D, I, E), CC_DEV) && q36_mc_res(&g->fin, D, CC_DEV) &&
+         q36_mc_res(&g->gsb, Ish, CC_DEV) && q36_mc_res(&g->us, Ish, CC_DEV) &&
+         q36_mc_res(&g->hs, Ish, CC_DEV) && q36_mc_res(&g->sd, D, CC_DEV) &&
+         (!E || (q36_mc_res(&g->lg, E, CC_DEV) && q36_mc_res(&g->sg, 1, CC_DEV) &&
+                 q36_mc_res(&g->ids, K, CC_DEV) && q36_mc_res(&g->wt, K, CC_DEV) && q36_mc_res(&g->rt, D, CC_DEV) &&
+                 q36_mc_res(&g->mh, cc_moe_hid_floats(1, K, D, I, E), CC_DEV))) && q36_mc_res(&g->fin, D, CC_DEV) &&
          q36_mc_res(&g->hid, D, CC_DEV) &&
          q36_mc_res(&g->outd, p->nvoc ? p->nvoc : c->vocab, g->pick_dev ? CC_DEV : CC_DOWN) &&
          (!g->pick_dev || q36_mc_res(&g->pick, 2, CC_DOWN));
@@ -123,8 +137,10 @@ static int q36_mc_init(Model *m) {
     }
     g->vids_n = 0; g->vids_gen = 0;
     g->failed = 0; g->on = 1;
-    fprintf(stderr, "[mtp] the head runs on the CUDA chain's device, its experts in the frame (format %d)%s\n", g->fmt,
-            p->voc ? ", drafts score an adaptive vocabulary" : p->vid ? ", drafts score a listed vocabulary" : "");
+    if (E) fprintf(stderr, "[mtp] the head runs on the CUDA chain's device, its experts in the frame (format %d)%s\n", g->fmt,
+                   p->voc ? ", drafts score an adaptive vocabulary" : p->vid ? ", drafts score a listed vocabulary" : "");
+    else fprintf(stderr, "[mtp] the head runs on the CUDA chain's device, its dense MLP beside the trunk's%s\n",
+                 p->voc ? ", drafts score an adaptive vocabulary" : p->vid ? ", drafts score a listed vocabulary" : "");
     return 1;
 }
 /* scratch for R rows, the head's device KV cache at the model's row stride */
@@ -261,13 +277,14 @@ static int q36_mc_row(Model *m, int tok, const float *hid, int pos, float *logit
              cc_matmul(g->lo, g->ctx, 0, g->tmp, 0, 1) &&
              cc_ew(g->x, g->x, g->tmp, NULL, NULL, &add) &&
              q36_mc_norm(g->x, 0, D, g->o_post, g->nrm, 0, D, 1, D, c->eps) &&
-             cc_matmul(g->rq, g->nrm, 0, g->lg, 0, 1) &&
+             (!E || cc_matmul(g->rq, g->nrm, 0, g->lg, 0, 1)) &&
              cc_matmul(g->shg, g->nrm, 0, g->gsb, 0, 1) && cc_matmul(g->shu, g->nrm, 0, g->us, 0, 1) &&
              cc_ew(g->hs, g->gsb, g->us, NULL, NULL, &sw) &&
-             cc_matmul(g->shd, g->hs, 0, g->sd, 0, 1) && cc_matmul(g->sq, g->nrm, 0, g->sg, 0, 1) &&
-             cc_route(g->lg, NULL, g->ids, g->wt, &rp) &&
-             cc_moe(g->tab, g->nrm, g->ids, g->wt, g->mh, g->rt, NULL, &mp) &&
-             cc_ew(g->x, g->x, g->rt, g->sd, g->sg, &cb1) &&
+             cc_matmul(g->shd, g->hs, 0, g->sd, 0, 1) &&
+             (E ? cc_matmul(g->sq, g->nrm, 0, g->sg, 0, 1) && cc_route(g->lg, NULL, g->ids, g->wt, &rp) &&
+                  cc_moe(g->tab, g->nrm, g->ids, g->wt, g->mh, g->rt, NULL, &mp) &&
+                  cc_ew(g->x, g->x, g->rt, g->sd, g->sg, &cb1)
+                : cc_ew(g->x, g->x, g->sd, NULL, NULL, &add)) &&
              q36_mc_norm(g->x, 0, D, g->o_head, g->fin, 0, D, 1, D, c->eps) && cc_copy(g->hid, 0, g->fin, 0, D) &&
              (p->voc ? cc_matmul_rows(g->lm, g->vids, g->fin, g->outd, V) : cc_matmul(g->lm, g->fin, 0, g->outd, 0, 1)) &&
              (!g->pick_dev || cc_pick(g->outd, g->pick, V)) && cc_submit(1);

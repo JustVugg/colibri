@@ -2242,6 +2242,7 @@ static size_t ink_kv_later(const Model *m) {
         b += 2 * (size_t)L_KV(c, i) * (size_t)kv_ring_rows(c, i, t) * (size_t)L_HD(c, i) * sizeof(float);
     return b * (size_t)(g_ink_mux_slots > 1 ? g_ink_mux_slots : 1);
 }
+static size_t ink_ps_plan(void);   /* the prefix store's budget (prefix_store.h), planned with the RAM */
 static void ink_vk_tier_start(Model *m) {
     Cfg *c = &m->c;
     if (!g_vk_ready) return;
@@ -2298,7 +2299,7 @@ static void ink_vk_tier_start(Model *m) {
                         .max_rows = INK_VK_ROWS * c->topk,
                         .ram_reserve = (size_t)slotb * (size_t)m->cache[0].cap * (size_t)nsp,
                         .ram_floor = (size_t)slotb * (size_t)c->topk * (size_t)nsp, .ram_given = ink_vk_ram_given,
-                        .ram_later = ink_kv_later(m),
+                        .ram_later = ink_kv_later(m) + ink_ps_plan(),
                         .dense_bytes = ink_vk_dense_bytes(m),
                         .in_ram = ink_vk_in_ram, .ram_ctx = m,
                         .load = ink_vk_load, .release = ink_vk_unhold, .load_ctx = m, .load_batch = ink_vk_load_batch};
@@ -3312,7 +3313,23 @@ static int pi_desc(const void *a, const void *b) {
     float d = ((const PI*)b)->p - ((const PI*)a)->p;
     return d > 0 ? 1 : d < 0 ? -1 : 0;
 }
+/* COLI_LOGIT_DUMP=1: each served step's top five id:logit to stderr, as sample.h's pick_tok writes them
+ * (comparing two configurations on the same context: a stored prefix against a fresh read) */
+static void serve_logit_dump(const float *lo, int V) {
+    static int dump = -1;
+    if (dump < 0) dump = getenv("COLI_LOGIT_DUMP") ? 1 : 0;
+    if (!dump) return;
+    int id[5] = {-1, -1, -1, -1, -1}; float v[5] = {-3e38f, -3e38f, -3e38f, -3e38f, -3e38f};
+    for (int t = 0; t < V; t++) {
+        const float x = lo[t];
+        for (int k = 0; k < 5; k++) if (x > v[k]) { for (int j = 4; j > k; j--) { v[j] = v[j - 1]; id[j] = id[j - 1]; } v[k] = x; id[k] = t; break; }
+    }
+    fprintf(stderr, "[LOGITS]");
+    for (int k = 0; k < 5; k++) fprintf(stderr, " %d:%.6f", id[k], v[k]);
+    fprintf(stderr, "\n");
+}
 static int sample_logits(const float *logit, int n, float temp, float top_p) {
+    serve_logit_dump(logit, n);
     int best = 0;
     for (int i = 1; i < n; i++) if (logit[i] > logit[best]) best = i;
     if (temp <= 0.f) return best;
@@ -3536,6 +3553,139 @@ static void ink_park_decide(Model *m, const int *ids, int np, int max_tok, int a
     else if (d < 0) coli_park_free(&g_ink_park);
 }
 
+/* ---- every prompt read, kept by content for later requests (prefix_store.h) -----------------
+ * Most layers attend a sliding window kept as a ring and every layer carries short convolutions:
+ * neither can be wound back, so the slot resumes only from the end of what it holds (or a pin,
+ * whose global rows must still be in the slot). An agent's new conversation on the same system
+ * prompt read its whole prompt again; so did a conversation back after another took the slot. The
+ * store keeps the global layers' K/V rows in blocks named by their tokens, shared by every prompt
+ * that starts with them, and checkpoints of the rest (the sliding layers' rings, every layer's four
+ * convolution banks) where a prompt's messages start (<|message_system|>, <|message_user|>,
+ * <|message_model|>, <|message_tool|>) and where a turn ends. A request takes the deepest checkpoint
+ * its prompt starts with when it reaches further than the slot. COLI_PREFIX_STORE=0 or
+ * COLI_KV_PREFIX=0 off; COLI_PREFIX_STORE_MB, COLI_PREFIX_STORE_BLOCK as on qwen36. Not for audio,
+ * a pin or a read-out. */
+#include "prefix_store.h"
+static ColiPrefixStore g_ink_ps;
+static int g_ink_ps_init;
+static int ink_ps_on(void) {
+    if (!g_ink_ps_init) {
+        const char *e = getenv("COLI_KV_PREFIX");
+        g_ink_ps_init = 1;
+        coli_ps_init_env(&g_ink_ps, e && *e == '0', compat_mem_available_gb() * 1024.0);
+    }
+    return g_ink_ps.on;
+}
+/* the store's budget, decided when the engine plans its RAM: a tier's host pool leaves it (ram_later) */
+static size_t ink_ps_plan(void) { ink_ps_on(); return g_ink_ps.on ? g_ink_ps.budget : 0; }
+/* the global layers' K and V rows, head by head */
+static int ink_ps_parts(Model *m, ColiPsPart *parts) {
+    Cfg *c = &m->c; int n = 0;
+    for (int i = 0; i < c->n_layers; i++) {
+        const int rows = kv_ring_rows(c, i, m->max_t);
+        if (!m->K || !m->V || rows != m->max_t) continue;   /* a ring: the checkpoint's */
+        const int kv = L_KV(c, i), hd = L_HD(c, i);
+        const size_t row = (size_t)hd * sizeof(float), hs = (size_t)rows * row;
+        parts[n++] = (ColiPsPart){m->K[i], row, rows, kv, hs, 1};
+        parts[n++] = (ColiPsPart){m->V[i], row, rows, kv, hs, 1};
+    }
+    return n;
+}
+typedef struct { InkPinState *cs; float **rk, **rv; int n_layers; } InkPsState;
+static void ink_ps_state_free(void *v) {
+    InkPsState *x = (InkPsState *)v;
+    if (!x) return;
+    ink_pin_state_free(x->cs);
+    for (int i = 0; i < x->n_layers; i++) { if (x->rk) free(x->rk[i]); if (x->rv) free(x->rv[i]); }
+    free(x->rk); free(x->rv); free(x);
+}
+/* the convolution banks (a pin's state) and the sliding layers' rings */
+static InkPsState *ink_ps_state_save(Model *m, size_t *bytes) {
+    Cfg *c = &m->c; const int L = c->n_layers;
+    InkPsState *x = (InkPsState *)calloc(1, sizeof *x);
+    if (!x) return NULL;
+    x->n_layers = L;
+    int ok = (x->cs = ink_pin_state_save(m, NULL)) != NULL && (x->rk = (float **)calloc((size_t)L, sizeof(float *))) &&
+             (x->rv = (float **)calloc((size_t)L, sizeof(float *)));
+    *bytes = sizeof *x;
+    for (int i = 0; ok && i < L; i++) {
+        *bytes += (size_t)ink_cs_cells(c, 0, i) * 2 * sizeof(float) + (size_t)ink_cs_cells(c, 2, i) * 2 * sizeof(float);
+        const int rows = kv_ring_rows(c, i, m->max_t);
+        if (rows == m->max_t) continue;
+        const size_t rb = (size_t)L_KV(c, i) * rows * L_HD(c, i) * sizeof(float);
+        ok = (x->rk[i] = (float *)malloc(rb)) && (x->rv[i] = (float *)malloc(rb));
+        if (!ok) break;
+        memcpy(x->rk[i], m->K[i], rb); memcpy(x->rv[i], m->V[i], rb);
+        *bytes += 2 * rb;
+    }
+    if (!ok) { ink_ps_state_free(x); return NULL; }
+    return x;
+}
+/* ids[0, P) as the Model holds them now, with its rings and banks (a chain's step leaves them on the
+ * host too) */
+static void ink_ps_save(Model *m, const int *ids, int P) {
+    if (!ink_ps_on() || P < g_ink_ps.B || m->kvp.tainted || m->kv_len != P || !m->K) return;
+    ColiPsPart *parts = (ColiPsPart *)malloc((size_t)2 * m->c.n_layers * sizeof *parts + 1);
+    if (!parts) return;
+    const int np = ink_ps_parts(m, parts);
+    size_t sb = 0;
+    InkPsState *st = ink_ps_state_save(m, &sb);
+    if (st) coli_ps_save(&g_ink_ps, ids, P, parts, np, st, sb, ink_ps_state_free, compat_mem_available_gb() * 1024.0);
+    free(parts);
+}
+/* The deepest prefix the store holds of ids[0, np), when it reaches past `held` positions: its rows,
+ * rings and banks put back, the record and the chain told. The positions now held; 0 when nothing. */
+static int ink_ps_take(Model *m, const int *ids, int np, int held) {
+    if (!ink_ps_on() || np < 2 || !m->K) return 0;
+    Cfg *c = &m->c;
+    ColiPsPart *parts = (ColiPsPart *)malloc((size_t)2 * c->n_layers * sizeof *parts + 1);
+    if (!parts) return 0;
+    const int nparts = ink_ps_parts(m, parts);
+    if (!coli_ps_layout(&g_ink_ps, parts, nparts)) { free(parts); return 0; }
+    ColiPsHit h;
+    const int P = coli_ps_lookup(&g_ink_ps, ids, np, np - 1, 1, &h);
+    const InkPsState *x = P > 0 && h.ck >= 0 ? (const InkPsState *)g_ink_ps.ck[h.ck].state : NULL;
+    if (P <= held + coli_ps_min_gain(&g_ink_ps) || !x || x->n_layers != c->n_layers || !coli_ps_parts_hold(parts, nparts, P)) {
+        coli_ps_hit_free(&h); free(parts); return 0;
+    }
+    coli_ps_load(&g_ink_ps, &h, parts, nparts);
+    free(parts);
+    ink_pin_state_restore(m, x->cs);
+    for (int i = 0; i < c->n_layers; i++) {
+        const int rows = kv_ring_rows(c, i, m->max_t);
+        if (rows == m->max_t || !x->rk[i]) continue;
+        const size_t rb = (size_t)L_KV(c, i) * rows * L_HD(c, i) * sizeof(float);
+        memcpy(m->K[i], x->rk[i], rb); memcpy(m->V[i], x->rv[i], rb);
+    }
+    m->kv_len = P;
+    kv_prefix_clear(&m->kvp);
+    kv_prefix_record(&m->kvp, ids, 0, P);
+#ifdef COLI_VULKAN
+    inkc_host_wrote(m, 0);      /* the convolution banks go up again */
+    inkc_cpu_step(m, 0, P);     /* and the rows of positions [0, P) */
+#endif
+    if (getenv("INK_PREFIX_LOG") || getenv("COLI_PREFIX_LOG")) {
+        fprintf(stderr, "[PREFIX] %d of %d prompt tokens from the store (%d blocks of %d and a checkpoint; the slot held %d)\n",
+                P, np, h.depth, g_ink_ps.B, held);
+        fflush(stderr);
+    }
+    coli_ps_hit_free(&h);
+    return P;
+}
+/* where a prompt read from `from` keeps checkpoints (coli_ps_marks): where its messages start */
+static int ink_ps_marks(const Tok *T, const int *ids, int np, int from, int *marks) {
+    static int opens[4], nopen = -1;
+    if (nopen < 0) {
+        static const char *names[] = {"<|message_system|>", "<|message_user|>", "<|message_model|>", "<|message_tool|>"};
+        nopen = 0;
+        for (size_t o = 0; o < sizeof names / sizeof *names; o++)
+            for (int k = 0; k < T->nsp; k++)
+                if (T->sp[k].len == (int)strlen(names[o]) && !memcmp(T->sp[k].str, names[o], (size_t)T->sp[k].len)) { opens[nopen++] = T->sp[k].id; break; }
+    }
+    if (!nopen || !ink_ps_on()) return 0;
+    return coli_ps_marks(ids, np, from, g_ink_ps.B, opens, nopen, marks);
+}
+
 static int ink_serve_start(Model *m, Tok *T, SReq *q, int **ids_out, int *np_out, float **logit_out,
                            InkReqClock *clk, int lone) {
     Cfg *c = &m->c;
@@ -3615,8 +3765,13 @@ static int ink_serve_start(Model *m, Tok *T, SReq *q, int **ids_out, int *np_out
             s = coli_pin_best(&g_pins, ids, np);
         }
     }
+    /* the prompt the store holds further than the slot does: another conversation's on the same
+     * system prompt, this one's before another took the slot (ink_ps_take) */
+    const int ps_plain = naud == 0 && q->logprobs == 0 && !q->pin;
+    int ps_got = 0;
+    if (ps_plain) { ps_got = ink_ps_take(m, ids, np, reuse); if (ps_got) { reuse = ps_got; g_pin_use_logit = 0; g_pin_logit = NULL; } }
     g_echo_k = q->logprobs; g_echo_id = q->id; g_echo_tok = T;
-    if (getenv("INK_PREFIX_LOG")) {
+    if (getenv("INK_PREFIX_LOG") && !ps_got) {
         /* Report the decision either way, with the reason when it is no. "It
          * did not get faster" is otherwise indistinguishable from "reuse is not
          * wired up", both for a user and for the CI gate. */
@@ -3650,9 +3805,12 @@ static int ink_serve_start(Model *m, Tok *T, SReq *q, int **ids_out, int *np_out
          * between them, each a whole step (its rings and banks as complete as any step's) */
         int seg = coli_prompt_segment_rows(2048);
         whole_steps = 1;
+        int marks[2], nm = ps_plain ? ink_ps_marks(T, ids, np, reuse, marks) : 0, mk = 0;   /* each kept (ink_ps_save) */
         for (int at = reuse; at < np; ) {
             if (coli_prompt_poll(&brk)) { free(logit); logit = NULL; break; }
-            int n = np - at < seg ? np - at : seg;
+            if (mk < nm && at == marks[mk]) { ink_ps_save(m, ids, at); mk++; }
+            const int end = mk < nm ? marks[mk] : np;
+            int n = end - at < seg ? end - at : seg;
             g_coli_prompt_break = &brk;   /* and between the chain's chunks inside the step */
             float *next = step_mm(m, ids + at, n, at, NULL, NULL, 0);
             g_coli_prompt_break = NULL;
@@ -3662,7 +3820,18 @@ static int ink_serve_start(Model *m, Tok *T, SReq *q, int **ids_out, int *np_out
         }
     } else {
         if (lone && !chain && q->logprobs == 0) g_coli_prompt_break = &brk;
-        logit = step_mm(m, ids + reuse, np - reuse, reuse, NULL, q->audio, naud);
+        int at = reuse, cut = 0;
+        if (ps_plain) {   /* in pieces where its messages start, the state there kept (ink_ps_save) */
+            int marks[2], nm = ink_ps_marks(T, ids, np, reuse, marks);
+            for (int k = 0; k < nm; k++) {
+                float *lo = step_mm(m, ids + at, marks[k] - at, at, NULL, NULL, 0);
+                if (!lo) { cut = 1; break; }
+                free(lo);
+                at = marks[k];
+                ink_ps_save(m, ids, at);
+            }
+        }
+        logit = cut ? NULL : step_mm(m, ids + at, np - at, at, NULL, q->audio, naud);
         g_coli_prompt_break = NULL;
     }
     if (!logit) {
@@ -3739,6 +3908,13 @@ static int serve_one(Model *m, Tok *T, SReq *q) {
     printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %d\n", dt, np, gen,
            m->t_fill - f0, m->t_shared - s0, m->t_expert - e0, m->t_attn - a0, 0.0, forwards);
     fflush(stdout);
+    /* the conversation as the turn left it, for its next turn after another took the slot (one of
+     * COLI_PARK_MIN tokens at least) */
+    if (q->logprobs == 0 && !q->pin && !m->kvp.tainted) {
+        const char *mn = getenv("COLI_PARK_MIN");
+        const int least = mn && atoi(mn) > 0 ? atoi(mn) : 1024;
+        if (m->kv_len >= least && m->kvp.len == m->kv_len) ink_ps_save(m, m->kvp.fed, m->kv_len);
+    }
 #ifdef COLI_VULKAN
     ink_vk_report(); ink_vk_tier_report(m, "turn"); inkc_report(m);
 #endif
@@ -3988,15 +4164,15 @@ static void serve_loop(Model *m, Tok *T) {
     coli_serve_write_ready(stdout,rss_gb());
     serve_hwinfo(m);
     serve_tiers_emap(m);
-    if (g_ink_mux_slots > 1) { serve_mux(m, T); return; }
+    if (g_ink_mux_slots > 1) { serve_mux(m, T); coli_ps_report(&g_ink_ps); return; }
     for (;;) {
-        while (!g_qn) if (serve_read_cmd(stdin, stdout, NULL) < 0) return;   /* blocks on stdin */
+        while (!g_qn) if (serve_read_cmd(stdin, stdout, NULL) < 0) { coli_ps_report(&g_ink_ps); return; }   /* blocks on stdin */
         SReq q = g_q[0];
         memmove(g_q, g_q+1, (size_t)(--g_qn) * sizeof(SReq));
         int fatal=serve_one(m,T,&q);
         serve_tiers_emap(m);
         serve_request_dispose(&q);
-        if(fatal<0){ while(g_qn) serve_request_dispose(&g_q[--g_qn]); return; }
+        if(fatal<0){ while(g_qn) serve_request_dispose(&g_q[--g_qn]); coli_ps_report(&g_ink_ps); return; }
     }
 }
 

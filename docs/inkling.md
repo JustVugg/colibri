@@ -155,6 +155,22 @@ curl localhost:8000/v1/chat/completions -d '{
 }'
 ```
 
+## Every prompt kept: the prefix store
+
+The sliding layers' rings and every layer's short convolutions cannot be wound back, so a slot
+resumes only from the end of what it holds (or a pin, whose global rows must still be in the slot):
+an agent's new conversation on the same system prompt read its whole prompt again, and so did a
+conversation back after another took the slot. `prefix_store.h` keeps every prompt read, as qwen36
+does ([qwen36.md](qwen36.md#the-prefix-store)): the global layers' K/V rows in blocks of 256 tokens
+named by their tokens, shared by every prompt that starts with them, and checkpoints of the rest
+(the sliding layers' rings, every layer's four convolution banks) where a prompt's messages start
+(`<|message_system|>`, `<|message_user|>`, `<|message_model|>`, `<|message_tool|>`) and where a turn
+ends. A request takes the deepest checkpoint its prompt starts with when it reaches further than
+the slot. `COLI_PREFIX_STORE=0` or `COLI_KV_PREFIX=0` turns it off; not for audio, a pin or a
+read-out. `tests/test_inkling_prefix_store.py` holds every request that took the store to a fresh
+engine reading the same prompt with the store off, each step's top five logits to the last digit;
+`INK_PS_BACKEND=vulkan` the same on the dense chain. The 975B checkpoint has not run it here.
+
 ## Expert cache size
 
 `cap` (first positional argument, or `--cap` through `coli`) is how many experts each

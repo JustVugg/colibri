@@ -5273,7 +5273,23 @@ static int sample_desc(const void *a, const void *b) {
     return (pb > pa) - (pa > pb);
 }
 
+/* COLI_LOGIT_DUMP=1: each served step's top five id:logit to stderr, as sample.h's pick_tok writes
+ * them (comparing two configurations on the same context: a stored prefix against a fresh read) */
+static void serve_logit_dump(const float *lo, int V) {
+    static int dump = -1;
+    if (dump < 0) dump = getenv("COLI_LOGIT_DUMP") ? 1 : 0;
+    if (!dump) return;
+    int id[5] = {-1, -1, -1, -1, -1}; float v[5] = {-3e38f, -3e38f, -3e38f, -3e38f, -3e38f};
+    for (int t = 0; t < V; t++) {
+        const float x = lo[t];
+        for (int k = 0; k < 5; k++) if (x > v[k]) { for (int j = 4; j > k; j--) { v[j] = v[j - 1]; id[j] = id[j - 1]; } v[k] = x; id[k] = t; break; }
+    }
+    fprintf(stderr, "[LOGITS]");
+    for (int k = 0; k < 5; k++) fprintf(stderr, " %d:%.6f", id[k], v[k]);
+    fprintf(stderr, "\n");
+}
 static int serve_sample(const float *logits, int vocab, float temperature, float top_p) {
+    serve_logit_dump(logits, vocab);
     if (temperature <= 0.0f) return argmax(logits, vocab);
     SampleProb *rank = xmalloc((size_t)vocab * sizeof(SampleProb), "sampling");
     float top = logits[0];
@@ -5662,6 +5678,167 @@ static void v41_park_decide(Model *m, const int *ids, int np, int max_tok, int i
     }
 }
 
+/* ---- every prompt read, kept by content for later requests (prefix_store.h) -----------------
+ * An agent starts each task as a new conversation on the same system prompt and tools. The state
+ * the slot holds cannot be wound back to where the new conversation parts from the old one (the
+ * window rings, the compressor's filling group), so the new one read its whole prompt again; and a
+ * conversation's next turn did too, since resuming the live state is opt-in here (kv_prefix_on: a
+ * position decoded attends otherwise than the same text prefilled). The store keeps the compressed
+ * rows and index keys in blocks named by their tokens, shared by every prompt that starts with
+ * them, and checkpoints of the rest (every layer's window ring and its positions, the compressor's
+ * filling group, the layer whose index keys were published last) where a prompt's messages start
+ * and where it ends. A prompt's rows read past a checkpoint publish their own top-k lists and
+ * candidate masks before any layer reads them, so those are not kept (a decoded position would
+ * read the last forward's, and nothing here resumes one). Only what a prompt read put there: a
+ * request that started from nothing or from the store saves, one that resumed the live state (with
+ * decoded positions) or a photo does not, so a request that takes a checkpoint computes what the
+ * same prompt read cold computes. It keeps two positions at least to read (a single one reads the
+ * keys published last, as a decoded one does). The engram history is the prompt's ids again.
+ * COLI_PREFIX_STORE=0 or COLI_KV_PREFIX=0 off; COLI_PREFIX_STORE_MB its budget;
+ * COLI_PREFIX_STORE_BLOCK the tokens a block (a multiple of every compression ratio). Off for a
+ * picture's prompt and for a read-out (logprobs). */
+#include "prefix_store.h"
+static ColiPrefixStore g_v41_ps;
+static int g_v41_ps_init;
+static int v41_ps_on(void) {
+    if (!g_v41_ps_init) {
+        const char *e = getenv("COLI_KV_PREFIX");
+        g_v41_ps_init = 1;
+        coli_ps_init_env(&g_v41_ps, e && *e == '0', compat_mem_available_gb() * 1024.0);
+    }
+    return g_v41_ps.on;
+}
+/* the store's budget, decided when the engine plans its RAM: a tier's host pool leaves it (ram_later) */
+static size_t v41_ps_plan(void) { v41_ps_on(); return g_v41_ps.on ? g_v41_ps.budget : 0; }
+/* the compressed rows and index keys, a row for `ratio` positions */
+static int v41_ps_parts(const Model *m, ColiPsPart *parts) {
+    const Cfg *c = &m->c; int n = 0;
+    for (int i = 0; i < c->n_layers; i++) {
+        const Layer *l = &m->L[i]; const int r = c->compress_ratio[i] > 0 ? c->compress_ratio[i] : 1;
+        if (!c->kv_source[i] || !l->ckv || !l->ikey) continue;
+        const int slots = c->max_positions / r;
+        parts[n++] = (ColiPsPart){l->ckv, (size_t)c->head_dim * sizeof(float), slots, 1, 0, r};
+        parts[n++] = (ColiPsPart){l->ikey, (size_t)c->index_head_dim * sizeof(float), slots, 1, 0, r};
+    }
+    return n;
+}
+typedef struct {
+    int n_layers, window, pos, pub_layer;
+    float **win, **cs_kv, **cs_score; int **win_pos;
+} V41PsState;
+static void v41_ps_state_free(void *v) {
+    V41PsState *x = (V41PsState *)v;
+    if (!x) return;
+    for (int i = 0; i < x->n_layers; i++) {
+        if (x->win) free(x->win[i]);
+        if (x->win_pos) free(x->win_pos[i]);
+        if (x->cs_kv) free(x->cs_kv[i]);
+        if (x->cs_score) free(x->cs_score[i]);
+    }
+    free(x->win); free(x->win_pos); free(x->cs_kv); free(x->cs_score); free(x);
+}
+/* a checkpoint's state: the host's, which every chain leaves canonical after a forward */
+static V41PsState *v41_ps_state_save(const Model *m, size_t *bytes) {
+    const Cfg *c = &m->c; const int L = c->n_layers, W = c->window, hd = c->head_dim;
+    V41PsState *x = (V41PsState *)calloc(1, sizeof *x);
+    if (!x) return NULL;
+    x->n_layers = L; x->window = W; x->pos = m->pos;
+    x->pub_layer = m->published_index_k ? m->published_index_layer : -1;
+    int ok = (x->win = (float **)calloc((size_t)L, sizeof(float *))) && (x->win_pos = (int **)calloc((size_t)L, sizeof(int *))) &&
+             (x->cs_kv = (float **)calloc((size_t)L, sizeof(float *))) && (x->cs_score = (float **)calloc((size_t)L, sizeof(float *)));
+    *bytes = sizeof *x;
+    for (int i = 0; ok && i < L; i++) {
+        const Layer *l = &m->L[i]; const int r = c->compress_ratio[i];
+        const size_t wb = (size_t)W * hd * sizeof(float);
+        ok = (x->win[i] = (float *)malloc(wb)) && (x->win_pos[i] = (int *)malloc((size_t)W * sizeof(int)));
+        if (!ok) break;
+        memcpy(x->win[i], l->window, wb); memcpy(x->win_pos[i], l->window_pos, (size_t)W * sizeof(int));
+        *bytes += wb + (size_t)W * sizeof(int);
+        if (c->kv_source[i] && r > 1) {
+            const size_t cb = (size_t)r * hd * sizeof(float);
+            ok = (x->cs_kv[i] = (float *)malloc(cb)) && (x->cs_score[i] = (float *)malloc(cb));
+            if (!ok) break;
+            memcpy(x->cs_kv[i], l->cstate_kv, cb); memcpy(x->cs_score[i], l->cstate_score, cb);
+            *bytes += 2 * cb;
+        }
+    }
+    if (!ok) { v41_ps_state_free(x); return NULL; }
+    return x;
+}
+/* ids[0, P) as the Model holds them now, with its state at P */
+static void v41_ps_save(Model *m, const int *ids, int P) {
+    if (!v41_ps_on() || P < g_v41_ps.B || m->kvp.tainted || m->pos != P) return;
+    ColiPsPart *parts = (ColiPsPart *)malloc((size_t)2 * m->c.n_layers * sizeof *parts + 1);
+    if (!parts) return;
+    int np = v41_ps_parts(m, parts);
+    size_t sb = 0;
+    V41PsState *st = v41_ps_state_save(m, &sb);
+    if (st) coli_ps_save(&g_v41_ps, ids, P, parts, np, st, sb, v41_ps_state_free, compat_mem_available_gb() * 1024.0);
+    free(parts);
+}
+/* The deepest prefix the store holds of ids[0, np), two positions short of its end at most, when
+ * it reaches past `held` positions: its rows and state put back, the record and the chains told.
+ * The positions now held; 0 when nothing. */
+static int v41_ps_take(Model *m, const int *ids, int np, int held) {
+    if (!v41_ps_on() || np < 3) return 0;
+    const Cfg *c = &m->c;
+    ColiPsPart *parts = (ColiPsPart *)malloc((size_t)2 * c->n_layers * sizeof *parts + 1);
+    if (!parts) return 0;
+    int nparts = v41_ps_parts(m, parts);
+    if (!coli_ps_layout(&g_v41_ps, parts, nparts)) { free(parts); return 0; }
+    ColiPsHit h;
+    int P = coli_ps_lookup(&g_v41_ps, ids, np, np - 2, 1, &h);
+    const V41PsState *x = P > 0 && h.ck >= 0 ? (const V41PsState *)g_v41_ps.ck[h.ck].state : NULL;
+    if (P <= held + coli_ps_min_gain(&g_v41_ps) || !x || x->n_layers != c->n_layers || x->window != c->window || x->pos != P ||
+        !coli_ps_parts_hold(parts, nparts, P)) { coli_ps_hit_free(&h); free(parts); return 0; }
+    coli_ps_load(&g_v41_ps, &h, parts, nparts);
+    free(parts);
+    const int W = c->window, hd = c->head_dim;
+    for (int i = 0; i < c->n_layers; i++) {
+        Layer *l = &m->L[i]; const int r = c->compress_ratio[i];
+        memcpy(l->window, x->win[i], (size_t)W * hd * sizeof(float));
+        memcpy(l->window_pos, x->win_pos[i], (size_t)W * sizeof(int));
+        if (c->kv_source[i] && r > 1 && x->cs_kv[i]) {
+            memcpy(l->cstate_kv, x->cs_kv[i], (size_t)r * hd * sizeof(float));
+            memcpy(l->cstate_score, x->cs_score[i], (size_t)r * hd * sizeof(float));
+        }
+    }
+    m->published_index_k = x->pub_layer >= 0 ? m->L[x->pub_layer].ikey : NULL;
+    m->published_index_layer = x->pub_layer >= 0 ? x->pub_layer : m->published_index_layer;
+    m->shared_topk_rows = m->shared_topk_width = 0;   /* as model_reset_rows: the prompt's rows publish their own */
+    m->engram.history_len = 0;
+    if (m->engram.active) engram_push(&m->engram, ids, P, NULL);   /* the history is the ids' */
+    m->pos = P;
+    kv_prefix_clear(&m->kvp);
+    kv_prefix_record(&m->kvp, ids, 0, P);
+#ifdef COLI_VULKAN
+    v41c_reset(m);   /* the host's rows and state are the conversation's: the mirrors go up again */
+#endif
+#ifdef COLI_CUDA
+    v41u_lower(m, 0);
+#endif
+    if (getenv("COLI_PREFIX_LOG")) {
+        fprintf(stderr, "[PREFIX] %d of %d prompt tokens from the store (%d blocks of %d and a checkpoint; the slot held %d)\n",
+                P, np, h.depth, g_v41_ps.B, held);
+        fflush(stderr);
+    }
+    coli_ps_hit_free(&h);
+    return P;
+}
+/* where a prompt read from `from` keeps checkpoints (coli_ps_marks): where its messages start */
+static int v41_ps_marks(const Tok *T, const int *ids, int np, int from, int *marks) {
+    static int opens[3], nopen = -1;
+    if (nopen < 0) {
+        static const char *names[] = {"<\xef\xbd\x9cUser\xef\xbd\x9c>", "<\xef\xbd\x9c" "Assistant\xef\xbd\x9c>", "<\xef\xbd\x9cSystem\xef\xbd\x9c>"};
+        nopen = 0;
+        for (size_t o = 0; o < sizeof names / sizeof *names; o++)
+            for (int k = 0; k < T->nsp; k++)
+                if (T->sp[k].len == (int)strlen(names[o]) && !memcmp(T->sp[k].str, names[o], (size_t)T->sp[k].len)) { opens[nopen++] = T->sp[k].id; break; }
+    }
+    if (!nopen || !v41_ps_on()) return 0;
+    return coli_ps_marks(ids, np, from, g_v41_ps.B, opens, nopen, marks);
+}
+
 static int v41_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int *ids, float *logits,
                            float **pending_image, int *pending_h, int *pending_w, V41Req *rq, int lone) {
     Cfg *c = &m->c;
@@ -5727,7 +5904,17 @@ static int v41_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int 
             ps = coli_pin_best(&g_pins, ids, n_prompt);
         }
     }
-    if (getenv("COLI_PREFIX_LOG")) {
+    /* the prompt the store holds further than the slot does: another conversation's on the same
+     * system prompt, this one's last turn (v41_ps_take). A request whose state is what its prompt
+     * read put there, from nothing or from the store, keeps what it reads (ps_keep). */
+    const int had_image = *pending_image != NULL;
+    int ps_from = 0;
+    if (cmd->logprobs == 0 && !had_image) {
+        int got = v41_ps_take(m, ids, n_prompt, reuse);
+        if (got) { reuse = got; ps_from = 1; g_pin_use_logit = 0; g_pin_logit = NULL; }
+    }
+    const int ps_keep = (ps_from || !reuse) && cmd->logprobs == 0 && !had_image;
+    if (getenv("COLI_PREFIX_LOG") && !ps_from) {
         if (reuse)
             fprintf(stderr, "[PREFIX] reusing %d of %d prompt tokens (%.0f%%)\n",
                     reuse, n_prompt, 100.0 * reuse / n_prompt);
@@ -5805,9 +5992,20 @@ static int v41_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int 
     ColiPromptBreak brk = { .poll = v41_prompt_poll, .id = cmd->id };
     if (!echoed) {
         if (lone) g_coli_prompt_break = &brk;
-        forward_with_image(m, ids + reuse, n_prompt - reuse, logits, aligned,
-                           image_at, image_h, image_w, image_mask);
+        int at = reuse;
+        if (ps_keep) {   /* the prompt in pieces where its messages start, each kept for later requests */
+            int marks[2], nm = v41_ps_marks(tokenizer, ids, n_prompt, reuse, marks);
+            for (int k = 0; k < nm && !brk.control; k++) {
+                forward_with_image(m, ids + at, marks[k] - at, logits, NULL, -1, 0, 0, NULL);
+                at = marks[k];
+                if (!brk.control) v41_ps_save(m, ids, at);
+            }
+        }
+        if (!brk.control)
+            forward_with_image(m, ids + at, n_prompt - at, logits, aligned,
+                               image_at, image_h, image_w, image_mask);
         g_coli_prompt_break = NULL;
+        if (ps_keep && !brk.control) v41_ps_save(m, ids, n_prompt);   /* and where it ends */
     }
     free(aligned); free(image_mask);
     if (brk.control) {
@@ -5983,7 +6181,7 @@ static void serve_mux(Model *m, Tok *tokenizer, const char *snap) {
 }
 
 static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
-    if (g_v41_mux_slots > 1) { serve_mux(m, tokenizer, snap); return; }
+    if (g_v41_mux_slots > 1) { serve_mux(m, tokenizer, snap); coli_ps_report(&g_v41_ps); return; }
     Cfg *c = &m->c;
     coli_serve_stdio_init();
     int eos_ids[8];
@@ -6241,6 +6439,7 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
         serve_emap(m);
         coli_serve_command_dispose(&command);
     }
+    coli_ps_report(&g_v41_ps);
     free(ids); free(logits);
 }
 
@@ -6534,7 +6733,7 @@ static void vk_tier_start(Model *m, const char *snap, int cap) {
                     .max_rows = MOE_ROW_CHUNK * c->n_activated,
                     .ram_reserve = expert * (size_t)cap * (size_t)c->n_layers,
                     .ram_floor = expert * (size_t)c->n_activated * (size_t)c->n_layers, .ram_given = vk_ram_given,
-                    .ram_later = v41_state_later(m),
+                    .ram_later = v41_state_later(m) + v41_ps_plan(),
                     .dense_bytes = v41_tier_dense_bytes(m), .chain_bytes = v41_tier_chain_bytes(m), .in_ram = vk_in_ram, .ram_ctx = m,
                     .load = vk_load, .release = vk_unhold, .load_ctx = m, .load_batch = vk_load_batch};
     rt_init("deepseek_v41", c->n_layers, c->n_routed);
