@@ -60,6 +60,7 @@ EXPORTS
     dsv4_cuda_mem_free_mb
     dsv4_cuda_device_unified
     dsv4_cuda_stream_drain
+    dsv4_cuda_upload_fence
     dsv4_cuda_kv_comp_append
     dsv4_cuda_head_argmax
     dsv4_cuda_upload_head_exact

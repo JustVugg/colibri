@@ -886,6 +886,8 @@ static const ColiEnvVar coli_env_table[] = {
     {"V4_PREFIX_LOG",                    CE_STR   , CE_DSV4                                         , 0             , NULL},
     {"V4_REPLAY_TRACE", CE_PATH, CE_DSV4, 0, NULL},
     {"V4_SERVE_STATS_LOG", CE_BOOL, CE_DSV4, 0, NULL},
+    {"V4_UPLOAD_FENCE", CE_BOOL, CE_DSV4, 0, NULL},
+    {"V4_UPLOAD_THREAD", CE_BOOL, CE_DSV4, 0, NULL},
     {"VK_PROF", CE_STR, CE_ALL | CE_DSV4 | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_QWENIMAGE | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"WARMUP",                           CE_INT   , CE_OLMOE | CE_QWEN                              , 0             , NULL},
     {"WIDE",                             CE_INT   , CE_OLMOE | CE_QWEN                              , 0             , NULL},

@@ -6132,6 +6132,8 @@ static int moe_token_pipeline(float *output,
 #ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
 #ifdef COLI_V4_GPU_TIER
     int gpu_compute = 0;
+    int uploads_queued = 0;                 /* views handed to the uploader thread */
+    unsigned long long uploads_before = 0;  /* the upload counter before the first of them */
 #endif
     if (!result) {
 #ifdef COLI_V4_GPU_TIER
@@ -6158,6 +6160,7 @@ static int moe_token_pipeline(float *output,
             views[current] = jobs[slot].view;
             leased[current] = 1;
 #ifdef COLI_V4_GPU_TIER
+            int handed = 0;
             if (store->gpu) {
                 if (coli_v4_hybrid_enabled())
                     /* peek only: uploads are decided once the token's full
@@ -6165,18 +6168,34 @@ static int moe_token_pipeline(float *output,
                     coli_v4_gpu_expert_peek(store, &views[current]);
                 else {
                     double at0 = v4_wait_clock();
-                    unsigned long long uploads = coli_v4_gpu_expert_uploads();
-                    coli_v4_gpu_expert_attach(store, &views[current]);
-                    if (dec) {
-                        g_v4_dec_attach_s += v4_wait_clock() - at0;
-                        g_v4_dec_uploads += coli_v4_gpu_expert_uploads() - uploads;
+                    /* the counter is the uploader's while views are with it */
+                    unsigned long long uploads =
+                        uploads_queued ? 0 : coli_v4_gpu_expert_uploads();
+                    if (coli_v4_upload_thread_on() &&
+                        coli_v4_gpu_expert_attach_queued(store, &views[current]) == 0) {
+                        /* V4_UPLOAD_THREAD: the uploader attaches it while this
+                         * lane's next read starts below; joined after the reads */
+                        if (!uploads_queued) uploads_before = uploads;
+                        uploads_queued++;
+                        handed = 1;
+                        if (dec) g_v4_dec_attach_s += v4_wait_clock() - at0;
+                    } else {
+                        /* never beside the uploader: one thread in the backend */
+                        if (uploads_queued) coli_v4_gpu_expert_upload_join();
+                        coli_v4_gpu_expert_attach(store, &views[current]);
+                        if (dec) {
+                            g_v4_dec_attach_s += v4_wait_clock() - at0;
+                            if (!uploads_queued)
+                                g_v4_dec_uploads += coli_v4_gpu_expert_uploads() - uploads;
+                        }
                     }
                 }
             }
 #endif
 #ifdef COLI_V4_GPU_TIER
-            if (!views[current].gate.gpu || !views[current].up.gpu ||
-                !views[current].down.gpu)
+            /* a handed view is the uploader's until the join, which checks it */
+            if (!handed && (!views[current].gate.gpu || !views[current].up.gpu ||
+                            !views[current].down.gpu))
                 gpu_compute = 0;
 #endif
 
@@ -6190,6 +6209,19 @@ static int moe_token_pipeline(float *output,
     }
     v4_lanes_finish(store, jobs, loaders, loader_active);
 #ifdef COLI_V4_GPU_TIER
+    if (uploads_queued) {
+        /* on every exit of the loop, a failed read included: the views and
+         * their leases are the uploader's until it has reported them */
+        double join0 = v4_wait_clock();
+        coli_v4_gpu_expert_upload_join();
+        if (dec) {
+            g_v4_dec_attach_s += v4_wait_clock() - join0;
+            g_v4_dec_uploads += coli_v4_gpu_expert_uploads() - uploads_before;
+        }
+        for (int i = 0; i < selected; i++)
+            if (!views[i].gate.gpu || !views[i].up.gpu || !views[i].down.gpu)
+                gpu_compute = 0;
+    }
     /* If the token cannot take the fused GPU path after all (an attach
      * failed), its mirror-only views need their host data now. */
     if (!result && !gpu_compute)
@@ -6467,6 +6499,9 @@ static int moe_token_pipeline(float *output,
      * copies read from. (The fused kernels sync internally, so this is only
      * ever a wait on already-finished work — never a correctness gamble.) */
     if (hybrid_pending_drain) coli_v4_gpu_expert_drain(store);
+    /* The uploader's copies read from the leased slabs: wait for the ones
+     * still in flight before the leases go. */
+    if (uploads_queued) coli_v4_gpu_expert_upload_settle();
     /* A view still without a lease was computed from VRAM (VRAM-first): its
      * routing never reached the store, which counts it here, once per
      * token-layer (fetch[] is free again: it carries the expert ids). */
@@ -12244,7 +12279,9 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     return 0;
 }
 
+static void v4_upload_report(void);
 void coli_v4_gpu_engine_close(ColiV4Engine *engine) {
+    v4_upload_report();
     if (!engine || !engine->gpu.enabled) return;
     /* First, while the store, the shared-expert mirrors and the backend are
      * all still alive: join a COLI_CUDA_MOE_DOUBLE prefetch worker (it holds
@@ -12959,7 +12996,8 @@ static uint64_t v4_mirror_tick(void) {
     return __atomic_add_fetch(&g_v4_mirror_clock, 1, __ATOMIC_RELAXED);
 }
 /* Mirror uploads, every cache (coli_v4_gpu_expert_uploads). Uploads happen on
- * the generation thread only. */
+ * the generation thread, or on the uploader thread (V4_UPLOAD_THREAD) while
+ * the generation thread waits to join it: read it after the join. */
 static unsigned long long g_v4_mirror_uploads;
 unsigned long long coli_v4_gpu_expert_uploads(void) {
     return g_v4_mirror_uploads;
@@ -13399,11 +13437,11 @@ static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
                 dsv4_cuda_tensor_refill_fp4(
                     cache->entries[found].gate, (const uint8_t *)view->gate.data,
                     (const uint8_t *)view->gate.scales, (int)view->gate.rows,
-                    (int)view->gate.columns, 0) &&
+                    (int)view->gate.columns, sync >= 2 ? 3 : 0) &&
                 dsv4_cuda_tensor_refill_fp4(
                     cache->entries[found].up, (const uint8_t *)view->up.data,
                     (const uint8_t *)view->up.scales, (int)view->up.rows,
-                    (int)view->up.columns, 0) &&
+                    (int)view->up.columns, sync >= 2 ? 3 : 0) &&
                 dsv4_cuda_tensor_refill_fp4(
                     cache->entries[found].down, (const uint8_t *)view->down.data,
                     (const uint8_t *)view->down.scales, (int)view->down.rows,
@@ -13602,6 +13640,178 @@ int coli_v4_gpu_expert_drain(ColiExpertStore *store) {
     for (V4GpuExpertMirrorCache *cache = store->gpu; cache; cache = cache->next)
         if (!dsv4_cuda_stream_drain(cache->device)) failed = 1;
     return failed ? -1 : 0;
+}
+
+/* ---- the decode uploader thread (V4_UPLOAD_THREAD=1; off by default) ------
+ * A decode step attaches each expert it read from the store before it starts
+ * that lane's next read: a refill is the three tensors' copies and a wait for
+ * them on the compute stream, on the thread that feeds the lanes. With the
+ * switch on, the step hands the view to this thread and starts the next read
+ * at once. The thread runs the same tiered attach as the step would
+ * (v4_gpu_expert_attach_tiered: the same caches, growth guard, LRU and
+ * recycle in place), one view at a time, and the step joins it once its reads
+ * are in.
+ *
+ * Where a refill's copies go (the sync the attach passes to the backend):
+ *   3  the device's second stream, enqueued only. After the join the step
+ *      records an event behind them and the compute stream waits for it
+ *      (dsv4_cuda_upload_fence), so the expert group runs after the copies on
+ *      the device and the host waits for no transfer. The default.
+ *   2  the second stream, drained by this thread before the job is reported
+ *      (V4_UPLOAD_FENCE=0).
+ *   1  the compute stream, drained, as the inline attach: a backend without
+ *      dsv4_cuda_upload_fence (an older DLL).
+ * A new mirror, while the cache still grows, is a synchronous upload in every
+ * mode. The handed views keep their leases until the settle has seen the
+ * second stream empty.
+ *
+ * The step makes no backend call between its first hand-over and the join, so
+ * the backend is entered by one thread at a time, as before. */
+extern int dsv4_cuda_upload_fence(int device, int drain);
+typedef struct {
+    ColiExpertView *view;
+    V4GpuExpertMirrorCache *cache;
+} V4UploadJob;
+#define V4_UPLOAD_QUEUE 32
+#define V4_UPLOAD_DEVICES 8
+static struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t ready, done;
+    pthread_t thread;
+    int started;        /* 0 not yet, 1 running, -1 it could not start */
+    V4UploadJob queue[V4_UPLOAD_QUEUE];
+    unsigned head, tail;
+    int busy;           /* handed over and not yet reported */
+    int sync;           /* of the views in flight: chosen when the first one is handed over */
+    int backend;        /* -1 not asked yet, 1 the backend has the fence, 0 it has not */
+    int devices[V4_UPLOAD_DEVICES], device_count;   /* cards whose second stream may hold copies */
+    unsigned long long jobs, attached, fences, fence_drains;
+    double seconds;     /* in the attach, on the thread */
+} g_v4_up = {.mutex = PTHREAD_MUTEX_INITIALIZER, .ready = PTHREAD_COND_INITIALIZER,
+             .done = PTHREAD_COND_INITIALIZER, .backend = -1};
+
+int coli_v4_upload_thread_on(void) {
+    const char *setting = getenv("V4_UPLOAD_THREAD");
+    return setting && *setting && atoi(setting) != 0;
+}
+
+static double v4_upload_clock(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (double)now.tv_sec + (double)now.tv_nsec * 1e-9;
+}
+
+static void *v4_uploader_main(void *unused) {
+    (void)unused;
+    pthread_mutex_lock(&g_v4_up.mutex);
+    for (;;) {
+        while (g_v4_up.head == g_v4_up.tail)
+            pthread_cond_wait(&g_v4_up.ready, &g_v4_up.mutex);
+        V4UploadJob job = g_v4_up.queue[g_v4_up.head % V4_UPLOAD_QUEUE];
+        g_v4_up.head++;
+        int sync = g_v4_up.sync;
+        pthread_mutex_unlock(&g_v4_up.mutex);
+        double started = v4_upload_clock();
+        int attached = v4_gpu_expert_attach_tiered(job.cache, job.view, sync) == 0;
+        double spent = v4_upload_clock() - started;
+        pthread_mutex_lock(&g_v4_up.mutex);
+        g_v4_up.seconds += spent;
+        if (attached) g_v4_up.attached++;
+        if (--g_v4_up.busy == 0) pthread_cond_broadcast(&g_v4_up.done);
+    }
+    return NULL;
+}
+
+/* with the mutex held */
+static int v4_upload_note_device(int device) {
+    for (int i = 0; i < g_v4_up.device_count; i++)
+        if (g_v4_up.devices[i] == device) return 1;
+    if (g_v4_up.device_count >= V4_UPLOAD_DEVICES) return 0;
+    g_v4_up.devices[g_v4_up.device_count++] = device;
+    return 1;
+}
+
+int coli_v4_gpu_expert_attach_queued(ColiExpertStore *store, ColiExpertView *view) {
+    if (!store || !view || !store->gpu || dsv4_cuda_lost()) return -1;
+    V4GpuExpertMirrorCache *cache = v4_gpu_expert_cache(store, view->key.layer);
+    if (!cache) return -1;
+    V4GpuExpertMirrorCache *peer = v4_peer_pool();
+    pthread_mutex_lock(&g_v4_up.mutex);
+    if (!g_v4_up.started) {
+        g_v4_up.started =
+            pthread_create(&g_v4_up.thread, NULL, v4_uploader_main, NULL) == 0 ? 1 : -1;
+        if (g_v4_up.started > 0)
+            pthread_detach(g_v4_up.thread);
+        else
+            fprintf(stderr, "v4_gpu uploader: the thread did not start, the decode "
+                            "attaches stay on the generation thread\n");
+    }
+    if (g_v4_up.started < 0 || g_v4_up.tail - g_v4_up.head >= V4_UPLOAD_QUEUE ||
+        !v4_upload_note_device(cache->device) ||
+        (peer && !v4_upload_note_device(peer->device))) {
+        pthread_mutex_unlock(&g_v4_up.mutex);
+        return -1;
+    }
+    if (!g_v4_up.busy) {
+        /* the uploader is idle here: nothing else is in the backend */
+        if (g_v4_up.backend < 0)
+            g_v4_up.backend = dsv4_cuda_upload_fence(cache->device, 1) ? 1 : 0;
+        const char *fence = getenv("V4_UPLOAD_FENCE");
+        g_v4_up.sync = !g_v4_up.backend ? 1 : fence && *fence && atoi(fence) == 0 ? 2 : 3;
+    }
+    g_v4_up.queue[g_v4_up.tail % V4_UPLOAD_QUEUE] = (V4UploadJob){view, cache};
+    g_v4_up.tail++;
+    g_v4_up.busy++;
+    g_v4_up.jobs++;
+    pthread_cond_signal(&g_v4_up.ready);
+    pthread_mutex_unlock(&g_v4_up.mutex);
+    return 0;
+}
+
+void coli_v4_gpu_expert_upload_join(void) {
+    pthread_mutex_lock(&g_v4_up.mutex);
+    while (g_v4_up.busy > 0)
+        pthread_cond_wait(&g_v4_up.done, &g_v4_up.mutex);
+    int sync = g_v4_up.sync, count = g_v4_up.device_count;
+    pthread_mutex_unlock(&g_v4_up.mutex);
+    if (sync != 3) return;   /* the uploader drained its copies itself */
+    for (int i = 0; i < count; i++) {
+        if (dsv4_cuda_upload_fence(g_v4_up.devices[i], 0)) {
+            g_v4_up.fences++;
+        } else {
+            /* no event: wait for the copies here, before anything reads the mirrors */
+            dsv4_cuda_upload_fence(g_v4_up.devices[i], 1);
+            g_v4_up.fence_drains++;
+        }
+    }
+}
+
+void coli_v4_gpu_expert_upload_settle(void) {
+    pthread_mutex_lock(&g_v4_up.mutex);
+    while (g_v4_up.busy > 0)
+        pthread_cond_wait(&g_v4_up.done, &g_v4_up.mutex);
+    int sync = g_v4_up.sync, count = g_v4_up.device_count;
+    g_v4_up.device_count = 0;
+    pthread_mutex_unlock(&g_v4_up.mutex);
+    /* After an expert group that synchronized its stream behind the fence this
+     * waits on finished work; after a step that computed on the CPU instead it
+     * is what keeps the slabs in place under the copies. */
+    if (sync == 3)
+        for (int i = 0; i < count; i++)
+            dsv4_cuda_upload_fence(g_v4_up.devices[i], 1);
+}
+
+static void v4_upload_report(void) {
+    static unsigned long long reported;
+    if (g_v4_up.jobs == reported) return;
+    reported = g_v4_up.jobs;
+    fprintf(stderr, "v4_gpu uploader: jobs=%llu attached=%llu avg=%.3f ms copies=%s "
+                    "fences=%llu fence-drains=%llu\n",
+            g_v4_up.jobs, g_v4_up.attached,
+            1e3 * g_v4_up.seconds / (double)g_v4_up.jobs,
+            g_v4_up.sync == 3 ? "second-stream, fenced"
+            : g_v4_up.sync == 2 ? "second-stream, drained" : "compute-stream, drained",
+            g_v4_up.fences, g_v4_up.fence_drains);
 }
 
 /* Lookup-only twin of attach: report whether {layer, expert} is already

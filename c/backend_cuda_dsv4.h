@@ -89,6 +89,11 @@ int dsv4_cuda_device_unified(int device);
  * the CPU subset computes meanwhile, this closes the pipeline). Returns 1 on
  * success, 0 when the backend is unavailable. */
 int dsv4_cuda_stream_drain(int device);
+/* V4_UPLOAD_THREAD: dsv4_cuda_tensor_refill_fp4 with sync 2 or 3 copies on
+ * the device's second stream (2 drains it, 3 only enqueues). drain=0 orders
+ * the compute stream after the copies enqueued so far; drain=1 waits for them
+ * on the host. Returns 1 on success. */
+int dsv4_cuda_upload_fence(int device,int drain);
 int dsv4_cuda_kv_ring_append(int device,int layer,const float *rows,int start_pos,
                              int count,int window,int dim);
 int dsv4_cuda_kv_comp_append(int device,int layer,const float *rows,int start_idx,

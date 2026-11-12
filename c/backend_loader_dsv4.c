@@ -185,6 +185,7 @@ typedef const char     *(*fn_backend_name)(void);
 typedef long long       (*fn_mem_free_mb)(int device);
 typedef int             (*fn_device_unified)(int device);
 typedef int             (*fn_stream_drain)(int device);
+typedef int             (*fn_upload_fence)(int device, int drain);
 typedef int             (*fn_kv_ring_append)(int device, int layer, const float *rows,
                                              int start_pos, int count, int window, int dim);
 typedef int             (*fn_kv_comp_append)(int device, int layer, const float *rows,
@@ -347,6 +348,7 @@ static struct {
     fn_mem_free_mb mem_free_mb;
     fn_device_unified device_unified;     /* optional: older DLLs answer 0 (discrete) */
     fn_stream_drain stream_drain;                /* optional (older DLLs) */
+    fn_upload_fence upload_fence;                /* optional: the decode uploader thread (V4_UPLOAD_THREAD) */
     fn_kv_ring_append kv_ring_append;
     fn_kv_comp_append kv_comp_append;
     fn_head_argmax     head_argmax;
@@ -575,6 +577,7 @@ static int dsv4_cuda_resolve(const char *dllname){
     /* optional: an older DLL without the export keeps the whole tier alive;
      * the engine probes this and simply stays on synchronous attaches. */
     g_dsv4.stream_drain = (fn_stream_drain)GetProcAddress(g_dsv4.dll, "dsv4_cuda_stream_drain");
+    g_dsv4.upload_fence = (fn_upload_fence)GetProcAddress(g_dsv4.dll, "dsv4_cuda_upload_fence");
     g_dsv4.expert_bank_upload_aux = (fn_expert_bank_upload_aux)GetProcAddress(g_dsv4.dll, "dsv4_cuda_expert_bank_upload_aux");
     g_dsv4.expert_bank_slots = (fn_expert_bank_slots)GetProcAddress(g_dsv4.dll, "dsv4_cuda_expert_bank_slots");
     g_dsv4.expert_bank_slot_bytes = (fn_expert_bank_slot_bytes)GetProcAddress(g_dsv4.dll, "dsv4_cuda_expert_bank_slot_bytes");
@@ -995,6 +998,14 @@ int dsv4_cuda_stream_drain(int device){
     if(!g_dsv4.available) return 1;
     if(!g_dsv4.stream_drain) return 0;
     return g_dsv4.stream_drain(device);
+}
+
+/* V4_UPLOAD_THREAD. A DLL without the export answers 0: the engine asks once
+ * and its uploader then copies on the compute stream and drains it, as the
+ * inline attach does (an older DLL reads any non-zero sync as "drain"). */
+int dsv4_cuda_upload_fence(int device, int drain){
+    if(!g_dsv4.available || !g_dsv4.upload_fence) return 0;
+    return g_dsv4.upload_fence(device, drain);
 }
 
 int dsv4_cuda_kv_ring_append(int device, int layer, const float *rows, int start_pos,

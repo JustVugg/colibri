@@ -1167,6 +1167,17 @@ int coli_v4_hybrid_enabled(void);
 int coli_v4_gpu_expert_attach_async(ColiExpertStore *store,
                                     ColiExpertView *view);
 int coli_v4_gpu_expert_drain(ColiExpertStore *store);
+/* V4_UPLOAD_THREAD=1: a decode step hands the attach of an expert it read to
+ * the uploader thread and goes on to its next read. attach_queued returns 0
+ * when the view was handed over (it must stay in place, with its lease, until
+ * the settle) and -1 when the caller attaches it itself. The join waits for
+ * the handed views (their gpu handles are final when it returns) and orders
+ * every card's compute stream after the copies still in flight; the settle
+ * waits for those copies, before the leases are released. */
+int coli_v4_upload_thread_on(void);
+int coli_v4_gpu_expert_attach_queued(ColiExpertStore *store, ColiExpertView *view);
+void coli_v4_gpu_expert_upload_join(void);
+void coli_v4_gpu_expert_upload_settle(void);
 extern double g_v4_hyb_fill_bw, g_v4_hyb_host_bw;
 extern unsigned long long g_v4_hyb_gpu_n, g_v4_hyb_cpu_n;
 extern unsigned long long g_v4_hyb_upload_n, g_v4_hyb_skip_n;

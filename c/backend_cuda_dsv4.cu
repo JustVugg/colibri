@@ -56,7 +56,7 @@ struct Dsv4CudaExpertSet { ExpertPtr *table;int64_t *hash;Dsv4CudaTensor *sg,*su
 #if COLI_DSV4_TC
 struct TcPlan {int O,I,ok;cublasLtMatmulDesc_t op;cublasLtMatrixLayout_t a,b,c,d;cublasLtMatmulHeuristicResult_t algo;};
 #endif
-struct Dev { int id,sms,sm; cudaStream_t stream,aux; cudaEvent_t ready,fork,join;float *dx,*dy,*p1,*p2,*p3,*p4,*aux1,*aux2,*aux3; size_t xcap,ycap,p1cap,p2cap,p3cap,p4cap,aux1cap,aux2cap,aux3cap; float *hx,*hy;
+struct Dev { int id,sms,sm; cudaStream_t stream,aux; cudaEvent_t ready,fork,join,upfence;float *dx,*dy,*p1,*p2,*p3,*p4,*aux1,*aux2,*aux3; size_t xcap,ycap,p1cap,p2cap,p3cap,p4cap,aux1cap,aux2cap,aux3cap; float *hx,*hy;
 #ifdef COLI_DSV4_NCCL
     ncclComm_t ep_comm;
 #endif
@@ -1853,7 +1853,7 @@ static void dev_release(int n){
 #ifdef COLI_DSV4_DEEPGEMM
         if(g[i].dga1)cudaFree(g[i].dga1);if(g[i].dga2)cudaFree(g[i].dga2);if(g[i].dgsfa1)cudaFree(g[i].dgsfa1);if(g[i].dgsfa2)cudaFree(g[i].dgsfa2);if(g[i].dglayout)cudaFree(g[i].dglayout);if(g[i].dgrowmap)cudaFree(g[i].dgrowmap);if(g[i].dgmm1)cudaFree(g[i].dgmm1);if(g[i].dgmm2)cudaFree(g[i].dgmm2);if(g[i].dgref)cudaFree(g[i].dgref);if(g[i].dgdensews)cudaFree(g[i].dgdensews);
 #endif
-        tc_dev_free(&g[i]);if(g[i].hx)cudaFreeHost(g[i].hx);if(g[i].hy)cudaFreeHost(g[i].hy);if(g[i].ready)cudaEventDestroy(g[i].ready);if(g[i].fork)cudaEventDestroy(g[i].fork);if(g[i].join)cudaEventDestroy(g[i].join);if(g[i].aux)cudaStreamDestroy(g[i].aux);if(g[i].stream)cudaStreamDestroy(g[i].stream);
+        tc_dev_free(&g[i]);if(g[i].hx)cudaFreeHost(g[i].hx);if(g[i].hy)cudaFreeHost(g[i].hy);if(g[i].ready)cudaEventDestroy(g[i].ready);if(g[i].fork)cudaEventDestroy(g[i].fork);if(g[i].join)cudaEventDestroy(g[i].join);if(g[i].upfence)cudaEventDestroy(g[i].upfence);if(g[i].aux)cudaStreamDestroy(g[i].aux);if(g[i].stream)cudaStreamDestroy(g[i].stream);
         /* zero the slot: every buffer above is grown lazily through buf(), which
          * would cudaFree a stale pointer (and trust its cap) after a re-init */
         memset(&g[i],0,sizeof g[i]);}ng=0;
@@ -1970,16 +1970,24 @@ extern "C" int dsv4_cuda_upload_fp4(Dsv4CudaTensor **t,const uint8_t*w,const uin
  * copies are ordered on c->stream from pinned AND pageable slabs (a pageable
  * cudaMemcpyAsync stages the source before it returns, so the slab may be
  * released at once); sync=1 drains before returning. A legacy-stream
- * cudaMemcpy here was not ordered against the kernels on c->stream (see h2d). */
+ * cudaMemcpy here was not ordered against the kernels on c->stream (see h2d).
+ * sync 2 and 3 are the decode uploader thread's (V4_UPLOAD_THREAD): the
+ * copies go on the device's second stream, so they never queue behind the
+ * compute stream's kernels. 2 drains that stream before returning; 3 only
+ * enqueues, and dsv4_cuda_upload_fence orders the compute stream after the
+ * copies. */
 static bool host_pinned(const void*p,size_t len);
+static void upload_submit(Dev*c);
 extern "C" int dsv4_cuda_tensor_refill_fp4(Dsv4CudaTensor *t,const uint8_t*w,const uint8_t*s,int O,int I,int sync){
     if(!t||!w||!s||t->fmt!=4||t->O!=O||t->I!=I||!t->own_w||!t->own_scale||!t->w||!t->scale)return 0;
     Dev*c=ctx(t->device);if(!c||!ok(cudaSetDevice(t->device),"select refill device"))return 0;
     size_t wb=(size_t)O*I/2,sb=(size_t)O*I/32;
     if(host_pinned(w,wb))host_pinned(s,sb);   /* page-lock the slab when the cap allows: pure DMA then */
-    if(!ok(cudaMemcpyAsync(t->w,w,wb,cudaMemcpyHostToDevice,c->stream),"refill weight upload")||
-       !ok(cudaMemcpyAsync(t->scale,s,sb,cudaMemcpyHostToDevice,c->stream),"refill scale upload"))return 0;
-    if(sync&&!ok(cudaStreamSynchronize(c->stream),"refill drain"))return 0;
+    cudaStream_t cs=sync>=2?c->aux:c->stream;
+    if(!ok(cudaMemcpyAsync(t->w,w,wb,cudaMemcpyHostToDevice,cs),"refill weight upload")||
+       !ok(cudaMemcpyAsync(t->scale,s,sb,cudaMemcpyHostToDevice,cs),"refill scale upload"))return 0;
+    if(sync==3){upload_submit(c);return 1;}
+    if(sync&&!ok(cudaStreamSynchronize(cs),"refill drain"))return 0;
     return 1;
 }
 extern "C" int dsv4_cuda_upload_bf16(Dsv4CudaTensor **t,const uint16_t*w,int O,int I,int d){return upload(t,w,(size_t)O*I*2,nullptr,0,O,I,d,16);}
@@ -3137,6 +3145,26 @@ extern "C" int dsv4_cuda_stream_drain(int device){
     Dev*c=ctx(device);if(!c)return 0;
     if(!ok(cudaSetDevice(device),"select drain device"))return 0;
     return ok(cudaStreamSynchronize(c->stream),"hybrid drain")?1:0;
+}
+/* The decode uploader thread (V4_UPLOAD_THREAD) enqueues its mirror refills
+ * on the device's second stream and returns (refill sync 3). drain=0: record
+ * an event behind those copies and make the compute stream wait for it, so
+ * whatever the caller launches next on the compute stream (the expert group)
+ * runs after the copies, and the host waits for neither. drain=1: wait for
+ * the second stream on the host, before the slabs the copies read from are
+ * released; with nothing enqueued it returns at once, which is how the
+ * engine asks whether the backend has this entry. */
+/* An enqueue-only copy is the last call its thread makes: ask the stream for
+ * its status so the driver submits the copy now and the transfer runs under
+ * the reads that follow, not when the next call on this device happens to
+ * flush it (WDDM batches a thread's submissions). */
+static void upload_submit(Dev*c){cudaError_t e=cudaStreamQuery(c->aux);if(e!=cudaSuccess&&e!=cudaErrorNotReady)ok(e,"upload submit");}
+extern "C" int dsv4_cuda_upload_fence(int device,int drain){
+    Dev*c=ctx(device);if(!c||!ok(cudaSetDevice(device),"select upload fence device"))return 0;
+    if(drain)return ok(cudaStreamSynchronize(c->aux),"upload drain")?1:0;
+    if(!c->upfence&&!ok(cudaEventCreateWithFlags(&c->upfence,cudaEventDisableTiming),"upload fence event"))return 0;
+    return ok(cudaEventRecord(c->upfence,c->aux),"upload fence record")&&
+           ok(cudaStreamWaitEvent(c->stream,c->upfence,0),"upload fence wait")?1:0;
 }
 
 static int bank_upload_stream(Dsv4CudaExpertSet*set,int e,
