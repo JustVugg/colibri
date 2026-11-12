@@ -200,6 +200,49 @@ class Qwen36PrefixServeTest(PrefixReuseContract, unittest.TestCase):
             finally:
                 engine.close()
 
+    def _retention_engine(self, cache_dir, extra_env):
+        env = {"SNAP": str(FIXTURE), "SERVE": "1", "COLI_DENSE_I8": "0",
+               "COLI_PROMPT_CACHE": "1", "COLI_PROMPT_CACHE_MIN": "",
+               "COLI_PROMPT_CACHE_DIR": str(cache_dir)}
+        env.update(extra_env)
+        return self.watch(ServeEngine(ENGINE, ["8", "8"], env, log_prefix=False))
+
+    def test_disk_snapshot_retention_prunes_by_count_and_bytes(self):
+        first = b"retention-case-alpha " * 15    # 300 tokens, stores a snapshot
+        second = b"retention-case-bravo " * 13   # 260 tokens, stores a snapshot
+        with tempfile.TemporaryDirectory(prefix="qwen36-pcache-count-") as cache_dir:
+            engine = self._retention_engine(cache_dir, {"COLI_PROMPT_CACHE_MAX": "1",
+                                                        "COLI_PROMPT_CACHE_GB": "0"})
+            try:
+                engine.ask("store-a", first, max_tok=1)
+                engine.ask("store-b", second, max_tok=1)
+                files = list(Path(cache_dir).glob("pfx_*.bin"))
+                self.assertEqual(len(files), 1,
+                                 "file-count cap did not evict down to one file")
+                engine.ask("restore-b", second, max_tok=1)
+                self.assertIn("prefix_reuse_source=disk_snapshot", engine.last_done,
+                              "retention removed the newest snapshot it just kept")
+            finally:
+                engine.close()
+        with tempfile.TemporaryDirectory(prefix="qwen36-pcache-bytes-") as cache_dir:
+            # A byte budget of ~1 byte is below any snapshot's size: storing the
+            # second snapshot must evict the first even though the file-count
+            # cap of 2 would have kept both. This is the gap the file-count cap
+            # alone cannot express.
+            engine = self._retention_engine(cache_dir, {"COLI_PROMPT_CACHE_MAX": "2",
+                                                        "COLI_PROMPT_CACHE_GB": "0.000000001"})
+            try:
+                engine.ask("store-a", first, max_tok=1)
+                engine.ask("store-b", second, max_tok=1)
+                files = list(Path(cache_dir).glob("pfx_*.bin"))
+                self.assertEqual(len(files), 1,
+                                 "byte budget did not evict the older snapshot")
+                engine.ask("restore-b", second, max_tok=1)
+                self.assertIn("prefix_reuse_source=disk_snapshot", engine.last_done,
+                              "byte-budget eviction removed the newest snapshot")
+            finally:
+                engine.close()
+
     def test_multiplexed_submissions_are_not_consumed_by_cancel_poll(self):
         wire = b""
         for slot, rid in enumerate(("mux-a", "mux-b")):

@@ -8126,6 +8126,11 @@ static int q36_pcache_max_files(void) {   /* files kept in the directory; 0 = ne
     int v = e && *e ? atoi(e) : 8;
     return v < 0 ? 0 : v > 64 ? 64 : v;
 }
+static double q36_pcache_max_gb(void) {   /* total snapshot bytes kept; 0 = no byte budget */
+    const char *e = getenv("COLI_PROMPT_CACHE_GB");
+    double v = e && *e ? atof(e) : 8.0;
+    return v < 0 ? 0 : v > 1024 ? 1024 : v;
+}
 
 static uint64_t q36_fnv64a(uint64_t h, const void *p, size_t n) {
     const uint8_t *b = (const uint8_t *)p;
@@ -8160,15 +8165,20 @@ static void q36_pcache_mkdir(void) {
 #endif
 }
 
-/* LRU eviction: remove the oldest modification time first. `keep_path` survives;
+/* Retention: oldest modification time first, under both a file-count cap and a
+ * total-bytes budget (`COLI_PROMPT_CACHE_MAX`, `COLI_PROMPT_CACHE_GB`). A count
+ * cap alone is blind to snapshot size: snapshots scale with prompt length, so a
+ * few long-session states can fill the count cap and silently evict a small
+ * prompt's snapshot that repeated requests still need. `keep_path` survives;
  * restored snapshots update their modification time to count as use. */
 static void q36_pcache_prune(const char *keep_path) {
     int maxf = q36_pcache_max_files();
-    if (maxf <= 0) return;
+    double maxb = q36_pcache_max_gb() * 1073741824.0;
+    if (maxf <= 0 && maxb <= 0) return;
     DIR *d = opendir(g_pc_dir);
     if (!d) return;
     struct dirent *de;
-    char name[64][512]; double born[64]; int n = 0;
+    char name[64][512]; double born[64]; double bytes[64]; int n = 0;
     while ((de = readdir(d)) != NULL && n < 64) {
         if (strncmp(de->d_name, "pfx_", 4) != 0 || !strstr(de->d_name, ".bin")) continue;
         char full[4352]; snprintf(full, sizeof full, "%s/%s", g_pc_dir, de->d_name);
@@ -8183,15 +8193,23 @@ static void q36_pcache_prune(const char *keep_path) {
         }
         if (llen < 0) { remove(full); continue; }   /* not a snapshot this engine wrote: gone */
         if (stat(full, &sb) != 0) { remove(full); continue; }
-        snprintf(name[n], sizeof name[0], "%s", full); born[n] = sb.st_mtime; n++;
+        snprintf(name[n], sizeof name[0], "%s", full); born[n] = sb.st_mtime; bytes[n] = (double)sb.st_size; n++;
     }
     closedir(d);
+    double keep_bytes = 0;
+    struct stat ksb;
+    if (stat(keep_path, &ksb) == 0) keep_bytes = (double)ksb.st_size;
     int count = n + 1;                          /* the candidates + the file just written */
-    for (int kills = count - maxf; kills > 0; kills--) {
+    double total = keep_bytes;
+    for (int j = 0; j < n; j++) total += bytes[j];
+    for (;;) {
+        int over = (maxf > 0 && count > maxf) || (maxb > 0 && total > maxb);
+        if (!over) break;
         int wi = -1;
         for (int j = 0; j < n; j++)
             if (born[j] >= 0 && (wi < 0 || born[j] < born[wi])) wi = j;
-        if (wi < 0) break;                      /* fewer stored than the cap wants gone */
+        if (wi < 0) break;                      /* fewer stored than the caps want gone */
+        total -= bytes[wi]; count--;
         remove(name[wi]);
         born[wi] = -1;
     }
