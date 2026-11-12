@@ -431,10 +431,11 @@ short of: its attention then stays on the device.
 
 Measured on an RTX 5080 16 GB (Ryzen 9 5950X, Windows 11, `--memory-gb
 16`, V4 Flash, a 3,278-token prompt, 36 tokens, greedy, the same text in
-every run): `decprof` attention 84 -> 21 ms per token, the 35 tokens
-after the first 22.5 -> 20.2 s, and 80.6 -> 60.6 s to the first token (the
-556 allocation failures of the prompt gone). Both verifiers clean over
-1,505 calls each.
+every run, three runs per setting): `decprof` attention 81.6 -> 20.1 ms
+per token, the 35 tokens after the first 22.81 -> 20.52 s, and 85.0 ->
+63.2 s to the first token (the 556 allocation failures of the prompt
+gone). Both verifiers clean over 1,505 calls each. The record is in
+`docs/experiments/v4-decode-attention-fused-2026-11-12/`.
 
 ### Decode on two GPUs (peer mirror pool) and VRAM-first lookups
 
