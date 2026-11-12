@@ -1421,6 +1421,102 @@ static int test_expert_store_per_matrix_direct(void) {
     return 0;
 }
 
+/* V4_SLAB_SHIFT: a direct read leaves the record where its window landed.
+ * Expert 0 of the fixture has its scales and weights apart in the file (the
+ * weights' window, the scales buffered); the others are one contiguous
+ * record (one window). Every byte of every tensor is compared, with the
+ * switch unset and with 0, and the weights' address says which path ran. */
+static int slab_shift_check(ColiExpertStore *store, int expert, int kept,
+                            uint64_t payload_at) {
+    ColiExpertView view;
+    if (coli_expert_lookup(store, (ColiExpertKey){0, expert}, &view) != 0) {
+        fprintf(stderr, "slab shift: lookup of expert %d failed\n", expert);
+        return 1;
+    }
+    int scale = expert ? 4 + expert * 51 : 0;
+    int weight = scale + 3 + (expert ? 0 : 4);
+    const ColiTensorView *tensors[3] = {&view.gate, &view.down, &view.up};
+    int bad = !expect_fixture_expert(&view, expert);
+    for (int matrix = 0; matrix < 3 && !bad; matrix++) {
+        const unsigned char *data = tensors[matrix]->data;
+        const unsigned char *scales = tensors[matrix]->scales;
+        if (scales[0] != (unsigned char)(scale + matrix)) bad = 1;
+        for (int byte = 0; byte < 16; byte++)
+            if (data[byte] != (unsigned char)(weight + matrix * 16 + byte)) bad = 1;
+    }
+    /* kept: the weights sit at their file offset modulo a page (the slab is
+     * page-aligned). moved: they follow the three scale bytes. */
+    const unsigned char *gate_data = view.gate.data, *gate_scales = view.gate.scales;
+    uintptr_t in_page = (uintptr_t)gate_data & 4095u;
+    uint64_t file_in_page = (payload_at + (uint64_t)weight) & 4095u;
+    if (!bad && kept && in_page != (uintptr_t)file_in_page) {
+        fprintf(stderr, "slab shift: expert %d was moved (address %zu in its page, "
+                        "file offset %llu)\n", expert, (size_t)in_page,
+                (unsigned long long)file_in_page);
+        bad = 1;
+    }
+    if (!bad && !kept && gate_data != gate_scales + 3) {
+        fprintf(stderr, "slab shift: expert %d was not moved with V4_SLAB_SHIFT=0\n", expert);
+        bad = 1;
+    }
+    if (bad) fprintf(stderr, "slab shift: expert %d differs (kept=%d)\n", expert, kept);
+    coli_expert_release(store, &view);
+    return bad;
+}
+
+static int test_expert_store_slab_shift(void) {
+    setenv("COLI_V4_AUTOPIN", "0", 1);
+    setenv("COLI_V4_SAVE_USAGE", "0", 1);
+    setenv("COLI_V4_ROWS16", "0", 1);
+    setenv("COLI_V4_PREWARM", "0", 1);
+    unsetenv("COLI_V4_DIRECT");
+    for (int pass = 0; pass < 2; pass++) {
+        int kept = pass == 0;
+        if (kept) unsetenv("V4_SLAB_SHIFT"); else setenv("V4_SLAB_SHIFT", "0", 1);
+        char directory[] = "colibri-v4-shift-XXXXXX";
+        char path[256], error[256];
+        if (!mkdtemp(directory)) { perror("mkdtemp slab shift"); return 1; }
+        snprintf(path, sizeof(path), "%s/model.safetensors", directory);
+        if (write_fixture(path) != 0) { perror("write_fixture"); rmdir(directory); return 1; }
+        uint64_t header_length = 0;
+        int fd = open(path, O_RDONLY | COMPAT_O_BINARY);
+        int header_read = fd >= 0 && read(fd, &header_length, sizeof(header_length)) ==
+                                         (ssize_t)sizeof(header_length);
+        if (fd >= 0) close(fd);
+        if (!header_read) { unlink(path); rmdir(directory); return 1; }
+        ColiDeepSeekV4ExpertStoreOptions options = {
+            directory, 1, 7, 306, -1, 0, 0, 0
+        };
+        ColiExpertStore *store = NULL;
+        if (coli_deepseek_v4_expert_store_open(&options, &store,
+                                                error, sizeof(error)) != 0) {
+            fprintf(stderr, "%s\n", error);
+            unlink(path); rmdir(directory);
+            return 1;
+        }
+        int failed = coli_v4_test_force_streaming_direct(store) != 0;
+        if (failed) fprintf(stderr, "slab shift: no streaming-direct fd\n");
+        coli_v4_test_reset_direct_io_stats();
+        /* apart, contiguous, contiguous, then the first two again from RAM */
+        static const int order[5] = {0, 3, 6, 0, 3};
+        for (int i = 0; i < 5 && !failed; i++)
+            failed = slab_shift_check(store, order[i], kept, 8 + header_length);
+        uint64_t reads = coli_v4_test_direct_reads();
+        uint64_t fallbacks = coli_v4_test_direct_fallbacks();
+        store->ops->destroy(store);
+        if (scratch_remove(directory, path)) return 1;
+        if (failed) return 1;
+        if (reads != 3 || fallbacks != 0) {
+            fprintf(stderr, "slab shift: direct reads=%llu fallbacks=%llu (kept=%d)\n",
+                    (unsigned long long)reads, (unsigned long long)fallbacks, kept);
+            return 1;
+        }
+    }
+    unsetenv("V4_SLAB_SHIFT");
+    puts("DeepSeek-V4 ExpertStore slab shift: ok");
+    return 0;
+}
+
 static int prewarm_resident(ColiExpertStore *store, int layers, int experts) {
     int resident = 0;
     for (int layer = 0; layer < layers; layer++)
@@ -2651,6 +2747,10 @@ int main(int argc, char **argv) {
     }
     if (test_expert_store_per_matrix_direct() != 0) {
         fprintf(stderr, "FAIL: test_expert_store_per_matrix_direct\n");
+        return 1;
+    }
+    if (test_expert_store_slab_shift() != 0) {
+        fprintf(stderr, "FAIL: test_expert_store_slab_shift\n");
         return 1;
     }
     if (test_expert_store_prewarm() != 0) {
