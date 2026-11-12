@@ -210,3 +210,13 @@ c/*.err
 # kv-quant run artifacts and fixtures
 c/dsv41_kvq_*/
 kvq-*.csv
+# ...and the logits/token dumps its arms write into c/ (each arm `rm -f`s its own at the
+# start and leaves them behind): `kv-quant-deepseek` is the lane this branch owns, and a
+# lane run leaves seven untracked names that a `git add -A` before a push would ship.
+c/off.f32
+c/on.f32
+c/off.txt
+c/on.txt
+c/plain.txt
+c/forced.txt
+c/self.json
