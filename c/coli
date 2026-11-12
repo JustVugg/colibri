@@ -754,11 +754,10 @@ def env_for_engine(a, arch, plan=None):
 
 def dsv4_cuda_available(model=None):
     # Windows loads the tier as a runtime DLL next to the engine; Linux links
-    # it straight into the binary (nvcc, -lcudart), so the DLL check there
-    # rejected every valid `make deepseek-v4 CUDA=1` build (#1219). Detect the
-    # Linux build through the dynamic libcudart entry added by the in-tree
-    # CUDA=1 target. DeepSeek V4 has no HIP backend, so libamdhip64 alone must
-    # not make a CPU engine look GPU-capable.
+    # it straight into the binary (nvcc, -lcudart; hipcc, -lamdhip64), so the
+    # DLL check there rejected every valid `make deepseek-v4 CUDA=1` build
+    # (#1219). Detect the Linux build through the dynamic runtime library
+    # added by the in-tree CUDA=1 / HIP=1 target.
     eng = engine_for(model) if model else GLM
     if sys.platform == "win32":
         # backend_loader_dsv4.c tries the DeepGEMM build first and the generic
@@ -769,7 +768,8 @@ def dsv4_cuda_available(model=None):
     if sys.platform == "linux" and os.path.exists(eng):
         try:
             linked = subprocess.run(["ldd", eng], capture_output=True, text=True, timeout=3)
-            return any("libcudart" in line and "not found" not in line
+            return any(("libcudart" in line or "libamdhip64" in line) and
+                       "not found" not in line
                        for line in linked.stdout.splitlines())
         except (OSError, subprocess.SubprocessError):
             return False

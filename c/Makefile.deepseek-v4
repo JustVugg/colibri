@@ -212,6 +212,24 @@ LDFLAGS += -L$(CUDA_HOME)/lib64 -L$(CUDA_HOME)/lib64/stubs -Wl,-rpath,$(CUDA_HOM
 endif
 endif
 
+# ---- Linux HIP tier (opt-in): HIP=1 ------------------------------------------
+# The same backend_cuda_dsv4.cu, compiled by hipcc and linked straight into the
+# engine like CUDA=1 (needs ROCm 6.3+: OCP fp8 in <hip/hip_fp8.h>). cuBLASLt and
+# DeepGEMM are NVIDIA-only, so NO_TC is implied.
+HIP ?= 0
+ifeq ($(HIP),1)
+ifeq ($(IS_WIN),)
+ROCM_HOME ?= /opt/rocm
+HIP_ARCH ?= native
+NVCC = hipcc
+NO_TC = 1
+V4_NVCCFLAGS = -O3 -std=c++20 --offload-arch=$(HIP_ARCH) -DCOLI_DSV4_NO_TC -D_GNU_SOURCE -fPIC
+CFLAGS += -DCOLI_V4_GPU_TIER -DCOLI_V4_HIP
+V4_WIN_EXTRA_OBJS += backend_cuda_dsv4.o
+LDFLAGS += -L$(ROCM_HOME)/lib -Wl,-rpath,$(ROCM_HOME)/lib -lamdhip64 -lstdc++
+endif
+endif
+
 # ---- Vulkan (opt-in): VK=1 ---------------------------------------------------
 # The parent Makefile's VK=1, for this engine: -DCOLI_VULKAN, the backend object
 # and the SPIR-V shaders it loads at run time (COLI_VK_SHADERS, else shaders/ next

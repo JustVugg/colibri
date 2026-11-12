@@ -10258,8 +10258,14 @@ static int hot_pack_matrix(ColiTensorView *view, unsigned char *scratch) {
  * different order (not bitwise the reference), which makes greedy text depend
  * on which experts happen to be hot; this valve removes that variable for
  * numerics comparisons (measured 2026-08-15). */
+#ifdef COLI_V4_HIP
+extern int g_v4_gpu_mirror_on;   /* a packed rows16 view is refused by the mirror */
+#endif
 static int hot_rows16_wanted(void) {
     static int rows16 = -1;
+#ifdef COLI_V4_HIP
+    if (g_v4_gpu_mirror_on) return 0;
+#endif
     if (rows16 < 0) {
         const char *env = getenv("COLI_V4_ROWS16");
         rows16 = !(env && *env == '0');
@@ -12097,6 +12103,10 @@ static int g_v4_gpu_open_device = -1;
 static int v4_gpu_wanted(void) {
     const char *setting = getenv("DSV4_CUDA");
     if (setting && atoi(setting) == 0) return 0;
+#ifdef COLI_V4_HIP
+    setting = getenv("COLI_CUDA");   /* coli --gpu none */
+    if (setting && atoi(setting) == 0) return 0;
+#endif
     return 1;
 }
 
@@ -12140,6 +12150,29 @@ static void v4_gpu_route_scratch_clear(void) {
     }
 }
 
+#ifdef COLI_V4_HIP
+/* coli --vram N reaches the engine as CUDA_EXPERT_GB, the name the other
+ * engines take on HIP too (GPU_BACKENDS.md). The expert mirrors may
+ * grow until the card has that much less free than it had at open: the hold
+ * is a floor for the mirror guard's reserve (v4_gpu_mirror_reserve_mb). Below
+ * 10 GiB the dense/attention mirrors (6.2 GiB) are worth less on the card
+ * than the same VRAM as expert mirrors, so they stay in RAM. */
+static long long g_v4_vram_hold_mb;
+int g_v4_gpu_mirror_on;   /* defined in the GPU unit, read by the expert store */
+
+static void v4_gpu_place(ColiV4Engine *engine, int device) {
+    const char *gb = getenv("CUDA_EXPERT_GB");
+    long long free_mb = dsv4_cuda_mem_free_mb(device);
+    long long budget_mb = gb && atof(gb) > 0.0 ? (long long)(atof(gb) * 1024.0)
+                                               : free_mb;
+    if (budget_mb > free_mb) budget_mb = free_mb;
+    g_v4_vram_hold_mb = free_mb - budget_mb;
+    engine->gpu.dense_ram = budget_mb < (10LL << 10);
+    fprintf(stderr, "v4_gpu place device=%d budget=%lldMiB dense=%s\n", device,
+            budget_mb, engine->gpu.dense_ram ? "ram" : "card");
+}
+#endif
+
 int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     if (!engine) return -1;
     engine->gpu.enabled = 0;
@@ -12172,6 +12205,9 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
         count = coli_v4_gpu_devices_parse(setting, engine->gpu.devices);
     } else {
         const char *device_setting = getenv("DSV4_CUDA_DEVICE");
+#ifdef COLI_V4_HIP
+        if (!device_setting) device_setting = getenv("COLI_GPUS");   /* coli --gpu N: the first */
+#endif
         engine->gpu.devices[0] = device_setting ? atoi(device_setting) : 0;
     }
     if (count < 1 || count > engine->config.num_hidden_layers) {
@@ -12261,6 +12297,9 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     engine->gpu.enabled = 1;
     engine->gpu.device = device;
     g_v4_gpu_open_device = device;
+#ifdef COLI_V4_HIP
+    if (count == 1 && ndevices == 1) v4_gpu_place(engine, device);
+#endif
     v4_gpu_mirror_reserve_size(&engine->config,
                                !coli_v4_index_gguf(engine->target_index));
     /* Routed-expert fp4 mirror caches hang off the expert store, one per
@@ -12275,6 +12314,9 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
             return -1;
         }
     }
+#ifdef COLI_V4_HIP
+    g_v4_gpu_mirror_on = engine->experts && engine->experts->gpu;
+#endif
     /* VRAM-first decode never asks the store for a mirrored expert: its RAM
      * pin ranking leaves them out (the peer pool's too, once there is one). */
     if (engine->experts && engine->experts->gpu &&
@@ -12594,6 +12636,7 @@ int coli_v4_gpu_layer_upload(ColiV4Engine *engine, int layer,
     int device = engine->gpu.devices[owner];
     if (layer < 0 || layer >= COLI_V4_RESIDENT_MAX_LAYERS) return 0;
     if (engine->gpu.layer_ready[layer]) return 0;
+    if (engine->gpu.dense_ram) return 0;
     static const char *const tensors[] = {
         "attn.wq_a", "attn.wq_b", "attn.wkv", "attn.wo_a", "attn.wo_b",
         "ffn.shared_experts.w1", "ffn.shared_experts.w2", "ffn.shared_experts.w3"
@@ -13259,6 +13302,12 @@ int coli_v4_gpu_experts_preload(ColiV4Engine *engine, char *error, size_t size) 
     int experts = engine->config.n_routed_experts;
     int hidden = engine->config.hidden_size;
     int intermediate = engine->config.moe_intermediate_size;
+    if (engine->gpu.dense_ram) {   /* dense and shared experts live in RAM */
+        if (error && size)
+            snprintf(error, size, "the GPU keeps dense and shared experts in RAM "
+                                  "below 10 GiB (use --vram 10 or more)");
+        return 1;
+    }
     if (layers < 1 || layers > COLI_V4_RESIDENT_MAX_LAYERS ||
         engine->gpu.device_count < 1 || engine->gpu.device_count > layers ||
         experts < 1 || hidden < 1 || intermediate < 1) return -1;
@@ -13977,11 +14026,19 @@ static long long v4_gpu_mirror_reserve_mb(int live, long long *margin_mb) {
         explicit_mb = env ? atoll(env) : -1;
         if (env && explicit_mb < 256) explicit_mb = 256;
     }
+#ifdef COLI_V4_HIP
+    /* --vram's hold and an explicit reserve are both floors: they compose */
+    if (explicit_mb >= 0)
+        return explicit_mb > g_v4_vram_hold_mb ? explicit_mb : g_v4_vram_hold_mb;
+#endif
     if (explicit_mb >= 0) return explicit_mb;
     long long reserve_mb = coli_v4_mirror_reserve_mb(
         v4_reserve_bank_bytes,
         v4_bank_double_usable() ? 2 : 1,
         v4_reserve_mirror_bytes, live);
+#ifdef COLI_V4_HIP
+    if (g_v4_vram_hold_mb > reserve_mb) reserve_mb = g_v4_vram_hold_mb;
+#endif
     if (margin_mb && v4_reserve_bank_bytes > 0)
         *margin_mb = (COLI_V4_MIRROR_PROBE_EVERY * v4_reserve_mirror_bytes +
                       (1LL << 20) - 1) >> 20;

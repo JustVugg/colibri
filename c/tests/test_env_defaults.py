@@ -322,9 +322,10 @@ class Dsv4CudaDetectTest(unittest.TestCase):
         out = "\tlibcudart.so.12 => /opt/cuda/lib64/libcudart.so.12 (0x00007f)\n"
         self.assertTrue(self._detect("linux", ldd_stdout=out))
 
-    def test_linux_hip_link_is_not_dsv4_cuda(self):
+    def test_linux_hip_link_is_dsv4_cuda(self):
+        # The native V4 tier is a HIP build too (libamdhip64).
         out = "\tlibamdhip64.so.6 => /opt/rocm/lib/libamdhip64.so.6 (0x00007f)\n"
-        self.assertFalse(self._detect("linux", ldd_stdout=out))
+        self.assertTrue(self._detect("linux", ldd_stdout=out))
 
     def test_linux_cpu_build_rejected(self):
         out = "\tlibc.so.6 => /usr/lib/libc.so.6 (0x00007f)\n"

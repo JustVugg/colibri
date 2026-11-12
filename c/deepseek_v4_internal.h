@@ -1226,6 +1226,7 @@ struct ColiV4Engine {
         int device_count;
         unsigned char layer_ready[COLI_V4_RESIDENT_MAX_LAYERS];
         long long uploaded_bytes;
+        int dense_ram;      /* HIP: the dense/attention mirrors stay in RAM */
         /* Optional opaque V4GpuExpertMirrorCache* for the dspark/MTP draft
          * experts (separate bounded LRU; see dspark_mirrors_ensure). NULL
          * unless V4_MTP_GPU=1 and the tier opened successfully. */
