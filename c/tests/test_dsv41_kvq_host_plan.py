@@ -189,6 +189,17 @@ class Dsv41KvqHostPlanTest(unittest.TestCase):
         self.assertEqual(_geometry(16384, False, drop=("dspark_target_layer_ids",)).workspace_bytes,
                          16384 * (104092 - 3 * 5120) * 4 + 5120 * 4)
 
+    def test_a_config_spelling_the_heads_n_heads_prices_the_same(self):
+        # deepseek_v41.c:199 reads n_heads first and num_attention_heads second, so the
+        # engine serves a config that spells only the alias. The workspace closed form
+        # holds the queries at that width, so the planner has to read it the same way --
+        # and with the engine's precedence when both keys are present.
+        alias = _geometry(16384, False, drop=("num_attention_heads",), n_heads=64)
+        self.assertEqual(alias.workspace_bytes, 16384 * 416368 + 5120 * 4)
+        both = _geometry(16384, False, n_heads=32, num_attention_heads=64)
+        self.assertEqual(both.workspace_bytes, 16384 * (104092 - 32 * 512) * 4 + 5120 * 4,
+                         "n_heads wins, as it does in the engine")
+
     def test_the_geometry_guard_keeps_the_fp32_price(self):
         # the formats are defined at head_dim 512 / index_head_dim 128: at any other
         # geometry the engine keeps the fp32 host, and the planner must price fp32 there

@@ -947,7 +947,7 @@ def _dsv41_geometry(config, context, _model_dir):
     buffers plus attention_run's, at the context (deepseek_v41.c prefill is one forward
     over the prompt -- there is no chunk size to bound it), named term by term below.
     Pricing a prompt chunk instead under-reserved it by the rows the engine actually
-    asks for (266x at 262144).
+    asks for (262164480 B priced against 109148393472 B allocated at 262144, 416x).
     """
     section = config.get("text_config", config)
     layers = _required_int(section, "num_hidden_layers", "deepseek_v41")
@@ -1045,8 +1045,20 @@ def _dsv41_geometry(config, context, _model_dir):
     # head_dim * 4 = 4 MiB at 32 rows), its `head_score` (n_heads * (window + index_topk) *
     # 4 = 163,840 B), and forward_full's `embedded` and `collapsed` rows (2 * hidden * 4).
     # The single `hidden` row below is the one the old form priced.
+    #
+    # Context-sized and still unpriced, one layer's worth at a time: attention_run's own
+    # per-call buffers, allocated at its top and freed at its end -- `latent`
+    # ((n/ratio + 1) * head_dim floats: 256.0 MiB at 262144 ratio 2), `kv_all`
+    # ((window_rows + compress_len) * head_dim: 805.3 MB there, window_rows being n during
+    # prefill and the ring's 128 during decode) and the packed ring's `win_dec`
+    # (window * head_dim = 256 KB). 1.07 GB together at 262144 ratio 2, 1.61 GB at ratio 1:
+    # under 1.5% of the 101.65 GiB price, and not live beside the next layer's.
     q_lora = _required_int(section, "q_lora_rank", "deepseek_v41")
-    heads = _required_int(section, "num_attention_heads", "deepseek_v41")
+    # The engine reads n_heads first and num_attention_heads second (deepseek_v41.c:199),
+    # so a config spelling only the alias is served: pricing it must not refuse it, and
+    # where both are present the engine's precedence (n_heads) is the one priced.
+    heads = _required_int(section, "n_heads", "deepseek_v41") if "n_heads" in section \
+        else _required_int(section, "num_attention_heads", "deepseek_v41")
     index_topk = _required_int(section, "index_topk", "deepseek_v41")
     # The engine reads at most eight target layers (deepseek_v41.c:299) and keeps
     # main_hidden only when a draft head loaded, which is the same condition as `stages`.
