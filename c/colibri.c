@@ -3261,6 +3261,12 @@ static void *map_of_fd(int fd){
 #endif
         }
     }
+#elif defined(_WIN32)
+    /* the whole shard as one read-only view, kept for the life of the process like the mmap above */
+    struct stat st; compat_ro_map wm; const void *wp;
+    if(g_nmaps<512 && fstat(fd,&st)==0 && compat_map_readonly(fd,0,(size_t)st.st_size,&wm,&wp)==0){
+        base=(void*)wp; g_maps[g_nmaps].fd=fd; g_maps[g_nmaps].base=base; g_maps[g_nmaps].len=wm.len; g_nmaps++;
+    }
 #endif
     pthread_mutex_unlock(&g_map_mtx);
     return base;

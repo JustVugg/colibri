@@ -156,6 +156,22 @@ class TrunkResidentLayersTest(unittest.TestCase):
             f"`resident dense` did not drop ({rb} -> {ro} MB): the trunk pages "
             f"were not actually handed to mmap (knob set but no effect)")
 
+    def test_trunk_and_experts_mapped_keep_tokens(self):
+        """TRUNK_RESIDENT_LAYERS=0 COLI_MMAP=1, the low-RAM combination the docs
+        give (#1764): the routed experts become views of the same mapping as the
+        trunk, so the tokens must still be the resident baseline's and the
+        resident dense must still drop. Before map_of_fd mapped on Windows both
+        knobs fell back to copies there without a word."""
+        base_t, base_p = self._run()
+        map_t, map_p = self._run(TRUNK_RESIDENT_LAYERS="0", COLI_MMAP="1")
+        for name, t in (("baseline", base_t), ("mapped", map_t)):
+            self.assertEqual(t["returncode"], 0,
+                             f"{name} exited non-zero:\n{t.get('stderr', '')}")
+        self.assertEqual(self._ids(base_p), self._ids(map_p),
+                         "COLI_MMAP=1 with the trunk mapped changed the decoded tokens")
+        self.assertLess(self._resident_mb(map_t), self._resident_mb(base_t),
+                        "`resident dense` did not drop with the trunk mapped")
+
     def test_unset_and_above_nlayers_are_noops(self):
         """Unset and >= n_layers both change nothing (condition 1 of the review).
 
