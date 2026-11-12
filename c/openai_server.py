@@ -6662,14 +6662,14 @@ def cap_for_arch(arch, cap, env=None, model=None):
         # nearly every expert from the disk: the setup passes --auto-tier only
         # for CUDA. Qwen3.8 on a 61 GB box planned 275 slots and started at 1;
         # Qwen3.6 plans 153 at 20 GB, and coli tune measured 105 on a 32 GB laptop.
-        from resource_plan import build_plan
+        from resource_plan import build_plan, format_bytes
         settings = env if env is not None else os.environ
         ram = settings.get("RAM_GB", "0")
         limits = family_by_id(arch).limits
+        context = int(settings.get(limits.context_env, limits.default_context))
         try:
             plan = build_plan(model, ram_gb=0 if ram == "auto" else float(ram),
-                              context=int(settings.get(limits.context_env, limits.default_context)),
-                              gpu_indices=[])
+                              context=context, gpu_indices=[])
             slots = plan["tiers"]["ram"]["cache_slots_per_layer"]
         except (OSError, ValueError, KeyError, TypeError) as error:
             if arch in ("deepseek_v41", "mimo"):
@@ -6690,6 +6690,25 @@ def cap_for_arch(arch, cap, env=None, model=None):
             if arch in ("qwen36", "qwen38"):
                 print(f"[{arch}] RAM plan: {max(slots, 0)} expert cache slots/layer, below one "
                       f"token's route; starting at {floor} (--cap or --ram sets more)", file=sys.stderr)
+                return floor
+            if arch == "deepseek_v41":
+                # V4.1's prompt workspace is priced at the CONTEXT -- what ONE forward of a
+                # context-long prompt allocates (family_registry._dsv41_geometry, the plan's
+                # own runtime term) -- so a context the operator set past what the RAM
+                # holds leaves no room for one expert slot a layer. That is a fact about a
+                # prompt of that length, not about every prompt this box can serve: the
+                # engine allocates the workspace at the PROMPT's rows, so it serves short
+                # prompts on a box whose CTX is far larger. Refusing to start turned a
+                # 4k-token conversation into no conversation at all (#2712 review F2), so
+                # the launch floor is one slot; the plan and `coli doctor` still report
+                # the budget as short, which is what it is.
+                tier = plan["tiers"]["ram"]
+                print(f"[v41] RAM plan: {format_bytes(tier['workspace_bytes'])} of prompt "
+                      f"workspace at CTX={context} does not fit the "
+                      f"{format_bytes(tier['budget_bytes'])} RAM budget, leaving no expert "
+                      f"slot a layer; starting at {floor} -- a prompt that long needs the "
+                      f"workspace's RAM beside the cache, a shorter CTX, --ram or --cap "
+                      f"leaves room", file=sys.stderr)
                 return floor
             raise ValueError(f"{family_by_id(arch).display_name} RAM budget cannot hold one "
                              f"expert slot per layer")

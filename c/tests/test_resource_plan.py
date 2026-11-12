@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import os
 import struct
@@ -274,6 +276,48 @@ class ResourcePlanTest(unittest.TestCase):
                     plan["tiers"]["ram"]["cache_slots_per_layer"], 1)
                 self.assertFalse([w for w in plan["warnings"]
                                   if "cannot hold one expert slot" in w])
+
+    def test_a_workspace_past_the_ram_starts_at_one_slot_instead_of_refusing(self):
+        """#2712 review F2: the plan stays honest, the LAUNCH does not refuse.
+
+        The workspace is priced at the context -- what ONE forward of a context-long
+        prompt allocates -- so at a context the operator set past what the RAM holds the
+        plan cannot keep one expert slot a layer, and cap_for_arch raised: a 64 GB box
+        with CTX=262144 served nothing at all, though the engine allocates the workspace
+        at the PROMPT's rows and serves 4k-token prompts there (1.71 GB, not 109.2). The
+        floor is one slot a layer; the plan and `coli doctor` keep reporting the budget
+        as short, which is why it lives at the launch seam and not in build_plan.
+        """
+        from openai_server import cap_for_arch
+
+        (self.model / "config.json").write_text(json.dumps({
+            "model_type": "deepseek_v41", "num_hidden_layers": 2,
+            "n_routed_experts": 128, "hidden_size": 128, "head_dim": 64,
+            "window_size": 8, "index_head_dim": 32, "hc_mult": 4,
+            "num_attention_heads": 4, "q_lora_rank": 64, "index_topk": 16,
+            "compress_ratios": [0, 2], "kv_source_layers": [1],
+        }))
+        write_shard(self.model / "model.safetensors", [
+            ("embed.weight", GB),
+            *[(f"layers.{layer}.ffn.experts.{expert}.w1.weight", 16 * 1024**2)
+              for layer in range(2) for expert in range(128)],
+        ])
+        with mock.patch("resource_plan.memory_available", return_value=6 * GB):
+            plan = build_plan(self.model, ram_gb=6.0, context=262144,
+                              available_memory=6 * GB, available_disk=100 * GB,
+                              gpus=[], cpu_sockets=1)
+        # the plan itself is unchanged and says what is true: no slot, and why
+        self.assertEqual(plan["tiers"]["ram"]["cache_slots_per_layer"], 0)
+        self.assertTrue([w for w in plan["warnings"]
+                         if "cannot hold one expert slot" in w],
+                        "the plan must still report the short budget")
+        err = io.StringIO()
+        with mock.patch("resource_plan.memory_available", return_value=6 * GB), \
+             contextlib.redirect_stderr(err):
+            cap = cap_for_arch("deepseek_v41", None, {"RAM_GB": "6", "CTX": "262144"}, self.model)
+        self.assertEqual(cap, 1, "the launch floor: one expert slot a layer")
+        self.assertIn("prompt workspace", err.getvalue())
+        self.assertIn("CTX=262144", err.getvalue())
 
     def test_sibling_plan_advises_no_colibri_knob(self):
         other = tempfile.TemporaryDirectory()
