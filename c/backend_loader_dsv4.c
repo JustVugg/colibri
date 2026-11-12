@@ -170,6 +170,25 @@ typedef int             (*fn_indexer_score_batch)(int device, const float *queri
 typedef int             (*fn_fp8_ref_matmul)(int device, const uint8_t *w, const float *bscale,
                                              int rows, int cols, int packed_rows8, const float *x,
                                              int tokens, float *y);
+typedef int             (*fn_indexer_resident)(int device, int layer, const uint8_t *w, const float *bscale,
+                                               int rows, int cols, int packed_rows8, const uint16_t *head_w,
+                                               int heads, int hidden);
+typedef int             (*fn_indexer_keys_sync)(int device, int layer, unsigned long long owner,
+                                                const float *keys, int count, int dim);
+typedef int             (*fn_matmul_bf16_multi)(Dsv4CudaTensor *const *ts, int n, const float *x,
+                                                int tokens, float *const *ys);
+typedef int             (*fn_decode_proj_multi)(Dsv4CudaTensor *const *ts, int n, const float *x,
+                                                float *const *ys);
+typedef int             (*fn_attn_decode_fused)(const Dsv4FusedArgs *a);
+typedef int             (*fn_attn_decode_chain)(int device, int layer, const float *q, const float *chunk,
+                                                int chunk_start, const float *sinks, const int *meta,
+                                                const int *sel, int selstride, int abs_base, int comp_limit,
+                                                int heads, int dim, float scale, const float *icos,
+                                                const float *isin, int rope_dim, int rope_fma,
+                                                Dsv4CudaTensor *wa, int groups, Dsv4CudaTensor *wb,
+                                                float *out, float *att_out, float *oa_out,
+                                                const float *qa, int q_rank, Dsv4CudaTensor *wqb,
+                                                float eps, int norm_fma, float *q_out);
 typedef int             (*fn_tensor_refill_fp4)(Dsv4CudaTensor *t, const uint8_t *w, const uint8_t *scale,
                                                 int O, int I, int sync);
 typedef int (*fn_head_scores_exact)(Dsv4CudaTensor*,const float*,float*);
@@ -331,6 +350,13 @@ static struct {
     fn_proj_batch proj_batch;                       /* optional (V4_ATTN_BATCH_PROJ, older DLLs: 0) */
     fn_proj_batch_release proj_batch_release;       /* optional */
     fn_fp8_ref_matmul fp8_ref_matmul;
+    /* optional, V4_LAYER_FUSED: a decode token's attention on the device */
+    fn_indexer_resident indexer_resident;
+    fn_indexer_keys_sync indexer_keys_sync;
+    fn_attn_decode_chain attn_decode_chain;
+    fn_attn_decode_fused attn_decode_fused;
+    fn_matmul_bf16_multi matmul_bf16_multi;
+    fn_decode_proj_multi decode_proj_multi;
     fn_indexer_prepare indexer_prepare;
     fn_upload_compressor upload_compressor;
     fn_upload_compressor upload_head_exact;
@@ -527,6 +553,14 @@ static int dsv4_cuda_resolve(const char *dllname){
     RESOLVE(sparse_attn_batch_cached_idx, fn_sparse_attn_batch_cached_idx);
     RESOLVE(indexer_score_batch, fn_indexer_score_batch);
     RESOLVE(fp8_ref_matmul, fn_fp8_ref_matmul);
+    /* optional (V4_LAYER_FUSED): a DLL without these exports keeps the tier
+     * alive, and the engine keeps the paths it had */
+    g_dsv4.indexer_resident = (fn_indexer_resident)GetProcAddress(g_dsv4.dll, "dsv4_cuda_indexer_resident");
+    g_dsv4.indexer_keys_sync = (fn_indexer_keys_sync)GetProcAddress(g_dsv4.dll, "dsv4_cuda_indexer_keys_sync");
+    g_dsv4.attn_decode_chain = (fn_attn_decode_chain)GetProcAddress(g_dsv4.dll, "dsv4_cuda_attn_decode_chain");
+    g_dsv4.attn_decode_fused = (fn_attn_decode_fused)GetProcAddress(g_dsv4.dll, "dsv4_cuda_attn_decode_fused");
+    g_dsv4.matmul_bf16_multi = (fn_matmul_bf16_multi)GetProcAddress(g_dsv4.dll, "dsv4_cuda_matmul_bf16_multi");
+    g_dsv4.decode_proj_multi = (fn_decode_proj_multi)GetProcAddress(g_dsv4.dll, "dsv4_cuda_decode_proj_multi");
     g_dsv4.upload_head_exact = (fn_upload_compressor)GetProcAddress(g_dsv4.dll, "dsv4_cuda_upload_head_exact");
     g_dsv4.head_scores_exact = (fn_head_scores_exact)GetProcAddress(g_dsv4.dll, "dsv4_cuda_head_scores_exact");
     g_dsv4.head_scores_batch_exact = (fn_head_scores_batch_exact)GetProcAddress(g_dsv4.dll, "dsv4_cuda_head_scores_batch_exact");
@@ -925,6 +959,52 @@ int dsv4_cuda_fp8_ref_matmul(int device, const uint8_t *w, const float *bscale,
                              int tokens, float *y){
     if(!g_dsv4.available) return 0;
     return g_dsv4.fp8_ref_matmul(device, w, bscale, rows, cols, packed_rows8, x, tokens, y);
+}
+
+int dsv4_cuda_indexer_resident(int device, int layer, const uint8_t *w, const float *bscale,
+                               int rows, int cols, int packed_rows8, const uint16_t *head_w,
+                               int heads, int hidden){
+    if(!g_dsv4.available||!g_dsv4.indexer_resident) return 0;
+    return g_dsv4.indexer_resident(device, layer, w, bscale, rows, cols, packed_rows8, head_w,
+                                   heads, hidden);
+}
+
+int dsv4_cuda_indexer_keys_sync(int device, int layer, unsigned long long owner,
+                                const float *keys, int count, int dim){
+    if(!g_dsv4.available||!g_dsv4.indexer_keys_sync) return 0;
+    return g_dsv4.indexer_keys_sync(device, layer, owner, keys, count, dim);
+}
+
+
+int dsv4_cuda_matmul_bf16_multi(Dsv4CudaTensor *const *ts, int n, const float *x, int tokens,
+                                float *const *ys){
+    if(!g_dsv4.available||!g_dsv4.matmul_bf16_multi) return 0;
+    return g_dsv4.matmul_bf16_multi(ts, n, x, tokens, ys);
+}
+int dsv4_cuda_decode_proj_multi(Dsv4CudaTensor *const *ts, int n, const float *x, float *const *ys){
+    if(!g_dsv4.available||!g_dsv4.decode_proj_multi) return 0;   /* a DLL without it: the separate calls */
+    return g_dsv4.decode_proj_multi(ts, n, x, ys);
+}
+
+int dsv4_cuda_attn_decode_fused(const Dsv4FusedArgs *a){
+    if(!g_dsv4.available||!g_dsv4.attn_decode_fused) return 0;   /* a DLL without it: the chained forms */
+    return g_dsv4.attn_decode_fused(a);
+}
+
+int dsv4_cuda_attn_decode_chain(int device, int layer, const float *q, const float *chunk,
+                                int chunk_start, const float *sinks, const int *meta,
+                                const int *sel, int selstride, int abs_base, int comp_limit,
+                                int heads, int dim, float scale, const float *icos,
+                                const float *isin, int rope_dim, int rope_fma,
+                                Dsv4CudaTensor *wa, int groups, Dsv4CudaTensor *wb,
+                                float *out, float *att_out, float *oa_out,
+                                const float *qa, int q_rank, Dsv4CudaTensor *wqb, float eps,
+                                int norm_fma, float *q_out){
+    if(!g_dsv4.available||!g_dsv4.attn_decode_chain) return 0;
+    return g_dsv4.attn_decode_chain(device, layer, q, chunk, chunk_start, sinks, meta, sel, selstride,
+                                    abs_base, comp_limit, heads, dim, scale, icos, isin, rope_dim,
+                                    rope_fma, wa, groups, wb, out, att_out, oa_out, qa, q_rank, wqb,
+                                    eps, norm_fma, q_out);
 }
 
 int dsv4_cuda_upload_head_exact(Dsv4CudaTensor **t,const uint16_t *w,int rows,int cols,int device){

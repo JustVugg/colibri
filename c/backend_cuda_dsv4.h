@@ -26,6 +26,11 @@ int dsv4_cuda_matvec(Dsv4CudaTensor *t,float *y,const float *x);
 int dsv4_cuda_matmul_batch(Dsv4CudaTensor *t,const Dsv4CudaActivation *input,
                            int tokens,Dsv4CudaActivation *output);
 int dsv4_cuda_matmul_bf16_batch(Dsv4CudaTensor *t,const float *x,int tokens,float *y);
+/* n (<= 8) bf16 matmuls over the same x [tokens][I] in one round trip. */
+int dsv4_cuda_matmul_bf16_multi(Dsv4CudaTensor *const *ts,int n,const float *x,int tokens,
+                                float *const *ys);
+/* one token, one round trip through several mirrors (bf16 / fp8); 0 on an older DLL */
+int dsv4_cuda_decode_proj_multi(Dsv4CudaTensor *const *ts,int n,const float *x,float *const *ys);
 /* Host-pointer batched sparse window attention (prefill). vals holds
  * [0,comp_base) window rows in position order then the compressed rows;
  * meta[3t]=window row offset, meta[3t+1]=window rows, meta[3t+2]=compressed
@@ -65,6 +70,55 @@ int dsv4_cuda_indexer_score_batch(int device,const float *queries,const float *k
 int dsv4_cuda_fp8_ref_matmul(int device,const uint8_t *w,const float *bscale,
                              int rows,int cols,int packed_rows8,const float *x,
                              int tokens,float *y);
+/* Device-resident indexer selection (one round trip): the layer's wq_b bytes
+ * + f32 block scales (CPU reference layout) and bf16 head-weight rows go up
+ * once; keys are appended per call (count 0, another owner or a regressed
+ * count re-seed); select runs projection -> prep -> head weights -> scoring
+ * into scores[tokens][count] (queries_out/head_w_out: verify downloads). */
+int dsv4_cuda_indexer_resident(int device,int layer,const uint8_t *w,const float *bscale,
+                               int rows,int cols,int packed_rows8,const uint16_t *head_w,
+                               int heads,int hidden);
+int dsv4_cuda_indexer_keys_sync(int device,int layer,unsigned long long owner,
+                                const float *keys,int count,int dim);
+/* Decode attention tail on the device: cached sparse attention (sel NULL =
+ * every compressed row) -> inverse RoPE + bf16 round -> grouped wo_a (mv
+ * kernel) -> bf16 round -> wo_b (mv kernel over its mirror) -> bf16-rounded
+ * out[wb->O]. att_out / oa_out: verify downloads. With qa (q NULL) the query
+ * is made on the card first: wq_b mv kernel, bf16 round, per-head rmsnorm
+ * (eps, norm_fma), forward RoPE; q_out: its verify download. */
+/* V4_LAYER_FUSED: a decode token's attention layer in one round trip (the
+ * projections, the norms, the compressors' state rows and, emit, their
+ * pooled rows into the caches, the indexer's selection and rank, the
+ * chain, the ring append); 1 = done (the outputs filled), 0 = refused or
+ * failed. cs_*: the compressors ([0] the attention's, [1] the indexer's;
+ * kv NULL = none) for the device's state mirror; ecos/esin the emitted
+ * row's RoPE tables; emit_out: verify downloads of the emitted rows. */
+typedef struct Dsv4FusedArgs {
+    int device, layer, hidden, q_rank, dim, rope_dim, position, first, comp_total, heads, groups;
+    const float *x, *icos, *isin, *sinks;
+    Dsv4CudaTensor *wqa, *wkv, *cwkv, *cwg, *iwkv, *iwg, *wqb, *wa, *wb;
+    const uint16_t *qnw, *kvw;
+    float eps, scale, had_scale, wscale;
+    int vnorm_fma, rope_fma, norm_fma, idx_rope_fma, hw_fma;
+    int idx_score, idx_count, idx_sel, idx_heads, idx_dim;
+    int emit, ratio;
+    const float *cs_kv[2], *cs_sc[2], *cs_ape[2];
+    const uint16_t *cs_norm[2];
+    int cs_rows[2], cs_proj[2], cs_dim[2], cs_fp4[2];
+    const float *ecos, *esin;
+    float *out, *kv_out, *qa_out, *ckv_out, *cg_out, *ikv_out, *ig_out, *q_out, *emit_out[2];
+    int *sel_out;
+} Dsv4FusedArgs;
+int dsv4_cuda_attn_decode_fused(const Dsv4FusedArgs *a);
+int dsv4_cuda_attn_decode_chain(int device,int layer,const float *q,const float *chunk,
+                                int chunk_start,const float *sinks,const int *meta,
+                                const int *sel,int selstride,int abs_base,int comp_limit,
+                                int heads,int dim,float scale,const float *icos,
+                                const float *isin,int rope_dim,int rope_fma,
+                                Dsv4CudaTensor *wa,int groups,Dsv4CudaTensor *wb,
+                                float *out,float *att_out,float *oa_out,
+                                const float *qa,int q_rank,Dsv4CudaTensor *wqb,float eps,
+                                int norm_fma,float *q_out);
 int dsv4_cuda_upload_fp8_ref(Dsv4CudaTensor **tensor,const uint8_t *w,
                             const float *scales,int rows,int cols,int packed_rows8,int device);
 int dsv4_cuda_fp8_ref_matmul_resident(Dsv4CudaTensor *tensor,const float *x,
