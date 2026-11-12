@@ -587,6 +587,11 @@ static void q36c_prewarm(Model *m, const Q36Chain *ch) {
     }
     pw.moe_d = c->hidden; pw.moe_i = c->inter;
     pw.ex_ours = c->n_experts > 0 && !g_gguf;   /* our formats' experts: their grouped GEMMs */
+    if (pw.ex_ours) {   /* and the formats vk_tier_start gives them on the device: int4 2 (4 in groups), int8 1 (13: bit 0) */
+        int i4 = g_expert_is_int4 || g_expert_mixed, gs = c->expert_gs;
+        int fg = i4 ? (gs ? 4 : 2) : gs ? 0 : 1, fd = g_expert_mixed && !xf_mode(m) ? (down_gs_of(c) ? 0 : 1) : fg;
+        pw.moe_fmts = 1u << fg | 1u << fd;
+    }
     /* a GGUF's experts, as the file has them: a prompt chunk's grouped GEMMs (vk_dmoe.h) */
     for (int i = 0; g_gguf && m->gqx && i < c->n_layers; i++) {
         int bg = gq_r16_base(m->gqx[i].tg), bd = gq_r16_base(m->gqx[i].td);

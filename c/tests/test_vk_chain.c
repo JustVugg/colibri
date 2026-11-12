@@ -4324,6 +4324,38 @@ static void test_gemv_rows(int fmt, int S, int I, int O) {
     vkc_free(xb); vkc_free(ya); vkc_free(y1); coli_vk_tensor_free(t);
     free(x); free(codes); free(sc);
 }
+/* chain_moe's pipelines, each a compile of its own (20 minutes on a Radeon RX 580): the
+ * prewarm makes those of the experts' formats alone (moe_fmts), and a layer whose formats
+ * have pipelines of their own makes no other at first use. Run before any other test makes
+ * one, so the counts are the pipelines made; the staging sizes are test_moe's (256 x 88)
+ * and the gv tests' (1024 x 128), whose runs then reuse them. */
+static void test_prewarm_moe(void) {
+    if (!vkc_moe_ready()) { printf("prewarm moe: no bufferDeviceAddress on this device, skipped\n"); return; }
+    setenv("COLI_VK_CHAIN_PREWARM", "1", 1);   /* a discrete card's default, on any device */
+    VkcStats s0, s1, s2, s3; vkc_stats(&s0);
+    VkcPrewarm pw = {.moe = 1, .moe_d = 256, .moe_i = 88, .moe_fmts = 1u << 2};
+    int n = vkc_prewarm(&pw);
+    vkc_stats(&s1);
+    CHECK(n > 0 && s1.moe_pipes - s0.moe_pipes == 1, "prewarm moe: int4 rows' experts: %d launches, %llu chain_moe pipelines made, not 1",
+          n, s1.moe_pipes - s0.moe_pipes);
+    pw.moe_fmts = 1u | 1u << 2 | 1u << 4;   /* and int4 in groups, and a format of no pipeline of its own: every format's */
+    n = vkc_prewarm(&pw);
+    vkc_stats(&s2);
+    CHECK(n > 0 && s2.moe_pipes - s1.moe_pipes == 2, "prewarm moe: formats 0, 2, 4: %d launches, %llu more pipelines, not 2",
+          n, s2.moe_pipes - s1.moe_pipes);
+    unsetenv("COLI_VK_CHAIN_PREWARM");
+    /* at first use, int8 rows at a staging size not made yet: their pipeline alone */
+    VkcBuf *x = vkc_buf(64 * 4, VKC_DEV), *ids = vkc_buf(16, VKC_DEV), *w = vkc_buf(16, VKC_DEV),
+           *tab = vkc_buf(COLI_VK_XB_ENTRY * 4, VKC_DEV), *hid = vkc_buf(2 * 64 * 4, VKC_DEV), *y = vkc_buf(64 * 4, VKC_DEV);
+    VkcMoe p = {.S = 1, .K = 1, .D = 64, .I = 64, .x_row = 64, .i_row = 1, .w_row = 1, .y_row = 64, .gfmt = 1, .dfmt = 1, .stage_n = 1024};
+    int ok = x && ids && w && tab && hid && y && vkc_begin() && vkc_moe(x, ids, w, tab, hid, y, &p) && vkc_submit(1);
+    vkc_stats(&s3);
+    CHECK(ok && s3.moe_pipes - s2.moe_pipes == 1, "moe at first use: int8 rows: %llu pipelines made, not 1", s3.moe_pipes - s2.moe_pipes);
+    VkcBuf *all[] = {x, ids, w, tab, hid, y};
+    for (size_t k = 0; k < sizeof all / sizeof *all; k++) if (all[k]) vkc_free(all[k]);
+    printf("prewarm moe: chain_moe pipelines made: %llu, %llu, then %llu at first use\n", s1.moe_pipes - s0.moe_pipes,
+           s2.moe_pipes - s1.moe_pipes, s3.moe_pipes - s2.moe_pipes);
+}
 int main(int argc, char **argv) {
     test_hyb_gate();   /* no device needed */
     const char *spv = argc > 1 ? argv[1] : "shaders/qmatmul.spv";
@@ -4355,6 +4387,7 @@ int main(int argc, char **argv) {
         else bench_gemv();
         vkc_shutdown(); coli_vk_shutdown(); return 0;
     }
+    test_prewarm_moe();   /* first: no chain_moe pipeline made before it */
     int fmts[4] = {1, 4, 10, 11};
     VkcStats sv0; vkc_stats(&sv0);
     for (int k = 0; k < 4; k++) {
