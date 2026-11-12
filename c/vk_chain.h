@@ -494,6 +494,10 @@ typedef struct {
     int gemv_i[16], n_gemv_i;   /* the GEMV's widths of x (a matrix's I) the types meet: its staging sizes */
     int moe_d, moe_i;           /* the experts' D and I: chain_moe's staging size (0: the device's largest) */
     int attn_hd, attn_gq;       /* the attention's head dim and query heads per kv head: chain_attn_flash's (0: none) */
+    /* moe 1: the formats the experts' gate/up and down take on the device, bit f for 1, 2
+     * and 4 (chain_moe's pipeline of that format), bit 0 for any other (its pipeline of
+     * every format); 0 not known: all four */
+    unsigned moe_fmts;
 } VkcPrewarm;
 /* a width of x the model's GEMVs meet, once (vkc_prewarm makes the staging size it takes) */
 static inline void vkc_prewarm_width(VkcPrewarm *pw, int I) {
@@ -898,6 +902,7 @@ typedef struct {
     unsigned long long tile_wide;      /* of the tile GEMMs, a GGUF's on 128 x 128 tiles (qmatmul_gemm_bdcw.comp) */
     unsigned long long grp_wide;       /* of the grouped expert GEMMs, those at the wider item (qmatmul_grp*_bdcw.comp) */
     unsigned long long dsa_tiled;      /* DeepSeek V4's indexer scores in tiles of rows (chain_dsv4_idx.comp, mode 11) */
+    unsigned long long moe_pipes;      /* chain_moe.comp's pipelines made (a driver's compile each: 20 minutes on a Radeon RX 580) */
 } VkcStats;
 void vkc_stats(VkcStats *st);
 /* COLI_VK_CHAIN_PROF=1: one stderr line of device time per kind of op */

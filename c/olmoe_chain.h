@@ -353,6 +353,7 @@ static void olc_prewarm(Model *m) {
     if (c->n_experts <= 0) return;
     VkcPrewarm pw = {.moe = 1, .ex_ours = 1, .attn_hd = c->head_dim, .attn_gq = 1};
     pw.moe_d = c->hidden; pw.moe_i = c->inter;
+    if (!m->gx) pw.moe_fmts = 1u << 1;   /* the tier's int8 rows (olmoe_vk_tier_start) */
     vkc_prewarm(&pw);
 }
 /* After the dense-host decision, before the tier: the chain's N layers (and the head) on
