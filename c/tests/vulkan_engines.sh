@@ -1804,10 +1804,11 @@ print(f"first row max |diff| {d:.2e} of {m:.2e} (tolerance {float(sys.argv[3]):.
 sys.exit(0 if d <= float(sys.argv[3]) * m and same else 1)
 PY
 }
-logits_row() {  # <a.f32> <b.f32> <row> <rel> <vocab>: logits_first for the Nth dump row. Rows past
-                # the first are input-shared only when every earlier row of the pair keeps its
-                # argmax -- the caller says which row, and why it is shared.
-  $PY - "$1" "$2" "$3" "$4" "$5" <<'PY'
+logits_row() {  # <a.f32> <b.f32> <row> <rel> <vocab> <argmax 0|1>: logits_first for the Nth
+                # dump row. Rows past the first are input-shared only when every earlier row of
+                # the pair keeps its argmax -- the caller says which row, and why it is shared;
+                # with argmax 0 the row is held to the tolerance alone and the pick is printed.
+  $PY - "$1" "$2" "$3" "$4" "$5" "$6" <<'PY'
 import array, sys
 row = int(sys.argv[3])
 a = array.array("f", open(sys.argv[1], "rb").read()); b = array.array("f", open(sys.argv[2], "rb").read())
@@ -1817,7 +1818,7 @@ if not a or len(a) != len(b): sys.exit(f"the dumps' row {row} differs in length"
 d = max(abs(x - y) for x, y in zip(a, b)); m = max(abs(x) for x in a)
 same = max(range(v), key=lambda i: a[i]) == max(range(v), key=lambda i: b[i])
 print(f"row {row} max |diff| {d:.4f} of {m:.4f} (tolerance {float(sys.argv[4]):.0e}), argmax {'kept' if same else 'FLIPPED'}")
-sys.exit(0 if d <= float(sys.argv[4]) * m and same else 1)
+sys.exit(0 if d <= float(sys.argv[4]) * m and (same or sys.argv[6] == "0") else 1)
 PY
 }
 chain_gate() {  # <engine> <tag> <tol 0|1> <env...> -- <argv...>   (CPUENV: the CPU arm's own settings)
@@ -5052,10 +5053,21 @@ PYTOL
 # index keys decoded where read, the row a chunk's write-back packs). The exactness side
 # is the CPU on the fp32 host (COLI_VK_KV_FP32=1, COLI_VULKAN unset: the reference's own
 # oracle, 8/8 tokens); the packed run must engage (its host line), keep the chain off, and
-# hold the FIRST decode row to the tolerance the arms above use -- that row is the one
-# input the two runs share. Row 1 (the prefill forward writes row 0) is the first DECODE
-# row, and it is shared here because row 0 keeps its argmax on this fixture: it gates that
-# the slot a decode step writes holds that step's own key, not the row it evicted.
+# hold the FIRST decode row to the tolerance the arms above use.
+#
+# Row 1 (the prefill forward writes row 0) is the first DECODE row. It gates one thing: the
+# slot a decode step writes holds THAT step's key, not the row it evicted -- the bug that
+# read 0.801 of row 1's own scale (argmax flipped) and reads 0.058 with the slot re-decoded
+# from the code row it stored. What it no longer asserts is the argmax: the packed host reads
+# its own code rows in the PREFILL too (attention_run rounds each chunk row through the codec
+# before any query sees it, so that a prompt prefilled in one forward answers as the same
+# prompt continued from its own stored state does -- tests.test_dsv41_prefix_serve), while
+# this fp32 arm reads exact floats. The two arms are therefore not input-shared past the
+# prefill by construction: the packed row 1 carries the query path's quantize hop as well as
+# the store's, 0.161 of 1.593 = 0.101 here, and a greedy pick may move without anything being
+# wrong. The tolerance's teeth stay -- the evicted-slot bug is 0.801 of the row's scale, four
+# times this tolerance and eight times what the codec's two hops cost -- and the pick is
+# printed, not required.
 v41_kvq_cpu_host() {
   local rc=0 rcq=0
   rm -f off.f32 on.f32
@@ -5069,7 +5081,7 @@ v41_kvq_cpu_host() {
   grep -q "decoding the host's code rows into kv_all" on.log || { tail -20 on.log; fail "kv-quant CPU host: the CPU never read the host's codes"; }
   [ "$(chain_count deepseek_v41 on.log)" = 0 ] || { tail -20 on.log; fail "kv-quant CPU host: the chain ran with COLI_VK_CHAIN=0"; }
   local lg; lg=$(logits_first off.f32 on.f32 1.0 256) || { echo "$lg"; fail "kv-quant CPU host: the first decode row beyond the documented tolerance"; }
-  local l1; l1=$(logits_row off.f32 on.f32 1 0.2 256) || { echo "$l1"; fail "kv-quant CPU host: decode row 1 beyond the documented tolerance -- the packed ring's snapshot reads the slot the step evicted"; }
+  local l1; l1=$(logits_row off.f32 on.f32 1 0.2 256 0) || { echo "$l1"; fail "kv-quant CPU host: decode row 1 beyond the documented tolerance -- the packed ring's snapshot reads the slot the step evicted"; }
   echo "OK kv-quant CPU host: $lg; $l1; $(token_diff off.txt on.txt), the chain off and the host's codes read on the CPU"
 }
 # The packed SPEC arm, self-referenced. V41_SPEC_FORCE drafts the REFERENCE's own next
