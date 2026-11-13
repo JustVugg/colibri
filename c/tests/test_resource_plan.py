@@ -3219,11 +3219,11 @@ class WindowsCommitLimitTest(unittest.TestCase):
 
 
 def vm_stat_output(free, active, inactive, speculative, wired, purgeable, file_backed,
-                   compressor, page=16384):
+                   compressor, anonymous=0, page=16384):
     """vm_stat's output, in its order and its format (printf "%-30s %16llu.").
-    As on a Mac, the anonymous and the file-backed pages are the pages of the
-    active, inactive and speculative queues."""
-    anonymous = active + inactive + speculative - file_backed
+    Pages free is free_count - speculative_count, File-backed pages is
+    external_page_count; no identity ties them to the queues (whether the
+    external count holds the speculative pages depends on the macOS version)."""
     rows = (("Pages free", free), ("Pages active", active), ("Pages inactive", inactive),
             ("Pages speculative", speculative), ("Pages throttled", 0),
             ("Pages wired down", wired), ("Pages purgeable", purgeable),
@@ -3245,18 +3245,29 @@ def vm_stat_output(free, active, inactive, speculative, wired, purgeable, file_b
 # active queue.
 MAC16_AFTER_RUN = vm_stat_output(free=40000, active=577576, inactive=276000, speculative=15000,
                                  wired=110000, purgeable=5000, file_backed=626387,
-                                 compressor=30000)
+                                 compressor=30000, anonymous=242189)
 # The same synthetic Mac minutes later: 400000 of those pages have aged into the
 # inactive queue.
 MAC16_AGED = vm_stat_output(free=40000, active=177576, inactive=676000, speculative=15000,
-                            wired=110000, purgeable=5000, file_backed=626387, compressor=30000)
+                            wired=110000, purgeable=5000, file_backed=626387, compressor=30000,
+                            anonymous=242189)
 # From #1614 run 1: 48 GB, browsers open, 8.3 GiB in the compressor, free +
 # inactive 32.5 GiB. The free/file-backed split is ours (the report has none):
 # here most of the inactive queue is anonymous. Were it file-backed, the new
 # figure would stay near 32 GiB.
 MAC48_DIRTY = vm_stat_output(free=300000, active=271728, inactive=1830000, speculative=20000,
                              wired=180000, purgeable=10000, file_backed=450000,
-                             compressor=544000)
+                             compressor=544000, anonymous=1671728)
+# Measured by a reviewer on a Mac mini M4, macOS 15.6. Pages free (36277 against
+# free_count - speculative_count 36233), File-backed pages (225055 against
+# external_page_count 224891: not external + speculative, 248700), Anonymous
+# pages and the active + inactive + speculative total (325300) are vm_stat's;
+# speculative 23809, inactive, active and purgeable 2 are derived from the
+# reported host_statistics64 figures; wired and the compressor are ours, unread.
+# The C rule on the raw counters gave 4278288384 bytes, 0.08% below this text.
+MAC_M4_15_6 = vm_stat_output(free=36277, active=36487, inactive=265004, speculative=23809,
+                             wired=150000, purgeable=2, file_backed=225055,
+                             compressor=200000, anonymous=353884)
 
 
 class DarwinAvailableMemoryTest(unittest.TestCase):
@@ -3301,3 +3312,13 @@ class DarwinAvailableMemoryTest(unittest.TestCase):
         # fixture's inactive queue is mostly anonymous; the report does not say
         self.assertEqual(self.available(MAC48_DIRTY), 760000 * 16384)   # 11.6 GiB
         self.assertLess(self.available(MAC48_DIRTY), 32 << 30)
+
+    def test_speculative_pages_counted_at_most_once(self):
+        # macOS 15.6: File-backed pages is external_page_count without the
+        # speculative pages, and Pages free leaves them out too. The figure is
+        # the reviewer's vm_stat rule to the byte, and Pages speculative is
+        # never read, so no macOS version can count it twice
+        self.assertEqual(self.available(MAC_M4_15_6), 4281696256)   # (36277 + 225055 + 2) pages
+        moved = MAC_M4_15_6.replace(f"{23809:>16}.", f"{123809:>16}.")
+        self.assertNotEqual(moved, MAC_M4_15_6)
+        self.assertEqual(darwin_available_bytes(moved), 4281696256)

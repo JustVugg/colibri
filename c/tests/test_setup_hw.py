@@ -145,7 +145,8 @@ class MemoryParsing(unittest.TestCase):
 
     def test_darwin(self):
         # free + file-backed + purgeable (resource_plan.darwin_available_bytes): not the
-        # inactive queue, and the speculative pages are already file-backed
+        # inactive queue, and not Pages speculative (out of Pages free; in File-backed or
+        # not, depending on the macOS version)
         vm_stat = ("Mach Virtual Memory Statistics: (page size of 16384 bytes)\n"
                    "Pages free:                               10000.\n"
                    "Pages inactive:                           5000.\n"

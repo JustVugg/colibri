@@ -2046,6 +2046,11 @@ def darwin_available_bytes(vm_stat_text):
     same figure compat_meminfo_gb computes from host_statistics64. None when
     vm_stat printed none of the three.
 
+    vm_stat prints free_count - speculative_count as "Pages free" and
+    external_page_count as "File-backed pages". Whether the external count holds
+    the speculative (read-ahead) pages depends on the macOS version (on 15.6 it
+    does not), so they are counted once or not at all, never twice.
+
     Not "Pages inactive": that queue holds file pages, which macOS can drop,
     and anonymous pages, which it can only compress or swap. It leaves out file
     pages still in the active queue, so it moves as they age (one possible

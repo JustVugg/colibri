@@ -827,8 +827,11 @@ static inline void compat_meminfo_gb(double *total_gb, double *avail_gb){
      * Not inactive_count: that queue also holds anonymous pages, which can only
      * be compressed or swapped, and it leaves out file pages still active
      * (#1614, #2785). It can, not it will: the compressor is not modeled.
-     * free_count includes the speculative pages, which are file-backed: counted
-     * once. The counts are in kernel pages, so vm_kernel_page_size (vm_stat's),
+     * The terms are vm_stat's: "Pages free" is free_count - speculative_count,
+     * "File-backed pages" external_page_count. Speculative (read-ahead) pages
+     * come out of free_count; whether external_page_count holds them depends on
+     * the macOS version (on 15.6 it does not), so they count once or not at all,
+     * never twice. The counts are in kernel pages, so vm_kernel_page_size (vm_stat's),
      * not the process's (4 KiB under Rosetta on a 16 KiB kernel).
      * resource_plan.darwin_available_bytes reads the same three vm_stat lines. */
     if(host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vm, &cnt) == KERN_SUCCESS)
