@@ -1399,7 +1399,8 @@ def cmd_build(a):
                   f"  Clone https://github.com/JustVugg/colibri and run ./setup.sh, or make -C c colibri.")
     family=resolve_model(a.model).descriptor if a.model else family_by_id("glm")
     target=family.build_target
-    sys.exit(subprocess.call(["make","-C",HERE,target]))
+    from setup_flow import gnu_make   # gmake on the BSDs, where make is BSD make
+    sys.exit(subprocess.call([gnu_make() or "make","-C",HERE,target]))
 
 def cmd_info(a):
     banner("info", model=a.model)
