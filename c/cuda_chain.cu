@@ -974,7 +974,9 @@ static int cc_attn_f2_go(CcCtx *c, CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcB
     return 0;
 #endif
 }
-/* one thread per channel, the rows in order, the channel's ring in registers */
+/* one thread per channel, the rows in order, the channel's ring in registers. SN: a verify's rows each
+ * with its own copy (snap_n > 0), a kernel apart so that a decode step's has no such code (#2757) */
+template <bool SN>
 __global__ static void cc_dnconv_k(const float *__restrict__ xin, const float *__restrict__ w, float *__restrict__ ring,
                                    float *__restrict__ o, float *__restrict__ snap, CcDnConv p) {
     COLI_PDL_WAIT();
@@ -1002,7 +1004,7 @@ __global__ static void cc_dnconv_k(const float *__restrict__ xin, const float *_
         for (int k = 0; k < 8; k++) if (k == nh - 1) hist[k] = cur;
         if (s == p.snap_row)
             for (int k = 0; k < 8; k++) if (k < nh) snap[p.snap_off + c * nh + k] = hist[k];
-        if (s < p.snap_n) {   /* a verify's row s: its own copy (the table's address s) */
+        if (SN && s < p.snap_n) {   /* a verify's row s: its own copy (the table's address s) */
             float *dst = (float *)(uintptr_t)reinterpret_cast<const unsigned long long *>(snap + p.snap_off)[s];
             for (int k = 0; k < 8; k++) if (k < nh) dst[c * nh + k] = hist[k];
         }
@@ -1057,8 +1059,10 @@ __device__ static float cc_softplus(float x) {
     float e = expf(x);
     return e < 1e-4f ? e - 0.5f * e * e : logf(1.f + e);
 }
-/* one block of 128 per value head, thread v's column of the state in registers */
-template <int KD>
+/* one block of 128 per value head, thread v's column of the state in registers. SN: a verify's rows each
+ * with its own copy (snap_n > 0), a kernel apart: compiled into the decode step's kernel, that copy took
+ * its call on an R9700 from 16 to 68 us, the scratch from 1092 to 2600 bytes (#2757) */
+template <int KD, bool SN>
 __global__ static void __launch_bounds__(128) cc_dnrec_k(const float *__restrict__ cv, const float *__restrict__ ab,
         const float *__restrict__ z, float *__restrict__ st, const float *__restrict__ prm, float *__restrict__ y,
         float *__restrict__ snap, CcDnRec p) {
@@ -1125,7 +1129,7 @@ __global__ static void __launch_bounds__(128) cc_dnrec_k(const float *__restrict
                 #pragma unroll
                 for (int k = 0; k < KD; k++) snap[nb + k * p.VD + v] = col[k];
             }
-            if (s < p.snap_n) {   /* a verify's row s: its own copy (the table's address s) */
+            if (SN && s < p.snap_n) {   /* a verify's row s: its own copy (the table's address s) */
                 float *dst = (float *)(uintptr_t)reinterpret_cast<const unsigned long long *>(snap + p.snap_off)[s] + h * KD * p.VD;
                 #pragma unroll
                 for (int k = 0; k < KD; k++) dst[k * p.VD + v] = col[k];
@@ -2792,7 +2796,8 @@ static int cc_dnconv(CcBuf *in, CcBuf *w, CcBuf *ring, CcBuf *out, CcBuf *snap, 
         coli_launch(cc_dnconv_ring_k, grid1((size_t)p->CD, 128), 128, 0, c->stream, fp(in), fpw(ring), fpw(snap), *p);
         return launched(c, "dnconv");
     }
-    coli_launch(cc_dnconv_k, grid1((size_t)p->CD, 64), 64, 0, c->stream, fp(in), fp(w), fpw(ring), fpw(out), fpw(snap), *p);
+    if (p->snap_n > 0) coli_launch(cc_dnconv_k<true>, grid1((size_t)p->CD, 64), 64, 0, c->stream, fp(in), fp(w), fpw(ring), fpw(out), fpw(snap), *p);
+    else coli_launch(cc_dnconv_k<false>, grid1((size_t)p->CD, 64), 64, 0, c->stream, fp(in), fp(w), fpw(ring), fpw(out), fpw(snap), *p);
     return launched(c, "dnconv");
 }
 static int cc_dnrec(int KD, CcBuf *cv, CcBuf *ab, CcBuf *z, CcBuf *st, CcBuf *prm, CcBuf *y, CcBuf *snap, const CcDnRec *p) {
@@ -2851,16 +2856,19 @@ rows:
         }
     }
 one:
+#define CC_DR(KD_) do { if (p->snap_n > 0) coli_launch(cc_dnrec_k<KD_, true>, (unsigned)p->VH, 128, 0, c->stream, a, b, zz, s, pr, yy, sn, *p); \
+                        else coli_launch(cc_dnrec_k<KD_, false>, (unsigned)p->VH, 128, 0, c->stream, a, b, zz, s, pr, yy, sn, *p); } while (0)
     switch (KD) {
-    case 4:   coli_launch(cc_dnrec_k<4>, (unsigned)p->VH, 128, 0, c->stream, a, b, zz, s, pr, yy, sn, *p); break;
-    case 8:   coli_launch(cc_dnrec_k<8>, (unsigned)p->VH, 128, 0, c->stream, a, b, zz, s, pr, yy, sn, *p); break;
-    case 16:  coli_launch(cc_dnrec_k<16>, (unsigned)p->VH, 128, 0, c->stream, a, b, zz, s, pr, yy, sn, *p); break;
-    case 32:  coli_launch(cc_dnrec_k<32>, (unsigned)p->VH, 128, 0, c->stream, a, b, zz, s, pr, yy, sn, *p); break;
-    case 64:  coli_launch(cc_dnrec_k<64>, (unsigned)p->VH, 128, 0, c->stream, a, b, zz, s, pr, yy, sn, *p); break;
-    case 128: coli_launch(cc_dnrec_k<128>, (unsigned)p->VH, 128, 0, c->stream, a, b, zz, s, pr, yy, sn, *p); break;
-    case 256: coli_launch(cc_dnrec_k<256>, (unsigned)p->VH, 128, 0, c->stream, a, b, zz, s, pr, yy, sn, *p); break;
+    case 4:   CC_DR(4); break;
+    case 8:   CC_DR(8); break;
+    case 16:  CC_DR(16); break;
+    case 32:  CC_DR(32); break;
+    case 64:  CC_DR(64); break;
+    case 128: CC_DR(128); break;
+    case 256: CC_DR(256); break;
     default: return 0;
     }
+#undef CC_DR
     return launched(c, "dnrec");
 }
 static int cc_ew(CcBuf *y, CcBuf *a, CcBuf *b, CcBuf *cb, CcBuf *e, const CcEw *p) {
