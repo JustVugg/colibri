@@ -35,6 +35,15 @@ jobs:
             make_args: "ARCH=x86-64-v3 VK=1"
             vk: "1"
             v4: "1"
+          # Raspberry Pi 4/5 and other aarch64 boards (#2684). Plain armv8-a, so the
+          # archive starts on a Cortex-A72 too: the dotprod/i8mm kernels need a build on
+          # the board (ARCH=native). CPU only, as these boards have no GPU worth it.
+          - os: ubuntu-24.04-arm
+            name: linux-aarch64
+            ext: ""
+            glibc: "2.39"
+            make_args: "ARCH=armv8-a"
+            v4: "1"
           - os: macos-latest
             name: macos-arm64
             ext: ""
@@ -119,7 +128,7 @@ jobs:
       # server by itself. Rust is on every runner; Linux needs WebKitGTK to build it. pwsh on
       # Windows: the MSVC linker, not the link.exe of a POSIX shell's PATH. It needs a display
       # to run, so the verify step checks that it is in the archive.
-      - if: matrix.os == 'ubuntu-24.04'
+      - if: matrix.os == 'ubuntu-24.04' || matrix.os == 'ubuntu-24.04-arm'
         run: bash .github/scripts/apt-install.sh libwebkit2gtk-4.1-dev
       - name: Build the desktop window
         if: matrix.os != 'windows-latest'
