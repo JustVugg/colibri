@@ -8966,6 +8966,14 @@ typedef struct {
     uint64_t used;
     unsigned char *slab;
     int aligned_slab;
+    /* Where the record's bytes sit in the slab (V4_SLAB_SHIFT). A direct read
+     * lands a 4 KiB-aligned window of the file, and the record starts some
+     * bytes into it: the views add these instead of the record being moved to
+     * the slab's first byte after every read. Both are 0 after a buffered
+     * read, a per-matrix or GGUF record, or with V4_SLAB_SHIFT=0. */
+    size_t data_shift;     /* the scales */
+    size_t weight_shift;   /* the weights; equal to data_shift when one window
+                            * brought the whole record */
     int lru_previous;
     int lru_next;
     unsigned char in_lru;
@@ -9359,8 +9367,8 @@ static void fill_tensor_view(ColiTensorView *view,
     memset(view, 0, sizeof(*view));
     view->format = COLI_TENSOR_FP4_NATIVE_BLOCK;
     view->scale_format = COLI_SCALE_UE8M0;
-    view->data = slot->slab + weight_base;
-    view->scales = slot->slab + scale_base;
+    view->data = slot->slab + slot->weight_shift + weight_base;
+    view->scales = slot->slab + slot->data_shift + scale_base;
     view->data_bytes = (size_t)weight->nbytes;
     view->scale_bytes = (size_t)scale->nbytes;
     view->rows = weight->shape[0];
@@ -9957,9 +9965,23 @@ static int v4_pread_full_try(int fd, void *destination, size_t length,
     return 0;
 }
 
+/* V4_SLAB_SHIFT (on; 0 = off): a direct read leaves the record where its
+ * window landed, and the slot's views point there, instead of moving it to
+ * the slab's first byte: the move is the whole record (12.6 MB for a V4
+ * Flash expert) after every read, on the thread that read it. */
+static int v4_slab_shift_on(void) {
+    const char *setting = getenv("V4_SLAB_SHIFT");
+    return !(setting && *setting == '0');
+}
+
+/* shift: NULL moves the range to slab + destination_offset, as a caller that
+ * tiles several ranges into one slab needs. Otherwise the range stays where
+ * the window put it, *shift bytes into the slab (destination_offset is then
+ * 0), and nothing is moved. */
 static int v4_read_direct_window(const V4ExpertStoreState *state, int shard,
                                  int rep, unsigned char *slab, uint64_t offset,
-                                 size_t length, size_t destination_offset) {
+                                 size_t length, size_t destination_offset,
+                                 size_t *shift) {
     if (!state || !state->index || shard < 0 || shard >= state->index->nfd) return -1;
     /* DUAL-SSD: prefer the routed replica's O_DIRECT twin. */
     int dfd = rep ? state->index->mdfds[rep - 1][shard] : state->index->dfds[shard];
@@ -9982,7 +10004,10 @@ static int v4_read_direct_window(const V4ExpertStoreState *state, int shard,
     if (direct_length < wanted && v4_pread_full_try(
             fd, slab + direct_length,
             wanted - direct_length, base + direct_length)) return -1;
-    memmove(slab + destination_offset, slab + pad, length);
+    if (shift)
+        *shift = pad;
+    else
+        memmove(slab + destination_offset, slab + pad, length);
     __atomic_fetch_add(&g_v4_mir_bytes[rep], (uint64_t)length, __ATOMIC_RELAXED);
     __atomic_fetch_add(&g_v4_mir_nread[rep], 1, __ATOMIC_RELAXED);
     return 0;
@@ -9999,7 +10024,7 @@ static int v4_read_direct_copy(const V4ExpertStoreState *state, int shard,
     unsigned char *bounce = NULL;
     if (posix_memalign((void **)&bounce, 4096, length + 8192u)) return -1;
     int result = v4_read_direct_window(state, shard, rep, bounce, offset,
-                                       length, 0);
+                                       length, 0, NULL);
     if (!result) memcpy(destination, bounce, length);
     compat_aligned_free(bounce);
     return result;
@@ -10014,7 +10039,7 @@ static int v4_try_direct_segment(V4ExpertStoreState *state, int shard, int rep,
     size_t length = (size_t)bytes;
     if (dest == 0)
         return v4_read_direct_window(state, shard, rep, slot->slab, offset,
-                                     length, 0);
+                                     length, 0, NULL);
     return v4_read_direct_copy(state, shard, rep, slot->slab + dest, offset,
                                length);
 }
@@ -10118,6 +10143,10 @@ static int v4_gguf_interleave(const V4ExpertRecord *record, unsigned char *slab)
 static int v4_read_expert_record(V4ExpertStoreState *state,
                                  const V4ExpertRecord *record,
                                  V4ExpertSlot *slot, int rep) {
+    /* whatever a previous record left: every path below that does not shift
+     * puts the record at the slab's first byte */
+    slot->data_shift = 0;
+    slot->weight_shift = 0;
     if (record->gguf) {
         int used_direct = 0, used_fallback = 0;
         uint64_t cursor = 0;
@@ -10172,11 +10201,15 @@ static int v4_read_expert_record(V4ExpertStoreState *state,
     int direct_available = slot->aligned_slab &&
         coli_st_streaming_direct_available_rep(state->index, record->scale_shard, rep);
     int same_shard = record->scale_shard == record->weight_shard;
+    int keep = v4_slab_shift_on();
+    size_t window_shift = 0;
     if (direct_available && same_shard &&
         record->scale_offset + record->scale_bytes == record->weight_offset &&
         !v4_read_direct_window(state, record->scale_shard, rep, slot->slab,
                                record->scale_offset,
-                               (size_t)record->record_bytes, 0)) {
+                               (size_t)record->record_bytes, 0,
+                               keep ? &window_shift : NULL)) {
+        slot->data_shift = slot->weight_shift = window_shift;
         __atomic_fetch_add(&v4_direct_reads, UINT64_C(1), __ATOMIC_RELAXED);
         __atomic_fetch_add(&v4_direct_flock_reads, UINT64_C(1),
                            __ATOMIC_RELAXED);
@@ -10185,10 +10218,20 @@ static int v4_read_expert_record(V4ExpertStoreState *state,
         return 0;
     }
 
+    /* The scales and the weights are apart in the file. Kept in place, the
+     * weights' window lands on the first page boundary past the scale run
+     * (the buffered read below puts that at the slab's first byte) and the
+     * weights start window_shift bytes into it; the views count the weights
+     * from the end of the scale run, hence the difference. */
+    size_t weight_at = keep ? ((size_t)record->scale_bytes + 4095u) & ~(size_t)4095u : 0;
+    window_shift = 0;
     int weight_direct = direct_available && !v4_read_direct_window(
-        state, record->weight_shard, rep, slot->slab, record->weight_offset,
-        (size_t)record->weight_bytes, (size_t)record->scale_bytes);
+        state, record->weight_shard, rep, slot->slab + weight_at,
+        record->weight_offset, (size_t)record->weight_bytes,
+        keep ? 0 : (size_t)record->scale_bytes, keep ? &window_shift : NULL);
     if (weight_direct) {
+        if (keep)
+            slot->weight_shift = weight_at + window_shift - (size_t)record->scale_bytes;
         __atomic_fetch_add(&v4_direct_reads, UINT64_C(1), __ATOMIC_RELAXED);
         __atomic_fetch_add(&v4_direct_payload_bytes, record->weight_bytes,
                            __ATOMIC_RELAXED);
@@ -10596,7 +10639,7 @@ retry_lookup:
         return -1;
     }
     if (!slot->slab) {
-        size_t capacity = (size_t)state->record_bytes + 8192u;
+        size_t capacity = (size_t)state->record_bytes + COLI_V4_EXPERT_SLAB_SLACK;
         if (posix_memalign((void **)&slot->slab, 4096, capacity)) {
             slot->slab = NULL;
             pthread_mutex_unlock(&state->mutex);
@@ -15805,7 +15848,7 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
         for (int i = 0; i < n; i++) {
             unsigned char *buffer = NULL;
             ColiExpertView view;
-            if (posix_memalign((void **)&buffer, 4096, (size_t)record + 8192u)) buffer = NULL;
+            if (posix_memalign((void **)&buffer, 4096, (size_t)record + COLI_V4_EXPERT_SLAB_SLACK)) buffer = NULL;
             VktExpertSrc src;
             unsigned char *rows = NULL;
             if (buffer && !coli_v4_expert_store_read_private(

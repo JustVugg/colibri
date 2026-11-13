@@ -792,6 +792,11 @@ void coli_v4_expert_store_note_vram(ColiExpertStore *store, int layer,
 extern void (*coli_v4_expert_store_vram_held)(ColiExpertStore *store, int layer,
                                               unsigned char *held, int experts);
 
+/* Bytes a slab holds past its record. A direct read lands a 4 KiB-aligned
+ * window of the file in the slab, and the record's weights stay where that
+ * window put them (V4_SLAB_SHIFT): the scale run rounded up to a page, the
+ * window's leading pad and its trailing round-up are three pages at most. */
+#define COLI_V4_EXPERT_SLAB_SLACK 16384u
 #if defined(COLI_VULKAN) || defined(COLI_CUDA)
 /* The routed-expert tier (vk_tier.c, Makefile.deepseek-v4 VK=1; cu_tier.c on a CUDA device). The MoE
  * units reach it through this table, which the engine's own unit fills when
@@ -829,6 +834,8 @@ uint64_t coli_v4_expert_store_record_bytes(ColiExpertStore *store);
  * (w3) and down (w2) as the file has them, *mx = 1 when the store lays them out as the
  * checkpoint's FP4 (all three MXFP4); 0 for a checkpoint's store, -1 without one. */
 int coli_v4_expert_store_gguf_form(ColiExpertStore *store, int layer, int types[3], int *mx);
+/* buffer: 4 KiB-aligned, the store's record bytes + COLI_V4_EXPERT_SLAB_SLACK.
+ * The view points into it, not necessarily at its first byte. */
 int coli_v4_expert_store_read_private(ColiExpertStore *store, ColiExpertKey key,
                                       unsigned char *buffer, ColiExpertView *view);
 extern int (*coli_v4_expert_store_device_tier)(int layer, int expert);

@@ -558,6 +558,37 @@ token-layers (`calls`), their wall time from routing on, the wait for store
 fetches, the VRAM attach time and the mirror `uploads` it caused, and the
 fused GPU compute.
 
+### An expert record stays where its read landed (`V4_SLAB_SHIFT`, on)
+
+A direct read of an expert lands a 4 KiB-aligned window of the file in the
+expert's slab, and the record starts some bytes into that window. The reader
+used to move the record to the slab's first byte after every read: 12.6 MB for
+a V4 Flash expert, on the thread that read it. The slot now remembers where
+the record sits and the tensor views point there; nothing is moved. For a
+checkpoint that keeps an expert's scales and weights apart in the file, the
+weights' window lands on the first page boundary past the scale run and the
+scales are read to the slab's first byte, as before. Per-matrix and GGUF
+records, buffered reads and a direct read that fell back are unchanged. A slab
+holds 16 KiB past its record instead of 8. `V4_SLAB_SHIFT=0` restores the
+move; the bytes are the same either way.
+
+Measured on the RTX 5080 (3,278-token prompt, 36 tokens, `--memory-gb 16`,
+`COLI_CUDA_MOE_BATCH=1 COLI_CUDA_MOE_DOUBLE=1`, three interleaved runs per
+cell, medians; the text is the same in all twelve runs):
+
+| mirror reserve | | `V4_SLAB_SHIFT=0` | on |
+|---|---|---|---|
+| the default (8329 MiB with two banks) | 35 tokens after the first (s) | 22.15 | 20.34 (+8.9 % tok/s) |
+| | routed experts per token (ms) | 523.4 | 474.1 |
+| | time to first token (s) | 65.1 | 58.5 |
+| `DSV4_CUDA_VRAM_RESERVE_MB=600` | 35 tokens after the first (s) | 20.75 | 18.81 (+10.3 % tok/s) |
+| | routed experts per token (ms) | 482.1 | 428.9 |
+| | time to first token (s) | 64.9 | 58.7 |
+
+The prompt gains too, a tenth of its time, because the bank refills read
+experts through the same path. Not measured: a CPU-only run, Linux, a contiguous (FLOCK-packed)
+checkpoint. The record is in `docs/experiments/v4-slab-shift-2026-11-13/`.
+
 ## Prefill: segments, chunks, checkpoints
 
 - **Chunks/segments.** Prefill runs layer-major over 128-token chunks
@@ -838,6 +869,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_LOADER_LANES` (9, max 16) | persistent expert-loader threads for decode. The default suits the CPU path (1.41× decode, #1097); **with the GPU tier set `3`**: mirrors/RAM absorb most decode misses (9 lanes ≈ +4 % decode) while the extra readers contend with the MoE bank refill for the NVMe queues (~10 % slower prefill; measured on the reference box, v1.7.0) |
 | `V4_EXPERT_UNION` (1) | per-chunk expert union batching on the CPU path |
 | `COLI_V4_DIRECT` (1) | O_DIRECT streaming reads |
+| `V4_SLAB_SHIFT` (1) | an expert record stays where its direct read landed and the views point there; `0` = moved to the slab's first byte after every read, as before (see [An expert record stays where its read landed](#an-expert-record-stays-where-its-read-landed-v4_slab_shift-on)) |
 | `COLI_V4_AUTOPIN`, `COLI_V4_SAVE_USAGE` | hot-expert pinning from `.coli_usage` history |
 | `COLI_V4_PREWARM` (unset) | the expert cache filled before the first request: unset, a serve (chat, web) reads every expert its RAM plan holds, or with a smaller cache each layer's most used ones in `.coli_usage`, before it says ready, in parallel with a progress line, and stops short of the RAM the plan keeps for the system; a one-shot run fills it as experts are used. `0` skips it, `1` fills it in every run (#2109) |
 
