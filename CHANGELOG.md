@@ -524,6 +524,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **Qwen3.8 decode on HIP slower since the verify's DeltaNet copies** (#2757). #2765 put the copy
+  of each verify row's DeltaNet state (`snap_n`) into `cc_dnrec_k` and `cc_dnconv_k`, the kernels a
+  decode step runs too. On a Radeon AI PRO R9700, where decode with the pool read over the bus had
+  gone from 40 to 27 tok/s, the trace showed the recurrence at 256 VGPRs going to scratch (1092 to
+  2600 bytes) and its call from 16 to 68 us. Both kernels now take that copy as a template flag,
+  used only where a verify asks for it; on an RTX PRO 4000 the recurrence is back from 16.9 to
+  14.75 us and decode from 32.5 to 32.8 tok/s, as before #2765. A matmul also no longer asks the
+  runtime for the device each time it forgets its stream's quantized input (2898 to 37989 device
+  queries in a 64-token request on the R9700).
 - **macOS: one rule for available memory, free + file-backed + purgeable pages** (#2785, #1614).
   The planner, `coli setup` and every engine counted free + inactive pages (DeepSeek V4 with its
   own copy). That queue holds file pages, which macOS can drop, and anonymous pages, which it can
