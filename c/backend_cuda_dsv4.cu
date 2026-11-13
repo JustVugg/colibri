@@ -1,9 +1,13 @@
 #include "backend_cuda_dsv4.h"
 #include <chrono>
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
+#include "backend_gpu_compat.h"
+#else
 #include <cuda_runtime.h>
 #include <cuda_profiler_api.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#endif
 #include "backend_cuda_dsv4_quant.cuh"
 #if !defined(COLI_DSV4_NO_TC)
 #include <cublasLt.h>
@@ -96,9 +100,13 @@ static bool dev_ok(int a,int b){return !g_cuda_lost&&(a==b||(a>=0&&a<16&&b>=0&&b
  * (the F18 probe). g_cuda_lost latches on the first one: from then on ctx()
  * answers no device, so every entry point refuses without touching CUDA and
  * the engine takes its host paths (dsv4_cuda_lost) until the process ends. */
+#if !defined(__HIP_PLATFORM_AMD__) && !defined(__HIP__)
 static bool sticky(cudaError_t e){switch(e){case cudaErrorIllegalAddress:case cudaErrorLaunchFailure:case cudaErrorHardwareStackError:
     case cudaErrorIllegalInstruction:case cudaErrorMisalignedAddress:case cudaErrorInvalidAddressSpace:case cudaErrorInvalidPc:
     case cudaErrorAssert:case cudaErrorLaunchTimeout:case cudaErrorECCUncorrectable:return true;default:return false;}}
+#else
+static bool sticky(cudaError_t e){switch(e){case hipErrorIllegalAddress:case hipErrorLaunchFailure:case hipErrorAssert:return true;default:return false;}}
+#endif
 static void cuda_lost(const char*s,cudaError_t e){if(g_cuda_lost)return;g_cuda_lost=1;
     fprintf(stderr,"[DSV4 CUDA] %s: %s is a sticky fault: CUDA is lost for this process, on every device; the GPU paths "
                    "stay off and the engine runs on the host until the server restarts\n",s,cudaGetErrorString(e));}
@@ -2703,6 +2711,7 @@ extern "C" int dsv4_cuda_expert_fp8(Dsv4CudaTensor *gate,Dsv4CudaTensor *up,Dsv4
  * Each output keeps the launch sequence's arithmetic and order (tests/
  * test_dsv4_fused6_cuda.cu compares the two bit for bit). Any other shape, or a
  * device without cooperative launch, takes the launch sequence. */
+#if !defined(__HIP_PLATFORM_AMD__) && !defined(__HIP__)
 struct V4FBar { unsigned arrive; unsigned pad0[31]; unsigned gen; unsigned pad1[31]; };
 /* Grid barrier for a cooperative launch: the last block to arrive bumps the generation. */
 __device__ __forceinline__ void v4f_bar_sync(V4FBar* b,unsigned n){
@@ -2817,6 +2826,7 @@ __global__ void __launch_bounds__(1024,1) v4f_moe_kernel(V4FMoeArgs a){
         a.y[o]=v4f_bfr(v+v4f_bfr(__ldcg(a.parts+6*4096+o))); }
 }
 
+#endif
 /* Peer-compute failures. pstep keeps a peer step's first error; peer_fail
  * drains the peer and peer_latch reports the error once, with the device, as
  * it latches the peer off. peer_drain waits out what was queued on the peer,
@@ -2872,6 +2882,7 @@ static int moe_once(Dsv4CudaTensor *const *gate,Dsv4CudaTensor *const *up,Dsv4Cu
      * 0 once the device has no cooperative launch, a buffer failed or a launch was
      * refused: from then on the launch sequence below. The grid needs >= 8 blocks so
      * that one block's down rows span at most two experts (the kernel's aq[2]). */
+#if !defined(__HIP_PLATFORM_AMD__) && !defined(__HIP__)
     static int fnb=-1;
     const char*fused_env=getenv("DSV4_CUDA_MOE_FUSED6");
     if(fused_env&&atoi(fused_env)&&fnb<0){int coop=0;cudaDeviceGetAttribute(&coop,cudaDevAttrCooperativeLaunch,sg->device);
@@ -2899,6 +2910,7 @@ static int moe_once(Dsv4CudaTensor *const *gate,Dsv4CudaTensor *const *up,Dsv4Cu
         }
     }
 
+#endif
     Dev*pc=nullptr;
     if(moe_batched()){
         /* Peer compute (peer_runs): routed experts whose mirrors live on a

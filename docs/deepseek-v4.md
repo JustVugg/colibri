@@ -176,6 +176,17 @@ the engine's folder (a relative path too), `COLI_DSV4_DLL=<absolute path>`
 the current directory). The start-up banner names the choice and the file:
 `[DSV4 CUDA] backend=coli_cuda_dsv4_dg.dll (deepgemm-sm120) path=...`. Deploy = `deepseek_v4.exe` + both DLLs next to it.
 
+### Linux HIP tier
+
+```bash
+cd c
+make deepseek-v4 HIP=1 HIP_ARCH=gfx1102   # ROCM_HOME=/usr when ROCm is not in /opt/rocm
+```
+
+The same `backend_cuda_dsv4.cu`, compiled by `hipcc` (ROCm 6.3 or newer: the
+OCP fp8 type in `<hip/hip_fp8.h>`) and linked into the engine like `CUDA=1`.
+The cooperative fused-MoE kernel is CUDA-only and compiled out on HIP.
+
 ### Linux CUDA tier
 
 ```bash
@@ -228,6 +239,22 @@ outside ASCII (Chinese, accented letters) does not survive the command line of
 the engine run by hand: give it with `--prompt-file <UTF-8 file>`. `--ngen` is a ceiling, not a
 target (answers end at EOS; an oversized ceiling is clamped to the context
 with a stderr note). `CTX`/`--ctx` sets the context window.
+
+On the HIP build the engine reads the GPU variables `coli` already exports,
+the same names the other engines take on HIP too ([GPU_BACKENDS.md](../GPU_BACKENDS.md)):
+`COLI_CUDA=0` (`--gpu none`) turns the native tier off, `COLI_GPUS` (`--gpu N`)
+picks the device, and `CUDA_EXPERT_GB` (`--vram N`) is the VRAM the engine may
+use: the expert mirrors grow until the card has that much less free than it
+had at open, and never below the engine's own reserve (an explicit
+`DSV4_CUDA_VRAM_RESERVE_MB` is a floor too). The display server shares the
+card, so leave it room: `--vram` is a cap on this process, not on the card, and
+it caps the mirrors: the engine's working buffers (0.2 to 0.5 GiB measured) come
+on top. On an 8 GB card with a desktop that makes about 6 the practical
+maximum; 7 left the card with 0.5 GiB free in a run and was stopped.
+
+Below 10 GiB the dense/attention mirrors (6.2 GiB) are worth less on the card
+than the same VRAM as expert mirrors, so on an 8 GB card they stay in RAM.
+A long prompt is then prefilled on the CPU.
 
 What the knobs do (full table in [Environment reference](#environment-reference-v4-engine)):
 `COLI_CUDA_ATTN_BATCH=1` puts the batched prefill attention block on the GPU
@@ -285,6 +312,7 @@ the next read.
 |---|---|---|---|---|
 | 6 GB | no (6.3 GB does not fit) | yes (3.2 GiB) | `CUDA_DENSE=0 COLI_CUDA_MOE_BATCH=1 COLI_CUDA_ATTN_BATCH=0` | GPU MoE prefill (generic kernels on non-RTX50), CPU attention/decode; ~90 mirrors between prefills |
 | 8 GB | yes | no (~0.9 GiB left) | `CUDA_DENSE=1 COLI_CUDA_ATTN_BATCH=1 COLI_CUDA_MOE_BATCH=0` | GPU attention + GPU decode dense; MoE prefill on the CPU union; ~25 mirrors |
+| 8 GB (HIP build) | no (stays in RAM) | no | the HIP default (`--vram N` pins the budget) | decode dense in RAM, ~530–549 mirrors; prefill on the CPU |
 | 10–12 GB | yes | 12 GB: yes (tight); 10 GB: only a pruned checkpoint's smaller bank on generic builds | `CUDA_DENSE=1 COLI_CUDA_ATTN_BATCH=1 COLI_CUDA_MOE_BATCH=1` | full GPU prefill; 12 GB: the 32-mirror minimum beside a 256-expert bank's reserve (~350 mirrors with `COLI_CUDA_MOE_BATCH=0`), ~150 beside a 132-expert one; 10 GB: the 32-mirror minimum beside a 132-expert bank (256 experts: `COLI_CUDA_MOE_BATCH=0`, ~190 mirrors) |
 | 16 GB (this box) | yes | yes | the canonical line above (mirror cap can be left unset) | ~330 mirrors; the numbers in this document predate the bank-sized reserve (the fixed 2800 MiB default left more mirrors, but too little room for the bank once decode had filled the card) |
 | 24 GB | yes | yes | canonical | ~1 000 mirrors (~9 %) |
