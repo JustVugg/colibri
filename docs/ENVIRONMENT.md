@@ -138,8 +138,8 @@ are still checked for engine ownership regardless of prefix.
 | `CAP_RAISE` | `1` (on); `0` on Metal + macOS + fast model volume (#379) | Let the engine raise the expert-cache cap above `topk` when RAM allows (bigger batches). `0` fixes the cap. When the platform-aware Metal cache default engages (F_NOCACHE probe measured the model volume fast), the *default* flips to `0` — auto-raise re-creates the Metal residency churn the minimal cache avoids. An explicit `CAP_RAISE` always wins. |
 | `COLI_SSD_FAST_GBS` | `4.0` | Threshold (GB/s, measured F_NOCACHE, cached in `<model>/.coli_ssd` — see [The `.coli_ssd` probe cache](#the-coli_ssd-probe-cache) below) at or above which the model volume counts as "fast" for the platform-aware Metal cache defaults (#379). |
 | `PREFETCH` | `0` | Prefetch depth for streamed experts. |
-| `COLI_MMAP` | `0` | colibri: serve the routed experts as read-only `mmap` views of their shards instead of copying each one into a cache slab, so the page cache is the expert cache. Experts only; for the dense weights see `TRUNK_RESIDENT_LAYERS`. Linux, macOS and FreeBSD: elsewhere (Windows) the experts are read into slabs as without it. Incompatible with `URING=1`. See [Weights from disk instead of RAM](#weights-from-disk-instead-of-ram). |
-| `TRUNK_RESIDENT_LAYERS` | unset (the whole trunk resident) | colibri: keep the dense tensors of only the top N layers resident. In the layers below, the attention projections, the dense MLP and the shared expert become read-only `mmap` views of the shards, paged in from disk when the OS has evicted them; `0` maps every layer. Embeddings, LM head, norms, router, MTP layer and DSA indexer stay resident, and so does a tensor without its `.qs` companion (a bf16 checkpoint maps nothing). CPU-only: exits 2 with `COLI_METAL`, `COLI_VULKAN` or `COLI_CUDA` set. Linux, macOS and FreeBSD; on Windows the trunk stays resident. The RAM it frees goes to the expert cache: lower `RAM_GB` or `CAP` to lower the total (#1399). |
+| `COLI_MMAP` | `0` | colibri: serve the routed experts as read-only `mmap` views of their shards instead of copying each one into a cache slab, so the page cache is the expert cache. Experts only; for the dense weights see `TRUNK_RESIDENT_LAYERS`. Linux, macOS, FreeBSD and Windows: elsewhere the experts are read into slabs as without it. Incompatible with `URING=1`. See [Weights from disk instead of RAM](#weights-from-disk-instead-of-ram). |
+| `TRUNK_RESIDENT_LAYERS` | unset (the whole trunk resident) | colibri: keep the dense tensors of only the top N layers resident. In the layers below, the attention projections, the dense MLP and the shared expert become read-only `mmap` views of the shards, paged in from disk when the OS has evicted them; `0` maps every layer. Embeddings, LM head, norms, router, MTP layer and DSA indexer stay resident, and so does a tensor without its `.qs` companion (a bf16 checkpoint maps nothing). CPU-only: exits 2 with `COLI_METAL`, `COLI_VULKAN` or `COLI_CUDA` set. Linux, macOS, FreeBSD and Windows. The RAM it frees goes to the expert cache: lower `RAM_GB` or `CAP` to lower the total (#1399). |
 | `PIN` | unset | Path to a `.coli_usage`/stats file; pins the hottest experts into a resident "hot store" at startup. **`PIN=auto`** seeds from the model dir's live `.coli_usage` (appended after every turn, so each restart's pin placement follows the accumulated real workload) with `stats.txt` as the fallback for a virgin model dir; neither present → no pin this run. |
 | `PIN_GB` | `10.0` | Size budget (GB) for the pinned hot store when `PIN` is set. |
 | `AUTOPIN` | `1` (on) | Auto-pin the hot store from usage history once ≥5000 selections are recorded. Automatic pinning is capped so it cannot reduce the adaptive LRU capacity that fits before pinning; explicit `PIN`/`PIN_GB` settings remain authoritative. |
@@ -180,7 +180,7 @@ What each engine can do:
 
 | Engine | Dense weights | Routed experts |
 |---|---|---|
-| `colibri` (GLM-5.2) | `TRUNK_RESIDENT_LAYERS=0`: attention, dense MLP and shared expert of every layer mapped from disk. CPU only; Linux, macOS, FreeBSD. | `COLI_MMAP=1`: mapped, the page cache is the cache. Linux, macOS, FreeBSD. |
+| `colibri` (GLM-5.2) | `TRUNK_RESIDENT_LAYERS=0`: attention, dense MLP and shared expert of every layer mapped from disk. CPU only; Linux, macOS, FreeBSD, Windows. | `COLI_MMAP=1`: mapped, the page cache is the cache. Linux, macOS, FreeBSD, Windows. |
 | `kimi_k3` | `K3_MMAP=1`: every prepared matrix mapped, LM head included. The embedding is read one row per token in any case. CPU only. | Cache of at least one slot per layer (`K3_EXPERT_GB`). |
 | `deepseek_v4` | Automatic: when the dense trunk or the BF16 head does not fit in `RAM_GB`, it is read from disk again on every use. The `ram_tiers` line on stderr says `dense=streamed`. | Cache of at least the top-k slots per layer. |
 | `glm53` | Resident (`GLM53_BITS` picks 4, 8 or 32 bits). | `COLI_MAP_EXPERTS=1`: views of a per-shard mapping, CPU runs only. |
@@ -193,7 +193,14 @@ worst case every token reads every mapped byte: this is how a model runs at
 all, not how it runs fast. Mapped bytes also do not count as resident, and the
 engine hands the RAM they free to the expert cache; to lower the total, lower
 `RAM_GB` (`coli --ram`) or `CAP` too. For GLM-5.2 on a machine where not even
-the trunk fits: `TRUNK_RESIDENT_LAYERS=0 COLI_MMAP=1 RAM_GB=2`.
+the trunk fits: `TRUNK_RESIDENT_LAYERS=0 COLI_MMAP=1 RAM_GB=2`. On Windows the
+mapped pages the engine has read count in its working set, the figure
+`RSS_GUARD_GB` checks. With the trunk mapped but not the experts, the guard can
+then trim the expert cache to make room for them. With `COLI_MMAP=1` it has no
+copies to free, but it still lowers the expert-cache cap, without a
+`[RAM-GUARD]` line. `RSS_GUARD_GB=0` turns the guard off in both cases. If a
+shard cannot be mapped, the engine says so in one `[MMAP]` line and reads those
+weights into RAM.
 
 ## The `.coli_ssd` probe cache
 
