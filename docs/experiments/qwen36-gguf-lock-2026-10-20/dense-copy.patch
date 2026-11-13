@@ -1,0 +1,22 @@
+--- a/c/qwen36.c
++++ b/c/qwen36.c
+@@ -2477,7 +2477,18 @@
+         struct stat st;
+         if (fstat(g_gg.fds[p], &st)) break;
+         if (st.st_size <= 0) { errno = EINVAL; break; }   /* an empty part: errno holds no reason */
+-        void *base = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, g_gg.fds[p], 0);
++        /* First-step diagnosis (2026-10-20): the mapping from a copy of every tensor but the routed experts, at
++         * the same offsets (bench_diag.c's BENCH_WRITE_DENSE_COPY); the experts are still read from the file itself
++         * (load_expert_merged, g_gg.fds) */
++        const char *t3 = getenv("T3_DENSE_COPY");
++        int fd = g_gg.fds[p];
++        if (t3 && *t3 && g_gg.n_files == 1) {
++            struct stat cs;
++            fd = open(t3, O_RDONLY);
++            if (fd < 0 || fstat(fd, &cs) || cs.st_size != st.st_size) { fprintf(stderr, "T3: bad copy %s\n", t3); exit(1); }
++            fprintf(stderr, "[t3] the GGUF mapped from %s, its experts read from the file\n", t3);
++        }
++        void *base = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+         if (base == MAP_FAILED) break;
+         g_gg_map[p] = base;
+         g_gg_map_bytes[p] = (size_t)st.st_size;

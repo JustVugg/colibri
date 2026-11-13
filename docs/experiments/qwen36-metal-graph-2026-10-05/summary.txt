@@ -1,0 +1,27 @@
+The summary printed at the end of the measurement by the script that ran it (a local script, not in this record: before every run it waits for the nominal thermal state, rests 60 s and reads the swap counters, then runs the manifests' command): every run's raw log is in baseline.txt and trial.txt. Its 'peak memory ... MB' is in MiB (2^20 bytes); 'pages written to swap' is the system-wide counter. Its 'pages written to swap during the runs' (4,396) are the discarded warm-up's (1,096) and v0-run1's (3,300, a run of the CPU engine); no other run wrote any (each run's counters before and after are in baseline.txt and trial.txt). Its v0 line names no commit: bin-pr7-cpu/ holds only the script that runs bin-pr7/qwen36-bench, the v1 binary, with COLI_METAL=0.
+
+model <model>; text promessi_sposi.txt; lengths 64,512; gen 32; runs 4; extra env: none
+cooldown before every run: 60 seconds, after waiting for thermal state 0: yes, at most 900s; thermal states: 0 nominal, 1 fair, 2 serious, 3 critical
+v0: bin-pr7-cpu/qwen36-bench ()
+v1: bin-pr7/qwen36-bench (commit f6935a058fe817e3dff6287e1e409e581fc340a8 (Metal engine, make qwen36 METAL=1 flags on macOS))
+order: the binaries' order turns at every round (ABBA)
+
+v0: 4 runs (median, min-max)
+tokens    new            prompt tok/s          first token ms        generation tok/s  experts read  fingerprint
+    64     64        2.43 (2.41-2.45)           884 (806-974)     1.712 (1.471-1.766)         11275  f1300d8431ba2787
+   512    512        3.13 (3.12-3.15)         1032 (998-1045)     1.854 (1.781-1.889)         61469  8e0bf69c62deb041
+peak memory 3289 MB, model ready in 2.90 s (medians)
+
+v1: 4 runs (median, min-max)
+tokens    new            prompt tok/s          first token ms        generation tok/s  experts read  fingerprint
+    64     64     18.55 (17.50-22.39)           457 (316-586)     8.559 (8.376-8.763)          8999  9585b2736ec3699f
+   512    512  111.27 (108.47-115.38)           283 (276-352)     9.206 (8.414-9.285)         10839  465ed0efdf92a690
+peak memory 998 MB, model ready in 0.25 s (medians)
+
+warm-up (does not count): 64 tokens: prompt 2.43 tok/s, generation 1.102 tok/s; 512 tokens: prompt 3.14 tok/s, generation 1.275 tok/s
+
+v1 against v0 (medians):
+    64 tokens: prompt +663.2%, first token +93.3%, generation +400.1%  (RESULTS DIFFER)
+   512 tokens: prompt +3455.0%, first token +264.0%, generation +396.4%  (RESULTS DIFFER)
+(positive = faster)
+swap used 478.88M -> 366.56M; pages written to swap during the runs: 4396 (16 KB each)

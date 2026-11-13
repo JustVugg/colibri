@@ -1,0 +1,26 @@
+_tensor *router_logits;
+    q36_tensor *x;                 /* input/output tensor */
+    int head_count, head_size, kv_head_count;
+    int head_size_norm;
+    int kv_cap;
+    int is_delta;
+} QgLayer;
+
+typedef struct {
+    q36_tensor *token_embeddings;
+    q36_tensor *ln_f;
+    q36_tensor *lm_head;
+    q36_tensor *rope_table;
+    q36_tensor *x;                 /* input/output tensor */
+    QgLayer *layers;
+    int head_count, head_size, kv_head_count;
+    int head_size_norm;
+    int kv_cap;
+    int layer_count;
+    int is_delta;
+} QgModel;
+
+/* Forward pass: one sequence of GPU operations. */
+void qwen36_graph_forward(QgModel *model, q36_tensor *tokens, int batch, int seq_len, int kv_cap,
+                 q36_tensor *rope_table, q36_tensor *logits, q36_tensor *norm,
+                 q36_layer_loader_t *loader, q36_advice

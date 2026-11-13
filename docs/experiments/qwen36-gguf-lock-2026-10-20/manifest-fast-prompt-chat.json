@@ -1,0 +1,79 @@
+{
+  "version": 1,
+  "hypothesis": "On a GGUF, with its dense matrices locked in memory through a prompt, the Metal graph in its default (fast) mode reads a 512-token prompt faster on an 8 GB M1: it no longer reads back the dense pages its own expert reads pushed out of memory; the same logits.",
+  "commit": "627409db6b9ea4642c64b45d9956f7a9f6005e2b",
+  "model": "unsloth's Qwen3.6-35B-A3B-UD-Q4_K_M.gguf (22,134,528,992 bytes, downloaded to this Mac's SSD on 2026-10-18, finished at 23:34), in the directory coli import --mode link makes for it (gguf.json, config.json, tokenizer.json): dense matrices in Q8_0, the head in Q6_K, the embedding in Q8_0, the routers and the DeltaNet's alpha and beta projections in F32, the routed experts' gate and up in Q4_K and their down in Q5_K (37 layers) or Q6_K (3)",
+  "command": "git archive <commit> c | tar -x -C <dir>, make -C <dir>/c qwen36_metal.o backend_metal.o METAL=1, then from the repository root, with the compiler flags make -C c qwen36 METAL=1 gives qwen36.c except its qpack path (-DQWEN36_QPACK and its objects, which the harness does not use): clang -O3 -Xclang -fopenmp -I<libomp>/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_METAL -DQWEN36_METAL -I<dir>/c docs/experiments/qwen36-gguf-lock-2026-10-20/bench.c <dir>/c/qwen36_metal.o <dir>/c/backend_metal.o -o bin-<commit>/qwen36-bench -lm -L<libomp>/lib -lomp -framework Metal -framework Foundation -framework Accelerate -lc++; every run: /usr/bin/time -l env -i PATH=/usr/bin:/bin HOME=$HOME TEACHER=1 launchers/<name>/qwen36-bench chat.txt 64,512 32, where each launcher is a script of one line that sets SNAP and its variables and runs a harness; baseline = launchers/gguf-08293922/, trial = launchers/gguf/: the same file and the same defaults, bin-08293922/ (the change before) against bin-627409db/ (this change)",
+  "prompt_hash": "d77e4d25d43fa554459d85996f69e8573038376cbe2b2fe2725bb12a98fe1960",
+  "hardware": {
+    "cpu": "Apple M1, 4 performance + 4 efficiency cores (MacBook Air, MacBookAir10,1, no fan)",
+    "ram": "8 GB unified memory",
+    "storage": "internal APPLE SSD AP0256Q, APFS",
+    "os": "macOS 26.6.2 (25G83), Apple clang 21.0.0 (clang-2100.3.34.2), Homebrew libomp"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "GGUF_DENSE_LOCK"
+  ],
+  "baseline": {
+    "config": {
+      "BUILD": "the compiler flags of make -C c qwen36 METAL=1 on macOS without its qpack path: clang -O3 -Xclang -fopenmp -DCOLI_METAL -DQWEN36_METAL, qwen36_metal.o and backend_metal.o",
+      "PROMPT": "the first 64 and the first 512 tokens of chat.txt (an English conversation written for these measurements, plain User:/Assistant: text, read whole; prompt_hash is its SHA-256), each from an empty state; after each, 32 tokens, each fed the text's own next token (teacher forcing: both versions read the same tokens)",
+      "ORDER": "1 warm-up run of the baseline (discarded; both versions read the same file), then baseline trial trial baseline baseline trial trial baseline, one process each",
+      "REST": "thermal state nominal, then 60 s, before every run",
+      "EXPERT_CACHE": "the Metal graph's default: a sixteenth of the RAM, 512 MiB: 263 slots of 2.04 MB, 255 retained (a prompt loads its experts eight at a time)",
+      "SNAP": "Qwen3.6-35B-A3B UD-Q4_K_M GGUF, internal SSD",
+      "MEASURED": "tokens per second reading the 512-token prompt from an empty state",
+      "ENGINE": "the Metal graph, default (fast) kernels",
+      "GGUF_DENSE_LOCK": "the change before's (08293922): the dense matrices' pages left to the system (a prompt's expert reads from the same file push them out of memory)"
+    },
+    "samples": {
+      "tok_s": [
+        64.11,
+        60.35,
+        64.69,
+        61.01
+      ]
+    },
+    "median_tok_s": 62.56,
+    "quality": {
+      "method": "Correctness: the lock changes nothing that is computed: both versions give the same logits, bit for bit (the same fingerprint of every logit in every run of both), and read the same tokens (teacher forcing). Fingerprints of every logit and hashes of the tokens, the same in every run of both versions: 64 tokens 88ce147048ad7765/f55beb9e5e71ac78, 512 tokens 33d594906f36b78b/99b2135657766012; the 32 tokens' mean negative log-likelihood and top-1 rate: after 64 tokens 2.02861 0.531, after 512 tokens 1.81011 0.469.",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-gguf-lock-2026-10-20/baseline-fast-chat.txt",
+      "sha256": "9dbf155622a043697e5d656a8b344ce0911584876b25b47c366e7252dbca26ea"
+    }
+  },
+  "trial": {
+    "config": {
+      "BUILD": "the compiler flags of make -C c qwen36 METAL=1 on macOS without its qpack path: clang -O3 -Xclang -fopenmp -DCOLI_METAL -DQWEN36_METAL, qwen36_metal.o and backend_metal.o",
+      "PROMPT": "the first 64 and the first 512 tokens of chat.txt (an English conversation written for these measurements, plain User:/Assistant: text, read whole; prompt_hash is its SHA-256), each from an empty state; after each, 32 tokens, each fed the text's own next token (teacher forcing: both versions read the same tokens)",
+      "ORDER": "1 warm-up run of the baseline (discarded; both versions read the same file), then baseline trial trial baseline baseline trial trial baseline, one process each",
+      "REST": "thermal state nominal, then 60 s, before every run",
+      "EXPERT_CACHE": "the Metal graph's default: a sixteenth of the RAM, 512 MiB: 263 slots of 2.04 MB, 255 retained (a prompt loads its experts eight at a time)",
+      "SNAP": "Qwen3.6-35B-A3B UD-Q4_K_M GGUF, internal SSD",
+      "MEASURED": "tokens per second reading the 512-token prompt from an empty state",
+      "ENGINE": "the Metal graph, default (fast) kernels",
+      "GGUF_DENSE_LOCK": "this change's (627409db): the dense matrices' pages locked in memory (mlock) from the start of each prompt to the end of the decode step after it"
+    },
+    "samples": {
+      "tok_s": [
+        65.98,
+        66.14,
+        64.21,
+        64.1
+      ]
+    },
+    "median_tok_s": 65.095,
+    "quality": {
+      "method": "Correctness: the lock changes nothing that is computed: both versions give the same logits, bit for bit (the same fingerprint of every logit in every run of both), and read the same tokens (teacher forcing). Fingerprints of every logit and hashes of the tokens, the same in every run of both versions: 64 tokens 88ce147048ad7765/f55beb9e5e71ac78, 512 tokens 33d594906f36b78b/99b2135657766012; the 32 tokens' mean negative log-likelihood and top-1 rate: after 64 tokens 2.02861 0.531, after 512 tokens 1.81011 0.469.",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-gguf-lock-2026-10-20/trial-fast-chat.txt",
+      "sha256": "f5eb59a4c66735ef131749c2dd209d4526f9f21fb274fedc665bcf022407d2b4"
+    }
+  },
+  "outcome": "no-change"
+}

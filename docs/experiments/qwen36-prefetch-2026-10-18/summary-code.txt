@@ -1,0 +1,27 @@
+The summary printed at the end of the measurement by the script that ran it (a local script, not in this record: before every run it waits for the nominal thermal state, rests 60 s and reads the swap counters, then runs the manifests' command): every run's raw log is in baseline-code.txt and trial-code.txt. Its 'peak memory ... MB' is in MiB (2^20 bytes); 'pages written to swap' is the system-wide counter. Its 'first token ms' is the first decode step and its 'generation tok/s' steps 2 to 32, the harness's two columns; the manifests and the README count all 32 steps. Its 'pages written to swap during the runs' (20) are v1-run4's (20, a run with QWEN36_PREFETCH=1); no other run wrote any (each run's counters before and after are in baseline-code.txt and trial-code.txt).
+
+model <model+head>; text code.txt; lengths 64,512; gen 32; runs 4; extra env: TEACHER=1
+cooldown before every run: 60 seconds, after waiting for thermal state 0: yes, at most 900s; thermal states: 0 nominal, 1 fair, 2 serious, 3 critical
+v0: launchers/pr14-guessed4/qwen36-bench (commit 2a2c5bc65646cc12b219f517755441e86656dd0e (fast mode, QWEN36_FAST_EXPERTS=5 QWEN36_FAST_GUESSED=4, the MTP head's drafts))
+v1: launchers/pr14-prefetch/qwen36-bench (commit 2a2c5bc65646cc12b219f517755441e86656dd0e (fast mode, QWEN36_FAST_EXPERTS=5 QWEN36_FAST_GUESSED=4 QWEN36_PREFETCH=1, the MTP head's drafts))
+order: the binaries' order turns at every round (ABBA)
+
+v0: 4 runs (median, min-max)
+tokens    new            prompt tok/s          first token ms        generation tok/s  experts read  fingerprint
+    64     64     22.53 (21.69-22.61)           285 (273-298)  10.846 (10.652-11.046)          7604  a10bddf1eda31730  nll 2.7850 top1 0.438
+   512    512   101.26 (97.38-105.79)           357 (331-385)  12.904 (12.825-13.044)          9865  7a6e8ecab7029d58  nll 2.5648 top1 0.562
+peak memory 1121 MB, model ready in 0.28 s (medians)
+
+v1: 4 runs (median, min-max)
+tokens    new            prompt tok/s          first token ms        generation tok/s  experts read  fingerprint
+    64     64     22.26 (21.93-22.47)           271 (259-275)  11.052 (10.963-11.126)          7604  a10bddf1eda31730  nll 2.7850 top1 0.438
+   512    512  104.40 (101.52-105.64)           393 (354-404)  13.022 (13.005-13.384)          9865  7a6e8ecab7029d58  nll 2.5648 top1 0.562
+peak memory 1134 MB, model ready in 0.29 s (medians)
+
+warm-up (does not count): 64 tokens: prompt 22.18 tok/s, generation 11.031 tok/s; 512 tokens: prompt 105.14 tok/s, generation 13.004 tok/s
+
+v1 against v0 (medians):
+    64 tokens: prompt -1.2%, first token +5.2%, generation +1.9%  (same results; nll 2.7850 -> 2.7850 (+0.0000), top1 0.438 -> 0.438)
+   512 tokens: prompt +3.1%, first token -9.2%, generation +0.9%  (same results; nll 2.5648 -> 2.5648 (+0.0000), top1 0.562 -> 0.562)
+(positive = faster)
+swap used 355.75M -> 356.06M; pages written to swap during the runs: 20 (16 KB each)

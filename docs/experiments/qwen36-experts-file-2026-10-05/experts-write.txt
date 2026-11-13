@@ -1,0 +1,23 @@
+The output of qwen36-canonical --experts under /usr/bin/time -l, on the M1 on 2026-10-03 at 23:53, with the converter of that day: before the signal handling, F_FULLFSYNC and the file's mode were added and the volume's device number left out of the stamp. <model> is a directory of links to the model's files.
+
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+<model>/experts.qc: 10240 planar INT4 experts, 17112776704 bytes, scales as 16-bit codes, 23.2 s; no requantization
+       23.66 real         1.72 user         5.73 sys
+            10305536  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+                 791  page reclaims
+                   8  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+               26448  voluntary context switches
+               35888  involuntary context switches
+         53442239668  instructions retired
+         23218566266  cycles elapsed
+             9651136  peak memory footprint

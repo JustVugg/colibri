@@ -1,0 +1,81 @@
+{
+  "version": 1,
+  "hypothesis": "In fast-mode decode, using a token's five likeliest routed experts and the rest of its top-8 only when they are already in memory reads fewer experts from the SSD, so decode steps 2 to 32 after a 512-token prompt of promessi_sposi.txt get faster on an 8 GB M1, both versions fed the same tokens (teacher forcing), at a quality cost that is measured and stated.",
+  "commit": "f2aa1165b1e96779a770041c3fbdc367d0ecfe85",
+  "model": "Qwen3.6-35B-A3B (Qwen3_5MoeForConditionalGeneration) converted to Colibri's qwen36 container: INT4 routed experts with gs=64 group scales, f16 dense weights (quantized to INT8 at load) and f16 embedding; 23 GB of safetensors; canonical.qc beside it (1.94 GB, written by qwen36-canonical) and experts.qc (17.1 GB, scales as 16-bit codes, the bytes qwen36-canonical --experts writes: its records written on 2026-10-05, its 8-byte stamp on 2026-10-07); the checkpoint's shards were written on 2026-09-16",
+  "command": "git archive f2aa1165 c | tar -x -C <dir>, make -C <dir>/c qwen36_metal.o backend_metal.o METAL=1, then from the repository root, with the compiler flags make -C c qwen36 METAL=1 gives qwen36.c except its qpack path (-DQWEN36_QPACK and its objects, which the harness does not use): clang -O3 -Xclang -fopenmp -I<libomp>/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_METAL -DQWEN36_METAL -I<dir>/c docs/experiments/qwen36-fast-experts-2026-10-06/bench.c <dir>/c/qwen36_metal.o <dir>/c/backend_metal.o -o <dir>/qwen36-bench -lm -L<libomp>/lib -lomp -framework Metal -framework Foundation -framework Accelerate -lc++; every run: /usr/bin/time -l env -i PATH=/usr/bin:/bin HOME=$HOME SNAP=<model> TEACHER=1 <dir>/qwen36-bench promessi_sposi.txt 64,512 32; baseline = the defaults, trial = QWEN36_FAST_EXPERTS=5, through launchers/fast5/qwen36-bench, a script with the one line QWEN36_FAST_EXPERTS=5 exec bin-pr10/qwen36-bench \"$@\"",
+  "prompt_hash": "f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f",
+  "hardware": {
+    "cpu": "Apple M1, 4 performance + 4 efficiency cores (MacBook Air, MacBookAir10,1, no fan)",
+    "ram": "8 GB unified memory",
+    "storage": "internal APPLE SSD AP0256Q, APFS",
+    "os": "macOS 26.6.2 (25G83), Apple clang 21.0.0 (clang-2100.3.34.2), Homebrew libomp"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "QWEN36_FAST_EXPERTS"
+  ],
+  "baseline": {
+    "config": {
+      "SNAP": "Qwen3.6-35B-A3B, Colibri qwen36 container, INT4 experts gs=64, internal SSD",
+      "BUILD": "the compiler flags of make -C c qwen36 METAL=1 on macOS without its qpack path: clang -O3 -Xclang -fopenmp -DCOLI_METAL -DQWEN36_METAL, qwen36_metal.o and backend_metal.o",
+      "EXPERT_CACHE": "the Metal graph's default: a sixteenth of the RAM (512 MiB, 303 slots of 1.77 MB)",
+      "PROMPT": "the first 64 and the first 512 tokens of promessi_sposi.txt (speed-bench/promessi_sposi.txt of antirez's ds4 at commit 0aaea5a, of which the harness reads the first 20,480 bytes; prompt_hash is its SHA-256), each from an empty state; after each, 32 tokens, each fed the text's own next token (teacher forcing: both versions read the same tokens)",
+      "ORDER": "1 warm-up run (baseline, discarded), then baseline trial trial baseline baseline trial trial baseline, one process each",
+      "REST": "thermal state nominal, then 60 s, before every run",
+      "EXPERT_SOURCE": "experts.qc beside the model",
+      "ENGINE": "the Metal graph, default (fast) kernels",
+      "QWEN36_FAST_EXPERTS": "unset: every chosen expert is used",
+      "MEASURED": "tokens per second of decode steps 2 to 32 after the 512-token prompt, each step fed the text's next token (teacher forcing)"
+    },
+    "samples": {
+      "tok_s": [
+        9.509,
+        9.518,
+        9.533,
+        9.471
+      ]
+    },
+    "median_tok_s": 9.5135,
+    "quality": {
+      "method": "Correctness: both versions were fed the same tokens (teacher forcing: the hash of the tokens is the same in every run of both), and without the variable this commit's exact-mode logits are its parent's (fingerprints.txt). The quality cost is measured, not gated: over 1024 teacher-forced tokens of this text after a 512-token prompt (quality.txt), J = 5 changes the mean negative log-likelihood by +1.21% (standard error 0.48%; perplexity +3.3%) and the share of tokens the model ranks first by -1.0 points (standard error 0.7). Fingerprints (baseline / trial), each the same in every run of its version: 64 tokens 22460e54acfb3fb4/5cb23346ab6be1d8 / 08a30e957ef8d52e/5cb23346ab6be1d8, 512 tokens 42619567031d6eeb/7a8848450b863c49 / 5dbac05a9c05dd71/7a8848450b863c49.",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-fast-experts-2026-10-06/baseline-prose.txt",
+      "sha256": "f73d73698c3c0c072d4f38a2485fa5a37a0a170a1e5f9f3e4a8fe84f36f74062"
+    }
+  },
+  "trial": {
+    "config": {
+      "SNAP": "Qwen3.6-35B-A3B, Colibri qwen36 container, INT4 experts gs=64, internal SSD",
+      "BUILD": "the compiler flags of make -C c qwen36 METAL=1 on macOS without its qpack path: clang -O3 -Xclang -fopenmp -DCOLI_METAL -DQWEN36_METAL, qwen36_metal.o and backend_metal.o",
+      "EXPERT_CACHE": "the Metal graph's default: a sixteenth of the RAM (512 MiB, 303 slots of 1.77 MB)",
+      "PROMPT": "the first 64 and the first 512 tokens of promessi_sposi.txt (speed-bench/promessi_sposi.txt of antirez's ds4 at commit 0aaea5a, of which the harness reads the first 20,480 bytes; prompt_hash is its SHA-256), each from an empty state; after each, 32 tokens, each fed the text's own next token (teacher forcing: both versions read the same tokens)",
+      "ORDER": "1 warm-up run (baseline, discarded), then baseline trial trial baseline baseline trial trial baseline, one process each",
+      "REST": "thermal state nominal, then 60 s, before every run",
+      "EXPERT_SOURCE": "experts.qc beside the model",
+      "ENGINE": "the Metal graph, default (fast) kernels",
+      "QWEN36_FAST_EXPERTS": "5: a token's five likeliest routed experts, the rest of its top-8 only when already in memory",
+      "MEASURED": "tokens per second of decode steps 2 to 32 after the 512-token prompt, each step fed the text's next token (teacher forcing)"
+    },
+    "samples": {
+      "tok_s": [
+        11.593,
+        11.65,
+        11.571,
+        11.438
+      ]
+    },
+    "median_tok_s": 11.582,
+    "quality": {
+      "method": "Correctness: both versions were fed the same tokens (teacher forcing: the hash of the tokens is the same in every run of both), and without the variable this commit's exact-mode logits are its parent's (fingerprints.txt). The quality cost is measured, not gated: over 1024 teacher-forced tokens of this text after a 512-token prompt (quality.txt), J = 5 changes the mean negative log-likelihood by +1.21% (standard error 0.48%; perplexity +3.3%) and the share of tokens the model ranks first by -1.0 points (standard error 0.7). Fingerprints (baseline / trial), each the same in every run of its version: 64 tokens 22460e54acfb3fb4/5cb23346ab6be1d8 / 08a30e957ef8d52e/5cb23346ab6be1d8, 512 tokens 42619567031d6eeb/7a8848450b863c49 / 5dbac05a9c05dd71/7a8848450b863c49.",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-fast-experts-2026-10-06/trial-prose.txt",
+      "sha256": "aab42722126f994ec757dcf809f1d71828050423e9736fd9deb57ea66d452ab9"
+    }
+  },
+  "outcome": "improvement"
+}

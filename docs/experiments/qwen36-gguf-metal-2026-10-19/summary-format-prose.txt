@@ -1,0 +1,27 @@
+The summary run.sh printed at the end of the measurement (summary.py): medians of the 4 runs of each version, min-max in brackets; 'peak memory ... MB' is in MiB (2^20 bytes); 'pages written to swap' is the system-wide counter.
+
+model set by each launcher; text promessi_sposi.txt; lengths 64,512; gen 32; runs 4; extra env: TEACHER=1
+cooldown before every run: 60 seconds, after waiting for thermal state 0: yes, at most 900s; thermal states: 0 nominal, 1 fair, 2 serious, 3 critical
+v0: launchers/own/qwen36-bench (this change (08293922), the defaults, SNAP=<model>)
+v1: launchers/gguf/qwen36-bench (this change (08293922), the defaults, SNAP=<GGUF model>)
+order: the binaries' order turns at every round (ABBA)
+
+v0: 4 runs (median, min-max)
+tokens    new            prompt tok/s          first token ms        generation tok/s  experts read  fingerprint
+    64     64     22.09 (18.35-26.38)           339 (238-577)     8.975 (8.625-9.154)          8717  22460e54acfb3fb4  nll 2.6915 top1 0.469
+   512    512  131.93 (127.95-137.22)           237 (229-248)     9.443 (9.400-9.468)         10754  42619567031d6eeb  nll 2.9840 top1 0.438
+peak memory 988 MB, model ready in 0.26 s (medians)
+
+v1: 4 runs (median, min-max)
+tokens    new            prompt tok/s          first token ms        generation tok/s  experts read  fingerprint
+    64     64     14.41 (14.00-15.43)         1179 (825-1281)     7.034 (6.804-7.199)          9072  d11eb1bbd30253bb  nll 2.7205 top1 0.469
+   512    512     66.06 (63.34-71.55)          972 (846-1165)     7.409 (7.267-7.552)         10962  c048488df5ccaad8  nll 3.0096 top1 0.500
+peak memory 1094 MB, model ready in 0.18 s (medians)
+
+warm-up (does not count): 64 tokens: prompt 18.83 tok/s, generation 8.827 tok/s; 512 tokens: prompt 123.98 tok/s, generation 9.120 tok/s
+
+v1 against v0 (medians):
+    64 tokens: prompt -34.8%, first token -71.3%, generation -21.6%  (same words, logits differ; nll 2.6915 -> 2.7205 (+0.0290), top1 0.469 -> 0.469)
+   512 tokens: prompt -49.9%, first token -75.7%, generation -21.5%  (same words, logits differ; nll 2.9840 -> 3.0096 (+0.0256), top1 0.438 -> 0.500)
+(positive = faster)
+swap used 549.62M -> 501.62M; pages written to swap during the runs: 0 (16 KB each)

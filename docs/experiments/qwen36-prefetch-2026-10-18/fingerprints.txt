@@ -1,0 +1,260 @@
+Exact mode (QWEN36_METAL_EXACT=1), the first 64 and 512 tokens of promessi_sposi.txt, each from an empty state, then
+32 greedy tokens, one run each, this commit (aeb219a4; the runs used 2a2c5bc6, a local commit with the same c/ tree;
+bin-pr14/) through one-line scripts that set the variables and run it: launchers/pr14-exact/ (QWEN36_METAL_EXACT=1,
+the MTP head's drafts), launchers/pr14-exact-pf/ (with QWEN36_PREFETCH=1), launchers/pr14-exact-mtp0/ (QWEN36_MTP=0:
+every step a plain decode step, the ones that copy) and launchers/pr14-exact-mtp0-pf/ (with QWEN36_PREFETCH=1); and
+the exact-mode run of the guessed-experts commit below it, in that record (launchers/pr13-exact/). Each run:
+/usr/bin/time -l env -i PATH=/usr/bin:/bin HOME=$HOME SNAP=<model+head> launchers/<variant>/qwen36-bench
+promessi_sposi.txt 64,512 32. The FNV-1a fingerprints of every logit and the hashes of the tokens are the same in all
+five: 64 tokens 780355523be4f87c/1190b702cc495428, 512 tokens 7ac88927ab1b11dc/d37fd94c2856ba1a. The copies, from the
+line at exit, with the drafts: 4,114 copied, 3,342 taken (273 after waiting, 2,700 computed early); not copied: 6,118
+held by the cache, 1,467 not in the file cache, 1 too late, 0 copied already, 0 without a free slot, 0 failed; with
+QWEN36_MTP=0: 5,331 copied, 4,325 taken (319 after waiting, 3,560 computed early); not copied: 7,796 held by the
+cache, 1,847 not in the file cache, 2 too late, 0 copied already, 0 without a free slot, 0 failed.
+
+Fast mode with QWEN36_FAST_EXPERTS=5 QWEN36_FAST_GUESSED=4 and the drafts, each step fed the text's next token: the
+four runs of each text with the rule in the guessed-experts record (of the commit below) and all nine runs of this
+record (the warm-up, four without the copies and four with them) give the same fingerprints and token hashes: prose 64
+tokens eff003037c18fd94/5cb23346ab6be1d8, 512 tokens 8027489962d08239/7a8848450b863c49; code 64 tokens
+a10bddf1eda31730/24b5cd77c9db23fb, 512 tokens 7a6e8ecab7029d58/561100505ac9d4ca; chat 64 tokens
+307e6fd7980a92cf/f55beb9e5e71ac78, 512 tokens 9d70cb5e1eb455e0/99b2135657766012.
+
+## the drafts
+### before the run (date, thermal state, swap, wait)
+2026-10-22 17:51:16
+0
+swap_used=355.75M swapouts=86940
+waited for state 0: 0s
+### harness output
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,4.564,14.02,32,408.0,8.106,9022,7.38,780355523be4f87c,1190b702cc495428,0.00000,0.000
+512,512,21.896,23.38,32,617.4,8.020,10978,7.40,7ac88927ab1b11dc,d37fd94c2856ba1a,0.00000,0.000
+### engine log and /usr/bin/time -l
+[tok] loaded 248044 pieces (max id 248069) from <model+head>/tokenizer.json
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[qwen-dense] <model+head>/canonical.qc: 291 INT8 matrices (1941078016 bytes) checked in 0.037 s, read instead of converted
+[qwen36] embedding: rows read in place from the checkpoint, COLI_EMBED_MMAP=0 builds the f32 table
+[dense-i8] 291 matrices read from canonical.qc, no f32 copies
+[qwen-experts] <model+head>/experts.qc: 10240 planar records, 1671168 bytes each (scales as 16-bit codes); checkpoint metadata and shard samples checked in 0.011 s
+[qwen36-mtp] the MTP head drafts (speculative decoding; QWEN36_MTP=0 turns it off)
+[qwen-cache] global_bytes=536150016 slots=303 slot_bytes=1769472 decode_policy=expected-reuse
+[qwen36-metal] graph ready on Apple M1: rows<=2048 dense=mapped kv=float (1941078016 bytes mapped); the experts in the global cache, not in the per-layer one
+[bench] Metal graph ready in 0.27 s; text 5871 tokens; lengths 64,512; gen 32; each length from an empty state
+[qwen36 mtp] 64 tokens: 1.14 tokens/forward (28 forwards per 32 tokens) | acceptance 80.0% (4/5 drafts) | gate off: T(1) 133.8 ms, rows 2:1.36, rho 0.35, acceptance by position 0.80 0.60 0.50 0.50 0.50
+[qwen36 mtp] 64 tokens: 22 drafts below the confidence 0.60 left out, 0 steps without the head
+[qwen36 mtp] 512 tokens: 1.03 tokens/forward (31 forwards per 32 tokens) | acceptance 25.0% (1/4 drafts) | gate off: T(1) 124.3 ms, rows 2:2.28, rho 0.47, acceptance by position 0.43 0.60 0.50 0.50 0.50
+[qwen36 mtp] 512 tokens: 25 drafts below the confidence 0.60 left out, 0 steps without the head
+[bench] peak RSS 0.83 GB
+       36.45 real         2.75 user        13.63 sys
+           891338752  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              137934  page reclaims
+               33728  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                 877  voluntary context switches
+              416871  involuntary context switches
+         42232342021  instructions retired
+         39604855447  cycles elapsed
+          1272079296  peak memory footprint
+### after the run
+2026-10-22 17:51:53
+0
+swap_used=355.75M swapouts=86940
+## the drafts, QWEN36_PREFETCH=1
+### before the run (date, thermal state, swap, wait)
+2026-10-22 17:52:53
+0
+swap_used=355.75M swapouts=86940
+waited for state 0: 0s
+### harness output
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,4.521,14.16,32,372.2,8.106,9022,6.57,780355523be4f87c,1190b702cc495428,0.00000,0.000
+512,512,21.610,23.69,32,508.5,8.027,10978,6.65,7ac88927ab1b11dc,d37fd94c2856ba1a,0.00000,0.000
+### engine log and /usr/bin/time -l
+[tok] loaded 248044 pieces (max id 248069) from <model+head>/tokenizer.json
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[qwen-dense] <model+head>/canonical.qc: 291 INT8 matrices (1941078016 bytes) checked in 0.036 s, read instead of converted
+[qwen36] embedding: rows read in place from the checkpoint, COLI_EMBED_MMAP=0 builds the f32 table
+[dense-i8] 291 matrices read from canonical.qc, no f32 copies
+[qwen-experts] <model+head>/experts.qc: 10240 planar records, 1671168 bytes each (scales as 16-bit codes); checkpoint metadata and shard samples checked in 0.011 s
+[qwen36-mtp] the MTP head drafts (speculative decoding; QWEN36_MTP=0 turns it off)
+[qwen-cache] global_bytes=536150016 slots=303 slot_bytes=1769472 decode_policy=expected-reuse
+[qwen36-metal] graph ready on Apple M1: rows<=2048 dense=mapped kv=float (1941078016 bytes mapped); the experts in the global cache, not in the per-layer one
+[qwen-experts] QWEN36_PREFETCH=1: a decode step copies the next layer's guesses that the system's file cache holds while this layer computes, into 8 slots beside the expert cache (14155776 bytes)
+[bench] Metal graph ready in 0.30 s; text 5871 tokens; lengths 64,512; gen 32; each length from an empty state
+[qwen36 mtp] 64 tokens: 1.14 tokens/forward (28 forwards per 32 tokens) | acceptance 80.0% (4/5 drafts) | gate off: T(1) 132.2 ms, rows 2:1.40, rho 0.37, acceptance by position 0.80 0.60 0.50 0.50 0.50
+[qwen36 mtp] 64 tokens: 22 drafts below the confidence 0.60 left out, 0 steps without the head
+[qwen36 mtp] 512 tokens: 1.03 tokens/forward (31 forwards per 32 tokens) | acceptance 25.0% (1/4 drafts) | gate off: T(1) 125.4 ms, rows 2:2.08, rho 0.52, acceptance by position 0.43 0.60 0.50 0.50 0.50
+[qwen36 mtp] 512 tokens: 25 drafts below the confidence 0.60 left out, 0 steps without the head
+[bench] peak RSS 0.82 GB
+[qwen-experts] QWEN36_PREFETCH: 4114 guesses copied beside the cache, 3342 of them taken by their layer (273 after waiting for the copy, 2700 computed early while the layer read the rest); not copied: 6118 held by the cache, 1467 not in the file cache, 1 too late, 0 copied already, 0 without a free slot, 0 failed
+       35.72 real         2.77 user        13.93 sys
+           879427584  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              144209  page reclaims
+               34217  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                 997  voluntary context switches
+              429755  involuntary context switches
+         43993028005  instructions retired
+         40558158869  cycles elapsed
+          1289839552  peak memory footprint
+### after the run
+2026-10-22 17:53:29
+0
+swap_used=355.75M swapouts=86940
+## QWEN36_MTP=0
+### before the run (date, thermal state, swap, wait)
+2026-10-22 17:54:29
+0
+swap_used=355.75M swapouts=86940
+waited for state 0: 0s
+### harness output
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,4.290,14.92,32,360.4,8.262,8946,6.96,780355523be4f87c,1190b702cc495428,0.00000,0.000
+512,512,21.391,23.94,32,320.8,8.412,10634,6.93,7ac88927ab1b11dc,d37fd94c2856ba1a,0.00000,0.000
+### engine log and /usr/bin/time -l
+[tok] loaded 248044 pieces (max id 248069) from <model+head>/tokenizer.json
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[qwen-dense] <model+head>/canonical.qc: 291 INT8 matrices (1941078016 bytes) checked in 0.036 s, read instead of converted
+[qwen36] embedding: rows read in place from the checkpoint, COLI_EMBED_MMAP=0 builds the f32 table
+[dense-i8] 291 matrices read from canonical.qc, no f32 copies
+[qwen-experts] <model+head>/experts.qc: 10240 planar records, 1671168 bytes each (scales as 16-bit codes); checkpoint metadata and shard samples checked in 0.011 s
+[qwen-cache] global_bytes=536150016 slots=303 slot_bytes=1769472 decode_policy=expected-reuse
+[qwen36-metal] graph ready on Apple M1: rows<=2048 dense=mapped kv=float (1941078016 bytes mapped); the experts in the global cache, not in the per-layer one
+[bench] Metal graph ready in 0.20 s; text 5871 tokens; lengths 64,512; gen 32; each length from an empty state
+[bench] peak RSS 0.86 GB
+       34.68 real         2.72 user        13.32 sys
+           919961600  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              154622  page reclaims
+                8382  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                 906  voluntary context switches
+              397418  involuntary context switches
+         39755067447  instructions retired
+         37226615581  cycles elapsed
+          1047534976  peak memory footprint
+### after the run
+2026-10-22 17:55:04
+0
+swap_used=355.75M swapouts=86940
+## QWEN36_MTP=0, QWEN36_PREFETCH=1
+### before the run (date, thermal state, swap, wait)
+2026-10-22 17:56:04
+0
+swap_used=355.75M swapouts=86940
+waited for state 0: 0s
+### harness output
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,4.203,15.23,32,330.7,8.284,8946,5.86,780355523be4f87c,1190b702cc495428,0.00000,0.000
+512,512,21.464,23.85,32,598.6,8.273,10634,6.18,7ac88927ab1b11dc,d37fd94c2856ba1a,0.00000,0.000
+### engine log and /usr/bin/time -l
+[tok] loaded 248044 pieces (max id 248069) from <model+head>/tokenizer.json
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[qwen-dense] <model+head>/canonical.qc: 291 INT8 matrices (1941078016 bytes) checked in 0.036 s, read instead of converted
+[qwen36] embedding: rows read in place from the checkpoint, COLI_EMBED_MMAP=0 builds the f32 table
+[dense-i8] 291 matrices read from canonical.qc, no f32 copies
+[qwen-experts] <model+head>/experts.qc: 10240 planar records, 1671168 bytes each (scales as 16-bit codes); checkpoint metadata and shard samples checked in 0.011 s
+[qwen-cache] global_bytes=536150016 slots=303 slot_bytes=1769472 decode_policy=expected-reuse
+[qwen36-metal] graph ready on Apple M1: rows<=2048 dense=mapped kv=float (1941078016 bytes mapped); the experts in the global cache, not in the per-layer one
+[qwen-experts] QWEN36_PREFETCH=1: a decode step copies the next layer's guesses that the system's file cache holds while this layer computes, into 8 slots beside the expert cache (14155776 bytes)
+[bench] Metal graph ready in 0.20 s; text 5871 tokens; lengths 64,512; gen 32; each length from an empty state
+[bench] peak RSS 0.87 GB
+[qwen-experts] QWEN36_PREFETCH: 5331 guesses copied beside the cache, 4325 of them taken by their layer (319 after waiting for the copy, 3560 computed early while the layer read the rest); not copied: 7796 held by the cache, 1847 not in the file cache, 2 too late, 0 copied already, 0 without a free slot, 0 failed
+       34.98 real         2.52 user        13.33 sys
+           934559744  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              131949  page reclaims
+               34155  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                 831  voluntary context switches
+              419672  involuntary context switches
+         41711835943  instructions retired
+         39773528728  cycles elapsed
+          1061969216  peak memory footprint
+### after the run
+2026-10-22 17:56:39
+0
+swap_used=355.75M swapouts=86940
+## the guessed-experts commit below, the drafts (that record's run)
+### before the run (date, thermal state, swap, wait)
+2026-10-22 16:01:37
+0
+swap_used=355.75M swapouts=86940
+waited for state 0: 0s
+### harness output
+ctx_tokens,prefill_tokens,prefill_s,prefill_tps,gen_tokens,gen_first_ms,gen_steady_tps,expert_miss,disk_s,fingerprint,tokens,nll,top1
+64,64,5.098,12.55,32,871.7,8.154,9022,7.48,780355523be4f87c,1190b702cc495428,0.00000,0.000
+512,512,21.423,23.90,32,471.3,8.110,10978,7.40,7ac88927ab1b11dc,d37fd94c2856ba1a,0.00000,0.000
+### engine log and /usr/bin/time -l
+[tok] loaded 248044 pieces (max id 248069) from <model+head>/tokenizer.json
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[qwen-dense] <model+head>/canonical.qc: 291 INT8 matrices (1941078016 bytes) checked in 0.081 s, read instead of converted
+[qwen36] embedding: rows read in place from the checkpoint, COLI_EMBED_MMAP=0 builds the f32 table
+[dense-i8] 291 matrices read from canonical.qc, no f32 copies
+[qwen-experts] <model+head>/experts.qc: 10240 planar records, 1671168 bytes each (scales as 16-bit codes); checkpoint metadata and shard samples checked in 0.011 s
+[qwen36-mtp] the MTP head drafts (speculative decoding; QWEN36_MTP=0 turns it off)
+[qwen-cache] global_bytes=536150016 slots=303 slot_bytes=1769472 decode_policy=expected-reuse
+[qwen36-metal] graph ready on Apple M1: rows<=2048 dense=mapped kv=float (1941078016 bytes mapped); the experts in the global cache, not in the per-layer one
+[bench] Metal graph ready in 0.79 s; text 5871 tokens; lengths 64,512; gen 32; each length from an empty state
+[qwen36 mtp] 64 tokens: 1.14 tokens/forward (28 forwards per 32 tokens) | acceptance 80.0% (4/5 drafts) | gate off: T(1) 140.0 ms, rows 2:1.30, rho 0.27, acceptance by position 0.80 0.60 0.50 0.50 0.50
+[qwen36 mtp] 64 tokens: 22 drafts below the confidence 0.60 left out, 0 steps without the head
+[qwen36 mtp] 512 tokens: 1.03 tokens/forward (31 forwards per 32 tokens) | acceptance 25.0% (1/4 drafts) | gate off: T(1) 124.7 ms, rows 2:1.93, rho 0.43, acceptance by position 0.43 0.60 0.50 0.50 0.50
+[qwen36 mtp] 512 tokens: 25 drafts below the confidence 0.60 left out, 0 steps without the head
+[bench] peak RSS 0.82 GB
+       37.29 real         2.83 user        13.82 sys
+           878837760  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              149433  page reclaims
+               26078  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                 719  voluntary context switches
+              423564  involuntary context switches
+         42886629502  instructions retired
+         38875397320  cycles elapsed
+          1272423296  peak memory footprint
+### after the run
+2026-10-22 16:02:15
+0
+swap_used=355.75M swapouts=86940

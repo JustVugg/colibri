@@ -1,0 +1,57 @@
+Wired memory: the system's 'Pages wired down' (vm_stat, 16 KiB pages, in GB of 10^9 bytes) every 0.5 s while one run of each version ran: /usr/bin/time is not used here; each run was env -i PATH=/usr/bin:/bin HOME=$HOME TEACHER=1 launchers/<gguf-08293922|gguf>/qwen36-bench promessi_sposi.txt 64,512 32 (fast mode), after the nominal thermal state and a 60 s rest, in the order the change before, this change, this change, the change before. Wired pages are those the system cannot page out: its own, the GPU's buffers while it uses them (the dense matrices' pages included), and with this change the dense matrices locked through each prompt. The time of each line of the harness's output was written too: its header, printed when the model is ready, just before the 64-token prompt, and the line of each length, printed at the end of its decode. From them: the 64-token prompt from the header for its prefill_s; each decode, gen_first_ms and 31 steps at gen_steady_tps before its line; the 512-token prompt, its prefill_s before that; with the median and the range of the samples inside each, those within 0.3 s of its ends left out. Each sample: seconds from the start of the run, wired GB.
+
+## the change before (bin-08293922/)
+start 1.11 GB, largest 4.03 GB, 46 samples; harness output:
+    64,64,4.727,13.54,32,631.5,6.896,9072,9.39,d11eb1bbd30253bb,5cb23346ab6be1d8,2.72050,0.469
+    512,512,7.884,64.94,32,921.3,7.273,10962,10.89,c048488df5ccaad8,7a8848450b863c49,3.00958,0.500
+the 64-token prompt (0.4-5.1 s): median 1.77 GB (1.66-2.21, 8 samples)
+the decode after it (5.2-10.3 s): median 3.91 GB (3.80-3.94, 9 samples)
+the 512-token prompt (10.4-18.3 s): median 1.81 GB (1.76-4.03, 14 samples)
+the decode after it (18.3-23.5 s): median 3.92 GB (2.59-3.93, 9 samples)
+0.0:1.11 0.5:1.45 1.0:1.99 1.6:2.21 2.1:1.78 2.6:1.78 3.1:1.66 3.6:1.72 4.1:1.68 4.6:1.76
+5.2:2.15 5.7:3.80 6.2:3.89 6.7:3.91 7.2:3.91 7.8:3.91 8.3:3.91 8.8:3.90 9.3:3.90 9.9:3.94
+10.4:3.91 10.9:4.03 11.4:3.97 11.9:1.76 12.4:1.78 13.0:1.76 13.5:1.82 14.0:1.76 14.5:1.81 15.0:1.79
+15.5:1.83 16.1:1.78 16.6:1.81 17.1:1.86 17.7:1.89 18.2:1.93 18.7:2.59 19.2:3.76 19.7:3.89 20.3:3.92
+20.8:3.92 21.3:3.93 21.8:3.89 22.4:3.93 22.9:3.93 23.4:3.92
+
+## this change (bin-627409db/)
+start 1.11 GB, largest 4.02 GB, 40 samples; harness output:
+    64,64,3.406,18.79,32,362.6,6.875,9072,9.38,d11eb1bbd30253bb,5cb23346ab6be1d8,2.72050,0.469
+    512,512,7.178,71.32,32,296.0,7.202,10962,10.26,c048488df5ccaad8,7a8848450b863c49,3.00958,0.500
+the 64-token prompt (0.3-3.8 s): median 3.29 GB (3.27-3.78, 5 samples)
+the decode after it (3.9-8.7 s): median 3.91 GB (3.89-3.93, 8 samples)
+the 512-token prompt (8.8-16.0 s): median 3.49 GB (3.43-4.02, 13 samples)
+the decode after it (16.0-20.6 s): median 3.93 GB (3.85-3.93, 8 samples)
+0.0:1.11 0.5:3.35 1.0:3.75 1.6:3.78 2.1:3.27 2.6:3.29 3.1:3.27 3.6:3.27 4.1:3.93 4.6:3.93
+5.2:3.91 5.7:3.91 6.2:3.91 6.7:3.89 7.2:3.89 7.8:3.90 8.3:3.91 8.8:3.92 9.3:4.02 9.8:3.85
+10.3:3.50 10.9:3.53 11.4:3.48 11.9:3.49 12.4:3.48 12.9:3.49 13.4:3.47 14.0:3.45 14.5:3.43 15.0:3.48
+15.5:3.49 16.0:3.50 16.5:3.85 17.1:3.91 17.6:3.93 18.1:3.93 18.6:3.92 19.1:3.93 19.7:3.93 20.2:3.93
+
+## this change, again
+start 1.11 GB, largest 3.98 GB, 41 samples; harness output:
+    64,64,3.409,18.77,32,378.1,6.741,9072,9.35,d11eb1bbd30253bb,5cb23346ab6be1d8,2.72050,0.469
+    512,512,7.284,70.29,32,300.9,7.115,10962,10.64,c048488df5ccaad8,7a8848450b863c49,3.00958,0.500
+the 64-token prompt (0.3-3.7 s): median 3.27 GB (3.26-3.75, 5 samples)
+the decode after it (3.8-8.8 s): median 3.92 GB (3.91-3.93, 9 samples)
+the 512-token prompt (8.9-16.2 s): median 3.48 GB (3.45-3.98, 13 samples)
+the decode after it (16.2-20.8 s): median 3.92 GB (3.81-3.93, 8 samples)
+0.0:1.11 0.5:3.52 1.0:3.75 1.6:3.58 2.1:3.27 2.6:3.26 3.1:3.26 3.6:3.27 4.1:3.92 4.6:3.92
+5.2:3.93 5.7:3.93 6.2:3.93 6.7:3.92 7.2:3.91 7.7:3.91 8.3:3.91 8.8:3.88 9.3:3.98 9.9:3.48
+10.4:3.45 10.9:3.52 11.4:3.52 11.9:3.48 12.4:3.48 13.0:3.49 13.5:3.48 14.0:3.48 14.5:3.45 15.1:3.46
+15.6:3.48 16.1:3.41 16.6:3.81 17.1:3.90 17.6:3.92 18.2:3.93 18.7:3.92 19.2:3.92 19.7:3.93 20.3:3.93
+20.8:3.92
+
+## the change before, again
+start 1.11 GB, largest 4.05 GB, 44 samples; harness output:
+    64,64,3.935,16.26,32,1055.4,7.120,9072,9.02,d11eb1bbd30253bb,5cb23346ab6be1d8,2.72050,0.469
+    512,512,7.663,66.81,32,924.4,7.391,10962,10.19,c048488df5ccaad8,7a8848450b863c49,3.00958,0.500
+the 64-token prompt (0.3-4.2 s): median 1.86 GB (1.76-2.08, 6 samples)
+the decode after it (4.3-9.7 s): median 3.91 GB (2.71-3.92, 10 samples)
+the 512-token prompt (9.8-17.5 s): median 1.82 GB (1.68-3.99, 14 samples)
+the decode after it (17.5-22.6 s): median 3.92 GB (2.91-3.92, 8 samples)
+0.0:1.11 0.5:1.74 1.1:2.08 1.6:1.92 2.1:1.85 2.6:1.87 3.1:1.82 3.6:1.76 4.2:2.07 4.7:2.71
+5.2:3.42 5.7:3.88 6.2:3.92 6.7:3.91 7.3:3.91 7.8:3.91 8.3:3.91 8.8:3.90 9.3:3.91 9.9:4.05
+10.4:3.99 10.9:1.68 11.4:1.74 11.9:1.82 12.4:1.86 13.0:1.86 13.5:1.82 14.0:1.82 14.6:1.81 15.1:1.82
+15.6:1.81 16.1:1.82 16.6:1.86 17.1:1.84 17.6:2.37 18.2:2.91 18.7:3.81 19.2:3.91 19.7:3.92 20.2:3.92
+20.8:3.91 21.3:3.92 21.8:3.92 22.4:3.95
+

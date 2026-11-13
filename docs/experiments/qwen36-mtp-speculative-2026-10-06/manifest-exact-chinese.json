@@ -1,0 +1,81 @@
+{
+  "version": 1,
+  "hypothesis": "On guxiang.txt, a Chinese text none of whose Chinese characters is among the first 32768 ids the checkpoint's MTP head drafts from (only its punctuation and line breaks are), the head stays idle, and the 32 decode steps after a 512-token prompt, the first included, are as fast with the head as without it on an 8 GB M1, in exact mode, with the tokens and logits of plain decoding.",
+  "commit": "c8fc51fcd3f1a7b725b26c2a103fdd52bbca4138",
+  "model": "Qwen3.6-35B-A3B (Qwen3_5MoeForConditionalGeneration) converted to Colibri's qwen36 container: INT4 routed experts with gs=64 group scales, f16 dense weights (quantized to INT8 at load) and f16 embedding; 23 GB of safetensors; canonical.qc beside it (1.94 GB, written by qwen36-canonical) and experts.qc (17.1 GB, scales as 16-bit codes, the bytes qwen36-canonical --experts writes: its records written on 2026-10-05, its 8-byte stamp on 2026-10-07); the checkpoint's shards were written on 2026-09-16; and model-mtp.safetensors (the checkpoint's MTP head: the 529 tensors tools/convert_qwen36.py --mtp-only writes, byte for byte, read from a file of 531,710,984 bytes written on 2026-10-06, SHA-256 c8a3779f7e95016f923d3686663061621ac0ab1d221dc677e0f8869357a1a4ac; head.txt)",
+  "command": "git archive c8fc51fc c | tar -x -C <dir>, make -C <dir>/c qwen36_metal.o backend_metal.o METAL=1, then from the repository root, with the compiler flags make -C c qwen36 METAL=1 gives qwen36.c except its qpack path (-DQWEN36_QPACK and its objects, which the harness does not use): clang -O3 -Xclang -fopenmp -I<libomp>/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_METAL -DQWEN36_METAL -I<dir>/c docs/experiments/qwen36-mtp-speculative-2026-10-06/bench.c <dir>/c/qwen36_metal.o <dir>/c/backend_metal.o -o <dir>/qwen36-bench -lm -L<libomp>/lib -lomp -framework Metal -framework Foundation -framework Accelerate -lc++; every run: /usr/bin/time -l env -i PATH=/usr/bin:/bin HOME=$HOME SNAP=<model+head> launchers/<variant>/qwen36-bench guxiang.txt 64,512 32; <variant> is exact-mtp0 for the baseline (launchers/exact-mtp0/qwen36-bench, a script with the one line QWEN36_METAL_EXACT=1 QWEN36_MTP=0 exec bin-pr11/qwen36-bench \"$@\") and exact-mtp for the trial (QWEN36_METAL_EXACT=1 exec bin-pr11/qwen36-bench \"$@\")",
+  "prompt_hash": "8d67c9128e501af971ca6c178ee54dfb120e6c3e7150f004c3f507ba166f6fb2",
+  "hardware": {
+    "cpu": "Apple M1, 4 performance + 4 efficiency cores (MacBook Air, MacBookAir10,1, no fan)",
+    "ram": "8 GB unified memory",
+    "storage": "internal APPLE SSD AP0256Q, APFS",
+    "os": "macOS 26.6.2 (25G83), Apple clang 21.0.0 (clang-2100.3.34.2), Homebrew libomp"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "QWEN36_MTP"
+  ],
+  "baseline": {
+    "config": {
+      "SNAP": "Qwen3.6-35B-A3B, Colibri qwen36 container, INT4 experts gs=64, internal SSD, with the checkpoint's MTP head in model-mtp.safetensors",
+      "BUILD": "the compiler flags of make -C c qwen36 METAL=1 on macOS without its qpack path: clang -O3 -Xclang -fopenmp -DCOLI_METAL -DQWEN36_METAL, qwen36_metal.o and backend_metal.o",
+      "EXPERT_CACHE": "the Metal graph's default: a sixteenth of the RAM (512 MiB, 303 slots of 1.77 MB, the head's experts among them)",
+      "PROMPT": "the first 64 and the first 512 tokens of guxiang.txt (in this record: My Old Home (\u6545\u4e61), Lu Xun's short story of 1921, in the public domain, from the Chinese Wikisource in simplified characters, 15,073 bytes read whole; no Chinese character is among the first 32768 token ids; prompt_hash is its SHA-256), each from an empty state; after each, 32 tokens, greedy",
+      "ORDER": "1 warm-up run (baseline, discarded), then baseline trial trial baseline baseline trial trial baseline, one process each",
+      "REST": "thermal state nominal, then 60 s, before every run",
+      "EXPERT_SOURCE": "experts.qc beside the model; the head's experts from model-mtp.safetensors",
+      "ENGINE": "the Metal graph, exact mode (QWEN36_METAL_EXACT=1)",
+      "QWEN36_MTP": "0: plain decoding",
+      "MEASURED": "tokens per second of all 32 decode steps after the 512-token prompt, the first included: 32 / (gen_first_ms / 1000 + 31 / gen_steady_tps), from the harness's columns; greedy (both versions generate the same tokens)"
+    },
+    "samples": {
+      "tok_s": [
+        7.862,
+        7.45,
+        7.505,
+        7.622
+      ]
+    },
+    "median_tok_s": 7.5635,
+    "quality": {
+      "method": "FNV-1a fingerprint of every logit of the run, and the hash of the generated tokens, per prompt length: 64 tokens 0ad00090e0a03140/266a8cefdde78c56, 512 tokens c9d6b32dd641377a/8adbbd1531b837f3, the same in all nine runs (the warm-up and the 4 runs of each version)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-mtp-speculative-2026-10-06/baseline-exact-chinese.txt",
+      "sha256": "4cf388c0b3f8c2970c2aecc86f27f51970dfaaafe69d449a7a4779f7b80b6627"
+    }
+  },
+  "trial": {
+    "config": {
+      "SNAP": "Qwen3.6-35B-A3B, Colibri qwen36 container, INT4 experts gs=64, internal SSD, with the checkpoint's MTP head in model-mtp.safetensors",
+      "BUILD": "the compiler flags of make -C c qwen36 METAL=1 on macOS without its qpack path: clang -O3 -Xclang -fopenmp -DCOLI_METAL -DQWEN36_METAL, qwen36_metal.o and backend_metal.o",
+      "EXPERT_CACHE": "the Metal graph's default: a sixteenth of the RAM (512 MiB, 303 slots of 1.77 MB, the head's experts among them)",
+      "PROMPT": "the first 64 and the first 512 tokens of guxiang.txt (in this record: My Old Home (\u6545\u4e61), Lu Xun's short story of 1921, in the public domain, from the Chinese Wikisource in simplified characters, 15,073 bytes read whole; no Chinese character is among the first 32768 token ids; prompt_hash is its SHA-256), each from an empty state; after each, 32 tokens, greedy",
+      "ORDER": "1 warm-up run (baseline, discarded), then baseline trial trial baseline baseline trial trial baseline, one process each",
+      "REST": "thermal state nominal, then 60 s, before every run",
+      "EXPERT_SOURCE": "experts.qc beside the model; the head's experts from model-mtp.safetensors",
+      "ENGINE": "the Metal graph, exact mode (QWEN36_METAL_EXACT=1)",
+      "QWEN36_MTP": "unset: the MTP head drafts the token after each one, a draft verified from its confidence 0.6",
+      "MEASURED": "tokens per second of all 32 decode steps after the 512-token prompt, the first included: 32 / (gen_first_ms / 1000 + 31 / gen_steady_tps), from the harness's columns; greedy (both versions generate the same tokens)"
+    },
+    "samples": {
+      "tok_s": [
+        7.592,
+        7.595,
+        7.277,
+        7.576
+      ]
+    },
+    "median_tok_s": 7.584,
+    "quality": {
+      "method": "FNV-1a fingerprint of every logit of the run, and the hash of the generated tokens, per prompt length: 64 tokens 0ad00090e0a03140/266a8cefdde78c56, 512 tokens c9d6b32dd641377a/8adbbd1531b837f3, the same in all nine runs (the warm-up and the 4 runs of each version)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-mtp-speculative-2026-10-06/trial-exact-chinese.txt",
+      "sha256": "6d049598abe166d5fe41172c1cc0628bf67032cafb34af455b2d2c5685425f20"
+    }
+  },
+  "outcome": "no-change"
+}

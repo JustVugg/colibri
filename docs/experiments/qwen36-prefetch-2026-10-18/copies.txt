@@ -1,0 +1,15 @@
+The copies of each run with QWEN36_PREFETCH=1, from the line the engine prints at exit (it counts both prompts of a
+run, 64 and 512 tokens, and their 32 decode steps each); the runs' raw logs are in trial-<text>.txt.
+
+prose, trial run 1 (v1-run1): 2,818 copied, 2,003 taken (220 after waiting, 674 computed early); not copied: 4,809 held by the cache, 1,139 not in the file cache, 9 too late, 0 copied already, 0 without a free slot, 0 failed
+prose, trial run 2 (v1-run2): 2,840 copied, 2,031 taken (196 after waiting, 676 computed early); not copied: 4,809 held by the cache, 1,115 not in the file cache, 11 too late, 0 copied already, 0 without a free slot, 0 failed
+prose, trial run 3 (v1-run3): 2,823 copied, 2,005 taken (192 after waiting, 695 computed early); not copied: 4,809 held by the cache, 1,132 not in the file cache, 11 too late, 0 copied already, 0 without a free slot, 0 failed
+prose, trial run 4 (v1-run4): 2,833 copied, 2,020 taken (208 after waiting, 672 computed early); not copied: 4,809 held by the cache, 1,122 not in the file cache, 11 too late, 0 copied already, 0 without a free slot, 0 failed
+code, trial run 1 (v1-run1): 2,488 copied, 1,767 taken (318 after waiting, 759 computed early); not copied: 2,701 held by the cache, 1,229 not in the file cache, 17 too late, 0 copied already, 0 without a free slot, 0 failed
+code, trial run 2 (v1-run2): 2,515 copied, 1,793 taken (348 after waiting, 730 computed early); not copied: 2,699 held by the cache, 1,206 not in the file cache, 15 too late, 0 copied already, 0 without a free slot, 0 failed
+code, trial run 3 (v1-run3): 2,441 copied, 1,713 taken (329 after waiting, 746 computed early); not copied: 2,701 held by the cache, 1,275 not in the file cache, 18 too late, 0 copied already, 0 without a free slot, 0 failed
+code, trial run 4 (v1-run4): 2,461 copied, 1,729 taken (374 after waiting, 726 computed early); not copied: 2,699 held by the cache, 1,254 not in the file cache, 21 too late, 0 copied already, 0 without a free slot, 0 failed
+chat, trial run 1 (v1-run1): 3,261 copied, 2,307 taken (482 after waiting, 1,021 computed early); not copied: 2,381 held by the cache, 1,356 not in the file cache, 22 too late, 0 copied already, 0 without a free slot, 0 failed
+chat, trial run 2 (v1-run2): 3,257 copied, 2,330 taken (493 after waiting, 997 computed early); not copied: 2,386 held by the cache, 1,360 not in the file cache, 17 too late, 0 copied already, 0 without a free slot, 0 failed
+chat, trial run 3 (v1-run3): 3,328 copied, 2,374 taken (494 after waiting, 987 computed early); not copied: 2,384 held by the cache, 1,285 not in the file cache, 23 too late, 0 copied already, 0 without a free slot, 0 failed
+chat, trial run 4 (v1-run4): 3,323 copied, 2,377 taken (464 after waiting, 987 computed early); not copied: 2,383 held by the cache, 1,293 not in the file cache, 21 too late, 0 copied already, 0 without a free slot, 0 failed

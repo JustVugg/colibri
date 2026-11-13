@@ -1,0 +1,14 @@
+--- a/c/qwen36_graph.h
++++ b/c/qwen36_graph.h
+@@ -160,8 +160,9 @@
+     out->in = w->I;
+     out->out = w->O;
+     if (qg_mapped(g, q, qb) && qg_mapped(g, sc, sb)) {
+-        out->q = q36_map_view(g->map, (size_t)(q - g->map_base), qb);
+-        out->sc = q36_map_view(g->map, (size_t)(sc - g->map_base), sb);
++        /* First-step diagnosis (2026-10-20): each matrix in a window of its own, as a GGUF's */
++        out->q = q36_map_view_own(g->map, (size_t)(q - g->map_base), qb);
++        out->sc = q36_map_view_own(g->map, (size_t)(sc - g->map_base), sb);
+     } else {
+         out->q = q36_tensor_upload(q, qb);
+         out->sc = q36_tensor_upload(sc, sb);

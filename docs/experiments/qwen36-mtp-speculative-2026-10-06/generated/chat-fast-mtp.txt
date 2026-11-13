@@ -1,0 +1,19 @@
+ floor, which are worth it if you want a deeper experience. For the Vatican, the early morning slot is the best to avoid the longest lines.
+
+For food, Rome is famous for its classic dishes. For lunch, try a pizza al taglio (pizza by the slice) from a bakery like Bonci or Da Baffetto, or a quick pasta dish at a small trattoria. For dinner, the classics are carbonara, cacio e pepe, amatriciana, and saltimbocca alla romana. For drinks, a glass of local wine or an aperitivo with an Aperol spritz is a good way to start the evening.
+
+Would you like me to suggest specific restaurants or help you plan the order of visits to avoid queues?
+
+User: I'm planning to stay in the Monti district.
+
+Assistant:
+
+<think>
+Here's a thinking process:
+
+1.  **Analyze User Input:**
+   - User says: "I'm planning to stay in the Monti district."
+   - Context: 3-day trip to Rome in late October, first-time visitor, asked for itinerary, food, tickets, transport, and Roma Pass advice.
+   - New info: Accommodation location = Monti district.
+
+2.  **

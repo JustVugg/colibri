@@ -1,0 +1,77 @@
+{
+  "version": 1,
+  "hypothesis": "The Metal graph, the forward pass on the GPU with the experts still read from disk, generates faster than the CPU engine on an 8 GB M1, with the model's likelihood of a known text unchanged.",
+  "commit": "0e485d645bae1d096d7cf20f357a467a6dbbee3c",
+  "model": "Qwen3.6-35B-A3B (Qwen3_5MoeForConditionalGeneration) converted to Colibri's qwen36 container: INT4 routed experts with gs=64 group scales, f16 dense weights (quantized to INT8 at load) and f16 embedding; 23 GB of safetensors; canonical.qc beside it (1.94 GB, written by qwen36-canonical)",
+  "command": "git archive 0e485d64 c | tar -x -C <dir>, make -C <dir>/c qwen36_metal.o backend_metal.o METAL=1, then from the repository root, with the compiler flags make -C c qwen36 METAL=1 gives qwen36.c except its qpack path (-DQWEN36_QPACK and its objects, which the harness does not use): clang -O3 -Xclang -fopenmp -I<libomp>/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_METAL -DQWEN36_METAL -I<dir>/c docs/experiments/qwen36-metal-graph-2026-10-05/bench.c <dir>/c/qwen36_metal.o <dir>/c/backend_metal.o -o <dir>/qwen36-bench -lm -L<libomp>/lib -lomp -framework Metal -framework Foundation -framework Accelerate -lc++; every run: /usr/bin/time -l env -i PATH=/usr/bin:/bin HOME=$HOME SNAP=<model> <dir>/qwen36-bench promessi_sposi.txt 64,512 32; baseline = the same binary with COLI_METAL=0, through bin-pr7-cpu/qwen36-bench, a script with the one line COLI_METAL=0 exec bin-pr7/qwen36-bench \"$@\", trial = the defaults; 0e485d64 is the measured f6935a05 with the comments, docs and graph test corrected after the runs (the measured commit is local, not in the repository), and the harness built from 0e485d64 is the binary the runs used, byte for byte",
+  "prompt_hash": "f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f",
+  "hardware": {
+    "cpu": "Apple M1, 4 performance + 4 efficiency cores (MacBook Air, MacBookAir10,1, no fan)",
+    "ram": "8 GB unified memory",
+    "storage": "internal APPLE SSD AP0256Q, APFS",
+    "os": "macOS 26.6.2 (25G83), Apple clang 21.0.0 (clang-2100.3.34.2), Homebrew libomp"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "ENGINE"
+  ],
+  "baseline": {
+    "config": {
+      "SNAP": "Qwen3.6-35B-A3B, Colibri qwen36 container, INT4 experts gs=64, internal SSD",
+      "BUILD": "the compiler flags of make -C c qwen36 METAL=1 on macOS without its qpack path: clang -O3 -Xclang -fopenmp -DCOLI_METAL -DQWEN36_METAL, qwen36_metal.o and backend_metal.o",
+      "EXPERT_CACHE": "each engine's own, given with ENGINE (the harness sets the CPU engine's to 16 per layer, qwen36's default until dev sized it from the RAM)",
+      "PROMPT": "the first 64 and the first 512 tokens of promessi_sposi.txt (speed-bench/promessi_sposi.txt of antirez's ds4 at commit 0aaea5a, of which the harness reads the first 20,480 bytes; prompt_hash is its SHA-256), each from an empty state; after each, 32 greedy tokens",
+      "ORDER": "1 warm-up run (baseline, discarded), then baseline trial trial baseline baseline trial trial baseline, one process each",
+      "REST": "thermal state nominal, then 60 s, before every run",
+      "ENGINE": "CPU engine (COLI_METAL=0), with the expert cache the harness sets: 16 experts per layer, 640 of 1.77 MB (1.13 GB)",
+      "MEASURED": "tokens per second of the 32 tokens generated after the 512-token prompt (the first token excluded)"
+    },
+    "samples": {
+      "tok_s": [
+        1.821,
+        1.889,
+        1.781,
+        1.888
+      ]
+    },
+    "median_tok_s": 1.8545,
+    "quality": {
+      "method": "Teacher-forced likelihood of 1024 tokens of promessi_sposi.txt after a 64-token prompt (TEACHER=1, one run per engine, raw logs in quality.txt): mean nll 2.94818 and top-1 0.463 on the CPU engine, 2.94494 and 0.466 on the Metal graph in its default (fast) mode, 2.94753 and 0.463 with QWEN36_METAL_EXACT=1. The graph keeps activations in float where the CPU engine quantizes them to int8, so neither of its modes gives the CPU engine's bits. Fingerprints (baseline / trial), each the same in every run of its version: 64 tokens f1300d8431ba2787/833c8fed434981a0 / 9585b2736ec3699f/1190b702cc495428, 512 tokens 8e0bf69c62deb041/a85d82db8081fff4 / 465ed0efdf92a690/d37fd94c2856ba1a.",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-metal-graph-2026-10-05/baseline.txt",
+      "sha256": "1af1421f13b2e807d497ad9624ae3fdae4c6f618f9672c9c8d3e2f0a3f9f6a98"
+    }
+  },
+  "trial": {
+    "config": {
+      "SNAP": "Qwen3.6-35B-A3B, Colibri qwen36 container, INT4 experts gs=64, internal SSD",
+      "BUILD": "the compiler flags of make -C c qwen36 METAL=1 on macOS without its qpack path: clang -O3 -Xclang -fopenmp -DCOLI_METAL -DQWEN36_METAL, qwen36_metal.o and backend_metal.o",
+      "EXPERT_CACHE": "each engine's own, given with ENGINE (the harness sets the CPU engine's to 16 per layer, qwen36's default until dev sized it from the RAM)",
+      "PROMPT": "the first 64 and the first 512 tokens of promessi_sposi.txt (speed-bench/promessi_sposi.txt of antirez's ds4 at commit 0aaea5a, of which the harness reads the first 20,480 bytes; prompt_hash is its SHA-256), each from an empty state; after each, 32 greedy tokens",
+      "ORDER": "1 warm-up run (baseline, discarded), then baseline trial trial baseline baseline trial trial baseline, one process each",
+      "REST": "thermal state nominal, then 60 s, before every run",
+      "ENGINE": "Metal graph, default (fast) kernels, with its expert cache at the default, a sixteenth of the RAM: 512 MiB, 303 experts of 1.77 MB (0.54 GB)",
+      "MEASURED": "tokens per second of the 32 tokens generated after the 512-token prompt (the first token excluded)"
+    },
+    "samples": {
+      "tok_s": [
+        9.285,
+        9.213,
+        9.199,
+        8.414
+      ]
+    },
+    "median_tok_s": 9.206,
+    "quality": {
+      "method": "Teacher-forced likelihood of 1024 tokens of promessi_sposi.txt after a 64-token prompt (TEACHER=1, one run per engine, raw logs in quality.txt): mean nll 2.94818 and top-1 0.463 on the CPU engine, 2.94494 and 0.466 on the Metal graph in its default (fast) mode, 2.94753 and 0.463 with QWEN36_METAL_EXACT=1. The graph keeps activations in float where the CPU engine quantizes them to int8, so neither of its modes gives the CPU engine's bits. Fingerprints (baseline / trial), each the same in every run of its version: 64 tokens f1300d8431ba2787/833c8fed434981a0 / 9585b2736ec3699f/1190b702cc495428, 512 tokens 8e0bf69c62deb041/a85d82db8081fff4 / 465ed0efdf92a690/d37fd94c2856ba1a.",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-metal-graph-2026-10-05/trial.txt",
+      "sha256": "6cb954d5c6828b00f967a59abae7ea83aa806eb1b41022bf373a8bcd26603228"
+    }
+  },
+  "outcome": "improvement"
+}
