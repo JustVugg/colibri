@@ -1,0 +1,83 @@
+{
+  "version": 1,
+  "hypothesis": "cc_attn_fk staging K and V with 16-byte loads in groups of 8 makes Qwen3.6's long prompts faster on sm_70 with the same bits",
+  "commit": "a37779ed052d57a1413a4e914075e2f5f420ca72",
+  "model": "q36",
+  "metric": "prompt tok/s at 8192 tokens",
+  "command": "env -i PATH=/usr/bin:/bin HOME=/root LD_LIBRARY_PATH=/usr/local/cuda/lib64 COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close OMP_DISPLAY_AFFINITY=TRUE OMP_AFFINITY_FORMAT=omp-thread:%n:cpus:%A OMP_NUM_THREADS=14 COLI_TRUNK_PROBE=0 /usr/bin/time -v /workspace/p/bin-b/qwen36-bench --model /workspace/p/q36 --text /workspace/p/bench/promessi_sposi.txt --lengths 2048,4096,8192 --gen 1 --teacher --steps /workspace/p/misura2/v1-runN.steps",
+  "prompt_hash": "f53e0d80cb2d4492",
+  "hardware": {
+    "cpu": "Intel(R) Xeon(R) Gold 6130 CPU @ 2.10GHz",
+    "ram": "377 GiB",
+    "storage": "overlay         100G",
+    "os": "Ubuntu 24.04.1 LTS, kernel 7.0.0-31-generic",
+    "gpu": "Tesla V100-SXM2-32GB"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "HARNESS"
+  ],
+  "baseline": {
+    "config": {
+      "HARNESS": "commit bf0b0eae719208e7603c282db280149564f7d6a8; harness qwen36_bench.c ca1bd9cc3d24; CUDA",
+      "COLI_CUDA": "1",
+      "COLI_GPUS": "0",
+      "CUDA_EXPERT_GB": "auto",
+      "OMP_WAIT_POLICY": "ACTIVE",
+      "OMP_PROC_BIND": "close",
+      "OMP_DISPLAY_AFFINITY": "TRUE",
+      "OMP_AFFINITY_FORMAT": "omp-thread:%n:cpus:%A",
+      "OMP_NUM_THREADS": "14",
+      "COLI_TRUNK_PROBE": "0"
+    },
+    "samples": {
+      "tok_s": [
+        2219.7,
+        2228.19,
+        2217.23,
+        2216.97
+      ]
+    },
+    "median_tok_s": 2218.465,
+    "quality": {
+      "method": "the fingerprint of every logit is the same in every run of both versions, at every length",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/cuda-prompt-attn-f16-2026-11-09/prompt.md",
+      "sha256": "d942c3b76931a5e986074f95418fcda4482e7e136f2c1a36a6e7b4d52548a6e6"
+    }
+  },
+  "trial": {
+    "config": {
+      "HARNESS": "commit a37779ed052d57a1413a4e914075e2f5f420ca72; harness qwen36_bench.c ca1bd9cc3d24; CUDA",
+      "COLI_CUDA": "1",
+      "COLI_GPUS": "0",
+      "CUDA_EXPERT_GB": "auto",
+      "OMP_WAIT_POLICY": "ACTIVE",
+      "OMP_PROC_BIND": "close",
+      "OMP_DISPLAY_AFFINITY": "TRUE",
+      "OMP_AFFINITY_FORMAT": "omp-thread:%n:cpus:%A",
+      "OMP_NUM_THREADS": "14",
+      "COLI_TRUNK_PROBE": "0"
+    },
+    "samples": {
+      "tok_s": [
+        3005.61,
+        3016.08,
+        3013.52,
+        3015.57
+      ]
+    },
+    "median_tok_s": 3014.545,
+    "quality": {
+      "method": "the fingerprint of every logit is the same in every run of both versions, at every length",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/cuda-prompt-attn-f16-2026-11-09/prompt.md",
+      "sha256": "d942c3b76931a5e986074f95418fcda4482e7e136f2c1a36a6e7b4d52548a6e6"
+    }
+  },
+  "outcome": "improvement"
+}
