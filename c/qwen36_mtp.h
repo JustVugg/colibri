@@ -703,18 +703,22 @@ static void q36_mtp_rows(Model *m, const int *tok, const float *hid, int R, int 
 /* After a forward fed ids[0..S) at pos_base with its residual rows res[S] (normalized here):
  * the head reads the rows it completes and keeps the last one pending. A forward that
  * starts behind the head (a verify's rejected rows undone) continues from the forward
- * before's row there; one that leaves a gap stops the head until the next prompt. */
-static void q36_mtp_feed_rows(Model *m, const int *ids, int S, int pos_base, const float *hid);
+ * before's row there; one that leaves a gap stops the head until the next prompt.
+ * A prompt's rows go to the head Q36_MTP_FEED_ROWS at a time and the forward keeps its last
+ * Q36_MTP_FEED_ROWS rows: the head's buffers (the host's, and q36_mc_bufs' on the card) held the
+ * whole prompt, 220 KiB a row on Qwen3.8-27B's card (93K tokens: 21 GB; every later verify's
+ * copies refused). A later forward that starts further back than that waits as after a gap. */
+#define Q36_MTP_FEED_ROWS 4096
+static void q36_mtp_feed_in(Model *m, const int *ids, int S, int pos_base, const float *rows, int normed);
 static void q36_mtp_feed(Model *m, const int *ids, int S, int pos_base, const float *res) {
-    Q36Mtp *p = &g_q36_mtp; int D = m->c.hidden;
-    if (!p->on || S < 1 || !q36_mtp_kv(m)) return;
-    float *hid = falloc((int64_t)S * D);   /* h_p: the model's output, after its final norm */
-    #pragma omp parallel for schedule(static) if(S > 8)
-    for (int s = 0; s < S; s++) rmsnorm_row(hid + (int64_t)s * D, res + (int64_t)s * D, m->final_norm, D, m->c.eps);
-    q36_mtp_feed_rows(m, ids, S, pos_base, hid);
-    free(hid);
+    if (!g_q36_mtp.on || S < 1 || !q36_mtp_kv(m)) return;
+    q36_mtp_feed_in(m, ids, S, pos_base, res, 0);
 }
 static void q36_mtp_feed_rows(Model *m, const int *ids, int S, int pos_base, const float *hid) {
+    q36_mtp_feed_in(m, ids, S, pos_base, hid, 1);
+}
+/* rows: the forward's residuals (normed 0: the final norm here, a chunk at a time) or h_p (1) */
+static void q36_mtp_feed_in(Model *m, const int *ids, int S, int pos_base, const float *rows, int normed) {
     Q36Mtp *p = &g_q36_mtp; int D = m->c.hidden;
     if (pos_base == 0) { p->len = 0; p->has_pend = 0; p->done_pos = -1; }
     else {
@@ -732,14 +736,28 @@ static void q36_mtp_feed_rows(Model *m, const int *ids, int S, int pos_base, con
         }
     }
     p->done_pos = -1;
-    if (pos_base == 0 || p->has_pend) {
-        if (S > 1) q36_mtp_rows(m, ids + 1, hid, S - 1, pos_base + 1, NULL, NULL);
-        memcpy(p->pend, hid + (int64_t)(S - 1) * D, sizeof(float) * D);
+    const int feed = pos_base == 0 || p->has_pend, C = S < Q36_MTP_FEED_ROWS ? S : Q36_MTP_FEED_ROWS;
+    if (C > p->last_cap) { free(p->last); p->last = falloc((int64_t)C * D); p->last_cap = C; }
+    float *buf = normed ? NULL : falloc((int64_t)C * D);   /* h_p: the model's output, after its final norm */
+    for (int s0 = 0; s0 < S; s0 += C) {
+        const int n = S - s0 < C ? S - s0 : C;
+        const float *h = rows + (int64_t)s0 * D;
+        if (!normed) {
+            #pragma omp parallel for schedule(static) if(n > 8)
+            for (int s = 0; s < n; s++) rmsnorm_row(buf + (int64_t)s * D, h + (int64_t)s * D, m->final_norm, D, m->c.eps);
+            h = buf;
+        }
+        const int pairs = s0 + n < S ? n : n - 1;   /* each row with the token after it; the last waits (pend) */
+        if (feed && pairs > 0 && p->on) q36_mtp_rows(m, ids + 1 + s0, h, pairs, pos_base + 1 + s0, NULL, NULL);
+        const int k0 = S - C > s0 ? S - C - s0 : 0;   /* this chunk's rows among the forward's last C */
+        if (k0 < n) memcpy(p->last + (int64_t)(s0 + k0 - (S - C)) * D, h + (int64_t)k0 * D, sizeof(float) * (size_t)(n - k0) * D);
+    }
+    free(buf);
+    if (feed) {
+        memcpy(p->pend, p->last + (int64_t)(C - 1) * D, sizeof(float) * D);
         p->len = pos_base + S - 1; p->has_pend = 1;
     }
-    if (S > p->last_cap) { free(p->last); p->last = falloc((int64_t)S * D); p->last_cap = S; }
-    memcpy(p->last, hid, sizeof(float) * (size_t)S * D);
-    p->last_base = pos_base; p->last_n = S;
+    p->last_base = pos_base + S - C; p->last_n = C;
 }
 
 /* Whether the head can draft for a token about to be fed at pos */
