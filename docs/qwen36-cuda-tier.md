@@ -715,6 +715,26 @@ a layer's non-resident experts into VRAM and runs them with the residents:
   back to a chunk of a few dozen rows: a smaller chunk leaves the pool behind for the next
   large one, its layers holding an expert that left on the host's step as before. An expert
   whose page-lock is refused stays out until the next follow.
+- The residents' copies go to the pool too when the card holds fewer than every expert and
+  the chain runs (`tier_warmstart`, which calls `qt_chain_host_all` once the loop that
+  pools the experts off the card has ended): an expert the promotions, the swaps or the KV
+  mirrors' give-back move off the card is in the pool already, for any prompt chunk that
+  stages, and the follow has nothing to do (once every expert is in, it returns at once; the chain's staged table
+  still follows the residents, by the tier's epoch). The copies are the slots' own, in
+  whichever layout the pool takes (planar blocks, int4 pairs, a GGUF's rows). It costs the
+  RAM page-locked, every expert's instead of those off the card, and a pass over the
+  residents at the warm start: on a Colab T4, 16.88 GB of the RAM cache page-locked
+  instead of 6.00, the model ready in 21.96 s instead of 19.73. A short chunk gains from
+  it because it copies only its routed experts (above): with a whole layer's copy for
+  each of those layers, a 64-token prompt after a long one was slower than with the
+  host's step (89.94 against 103.58 tok/s on that T4, on the code before the routed
+  copy). They come last: where the driver refuses page-locks, the
+  experts off the card, which the pool is for, have theirs and the residents get what is
+  left. If the driver refused any page-lock, the pool is not whole and the follow stays on
+  as without this: the pooled residents leave it, the experts that leave the card join it,
+  and the startup line says the page-locks did not reach every expert. A card that holds
+  every expert pools nothing, as before. The startup line `host pool` says how many of its
+  experts are the residents'.
 - The staging (`cc_fetch`, `cc_fetch_wait`, `cc_fetch_done`): one layer's worth of VRAM,
   the most non-resident experts any layer has, filled on a copy stream of its own. The copy
   of the next such layer starts once the layer before has run its experts' GEMMs, so it
@@ -844,7 +864,8 @@ the mirrors grow, the chain now makes room for them, a chunk's scratch and stagi
 yet allocated, and 256 MiB for the driver (a kernel's first launch loads its code into device
 memory), out of the expert tier where the card lacks it (`q36cc_mirror_room`,
 `qt_chain_give_back`): residents leave the card, the tier's budget comes down by as much, the
-CPU computes them from their RAM copy and the host pool takes them at its next follow.
+CPU computes them from their RAM copy and the host pool takes them at its next follow (they
+are in it already where the warm start pooled the residents' copies too).
 
 The driver packs allocations under 2 MiB into 2 MiB pages and releases a page only when
 nothing in it is left. The 35B's expert matrices are 512 KiB each, so the coldest residents,

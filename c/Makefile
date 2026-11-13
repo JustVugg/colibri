@@ -3310,7 +3310,7 @@ tests/test_qwen36_tier_replan$(EXE): tests/test_qwen36_tier_replan.c qwen36_tier
 tests/test_qwen36_tier_promote$(EXE): tests/test_qwen36_tier_promote.c qwen36_tier.c
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
-# qt_chain_host_follow: after the promotions the host pool is the non-residents again (fake backend).
+# qt_chain_host_follow: after the promotions the host pool is the non-residents again, or every expert when the warm start pooled them all (qt_chain_host_all; fake backend).
 tests/test_qwen36_tier_host_pool$(EXE): tests/test_qwen36_tier_host_pool.c qwen36_tier.c
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 

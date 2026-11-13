@@ -89,12 +89,14 @@ void coli_cuda_tensor_free(ColiCudaTensor *t) {
 }
 /* no bus to copy host memory over: the tier keeps the host's step for those experts. A test of
  * the host pool sets fake_host_reg_ok and fake_planar_rows, and fake_host_reg_bytes to lock only
- * ranges of that size; the page-locks taken and the releases are counted. */
-static int fake_host_reg_ok, fake_planar_rows, fake_host_regs, fake_host_unregs;
+ * ranges of that size, and fake_host_reg_max to refuse a page-lock once that many are held
+ * (the driver's limit, 0: none); the page-locks taken and the releases are counted. */
+static int fake_host_reg_ok, fake_planar_rows, fake_host_regs, fake_host_unregs, fake_host_reg_max;
 static size_t fake_host_reg_bytes;
 int coli_cuda_host_register(void *p, size_t bytes) {
     (void)p;
-    int ok = fake_host_reg_ok && (!fake_host_reg_bytes || bytes == fake_host_reg_bytes);
+    int ok = fake_host_reg_ok && (!fake_host_reg_bytes || bytes == fake_host_reg_bytes) &&
+             (!fake_host_reg_max || fake_host_regs - fake_host_unregs < fake_host_reg_max);
     fake_host_regs += ok;
     return ok;
 }

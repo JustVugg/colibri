@@ -22,6 +22,9 @@
  * drives tier_warmstart() directly against the fake CUDA backend shared with
  * the other tier tests.
  *
+ * A third case drives the warm start's host pool (tier_warmstart's pool_all) on a planar
+ * and on a per-row int4 container: which experts' RAM copies it page-locks.
+ *
  * Include order matters: qwen36.c first (it never references coli_cuda_*),
  * then the fake backend, then qwen36_tier.c -- which puts the tier's own
  * statics (qs(), G) in this TU, so the test can read back the exact pointer
@@ -129,12 +132,13 @@ static void free_model(Model *m) {
 }
 
 /* qt_fill_wait() returns when the queue is empty, and the uploader dequeues
- * BEFORE uploading -- so wait on the observable end state instead. */
-static int wait_resident(void) {
+ * BEFORE uploading -- so wait on the observable end state instead: `want`
+ * experts in VRAM. */
+static int wait_resident(int want) {
     for (int i = 0; i < 500; i++) {
-        int all = 1;
-        for (int e = 0; e < NE; e++) if (!qt_is_resident(0, e)) all = 0;
-        if (all) return 1;
+        int n = 0;
+        for (int e = 0; e < NE; e++) n += qt_is_resident(0, e);
+        if (n >= want) return 1;
         struct timespec ts = {0, 2000000};          /* 2 ms */
         nanosleep(&ts, NULL);
     }
@@ -169,7 +173,7 @@ static void case_int8(void) {
     tier_warmstart(&m, 0);
     qt_fill_wait();
 
-    ck(wait_resident(), "every planned int8 expert reached VRAM");
+    ck(wait_resident(NE), "every planned int8 expert reached VRAM");
     ck(fake_uploads == 3 * NE, "three uploads per planned expert (gate, up, down)");
 
     int computable = 1, intact = 1, tier_live = 1;
@@ -207,7 +211,7 @@ static void case_int4(void) {
     }
     tier_warmstart(&m, 1);
     qt_fill_wait();
-    ck(wait_resident(), "every planned int4 expert reached VRAM");
+    ck(wait_resident(NE), "every planned int4 expert reached VRAM");
 
     int freed = 1, remat = 1;
     for (int e = 0; e < NE; e++) {
@@ -224,9 +228,121 @@ static void case_int4(void) {
     free_model(&m);
 }
 
+/* --- the host pool: which RAM copies the warm start page-locks -------------
+ * The pool's layouts: planar int4 in groups of 64 (the shared kernel's slots, gate|up|down in
+ * pw), or int4 in pairs, gate|up|down in one block with a scale a row (a per-row container's
+ * slots). With the chain on and the card short of every expert every RAM copy goes to the pool,
+ * the residents' too, and the follow keeps them (qt_chain_host_all), unless a page-lock was refused:
+ * the pool is then not whole and the follow works; with the chain off only the experts off the card;
+ * a card that holds every expert pools none. */
+enum { PI = 64, PMB = EXP_D * PI / 2, PSC = 2 * PI + EXP_D };   /* a matrix's bytes; the scales, one a row */
+
+static void build_pool_model(Model *m, int pairs) {
+    memset(m, 0, sizeof *m);
+    m->c.n_layers = NL; m->c.n_experts = NE;
+    m->c.hidden = EXP_D; m->c.inter = PI;
+    m->c.topk = TOPK; m->c.expert_gs = pairs ? 0 : 64;
+    m->active_of  = calloc(NL, sizeof(int));
+    m->is_pinned  = calloc((size_t)NL * NE, 1);
+    m->is_queued  = calloc((size_t)NL * NE, 1);
+    m->cache      = calloc(NL, sizeof(LCache));
+    LCache *lc = &m->cache[0];
+    lc->cap = NE; lc->n = NE;
+    lc->slots = calloc(NE, sizeof(Slot));
+    lc->slot_by_expert = malloc(NE * sizeof(int));
+    g_pw_gp = PMB;                        /* as slot_ensure_allocated's planar slots */
+    for (int e = 0; e < NE; e++) {
+        Slot *s = &lc->slots[e];
+        if (pairs) { s->g4 = calloc(3, PMB); s->u4 = s->g4 + PMB; s->d4 = s->u4 + PMB; }
+        else s->pw = calloc(3, PMB);
+        s->gs = calloc(PSC, sizeof(float)); s->us = s->gs + PI; s->ds = s->gs + 2 * PI;
+        s->is_int4 = 1;
+        s->eid = e;
+        s->pinned = 1;
+        s->used = ++m->clock;
+        lc->slot_by_expert[e] = e;
+    }
+}
+
+static void free_pool_model(Model *m) {
+    LCache *lc = &m->cache[0];
+    for (int e = 0; e < NE; e++) { Slot *s = &lc->slots[e]; free(s->pw); free(s->g4); free(s->gs); }   /* g4: the pairs' one block */
+    free(lc->slots); free(lc->slot_by_expert);
+    free(m->cache); free(m->active_of); free(m->is_pinned); free(m->is_queued);
+}
+
+/* One warm start with room on the card for `fit` experts: how many experts the pool holds (-1 if
+ * the tier did not start or the uploads did not land), whether the follow, before a large prompt
+ * chunk, leaves the pool as it is, and how many of the experts on the card are in it (*res).
+ * limit: the driver's page-lock limit in experts (0: none). */
+static int warm_pool(int pairs, int fit, int chain, int limit, int *kept, int *res) {
+    Model m; build_pool_model(&m, pairs);
+    size_t one = 3 * dev_alloc_footprint(PMB) + 3 * dev_alloc_footprint(PI * sizeof(float));   /* an expert on the card */
+    char gb[64]; snprintf(gb, sizeof gb, "%.15f", (double)(fit * one + one / 2) / 1073741824.0);
+    setenv("CUDA_EXPERT_GB", gb, 1);
+    int n = -1, j, l;
+    *kept = 0; *res = 0;
+    qt_source_planar(!pairs);
+    if (qt_init(NL, NE, EXP_D, PI, NE, TOPK, pairs ? 0 : 64, 1)) {
+        g_cuda_chain = chain;
+        fake_host_reg_max = limit ? fake_host_regs - fake_host_unregs + 2 * limit : 0;
+        tier_warmstart(&m, 1);
+        qt_fill_wait();
+        fake_host_reg_max = 0;
+        if (wait_resident(fit)) {
+            n = qt_chain_host_count();
+            for (int e = 0; e < NE; e++) { const void *w; const float *sc; size_t a, b; *res += qt_is_resident(0, e) && qt_chain_host(0, e, &w, &a, &sc, &b); }
+        }
+        *kept = qt_chain_host_follow(&j, &l) == 0 && qt_chain_host_count() == n;
+        g_cuda_chain = 0;
+        qt_shutdown();
+    }
+    unsetenv("CUDA_EXPERT_GB");
+    qt_source_planar(0);
+    free_pool_model(&m);
+    return n;
+}
+
+static void case_host_pool(void) {
+    printf("host pool at the warm start\n");
+    setenv("COLI_CUDA", "1", 1);
+    setenv("COLI_GPUS", "0", 1);
+    setenv("COLI_PLACE", "off", 1);
+    unsetenv("QT_NO_WARMSTART");
+    fake_host_reg_ok = 1; fake_planar_rows = 1;
+    for (int pairs = 0; pairs < 2; pairs++) {
+        const char *kind = pairs ? "per-row pairs" : "planar";
+        char w[128];
+        int kept, res, n = warm_pool(pairs, 2, 1, 0, &kept, &res);
+        /* outcome: every_expert_pooled_when_the_card_holds_part */
+        snprintf(w, sizeof w, "%s, the chain on, two of four on the card: every expert pooled, the residents too", kind);
+        ck(n == NE && res == 2, w);
+        snprintf(w, sizeof w, "%s: the follow keeps the residents in the pool", kind);
+        ck(kept, w);
+        n = warm_pool(pairs, 2, 0, 0, &kept, &res);
+        /* outcome: only_the_experts_off_the_card_without_the_chain */
+        snprintf(w, sizeof w, "%s, the chain off: only the two experts off the card pooled", kind);
+        ck(n == NE - 2 && res == 0, w);
+        n = warm_pool(pairs, NE, 1, 0, &kept, &res);
+        /* outcome: no_pool_when_the_card_holds_every_expert */
+        snprintf(w, sizeof w, "%s, every expert on the card: none pooled", kind);
+        ck(n == 0, w);
+        /* outcome: the_experts_off_the_card_first_when_the_page_locks_run_out */
+        n = warm_pool(pairs, 2, 1, NE - 1, &kept, &res);
+        snprintf(w, sizeof w, "%s, page-locks for three of four: the two experts off the card first, then one resident", kind);
+        ck(n == NE - 1 && res == 1, w);
+        /* outcome: the_follow_stays_on_when_the_pool_is_not_whole */
+        snprintf(w, sizeof w, "%s: the pool is not whole, so the follow still works (it takes the resident out)", kind);
+        ck(!kept, w);
+    }
+    unsetenv("COLI_PLACE");
+    fake_host_reg_ok = fake_planar_rows = 0;
+}
+
 int main(void) {
     case_int8();
     case_int4();
+    case_host_pool();
     if (fails) { printf("FAILED %d\n", fails); return 1; }
     printf("OK test_qwen36_tier_int8_engine\n");
     return 0;
