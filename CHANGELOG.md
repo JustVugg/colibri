@@ -532,8 +532,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   automatic cache moved from 42 to 64 slots within minutes on a 16 GB Mac, and why a 48 GB Mac
   with browsers open accepted a 32 GiB cache that was compressed, then swapped: neither report
   shows how its pages split, so this is unconfirmed. #2785's 0-slot plan came mostly from the
-  planner's OLMoE runtime reserve, a separate fix. The compressor is still not modeled. Not yet
-  tested on a Mac.
+  planner's OLMoE runtime reserve, a separate fix. The compressor is still not modeled. Checked on
+  one Mac (macOS 15.6), not yet on the reporters' machines.
 - **CUDA on Windows: the answer stopped a few tokens in with the card at 100%** (#2696). Windows'
   WDDM driver model, which WSL2 drives the card through too, holds CUDA launches back and sends
   them in batches. A hybrid step (a layer whose experts are partly in RAM) has the card signal the
