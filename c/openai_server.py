@@ -6340,7 +6340,11 @@ def _engine_timing_stats(fields):
         "prefill_chunk_max_s",
         "prefill_deltanet_s", "prefill_attention_s", "prefill_moe_s",
         "prefill_shared_s", "prefill_router_s", "prefill_lm_head_s",
+        "prefill_moe_hold_s", "prefill_moe_mm_s", "prefill_moe_act_s",
         "first_sample_s", "first_emit_after_prefill_s",
+    }
+    int_fields = {
+        "prefill_moe_experts", "prefill_moe_pairs", "prefill_moe_calls",
     }
     for entry in fields[7:]:
         key, sep, value = entry.partition("=")
@@ -6351,6 +6355,16 @@ def _engine_timing_stats(fields):
             if not math.isfinite(seconds) or seconds < 0:
                 raise ValueError(f"invalid engine timing: {key}")
             out[key] = seconds
+        elif key in int_fields:
+            tokens = int(value)
+            if tokens < 0:
+                raise ValueError(f"invalid engine count: {key}")
+            out[key] = tokens
+        elif key == "prefill_moe_bytes":
+            count = float(value)
+            if not math.isfinite(count) or count < 0:
+                raise ValueError("invalid prefill_moe_bytes")
+            out[key] = count
         elif key == "reused_prompt_tokens":
             tokens = int(value)
             if tokens < 0:
