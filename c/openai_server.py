@@ -9397,6 +9397,9 @@ class APIHandler(BaseHTTPRequestHandler):
                     "prefill_chunk_max_s",
                     "prefill_deltanet_s", "prefill_attention_s", "prefill_moe_s",
                     "prefill_shared_s", "prefill_router_s", "prefill_lm_head_s",
+                    "prefill_moe_hold_s", "prefill_moe_mm_s", "prefill_moe_act_s",
+                    "prefill_moe_bytes", "prefill_moe_experts", "prefill_moe_pairs",
+                    "prefill_moe_calls",
                     "first_sample_s", "first_emit_after_prefill_s",
                 ):
                     value = stats.get(name)

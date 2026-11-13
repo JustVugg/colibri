@@ -1666,6 +1666,20 @@ static int q36_attn_rowblock(void) {
     return n;
 }
 
+/* ---- C14 phase-0 MoE profile (Q36_MOE_PROF=1) --------------------------------
+ * Splits moe_gq_run's prefill wall into expert-pin (hold) vs matmul (compute,
+ * which is also where a cold page faults on the mmap'd weights) and counts the
+ * activated experts and their weight bytes, so the stream-vs-compute split is
+ * measured, not inferred. Off by default: zero cost when off (one getenv per
+ * call, cached). */
+static int g_mp_on = -1;
+static double g_mp_hold, g_mp_mm, g_mp_act, g_mp_bytes;
+static long g_mp_experts, g_mp_pairs, g_mp_calls;
+static inline int q36_moe_prof(void) {
+    if (g_mp_on < 0) { const char *e = getenv("Q36_MOE_PROF"); g_mp_on = (e && *e == '1'); }
+    return g_mp_on;
+}
+
 /* y[1,O] = x[1,I] @ W^T with W quantized: q[O,I] int8 + scale per row.
  * matmul_q lives in qgemv.h so tests/test_qgemv.c can link the exact kernel
  * the engine runs (qwen36.c has a main() and cannot itself be linked into a
@@ -6244,6 +6258,8 @@ static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const 
 static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, const int *idx, const float *val) {
     Cfg *c = &m->c; const int D = q36_eh(c), K = c->topk, I = c->inter, E = c->n_experts;
     const GqExp *gx = &m->gqx[layer];
+    int mp = S > 1 && q36_moe_prof();
+    if (mp) g_mp_calls++;
     static int nodec = -1; if (nodec < 0) { const char *e = getenv("GQ_NODECODE"); nodec = e && *e == '1'; }
     if (S == 1 && !nodec && !moe_gq_decode(m, layer, x, out, idx, val)) return;
     int *cnt = calloc((size_t)E + 1, sizeof(int)), *tok = malloc(sizeof(int) * (size_t)S * K);
@@ -6261,7 +6277,19 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
     for (int e = 0; e < E; e++) {
         int n = cnt[e + 1] - cnt[e]; if (!n) continue;
         const int *tl = tok + cnt[e]; const float *wl = wt + cnt[e];
+        double _h0 = mp ? tm_now() : 0;
         Slot *sl = expert_hold(m, layer, e);
+        if (mp) {
+            g_mp_hold += tm_now() - _h0;
+            g_mp_experts++;
+            g_mp_pairs += n;
+            /* one expert's weight bytes exactly as the matmuls read them: D rows
+             * of I (gate), D rows of I (up), I rows of D (down) */
+            int64_t rb1 = gq_row_bytes(gx->hg, I), rb2 = gq_row_bytes(gx->hu, I), rb3 = gq_row_bytes(gx->hd, D);
+            if (rb1 >= 0 && rb2 >= 0 && rb3 >= 0)
+                g_mp_bytes += (double)rb1 * D + (double)rb2 * D + (double)rb3 * I;
+        }
+        double _m0 = mp ? tm_now() : 0;
         for (int r = 0; r < n; r++) memcpy(X + (int64_t)r * D, x + (int64_t)tl[r] * D, sizeof(float) * (size_t)D);
         if (q36_exp_i8_on()) {   /* C10b: this expert as the idot contract, the rows' activations quantized per matmul input */
             q36_slot_i8(m, layer, sl);
@@ -6282,7 +6310,11 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
         }
         if (gx->sg) for (int64_t q = 0; q < (int64_t)n * I; q++) G[q] *= gx->sg[e];
         if (gx->su) for (int64_t q = 0; q < (int64_t)n * I; q++) U[q] *= gx->su[e];
+        if (mp) g_mp_mm += tm_now() - _m0;
+        double _a0 = mp ? tm_now() : 0;
         for (int64_t q = 0; q < (int64_t)n * I; q++) { float gv = G[q]; G[q] = (gv / (1.f + expf(-gv))) * U[q]; }
+        if (mp) g_mp_act += tm_now() - _a0;
+        double _d0 = mp ? tm_now() : 0;
         if (q36_exp_i8_on()) {   /* C10b: the rows of G as the down's int8 activations */
             for (int r = 0; r < n; r++) AS[r] = dense_act_i8(G + (int64_t)r * I, I, HQ + (int64_t)r * I, NULL);
             matmul_q_idot(Y, HQ, AS, sl->di8, sl->rdi8, n, I, D);
@@ -6296,6 +6328,7 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
             float *os = out + (int64_t)tl[r] * D; const float *ys = Y + (int64_t)r * D; const float w = wl[r];
             for (int d = 0; d < D; d++) os[d] += w * ys[d];
         }
+        if (mp) g_mp_mm += tm_now() - _d0;
         slot_release(sl);
     }
     gq_act_free(&act);
@@ -9447,6 +9480,8 @@ typedef struct {
     double prefill_embedding_s, prefill_chunk_avg_s, prefill_chunk_max_s;
     double prefill_deltanet_s, prefill_attention_s, prefill_moe_s;
     double prefill_shared_s, prefill_router_s, prefill_lm_head_s;
+    double prefill_moe_hold_s, prefill_moe_mm_s, prefill_moe_act_s, prefill_moe_bytes;
+    long prefill_moe_experts, prefill_moe_pairs, prefill_moe_calls;
     double first_sample_s, first_emit_after_prefill_s;
     int reused_prompt_tokens, prefill_chunk_count;
     const char *prefix_reuse_source, *prefix_reuse_miss;
@@ -9637,6 +9672,8 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     double prefill_started = now_s();
     double prefill_tm_start[6];
     Q36PrefillTiming prefill_timing = {0};
+    double mp_hold0 = g_mp_hold, mp_mm0 = g_mp_mm, mp_act0 = g_mp_act, mp_bytes0 = g_mp_bytes;
+    long mp_experts0 = g_mp_experts, mp_pairs0 = g_mp_pairs, mp_calls0 = g_mp_calls;
     memcpy(prefill_tm_start, g_tm_pre, sizeof prefill_tm_start);
     g_q36_prefill_timing = &prefill_timing;
     if (!prefill_control && reuse < np) {
@@ -9652,6 +9689,13 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     clk->prefill_shared_s = (g_tm_pre[3] - prefill_tm_start[3]) / 1000.0;
     clk->prefill_router_s = (g_tm_pre[4] - prefill_tm_start[4]) / 1000.0;
     clk->prefill_lm_head_s = (g_tm_pre[5] - prefill_tm_start[5]) / 1000.0;
+    clk->prefill_moe_hold_s = g_mp_hold - mp_hold0;
+    clk->prefill_moe_mm_s = g_mp_mm - mp_mm0;
+    clk->prefill_moe_act_s = g_mp_act - mp_act0;
+    clk->prefill_moe_bytes = g_mp_bytes - mp_bytes0;
+    clk->prefill_moe_experts = g_mp_experts - mp_experts0;
+    clk->prefill_moe_pairs = g_mp_pairs - mp_pairs0;
+    clk->prefill_moe_calls = g_mp_calls - mp_calls0;
     /* Also honor a control arriving during the final projection before DATA.
      * In that case the fully completed prefix is still safe to reuse. */
     if(g_q36_mux_slots == 1 && !prefill_control) prefill_control = serve_control_pending(q->id);
@@ -9782,6 +9826,13 @@ static void serve_one_turn(Model *m, ServeReq *q){
            clk.prefix_reuse_source ? clk.prefix_reuse_source : "none");
     if (clk.prefix_reuse_miss)
         printf(" prefix_reuse_miss=%s", clk.prefix_reuse_miss);
+    if (q36_moe_prof())
+        printf(" prefill_moe_hold_s=%.6f prefill_moe_mm_s=%.6f prefill_moe_act_s=%.6f"
+               " prefill_moe_bytes=%.0f prefill_moe_experts=%ld prefill_moe_pairs=%ld"
+               " prefill_moe_calls=%ld",
+               clk.prefill_moe_hold_s, clk.prefill_moe_mm_s, clk.prefill_moe_act_s,
+               clk.prefill_moe_bytes, clk.prefill_moe_experts, clk.prefill_moe_pairs,
+               clk.prefill_moe_calls);
     if (clk.first_sample_s >= 0)
         printf(" first_sample_s=%.6f", clk.first_sample_s);
     if (clk.first_emit_after_prefill_s >= 0)
