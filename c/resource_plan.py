@@ -3054,6 +3054,18 @@ def physical_cpu_count():
                 return cores
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             _physical_cores_warn(f"sysctl core probe failed: {error}")
+    if sys.platform.startswith("freebsd"):
+        # kern.smp.cores counts a core once, whatever kern.smp.threads_per_core is
+        # (omp_tune.h coli_physical_cores, the same sysctl). There is no lscpu here.
+        try:
+            result = subprocess.run(["sysctl", "-n", "kern.smp.cores"], text=True,
+                                    capture_output=True, check=True, timeout=5)
+            cores = int(result.stdout.strip())
+            if cores > 0:
+                return cores
+            _physical_cores_warn("kern.smp.cores reported no cores")
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            _physical_cores_warn(f"sysctl core probe failed: {error}")
     try:
         # Ask lscpu for exactly core,socket and dedupe on (core, socket).
         # Counting un-deduplicated rows would return logical threads (SMT),
