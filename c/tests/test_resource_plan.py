@@ -3189,6 +3189,15 @@ class PhysicalCpuCountTest(unittest.TestCase):
                     cpu += 1
         return "# CPU,Core,Socket\n" + "\n".join(rows)
 
+    def test_freebsd_reads_kern_smp_cores(self):
+        # FreeBSD has no lscpu: the cores come from the kern.smp.cores sysctl, which
+        # counts a core once with SMT on (40 here, not the 80 logical CPUs)
+        with mock.patch("resource_plan.subprocess.run", return_value=self._lscpu("40\n")) as run, \
+             mock.patch.object(sys, "platform", "freebsd15"), \
+             mock.patch("resource_plan.os.cpu_count", return_value=80):
+            self.assertEqual(physical_cpu_count(), 40)
+        self.assertEqual(run.call_args.args[0], ["sysctl", "-n", "kern.smp.cores"])
+
     def test_counts_physical_cores_not_smt_threads(self):
         blob = self._lscpu_topology(sockets=2, cores_per_socket=16, threads_per_core=2)
         with mock.patch("resource_plan.subprocess.run", return_value=self._lscpu(blob)), \
