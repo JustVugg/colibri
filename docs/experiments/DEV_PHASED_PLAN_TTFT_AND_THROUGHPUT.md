@@ -124,7 +124,7 @@ Start at concurrency 1. Add realistic concurrency after single-request timing is
 
 ### C14 — Budgeted hybrid RAM residency
 
-**Priority:** P1 · **Status:** Initial implementation exists; benchmark and harden
+**Priority:** P1 · **Status:** Initial implementation exists; benchmark and harden · **Scoping update 2026-11-13 (C15 phase 0 fallout): expectations re-anchored below**
 
 **Goal:** Use user-approved memory headroom to keep frequently used routed experts in owned RAM copies while retaining mmap-backed access for cold experts.
 
@@ -148,6 +148,17 @@ Review promotion/eviction for concurrency safety, pinned-slot limits, allocation
 **Design direction:** expose a clear user-configurable upper budget, not a hard RAM lock; preserve OS/application headroom; promote hot experts only when measured reuse justifies it; observe MTP weights/buffers separately; avoid aggressive prefetch that causes cache pollution.
 
 **Acceptance:** retain a budget only if repeated measurements improve a target workload without unacceptable TTFT, decode, memory-pressure or swap regressions. 5 GB is a test point, not an assumed default.
+
+**Scoping (2026-11-13, from the C15 phase-0 shares + code reading): residency cannot be the prefill-TTFT lever; its value is decode robustness under memory pressure.**
+
+- Expert geometry (config): 256 experts, top-k 8, expert width D=2048, intermediate I=512 → 3·D·I ≈ 3.15 M params/expert ≈ 0.81 MB/expert at IQ2_XXS (~2.06 bpw) ≈ **207 MB/layer, ~8.3 GB of routed weights** — matching the +8.7 GB first-prefill RSS growth the memory run recorded (lazy expert paging).
+- The path on this host (CPU GGUF serve → `use_gq` → `moe_gq_run`, qwen36.c ~6244): counting-sort the S·K (token, expert) pairs by expert, then per *activated* expert one `gq_matmul2_act` (gate+up) and one `gq_matmul` (down), weights read **directly from the page-cache-backed mmap** (`gq_slot_W` — "C3: point, don't copy"; no per-use copies to skip). The inner kernel on Apple silicon is the fused NEON `gq_dot_arm_iq2_xxs` (one weight row's registers reused across all its activation rows); the AVX2 batched prefill kernels (`GQ_R16_ON`/tile16/f8, "unpack 16 file rows once") are **x86-only** and do not apply here.
+- Compute arithmetic: a 12K prefill issues ≈ 40 layers × 8 experts × 3 matmuls × 2·D·I ≈ **2.0 GFLOP/token ≈ 24.9 TFLOP total**; at the measured 320.5 s MoE time that is ~78 GFLOPS over 6 threads (~13 GFLOPS/thread) — the profile of a scalar-ish NEON int8-dot dequant loop, i.e. **compute-bound**.
+- Data movement is bounded *by the measurements themselves*: a full 8.3 GB expert stream at this host's 120 GB/s (M4 base) is ≥ 69 s — more than the *entire* 4K MoE time (102 s) once compute is added, which is impossible; so router activation skew keeps the per-prefill stream well under the full weight size, and the stream is page-cache-served in any case (the memory run showed the pages stay resident between colds; later colds added only +212/+268 MB RSS). Flat ms/token across sizes (23.6 → 24.9 → 26.0 at 1K/4K/12K) says the same: a stream-once term would *fall* per token as S grows.
+- **Consequence 1 — prefill TTFT:** `Q36_HYBRID_GB` cannot materially improve long-prompt TTFT. The binding prefill-MoE cost is the fused-dot compute, not where the weights sit. The real prefill-MoE levers are kernel work: profile the `gq_dot_arm_iq2_xxs` inner loop, or evaluate the C10b int8-expert path (`q36_exp_i8_on`, `matmul_q_idot`) as an accuracy-gated A/B — different numerics, needs its own correctness story, not bit-exact.
+- **Consequence 2 — decode:** one decode token streams 8 experts × 3.15 M params × 2.06 bpw × 40 layers ≈ **256 MB**; at 8.6 tok/s (12K ctx) that is ≈ 2.2 GB/s — an order of magnitude under M4 bandwidth. Decode expert cost is per-expert n=1 GEMV latency/compute, not residency; consistent with prompt-lookup's null decode result (15.5 vs 16.3 tok/s).
+- **Where residency CAN matter:** insulating decode from page-cache eviction on this 16 GB host under real co-tenant memory pressure (the brewer contamination incident is the existence proof that pressure events happen), and multi-turn stability. The benchmark plan above stays, but an idle-host arm will likely measure ~0 delta — the informative arm is **under memory pressure**, and its metric is decode tok/s stability, not TTFT.
+- **C14 phase 0 before any benchmark run:** env-gated instrumentation in `moe_gq_run` (`Q36_MOE_PROF=1`): per prefill, activated-expert count, weight bytes actually touched, and the hold-vs-matmul time split, flowing through the DONE STAT line into the gateway timings whitelist (same pipe as `prefill_attention_s`). Purpose: turn the stream-vs-compute arithmetic above into measured shares — it also sets the ceiling for ANY data-movement intervention (residency, prefetch, compaction) before more kernel work is spent.
 
 ### C15 — Long-prompt prefill acceleration
 
