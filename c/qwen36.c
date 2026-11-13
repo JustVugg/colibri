@@ -9689,9 +9689,9 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     clk->prefill_shared_s = (g_tm_pre[3] - prefill_tm_start[3]) / 1000.0;
     clk->prefill_router_s = (g_tm_pre[4] - prefill_tm_start[4]) / 1000.0;
     clk->prefill_lm_head_s = (g_tm_pre[5] - prefill_tm_start[5]) / 1000.0;
-    clk->prefill_moe_hold_s = g_mp_hold - mp_hold0;
-    clk->prefill_moe_mm_s = g_mp_mm - mp_mm0;
-    clk->prefill_moe_act_s = g_mp_act - mp_act0;
+    clk->prefill_moe_hold_s = (g_mp_hold - mp_hold0) / 1000.0;
+    clk->prefill_moe_mm_s = (g_mp_mm - mp_mm0) / 1000.0;
+    clk->prefill_moe_act_s = (g_mp_act - mp_act0) / 1000.0;
     clk->prefill_moe_bytes = g_mp_bytes - mp_bytes0;
     clk->prefill_moe_experts = g_mp_experts - mp_experts0;
     clk->prefill_moe_pairs = g_mp_pairs - mp_pairs0;
