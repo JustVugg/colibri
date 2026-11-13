@@ -2012,12 +2012,24 @@ extern "C" int dsv4_cuda_upload_compressor(Dsv4CudaTensor **pt,const uint16_t *w
 }
 
 extern "C" int dsv4_cuda_upload_head_exact(Dsv4CudaTensor **pt,const uint16_t *w,int O,int I,int device){
-    if(!pt||*pt||I<1||I%8)return 0;
-    Dsv4CudaTensor *t=nullptr;
-    if(!dsv4_cuda_upload_compressor(&t,w,O,I,device))return 0;
-    // The head only consumes the packed copy; discard the upload source.
-    if(!ok(cudaFree(t->w),"head source release")){dsv4_cuda_tensor_free(t);return 0;}
-    t->w=t->bf16_cache;t->bf16_cache=nullptr;t->fmt=12;t->bytes=(long long)O*I*2;
+    if(!pt||*pt||!w||O<1||O%32||I<1||I%8)return 0;
+    Dev *c=ctx(device);if(!c||!ok(cudaSetDevice(device),"select head device"))return 0;
+    Dsv4CudaTensor *t=(Dsv4CudaTensor*)calloc(1,sizeof(*t));if(!t)return 0;
+    t->O=O;t->I=I;t->device=device;t->fmt=12;t->bytes=(long long)O*I*2;
+    // The head only consumes the packed copy: pack it through a staging buffer of at most
+    // 1024 rows instead of a second full row-major copy (deepseek_v4.c counts the same bytes).
+    const int chunk=O<1024?O:1024;void *stage=nullptr;
+    int good=alloc_ok(cudaMalloc(&t->w,(size_t)O*I*2),"head allocation");t->own_w=good;
+    good=good&&alloc_ok(cudaMalloc(&stage,(size_t)chunk*I*2),"head staging allocation");
+    // r is a multiple of 32, so rows r.. start their 32-row column groups at r*I in the packed layout.
+    for(int r=0;good&&r<O;r+=chunk){int n=O-r<chunk?O-r:chunk;
+        good=ok(cudaMemcpyAsync(stage,w+(size_t)r*I,(size_t)n*I*2,cudaMemcpyHostToDevice,c->stream),"head upload");
+        if(good){pack_bf16_rows32<<<((long long)n*I+255)/256,256,0,c->stream>>>((uint16_t*)t->w+(size_t)r*I,(const uint16_t*)stage,n,I);
+                 good=ok(cudaGetLastError(),"head packing launch");}
+    }
+    int drained=ok(cudaStreamSynchronize(c->stream),"head packing sync");
+    if(stage)cudaFree(stage);
+    if(!good||!drained){dsv4_cuda_tensor_free(t);return 0;}
     *pt=t;return 1;
 }
 __global__ void head_scores_exact(const __nv_bfloat16 *w,const float *x,float *out,int O,int I){
