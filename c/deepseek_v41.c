@@ -2857,6 +2857,16 @@ static void indexer_run(Model *m, int layer, const float *x, const float *qr, in
             candidate_row_ids(maskrow, c->candidate_block_size, compress_len, m->candidate_topk,
                               m->candidates + (size_t)t * m->candidate_topk);
         } else if (c->candidate_source >= 0 && c->candidate_source < layer && m->candidates) {
+            /* The ids carry no reach of their own: candidate_width is the source layer's, set
+             * from its compress_len on every row set and before any layer after it reads (so
+             * v41_unpark restores the ids and leaves the width). Reaching here without one
+             * would paint w = 0 and drop every position silently, so that order is checked,
+             * not assumed: it cannot hold with ids and a row to mask and no reach at all. */
+            if (compress_len > 0 && m->candidate_width <= 0) {
+                fprintf(stderr, "[v41] candidate blocks at layer %d with no source reach "
+                                "(candidate_width %d)\n", layer, m->candidate_width);
+                exit(1);
+            }
             int w = compress_len < m->candidate_width ? compress_len : m->candidate_width;
             if (!maskrow) maskrow = xmalloc((size_t)(compress_len > 0 ? compress_len : 1), "candidate row");
             candidate_keep_row(m->candidates + (size_t)t * m->candidate_topk, m->candidate_topk,
@@ -5475,8 +5485,9 @@ static void v41_unpark(Model *m) {
         m->shared_topk_rows = m->shared_topk ? g_v41_park_x.topk_rows : 0; m->shared_topk_width = m->shared_topk ? g_v41_park_x.topk_width : 0;
         free(m->candidates); m->candidates = g_v41_park_x.cand; g_v41_park_x.cand = NULL;
         m->candidate_topk = m->candidates ? g_v41_park_x.cand_topk : 0;
-        /* the width is not the ids' size any more: the source layer sets it from its own
-         * reach before any later layer reads, so a restored mask needs nothing here */
+        /* the width is not the ids' size any more, so it is not restored: the source layer
+         * sets it from its own reach before any later layer reads, and indexer_run's reader
+         * checks that it is there rather than assuming it */
         if (!m->candidates) m->candidate_width = 0;
         m->candidate_rows = m->candidates ? g_v41_park_x.cand_rows : 0;
 #ifdef COLI_VULKAN
