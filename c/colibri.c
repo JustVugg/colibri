@@ -14272,6 +14272,8 @@ int main(int argc, char **argv){
 #endif
 #ifdef __FreeBSD__
         fprintf(stderr,"[OMP] hot-thread tuning: re-exec once (COLI_NO_OMP_TUNE=1 to skip)\n");
+        /* the path from the kernel (omp_tune.h): /proc/curproc/file needs procfs mounted */
+        { char self[4096]; if(coli_self_exe_path(self,sizeof(self))) execv(self, argv); }
         execv("/proc/curproc/file", argv);         /* returns only on failure -> fall through and run untuned */
         perror("[OMP] execv self-reexec failed, running untuned");
 #endif
