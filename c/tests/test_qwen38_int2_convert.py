@@ -145,7 +145,11 @@ class Int2Convert(unittest.TestCase):
             want = (ids == 2).any(axis=1)
             np.testing.assert_array_equal(xe, x[want].astype(np.float64))
             np.testing.assert_allclose(ge, (gates * (ids == 2)).sum(axis=1)[want])
-            np.testing.assert_allclose(dump.layer_moment(0), x.astype(np.float64).T @ x / n, rtol=1e-12)
+            # atol for the entries that nearly cancel: layer_moment's x.T @ x is one array
+            # against itself (BLAS syrk), this one is two arrays (gemm), and the two round
+            # a sum near zero differently on some BLAS builds (3.8e-16 apart on FreeBSD's).
+            np.testing.assert_allclose(dump.layer_moment(0), x.astype(np.float64).T @ x / n,
+                                       rtol=1e-12, atol=1e-12)
             w3 = [(self.rng.standard_normal(shape) * 0.05).astype(np.float32) for shape in ((128, h), (128, h), (h, 128))]
 
             def out(ws, rows):
