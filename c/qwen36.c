@@ -4202,6 +4202,15 @@ static int gguf_report_unused(const Cfg *c) {
  * matrix of floats (F32, F16 or BF16, as the published files keep the router) as the CPU engine
  * holds it, in F32; the routed experts in the six types. A tensor that is not there, or of another
  * shape, is the loader's to report. */
+/* The model's own file carries the MTP head (mtp.*) or the vision tower and projector (v.*, mm.*):
+ * Ollama's files do, the files the graph was measured on (unsloth's) do not. */
+static int qwen_gguf_carries_heads(void) {
+    for (int k = 0; k < g_gg.n_tensors; k++) {
+        const char *n = g_gg.t[k].name;
+        if (!strncmp(n, "mtp.", 4) || !strncmp(n, "v.", 2) || !strncmp(n, "mm.", 3)) return 1;
+    }
+    return 0;
+}
 static const char *qwen_gguf_graph_off(const Cfg *c, char *text, size_t cap) {
     static const char *const attn[] = {"attn_q", "attn_k", "attn_v", "attn_output"};
     static const char *const delta[] = {"attn_qkv", "attn_gate", "ssm_out"};
@@ -4270,6 +4279,9 @@ static int qwen_graph_eligible(Model *m) {
              c->hidden % 64 || c->inter % 64)
         why = "a geometry outside the graph's kernels (top-k<=8, experts<=256, head_dim<=256, DeltaNet key "
               "dim<=128, hidden and expert sizes multiples of 64)";
+    else if (c->lfm3) why = "LFM3 (its convolution layers are the CPU engine's)";
+    else if (g_gguf && qwen_gguf_carries_heads())
+        why = "a GGUF with its MTP head or vision tower in the model's file (Ollama's), which the graph has not been run on";
     else if (g_tok_exact)   /* main sets it before model_init exactly when the snapshot has a Clef head */
         why = "a Clef decision head (DECIDE reads every position's hidden state, the graph returns the last one)";
     else if (g_gguf) why = qwen_gguf_graph_off(c, gguf, sizeof gguf);
@@ -8364,6 +8376,7 @@ static void q36_park_copy(const Cfg *c, void *kv, int rows, void *copy, int r, i
 }
 static int q36_park_rows(const Model *m, int i, int n) { int R = q36_kv_rows(m, i); return n < R ? n : R; }
 static void q36_park(Model *m, int np, int max_tok) {
+    if (QWEN_GRAPH(m)) return;   /* the copies are the CPU engine's state; the graph's is on the GPU */
     const char *e = getenv("COLI_PARK"), *mn = getenv("COLI_PARK_MIN");
     const int H = m->kvp.len, gen = max_tok < Q36_PARK_GEN ? max_tok : Q36_PARK_GEN,
               least = mn && atoi(mn) > 0 ? atoi(mn) : Q36_PARK_MIN, n = np + gen + Q36_PARK_SPEC;
@@ -8504,7 +8517,8 @@ static ColiPrefixStore g_q36_ps;
 static int g_q36_ps_init;
 static int q36_ps_on(const Model *m) {
     if (!g_q36_ps_init) { g_q36_ps_init = 1; coli_ps_init_env(&g_q36_ps, kv_prefix_off(), compat_mem_available_gb() * 1024.0); }
-    return g_q36_ps.on && !g_q36_mtp.on && !m->vis_rows_n && !m->mpos && !m->rope_delta;
+    /* the graph keeps its state on the GPU: the store's copies are the CPU engine's (QWEN_GRAPH) */
+    return g_q36_ps.on && !g_q36_mtp.on && !m->vis_rows_n && !m->mpos && !m->rope_delta && !QWEN_GRAPH(m);
 }
 /* the store's budget, decided when the engine plans its RAM: a tier's host pool leaves it (ram_later) */
 static size_t q36_ps_plan(const Model *m) { q36_ps_on(m); return g_q36_ps.on ? g_q36_ps.budget : 0; }
@@ -8665,6 +8679,7 @@ static int q36_pes_on(void) {
 static int g_q36_pes_due;   /* the prompt's length whose state is still to copy, 0 none */
 static void q36_pes_take(Model *m, const int *ids, int np, const float *logit) {
     g_q36_pes_due = 0;
+    if (QWEN_GRAPH(m)) return;   /* a copy of the CPU engine's state: the graph has its own snapshot */
     if (!q36_pes_on() || !logit || np < 1 || m->kvp.tainted || g_q36_park.on || m->kv_len != np) return;
     if (g_q36_pes.len == np && !memcmp(g_q36_pes.ids, ids, (size_t)np * sizeof(int))) return;   /* the snapshot that served it */
     g_q36_pes.len = 0;
@@ -8713,6 +8728,7 @@ static void q36_pes_put(Model *m, int n) {
 static int q36_pes_restore(Model *m, const int *ids, int np, const float **logit) {
     const int n = g_q36_pes.len;
     *logit = NULL;
+    if (QWEN_GRAPH(m)) return 0;
     if (!q36_pes_on() || n < 1 || n > np || !g_q36_pes.st ||
         memcmp(g_q36_pes.ids, ids, (size_t)n * sizeof(int)) != 0) return 0;
     if (!kv_prefix_holds(&m->kvp, g_q36_pes.ids, n) ||
@@ -8729,6 +8745,7 @@ static int q36_pes_restore(Model *m, const int *ids, int np, const float **logit
  * wrote them in. */
 static int q36_pes_after_abort(Model *m, int pos_base, int S) {
     const int n = g_q36_pes.len;
+    if (QWEN_GRAPH(m)) return 0;
     if (!q36_pes_on() || n < 1 || n > pos_base || !g_q36_pes.st ||
         !kv_prefix_holds(&m->kvp, g_q36_pes.ids, n)) return 0;
     if (m->ring_pos && m->kv_ring)
@@ -9847,7 +9864,7 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
      * follows the shared positions. A read-out asks a frame for every position, so it
      * reads the whole prompt. */
     int rewind = 0;
-    if (!reuse && !kv_prefix_off() && q->logprobs == 0 && q36_attention_only(m))
+    if (!reuse && !kv_prefix_off() && q->logprobs == 0 && q36_attention_only(m) && !QWEN_GRAPH(m))
         rewind = kv_prefix_common(&m->kvp, ids, np);
     if (getenv("COLI_PREFIX_LOG")) {
         if (reuse)
