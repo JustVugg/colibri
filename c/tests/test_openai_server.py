@@ -2964,6 +2964,10 @@ class CapSentinelShimTest(unittest.TestCase):
             "qwen38", None, {"COLI_PLAN_CAP": "11", "COLI_PROFILE_CAP": "7"}), 7)
         self.assertEqual(cap_for_arch(
             "qwen38", 5, {"COLI_PLAN_CAP": "11", "COLI_PROFILE_CAP": "7"}), 5)
+        # #2785: OLMoE sizes its own cache from the plan's RAM_GB
+        self.assertEqual(cap_for_arch("olmoe", None, planned), 0)
+        self.assertEqual(cap_for_arch(
+            "olmoe", None, {"COLI_PLAN_CAP": "11", "COLI_PROFILE_CAP": "7"}), 7)
 
     def test_engine_consumes_profile_cap_without_leaking_private_env(self):
         process = FakeProcess(lambda _process, _frame: None)

@@ -3557,7 +3557,11 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     # normalized FP8 scale bank), unlike per_cap_bytes which is paid for
     # every cache slot. Include it in the resident runtime reservation so the
     # selected capacity cannot overrun the model's actual allocation.
-    runtime_bytes = int(1.2 * GB + 2.5 * GB + 64 * max_expert +
+    # The base is colibri.c's slack (expert_avail: 1.2 + 2.5 GB and 64 experts in
+    # flight). olmoe.c sets aside 0.5 GB of activations beside its resident dense
+    # (model_init_range, #2785).
+    base_reserve = 0.5 * GB if family_id == "olmoe" else 1.2 * GB + 2.5 * GB + 64 * max_expert
+    runtime_bytes = int(base_reserve +
                         info["expert_fixed_bytes"] + kv_bytes + kv_buffer + shared_dense_bytes)
     per_cap = info["per_cap_bytes"]
     configured_experts = geometry.configured_experts

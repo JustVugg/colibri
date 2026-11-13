@@ -534,6 +534,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   shows how its pages split, so this is unconfirmed. #2785's 0-slot plan came mostly from the
   planner's OLMoE runtime reserve, a separate fix. The compressor is still not modeled. Checked on
   one Mac (macOS 15.6), not yet on the reporters' machines.
+- **`--auto-tier` gave OLMoE a smaller expert cache than OLMoE picks by itself** (#2785). Once
+  the plan had a slot, `coli serve`, `chat` and `web` passed the plan's cap to olmoe, which then
+  no longer sized its cache from `RAM_GB` or gave slots back as the KV grew. The plan also set
+  aside colibri.c's runtime reserve (1.2 + 2.5 GB and 64 experts) where olmoe.c sets aside 0.5 GB,
+  so that cap came out 34-36 slots per layer lower than with olmoe's reserve on OLMoE-1B-7B, and
+  the KV's worth lower again. The gateway now hands OLMoE the plan's `RAM_GB` only, and olmoe sizes
+  the cache itself. The plan reserves olmoe.c's 0.5 GB and still the KV of the planned context:
+  `coli plan` and `coli doctor` show, and `coli tune` starts from, the cache olmoe keeps at a full
+  context, which is the KV's worth of slots below the size it starts with.
 - **CUDA on Windows: the answer stopped a few tokens in with the card at 100%** (#2696). Windows'
   WDDM driver model, which WSL2 drives the card through too, holds CUDA launches back and sends
   them in batches. A hybrid step (a layer whose experts are partly in RAM) has the card signal the
