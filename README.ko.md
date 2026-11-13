@@ -230,7 +230,7 @@ Mixture-of-Experts 모델은 디스크에서는 용량이 크지만 토큰당 �
 
 모든 MoE 엔진은 Vulkan 1.2 드라이버가 있는 모든 GPU(AMD, Intel, NVIDIA, 내장 또는 디스크리트)를 두 가지 방식으로 사용할 수 있습니다.
 
-- **엑스퍼트 티어**: GPU 메모리의 라우팅되는 엑스퍼트의 캐시. 시작할 때 과거 대화에서 쓴 엑스퍼트로 채우고 대화하면서 적응합니다. GPU가 자신이 가진 엑스퍼트를 계산하는 동안 CPU가 나머지를 계산합니다.
+- **엑스퍼트 티어**: GPU 메모리 안의 라우팅 엑스퍼트 캐시. 시작할 때 과거 대화에서 쓴 엑스퍼트로 채우고 대화하면서 적응합니다. GPU가 자신이 가진 엑스퍼트를 계산하는 동안 CPU가 나머지를 계산합니다.
 - **dense 체인**: 레이어들 전체의 연산을 GPU에 한 번으로 기록하고, 모델의 진행 상태를 레이어에서 레이어로 넘길 때도 GPU에 그대로 둡니다.
 
 컴퓨터 A의 내장 Radeon 780M에서 측정(매 실행 전 페이지 캐시에서 모델 파일을 비우고 100 토큰 디코드, [vulkan.md](docs/vulkan.md#the-chain-on-a-radeon-780m)):
@@ -245,7 +245,7 @@ Mixture-of-Experts 모델은 디스크에서는 용량이 크지만 토큰당 �
 
 내장 GPU는 CPU의 RAM을 공유합니다. 절약하는 것은 자신이 가진 엑스퍼트의 연산과 디스크 읽기이므로 Qwen3.6 같은 모델에서는 이득이지만, OLMoE처럼 엑스퍼트가 이미 RAM에 있는 작은 모델에서는 손해 볼 수 있습니다. 그래서 셋업이 내장 GPU에는 Qwen3.6, Qwen3-Coder, Qwen3.8-Flash-Next에만 Vulkan을 켜고, 각 엔진이 dense 체인을 거기서 돌릴지 스스로 결정하는 것입니다(Qwen3.6은 예, Qwen3.8은 아니오). 그래도 Vulkan을 쓰려면 `--backend vulkan`입니다.
 
-**GPU 켜기와 끄기.** `coli setup --backend vulkan`은 모든 모델에 GPU를 쓰도록 하고, `coli setup --backend cpu`(또는 `--no-gpu`)는 전부 CPU에 둡니다. Vulkan으로 빌드된 엔진은 `coli chat`, `serve`, `web`을 실행하는 환경에 `COLI_VULKAN=1`이 있을 때만 GPU를 씁니다(셋업이 Vulkan을 선택했다면 자동으로 켭니다). 없으면 엔진은 CPU에서 돕니다. GPU를 켠 상태에서 `COLI_VK_CHAIN=0`을 지정하면 엑스퍼트 티어는 유지하면서 dense 레이어를 CPU에서 돌립니다. 내장 GPU에서는 둘 다 시험해보세요: Intel Iris Xe(Core i7-1355U) 노트북에서 Qwen3.6은 CPU에서 2.1 tok/s, Vulkan에서 1.7-1.9, dense 체인을 끄면 2.1이었습니다.
+**GPU 켜기와 끄기.** `coli setup --backend vulkan`은 모든 모델에 GPU를 쓰도록 하고, `coli setup --backend cpu`(또는 `--no-gpu`)는 전부 CPU에 둡니다. Vulkan으로 빌드된 엔진은 `coli chat`, `serve`, `web`을 실행하는 환경에 `COLI_VULKAN=1`이 있을 때만 GPU를 씁니다(셋업이 Vulkan을 선택했다면 자동으로 켭니다). 없으면 엔진은 CPU에서 돌립니다. GPU를 켠 상태에서 `COLI_VK_CHAIN=0`을 지정하면 엑스퍼트 티어는 유지하면서 dense 레이어를 CPU에서 돌립니다. 내장 GPU에서는 둘 다 시험해보세요: Intel Iris Xe(Core i7-1355U) 노트북에서 Qwen3.6은 CPU에서 2.1 tok/s, Vulkan에서 1.7-1.9, dense 체인을 끄면 2.1이었습니다.
 
 디스크리트 GPU에서는 셋업이 모든 엔진을 Vulkan으로 빌드합니다(엔진에 CUDA 경로가 있고 툴킷이 있으면 CUDA 우선), dense 레이어는 카드에 둡니다. 이것이 이 설계가 겨냥하고 있는 경우입니다. RTX PRO 4000(24 GB, 컴퓨터 D)에서 Qwen3.6-35B-A3B는 92.9 tok/s로 디코드하고 프롬프트는 초당 2,076 토큰으로 읽으며, OLMoE는 각각 299.4 tok/s와 6,867 tok/s 입니다([표](#three-backends-on-one-machine)). 카드보다 큰 모델은 카드에 들어가지 않는 엑스퍼트를 RAM의 호스트 풀에 두고, 매 스텝 카드가 자기 몫을 계산하는 동안 CPU가 그것들을 같은 프레임 안에서 계산합니다. Qwen3.8-Flash-Next IQ2_XS(68 GB)가 같은 방식으로 50.6 tok/s로 디코드합니다([vulkan.md](docs/vulkan.md#the-routed-experts-in-the-frame-vk_dmoeh)). 한 사용자가 Tesla V100 16 GB에서 Qwen3.6을 17-19 tok/s로 측정한 결과를 공유했습니다([#1852](https://github.com/JustVugg/colibri/issues/1852)). 여러분의 측정 수치도 환영합니다.
 
@@ -264,11 +264,11 @@ CI는 소프트웨어 드라이버 위에서 모든 엔진의 Vulkan 경로를 C
 - **Qwen3.6의 DeltaNet 레이어를 카드에서**(`Q36_DN_GPU=1`, 옵트인). Qwen3.6의 30개 DeltaNet 레이어는 토큰마다 데이터를 카드와 CPU 사이에 4번 복사했는데, 이제 디코드 토큰이 레이어 전체를 카드에서 실행하고 리커런트 상태는 VRAM에 둡니다. dense 레이어가 VRAM에 있는 RTX 3070에서: 25.4에서 30.0 tok/s([qwen36-cuda-tier.md](docs/qwen36-cuda-tier.md#the-deltanet-layer-on-the-card-q36_dn_gpu1)).
 - **오래된 카드.** CUDA 툴킷이 더 이상 여러분 카드를 컴파일하지 못하면([#1852](https://github.com/JustVugg/colibri/issues/1852)의 CUDA 13과 V100) 셋업이 빌드 전에 알아채고 이유를 알리며 Vulkan으로 카드를 씁니다. CUDA 12.x 툴킷은 CUDA 경로를 되살립니다. DeepSeek V4의 CUDA 티어는 Pascal과 Turing도 빌드됩니다(`CUDA_ARCH=portable-pre-ampere NO_TC=1`).
 
-이 내용에 대한 모든 것 : [docs/cuda.md](docs/cuda.md).
+이 내용에 대한 모든 것: [docs/cuda.md](docs/cuda.md).
 
 ### Apple Silicon
 
-Metal 백엔드가 여러 엔진의 유니파이드 메모리 GPU에서 엑스퍼트 연산을 합니다([docs/metal.md](docs/metal.md)). 릴리스의 macOS 아카이브에는 `colibri`, `inkling`, `kimi_k3`가 그렇게 빌드돼 있습니다. `COLI_METAL=1`(Kimi K3는 `K3_METAL=1`)이 켜고, 없으면 CPU에서 돕니다. 소스에서는 `METAL=1`로 빌드하세요. 한 단계 셋업은 CPU용으로 빌드합니다.
+Metal 백엔드가 여러 엔진의 유니파이드 메모리 GPU에서 엑스퍼트 연산을 합니다([docs/metal.md](docs/metal.md)). 릴리스의 macOS 아카이브에는 `colibri`, `inkling`, `kimi_k3`가 그렇게 빌드돼 있습니다. `COLI_METAL=1`(Kimi K3는 `K3_METAL=1`)로 켭니다. 없으면 CPU에서 돌립니다. 소스에서는 `METAL=1`로 빌드하세요. 한 단계 셋업은 CPU용으로 빌드합니다.
 
 <a id="system-one-mode-ask-a-closed-question"></a>
 <a id="system-one-a-decision-with-a-probability"></a>
@@ -318,12 +318,12 @@ curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -
 <p align="center">
   <img src="docs/media/ui/ui-experts.png" width="900" alt="엑스퍼트 맵이 열린 채팅: OLMoE 16개 블록 각각의 엑스퍼트마다 셀 하나">
 </p>
-<p align="center"><em>채팅 옆에 <strong>엑스퍼트 맵</strong>을 연 OLMoE: 블록마다 엑스퍼트 하나씩 셀 하나, 이번 스텝에 선택된 건 흰색, 이 답변에서 쓰인 건 호박색.</em></p>
+<p align="center"><em>채팅 옆에 <strong>엑스퍼트 맵</strong>을 연 OLMoE: 블록마다 엑스퍼트 하나당 하나의 셀, 이번 스텝에 선택된 건 흰색, 이 답변에서 쓰인 건 호박색.</em></p>
 
 <p align="center">
   <img src="docs/media/ui/ui-systemone.png" width="900" alt="System One 페이지: 한 번 읽은 풀 리퀘스트, 허용된 답마다 확률, 그리고 모델이 얼마나 확신하는지">
 </p>
-<p align="center"><em><strong>System One</strong>: 모델에 문서와 고를 수 있는 답만 줍니다. 여기서 RTX PRO 4000의 Qwen3.6-35B는 캐시 크기 제한을 깨는 풀 리퀘스트를 읽고 있습니. <strong>request changes 81%</strong>, 엔트로피 0.56(불확실), 읽은 토큰 98, 생성된 토큰 0.</em></p>
+<p align="center"><em><strong>System One</strong>: 모델에 문서와 고를 수 있는 답만 줍니다. 여기서 RTX PRO 4000의 Qwen3.6-35B는 캐시 크기 제한을 깨는 풀 리퀘스트를 읽고 있습니다. <strong>request changes 81%</strong>, 엔트로피 0.56(불확실), 읽은 토큰 98, 생성된 토큰 0.</em></p>
 
 **Profiling** 페이지는 각 턴이 어디에 시간을 쓰는지 단계별로 보여주고, 최근 30 턴을 추세로 보여줍니다.
 
@@ -363,7 +363,7 @@ curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -
 - **충실한 모델.** 모든 엔진은 작은 픽스처에서 모델의 레퍼런스 구현과 비교해 CI로 검증됩니다. GLM-5.2의 MLA 어텐션은 압축된 KV 상태(토큰당 32,768이 아닌 576개의 float, 57배 작음)를 유지하는데 이것이 재시작을 거쳐도 살아남아서, 대화를 다시 열 때 프롬프트를 다시 읽을 필요가 없습니다.
 - **가치를 입증하는 추측.** GLM-5.2의 int8 MTP 헤드는 이득일 때 포워드당 2.2-2.8 토큰의 초안을 제안합니다. 기본으로 켜진 Qwen3.8-Flash-Next의 MTP 헤드는 같은 출력에 16-20%를, 코드 편집의 프롬프트 룩업은 6-7%를 더합니다. Qwen3.6의 헤드(`Q36_MTP=1`)는 디코드를 CUDA에서 99.7-104.5에서 115.8-120.1 tok/s로, Vulkan에서 83.2-83.8에서 99.9-109.3으로 올립니다(RTX PRO 4000). DeepSeek V4.1의 DSpark 헤드는 자신감만큼 깊게 초안하고, 게이트가 이득 없는 초안을 건너뜁니다. 초안이 아끼는 것보다 비용이 큰 곳(DeepSeek V4)에서는 꺼져 있습니다([speculative.md](docs/speculative.md), [tuning.md](docs/tuning.md#speculation-and-reproducibility)).
 
-엔진은 모델 계열마다 C 파일 하나(GLM-5.2는 `c/colibri.c`)에 공유 헤더 위에 구성되고, BLAS도 런타임 Python도 없습니. Python은 설정, 런처, 변환기, API 게이트웨이만 돌립니다.
+엔진은 모델 계열마다 C 파일 하나(GLM-5.2는 `c/colibri.c`)에 공유 헤더 위에 구성되고, BLAS도 런타임 Python도 없습니다. Python은 설정, 런처, 변환기, API 게이트웨이만 돌립니다.
 
 <a id="what-it-achieves"></a>
 <a id="benchmarks"></a>
