@@ -3261,7 +3261,15 @@ static void *map_of_fd(int fd){
 #endif
         }
     }
+#elif defined(_WIN32)
+    /* the whole shard as one read-only view, kept for the life of the process like the mmap above */
+    struct stat st; compat_ro_map wm; const void *wp;
+    if(g_nmaps<512 && fstat(fd,&st)==0 && compat_map_readonly(fd,0,(size_t)st.st_size,&wm,&wp)==0){
+        base=(void*)wp; g_maps[g_nmaps].fd=fd; g_maps[g_nmaps].base=base; g_maps[g_nmaps].len=wm.len; g_nmaps++;
+    }
 #endif
+    if(!base){ static int warned;      /* under g_map_mtx: one line per process */
+        if(!warned){ warned=1; fprintf(stderr,"[MMAP] a model shard could not be mapped: TRUNK_RESIDENT_LAYERS / COLI_MMAP read its weights into RAM instead\n"); } }
     pthread_mutex_unlock(&g_map_mtx);
     return base;
 }
@@ -13343,8 +13351,8 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
 
 static double g_mem_avail_boot=0;   /* MemAvailable all'avvio, prima di caricare il modello */
 /* RAM disponibile ADESSO (GB): e' il tetto vero, non il totale. Linux: MemAvailable
- * da /proc/meminfo. macOS: pagine free+inactive+purgeable da host_statistics64
- * (stessa semantica: recuperabili senza swap). Senza questo ramo il fallback
+ * da /proc/meminfo. macOS: pagine free+file-backed+purgeable da host_statistics64
+ * (recuperabili senza comprimere ne' swappare, compat_meminfo_gb). Senza questo ramo il fallback
  * "assumo 8 GB" castrava la cache expert proprio sulle macchine con piu' RAM. */
 static double mem_available_gb(void){
     /* Era la sola copia giusta di questa misura; glm53.c ne aveva una che

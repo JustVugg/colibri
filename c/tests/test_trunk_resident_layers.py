@@ -156,6 +156,30 @@ class TrunkResidentLayersTest(unittest.TestCase):
             f"`resident dense` did not drop ({rb} -> {ro} MB): the trunk pages "
             f"were not actually handed to mmap (knob set but no effect)")
 
+    def test_trunk_and_experts_mapped_keep_tokens(self):
+        """TRUNK_RESIDENT_LAYERS=0 COLI_MMAP=1, the low-RAM combination the docs
+        give (#1764): the routed experts become views of the same mapping as the
+        trunk, so the tokens must still be the resident baseline's.
+
+        The experts must really be views. PROF=1 prints a `[PROF] DISK-CLASS`
+        line only when the expert loader read some expert with pread into a
+        slab, which a mapped expert never does: the baseline must print it and
+        the mapped run must not. Before map_of_fd mapped on Windows, both knobs
+        fell back to copies there without a word."""
+        base_t, base_p = self._run(PROF="1")
+        map_t, map_p = self._run(PROF="1", TRUNK_RESIDENT_LAYERS="0", COLI_MMAP="1")
+        for name, t in (("baseline", base_t), ("mapped", map_t)):
+            self.assertEqual(t["returncode"], 0,
+                             f"{name} exited non-zero:\n{t.get('stderr', '')}")
+        self.assertEqual(self._ids(base_p), self._ids(map_p),
+                         "COLI_MMAP=1 with the trunk mapped changed the decoded tokens")
+        base_out = (base_p.stdout or "") + (base_p.stderr or "")
+        map_out = (map_p.stdout or "") + (map_p.stderr or "")
+        self.assertIn("[PROF] DISK-CLASS", base_out,
+                      "the baseline read no expert with pread: the check below would be vacuous")
+        self.assertNotIn("[PROF] DISK-CLASS", map_out,
+                         "COLI_MMAP=1 still read experts with pread: the experts were not mapped")
+
     def test_unset_and_above_nlayers_are_noops(self):
         """Unset and >= n_layers both change nothing (condition 1 of the review).
 

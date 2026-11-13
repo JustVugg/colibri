@@ -15,6 +15,7 @@ from resource_plan import (
     analyze_model,
     build_plan,
     cpu_socket_count,
+    darwin_available_bytes,
     discover_gpus,
     environment_for_plan,
     format_plan,
@@ -73,6 +74,26 @@ def write_shard(path, tensors, f32_fill=None):
                     stream.seek(base + start)
                     stream.write(f32_fill * ((end - start) // 4))
         stream.truncate(base + offset)
+
+
+def write_gguf(path, tensors, arch, blocks):
+    """A GGUF v3 file as tools/gguf_reader.py reads it: (name, ggml type, dims in ggml
+    order) tensors of type 0 (F32) or 8 (Q8_0), the payload extended as write_shard's."""
+    def text(value):
+        return struct.pack("<Q", len(value.encode())) + value.encode()
+    out = b"GGUF" + struct.pack("<IQQ", 3, len(tensors), 2)
+    out += text("general.architecture") + struct.pack("<I", 8) + text(arch)
+    out += text(f"{arch}.block_count") + struct.pack("<II", 4, blocks)
+    offset = 0
+    for name, kind, dims in tensors:
+        count = 1
+        for dim in dims:
+            count *= dim
+        out += text(name) + struct.pack(f"<I{len(dims)}QIQ", len(dims), *dims, kind, offset)
+        offset += -(-(count * 4 if kind == 0 else count // 32 * 34) // 32) * 32
+    with path.open("wb") as stream:
+        stream.write(out)
+        stream.truncate(-(-len(out) // 32) * 32 + offset)
 
 
 class ShardFixtureTest(unittest.TestCase):
@@ -662,6 +683,60 @@ class ResourcePlanTest(unittest.TestCase):
             # layers=2, ctx=32, heads=4, head_dim=32//4=8, K and V, fp32:
             self.assertEqual(ram["sequence_state_bytes"], 2 * 32 * 4 * 8 * 2 * 4)
             self.assertEqual(ram["fixed_state_bytes"], 0)
+
+    def test_olmoe_plans_the_cache_olmoe_sizes_itself(self):
+        # #2785: the plan reserves what olmoe.c reserves (model_init_range): 0.5 GB of
+        # activations beside the resident dense, not colibri.c's 1.2 + 2.5 GB and 64
+        # experts. The KV of the planned context stays on top: the engine's own cache
+        # gives that back as the KV grows (kv_room_fit). OLMoE-1B-7B's geometry, as
+        # convert_olmoe_merged.py writes it (int8, one expert per layer, the BF16
+        # embedding for the dense) and as `coli import` links a Q8_0 GGUF (two experts
+        # per layer, every dense tensor).
+        hidden, inter, layers, experts, vocab = 2048, 1024, 16, 64, 50304
+        config = json.dumps({
+            "model_type": "olmoe", "num_hidden_layers": layers, "hidden_size": hidden,
+            "num_attention_heads": 16, "num_key_value_heads": 16, "num_experts": experts,
+            "num_experts_per_tok": 8, "intermediate_size": inter, "vocab_size": vocab})
+        merged, gguf = self.model / "merged", self.model / "gguf"
+        for folder in (merged, gguf):
+            folder.mkdir()
+            (folder / "config.json").write_text(config)
+        tensors = [("model.embed_tokens.weight", vocab * hidden * 2, "BF16", [vocab, hidden])]
+        for i in range(layers):
+            p = f"model.layers.{i}.mlp.experts.0."
+            tensors += [(p + "merged_weight", 3 * inter * hidden, "I8", [3 * inter * hidden]),
+                        (p + "qs", (2 * inter + hidden) * 4, "F32", [2 * inter + hidden])]
+        write_shard(merged / "model.safetensors", tensors)
+        q8, f32 = 8, 0
+        tensors = [("token_embd.weight", q8, [hidden, vocab]), ("output.weight", q8, [hidden, vocab]),
+                   ("output_norm.weight", f32, [hidden])]
+        for i in range(layers):
+            tensors += [(f"blk.{i}.{name}.weight", q8, [hidden, hidden])
+                        for name in ("attn_q", "attn_k", "attn_v", "attn_output")]
+            tensors += [(f"blk.{i}.{name}.weight", f32, [hidden])
+                        for name in ("attn_norm", "attn_q_norm", "attn_k_norm", "ffn_norm")]
+            tensors += [(f"blk.{i}.ffn_gate_inp.weight", f32, [hidden, experts]),
+                        (f"blk.{i}.ffn_gate_exps.weight", q8, [hidden, inter, 2]),
+                        (f"blk.{i}.ffn_up_exps.weight", q8, [hidden, inter, 2]),
+                        (f"blk.{i}.ffn_down_exps.weight", q8, [inter, hidden, 2])]
+        write_gguf(gguf / "olmoe.gguf", tensors, arch="olmoe", blocks=layers)
+        (gguf / "gguf.json").write_text(json.dumps({"gguf": "olmoe.gguf"}))
+        slot = {merged: hidden * inter * 3 + (inter * 2 + hidden) * 4,   # olmoe.c slot_bytes()
+                gguf: 3 * hidden * inter // 32 * 34}                      # Q8_0 blocks
+        # what _discover_metal_gpus reports for an M1 Pro: no placement budget
+        metal = [{"index": 0, "name": "Apple M1 Pro", "total_bytes": 0, "free_bytes": None,
+                  "unified_memory": True, "backend": "metal"}]
+        for model, ram_gb, available, planned in ((merged, 0, 8 * GB, 52), (merged, 0, 11 * GB, 64),
+                                                  (gguf, 8, 8 * GB, 55), (gguf, 0, 8 * GB, 46)):
+            with self.subTest(model=model.name, ram_gb=ram_gb, available=available):
+                plan = build_plan(model, ram_gb=ram_gb, context=4096, available_memory=available,
+                                  available_disk=1, gpus=metal, physical_cpus=8,
+                                  cpu_sockets=1, env={})
+                ram = plan["tiers"]["ram"]
+                room = ram["budget_bytes"] - ram["dense_bytes"] - GB // 2 - ram["sequence_state_bytes"]
+                self.assertEqual(ram["cache_slots_per_layer"],
+                                 min(experts, room // (slot[model] * layers)))
+                self.assertEqual(ram["cache_slots_per_layer"], planned)
 
     def test_glm_dsa_state_is_charged_only_when_every_indexer_weight_exists(self):
         config = json.loads((self.model / "config.json").read_text())
@@ -3215,3 +3290,109 @@ class WindowsCommitLimitTest(unittest.TestCase):
             "dwLength", "dwMemoryLoad", "ullTotalPhys", "ullAvailPhys",
             "ullTotalPageFile", "ullAvailPageFile", "ullTotalVirtual",
             "ullAvailVirtual", "ullAvailExtendedVirtual"])
+
+
+def vm_stat_output(free, active, inactive, speculative, wired, purgeable, file_backed,
+                   compressor, anonymous=0, page=16384):
+    """vm_stat's output, in its order and its format (printf "%-30s %16llu.").
+    Pages free is free_count - speculative_count, File-backed pages is
+    external_page_count; no identity ties them to the queues (whether the
+    external count holds the speculative pages depends on the macOS version)."""
+    rows = (("Pages free", free), ("Pages active", active), ("Pages inactive", inactive),
+            ("Pages speculative", speculative), ("Pages throttled", 0),
+            ("Pages wired down", wired), ("Pages purgeable", purgeable),
+            ('"Translation faults"', 412345678), ("Pages copy-on-write", 15071823),
+            ("Pages zero filled", 165834917), ("Pages reactivated", 4196520),
+            ("Pages purged", 2289932), ("File-backed pages", file_backed),
+            ("Anonymous pages", anonymous), ("Pages stored in compressor", 3 * compressor),
+            ("Pages occupied by compressor", compressor), ("Decompressions", 2973697),
+            ("Compressions", 4876563), ("Pageins", 5524149), ("Pageouts", 98286),
+            ("Swapins", 0), ("Swapouts", 0))
+    return (f"Mach Virtual Memory Statistics: (page size of {page} bytes)\n" +
+            "".join(f"{name + ':':<30} {count:>16}.\n" for name, count in rows))
+
+
+# Synthetic fixtures: neither report posted vm_stat. From #2785: a 16 GB M1 Pro
+# (2^20 pages of 16 KiB), and a dev figure (5.5 GB, a 4.84 GB budget) inside the
+# 4.6-6.3 GB budget its `coli plan` saw. The rest is ours, chosen to show the
+# mechanism: right after a run, 7 GB of the model's file pages are still in the
+# active queue.
+MAC16_AFTER_RUN = vm_stat_output(free=40000, active=577576, inactive=276000, speculative=15000,
+                                 wired=110000, purgeable=5000, file_backed=626387,
+                                 compressor=30000, anonymous=242189)
+# The same synthetic Mac minutes later: 400000 of those pages have aged into the
+# inactive queue.
+MAC16_AGED = vm_stat_output(free=40000, active=177576, inactive=676000, speculative=15000,
+                            wired=110000, purgeable=5000, file_backed=626387, compressor=30000,
+                            anonymous=242189)
+# From #1614 run 1: 48 GB, browsers open, 8.3 GiB in the compressor, free +
+# inactive 32.5 GiB. The free/file-backed split is ours (the report has none):
+# here most of the inactive queue is anonymous. Were it file-backed, the new
+# figure would stay near 32 GiB.
+MAC48_DIRTY = vm_stat_output(free=300000, active=271728, inactive=1830000, speculative=20000,
+                             wired=180000, purgeable=10000, file_backed=450000,
+                             compressor=544000, anonymous=1671728)
+# Measured by a reviewer on a Mac mini M4, macOS 15.6. Pages free (36277 against
+# free_count - speculative_count 36233), File-backed pages (225055 against
+# external_page_count 224891: not external + speculative, 248700), Anonymous
+# pages and the active + inactive + speculative total (325300) are vm_stat's;
+# speculative 23809, inactive, active and purgeable 2 are derived from the
+# reported host_statistics64 figures; wired and the compressor are ours, unread.
+# The C rule on the raw counters gave 4278288384 bytes, 0.08% below this text.
+MAC_M4_15_6 = vm_stat_output(free=36277, active=36487, inactive=265004, speculative=23809,
+                             wired=150000, purgeable=2, file_backed=225055,
+                             compressor=200000, anonymous=353884)
+
+
+class DarwinAvailableMemoryTest(unittest.TestCase):
+    """#2785, #1614: on macOS what can be planned is Pages free + File-backed
+    pages + Pages purgeable. The inactive queue mixes file pages, which macOS
+    can drop, with anonymous pages, which it can only compress or swap."""
+
+    def available(self, vm_stat):
+        """memory_available() on a Mac: no /proc/meminfo, vm_stat's output."""
+        result = subprocess.CompletedProcess(args=["vm_stat"], returncode=0,
+                                             stdout=vm_stat, stderr="")
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(sys, "platform", "darwin"), \
+             mock.patch("resource_plan.subprocess.run", return_value=result) as run:
+            available = memory_available(meminfo_path=Path(tmp) / "meminfo")
+        self.assertEqual(run.call_args.args[0], ["vm_stat"])
+        return available
+
+    def test_free_file_backed_and_purgeable_pages(self):
+        self.assertEqual(darwin_available_bytes(MAC16_AFTER_RUN), (40000 + 626387 + 5000) * 16384)
+        self.assertEqual(darwin_available_bytes(MAC48_DIRTY), (300000 + 450000 + 10000) * 16384)
+        # an Intel Mac's 4 KiB pages; no vm_stat output is no measurement
+        self.assertEqual(darwin_available_bytes(vm_stat_output(1, 0, 0, 0, 0, 0, 0, 0, page=4096)),
+                         4096)
+        self.assertIsNone(darwin_available_bytes(""))
+
+    def test_a_model_cache_still_active_is_available(self):
+        # dev's free + inactive + speculative + purgeable reads 5.5 GB here, a
+        # budget in the range #2785's `coli plan` saw. Its 0 slots came mostly
+        # from the planner's runtime reserve; this fixture shows the active file
+        # pages the old sum leaves out (our assumption, not measured on that Mac)
+        self.assertEqual(self.available(MAC16_AFTER_RUN), 671387 * 16384)   # 11.0 GB
+
+    def test_pages_aging_into_inactive_do_not_move_it(self):
+        # the old sum goes from 5.5 to 12.1 GB as the pages age: our hypothesis
+        # for #2785's automatic OLMoE cache of 42, 60 and 64 slots within minutes
+        self.assertEqual(self.available(MAC16_AGED), self.available(MAC16_AFTER_RUN))
+
+    def test_anonymous_inactive_pages_are_not_available(self):
+        # #1614 run 1 accepted RAM_GB=32 at 32.5 GiB of free + inactive, then
+        # compressed and swapped 3 GiB. Below 32 GiB here only because this
+        # fixture's inactive queue is mostly anonymous; the report does not say
+        self.assertEqual(self.available(MAC48_DIRTY), 760000 * 16384)   # 11.6 GiB
+        self.assertLess(self.available(MAC48_DIRTY), 32 << 30)
+
+    def test_speculative_pages_counted_at_most_once(self):
+        # macOS 15.6: File-backed pages is external_page_count without the
+        # speculative pages, and Pages free leaves them out too. The figure is
+        # the reviewer's vm_stat rule to the byte, and Pages speculative is
+        # never read, so no macOS version can count it twice
+        self.assertEqual(self.available(MAC_M4_15_6), 4281696256)   # (36277 + 225055 + 2) pages
+        moved = MAC_M4_15_6.replace(f"{23809:>16}.", f"{123809:>16}.")
+        self.assertNotEqual(moved, MAC_M4_15_6)
+        self.assertEqual(darwin_available_bytes(moved), 4281696256)

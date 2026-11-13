@@ -524,6 +524,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **macOS: one rule for available memory, free + file-backed + purgeable pages** (#2785, #1614).
+  The planner, `coli setup` and every engine counted free + inactive pages (DeepSeek V4 with its
+  own copy). That queue holds file pages, which macOS can drop, and anonymous pages, which it can
+  only compress or swap, and it leaves out file pages still active. The new figure is physical
+  memory less Activity Monitor's "Memory Used", the same in Python and C. Possibly why OLMoE's
+  automatic cache moved from 42 to 64 slots within minutes on a 16 GB Mac, and why a 48 GB Mac
+  with browsers open accepted a 32 GiB cache that was compressed, then swapped: neither report
+  shows how its pages split, so this is unconfirmed. #2785's 0-slot plan came mostly from the
+  planner's OLMoE runtime reserve, a separate fix. The compressor is still not modeled. Checked on
+  one Mac (macOS 15.6), not yet on the reporters' machines.
+- **`--auto-tier` gave OLMoE a smaller expert cache than OLMoE picks by itself** (#2785). Once
+  the plan had a slot, `coli serve`, `chat` and `web` passed the plan's cap to olmoe, which then
+  no longer sized its cache from `RAM_GB` or gave slots back as the KV grew. The plan also set
+  aside colibri.c's runtime reserve (1.2 + 2.5 GB and 64 experts) where olmoe.c sets aside 0.5 GB,
+  so that cap came out 34-36 slots per layer lower than with olmoe's reserve on OLMoE-1B-7B, and
+  the KV's worth lower again. The gateway now hands OLMoE the plan's `RAM_GB` only, and olmoe sizes
+  the cache itself. The plan reserves olmoe.c's 0.5 GB and still the KV of the planned context:
+  `coli plan` and `coli doctor` show, and `coli tune` starts from, the cache olmoe keeps at a full
+  context, which is the KV's worth of slots below the size it starts with.
 - **CUDA on Windows: the answer stopped a few tokens in with the card at 100%** (#2696). Windows'
   WDDM driver model, which WSL2 drives the card through too, holds CUDA launches back and sends
   them in batches. A hybrid step (a layer whose experts are partly in RAM) has the card signal the
@@ -690,6 +709,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 - **The chat page's live expert map lights up on Qwen3.8.** The gateway serves the experts each decode step routed (`/experts?since=N`) from the engine's `HITL` lines, and no engine wrote them, so the map stayed dark while an answer was written and filled in only after the turn. qwen38 now writes one after the tokens of each step, the experts routed since the previous one (the CUDA chain's too). `COLI_HITS_LIVE=0` turns them off.
 - The chat page's first-run dialog waits for the models service to finish measuring the
   machine; on a fresh state it showed "- GB di RAM" and no model that fits.
+- **`TRUNK_RESIDENT_LAYERS` and `COLI_MMAP` map the shards on Windows** (#1764). GLM-5.2's two
+  weights-from-disk knobs mapped only on Linux, macOS and FreeBSD; on Windows they read the
+  weights into RAM as without them, and said nothing. They now map there too, and one `[MMAP]` line
+  says so when a shard cannot be mapped.
 
 ### Docs
 

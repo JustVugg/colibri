@@ -138,14 +138,7 @@ static void hw_probe(char *cpu, size_t cn, int *cores, double *ram_total, double
 #ifdef _WIN32
     compat_meminfo(ram_total,ram_avail);
 #elif defined(__APPLE__)
-    { uint64_t ms=0; size_t sl=sizeof(ms);
-      if(!sysctlbyname("hw.memsize",&ms,&sl,NULL,0)) *ram_total=(double)ms/1e9;
-      int64_t pgsz=0; sl=sizeof(pgsz);
-      if(sysctlbyname("hw.pagesize",&pgsz,&sl,NULL,0)||pgsz<=0) pgsz=16384;
-      vm_statistics64_data_t vs; mach_msg_type_number_t nc=HOST_VM_INFO64_COUNT;
-      if(host_statistics64(mach_host_self(),HOST_VM_INFO64,(host_info64_t)&vs,&nc)==KERN_SUCCESS)
-          /* macOS analogue of Linux MemAvailable: free + inactive + purgeable */
-          *ram_avail=(double)(vs.free_count+vs.inactive_count+vs.purgeable_count)*(double)pgsz/1e9; }
+    compat_meminfo_gb(ram_total,ram_avail);   /* free + file-backed + purgeable, as the budgets */
 #else
     FILE *mi=fopen("/proc/meminfo","r");
     if(mi){ char ln[256]; double mt=0,ma=0;

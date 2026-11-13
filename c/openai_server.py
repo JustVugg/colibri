@@ -6660,7 +6660,10 @@ def cap_for_arch(arch, cap, env=None, model=None):
             planned = int(env.get("COLI_PLAN_CAP", ""))
         except (TypeError, ValueError):
             planned = 0
-        if planned >= 1:
+        # OLMoE sizes its cache from RAM_GB itself, after its dense weights are
+        # resident, and gives slots back as the KV grows (kv_room_fit): an
+        # argv cap turns both off (#2785).
+        if planned >= 1 and arch != "olmoe":
             return planned
     if arch in ("deepseek_v41", "mimo", "qwen36", "qwen38") and model is not None:
         # V4.1, MiMo, Qwen3.6 and Qwen3.8 only read their argv cap, not RAM_GB.
