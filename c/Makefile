@@ -1869,6 +1869,19 @@ qwen38-tiny-int4-check: qwen38-tiny-int4-generate qwen38-tiny-fp8-generate qwen3
 	echo "qwen38 int4-g64 experts: ref_int4.json reproduced in $$n configurations, last logits identical across paths; FP8 control ok"
 	./tests/test_qwen38_tier_engine$(EXE) ./qwen38_tiny_int4
 
+# The routed experts as AMD's Quark checkpoint ships them in MXFP4 (e2m1 nibbles, one E8M0
+# exponent per 32 inputs): --mxfp4-experts rounds the fixture's experts (scaled by 3, as the
+# int4 fixture's) to MXFP4, writes them under quark/ with Quark's tensor names and as FP8
+# shards that hold the same values exactly (e2m1 times a power of two is exact in e4m3 under a
+# power-of-two block scale), and tools/convert_qwen38_experts_mxfp4.py copies quark/ into the
+# experts-mxfp4/ sidecar. ref.json, in float32, is the reference of those values, so the FP8
+# shards and the sidecar answer to the same oracle. The test then checks every record against
+# the Quark bytes and every expert against the FP8 shards' values, to the bit.
+.PHONY: qwen38-tiny-mxfp4-generate
+qwen38-tiny-mxfp4-generate:
+	$(PYTHON) tools/make_qwen38_tiny.py --out ./qwen38_tiny_mxfp4 --mxfp4-experts --expert-gain 3
+	$(PYTHON) tests/test_qwen38_mxfp4_convert.py --model ./qwen38_tiny_mxfp4 --exact
+
 # Speculative decoding with the checkpoint's MTP head (Q38_MTP=1; qwen38_core.h,
 # "the MTP head"). The fixtures are the three above plus an MTP head (--mtp:
 # random head weights from their own seed under the release's mtp.* names; the
