@@ -840,8 +840,8 @@ __global__ static void __launch_bounds__(32 * NW) cc_attn_f2(const float *__rest
                 for (int u = 0; u < 2; u++) {
                     if (edge || sel) {
                         int key = k0 + j * 8 + tig * 2 + u, kl = j * 8 + tig * 2 + u;
-                        if (key > qp0 || (win > 0 && key + win <= qp0) || !((mk0 >> kl) & 1u)) sc[j][u] = -1e30f;
-                        if (key > qp1 || (win > 0 && key + win <= qp1) || !((mk1 >> kl) & 1u)) sc[j][2 + u] = -1e30f;
+                        if (key > qp0 || (win > 0 && key + win <= qp0) || (sel && !((mk0 >> kl) & 1u))) sc[j][u] = -1e30f;
+                        if (key > qp1 || (win > 0 && key + win <= qp1) || (sel && !((mk1 >> kl) & 1u))) sc[j][2 + u] = -1e30f;
                     }
                     x0 = fmaxf(x0, sc[j][u]); x1 = fmaxf(x1, sc[j][2 + u]);
                 }
