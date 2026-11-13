@@ -188,6 +188,10 @@ jobs:
         run: |
           cd c
           make vk-memtype-check VK=1
+      - name: The pipelines' cache on disk
+        run: |
+          cd c
+          VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json make vk-pcache-check VK=1
 
   # Every engine with a Vulkan hook, run twice on its tiny fixture: on the CPU and on
   # Lavapipe, with the same snapshot and settings. The gate is the CPU's tokens (and

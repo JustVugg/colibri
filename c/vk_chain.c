@@ -16,6 +16,7 @@
 #include "vk_tier.h"
 #include "vk_alloc.h"
 #include "vk_load.h"
+#include "vk_pcache.h"
 #include "shaders/chain_qsa.h"
 #include <stdarg.h>
 #include <stdio.h>
@@ -405,6 +406,25 @@ static size_t dir_prefix(const char *path) {
 #endif
     return sl ? (size_t)(sl - path) + 1 : 0;
 }
+/* the file each module came from (load_module), for the line a long build gives
+ * (vk_pcache.h); a handle the driver hands out again takes the new file */
+static struct { VkShaderModule m; char file[48]; } g_mod_file[128];
+static void mod_note(VkShaderModule m, const char *file) {
+    int i = 0, n = (int)(sizeof g_mod_file / sizeof *g_mod_file);
+    while (i < n && g_mod_file[i].m && g_mod_file[i].m != m) i++;
+    if (i == n) return;
+    g_mod_file[i].m = m;
+    snprintf(g_mod_file[i].file, sizeof g_mod_file[i].file, "%s", file);
+}
+static const char *mod_file(VkShaderModule m) {
+    for (size_t i = 0; m && i < sizeof g_mod_file / sizeof *g_mod_file && g_mod_file[i].m; i++)
+        if (g_mod_file[i].m == m) return g_mod_file[i].file;
+    return "a chain pipeline";
+}
+/* vkCreateComputePipelines of one pipeline, through the device's cache on disk */
+static VkResult chain_pipe(const VkComputePipelineCreateInfo *ci, VkPipeline *p) {
+    return coli_vk_pipe_create(KC.dev, ci, p, mod_file(ci->stage.module));
+}
 static VkShaderModule load_module(const char *dir_spv, const char *file) {
     char path[1200];
     size_t pre = dir_prefix(dir_spv);
@@ -422,6 +442,7 @@ static VkShaderModule load_module(const char *dir_spv, const char *file) {
     if (vkCreateShaderModule(KC.dev, &ci, NULL, &m) != VK_SUCCESS) m = VK_NULL_HANDLE;
     free(code);
     if (!m) fprintf(stderr, "[VK] chain: cannot load %s\n", path);
+    else mod_note(m, file);
     return m;
 }
 /* The chain's shaders size their work by gl_SubgroupSize and gl_SubgroupID, so each
@@ -446,7 +467,7 @@ static VkPipeline make_pipe(VkShaderModule m, const VkSpecializationInfo *si) {
                   .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main", .pSpecializationInfo = si},
         .layout = KC.pl};
     VkPipeline p = VK_NULL_HANDLE;
-    if (vkCreateComputePipelines(KC.dev, VK_NULL_HANDLE, 1, &ci, NULL, &p) != VK_SUCCESS) return VK_NULL_HANDLE;
+    if (chain_pipe(&ci, &p) != VK_SUCCESS) return VK_NULL_HANDLE;
     return p;
 }
 
@@ -465,7 +486,7 @@ static VkPipeline coop_pipe(VkShaderModule m, const VkSpecializationInfo *si) {
                   .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main", .pSpecializationInfo = si},
         .layout = KC.pl};
     VkPipeline p = VK_NULL_HANDLE;
-    if (vkCreateComputePipelines(KC.dev, VK_NULL_HANDLE, 1, &ci, NULL, &p) != VK_SUCCESS) return VK_NULL_HANDLE;
+    if (chain_pipe(&ci, &p) != VK_SUCCESS) return VK_NULL_HANDLE;
     return p;
 }
 /* COLI_VK_<name>=0 keeps a family of matrix-unit shaders off */
@@ -689,7 +710,7 @@ int vkc_init(void) {
                           .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = KC.mod_tg, .pName = "main",
                           .pSpecializationInfo = &si}, .layout = KC.pl};
             host_first();
-            if (vkCreateComputePipelines(KC.dev, VK_NULL_HANDLE, 1, &ci, NULL, &KC.tg) != VK_SUCCESS) KC.tg = VK_NULL_HANDLE;
+            if (chain_pipe(&ci, &KC.tg) != VK_SUCCESS) KC.tg = VK_NULL_HANDLE;
         }
     }
     /* the fp32 tiled GEMM at the backend's tiles; none = every S on the GEMV */
@@ -1810,7 +1831,7 @@ static VkPipeline fa_pipe(int hd, int gq, int sub) {
                   .pSpecializationInfo = &si}, .layout = KC.pl};
     VkPipeline p = VK_NULL_HANDLE;
     host_first();
-    if (vkCreateComputePipelines(KC.dev, VK_NULL_HANDLE, 1, &ci, NULL, &p) != VK_SUCCESS) {
+    if (chain_pipe(&ci, &p) != VK_SUCCESS) {
         vkDestroyShaderModule(KC.dev, KC.mod_fa, NULL); KC.mod_fa = VK_NULL_HANDLE;   /* not again */
         return VK_NULL_HANDLE;
     }
@@ -2625,6 +2646,7 @@ static VkPipeline moe_pipe_f(int bd, int n, int fmt, int tg, int td) {
     VkSpecializationInfo si = {5, me, sizeof v, v};
     double t0 = vkc_now_ms();
     *pp = make_pipe(KC.mod_moe, &si);
+    KC.st.moe_pipes++;
     double dt = vkc_now_ms() - t0;
     if (dt > 5000.0) fprintf(stderr, "[VK] chain: chain_moe.spv%s took %.1f s to build\n", bd ? " (block formats)" : "", dt / 1e3);
     return *pp;
@@ -2761,7 +2783,13 @@ int vkc_prewarm(const VkcPrewarm *pw) {
     int npr = 0;
     for (int g = 0; g < 64 && pw->moe == 2; g++) for (int d = 0; d < 64; d++) npr += (pw->ex_gu >> g & 1) && (pw->ex_dn >> d & 1);
     if (npr > 16) npr = 0;
-    if (ok && (pw->moe == 1 || pw->moe == 2) && (npr || moe_pipe(pw->moe == 2, mn))) {
+    /* our formats': the pipeline of each format the experts take, that of every format only
+     * for another one or when they are not known (a compile each: on a Radeon RX 580, AMD's
+     * driver took 20 minutes a pipeline, and the four held a qwen36 start for 80 minutes;
+     * an RTX 5090's took 73 s for the one of every format at a staging of 256 floats) */
+    unsigned fm = pw->moe == 1 && pw->moe_fmts ? pw->moe_fmts : ~0u;
+    int every = (fm & ~(1u << 1 | 1u << 2 | 1u << 4)) != 0;
+    if (ok && (pw->moe == 1 || pw->moe == 2) && (npr || (every ? moe_pipe(pw->moe == 2, mn) != VK_NULL_HANDLE : moe_build()))) {
         VkcMoe p = {.S = 1, .K = 1, .D = 64, .I = 64, .x_row = 64, .i_row = 1, .w_row = 1, .y_row = 64, .blocks = pw->moe == 2,
                     .stage_n = mn};
         for (int g = 0; g < 64 && npr && ok; g++) for (int d = 0; d < 64 && ok; d++) {
@@ -2770,10 +2798,12 @@ int vkc_prewarm(const VkcPrewarm *pw) {
             ok = vkc_moe(x, ids, rw, tab, hid, y, &p); n += ok;
         }
         p.gfmt = p.dfmt = 0;
-        if (!npr) { ok = ok && vkc_moe(x, ids, rw, tab, hid, y, &p); n += ok; }
+        if (!npr && every) { ok = ok && vkc_moe(x, ids, rw, tab, hid, y, &p); n += ok; }
         /* our formats' pipelines of one format each (1, 2 and 4: what a container's experts are) */
         for (int f = 1; f <= 4 && ok && pw->moe == 1; f++) {
-            if (!moe_fi(f)) continue;
+            /* without the pipeline of every format, one the device refuses is skipped: the
+             * prewarms after this one still run */
+            if (!moe_fi(f) || !(fm >> f & 1) || (!every && !moe_pipe_f(0, mn, f, 0, 0))) continue;
             p.gfmt = p.dfmt = f;
             ok = vkc_moe(x, ids, rw, tab, hid, y, &p); n += ok;
             /* and chain_moe_gv.comp's at the layer's widths (its staging sized by them) */
@@ -2871,17 +2901,19 @@ int vkc_moe(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcBuf *hid, VkcBu
     VkPipeline mp = p->blocks && moe_i8_type(p->gfmt) && moe_i8_type(p->dfmt) && p->D % 32 == 0 && p->I % 32 == 0
                     ? moe_i8_pipe(sn, tg, td) : VK_NULL_HANDLE;
     if (mp) KC.st.moe_i8++;
-    else mp = moe_pipe_f(p->blocks != 0, sn, 0, tg, td);
+    else if (p->blocks) mp = moe_pipe_f(1, sn, 0, tg, td);
     /* our formats: each pass on the pipeline of its matrices' format (chain_moe.comp's FMTC),
-     * where the layer's is known and one of 1, 2, 4 */
+     * where the layer's is known and one of 1, 2, 4; the pipeline of every format made only
+     * for a pass without one (each is a compile of its own: vkc_prewarm) */
     VkPipeline mg = mp, md = mp;
     if (!p->blocks) {
-        VkPipeline g = moe_fi(p->gfmt) ? moe_pipe_f(0, sn, p->gfmt, 0, 0) : VK_NULL_HANDLE;
-        VkPipeline d = moe_fi(p->dfmt) ? moe_pipe_f(0, sn, p->dfmt, 0, 0) : VK_NULL_HANDLE;
-        if (g) mg = g;
-        if (d) md = d;
+        mg = moe_fi(p->gfmt) ? moe_pipe_f(0, sn, p->gfmt, 0, 0) : VK_NULL_HANDLE;
+        md = moe_fi(p->dfmt) ? moe_pipe_f(0, sn, p->dfmt, 0, 0) : VK_NULL_HANDLE;
+        if (!mg || !md) mp = moe_pipe_f(0, sn, 0, 0, 0);
+        if (!mg) mg = mp;
+        if (!md) md = mp;
     }
-    if (!mp || p->S < 1 || p->K < 1 || p->K > VKC_ROUTE_KMAX || p->D < 1 || p->I < 1 || p->act < 0 || p->act > 1 ||
+    if (!mg || !md || p->S < 1 || p->K < 1 || p->K > VKC_ROUTE_KMAX || p->D < 1 || p->I < 1 || p->act < 0 || p->act > 1 ||
         (p->act == 1 && !(p->a > 0.0f && p->b > 0.0f)) || p->t_off < 0 || !x || !ids || !w || !table || !hid || !y ||
         hid == x || hid == y || y == x) return 0;
     if ((size_t)p->S * p->K * ((size_t)p->I + p->D) * sizeof(float) > hid->bytes) return 0;
@@ -3404,7 +3436,7 @@ static VkPipeline kf_coop_pipe(int hd) {
                   .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = KF.cmod, .pName = "main",
                   .pSpecializationInfo = &si}, .layout = KC.pl};
     host_first();
-    if (vkCreateComputePipelines(KC.dev, VK_NULL_HANDLE, 1, &ci, NULL, &KF.cpipe[k]) != VK_SUCCESS) KF.cpipe[k] = VK_NULL_HANDLE;
+    if (chain_pipe(&ci, &KF.cpipe[k]) != VK_SUCCESS) KF.cpipe[k] = VK_NULL_HANDLE;
     return KF.cpipe[k];
 }
 int vkc_attn_full_coop(VkcBuf *qkv, VkcBuf *o, const VkcAttnFull *p) {
