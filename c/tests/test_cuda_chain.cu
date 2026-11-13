@@ -28,6 +28,14 @@
 #include <atomic>
 #include <chrono>
 
+#ifdef _WIN32
+/* MSVC has no POSIX setenv/unsetenv */
+static int setenv(const char *name, const char *value, int overwrite) {
+    (void)overwrite; return _putenv_s(name, value);
+}
+static int unsetenv(const char *name) { return _putenv_s(name, ""); }
+#endif
+
 static int fails;
 static void ck(int ok, const char *what) { if (ok) { printf("  ok   %s\n", what); return; } printf("  FAIL %s\n", what); fails++; }
 static float frand(unsigned *s) { *s = *s * 1664525u + 1013904223u; return ((*s >> 8) & 0xFFFF) / 65535.f * 2.f - 1.f; }

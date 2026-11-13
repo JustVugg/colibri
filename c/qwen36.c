@@ -10759,7 +10759,8 @@ int main(int argc, char **argv) {
         int match = 0;
         printf("\nReference: ");  for (int i=np;i<nfull;i++) printf("%d ", full[i]);
         printf("\nC engine : ");  for (int i=np;i<nfull;i++) { printf("%d ", out[i]); if (out[i]==full[i]) match++; }
-        if (g_tok) { printf("Text      : "); print_decoded(out, np, nfull); printf("\n"); }
+        /* the "C engine :" line holds the ids only */
+        if (g_tok) { printf("\nText      : "); print_decoded(out, np, nfull); }
         printf("\nMatching tokens: %d/%d\n", match, n_new);
         ref_match = match;
     } else {

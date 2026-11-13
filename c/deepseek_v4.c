@@ -7100,8 +7100,13 @@ static int v4_moe_batch_union(
     ExpertLoadJob jobs[DUAL_EXPERT_LOADER_MAX] = {{0}};
     ExpertLoadHandle loaders[DUAL_EXPERT_LOADER_MAX] = {{0}};
     int active[DUAL_EXPERT_LOADER_MAX] = {0};
-    int preload = key_count < dual_loader_lanes()
-        ? key_count : dual_loader_lanes();
+    /* Every lane holds a cache lease, and so does the expert being computed:
+     * with lanes + 1 > the layer's slots (no prefill pool) the last lookups
+     * found no free slot and the union failed. */
+    int lanes = dual_loader_lanes();
+    int lease_capacity = coli_v4_expert_store_lease_capacity(store, weights->plan.layer);
+    if (lease_capacity > 1 && lanes >= lease_capacity) lanes = lease_capacity - 1;
+    int preload = key_count < lanes ? key_count : lanes;
     for (int current = 0; !result && current < preload; current++) {
         jobs[current].store = store;
         jobs[current].key = keys[current];
@@ -7113,7 +7118,7 @@ static int v4_moe_batch_union(
             active[current] = 1;
     }
     for (int current = 0; !result && current < key_count; current++) {
-        int slot = current % dual_loader_lanes();
+        int slot = current % lanes;
         if (!active[slot] || profiled_expert_load_finish(&loaders[slot]) ||
             jobs[slot].result) {
             result = moe_fail("layer %d: reading expert %d from the expert store failed",
@@ -7122,7 +7127,7 @@ static int v4_moe_batch_union(
         }
         active[slot] = 0;
         ColiExpertView view = jobs[slot].view;
-        int next = current + dual_loader_lanes();
+        int next = current + lanes;
         if (next < key_count) {
             memset(&jobs[slot], 0, sizeof(jobs[slot]));
             jobs[slot].store = store;
@@ -7151,7 +7156,7 @@ static int v4_moe_batch_union(
                 expert_batch_capacity);
         coli_expert_release(store, &view);
     }
-    for (int slot = 0; slot < dual_loader_lanes(); slot++)
+    for (int slot = 0; slot < lanes; slot++)
         if (active[slot]) {
             profiled_expert_load_finish(&loaders[slot]);
             if (!jobs[slot].result) coli_expert_release(store, &jobs[slot].view);
@@ -10758,6 +10763,16 @@ void coli_v4_expert_store_prefill_pool(ColiExpertStore *store, int layer) {
     pthread_mutex_unlock(&state->mutex);
 }
 
+int coli_v4_expert_store_lease_capacity(ColiExpertStore *store, int layer) {
+    if (!store || !store->state || !hot_find(store)) return 0;
+    V4ExpertStoreState *state = store->state;
+    pthread_mutex_lock(&state->mutex);
+    int capacity = state->pool_layer >= 0 && state->pool_layer == layer
+        ? state->layers * state->slots_per_layer : state->slots_per_layer;
+    pthread_mutex_unlock(&state->mutex);
+    return capacity;
+}
+
 /* The CUDA expert bank's side of the store (COLI_V4_UNIT_GPU,
  * COLI_CUDA_MOE_BATCH=1). The bank reads each routed expert once per layer per
  * prompt and computes every routing from VRAM, so its reads cannot keep the
@@ -12706,14 +12721,15 @@ void coli_v4_gpu_head_upload(ColiV4Engine *engine) {
 #if defined(__AVX2__)
     const char *enabled = getenv("DSV4_CUDA_HEAD");
     if (!engine || !engine->gpu.enabled || engine->gpu.head ||
-        !engine->head_cache.data || (enabled && !atoi(enabled))) return;
+        (enabled && !atoi(enabled))) return;
     int rows = engine->config.vocab_size, cols = engine->config.hidden_size;
+    uint64_t head_bytes = (uint64_t)rows * cols * 2;
     if (rows < 1 || rows % 32 || cols < 1 || cols % 8 ||
-        engine->head_cache.bytes != (uint64_t)rows * cols * 2) return;
+        (engine->head_cache.data && engine->head_cache.bytes != head_bytes)) return;
     long long reserve = v4_gpu_resident_reserve_mb();
-    long long need = ((long long)rows * cols * 4 + 1048575) / 1048576;
+    long long need = ((long long)rows * cols * 2 + 1024LL * cols * 2 + 1048575) / 1048576;
     /* After expert preloading: never displace complete banks to fit the head.
-     * Packing temporarily needs both copies; final residency retains one.
+     * The upload packs through a staging buffer of at most 1024 rows: the head plus that.
      * Prefer the owning (last) device, then any other with room, rather than
      * always pinning the head to device 0. */
     int count = engine->gpu.device_count > 0 ? engine->gpu.device_count : 1;
@@ -12732,6 +12748,32 @@ void coli_v4_gpu_head_upload(ColiV4Engine *engine) {
         if (d == forced) continue;
         order[n++] = d;
     }
+    /* A head the RAM plan streams is read from disk for the upload and freed after it,
+     * so the CPU fallback keeps streaming as planned. Read only when the upload can
+     * happen and the OS still has the bytes: the expert slabs are allocated on first
+     * lookup, but a resident-expert preload has already filled them. */
+    int borrowed = !engine->head_cache.data;
+    if (borrowed) {
+        const ColiSafetensorsTensor *t = engine->target_index
+            ? coli_st_find(engine->target_index, "head.weight") : NULL;
+        int room = 0;
+        for (int k = 0; k < n && !room; k++)
+            room = dsv4_cuda_mem_free_mb(order[k]) >= reserve + need;
+        char why[256] = "";
+        const char *skip =
+            !t || t->dtype != COLI_ST_BF16 || (uint64_t)t->nbytes != head_bytes
+                ? "head.weight is not a BF16 vocab x hidden tensor"
+            : !dsv4_cuda_head_exact_available() ? "backend has no exact head"
+            : !room ? "no device has room"
+            : coli_v4_os_available_memory() < head_bytes + (512ull << 20) ? "host RAM too low to read it"
+            : coli_v4_head_cache_load(engine, engine->target_index, why, sizeof why) ? why
+            : NULL;
+        if (skip) {
+            fprintf(stderr, "v4_gpu head=cpu-streamed (%s) need-MiB=%lld reserve-MiB=%lld\n",
+                    skip, need, reserve);
+            return;
+        }
+    }
     Dsv4CudaTensor *head = NULL;
     int device = -1;
     for (int k = 0; k < n; k++) {
@@ -12747,6 +12789,11 @@ void coli_v4_gpu_head_upload(ColiV4Engine *engine) {
             head = NULL;
         }
     }
+    if (borrowed) {
+        free(engine->head_cache.data);
+        engine->head_cache.data = NULL;
+        engine->head_cache.bytes = 0;
+    }
     if (!head) {
         fprintf(stderr, "v4_gpu head=cpu-fallback device=%d free-MiB=%lld need-MiB=%lld reserve-MiB=%lld\n",
                 first, dsv4_cuda_mem_free_mb(first), need, reserve);
@@ -12755,7 +12802,8 @@ void coli_v4_gpu_head_upload(ColiV4Engine *engine) {
     engine->gpu.head = head;
     long long bytes = dsv4_cuda_tensor_bytes(head);
     engine->gpu.uploaded_bytes += bytes;
-    fprintf(stderr, "v4_gpu head=resident device=%d bytes=%lld arithmetic=separate-mul-add\n", device, bytes);
+    fprintf(stderr, "v4_gpu head=resident device=%d bytes=%lld arithmetic=separate-mul-add%s\n", device, bytes,
+            borrowed ? " host-copy=read-from-disk-and-freed" : "");
 #else
     (void)engine;
 #endif
@@ -16233,6 +16281,13 @@ static int head_scores_impl(ColiV4Engine *engine, const float *hidden,
         V4_DUMP_LOGITS(scores, (size_t)vocab);
         return mismatches ? -1 : 0;
     }
+#ifdef COLI_V4_GPU_TIER
+    /* the plan streams the head, but coli_v4_gpu_head_upload may have put it on the device */
+    if (!coli_v4_gpu_head_scores(engine, hidden, scores)) {
+        V4_DUMP_LOGITS(scores, (size_t)vocab);
+        return 0;
+    }
+#endif
     /* Low-memory fallback: stream small row tiles exactly as before. */
     enum { ROWS = 64 };
     uint16_t *raw = malloc((size_t)ROWS * d * sizeof(*raw));

@@ -2251,18 +2251,39 @@ static int q38_ps_parts(const Model *m,ColiPsPart *parts){
 }
 /* ids[0, P) as the Model holds them now, with its state at P (a pin's: the devices' newest first) */
 static void q38_ps_save(Model *m,const int *ids,int P){
-    if(!q38_ps_on(m)||P<g_q38_ps.B||m->kvp.tainted||m->kv_len!=P)return;
-    if(m->mtp&&m->mtp_len<P/g_q38_ps.B*g_q38_ps.B)return;   /* a whole block without its head rows */
+    if(!q38_ps_on(m)||P<g_q38_ps.B)return;
+    /* nothing else shows a save: without these lines a store that never keeps looks like one never asked */
+    const int log=getenv("COLI_PREFIX_LOG")!=NULL;
+    const int head_short=m->mtp&&m->mtp_len<P/g_q38_ps.B*g_q38_ps.B;   /* a whole block without its head rows */
+    if(m->kvp.tainted||m->kv_len!=P||head_short){
+        if(log){
+            fprintf(stderr,"[PREFIX] store: checkpoint at %d not kept: the state holds %d positions%s%s\n",
+                    P,m->kv_len,m->kvp.tainted?", tainted":"",head_short?", MTP head rows short":"");
+            fflush(stderr);
+        }
+        return;
+    }
     ColiPsPart *parts=(ColiPsPart*)malloc((size_t)3*q38_layer_rows(m)*sizeof *parts+1);
     if(!parts)return;
     const int np=q38_ps_parts(m,parts);
     Q38PinState *st=NULL;
     size_t rec=0,conv=0,ple=0;
+    int kept=0;
+    double avail=-1;
     if(q38_prefix_geometry(m,&rec,&conv,&ple)&&q38_pin_state_copy(m,&st,1)){
         size_t sb=sizeof *st+ple*sizeof(float);
         for(int i=0;i<m->c.layers;i++)if(!m->c.is_attn[i])sb+=(rec+conv)*sizeof(float);
-        coli_ps_save(&g_q38_ps,ids,P,parts,np,st,sb,q38_pin_state_free,compat_mem_available_gb()*1024.0);
+        avail=compat_mem_available_gb()*1024.0;
+        kept=coli_ps_save(&g_q38_ps,ids,P,parts,np,st,sb,q38_pin_state_free,avail);
     }else q38_pin_state_free(st);
+    if(log){
+        char held[32];   /* bytes below a MiB: a small store does not read as an empty one */
+        if(g_q38_ps.bytes<1048576)snprintf(held,sizeof held,"%zu bytes",g_q38_ps.bytes);
+        else snprintf(held,sizeof held,"%.1f MiB",g_q38_ps.bytes/1048576.0);
+        fprintf(stderr,"[PREFIX] store: checkpoint at %d %s (%s held in %d checkpoints; %.0f MiB of RAM free, %d kept free)\n",
+                P,kept?"kept":"not kept",held,coli_ps_live_ckpts(&g_q38_ps),avail,COLI_PS_RAM_FLOOR_MB);
+        fflush(stderr);
+    }
     free(parts);
 }
 /* The deepest prefix the store holds of ids[0, np), when it reaches past `held` positions: its rows
@@ -2280,10 +2301,13 @@ static int q38_ps_take(Model *m,const int *ids,int np,int held){
        !coli_ps_parts_hold(parts,nparts,P)){coli_ps_hit_free(&h);free(parts);return 0;}
     q38_prefix_settle(m);   /* the chain's prompt-end snapshot is the host's before the state moves */
     /* the whole blocks the slot holds already (its record shares them with the prompt; the MTP
-     * head's rows stand below its own length) stay in place, on the host and in the mirrors */
-    int keep=kv_prefix_common(&m->kvp,ids,np);
+     * head's rows stand below its own length) stay in place, on the host and in the mirrors. The
+     * head's row at common - 1 was made with the record's next token, not the prompt's: it goes too. */
+    const int common=kv_prefix_common(&m->kvp,ids,np);
+    int keep=common;
     if(keep>m->kv_len)keep=m->kv_len;
     if(m->mtp&&keep>m->mtp_len)keep=m->mtp_len;
+    if(m->mtp&&keep>common-1)keep=common-1;
     coli_ps_load_from(&g_q38_ps,&h,parts,nparts,keep);
     keep=coli_ps_kept(&g_q38_ps,&h,keep);
     free(parts);
@@ -2485,6 +2509,7 @@ static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     int budget = q38_serve_budget(np, q->max_tok, max_ctx, q->logprobs > 0);
     if(budget < 0){
         printf("ERROR %s CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d\n",q->id,np,q->max_tok,max_ctx);
+        q38_vision_detach(m);   /* else the next request's rows at these positions would be the picture's */
         fflush(stdout); free(ids); return 0;
     }
     if(budget < q->max_tok){
@@ -3406,7 +3431,8 @@ int main(int argc, char **argv) {
         int match = 0;
         printf("\nReference: ");  for (int i=np;i<nfull;i++) printf("%d ", full[i]);
         printf("\nC engine : ");  for (int i=np;i<nfull;i++) { printf("%d ", out[i]); if (out[i]==full[i]) match++; }
-        if (g_tok) { printf("Text      : "); print_decoded(stdout,out,np,nfull); printf("\n"); }
+        /* the "C engine :" line holds the ids only */
+        if (g_tok) { printf("\nText      : "); print_decoded(stdout,out,np,nfull); }
         printf("\nMatching tokens: %d/%d\n", match, n_new);
         if(ref_logits)ref_numeric_match=compare_reference_logits(g_last_logit,ref_logits);
         ref_match = match;

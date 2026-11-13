@@ -4040,7 +4040,9 @@ def expand_dsv41_images(messages, model_dir, max_tokens=None):
                 pieces.append(DSV41_IMAGE_PLACEHOLDER * span)
             else:
                 raise APIError(400, f"unsupported content part {kind!r}.", "messages")
-        rewritten.append({**message, "content": "".join(pieces)})
+        # encoding.py process_image_messages: each text part and each image is its own
+        # block, and the blocks join on a blank line
+        rewritten.append({**message, "content": "\n\n".join(pieces)})
     return rewritten, images
 
 
@@ -10586,6 +10588,9 @@ def keep_engine(server, start, stopping, watch=ENGINE_WATCH_S, delays=ENGINE_RES
             if not stopping.is_set():
                 server.engine, fresh = fresh, None
                 server.engine_restarts += 1
+                # its RAM plan ran again (chat_context_env), so the context it holds may differ
+                server.context_limit = getattr(server.engine, "context_limit", None)
+                server.max_tokens = getattr(server.engine, "max_tokens", None) or server.max_tokens
         if fresh is not None:     # the server stopped while it loaded
             fresh.close()
             return

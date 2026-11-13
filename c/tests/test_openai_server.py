@@ -3220,6 +3220,27 @@ class EngineRestartTest(unittest.TestCase):
         self.assertEqual(fresh.closed, 0)
         self.assertEqual(server.pinned_prefixes, {})   # the photos lived in the dead KV
 
+    def test_keep_engine_takes_the_context_the_new_engine_holds(self):
+        # a restart with less free RAM plans a smaller context: /health and the request
+        # clamp must say so, not the first engine's figures
+        dead, fresh = _DeadableEngine("dead"), _DeadableEngine("fresh")
+        dead.context_limit, dead.max_tokens = 31744, 31744
+        fresh.context_limit, fresh.max_tokens = 20480, 20480
+        server = self._server(dead)
+        server.context_limit, server.max_tokens = 31744, 31744
+        stopping = threading.Event()
+        thread = threading.Thread(target=openai_server.keep_engine,
+                                  args=(server, lambda: fresh, stopping, 0.01, (0.01, 0.02), 0.01),
+                                  daemon=True)
+        thread.start()
+        dead.alive = False
+        deadline = time.monotonic() + 2
+        while server.engine is not fresh and time.monotonic() < deadline:
+            time.sleep(0.01)
+        stopping.set()
+        thread.join(timeout=2)
+        self.assertEqual((server.context_limit, server.max_tokens), (20480, 20480))
+
     def test_keep_engine_tries_a_failed_start_again(self):
         dead, fresh = _DeadableEngine("dead"), _DeadableEngine("fresh")
         dead.alive = False
@@ -4179,7 +4200,9 @@ class HTTPTest(unittest.TestCase):
                 with patch("openai_server.ARCH", arch):
                     with self.request("/v1/chat/completions", request("this")) as response:
                         self.assertEqual(response.status, 200)
-                self.assertIn("look at this", self.engine.calls[-1][0])
+                # V4.1 joins content blocks on a blank line, as its encoding.py does
+                joined = "look at \n\nthis" if arch == "deepseek_v41" else "look at this"
+                self.assertIn(joined, self.engine.calls[-1][0])
 
 class ClientHangupTest(unittest.TestCase):
     """A client that disconnects mid-response must not print a traceback.

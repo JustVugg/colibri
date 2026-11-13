@@ -64,6 +64,7 @@ EXPORTS
     dsv4_cuda_head_argmax
     dsv4_cuda_upload_head_exact
     dsv4_cuda_head_scores_exact
+    dsv4_cuda_head_exact_available
     dsv4_cuda_head_scores_batch_exact
     dsv4_cuda_head_argmax_batch_exact
     dsv4_cuda_final_argmax

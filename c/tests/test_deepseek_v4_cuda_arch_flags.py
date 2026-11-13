@@ -20,8 +20,10 @@ GPU, and it checks exactly what make decides to recompile. The sources are
 copied, not linked, so their timestamps can be pinned without touching the tree.
 """
 import os
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -203,6 +205,36 @@ class DeepseekV4CudaArchFlagsTest(unittest.TestCase):
                        timeout=120)
         self.assertFalse((self.dir / STAMP).exists(),
                          f"{STAMP} survived deepseek-v4-clean")
+
+
+class PreAmperePresetToolkitTest(unittest.TestCase):
+    """CUDA 13 dropped compute_61, the oldest target of CUDA_ARCH=portable-pre-ampere,
+    so nvcc 13 stops at once with "Unsupported gpu architecture 'compute_61'". Every
+    place that sends Pascal and Turing cards to the preset names the last toolkit
+    that still builds it. Reads files only: no make, no CUDA."""
+
+    def test_every_hint_names_the_last_toolkit_that_builds_the_preset(self):
+        sys.path.insert(0, str(C_DIR))
+        import resource_plan
+        import setup_flow
+        makefile = (C_DIR / "Makefile.deepseek-v4").read_text(encoding="utf-8")
+        preset = makefile.split("else ifeq ($(CUDA_ARCH),portable-pre-ampere)", 1)[1].split("\nelse\n", 1)[0]
+        oldest = min(int(sm) for sm in re.findall(r"arch=compute_(\d+)", preset))
+        # setup_flow's measured table of what each nvcc release lists
+        builds = [first for first, low, high in setup_flow.CUDA_RELEASES if low <= oldest <= high]
+        self.assertNotEqual(builds[-1], setup_flow.CUDA_RELEASES[-1][0],
+                            f"compute_{oldest} is still built by the newest CUDA release")
+        limit = "CUDA <= %d.%d" % builds[-1]
+        hints = {"Makefile.deepseek-v4 preset": [preset],
+                 "resource_plan.CUDA_TIER_FLOOR": [resource_plan.CUDA_TIER_FLOOR["deepseek_v4"][1]]}
+        for name in ("backend_loader_dsv4.c", "backend_cuda_dsv4.cu", "../docs/deepseek-v4.md"):
+            text = " ".join((C_DIR / name).read_text(encoding="utf-8").split())
+            hints[name] = re.findall(r"portable-pre-ampere NO_TC=1.{0,40}", text)
+        for where, found in hints.items():
+            with self.subTest(where=where):
+                self.assertTrue(found)
+                missing = [hint[:80] for hint in found if limit not in hint]
+                self.assertEqual(missing, [], f"recommends the preset without '{limit}'")
 
 
 if __name__ == "__main__":
