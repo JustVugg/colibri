@@ -525,19 +525,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 ### Fixed
 
 - **DeepSeek V4.1's candidate blocks cost the square of the context** (a 262144-token prompt
-  allocated 64 GiB, 38 % of the engine's peak). The candidate source layer published the blocks
-  it keeps as a dense mask, one byte per compressed position per query row, and the layers after
-  it read one bit of it: at ratio 1 that is `n²` bytes. It now publishes the blocks themselves --
-  `rows × candidate_top_k_blocks` int32 ids in the source's own coordinates, `-1` past the ones a
-  row keeps (`cross_layer.py`'s `block_candidate_idxs` in DI), with the same reach kept as the
-  paint bound. 2 GiB at 262144 tokens instead of 64 GiB (that is the prompt's rows, as the mask
-  was; `v41_take_tail` then leaves 19.8 MB of them), 320 B instead of 1600 B on the tiny
-  fixture, and a decode step no longer reallocates it every token. The bits are unchanged: the
-  mask was the union of the chosen blocks' ranges, so reading the blocks out of it and painting
-  them back is the identity, and `c/tests/test_dsv41_candidate_ids.c` holds it against a frozen
-  copy of the pre-change writer on 11760 shapes. The device masks the chain still paints stay
-  dense (a separate change), and so does allocating the prompt's rows rather than the tail's
-  (2 GiB to 19.8 MB at 262144), which is named there.
+  allocated 64 GiB). The candidate source layer published the blocks it keeps as a dense mask,
+  one byte per compressed position per query row, and the layers after it read one bit of it: at
+  ratio 1 that is `n²` bytes. It now publishes the blocks themselves -- `rows ×
+  candidate_topk_blocks` int32 ids in the source's own coordinates, `-1` past the ones a row
+  keeps (`cross_layer.py`'s `block_candidate_idxs` in DI), with the same reach kept as the paint
+  bound. 2 GiB at 262144 tokens instead of 64 GiB (that is the prompt's rows, as the mask was;
+  `v41_take_tail` then keeps only 19.8 MB of ids live, and the allocation stays the prompt's),
+  and 320 B instead of 1600 B on a `--prompt-len 40` fixture (`dsv41_long`). The reallocation
+  went with the reach, not the rows: the mask grew every token at ratio 1, the ids do not follow
+  the reach (a plain decode allocates at the prompt and once at its first token; a speculative
+  step resizes it to its batch's rows, and the plain step after it back to one). The bits a reader
+  consults are unchanged: a row's ids name the blocks its mask held, and where a repainted row the
+  chain's device wrote differs it does so past the chunk's reach, where the score is already
+  `-inf`; `c/tests/test_dsv41_candidate_ids.c` holds the selection and the repaint against a
+  frozen copy of the pre-change writer, on 11,760 cases (2,464 of them sensitive to a stale
+  padding slot). The device masks the chain still paints stay dense (a separate change), and so
+  does allocating the prompt's rows rather than the tail's (2 GiB to 19.8 MB at 262144), which is
+  named there.
 - **CUDA on Windows: the answer stopped a few tokens in with the card at 100%** (#2696). Windows'
   WDDM driver model, which WSL2 drives the card through too, holds CUDA launches back and sends
   them in batches. A hybrid step (a layer whose experts are partly in RAM) has the card signal the

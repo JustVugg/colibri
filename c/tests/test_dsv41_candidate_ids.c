@@ -2,8 +2,10 @@
  * ids (rows x candidate_topk int32) instead of a dense mask (rows x the reach bytes), which
  * is what made a 262144-token prompt allocate 64 GiB. The mask was the union of the chosen
  * blocks' ranges clipped at the reach, so reading the blocks out of it and painting them
- * back is the identity -- independent of how the blocks were chosen. This gate holds that
- * identity, and holds it against a *frozen* copy of the pre-change writer: with the writer
+ * back is the identity -- independent of how the blocks were chosen. (A row a chain's device
+ * wrote is clipped at the *chunk's* reach, not the layer's, so its ids repaint the block
+ * straddling that reach out past it: clipped_row below pins that geometry.) This gate holds
+ * that identity, and holds it against a *frozen* copy of the pre-change writer: with the writer
  * itself kept (the selection must stay in one place) a harness that compares the live
  * writer with the live reconstruction compares the engine with itself and cannot see a
  * selection change at all (a flipped tie-break passes it). Hence ref_candidate_blocks below:
@@ -12,9 +14,12 @@
  * The invariants, asserted here:
  *  P1 every one of the topk slots is written, -1 past the kept blocks (the ids are poisoned
  *     before the extraction, and a reader that trusts a stale slot masks differently);
- *  P2 the paint bound is min(compress_len, candidate_width): an id past it writes nothing;
+ *  P2 the paint bound is min(compress_len, candidate_width), asserted where the reader
+ *     computes it (candidate_paint_width) as well as where it is used: an id past the bound
+ *     writes nothing, and [w, width) keeps its poison;
  *  P3 positions past the bound may differ and no reader looks at them (indexer_run sets
- *     score[j] = -INFINITY before the mask runs), so only [0, w) is compared;
+ *     score[j] = -INFINITY before the mask runs), so [0, w) is compared against the source's
+ *     row and [w, width) against the poison -- an over-paint is a CHECK, not a heap abort;
  *  P5 the ids are block ids in the source's own coordinates.
  * The memory side (v41_candidate_bytes) is asserted at the end: no width enters it, and the
  * topk is the caller's, so an allocator and the copy of its array cannot disagree. */
@@ -84,6 +89,38 @@ static int pinned_tie_vector(void) {
     return 0;
 }
 
+static int paint_width(void) {
+    /* P2 where the reader computes it: a `w` this harness chose cannot see the reader's own
+     * bound being widened, and a widened one memsets and paints past its compress_len-byte
+     * scratch. */
+    static const int table[][3] = {{0, 0, 0}, {0, 5, 0}, {5, 0, 0}, {5, 9, 5}, {9, 5, 5}, {9, 9, 9}, {7, 7, 7}};
+    for (size_t i = 0; i < sizeof table / sizeof *table; i++)
+        CHECK(candidate_paint_width(table[i][0], table[i][1]) == table[i][2]);
+    return 0;
+}
+
+static int clipped_row(void) {
+    /* A row the chain converted: the device painted blocks 0 and 1 of a 16-position row and
+     * the conversion clips it at the chunk's reach wc = 12 (deepseek_v41_chain.h:1454), so
+     * block 1 is set on [8,12) and 0 on [12,16); the ids are extracted over wh = 16 and the
+     * reader repaints at w = 16. This is the one geometry in which a painted block's *last*
+     * in-scan position is 0: an extraction that asked "is the last position set" (`hit =`
+     * for `hit |=`) would drop block 1 and unmask [8,12), which every reader consults. */
+    enum { width = 16, block = 8, wc = 12, slots = 4 };
+    uint8_t row[width], back[width];
+    int32_t ids[slots];
+    memset(row, 1, (size_t)wc);
+    memset(row + wc, 0, (size_t)(width - wc));
+    int kept = candidate_row_ids(row, block, width, slots, ids);
+    CHECK(kept == 2 && ids[0] == 0 && ids[1] == 1 && ids[2] == -1 && ids[3] == -1);
+    memset(back, 0xa5, sizeof back);
+    candidate_keep_row(ids, slots, block, width, back);
+    CHECK(memcmp(back, row, (size_t)wc) == 0);     /* [0, wc): the clipped row, exactly */
+    for (int j = wc; j < width; j++)               /* [wc, width): block 1's tail, past the reach */
+        CHECK(back[j] == 1);
+    return 0;
+}
+
 static int candidate_bytes(void) {
     /* 262144 rows x 2048 slots x 4 B: the reach does not appear, so neither does n^2 */
     CHECK(v41_candidate_bytes(2048, 262144) == 2147483648u);
@@ -103,6 +140,8 @@ int main(void) {
     static const int topks[] = {0, 1, 2, 3, 8, 64, 2048};
     long cases = 0, padding = 0;
     if (pinned_tie_vector()) return 1;
+    if (paint_width()) return 1;
+    if (clipped_row()) return 1;
     for (size_t wi = 0; wi < sizeof widths / sizeof *widths; wi++) {
         int width = widths[wi], nblocks = 0;
         float *score = malloc((size_t)width * sizeof(float));
@@ -139,10 +178,12 @@ int main(void) {
                         /* 3. and they paint the frozen row back on [0, w) for every reach
                          *    the reader can have, w = min(compress_len, candidate_width) */
                         for (int cl = 0; cl <= width; cl++) {
-                            int w = cl < width ? cl : width;
+                            int w = candidate_paint_width(cl, width);
                             memset(back, 0xa5, (size_t)width);
                             candidate_keep_row(ids, slots, block, w, back);
                             CHECK(memcmp(back, ref, (size_t)w) == 0);
+                            for (int j = w; j < width; j++)   /* P2/P3: past `w` is untouched */
+                                CHECK(back[j] == 0xa5);
                         }
                         /* the -1 padding is load-bearing: a stale slot holding the last
                          * block's id would mask a row differently, which is why the
@@ -162,6 +203,8 @@ int main(void) {
         free(score); free(live); free(ref); free(back);
     }
     if (candidate_bytes()) return 1;
+    CHECK(cases == 11760);   /* 14 widths x 5 block sizes x 7 topks x 6 lens x 4 score rows */
+    CHECK(padding > 0);      /* the stale-slot case is exercised, not merely counted */
     printf("dsv41 candidate ids: %ld cases, %ld padding-sensitive; writer == the frozen 15f810f0 "
            "writer, the ids repaint it on [0,w), bytes(262144 rows, topk 2048) = 2 GiB\n", cases, padding);
     return 0;

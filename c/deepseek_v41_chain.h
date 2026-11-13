@@ -1264,8 +1264,8 @@ static int v41c_forward_seg(Model *m, V41Chain *ch, float *h, float *pre_mix, in
         return 0;
     }
     /* A partial chain's handoff beyond the streams: the CPU's layers read the candidate
-     * mask a chain layer made (the candidate source is a chain layer, an index source
-     * after N reads it) and the index list the last chain index source published (a
+     * blocks a chain layer made (the candidate source is a chain layer, an index source
+     * after N reads them) and the index list the last chain index source published (a
      * compressed layer after N reads it before the next index source runs). */
     int cs = c->candidate_source, cand_out = 0, list_out = -1, list_w = 0;
     if (hi < L) {
@@ -1447,7 +1447,11 @@ static int v41c_forward_seg(Model *m, V41Chain *ch, float *h, float *pre_mix, in
                 const int32_t *mk = (const int32_t *)vkc_ptr(ch->cmd);
                 int wc = (pb + nr) / c->compress_ratio[cs], wh = m->candidate_width;
                 /* the device's row, converted at its own reach `wc` and then read as blocks:
-                 * block-aligned, so the ids recover exactly the blocks it painted (P4) */
+                 * the ids name the blocks the device painted, and the repaint that follows at
+                 * `wh` also paints a straddling block's tail past `wc`. No reader consults it:
+                 * v41c_unsupported keeps every consumer on the source's ratio, so a reader's
+                 * reach is at most `wc`, and indexer_run has set the score past it to -INFINITY
+                 * before the mask runs (P3). */
                 uint8_t *keep = xmalloc((size_t)(wh > 0 ? wh : 1), "candidate row");
                 for (int s = 0; s < nr; s++) {
                     const int32_t *mrow = mk + (size_t)s * ch->wcap;
