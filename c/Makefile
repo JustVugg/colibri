@@ -11,7 +11,8 @@
 DETECT_CC := $(if $(filter default,$(origin CC)),gcc,$(CC))
 TRIPLET   := $(shell $(DETECT_CC) -dumpmachine 2>/dev/null)
 
-MINGW  := $(findstring mingw,$(TRIPLET))
+# clang names the same MinGW target x86_64-w64-windows-gnu (MSYS2's clang, llvm-mingw)
+MINGW  := $(findstring mingw,$(TRIPLET))$(findstring windows-gnu,$(TRIPLET))
 CYGWIN := $(findstring cygwin,$(TRIPLET))
 DARWIN := $(findstring darwin,$(TRIPLET))
 LINUX  := $(findstring linux,$(TRIPLET))
@@ -148,11 +149,15 @@ LDFLAGS = -lm -fopenmp -static -lpsapi $(EXTRA_LDFLAGS)
 # "cannot find -lgomp" (#1900, #2612). Ask the compiler where the archive is: when
 # it is missing, -print-file-name just echoes "libgomp.a" back. Warn up front and
 # name the package; the build still goes on, so goals that never link OpenMP are
-# not blocked. LIBGOMP_CHECK=0 silences it.
+# not blocked. LIBGOMP_CHECK=0 silences it. clang's -fopenmp links LLVM's libomp.a
+# instead, from its own package (#2286).
 ifneq ($(LIBGOMP_CHECK),0)
 ifneq ($(filter-out clean%,$(or $(MAKECMDGOALS),all)),)
-ifeq ($(shell $(DETECT_CC) -print-file-name=libgomp.a 2>/dev/null),libgomp.a)
-$(warning $(DETECT_CC) has no libgomp.a, so the -static -fopenmp link will fail with "cannot find -lgomp". In the "MSYS2 UCRT64" shell run: pacman -S --needed mingw-w64-ucrt-x86_64-libgomp (docs/windows.md))
+OMP_LIB := $(if $(findstring clang,$(notdir $(DETECT_CC))),omp,gomp)
+OMP_PKG := $(if $(findstring clang,$(notdir $(DETECT_CC))),llvm-openmp,libgomp)
+OMP_DOC := $(if $(findstring clang,$(notdir $(DETECT_CC))),docs/deepseek-v4.md,docs/windows.md)
+ifeq ($(shell $(DETECT_CC) -print-file-name=lib$(OMP_LIB).a 2>/dev/null),lib$(OMP_LIB).a)
+$(warning $(DETECT_CC) has no lib$(OMP_LIB).a, so the -static -fopenmp link will fail with "cannot find -l$(OMP_LIB)". In the "MSYS2 UCRT64" shell run: pacman -S --needed mingw-w64-ucrt-x86_64-$(OMP_PKG) ($(OMP_DOC)))
 endif
 endif
 endif

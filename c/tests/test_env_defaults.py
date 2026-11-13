@@ -59,7 +59,13 @@ class EnvDefaultsTest(unittest.TestCase):
         self.assertEqual(e["PIPE"], "1")
         self.assertEqual(e["PILOT_REAL"], "1")
         self.assertEqual(e["OMP_WAIT_POLICY"], "active")
+        self.assertEqual(e["KMP_BLOCKTIME"], "200")  # libomp (clang): no endless idle spin
         self.assertNotIn("OMP_PROC_BIND", e)  # MinGW libgomp: niente affinity
+
+    def test_passive_keeps_libomp_blocktime_zero(self):
+        # libomp gives passive its blocktime 0 only while KMP_BLOCKTIME is unset
+        e = self.env_for_with({"OMP_WAIT_POLICY": "passive"}, "win32")
+        self.assertNotIn("KMP_BLOCKTIME", e)
 
     def test_explicit_override_wins(self):
         e = self.env_for_with({"DIRECT": "0", "PIPE": "0"}, "win32")
@@ -70,13 +76,14 @@ class EnvDefaultsTest(unittest.TestCase):
     def test_kill_switch_scope_is_omp_only(self):
         e = self.env_for_with({"COLI_NO_OMP_TUNE": "1"}, "win32")
         self.assertNotIn("OMP_WAIT_POLICY", e)
+        self.assertNotIn("KMP_BLOCKTIME", e)
         self.assertNotIn("OMP_NUM_THREADS", e)
         self.assertEqual(e["DIRECT"], "1")   # i default I/O restano attivi
         self.assertEqual(e["PIPE"], "1")
 
     def test_non_windows_untouched(self):
         e = self.env_for_with({}, "linux")
-        for k in ("DIRECT", "PIPE", "PILOT_REAL", "OMP_WAIT_POLICY"):
+        for k in ("DIRECT", "PIPE", "PILOT_REAL", "OMP_WAIT_POLICY", "KMP_BLOCKTIME"):
             self.assertNotIn(k, e)
 
 

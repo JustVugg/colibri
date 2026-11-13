@@ -13904,7 +13904,6 @@ static Dsv4CudaExpertSet *v4_moe_bank;
 static int v4_moe_bank_device = -1;
 static Dsv4CudaActivation *v4_moe_in, *v4_moe_out;
 static int v4_moe_bank_layer = -1;
-static int v4_moe_bank_hash_layer = -1;
 static unsigned char v4_moe_bank_valid[256];
 static int v4_moe_bank_failed;
 
@@ -14099,7 +14098,6 @@ void coli_v4_gpu_moe_batch_release(void) {
     dsv4_cuda_expert_set_free(v4_moe_bank);
     v4_moe_bank = NULL;
     v4_moe_bank_layer = -1;
-    v4_moe_bank_hash_layer = -1;
     memset(v4_moe_bank_valid, 0, sizeof(v4_moe_bank_valid));
 }
 
@@ -14113,7 +14111,6 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
                                 int batch) {
 #define bank v4_moe_bank
 #define bank_layer v4_moe_bank_layer
-#define hash_layer v4_moe_bank_hash_layer
 #define bank_valid v4_moe_bank_valid
 #define in_mirror v4_moe_in
 #define out_mirror v4_moe_out
@@ -14612,7 +14609,6 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
 #undef out_mirror
 #undef bank
 #undef bank_layer
-#undef hash_layer
 #undef bank_valid
 #undef bank_failed
 }

@@ -55,6 +55,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **Windows: DeepSeek V4 built with clang and LLVM's libomp** (#2286). MinGW's libgomp, which the
+  gcc build links, has no spin-wait: its barriers sleep on a semaphore whatever
+  `OMP_WAIT_POLICY` and `GOMP_SPINCOUNT` say, and every one of a token's small parallel regions
+  paid a thread wake-up (22 us a barrier with 4 threads on an i7-7700HQ, 0.3 us with libomp).
+  The release builds `deepseek_v4.exe` with `CC=clang`, libomp linked in (no new DLL), and on
+  Windows the launcher adds `KMP_BLOCKTIME=200` when the wait policy is active, so the team
+  sleeps between requests instead of spinning. Same tokens on the tiny fixture's oracle, which
+  decodes 3.1x faster on that laptop; the issue measured 1.5x on the full model with an LTO
+  clang build. With the CUDA tier the Windows team now really spins (not measured).
+  `c/Makefile` now recognises clang's `x86_64-w64-windows-gnu` target.
 - **CPU without FMA: FP8 and int4-g64 experts read once for a prompt's rows** (#2715). On a
   CPU without AVX2 or FMA (Sandy and Ivy Bridge, a build for the x86-64 baseline or v2),
   quant.h's FP8 kernel decoded every weight again for each row and waited on one chain of adds:
