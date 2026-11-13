@@ -8,8 +8,9 @@
  * with a frame that fails mid-run (the state rebuilt on the CPU, the run finishing
  * there), once without the chain. Every run must stay within the oracle's limits
  * (ref.json), the chain runs must have set up and run every layer on the device.
- * Then the promotions' brake (q38cc_braked) on frames written by hand: the fixture has
- * no GGUF, so no host pool and no promotion runs above. */
+ * Then a refusal of the card's memory on a chain written by hand (q38cc_forward gives
+ * the K/V mirrors back), and the promotions' brake (q38cc_braked) on frames written by
+ * hand: the fixture has no GGUF, so no host pool and no promotion runs above. */
 #define main qwen38_main_unused
 #include "../qwen38.c"
 #undef main
@@ -131,6 +132,48 @@ int main(void) {
     unsetenv("Q38_MTP_FORCE");
     setenv("Q38_MTP", "0", 1);
     qt_shutdown();
+
+    printf(" a refusal of the card's memory gives the K/V mirrors back\n");
+    {   /* a chain written by hand: three layers, the middle one DeltaNet, and the MTP head's slot, the
+         * mirrors in float16; the card's room (fake_chain_dev_cap) for one attention layer's mirrors and
+         * half of the next, then for every mirror but not a row's scratch */
+        static Model rm; static Q38CChain rc;
+        static uint8_t att[3] = {1, 0, 1};
+        static CcBuf *kc[4], *vc[4], *ik[4], *pk[4]; static int kvv[4], pkv[4];
+        rm.c.layers = 3; rm.c.is_attn = att; rm.c.kv_heads = 2; rm.c.head_dim = 8; rm.c.idx_dim = 4; rm.c.idx_ratio = 4;
+        rm.c.hc_width = 64; rm.kv_cap = 32; rm.cchain = &rc;
+        rc.kc = kc; rc.vc = vc; rc.ik = ik; rc.pk = pk; rc.kv_valid = kvv; rc.pk_valid = pkv;
+        rc.ok = 1; rc.mtp_on = 1; rc.kvh = 1;
+        const size_t lay = 2 * (2 * 8 * 32 * 2) + 4 * 32 * 4 + 4 * (32 / 4 + 1) * 4;   /* kc and vc in halves, ik, pk */
+        const int chain0 = g_cuda_chain; g_cuda_chain = 1;
+        const size_t b0 = fake_chain_dev_bytes;
+        int none = 1;
+        fake_chain_dev_cap = b0 + lay + lay / 2;
+        int r1 = q38cc_forward(&rm, NULL, 1, 0, 1, NULL, 0, NULL, NULL);
+        for (int i = 0; i < 4; i++) none = none && !kc[i] && !vc[i] && !ik[i] && !pk[i];
+        tk(r1 == 0 && rc.failed && rc.cap == 0, "the second layer's mirrors refused: the per-matrix path");
+        tk(none && fake_chain_dev_bytes == b0, "the first layer's mirrors and the second's half given back");
+        rc.failed = 0;
+        fake_chain_dev_cap = b0 + 3 * lay + 16;   /* every mirror, not a row's 256-byte streams */
+        int r2 = q38cc_forward(&rm, NULL, 1, 0, 1, NULL, 0, NULL, NULL);
+        none = 1;
+        for (int i = 0; i < 4; i++) none = none && !kc[i] && !vc[i] && !ik[i] && !pk[i];
+        tk(r2 == 0 && rc.failed && none && fake_chain_dev_bytes == b0, "the scratch refused: every mirror given back");
+        fake_chain_dev_cap = 0;
+        tk(q38cc_forward(&rm, NULL, 1, 0, 1, NULL, 0, NULL, NULL) == 0 && fake_chain_dev_bytes == b0,
+           "the chain stays off: a later forward takes nothing from the card");
+        /* a growth to 64 positions with room for the first layer's new mirrors only: the last
+         * layer's old ones, which dev kept, go too */
+        const size_t lay64 = 2 * (2 * 8 * 64 * 2) + 4 * 64 * 4 + 4 * (64 / 4 + 1) * 4;
+        int placed = q38cc_mirror(&rc, &rm) && rc.cap == 32 && fake_chain_dev_bytes == b0 + 3 * lay;
+        rm.kv_cap = 64; fake_chain_dev_cap = b0 + 2 * lay + lay64;
+        int r4 = q38cc_mirror(&rc, &rm);
+        none = 1;
+        for (int i = 0; i < 4; i++) none = none && !kc[i] && !vc[i] && !ik[i] && !pk[i];
+        tk(placed && r4 == 0 && rc.cap == 0 && none && fake_chain_dev_bytes == b0, "a refused growth leaves no mirror on the card");
+        fake_chain_dev_cap = 0; rm.kv_cap = 32;
+        g_cuda_chain = chain0;
+    }
 
     printf(" the promotions' brake\n");
     unsetenv("COLI_CUDA_CHAIN_PROMOTE_HITS");
