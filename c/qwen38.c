@@ -2251,18 +2251,39 @@ static int q38_ps_parts(const Model *m,ColiPsPart *parts){
 }
 /* ids[0, P) as the Model holds them now, with its state at P (a pin's: the devices' newest first) */
 static void q38_ps_save(Model *m,const int *ids,int P){
-    if(!q38_ps_on(m)||P<g_q38_ps.B||m->kvp.tainted||m->kv_len!=P)return;
-    if(m->mtp&&m->mtp_len<P/g_q38_ps.B*g_q38_ps.B)return;   /* a whole block without its head rows */
+    if(!q38_ps_on(m)||P<g_q38_ps.B)return;
+    /* nothing else shows a save: without these lines a store that never keeps looks like one never asked */
+    const int log=getenv("COLI_PREFIX_LOG")!=NULL;
+    const int head_short=m->mtp&&m->mtp_len<P/g_q38_ps.B*g_q38_ps.B;   /* a whole block without its head rows */
+    if(m->kvp.tainted||m->kv_len!=P||head_short){
+        if(log){
+            fprintf(stderr,"[PREFIX] store: checkpoint at %d not kept: the state holds %d positions%s%s\n",
+                    P,m->kv_len,m->kvp.tainted?", tainted":"",head_short?", MTP head rows short":"");
+            fflush(stderr);
+        }
+        return;
+    }
     ColiPsPart *parts=(ColiPsPart*)malloc((size_t)3*q38_layer_rows(m)*sizeof *parts+1);
     if(!parts)return;
     const int np=q38_ps_parts(m,parts);
     Q38PinState *st=NULL;
     size_t rec=0,conv=0,ple=0;
+    int kept=0;
+    double avail=-1;
     if(q38_prefix_geometry(m,&rec,&conv,&ple)&&q38_pin_state_copy(m,&st,1)){
         size_t sb=sizeof *st+ple*sizeof(float);
         for(int i=0;i<m->c.layers;i++)if(!m->c.is_attn[i])sb+=(rec+conv)*sizeof(float);
-        coli_ps_save(&g_q38_ps,ids,P,parts,np,st,sb,q38_pin_state_free,compat_mem_available_gb()*1024.0);
+        avail=compat_mem_available_gb()*1024.0;
+        kept=coli_ps_save(&g_q38_ps,ids,P,parts,np,st,sb,q38_pin_state_free,avail);
     }else q38_pin_state_free(st);
+    if(log){
+        char held[32];   /* bytes below a MiB: a small store does not read as an empty one */
+        if(g_q38_ps.bytes<1048576)snprintf(held,sizeof held,"%zu bytes",g_q38_ps.bytes);
+        else snprintf(held,sizeof held,"%.1f MiB",g_q38_ps.bytes/1048576.0);
+        fprintf(stderr,"[PREFIX] store: checkpoint at %d %s (%s held in %d checkpoints; %.0f MiB of RAM free, %d kept free)\n",
+                P,kept?"kept":"not kept",held,coli_ps_live_ckpts(&g_q38_ps),avail,COLI_PS_RAM_FLOOR_MB);
+        fflush(stderr);
+    }
     free(parts);
 }
 /* The deepest prefix the store holds of ids[0, np), when it reaches past `held` positions: its rows

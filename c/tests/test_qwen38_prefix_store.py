@@ -157,6 +157,13 @@ class Qwen38PrefixStoreTest(unittest.TestCase):
         b = e.ask("b1", chat(Q2), max_tok=6)
         log = e.close()
         self.assertEqual([h[0] for h in self.hits(log)], [ntok(SYSTEM)], log[-3000:])
+        # every save says whether it was kept (COLI_PREFIX_LOG). The first request's, logged before the second
+        # one reuses: where the system prompt ends, and where its turn ended (the reply fed but for a 6th token,
+        # which max_tok stops before it is fed)
+        first = log[:log.index("[PREFIX] reusing")]
+        saves = [(int(p), k) for p, k in re.findall(r"\[PREFIX\] store: checkpoint at (\d+) (kept|not kept)", first)]
+        end = ntok(chat(Q1)) + len(a) - (len(a) == 6)
+        self.assertEqual(saves, [(ntok(SYSTEM), "kept"), (end, "kept")], log[-3000:])
         self.same(log, 0, chat(Q1), a)
         self.same(log, 1, chat(Q2), b)
 
