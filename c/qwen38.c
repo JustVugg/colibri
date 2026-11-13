@@ -2299,8 +2299,8 @@ static int q38_ps_parts(const Model *m,ColiPsPart *parts){
     return n;
 }
 /* ids[0, P) as the Model holds them now, with its state at P (a pin's: the devices' newest first) */
-static void q38_ps_save(Model *m,const int *ids,int P){
-    if(!q38_ps_on(m)||P<g_q38_ps.B)return;
+static int q38_ps_save(Model *m,const int *ids,int P){
+    if(!q38_ps_on(m)||P<g_q38_ps.B)return 0;
     /* nothing else shows a save: without these lines a store that never keeps looks like one never asked */
     const int log=getenv("COLI_PREFIX_LOG")!=NULL;
     const int head_short=m->mtp&&m->mtp_len<P/g_q38_ps.B*g_q38_ps.B;   /* a whole block without its head rows */
@@ -2310,10 +2310,10 @@ static void q38_ps_save(Model *m,const int *ids,int P){
                     P,m->kv_len,m->kvp.tainted?", tainted":"",head_short?", MTP head rows short":"");
             fflush(stderr);
         }
-        return;
+        return 0;
     }
     ColiPsPart *parts=(ColiPsPart*)malloc((size_t)3*q38_layer_rows(m)*sizeof *parts+1);
-    if(!parts)return;
+    if(!parts)return 0;
     const int np=q38_ps_parts(m,parts);
     Q38PinState *st=NULL;
     size_t rec=0,conv=0,ple=0;
@@ -2334,10 +2334,12 @@ static void q38_ps_save(Model *m,const int *ids,int P){
         fflush(stderr);
     }
     free(parts);
+    return kept;
 }
-/* The deepest prefix the store holds of ids[0, np), when it reaches past `held` positions: its rows
- * and state put back, the record and the chains told. The positions now held; 0 when nothing. */
-static int q38_ps_take(Model *m,const int *ids,int np,int held){
+/* The deepest prefix the store holds of ids[0, np), when it reaches past `floor` positions (the slot
+ * holds `held`): its rows and state put back, the record and the chains told. The positions now
+ * held; 0 when nothing. */
+static int q38_ps_take_ram(Model *m,const int *ids,int np,int held,int floor){
     if(!q38_ps_on(m)||np<2)return 0;
     ColiPsPart *parts=(ColiPsPart*)malloc((size_t)3*q38_layer_rows(m)*sizeof *parts+1);
     if(!parts)return 0;
@@ -2346,7 +2348,7 @@ static int q38_ps_take(Model *m,const int *ids,int np,int held){
     ColiPsHit h;
     const int P=coli_ps_lookup(&g_q38_ps,ids,np,np-1,1,&h);
     Q38PinState *st=P>0&&h.ck>=0?(Q38PinState*)g_q38_ps.ck[h.ck].state:NULL;
-    if(P<=held+coli_ps_min_gain(&g_q38_ps)||!st||st->n_layers!=m->c.layers||(m->mtp&&!st->mtp_pend)||P>m->kv_cap||
+    if(P<=floor||!st||st->n_layers!=m->c.layers||(m->mtp&&!st->mtp_pend)||P>m->kv_cap||
        !coli_ps_parts_hold(parts,nparts,P)){coli_ps_hit_free(&h);free(parts);return 0;}
     q38_prefix_settle(m);   /* the chain's prompt-end snapshot is the host's before the state moves */
     /* the whole blocks the slot holds already (its record shares them with the prompt; the MTP
@@ -2379,6 +2381,426 @@ static int q38_ps_take(Model *m,const int *ids,int np,int held){
     }
     coli_ps_hit_free(&h);
     return P;
+}
+/* ---- the store's checkpoints on disk (Q38_PREFIX_DISK=1, default 0) -----------------------------
+ * The store dies with the process: after a restart the first request reads its whole system prompt
+ * again. With Q38_PREFIX_DISK=1 the checkpoints a prompt keeps where conversations part from it
+ * (where the system prompt ends, where its messages start: q38_serve_prefill_at; not a turn's end)
+ * also go to Q38_PREFIX_DIR (default <SNAP>/.coli_ckpt, as deepseek_v4.c's) as
+ * q38_<identity>_<ids hash>.bin: the head, the ids, the state (Q38PinState), every position's rows
+ * (the store's blocks and the checkpoint's tail), then a SHA-256 of all that. Written after DONE,
+ * from a copy of the store's (none under COLI_PS_RAM_FLOOR_MB free), on a thread of its own as
+ * temp + rename, so decode never waits on the disk. A request the RAM store does not take as far
+ * takes the deepest file its prompt starts with: size and hash checked before a row is written (a
+ * file that fails them is deleted), then its rows and state put back as a store hit's. The
+ * identity, in the name and the head: this format, the rows' layout and block, the state's
+ * geometry, the weights (SNAP's safetensors and config, a GGUF's files, the int4 or low-bit expert
+ * sidecar's files, by name, size and time), the knobs that pick the prefill's kernels, this build
+ * and the kernels it loads at run time (the binary, the backend DLL, the Vulkan shaders by size and
+ * time): another model or build never opens a file. Q38_PREFIX_DISK_MB caps the directory (default
+ * 4096): the least recently used go first (mtime: the last request whose prompt starts with the
+ * file; at one age the deeper first, so a conversation's system-prompt file goes last); a file over
+ * the cap is not written.
+ * shortcut: only the knobs hashed in q38_psd_on are in the identity; another one that changes the
+ * prefill's bits needs its own Q38_PREFIX_DIR per A/B arm. */
+#include <sys/stat.h>
+#include <utime.h>
+#include <dirent.h>
+#include "own_file.h"         /* the files sit in a downloaded model's directory */
+#include "evidence_digest.h"  /* the files' SHA-256 trailer */
+#ifdef _WIN32
+#include <direct.h>
+#include <process.h>
+#define q38_psd_mkdir(p) _mkdir(p)
+#define q38_psd_pid() _getpid()
+#define q38_psd_seek(f,o,w) _fseeki64((f),(o),(w))
+#define q38_psd_tell(f) ((int64_t)_ftelli64(f))
+#else
+#define q38_psd_mkdir(p) mkdir((p),0755)
+#define q38_psd_pid() getpid()
+#define q38_psd_seek(f,o,w) fseeko((f),(off_t)(o),(w))
+#define q38_psd_tell(f) ((int64_t)ftello(f))
+#endif
+#define Q38_PSD_MAGIC "Q38PSD1"   /* with its NUL, 8 bytes */
+#define Q38_PSD_FNV0 0xcbf29ce484222325ull
+enum { Q38_PSD_HEAD=8+8+4*4, Q38_PSD_JOBS=4 };   /* magic, identity, P, depth, tail, B; the ids follow */
+static char g_q38_psd_dir[1024];   /* "" not worked out yet, "-" none */
+static uint64_t g_q38_psd_id;
+static uint64_t q38_psd_fnv(uint64_t h,const void *p,size_t n){
+    const unsigned char *b=(const unsigned char*)p;
+    while(n--)h=(h^*b++)*0x100000001b3ull;
+    return h;
+}
+/* a file by size and time; its path when it cannot be stat'd */
+static uint64_t q38_psd_stamp(uint64_t h,const char *path){
+    struct stat st;
+    if(stat(path,&st))return q38_psd_fnv(h,path,strlen(path));
+    const int64_t stamp[2]={(int64_t)st.st_size,(int64_t)st.st_mtime};
+    return q38_psd_fnv(h,stamp,sizeof stamp);
+}
+/* dir's files that end in sfx ("": all), and its config.json, gguf.json and index.json, by name,
+ * size and time, in any order */
+static uint64_t q38_psd_dir_stamp(uint64_t h,const char *dir,const char *sfx){
+    DIR *d=dir?opendir(dir):NULL; struct dirent *de; char path[1200]; struct stat st;
+    uint64_t files=0; const size_t k=strlen(sfx);
+    while(d&&(de=readdir(d))){
+        const size_t n=strlen(de->d_name);
+        if(!(n>k&&!strcmp(de->d_name+n-k,sfx))&&strcmp(de->d_name,"config.json")&&
+           strcmp(de->d_name,"gguf.json")&&strcmp(de->d_name,"index.json"))continue;
+        snprintf(path,sizeof path,"%s/%s",dir,de->d_name);
+        if(stat(path,&st)||!S_ISREG(st.st_mode))continue;
+        const int64_t stamp[2]={(int64_t)st.st_size,(int64_t)st.st_mtime};
+        files+=q38_psd_fnv(q38_psd_fnv(Q38_PSD_FNV0,de->d_name,n),stamp,sizeof stamp);
+    }
+    if(d)closedir(d);
+    return q38_psd_fnv(h,&files,sizeof files);
+}
+/* Q38_PREFIX_DISK=1 with the store on: the directory and the identity, worked out once a serve. */
+static int q38_psd_on(Model *m){
+    const char *e=getenv("Q38_PREFIX_DISK");
+    if(!e||atoi(e)<1||!q38_ps_on(m))return 0;
+    if(!g_q38_psd_dir[0]){
+        const char *dir=getenv("Q38_PREFIX_DIR"),*snap=getenv("SNAP");
+        if(dir&&*dir)snprintf(g_q38_psd_dir,sizeof g_q38_psd_dir,"%s",dir);
+        else if(snap&&*snap)snprintf(g_q38_psd_dir,sizeof g_q38_psd_dir,"%s/.coli_ckpt",snap);
+        else g_q38_psd_dir[0]='-';
+        if(g_q38_psd_dir[0]!='-'&&coli_own_is_link(g_q38_psd_dir)){   /* the engine makes it: a link came with the model */
+            fprintf(stderr,"[PREFIX] disk: %s is a link, not the engine's directory: checkpoints stay in memory\n",g_q38_psd_dir);
+            g_q38_psd_dir[0]='-';
+        }
+        ColiPsPart *parts=(ColiPsPart*)malloc((size_t)3*q38_layer_rows(m)*sizeof *parts+1);
+        const int np=parts?q38_ps_parts(m,parts):0;
+        size_t g[3]={0,0,0};
+        if(!np||!coli_ps_layout(&g_q38_ps,parts,np)||!q38_prefix_geometry(m,&g[0],&g[1],&g[2]))g_q38_psd_dir[0]='-';
+        free(parts);
+        const Cfg *c=&m->c;
+        const int64_t shape[8]={g_q38_ps.B,(int64_t)g[0],(int64_t)g[1],(int64_t)g[2],c->layers,c->vocab,c->hc_width,m->mtp!=0};
+        uint64_t h=q38_psd_fnv(Q38_PSD_FNV0,Q38_PSD_MAGIC,8);
+        h=q38_psd_fnv(h,shape,sizeof shape);
+        h=q38_psd_fnv(h,&g_q38_ps.sig,sizeof g_q38_ps.sig);   /* every part's row size and heads */
+        h=q38_psd_fnv(h,c->is_attn,(size_t)c->layers);
+        /* the weights: SNAP's safetensors and config, a GGUF's files (they may sit elsewhere) */
+        h=q38_psd_dir_stamp(h,snap,".safetensors");
+        for(int k=0;g_q38_gguf&&k<g_q38gg.n_files;k++)h=q38_psd_stamp(h,g_q38gg.paths[k]);
+        for(int k=0;g_q38_gguf&&k<g_q38gg_mtp.n_files;k++)h=q38_psd_stamp(h,g_q38gg_mtp.paths[k]);
+        /* the routed experts attached (the int4 sidecar is taken unasked when it is complete): which, and their files */
+        char path[1200];
+        const int ex=m->x4?(m->x4->lb?2:1):0;
+        h=q38_psd_fnv(h,&ex,sizeof ex);
+        if(ex&&snap){
+            snprintf(path,sizeof path,"%s/%s",snap,m->x4->lb?m->x4->lb->dir:Q38_INT4_DIR);
+            h=q38_psd_dir_stamp(h,path,"");
+        }
+        /* the kernels loaded at run time: this binary, the backend DLL, the Vulkan shaders */
+#ifdef _WIN32
+        static const char *dlls[]={NULL,"coli_cuda.dll","coli_hip.dll"};
+        for(size_t k=0;k<sizeof dlls/sizeof *dlls;k++){
+            HMODULE mod=dlls[k]?GetModuleHandleA(dlls[k]):NULL;
+            const DWORD n=dlls[k]&&!mod?0:GetModuleFileNameA(mod,path,(DWORD)sizeof path);
+            if(n&&n<sizeof path)h=q38_psd_stamp(h,path);
+        }
+#elif defined(__linux__)
+        h=q38_psd_stamp(h,"/proc/self/exe");
+#endif
+#ifdef COLI_VULKAN
+        {
+            char spv[1024];
+            snprintf(path,sizeof path,"%s",coli_vk_shader_path(spv,sizeof spv));
+            char *sl=strrchr(path,'/'),*bs=strrchr(path,'\\');
+            if(bs&&(!sl||bs>sl))sl=bs;
+            if(sl)*sl=0; else strcpy(path,".");
+            h=q38_psd_dir_stamp(h,path,".spv");
+        }
+#endif
+        /* the knobs that pick the prefill's kernels: their states' bits are not the same */
+        static const char *knobs[]={"COLI_CUDA","COLI_CUDA_CHAIN","COLI_VULKAN","COLI_VK_CHAIN","Q38_TRUNK_GPU","Q38_DN_GPU",
+                                    "Q38_EXPERT_INT4","Q38_EXPERT_INT2","Q38_EXPERT_LOWBIT","Q38_TRUNK_CPU_INT8",
+                                    "Q38_TRUNK_CPU_INT4","Q38_TRUNK_MIN_KB","Q38_FP8_KERNEL","Q38_NATIVE_FP8",
+                                    "Q38_NATIVE_BF16","Q38_PREFILL_BATCH","Q38_MTP","Q38_KV","GQ_EXACT","Q38_ILV16",
+                                    "Q38_MOE_GROUPED","Q38_TRUNK_INT4_HEAD"};
+        for(size_t k=0;k<sizeof knobs/sizeof *knobs;k++){
+            const char *v=getenv(knobs[k]);
+            h=q38_psd_fnv(h,knobs[k],strlen(knobs[k])+1);
+            h=q38_psd_fnv(h,v?v:"",v?strlen(v)+1:0);
+        }
+        { unsigned char kv=(unsigned char)q38_kv16(); h=q38_psd_fnv(h,&kv,1); }   /* Q38_KV unset follows SERVE: hash what the rows hold */
+        h=q38_psd_fnv(h,__DATE__ " " __TIME__,sizeof(__DATE__ " " __TIME__));   /* this build: a kernel change changes a state's bits */
+        g_q38_psd_id=h;
+    }
+    return g_q38_psd_dir[0]!='-';
+}
+static void q38_psd_path(char *out,size_t n,const int *ids,int P){
+    snprintf(out,n,"%s/q38_%016llx_%016llx.bin",g_q38_psd_dir,(unsigned long long)g_q38_psd_id,
+             (unsigned long long)q38_psd_fnv(Q38_PSD_FNV0,ids,(size_t)P*sizeof(int)));
+}
+/* a file's whole size at P: head, ids, state, rows, hash */
+static int64_t q38_psd_size(const Model *m,int P,size_t rec,size_t conv,size_t ple){
+    int64_t b=Q38_PSD_HEAD+(int64_t)P*(int64_t)sizeof(int)+(int64_t)ple*(int64_t)sizeof(float)+(int64_t)sizeof(int64_t[2])+(int64_t)sizeof(int);
+    for(int i=0;i<m->c.layers;i++)if(!m->c.is_attn[i])b+=(int64_t)(rec+conv)*(int64_t)sizeof(float);
+    if(m->mtp)b+=(int64_t)Q38_SPEC_ROWS*m->c.hc_width*(int64_t)sizeof(float)+2*(int64_t)sizeof(int)+Q38_SPEC_ROWS*(int64_t)sizeof(int);
+    return b+(int64_t)P*(int64_t)(g_q38_ps.blk_bytes/g_q38_ps.B)+32;   /* every part a row a position (per 1) */
+}
+static double q38_psd_cap(void){ const char *e=getenv("Q38_PREFIX_DISK_MB"); return (e&&*e?atof(e):4096.0)*1048576.0; }
+/* a name the engine writes: q38_<16 hex>_<16 hex>.bin, or its temp (.bin.<pid>.tmp) */
+static int q38_psd_ours(const char *s){
+    static const char hex[]="0123456789abcdef",dig[]="0123456789";
+    const size_t n=strlen(s);
+    if(n<41||strncmp(s,"q38_",4)||strspn(s+4,hex)!=16||s[20]!='_'||strspn(s+21,hex)!=16||strncmp(s+37,".bin",4))return 0;
+    return n==41||(n>46&&s[41]=='.'&&strspn(s+42,dig)==n-46&&!strcmp(s+n-4,".tmp"));
+}
+typedef struct { char name[64]; int64_t bytes; time_t used; } Q38PsdFile;
+static int q38_psd_older(const void *a,const void *b){
+    const Q38PsdFile *x=(const Q38PsdFile*)a,*y=(const Q38PsdFile*)b;
+    if(x->used!=y->used)return x->used<y->used?-1:1;
+    return (x->bytes<y->bytes)-(x->bytes>y->bytes);   /* used at once: the deeper first */
+}
+/* The directory under Q38_PREFIX_DISK_MB: the least recently used of the engine's files go; keep stays. */
+static void q38_psd_trim(const char *keep){
+    DIR *d=opendir(g_q38_psd_dir);
+    if(!d)return;
+    Q38PsdFile *f=NULL; int n=0,room=0; double total=0;
+    const double cap=q38_psd_cap(); char path[1200]; struct dirent *de; struct stat st;
+    while((de=readdir(d))){
+        if(!q38_psd_ours(de->d_name)||strlen(de->d_name)>=sizeof f->name)continue;
+        snprintf(path,sizeof path,"%s/%s",g_q38_psd_dir,de->d_name);
+        if(stat(path,&st)||!S_ISREG(st.st_mode))continue;
+        total+=(double)st.st_size;
+        if(!strcmp(path,keep))continue;
+        if(n==room){
+            Q38PsdFile *g=(Q38PsdFile*)realloc(f,(size_t)(room?2*room:64)*sizeof *f);
+            if(!g)break;
+            f=g; room=room?2*room:64;
+        }
+        snprintf(f[n].name,sizeof f->name,"%s",de->d_name);
+        f[n].bytes=(int64_t)st.st_size; f[n++].used=st.st_mtime;
+    }
+    closedir(d);
+    if(n)qsort(f,(size_t)n,sizeof *f,q38_psd_older);
+    for(int i=0;i<n&&total>cap;i++){
+        snprintf(path,sizeof path,"%s/%s",g_q38_psd_dir,f[i].name);
+        if(remove(path))continue;
+        total-=(double)f[i].bytes;
+        fprintf(stderr,"[PREFIX] disk: evicted %s (Q38_PREFIX_DISK_MB)\n",f[i].name);
+    }
+    free(f);
+}
+/* What the writer's thread writes: whole images (all but the hash), freed as they go. */
+typedef struct { char *img[Q38_PSD_JOBS]; size_t n[Q38_PSD_JOBS]; char path[Q38_PSD_JOBS][1100]; int count; time_t now; } Q38PsdJob;
+/* The request's age (q38_psd_find): every file on its prompt's path gets it, the written ones too, so
+ * the trim, the deeper first at one age, takes a chain's descendants before the system prompt's file. */
+static time_t g_q38_psd_now;
+static Q38PsdJob g_q38_psd_job;
+static pthread_t g_q38_psd_th;
+static int g_q38_psd_busy;
+static void *q38_psd_write(void *arg){
+    Q38PsdJob *j=(Q38PsdJob*)arg;
+    for(int i=0;i<j->count;i++){
+        char tmp[1200]; unsigned char dg[32]; int32_t P;
+        memcpy(&P,j->img[i]+16,sizeof P);
+        snprintf(tmp,sizeof tmp,"%s.%d.tmp",j->path[i],(int)q38_psd_pid());   /* its own temp: two engines never mix bytes */
+        EvidenceSha256 sha; evidence_sha256_init(&sha);
+        evidence_sha256_update(&sha,j->img[i],j->n[i]); evidence_sha256_final(&sha,dg);
+        FILE *f=coli_own_fopen(tmp,"wb");
+        if(!f){q38_psd_mkdir(g_q38_psd_dir);f=coli_own_fopen(tmp,"wb");}
+        int ok=f&&fwrite(j->img[i],1,j->n[i],f)==j->n[i]&&fwrite(dg,1,sizeof dg,f)==sizeof dg;
+        if(f)ok=!fclose(f)&&ok;
+        if(ok&&rename(tmp,j->path[i]))ok=0;   /* compat.h's rename replaces on Windows too */
+        if(!ok)remove(tmp);
+        else{struct utimbuf t={j->now,j->now};utime(j->path[i],&t);}
+        fprintf(stderr,"[PREFIX] disk: checkpoint at %d %s (%.1f MiB, %s)\n",P,ok?"written":"not written",
+                (j->n[i]+sizeof dg)/1048576.0,j->path[i]);
+        free(j->img[i]); j->img[i]=NULL;
+        if(ok)q38_psd_trim(j->path[i]);
+    }
+    fflush(stderr);
+    return NULL;
+}
+static void q38_psd_join(void){ if(g_q38_psd_busy){pthread_join(g_q38_psd_th,NULL);g_q38_psd_busy=0;} }
+/* The image of the store's checkpoint at exactly ids[0, P) (its size in *bytes); NULL when the store
+ * does not hold it, it is over the cap, or its copy would leave less than the store's RAM floor free. */
+static char *q38_psd_image(Model *m,const int *ids,int P,size_t *bytes){
+    size_t rec=0,conv=0,ple=0;
+    if(!q38_prefix_geometry(m,&rec,&conv,&ple))return NULL;
+    ColiPsHit h;
+    const int got=coli_ps_lookup(&g_q38_ps,ids,P,P,1,&h);
+    g_q38_ps.lookups--;   /* not a request's */
+    const Q38PinState *st=got==P&&h.ck>=0?(const Q38PinState*)g_q38_ps.ck[h.ck].state:NULL;
+    const int64_t size=q38_psd_size(m,P,rec,conv,ple)-32;
+    const double avail=compat_mem_available_gb()*1024.0;
+    char *img=NULL;
+    if(st&&st->n_layers==m->c.layers&&(!m->mtp||st->mtp_pend)&&(!ple||st->ple)&&size+32<=q38_psd_cap()&&
+       (avail<0||avail-size/1048576.0>=COLI_PS_RAM_FLOOR_MB))img=(char*)malloc((size_t)size);
+    if(img){
+        const ColiPsCkpt *ck=&g_q38_ps.ck[h.ck];
+        const int32_t head[4]={P,ck->depth,ck->tail,g_q38_ps.B};
+        char *w=img;
+#define Q38_PSD_PUT(p,n) (memcpy(w,(p),(n)),w+=(n))
+        Q38_PSD_PUT(Q38_PSD_MAGIC,8); Q38_PSD_PUT(&g_q38_psd_id,8); Q38_PSD_PUT(head,sizeof head);
+        Q38_PSD_PUT(ids,(size_t)P*sizeof(int));
+        for(int i=0;i<m->c.layers;i++)
+            if(!m->c.is_attn[i]){Q38_PSD_PUT(st->rec[i],rec*sizeof(float));Q38_PSD_PUT(st->conv[i],conv*sizeof(float));}
+        if(ple)Q38_PSD_PUT(st->ple,ple*sizeof(float));
+        Q38_PSD_PUT(st->ple_hist,sizeof st->ple_hist); Q38_PSD_PUT(&st->ple_len,sizeof(int));
+        if(m->mtp){
+            Q38_PSD_PUT(st->mtp_pend,(size_t)Q38_SPEC_ROWS*m->c.hc_width*sizeof(float));
+            Q38_PSD_PUT(&st->mtp_len,sizeof(int)); Q38_PSD_PUT(&st->mtp_pend_n,sizeof(int));
+            Q38_PSD_PUT(st->mtp_pend_tok,sizeof st->mtp_pend_tok);
+        }
+        for(int k=0;k<h.depth;k++)Q38_PSD_PUT(g_q38_ps.blk[h.path[k]].rows,g_q38_ps.blk_bytes);
+        if(ck->tail)Q38_PSD_PUT(ck->trows,(size_t)ck->tail*(g_q38_ps.blk_bytes/g_q38_ps.B));
+#undef Q38_PSD_PUT
+        if(w-img!=size){free(img);img=NULL;}   /* the geometry and the size disagree: nothing written */
+        else *bytes=(size_t)size;
+    }
+    coli_ps_hit_free(&h);
+    return img;
+}
+/* The checkpoints this request's prompt kept where conversations part from it, written after its
+ * DONE (q38_psd_flush). */
+static int *g_q38_psd_ids[Q38_PSD_JOBS],g_q38_psd_P[Q38_PSD_JOBS],g_q38_psd_n;
+static void q38_psd_mark(Model *m,const int *ids,int P){
+    if(g_q38_psd_n>=Q38_PSD_JOBS||!q38_psd_on(m))return;
+    int *c=(int*)malloc((size_t)P*sizeof(int));
+    if(!c)return;
+    memcpy(c,ids,(size_t)P*sizeof(int));
+    g_q38_psd_ids[g_q38_psd_n]=c; g_q38_psd_P[g_q38_psd_n++]=P;
+}
+/* After DONE: the marks' images to the writer's thread (the last request's writes finished first). */
+static void q38_psd_flush(Model *m){
+    if(!g_q38_psd_n)return;
+    q38_psd_join();
+    Q38PsdJob *j=&g_q38_psd_job;
+    j->count=0; j->now=g_q38_psd_now?g_q38_psd_now:time(NULL); g_q38_psd_now=0;
+    for(int i=g_q38_psd_n-1;i>=0;i--){   /* the deepest first: where the system prompt ends is the last trim's keep */
+        const int P=g_q38_psd_P[i]; size_t n=0; char *img; struct stat sb;
+        q38_psd_path(j->path[j->count],sizeof j->path[0],g_q38_psd_ids[i],P);
+        if(!stat(j->path[j->count],&sb)){   /* there already: q38_psd_find gave it this request's age */
+            if(getenv("COLI_PREFIX_LOG"))fprintf(stderr,"[PREFIX] disk: checkpoint at %d on disk already\n",P);
+        }else if((img=q38_psd_image(m,g_q38_psd_ids[i],P,&n))){j->img[j->count]=img;j->n[j->count++]=n;}
+        else fprintf(stderr,"[PREFIX] disk: checkpoint at %d not written (not in the store, over Q38_PREFIX_DISK_MB "
+                            "or under the RAM floor)\n",P);
+        free(g_q38_psd_ids[i]);
+    }
+    g_q38_psd_n=0;
+    if(!j->count)return;
+    if(pthread_create(&g_q38_psd_th,NULL,q38_psd_write,j))q38_psd_write(j);   /* no thread: here */
+    else g_q38_psd_busy=1;
+}
+/* The deepest file of this identity that ids[0, np) starts with, floor < P < np and P within the
+ * context: its P (its path in out), 0 none. Reads the heads and ids only; every file the prompt
+ * starts with gets this request's age (g_q38_psd_now). */
+static int q38_psd_find(Model *m,const int *ids,int np,int floor,char *out,size_t size){
+    char want[32];
+    const int wl=snprintf(want,sizeof want,"q38_%016llx_",(unsigned long long)g_q38_psd_id);
+    DIR *d=opendir(g_q38_psd_dir);
+    if(!d)return 0;
+    int best=0,*fid=NULL; char path[1200]; struct dirent *de;
+    g_q38_psd_now=time(NULL);
+    struct utimbuf t={g_q38_psd_now,g_q38_psd_now};
+    while((de=readdir(d))){
+        if(strlen(de->d_name)!=41||!q38_psd_ours(de->d_name)||strncmp(de->d_name,want,(size_t)wl))continue;
+        snprintf(path,sizeof path,"%s/%s",g_q38_psd_dir,de->d_name);
+        FILE *f=coli_own_fopen(path,"rb");
+        if(!f)continue;
+        char magic[8]; uint64_t id=0; int32_t head[4]={0};
+        int ok=fread(magic,8,1,f)==1&&!memcmp(magic,Q38_PSD_MAGIC,8)&&fread(&id,8,1,f)==1&&id==g_q38_psd_id&&
+               fread(head,sizeof head,1,f)==1&&head[0]>0&&head[0]<np&&
+               head[3]==g_q38_ps.B&&head[1]>=0&&head[2]>=0&&head[2]<head[3]&&(int64_t)head[1]*head[3]+head[2]==head[0];
+        int *g=ok?(int*)realloc(fid,(size_t)head[0]*sizeof(int)):NULL;
+        if(g)fid=g;
+        ok=g&&fread(fid,sizeof(int),(size_t)head[0],f)==(size_t)head[0]&&!memcmp(fid,ids,(size_t)head[0]*sizeof(int));
+        fclose(f);
+        if(ok)utime(path,&t);   /* on this prompt's path: the age the trim goes by, the shallower kept too */
+        if(ok&&head[0]>floor&&head[0]>best&&head[0]<=m->kv_cap){best=head[0];snprintf(out,size,"%s",path);}
+    }
+    closedir(d);
+    free(fid);
+    return best;
+}
+/* The file at path (P positions of ids) into the slot as a store hit: P; 0 refused (a file whose
+ * size, hash or state fails is deleted; the slot untouched); -1 a read failed with rows already
+ * written: the slot emptied, the caller reads the whole prompt. */
+static int q38_psd_restore(Model *m,const char *path,const int *ids,int P,int np,int held){
+    size_t rec=0,conv=0,ple=0;
+    ColiPsPart *parts=(ColiPsPart*)malloc((size_t)3*q38_layer_rows(m)*sizeof *parts+1);
+    const int nparts=parts?q38_ps_parts(m,parts):0;
+    const size_t bb=g_q38_ps.blk_bytes,pos=bb/g_q38_ps.B;
+    char *buf=parts?(char*)malloc(bb):NULL;
+    Q38PinState *st=NULL; FILE *f=NULL; int rc=0,bad=0;
+    if(!buf||!nparts||!coli_ps_layout(&g_q38_ps,parts,nparts)||!coli_ps_parts_hold(parts,nparts,P)||
+       !q38_prefix_geometry(m,&rec,&conv,&ple)||!(f=coli_own_fopen(path,"rb")))goto out;
+    const int64_t want=q38_psd_size(m,P,rec,conv,ple);
+    unsigned char dg[32],stored[32];
+    EvidenceSha256 sha; evidence_sha256_init(&sha);
+    int ok=!q38_psd_seek(f,0,SEEK_END)&&q38_psd_tell(f)==want&&!q38_psd_seek(f,0,SEEK_SET);
+    for(int64_t left=want-32;ok&&left>0;){
+        const size_t n=left<(int64_t)bb?(size_t)left:bb;
+        ok=fread(buf,1,n,f)==n;
+        if(ok)evidence_sha256_update(&sha,buf,n);
+        left-=(int64_t)n;
+    }
+    if(ok){evidence_sha256_final(&sha,dg);ok=fread(stored,1,32,f)==32&&!memcmp(dg,stored,32);}
+    ok=ok&&!q38_psd_seek(f,Q38_PSD_HEAD+(int64_t)P*(int64_t)sizeof(int),SEEK_SET);
+    if(!ok){bad=1;goto out;}
+    if(!q38_pin_state_copy(m,&st,1))goto out;   /* a state's room, the model's shape, before anything is written */
+#define Q38_PSD_GET(p,n) (fread((p),1,(n),f)==(n))
+    for(int i=0;ok&&i<m->c.layers;i++)
+        if(!m->c.is_attn[i])ok=Q38_PSD_GET(st->rec[i],rec*sizeof(float))&&Q38_PSD_GET(st->conv[i],conv*sizeof(float));
+    if(ple)ok=ok&&st->ple&&Q38_PSD_GET(st->ple,ple*sizeof(float));
+    ok=ok&&Q38_PSD_GET(st->ple_hist,sizeof st->ple_hist)&&Q38_PSD_GET(&st->ple_len,sizeof(int));
+    if(m->mtp)ok=ok&&st->mtp_pend&&Q38_PSD_GET(st->mtp_pend,(size_t)Q38_SPEC_ROWS*m->c.hc_width*sizeof(float))&&
+                 Q38_PSD_GET(&st->mtp_len,sizeof(int))&&Q38_PSD_GET(&st->mtp_pend_n,sizeof(int))&&
+                 Q38_PSD_GET(st->mtp_pend_tok,sizeof st->mtp_pend_tok)&&
+                 st->mtp_len>=0&&st->mtp_len<=P&&st->mtp_pend_n>=0&&st->mtp_pend_n<=Q38_SPEC_ROWS;
+    ok=ok&&st->ple_len>=0&&st->ple_len<=2;   /* indices into the PLE history */
+    /* the token ids the state carries index the embeddings: in the vocabulary, as the segment adapter checks */
+    for(int j=0;ok&&j<st->ple_len;j++)ok=st->ple_hist[j]>=0&&st->ple_hist[j]<m->c.vocab;
+    for(int j=0;ok&&m->mtp&&j+1<st->mtp_pend_n;j++)ok=st->mtp_pend_tok[j]>=0&&st->mtp_pend_tok[j]<m->c.vocab;
+    if(!ok){bad=1;goto out;}
+    q38_prefix_settle(m);   /* the chain's prompt-end snapshot is the host's before the state moves */
+    /* the rows, block by block as the store keeps them, then the tail: from here the slot changes */
+    for(int k=0;ok&&k<P/g_q38_ps.B;k++)
+        if((ok=Q38_PSD_GET(buf,bb)))coli_ps_rows(parts,nparts,k*g_q38_ps.B,g_q38_ps.B,buf,0);
+    if(ok&&P%g_q38_ps.B&&(ok=Q38_PSD_GET(buf,(size_t)(P%g_q38_ps.B)*pos)))
+        coli_ps_rows(parts,nparts,P/g_q38_ps.B*g_q38_ps.B,P%g_q38_ps.B,buf,0);
+#undef Q38_PSD_GET
+    if(ok)q38_pin_state_copy(m,&st,0);   /* the state on the host, the devices told to take it up */
+    m->kv_len=ok?P:0;
+    kv_prefix_clear(&m->kvp);
+    if(ok)kv_prefix_record(&m->kvp,ids,0,P);
+#ifdef COLI_VULKAN
+    q38c_rollback(m,-1,0);   /* every row came from the file: the mirrors take them all up again */
+    q38c_mtp_host(m,0);
+#endif
+#ifdef COLI_CUDA
+    q38cc_rollback(m,-1,0);
+    q38cc_mtp_host(m,0);
+#endif
+    rc=ok?P:-1;
+out:
+    if(f)fclose(f);
+    if(bad){
+        remove(path);
+        fprintf(stderr,"[PREFIX] disk: %s dropped (size, hash or state wrong)\n",path);
+    }else if(rc>0)fprintf(stderr,"[PREFIX] %d of %d prompt tokens from disk (%s; the slot held %d)\n",P,np,path,held);
+    else if(rc<0)fprintf(stderr,"[PREFIX] disk: %s failed part way: the prompt is read whole\n",path);
+    fflush(stderr);
+    q38_pin_state_free(st); free(buf); free(parts);
+    return rc;
+}
+/* The deepest prefix of ids[0, np) the store holds, in RAM or on disk, past `held` (q38_ps_take_ram):
+ * the positions now held; 0 nothing; -1 the slot emptied by a file that failed part way. The RAM's
+ * when it reaches as far as the deepest file. */
+static int q38_ps_take(Model *m,const int *ids,int np,int held){
+    if(!q38_ps_on(m)||np<2)return 0;
+    const int floor=held+coli_ps_min_gain(&g_q38_ps);
+    char path[1200];
+    int dP=q38_psd_on(m)?q38_psd_find(m,ids,np,floor,path,sizeof path):0;
+    if(!dP)return q38_ps_take_ram(m,ids,np,held,floor);
+    int got=q38_ps_take_ram(m,ids,np,held,dP-1);
+    for(int tries=0;!got&&dP>0&&tries<3;tries++)
+        if(!(got=q38_psd_restore(m,path,ids,dP,np,held)))dP=q38_psd_find(m,ids,np,floor,path,sizeof path);   /* that one refused */
+    return got?got:q38_ps_take_ram(m,ids,np,held,floor);
 }
 /* where a prompt read from `from` keeps checkpoints (coli_ps_marks): where its messages start */
 static int q38_ps_marks(const Model *m,const int *ids,int np,int from,int *marks){
@@ -2468,7 +2890,7 @@ static float *q38_serve_prefill_at(Model *m,const int *ids,int from,int np,ColiP
         q38_head_pin(m,ids,h,lo);
         free(lo);
         from=h;
-        q38_ps_save(m,ids,from);
+        if(q38_ps_save(m,ids,from))q38_psd_mark(m,ids,from);
     }
     if(snap_ok){   /* in pieces where its messages start, the state there kept for later requests (q38_ps_save) */
         int marks[2],nm=q38_ps_marks(m,ids,np,from,marks);
@@ -2478,7 +2900,7 @@ static float *q38_serve_prefill_at(Model *m,const int *ids,int from,int np,ColiP
             if(!lo)return NULL;
             free(lo);
             from=marks[k];
-            q38_ps_save(m,ids,from);
+            if(q38_ps_save(m,ids,from))q38_psd_mark(m,ids,from);
         }
     }
     const int a=snap_ok?q38_answer_start(ids,np):-1;
@@ -2618,7 +3040,8 @@ static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
      * system prompt, this one's before another took the slot or on the other slot (q38_ps_take) */
     if(!q->logprobs&&!prefix_off&&!(m->vis_map&&m->vis_rows_n>0)){
         int got=q38_ps_take(m,ids,np,reuse);
-        if(got){reuse=got;pin_lo=NULL;reused_from="the store";}
+        if(got<0){reuse=0;pin_lo=NULL;}   /* a file failed part way: the slot is empty */
+        else if(got){reuse=got;pin_lo=NULL;reused_from="the store";}
     }
     if(getenv("COLI_PREFIX_LOG")){
         if(reuse)
@@ -2797,7 +3220,8 @@ static int serve_one_turn(Model *m, ServeReq *q){
     else fprintf(stderr,"[qwen38] internal error: PROF frame overflow\n");
     fflush(stdout);
     /* the conversation as the turn left it, for its next turn after another took the slot (one as
-     * long as a parked one at least: COLI_PARK_MIN) */
+     * long as a parked one at least: COLI_PARK_MIN); the marks' files first, before its save evicts them */
+    q38_psd_flush(m);
     {
         const char *mn=getenv("COLI_PARK_MIN");
         const int least=mn&&atoi(mn)>0?atoi(mn):Q38_PARK_MIN;
@@ -2911,6 +3335,7 @@ static void q38_mux_finish(Model *m,Q38MuxReq *r){
     q38_report_request_split(m,&r->clk,r->q.id);
     /* the slot's conversation as the turn left it, for its next turn on another slot (one as long
      * as a parked one at least: COLI_PARK_MIN) */
+    q38_psd_flush(m);
     q38_mux_bind(m,r->q.slot);
     const char *mn=getenv("COLI_PARK_MIN");
     const int least=mn&&atoi(mn)>0?atoi(mn):Q38_PARK_MIN;
@@ -3064,11 +3489,11 @@ static void serve_loop(Model *m){
     printf("STAT 0 0.00 0.0 %.2f\n",rss_gb());
     fflush(stdout);
     serve_emap(m);                       /* after READY and STAT: the boot reader discards what precedes them */
-    if(g_q38_mux_slots>1){serve_mux(m);q38_mux_free(m);coli_ps_report(&g_q38_ps);return;}
+    if(g_q38_mux_slots>1){serve_mux(m);q38_mux_free(m);q38_psd_join();coli_ps_report(&g_q38_ps);return;}
     for(;;){
         ServeReq q={0}; int r;
         do r=serve_read_req(stdin,stdout,&q,NULL); while(r!=2&&r>=0);
-        if(r<0){q38_prefix_cache_release(m);coli_ps_report(&g_q38_ps);return;}
+        if(r<0){q38_prefix_cache_release(m);q38_psd_join();coli_ps_report(&g_q38_ps);return;}
         if(r==2){
             int status=serve_one(m,&q);free(q.payload);
 #ifdef COLI_CUDA
@@ -3079,7 +3504,7 @@ static void serve_loop(Model *m){
             q38c_report(m);
             vkt_report("turn", m->hits, m->miss);
 #endif
-            if(status<0){q38_prefix_cache_release(m);coli_ps_report(&g_q38_ps);return;}
+            if(status<0){q38_prefix_cache_release(m);q38_psd_join();coli_ps_report(&g_q38_ps);return;}
             serve_emap(m);
         }
     }
