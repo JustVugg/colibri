@@ -284,8 +284,16 @@ class ConvertQwen38ExpertsInt4(unittest.TestCase):
         from contextlib import redirect_stdout
         import io
         buf = io.StringIO()
-        with redirect_stdout(buf):
-            self.converter.convert(str(self.root), workers=1, **kw)
+        try:
+            with redirect_stdout(buf):
+                self.converter.convert(str(self.root), workers=1, **kw)
+        finally:
+            # workers=1 converts in this process, whose Source keeps the shards open: Windows cannot delete an open file
+            source = self.converter._SOURCE
+            if source is not None:
+                for fd in source._fds.values():
+                    os.close(fd)
+                source._fds.clear()
         return buf.getvalue()
 
     def test_layout_quantizer_and_error(self):
