@@ -219,17 +219,18 @@ class Dsv41VendorEncodingCases(unittest.TestCase):
 
     Two of the five reference cases are not modelled by the gateway and are
     not copied here: case 3 and case 4 use the `latest_reminder` role and the
-    internal classification `task` tokens, and case 5 carries multimodal
-    content blocks that the gateway expands into image placeholders upstream
-    of the renderer (expand_dsv41_images), not inside it.
+    internal classification `task` tokens. Case 5 carries multimodal content
+    blocks, which the gateway expands into image placeholders upstream of the
+    renderer (expand_dsv41_images), so its test runs the expander first.
     """
 
     @staticmethod
     def _case(number):
-        payload = json.loads((HERE / f"fixtures/dsv41_encoding_case{number}.json").read_text())
+        payload = json.loads((HERE / f"fixtures/dsv41_encoding_case{number}.json")
+                             .read_text(encoding="utf-8"))
         if isinstance(payload, list):
             payload = {"messages": payload}
-        vendor = (HERE / f"fixtures/dsv41_encoding_case{number}.txt").read_text()
+        vendor = (HERE / f"fixtures/dsv41_encoding_case{number}.txt").read_text(encoding="utf-8")
         return payload, vendor
 
     def _assert_case(self, number, reasoning_effort=None):
@@ -254,6 +255,26 @@ class Dsv41VendorEncodingCases(unittest.TestCase):
 
     def test_case2_plain_multi_turn_chat(self):
         self._assert_case(2)
+
+    def test_case5_image_blocks_through_the_image_expander(self):
+        # three text parts around two images, in thinking mode at the reference's "max"
+        # effort, which is the gateway's "xhigh": both are the budget 100
+        from unittest import mock
+        import openai_server
+
+        payload, vendor = self._case(5)
+        # The stub gives each image the shortest span, 2 placeholders. The reference
+        # writes one placeholder per image, so the comparison folds each span to one.
+        with mock.patch("openai_server._image_bytes_from_url", return_value=b""), \
+                mock.patch("openai_server._preprocess_dsv41_image",
+                           return_value=(None, 1, 1, 0, 0)):
+            messages, images = openai_server.expand_dsv41_images(payload["messages"], None)
+        self.assertEqual(len(images), 2)
+        rendered = openai_server.render_chat_dsv41(
+            messages, enable_thinking=payload["thinking_mode"] == "thinking",
+            reasoning_effort="xhigh")
+        image = openai_server.DSV41_IMAGE_PLACEHOLDER
+        self.assertEqual(rendered.replace(image * 2, image), vendor)
 
     def test_non_string_tool_call_ids_do_not_break_the_reorder(self):
         """The parallel-call reorder keys a dict by tool-call id: an id that is an object
