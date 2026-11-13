@@ -8,10 +8,15 @@
 </p>
 
 <p align="center">
+  <a href="https://news.ycombinator.com/item?id=48842459"><img src="https://hackergit.org/badge/JustVugg/colibri.svg?style=card" alt="Hacker News points via HackerGit" width="250" height="55"></a>
+</p>
+
+<p align="center">
   <a href="https://justvugg.github.io/colibri"><b>Website</b></a> ·
   <a href="https://discord.gg/RXV83nSZdk"><b>Discord</b></a> ·
   English · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.it.md">Italiano</a> · <a href="README.ja.md">日本語</a> · <a href="README.id.md">Bahasa Indonesia</a> · <a href="README.pt-BR.md">Português (Brasil)</a>
 </p>
+
 
 **Tiny engine, immense model.** colibri runs very large open models on the
 machine you already have. A mixture-of-experts model of hundreds of billions of
