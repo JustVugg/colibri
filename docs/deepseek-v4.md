@@ -146,9 +146,11 @@ them). `make cuda-dsv4-dg-dll` and `DEEPGEMM=1` run it on first build
 `DEEPGEMM_HOME=<dir>` points at an existing tree instead and `DEEPGEMM_PIN`
 bumps the commit. Attribution: `THIRD_PARTY_NOTICES.md`. Loader rules:
 try `_dg` first, ask it whether device 0 fits (`dsv4_cuda_backend_arch_ok`),
-otherwise load the generic DLL; `COLI_DSV4_DLL=<file name>` forces one. The
-start-up banner names the choice: `[DSV4 CUDA] backend=coli_cuda_dsv4_dg.dll
-(deepgemm-sm120)`. Deploy = `deepseek_v4.exe` + both DLLs next to it.
+otherwise load the generic DLL; `COLI_DSV4_DLL=<file name>` forces one from
+the engine's folder (a relative path too), `COLI_DSV4_DLL=<absolute path>`
+(`C:/x/coli_cuda_dsv4_dg.dll` or `C:\x\...`) loads that file, its CUDA runtime from beside it or PATH (never
+the current directory). The start-up banner names the choice and the file:
+`[DSV4 CUDA] backend=coli_cuda_dsv4_dg.dll (deepgemm-sm120) path=...`. Deploy = `deepseek_v4.exe` + both DLLs next to it.
 
 ### Linux CUDA tier
 
@@ -716,7 +718,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `DSV4_CUDA` (1) | master switch for the V4 GPU tier; `0` = CPU only |
 | `DSV4_CUDA_DEVICE` (0) | single CUDA device ordinal, used when `DSV4_CUDA_DEVICES` is unset |
 | `DSV4_CUDA_DEVICES` (unset) | ordered comma-separated distinct CUDA ordinals; split contiguous layers across these devices |
-| `COLI_DSV4_DLL` | Windows: force a backend DLL file name (loader) |
+| `COLI_DSV4_DLL` | Windows: force a backend DLL, by file name or relative path (engine's folder) or absolute path (loader) |
 | `COLI_CUDA_ATTN_BATCH` (0; 1 for a GGUF on the CUDA expert tier) | `1` = GPU batched prefill attention block + GPU decode attention/indexer; unset, it is on for a GGUF whose dense matrices the CUDA expert tier's device holds (`COLI_CUDA=1`, `COLI_CUDA_DENSE`), `0` keeps it on the CPU |
 | `COLI_CUDA_MOE_BATCH` (0) | `1` = prefill MoE on the transient VRAM expert bank |
 | `COLI_CUDA_MOE_BATCH_MIN` (256) | min fresh tokens to engage the bank |
