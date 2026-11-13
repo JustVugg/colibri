@@ -10,7 +10,7 @@
 <p align="center">
   <a href="https://justvugg.github.io/colibri"><b>Sito web</b></a> ·
   <a href="https://discord.gg/RXV83nSZdk"><b>Discord</b></a> ·
-  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · Italiano · <a href="README.ja.md">日本語</a> · <a href="README.id.md">Bahasa Indonesia</a> · <a href="README.pt-BR.md">Português (Brasil)</a>
+  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · Italiano · <a href="README.ja.md">日本語</a> · <a href="README.id.md">Bahasa Indonesia</a> · <a href="README.pt-BR.md">Português (Brasil)</a> · <a href="README.es.md">Español</a> · <a href="README.fr.md">Français</a> · <a href="README.de.md">Deutsch</a> · <a href="README.ru.md">Русский</a>
 </p>
 
 **Motore piccolo, modello immenso.** colibri fa girare modelli aperti molto
@@ -21,7 +21,7 @@ modello li chiede. C puro, un file per famiglia di modelli, nessuna GPU
 necessaria.
 
 Oggi girano tredici motori. Dieci sono per modelli linguistici: **GLM-5.2/5.3** (che
-esegue anche **Mistral-Large-4**), **GLM-5.3-Flash**, **Inkling**, **Kimi K3**,
+esegue anche **Mistral-Large-4**), **GLM-5.3-Flash**, **Inkling**, **Kimi K3** (e K3.1 Pro),
 **DeepSeek V4 Flash**, **DeepSeek V4.1 Flash**, **MiMo-V2.6 Flash** (e Pro),
 **Qwen3.8-Flash-Next**, **Qwen3.6** (che esegue anche Qwen3-Coder, il denso
 Qwen3.8-27B, **Flint**, **Muse Spark Open** e **LFM3-VL**) e **OLMoE**. Uno disegna
@@ -235,6 +235,7 @@ velocità la decide il disco: un NVMe veloce è ciò che aiuta di più)
 | **Inkling** (975B): expert int4, pesi densi bf16 | `inkling` | 514 GB | 120 / 128 GB così come scaricato; 25 GB dopo una [conversione della parte densa](docs/inkling.md) | CUDA, Vulkan | 0.25 tok/s (Ryzen 9 7900, 187 GB, RTX A6000) |
 | MiMo-V2.6 Pro (1.02T): visione e tool | `mimo-v2.6-pro` | 564 GB | 54 / 64 GB | Vulkan | 0.66-0.79 tok/s (A, CPU) |
 | **Kimi K3** (2.8T): il più grande | `kimi-k3` | 1.56 TB | 32 / 64 GB | CUDA, Vulkan | circa 9.4 s per token, expert letti a 6.3 GB/s |
+| **Kimi K3.1 Pro** (2.8T): K3 con attenzione sparsa oltre 2048 token | `kimi-k3.1-pro` | 1.56 TB | 32 / 64 GB | CUDA, Vulkan | |
 
 <a id="other-supported-models"></a>
 
@@ -255,7 +256,7 @@ velocità la decide il disco: un NVMe veloce è ciò che aiuta di più)
 cartella del modello lì vicino; poi si passa quella cartella a `--model`, come per ogni altro
 ([gguf.md](docs/gguf.md)). Niente viene convertito né quantizzato di nuovo: i blocchi girano come
 il file li contiene, da IQ1_S a Q8_0, F16, BF16 e MXFP4. Anche i motori di tutti i modelli di chat
-qui sopra leggono i GGUF ([le architetture](docs/gguf.md#supported-architectures)); questi quattro
+qui sopra leggono i GGUF ([le architetture](docs/gguf.md#supported-architectures)); questi
 modelli arrivano come GGUF:
 
 | Modello | GGUF | GPU | Misurato |
@@ -264,6 +265,7 @@ modelli arrivano come GGUF:
 | **Muse Spark Open** (816B, 42B attivi): testo e tool, con l'accordo di licenza di Meta | unsloth, da UD-IQ1_S 176 GB a UD-Q4_K_XL 505 GB | CUDA, Vulkan | 1.55-1.58 tok/s con Vulkan, 1.34-1.40 con CUDA, 0.83-0.89 sulla CPU (D) |
 | **Flint** (40B, 2.5B attivi): testo e tool, Apache 2.0 | unsloth, da UD-IQ1_M 11.4 GB a BF16 79.6 GB | CUDA, Vulkan | UD-Q4_K_XL: 77.4 tok/s con CUDA, 77.7 con Vulkan, 15.8 sulla CPU (D) |
 | **LFM3-VL-2B**: testo, immagini e tool, LFM Open License | LiquidAI, da QAD-Q4_0 a BF16 (o il checkpoint, convertito) | CUDA, Vulkan | Q4_K_M: 235.1 tok/s con CUDA, 214.1 con Vulkan, 34.5 sulla CPU (D) |
+| **Qwen-Image-2.1** e il suo **Turbo**: da testo a immagine, licenza non commerciale ([qwen-image.md](docs/qwen-image.md#gguf-unsloth)) | unsloth, da Q2_K 2.5 GB a F16 14.2 GB, con un GGUF Qwen3-VL-8B-Instruct come text encoder | Vulkan | Turbo Q4_K_M, 1024x1024 in 8 passi: 37 s di denoising con Vulkan (D); a 512x512 8.4-9.3 s a passo sulla CPU (A) |
 
 I modelli più grandi delle tabelle qui sopra dai loro GGUF, sulla stessa macchina: [Benchmark](#large-models-on-the-same-machine).
 
@@ -515,7 +517,9 @@ in questo passo, ambra se usato in questa risposta.</em></p>
 legge una pull request che rompe il limite di una cache: <strong>request changes all'81%</strong>, entropia 0,56 (incerto), 98 token letti, 0 generati.</em></p>
 
 La pagina **Profiling** mostra dove ogni turno spende il suo tempo, fase per
-fase, con gli ultimi 30 turni come tendenza.
+fase, con gli ultimi 30 turni come tendenza. Con [joules](https://pypi.org/project/landauer-gap/)
+installato accanto al gateway (`pip install landauer-gap`) mostra anche i watt della
+macchina e i joule per token dell'ultimo turno.
 
 ### L'interfaccia nel terminale
 
@@ -546,6 +550,12 @@ API:
   Qwen3.8-Flash-Next, Qwen3.8-27B, LFM3-VL e Mistral-Large-4 (da un GGUF, con il
   file `mmproj` accanto): un percorso in un messaggio di `coli chat`, un allegato
   in `coli web` o `coli ui`, o una parte `image_url`;
+- **documenti in ingresso** su ogni motore di chat: `/file PATH` in `coli chat` (o
+  `coli chat --file PATH`) invia il testo di un file di testo o di un PDF insieme al
+  messaggio successivo. Viene letto solo un file indicato così, mai un percorso dentro
+  un messaggio; deve essere un file regolare con un suffisso di testo o `.pdf`, entro
+  64 MiB e 2 milioni di caratteri. Un PDF viene analizzato in un processo separato, con
+  un limite di tempo e di memoria, da `pdftotext` (poppler) o `pypdf`;
 - **immagini in uscita** con Qwen-Image-2.1 su `POST /v1/images/generations`,
   disegnate anche dentro il terminale da `coli chat`
   ([qwen-image.md](docs/qwen-image.md));
@@ -804,7 +814,7 @@ fallimento ben controllato vale più di un numero veloce senza spiegazione.
 | Vulkan: il livello degli expert, la catena densa, le schede senza Resizable BAR | [vulkan.md](docs/vulkan.md) |
 | CUDA, e il livello CUDA di Qwen3.6 | [cuda.md](docs/cuda.md), [qwen36-cuda-tier.md](docs/qwen36-cuda-tier.md) |
 | Apple Silicon, Windows | [metal.md](docs/metal.md), [windows.md](docs/windows.md) |
-| Tuning, la cache che impara, prefetch, speculazione | [tuning.md](docs/tuning.md) |
+| Tuning, la cache che impara, prefetch | [tuning.md](docs/tuning.md) |
 | La decodifica speculativa: le teste MTP, il lookup sul prompt, il controllo | [speculative.md](docs/speculative.md) |
 | Più SSD, più macchine | [multidisk.md](docs/multidisk.md), [cluster.md](docs/cluster.md) |
 | Benchmark e come misurare | [benchmarks.md](docs/benchmarks.md), [benchmarking.md](docs/benchmarking.md) |
