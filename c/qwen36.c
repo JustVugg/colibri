@@ -1652,6 +1652,20 @@ static inline void q36_kv_axpy(float *y, float a, const void *base, int64_t idx,
     for (int i = 0; i < n; i++) y[i] += a * v[i];
 }
 
+/* Q36_ATTN_ROWBLOCK=N (rows per block, 2..64): the prompt-attention score and
+ * context loops process N query rows per pass over the cache, so each K/V row
+ * is read ~N times less. Off (0) by default until the A/B validates it.
+ * Read per call so a rebuild is not needed to toggle; getenv at ten calls a
+ * prompt chunk costs nothing next to the attention work itself. */
+static int q36_attn_rowblock(void) {
+    const char *e = getenv("Q36_ATTN_ROWBLOCK");
+    if (!e || !*e) return 0;
+    int n = atoi(e);
+    if (n < 0) n = 0;
+    if (n > 64) n = 64;
+    return n;
+}
+
 /* y[1,O] = x[1,I] @ W^T with W quantized: q[O,I] int8 + scale per row.
  * matmul_q lives in qgemv.h so tests/test_qgemv.c can link the exact kernel
  * the engine runs (qwen36.c has a main() and cannot itself be linked into a
@@ -5402,6 +5416,65 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             }
         }
     float *ctx = falloc((int64_t)S*H*hd);
+    int rbn = q36_attn_rowblock();
+    if (rbn >= 2 && !mr && !ring && !win && !l->sinks && S > 1) {
+        /* Row-blocked prefill attention (Q36_ATTN_ROWBLOCK=N): the score and
+         * context passes handle N query rows per trip over the cache, so each
+         * K/V row is read ~N times less (16 q-heads share each of the 2 KV
+         * heads here, and the old loop re-read every row per (head, prompt
+         * row) pair — the measured prefill attention is bandwidth-bound on
+         * exactly that traffic). Bit-exactness by construction: every score
+         * is still the same per-pair q36_kv_dot, softmax_row sees the same
+         * values in the same per-row order, and each row's context keeps its
+         * ascending-t accumulation; only the order of independent pairs
+         * changes, so outputs must stay identical (fixture oracles + A/B).
+         * Decode (S==1), multiplexed rows, ring/window layers and sinks keep
+         * the original loop below. */
+        int nth = 1;
+#ifdef _OPENMP
+        nth = omp_get_max_threads();
+#endif
+        float *scb = falloc((int64_t)rbn * nth * m->kv_cap);
+        #pragma omp parallel for collapse(2) schedule(static)
+        for (int hh = 0; hh < H; hh++) {
+            for (int s0 = 0; s0 < S; s0 += rbn) {
+                int tid = 0;
+#ifdef _OPENMP
+                tid = omp_get_thread_num();
+#endif
+                float *sc = scb + ((int64_t)tid * rbn) * m->kv_cap;
+                int kvh = hh / q_per_kv;
+                const void *Kl = m->K[layer], *Vl = m->V[layer];
+                int rb = S - s0 < rbn ? S - s0 : rbn;
+                int qmax = pos_base + s0 + rb - 1;
+                /* scores: the K row is loaded once for the block's query rows */
+                for (int t = 0; t <= qmax; t++) {
+                    int64_t ki = q36_kv_at(m, layer, kvh, t);
+                    int i0 = t - pos_base - s0;
+                    if (i0 < 0) i0 = 0;
+                    for (int i = i0; i < rb; i++)
+                        sc[(int64_t)i * m->kv_cap + t] =
+                            q36_kv_dot(query + ((int64_t)(s0+i)*H + hh)*hd, Kl, ki, kvd) * scale;
+                }
+                for (int i = 0; i < rb; i++)
+                    softmax_row(sc + (int64_t)i * m->kv_cap, pos_base + s0 + i + 1);
+                /* context: per row ascending t, as the reference loop writes it */
+                for (int i = 0; i < rb; i++) {
+                    float *cx = ctx + ((int64_t)(s0+i)*H + hh)*hd;
+                    for (int dd = 0; dd < kvd; dd++) cx[dd] = 0;
+                }
+                for (int t = 0; t <= qmax; t++) {
+                    int64_t vi = q36_kv_at(m, layer, kvh, t);
+                    int i0 = t - pos_base - s0;
+                    if (i0 < 0) i0 = 0;
+                    for (int i = i0; i < rb; i++)
+                        q36_kv_axpy(ctx + ((int64_t)(s0+i)*H + hh)*hd,
+                                    sc[(int64_t)i * m->kv_cap + t], Vl, vi, kvd);
+                }
+            }
+        }
+        free(scb);
+    } else
     #pragma omp parallel for collapse(2) schedule(static)
     for (int hh = 0; hh < H; hh++) {
         for (int s = 0; s < S; s++) {
