@@ -114,8 +114,27 @@ int main(int argc, char **argv_in) {
     tk(rc == 0, "engine with the int8 trunk on the fake tier stays within the oracle's limits");
     tk(g_trunk_n > 0 && qt_dense_count() == g_trunk_n, "every offered dense matrix was placed and uploaded");
     tk(fake_uploads >= g_trunk_n, "one upload per placed matrix");
+    size_t budget_off = G.budget[0], trunk_off = G_trunk_bytes[0];
     qt_shutdown();
     tk(qt_dense_count() == 0, "dense handles released at shutdown");
+
+    /* The same with COLI_CUDA_CHAIN=1: the chain's device memory (q38cc_reserve_bytes) is
+     * offered as a component of its own before the FP8 tier sizes its expert budget, as on
+     * a GGUF, so the budget is the one above less the chain's bytes. Without the offer the
+     * promotions fill what the chain allocates after q38_tier_start. */
+    printf(" the CUDA chain's reserve beside the FP8 tier\n");
+    setenv("COLI_CUDA_CHAIN", "1", 1);
+    G_offer_n = 0;                               /* offers are per load; this process opens another model */
+    rc = qwen38_main_unused(4, argv);
+    tk(rc == 0, "engine with the chain on the fake tier stays within the oracle's limits");
+    size_t chain = 0; int chain_dev = QT_PLACE_CPU;
+    for (int o = 0; o < G_offer_n; o++)
+        if (!strcmp(G_offer[o].name, "chain")) { chain = G_offer[o].bytes; chain_dev = G_offer[o].dev; }
+    tk(chain > 0 && chain_dev == G.dev[0], "the chain's reserve offered and placed on its card");
+    tk(G_trunk_bytes[0] == trunk_off + chain, "the trunk's bytes on the card count the chain's reserve");
+    tk(G.budget[0] == budget_off - chain, "the expert budget leaves the chain's reserve");
+    qt_shutdown();
+    setenv("COLI_CUDA_CHAIN", "0", 1);
 
     if (argc > 1) {
         /* Third pass: the int4-g64 sidecar. The tier must stay off -- no

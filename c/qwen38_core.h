@@ -4039,6 +4039,17 @@ static void q38_tier_warm(Model *m,int hist) {
 static size_t q38cc_reserve_bytes(Model *m);   /* qwen38_cuda_chain.h */
 static size_t q38cc_stage_mb_env(void); static size_t q38cc_prompt_stage_bytes(Model *m); static size_t q38cc_gguf_stride(Model *m);
 static int q38cc_env_on(void);
+/* the chain's own device memory (COLI_CUDA_CHAIN=1), offered as a component of its own before
+ * the tier sizes the experts' budget: the chain allocates it after q38_tier_start, and the
+ * experts would take that room first; 0: no chain */
+static int q38_tier_offer_chain(Model *m) {
+    if(!q38cc_env_on())return 0;
+    size_t rb=q38cc_reserve_bytes(m);
+    qt_trunk_offer("chain",0,rb);
+    fprintf(stderr,"[qtier] qwen38: %.2f GiB kept for the CUDA chain (its mirrors at %d positions, its scratch and own matrices)\n",
+            rb/1073741824.0,m->kv_cap>0?m->kv_cap:m->max_t>0?m->max_t:qwen38_max_ctx());
+    return 1;
+}
 #endif
 static void q38_tier_start(Model *m,int cap) {
     const char *on=getenv("COLI_CUDA");
@@ -4061,14 +4072,9 @@ static void q38_tier_start(Model *m,int cap) {
         }
         if(!ok)fprintf(stderr,"[qtier] qwen38: the GGUF's expert types are not all ones the CUDA tier computes; the experts stay on the CPU\n");
         q38_trunk_offer_all(m);
-        /* the chain's own device memory (COLI_CUDA_CHAIN=1), before the arena takes the budget */
-        if(ok&&q38cc_env_on()){
-            size_t rb=q38cc_reserve_bytes(m);
-            qt_trunk_offer("chain",0,rb);
-            if(!q38cc_stage_mb_env())qt_reserve_stage(q38cc_prompt_stage_bytes(m),(size_t)c->experts*q38cc_gguf_stride(m));
-            fprintf(stderr,"[qtier] qwen38: %.2f GiB kept for the CUDA chain (its mirrors at %d positions, its scratch and own matrices)\n",
-                    rb/1073741824.0,m->kv_cap>0?m->kv_cap:m->max_t>0?m->max_t:qwen38_max_ctx());
-        }
+        /* before the arena takes the budget */
+        if(ok&&q38_tier_offer_chain(m)&&!q38cc_stage_mb_env())
+            qt_reserve_stage(q38cc_prompt_stage_bytes(m),(size_t)c->experts*q38cc_gguf_stride(m));
         /* each expert in a slot of its own layer's size (one device), the chain's promotions too
          * (qt_chain_arena_exact): unsloth's UD-IQ2_XS mixes layers of 1.45 to 2.09 MB experts, and
          * slots of the largest held a fifth fewer. With the chain only: the tier on its own swaps an
@@ -4118,6 +4124,9 @@ static void q38_tier_start(Model *m,int cap) {
             return;
         }
     q38_trunk_offer_all(m);                        /* sizes only; the placer decides in qt_init */
+#ifdef COLI_CUDA
+    q38_tier_offer_chain(m);                       /* as on a GGUF: the promotions would fill the chain's room */
+#endif
     if(qt_init_fp8(c->layers,c->experts,c->hidden,c->inter,cap,c->topk,E4M3_LUT)){
         atexit(qt_shutdown);
         fprintf(stderr,"[qtier] qwen38: fp8 expert tier on (RAM LRU %d/layer stays; experts stream to VRAM as they get hot)\n",cap);
