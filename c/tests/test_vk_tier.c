@@ -34,6 +34,10 @@
  *            with a budget of four (the smaller form's experts take the rooms the bigger
  *            form's give up, no upload refused), and streamed through slots that change
  *            format between the layers' steps;
+ *   rooms    three layers in three forms of three sizes: every expert sits in a room of
+ *            its own form's size (a budget of the experts' own bytes holds them all), a
+ *            smaller form's experts take the rooms the two bigger forms' give up and a
+ *            bigger form's never a smaller one's, no upload refused;
  *   timeout  a batch's wait gives up (COLI_VK_WAIT_FAULT): the tier stops and the experts
  *            that batch names keep their device memory until the device is idle;
  *   promote  a host pool that holds every expert (COLI_VK_TIER_HOST=1), the device four:
@@ -77,7 +81,7 @@
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fails++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
-enum { L = 2, E = 10, K = 3, HF_MAX = 512 };
+enum { L = 2, LX = 3, E = 10, K = 3, HF_MAX = 512 };   /* LX: rooms() adds a layer */
 static int H = 192, F = 128;   /* hidden and expert width; grouped() widens H */
 static unsigned rng = 7;
 static unsigned rnd(void) { rng = rng * 1103515245u + 12345u; return rng >> 8; }
@@ -167,7 +171,8 @@ static void mat_free(Mat *m) { free(m->codes); free(m->scales); free(m->w); }
 
 /* ---- the synthetic model ---------------------------------------------------------- */
 typedef struct { Mat g, u, d; } Ex;
-static Ex ex[L][E];
+static Ex ex[LX][E];
+static int g_layers = L;
 static int g_act; static float g_limit;
 static void expert_ref(const Ex *e, const float *x, float *y) {
     float h[HF_MAX];
@@ -245,7 +250,7 @@ static void route(int S, int lo, int span, int *idx, float *w) {
 }
 
 static VktConfig cfg_of(VktFmt gu, VktFmt dn, int act, float limit) {
-    return (VktConfig){.engine = "test", .layers = L, .experts = E, .hidden = H, .inter = F, .topk = K,
+    return (VktConfig){.engine = "test", .layers = g_layers, .experts = E, .hidden = H, .inter = F, .topk = K,
                        .gate_up = gu, .down = dn, .act = act, .act_limit = limit, .act_a = 4.f, .act_b = 25.f,
                        .max_rows = 1 << 20};
 }
@@ -1091,6 +1096,84 @@ static void layers(void) {
     H = H0; F = F0;
 }
 
+/* three layers in three forms of three sizes (Q4_K/Q5_K, Q5_K/Q6_K, Q6_K/Q6_K): a room
+ * for each size, not one of the biggest form's for every form but the most common */
+static void rooms(void) {
+    const int H0 = H, F0 = F;
+    H = 512; F = 256; g_layers = LX;
+    const VktFmt q4 = {(VktSrc)(VKT_SRC_GGML + GQ_Q4_K), 0}, q5 = {(VktSrc)(VKT_SRC_GGML + GQ_Q5_K), 0},
+                 q6 = {(VktSrc)(VKT_SRC_GGML + GQ_Q6_K), 0};
+    VktFmt lgu[LX] = {q4, q5, q6}, ldn[LX] = {q5, q6, q6};
+    size_t own[LX];
+    for (int l = 0; l < LX; l++) own[l] = vkt_expert_bytes(H, F, lgu[l], ldn[l]);
+    for (int mode = 0; mode < 2; mode++) {   /* resident, evicting */
+        for (int l = 0; l < LX; l++) for (int e = 0; e < E; e++) {
+            mat_make_block(&ex[l][e].g, lgu[l], H, F); mat_make_block(&ex[l][e].u, lgu[l], H, F);
+            mat_make_block(&ex[l][e].d, ldn[l], F, H);
+        }
+        g_act = VKT_ACT_SWIGLU; g_limit = 0;
+        /* every expert's own bytes; or two of each bigger form's, four experts on average */
+        const double bytes = (mode == 0 ? (double)E * (own[0] + own[1] + own[2]) : 2.0 * (own[1] + own[2])) + 0.5 * own[0];
+        char b[64]; snprintf(b, sizeof b, "%.12f", bytes / 1073741824.0);
+        setenv("COLI_VK_TIER_GB", b, 1);
+        setenv("COLI_VK_TIER_RATE", "64", 1);
+        setenv("COLI_VK_TIER_SYNC", "1", 1);
+        VktConfig vc = cfg_of(lgu[0], ldn[0], VKT_ACT_SWIGLU, 0);
+        vc.layer_gate_up = lgu; vc.layer_down = ldn;
+        int on = vkt_init(&vc, NULL);
+        unsetenv("COLI_VK_TIER_SYNC");
+        CHECK(on, "rooms: the tier did not start");
+        if (on) {
+            Books bk = {0, 0}; double worst = 0;
+            int res[LX] = {0, 0, 0}, mid[LX] = {0, 0, 0};
+            if (mode == 0)
+                for (int t = 0; t < 6; t++)
+                    for (int l = 0; l < LX; l++) {
+                        int idx[24 * K]; float w[24 * K];
+                        route(24, 0, E, idx, w);
+                        vkt_begin_forward();
+                        double r = step(l, 24, idx, w, &bk);
+                        if (!(r <= worst)) worst = r;
+                    }
+            else   /* two experts of layers 1 and 2 settle; layer 0's take their rooms (LFRU: a few hundred
+                    * steps); then layer 2's, the biggest, are routed again and take none of layer 0's */
+                for (int t = 0; t < 480; t++) {
+                    int lay = t < 60 ? 1 + t % 2 : t < 360 ? 0 : 2, idx[4 * K]; float w[4 * K];
+                    route(4, 0, t < 60 ? K : 5, idx, w);
+                    vkt_begin_forward();
+                    double r = step(lay, 4, idx, w, &bk);
+                    if (!(r <= worst)) worst = r;
+                    if (t == 59 || t == 359) for (int l = 0; l < LX; l++) { mid[l] = res[l]; res[l] = 0; for (int e = 0; e < E; e++) res[l] += vkt_resident(l, e); }
+                    if (t == 59) CHECK(res[0] == 0 && res[1] > 0 && res[2] > 0, "rooms: layers 1 and 2 did not settle (%d, %d, %d resident)", res[0], res[1], res[2]);
+                }
+            int end[LX] = {0, 0, 0};
+            for (int l = 0; l < LX; l++) for (int e = 0; e < E; e++) end[l] += vkt_resident(l, e);
+            printf("  Q4_K/Q5_K, Q5_K/Q6_K and Q6_K/Q6_K layers, %-10s device %4llu of %4llu, resident %d %d %d",
+                   mode ? "evicting" : "resident", bk.dev, bk.routed, end[0], end[1], end[2]);
+            if (mode) printf(" (%d %d %d, then %d %d %d)", mid[0], mid[1], mid[2], res[0], res[1], res[2]);
+            printf(", worst %.2e\n", worst);
+            unsigned long long ev, failed;
+            report_counts(&ev, &failed);
+            int counted = failed != ~0ull;
+            CHECK(bk.dev > 0, "rooms: nothing ran on the device");
+            CHECK(!counted || failed == 0, "rooms: %llu uploads refused", failed);
+            CHECK(worst < 2e-3, "rooms: device rows off the reference (%.3g)", worst);
+            if (mode == 0) CHECK(end[0] + end[1] + end[2] == LX * E, "rooms: %d of %d experts resident in a budget of their own bytes",
+                                 end[0] + end[1] + end[2], LX * E);
+            else {
+                CHECK(res[0] > 0 && res[1] + res[2] < mid[1] + mid[2] && (!counted || ev > 0),
+                      "rooms: the smallest form's experts did not take the bigger forms' rooms (%d %d %d resident)", res[0], res[1], res[2]);
+                CHECK(end[0] == res[0] && end[2] <= res[2], "rooms: a bigger form's expert took a smaller one's room (%d %d %d resident)",
+                      end[0], end[1], end[2]);
+            }
+            vkt_shutdown();
+        }
+        for (int l = 0; l < LX; l++) for (int e = 0; e < E; e++) { mat_free(&ex[l][e].g); mat_free(&ex[l][e].u); mat_free(&ex[l][e].d); }
+        memset(ex, 0, sizeof ex);
+    }
+    H = H0; F = F0; g_layers = L;
+}
+
 /* A large requested step under a deliberately tiny scratch budget: reserve a
  * smaller batch before allocating, then keep the backend usable for the format
  * and streaming reference checks below. Reusing those buffers needs no growth. */
@@ -1750,6 +1833,7 @@ int main(int argc, char **argv) {
     printf("stream:\n"); stream();
     printf("empty prefetch:\n"); empty_prefetch();
     printf("layers:\n"); layers();
+    printf("rooms:\n"); rooms();
     printf("promote:\n"); promote_case();
     printf("hybrid:\n");
     hybrid_case((VktFmt){(VktSrc)(VKT_SRC_GGML + GQ_Q4_K), 0}, (VktFmt){(VktSrc)(VKT_SRC_GGML + GQ_Q6_K), 0}, "Q4_K/Q6_K");
