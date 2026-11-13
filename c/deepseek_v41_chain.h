@@ -1357,7 +1357,7 @@ static int v41c_forward_seg(Model *m, V41Chain *ch, float *h, float *pre_mix, in
         int width = E / c->compress_ratio[cs];
         if (m->candidate_topk != topk || m->candidate_rows != n) {
             free(m->candidates);
-            m->candidates = xmalloc(v41_candidate_bytes(c, n), "candidate blocks");
+            m->candidates = xmalloc(v41_candidate_bytes(topk, n), "candidate blocks");
             m->candidate_topk = topk; m->candidate_rows = n;
         }
         m->candidate_width = width;   /* the device mask's reach, the paint bound: refreshed, not sized on */

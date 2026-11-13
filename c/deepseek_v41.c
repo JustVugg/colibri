@@ -2743,12 +2743,14 @@ static void candidate_keep_row(const int32_t *ids, int nids, int block, int w, u
     }
 }
 
-/* The candidate blocks' allocation: rows x candidate_topk int32 whatever the reach, and so
- * independent of the prompt's length (it was rows x reach bytes). The ids are the source's
- * blocks, so no width enters here; a topk of 0 keeps one slot a row, never a zero-byte one. */
-static size_t v41_candidate_bytes(const Cfg *c, int rows) {
-    int topk = c->candidate_topk_blocks > 0 ? c->candidate_topk_blocks : 1;
-    return (size_t)(rows > 0 ? rows : 1) * (size_t)topk * sizeof(int32_t);
+/* The candidate blocks' allocation: rows x topk int32 whatever the reach, and so independent
+ * of the prompt's length (it was rows x reach bytes). The ids are the source's blocks, so no
+ * width enters here; a topk of 0 keeps one slot a row, never a zero-byte one. `topk` is the
+ * caller's, never the config's: an allocation and the copy of it size the same slots, so a
+ * stored topk that differed from the config's can only be the difference between a copy that
+ * fits and one that does not. */
+static size_t v41_candidate_bytes(int topk, int rows) {
+    return (size_t)(rows > 0 ? rows : 1) * (size_t)(topk > 0 ? topk : 1) * sizeof(int32_t);
 }
 
 /* Does this layer complete a compression group at `pos`, and so republish its index
@@ -2843,7 +2845,7 @@ static void indexer_run(Model *m, int layer, const float *x, const float *qr, in
             int topk = c->candidate_topk_blocks > 0 ? c->candidate_topk_blocks : 1;
             if (m->candidate_topk != topk || m->candidate_rows != n) {
                 free(m->candidates);
-                m->candidates = xmalloc(v41_candidate_bytes(c, n), "candidate blocks");
+                m->candidates = xmalloc(v41_candidate_bytes(topk, n), "candidate blocks");
                 m->candidate_topk = topk;
                 m->candidate_rows = n;
             }
@@ -5457,7 +5459,7 @@ static int v41_park(Model *m, int np, int max_tok) {   /* the rows kept apart, 0
         g_v41_park_x.topk_rows = m->shared_topk_rows; g_v41_park_x.topk_width = m->shared_topk_width;
         g_v41_park_x.topk = v41_dup(m->shared_topk, (size_t)m->shared_topk_rows * (m->shared_topk_width > 0 ? m->shared_topk_width : 1) * sizeof(int));
         g_v41_park_x.cand_topk = m->candidate_topk; g_v41_park_x.cand_rows = m->candidate_rows;
-        g_v41_park_x.cand = v41_dup(m->candidates, v41_candidate_bytes(&m->c, m->candidate_rows));
+        g_v41_park_x.cand = v41_dup(m->candidates, v41_candidate_bytes(m->candidate_topk, m->candidate_rows));
     }
     free(p);
     return g_v41_park.on ? n : 0;

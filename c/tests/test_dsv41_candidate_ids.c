@@ -16,7 +16,8 @@
  *  P3 positions past the bound may differ and no reader looks at them (indexer_run sets
  *     score[j] = -INFINITY before the mask runs), so only [0, w) is compared;
  *  P5 the ids are block ids in the source's own coordinates.
- * The memory side (v41_candidate_bytes) is asserted at the end: no width enters it. */
+ * The memory side (v41_candidate_bytes) is asserted at the end: no width enters it, and the
+ * topk is the caller's, so an allocator and the copy of its array cannot disagree. */
 #define main dsv41_main_unused
 #include "../deepseek_v41.c"
 #undef main
@@ -84,15 +85,15 @@ static int pinned_tie_vector(void) {
 }
 
 static int candidate_bytes(void) {
-    Cfg c; memset(&c, 0, sizeof c);
-    c.candidate_topk_blocks = 2048;
     /* 262144 rows x 2048 slots x 4 B: the reach does not appear, so neither does n^2 */
-    CHECK(v41_candidate_bytes(&c, 262144) == 2147483648u);
-    CHECK(v41_candidate_bytes(&c, 2 * 1000) == 2 * v41_candidate_bytes(&c, 1000));   /* linear in rows */
-    c.candidate_topk_blocks = 0;
-    CHECK(v41_candidate_bytes(&c, 7) == 7 * (size_t)sizeof(int32_t));   /* topk 0: one slot a row */
-    c.candidate_topk_blocks = 3;
-    CHECK(v41_candidate_bytes(&c, 1) == 3 * sizeof(int32_t));           /* and nothing about a width */
+    CHECK(v41_candidate_bytes(2048, 262144) == 2147483648u);
+    CHECK(v41_candidate_bytes(2048, 2 * 1000) == 2 * v41_candidate_bytes(2048, 1000));   /* linear in rows */
+    CHECK(v41_candidate_bytes(0, 7) == 7 * (size_t)sizeof(int32_t));   /* topk 0: one slot a row */
+    CHECK(v41_candidate_bytes(3, 1) == 3 * sizeof(int32_t));           /* and nothing about a width */
+    /* the topk is the caller's: a copy sized for `stored` slots is a copy of `stored` slots,
+     * whatever the config says, so the park copy cannot out- or undersize the live array */
+    CHECK(v41_candidate_bytes(2, 5) == 5 * 2 * sizeof(int32_t));
+    CHECK(v41_candidate_bytes(2, 5) != v41_candidate_bytes(3, 5));
     return 0;
 }
 
@@ -114,7 +115,7 @@ int main(void) {
                 Cfg c; memset(&c, 0, sizeof c);
                 c.candidate_block_size = block; c.candidate_topk_blocks = topks[ti];
                 int slots = topks[ti] > 0 ? topks[ti] : 1;   /* what v41_candidate_bytes sizes */
-                int32_t *ids = malloc(v41_candidate_bytes(&c, 1));
+                int32_t *ids = malloc(v41_candidate_bytes(slots, 1));
                 if (!ids) return 1;
                 for (int li = 0; li < 6; li++) {
                     int lens = (int[]){0, 1, width / 2, width - 1, width, width + 3}[(size_t)li];
@@ -128,7 +129,7 @@ int main(void) {
                          *    change shows up here and nowhere else in this file */
                         CHECK(memcmp(live, ref, (size_t)width) == 0);
                         /* 2. the ids are the frozen row's blocks, every slot written (P1) */
-                        memset(ids, POISON, v41_candidate_bytes(&c, 1));
+                        memset(ids, POISON, v41_candidate_bytes(slots, 1));
                         int kept = candidate_row_ids(ref, block, width, slots, ids);
                         CHECK(kept <= slots);
                         for (int k = 0; k < slots; k++) {
