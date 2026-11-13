@@ -980,6 +980,74 @@ static int test_expert_store_prefill_pool(void) {
     return 0;
 }
 
+/* v4_moe_batch_union holds one lease per loader lane plus one for the expert
+ * it computes, so it caps its lanes at coli_v4_expert_store_lease_capacity()
+ * - 1. The capacity must be what the store really grants: six concurrent
+ * leases on a six-slot layer and no seventh (nine lanes used to ask for ten),
+ * and every slot while the prefill pool lends them to the layer. */
+static int test_expert_store_lease_capacity(void) {
+    enum { LAYERS = 2, EXPERTS = 8, SLOTS_PER_LAYER = 6 };
+    char directory[] = "colibri-v4-lease-XXXXXX";
+    char path[256], error[256];
+    setenv("COLI_V4_AUTOPIN", "0", 1);
+    setenv("COLI_V4_SAVE_USAGE", "0", 1);
+    setenv("COLI_V4_ROWS16", "0", 1);
+    if (!mkdtemp(directory)) { perror("mkdtemp lease"); return 1; }
+    snprintf(path, sizeof(path), "%s/model.safetensors", directory);
+    if (write_fixture_layers(path, LAYERS, EXPERTS)) {
+        perror("write lease fixture");
+        rmdir(directory);
+        return 1;
+    }
+    ColiDeepSeekV4ExpertStoreOptions options = {
+        directory, LAYERS, EXPERTS,
+        (uint64_t)LAYERS * SLOTS_PER_LAYER * 51, -1, UINT64_MAX, 0, 0
+    };
+    ColiExpertStore *store = NULL;
+    if (coli_deepseek_v4_expert_store_open(
+            &options, &store, error, sizeof(error))) {
+        fprintf(stderr, "lease store open failed: %s\n", error);
+        unlink(path); rmdir(directory);
+        return 1;
+    }
+    ColiExpertView views[EXPERTS + 1];
+    int capacity = coli_v4_expert_store_lease_capacity(store, 0);
+    int held = 0;
+    while (held <= SLOTS_PER_LAYER &&
+           !coli_expert_lookup(store, (ColiExpertKey){0, held}, &views[held]))
+        held++;
+    for (int i = 0; i < held; i++) coli_expert_release(store, &views[i]);
+    int failed = capacity != SLOTS_PER_LAYER || held != SLOTS_PER_LAYER ||
+                 coli_v4_expert_store_lease_capacity(NULL, 0) != 0;
+    if (failed)
+        fprintf(stderr, "lease capacity=%d, the store granted %d leases on a "
+                        "%d-slot layer\n", capacity, held, SLOTS_PER_LAYER);
+
+    coli_v4_expert_store_prefill_pool(store, 0);
+    int pooled = coli_v4_expert_store_lease_capacity(store, 0);
+    int other = coli_v4_expert_store_lease_capacity(store, 1);
+    int pooled_held = 0;
+    while (pooled_held < EXPERTS &&
+           !coli_expert_lookup(store, (ColiExpertKey){0, pooled_held},
+                               &views[pooled_held]))
+        pooled_held++;
+    for (int i = 0; i < pooled_held; i++) coli_expert_release(store, &views[i]);
+    coli_v4_expert_store_prefill_pool(store, -1);
+    int restored = coli_v4_expert_store_lease_capacity(store, 0);
+    if (pooled != LAYERS * SLOTS_PER_LAYER || other != SLOTS_PER_LAYER ||
+        pooled_held != EXPERTS || restored != SLOTS_PER_LAYER) {
+        fprintf(stderr, "pooled lease capacity=%d other layer=%d granted=%d "
+                        "after the pool=%d\n", pooled, other, pooled_held, restored);
+        failed = 1;
+    }
+    store->ops->destroy(store);
+    failed |= scratch_remove(directory, path);
+    if (failed) return 1;
+    puts("DeepSeek-V4 ExpertStore lease capacity: ok "
+         "(6 of 6 slots leased, 7th refused; pooled 12, 8 leased)");
+    return 0;
+}
+
 static int run_expert_miss_scaling_case(const char *directory, int experts,
                                         int slots) {
     char error[256];
@@ -2639,6 +2707,10 @@ int main(int argc, char **argv) {
     }
     if (test_expert_store_prefill_pool() != 0) {
         fprintf(stderr, "FAIL: test_expert_store_prefill_pool\n");
+        return 1;
+    }
+    if (test_expert_store_lease_capacity() != 0) {
+        fprintf(stderr, "FAIL: test_expert_store_lease_capacity\n");
         return 1;
     }
     if (test_expert_store_miss_scaling() != 0) {
