@@ -938,6 +938,7 @@ typedef struct {
     uint64_t *used;
     float *value;      /* cap x head_dim */
     uint64_t clock, hits, misses;
+    uint64_t staged;   /* rows engram_stage_rows read into the cache (V41_ENGRAM_STAGE) */
 } EngramTable;
 
 typedef struct {
@@ -1103,13 +1104,53 @@ cache:;
     t->used = xmalloc((size_t)cap * sizeof(uint64_t), "engram row clocks");
     t->value = xmalloc((size_t)cap * head_dim * sizeof(float), "engram row cache");
     for (int i = 0; i < cap; i++) { t->key[i] = -1; t->used[i] = 0; }
-    t->clock = t->hits = t->misses = 0;
+    t->clock = t->hits = t->misses = t->staged = 0;
+}
+
+/* The slot holding `id`, or -1 with *victim the slot a fill takes (the probe's first empty
+ * one, else its least recently used). Moves no counter. */
+static int engram_find(const EngramTable *t, int64_t id, int *victim) {
+    int slot = (int)((uint64_t)(id * 0x9E3779B97F4A7C15ull) >> 40) & t->mask;
+    *victim = slot;
+    for (int probe = 0; probe < 4; probe++) {
+        int at = (slot + probe) & t->mask;
+        if (t->key[at] == id) return at;
+        if (t->key[at] == -1) { *victim = at; return -1; }
+        if (t->used[at] < t->used[*victim]) *victim = at;
+    }
+    return -1;
+}
+
+/* Row `id` read from the shard and dequantized into `out`: the row and its scales one pread
+ * each, 264 bytes for the released table. It touches no cache state, so engram_stage_rows'
+ * readers run it side by side. */
+static void engram_fetch(const EngramTable *t, int64_t id, int head_dim, float *out) {
+    int groups = head_dim / 32;
+    uint8_t row[2048 + 128], *bytes = row, *scales = row + 512;
+    if (head_dim > 512 || groups > 64) {
+        fprintf(stderr, "[engram] head_dim %d exceeds the row buffer\n", head_dim); exit(1); }
+    if (t->gt >= 0) {   /* a ggml row (the open checked rb against the buffer) */
+        st_pread_full(t->fd_w, row, (size_t)t->rb, t->off_w + id * t->rb, "engram row");
+        if (gq_dequant_row(t->gt, row, out, head_dim)) {
+            fprintf(stderr, "[engram] no row reader for ggml type %s\n", gq_type_name(t->gt)); exit(1); }
+        return;
+    }
+    if (t->inline_scales) {
+        st_pread_full(t->fd_w, row, head_dim + groups, t->off_w + id * (head_dim + groups), "engram row");
+        scales = row + head_dim;
+    } else {
+        st_pread_full(t->fd_w, bytes, head_dim, t->off_w + id * head_dim, "engram row");
+        st_pread_full(t->fd_s, scales, groups, t->off_s + id * groups, "engram scale");
+    }
+    for (int g = 0; g < groups; g++) {
+        float scale = ue8m0(scales[g]);
+        for (int i = 0; i < 32; i++) out[g * 32 + i] = e4m3_decode(bytes[g * 32 + i]) * scale;
+    }
 }
 
 /* The row for `id`, dequantized. Reads through a direct-mapped-with-probe cache: on a
- * miss the row and its scales are one pread each, 264 bytes for the released table. */
+ * miss the row and its scales are one pread each (engram_fetch). */
 static const float *engram_row(EngramTable *t, int64_t id, int head_dim) {
-    int groups = head_dim / 32;
     /* SEC: `id` is a hash bucket plus an offset, both from the sidecar; the row count
      * is the shard's. An id past either end read whatever the file holds there, and
      * -1 -- the empty-slot key -- "hit" an empty slot and returned a row never read.
@@ -1120,44 +1161,14 @@ static const float *engram_row(EngramTable *t, int64_t id, int head_dim) {
                 (long long)id, (long long)t->rows);
         exit(1);
     }
-    int slot = (int)((uint64_t)(id * 0x9E3779B97F4A7C15ull) >> 40) & t->mask;
-    int victim = slot;
-    for (int probe = 0; probe < 4; probe++) {
-        int at = (slot + probe) & t->mask;
-        if (t->key[at] == id) { t->used[at] = ++t->clock; t->hits++;
-                                return t->value + (size_t)at * head_dim; }
-        if (t->key[at] == -1) { victim = at; goto fill; }
-        if (t->used[at] < t->used[victim]) victim = at;
-    }
-fill:
+    int victim, at = engram_find(t, id, &victim);
+    if (at >= 0) { t->used[at] = ++t->clock; t->hits++;
+                   return t->value + (size_t)at * head_dim; }
     t->misses++;
-    {
-        uint8_t row[2048 + 128], *bytes = row, *scales = row + 512;
-        if (head_dim > 512 || groups > 64) {
-            fprintf(stderr, "[engram] head_dim %d exceeds the row buffer\n", head_dim); exit(1); }
-        if (t->gt >= 0) {   /* a ggml row (the open checked rb against the buffer) */
-            float *out = t->value + (size_t)victim * head_dim;
-            st_pread_full(t->fd_w, row, (size_t)t->rb, t->off_w + id * t->rb, "engram row");
-            if (gq_dequant_row(t->gt, row, out, head_dim)) {
-                fprintf(stderr, "[engram] no row reader for ggml type %s\n", gq_type_name(t->gt)); exit(1); }
-            t->key[victim] = id; t->used[victim] = ++t->clock;
-            return out;
-        }
-        if (t->inline_scales) {
-            st_pread_full(t->fd_w, row, head_dim + groups, t->off_w + id * (head_dim + groups), "engram row");
-            scales = row + head_dim;
-        } else {
-            st_pread_full(t->fd_w, bytes, head_dim, t->off_w + id * head_dim, "engram row");
-            st_pread_full(t->fd_s, scales, groups, t->off_s + id * groups, "engram scale");
-        }
-        float *out = t->value + (size_t)victim * head_dim;
-        for (int g = 0; g < groups; g++) {
-            float scale = ue8m0(scales[g]);
-            for (int i = 0; i < 32; i++) out[g * 32 + i] = e4m3_decode(bytes[g * 32 + i]) * scale;
-        }
-        t->key[victim] = id; t->used[victim] = ++t->clock;
-        return out;
-    }
+    float *out = t->value + (size_t)victim * head_dim;
+    engram_fetch(t, id, head_dim, out);
+    t->key[victim] = id; t->used[victim] = ++t->clock;
+    return out;
 }
 
 /* engram.py NgramHashState: the ids of the n-grams ending at `pos`, for one table.
@@ -3765,8 +3776,86 @@ static void engram_advise(const EngramTable *t, int64_t id, int head_dim) {
     (void)t; (void)id; (void)head_dim;
 #endif
 }
-/* engram_advise for every row of positions pos .. pos + n - 1 of a table (V41_ENGRAM_ADVISE=0: none) */
-static void engram_advise_rows(const Engram *e, int table, int pos, int n) {
+/* V41_ENGRAM_STAGE=1: engram_stage_rows' readers, V41_ENGRAM_STAGE_THREADS (default 8, at
+ * most 64); 0 when off */
+static int engram_stage_threads(void) {
+    static int threads = -1;
+    if (threads < 0) {
+        const char *on = getenv("V41_ENGRAM_STAGE"), *count = getenv("V41_ENGRAM_STAGE_THREADS");
+        int n = count && atoi(count) > 0 ? atoi(count) : 8;
+        threads = on && atoi(on) > 0 ? (n > 64 ? 64 : n) : 0;
+    }
+    return threads;
+}
+
+static int engram_id_order(const void *a, const void *b) {
+    int64_t x = *(const int64_t *)a, y = *(const int64_t *)b;
+    return (x > y) - (x < y);
+}
+
+/* The rows of positions pos .. pos + n - 1 of a table that the cache does not hold, read on
+ * `threads` readers and put in the cache before the gather looks them up, a decode step's
+ * too: engram_row reads a missing row with one pread and waits for it, and engram_advise
+ * asks the OS ahead only on POSIX and only for a block. A slot holds the same dequantized
+ * row whoever read it, so the gather returns the same bits; only which rows the cache keeps
+ * can differ. At most half the cache is read at once, so a block does not evict its own
+ * rows before their use; a row the gather does not find it reads itself, as before. */
+static void engram_stage_rows(Engram *e, int table, int pos, int n, int threads) {
+    EngramTable *t = &e->table[table];
+    const int hd = e->head_dim;
+    int64_t ids[V41_MAX_NGRAM * V41_MAX_EHEADS];
+    int64_t *want = xmalloc((size_t)n * e->cols * sizeof *want, "engram stage ids");
+    int count = 0, victim;
+    for (int r = 0; r < n; r++) {
+        engram_hash(e, table, pos + r, ids);
+        for (int col = 0; col < e->cols; col++) {
+            if (ids[col] < 0 || ids[col] >= t->rows) continue;   /* engram_row reports it */
+            int at = engram_find(t, ids[col], &victim);
+            if (at >= 0) t->used[at] = ++t->clock;   /* kept for its use below */
+            else want[count++] = ids[col];
+        }
+    }
+    qsort(want, (size_t)count, sizeof *want, engram_id_order);
+    int unique = 0;
+    for (int i = 0; i < count; i++)
+        if (!unique || want[i] != want[unique - 1]) want[unique++] = want[i];
+    if (unique > t->cap / 2) unique = t->cap / 2;
+    if (unique < 1) { free(want); return; }
+    float *rows = xmalloc((size_t)unique * hd * sizeof(float), "engram stage rows");
+    int next = 0;
+#if defined(_OPENMP)
+    /* at the default team width, as expert_fetch: a narrower region makes libgomp retire
+     * and respawn pool threads on every call. Only `threads` of the team read. */
+    const int team = threads > omp_get_max_threads() ? threads : omp_get_max_threads();
+    #pragma omp parallel num_threads(team) if (unique > 1)
+#endif
+    {
+#if defined(_OPENMP)
+        const int tid = omp_get_thread_num();
+#else
+        const int tid = 0;
+#endif
+        if (tid < threads)
+            for (;;) {
+                const int i = __atomic_fetch_add(&next, 1, __ATOMIC_RELAXED);
+                if (i >= unique) break;
+                engram_fetch(t, want[i], hd, rows + (size_t)i * hd);
+            }
+    }
+    for (int i = 0; i < unique; i++) {
+        engram_find(t, want[i], &victim);
+        memcpy(t->value + (size_t)victim * hd, rows + (size_t)i * hd, (size_t)hd * sizeof(float));
+        t->key[victim] = want[i]; t->used[victim] = ++t->clock;
+    }
+    t->staged += (uint64_t)unique;
+    free(rows); free(want);
+}
+
+/* engram_advise for every row of positions pos .. pos + n - 1 of a table (V41_ENGRAM_ADVISE=0:
+ * none); with V41_ENGRAM_STAGE=1 the rows are read instead (engram_stage_rows) */
+static void engram_advise_rows(Engram *e, int table, int pos, int n) {
+    const int threads = engram_stage_threads();
+    if (threads) { engram_stage_rows(e, table, pos, n, threads); return; }
     static int on = -1;
     if (on < 0) { const char *v = getenv("V41_ENGRAM_ADVISE"); on = !(v && *v == '0'); }
     if (!on || n < 2) return;   /* a decode step's few rows: as they come */
@@ -6119,12 +6208,13 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
             for (int t = 0; t < m->engram.n_layers; t++) {
                 EngramTable *tab = &m->engram.table[t];
                 uint64_t total = tab->hits + tab->misses;
+                uint64_t rows_read = tab->misses + tab->staged;   /* the gather's and the stager's */
                 fprintf(stderr, "[v41] engram table %d (layer %d): %llu lookups, "
                                 "%.0f%% cache hits, %llu rows read (%.1f MB)\n",
                         t, m->engram.layer_of[t], (unsigned long long)total,
                         total ? 100.0 * (double)tab->hits / (double)total : 0.0,
-                        (unsigned long long)tab->misses,
-                        tab->misses * (double)(m->engram.head_dim + m->engram.head_dim / 32) / 1e6);
+                        (unsigned long long)rows_read,
+                        rows_read * (double)(m->engram.head_dim + m->engram.head_dim / 32) / 1e6);
             }
         }
         if (stats) {
@@ -6861,7 +6951,7 @@ int main(int argc, char **argv) {
                             "%llu reads\n", t, m.engram.layer_of[t],
                     (long long)m.engram.table[t].rows,
                     (unsigned long long)m.engram.table[t].hits,
-                    (unsigned long long)m.engram.table[t].misses);
+                    (unsigned long long)(m.engram.table[t].misses + m.engram.table[t].staged));
     if (spec_checked)
         fprintf(stderr, "[v41] DSpark: checked %d draft round%s against the reference%s\n",
                 spec_checked, spec_checked == 1 ? "" : "s", spec_failed ? "  MISMATCH" : "");
