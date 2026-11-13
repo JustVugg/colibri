@@ -1,6 +1,7 @@
 import os
 import shutil
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -129,6 +130,33 @@ class MakefilePlatformTests(unittest.TestCase):
                 )
                 self.assertEqual(link.split()[0], cc)
                 self.assertEqual(link.split()[-3:], tail)
+
+    def test_deepseek_v4_clang_stub_only_when_num_devices_is_unresolved(self):
+        # libomp.a's weak omp_get_num_devices stays unresolved with MSYS2's 22.1.7 or
+        # binutils 2.46; where it links, no second definition is added (#2286)
+        undefined = "libomp.a(kmp_alloc.cpp.obj): undefined reference to `omp_get_num_devices'"
+        with tempfile.TemporaryDirectory() as tmp:
+            for libomp, error in (("22", undefined), ("23", "")):
+                with self.subTest(libomp=libomp):
+                    fake = Path(tmp) / f"clang-{libomp}"
+                    fake.write_text(
+                        "#!/bin/sh\n"
+                        '[ "$1" = -dumpmachine ] && { echo x86_64-w64-windows-gnu; exit 0; }\n'
+                        f"cat <<'EOF'\n{error}\nEOF\n"
+                    )
+                    fake.chmod(0o755)
+                    result = subprocess.run(
+                        [MAKE, "--no-print-directory", "-B", "-n", "-f",
+                         "Makefile.deepseek-v4", "backend_loader_dsv4.o",
+                         "OS=Windows_NT", f"CC={fake.as_posix()}"],
+                        cwd=C_DIR, text=True, capture_output=True, check=True,
+                    )
+                    compile_line = next(
+                        line for line in result.stdout.splitlines()
+                        if "-c backend_loader_dsv4.c" in line
+                    )
+                    self.assertEqual("-DCOLI_OMP_NUM_DEVICES_STUB" in compile_line,
+                                     libomp == "22", compile_line)
 
     def test_darwin_portable_build_does_not_force_x86_architecture(self):
         missing_libomp = "/colibri-test/missing-libomp"

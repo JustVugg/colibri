@@ -36,6 +36,14 @@
 
 #include "backend_cuda_dsv4.h"
 
+/* Only for a clang build whose link leaves libomp.a's weak omp_get_num_devices
+ * unresolved (MSYS2's llvm-openmp 22.1.7 or binutils 2.46, #2286; Makefile.deepseek-v4
+ * probes for it). No offload runtime is linked, so 0 non-host devices: what libomp
+ * itself returns without one. */
+#ifdef COLI_OMP_NUM_DEVICES_STUB
+int omp_get_num_devices(void) { return 0; }
+#endif
+
 /* Two builds of the same source ship side by side: coli_cuda_dsv4_dg.dll
  * (DeepGEMM, sm_120a tensor-core paths) and coli_cuda_dsv4.dll (portable
  * generic kernels, sm_80+). The loader tries the DeepGEMM one first and asks

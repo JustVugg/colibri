@@ -67,6 +67,19 @@ LDFLAGS = -lm -fopenmp -static -pthread
 ifneq ($(findstring clang,$(notdir $(CC))),)
 LDFLAGS = -lm -fopenmp -static
 LTO ?= 0
+# libomp.a defines omp_get_num_devices() only as a COFF weak symbol, and GNU ld leaves
+# it unresolved with MSYS2's llvm-openmp 22.1.7 or binutils 2.46 (GitHub's runner has
+# both): "undefined reference to `omp_get_num_devices'" from libomp's own kmp_alloc.
+# Link one call to it the same way; only when that fails on this symbol does
+# backend_loader_dsv4.c define it, with what libomp returns when no offload runtime is
+# linked: 0 devices. Where it links (llvm-openmp 23.x with binutils 2.47), nothing is added.
+V4_OMP_PROBE := $(shell case `$(CC) -dumpmachine 2>/dev/null` in (*mingw*|*windows-gnu*) \
+	echo 'int omp_get_num_devices(void); int main(void) { return omp_get_num_devices(); }' | \
+	$(CC) -x c - -fopenmp -static -o deepseek_v4_omp_probe.exe 2>&1; \
+	rm -f deepseek_v4_omp_probe.exe;; esac)
+ifneq ($(findstring omp_get_num_devices,$(V4_OMP_PROBE)),)
+CFLAGS += -DCOLI_OMP_NUM_DEVICES_STUB
+endif
 endif
 V4_BINARY := deepseek_v4.exe
 V4_WIN_EXTRA_OBJS = backend_loader_dsv4.o
