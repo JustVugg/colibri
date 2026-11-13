@@ -530,7 +530,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   it read one bit of it: at ratio 1 that is `n²` bytes. It now publishes the blocks themselves --
   `rows × candidate_top_k_blocks` int32 ids in the source's own coordinates, `-1` past the ones a
   row keeps (`cross_layer.py`'s `block_candidate_idxs` in DI), with the same reach kept as the
-  paint bound. 2 GiB at 262144 tokens instead of 64 GiB, 320 B instead of 1600 B on the tiny
+  paint bound. 2 GiB at 262144 tokens instead of 64 GiB (that is the prompt's rows, as the mask
+  was; `v41_take_tail` then leaves 19.8 MB of them), 320 B instead of 1600 B on the tiny
   fixture, and a decode step no longer reallocates it every token. The bits are unchanged: the
   mask was the union of the chosen blocks' ranges, so reading the blocks out of it and painting
   them back is the identity, and `c/tests/test_dsv41_candidate_ids.c` holds it against a frozen

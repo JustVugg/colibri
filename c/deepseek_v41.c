@@ -4590,7 +4590,7 @@ static int v41_prefill_tail(const Cfg *c, int n, int spec_batch, int keep_rows, 
 
 /* Past the source layer: the rows of the tail to the front of every per-row buffer the
  * later layers read (the streams and their mix, the DSpark input a target layer at or
- * before the source wrote, the candidate mask, the index list the last index source
+ * before the source wrote, the candidate blocks, the index list the last index source
  * published), the forward's rows and start the tail's. */
 static void v41_take_tail(Model *m, float *h, float *pre_mix, int *n, int *start_pos, int tail, int targets, int *trace_row) {
     const Cfg *c = &m->c;
@@ -5419,7 +5419,7 @@ static int v41_prompt_poll(ColiPromptBreak *b) {
  * layer's window ring rows and their positions, the compressed rows and index keys of the
  * positions the request may write (a row for `ratio` of them), the compressor's partial
  * group, the engram history's first entries, and what crosses forwards (the index keys
- * published last, the shared top-k list, the candidate mask); the next request brings them
+ * published last, the shared top-k list, the candidate blocks); the next request brings them
  * back, keeps them parked or drops them (v41_park_decide). The host's state stays canonical:
  * the chains' watermarks come down to 0. The draft head's windows are not kept: no prompt
  * resets them either, and a draft is only verified. */
@@ -5523,7 +5523,7 @@ static void v41_park_decide(Model *m, const int *ids, int np, int max_tok, int i
  * them, and checkpoints of the rest (every layer's window ring and its positions, the compressor's
  * filling group, the layer whose index keys were published last) where a prompt's messages start
  * and where it ends. A prompt's rows read past a checkpoint publish their own top-k lists and
- * candidate masks before any layer reads them, so those are not kept (a decoded position would
+ * candidate blocks before any layer reads them, so those are not kept (a decoded position would
  * read the last forward's, and nothing here resumes one). Only what a prompt read put there: a
  * request that started from nothing or from the store saves, one that resumed the live state (with
  * decoded positions) or a photo does not, so a request that takes a checkpoint computes what the

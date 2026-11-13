@@ -387,7 +387,7 @@ static int v41c_clean_at(const Model *m, int b) {
  * prompt chunk and the pools' granularity. The CPU runs layers N.. and the head; the
  * streams of every row and the last site's mix cross to the host once per forward
  * (v41c_forward), with the host state the CPU's layers read from a chain layer: the
- * candidate mask (m->candidates) and the index list (m->shared_topk). A chain layer that
+ * candidate blocks (m->candidates) and the index list (m->shared_topk). A chain layer that
  * reads the index keys of a CPU layer (the published-key rule) reads the host's rows, as
  * the CPU's layer order has them, from a mirror of that layer's keys. */
 static int v41c_scratch(V41Chain *ch, Model *m, int rows, int ctx);
