@@ -157,6 +157,18 @@ class MemoryParsing(unittest.TestCase):
         self.assertEqual(mem["total"], 17179869184)
         self.assertEqual(mem["available"], 14500 * 16384)
 
+    def test_freebsd(self):
+        # sysctl -n hw.physmem v_free_count v_inactive_count v_page_size: one per line
+        mem = setup_hw.memory_from_freebsd("910533877760\n39321600\n157286400\n4096\n")
+        self.assertEqual(mem["total"], 910533877760)
+        self.assertEqual(mem["available"], (39321600 + 157286400) * 4096)
+
+    def test_freebsd_unreadable_counters_are_unknown_not_zero(self):
+        mem = setup_hw.memory_from_freebsd("910533877760\n")
+        self.assertEqual(mem["total"], 910533877760)
+        self.assertIsNone(mem["available"])
+        self.assertEqual(setup_hw.memory_from_freebsd(""), {"total": None, "available": None})
+
 
 class CpuParsing(unittest.TestCase):
     def test_x86(self):

@@ -139,6 +139,8 @@ static void hw_probe(char *cpu, size_t cn, int *cores, double *ram_total, double
     compat_meminfo(ram_total,ram_avail);
 #elif defined(__APPLE__)
     compat_meminfo_gb(ram_total,ram_avail);   /* free + file-backed + purgeable, as the budgets */
+#elif defined(__FreeBSD__)
+    compat_meminfo_gb(ram_total,ram_avail);   /* no /proc/meminfo on FreeBSD: the sysctl branch there */
 #else
     FILE *mi=fopen("/proc/meminfo","r");
     if(mi){ char ln[256]; double mt=0,ma=0;

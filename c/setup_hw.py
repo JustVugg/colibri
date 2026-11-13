@@ -78,6 +78,19 @@ def memory_from_darwin(memsize_text, vm_stat_text=""):
     return {"total": total, "available": darwin_available_bytes(vm_stat_text)}
 
 
+def memory_from_freebsd(sysctl_text):
+    """``sysctl -n hw.physmem vm.stats.vm.v_free_count vm.stats.vm.v_inactive_count
+    vm.stats.vm.v_page_size``: the total, then free + inactive pages, the engine's
+    own definition of available on FreeBSD (resource_plan.freebsd_available_bytes)."""
+    from resource_plan import freebsd_available_bytes
+    values = (sysctl_text or "").split()
+    try:
+        total = int(values[0])
+    except (IndexError, ValueError):
+        total = None
+    return {"total": total, "available": freebsd_available_bytes(" ".join(values[1:]))}
+
+
 def _windows_memory():
     try:
         from resource_plan import WINDOWS_MEMORYSTATUSEX_FIELDS
@@ -103,6 +116,10 @@ def detect_memory():
         return _windows_memory()
     if sys.platform == "darwin":
         return memory_from_darwin(_run(["sysctl", "-n", "hw.memsize"]), _run(["vm_stat"]))
+    if sys.platform.startswith("freebsd"):
+        # No /proc/meminfo there (linprocfs is optional and rarely mounted).
+        return memory_from_freebsd(_run(["sysctl", "-n", "hw.physmem", "vm.stats.vm.v_free_count",
+                                         "vm.stats.vm.v_inactive_count", "vm.stats.vm.v_page_size"]))
     try:
         with open("/proc/meminfo", encoding="ascii", errors="replace") as handle:
             mem = memory_from_meminfo(handle.read(256 * 1024))
