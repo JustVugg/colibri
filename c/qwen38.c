@@ -1112,23 +1112,42 @@ static int q38_spec_force_mode(const char *name, const char *value, int max_row,
     fprintf(stderr, "%s must be %saccept, mixed, cycle or row1..row%d\n", name, lookup ? "" : "reject, ", max_row);
     exit(1);
 }
+#ifdef COLI_CUDA
+static int q38_df_on(void) { return g_q38_df.on; }
+static void q38_df_embed(void *ctx, int id, float *out) { q38_embed_row((Model *)ctx, id, 0, out); }
+/* COLI_DFLASH=<dir>: DFlash2's drafter (dflash_cuda.h) on the CUDA chain's device, its context the
+ * mean of the four streams after the drafter's target layers; it drafts in the MTP head's place */
+static void q38_df_attach(Model *m) {
+    const char *dir = getenv("COLI_DFLASH");
+    if (!dir || !*dir) return;
+    Q38CChain *ch = q38cc_of(m);
+    ColiCudaTensor *lm = g_cuda_chain && ch && ch->ok && !ch->failed ? q38cc_t(ch, &m->lm_head) : NULL;
+    if (!lm) { fprintf(stderr, "[dflash] COLI_DFLASH: the drafter runs on the CUDA chain's device, which is not up here: off\n"); return; }
+    if (m->mtp) fprintf(stderr, "[dflash] the drafter drafts, the MTP head stays off\n");
+    df_load(&g_q38_df, dir, m->c.hidden, m->c.vocab, ch->dev, lm, q38_df_embed, m);
+}
+#else
+static int q38_df_on(void) { return 0; }
+#endif
 static Q38Spec q38_spec_begin(Model *m, const int *prompt, int np) {
     Q38Spec sp; memset(&sp, 0, sizeof sp);
-    sp.on = m->mtp;
-    sp.force = q38_spec_force_mode("Q38_MTP_FORCE", getenv("Q38_MTP_FORCE"), 3, 0, &sp.force_row);
+    sp.on = m->mtp || q38_df_on();
+    const int dmax = q38_df_on() ? Q38_SPEC_ROWS - 1 : 3;   /* DFlash2's drafter: its block, as the verify takes it */
+    sp.force = q38_spec_force_mode("Q38_MTP_FORCE", getenv("Q38_MTP_FORCE"), dmax, 0, &sp.force_row);
     const char *depth = getenv("Q38_MTP_DRAFTS");
-    sp.depth = m->mtp_drafts;
+    sp.depth = q38_df_on() ? dmax : m->mtp_drafts;
     if (depth && *depth) {
         if (!strcmp(depth, "auto") || !strcmp(depth, "0")) sp.depth = 0;
-        else if (depth[0] >= '1' && depth[0] <= '3' && !depth[1]) sp.depth = depth[0] - '0';
-        else { fprintf(stderr, "Q38_MTP_DRAFTS must be 1, 2, 3, or 0 (auto: the gate picks)\n"); exit(1); }
+        else if (depth[0] >= '1' && depth[0] <= '0' + dmax && !depth[1]) sp.depth = depth[0] - '0';
+        else { fprintf(stderr, "Q38_MTP_DRAFTS must be 1 to %d, or 0 (auto: the gate picks)\n", dmax); exit(1); }
     }
     sp.lookup = q38_env_bool("COLI_LOOKUP", 1);   /* on by default, always gated (docs/speculative.md) */
     sp.lookup_max = q38_env_positive_int("COLI_LOOKUP_DRAFTS", Q38_SPEC_ROWS - 1, Q38_SPEC_ROWS - 1);
     sp.lk_force = q38_spec_force_mode("COLI_LOOKUP_FORCE", getenv("COLI_LOOKUP_FORCE"), Q38_SPEC_ROWS - 1, 1,
                                       &sp.lk_force_row);
     spec_gate_init(&sp.gate, !q38_env_bool("COLI_SPEC_GATE", 1));
-    sp.pstep = q38_env_bool("Q38_MTP_PSTEP", m->mtp_pstep);   /* off by default: measured 1-5% slower on the Vulkan chain at depth 2; on beside the CUDA chain's card head (q38_mtp_card_defaults) */
+    if (q38_df_on() && !sp.gate.off) sp.gate.since_plain = SPEC_REFRESH;   /* DFlash2: a request's first step plain, T(1) measured */
+    sp.pstep = q38_env_bool("Q38_MTP_PSTEP", q38_df_on() ? 1 : m->mtp_pstep);   /* off by default: measured 1-5% slower on the Vulkan chain at depth 2; on beside the CUDA chain's card head (q38_mtp_card_defaults) */
     if (sp.lookup && prompt && np > 0) {
         sp.hist_cap = np + 256;
         sp.hist = (int *)malloc((size_t)sp.hist_cap * sizeof(int));
@@ -1144,7 +1163,7 @@ static Q38Spec q38_spec_begin(Model *m, const int *prompt, int np) {
  * the MTP head's acceptance follows by draft position when it drafts deeper
  * than one, and prompt lookup has a line of its own. */
 static void q38_spec_report(const Model *m, const Q38Spec *sp, const char *scope) {
-    if (m->mtp) {
+    if (m->mtp || q38_df_on()) {
         char depth[160] = "";
         if (sp->depth != 1) {
             int at = snprintf(depth, sizeof depth, " | %s, by position:", sp->depth ? "fixed depth" : "depth by the gate");
@@ -1163,6 +1182,13 @@ static void q38_spec_report(const Model *m, const Q38Spec *sp, const char *scope
                 sp->force == 'r' ? "reject" : sp->force == 'a' ? "accept" : sp->force == 'm' ? "mixed" :
                 sp->force == 'c' ? "cycle" : sp->force == 'w' ? "row" : "", depth,
                 sp->ended_ahead ? " | ended mid-verify" : "");
+#ifdef COLI_CUDA
+        if (q38_df_on()) {
+            char g[384]; spec_gate_describe(&sp->gate, SPEC_SRC_MTP, g, sizeof g);
+            fprintf(stderr, "[qwen38 dflash] %s: the drafter's drafts in the head's place | gate %s\n", scope, g);
+            df_report(&g_q38_df);
+        }
+#endif
     }
     if (!sp->gate.off && ((m->mtp && sp->depth == 0) || sp->lookup)) {
         char g[384];
@@ -2225,18 +2251,39 @@ static int q38_ps_parts(const Model *m,ColiPsPart *parts){
 }
 /* ids[0, P) as the Model holds them now, with its state at P (a pin's: the devices' newest first) */
 static void q38_ps_save(Model *m,const int *ids,int P){
-    if(!q38_ps_on(m)||P<g_q38_ps.B||m->kvp.tainted||m->kv_len!=P)return;
-    if(m->mtp&&m->mtp_len<P/g_q38_ps.B*g_q38_ps.B)return;   /* a whole block without its head rows */
+    if(!q38_ps_on(m)||P<g_q38_ps.B)return;
+    /* nothing else shows a save: without these lines a store that never keeps looks like one never asked */
+    const int log=getenv("COLI_PREFIX_LOG")!=NULL;
+    const int head_short=m->mtp&&m->mtp_len<P/g_q38_ps.B*g_q38_ps.B;   /* a whole block without its head rows */
+    if(m->kvp.tainted||m->kv_len!=P||head_short){
+        if(log){
+            fprintf(stderr,"[PREFIX] store: checkpoint at %d not kept: the state holds %d positions%s%s\n",
+                    P,m->kv_len,m->kvp.tainted?", tainted":"",head_short?", MTP head rows short":"");
+            fflush(stderr);
+        }
+        return;
+    }
     ColiPsPart *parts=(ColiPsPart*)malloc((size_t)3*q38_layer_rows(m)*sizeof *parts+1);
     if(!parts)return;
     const int np=q38_ps_parts(m,parts);
     Q38PinState *st=NULL;
     size_t rec=0,conv=0,ple=0;
+    int kept=0;
+    double avail=-1;
     if(q38_prefix_geometry(m,&rec,&conv,&ple)&&q38_pin_state_copy(m,&st,1)){
         size_t sb=sizeof *st+ple*sizeof(float);
         for(int i=0;i<m->c.layers;i++)if(!m->c.is_attn[i])sb+=(rec+conv)*sizeof(float);
-        coli_ps_save(&g_q38_ps,ids,P,parts,np,st,sb,q38_pin_state_free,compat_mem_available_gb()*1024.0);
+        avail=compat_mem_available_gb()*1024.0;
+        kept=coli_ps_save(&g_q38_ps,ids,P,parts,np,st,sb,q38_pin_state_free,avail);
     }else q38_pin_state_free(st);
+    if(log){
+        char held[32];   /* bytes below a MiB: a small store does not read as an empty one */
+        if(g_q38_ps.bytes<1048576)snprintf(held,sizeof held,"%zu bytes",g_q38_ps.bytes);
+        else snprintf(held,sizeof held,"%.1f MiB",g_q38_ps.bytes/1048576.0);
+        fprintf(stderr,"[PREFIX] store: checkpoint at %d %s (%s held in %d checkpoints; %.0f MiB of RAM free, %d kept free)\n",
+                P,kept?"kept":"not kept",held,coli_ps_live_ckpts(&g_q38_ps),avail,COLI_PS_RAM_FLOOR_MB);
+        fflush(stderr);
+    }
     free(parts);
 }
 /* The deepest prefix the store holds of ids[0, np), when it reaches past `held` positions: its rows
@@ -2254,10 +2301,13 @@ static int q38_ps_take(Model *m,const int *ids,int np,int held){
        !coli_ps_parts_hold(parts,nparts,P)){coli_ps_hit_free(&h);free(parts);return 0;}
     q38_prefix_settle(m);   /* the chain's prompt-end snapshot is the host's before the state moves */
     /* the whole blocks the slot holds already (its record shares them with the prompt; the MTP
-     * head's rows stand below its own length) stay in place, on the host and in the mirrors */
-    int keep=kv_prefix_common(&m->kvp,ids,np);
+     * head's rows stand below its own length) stay in place, on the host and in the mirrors. The
+     * head's row at common - 1 was made with the record's next token, not the prompt's: it goes too. */
+    const int common=kv_prefix_common(&m->kvp,ids,np);
+    int keep=common;
     if(keep>m->kv_len)keep=m->kv_len;
     if(m->mtp&&keep>m->mtp_len)keep=m->mtp_len;
+    if(m->mtp&&keep>common-1)keep=common-1;
     coli_ps_load_from(&g_q38_ps,&h,parts,nparts,keep);
     keep=coli_ps_kept(&g_q38_ps,&h,keep);
     free(parts);
@@ -2459,6 +2509,7 @@ static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     int budget = q38_serve_budget(np, q->max_tok, max_ctx, q->logprobs > 0);
     if(budget < 0){
         printf("ERROR %s CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d\n",q->id,np,q->max_tok,max_ctx);
+        q38_vision_detach(m);   /* else the next request's rows at these positions would be the picture's */
         fflush(stdout); free(ids); return 0;
     }
     if(budget < q->max_tok){
@@ -3230,11 +3281,13 @@ int main(int argc, char **argv) {
      * now that the tier placed the trunk and the CPU holds its int8 rows (the chain's own
      * copies of the rest come from the same bytes) */
     if (q38cc_env_on() && q38cc_setup(&m, g_q38_mux_slots)) { g_cuda_chain=1; atexit(cc_shutdown); }
+    q38_df_attach(&m);   /* COLI_DFLASH=<dir>: DFlash2's drafter, in the MTP head's place */
     /* The MTP head stays on the CPU beside the CUDA chain, and its drafts cost more than they
      * save there (an RTX PRO 4000, Qwen3.8-Flash-Next IQ2_XS with the host pool: plain decode
      * 46-48 tok/s, the head's drafts 42.5-44.7, the prompt 180 against 150 tok/s as the head
      * reads every prompt row): unset, Q38_MTP leaves it off as beside the Vulkan chain. */
-    if (g_cuda_chain && m.mtp && q38cc_head_on_card(&m)) q38_mtp_card_defaults(&m);
+    if (g_q38_df.on) m.mtp = 0;
+    else if (g_cuda_chain && m.mtp && q38cc_head_on_card(&m)) q38_mtp_card_defaults(&m);
     else if (g_cuda_chain && m.mtp && !(getenv("Q38_MTP") && *getenv("Q38_MTP"))) {
         m.mtp = 0;
         fprintf(stderr, "[qwen38] speculative decoding with the MTP head: off (its routed experts did not reach the card; "
@@ -3378,7 +3431,8 @@ int main(int argc, char **argv) {
         int match = 0;
         printf("\nReference: ");  for (int i=np;i<nfull;i++) printf("%d ", full[i]);
         printf("\nC engine : ");  for (int i=np;i<nfull;i++) { printf("%d ", out[i]); if (out[i]==full[i]) match++; }
-        if (g_tok) { printf("Text      : "); print_decoded(stdout,out,np,nfull); printf("\n"); }
+        /* the "C engine :" line holds the ids only */
+        if (g_tok) { printf("\nText      : "); print_decoded(stdout,out,np,nfull); }
         printf("\nMatching tokens: %d/%d\n", match, n_new);
         if(ref_logits)ref_numeric_match=compare_reference_logits(g_last_logit,ref_logits);
         ref_match = match;

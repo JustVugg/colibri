@@ -1642,7 +1642,7 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
 }
 
 static double mem_avail_bytes(void) {
-    /* Shared probe: Linux MemAvailable, macOS free+inactive+purgeable,
+    /* Shared probe: Linux MemAvailable, macOS free+file-backed+purgeable,
      * Windows ullAvailPhys/commit. The #else here used to return 0, so
      * Windows auto-cap was always 16 experts/layer and never warned. */
     double gb = compat_mem_available_gb();

@@ -10,7 +10,9 @@
  * the free RAM's floor evict the oldest entries nothing follows, never a block a checkpoint
  * stands on; a layout that changes empties the store; a group that does not divide the block keeps
  * nothing. The checkpoints' places: the first message start past what the slot held, the last but
- * the reply's. */
+ * the reply's. A chain and state over the budget are refused before anything is evicted, the RAM
+ * floor holds across a whole save, a save that fails takes back the blocks it added, and a chain's
+ * shallowest checkpoint (its system prompt's) outlives its deeper ones while the chain is used. */
 #include <stdio.h>
 #include <stdint.h>
 #include "../prefix_store.h"
@@ -226,6 +228,73 @@ int main(void) {
     X[nx++] = 400; X[nx++] = 401;                                         /* the reply's opening from 103 */
     nk = coli_ps_marks_ex(X, nx, 0, B, &eom, 1, 1, mk_);
     check(nk == 2 && mk_[0] == 41 && mk_[1] == 72, "marks after the token that closes a message");
+
+    /* On Qwen3.8 a checkpoint's state is ~112 MiB and a block 13.5 MiB, so a budget may hold a
+     * system prompt's blocks but not them and a state. S: a state's bytes as the
+     * engine says them (the test's state is 8). */
+    const size_t S = 100000, blk = coli_ps_span(parts, NP, B) + (size_t)B * sizeof(int);
+    const double blk_mb = (double)blk / 1048576.0;
+    read_rows(A, 0, na);
+    /* a chain and its state over the budget: refused before anything is evicted, no block left */
+    ColiPrefixStore f;
+    const size_t cost = coli_ps_cost(parts, NP, sys, S);
+    coli_ps_init(&f, B, cost - 1);
+    check(coli_ps_save(&f, A, B, parts, NP, state_of(A, B), 8, state_free, -1), "fit: a small checkpoint kept");
+    size_t b0 = f.bytes;
+    fr = frees;
+    check(!coli_ps_save(&f, A, sys, parts, NP, state_of(A, sys), S, state_free, -1) && frees == fr + 1 && f.bytes == b0 &&
+          coli_ps_live_ckpts(&f) == 1 && coli_ps_live_blocks(&f) == 1,
+          "a chain and state one byte over the budget: refused, nothing evicted, no block left behind");
+    coli_ps_clear(&f);
+    coli_ps_init(&f, B, cost);
+    check(coli_ps_save(&f, A, sys, parts, NP, state_of(A, sys), S, state_free, -1) && f.bytes == cost,
+          "a budget of exactly coli_ps_cost holds the chain and its state");
+    coli_ps_clear(&f);
+    /* the free RAM's floor holds across a whole save */
+    ColiPrefixStore g;
+    coli_ps_init(&g, B, (size_t)64 << 20);
+    fr = frees;
+    check(!coli_ps_save(&g, A, sys, parts, NP, state_of(A, sys), 8, state_free, COLI_PS_RAM_FLOOR_MB + 5.5 * blk_mb) &&
+          frees == fr + 1 && g.bytes == 0 && coli_ps_live_blocks(&g) == 0,
+          "RAM over the floor for 5 blocks of 12: the save stops at the floor, its blocks taken back");
+    /* a checkpoint that cannot be kept takes the blocks its save added with it */
+    fr = frees;
+    check(!coli_ps_save(&g, A, sys, parts, NP, state_of(A, sys), S, state_free, COLI_PS_RAM_FLOOR_MB + 12 * blk_mb + S / 2 / 1048576.0) &&
+          frees == fr + 1 && g.bytes == 0 && coli_ps_live_blocks(&g) == 0,
+          "RAM for the 12 blocks but not the state: nothing kept, no block left behind");
+    check(coli_ps_save(&g, A, sys, parts, NP, state_of(A, sys), S, state_free, COLI_PS_RAM_FLOOR_MB + 12 * blk_mb + 2.0 * S / 1048576.0),
+          "RAM for both: kept");
+    coli_ps_clear(&g);
+    /* a chain's shallowest checkpoint outlives its deeper ones: a budget for the chain and two
+     * states, three checkpoints saved on it (the system prompt's end, a message start, the turn's end) */
+    ColiPrefixStore r;
+    const int P2 = sys + 1 + 60;
+    coli_ps_init(&r, B, coli_ps_cost(parts, NP, na, S) + S + S / 2);
+    check(coli_ps_save(&r, A, sys, parts, NP, state_of(A, sys), S, state_free, -1) &&
+          coli_ps_save(&r, A, P2, parts, NP, state_of(A, P2), S, state_free, -1) &&
+          coli_ps_save(&r, A, na, parts, NP, state_of(A, na), S, state_free, -1) && coli_ps_live_ckpts(&r) == 2,
+          "root: three checkpoints on one chain, room for two");
+    P = coli_ps_lookup(&r, C, nc, nc - 1, 1, &h);
+    check(P == sys, "root: a new conversation on the system prompt still takes its checkpoint (the message start's went)");
+    coli_ps_hit_free(&h);
+    P = coli_ps_lookup(&r, A2, na2, na2 - 1, 1, &h);
+    check(P == na, "root: the conversation's next turn takes its end");
+    coli_ps_hit_free(&h);
+    /* a lookup keeps its chain's shallowest checkpoint in use too: an unrelated prompt saved after
+     * the conversation, the conversation's next turn looked up, then a save that needs one eviction */
+    r.budget = (size_t)64 << 20;
+    read_rows(E, 0, ne);
+    check(coli_ps_save(&r, E, ne, parts, NP, state_of(E, ne), S, state_free, -1), "root: an unrelated prompt kept");
+    P = coli_ps_lookup(&r, A2, na2, na2 - 1, 1, &h);
+    coli_ps_hit_free(&h);
+    int F[64]; for (int i = 0; i < B; i++) F[i] = 7000 + i;
+    read_rows(F, 0, B);
+    r.budget = r.bytes + coli_ps_cost(parts, NP, B, S) - 1;
+    check(coli_ps_save(&r, F, B, parts, NP, state_of(F, B), S, state_free, -1), "root: one more save, one checkpoint evicted");
+    P = coli_ps_lookup(&r, C, nc, nc - 1, 1, &h);
+    check(P == sys, "root: the oldest went (the unrelated prompt's), not the system prompt's, which the lookup used");
+    coli_ps_hit_free(&h);
+    coli_ps_clear(&r);
 
     coli_ps_clear(&s); coli_ps_clear(&t); coli_ps_clear(&u); coli_ps_clear(&v); coli_ps_clear(&w); coli_ps_clear(&x);
     if (fails) { printf("test_prefix_store: %d failure(s)\n", fails); return 1; }

@@ -11,7 +11,9 @@ static void mark(GSession *s, float value) {
     for (int i=0;i<48;i++) s->layer[1].kda_window[i]=-value-i*0.0625f;
 }
 int main(void) {
+#ifdef _OPENMP
     omp_set_num_threads(1);
+#endif
     GModel m={0}; Cfg *c=&m.c;
     c->n_layers=2; c->kv_lora=8; c->index_hd=4; c->vocab=256;
     c->kda_heads=2; c->kda_hd=4; c->kda_proj=8; c->conv_k=2; c->is_full[0]=1;

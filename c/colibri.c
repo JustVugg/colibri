@@ -777,7 +777,9 @@ static int g_cuda_expert_auto;
 static int g_cuda_dense;
 static int g_cuda_release_host;
 static double g_cuda_reserve_gb;   /* CUDA_RESERVE_GB: VRAM headroom kept free of expert tier (default 2 GB) */
+#ifdef COLI_ANS   /* read and set only under COLI_ANS: unguarded, a CUDA build warns -Wunused-variable */
 static int g_cuda_raw_experts=-1;   /* experimental ANS tier: keep this global hot prefix raw */
+#endif
 static int g_cuda_devices[COLI_CUDA_MAX_DEVICES], g_cuda_ndev, g_cuda_rr;
 static int64_t g_cuda_dense_projected[COLI_CUDA_MAX_DEVICES];
 static void qt_cuda_reset(QT *t){
@@ -3261,7 +3263,15 @@ static void *map_of_fd(int fd){
 #endif
         }
     }
+#elif defined(_WIN32)
+    /* the whole shard as one read-only view, kept for the life of the process like the mmap above */
+    struct stat st; compat_ro_map wm; const void *wp;
+    if(g_nmaps<512 && fstat(fd,&st)==0 && compat_map_readonly(fd,0,(size_t)st.st_size,&wm,&wp)==0){
+        base=(void*)wp; g_maps[g_nmaps].fd=fd; g_maps[g_nmaps].base=base; g_maps[g_nmaps].len=wm.len; g_nmaps++;
+    }
 #endif
+    if(!base){ static int warned;      /* under g_map_mtx: one line per process */
+        if(!warned){ warned=1; fprintf(stderr,"[MMAP] a model shard could not be mapped: TRUNK_RESIDENT_LAYERS / COLI_MMAP read its weights into RAM instead\n"); } }
     pthread_mutex_unlock(&g_map_mtx);
     return base;
 }
@@ -8847,7 +8857,7 @@ static int mlv_vk_mm(MvMat *w, float *y, const float *x, int S){
     return ok;
 }
 #endif
-static struct { float *patches; unsigned long long bytes; int gh, gw, present; } g_mlv_pending;
+static struct { float *patches; unsigned long long bytes, id; int gh, gw, present; } g_mlv_pending;   /* id: its IMAGE frame's */
 static float *g_vis_rows; static int *g_vis_map, g_vis_map_len;
 static void vis_apply(Model *m, float *x, int S, int pos_base){
     if(!g_vis_map) return;
@@ -11573,7 +11583,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
         if(g_mlv_pending.present) fprintf(stderr,"[ml4] a second picture came before its SUBMIT; the first is dropped\n");
         mlv_pending_clear();
         g_mlv_pending.patches=(float*)buf; g_mlv_pending.bytes=bytes;
-        g_mlv_pending.gh=gh; g_mlv_pending.gw=gw; g_mlv_pending.present=1;
+        g_mlv_pending.gh=gh; g_mlv_pending.gw=gw; g_mlv_pending.id=iid; g_mlv_pending.present=1;
         free(line); return 0;
     }
     if(!strncmp(line,"STOP ",5)){
@@ -11699,6 +11709,12 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
         fflush(stdout); return 0;
     }
     int vis_first=-1;   /* the prompt's first [IMG], when an IMAGE frame came before it */
+    if(g_mlv_pending.present && g_mlv_pending.id!=sub.id){
+        /* its own SUBMIT was refused before this point (CONTEXT_EXCEEDED, EMPTY_PROMPT, SLOT_BUSY, ...) */
+        fprintf(stderr,"[ml4] the picture of request %llu was not used; request %llu goes without it\n",
+                g_mlv_pending.id,sub.id);
+        mlv_pending_clear();
+    }
     if(g_mlv_pending.present){
         int bad=mlv_attach(m,T,tmp,nt,&vis_first);
         mlv_pending_clear();
@@ -13343,8 +13359,8 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
 
 static double g_mem_avail_boot=0;   /* MemAvailable all'avvio, prima di caricare il modello */
 /* RAM disponibile ADESSO (GB): e' il tetto vero, non il totale. Linux: MemAvailable
- * da /proc/meminfo. macOS: pagine free+inactive+purgeable da host_statistics64
- * (stessa semantica: recuperabili senza swap). Senza questo ramo il fallback
+ * da /proc/meminfo. macOS: pagine free+file-backed+purgeable da host_statistics64
+ * (recuperabili senza comprimere ne' swappare, compat_meminfo_gb). Senza questo ramo il fallback
  * "assumo 8 GB" castrava la cache expert proprio sulle macchine con piu' RAM. */
 static double mem_available_gb(void){
     /* Era la sola copia giusta di questa misura; glm53.c ne aveva una che

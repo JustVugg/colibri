@@ -130,7 +130,8 @@ endif
 # backend_cuda_dsv4.cu is compiled by nvcc and linked straight into the
 # engine, so the dsv4_cuda_* symbols are the real ones. Defaults to the
 # GENERIC kernels (CUDA_ARCH=native|portable|portable-pre-ampere|sm_XX;
-# portable covers sm_80+, portable-pre-ampere adds sm_61/sm_75 and needs NO_TC=1);
+# portable covers sm_80+, portable-pre-ampere adds sm_61/sm_75 and needs NO_TC=1
+# and CUDA <= 12.9);
 # DEEPGEMM=1 adds the sm_120a DeepGEMM tensor-core paths and needs the
 # patched sm120 DeepGEMM checkout at DEEPGEMM_HOME (see
 # patches-deepgemm-sm120-msvc.patch and docs/deepseek-v4.md). Untested here
@@ -175,6 +176,11 @@ else ifeq ($(CUDA_ARCH),portable-pre-ampere)
 # Requires NO_TC=1: the DSV4_CUDA_TC path calls cuBLASLt block-scaling APIs
 # (CUBLASLT_MATMUL_DESC_A_SCALE_MODE and friends) that need CUDA >= 12.8, and
 # those are a TOOLKIT dependency rather than an architecture one.
+#
+# Needs CUDA <= 12.9: CUDA 13 dropped compute_61 (its nvcc --list-gpu-arch
+# starts at compute_75), so nvcc stops at once with "Unsupported gpu
+# architecture 'compute_61'". With CUDA 13, a Turing card builds with
+# CUDA_ARCH=sm_75 NO_TC=1.
 #
 # DEEPGEMM is unavailable here and cannot be made available: it calls
 # cuTensorMapEncodeTiled (TMA), a hardware unit introduced in sm_90, so there

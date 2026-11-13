@@ -131,6 +131,89 @@ static void test_head(void) {
     assert(coli_v4_gpu_head_batch(engine, &input, 3, NULL, ids, values) == -1);
     unsetenv("DSV4_CUDA_HEAD_BATCH");
     coli_v4_gpu_engine_close(engine); assert(shutdowns == before + 1);
+    /* DSV4_CUDA_HEAD_LAZY (default): the first head call uploads; a refused
+     * upload is not retried within the same open; 0 leaves it to engine open. */
+    engine->gpu.enabled = 1; head_scores_ok = 1; head_upload_ok = 1;
+    int uploads = head_uploads;
+    assert(!coli_v4_gpu_head_scores(engine, &input, &scores) && scores == input);
+    assert(engine->gpu.head && head_uploads == uploads + 1 && engine->gpu.head_tried);
+    assert(!coli_v4_gpu_head_scores(engine, &input, &scores) && head_uploads == uploads + 1);
+    coli_v4_gpu_engine_close(engine);
+    assert(!engine->gpu.head && !engine->gpu.head_tried);
+    engine->gpu.enabled = 1; head_upload_ok = 0; uploads = head_uploads;
+    assert(coli_v4_gpu_head_scores(engine, &input, &scores) == -1);
+    assert(!engine->gpu.head && head_uploads == uploads + 1);
+    head_upload_ok = 1;
+    assert(coli_v4_gpu_head_batch(engine, &input, 3, NULL, ids, values) == -1);
+    assert(!engine->gpu.head && head_uploads == uploads + 1);
+    coli_v4_gpu_engine_close(engine);
+    setenv("DSV4_CUDA_HEAD_LAZY", "0", 1);
+    engine->gpu.enabled = 1; uploads = head_uploads;
+    assert(coli_v4_gpu_head_scores(engine, &input, &scores) == -1);
+    assert(!engine->gpu.head && head_uploads == uploads && !engine->gpu.head_tried);
+    unsetenv("DSV4_CUDA_HEAD_LAZY");
+    coli_v4_gpu_engine_close(engine);
+    free(engine);
+#endif
+}
+
+/* A head the RAM plan streams: read for the upload through these, then freed. */
+static int head_exact = 1, head_reads, head_read_fail;
+static uint64_t host_free = UINT64_C(64) << 30;
+static ColiSafetensorsTensor head_tensor = {.dtype = COLI_ST_BF16, .nbytes = 512, .rank = 2};
+int dsv4_cuda_head_exact_available(void) { return head_exact; }
+uint64_t coli_v4_os_available_memory(void) { return host_free; }
+const ColiSafetensorsTensor *coli_st_find(const ColiSafetensorsIndex *index, const char *name) {
+    assert(index && !strcmp(name, "head.weight"));
+    return &head_tensor;
+}
+int coli_v4_head_cache_load(ColiV4Engine *engine, const ColiSafetensorsIndex *index,
+                            char *error, size_t error_size) {
+    assert(engine && index && !engine->head_cache.data);
+    head_reads++;
+    if (head_read_fail) { snprintf(error, error_size, "cannot load resident BF16 head.weight"); return -1; }
+    engine->head_cache.data = calloc(1, 512); assert(engine->head_cache.data);
+    engine->head_cache.bytes = 512;
+    return 0;
+}
+static void test_head_borrowed(void) {
+#if defined(__AVX2__)
+    ColiV4Engine *engine = calloc(1, sizeof(*engine)); assert(engine);
+    static int index_storage;
+    engine->target_index = (ColiSafetensorsIndex *)&index_storage;
+    engine->gpu.enabled = 1;
+    engine->config.vocab_size = 32; engine->config.hidden_size = 8;
+    head_uploads = 0; head_upload_ok = 1; head_scores_ok = 1;
+    /* nothing is read when the upload cannot happen */
+    head_exact = 0;
+    coli_v4_gpu_head_upload(engine);
+    head_exact = 1; low_memory_device = 0;
+    coli_v4_gpu_head_upload(engine);
+    low_memory_device = -1; host_free = 512;
+    coli_v4_gpu_head_upload(engine);
+    host_free = UINT64_C(64) << 30; head_tensor.dtype = COLI_ST_F16;
+    coli_v4_gpu_head_upload(engine);
+    head_tensor.dtype = COLI_ST_BF16;
+    assert(!head_reads && !head_uploads && !engine->gpu.head && !engine->head_cache.data);
+    /* unreadable head.weight: no upload */
+    head_read_fail = 1;
+    coli_v4_gpu_head_upload(engine);
+    assert(head_reads == 1 && !head_uploads && !engine->gpu.head && !engine->head_cache.data);
+    head_read_fail = 0;
+    /* refused: the host copy is freed, the CPU keeps streaming */
+    head_upload_ok = 0;
+    coli_v4_gpu_head_upload(engine);
+    assert(head_reads == 2 && head_uploads == 1 && !engine->gpu.head);
+    assert(!engine->head_cache.data && !engine->head_cache.bytes);
+    /* uploaded: the device holds the head, the host copy is freed */
+    head_upload_ok = 1;
+    coli_v4_gpu_head_upload(engine);
+    assert(head_reads == 3 && head_uploads == 2 && engine->gpu.head && live_tensors == 1);
+    assert(!engine->head_cache.data && !engine->head_cache.bytes);
+    float input = 7, scores = -1;
+    assert(!coli_v4_gpu_head_scores(engine, &input, &scores) && scores == input);
+    coli_v4_gpu_engine_close(engine);
+    assert(!live_tensors && !engine->gpu.head);
     free(engine);
 #endif
 }
@@ -459,6 +542,7 @@ int main(void) {
     test_resident_route();
     test_wo_decode();
     test_head();
+    test_head_borrowed();
     puts("test_v4_gpu_placement: ok");
     return 0;
 }

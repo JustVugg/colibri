@@ -3947,8 +3947,7 @@ static void q38_dho_count(Q38Weight *w,size_t *bytes,int *n) {
 
 /* after qt_init: quantize and upload what the placer accepted */
 static void q38_trunk_place_all(Model *m) {
-    (void)m;
-    int placed=0,offered=g_trunk_n; size_t placed_bytes=0; double t0=now_s();
+    int placed=0,offered=g_trunk_n,release=q38_trunk_cpu_int8_wanted(); size_t placed_bytes=0,released=0; double t0=now_s();
     for(int i=0;i<g_trunk_n;i++){
         Q38TrunkItem *it=&g_trunk[i]; Q38Weight *w=it->w;
         if(it->cpu_only){offered--;continue;}
@@ -3981,10 +3980,18 @@ static void q38_trunk_place_all(Model *m) {
             free(x);free(yg);free(yc);
         }
         if(h>=0){ w->gpu=h+1; placed++; placed_bytes+=(size_t)O*I; }
+        /* Every CPU read of a placed matrix goes through q8 now, so its BF16 rows go here
+         * rather than in q38_trunk_cpu_int8 after the tier is up: the load no longer holds the
+         * whole BF16 trunk beside the placed matrices' int8 (Q38_TRUNK_CPU_INT8=0 keeps BF16). */
+        if(h>=0&&release&&w->owns_data&&w->data){
+            uint64_t was=q38_weight_bytes(w);
+            free(w->data); w->data=NULL; w->owns_data=0; released+=was;
+            m->resident_weight_bytes-=was; m->resident_weight_bytes+=(size_t)O*I+(size_t)O*sizeof(float);
+        }
     }
     if(g_trunk_n)
-        fprintf(stderr,"[qtier] qwen38 trunk: %d of %d offered matrices resident (int8, a GGUF's blocks as they are; %.2f GiB) in %.1fs; the rest answers from the CPU\n",
-                placed,offered,placed_bytes/1073741824.0,now_s()-t0);
+        fprintf(stderr,"[qtier] qwen38 trunk: %d of %d offered matrices resident (int8, a GGUF's blocks as they are; %.2f GiB; %.2f GiB of BF16 released) in %.1fs; the rest answers from the CPU\n",
+                placed,offered,placed_bytes/1073741824.0,released/1073741824.0,now_s()-t0);
 }
 
 /* Start the tier after the model is loaded. COLI_CUDA=1 turns it on (the
@@ -4039,6 +4046,17 @@ static void q38_tier_warm(Model *m,int hist) {
 static size_t q38cc_reserve_bytes(Model *m);   /* qwen38_cuda_chain.h */
 static size_t q38cc_stage_mb_env(void); static size_t q38cc_prompt_stage_bytes(Model *m); static size_t q38cc_gguf_stride(Model *m);
 static int q38cc_env_on(void);
+/* the chain's own device memory (COLI_CUDA_CHAIN=1), offered as a component of its own before
+ * the tier sizes the experts' budget: the chain allocates it after q38_tier_start, and the
+ * experts would take that room first; 0: no chain */
+static int q38_tier_offer_chain(Model *m) {
+    if(!q38cc_env_on())return 0;
+    size_t rb=q38cc_reserve_bytes(m);
+    qt_trunk_offer("chain",0,rb);
+    fprintf(stderr,"[qtier] qwen38: %.2f GiB kept for the CUDA chain (its mirrors at %d positions, its scratch and own matrices)\n",
+            rb/1073741824.0,m->kv_cap>0?m->kv_cap:m->max_t>0?m->max_t:qwen38_max_ctx());
+    return 1;
+}
 #endif
 static void q38_tier_start(Model *m,int cap) {
     const char *on=getenv("COLI_CUDA");
@@ -4061,14 +4079,9 @@ static void q38_tier_start(Model *m,int cap) {
         }
         if(!ok)fprintf(stderr,"[qtier] qwen38: the GGUF's expert types are not all ones the CUDA tier computes; the experts stay on the CPU\n");
         q38_trunk_offer_all(m);
-        /* the chain's own device memory (COLI_CUDA_CHAIN=1), before the arena takes the budget */
-        if(ok&&q38cc_env_on()){
-            size_t rb=q38cc_reserve_bytes(m);
-            qt_trunk_offer("chain",0,rb);
-            if(!q38cc_stage_mb_env())qt_reserve_stage(q38cc_prompt_stage_bytes(m),(size_t)c->experts*q38cc_gguf_stride(m));
-            fprintf(stderr,"[qtier] qwen38: %.2f GiB kept for the CUDA chain (its mirrors at %d positions, its scratch and own matrices)\n",
-                    rb/1073741824.0,m->kv_cap>0?m->kv_cap:m->max_t>0?m->max_t:qwen38_max_ctx());
-        }
+        /* before the arena takes the budget */
+        if(ok&&q38_tier_offer_chain(m)&&!q38cc_stage_mb_env())
+            qt_reserve_stage(q38cc_prompt_stage_bytes(m),(size_t)c->experts*q38cc_gguf_stride(m));
         /* each expert in a slot of its own layer's size (one device), the chain's promotions too
          * (qt_chain_arena_exact): unsloth's UD-IQ2_XS mixes layers of 1.45 to 2.09 MB experts, and
          * slots of the largest held a fifth fewer. With the chain only: the tier on its own swaps an
@@ -4118,6 +4131,9 @@ static void q38_tier_start(Model *m,int cap) {
             return;
         }
     q38_trunk_offer_all(m);                        /* sizes only; the placer decides in qt_init */
+#ifdef COLI_CUDA
+    q38_tier_offer_chain(m);                       /* as on a GGUF: the promotions would fill the chain's room */
+#endif
     if(qt_init_fp8(c->layers,c->experts,c->hidden,c->inter,cap,c->topk,E4M3_LUT)){
         atexit(qt_shutdown);
         fprintf(stderr,"[qtier] qwen38: fp8 expert tier on (RAM LRU %d/layer stays; experts stream to VRAM as they get hot)\n",cap);
@@ -4445,7 +4461,7 @@ static void q38_expert_row(Model *m,int layer,int eid,const float *xs,float *eg,
  * experts loaded as one batch, and one parallel region runs gate+up over (expert, row
  * block) items for all the rows each expert received, the hidden rows, then down.
  * Every output row comes from the per-row kernel q38_weight_matmul calls for that
- * matrix (q38_matmul_int4g64, x2_matmul, xl_matmul: a row's bits do not depend on how
+ * matrix (q38_matmul_int4g64, x2_matmul, xl_matmul, matmul_fp8 without FMA: a row's bits do not depend on how
  * many activation rows share the call), and each row's sum is added in rank order as
  * the decode loop adds it, so the output is the decode loop's to the bit.
  * Q38_MOE_GROUPED=0 keeps the decode loop. */
@@ -4462,6 +4478,9 @@ static int q38_rows_kind(const Q38Weight *w) {
     if(!w->data||w->q4||w->q8||w->gpu||w->act2)return Q38_ROWS_NONE;
     if(w->kind==Q38_WEIGHT_INT4G64&&w->r16)return Q38_ROWS_GQ;   /* xf16 rows take gq_act */
     if(w->kind==Q38_WEIGHT_INT4G64&&w->scales)return Q38_ROWS_F32;
+#ifdef COLI_FP8_NOFMA_LANES
+    if(w->kind==Q38_WEIGHT_FP8&&w->scales)return Q38_ROWS_F32;   /* quant.h matmul_fp8_nofma_part */
+#endif
     if((w->kind==Q38_WEIGHT_LOWBIT16||(w->kind==Q38_WEIGHT_VQ2&&w->vqb))&&w->r16)return Q38_ROWS_GQ;   /* xl16 / vq2r16 rows take gq_act */
     if((w->kind==Q38_WEIGHT_INT2G32||w->kind==Q38_WEIGHT_LOWBIT16)&&w->scales&&w->x2q)return Q38_ROWS_X2;
     if(w->kind==Q38_WEIGHT_VQ2&&w->scales&&w->x2q&&w->vqb)return Q38_ROWS_X2;
@@ -4469,10 +4488,26 @@ static int q38_rows_kind(const Q38Weight *w) {
     if(w->kind==Q38_WEIGHT_GGML&&gq_int_ok(w->gq_type,w->cols)&&gq_row_bytes(w->gq_type,w->cols)>0)return Q38_ROWS_GQ;
     return Q38_ROWS_NONE;
 }
+/* A layer of native FP8 experts on a build without FMA: q38_rows has their kernel there, quant.h's
+ * FP8 rows in lanes. Only with the parallel batch reads and the release's layout (the scale bank,
+ * gate/up adjacent), else the grouped path would run them a row at a time. With FMA (AVX2 and
+ * the others) they keep the per-expert paths. */
+static int q38_layer_fp8_rows(Model *m,int layer) {
+#ifdef COLI_FP8_NOFMA_LANES
+    st_tensor *w[3];
+    return m->expert_parallel_reads&&!q38_layer_int4(m,layer)&&!g_q38_gguf&&
+           q38_prepare_expert_scale_bank(m,layer)&&q38_native_fp8_expert_tensors(m,layer,0,w);
+#else
+    (void)m;(void)layer;return 0;
+#endif
+}
 /* rows [r0,r1) of w (O x I) for n activation rows: y[a*ys + o]; xr[a] the f32 rows,
  * xq/dx the int8-per-32 ones ([n][I], [n][I/32]), ga the GGUF types' (n rows) */
 static void q38_rows(float *y,int ys,const Q38Weight *w,int I,int r0,int r1,
                      const float *const *xr,const int8_t *xq,const float *dx,const gq_act *ga,int n) {
+#ifdef COLI_FP8_NOFMA_LANES
+    if(w->kind==Q38_WEIGHT_FP8){matmul_fp8_nofma_part(y,ys,(const uint8_t*)w->data,w->scales,I,r0,r1,xr,n);return;}
+#endif
 #ifdef XF16_ON
     if(w->kind==Q38_WEIGHT_INT4G64&&w->r16){q38_xf16_rows(y,ys,w,ga,r0,r1,n);return;}   /* whole groups, as below */
 #endif
@@ -4576,7 +4611,7 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
     static int on=-1;
     if(on<0){const char *e=getenv("Q38_MOE_GROUPED");on=!(e&&e[0]=='0');}
     Cfg *c=&m->c;const int H=c->hidden,E=c->experts,K=c->topk,I=c->inter,SI=c->shared_inter;
-    if(!on||S<1||S>Q38_GROUPED_ROWS||!(q38_layer_int4(m,layer)||g_q38_gguf)||H%32||I%32)return 0;
+    if(!on||S<1||S>Q38_GROUPED_ROWS||!(q38_layer_int4(m,layer)||g_q38_gguf||q38_layer_fp8_rows(m,layer))||H%32||I%32)return 0;
     /* every distinct expert of the rows in the cache at once, or the per-expert paths */
     if((S*K<E?S*K:E)>m->cache[layer].cap)return 0;   /* at most E distinct, however many rows */
     /* the device tiers take experts per row; the statistics hooks keep the loop's order. The
@@ -5165,7 +5200,12 @@ static void q38_moe_ex(Model *m,Layer *l,int layer,const float *x,int S,float *o
         if(group>Q38_GROUPED_ROWS)group=Q38_GROUPED_ROWS;
         if(group<1)group=1;
         int n0=S<group?S:group,base=0;
-        if(q38_moe_decode_grouped(m,l,layer,x,n0,out,logits_in,routed_only,0,NULL,NULL,NULL)){
+        /* FP8 experts with a cache smaller than the layer: a prompt keeps the prefill MoE when its
+         * chunks are wider than the cap/K-row groups here. Both read an expert once a chunk or a
+         * group, so the narrower of the two reads more */
+        if((S<=group||m->cache[layer].cap>=E||group>=q38_moe_prefill_rows(&m->c,S)||
+            !q38_layer_fp8_rows(m,layer))&&
+           q38_moe_decode_grouped(m,l,layer,x,n0,out,logits_in,routed_only,0,NULL,NULL,NULL)){
             for(base=n0;base<S;base+=group){
                 int n=S-base<group?S-base:group;
                 if(!q38_moe_decode_grouped(m,l,layer,x+(int64_t)base*H,n,out+(int64_t)base*H,
@@ -5192,6 +5232,9 @@ static void q38_embed_row(Model *m,int id,int abs_pos,float *out);   /* below; t
 #include "qwen38_chain.h"  /* COLI_VK_CHAIN: every layer's dense chain on the device */
 #endif
 #ifdef COLI_CUDA
+#include "cuda_chain.h"
+#include "dflash_cuda.h"        /* COLI_DFLASH: DFlash2's drafter on the CUDA chain's device */
+static DfDrafter g_q38_df;
 #include "qwen38_cuda_chain.h"  /* COLI_CUDA_CHAIN: every layer's dense chain on the CUDA device */
 #endif
 
@@ -5390,6 +5433,10 @@ static float *q38_forward(Model *m,const int *ids,int S,int pos_base,int nlogits
     m->kv_len=pos_base+S;
     /* Rewinding and writing a shorter branch invalidates its old tail. */
     if(m->kvp.len>pos_base)m->kvp.len=pos_base;
+#ifdef COLI_CUDA
+    /* DFlash2's drafter: the chain put this forward's rows in its cache (df_ctx) when it ran them all */
+    if(g_q38_df.on)df_note(&g_q38_df,ids,S,pos_base,m->kvp.fed,m->kvp.len);
+#endif
     kv_prefix_record(&m->kvp,ids,pos_base,S);
     if(m->vis_map && m->vis_rows_n>0)kv_prefix_taint(&m->kvp);
     float *logit;
@@ -5482,6 +5529,9 @@ static void q38_seq_free(Model *m,Q38Seq *q) {
  * is (as a verify's rows, below), so each conversation gets the logits it would
  * alone. Decode rows are never an image's. S rows of logits come back. */
 static float *q38_forward_rows(Model *m,const Q38Row *rows,const int *ids,int S) {
+#ifdef COLI_CUDA
+    g_q38_df.len=0;   /* DFlash2's drafter keeps one conversation's rows: several in a step leave it none */
+#endif
     Cfg *c=&m->c;int H=c->hidden,W=c->hc_width,C=c->hc_count;
     m->timers.forwards++;
     m->mux_rows=rows;
@@ -6009,7 +6059,13 @@ static float *q38_spec_step(Model *m,Q38Spec *sp,int tok,int pos,int more) {
     if(pos+room>=m->kv_cap)room=m->kv_cap-1-pos;
     int d[Q38_SPEC_ROWS],k=0,src=SPEC_SRC_MTP,made=0;   /* made: the head's drafts before a trim */
     double t_verify=0.0;   /* when the verify's cost began (0: at its forward) */
+#ifdef COLI_CUDA
+    const int dfl=g_q38_df.on;   /* DFlash2's drafter drafts in the head's place: its whole block in one pass */
+    int head_ready=sp->on&&(dfl?df_ready(&g_q38_df,pos):m->mtp_pend_n&&m->mtp_len+m->mtp_pend_n==pos);
+#else
+    const int dfl=0;
     int head_ready=sp->on&&m->mtp_pend_n&&m->mtp_len+m->mtp_pend_n==pos;
+#endif
     if(room>0&&(head_ready||sp->lookup)){
         /* the lookup's proposal, gated; the forced mode proposes the oracle's tokens */
         int kl=0,dl[Q38_SPEC_ROWS];double vl=0.0;
@@ -6027,7 +6083,7 @@ static float *q38_spec_step(Model *m,Q38Spec *sp,int tok,int pos,int more) {
         /* the head's depth: fixed, or the gate's pick */
         int km=0;double vm=0.0;
         if(head_ready){
-            int maxm=room<3?room:3;
+            int maxm=dfl?room:room<3?room:3;
             if(sp->depth){
                 /* the plain step that keeps T(1) measured for the trim below (see q36_mtp_depth) */
                 if(sp->depth>1&&sp->pstep&&!sp->gate.off&&!sp->force&&sp->gate.since_plain>=SPEC_REFRESH){sp->gate.declined[SPEC_SRC_MTP]++;vm=1.0;}
@@ -6038,6 +6094,26 @@ static float *q38_spec_step(Model *m,Q38Spec *sp,int tok,int pos,int more) {
         if(kl>0&&(km==0||sp->lk_force||vl>vm||(vl==vm&&kl>km))){k=kl;src=SPEC_SRC_LOOKUP;memcpy(d,dl,(size_t)k*sizeof(int));}
         else if(km>0)k=km;
         if(k>0&&!q38_spec_alloc(m,k))k=0;   /* no memory for the copies: a plain step */
+#ifdef COLI_CUDA
+        if(k>0&&src==SPEC_SRC_MTP&&dfl){
+            float pr[Q38_SPEC_ROWS],*emb=falloc(c->hidden);
+            t_verify=now_s();   /* the block, then the verify: one cycle */
+            q38_embed_row(m,tok,pos,emb);
+            int n=df_draft(&g_q38_df,emb,tok,pos,k,d,pr);
+            free(emb);
+            if(n<k)k=n;
+            for(int j=0;j<k;j++)sp->ahead_p[j]=pr[j];
+            made=k;
+            if(sp->pstep&&sp->depth&&!sp->force&&k>1){
+                int kp=spec_gate_pick_p(&sp->gate,SPEC_SRC_MTP,k,sp->ahead_p,NULL);
+                k=kp<1?1:kp;
+            }
+            if(sp->force)for(int j=1;j<=k;j++){
+                int t=q38_spec_forced(sp->force,sp->force_row,(int)sp->verifies,k,j,pos,V);
+                if(t>=0)d[j-1]=t;
+            }
+        } else
+#endif
         if(k>0&&src==SPEC_SRC_MTP){
             float *hidden=falloc(c->hc_width);
             t_verify=now_s();   /* the head's first draft is the head pass a plain step makes too */
@@ -6095,7 +6171,7 @@ static float *q38_spec_step(Model *m,Q38Spec *sp,int tok,int pos,int more) {
      * Qwen3.8-Flash-Next's rows of a verify 827 -> 267 us on an i5-13500's NVMe */
     {
         int seq[Q38_SPEC_ROWS];seq[0]=tok;memcpy(seq+1,d,(size_t)k*sizeof(int));
-        int from=src!=SPEC_SRC_MTP?0:made==k?k:k+1;
+        int from=src!=SPEC_SRC_MTP||dfl?0:made==k?k:k+1;   /* DFlash2's block asked for none */
         q38_ple_advise(m,seq,k+1,from);
     }
     int S=k+1;

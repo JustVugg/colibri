@@ -328,6 +328,14 @@ ifeq ($(shell printf '%s\n' 12.9 $(NVCC_RELEASE) | sort -V 2>/dev/null | head -1
 CUDA_GENCODE += -gencode arch=compute_121,code=sm_121
 endif
 endif
+else ifeq ($(CUDA_ARCH),portable-pre-ampere)
+# DeepSeek V4's Pascal/Turing preset, the same list as Makefile.deepseek-v4's
+# (see the reasoning there): the Windows coli_cuda_dsv4.dll is built here, and
+# the loader's "no usable backend" message names this preset with NO_TC=1.
+CUDA_GENCODE = -gencode arch=compute_61,code=sm_61 -gencode arch=compute_75,code=sm_75 \
+               -gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 \
+               -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=sm_90 \
+               -gencode arch=compute_90,code=compute_90
 else
 CUDA_GENCODE = -arch=$(CUDA_ARCH)
 endif
@@ -561,7 +569,7 @@ TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_frami
 	test_e8x4g64_loader test_qwenimage_vae test_vk_tier \
 	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract test_idot_ssse3 test_int_kernel_exact_ssse3 \
 	test_ggml_quants test_gguf_c test_gq_dot
-TEST_EXCLUDE += test_vk_chain test_vk_memtype test_glm53_vk_f32 test_vk_dev2_window
+TEST_EXCLUDE += test_vk_chain test_vk_memtype test_glm53_vk_f32 test_vk_dev2_window test_vk_pcache
 # needs a CUDA device and the CUDA objects: make tests/test_cu_tier CUDA=1
 TEST_EXCLUDE += test_cu_tier
 # takes a fixture and the CPU build's logits on its command line (ci.yml, the int4 gs64 A/B step)
@@ -900,6 +908,13 @@ deepseek-v4-tiny-check: deepseek-v4-tiny-generate
 		--binary $(CURDIR)/$(if $(IS_WIN),deepseek_v4.exe,deepseek_v4) \
 		--fixture $(CURDIR)/deepseek_v4_tiny
 
+# Windows + GPU: COLI_DSV4_DLL as a path loads a backend outside the engine's folder with
+# the CUDA runtime only on PATH. DSV4_DLL names a built coli_cuda_dsv4*.dll (copied, never changed).
+.PHONY: dsv4-dll-path-check
+dsv4-dll-path-check: deepseek-v4
+	@test -n "$(DSV4_DLL)" || { echo "usage: make dsv4-dll-path-check DSV4_DLL=C:/path/coli_cuda_dsv4.dll" >&2; exit 2; }
+	DSV4_TEST_DLL="$(DSV4_DLL)" $(PYTHON) tests/test_dsv4_dll_path.py -v
+
 deepseek-v4-oracle: deepseek-v4
 	@test -n "$(MODEL)" || { echo "usage: make deepseek-v4-oracle MODEL=/path/to/checkpoint" >&2; exit 2; }
 	$(PYTHON) tools/make_deepseek_v4_oracle.py --model "$(MODEL)" \
@@ -1132,7 +1147,7 @@ backend_cuda.o: backend_cuda.cu backend_cuda.h cuda_bd.cuh cuda_chain.h fp8_form
 
 # The dense chain on a CUDA device (cuda_chain.h): the backend's twin of vk_chain.c,
 # built into the same backend (one table export, coli_cuda_chain_ops).
-cuda_chain.o: cuda_chain.cu cuda_chain.h cuda_dsv4c.cuh cuda_glm53c.cuh cuda_k3c.cuh backend_cuda.h backend_gpu_compat.h .build-config
+cuda_chain.o: cuda_chain.cu cuda_chain.h cuda_dsv4c.cuh cuda_glm53c.cuh cuda_k3c.cuh cuda_dflash.cuh backend_cuda.h backend_gpu_compat.h .build-config
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) -c cuda_chain.cu -o $@
 
@@ -1164,14 +1179,19 @@ deepgemm-fetch $(DEEPGEMM_STAMP):
 # backend_loader.c / coli_cuda.dll split. Run from a vcvars64 shell, like
 # cuda-dll. Two flavours ship side by side and the loader picks at runtime by
 # compute capability: coli_cuda_dsv4.dll is the GENERIC build (plain CUDA
-# kernels, any sm_80+ card; CUDA_ARCH=portable for a fat binary) and
+# kernels, any sm_80+ card; CUDA_ARCH=portable for a fat binary,
+# CUDA_ARCH=portable-pre-ampere NO_TC=1 adds Pascal and Turing) and
 # coli_cuda_dsv4_dg.dll the DeepGEMM sm_120a build (tensor-core prefill paths;
 # needs the sm120 DeepGEMM checkout at DEEPGEMM_HOME, see
 # patches-deepgemm-sm120-msvc.patch). Both need -lcuda for the TMA driver API.
 # DSV4_TC=0 leaves out the opt-in cuBLASLt MXFP8 path (DSV4_CUDA_TC=1 at run
 # time): the DLL then links no cuBLASLt and needs only cudart64_12.dll beside it
 # and the NVIDIA driver -- the form the Windows CUDA package ships (#2047):
-# cublasLt64_12.dll alone is hundreds of MB.
+# cublasLt64_12.dll alone is hundreds of MB. NO_TC=1, the name
+# Makefile.deepseek-v4 and the loader's advice use, means the same here.
+ifeq ($(NO_TC),1)
+DSV4_TC ?= 0
+endif
 DSV4_TC ?= 1
 ifeq ($(DSV4_TC),0)
 DSV4_DLL_TC = -DCOLI_DSV4_NO_TC
@@ -1381,7 +1401,8 @@ cuda-test: tests/test_mxfp4_expert_cuda.cu backend_cuda.cu backend_cuda.h fp8_fo
 # The DeepSeek V4 kernels on their own: dense, batched attention and routed MoE
 # against the CPU reference in each test, then the generic build's kernel
 # variants (expert-major vs per-route MoE, warp vs block dense batch) against
-# each other bit for bit. Needs a GPU, so CI runs none of it; it does not
+# each other bit for bit, and the 128-block fp8 calls bit for bit against
+# coli_fp8_matvec_ref itself. Needs a GPU, so CI runs none of it; it does not
 # build these tests either, only backend_cuda_dsv4.cu itself. First, the
 # two-GPU start-up (peer probe, init rollback; it includes backend_cuda_dsv4.cu
 # with shims, so it links what the backend needs -- cuBLASLt for the default
@@ -1389,7 +1410,7 @@ cuda-test: tests/test_mxfp4_expert_cuda.cu backend_cuda.cu backend_cuda.h fp8_fo
 # context exists), then the decode MoE with experts on a peer GPU (peer
 # compute and in-place reads vs one GPU, and an injected peer failure; skips
 # without two peer-capable GPUs).
-dsv4-cuda-test: tests/test_dsv4_dense_batch_cuda.c tests/test_dsv4_attention_batch_cuda.c tests/test_dsv4_moe_batch_cuda.c tests/test_dsv4_generic_bitwise_cuda.c tests/test_dsv4_bank_bytes_cuda.c tests/test_dsv4_peer_init_cuda.cu tests/test_dsv4_peer_moe_cuda.c backend_cuda_dsv4.cu backend_cuda_dsv4.h $(DSV4_CUDA_OBJ)
+dsv4-cuda-test: tests/test_dsv4_dense_batch_cuda.c tests/test_dsv4_attention_batch_cuda.c tests/test_dsv4_moe_batch_cuda.c tests/test_dsv4_generic_bitwise_cuda.c tests/test_dsv4_bank_bytes_cuda.c tests/test_dsv4_peer_init_cuda.cu tests/test_dsv4_peer_moe_cuda.c tests/test_dsv4_act_quant_cuda.c tests/deepseek_v4_native_quant.o backend_cuda_dsv4.cu backend_cuda_dsv4.h $(DSV4_CUDA_OBJ)
 	"$(NVCC)" $(NVCCFLAGS) tests/test_dsv4_peer_init_cuda.cu -o dsv4_peer_init_cuda_test$(EXE) -lcuda -lcublasLt $(if $(filter 1,$(NCCL)),-lnccl)
 	./dsv4_peer_init_cuda_test$(EXE)
 	$(CC) $(CFLAGS) tests/test_dsv4_peer_moe_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_peer_moe_cuda_test$(EXE) $(LDFLAGS)
@@ -1404,6 +1425,8 @@ dsv4-cuda-test: tests/test_dsv4_dense_batch_cuda.c tests/test_dsv4_attention_bat
 	./dsv4_moe_cuda_test$(EXE)
 	$(CC) $(CFLAGS) tests/test_dsv4_generic_bitwise_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_generic_bitwise_cuda_test$(EXE) $(LDFLAGS)
 	./dsv4_generic_bitwise_cuda_test$(EXE)
+	$(CC) $(CFLAGS) tests/test_dsv4_act_quant_cuda.c tests/deepseek_v4_native_quant.o $(DSV4_CUDA_OBJ) -o dsv4_act_quant_cuda_test$(EXE) $(LDFLAGS)
+	./dsv4_act_quant_cuda_test$(EXE)
 
 # DSV4_CUDA_MOE_FUSED6 gate: the decode MoE's launch sequence and the fused cooperative
 # kernel on the same inputs, bit for bit (needs a GPU with cooperative launch). The test
@@ -1473,6 +1496,11 @@ cuda-k3c-check: backend_cuda.o cuda_chain.o
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu cuda_chain.cu tests/test_cuda_k3c.cu -o cuda_k3c_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	./cuda_k3c_test$(EXE)
 
+# DFlash2's drafter's convolution on the CUDA chain (cuda_dflash.cuh) against the CPU's arithmetic.
+cuda-dflash-check: backend_cuda.o cuda_chain.o
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu cuda_chain.cu tests/test_cuda_dflash.cu -o cuda_dflash_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	./cuda_dflash_test$(EXE)
+
 hip-test:
 	$(MAKE) cuda-test HIP=1
 
@@ -1493,6 +1521,7 @@ gpu-compile: backend_cuda.o cuda_chain.o
 	$(CC) $(filter-out -MMD -MP -fopenmp,$(CFLAGS)) -ffp-contract=off -c tests/cuda_glm53c_ref.c -o tests/cuda_glm53c_ref.o
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu cuda_chain.cu tests/test_cuda_glm53c.cu $(if $(filter 1,$(HIP)),-x none) tests/cuda_glm53c_ref.o -o cuda_glm53c_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu cuda_chain.cu tests/test_cuda_k3c.cu -o cuda_k3c_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu cuda_chain.cu tests/test_cuda_dflash.cu -o cuda_dflash_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_ragged_attention.cu -o ragged_attention_test$(EXE) $(GPU_TEST_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_absorb_determinism.cu -o absorb_determinism_test$(EXE) $(GPU_TEST_LIBS)
@@ -2726,6 +2755,14 @@ tests/test_cu_tier$(EXE): tests/test_cu_tier.c $(CUDA_OBJ)
 tests/test_vk_dev2_window$(EXE): tests/test_vk_dev2_window.c backend_vulkan.c shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/rmsnorm.spv shaders/attention_absorb.spv
 	@[ "$(VK)" = 1 ] || { echo "tests/test_vk_dev2_window needs VK=1" >&2; exit 1; }
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# The pipelines' cache on disk (vk_pcache.h): written, read, refused when not the device's.
+tests/test_vk_pcache$(EXE): tests/test_vk_pcache.c backend_vulkan.c shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/rmsnorm.spv shaders/attention_absorb.spv
+	@[ "$(VK)" = 1 ] || { echo "tests/test_vk_pcache needs VK=1" >&2; exit 1; }
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+.PHONY: vk-pcache-check
+vk-pcache-check: tests/test_vk_pcache$(EXE)
+	./tests/test_vk_pcache$(EXE) shaders/qmatmul.spv
 
 tests/test_vk_tier$(EXE): tests/test_vk_tier.c $(VK_OBJ) $(VK_SPV)
 	@[ "$(VK)" = 1 ] || { echo "tests/test_vk_tier needs VK=1" >&2; exit 1; }

@@ -605,9 +605,10 @@ def env_for_engine(a, arch, plan=None):
         # of the chat process on Windows — and olmoe never read COLI_TEMP, so the
         # ONLY working channel was a poisoned system variable (#509's exact shape).
     # --ram reaches engines and gateway planners that consume RAM_GB. kimi_k3
-    # gained a RAM budget in #855; qwen36's gateway turns it into the positional
-    # cache cap, so it must receive the flag even though the engine gets that cap.
-    if arch in ("deepseek_v4", "deepseek_v41", "kimi", "glm53", "olmoe", "mimo", "qwen36"):
+    # gained a RAM budget in #855; the qwen36 and qwen38 gateways turn it into
+    # the positional cache cap, so they must receive the flag even though the
+    # engine gets that cap.
+    if arch in ("deepseek_v4", "deepseek_v41", "kimi", "glm53", "olmoe", "mimo", "qwen36", "qwen38"):
         if a.ram: env["RAM_GB"] = str(a.ram)
     if arch == "glm53":
         # Expert workers: env_for() wires these for glm; glm53 goes through

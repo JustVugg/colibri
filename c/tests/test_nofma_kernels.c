@@ -5,7 +5,8 @@
  *   fp8    quant.h's matmul_fp8 (one row: four output rows a pass; two rows or more: the rows in
  *          the lanes of a vector) against matmul_fp8_scalar: rows 1..33 (the lane tail and whole
  *          groups), widths on and off the 128-block grid, outputs off the four-row pass, weights
- *          with the NaN codes, activations of a full 24-bit mantissa (the products round)
+ *          with the NaN codes, activations of a full 24-bit mantissa (the products round); and
+ *          matmul_fp8_nofma_part (qwen38's grouped MoE): a range of output rows, rows by pointer
  *   int4   expert_ffn.h's xf_dot_f32 and xf_dot_f32_rows (one to nine rows a call, a stride)
  *          against xf_dot_f32_ref: random codes and scales over wide exponent ranges, activations
  *          with zeros of both signs and subnormals, the all-0 and all-15 codes */
@@ -45,6 +46,25 @@ static void fp8_case(int S, int I, int O) {
     matmul_fp8(y, x, q8, bs, S, I, O);
     matmul_fp8_scalar(y1, x, q8, bs, S, I, O);
     if (!same_bits(y, y1, (int64_t)S * O)) { printf("FAIL fp8 S=%d I=%d O=%d: not matmul_fp8_scalar's bits\n", S, I, O); fails++; }
+#ifdef COLI_FP8_NOFMA_LANES
+    /* matmul_fp8_nofma_part (qwen38's grouped MoE): output rows [r0,r1) of rows given by pointers,
+     * into a wider stride; every other output keeps its sentinel */
+    const int r0 = O > 5 ? 3 : 0, r1 = O > 5 ? O - 2 : O, ys = O + 7;
+    const float **xr = malloc((size_t)S * sizeof(float *));
+    float *yp = malloc((size_t)S * ys * sizeof(float));
+    for (int s = 0; s < S; s++) xr[s] = x + (int64_t)(S - 1 - s) * I;   /* the rows reversed: not one block */
+    for (int64_t i = 0; i < (int64_t)S * ys; i++) yp[i] = -7.f;
+    matmul_fp8_nofma_part(yp, ys, q8, bs, I, r0, r1, xr, S);
+    for (int s = 0; s < S; s++)
+        for (int o = 0; o < ys; o++) {
+            const float *want = o >= r0 && o < r1 ? y1 + (int64_t)(S - 1 - s) * O + o : &(float){ -7.f };
+            if (!same_bits(yp + (int64_t)s * ys + o, want, 1)) {
+                printf("FAIL fp8 part S=%d I=%d O=%d rows %d..%d: row %d output %d\n", S, I, O, r0, r1, s, o); fails++;
+                s = S; break;
+            }
+        }
+    free(xr); free(yp);
+#endif
     free(q8); free(bs); free(x); free(y); free(y1);
 }
 

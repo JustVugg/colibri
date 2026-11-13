@@ -14,7 +14,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 
-FILE_TYPES = {"F32": 0, "Q4_0": 2, "Q8_0": 8, "Q4_K": 12, "IQ4_XS": 23, "Q2_0": 42}
+FILE_TYPES = {"F32": 0, "Q4_0": 2, "Q8_0": 8, "Q4_K": 12, "IQ4_XS": 23, "Q2_0": 42, "MXFP8": 43}
 
 
 class GgufInternalTypes(unittest.TestCase):
@@ -24,16 +24,18 @@ class GgufInternalTypes(unittest.TestCase):
         cls.exe = Path(cls.build.name) / 'reader'
         src = Path(cls.build.name) / 'reader.c'
         src.write_text('#include "gguf.h"\nint main(int argc,char **argv){'
-                       'if(argc==1){printf("%d %d\\n",GQ_Q2_0_R16,GQ_R16_END);return 0;}'
+                       'if(argc==1){printf("%d %d %d\\n",GQ_TYPE_MAX,GQ_Q2_0_R16,GQ_R16_END);return 0;}'
                        'gguf_ctx g;if(argc!=2)return 2;gguf_header_only=1;'
                        'if(gguf_open(&g,argv[1])){fprintf(stderr,"%s\\n",g.err);return 1;}'
                        'gguf_close(&g);return 0;}\n')
         subprocess.run([os.environ.get('CC', 'cc'), '-std=c11', '-D_GNU_SOURCE',
                         '-Wall', '-Wextra', '-Wno-unused-function', '-I', str(ROOT),
                         str(src), '-lm', '-o', str(cls.exe)], check=True)
-        # the interleaved ids as ggml_quants.h numbers them today (a form added later is covered too)
-        lo, end = map(int, subprocess.run([str(cls.exe)], capture_output=True, text=True, check=True).stdout.split())
-        cls.r16_ids, cls.past = range(lo, end), end
+        # the end of ggml's table and the interleaved ids as ggml_quants.h numbers them today
+        # (a type or a form added later is covered too)
+        top, lo, end = map(int, subprocess.run([str(cls.exe)], capture_output=True, text=True,
+                                               check=True).stdout.split())
+        cls.top, cls.r16_ids, cls.past = top, range(lo, end), end
 
     @classmethod
     def tearDownClass(cls):
@@ -56,7 +58,7 @@ class GgufInternalTypes(unittest.TestCase):
                     self.assertIn(b'cannot hold rows', result.stderr)
 
     def test_ids_past_the_table_are_refused(self):
-        for dtype in (43, 63, self.past, 0xFFFFFFFF):
+        for dtype in (self.top, 63, self.past, 0xFFFFFFFF):
             with self.subTest(dtype=dtype):
                 result = self._open(dtype)
                 self.assertEqual(result.returncode, 1, result.stderr)

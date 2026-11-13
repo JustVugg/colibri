@@ -303,7 +303,7 @@ static int k3_cap_for_ram(double budget_gb, double resident_gb, double reserve_g
  * compat_mem_available_gb, the quantity colibri.c's cap_for_ram() budgets
  * against: Linux MemAvailable bounded by a container's cgroup, Windows
  * ullAvailPhys bounded by the commit still grantable, macOS
- * free+inactive+purgeable. #855. */
+ * free+file-backed+purgeable. #855. */
 static double k3_mem_avail(void){ return compat_mem_available_gb(); }
 static double rss_gb(void){ struct rusage r; getrusage(RUSAGE_SELF,&r);
 #if defined(__APPLE__)

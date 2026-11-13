@@ -6,6 +6,11 @@ engine names the dense head, and every run's tokens are plain decoding's, the he
 (depths 1 and 3) and the forced verifies (every draft accepted, every one rejected, mixed) alike.
 The same file without the layer runs with Q36_MTP=1 as without it. On the real 27B the head's
 drafts were 97.5 % and 80.7 % accepted at one draft a verify (code, prose; UD-Q3_K_XL, CPU).
+
+unsloth's Dynamic v3.1 files ship the head apart (MTP/mtp-*.gguf beside the model): the importer
+links it, and the engine drafts with it exactly as with the head inside, the same drafts and the
+same tokens. On the real 27B (UD-IQ2_XXS v3.1 with MTP/mtp-Qwen3.8-27B-Q4_0.gguf, CUDA chain) three
+drafts a verify took decoding from 30.5 to 55.8 tok/s (code) and 41.2 (prose), the texts unchanged.
 """
 import json
 import os
@@ -40,10 +45,15 @@ class Qwen36MtpGgufTest(unittest.TestCase):
     def setUpClass(cls):
         cls.tmp = Path(tempfile.mkdtemp(prefix="q36_mtp_gguf_"))
         cls.models = {}
-        for name, mtp in (("head", True), ("plain", False)):
-            gg = cls.tmp / f"{name}.gguf"
-            write_model(gg, np.random.default_rng(29), dense=True, mtp=mtp)
-            out = cls.tmp / name
+        for name, mtp in (("head", True), ("plain", False), ("apart", True)):
+            gg = cls.tmp / name / f"{name}.gguf"
+            gg.parent.mkdir()
+            apart = None
+            if name == "apart":   # unsloth's layout: MTP/mtp-<model>-Q8_0.gguf beside the model
+                (gg.parent / "MTP").mkdir()
+                apart = gg.parent / "MTP" / "mtp-apart-Q8_0.gguf"
+            write_model(gg, np.random.default_rng(29), dense=True, mtp=mtp, mtp_file=apart)
+            out = cls.tmp / f"{name}.colibri"
             r = subprocess.run([sys.executable, str(HERE / "tools" / "gguf_import.py"), str(gg), str(out)],
                                capture_output=True, text=True)
             if r.returncode:
@@ -90,6 +100,23 @@ class Qwen36MtpGgufTest(unittest.TestCase):
                 if env.get("Q36_MTP_FORCE") == "accept":   # every draft stood: fewer forwards than tokens
                     m = re.search(r"\[qwen36 mtp\] [^\n]*?\(\d+/(\d+) drafts\)", log)
                     self.assertTrue(m and int(m.group(1)) > 0, log[-2000:])
+
+    def test_a_head_in_its_own_file_drafts_as_the_head_inside(self):
+        model, inside = self.models["apart"], self.models["head"]
+        self.assertIn("mtp", json.loads((model / "gguf.json").read_text()))
+        plain, _ = self.run_engine(model, self.ref(model, [0] * GEN))
+        ref = self.ref(model, [int(t) for t in plain])
+        self.ref(inside, [int(t) for t in plain])
+        for what, env in (("one draft", {}), ("three drafts", {"Q36_MTP_DRAFTS": "3"})):
+            with self.subTest(what):
+                got, log = self.run_engine(model, ref, Q36_MTP="1", **env)
+                self.assertIn("[gguf] MTP head", log, log[-2000:])
+                self.assertIn(HEAD, log, log[-2000:])
+                self.assertEqual(got, plain, f"{what}: the tokens moved")
+                want, wlog = self.run_engine(inside, inside / "ref.json", Q36_MTP="1", **env)
+                self.assertEqual(got, want)
+                stat = lambda t: re.search(r"\[qwen36 mtp\] [^\n]*?\(\d+/\d+ drafts\)", t).group(0)
+                self.assertEqual(stat(log), stat(wlog), "the drafts differ from the head inside")
 
     def test_a_file_without_the_layer_runs_as_before(self):
         model = self.models["plain"]

@@ -8,14 +8,14 @@
  * with a frame that fails mid-run (the state rebuilt on the CPU, the run finishing
  * there), once without the chain. Every run must stay within the oracle's limits
  * (ref.json), the chain runs must have set up and run every layer on the device.
- * Then the promotions' brake (q38cc_braked) on frames written by hand: the fixture has
- * no GGUF, so no host pool and no promotion runs above. */
+ * Then a refusal of the card's memory on a chain written by hand (q38cc_forward gives
+ * the K/V mirrors back), and the promotions' brake (q38cc_braked) on frames written by
+ * hand: the fixture has no GGUF, so no host pool and no promotion runs above. */
 #define main qwen38_main_unused
 #include "../qwen38.c"
 #undef main
 
 #ifdef _WIN32
-#undef setenv
 #undef unsetenv
 #define unsetenv(name) _putenv_s(name, "")
 #endif
@@ -132,6 +132,48 @@ int main(void) {
     setenv("Q38_MTP", "0", 1);
     qt_shutdown();
 
+    printf(" a refusal of the card's memory gives the K/V mirrors back\n");
+    {   /* a chain written by hand: three layers, the middle one DeltaNet, and the MTP head's slot, the
+         * mirrors in float16; the card's room (fake_chain_dev_cap) for one attention layer's mirrors and
+         * half of the next, then for every mirror but not a row's scratch */
+        static Model rm; static Q38CChain rc;
+        static uint8_t att[3] = {1, 0, 1};
+        static CcBuf *kc[4], *vc[4], *ik[4], *pk[4]; static int kvv[4], pkv[4];
+        rm.c.layers = 3; rm.c.is_attn = att; rm.c.kv_heads = 2; rm.c.head_dim = 8; rm.c.idx_dim = 4; rm.c.idx_ratio = 4;
+        rm.c.hc_width = 64; rm.kv_cap = 32; rm.cchain = &rc;
+        rc.kc = kc; rc.vc = vc; rc.ik = ik; rc.pk = pk; rc.kv_valid = kvv; rc.pk_valid = pkv;
+        rc.ok = 1; rc.mtp_on = 1; rc.kvh = 1;
+        const size_t lay = 2 * (2 * 8 * 32 * 2) + 4 * 32 * 4 + 4 * (32 / 4 + 1) * 4;   /* kc and vc in halves, ik, pk */
+        const int chain0 = g_cuda_chain; g_cuda_chain = 1;
+        const size_t b0 = fake_chain_dev_bytes;
+        int none = 1;
+        fake_chain_dev_cap = b0 + lay + lay / 2;
+        int r1 = q38cc_forward(&rm, NULL, 1, 0, 1, NULL, 0, NULL, NULL);
+        for (int i = 0; i < 4; i++) none = none && !kc[i] && !vc[i] && !ik[i] && !pk[i];
+        tk(r1 == 0 && rc.failed && rc.cap == 0, "the second layer's mirrors refused: the per-matrix path");
+        tk(none && fake_chain_dev_bytes == b0, "the first layer's mirrors and the second's half given back");
+        rc.failed = 0;
+        fake_chain_dev_cap = b0 + 3 * lay + 16;   /* every mirror, not a row's 256-byte streams */
+        int r2 = q38cc_forward(&rm, NULL, 1, 0, 1, NULL, 0, NULL, NULL);
+        none = 1;
+        for (int i = 0; i < 4; i++) none = none && !kc[i] && !vc[i] && !ik[i] && !pk[i];
+        tk(r2 == 0 && rc.failed && none && fake_chain_dev_bytes == b0, "the scratch refused: every mirror given back");
+        fake_chain_dev_cap = 0;
+        tk(q38cc_forward(&rm, NULL, 1, 0, 1, NULL, 0, NULL, NULL) == 0 && fake_chain_dev_bytes == b0,
+           "the chain stays off: a later forward takes nothing from the card");
+        /* a growth to 64 positions with room for the first layer's new mirrors only: the last
+         * layer's old ones, which dev kept, go too */
+        const size_t lay64 = 2 * (2 * 8 * 64 * 2) + 4 * 64 * 4 + 4 * (64 / 4 + 1) * 4;
+        int placed = q38cc_mirror(&rc, &rm) && rc.cap == 32 && fake_chain_dev_bytes == b0 + 3 * lay;
+        rm.kv_cap = 64; fake_chain_dev_cap = b0 + 2 * lay + lay64;
+        int r4 = q38cc_mirror(&rc, &rm);
+        none = 1;
+        for (int i = 0; i < 4; i++) none = none && !kc[i] && !vc[i] && !ik[i] && !pk[i];
+        tk(placed && r4 == 0 && rc.cap == 0 && none && fake_chain_dev_bytes == b0, "a refused growth leaves no mirror on the card");
+        fake_chain_dev_cap = 0; rm.kv_cap = 32;
+        g_cuda_chain = chain0;
+    }
+
     printf(" the promotions' brake\n");
     unsetenv("COLI_CUDA_CHAIN_PROMOTE_HITS");
     tk(q38cc_promote_hits() == Q38CC_PROMO_HITS, "unset: the default threshold");
@@ -233,7 +275,7 @@ int main(void) {
             q38cc_srv_open(sv, &dfl, &hfl, x, out);
             for (int rep = 0; rep < 2; rep++) for (int i = 0; i < L; i++) {
                 const int n = rep ? R : 1;   /* a decode step's row, a verify's five */
-                q38cc_srv_post(sv, i, n, ++v, tg, td, ids[i], w[i], res + i * NE);
+                q38cc_srv_post(sv, i, n, ++v, tg, td, ids[i], w[i], res + i * NE, 0);
                 /* q38cc_dm_serve's arithmetic for the same slots */
                 const uint8_t *gp[R * K]; const float *xp[R * K]; int pa[R * K], np = 0;
                 for (int a = 0; a < n * K; a++) {
@@ -269,17 +311,74 @@ int main(void) {
             if (!(cl && sv->jobs == 2 * L && (int)sv->slots == slots)) printf("       closed %d, jobs %llu, slots %llu of %d\n", cl, sv->jobs, sv->slots, slots);
             tk(cl && sv->jobs == 2 * L && (int)sv->slots == slots, "the forward closed, its jobs and slots in the books");
             q38cc_srv_open(sv, &dfl, &hfl, x, out);
-            q38cc_srv_post(sv, 0, 1, ++v, tg, td, ids[0], w[0], res + 0 * NE);
-            q38cc_srv_post(sv, 1, 1, ++v, tg, td, ids[1], w[1], res + 1 * NE);
+            q38cc_srv_post(sv, 0, 1, ++v, tg, td, ids[0], w[0], res + 0 * NE, 0);
+            q38cc_srv_post(sv, 1, 1, ++v, tg, td, ids[1], w[1], res + 1 * NE, 0);
             tk(q38cc_srv_close(sv, 0, v) && hfl == v, "a failed frame: the jobs skipped, the host's word past them");
             q38cc_srv_open(sv, &dfl, &hfl, x, out);
-            q38cc_srv_post(sv, 2, 1, ++v, tg, td, ids[2], w[2], res + 2 * NE);
+            q38cc_srv_post(sv, 2, 1, ++v, tg, td, ids[2], w[2], res + 2 * NE, 0);
             dfl = v;
             for (long spin = 0; hfl < v && spin < 2000000000L; spin++) q38cc_relax();
             tk(q38cc_srv_close(sv, 1, v) && hfl == v, "and the next forward served");
+            /* a job the device does not wait for (q38cc_dm_skips): without a pooled slot (experts 0
+             * and 1 are the card's, -1 off the table) it writes no rows and no word, a later job's
+             * rows may be there; with one it is served as before */
+            int idz[K]; float wz[K];
+            for (int a = 0; a < K; a++) { idz[a] = a % 3 == 2 ? -1 : a % 2; wz[a] = 0.5f; }
+            for (int k = 0; k < R * H; k++) out[k] = 7.f;
+            const unsigned long long sk0 = sv->skips, jb0 = sv->jobs; const unsigned h0 = hfl;
+            q38cc_srv_open(sv, &dfl, &hfl, x, out);
+            q38cc_srv_post(sv, 0, 1, ++v, tg, td, idz, wz, res + 0 * NE, 1);
+            dfl = v;
+            int cl3 = q38cc_srv_close(sv, 1, v), kept = 1;
+            for (int k = 0; k < R * H; k++) if (out[k] != 7.f) kept = 0;
+            tk(cl3 && hfl == h0 && kept && sv->skips == sk0 + 1 && sv->jobs == jb0, "a job without a pooled slot the device went on from: no rows, no word");
+            int np2 = 0;
+            for (int a = 0; a < K; a++) if (ids[2][a] >= 0 && res[2 * NE + ids[2][a]] >= 2) np2++;
+            q38cc_srv_open(sv, &dfl, &hfl, x, out);
+            q38cc_srv_post(sv, 2, 1, ++v, tg, td, ids[2], w[2], res + 2 * NE, 1);
+            dfl = v;
+            for (long spin = 0; hfl < v && spin < 2000000000L; spin++) q38cc_relax();
+            tk(np2 > 0 && q38cc_srv_close(sv, 1, v) && hfl == v && sv->skips == sk0 + 1 && sv->jobs == jb0 + 1,
+               "one with pooled slots: served, its word written");
             q38cc_srv_stop(sv);
         }
         free(pool); free(x); free(out); free(want);
+    }
+
+    printf(" a decode step's pooled experts: the CPU's or the bus's, measured (q38cc_pd_*)\n");
+    {   /* steps of one row at a time each path takes: the paths by turns in blocks of Q38CC_PD_BLK,
+         * the faster once both have Q38CC_PD_N, the bus only past the margin, a new round after
+         * Q38CC_PD_EVERY steps; q38cc_pc_step follows the forward's path */
+        static const double ms[4][2] = {{10.0, 11.0}, {11.0, 10.0}, {10.0, 9.9}, {10.0, 9.0}};
+        static const int want[4] = {0, 1, 0, 1};
+        int32_t pof = 0; CcBuf *tabd = (CcBuf *)&pof;
+        for (int c = 0; c < 4; c++) {
+            Q38CChain *ch = (Q38CChain *)calloc(1, sizeof *ch);
+            if (!ch) { tk(0, "the chain's struct"); break; }
+            ch->pool_of = &pof; ch->pool_cpu = 1; ch->dm_tabd = tabd;
+            int turns = 1, steps = 0, follows = 1;
+            while (!ch->pd_dec && steps < 1000) {
+                const int k = steps, pd = q38cc_pd_begin(ch, 1);
+                if (pd != (k / Q38CC_PD_BLK) % 2) turns = 0;
+                if (q38cc_pc_step(ch, 1) != !pd) follows = 0;
+                q38cc_pd_end(ch, 1, pd, ms[c][pd] / 1e3);
+                steps++;
+            }
+            tk(turns && follows, "the paths by turns, the decode table only on the CPU's");
+            tk(ch->pd_dec && ch->pd_bus == want[c] && steps == 2 * Q38CC_PD_N,   /* Q38CC_PD_N a multiple of Q38CC_PD_BLK: the bus's last at step 2 N */
+               c == 0 ? "the CPU faster: the CPU's" : c == 1 ? "the bus faster: the bus's" : c == 2 ? "the bus 1 % faster: still the CPU's" : "the bus 10 % faster: the bus's");
+            if (c == 3) {
+                int same = 1;
+                while (ch->pd_k < ch->pd_next) { const int pd = q38cc_pd_begin(ch, 1); if (pd != 1) same = 0; q38cc_pd_end(ch, 1, pd, 0.01); }
+                const int pd = q38cc_pd_begin(ch, 1);
+                tk(same && !ch->pd_dec && pd == 0 && ch->pd_n[0][1] == 0, "the decided path until the next round, which measures again");
+                q38cc_pd_end(ch, 1, pd, 0.01);
+                tk(q38cc_pd_begin(ch, Q38CC_DM_ROWS + 1) < 0 && !ch->pd_now, "a prompt's rows: not measured, the CPU's");
+                ch->pd_mode = 1;
+                tk(q38cc_pd_begin(ch, 1) < 0, "COLI_CUDA_CHAIN_POOL_READ=0: not measured");
+            }
+            free(ch);
+        }
     }
 
     printf(" the MTP head's experts in Q2_0 for the card (q38cc_q2_0_block)\n");
@@ -316,6 +415,46 @@ int main(void) {
             for (int j = 0; j < 64; j++) flat = flat && fabsf(y[j] - x[j]) <= 1e-3f * 0.0123f;
         }
         tk(flat, "a flat block, positive or negative, decodes to itself");
+    }
+
+    printf(" a prompt chunk's staging: the layers it runs in the frame\n");
+    {   /* four layers of four experts, experts 0 to 2 of each in the host pool, layers 1 and 3 able
+         * to miss (dm_part: a chunk takes the host's route there, which waits for no copy and starts
+         * none): their pooled experts get no places and no copies, so the copies go from one framed
+         * layer to the next (#2764) */
+        enum { L = 4, E = 4, H = 64, IN = 64 };
+        const size_t sz0 = fake_chain_table.size;
+        fake_chain_table.size = sizeof fake_chain_table;   /* the staging's device addresses */
+        fcc_init(0);
+        Model mm; memset(&mm, 0, sizeof mm);
+        mm.c.layers = L; mm.c.experts = E; mm.c.hidden = H; mm.c.inter = IN;
+        int gtg[L], gtd[L];
+        for (int i = 0; i < L; i++) gtg[i] = gtd[i] = GQ_Q8_0;
+        const int on0 = G.on, nl0 = G.nl, wf0 = G.wfmt; int *gtg0 = G_gtg, *gtd0 = G_gtd;
+        G.on = 1; G.nl = L; G.wfmt = QT_GGUF; G_gtg = gtg; G_gtd = gtd;
+        Q38CChain cc; memset(&cc, 0, sizeof cc);
+        int64_t gb = 0, db = 0;
+        const int typed = q38cc_pool_types(&mm, 0, &gb, &db);
+        const size_t st = 2 * Q38CC_PAD(gb) + Q38CC_PAD(db);
+        CcBuf *pool_b[1] = {cc_buf((size_t)L * E * st, CC_DOWN)};
+        cc.pool_buf = pool_b; cc.pool_nb = 1; cc.pool_per = L * E; cc.pool_stride = st;
+        cc.pool_of = (int32_t *)malloc((size_t)L * E * sizeof(int32_t)); cc.dm_host = (CcExpert *)calloc((size_t)L * E, sizeof(CcExpert));
+        cc.dm_res = (uint8_t *)calloc((size_t)L * E, 1); cc.dm_part = (int *)calloc(L, sizeof(int));
+        for (int j = 0; j < L * E; j++) { const int pooled = j % E < 3; cc.pool_of[j] = pooled ? j : -1; cc.dm_res[j] = pooled ? 2 : 1; }
+        cc.dm_part[1] = cc.dm_part[3] = 1;
+        cc.dm_stage = cc_buf(3 * st, CC_DEV); cc.dm_stage_size = 3 * st; cc.dm_stage_cap = 3;
+        const int ok = typed && pool_b[0] && cc.dm_stage && q38cc_stage_table(&cc, &mm);
+        tk(ok && cc.dm_frn[0] > 0 && cc.dm_frn[2] > 0, "the framed layers' pooled experts have their copies");
+        tk(ok && cc.dm_frn[1] == 0 && cc.dm_frn[3] == 0, "a layer that can miss: no places, no copies");
+        int kept = ok;
+        for (int i = 1; i < L && kept; i += 2)
+            for (int e = 0; e < E; e++) kept = kept && !memcmp(&cc.dm_hostb[i * E + e], &cc.dm_host[i * E + e], sizeof(CcExpert));
+        tk(kept, "its entries in the chunk's table the same as the decode's");
+        free(cc.pool_of); free(cc.dm_host); free(cc.dm_res); free(cc.dm_part);
+        free(cc.dm_hostb); free(cc.dm_fro); free(cc.dm_frn); free(cc.dm_fr); free(cc.dm_iv);
+        cc_free(cc.dm_tabb); cc_free(cc.dm_stage); cc_free(pool_b[0]);
+        G.on = on0; G.nl = nl0; G.wfmt = wf0; G_gtg = gtg0; G_gtd = gtd0;
+        fake_chain_table.size = sz0;
     }
 
     if (t_fails) { printf("test_qwen38_cuda_chain: %d failure(s)\n", t_fails); return 1; }

@@ -11,7 +11,11 @@ import sys
 
 failed = []
 for binary in sys.argv[1:]:
-    rc = subprocess.call([os.path.normpath(binary)])
+    # An absolute path: Windows looks a bare relative name such as tests/x.exe
+    # up on the search path, not in the current directory, when
+    # NoDefaultCurrentDirectoryInExePath is set; and MSYS2's Python keeps the
+    # forward slash through normpath (os.sep is '/' under MSYSTEM).
+    rc = subprocess.call([os.path.abspath(binary)])
     if rc != 0:
         failed.append(binary)
 if failed:

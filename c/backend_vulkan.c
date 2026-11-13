@@ -17,6 +17,7 @@
 #include "vk_igpu_threshold.h"
 #include "vk_load.h"
 #include "vk_memtype.h"
+#include "vk_pcache.h"
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -112,6 +113,168 @@ static int vk_integrated(VkPhysicalDevice phys) {
 
 #define VKCHECK(x, what) do { VkResult _r = (x); if (_r != VK_SUCCESS) { \
     fprintf(stderr, "[VK] %s failed: %d\n", what, _r); return 0; } } while (0)
+
+/* ---- the pipelines' cache on disk (vk_pcache.h) --------------------------------------
+ * One VkPipelineCache per device, opened with the device (pc_open) from the file the last
+ * run wrote, written back (pc_save) after a pipeline that took PC_SLOW_MS or more to make
+ * (the process may not reach its teardown: a killed server, an exit()) and at the device's
+ * teardown (pc_close) when anything was added. A file goes to <path>.<pid>.tmp first and
+ * then takes the name, so a reader never sees half of one. */
+#define PC_MAXDEV 4
+#define PC_SLOW_MS 1000.0
+#define PC_MAX_BYTES ((size_t)1 << 30)
+static struct { VkDevice dev; VkPipelineCache pc; int dirty, had; char path[1024]; } g_pc[PC_MAXDEV];
+static pthread_mutex_t g_pc_mx = PTHREAD_MUTEX_INITIALIZER;
+static int pc_mkdir(const char *p) {
+#ifdef _WIN32
+    return CreateDirectoryA(p, NULL) || GetLastError() == ERROR_ALREADY_EXISTS;
+#else
+    struct stat st;
+    return mkdir(p, 0755) == 0 || (stat(p, &st) == 0 && S_ISDIR(st.st_mode));
+#endif
+}
+/* the directory of the files (made when missing), 0 without one */
+static int pc_dir(char *out, size_t n) {
+    const char *e = getenv("COLI_VK_PIPELINE_CACHE");
+    if (e && !strcmp(e, "0")) return 0;
+    if (e && *e) return snprintf(out, n, "%s", e) < (int)n && pc_mkdir(out);
+#ifdef _WIN32
+    const char *root = getenv("LOCALAPPDATA"), *sub = "";
+#else
+    const char *root = getenv("XDG_CACHE_HOME"), *sub = "";
+    if (!root || !*root) { root = getenv("HOME"); sub = "/.cache"; }
+#endif
+    if (!root || !*root) return 0;
+    char p[1024];
+    if (snprintf(p, sizeof p, "%s%s", root, sub) >= (int)sizeof p || !pc_mkdir(p)) return 0;
+    if (snprintf(p, sizeof p, "%s%s/colibri", root, sub) >= (int)sizeof p || !pc_mkdir(p)) return 0;
+    return snprintf(out, n, "%s/vk-pipelines", p) < (int)n && pc_mkdir(out);
+}
+static int pc_find(VkDevice dev) {
+    for (int i = 0; dev && i < PC_MAXDEV; i++) if (g_pc[i].dev == dev) return i;
+    return -1;
+}
+static void pc_save(int i) {
+    pthread_mutex_lock(&g_pc_mx);
+    size_t n = 0;
+    void *data = NULL;
+    if (g_pc[i].pc && g_pc[i].path[0] && vkGetPipelineCacheData(g_pc[i].dev, g_pc[i].pc, &n, NULL) == VK_SUCCESS &&
+        n >= 32 && n <= PC_MAX_BYTES && (data = malloc(n)) &&
+        vkGetPipelineCacheData(g_pc[i].dev, g_pc[i].pc, &n, data) == VK_SUCCESS) {
+        char tmp[1100];
+#ifdef _WIN32
+        snprintf(tmp, sizeof tmp, "%s.%lu.tmp", g_pc[i].path, (unsigned long)GetCurrentProcessId());
+#else
+        snprintf(tmp, sizeof tmp, "%s.%ld.tmp", g_pc[i].path, (long)getpid());
+#endif
+        FILE *f = fopen(tmp, "wb");
+        int ok = f && fwrite(data, 1, n, f) == n;
+        if (f && fclose(f)) ok = 0;
+#ifdef _WIN32
+        ok = ok && MoveFileExA(tmp, g_pc[i].path, MOVEFILE_REPLACE_EXISTING);
+#else
+        ok = ok && rename(tmp, g_pc[i].path) == 0;
+#endif
+        if (!ok) { remove(tmp); fprintf(stderr, "[VK] pipeline cache: cannot write %s\n", g_pc[i].path); }
+        else g_pc[i].dirty = 0;
+    }
+    free(data);
+    pthread_mutex_unlock(&g_pc_mx);
+}
+/* the device's cache, from its file when that file is this device's and driver's */
+static void pc_open(VkPhysicalDevice phys, VkDevice dev) {
+    if (!dev || pc_find(dev) >= 0) return;
+    int i = 0;
+    while (i < PC_MAXDEV && g_pc[i].dev) i++;
+    if (i == PC_MAXDEV) return;
+    VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(phys, &pp);
+    char dir[1024], path[1024] = "";
+    if (pc_dir(dir, sizeof dir)) {
+        int k = snprintf(path, sizeof path, "%s/vk-%04x-%04x-%08x-", dir, pp.vendorID, pp.deviceID, pp.driverVersion);
+        for (int b = 0; b < (int)VK_UUID_SIZE && k > 0 && k + 3 < (int)sizeof path; b++)
+            k += snprintf(path + k, sizeof path - (size_t)k, "%02x", pp.pipelineCacheUUID[b]);
+        if (k <= 0 || k + 5 >= (int)sizeof path) path[0] = 0;
+        else strcat(path, ".bin");
+    }
+    void *data = NULL;
+    size_t n = 0;
+    FILE *f = path[0] ? fopen(path, "rb") : NULL;
+    if (f) {
+        long len = fseek(f, 0, SEEK_END) == 0 ? ftell(f) : -1;
+        if (len >= 32 && (size_t)len <= PC_MAX_BYTES && fseek(f, 0, SEEK_SET) == 0 && (data = malloc((size_t)len)) &&
+            fread(data, 1, (size_t)len, f) == (size_t)len) n = (size_t)len;
+        fclose(f);
+    }
+    /* VkPipelineCacheHeaderVersionOne: the header's length, its version, the vendor, the
+     * device and the driver's UUID; data that is not this device's never reaches the driver */
+    if (n) {
+        uint32_t h[4]; memcpy(h, data, sizeof h);
+        if (h[0] < 32 || h[0] > n || h[1] != VK_PIPELINE_CACHE_HEADER_VERSION_ONE || h[2] != pp.vendorID ||
+            h[3] != pp.deviceID || memcmp((const uint8_t *)data + 16, pp.pipelineCacheUUID, VK_UUID_SIZE)) n = 0;
+    }
+    VkPipelineCacheCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, .initialDataSize = n,
+                                    .pInitialData = n ? data : NULL};
+    VkPipelineCache pc = VK_NULL_HANDLE;
+    if (vkCreatePipelineCache(dev, &ci, NULL, &pc) != VK_SUCCESS) {
+        ci.initialDataSize = 0; ci.pInitialData = NULL; n = 0;
+        if (vkCreatePipelineCache(dev, &ci, NULL, &pc) != VK_SUCCESS) pc = VK_NULL_HANDLE;
+    }
+    free(data);
+    if (!pc) return;
+    g_pc[i].dev = dev; g_pc[i].pc = pc; g_pc[i].dirty = 0; g_pc[i].had = n > 0;
+    snprintf(g_pc[i].path, sizeof g_pc[i].path, "%s", path);
+    if (path[0]) fprintf(stderr, "[VK] pipeline cache: %s (%s)\n", path, n ? "read" : "new");
+}
+static void pc_close(VkDevice dev) {
+    int i = pc_find(dev);
+    if (i < 0) return;
+    if (g_pc[i].dirty) pc_save(i);
+    vkDestroyPipelineCache(dev, g_pc[i].pc, NULL);
+    memset(&g_pc[i], 0, sizeof g_pc[i]);
+}
+const char *coli_vk_pcache_path(VkDevice dev) { int i = pc_find(dev); return i < 0 ? "" : g_pc[i].path; }
+/* a line a minute while a named build runs past g_pc_watch_s (10 s; tests set 0) */
+static int g_pc_watch_s = 10;
+typedef struct { const char *what; double t0; int done, cached; pthread_mutex_t mx; pthread_cond_t cv; } PcWatch;
+static void *pc_watch(void *arg) {
+    PcWatch *w = arg;
+    int wait = g_pc_watch_s;
+    pthread_mutex_lock(&w->mx);
+    while (!w->done) {
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec += wait;
+        if (pthread_cond_timedwait(&w->cv, &w->mx, &ts) != 0 && !w->done) {
+            fprintf(stderr, "[VK] still building %s: %.0f s so far (the driver compiles it once%s)\n", w->what,
+                    (vk_now() - w->t0) / 1e3, w->cached ? "; the next start reads it from the pipeline cache" : "");
+            wait = 60;
+        }
+    }
+    pthread_mutex_unlock(&w->mx);
+    return NULL;
+}
+VkResult coli_vk_pipe_create(VkDevice dev, const VkComputePipelineCreateInfo *ci, VkPipeline *pipe, const char *what) {
+    int i = pc_find(dev);
+    PcWatch w = {.what = what, .t0 = vk_now(), .cached = i >= 0 && g_pc[i].path[0]};
+    pthread_t th;
+    int watching = 0;
+    if (what && pthread_mutex_init(&w.mx, NULL) == 0) {
+        if (pthread_cond_init(&w.cv, NULL) == 0) {
+            watching = pthread_create(&th, NULL, pc_watch, &w) == 0;
+            if (!watching) pthread_cond_destroy(&w.cv);
+        }
+        if (!watching) pthread_mutex_destroy(&w.mx);
+    }
+    VkResult r = vkCreateComputePipelines(dev, i >= 0 ? g_pc[i].pc : VK_NULL_HANDLE, 1, ci, NULL, pipe);
+    if (watching) {
+        pthread_mutex_lock(&w.mx); w.done = 1; pthread_cond_signal(&w.cv); pthread_mutex_unlock(&w.mx);
+        pthread_join(th, NULL);
+        pthread_cond_destroy(&w.cv); pthread_mutex_destroy(&w.mx);
+    }
+    if (r == VK_SUCCESS && i >= 0) {
+        g_pc[i].dirty = 1;
+        if (vk_now() - w.t0 >= PC_SLOW_MS) pc_save(i);
+    }
+    return r;
+}
 
 /* ---- device memory books, and COLI_VK_DEVICE_CAP_MB (docs/vulkan.md, "A partial chain") --
  * Every device memory allocation of the process goes through vk_mem_alloc / vk_mem_free
@@ -1272,7 +1435,7 @@ static int build_pipeline(VkDevice dev, int nbind, size_t pc_size, VkShaderModul
         .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = pin_info(dev, &rss),
                   .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = shader, .pName = "main"},
         .layout = *plyt};
-    VKCHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, NULL, pipe), "pipeline");
+    VKCHECK(coli_vk_pipe_create(dev, &cpi, pipe, NULL), "pipeline");
     VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = (uint32_t)nbind};
     VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &ps};
@@ -1322,7 +1485,7 @@ static int gemm_pipeline(VkGemmTile t, int slot) {
                   .pSpecializationInfo = &si},
         .layout = G.plyt};
     VkPipeline pipe;
-    VKCHECK(vkCreateComputePipelines(G.dev, VK_NULL_HANDLE, 1, &cpi, NULL, &pipe), "gemm pipeline");
+    VKCHECK(coli_vk_pipe_create(G.dev, &cpi, &pipe, NULL), "gemm pipeline");
     if (G.pipe_gemm[slot]) vkDestroyPipeline(G.dev, G.pipe_gemm[slot], NULL);
     G.pipe_gemm[slot] = pipe; G.gemm_t[slot] = t;
     G.cmd_ready = 0;                     /* a recorded GEMM dispatch names the old pipeline */
@@ -1357,7 +1520,7 @@ static int coop_pipeline(VkCoopTile t, int slot) {
                   .pSpecializationInfo = &si},
         .layout = G.plyt};
     VkPipeline pipe;
-    VKCHECK(vkCreateComputePipelines(G.dev, VK_NULL_HANDLE, 1, &cpi, NULL, &pipe), "coop pipeline");
+    VKCHECK(coli_vk_pipe_create(G.dev, &cpi, &pipe, NULL), "coop pipeline");
     if (G.pipe_coop[slot]) vkDestroyPipeline(G.dev, G.pipe_coop[slot], NULL);
     G.pipe_coop[slot] = pipe; G.coop_t[slot] = t;
     G.cmd_ready = 0;
@@ -1715,6 +1878,7 @@ int coli_vk_init(const char *spv_path) {
     }
     if (!G.dev)
     VKCHECK(vkCreateDevice(G.phys, &di, NULL, &G.dev), "vkCreateDevice");
+    pc_open(G.phys, G.dev);   /* the pipelines' cache on disk (vk_pcache.h) */
     /* the types the device's buffers take: every memory type below is one of them (the
      * retries' too), and the uploader's two, chosen before the device existed, are chosen
      * again among them */
@@ -3450,6 +3614,7 @@ int coli_vk_init_dev2(const char *spv_path, int devidx) {
     if (G2.pin_sg && !vk_create_device_pinned(G2.phys, &di, &G2.dev)) G2.pin_sg = 0;
     if (!G2.dev)
     VKCHECK(vkCreateDevice(G2.phys, &di, NULL, &G2.dev), "d2 vkCreateDevice");
+    pc_open(G2.phys, G2.dev);
     const uint32_t take = vk_buffer_types(G2.dev, 0);   /* the types its buffers take: no addresses on this device */
     vk_mem_device(1, G2.phys, G2.dev, take);
     vk_pool_blocks(1);
@@ -4701,7 +4866,7 @@ static int xb_pipeline(XbCtx *X, VkShaderModule sh, VkPipelineLayout pl, const V
     VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
         .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = pin_info(X->dev, &rss),
                   .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = sh, .pName = "main", .pSpecializationInfo = si}, .layout = pl};
-    VKCHECK(vkCreateComputePipelines(X->dev, VK_NULL_HANDLE, 1, &ci, NULL, pipe), "xb pipeline");
+    VKCHECK(coli_vk_pipe_create(X->dev, &ci, pipe, NULL), "xb pipeline");
     return 1;
 }
 
@@ -4733,7 +4898,7 @@ static void xb_coop_init(XbCtx *X) {
                 .flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT,
                 .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = X->sh_coop, .pName = "main",
                 .pSpecializationInfo = &si}, .layout = X->pl4};
-        if (vkCreateComputePipelines(X->dev, VK_NULL_HANDLE, 1, &ci, NULL, &X->p_coop[k]) != VK_SUCCESS)
+        if (coli_vk_pipe_create(X->dev, &ci, &X->p_coop[k], NULL) != VK_SUCCESS)
             X->p_coop[k] = VK_NULL_HANDLE;
     }
     e = getenv("COLI_VK_TIER_COOP_ROWS");
@@ -4879,7 +5044,7 @@ static void xb_grp_init(XbCtx *X) {
                       .flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT,
                       .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = X->sh_grp[v], .pName = "main",
                       .pSpecializationInfo = X->grp_q ? NULL : &si}, .layout = X->pl_grp};
-        if (vkCreateComputePipelines(X->dev, VK_NULL_HANDLE, 1, &ci, NULL, &X->p_grp[v]) != VK_SUCCESS) {
+        if (coli_vk_pipe_create(X->dev, &ci, &X->p_grp[v], NULL) != VK_SUCCESS) {
             X->p_grp[v] = VK_NULL_HANDLE; return;
         }
     }
@@ -4897,7 +5062,7 @@ static void xb_grp_init(XbCtx *X) {
                       .flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT,
                       .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = X->sh_gv[v], .pName = "main",
                       .pSpecializationInfo = &si}, .layout = X->pl_grp};
-        if (vkCreateComputePipelines(X->dev, VK_NULL_HANDLE, 1, &ci, NULL, &X->p_gv[v]) != VK_SUCCESS) {
+        if (coli_vk_pipe_create(X->dev, &ci, &X->p_gv[v], NULL) != VK_SUCCESS) {
             X->p_gv[v] = VK_NULL_HANDLE; X->p_gv[0] = VK_NULL_HANDLE; break;
         }
     }
@@ -6498,6 +6663,7 @@ static void dev2_shutdown(void) {
     pool_destroy(&g_tpool2);
     up_destroy(&g_up[1]);
     g_up[1].on = g_up[1].shared = 0; g_up[1].failed = 0; g_up[1].nfams = 0; g_up[1].dev = VK_NULL_HANDLE;
+    pc_close(G2.dev);
     vkDestroyDevice(G2.dev, NULL);
     memset(&G2, 0, sizeof(G2));
     vk_mem_forget(1);
@@ -6574,6 +6740,7 @@ void coli_vk_shutdown(void) {
     up_destroy(&g_up[0]);
     g_up[0].on = g_up[0].shared = 0; g_up[0].failed = 0; g_up[0].nfams = 0; g_up[0].dev = VK_NULL_HANDLE;
     dev2_shutdown();   /* a device of this instance: it goes first */
+    pc_close(G.dev);
     vkDestroyDevice(G.dev, NULL);
     vkDestroyInstance(G.inst, NULL);
     memset(&G, 0, sizeof(G));

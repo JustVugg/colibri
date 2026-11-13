@@ -10,7 +10,9 @@
 #include <string.h>
 #include <time.h>
 #include <math.h>
+#ifdef _OPENMP
 #include <omp.h>
+#endif
 #include "../lowbit_g16.h"
 
 #ifndef XL16_ON

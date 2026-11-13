@@ -26,6 +26,20 @@ static unsigned char e4m3_encode(float x) {
 static float e8m0(unsigned char v) {
     return v == 255 ? NAN : ldexpf(1.0f, (int)v - 127);
 }
+/* The device act_quant of a 128-block fp8 input (on unless DSV4_CUDA_ACT_QUANT=0), as
+ * coli_fp8_activation_qdq_ref: e4m3 per 128 with a power-of-two scale >= max/448. */
+static void act_qdq(float *x, int n) {
+    const char *e = getenv("DSV4_CUDA_ACT_QUANT");
+    if (e && *e && !atoi(e)) return;
+    for (int b = 0; b < n; b += 128) {
+        float m = 1e-4f, raw, s;
+        int ex;
+        for (int i = b; i < b + 128 && i < n; i++) m = fmaxf(m, fabsf(x[i]));
+        raw = m / 448.0f; frexpf(raw, &ex); s = ldexpf(1.0f, ex - 1);
+        if (s < raw) s *= 2.0f;
+        for (int i = b; i < b + 128 && i < n; i++) x[i] = e4m3_decode(e4m3_encode(x[i] / s)) * s;
+    }
+}
 
 int main(void) {
     int device = 0;
@@ -44,6 +58,10 @@ int main(void) {
         scales[b] = (unsigned char)((b % 7) - 3 + 127);
     for (int i = 0; i < groups * I; i++)
         x[i] = (float)((i % 61) - 30) / 16.0f;
+    float *xq = malloc((size_t)groups * I * sizeof(float));
+    if (!xq) return 6;
+    memcpy(xq, x, (size_t)groups * I * sizeof(float));
+    for (int g = 0; g < groups; g++) act_qdq(xq + (size_t)g * I, I);   /* per group, as the GPU */
     int scale_rows_per_group = (o_rank + 127) / 128;
     int scale_columns = (group_width + 127) / 128;
     for (int g = 0; g < groups; g++)
@@ -54,7 +72,7 @@ int main(void) {
                            (o / 128) * scale_columns + i / 128;
                 float wv = e4m3_decode(w[((size_t)g * o_rank + o) * I + i]) *
                            e8m0(scales[b128]);
-                s += x[(size_t)g * I + i] * wv;
+                s += xq[(size_t)g * I + i] * wv;
             }
             cpu[(size_t)g * o_rank + o] = s;
         }
@@ -77,6 +95,7 @@ int main(void) {
     printf("grouped matvec: OK worst=%.2e (O=%d I=%d groups=%d)\n",
            worst, O, I, groups);
     dsv4_cuda_tensor_free(t);
+    free(xq);
     dsv4_cuda_shutdown();
     return 0;
 }

@@ -1298,10 +1298,6 @@ static int multiply_u64(uint64_t a, uint64_t b, uint64_t *output) {
     return 0;
 }
 
-#ifdef __APPLE__
-#include <mach/mach.h>
-#endif
-
 uint64_t coli_v4_os_available_memory(void) {
 #ifdef _WIN32
     MEMORYSTATUSEX status;
@@ -1313,37 +1309,15 @@ uint64_t coli_v4_os_available_memory(void) {
     return status.ullAvailPageFile && status.ullAvailPageFile < status.ullAvailPhys
         ? (uint64_t)status.ullAvailPageFile : (uint64_t)status.ullAvailPhys;
 #elif defined(__APPLE__)
-    /* No /proc and no _SC_AVPHYS_PAGES on macOS. "Available" is what the
-     * kernel could hand out without swapping: free + inactive pages -- the
-     * same approximation Activity Monitor reports, and the closest analogue
-     * of Linux's MemAvailable (which also counts reclaimable cache).
-     *
-     * Two things a caller must know before trusting this number.
-     *
-     * It does NOT add purgeable_count, while inkling.c, kimi_k3.c, compat.h and
-     * telemetry.h all do. The same machine therefore reports a smaller figure
-     * here than through any other engine. Keep the two in mind together: they
-     * are not interchangeable.
-     *
-     * And "could hand out without swapping" is not "will keep resident".
-     * macOS answers memory pressure by COMPRESSING anonymous pages rather than
-     * swapping them, so a budget this function accepts can still end up half
-     * compressed, and every cache hit then pays a decompression. Swap stays at
-     * zero throughout, so a swap-based check sees nothing wrong. Reported and
-     * measured in issue #1614: on a 48 GB machine a 32 GiB budget decoded
-     * SLOWER than a 16 GiB one (0.96 vs 1.31 tok/s) while the hit rate rose
-     * monotonically. Sizing a cache from this number alone is therefore
-     * unsafe on Darwin; a fix needs vm.compressor_page_count, which this
-     * function does not read. */
-    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
-    vm_statistics64_data_t vm;
-    vm_size_t page = 0;
-    if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
-                          (host_info64_t)&vm, &count) == KERN_SUCCESS &&
-        host_page_size(mach_host_self(), &page) == KERN_SUCCESS && page)
-        return ((uint64_t)vm.free_count + (uint64_t)vm.inactive_count) *
-               (uint64_t)page;
-    return 0;
+    /* compat_meminfo_gb's rule, as every other engine and the planner: free +
+     * file-backed + purgeable pages, what macOS can take back without
+     * compressing or swapping. This used to be free + inactive, which also
+     * counts inactive anonymous pages: on a 48 GB Mac with browsers open it
+     * offered 32.5 GiB, and a 32 GiB cache was compressed, then swapped (#1614).
+     * Still not modeled: the compressor. #1614 measured 32 GiB decoding slower
+     * than 16 GiB (0.96 vs 1.31 tok/s) with swap at zero; a fix needs
+     * vm.compressor_page_count (compressor_page_count in host_statistics64). */
+    return (uint64_t)(compat_mem_available_gb() * 1e9);
 #else
     /* MemAvailable bounded by a container's cgroup (compat_mem_available_gb) */
     double gb = compat_mem_available_gb();
@@ -1869,6 +1843,24 @@ int coli_v4_hc_post(float *output, const float *branch,
                     const float *residual, const float *post,
                     const float *comb, int hc, int dimension) {
     return coli_hc_post(output, branch, residual, post, comb, hc, dimension);
+}
+
+/* the same two steps with the caller's choice of OpenMP team
+ * (hyper_connections.h: coli_hc_pre_team) */
+int coli_v4_hc_pre_team(float *output, float *post, float *comb,
+                        const float *input, const float *hc_fn,
+                        const float scale[3], const float *base,
+                        int hc, int dimension, int iterations,
+                        float norm_eps, float hc_eps, int team) {
+    return coli_hc_pre_team(output, post, comb, input, hc_fn, scale, base,
+                            hc, dimension, iterations, norm_eps, hc_eps, team);
+}
+
+int coli_v4_hc_post_team(float *output, const float *branch,
+                         const float *residual, const float *post,
+                         const float *comb, int hc, int dimension, int team) {
+    return coli_hc_post_team(output, branch, residual, post, comb, hc,
+                             dimension, team);
 }
 
 int coli_v4_rmsnorm(float *output, const float *input, const float *weight,
@@ -5007,11 +4999,35 @@ static void decode_bf16(float *output, const uint16_t *input, size_t count) {
     for (size_t i = 0; i < count; i++) output[i] = coli_bf16_decode(input[i]);
 }
 
-static int normalized_hc_pre(float *reduced, float *post, float *comb,
-                             float *normalized, const float *input_hc,
-                             const ColiDeepSeekV4LayerWeights *weights,
-                             const ColiDeepSeekV4Config *config,
-                             const char *branch, const char *norm_name) {
+/* V4_HC_TEAM: the OpenMP team of a decode token's hyper-connection steps
+ * (the pipeline block; the prompt's paths are not touched). Unset: 0 in a CPU
+ * run, the default team for every loop as before, and COLI_V4_HC_GPU_TEAM
+ * when the expert store has its GPU tier: the mix on that many threads and
+ * the column loops on the calling thread. There each layer's device work
+ * puts the team to sleep, and the four hyper-connection steps of a layer
+ * each woke and joined all of it. The results do not depend on the team
+ * (hyper_connections.h). Measured on a 5950X (a team of 16) beside an RTX
+ * 5080, decprof's hc per token: the default team 27 ms, 4 threads 18, 6
+ * threads 17, 8 threads 19, 12 threads 18, 16 threads 20, 1 thread 31 (the
+ * mix alone is ~0.3 ms of serial work per call). */
+#define COLI_V4_HC_GPU_TEAM 6
+static int v4_hc_decode_team(const ColiExpertStore *experts) {
+    static int setting = -2;
+    if (setting == -2) {
+        const char *text = getenv("V4_HC_TEAM");
+        setting = text && *text ? atoi(text) : -1;
+        if (setting < -1) setting = -1;
+    }
+    if (setting >= 0) return setting;
+    return experts && experts->gpu ? COLI_V4_HC_GPU_TEAM : 0;
+}
+
+static int normalized_hc_pre_team(float *reduced, float *post, float *comb,
+                                  float *normalized, const float *input_hc,
+                                  const ColiDeepSeekV4LayerWeights *weights,
+                                  const ColiDeepSeekV4Config *config,
+                                  const char *branch, const char *norm_name,
+                                  int team) {
     char name[64];
     snprintf(name, sizeof(name), "hc_%s_fn", branch);
     const float *function = value(weights, name, NULL);
@@ -5027,10 +5043,10 @@ static int normalized_hc_pre(float *reduced, float *post, float *comb,
         return -1;
     }
     decode_bf16(norm, raw_norm, (size_t)d);
-    int result = coli_v4_hc_pre(reduced, post, comb, input_hc, function,
-                                scale, base, config->hc_mult, d,
-                                config->hc_sinkhorn_iters,
-                                config->rms_norm_eps, config->hc_eps);
+    int result = coli_v4_hc_pre_team(reduced, post, comb, input_hc, function,
+                                     scale, base, config->hc_mult, d,
+                                     config->hc_sinkhorn_iters,
+                                     config->rms_norm_eps, config->hc_eps, team);
     if (!result) {
         coli_bf16_round_array(reduced, (size_t)d);
         result = coli_v4_rmsnorm(normalized, reduced, norm, d,
@@ -5039,6 +5055,15 @@ static int normalized_hc_pre(float *reduced, float *post, float *comb,
     }
     free(norm);
     return result;
+}
+
+static int normalized_hc_pre(float *reduced, float *post, float *comb,
+                             float *normalized, const float *input_hc,
+                             const ColiDeepSeekV4LayerWeights *weights,
+                             const ColiDeepSeekV4Config *config,
+                             const char *branch, const char *norm_name) {
+    return normalized_hc_pre_team(reduced, post, comb, normalized, input_hc,
+                                  weights, config, branch, norm_name, 0);
 }
 
 #ifndef COLI_V4_DISABLE_BF16_ROUTE
@@ -6591,8 +6616,10 @@ static int block_token_pipeline(float *output_hc,
     /* the stage that failed, for the error (the request's only report) */
     const char *stage = "attention hyper-connection";
     if (error && error_size) error[0] = 0;
-    int result = normalized_hc_pre(reduced, post, comb, normalized, input_hc,
-                                   weights, config, "attn", "attn_norm.weight");
+    int team = v4_hc_decode_team(experts);
+    int result = normalized_hc_pre_team(reduced, post, comb, normalized, input_hc,
+                                        weights, config, "attn", "attn_norm.weight",
+                                        team);
     DP_MARK(dp_hc);
     if (!result) stage = "attention";
     if (!result) result = attention
@@ -6602,22 +6629,22 @@ static int block_token_pipeline(float *output_hc,
                                       position, error, error_size);
     DP_MARK(dp_attn);
     if (!result) stage = "attention hyper-connection post";
-    if (!result) result = coli_v4_hc_post(state, branch, residual,
-                                          post, comb, hc, d);
+    if (!result) result = coli_v4_hc_post_team(state, branch, residual,
+                                               post, comb, hc, d, team);
     if (!result) coli_bf16_round_array(state, hd);
     if (!result) memcpy(residual, state, hd * sizeof(*residual));
     if (!result) stage = "FFN hyper-connection";
-    if (!result) result = normalized_hc_pre(reduced, post, comb, normalized, state,
-                                            weights, config, "ffn",
-                                            "ffn_norm.weight");
+    if (!result) result = normalized_hc_pre_team(reduced, post, comb, normalized, state,
+                                                 weights, config, "ffn",
+                                                 "ffn_norm.weight", team);
     DP_MARK(dp_hc);
     if (!result) stage = "MoE";
     if (!result) result = moe_token_pipeline(branch, weights, config, experts,
                                              normalized, token);
     DP_MARK(dp_moe);
     if (!result) stage = "FFN hyper-connection post";
-    if (!result) result = coli_v4_hc_post(output_hc, branch, residual,
-                                          post, comb, hc, d);
+    if (!result) result = coli_v4_hc_post_team(output_hc, branch, residual,
+                                               post, comb, hc, d, team);
     if (!result) coli_bf16_round_array(output_hc, hd);
     DP_MARK(dp_hc);
     if (dprof) dp_layers++;
@@ -7073,8 +7100,13 @@ static int v4_moe_batch_union(
     ExpertLoadJob jobs[DUAL_EXPERT_LOADER_MAX] = {{0}};
     ExpertLoadHandle loaders[DUAL_EXPERT_LOADER_MAX] = {{0}};
     int active[DUAL_EXPERT_LOADER_MAX] = {0};
-    int preload = key_count < dual_loader_lanes()
-        ? key_count : dual_loader_lanes();
+    /* Every lane holds a cache lease, and so does the expert being computed:
+     * with lanes + 1 > the layer's slots (no prefill pool) the last lookups
+     * found no free slot and the union failed. */
+    int lanes = dual_loader_lanes();
+    int lease_capacity = coli_v4_expert_store_lease_capacity(store, weights->plan.layer);
+    if (lease_capacity > 1 && lanes >= lease_capacity) lanes = lease_capacity - 1;
+    int preload = key_count < lanes ? key_count : lanes;
     for (int current = 0; !result && current < preload; current++) {
         jobs[current].store = store;
         jobs[current].key = keys[current];
@@ -7086,7 +7118,7 @@ static int v4_moe_batch_union(
             active[current] = 1;
     }
     for (int current = 0; !result && current < key_count; current++) {
-        int slot = current % dual_loader_lanes();
+        int slot = current % lanes;
         if (!active[slot] || profiled_expert_load_finish(&loaders[slot]) ||
             jobs[slot].result) {
             result = moe_fail("layer %d: reading expert %d from the expert store failed",
@@ -7095,7 +7127,7 @@ static int v4_moe_batch_union(
         }
         active[slot] = 0;
         ColiExpertView view = jobs[slot].view;
-        int next = current + dual_loader_lanes();
+        int next = current + lanes;
         if (next < key_count) {
             memset(&jobs[slot], 0, sizeof(jobs[slot]));
             jobs[slot].store = store;
@@ -7124,7 +7156,7 @@ static int v4_moe_batch_union(
                 expert_batch_capacity);
         coli_expert_release(store, &view);
     }
-    for (int slot = 0; slot < dual_loader_lanes(); slot++)
+    for (int slot = 0; slot < lanes; slot++)
         if (active[slot]) {
             profiled_expert_load_finish(&loaders[slot]);
             if (!jobs[slot].result) coli_expert_release(store, &jobs[slot].view);
@@ -10731,6 +10763,16 @@ void coli_v4_expert_store_prefill_pool(ColiExpertStore *store, int layer) {
     pthread_mutex_unlock(&state->mutex);
 }
 
+int coli_v4_expert_store_lease_capacity(ColiExpertStore *store, int layer) {
+    if (!store || !store->state || !hot_find(store)) return 0;
+    V4ExpertStoreState *state = store->state;
+    pthread_mutex_lock(&state->mutex);
+    int capacity = state->pool_layer >= 0 && state->pool_layer == layer
+        ? state->layers * state->slots_per_layer : state->slots_per_layer;
+    pthread_mutex_unlock(&state->mutex);
+    return capacity;
+}
+
 /* The CUDA expert bank's side of the store (COLI_V4_UNIT_GPU,
  * COLI_CUDA_MOE_BATCH=1). The bank reads each routed expert once per layer per
  * prompt and computes every routing from VRAM, so its reads cannot keep the
@@ -11997,7 +12039,14 @@ int coli_v4_engine_open(ColiV4Engine **output,
 #endif
 #ifdef COLI_V4_GPU_TIER
     if (coli_v4_gpu_experts_init(engine, error, error_size)) goto fail;
-    coli_v4_gpu_head_upload(engine);
+    /* DSV4_CUDA_HEAD_LAZY (1): the exact head goes up at the first head call
+     * (coli_v4_gpu_head_ready), not here. At open nothing else is on the card
+     * yet, so the budget check passes, and the dense mirrors and the prefill
+     * bank that follow then find 1 GiB less (2 while the head packs): on a
+     * 16 GB card the prompt ran out of VRAM (`kv ring allocation: out of
+     * memory`). By the first head call the prompt is done and its bank
+     * released. 0 = upload here, as before. */
+    if (!coli_v4_gpu_head_lazy()) coli_v4_gpu_head_upload(engine);
 #endif
     *output = engine;
     return 0;
@@ -12282,6 +12331,7 @@ void coli_v4_gpu_engine_close(ColiV4Engine *engine) {
     }
     dsv4_cuda_tensor_free((Dsv4CudaTensor *)engine->gpu.head);
     engine->gpu.head = NULL;
+    engine->gpu.head_tried = 0;
     v4_gpu_route_scratch_clear();
     dsv4_cuda_shutdown();
     engine->gpu.enabled = 0;
@@ -12662,18 +12712,24 @@ static long long v4_gpu_resident_reserve_mb(void) {
     return reserve < 256 ? 256 : reserve;
 }
 
+int coli_v4_gpu_head_lazy(void) {
+    const char *setting = getenv("DSV4_CUDA_HEAD_LAZY");
+    return !setting || atoi(setting) != 0;
+}
+
 void coli_v4_gpu_head_upload(ColiV4Engine *engine) {
 #if defined(__AVX2__)
     const char *enabled = getenv("DSV4_CUDA_HEAD");
     if (!engine || !engine->gpu.enabled || engine->gpu.head ||
-        !engine->head_cache.data || (enabled && !atoi(enabled))) return;
+        (enabled && !atoi(enabled))) return;
     int rows = engine->config.vocab_size, cols = engine->config.hidden_size;
+    uint64_t head_bytes = (uint64_t)rows * cols * 2;
     if (rows < 1 || rows % 32 || cols < 1 || cols % 8 ||
-        engine->head_cache.bytes != (uint64_t)rows * cols * 2) return;
+        (engine->head_cache.data && engine->head_cache.bytes != head_bytes)) return;
     long long reserve = v4_gpu_resident_reserve_mb();
-    long long need = ((long long)rows * cols * 4 + 1048575) / 1048576;
+    long long need = ((long long)rows * cols * 2 + 1024LL * cols * 2 + 1048575) / 1048576;
     /* After expert preloading: never displace complete banks to fit the head.
-     * Packing temporarily needs both copies; final residency retains one.
+     * The upload packs through a staging buffer of at most 1024 rows: the head plus that.
      * Prefer the owning (last) device, then any other with room, rather than
      * always pinning the head to device 0. */
     int count = engine->gpu.device_count > 0 ? engine->gpu.device_count : 1;
@@ -12692,6 +12748,32 @@ void coli_v4_gpu_head_upload(ColiV4Engine *engine) {
         if (d == forced) continue;
         order[n++] = d;
     }
+    /* A head the RAM plan streams is read from disk for the upload and freed after it,
+     * so the CPU fallback keeps streaming as planned. Read only when the upload can
+     * happen and the OS still has the bytes: the expert slabs are allocated on first
+     * lookup, but a resident-expert preload has already filled them. */
+    int borrowed = !engine->head_cache.data;
+    if (borrowed) {
+        const ColiSafetensorsTensor *t = engine->target_index
+            ? coli_st_find(engine->target_index, "head.weight") : NULL;
+        int room = 0;
+        for (int k = 0; k < n && !room; k++)
+            room = dsv4_cuda_mem_free_mb(order[k]) >= reserve + need;
+        char why[256] = "";
+        const char *skip =
+            !t || t->dtype != COLI_ST_BF16 || (uint64_t)t->nbytes != head_bytes
+                ? "head.weight is not a BF16 vocab x hidden tensor"
+            : !dsv4_cuda_head_exact_available() ? "backend has no exact head"
+            : !room ? "no device has room"
+            : coli_v4_os_available_memory() < head_bytes + (512ull << 20) ? "host RAM too low to read it"
+            : coli_v4_head_cache_load(engine, engine->target_index, why, sizeof why) ? why
+            : NULL;
+        if (skip) {
+            fprintf(stderr, "v4_gpu head=cpu-streamed (%s) need-MiB=%lld reserve-MiB=%lld\n",
+                    skip, need, reserve);
+            return;
+        }
+    }
     Dsv4CudaTensor *head = NULL;
     int device = -1;
     for (int k = 0; k < n; k++) {
@@ -12707,6 +12789,11 @@ void coli_v4_gpu_head_upload(ColiV4Engine *engine) {
             head = NULL;
         }
     }
+    if (borrowed) {
+        free(engine->head_cache.data);
+        engine->head_cache.data = NULL;
+        engine->head_cache.bytes = 0;
+    }
     if (!head) {
         fprintf(stderr, "v4_gpu head=cpu-fallback device=%d free-MiB=%lld need-MiB=%lld reserve-MiB=%lld\n",
                 first, dsv4_cuda_mem_free_mb(first), need, reserve);
@@ -12715,22 +12802,35 @@ void coli_v4_gpu_head_upload(ColiV4Engine *engine) {
     engine->gpu.head = head;
     long long bytes = dsv4_cuda_tensor_bytes(head);
     engine->gpu.uploaded_bytes += bytes;
-    fprintf(stderr, "v4_gpu head=resident device=%d bytes=%lld arithmetic=separate-mul-add\n", device, bytes);
+    fprintf(stderr, "v4_gpu head=resident device=%d bytes=%lld arithmetic=separate-mul-add%s\n", device, bytes,
+            borrowed ? " host-copy=read-from-disk-and-freed" : "");
 #else
     (void)engine;
 #endif
 }
 
+/* The exact head, uploaded on first use under DSV4_CUDA_HEAD_LAZY: 1 when it
+ * is resident. One attempt per engine open: a refusal (the budget, a failed
+ * upload) keeps the CPU head for the run instead of probing every token. */
+int coli_v4_gpu_head_ready(ColiV4Engine *engine) {
+    if (!engine || !engine->gpu.enabled) return 0;
+    if (!engine->gpu.head && !engine->gpu.head_tried && coli_v4_gpu_head_lazy()) {
+        engine->gpu.head_tried = 1;
+        coli_v4_gpu_head_upload(engine);
+    }
+    return engine->gpu.head != NULL;
+}
+
 int coli_v4_gpu_head_scores(ColiV4Engine *engine,const float *input,float *scores) {
-    if (!engine || !engine->gpu.enabled || !engine->gpu.head) return -1;
+    if (!coli_v4_gpu_head_ready(engine)) return -1;
     return dsv4_cuda_head_scores_exact(engine->gpu.head, input, scores) ? 0 : -1;
 }
 
 int coli_v4_gpu_head_batch(ColiV4Engine *engine,const float *input,int batch,
                            float *scores,int *ids,float *values) {
     const char *enabled = getenv("DSV4_CUDA_HEAD_BATCH");
-    if ((enabled && !atoi(enabled)) || !engine || !engine->gpu.enabled ||
-        !engine->gpu.head || !input || batch < 1 || batch > 128) return -1;
+    if ((enabled && !atoi(enabled)) || !input || batch < 1 || batch > 128 ||
+        !coli_v4_gpu_head_ready(engine)) return -1;
     if (scores)
         return dsv4_cuda_head_scores_batch_exact(engine->gpu.head, input, batch, scores) ? 0 : -1;
     return dsv4_cuda_head_argmax_batch_exact(engine->gpu.head, input, batch, ids, values) ? 0 : -1;
@@ -16181,6 +16281,13 @@ static int head_scores_impl(ColiV4Engine *engine, const float *hidden,
         V4_DUMP_LOGITS(scores, (size_t)vocab);
         return mismatches ? -1 : 0;
     }
+#ifdef COLI_V4_GPU_TIER
+    /* the plan streams the head, but coli_v4_gpu_head_upload may have put it on the device */
+    if (!coli_v4_gpu_head_scores(engine, hidden, scores)) {
+        V4_DUMP_LOGITS(scores, (size_t)vocab);
+        return 0;
+    }
+#endif
     /* Low-memory fallback: stream small row tiles exactly as before. */
     enum { ROWS = 64 };
     uint16_t *raw = malloc((size_t)ROWS * d * sizeof(*raw));
@@ -18781,11 +18888,8 @@ static void v4_hwinfo_emit(void) {
      * it already carries a Darwin branch. Declared extern because the amalgamation compiles
      * this file once per -DCOLI_V4_UNIT_*, so the definition need not be in this unit.
      *
-     * That branch returns free + inactive, NOT free + inactive + purgeable: this engine is
-     * deliberately one term more conservative than inkling.c, kimi_k3.c, compat.h and
-     * telemetry.h, which all add purgeable_count. Whoever changes one of the two formulas
-     * should know the other exists, or the same machine will report two different "free RAM"
-     * figures depending on which engine is asked. */
+     * That branch calls compat_mem_available_gb(): free + file-backed + purgeable pages, the
+     * figure every other engine and the planner report for the same machine. */
     {
         extern uint64_t coli_v4_os_available_memory(void);
         if (!cpu[0]) {
@@ -18818,11 +18922,8 @@ static void v4_hwinfo_emit(void) {
      * it already carries a Darwin branch. Declared extern because the amalgamation compiles
      * this file once per -DCOLI_V4_UNIT_*, so the definition need not be in this unit.
      *
-     * That branch returns free + inactive, NOT free + inactive + purgeable: this engine is
-     * deliberately one term more conservative than inkling.c, kimi_k3.c, compat.h and
-     * telemetry.h, which all add purgeable_count. Whoever changes one of the two formulas
-     * should know the other exists, or the same machine will report two different "free RAM"
-     * figures depending on which engine is asked. */
+     * That branch calls compat_mem_available_gb(): free + file-backed + purgeable pages, the
+     * figure every other engine and the planner report for the same machine. */
     {
         extern uint64_t coli_v4_os_available_memory(void);
         if (!cpu[0]) {

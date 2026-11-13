@@ -1854,6 +1854,29 @@ class SchedulerTest(unittest.TestCase):
                 self.assertEqual(list(scheduler.queue), [older])
                 self.assertEqual(scheduler.snapshot()["rejected"], 1)
 
+    def test_preferred_slot_is_taken_when_free_and_left_when_busy(self):
+        # conversation_cache_slot's slot is a preference: free, it is the pick; busy with
+        # another conversation, a free slot is taken at once instead of waiting for it.
+        scheduler = GenerationScheduler(max_queue=0, queue_timeout=0.01, capacity=3)
+        with scheduler.admit(prefer=2) as (_, slot):
+            self.assertEqual(slot, 2)
+            with patch.object(scheduler.condition, "wait", side_effect=AssertionError("waited for a busy preferred slot")):
+                with scheduler.admit(prefer=2) as (_, other):
+                    self.assertEqual(other, 0)
+                    self.assertEqual(scheduler.snapshot()["active"], 2)
+        stats = scheduler.snapshot()
+        self.assertEqual((stats["rejected"], stats["timed_out"], stats["completed"]), (0, 0, 2))
+
+    def test_preference_does_not_bypass_older_any_slot_waiter(self):
+        scheduler = GenerationScheduler(max_queue=1, capacity=2)
+        older = (object(), None)
+        scheduler.queue.append(older)
+        with self.assertRaises(APIError) as caught:
+            with scheduler.admit(prefer=1):
+                self.fail("bypassed older waiter")
+        self.assertEqual(caught.exception.code, "queue_full")
+        self.assertEqual(list(scheduler.queue), [older])
+
     def test_zero_queue_rejects_busy_pinned_slot_with_spare_capacity(self):
         scheduler = GenerationScheduler(max_queue=0, queue_timeout=0.01, capacity=2)
         with scheduler.admit(slot=0):
@@ -2941,6 +2964,10 @@ class CapSentinelShimTest(unittest.TestCase):
             "qwen38", None, {"COLI_PLAN_CAP": "11", "COLI_PROFILE_CAP": "7"}), 7)
         self.assertEqual(cap_for_arch(
             "qwen38", 5, {"COLI_PLAN_CAP": "11", "COLI_PROFILE_CAP": "7"}), 5)
+        # #2785: OLMoE sizes its own cache from the plan's RAM_GB
+        self.assertEqual(cap_for_arch("olmoe", None, planned), 0)
+        self.assertEqual(cap_for_arch(
+            "olmoe", None, {"COLI_PLAN_CAP": "11", "COLI_PROFILE_CAP": "7"}), 7)
 
     def test_engine_consumes_profile_cap_without_leaking_private_env(self):
         process = FakeProcess(lambda _process, _frame: None)
@@ -3192,6 +3219,27 @@ class EngineRestartTest(unittest.TestCase):
         self.assertEqual(dead.closed, 1)
         self.assertEqual(fresh.closed, 0)
         self.assertEqual(server.pinned_prefixes, {})   # the photos lived in the dead KV
+
+    def test_keep_engine_takes_the_context_the_new_engine_holds(self):
+        # a restart with less free RAM plans a smaller context: /health and the request
+        # clamp must say so, not the first engine's figures
+        dead, fresh = _DeadableEngine("dead"), _DeadableEngine("fresh")
+        dead.context_limit, dead.max_tokens = 31744, 31744
+        fresh.context_limit, fresh.max_tokens = 20480, 20480
+        server = self._server(dead)
+        server.context_limit, server.max_tokens = 31744, 31744
+        stopping = threading.Event()
+        thread = threading.Thread(target=openai_server.keep_engine,
+                                  args=(server, lambda: fresh, stopping, 0.01, (0.01, 0.02), 0.01),
+                                  daemon=True)
+        thread.start()
+        dead.alive = False
+        deadline = time.monotonic() + 2
+        while server.engine is not fresh and time.monotonic() < deadline:
+            time.sleep(0.01)
+        stopping.set()
+        thread.join(timeout=2)
+        self.assertEqual((server.context_limit, server.max_tokens), (20480, 20480))
 
     def test_keep_engine_tries_a_failed_start_again(self):
         dead, fresh = _DeadableEngine("dead"), _DeadableEngine("fresh")
@@ -4152,7 +4200,9 @@ class HTTPTest(unittest.TestCase):
                 with patch("openai_server.ARCH", arch):
                     with self.request("/v1/chat/completions", request("this")) as response:
                         self.assertEqual(response.status, 200)
-                self.assertIn("look at this", self.engine.calls[-1][0])
+                # V4.1 joins content blocks on a blank line, as its encoding.py does
+                joined = "look at \n\nthis" if arch == "deepseek_v41" else "look at this"
+                self.assertIn(joined, self.engine.calls[-1][0])
 
 class ClientHangupTest(unittest.TestCase):
     """A client that disconnects mid-response must not print a traceback.

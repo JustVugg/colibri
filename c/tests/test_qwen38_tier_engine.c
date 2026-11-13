@@ -22,7 +22,6 @@
 #undef main
 
 #ifdef _WIN32
-#undef setenv
 #undef unsetenv
 #define unsetenv(name) _putenv_s(name, "")
 #endif
@@ -36,6 +35,30 @@ static void tk(int ok, const char *what) {
     if (ok) { printf("  ok   %s\n", what); return; }
     printf("  FAIL %s\n", what);
     t_fails++;
+}
+
+/* The load's own steps, model_init then q38_tier_start, with the trunk placed on the
+ * fake tier: a placed matrix keeps only its int8 rows from then on (its BF16 rows freed
+ * at placement, not later in q38_trunk_cpu_int8), and resident_weight_bytes follows.
+ * Q38_TRUNK_CPU_INT8=0 (keep_bf16) leaves the BF16 rows and the count alone. */
+static void trunk_bf16_at_placement(int keep_bf16) {
+    Model m; model_init(&m, "./qwen38_tiny_fp8", 1, 8);
+    uint64_t expect = m.resident_weight_bytes;
+    q38_tier_start(&m, 1);
+    int placed = 0, bf16 = 0, q8 = 0;
+    for (int i = 0; i < g_trunk_n; i++) {
+        Q38Weight *w = g_trunk[i].w;
+        if (!w->gpu) continue;
+        placed++; bf16 += w->data != NULL; q8 += w->q8 != NULL;
+        if (!keep_bf16) expect = expect - q38_weight_bytes(w) + (uint64_t)w->rows * w->cols + (uint64_t)w->rows * sizeof(float);
+    }
+    tk(placed > 0 && placed == qt_dense_count(), "model_init + q38_tier_start placed the trunk");
+    tk(q8 == placed, "every placed matrix has its int8 rows");
+    if (keep_bf16) tk(bf16 == placed, "Q38_TRUNK_CPU_INT8=0: every placed matrix keeps its BF16 rows");
+    else tk(bf16 == 0, "every placed matrix's BF16 rows freed at placement");
+    tk(m.resident_weight_bytes == expect, "resident_weight_bytes counts int8 rows and scales for what was freed");
+    qt_shutdown();
+    q38_model_free(&m);
 }
 
 int main(int argc, char **argv_in) {
@@ -114,8 +137,31 @@ int main(int argc, char **argv_in) {
     tk(rc == 0, "engine with the int8 trunk on the fake tier stays within the oracle's limits");
     tk(g_trunk_n > 0 && qt_dense_count() == g_trunk_n, "every offered dense matrix was placed and uploaded");
     tk(fake_uploads >= g_trunk_n, "one upload per placed matrix");
+    size_t budget_off = G.budget[0], trunk_off = G_trunk_bytes[0];
     qt_shutdown();
     tk(qt_dense_count() == 0, "dense handles released at shutdown");
+    trunk_bf16_at_placement(0);
+    setenv("Q38_TRUNK_CPU_INT8", "0", 1);
+    trunk_bf16_at_placement(1);
+    unsetenv("Q38_TRUNK_CPU_INT8");
+
+    /* The same with COLI_CUDA_CHAIN=1: the chain's device memory (q38cc_reserve_bytes) is
+     * offered as a component of its own before the FP8 tier sizes its expert budget, as on
+     * a GGUF, so the budget is the one above less the chain's bytes. Without the offer the
+     * promotions fill what the chain allocates after q38_tier_start. */
+    printf(" the CUDA chain's reserve beside the FP8 tier\n");
+    setenv("COLI_CUDA_CHAIN", "1", 1);
+    G_offer_n = 0;                               /* offers are per load; this process opens another model */
+    rc = qwen38_main_unused(4, argv);
+    tk(rc == 0, "engine with the chain on the fake tier stays within the oracle's limits");
+    size_t chain = 0; int chain_dev = QT_PLACE_CPU;
+    for (int o = 0; o < G_offer_n; o++)
+        if (!strcmp(G_offer[o].name, "chain")) { chain = G_offer[o].bytes; chain_dev = G_offer[o].dev; }
+    tk(chain > 0 && chain_dev == G.dev[0], "the chain's reserve offered and placed on its card");
+    tk(G_trunk_bytes[0] == trunk_off + chain, "the trunk's bytes on the card count the chain's reserve");
+    tk(G.budget[0] == budget_off - chain, "the expert budget leaves the chain's reserve");
+    qt_shutdown();
+    setenv("COLI_CUDA_CHAIN", "0", 1);
 
     if (argc > 1) {
         /* Third pass: the int4-g64 sidecar. The tier must stay off -- no

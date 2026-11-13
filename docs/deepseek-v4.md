@@ -125,6 +125,7 @@ picks at start-up by GPU:
 |---|---|---|---|
 | `coli_cuda_dsv4_dg.dll` | `make cuda-dsv4-dg-dll` (from a vcvars64 shell; fetches the pinned DeepGEMM headers on first use) | DeepGEMM tensor-core prefill paths + generic kernels | compute capability 12.x (RTX 50-series) |
 | `coli_cuda_dsv4.dll` | `make cuda-dsv4-dll CUDA_ARCH=portable` | generic CUDA kernels only (fp32 compute from fp8/fp4 decode) | any sm_80+ (RTX 30/40/50, A/H series) |
+| `coli_cuda_dsv4.dll` | `make cuda-dsv4-dll CUDA_ARCH=portable-pre-ampere NO_TC=1`, CUDA <= 12.9 | the same generic kernels, plus sm_61/sm_75 code (see [GPU coverage](#gpu-coverage)) | Pascal and Turing too (GTX 10/16, RTX 20) |
 
 The release's Windows CUDA package (`colibri-<tag>-windows-x86_64-cuda.zip`)
 carries both, built with `DSV4_TC=0`: that leaves out the opt-in cuBLASLt
@@ -146,9 +147,11 @@ them). `make cuda-dsv4-dg-dll` and `DEEPGEMM=1` run it on first build
 `DEEPGEMM_HOME=<dir>` points at an existing tree instead and `DEEPGEMM_PIN`
 bumps the commit. Attribution: `THIRD_PARTY_NOTICES.md`. Loader rules:
 try `_dg` first, ask it whether device 0 fits (`dsv4_cuda_backend_arch_ok`),
-otherwise load the generic DLL; `COLI_DSV4_DLL=<file name>` forces one. The
-start-up banner names the choice: `[DSV4 CUDA] backend=coli_cuda_dsv4_dg.dll
-(deepgemm-sm120)`. Deploy = `deepseek_v4.exe` + both DLLs next to it.
+otherwise load the generic DLL; `COLI_DSV4_DLL=<file name>` forces one from
+the engine's folder (a relative path too), `COLI_DSV4_DLL=<absolute path>`
+(`C:/x/coli_cuda_dsv4_dg.dll` or `C:\x\...`) loads that file, its CUDA runtime from beside it or PATH (never
+the current directory). The start-up banner names the choice and the file:
+`[DSV4 CUDA] backend=coli_cuda_dsv4_dg.dll (deepgemm-sm120) path=...`. Deploy = `deepseek_v4.exe` + both DLLs next to it.
 
 ### Linux CUDA tier
 
@@ -566,8 +569,11 @@ build's two activation-quantise kernels (`fp8_sim64`, `fp8_sim64_dynamic`)
 do call `__nv_cvt_float_to_fp8`, but `cuda_fp8.h` resolves that to native
 `cvt` PTX only at `__CUDA_ARCH__ >= 890` and to its own software path
 below, so it builds and runs on older cards. All of it compiles unchanged
-for sm_61 and sm_75, so `CUDA_ARCH=portable-pre-ampere NO_TC=1` extends the
-generic tier to Pascal and Turing.
+for sm_61 and sm_75, so `CUDA_ARCH=portable-pre-ampere NO_TC=1`, built with
+CUDA <= 12.9, extends the generic tier to Pascal and Turing. CUDA 13 dropped
+`compute_61` (its `nvcc --list-gpu-arch` starts at `compute_75`), so nvcc
+stops at once with `Unsupported gpu architecture 'compute_61'`. With CUDA 13,
+a Turing card builds with `CUDA_ARCH=sm_75 NO_TC=1`.
 
 `NO_TC=1` is required because the opt-in `DSV4_CUDA_TC` path calls cuBLASLt
 block-scaling APIs (`CUBLASLT_MATMUL_DESC_A_SCALE_MODE` and friends) that need
@@ -587,7 +593,7 @@ is no software path to fall back to.
 |---|---|---|---|
 | CPU only (no DLL / `DSV4_CUDA=0` / Linux default) | — | CPU reference | CPU reference |
 | generic DLL / `CUDA=1` | any sm_80+ | GPU attention block, indexer, generic batched MoE on the VRAM bank | GPU attention, indexer, expert mirrors |
-| generic, pre-Ampere / `CUDA=1 CUDA_ARCH=portable-pre-ampere NO_TC=1` | sm_61 (Pascal), sm_75 (Turing) | as generic | as generic |
+| generic, pre-Ampere / `CUDA=1 CUDA_ARCH=portable-pre-ampere NO_TC=1`, CUDA <= 12.9 | sm_61 (Pascal), sm_75 (Turing) | as generic | as generic |
 | DeepGEMM DLL / `CUDA=1 DEEPGEMM=1` | compute 12.x | as generic + tensor-core dense/MoE GEMMs | same as generic |
 | multi-GPU layer placement | up to 16 visible CUDA devices | contiguous layer ranges, with dense mirrors and KV on the owning device | per-device expert caches; layers still execute sequentially |
 
@@ -716,7 +722,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `DSV4_CUDA` (1) | master switch for the V4 GPU tier; `0` = CPU only |
 | `DSV4_CUDA_DEVICE` (0) | single CUDA device ordinal, used when `DSV4_CUDA_DEVICES` is unset |
 | `DSV4_CUDA_DEVICES` (unset) | ordered comma-separated distinct CUDA ordinals; split contiguous layers across these devices |
-| `COLI_DSV4_DLL` | Windows: force a backend DLL file name (loader) |
+| `COLI_DSV4_DLL` | Windows: force a backend DLL, by file name or relative path (engine's folder) or absolute path (loader) |
 | `COLI_CUDA_ATTN_BATCH` (0; 1 for a GGUF on the CUDA expert tier) | `1` = GPU batched prefill attention block + GPU decode attention/indexer; unset, it is on for a GGUF whose dense matrices the CUDA expert tier's device holds (`COLI_CUDA=1`, `COLI_CUDA_DENSE`), `0` keeps it on the CPU |
 | `COLI_CUDA_MOE_BATCH` (0) | `1` = prefill MoE on the transient VRAM expert bank |
 | `COLI_CUDA_MOE_BATCH_MIN` (256) | min fresh tokens to engage the bank |
@@ -725,6 +731,8 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `DSV4_CUDA_RESIDENT_RESERVE_MB` (2800, min 256) | VRAM kept free while resident experts preload and the exact head uploads; separate from the mirror-growth reserve above |
 | `DSV4_CUDA_RESIDENT_EXPERTS` (auto) | `auto` loads every routed expert when the budget fits and keeps the LRU cache on a budget refusal; `1` requires residency (a budget refusal or hard failure rejects engine open); `0` keeps the cache |
 | `DSV4_CUDA_HEAD` (1) | exact vocabulary head on the GPU; `0` keeps it on the CPU |
+| `DSV4_CUDA_HEAD_LAZY` (1) | upload the exact head at the first head call, after the prompt, instead of at engine open, where its 1 GiB (2 while packing) is taken before the dense mirrors and the prefill bank are sized; `0` uploads at open |
+| `V4_HC_TEAM` (unset) | the OpenMP team of a decode token's hyper-connection steps: unset = the default team in a CPU run, and with the GPU tier on the mix on 6 threads and the column loops on the calling thread (the team sleeps through each layer's device work, and waking all of it four times a layer cost more than the loops); `0` = the default team everywhere, `N` = the mix on N threads. Same results whatever the team |
 | `DSV4_CUDA_HEAD_DEVICE` (unset) | exact-head device: unset tries the owning (last) device with room, then any other; set an ordinal to try that device first |
 | `DSV4_CUDA_HEAD_BATCH` (1) | batched exact head; `0` per-token |
 | `DSV4_HEAD_VERIFY` (0) | `1` checks the batched head against the per-token path (diagnostic) |
@@ -749,6 +757,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `DSV4_MOE_EXPERT_MAJOR` (1, `.cu`) | generic batched MoE: expert-major fp4 kernel (weights read once per chunk); `0` = one matvec per route; `_VERIFY=1` compares both bit for bit (keeps the per-route results, also with `0`) |
 | `DSV4_MOE_EM_TB` (auto, `.cu`) | routes per pass of the expert-major kernel: unset = 2 below 4 routes per routed expert in the chunk, else 4; `2`, `3`, `4` or `6` forces one (anything else is ignored with a warning) |
 | `DSV4_MM_WARP` (auto, `.cu`) | generic dense batch matmul, fp8 shapes whose I is a multiple of 256: warp-per-row kernel for I ≤ 1024 (unset, empty or `auto`), `1` = all of them, `0` = off; `DSV4_MM_WARP_VERIFY=1` compares bit for bit (keeps the old kernel's results, also with `0`) |
+| `DSV4_CUDA_ACT_QUANT` (1, `.cu`) | the generic 128-block fp8 calls (`dsv4_cuda_matvec`, `_matvec_grouped`, `_wo_decode`, `_proj_batch`, the generic `_matmul_batch`) round their input to E4M3 per 128 on the device first, as `coli_fp8_matvec_ref` does on the CPU; `0` = the raw input (the behaviour before) |
 | `V4_MOE_BATCH_PROF` (0) | `1` = one `moebprof` line per chunk-layer: switch (layer change: prefetch-worker wait, bank swap) / route / refill / compute ms |
 | `V4_GPU_RESIDENT_FIRST` (0) | `1` = decode computes VRAM-mirrored experts without an expert-store lookup, and the RAM pins skip them (VRAM adds to the RAM tier); off under `DSV4_HYBRID=1` |
 | `DSV4_CUDA_PEER_DEVICE` (unset) | second GPU for a decode mirror pool (peer access required; unused under `DSV4_HYBRID=1`) |
