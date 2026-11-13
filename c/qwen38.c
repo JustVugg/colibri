@@ -2280,10 +2280,13 @@ static int q38_ps_take(Model *m,const int *ids,int np,int held){
        !coli_ps_parts_hold(parts,nparts,P)){coli_ps_hit_free(&h);free(parts);return 0;}
     q38_prefix_settle(m);   /* the chain's prompt-end snapshot is the host's before the state moves */
     /* the whole blocks the slot holds already (its record shares them with the prompt; the MTP
-     * head's rows stand below its own length) stay in place, on the host and in the mirrors */
-    int keep=kv_prefix_common(&m->kvp,ids,np);
+     * head's rows stand below its own length) stay in place, on the host and in the mirrors. The
+     * head's row at common - 1 was made with the record's next token, not the prompt's: it goes too. */
+    const int common=kv_prefix_common(&m->kvp,ids,np);
+    int keep=common;
     if(keep>m->kv_len)keep=m->kv_len;
     if(m->mtp&&keep>m->mtp_len)keep=m->mtp_len;
+    if(m->mtp&&keep>common-1)keep=common-1;
     coli_ps_load_from(&g_q38_ps,&h,parts,nparts,keep);
     keep=coli_ps_kept(&g_q38_ps,&h,keep);
     free(parts);

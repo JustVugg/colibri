@@ -205,6 +205,28 @@ class Qwen38PrefixStoreTest(unittest.TestCase):
                 self.assertNotIn("from the store", log)
                 self.same(log, 1, chat(Q2), b, **env)
 
+    def test_mtp_head_row_where_the_slot_parts_from_the_prompt(self):
+        """The slot's record parts from the prompt exactly at a block's start (token 32: another system
+        prompt that ends "7;)" for "5;)"), so its MTP head row at 31 was made with the record's token 32,
+        not the prompt's. With the head on, a take keeps in place only the blocks below common - 1 (16
+        rows) and rewrites that row from the store; with it off both blocks stay (32). The answers are a
+        fresh read's either way."""
+        other = SYSTEM[:-3] + b"7;)"
+        for fixture, mtp, kept in (("plain", "0", 32), ("mtp", "1", 16)):
+            if fixture not in self.dirs:
+                continue
+            with self.subTest(mtp=mtp):
+                e = self.spawn(fixture=fixture, Q38_MTP=mtp)
+                e.ask("a1", chat(Q1), max_tok=6)
+                e.ask("x1", chat(Q2, system=other), max_tok=6)
+                b = e.ask("b1", chat(Q3), max_tok=6)
+                log = e.close()
+                took = re.findall(r"\[PREFIX\] (\d+) of \d+ prompt tokens from the store \(\d+ blocks of \d+ and a "
+                                  r"checkpoint, (\d+) rows in place", log)
+                self.assertTrue(took, log[-3000:])
+                self.assertEqual(took[-1], (str(ntok(SYSTEM)), str(kept)), log[-3000:])
+                self.same(log, 2, chat(Q3), b, fixture=fixture, Q38_MTP=mtp, logit_check=mtp == "0")
+
     def test_read_out_reads_everything(self):
         e = self.spawn()
         e.ask("a1", chat(Q1), max_tok=6)
