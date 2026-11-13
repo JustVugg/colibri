@@ -2485,6 +2485,7 @@ static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     int budget = q38_serve_budget(np, q->max_tok, max_ctx, q->logprobs > 0);
     if(budget < 0){
         printf("ERROR %s CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d\n",q->id,np,q->max_tok,max_ctx);
+        q38_vision_detach(m);   /* else the next request's rows at these positions would be the picture's */
         fflush(stdout); free(ids); return 0;
     }
     if(budget < q->max_tok){
