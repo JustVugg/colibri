@@ -38,6 +38,30 @@ static void tk(int ok, const char *what) {
     t_fails++;
 }
 
+/* The load's own steps, model_init then q38_tier_start, with the trunk placed on the
+ * fake tier: a placed matrix keeps only its int8 rows from then on (its BF16 rows freed
+ * at placement, not later in q38_trunk_cpu_int8), and resident_weight_bytes follows.
+ * Q38_TRUNK_CPU_INT8=0 (keep_bf16) leaves the BF16 rows and the count alone. */
+static void trunk_bf16_at_placement(int keep_bf16) {
+    Model m; model_init(&m, "./qwen38_tiny_fp8", 1, 8);
+    uint64_t expect = m.resident_weight_bytes;
+    q38_tier_start(&m, 1);
+    int placed = 0, bf16 = 0, q8 = 0;
+    for (int i = 0; i < g_trunk_n; i++) {
+        Q38Weight *w = g_trunk[i].w;
+        if (!w->gpu) continue;
+        placed++; bf16 += w->data != NULL; q8 += w->q8 != NULL;
+        if (!keep_bf16) expect = expect - q38_weight_bytes(w) + (uint64_t)w->rows * w->cols + (uint64_t)w->rows * sizeof(float);
+    }
+    tk(placed > 0 && placed == qt_dense_count(), "model_init + q38_tier_start placed the trunk");
+    tk(q8 == placed, "every placed matrix has its int8 rows");
+    if (keep_bf16) tk(bf16 == placed, "Q38_TRUNK_CPU_INT8=0: every placed matrix keeps its BF16 rows");
+    else tk(bf16 == 0, "every placed matrix's BF16 rows freed at placement");
+    tk(m.resident_weight_bytes == expect, "resident_weight_bytes counts int8 rows and scales for what was freed");
+    qt_shutdown();
+    q38_model_free(&m);
+}
+
 int main(int argc, char **argv_in) {
     /* the fixture: 4 layers x 4 experts, hidden 32, inter 8, top-2, all
      * routed experts native e4m3 with one 128x128 block scale per matrix */
@@ -117,6 +141,10 @@ int main(int argc, char **argv_in) {
     size_t budget_off = G.budget[0], trunk_off = G_trunk_bytes[0];
     qt_shutdown();
     tk(qt_dense_count() == 0, "dense handles released at shutdown");
+    trunk_bf16_at_placement(0);
+    setenv("Q38_TRUNK_CPU_INT8", "0", 1);
+    trunk_bf16_at_placement(1);
+    unsetenv("Q38_TRUNK_CPU_INT8");
 
     /* The same with COLI_CUDA_CHAIN=1: the chain's device memory (q38cc_reserve_bytes) is
      * offered as a component of its own before the FP8 tier sizes its expert budget, as on
