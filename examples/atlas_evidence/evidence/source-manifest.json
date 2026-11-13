@@ -1,0 +1,20 @@
+{
+  "schema": "atlas.evidence.source-manifest.v1",
+  "files": {
+    "examples/atlas_evidence/__init__.py": "b4ceb0a7e9facaa9e1ea8e3aa0dc177710ff01466177d7060e0ea6e574fbc030",
+    "examples/atlas_evidence/__main__.py": "f1d4620b1df711042ecb4c85f3d00e1f0f8ba23f4b9d1c6766e0d6f6b664ec29",
+    "examples/atlas_evidence/client.py": "2b2d2a513279ee345cbfad39b10352ebc207b62513b82438756b8825465a20a6",
+    "examples/atlas_evidence/core.py": "b20f235d0bccb884f5b53bb44b446c729ac7f60ff6135037a06ae0995c502794",
+    "examples/atlas_evidence/integrations.lock.json": "ff3d89e4c25ebf9a48931a86d0d98abf01ed0097b02ee6a8a4c76cabcb5a6588",
+    "examples/atlas_evidence/render.py": "f16f2bf31e55224c88025d5e9dd232769b0cb2b8cbf4d8680ad463f4fbf8d01b",
+    "examples/atlas_evidence/replay.py": "7f5918ea53bc403a5843eaf56772a774b245d585ffdc77f173ca97cc436abcef",
+    "examples/atlas_evidence/requirements.txt": "e4a4193d2297a0e74ea9d8432630f0383848ada083efebcba2bd4a5be13955ce",
+    "examples/atlas_evidence/tests/test_cli.py": "923dd4f75ed2b169bab83345cb0d9bf3dc03b34a9165a422cdb626d7bdc541a4",
+    "examples/atlas_evidence/tests/test_client.py": "02e1aac65b411920ccc962059ae2a6e638a30efa0045df697e9e26f8a9d7e2f5",
+    "examples/atlas_evidence/tests/test_core.py": "84ee2ac6763928540a426988d7d188f019538f33790057e290ba239a896f70d2",
+    "examples/atlas_evidence/tests/test_gateway.py": "58e5144f80c65e8e0441a8a10c4efceb10c05d46c007778f47c51fed2d5d91a1",
+    "examples/atlas_evidence/tests/test_regnav.py": "4ffcbd7448160a2eb5d791fac0aeb8435d3c95a39b68c804a31a2eb103e528c3",
+    "examples/atlas_evidence/tests/test_render.py": "73aead4e0b4418730e48b74db0a530ee3ab0bab958729998b7320072fa95f424",
+    "examples/atlas_evidence/tests/test_replay.py": "bcce0be1dadac55df611c7637f4bc4fbefe73f72b86e1062f54db5996736079a"
+  }
+}
