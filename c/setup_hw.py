@@ -68,20 +68,14 @@ def memory_from_windows_status(total_phys, avail_phys, avail_pagefile=None):
 
 
 def memory_from_darwin(memsize_text, vm_stat_text=""):
-    """hw.memsize plus the reclaimable pages of vm_stat (free, inactive,
-    speculative, purgeable), the engine's own definition of available."""
+    """hw.memsize plus what vm_stat says macOS can take back without compressing
+    or swapping (resource_plan.darwin_available_bytes, the planner's own rule)."""
+    from resource_plan import darwin_available_bytes
     try:
         total = int((memsize_text or "").strip())
     except ValueError:
         total = None
-    page_match = re.search(r"page size of (\d+) bytes", vm_stat_text or "")
-    page = int(page_match.group(1)) if page_match else 16384
-    pages = 0
-    for key in ("Pages free", "Pages inactive", "Pages speculative", "Pages purgeable"):
-        match = re.search(rf"{key}:\s+(\d+)\.", vm_stat_text or "")
-        if match:
-            pages += int(match.group(1))
-    return {"total": total, "available": pages * page if pages else None}
+    return {"total": total, "available": darwin_available_bytes(vm_stat_text)}
 
 
 def _windows_memory():
