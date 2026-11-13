@@ -758,7 +758,7 @@ checkpoint layout and the text-only capability boundary.
 | `Q38_DN_GPU` | `0` (off) | CUDA expert tier with the trunk in VRAM: a decode token runs every DeltaNet layer whose `dnqkv`, `dnz` and `dnout` sit on one card end to end on that card (conv, recurrence, gated norm; state resident in VRAM). See [qwen38.md](qwen38.md#the-deltanet-layer-on-the-card-q38_dn_gpu1). |
 | `COLI_MAP_EXPERTS` | `0` | Point the native-FP8 routed-expert slots (or the int4-g64 sidecar's records) at a read-only mapping of their shard instead of copying 14 MB per miss into a slab. Same variable as in `glm53`. |
 | `Q38_FP8_KERNEL` | vector | The routed experts' e4m3 blocks are decoded eight at a time in registers and multiplied with FMA (AVX2 builds); `scalar` restores `quant.h`'s table kernel, which differs only by float summation order inside a block. |
-| `COLI_TIMERS` | `0` (off) | Set to `1` for the detailed Qwen3.8 phase breakdown on stderr. The shared per-request `PROF` frame is emitted regardless. |
+| `COLI_TIMERS` | `0` (off) | Set to `1` for the detailed Qwen3.8 phase breakdown on stderr. In serve mode each request also prints its `request prefill` and `request decode` banks and one `experts:` line (RAM cache hits and disk reads, and with the CUDA tier its VRAM hit rate, uploads and swaps), prompt and decode apart. The shared per-request `PROF` frame is emitted regardless. |
 | `COLI_VULKAN` | `0` | `VK=1` build: the trunk on the Vulkan device, and the routed experts of the model's layers on the shared expert tier (`COLI_VK_TIER*`, `COLI_VK_DENSE`, see [Vulkan](#vulkan-any-gpu-with-a-vulkan-12-driver)); the MTP head's layer too on a discrete GPU (`COLI_VK_TIER_MTP`). |
 
 ## DeepSeek V4 engine (`deepseek_v4`)

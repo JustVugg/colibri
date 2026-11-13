@@ -2008,8 +2008,57 @@ static int q38_serve_budget(int np, int max_tok, int max_ctx, int read_only){
 }
 
 /* When a request was accepted, and the counters then: the DONE and PROF frames
- * report the request's share from them. */
-typedef struct { double started; uint64_t hits, misses; Q38Timers timers; } Q38ReqClock;
+ * report the request's share from them. The prefill_* fields are the same counters
+ * when the prompt had been read, where COLI_TIMERS=1 splits the request. */
+typedef struct {
+    double started; uint64_t hits, misses; Q38Timers timers; QtCounters qt;
+    uint64_t prefill_hits, prefill_misses; Q38Timers prefill_timers; QtCounters prefill_qt;
+} Q38ReqClock;
+
+static QtCounters q38_qt_delta(const QtCounters *after,const QtCounters *before){
+    QtCounters d={after->hits-before->hits,after->miss-before->miss,after->uploads-before->uploads,
+                  after->swaps-before->swaps,after->q_full_skips-before->q_full_skips};
+    return d;
+}
+
+/* Where a request's routed experts came from, the prompt ([0]) and the decode ([1]) apart:
+ * the RAM cache's hits and disk reads, and with the VRAM tier on its hit rate (a tier miss is
+ * an expert the CPU computed). One line with its newline; -1 when it does not fit. */
+static int q38_format_expert_split(char *out,size_t capacity,const char *id,const uint64_t ram_hits[2],
+                                   const uint64_t ram_misses[2],int tier_on,const QtCounters tier[2]){
+    int n=snprintf(out,capacity,"[qwen38] request %s experts: prefill RAM %llu hits, %llu disk | "
+                   "decode RAM %llu hits, %llu disk",id,(unsigned long long)ram_hits[0],
+                   (unsigned long long)ram_misses[0],(unsigned long long)ram_hits[1],
+                   (unsigned long long)ram_misses[1]);
+    if(n>=0&&(size_t)n<capacity&&tier_on)
+        n+=snprintf(out+n,capacity-(size_t)n," | VRAM hit rate: prefill %.1f %% (%llu hits, %llu CPU), "
+                    "decode %.1f %% (%llu hits, %llu CPU) | uploads %llu, swaps %llu, q_skips %llu",
+                    q38_cache_hit_percent(tier[0].hits,tier[0].miss),(unsigned long long)tier[0].hits,
+                    (unsigned long long)tier[0].miss,q38_cache_hit_percent(tier[1].hits,tier[1].miss),
+                    (unsigned long long)tier[1].hits,(unsigned long long)tier[1].miss,
+                    (unsigned long long)(tier[0].uploads+tier[1].uploads),
+                    (unsigned long long)(tier[0].swaps+tier[1].swaps),
+                    (unsigned long long)(tier[0].q_full_skips+tier[1].q_full_skips));
+    if(n>=0&&(size_t)n+1<capacity){out[n++]='\n';out[n]=0;return n;}
+    return -1;
+}
+
+/* COLI_TIMERS=1, after a request's "request" bank: its prefill and decode banks and where its
+ * experts came from. The process-wide prefill/decode banks (tm_report) print only at exit,
+ * which a serve process stopped by its gateway never reaches. */
+static void q38_report_request_split(const Model *m,const Q38ReqClock *clk,const char *id){
+    if(!q38_tm_enabled())return;
+    Q38Timers prefill=q38_tm_delta(&clk->prefill_timers,&clk->timers);
+    Q38Timers decode=q38_tm_delta(&m->timers,&clk->prefill_timers);
+    q38_tm_report_bank(&prefill,"request prefill");
+    q38_tm_report_bank(&decode,"request decode");   /* ms/forward here = per decode step */
+    QtCounters now,tier[2];int tier_on=qt_counters(&now);
+    tier[0]=q38_qt_delta(&clk->prefill_qt,&clk->qt);tier[1]=q38_qt_delta(&now,&clk->prefill_qt);
+    uint64_t ram_hits[2]={clk->prefill_hits-clk->hits,m->hits-clk->prefill_hits};
+    uint64_t ram_misses[2]={clk->prefill_misses-clk->misses,m->miss-clk->prefill_misses};
+    char line[512];
+    if(q38_format_expert_split(line,sizeof line,id,ram_hits,ram_misses,tier_on,tier)>0)fputs(line,stderr);
+}
 
 /* A request's prompt into the conversation the Model holds: its tokens and image,
  * the budget, ACCEPT, the pins and the prefix cache, the prefill and its read-out.
@@ -2519,7 +2568,7 @@ static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     }
     printf("ACCEPT %s %d\n",q->id,np); fflush(stdout);
     if(lone)q38_park_decide(m,ids,np,q->max_tok);   /* a conversation parked by the last request: back, kept or dropped */
-    clk->started=now_s(); clk->hits=m->hits; clk->misses=m->miss; clk->timers=m->timers;
+    clk->started=now_s(); clk->hits=m->hits; clk->misses=m->miss; clk->timers=m->timers; qt_counters(&clk->qt);
     /* Prima gli scatti CHIESTI, e il piu profondo: sono punti di ritorno che
      * il client ha dichiarato, e battono la cache automatica, che insegue solo
      * l'ultimo prompt. Se nessuno serve, si ricade su quella. */
@@ -2646,6 +2695,9 @@ static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     if(getenv("Q38_PREFIX_LOG"))
         fprintf(stderr,"[qwen38 prefix] request=%s reused=%d/%d\n",q->id,reuse,np);
     if(m->draft_vocab)draft_vocab_begin(m->draft_vocab,ids,np,reuse);
+    /* the prompt has been read: what follows is the decode's share of the request */
+    clk->prefill_hits=m->hits; clk->prefill_misses=m->miss; clk->prefill_timers=m->timers;
+    qt_counters(&clk->prefill_qt);
     *ids_out=ids; *np_out=np; *lo_out=lo;
     return 1;
 }
@@ -2753,6 +2805,7 @@ static int serve_one_turn(Model *m, ServeReq *q){
     }
     serve_hits(m);
     q38_tm_report_bank(&timers,"request");
+    q38_report_request_split(m,&clk,q->id);
     {char scope[96];snprintf(scope,sizeof scope,"turn %s",q->id);q38_spec_report(m,&spec,scope);q38_vocab_report(m,scope);}
     q38_spec_free(&spec);
     return input_eof?-1:0;
@@ -2855,6 +2908,7 @@ static void q38_mux_finish(Model *m,Q38MuxReq *r){
     fflush(stdout);
     serve_hits(m);
     q38_tm_report_bank(&timers,"request");
+    q38_report_request_split(m,&r->clk,r->q.id);
     /* the slot's conversation as the turn left it, for its next turn on another slot (one as long
      * as a parked one at least: COLI_PARK_MIN) */
     q38_mux_bind(m,r->q.slot);
