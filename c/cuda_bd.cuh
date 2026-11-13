@@ -1677,17 +1677,18 @@ static inline void bd_smem_raise(const void *k, size_t sm, size_t smem_max, unsi
  * wait), so one buffer serves every GEMV of the stream. NULL: none (the blocks quantize x). */
 /* what the scratch holds: x (S rows of I) at quantization, NULL when unknown */
 struct BdXqHeld { const float *x; int S, I; };
-/* bytes 0: no buffer asked for, the record alone (forgotten: bd_xq_forget) */
+static std::mutex g_bd_xq_mu;
+static struct { cudaStream_t st; int dev; void *p; size_t cap; BdXqHeld h; } g_bd_xq[16];
+static int g_bd_xq_n;
 static void *bd_xq_scratch(cudaStream_t st, size_t bytes, BdXqHeld **held = nullptr) {
-    static std::mutex mu;
-    static struct { cudaStream_t st; int dev; void *p; size_t cap; BdXqHeld h; } c[16];
-    static int n;
+    auto &c = g_bd_xq;
+    int &n = g_bd_xq_n;
     int dev = -1;
+    if (!bytes) return nullptr;
     if (cudaGetDevice(&dev) != cudaSuccess) { (void)cudaGetLastError(); return nullptr; }
-    std::lock_guard<std::mutex> lk(mu);
+    std::lock_guard<std::mutex> lk(g_bd_xq_mu);
     int i = 0;
     while (i < n && !(c[i].st == st && c[i].dev == dev)) i++;
-    if (!bytes) { if (i < n) c[i].h = {nullptr, 0, 0}; return nullptr; }
     if (i == n) { if (n == 16) return nullptr; c[n++] = {st, dev, nullptr, 0, {nullptr, 0, 0}}; }
     if (c[i].cap < bytes) {
         size_t cap = bytes < ((size_t)1 << 20) ? ((size_t)1 << 20) : bytes;   /* grown seldom: freeing waits for the device */
@@ -1704,7 +1705,13 @@ static void *bd_xq_scratch(cudaStream_t st, size_t bytes, BdXqHeld **held = null
  * without it forgets what the scratch holds (bd_xq_forget): a quantization is kept only through
  * matmuls each vouched for since it, whether or not they quantized */
 static thread_local int g_bd_x_same = 0;
-static void bd_xq_forget(cudaStream_t st) { (void)bd_xq_scratch(st, 0); }
+/* the stream's records forgotten on whatever device: a stream is one device's, and a record forgotten
+ * costs no more than its x quantized again. So a matmul does not ask for the device (cudaGetDevice
+ * every matmul: an R9700's runtime went from 2898 calls to 37989 in a 64-token request, #2757) */
+static void bd_xq_forget(cudaStream_t st) {
+    std::lock_guard<std::mutex> lk(g_bd_xq_mu);
+    for (int i = 0; i < g_bd_xq_n; i++) if (g_bd_xq[i].st == st) g_bd_xq[i].h = {nullptr, 0, 0};
+}
 /* x (S rows of I, packed) in the stream's scratch quantized: once, and again only when the scratch
  * held another x, or the caller did not vouch that x is unchanged since (g_bd_x_same). NULL: none */
 static const uint4 *bd_xq_quant(const float *x, int S, int I, cudaStream_t st) {
