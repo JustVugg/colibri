@@ -549,6 +549,61 @@ decode has grown its mirror cache; the mirrors that room holds back cost some
 decode speed, and the reserve drops back to one bank once the prefetch has
 turned itself off (`moe-double=off`).
 
+### A decode token's attention on the device (`V4_LAYER_FUSED`)
+
+Opt-in (`V4_LAYER_FUSED=1`). A decode token's attention layer, as the
+engine runs it without the switch, is several device round trips with host
+arithmetic between them: the projections one by one, the compressor and
+indexer steps on the host, the selection's scores downloaded and ranked on
+the host, the cached sparse attention, then the output projection. Under
+WDDM each round trip costs more than the kernels it launches. With the
+switch on the layer is one round trip:
+
+- the token's six projections (`wq_a`, `wkv`, the two compressors' and
+  the indexer's pairs) from one upload of the hidden state;
+- the query's norm and RoPE, the key row's norm, RoPE and FP8
+  quantize-dequantize, and the row entered into the device KV ring;
+- on a token that emits a compressed row, the row pooled from a device
+  mirror of the compressor state (`V4_LAYER_FUSED_EMIT`);
+- the indexer's query, its scores over the resident keys and the top-k,
+  as a bitonic rank with the host's tie order;
+- the cached sparse attention over the selected rows, inverse RoPE and
+  the grouped output projection.
+
+The whole sequence is captured as a CUDA graph per layer
+(`DSV4_LF_GRAPH`), so a token replays 43 graphs. A token the fused layer
+does not take (a refusal, a layer without mirrors) falls back to the
+chained forms it is built from (`V4_WO_CHAIN`, `V4_DECODE_PROJ6`), and
+from those to the paths the engine had before.
+
+Every step keeps the CPU reference's order of operations, including which
+products are fused, so the results are the CPU's bit for bit.
+`V4_LAYER_FUSED_VERIFY=1` runs the fused layer into side buffers beside
+the usual path and counts differing words per call (`lfverify`);
+`DSV4_WO_VERIFY=1` does the same for the chained tail (`woverify`).
+
+With the switch unset nothing changes: the new entry points are not
+called, and the kernels the existing entry points would otherwise pick up
+(the warp matvecs `DSV4_MV_WARP`, the cached sparse attention's second
+form `DSV4_SATTN_V2`, the coalesced indexer reads `DSV4_IDX_COAL`,
+`DSV4_IDX_TILE`) default to off. Each sub-switch has its own variable,
+which wins when set; unset, it follows `V4_LAYER_FUSED`.
+
+VRAM: the fused layer reads the plain bf16 compressor mirrors and its own
+resident indexer weights, so with it on the packed compressor copies
+(`DSV4_CUDA_COMPRESSOR`) and the resident indexer mirrors
+(`DSV4_CUDA_RESIDENT_INDEXER`) default to off: 769 MiB on V4 Flash that
+would be held unread. On a 16 GB card that is also what the prompt was
+short of: its attention then stays on the device.
+
+Measured on an RTX 5080 16 GB (Ryzen 9 5950X, Windows 11, `--memory-gb
+16`, V4 Flash, a 3,278-token prompt, 36 tokens, greedy, the same text in
+every run, three runs per setting): `decprof` attention 81.6 -> 20.1 ms
+per token, the 35 tokens after the first 22.81 -> 20.52 s, and 85.0 ->
+63.2 s to the first token (the 556 allocation failures of the prompt
+gone). Both verifiers clean over 1,505 calls each. The record is in
+`docs/experiments/v4-decode-attention-fused-2026-11-12/`.
+
 ### Decode on two GPUs (peer mirror pool) and VRAM-first lookups
 
 Decode mirrors routed experts in VRAM, but a mirror used to be an upload
@@ -928,6 +983,12 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `DSV4_CUDA_HEAD` (1) | exact vocabulary head on the GPU; `0` keeps it on the CPU |
 | `DSV4_CUDA_HEAD_LAZY` (1) | upload the exact head at the first head call, after the prompt, instead of at engine open, where its 1 GiB (2 while packing) is taken before the dense mirrors and the prefill bank are sized; `0` uploads at open |
 | `V4_HC_TEAM` (unset) | the OpenMP team of a decode token's hyper-connection steps: unset = the default team in a CPU run, and with the GPU tier on the mix on 6 threads and the column loops on the calling thread (the team sleeps through each layer's device work, and waking all of it four times a layer cost more than the loops); `0` = the default team everywhere, `N` = the mix on N threads. Same results whatever the team |
+| `V4_LAYER_FUSED` (0) | `1` = a decode token's attention layer in one device round trip, and under it the chained forms and shared kernels listed below; `0` = the engine as before |
+| `V4_LAYER_FUSED_VERIFY` (0), `DSV4_WO_VERIFY` (0) | `1` = run the fused layer (the chained tail) beside the usual path and count differing words per call (`lfverify`, `woverify`) |
+| `V4_LAYER_FUSED_EMIT`, `V4_WO_CHAIN`, `V4_DECODE_PROJ6`, `V4_DECODE_GPU_PROJ`, `V4_IDX_FUSED` (follow `V4_LAYER_FUSED`) | the parts of the device attention, each switchable on its own: the emitting tokens through the fused layer, the chained tail, the projections in one trip, the device projections, the fused layer's indexer on the device |
+| `DSV4_MV_WARP`, `DSV4_SATTN_V2`, `DSV4_IDX_COAL`, `DSV4_IDX_TILE` (follow `V4_LAYER_FUSED`) | backend kernels the existing entry points share with the device attention: a warp per row for the one-token matvecs, the cached sparse attention read once per selected row, the indexer's coalesced reads |
+| `DSV4_LF_GRAPH` (1), `DSV4_CHAIN_PACK` (1), `DSV4_PROJ_ONEDL` (1), `DSV4_SATTN_SPLIT` (1), `DSV4_SATTN_SPLIT_DS` (128), `DSV4_SATTN_HPB` (4), `DSV4_SATTN_HPB_PF` (16), `DSV4_IDX_HEADW` (2), `DSV4_IDX_SCORE_K` (8), `DSV4_IDX_PROJ_WARP` (0), `DSV4_MV_WARP_UNROLL` (1), `DSV4_MV_WARP_LUT` (1), `DSV4_CS_POOL_FMA` (1), `V4_COMP_EMIT_PAR` | shapes of those kernels, each measured at its default; all give the same results |
+| `DSV4_LF_KPROF`, `DSV4_LF_GPROF`, `DSV4_WO_KPROF`, `DSV4_PROJ_KPROF`, `DSV4_MV_WARP_VERIFY` (0) | per-kernel timers and checks of the device attention |
 | `DSV4_CUDA_HEAD_DEVICE` (unset) | exact-head device: unset tries the owning (last) device with room, then any other; set an ordinal to try that device first |
 | `DSV4_CUDA_HEAD_BATCH` (1) | batched exact head; `0` per-token |
 | `DSV4_HEAD_VERIFY` (0) | `1` checks the batched head against the per-token path (diagnostic) |

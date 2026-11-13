@@ -43,11 +43,17 @@ EXPORTS
     dsv4_cuda_matvec
     dsv4_cuda_matmul_batch
     dsv4_cuda_matmul_bf16_batch
+    dsv4_cuda_matmul_bf16_multi
+    dsv4_cuda_decode_proj_multi
+    dsv4_cuda_attn_decode_fused
     dsv4_cuda_sparse_attn_batch
     dsv4_cuda_sparse_attn_batch_cached
     dsv4_cuda_sparse_attn_batch_cached_idx
     dsv4_cuda_indexer_score_batch
     dsv4_cuda_fp8_ref_matmul
+    dsv4_cuda_indexer_resident
+    dsv4_cuda_indexer_keys_sync
+    dsv4_cuda_attn_decode_chain
     dsv4_cuda_proj_batch
     dsv4_cuda_proj_batch_release
     dsv4_cuda_wo_decode
