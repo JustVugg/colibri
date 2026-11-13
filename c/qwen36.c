@@ -10020,10 +10020,12 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     qt_stats_mark();
 #ifdef QWEN36_METAL_GRAPH
     if (snap_armed) qg_snapshot_taken(m, ids);
-    if (!m->graph)
+    if (!m->graph)   /* both copy the CPU engine's state */
 #endif
-    if (q->pin) pin_save(m, ids, np, lo);
-    else if (q->logprobs == 0) q36_pes_take(m, ids, np, lo);   /* its state after the first token: q36_pes_commit */
+    {
+        if (q->pin) pin_save(m, ids, np, lo);
+        else if (q->logprobs == 0) q36_pes_take(m, ids, np, lo);   /* its state after the first token: q36_pes_commit */
+    }
     clk->s_disk=m->t_disk; clk->s_attn=tm_sum(0)+tm_sum(1); clk->s_moe=tm_sum(2); clk->s_head=tm_sum(5);
     clk->hits=m->hits; clk->miss=m->miss;
     clk->t0=now_s();
