@@ -91,6 +91,7 @@ static struct {
     int nform, per_layer;
     uint8_t lform[VKT_MAX_LAYERS], lcls[VKT_MAX_LAYERS];
     int ncls, major;                   /* the room classes; the form most layers have */
+    size_t mpad_w[2], mpad_s[2];       /* the other forms' biggest tensors by role (tier_stage_expert_bytes_at) */
     size_t pad_w[VKT_FORMS][2], pad_s[VKT_FORMS][2];
     uint8_t fall[VKT_FORMS][VKT_FORMS], nfall[VKT_FORMS];
     int h_exact; size_t h_bytes, h_max;   /* the host pool's experts at their own forms' sizes (host_init): the average, the largest */
@@ -2822,6 +2823,7 @@ static int forms_per_layer(void) {
     for (int l = 0; l < T.main_layers; l++) count[T.lform[l]]++;
     for (int j = 0; j < T.nform; j++) if (j != 1 && count[j] > count[major]) major = j;
     T.ncls = 0; T.major = major;
+    memset(T.mpad_w, 0, sizeof T.mpad_w); memset(T.mpad_s, 0, sizeof T.mpad_s);
     for (int i = 0; i < T.nform; i++) {
         const int j = i == 0 ? major : i == major ? 0 : i;   /* the most common form first */
         if (j == 1 || !count[j]) continue;
@@ -2831,6 +2833,12 @@ static int forms_per_layer(void) {
         while (c < T.ncls && (T.pad_w[c][0] != wg || T.pad_s[c][0] != sg || T.pad_w[c][1] != wd || T.pad_s[c][1] != sd)) c++;
         if (c == T.ncls) { T.pad_w[c][0] = wg; T.pad_s[c][0] = sg; T.pad_w[c][1] = wd; T.pad_s[c][1] = sd; T.ncls++; }
         fcls[j] = c;
+        if (j != major) {
+            if (wg > T.mpad_w[0]) T.mpad_w[0] = wg;
+            if (sg > T.mpad_s[0]) T.mpad_s[0] = sg;
+            if (wd > T.mpad_w[1]) T.mpad_w[1] = wd;
+            if (sd > T.mpad_s[1]) T.mpad_s[1] = sd;
+        }
     }
     for (int l = 0; l < T.main_layers; l++) T.lcls[l] = (uint8_t)fcls[T.lform[l]];
     /* the classes whose rooms hold a class's tensors, the tightest first (pick_victim) */
@@ -2860,6 +2868,26 @@ static size_t tier_expert_bytes_at(size_t a) {
     unsigned long long sum = 0;
     for (int l = 0; l < T.main_layers; l++) sum += room[T.lcls[l]];
     return T.main_layers ? (size_t)((sum + (unsigned long long)T.main_layers - 1) / (unsigned long long)T.main_layers) : room[0];
+}
+
+/* A prompt chunk's staging (VktConfig.stage, vk_dmoe.h) takes one layer's host pool experts at a time,
+ * each at its own form's size, so its share of them is sized per expert as the rooms were before
+ * every form had a room of its own size: a layer of another form than most layers' at those forms'
+ * biggest tensors. The rooms' average left it short where a layer's forms are bigger than the
+ * average: Qwen3.8-Flash-Next UD-IQ2_XS (5 sizes) with a 6 GiB tier on an RTX PRO 4000 staged in
+ * 840 MiB instead of 1019, and its 3036-token prompt went from 262.5 to 255.4 tok/s. With one or two
+ * sizes this is the rooms' average (tier_expert_bytes_at). */
+static size_t tier_stage_expert_bytes_at(size_t a) {
+    if (!T.per_layer) return expert_bytes_at(T.c.hidden, T.c.inter, T.c.gate_up, T.c.down, a);
+    size_t r0 = 0, r1 = 0;
+    for (int k = 0; k < 3; k++) {
+        size_t w0 = T.pad_w[0][k == 2], s0 = T.pad_s[0][k == 2], w1 = T.mpad_w[k == 2], s1 = T.mpad_s[k == 2];
+        r0 += (w0 + a - 1) / a * a + (s0 + a - 1) / a * a;
+        r1 += (w1 + a - 1) / a * a + (s1 + a - 1) / a * a;
+    }
+    unsigned long long sum = 0;
+    for (int l = 0; l < T.main_layers; l++) sum += T.lform[l] != T.major ? r1 : r0;
+    return T.main_layers ? (size_t)((sum + (unsigned long long)T.main_layers - 1) / (unsigned long long)T.main_layers) : r0;
 }
 
 /* One main expert's bytes at its own layer's form (no room of a bigger one), on average over
@@ -3325,10 +3353,13 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
         long long per = (all - fit + T.main_layers - 1) / T.main_layers;
         per += per / 4;
         if (per > T.c.experts) per = T.c.experts;
-        if (T.c.stage && blocks && !(sg && *sg == '0') && pool && fit < all && per > 0 && fit - per >= 2) {
-            fit -= per; fit_raw -= per;
-            want -= (double)per * T.exp_bytes;
-            T.stage_room = (size_t)per * T.exp_bytes;
+        /* its bytes a layer's share at the staged experts' sizes, taken from the budget in main experts */
+        const size_t sexp = T.per_layer ? tier_stage_expert_bytes_at(coli_vk_buffer_alignment()) : T.exp_bytes;
+        const long long take = sexp > T.exp_bytes ? (long long)(((size_t)per * sexp + T.exp_bytes - 1) / T.exp_bytes) : per;
+        if (T.c.stage && blocks && !(sg && *sg == '0') && pool && fit < all && per > 0 && fit - take >= 2) {
+            fit -= take; fit_raw -= take;
+            want -= (double)take * T.exp_bytes;
+            T.stage_room = (size_t)per * sexp;
         }
     }
     /* Streaming (big prefill steps, see "streaming" above): COLI_VK_TIER_STREAM=0 turns
