@@ -522,6 +522,104 @@ static void bench_route(void) {
     T->free(lb); T->free(ib); T->free(wb);
 }
 
+/* ---- two staging banks: fetch_at, fetch_wait_at, fetch_done_at -------------------------------------- */
+/* What the forty-row staging test hands over: experts 1 and 5 (k 0 and 1) as planar blocks in host memory, the table of
+ * the residents, two banks of st bytes in one DEV buffer (a weight block of mb bytes, the scales of nsc floats from wa in
+ * a bank), the rows with their routes, and the reference of the MoE on them. */
+struct StageCase {
+    uint8_t *hw[2][3]; float *hs[2][3];
+    size_t mb, nsc, wa, st;
+    CcBuf *banks;
+    std::vector<CcExpert> tab;
+    CcMoe moe;
+    CcBuf *x, *ids, *w, *hid;
+    int rows, D;
+    const std::vector<float> *ref; double scale;
+};
+/* expert k in bank `at` of the table entry xp, and the copies that put it there */
+static void stage_expert(const StageCase &c, int k, int at, CcExpert &xp, std::vector<CcFetch> &f) {
+    const char *g = (const char *)T->dev_addr(c.banks) + at * c.st;
+    xp.g = g; xp.u = g + c.mb; xp.d = g + 2 * c.mb;
+    xp.gs = (const float *)(g + c.wa); xp.us = xp.gs + c.nsc; xp.ds = xp.gs + 2 * c.nsc; xp.planar = 1;
+    for (int j = 0; j < 3; j++) {
+        f.push_back({c.hw[k][j], at * c.st + j * c.mb, c.mb});
+        f.push_back({c.hs[k][j], at * c.st + c.wa + j * c.nsc * 4, c.nsc * 4});
+    }
+}
+/* whether the n bytes at dev are those at want: the copy that writes them has landed. A stream's copies land in order, so
+ * the last block of a fetch says the whole fetch. Polled; five seconds only keep a broken run from hanging. */
+static int landed(const char *dev, const void *want, size_t n) {
+    std::vector<unsigned char> got(n);
+    auto t0 = std::chrono::steady_clock::now();
+    do {
+        cudaMemcpy(got.data(), dev, n, cudaMemcpyDeviceToHost);
+        if (!memcmp(got.data(), want, n)) return 1;
+        std::this_thread::yield();
+    } while (std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5));
+    return 0;
+}
+struct ThreeLayers { int ok, b_landed, c_over_a; double err[3]; };
+/* Three layers on two banks: A's expert 1 in bank `first`, B's expert 5 in the other bank, C's expert 5 in bank `first`
+ * again, the MoE of each on the rows. The banks are zeroed first, so what the host sees land is this run's. The frame's
+ * compute is held at a flag the host raises, so what the copy stream does meanwhile can be seen: B's copy lands while A is
+ * still unread. With done_first, A's MoE is followed by fetch_done_at(first) as the engine does and C's copy waits for it;
+ * without it C's copy goes on to A's bank at once, and the host waits for that to land before it lets A read (the
+ * counter-proof: A must then come out wrong). */
+static ThreeLayers three_layers(StageCase &c, int first, int done_first) {
+    ThreeLayers r = {};
+    const int other = 1 - first;
+    std::vector<CcExpert> t[3] = {c.tab, c.tab, c.tab};
+    std::vector<CcFetch> f[3];
+    stage_expert(c, 0, first, t[0][2 + 1], f[0]);
+    stage_expert(c, 1, other, t[1][2 + 5], f[1]);
+    stage_expert(c, 1, first, t[2][2 + 5], f[2]);
+    CcBuf *tb[3], *yb[3], *gate = T->buf(64, CC_UP);
+    size_t yn = (size_t)c.rows * c.D;
+    int ok = gate != NULL;
+    for (int l = 0; l < 3; l++) { tb[l] = T->buf(t[l].size() * sizeof(CcExpert), CC_DEV); yb[l] = T->buf(yn * 4, CC_DEV); ok = ok && tb[l] && yb[l]; }
+    ok = ok && T->begin() && T->zero(c.banks, 0, 2 * c.st / 4);
+    for (int l = 0; l < 3 && ok; l++) ok = T->write(tb[l], 0, t[l].data(), t[l].size() * sizeof(CcExpert));
+    ok = ok && T->submit(1);
+    volatile unsigned *flag = ok ? (volatile unsigned *)T->ptr(gate) : NULL;
+    if (flag) *flag = 0;
+    ok = ok && T->begin() && T->fetch_at(c.banks, f[0].data(), (int)f[0].size(), first) && T->fetch_at(c.banks, f[1].data(), (int)f[1].size(), other) &&
+         T->wait_host(gate, 0, 1) &&
+         T->fetch_wait_at(first) && T->moe(tb[0], c.x, c.ids, c.w, c.hid, yb[0], NULL, &c.moe) && (!done_first || T->fetch_done_at(first)) &&
+         T->fetch_at(c.banks, f[2].data(), (int)f[2].size(), first) &&
+         T->fetch_wait_at(other) && T->moe(tb[1], c.x, c.ids, c.w, c.hid, yb[1], NULL, &c.moe) && T->fetch_done_at(other) &&
+         T->fetch_wait_at(first) && T->moe(tb[2], c.x, c.ids, c.w, c.hid, yb[2], NULL, &c.moe) && T->fetch_done_at(first);
+    if (flag) ok &= T->submit(0);
+    const char *base = ok ? (const char *)T->dev_addr(c.banks) : NULL;
+    size_t last = c.wa + 2 * c.nsc * 4;   /* the last block of an expert's copy: its down scales */
+    if (base) {
+        r.b_landed = landed(base + other * c.st + last, c.hs[1][2], c.nsc * 4);
+        if (!done_first) r.c_over_a = landed(base + first * c.st + last, c.hs[1][2], c.nsc * 4);
+    }
+    if (flag) { std::atomic_thread_fence(std::memory_order_seq_cst); *flag = 1; std::atomic_thread_fence(std::memory_order_seq_cst); }
+    r.ok = ok && T->finish();
+    for (int l = 0; l < 3; l++) r.err[l] = r.ok ? maxdiff(down(yb[l], yn).data(), c.ref->data(), yn) / c.scale : 1;
+    for (int l = 0; l < 3; l++) { T->free(tb[l]); T->free(yb[l]); }
+    T->free(gate);
+    return r;
+}
+/* the same test with each bank as the first and the third layer's: both banks' events gate a copy */
+static void test_two_banks(StageCase &c) {
+    char what[240];
+    for (int first = 0; first < 2; first++) {
+        ThreeLayers good = three_layers(c, first, 1);
+        if (good.err[0] >= 2e-3 || good.err[1] >= 2e-3 || good.err[2] >= 2e-3)
+            printf("  (two banks, first in %d: relative errors %.3g, %.3g, %.3g)\n", first, good.err[0], good.err[1], good.err[2]);
+        snprintf(what, sizeof what, "forty rows, three layers in two banks (the first and the third in bank %d): the other bank is copied while "
+                 "the first waits to be read, the third layer's copy waits for the first's fetch_done_at", first);
+        ck(good.ok && good.b_landed && good.err[0] < 2e-3 && good.err[1] < 2e-3 && good.err[2] < 2e-3, what);
+        ThreeLayers broken = three_layers(c, first, 0);
+        snprintf(what, sizeof what, "counter-proof: without fetch_done_at(%d) the third layer's copy lands on the first's bank before it is read "
+                 "(the check above fails)", first);
+        ck(broken.ok && broken.b_landed && broken.c_over_a && broken.err[0] >= 2e-3, what);
+    }
+    CcFetch one = {c.hw[0][0], 0, c.mb};
+    ck(!T->fetch_at(c.banks, &one, 1, 2) && !T->fetch_wait_at(2) && !T->fetch_done_at(-1), "a third bank refused");
+}
 int main(void) {
     int dev = 0;
     if (!coli_cuda_init(&dev, 1)) { printf("no CUDA device: skipped\n"); return 0; }
@@ -1526,6 +1624,13 @@ int main(void) {
                         ck(oks && e1 < 2e-3 && e2 < 2e-3, "forty rows, two experts staged into VRAM from host memory, twice in swapped places");
                         CcFetch bad = {hwv[0][0], 2 * st - 8, 16};
                         ck(!sg || !T->fetch(sg, &bad, 1), "a fetch past its buffer refused");
+                        if (base && T->size >= offsetof(ColiCudaChainOps, fetch_done_at) + sizeof T->fetch_done_at && T->fetch_at && T->fetch_wait_at && T->fetch_done_at) {
+                            StageCase sc = {};
+                            memcpy(sc.hw, hwv, sizeof sc.hw); memcpy(sc.hs, hsv, sizeof sc.hs);
+                            sc.mb = mb; sc.nsc = nsc; sc.wa = wa; sc.st = st; sc.banks = sg; sc.tab = tab; sc.moe = m3;
+                            sc.x = x2b; sc.ids = i2b; sc.w = w2b; sc.hid = h2b; sc.rows = S2; sc.D = D; sc.ref = &rf; sc.scale = sc2;
+                            test_two_banks(sc);
+                        } else printf("  (no fetch_at, fetch_wait_at and fetch_done_at in this backend: the two-bank test skipped)\n");
                         T->free(sg); T->free(t1b); T->free(t2b); T->free(y3b);
                     }
                     for (void *h : hosts) cudaFreeHost(h);
