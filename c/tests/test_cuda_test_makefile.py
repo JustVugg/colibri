@@ -1,12 +1,14 @@
 """Build-contract checks for the real-GPU MXFP4 correctness test."""
 import shutil
+import sys
 import subprocess
 import unittest
 from pathlib import Path
 
 
 HERE = Path(__file__).resolve().parent.parent
-MAKE = shutil.which("make")
+# GNU make: the BSDs' own make cannot read this Makefile, and they install GNU make as gmake.
+MAKE = shutil.which("gmake" if sys.platform.startswith(("freebsd", "openbsd", "netbsd", "dragonfly")) else "make")
 
 
 def cuda_test_recipe(*variables):

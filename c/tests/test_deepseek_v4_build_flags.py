@@ -21,6 +21,7 @@ without touching the tree.
 """
 import os
 import shutil
+import sys
 import subprocess
 import tempfile
 import time
@@ -28,7 +29,8 @@ import unittest
 from pathlib import Path
 
 C_DIR = Path(__file__).resolve().parent.parent
-MAKE = shutil.which("make")
+# GNU make: the BSDs' own make cannot read this Makefile, and they install GNU make as gmake.
+MAKE = shutil.which("gmake" if sys.platform.startswith(("freebsd", "openbsd", "netbsd", "dragonfly")) else "make")
 UNIT = "COLI_V4_UNIT_MATH.o"
 
 FAKE_CC = """#!/bin/sh
