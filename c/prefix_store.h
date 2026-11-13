@@ -29,9 +29,13 @@
  * changes (another KV element size) empties it.
  *
  * MEMORY. A budget in bytes, and the RAM the system has free: an entry that would leave less than
- * COLI_PS_RAM_FLOOR_MB free goes only if older ones make the room. The least recently used goes
- * first, a checkpoint or a block nothing follows (a block other blocks or checkpoints follow stays
- * while they do). */
+ * COLI_PS_RAM_FLOOR_MB free goes only if older ones make the room (the floor holds across a whole
+ * save, every entry it adds counted). The least recently used goes first, a checkpoint or a block
+ * nothing follows (a block other blocks or checkpoints follow stays while they do); between
+ * checkpoints used at once the deeper. A chain's shallowest checkpoint (where its system prompt
+ * ends: what every new conversation on it takes) is used whenever the chain is, so it goes last
+ * while its chain is in use. A save whose chain and state the budget cannot hold is refused before
+ * it evicts anything, and a save that fails takes back the blocks it added. */
 #ifndef COLI_PREFIX_STORE_H
 #define COLI_PREFIX_STORE_H
 
@@ -175,6 +179,11 @@ static inline size_t coli_ps_span(const ColiPsPart *parts, int nparts, int n) {
     for (int p = 0; p < nparts; p++) b += (size_t)(n / coli_ps_per(&parts[p])) * parts[p].row * (size_t)parts[p].heads;
     return b;
 }
+/* What a checkpoint at P costs the store with its whole chain: every position's rows and token, and
+ * the state. A budget under it can never keep that checkpoint. */
+static inline size_t coli_ps_cost(const ColiPsPart *parts, int nparts, int P, size_t state_bytes) {
+    return coli_ps_span(parts, nparts, P) + (size_t)P * sizeof(int) + state_bytes;
+}
 /* The layout of the parts; a store kept for another one is emptied first. 0 when a part's group
  * does not divide the block: then nothing is kept or taken. */
 static inline int coli_ps_layout(ColiPrefixStore *s, const ColiPsPart *parts, int nparts) {
@@ -210,27 +219,48 @@ static inline int coli_ps_parts_hold(const ColiPsPart *parts, int nparts, int n)
     return 1;
 }
 
-/* The oldest entry nothing follows goes; 0 when there is none. */
+/* The oldest entry nothing follows goes (of checkpoints used at once, the deeper); 0 when there is none. */
 static inline int coli_ps_evict_one(ColiPrefixStore *s) {
-    int bi = -1, ci = -1; uint64_t bu = UINT64_MAX, cu = UINT64_MAX;
-    for (int i = 0; i < s->nck; i++) if (s->ck[i].live && s->ck[i].used < cu) { cu = s->ck[i].used; ci = i; }
+    int bi = -1, ci = -1, cp = -1; uint64_t bu = UINT64_MAX, cu = UINT64_MAX;
+    for (int i = 0; i < s->nck; i++) {
+        const ColiPsCkpt *c = &s->ck[i];
+        const int P = c->depth * s->B + c->tail;
+        if (c->live && (c->used < cu || (c->used == cu && P > cp))) { cu = c->used; ci = i; cp = P; }
+    }
     for (int i = 0; i < s->nblk; i++) if (s->blk[i].live && !s->blk[i].refs && s->blk[i].used < bu) { bu = s->blk[i].used; bi = i; }
     if (ci < 0 && bi < 0) return 0;
     if (ci >= 0 && (bi < 0 || cu <= bu)) coli_ps_ckpt_drop(s, ci); else coli_ps_block_drop(s, bi);
     s->evicted++;
     return 1;
 }
-/* room for `need` more bytes: the budget, and the free RAM's floor (avail_mb < 0: not known) */
-static inline int coli_ps_room(ColiPrefixStore *s, size_t need, double avail_mb) {
+/* room for `need` more bytes: the budget, and the free RAM's floor (*avail_mb < 0: not known), which
+ * the bytes evicted raise and the `need` granted lowers, so it holds across a whole save */
+static inline int coli_ps_room(ColiPrefixStore *s, size_t need, double *avail_mb) {
     const double floor_mb = COLI_PS_RAM_FLOOR_MB;
     for (;;) {
         int over = s->bytes + need > s->budget;
-        if (!over && avail_mb >= 0 && avail_mb - (double)need / 1048576.0 < floor_mb) over = 2;
-        if (!over) return 1;
+        if (!over && *avail_mb >= 0 && *avail_mb - (double)need / 1048576.0 < floor_mb) over = 2;
+        if (!over) { if (*avail_mb >= 0) *avail_mb -= (double)need / 1048576.0; return 1; }
         size_t before = s->bytes;
         if (!coli_ps_evict_one(s)) return 0;
-        if (over == 2) avail_mb += (double)(before - s->bytes) / 1048576.0;
+        if (*avail_mb >= 0) *avail_mb += (double)(before - s->bytes) / 1048576.0;
     }
+}
+/* The shallowest checkpoint at most P on the chain that ends at block cur (d blocks) with ids'
+ * tokens, used now: where a system prompt ends, every conversation on it parts there, so it stays
+ * while its chain is in use, past the deeper checkpoints of older turns. */
+static inline void coli_ps_touch_root(ColiPrefixStore *s, int cur, int d, const int *ids, int P) {
+    int root = -1, rootP = P + 1;
+    for (int i = 0; i < s->nck; i++) {
+        const ColiPsCkpt *c = &s->ck[i];
+        const int cp = c->depth * s->B + c->tail;
+        if (!c->live || c->depth > d || cp >= rootP) continue;
+        int b = cur;
+        for (int k = d; k > c->depth; k--) b = s->blk[b].parent;   /* the chain's block at depth c->depth - 1 */
+        if (b != c->base || (c->tail && memcmp(c->ttok, ids + (size_t)c->depth * s->B, (size_t)c->tail * sizeof(int)))) continue;
+        root = i; rootP = cp;
+    }
+    if (root >= 0) s->ck[root].used = s->tick;
 }
 
 /* Fewer positions than this past what the slot holds are not worth a load (the rows of every
@@ -272,6 +302,7 @@ static inline int coli_ps_lookup(ColiPrefixStore *s, const int *ids, int n, int 
         s->tick++;
         for (int k = 0; k < bestd; k++) s->blk[h->path[k]].used = s->tick;
         if (bestck >= 0) s->ck[bestck].used = s->tick;
+        coli_ps_touch_root(s, bestd > 0 ? h->path[bestd - 1] : -1, bestd, ids, bestP);
     }
     return bestP;
 }
@@ -297,54 +328,73 @@ static inline int coli_ps_kept(const ColiPrefixStore *s, const ColiPsHit *h, int
     return (k < h->depth ? k : h->depth) * s->B;
 }
 
+/* A save that failed takes back the n blocks it added, the last of the chain that ends at cur:
+ * without their checkpoint they are only RAM. */
+static inline void coli_ps_unwind(ColiPrefixStore *s, int cur, int n) {
+    while (n-- > 0 && cur >= 0) { const int p = s->blk[cur].parent; coli_ps_block_drop(s, cur); cur = p; }
+}
+
 /* Keep ids[0, P) with the parts' rows of those positions and, when state is not NULL, a checkpoint
  * at P (the store owns state from here on, and frees it if it cannot keep it). Whole blocks the
  * store has already are not copied again; a checkpoint at the same prefix is replaced. 1 when kept;
- * avail_mb: the system's free RAM in MiB (< 0: not known). */
+ * avail_mb: the system's free RAM in MiB as the engine calls (< 0: not known); every entry the save
+ * adds, the state included, is counted against it. A chain and state over the budget are refused
+ * before anything is evicted; a checkpoint that cannot be kept takes the blocks its save added with
+ * it. */
 static inline int coli_ps_save(ColiPrefixStore *s, const int *ids, int P, const ColiPsPart *parts, int nparts,
                                void *state, size_t state_bytes, void (*state_free)(void *), double avail_mb) {
-    if (!s->on || P < 1 || !coli_ps_parts_hold(parts, nparts, P) || !coli_ps_layout(s, parts, nparts)) {
+    if (!s->on || P < 1 || !coli_ps_parts_hold(parts, nparts, P) || !coli_ps_layout(s, parts, nparts) ||
+        coli_ps_cost(parts, nparts, state ? P : P / s->B * s->B, state ? state_bytes : 0) > s->budget) {
         if (state && state_free) state_free(state);
         return 0;
     }
     const int B = s->B, nd = P / B, tail = P - nd * B;
     const size_t bb = s->blk_bytes;
-    uint64_t key = coli_ps_root_key(); int cur = -1, ok = 1;
+    uint64_t key = coli_ps_root_key(); int cur = -1, ok = 1, d = 0, added = 0;
     s->tick++;
-    for (int d = 0; d < nd && ok; d++) {
+    for (; d < nd; d++) {   /* the blocks the store has */
         const int *tk = ids + (size_t)d * B;
         uint64_t k = coli_ps_key(key, tk, B);
         int b = coli_ps_find(s, cur, k, tk);
-        if (b < 0) {
-            if (cur >= 0) s->blk[cur].refs++;   /* held while the new block is made: the room may evict leaves */
-            ok = coli_ps_room(s, bb + (size_t)B * sizeof(int), avail_mb);
-            if (cur >= 0) s->blk[cur].refs--;
-            if (!ok) break;
-            for (b = 0; b < s->nblk && s->blk[b].live; b++) {}
-            if (b == s->nblk) {
-                if (s->nblk == s->cblk) {
-                    int nc = s->cblk ? 2 * s->cblk : 64;
-                    ColiPsBlock *g = (ColiPsBlock *)realloc(s->blk, (size_t)nc * sizeof *g);
-                    if (!g) { ok = 0; break; }
-                    memset(g + s->cblk, 0, (size_t)(nc - s->cblk) * sizeof *g);
-                    s->blk = g; s->cblk = nc;
-                }
-                s->nblk++;
-            }
-            ColiPsBlock *x = &s->blk[b];
-            x->tok = (int *)malloc((size_t)B * sizeof(int)); x->rows = malloc(bb);
-            if (!x->tok || !x->rows) { free(x->tok); free(x->rows); memset(x, 0, sizeof *x); ok = 0; break; }
-            memcpy(x->tok, tk, (size_t)B * sizeof(int));
-            coli_ps_rows(parts, nparts, d * B, B, (char *)x->rows, 1);
-            x->parent = cur; x->key = k; x->bytes = bb + (size_t)B * sizeof(int); x->live = 1;
-            if (cur >= 0) s->blk[cur].refs++;
-            s->bytes += x->bytes; s->blocks_new++;
-            coli_ps_ht_put(s, k, b);
-        }
+        if (b < 0) break;
         s->blk[b].used = s->tick;
         cur = b; key = k;
     }
-    if (!ok || !state) { if (state && state_free) state_free(state); return ok && !state; }
+    coli_ps_touch_root(s, cur, d, ids, P);   /* before anything is evicted for this save */
+    for (; d < nd; d++) {   /* the rest, new: past a new block nothing is stored */
+        const int *tk = ids + (size_t)d * B;
+        uint64_t k = coli_ps_key(key, tk, B);
+        if (cur >= 0) s->blk[cur].refs++;   /* held while the new block is made: the room may evict leaves */
+        ok = coli_ps_room(s, bb + (size_t)B * sizeof(int), &avail_mb);
+        if (cur >= 0) s->blk[cur].refs--;
+        if (!ok) break;
+        int b;
+        for (b = 0; b < s->nblk && s->blk[b].live; b++) {}
+        if (b == s->nblk) {
+            if (s->nblk == s->cblk) {
+                int nc = s->cblk ? 2 * s->cblk : 64;
+                ColiPsBlock *g = (ColiPsBlock *)realloc(s->blk, (size_t)nc * sizeof *g);
+                if (!g) { ok = 0; break; }
+                memset(g + s->cblk, 0, (size_t)(nc - s->cblk) * sizeof *g);
+                s->blk = g; s->cblk = nc;
+            }
+            s->nblk++;
+        }
+        ColiPsBlock *x = &s->blk[b];
+        x->tok = (int *)malloc((size_t)B * sizeof(int)); x->rows = malloc(bb);
+        if (!x->tok || !x->rows) { free(x->tok); free(x->rows); memset(x, 0, sizeof *x); ok = 0; break; }
+        memcpy(x->tok, tk, (size_t)B * sizeof(int));
+        coli_ps_rows(parts, nparts, d * B, B, (char *)x->rows, 1);
+        x->parent = cur; x->key = k; x->bytes = bb + (size_t)B * sizeof(int); x->live = 1; x->used = s->tick;
+        if (cur >= 0) s->blk[cur].refs++;
+        s->bytes += x->bytes; s->blocks_new++; added++;
+        coli_ps_ht_put(s, k, b);
+        cur = b; key = k;
+    }
+    if (!ok || !state) {
+        if (state) { coli_ps_unwind(s, cur, added); if (state_free) state_free(state); }
+        return ok && !state;
+    }
     /* the checkpoint: one at the same prefix goes first */
     for (int i = 0; i < s->nck; i++) {
         ColiPsCkpt *c = &s->ck[i];
@@ -353,15 +403,15 @@ static inline int coli_ps_save(ColiPrefixStore *s, const int *ids, int P, const 
     }
     const size_t tb = coli_ps_span(parts, nparts, tail), need = tb + (size_t)tail * sizeof(int) + state_bytes;
     if (cur >= 0) s->blk[cur].refs++;
-    ok = coli_ps_room(s, need, avail_mb);
+    ok = coli_ps_room(s, need, &avail_mb);
     if (cur >= 0) s->blk[cur].refs--;
-    if (!ok) { if (state_free) state_free(state); return 0; }
+    if (!ok) goto fail;
     int c; for (c = 0; c < s->nck && s->ck[c].live; c++) {}
     if (c == s->nck) {
         if (s->nck == s->cck) {
             int nc = s->cck ? 2 * s->cck : 32;
             ColiPsCkpt *g = (ColiPsCkpt *)realloc(s->ck, (size_t)nc * sizeof *g);
-            if (!g) { if (state_free) state_free(state); return 0; }
+            if (!g) goto fail;
             memset(g + s->cck, 0, (size_t)(nc - s->cck) * sizeof *g);
             s->ck = g; s->cck = nc;
         }
@@ -370,7 +420,7 @@ static inline int coli_ps_save(ColiPrefixStore *s, const int *ids, int P, const 
     ColiPsCkpt *x = &s->ck[c];
     x->ttok = tail ? (int *)malloc((size_t)tail * sizeof(int)) : NULL;
     x->trows = tail ? malloc(tb) : NULL;
-    if (tail && (!x->ttok || !x->trows)) { free(x->ttok); free(x->trows); memset(x, 0, sizeof *x); if (state_free) state_free(state); return 0; }
+    if (tail && (!x->ttok || !x->trows)) { free(x->ttok); free(x->trows); memset(x, 0, sizeof *x); goto fail; }
     if (tail) { memcpy(x->ttok, ids + (size_t)nd * B, (size_t)tail * sizeof(int)); coli_ps_rows(parts, nparts, nd * B, tail, (char *)x->trows, 1); }
     x->base = cur; x->depth = nd; x->tail = tail;
     x->state = state; x->state_bytes = state_bytes; x->state_free = state_free;
@@ -378,6 +428,10 @@ static inline int coli_ps_save(ColiPrefixStore *s, const int *ids, int P, const 
     if (cur >= 0) s->blk[cur].refs++;
     s->bytes += need; s->saves++;
     return 1;
+fail:
+    coli_ps_unwind(s, cur, added);
+    if (state_free) state_free(state);
+    return 0;
 }
 
 static inline int coli_ps_live_blocks(const ColiPrefixStore *s) { int n = 0; for (int i = 0; i < s->nblk; i++) n += s->blk[i].live; return n; }
