@@ -200,9 +200,6 @@ static void share_trunk(Model *to, const Model *from) {
     }
 }
 
-/* The lm_head computes on the card and one copy takes its logits to the host's buffer: no matmul of
- * the chain's steps stores through the bus, and the logits equal the CPU path's after a prompt read
- * in chunks, a decode token and a verify whose three logits rows lie in two chunks. */
 /* the MTP head of section H (E routed experts, the whole vocabulary), on */
 static void mtp_head(void) {
     uint32_t ms = 99;
@@ -254,6 +251,9 @@ static int probe(int S, int cpu) {
 }
 #endif
 
+/* The lm_head computes on the card and one copy takes its logits to the host's buffer: no matmul of
+ * the chain's steps stores through the bus, and the logits equal the CPU path's after a prompt read
+ * in chunks, a decode token and a verify whose three logits rows lie in two chunks. */
 static void head_logits_on_the_card(Weights *w, const Model *shared, const int *ids) {
     g_q36_mtp.on = 0; memset(&g_q36_mc, 0, sizeof g_q36_mc);   /* section H's MTP head is not part of these steps */
     Model r, m; build_model(&r, w); build_model(&m, w);
