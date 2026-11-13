@@ -2015,6 +2015,8 @@ extern "C" int dsv4_cuda_upload_compressor(Dsv4CudaTensor **pt,const uint16_t *w
     t->bytes+=bytes;*pt=t;return 1;
 }
 
+extern "C" int dsv4_cuda_head_exact_available(void){return 1;}
+
 extern "C" int dsv4_cuda_upload_head_exact(Dsv4CudaTensor **pt,const uint16_t *w,int O,int I,int device){
     if(!pt||*pt||!w||O<1||O%32||I<1||I%8)return 0;
     Dev *c=ctx(device);if(!c||!ok(cudaSetDevice(device),"select head device"))return 0;
