@@ -1316,7 +1316,7 @@ expert-group-rows-test: tests/test_expert_group_rows_cuda.cu backend_cuda.cu bac
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_expert_group_rows_cuda.cu -o expert_group_rows_test$(EXE) $(GPU_TEST_LIBS)
 	./expert_group_rows_test$(EXE)
 
-cuda-test: tests/test_mxfp4_expert_cuda.cu backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu tests/test_cuda_fmt_trap_cuda.cu tests/test_alloc_footprint_cuda.cu tests/test_cuda_init_failure.cu tests/test_expert_group_rows_cuda.cu
+cuda-test: tests/test_mxfp4_expert_cuda.cu tests/test_mxfp4_group_cuda.cu backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu tests/test_cuda_fmt_trap_cuda.cu tests/test_alloc_footprint_cuda.cu tests/test_cuda_init_failure.cu tests/test_expert_group_rows_cuda.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	./backend_cuda_test$(EXE)
@@ -1389,6 +1389,10 @@ cuda-test: tests/test_mxfp4_expert_cuda.cu backend_cuda.cu backend_cuda.h fp8_fo
 	./mxfp4_cuda_test$(EXE)
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_mxfp4_expert_cuda.cu $(if $(filter 1,$(HIP)),-x none) tests/mxfp4_ref.o -o mxfp4_expert_cuda_test$(EXE) $(GPU_TEST_LIBS)
 	./mxfp4_expert_cuda_test$(EXE)
+	# fmt=7 expert groups (grouped_hidden_mx4_dual / grouped_down_mx4): the sync, pinned and
+	# issue/take calls against the expert MLP through quant.h, K%32==0 and short K, 1-9 rows
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_mxfp4_group_cuda.cu $(if $(filter 1,$(HIP)),-x none) tests/mxfp4_ref.o -o mxfp4_group_cuda_test$(EXE) $(GPU_TEST_LIBS)
+	./mxfp4_group_cuda_test$(EXE)
 	# Allocator footprint (#687): what a cudaMalloc really takes off the card,
 	# which is what the expert tier has to be charged rather than the logical
 	# byte count. Runs LAST on purpose - it is the only test here that
