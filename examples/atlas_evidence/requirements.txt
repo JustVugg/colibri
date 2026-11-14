@@ -1,0 +1,3 @@
+# Optional durable replay integration; the basic demo/checker uses only stdlib.
+# MIT-licensed Atlas Reweave, pinned to the source verified for this example.
+atlas-reweave @ git+https://github.com/Albertito-AI/atlas-reweave.git@7242490af31dc0d805c48b79209414d711b40d7b
