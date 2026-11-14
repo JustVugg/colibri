@@ -1286,14 +1286,16 @@ static float gq_dot_i8(const int8_t *w8, const float *sw, const float *mw, int h
 }
 
 static int gq_exact_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("GQ_EXACT"); v = e && *e && *e != '0'; } return v; }
-/* C18: decode-once grid dots (Q36_EXPERT_DEC1=1, off by default). The ARM fused grid
- * kernel keeps a weight row in registers but re-runs the grid decode once per activation
- * row; on a prompt that decode is 27-40% of the kernel and its interleaving with the dot
- * caps the whole engine at ~115 GFLOPS aggregate. The decode-once path decodes each row
- * once into int8 + per-32 scales, then runs the fused kernel's exact float steps against
- * every activation row (same bits: microbenchmark precheck maxdiff 0.0). Decode (S==1)
- * keeps the fused kernel: there the register-resident decode wins. */
-static int gq_dec1(void) { static int v = -1; if (v < 0) { const char *e = getenv("Q36_EXPERT_DEC1"); v = e && *e == '1'; } return v; }
+/* C18: decode-once grid dots — DEFAULT ON since the 2026-11-14 A/B (sha-identical
+ * outputs, paired prefill_moe_s −33% to −49%, decode unchanged within drift).
+ * Q36_EXPERT_DEC1=0 restores the fused grid kernel. The ARM fused grid kernel keeps
+ * a weight row in registers but re-runs the grid decode once per activation row; on
+ * a prompt that decode is 27-40% of the kernel and its interleaving with the dot
+ * caps the whole engine at ~115 GFLOPS aggregate. The decode-once path decodes each
+ * row once into int8 + per-32 scales, then runs the fused kernel's exact float steps
+ * against every activation row (same bits: microbenchmark precheck maxdiff 0.0).
+ * Decode (S==1) keeps the fused kernel: there the register-resident decode wins. */
+static int gq_dec1(void) { static int v = -1; if (v < 0) { const char *e = getenv("Q36_EXPERT_DEC1"); v = !(e && *e == '0'); } return v; }
 
 /* Q8_0 needs no unpack: the block already is 32 int8 codes and one scale. */
 static inline float gq_dot_q8_0(const uint8_t *row, const int8_t *xq, const float *dx, int64_t n) {

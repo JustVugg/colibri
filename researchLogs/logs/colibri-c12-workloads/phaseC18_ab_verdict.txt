@@ -1,0 +1,40 @@
+sha r1_12k: ['8cf3e944e430'] OK
+sha r1_4k_a: ['a8aaa8ef0bf0'] OK
+sha r1_4k_b: ['a8aaa8ef0bf0'] OK
+sha r2_12k: ['8cf3e944e430'] OK
+sha r2_4k_a: ['a8aaa8ef0bf0'] OK
+sha r2_4k_b: ['a8aaa8ef0bf0'] OK
+sha gate: PASS
+
+paired prefill_moe_s (base -> dec1):
+  r1 4k_a: 96.6 -> 65.0 s  (+32.7%)
+  r2 4k_a: 135.4 -> 69.7 s  (+48.5%)
+  4k_a mean: +40.6%
+  r1 4k_b: 115.4 -> 66.1 s  (+42.7%)
+  r2 4k_b: 140.3 -> 71.8 s  (+48.8%)
+  4k_b mean: +45.7%
+  r1 12k: 347.1 -> 207.5 s  (+40.2%)
+  r2 12k: 409.7 -> 213.3 s  (+47.9%)
+  12k mean: +44.1%
+
+paired prefill_s / attention / deltanet / ttft:
+  r1 4k_a: prefill 145.1 -> 131.1 s  attn 21.6 -> 31.2  dn 26.3 -> 34.0  ttft 145.1 -> 131.1
+  r2 4k_a: prefill 208.1 -> 141.4 s  attn 34.6 -> 34.4  dn 37.0 -> 36.3  ttft 208.1 -> 141.4
+  r1 4k_b: prefill 176.9 -> 132.5 s  attn 28.2 -> 31.2  dn 32.5 -> 34.2  ttft 176.9 -> 132.5
+  r2 4k_b: prefill 215.0 -> 146.2 s  attn 35.4 -> 35.5  dn 38.2 -> 37.8  ttft 215.1 -> 146.2
+  r1 12k: prefill 681.1 -> 587.9 s  attn 234.4 -> 265.7  dn 97.0 -> 111.7  ttft 681.1 -> 587.9
+  r2 12k: prefill 801.1 -> 608.6 s  attn 270.6 -> 274.4  dn 117.7 -> 117.7  ttft 801.2 -> 608.6
+
+decode_tokens_per_sec:
+  base_r1_12k: 6.706949923198001
+  base_r1_4k_a: 9.790738029014182
+  base_r1_4k_b: 9.722076222278867
+  base_r2_12k: 6.405548533990118
+  base_r2_4k_a: 8.327435628612506
+  base_r2_4k_b: 8.210617589439362
+  dec1_r1_12k: 6.111799671746086
+  dec1_r1_4k_a: 9.095640660903618
+  dec1_r1_4k_b: 9.149478044749793
+  dec1_r2_12k: 6.002754055559886
+  dec1_r2_4k_a: 8.399444516156818
+  dec1_r2_4k_b: 8.314593740278116
