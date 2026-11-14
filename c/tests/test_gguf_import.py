@@ -1081,7 +1081,59 @@ def write_inkling2(path, t, experts="F32", dense="F32"):
     return held
 
 
-def write_inkling2_pair(root, experts="F32", seed=11, dense="F32"):
+INK2V = dict(D=32, L=2, H=2, I=64, P=4, M=2, G=4, PROJ=64, IMG=292)   # IMG: the picture's token, past the unpadded vocabulary
+
+
+def write_inkling2_mmproj(path, rng):
+    """A tiny vision tower as unsloth's mmproj-*.gguf lays Inkling-2's out (architecture clip,
+    projector inkling2, v.* and mm.* names, the patch embedding a convolution [D][3][P][P], the
+    matrices F16). Returns its tensors under the checkpoint's names as the file gives them back,
+    and the checkpoint's vision_config."""
+    g = INK2V
+    D, L, H, I, P, M, G, PROJ = g["D"], g["L"], g["H"], g["I"], g["P"], g["M"], g["G"], g["PROJ"]
+    r = lambda *s, std=0.08, base=0.0: (base + rng.standard_normal(s) * std).astype(np.float32)
+    w = gguf.GGUFWriter(str(path), "clip")
+    w.add_string("clip.projector_type", "inkling2"); w.add_bool("clip.has_vision_encoder", True)
+    for key, v in (("patch_size", P), ("embedding_length", D), ("feed_forward_length", I), ("block_count", L),
+                   ("attention.head_count", H), ("projector.scale_factor", M), ("image_size", P * G),
+                   ("projection_dim", INK2["D"])):
+        w.add_uint32("clip.vision." + key, v)
+    w.add_float32("clip.vision.attention.layer_norm_epsilon", 1e-5)
+    held, V = {}, "model.visual."
+    def mat(name, hf, a):
+        q = np.ascontiguousarray(a).astype(np.float16)
+        w.add_tensor(name, q); held[hf] = q.astype(np.float32)
+    def vec(name, hf, a):
+        w.add_tensor(name, np.ascontiguousarray(a, dtype=np.float32)); held[hf] = a
+    vec("v.class_embd", V + "backbone.embeddings.class_embedding", r(D, std=0.3))
+    vec("v.class_pos_embd", V + "backbone.embeddings.cls_position_embedding", r(D, std=0.3))
+    conv = r(D, 3, P, P, std=0.1).astype(np.float16)   # the file's; the checkpoint's rows are [P][P][3]
+    w.add_tensor("v.patch_embd.weight", conv)
+    held[V + "backbone.embeddings.patch_embedding.weight"] = conv.astype(np.float32).transpose(0, 2, 3, 1).reshape(D, -1)
+    pos = r(G, G, D, std=0.3)
+    w.add_tensor("v.position_embd.weight", pos)
+    held[V + "backbone.embeddings.position_embedding"] = pos.reshape(G * G, D)
+    vec("v.pre_ln.weight", V + "backbone.ln_pre.weight", r(D, std=0.1, base=1.0))
+    vec("v.pre_ln.bias", V + "backbone.ln_pre.bias", r(D, std=0.1))
+    for i in range(L):
+        b, h = f"v.blk.{i}.", f"{V}backbone.layers.{i}."
+        for gg_, hf in (("ln1", "ln_1"), ("ln2", "ln_2")):
+            vec(b + gg_ + ".weight", h + hf + ".weight", r(D, std=0.1, base=1.0)); vec(b + gg_ + ".bias", h + hf + ".bias", r(D, std=0.1))
+        vec(b + "ls1.weight", h + "ls_1.gamma", r(D, std=0.3, base=1.0)); vec(b + "ls2.weight", h + "ls_2.gamma", r(D, std=0.3, base=1.0))
+        for gg_, hf, o, n in (("attn_q", "self_attn.q_proj", D, D), ("attn_k", "self_attn.k_proj", D, D),
+                              ("attn_v", "self_attn.v_proj", D, D), ("attn_out", "self_attn.out_proj", D, D),
+                              ("ffn_up", "mlp.c_fc", I, D), ("ffn_down", "mlp.c_proj", D, I)):
+            mat(b + gg_ + ".weight", h + hf + ".weight", r(o, n, std=0.15)); vec(b + gg_ + ".bias", h + hf + ".bias", r(o, std=0.05))
+    mat("mm.up.weight", V + "proj_in.weight", r(PROJ, M * M * D, std=0.1))
+    mat("mm.down.weight", V + "proj_out.weight", r(INK2["D"], PROJ, std=0.1))
+    w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
+    vc = {"native_patch_size": P, "adapter_merge_size": M, "projection_hidden_dim": PROJ, "hidden_size": D,
+          "num_hidden_layers": L, "num_attention_heads": H, "intermediate_size": I, "posemb_grid_size": G,
+          "layer_norm_eps": 1e-5}
+    return held, vc
+
+
+def write_inkling2_pair(root, experts="F32", seed=11, dense="F32", vision=False):
     """root/ink2.gguf imported into root/gg, and root/snap: the model the file holds as a
     checkpoint (safetensors under the official names, its experts as the file gives them back,
     the config the import wrote). Returns (gg, snap)."""
@@ -1089,14 +1141,23 @@ def write_inkling2_pair(root, experts="F32", seed=11, dense="F32"):
     import convert_inkling2_int4 as cv
     root = Path(root)
     t = write_inkling2(root / "ink2.gguf", ink2_weights(np.random.default_rng(seed)), experts, dense)
+    if vision:   # the tower's own GGUF next to the model, which the import links
+        vt, vc = write_inkling2_mmproj(root / "mmproj-ink2.gguf", np.random.default_rng(seed + 1))
+        t.update(vt)
     p = subprocess.run([sys.executable, str(HERE / "tools" / "gguf_import.py"), str(root / "ink2.gguf"), str(root / "gg")],
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     if p.returncode:
         raise AssertionError(p.stdout.decode())
+    cfg = json.loads((root / "gg" / "config.json").read_text())
+    if vision:
+        if cfg.get("vision_config") != vc:
+            raise AssertionError(f"the import's vision_config {cfg.get('vision_config')} is not {vc}")
+        cfg["image_token_id"] = INK2V["IMG"]   # the real model's is the engine's default (200054)
+        (root / "gg" / "config.json").write_text(json.dumps(cfg))
     snap = root / "snap"
     snap.mkdir()
     cv.write_safetensors(str(snap / "model.safetensors"), {k: ("F32", v.shape, v.tobytes()) for k, v in t.items()})
-    (snap / "config.json").write_text((root / "gg" / "config.json").read_text())
+    (snap / "config.json").write_text(json.dumps(cfg))
     return root / "gg", snap
 
 
@@ -1119,13 +1180,19 @@ class Inkling2Config(unittest.TestCase):
 INKLING = HERE / ("inkling.exe" if sys.platform == "win32" else "inkling")
 
 
-def inkling_run(snap, env=None):
+def inkling_run(snap, env=None, image=None):
     """The inkling engine's greedy tokens for a fixed prompt (oracle mode on a reference with
-    the prompt only) and its last prompt position's logits."""
+    the prompt only) and its last prompt position's logits. image: (pixel_values, rows, cols), a
+    picture of rows x cols tokens among the prompt's."""
     with tempfile.TemporaryDirectory() as tmp:
         ref, dump = Path(tmp) / "ref.json", Path(tmp) / "logits.bin"
         prompt = [5, 77, 13, 201, 42, 9, 150, 33, 61, 18, 240, 7]
-        ref.write_text(json.dumps({"prompt_ids": prompt, "full_ids": prompt + [0] * 12}))
+        extra = {}
+        if image is not None:
+            pix, rows, cols = image
+            prompt = prompt[:4] + [INK2V["IMG"]] * (rows * cols) + prompt[4:]
+            extra = {"pixel_values": [float(v) for v in pix], "image_grid_thw": [1, rows, cols]}
+        ref.write_text(json.dumps({"prompt_ids": prompt, "full_ids": prompt + [0] * 12, **extra}))
         p = subprocess.run([str(INKLING), "4", "0", str(ref)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                            env=dict(os.environ, SNAP=str(snap), DUMP=str(dump), NOGPU="1", OMP_NUM_THREADS="2", **(env or {})))
         out = p.stdout.decode("utf-8", "replace")
@@ -1160,6 +1227,22 @@ class Inkling2Gguf(unittest.TestCase):
             ts, ls = inkling_run(snap)
             self.assertEqual(tg, ts)
             self.assertLess(float(np.abs(lg - ls).max()), 1e-3 * max(1.0, float(np.abs(ls).max())))
+
+    def test_the_vision_tower_from_its_mmproj(self):
+        """unsloth's mmproj-*.gguf beside the model: the import links it and writes vision_config,
+        the engine reads the tower under the checkpoint's names (the patch embedding from the
+        file's convolution); a picture in the prompt gives the checkpoint's tokens and logits."""
+        with tempfile.TemporaryDirectory() as tmp:
+            gg, snap = write_inkling2_pair(tmp, vision=True)
+            tile = INK2V["P"] * INK2V["M"]
+            pix = np.random.default_rng(3).uniform(-1, 1, 2 * tile * tile * 3).astype(np.float32)
+            tg, lg = inkling_run(gg, image=(pix, 1, 2))
+            ts, ls = inkling_run(snap, image=(pix, 1, 2))
+            self.assertEqual(tg, ts)
+            self.assertLess(float(np.abs(lg - ls).max()), 1e-4 * max(1.0, float(np.abs(ls).max())))
+            other = np.random.default_rng(4).uniform(-1, 1, pix.size).astype(np.float32)
+            _, lo = inkling_run(gg, image=(other, 1, 2))   # another picture, other logits: the tower ran
+            self.assertGreater(float(np.abs(lo - lg).max()), 1e-3)
 
     def test_q8_0_dense(self):
         """The attention's matrices and the head as Q8_0 blocks too, as unsloth's files hold them

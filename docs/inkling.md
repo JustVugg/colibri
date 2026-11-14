@@ -101,6 +101,13 @@ Two ways to run it:
   ./coli import ~/models/Inkling-2-Small-UD-Q2_K_XL-00001-of-00006.gguf   # every part next to it
   ```
 
+  The vision tower is its own file in the repo, `mmproj-F16.gguf` (0.66 GB; BF16 and F32 too):
+  put it next to the parts (or name it with `--mmproj`) and the import links it and writes the
+  tower's `vision_config`. The engine reads it under the checkpoint's names: the same values
+  as the checkpoint's tower, the patch embedding a convolution there that it takes in the
+  checkpoint's pixel order. UD-IQ1_S with it, the red square and blue circle of the pictures
+  section below: "The image contains a red square and a blue circle."
+
 - **The official checkpoint as int4 g64.** Thinking Machines publish the experts in NVFP4
   (layers 0-39) and MXFP8 (layers 40-47), 393.5 GB. `c/tools/convert_inkling2_int4.py` turns
   them into colibri's int4 with one f32 scale per 64 weights (the planar layout of

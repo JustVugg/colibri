@@ -63,7 +63,10 @@ static Ink2Vision *ink2_vision_load(Model *m, const char *snap) {
     if (fread(buf, 1, n, f) != (size_t)n) {} buf[n] = 0; fclose(f);
     char *arena = NULL; jval *root = json_parse(buf, &arena);
     jval *vc = root ? json_get(root, "vision_config") : NULL;
-    if (!vc || !st_has(&m->S, "model.visual.backbone.embeddings.patch_embedding.weight")) { free(buf); free(arena); return NULL; }
+    const char *PE = "model.visual.backbone.embeddings.patch_embedding.weight";
+    char pe_conv[128]; snprintf(pe_conv, sizeof pe_conv, "%s.gguf", PE);   /* a GGUF mmproj's (st_gguf.h) */
+    const int conv = !st_has(&m->S, PE) && st_has(&m->S, pe_conv);
+    if (!vc || (!st_has(&m->S, PE) && !conv)) { free(buf); free(arena); return NULL; }
     Ink2Vision *v = calloc(1, sizeof *v);
     if (!v) { fprintf(stderr, "OOM\n"); exit(1); }
     v->D = (int)jnum(vc, "hidden_size", 1024);
@@ -84,7 +87,20 @@ static Ink2Vision *ink2_vision_load(Model *m, const char *snap) {
     if (v->hd % 4 || v->D % v->H) { fprintf(stderr, "inkling2 vision: head width %d is not a multiple of 4\n", v->hd); exit(1); }
     char nm[256];
     #define PV(suffix) (snprintf(nm, sizeof(nm), "model.visual." suffix), nm)
-    v->patch_w = load_w(m, PV("backbone.embeddings.patch_embedding.weight"), 0);
+    if (conv) {   /* the GGUF's convolution [D][3][P][P]: each row's pixels in the checkpoint's order, [P][P][3] */
+        const int P = v->patch, n = 3 * P * P;
+        if (st_numel(&m->S, pe_conv) != (int64_t)v->D * n) { fprintf(stderr, "inkling2 vision: %s is not %d x %d\n", pe_conv, v->D, n); exit(1); }
+        float *cw = load_t(m, pe_conv), *w = falloc((int64_t)v->D * n);
+        for (int o = 0; o < v->D; o++)
+            for (int c = 0; c < 3; c++)
+                for (int y = 0; y < P; y++)
+                    for (int x = 0; x < P; x++)
+                        w[(int64_t)o * n + (y * P + x) * 3 + c] = cw[(int64_t)o * n + (c * P + y) * P + x];
+        free(cw);
+        memset(&v->patch_w, 0, sizeof v->patch_w);
+        v->patch_w.f = w;
+    } else
+        v->patch_w = load_w(m, PV("backbone.embeddings.patch_embedding.weight"), 0);
     v->pos = load_t(m, PV("backbone.embeddings.position_embedding"));
     v->cls = load_t(m, PV("backbone.embeddings.class_embedding"));
     float *cp = load_t(m, PV("backbone.embeddings.cls_position_embedding"));
