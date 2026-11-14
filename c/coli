@@ -3746,6 +3746,7 @@ def cmd_ui(a):
     if a.models_backend: cmd += ["--models-backend", a.models_backend]
     for d in a.models_dir or []: cmd += ["--models-dir", d]
     if a.searx: cmd += ["--searx", a.searx]
+    if getattr(a, "skills_dir", ""): cmd += ["--skills-dir", a.skills_dir]
     try:
         sys.exit(subprocess.call(cmd))
     except KeyboardInterrupt:
@@ -4190,6 +4191,8 @@ def main():
                      "uses, ~/colibri-models)")
     pui.add_argument("--searx",default=os.environ.get("COLIBRI_SEARX",""),
                      help="a SearXNG instance for the chat's web search (default: DuckDuckGo's HTML results)")
+    pui.add_argument("--skills-dir",default=os.environ.get("COLIBRI_SKILLS",""),
+                     help="the chat's skills, one folder with a SKILL.md each (default: ~/colibri-skills)")
     pui.add_argument("--no-browser",action="store_true",help="don't open the browser")
     # One-step setup (setup_flow.py). No `common` parent: --model here names a
     # catalog entry, not a model directory, and nothing below loads an engine.

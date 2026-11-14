@@ -37,6 +37,19 @@ and when the page stops a request the upstream connection closes, which stops th
 - **Web search**: the chat can search and read pages before it answers (`web.py`): results
   from a SearXNG instance when `coli ui --searx URL` names one, else DuckDuckGo's plain HTML
   results (no key); the pages' readable text only, at public addresses only.
+- **Skills** (Settings, "Skill"): folders with a SKILL.md (a front matter with `name` and
+  `description`, then the instructions) in `--skills-dir` (default `~/colibri-skills`,
+  `skills.py`). Add, edit, switch on/off, delete (to `.trash`) or import a whole folder from the
+  page. The chat lists the enabled skills' names and descriptions; the model loads one with the
+  `skill` tool, or the message starts with `/name` to load it up front. A turn using a skill
+  gets up to 16 rounds of tool calls instead of 3. On/off for the chat in the **+** menu.
+- **MCP** (Settings, "MCP"): MCP servers whose tools the model can call (`mcp.py`), kept in
+  `--mcp-config` (default `~/colibri-mcp.json`, Bionic's `ng-mcp.json` shape). Add or edit one
+  as JSON, switch it on/off, connect it to list its tools, or import Bionic's `ng-mcp.json` or any
+  `mcpServers` file. stdio servers (npm shims included) and streamable HTTP; no OAuth sign-in.
+  A server starts on first use; the model sees its tools as `<server>__<tool>`; a result is cut to
+  6,000 characters and images are described, not sent. Every tool's schema goes into every
+  prompt, so switch on only the servers a task needs. On/off for the chat in the **+** menu.
 - **Mascot**: the hummingbird follows the turn (reading, reasoning, writing, done, stopped).
 
 - **Models**: what fits the machine the gateway runs on and how fast it would go, each model

@@ -10,6 +10,8 @@ Besides the proxy it answers /agents (ui/agents.py: a coding agent opened in a
 new terminal window, pointed at colibri) and /v1/responses (ui/responses_shim.py:
 the Responses API over the gateway's chat API, for agents that speak only that).
 /web/ is the chat's web search (ui/web.py: SearXNG with --searx, else DuckDuckGo).
+/skills/ is the chat's skills (ui/skills.py: SKILL.md folders in --skills-dir).
+/mcp/ is the chat's MCP connections (ui/mcp.py: servers in --mcp-config, their tools for the model).
 /models/ is the Models page (ui/models.py): in this process when the gateway is on
 this machine, else a models service on the engine's machine (--models-backend);
 with neither it answers 404 and the page says the feature is not available.
@@ -20,7 +22,7 @@ import argparse, http.client, json, os, sys, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import agents, responses_shim, web   # noqa: E402
+import agents, mcp, responses_shim, skills, web   # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROXIED = ("/v1/", "/health", "/profile", "/experts")
@@ -171,10 +173,41 @@ class Handler(BaseHTTPRequestHandler):
         code, obj = self.models.handle(self.command, u.path, u.query, self.rfile.read(n) if n else b"")
         return self._json(code, obj)
 
+    def _skills(self, path):
+        """the chat's skills (ui/skills.py): only for this page, like /agents"""
+        post = self.command == "POST"
+        if not self._local_ok(post):
+            return self._json(403, {"error": "solo dalla pagina di colibri su questa macchina"})
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > 1 << 20:
+            return self._json(413, {"error": "richiesta troppo grande"})
+        q = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(self.path).query))
+        code, obj = skills.handle(self.command, path, q, self.rfile.read(n) if n else b"")
+        return self._json(code, obj)
+
+    def _mcp(self, path):
+        """the chat's MCP connections (ui/mcp.py): only for this page, like /agents (it starts programs)"""
+        post = self.command == "POST"
+        if not self._local_ok(post):
+            return self._json(403, {"error": "solo dalla pagina di colibri su questa macchina"})
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > 1 << 20:
+            return self._json(413, {"error": "richiesta troppo grande"})
+        q = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(self.path).query))
+        code, obj = mcp.handle(self.command, path, q, self.rfile.read(n) if n else b"")
+        try:
+            return self._json(code, obj)
+        except (BrokenPipeError, ConnectionResetError):
+            pass   # the page stopped the turn while a tool ran
+
     def _route(self):
         path = urllib.parse.urlparse(self.path).path
         if path.startswith("/web/") and self.command == "GET":
             self._web(path)
+        elif path.startswith("/skills/"):
+            self._skills(path)
+        elif path.startswith("/mcp/"):
+            self._mcp(path)
         elif path == "/v1/responses" and self.command == "POST":
             responses_shim.serve(self, self.backend)   # Codex: the Responses API over colibri's chat API
         elif path == "/agents" or path.startswith("/agents/"):
@@ -209,8 +242,14 @@ def main():
                     help="where models are, for the Models page (default: colibri's own folder)")
     ap.add_argument("--searx", default=os.environ.get("COLIBRI_SEARX", ""),
                     help="a SearXNG instance for web search (default: DuckDuckGo's HTML results)")
+    ap.add_argument("--skills-dir", default=skills.DIR,
+                    help="the chat's skills, one folder with a SKILL.md each (default: ~/colibri-skills)")
+    ap.add_argument("--mcp-config", default=mcp.CONFIG,
+                    help="the chat's MCP servers (default: ~/colibri-mcp.json)")
     a = ap.parse_args()
     web.SEARX = a.searx
+    skills.DIR = os.path.abspath(os.path.expanduser(a.skills_dir))
+    mcp.CONFIG = os.path.abspath(os.path.expanduser(a.mcp_config))
     Handler.backend = urllib.parse.urlparse(a.backend)
     Handler.models_backend = urllib.parse.urlparse(a.models_backend) if a.models_backend else None
     Handler.port = a.port
@@ -228,6 +267,8 @@ def main():
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        mcp.shutdown()   # the MCP servers this UI started
 
 
 if __name__ == "__main__":

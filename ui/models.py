@@ -270,6 +270,11 @@ def gateway_proc():
 def gateway_model_dir():
     p = gateway_proc()
     m = _argval(p["argv"], "--model") if p and p["coli"] else None
+    if not m and not LINUX:       # Windows: the model `coli setup` set up, when the gateway answers
+        import win_switch
+        c = win_switch._cfg() if win_switch.available() else None
+        if c and win_switch._answering(sys.modules[__name__]):
+            return os.path.realpath(c["model_dir"])
     return os.path.realpath(os.path.join(p["cwd"], os.path.expanduser(m))) if m else None
 
 
@@ -287,7 +292,14 @@ def tier_of(argv, env):
 
 def gateway_tier():
     p = gateway_proc()
-    return tier_of(p["argv"], p["env"]) if p and p["coli"] else None
+    if p and p["coli"]:
+        return tier_of(p["argv"], p["env"])
+    if not LINUX:                 # Windows: the tier of the model `coli setup` set up, while its gateway answers
+        import win_switch
+        c = win_switch._cfg() if win_switch.available() else None
+        if c and win_switch._answering(sys.modules[__name__]):
+            return tier_of(list(c.get("args") or []), dict(c.get("env") or {}))
+    return None
 
 
 # ------------------------------------------------------------------ the machine
@@ -1201,6 +1213,10 @@ def switch_model(path, force=False, tier=None):
     """Restart the gateway on another model of this disk, the way it was started (its command,
     folder and environment) with --model changed; `tier` ram or gpu also turns the GPU off or
     on. A model that does not start brings the previous one back."""
+    if not LINUX:                 # no /proc: switch through `coli setup` / `coli start` (ui/win_switch.py)
+        import win_switch
+        if win_switch.available():
+            return win_switch.switch(sys.modules[__name__], path, force, tier)
     path = os.path.realpath(path)
     if not os.path.isdir(path) or not under_roots(path):
         raise ValueError("cartella del modello non valida")
@@ -1289,6 +1305,13 @@ def switch_model(path, force=False, tier=None):
 
 
 # ------------------------------------------------------------------ the API
+def _win_can_switch():
+    if LINUX:
+        return False
+    import win_switch
+    return win_switch.available()
+
+
 def get(path, q):
     """(status, body) for GET /models/..."""
     if path == "/models/machine":
@@ -1299,7 +1322,8 @@ def get(path, q):
         return 200, {"machine": MACHINE, "eta": CAL["eta"], "cal": CAL, "catalog": rows, "installed": inst,
                      "best": best_per_tier(rows + [r for r in inst if r.get("tiers")]),
                      "in_use": gateway_model_dir(), "in_use_tier": gateway_tier(), "roots": roots(),
-                     "can_switch": LINUX, "gguf_arches": sorted(gguf_arches())}
+                     "can_switch": LINUX or _win_can_switch(),
+                     "switch_via": "setup" if _win_can_switch() else "proc", "gguf_arches": sorted(gguf_arches())}
     if path == "/models/search":
         return 200, {"q": q.get("q", ""), "results": hf_search(q.get("q", ""))}
     if path == "/models/files":
@@ -1322,6 +1346,20 @@ def post(path, b):
         return 200, job_view(start_catalog_download(b["id"]) if b.get("id") else start_gguf_download(b["repo"], b["stem"]))
     if path == "/models/use":
         return 200, job_view(switch_model(b["path"], bool(b.get("force")), b.get("tier")))
+    if path == "/models/ctx":         # Windows: restart with another context (ui/win_switch.py)
+        if not _win_can_switch():
+            return 400, {"error": "changing the context from here works only with a coli setup on Windows for now: "
+                                  "restart coli serve with --ctx"}
+        import win_switch
+        return 200, job_view(win_switch.set_ctx(sys.modules[__name__], b.get("ctx"), bool(b.get("force"))))
+    if path in ("/models/unload", "/models/load"):    # Windows: free the GPU, start the model again
+        if not _win_can_switch():
+            return 400, {"error": "unload and load work only with a coli setup on Windows for now: "
+                                  "stop the server with `coli stop`"}
+        import win_switch
+        if path == "/models/load":
+            return 200, job_view(win_switch.load(sys.modules[__name__]))
+        return 200, job_view(win_switch.unload(sys.modules[__name__], bool(b.get("force"))))
     m = re.fullmatch(r"/models/jobs/([0-9a-f]+)/cancel", path)
     if m and m.group(1) in JOBS:
         JOBS[m.group(1)]["cancel"] = True

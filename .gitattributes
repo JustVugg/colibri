@@ -1,2 +1,4 @@
 # cmd.exe finds labels unreliably in LF-only batch files: keep CRLF on checkout.
 START-HERE.bat text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
