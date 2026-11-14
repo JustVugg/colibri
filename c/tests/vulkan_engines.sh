@@ -4950,7 +4950,7 @@ family_kv_quant_deepseek() {
     make clean >/dev/null 2>&1 || true
     make deepseek_v41 tests/test_vk_kv_quant VK=1 EXTRA_CFLAGS="$SANF" EXTRA_LDFLAGS="$SANF"
     export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0
-    export UBSAN_OPTIONS=print_stacktrace=1
+    export UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
   else
     make deepseek_v41 tests/test_vk_kv_quant VK=1
   fi
@@ -4959,6 +4959,7 @@ family_kv_quant_deepseek() {
   if san_diag vk_kv_quant.log; then cat vk_kv_quant.log; fail "kv-quant: sanitizer diagnostic in the codec"; fi
   [ -d dsv41_kvq_tiny ] || $PY tools/make_dsv41_tiny.py --out dsv41_kvq_tiny --kv-quant-dims --emit-ref dsv41_kvq_tiny/ref.json
   [ -d dsv41_kvq_long ] || $PY tools/make_dsv41_tiny.py --out dsv41_kvq_long --kv-quant-dims --emit-ref dsv41_kvq_long/ref.json --prompt-len 40 --max-new 6
+  rm -f chain.usage chain-serve.usage san_serve.log
   # Every arm runs THE DEFAULT: the var unset is the packed cache (the packed mirrors AND
   # the host's code rows, the engage line saying so), both flag names scrubbed from the
   # environment. The flag's old =1 level (the device mirrors packed, the host fp32) ran its
@@ -4988,8 +4989,10 @@ family_kv_quant_deepseek() {
   if [ "${SAN:-0}" = 1 ]; then
     # the arms' own gates read stdout; a sanitizer report lands on stderr, so every log
     # this family wrote is swept here as well -- a heap overrun in a packed row can leave
-    # the tokens it printed untouched
-    for f in vk_kv_quant.log off.log on.log plain.log forced.log; do
+    # the tokens it printed untouched. The arms overwrite off.log/on.log arm after arm and
+    # san_serve.log serve turn after serve turn, so kvq_san_sweep reads each at the arm
+    # that wrote it; this closing sweep is the belt to that, the serve module's included
+    for f in vk_kv_quant.log off.log on.log plain.log forced.log san_serve.log; do
       [ -f "$f" ] || continue
       if san_diag "$f"; then cat "$f"; fail "kv-quant sanitize: $f carries a sanitizer diagnostic"; fi
     done
@@ -5007,6 +5010,17 @@ family_kv_quant_deepseek() {
     make clean >/dev/null 2>&1 || true
   fi
   unset OMP_NUM_THREADS
+}
+# The arms overwrite off.log/on.log arm after arm (every one's 2> redirection truncates
+# them), so a sweep held to the family's end would only ever read the LAST arm's pair:
+# sweep each arm's own logs at the arm, while they are still that arm's. A no-op off the
+# SAN leg -- the non-sanitized run has no diagnostic to hide.
+kvq_san_sweep() {
+  [ "${SAN:-0}" = 1 ] || return 0
+  local tag=$1 f; shift
+  for f in "$@"; do
+    if san_diag "$f"; then cat "$f"; fail "kv-quant sanitize: $tag: $f carries a sanitizer diagnostic"; fi
+  done
 }
 # The packed cache under the KV split: the split arms (its whole fp32 mirrors win, the
 # give-way line says so) and the HOST stays codes -- the split's four read paths dequantize
@@ -5031,6 +5045,7 @@ v41_kvq_host_split() {
   grep -q 'COLI_VK_KV_FP32 unset' on.log || { cat on.log; fail "kv-quant host split: the packed cache never engaged"; }
   grep -q 'gives way' on.log || { cat on.log; fail "kv-quant host split: the mirrors never gave way to the split"; }
   [ "$(chain_count deepseek_v41 on.log)" -gt 0 ] || { cat on.log; fail "kv-quant host split: the chain never ran"; }
+  kvq_san_sweep "host split" off.log on.log
   # the tolerance, but without logits_first's argmax-kept: this arm carries BOTH hops
   # (the mirrors' quantize and the host's own), and the fixture's logit gaps are narrower
   # than that noise -- a moved greedy pick is the honest outcome, printed not failed
@@ -5080,6 +5095,7 @@ v41_kvq_cpu_host() {
   grep -q 'COLI_VK_KV_FP32 unset' on.log || { cat on.log; fail "kv-quant CPU host: the packed host never engaged"; }
   grep -q "decoding the host's code rows into kv_all" on.log || { tail -20 on.log; fail "kv-quant CPU host: the CPU never read the host's codes"; }
   [ "$(chain_count deepseek_v41 on.log)" = 0 ] || { tail -20 on.log; fail "kv-quant CPU host: the chain ran with COLI_VK_CHAIN=0"; }
+  kvq_san_sweep "CPU host" off.log on.log
   local lg; lg=$(logits_first off.f32 on.f32 1.0 256) || { echo "$lg"; fail "kv-quant CPU host: the first decode row beyond the documented tolerance"; }
   local l1; l1=$(logits_row off.f32 on.f32 1 0.2 256 0) || { echo "$l1"; fail "kv-quant CPU host: decode row 1 beyond the documented tolerance -- the packed ring's snapshot reads the slot the step evicted"; }
   echo "OK kv-quant CPU host: $lg; $l1; $(token_diff off.txt on.txt), the chain off and the host's codes read on the CPU"
@@ -5122,6 +5138,7 @@ PY
   # the fixture also records the VENDOR's draft rounds, which this fixture's greedy stream does
   # not reproduce, so exit 1 from that one comparison is expected; nothing else may cause it
   [ "$rcf" = 0 ] || grep -q 'DSpark: checked .* MISMATCH' forced.log || { tail -20 forced.log; fail "kv-quant spec self: exit $rcf, not the recorded drafts' own mismatch"; }
+  kvq_san_sweep "spec self" plain.log forced.log
   cmp -s plain.txt forced.txt || { echo "plain:  $(cat plain.txt)"; echo "forced: $(cat forced.txt)"; fail "kv-quant spec self: the verified stream differs from the plain one"; }
   echo "OK kv-quant spec self: $acc of $prop forced drafts accepted, the stream = the plain one ($(cat forced.txt))"
 }
@@ -5154,6 +5171,7 @@ v41_kvq() {
   { [ "$rcq" = 0 ] || grep -q '\[mismatch\]' on.log; } || { tail -20 on.log; fail "kv-quant $tag: exit $rcq without a token drift to show for it"; }
   grep -q 'COLI_VK_KV_FP32 unset' on.log || { cat on.log; fail "kv-quant $tag: the packed cache never engaged"; }
   [ "$(chain_count deepseek_v41 on.log)" -gt 0 ] || { cat on.log; fail "kv-quant $tag: the chain never ran"; }
+  kvq_san_sweep "$tag" off.log on.log
   local lg; lg=$(logits_first off.f32 on.f32 1.0 256) || { echo "$lg"; fail "kv-quant $tag: the first decode row beyond the documented tolerance"; }
   echo "OK kv-quant $tag: $lg, $(chain_count deepseek_v41 on.log) chain forwards, $(token_diff off.txt on.txt)$(grep -q 'Matching tokens:' on.log && grep -a -o 'Matching tokens: [0-9]*/[0-9]*' on.log | tail -1 | sed 's/^/, the reference: /')"
   v41_kvq_ledger "$tag"
@@ -5170,6 +5188,7 @@ v41_kvq_ledger() {
   local off on_out on host
   off=$(KVQ_LEDGER_RUN=fp32 v41_kvq_serve "$1")
   on_out=$(KVQ_LEDGER_RUN=packed v41_kvq_serve "$1")
+  kvq_san_sweep "$1 serve" san_serve.log
   on=$(printf '%s\n' "$on_out" | sed -n '1p')
   host=$(printf '%s\n' "$on_out" | sed -n 's/^host kv \([0-9]*\) B.*/\1/p')
   [ -n "$off" ] && [ -n "$on" ] || { fail "kv-quant $1: no kv-mirror line from the serve turn"; }
@@ -5189,7 +5208,9 @@ v41_kvq_ledger() {
 }
 # one serve turn of the engine (the ledger ends a turn), <fp32|packed> in KVQ_LEDGER_RUN:
 # prints the kv-mirror line's tail (the MiB and, when packed, the annotation) and, when
-# packed, the host kv line's. The protocol as vulkan_chain_serve.py drives it: wait for
+# packed, the host kv line's, the turn's whole stderr TEE'd to san_serve.log (appended,
+# the sweep at the ledger that reads it) so a sanitizer report the ledger does not print
+# is still on disk. The protocol as vulkan_chain_serve.py drives it: wait for
 # READY, one SUBMIT, drain to DONE. `packed` scrubs both flag names from the environment
 # entirely -- what a user who set nothing runs.
 v41_kvq_serve() {
@@ -5202,8 +5223,12 @@ env.pop("COLI_VK_KV_FP32", None); env.pop("COLI_VK_KV_QUANT", None)   # the lega
 if quant == "fp32": env["COLI_VK_KV_FP32"] = "1"
 p = subprocess.Popen(["./deepseek_v41", "2", "dsv41_kvq_tiny/ref.json"], env=env,
                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+san = open("san_serve.log", "ab")   # tee the turn's stderr: the ledger prints its own lines, the sanitizer's land here
 err = []
-threading.Thread(target=lambda: [err.append(l) for l in iter(p.stderr.readline, b"")], daemon=True).start()
+def drain():
+    for l in iter(p.stderr.readline, b""):
+        san.write(l); san.flush(); err.append(l)
+threading.Thread(target=drain, daemon=True).start()
 try:
     while b"READY" not in p.stdout.readline():
         if p.poll() is not None: sys.exit("engine exited before READY")
