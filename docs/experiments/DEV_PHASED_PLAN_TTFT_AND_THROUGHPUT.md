@@ -6,6 +6,8 @@
 **Baseline inspected:** `bc4b92509b214687423294a1ee320d3933faa018`
 **Scope:** Interactive and agent inference performance, primarily Qwen3.6 35B-A3B MoE and 27B dense.
 
+> **Artifact location convention (2026-11-14):** experiment drivers, result rows and server logs referenced by this plan live under `researchLogs/logs/colibri-c12-workloads/` (moved from `logs/logs/colibri-c12-workloads/`; the old `logs/` location no longer holds them). Future work recorded in this doc must reference `researchLogs/` paths, never `logs/`.
+
 > Implementation notes and observations are recorded in Section 7. A completed instrumentation change is not a performance result; real-model baselines are still required.
 
 ## 1. Objective
