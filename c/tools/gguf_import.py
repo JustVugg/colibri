@@ -495,6 +495,59 @@ def inkling_config(meta, tensors, overrides=None):
     return cfg, layers
 
 
+def inkling2_config(meta, tensors, overrides=None):
+    """Inkling-2 (llama.cpp's inkling2: Inkling-2-Small) as the inkling engine's config.json, in
+    the flat shape transformers saves (inkling2_text): the engine reads every Inkling-2 tensor by
+    the checkpoint's own names (model.llm.*), which st_gguf.h gives the GGUF's. A global layer
+    every attn_res.block_size layers, from sliding_window_pattern."""
+    p = "inkling2."
+    need = lambda k: meta[p + k] if (p + k) in meta else sys.exit(f"GGUF metadata lacks {p + k}")
+    layers = int(need("block_count"))
+    local = [bool(x) for x in need("attention.sliding_window_pattern")][:layers]
+    if len(local) != layers:
+        sys.exit(f"GGUF metadata: sliding_window_pattern has {len(local)} layers, block_count {layers}")
+    kv = need("attention.head_count_kv")
+    kv = [int(x) for x in kv][:layers] if isinstance(kv, (list, tuple)) else [int(kv)] * layers
+    kv_local = next((kv[i] for i in range(layers) if local[i]), kv[0])
+    kv_global = next((kv[i] for i in range(layers) if not local[i]), kv[0])
+    heads, head_dim = int(need("attention.head_count")), int(need("attention.key_length"))
+    emb = tensors.get("token_embd.weight") or sys.exit("GGUF has no token_embd.weight")
+    vocab = int(meta.get(p + "vocab_size", emb["dims"][1]))
+    eos = int(meta.get("tokenizer.ggml.eos_token_id", 200006))
+    cfg = {
+        "architectures": ["Inkling2ForCausalLM"],
+        "model_type": "inkling2_text",
+        "hidden_size": int(need("embedding_length")),
+        "num_hidden_layers": layers,
+        "moe_intermediate_size": int(need("expert_feed_forward_length")),
+        "num_attention_heads": heads, "swa_num_attention_heads": heads,
+        "num_key_value_heads": kv_global, "swa_num_key_value_heads": kv_local,
+        "head_dim": head_dim, "swa_head_dim": head_dim,
+        "sliding_window_size": int(need("attention.sliding_window")),
+        "layer_types": ["hybrid_sliding" if local[i] else "hybrid" for i in range(layers)],
+        "d_rel": int(need("d_rel")), "rel_extent": int(need("rel_extent")),
+        "conv_kernel_size": int(need("shortconv_kernel")),
+        "n_routed_experts": int(need("expert_count")),
+        "num_experts_per_tok": int(need("expert_used_count")),
+        "route_scale": float(meta.get(p + "expert_weights_scale", 1.0)),
+        "scoring_func": "sigmoid",
+        "log_scaling_n_floor": int(meta.get(p + "log_scaling_n_floor", 0)),
+        "log_scaling_alpha": float(meta.get(p + "log_scaling_alpha", 0.0)),
+        "qk_l2_clip_threshold": float(need("qk_clip_threshold")),
+        "rel_l2_clip_threshold": float(need("rel_clip_threshold")),
+        "n_layers_per_attn_res_block": int(need("attn_res.block_size")),
+        "mlp_gate_softcap": float(need("mlp_gate_softcap")),
+        "mlp_up_softcap": float(need("mlp_up_softcap")),
+        "final_logit_softcapping": float(need("final_logit_softcapping")),
+        "rms_norm_eps": float(meta.get(p + "attention.layer_norm_rms_epsilon", 1e-6)),
+        "vocab_size": vocab,
+        "unpadded_vocab_size": int(meta.get(p + "unpadded_vocab_size", vocab)),
+        "max_position_embeddings": int(meta.get(p + "context_length", 1048576)),
+        "eos_token_id": eos,
+    }
+    return cfg, layers
+
+
 def glm5next_config(meta, tensors, overrides=None):
     """GLM-5.3-Flash (llama.cpp's glm5-next) as the glm53 engine's config.json, the shape of
     zai-org's (Glm5NextForConditionalGeneration, its text_config). head_count_kv marks the MLA
@@ -1058,7 +1111,7 @@ def qwen4exp_config(meta, tensors, overrides=None):
 
 
 COPY_UNREAD = {"qwen4exp"}   # their engine does not read the colibri container (copy mode)
-ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen3moe": qwen3moe_config, "qwen3": qwen3_config, "flint": flint_config, "muse-spark": muse_config, "lfm3": lfm3_config, "deepseek4": deepseek4_config, "inkling": inkling_config, "glm5-next": glm5next_config, "glm-dsa": glmdsa_config, "mistral-large4": mistral_large4_config, "mimo2": mimo2_config, "deepseek41": deepseek41_config, "kimi-k3": kimik3_config, "olmoe": olmoe_config, "qwen4exp": qwen4exp_config}
+ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen3moe": qwen3moe_config, "qwen3": qwen3_config, "flint": flint_config, "muse-spark": muse_config, "lfm3": lfm3_config, "deepseek4": deepseek4_config, "inkling": inkling_config, "inkling2": inkling2_config, "glm5-next": glm5next_config, "glm-dsa": glmdsa_config, "mistral-large4": mistral_large4_config, "mimo2": mimo2_config, "deepseek41": deepseek41_config, "kimi-k3": kimik3_config, "olmoe": olmoe_config, "qwen4exp": qwen4exp_config}
 
 # unsloth ships Qwen3.8-Flash-Next's MTP head apart, in an MTP/ folder of the repository:
 # shared-* borrow token_embd and output from the model (the engine always does), the

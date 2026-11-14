@@ -946,6 +946,216 @@ class InklingConfig(unittest.TestCase):
         self.assertEqual((cfg["unpadded_vocab_size"], cfg["eos_token_id"]), (200058, 200006))
 
 
+INK2 = dict(D=128, L=4, E=8, K=2, I=64, H=4, HD=32, KVL=2, KVG=1, DR=8, WIN=8, EXT=16, CK=4, V=300, UV=290)
+INK2_LOCAL = [True, True, False, True]   # layer 2 global
+INK2_SCALED = (0, 1)                     # the NVFP4 layers: experts without their global scale
+
+
+def ink2_weights(rng):
+    """A small Inkling-2 under the checkpoint's own names (model.llm.*), f32, every parameter
+    drawn at random: the snapshot's tensors."""
+    g = INK2
+    D, E, I, H, HD, DR, CK = g["D"], g["E"], g["I"], g["H"], g["HD"], g["DR"], g["CK"]
+    r = lambda *s, std=0.08, base=0.0: (base + rng.standard_normal(s) * std).astype(np.float32)
+    t = {"model.llm.embed.weight": r(g["V"], D, std=0.5), "model.llm.embed_norm.weight": r(D, std=0.1, base=1.0),
+         "model.llm.norm.weight": r(D, std=0.1, base=1.0), "model.llm.unembed.weight": r(g["V"], D, std=0.1),
+         "model.llm.attn_res.output_query": r(D, std=0.3)}
+    for i, local in enumerate(INK2_LOCAL):
+        p = f"model.llm.layers.{i}."
+        kv = (g["KVL"] if local else g["KVG"]) * HD
+        if local:
+            t[p + "attn_norm.weight"] = r(D, std=0.1, base=1.0)
+            t[p + "attn.k_sconv.weight"] = r(kv, CK, std=0.3); t[p + "attn.v_sconv.weight"] = r(kv, CK, std=0.3)
+        else:
+            for n in "qkv":
+                t[p + f"{n}_input_norm.weight"] = r(D, std=0.1, base=1.0)
+            for n in "kv":
+                t[p + f"attn.{n}_sconv.static_w"] = r(CK, kv, std=0.3)
+                t[p + f"attn.{n}_sconv.weight_proj"] = r(kv // HD * CK, D, std=0.05)
+        t[p + "mlp_norm.weight"] = r(D, std=0.1, base=1.0)
+        t[p + "attn.wq_du.weight"] = r(H * HD, D); t[p + "attn.wk_dv.weight"] = r(kv, D)
+        t[p + "attn.wv_dv.weight"] = r(kv, D); t[p + "attn.wr_du.weight"] = r(H * DR, D)
+        t[p + "attn.wo_ud.weight"] = r(D, H * HD); t[p + "attn.gate_attn.weight"] = r(H * HD, D)
+        t[p + "attn.attn_sink_proj.weight"] = r(H, D)
+        t[p + "attn.q_l2_clip.scale"] = r(H, HD, std=0.3, base=1.0); t[p + "attn.rel_l2_clip.scale"] = r(H, DR, std=0.3, base=1.0)
+        t[p + "attn.rel_logits_proj.proj"] = r(DR, g["WIN"] if local else g["EXT"], std=0.3)
+        t[p + "attn_sconv.weight"] = r(D, CK, std=0.3); t[p + "mlp_sconv.weight"] = r(D, CK, std=0.3)
+        t[p + "mlp.gate.weight"] = r(E, D, std=0.2); t[p + "mlp.gate.bias"] = r(E, std=0.1)
+        t[p + "mlp.experts.gate_up_proj"] = r(E, 2 * I, D)   # gate rows, then up rows
+        t[p + "mlp.experts.down_proj"] = r(E, D, I)
+        if i > 0:
+            t[f"model.llm.attn_res.attn_queries.{i - 1}"] = r(D, std=0.3) if local else r(3, D, std=0.3)
+        t[f"model.llm.attn_res.mlp_queries.{i}"] = r(D, std=0.3)
+    return t
+
+
+def write_inkling2(path, t, experts="F32"):
+    """The model of ink2_weights as unsloth's Inkling-2 GGUFs lay it out (llama.cpp's inkling2):
+    the short convolutions folded with their residual and scale (a global layer's static taps in
+    convolution order, its dynamic projection scaled), each layer's attention-residual queries
+    under the layer, and the experts of the INK2_SCALED layers stored divided by a global scale an
+    expert, which comes as ffn_*_exps.scale (gate's and up's one number, as the NVFP4 w13's amax
+    gives it). experts: the routed experts' ggml type, F32 or Q8_0. Returns the model the file
+    holds: t with each layer's experts as the engine reads them back (dequantized, scale applied)."""
+    g = INK2
+    D, E, I, CK = g["D"], g["E"], g["I"], g["CK"]
+    held = dict(t)
+    w = gguf.GGUFWriter(str(path), "inkling2")
+    p = "inkling2."
+    for key, v in (("block_count", g["L"]), ("context_length", 4096), ("embedding_length", D),
+                   ("attention.head_count", g["H"]), ("attention.key_length", g["HD"]), ("vocab_size", g["V"]),
+                   ("unpadded_vocab_size", g["UV"]), ("expert_count", E), ("expert_used_count", g["K"]),
+                   ("expert_feed_forward_length", I), ("attention.sliding_window", g["WIN"]), ("d_rel", g["DR"]),
+                   ("rel_extent", g["EXT"]), ("shortconv_kernel", CK), ("attn_res.block_size", 2),
+                   ("log_scaling_n_floor", 4)):
+        w.add_uint32(p + key, v)
+    w.add_array(p + "attention.head_count_kv", [g["KVL"] if l else g["KVG"] for l in INK2_LOCAL])
+    w.add_array(p + "attention.sliding_window_pattern", INK2_LOCAL)
+    for key, v in (("expert_weights_scale", 2.0), ("log_scaling_alpha", 0.1), ("qk_clip_threshold", 3.0),
+                   ("rel_clip_threshold", 2.0), ("mlp_gate_softcap", 4.0), ("mlp_up_softcap", 25.0),
+                   ("final_logit_softcapping", 30.0), ("attention.layer_norm_rms_epsilon", 1e-6)):
+        w.add_float32(p + key, v)
+    toks = [f"<0x{b:02X}>" if b < 256 else f"t{b}" for b in range(g["V"] - 3)] + ["<|bos|>", "<|eos|>", "<|pad|>"]
+    w.add_tokenizer_model("gpt2"); w.add_tokenizer_pre("inkling"); w.add_token_list(toks)
+    w.add_token_types([1] * (g["V"] - 3) + [3, 3, 3]); w.add_token_merges([])
+    w.add_bos_token_id(g["V"] - 3); w.add_eos_token_id(g["V"] - 2)
+    add = lambda name, a: w.add_tensor(name, np.ascontiguousarray(a, dtype=np.float32))
+    def exps(name, a):   # the tensor, and its values as the file gives them back
+        a = np.ascontiguousarray(a, dtype=np.float32)
+        if experts == "F32":
+            add(name, a)
+            return a
+        q = gguf.quants.quantize(a, QT[experts])
+        w.add_tensor(name, q, raw_dtype=QT[experts])
+        return gguf.quants.dequantize(q, QT[experts]).reshape(a.shape).astype(np.float32)
+    fold = lambda c, k: (c + (np.arange(CK) == CK - 1)) / np.sqrt(k)
+    m = "model.llm."
+    add("token_embd.weight", t[m + "embed.weight"]); add("token_embd_norm.weight", t[m + "embed_norm.weight"])
+    add("output_norm.weight", t[m + "norm.weight"]); add("output.weight", t[m + "unembed.weight"])
+    add("output_res_score.weight", t[m + "attn_res.output_query"])
+    for i, local in enumerate(INK2_LOCAL):
+        s, b = f"{m}layers.{i}.", f"blk.{i}."
+        if local:
+            add(b + "attn_norm.weight", t[s + "attn_norm.weight"])
+            for n in "kv":
+                add(b + f"shortconv_{n}.weight", fold(t[s + f"attn.{n}_sconv.weight"], CK + 1))
+        else:
+            for n in "qkv":
+                add(b + f"attn_{n}_in_norm.weight", t[s + f"{n}_input_norm.weight"])
+            for n in "kv":
+                add(b + f"shortconv_{n}.weight", fold(t[s + f"attn.{n}_sconv.static_w"][::-1].T, 2 * CK + 1))
+                add(b + f"shortconv_{n}_dyn.weight", t[s + f"attn.{n}_sconv.weight_proj"] / np.sqrt(2 * CK + 1))
+        add(b + "ffn_norm.weight", t[s + "mlp_norm.weight"])
+        for gg, hf in (("attn_q", "attn.wq_du.weight"), ("attn_k", "attn.wk_dv.weight"), ("attn_v", "attn.wv_dv.weight"),
+                       ("attn_r", "attn.wr_du.weight"), ("attn_output", "attn.wo_ud.weight"),
+                       ("attn_gate", "attn.gate_attn.weight"), ("attn_sink_proj", "attn.attn_sink_proj.weight"),
+                       ("attn_q_clip", "attn.q_l2_clip.scale"), ("attn_r_clip", "attn.rel_l2_clip.scale"),
+                       ("attn_rel_proj", "attn.rel_logits_proj.proj"), ("ffn_gate_inp", "mlp.gate.weight")):
+            add(b + gg + ".weight", t[s + hf])
+        add(b + "exp_probs_b.bias", t[s + "mlp.gate.bias"])
+        add(b + "shortconv_attn.weight", fold(t[s + "attn_sconv.weight"], CK + 1))
+        add(b + "shortconv_mlp.weight", fold(t[s + "mlp_sconv.weight"], CK + 1))
+        if i > 0:
+            add(b + "attn_res_score.weight", t[f"{m}attn_res.attn_queries.{i - 1}"])
+        add(b + "ffn_res_score.weight", t[f"{m}attn_res.mlp_queries.{i}"])
+        gu, dn = t[s + "mlp.experts.gate_up_proj"], t[s + "mlp.experts.down_proj"]
+        gate, up = gu[:, :I], gu[:, I:]
+        if i in INK2_SCALED:
+            sg = (np.abs(gu).max(axis=(1, 2)) / 2688.0).astype(np.float32)
+            sd = (np.abs(dn).max(axis=(1, 2)) / 2688.0).astype(np.float32)
+            gate, up, dn = gate / sg[:, None, None], up / sg[:, None, None], dn / sd[:, None, None]
+            add(b + "ffn_gate_exps.scale", sg); add(b + "ffn_up_exps.scale", sg); add(b + "ffn_down_exps.scale", sd)
+        else:
+            sg = sd = np.ones(E, np.float32)
+        hg, hu = exps(b + "ffn_gate_exps.weight", gate), exps(b + "ffn_up_exps.weight", up)
+        hd = exps(b + "ffn_down_exps.weight", dn)
+        held[s + "mlp.experts.gate_up_proj"] = np.concatenate([hg, hu], axis=1) * sg[:, None, None]
+        held[s + "mlp.experts.down_proj"] = hd * sd[:, None, None]
+    w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
+    return held
+
+
+def write_inkling2_pair(root, experts="F32", seed=11):
+    """root/ink2.gguf imported into root/gg, and root/snap: the model the file holds as a
+    checkpoint (safetensors under the official names, its experts as the file gives them back,
+    the config the import wrote). Returns (gg, snap)."""
+    sys.path.insert(0, str(HERE / "tools"))
+    import convert_inkling2_int4 as cv
+    root = Path(root)
+    t = write_inkling2(root / "ink2.gguf", ink2_weights(np.random.default_rng(seed)), experts)
+    p = subprocess.run([sys.executable, str(HERE / "tools" / "gguf_import.py"), str(root / "ink2.gguf"), str(root / "gg")],
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if p.returncode:
+        raise AssertionError(p.stdout.decode())
+    snap = root / "snap"
+    snap.mkdir()
+    cv.write_safetensors(str(snap / "model.safetensors"), {k: ("F32", v.shape, v.tobytes()) for k, v in t.items()})
+    (snap / "config.json").write_text((root / "gg" / "config.json").read_text())
+    return root / "gg", snap
+
+
+class Inkling2Config(unittest.TestCase):
+    """llama.cpp's inkling2 as the inkling engine's flat inkling2_text config.json."""
+    @unittest.skipIf(gguf is None, "gguf-py (pip install gguf) is not installed")
+    def test_the_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gg, _ = write_inkling2_pair(tmp)
+            cfg = json.loads((gg / "config.json").read_text())
+            self.assertEqual(cfg["model_type"], "inkling2_text")
+            self.assertEqual(cfg["layer_types"], ["hybrid_sliding", "hybrid_sliding", "hybrid", "hybrid_sliding"])
+            self.assertEqual((cfg["num_key_value_heads"], cfg["swa_num_key_value_heads"]), (1, 2))
+            self.assertEqual((cfg["d_rel"], cfg["rel_extent"], cfg["sliding_window_size"], cfg["conv_kernel_size"]), (8, 16, 8, 4))
+            self.assertEqual((cfg["n_routed_experts"], cfg["num_experts_per_tok"], cfg["route_scale"]), (8, 2, 2.0))
+            self.assertEqual((cfg["mlp_gate_softcap"], cfg["mlp_up_softcap"], cfg["n_layers_per_attn_res_block"]), (4.0, 25.0, 2))
+            self.assertEqual((cfg["vocab_size"], cfg["unpadded_vocab_size"]), (300, 290))
+
+
+INKLING = HERE / ("inkling.exe" if sys.platform == "win32" else "inkling")
+
+
+def inkling_run(snap, env=None):
+    """The inkling engine's greedy tokens for a fixed prompt (oracle mode on a reference with
+    the prompt only) and its last prompt position's logits."""
+    with tempfile.TemporaryDirectory() as tmp:
+        ref, dump = Path(tmp) / "ref.json", Path(tmp) / "logits.bin"
+        prompt = [5, 77, 13, 201, 42, 9, 150, 33, 61, 18, 240, 7]
+        ref.write_text(json.dumps({"prompt_ids": prompt, "full_ids": prompt + [0] * 12}))
+        p = subprocess.run([str(INKLING), "4", "0", str(ref)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           env=dict(os.environ, SNAP=str(snap), DUMP=str(dump), NOGPU="1", OMP_NUM_THREADS="2", **(env or {})))
+        out = p.stdout.decode("utf-8", "replace")
+        line = [l for l in out.splitlines() if l.startswith("C engine")]
+        if not line:
+            raise AssertionError(f"inkling produced no tokens (rc {p.returncode}):\n{out[-2000:]}")
+        return line[-1].split(":", 1)[1].split(), np.fromfile(dump, np.float32)
+
+
+@unittest.skipIf(gguf is None, "gguf-py (pip install gguf) is not installed")
+@unittest.skipUnless(INKLING.is_file(), "inkling is not built")
+class Inkling2Gguf(unittest.TestCase):
+    """An Inkling-2 GGUF reads as the checkpoint it came from: the engine's tokens and logits
+    from the imported GGUF (folded convolutions, queries by layer, experts without their global
+    scale) against the same model as safetensors under the official names."""
+    def test_the_gguf_is_the_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gg, snap = write_inkling2_pair(tmp)
+            tg, lg = inkling_run(gg)
+            ts, ls = inkling_run(snap)
+            self.assertEqual(tg, ts)
+            self.assertLess(float(np.abs(lg - ls).max()), 1e-3 * max(1.0, float(np.abs(ls).max())))
+
+    def test_q8_0_experts(self):
+        """Q8_0 blocks, the NVFP4 layers' holding W / scale: the float kernels (GQ_EXACT=1) on the
+        file against its weights as f32. The integer kernels quantize the activations too, and
+        this small random net makes about 1% of that noise a call anything from 2% to 100% of
+        the logits: their tokens are the device gates' business (tests/vulkan_engines.sh)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            gg, snap = write_inkling2_pair(tmp, experts="Q8_0")
+            tg, lg = inkling_run(gg, {"GQ_EXACT": "1"})
+            ts, ls = inkling_run(snap)
+            self.assertEqual(tg, ts)
+            self.assertLess(float(np.abs(lg - ls).max()), 1e-3 * max(1.0, float(np.abs(ls).max())))
+
+
 class GlmDsaConfig(unittest.TestCase):
     """llama.cpp's glm-dsa as the colibri engine's config.json, from unsloth's GLM-5.3 header:
     MLA's head dims from the _mla lengths, the NextN block past the model's layers, every

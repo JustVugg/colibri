@@ -638,6 +638,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"IDOT",                             CE_INT   , CE_COLIBRI | CE_INKLING | CE_OLMOE | CE_QWEN    , 0             , NULL},
     {"IDOT_GS",                          CE_STR   , CE_COLIBRI                                      , 0             , NULL},
     {"INK_DENSE_Q4",                     CE_STR   , CE_INKLING                                      , 0             , NULL},
+    {"INK_FILL_THREADS",                 CE_INT   , CE_INKLING                                      , 0             , NULL},
     {"INK_METAL_MIN_S",                  CE_INT   , CE_INKLING                                      , 0             , NULL},
     {"INK_METAL_SHARED",                 CE_BOOL  , CE_INKLING                                      , 0             , NULL},
     {"INK_PREFIX_LOG",                   CE_STR   , CE_INKLING                                      , 0             , NULL},

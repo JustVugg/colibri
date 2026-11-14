@@ -634,7 +634,9 @@ endif
 CFLAGS   += -DCOLI_CUDA
 LDFLAGS  += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lcublasLt -lcublas -lstdc++
 CUDA_OBJ  = backend_cuda.o cuda_chain.o cu_xb.o cu_tier.o
-INK_CUDA_OBJ = backend_cuda_ink.o
+# inkling's bf16 dense matrices (backend_cuda_ink.o), and the expert tier Inkling-2's
+# experts run on (cu_tier.o over the backend)
+INK_CUDA_OBJ = backend_cuda_ink.o $(CUDA_OBJ)
 ifeq ($(COLI_ANS),1)
 ifeq ($(strip $(DIETGPU_ROOT)),)
 $(error DIETGPU_ROOT is required when COLI_ANS=1)
@@ -2518,6 +2520,9 @@ tests/test_inkling_serve_framing$(EXE): tests/test_inkling_serve_framing.c inkli
 	$(CC) $(CFLAGS) $< $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_inkling_shared_batch$(EXE): tests/test_inkling_shared_batch.c inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_inkling2_kernels$(EXE): tests/test_inkling2_kernels.c inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
 
 # Reproducible local A/B for the shared-expert prefill path.  This is timing

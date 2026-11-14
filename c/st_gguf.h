@@ -204,6 +204,39 @@ static const st_gg_name st_gg_ink_layer[] = {
     {"ffn_down_exps.weight", "mlp.experts.%d.down_proj"},
     {NULL, NULL}};
 
+/* Inkling-2 (inkling2): under the checkpoint's own names (model.llm.*), which inkling2.h reads.
+ * The GGUF folds two things the checkpoint keeps apart, and inkling2.h unfolds them on load: the
+ * short convolutions carry their residual and their 1/sqrt(K + 1) (a global layer's static taps,
+ * in convolution order, and its dynamic projection 1/sqrt(2K + 1)), and the routed experts of the
+ * NVFP4 layers are stored without their global scale, which comes as one F32 per expert
+ * (ffn_*_exps.scale, amax / (448 * 6)). A layer's attention-residual queries, the checkpoint's
+ * model.llm.attn_res.attn_queries.(i-1) and mlp_queries.i, come under the layer's prefix. */
+static const st_gg_name st_gg_ink2_glob[] = {
+    {"token_embd.weight", "model.llm.embed.weight"}, {"token_embd_norm.weight", "model.llm.embed_norm.weight"},
+    {"output_norm.weight", "model.llm.norm.weight"}, {"output.weight", "model.llm.unembed.weight"},
+    {"output_res_score.weight", "model.llm.attn_res.output_query"},
+    {NULL, NULL}};
+static const st_gg_name st_gg_ink2_layer[] = {
+    {"attn_norm.weight", "attn_norm.weight"}, {"ffn_norm.weight", "mlp_norm.weight"},
+    {"attn_q_in_norm.weight", "q_input_norm.weight"}, {"attn_k_in_norm.weight", "k_input_norm.weight"},
+    {"attn_v_in_norm.weight", "v_input_norm.weight"},
+    {"attn_q.weight", "attn.wq_du.weight"}, {"attn_k.weight", "attn.wk_dv.weight"},
+    {"attn_v.weight", "attn.wv_dv.weight"}, {"attn_r.weight", "attn.wr_du.weight"},
+    {"attn_output.weight", "attn.wo_ud.weight"}, {"attn_gate.weight", "attn.gate_attn.weight"},
+    {"attn_sink_proj.weight", "attn.attn_sink_proj.weight"},
+    {"attn_q_clip.weight", "attn.q_l2_clip.scale"}, {"attn_r_clip.weight", "attn.rel_l2_clip.scale"},
+    {"attn_rel_proj.weight", "attn.rel_logits_proj.proj"},
+    {"shortconv_k.weight", "attn.k_sconv.gguf"}, {"shortconv_v.weight", "attn.v_sconv.gguf"},
+    {"shortconv_k_dyn.weight", "attn.k_sconv.gguf_dyn"}, {"shortconv_v_dyn.weight", "attn.v_sconv.gguf_dyn"},
+    {"shortconv_attn.weight", "attn_sconv.gguf"}, {"shortconv_mlp.weight", "mlp_sconv.gguf"},
+    {"attn_res_score.weight", "attn_res.attn_query"}, {"ffn_res_score.weight", "attn_res.mlp_query"},
+    {"ffn_gate_inp.weight", "mlp.gate.weight"}, {"exp_probs_b.bias", "mlp.gate.bias"},
+    {"ffn_gate_exps.weight", "mlp.experts.%d.gate_proj"}, {"ffn_up_exps.weight", "mlp.experts.%d.up_proj"},
+    {"ffn_down_exps.weight", "mlp.experts.%d.down_proj"},
+    {"ffn_gate_exps.scale", "mlp.experts.gate_scale"}, {"ffn_up_exps.scale", "mlp.experts.up_scale"},
+    {"ffn_down_exps.scale", "mlp.experts.down_scale"},
+    {NULL, NULL}};
+
 /* GLM-5.3-Flash (glm5-next): conversion/glm.py Glm5NextModel. MLA's kv_b comes split the way
  * glm53.c absorbs it (k_b = W_k^T per head, v_b = W_v); KDA's A_log comes as ssm_a = -exp(A_log);
  * glm53.c reads both forms. */
@@ -369,6 +402,7 @@ static const st_gg_map st_gguf_maps[] = {
     {"dflash", "mtp.%d.", st_gg_dflash_glob, st_gg_dsv41_layer, NULL, NULL},
     {"kimi-k3", "model.layers.%d.", st_gg_k3_glob, st_gg_k3_layer, NULL, NULL},
     {"inkling", "model.layers.%d.", st_gg_ink_glob, st_gg_ink_layer, NULL, NULL},
+    {"inkling2", "model.llm.layers.%d.", st_gg_ink2_glob, st_gg_ink2_layer, NULL, NULL},
     {"qwen_image", "transformer_blocks.%d.", st_gg_qimg_glob, st_gg_qimg_layer,
      "model.diffusion_model.", "transformer_blocks.%d.%n"},
     {"qwen3vl", "model.language_model.layers.%d.", st_gg_q3vl_glob, st_gg_q3vl_layer, NULL, NULL},
