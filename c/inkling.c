@@ -63,6 +63,9 @@
 #ifdef COLI_CUDA
 #include "backend_cuda_ink.h"
 static int g_cuda = 0;
+static int g_ink_cuda_dev = 0;   /* GPU_DEV */
+static int g_cu_chain = 0;       /* Inkling-2's CUDA chain on (1), for prompts only (2) (inkling2_cuchain.h) */
+static int g_ink2cc_want = 0;    /* planned at the tier's start: the tier leaves its memory */
 #endif
 #ifdef COLI_METAL
 /* Apple-GPU expert MoE (opt-in, COLI_METAL=1). Reuses colibri's batched
@@ -158,6 +161,10 @@ typedef struct { float *f; uint16_t *h; void *dev;
                                       * the key of its device copy, whatever the host holds */
                  const char *vk_name;/* the tensor's name, to read it back (ink_dho_reload) */
 #endif
+#ifdef COLI_CUDA
+                 void *cut; int cutf;/* the backend's tensor (ColiCudaTensor) and its format, where
+                                      * Inkling-2's CUDA chain moved the matrix (inkling2_cuchain.h) */
+#endif
                } Wt;
 
 typedef struct {
@@ -252,6 +259,9 @@ typedef struct {
     void *vkchain;                        /* the dense chain's device state (inkling_chain.h), NULL until it runs */
     void *vkchain2;                       /* its layers on COLI_VK_DEV2's device, after the primary's (inkling_chain.h) */
     void *ink2chain;                      /* Inkling-2's dense chain (inkling2_chain.h), NULL until it runs */
+#endif
+#ifdef COLI_CUDA
+    void *ink2cuchain;                    /* its CUDA twin (inkling2_cuchain.h) */
 #endif
     /* A multiplexed decode step (ink_step_rows): row s is the token at
      * mux_rows[s].pos of mux_rows[s].seq; NULL in every other forward. */
@@ -697,6 +707,11 @@ static void matmul_w(float *y, const float *x, Wt W, int S, int I, int O) {
     }
 #endif
 #ifdef COLI_CUDA
+    if (W.cut) {   /* the CUDA chain's tensor (inkling2_cuchain.h): the step it declined */
+        ColiCudaTensor *t = (ColiCudaTensor *)W.cut;
+        if (coli_cuda_matmul(&t, y, x, NULL, NULL, W.cutf, S, I, O, g_ink_cuda_dev, 0)) return;
+        fprintf(stderr, "cuda matmul failed and host copy was freed\n"); exit(1);
+    }
     if (W.dev) {
         if (ink_cuda_matmul_bf16(y, x, W.dev, S, I, O) == 0) return;
         fprintf(stderr, "cuda matmul failed and host copy was freed\n"); exit(1);
@@ -1600,7 +1615,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     if (!getenv("NOGPU") && !cuda_off) {
         int dev = getenv("GPU_DEV") ? atoi(getenv("GPU_DEV")) : 0;
         if (ink_cuda_init(dev) == 0) {
-            g_cuda = 1;
+            g_cuda = 1; g_ink_cuda_dev = dev;
             fprintf(stderr, "[cuda] device %d ready, %.1f GB free — bf16 residents to VRAM\n",
                     dev, ink_cuda_free_bytes()/1e9);
         } else fprintf(stderr, "[cuda] init failed, running on CPU\n");
@@ -2773,8 +2788,14 @@ static void ink_vk_tier_start(Model *m) {
  * pool of system RAM the device reads), beside the bf16 dense matrices the backend already
  * holds there (load_w), whose memory the budget it reads leaves them. Inkling keeps the
  * backend alone, as before: its experts on the CPU. */
+static size_t ink2cc_plan_bytes(const Model *m);   /* inkling2_cuchain.h */
 static void ink_cu_tier_start(Model *m) {
     Cfg *c = &m->c;
+    /* Inkling-2's CUDA chain (COLI_CUDA_CHAIN=1 or 2, inkling2_cuchain.h; off by default: it measured
+     * no faster than the matrices a call at a time) planned here, before the tier sizes itself: the
+     * tier leaves its buffers and K/V mirrors */
+    { const char *e = getenv("COLI_CUDA_CHAIN");
+      g_ink2cc_want = c->v2 && g_cuda && !XT(ready)() && e && (*e == '1' || *e == '2') && g_ink_mux_slots <= 1; }
     if (!c->v2 || !g_cuda || XT(ready)() || !cut_wanted()) return;   /* cut_wanted: COLI_VK_TIER=0 keeps it off */
     int dev = getenv("GPU_DEV") ? atoi(getenv("GPU_DEV")) : 0;
     if (!coli_cuda_init(&dev, 1)) { fprintf(stderr, "[CUDA] tier inkling: device %d unavailable; the experts stay on the CPU\n", dev); return; }
@@ -2817,7 +2838,9 @@ static void ink_cu_tier_start(Model *m) {
                     .ram_reserve = (size_t)slotb * (size_t)m->cache[0].cap * (size_t)nsp,
                     .ram_floor = (size_t)slotb * (size_t)c->topk * (size_t)nsp, .ram_given = ink_vk_ram_given,
                     .ram_later = ink_kv_later(m) + ink_ps_plan(),
-                    .dense_bytes = 0,   /* the backend's bf16 matrices are up already: the free memory counts them */
+                    /* the backend's bf16 matrices are up already (the free memory counts them); the chain's own
+                     * buffers are not yet */
+                    .dense_bytes = g_ink2cc_want ? ink2cc_plan_bytes(m) : 0,
                     .in_ram = ink_vk_in_ram, .ram_ctx = m,
                     .load = ink_vk_load, .release = ink_vk_unhold, .load_ctx = m, .load_batch = ink_vk_load_batch};
     const int tier_on = cut_init(&vc, m->eusage);
@@ -3415,10 +3438,16 @@ static void inkling_layers_forward_range(Model *m, float *x, int S, int pos0,
     free(nrm); free(tmp);
 }
 
-#ifdef COLI_VULKAN
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
 static int64_t ink_cs_cells(Cfg *c, int bank, int layer);
+#endif
+#ifdef COLI_VULKAN
 #include "inkling_chain.h"   /* COLI_VK_CHAIN: every layer's dense chain on the device */
 #include "inkling2_chain.h"  /* the same for Inkling-2 */
+#endif
+#ifdef COLI_CUDA
+#include "cuda_chain.h"
+#include "inkling2_cuchain.h"   /* COLI_CUDA_CHAIN: Inkling-2's on a CUDA device */
 #endif
 
 /* ---------- one forward pass over S new tokens ----------
@@ -3509,6 +3538,9 @@ static void ink_pin_state_restore(Model *m, const InkPinState *st){
 #ifdef COLI_VULKAN
     inkc_host_wrote(m, 0);   /* the dense chain's copy goes up again before its next step */
 #endif
+#ifdef COLI_CUDA
+    ink2cc_host_wrote(m, 0);
+#endif
 }
 
 static float *step_mm(Model *m, const int *ids, int S, int pos0, int *tf_out,
@@ -3546,8 +3578,25 @@ static float *step_mm(Model *m, const int *ids, int S, int pos0, int *tf_out,
         if (!took && !coli_prompt_broken()) inkc_cpu_step(m, pos0, S);   /* stopped: no CPU redo */
         else if (took == 2) layer0 = inkc_ran();   /* a partial chain: x is the residual after the last layer it ran */
     }
+#ifdef COLI_CUDA
+    if (!chain_logit && g_cu_chain) {   /* Inkling-2's CUDA chain (inkling2_cuchain.h) */
+        chain_logit = falloc(c->unpad_vocab);
+        int took = ink2cc_forward(m, x, S, pos0, (g_echo_k > 0 && g_echo_id && S > 1) || tf_out != NULL, chain_logit);
+        if (took != 1) { free(chain_logit); chain_logit = NULL; }
+        if (!took && !coli_prompt_broken()) ink2cc_cpu_step(m, pos0, S);
+    }
+#endif
     if (!chain_logit)
         inkling_layers_forward_range(m, x, S, pos0, layer0, c->n_layers);
+#elif defined(COLI_CUDA)
+    float *chain_logit = NULL;
+    if (g_cu_chain) {   /* Inkling-2's CUDA chain (inkling2_cuchain.h) */
+        chain_logit = falloc(c->unpad_vocab);
+        int took = ink2cc_forward(m, x, S, pos0, (g_echo_k > 0 && g_echo_id && S > 1) || tf_out != NULL, chain_logit);
+        if (took != 1) { free(chain_logit); chain_logit = NULL; }
+        if (!took && !coli_prompt_broken()) ink2cc_cpu_step(m, pos0, S);
+    }
+    if (!chain_logit) inkling_layers_forward_range(m, x, S, pos0, 0, c->n_layers);
 #else
     inkling_layers_forward_range(m, x, S, pos0, 0, c->n_layers);
 #endif
@@ -3612,7 +3661,7 @@ static float *step_mm(Model *m, const int *ids, int S, int pos0, int *tf_out,
         }
         free(normed); free(logits);
     }
-#ifdef COLI_VULKAN
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
     if (chain_logit) { free(x); free(last); return chain_logit; }   /* the chain's last frame ran the head */
 #endif
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
@@ -3694,6 +3743,9 @@ static void state_reset(Model *m) {
     }
 #ifdef COLI_VULKAN
     inkc_host_wrote(m, 1);   /* zeros: the dense chain fills its copy with zeros */
+#endif
+#ifdef COLI_CUDA
+    ink2cc_host_wrote(m, 1);
 #endif
 }
 
@@ -3850,6 +3902,9 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new,
     fflush(stdout); ink_vk_report(); ink_vk_tier_report(m, "run"); inkc_report(m);
 #elif defined(COLI_CUDA)
     fflush(stdout); ink_vk_tier_report(m, "run");
+#endif
+#ifdef COLI_CUDA
+    ink2cc_report(m);
 #endif
     free(ids);
 }
@@ -4138,6 +4193,9 @@ static void ink_unpark(Model *m) {
         inkc_host_wrote(m, 0);      /* the convolution states go up again */
         inkc_cpu_step(m, 0, n);     /* and the rows of positions [0, n), the ones that came back */
 #endif
+#ifdef COLI_CUDA
+        ink2cc_host_wrote(m, 0); ink2cc_cpu_step(m, 0, n);
+#endif
     } else coli_park_free(&g_ink_park);
     free(p);
 }
@@ -4259,6 +4317,9 @@ static int ink_ps_take(Model *m, const int *ids, int np, int held) {
 #ifdef COLI_VULKAN
     inkc_host_wrote(m, 0);      /* the convolution banks go up again */
     inkc_cpu_step(m, 0, P);     /* and the rows of positions [0, P) */
+#endif
+#ifdef COLI_CUDA
+    ink2cc_host_wrote(m, 0); ink2cc_cpu_step(m, 0, P);
 #endif
     if (getenv("INK_PREFIX_LOG") || getenv("COLI_PREFIX_LOG")) {
         fprintf(stderr, "[PREFIX] %d of %d prompt tokens from the store (%d blocks of %d and a checkpoint; the slot held %d)\n",
@@ -4541,6 +4602,9 @@ static int serve_one(Model *m, Tok *T, SReq *q) {
     ink_vk_report(); ink_vk_tier_report(m, "turn"); inkc_report(m);
 #elif defined(COLI_CUDA)
     ink_vk_tier_report(m, "turn");
+#endif
+#ifdef COLI_CUDA
+    ink2cc_report(m);
 #endif
     serve_hits(m);
     free(ids);
@@ -4960,6 +5024,7 @@ int main(int argc, char **argv) {
 #endif
 #ifdef COLI_CUDA
         ink_cu_tier_start(&m);   /* Inkling-2: the experts in the CUDA tier, after the history */
+        ink2cc_start(&m);        /* COLI_CUDA_CHAIN, after the tier */
 #endif
         char tkp[2048]; snprintf(tkp, sizeof(tkp), "%s/tokenizer.json", snap);
         Tok T; tok_load(&T, tkp);
@@ -4988,6 +5053,7 @@ int main(int argc, char **argv) {
 #endif
 #ifdef COLI_CUDA
         ink_cu_tier_start(&m);   /* Inkling-2: the experts in the CUDA tier, after the history */
+        ink2cc_start(&m);        /* COLI_CUDA_CHAIN, after the tier */
 #endif
         char tkp[2048]; snprintf(tkp, sizeof(tkp), "%s/tokenizer.json", snap);
         Tok T; tok_load(&T, tkp);
@@ -5045,6 +5111,7 @@ int main(int argc, char **argv) {
 #endif
 #ifdef COLI_CUDA
     ink_cu_tier_start(&m);
+    ink2cc_start(&m);
 #endif
     printf("== Inkling C engine (Stage A), cache = %d experts/layer, experts @ %s ==\n",
            cap, m.gx ? "GGUF" : m.xg64 ? "container (int4 g64)" : m.xq ? "container (int4/int8 + .qs)"
@@ -5126,6 +5193,9 @@ int main(int argc, char **argv) {
     fflush(stdout); ink_vk_report(); ink_vk_tier_report(&m, "run"); inkc_report(&m);
 #elif defined(COLI_CUDA)
     fflush(stdout); ink_vk_tier_report(&m, "run");
+#endif
+#ifdef COLI_CUDA
+    ink2cc_report(&m);
 #endif
     free(buf); free(arena);
     return (match == ngen) ? 0 : 1;

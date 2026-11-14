@@ -157,7 +157,9 @@ On a GPU, the CUDA build (`CUDA=1`) or the Vulkan one (`VK=1`, `COLI_VULKAN=1`):
   device. With Vulkan the layers run as a dense chain there (`COLI_VK_CHAIN`, on by default on
   a discrete GPU, [vulkan.md](vulkan.md#inkling-2-on-the-chain)): the attention, the residual
   mixes and the convolutions on the device, one frame a layer, the routed experts on the host;
-  with CUDA, or `COLI_VK_CHAIN=0`, the matrices go a call at a time and the rest runs on the CPU.
+  with CUDA, or `COLI_VK_CHAIN=0`, the matrices go a call at a time and the rest runs on the CPU
+  (a CUDA build has the same chain with `COLI_CUDA_CHAIN=1`, off by default: it measured no
+  faster there, [cuda.md](cuda.md#inkling-2-on-cuda-inkling2_cuchainh)).
 - the RAM cache's pinned experts that the tier holds go back to its LRU after the warm start,
   so that RAM and VRAM hold different experts. The tier's host pool is off for Inkling-2
   (`COLI_VK_TIER_HOST=1` turns it on): the RAM it takes from the expert cache cost more than
