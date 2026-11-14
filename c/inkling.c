@@ -235,6 +235,7 @@ typedef struct {
     Wt audio_enc;                         /* [mel_bins*mel_vocab, D] embedding table */
     float *audio_norm;                    /* audio tower RMSNorm [D]; NULL = no audio */
     struct Ink2Vision *vis;               /* Inkling-2's vision tower (inkling2_vision.h); NULL = none */
+    struct Ink2Mtp *mtp;                  /* Inkling-2's drafter (inkling2_mtp.h, INK2_MTP=1); NULL = none */
     float *img; int img_n, img_next;      /* a request's image rows [img_n][D], the next one step_mm takes */
     Layer *L;
     LCache *cache;
@@ -1528,6 +1529,8 @@ static void ink_vk_init_model(Model *m, int layer_begin, int layer_end) {
 
 static void ink2_load_layer(Model *m, int i, char *nm, size_t nmz);   /* inkling2.h */
 static struct Ink2Vision *ink2_vision_load(Model *m, const char *snap);   /* inkling2_vision.h */
+static int ink2m_wanted(void);                                     /* inkling2_mtp.h */
+static struct Ink2Mtp *ink2m_load(Model *m, const char *snap);
 /* The name of a layer's routed experts' gate/up (k 0) or down (k 1) tensor: Inkling's
  * gate_up_proj/down_proj; Inkling-2's under model.llm, gate_up_proj/down_proj in a container,
  * the checkpoint's w13_weight/w2_weight otherwise (x2_names) */
@@ -1557,6 +1560,12 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
          * COLI_METAL=1: not measured on a Mac yet, so off unless asked */
         const char *im = getenv("INK2_METAL");
         if (!(im && *im == '1')) setenv("COLI_METAL", "0", 1);
+        /* INK2_MTP: the drafter reads the layers' streams on the host, and its verify rolls the
+         * state back, which the dense chains keep a copy of on the device: they stay off */
+        if (ink2m_wanted()) {
+            setenv("COLI_VK_CHAIN", "0", 1); unsetenv("COLI_CUDA_CHAIN");
+            fprintf(stderr, "[inkling2] INK2_MTP: the dense chains off (the drafter reads the layers on the host)\n");
+        }
 #if !defined(COLI_CUDA) && !defined(COLI_VULKAN)
         fprintf(stderr, "[inkling2] Inkling-2 runs on the CPU in this build\n");
         setenv("NOGPU", "1", 1);
@@ -1646,6 +1655,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         m->lm_head    = load_w(m, "model.llm.unembed.weight", 1);
         m->x2_out_query = load_t(m, "model.llm.attn_res.output_query");
         m->vis = ink2_vision_load(m, snap);
+        if (ink2m_wanted()) m->mtp = ink2m_load(m, snap);
     } else if (load_boundaries) {
         m->embed      = load_w(m, "model.embed_tokens.weight", 0);
         { const char *en = embed_norm_name(&m->S); m->embed_norm = en ? load_t(m, en) : NULL; }
@@ -2341,6 +2351,9 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
     free(q); free(k); free(vv); free(rr); free(ctx);
 }
 
+static void ink2m_begin(Model *m, int S);                         /* inkling2_mtp.h */
+static void ink2m_capture(Model *m, int k, const float *x, int S);
+static void ink2m_end(Model *m, int pos0, int S);
 #include "inkling2.h"   /* Inkling-2: its attention, convolutions and attention residuals */
 #include "inkling2_vision.h"   /* Inkling-2: its vision tower */
 
@@ -3721,6 +3734,8 @@ static float *step(Model *m, const int *ids, int S, int pos0, int *tf_out) {
     return step_mm(m, ids, S, pos0, tf_out, NULL, 0);
 }
 
+#include "inkling2_mtp.h"   /* Inkling-2's drafter (INK2_MTP=1) */
+
 /* ---- several conversations at once (KV_SLOTS>1, serve_mux) ------------------- */
 static void ink_seq_swap(Model *m, InkSeq *q) {
     float **K = m->K, **V = m->V; int len = m->kv_len; kv_prefix p = m->kvp;
@@ -3871,7 +3886,22 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out,
     float *logit = step_mm(m, prompt, np, 0, NULL, dmel, naud);
     int len = np;
     Cfg *c = &m->c;
-    for (int s = 0; s < n_new; s++) {
+    if (m->mtp && n_new > 0) {   /* INK2_MTP: the same greedy tokens through the drafter's blocks */
+        int blk[INK2M_MAXB], nblk = 1, fed = np;
+        int best = 0; float bv = logit[0];
+        for (int i = 1; i < c->unpad_vocab; i++) if (logit[i] > bv) { bv = logit[i]; best = i; }
+        if (df) fwrite(logit, sizeof(float), (size_t)c->unpad_vocab, df);
+        free(logit); logit = NULL;
+        blk[0] = best;
+        for (;;) {
+            for (int j = 0; j < nblk && len - np < n_new; j++) out[len++] = blk[j];
+            if (len - np >= n_new) break;
+            const int last = blk[nblk - 1];
+            nblk = ink2m_step(m, last, fed, blk); fed += nblk;
+        }
+        ink2m_report(m);
+    }
+    for (int s = 0; s < n_new && logit; s++) {
         if (df) fwrite(logit, sizeof(float), (size_t)c->unpad_vocab, df);
         int best = 0; float bv = logit[0];
         for (int i = 1; i < c->unpad_vocab; i++) if (logit[i] > bv) { bv = logit[i]; best = i; }
@@ -3905,7 +3935,28 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new,
     float *logit = step_mm(m, ids, np, 0, NULL, dmel, naud);
     int len = np;
     char buf[512];
-    for (int s = 0; s < n_new; s++) {
+    if (m->mtp && n_new > 0) {   /* INK2_MTP: the drafter's blocks the target keeps (inkling2_mtp.h) */
+        int blk[INK2M_MAXB], nblk = 1, fed = np, s = 0, stop = 0;
+        int best = 0; float bv = logit[0];
+        for (int i = 1; i < c->unpad_vocab; i++) if (logit[i] > bv) { bv = logit[i]; best = i; }
+        free(logit); logit = NULL;
+        t1 = now_s();
+        blk[0] = best;
+        while (!stop) {
+            for (int j = 0; j < nblk && !stop; j++) {
+                if (blk[j] == c->eos) { printf("\n[eos after %d tokens]", s); stop = 1; break; }
+                int nb = tok_decode(T, &blk[j], 1, buf, sizeof(buf)-1);
+                buf[nb] = 0; fputs(buf, stdout); fflush(stdout);
+                len++; s++;
+                if (s >= n_new) stop = 1;
+            }
+            if (stop) break;
+            const int last = blk[nblk - 1];
+            nblk = ink2m_step(m, last, fed, blk); fed += nblk;
+        }
+        ink2m_report(m);
+    }
+    for (int s = 0; s < n_new && logit; s++) {
         int best = 0; float bv = logit[0];
         for (int i = 1; i < c->unpad_vocab; i++) if (logit[i] > bv) { bv = logit[i]; best = i; }
         free(logit);
@@ -4602,6 +4653,31 @@ static int serve_one(Model *m, Tok *T, SReq *q) {
     float rep = ink_rep_pen(m);
     int hist[128], nhist = 0;
     for (int i = (np > 128 ? np - 128 : 0); i < np; i++) hist[nhist++] = ids[i];
+    if (m->mtp && q->temp <= 0.f && rep == 1.f && q->logprobs == 0 && !m->mux_rows && q->max_tok > 0) {
+        /* INK2_MTP, a greedy request: the target's token, then the drafter's blocks it keeps
+         * (inkling2_mtp.h); each block's tokens go out in order */
+        int blk[INK2M_MAXB], nblk = 1, fed = np, stop = 0;
+        blk[0] = sample_logits(logit, c->unpad_vocab, 0.f, 1.f);
+        free(logit); logit = NULL;
+        while (!stop) {
+            for (int j = 0; j < nblk && !stop; j++) {
+                const int tk = blk[j];
+                if (tk == c->eos) { limited = 0; stop = 1; break; }
+                int nb = tok_decode(T, &tk, 1, buf, sizeof(buf)-1);
+                coli_serve_write_data(stdout,q->id,buf,(size_t)nb);
+                gen++; len++;
+                while (stdin_readable()) {
+                    int r = serve_read_cmd(stdin, stdout, q->id);
+                    if (r < 0) { free(ids); return -1; }
+                    if (r > 0) { cancelled = 1; limited = 0; }
+                }
+                if (cancelled || gen >= q->max_tok) stop = 1;
+            }
+            if (stop) break;
+            const int last = blk[nblk - 1];
+            nblk = ink2m_step(m, last, fed, blk); fed += nblk; forwards++;
+        }
+    } else
     for (int s = 0; s < q->max_tok && !cancelled; s++) {
         apply_rep_penalty(logit, c->unpad_vocab, hist, nhist, rep);
         int tk = sample_logits(logit, c->unpad_vocab, q->temp, q->top_p);
@@ -5223,6 +5299,9 @@ int main(int argc, char **argv) {
     }
 
     /* pass 2: greedy generation, token-for-token vs the oracle */
+    if (m.mtp && getenv("INK2_MTP_ORACLE") && *getenv("INK2_MTP_ORACLE") == '1') {   /* tests: see ink2m_draft */
+        g_ink2m_known = full; g_ink2m_nknown = nfull;
+    }
     int *out = malloc(nfull * sizeof(int));
     double t = now_s();
     INK_IMG_REWIND();

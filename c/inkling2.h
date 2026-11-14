@@ -352,6 +352,8 @@ static void ink2_layers_forward(Model *m, float *x, int S, int pos0) {
     float *a = falloc(SD), *res = falloc(SD);
     if (!blocks) { fprintf(stderr, "OOM\n"); exit(1); }
     int B = 0;
+    ink2m_begin(m, S);   /* INK2_MTP: the drafter's fused streams of this forward */
+    ink2m_capture(m, 0, x, S);
     for (int i = 0; i < L; i++) {
         if (coli_prompt_break()) break;
         Layer *l = &m->L[i];
@@ -393,11 +395,14 @@ static void ink2_layers_forward(Model *m, float *x, int S, int pos0) {
         moe(m, l, i, nq, S, mo);
         ink2_sconv(m, mo, S, D, l->m_cw, 3, i);
         for (int64_t j = 0; j < SD; j++) x[j] = res[j] + mo[j];
+        ink2m_capture(m, i + 1, x, S);
     }
     if (!coli_prompt_broken()) {   /* the output's mix of the blocks and the last stream */
         float *outs[1] = { hq };
         ink2_attn_res(c, m->x2_out_query, 1, blocks, B, x, S, outs);
         memcpy(x, hq, (size_t)SD * sizeof(float));
+        ink2m_capture(m, L + 1, x, S);
+        ink2m_end(m, pos0, S);
     }
     for (int b = 0; b < B; b++) free(blocks[b]);
     free(blocks); free(hq); free(hk); free(hv); free(nq); free(nk); free(nv); free(a); free(res);
