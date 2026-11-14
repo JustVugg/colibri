@@ -644,6 +644,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"INK_DENSE_Q4",                     CE_STR   , CE_INKLING                                      , 0             , NULL},
     {"INK_FILL_ASYNC",                   CE_BOOL  , CE_INKLING                                      , 0             , NULL},
     {"INK_FILL_DELAY_US",                CE_INT   , CE_INKLING                                      , 0             , NULL},
+    {"INK_FILL_DIRECT",                  CE_BOOL  , CE_INKLING                                      , 0             , NULL},
     {"INK_FILL_THREADS",                 CE_INT   , CE_INKLING                                      , 0             , NULL},
     {"INK_METAL_MIN_S",                  CE_INT   , CE_INKLING                                      , 0             , NULL},
     {"INK_METAL_SHARED",                 CE_BOOL  , CE_INKLING                                      , 0             , NULL},

@@ -2077,6 +2077,62 @@ static int ink_fill_threads(void) {
     if (n < 0) { const char *e = getenv("INK_FILL_THREADS"); n = e && atoi(e) > 0 ? atoi(e) : 12; }
     return n;
 }
+/* INK_FILL_DIRECT (default on, Linux): the pieces read with O_DIRECT, past the page cache, each
+ * piece's 4 KiB-aligned span into a buffer of the thread's and the piece copied out (a container's
+ * slices start wherever its header ends). Measured on two NVMe in RAID0, the engine's pieces of
+ * 2 MiB: 2.3 ms an expert against 3.0 buffered in rounds of three, 2.1-2.3 against 2.8-3.0 deeper
+ * (8.2 GB/s against 6.0); Inkling-2-Small's decode (the CUDA build, 48 tokens on two prompts,
+ * alternated) 1.96-2.01 -> 2.30-2.33 tok/s, the prompt 12.8-13.1 -> 11.0-11.2 s. A file system
+ * without O_DIRECT, or a read it refuses, falls back to the buffered read for good. */
+#if defined(__linux__) && defined(O_DIRECT)
+static int ink_fill_direct_on = -1;
+static int ink_dfd_of[1024];   /* the O_DIRECT twin of a shard's fd (index: the fd), 0 unknown, -1 none */
+static int ink_dfd(int fd) {
+    if (ink_fill_direct_on < 0) { const char *e = getenv("INK_FILL_DIRECT"); ink_fill_direct_on = !(e && *e == '0'); }
+    if (!ink_fill_direct_on || fd < 0 || fd >= 1024) return -1;
+    if (!ink_dfd_of[fd]) {
+        char lk[64], path[4096];
+        snprintf(lk, sizeof lk, "/proc/self/fd/%d", fd);
+        const ssize_t n = readlink(lk, path, sizeof path - 1);
+        int d = -1;
+        if (n > 0) { path[n] = 0; d = open(path, O_RDONLY | O_DIRECT); }
+        ink_dfd_of[fd] = d >= 0 ? d : -1;
+        static int said;
+        if (d >= 0 && !said) { said = 1; fprintf(stderr, "[inkling] the experts' reads with O_DIRECT, past the page cache (INK_FILL_DIRECT=0: buffered)\n"); }
+    }
+    return ink_dfd_of[fd];
+}
+/* The pieces' aligned buffers, one a reader, kept across rounds (a round's readers are a new team
+ * of the fill thread's each time: buffers of their own would leak); a round holds them all. */
+static uint8_t **ink_bb;
+static int ink_nbb;
+static pthread_mutex_t ink_bb_mu = PTHREAD_MUTEX_INITIALIZER;
+static int ink_bb_take(int n) {   /* locked on success: 1 */
+    pthread_mutex_lock(&ink_bb_mu);
+    if (n > ink_nbb) {
+        uint8_t **b = realloc(ink_bb, (size_t)n * sizeof *b);
+        if (!b) { pthread_mutex_unlock(&ink_bb_mu); return 0; }
+        ink_bb = b;
+        for (; ink_nbb < n; ink_nbb++)
+            if (posix_memalign((void **)&ink_bb[ink_nbb], 4096, INK_FILL_PIECE + 8192)) { pthread_mutex_unlock(&ink_bb_mu); return 0; }
+    }
+    return 1;
+}
+/* 1 when the piece came through O_DIRECT */
+static int ink_pread_direct(int dfd, uint8_t *bb, uint8_t *dst, int64_t n, int64_t off) {
+    const int64_t a = off & ~(int64_t)4095, e = (off + n + 4095) & ~(int64_t)4095, need = off + n - a;
+    if (e - a > INK_FILL_PIECE + 8192) return 0;
+    int64_t got = 0;
+    while (got < need) {
+        const ssize_t r = pread(dfd, bb + got, (size_t)(e - a - got), a + got);
+        if (r < 0 || (r == 0 && got < need)) return 0;
+        if (r == 0) break;
+        got += r;
+    }
+    memcpy(dst, bb + (off - a), (size_t)n);
+    return 1;
+}
+#endif
 static void ink_fill_slots(Model *m, int layer, const int *layers, Slot **fill, int nfill) {
     if (nfill < 1) return;
     if (!m->xg64) {
@@ -2111,11 +2167,33 @@ static void ink_fill_slots(Model *m, int layer, const int *layers, Slot **fill, 
                                     len[k] - o < INK_FILL_PIECE ? len[k] - o : INK_FILL_PIECE };
         }
     }
+#if defined(__linux__) && defined(O_DIRECT)
+    int *dfd = malloc((size_t)np * sizeof(int));   /* opened here, outside the threads */
+    if (!dfd) { fprintf(stderr, "OOM fill\n"); exit(1); }
+    const int nt = ink_fill_threads();
+    const int held = ink_bb_take(nt);
+    for (int i = 0; i < np; i++) dfd[i] = held ? ink_dfd(pc[i].fd) : -1;
+    int refused = 0;
+    #pragma omp parallel for schedule(dynamic,1) num_threads(nt) reduction(|:refused)
+    for (int i = 0; i < np; i++) {
+        if (dfd[i] >= 0 && ink_pread_direct(dfd[i], ink_bb[omp_get_thread_num()], pc[i].dst, pc[i].n, pc[i].off)) continue;
+        refused |= dfd[i] >= 0;
+        pread_all(pc[i].fd, pc[i].dst, pc[i].n, pc[i].off);
+        posix_fadvise(pc[i].fd, pc[i].off, pc[i].n, POSIX_FADV_DONTNEED);
+    }
+    if (held) pthread_mutex_unlock(&ink_bb_mu);
+    if (refused && ink_fill_direct_on) {
+        ink_fill_direct_on = 0;
+        fprintf(stderr, "[inkling] an O_DIRECT read was refused: the experts' reads go through the page cache from now on\n");
+    }
+    free(dfd);
+#else
     #pragma omp parallel for schedule(dynamic,1) num_threads(ink_fill_threads())
     for (int i = 0; i < np; i++) {
         pread_all(pc[i].fd, pc[i].dst, pc[i].n, pc[i].off);
         posix_fadvise(pc[i].fd, pc[i].off, pc[i].n, POSIX_FADV_DONTNEED);
     }
+#endif
     free(pc);
     for (int j = 0; j < nfill; j++) fill[j]->filled = 1;
 }
