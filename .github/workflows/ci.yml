@@ -97,7 +97,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: C suite under ASan + UBSan
-        run: make -C c test-asan
+        run: make -C c -j"$(nproc)" test-asan
       - name: rANS fuzz round-trip (ASan + UBSan)
         # Already sanitized and already asserting byte identity across every
         # compiled decode arm; it just had no job to run in.
@@ -2227,7 +2227,7 @@ jobs:
       # rieseguiva un binario non strumentato. Uno di quei test era rosso da
       # settimane senza che nessuno potesse vederlo.
       - name: Build the engines those tests exercise
-        run: make -C c kimi_k3 inkling colibri olmoe qwen38 qwen36 deepseek_v41 qwenimage glm53 mimo
+        run: make -C c -j"$(nproc)" kimi_k3 inkling colibri olmoe qwen38 qwen36 deepseek_v41 qwenimage glm53 mimo
       - name: Python test suite
         run: cd c && python3 -m unittest discover -s tests -p 'test_*.py'
 
