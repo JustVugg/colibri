@@ -193,9 +193,14 @@ GPU tiers and the reads above; it was not measured since. The host pool on
 (`COLI_VK_TIER_HOST=1`) gave CUDA 1.27-1.29 tok/s against 1.60-1.61 off, and Vulkan 1.33-1.41
 against 1.26-1.63, before the pieced reads.
 
-The CUDA build's CPU computes its share of the experts more slowly than the Vulkan build's (an
-`expert-mm` of 18.5-19.8 s against 13.9-14.4 s over the same experts, whichever CUDA sync policy
-the backend takes); that is where its decode trails, and it is not found yet.
+The CUDA build's CPU used to compute its share of the experts more slowly than the Vulkan build's
+(0.72-0.76 ms a pair against 0.52, the same experts, the reads first): a CUDA build of the engine
+left out the OpenMP tuning every other build takes (an active wait, a thread a core), because
+Inkling's 727 dense calls a token on the CUDA backend starved its driver with a spinning team. It
+was the binary, not the card: with `NOGPU=1` the same build took 0.72 ms a pair. A CUDA build now
+takes the tuning for Inkling-2 (the snapshot's `config.json` says so before the engine re-executes
+itself); Inkling keeps the exception. The same session, 48 tokens on two prompts: 1.55-1.59 ->
+1.91 tok/s, as the Vulkan build.
 
 ### Inkling-2: pictures
 

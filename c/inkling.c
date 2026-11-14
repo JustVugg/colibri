@@ -4888,14 +4888,23 @@ int main(int argc, char **argv) {
      * wait policy parks the team between regions and re-wake latency dominates.
      * libgomp reads OMP_/GOMP_ vars before main(), so seed them and re-exec
      * once (COLI_OMP_TUNED guards the exec; COLI_NO_OMP_TUNE=1 disables).
-     * NOT under CUDA — same exception glm.c makes: a spinning 24-thread team
-     * starves the CUDA driver during every stream sync. */
-#if !defined(COLI_CUDA) && !defined(__APPLE__)
+     * NOT under CUDA for Inkling — same exception glm.c makes: a spinning 24-thread team
+     * starves the CUDA driver during every stream sync (its 727 dense calls a token).
+     * Inkling-2 under CUDA takes it: passive and unbound, its routed experts on the CPU
+     * ran 0.98-1.00 ms a pair against 0.85 tuned (an RTX PRO 4000, an i5-13500, the int4
+     * g64 container, 48 tokens on two prompts), the decode 1.55-1.59 -> 1.91-1.92 tok/s;
+     * the binding alone 1.85-1.86. */
+#if defined(COLI_CUDA) && !defined(__APPLE__)
+    const int omp_tune = ink_snap_v2(getenv("SNAP"));
+#else
+    const int omp_tune = 1;
+#endif
+#if !defined(__APPLE__)
     /* NOT on Apple Silicon: the active-spin team steals the shared SoC power
      * budget (same mechanism as the M5 Max Metal report) and measured strictly
      * worse on Inkling-Small even for pure-CPU decode — 0.50 vs 0.84 tok/s,
      * and 2x the prefill. Opt back in with COLI_OMP_TUNED=0 unset + Linux. */
-    if (!getenv("COLI_OMP_TUNED") && !getenv("COLI_NO_OMP_TUNE")) {
+    if (omp_tune && !getenv("COLI_OMP_TUNED") && !getenv("COLI_NO_OMP_TUNE")) {
         setenv("OMP_WAIT_POLICY","active",0);
         setenv("GOMP_SPINCOUNT","200000",0);
         setenv("OMP_PROC_BIND","close",0);
@@ -4907,7 +4916,7 @@ int main(int argc, char **argv) {
         perror("[OMP] execv self-reexec failed, running untuned");
 #endif
     }
-#endif  /* !COLI_CUDA && !__APPLE__ */
+#endif  /* !__APPLE__ */
     coli_omp_tune_threads("inkling");
     /* Registry check: an unknown or wrong-engine variable is silently ignored
      * otherwise, and the run then reports a plausible number for the WRONG
