@@ -1040,6 +1040,20 @@ static int test_expert_store_lease_capacity(void) {
                         "after the pool=%d\n", pooled, other, pooled_held, restored);
         failed = 1;
     }
+    /* The GPU tier's decode mirrors on the store do not turn the pool off: a
+     * prompt that takes the CPU union there sweeps the same experts chunk
+     * after chunk (only the VRAM bank, COLI_CUDA_MOE_BATCH=1, replaces it). */
+    int mirrors = 0;
+    store->gpu = &mirrors;
+    coli_v4_expert_store_prefill_pool(store, 0);
+    int mirrored = coli_v4_expert_store_lease_capacity(store, 0);
+    coli_v4_expert_store_prefill_pool(store, -1);
+    store->gpu = NULL;
+    if (mirrored != LAYERS * SLOTS_PER_LAYER) {
+        fprintf(stderr, "pooled lease capacity=%d with GPU mirrors on the "
+                        "store\n", mirrored);
+        failed = 1;
+    }
     store->ops->destroy(store);
     failed |= scratch_remove(directory, path);
     if (failed) return 1;

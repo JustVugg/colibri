@@ -11323,9 +11323,17 @@ int coli_v4_test_force_streaming_direct(ColiExpertStore *store) {
  *
  * The capability is intentionally private to the production hot store.  A
  * registered alternative ExpertStore backend receives a safe no-op rather
- * than having its opaque state reinterpreted here. */
+ * than having its opaque state reinterpreted here.
+ *
+ * With the GPU tier's mirrors on the store, a prompt's experts go through the
+ * VRAM bank (COLI_CUDA_MOE_BATCH=1), which reads each one once per layer and
+ * needs no pool. Without the bank the prompt takes the CPU union here, as on
+ * a CPU build. */
 void coli_v4_expert_store_prefill_pool(ColiExpertStore *store, int layer) {
-    if (!store || !store->state || store->gpu || !hot_find(store)) return;
+    if (!store || !store->state || !hot_find(store)) return;
+#ifdef COLI_V4_GPU_TIER
+    if (store->gpu && coli_v4_gpu_moe_batch_wanted()) return;
+#endif
     V4ExpertStoreState *state = store->state;
     if (layer < 0 || layer >= state->layers) layer = -1;
     pthread_mutex_lock(&state->mutex);
