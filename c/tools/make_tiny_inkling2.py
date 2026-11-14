@@ -17,7 +17,10 @@ the static convolution taps, the clip scales, the routing bias), so that none of
 snapshot and writes the oracle of the same model with the container's experts (its int4 g64
 weights decoded to f32): the engine reading the container must reproduce it.
 
-Usage: python3 make_tiny_inkling2.py <outdir> [--g64]
+--vision adds a tiny vision tower and one image among the prompt's tokens
+(Inkling2ForConditionalGeneration); the oracle carries the image's pixels.
+
+Usage: python3 make_tiny_inkling2.py <outdir> [--g64 | --vision]
        python3 make_tiny_inkling2.py --int4-ref <container> <snapshot> <outdir>
 """
 import glob
@@ -52,9 +55,8 @@ def oracle(model, out):
     print("continuation:", full[len(PROMPT):])
 
 
-def build(out, g64):
-    torch.manual_seed(0)
-    cfg = Inkling2TextConfig(
+def text_config(g64):
+    return Inkling2TextConfig(
         vocab_size=256,
         unpadded_vocab_size=250,
         hidden_size=128 if g64 else 64,
@@ -83,7 +85,11 @@ def build(out, g64):
         max_position_embeddings=4096,
         eos_token_id=None,
     )
-    model = Inkling2ForCausalLM(cfg).eval().float()
+
+
+def randomize(model):
+    """Every parameter drawn at random, gains near one (the ones transformers starts at zero or
+    one included: none of them is a no-op)."""
     g = torch.Generator().manual_seed(1)
     with torch.no_grad():
         for name, p in model.named_parameters():
@@ -91,9 +97,54 @@ def build(out, g64):
                 p.copy_(1.0 + 0.2 * torch.randn(p.shape, generator=g))     # gains near one
             else:
                 p.copy_(0.2 * torch.randn(p.shape, generator=g))
+
+
+def build(out, g64):
+    torch.manual_seed(0)
+    model = Inkling2ForCausalLM(text_config(g64)).eval().float()
+    randomize(model)
     model.save_pretrained(out, safe_serialization=True)
     oracle(model, out)
     print(f"saved tiny model + ref_inkling2.json to {out}/")
+
+
+IMG = 252             # the image placeholder (Inkling-2-Small's is 200054), past the unpadded vocab
+IMG_ROWS, IMG_COLS = 2, 3
+
+
+def build_vision(out):
+    """The same text model with a tiny vision tower (Inkling2ForConditionalGeneration): two
+    layers, 4-pixel patches merged 2 x 2 (an image token is an 8 x 8 tile), the position table a
+    4 x 4 grid; one random 2 x 3-token image among the prompt's tokens. The oracle adds the
+    image's pixels ([tokens][tile][tile][3], in [-1, 1], as Inkling2ImageProcessor gives them)
+    and its grid."""
+    from transformers import Inkling2Config, Inkling2ForConditionalGeneration, Inkling2VisionConfig
+    torch.manual_seed(0)
+    vision = Inkling2VisionConfig(hidden_size=32, num_hidden_layers=2, num_attention_heads=2, patch_size=4,
+                                  spatial_merge_size=2, posemb_grid_size=4, projection_hidden_dim=48,
+                                  text_hidden_size=64, mlp_ratio=2.0, layer_norm_eps=1e-5)
+    cfg = Inkling2Config(text_config=text_config(False).to_dict(), vision_config=vision.to_dict(), image_token_id=IMG)
+    model = Inkling2ForConditionalGeneration(cfg).eval().float()
+    randomize(model)
+    g = torch.Generator().manual_seed(2)
+    tile = vision.patch_size * vision.spatial_merge_size
+    pixels = torch.rand(IMG_ROWS * IMG_COLS, tile, tile, 3, generator=g) * 2 - 1
+    grid = torch.tensor([[1, IMG_ROWS, IMG_COLS]])
+    prompt = PROMPT[:4] + [IMG] * (IMG_ROWS * IMG_COLS) + PROMPT[4:]
+    ids = torch.tensor([prompt], dtype=torch.long)
+    with torch.no_grad():
+        gen = model.generate(ids, pixel_values=pixels, image_grid_thw=grid, max_new_tokens=N_NEW, do_sample=False)
+        full = gen[0].tolist()
+        tf = model(torch.tensor([full]), pixel_values=pixels, image_grid_thw=grid).logits[0].argmax(-1).tolist()
+        last = model(ids, pixel_values=pixels, image_grid_thw=grid).logits[0, -1].tolist()
+    model.save_pretrained(out, safe_serialization=True)
+    ref = {"prompt_ids": prompt, "full_ids": full, "tf_pred": tf, "prompt_last_logits": last,
+           "image_token_id": IMG, "image_grid_thw": [1, IMG_ROWS, IMG_COLS],
+           "pixel_values": pixels.flatten().tolist()}
+    with open(f"{out}/ref_inkling2.json", "w") as f:
+        json.dump(ref, f)
+    print("continuation:", full[len(prompt):])
+    print(f"saved tiny model with vision + ref_inkling2.json to {out}/")
 
 
 def int4_ref(container, snap, out):
@@ -144,6 +195,10 @@ def main():
         if len(a) != 4:
             sys.exit(__doc__)
         int4_ref(*a[1:])
+        return
+    if "--vision" in a:
+        a = [x for x in a if x != "--vision"]
+        build_vision(a[0] if a else "tiny_inkling2_vision")
         return
     g64 = "--g64" in a
     a = [x for x in a if x != "--g64"]
