@@ -6686,6 +6686,23 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
     (void)layers_forward_control(m, x, S, pos_base, layer_begin, layer_end,
                                  allow_prefetch, lf, NULL);
 }
+/* step_ex's layers on the CPU, a prompt's rows Q36_CPU_ROWS at a time as the chains read them: the
+ * layers' scratch (attention's q, k, v, gate and context, nrm and tmp: 192 KiB a row on Qwen3.8-27B)
+ * is a chunk's, not the prompt's (a 93K-token prompt off the chain: 18 GB). The CPU's kernels compute
+ * a row on its own and a chunk's attention reads the rows before it from the cache: the same bits.
+ * A sliding layer's ring reads a step's own rows apart and DUMP_LAYERS writes a step's last row:
+ * those take the prompt whole. */
+#define Q36_CPU_ROWS 4096
+static int layers_forward_rows(Model *m, float *x, int S, int pos_base, int layer_begin, FILE *lf,
+                               Q36StepControl *control) {
+    const int C = lf || m->kv_ring ? S : Q36_CPU_ROWS;
+    for (int s0 = 0; s0 < S; s0 += C) {
+        const int n = S - s0 < C ? S - s0 : C;
+        if (layers_forward_control(m, x + (int64_t)s0 * m->c.hidden, n, pos_base + s0, layer_begin,
+                                   m->c.n_layers, 1, lf, control)) return 1;
+    }
+    return 0;
+}
 
 /* Fotografia dello stato dopo un prefill "pinnato" (SUBMIT pin=1).
  *
@@ -6946,8 +6963,7 @@ static float *step_ex_control(Model *m, const int *ids, int S, int pos_base, int
         } else if (rows_only) { free(chain_logit); chain_logit = NULL; }
     }
 #endif
-    if (stopped || (!chain_logit && layers_forward_control(m, x, S, pos_base, chain_n,
-                                                           c->n_layers, 1, lf, control))) {
+    if (stopped || (!chain_logit && layers_forward_rows(m, x, S, pos_base, chain_n, lf, control))) {
         /* Some layers (or a chain's first chunks) may have advanced, others not. Neither
          * the previous prefix nor a partially processed prompt describes this state. */
         q36_prefill_abort(m, pos_base, S);
@@ -8124,6 +8140,9 @@ static int q36_spec_alloc(Model *m, int rows) {
         }
         m->snap_slots = sl + 1;
     }
+#ifdef COLI_CUDA
+    if (!q36cc_verify_room(m, rows)) return 0;
+#endif
     return 1;
 }
 

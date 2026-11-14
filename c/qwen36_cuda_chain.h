@@ -179,7 +179,7 @@ static void q36cc_recover(Model *m, int upto) {
     for (int s = 0; s < upto; s++) q36_embed_row(m, ids[s], s, x + (int64_t)s * D);
     int snap = m->snap_rows, rowwise = g_q36_rowwise;
     m->snap_rows = 0; g_q36_rowwise = 0;
-    layers_forward_range(m, x, upto, 0, 0, c->n_layers, 0, NULL);
+    layers_forward_rows(m, x, upto, 0, 0, NULL, NULL);   /* a chunk's scratch, not the context's */
     m->snap_rows = snap; g_q36_rowwise = rowwise;
     free(ids); free(x);
 }
@@ -954,6 +954,18 @@ static int q36cc_spec_slots(Q36CChain *ch, Model *m, int rows) {
         ch->snap_slots = sl + 1;
     }
     return 1;
+}
+/* A verify's copies on the device before its drafts are made (q36_spec_alloc): 0 when the device
+ * refuses them and the chain would run the verify, so the caller takes a plain step there. On the
+ * CPU (q36cc_forward's refusal) a long context's verifies ran on the host's path: Qwen3.8-27B at
+ * 93K tokens, 72 GB of commit and the process out of memory. */
+static int q36cc_verify_room(Model *m, int rows) {
+    Q36CChain *ch = q36cc_of(m);
+    if (!g_cuda_chain || qq_active() || g_pilot || m->mux_rows || !ch || !ch->ok || ch->failed ||
+        q36cc_spec_slots(ch, m, rows)) return 1;
+    static int told;
+    if (!told) { told = 1; fprintf(stderr, "[chain] qwen36: device memory for a verify's %d copies refused; plain steps, not the CPU\n", rows); }
+    return 0;
 }
 /* The uploads that make the device state the host's, as the step at pos_base needs it. */
 static int q36cc_push_state(Q36CChain *ch, Model *m, int pos_base) {
@@ -2174,6 +2186,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
     if (S == 1) { ch->dec_n++; ch->dec_wait_ms += ch->wait_ms - w0; ch->dec_host_ms += ch->host_ms - h0; }
     return L;
 lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */
+    fprintf(stderr, "[chain] qwen36: a frame of a %d-row step at position %d failed; the CPU runs from here on\n", S, pos_base);
     if (!cc_lost()) cc_finish();
     q36cc_dm_end(ch);
     if (!ch->mx_rows) q36cc_recover(m, pos_base);   /* the held conversation (none in a multiplexed step) */
