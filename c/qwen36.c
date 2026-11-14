@@ -8469,9 +8469,9 @@ static void q36_pending_image_clear(void){
     memset(&g_pending_image, 0, sizeof g_pending_image);
 }
 
-static int serve_read_req(ServeReq *q){
+static int serve_read_req(FILE *in, FILE *out, ServeReq *q){
     char line[512], cmd[16], id[64];
-    if(!fgets(line,sizeof(line),stdin)) return -1;
+    if(!fgets(line,sizeof(line),in)) return -1;
     if(sscanf(line,"%15s %63s",cmd,id)<2) return 0;
     if(!strcmp(cmd,"IMAGE")){
         /* The payload is consumed whatever happens next: left in the stream it
@@ -8479,12 +8479,12 @@ static int serve_read_req(ServeReq *q){
          * say how long the payload is cannot be skipped, so it ends the session. */
         unsigned long long bytes; int gh, gw;
         if(sscanf(line,"%*s %*s %llu %d %d",&bytes,&gh,&gw)!=3 || bytes>(1ull<<30) || gh<1 || gw<1){
-            printf("ERROR %s bad image header\n",id); fflush(stdout); return -1;
+            fprintf(out,"ERROR %s bad image header\n",id); fflush(out); return -1;
         }
         unsigned char *buf = malloc((size_t)bytes + 1);
-        if(!buf){ printf("ERROR %s out of memory\n",id); fflush(stdout); return -1; }
-        if(bytes && fread(buf,1,(size_t)bytes,stdin)!=(size_t)bytes){ free(buf); return -1; }
-        int t = fgetc(stdin); if(t=='\r') t = fgetc(stdin);
+        if(!buf){ fprintf(out,"ERROR %s out of memory\n",id); fflush(out); return -1; }
+        if(bytes && fread(buf,1,(size_t)bytes,in)!=(size_t)bytes){ free(buf); return -1; }
+        int t = fgetc(in); if(t=='\r') t = fgetc(in);
         if(t!='\n'){ free(buf); return -1; }
         if(g_pending_image.present) fprintf(stderr,"[qwen36] a second image arrived before its SUBMIT; dropping the first\n");
         q36_pending_image_clear();
@@ -8498,12 +8498,12 @@ static int serve_read_req(ServeReq *q){
          * header that does not say how long the payload is ends the session. */
         int dslot; unsigned long long bytes;
         if(sscanf(line,"%*s %*s %d %llu",&dslot,&bytes)!=2 || dslot<0 || bytes>(64ull<<20)){
-            printf("ERROR %s BAD_FRAME\n",id); fflush(stdout); return -1;
+            fprintf(out,"ERROR %s BAD_FRAME\n",id); fflush(out); return -1;
         }
         char *payload=malloc((size_t)bytes+1);
-        if(!payload){ printf("ERROR %s DECIDE_FAILED out of memory\n",id); fflush(stdout); return -1; }
-        if(bytes && fread(payload,1,(size_t)bytes,stdin)!=(size_t)bytes){ free(payload); return -1; }
-        int t = fgetc(stdin); if(t=='\r') t = fgetc(stdin);
+        if(!payload){ fprintf(out,"ERROR %s DECIDE_FAILED out of memory\n",id); fflush(out); return -1; }
+        if(bytes && fread(payload,1,(size_t)bytes,in)!=(size_t)bytes){ free(payload); return -1; }
+        int t = fgetc(in); if(t=='\r') t = fgetc(in);
         if(t!='\n'){ free(payload); return -1; }
         payload[bytes]=0;
         snprintf(q->id,sizeof(q->id),"%s",id);
@@ -8518,7 +8518,7 @@ static int serve_read_req(ServeReq *q){
     int slot, plen, max_tok; float temp, top_p;
     if(sscanf(line,"%*s %*s %d %d %d %f %f",&slot,&plen,&max_tok,&temp,&top_p)!=5 ||
        plen<0||plen>(1<<24)||max_tok<0){   /* 0 = modalita jev, vedi sotto */
-        printf("ERROR %s bad submit header\n",id); fflush(stdout); return 0;
+        fprintf(out,"ERROR %s bad submit header\n",id); fflush(out); return 0;
     }
     q->slot = slot;
     /* Le chiavi key=value stanno dopo i campi fissi. Si riusa il parser
@@ -8548,19 +8548,19 @@ static int serve_read_req(ServeReq *q){
             if (*tail) {
                 ColiSubmit ext; memset(&ext, 0, sizeof ext);
                 if (coli_submit_ext(ext_buf, &ext)) { q->logprobs = ext.logprobs; q->pin = ext.pin; }
-                else { printf("ERROR %s bad submit extension\n", id); fflush(stdout); return 0; }
+                else { fprintf(out,"ERROR %s bad submit extension\n", id); fflush(out); return 0; }
             }
         }
     }
     /* La convalida di max_tok si chiude QUI, non sopra: 0 e legittimo solo in
      * modalita jev, e se logprobs c'e si sa solo dopo aver letto le chiavi. */
     if(max_tok < 1 && !(max_tok == 0 && q->logprobs > 0)){
-        printf("ERROR %s bad submit header\n",id); fflush(stdout); return 0;
+        fprintf(out,"ERROR %s bad submit header\n",id); fflush(out); return 0;
     }
     char *payload=malloc((size_t)plen+1);
-    if(!payload){ printf("ERROR %s out of memory\n",id); fflush(stdout); return 0; }
-    if(fread(payload,1,(size_t)plen,stdin)!=(size_t)plen){ free(payload); return -1; }
-    (void)fgetc(stdin); payload[plen]=0;
+    if(!payload){ fprintf(out,"ERROR %s out of memory\n",id); fflush(out); return 0; }
+    if(fread(payload,1,(size_t)plen,in)!=(size_t)plen){ free(payload); return -1; }
+    (void)fgetc(in); payload[plen]=0;
     snprintf(q->id,sizeof(q->id),"%s",id);
     q->max_tok=max_tok; q->temp=temp; q->top_p=top_p;
     q->payload=payload; q->plen=plen;
@@ -8644,17 +8644,20 @@ static int serve_eos_ids(int *ids, int cap){
  * generazione in attesa di un comando che potrebbe non arrivare mai. */
 static int g_q36_mux_slots = 1;
 enum { Q36_CONTROL_NONE, Q36_CONTROL_STOP, Q36_CONTROL_CANCEL };
-static int serve_control_pending(const char *id){
+static int serve_control_read(FILE *in, int (*ready)(void), const char *id){
     int control = Q36_CONTROL_NONE;
-    while(coli_serve_stdin_ready()){
+    while(ready()){
         char line[512], cmd[16], who[64];
-        if(!fgets(line,sizeof(line),stdin)) break;
+        if(!fgets(line,sizeof(line),in)) break;
         if(sscanf(line,"%15s %63s",cmd,who)<2) continue;
         if(strcmp(who,id)) continue;
         if(!strcmp(cmd,"CANCEL")) control = Q36_CONTROL_CANCEL;
         else if(!strcmp(cmd,"STOP") && control == Q36_CONTROL_NONE) control = Q36_CONTROL_STOP;
     }
     return control;
+}
+static int serve_control_pending(const char *id){
+    return serve_control_read(stdin, coli_serve_stdin_ready, id);
 }
 
 /* A served prompt's checks for its STOP or CANCEL: the one before its forward, then one before
@@ -9573,7 +9576,7 @@ static void serve_mux(Model *m){
         /* idle: wait for a command; decoding: take one only when one is there */
         if (!input_eof && (!active || coli_serve_stdin_ready())) {
             ServeReq q = {0};
-            int r = serve_read_req(&q);
+            int r = serve_read_req(stdin, stdout, &q);
             if (r < 0) input_eof = 1;
             else if (r == 4 || r == 5) {
                 for (int i = 0; i < n; i++) if (rq[i].active && !strcmp(rq[i].q.id, q.id)) {
@@ -9730,7 +9733,7 @@ static void serve_loop(Model *m){
     if(g_q36_mux_slots>1){ serve_mux(m); q36_ps_report(); return; }
     for(;;){
         ServeReq q={0}; int r;
-        do r=serve_read_req(&q); while(r==0||r==4||r==5);
+        do r=serve_read_req(stdin,stdout,&q); while(r==0||r==4||r==5);
         if(r<0){ q36_mtp_vocab_save(); q36_ps_report(); return; }
         /* Resend the grid after EVERY turn, not only after READY: at boot the
          * expert cache is empty by definition, and that cold snapshot stayed
