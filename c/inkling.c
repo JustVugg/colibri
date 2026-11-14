@@ -92,9 +92,12 @@ static int g_ink_dho = 0;       /* COLI_VK_DENSE_HOST: the dense matrices on the
  * device; L = 0 while there is none (the chain off, or one that declines as before). */
 static VkcFit g_inkc_fit;
 #endif
-#ifndef COLI_VULKAN   /* exclusive RAM/VRAM (vk_tier.h) is the Vulkan build's: no device holds an expert */
-static inline int  vkt_ram_first(int layer, int eid) { (void)layer; (void)eid; return 0; }
-static inline void vkt_ram_gave(void) {}
+/* The routed-expert tier on either device (xtier.h): Vulkan's (vk_tier.h), or CUDA's
+ * (cu_tier.h, the same tier over the CUDA backend) once ink_cu_tier_start chose it. A build
+ * without one of them has its stubs, so XT(...) is always defined. */
+#include "xtier.h"
+#ifdef COLI_CUDA
+#include "backend_cuda.h"   /* the CUDA tier's device (coli_cuda_init) and its block types */
 #endif
 #if defined(__APPLE__)
 #include <mach/mach.h>
@@ -117,6 +120,10 @@ typedef struct {
     int audio_tok, mel_bins, mel_vocab;   /* DMel audio input (TMLv0 <|audio|> placeholder) */
     unsigned char local[MAXL];            /* 1 = sliding-window layer */
     unsigned char sparse[MAXL];           /* 1 = MoE layer, 0 = dense MLP */
+    /* Inkling-2 (model_type inkling2, inkling2.h): v2 = 1 */
+    int v2, res_block;                    /* layers per block of the attention residuals */
+    float qk_clip, rel_clip;              /* L2 clips of q and k, of the relative states */
+    float gate_cap, up_cap, logit_cap;    /* the experts' and the logits' softcaps */
 } Cfg;
 
 /* per-layer dims that depend on the attention type */
@@ -153,6 +160,7 @@ typedef struct { float *f; uint16_t *h; void *dev;
 typedef struct {
     float *in_ln, *post_ln;
     Wt q, k, v, r, o;                     /* projections */
+    Wt ag;                                /* Inkling-2's attention gate, attn.gate_attn [H*hd, D]; absent on Inkling */
     float *qn, *kn;                       /* per-head rmsnorm [head_dim] */
     float *relp;                          /* [d_rel, ext] bias bank */
     float *k_cw, *v_cw, *a_cw, *m_cw;     /* sconv weights, [C*K] depthwise */
@@ -161,6 +169,9 @@ typedef struct {
     /* MoE layers */
     float *router, *rbias, rgs;           /* [E+ns, D], [E], scalar */
     Wt sh_g, sh_u, sh_d;                  /* shared experts [ns][I,D] etc. */
+    struct Ink2Layer *x2;                 /* Inkling-2's own tensors (inkling2.h), NULL on Inkling */
+    float *xgsc, *xusc, *xdsc;            /* Inkling-2 from a GGUF: each routed expert's gate, up and down
+                                           * global scale [E] (its NVFP4 layers), NULL elsewhere */
 } Layer;
 
 /* ---------- routed-expert cache: LRU + optional pinned set ----------
@@ -207,11 +218,19 @@ typedef struct {
                                            * coli_ggml_held_type says so (INK_ILV16=0: the file's) */
     Wt embed, lm_head;
     float *embed_norm, *final_norm;
+    float *x2_out_query;                  /* Inkling-2: the output's attention residual query [D] */
+    int x2_names;                         /* Inkling-2's routed experts: 1 gate_up_proj/down_proj (a container),
+                                           * 2 the checkpoint's w13_weight/w2_weight, w13's gate and up rows
+                                           * interleaved (even = gate) */
     Wt audio_enc;                         /* [mel_bins*mel_vocab, D] embedding table */
     float *audio_norm;                    /* audio tower RMSNorm [D]; NULL = no audio */
     Layer *L;
     LCache *cache;
     int64_t rb13, rb2;                    /* container row-bytes (0 = not container) */
+    int xg64;                             /* the container's experts are int4 g64 (expert_ffn.h's planar
+                                           * layout, an f32 scale per 64): Inkling-2's */
+    int64_t ns13, ns2;                    /* an expert's scales: gate/up and down (2I and D, one a row;
+                                           * with xg64 one a 64-block of each row) */
     uint32_t **eusage;                    /* per-layer expert selection counts */
     uint8_t **ehit;                       /* experts routed this turn, for HITS (dashboard Brain) */
     int npin;                             /* pinned experts per sparse layer */
@@ -243,6 +262,25 @@ static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return
 static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
 static float sigmoidf(float x) { return 1.f / (1.f + expf(-x)); }
 static float siluf(float x) { return x / (1.f + expf(-x)); }
+/* A routed expert's activation over its gate and up rows (g <- act(g, u)): SwiGLU, or on
+ * Inkling-2 the softcapped one, softcap(g, gc) * sigmoid(g) * softcap(u, uc) (inkling2.h). */
+static inline void ink_glu(const Cfg *c, float *g, const float *u, int64_t n) {
+    if (c->v2) {
+        const float gc = c->gate_cap, uc = c->up_cap;
+        for (int64_t i = 0; i < n; i++) {
+            const float gi = g[i], ui = u[i];
+            g[i] = tanhf(gi / gc) * gc * (1.f / (1.f + expf(-gi))) * (tanhf(ui / uc) * uc);
+        }
+        return;
+    }
+    for (int64_t i = 0; i < n; i++) g[i] = siluf(g[i]) * u[i];
+}
+/* the logits after lm_head: Inkling-2 softcaps them */
+static inline void ink2_head_post(const Cfg *c, float *lo, int64_t n) {
+    if (!c->v2 || c->logit_cap <= 0) return;
+    const float cap = c->logit_cap;
+    for (int64_t i = 0; i < n; i++) lo[i] = tanhf(lo[i] / cap) * cap;
+}
 
 /* A GGUF expert in its slot (m->gx): gate and up rows on one quantization of x into
  * g[0..I) and g[I..2I), the SwiGLU into g, then hh = down g; ggml_quants.h kernels. */
@@ -254,8 +292,14 @@ static void ink_gx_expert(const Model *m, int layer, const Slot *e, const float 
     vu.data = e->p13 + I * gq_row_bytes(t3[0], D); vu.block_columns = (uint32_t)t3[1];
     ColiTensorView vd = { COLI_TENSOR_GGML, COLI_SCALE_NONE, e->p2, NULL, 0, 0, D, I, 1, (uint32_t)t3[2], NULL };
     if (coli_ggml_matmul2(g, &vg, g + I, &vu, xs, 1)) { fprintf(stderr, "layer %d: GGUF expert gate/up failed\n", layer); exit(1); }
-    for (int64_t k = 0; k < I; k++) g[k] = siluf(g[k]) * g[I + k];
+    const Layer *ly = &m->L[layer];   /* Inkling-2: the expert's global scales, which its GGUF rows lack */
+    if (ly->xgsc) {
+        const float gs = ly->xgsc[e->eid], us = ly->xusc[e->eid];
+        for (int64_t k = 0; k < I; k++) { g[k] *= gs; g[I + k] *= us; }
+    }
+    ink_glu(&m->c, g, g + I, I);
     if (coli_ggml_matmul(hh, &vd, g, 1)) { fprintf(stderr, "layer %d: GGUF expert down failed\n", layer); exit(1); }
+    if (ly->xdsc) { const float ds = ly->xdsc[e->eid]; for (int64_t d = 0; d < D; d++) hh[d] *= ds; }
 }
 
 /* TOPP=p (0..1): top-p adattivo sui routed — tieni gli esperti fino al peso
@@ -263,6 +307,21 @@ static void ink_gx_expert(const Model *m, int layer, const Slot *e, const float 
 static float g_topp = 0.f;
 
 #include "matmul_f32.h"   /* y[S,O] = x[S,I] @ W^T, W [O,I] f32 row-major */
+#include "expert_ffn.h"   /* int4 g64 rows (an Inkling-2 container's routed experts): xf_dot_f32 */
+
+/* An int4 g64 expert at one row x: gate rows, then up rows, then down (expert_ffn.h's planar
+ * rows, one f32 scale per 64). The rows go over the threads, as matmul_q4 sends the int4
+ * container's; each row is xf_dot_f32's sum, so the bits do not depend on the threads. */
+static void ink_xg64_expert(const Model *m, const Slot *e, const float *xs, float *g, float *hh) {
+    const int D = m->c.hidden, I = m->c.moe_inter;
+    #pragma omp parallel for schedule(static)
+    for (int r = 0; r < 2*I; r++)
+        g[r] = xf_dot_f32(e->p13 + (int64_t)r * (D / 2), e->s13 + (int64_t)r * (D / XF_BLOCK), xs, D);
+    ink_glu(&m->c, g, g + I, I);
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < D; o++)
+        hh[o] = xf_dot_f32(e->p2 + (int64_t)o * (I / 2), e->s2 + (int64_t)o * (I / XF_BLOCK), g, I);
+}
 
 #if defined(__AVX512BF16__) && defined(__AVX512F__)
 #include <immintrin.h>
@@ -571,6 +630,53 @@ static void ink_vk_report(void) {
 }
 #endif
 
+#if defined(__AVX2__) && defined(__FMA__) && !defined(HAVE_BF16_DOT)
+/* Inkling-2's bf16 matrices on an AVX2 host (the default x86-64-v3 build): eight lanes of fma
+ * a row, summed by one fixed tree at the end. matmul_h's path there keeps one chain a row, the
+ * order Inkling's numerics were fixed in, and is bound by the fma's latency: Inkling-2-Small's
+ * attention took 13.3 s of a 54 s run on an i5-13500. Every row has its own accumulators in
+ * the same order whatever S, so a row's bits are the same in a prompt and in decode. Inkling
+ * keeps matmul_h (g_ink_hl stays 0). */
+#define INK_HL 1
+static int g_ink_hl = 0;
+static inline __m256 ink_bf16x8(const uint16_t *p) {
+    return _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)p)), 16));
+}
+static inline float ink_hsum8(__m256 v) {   /* (l0+l4 + l2+l6) + (l1+l5 + l3+l7) */
+    __m128 s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
+    return _mm_cvtss_f32(s);
+}
+static void matmul_h_lanes(float *y, const float *x, const uint16_t *W, int S, int I, int O) {
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++) {
+        const uint16_t *w = W + (int64_t)o * I;
+        int s = 0;
+        for (; s + 3 < S; s += 4) {   /* each weight row widened once for four rows of x */
+            const float *x0 = x + (int64_t)(s+0)*I, *x1 = x + (int64_t)(s+1)*I;
+            const float *x2 = x + (int64_t)(s+2)*I, *x3 = x + (int64_t)(s+3)*I;
+            __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+            for (int i = 0; i < I; i += 8) {
+                const __m256 wv = ink_bf16x8(w + i);
+                a0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0 + i), wv, a0);
+                a1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1 + i), wv, a1);
+                a2 = _mm256_fmadd_ps(_mm256_loadu_ps(x2 + i), wv, a2);
+                a3 = _mm256_fmadd_ps(_mm256_loadu_ps(x3 + i), wv, a3);
+            }
+            y[(int64_t)(s+0)*O + o] = ink_hsum8(a0); y[(int64_t)(s+1)*O + o] = ink_hsum8(a1);
+            y[(int64_t)(s+2)*O + o] = ink_hsum8(a2); y[(int64_t)(s+3)*O + o] = ink_hsum8(a3);
+        }
+        for (; s < S; s++) {
+            const float *xs = x + (int64_t)s * I;
+            __m256 a = _mm256_setzero_ps();
+            for (int i = 0; i < I; i += 8) a = _mm256_fmadd_ps(_mm256_loadu_ps(xs + i), ink_bf16x8(w + i), a);
+            y[(int64_t)s * O + o] = ink_hsum8(a);
+        }
+    }
+}
+#endif
+
 #ifdef COLI_INKLING_SHARED_BATCH_TEST
 static uint64_t g_matmul_w_calls;
 #endif
@@ -615,6 +721,9 @@ static void matmul_w(float *y, const float *x, Wt W, int S, int I, int O) {
     }
 #ifdef COLI_VULKAN
     if (W.vk && ink_vk_matmul(y, x, &W, S, I, O)) return;
+#endif
+#ifdef INK_HL
+    if (!W.f && g_ink_hl && I % 8 == 0) { matmul_h_lanes(y, x, W.h, S, I, O); return; }
 #endif
     if (W.f) matmul(y, x, W.f, S, I, O);
     else     matmul_h(y, x, W.h, S, I, O);
@@ -803,6 +912,23 @@ static double jnum(jval *o, const char *k, double dflt) {
     return (v && v->t == J_NUM) ? v->num : dflt;
 }
 
+/* the snapshot is Inkling-2's (model_type inkling2*, at the top or in text_config): --chat frames
+ * the prompt before the model loads */
+static int ink_snap_v2(const char *snap) {
+    char path[2048]; snprintf(path, sizeof(path), "%s/config.json", snap ? snap : ".");
+    FILE *f = fopen(path, "rb"); if (!f) return 0;
+    fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
+    char *buf = malloc(n+1); if (!buf) { fclose(f); return 0; }
+    if(fread(buf,1,n,f)!=(size_t)n){} buf[n]=0; fclose(f);
+    char *arena=NULL; jval *root = json_parse(buf, &arena);
+    jval *r = root ? json_get(root, "text_config") : NULL; if (!r) r = root;
+    jval *mty = root ? json_get(root, "model_type") : NULL, *mtr = r ? json_get(r, "model_type") : NULL;
+    int v2 = (mty && mty->t == J_STR && !strncmp(mty->str, "inkling2", 8)) ||
+             (mtr && mtr->t == J_STR && !strncmp(mtr->str, "inkling2", 8));
+    free(buf); free(arena);
+    return v2;
+}
+
 static void load_cfg(Cfg *c, const char *snap) {
     char path[2048]; snprintf(path, sizeof(path), "%s/config.json", snap);
     FILE *f = fopen(path, "rb"); if(!f){perror(path);exit(1);}
@@ -853,6 +979,30 @@ static void load_cfg(Cfg *c, const char *snap) {
     } else {
         c->dense_inter = (int)jnum(r,"intermediate_size",24576);
         c->moe_inter   = (int)jnum(r,"moe_intermediate_size",3072);
+    }
+    /* Inkling-2 (inkling2.h): model_type inkling2 in the checkpoint's config.json, inkling2_text
+     * in a flat snapshot transformers saved */
+    jval *mty = json_get(root, "model_type"), *mtr = json_get(r, "model_type");
+    c->v2 = (mty && mty->t == J_STR && !strncmp(mty->str, "inkling2", 8)) ||
+            (mtr && mtr->t == J_STR && !strncmp(mtr->str, "inkling2", 8));
+    if (c->v2) {
+        c->res_block = (int)jnum(r, "n_layers_per_attn_res_block", 6);
+        c->qk_clip   = (float)jnum(r, "qk_l2_clip_threshold", 22.627416997969522);
+        c->rel_clip  = (float)jnum(r, "rel_l2_clip_threshold", 8.0);
+        c->gate_cap  = (float)jnum(r, "mlp_gate_softcap", 4.0);
+        c->up_cap    = (float)jnum(r, "mlp_up_softcap", 25.0);
+        c->logit_cap = (float)jnum(r, "final_logit_softcapping", 30.0);
+        c->mup = 1.f;                     /* no width multiplier: the logits are softcapped instead */
+        c->n_shared = 0;                  /* every layer routed experts only */
+        /* the checkpoint's intermediate_size is the experts' width; a saved snapshot's moe_intermediate_size */
+        c->moe_inter = (int)jnum(r, "moe_intermediate_size", jnum(r, "intermediate_size", 2304));
+        c->dense_inter = 0;
+        if (c->res_block < 1 || !(c->qk_clip > 0) || !(c->rel_clip > 0) || !(c->gate_cap > 0) ||
+            !(c->up_cap > 0) || !(c->logit_cap >= 0)) {
+            fprintf(stderr, "inkling2: config out of range (res_block %d, clips %g %g, softcaps %g %g %g)\n",
+                    c->res_block, c->qk_clip, c->rel_clip, c->gate_cap, c->up_cap, c->logit_cap);
+            exit(1);
+        }
     }
     if (c->n_layers > MAXL) { fprintf(stderr,"n_layers %d > MAXL\n", c->n_layers); exit(1); }
 
@@ -1155,7 +1305,7 @@ static void ink_vk_mark_dense(Model *m, int layer_begin, int layer_end, int head
     if (head) ink_vk_mark(&m->lm_head, 1, by, &cpu);
     for (int i = layer_begin; i < layer_end; i++) {
         Layer *l = &m->L[i];
-        Wt *one[] = { &l->q, &l->k, &l->v, &l->r, &l->o, &l->dg, &l->du, &l->dd };
+        Wt *one[] = { &l->q, &l->k, &l->v, &l->r, &l->o, &l->ag, &l->dg, &l->du, &l->dd };
         for (size_t j = 0; j < sizeof(one) / sizeof(one[0]); j++) ink_vk_mark(one[j], 1, by, &cpu);
         ink_vk_mark(&l->sh_g, m->c.n_shared, by, &cpu);   /* one device copy per shared expert */
         ink_vk_mark(&l->sh_u, m->c.n_shared, by, &cpu);
@@ -1244,6 +1394,7 @@ static size_t ink_dho_bytes(const Model *m, int layer_begin, int layer_end, int 
         int64_t q = (int64_t)L_HEADS(c, i) * L_HD(c, i), kv = (int64_t)L_KV(c, i) * L_HD(c, i), I = c->moe_inter;
         b += ink_dho_count(&l->q, D * q, (int)D) + ink_dho_count(&l->k, D * kv, (int)D) + ink_dho_count(&l->v, D * kv, (int)D) +
              ink_dho_count(&l->r, D * L_HEADS(c, i) * c->d_rel, (int)D) + ink_dho_count(&l->o, q * D, (int)q) +
+             ink_dho_count(&l->ag, D * q, (int)D) +
              ink_dho_count(&l->dg, D * c->dense_inter, (int)D) + ink_dho_count(&l->du, D * c->dense_inter, (int)D) +
              ink_dho_count(&l->dd, D * c->dense_inter, c->dense_inter) +
              ink_dho_count(&l->sh_g, c->n_shared * I * D, (int)D) + ink_dho_count(&l->sh_u, c->n_shared * I * D, (int)D) +
@@ -1258,6 +1409,7 @@ static void ink_dho_drop_layer(Model *m, int i, int *n) {
     int q = L_HEADS(c, i) * L_HD(c, i), kv = L_KV(c, i) * L_HD(c, i), I = c->moe_inter, ns = c->n_shared;
     ink_dho_drop(&l->q, 1, 0, D, q, n); ink_dho_drop(&l->k, 1, 0, D, kv, n); ink_dho_drop(&l->v, 1, 0, D, kv, n);
     ink_dho_drop(&l->r, 1, 0, D, L_HEADS(c, i) * c->d_rel, n); ink_dho_drop(&l->o, 1, 0, q, D, n);
+    ink_dho_drop(&l->ag, 1, 0, D, q, n);
     if (!c->sparse[i]) {
         ink_dho_drop(&l->dg, 1, 0, D, c->dense_inter, n); ink_dho_drop(&l->du, 1, 0, D, c->dense_inter, n);
         ink_dho_drop(&l->dd, 1, 0, c->dense_inter, D, n);
@@ -1310,8 +1462,12 @@ static void ink_vk_init_model(Model *m, int layer_begin, int layer_end) {
     /* COLI_VK_DENSE_HOST: with the dense part on the device (the per-matrix path, or the
      * chain: asked here silently, inkc_start says it after the tier), every matrix the
      * shaders read is marked and goes up now, its host copy given back */
-    int chain = !other_gpu && layer_begin == 0 && layer_end == m->c.n_layers &&
+    /* the chain's shaders compute Inkling's layers: Inkling-2's dense matrices go a call at a
+     * time (COLI_VK_DENSE's rule), its attention, residual mixes and convolutions on the CPU */
+    int chain = !m->c.v2 && !other_gpu && layer_begin == 0 && layer_end == m->c.n_layers &&
                 coli_vk_chain_decide(NULL, g_vk_tier_try, INKLING_CHAIN_IGPU) != COLI_VK_CHAIN_OFF;
+    if (m->c.v2 && coli_vk_dense())
+        fprintf(stderr, "[VK] inkling2: the dense matrices on the device a call at a time (Inkling-2 has no dense chain yet)\n");
     /* the chain's fit before any upload and before the expert cache is sized: the first n
      * layers on the device, the others (and lm_head, unless the tail went up) on the CPU
      * with their host copies, the per-matrix path leaving them there */
@@ -1347,6 +1503,17 @@ static void ink_vk_init_model(Model *m, int layer_begin, int layer_end) {
 }
 #endif
 
+static void ink2_load_layer(Model *m, int i, char *nm, size_t nmz);   /* inkling2.h */
+/* The name of a layer's routed experts' gate/up (k 0) or down (k 1) tensor: Inkling's
+ * gate_up_proj/down_proj; Inkling-2's under model.llm, gate_up_proj/down_proj in a container,
+ * the checkpoint's w13_weight/w2_weight otherwise (x2_names) */
+static const char *ink_lpfx(const Model *m) { return m->c.v2 ? "model.llm.layers" : "model.layers"; }
+static const char *ink_xname(const Model *m, char *nm, size_t nmz, int layer, int k) {
+    if (!m->c.v2) snprintf(nm, nmz, "model.layers.%d.mlp.experts.%s", layer, k ? "down_proj" : "gate_up_proj");
+    else snprintf(nm, nmz, "model.llm.layers.%d.mlp.experts.%s", layer,
+                  m->x2_names == 2 ? (k ? "w2_weight" : "w13_weight") : (k ? "down_proj" : "gate_up_proj"));
+    return nm;
+}
 static void model_init_range(Model *m, const char *snap, int cap, int bits,
                              int layer_begin, int layer_end,
                              int load_boundaries, int allocate_state,
@@ -1355,6 +1522,25 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     m->quant_bits = bits;
     load_cfg(&m->c, snap);
     st_init(&m->S, snap);
+    /* Inkling-2 on a device: its dense matrices a call at a time (matmul_w: the projections,
+     * the attention's gate and the unembedding) and its routed experts in the expert tier
+     * (Vulkan's, or CUDA's: the softcapped SwiGLU is the tier's SITU). Its attention, residual
+     * mixes and convolutions run on the CPU: the Vulkan dense chain computes Inkling's layers
+     * (ink_vk_init_model keeps it off), and the Metal expert path Inkling's SwiGLU. */
+    if (m->c.v2 && !getenv("NOGPU")) {
+        setenv("COLI_METAL", "0", 1);
+#if !defined(COLI_CUDA) && !defined(COLI_VULKAN)
+        fprintf(stderr, "[inkling2] Inkling-2 runs on the CPU in this build\n");
+        setenv("NOGPU", "1", 1);
+#endif
+    }
+#ifdef INK_HL
+    g_ink_hl = m->c.v2;   /* Inkling-2's bf16 matrices on the CPU through matmul_h_lanes */
+#endif
+    if (m->c.v2 && (layer_begin != 0 || (layer_end != 0 && layer_end != m->c.n_layers) || !load_boundaries)) {
+        fprintf(stderr, "inkling2: every layer in one process (the attention residuals mix them all)\n");
+        exit(1);
+    }
     /* densa pre-quantizzata, se il container c'e' (INK_DENSE_Q4=0 la ignora).
      * Sta in una SOTTOCARTELLA apposta: nella dir dello snapshot i nomi tensore
      * andrebbero in collisione con i bf16 originali, che restano intatti. */
@@ -1381,15 +1567,21 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     (void)cuda_off;
 #if defined(COLI_CUDA) && defined(COLI_VULKAN)
     {   /* The CUDA backend runs the dense bf16 matrices a call each (backend_cuda_ink.cu) and
-         * leaves the routed experts on the CPU, the Vulkan tier off (ink_vk_tier_start); Vulkan's
-         * chain and expert tier run both on the card. A build with both backends runs on Vulkan,
-         * the same card, unless COLI_VULKAN=0 asks for CUDA (qwen38.c's way for a GGUF). */
+         * leaves Inkling's routed experts on the CPU, the Vulkan tier off (ink_vk_tier_start);
+         * Vulkan's chain and expert tier run both on the card. A build with both backends runs on
+         * Vulkan, the same card, unless COLI_VULKAN=0 asks for CUDA (qwen38.c's way for a GGUF).
+         * Inkling-2 too: its experts on either tier, Vulkan's measured ahead (1.90-1.94 tok/s
+         * against CUDA's 1.59-1.71, docs/inkling.md). */
         const char *vk = getenv("COLI_VULKAN");
         if (!(vk && *vk == '0') && !getenv("NOGPU")) {
             if (!(vk && *vk)) {
                 setenv("COLI_VULKAN", "1", 1);
-                fprintf(stderr, "[cuda] the CUDA backend leaves the routed experts on the CPU: this run uses Vulkan, the same card "
-                                "(its dense chain and expert tier; COLI_VULKAN=0 keeps CUDA)\n");
+                if (m->c.v2)
+                    fprintf(stderr, "[cuda] Inkling-2 runs on Vulkan in a build with both backends, the same card "
+                                    "(its expert tier and dense matrices; COLI_VULKAN=0 keeps CUDA)\n");
+                else
+                    fprintf(stderr, "[cuda] the CUDA backend leaves the routed experts on the CPU: this run uses Vulkan, the same card "
+                                    "(its dense chain and expert tier; COLI_VULKAN=0 keeps CUDA)\n");
             }
             cuda_off = 1;
         }
@@ -1419,7 +1611,13 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         }
     }
 #endif
-    if (load_boundaries) {
+    if (load_boundaries && m->c.v2) {
+        m->embed      = load_w(m, "model.llm.embed.weight", 0);
+        m->embed_norm = st_has(&m->S, "model.llm.embed_norm.weight") ? load_t(m, "model.llm.embed_norm.weight") : NULL;
+        m->final_norm = load_t(m, "model.llm.norm.weight");
+        m->lm_head    = load_w(m, "model.llm.unembed.weight", 1);
+        m->x2_out_query = load_t(m, "model.llm.attn_res.output_query");
+    } else if (load_boundaries) {
         m->embed      = load_w(m, "model.embed_tokens.weight", 0);
         { const char *en = embed_norm_name(&m->S); m->embed_norm = en ? load_t(m, en) : NULL; }
         m->final_norm = load_t(m, "model.norm.weight");
@@ -1456,6 +1654,8 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     char nm[320];
     for (int i = layer_begin; i < layer_end; i++) {
         Layer *l = &m->L[i];
+        if (c->v2) ink2_load_layer(m, i, nm, sizeof(nm));
+        else {
         #define LD(field, suffix)  snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_t(m,nm)
         #define LDW(field, suffix) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_w(m,nm,1)
         LD(in_ln,  "input_layernorm.weight");
@@ -1504,6 +1704,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         }
         #undef LD
         #undef LDW
+        }
         /* conv states: raw inputs of the previous K-1 steps, zero-init */
         int kvdim = L_KV(c,i) * L_HD(c,i);
         for (int j = 0; j < 4; j++) if (allocate_state) {
@@ -1520,7 +1721,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         const char *k3[3] = {"gate_proj", "up_proj", "down_proj"};
         st_tensor *tt[3];
         for (int k = 0; k < 3; k++) {
-            snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.0.%s", i, k3[k]);
+            snprintf(nm, sizeof(nm), "%s.%d.mlp.experts.0.%s", ink_lpfx(m), i, k3[k]);
             tt[k] = st_find(&m->S, nm);
         }
         if (!tt[0]) break;   /* the checkpoint's gate_up_proj: not a GGUF */
@@ -1540,7 +1741,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         }
         for (int64_t e = 1; e < E; e++) {   /* every expert there, of the layer's types */
             for (int k = 0; k < 3; k++) {
-                snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%lld.%s", i, (long long)e, k3[k]);
+                snprintf(nm, sizeof(nm), "%s.%d.mlp.experts.%lld.%s", ink_lpfx(m), i, (long long)e, k3[k]);
                 const st_tensor *t = st_find(&m->S, nm);
                 if (!t || t->dtype != tt[k]->dtype || t->nbytes != tt[k]->nbytes) { fprintf(stderr, "layer %d: GGUF expert %lld missing or of another type\n", i, (long long)e); exit(1); }
             }
@@ -1550,21 +1751,37 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         if ((rbg + rbu + 1) / 2 > m->rb13) m->rb13 = (rbg + rbu + 1) / 2;
         if (rbd > m->rb2) m->rb2 = rbd;
     }
+    if (c->v2 && !m->gx) {   /* a container's gate_up_proj (gate rows, then up rows), else the checkpoint's w13 */
+        m->x2_names = 1;
+        if (!st_find(&m->S, ink_xname(m, nm, sizeof(nm), layer_begin, 0))) m->x2_names = 2;
+        if (!st_find(&m->S, ink_xname(m, nm, sizeof(nm), layer_begin, 0)) || !st_find(&m->S, ink_xname(m, nm, sizeof(nm), layer_begin, 1))) {
+            fprintf(stderr, "inkling2: layer %d has no routed experts (%s)\n", layer_begin, nm);
+            exit(1);
+        }
+    }
+    m->ns13 = 2*I; m->ns2 = D;
     for (int i = layer_begin; i < layer_end; i++) if (c->sparse[i]) {
-        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.gate_up_proj",i);
-        st_tensor *t = st_find(&m->S, nm);
+        st_tensor *t = st_find(&m->S, ink_xname(m, nm, sizeof(nm), i, 0));
         if (!m->gx && t && t->dtype == 3) {
             m->xq = 1;
             m->rb13 = t->nbytes / (E * 2*I);
-            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.down_proj",i);
-            st_tensor *t2 = st_find(&m->S, nm);
+            st_tensor *t2 = st_find(&m->S, ink_xname(m, nm, sizeof(nm), i, 1));
             m->rb2 = t2->nbytes / (E * (int64_t)D);
             if (m->rb13 != D && m->rb13*2 != D) { fprintf(stderr,"unsupported container row size %lld\n",(long long)m->rb13); exit(1); }
+            /* int4 g64 (expert_ffn.h): a scale per 64 of each row, which the .qs count tells;
+             * Inkling-2's containers only (tools/convert_inkling2_int4.py): with a hidden size of
+             * 64 Inkling's per-row count would read the same */
+            char qn[340];
+            snprintf(qn, sizeof(qn), "%s.qs", ink_xname(m, nm, sizeof(nm), i, 0));
+            if (c->v2 && D % XF_BLOCK == 0 && I % XF_BLOCK == 0 && st_numel(&m->S, qn) == E * 2*I * (D / XF_BLOCK)) {
+                if (m->rb13 * 2 != D || m->rb2 * 2 != I) { fprintf(stderr, "int4 g64 container with row bytes %lld/%lld\n", (long long)m->rb13, (long long)m->rb2); exit(1); }
+                m->xg64 = 1; m->ns13 = 2*I * (D / XF_BLOCK); m->ns2 = D * (I / XF_BLOCK);
+            }
         }
         break;
     }
     int nsp = 0; for (int i = layer_begin; i < layer_end; i++) nsp += c->sparse[i];
-    int64_t slotb = m->xq ? m->rb13*2*I + m->rb2*D + (2*I+D)*4
+    int64_t slotb = m->xq ? m->rb13*2*I + m->rb2*D + (m->ns13+m->ns2)*4
                   : m->quant_bits ? 3*I*D + (2*I+D)*4 : 3*I*D*4;
     double avail_auto = cap <= 0 ? mem_avail_bytes() : 0;
 #ifdef COLI_VULKAN
@@ -1609,7 +1826,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         int64_t st13 = m->rb13*2*I, st2 = m->rb2*D;
         size_t pg = 16384;
         size_t wlen = ((size_t)cap*(st13+st2) + pg - 1) / pg * pg;
-        size_t slen = ((size_t)cap*(2*I+D)*4 + pg - 1) / pg * pg;
+        size_t slen = ((size_t)cap*(m->ns13+m->ns2)*4 + pg - 1) / pg * pg;
         for (int i = layer_begin; i < layer_end; i++) {
             if (!c->sparse[i]) continue;
             void *wsl = NULL, *ssl = NULL;
@@ -1619,8 +1836,8 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
                 Slot *s = &m->cache[i].slots[k];
                 s->p13 = (uint8_t*)wsl + (int64_t)k*(st13+st2);
                 s->p2  = s->p13 + st13;
-                s->s13 = (float*)ssl + (int64_t)k*(2*I+D);
-                s->s2  = s->s13 + 2*I;
+                s->s13 = (float*)ssl + (int64_t)k*(m->ns13+m->ns2);
+                s->s2  = s->s13 + m->ns13;
             }
 #ifdef COLI_METAL
             if (g_metal) { coli_metal_register(wsl, wlen); coli_metal_register(ssl, slen); }
@@ -1720,13 +1937,13 @@ static Slot *slot_acquire(Model *m, int layer, int eid) {
         int lru = -1, dev = -1;   /* an expert the Vulkan tier holds goes first (vkt_ram_first) */
         for (int i = 0; i < lc->n; i++) {
             if (lc->slots[i].pinned) continue;
-            if (lc->slots[i].eid >= 0 && vkt_ram_first(layer, lc->slots[i].eid)) {
+            if (lc->slots[i].eid >= 0 && XT(ram_first)(layer, lc->slots[i].eid)) {
                 if (dev < 0 || lc->slots[i].used < lc->slots[dev].used) dev = i;
                 continue;
             }
             if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
         }
-        if (dev >= 0) { lru = dev; vkt_ram_gave(); }
+        if (dev >= 0) { lru = dev; XT(ram_gave)(); }
         if (lru < 0) { fprintf(stderr, "layer %d: cache cap %d entirely pinned\n", layer, lc->cap); exit(1); }
         s = &lc->slots[lru];
     }
@@ -1740,6 +1957,18 @@ static Slot *slot_acquire(Model *m, int layer, int eid) {
 }
 
 /* pure I/O (+ optional requant): safe to run in parallel across slots */
+/* Inkling-2's checkpoint interleaves an expert's gate and up rows (row 2i gate i, 2i + 1 up i):
+ * back to gate rows, then up rows, as the kernels read them */
+static void ink2_deinterleave(float *w, int64_t I, int64_t D) {
+    float *t = falloc(2 * I * D);
+    for (int64_t i = 0; i < I; i++) {
+        memcpy(t + i * D, w + (2 * i) * D, (size_t)D * sizeof(float));
+        memcpy(t + (I + i) * D, w + (2 * i + 1) * D, (size_t)D * sizeof(float));
+    }
+    memcpy(w, t, (size_t)(2 * I * D) * sizeof(float));
+    free(t);
+}
+
 static void slot_fill(Model *m, int layer, Slot *s) {
     Cfg *c = &m->c;
     int64_t D = c->hidden, I = c->moe_inter, n13 = 2*I*D, n2 = D*I;
@@ -1754,7 +1983,7 @@ static void slot_fill(Model *m, int layer, Slot *s) {
         uint8_t *dst[3] = { s->p13, s->p13 + I * gq_row_bytes(h3[0], D), s->p2 };
         const char *k3[3] = {"gate_proj", "up_proj", "down_proj"};
         for (int k = 0; k < 3; k++) {
-            snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%lld.%s", layer, (long long)eid, k3[k]);
+            snprintf(nm, sizeof(nm), "%s.%d.mlp.experts.%lld.%s", ink_lpfx(m), layer, (long long)eid, k3[k]);
             st_tensor *t = st_find(&m->S, nm);
             const int64_t n = rows[k] * rb[k];
             if (h3[k] == t3[k]) { pread_all(t->fd, dst[k], n, t->off); continue; }
@@ -1769,30 +1998,87 @@ static void slot_fill(Model *m, int layer, Slot *s) {
         return;
     }
     if (m->xq) {
-        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.gate_up_proj",layer);
+        ink_xname(m, nm, sizeof(nm), layer, 0);
         read_u8_slice(&m->S, nm, s->p13, eid*2*I*m->rb13, 2*I*m->rb13);
         snprintf(qs,sizeof(qs),"%s.qs",nm);
-        read_f32_slice(&m->S, qs, s->s13, eid*2*I, 2*I);
-        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.down_proj",layer);
+        read_f32_slice(&m->S, qs, s->s13, eid*m->ns13, m->ns13);
+        ink_xname(m, nm, sizeof(nm), layer, 1);
         read_u8_slice(&m->S, nm, s->p2, eid*D*m->rb2, D*m->rb2);
         snprintf(qs,sizeof(qs),"%s.qs",nm);
-        read_f32_slice(&m->S, qs, s->s2, eid*D, D);
+        read_f32_slice(&m->S, qs, s->s2, eid*m->ns2, m->ns2);
     } else if (m->quant_bits) {
         float *tmp = falloc(n13 > n2 ? n13 : n2);
-        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.gate_up_proj",layer);
-        read_f32_slice(&m->S, nm, tmp, eid*n13, n13);
+        read_f32_slice(&m->S, ink_xname(m, nm, sizeof(nm), layer, 0), tmp, eid*n13, n13);
+        if (m->x2_names == 2) ink2_deinterleave(tmp, I, D);
         quantize_rows(tmp, s->q13, s->s13, 2*I, D, m->quant_bits);
-        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.down_proj",layer);
+        ink_xname(m, nm, sizeof(nm), layer, 1);
         read_f32_slice(&m->S, nm, tmp, eid*n2, n2);
         quantize_rows(tmp, s->q2, s->s2, D, I, m->quant_bits);
         free(tmp);
     } else {
-        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.gate_up_proj",layer);
-        read_f32_slice(&m->S, nm, s->f13, eid*n13, n13);
-        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.down_proj",layer);
-        read_f32_slice(&m->S, nm, s->f2, eid*n2, n2);
+        read_f32_slice(&m->S, ink_xname(m, nm, sizeof(nm), layer, 0), s->f13, eid*n13, n13);
+        if (m->x2_names == 2) ink2_deinterleave(s->f13, I, D);
+        read_f32_slice(&m->S, ink_xname(m, nm, sizeof(nm), layer, 1), s->f2, eid*n2, n2);
     }
     s->filled = 1;
+}
+
+/* A round's missed experts into their slots. Inkling-2's int4 g64 container: each expert's four
+ * slices (gate_up and its scales, down and its scales: 17.9 MB on Inkling-2-Small) in pieces of
+ * at most INK_FILL_PIECE bytes, every piece of the round read at once on INK_FILL_THREADS threads
+ * (default 12), so the disk has as many reads in flight as it serves well: a decode step misses
+ * two or three experts a layer, which one thread each read as four reads after another.
+ * Measured on Inkling-2-Small (two NVMe in RAID0, 64 tokens on three prompts, the CUDA build):
+ * 3.5-4.5 ms of fill an expert before, 3.0-3.1 with 12 threads, 1.31-1.62 -> 1.64-1.70 tok/s;
+ * 8 threads 2.7-3.5 ms, 16 3.1-3.3, 32 3.5. Elsewhere slot_fill an expert a thread, as before.
+ * layers[j] is fill[j]'s layer, or NULL for `layer`. */
+#define INK_FILL_PIECE (2 << 20)
+static int ink_fill_threads(void) {
+    static int n = -1;
+    if (n < 0) { const char *e = getenv("INK_FILL_THREADS"); n = e && atoi(e) > 0 ? atoi(e) : 12; }
+    return n;
+}
+static void ink_fill_slots(Model *m, int layer, const int *layers, Slot **fill, int nfill) {
+    if (nfill < 1) return;
+    if (!m->xg64) {
+        #pragma omp parallel for schedule(dynamic,1)
+        for (int j = 0; j < nfill; j++) slot_fill(m, layers ? layers[j] : layer, fill[j]);
+        return;
+    }
+    const int64_t D = m->c.hidden, I = m->c.moe_inter;
+    typedef struct { int fd; int64_t off; uint8_t *dst; int64_t n; } Piece;
+    int64_t cap = 0;
+    const int64_t len[4] = { 2*I*m->rb13, m->ns13 * 4, D*m->rb2, m->ns2 * 4 };
+    for (int k = 0; k < 4; k++) cap += (len[k] + INK_FILL_PIECE - 1) / INK_FILL_PIECE;
+    cap *= nfill;
+    Piece *pc = malloc((size_t)cap * sizeof *pc);
+    if (!pc) { fprintf(stderr, "OOM fill\n"); exit(1); }
+    int np = 0;
+    for (int j = 0; j < nfill; j++) {
+        const int L = layers ? layers[j] : layer;
+        Slot *s = fill[j];
+        const int64_t e = s->eid;
+        char nm[320], qs[340];
+        st_tensor *t[4];
+        t[0] = st_find(&m->S, ink_xname(m, nm, sizeof(nm), L, 0));
+        snprintf(qs, sizeof(qs), "%s.qs", nm); t[1] = st_find(&m->S, qs);
+        t[2] = st_find(&m->S, ink_xname(m, nm, sizeof(nm), L, 1));
+        snprintf(qs, sizeof(qs), "%s.qs", nm); t[3] = st_find(&m->S, qs);
+        uint8_t *dst[4] = { s->p13, (uint8_t *)s->s13, s->p2, (uint8_t *)s->s2 };
+        for (int k = 0; k < 4; k++) {
+            if (!t[k]) { fprintf(stderr, "layer %d: the container lacks an expert tensor (%d)\n", L, k); exit(1); }
+            for (int64_t o = 0; o < len[k]; o += INK_FILL_PIECE)
+                pc[np++] = (Piece){ t[k]->fd, t[k]->off + e * len[k] + o, dst[k] + o,
+                                    len[k] - o < INK_FILL_PIECE ? len[k] - o : INK_FILL_PIECE };
+        }
+    }
+    #pragma omp parallel for schedule(dynamic,1) num_threads(ink_fill_threads())
+    for (int i = 0; i < np; i++) {
+        pread_all(pc[i].fd, pc[i].dst, pc[i].n, pc[i].off);
+        posix_fadvise(pc[i].fd, pc[i].off, pc[i].n, POSIX_FADV_DONTNEED);
+    }
+    free(pc);
+    for (int j = 0; j < nfill; j++) fill[j]->filled = 1;
 }
 
 /* pin the top-N experts per sparse layer from a usage-history file (colibri
@@ -1986,6 +2272,8 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
     free(q); free(k); free(vv); free(rr); free(ctx);
 }
 
+#include "inkling2.h"   /* Inkling-2: its attention, convolutions and attention residuals */
+
 /* ---------- dense MLP ---------- */
 static void dense_mlp(Model *m, Layer *l, float *x, int S, float *out) {
     Cfg *c = &m->c; int D = c->hidden, I = c->dense_inter;
@@ -2071,8 +2359,8 @@ static void shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
     free(bg); free(bh);
 }
 
-#ifdef COLI_VULKAN
-/* ---- the Vulkan routed-expert tier (vk_tier.c) ---------------------------------
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
+/* ---- the routed-expert tier (vk_tier.c on Vulkan; on CUDA, cu_tier.c: XT) ------
  * With the tier on, one MoE layer runs per block of rows: the block's resident
  * experts go to the device as one batch (vkt_issue), the CPU computes the other
  * (row, rank) pairs into rows of their own -- the same cache rounds and kernels as
@@ -2089,6 +2377,7 @@ static void shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
 static int ink_vk_fmt_of(const Model *m, VktFmt *f) {
     int D = m->c.hidden, I = m->c.moe_inter;
     if (m->gx) return 0;   /* GGUF experts: their blocks by layer (ink_vk_gguf_forms) */
+    if (m->xg64) { *f = (VktFmt){VKT_SRC_I4U_PLANAR64, XF_BLOCK}; return 1; }   /* Inkling-2's int4 g64 container */
     if (m->xq) {
         int q4 = m->rb13 * 2 == D;
         if (q4 ? m->rb2 * 2 != I : m->rb2 != I) return 0;
@@ -2101,13 +2390,24 @@ static int ink_vk_fmt_of(const Model *m, VktFmt *f) {
  * its types (published files mix them): gu[l], dn[l] for every layer, a layer without experts
  * given the first sparse layer's; *best = the commonest pair's layer. 0 when gate and up
  * differ in type, a type has no device form, or there are more pairs than the tier holds. */
+/* a GGUF block type's elements on the tier's device (0: no device form there) */
+static int ink_tier_block_elems(int fmt) {
+#ifdef COLI_CUDA
+    if (xt_cuda()) return coli_cuda_block_elems(fmt);
+#endif
+#ifdef COLI_VULKAN
+    return coli_vk_block_elems(fmt);
+#else
+    (void)fmt; return 0;
+#endif
+}
 static int ink_vk_gguf_forms(const Model *m, VktFmt *gu, VktFmt *dn, int *best, int *forms) {
     const Cfg *c = &m->c;
     int first = -1, bestn = 0;
     *forms = 0; *best = -1;
     for (int l = 0; l < c->n_layers; l++) if (c->sparse[l]) {
         const int *t3 = m->gx_t + 3 * l;
-        const int bg = coli_vk_block_elems(100 + t3[0]), bd = coli_vk_block_elems(100 + t3[2]);
+        const int bg = ink_tier_block_elems(100 + t3[0]), bd = ink_tier_block_elems(100 + t3[2]);
         if (t3[0] != t3[1] || !bg || !bd || c->hidden % bg || c->moe_inter % bd) return 0;
         gu[l] = (VktFmt){(VktSrc)(VKT_SRC_GGML + t3[0]), 0};
         dn[l] = (VktFmt){(VktSrc)(VKT_SRC_GGML + t3[2]), 0};
@@ -2150,7 +2450,8 @@ static VktExpertSrc ink_vk_slot_src(const Model *m, int layer, Slot *e) {
         }
         return (VktExpertSrc){dst[0], dst[1], dst[2], NULL, NULL, NULL};
     }
-    if (m->xq) return (VktExpertSrc){e->p13, e->p13 + I * m->rb13, e->p2, e->s13, e->s13 + I, e->s2};
+    if (m->xq) return (VktExpertSrc){e->p13, e->p13 + I * m->rb13, e->p2, e->s13,
+                                     e->s13 + (m->xg64 ? I * (D / XF_BLOCK) : I), e->s2};   /* up's scales after gate's */
     if (m->quant_bits) return (VktExpertSrc){e->q13, e->q13 + I * D, e->q2, e->s13, e->s13 + I, e->s2};
     return (VktExpertSrc){e->f13, e->f13 + I * D, e->f2, NULL, NULL, NULL};
 }
@@ -2181,9 +2482,28 @@ static void ink_vk_ram_given(void *ctx, size_t bytes) {
         if (cap > lc->cap) cap = lc->cap;
         was = lc->cap; now = cap; lc->cap = cap;
     }
-    fprintf(stderr, "[VK] inkling: the tier's host pool took %.1f GiB of the RAM the expert cache was sized from: %d slots a layer, not %d\n",
-            bytes / 1073741824.0, now, was);
+    fprintf(stderr, "%s inkling: the tier's host pool took %.1f GiB of the RAM the expert cache was sized from: %d slots a layer, not %d\n",
+            XT_TAG, bytes / 1073741824.0, now, was);
+    /* The history's pins came first (pins_load, half the cache it found): a layer whose
+     * smaller cache they would fill whole has no slot left to evict ("entirely pinned"). Its
+     * coldest pins (pins_load takes the hottest first, into the first slots) go back to the
+     * LRU until top-k slots of every layer can be evicted. */
+    int keep = now - c->topk, unpinned = 0;
+    if (keep < 0) keep = 0;
+    if (m->npin > keep) {
+        for (int i = 0; i < c->n_layers; i++) {
+            LCache *lc = &m->cache[i];
+            int np = 0;
+            for (int j = 0; lc->slots && j < lc->n; j++) np += lc->slots[j].pinned;
+            for (int j = lc->n - 1; lc->slots && j >= 0 && np > keep; j--)
+                if (lc->slots[j].pinned) { lc->slots[j].pinned = 0; np--; unpinned++; }
+        }
+        fprintf(stderr, "%s inkling: %d pins a layer, not %d, so that a layer's %d slots keep %d to evict (%d unpinned)\n",
+                XT_TAG, keep, m->npin, now, c->topk, unpinned);
+        m->npin = keep;
+    }
 }
+#ifdef COLI_VULKAN
 /* Bytes the dense matrices marked for the device will take there (the budget leaves
  * them room), from the geometry: int8 1 byte, int4-g64 0.5625, f32 4, bf16 2. */
 static size_t inkc_fit_later(const Model *m);   /* inkling_chain.h */
@@ -2202,7 +2522,7 @@ static size_t ink_vk_dense_bytes(const Model *m) {
         const Layer *l = &m->L[i];
         double D = c->hidden, q = (double)L_HEADS(c, i) * L_HD(c, i), kv = (double)L_KV(c, i) * L_HD(c, i);
         INK_VKB(&l->q, D * q); INK_VKB(&l->k, D * kv); INK_VKB(&l->v, D * kv);
-        INK_VKB(&l->r, D * L_HEADS(c, i) * c->d_rel); INK_VKB(&l->o, q * D);
+        INK_VKB(&l->r, D * L_HEADS(c, i) * c->d_rel); INK_VKB(&l->o, q * D); INK_VKB(&l->ag, D * q);
         INK_VKB(&l->dg, D * c->dense_inter); INK_VKB(&l->du, D * c->dense_inter); INK_VKB(&l->dd, D * c->dense_inter);
         double sh = (double)c->n_shared * c->moe_inter * D;
         INK_VKB(&l->sh_g, sh); INK_VKB(&l->sh_u, sh); INK_VKB(&l->sh_d, sh);
@@ -2210,6 +2530,7 @@ static size_t ink_vk_dense_bytes(const Model *m) {
     #undef INK_VKB
     return (size_t)b;
 }
+#endif
 /* A slot of its own for the warm start's reads (slot_fill's buffers), and its free. */
 static int ink_vk_tmp_slot(const Model *m, Slot *s, int eid) {
     int64_t D = m->c.hidden, I = m->c.moe_inter;
@@ -2218,8 +2539,8 @@ static int ink_vk_tmp_slot(const Model *m, Slot *s, int eid) {
     if (m->xq) { s->p13 = malloc((size_t)(m->rb13 * 2 * I)); s->p2 = malloc((size_t)(m->rb2 * D)); }
     else if (m->quant_bits) { s->q13 = malloc((size_t)(2 * I * D)); s->q2 = malloc((size_t)(D * I)); }
     else { s->f13 = malloc((size_t)(2 * I * D) * sizeof(float)); s->f2 = malloc((size_t)(D * I) * sizeof(float)); }
-    s->s13 = malloc((size_t)(2 * I + D) * sizeof(float));
-    if (s->s13) s->s2 = s->s13 + 2 * I;
+    s->s13 = malloc((size_t)(m->xq ? m->ns13 + m->ns2 : 2 * I + D) * sizeof(float));
+    if (s->s13) s->s2 = s->s13 + (m->xq ? m->ns13 : 2 * I);
     return s->s13 && (m->xq ? s->p13 && s->p2 : m->quant_bits ? s->q13 && s->q2 : s->f13 && s->f2);
 }
 static void ink_vk_tmp_free(Slot *s) {
@@ -2243,6 +2564,64 @@ static size_t ink_kv_later(const Model *m) {
     return b * (size_t)(g_ink_mux_slots > 1 ? g_ink_mux_slots : 1);
 }
 static size_t ink_ps_plan(void);   /* the prefix store's budget (prefix_store.h), planned with the RAM */
+/* The warm start on the tier XT names: the hottest experts of the history first (vkt_plan),
+ * read from disk in parallel, each handed over and released. */
+static void ink_tier_warm(Model *m, const char *engine) {
+    const Cfg *c = &m->c;
+    int all = c->n_layers * c->n_experts;
+    int *pl = malloc((size_t)all * sizeof(int)), *pe = malloc((size_t)all * sizeof(int));
+    const char *warm = getenv("COLI_VK_TIER_WARM");   /* 0: no warm start, the tier fills as experts pass by */
+    int n = pl && pe && !(warm && *warm == '0') ? XT(plan)(pl, pe, all) : 0;
+    if (n > 0) {
+        double t0 = now_s();
+        #pragma omp parallel for schedule(dynamic, 4)
+        for (int i = 0; i < n; i++) {
+            Slot tmp;
+            if (ink_vk_tmp_slot(m, &tmp, pe[i])) {
+                slot_fill(m, pl[i], &tmp);
+                VktExpertSrc src = ink_vk_slot_src(m, pl[i], &tmp);
+                XT(put)(pl[i], pe[i], &src);
+            } else XT(put)(pl[i], pe[i], NULL);   /* no memory: the planned slot is released */
+            ink_vk_tmp_free(&tmp);
+        }
+        XT(put_done)();
+        XT(warm_report)(engine, n, now_s() - t0);
+    }
+    free(pl); free(pe);
+    /* Inkling-2: the history pinned its hottest experts in RAM (pins_load) and the warm start
+     * put the same ones on the device or in its host pool. A pinned copy of an expert the tier
+     * holds goes back to the LRU, the first the cache gives up (XT(ram_first)), so that RAM
+     * holds other experts: Inkling-2-Small int4 g64 on a 24 GB card and 62 GB of RAM held
+     * 26 a layer twice. Inkling keeps its pins as before. */
+    if (!c->v2) return;
+    int unp = 0, most = 0;
+    for (int i = 0; i < c->n_layers; i++) {
+        LCache *lc = &m->cache[i];
+        int np = 0;
+        for (int j = 0; lc->slots && j < lc->n; j++) {
+            Slot *s = &lc->slots[j];
+            if (s->pinned && s->eid >= 0 && XT(resident)(i, s->eid)) { s->pinned = 0; unp++; }
+            np += s->pinned;
+        }
+        if (np > most) most = np;
+    }
+    if (unp) {
+        fprintf(stderr, "%s inkling: %d pinned experts the tier holds went back to the RAM cache's LRU (%d pins a layer at most now)\n",
+                XT_TAG, unp, most);
+        m->npin = most;
+    }
+}
+/* Inkling-2 keeps the tier's host pool off unless asked (COLI_VK_TIER_HOST=1 or _GB): the pool
+ * is sized from the RAM the expert cache was sized from, and on Inkling-2-Small int4 g64 (62 GB
+ * of RAM, a 24 GB card, 64 tokens a prompt) the RAM cache it shrank lost more than the device
+ * gained: CUDA 1.27-1.29 tok/s with it, 1.60-1.61 without; Vulkan 1.33-1.41 and 1.26-1.63. */
+static void ink2_host_pool_default(const Cfg *c) {
+    if (!c->v2 || getenv("COLI_VK_TIER_HOST") || getenv("COLI_VK_TIER_HOST_GB")) return;
+    setenv("COLI_VK_TIER_HOST", "0", 1);
+    fprintf(stderr, "%s tier inkling: Inkling-2 keeps the host pool off, the RAM to the expert cache "
+                    "(COLI_VK_TIER_HOST=1 turns it on)\n", XT_TAG);
+}
+#ifdef COLI_VULKAN
 static void ink_vk_tier_start(Model *m) {
     Cfg *c = &m->c;
     if (!g_vk_ready) return;
@@ -2264,7 +2643,17 @@ static void ink_vk_tier_start(Model *m) {
         int best, forms;
         lgu = malloc((size_t)c->n_layers * sizeof *lgu); ldn = malloc((size_t)c->n_layers * sizeof *ldn);
         gguf_ok = lgu && ldn && ink_vk_gguf_forms(m, lgu, ldn, &best, &forms);
-        if (gguf_ok) {
+        /* Inkling-2's NVFP4 layers: ink_vk_moe folds an expert's gate/up scale into the row it
+         * hands the device, which needs gate's and up's to be one number (the checkpoint's w13
+         * has one amax an expert: unsloth's files keep it twice) */
+        int split = -1;
+        for (int l = 0; gguf_ok && split < 0 && l < c->n_layers; l++)
+            for (int e = 0; m->L[l].xgsc && e < c->n_experts; e++)
+                if (m->L[l].xgsc[e] != m->L[l].xusc[e]) { split = l; break; }
+        if (split >= 0) {
+            fprintf(stderr, "[VK] tier inkling: layer %d's experts have gate and up scales of their own; the experts stay on the CPU\n", split);
+            gguf_ok = 0; free(lgu); free(ldn); lgu = ldn = NULL;
+        } else if (gguf_ok) {
             f = lgu[best]; fd = ldn[best];
             int bestn = 0;
             for (int l = 0; l < c->n_layers; l++) bestn += c->sparse[l] && lgu[l].kind == lgu[best].kind && ldn[l].kind == ldn[best].kind;
@@ -2288,14 +2677,16 @@ static void ink_vk_tier_start(Model *m) {
         int nsp = 0;
         for (int i = 0; i < c->n_layers; i++) nsp += c->sparse[i];
         int64_t D = c->hidden, I = c->moe_inter;
-        int64_t slotb = m->xq ? m->rb13*2*I + m->rb2*D + (2*I+D)*4
+        int64_t slotb = m->xq ? m->rb13*2*I + m->rb2*D + (m->ns13+m->ns2)*4
                       : m->quant_bits ? 3*I*D + (2*I+D)*4 : 3*I*D*4;
         if (!m->gx) fd = f;
         g_ink_vk_slot_bytes = (size_t)slotb;
+        ink2_host_pool_default(c);
         VktConfig vc = {.engine = "inkling", .layers = c->n_layers, .experts = c->n_experts,
                         .hidden = c->hidden, .inter = c->moe_inter, .topk = c->topk,
                         .gate_up = f, .down = fd, .layer_gate_up = lgu, .layer_down = ldn,
-                        .act = VKT_ACT_SWIGLU,
+                        /* Inkling-2: softcap(g, a) * sigmoid(g) * softcap(u, b), ink_glu's */
+                        .act = c->v2 ? VKT_ACT_SITU : VKT_ACT_SWIGLU, .act_a = c->gate_cap, .act_b = c->up_cap,
                         .max_rows = INK_VK_ROWS * c->topk,
                         .ram_reserve = (size_t)slotb * (size_t)m->cache[0].cap * (size_t)nsp,
                         .ram_floor = (size_t)slotb * (size_t)c->topk * (size_t)nsp, .ram_given = ink_vk_ram_given,
@@ -2308,26 +2699,7 @@ static void ink_vk_tier_start(Model *m) {
         free(lgu); free(ldn);   /* read during vkt_init only */
         if (tier_on) {
             atexit(vkt_shutdown);
-            int all = c->n_layers * c->n_experts;
-            int *pl = malloc((size_t)all * sizeof(int)), *pe = malloc((size_t)all * sizeof(int));
-            const char *warm = getenv("COLI_VK_TIER_WARM");   /* 0: no warm start, the tier fills as experts pass by */
-            int n = pl && pe && !(warm && *warm == '0') ? vkt_plan(pl, pe, all) : 0;
-            if (n > 0) {
-                double t0 = now_s();
-                #pragma omp parallel for schedule(dynamic, 4)
-                for (int i = 0; i < n; i++) {
-                    Slot tmp;
-                    if (ink_vk_tmp_slot(m, &tmp, pe[i])) {
-                        slot_fill(m, pl[i], &tmp);
-                        VktExpertSrc src = ink_vk_slot_src(m, pl[i], &tmp);
-                        vkt_put(pl[i], pe[i], &src);
-                    } else vkt_put(pl[i], pe[i], NULL);   /* no memory: the planned slot is released */
-                    ink_vk_tmp_free(&tmp);
-                }
-                vkt_put_done();
-                vkt_warm_report("inkling", n, now_s() - t0);
-            }
-            free(pl); free(pe);
+            ink_tier_warm(m, "inkling");
         }
     }
     if (!vkt_ready() && !coli_vk_dense() && coli_vk_dense_decide("inkling", 0, 1)) {   /* no tier after all */
@@ -2337,6 +2709,67 @@ static void ink_vk_tier_start(Model *m) {
     }
     g_vk_tier_try = vkt_ready();
 }
+#endif
+#ifdef COLI_CUDA
+/* Inkling-2 on the CUDA build: the routed experts in the tier on the CUDA device (cu_tier.h,
+ * vk_tier.c's logic: resident from the history, admitted as the CPU computes them, a host
+ * pool of system RAM the device reads), beside the bf16 dense matrices the backend already
+ * holds there (load_w), whose memory the budget it reads leaves them. Inkling keeps the
+ * backend alone, as before: its experts on the CPU. */
+static void ink_cu_tier_start(Model *m) {
+    Cfg *c = &m->c;
+    if (!c->v2 || !g_cuda || XT(ready)() || !cut_wanted()) return;   /* cut_wanted: COLI_VK_TIER=0 keeps it off */
+    int dev = getenv("GPU_DEV") ? atoi(getenv("GPU_DEV")) : 0;
+    if (!coli_cuda_init(&dev, 1)) { fprintf(stderr, "[CUDA] tier inkling: device %d unavailable; the experts stay on the CPU\n", dev); return; }
+    xt_use_cuda(1);
+    VktFmt f = {VKT_SRC_NONE, 0}, fd, *lgu = NULL, *ldn = NULL;
+    int ok;
+    if (m->gx) {
+        int best, forms, split = -1;
+        lgu = malloc((size_t)c->n_layers * sizeof *lgu); ldn = malloc((size_t)c->n_layers * sizeof *ldn);
+        ok = lgu && ldn && ink_vk_gguf_forms(m, lgu, ldn, &best, &forms);
+        for (int l = 0; ok && split < 0 && l < c->n_layers; l++)   /* ink_vk_moe's folded scales */
+            for (int e = 0; m->L[l].xgsc && e < c->n_experts; e++)
+                if (m->L[l].xgsc[e] != m->L[l].xusc[e]) { split = l; break; }
+        if (ok && split < 0) {
+            f = lgu[best]; fd = ldn[best];
+            fprintf(stderr, "[CUDA] tier inkling: the GGUF experts' blocks go to the device as the file has them (%s gate/up, %s down%s)\n",
+                    gq_type_name(m->gx_t[3 * best]), gq_type_name(m->gx_t[3 * best + 2]), forms > 1 ? ", some layers their own types" : "");
+            if (forms == 1) { free(lgu); free(ldn); lgu = ldn = NULL; }
+        } else {
+            fprintf(stderr, "[CUDA] tier inkling: the GGUF's experts: %s; the experts stay on the CPU\n",
+                    split >= 0 ? "gate and up with scales of their own" : "a type without a device form, or more types than the tier holds");
+            free(lgu); free(ldn); xt_use_cuda(0); return;
+        }
+    } else if (!ink_vk_fmt_of(m, &f)) {
+        fprintf(stderr, "[CUDA] tier inkling: no expert format the tier reads; the experts stay on the CPU\n");
+        xt_use_cuda(0); return;
+    } else fd = f;
+    int nsp = 0;
+    for (int i = 0; i < c->n_layers; i++) nsp += c->sparse[i];
+    int64_t D = c->hidden, I = c->moe_inter;
+    int64_t slotb = m->xq ? m->rb13*2*I + m->rb2*D + (m->ns13+m->ns2)*4
+                  : m->quant_bits ? 3*I*D + (2*I+D)*4 : 3*I*D*4;
+    g_ink_vk_slot_bytes = (size_t)slotb;
+    ink2_host_pool_default(c);
+    VktConfig vc = {.engine = "inkling", .layers = c->n_layers, .experts = c->n_experts,
+                    .hidden = c->hidden, .inter = c->moe_inter, .topk = c->topk,
+                    .gate_up = f, .down = fd, .layer_gate_up = lgu, .layer_down = ldn,
+                    .act = VKT_ACT_SITU, .act_a = c->gate_cap, .act_b = c->up_cap,
+                    .max_rows = INK_VK_ROWS * c->topk,
+                    .ram_reserve = (size_t)slotb * (size_t)m->cache[0].cap * (size_t)nsp,
+                    .ram_floor = (size_t)slotb * (size_t)c->topk * (size_t)nsp, .ram_given = ink_vk_ram_given,
+                    .ram_later = ink_kv_later(m) + ink_ps_plan(),
+                    .dense_bytes = 0,   /* the backend's bf16 matrices are up already: the free memory counts them */
+                    .in_ram = ink_vk_in_ram, .ram_ctx = m,
+                    .load = ink_vk_load, .release = ink_vk_unhold, .load_ctx = m, .load_batch = ink_vk_load_batch};
+    const int tier_on = cut_init(&vc, m->eusage);
+    free(lgu); free(ldn);   /* read during the start only */
+    if (!tier_on) { xt_use_cuda(0); return; }
+    atexit(cut_shutdown);
+    ink_tier_warm(m, "inkling");
+}
+#endif
 /* The tier's streaming (a big prompt chunk's cold experts on the device): an expert's
  * bytes through the layer cache as moe()'s rounds get them; a group at once, filled in
  * parallel, up to the cache's capacity (a slot stays the expert's until the next
@@ -2356,8 +2789,7 @@ static int ink_vk_load_batch(void *ctx, int layer, const int *e, int n, VktExper
     for (int i = 0; i < n; i++) use[i] = ink_vk_get(m, layer, e[i], fill, &nfill);
     if (nfill) {
         double tf = now_s();
-        #pragma omp parallel for schedule(dynamic,1)
-        for (int j = 0; j < nfill; j++) slot_fill(m, layer, fill[j]);
+        ink_fill_slots(m, layer, NULL, fill, nfill);
         m->t_fill += now_s() - tf;
     }
     for (int i = 0; i < n; i++) {
@@ -2377,10 +2809,10 @@ static int ink_vk_load(void *ctx, int layer, int e, VktExpertSrc *src, void **h)
 }
 static void ink_vk_unhold(void *ctx, void *h) { (void)ctx; ink_vk_drop_rows((Slot *)h); }
 static void ink_vk_tier_report(const Model *m, const char *scope) {
-    vkt_report(scope, m->hits, m->miss);   /* nothing when the tier never started */
+    XT(report)(scope, m->hits, m->miss);   /* nothing when the tier never started */
 }
 #endif
-#if defined(COLI_VULKAN) || defined(COLI_CACHE_INDEX_TEST)
+#if defined(COLI_VULKAN) || defined(COLI_CUDA) || defined(COLI_CACHE_INDEX_TEST)
 /* The CPU's pairs of a block (want[i] set) into ctb[i]: moe()'s rounds of at most
  * `cap - npin` pairs -- acquire, fill in parallel, check, compute -- with its kernels. The
  * pairs' history and HITS were counted by the caller. */
@@ -2406,8 +2838,7 @@ static void ink_vk_cpu_pairs(Model *m, int layer, const float *x, int n, const i
         }
         if (nfill) {
             double tf = now_s();
-            #pragma omp parallel for schedule(dynamic,1)
-            for (int j = 0; j < nfill; j++) slot_fill(m, layer, fill[j]);
+            ink_fill_slots(m, layer, NULL, fill, nfill);
             m->t_fill += now_s() - tf;
         }
         for (int r = 0; r < nr; r++) {
@@ -2422,29 +2853,30 @@ static void ink_vk_cpu_pairs(Model *m, int layer, const float *x, int n, const i
             const float *xs = x + (int64_t)(pi[r] / K) * D;
             float *hh = ctb + (int64_t)pi[r] * D;
             if (m->gx) ink_gx_expert(m, layer, e, xs, g, hh);
+            else if (m->xg64) ink_xg64_expert(m, e, xs, g, hh);
             else if (m->xq) {
                 if (q4) {
                     matmul_q4(g, xs, e->p13, e->s13, D, 2*I);   /* gate rows then up rows */
-                    for (int k = 0; k < I; k++) g[k] = siluf(g[k]) * u[k];
+                    ink_glu(&m->c, g, u, I);
                     matmul_q4(hh, g, e->p2, e->s2, I, D);
                 } else {
                     matmul_q(g, xs, (int8_t*)e->p13, e->s13, D, 2*I);
-                    for (int k = 0; k < I; k++) g[k] = siluf(g[k]) * u[k];
+                    ink_glu(&m->c, g, u, I);
                     matmul_q(hh, g, (int8_t*)e->p2, e->s2, I, D);
                 }
             } else if (m->quant_bits) {
                 matmul_q(g, xs, e->q13, e->s13, D, 2*I);
-                for (int k = 0; k < I; k++) g[k] = siluf(g[k]) * u[k];
+                ink_glu(&m->c, g, u, I);
                 matmul_q(hh, g, e->q2, e->s2, I, D);
             } else {
                 matmul(g, xs, e->f13, 1, D, 2*I);
-                for (int k = 0; k < I; k++) g[k] = siluf(g[k]) * u[k];
+                ink_glu(&m->c, g, u, I);
                 matmul(hh, g, e->f2, 1, I, D);
             }
-#ifdef COLI_VULKAN
-            if (ink_gx_ilv(m, layer) && !vkt_wants(layer, e->eid)) continue;   /* converted only for the tier to take */
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
+            if (ink_gx_ilv(m, layer) && !XT(wants)(layer, e->eid)) continue;   /* converted only for the tier to take */
             VktExpertSrc vs = ink_vk_slot_src(m, layer, e);
-            vkt_note(layer, e->eid, &vs);
+            XT(note)(layer, e->eid, &vs);
             ink_vk_drop_rows(e);
 #endif
         }
@@ -2452,14 +2884,20 @@ static void ink_vk_cpu_pairs(Model *m, int layer, const float *x, int n, const i
     free(use); free(fill); free(pi);
 }
 #endif
-#ifdef COLI_VULKAN
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
 /* moe() with the tier on, after its routing pass: idx/keff/wgt as moe() made them;
  * routed_only leaves the shared experts out (the dense chain runs them). */
 static void ink_vk_moe(Model *m, Layer *l, int layer, const float *x, int S, float *out,
                        const int *idx, const int *keff, const float *wgt, int routed_only) {
     Cfg *c = &m->c;
     int D = c->hidden, K = c->topk, I = c->moe_inter, ns = c->n_shared;
-    int B = vkt_step_rows(S, INK_VK_ROWS);   /* a whole prompt chunk when the tier streams */
+    int B = XT(step_rows)(S, INK_VK_ROWS);   /* a whole prompt chunk when the tier streams */
+    /* Inkling-2 from a GGUF, its NVFP4 layers: each expert's global scale is outside its
+     * blocks (ink_gx_expert). Gate's and up's are one number (ink_vk_tier_start checks), so the
+     * device reads every (row, rank) pair as a row of its own, x times that scale, and down's
+     * scale goes into the pair's weight in the sum below. */
+    const int xscaled = l->xgsc != NULL;
+    float *xp = xscaled ? falloc((int64_t)B * K * D) : NULL;
     float *ctb = falloc((int64_t)B * K * D), *shb = ns > 0 && !routed_only ? falloc((int64_t)B * D) : NULL;
     float *g = falloc(2*I), *u = g + I, *hh = falloc(D);
     int *ib = malloc((size_t)B * K * sizeof(int));
@@ -2477,7 +2915,16 @@ static void ink_vk_moe(Model *m, Layer *l, int layer, const float *x, int S, flo
             if (m->eusage && m->eusage[layer]) m->eusage[layer][ib[i]]++;
             ehit_mark(m, layer, ib[i]);
         }
-        int ndev = vkt_issue(layer, xb, rows, K, ib, taken);
+        int ndev;
+        if (xscaled) {
+            for (int i = 0; i < n; i++) {
+                if (ib[i] < 0) continue;
+                const float sc = l->xgsc[ib[i]], *xr = xb + (int64_t)(i / K) * D;
+                float *xd = xp + (int64_t)i * D;
+                for (int d = 0; d < D; d++) xd[d] = xr[d] * sc;
+            }
+            ndev = XT(issue)(layer, xp, n, 1, ib, taken);
+        } else ndev = XT(issue)(layer, xb, rows, K, ib, taken);
         for (int i = 0; i < n; i++) want[i] = ib[i] >= 0 && !taken[i];
         ink_vk_cpu_pairs(m, layer, xb, n, ib, want, ctb, g);
         if (shb) {
@@ -2486,7 +2933,7 @@ static void ink_vk_moe(Model *m, Layer *l, int layer, const float *x, int S, flo
             shared_experts_cpu(m, l, xb, rows, shb, wgt + (int64_t)s0 * (K + ns), g, u, hh);
             sh = now_s() - ts; m->t_shared += sh;
         }
-        if (ndev && !vkt_join(dev)) {   /* the batch failed (the tier stops): those pairs here */
+        if (ndev && !XT(join)(dev)) {   /* the batch failed (the tier stops): those pairs here */
             ink_vk_cpu_pairs(m, layer, xb, n, ib, taken, ctb, g);
             memset(taken, 0, (size_t)n);
         }
@@ -2497,13 +2944,14 @@ static void ink_vk_moe(Model *m, Layer *l, int layer, const float *x, int S, flo
                 int i = s * K + kk;
                 if (ib[i] < 0) continue;
                 const float *cp = taken[i] ? dev[i] : ctb + (int64_t)i * D;
-                for (int d = 0; d < D; d++) os[d] += w[kk] * cp[d];
+                const float wk = taken[i] && xscaled ? w[kk] * l->xdsc[ib[i]] : w[kk];
+                for (int d = 0; d < D; d++) os[d] += wk * cp[d];
             }
             if (shb) { const float *sp = shb + (int64_t)s * D; for (int d = 0; d < D; d++) os[d] += sp[d]; }
         }
         m->t_expert += now_s() - te - sh - (m->t_fill - f0);
     }
-    free(ctb); free(shb); free(g); free(hh); free(ib); free(taken); free(want); free(dev);
+    free(xp); free(ctb); free(shb); free(g); free(hh); free(ib); free(taken); free(want); free(dev);
 }
 #endif
 
@@ -2572,8 +3020,8 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out, c
         m->euse += keff[s];
     }
     if (shw) for (int s = 0; s < S; s++) for (int j = 0; j < ns; j++) shw[(int64_t)j*S + s] = wgt[(int64_t)s*(K+ns) + K + j];
-#ifdef COLI_VULKAN
-    if (vkt_ready()) {   /* the Vulkan expert tier takes the layer from here (ink_vk_moe) */
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
+    if (XT(ready)()) {   /* the expert tier (Vulkan's or CUDA's) takes the layer from here (ink_vk_moe) */
         ink_vk_moe(m, l, layer, x, S, out, idx, keff, wgt, shw != NULL);
         if (!lg_in) free(logits);
         free(idx); free(keff); free(wgt); free(use); free(fill); free(fl);
@@ -2673,8 +3121,7 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out, c
         }
         if (nfill) {                                      /* riempimento in parallelo */
             double tf = now_s();
-            #pragma omp parallel for schedule(dynamic,1)
-            for (int j = 0; j < nfill; j++) slot_fill(m, fl[j], fill[j]);
+            ink_fill_slots(m, 0, fl, fill, nfill);
             m->t_fill += now_s() - tf;
         }
         /* Validate before the CPU/Metal split: either backend must refuse a
@@ -2760,23 +3207,24 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out, c
             float *os = out + (int64_t)s*D;
             float *w = wgt + (int64_t)s*(K+ns);
             if (m->gx) ink_gx_expert(m, layer, e, xs, g, hh);
+            else if (m->xg64) ink_xg64_expert(m, e, xs, g, hh);
             else if (m->xq) {
                 if (q4) {
                     matmul_q4(g, xs, e->p13, e->s13, D, 2*I);   /* gate rows then up rows */
-                    for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
+                    ink_glu(c, g, u, I);
                     matmul_q4(hh, g, e->p2, e->s2, I, D);
                 } else {
                     matmul_q(g, xs, (int8_t*)e->p13, e->s13, D, 2*I);
-                    for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
+                    ink_glu(c, g, u, I);
                     matmul_q(hh, g, (int8_t*)e->p2, e->s2, I, D);
                 }
             } else if (m->quant_bits) {
                 matmul_q(g, xs, e->q13, e->s13, D, 2*I);
-                for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
+                ink_glu(c, g, u, I);
                 matmul_q(hh, g, e->q2, e->s2, I, D);
             } else {
                 matmul(g, xs, e->f13, 1, D, 2*I);
-                for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
+                ink_glu(c, g, u, I);
                 matmul(hh, g, e->f2, 1, I, D);
             }
             for (int d = 0; d < D; d++) os[d] += w[kk] * hh[d];
@@ -2844,6 +3292,11 @@ static int audio_tok_count(Model *m, const int *ids, int n) {
 static void inkling_layers_forward_range(Model *m, float *x, int S, int pos0,
                                           int layer_begin, int layer_end) {
     Cfg *c = &m->c; int D = c->hidden;
+    if (c->v2) {   /* every layer at once: the attention residuals mix them all (inkling2.h) */
+        if (layer_begin != 0 || layer_end != c->n_layers) { fprintf(stderr, "inkling2: a forward over every layer only\n"); exit(1); }
+        ink2_layers_forward(m, x, S, pos0);
+        return;
+    }
     float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
     for (int i = layer_begin; i < layer_end; i++) {
         if (coli_prompt_break()) break;   /* a served prompt's CANCEL: step_mm leaves without the rest */
@@ -3028,6 +3481,7 @@ static float *step_mm(Model *m, const int *ids, int S, int pos0, int *tf_out,
                     for (int d = 0; d < D; d++) nr[d] /= c->mup;
                 }
                 matmul_w(logits, normed, m->lm_head, rows, D, c->unpad_vocab);
+                ink2_head_post(c, logits, (int64_t)rows * c->unpad_vocab);
                 for (int r = 0; r < rows; r++) {
                     int p = base + r;
                     ink_echo(g_echo_id, pos0 + p + 1, ids[p+1], logits + (int64_t)r * c->unpad_vocab,
@@ -3044,6 +3498,7 @@ static float *step_mm(Model *m, const int *ids, int S, int pos0, int *tf_out,
                     for (int d = 0; d < D; d++) nr[d] /= c->mup;
                 }
                 matmul_w(logits, normed, m->lm_head, rows, D, c->unpad_vocab);
+                ink2_head_post(c, logits, (int64_t)rows * c->unpad_vocab);
                 for (int r = 0; r < rows; r++) {
                     const float *lr = logits + (int64_t)r * c->unpad_vocab;
                     int best = 0; for (int i = 1; i < c->unpad_vocab; i++) if (lr[i] > lr[best]) best = i;
@@ -3059,6 +3514,7 @@ static float *step_mm(Model *m, const int *ids, int S, int pos0, int *tf_out,
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
     for (int d = 0; d < D; d++) last[d] /= c->mup;
     matmul_w(logit, last, m->lm_head, 1, D, c->unpad_vocab);
+    ink2_head_post(c, logit, c->unpad_vocab);
     free(x); free(last);
     return logit;
 }
@@ -3118,6 +3574,7 @@ static float *ink_step_rows(Model *m, const InkRow *rows, const int *ids, int S)
         for (int d = 0; d < D; d++) nr[d] /= c->mup;
     }
     matmul_w(logit, normed, m->lm_head, S, D, c->unpad_vocab);
+    ink2_head_post(c, logit, (int64_t)S * c->unpad_vocab);
     free(x); free(normed);
     return logit;
 }
@@ -3287,6 +3744,8 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new,
            wall - m->t_fill - m->t_expert - m->t_shared - m->t_attn);
 #ifdef COLI_VULKAN
     fflush(stdout); ink_vk_report(); ink_vk_tier_report(m, "run"); inkc_report(m);
+#elif defined(COLI_CUDA)
+    fflush(stdout); ink_vk_tier_report(m, "run");
 #endif
     free(ids);
 }
@@ -3917,6 +4376,8 @@ static int serve_one(Model *m, Tok *T, SReq *q) {
     }
 #ifdef COLI_VULKAN
     ink_vk_report(); ink_vk_tier_report(m, "turn"); inkc_report(m);
+#elif defined(COLI_CUDA)
+    ink_vk_tier_report(m, "turn");
 #endif
     serve_hits(m);
     free(ids);
@@ -3978,7 +4439,7 @@ static void serve_tiers_emap(Model *m) {
     int nsp = 0, filled = 0;
     for (int i = 0; i < c->n_layers; i++) if (c->sparse[i]) { nsp++; filled += m->cache[i].n; }
     int64_t I = c->moe_inter, D = c->hidden;
-    int64_t slotb = m->xq ? m->rb13*2*I + m->rb2*D + (2*I+D)*4
+    int64_t slotb = m->xq ? m->rb13*2*I + m->rb2*D + (m->ns13+m->ns2)*4
                   : m->quant_bits ? 3*I*D + (2*I+D)*4 : 3*I*D*4;
     printf("TIERS 0 %d %d 0.00 %.2f\n", filled, nsp*E - filled, filled*(double)slotb/1e9);
     /* EMAP: 1 byte/expert hex — tier(2b: 0=disk 1=RAM 2=Vulkan device)<<6 | heat(6b: log2 usage) */
@@ -3988,8 +4449,8 @@ static void serve_tiers_emap(Model *m) {
         for (int e = 0; e < E; e++) {
             Slot *resident = slot_indexed(m, i, e);
             int tier = resident && resident->filled;
-#ifdef COLI_VULKAN
-            if (vkt_resident(i, e)) tier = 2;   /* on the Vulkan device */
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
+            if (XT(resident)(i, e)) tier = 2;   /* on the device */
 #endif
             uint32_t u = m->eusage[i] ? m->eusage[i][e] : 0;
             int heat = 0; while (u) { heat++; u >>= 1; } if (heat > 63) heat = 63;
@@ -4140,6 +4601,8 @@ static void serve_mux(Model *m, Tok *T) {
         if (ended) {
 #ifdef COLI_VULKAN
             ink_vk_report(); ink_vk_tier_report(m, "turn");
+#elif defined(COLI_CUDA)
+            ink_vk_tier_report(m, "turn");
 #endif
             serve_tiers_emap(m);
         }
@@ -4264,7 +4727,20 @@ int main(int argc, char **argv) {
      * generazione. Senza template un modello instruct riceve testo fuori
      * distribuzione. THINK=<0..1> alza lo sforzo di ragionamento (default 0). */
     char *chat_buf = NULL;
-    if (chat && prompt && !dmel) {
+    if (chat && prompt && !dmel && ink_snap_v2(snap)) {
+        /* Inkling-2's chat_template.jinja: the effort level before the first message that is not
+         * a system one, and no generation prompt (the model opens its own turn). With effort 0 the
+         * prompt opens the model's text block, as openai_server.py's render_chat_inkling2 does */
+        const char *eff = getenv("THINK") ? getenv("THINK") : "0";
+        size_t need = strlen(prompt) + strlen(eff) + 256;
+        chat_buf = malloc(need);
+        if (!chat_buf) { fprintf(stderr, "OOM chat template\n"); return 1; }
+        snprintf(chat_buf, need,
+                 "<|message_system|><|content_text|>Thinking effort level: %s<|end_message|>"
+                 "<|message_user|><|content_text|>%s<|end_message|>%s", eff, prompt,
+                 atof(eff) == 0.0 ? "<|message_model|><|content_text|>" : "");
+        prompt = chat_buf;
+    } else if (chat && prompt && !dmel) {
         const char *eff = getenv("THINK") ? getenv("THINK") : "0";
         size_t need = strlen(prompt) + strlen(eff) + 256;
         chat_buf = malloc(need);
@@ -4313,6 +4789,9 @@ int main(int argc, char **argv) {
         ink_vk_tier_start(&m);   /* after the history: the warm start reads it */
         inkc_start(&m);          /* COLI_VK_CHAIN, after the tier */
 #endif
+#ifdef COLI_CUDA
+        ink_cu_tier_start(&m);   /* Inkling-2: the experts in the CUDA tier, after the history */
+#endif
         char tkp[2048]; snprintf(tkp, sizeof(tkp), "%s/tokenizer.json", snap);
         Tok T; tok_load(&T, tkp);
         if (g_ink_mux_slots > 1) {   /* the whole context's state for every slot; slot 0 is the Model's */
@@ -4331,11 +4810,15 @@ int main(int argc, char **argv) {
     if (prompt || pfile) {
         Model m; model_init(&m, snap, cap, bits);
         printf("== Inkling C engine, %d layers, experts @ %s, cache %d/layer ==\n",
-               m.c.n_layers, m.xq ? "container" : bits ? "int" : "f32", m.cache[0].cap);
+               m.c.n_layers, m.gx ? "GGUF" : m.xg64 ? "container (int4 g64)" : m.xq ? "container" : bits ? "int" : "f32",
+               m.cache[0].cap);
         pins_load(&m, snap);
 #ifdef COLI_VULKAN
         ink_vk_tier_start(&m);
         inkc_start(&m);          /* COLI_VK_CHAIN, after the tier */
+#endif
+#ifdef COLI_CUDA
+        ink_cu_tier_start(&m);   /* Inkling-2: the experts in the CUDA tier, after the history */
 #endif
         char tkp[2048]; snprintf(tkp, sizeof(tkp), "%s/tokenizer.json", snap);
         Tok T; tok_load(&T, tkp);
@@ -4391,8 +4874,12 @@ int main(int argc, char **argv) {
     ink_vk_tier_start(&m);   /* the oracle reads no history: the tier fills as experts pass by */
     inkc_start(&m);          /* COLI_VK_CHAIN, after the tier */
 #endif
+#ifdef COLI_CUDA
+    ink_cu_tier_start(&m);
+#endif
     printf("== Inkling C engine (Stage A), cache = %d experts/layer, experts @ %s ==\n",
-           cap, m.xq ? "container (int4/int8 + .qs)" : bits ? "int (runtime quant)" : "f32");
+           cap, m.gx ? "GGUF" : m.xg64 ? "container (int4 g64)" : m.xq ? "container (int4/int8 + .qs)"
+                : bits ? "int (runtime quant)" : "f32");
     printf("cfg: D=%d L=%d V=%d(%d) heads=%d/%d kv=%d/%d hd=%d win=%d d_rel=%d ext=%d E=%d+%d topk=%d\n",
            m.c.hidden, m.c.n_layers, m.c.vocab, m.c.unpad_vocab, m.c.n_heads, m.c.swa_heads,
            m.c.n_kv, m.c.swa_kv, m.c.head_dim, m.c.window, m.c.d_rel, m.c.rel_extent,
@@ -4442,6 +4929,8 @@ int main(int argc, char **argv) {
            rss_gb(), tot?100.0*m.hits/tot:0.0, ngen/dt);
 #ifdef COLI_VULKAN
     fflush(stdout); ink_vk_report(); ink_vk_tier_report(&m, "run"); inkc_report(&m);
+#elif defined(COLI_CUDA)
+    fflush(stdout); ink_vk_tier_report(&m, "run");
 #endif
     free(buf); free(arena);
     return (match == ngen) ? 0 : 1;
@@ -4483,6 +4972,7 @@ static void inkling_segment_layer_destroy(Layer *layer) {
     inkling_segment_wt_destroy(&layer->v);
     inkling_segment_wt_destroy(&layer->r);
     inkling_segment_wt_destroy(&layer->o);
+    inkling_segment_wt_destroy(&layer->ag);
     free(layer->qn); free(layer->kn); free(layer->relp);
     free(layer->k_cw); free(layer->v_cw);
     free(layer->a_cw); free(layer->m_cw);

@@ -1052,6 +1052,7 @@ static void inkc_start(Model *m) {
     if (g_metal) { if (e && *e && *e != '0') fprintf(stderr, "[VK] inkling: dense chain off, the Metal expert path is on\n"); return; }
 #endif
     (void)e;
+    if (m->c.v2) { g_vk_chain = 0; return; }   /* the chain computes Inkling's layers, not Inkling-2's */
     g_vk_chain = coli_vk_chain_decide("inkling", vkt_ready(), INKLING_CHAIN_IGPU);
     if (g_vk_chain && g_ink_mux_slots > 1) {
         g_vk_chain = 0;

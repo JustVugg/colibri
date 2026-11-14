@@ -1227,6 +1227,17 @@ def chat_flavor():
 
 def detect_chat_flavor(family_id, model_dir):
     """The template a checkpoint ships, when it differs from its family's (see CHAT_FLAVOR)."""
+    if family_id == "inkling" and model_dir:   # Inkling-2: the model opens its own turn
+        try:
+            config = json.loads((Path(model_dir) / "config.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            config = {}
+        if isinstance(config, dict):
+            text = config.get("text_config")
+            types = (config.get("model_type"), text.get("model_type") if isinstance(text, dict) else None)
+            if any(isinstance(t, str) and t.startswith("inkling2") for t in types):
+                return "inkling2"
+        return None
     if family_id == "glm" and model_dir:   # the colibri engine: Mistral-Large-4's own chat format
         try:
             config = json.loads((Path(model_dir) / "config.json").read_text(encoding="utf-8"))
@@ -3609,6 +3620,82 @@ def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, 
     return "".join(prompt)
 
 
+def render_chat_inkling2(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                         tool_choice=None, add_generation_prompt=True):
+    """Text-only subset of Inkling-2's chat_template.jinja. Where it differs from Inkling's
+    (render_chat_inkling): the effort level comes before the first message that is not a
+    system one, a model turn's reasoning is a message of its own under the turn's role token,
+    an assistant's or a tool's name follows its role token, an assistant turn with reasoning and
+    no text has no text block, and there is no generation prompt: the model opens its own turn
+    (<|message_model|>, then <|content_thinking|> or <|content_text|>) and ends it with
+    <|content_model_end_sampling|>. With thinking off the prompt opens the model's text block,
+    the state every turn without reasoning was trained on, so that a first sampled
+    <|content_thinking|> cannot spend the budget before the answer (render_chat_inkling's
+    reason). add_generation_prompt=False continues a trailing assistant turn: rendered open,
+    without its <|end_message|> and <|content_model_end_sampling|>."""
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    if tools or (tool_choice not in (None, "none")):
+        raise APIError(400, "Tool use is not wired up for the Inkling engine yet.",
+                       "tools", "unsupported_parameter")
+    role_token = {"user": "<|message_user|>", "system": "<|message_system|>",
+                  "developer": "<|message_system|>", "assistant": "<|message_model|>",
+                  "tool": "<|message_tool|>"}
+    effort_map = {"none": 0.0, "minimal": 0.1, "low": 0.2, "medium": 0.7,
+                  "high": 0.9, "xhigh": 0.99, "max": 0.99}
+    if reasoning_effort in effort_map:
+        eff = effort_map[reasoning_effort]
+    else:
+        eff = 0.9 if enable_thinking else 0.0   # off unless asked, as for Inkling
+    effort_str = ("<|message_system|><|content_text|>Thinking effort level: "
+                  f"{0 if eff == 0.0 else eff}<|end_message|>")
+    prompt = []
+    effort_emitted = False
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        if not isinstance(role, str) or role not in role_token:
+            raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        if not effort_emitted and role not in ("system", "developer"):
+            prompt.append(effort_str)
+            effort_emitted = True
+        rtok = role_token[role]
+        name = message.get("name")
+        if role in ("assistant", "tool") and isinstance(name, str) and name:
+            rtok += name
+        open_turn = (not add_generation_prompt and role == "assistant"
+                     and index == len(messages) - 1)
+        reasoning = message.get("reasoning_content") if role == "assistant" else None
+        if reasoning is not None and not isinstance(reasoning, str):
+            raise APIError(400, "`reasoning_content` must be a string.",
+                           f"messages.{index}.reasoning_content")
+        if reasoning:
+            prompt.append(f"{rtok}<|content_thinking|>{reasoning}<|end_message|>")
+        raw = message.get("content")
+        if isinstance(raw, list):   # one block per text part, as the template renders a list
+            texts = [content_text([part], f"messages.{index}.content")
+                     if isinstance(part, dict) else content_text(part, f"messages.{index}.content")
+                     for part in raw]
+        elif raw is None:            # no content: no block
+            texts = []
+        else:
+            text = content_text(raw, f"messages.{index}.content")
+            texts = [text] if (text or not reasoning) else []
+        if open_turn and not texts:
+            texts = [""]
+        for k, text in enumerate(texts):
+            last = open_turn and k == len(texts) - 1
+            prompt.append(f"{rtok}<|content_text|>{text}" + ("" if last else "<|end_message|>"))
+        if role == "assistant" and not open_turn:
+            prompt.append("<|content_model_end_sampling|>")
+    if not effort_emitted:
+        prompt.append(effort_str)
+    if add_generation_prompt and eff == 0.0:
+        prompt.append("<|message_model|><|content_text|>")
+    return "".join(prompt)
+
+
 def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                 tool_choice=None, add_generation_prompt=True):
     """Render the text-only subset of the official GLM-5.2 chat template.
@@ -5007,6 +5094,9 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
     if not add_generation_prompt and ARCH not in CONTINUATION_FAMILIES:
         raise APIError(400, f"Continuing an assistant turn is not implemented for {ARCH!r}.",
                        "messages", "unsupported_parameter")
+    if ARCH == "inkling" and chat_flavor() == "inkling2":
+        return render_chat_inkling2(messages, enable_thinking, reasoning_effort, tools,
+                                    tool_choice, add_generation_prompt=add_generation_prompt)
     if ARCH == "inkling":
         return render_chat_inkling(messages, enable_thinking, reasoning_effort, tools,
                                     tool_choice, audio_out=audio_out,
