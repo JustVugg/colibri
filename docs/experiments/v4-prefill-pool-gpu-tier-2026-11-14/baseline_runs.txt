@@ -1,0 +1,66 @@
+== pool0_r1 [DSV4_CUDA_PIN_HOST=0 COLI_V4_PREFILL_POOL=0]: exit=0 abort=0 peak=6930MiB min_free=1246MiB stdout_md5=0675623b31a5
+[OMP] deepseek-v4: 16 compute threads (the physical cores of 32 logical CPUs; the 3 expert-loader workers take the SMT siblings); OMP_NUM_THREADS=<n> overrides, COLI_NO_OMP_TUNE=1 disables
+ram_tiers available=32.95GiB dense=resident(6.23GiB) target_slots=38 target_cache=20.35GiB head=resident-bf16 projected=32.45GiB
+v4_open index=0.03s plan=0.00s (index built once, reused by plan/inventory/head)
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_autopin history=<models>/dsv4-flash-reap-150b/.coli_usage selections=2289721
+v4_hot_policy pin_slots_per_layer=16 repin_interval=6 mode=resident-ram rows16=hot-pins
+[DSV4 CUDA] device 0: AMD Radeon RX 7600M XT 8.6 GB sm_110
+v4_gpu place device=0 budget=5120MiB dense=ram
+v4_gpu tier=dense-matvec device=0
+v4_gpu resident-experts=cache-fallback (the GPU keeps dense and shared experts in RAM below 10 GiB (use --vram 10 or more))
+v4_cli mode=chat memory=auto target_only=1
+v4_dense_resident layers=43 bytes=6.226GiB
+v4_gpu head=resident device=0 bytes=1059061760 arithmetic=separate-mul-add
+The survey team crossed rivers 3 through 62 at dawn
+v4_tokens prompt=2535 generated=12 total=2547 expert_requests=73516 hits=12734 misses=60782 hit_rate=17.321 bytes=812615467008 target_only=1
+TUNE decode: 12 tokens in 536.097s
+generated_text=The survey team crossed rivers 3 through 62 at dawn
+timing time_to_first_token=526.199s after_first=9.868s
+v4_rows16 packed_slots=0
+v4_direct reads=60782 flock_reads=0 fallbacks=0 payload_bytes=777010544640
+
+== pool0_r2 [DSV4_CUDA_PIN_HOST=0 COLI_V4_PREFILL_POOL=0]: exit=0 abort=0 peak=6837MiB min_free=1339MiB stdout_md5=0675623b31a5
+[OMP] deepseek-v4: 16 compute threads (the physical cores of 32 logical CPUs; the 3 expert-loader workers take the SMT siblings); OMP_NUM_THREADS=<n> overrides, COLI_NO_OMP_TUNE=1 disables
+ram_tiers available=31.92GiB dense=resident(6.23GiB) target_slots=37 target_cache=19.81GiB head=resident-bf16 projected=31.90GiB
+v4_open index=0.04s plan=0.00s (index built once, reused by plan/inventory/head)
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_autopin history=<models>/dsv4-flash-reap-150b/.coli_usage selections=2289721
+v4_hot_policy pin_slots_per_layer=16 repin_interval=6 mode=resident-ram rows16=hot-pins
+[DSV4 CUDA] device 0: AMD Radeon RX 7600M XT 8.6 GB sm_110
+v4_gpu place device=0 budget=5120MiB dense=ram
+v4_gpu tier=dense-matvec device=0
+v4_gpu resident-experts=cache-fallback (the GPU keeps dense and shared experts in RAM below 10 GiB (use --vram 10 or more))
+v4_cli mode=chat memory=auto target_only=1
+v4_dense_resident layers=43 bytes=6.226GiB
+v4_gpu head=resident device=0 bytes=1059061760 arithmetic=separate-mul-add
+The survey team crossed rivers 3 through 62 at dawn
+v4_tokens prompt=2535 generated=12 total=2547 expert_requests=73516 hits=12706 misses=60810 hit_rate=17.283 bytes=812989808640 target_only=1
+TUNE decode: 12 tokens in 516.309s
+generated_text=The survey team crossed rivers 3 through 62 at dawn
+timing time_to_first_token=506.610s after_first=9.669s
+v4_rows16 packed_slots=0
+v4_direct reads=60810 flock_reads=0 fallbacks=0 payload_bytes=777363652608
+
+== pool0_r3 [DSV4_CUDA_PIN_HOST=0 COLI_V4_PREFILL_POOL=0]: exit=0 abort=0 peak=6950MiB min_free=1226MiB stdout_md5=0675623b31a5
+[OMP] deepseek-v4: 16 compute threads (the physical cores of 32 logical CPUs; the 3 expert-loader workers take the SMT siblings); OMP_NUM_THREADS=<n> overrides, COLI_NO_OMP_TUNE=1 disables
+ram_tiers available=31.82GiB dense=resident(6.23GiB) target_slots=36 target_cache=19.27GiB head=resident-bf16 projected=31.36GiB
+v4_open index=0.03s plan=0.00s (index built once, reused by plan/inventory/head)
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_autopin history=<models>/dsv4-flash-reap-150b/.coli_usage selections=2289721
+v4_hot_policy pin_slots_per_layer=16 repin_interval=6 mode=resident-ram rows16=hot-pins
+[DSV4 CUDA] device 0: AMD Radeon RX 7600M XT 8.6 GB sm_110
+v4_gpu place device=0 budget=5120MiB dense=ram
+v4_gpu tier=dense-matvec device=0
+v4_gpu resident-experts=cache-fallback (the GPU keeps dense and shared experts in RAM below 10 GiB (use --vram 10 or more))
+v4_cli mode=chat memory=auto target_only=1
+v4_dense_resident layers=43 bytes=6.226GiB
+v4_gpu head=resident device=0 bytes=1059061760 arithmetic=separate-mul-add
+The survey team crossed rivers 3 through 62 at dawn
+v4_tokens prompt=2535 generated=12 total=2547 expert_requests=73516 hits=12701 misses=60815 hit_rate=17.277 bytes=813056655360 target_only=1
+TUNE decode: 12 tokens in 512.465s
+generated_text=The survey team crossed rivers 3 through 62 at dawn
+timing time_to_first_token=502.620s after_first=9.814s
+v4_rows16 packed_slots=0
+v4_direct reads=60815 flock_reads=0 fallbacks=0 payload_bytes=777433645056
+
