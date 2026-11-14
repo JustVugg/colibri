@@ -49,10 +49,12 @@ static void state_free(void *p) { frees++; free(p); }
 /* A part whose rows are NOT one array, as DeepSeek V4.1's index-key mirror is: a block of ROWS4
  * rows keeps its ROWS4 data rows and then their scale bytes, so row t + 1 does not start where
  * row t ends and no contiguous run of `row` bytes a store copies is a run of rows. Such a part
- * hands the store rows_io, and the store copies the staging it writes instead. ROWS4 does not
- * divide the store's B: a block of B positions starts inside one of these, which is where a
- * linear copy of the same length leaves some of its rows' bytes behind and takes other rows'. */
-enum { ROWS4 = 3, ROWB = 8, SECB = ROWB * ROWS4, BLKB = SECB + ROWS4 };   /* 24 data bytes, 3 scales */
+ * hands the store rows_io, and the store copies the staging it writes instead; production's is
+ * compressed too, a row for IPER positions the way the ikey part's per is the KV ratio, so the
+ * part below keeps that shape. ROWS4 does not divide the store's B: a block of B positions
+ * starts inside one of these, which is where a linear copy of the same length leaves some of
+ * its rows' bytes behind and takes other rows'. */
+enum { ROWS4 = 3, ROWB = 8, IPER = 2, SECB = ROWB * ROWS4, BLKB = SECB + ROWS4 };   /* 24 data bytes, 3 scales */
 static uint8_t m_out[CAP / ROWS4 * BLKB], m_in[CAP / ROWS4 * BLKB];
 static void blk_rows_io(void *base, int row0, int n, char *buf, int out) {
     uint8_t *m = (uint8_t *)base;
@@ -198,32 +200,41 @@ int main(void) {
           "a group of 5 in blocks of 16: nothing kept, the state freed");
     check(!coli_ps_layout(&w, odd, 2) && coli_ps_layout(&w, parts, NP), "the layout refuses it, takes the block's divisors");
 
-    /* a part whose rows are not one array: saved from one mirror, put back into a second one.
-     * The checkpoint is at 205 -- 12 blocks and a tail of 13 rows, 192..204 -- and the tail's last
-     * row opens a block of its own: the 117 staging bytes a linear part would copy stop inside
-     * that block, before its scale bytes, so that row comes back with data and no scale (proved:
-     * with rows_io NULL the check below fails on row 204). */
+    /* a part whose rows are not one array, and compressed the way production's is (a row for
+     * IPER positions): saved from one mirror, put back into a second one. The checkpoint is
+     * at 205 -- 12 blocks and a tail of 13 rows, 192..204 -- and the tail stages its 6 whole
+     * groups while the 13th row's half-read group stays the engine's state to refill, as the
+     * compressed part above leaves its filling group; the tail's last staged group ends on a
+     * mirror block's last row, and the 54 staging bytes a linear part would copy come from the
+     * middle of a mirror block's data rows, not its rows (proved: with rows_io NULL the check
+     * below fails on the first group already). */
     for (int t = 0; t < sys + B; t++) {   /* past the checkpoint, so a row left un-restored shows */
         for (int j = 0; j < ROWB; j++) m_out[(size_t)(t / ROWS4) * BLKB + (size_t)(t % ROWS4) * ROWB + j] = (uint8_t)(t * 7 + j);
         m_out[(size_t)(t / ROWS4) * BLKB + SECB + t % ROWS4] = (uint8_t)(t ^ 0x33);
     }
     ColiPrefixStore y;
     coli_ps_init(&y, B, (size_t)64 << 20);
-    ColiPsPart blk_out[1] = {{m_out, ROWB + 1, CAP, 1, 0, 1, blk_rows_io}};
-    ColiPsPart blk_in[1] = {{m_in, ROWB + 1, CAP, 1, 0, 1, blk_rows_io}};
+    ColiPsPart blk_out[1] = {{m_out, ROWB + 1, CAP / IPER, 1, 0, IPER, blk_rows_io}};
+    ColiPsPart blk_in[1] = {{m_in, ROWB + 1, CAP / IPER, 1, 0, IPER, blk_rows_io}};
     memset(m_in, 0, sizeof m_in);
     check(coli_ps_save(&y, A, sys + 5, blk_out, 1, state_of(A, sys + 5), 8, state_free, -1),
-          "a part of block-wide sections is kept, a checkpoint tail of 13 rows and all");
+          "a part of block-wide sections is kept, a checkpoint tail of 13 rows staging its 6 whole groups");
     ColiPsHit hb;
     int P5 = coli_ps_lookup(&y, A, na, sys + 5, 1, &hb);
     void *st5 = coli_ps_load(&y, &hb, blk_in, 1);
     int same5 = st5 != NULL;
-    for (int t = 0; same5 && t < P5; t++) {
+    for (int t = 0; same5 && t < P5 / IPER; t++) {   /* every whole group staged, row for row */
         uint8_t a[ROWB + 1], b[ROWB + 1];
         blk_rows_io(m_out, t, 1, (char *)a, 1); blk_rows_io(m_in, t, 1, (char *)b, 1);
         same5 = !memcmp(a, b, sizeof a);
     }
-    check(P5 == sys + 5 && same5, "the block-sections rows come back through rows_io, row for row");
+    check(P5 == sys + 5 && same5, "the block-sections rows come back through rows_io, group for group");
+    {
+        uint8_t tail[ROWB + 1]; int fresh_group = 1;   /* the half-read group: the state's, not staged */
+        blk_rows_io(m_in, P5 / IPER, 1, (char *)tail, 1);
+        for (int j = 0; j < ROWB + 1; j++) fresh_group = fresh_group && !tail[j];
+        check(fresh_group, "the tail's half-read group stays unstaged, left to the state to refill");
+    }
     coli_ps_hit_free(&hb);
     state_free(st5);
 

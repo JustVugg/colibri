@@ -185,6 +185,7 @@ class InklingPrefixStoreTest(unittest.TestCase):
                 e.p.stdout.read(int(line.split()[2]))
                 e.p.stdout.readline()
             elif kind in (b"DONE", b"ERROR"):
+                self.assertEqual(kind, b"DONE", f"engine error: {line!r}")   # an ERROR frame ends no read-out well
                 break
         log = e.close()
         self.assertEqual(log.count("prompt tokens from the store"), 0, "a read-out took a stored prefix")

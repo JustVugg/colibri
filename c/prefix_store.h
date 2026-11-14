@@ -80,7 +80,7 @@ typedef struct {
 
 typedef struct {
     int on, B;
-    uint64_t sig;               /* the layout: parts' row sizes and heads */
+    uint64_t sig;               /* the layout: parts' row sizes, heads and staging */
     size_t blk_bytes;           /* a block's rows over every part */
     ColiPsBlock *blk; int nblk, cblk;
     ColiPsCkpt *ck; int nck, cck;
@@ -174,10 +174,12 @@ static inline void coli_ps_clear(ColiPrefixStore *s) {
 
 static inline int coli_ps_per(const ColiPsPart *q) { return q->per > 1 ? q->per : 1; }
 /* the bytes of every part's rows for n positions from a block's start (a compressed part's whole
- * groups) */
+ * groups). A rows_io part's staging is the one run the part itself moves -- heads do not apply
+ * to it, as coli_ps_rows reads it -- so the span prices it once, not once a head. */
 static inline size_t coli_ps_span(const ColiPsPart *parts, int nparts, int n) {
     size_t b = 0;
-    for (int p = 0; p < nparts; p++) b += (size_t)(n / coli_ps_per(&parts[p])) * parts[p].row * (size_t)parts[p].heads;
+    for (int p = 0; p < nparts; p++) b += (size_t)(n / coli_ps_per(&parts[p])) * parts[p].row
+                                             * (size_t)(parts[p].rows_io ? 1 : parts[p].heads);
     return b;
 }
 /* The layout of the parts; a store kept for another one is emptied first. 0 when a part's group
@@ -189,6 +191,8 @@ static inline int coli_ps_layout(ColiPrefixStore *s, const ColiPsPart *parts, in
         h = coli_ps_mix(h, (uint64_t)parts[p].row);
         h = coli_ps_mix(h, (uint64_t)parts[p].heads);
         h = coli_ps_mix(h, (uint64_t)coli_ps_per(&parts[p]));
+        h = coli_ps_mix(h, (uint64_t)!!parts[p].rows_io);   /* staging counts too: the same
+         * widths moved by the part itself are not the layout the store copied head by head */
     }
     if (s->sig && s->sig != h) coli_ps_clear(s);
     s->sig = h; s->blk_bytes = coli_ps_span(parts, nparts, s->B);
