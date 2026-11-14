@@ -10,8 +10,11 @@ temporary mirror directories, and checks:
     that file on the primary; a directory without the sidecar is skipped;
   * COLI_DISK_WEIGHTS with the wrong count, a zero or junk is refused;
   * without the sidecar (Q38_EXPERT_INT4=0) no mirror is opened.
+--lowbit NAME runs the same checks on a low-bit sidecar (Q38_EXPERT_LOWBIT=NAME,
+experts-NAME/), as make qwen38-tiny-mxfp4-check does for mxfp4.
 
   python3 tests/qwen38_mirror_check.py --model ./qwen38_tiny_int4 --engine ./qwen38
+  python3 tests/qwen38_mirror_check.py --model ./qwen38_tiny_mxfp4 --engine ./qwen38 --lowbit mxfp4 --ref ref.json
 """
 import argparse
 import os
@@ -23,11 +26,12 @@ import tempfile
 from pathlib import Path
 
 SIDECAR = "experts-int4g64"
+ON = {"Q38_EXPERT_INT4": "1"}
 
 
 def run(engine, model, ref, cap, dump, **env):
     full = dict(os.environ, OMP_NUM_THREADS="2", SNAP=str(model), DUMP=str(dump), **env)
-    for key in ("COLI_MODEL_MIRROR", "COLI_DISK_WEIGHTS"):
+    for key in ("COLI_MODEL_MIRROR", "COLI_DISK_WEIGHTS", "Q38_EXPERT_LOWBIT"):
         if key not in env:
             full.pop(key, None)
     p = subprocess.run([str(engine), str(cap), "8", str(ref)], env=full,
@@ -42,11 +46,15 @@ def reads(stderr):
 
 
 def main():
+    global SIDECAR, ON
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--model", required=True, type=Path, help=f"a snapshot with {SIDECAR}/ (qwen38_tiny_int4)")
     ap.add_argument("--engine", required=True, type=Path)
     ap.add_argument("--ref", default="ref_int4.json", help="the reference inside --model")
+    ap.add_argument("--lowbit", help="a low-bit sidecar instead: Q38_EXPERT_LOWBIT=NAME, experts-NAME/")
     a = ap.parse_args()
+    if a.lowbit:
+        SIDECAR, ON = f"experts-{a.lowbit}", {"Q38_EXPERT_LOWBIT": a.lowbit}
     model, engine, ref = a.model.resolve(), a.engine.resolve(), a.model.resolve() / a.ref
     failures = 0
 
@@ -74,14 +82,14 @@ def main():
         ]
         for cap in (1, 2):
             base = tmp / f"base-{cap}.f32"
-            rc, out, err = run(engine, model, ref, cap, base, Q38_EXPERT_INT4="1")
+            rc, out, err = run(engine, model, ref, cap, base, **ON)
             if rc or "Matching tokens: 8/8" not in out:
                 print(err[-2000:])
                 check(False, f"cap {cap}: the run without a mirror")
                 continue
             for what, env, n in cases:
                 dump = tmp / f"mirror-{cap}.f32"
-                rc, out2, err = run(engine, model, ref, cap, dump, Q38_EXPERT_INT4="1", **env)
+                rc, out2, err = run(engine, model, ref, cap, dump, **ON, **env)
                 counts = reads(err)
                 same = rc == 0 and out2 == out and dump.read_bytes() == base.read_bytes()
                 check(same and counts is not None and len(counts) == n and all(counts),
@@ -89,13 +97,13 @@ def main():
                 if not same:
                     print(err[-2000:])
         dump = tmp / "skip.f32"
-        rc, out, err = run(engine, model, ref, 1, dump, Q38_EXPERT_INT4="1",
+        rc, out, err = run(engine, model, ref, 1, dump, **ON,
                            COLI_MODEL_MIRROR=f"{m3};{empty}")
         check(rc == 0 and "header differs" in err and "no file equal to the primary's -- skipped" in err
               and reads(err) is not None and len(reads(err)) == 2,
               "a differing file and an empty directory are skipped, the rest of the copy serves")
         for spec in ("1", "1,1,1", "1,0", "1,x", "2,1,"):
-            rc, _, err = run(engine, model, ref, 1, dump, Q38_EXPERT_INT4="1",
+            rc, _, err = run(engine, model, ref, 1, dump, **ON,
                              COLI_MODEL_MIRROR=str(m1), COLI_DISK_WEIGHTS=spec)
             check(rc != 0 and "COLI_DISK_WEIGHTS" in err, f"COLI_DISK_WEIGHTS={spec} with one mirror is refused")
         rc, out, err = run(engine, model, model / "ref.json", 1, dump, Q38_EXPERT_INT4="0", COLI_MODEL_MIRROR=str(m1))

@@ -77,7 +77,8 @@ typedef enum {
     Q38_WEIGHT_INT2G32,            /* routed experts from the experts-int2g32/ sidecar: data codes, x2q group scales, scales row scales */
     Q38_WEIGHT_LOWBIT16,           /* routed experts from experts-int2g16/ or -int3g16/ (lowbit_g16.h): as INT2G32, lbits bits, 4-bit scales per 16 */
     Q38_WEIGHT_VQ2,                /* routed experts from experts-vq2g32/ (vq2_g32.h): data codes, x2q 4-bit scales per 32, scales row scales, vqb the codebooks */
-    Q38_WEIGHT_VQ1                 /* routed experts from experts-vq1g64/ (vq1_g64.h): as VQ2 with 10-bit indices of 16-vectors, scales per 64, vq1b the codebooks */
+    Q38_WEIGHT_VQ1,                /* routed experts from experts-vq1g64/ (vq1_g64.h): as VQ2 with 10-bit indices of 16-vectors, scales per 64, vq1b the codebooks */
+    Q38_WEIGHT_MXFP4               /* routed experts from experts-mxfp4/ (AMD Quark's bytes): data e2m1 nibbles, x2q a ue8m0 exponent per 32; quant.h matmul_mxfp4 */
 } Q38WeightKind;
 
 /* GGUF mode (SNAP holds gguf.json, written by tools/gguf_import.py). llama.cpp's
@@ -126,7 +127,7 @@ typedef struct {
     char *vk_name;                 /* COLI_VULKAN=1: its tensor's name, to read it back from disk (q38_dho_reload) */
     int vk_fmt, vk_gone;           /* dense weights on the device only (COLI_VK_DENSE_HOST): the device copy's format, and 1 while no host copy is kept */
     int gq_type;                   /* Q38_WEIGHT_GGML: the ggml type of the rows */
-    const uint8_t *x2q;            /* Q38_WEIGHT_INT2G32: u8 scale per row and 32 inputs; LOWBIT16: two 4-bit ones per byte (borrowed, like data) */
+    const uint8_t *x2q;            /* Q38_WEIGHT_INT2G32: u8 scale per row and 32 inputs; LOWBIT16: two 4-bit ones per byte; MXFP4: a ue8m0 exponent per row and 32 inputs (borrowed, like data) */
     int lbits;                     /* Q38_WEIGHT_LOWBIT16: 2 or 3 */
     int r16;                       /* Q38_WEIGHT_LOWBIT16 / VQ2: data holds the rows interleaved by 16 (lowbit_g16.h xl16_*, vq2_g32.h vq2r16_*), codes, scales and row scales together; x2q/scales unset */
     const Vq2Books *vqb;           /* Q38_WEIGHT_VQ2: the sidecar's codebooks (borrowed) */
@@ -451,6 +452,8 @@ static uint64_t q38_weight_bytes(const Q38Weight *weight) {
         return (uint64_t)weight->rows*(vq2_code_bytes(weight->cols)+vq2_scale_bytes(weight->cols)+sizeof(float));
     if(weight->kind==Q38_WEIGHT_VQ1)
         return (uint64_t)weight->rows*(vq1_code_bytes(weight->cols)+vq1_scale_bytes(weight->cols)+sizeof(float));
+    if(weight->kind==Q38_WEIGHT_MXFP4)
+        return (uint64_t)weight->rows*((uint64_t)(weight->cols+1)/2+(uint64_t)(weight->cols+31)/32);
     uint64_t element_size=weight->kind==Q38_WEIGHT_F32?sizeof(float):
                           weight->kind==Q38_WEIGHT_BF16?sizeof(uint16_t):
                           weight->kind==Q38_WEIGHT_FP8?sizeof(uint8_t):0;
@@ -852,6 +855,8 @@ static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
             fprintf(stderr,"OOM vq1 activation\n");exit(1);
         }
     }
+    else if(weight->kind==Q38_WEIGHT_MXFP4&&weight->x2q)   /* a row's bits do not depend on S */
+        matmul_mxfp4(y,x,(const uint8_t*)weight->data,weight->x2q,S,I,O);
     else if(weight->kind==Q38_WEIGHT_GGML){
         if(gq_matmul(y,x,(const uint8_t*)weight->data,weight->gq_type,S,I,O)){
             fprintf(stderr,"qwen38: GGUF matrix of type %s is not supported\n",gq_type_name(weight->gq_type));exit(1);
@@ -2263,21 +2268,48 @@ static void q38_load_expert_slice(Model *m,const char *name,const st_tensor *ten
  * (vq2_g32.h, vq 1) and vq1g64 (vq1_g64.h, vq 2: 10-bit indices, cols/64 x 10 code bytes,
  * a nibble per 64, 1024 x 16 books) keep the record but not the cols/32 scale bytes: a nibble per 32,
  * and two 256 x 8 int8 codebooks in index.json ("codebooks": {"a": [...], "b": [...]}). */
-typedef struct Q38Lowbit { const char *name,*dir,*format,*codes,*scales,*qtail; int bits,gs,vq; } Q38Lowbit;
+typedef struct Q38Lowbit { const char *name,*dir,*format,*codes,*scales,*qtail; int bits,gs,vq,mx; } Q38Lowbit;
 static const Q38Lowbit Q38_LOWBIT[5]={
-    {"int2g32","experts-int2g32","colibri.qwen38.experts-int2g32","planar128-2bit-lv10","u8-per-32-f32-per-row",".q8",2,32,0},
-    {"int2g16","experts-int2g16","colibri.qwen38.experts-int2g16","planar128-2bit-lv10","u4-per-16-f32-per-row",".q4",2,16,0},
-    {"int3g16","experts-int3g16","colibri.qwen38.experts-int3g16","planar128-3bit-lv26","u4-per-16-f32-per-row",".q4",3,16,0},
-    {"vq2g32","experts-vq2g32","colibri.qwen38.experts-vq2g32","vq2-2x256x8-int8","u4-per-32-f32-per-row",".q4",2,32,1},
-    {"vq1g64","experts-vq1g64","colibri.qwen38.experts-vq1g64","vq1-2x1024x16-int8","u4-per-64-f32-per-row",".q4",2,64,2},
+    {"int2g32","experts-int2g32","colibri.qwen38.experts-int2g32","planar128-2bit-lv10","u8-per-32-f32-per-row",".q8",2,32,0,0},
+    {"int2g16","experts-int2g16","colibri.qwen38.experts-int2g16","planar128-2bit-lv10","u4-per-16-f32-per-row",".q4",2,16,0,0},
+    {"int3g16","experts-int3g16","colibri.qwen38.experts-int3g16","planar128-3bit-lv26","u4-per-16-f32-per-row",".q4",3,16,0,0},
+    {"vq2g32","experts-vq2g32","colibri.qwen38.experts-vq2g32","vq2-2x256x8-int8","u4-per-32-f32-per-row",".q4",2,32,1,0},
+    {"vq1g64","experts-vq1g64","colibri.qwen38.experts-vq1g64","vq1-2x1024x16-int8","u4-per-64-f32-per-row",".q4",2,64,2,0},
 };
+/* AMD Quark's MXFP4 experts, copied unchanged by tools/convert_qwen38_experts_mxfp4.py into
+ * <snap>/experts-mxfp4/ (Q38_EXPERT_LOWBIT=mxfp4). A record is
+ *
+ *   gate scales [I][H/32] | down scales [H][I/32] | up scales [I][H/32] |
+ *   gate e2m1 [I][H/2] | down e2m1 [H][I/2] | up e2m1 [I][H/2]
+ *
+ * (U8 "...weight_scale" and "...weight", widths rounded up; a U8 "record_pad" after it keeps
+ * the next record on 4096), 2,611,200 bytes on the release: 53% of the FP8 expert. The values
+ * are quant.h's matmul_mxfp4's: e2m1(nibble) x 2^(s - 127), the low nibble the even column. */
+static const Q38Lowbit Q38_MXFP4={"mxfp4","experts-mxfp4","colibri.qwen38.experts-mxfp4","e2m1-lo-even","ue8m0-per-32","",4,32,0,1};
+static const int q38_mx4_order[3]={0,2,1};   /* the record's matrix order (w1, w2, w3) as gate, up, down indices */
+/* the bytes of each matrix's codes and scales, and of the record */
+static void q38_mx4_sizes(Q38Int4Experts *x,int H,int I) {
+    const int rows[3]={I,I,H},cols[3]={H,H,I};
+    x->record_bytes=0;
+    for(int k=0;k<3;k++){
+        x->code_bytes[k]=(int64_t)rows[k]*((cols[k]+1)/2);
+        x->q_bytes[k]=x->scale_count[k]=(int64_t)rows[k]*((cols[k]+31)/32);
+        x->record_bytes+=x->code_bytes[k]+x->q_bytes[k];
+    }
+}
+/* where each matrix's scales and codes start in its record */
+static void q38_mx4_offsets(const Q38Int4Experts *x,int64_t code_off[3],int64_t scale_off[3]) {
+    int64_t s=0,w=x->q_bytes[0]+x->q_bytes[1]+x->q_bytes[2];
+    for(int j=0;j<3;j++){const int k=q38_mx4_order[j];scale_off[k]=s;code_off[k]=w;s+=x->q_bytes[k];w+=x->code_bytes[k];}
+}
 static size_t q38_lb_scale_bytes(const Q38Lowbit *lb,int cols) { return lb->vq==2?vq1_scale_bytes(cols):lb->vq?vq2_scale_bytes(cols):xl_scale_bytes(cols); }
 static size_t q38_lb_code_bytes(const Q38Lowbit *lb,int cols) { return lb->vq==2?vq1_code_bytes(cols):xl_code_bytes(lb->bits,cols); }
 static const Q38Lowbit *q38_expert_lowbit_wanted(void) {
     const char *name=getenv("Q38_EXPERT_LOWBIT");
     if(name&&*name){
         for(int i=0;i<5;i++)if(!strcmp(name,Q38_LOWBIT[i].name))return &Q38_LOWBIT[i];
-        fprintf(stderr,"Q38_EXPERT_LOWBIT must be int2g32, int2g16, int3g16, vq2g32 or vq1g64\n");exit(1);
+        if(!strcmp(name,Q38_MXFP4.name))return &Q38_MXFP4;
+        fprintf(stderr,"Q38_EXPERT_LOWBIT must be int2g32, int2g16, int3g16, vq2g32, vq1g64 or mxfp4\n");exit(1);
     }
     const char *value=getenv("Q38_EXPERT_INT2");
     if(!value||!*value||(value[0]=='0'&&!value[1]))return NULL;
@@ -2316,6 +2348,21 @@ static int q38_int4_record_at(Model *m,Q38Int4Experts *x,int layer,int expert,
     Cfg *c=&m->c;const char *projection[3]={"gate_proj","up_proj","down_proj"};
     int rows[3]={c->inter,c->inter,c->hidden},cols[3]={c->hidden,c->hidden,c->inter};
     char suffix[192],name[320];int64_t at=0;
+    if(x->lb&&x->lb->mx){   /* MXFP4: the three scales, then the three codes, U8, back to back */
+        for(int part=0;part<6;part++){
+            const int k=q38_mx4_order[part%3],scale=part<3;
+            int length=snprintf(suffix,sizeof suffix,"mlp.experts.%d.%s.weight%s",expert,projection[k],scale?"_scale":"");
+            if(length<0||(size_t)length>=sizeof suffix)return -1;
+            q38_name(m,name,sizeof name,layer,suffix);
+            st_tensor *t=st_find(&x->S,name);
+            const int64_t width=scale?(cols[k]+31)/32:(cols[k]+1)/2,bytes=scale?x->q_bytes[k]:x->code_bytes[k];
+            if(!t||t->dtype!=3||t->rank!=2||t->shape[0]!=rows[k]||t->shape[1]!=width||t->nbytes!=bytes)return -1;
+            if(!part){*fd=t->fd;*start=t->off;}
+            else if(t->fd!=*fd||t->off!=*start+at)return -1;
+            at+=bytes;
+        }
+        return 0;
+    }
     const int int2=x->lb!=NULL,parts=int2?9:6;
     for(int part=0;part<parts;part++){
         /* int4: codes, f32 scales per 64; int2: codes, u8 scales per 32, f32 per row */
@@ -2360,8 +2407,9 @@ static void q38_expert_int4_attach(Model *m,const char *snap) {
     if(!f){
         if(wanted>0){
             fprintf(stderr,"%s but %s cannot be opened "
-                           "(tools/convert_qwen38_experts_int4.py%s%s writes it)\n",
-                    int2?"a low-bit sidecar was asked for":"Q38_EXPERT_INT4=1",path,int2?" --lowbit ":"",int2?lb->name:"");exit(1);
+                           "(tools/convert_qwen38_experts_%s.py%s%s writes it)\n",
+                    int2?"a low-bit sidecar was asked for":"Q38_EXPERT_INT4=1",path,int2&&lb->mx?"mxfp4":"int4",
+                    int2&&!lb->mx?" --lowbit ":"",int2&&!lb->mx?lb->name:"");exit(1);
         }
         return;
     }
@@ -2393,7 +2441,8 @@ static void q38_expert_int4_attach(Model *m,const char *snap) {
     if(!x){fprintf(stderr,"OOM int4 expert index\n");exit(1);}
     int rows[3]={c->inter,c->inter,c->hidden},cols[3]={c->hidden,c->hidden,c->inter};
     x->bits=int2?lb->bits:4;x->lb=lb;
-    if(int2){
+    if(int2&&lb->mx)q38_mx4_sizes(x,c->hidden,c->inter);   /* any width: a short last group rounds up */
+    else if(int2){
         for(int k=0;k<3;k++)if(!xl_layout_ok(cols[k]))
             q38_int4_refuse(dir,"the low-bit formats need widths that are multiples of 128");
         for(int k=0;k<3;k++){
@@ -2408,7 +2457,7 @@ static void q38_expert_int4_attach(Model *m,const char *snap) {
         x->scale_count[k]=(int64_t)rows[k]*q38_int4_groups(cols[k]);
         x->scale_off+=x->code_bytes[k];
     }
-    x->record_bytes=x->scale_off+
+    if(!(int2&&lb->mx))x->record_bytes=x->scale_off+
         (x->scale_count[0]+x->scale_count[1]+x->scale_count[2])*(int64_t)sizeof(float);
     if(q38_json_int(root,"layers")!=c->layers||q38_json_int(root,"experts")!=c->experts||
        q38_json_int(root,"hidden_size")!=c->hidden||
@@ -2506,6 +2555,15 @@ static void q38_bind_int4_record(Model *m,Slot *slot,uint8_t *record) {
     int rows[3]={c->inter,c->inter,c->hidden},cols[3]={c->hidden,c->hidden,c->inter};
     Q38Weight *dst[3]={&slot->gate,&slot->up,&slot->down};
     uint8_t *codes=record;float *scales=(float*)(record+x->scale_off);
+    if(x->lb&&x->lb->mx){
+        int64_t code_off[3],scale_off[3];q38_mx4_offsets(x,code_off,scale_off);
+        for(int k=0;k<3;k++){
+            Q38Weight *weight=dst[k];q38_weight_free(weight);
+            weight->data=record+code_off[k];weight->x2q=record+scale_off[k];weight->rows=rows[k];weight->cols=cols[k];
+            weight->elements=(int64_t)rows[k]*cols[k];weight->scale_count=x->scale_count[k];weight->kind=Q38_WEIGHT_MXFP4;
+        }
+        return;
+    }
     if(x->lb){
         const uint8_t *q=record+x->q_off;
         for(int k=0;k<3;k++){
@@ -4185,6 +4243,11 @@ static void q38_tier_start(Model *m,int cap) {
 #else
         (void)cap;
 #endif
+        return;
+    }
+    if(m->x4&&m->x4->lb&&m->x4->lb->mx){
+        fprintf(stderr,"[qtier] qwen38: the expert tier streams native FP8 experts only; the mxfp4 experts stay "
+                       "on the CPU and the tier stays off (its fmt 7 copy mode is not wired yet)\n");
         return;
     }
     if(m->x4){

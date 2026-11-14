@@ -1882,6 +1882,45 @@ qwen38-tiny-mxfp4-generate:
 	$(PYTHON) tools/make_qwen38_tiny.py --out ./qwen38_tiny_mxfp4 --mxfp4-experts --expert-gain 3
 	$(PYTHON) tests/test_qwen38_mxfp4_convert.py --model ./qwen38_tiny_mxfp4 --exact
 
+# The engine on that sidecar (Q38_EXPERT_LOWBIT=mxfp4, quant.h matmul_mxfp4). Gates:
+#  (a) the MXFP4 matmul equals a dequantized reference, every expert the single and the
+#      batch path load holds the sidecar's bytes, and every value is the FP8 shards' to the
+#      bit (tests/test_qwen38_mxfp4_experts);
+#  (b) ref.json reproduced through the single, batched, prefill-batch and mapped paths at
+#      caps 1, 2 and 4, the last logits identical to the bit across them; the FP8 experts
+#      of the same fixture reproduce it too, so both runs give the same tokens;
+#  (c) the two runs' last logits within cosine 0.99999, the refusals (another geometry, an
+#      incomplete conversion, a record not of the layout, no sidecar, an unknown
+#      Q38_EXPERT_LOWBIT) and the CUDA tier declining MXFP4 (tests/qwen38_mxfp4_engine_check.py);
+#  (d) the sidecar read from COLI_MODEL_MIRROR copies, as the int4 one (tests/qwen38_mirror_check.py).
+.PHONY: qwen38-tiny-mxfp4-check
+qwen38-tiny-mxfp4-check: qwen38-tiny-mxfp4-generate qwen38$(EXE) tests/test_qwen38_mxfp4_experts$(EXE)
+	OMP_NUM_THREADS=2 ./tests/test_qwen38_mxfp4_experts$(EXE) ./qwen38_tiny_mxfp4
+	@d=./qwen38_tiny_mxfp4/logits; rm -rf $$d; mkdir -p $$d; n=0; \
+	for trunk in 1024 0; do for cap in 1 2 4; do for mode in single batched prefill prefill-serial mapped; do \
+		case $$mode in \
+			single) e="Q38_PREFILL_BATCH=0 Q38_EXPERT_PARALLEL_READS=0";; \
+			batched) e="Q38_PREFILL_BATCH=0";; \
+			prefill) e="Q38_PREFILL_BATCH=1";; \
+			prefill-serial) e="Q38_PREFILL_BATCH=1 Q38_EXPERT_PARALLEL_READS=0";; \
+			mapped) e="COLI_MAP_EXPERTS=1";; \
+		esac; \
+		env $$e Q38_EXPERT_LOWBIT=mxfp4 Q38_TRUNK_MIN_KB=$$trunk DUMP=$$d/t$$trunk-c$$cap-$$mode.f32 OMP_NUM_THREADS=2 \
+			SNAP=./qwen38_tiny_mxfp4 ./qwen38$(EXE) $$cap 8 ./qwen38_tiny_mxfp4/ref.json > $$d/run.log 2>&1 \
+			|| { cat $$d/run.log; echo "FAIL mxfp4 experts, trunk=$$trunk cap=$$cap $$mode"; exit 1; }; \
+		grep -q 'routed experts: experts-mxfp4' $$d/run.log || { cat $$d/run.log; echo "FAIL the sidecar was not used"; exit 1; }; \
+		n=$$((n+1)); \
+	done; done; \
+	for f in $$d/t$$trunk-*.f32; do cmp -s $$f $$d/t$$trunk-c1-single.f32 \
+		|| { echo "FAIL $$f: last logits differ from the single path"; exit 1; }; done; done; \
+	Q38_EXPERT_INT4=0 DUMP=$$d/fp8.f32 OMP_NUM_THREADS=2 SNAP=./qwen38_tiny_mxfp4 \
+		./qwen38$(EXE) 2 8 ./qwen38_tiny_mxfp4/ref.json > $$d/run.log 2>&1 \
+		|| { cat $$d/run.log; echo "FAIL FP8 experts of the mxfp4 fixture"; exit 1; }; \
+	echo "qwen38 mxfp4 experts: ref.json reproduced in $$n configurations, last logits identical across paths; FP8 control ok"
+	$(PYTHON) tests/qwen38_mxfp4_engine_check.py --model ./qwen38_tiny_mxfp4 --engine ./qwen38$(EXE) \
+		--mxfp4 ./qwen38_tiny_mxfp4/logits/t1024-c2-batched.f32 --fp8 ./qwen38_tiny_mxfp4/logits/fp8.f32
+	$(PYTHON) tests/qwen38_mirror_check.py --model ./qwen38_tiny_mxfp4 --engine ./qwen38$(EXE) --lowbit mxfp4 --ref ref.json
+
 # The int4 fixture's sidecar read from COLI_MODEL_MIRROR copies in temporary directories: the
 # tokens and last logits of the run without a mirror, every replica serving records, a differing
 # file left on the primary, bad COLI_DISK_WEIGHTS refused (tests/qwen38_mirror_check.py).
@@ -2298,6 +2337,11 @@ tests/test_qwen38_draft_head$(EXE): tests/test_qwen38_draft_head.c qwen38.c $(VK
 # The int4-g64 expert matmul with no model (part of test-c); given a converted
 # snapshot on argv it checks the sidecar's loaders too (qwen38-tiny-int4-check).
 tests/test_qwen38_int4_experts$(EXE): tests/test_qwen38_int4_experts.c qwen38.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+# The MXFP4 expert matmul with no model (part of test-c); given a converted snapshot on
+# argv it checks the experts-mxfp4/ sidecar's loaders too (qwen38-tiny-mxfp4-check).
+tests/test_qwen38_mxfp4_experts$(EXE): tests/test_qwen38_mxfp4_experts.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_qwen38_igpu_defaults$(EXE): tests/test_qwen38_igpu_defaults.c qwen38.c $(VK_OBJ)

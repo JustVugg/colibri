@@ -1508,6 +1508,8 @@ jobs:
         run: make -C c qwen38-tiny-fp8-check qwen38-tier-engine-check qwen38-dn-gpu-check qwen38-cuda-chain-check
       - name: Routed experts as int4-g64 from the converter's sidecar, then read from mirror copies
         run: make -C c qwen38-tiny-int4-check qwen38-tiny-mirror-check
+      - name: Routed experts as AMD Quark's MXFP4 from the converter's sidecar
+        run: make -C c qwen38-tiny-mxfp4-check
       - name: MTP speculative decoding against plain decoding (lossless gate)
         run: make -C c qwen38-tiny-mtp-check
       - name: Repeat the eviction path under ASan and UBSan
