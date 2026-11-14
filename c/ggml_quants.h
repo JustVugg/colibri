@@ -1286,6 +1286,14 @@ static float gq_dot_i8(const int8_t *w8, const float *sw, const float *mw, int h
 }
 
 static int gq_exact_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("GQ_EXACT"); v = e && *e && *e != '0'; } return v; }
+/* C18: decode-once grid dots (Q36_EXPERT_DEC1=1, off by default). The ARM fused grid
+ * kernel keeps a weight row in registers but re-runs the grid decode once per activation
+ * row; on a prompt that decode is 27-40% of the kernel and its interleaving with the dot
+ * caps the whole engine at ~115 GFLOPS aggregate. The decode-once path decodes each row
+ * once into int8 + per-32 scales, then runs the fused kernel's exact float steps against
+ * every activation row (same bits: microbenchmark precheck maxdiff 0.0). Decode (S==1)
+ * keeps the fused kernel: there the register-resident decode wins. */
+static int gq_dec1(void) { static int v = -1; if (v < 0) { const char *e = getenv("Q36_EXPERT_DEC1"); v = e && *e == '1'; } return v; }
 
 /* Q8_0 needs no unpack: the block already is 32 int8 codes and one scale. */
 static inline float gq_dot_q8_0(const uint8_t *row, const int8_t *xq, const float *dx, int64_t n) {
@@ -1914,6 +1922,39 @@ static inline void gq_row_all(float *y, int ystride, const gq_act *a, const uint
 #if defined(__ARM_NEON) && defined(__aarch64__) && !defined(__AVX2__)
     /* the fused grid dots: a weight row's registers, no unpack buffer */
     if ((t == GQ_IQ2_XXS || t == GQ_IQ3_XXS) && I % 256 == 0) {
+        /* C18 decode-once (Q36_EXPERT_DEC1): one grid decode serves every activation
+         * row. The float steps are the fused kernel's, in its order, so the bits are
+         * the fused kernel's. Stack scratch is bounded: the gate needs I % 256 == 0
+         * and I <= 16384 (2 KB int8 + 256 scales for the serving shapes). */
+        if (a->S > 1 && gq_dec1() && I <= 16384) {
+            const int BYTES = GQ_TYPES[t].bytes;
+            int8_t dw[I]; float ds[I / 32];
+            int64_t xb = 0;
+            for (int64_t blk = 0; blk < I / 256; blk++) {
+                const uint8_t *b = row + blk * BYTES; const float d = gq_f16(gq_rd16(b));
+                for (int ib = 0; ib < 8; ib++, xb++) {
+                    float s2[2]; int8x16_t w0, w1;
+                    if (t == GQ_IQ2_XXS) gq_arm_sb_iq2_xxs(b, d, ib, s2, &w0, &w1);
+                    else                 gq_arm_sb_iq3_xxs(b, d, ib, s2, &w0, &w1);
+                    vst1q_s8(dw + 32 * xb, w0); vst1q_s8(dw + 32 * xb + 16, w1);
+                    ds[xb] = s2[0];
+                }
+            }
+            for (int s = 0; s < a->S; s++) {
+                float32x4_t vacc = vdupq_n_f32(0.f);
+                const int8_t *xs8 = a->q + (int64_t)s * I;
+                const float *dxs = a->d + (int64_t)s * (I / 32);
+                for (int x = 0; x < I / 32; x++) {
+                    int32x4_t p0, p1;
+                    gq_arm_dot2(vld1q_s8(dw + 32 * x), vld1q_s8(dw + 32 * x + 16),
+                                vld1q_s8(xs8 + 32 * x), vld1q_s8(xs8 + 32 * x + 16), &p0, &p1);
+                    vacc = vmlaq_n_f32(vacc, vcvtq_f32_s32(p0), ds[x] * dxs[x]);
+                    vacc = vmlaq_n_f32(vacc, vcvtq_f32_s32(p1), ds[x] * dxs[x]);
+                }
+                y[(int64_t)s * ystride] = vaddvq_f32(vacc);
+            }
+            return;
+        }
         if (t == GQ_IQ2_XXS) gq_dot_arm_iq2_xxs(y, ystride, row, a->q, a->d, I, a->S);
         else                 gq_dot_arm_iq3_xxs(y, ystride, row, a->q, a->d, I, a->S);
         return;
