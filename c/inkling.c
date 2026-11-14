@@ -87,6 +87,9 @@ static int g_metal = 0;
 static int g_vk_ready = 0;
 static int g_vk_tier_try = 0;   /* the device opened with the expert tier to be tried */
 static int g_vk_chain = 0;      /* COLI_VK_CHAIN decided on, and the chain's pipelines are up (inkling_chain.h) */
+#ifdef COLI_VULKAN
+static int g_ink2c_want = 0;    /* Inkling-2's chain planned at load (inkling2_chain.h): the tier leaves its memory */
+#endif
 static int g_ink_dho = 0;       /* COLI_VK_DENSE_HOST: the dense matrices on the device only (ink_dho_place) */
 /* The partial chain's fit (inkc_fit_start, inkling_chain.h): the first n of L layers on the
  * device; L = 0 while there is none (the chain off, or one that declines as before). */
@@ -224,6 +227,8 @@ typedef struct {
                                            * interleaved (even = gate) */
     Wt audio_enc;                         /* [mel_bins*mel_vocab, D] embedding table */
     float *audio_norm;                    /* audio tower RMSNorm [D]; NULL = no audio */
+    struct Ink2Vision *vis;               /* Inkling-2's vision tower (inkling2_vision.h); NULL = none */
+    float *img; int img_n, img_next;      /* a request's image rows [img_n][D], the next one step_mm takes */
     Layer *L;
     LCache *cache;
     int64_t rb13, rb2;                    /* container row-bytes (0 = not container) */
@@ -246,6 +251,7 @@ typedef struct {
 #ifdef COLI_VULKAN
     void *vkchain;                        /* the dense chain's device state (inkling_chain.h), NULL until it runs */
     void *vkchain2;                       /* its layers on COLI_VK_DEV2's device, after the primary's (inkling_chain.h) */
+    void *ink2chain;                      /* Inkling-2's dense chain (inkling2_chain.h), NULL until it runs */
 #endif
     /* A multiplexed decode step (ink_step_rows): row s is the token at
      * mux_rows[s].pos of mux_rows[s].seq; NULL in every other forward. */
@@ -1462,12 +1468,14 @@ static void ink_vk_init_model(Model *m, int layer_begin, int layer_end) {
     /* COLI_VK_DENSE_HOST: with the dense part on the device (the per-matrix path, or the
      * chain: asked here silently, inkc_start says it after the tier), every matrix the
      * shaders read is marked and goes up now, its host copy given back */
-    /* the chain's shaders compute Inkling's layers: Inkling-2's dense matrices go a call at a
-     * time (COLI_VK_DENSE's rule), its attention, residual mixes and convolutions on the CPU */
-    int chain = !m->c.v2 && !other_gpu && layer_begin == 0 && layer_end == m->c.n_layers &&
-                coli_vk_chain_decide(NULL, g_vk_tier_try, INKLING_CHAIN_IGPU) != COLI_VK_CHAIN_OFF;
-    if (m->c.v2 && coli_vk_dense())
-        fprintf(stderr, "[VK] inkling2: the dense matrices on the device a call at a time (Inkling-2 has no dense chain yet)\n");
+    /* Inkling's chain (inkling_chain.h) fits and places its layers here; Inkling-2's
+     * (inkling2_chain.h) reads the per-matrix path's copies of its dense matrices, and the
+     * tier leaves the memory its own buffers take (ink_vk_dense_bytes) */
+    int whole = !other_gpu && layer_begin == 0 && layer_end == m->c.n_layers;
+    int chain = !m->c.v2 && whole && coli_vk_chain_decide(NULL, g_vk_tier_try, INKLING_CHAIN_IGPU) != COLI_VK_CHAIN_OFF;
+    g_ink2c_want = m->c.v2 && whole && coli_vk_chain_decide(NULL, g_vk_tier_try, INKLING_CHAIN_IGPU) != COLI_VK_CHAIN_OFF;
+    if (m->c.v2 && coli_vk_dense() && !g_ink2c_want)
+        fprintf(stderr, "[VK] inkling2: the dense matrices on the device a call at a time (COLI_VK_CHAIN=0)\n");
     /* the chain's fit before any upload and before the expert cache is sized: the first n
      * layers on the device, the others (and lm_head, unless the tail went up) on the CPU
      * with their host copies, the per-matrix path leaving them there */
@@ -1504,6 +1512,7 @@ static void ink_vk_init_model(Model *m, int layer_begin, int layer_end) {
 #endif
 
 static void ink2_load_layer(Model *m, int i, char *nm, size_t nmz);   /* inkling2.h */
+static struct Ink2Vision *ink2_vision_load(Model *m, const char *snap);   /* inkling2_vision.h */
 /* The name of a layer's routed experts' gate/up (k 0) or down (k 1) tensor: Inkling's
  * gate_up_proj/down_proj; Inkling-2's under model.llm, gate_up_proj/down_proj in a container,
  * the checkpoint's w13_weight/w2_weight otherwise (x2_names) */
@@ -1617,6 +1626,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         m->final_norm = load_t(m, "model.llm.norm.weight");
         m->lm_head    = load_w(m, "model.llm.unembed.weight", 1);
         m->x2_out_query = load_t(m, "model.llm.attn_res.output_query");
+        m->vis = ink2_vision_load(m, snap);
     } else if (load_boundaries) {
         m->embed      = load_w(m, "model.embed_tokens.weight", 0);
         { const char *en = embed_norm_name(&m->S); m->embed_norm = en ? load_t(m, en) : NULL; }
@@ -2081,6 +2091,46 @@ static void ink_fill_slots(Model *m, int layer, const int *layers, Slot **fill, 
     for (int j = 0; j < nfill; j++) fill[j]->filled = 1;
 }
 
+/* A round's reads on a thread of their own while the caller computes the experts the round
+ * found in RAM, then the read ones: a decode step misses two or three experts a layer, and the
+ * CPU used to wait for them before computing any. INK_FILL_ASYNC=0 reads first, as before.
+ * Only the int4 g64 container's reads (ink_fill_slots' pieces) go to the thread. */
+typedef struct { Model *m; int layer; Slot **fill; int nfill, on; pthread_t th; } InkFillJob;
+static int ink_fill_async(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("INK_FILL_ASYNC"); on = !(e && *e == '0'); }
+    return on;
+}
+/* INK_FILL_DELAY_US (tests): the thread waits that long before it reads, so that a pair computed
+ * before its expert's read finished would show in the oracles instead of hiding in the timing */
+static void *ink_fill_job(void *p) {
+    InkFillJob *j = p;
+    static int delay = -1;
+    if (delay < 0) { const char *e = getenv("INK_FILL_DELAY_US"); delay = e ? atoi(e) : 0; }
+    if (delay > 0) usleep((useconds_t)delay);
+    ink_fill_slots(j->m, j->layer, NULL, j->fill, j->nfill);
+    return NULL;
+}
+/* Starts the reads; 1 when they run on the thread (ink_fill_end joins it), 0 when they are done. */
+static int ink_fill_begin(InkFillJob *j, Model *m, int layer, Slot **fill, int nfill, int others) {
+    *j = (InkFillJob){ .m = m, .layer = layer, .fill = fill, .nfill = nfill };
+    if (nfill < 1) return 0;
+    if (others > 0 && m->xg64 && ink_fill_async() && pthread_create(&j->th, NULL, ink_fill_job, j) == 0)
+        return j->on = 1;
+    double tf = now_s();
+    ink_fill_slots(m, layer, NULL, fill, nfill);
+    m->t_fill += now_s() - tf;
+    return 0;
+}
+/* The wait for the reads past the caller's own work: the fill time the step still pays. */
+static void ink_fill_end(InkFillJob *j) {
+    if (!j->on) return;
+    double tf = now_s();
+    pthread_join(j->th, NULL);
+    j->m->t_fill += now_s() - tf;
+    j->on = 0;
+}
+
 /* pin the top-N experts per sparse layer from a usage-history file (colibri
  * .coli_usage convention: one uint32 count per expert per layer). Pins are
  * regular cache slots flagged non-evictable, filled in parallel at startup.
@@ -2273,6 +2323,7 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
 }
 
 #include "inkling2.h"   /* Inkling-2: its attention, convolutions and attention residuals */
+#include "inkling2_vision.h"   /* Inkling-2: its vision tower */
 
 /* ---------- dense MLP ---------- */
 static void dense_mlp(Model *m, Layer *l, float *x, int S, float *out) {
@@ -2507,7 +2558,13 @@ static void ink_vk_ram_given(void *ctx, size_t bytes) {
 /* Bytes the dense matrices marked for the device will take there (the budget leaves
  * them room), from the geometry: int8 1 byte, int4-g64 0.5625, f32 4, bf16 2. */
 static size_t inkc_fit_later(const Model *m);   /* inkling_chain.h */
+static size_t ink2c_plan_bytes(const Model *m);   /* inkling2_chain.h */
+static size_t ink_vk_dense_bytes_mats(const Model *m);
+/* plus Inkling-2's chain's own buffers when it is planned (g_ink2c_want) */
 static size_t ink_vk_dense_bytes(const Model *m) {
+    return ink_vk_dense_bytes_mats(m) + (g_ink2c_want ? ink2c_plan_bytes(m) : 0);
+}
+static size_t ink_vk_dense_bytes_mats(const Model *m) {
     const Cfg *c = &m->c;
     double b = 0;
     if (g_inkc_fit.L && vkc_fit_partial(&g_inkc_fit))   /* a partial chain: its layers placed already */
@@ -2826,7 +2883,8 @@ static void ink_vk_cpu_pairs(Model *m, int layer, const float *x, int n, const i
     int q4 = m->xq && m->rb13*2 == D;
     Slot **use = malloc((size_t)cap * sizeof(Slot *)), **fill = malloc((size_t)cap * sizeof(Slot *));
     int *pi = malloc((size_t)cap * sizeof(int));
-    if (!use || !fill || !pi) { fprintf(stderr, "OOM ink_vk_cpu_pairs\n"); exit(1); }
+    uint8_t *fresh = malloc((size_t)cap);
+    if (!use || !fill || !pi || !fresh) { fprintf(stderr, "OOM ink_vk_cpu_pairs\n"); exit(1); }
     for (int i = 0; i < n; ) {
         int nr = 0, nfill = 0;
         for (; i < n && nr < round_cap; i++) {
@@ -2834,13 +2892,16 @@ static void ink_vk_cpu_pairs(Model *m, int layer, const float *x, int n, const i
             Slot *e = slot_find(m, layer, ib[i]);
             if (e) m->hits++;
             else { m->miss++; e = slot_acquire(m, layer, ib[i]); fill[nfill++] = e; }
+            /* a slot this round acquired for an earlier pair is not filled yet either: an expert
+             * two rows of a prompt chunk route to is read once and waits for its read both times */
+            fresh[nr] = !e->filled;
             use[nr] = e; pi[nr] = i; nr++;
         }
-        if (nfill) {
-            double tf = now_s();
-            ink_fill_slots(m, layer, NULL, fill, nfill);
-            m->t_fill += now_s() - tf;
-        }
+        /* int4 g64: the reads on a thread of their own while the hits compute (ink_fill_begin) */
+        int nready = 0;
+        for (int r = 0; r < nr; r++) nready += !fresh[r];
+        InkFillJob fj;
+        const int async = ink_fill_begin(&fj, m, layer, fill, nfill, nready);
         for (int r = 0; r < nr; r++) {
             if (use[r]->eid != ib[pi[r]]) {
                 fprintf(stderr, "layer %d: cache served expert %d for requested expert %d\n",
@@ -2848,11 +2909,20 @@ static void ink_vk_cpu_pairs(Model *m, int layer, const float *x, int n, const i
                 exit(1);
             }
         }
+        if (async) {   /* each pair's output has a row of its own: the order does not matter */
+            for (int pass = 0; pass < 2; pass++) {
+                if (pass) ink_fill_end(&fj);
+                for (int r = 0; r < nr; r++)
+                    if (fresh[r] == pass)
+                        ink_xg64_expert(m, use[r], x + (int64_t)(pi[r] / K) * D, g, ctb + (int64_t)pi[r] * D);
+            }
+        }
         for (int r = 0; r < nr; r++) {
             Slot *e = use[r];
             const float *xs = x + (int64_t)(pi[r] / K) * D;
             float *hh = ctb + (int64_t)pi[r] * D;
-            if (m->gx) ink_gx_expert(m, layer, e, xs, g, hh);
+            if (async) { /* computed above */ }
+            else if (m->gx) ink_gx_expert(m, layer, e, xs, g, hh);
             else if (m->xg64) ink_xg64_expert(m, e, xs, g, hh);
             else if (m->xq) {
                 if (q4) {
@@ -2881,7 +2951,7 @@ static void ink_vk_cpu_pairs(Model *m, int layer, const float *x, int n, const i
 #endif
         }
     }
-    free(use); free(fill); free(pi);
+    free(use); free(fill); free(pi); free(fresh);
 }
 #endif
 #if defined(COLI_VULKAN) || defined(COLI_CUDA)
@@ -2973,6 +3043,7 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out, c
     Slot **use  = malloc((size_t)S*K*sizeof(Slot*));
     Slot **fill = malloc((size_t)S*K*sizeof(Slot*));
     int  *fl    = malloc((size_t)S*K*sizeof(int));
+    uint8_t *fresh = malloc((size_t)S*K);   /* the round's pairs whose expert is being read */
     int nfill = 0;
     /* pass 1: routing + slot bookkeeping (serial) */
     for (int s = 0; s < S; s++) {
@@ -3024,7 +3095,7 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out, c
     if (XT(ready)()) {   /* the expert tier (Vulkan's or CUDA's) takes the layer from here (ink_vk_moe) */
         ink_vk_moe(m, l, layer, x, S, out, idx, keff, wgt, shw != NULL);
         if (!lg_in) free(logits);
-        free(idx); free(keff); free(wgt); free(use); free(fill); free(fl);
+        free(idx); free(keff); free(wgt); free(use); free(fill); free(fl); free(fresh);
         return;
     }
 #endif
@@ -3044,6 +3115,7 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out, c
     int cap = m->cache[layer].cap; if (cap < 1) cap = 1;
     int round_cap = slot_round_cap(m, layer);
     float *g = falloc(2*I), *u = g + I, *hh = falloc(D);
+    float *hb = m->xg64 ? falloc((int64_t)round_cap*D) : NULL;   /* the round's outputs, read ahead */
     int q4 = m->xq && m->rb13*2 == D;   /* packed int4 vs int8 container */
     int shared_done = 0;                /* set when overlapped with the last GPU round */
     int64_t npair = (int64_t)S*K;
@@ -3117,13 +3189,14 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out, c
                 e = slot_acquire(m, layer, eid);
                 fill[nfill] = e; fl[nfill] = layer; nfill++;
             }
+            fresh[t - base] = !e->filled;   /* this round's earlier pair may have acquired it */
             use[t - base] = e;
         }
-        if (nfill) {                                      /* riempimento in parallelo */
-            double tf = now_s();
-            ink_fill_slots(m, 0, fl, fill, nfill);
-            m->t_fill += now_s() - tf;
-        }
+        /* riempimento in parallelo; int4 g64: on a thread of its own while the hits compute */
+        InkFillJob fj;
+        int nhit = 0;
+        for (int64_t t = base; t < end; t++) nhit += use[t - base] && !fresh[t - base];
+        const int async = ink_fill_begin(&fj, m, layer, fill, nfill, nhit);
         /* Validate before the CPU/Metal split: either backend must refuse a
          * cache slot whose weights belong to a different routed expert. */
         for (int64_t t = base; t < end; t++) {
@@ -3136,6 +3209,9 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out, c
                 exit(1);
             }
         }
+#ifdef COLI_METAL
+        if (mxg) ink_fill_end(&fj);   /* the GPU's round reads every slot */
+#endif
         double te = now_s();
 #ifdef COLI_METAL
         if (mxg) {
@@ -3199,6 +3275,25 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out, c
             } else { m->t_expert += now_s() - te; continue; }
         }
 #endif
+        if (async) {   /* int4 g64, reads in flight: the hits, the wait, the read ones; the sum in pair order */
+            for (int pass = 0; pass < 2; pass++) {
+                if (pass) { m->t_expert += now_s() - te; ink_fill_end(&fj); te = now_s(); }
+                for (int64_t t = base; t < end; t++) {
+                    Slot *e = use[t - base];
+                    if (!e || fresh[t - base] != pass) continue;
+                    ink_xg64_expert(m, e, x + (int64_t)(t / K)*D, g, hb + (t - base)*D);
+                }
+            }
+            for (int64_t t = base; t < end; t++) {
+                if (!use[t - base]) continue;
+                int s = (int)(t / K), kk = (int)(t % K);
+                float *os = out + (int64_t)s*D;
+                const float wk = wgt[(int64_t)s*(K+ns) + kk], *hp = hb + (t - base)*D;
+                for (int d = 0; d < D; d++) os[d] += wk * hp[d];
+            }
+            m->t_expert += now_s() - te;
+            continue;
+        }
         for (int64_t t = base; t < end; t++) {            /* calcolo + accumulo */
             int s = (int)(t / K), kk = (int)(t % K);
             Slot *e = use[t - base];
@@ -3249,8 +3344,8 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out, c
         m->t_shared += now_s() - ts;
     }
     if (!lg_in) free(logits);
-    free(idx); free(keff); free(wgt); free(use); free(fill); free(fl);
-    free(g); free(hh);              /* u aliases g+I */
+    free(idx); free(keff); free(wgt); free(use); free(fill); free(fl); free(fresh);
+    free(g); free(hh); free(hb);    /* u aliases g+I */
 #ifdef COLI_METAL
     if (mxg) {
         free(mxg); free(mrw); free(mgp); free(mup); free(mdp);
@@ -3321,7 +3416,9 @@ static void inkling_layers_forward_range(Model *m, float *x, int S, int pos0,
 }
 
 #ifdef COLI_VULKAN
+static int64_t ink_cs_cells(Cfg *c, int bank, int layer);
 #include "inkling_chain.h"   /* COLI_VK_CHAIN: every layer's dense chain on the device */
+#include "inkling2_chain.h"  /* the same for Inkling-2 */
 #endif
 
 /* ---------- one forward pass over S new tokens ----------
@@ -3419,11 +3516,18 @@ static float *step_mm(Model *m, const int *ids, int S, int pos0, int *tf_out,
     Cfg *c = &m->c; int D = c->hidden;
     float *x = falloc((int64_t)S*D);
     float *arow = (dmel && naud > 0) ? falloc(D) : NULL;
-    int aidx = 0;
+    int aidx = 0, used_img = 0;
     for (int s = 0; s < S; s++) {
         if (arow && m->audio_norm && ids[s] == c->audio_tok && aidx < naud) {
             audio_embed_row(m, dmel + (int64_t)aidx*c->mel_bins, x + (int64_t)s*D, arow);
             aidx++;
+            continue;
+        }
+        /* Inkling-2: an image placeholder takes the vision tower's next row, in place of the
+         * (normed) embedding, as transformers' masked_scatter puts it */
+        if (m->img && ids[s] == m->vis->image_tok && m->img_next < m->img_n) {
+            memcpy(x + (int64_t)s*D, m->img + (int64_t)(m->img_next++)*D, (size_t)D*sizeof(float));
+            used_img = 1;
             continue;
         }
         wt_row_f32(m->embed, (int64_t)ids[s]*D, x + (int64_t)s*D, D);
@@ -3456,7 +3560,7 @@ static float *step_mm(Model *m, const int *ids, int S, int pos0, int *tf_out,
      * Audio taints the record: every frame carries the same token id while the
      * mel payload differs, so ids alone cannot tell two clips apart. */
     kv_prefix_record(&m->kvp, ids, pos0, S);
-    if (dmel && naud > 0) kv_prefix_taint(&m->kvp);
+    if ((dmel && naud > 0) || used_img) kv_prefix_taint(&m->kvp);   /* an image's placeholders, too */
     float *last = falloc(D);
     float *logit = falloc(c->unpad_vocab);
     /* Lettura del prefill: un passaggio di lm_head per posizione, pagato solo
@@ -3809,6 +3913,15 @@ static int sample_logits(const float *logit, int n, float temp, float top_p) {
     return pick;
 }
 
+/* REP_PEN, or the engine's default: 1.1 for Inkling, off for Inkling-2. Its tool calls repeat the
+ * declaration's tokens (the name, "name", "args", the parameters' keys, <|end_message|>), all of
+ * them in the 128 tokens the guard looks at, and with 1.1 a call for a question that needed the
+ * tool came out unparsable, or not at all, where the CLI's plain greedy pick wrote it whole. */
+static float ink_rep_pen(const Model *m) {
+    const char *e = getenv("REP_PEN");
+    return e ? (float)atof(e) : m->c.v2 ? 1.0f : 1.1f;
+}
+
 /* light repeat guard: recently emitted tokens get their logit divided by pen>1 */
 static void apply_rep_penalty(float *logit, int n, const int *hist, int nhist, float pen) {
     if (pen <= 1.f) return;
@@ -3841,12 +3954,15 @@ static const char *prompt_reject(int np, int want) {
 
 typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int plen;
                  uint8_t *audio; int alen;
-                 int logprobs, pin; } SReq;   /* raw DMel bytes after the payload; SUBMIT logprobs=k / pin=1 */
+                 int logprobs, pin;
+                 float *img; uint64_t img_bytes; int img_rows, img_cols; } SReq;
+                 /* raw DMel bytes after the payload; SUBMIT logprobs=k / pin=1; the IMAGE frame
+                  * before the SUBMIT (Inkling-2: [rows * cols][tile][tile][3] f32 pixels) */
 #define SRV_QMAX 16
 static SReq g_q[SRV_QMAX]; static int g_qn = 0;
 static const ColiServeWireProfile inkling_wire = {
     .max_header_bytes = 511,
-    .max_payload_bytes = 1u << 22,
+    .max_payload_bytes = 1u << 26,   /* an IMAGE frame's pixels: 256 tiles of 40 x 40 x 3 f32 are 4.9 MB */
     .max_extension_bytes = 1u << 26,
     .max_tokens = 1 << 20,
     .require_exact_lf = 1,
@@ -3858,7 +3974,26 @@ static const ColiServeWireProfile inkling_wire = {
 static void serve_request_dispose(SReq *request) {
     if (!request) return;
     free(request->payload);
+    free(request->img);
     memset(request, 0, sizeof(*request));
+}
+
+/* The IMAGE frame the gateway sends right before its SUBMIT (same id, under one lock): held
+ * here until that SUBMIT takes it; another SUBMIT drops it. */
+static struct { char id[64]; unsigned char *pix; uint64_t bytes; int rows, cols; } g_ink_img;
+static void ink_image_hold(ColiServeCommand *command) {
+    free(g_ink_img.pix);
+    snprintf(g_ink_img.id, sizeof(g_ink_img.id), "%s", command->id);
+    g_ink_img.bytes = command->payload_bytes;
+    g_ink_img.rows = command->grid_h; g_ink_img.cols = command->grid_w;
+    g_ink_img.pix = coli_serve_command_take_payload(command);
+}
+static void ink_image_attach(SReq *q) {
+    if (g_ink_img.pix && !strcmp(g_ink_img.id, q->id)) {
+        q->img = (float *)g_ink_img.pix; q->img_bytes = g_ink_img.bytes;
+        q->img_rows = g_ink_img.rows; q->img_cols = g_ink_img.cols;
+    } else free(g_ink_img.pix);
+    g_ink_img.pix = NULL;
 }
 
 static int stdin_readable(void) {
@@ -3904,6 +4039,7 @@ static int serve_read_cmd(FILE *input, FILE *output, const char *cur_id) {
     if(command.kind==COLI_SERVE_COMMAND_STOP){
         coli_serve_command_dispose(&command); return 0;
     }
+    if(command.kind==COLI_SERVE_COMMAND_IMAGE){ ink_image_hold(&command); coli_serve_command_dispose(&command); return 0; }
     if(command.kind==COLI_SERVE_COMMAND_SUBMIT){
         if (g_qn < SRV_QMAX) {
             SReq *q = &g_q[g_qn++];
@@ -3914,6 +4050,7 @@ static int serve_read_cmd(FILE *input, FILE *output, const char *cur_id) {
             q->alen=(int)command.extension_bytes;
             q->audio=coli_serve_command_extension(&command);
             q->payload=(char*)coli_serve_command_take_payload(&command);
+            ink_image_attach(q);
         } else coli_serve_write_error(output,command.id,"queue full");
     }
     coli_serve_command_dispose(&command);
@@ -4175,8 +4312,33 @@ static int ink_serve_start(Model *m, Tok *T, SReq *q, int **ids_out, int *np_out
                  m->audio_norm?"":" — snapshot has no audio tensors");
         coli_serve_write_error(stdout,q->id,message); free(ids); return 0;
     }
+    /* Inkling-2's image: the vision tower's rows, one per image placeholder, which step_mm puts
+     * in place of their embeddings. Like audio it taints the prefix record (the placeholders are
+     * the same tokens whatever the picture) and keeps the pins and the prefix store out. */
+    int nimg = 0;
+    if (q->img) {
+        const Ink2Vision *v = m->vis;
+        char message[256];
+        if (!v) { coli_serve_write_error(stdout, q->id, "this snapshot has no vision tower"); free(ids); return 0; }
+        const int tile = v->patch * v->merge;
+        nimg = q->img_rows * q->img_cols;
+        int placeholders = 0;
+        for (int i = 0; i < np; i++) placeholders += ids[i] == v->image_tok;
+        if ((uint64_t)nimg * tile * tile * 3 * sizeof(float) != q->img_bytes || placeholders != nimg) {
+            snprintf(message, sizeof(message), "image of %dx%d tiles (%llu bytes) for %d placeholders",
+                     q->img_rows, q->img_cols, (unsigned long long)q->img_bytes, placeholders);
+            coli_serve_write_error(stdout, q->id, message); free(ids); return 0;
+        }
+        double tv = now_s();
+        free(m->img);
+        m->img = falloc((int64_t)nimg * c->hidden);
+        ink2_vision_image(v, q->img, q->img_rows, q->img_cols, m->img);
+        m->img_n = nimg; m->img_next = 0;
+        fprintf(stderr, "[inkling2] image: %dx%d tokens through the vision tower in %.2fs\n", q->img_rows, q->img_cols, now_s() - tv);
+    }
+    const int media = naud > 0 || nimg > 0;
     /* a conversation the last request parked: back, kept or dropped, before kv_alloc grows the cache */
-    if (lone) ink_park_decide(m, ids, np, q->max_tok, naud > 0);
+    if (lone) ink_park_decide(m, ids, np, q->max_tok, media);
     else coli_park_free(&g_ink_park);
     /* KV PREFIX REUSE (#639 for GLM; this engine re-prefilled every turn).
      * A chat client resends the whole transcript each turn, so turn N used to
@@ -4197,13 +4359,13 @@ static int ink_serve_start(Model *m, Tok *T, SReq *q, int **ids_out, int *np_out
     kv_alloc(m, np + q->max_tok + 8);
     /* naud>0 taints this turn before the comparison, not after: a request that
      * brings its own audio must not match a text-only state either. */
-    if (naud > 0) kv_prefix_taint(&m->kvp);
+    if (media) kv_prefix_taint(&m->kvp);
     int reuse = kv_prefix_reuse(&m->kvp, ids, np);
     /* La fotografia si prova sempre, non solo quando il riuso vivo fallisce:
      * altrimenti la prima opzione trova ancora lo stato del prompt, passa dal
      * riuso normale e il suo primo token resta senza predittore. */
     g_pin_use_logit = 0; g_pin_logit = NULL;
-    if (naud == 0) {
+    if (!media) {
         /* Il piu profondo degli scatti valido per questo prompt. Uno scatto le
          * cui righe K/V non ci sono piu si butta e si riprova col precedente,
          * invece di rinunciare e rifare tutto da zero. */
@@ -4226,7 +4388,7 @@ static int ink_serve_start(Model *m, Tok *T, SReq *q, int **ids_out, int *np_out
     }
     /* the prompt the store holds further than the slot does: another conversation's on the same
      * system prompt, this one's before another took the slot (ink_ps_take) */
-    const int ps_plain = naud == 0 && q->logprobs == 0 && !q->pin;
+    const int ps_plain = !media && q->logprobs == 0 && !q->pin;
     int ps_got = 0;
     if (ps_plain) { ps_got = ink_ps_take(m, ids, np, reuse); if (ps_got) { reuse = ps_got; g_pin_use_logit = 0; g_pin_logit = NULL; } }
     g_echo_k = q->logprobs; g_echo_id = q->id; g_echo_tok = T;
@@ -4244,7 +4406,7 @@ static int ink_serve_start(Model *m, Tok *T, SReq *q, int **ids_out, int *np_out
                     (m->kvp.len > 0 && m->kvp.len < np) ? " (diverged)" : "");
         fflush(stderr);
     }
-    if (!reuse && lone && naud == 0) ink_park(m, np, q->max_tok);   /* a short request keeps the conversation (ink_park_decide) */
+    if (!reuse && lone && !media) ink_park(m, np, q->max_tok);   /* a short request keeps the conversation (ink_park_decide) */
     if (!reuse) state_reset(m);
     clk->t0 = now_s();
     clk->h0 = m->hits; clk->m0 = m->miss;
@@ -4259,7 +4421,7 @@ static int ink_serve_start(Model *m, Tok *T, SReq *q, int **ids_out, int *np_out
 #endif
     float *logit = NULL;
     int whole_steps = 0;   /* stopped between two segments: the state is the prompt read so far */
-    if (lone && chain && q->logprobs == 0 && naud == 0) {
+    if (lone && chain && q->logprobs == 0 && !media) {
         /* a chain is not stopped inside its forward: the prompt goes in segments, checked
          * between them, each a whole step (its rings and banks as complete as any step's) */
         int seg = coli_prompt_segment_rows(2048);
@@ -4293,6 +4455,7 @@ static int ink_serve_start(Model *m, Tok *T, SReq *q, int **ids_out, int *np_out
         logit = cut ? NULL : step_mm(m, ids + at, np - at, at, NULL, q->audio, naud);
         g_coli_prompt_break = NULL;
     }
+    free(m->img); m->img = NULL; m->img_n = m->img_next = 0;   /* read with the prompt, or not at all */
     if (!logit) {
         /* stopped inside a forward: the sliding layers' rings and the convolution banks hold
          * part of this prompt, so the state starts over and the next request reads its prompt
@@ -4304,7 +4467,7 @@ static int ink_serve_start(Model *m, Tok *T, SReq *q, int **ids_out, int *np_out
         free(ids);
         return 0;
     }
-    if (q->pin && logit && naud == 0) {
+    if (q->pin && logit && !media) {
         coli_pin_pool_init(&g_pins, c->unpad_vocab);
         ColiPin *k = coli_pin_store(&g_pins, ids, np, logit);
         if (k) {
@@ -4330,7 +4493,7 @@ static int serve_one(Model *m, Tok *T, SReq *q) {
     int len = np, gen = 0, limited = 1, cancelled = 0;
     char buf[512];
     /* repetition-penalty history: prompt tail + emitted tokens, ring of 128 */
-    float rep = getenv("REP_PEN") ? atof(getenv("REP_PEN")) : 1.1f;
+    float rep = ink_rep_pen(m);
     int hist[128], nhist = 0;
     for (int i = (np > 128 ? np - 128 : 0); i < np; i++) hist[nhist++] = ids[i];
     for (int s = 0; s < q->max_tok && !cancelled; s++) {
@@ -4537,7 +4700,7 @@ static void serve_mux(Model *m, Tok *T) {
     InkRow *rows = malloc((size_t)n * sizeof *rows);
     int *tok = malloc((size_t)n * sizeof(int)), *who = malloc((size_t)n * sizeof(int));
     if (!rq || !rows || !tok || !who) { fprintf(stderr, "[serve] out of memory\n"); exit(1); }
-    float rep = getenv("REP_PEN") ? atof(getenv("REP_PEN")) : 1.1f;
+    float rep = ink_rep_pen(m);
     unsigned long long steps = 0, nrows = 0;
     fprintf(stderr, "[inkling] serving %d conversations at once (KV_SLOTS)\n", n);
     for (;;) {
@@ -4554,6 +4717,8 @@ static void serve_mux(Model *m, Tok *T) {
             } else if (result == COLI_SERVE_READ_OK) {
                 if (command.kind == COLI_SERVE_COMMAND_CANCEL) {
                     for (int i = 0; i < n; i++) if (rq[i].active && !strcmp(rq[i].q.id, command.id)) rq[i].cancel = 1;
+                } else if (command.kind == COLI_SERVE_COMMAND_IMAGE) {
+                    ink_image_hold(&command);
                 } else if (command.kind == COLI_SERVE_COMMAND_SUBMIT) {
                     if (command.slot < 0 || command.slot >= n) coli_serve_write_error(stdout, command.id, "invalid cache slot");
                     else if (rq[command.slot].active) coli_serve_write_error(stdout, command.id, "SLOT_BUSY");
@@ -4567,9 +4732,11 @@ static void serve_mux(Model *m, Tok *T) {
                         t->q.alen = (int)command.extension_bytes;
                         t->q.audio = coli_serve_command_extension(&command);
                         t->q.payload = (char *)coli_serve_command_take_payload(&command);
+                        ink_image_attach(&t->q);
                         ink_mux_bind(m, command.slot);
                         int ok = ink_serve_start(m, T, &t->q, &t->ids, &t->np, &t->lo, &t->clk, 0);
                         free(t->q.payload); t->q.payload = NULL; t->q.audio = NULL;
+                        free(t->q.img); t->q.img = NULL;
                         if (ok) {
                             t->active = 1; t->limited = 1; t->forwards = 1;
                             for (int i = (t->np > 128 ? t->np - 128 : 0); i < t->np; i++) t->hist[t->nhist++] = t->ids[i];
@@ -4624,7 +4791,9 @@ static void serve_loop(Model *m, Tok *T) {
     else g_rng ^= (uint64_t)time(NULL) * 2654435761u;
     /* the gateway reads a STAT line right after the READY sentinel (colibri
      * reports its load stats there) — match the handshake */
-    coli_serve_write_ready(stdout,rss_gb());
+    /* Inkling-2 says whether it loaded its vision tower (the gateway refuses pictures by name
+     * when it did not); Inkling's handshake stays as it was */
+    coli_serve_write_ready_caps(stdout, rss_gb(), m->c.v2 ? (m->vis ? "vision=1" : "vision=0") : NULL);
     serve_hwinfo(m);
     serve_tiers_emap(m);
     if (g_ink_mux_slots > 1) { serve_mux(m, T); coli_ps_report(&g_ink_ps); return; }
@@ -4895,10 +5064,33 @@ int main(int argc, char **argv) {
         for (int i = 0; i < ndm; i++) rdmel[i] = (uint8_t)dmint[i];
         printf("audio oracle: %d DMel frames x %d bins\n", rnaud, m.c.mel_bins);
     }
+    /* optional image oracle (make_tiny_inkling2.py --vision): "pixel_values" = the processor's
+     * [tokens][tile][tile][3], "image_grid_thw" = [1, rows, cols]; its rows go through the
+     * vision tower once and each pass below takes them from the first */
+    float *img_rows = NULL; int img_n = 0;
+    {
+        jval *pv = json_get(ref, "pixel_values");
+        int ng = 0, *grid = read_int_array(ref, "image_grid_thw", &ng);
+        if (pv && pv->t == J_ARR && grid && ng == 3) {
+            if (!m.vis) { fprintf(stderr, "the oracle has an image but the snapshot no vision tower\n"); return 1; }
+            const int tile = m.vis->patch * m.vis->merge;
+            img_n = grid[1] * grid[2];
+            if (pv->len != img_n * tile * tile * 3) { fprintf(stderr, "pixel_values: %d values for %d tiles\n", pv->len, img_n); return 1; }
+            float *pix = falloc(pv->len);
+            for (int i = 0; i < pv->len; i++) pix[i] = (float)pv->kids[i]->num;
+            img_rows = falloc((int64_t)img_n * m.c.hidden);
+            ink2_vision_image(m.vis, pix, grid[1], grid[2], img_rows);
+            free(pix);
+            printf("image oracle: %dx%d tokens through the vision tower\n", grid[1], grid[2]);
+        }
+        free(grid);
+    }
+    #define INK_IMG_REWIND() do { if (img_rows) { m.img = img_rows; m.img_n = img_n; m.img_next = 0; } } while (0)
 
     /* pass 1: teacher-forced argmax over the full reference sequence */
     if (tfref && ntf == nfull) {
         int *tf = malloc(nfull * sizeof(int));
+        INK_IMG_REWIND();
         float *lg = step_mm(&m, full, nfull, 0, tf, rdmel, rnaud);
         free(lg);
         int ok = 0; for (int i = 0; i < nfull; i++) ok += (tf[i] == tfref[i]);
@@ -4910,7 +5102,10 @@ int main(int argc, char **argv) {
     /* pass 2: greedy generation, token-for-token vs the oracle */
     int *out = malloc(nfull * sizeof(int));
     double t = now_s();
+    INK_IMG_REWIND();
     generate(&m, pids, np, ngen, out, rdmel, rnaud);
+    m.img = NULL;
+    #undef INK_IMG_REWIND
     double dt = now_s() - t;
     int match = 0;
     printf("Reference: "); for (int i=np;i<nfull;i++) printf("%d ", full[i]);

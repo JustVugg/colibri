@@ -75,6 +75,14 @@
 #include "vk_chain.h"
 #include "vk_kvsplit.h"
 
+/* Inkling-2's chain (inkling2_chain.h, included after this file): the entry points below hand
+ * an Inkling-2 model there */
+static void ink2c_host_wrote(Model *m, int zero);
+static void ink2c_cpu_step(Model *m, int pos_base, int S);
+static int  ink2c_forward(Model *m, float *xh, int S, int pos_base, int want_x, float *logit);
+static void ink2c_report(Model *m);
+static void ink2c_start(Model *m);
+
 /* COLI_VK_CHAIN unset on an integrated GPU with the expert tier (coli_vk_chain_decide):
  * no Inkling checkpoint has been timed on one */
 #ifndef INKLING_CHAIN_IGPU
@@ -677,6 +685,7 @@ static int inkc_scratch(InkChain *ch, Model *m, int rows) {
 /* ---- state between the host and the device ----------------------------------- */
 /* The host wrote its convolution states (zero: state_reset's zeros). */
 static void inkc_host_wrote(Model *m, int zero) {
+    if (m->c.v2) { ink2c_host_wrote(m, zero); return; }
     for (int d = 0; d < 2; d++) {
         InkChain *ch = inkc_of(m, d);
         if (!ch || !ch->ok) continue;
@@ -696,6 +705,7 @@ static void inkc_cpu_one(InkChain *ch, int pos_base, int S) {
     }
 }
 static void inkc_cpu_step(Model *m, int pos_base, int S) {
+    if (m->c.v2) { ink2c_cpu_step(m, pos_base, S); return; }
     for (int d = 0; d < 2; d++) inkc_cpu_one(inkc_of(m, d), pos_base, S);
 }
 /* Record the uploads that make the device state the host's: the convolution states if
@@ -809,7 +819,7 @@ static int inkc_attention(InkChain *ch, Model *m, int i, int n, int pb) {
     }
     VkcRelAttn a = {n, H, KV, hd, pb, cap, local ? c->window : 0, L_EXT(c, i), dr,
                     0, H * hd, 0, H * hd, 0, 0, 0, (int)vs, kvo, 0, H * dr, (int)ch->o_relp[i], local ? ch->rows : 0,
-                    1.f / (float)hd};
+                    1.f / (float)hd, 0, 0};
     ok = ok && vkc_relattn(ch->q, ch->kc[i], ch->vc[i], ch->ctx, ch->kvs, ch->r, ch->prm, ch->tau, &a);
     if (!ok) return 0;
     /* the step's rows into the ring after the attention read them: the last `cap` of them */
@@ -994,6 +1004,7 @@ lost:   /* a frame failed: the device is gone (or would not take a command); the
  * the CPU's layers (from inkc_ran) and lm_head on it. */
 static int inkc_forward(Model *m, float *xh, int S, int pos_base, int want_x, float *logit) {
     g_inkc_ran = 0;
+    if (m->c.v2) return ink2c_forward(m, xh, S, pos_base, want_x, logit);
     if (!g_vk_chain) return 0;
     if (g_vk_chain == COLI_VK_CHAIN_PREFILL && S <= 2) return 0;   /* prompts only: decode on the CPU */
     InkChain *ch = inkc_setup(m), *ch2 = NULL;
@@ -1024,6 +1035,7 @@ static int inkc_forward(Model *m, float *xh, int S, int pos_base, int want_x, fl
 }
 
 static void inkc_report(Model *m) {
+    if (m->c.v2) { ink2c_report(m); return; }
     for (int d = 0; d < 2; d++) {
         InkChain *ch = inkc_of(m, d);
         if (!ch || !ch->ok || !ch->forwards) continue;
@@ -1052,7 +1064,7 @@ static void inkc_start(Model *m) {
     if (g_metal) { if (e && *e && *e != '0') fprintf(stderr, "[VK] inkling: dense chain off, the Metal expert path is on\n"); return; }
 #endif
     (void)e;
-    if (m->c.v2) { g_vk_chain = 0; return; }   /* the chain computes Inkling's layers, not Inkling-2's */
+    if (m->c.v2) { ink2c_start(m); return; }   /* Inkling-2's layers: inkling2_chain.h */
     g_vk_chain = coli_vk_chain_decide("inkling", vkt_ready(), INKLING_CHAIN_IGPU);
     if (g_vk_chain && g_ink_mux_slots > 1) {
         g_vk_chain = 0;

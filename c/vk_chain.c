@@ -3319,18 +3319,19 @@ int vkc_mla(const VkcMla *m, VkcMlaScratch *s, VkcBuf *x, size_t x_off, int S, i
     return vkc_mla_qkv(m, s, x, x_off, S, pos_base, cs, c, NULL, 0) &&
            vkc_mla_attn(m, s, S, pos_base, kv_start, c, NULL, 0, 0, NULL, 0, out, out_off);
 }
-/* ---- inkling's ops: chain_sconv.comp and chain_relattn.comp, made on first use ---- */
-static struct { VkShaderModule mod[2]; VkPipeline pipe[2]; int tried[2]; } g_kx[2];
+/* ---- inkling's ops: chain_sconv.comp, chain_relattn.comp and Inkling-2's chain_ink2.comp,
+ * made on first use ---- */
+static struct { VkShaderModule mod[3]; VkPipeline pipe[3]; int tried[3]; } g_kx[2];
 #define KX (g_kx[g_kd])
 static VkPipeline kx_pipe(int k) {
-    static const char *const file[2] = {"chain_sconv.spv", "chain_relattn.spv"};
+    static const char *const file[3] = {"chain_sconv.spv", "chain_relattn.spv", "chain_ink2.spv"};
     if (KX.pipe[k] || KX.tried[k] || !vkc_ready()) return KX.pipe[k];
     KX.tried[k] = 1;
     if ((KX.mod[k] = load_module(KC.core.spv_path, file[k]))) KX.pipe[k] = make_pipe(KX.mod[k], NULL);
     return KX.pipe[k];
 }
 static void kx_shutdown(void) {
-    for (int k = 0; k < 2; k++) {
+    for (int k = 0; k < 3; k++) {
         if (KX.pipe[k]) vkDestroyPipeline(KC.dev, KX.pipe[k], NULL);
         if (KX.mod[k]) vkDestroyShaderModule(KC.dev, KX.mod[k], NULL);
     }
@@ -3338,6 +3339,40 @@ static void kx_shutdown(void) {
 }
 int vkc_sconv_ready(void) { return kx_pipe(0) != VK_NULL_HANDLE; }
 int vkc_relattn_ready(void) { return kx_pipe(1) != VK_NULL_HANDLE; }
+int vkc_ink2_ready(void) { return kx_pipe(2) != VK_NULL_HANDLE; }
+int vkc_ink2_mix(VkcBuf *x, VkcBuf *blk, VkcBuf *prm, VkcBuf *y, const VkcInk2Mix *p) {
+    VkPipeline pipe = kx_pipe(2);
+    KC.kind = PK_ARES;
+    if (!pipe || p->S < 0 || p->D < 1 || p->nb < 0 || p->nb > 15 || (p->nb > 0 && !blk) || y == x || y == blk) return 0;
+    if (p->S == 0) return open_frame() && !KC.lost;
+    int32_t pc[13] = {0, p->S, p->D, p->nb, p->x_off, p->x_row, p->b_off, p->b_row, p->w_off, p->y_off, p->y_row, 0, 0};
+    memcpy(&pc[11], &p->eps, 4); memcpy(&pc[12], &p->scale, 4);
+    VkcBind bd[4] = {B(x, 0), B(p->nb > 0 ? blk : NULL, 0), B(prm, 0), B(y, 1)};
+    uint32_t gx, gy; grid((uint64_t)p->S, &gx, &gy);
+    return record(pipe, bd, 4, pc, sizeof pc, gx, gy, 1);
+}
+int vkc_ink2_clip(VkcBuf *x, VkcBuf *prm, const VkcInk2Clip *p) {
+    VkPipeline pipe = kx_pipe(2);
+    KC.kind = PK_NORM;
+    if (!pipe || p->nseg < 0 || p->n < 1 || p->per_row < 1 || (p->has_w && !prm)) return 0;
+    if (p->nseg == 0) return open_frame() && !KC.lost;
+    int32_t pc[12] = {1, p->nseg, p->n, p->per_row, p->x_off, p->x_row, p->has_w, 0, p->w_off, 0, 0, 0};
+    memcpy(&pc[11], &p->thr, 4);
+    VkcBind bd[4] = {B(x, 1), B(NULL, 0), B(p->has_w ? prm : NULL, 0), B(NULL, 0)};
+    uint32_t gx, gy; grid((uint64_t)p->nseg, &gx, &gy);
+    return record(pipe, bd, 4, pc, sizeof pc, gx, gy, 1);
+}
+int vkc_ink2_dconv(VkcBuf *x, VkcBuf *dyn, VkcBuf *prm, VkcBuf *ring, const VkcInk2Dconv *p) {
+    VkPipeline pipe = kx_pipe(2);
+    KC.kind = PK_DNCONV;
+    if (!pipe || p->S < 0 || p->C < 1 || p->K < 1 || p->K > 9 || p->hd < 1 || p->C % p->hd) return 0;
+    if (p->S == 0) return open_frame() && !KC.lost;
+    int32_t pc[12] = {2, p->S, p->C, p->K, p->x_off, p->x_row, p->d_off, p->d_row, p->st_off, p->ring_off, p->hd, 0};
+    memcpy(&pc[11], &p->fc, 4);
+    VkcBind bd[4] = {B(x, 1), B(dyn, 0), B(prm, 0), B(ring, 1)};
+    uint32_t gx, gy; grid(((uint64_t)p->C + 255) / 256, &gx, &gy);
+    return record(pipe, bd, 4, pc, sizeof pc, gx, gy, 1);
+}
 int vkc_sconv(VkcBuf *x, VkcBuf *w, VkcBuf *ring, const VkcSconv *p) {
     VkPipeline pipe = kx_pipe(0);
     if (!pipe || (p->mode == 0 && (p->CK < 1 || p->CK > 9))) return 0;
@@ -3365,6 +3400,7 @@ int vkc_relattn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *kvs, VkcBu
         struct { VkcRelAttn a; int s0; } x = {*p, r0};
         x.a.S = S - r0 < rr ? S - r0 : rr;
         x.a.q_off += r0 * p->q_row; x.a.o_off += r0 * p->o_row; x.a.r_off += r0 * p->r_row; x.a.tau_off += r0;
+        if (p->has_sink) x.a.sink_off += r0 * p->H;
         if (r0 && !attn_slice_next()) return 0;
         ok = record(pipe, bd, 8, &x, sizeof x, (uint32_t)p->H, (uint32_t)x.a.S, 1);
     }

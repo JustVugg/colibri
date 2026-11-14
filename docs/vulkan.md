@@ -1788,6 +1788,47 @@ chain's ops, a set of those configurations and a serve session of each engine un
 ASan and UBSan. On the 780M (RADV) every one of those configurations and serve sessions
 gave the CPU's tokens.
 
+### Inkling-2 on the chain
+
+Inkling-2 (`inkling2_chain.h`) has a chain of its own beside Inkling's, with the same knobs,
+default rule and line (`[VK] inkling2 chain: ...`), and the same split of work: per layer one
+frame on the device and the routed experts on the host (`moe_ex`, the tier's batch and the
+CPU's share), the K/V rows coming back to the host's cache, which stays canonical, and the
+four short-convolution states coming back at the end of every step, all of them in one
+buffer and one copy. What the frame runs, after the layer before's MoE output joined the
+stream (its short convolution, the residual add): the attention residuals' input mix of the
+block states and the stream (one query on a sliding layer, three on a global one), the
+norms, q, k, v, the relative states, the gate and the sinks, the short convolutions of K and
+V (static, or on a global layer the per-token taps projected from the normed input), the L2
+clips of q, the relative states and k, V normalised without a weight, the attention, the
+gate, o_proj and its convolution, the block state where a block starts, the residual, the
+MLP's input mix, its norm and the router logits. The last frame mixes the output and runs
+the final norm and lm_head; the host softcaps the logits.
+
+Three ops are Inkling-2's own, in `chain_ink2.comp` (made on first use): the residual mix of
+normalised states (one pass over the vectors for every sum, the subgroups' sums joined in
+order), the L2 clip of each head, and the dynamic convolution over a step's rows with its
+state. `chain_relattn.comp` takes the sink: a logit per (row, head) that starts the online
+softmax (m = sink, l = 1), as `ink2_attention` starts its maximum and sum, and follows its
+rows over the slices of a long prompt chunk. The dense matrices are the per-matrix path's
+copies; the router, the sink projection and the dynamic taps' projections go up as f32 (the
+router as bf16 where that is exact), and the tier's budget leaves the chain's buffers and
+its K/V mirrors at the served context (`ink2c_plan_bytes`). It declines, and the per-matrix
+path runs, with several conversations (`KV_SLOTS`), on a geometry outside its shaders, or
+when the device refuses its memory; a device lost mid-step rebuilds the state on the CPU
+from the prefix record, as Inkling's.
+
+The tiny oracles match token for token with it, their logits within 1.2e-5 of the CPU's
+(`tests/vulkan_engines.sh inkling2`); `tests/test_vk_chain.c` holds the three ops and the
+sink to CPU references. On the RTX PRO 4000 with Inkling-2-Small int4 g64 (62 GB of RAM, the
+experts mostly from RAM and disk) the dense part of a run of 64 tokens went from 6.1-6.3 s
+(the per-matrix path: 289 matrices a token a call at a time, the attention and the mixes on
+the CPU) to 5.1-5.5 s, about 14 ms a token of 510; whole runs vary more than that between
+two disk-bound runs. Most of the device's time is the bf16 GEMVs: `chain_gemv.comp`'s bf16 and
+f16 rows now issue four steps' loads before using the first, as its int8 rows do (the same
+sums in the same order, the same bits): Inkling-2's 6144 x 4608 went from 223 to 188 us a
+decode row in the run, 147 to 142 us alone.
+
 ### GLM-5.2 and GLM-5.3 Flash on the chain
 
 `glm_chain.h` (colibri) and `glm53_chain.h` (glm53) follow the recipe below with the

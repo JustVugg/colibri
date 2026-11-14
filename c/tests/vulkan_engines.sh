@@ -343,8 +343,11 @@ dense_where() {
     # inkling places none when the host keeps them by design (bf16 weights under the
     # AVX512-BF16 dot, which rounds the activations as the shader does not): its
     # placement line then says "0 resident matrices go to the GPU", and the count is
-    # not required, as in family_inkling_olmoe's own bf16 check.
-    grep -qa "^\[VK\] $eng: 0 resident matrices go to the GPU" "$log" || need_gpu "$eng" "$log" "$tag"
+    # not required, as in family_inkling_olmoe's own bf16 check. A dense chain that ran (on by
+    # default on a discrete GPU: "[VK] <engine> chain: N forwards", Inkling-2's "inkling2
+    # chain") ran the trunk there without the per-matrix path's count.
+    grep -qa "^\[VK\] $eng: 0 resident matrices go to the GPU" "$log" || [ "$(chain_count "$eng" "$log")" -gt 0 ] ||
+      [ "$(chain_count "${eng}2" "$log")" -gt 0 ] || need_gpu "$eng" "$log" "$tag"
     where=device
   else
     [ "$(vk_count "$eng" "$log")" = 0 ] || { cat "$log"; fail "$tag: dense matmuls ran on the device with the trunk on the CPU"; }
@@ -604,6 +607,17 @@ PY
     tier_gate inkling "inkling2 tier GGUF Q8_0 cap=$cap" $D GQ_EXACT=1 COLI_VK_IDOT=0 SNAP=ink2_gguf/gg -- $cap 0 ink2_gguf/ref.json
   done
   EVICT=1 tier_gate inkling "inkling2 tier, a budget of two experts" COLI_VK_TIER_GB=0.00003 SNAP=cont_g64 -- 8 0 $RG
+  # the CPU's pairs' reads held back (INK_FILL_DELAY_US): none may compute before its expert lands
+  EVICT=1 tier_gate inkling "inkling2 tier, eviction, reads held back" COLI_VK_TIER_GB=0.00003 INK_FILL_DELAY_US=3000 SNAP=cont_g64 -- 8 0 $RG
+  tier_gate inkling "inkling2 tier int4 g64 container cap=4, reads held back" INK_FILL_DELAY_US=3000 SNAP=cont_g64 -- 4 0 $RG
+  # Inkling-2's dense chain (inkling2_chain.h, its line "[VK] inkling2 chain: ..."): every layer
+  # on the device, the routed experts on the host; then prompts only, the state handed to the
+  # CPU's decode and back
+  for cap in 1 8; do
+    CHAINNAME=inkling2 chain_gate inkling "chain inkling2 f32 cap=$cap" 1 COLI_VK_DENSE=1 SNAP=tiny_inkling2 -- $cap 0 $R2
+    CHAINNAME=inkling2 chain_gate inkling "chain inkling2 int4 g64 container cap=$cap" 1 COLI_VK_DENSE=1 SNAP=cont_g64 -- $cap 0 $RG
+  done
+  CHAINMODE=2 CHAINNAME=inkling2 chain_gate inkling "chain inkling2 prompts only" 1 COLI_VK_DENSE=1 SNAP=tiny_inkling2 -- 8 0 $R2
 }
 
 family_inkling_olmoe() {
@@ -1811,10 +1825,10 @@ chain_gate() {  # <engine> <tag> <tol 0|1> <env...> -- <argv...>   (CPUENV: the 
   env "${envs[@]}" DUMP=vk.f32 COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=${CHAINMODE:-1} \
     ./"$eng" "$@" > vk.log 2>&1 || { [ $rc_cpu != 0 ] || { cat vk.log; fail "$tag: the chain misses the oracle the CPU passes"; }; }
   same_tokens cpu.log vk.log "$tag"
-  [ "$(chain_count "$eng" vk.log)" -gt 0 ] || { cat vk.log; fail "$tag: the chain never ran"; }
+  [ "$(chain_count "${CHAINNAME:-$eng}" vk.log)" -gt 0 ] || { cat vk.log; fail "$tag: the chain never ran"; }
   local lg=""
   if [ "$tol" = 1 ]; then lg=$(logits_close cpu.f32 vk.f32) || { echo "$lg"; fail "$tag: logits"; }; lg=", $lg"; fi
-  echo "OK $tag: tokens = CPU$lg, $(chain_count "$eng" vk.log) chain forwards"
+  echo "OK $tag: tokens = CPU$lg, $(chain_count "${CHAINNAME:-$eng}" vk.log) chain forwards"
 }
 
 # dmoe_gate <engine> <tag> all|some|rows|none <env...> -- <argv...>: chain_gate, and how many

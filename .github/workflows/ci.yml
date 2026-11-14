@@ -1802,6 +1802,22 @@ jobs:
           for cap in 1 8; do
             SNAP=cont_g64 ./inkling "$cap" 0 ref_g64/ref_inkling2.json
           done
+          # a round's reads on their thread (INK_FILL_ASYNC), held back: no pair computes its
+          # expert before the read lands. Caps 2 to 4 make rounds where an expert two rows of the
+          # prompt route to is missed for the first and found, still unread, for the second.
+          for cap in 2 3 4; do
+            INK_FILL_DELAY_US=3000 SNAP=cont_g64 ./inkling "$cap" 0 ref_g64/ref_inkling2.json
+          done
+      - name: Inkling-2's vision tower, token-exact with an image in the prompt
+        run: |
+          cd c
+          # A tiny random tower (axial rope, layer scale, the bilinear position table, the 2 x 2
+          # merger) and one 2 x 3-tile image among the prompt's tokens: the engine's features
+          # replace the placeholders' embeddings, and the generation must match transformers.
+          python3 tools/make_tiny_inkling2.py tiny_vis --vision
+          for cap in 1 8; do
+            SNAP=tiny_vis ./inkling "$cap" 0 tiny_vis/ref_inkling2.json
+          done
       - name: An Inkling-2 GGUF as unsloth's lay it out reads as the checkpoint it came from
         run: |
           cd c

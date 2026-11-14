@@ -1462,7 +1462,9 @@ FAMILIES = (
         # turno senza risposta (#1278). 16384 e' il valore che hanno gia' tutte
         # le famiglie con lo stesso contesto massimo di 1048576.
         limits=FamilyLimits(8192, 1048576, 1024, 16384, 16, 8, "CTX_MAX"),
-        capabilities=FamilyCapabilities(False, False, True, True),
+        # image: Inkling-2's pictures (expand_inkling2_images); the engine says CAPS vision=1
+        # only when it loaded the tower, and Inkling's handshake says nothing (text)
+        capabilities=FamilyCapabilities(False, False, True, True, image=True),
         has_gateway_adapter=True,
         tune_prompt_template="<|user|>{prompt}<|assistant|>",
     ),
