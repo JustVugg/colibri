@@ -1829,6 +1829,14 @@ f16 rows now issue four steps' loads before using the first, as its int8 rows do
 sums in the same order, the same bits): Inkling-2's 6144 x 4608 went from 223 to 188 us a
 decode row in the run, 147 to 142 us alone.
 
+The GEMVs run slower in a decode than alone because the card is idle between frames (most of
+the step is the host's experts and the disk) and the driver clocks it down: through a decode,
+38% of the samples found it in P8 (405 MHz memory, 180 MHz cores) and 19% in P0. lm_head
+(200058 x 4608 bf16) takes 4.45 ms alone, at 414 GB/s, and 7.4 to 12.3 ms there. With the
+clocks locked high (`nvidia-smi -lgc` / `-lmc`, root) the chain's device time went from 4.48 to
+2.98 s a run and lm_head to 4.45 ms, but the decode stayed within its noise (1.83 -> 1.85 and
+1.82 -> 1.83 tok/s): the disk sets the pace here.
+
 ### GLM-5.2 and GLM-5.3 Flash on the chain
 
 `glm_chain.h` (colibri) and `glm53_chain.h` (glm53) follow the recipe below with the

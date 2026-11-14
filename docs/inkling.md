@@ -157,7 +157,9 @@ On a GPU, the CUDA build (`CUDA=1`) or the Vulkan one (`VK=1`, `COLI_VULKAN=1`):
   device. With Vulkan the layers run as a dense chain there (`COLI_VK_CHAIN`, on by default on
   a discrete GPU, [vulkan.md](vulkan.md#inkling-2-on-the-chain)): the attention, the residual
   mixes and the convolutions on the device, one frame a layer, the routed experts on the host;
-  with CUDA, or `COLI_VK_CHAIN=0`, the matrices go a call at a time and the rest runs on the CPU.
+  with CUDA, or `COLI_VK_CHAIN=0`, the matrices go a call at a time and the rest runs on the CPU
+  (a CUDA build has the same chain with `COLI_CUDA_CHAIN=1`, off by default: it measured no
+  faster there, [cuda.md](cuda.md#inkling-2-on-cuda-inkling2_cuchainh)).
 - the RAM cache's pinned experts that the tier holds go back to its LRU after the warm start,
   so that RAM and VRAM hold different experts. The tier's host pool is off for Inkling-2
   (`COLI_VK_TIER_HOST=1` turns it on): the RAM it takes from the expert cache cost more than
@@ -191,9 +193,18 @@ GPU tiers and the reads above; it was not measured since. The host pool on
 (`COLI_VK_TIER_HOST=1`) gave CUDA 1.27-1.29 tok/s against 1.60-1.61 off, and Vulkan 1.33-1.41
 against 1.26-1.63, before the pieced reads.
 
-The CUDA build's CPU computes its share of the experts more slowly than the Vulkan build's (an
-`expert-mm` of 18.5-19.8 s against 13.9-14.4 s over the same experts, whichever CUDA sync policy
-the backend takes); that is where its decode trails, and it is not found yet.
+The CUDA build's CPU used to compute its share of the experts more slowly than the Vulkan build's
+(0.72-0.76 ms a pair against 0.52, the same experts, the reads first): a CUDA build of the engine
+left out the OpenMP tuning every other build takes (an active wait, a thread a core), because
+Inkling's 727 dense calls a token on the CUDA backend starved its driver with a spinning team. It
+was the binary, not the card: with `NOGPU=1` the same build took 0.72 ms a pair. A CUDA build now
+takes the tuning for Inkling-2 (the snapshot's `config.json` says so before the engine re-executes
+itself). The same session, 48 tokens on two prompts: 1.55-1.59 -> 1.91 tok/s, as the Vulkan build.
+
+Inkling keeps the exception, measured: Inkling-Small (sabrewing-engine's int4 container, 141 GB)
+with the CUDA build on the same machine, its dense matrices on the card, 48 tokens on two prompts,
+each setting twice in rotation, decoded at 1.33-1.37 tok/s with the tuning against 1.35-1.39
+without it and 1.36-1.39 with the binding alone. Its tiny oracle matches 24/24 either way.
 
 ### Inkling-2: pictures
 

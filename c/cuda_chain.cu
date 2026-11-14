@@ -3682,6 +3682,7 @@ static int cc_preload(void) {
 #include "cuda_dsv4c.cuh"   /* DeepSeek V4.1's layer ops */
 #include "cuda_glm53c.cuh"  /* GLM-5.3's layer ops */
 #include "cuda_k3c.cuh"     /* Kimi K3's residual mix and activation */
+#include "cuda_inkc.cuh"    /* Inkling's and Inkling-2's ops */
 #include "cuda_dflash.cuh"  /* DFlash2's drafter's convolution */
 static const ColiCudaChainOps g_cc_ops = {
     sizeof(ColiCudaChainOps),
@@ -3721,5 +3722,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_ares_mix, cc_situ,
     cc_dflash, cc_dfconv, cc_dftopk, cc_dftap,
     cc_wait_host_if,
+    cc_sconv, cc_relattn, cc_ink2_mix, cc_ink2_clip, cc_ink2_dconv,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }

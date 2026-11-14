@@ -1156,7 +1156,7 @@ backend_cuda.o: backend_cuda.cu backend_cuda.h cuda_bd.cuh cuda_chain.h fp8_form
 
 # The dense chain on a CUDA device (cuda_chain.h): the backend's twin of vk_chain.c,
 # built into the same backend (one table export, coli_cuda_chain_ops).
-cuda_chain.o: cuda_chain.cu cuda_chain.h cuda_dsv4c.cuh cuda_glm53c.cuh cuda_k3c.cuh cuda_dflash.cuh backend_cuda.h backend_gpu_compat.h .build-config
+cuda_chain.o: cuda_chain.cu cuda_chain.h cuda_dsv4c.cuh cuda_glm53c.cuh cuda_k3c.cuh cuda_inkc.cuh cuda_dflash.cuh backend_cuda.h backend_gpu_compat.h .build-config
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) -c cuda_chain.cu -o $@
 
@@ -1489,6 +1489,7 @@ cuda-chain-check: backend_cuda.o cuda_chain.o
 	$(MAKE) cuda-dsv4c-check
 	$(MAKE) cuda-glm53c-check
 	$(MAKE) cuda-k3c-check
+	$(MAKE) cuda-inkc-check
 # DeepSeek V4.1's layer ops on the CUDA chain (cuda_dsv4c.cuh) against the CPU's references.
 cuda-dsv4c-check: backend_cuda.o cuda_chain.o
 	$(CC) $(filter-out -MMD -MP -fopenmp,$(CFLAGS)) -c tests/cuda_dsv4c_ref.c -o tests/cuda_dsv4c_ref.o
@@ -1504,6 +1505,11 @@ cuda-glm53c-check: backend_cuda.o cuda_chain.o
 cuda-k3c-check: backend_cuda.o cuda_chain.o
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu cuda_chain.cu tests/test_cuda_k3c.cu -o cuda_k3c_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	./cuda_k3c_test$(EXE)
+
+# Inkling's and Inkling-2's ops on the CUDA chain (cuda_inkc.cuh) against the CPU's arithmetic.
+cuda-inkc-check: backend_cuda.o cuda_chain.o
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu cuda_chain.cu tests/test_cuda_inkc.cu -o cuda_inkc_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	./cuda_inkc_test$(EXE)
 
 # DFlash2's drafter's convolution on the CUDA chain (cuda_dflash.cuh) against the CPU's arithmetic.
 cuda-dflash-check: backend_cuda.o cuda_chain.o
@@ -1530,6 +1536,7 @@ gpu-compile: backend_cuda.o cuda_chain.o
 	$(CC) $(filter-out -MMD -MP -fopenmp,$(CFLAGS)) -ffp-contract=off -c tests/cuda_glm53c_ref.c -o tests/cuda_glm53c_ref.o
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu cuda_chain.cu tests/test_cuda_glm53c.cu $(if $(filter 1,$(HIP)),-x none) tests/cuda_glm53c_ref.o -o cuda_glm53c_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu cuda_chain.cu tests/test_cuda_k3c.cu -o cuda_k3c_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu cuda_chain.cu tests/test_cuda_inkc.cu -o cuda_inkc_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu cuda_chain.cu tests/test_cuda_dflash.cu -o cuda_dflash_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_ragged_attention.cu -o ragged_attention_test$(EXE) $(GPU_TEST_LIBS)

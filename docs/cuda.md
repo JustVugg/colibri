@@ -282,6 +282,27 @@ matrices apart.
 (`KV16=1`, `COLI_CUDA_CHAIN_ROWS=3`, `COLI_CUDA_CHAIN_QKV=0`, `COLI_CUDA_CHAIN_FAULT=n`): the
 reference's tokens and the last logits within 1e-5 of the CPU's.
 
+## Inkling-2 on CUDA (`inkling2_cuchain.h`)
+
+A CUDA build runs Inkling-2's dense matrices on the card a call at a time (its own small
+backend, `backend_cuda_ink.cu`) and the attention, the attention residuals and the short
+convolutions on the CPU. `COLI_CUDA_CHAIN=1` (`2`: prompts only) runs every layer on the card
+instead, the twin of the Vulkan chain ([vulkan.md](vulkan.md#inkling-2-on-the-chain)): one
+frame a layer on the chain's stream, the routed experts on the host (the CUDA tier's groups and
+the CPU's share), the K/V cache canonical on the host. Its ops are `cuda_inkc.cuh`'s: Inkling's
+short convolution, the attention with its relative-position bias, tau, window and sink, and
+Inkling-2's residual mix, L2 clips and dynamic convolution (`make CUDA=1 cuda-inkc-check` holds
+them to the CPU's arithmetic). The chain needs the backend's own tensors: at its first forward
+each bf16 matrix is read back once, freed and uploaded as a GGUF's BF16 rows (the same bytes);
+the per-matrix path then runs through those tensors where the chain declines a step.
+
+It is off by default because it measured no faster. On an RTX PRO 4000 with Inkling-2-Small int4
+g64 (62 GB of RAM, the experts from RAM and disk), 64 tokens on three prompts in the same session:
+1.24-1.27 tok/s with it against 1.26-1.29 without, the same text. The dense part of a run went
+from 4.7 to 3.4 s, but the routed experts and the reads took about as much back (the chain and
+the expert tier share the card), and the first prompt pays about 4.5 s to move the matrices. The
+tiny oracles match token for token with it, their logits within 1e-5 of the CPU's.
+
 ## The decision engines
 
 Laya (`laya.c`) and GLiNER2.5-Decide (`gliner_decide.c`) answer a decision with one forward

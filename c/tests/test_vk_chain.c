@@ -3268,6 +3268,8 @@ static void bench_gemv(void) {
     if (fe && *fe) { fmts[0] = atoi(fe); nf = 1; }
     for (int f = 0; f < nf; f++) for (int k = 0; k < nsh; k++) {
         int I = shapes[k][0], O = shapes[k][1], fmt = fmts[f], gs = fmt == 4 ? 64 : 0, nm = 24;
+        const char *ne = getenv("COLI_VK_BENCH_N");      /* matrices back to back (24): fewer for a big one */
+        if (ne && atoi(ne) > 0) nm = atoi(ne);
         size_t rb = fmt == 1 ? (size_t)I : fmt == 4 ? (size_t)I / 2 : fmt == 10 ? (size_t)I * 4 : (size_t)I * 2;
         ColiVkTensor **t = calloc(nm, sizeof *t);
         uint8_t *w = malloc(rb * O); float *sc = malloc((size_t)O * (I / 64 + 1) * sizeof(float));
