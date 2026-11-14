@@ -825,10 +825,12 @@ static void test_sconv(int C, int CK) {
  * ([T][KVH*hd]), r [S][H*dr], relp [dr][ext], tau [S]; the device sees the positions
  * before pos_base through a ring of cap rows (t % cap, the latest such t < pos_base)
  * and the step's own rows in a scratch, k at ks, v at vs, kvd floats a row. */
-static void test_relattn(int S, int pos_base, int window, int cap, int hd, int dr, int ext) {
-    int H = 4, KVH = 2, kvd = KVH * hd, T = pos_base + S, koff = 32, roff = 16, poff = 24, toff = 8;
+/* sink (Inkling-2): a logit per (row, head) after the tau rows, in the softmax's denominator only */
+static void test_relattn_s(int S, int pos_base, int window, int cap, int hd, int dr, int ext, int sink) {
+    int H = 4, KVH = 2, kvd = KVH * hd, T = pos_base + S, koff = 32, roff = 16, poff = 24, toff = 8, soff = toff + S + 3;
     float *q = fvec((size_t)S * H * hd, 1.f), *kt = fvec((size_t)T * kvd, 1.f), *vt = fvec((size_t)T * kvd, 1.f);
     float *r = fvec((size_t)S * H * dr, 0.5f), *relp = fvec((size_t)dr * ext, 0.5f), *tau = malloc(S * sizeof *tau);
+    float *snk = fvec((size_t)S * H, 3.f);
     for (int s = 0; s < S; s++) tau[s] = 1.f + (rnd() % 1000) / 2000.f;
     float scale = 1.f / (float)hd;
     float *ref = malloc((size_t)S * H * hd * sizeof *ref);
@@ -842,6 +844,9 @@ static void test_relattn(int S, int pos_base, int window, int cap, int hd, int d
             double b = 0; if (dist < ext) for (int k = 0; k < dr; k++) b += (double)r[((size_t)s * H + h) * dr + k] * relp[k * ext + dist];
             sc[j] = tau[s] * (a * scale + b); if (sc[j] > mx) mx = sc[j];
         }
+        double sk = snk[s * H + h];
+        if (sink && sk > mx) mx = sk;
+        if (sink) sum = exp(sk - mx);
         for (int j = 0; j < n; j++) { sc[j] = exp(sc[j] - mx); sum += sc[j]; }
         for (int d = 0; d < hd; d++) {
             double a = 0; for (int j = 0; j < n; j++) a += sc[j] / sum * vt[(size_t)(t0 + j) * kvd + kvh * hd + d];
@@ -860,18 +865,114 @@ static void test_relattn(int S, int pos_base, int window, int cap, int hd, int d
     float *scr = calloc(nsc, sizeof *scr);
     memcpy(scr + ks, kt + (size_t)pos_base * kvd, (size_t)S * kvd * sizeof(float));
     memcpy(scr + vs, vt + (size_t)pos_base * kvd, (size_t)S * kvd * sizeof(float));
-    float *rbuf = calloc(roff + (size_t)S * H * dr, sizeof *rbuf), *pbuf = calloc(poff + (size_t)dr * ext, sizeof *pbuf), *tbuf = calloc(toff + S, sizeof *tbuf);
+    size_t nt = (size_t)soff + (size_t)S * H;
+    float *rbuf = calloc(roff + (size_t)S * H * dr, sizeof *rbuf), *pbuf = calloc(poff + (size_t)dr * ext, sizeof *pbuf), *tbuf = calloc(nt, sizeof *tbuf);
     memcpy(rbuf + roff, r, (size_t)S * H * dr * sizeof(float)); memcpy(pbuf + poff, relp, (size_t)dr * ext * sizeof(float));
     memcpy(tbuf + toff, tau, S * sizeof(float));
+    memcpy(tbuf + soff, snk, (size_t)S * H * sizeof(float));
     VkcBuf *qb = up(q, (size_t)S * H * hd), *kb = up(kr, nr), *vb = up(vr, nr), *sb = up(scr, nsc), *rb = up(rbuf, roff + (size_t)S * H * dr);
-    VkcBuf *pb = up(pbuf, poff + (size_t)dr * ext), *tb = up(tbuf, toff + S), *ob = vkc_buf((size_t)S * H * hd * 4, VKC_DOWN);
+    VkcBuf *pb = up(pbuf, poff + (size_t)dr * ext), *tb = up(tbuf, nt), *ob = vkc_buf((size_t)S * H * hd * 4, VKC_DOWN);
     VkcRelAttn p = {S, H, KVH, hd, pos_base, cap, window, ext, dr, 0, H * hd, 0, H * hd, koff, koff, (int)ks, (int)vs, kvd,
-                    roff, H * dr, poff, toff, scale};
+                    roff, H * dr, poff, toff, scale, sink, sink ? soff : 0};
     vkc_begin(); int ok = vkc_relattn(qb, kb, vb, ob, sb, rb, pb, tb, &p); vkc_submit(1);
     double e = relerr((float *)vkc_ptr(ob), ref, (size_t)S * H * hd, 1e-3);
-    CHECK(ok && e < 2e-5, "relattn S %d pos %d window %d cap %d hd %d d_rel %d ext %d: err %.2e", S, pos_base, window, cap, hd, dr, ext, e);
+    CHECK(ok && e < 2e-5, "relattn S %d pos %d window %d cap %d hd %d d_rel %d ext %d sink %d: err %.2e", S, pos_base, window, cap, hd, dr, ext, sink, e);
     vkc_free(qb); vkc_free(kb); vkc_free(vb); vkc_free(sb); vkc_free(rb); vkc_free(pb); vkc_free(tb); vkc_free(ob);
-    free(q); free(kt); free(vt); free(r); free(relp); free(tau); free(ref); free(kr); free(vr); free(scr); free(rbuf); free(pbuf); free(tbuf);
+    free(q); free(kt); free(vt); free(r); free(relp); free(tau); free(snk); free(ref); free(kr); free(vr); free(scr); free(rbuf); free(pbuf); free(tbuf);
+}
+static void test_relattn(int S, int pos_base, int window, int cap, int hd, int dr, int ext) {
+    test_relattn_s(S, pos_base, window, cap, hd, dr, ext, 0);
+}
+/* Inkling-2's residual mix (inkling2.h's ink2_attn_res): nb block states and the stream, each
+ * RMS-normalised without a weight, mixed by softmax((q . n_e) / sqrt(D)) */
+static void test_ink2_mix(int S, int D, int nb) {
+    int bro = (nb + 2) * D, xo = 5, bo = 7, wo = 3, yo = 2;
+    float *x = fvec((size_t)xo + (size_t)S * D, 2.f), *blk = fvec((size_t)bo + (size_t)S * bro, 2.f), *q = fvec((size_t)wo + D, 1.f);
+    float *ref = malloc((size_t)S * D * sizeof *ref), eps = 1e-6f, scale = 1.f / sqrtf((float)D);
+    for (int s = 0; s < S; s++) {
+        double w[16], r[16], mx = -1e300, sum = 0;
+        for (int e = 0; e <= nb; e++) {
+            const float *v = e < nb ? blk + bo + (size_t)s * bro + (size_t)e * D : x + xo + (size_t)s * D;
+            double ms = 0, dt = 0;
+            for (int d = 0; d < D; d++) { ms += (double)v[d] * v[d]; dt += (double)v[d] * q[wo + d]; }
+            r[e] = 1.0 / sqrt(ms / D + eps); w[e] = dt * r[e] * scale; if (w[e] > mx) mx = w[e];
+        }
+        for (int e = 0; e <= nb; e++) { w[e] = exp(w[e] - mx); sum += w[e]; }
+        for (int d = 0; d < D; d++) {
+            double a = 0;
+            for (int e = 0; e <= nb; e++) {
+                const float *v = e < nb ? blk + bo + (size_t)s * bro + (size_t)e * D : x + xo + (size_t)s * D;
+                a += w[e] / sum * v[d] * r[e];
+            }
+            ref[(size_t)s * D + d] = (float)a;
+        }
+    }
+    VkcBuf *xb = up(x, (size_t)xo + (size_t)S * D), *bb = up(blk, (size_t)bo + (size_t)S * bro), *wb = up(q, (size_t)wo + D);
+    VkcBuf *yb = vkc_buf(((size_t)yo + (size_t)S * D) * 4, VKC_DOWN);
+    VkcInk2Mix p = {S, D, nb, xo, D, bo, bro, wo, yo, D, eps, scale};
+    vkc_begin(); int ok = vkc_ink2_mix(xb, bb, wb, yb, &p); vkc_submit(1);
+    double e = relerr((float *)vkc_ptr(yb) + yo, ref, (size_t)S * D, 1e-3);
+    CHECK(ok && e < 2e-5, "ink2 mix S %d D %d nb %d: err %.2e", S, D, nb, e);
+    vkc_free(xb); vkc_free(bb); vkc_free(wb); vkc_free(yb); free(x); free(blk); free(q); free(ref);
+}
+/* Inkling-2's L2 clips (ink2_l2clip): per segment, times a learned scale, then down to thr */
+static void test_ink2_clip(int rows, int per_row, int n, int has_w, float thr) {
+    int xo = 4, row = per_row * n + 3, wo = 6, nseg = rows * per_row;
+    float *x = fvec((size_t)xo + (size_t)rows * row, 3.f), *w = fvec((size_t)wo + (size_t)per_row * n, 2.f);
+    float *ref = malloc(((size_t)xo + (size_t)rows * row) * sizeof *ref);
+    memcpy(ref, x, ((size_t)xo + (size_t)rows * row) * sizeof *ref);
+    for (int g = 0; g < nseg; g++) {
+        float *v = ref + xo + (size_t)(g / per_row) * row + (size_t)(g % per_row) * n;
+        if (has_w) for (int i = 0; i < n; i++) v[i] *= w[wo + (g % per_row) * n + i];
+        double ss = 0; for (int i = 0; i < n; i++) ss += (double)v[i] * v[i];
+        float f = thr / ((float)sqrt(ss) + 1e-6f);
+        if (f < 1.f) for (int i = 0; i < n; i++) v[i] *= f;
+    }
+    VkcBuf *xb = up(x, (size_t)xo + (size_t)rows * row), *wb = up(w, (size_t)wo + (size_t)per_row * n);
+    VkcInk2Clip p = {nseg, n, per_row, xo, row, has_w, wo, thr};
+    vkc_begin(); int ok = vkc_ink2_clip(xb, has_w ? wb : NULL, &p); vkc_submit(1);
+    float *y = down(xb, 0, (size_t)xo + (size_t)rows * row);
+    double e = relerr(y, ref, (size_t)xo + (size_t)rows * row, 1e-3);
+    CHECK(ok && e < 2e-6, "ink2 clip rows %d x %d of %d, scale %d, thr %g: err %.2e", rows, per_row, n, has_w, thr, e);
+    vkc_free(xb); vkc_free(wb); free(x); free(w); free(ref); free(y);
+}
+/* a global layer's dynamic short convolution (ink2_dsconv_rows) over two steps, its state carried */
+static void test_ink2_dconv(int KV, int hd, int K, int S1, int S2) {
+    int C = KV * hd, P = K - 1, S = S1 + S2, xo = 3, dro = KV * K + 2, wo = 5, ro = 4;
+    float *x = fvec((size_t)xo + (size_t)S * C, 1.f), *dyn = fvec((size_t)S * dro, 0.5f), *st = fvec((size_t)wo + (size_t)K * C, 0.5f);
+    float *ring0 = fvec((size_t)ro + (size_t)C * P, 1.f), *ref = malloc((size_t)S * C * sizeof *ref);
+    float fc = sqrtf((float)(2 * K + 1));
+    for (int c = 0; c < C; c++) {
+        int h = c / hd;
+        float *col = malloc((size_t)(P + S) * sizeof *col);
+        for (int j = 0; j < P; j++) col[j] = ring0[ro + c * P + j];
+        for (int t = 0; t < S; t++) col[P + t] = x[xo + (size_t)t * C + c];
+        for (int t = 0; t < S; t++) {
+            float acc = 0.f;
+            for (int lag = 0; lag < K; lag++) acc += col[P + t - lag] * (st[wo + lag * C + c] + dyn[(size_t)t * dro + h * K + lag]);
+            ref[(size_t)t * C + c] = (acc + col[P + t]) / fc;
+        }
+        free(col);
+    }
+    VkcBuf *xb = up(x, (size_t)xo + (size_t)S * C), *db = up(dyn, (size_t)S * dro), *wb = up(st, (size_t)wo + (size_t)K * C);
+    VkcBuf *rb = up(ring0, (size_t)ro + (size_t)C * P);
+    VkcInk2Dconv p1 = {S1, C, K, hd, xo, C, 0, dro, wo, ro, fc}, p2 = {S2, C, K, hd, xo + S1 * C, C, S1 * dro, dro, wo, ro, fc};
+    vkc_begin(); int ok = vkc_ink2_dconv(xb, db, wb, rb, &p1); vkc_submit(1);
+    vkc_begin(); ok = ok && vkc_ink2_dconv(xb, db, wb, rb, &p2); vkc_submit(1);
+    float *y = down(xb, xo, (size_t)S * C);
+    double e = relerr(y, ref, (size_t)S * C, 1e-3);
+    CHECK(ok && e < 2e-6, "ink2 dconv %d heads of %d, %d taps, rows %d + %d: err %.2e", KV, hd, K, S1, S2, e);
+    vkc_free(xb); vkc_free(db); vkc_free(wb); vkc_free(rb); free(x); free(dyn); free(st); free(ring0); free(ref); free(y);
+}
+static void test_inkling2(void) {
+    if (!vkc_ink2_ready()) { printf("skip: chain_ink2.spv\n"); return; }
+    test_relattn_s(1, 0, 0, 64, 16, 4, 32, 1);          /* the first position: the sink and one key */
+    test_relattn_s(1, 40, 16, 16, 32, 4, 16, 1);        /* decode over a wrapped ring */
+    test_relattn_s(130, 3, 0, 200, 24, 4, 200, 1);      /* two tiles, and sliced rows keep their sinks */
+    test_relattn_s(3, 513, 512, 512, 128, 16, 512, 1);  /* Inkling-2-Small's window, hd 128 */
+    test_ink2_mix(1, 64, 0); test_ink2_mix(3, 4608, 8); test_ink2_mix(2, 300, 15);
+    test_ink2_clip(3, 4, 128, 1, 2.f); test_ink2_clip(2, 2, 16, 0, 0.5f); test_ink2_clip(1, 48, 300, 1, 22.6f);
+    test_ink2_dconv(2, 16, 4, 3, 1); test_ink2_dconv(8, 128, 4, 1, 1); test_ink2_dconv(1, 8, 9, 5, 4); test_ink2_dconv(3, 4, 1, 2, 2);
 }
 /* the shared experts joining the routed sum: y = routed; y += w_j[r] * sh_j[r] in order */
 static void test_weighted_add(void) {
@@ -4808,9 +4909,11 @@ int main(int argc, char **argv) {
     rng = rng_routed;
     if (vkc_sconv_ready() && vkc_relattn_ready()) {
         test_inkling();
+        test_inkling2();
         VkcStats s0; vkc_stats(&s0);
         setenv("COLI_VK_ATTN_SLICE", "30000", 1);   /* the relative attention over slices of rows */
         test_relattn(20, 30, 16, 16, 16, 4, 16); test_relattn(130, 3, 0, 200, 24, 4, 200); test_relattn(40, 10, 0, 64, 32, 16, 64);
+        test_relattn_s(130, 3, 0, 200, 24, 4, 200, 1);   /* Inkling-2's sinks follow their rows over the slices */
         unsetenv("COLI_VK_ATTN_SLICE");
         VkcStats s1; vkc_stats(&s1);
         CHECK(s1.attn_slices > s0.attn_slices, "relattn: no slice");
