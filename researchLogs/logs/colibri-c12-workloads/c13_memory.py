@@ -20,7 +20,7 @@ import sys
 import time
 import urllib.request
 
-sys.path.insert(0, "/Users/creemac/colibri/colibri/logs/logs/colibri-c12-workloads")
+sys.path.insert(0, "/Users/creemac/colibri/colibri/researchLogs/logs/colibri-c12-workloads")
 import c13_matrix as M   # FILLER, PAD, SIZES, make_q, messages (no side effects)
 
 BASE = M.BASE

@@ -6,7 +6,7 @@
 # Resumable: each run is self-contained; re-running redoes all four, tee
 # overwrites the per-run result files.
 set -u
-cd /Users/creemac/colibri/colibri/logs/logs/colibri-c12-workloads
+cd /Users/creemac/colibri/colibri/researchLogs/logs/colibri-c12-workloads
 KEY='-4Jc6egKcHmI-1okTj4_MUWOU4etmppT8LLG-wxzUBk'
 MODEL=/Users/creemac/.lmstudio/models/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-IQ2_XXS.colibri
 
