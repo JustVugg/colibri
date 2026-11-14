@@ -1552,7 +1552,11 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
      * mixes and convolutions run on the CPU: the Vulkan dense chain computes Inkling's layers
      * (ink_vk_init_model keeps it off), and the Metal expert path Inkling's SwiGLU. */
     if (m->c.v2 && !getenv("NOGPU")) {
-        setenv("COLI_METAL", "0", 1);
+        /* Metal: the int4 g64 container's routed experts on the Apple GPU (fmt 9 and
+         * Inkling-2's SwiGLU in backend_metal.mm), asked for with INK2_METAL=1 beside
+         * COLI_METAL=1: not measured on a Mac yet, so off unless asked */
+        const char *im = getenv("INK2_METAL");
+        if (!(im && *im == '1')) setenv("COLI_METAL", "0", 1);
 #if !defined(COLI_CUDA) && !defined(COLI_VULKAN)
         fprintf(stderr, "[inkling2] Inkling-2 runs on the CPU in this build\n");
         setenv("NOGPU", "1", 1);
@@ -3266,8 +3270,13 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out, c
                 for (int j = 0; j < nb; j++) {
                     Slot *e = mslot[j];
                     mgp[j] = e->p13; mup[j] = e->p13 + (int64_t)I*m->rb13; mdp[j] = e->p2;
-                    mgs[j] = e->s13; mus[j] = e->s13 + I; mds[j] = e->s2;
+                    /* int4 g64: the up rows' scales after the gate's I x D/64 */
+                    mgs[j] = e->s13; mus[j] = e->s13 + (m->xg64 ? (int64_t)I * (D / XF_BLOCK) : I); mds[j] = e->s2;
                 }
+                /* Inkling: int4 (2) or int8 (1) rows and SwiGLU; Inkling-2: int4 g64 planar (9)
+                 * and its softcapped SwiGLU (act 2) */
+                const int mfmt = m->xg64 ? 9 : q4 ? 2 : 1, mact = c->v2 ? 2 : 0;
+                const float ma0 = c->v2 ? c->gate_cap : 0.f, ma1 = c->v2 ? c->up_cap : 0.f;
                 /* Last round: submit async and run the shared experts on the
                  * CPU while the GPU computes the routed ones — they are
                  * independent (both read x, both accumulate into out, and the
@@ -3275,8 +3284,8 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out, c
                  * On a GPU fault _end returns 0 and the CPU loop below redoes
                  * the round; shared_done stays set either way. */
                 if (base + round_cap >= npair && !sh_h) {
-                    ColiMetalMoeHandle *h = coli_metal_moe_block_begin(
-                        nb, D, I, q4 ? 2 : 1, 0, mgp, mup, mdp, mgs, mus, mds,
+                    ColiMetalMoeHandle *h = coli_metal_moe_block_begin_act(
+                        nb, D, I, mfmt, 0, mact, ma0, ma1, mgp, mup, mdp, mgs, mus, mds,
                         mxg, mxoff, mnr, mrows, mrw);
                     if (h) {
                         double ts = now_s();
@@ -3290,8 +3299,8 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out, c
                         te = now_s();                      /* fault: CPU redo below */
                     }
                 }
-                if (coli_metal_moe_block(nb, D, I, q4 ? 2 : 1, 0, mgp, mup, mdp, mgs, mus, mds,
-                                         mxg, mxoff, mnr, mrows, mrw, out, S)) {
+                if (coli_metal_moe_block_act(nb, D, I, mfmt, 0, mact, ma0, ma1, mgp, mup, mdp, mgs, mus, mds,
+                                             mxg, mxoff, mnr, mrows, mrw, out)) {
                     m->t_expert += now_s() - te;
                     continue;                              /* round done on the GPU */
                 }

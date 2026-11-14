@@ -165,7 +165,13 @@ On a GPU, the CUDA build (`CUDA=1`) or the Vulkan one (`VK=1`, `COLI_VULKAN=1`):
   (`COLI_VK_TIER_HOST=1` turns it on): the RAM it takes from the expert cache cost more than
   the device gained (numbers below).
 - a build with both backends runs Inkling-2 on Vulkan, as it runs Inkling (`COLI_VULKAN=0`
-  keeps CUDA): measured ahead below. Metal leaves Inkling-2 on the CPU.
+  keeps CUDA): measured ahead below.
+- on a Mac, `INK2_METAL=1` beside `COLI_METAL=1` sends the int4 g64 container's routed experts
+  to the Apple GPU in batched blocks, as Inkling's go (`backend_metal.mm`: the planar rows as
+  format 9 and Inkling-2's softcapped SwiGLU); the rest runs on the CPU. It has not run on a
+  Mac yet: CI compiles it, and the format's loop transcribed to C matches `xf_dot_f32_ref`
+  within 1e-5, but no Metal device here executes it. So it stays off unless asked, and a
+  GGUF's experts stay on the CPU.
 
 Measured on an RTX PRO 4000 Blackwell (24 GB), an i5-13500 (the engine's six P-cores) and
 62 GB of RAM, the container on two NVMe in RAID0: `--chat`, a prompt of 26-27 tokens and 64
