@@ -63,7 +63,7 @@ def main():
             ("user", tag + FILLER.format(i=1) + PAD * 52 +
              " Question: in module 1, which component flushes the snapshot, and when?")]
     for turn in range(1, 5):
-        row, text = send(hist, f"{LABEL}_t{turn}")
+        row, text = send(M.messages(*hist), f"{LABEL}_t{turn}")
         if turn < 4:
             hist = hist + [("assistant", text),
                            ("user", tag + FILLER.format(i=turn + 1) + PAD * 6 +
