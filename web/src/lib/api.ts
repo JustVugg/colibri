@@ -20,6 +20,7 @@ export interface ChatMessage {
      the message so it travels with the transcript through slot switches and
      archives; never sent to the server. */
   finish?: string
+  usage?: TokenUsage
   /* Both turns of a text-to-image exchange, the prompt and its picture, carry
      mode "image". They stay in the conversation on screen but are never sent to
      a text model, which would read a question followed by an empty answer. */
@@ -104,6 +105,9 @@ export interface TokenUsage {
   prompt_tokens: number
   completion_tokens: number
   total_tokens: number
+  prompt_tokens_details?: {
+    cached_tokens?: number
+  }
 }
 
 /* The server ran the turn on a summary of the conversation's first messages, which
