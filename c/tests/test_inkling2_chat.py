@@ -248,6 +248,37 @@ class Inkling2ReplyTest(unittest.TestCase):
             gw.CHAT_FLAVOR = saved
 
 
+class InklingCompletionTextTest(unittest.TestCase):
+    """/v1/completions: every part's text in its order, only the markers dropped, also when a
+    marker is split across chunks."""
+
+    def strip(self, reply, pieces, marker):
+        out = []
+        strip = gw.InklingMarkerStrip(out.append, marker)
+        for k in range(0, len(reply), pieces):
+            strip.feed(reply[k:k + pieces])
+        strip.close()
+        return "".join(out)
+
+    def test_inkling2_keeps_the_reasoning_and_the_call(self):
+        want = 'I should look it up.get_weather{"name":"get_weather","args":{"city":"Rome"}}'
+        for pieces in (1, 3, 7, len(REPLY)):
+            self.assertEqual(self.strip(REPLY, pieces, gw._INK2_TOKEN), want)
+        saved = gw.CHAT_FLAVOR
+        try:
+            gw.CHAT_FLAVOR = "inkling2"
+            self.assertEqual(gw.ink_completion_text(REPLY), want)
+            self.assertEqual(gw.ink_completion_text("a < b <|x and <|end_message|>"), "a < b <|x and ")
+        finally:
+            gw.CHAT_FLAVOR = saved
+
+    def test_inkling_keeps_the_reasoning(self):
+        reply = "<|content_thinking|>Paris, surely.<|content_text|>The capital is Paris.<|end_message|><|audio|>"
+        for pieces in (1, 4, len(reply)):   # <|audio|> is not one of Inkling's markers: kept
+            self.assertEqual(self.strip(reply, pieces, gw._INK_MARKER),
+                             "Paris, surely.The capital is Paris.<|audio|>")
+
+
 try:
     import numpy as np
     from PIL import Image
