@@ -1173,6 +1173,8 @@ def _parse_arch_tool_calls(reply, tools, tool_reply, track_spans):
         return parse_muse_tool_calls(reply, tools) + (None, None)
     if chat_flavor() == "mistral_large4":
         return parse_mistral_tool_calls(reply, tools) + (None, None)
+    if ARCH == "inkling" and chat_flavor() == "inkling2":
+        return parse_inkling2_tool_calls(reply, tools) + (None, None)
     if ARCH == "mimo":
         return _parse_mimo_tool_calls(reply, tools, track_spans)
     return _parse_tool_calls(reply, tools, track_spans)
@@ -1192,6 +1194,8 @@ def _tool_stream_markers():
         return (MUSE_ATEM_OPEN,)
     if chat_flavor() == "mistral_large4":
         return (ML4_CALLS,)
+    if ARCH == "inkling" and chat_flavor() == "inkling2":
+        return (INK2_CALL_OPEN,)
     return (BOX_START,)
 
 
@@ -1349,6 +1353,148 @@ def strip_inkling_markers(text):
         _, _, after = rest.partition(INK_TEXT)
         text = pre + after
     return _INK_MARKER.sub("", text)
+
+
+# ---- Inkling-2's turns (chat_template.jinja) ---------------------------------------------
+# Every part of a model turn is a message of its own: <|message_model|>[name]<|content_KIND|>
+# ... <|end_message|>, the turn closed by <|content_model_end_sampling|>. Its reasoning is a
+# content_thinking part, its answer content_text, and a tool call a content_invoke_tool_json
+# part, {"name": ..., "args": {...}}, under the tool's name. Inkling2StreamSplit hands the
+# answer and the reasoning to their callbacks; a call, when the request declared tools, goes
+# to the content stream as INK2_CALL_OPEN + its JSON + INK2_CALL_CLOSE, which no marker strip
+# touches, and parse_inkling2_tool_calls reads it back from there (without tools it is
+# dropped). A header's name (the text between <|message_...|> and the part's kind) is never
+# content.
+INK2_CALL_OPEN, INK2_CALL_CLOSE = "", ""
+_INK2_TOKEN = _re.compile(r"<\|[a-z_0-9]+\|>")
+_INK2_PREFIX = _re.compile(r"<(?:\|[a-z_0-9]*\|?)?\Z")
+
+
+class Inkling2StreamSplit:
+    def __init__(self, on_content, on_reasoning=None, on_reasoning_end=None, keep_calls=False):
+        self.on_content = on_content
+        self.on_reasoning = on_reasoning
+        self.on_reasoning_end = on_reasoning_end
+        self.keep_calls = keep_calls
+        self.mode = "content"   # content | reasoning | call | idle (a header, between parts)
+        self.buf = ""
+
+    def feed(self, piece):
+        self.buf += piece
+        while True:
+            m = _INK2_TOKEN.search(self.buf)
+            if not m:
+                cut = self.buf.rfind("<")
+                if cut >= 0 and _INK2_PREFIX.match(self.buf, cut):   # a marker split across chunks
+                    self._emit(self.buf[:cut])
+                    self.buf = self.buf[cut:]
+                else:
+                    self._emit(self.buf)
+                    self.buf = ""
+                return
+            self._emit(self.buf[:m.start()])
+            self._marker(m.group(0))
+            self.buf = self.buf[m.end():]
+
+    def _marker(self, tok):
+        if tok == "<|content_thinking|>":
+            self._end_part()
+            self.mode = "reasoning"
+        elif tok == "<|content_text|>":
+            self._end_part()
+            self.mode = "content"
+        elif tok == "<|content_invoke_tool_json|>":
+            self._end_part()
+            self.mode = "call"
+            if self.keep_calls:
+                self.on_content(INK2_CALL_OPEN)
+        elif tok in ("<|end_message|>", "<|content_model_end_sampling|>") or tok.startswith("<|message_"):
+            self._end_part()
+            self.mode = "idle"
+        # any other marker (an unused token, a kind it has no use for): dropped, the part kept
+
+    def _end_part(self):
+        if self.mode == "reasoning" and self.on_reasoning_end:
+            self.on_reasoning_end()
+        elif self.mode == "call" and self.keep_calls:
+            self.on_content(INK2_CALL_CLOSE)
+
+    def _emit(self, text):
+        if not text:
+            return
+        if self.mode == "content":
+            self.on_content(text)
+        elif self.mode == "reasoning":
+            if self.on_reasoning:
+                self.on_reasoning(text)
+        elif self.mode == "call" and self.keep_calls:
+            self.on_content(text)
+
+    def close(self):
+        """The end of the reply: a held tail that never became a marker is text, and an open
+        part closes (a call cut short by the token budget still closes, unparsable)."""
+        tail, self.buf = self.buf, ""
+        self._emit(tail)
+        self._end_part()
+        self.mode = "idle"
+
+    finish = close
+
+
+def split_inkling2(text, keep_calls=False):
+    """Inkling2StreamSplit over a whole reply: (content, reasoning)."""
+    out, why = [], []
+    split = Inkling2StreamSplit(out.append, why.append, keep_calls=keep_calls)
+    split.feed(text or "")
+    split.close()
+    return "".join(out), "".join(why)
+
+
+def parse_inkling2_tool_calls(reply, tools=None):
+    """The calls Inkling2StreamSplit left in the content as INK2_CALL_OPEN + JSON +
+    INK2_CALL_CLOSE back into OpenAI tool_calls; the rest is the content. A call whose JSON
+    does not parse (cut short by the token budget), whose args are not an object, or whose
+    name the request did not declare is dropped: its raw JSON never reaches the content."""
+    reply = reply or ""
+    names = {_tool_function(t).get("name") for t in (tools or [])}
+    calls, content, pos = [], [], 0
+    while True:
+        i = reply.find(INK2_CALL_OPEN, pos)
+        if i < 0:
+            content.append(reply[pos:])
+            break
+        content.append(reply[pos:i])
+        j = reply.find(INK2_CALL_CLOSE, i + 1)
+        body = reply[i + 1:j if j >= 0 else len(reply)]
+        pos = j + 1 if j >= 0 else len(reply)
+        try:
+            obj = json.loads(body)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict) or not isinstance(obj.get("name"), str):
+            continue
+        args = obj.get("args", {})
+        if not isinstance(args, dict) or (tools and obj["name"] not in names):
+            continue
+        calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
+                      "function": {"name": obj["name"], "arguments": json.dumps(args, ensure_ascii=False)}})
+    text = "".join(content).replace(INK2_CALL_OPEN, "").replace(INK2_CALL_CLOSE, "")
+    return text.strip(), calls
+
+
+def ink_split(text, tools=None):
+    """Inkling's (content, reasoning) split for the checkpoint's flavor: Inkling-2's keeps a
+    declared tool's calls for parse_inkling2_tool_calls."""
+    if chat_flavor() == "inkling2":
+        return split_inkling2(text, keep_calls=bool(tools))
+    return split_inkling(text)
+
+
+def ink_stream_split(on_content, on_reasoning=None, on_reasoning_end=None, tools=None):
+    """The streaming twin of ink_split."""
+    if chat_flavor() == "inkling2":
+        return Inkling2StreamSplit(on_content, on_reasoning, on_reasoning_end, keep_calls=bool(tools))
+    return InklingStreamSplit(on_content, on_reasoning, on_reasoning_end)
 
 
 def split_inkling(text):
@@ -3631,13 +3777,32 @@ def render_chat_inkling2(messages, enable_thinking=False, reasoning_effort=None,
     <|content_model_end_sampling|>. With thinking off the prompt opens the model's text block,
     the state every turn without reasoning was trained on, so that a first sampled
     <|content_thinking|> cannot spend the budget before the answer (render_chat_inkling's
-    reason). add_generation_prompt=False continues a trailing assistant turn: rendered open,
-    without its <|end_message|> and <|content_model_end_sampling|>."""
+    reason). Not with tools declared: a call is a part of its own, and a turn opened as text
+    never called one (Inkling-2-Small, a question that needs the tool); an empty reasoning part
+    before it gave nothing at all. With tools the model opens its turn as the template leaves
+    it to, and may reason a little first. add_generation_prompt=False continues a trailing
+    assistant turn: rendered open, without its <|end_message|> and
+    <|content_model_end_sampling|>.
+
+    Tools as the template declares them: one system message `tool_declare` with the specs as
+    sorted, compact JSON before every other message; an assistant's tool call a model message
+    under the tool's name, <|content_invoke_tool_json|>{"name":...,"args":{...}} (the args'
+    keys sorted, OpenAI's JSON string parsed back to the object the template wants); a tool's
+    result under the name of the call it answers. tool_choice: "none" offers no tools, a named
+    function only that one, and "required" or a name adds TOOL_CHOICE_REQUIRED_INSTRUCTION as a
+    system message after the declaration (a prompt-level instruction: sampling is free)."""
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
-    if tools or (tool_choice not in (None, "none")):
-        raise APIError(400, "Tool use is not wired up for the Inkling engine yet.",
-                       "tools", "unsupported_parameter")
+    forced = _tool_choice_name(tool_choice) if isinstance(tool_choice, dict) else None
+    if tool_choice == "none":
+        tools = None
+    elif forced:
+        tools = [t for t in (tools or []) if _tool_function(t).get("name") == forced]
+        if not tools:
+            raise APIError(400, f"`tool_choice` names {forced!r}, which `tools` does not declare.",
+                           "tool_choice")
+    elif tool_choice == "required" and not tools:
+        raise APIError(400, "`tool_choice` is \"required\" but no `tools` were given.", "tool_choice")
     role_token = {"user": "<|message_user|>", "system": "<|message_system|>",
                   "developer": "<|message_system|>", "assistant": "<|message_model|>",
                   "tool": "<|message_tool|>"}
@@ -3650,6 +3815,27 @@ def render_chat_inkling2(messages, enable_thinking=False, reasoning_effort=None,
     effort_str = ("<|message_system|><|content_text|>Thinking effort level: "
                   f"{0 if eff == 0.0 else eff}<|end_message|>")
     prompt = []
+    if tools:
+        specs = []
+        for index, tool in enumerate(tools):
+            fn = _tool_function(tool)
+            if not isinstance(fn.get("name"), str) or not fn["name"]:
+                raise APIError(400, "Each tool needs a function name.", f"tools.{index}")
+            specs.append({"description": fn.get("description") or "", "name": fn["name"],
+                          "parameters": fn.get("parameters") or {},
+                          "type": (tool.get("type") if isinstance(tool, dict) else None) or "function"})
+        prompt.append("<|message_system|>tool_declare<|content_xml|>"
+                      + json.dumps(specs, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+                      + "<|end_message|>")
+        if tool_choice == "required" or forced:
+            prompt.append("<|message_system|><|content_text|>"
+                          + TOOL_CHOICE_REQUIRED_INSTRUCTION.strip() + "<|end_message|>")
+    call_names = {}   # tool_call_id -> the function it called, for a tool message without a name
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            for tc in message.get("tool_calls") or []:
+                if isinstance(tc, dict) and isinstance(tc.get("function"), dict) and tc.get("id"):
+                    call_names[tc["id"]] = tc["function"].get("name")
     effort_emitted = False
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
@@ -3662,8 +3848,13 @@ def render_chat_inkling2(messages, enable_thinking=False, reasoning_effort=None,
             effort_emitted = True
         rtok = role_token[role]
         name = message.get("name")
+        if role == "tool" and not (isinstance(name, str) and name):
+            name = call_names.get(message.get("tool_call_id"))
         if role in ("assistant", "tool") and isinstance(name, str) and name:
             rtok += name
+        tool_calls = message.get("tool_calls") if role == "assistant" else None
+        if tool_calls is not None and not isinstance(tool_calls, list):
+            raise APIError(400, "`tool_calls` must be an array.", f"messages.{index}.tool_calls")
         open_turn = (not add_generation_prompt and role == "assistant"
                      and index == len(messages) - 1)
         reasoning = message.get("reasoning_content") if role == "assistant" else None
@@ -3673,25 +3864,56 @@ def render_chat_inkling2(messages, enable_thinking=False, reasoning_effort=None,
         if reasoning:
             prompt.append(f"{rtok}<|content_thinking|>{reasoning}<|end_message|>")
         raw = message.get("content")
-        if isinstance(raw, list):   # one block per text part, as the template renders a list
-            texts = [content_text([part], f"messages.{index}.content")
-                     if isinstance(part, dict) else content_text(part, f"messages.{index}.content")
-                     for part in raw]
+        if isinstance(raw, list):   # one block per part, as the template renders a list
+            texts = []
+            for part in raw:
+                if isinstance(part, dict) and part.get("type") == "inkling2_image":   # expand_inkling2_images
+                    texts.append((part["tokens"],))
+                elif isinstance(part, dict) and part.get("type") in ("image_url", "input_image"):
+                    raise APIError(400, "this engine loaded no vision tower: images cannot be served.",
+                                   f"messages.{index}.content", "unsupported_content_type")
+                else:
+                    texts.append(content_text([part], f"messages.{index}.content") if isinstance(part, dict)
+                                 else content_text(part, f"messages.{index}.content"))
         elif raw is None:            # no content: no block
             texts = []
         else:
             text = content_text(raw, f"messages.{index}.content")
-            texts = [text] if (text or not reasoning) else []
-        if open_turn and not texts:
+            texts = [text] if (text or not (reasoning or tool_calls)) else []
+        if open_turn and not texts and not tool_calls:
             texts = [""]
         for k, text in enumerate(texts):
-            last = open_turn and k == len(texts) - 1
+            if isinstance(text, tuple):   # a picture: its tiles' placeholders
+                prompt.append(f"{rtok}<|content_image|>" + INK2_IMAGE * text[0] + "<|end_message|>")
+                continue
+            last = open_turn and not tool_calls and k == len(texts) - 1
             prompt.append(f"{rtok}<|content_text|>{text}" + ("" if last else "<|end_message|>"))
+        for k, tc in enumerate(tool_calls or []):
+            where = f"messages.{index}.tool_calls.{k}"
+            fn = tc.get("function") if isinstance(tc, dict) else None
+            if not isinstance(fn, dict) or not isinstance(fn.get("name"), str) or not fn["name"]:
+                raise APIError(400, "A tool call needs a function name.", where)
+            if isinstance(name, str) and name and name != fn["name"]:
+                raise APIError(400, f"The assistant's name {name!r} is not its tool call's {fn['name']!r}.", where)
+            args = fn.get("arguments") or {}
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except ValueError:
+                    raise APIError(400, "A tool call's `arguments` must be a JSON object.", where + ".function.arguments")
+            if not isinstance(args, dict):
+                raise APIError(400, "A tool call's `arguments` must be a JSON object.", where + ".function.arguments")
+            body = ",".join(json.dumps(key, ensure_ascii=False) + ":"
+                            + json.dumps(args[key], separators=(",", ":"), ensure_ascii=False)
+                            for key in sorted(args))
+            prompt.append(f"<|message_model|>{fn['name']}<|content_invoke_tool_json|>"
+                          + '{"name":' + json.dumps(fn["name"], ensure_ascii=False) + ',"args":{' + body
+                          + "}}<|end_message|>")
         if role == "assistant" and not open_turn:
             prompt.append("<|content_model_end_sampling|>")
     if not effort_emitted:
         prompt.append(effort_str)
-    if add_generation_prompt and eff == 0.0:
+    if add_generation_prompt and eff == 0.0 and not tools:
         prompt.append("<|message_model|><|content_text|>")
     return "".join(prompt)
 
@@ -3984,6 +4206,44 @@ def _preprocess_ml4_image(data, model_dir, max_tokens=None):
 
 
 ML4_MAX_IMAGE_TOKENS = 256   # merged tokens a picture at most (ML4_MAX_IMAGE_TOKENS): the tower runs on the CPU
+INK2_MAX_IMAGE_TOKENS = 256  # tiles a picture at most (INK2_MAX_IMAGE_TOKENS): the tower runs on the CPU
+INK2_IMAGE = "<|unused_200054|>"
+
+
+def expand_inkling2_images(messages, model_dir, max_tokens=None):
+    """Inkling-2: each picture becomes {"type": "inkling2_image", "tokens": N} for
+    render_chat_inkling2 (<|content_image|> and N image placeholders, as the template and
+    Inkling2Processor write it) and its tiles (tools/inkling2_image.py). Pictures go in user
+    and tool messages only, as the template has it. Returns (messages, images); images are
+    (tiles, rows, cols), as the engine's IMAGE frame takes them."""
+    images, rewritten = [], []
+    for index, message in enumerate(messages):
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list) or not any(isinstance(p, dict) and p.get("type") in ("image_url", "input_image")
+                                                    for p in content):
+            rewritten.append(message)
+            continue
+        if message.get("role") not in ("user", "tool"):
+            raise APIError(400, "Inkling-2 takes pictures in user and tool messages only.", f"messages.{index}.content")
+        parts = []
+        for part in content:
+            kind = part.get("type") if isinstance(part, dict) else None
+            if kind in ("image_url", "input_image"):
+                data = _image_bytes_from_url(_image_part_url(part, kind))
+                try:
+                    import sys as _sys
+                    _sys.path.insert(0, str(Path(__file__).resolve().parent / "tools"))
+                    from inkling2_image import preprocess
+                except ImportError as problem:
+                    raise APIError(400, f"image support needs Pillow and numpy ({problem}); "
+                                        "pip install pillow numpy", "messages")
+                tiles, rows, cols = preprocess(data, model_dir, max_tokens)
+                images.append((tiles, rows, cols))
+                parts.append({"type": "inkling2_image", "tokens": rows * cols})
+            else:
+                parts.append(part)
+        rewritten.append({**message, "content": parts})
+    return rewritten, images
 
 
 def expand_ml4_images(messages, model_dir, max_tokens=None):
@@ -9683,7 +9943,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 reasoning = ""
                 answer_spans = tool_spans = None
                 if ARCH == "inkling":
-                    text, reasoning = split_inkling(text)
+                    text, reasoning = ink_split(text, tools if chat else None)
                 elif chat:
                     # #597 item 4: GLM emits reasoning then </think> then the answer. Route the
                     # reasoning to reasoning_content instead of dumping it (or the raw </think>)
@@ -9810,7 +10070,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 event([{"index": 0, "delta": {"reasoning_content": text},
                         "logprobs": None, "finish_reason": None}])
 
-            splitter = (InklingStreamSplit(emit, emit_reasoning if chat else None)
+            splitter = (ink_stream_split(emit, emit_reasoning if chat else None)
                         if ARCH == "inkling" else None)
             # #597 item 4: GLM (chat) streams reasoning then </think> then the answer. Split the
             # reasoning into reasoning_content deltas instead of leaking it — and the raw </think> —
@@ -9900,7 +10160,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 think = (ThinkingStreamSplit(emit_reasoning, feed_content,
                                              initial_thinking=starts_in_reasoning(
                                                  enable_thinking, add_generation_prompt))
-                         if glm_think else None)
+                         if glm_think else
+                         # Inkling-2: its turn's parts, a call as INK2_CALL_OPEN + JSON
+                         ink_stream_split(feed_content, emit_reasoning, tools=tools)
+                         if ARCH == "inkling" and chat_flavor() == "inkling2" else None)
                 def emit_tools(chunk):
                     if dbg_echo:
                         sys.stderr.write(chunk); sys.stderr.flush()
@@ -10231,7 +10494,7 @@ class APIHandler(BaseHTTPRequestHandler):
             raise
         text = "".join(output)
         if ARCH == "inkling":
-            text, _reasoning = split_inkling(text)
+            text, _reasoning = ink_split(text)
         else:
             _reasoning, text = split_thinking_reply(text, thinking, True)
         # it goes back in as a prompt, and a prompt refuses NUL bytes (a model can write one)
@@ -10267,6 +10530,10 @@ class APIHandler(BaseHTTPRequestHandler):
             ceiling = os.environ.get("MIMO_MAX_IMAGE_TOKENS")
             messages, images = expand_qwen38_images(messages, model_dir,
                                                     int(ceiling) if ceiling else None)
+        elif ARCH == "inkling" and chat_flavor() == "inkling2":
+            ceiling = os.environ.get("INK2_MAX_IMAGE_TOKENS")
+            messages, images = expand_inkling2_images(messages, model_dir,
+                                                      int(ceiling) if ceiling else INK2_MAX_IMAGE_TOKENS)
         elif CHAT_FLAVOR == "mistral_large4" and ml4_has_vision(model_dir):
             # Mistral-Large-4: Pixtral's patches (14, merge 2), [IMG] rows closed by [IMG_BREAK] / [IMG_END]
             ceiling = os.environ.get("ML4_MAX_IMAGE_TOKENS")
@@ -10378,7 +10645,7 @@ class APIHandler(BaseHTTPRequestHandler):
             content = []
             reasoning = ""
             if ARCH == "inkling":
-                text, reasoning = split_inkling(text)
+                text, reasoning = ink_split(text, tools)
             elif split_reasoning:
                 reasoning, text = split_thinking_reply(text, enable_thinking,
                                                        add_generation_prompt)
@@ -10550,9 +10817,9 @@ class APIHandler(BaseHTTPRequestHandler):
                 send_event("content_block_stop", {"type": "content_block_stop", "index": 0})
 
             if ARCH == "inkling":
-                split = InklingStreamSplit(emit_answer,
-                                           emit_thinking if enable_thinking else None,
-                                           close_thinking if enable_thinking else None)
+                split = ink_stream_split(emit_answer,
+                                         emit_thinking if enable_thinking else None,
+                                         close_thinking if enable_thinking else None, tools=tools)
             else:
                 # Anche qui: su GLM-5.3 il blocco e' aperto dal prompt, quindi
                 # lo splitter serve pure col ragionamento "spento", o il
