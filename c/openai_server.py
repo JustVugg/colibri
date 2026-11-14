@@ -8110,10 +8110,18 @@ def engine_alive(engine):
 
 # The endpoints that only make sense for a chat model, refused with a pointer
 # when the model draws images instead.
-TEXT_ENDPOINTS = ("/v1/chat/completions", "/v1/completions", "/v1/messages", "/v1/systemone")
+TEXT_ENDPOINTS = ("/v1/chat/completions", "/v1/completions", "/v1/messages",
+                  "/v1/messages/count_tokens", "/v1/systemone")
+ANTHROPIC_ENDPOINTS = ("/v1/messages", "/v1/messages/count_tokens")
+# Anthropic's error `type` follows the HTTP status; any other 5xx is api_error.
+ANTHROPIC_ERROR_TYPES = {400: "invalid_request_error", 401: "authentication_error",
+                         403: "permission_error", 404: "not_found_error",
+                         413: "request_too_large", 429: "rate_limit_error",
+                         503: "overloaded_error", 529: "overloaded_error"}
 # The endpoints that generate or score text with a language model, refused with a
 # pointer to /v1/systemone when the model is a decision engine (chat=0).
-GENERATING_ENDPOINTS = ("/v1/chat/completions", "/v1/completions", "/v1/messages")
+GENERATING_ENDPOINTS = ("/v1/chat/completions", "/v1/completions", "/v1/messages",
+                        "/v1/messages/count_tokens")
 IMAGE_OPTION_KEYS = ("default_width", "default_height", "default_steps", "min_side",
                      "max_side", "multiple")
 
@@ -8900,6 +8908,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.systemone(body, request_id)
             elif path == "/v1/messages":
                 self.anthropic_messages(body, request_id)
+            elif path == "/v1/messages/count_tokens":
+                self.anthropic_count_tokens(body, request_id)
             else:
                 raise APIError(404, "Not found.", None, "not_found")
         except APIError as error:
@@ -9561,6 +9571,15 @@ class APIHandler(BaseHTTPRequestHandler):
         stream ends at the close, which the 200 already announced (#597 item 3)."""
         if self._committed:
             self.close_connection = True
+            if urlsplit(self.path).path in ANTHROPIC_ENDPOINTS:
+                # Anthropic's stream has an `error` event for this: say why before the
+                # close, instead of a silent truncation.
+                data = json.dumps(self.error_body(error), ensure_ascii=False)
+                try:
+                    self.wfile.write(f"event: error\ndata: {data}\n\n".encode())
+                    self.wfile.flush()
+                except OSError:
+                    pass
             return
         self.send_json(error.status, self.error_body(error), request_id, error.headers)
 
@@ -9573,9 +9592,11 @@ class APIHandler(BaseHTTPRequestHandler):
             body = error_object(error)
             body["detail"] = [{"loc": self._systemone_loc(error.param), "msg": error.message, "type": "value_error"}]
             return body
-        if path != "/v1/messages":
+        if path not in ANTHROPIC_ENDPOINTS:
             return error_object(error)
-        return {"type": "error", "error": {"type": error.error_type, "message": error.message}}
+        kind = ANTHROPIC_ERROR_TYPES.get(
+            error.status, "api_error" if error.status >= 500 else "invalid_request_error")
+        return {"type": "error", "error": {"type": kind, "message": error.message}}
 
     def generation(self, body, prompt, request_id, chat, tools=None, tool_choice=None,
                    enable_thinking=False, audio=None, image=None,
@@ -10296,11 +10317,35 @@ class APIHandler(BaseHTTPRequestHandler):
     ANTHROPIC_STOP = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
 
     def anthropic_messages(self, body, request_id):
-        for unsupported, why in (("stop_sequences", "custom stop sequences"),
-                                 ("top_k", "top-k sampling")):
-            if body.get(unsupported) not in (None, [], ""):
-                raise APIError(400, f"Colibri does not support `{unsupported}` ({why}) yet.",
-                               unsupported, "unsupported_value")
+        if body.get("top_k") not in (None, [], ""):
+            raise APIError(400, "Colibri does not support `top_k` (top-k sampling) yet.",
+                           "top_k", "unsupported_value")
+        client_stops = body.get("stop_sequences")
+        if client_stops is None:
+            client_stops = []
+        if (not isinstance(client_stops, list) or
+                any(not isinstance(s, str) or not s for s in client_stops)):
+            raise APIError(400, "`stop_sequences` must be an array of non-empty strings.",
+                           "stop_sequences", "invalid_value")
+        if body.get("max_tokens") is None:
+            raise APIError(400, "`max_tokens` is required.", "max_tokens")
+        translated, prompt, tools, enable_thinking, add_generation_prompt, image = (
+            self._anthropic_request(body))
+        self.anthropic_generation(translated, prompt, request_id, tools, enable_thinking,
+                                  add_generation_prompt, image, tuple(client_stops))
+
+    def anthropic_count_tokens(self, body, request_id):
+        """POST /v1/messages/count_tokens: an estimate, as the engine has no tokenize call.
+        The prompt /v1/messages would render, times the tokens per character measured on
+        the prompts served so far; nothing reaches the engine."""
+        prompt = self._anthropic_request(body)[1]
+        # shortcut: an image's placeholders count as text; a vision count needs the engine
+        ratio = getattr(self.server, "tokens_per_char", None) or COMPACT_DEFAULT_RATIO
+        self.send_json(200, {"input_tokens": max(1, round(len(prompt) * ratio))}, request_id)
+
+    def _anthropic_request(self, body):
+        """An Anthropic request as the OpenAI path sees it: (translated body, prompt,
+        tools, enable_thinking, add_generation_prompt, image)."""
         messages, image = self.expand_images(anthropic_to_openai(body))
         tools, tool_choice = anthropic_tools(body)
         thinking = body.get("thinking")
@@ -10314,8 +10359,6 @@ class APIHandler(BaseHTTPRequestHandler):
                 enable_thinking = True
         if ARCH == "olmoe" or chat_flavor() == "qwen3_coder":
             enable_thinking = False   # #984: OLMoE has no thinking mode (see the OpenAI path)
-        if body.get("max_tokens") is None:
-            raise APIError(400, "`max_tokens` is required.", "max_tokens")
         # Reuse the OpenAI path's own validation by handing it an equivalent body.
         translated = {"messages": messages, "max_tokens": body.get("max_tokens"),
                       "temperature": body.get("temperature"), "top_p": body.get("top_p"),
@@ -10333,17 +10376,18 @@ class APIHandler(BaseHTTPRequestHandler):
                                       tools, tool_choice,
                                       add_generation_prompt=add_generation_prompt,
                                       preserve_thinking=not enable_thinking)
-        self.anthropic_generation(translated, prompt, request_id, tools, enable_thinking,
-                                  add_generation_prompt, image)
+        return translated, prompt, tools, enable_thinking, add_generation_prompt, image
 
     def anthropic_generation(self, body, prompt, request_id, tools, enable_thinking,
-                             add_generation_prompt=True, image=None):
+                             add_generation_prompt=True, image=None, client_stops=()):
         maximum, temperature, top_p, grammar, _stop_sequences = generation_options(
             body, self.server.max_tokens)
         # Same policy as /v1/chat/completions: `body` is the translated OpenAI-shaped
-        # request, and anthropic_messages() has already refused a client `stop_sequences`,
-        # so this resolves to the implicit GLM role boundaries.
+        # request with no `stop`, so this resolves to the family's implicit role
+        # boundaries. The client's `stop_sequences` are added to them, not swapped in:
+        # a role marker still ends the turn (as end_turn, not stop_sequence).
         stop_sequences, ignore_leading_stop = stop_policy(body, True)
+        stop_sequences = tuple(stop_sequences) + tuple(client_stops)
         cache_slot = body.get("cache_slot")
         if (cache_slot is not None and
                 (isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or
@@ -10373,8 +10417,9 @@ class APIHandler(BaseHTTPRequestHandler):
         split_reasoning = enable_thinking or starts_in_reasoning(enable_thinking,
                                                                  add_generation_prompt)
 
-        def blocks_and_stop(text, stats, tool_reply=None):
-            """Split a finished reply into Anthropic content blocks + stop_reason."""
+        def blocks_and_stop(text, stats, tool_reply=None, matched=None):
+            """Split a finished reply into Anthropic content blocks, stop_reason and
+            stop_sequence (the client's sequence that ended it, else None)."""
             content = []
             reasoning = ""
             if ARCH == "inkling":
@@ -10398,8 +10443,10 @@ class APIHandler(BaseHTTPRequestHandler):
                     arguments = {}
                 content.append({"type": "tool_use", "id": call["id"],
                                 "name": function["name"], "input": arguments})
+            if not calls and matched in client_stops:
+                return content, "stop_sequence", matched
             reason = "tool_calls" if calls else ("length" if stats["length_limited"] else "stop")
-            return content, self.ANTHROPIC_STOP[reason]
+            return content, self.ANTHROPIC_STOP[reason], None
 
         with self.server.scheduler.admit(self.client_disconnected, cache_slot, prefer_slot) as admission, \
                 contextlib.ExitStack() as stream_cleanup:
@@ -10424,12 +10471,12 @@ class APIHandler(BaseHTTPRequestHandler):
                     channels.finish()
                 stop_filter.finish()
                 sideband.finish()
-                content, stop_reason = blocks_and_stop("".join(output), stats,
-                                                       sideband.reply())
+                content, stop_reason, stop_sequence = blocks_and_stop(
+                    "".join(output), stats, sideband.reply(), stop_filter.matched)
                 self.send_json(200, {
                     "id": message_id, "type": "message", "role": "assistant",
                     "model": self.server.model_id, "content": content,
-                    "stop_reason": stop_reason, "stop_sequence": None,
+                    "stop_reason": stop_reason, "stop_sequence": stop_sequence,
                     "usage": {"input_tokens": stats["prompt_tokens"],
                               "output_tokens": stats["completion_tokens"]}},
                     request_id, queue_headers)
@@ -10593,8 +10640,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 send_event("content_block_stop", {"type": "content_block_stop",
                                                   "index": text_index})
 
-            content, stop_reason = blocks_and_stop("".join(raw), stats,
-                                                   sideband.reply())
+            content, stop_reason, stop_sequence = blocks_and_stop(
+                "".join(raw), stats, sideband.reply(), stop_filter.matched)
             index = text_index + 1 if stream_state["text_started"] else 1
             for block in content:
                 if block["type"] != "tool_use":
@@ -10608,8 +10655,11 @@ class APIHandler(BaseHTTPRequestHandler):
                 send_event("content_block_stop", {"type": "content_block_stop", "index": index})
                 index += 1
             send_event("message_delta", {"type": "message_delta",
-                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                "usage": {"output_tokens": stats["completion_tokens"]}})
+                "delta": {"stop_reason": stop_reason, "stop_sequence": stop_sequence},
+                # message_start went out before the prompt was counted, so its
+                # input_tokens is 0; Anthropic's message_delta usage may carry it
+                "usage": {"input_tokens": stats["prompt_tokens"],
+                          "output_tokens": stats["completion_tokens"]}})
             send_event("message_stop", {"type": "message_stop"})
             # close_connection was already set when the 200 was committed (#597 item 3).
 

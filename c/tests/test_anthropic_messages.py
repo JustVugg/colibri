@@ -587,12 +587,108 @@ class MessagesHTTPTest(unittest.TestCase):
         self.assertEqual(payloads[-2]["delta"]["stop_reason"], "tool_use")
 
     def test_unsupported_fields_refuse_loudly(self):
-        for field, value in (("stop_sequences", ["STOP"]), ("top_k", 40)):
-            with self.assertRaises(HTTPError) as caught:
-                self.post(self.base_body(**{field: value}))
-            self.addCleanup(caught.exception.close)
-            self.assertEqual(caught.exception.code, 400)
-            self.assertIn(field, json.load(caught.exception)["error"]["message"])
+        with self.assertRaises(HTTPError) as caught:
+            self.post(self.base_body(top_k=40))
+        self.addCleanup(caught.exception.close)
+        self.assertEqual(caught.exception.code, 400)
+        self.assertIn("top_k", json.load(caught.exception)["error"]["message"])
+
+    # ---- stop_sequences, error types, count_tokens -------------------------------------
+    def events(self, raw):
+        """(event name, payload) pairs of an Anthropic SSE stream, in order."""
+        pairs, name = [], None
+        for line in raw.splitlines():
+            if line.startswith("event: "):
+                name = line[len("event: "):]
+            elif line.startswith("data: "):
+                pairs.append((name, json.loads(line[len("data: "):])))
+        return pairs
+
+    def error_of(self, call):
+        with self.assertRaises(HTTPError) as caught:
+            call()
+        self.addCleanup(caught.exception.close)
+        return caught.exception.code, json.load(caught.exception)
+
+    def test_client_stop_sequence_ends_the_turn_and_is_named(self):
+        self.engine.script = ("Hello ", "EN", "D and more", "tail")
+        with self.post(self.base_body(stop_sequences=["END"])) as response:
+            payload = json.load(response)
+        self.assertEqual(payload["content"], [{"type": "text", "text": "Hello "}])
+        self.assertEqual((payload["stop_reason"], payload["stop_sequence"]),
+                         ("stop_sequence", "END"))
+        self.assertEqual(self.engine.emitted, 3)   # generation stopped, not merely hidden
+
+    def test_streamed_stop_sequence_is_named_in_message_delta(self):
+        self.engine.script = ("Hello ", "EN", "D and more")
+        with self.post(self.base_body(stream=True, stop_sequences=["END"])) as response:
+            raw = response.read().decode()
+        events = self.events(raw)
+        text = "".join(p["delta"]["text"] for _name, p in events
+                       if p["type"] == "content_block_delta" and p["delta"]["type"] == "text_delta")
+        self.assertEqual(text, "Hello ")
+        delta = [p for name, p in events if name == "message_delta"][0]
+        self.assertEqual(delta["delta"], {"stop_reason": "stop_sequence", "stop_sequence": "END"})
+        self.assertEqual(delta["usage"], {"input_tokens": 11, "output_tokens": 3})
+
+    def test_role_marker_still_ends_the_turn_beside_client_stops(self):
+        self.engine.script = ("ready", "<|user|>", "END")
+        with self.post(self.base_body(stop_sequences=["END"])) as response:
+            payload = json.load(response)
+        self.assertEqual(payload["content"], [{"type": "text", "text": "ready"}])
+        self.assertEqual((payload["stop_reason"], payload["stop_sequence"]), ("end_turn", None))
+
+    def test_bad_stop_sequences_are_400(self):
+        for value in ("END", [""], [5]):
+            with self.subTest(value=value):
+                code, payload = self.error_of(
+                    lambda: self.post(self.base_body(stop_sequences=value)))
+                self.assertEqual((code, payload["error"]["type"]), (400, "invalid_request_error"))
+                self.assertIn("stop_sequences", payload["error"]["message"])
+        self.assertEqual(self.engine.prompts, [])
+
+    def test_error_types_follow_the_status(self):
+        code, payload = self.error_of(lambda: self.post(self.base_body(), {"x-api-key": "no"}))
+        self.assertEqual((code, payload["error"]["type"]), (401, "authentication_error"))
+        code, payload = self.error_of(lambda: self.post(self.base_body(model="other")))
+        self.assertEqual((code, payload["error"]["type"]), (404, "not_found_error"))
+        self.engine.script = None                  # iterating None: the engine call fails
+        code, payload = self.error_of(lambda: self.post(self.base_body()))
+        self.assertEqual((code, payload["type"], payload["error"]["type"]),
+                         (500, "error", "api_error"))
+
+    def test_engine_failure_mid_stream_sends_an_error_event(self):
+        self.engine.script = None
+        with self.post(self.base_body(stream=True)) as response:
+            raw = response.read().decode()
+        self.assertEqual(raw.count("event: error"), 1)
+        name, payload = self.events(raw)[-1]
+        self.assertEqual((name, payload["type"], payload["error"]["type"]),
+                         ("error", "error", "api_error"))
+
+    def test_openai_error_envelope_is_unchanged(self):
+        code, payload = self.error_of(lambda: self.post(
+            {"model": "other", "messages": [{"role": "user", "content": "x"}]},
+            path="/v1/chat/completions"))
+        self.assertEqual(code, 404)
+        self.assertEqual(payload["error"]["type"], "invalid_request_error")
+        self.assertNotIn("type", payload)
+
+    def test_count_tokens_estimates_without_generating(self):
+        body = {"model": "test-model", "system": "Be brief.",
+                "messages": [{"role": "user", "content": "Hi " * 100}]}
+        with self.post(body, path="/v1/messages/count_tokens") as response:
+            payload = json.load(response)
+        self.assertEqual(list(payload), ["input_tokens"])
+        self.assertGreater(payload["input_tokens"], 50)
+        self.server.tokens_per_char = 0.5          # what served prompts measured
+        with self.post(body, path="/v1/messages/count_tokens") as response:
+            measured = json.load(response)["input_tokens"]
+        self.assertGreater(measured, payload["input_tokens"])
+        self.assertEqual(self.engine.prompts, [])
+        code, payload = self.error_of(lambda: self.post(body, {"x-api-key": "no"},
+                                                        path="/v1/messages/count_tokens"))
+        self.assertEqual((code, payload["error"]["type"]), (401, "authentication_error"))
 
     # ---- images end to end -----------------------------------------------------------
     # The translation alone is not the contract: the picture has to reach the engine.
