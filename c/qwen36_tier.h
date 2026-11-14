@@ -301,13 +301,16 @@ void qt_chain_promote_done(int ci, int vi, int ok);
 int  qt_chain_changes(int *idx, int max, int *overflow);
 uint64_t qt_chain_promoted(void);
 size_t qt_chain_give_back(size_t bytes, int (*addr)(const struct ColiCudaTensor *t, uintptr_t *at));   /* device memory back for the chain's KV mirrors (residents out, by page with addr) */
-/* The host pool (qwen36_tier.c): qt_note_host page-locks a non-resident expert's RAM copy (its
- * planar blocks or its int4 pairs, and scales, as the engine's slot holds them) for the device
- * to copy a prompt chunk's experts from; qt_chain_host the copy's two blocks, the three matrices
- * and the three scale arrays (1 when registered); qt_chain_host_count how many;
+/* The host pool (qwen36_tier.c): qt_note_host page-locks an expert's RAM copy (its planar
+ * blocks or its int4 pairs, and scales, as the engine's slot holds them; a non-resident's, and
+ * a resident's when the card holds fewer than every expert) for the device to copy a prompt
+ * chunk's experts from; qt_chain_host the copy's two blocks, the three matrices and the three
+ * scale arrays (1 when registered); qt_chain_host_count how many;
  * qt_chain_host_planar whether the int4 is in planar blocks; qt_chain_host_off why the pool is
- * off (NULL when on); qt_chain_host_follow makes the pool
- * the non-residents again after experts moved (1 when it changed). */
+ * off (NULL when on); qt_chain_host_follow makes the pool the non-residents again after
+ * experts moved (1 when it changed); qt_chain_host_all, once the warm start has pooled the
+ * non-residents, page-locks the residents' copies too (1 when every expert is then in the pool, and the follow
+ * keeps them all; else the follow works as before). */
 void qt_note_host(int layer, int eid, const uint8_t *g4, const uint8_t *u4, const uint8_t *d4,
                   const float *gs, const float *us, const float *ds);
 int  qt_chain_host(int layer, int eid, const void **w, size_t *wb, const float **sc, size_t *sb);
@@ -315,6 +318,7 @@ int  qt_chain_host_count(void);
 int  qt_chain_host_planar(void);
 const char *qt_chain_host_off(void);
 int  qt_chain_host_follow(int *joined, int *left);
+int  qt_chain_host_all(void);
 
 #else /* !COLI_CUDA: inline stubs, engine stays CPU-only */
 
@@ -388,6 +392,7 @@ static inline int  qt_chain_host_count(void){return 0;}
 static inline int  qt_chain_host_planar(void){return 0;}
 static inline const char *qt_chain_host_off(void){return NULL;}
 static inline int  qt_chain_host_follow(int*j,int*l){*j=*l=0;return 0;}
+static inline int  qt_chain_host_all(void){return 0;}
 static inline int  qt_streaming(void){return 0;}
 static inline int  qt_experts_on(void){return 0;}
 static inline void qt_source_planar(int a){(void)a;}

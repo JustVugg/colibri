@@ -9846,9 +9846,28 @@ static void tier_warmstart(Model *m, int expert_is_int4) {
         }
     }
     qt_fill_wait();
-    if (qt_chain_host_count())
+    /* The chain's host pool takes the residents' RAM copies too when the card holds fewer than every
+     * expert: the chain's promotions, the tier's swaps and the KV mirrors' give-back then move
+     * experts off the card, and each one that leaves is in the pool already, for a prompt chunk of
+     * any size, with no follow to pay for (qt_chain_host_follow: before a large chunk only, a
+     * cost per expert moved). After the loop, so a page-lock refused costs a resident its copy
+     * and not a non-resident, the pool's first use. If a page-lock was refused the pool is not
+     * whole: the follow stays on and the line says so. Vulkan's tier keeps every expert in its
+     * host pool the same way (vk_tier.c). */
+    int pool_all = 0, all_in = 0, nres = 0;
+#ifdef COLI_CUDA
+    int off = 0;   /* the experts the card does not hold */
+    for (int gi = 0; gi < cap_total; gi++) off += !planned[gi] && !q36_dense_l(&m->c, gi / m->c.n_experts);
+    pool_all = off > 0 && g_cuda_chain;
+    if (pool_all) { const int was = qt_chain_host_count(); all_in = qt_chain_host_all(); nres = qt_chain_host_count() - was; }
+#endif
+    if (qt_chain_host_count()) {
+        char how[128] = "";
+        if (pool_all && all_in) snprintf(how, sizeof how, "%d of them the residents', so an expert that leaves the card is in it; ", nres);
+        else if (pool_all) snprintf(how, sizeof how, "the page-locks did not reach every expert, so it follows the residents as before; ");
         fprintf(stderr, "[qtier] host pool: %d experts of the RAM cache page-locked for the device to copy a prompt chunk's "
-                        "experts from (COLI_CUDA_HOST_POOL=0 off)\n", qt_chain_host_count());
+                        "experts from (%sCOLI_CUDA_HOST_POOL=0 off)\n", qt_chain_host_count(), how);
+    }
 #ifdef COLI_CUDA
     else if (g_cuda_chain && wn < cap_total && qt_chain_host_off())
         fprintf(stderr, "[qtier] no host pool (%s): a prompt chunk's experts outside VRAM take the CPU's step\n", qt_chain_host_off());

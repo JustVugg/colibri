@@ -1,0 +1,79 @@
+{
+  "version": 1,
+  "hypothesis": "The host pool holds only the experts off the card, so after a long prompt a 64-token prompt (a chunk of 33 to 127 rows, which the pool's follow does not run before) sends each layer holding an expert that left the card to the host's step whole. Page-locking the residents' RAM copies too, at the warm start, puts every expert in the pool: those layers are staged, copying only the experts their rows route to, and the 64 after a 512 is faster. The routed copy is already in the baseline.",
+  "commit": "5ab885097c02ccd1fbae47253521b7e6942d95cf",
+  "model": "q36",
+  "metric": "prompt tok/s at 64 tokens after a 512-token prompt (the third row of every run), baseline: dev plus the routed copy",
+  "command": "env -i PATH=/usr/bin:/bin HOME=/root LD_LIBRARY_PATH=/usr/lib64-nvidia COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close OMP_DISPLAY_AFFINITY=TRUE OMP_AFFINITY_FORMAT=omp-thread:%n:cpus:%A /content/bin-p2833/qwen36-bench --model /content/q36 --text /content/bench/promessi_sposi.txt --lengths 64,512,64 --gen 32 --teacher --steps /content/misura-p2833/v1-runN.steps",
+  "prompt_hash": "f53e0d80cb2d4492",
+  "hardware": {
+    "cpu": "Intel(R) Xeon(R) CPU @ 2.00GHz",
+    "ram": "51 GiB",
+    "storage": "overlay         236G",
+    "os": "Ubuntu 24.04.4 LTS, kernel 6.6.159+",
+    "gpu": "Tesla T4"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "HARNESS"
+  ],
+  "baseline": {
+    "config": {
+      "HARNESS": "commit 4306f437ec97afd0fcd45166620c6a0175e0a5ed; harness qwen36_bench.c ca1bd9cc3d24; CUDA",
+      "COLI_CUDA": "1",
+      "COLI_GPUS": "0",
+      "CUDA_EXPERT_GB": "auto",
+      "OMP_WAIT_POLICY": "ACTIVE",
+      "OMP_PROC_BIND": "close",
+      "OMP_DISPLAY_AFFINITY": "TRUE",
+      "OMP_AFFINITY_FORMAT": "omp-thread:%n:cpus:%A"
+    },
+    "samples": {
+      "tok_s": [
+        104.4,
+        104.86,
+        106.76,
+        104.72
+      ]
+    },
+    "median_tok_s": 104.79,
+    "quality": {
+      "method": "the 64-token prompt that opens the process and the 512-token prompt have the same fingerprint, nll and top1 in every run of both versions; the 64 after the 512 does not: another fingerprint (54bb171c568c376e, the same in the four runs of the trial; 9d8c5feaaca51a44 in the baseline's), nll 2.6907 -> 2.6959 (+0.19 %), top1 0.469 in both. Dev fd7ed68a built with Q36CC_FOLLOW_ROWS at 33 (the follow before every staged chunk, one run) gives the trial's fingerprint and nll in that prompt: the difference is dev's staged path against the host's step for the layers that held an expert in neither the card nor the pool (correctness.txt). Passed on these grounds: top1 is equal and the nll rises by 0.19 % on this one prompt; no tolerance was set before the runs.",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-cuda-host-pool-all-2026-11-13/base.md",
+      "sha256": "a00f8ff4d330faa9c1ea7bb0843741fc14ec22eab373c1c0fca104eedce9efd5"
+    }
+  },
+  "trial": {
+    "config": {
+      "HARNESS": "commit 5ab885097c02ccd1fbae47253521b7e6942d95cf; harness qwen36_bench.c ca1bd9cc3d24; CUDA",
+      "COLI_CUDA": "1",
+      "COLI_GPUS": "0",
+      "CUDA_EXPERT_GB": "auto",
+      "OMP_WAIT_POLICY": "ACTIVE",
+      "OMP_PROC_BIND": "close",
+      "OMP_DISPLAY_AFFINITY": "TRUE",
+      "OMP_AFFINITY_FORMAT": "omp-thread:%n:cpus:%A"
+    },
+    "samples": {
+      "tok_s": [
+        222.95,
+        222.51,
+        221.72,
+        221.13
+      ]
+    },
+    "median_tok_s": 222.115,
+    "quality": {
+      "method": "the 64-token prompt that opens the process and the 512-token prompt have the same fingerprint, nll and top1 in every run of both versions; the 64 after the 512 does not: another fingerprint (54bb171c568c376e, the same in the four runs of the trial; 9d8c5feaaca51a44 in the baseline's), nll 2.6907 -> 2.6959 (+0.19 %), top1 0.469 in both. Dev fd7ed68a built with Q36CC_FOLLOW_ROWS at 33 (the follow before every staged chunk, one run) gives the trial's fingerprint and nll in that prompt: the difference is dev's staged path against the host's step for the layers that held an expert in neither the card nor the pool (correctness.txt). Passed on these grounds: top1 is equal and the nll rises by 0.19 % on this one prompt; no tolerance was set before the runs.",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-cuda-host-pool-all-2026-11-13/base.md",
+      "sha256": "a00f8ff4d330faa9c1ea7bb0843741fc14ec22eab373c1c0fca104eedce9efd5"
+    }
+  },
+  "outcome": "improvement"
+}

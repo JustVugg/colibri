@@ -31,6 +31,10 @@
  *     matmul_rows scores the whole vocabulary.
  *   - the host pool follows the residents before a prompt chunk of Q36CC_FOLLOW_ROWS rows or
  *     more, not before a smaller one, and a change stales the staged table (q36cc_follow);
+ *   - the staged table of a prompt chunk (q36cc_dm_begin) follows the tier's residents when the warm
+ *     start pooled every expert (qt_chain_host_all): after a promotion and a give-back every expert off
+ *     the card is staged, none of the layers goes to the host's step whole, and the follow has nothing
+ *     to do; without it a chunk of 36 rows leaves the layer holding a victim to the host;
  *   - the promotions' brake holds only where the warm start's set came from a history (this
  *     model's heat file); COLI_CUDA_CHAIN_PROMOTE_HITS, when set, wins;
  *   - the staging buffer for a prompt chunk's host-pool experts grows into the old one's place: a small card
@@ -230,6 +234,38 @@ static void head_logits_on_the_card(Weights *w, const Model *shared, const int *
     ck(ch->forwards == 3 && !ch->failed && g_cuda_chain, "the chain took the three steps, none went to the CPU");
     ck(fake_chain_host_stores == stores0, "no matmul of those steps stored into host memory: the head's logits come down in a copy");
     g_cuda_chain = 0;
+}
+
+/* a short prompt chunk's copies for one layer (q36cc_routed_fetches): the experts its rows route
+ * to that have regions in the staged table, two regions each, in the table's order. Only the
+ * list is tested here: the copy itself runs on a card (the T4 bench of the experiment record). */
+static void test_routed_fetches(void) {
+    enum { RE = 8 };
+    CcFetch fr[8], out[2 * RE]; uint8_t used[RE];
+    memset(used, 1, sizeof used);   /* the scratch as the layer before left it */
+    for (int k = 0; k < 8; k++) fr[k] = (CcFetch){(const void *)(uintptr_t)(0x1000 + k), (size_t)k, (size_t)(100 + k)};
+    const int frx[RE] = {-1, 0, -1, 2, 4, -1, 6, -1};   /* 1, 3, 4 and 6 in the pool; the rest resident */
+    const int ids[6] = {6, 0, 1, 6, -1, 9};              /* two rows of three: 6 twice, a resident, an empty slot, an id past E */
+    int k = q36cc_routed_fetches(ids, 6, RE, frx, fr, used, out);
+    ck(k == 4 && out[0].src == fr[0].src && out[1].src == fr[1].src && out[2].src == fr[6].src && out[3].src == fr[7].src,
+       "the routed experts in the pool, each once, in the table's order: weights, then scales");
+    const int res[3] = {0, 2, 5};
+    ck(q36cc_routed_fetches(res, 3, RE, frx, fr, used, out) == 0, "routes only to residents: nothing to copy (the scratch starts clean)");
+    const int all[RE] = {7, 6, 5, 4, 3, 2, 1, 0};
+    k = q36cc_routed_fetches(all, RE, RE, frx, fr, used, out);
+    int whole = k == 8;
+    for (int j = 0; j < 8 && whole; j++) whole = out[j].src == fr[j].src && out[j].dst == fr[j].dst && out[j].bytes == fr[j].bytes;
+    ck(whole, "routes to every expert: the layer's whole copy, as a longer chunk makes it");
+    ck(Q36CC_ROUTED_ROWS > Q36CC_STAGE_ROWS, "a chunk the staging takes can be short enough to copy only its routes");
+    ck(q36cc_routes_only(Q36CC_STAGE_ROWS + 1, 4) && q36cc_routes_only(Q36CC_ROUTED_ROWS, 4) &&
+       !q36cc_routes_only(Q36CC_ROUTED_ROWS + 1, 4), "an int4 per group chunk copies only its routes up to Q36CC_ROUTED_ROWS rows");
+    ck(q36cc_routes_only(Q36CC_STAGE_ROWS + 1, 2), "so does a per-row int4's (the same two regions an expert, planar blocks or pairs)");
+    ck(!q36cc_routes_only(Q36CC_STAGE_ROWS + 1, 100) && !q36cc_routes_only(Q36CC_STAGE_ROWS + 1, 142),
+       "a GGUF's chunk copies whole layers: no list of its experts' regions");
+    ck(!q36cc_routes_only(Q36CC_STAGE_ROWS + 1, 1) && !q36cc_routes_only(Q36CC_STAGE_ROWS + 1, 8),
+       "the formats with no staged table (int8, fp8) take no such list either");
+    ck(Q36CC_DM_ROWS <= Q36CC_STAGE_ROWS,
+       "no staged chunk has a layer the host serves inside the frame: the wait for the routes cannot block");
 }
 
 int main(void) {
@@ -601,6 +637,68 @@ int main(void) {
         qt_shutdown();
     }
     remove(heat);
+
+    printf(" M. a short prompt chunk copies only the experts its rows route to\n");
+    test_routed_fetches();
+    printf(" N. the staged table follows the residents when every expert is pooled\n");
+    {   /* the ops through dev_addr: the fake's table, tensor_dev and the staging's address, no copy (fetch is not there) */
+        fake_chain_table.size = offsetof(ColiCudaChainOps, dev_addr) + sizeof fake_chain_table.dev_addr;
+        for (int all = 1; all >= 0; all--) {
+            char w[160];
+            int regs0 = fake_host_regs, unregs0 = fake_host_unregs;
+            qt_source_planar(1);
+            ck(qt_init(NL, HE, D, HI, HE, TOPK, 64, 1), "a planar tier");
+            for (int e = 0; e < HE; e++) for (int i = 0; i < NL; i++) hp_note(i, e, 0);
+            qt_fill_wait();
+            for (int i = 0; i < NL; i++) for (int e = 0; e < HE; e++) if (!qt_is_resident(i, e)) hp_note(i, e, 1);
+            if (all) qt_chain_host_all();
+            Model km; memset(&km, 0, sizeof km);   /* the chunk's dimensions, as the tier's */
+            km.c.hidden = D; km.c.inter = HI; km.c.n_layers = NL; km.c.n_experts = HE; km.c.topk = TOPK;
+            Q36CChain fc; memset(&fc, 0, sizeof fc);
+            fc.rows = 64;
+            ck(qt_chain_format(&fc.dm_fmt, &fc.dm_gs) && fc.dm_fmt == 4 && qt_chain_devices() == 1, "the chain reads the tier's format");
+            ck(q36cc_dm_begin(&fc, &km, 40), "a chunk of 40 rows: the table built before anything moved");
+            q36cc_dm_end(&fc);
+            int clean = 1;
+            for (int i = 0; i < NL; i++) clean = clean && !fc.dm_partb[i];
+            ck(clean && fc.dm_staged == 0 && !fc.dm_stage_off, "before the moves: no layer goes to the host's step");
+            for (int t = 0; t < 3; t++) { hp_route(0, 4, 5); hp_route(1, 0, 5); }
+            QtPromo pr[8];
+            int np = qt_chain_promote(8, pr);
+            for (int k = 0; k < np; k++) qt_chain_promote_done(pr[k].ci, pr[k].vi, 1);
+            int moved = np > 0;
+            for (int round = 0; round < 2; round++) {   /* after the promotions, then after the KV mirrors' give-back */
+                if (round) qt_chain_give_back(2 * G.exp_bytes - 1, NULL);
+                ck(q36cc_dm_begin(&fc, &km, 40), "a chunk of 40 rows after the moves");
+                q36cc_dm_end(&fc);
+                int agrees = 1, hostl = 0;   /* the table says what the tier says: resident, staged, or the host's */
+                for (int i = 0; i < NL; i++) {
+                    hostl += fc.dm_partb[i];
+                    for (int e = 0; e < HE; e++) {
+                        const int res = qt_is_resident(i, e), pool = hp_pooled(i, e), j = i * HE + e;
+                        agrees = agrees && fc.dm_res[j] == res && (fc.dm_hostb[j].g != NULL) == (res || pool);
+                    }
+                }
+                if (all) {
+                    snprintf(w, sizeof w, "every expert pooled, %s: the staged table equals the residents, every expert off the card staged, no layer to the host", round ? "after the give-back" : "after the promotions");
+                    ck(moved && agrees && hostl == 0 && fc.hp_follows == 0, w);
+                } else if (!round) {
+                    ck(moved && agrees && hostl > 0 && fc.hp_follows == 0,
+                       "the non-residents only (a 40-row chunk does not follow): a layer holding a victim goes to the host's step whole");
+                }
+            }
+            if (all) {
+                ck(q36cc_dm_begin(&fc, &km, Q36CC_FOLLOW_ROWS), "a chunk of Q36CC_FOLLOW_ROWS rows");
+                q36cc_dm_end(&fc);
+                ck(fc.hp_follows == 0 && !fc.dm_partb[0] && !fc.dm_partb[1], "every expert pooled: the follow did nothing, the layers stay on the device");
+            }
+            cc_free(fc.dm_stage); cc_free(fc.dm_tabb);
+            qt_source_planar(0);
+            qt_shutdown();
+            ck(fake_host_regs - regs0 == fake_host_unregs - unregs0, "the exit releases every page-lock the pool took");
+        }
+        fake_chain_table.size = CC_OPS_BASE_SIZE;
+    }
     if (fails) { printf("test_qwen36_cuda_chain: %d failure(s)\n", fails); return 1; }
     printf("OK test_qwen36_cuda_chain: the CUDA chain gives the CPU path's logits; host and device state agree; a lost device rebuilds; the host pool follows before a large prompt chunk only; the promotions' brake only with a history\n");
     return 0;

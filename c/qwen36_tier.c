@@ -1490,7 +1490,9 @@ static void qt_lfru_tick_locked(void);
  * or a GGUF's rows as the file has them (gate, up and down back to back, no scales; the engine
  * holds them so when this tier takes a GGUF's experts). A per-row container had none: its
  * 12.7K-token prompt ran the experts outside VRAM on the CPU (#2734). COLI_CUDA_HOST_POOL=0 off. */
-static int G_host_on = -1;
+/* The warm start pools the experts off the card, and the residents' copies too when the card holds
+ * fewer than every expert and the chain runs; G_host_all: it did, every one (qt_chain_host_all). */
+static int G_host_on = -1, G_host_all;
 static unsigned long long G_host_n, G_host_bytes;
 static int host_pool_on(void){
     if(G_host_on >= 0) return G_host_on;
@@ -1552,17 +1554,40 @@ int qt_chain_host(int layer,int eid,const void **w,size_t *wb,const float **sc,s
     return r;
 }
 int qt_chain_host_count(void){ return G.on && G_host_on > 0 ? (int)G_host_n : 0; }
+/* Every expert in the pool: the residents' copies too, the slots' own (qt_note_planned kept
+ * them), page-locked once the warm start's loop has done the non-residents. An expert the card
+ * lets go (a promotion, a swap, the KV mirrors' give-back) is then in the pool already, for a
+ * prompt chunk of any size, and the follow below has nothing to do. The residents come last: if
+ * the page-locks run out, those of the experts the pool is for are taken. The follow is turned
+ * off (G_host_all) only if every expert with a RAM copy ended up in the pool: with one left out
+ * (a page-lock refused) it stays on, as before this existed, so that an expert leaving the card
+ * still joins. 1 when the pool holds them all. Cleared at the exit. */
+int qt_chain_host_all(void){
+    if(!G.on || !host_pool_on()) return 0;
+    for(int i=0; i<G.nl*G.ne; i++){
+        pthread_mutex_lock(&G.mx);
+        const QSlot c = G.slot[i];
+        pthread_mutex_unlock(&G.mx);
+        if(!c.hreg && c.g4) qt_note_host(i/G.ne, i%G.ne, c.g4, c.u4, c.d4, c.gs, c.us, c.ds);
+    }
+    int out = 0;
+    pthread_mutex_lock(&G.mx);
+    for(int i=0; i<G.nl*G.ne; i++) out += G.slot[i].g4 && !G.slot[i].hreg;
+    G_host_all = out == 0;
+    pthread_mutex_unlock(&G.mx);
+    return G_host_all;
+}
 /* The pool follows the residents. The warm start page-locks the experts it leaves in RAM; the
  * chain's promotions and the tier's LFRU swaps then trade experts between the card and the RAM, and
  * the pool kept its first set: an expert that left the card was not in it, so a prompt chunk's
  * layer holding one went to the host's step whole (q36cc_stage_table), and one that came in kept
  * its RAM page-locked for nothing. Before a large prompt chunk (Q36CC_FOLLOW_ROWS) the chain calls
  * this: the non-residents join the pool, the residents leave it; the CUDA calls outside the lock,
- * as in qt_note_host.
+ * as in qt_note_host. Nothing when the pool holds every expert (qt_chain_host_all).
  * 1 when the pool changed; *joined and *left say how many. */
 int qt_chain_host_follow(int *joined,int *left){
     *joined=*left=0;
-    if(!G.on || G_host_on <= 0) return 0;
+    if(!G.on || G_host_on <= 0 || G_host_all) return 0;
     size_t n = (size_t)G.nl*G.ne, mb = (size_t)G.D*G.Ih/2, sb = (2*G.sc_gu + G.sc_d)*sizeof(float);
     int *mv = malloc(n*sizeof(int)), nj = 0, nl = 0;   /* the joins from the front, the leaves from the back */
     if(!mv) return 0;
@@ -1768,7 +1793,7 @@ uint64_t qt_chain_promoted(void){ return G.on ? G.promo_done : 0; }
  * a 44K-token prompt ran out of memory mid-step and every later step went to the CPU. The
  * experts given back compute on the CPU from their RAM copy (qt_evicted_take: an int4
  * container's int8 again), and join the host pool before the next large prompt chunk
- * (qt_chain_host_follow).
+ * (qt_chain_host_follow), or are in it already (qt_chain_host_all).
  *
  * The driver packs allocations under 2 MiB into 2 MiB pages and releases a page only when
  * nothing in it is left: an expert's matrices are 512 KiB each on Qwen3.6, so the coldest
@@ -2527,7 +2552,7 @@ void qt_shutdown(void){
     memset(G.is_cnt,0,sizeof G.is_cnt);
     G.on=0;
     G_fp8_stream=0; G_stream=0; G_trunk_only=0; G_src_planar=0;
-    G_host_on=-1; G_host_n=G_host_bytes=0;
+    G_host_on=-1; G_host_all=0; G_host_n=G_host_bytes=0;
     coli_cuda_shutdown();
 }
 

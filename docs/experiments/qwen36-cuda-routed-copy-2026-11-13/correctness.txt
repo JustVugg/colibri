@@ -1,0 +1,175 @@
+# correctness.txt: the checks of this PR's code against dev fd7ed68a, 13 November 2026. The code was measured as local
+# commit 4306f437e; the commit of this PR differs from it by two comments (c/qwen36_cuda_chain.h and the chain's test,
+# 2 lines each). Lines taken from the runs' logs as printed.
+
+## make -C c check on macOS arm64, on the commit of this PR: section M of
+## test_qwen36_cuda_chain (the fake card: it has no host pool, so the copy itself does not run there), then the totals
+ M. a short prompt chunk copies only the experts its rows route to
+  ok   the routed experts in the pool, each once, in the table's order: weights, then scales
+  ok   routes only to residents: nothing to copy (the scratch starts clean)
+  ok   routes to every expert: the layer's whole copy, as a longer chunk makes it
+  ok   a chunk the staging takes can be short enough to copy only its routes
+  ok   an int4 per group chunk copies only its routes up to Q36CC_ROUTED_ROWS rows
+  ok   so does a per-row int4's (the same two regions an expert, planar blocks or pairs)
+  ok   a GGUF's chunk copies whole layers: no list of its experts' regions
+  ok   the formats with no staged table (int8, fp8) take no such list either
+  ok   no staged chunk has a layer the host serves inside the frame: the wait for the routes cannot block
+OK test_qwen36_cuda_chain: the CUDA chain gives the CPU path's logits; host and device state agree; a lost device rebuilds; the host pool follows before a large prompt chunk only; the promotions' brake only with a history
+Ran 3290 tests in 269.033s
+OK (skipped=582)
+
+## the same section with the code broken on purpose, one way at a time (the binary deleted before each build):
+## A no filter on the routes (frx[e] >= 0), B one region an expert, C no clearing of the scratch,
+## D the old rule fmt < 100, E Q36CC_DM_ROWS at 40
+### A
+  FAIL the routed experts in the pool, each once, in the table's order: weights, then scales
+  FAIL routes only to residents: nothing to copy (the scratch starts clean)
+  FAIL routes to every expert: the layer's whole copy, as a longer chunk makes it
+test_qwen36_cuda_chain: 3 failure(s)
+### B
+  FAIL the routed experts in the pool, each once, in the table's order: weights, then scales
+  FAIL routes to every expert: the layer's whole copy, as a longer chunk makes it
+test_qwen36_cuda_chain: 2 failure(s)
+### C
+  FAIL the routed experts in the pool, each once, in the table's order: weights, then scales
+  FAIL routes only to residents: nothing to copy (the scratch starts clean)
+test_qwen36_cuda_chain: 2 failure(s)
+### D
+  FAIL the formats with no staged table (int8, fp8) take no such list either
+test_qwen36_cuda_chain: 1 failure(s)
+### E
+  FAIL no staged chunk has a layer the host serves inside the frame: the wait for the routes cannot block
+test_qwen36_cuda_chain: 1 failure(s)
+
+## make cuda-chain-check CUDA=1 CUDA_ARCH=sm_75 on dev fd7ed68a (Tesla T4): not run on this branch, which does not
+## touch cuda_chain.cu; the three FAIL lines dev has
+  FAIL 300 rows: the up projection and the mix in one pass, those of the two ops to the bit
+  FAIL 100 rows: the up projection and the mix in one pass, those of the two ops to the bit
+lost
+  FAIL the counters saw the frames, ops and matmuls
+  ok   a failed launch loses the device to the chain
+  ok   every later call returns 0
+test_cuda_chain: 3 failure(s)
+
+## the engine's lines of one run on the T4 (dev, then this PR; the same lines in the 4 runs of each, but for the
+## times). The rule's line is only in this PR's runs (misura-p28/v1-run1.err)
+### dev
+[chain] qwen36: 99 forwards, 275 frames (111935 ops, 32769 matmuls), 498.1 ms waiting for the device, 1190.9 ms of routed experts on the host, 396.0 MiB on the device; per decode token 2.49 ms waiting, 6.48 ms of experts (96 tokens)
+[chain] qwen36: 83 prompt layer steps staged the host pool's experts (12.41 GB copied over the bus)
+[chain] qwen36: 2048 rows per prompt chunk (286 KiB a row, 1.7 GB free on the device; COLI_CUDA_CHAIN_ROWS sets it)
+### this PR
+[chain] qwen36: a prompt chunk copies its layers' host-pool experts over the bus, one of up to 256 rows only those its rows route to
+[chain] qwen36: 99 forwards, 318 frames (112021 ops, 32769 matmuls), 712.7 ms waiting for the device, 1137.5 ms of routed experts on the host, 396.0 MiB on the device; per decode token 2.49 ms waiting, 6.22 ms of experts (96 tokens)
+[chain] qwen36: 83 prompt layer steps staged the host pool's experts, 43 of them only those their rows route to (8.09 GB copied over the bus)
+[chain] qwen36: 2048 rows per prompt chunk (286 KiB a row, 1.7 GB free on the device; COLI_CUDA_CHAIN_ROWS sets it)
+
+## the frames and the chain's wait for the device in the 8 runs (the first four lines dev, the last four this PR)
+v0-run1: 99 forwards, 275 frames (111935 ops, 32769 matmuls), 498.1 ms waiting for the device
+v0-run2: 99 forwards, 275 frames (111935 ops, 32769 matmuls), 498.4 ms waiting for the device
+v0-run3: 99 forwards, 275 frames (111935 ops, 32769 matmuls), 498.7 ms waiting for the device
+v0-run4: 99 forwards, 275 frames (111935 ops, 32769 matmuls), 498.7 ms waiting for the device
+v1-run1: 99 forwards, 318 frames (112021 ops, 32769 matmuls), 712.7 ms waiting for the device
+v1-run2: 99 forwards, 318 frames (112021 ops, 32769 matmuls), 711.8 ms waiting for the device
+v1-run3: 99 forwards, 318 frames (112021 ops, 32769 matmuls), 713.0 ms waiting for the device
+v1-run4: 99 forwards, 318 frames (112021 ops, 32769 matmuls), 711.0 ms waiting for the device
+
+## the logits: the fingerprint, the nll and the top-1 of every run (the CSV's columns 10, 12 and 13), the lengths 64,
+## 512 and 64 after the 512. Dev's runs v0, this PR's v1; the same values in all 8 runs
+v0-run1: 64 4e0d1505a6060a16 nll 2.69270 top1 0.469 | 512 e82105bcd0bd1efa nll 2.96212 top1 0.469 | 64 9d8c5feaaca51a44 nll 2.69070 top1 0.469 |
+v0-run2: 64 4e0d1505a6060a16 nll 2.69270 top1 0.469 | 512 e82105bcd0bd1efa nll 2.96212 top1 0.469 | 64 9d8c5feaaca51a44 nll 2.69070 top1 0.469 |
+v0-run3: 64 4e0d1505a6060a16 nll 2.69270 top1 0.469 | 512 e82105bcd0bd1efa nll 2.96212 top1 0.469 | 64 9d8c5feaaca51a44 nll 2.69070 top1 0.469 |
+v0-run4: 64 4e0d1505a6060a16 nll 2.69270 top1 0.469 | 512 e82105bcd0bd1efa nll 2.96212 top1 0.469 | 64 9d8c5feaaca51a44 nll 2.69070 top1 0.469 |
+v1-run1: 64 4e0d1505a6060a16 nll 2.69270 top1 0.469 | 512 e82105bcd0bd1efa nll 2.96212 top1 0.469 | 64 9d8c5feaaca51a44 nll 2.69070 top1 0.469 |
+v1-run2: 64 4e0d1505a6060a16 nll 2.69270 top1 0.469 | 512 e82105bcd0bd1efa nll 2.96212 top1 0.469 | 64 9d8c5feaaca51a44 nll 2.69070 top1 0.469 |
+v1-run3: 64 4e0d1505a6060a16 nll 2.69270 top1 0.469 | 512 e82105bcd0bd1efa nll 2.96212 top1 0.469 | 64 9d8c5feaaca51a44 nll 2.69070 top1 0.469 |
+v1-run4: 64 4e0d1505a6060a16 nll 2.69270 top1 0.469 | 512 e82105bcd0bd1efa nll 2.96212 top1 0.469 | 64 9d8c5feaaca51a44 nll 2.69070 top1 0.469 |
+
+## tests/cuda_tier_engines.sh on this PR (the engines other than this chain)
+# On the Tesla T4 (sm_75), local commit 4306f437 in a fresh worktree, `PY=python3 bash tests/cuda_tier_engines.sh`: rc=0,
+# 42 OK lines and the last line, as printed:
+OK glm53 decode: tokens = CPU, device 56
+OK glm53 evict: tokens = CPU, device 16
+OK glm53 chain decode: tokens = CPU, max |logit diff| 4.77e-07 of 1.82e+00, 9 chain forwards
+OK glm53 chain 100-token prompt, 32-bit trunk: tokens = CPU, max |logit diff| 7.15e-07 of 1.97e+00, 5 chain forwards
+OK glm53 chain 100-token prompt, 4-bit trunk, exact GEMMs: tokens = CPU, max |logit diff| 5.96e-07 of 1.89e+00, 5 chain forwards
+OK glm53 chain 100-token prompt, 4-bit trunk, tensor cores: tokens = CPU, max |logit diff| 6.05e-04 of 1.89e+00, 5 chain forwards
+OK glm53 chain prefill chunks of 7, one cache slot: tokens = CPU, max |logit diff| 4.79e-07 of 1.89e+00, 19 chain forwards
+OK glm53 chain chunks of 3: tokens = CPU, max |logit diff| 5.96e-07 of 1.97e+00, 38 chain forwards
+OK qwen36 GGUF dense, DeltaNet qkv and gate in two types, a 12-row step: tokens = CPU, max |logit diff| 2.47e-02 of 3.14e+00, 2 in_proj as two tensors, the chain on
+OK qwen36 GGUF dense, DeltaNet qkv and gate in two types, chunks of 5: tokens = CPU, max |logit diff| 4.77e-07 of 3.14e+00, 2 in_proj as two tensors, the chain on
+OK qwen36 GGUF hybrid steps: tokens = CPU (48 hybrid layer steps)
+OK qwen36 GGUF hybrid steps, each signal sent at once: tokens = CPU (48 hybrid layer steps)
+OK qwen36 GGUF the host's word lost: tokens = CPU (0 hybrid layer steps)
+OK deepseek_v41 cap=1: output = CPU, oracle passed, device 287
+OK deepseek_v41 cap=2: output = CPU, oracle passed, device 287
+OK deepseek_v41 cap=8: output = CPU, oracle passed, device 287
+OK deepseek_v41 GGUF: tokens = CPU, device 228, 68 dense matrices on the card
+OK colibri GGUF chain decode: tokens = CPU, max |logit diff| 8.05e-07 of 1.81e+00, 8 chain forwards, device 90
+OK colibri GGUF chain decode, cap=1: tokens = CPU, max |logit diff| 8.05e-07 of 1.81e+00, 8 chain forwards, device 90
+OK colibri GGUF chain DSA top-4, the dense part at 8 bits (the serve's: the indexer's F32 head weights in int8): tokens = CPU, max |logit diff| 7.75e-07 of 1.46e+00, 8 chain forwards, device 282
+OK colibri GGUF chain 40-token prompt: tokens = CPU, max |logit diff| 7.75e-07 of 1.82e+00, 8 chain forwards, device 294
+OK colibri GGUF chain 40-token prompt in chunks of 3: tokens = CPU, max |logit diff| 7.75e-07 of 1.82e+00, 8 chain forwards, device 294
+OK colibri GGUF chain DSA top-4: tokens = CPU, max |logit diff| 7.15e-07 of 1.90e+00, 8 chain forwards, device 90
+OK colibri GGUF chain DSA top-4, 40-token prompt in chunks of 5: tokens = CPU, max |logit diff| 1.39e-06 of 1.69e+00, 8 chain forwards, device 282
+OK colibri GGUF chain DSA_FORCE: tokens = CPU, max |logit diff| 8.94e-07 of 1.82e+00, 8 chain forwards, device 294
+OK colibri GGUF chain 40-token prompt, tensor cores: tokens = CPU, max |logit diff| 1.39e-06 of 1.69e+00, 8 chain forwards, device 282
+OK colibri GGUF chain DSA top-4 over shared indexer layers (layers 2 and 3 reuse layer 1's selection): tokens = CPU, max |logit diff| 7.75e-07 of 1.77e+00, 8 chain forwards, device 90
+OK colibri GGUF chain DSA top-4 over shared indexer layers, 40-token prompt in chunks of 5: tokens = CPU, max |logit diff| 8.34e-07 of 1.73e+00, 7 chain forwards, device 288
+OK colibri int4 container dense on the card: tokens = CPU, max |logit diff| 1.22e-06 of 2.03e+00, 41 tensors on the card, 0 expert group calls
+OK colibri int4 container dense on the card, 40-token prompt: tokens = CPU, max |logit diff| 1.34e-06 of 1.86e+00, 41 tensors on the card, 0 expert group calls
+OK colibri int4 container dense and every expert on the card: tokens = CPU, max |logit diff| 1.16e-06 of 2.03e+00, 89 tensors on the card, 40 expert group calls
+OK colibri int4 container dense and every expert on the card, 40-token prompt: tokens = CPU, max |logit diff| 1.16e-06 of 1.86e+00, 89 tensors on the card, 40 expert group calls
+OK mimo dense bits 32: tokens = CPU, device 260, 16 dense matrices on the card
+OK mimo dense bits 0: tokens = CPU, device 260, 0 dense matrices on the card
+OK kimi_k3 GGUF all: tokens = CPU, logits within 2.0e-06 of the largest, device 120
+OK kimi_k3 GGUF budget of two: tokens = CPU, logits within 2.0e-06 of the largest, device 120
+OK kimi_k3 GGUF host pool: tokens = CPU, logits within 2.0e-06 of the largest, device 120
+OK glm53 dev2 decode: tokens = CPU, second device Tesla T4 (the same card): resident 2 (budget 14, 54.0 KiB of 13.96 GiB), 87 rows in 7 batches (1 beside prompt steps), uploads 2, 9.5 ms
+OK glm53 dev2 evict: tokens = CPU, second device Tesla T4 (the same card): resident 1 (budget 1, 27.0 KiB of 13.96 GiB), 44 rows in 4 batches (1 beside prompt steps), uploads 1, 8.8 ms
+OK glm53 dev2 fault: tokens = CPU, second device Tesla T4 (the same card): resident 0 (budget 0, 0.0 KiB of 13.96 GiB), 80 rows in 1 batches (1 beside prompt steps), uploads 2, 9.3 ms (stopped)
+OK deepseek_v41 dev2 decode: output = CPU, oracle passed, second device Tesla T4 (the same card): resident 46 (budget 46, 690.0 KiB of 13.96 GiB), 211 rows in 48 batches (0 beside prompt steps), uploads 46, 2.9 ms
+OK deepseek_v41 dev2 fault: output = CPU, oracle passed, second device Tesla T4 (the same card): resident 0 (budget 0, 0.0 KiB of 13.96 GiB), 17 rows in 1 batches (0 beside prompt steps), uploads 46, 0.2 ms (stopped)
+fails: 0
+
+## other logits in a process now and then, seen after the measure: it is dev's. A second VM of the same kind (14
+## November), one binary against itself, a warm-up and 5 + 5 processes, 10 s of rest. A line a process: the fingerprint
+## (its first 8 digits) and the nll of the three lengths, the slots the host served in decode, the prompt layer steps
+## staged, the tier's miss(CPU), the seconds to ready
+### dev fd7ed68a (v1-run2 is the odd one)
+warmup 4e0d1505/2.69270 e82105bc/2.96212 9d8c5fea/2.69070 | host-slots 4370 staged 83 miss 40005 ready 20.34
+v0-run1 4e0d1505/2.69270 e82105bc/2.96212 9d8c5fea/2.69070 | host-slots 4370 staged 83 miss 40005 ready 20.41
+v0-run2 4e0d1505/2.69270 e82105bc/2.96212 9d8c5fea/2.69070 | host-slots 4370 staged 83 miss 40005 ready 20.29
+v0-run3 4e0d1505/2.69270 e82105bc/2.96212 9d8c5fea/2.69070 | host-slots 4370 staged 83 miss 40005 ready 20.22
+v0-run4 4e0d1505/2.69270 e82105bc/2.96212 9d8c5fea/2.69070 | host-slots 4370 staged 83 miss 40005 ready 20.21
+v0-run5 4e0d1505/2.69270 e82105bc/2.96212 9d8c5fea/2.69070 | host-slots 4370 staged 83 miss 40005 ready 20.13
+v1-run1 4e0d1505/2.69270 e82105bc/2.96212 9d8c5fea/2.69070 | host-slots 4370 staged 83 miss 40005 ready 20.30
+v1-run2 4e0d1505/2.69270 9a4a9de2/2.96089 7717096b/2.70728 | host-slots 4359 staged 81 miss 40007 ready 20.14
+v1-run3 4e0d1505/2.69270 e82105bc/2.96212 9d8c5fea/2.69070 | host-slots 4370 staged 83 miss 40005 ready 20.34
+v1-run4 4e0d1505/2.69270 e82105bc/2.96212 9d8c5fea/2.69070 | host-slots 4370 staged 83 miss 40005 ready 20.18
+v1-run5 4e0d1505/2.69270 e82105bc/2.96212 9d8c5fea/2.69070 | host-slots 4370 staged 83 miss 40005 ready 20.21
+### this PR's commit (the warm-up and v1-run2 are the odd ones)
+warmup 4e0d1505/2.69270 318606fe/2.96250 7717096b/2.70728 | host-slots 4361 staged 81 miss 40009 ready 20.47
+v0-run1 4e0d1505/2.69270 e82105bc/2.96212 9d8c5fea/2.69070 | host-slots 4370 staged 83 miss 40005 ready 20.47
+v0-run2 4e0d1505/2.69270 e82105bc/2.96212 9d8c5fea/2.69070 | host-slots 4370 staged 83 miss 40005 ready 20.36
+v0-run3 4e0d1505/2.69270 e82105bc/2.96212 9d8c5fea/2.69070 | host-slots 4370 staged 83 miss 40005 ready 20.32
+v0-run4 4e0d1505/2.69270 e82105bc/2.96212 9d8c5fea/2.69070 | host-slots 4370 staged 83 miss 40005 ready 20.23
+v0-run5 4e0d1505/2.69270 e82105bc/2.96212 9d8c5fea/2.69070 | host-slots 4370 staged 83 miss 40005 ready 20.34
+v1-run1 4e0d1505/2.69270 e82105bc/2.96212 9d8c5fea/2.69070 | host-slots 4370 staged 83 miss 40005 ready 20.29
+v1-run2 4e0d1505/2.69270 9a4a9de2/2.96089 7717096b/2.70728 | host-slots 4359 staged 81 miss 40007 ready 20.28
+v1-run3 4e0d1505/2.69270 e82105bc/2.96212 9d8c5fea/2.69070 | host-slots 4370 staged 83 miss 40005 ready 20.30
+v1-run4 4e0d1505/2.69270 e82105bc/2.96212 9d8c5fea/2.69070 | host-slots 4370 staged 83 miss 40005 ready 20.45
+v1-run5 4e0d1505/2.69270 e82105bc/2.96212 9d8c5fea/2.69070 | host-slots 4370 staged 83 miss 40005 ready 20.29
+### dev (v0) and this PR's commit (v1), each with one throwaway line in qt_chain_hold(1) that waits for the queued
+### uploads before a chain forward (while G.inflight > 0, wait): the same values in the 11 processes (the last
+### number is the tier's swaps, not the seconds)
+warmup 4e0d1505/2.69270 e52d7103/2.96178 f8cef997/2.70365 | host-slots 4355 staged 81 miss 40004 swaps 426
+v0-run1 4e0d1505/2.69270 e52d7103/2.96178 f8cef997/2.70365 | host-slots 4355 staged 81 miss 40004 swaps 426
+v0-run2 4e0d1505/2.69270 e52d7103/2.96178 f8cef997/2.70365 | host-slots 4355 staged 81 miss 40004 swaps 426
+v0-run3 4e0d1505/2.69270 e52d7103/2.96178 f8cef997/2.70365 | host-slots 4355 staged 81 miss 40004 swaps 426
+v0-run4 4e0d1505/2.69270 e52d7103/2.96178 f8cef997/2.70365 | host-slots 4355 staged 81 miss 40004 swaps 426
+v0-run5 4e0d1505/2.69270 e52d7103/2.96178 f8cef997/2.70365 | host-slots 4355 staged 81 miss 40004 swaps 426
+v1-run1 4e0d1505/2.69270 e52d7103/2.96178 f8cef997/2.70365 | host-slots 4355 staged 81 miss 40004 swaps 426
+v1-run2 4e0d1505/2.69270 e52d7103/2.96178 f8cef997/2.70365 | host-slots 4355 staged 81 miss 40004 swaps 426
+v1-run3 4e0d1505/2.69270 e52d7103/2.96178 f8cef997/2.70365 | host-slots 4355 staged 81 miss 40004 swaps 426
+v1-run4 4e0d1505/2.69270 e52d7103/2.96178 f8cef997/2.70365 | host-slots 4355 staged 81 miss 40004 swaps 426
+v1-run5 4e0d1505/2.69270 e52d7103/2.96178 f8cef997/2.70365 | host-slots 4355 staged 81 miss 40004 swaps 426
