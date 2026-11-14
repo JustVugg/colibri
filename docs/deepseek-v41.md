@@ -657,7 +657,7 @@ projection tagged by the audit's regime):
 | 64K | 344 MiB | 0 | +0.34 | guard margin (not throughput) | ≤+2% |
 | 128K | 689 MiB | +1 | +0.67 | guard margin, the split stays unarmed ~4x longer | ≤+2% (+3-8% only with a `COLI_VK_TIER_GB` raise) |
 | 256K | 1,377 MiB | +2 | +1.34 | ≤2% | ≤+4% |
-| 1M | 5.4 GiB | +7 | +5.51 | unmeasured | up to +50% capacity, unmeasured |
+| 1M | 5.4 GiB | +7 | +5.39 | unmeasured | up to +50% capacity, unmeasured |
 
 The 64K row is the plan's ±1 resolved to 0, and the reason is the floor: the 344 MiB
 freed there is below one expert of every layer (771.14 MiB), and the slot a freed
@@ -892,7 +892,11 @@ proof) and checks the ledger's mirror math.
 The vendor quantizes some activations on the fly, in kernels that only exist for the
 GPU: the KV cache is rounded to fp8 before it is stored (`act_quant(..., inplace=True)`
 in `Attention.forward`), and the indexer's queries and keys, and the compressor's
-latents, are rounded to fp4. This engine keeps all of them in fp32 -- more precise, and
-therefore not bit-identical to a GPU run of the same weights. Nothing downstream is an
+latents, are rounded to fp4. The indexer's queries and the compressor's latents this
+engine keeps in fp32, more precise and therefore not bit-identical to a GPU run of the
+same weights; the KV cache itself it stores in the checkpoint's own packed formats by
+default now, with `COLI_VK_KV_FP32=1` the exact fp32 opt-out (the "Quantized KV mirrors"
+section above) -- near where the vendor is near, through the checkpoint's codecs rather
+than the vendor's kernels. Nothing downstream is an
 argmax over a near-tie by construction, but it is a difference, and it is the reason a
 divergence against a GPU reference would not necessarily be a bug here.
