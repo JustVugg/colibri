@@ -78,6 +78,16 @@ class GatewayHarness:
         status, headers, raw = self.request("/v1/images/generations", body)
         return status, headers, parse_sse(raw.decode("utf-8"))
 
+    def edit(self, **body):
+        body.setdefault("model", MODEL_ID)
+        return self.request("/v1/images/edits", body)
+
+    def stream_edit(self, **body):
+        body.setdefault("model", MODEL_ID)
+        body["stream"] = True
+        status, headers, raw = self.request("/v1/images/edits", body)
+        return status, headers, parse_sse(raw.decode("utf-8"))
+
 
 def parse_sse(text):
     """[(event, data)] in order; `data: [DONE]` appears as (None, "[DONE]")."""
@@ -293,6 +303,42 @@ class ImagesEndpointTest(unittest.TestCase):
                                            steps=2)
         self.assertEqual(status, 200, raw)
 
+    def test_image_edits_endpoint_returns_png_and_meta(self):
+        _s, _h, gen_raw = self.gw.generate(prompt="a blue circle", size="256x256", steps=2, seed=1)
+        base_b64 = json.loads(gen_raw)["data"][0]["b64_json"]
+        status, headers, raw = self.gw.edit(prompt="a red circle", image=base_b64, size="256x256",
+                                            steps=2, seed=1, strength=0.75)
+        self.assertEqual(status, 200, raw)
+        body = json.loads(raw)
+        self.assertEqual(set(body), {"created", "data", "colibri"})
+        width, height, channels, pixels = png_pixels(body["data"][0]["b64_json"])
+        self.assertEqual((width, height, channels), (256, 256, 4))
+        self.assertEqual(len(pixels), 256 * 256 * 4)
+
+    def test_image_edits_data_uri_and_streaming(self):
+        _s, _h, gen_raw = self.gw.generate(prompt="a star", size="256x256", steps=2, seed=5)
+        base_b64 = json.loads(gen_raw)["data"][0]["b64_json"]
+        data_uri = f"data:image/png;base64,{base_b64}"
+        status, headers, events = self.gw.stream_edit(prompt="a bright star", image=data_uri,
+                                                      size="256x256", steps=2, seed=5)
+        self.assertEqual(status, 200)
+        self.assertTrue(headers.get("Content-Type", "").startswith("text/event-stream"))
+        self.assertEqual(events[-1], (None, "[DONE]"))
+        self.assertEqual(events[-2][0], "image_generation.completed")
+
+    def test_image_edits_validation_errors(self):
+        status, _h, raw = self.gw.edit(prompt="a tree")
+        status, error = self.error(status, raw)
+        self.assertEqual(status, 400)
+        self.assertEqual(error["param"], "image")
+        _s, _h, gen_raw = self.gw.generate(prompt="base", size="256x256", steps=2)
+        base_b64 = json.loads(gen_raw)["data"][0]["b64_json"]
+        for bad_strength in (-0.1, 1.5, "high"):
+            status, _h, raw = self.gw.edit(prompt="modify", image=base_b64, strength=bad_strength)
+            status, error = self.error(status, raw)
+            self.assertEqual(status, 400)
+            self.assertEqual(error["param"], "strength")
+
 
 class ImagesFailureTest(unittest.TestCase):
     def test_engine_death_mid_stream_is_an_error_event_then_done(self):
@@ -380,6 +426,30 @@ class TextModelImagesTest(unittest.TestCase):
             entry = json.loads(conn.getresponse().read())["data"][0]
             self.assertNotIn("image_generation", entry["capabilities"])
             self.assertEqual(entry["capabilities"], ["chat", "systemone"])
+            conn.close()
+        finally:
+            server.scheduler.close()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_a_chat_model_refuses_image_edits(self):
+        class Chat:
+            def generate(self, *args, **kwargs):
+                raise AssertionError("never called")
+
+        server = APIServer(("127.0.0.1", 0), Chat(), "text-model", None, 16)
+        thread = threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True)
+        thread.start()
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=10)
+            conn.request("POST", "/v1/images/edits",
+                         json.dumps({"model": "text-model", "prompt": "x", "image": "abc"}),
+                         {"Content-Type": "application/json"})
+            response = conn.getresponse()
+            body = json.loads(response.read())
+            self.assertEqual(response.status, 400)
+            self.assertIn("does not generate images", body["error"]["message"])
             conn.close()
         finally:
             server.scheduler.close()
