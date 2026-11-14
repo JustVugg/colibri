@@ -104,24 +104,54 @@ def send(msgs, label, max_tokens=96):
     with urllib.request.urlopen(req, timeout=14400) as resp:
         payload = json.loads(resp.read())
     t = payload.get("timings", {})
-    text = payload["choices"][0]["message"]["content"]
+    msg = payload["choices"][0]["message"]
+    text = msg.get("content") or ""
+    calls = [(c.get("function", {}).get("name"), c.get("function", {}).get("arguments"))
+             for c in (msg.get("tool_calls") or [])]
     row = {"label": label, "client_total_s": round(time.time() - t0, 4)}
     for k in TURN_KEYS:
         row[k] = t.get(k)
+    row["emitted_tool_calls"] = calls
     row["output_sha12"] = hashlib.sha256(text.encode()).hexdigest()[:12]
     print(json.dumps(row), flush=True)
-    return row, text
+    # the engine's own turn, replayed verbatim (role/content/tool_calls/
+    # reasoning_content as received) — the reuse contract needs byte-identical
+    # prefixes, and a tool-call turn must come back as one
+    replay = {"role": "assistant", "content": text}
+    if msg.get("tool_calls"):
+        replay["tool_calls"] = msg["tool_calls"]
+    if msg.get("reasoning_content"):
+        replay["reasoning_content"] = msg["reasoning_content"]
+    return row, replay
+
+def replay_module(replay, fallback):
+    """the module the engine's tool call asked for, for the tool-result turn"""
+    try:
+        calls = replay.get("tool_calls") or []
+        args = json.loads(calls[0]["function"]["arguments"])
+        m = args.get("module")
+        if m in ("ingest", "delivery", "failure", "cost"):
+            return m
+    except (KeyError, ValueError, IndexError, TypeError):
+        pass
+    return fallback
 
 def session(name, mods, pads_user, pads_result, tag):
-    """One agent session: user -> assistant -> tool_calls -> tool -> user -> ..."""
-    hist = [("system", SYSTEM)]
+    """One agent session: user -> assistant (actual output, possibly a real
+    tool call) -> tool result for the module it asked about -> user -> ..."""
+    hist = [{"role": "system", "content": SYSTEM}]
     for i, (mod, pu, pr) in enumerate(zip(mods, pads_user, pads_result), 1):
-        hist = hist + [("user", f"[agent-ext {tag} {name}] In module {mod}, how does the "
-                                   f"{'recovery worker' if i % 2 else 'budgeter'} behave, "
-                                   "and which clause covers it? " + "context padding. " * pu)]
-        row, text = send(M.messages(*hist), f"{name}_t{i}")
-        hist = hist + [("assistant", text), tool_call_msg(mod),
-                       ("tool", TOOL_RESULT.format(m=mod, r=i) + "detail padding. " * pr)]
+        hist.append({"role": "user",
+                     "content": f"[agent-ext {tag} {name}] In module {mod}, how does the "
+                                f"{'recovery worker' if i % 2 else 'budgeter'} behave, "
+                                "and which clause covers it? " + "context padding. " * pu})
+        row, replay = send(list(hist), f"{name}_t{i}")
+        hist.append(replay)
+        mod_r = replay_module(replay, mod)
+        if not replay.get("tool_calls"):       # the engine stayed in prose: keep the
+            hist.append(tool_call_msg(mod_r))  # scripted tool-call turn for the shape
+        hist.append({"role": "tool",
+                     "content": TOOL_RESULT.format(m=mod_r, r=i) + "detail padding. " * pr})
 
 def main():
     if MODE == "smoke":

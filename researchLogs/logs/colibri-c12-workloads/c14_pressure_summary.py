@@ -15,15 +15,17 @@ import pathlib
 HERE = pathlib.Path(__file__).resolve().parent
 
 def load(arm):
-    p = HERE / f"phaseC14_pressure_{arm}.jsonl"
-    if not p.exists():
-        return None
+    """arm like 'idle0' or 'press2': merge its r1/r2 round files."""
     rows = []
-    for line in p.read_text().splitlines():
-        line = line.strip()
-        if line.startswith("{"):
-            rows.append(json.loads(line))
-    return rows
+    for r in (1, 2):
+        p = HERE / f"phaseC14_pressure_{arm}_r{r}.jsonl"
+        if not p.exists():
+            continue
+        for line in p.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                rows.append(json.loads(line))
+    return rows or None
 
 def dec(rows):
     return {r["label"]: r.get("decode_tokens_per_sec") for r in rows}

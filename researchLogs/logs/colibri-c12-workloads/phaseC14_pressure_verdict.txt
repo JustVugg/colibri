@@ -1,0 +1,71 @@
+
+idle0: per-turn
+  idle0_r1_t1: decode 7.874 tok/s  prefill 44.1s  ttft 44.2s  reused 0/1948  sha 456ecc343f37
+  idle0_r1_t2: decode 4.391 tok/s  prefill 11.5s  ttft 11.6s  reused 1961/2286  sha 2d2dd447f7a6
+  idle0_r1_t3: decode 3.964 tok/s  prefill 11.6s  ttft 11.8s  reused 2296/2621  sha 2d2dd447f7a6
+  idle0_r1_t4: decode 6.361 tok/s  prefill 11.9s  ttft 12.1s  reused 2631/2956  sha 2d2dd447f7a6
+  idle0_r2_t1: decode 7.668 tok/s  prefill 53.5s  ttft 53.7s  reused 0/1948  sha 456ecc343f37
+  idle0_r2_t2: decode 6.426 tok/s  prefill 12.8s  ttft 13.1s  reused 1961/2286  sha 2d2dd447f7a6
+  idle0_r2_t3: decode 3.801 tok/s  prefill 13.1s  ttft 13.3s  reused 2296/2621  sha 2d2dd447f7a6
+  idle0_r2_t4: decode 3.817 tok/s  prefill 13.3s  ttft 13.5s  reused 2631/2956  sha 2d2dd447f7a6
+
+idle2: per-turn
+  idle2_r1_t1: decode 7.466 tok/s  prefill 46.6s  ttft 46.8s  reused 0/1948  sha 456ecc343f37
+  idle2_r1_t2: decode 7.041 tok/s  prefill 12.1s  ttft 12.3s  reused 1961/2286  sha 2d2dd447f7a6
+  idle2_r1_t3: decode 2.458 tok/s  prefill 12.1s  ttft 12.3s  reused 2296/2621  sha 2d2dd447f7a6
+  idle2_r1_t4: decode 6.218 tok/s  prefill 13.1s  ttft 13.3s  reused 2631/2956  sha 2d2dd447f7a6
+  idle2_r2_t1: decode 7.747 tok/s  prefill 52.9s  ttft 53.1s  reused 0/1948  sha 456ecc343f37
+  idle2_r2_t2: decode 4.213 tok/s  prefill 13.0s  ttft 13.2s  reused 1961/2286  sha 2d2dd447f7a6
+  idle2_r2_t3: decode 4.059 tok/s  prefill 13.2s  ttft 13.5s  reused 2296/2621  sha 2d2dd447f7a6
+  idle2_r2_t4: decode 2.979 tok/s  prefill 13.4s  ttft 13.7s  reused 2631/2956  sha 2d2dd447f7a6
+
+press0: per-turn
+  press0_r1_t1: decode 7.709 tok/s  prefill 51.9s  ttft 52.1s  reused 0/1948  sha 456ecc343f37
+  press0_r1_t2: decode 6.894 tok/s  prefill 12.8s  ttft 13.0s  reused 1961/2286  sha 2d2dd447f7a6
+  press0_r1_t3: decode 6.557 tok/s  prefill 12.7s  ttft 12.9s  reused 2296/2621  sha 2d2dd447f7a6
+  press0_r1_t4: decode 5.217 tok/s  prefill 12.9s  ttft 13.1s  reused 2631/2956  sha 2d2dd447f7a6
+  press0_r2_t1: decode 7.823 tok/s  prefill 51.8s  ttft 52.0s  reused 0/1948  sha 456ecc343f37
+  press0_r2_t2: decode 3.634 tok/s  prefill 12.5s  ttft 12.7s  reused 1961/2286  sha 2d2dd447f7a6
+  press0_r2_t3: decode 4.940 tok/s  prefill 12.8s  ttft 13.1s  reused 2296/2621  sha 2d2dd447f7a6
+  press0_r2_t4: decode 5.947 tok/s  prefill 13.1s  ttft 13.4s  reused 2631/2956  sha 2d2dd447f7a6
+
+press2: per-turn
+  press2_r1_t1: decode 7.797 tok/s  prefill 51.6s  ttft 51.8s  reused 0/1948  sha 456ecc343f37
+  press2_r1_t2: decode 7.163 tok/s  prefill 12.9s  ttft 13.1s  reused 1961/2286  sha 2d2dd447f7a6
+  press2_r1_t3: decode 3.439 tok/s  prefill 13.0s  ttft 13.2s  reused 2296/2621  sha 2d2dd447f7a6
+  press2_r1_t4: decode 5.661 tok/s  prefill 13.4s  ttft 13.6s  reused 2631/2956  sha 2d2dd447f7a6
+  press2_r2_t1: decode 7.802 tok/s  prefill 53.3s  ttft 53.5s  reused 0/1948  sha 456ecc343f37
+  press2_r2_t2: decode 7.117 tok/s  prefill 13.0s  ttft 13.3s  reused 1961/2286  sha 2d2dd447f7a6
+  press2_r2_t3: decode 6.548 tok/s  prefill 13.1s  ttft 13.3s  reused 2296/2621  sha 2d2dd447f7a6
+  press2_r2_t4: decode 6.174 tok/s  prefill 13.6s  ttft 13.9s  reused 2631/2956  sha 2d2dd447f7a6
+
+paired decode deltas (hybrid2 vs 0):
+  r1 t1 idle: 7.874 -> 7.466 tok/s (-5.2%)
+  r1 t2 idle: 4.391 -> 7.041 tok/s (+60.3%)
+  r1 t3 idle: 3.964 -> 2.458 tok/s (-38.0%)
+  r1 t4 idle: 6.361 -> 6.218 tok/s (-2.2%)
+  r2 t1 idle: 7.668 -> 7.747 tok/s (+1.0%)
+  r2 t2 idle: 6.426 -> 4.213 tok/s (-34.4%)
+  r2 t3 idle: 3.801 -> 4.059 tok/s (+6.8%)
+  r2 t4 idle: 3.817 -> 2.979 tok/s (-22.0%)
+  idle mean: -4.2%
+  r1 t1 press: 7.709 -> 7.797 tok/s (+1.1%)
+  r1 t2 press: 6.894 -> 7.163 tok/s (+3.9%)
+  r1 t3 press: 6.557 -> 3.439 tok/s (-47.6%)
+  r1 t4 press: 5.217 -> 5.661 tok/s (+8.5%)
+  r2 t1 press: 7.823 -> 7.802 tok/s (-0.3%)
+  r2 t2 press: 3.634 -> 7.117 tok/s (+95.8%)
+  r2 t3 press: 4.940 -> 6.548 tok/s (+32.6%)
+  r2 t4 press: 5.947 -> 6.174 tok/s (+3.8%)
+  press mean: +12.2%
+
+paired decode deltas (pressure vs idle, hybrid 0):
+  r1 t1: 7.874 -> 7.709 tok/s (-2.1%)
+  r1 t2: 4.391 -> 6.894 tok/s (+57.0%)
+  r1 t3: 3.964 -> 6.557 tok/s (+65.4%)
+  r1 t4: 6.361 -> 5.217 tok/s (-18.0%)
+  r2 t1: 7.668 -> 7.823 tok/s (+2.0%)
+  r2 t2: 6.426 -> 3.634 tok/s (-43.4%)
+  r2 t3: 3.801 -> 4.940 tok/s (+30.0%)
+  r2 t4: 3.817 -> 5.947 tok/s (+55.8%)
+  mean: +18.3%
