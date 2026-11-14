@@ -1122,12 +1122,17 @@ class Releases(HomeTestCase):
         # #2091: a CUDA choice on Windows with no engine here takes the release's
         # engines and unpacks its CUDA backend over them
         tc = dict(TC_ALL, source_checkout=False, can_build=False, can_build_vulkan=False)
+        # The modeled host's processor, not the one running the test (as in
+        # prebuilt_download above): a host whose detect_cpu reports no AVX2 is
+        # rightly refused the prebuilt engine, which this download must not hit.
+        modern = {"arch": "x86_64", "name": "a processor with AVX2", "features": ["avx2"]}
         for cuda in (True, False):
             with self.subTest(cuda=cuda):
                 empty = os.path.join(self.tmp.name, f"nothing-here-{cuda}")
                 os.makedirs(empty)
                 getter = self.windows_release("v2.1.0", f"release-{cuda}", cuda=cuda)
                 with modeled("win32"), mock.patch.object(setup_flow, "HERE", empty), \
+                     mock.patch.object(setup_hw, "detect_cpu", return_value=modern), \
                      mock.patch.dict(os.environ, {"COLI_SETUP_HOME": os.path.join(self.tmp.name, f"h-{cuda}")}), \
                      mock.patch.object(setup_flow, "_api_get", side_effect=getter):
                     out = []
