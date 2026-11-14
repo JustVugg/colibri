@@ -11,6 +11,12 @@ on:
 permissions:
   contents: read
 
+# A new push to a pull request cancels that PR's older run. Pushes to dev and
+# main each get their own group (run_id), so they are never queued or cancelled.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   # The environment-variable registry (c/coli_env.h) against the sources. No
   # build, no model, no GPU -- seconds, so it reports before anything else.
