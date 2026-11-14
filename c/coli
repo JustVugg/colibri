@@ -3767,7 +3767,11 @@ def _stop_proc_table(port):
     # header, so `pid=,comm=,command=` there is the pid alone.
     if table: return table
     try:
-        out=subprocess.run(["ps","-Aww","-o","pid=","-o","comm=","-o","command="],
+        # ucomm, not comm: macOS's comm is the executable's whole path cut at 16
+        # characters ("/Users/risner/tm" for an engine in a home folder), which named no
+        # engine, so one whose launcher was gone was never found. ucomm is the name alone
+        # on macOS and the BSDs, and Linux's ps takes it as comm.
+        out=subprocess.run(["ps","-Aww","-o","pid=","-o","ucomm=","-o","command="],
                            capture_output=True,text=True,timeout=10).stdout
     except (OSError,subprocess.SubprocessError):
         return []
