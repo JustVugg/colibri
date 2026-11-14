@@ -2049,8 +2049,8 @@ four configurations).
 device, deepseek_v41 chains the first N and `forward_full`'s CPU loop runs the rest from
 layer N (`v41c_forward` returns the layers it ran). The handoff gives back every row's
 `hc_mult` streams and the last FFN site's mix, and the host state the CPU's layers read
-from a chain layer within the same forward: the candidate mask (`m->candidates`, when the
-candidate source is a chain layer and an index source after N reads it) and the index
+from a chain layer within the same forward: the candidate blocks (`m->candidates`, when the
+candidate source is a chain layer and an index source after N reads them) and the index
 list the last chain index source published (`m->shared_topk`, which a compressed layer
 after N reads before the next index source runs). A chain layer that reads a CPU layer's
 index keys (the published-key rule: the layer that published last, or an earlier row's
@@ -3928,7 +3928,7 @@ predict a layer more than the engine places.
 | qwen38 | the four hyper-connection streams of every row; the MTP head reads the final streams from whichever side ran the last layer, and the PLE ring and n-gram history stay with the PLE layer's side | yes |
 | colibri (GLM-5.2) | the residual rows; when layer N is a shared DSA indexer layer, the selection the device's last full layer made (1 + `index_topk` ints a row) | yes ([GLM](#glm-52-and-glm-53-flash-on-the-chain)) |
 | glm53 (GLM-5.3 Flash) | the hc_mult streams | yes ([GLM](#glm-52-and-glm-53-flash-on-the-chain)) |
-| deepseek_v41 | the hc_mult streams and the last site's mix; the candidate mask and the published index list a chain layer made for the CPU's layers; DSpark's target means from whichever side ran them | yes |
+| deepseek_v41 | the hc_mult streams and the last site's mix; the candidate blocks and the published index list a chain layer made for the CPU's layers; DSpark's target means from whichever side ran them | yes |
 | kimi_k3 | the AttnRes prefix, the block snapshots and their count; with every layer but not the head, the final rows for the CPU's head | yes |
 
 **`COLI_VK_DEVICE_CAP_MB=n`** (tests) limits the device to n MiB of device
@@ -3955,7 +3955,7 @@ reports, its allocation granularity) is not verified.
 
 `partial-dsk` does the same for DeepSeek V4.1 Flash and Kimi K3 on Lavapipe:
 `COLI_VK_CHAIN_LAYERS` at every k of their six-layer fixtures (V4.1's cuts at 2 and 4 hand
-the CPU's layers the index list and the candidate mask; Kimi K3's at 1, 3 and 5 cut inside
+the CPU's layers the index list and the candidate blocks; Kimi K3's at 1, 3 and 5 cut inside
 an AttnRes block of two layers); `COLI_VK_DEVICE_CAP_MB` aimed at 0, 1, 3 and 5 layers and
 at every layer but the head (the line's N and `coli plan`'s, with the same free, per-layer
 and fixed bytes); an upload failing inside layers 0, 2 and 4, and with the dense weights on

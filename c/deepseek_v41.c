@@ -266,6 +266,17 @@ static void cfg_load(Cfg *c, const char *snap) {
         c->index_head_dim < 0 || (c->index_head_dim > 0 && c->rope_dim > c->index_head_dim)) {
         fprintf(stderr, "[cfg] rope_head_dim %d does not fit head_dim %d and index_head_dim %d\n",
                 c->rope_dim, c->head_dim, c->index_head_dim); exit(1); }
+    /* The candidate blocks' width: a row of ids is `candidate_topk_blocks` int32 slots, a
+     * number the host clamps to one and the chain hands the shader unclamped, so a value
+     * below one would make the host's stride and the device's topk disagree about the same
+     * forward. Above 1,048,576 (the family's registered maximum context,
+     * `family_registry.py`) a row cannot keep more blocks than it has positions, so refusing
+     * it loses nothing, and the allocation is rows x topk x 4 B: a config field is not the
+     * place to ask for more than that. */
+    if (c->candidate_source >= 0 &&
+        (c->candidate_topk_blocks < 1 || c->candidate_topk_blocks > (1 << 20))) {
+        fprintf(stderr, "[cfg] candidate_topk_blocks %d out of range (1..%d)\n",
+                c->candidate_topk_blocks, 1 << 20); exit(1); }
     int ratios[V41_MAX_LAYERS] = {0};
     int nr = jints(t, "compress_ratios", ratios, V41_MAX_LAYERS);
     if (nr < c->n_layers) {
@@ -1348,9 +1359,13 @@ typedef struct {
     /* rope tables: [max_pos, rope_dim/2] cos/sin pairs, one per theta in use */
     float *rope_window, *rope_compress;
     int pos;                    /* positions consumed so far */
-    /* candidate mask published by the candidate source layer, one row per query */
-    uint8_t *candidates;
-    int candidate_width, candidate_rows;
+    /* candidate blocks published by the candidate source layer, one row of block ids per
+     * query: `candidate_topk` int32 slots, -1 past the blocks that row keeps (P1), in the
+     * source's coordinates (DI's block_candidate_idxs, P5). `candidate_width` is no size
+     * any more -- it is the source's reach, the bound its row was painted to (P2/P3), and
+     * every source-layer row set refreshes it. */
+    int32_t *candidates;
+    int candidate_topk, candidate_width, candidate_rows;
     /* What an index source publishes for the layers after it (model.py's
      * shared_attn.topk_idxs): the compressed positions each query keeps, already
      * shifted by the window offset. A layer that compresses but does not index reads
@@ -1427,7 +1442,7 @@ typedef struct {
     int32_t *history; int history_len, history_cap;
     const float *published_index_k; int published_index_layer;
     int *shared_topk; int shared_topk_rows, shared_topk_width;
-    uint8_t *candidates; int candidate_width, candidate_rows;
+    int32_t *candidates; int candidate_topk, candidate_width, candidate_rows;
 } V41Seq;
 static int g_v41_mux_slots = 1;   /* KV_SLOTS: the conversations a serve decodes at once */
 
@@ -2681,7 +2696,9 @@ static int compressor_run(Model *m, int layer, const float *x, int n, int start_
     return produced;
 }
 
-/* model.py select_candidate_blocks, one query row. `keep` is `width` bytes. */
+/* model.py select_candidate_blocks, one query row. `keep` is `width` bytes, and it is
+ * also the source of the block ids the layers after the source read (candidate_row_ids):
+ * the selection stays here, in one place, and the ids are its re-encoding. */
 static void candidate_blocks(const Cfg *c, const float *score, int width, int lens, uint8_t *keep) {
     int block = c->candidate_block_size;
     int blocks = (width + block - 1) / block;
@@ -2705,6 +2722,61 @@ static void candidate_blocks(const Cfg *c, const float *score, int width, int le
         best[chosen] = -INFINITY;
     }
     free(best);
+}
+
+/* The blocks `row` keeps -- block b kept iff any of its positions is set -- in block order,
+ * and -1 in every slot from there to `topk`: the source's selection in the source's
+ * coordinates (DI's block_candidate_idxs). Every slot is written, so a reader scans all
+ * `topk` and skips -1 rather than trusting the count; -1 never names a block. Both writers
+ * paint at most `candidate_topk_blocks` blocks, so nothing is dropped here. */
+static int candidate_row_ids(const uint8_t *row, int block, int scan, int topk, int32_t *ids) {
+    int blocks = (scan + block - 1) / block, n = 0;
+    for (int b = 0; b < blocks; b++) {
+        int hit = 0;
+        for (int i = b * block; i < (b + 1) * block && i < scan; i++) hit |= row[i] != 0;
+        if (hit && n < topk) ids[n++] = b;
+    }
+    for (int k = n; k < topk; k++) ids[k] = -1;
+    return n;
+}
+
+/* Those ids back into one row's mask. `w` = candidate_paint_width(this layer's compress_len,
+ * the mask's candidate_width). A paint can set a position the published row held 0: a row the
+ * chain converted was clipped at the chunk's reach `wc`, so the block straddling `wc` is
+ * repainted out to `(b+1)*block`, up to a block past it. No reader consults those positions --
+ * a reader's reach `lens` is at most `wc` (v41c_unsupported refuses a consumer of another
+ * ratio) and indexer_run has set score[j] = -INFINITY past its own reach before the mask
+ * runs -- so the bits a reader masks on are the ones the source kept. Positions past `w` are
+ * left untouched. */
+static void candidate_keep_row(const int32_t *ids, int nids, int block, int w, uint8_t *keep) {
+    memset(keep, 0, (size_t)w);
+    for (int k = 0; k < nids; k++) {
+        int b = ids[k];
+        /* -1 is the padding, and a block that starts at or past `w` paints nothing. The bound
+         * is on the id, not on its product: `b * block` would wrap on a 32-bit long (Windows)
+         * and let a poisoned id through. `block < 1` names no blocks and would divide by
+         * zero here; candidate_blocks divides by it first, but the guard keeps this line
+         * defined on its own. */
+        if (block < 1 || b < 0 || b > (w - 1) / block) continue;
+        for (int i = b * block; i < (b + 1) * block && i < w; i++) keep[i] = 1;
+    }
+}
+
+/* The bound the reader paints its row to: this layer's reach, clipped to the source's (the
+ * width the source painted its row to). Extracted so the gate can assert the min where it is
+ * computed, not only where it is used. */
+static int candidate_paint_width(int compress_len, int candidate_width) {
+    return compress_len < candidate_width ? compress_len : candidate_width;
+}
+
+/* The candidate blocks' allocation: rows x topk int32 whatever the reach, and so independent
+ * of the prompt's length (it was rows x reach bytes). The ids are the source's blocks, so no
+ * width enters here; a topk of 0 keeps one slot a row, never a zero-byte one. `topk` is the
+ * caller's, never the config's: an allocation and the copy of it size the same slots, so a
+ * stored topk that differed from the config's can only be the difference between a copy that
+ * fits and one that does not. */
+static size_t v41_candidate_bytes(int topk, int rows) {
+    return (size_t)(rows > 0 ? rows : 1) * (size_t)(topk > 0 ? topk : 1) * sizeof(int32_t);
 }
 
 /* Does this layer complete a compression group at `pos`, and so republish its index
@@ -2747,6 +2819,9 @@ static void indexer_run(Model *m, int layer, const float *x, const float *qr, in
     float *wblk = xmalloc((size_t)block * nh * sizeof(float), "indexer weights");
     float *score = xmalloc((size_t)compress_len * sizeof(float), "indexer scores");
     uint64_t *work = xmalloc((size_t)(compress_len > 0 ? compress_len : 1) * 2 * sizeof(uint64_t), "indexer order");
+    /* one row of the mask, this layer's reach long: the source paints there and a reader
+     * of the source's blocks reconstructs there (candidate_blocks, candidate_keep_row) */
+    uint8_t *maskrow = NULL;
     float scale = (1.0f / sqrtf((float)ihd)) * (1.0f / sqrtf((float)nh));
 
     for (int t = 0; t < n; t++) {
@@ -2793,17 +2868,37 @@ static void indexer_run(Model *m, int layer, const float *x, const float *qr, in
             score[j] = total;
         }
         if (layer == c->candidate_source) {
-            if (m->candidate_width != compress_len || m->candidate_rows != n) {
+            int topk = c->candidate_topk_blocks > 0 ? c->candidate_topk_blocks : 1;
+            if (m->candidate_topk != topk || m->candidate_rows != n) {
                 free(m->candidates);
-                m->candidates = xmalloc((size_t)n * compress_len, "candidate mask");
-                m->candidate_width = compress_len;
+                m->candidates = xmalloc(v41_candidate_bytes(topk, n), "candidate blocks");
+                m->candidate_topk = topk;
                 m->candidate_rows = n;
             }
-            candidate_blocks(c, score, compress_len, lens, m->candidates + (size_t)t * compress_len);
+            /* The ids' reach, and the bound the row is painted to -- refreshed on every row
+             * set, never a realloc trigger: a stale one would paint a different width. */
+            m->candidate_width = compress_len;
+            if (!maskrow) maskrow = xmalloc((size_t)(compress_len > 0 ? compress_len : 1), "candidate row");
+            candidate_blocks(c, score, compress_len, lens, maskrow);
+            candidate_row_ids(maskrow, c->candidate_block_size, compress_len, m->candidate_topk,
+                              m->candidates + (size_t)t * m->candidate_topk);
         } else if (c->candidate_source >= 0 && c->candidate_source < layer && m->candidates) {
-            const uint8_t *keep = m->candidates + (size_t)t * m->candidate_width;
-            for (int j = 0; j < compress_len && j < m->candidate_width; j++)
-                if (!keep[j]) score[j] = -INFINITY;
+            /* The ids carry no reach of their own: candidate_width is the source layer's, set
+             * from its compress_len on every row set and carried with the ids by v41_unpark,
+             * so it is there before any layer after the source reads. w = 0 would drop every
+             * position silently, so the order is checked rather than assumed -- a tripwire:
+             * the producers above make it unreachable, which is why it has no test. */
+            if (compress_len > 0 && m->candidate_width <= 0) {
+                fprintf(stderr, "[v41] candidate blocks at layer %d with no source reach "
+                                "(candidate_width %d)\n", layer, m->candidate_width);
+                exit(1);
+            }
+            int w = candidate_paint_width(compress_len, m->candidate_width);
+            if (!maskrow) maskrow = xmalloc((size_t)(compress_len > 0 ? compress_len : 1), "candidate row");
+            candidate_keep_row(m->candidates + (size_t)t * m->candidate_topk, m->candidate_topk,
+                               c->candidate_block_size, w, maskrow);
+            for (int j = 0; j < w; j++)
+                if (!maskrow[j]) score[j] = -INFINITY;
         }
         /* top-k, then back into position order: the attention kernel treats every slot
          * independently, but keeping them sorted makes the concatenated index list
@@ -2813,7 +2908,7 @@ static void indexer_run(Model *m, int layer, const float *x, const float *qr, in
         for (int k = 0; k < topk; k++)
             row[k] = (k < taken && row[k] < lens) ? row[k] + offset : -1;
     }
-    free(qblk); free(wblk); free(score); free(work);
+    free(qblk); free(wblk); free(score); free(work); free(maskrow);
 }
 
 /* wo_a is block diagonal over o_groups: each group projects only its own heads, and
@@ -4521,7 +4616,7 @@ static int v41_prefill_tail(const Cfg *c, int n, int spec_batch, int keep_rows, 
 
 /* Past the source layer: the rows of the tail to the front of every per-row buffer the
  * later layers read (the streams and their mix, the DSpark input a target layer at or
- * before the source wrote, the candidate mask, the index list the last index source
+ * before the source wrote, the candidate blocks, the index list the last index source
  * published), the forward's rows and start the tail's. */
 static void v41_take_tail(Model *m, float *h, float *pre_mix, int *n, int *start_pos, int tail, int targets, int *trace_row) {
     const Cfg *c = &m->c;
@@ -4531,7 +4626,8 @@ static void v41_take_tail(Model *m, float *h, float *pre_mix, int *n, int *start
     if (targets && m->main_hidden)
         memmove(m->main_hidden, m->main_hidden + (size_t)r0 * targets * dim, (size_t)tail * targets * dim * sizeof(float));
     if (m->candidates && m->candidate_rows == *n) {
-        memmove(m->candidates, m->candidates + (size_t)r0 * m->candidate_width, (size_t)tail * m->candidate_width);
+        int topk = m->candidate_topk > 0 ? m->candidate_topk : 1;
+        memmove(m->candidates, m->candidates + (size_t)r0 * topk, (size_t)tail * topk * sizeof(int32_t));
         m->candidate_rows = tail;
     }
     /* The layers past the source that run no indexer of their own read this list. Its
@@ -4836,7 +4932,8 @@ static void v41_seq_swap(Model *m, V41Seq *q) {
     V41_SWAP(int, m->published_index_layer, q->published_index_layer);
     V41_SWAP(int *, m->shared_topk, q->shared_topk);
     V41_SWAP(int, m->shared_topk_rows, q->shared_topk_rows); V41_SWAP(int, m->shared_topk_width, q->shared_topk_width);
-    V41_SWAP(uint8_t *, m->candidates, q->candidates);
+    V41_SWAP(int32_t *, m->candidates, q->candidates);
+    V41_SWAP(int, m->candidate_topk, q->candidate_topk);
     V41_SWAP(int, m->candidate_width, q->candidate_width); V41_SWAP(int, m->candidate_rows, q->candidate_rows);
 #undef V41_SWAP
 }
@@ -5008,6 +5105,19 @@ static void model_reset_rows(Model *m, int n) {
     m->engram.history_len = 0;
     m->published_index_k = NULL;
     m->shared_topk_rows = m->shared_topk_width = 0;
+    /* The candidate blocks go further than the shared list's rows = 0: its readers key on
+     * the pointer, not a row count, so a stale buffer would still be read (a reader that ran
+     * before this conversation's source layer refreshed it -- unreachable today, because the
+     * source runs before its consumers in every forward, and kept that way by inspection
+     * rather than by a gate). Freeing is also the honest accounting: this and the shared
+     * list are the state a reset drops that scales with the prompt (2 GiB of blocks at
+     * 262144 rows), the blocks being the half whose next publisher is a whole forward away
+     * -- the shared list's buffer keeps its older habit of waiting for its next publisher
+     * to resize it -- and the rows the state keeps apart (park, a short request) were
+     * already saved by v41_park before this runs. */
+    free(m->candidates);
+    m->candidates = NULL;
+    m->candidate_topk = m->candidate_width = m->candidate_rows = 0;
     m->pos = 0;
 #ifdef COLI_VULKAN
     v41c_reset(m);   /* nothing on the device describes the new sequence */
@@ -5348,14 +5458,14 @@ static int v41_prompt_poll(ColiPromptBreak *b) {
  * layer's window ring rows and their positions, the compressed rows and index keys of the
  * positions the request may write (a row for `ratio` of them), the compressor's partial
  * group, the engram history's first entries, and what crosses forwards (the index keys
- * published last, the shared top-k list, the candidate mask); the next request brings them
+ * published last, the shared top-k list, the candidate blocks); the next request brings them
  * back, keeps them parked or drops them (v41_park_decide). The host's state stays canonical:
  * the chains' watermarks come down to 0. The draft head's windows are not kept: no prompt
  * resets them either, and a draft is only verified. */
 #define V41_PARK_SPEC 16   /* the rows a verify writes past the tokens that stand */
 static ColiPark g_v41_park;
-static struct { int history_len, published_layer, topk_rows, topk_width, cand_width, cand_rows;
-                const float *published; int *topk; uint8_t *cand; } g_v41_park_x;
+static struct { int history_len, published_layer, topk_rows, topk_width, cand_topk, cand_width, cand_rows;
+                const float *published; int *topk; int32_t *cand; } g_v41_park_x;
 static Tok *g_v41_log_tok;   /* the request's tokenizer, for COLI_PREFIX_LOG */
 static void v41_decode_one(int id, unsigned char *out, int *n) {
     *n = g_v41_log_tok ? tok_decode(g_v41_log_tok, &id, 1, (char *)out, 255) : 0;
@@ -5397,8 +5507,9 @@ static int v41_park(Model *m, int np, int max_tok) {   /* the rows kept apart, 0
         g_v41_park_x.published = m->published_index_k; g_v41_park_x.published_layer = m->published_index_layer;
         g_v41_park_x.topk_rows = m->shared_topk_rows; g_v41_park_x.topk_width = m->shared_topk_width;
         g_v41_park_x.topk = v41_dup(m->shared_topk, (size_t)m->shared_topk_rows * (m->shared_topk_width > 0 ? m->shared_topk_width : 1) * sizeof(int));
-        g_v41_park_x.cand_width = m->candidate_width; g_v41_park_x.cand_rows = m->candidate_rows;
-        g_v41_park_x.cand = v41_dup(m->candidates, (size_t)m->candidate_rows * m->candidate_width);
+        g_v41_park_x.cand_topk = m->candidate_topk; g_v41_park_x.cand_rows = m->candidate_rows;
+        g_v41_park_x.cand_width = m->candidate_width;
+        g_v41_park_x.cand = v41_dup(m->candidates, v41_candidate_bytes(m->candidate_topk, m->candidate_rows));
     }
     free(p);
     return g_v41_park.on ? n : 0;
@@ -5413,7 +5524,12 @@ static void v41_unpark(Model *m) {
         free(m->shared_topk); m->shared_topk = g_v41_park_x.topk; g_v41_park_x.topk = NULL;
         m->shared_topk_rows = m->shared_topk ? g_v41_park_x.topk_rows : 0; m->shared_topk_width = m->shared_topk ? g_v41_park_x.topk_width : 0;
         free(m->candidates); m->candidates = g_v41_park_x.cand; g_v41_park_x.cand = NULL;
-        m->candidate_width = m->candidates ? g_v41_park_x.cand_width : 0; m->candidate_rows = m->candidates ? g_v41_park_x.cand_rows : 0;
+        m->candidate_topk = m->candidates ? g_v41_park_x.cand_topk : 0;
+        /* The width is the bound the ids were painted to, not their size any more, and it
+         * travels with them: a reader that runs before the source layer is refreshed reads the
+         * reach the parked rows were selected at, as base's dense row did. */
+        m->candidate_width = m->candidates ? g_v41_park_x.cand_width : 0;
+        m->candidate_rows = m->candidates ? g_v41_park_x.cand_rows : 0;
 #ifdef COLI_VULKAN
         v41c_reset(m);   /* the host's rows from 0 are the conversation's again: the mirrors go up again */
 #endif
@@ -5447,7 +5563,7 @@ static void v41_park_decide(Model *m, const int *ids, int np, int max_tok, int i
  * them, and checkpoints of the rest (every layer's window ring and its positions, the compressor's
  * filling group, the layer whose index keys were published last) where a prompt's messages start
  * and where it ends. A prompt's rows read past a checkpoint publish their own top-k lists and
- * candidate masks before any layer reads them, so those are not kept (a decoded position would
+ * candidate blocks before any layer reads them, so those are not kept (a decoded position would
  * read the last forward's, and nothing here resumes one). Only what a prompt read put there: a
  * request that started from nothing or from the store saves, one that resumed the live state (with
  * decoded positions) or a photo does not, so a request that takes a checkpoint computes what the
@@ -5565,6 +5681,10 @@ static int v41_ps_take(Model *m, const int *ids, int np, int held) {
     m->published_index_k = x->pub_layer >= 0 ? m->L[x->pub_layer].ikey : NULL;
     m->published_index_layer = x->pub_layer >= 0 ? x->pub_layer : m->published_index_layer;
     m->shared_topk_rows = m->shared_topk_width = 0;   /* as model_reset_rows: the prompt's rows publish their own */
+    free(m->candidates);   /* ... and the candidate blocks are dropped, not kept: the state put back is the
+                            * store's positions, whose rows publish their own before any layer reads them */
+    m->candidates = NULL;
+    m->candidate_topk = m->candidate_width = m->candidate_rows = 0;
     m->engram.history_len = 0;
     if (m->engram.active) engram_push(&m->engram, ids, P, NULL);   /* the history is the ids' */
     m->pos = P;

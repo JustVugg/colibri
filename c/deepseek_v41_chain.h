@@ -387,7 +387,7 @@ static int v41c_clean_at(const Model *m, int b) {
  * prompt chunk and the pools' granularity. The CPU runs layers N.. and the head; the
  * streams of every row and the last site's mix cross to the host once per forward
  * (v41c_forward), with the host state the CPU's layers read from a chain layer: the
- * candidate mask (m->candidates) and the index list (m->shared_topk). A chain layer that
+ * candidate blocks (m->candidates) and the index list (m->shared_topk). A chain layer that
  * reads the index keys of a CPU layer (the published-key rule) reads the host's rows, as
  * the CPU's layer order has them, from a mirror of that layer's keys. */
 static int v41c_scratch(V41Chain *ch, Model *m, int rows, int ctx);
@@ -1264,8 +1264,8 @@ static int v41c_forward_seg(Model *m, V41Chain *ch, float *h, float *pre_mix, in
         return 0;
     }
     /* A partial chain's handoff beyond the streams: the CPU's layers read the candidate
-     * mask a chain layer made (the candidate source is a chain layer, an index source
-     * after N reads it) and the index list the last chain index source published (a
+     * blocks a chain layer made (the candidate source is a chain layer, an index source
+     * after N reads them) and the index list the last chain index source published (a
      * compressed layer after N reads it before the next index source runs). */
     int cs = c->candidate_source, cand_out = 0, list_out = -1, list_w = 0;
     if (hi < L) {
@@ -1352,13 +1352,15 @@ static int v41c_forward_seg(Model *m, V41Chain *ch, float *h, float *pre_mix, in
         v41c_off(ch);
         return 0;
     }
-    if (cand_out) {   /* the CPU's mask, as indexer_run sizes it */
+    if (cand_out) {   /* the CPU's candidate blocks, as indexer_run sizes them */
+        int topk = c->candidate_topk_blocks > 0 ? c->candidate_topk_blocks : 1;
         int width = E / c->compress_ratio[cs];
-        if (m->candidate_width != width || m->candidate_rows != n) {
+        if (m->candidate_topk != topk || m->candidate_rows != n) {
             free(m->candidates);
-            m->candidates = xmalloc((size_t)n * (width > 0 ? width : 1), "candidate mask");
-            m->candidate_width = width; m->candidate_rows = n;
+            m->candidates = xmalloc(v41_candidate_bytes(topk, n), "candidate blocks");
+            m->candidate_topk = topk; m->candidate_rows = n;
         }
+        m->candidate_width = width;   /* the device mask's reach, the paint bound: refreshed, not sized on */
     }
     if (list_out >= 0 && (m->shared_topk_rows != n || m->shared_topk_width != list_w)) {   /* the CPU's list, as attention_run sizes it */
         free(m->shared_topk);
@@ -1441,13 +1443,23 @@ static int v41c_forward_seg(Model *m, V41Chain *ch, float *h, float *pre_mix, in
                 int r = c->compress_ratio[i], g0 = pb / r, np = (pb + nr) / r - g0;
                 if (np > 0) memcpy(l->ckv + (size_t)g0 * hd, vkc_ptr(ch->cdn), (size_t)np * hd * sizeof(float));
             }
-            if (cand_out && i == cs) {                     /* the candidate source's mask, for the CPU's readers */
+            if (cand_out && i == cs) {                     /* the candidate source's blocks, for the CPU's readers */
                 const int32_t *mk = (const int32_t *)vkc_ptr(ch->cmd);
                 int wc = (pb + nr) / c->compress_ratio[cs], wh = m->candidate_width;
+                /* the device's row, converted at its own reach `wc` and then read as blocks:
+                 * the ids name the blocks the device painted, and the repaint that follows at
+                 * `wh` also paints a straddling block's tail past `wc`. No reader consults it:
+                 * v41c_unsupported keeps every consumer on the source's ratio, so a reader's
+                 * reach is at most `wc`, and indexer_run has set the score past it to -INFINITY
+                 * before the mask runs (P3). */
+                uint8_t *keep = xmalloc((size_t)(wh > 0 ? wh : 1), "candidate row");
                 for (int s = 0; s < nr; s++) {
-                    uint8_t *keep = m->candidates + (size_t)(c0 + s) * wh;
-                    for (int j = 0; j < wh; j++) keep[j] = j < wc && mk[(size_t)s * ch->wcap + j] != 0;
+                    const int32_t *mrow = mk + (size_t)s * ch->wcap;
+                    for (int j = 0; j < wh; j++) keep[j] = j < wc && mrow[j] != 0;
+                    candidate_row_ids(keep, c->candidate_block_size, wh, m->candidate_topk,
+                                      m->candidates + (size_t)(c0 + s) * m->candidate_topk);
                 }
+                free(keep);
             }
             /* A2: the shared expert, while the host computes the routed experts */
             ok = vkc_begin() && v41c_shared(ch, m, l, nr) && vkc_submit(0);
