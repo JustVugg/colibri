@@ -568,9 +568,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   chain's device wrote differs it does so past the chunk's reach, where the score is already
   `-inf`; `c/tests/test_dsv41_candidate_ids.c` holds the selection and the repaint against a
   frozen copy of the pre-change writer, on 11,760 cases (2,464 of them sensitive to a stale
-  padding slot). The device masks the chain still paints stay dense (a separate change), and so
-  does allocating the prompt's rows rather than the tail's (2 GiB to 19.8 MB at 262144), which is
-  named there.
+  padding slot), and pins the extraction's truncation fallback (more set blocks than slots,
+  which no writer produces: the first topk in block order, every slot written). A conversation
+  reset and a prefix-store take now drop the blocks too, as they already dropped the shared
+  top-k list: the rows a reset keeps apart were saved by park first, and a new conversation
+  no longer holds the last one's allocation (2 GiB at 262144) live. The device masks the
+  chain still paints stay dense (a separate change), and so does allocating the prompt's
+  rows rather than the tail's (2 GiB to 19.8 MB at 262144), which is named there.
 - **CUDA on Windows: the answer stopped a few tokens in with the card at 100%** (#2696). Windows'
   WDDM driver model, which WSL2 drives the card through too, holds CUDA launches back and sends
   them in batches. A hybrid step (a layer whose experts are partly in RAM) has the card signal the

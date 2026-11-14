@@ -5105,6 +5105,16 @@ static void model_reset_rows(Model *m, int n) {
     m->engram.history_len = 0;
     m->published_index_k = NULL;
     m->shared_topk_rows = m->shared_topk_width = 0;
+    /* The candidate blocks go further than the shared list's rows = 0: its readers key on
+     * the pointer, not a row count, so a stale buffer would still be read (a reader that ran
+     * before this conversation's source layer refreshed it -- unreachable today, because the
+     * source runs before its consumers in every forward, and kept that way by inspection
+     * rather than by a gate). Freeing is also the honest accounting: this is the one state a
+     * reset drops that scales with the prompt (2 GiB at 262144 rows), and the rows the state
+     * keeps apart (park, a short request) were already saved by v41_park before this runs. */
+    free(m->candidates);
+    m->candidates = NULL;
+    m->candidate_topk = m->candidate_width = m->candidate_rows = 0;
     m->pos = 0;
 #ifdef COLI_VULKAN
     v41c_reset(m);   /* nothing on the device describes the new sequence */
@@ -5668,6 +5678,10 @@ static int v41_ps_take(Model *m, const int *ids, int np, int held) {
     m->published_index_k = x->pub_layer >= 0 ? m->L[x->pub_layer].ikey : NULL;
     m->published_index_layer = x->pub_layer >= 0 ? x->pub_layer : m->published_index_layer;
     m->shared_topk_rows = m->shared_topk_width = 0;   /* as model_reset_rows: the prompt's rows publish their own */
+    free(m->candidates);   /* ... and the candidate blocks are dropped, not kept: the state put back is the
+                            * store's positions, whose rows publish their own before any layer reads them */
+    m->candidates = NULL;
+    m->candidate_topk = m->candidate_width = m->candidate_rows = 0;
     m->engram.history_len = 0;
     if (m->engram.active) engram_push(&m->engram, ids, P, NULL);   /* the history is the ids' */
     m->pos = P;

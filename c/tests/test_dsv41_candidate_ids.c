@@ -22,7 +22,10 @@
  *     row and [w, width) against the poison -- an over-paint is a CHECK, not a heap abort;
  *  P5 the ids are block ids in the source's own coordinates.
  * The memory side (v41_candidate_bytes) is asserted at the end: no width enters it, and the
- * topk is the caller's, so an allocator and the copy of its array cannot disagree. */
+ * topk is the caller's, so an allocator and the copy of its array cannot disagree. The
+ * extraction's truncation branch (a row with more set blocks than slots -- unreachable in
+ * the engine, where both writers paint at most topk blocks) is pinned by truncated_row so
+ * the fallback stays a documented choice: the first topk blocks in block order. */
 #define main dsv41_main_unused
 #include "../deepseek_v41.c"
 #undef main
@@ -121,6 +124,29 @@ static int clipped_row(void) {
     return 0;
 }
 
+static int truncated_row(void) {
+    /* A row with more set blocks than slots: nothing in the engine produces one (both writers
+     * paint at most candidate_topk_blocks blocks -- candidate_blocks' `wanted` and the shader's
+     * `wanted` -- and test_vk_chain holds the device's mask to the CPU's slot-for-slot), so
+     * this branch is a fallback, not a path. It is pinned here so that if the invariant ever
+     * breaks the fallback is a chosen, documented answer -- the first `topk` blocks in block
+     * order, every slot still written (P1) -- rather than an accident someone stumbles into. */
+    enum { width = 12, block = 2, slots = 3 };
+    uint8_t row[width], back[width];
+    int32_t ids[slots];
+    memset(row, 1, sizeof row);   /* all six blocks set, three slots */
+    int kept = candidate_row_ids(row, block, width, slots, ids);
+    CHECK(kept == slots);                          /* full, and in block order from the first */
+    CHECK(ids[0] == 0 && ids[1] == 1 && ids[2] == 2);
+    memset(back, 0, sizeof back);
+    candidate_keep_row(ids, slots, block, width, back);
+    for (int j = 0; j < 6; j++) CHECK(back[j] == 1);   /* blocks 0..2 repainted */
+    for (int j = 6; j < width; j++) CHECK(back[j] == 0);   /* blocks 3..5 dropped, visibly */
+    /* and the drop is visible to the padding-sensitive check too: the kept prefix is not the
+     * whole row, so a stale slot past `kept` (there is none: kept == slots) cannot hide it */
+    return 0;
+}
+
 static int candidate_bytes(void) {
     /* 262144 rows x 2048 slots x 4 B: the reach does not appear, so neither does n^2 */
     CHECK(v41_candidate_bytes(2048, 262144) == 2147483648u);
@@ -142,6 +168,7 @@ int main(void) {
     if (pinned_tie_vector()) return 1;
     if (paint_width()) return 1;
     if (clipped_row()) return 1;
+    if (truncated_row()) return 1;
     for (size_t wi = 0; wi < sizeof widths / sizeof *widths; wi++) {
         int width = widths[wi], nblocks = 0;
         float *score = malloc((size_t)width * sizeof(float));
