@@ -10,12 +10,12 @@
 <p align="center">
   <a href="https://justvugg.github.io/colibri"><b>网站</b></a> ·
   <a href="https://discord.gg/RXV83nSZdk"><b>Discord</b></a> ·
-  <a href="README.md">English</a> · 简体中文 · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.it.md">Italiano</a> · <a href="README.ja.md">日本語</a> · <a href="README.id.md">Bahasa Indonesia</a> · <a href="README.pt-BR.md">Português (Brasil)</a>
+  <a href="README.md">English</a> · 简体中文 · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.it.md">Italiano</a> · <a href="README.ja.md">日本語</a> · <a href="README.id.md">Bahasa Indonesia</a> · <a href="README.pt-BR.md">Português (Brasil)</a> · <a href="README.es.md">Español</a> · <a href="README.fr.md">Français</a> · <a href="README.de.md">Deutsch</a> · <a href="README.ru.md">Русский</a>
 </p>
 
 **小巧引擎，庞大模型。** colibri 在你现有的机器上运行超大规模的开放模型。一个拥有数千亿参数的专家混合（mixture-of-experts，MoE）模型，每个 token 只会用到自身的一小部分，因此 colibri 把这一部分放在内存中，其余部分，也就是各个专家，则在模型需要时从磁盘读取。纯 C 实现，每个模型家族一个文件，不需要 GPU。
 
-如今有十三个引擎在运行。其中十个用于语言模型：**GLM-5.2/5.3**（也运行 **Mistral-Large-4**）、**GLM-5.3-Flash**、**Inkling**、**Kimi K3**、**DeepSeek V4 Flash**、**DeepSeek V4.1 Flash**、**MiMo-V2.6 Flash**（以及 Pro）、**Qwen3.8-Flash-Next**、**Qwen3.6**（也运行 Qwen3-Coder、稠密的 Qwen3.8-27B、**Flint**、**Muse Spark Open** 和 **LFM3-VL**）以及 **OLMoE**。一个用来画图：**Qwen-Image-2.1**。两个用来回答决策问题：**Laya** 和 **GLiNER2.5-Decide**，第三个决策模型 **Clef** 运行在 Qwen3.6 引擎上。语言模型也可以直接运行已发布的 GGUF 文件，按原样读取（[GGUF](docs/gguf.md)），可在 CPU 上运行，可通过 Vulkan 在任何 GPU 上运行，也可通过 CUDA 在 NVIDIA 显卡上运行。[哪一个适合我的机器](#which-model-for-my-machine)
+如今有十三个引擎在运行。其中十个用于语言模型：**GLM-5.2/5.3**（也运行 **Mistral-Large-4**）、**GLM-5.3-Flash**、**Inkling**、**Kimi K3**（以及 K3.1 Pro）、**DeepSeek V4 Flash**、**DeepSeek V4.1 Flash**、**MiMo-V2.6 Flash**（以及 Pro）、**Qwen3.8-Flash-Next**、**Qwen3.6**（也运行 Qwen3-Coder、稠密的 Qwen3.8-27B、**Flint**、**Muse Spark Open** 和 **LFM3-VL**）以及 **OLMoE**。一个用来画图：**Qwen-Image-2.1**。两个用来回答决策问题：**Laya** 和 **GLiNER2.5-Decide**，第三个决策模型 **Clef** 运行在 Qwen3.6 引擎上。语言模型也可以直接运行已发布的 GGUF 文件，按原样读取（[GGUF](docs/gguf.md)），可在 CPU 上运行，可通过 Vulkan 在任何 GPU 上运行，也可通过 CUDA 在 NVIDIA 显卡上运行。[哪一个适合我的机器](#which-model-for-my-machine)
 
 ```
 $ ./coli chat
@@ -161,6 +161,7 @@ Starting colibri
 | **Inkling**（975B）：int4 专家，bf16 稠密权重 | `inkling` | 514 GB | 按下载格式为 120 / 128 GB；经过[稠密部分转换](docs/inkling.md)后为 25 GB | CUDA、Vulkan | 0.25 tok/s（Ryzen 9 7900，187 GB，RTX A6000） |
 | MiMo-V2.6 Pro（1.02T）：视觉和工具调用 | `mimo-v2.6-pro` | 564 GB | 54 / 64 GB | Vulkan | 0.66-0.79 tok/s（A，CPU） |
 | **Kimi K3**（2.8T）：最大的模型 | `kimi-k3` | 1.56 TB | 32 / 64 GB | CUDA、Vulkan | 每个 token 约 9.4 秒，专家读取速度为 6.3 GB/s |
+| **Kimi K3.1 Pro**（2.8T）：超过 2048 个 token 时启用稀疏注意力的 K3 | `kimi-k3.1-pro` | 1.56 TB | 32 / 64 GB | CUDA、Vulkan | |
 
 <a id="other-supported-models"></a>
 
@@ -177,7 +178,7 @@ Starting colibri
 
 **来自 GGUF：已发布的文件，按原样读取**
 
-`./coli import` 接收 GGUF 的第一个文件（其他分片放在旁边），并在旁边写出一个模型目录；之后像其他模型一样把这个目录传给 `--model`（[gguf.md](docs/gguf.md)）。不做转换，也不再次量化：各个块按文件中的样子运行，从 IQ1_S 到 Q8_0、F16、BF16 和 MXFP4。上面所有聊天模型的引擎也都能读取 GGUF（[架构列表](docs/gguf.md#supported-architectures)）；下面这四个模型以 GGUF 形式发布：
+`./coli import` 接收 GGUF 的第一个文件（其他分片放在旁边），并在旁边写出一个模型目录；之后像其他模型一样把这个目录传给 `--model`（[gguf.md](docs/gguf.md)）。不做转换，也不再次量化：各个块按文件中的样子运行，从 IQ1_S 到 Q8_0、F16、BF16 和 MXFP4。上面所有聊天模型的引擎也都能读取 GGUF（[架构列表](docs/gguf.md#supported-architectures)）；下面这些模型以 GGUF 形式发布：
 
 | 模型 | GGUF | GPU | 实测 |
 |---|---|---|---|
@@ -185,6 +186,7 @@ Starting colibri
 | **Muse Spark Open**（816B，激活 42B）：文本和工具调用，遵循 Meta 的许可协议 | unsloth，从 UD-IQ1_S 176 GB 到 UD-Q4_K_XL 505 GB | CUDA、Vulkan | Vulkan 1.55-1.58 tok/s，CUDA 1.34-1.40，CPU 0.83-0.89（D） |
 | **Flint**（40B，激活 2.5B）：文本和工具调用，Apache 2.0 | unsloth，从 UD-IQ1_M 11.4 GB 到 BF16 79.6 GB | CUDA、Vulkan | UD-Q4_K_XL：CUDA 77.4 tok/s，Vulkan 77.7，CPU 15.8（D） |
 | **LFM3-VL-2B**：文本、图像和工具调用，LFM Open License | LiquidAI，从 QAD-Q4_0 到 BF16（或转换后的 checkpoint） | CUDA、Vulkan | Q4_K_M：CUDA 235.1 tok/s，Vulkan 214.1，CPU 34.5（D） |
+| **Qwen-Image-2.1** 及其 **Turbo**：文生图，非商业许可（[qwen-image.md](docs/qwen-image.md#gguf-unsloth)） | unsloth，从 Q2_K 2.5 GB 到 F16 14.2 GB，文本编码器为 Qwen3-VL-8B-Instruct GGUF | Vulkan | Turbo Q4_K_M，1024x1024 在 8 步内：Vulkan 上去噪 37 秒（D）；512x512 时 CPU 上每步 8.4-9.3 秒（A） |
 
 上面表格中更大的模型从其 GGUF 在同一台机器上的结果：[基准测试](#large-models-on-the-same-machine)。
 
@@ -307,7 +309,7 @@ curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -
 </p>
 <p align="center"><em><strong>System One</strong>：给模型一份文档，以及它唯一可以选择的几个答案。图中 RTX PRO 4000 上的 Qwen3.6-35B 读取一个破坏了缓存大小上限的拉取请求：<strong>request changes 的概率为 81%</strong>，熵 0.56（不确定），读取 98 个 token，生成 0 个。</em></p>
 
-**性能剖析**（Profiling）页面按阶段显示每一轮的时间花在了哪里，并以最近 30 轮作为趋势。
+**性能剖析**（Profiling）页面按阶段显示每一轮的时间花在了哪里，并以最近 30 轮作为趋势。若在网关旁安装了 [joules](https://pypi.org/project/landauer-gap/)（`pip install landauer-gap`），它还会显示机器的功率（watts）以及上一轮每个 token 的焦耳数（joules）。
 
 ### 终端界面
 
@@ -326,6 +328,7 @@ curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -
 - **兼容 Anthropic**：`/v1/messages`，因此 Claude Code 和 Anthropic SDK 可以直接连接它；
 - **工具调用**：除 Inkling 和 OLMoE 之外的每个聊天引擎都支持，各自使用其模型的原生格式（[各引擎对照表](docs/api.md#tool-calling-support)）；
 - **图像输入**：GLM-5.3-Flash、DeepSeek V4.1 Flash、MiMo-V2.6、Qwen3.8-Flash-Next、Qwen3.8-27B、LFM3-VL 和 Mistral-Large-4（来自 GGUF 时，把 `mmproj` 文件放在旁边）支持，方式可以是 `coli chat` 消息中的一个路径、`coli web` 或 `coli ui` 中的一个附件，或一个 `image_url` 部分；
+- **文档输入**：在每个聊天引擎上可用：在 `coli chat` 中使用 `/file PATH`（或 `coli chat --file PATH`），会把一个文本文件或 PDF 的文字随下一条消息一起发送。只读取以这种方式指定的文件，从不读取消息中的路径；它必须是带文本后缀或 `.pdf` 的普通文件，大小不超过 64 MiB，且不超过 200 万个字符。PDF 在单独的进程中解析，并有时间和内存限制，使用 `pdftotext`（poppler）或 `pypdf`；
 - **图像输出**：Qwen-Image-2.1 通过 `POST /v1/images/generations` 提供，`coli chat` 还能直接在终端中显示图片（[qwen-image.md](docs/qwen-image.md)）；
 - **决策**：通过 `POST /v1/systemone`（[见上文](#system-one-a-decision-with-a-probability)）。
 - **同时进行多个对话**：在每个文本引擎上，`coli serve --kv-slots N` 最多保留 16 个对话，每个都有自己的缓存，并把它们的下一个 token 一起解码（[api.md](docs/api.md#isolated-kv-contexts)）。
@@ -477,7 +480,7 @@ colibri 希望前沿模型更少依赖稀缺硬件，运行成本更低。这意
 | Vulkan：专家层级、稠密链、没有 Resizable BAR 的显卡 | [vulkan.md](docs/vulkan.md) |
 | CUDA，以及 Qwen3.6 的 CUDA 层级 | [cuda.md](docs/cuda.md)、[qwen36-cuda-tier.md](docs/qwen36-cuda-tier.md) |
 | Apple Silicon、Windows | [metal.md](docs/metal.md)、[windows.md](docs/windows.md) |
-| 调优、学习型缓存、预取、推测解码 | [tuning.md](docs/tuning.md) |
+| 调优、学习型缓存、预取 | [tuning.md](docs/tuning.md) |
 | 推测解码：MTP head、提示词查找、关卡 | [speculative.md](docs/speculative.md) |
 | 多块 SSD、多台机器 | [multidisk.md](docs/multidisk.md)、[cluster.md](docs/cluster.md) |
 | 基准测试以及如何测量 | [benchmarks.md](docs/benchmarks.md)、[benchmarking.md](docs/benchmarking.md) |

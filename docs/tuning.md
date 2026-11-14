@@ -112,7 +112,10 @@ The OpenMP runtime reads these variables before `main()`, so they must be set
 on the engine invocation rather than exported after startup. The engine uses
 `overwrite=0`; explicit values remain authoritative. `GOMP_SPINCOUNT` applies
 to libgomp and `KMP_BLOCKTIME` to Intel/LLVM OpenMP runtimes, so carrying both
-keeps the command portable across common builds.
+keeps the command portable across common builds. On Windows, MinGW's libgomp
+(the gcc builds) ignores the wait policy and the spin count alike: its barriers
+always sleep on a semaphore. A clang build links LLVM's libomp, which does spin
+(#2286, [deepseek-v4.md](deepseek-v4.md#build)).
 
 Treat this as a measured per-host override, not a recommended CUDA default.
 Compare it against the unchanged command with stable page-cache state and an

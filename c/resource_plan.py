@@ -2504,6 +2504,18 @@ def _host_memory_available(meminfo_path):
     return kib * 1024
 
 
+def freebsd_available_bytes(sysctl_text):
+    """Available memory on FreeBSD from ``sysctl -n vm.stats.vm.v_free_count
+    vm.stats.vm.v_inactive_count vm.stats.vm.v_page_size`` (one number per line):
+    free + inactive pages, the definition the C engine's compat_meminfo_gb uses
+    there. ``None`` when the output is not those three numbers."""
+    try:
+        free, inactive, page = (int(value) for value in (sysctl_text or "").split())
+    except ValueError:
+        return None
+    return (free + inactive) * page
+
+
 def memory_available(*, meminfo_path=Path("/proc/meminfo"),
                      cgroup_root=Path("/sys/fs/cgroup"),
                      proc_cgroup_path=Path("/proc/self/cgroup"),
@@ -2587,6 +2599,18 @@ def memory_available(*, meminfo_path=Path("/proc/meminfo"),
             if total:
                 return int(total)
         except (OSError, subprocess.SubprocessError, ValueError):
+            pass
+    # FreeBSD: no /proc/meminfo unless linprocfs is mounted there, which a default
+    # install does not do. The kernel's page counters instead (freebsd_available_bytes).
+    if sys.platform.startswith("freebsd"):
+        try:
+            out = subprocess.run(["sysctl", "-n", "vm.stats.vm.v_free_count",
+                                  "vm.stats.vm.v_inactive_count", "vm.stats.vm.v_page_size"],
+                                 text=True, capture_output=True, timeout=5).stdout
+            available = freebsd_available_bytes(out)
+            if available:
+                return available
+        except (OSError, subprocess.SubprocessError):
             pass
     return None
 

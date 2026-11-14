@@ -24,6 +24,26 @@
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include <hip/hip_bf16.h>
+/* The DeepSeek V4 backend was written against CUDA's spellings. Map the two
+ * bf16 names it uses that HIP spells differently, as llama.cpp's
+ * ggml/src/ggml-cuda/vendors/hip.h does. The fp8 names live in
+ * backend_cuda_dsv4_quant.cuh: <hip/hip_fp8.h> has the OCP e4m3 type only
+ * from ROCm 6.3, and backend_cuda.cu (built by the ROCm 6.2 CI image) does
+ * not need it. */
+typedef __hip_bfloat16 __nv_bfloat16;
+typedef __hip_bfloat162 __nv_bfloat162;
+/* HIP's __shfl_*_sync takes a 64-bit mask, which is not the CUDA contract the
+ * backend is written to. Map to the legacy intrinsics (the mask is dropped),
+ * as llama.cpp's vendors/hip.h does. Without a width the group is 32 lanes,
+ * CUDA's warp, not warpSize: the callers' lanes are threadIdx.x & 31, so a
+ * wave64 target (GCN, CDNA) shuffles in 32-lane groups too, like bd_shfl and
+ * cc_shfl_xor. Run on RDNA only. */
+#define COLI_SHFL_WIDTH(_0, width, ...) width
+#define __shfl_sync(mask, var, lane, ...)      __shfl(var, lane, COLI_SHFL_WIDTH(_0, ##__VA_ARGS__, 32))
+#define __shfl_up_sync(mask, var, lane, ...)   __shfl_up(var, lane, COLI_SHFL_WIDTH(_0, ##__VA_ARGS__, 32))
+#define __shfl_down_sync(mask, var, lane, ...) __shfl_down(var, lane, COLI_SHFL_WIDTH(_0, ##__VA_ARGS__, 32))
+#define __shfl_xor_sync(mask, var, lane, ...)  __shfl_xor(var, lane, COLI_SHFL_WIDTH(_0, ##__VA_ARGS__, 32))
 /* rocWMMA requires matrix cores (MFMA: gfx908+, WMMA: gfx11xx); on other
  * targets (gfx906, gfx101x, gfx103x) its headers static_assert. The Makefile
  * passes -DCOLI_HIP_NO_WMMA for those archs: the WMMA kernel bodies stay
@@ -61,6 +81,16 @@ namespace nvcuda { namespace wmma = ::rocwmma; }
 #define cudaError_t              hipError_t
 #define cudaSuccess              hipSuccess
 #define cudaErrorMemoryAllocation hipErrorOutOfMemory
+#define cudaErrorNoKernelImageForDevice hipErrorNoBinaryForGpu
+#define cudaErrorInvalidDeviceFunction hipErrorInvalidDeviceFunction
+#define cudaErrorLaunchFailure hipErrorLaunchFailure
+#define cudaErrorLaunchOutOfResources hipErrorLaunchOutOfResources
+#define cudaDeviceReset hipDeviceReset
+typedef hipFuncAttributes cudaFuncAttributes;
+#define cudaFuncGetAttributes hipFuncGetAttributes
+#define cudaDevAttrCooperativeLaunch hipDeviceAttributeCooperativeLaunch
+#define cudaOccupancyMaxActiveBlocksPerMultiprocessor hipOccupancyMaxActiveBlocksPerMultiprocessor
+#define cudaLaunchCooperativeKernel hipLaunchCooperativeKernel
 #define cudaErrorNotReady        hipErrorNotReady
 #define cudaGetErrorString       hipGetErrorString
 #define cudaGetLastError         hipGetLastError
@@ -69,12 +99,23 @@ namespace nvcuda { namespace wmma = ::rocwmma; }
 #define cudaGetDeviceCount       hipGetDeviceCount
 #define cudaDeviceProp           hipDeviceProp_t
 #define cudaGetDeviceProperties  hipGetDeviceProperties
+#define cudaDevAttrIntegrated    hipDeviceAttributeIntegrated
+#define cudaDevAttrPageableMemoryAccessUsesHostPageTables hipDeviceAttributePageableMemoryAccessUsesHostPageTables
+#define cudaDeviceGetAttribute  hipDeviceGetAttribute
+#define cudaDeviceCanAccessPeer  hipDeviceCanAccessPeer
+#define cudaDeviceEnablePeerAccess hipDeviceEnablePeerAccess
+#define cudaErrorHostMemoryAlreadyRegistered hipErrorHostMemoryAlreadyRegistered
+#define cudaErrorPeerAccessAlreadyEnabled  hipErrorPeerAccessAlreadyEnabled
+#define cudaProfilerStart        hipProfilerStart
+#define cudaProfilerStop         hipProfilerStop
 #define cudaMalloc               hipMalloc
 #define cudaMallocManaged        hipMallocManaged
 #define cudaFree                 hipFree
 #define cudaMemcpy               hipMemcpy
 #define cudaMemcpy2D             hipMemcpy2D
-#define cudaFuncSetAttribute     hipFuncSetAttribute
+#define cudaMemcpy2DAsync        hipMemcpy2DAsync
+#define cudaFuncSetAttribute(func, attr, value) \
+    hipFuncSetAttribute((const void *)(func), (hipFuncAttribute)(attr), (int)(value))
 #define cudaGetDevice            hipGetDevice
 #define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
 #define cudaMemcpyAsync          hipMemcpyAsync
@@ -89,6 +130,22 @@ namespace nvcuda { namespace wmma = ::rocwmma; }
 #define cudaStreamDestroy        hipStreamDestroy
 #define cudaStreamSynchronize    hipStreamSynchronize
 #define cudaStreamWaitEvent      hipStreamWaitEvent
+#define cudaGraph_t              hipGraph_t
+#define cudaGraphExec_t          hipGraphExec_t
+#define cudaGraphDestroy         hipGraphDestroy
+#define cudaGraphExecDestroy     hipGraphExecDestroy
+#define cudaGraphLaunch          hipGraphLaunch
+#define cudaStreamBeginCapture   hipStreamBeginCapture
+#define cudaStreamEndCapture     hipStreamEndCapture
+#define cudaStreamCaptureModeThreadLocal hipStreamCaptureModeThreadLocal
+/* CUDA's cudaGraphInstantiate(exec, graph, flags) has no 1:1 HIP twin before
+ * HIP 7; hipGraphInstantiate takes error-node/log arguments instead. */
+static inline hipError_t cudaGraphInstantiate(hipGraphExec_t *exec,
+                                              hipGraph_t graph,
+                                              unsigned long long flags) {
+    (void)flags;
+    return hipGraphInstantiate(exec, graph, nullptr, nullptr, 0);
+}
 #define cudaDeviceSynchronize    hipDeviceSynchronize
 #define cudaEvent_t              hipEvent_t
 #define cudaEventCreate          hipEventCreate

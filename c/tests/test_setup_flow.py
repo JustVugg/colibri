@@ -964,7 +964,8 @@ class Releases(HomeTestCase):
         self.assertEqual(suffix("linux", "x86_64"), "linux-x86_64.tar.gz")
         self.assertEqual(suffix("win32", "AMD64"), "windows-x86_64.zip")
         self.assertEqual(suffix("darwin", "arm64"), "macos-arm64.tar.gz")
-        self.assertIsNone(suffix("linux", "aarch64"))
+        self.assertEqual(suffix("linux", "aarch64"), "linux-aarch64.tar.gz")
+        self.assertIsNone(suffix("linux", "armv7l"))
 
     def test_find_release_falls_back_to_latest(self):
         seen = []
@@ -1068,7 +1069,12 @@ class Releases(HomeTestCase):
         empty = os.path.join(self.tmp.name, f"nothing-here-{os_name}-{vulkan}")
         os.makedirs(empty)
         home = os.path.join(self.tmp.name, f"home-{os_name}-{vulkan}")
+        # The modeled host's processor, not the one running the test: on a host whose
+        # detect_cpu reports no AVX2 (no /proc/cpuinfo, or an older processor) setup
+        # rightly refuses the prebuilt engine, which a test of the download must not hit.
+        modern = {"arch": "x86_64", "name": "a processor with AVX2", "features": ["avx2"]}
         with modeled(os_name), mock.patch.object(setup_flow, "HERE", empty), \
+             mock.patch.object(setup_hw, "detect_cpu", return_value=modern), \
              mock.patch.dict(os.environ, {"COLI_SETUP_HOME": home}), \
              mock.patch.object(setup_flow, "_api_get", side_effect=getter):
             out = []

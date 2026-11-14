@@ -43,23 +43,33 @@ EXPORTS
     dsv4_cuda_matvec
     dsv4_cuda_matmul_batch
     dsv4_cuda_matmul_bf16_batch
+    dsv4_cuda_matmul_bf16_multi
+    dsv4_cuda_decode_proj_multi
+    dsv4_cuda_attn_decode_fused
     dsv4_cuda_sparse_attn_batch
     dsv4_cuda_sparse_attn_batch_cached
     dsv4_cuda_sparse_attn_batch_cached_idx
     dsv4_cuda_indexer_score_batch
     dsv4_cuda_fp8_ref_matmul
+    dsv4_cuda_indexer_resident
+    dsv4_cuda_indexer_keys_sync
+    dsv4_cuda_attn_decode_chain
     dsv4_cuda_proj_batch
     dsv4_cuda_proj_batch_release
     dsv4_cuda_wo_decode
     dsv4_cuda_upload_fp8_ref
     dsv4_cuda_fp8_ref_matmul_resident
     dsv4_cuda_tensor_refill_fp4
+    dsv4_cuda_mirror_alloc
+    dsv4_cuda_mirror_refill
+    dsv4_cuda_mirror_check
     dsv4_cuda_backend_arch_ok
     dsv4_cuda_backend_name
     dsv4_cuda_kv_ring_append
     dsv4_cuda_mem_free_mb
     dsv4_cuda_device_unified
     dsv4_cuda_stream_drain
+    dsv4_cuda_upload_fence
     dsv4_cuda_kv_comp_append
     dsv4_cuda_head_argmax
     dsv4_cuda_upload_head_exact

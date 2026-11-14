@@ -10,7 +10,7 @@
 <p align="center">
   <a href="https://justvugg.github.io/colibri"><b>Website</b></a> ·
   <a href="https://discord.gg/RXV83nSZdk"><b>Discord</b></a> ·
-  English · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.it.md">Italiano</a> · <a href="README.ja.md">日本語</a> · <a href="README.id.md">Bahasa Indonesia</a> · <a href="README.pt-BR.md">Português (Brasil)</a>
+  English · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.it.md">Italiano</a> · <a href="README.ja.md">日本語</a> · <a href="README.id.md">Bahasa Indonesia</a> · <a href="README.pt-BR.md">Português (Brasil)</a> · <a href="README.es.md">Español</a> · <a href="README.fr.md">Français</a> · <a href="README.de.md">Deutsch</a> · <a href="README.ru.md">Русский</a>
 </p>
 
 **Tiny engine, immense model.** colibri runs very large open models on the
@@ -87,8 +87,8 @@ the setup:
    RAM, plus a minimum cache of experts, must fit in your RAM, and the download
    on your disk;
 3. **gets the engine**: it builds it for your machine when a compiler is there,
-   otherwise it downloads the prebuilt one, which runs on the CPU and, on Linux
-   and Windows, on a Vulkan GPU too. It builds
+   otherwise it downloads the prebuilt one, which runs on the CPU and, on x86-64
+   Linux and Windows, on a Vulkan GPU too. It builds
    for your GPU when that pays: CUDA for an NVIDIA card on Linux when the CUDA toolkit is installed,
    otherwise Vulkan. On a discrete GPU it always does; on an integrated GPU,
    which shares the CPU's RAM, only for the models measured faster there

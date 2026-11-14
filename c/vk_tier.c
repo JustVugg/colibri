@@ -80,16 +80,20 @@ static struct {
      * layers', [1] the extra layers' (VktConfig.extra_layers, an MTP head's), from
      * main_layers on; [2..nform) the main layers' other forms when their formats differ
      * by layer (VktConfig.layer_gate_up/layer_down), lform[l] naming each layer's. Then
-     * the main layers fall in two classes of rooms (lcls[l]): 0 those of the form most
-     * layers have, their tensors at their own size, 1 the others, each tensor in the room
-     * of its role's biggest form among them (pad_w, pad_s [class][role]: [0] gate and up,
-     * [1] down). A newcomer displaces a resident of its own class (vcls_of), so a freed
-     * expert's ranges fit the one that takes its place. */
+     * the main layers fall in classes of rooms (lcls[l], ncls of them): one for each size
+     * their forms' tensors take, 0 that of the form most layers have, so every tensor sits
+     * in a room of its own size (pad_w, pad_s [class][role]: [0] gate and up, [1] down).
+     * A newcomer displaces a resident of its own class (vcls_of), so a freed expert's
+     * ranges fit the one that takes its place; failing that, one of a class whose rooms
+     * hold it (fall[class]: those classes, the tightest first, nfall of them). */
     int main_layers;
     struct { VktFmt gu, dn; int gu_fmt, gu_gs, dn_fmt, dn_gs; size_t gu_codes, gu_scales, d_codes, d_scales, stage_bytes; } form[VKT_FORMS];
     int nform, per_layer;
     uint8_t lform[VKT_MAX_LAYERS], lcls[VKT_MAX_LAYERS];
-    size_t pad_w[2][2], pad_s[2][2];
+    int ncls, major;                   /* the room classes; the form most layers have */
+    size_t mpad_w[2], mpad_s[2];       /* the other forms' biggest tensors by role (tier_stage_expert_bytes_at) */
+    size_t pad_w[VKT_FORMS][2], pad_s[VKT_FORMS][2];
+    uint8_t fall[VKT_FORMS][VKT_FORMS], nfall[VKT_FORMS];
     int h_exact; size_t h_bytes, h_max;   /* the host pool's experts at their own forms' sizes (host_init): the average, the largest */
     /* the extra layers' experts: on the primary device, in a pool of their own (another
      * size than the main ones', so neither leaves holes the other cannot use), at most
@@ -152,7 +156,7 @@ static struct {
     /* evicted, freed at the next quiescent point */
     int *evict; int nevict, cevict;
     /* the coldest residents, refreshed once per forward */
-    int cand[3][VKT_CAND]; uint64_t cand_score[3][VKT_CAND]; int ncand[3];   /* per class (vcls_of): main, extra, the main layers' other forms */
+    int cand[VKT_FORMS + 1][VKT_CAND]; uint64_t cand_score[VKT_FORMS + 1][VKT_CAND]; int ncand[VKT_FORMS + 1];   /* per class (vcls_of): main, extra, the main layers' other rooms */
     /* the step in flight */
     int inflight, S, K;
     int *map; int cmap;
@@ -231,14 +235,15 @@ static int place_of(const VSlot *v) { return v->host ? 2 : v->dev; }
 static void set_place(VSlot *v, int pl) { v->dev = (uint8_t)(pl == 2 ? 0 : pl); v->host = (uint8_t)(pl == 2); }
 static int form_of(int layer) { return T.per_layer && layer < T.main_layers ? T.lform[layer] : kind_of(layer); }
 /* the class of the residents a newcomer of `layer` displaces: 0 the main layers of the most
- * common form, 2 those of the other forms, 1 the extra layers (each class's rooms alike) */
-static int vcls_of(int layer) { return kind_of(layer) ? 1 : T.per_layer && T.lcls[layer] ? 2 : 0; }
+ * common form, 1 the extra layers, 2 on those of the main layers' other rooms, room class
+ * c at c + 1 (each class's rooms alike) */
+static int vcls_of(int layer) { return kind_of(layer) ? 1 : T.per_layer && T.lcls[layer] ? T.lcls[layer] + 1 : 0; }
 /* a main tensor's room (forms_per_layer): its class's, 0 with one form (its own size) */
 static size_t pad_w_of(int layer, int down) { return T.per_layer && !kind_of(layer) ? T.pad_w[T.lcls[layer]][down] : 0; }
 static size_t pad_s_of(int layer, int down) { return T.per_layer && !kind_of(layer) ? T.pad_s[T.lcls[layer]][down] : 0; }
 /* the room of any main expert: a staging slot refilled with every form */
-static size_t pad_w_max(int down) { return T.pad_w[0][down] > T.pad_w[1][down] ? T.pad_w[0][down] : T.pad_w[1][down]; }
-static size_t pad_s_max(int down) { return T.pad_s[0][down] > T.pad_s[1][down] ? T.pad_s[0][down] : T.pad_s[1][down]; }
+static size_t pad_w_max(int down) { size_t m = 0; for (int c = 0; c < T.ncls; c++) if (T.pad_w[c][down] > m) m = T.pad_w[c][down]; return m; }
+static size_t pad_s_max(int down) { size_t m = 0; for (int c = 0; c < T.ncls; c++) if (T.pad_s[c][down] > m) m = T.pad_s[c][down]; return m; }
 
 /* ---- source formats ---------------------------------------------------------- */
 static int src_per_row(VktSrc k) {
@@ -717,7 +722,7 @@ static uint64_t score(const VSlot *v) { return tier_lfru_score(v->heat, v->last,
 /* The coldest residents of each kind, ascending, once per forward (T.full: on the device,
  * the host pool holding every expert anyway). */
 static void refresh_candidates(void) {
-    T.ncand[0] = T.ncand[1] = T.ncand[2] = 0;
+    memset(T.ncand, 0, sizeof T.ncand);
     size_t n = (size_t)T.c.layers * T.c.experts;
     for (size_t i = 0; i < n; i++) {
         VSlot *v = &T.s[i];
@@ -751,22 +756,25 @@ static int peek_victim(int k, uint64_t hs) {
 }
 
 /* The resident a newcomer of `layer` with score hs displaces, or -1, and *from its class:
- * one of its own class first; failing that, with forms by layer, one of the other main
+ * one of its own class first; failing that, with forms by layer, one of another main
  * class whose rooms hold its tensors (a smaller form's newcomer in a bigger form's room,
- * never the other way: the freed ranges would not hold it). */
+ * never the other way: the freed ranges would not hold it), the tightest rooms first. */
 static int rooms_hold(int a, int b) {   /* pad class a's rooms hold pad class b's tensors */
     for (int r = 0; r < 2; r++) if (T.pad_w[a][r] < T.pad_w[b][r] || T.pad_s[a][r] < T.pad_s[b][r]) return 0;
     return 1;
 }
+static size_t room_bytes(int c) { return 2 * (T.pad_w[c][0] + T.pad_s[c][0]) + T.pad_w[c][1] + T.pad_s[c][1]; }
 static int pick_victim(int layer, uint64_t hs, int *from) {
     const int k = vcls_of(layer);
     int v = peek_victim(k, hs);
     *from = k;
     if (v >= 0 || k == 1 || !T.per_layer) return v;
-    const int o = k == 0 ? 2 : 0;
-    if (!rooms_hold(o == 2, k == 2)) return -1;
-    *from = o;
-    return peek_victim(o, hs);
+    const int c = T.lcls[layer];
+    for (int i = 0; i < T.nfall[c]; i++) {
+        const int o = T.fall[c][i] ? T.fall[c][i] + 1 : 0;
+        if ((v = peek_victim(o, hs)) >= 0) { *from = o; return v; }
+    }
+    return -1;
 }
 
 /* A forward starts when the layer index goes back (a layer that issues several
@@ -2789,11 +2797,12 @@ static int form_init(int k, VktFmt gu, VktFmt dn) {
 
 static int fmt_eq(VktFmt a, VktFmt b) { return a.kind == b.kind && a.gs == b.gs; }
 /* VktConfig.layer_gate_up/layer_down: each main layer's form, the ones past form 0 from 2
- * on, and the room every main tensor takes (the biggest form's of its role). 0 when a
- * layer's form has no device form, or there are more than VKT_FORMS. */
+ * on, and the room every main tensor takes (its own form's: forms whose tensors take the
+ * same bytes share a class). 0 when a layer's form has no device form, or there are more
+ * than VKT_FORMS. */
 static int forms_per_layer(void) {
     const int H = T.c.hidden, F = T.c.inter;
-    T.nform = 2;
+    T.nform = 2; T.ncls = 1;
     if (!T.c.layer_gate_up || !T.c.layer_down) return 1;
     if (T.main_layers > VKT_MAX_LAYERS) return 0;
     for (int l = 0; l < T.main_layers; l++) {
@@ -2808,20 +2817,40 @@ static int forms_per_layer(void) {
     }
     if (T.nform == 2) return 1;   /* every layer has form 0 */
     T.per_layer = 1;
-    /* the form most layers have: class 0, its rooms its own size; the others class 1 */
-    int count[VKT_FORMS] = {0}, major = 0;
+    /* the form most layers have: class 0; then a class for each other size the forms'
+     * tensors take, every room its own form's size */
+    int count[VKT_FORMS] = {0}, fcls[VKT_FORMS] = {0}, major = 0;
     for (int l = 0; l < T.main_layers; l++) count[T.lform[l]]++;
     for (int j = 0; j < T.nform; j++) if (j != 1 && count[j] > count[major]) major = j;
-    for (int l = 0; l < T.main_layers; l++) T.lcls[l] = (uint8_t)(T.lform[l] != major);
-    for (int j = 0; j < T.nform; j++) {
+    T.ncls = 0; T.major = major;
+    memset(T.mpad_w, 0, sizeof T.mpad_w); memset(T.mpad_s, 0, sizeof T.mpad_s);
+    for (int i = 0; i < T.nform; i++) {
+        const int j = i == 0 ? major : i == major ? 0 : i;   /* the most common form first */
         if (j == 1 || !count[j]) continue;
-        const int c = j != major;
         size_t sg, sd, wg = coli_vk_tensor_alloc_bytes(T.form[j].gu_fmt, H, F, T.form[j].gu_gs, &sg),
                wd = coli_vk_tensor_alloc_bytes(T.form[j].dn_fmt, F, H, T.form[j].dn_gs, &sd);
-        if (wg > T.pad_w[c][0]) T.pad_w[c][0] = wg;
-        if (sg > T.pad_s[c][0]) T.pad_s[c][0] = sg;
-        if (wd > T.pad_w[c][1]) T.pad_w[c][1] = wd;
-        if (sd > T.pad_s[c][1]) T.pad_s[c][1] = sd;
+        int c = 0;
+        while (c < T.ncls && (T.pad_w[c][0] != wg || T.pad_s[c][0] != sg || T.pad_w[c][1] != wd || T.pad_s[c][1] != sd)) c++;
+        if (c == T.ncls) { T.pad_w[c][0] = wg; T.pad_s[c][0] = sg; T.pad_w[c][1] = wd; T.pad_s[c][1] = sd; T.ncls++; }
+        fcls[j] = c;
+        if (j != major) {
+            if (wg > T.mpad_w[0]) T.mpad_w[0] = wg;
+            if (sg > T.mpad_s[0]) T.mpad_s[0] = sg;
+            if (wd > T.mpad_w[1]) T.mpad_w[1] = wd;
+            if (sd > T.mpad_s[1]) T.mpad_s[1] = sd;
+        }
+    }
+    for (int l = 0; l < T.main_layers; l++) T.lcls[l] = (uint8_t)fcls[T.lform[l]];
+    /* the classes whose rooms hold a class's tensors, the tightest first (pick_victim) */
+    for (int c = 0; c < T.ncls; c++) {
+        int n = 0;
+        for (int o = 0; o < T.ncls; o++) {
+            if (o == c || !rooms_hold(o, c)) continue;
+            int at = n++;
+            while (at > 0 && room_bytes(T.fall[c][at - 1]) > room_bytes(o)) { T.fall[c][at] = T.fall[c][at - 1]; at--; }
+            T.fall[c][at] = (uint8_t)o;
+        }
+        T.nfall[c] = (uint8_t)n;
     }
     return 1;
 }
@@ -2830,15 +2859,35 @@ static int forms_per_layer(void) {
  * that fills before it refuses the rest, and the count comes down to what it holds). */
 static size_t tier_expert_bytes_at(size_t a) {
     if (!T.per_layer) return expert_bytes_at(T.c.hidden, T.c.inter, T.c.gate_up, T.c.down, a);
-    size_t room[2] = {0, 0}; long long n[2] = {0, 0};
-    for (int c = 0; c < 2; c++)
+    size_t room[VKT_FORMS] = {0};
+    for (int c = 0; c < T.ncls; c++)
         for (int k = 0; k < 3; k++) {
             size_t w = T.pad_w[c][k == 2], sc = T.pad_s[c][k == 2];
             room[c] += (w + a - 1) / a * a + (sc + a - 1) / a * a;
         }
-    for (int l = 0; l < T.main_layers; l++) n[T.lcls[l]]++;
-    return n[0] + n[1] ? (size_t)((room[0] * (unsigned long long)n[0] + room[1] * (unsigned long long)n[1] + n[0] + n[1] - 1) /
-                                  (unsigned long long)(n[0] + n[1])) : room[0];
+    unsigned long long sum = 0;
+    for (int l = 0; l < T.main_layers; l++) sum += room[T.lcls[l]];
+    return T.main_layers ? (size_t)((sum + (unsigned long long)T.main_layers - 1) / (unsigned long long)T.main_layers) : room[0];
+}
+
+/* A prompt chunk's staging (VktConfig.stage, vk_dmoe.h) takes one layer's host pool experts at a time,
+ * each at its own form's size, so its share of them is sized per expert as the rooms were before
+ * every form had a room of its own size: a layer of another form than most layers' at those forms'
+ * biggest tensors. The rooms' average left it short where a layer's forms are bigger than the
+ * average: Qwen3.8-Flash-Next UD-IQ2_XS (5 sizes) with a 6 GiB tier on an RTX PRO 4000 staged in
+ * 840 MiB instead of 1019, and its 3036-token prompt went from 262.5 to 255.4 tok/s. With one or two
+ * sizes this is the rooms' average (tier_expert_bytes_at). */
+static size_t tier_stage_expert_bytes_at(size_t a) {
+    if (!T.per_layer) return expert_bytes_at(T.c.hidden, T.c.inter, T.c.gate_up, T.c.down, a);
+    size_t r0 = 0, r1 = 0;
+    for (int k = 0; k < 3; k++) {
+        size_t w0 = T.pad_w[0][k == 2], s0 = T.pad_s[0][k == 2], w1 = T.mpad_w[k == 2], s1 = T.mpad_s[k == 2];
+        r0 += (w0 + a - 1) / a * a + (s0 + a - 1) / a * a;
+        r1 += (w1 + a - 1) / a * a + (s1 + a - 1) / a * a;
+    }
+    unsigned long long sum = 0;
+    for (int l = 0; l < T.main_layers; l++) sum += T.lform[l] != T.major ? r1 : r0;
+    return T.main_layers ? (size_t)((sum + (unsigned long long)T.main_layers - 1) / (unsigned long long)T.main_layers) : r0;
 }
 
 /* One main expert's bytes at its own layer's form (no room of a bigger one), on average over
@@ -3304,10 +3353,13 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
         long long per = (all - fit + T.main_layers - 1) / T.main_layers;
         per += per / 4;
         if (per > T.c.experts) per = T.c.experts;
-        if (T.c.stage && blocks && !(sg && *sg == '0') && pool && fit < all && per > 0 && fit - per >= 2) {
-            fit -= per; fit_raw -= per;
-            want -= (double)per * T.exp_bytes;
-            T.stage_room = (size_t)per * T.exp_bytes;
+        /* its bytes a layer's share at the staged experts' sizes, taken from the budget in main experts */
+        const size_t sexp = T.per_layer ? tier_stage_expert_bytes_at(coli_vk_buffer_alignment()) : T.exp_bytes;
+        const long long take = sexp > T.exp_bytes ? (long long)(((size_t)per * sexp + T.exp_bytes - 1) / T.exp_bytes) : per;
+        if (T.c.stage && blocks && !(sg && *sg == '0') && pool && fit < all && per > 0 && fit - take >= 2) {
+            fit -= take; fit_raw -= take;
+            want -= (double)take * T.exp_bytes;
+            T.stage_room = (size_t)per * sexp;
         }
     }
     /* Streaming (big prefill steps, see "streaming" above): COLI_VK_TIER_STREAM=0 turns
@@ -3401,14 +3453,14 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     if (T.form[0].dn_gs) fprintf(stderr, " gs %d", T.form[0].dn_gs);
     if (T.per_layer) {
         int other = 0, forms = 0;
-        for (int l = 0; l < T.main_layers; l++) other += T.lcls[l];
+        for (int l = 0; l < T.main_layers; l++) other += T.lform[l] != T.major;
         for (int j = 0; j < T.nform; j++) {
             int used = 0;
-            for (int l = 0; l < T.main_layers && !used; l++) used = j != 1 && T.lform[l] == j && T.lcls[l];
+            for (int l = 0; l < T.main_layers && !used; l++) used = j != T.major && T.lform[l] == j;
             forms += used;
         }
-        fprintf(stderr, "; %d layer%s in %d form%s other than most layers', their experts in the room of the biggest of those, the rest at their own size",
-                other, other == 1 ? "" : "s", forms, forms == 1 ? "" : "s");
+        fprintf(stderr, "; %d layer%s in %d form%s other than most layers', every expert in a room of its own form's size (%d size%s)",
+                other, other == 1 ? "" : "s", forms, forms == 1 ? "" : "s", T.ncls, T.ncls == 1 ? "" : "s");
     }
     if (T.c.chain_bytes) fprintf(stderr, "; %s left for the dense chain's KV mirror and a prompt chunk",
                                  human((double)T.c.chain_bytes, hb, sizeof hb));

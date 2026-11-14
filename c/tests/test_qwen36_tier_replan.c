@@ -138,6 +138,13 @@ int main(void) {
     check(G.mk_on && G.mk_hits == 0 && G.mk_miss == 0, "the marker snapshots the counters (none yet)");
     qt_stats();
 
+    /* the running counters a served request takes its share from (qwen38 under COLI_TIMERS=1) */
+    QtCounters qc;
+    check(qt_counters(&qc) == 1, "qt_counters answers while the tier is on");
+    check(qc.hits == 0 && qc.miss == 0 && qc.uploads == G.uploads && qc.swaps == G.swaps &&
+          qc.q_full_skips == G.q_full_skips && qc.uploads > 0 && qc.swaps == 4,
+          "qt_counters reads the tier's counters: the uploads and the four re-plan swaps");
+
     qt_shutdown();
     if (fails) { printf("test_qwen36_tier_replan: %d failure(s)\n", fails); return 1; }
     printf("OK test_qwen36_tier_replan: the resident set follows the prompt's counts, budget-neutral, evictions reported\n");

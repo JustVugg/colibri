@@ -3107,6 +3107,26 @@ class CapSentinelShimTest(unittest.TestCase):
         self.assertEqual(env["V4_MTP_CONF"], "0.7")  # explicit override wins
         self.assertEqual(env["V4_MTP_GPU"], "0")     # GPU drafting opt-in, off by default
 
+    def test_direct_v4_server_libomp_team_sleeps_when_idle(self):
+        # an idle served engine must not spin: OMP_WAIT_POLICY=active alone is
+        # an infinite KMP_BLOCKTIME in LLVM's libomp (#341, #2286)
+        env = {}
+        explicit = {"KMP_BLOCKTIME": "0"}
+        passive = {"OMP_WAIT_POLICY": "PASSIVE"}
+        with patch("openai_server.sys.platform", "win32"):
+            for e in (env, explicit, passive):
+                tune_child_env(e, "deepseek_v4")
+        self.assertEqual(env["OMP_WAIT_POLICY"], "active")
+        self.assertEqual(env["KMP_BLOCKTIME"], "200")
+        self.assertEqual(explicit["KMP_BLOCKTIME"], "0")
+        # libomp gives passive its blocktime 0 only while KMP_BLOCKTIME is unset
+        self.assertNotIn("KMP_BLOCKTIME", passive)
+        # macOS's libomp is left as it was (#707)
+        mac = {}
+        with patch("openai_server.sys.platform", "darwin"):
+            tune_child_env(mac, "deepseek_v4")
+        self.assertNotIn("KMP_BLOCKTIME", mac)
+
     def test_direct_v4_server_preserves_explicit_omp_threads(self):
         env = {"OMP_NUM_THREADS": "3"}
         tune_child_env(env, "deepseek_v4")
@@ -3115,7 +3135,7 @@ class CapSentinelShimTest(unittest.TestCase):
     def test_direct_v4_server_honours_omp_kill_switch(self):
         env = {"COLI_NO_OMP_TUNE": "1"}
         tune_child_env(env, "deepseek_v4")
-        for key in ("OMP_NUM_THREADS", "OMP_WAIT_POLICY", "GOMP_SPINCOUNT",
+        for key in ("OMP_NUM_THREADS", "OMP_WAIT_POLICY", "GOMP_SPINCOUNT", "KMP_BLOCKTIME",
                     "OMP_DYNAMIC", "OMP_PROC_BIND", "OMP_PLACES"):
             self.assertNotIn(key, env)
 
