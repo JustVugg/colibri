@@ -1,0 +1,3 @@
+{"label": "s1_state", "prompt_tokens": 594, "reused_prompt_tokens": 594, "reuse_source": "disk_snapshot", "reuse_miss": null, "prefill_s": 0.0, "engine_ttft_s": 0.0902571659971727, "output_sha12": "a85ee064470b"}
+{"label": "s2_reset_system", "prompt_tokens": 816, "reused_prompt_tokens": 0, "reuse_source": "none", "reuse_miss": "divergent_prefix", "prefill_s": 26.4692, "engine_ttft_s": 26.605965124996146, "output_sha12": "456ecc343f37"}
+{"checks": [{"name": "reset_prompt_longer_than_state", "pass": true}, {"name": "reset_divergent_no_reuse", "pass": true}]}

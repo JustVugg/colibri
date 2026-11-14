@@ -1,0 +1,63 @@
+Reliable measurements require a stable procedure, calibrated instruments, and a record of the conditions under which each observation was made. A result becomes useful when another researcher can repeat the setup and obtain a comparable range, rather than merely reproduce one unusually favorable value.
+
+A system that processes a long sequence should be evaluated after its initial setup costs have passed. The first result may include file loading, memory allocation, cache initialization, and compilation, while later results reflect the repeated work that determines steady-state performance.
+
+When comparing two implementations, keep the input data, model parameters, output length, and stopping rules unchanged. Alternate the order of trials where practical, preserve raw measurements, and report a median together with the full observed range so that variation remains visible.
+
+A performance report should distinguish internal component speed from the rate experienced by a person using the system. Prefill, verification, drafting, transfer, and output delivery can each contribute different costs, and optimizing one stage does not guarantee that the whole request becomes faster.
+
+Correctness is part of performance engineering. A faster path is useful only when it preserves the same decisions, handles termination consistently, restores state after rejected speculative work, and produces repeatable results under identical deterministic settings.
+
+Memory measurements should be taken while the complete workload is running, not inferred from the size of the model file alone. Runtime buffers, caches, temporary activations, and operating-system accounting can make resident memory substantially different from stored weight size.
+
+A good experimental log records the exact executable, environment variables, input, and machine configuration. Raw output and timing details make it possible to revisit a conclusion when a later code change alters dispatch behavior or resource usage.
+
+Small isolated kernels can help explain a bottleneck, but they do not substitute for an end-to-end workload. Real generation includes tokenization, model state updates, output selection, synchronization, and the interactions among layers that a synthetic operation cannot capture.
+
+Reliable measurements require a stable procedure, calibrated instruments, and a record of the conditions under which each observation was made. A result becomes useful when another researcher can repeat the setup and obtain a comparable range, rather than merely reproduce one unusually favorable value.
+
+A system that processes a long sequence should be evaluated after its initial setup costs have passed. The first result may include file loading, memory allocation, cache initialization, and compilation, while later results reflect the repeated work that determines steady-state performance.
+
+When comparing two implementations, keep the input data, model parameters, output length, and stopping rules unchanged. Alternate the order of trials where practical, preserve raw measurements, and report a median together with the full observed range so that variation remains visible.
+
+A performance report should distinguish internal component speed from the rate experienced by a person using the system. Prefill, verification, drafting, transfer, and output delivery can each contribute different costs, and optimizing one stage does not guarantee that the whole request becomes faster.
+
+Correctness is part of performance engineering. A faster path is useful only when it preserves the same decisions, handles termination consistently, restores state after rejected speculative work, and produces repeatable results under identical deterministic settings.
+
+Memory measurements should be taken while the complete workload is running, not inferred from the size of the model file alone. Runtime buffers, caches, temporary activations, and operating-system accounting can make resident memory substantially different from stored weight size.
+
+A good experimental log records the exact executable, environment variables, input, and machine configuration. Raw output and timing details make it possible to revisit a conclusion when a later code change alters dispatch behavior or resource usage.
+
+Small isolated kernels can help explain a bottleneck, but they do not substitute for an end-to-end workload. Real generation includes tokenization, model state updates, output selection, synchronization, and the interactions among layers that a synthetic operation cannot capture.
+
+Reliable measurements require a stable procedure, calibrated instruments, and a record of the conditions under which each observation was made. A result becomes useful when another researcher can repeat the setup and obtain a comparable range, rather than merely reproduce one unusually favorable value.
+
+A system that processes a long sequence should be evaluated after its initial setup costs have passed. The first result may include file loading, memory allocation, cache initialization, and compilation, while later results reflect the repeated work that determines steady-state performance.
+
+When comparing two implementations, keep the input data, model parameters, output length, and stopping rules unchanged. Alternate the order of trials where practical, preserve raw measurements, and report a median together with the full observed range so that variation remains visible.
+
+A performance report should distinguish internal component speed from the rate experienced by a person using the system. Prefill, verification, drafting, transfer, and output delivery can each contribute different costs, and optimizing one stage does not guarantee that the whole request becomes faster.
+
+Correctness is part of performance engineering. A faster path is useful only when it preserves the same decisions, handles termination consistently, restores state after rejected speculative work, and produces repeatable results under identical deterministic settings.
+
+Memory measurements should be taken while the complete workload is running, not inferred from the size of the model file alone. Runtime buffers, caches, temporary activations, and operating-system accounting can make resident memory substantially different from stored weight size.
+
+A good experimental log records the exact executable, environment variables, input, and machine configuration. Raw output and timing details make it possible to revisit a conclusion when a later code change alters dispatch behavior or resource usage.
+
+Small isolated kernels can help explain a bottleneck, but they do not substitute for an end-to-end workload. Real generation includes tokenization, model state updates, output selection, synchronization, and the interactions among layers that a synthetic operation cannot capture.
+
+Reliable measurements require a stable procedure, calibrated instruments, and a record of the conditions under which each observation was made. A result becomes useful when another researcher can repeat the setup and obtain a comparable range, rather than merely reproduce one unusually favorable value.
+
+A system that processes a long sequence should be evaluated after its initial setup costs have passed. The first result may include file loading, memory allocation, cache initialization, and compilation, while later results reflect the repeated work that determines steady-state performance.
+
+When comparing two implementations, keep the input data, model parameters, output length, and stopping rules unchanged. Alternate the order of trials where practical, preserve raw measurements, and report a median together with the full observed range so that variation remains visible.
+
+A performance report should distinguish internal component speed from the rate experienced by a person using the system. Prefill, verification, drafting, transfer, and output delivery can each contribute different costs, and optimizing one stage does not guarantee that the whole request becomes faster.
+
+Correctness is part of performance engineering. A faster path is useful only when it preserves the same decisions, handles termination consistently, restores state after rejected speculative work, and produces repeatable results under identical deterministic settings.
+
+Memory measurements should be taken while the complete workload is running, not inferred from the size of the model file alone. Runtime buffers, caches, temporary activations, and operating-system accounting can make resident memory substantially different from stored weight size.
+
+A good experimental log records the exact executable, environment variables, input, and machine configuration. Raw output and timing details make it possible to revisit a conclusion when a later code change alters dispatch behavior or resource usage.
+
+Small isolated kernels can help explain a bottleneck, but they do not substitute for an end-to-end workload. Real generation includes tokenization, model state updates, output selection, synchronization, and the interactions among layers that a synthetic operation cannot capture.

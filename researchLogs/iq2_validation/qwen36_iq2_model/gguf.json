@@ -1,0 +1,8 @@
+{
+ "format": "colibri-gguf-v1",
+ "gguf": "/Users/creemac/.lmstudio/models/unsloth/Qwen3.6-27B-MTP-GGUF/Qwen3.6-27B-UD-IQ2_XXS.gguf",
+ "mode": "link",
+ "arch": "qwen35",
+ "parts": 1,
+ "size": 9567265920
+}

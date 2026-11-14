@@ -1,0 +1,4 @@
+[OMP] qwen36: 4 physical-core threads instead of 10 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+[gguf] /Users/creemac/.lmstudio/models/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf: 1 file(s), 579 tensors, read in place (native ggml types, no conversion)
+== qwen36 Phase-2 engine | cache=128/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 151936 pieces (max id 151935) from /Users/creemac/.colibri-models/qwen3-coder-30b-a3b-ud-tq1/tokenizer.json

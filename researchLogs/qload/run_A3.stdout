@@ -1,0 +1,1 @@
+GGUF CHECK OK: /Users/creemac/.lmstudio/models/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf | 48 layers, 128 experts top-8 | 579 tensors, 8.00 GB of weights | tokenizer ok

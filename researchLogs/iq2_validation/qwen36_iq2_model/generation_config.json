@@ -1,0 +1,8 @@
+{
+ "eos_token_id": [
+  248046,
+  248044
+ ],
+ "bos_token_id": 248044,
+ "pad_token_id": 248055
+}

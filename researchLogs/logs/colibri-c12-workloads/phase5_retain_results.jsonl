@@ -1,0 +1,24 @@
+{"label": "retain_a_t1", "prompt_tokens": 378, "reused_prompt_tokens": 0, "reuse_source": "none", "reuse_miss": "no_matching_disk_snapshot", "snapshot_restore_s": 0.000268, "prefill_s": 12.693, "engine_ttft_s": 12.816480000008596, "output_sha12": "4c982b2658ea"}
+{"cache": {"files": 1, "total_mb": 71.1}}
+{"label": "retain_a_t2", "prompt_tokens": 866, "reused_prompt_tokens": 416, "reuse_source": "live_state", "reuse_miss": null, "snapshot_restore_s": 0.0, "prefill_s": 14.4727, "engine_ttft_s": 14.584333457998582, "output_sha12": "42af23d1abdc"}
+{"cache": {"files": 2, "total_mb": 151.8}}
+{"label": "retain_a_t3", "prompt_tokens": 1424, "reused_prompt_tokens": 904, "reuse_source": "live_state", "reuse_miss": null, "snapshot_restore_s": 0.0, "prefill_s": 17.5928, "engine_ttft_s": 17.728816499991808, "output_sha12": "285a263eb39d"}
+{"cache": {"files": 3, "total_mb": 243.4}}
+{"label": "retain_b_t1", "prompt_tokens": 373, "reused_prompt_tokens": 0, "reuse_source": "none", "reuse_miss": "prompt_not_longer", "snapshot_restore_s": 0.000225, "prefill_s": 12.5042, "engine_ttft_s": 12.644764749988099, "output_sha12": "9986fe24449f"}
+{"cache": {"files": 4, "total_mb": 314.4}}
+{"label": "retain_b_t2", "prompt_tokens": 857, "reused_prompt_tokens": 373, "reuse_source": "disk_snapshot", "reuse_miss": null, "snapshot_restore_s": 0.081881, "prefill_s": 16.7454, "engine_ttft_s": 16.982914209002047, "output_sha12": "0dd132099e52"}
+{"cache": {"files": 5, "total_mb": 394.9}}
+{"label": "retain_b_t3", "prompt_tokens": 1411, "reused_prompt_tokens": 896, "reuse_source": "live_state", "reuse_miss": null, "snapshot_restore_s": 0.0, "prefill_s": 18.3386, "engine_ttft_s": 18.481054457995924, "output_sha12": "1432c481c2e4"}
+{"cache": {"files": 6, "total_mb": 486.3}}
+{"label": "retain_c_t1", "prompt_tokens": 378, "reused_prompt_tokens": 0, "reuse_source": "none", "reuse_miss": "prompt_not_longer", "snapshot_restore_s": 0.000329, "prefill_s": 13.3534, "engine_ttft_s": 13.501075207997928, "output_sha12": "2ebecab69836"}
+{"cache": {"files": 6, "total_mb": 486.3}}
+{"label": "retain_c_t2", "prompt_tokens": 864, "reused_prompt_tokens": 378, "reuse_source": "disk_snapshot", "reuse_miss": null, "snapshot_restore_s": 0.089734, "prefill_s": 16.9946, "engine_ttft_s": 17.246708499995293, "output_sha12": "7753ec55f811"}
+{"cache": {"files": 6, "total_mb": 486.2}}
+{"label": "retain_c_t3", "prompt_tokens": 1414, "reused_prompt_tokens": 894, "reuse_source": "live_state", "reuse_miss": null, "snapshot_restore_s": 0.0, "prefill_s": 19.179, "engine_ttft_s": 19.35334362499998, "output_sha12": "e13c12baecd0"}
+{"cache": {"files": 6, "total_mb": 486.0}}
+{"cache_final": {"files": 6, "total_mb": 486.0}}
+{"label": "repeat_c_t3", "prompt_tokens": 1414, "reused_prompt_tokens": 1414, "reuse_source": "disk_snapshot", "reuse_miss": null, "snapshot_restore_s": 0.124166, "prefill_s": 0.0, "engine_ttft_s": 0.12883583399525378, "output_sha12": "e13c12baecd0"}
+{"cache": {"files": 6, "total_mb": 486.0}}
+{"label": "repeat_a_t1", "prompt_tokens": 378, "reused_prompt_tokens": 0, "reuse_source": "none", "reuse_miss": "prompt_not_longer", "snapshot_restore_s": 0.00021, "prefill_s": 14.038, "engine_ttft_s": 14.180692084002658, "output_sha12": "4c982b2658ea"}
+{"cache": {"files": 6, "total_mb": 486.1}}
+{"checks": [{"name": "retain_c_t3_newest_restored", "pass": true}, {"name": "retain_a_t1_repeat_output_identical", "pass": true}, {"name": "retain_budget_respected", "pass": true}]}

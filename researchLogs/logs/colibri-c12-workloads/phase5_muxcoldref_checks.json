@@ -1,0 +1,1 @@
+{"checks": [{"name": "cold_a_t1_output_matches_mux", "pass": true}, {"name": "cold_a_t2_output_matches_mux", "pass": true}, {"name": "cold_b_t1_output_matches_mux", "pass": true}, {"name": "cold_b_t2_output_matches_mux", "pass": true}]}

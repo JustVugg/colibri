@@ -1,0 +1,1094 @@
+files=1 tensors=866
+file[0] /Users/creemac/.lmstudio/models/unsloth/Qwen3.6-27B-MTP-GGUF/Qwen3.6-27B-UD-IQ2_XXS.gguf bytes=8.910GiB
+
+-- metadata --
+general.architecture = "qwen35"
+general.type = "model"
+general.sampling.top_k = 20
+general.sampling.top_p = 0.95
+general.sampling.temp = 1
+general.name = "Qwen3.6-27B"
+general.basename = "Qwen3.6-27B"
+general.quantized_by = "Unsloth"
+general.size_label = "27B"
+general.license = "apache-2.0"
+general.license.link = "https://huggingface.co/Qwen/Qwen3.6-27B/blob/main/LICENSE"
+general.repo_url = "https://huggingface.co/unsloth"
+general.base_model.count = 1
+general.base_model.0.name = "Qwen3.6 27B"
+general.base_model.0.organization = "Qwen"
+general.base_model.0.repo_url = "https://huggingface.co/Qwen/Qwen3.6-27B"
+general.tags = array<string>[2] "unsloth", "image-text-to-text"
+qwen35.block_count = 65
+qwen35.context_length = 262144
+qwen35.embedding_length = 5120
+qwen35.feed_forward_length = 17408
+qwen35.attention.head_count = 24
+qwen35.attention.head_count_kv = 4
+qwen35.rope.dimension_sections = array<i32>[4] 47244640267, 10, 0, 0
+qwen35.rope.freq_base = 1e+07
+qwen35.attention.layer_norm_rms_epsilon = 1e-06
+qwen35.attention.key_length = 256
+qwen35.attention.value_length = 256
+qwen35.ssm.conv_kernel = 4
+qwen35.ssm.state_size = 128
+qwen35.ssm.group_count = 16
+qwen35.ssm.time_step_rank = 48
+qwen35.ssm.inner_size = 6144
+qwen35.full_attention_interval = 4
+qwen35.rope.dimension_count = 64
+qwen35.nextn_predict_layers = 1
+tokenizer.ggml.model = "gpt2"
+tokenizer.ggml.pre = "qwen35"
+tokenizer.ggml.tokens = array<string>[248320] "!", """, "#", "$", "%", "&", "'", "(", ")", "*", "+", ",", "-", ".", "/", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", ":", ";", "<", "=", ">", "?", "@", ...
+tokenizer.ggml.token_type = array<i32>[248320] 4294967297, 4294967297, 4294967297, 4294967297, 4294967297, 4294967297, 4294967297, 4294967297, 4294967297, 4294967297, 4294967297, 4294967297, 4294967297, 4294967297, 4294967297, 4294967297, 4294967297, 4294967297, 4294967297, 4294967297, 4294967297, 4294967297, 4294967297, 4294967297, 4294967297, 4294967297, 4294967297, 4294967297, 4294967297, 4294967297, 4294967297, 4294967297, ...
+tokenizer.ggml.merges = array<string>[247587] "Ġ Ġ", "ĠĠ ĠĠ", "i n", "Ġ t", "ĠĠĠĠ ĠĠĠĠ", "e r", "ĠĠ Ġ", "o n", "Ġ a", "r e", "a t", "s t", "e n", "o r", "Ġt h", "Ċ Ċ", "Ġ c", "l e", "Ġ s", "i t", "a n", "a r", "a l", "Ġth e", "Ġ p", "Ġ f", "o u", "Ġ =", "i s", "ĠĠĠĠ ĠĠĠ", "in g", "e s", ...
+tokenizer.ggml.eos_token_id = 248046
+tokenizer.ggml.padding_token_id = 248055
+tokenizer.ggml.bos_token_id = 248044
+tokenizer.ggml.add_bos_token = 0
+tokenizer.chat_template = "{%- set image_count = namespace(value=0) %}
+{%- set video_count = namespace(value=0) %}
+{%- macro render_content(content, do_vision_count, is_system_content=false) %}
+    {%- if content is string %}
+        {{- content }}
+    {%- elif content is iterable and content is not mapping %}
+        {%- for item in content %}
+            {%- if 'image' in item or 'image_url' in item or item.type == 'image' %}
+                {%- if is_system_content %}
+                    {{- raise_exception('System message cannot contain images.') }}
+                {%- endif %}
+                {%- if do_vision_count %}
+                    {%- set image_count.value = image_count.value + 1 %}
+                {%- endif %}
+                {%- if add_vision_id %}
+                    {{- 'Picture ' ~ image_count.value ~ ': ' }}
+                {%- endif %}
+                {{- '<|vision_start|><|image_pad|><|vision_end|>' }}
+            {%- elif 'video' in item or item.type == 'video' %}
+                {%- if is_system_content %}
+                    {{- raise_exception('System message cannot contain videos.') }}
+                {%- endif %}
+                {%- if do_vision_count %}
+                    {%- set video_count.value = video_count.value + 1 %}
+                {%- endif %}
+                {%- if add_vision_id %}
+                    {{- 'Video ' ~ video_count.value ~ ': ' }}
+                {%- endif %}
+                {{- '<|vision_start|><|video_pad|><|vision_end|>' }}
+            {%- elif 'text' in item %}
+                {{- item.text }}
+            {%- else %}
+                {{- raise_exception('Unexpected item type in content.') }}
+            {%- endif %}
+        {%- endfor %}
+    {%- elif content is none or content is undefined %}
+        {{- '' }}
+    {%- else %}
+        {{- raise_exception('Unexpected content type.') }}
+    {%- endif %}
+{%- endmacro %}
+{%- if not messages %}
+    {{- raise_exception('No messages provided.') }}
+{%- endif %}
+{%- set num_sys = 0 %}
+{%- set merged_system = '' %}
+{%- if messages[0].role == 'system' or messages[0].role == 'developer' %}
+    {%- set first = render_content(messages[0].content, false, true)|trim %}
+    {%- if messages|length > 1 and (messages[1].role == 'system' or messages[1].role == 'developer') %}
+        {%- set second = render_content(messages[1].content, false, true)|trim %}
+        {%- set merged_system = first + '\n' + second %}
+        {%- set num_sys = 2 %}
+    {%- else %}
+        {%- set merged_system = first %}
+        {%- set num_sys = 1 %}
+    {%- endif %}
+{%- endif %}
+{%- if tools and tools is iterable and tools is not mapping %}
+    {{- '<|im_start|>system\n' }}
+    {{- "# Tools\n\nYou have access to the following functions:\n\n<tools>" }}
+    {%- for tool in tools %}
+        {{- "\n" }}
+        {{- tool | tojson }}
+    {%- endfor %}
+    {{- "\n</tools>" }}
+    {{- '\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>' }}
+    {%- if merged_system %}
+        {{- '\n\n' + merged_system }}
+    {%- endif %}
+    {{- '<|im_end|>\n' }}
+{%- else %}
+    {%- if merged_system %}
+        {{- '<|im_start|>system\n' + merged_system + '<|im_end|>\n' }}
+    {%- endif %}
+{%- endif %}
+{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}
+{%- for message in messages[::-1] %}
+    {%- set index = (messages|length - 1) - loop.index0 %}
+    {%- if ns.multi_step_tool and message.role == "user" %}
+        {%- set content = render_content(message.content, false)|trim %}
+        {%- if not(content.startswith('<tool_response>') and content.endswith('</tool_response>')) %}
+            {%- set ns.multi_step_tool = false %}
+            {%- set ns.last_query_index = index %}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{%- for message in messages %}
+    {%- if loop.index0 >= num_sys and message.role != "system" and message.role != "developer" %}
+    {%- set content = render_content(message.content, true)|trim %}
+    {%- if message.role == "user" %}
+        {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>' + '\n' }}
+    {%- elif message.role == "assistant" %}
+        {%- set reasoning_content = '' %}
+        {%- if message.reasoning_content is string %}
+            {%- set reasoning_content = message.reasoning_content %}
+        {%- else %}
+            {%- if '</think>' in content %}
+                {%- set reasoning_content = content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n') %}
+                {%- set content = content.split('</think>')[-1].lstrip('\n') %}
+            {%- endif %}
+        {%- endif %}
+        {%- set reasoning_content = reasoning_content|trim %}
+        {%- if (preserve_thinking is defined and preserve_thinking is true) or (loop.index0 > ns.last_query_index) %}
+            {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content + '\n</think>\n\n' + content }}
+        {%- else %}
+            {{- '<|im_start|>' + message.role + '\n' + content }}
+        {%- endif %}
+        {%- if message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping %}
+            {%- for tool_call in message.tool_calls %}
+                {%- if tool_call.function is defined %}
+                    {%- set tool_call = tool_call.function %}
+                {%- endif %}
+                {%- if loop.first %}
+                    {%- if content|trim %}
+                        {{- '\n\n<tool_call>\n<function=' + tool_call.name + '>\n' }}
+                    {%- else %}
+                        {{- '<tool_call>\n<function=' + tool_call.name + '>\n' }}
+                    {%- endif %}
+                {%- else %}
+                    {{- '\n<tool_call>\n<function=' + tool_call.name + '>\n' }}
+                {%- endif %}
+                {%- if tool_call.arguments is mapping %}
+                    {%- for args_name in tool_call.arguments %}
+                        {%- set args_value = tool_call.arguments[args_name] %}
+                        {{- '<parameter=' + args_name + '>\n' }}
+                        {%- set args_value = args_value | tojson | safe if args_value is mapping or (args_value is sequence and args_value is not string) else args_value | string %}
+                        {{- args_value }}
+                        {{- '\n</parameter>\n' }}
+                    {%- endfor %}
+                {%- endif %}
+                {{- '</function>\n</tool_call>' }}
+            {%- endfor %}
+        {%- endif %}
+        {{- '<|im_end|>\n' }}
+    {%- elif message.role == "tool" %}
+        {%- if loop.previtem and loop.previtem.role != "tool" %}
+            {{- '<|im_start|>user' }}
+        {%- endif %}
+        {{- '\n<tool_response>\n' }}
+        {{- content }}
+        {{- '\n</tool_response>' }}
+        {%- if not loop.last and loop.nextitem.role != "tool" %}
+            {{- '<|im_end|>\n' }}
+        {%- elif loop.last %}
+            {{- '<|im_end|>\n' }}
+        {%- endif %}
+    {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+    {%- if enable_thinking is defined and enable_thinking is false %}
+        {{- '<think>\n\n</think>\n\n' }}
+    {%- else %}
+        {{- '<think>\n' }}
+    {%- endif %}
+{%- endif %}
+{#- Unsloth fixes - developer role, tool calling #}"
+general.quantization_version = 2
+general.file_type = 19
+quantize.imatrix.file = "Qwen3.6-27B-GGUF/imatrix_unsloth.gguf"
+quantize.imatrix.dataset = "unsloth_calibration_Qwen3.6-27B.txt"
+quantize.imatrix.entries_count = 496
+quantize.imatrix.chunks_count = 76
+
+-- tensor type histogram --
+F32      x456          0.098 GiB
+Q8_0     x1            0.052 GiB
+Q2_K     x14           0.330 GiB
+Q3_K     x2            0.511 GiB
+Q4_K     x96           2.109 GiB
+Q5_K     x1            0.814 GiB
+IQ2_XXS  x222          4.106 GiB
+IQ3_XXS  x64           0.568 GiB
+IQ3_S    x5            0.178 GiB
+IQ2_S    x5            0.133 GiB
+TOTAL      866 tensors         8.900 GiB
+
+-- tensors (name dims bytes type) --
+output.weight                                                [  5120 248320   1  1]   874086400  Q5_K
+output_norm.weight                                           [  5120      1   1  1]       20480  F32
+token_embd.weight                                            [  5120 248320   1  1]   546304000  Q3_K
+blk.0.attn_gate.weight                                       [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.0.attn_norm.weight                                       [  5120      1   1  1]       20480  F32
+blk.0.attn_qkv.weight                                        [  5120  10240   1  1]    29491200  Q4_K
+blk.0.ffn_down.weight                                        [ 17408   5120   1  1]    29245440  Q2_K
+blk.0.ffn_gate.weight                                        [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.0.ffn_up.weight                                          [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.0.post_attention_norm.weight                             [  5120      1   1  1]       20480  F32
+blk.0.ssm_a                                                  [    48      1   1  1]         192  F32
+blk.0.ssm_alpha.weight                                       [  5120     48   1  1]      983040  F32
+blk.0.ssm_beta.weight                                        [  5120     48   1  1]      983040  F32
+blk.0.ssm_conv1d.weight                                      [     4  10240   1  1]      163840  F32
+blk.0.ssm_dt.bias                                            [    48      1   1  1]         192  F32
+blk.0.ssm_norm.weight                                        [   128      1   1  1]         512  F32
+blk.0.ssm_out.weight                                         [  6144   5120   1  1]    17694720  Q4_K
+blk.1.attn_gate.weight                                       [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.1.attn_norm.weight                                       [  5120      1   1  1]       20480  F32
+blk.1.attn_qkv.weight                                        [  5120  10240   1  1]    29491200  Q4_K
+blk.1.ffn_down.weight                                        [ 17408   5120   1  1]    29245440  Q2_K
+blk.1.ffn_gate.weight                                        [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.1.ffn_up.weight                                          [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.1.post_attention_norm.weight                             [  5120      1   1  1]       20480  F32
+blk.1.ssm_a                                                  [    48      1   1  1]         192  F32
+blk.1.ssm_alpha.weight                                       [  5120     48   1  1]      983040  F32
+blk.1.ssm_beta.weight                                        [  5120     48   1  1]      983040  F32
+blk.1.ssm_conv1d.weight                                      [     4  10240   1  1]      163840  F32
+blk.1.ssm_dt.bias                                            [    48      1   1  1]         192  F32
+blk.1.ssm_norm.weight                                        [   128      1   1  1]         512  F32
+blk.1.ssm_out.weight                                         [  6144   5120   1  1]    17694720  Q4_K
+blk.2.attn_gate.weight                                       [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.2.attn_norm.weight                                       [  5120      1   1  1]       20480  F32
+blk.2.attn_qkv.weight                                        [  5120  10240   1  1]    29491200  Q4_K
+blk.2.ffn_down.weight                                        [ 17408   5120   1  1]    29245440  Q2_K
+blk.2.ffn_gate.weight                                        [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.2.ffn_up.weight                                          [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.2.post_attention_norm.weight                             [  5120      1   1  1]       20480  F32
+blk.2.ssm_a                                                  [    48      1   1  1]         192  F32
+blk.2.ssm_alpha.weight                                       [  5120     48   1  1]      983040  F32
+blk.2.ssm_beta.weight                                        [  5120     48   1  1]      983040  F32
+blk.2.ssm_conv1d.weight                                      [     4  10240   1  1]      163840  F32
+blk.2.ssm_dt.bias                                            [    48      1   1  1]         192  F32
+blk.2.ssm_norm.weight                                        [   128      1   1  1]         512  F32
+blk.2.ssm_out.weight                                         [  6144   5120   1  1]    17694720  Q4_K
+blk.3.attn_k.weight                                          [  5120   1024   1  1]     1351680  IQ2_XXS
+blk.3.attn_k_norm.weight                                     [   256      1   1  1]        1024  F32
+blk.3.attn_norm.weight                                       [  5120      1   1  1]       20480  F32
+blk.3.attn_output.weight                                     [  6144   5120   1  1]     8110080  IQ2_XXS
+blk.3.attn_q.weight                                          [  5120  12288   1  1]    16220160  IQ2_XXS
+blk.3.attn_q_norm.weight                                     [   256      1   1  1]        1024  F32
+blk.3.attn_v.weight                                          [  5120   1024   1  1]     2007040  IQ3_XXS
+blk.3.ffn_down.weight                                        [ 17408   5120   1  1]    29245440  Q2_K
+blk.3.ffn_gate.weight                                        [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.3.ffn_up.weight                                          [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.3.post_attention_norm.weight                             [  5120      1   1  1]       20480  F32
+blk.4.attn_gate.weight                                       [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.4.attn_norm.weight                                       [  5120      1   1  1]       20480  F32
+blk.4.attn_qkv.weight                                        [  5120  10240   1  1]    29491200  Q4_K
+blk.4.ffn_down.weight                                        [ 17408   5120   1  1]    29245440  Q2_K
+blk.4.ffn_gate.weight                                        [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.4.ffn_up.weight                                          [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.4.post_attention_norm.weight                             [  5120      1   1  1]       20480  F32
+blk.4.ssm_a                                                  [    48      1   1  1]         192  F32
+blk.4.ssm_alpha.weight                                       [  5120     48   1  1]      983040  F32
+blk.4.ssm_beta.weight                                        [  5120     48   1  1]      983040  F32
+blk.4.ssm_conv1d.weight                                      [     4  10240   1  1]      163840  F32
+blk.4.ssm_dt.bias                                            [    48      1   1  1]         192  F32
+blk.4.ssm_norm.weight                                        [   128      1   1  1]         512  F32
+blk.4.ssm_out.weight                                         [  6144   5120   1  1]    17694720  Q4_K
+blk.5.attn_gate.weight                                       [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.5.attn_norm.weight                                       [  5120      1   1  1]       20480  F32
+blk.5.attn_qkv.weight                                        [  5120  10240   1  1]    29491200  Q4_K
+blk.5.ffn_down.weight                                        [ 17408   5120   1  1]    29245440  Q2_K
+blk.5.ffn_gate.weight                                        [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.5.ffn_up.weight                                          [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.5.post_attention_norm.weight                             [  5120      1   1  1]       20480  F32
+blk.5.ssm_a                                                  [    48      1   1  1]         192  F32
+blk.5.ssm_alpha.weight                                       [  5120     48   1  1]      983040  F32
+blk.5.ssm_beta.weight                                        [  5120     48   1  1]      983040  F32
+blk.5.ssm_conv1d.weight                                      [     4  10240   1  1]      163840  F32
+blk.5.ssm_dt.bias                                            [    48      1   1  1]         192  F32
+blk.5.ssm_norm.weight                                        [   128      1   1  1]         512  F32
+blk.5.ssm_out.weight                                         [  6144   5120   1  1]    17694720  Q4_K
+blk.6.attn_gate.weight                                       [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.6.attn_norm.weight                                       [  5120      1   1  1]       20480  F32
+blk.6.attn_qkv.weight                                        [  5120  10240   1  1]    29491200  Q4_K
+blk.6.ffn_down.weight                                        [ 17408   5120   1  1]    29245440  Q2_K
+blk.6.ffn_gate.weight                                        [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.6.ffn_up.weight                                          [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.6.post_attention_norm.weight                             [  5120      1   1  1]       20480  F32
+blk.6.ssm_a                                                  [    48      1   1  1]         192  F32
+blk.6.ssm_alpha.weight                                       [  5120     48   1  1]      983040  F32
+blk.6.ssm_beta.weight                                        [  5120     48   1  1]      983040  F32
+blk.6.ssm_conv1d.weight                                      [     4  10240   1  1]      163840  F32
+blk.6.ssm_dt.bias                                            [    48      1   1  1]         192  F32
+blk.6.ssm_norm.weight                                        [   128      1   1  1]         512  F32
+blk.6.ssm_out.weight                                         [  6144   5120   1  1]    17694720  Q4_K
+blk.7.attn_k.weight                                          [  5120   1024   1  1]     1351680  IQ2_XXS
+blk.7.attn_k_norm.weight                                     [   256      1   1  1]        1024  F32
+blk.7.attn_norm.weight                                       [  5120      1   1  1]       20480  F32
+blk.7.attn_output.weight                                     [  6144   5120   1  1]     8110080  IQ2_XXS
+blk.7.attn_q.weight                                          [  5120  12288   1  1]    16220160  IQ2_XXS
+blk.7.attn_q_norm.weight                                     [   256      1   1  1]        1024  F32
+blk.7.attn_v.weight                                          [  5120   1024   1  1]     2007040  IQ3_XXS
+blk.7.ffn_down.weight                                        [ 17408   5120   1  1]    29245440  Q2_K
+blk.7.ffn_gate.weight                                        [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.7.ffn_up.weight                                          [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.7.post_attention_norm.weight                             [  5120      1   1  1]       20480  F32
+blk.8.attn_gate.weight                                       [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.8.attn_norm.weight                                       [  5120      1   1  1]       20480  F32
+blk.8.attn_qkv.weight                                        [  5120  10240   1  1]    29491200  Q4_K
+blk.8.ffn_down.weight                                        [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.8.ffn_gate.weight                                        [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.8.ffn_up.weight                                          [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.8.post_attention_norm.weight                             [  5120      1   1  1]       20480  F32
+blk.8.ssm_a                                                  [    48      1   1  1]         192  F32
+blk.8.ssm_alpha.weight                                       [  5120     48   1  1]      983040  F32
+blk.8.ssm_beta.weight                                        [  5120     48   1  1]      983040  F32
+blk.8.ssm_conv1d.weight                                      [     4  10240   1  1]      163840  F32
+blk.8.ssm_dt.bias                                            [    48      1   1  1]         192  F32
+blk.8.ssm_norm.weight                                        [   128      1   1  1]         512  F32
+blk.8.ssm_out.weight                                         [  6144   5120   1  1]    17694720  Q4_K
+blk.9.attn_gate.weight                                       [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.9.attn_norm.weight                                       [  5120      1   1  1]       20480  F32
+blk.9.attn_qkv.weight                                        [  5120  10240   1  1]    29491200  Q4_K
+blk.9.ffn_down.weight                                        [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.9.ffn_gate.weight                                        [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.9.ffn_up.weight                                          [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.9.post_attention_norm.weight                             [  5120      1   1  1]       20480  F32
+blk.9.ssm_a                                                  [    48      1   1  1]         192  F32
+blk.9.ssm_alpha.weight                                       [  5120     48   1  1]      983040  F32
+blk.9.ssm_beta.weight                                        [  5120     48   1  1]      983040  F32
+blk.9.ssm_conv1d.weight                                      [     4  10240   1  1]      163840  F32
+blk.9.ssm_dt.bias                                            [    48      1   1  1]         192  F32
+blk.9.ssm_norm.weight                                        [   128      1   1  1]         512  F32
+blk.9.ssm_out.weight                                         [  6144   5120   1  1]    17694720  Q4_K
+blk.10.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.10.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.10.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.10.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.10.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.10.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.10.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.10.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.10.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.10.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.10.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.10.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.10.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.10.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.11.attn_k.weight                                         [  5120   1024   1  1]     1351680  IQ2_XXS
+blk.11.attn_k_norm.weight                                    [   256      1   1  1]        1024  F32
+blk.11.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.11.attn_output.weight                                    [  6144   5120   1  1]     8110080  IQ2_XXS
+blk.11.attn_q.weight                                         [  5120  12288   1  1]    16220160  IQ2_XXS
+blk.11.attn_q_norm.weight                                    [   256      1   1  1]        1024  F32
+blk.11.attn_v.weight                                         [  5120   1024   1  1]     2007040  IQ3_XXS
+blk.11.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.11.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.11.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.11.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.12.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.12.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.12.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.12.ffn_down.weight                                       [ 17408   5120   1  1]    28549120  IQ2_S
+blk.12.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.12.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.12.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.12.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.12.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.12.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.12.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.12.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.12.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.12.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.13.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.13.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.13.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.13.ffn_down.weight                                       [ 17408   5120   1  1]    28549120  IQ2_S
+blk.13.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.13.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.13.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.13.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.13.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.13.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.13.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.13.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.13.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.13.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.14.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.14.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.14.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.14.ffn_down.weight                                       [ 17408   5120   1  1]    28549120  IQ2_S
+blk.14.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.14.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.14.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.14.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.14.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.14.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.14.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.14.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.14.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.14.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.15.attn_k.weight                                         [  5120   1024   1  1]     1351680  IQ2_XXS
+blk.15.attn_k_norm.weight                                    [   256      1   1  1]        1024  F32
+blk.15.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.15.attn_output.weight                                    [  6144   5120   1  1]     8110080  IQ2_XXS
+blk.15.attn_q.weight                                         [  5120  12288   1  1]    16220160  IQ2_XXS
+blk.15.attn_q_norm.weight                                    [   256      1   1  1]        1024  F32
+blk.15.attn_v.weight                                         [  5120   1024   1  1]     2007040  IQ3_XXS
+blk.15.ffn_down.weight                                       [ 17408   5120   1  1]    28549120  IQ2_S
+blk.15.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.15.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.15.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.16.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.16.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.16.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.16.ffn_down.weight                                       [ 17408   5120   1  1]    28549120  IQ2_S
+blk.16.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.16.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.16.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.16.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.16.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.16.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.16.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.16.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.16.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.16.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.17.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.17.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.17.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.17.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.17.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.17.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.17.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.17.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.17.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.17.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.17.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.17.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.17.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.17.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.18.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.18.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.18.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.18.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.18.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.18.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.18.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.18.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.18.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.18.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.18.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.18.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.18.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.18.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.19.attn_k.weight                                         [  5120   1024   1  1]     1351680  IQ2_XXS
+blk.19.attn_k_norm.weight                                    [   256      1   1  1]        1024  F32
+blk.19.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.19.attn_output.weight                                    [  6144   5120   1  1]     8110080  IQ2_XXS
+blk.19.attn_q.weight                                         [  5120  12288   1  1]    16220160  IQ2_XXS
+blk.19.attn_q_norm.weight                                    [   256      1   1  1]        1024  F32
+blk.19.attn_v.weight                                         [  5120   1024   1  1]     2007040  IQ3_XXS
+blk.19.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.19.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.19.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.19.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.20.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.20.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.20.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.20.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.20.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.20.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.20.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.20.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.20.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.20.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.20.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.20.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.20.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.20.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.21.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.21.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.21.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.21.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.21.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.21.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.21.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.21.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.21.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.21.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.21.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.21.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.21.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.21.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.22.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.22.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.22.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.22.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.22.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.22.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.22.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.22.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.22.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.22.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.22.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.22.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.22.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.22.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.23.attn_k.weight                                         [  5120   1024   1  1]     1351680  IQ2_XXS
+blk.23.attn_k_norm.weight                                    [   256      1   1  1]        1024  F32
+blk.23.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.23.attn_output.weight                                    [  6144   5120   1  1]     8110080  IQ2_XXS
+blk.23.attn_q.weight                                         [  5120  12288   1  1]    16220160  IQ2_XXS
+blk.23.attn_q_norm.weight                                    [   256      1   1  1]        1024  F32
+blk.23.attn_v.weight                                         [  5120   1024   1  1]     2007040  IQ3_XXS
+blk.23.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.23.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.23.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.23.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.24.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.24.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.24.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.24.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.24.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.24.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.24.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.24.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.24.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.24.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.24.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.24.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.24.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.24.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.25.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.25.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.25.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.25.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.25.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.25.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.25.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.25.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.25.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.25.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.25.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.25.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.25.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.25.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.26.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.26.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.26.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.26.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.26.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.26.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.26.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.26.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.26.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.26.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.26.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.26.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.26.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.26.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.27.attn_k.weight                                         [  5120   1024   1  1]     1351680  IQ2_XXS
+blk.27.attn_k_norm.weight                                    [   256      1   1  1]        1024  F32
+blk.27.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.27.attn_output.weight                                    [  6144   5120   1  1]     8110080  IQ2_XXS
+blk.27.attn_q.weight                                         [  5120  12288   1  1]    16220160  IQ2_XXS
+blk.27.attn_q_norm.weight                                    [   256      1   1  1]        1024  F32
+blk.27.attn_v.weight                                         [  5120   1024   1  1]     2007040  IQ3_XXS
+blk.27.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.27.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.27.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.27.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.28.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.28.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.28.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.28.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.28.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.28.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.28.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.28.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.28.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.28.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.28.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.28.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.28.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.28.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.29.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.29.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.29.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.29.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.29.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.29.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.29.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.29.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.29.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.29.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.29.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.29.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.29.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.29.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.30.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.30.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.30.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.30.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.30.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.30.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.30.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.30.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.30.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.30.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.30.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.30.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.30.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.30.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.31.attn_k.weight                                         [  5120   1024   1  1]     1351680  IQ2_XXS
+blk.31.attn_k_norm.weight                                    [   256      1   1  1]        1024  F32
+blk.31.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.31.attn_output.weight                                    [  6144   5120   1  1]     8110080  IQ2_XXS
+blk.31.attn_q.weight                                         [  5120  12288   1  1]    16220160  IQ2_XXS
+blk.31.attn_q_norm.weight                                    [   256      1   1  1]        1024  F32
+blk.31.attn_v.weight                                         [  5120   1024   1  1]     2007040  IQ3_XXS
+blk.31.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.31.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.31.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.31.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.32.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.32.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.32.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.32.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.32.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.32.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.32.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.32.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.32.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.32.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.32.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.32.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.32.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.32.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.33.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.33.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.33.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.33.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.33.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.33.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.33.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.33.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.33.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.33.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.33.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.33.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.33.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.33.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.34.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.34.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.34.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.34.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.34.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.34.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.34.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.34.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.34.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.34.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.34.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.34.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.34.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.34.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.35.attn_k.weight                                         [  5120   1024   1  1]     1351680  IQ2_XXS
+blk.35.attn_k_norm.weight                                    [   256      1   1  1]        1024  F32
+blk.35.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.35.attn_output.weight                                    [  6144   5120   1  1]     8110080  IQ2_XXS
+blk.35.attn_q.weight                                         [  5120  12288   1  1]    16220160  IQ2_XXS
+blk.35.attn_q_norm.weight                                    [   256      1   1  1]        1024  F32
+blk.35.attn_v.weight                                         [  5120   1024   1  1]     2007040  IQ3_XXS
+blk.35.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.35.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.35.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.35.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.36.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.36.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.36.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.36.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.36.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.36.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.36.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.36.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.36.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.36.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.36.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.36.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.36.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.36.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.37.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.37.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.37.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.37.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.37.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.37.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.37.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.37.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.37.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.37.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.37.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.37.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.37.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.37.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.38.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.38.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.38.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.38.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.38.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.38.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.38.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.38.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.38.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.38.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.38.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.38.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.38.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.38.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.39.attn_k.weight                                         [  5120   1024   1  1]     1351680  IQ2_XXS
+blk.39.attn_k_norm.weight                                    [   256      1   1  1]        1024  F32
+blk.39.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.39.attn_output.weight                                    [  6144   5120   1  1]     8110080  IQ2_XXS
+blk.39.attn_q.weight                                         [  5120  12288   1  1]    16220160  IQ2_XXS
+blk.39.attn_q_norm.weight                                    [   256      1   1  1]        1024  F32
+blk.39.attn_v.weight                                         [  5120   1024   1  1]     2007040  IQ3_XXS
+blk.39.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.39.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.39.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.39.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.40.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.40.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.40.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.40.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.40.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.40.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.40.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.40.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.40.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.40.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.40.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.40.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.40.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.40.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.41.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.41.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.41.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.41.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.41.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.41.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.41.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.41.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.41.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.41.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.41.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.41.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.41.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.41.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.42.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.42.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.42.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.42.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.42.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.42.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.42.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.42.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.42.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.42.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.42.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.42.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.42.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.42.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.43.attn_k.weight                                         [  5120   1024   1  1]     1351680  IQ2_XXS
+blk.43.attn_k_norm.weight                                    [   256      1   1  1]        1024  F32
+blk.43.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.43.attn_output.weight                                    [  6144   5120   1  1]     8110080  IQ2_XXS
+blk.43.attn_q.weight                                         [  5120  12288   1  1]    16220160  IQ2_XXS
+blk.43.attn_q_norm.weight                                    [   256      1   1  1]        1024  F32
+blk.43.attn_v.weight                                         [  5120   1024   1  1]     2007040  IQ3_XXS
+blk.43.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.43.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.43.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.43.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.44.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.44.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.44.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.44.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.44.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.44.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.44.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.44.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.44.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.44.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.44.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.44.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.44.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.44.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.45.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.45.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.45.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.45.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.45.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.45.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.45.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.45.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.45.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.45.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.45.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.45.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.45.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.45.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.46.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.46.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.46.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.46.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.46.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.46.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.46.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.46.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.46.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.46.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.46.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.46.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.46.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.46.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.47.attn_k.weight                                         [  5120   1024   1  1]     1351680  IQ2_XXS
+blk.47.attn_k_norm.weight                                    [   256      1   1  1]        1024  F32
+blk.47.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.47.attn_output.weight                                    [  6144   5120   1  1]     8110080  IQ2_XXS
+blk.47.attn_q.weight                                         [  5120  12288   1  1]    16220160  IQ2_XXS
+blk.47.attn_q_norm.weight                                    [   256      1   1  1]        1024  F32
+blk.47.attn_v.weight                                         [  5120   1024   1  1]     2007040  IQ3_XXS
+blk.47.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.47.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.47.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.47.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.48.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.48.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.48.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.48.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.48.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.48.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.48.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.48.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.48.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.48.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.48.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.48.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.48.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.48.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.49.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.49.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.49.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.49.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.49.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.49.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.49.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.49.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.49.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.49.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.49.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.49.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.49.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.49.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.50.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.50.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.50.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.50.ffn_down.weight                                       [ 17408   5120   1  1]    38297600  IQ3_S
+blk.50.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.50.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.50.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.50.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.50.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.50.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.50.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.50.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.50.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.50.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.51.attn_k.weight                                         [  5120   1024   1  1]     1351680  IQ2_XXS
+blk.51.attn_k_norm.weight                                    [   256      1   1  1]        1024  F32
+blk.51.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.51.attn_output.weight                                    [  6144   5120   1  1]     8110080  IQ2_XXS
+blk.51.attn_q.weight                                         [  5120  12288   1  1]    16220160  IQ2_XXS
+blk.51.attn_q_norm.weight                                    [   256      1   1  1]        1024  F32
+blk.51.attn_v.weight                                         [  5120   1024   1  1]     2007040  IQ3_XXS
+blk.51.ffn_down.weight                                       [ 17408   5120   1  1]    38297600  IQ3_S
+blk.51.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.51.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.51.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.52.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.52.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.52.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.52.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.52.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.52.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.52.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.52.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.52.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.52.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.52.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.52.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.52.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.52.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.53.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.53.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.53.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.53.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.53.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.53.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.53.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.53.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.53.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.53.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.53.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.53.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.53.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.53.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.54.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.54.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.54.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.54.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.54.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.54.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.54.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.54.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.54.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.54.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.54.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.54.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.54.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.54.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.55.attn_k.weight                                         [  5120   1024   1  1]     1351680  IQ2_XXS
+blk.55.attn_k_norm.weight                                    [   256      1   1  1]        1024  F32
+blk.55.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.55.attn_output.weight                                    [  6144   5120   1  1]     8110080  IQ2_XXS
+blk.55.attn_q.weight                                         [  5120  12288   1  1]    16220160  IQ2_XXS
+blk.55.attn_q_norm.weight                                    [   256      1   1  1]        1024  F32
+blk.55.attn_v.weight                                         [  5120   1024   1  1]     2007040  IQ3_XXS
+blk.55.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.55.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.55.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.55.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.56.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.56.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.56.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.56.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.56.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.56.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.56.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.56.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.56.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.56.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.56.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.56.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.56.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.56.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.57.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.57.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.57.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.57.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.57.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.57.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.57.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.57.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.57.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.57.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.57.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.57.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.57.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.57.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.58.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.58.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.58.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.58.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.58.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.58.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.58.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.58.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.58.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.58.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.58.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.58.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.58.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.58.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.59.attn_k.weight                                         [  5120   1024   1  1]     1351680  IQ2_XXS
+blk.59.attn_k_norm.weight                                    [   256      1   1  1]        1024  F32
+blk.59.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.59.attn_output.weight                                    [  6144   5120   1  1]     8110080  IQ2_XXS
+blk.59.attn_q.weight                                         [  5120  12288   1  1]    16220160  IQ2_XXS
+blk.59.attn_q_norm.weight                                    [   256      1   1  1]        1024  F32
+blk.59.attn_v.weight                                         [  5120   1024   1  1]     2007040  IQ3_XXS
+blk.59.ffn_down.weight                                       [ 17408   5120   1  1]    38297600  IQ3_S
+blk.59.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.59.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.59.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.60.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.60.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.60.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.60.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.60.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.60.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.60.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.60.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.60.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.60.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.60.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.60.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.60.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.60.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.61.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.61.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.61.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.61.ffn_down.weight                                       [ 17408   5120   1  1]    22978560  IQ2_XXS
+blk.61.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.61.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.61.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.61.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.61.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.61.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.61.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.61.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.61.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.61.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.62.attn_gate.weight                                      [  5120   6144   1  1]    12042240  IQ3_XXS
+blk.62.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.62.attn_qkv.weight                                       [  5120  10240   1  1]    29491200  Q4_K
+blk.62.ffn_down.weight                                       [ 17408   5120   1  1]    38297600  IQ3_S
+blk.62.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.62.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.62.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.62.ssm_a                                                 [    48      1   1  1]         192  F32
+blk.62.ssm_alpha.weight                                      [  5120     48   1  1]      983040  F32
+blk.62.ssm_beta.weight                                       [  5120     48   1  1]      983040  F32
+blk.62.ssm_conv1d.weight                                     [     4  10240   1  1]      163840  F32
+blk.62.ssm_dt.bias                                           [    48      1   1  1]         192  F32
+blk.62.ssm_norm.weight                                       [   128      1   1  1]         512  F32
+blk.62.ssm_out.weight                                        [  6144   5120   1  1]    17694720  Q4_K
+blk.63.attn_k.weight                                         [  5120   1024   1  1]     1351680  IQ2_XXS
+blk.63.attn_k_norm.weight                                    [   256      1   1  1]        1024  F32
+blk.63.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.63.attn_output.weight                                    [  6144   5120   1  1]     8110080  IQ2_XXS
+blk.63.attn_q.weight                                         [  5120  12288   1  1]    16220160  IQ2_XXS
+blk.63.attn_q_norm.weight                                    [   256      1   1  1]        1024  F32
+blk.63.attn_v.weight                                         [  5120   1024   1  1]     2007040  IQ3_XXS
+blk.63.ffn_down.weight                                       [ 17408   5120   1  1]    38297600  IQ3_S
+blk.63.ffn_gate.weight                                       [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.63.ffn_up.weight                                         [  5120  17408   1  1]    22978560  IQ2_XXS
+blk.63.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32
+blk.64.attn_k.weight                                         [  5120   1024   1  1]     1720320  Q2_K
+blk.64.attn_k_norm.weight                                    [   256      1   1  1]        1024  F32
+blk.64.attn_norm.weight                                      [  5120      1   1  1]       20480  F32
+blk.64.attn_output.weight                                    [  6144   5120   1  1]    10321920  Q2_K
+blk.64.attn_q.weight                                         [  5120  12288   1  1]    20643840  Q2_K
+blk.64.attn_q_norm.weight                                    [   256      1   1  1]        1024  F32
+blk.64.attn_v.weight                                         [  5120   1024   1  1]     2252800  Q3_K
+blk.64.ffn_down.weight                                       [ 17408   5120   1  1]    29245440  Q2_K
+blk.64.ffn_gate.weight                                       [  5120  17408   1  1]    29245440  Q2_K
+blk.64.ffn_up.weight                                         [  5120  17408   1  1]    29245440  Q2_K
+blk.64.nextn.eh_proj.weight                                  [ 10240   5120   1  1]    55705600  Q8_0
+blk.64.nextn.enorm.weight                                    [  5120      1   1  1]       20480  F32
+blk.64.nextn.hnorm.weight                                    [  5120      1   1  1]       20480  F32
+blk.64.nextn.shared_head_norm.weight                         [  5120      1   1  1]       20480  F32
+blk.64.post_attention_norm.weight                            [  5120      1   1  1]       20480  F32

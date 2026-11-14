@@ -1,0 +1,8 @@
+{"label": "mux_a_t1", "prompt_tokens": 413, "reused_prompt_tokens": 0, "reuse_source": "none", "reuse_miss": "no_live_state", "snapshot_restore_s": 0.0, "prefill_s": 13.1678, "engine_ttft_s": 26.558580917000654, "output_sha12": "f80cd4228c7a"}
+{"label": "mux_b_t1", "prompt_tokens": 373, "reused_prompt_tokens": 0, "reuse_source": "none", "reuse_miss": "no_live_state", "snapshot_restore_s": 1e-06, "prefill_s": 12.9991, "engine_ttft_s": 13.011731292004697, "output_sha12": "f8b04eb60be0"}
+{"cache": {"files": 0, "total_mb": 0.0}}
+{"label": "mux_b_t2", "prompt_tokens": 647, "reused_prompt_tokens": 412, "reuse_source": "live_state", "reuse_miss": null, "snapshot_restore_s": 0.0, "prefill_s": 7.8881, "engine_ttft_s": 7.896874375001062, "output_sha12": "46687c1dce93"}
+{"label": "mux_a_t2", "prompt_tokens": 689, "reused_prompt_tokens": 449, "reuse_source": "live_state", "reuse_miss": null, "snapshot_restore_s": 0.0, "prefill_s": 8.2543, "engine_ttft_s": 16.23334479201003, "output_sha12": "e8781503c6e6"}
+{"cache": {"files": 0, "total_mb": 0.0}}
+{"checks": [{"name": "mux_a_t2_live_reuse", "pass": true}, {"name": "mux_b_t2_live_reuse", "pass": true}, {"name": "mux_never_disk_snapshot", "pass": true}, {"name": "mux_no_snapshots_written", "pass": true}]}
+{"saved": "/Users/creemac/colibri/colibri/logs/logs/colibri-c12-workloads/phase5_mux_outputs.json"}

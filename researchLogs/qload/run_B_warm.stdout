@@ -1,0 +1,7 @@
+ 
+
+Topic 6: Machine learning.
+
+(1) Gradient descent minimizes a loss function by computing the gradient of the loss with respect to the parameters, and the update is a vector of the negative gradient times the learning rate; the loss is computed as the sum of squared errors, and the gradient is computed as the sum of the product of the error and the input, where the error is the difference between the prediction and the true value. The loss function is convex, and the gradient descent algorithm is guaranteed to converge to a global minimum. The learning rate is chosen to be small enough to ensure convergence, but large enough to make the optimization process efficient. The loss function is convex, and the gradient descent algorithm is guaranteed to converge to a global minimum. The learning rate is chosen to be small enough to ensure convergence, but large enough to make the optimization process efficient. The loss function is convex, and the gradient descent algorithm is guaranteed to converge to a global minimum. The learning rate is chosen to be small enough to ensure convergence, but large enough to make the optimization process efficient.
+
+(2) Gradient descent minimizes a loss function by computing the gradient of the loss with respect to the parameters, and the update is a vector of the negative gradient times the learning rate;

@@ -1,0 +1,2 @@
+{"label": "c1_cold_append_ref", "prompt_tokens": 3852, "reused_prompt_tokens": 0, "reuse_source": "none", "reuse_miss": "no_live_state", "prefill_s": 133.0475, "engine_ttft_s": 133.05866541698924, "output_sha12": "a85ee064470b"}
+{"checks": [{"name": "cold_ref_full_prefill", "pass": true}, {"name": "cold_ref_output_equals_reused", "pass": true}]}

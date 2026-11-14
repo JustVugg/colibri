@@ -1,0 +1,3 @@
+{"label": "s1_state", "prompt_tokens": 594, "reused_prompt_tokens": 594, "reuse_source": "disk_snapshot", "reuse_miss": null, "prefill_s": 0.0, "engine_ttft_s": 0.0905387919920031, "output_sha12": "a85ee064470b"}
+{"label": "s2_exact_repeat", "prompt_tokens": 594, "reused_prompt_tokens": 594, "reuse_source": "disk_snapshot", "reuse_miss": null, "prefill_s": 0.0, "engine_ttft_s": 0.0915976250107633, "output_sha12": "a85ee064470b"}
+{"label": "s3_append", "prompt_tokens": 848, "reused_prompt_tokens": 594, "reuse_source": "disk_snapshot", "reuse_miss": null, "prefill_s": 9.7822, "engine_ttft_s": 10.009762999994564, "output_sha12": "a85ee064470b"}

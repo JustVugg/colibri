@@ -1,0 +1,299 @@
+{
+  "schema_version": 1,
+  "config": {
+    "endpoint": "http://127.0.0.1:8001/v1/chat/completions",
+    "model": "qwen3.6-colibri",
+    "workload_sha256": "4d71fd106cfb875a2f33c34c5631fb81027b4f94d44f8cc20dacb04b8c94317a",
+    "workload_rows": 1,
+    "concurrency": 1,
+    "load_model": "closed_loop",
+    "arrival_distribution": null,
+    "arrival_seed": null,
+    "request_rate": null,
+    "warmup_requests": 0,
+    "repeats": 1,
+    "max_tokens": 128,
+    "temperature": 0.0,
+    "socket_timeout_seconds": 14400.0,
+    "slo_first_output_seconds": null,
+    "slo_duration_seconds": null,
+    "stream": true,
+    "include_usage": true,
+    "n": 1
+  },
+  "status": "measured",
+  "warmup": null,
+  "summary": {
+    "requests": 1,
+    "succeeded": 1,
+    "failed": 0,
+    "failure_rate": 0.0,
+    "wall_seconds": 3458.185688999991,
+    "successful_requests_per_second": 0.00028916897180532016,
+    "successful_requests_with_usage": 1,
+    "reported_successful_completion_tokens": 128,
+    "successful_completion_tokens_per_second": 0.03701362839108098,
+    "successful_duration_seconds": {
+      "count": 1,
+      "mean": 3458.1782422079996,
+      "p50": 3458.1782422079996,
+      "p95": 3458.1782422079996,
+      "p99": 3458.1782422079996
+    },
+    "successful_first_output_seconds": {
+      "count": 1,
+      "mean": 3434.5224983330118,
+      "p50": 3434.5224983330118,
+      "p95": 3434.5224983330118,
+      "p99": 3434.5224983330118
+    },
+    "successful_server_ttft_seconds": {
+      "count": 1,
+      "mean": 3409.4123690409906,
+      "p50": 3409.4123690409906,
+      "p95": 3409.4123690409906,
+      "p99": 3409.4123690409906
+    },
+    "successful_server_total_seconds": {
+      "count": 1,
+      "mean": 3458.1508912919962,
+      "p50": 3458.1508912919962,
+      "p95": 3458.1508912919962,
+      "p99": 3458.1508912919962
+    },
+    "successful_server_tokens_per_second": {
+      "count": 1,
+      "mean": 5.411295864433955,
+      "p50": 5.411295864433955,
+      "p95": 5.411295864433955,
+      "p99": 5.411295864433955
+    },
+    "successful_server_prepare_seconds": {
+      "count": 1,
+      "mean": 0.001360125999781303,
+      "p50": 0.001360125999781303,
+      "p95": 0.001360125999781303,
+      "p99": 0.001360125999781303
+    },
+    "successful_server_queue_wait_seconds": {
+      "count": 1,
+      "mean": 25.08293895800307,
+      "p50": 25.08293895800307,
+      "p95": 25.08293895800307,
+      "p99": 25.08293895800307
+    },
+    "successful_server_submit_to_accept_seconds": {
+      "count": 1,
+      "mean": 0.07146329099487048,
+      "p50": 0.07146329099487048,
+      "p95": 0.07146329099487048,
+      "p99": 0.07146329099487048
+    },
+    "successful_server_accept_to_first_output_seconds": {
+      "count": 1,
+      "mean": 3409.3409057499957,
+      "p50": 3409.3409057499957,
+      "p95": 3409.3409057499957,
+      "p99": 3409.3409057499957
+    },
+    "successful_server_engine_call_seconds": {
+      "count": 1,
+      "mean": 3433.0665922079934,
+      "p50": 3433.0665922079934,
+      "p95": 3433.0665922079934,
+      "p99": 3433.0665922079934
+    },
+    "successful_server_prefill_seconds": {
+      "count": 1,
+      "mean": 3407.764686,
+      "p50": 3407.764686,
+      "p95": 3407.764686,
+      "p99": 3407.764686
+    },
+    "successful_server_tokenize_seconds": {
+      "count": 1,
+      "mean": 0.070766,
+      "p50": 0.070766,
+      "p95": 0.070766,
+      "p99": 0.070766
+    },
+    "successful_server_prefix_match_seconds": {
+      "count": 1,
+      "mean": 5e-06,
+      "p50": 5e-06,
+      "p95": 5e-06,
+      "p99": 5e-06
+    },
+    "successful_server_snapshot_restore_seconds": {
+      "count": 1,
+      "mean": 0.001831,
+      "p50": 0.001831,
+      "p95": 0.001831,
+      "p99": 0.001831
+    },
+    "successful_server_snapshot_store_seconds": {
+      "count": 1,
+      "mean": 1.575869,
+      "p50": 1.575869,
+      "p95": 1.575869,
+      "p99": 1.575869
+    },
+    "successful_server_prefill_embedding_seconds": {
+      "count": 1,
+      "mean": 0.065212,
+      "p50": 0.065212,
+      "p95": 0.065212,
+      "p99": 0.065212
+    },
+    "successful_server_prefill_chunk_count": {
+      "count": 1,
+      "mean": 1.0,
+      "p50": 1.0,
+      "p95": 1.0,
+      "p99": 1.0
+    },
+    "successful_server_prefill_chunk_average_seconds": {
+      "count": 1,
+      "mean": 3407.657351,
+      "p50": 3407.657351,
+      "p95": 3407.657351,
+      "p99": 3407.657351
+    },
+    "successful_server_prefill_chunk_max_seconds": {
+      "count": 1,
+      "mean": 3407.657351,
+      "p50": 3407.657351,
+      "p95": 3407.657351,
+      "p99": 3407.657351
+    },
+    "successful_server_prefill_deltanet_seconds": {
+      "count": 1,
+      "mean": 328.733893,
+      "p50": 328.733893,
+      "p95": 328.733893,
+      "p99": 328.733893
+    },
+    "successful_server_prefill_attention_seconds": {
+      "count": 1,
+      "mean": 1844.183454,
+      "p50": 1844.183454,
+      "p95": 1844.183454,
+      "p99": 1844.183454
+    },
+    "successful_server_prefill_moe_seconds": {
+      "count": 1,
+      "mean": 1224.175645,
+      "p50": 1224.175645,
+      "p95": 1224.175645,
+      "p99": 1224.175645
+    },
+    "successful_server_prefill_shared_seconds": {
+      "count": 1,
+      "mean": 41.05139,
+      "p50": 41.05139,
+      "p95": 41.05139,
+      "p99": 41.05139
+    },
+    "successful_server_prefill_router_seconds": {
+      "count": 1,
+      "mean": 24.818372,
+      "p50": 24.818372,
+      "p95": 24.818372,
+      "p99": 24.818372
+    },
+    "successful_server_prefill_lm_head_seconds": {
+      "count": 1,
+      "mean": 0.0,
+      "p50": 0.0,
+      "p95": 0.0,
+      "p99": 0.0
+    },
+    "successful_server_first_sample_seconds": {
+      "count": 1,
+      "mean": 1.6e-05,
+      "p50": 1.6e-05,
+      "p95": 1.6e-05,
+      "p99": 1.6e-05
+    },
+    "successful_server_first_emit_after_prefill_seconds": {
+      "count": 1,
+      "mean": 0.000356,
+      "p50": 0.000356,
+      "p95": 0.000356,
+      "p99": 0.000356
+    },
+    "successful_server_prompt_tokens": {
+      "count": 1,
+      "mean": 32012.0,
+      "p50": 32012.0,
+      "p95": 32012.0,
+      "p99": 32012.0
+    },
+    "successful_server_reused_prompt_tokens": {
+      "count": 1,
+      "mean": 0.0,
+      "p50": 0.0,
+      "p95": 0.0,
+      "p99": 0.0
+    },
+    "successful_server_prefix_reuse_fraction": {
+      "count": 1,
+      "mean": 0.0,
+      "p50": 0.0,
+      "p95": 0.0,
+      "p99": 0.0
+    },
+    "successful_server_prefix_reuse_sources": {
+      "none": 1
+    },
+    "successful_server_prefix_reuse_misses": {
+      "no_matching_disk_snapshot": 1
+    },
+    "arrival_timing": null,
+    "latency_slo": null
+  },
+  "requests": [
+    {
+      "index": 0,
+      "start_seconds": 0.004251541991834529,
+      "success": true,
+      "http_status": 200,
+      "error": null,
+      "first_output_seconds": 3434.5224983330118,
+      "completion_tokens": 128,
+      "finish_reason": "length",
+      "server_timings": {
+        "request_prepare_s": 0.001360125999781303,
+        "queue_wait_s": 25.08293895800307,
+        "engine_submit_to_accept_s": 0.07146329099487048,
+        "accept_to_first_output_s": 3409.3409057499957,
+        "engine_ttft_s": 3409.4123690409906,
+        "engine_call_s": 3433.0665922079934,
+        "request_to_engine_done_s": 3458.1508912919962,
+        "decode_tokens_per_sec": 5.411295864433955,
+        "prefill_s": 3407.764686,
+        "prompt_tokens": 32012.0,
+        "reused_prompt_tokens": 0.0,
+        "tokenize_s": 0.070766,
+        "prefix_match_s": 5e-06,
+        "snapshot_restore_s": 0.001831,
+        "snapshot_store_s": 1.575869,
+        "prefill_embedding_s": 0.065212,
+        "prefill_chunk_count": 1.0,
+        "prefill_chunk_avg_s": 3407.657351,
+        "prefill_chunk_max_s": 3407.657351,
+        "prefill_deltanet_s": 328.733893,
+        "prefill_attention_s": 1844.183454,
+        "prefill_moe_s": 1224.175645,
+        "prefill_shared_s": 41.05139,
+        "prefill_router_s": 24.818372,
+        "prefill_lm_head_s": 0.0,
+        "first_sample_s": 1.6e-05,
+        "first_emit_after_prefill_s": 0.000356,
+        "prefix_reuse_source": "none",
+        "prefix_reuse_miss": "no_matching_disk_snapshot"
+      },
+      "duration_seconds": 3458.1782422079996
+    }
+  ]
+}

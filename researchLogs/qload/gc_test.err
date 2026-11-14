@@ -1,0 +1,4 @@
+[OMP] qwen36: 4 physical-core threads instead of 10 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+[gguf] qwen3moe: 48 layers (all attention), hidden 2048, 128 experts top-8, inter 768, vocab 151936
+[gguf] experts: layer 0 gate IQ1_S up IQ1_S down IQ1_S, 1.57 MB per expert at most
+[tok] loaded 151936 pieces, 151387 merges, 26 added tokens from the GGUF

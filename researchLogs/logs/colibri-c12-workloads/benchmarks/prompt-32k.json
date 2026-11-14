@@ -1,0 +1,115 @@
+{
+  "schema_version": 1,
+  "config": {
+    "endpoint": "http://localhost:8001/v1/chat/completions",
+    "model": "/Users/creemac/.lmstudio/models/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-IQ2_XXS.colibri",
+    "workload_sha256": "4d71fd106cfb875a2f33c34c5631fb81027b4f94d44f8cc20dacb04b8c94317a",
+    "workload_rows": 1,
+    "concurrency": 1,
+    "load_model": "closed_loop",
+    "arrival_distribution": null,
+    "arrival_seed": null,
+    "request_rate": null,
+    "warmup_requests": 0,
+    "repeats": 5,
+    "max_tokens": 128,
+    "temperature": 0.0,
+    "socket_timeout_seconds": 14400.0,
+    "slo_first_output_seconds": null,
+    "slo_duration_seconds": null,
+    "stream": true,
+    "include_usage": true,
+    "n": 1
+  },
+  "status": "measured",
+  "warmup": null,
+  "summary": {
+    "requests": 5,
+    "succeeded": 0,
+    "failed": 5,
+    "failure_rate": 1.0,
+    "wall_seconds": 0.0832531670021126,
+    "successful_requests_per_second": 0.0,
+    "successful_requests_with_usage": 0,
+    "reported_successful_completion_tokens": 0,
+    "successful_completion_tokens_per_second": null,
+    "successful_duration_seconds": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null
+    },
+    "successful_first_output_seconds": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null
+    },
+    "arrival_timing": null,
+    "latency_slo": null
+  },
+  "requests": [
+    {
+      "index": 0,
+      "start_seconds": 0.006149791995994747,
+      "success": false,
+      "http_status": 401,
+      "error": "HTTPError",
+      "first_output_seconds": null,
+      "completion_tokens": null,
+      "finish_reason": null,
+      "server_timings": null,
+      "duration_seconds": 0.03715895800269209
+    },
+    {
+      "index": 1,
+      "start_seconds": 0.04332920799788553,
+      "success": false,
+      "http_status": 401,
+      "error": "HTTPError",
+      "first_output_seconds": null,
+      "completion_tokens": null,
+      "finish_reason": null,
+      "server_timings": null,
+      "duration_seconds": 0.009685375000117347
+    },
+    {
+      "index": 2,
+      "start_seconds": 0.05302708299132064,
+      "success": false,
+      "http_status": 401,
+      "error": "HTTPError",
+      "first_output_seconds": null,
+      "completion_tokens": null,
+      "finish_reason": null,
+      "server_timings": null,
+      "duration_seconds": 0.011936834009247832
+    },
+    {
+      "index": 3,
+      "start_seconds": 0.06497916700027417,
+      "success": false,
+      "http_status": 401,
+      "error": "HTTPError",
+      "first_output_seconds": null,
+      "completion_tokens": null,
+      "finish_reason": null,
+      "server_timings": null,
+      "duration_seconds": 0.009036415998707525
+    },
+    {
+      "index": 4,
+      "start_seconds": 0.07402870799705852,
+      "success": false,
+      "http_status": 401,
+      "error": "HTTPError",
+      "first_output_seconds": null,
+      "completion_tokens": null,
+      "finish_reason": null,
+      "server_timings": null,
+      "duration_seconds": 0.009132749997661449
+    }
+  ]
+}

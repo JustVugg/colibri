@@ -1,0 +1,1 @@
+{"label": "base_r1_4k_a", "client_total_s": 142.7164, "prefill_s": 139.90742, "prefill_attention_s": 19.892778, "prefill_deltanet_s": 24.931744, "prefill_moe_s": 94.459601, "prefill_chunk_count": 1, "prompt_tokens": 4095, "engine_ttft_s": 139.92200200000661, "decode_tokens_per_sec": 11.138003000989366, "output_sha12": "fb965acd73e5"}

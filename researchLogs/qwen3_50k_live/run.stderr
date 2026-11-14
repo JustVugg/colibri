@@ -1,0 +1,11 @@
+[OMP] qwen36: 4 physical-core threads instead of 10 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+[gguf] /Users/creemac/.lmstudio/models/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf: 1 file(s), 579 tensors, read in place (native ggml types, no conversion)
+== qwen36 Phase-2 engine | cache=128/layer bits=4 ctx=50000 pilot=3 wide=4 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 151936 pieces (max id 151935) from /Users/creemac/.colibri-models/qwen3-coder-30b-a3b-ud-tq1/tokenizer.json
+[enc] prompt tokens: 45600 | generating 256 new tokens
+[gguf] qwen3moe: 48 layers (all attention), hidden 2048, 128 experts top-8, inter 768, vocab 151936
+[gguf] experts: layer 0 gate IQ1_S up IQ1_S down IQ1_S, 1.57 MB per expert at most
+resident weights loaded in 0.4s | RSS after load: 0.93 GB
+[qwen36] expert format on disk: GGUF native ggml types (the CUDA and Vulkan tiers hold the file's blocks)
+Generated (256 new tokens):
+Text : [qwen36] KV cache: float16, 4.22 GiB at 46080 positions (half of float32; Q36_KV=f32 keeps float32)

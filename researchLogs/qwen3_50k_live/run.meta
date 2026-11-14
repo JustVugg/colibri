@@ -1,0 +1,5 @@
+Started: 2026-11-06T23:26:52+05:30
+Command: SNAP=/Users/creemac/.colibri-models/qwen3-coder-30b-a3b-ud-tq1 Q36_MAXT=50000 Q36_KV=f16 N_NEW=256 Q36_PERF_STATS=1 COLI_TIMERS=1 COLI_METAL_IQ2_XXS=1 PILOT=3 WIDE=4 ./c/qwen36 128 4 logs/qwen3_50k_live/prompt.txt
+Finished: 2026-11-07T01:02:53+05:30
+exit_code=143
+2026-11-07T01:02:55+05:30 monitor_finished safety_stop=none

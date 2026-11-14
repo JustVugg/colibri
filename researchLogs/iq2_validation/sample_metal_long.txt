@@ -1,0 +1,1129 @@
+Analysis of sampling qwen36 (pid 24149) every 1 millisecond
+Process:         qwen36 [24149]
+Path:            /Users/USER/*/qwen36
+Load Address:    0x102f4c000
+Identifier:      qwen36
+Version:         0
+Code Type:       ARM64
+Platform:        macOS
+Parent Process:  zsh [24146]
+Target Type:     live task
+
+Date/Time:       2026-11-05 06:13:10.385 +0530
+Launch Time:     2026-11-05 06:13:04.241 +0530
+OS Version:      macOS 27.2 (26B123)
+Report Version:  7
+Analysis Tool:   /usr/bin/sample
+
+Physical footprint:         9.0G
+Physical footprint (peak):  9.0G
+Idle exit:                  untracked
+----
+
+Call graph:
+    1830 Thread_5983574   DispatchQueue_1: com.apple.main-thread  (serial)
+    + 1830 start  (in dyld) + 6652  [0x1827f8d7c]
+    +   1830 main  (in qwen36) + 7516  [0x102f4e89c]
+    +     1063 generate  (in qwen36) + 1152  [0x102f59aec]
+    +     ! 1063 q36_spec_step  (in qwen36) + 6044  [0x102fbce78]
+    +     !   1061 step_ex_control  (in qwen36) + 580  [0x102f8b420]
+    +     !   : 627 layers_forward_control  (in qwen36) + 11312  [0x102f8fdb8]
+    +     !   : | 627 moe_ex  (in qwen36) + 340  [0x102f9aa38]
+    +     !   : |   235 qwen_shared_experts_cpu  (in qwen36) + 848  [0x102fa1df8]
+    +     !   : |   + 159 matmul_d  (in qwen36) + 1512  [0x102f91c70]
+    +     !   : |   + ! 158 coli_metal_iq2_xxs_gemv_profile  (in qwen36) + 1888  [0x102fcb2d4]
+    +     !   : |   + ! : 158 -[_MTLCommandBuffer waitUntilCompleted]  (in Metal) + 80  [0x1962bccc0]
+    +     !   : |   + ! :   158 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x1828cd1b4]
+    +     !   : |   + ! :     158 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18288b50c]
+    +     !   : |   + ! 1 coli_metal_iq2_xxs_gemv_profile  (in qwen36) + 656  [0x102fcae04]
+    +     !   : |   + !   1 resolve(void const*, unsigned long, unsigned long long*)  (in qwen36) + 180  [0x102fc8720]
+    +     !   : |   + !     1 -[IOGPUMetalResource gpuAddress]  (in IOGPU) + 0  [0x1962748dc]
+    +     !   : |   + 75 matmul_d  (in qwen36) + 1208  [0x102f91b40]
+    +     !   : |   + ! 75 gq_matmul  (in qwen36) + 800  [0x102fa5ed4]
+    +     !   : |   + !   74 __kmpc_fork_call  (in libomp.dylib) + 172  [0x1031cb4e8]
+    +     !   : |   + !   : 74 __kmp_fork_call  (in libomp.dylib) + 6076  [0x1031d6bc8]
+    +     !   : |   + !   :   74 __kmp_invoke_task_func  (in libomp.dylib) + 320  [0x1031db258]
+    +     !   : |   + !   :     74 __kmp_invoke_microtask  (in libomp.dylib) + 156  [0x103226f8c]
+    +     !   : |   + !   :       74 gq_matmul_act.omp_outlined  (in qwen36) + 204  [0x102fa6d28]
+    +     !   : |   + !   :         38 gq_row_all  (in qwen36) + 788  [0x102fa7080]
+    +     !   : |   + !   :         | 38 gq_ublk  (in qwen36) + 8996,9388,...  [0x102fa9754,0x102fa98dc,...]
+    +     !   : |   + !   :         35 gq_row_all  (in qwen36) + 1116,1140,...  [0x102fa71c8,0x102fa71e0,...]
+    +     !   : |   + !   :         1 gq_ublk  (in qwen36) + 12660  [0x102faa5a4]
+    +     !   : |   + !   1 __kmpc_fork_call  (in libomp.dylib) + 192  [0x1031cb4fc]
+    +     !   : |   + !     1 __kmp_join_call  (in libomp.dylib) + 328  [0x1031d779c]
+    +     !   : |   + !       1 __kmp_internal_join  (in libomp.dylib) + 92  [0x1031d7f4c]
+    +     !   : |   + !         1 __kmp_join_barrier(int)  (in libomp.dylib) + 556  [0x1031f289c]
+    +     !   : |   + !           1 __kmp_hyper_barrier_gather(barrier_type, kmp_info*, int, int, void (*)(void*, void*), void*)  (in libomp.dylib) + 440  [0x1031f3240]
+    +     !   : |   + !             1 kmp_flag_64<false, true>::wait(kmp_info*, int, void*)  (in libomp.dylib) + 860  [0x1031f5294]
+    +     !   : |   + !               1 void __kmp_suspend_64<false, true>(int, kmp_flag_64<false, true>*)  (in libomp.dylib) + 368  [0x10320e1cc]
+    +     !   : |   + !                 1 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x1828cd1b4]
+    +     !   : |   + !                   1 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18288b50c]
+    +     !   : |   + 1 matmul_d  (in qwen36) + 1136  [0x102f91af8]
+    +     !   : |   +   1 gq_act_set  (in qwen36) + 184  [0x102fa5fc0]
+    +     !   : |   +     1 _xzm_xzone_malloc_small_freelist  (in libsystem_malloc.dylib) + 108  [0x1841ed0d8]
+    +     !   : |   209 qwen_shared_experts_cpu  (in qwen36) + 568  [0x102fa1ce0]
+    +     !   : |   + 208 matmul_d  (in qwen36) + 1512  [0x102f91c70]
+    +     !   : |   + ! 208 coli_metal_iq2_xxs_gemv_profile  (in qwen36) + 1888  [0x102fcb2d4]
+    +     !   : |   + !   208 -[_MTLCommandBuffer waitUntilCompleted]  (in Metal) + 80  [0x1962bccc0]
+    +     !   : |   + !     207 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x1828cd1b4]
+    +     !   : |   + !     : 207 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18288b50c]
+    +     !   : |   + !     1 _pthread_cond_wait  (in libsystem_pthread.dylib) + 992  [0x1828cd1c0]
+    +     !   : |   + 1 matmul_d  (in qwen36) + 96  [0x102f916e8]
+    +     !   : |   +   1 getenv  (in libsystem_c.dylib) + 44  [0x1828e5f34]
+    +     !   : |   +     1 os_unfair_lock_lock_with_options  (in libsystem_platform.dylib) + 12  [0x18789292c]
+    +     !   : |   179 qwen_shared_experts_cpu  (in qwen36) + 540  [0x102fa1cc4]
+    +     !   : |   + 179 matmul_d  (in qwen36) + 1512  [0x102f91c70]
+    +     !   : |   +   176 coli_metal_iq2_xxs_gemv_profile  (in qwen36) + 1888  [0x102fcb2d4]
+    +     !   : |   +   ! 176 -[_MTLCommandBuffer waitUntilCompleted]  (in Metal) + 80  [0x1962bccc0]
+    +     !   : |   +   !   176 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x1828cd1b4]
+    +     !   : |   +   !     176 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18288b50c]
+    +     !   : |   +   1 coli_metal_iq2_xxs_gemv_profile  (in qwen36) + 656  [0x102fcae04]
+    +     !   : |   +   ! 1 resolve(void const*, unsigned long, unsigned long long*)  (in qwen36) + 104  [0x102fc86d4]
+    +     !   : |   +   1 coli_metal_iq2_xxs_gemv_profile  (in qwen36) + 1552  [0x102fcb184]
+    +     !   : |   +   ! 1 -[AGXG16GFamilyCommandBuffer computeCommandEncoder]  (in AGXMetalG16G_B0) + 284  [0x250446658]
+    +     !   : |   +   !   1 -[AGXG16GFamilyCommandBuffer computeCommandEncoderWithConfig:]  (in AGXMetalG16G_B0) + 172  [0x2504464fc]
+    +     !   : |   +   !     1 -[AGXG16GFamilyComputeContext initWithCommandBuffer:config:]  (in AGXMetalG16G_B0) + 0  [0x25047f028]
+    +     !   : |   +   1 coli_metal_iq2_xxs_gemv_profile  (in qwen36) + 1580  [0x102fcb1a0]
+    +     !   : |   +     1 -[AGXG16GFamilyComputeContext useResource:usage:]  (in AGXMetalG16G_B0) + 76  [0x250483370]
+    +     !   : |   +       1 AGX::ContextCommon<AGX::HAL200::Encoders, AGX::HAL200::Classes, AGX::HAL200::ObjClasses, AGX::HAL200::DataBufferAllocator>::useResourceCommon(IOGPUMetalResource*, eAGXAllocationListResourceFlags, eAGXAllocationListResourceFlags)  (in AGXMetalG16G_B0) + 344  [0x2504691b4]
+    +     !   : |   +         1 MTLResourceListAddResource  (in Metal) + 0  [0x1962b1758]
+    +     !   : |   3 expf  (in libsystem_m.dylib) + 104  [0x2d0358b68]
+    +     !   : |   1 qwen_shared_experts_cpu  (in qwen36) + 664  [0x102fa1d40]
+    +     !   : |     1 expf  (in libsystem_m.dylib) + 84  [0x2d0358b54]
+    +     !   : 162 layers_forward_control  (in qwen36) + 2636  [0x102f8dbd4]
+    +     !   : | 162 matmul_d  (in qwen36) + 1208  [0x102f91b40]
+    +     !   : |   162 gq_matmul  (in qwen36) + 800  [0x102fa5ed4]
+    +     !   : |     155 __kmpc_fork_call  (in libomp.dylib) + 172  [0x1031cb4e8]
+    +     !   : |     + 154 __kmp_fork_call  (in libomp.dylib) + 6076  [0x1031d6bc8]
+    +     !   : |     + ! 154 __kmp_invoke_task_func  (in libomp.dylib) + 320  [0x1031db258]
+    +     !   : |     + !   154 __kmp_invoke_microtask  (in libomp.dylib) + 156  [0x103226f8c]
+    +     !   : |     + !     154 gq_matmul_act.omp_outlined  (in qwen36) + 204  [0x102fa6d28]
+    +     !   : |     + !       105 gq_row_all  (in qwen36) + 788  [0x102fa7080]
+    +     !   : |     + !       : 105 gq_ublk  (in qwen36) + 5192,5252,...  [0x102fa8878,0x102fa88b4,...]
+    +     !   : |     + !       43 gq_row_all  (in qwen36) + 1224,1140,...  [0x102fa7234,0x102fa71e0,...]
+    +     !   : |     + !       5 gq_ublk  (in qwen36) + 12648,12656,...  [0x102faa598,0x102faa5a0,...]
+    +     !   : |     + !       1 gq_row_all  (in qwen36) + 616  [0x102fa6fd4]
+    +     !   : |     + !         1 _tlv_get_addr  (in libdyld.dylib) + 20  [0x1827a7b1c]
+    +     !   : |     + 1 __kmp_fork_call  (in libomp.dylib) + 1392  [0x1031d597c]
+    +     !   : |     +   1 __kmp_acquire_ticket_lock  (in libomp.dylib) + 0  [0x103202498]
+    +     !   : |     7 __kmpc_fork_call  (in libomp.dylib) + 192  [0x1031cb4fc]
+    +     !   : |       7 __kmp_join_call  (in libomp.dylib) + 328  [0x1031d779c]
+    +     !   : |         7 __kmp_internal_join  (in libomp.dylib) + 92  [0x1031d7f4c]
+    +     !   : |           7 __kmp_join_barrier(int)  (in libomp.dylib) + 556  [0x1031f289c]
+    +     !   : |             7 __kmp_hyper_barrier_gather(barrier_type, kmp_info*, int, int, void (*)(void*, void*), void*)  (in libomp.dylib) + 440  [0x1031f3240]
+    +     !   : |               7 kmp_flag_64<false, true>::wait(kmp_info*, int, void*)  (in libomp.dylib) + 860  [0x1031f5294]
+    +     !   : |                 7 void __kmp_suspend_64<false, true>(int, kmp_flag_64<false, true>*)  (in libomp.dylib) + 368  [0x10320e1cc]
+    +     !   : |                   7 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x1828cd1b4]
+    +     !   : |                     7 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18288b50c]
+    +     !   : 97 layers_forward_control  (in qwen36) + 7308  [0x102f8ee14]
+    +     !   : | 97 matmul_d  (in qwen36) + 1208  [0x102f91b40]
+    +     !   : |   97 gq_matmul  (in qwen36) + 800  [0x102fa5ed4]
+    +     !   : |     94 __kmpc_fork_call  (in libomp.dylib) + 172  [0x1031cb4e8]
+    +     !   : |     + 94 __kmp_fork_call  (in libomp.dylib) + 6076  [0x1031d6bc8]
+    +     !   : |     +   94 __kmp_invoke_task_func  (in libomp.dylib) + 320  [0x1031db258]
+    +     !   : |     +     94 __kmp_invoke_microtask  (in libomp.dylib) + 156  [0x103226f8c]
+    +     !   : |     +       94 gq_matmul_act.omp_outlined  (in qwen36) + 204  [0x102fa6d28]
+    +     !   : |     +         61 gq_row_all  (in qwen36) + 788  [0x102fa7080]
+    +     !   : |     +         ! 61 gq_ublk  (in qwen36) + 5232,5272,...  [0x102fa88a0,0x102fa88c8,...]
+    +     !   : |     +         30 gq_row_all  (in qwen36) + 1140,1224,...  [0x102fa71e0,0x102fa7234,...]
+    +     !   : |     +         3 gq_ublk  (in qwen36) + 12648,12660  [0x102faa598,0x102faa5a4]
+    +     !   : |     3 __kmpc_fork_call  (in libomp.dylib) + 192  [0x1031cb4fc]
+    +     !   : |       3 __kmp_join_call  (in libomp.dylib) + 328  [0x1031d779c]
+    +     !   : |         3 __kmp_internal_join  (in libomp.dylib) + 92  [0x1031d7f4c]
+    +     !   : |           3 __kmp_join_barrier(int)  (in libomp.dylib) + 556  [0x1031f289c]
+    +     !   : |             3 __kmp_hyper_barrier_gather(barrier_type, kmp_info*, int, int, void (*)(void*, void*), void*)  (in libomp.dylib) + 440  [0x1031f3240]
+    +     !   : |               3 kmp_flag_64<false, true>::wait(kmp_info*, int, void*)  (in libomp.dylib) + 860  [0x1031f5294]
+    +     !   : |                 3 void __kmp_suspend_64<false, true>(int, kmp_flag_64<false, true>*)  (in libomp.dylib) + 368  [0x10320e1cc]
+    +     !   : |                   3 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x1828cd1b4]
+    +     !   : |                     3 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18288b50c]
+    +     !   : 80 layers_forward_control  (in qwen36) + 2668  [0x102f8dbf4]
+    +     !   : | 80 matmul_d  (in qwen36) + 1208  [0x102f91b40]
+    +     !   : |   80 gq_matmul  (in qwen36) + 800  [0x102fa5ed4]
+    +     !   : |     77 __kmpc_fork_call  (in libomp.dylib) + 172  [0x1031cb4e8]
+    +     !   : |     + 77 __kmp_fork_call  (in libomp.dylib) + 6076  [0x1031d6bc8]
+    +     !   : |     +   77 __kmp_invoke_task_func  (in libomp.dylib) + 320  [0x1031db258]
+    +     !   : |     +     77 __kmp_invoke_microtask  (in libomp.dylib) + 156  [0x103226f8c]
+    +     !   : |     +       77 gq_matmul_act.omp_outlined  (in qwen36) + 204  [0x102fa6d28]
+    +     !   : |     +         57 gq_row_all  (in qwen36) + 788  [0x102fa7080]
+    +     !   : |     +         ! 57 gq_ublk  (in qwen36) + 2548,2744,...  [0x102fa7e24,0x102fa7ee8,...]
+    +     !   : |     +         19 gq_row_all  (in qwen36) + 1140,1116,...  [0x102fa71e0,0x102fa71c8,...]
+    +     !   : |     +         1 gq_ublk  (in qwen36) + 12660  [0x102faa5a4]
+    +     !   : |     3 __kmpc_fork_call  (in libomp.dylib) + 192  [0x1031cb4fc]
+    +     !   : |       3 __kmp_join_call  (in libomp.dylib) + 328  [0x1031d779c]
+    +     !   : |         3 __kmp_internal_join  (in libomp.dylib) + 92  [0x1031d7f4c]
+    +     !   : |           3 __kmp_join_barrier(int)  (in libomp.dylib) + 556  [0x1031f289c]
+    +     !   : |             3 __kmp_hyper_barrier_gather(barrier_type, kmp_info*, int, int, void (*)(void*, void*), void*)  (in libomp.dylib) + 440  [0x1031f3240]
+    +     !   : |               3 kmp_flag_64<false, true>::wait(kmp_info*, int, void*)  (in libomp.dylib) + 860  [0x1031f5294]
+    +     !   : |                 3 void __kmp_suspend_64<false, true>(int, kmp_flag_64<false, true>*)  (in libomp.dylib) + 368  [0x10320e1cc]
+    +     !   : |                   3 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x1828cd1b4]
+    +     !   : |                     3 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18288b50c]
+    +     !   : 73 layers_forward_control  (in qwen36) + 1320  [0x102f8d6b0]
+    +     !   : | 35 attention  (in qwen36) + 308  [0x102f91fcc]
+    +     !   : | + 35 matmul_d  (in qwen36) + 1512  [0x102f91c70]
+    +     !   : | +   35 coli_metal_iq2_xxs_gemv_profile  (in qwen36) + 1888  [0x102fcb2d4]
+    +     !   : | +     35 -[_MTLCommandBuffer waitUntilCompleted]  (in Metal) + 80  [0x1962bccc0]
+    +     !   : | +       35 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x1828cd1b4]
+    +     !   : | +         35 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18288b50c]
+    +     !   : | 19 attention  (in qwen36) + 12836  [0x102f950bc]
+    +     !   : | + 19 matmul_d  (in qwen36) + 1512  [0x102f91c70]
+    +     !   : | +   18 coli_metal_iq2_xxs_gemv_profile  (in qwen36) + 1888  [0x102fcb2d4]
+    +     !   : | +   ! 18 -[_MTLCommandBuffer waitUntilCompleted]  (in Metal) + 80  [0x1962bccc0]
+    +     !   : | +   !   18 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x1828cd1b4]
+    +     !   : | +   !     18 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18288b50c]
+    +     !   : | +   1 coli_metal_iq2_xxs_gemv_profile  (in qwen36) + 1552  [0x102fcb184]
+    +     !   : | +     1 -[AGXG16GFamilyCommandBuffer computeCommandEncoder]  (in AGXMetalG16G_B0) + 284  [0x250446658]
+    +     !   : | +       1 -[AGXG16GFamilyCommandBuffer computeCommandEncoderWithConfig:]  (in AGXMetalG16G_B0) + 172  [0x2504464fc]
+    +     !   : | +         1 ???  (in <unknown binary>)  [0x252343a70]
+    +     !   : | 14 attention  (in qwen36) + 340  [0x102f91fec]
+    +     !   : | + 14 matmul_d  (in qwen36) + 1512  [0x102f91c70]
+    +     !   : | +   14 coli_metal_iq2_xxs_gemv_profile  (in qwen36) + 1888  [0x102fcb2d4]
+    +     !   : | +     14 -[_MTLCommandBuffer waitUntilCompleted]  (in Metal) + 80  [0x1962bccc0]
+    +     !   : | +       14 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x1828cd1b4]
+    +     !   : | +         14 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18288b50c]
+    +     !   : | 4 attention  (in qwen36) + 372  [0x102f9200c]
+    +     !   : | + 4 matmul_d  (in qwen36) + 1208  [0x102f91b40]
+    +     !   : | +   4 gq_matmul  (in qwen36) + 800  [0x102fa5ed4]
+    +     !   : | +     3 __kmpc_fork_call  (in libomp.dylib) + 172  [0x1031cb4e8]
+    +     !   : | +     ! 3 __kmp_fork_call  (in libomp.dylib) + 6076  [0x1031d6bc8]
+    +     !   : | +     !   3 __kmp_invoke_task_func  (in libomp.dylib) + 320  [0x1031db258]
+    +     !   : | +     !     3 __kmp_invoke_microtask  (in libomp.dylib) + 156  [0x103226f8c]
+    +     !   : | +     !       3 gq_matmul_act.omp_outlined  (in qwen36) + 204  [0x102fa6d28]
+    +     !   : | +     !         3 gq_row_all  (in qwen36) + 788  [0x102fa7080]
+    +     !   : | +     !           3 gq_ublk  (in qwen36) + 2548  [0x102fa7e24]
+    +     !   : | +     1 __kmpc_fork_call  (in libomp.dylib) + 192  [0x1031cb4fc]
+    +     !   : | +       1 __kmp_join_call  (in libomp.dylib) + 328  [0x1031d779c]
+    +     !   : | +         1 __kmp_internal_join  (in libomp.dylib) + 92  [0x1031d7f4c]
+    +     !   : | +           1 __kmp_join_barrier(int)  (in libomp.dylib) + 556  [0x1031f289c]
+    +     !   : | +             1 __kmp_hyper_barrier_gather(barrier_type, kmp_info*, int, int, void (*)(void*, void*), void*)  (in libomp.dylib) + 440  [0x1031f3240]
+    +     !   : | +               1 kmp_flag_64<false, true>::wait(kmp_info*, int, void*)  (in libomp.dylib) + 860  [0x1031f5294]
+    +     !   : | +                 1 void __kmp_suspend_64<false, true>(int, kmp_flag_64<false, true>*)  (in libomp.dylib) + 368  [0x10320e1cc]
+    +     !   : | +                   1 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x1828cd1b4]
+    +     !   : | +                     1 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18288b50c]
+    +     !   : | 1 attention  (in qwen36) + 5692  [0x102f934d4]
+    +     !   : |   1 attention  (in qwen36) + 7492  [0x102f93bdc]
+    +     !   : 5 layers_forward_control  (in qwen36) + 2772  [0x102f8dc5c]
+    +     !   : | 5 __kmpc_fork_call  (in libomp.dylib) + 172  [0x1031cb4e8]
+    +     !   : |   5 __kmp_fork_call  (in libomp.dylib) + 6076  [0x1031d6bc8]
+    +     !   : |     5 __kmp_invoke_task_func  (in libomp.dylib) + 320  [0x1031db258]
+    +     !   : |       5 __kmp_invoke_microtask  (in libomp.dylib) + 156  [0x103226f8c]
+    +     !   : |         5 matmul.omp_outlined  (in qwen36) + 244  [0x102f9a4f0]
+    +     !   : |           5 dot_f32_lanes  (in qwen36) + 128  [0x102f9743c]
+    +     !   : 5 layers_forward_control  (in qwen36) + 2844  [0x102f8dca4]
+    +     !   : | 4 __kmpc_fork_call  (in libomp.dylib) + 172  [0x1031cb4e8]
+    +     !   : | + 4 __kmp_fork_call  (in libomp.dylib) + 6076  [0x1031d6bc8]
+    +     !   : | +   4 __kmp_invoke_task_func  (in libomp.dylib) + 320  [0x1031db258]
+    +     !   : | +     4 __kmp_invoke_microtask  (in libomp.dylib) + 156  [0x103226f8c]
+    +     !   : | +       4 matmul.omp_outlined  (in qwen36) + 244  [0x102f9a4f0]
+    +     !   : | +         4 dot_f32_lanes  (in qwen36) + 128  [0x102f9743c]
+    +     !   : | 1 __kmpc_fork_call  (in libomp.dylib) + 192  [0x1031cb4fc]
+    +     !   : |   1 __kmp_join_call  (in libomp.dylib) + 328  [0x1031d779c]
+    +     !   : |     1 __kmp_internal_join  (in libomp.dylib) + 92  [0x1031d7f4c]
+    +     !   : |       1 __kmp_join_barrier(int)  (in libomp.dylib) + 556  [0x1031f289c]
+    +     !   : |         1 __kmp_hyper_barrier_gather(barrier_type, kmp_info*, int, int, void (*)(void*, void*), void*)  (in libomp.dylib) + 440  [0x1031f3240]
+    +     !   : |           1 kmp_flag_64<false, true>::wait(kmp_info*, int, void*)  (in libomp.dylib) + 860  [0x1031f5294]
+    +     !   : |             1 void __kmp_suspend_64<false, true>(int, kmp_flag_64<false, true>*)  (in libomp.dylib) + 368  [0x10320e1cc]
+    +     !   : |               1 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x1828cd1b4]
+    +     !   : |                 1 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18288b50c]
+    +     !   : 5 layers_forward_control  (in qwen36) + 3992  [0x102f8e120]
+    +     !   : | 4 layers_forward_control  (in qwen36) + 4356,4512,...  [0x102f8e28c,0x102f8e328,...]
+    +     !   : | 1 DYLD-STUB$$expf  (in qwen36) + 4  [0x102fd5210]
+    +     !   : 5 layers_forward_control  (in qwen36) + 6816  [0x102f8ec28]
+    +     !   : | 4 __kmpc_fork_call  (in libomp.dylib) + 172  [0x1031cb4e8]
+    +     !   : | + 4 __kmp_fork_call  (in libomp.dylib) + 6076  [0x1031d6bc8]
+    +     !   : | +   4 __kmp_invoke_task_func  (in libomp.dylib) + 320  [0x1031db258]
+    +     !   : | +     4 __kmp_invoke_microtask  (in libomp.dylib) + 156  [0x103226f8c]
+    +     !   : | +       4 deltanet.omp_outlined.1187  (in qwen36) + 672,696,...  [0x102f99a30,0x102f99a48,...]
+    +     !   : | 1 __kmpc_fork_call  (in libomp.dylib) + 192  [0x1031cb4fc]
+    +     !   : |   1 __kmp_join_call  (in libomp.dylib) + 328  [0x1031d779c]
+    +     !   : |     1 __kmp_internal_join  (in libomp.dylib) + 92  [0x1031d7f4c]
+    +     !   : |       1 __kmp_join_barrier(int)  (in libomp.dylib) + 556  [0x1031f289c]
+    +     !   : |         1 __kmp_hyper_barrier_gather(barrier_type, kmp_info*, int, int, void (*)(void*, void*), void*)  (in libomp.dylib) + 440  [0x1031f3240]
+    +     !   : |           1 kmp_flag_64<false, true>::wait(kmp_info*, int, void*)  (in libomp.dylib) + 860  [0x1031f5294]
+    +     !   : |             1 void __kmp_suspend_64<false, true>(int, kmp_flag_64<false, true>*)  (in libomp.dylib) + 368  [0x10320e1cc]
+    +     !   : |               1 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x1828cd1b4]
+    +     !   : |                 1 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18288b50c]
+    +     !   : 1 ???  (in <unknown binary>)  [0xffffffffffffec00]
+    +     !   : | 1 layers_forward_control  (in qwen36) + 10804  [0x102f8fbbc]
+    +     !   : 1 layers_forward_control  (in qwen36) + 7152  [0x102f8ed78]
+    +     !   :   1 __kmpc_fork_call  (in libomp.dylib) + 192  [0x1031cb4fc]
+    +     !   :     1 __kmp_join_call  (in libomp.dylib) + 328  [0x1031d779c]
+    +     !   :       1 __kmp_internal_join  (in libomp.dylib) + 92  [0x1031d7f4c]
+    +     !   :         1 __kmp_join_barrier(int)  (in libomp.dylib) + 556  [0x1031f289c]
+    +     !   :           1 __kmp_hyper_barrier_gather(barrier_type, kmp_info*, int, int, void (*)(void*, void*), void*)  (in libomp.dylib) + 440  [0x1031f3240]
+    +     !   :             1 kmp_flag_64<false, true>::wait(kmp_info*, int, void*)  (in libomp.dylib) + 860  [0x1031f5294]
+    +     !   :               1 void __kmp_suspend_64<false, true>(int, kmp_flag_64<false, true>*)  (in libomp.dylib) + 368  [0x10320e1cc]
+    +     !   :                 1 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x1828cd1b4]
+    +     !   :                   1 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18288b50c]
+    +     !   2 step_ex_control  (in qwen36) + 3024  [0x102f8bdac]
+    +     !     2 matmul_d  (in qwen36) + 1208  [0x102f91b40]
+    +     !       2 gq_matmul  (in qwen36) + 800  [0x102fa5ed4]
+    +     !         2 __kmpc_fork_call  (in libomp.dylib) + 172  [0x1031cb4e8]
+    +     !           2 __kmp_fork_call  (in libomp.dylib) + 6076  [0x1031d6bc8]
+    +     !             2 __kmp_invoke_task_func  (in libomp.dylib) + 320  [0x1031db258]
+    +     !               2 __kmp_invoke_microtask  (in libomp.dylib) + 156  [0x103226f8c]
+    +     !                 2 gq_matmul_act.omp_outlined  (in qwen36) + 204  [0x102fa6d28]
+    +     !                   1 gq_row_all  (in qwen36) + 788  [0x102fa7080]
+    +     !                   | 1 gq_ublk  (in qwen36) + 4796  [0x102fa86ec]
+    +     !                   1 gq_row_all  (in qwen36) + 1140  [0x102fa71e0]
+    +     767 generate  (in qwen36) + 336  [0x102f597bc]
+    +       700 step_ex_control  (in qwen36) + 580  [0x102f8b420]
+    +       : 454 layers_forward_control  (in qwen36) + 11312  [0x102f8fdb8]
+    +       : | 454 moe_ex  (in qwen36) + 340  [0x102f9aa38]
+    +       : |   167 qwen_shared_experts_cpu  (in qwen36) + 2196  [0x102fa233c]
+    +       : |   + 167 matmul_d  (in qwen36) + 1208  [0x102f91b40]
+    +       : |   +   165 gq_matmul  (in qwen36) + 800  [0x102fa5ed4]
+    +       : |   +   ! 162 __kmpc_fork_call  (in libomp.dylib) + 172  [0x1031cb4e8]
+    +       : |   +   ! : 162 __kmp_fork_call  (in libomp.dylib) + 6076  [0x1031d6bc8]
+    +       : |   +   ! :   162 __kmp_invoke_task_func  (in libomp.dylib) + 320  [0x1031db258]
+    +       : |   +   ! :     162 __kmp_invoke_microtask  (in libomp.dylib) + 156  [0x103226f8c]
+    +       : |   +   ! :       162 gq_matmul_act.omp_outlined  (in qwen36) + 204  [0x102fa6d28]
+    +       : |   +   ! :         137 gq_row_all  (in qwen36) + 1140,1116,...  [0x102fa71e0,0x102fa71c8,...]
+    +       : |   +   ! :         25 gq_row_all  (in qwen36) + 788  [0x102fa7080]
+    +       : |   +   ! :           25 gq_ublk  (in qwen36) + 8996,3636,...  [0x102fa9754,0x102fa8264,...]
+    +       : |   +   ! 3 __kmpc_fork_call  (in libomp.dylib) + 192  [0x1031cb4fc]
+    +       : |   +   !   3 __kmp_join_call  (in libomp.dylib) + 328  [0x1031d779c]
+    +       : |   +   !     3 __kmp_internal_join  (in libomp.dylib) + 92  [0x1031d7f4c]
+    +       : |   +   !       3 __kmp_join_barrier(int)  (in libomp.dylib) + 556  [0x1031f289c]
+    +       : |   +   !         3 __kmp_hyper_barrier_gather(barrier_type, kmp_info*, int, int, void (*)(void*, void*), void*)  (in libomp.dylib) + 440  [0x1031f3240]
+    +       : |   +   !           3 kmp_flag_64<false, true>::wait(kmp_info*, int, void*)  (in libomp.dylib) + 860  [0x1031f5294]
+    +       : |   +   !             3 void __kmp_suspend_64<false, true>(int, kmp_flag_64<false, true>*)  (in libomp.dylib) + 368  [0x10320e1cc]
+    +       : |   +   !               3 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x1828cd1b4]
+    +       : |   +   !                 3 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18288b50c]
+    +       : |   +   1 gq_matmul  (in qwen36) + 316  [0x102fa5cf0]
+    +       : |   +   ! 1 gq_act_set  (in qwen36) + 496  [0x102fa60f8]
+    +       : |   +   1 gq_matmul  (in qwen36) + 808  [0x102fa5edc]
+    +       : |   +     1 xzm_malloc_zone_try_free_default_main  (in libsystem_malloc.dylib) + 0  [0x1841f4674]
+    +       : |   144 qwen_shared_experts_cpu  (in qwen36) + 1888  [0x102fa2208]
+    +       : |   + 144 matmul_d  (in qwen36) + 1208  [0x102f91b40]
+    +       : |   +   144 gq_matmul  (in qwen36) + 800  [0x102fa5ed4]
+    +       : |   +     139 __kmpc_fork_call  (in libomp.dylib) + 172  [0x1031cb4e8]
+    +       : |   +     ! 139 __kmp_fork_call  (in libomp.dylib) + 6076  [0x1031d6bc8]
+    +       : |   +     !   139 __kmp_invoke_task_func  (in libomp.dylib) + 320  [0x1031db258]
+    +       : |   +     !     139 __kmp_invoke_microtask  (in libomp.dylib) + 156  [0x103226f8c]
+    +       : |   +     !       139 gq_matmul_act.omp_outlined  (in qwen36) + 204  [0x102fa6d28]
+    +       : |   +     !         114 gq_row_all  (in qwen36) + 1140,1116,...  [0x102fa71e0,0x102fa71c8,...]
+    +       : |   +     !         24 gq_row_all  (in qwen36) + 788  [0x102fa7080]
+    +       : |   +     !         : 24 gq_ublk  (in qwen36) + 3636,3568,...  [0x102fa8264,0x102fa8220,...]
+    +       : |   +     !         1 gq_row_all  (in qwen36) + 616  [0x102fa6fd4]
+    +       : |   +     !           1 _tlv_get_addr  (in libdyld.dylib) + 20  [0x1827a7b1c]
+    +       : |   +     5 __kmpc_fork_call  (in libomp.dylib) + 192  [0x1031cb4fc]
+    +       : |   +       5 __kmp_join_call  (in libomp.dylib) + 328  [0x1031d779c]
+    +       : |   +         5 __kmp_internal_join  (in libomp.dylib) + 92  [0x1031d7f4c]
+    +       : |   +           5 __kmp_join_barrier(int)  (in libomp.dylib) + 556  [0x1031f289c]
+    +       : |   +             5 __kmp_hyper_barrier_gather(barrier_type, kmp_info*, int, int, void (*)(void*, void*), void*)  (in libomp.dylib) + 440  [0x1031f3240]
+    +       : |   +               5 kmp_flag_64<false, true>::wait(kmp_info*, int, void*)  (in libomp.dylib) + 860  [0x1031f5294]
+    +       : |   +                 5 void __kmp_suspend_64<false, true>(int, kmp_flag_64<false, true>*)  (in libomp.dylib) + 368  [0x10320e1cc]
+    +       : |   +                   5 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x1828cd1b4]
+    +       : |   +                     5 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18288b50c]
+    +       : |   140 qwen_shared_experts_cpu  (in qwen36) + 1916  [0x102fa2224]
+    +       : |   + 140 matmul_d  (in qwen36) + 1208  [0x102f91b40]
+    +       : |   +   140 gq_matmul  (in qwen36) + 800  [0x102fa5ed4]
+    +       : |   +     135 __kmpc_fork_call  (in libomp.dylib) + 172  [0x1031cb4e8]
+    +       : |   +     ! 135 __kmp_fork_call  (in libomp.dylib) + 6076  [0x1031d6bc8]
+    +       : |   +     !   135 __kmp_invoke_task_func  (in libomp.dylib) + 320  [0x1031db258]
+    +       : |   +     !     135 __kmp_invoke_microtask  (in libomp.dylib) + 156  [0x103226f8c]
+    +       : |   +     !       135 gq_matmul_act.omp_outlined  (in qwen36) + 204  [0x102fa6d28]
+    +       : |   +     !         119 gq_row_all  (in qwen36) + 1140,1116,...  [0x102fa71e0,0x102fa71c8,...]
+    +       : |   +     !         16 gq_row_all  (in qwen36) + 788  [0x102fa7080]
+    +       : |   +     !           16 gq_ublk  (in qwen36) + 3636,3512,...  [0x102fa8264,0x102fa81e8,...]
+    +       : |   +     5 __kmpc_fork_call  (in libomp.dylib) + 192  [0x1031cb4fc]
+    +       : |   +       5 __kmp_join_call  (in libomp.dylib) + 328  [0x1031d779c]
+    +       : |   +         5 __kmp_internal_join  (in libomp.dylib) + 92  [0x1031d7f4c]
+    +       : |   +           5 __kmp_join_barrier(int)  (in libomp.dylib) + 556  [0x1031f289c]
+    +       : |   +             5 __kmp_hyper_barrier_gather(barrier_type, kmp_info*, int, int, void (*)(void*, void*), void*)  (in libomp.dylib) + 440  [0x1031f3240]
+    +       : |   +               5 kmp_flag_64<false, true>::wait(kmp_info*, int, void*)  (in libomp.dylib) + 860  [0x1031f5294]
+    +       : |   +                 5 void __kmp_suspend_64<false, true>(int, kmp_flag_64<false, true>*)  (in libomp.dylib) + 368  [0x10320e1cc]
+    +       : |   +                   5 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x1828cd1b4]
+    +       : |   +                     5 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18288b50c]
+    +       : |   2 expf  (in libsystem_m.dylib) + 104  [0x2d0358b68]
+    +       : |   1 qwen_shared_experts_cpu  (in qwen36) + 2060  [0x102fa22b4]
+    +       : |     1 DYLD-STUB$$expf  (in qwen36) + 4  [0x102fd5210]
+    +       : 86 layers_forward_control  (in qwen36) + 2636  [0x102f8dbd4]
+    +       : | 86 matmul_d  (in qwen36) + 1208  [0x102f91b40]
+    +       : |   85 gq_matmul  (in qwen36) + 800  [0x102fa5ed4]
+    +       : |   + 80 __kmpc_fork_call  (in libomp.dylib) + 172  [0x1031cb4e8]
+    +       : |   + ! 80 __kmp_fork_call  (in libomp.dylib) + 6076  [0x1031d6bc8]
+    +       : |   + !   80 __kmp_invoke_task_func  (in libomp.dylib) + 320  [0x1031db258]
+    +       : |   + !     80 __kmp_invoke_microtask  (in libomp.dylib) + 156  [0x103226f8c]
+    +       : |   + !       80 gq_matmul_act.omp_outlined  (in qwen36) + 204  [0x102fa6d28]
+    +       : |   + !         62 gq_row_all  (in qwen36) + 1140,1116,...  [0x102fa71e0,0x102fa71c8,...]
+    +       : |   + !         18 gq_row_all  (in qwen36) + 788  [0x102fa7080]
+    +       : |   + !           18 gq_ublk  (in qwen36) + 5172,5192,...  [0x102fa8864,0x102fa8878,...]
+    +       : |   + 5 __kmpc_fork_call  (in libomp.dylib) + 192  [0x1031cb4fc]
+    +       : |   +   5 __kmp_join_call  (in libomp.dylib) + 328  [0x1031d779c]
+    +       : |   +     5 __kmp_internal_join  (in libomp.dylib) + 92  [0x1031d7f4c]
+    +       : |   +       5 __kmp_join_barrier(int)  (in libomp.dylib) + 556  [0x1031f289c]
+    +       : |   +         5 __kmp_hyper_barrier_gather(barrier_type, kmp_info*, int, int, void (*)(void*, void*), void*)  (in libomp.dylib) + 440  [0x1031f3240]
+    +       : |   +           5 kmp_flag_64<false, true>::wait(kmp_info*, int, void*)  (in libomp.dylib) + 860  [0x1031f5294]
+    +       : |   +             5 void __kmp_suspend_64<false, true>(int, kmp_flag_64<false, true>*)  (in libomp.dylib) + 368  [0x10320e1cc]
+    +       : |   +               5 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x1828cd1b4]
+    +       : |   +                 5 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18288b50c]
+    +       : |   1 gq_matmul  (in qwen36) + 316  [0x102fa5cf0]
+    +       : |     1 gq_act_set  (in qwen36) + 608  [0x102fa6168]
+    +       : 56 layers_forward_control  (in qwen36) + 7308  [0x102f8ee14]
+    +       : | 56 matmul_d  (in qwen36) + 1208  [0x102f91b40]
+    +       : |   56 gq_matmul  (in qwen36) + 800  [0x102fa5ed4]
+    +       : |     54 __kmpc_fork_call  (in libomp.dylib) + 172  [0x1031cb4e8]
+    +       : |     + 54 __kmp_fork_call  (in libomp.dylib) + 6076  [0x1031d6bc8]
+    +       : |     +   54 __kmp_invoke_task_func  (in libomp.dylib) + 320  [0x1031db258]
+    +       : |     +     54 __kmp_invoke_microtask  (in libomp.dylib) + 156  [0x103226f8c]
+    +       : |     +       54 gq_matmul_act.omp_outlined  (in qwen36) + 204  [0x102fa6d28]
+    +       : |     +         44 gq_row_all  (in qwen36) + 1140,1116,...  [0x102fa71e0,0x102fa71c8,...]
+    +       : |     +         10 gq_row_all  (in qwen36) + 788  [0x102fa7080]
+    +       : |     +           10 gq_ublk  (in qwen36) + 5152,5212,...  [0x102fa8850,0x102fa888c,...]
+    +       : |     2 __kmpc_fork_call  (in libomp.dylib) + 192  [0x1031cb4fc]
+    +       : |       2 __kmp_join_call  (in libomp.dylib) + 328  [0x1031d779c]
+    +       : |         2 __kmp_internal_join  (in libomp.dylib) + 92  [0x1031d7f4c]
+    +       : |           2 __kmp_join_barrier(int)  (in libomp.dylib) + 556  [0x1031f289c]
+    +       : |             2 __kmp_hyper_barrier_gather(barrier_type, kmp_info*, int, int, void (*)(void*, void*), void*)  (in libomp.dylib) + 440  [0x1031f3240]
+    +       : |               2 kmp_flag_64<false, true>::wait(kmp_info*, int, void*)  (in libomp.dylib) + 860  [0x1031f5294]
+    +       : |                 2 void __kmp_suspend_64<false, true>(int, kmp_flag_64<false, true>*)  (in libomp.dylib) + 368  [0x10320e1cc]
+    +       : |                   2 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x1828cd1b4]
+    +       : |                     2 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18288b50c]
+    +       : 55 layers_forward_control  (in qwen36) + 1320  [0x102f8d6b0]
+    +       : | 31 attention  (in qwen36) + 308  [0x102f91fcc]
+    +       : | + 31 matmul_d  (in qwen36) + 1208  [0x102f91b40]
+    +       : | +   31 gq_matmul  (in qwen36) + 800  [0x102fa5ed4]
+    +       : | +     29 __kmpc_fork_call  (in libomp.dylib) + 172  [0x1031cb4e8]
+    +       : | +     ! 29 __kmp_fork_call  (in libomp.dylib) + 6076  [0x1031d6bc8]
+    +       : | +     !   29 __kmp_invoke_task_func  (in libomp.dylib) + 320  [0x1031db258]
+    +       : | +     !     29 __kmp_invoke_microtask  (in libomp.dylib) + 156  [0x103226f8c]
+    +       : | +     !       29 gq_matmul_act.omp_outlined  (in qwen36) + 204  [0x102fa6d28]
+    +       : | +     !         26 gq_row_all  (in qwen36) + 1108,1144,...  [0x102fa71c0,0x102fa71e4,...]
+    +       : | +     !         3 gq_row_all  (in qwen36) + 788  [0x102fa7080]
+    +       : | +     !           3 gq_ublk  (in qwen36) + 3472,3588,...  [0x102fa81c0,0x102fa8234,...]
+    +       : | +     2 __kmpc_fork_call  (in libomp.dylib) + 192  [0x1031cb4fc]
+    +       : | +       2 __kmp_join_call  (in libomp.dylib) + 328  [0x1031d779c]
+    +       : | +         2 __kmp_internal_join  (in libomp.dylib) + 92  [0x1031d7f4c]
+    +       : | +           2 __kmp_join_barrier(int)  (in libomp.dylib) + 556  [0x1031f289c]
+    +       : | +             2 __kmp_hyper_barrier_gather(barrier_type, kmp_info*, int, int, void (*)(void*, void*), void*)  (in libomp.dylib) + 440  [0x1031f3240]
+    +       : | +               2 kmp_flag_64<false, true>::wait(kmp_info*, int, void*)  (in libomp.dylib) + 860  [0x1031f5294]
+    +       : | +                 2 void __kmp_suspend_64<false, true>(int, kmp_flag_64<false, true>*)  (in libomp.dylib) + 368  [0x10320e1cc]
+    +       : | +                   2 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x1828cd1b4]
+    +       : | +                     2 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18288b50c]
+    +       : | 17 attention  (in qwen36) + 12836  [0x102f950bc]
+    +       : | + 17 matmul_d  (in qwen36) + 1208  [0x102f91b40]
+    +       : | +   17 gq_matmul  (in qwen36) + 800  [0x102fa5ed4]
+    +       : | +     16 __kmpc_fork_call  (in libomp.dylib) + 172  [0x1031cb4e8]
+    +       : | +     ! 16 __kmp_fork_call  (in libomp.dylib) + 6076  [0x1031d6bc8]
+    +       : | +     !   16 __kmp_invoke_task_func  (in libomp.dylib) + 320  [0x1031db258]
+    +       : | +     !     16 __kmp_invoke_microtask  (in libomp.dylib) + 156  [0x103226f8c]
+    +       : | +     !       16 gq_matmul_act.omp_outlined  (in qwen36) + 204  [0x102fa6d28]
+    +       : | +     !         14 gq_row_all  (in qwen36) + 1140,1084,...  [0x102fa71e0,0x102fa71a8,...]
+    +       : | +     !         2 gq_row_all  (in qwen36) + 788  [0x102fa7080]
+    +       : | +     !           2 gq_ublk  (in qwen36) + 3472,3636  [0x102fa81c0,0x102fa8264]
+    +       : | +     1 __kmpc_fork_call  (in libomp.dylib) + 192  [0x1031cb4fc]
+    +       : | +       1 __kmp_join_call  (in libomp.dylib) + 328  [0x1031d779c]
+    +       : | +         1 __kmp_internal_join  (in libomp.dylib) + 92  [0x1031d7f4c]
+    +       : | +           1 __kmp_join_barrier(int)  (in libomp.dylib) + 556  [0x1031f289c]
+    +       : | +             1 __kmp_hyper_barrier_gather(barrier_type, kmp_info*, int, int, void (*)(void*, void*), void*)  (in libomp.dylib) + 440  [0x1031f3240]
+    +       : | +               1 kmp_flag_64<false, true>::wait(kmp_info*, int, void*)  (in libomp.dylib) + 860  [0x1031f5294]
+    +       : | +                 1 void __kmp_suspend_64<false, true>(int, kmp_flag_64<false, true>*)  (in libomp.dylib) + 368  [0x10320e1cc]
+    +       : | +                   1 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x1828cd1b4]
+    +       : | +                     1 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18288b50c]
+    +       : | 4 attention  (in qwen36) + 372  [0x102f9200c]
+    +       : | + 4 matmul_d  (in qwen36) + 1208  [0x102f91b40]
+    +       : | +   4 gq_matmul  (in qwen36) + 800  [0x102fa5ed4]
+    +       : | +     4 __kmpc_fork_call  (in libomp.dylib) + 172  [0x1031cb4e8]
+    +       : | +       4 __kmp_fork_call  (in libomp.dylib) + 6076  [0x1031d6bc8]
+    +       : | +         4 __kmp_invoke_task_func  (in libomp.dylib) + 320  [0x1031db258]
+    +       : | +           4 __kmp_invoke_microtask  (in libomp.dylib) + 156  [0x103226f8c]
+    +       : | +             4 gq_matmul_act.omp_outlined  (in qwen36) + 204  [0x102fa6d28]
+    +       : | +               3 gq_row_all  (in qwen36) + 1112,1140  [0x102fa71c4,0x102fa71e0]
+    +       : | +               1 gq_row_all  (in qwen36) + 788  [0x102fa7080]
+    +       : | +                 1 gq_ublk  (in qwen36) + 2548  [0x102fa7e24]
+    +       : | 3 attention  (in qwen36) + 340  [0x102f91fec]
+    +       : |   3 matmul_d  (in qwen36) + 1208  [0x102f91b40]
+    +       : |     3 gq_matmul  (in qwen36) + 800  [0x102fa5ed4]
+    +       : |       3 __kmpc_fork_call  (in libomp.dylib) + 172  [0x1031cb4e8]
+    +       : |         3 __kmp_fork_call  (in libomp.dylib) + 6076  [0x1031d6bc8]
+    +       : |           3 __kmp_invoke_task_func  (in libomp.dylib) + 320  [0x1031db258]
+    +       : |             3 __kmp_invoke_microtask  (in libomp.dylib) + 156  [0x103226f8c]
+    +       : |               3 gq_matmul_act.omp_outlined  (in qwen36) + 204  [0x102fa6d28]
+    +       : |                 2 gq_row_all  (in qwen36) + 1084,1144  [0x102fa71a8,0x102fa71e4]
+    +       : |                 1 gq_row_all  (in qwen36) + 788  [0x102fa7080]
+    +       : |                   1 gq_ublk  (in qwen36) + 3472  [0x102fa81c0]
+    +       : 39 layers_forward_control  (in qwen36) + 2668  [0x102f8dbf4]
+    +       : | 39 matmul_d  (in qwen36) + 1208  [0x102f91b40]
+    +       : |   39 gq_matmul  (in qwen36) + 800  [0x102fa5ed4]
+    +       : |     38 __kmpc_fork_call  (in libomp.dylib) + 172  [0x1031cb4e8]
+    +       : |     + 38 __kmp_fork_call  (in libomp.dylib) + 6076  [0x1031d6bc8]
+    +       : |     +   38 __kmp_invoke_task_func  (in libomp.dylib) + 320  [0x1031db258]
+    +       : |     +     38 __kmp_invoke_microtask  (in libomp.dylib) + 156  [0x103226f8c]
+    +       : |     +       38 gq_matmul_act.omp_outlined  (in qwen36) + 204  [0x102fa6d28]
+    +       : |     +         25 gq_row_all  (in qwen36) + 1116,1108,...  [0x102fa71c8,0x102fa71c0,...]
+    +       : |     +         13 gq_row_all  (in qwen36) + 788  [0x102fa7080]
+    +       : |     +           13 gq_ublk  (in qwen36) + 2548,2596,...  [0x102fa7e24,0x102fa7e54,...]
+    +       : |     1 __kmpc_fork_call  (in libomp.dylib) + 192  [0x1031cb4fc]
+    +       : |       1 __kmp_join_call  (in libomp.dylib) + 328  [0x1031d779c]
+    +       : |         1 __kmp_internal_join  (in libomp.dylib) + 92  [0x1031d7f4c]
+    +       : |           1 __kmp_join_barrier(int)  (in libomp.dylib) + 556  [0x1031f289c]
+    +       : |             1 __kmp_hyper_barrier_gather(barrier_type, kmp_info*, int, int, void (*)(void*, void*), void*)  (in libomp.dylib) + 440  [0x1031f3240]
+    +       : |               1 kmp_flag_64<false, true>::wait(kmp_info*, int, void*)  (in libomp.dylib) + 860  [0x1031f5294]
+    +       : |                 1 void __kmp_suspend_64<false, true>(int, kmp_flag_64<false, true>*)  (in libomp.dylib) + 368  [0x10320e1cc]
+    +       : |                   1 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x1828cd1b4]
+    +       : |                     1 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18288b50c]
+    +       : 5 layers_forward_control  (in qwen36) + 3352  [0x102f8dea0]
+    +       : | 4 __kmpc_fork_call  (in libomp.dylib) + 172  [0x1031cb4e8]
+    +       : | + 4 __kmp_fork_call  (in libomp.dylib) + 6076  [0x1031d6bc8]
+    +       : | +   4 __kmp_invoke_task_func  (in libomp.dylib) + 320  [0x1031db258]
+    +       : | +     4 __kmp_invoke_microtask  (in libomp.dylib) + 156  [0x103226f8c]
+    +       : | +       3 deltanet.omp_outlined.1186  (in qwen36) + 3312  [0x102f99318]
+    +       : | +       ! 3 deltanet.omp_outlined.1186  (in qwen36) + 3448,3416  [0x102f993a0,0x102f99380]
+    +       : | +       1 deltanet.omp_outlined.1186  (in qwen36) + 2808  [0x102f99120]
+    +       : | +         1 deltanet.omp_outlined.1186  (in qwen36) + 2964  [0x102f991bc]
+    +       : | 1 __kmpc_fork_call  (in libomp.dylib) + 192  [0x1031cb4fc]
+    +       : |   1 __kmp_join_call  (in libomp.dylib) + 328  [0x1031d779c]
+    +       : |     1 __kmp_internal_join  (in libomp.dylib) + 92  [0x1031d7f4c]
+    +       : |       1 __kmp_join_barrier(int)  (in libomp.dylib) + 556  [0x1031f289c]
+    +       : |         1 __kmp_hyper_barrier_gather(barrier_type, kmp_info*, int, int, void (*)(void*, void*), void*)  (in libomp.dylib) + 440  [0x1031f3240]
+    +       : |           1 kmp_flag_64<false, true>::wait(kmp_info*, int, void*)  (in libomp.dylib) + 860  [0x1031f5294]
+    +       : |             1 void __kmp_suspend_64<false, true>(int, kmp_flag_64<false, true>*)  (in libomp.dylib) + 368  [0x10320e1cc]
+    +       : |               1 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x1828cd1b4]
+    +       : |                 1 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18288b50c]
+    +       : 2 layers_forward_control  (in qwen36) + 2844  [0x102f8dca4]
+    +       : | 2 __kmpc_fork_call  (in libomp.dylib) + 172  [0x1031cb4e8]
+    +       : |   2 __kmp_fork_call  (in libomp.dylib) + 6076  [0x1031d6bc8]
+    +       : |     2 __kmp_invoke_task_func  (in libomp.dylib) + 320  [0x1031db258]
+    +       : |       2 __kmp_invoke_microtask  (in libomp.dylib) + 156  [0x103226f8c]
+    +       : |         2 matmul.omp_outlined  (in qwen36) + 244  [0x102f9a4f0]
+    +       : |           2 dot_f32_lanes  (in qwen36) + 128  [0x102f9743c]
+    +       : 2 layers_forward_control  (in qwen36) + 3208  [0x102f8de10]
+    +       : | 2 __kmpc_fork_call  (in libomp.dylib) + 172  [0x1031cb4e8]
+    +       : |   2 __kmp_fork_call  (in libomp.dylib) + 6076  [0x1031d6bc8]
+    +       : |     2 __kmp_invoke_task_func  (in libomp.dylib) + 320  [0x1031db258]
+    +       : |       2 __kmp_invoke_microtask  (in libomp.dylib) + 156  [0x103226f8c]
+    +       : |         2 deltanet.omp_outlined  (in qwen36) + 2296  [0x102f98464]
+    +       : |           2 deltanet.omp_outlined  (in qwen36) + 2248,2296  [0x102f98434,0x102f98464]
+    +       : 1 layers_forward_control  (in qwen36) + 2772  [0x102f8dc5c]
+    +       :   1 __kmpc_fork_call  (in libomp.dylib) + 192  [0x1031cb4fc]
+    +       :     1 __kmp_join_call  (in libomp.dylib) + 328  [0x1031d779c]
+    +       :       1 __kmp_internal_join  (in libomp.dylib) + 92  [0x1031d7f4c]
+    +       :         1 __kmp_join_barrier(int)  (in libomp.dylib) + 556  [0x1031f289c]
+    +       :           1 __kmp_hyper_barrier_gather(barrier_type, kmp_info*, int, int, void (*)(void*, void*), void*)  (in libomp.dylib) + 440  [0x1031f3240]
+    +       :             1 kmp_flag_64<false, true>::wait(kmp_info*, int, void*)  (in libomp.dylib) + 860  [0x1031f5294]
+    +       :               1 void __kmp_suspend_64<false, true>(int, kmp_flag_64<false, true>*)  (in libomp.dylib) + 368  [0x10320e1cc]
+    +       :                 1 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x1828cd1b4]
+    +       :                   1 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18288b50c]
+    +       67 step_ex_control  (in qwen36) + 3024  [0x102f8bdac]
+    +         67 matmul_d  (in qwen36) + 1208  [0x102f91b40]
+    +           67 gq_matmul  (in qwen36) + 800  [0x102fa5ed4]
+    +             59 __kmpc_fork_call  (in libomp.dylib) + 172  [0x1031cb4e8]
+    +             | 59 __kmp_fork_call  (in libomp.dylib) + 6076  [0x1031d6bc8]
+    +             |   59 __kmp_invoke_task_func  (in libomp.dylib) + 320  [0x1031db258]
+    +             |     59 __kmp_invoke_microtask  (in libomp.dylib) + 156  [0x103226f8c]
+    +             |       59 gq_matmul_act.omp_outlined  (in qwen36) + 204  [0x102fa6d28]
+    +             |         34 gq_row_all  (in qwen36) + 788  [0x102fa7080]
+    +             |         + 34 gq_ublk  (in qwen36) + 4936,4808,...  [0x102fa8778,0x102fa86f8,...]
+    +             |         22 gq_row_all  (in qwen36) + 1116,1224,...  [0x102fa71c8,0x102fa7234,...]
+    +             |         3 gq_ublk  (in qwen36) + 12648,12660  [0x102faa598,0x102faa5a4]
+    +             8 __kmpc_fork_call  (in libomp.dylib) + 192  [0x1031cb4fc]
+    +               8 __kmp_join_call  (in libomp.dylib) + 328  [0x1031d779c]
+    +                 8 __kmp_internal_join  (in libomp.dylib) + 92  [0x1031d7f4c]
+    +                   8 __kmp_join_barrier(int)  (in libomp.dylib) + 556  [0x1031f289c]
+    +                     8 __kmp_hyper_barrier_gather(barrier_type, kmp_info*, int, int, void (*)(void*, void*), void*)  (in libomp.dylib) + 440  [0x1031f3240]
+    +                       8 kmp_flag_64<false, true>::wait(kmp_info*, int, void*)  (in libomp.dylib) + 860  [0x1031f5294]
+    +                         8 void __kmp_suspend_64<false, true>(int, kmp_flag_64<false, true>*)  (in libomp.dylib) + 368  [0x10320e1cc]
+    +                           8 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x1828cd1b4]
+    +                             8 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18288b50c]
+    1830 Thread_5983582
+    + 1830 start_wqthread  (in libsystem_pthread.dylib) + 8  [0x1828c7cc4]
+    +   1830 _pthread_wqthread  (in libsystem_pthread.dylib) + 368  [0x1828c8fcc]
+    +     1830 __workq_kernreturn  (in libsystem_kernel.dylib) + 8  [0x1828899ec]
+    1830 Thread_5983601
+    + 1830 thread_start  (in libsystem_pthread.dylib) + 8  [0x1828c7cd0]
+    +   1830 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x1828ccce4]
+    +     1830 __kmp_launch_worker(void*)  (in libomp.dylib) + 252  [0x10320d10c]
+    +       1164 __kmp_launch_thread  (in libomp.dylib) + 304  [0x1031da074]
+    +       ! 1164 __kmp_invoke_task_func  (in libomp.dylib) + 320  [0x1031db258]
+    +       !   1164 __kmp_invoke_microtask  (in libomp.dylib) + 156  [0x103226f8c]
+    +       !     1141 gq_matmul_act.omp_outlined  (in qwen36) + 204  [0x102fa6d28]
+    +       !     : 643 gq_row_all  (in qwen36) + 1140,1116,...  [0x102fa71e0,0x102fa71c8,...]
+    +       !     : 483 gq_row_all  (in qwen36) + 788  [0x102fa7080]
+    +       !     : | 483 gq_ublk  (in qwen36) + 2548,92,...  [0x102fa7e24,0x102fa748c,...]
+    +       !     : 15 gq_ublk  (in qwen36) + 12648,12660,...  [0x102faa598,0x102faa5a4,...]
+    +       !     12 matmul.omp_outlined  (in qwen36) + 244  [0x102f9a4f0]
+    +       !     : 12 dot_f32_lanes  (in qwen36) + 128,116  [0x102f9743c,0x102f97430]
+    +       !     4 deltanet.omp_outlined.1186  (in qwen36) + 2808  [0x102f99120]
+    +       !     : 4 deltanet.omp_outlined.1186  (in qwen36) + 2916,2928  [0x102f9918c,0x102f99198]
+    +       !     4 deltanet.omp_outlined.1187  (in qwen36) + 672,996  [0x102f99a30,0x102f99b74]
+    +       !     2 deltanet.omp_outlined  (in qwen36) + 2296  [0x102f98464]
+    +       !     : 1 deltanet.omp_outlined  (in qwen36) + 2272  [0x102f9844c]
+    +       !     : 1 expf  (in libsystem_m.dylib) + 12  [0x2d0358b0c]
+    +       !     1 deltanet.omp_outlined.1186  (in qwen36) + 4284  [0x102f996e4]
+    +       !       1 expf  (in libsystem_m.dylib) + 12  [0x2d0358b0c]
+    +       665 __kmp_launch_thread  (in libomp.dylib) + 220  [0x1031da020]
+    +       ! 665 __kmp_fork_barrier(int, int)  (in libomp.dylib) + 460  [0x1031f441c]
+    +       !   665 __kmp_hyper_barrier_release(barrier_type, kmp_info*, int, int, int, void*)  (in libomp.dylib) + 164  [0x1031f1908]
+    +       !     664 kmp_flag_64<false, true>::wait(kmp_info*, int, void*)  (in libomp.dylib) + 1712  [0x1031f55e8]
+    +       !     : 664 void __kmp_suspend_64<false, true>(int, kmp_flag_64<false, true>*)  (in libomp.dylib) + 368  [0x10320e1cc]
+    +       !     :   664 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x1828cd1b4]
+    +       !     :     664 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18288b50c]
+    +       !     1 kmp_flag_64<false, true>::wait(kmp_info*, int, void*)  (in libomp.dylib) + 1116  [0x1031f5394]
+    +       !       1 __kmp_now_nsec  (in libomp.dylib) + 24  [0x10320fae4]
+    +       !         1 gettimeofday  (in libsystem_c.dylib) + 56  [0x1828ebefc]
+    +       !           1 __commpage_gettimeofday_internal  (in libsystem_kernel.dylib) + 0  [0x182889bf4]
+    +       1 __kmp_launch_thread  (in libomp.dylib) + 364  [0x1031da0b0]
+    +         1 __kmp_join_barrier(int)  (in libomp.dylib) + 556  [0x1031f289c]
+    +           1 __kmp_hyper_barrier_gather(barrier_type, kmp_info*, int, int, void (*)(void*, void*), void*)  (in libomp.dylib) + 808  [0x1031f33b0]
+    +             1 kmp_flag_64<false, true>::release()  (in libomp.dylib) + 144  [0x1031f579c]
+    +               1 void __kmp_resume_template<kmp_flag_64<false, true>>(int, kmp_flag_64<false, true>*)  (in libomp.dylib) + 316  [0x10320f064]
+    +                 1 pthread_cond_signal  (in libsystem_pthread.dylib) + 712  [0x1828cc02c]
+    +                   1 __psynch_cvsignal  (in libsystem_kernel.dylib) + 4  [0x18288ca6c]
+    1830 Thread_5983602
+    + 1830 thread_start  (in libsystem_pthread.dylib) + 8  [0x1828c7cd0]
+    +   1830 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x1828ccce4]
+    +     1830 __kmp_launch_worker(void*)  (in libomp.dylib) + 252  [0x10320d10c]
+    +       1147 __kmp_launch_thread  (in libomp.dylib) + 304  [0x1031da074]
+    +       ! 1147 __kmp_invoke_task_func  (in libomp.dylib) + 320  [0x1031db258]
+    +       !   1147 __kmp_invoke_microtask  (in libomp.dylib) + 156  [0x103226f8c]
+    +       !     1126 gq_matmul_act.omp_outlined  (in qwen36) + 204  [0x102fa6d28]
+    +       !     : 660 gq_row_all  (in qwen36) + 1140,1116,...  [0x102fa71e0,0x102fa71c8,...]
+    +       !     : 451 gq_row_all  (in qwen36) + 788  [0x102fa7080]
+    +       !     : | 451 gq_ublk  (in qwen36) + 2548,92,...  [0x102fa7e24,0x102fa748c,...]
+    +       !     : 14 gq_ublk  (in qwen36) + 12648,12660,...  [0x102faa598,0x102faa5a4,...]
+    +       !     : 1 gq_row_all  (in qwen36) + 640  [0x102fa6fec]
+    +       !     :   1 _tlv_get_addr  (in libdyld.dylib) + 12  [0x1827a7b14]
+    +       !     12 matmul.omp_outlined  (in qwen36) + 244  [0x102f9a4f0]
+    +       !     : 12 dot_f32_lanes  (in qwen36) + 128  [0x102f9743c]
+    +       !     4 deltanet.omp_outlined.1187  (in qwen36) + 696,672,...  [0x102f99a48,0x102f99a30,...]
+    +       !     3 deltanet.omp_outlined.1186  (in qwen36) + 2808  [0x102f99120]
+    +       !     : 3 deltanet.omp_outlined.1186  (in qwen36) + 2916,2928,...  [0x102f9918c,0x102f99198,...]
+    +       !     1 deltanet.omp_outlined  (in qwen36) + 2296  [0x102f98464]
+    +       !     : 1 deltanet.omp_outlined  (in qwen36) + 2328  [0x102f98484]
+    +       !     1 deltanet.omp_outlined.1186  (in qwen36) + 3312  [0x102f99318]
+    +       !       1 deltanet.omp_outlined.1186  (in qwen36) + 3448  [0x102f993a0]
+    +       683 __kmp_launch_thread  (in libomp.dylib) + 220  [0x1031da020]
+    +         683 __kmp_fork_barrier(int, int)  (in libomp.dylib) + 460  [0x1031f441c]
+    +           682 __kmp_hyper_barrier_release(barrier_type, kmp_info*, int, int, int, void*)  (in libomp.dylib) + 164  [0x1031f1908]
+    +           : 682 kmp_flag_64<false, true>::wait(kmp_info*, int, void*)  (in libomp.dylib) + 1712  [0x1031f55e8]
+    +           :   682 void __kmp_suspend_64<false, true>(int, kmp_flag_64<false, true>*)  (in libomp.dylib) + 368  [0x10320e1cc]
+    +           :     682 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x1828cd1b4]
+    +           :       682 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18288b50c]
+    +           1 __kmp_hyper_barrier_release(barrier_type, kmp_info*, int, int, int, void*)  (in libomp.dylib) + 164  [0x1031f1908]
+    1830 Thread_5983603
+    + 1830 thread_start  (in libsystem_pthread.dylib) + 8  [0x1828c7cd0]
+    +   1830 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x1828ccce4]
+    +     1830 __kmp_launch_worker(void*)  (in libomp.dylib) + 252  [0x10320d10c]
+    +       1163 __kmp_launch_thread  (in libomp.dylib) + 304  [0x1031da074]
+    +       ! 1163 __kmp_invoke_task_func  (in libomp.dylib) + 320  [0x1031db258]
+    +       !   1163 __kmp_invoke_microtask  (in libomp.dylib) + 156  [0x103226f8c]
+    +       !     1139 gq_matmul_act.omp_outlined  (in qwen36) + 204  [0x102fa6d28]
+    +       !     : 645 gq_row_all  (in qwen36) + 1140,1116,...  [0x102fa71e0,0x102fa71c8,...]
+    +       !     : 484 gq_row_all  (in qwen36) + 788  [0x102fa7080]
+    +       !     : | 484 gq_ublk  (in qwen36) + 2548,92,...  [0x102fa7e24,0x102fa748c,...]
+    +       !     : 10 gq_ublk  (in qwen36) + 12660,12648,...  [0x102faa5a4,0x102faa598,...]
+    +       !     11 matmul.omp_outlined  (in qwen36) + 244  [0x102f9a4f0]
+    +       !     : 11 dot_f32_lanes  (in qwen36) + 128,116  [0x102f9743c,0x102f97430]
+    +       !     5 deltanet.omp_outlined.1187  (in qwen36) + 672,696,...  [0x102f99a30,0x102f99a48,...]
+    +       !     4 deltanet.omp_outlined.1186  (in qwen36) + 2808  [0x102f99120]
+    +       !     : 4 deltanet.omp_outlined.1186  (in qwen36) + 2916,2928,...  [0x102f9918c,0x102f99198,...]
+    +       !     2 deltanet.omp_outlined  (in qwen36) + 2296  [0x102f98464]
+    +       !     : 1 deltanet.omp_outlined  (in qwen36) + 2492  [0x102f98528]
+    +       !     : 1 expf  (in libsystem_m.dylib) + 100  [0x2d0358b64]
+    +       !     1 gq_matmul_act.omp_outlined  (in qwen36) + 204  [0x102fa6d28]
+    +       !     1 gq_row_all  (in qwen36) + 1456  [0x102fa731c]
+    +       666 __kmp_launch_thread  (in libomp.dylib) + 220  [0x1031da020]
+    +       ! 666 __kmp_fork_barrier(int, int)  (in libomp.dylib) + 460  [0x1031f441c]
+    +       !   666 __kmp_hyper_barrier_release(barrier_type, kmp_info*, int, int, int, void*)  (in libomp.dylib) + 164  [0x1031f1908]
+    +       !     666 kmp_flag_64<false, true>::wait(kmp_info*, int, void*)  (in libomp.dylib) + 1712  [0x1031f55e8]
+    +       !       666 void __kmp_suspend_64<false, true>(int, kmp_flag_64<false, true>*)  (in libomp.dylib) + 368  [0x10320e1cc]
+    +       !         666 _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x1828cd1b4]
+    +       !           666 __psynch_cvwait  (in libsystem_kernel.dylib) + 8  [0x18288b50c]
+    +       1 __kmp_launch_thread  (in libomp.dylib) + 220  [0x1031da020]
+    1710 Thread_5983581
+    + 1707 start_wqthread  (in libsystem_pthread.dylib) + 8  [0x1828c7cc4]
+    + ! 1707 _pthread_wqthread  (in libsystem_pthread.dylib) + 368  [0x1828c8fcc]
+    + !   1707 __workq_kernreturn  (in libsystem_kernel.dylib) + 8  [0x1828899ec]
+    + 3 start_wqthread  (in libsystem_pthread.dylib) + 0  [0x1828c7cbc]
+    914 Thread_5983659
+    + 912 start_wqthread  (in libsystem_pthread.dylib) + 8  [0x1828c7cc4]
+    + ! 912 _pthread_wqthread  (in libsystem_pthread.dylib) + 368  [0x1828c8fcc]
+    + !   912 __workq_kernreturn  (in libsystem_kernel.dylib) + 8  [0x1828899ec]
+    + 2 start_wqthread  (in libsystem_pthread.dylib) + 0  [0x1828c7cbc]
+    258 Thread_<multiple>   DispatchQueue_71: com.Metal.CommandQueueDispatch  (serial)
+    + 258 start_wqthread  (in libsystem_pthread.dylib) + 8  [0x1828c7cc4]
+    +   258 _pthread_wqthread  (in libsystem_pthread.dylib) + 292  [0x1828c8f80]
+    +     258 _dispatch_workloop_worker_thread  (in libdispatch.dylib) + 720  [0x18785f85c]
+    +       258 _dispatch_root_queue_drain_deferred_wlh  (in libdispatch.dylib) + 284  [0x18785ff58]
+    +         258 _dispatch_lane_invoke  (in libdispatch.dylib) + 392  [0x187855abc]
+    +           258 _dispatch_lane_serial_drain  (in libdispatch.dylib) + 332  [0x187854e24]
+    +             258 _dispatch_source_invoke  (in libdispatch.dylib) + 848  [0x187862f7c]
+    +               258 _dispatch_source_latch_and_call  (in libdispatch.dylib) + 392  [0x1878642a8]
+    +                 258 _dispatch_continuation_pop  (in libdispatch.dylib) + 596  [0x1878511b4]
+    +                   258 _dispatch_client_callout  (in libdispatch.dylib) + 16  [0x1878665a0]
+    +                     258 -[_MTLCommandQueue _submitAvailableCommandBuffers]  (in Metal) + 544  [0x1962b87cc]
+    +                       258 -[IOGPUMetalCommandQueue submitCommandBuffers:count:]  (in IOGPU) + 72  [0x196262e50]
+    +                         258 -[IOGPUMetalCommandQueue _submitCommandBuffers:count:]  (in IOGPU) + 380  [0x196262ff4]
+    +                           258 IOGPUCommandQueueSubmitCommandBuffers  (in IOGPU) + 184  [0x19627b008]
+    +                             258 iokit_user_client_trap  (in IOKit) + 8  [0x1871cccd8]
+    6 Thread_<multiple>   DispatchQueue_74: com.Metal.CompletionQueueDispatch  (serial)
+      6 start_wqthread  (in libsystem_pthread.dylib) + 8  [0x1828c7cc4]
+        6 _pthread_wqthread  (in libsystem_pthread.dylib) + 292  [0x1828c8f80]
+          6 _dispatch_workloop_worker_thread  (in libdispatch.dylib) + 720  [0x18785f85c]
+            6 _dispatch_root_queue_drain_deferred_wlh  (in libdispatch.dylib) + 284  [0x18785ff58]
+              6 _dispatch_lane_invoke  (in libdispatch.dylib) + 392  [0x187855abc]
+                6 _dispatch_lane_serial_drain  (in libdispatch.dylib) + 332  [0x187854e24]
+                  6 _dispatch_lane_invoke  (in libdispatch.dylib) + 448  [0x187855af4]
+                    6 _dispatch_lane_serial_drain  (in libdispatch.dylib) + 332  [0x187854e24]
+                      6 _dispatch_mach_invoke  (in libdispatch.dylib) + 472  [0x187869cdc]
+                        6 _dispatch_lane_serial_drain  (in libdispatch.dylib) + 332  [0x187854e24]
+                          6 _dispatch_mach_msg_invoke  (in libdispatch.dylib) + 480  [0x187868f84]
+                            6 _dispatch_client_callout4  (in libdispatch.dylib) + 16  [0x1878665e8]
+                              6 __IOGPUNotificationQueueSetDispatchQueue_block_invoke  (in IOGPU) + 64  [0x19626d1bc]
+                                4 IOGPUNotificationQueueDispatchAvailableCompletionNotifications  (in IOGPU) + 136  [0x19626d0ac]
+                                ! 4 -[_MTLCommandQueue commandBufferDidComplete:startTime:completionTime:error:]  (in Metal) + 108  [0x1962b9050]
+                                !   3 -[IOGPUMetalCommandBuffer didCompleteWithStartTime:endTime:error:]  (in IOGPU) + 240  [0x196260474]
+                                !   : 3 -[_MTLCommandBuffer didCompleteWithStartTime:endTime:error:]  (in Metal) + 828  [0x1962b94ac]
+                                !   :   3 pthread_cond_broadcast  (in libsystem_pthread.dylib) + 700  [0x1828c8078]
+                                !   :     3 __psynch_cvbroad  (in libsystem_kernel.dylib) + 8  [0x18288b538]
+                                !   1 _objc_msgSend_uncached  (in libobjcMsgSend2.dylib) + 68  [0x19a340b84]
+                                !     1 objc_lookUpImpOrForward  (in libobjc.A.dylib) + 128  [0x18276e364]
+                                2 IOGPUNotificationQueueDispatchAvailableCompletionNotifications  (in IOGPU) + 144  [0x19626d0b4]
+                                  2 _Block_release  (in libsystem_blocks.dylib) + 252  [0x1878481d0]
+                                    2 objc_destructInstance  (in libobjc.A.dylib) + 44  [0x18274dc08]
+                                      2 objc_destructInstance_nonnull_realized(objc_object*)  (in libobjc.A.dylib) + 92  [0x182770114]
+                                        2 _object_remove_associations  (in libobjc.A.dylib) + 100  [0x18277dfe0]
+
+Total number in stack (recursive counted multiple, when >=5):
+        28       __psynch_cvwait  (in libsystem_kernel.dylib) + 0  [0x18288b504]
+        28       _pthread_cond_wait  (in libsystem_pthread.dylib) + 980  [0x1828cd1b4]
+        28       gq_ublk  (in qwen36) + 0  [0x102fa7430]
+        26       __kmp_invoke_microtask  (in libomp.dylib) + 156  [0x103226f8c]
+        26       __kmp_invoke_task_func  (in libomp.dylib) + 320  [0x1031db258]
+        23       __kmp_fork_call  (in libomp.dylib) + 6076  [0x1031d6bc8]
+        23       __kmpc_fork_call  (in libomp.dylib) + 172  [0x1031cb4e8]
+        22       void __kmp_suspend_64<false, true>(int, kmp_flag_64<false, true>*)  (in libomp.dylib) + 368  [0x10320e1cc]
+        20       __kmp_join_barrier(int)  (in libomp.dylib) + 556  [0x1031f289c]
+        20       gq_matmul_act.omp_outlined  (in qwen36) + 204  [0x102fa6d28]
+        20       gq_row_all  (in qwen36) + 0  [0x102fa6d6c]
+        20       gq_row_all  (in qwen36) + 788  [0x102fa7080]
+        19       __kmp_hyper_barrier_gather(barrier_type, kmp_info*, int, int, void (*)(void*, void*), void*)  (in libomp.dylib) + 440  [0x1031f3240]
+        19       __kmp_internal_join  (in libomp.dylib) + 92  [0x1031d7f4c]
+        19       __kmp_join_call  (in libomp.dylib) + 328  [0x1031d779c]
+        19       __kmpc_fork_call  (in libomp.dylib) + 192  [0x1031cb4fc]
+        19       kmp_flag_64<false, true>::wait(kmp_info*, int, void*)  (in libomp.dylib) + 860  [0x1031f5294]
+        17       gq_matmul  (in qwen36) + 800  [0x102fa5ed4]
+        17       matmul_d  (in qwen36) + 1208  [0x102f91b40]
+        6       -[_MTLCommandBuffer waitUntilCompleted]  (in Metal) + 80  [0x1962bccc0]
+        6       coli_metal_iq2_xxs_gemv_profile  (in qwen36) + 1888  [0x102fcb2d4]
+        6       deltanet.omp_outlined.1186  (in qwen36) + 0  [0x102f98628]
+        6       dot_f32_lanes  (in qwen36) + 0  [0x102f973bc]
+        6       expf  (in libsystem_m.dylib) + 0  [0x2d0358b00]
+        6       matmul.omp_outlined  (in qwen36) + 244  [0x102f9a4f0]
+        6       matmul_d  (in qwen36) + 1512  [0x102f91c70]
+        5       start_wqthread  (in libsystem_pthread.dylib) + 8  [0x1828c7cc4]
+
+Sort by top of stack, same collapsed (when >= 5):
+        __workq_kernreturn  (in libsystem_kernel.dylib)        4449
+        __psynch_cvwait  (in libsystem_kernel.dylib)        2672
+        gq_row_all  (in qwen36)        2645
+        gq_ublk  (in qwen36)        1882
+        iokit_user_client_trap  (in IOKit)        258
+        dot_f32_lanes  (in qwen36)        46
+        deltanet.omp_outlined.1187  (in qwen36)        17
+        deltanet.omp_outlined.1186  (in qwen36)        16
+        expf  (in libsystem_m.dylib)        9
+        deltanet.omp_outlined  (in qwen36)        5
+        layers_forward_control  (in qwen36)        5
+        start_wqthread  (in libsystem_pthread.dylib)        5
+
+Binary Images:
+       0x102f4c000 -        0x10304cf17 +qwen36 (0) <4052D1DC-D6FB-3768-9881-A6581F355A0B> /Users/*/qwen36
+       0x1031bc000 -        0x103231607 +libomp.dylib (0) <3C615650-9FD3-3F55-92A6-1854D34E5D71> /opt/homebrew/*/libomp.dylib
+       0x182744000 -        0x182793657  libobjc.A.dylib (973.1) <1FF743DE-675D-30F9-82EC-A3B6801513D7> /usr/lib/libobjc.A.dylib
+       0x182794000 -        0x18279e23f  libsharedcache.dylib (0) <F3B27777-C26C-3C75-9BEA-64D0386BDCD8> /usr/lib/libsharedcache.dylib
+       0x18279f000 -        0x1827c6d23  libdyld.dylib (27104) <7ADDD814-2C61-3D07-B047-E6FDD97BA360> /usr/lib/system/libdyld.dylib
+       0x1827c7000 -        0x182886c83  dyld (1.0.0 - 27104) <D8104ED6-185E-3A2F-AD71-B91EDDBE2598> /usr/lib/dyld
+       0x182887000 -        0x1828c5a5b  libsystem_kernel.dylib (13432.41.4) <F2BCEB9A-0FEC-3C92-B6EA-8E37157050A8> /usr/lib/system/libsystem_kernel.dylib
+       0x1828c6000 -        0x1828d28ab  libsystem_pthread.dylib (553.40.2) <D5E656B3-84B5-368D-A6E7-CCC1A736FB75> /usr/lib/system/libsystem_pthread.dylib
+       0x1828d3000 -        0x1828e4b8b  libsystem_notify.dylib (368.40.2) <266B92EF-8350-347C-9086-B53BA04523CF> /usr/lib/system/libsystem_notify.dylib
+       0x1828e5000 -        0x182967cd3  libsystem_c.dylib (1786.40.6) <4BF47EBB-4CD0-3F4A-995A-717B8550CB12> /usr/lib/system/libsystem_c.dylib
+       0x182968000 -        0x182f0154f  libswiftCore.dylib (6.4.2 - 6.4.2.1.9) <EC0C27EC-C327-3027-80FA-2F2FF76C4D52> /usr/lib/swift/libswiftCore.dylib
+       0x182f02000 -        0x1841b8177  com.apple.Foundation (6.9 - 5027.1.8) <3F6D1ACE-7756-3B52-A297-8E7ADA36194F> /System/Library/Frameworks/Foundation.framework/Versions/C/Foundation
+       0x1841b9000 -        0x18420f0ff  libsystem_malloc.dylib (886.41.1) <22C6E10E-C6CC-3475-BDE0-270D72950E6A> /usr/lib/system/libsystem_malloc.dylib
+       0x184210000 -        0x184219b13  libsystem_darwin.dylib (1786.40.6) <4EE808C0-2386-3971-804B-BB42288EE0C9> /usr/lib/system/libsystem_darwin.dylib
+       0x18421a000 -        0x1849d2c57  com.apple.CoreGraphics (2.0 - 2050.1.6) <72E77A2C-C0E6-3871-B1EF-EC3D728C74DE> /System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics
+       0x1849d3000 -        0x18502f6cf  com.apple.SkyLight (1.600.0 - 957.8.8) <1AD26AFB-B313-3086-95F0-43FC18B8FBCA> /System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/SkyLight
+       0x185030000 -        0x1868354ef  com.apple.Network (1.0 - 6681.41.1) <CBBC8712-32E8-3581-B565-D4B11037C680> /System/Library/Frameworks/Network.framework/Versions/A/Network
+       0x186836000 -        0x18694dafb  com.apple.CoreDisplay (291.4 - 291.4) <D513002D-AD2F-3CC1-A371-81B9162D9939> /System/Library/Frameworks/CoreDisplay.framework/Versions/A/CoreDisplay
+       0x18694e000 -        0x18696e6a7  com.apple.DebugSymbols (219 - 219) <97D4D9DE-BB98-3F8B-8950-C3F7DEC867E8> /System/Library/PrivateFrameworks/DebugSymbols.framework/Versions/A/DebugSymbols
+       0x18696f000 -        0x18698220b  com.apple.UniformTypeIdentifiers (709 - 709) <14C84928-B369-3755-83D2-795784BE6330> /System/Library/Frameworks/UniformTypeIdentifiers.framework/Versions/A/UniformTypeIdentifiers
+       0x186983000 -        0x186a0f9f7  libswift_Concurrency.dylib (6.4.2 - 6.4.2.1.9) <2249664D-2D56-3C9B-A6C9-CD03B6B6A793> /usr/lib/swift/libswift_Concurrency.dylib
+       0x186a10000 -        0x186ea332f  com.apple.CoreFoundation (6.9 - 5027.1.8) <0E72BE04-5C19-3F5D-9809-94553E6A31F0> /System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation
+       0x186ea4000 -        0x186ef9127  libxpc.dylib (3298.40.28) <F6D8FB8F-6BA0-3857-B356-21C448C954A1> /usr/lib/system/libxpc.dylib
+       0x186efa000 -        0x186faf6b7  libcorecrypto.dylib (2109.40.22) <25AD16F2-2D5A-3301-A3FB-E77F118E4FE6> /usr/lib/system/libcorecrypto.dylib
+       0x186fb0000 -        0x186fde9d3  libsystem_info.dylib (603.40.2) <840F592C-740F-3965-B23A-A11A234C6ABA> /usr/lib/system/libsystem_info.dylib
+       0x186fdf000 -        0x186ff8eff  libc++abi.dylib (2200.32) <E7646A85-5F12-349C-B17F-5DF0797F24A0> /usr/lib/libc++abi.dylib
+       0x186ff9000 -        0x1871adc6f  com.apple.ColorSync (4.13.0 - 3929.1.5) <81DC556B-D4FD-35C4-80AA-9CD18B20A3E2> /System/Library/Frameworks/ColorSync.framework/Versions/A/ColorSync
+       0x1871ae000 -        0x18729419f  com.apple.framework.IOKit (2.0.2 - 100288.40.8.0.1) <67F14315-6B4D-34AE-B344-CE797235D252> /System/Library/Frameworks/IOKit.framework/Versions/A/IOKit
+       0x187295000 -        0x1876a5ec3  com.apple.security (7.0 - 62460.40.78) <FD30C4EE-0826-377F-8791-F5C7797BBA75> /System/Library/Frameworks/Security.framework/Versions/A/Security
+       0x1876a6000 -        0x1876ac1e7  libsystem_coreservices.dylib (203.1.1) <2A95AE6D-9363-34F5-9890-BCC9810000D3> /usr/lib/system/libsystem_coreservices.dylib
+       0x187826000 -        0x18784605b  libsystem_trace.dylib (1966.40.15.0.2) <ED20A12C-9BCA-3037-B78A-4AFF3B6E7EC2> /usr/lib/system/libsystem_trace.dylib
+       0x187847000 -        0x18784a01f  libsystem_blocks.dylib (98.1) <69165407-EE1A-37A4-BC82-29A711B02FE6> /usr/lib/system/libsystem_blocks.dylib
+       0x18784b000 -        0x1878911df  libdispatch.dylib (1605.40.4) <6F5E8225-AD67-3644-AFEF-25A4A43BF604> /usr/lib/system/libdispatch.dylib
+       0x187892000 -        0x18789b4f3  libsystem_platform.dylib (402.40.3) <FDF30FD1-5E97-3348-BEE7-BA386574A75F> /usr/lib/system/libsystem_platform.dylib
+       0x18789c000 -        0x18789ed2b  libsystem_featureflags.dylib (111) <6B6117CF-AFA9-3118-89B8-847366A4B863> /usr/lib/system/libsystem_featureflags.dylib
+       0x18789f000 -        0x187934033  libc++.1.dylib (2200.32) <29FF7149-AB23-3DEC-8DA3-39E2CB145F89> /usr/lib/libc++.1.dylib
+       0x187935000 -        0x187c18085  libicucore.A.dylib (78138) <49ADAB49-FE29-36D1-A552-C4739F86BDD3> /usr/lib/libicucore.A.dylib
+       0x187c19000 -        0x187f09f6b  com.apple.CoreServices.CarbonCore (1333 - 1333) <69834482-DB1B-3471-8529-97C51064CBEB> /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/CarbonCore.framework/Versions/A/CarbonCore
+       0x187f0a000 -        0x187f486a7  com.apple.CoreServicesInternal (505 - 505) <17073A93-E403-38FA-99D2-0EBFDDD7AF89> /System/Library/PrivateFrameworks/CoreServicesInternal.framework/Versions/A/CoreServicesInternal
+       0x187f49000 -        0x18824cb97  com.apple.LaunchServices (1141.1 - 1141.1) <E81639F2-5C13-3103-83F2-D24B0689D3F4> /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/LaunchServices
+       0x188fdf000 -        0x188ff521f  libswiftDispatch.dylib (1605.40.4) <F3FC740F-4CE6-361E-AD75-89F813C49949> /usr/lib/swift/libswiftDispatch.dylib
+       0x188ff6000 -        0x18904f52f  com.apple.RunningBoardServices (1.0 - 1084.40.7) <26745A34-620A-3147-AD6C-8BB04DE69008> /System/Library/PrivateFrameworks/RunningBoardServices.framework/Versions/A/RunningBoardServices
+       0x189050000 -        0x189124d1b  com.apple.BaseBoard (827.2.3 - 827.2.3) <18B1F0DB-C60B-36B1-814E-95BACE14A0CD> /System/Library/PrivateFrameworks/BaseBoard.framework/Versions/A/BaseBoard
+       0x189125000 -        0x1891b111f  libMobileGestalt.dylib (1622.40.11) <D676D2F3-5017-3B9D-B44A-028B08B4A1D0> /usr/lib/libMobileGestalt.dylib
+       0x1891b2000 -        0x1891e9127  com.apple.analyticsd (1.0 - 1) <36E5F5B9-E5E8-3E5D-936B-9DDE14C12CB1> /System/Library/PrivateFrameworks/CoreAnalytics.framework/Versions/A/CoreAnalytics
+       0x1891ea000 -        0x1893e40af  libsqlite3.dylib (408) <36AF1D09-C97F-3FD7-B948-67DDC28C0CBD> /usr/lib/libsqlite3.dylib
+       0x1893e5000 -        0x189420bdb  libsystem_containermanager.dylib (833.40.18.0.1) <BB240C3E-181D-3E64-81B5-FF7887CEA66A> /usr/lib/system/libsystem_containermanager.dylib
+       0x189421000 -        0x18942daf7  libCheckFix.dylib (33) <88C29213-DC29-3AF6-9F71-2F53309C8D4F> /usr/lib/libCheckFix.dylib
+       0x18942e000 -        0x189467507  com.apple.CSStore (1141.1 - 1141.1) <A55FB8BF-8B79-3DB4-9CAD-EBA8C6A9F11C> /System/Library/PrivateFrameworks/CoreServicesStore.framework/Versions/A/CoreServicesStore
+       0x189967000 -        0x18997f6af  com.apple.IOSurface (403.1 - 403.1) <63AECD4F-FCFB-360C-8B45-35F0F12E3BA9> /System/Library/Frameworks/IOSurface.framework/Versions/A/IOSurface
+       0x189980000 -        0x18999cae7  libswiftos.dylib (1090.40.3) <309CE1B1-E511-3672-A989-35EABD87C7D3> /usr/lib/swift/libswiftos.dylib
+       0x18999d000 -        0x1899a0397  libswiftObjectiveC.dylib (973.1) <F8D80D8B-FAC5-31E3-8CD0-7EEAA5A60B53> /usr/lib/swift/libswiftObjectiveC.dylib
+       0x1899a1000 -        0x1899c79ab  com.apple.TCC (1.0 - 1) <136DB379-BFEE-300A-89CF-3194402D1205> /System/Library/PrivateFrameworks/TCC.framework/Versions/A/TCC
+       0x1899c8000 -        0x1899df277  libsystem_asl.dylib (409.40.3) <EEB736E2-F339-3BF3-9503-32C0418076B8> /usr/lib/system/libsystem_asl.dylib
+       0x189a05000 -        0x189e45d97  com.apple.CoreData (120 - 1634) <306C8852-1EEC-3DB1-9A39-AAE646F9CD7A> /System/Library/Frameworks/CoreData.framework/Versions/A/CoreData
+       0x189e46000 -        0x189ed741f  com.apple.SystemConfiguration (1.21 - 1.21) <808BAD08-5FF7-353D-8B39-DDB742632BEF> /System/Library/Frameworks/SystemConfiguration.framework/Versions/A/SystemConfiguration
+       0x189ed8000 -        0x18a0292c3  com.apple.CollectionsInternal (1.2.0 - 5027.1.6) <1245D76F-9C9C-33A8-A5CD-9390AF4126DF> /System/Library/PrivateFrameworks/CollectionsInternal.framework/Versions/A/CollectionsInternal
+       0x18a02a000 -        0x18a03bb9f  com.apple.AtomicsInternal (1.1.0 - 5027.1.6) <872B48D5-E50D-3633-8D9B-BEE4456C1D61> /System/Library/PrivateFrameworks/AtomicsInternal.framework/Versions/A/AtomicsInternal
+       0x18a0a5000 -        0x18a13271f  com.apple.AppleKeyStore (1.0 - 1.0) <1036FB0E-E0D2-36E0-AEFE-022DA1150A2A> /System/Library/PrivateFrameworks/AppleKeyStore.framework/Versions/A/AppleKeyStore
+       0x18a133000 -        0x18a17b08b  com.apple.biome.BiomeFoundation (1.0 - 259) <1EECC87F-C22F-303B-B283-42950DA22DBB> /System/Library/PrivateFrameworks/BiomeFoundation.framework/Versions/A/BiomeFoundation
+       0x18a17c000 -        0x18a1f25c7  com.apple.proactive.support.ProactiveSupport (1.0 - 425) <C6AB626B-C582-38AA-BC81-FBF0029AD0F7> /System/Library/PrivateFrameworks/ProactiveSupport.framework/Versions/A/ProactiveSupport
+       0x18a1f3000 -        0x18a20957f  com.apple.ProtocolBuffer (1 - 326.21.9.18.1) <2AD48F0D-E159-3501-8CF6-26BC10C8B279> /System/Library/PrivateFrameworks/ProtocolBuffer.framework/Versions/A/ProtocolBuffer
+       0x18a27c000 -        0x18a2a2e9f  com.apple.UserManagement (1.0 - 1) <C3070476-985F-3FE9-85B9-E9CF2513859A> /System/Library/PrivateFrameworks/UserManagement.framework/Versions/A/UserManagement
+       0x18a2a3000 -        0x18a2ac713  com.apple.OpenDirectory (27.2 - 737.40.2) <36AD45FC-8578-3E27-B95E-08093928DA22> /System/Library/Frameworks/OpenDirectory.framework/Versions/A/OpenDirectory
+       0x18a2ad000 -        0x18a3114af  com.apple.CFOpenDirectory (27.2 - 737.40.2) <12433E73-1AA6-3D88-848E-5966211E46E2> /System/Library/Frameworks/OpenDirectory.framework/Versions/A/Frameworks/CFOpenDirectory.framework/Versions/A/CFOpenDirectory
+       0x18a340000 -        0x18a340f2f  libobjcMsgSend.dylib (973.1) <0B3C2D50-F0C7-3E78-8175-ADD879E8B1A1> /usr/lib/objc/libobjcMsgSend.dylib
+       0x18ddc7000 -        0x18e1422e3  com.apple.CFNetwork (1.0 - 3896.200.61) <D01FA3A7-8925-3D70-A21C-EF2176DFC5AD> /System/Library/Frameworks/CFNetwork.framework/Versions/A/CFNetwork
+       0x18e143000 -        0x18ea28a97  com.apple.IntelligencePlatformLibrary (441.26.3) <8C661F72-A9F0-328E-95D2-F47DF3CDF5CC> /System/Library/PrivateFrameworks/IntelligencePlatformLibrary.framework/Versions/A/IntelligencePlatformLibrary
+       0x18ee64000 -        0x18efb442f  com.apple.ExtensionFoundation (97 - 97) <5B78DBC3-637A-3CB3-A966-CCC14C08603C> /System/Library/Frameworks/ExtensionFoundation.framework/Versions/A/ExtensionFoundation
+       0x18efb5000 -        0x18f05ec3f  com.apple.BoardServices (1.0 - 827.2.3) <D6CAB517-3BF3-393B-A52F-DF4E70F5D3F9> /System/Library/PrivateFrameworks/BoardServices.framework/Versions/A/BoardServices
+       0x18f999000 -        0x18f9e2a9f  libswiftXPC.dylib (167.0.2) <88295802-0089-3B7F-8AB2-6406B73A0720> /usr/lib/swift/libswiftXPC.dylib
+       0x18f9e3000 -        0x18fa7152f  libswift_StringProcessing.dylib (6.4.2 - 6.4.2.1.9) <41BE15D1-2323-37FC-BF67-8413FC453DD4> /usr/lib/swift/libswift_StringProcessing.dylib
+       0x18fa72000 -        0x18fb5e367  com.apple.combine (1.0 - 3023) <0277BC95-39F7-3E5C-944E-A4209987ABDC> /System/Library/Frameworks/Combine.framework/Versions/A/Combine
+       0x18fb5f000 -        0x19002d65b  com.apple.ImageIO (3.3.0 - 2851.1.8) <B388581A-27D1-3631-8220-ADC787B1EC04> /System/Library/Frameworks/ImageIO.framework/Versions/A/ImageIO
+       0x19002e000 -        0x1904ab917  com.apple.QuartzCore (1223.10.17.2 - 1223.10.17.2) <6564B206-0813-35D3-BDB4-91A27B734190> /System/Library/Frameworks/QuartzCore.framework/Versions/A/QuartzCore
+       0x1904e6000 -        0x190536683  libFontRegistry.dylib (425) <D543CEBD-7AE4-375F-9CFA-7AD93F485F1D> /System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/ATS.framework/Versions/A/Resources/libFontRegistry.dylib
+       0x190537000 -        0x19075b917  com.apple.CoreText (910 - 910) <4E3218AC-BF14-36E8-9FF1-835A0DF3CF9E> /System/Library/Frameworks/CoreText.framework/Versions/A/CoreText
+       0x19075c000 -        0x1907ce8d7  com.apple.AE (944 - 944) <C25B391D-E297-3208-8A36-FCBE96A7F71A> /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/AE.framework/Versions/A/AE
+       0x1910a9000 -        0x19113135b  com.apple.spotlight.metadata.utilities (1.0 - 2465.1.9) <1ABB1A86-F173-309F-979C-51C7989619FA> /System/Library/PrivateFrameworks/MetadataUtilities.framework/Versions/A/MetadataUtilities
+       0x191171000 -        0x191171ee7  libenergytrace.dylib (23) <B72A86A4-6E70-3837-8421-FAC9621509D2> /usr/lib/libenergytrace.dylib
+       0x1916a2000 -        0x1916c7483  com.apple.PowerLog (1.0 - 1) <23FFDE08-3E6D-383B-B162-32B3E6D68438> /System/Library/PrivateFrameworks/PowerLog.framework/Versions/A/PowerLog
+       0x1916c8000 -        0x1916ff22b  com.apple.biome.BiomeStorage (1.0 - 259) <8E881F9F-3E48-35BF-9644-A2789CD90072> /System/Library/PrivateFrameworks/BiomeStorage.framework/Versions/A/BiomeStorage
+       0x191700000 -        0x191c4ea87  com.apple.biome.BiomeStreams (1.0 - 259) <B087019C-347B-35B1-A1F4-E074F6F508EE> /System/Library/PrivateFrameworks/BiomeStreams.framework/Versions/A/BiomeStreams
+       0x191cb9000 -        0x191d26383  libusrtcp.dylib (6681.41.1) <B9112E7D-7F38-3C23-88F3-12DC38C2E12B> /usr/lib/libusrtcp.dylib
+       0x191d27000 -        0x191dfccff  libboringssl.dylib (583.40.6) <CBB37497-FF09-3D71-89B2-F7D8CB4C6869> /usr/lib/libboringssl.dylib
+       0x191f1c000 -        0x191f36e13  libsystem_networkextension.dylib (2365.40.3.0.2) <61ABFE3D-5B3B-3E48-9E91-3745FB6AD31E> /usr/lib/system/libsystem_networkextension.dylib
+       0x191f37000 -        0x191f48877  libdns_services.dylib (3111.40.45) <441D088B-F006-373B-904A-43777D70E383> /usr/lib/libdns_services.dylib
+       0x191f49000 -        0x191fee8af  com.apple.security.CryptoKit (1.0 - 1) <E7C4045B-9A81-31A0-AABB-09293F8B48C6> /System/Library/Frameworks/CryptoKit.framework/Versions/A/CryptoKit
+       0x192096000 -        0x192159867  com.apple.MobileAssets (1.0 - 2215.41.2) <790466D8-1102-33E9-8D25-45F2AD895A65> /System/Library/PrivateFrameworks/MobileAsset.framework/Versions/A/MobileAsset
+       0x19215a000 -        0x1921a471b  com.apple.SoftwareUpdateCoreSupport (1.0 - 1) <C3B2E66E-2199-302A-9A44-7341A9B7474F> /System/Library/PrivateFrameworks/SoftwareUpdateCoreSupport.framework/Versions/A/SoftwareUpdateCoreSupport
+       0x1921a5000 -        0x1921abe03  libsystem_sandbox.dylib (3051.41.1) <041A67C3-6F5D-3406-8F91-4E212953E967> /usr/lib/system/libsystem_sandbox.dylib
+       0x192340000 -        0x192340f2f  libobjcMsgSend1.dylib (973.1) <670BD0AE-0137-3BFE-A1FF-7072BFCBC81C> /usr/lib/objc/libobjcMsgSend1.dylib
+       0x193891000 -        0x1940ec39f  com.apple.BiomeLibrary (441.26.3) <5EDD9EB7-B2ED-3572-8DE3-18A1B87B8EB5> /System/Library/PrivateFrameworks/BiomeLibrary.framework/Versions/A/BiomeLibrary
+       0x194ace000 -        0x194ae714f  libswiftObservation.dylib (6.4.2 - 6.4.2.1.9) <F0004E17-04B0-3C4B-B2E5-7BE81E6A9454> /usr/lib/swift/libswiftObservation.dylib
+       0x194ae8000 -        0x194afaf0f  libswiftSynchronization.dylib (6.4.2 - 6.4.2.1.9) <C4684805-FD40-37E4-B2D9-86E763C7D083> /usr/lib/swift/libswiftSynchronization.dylib
+       0x194afb000 -        0x194bd93ff  com.apple.biome.CascadeSets (1.0 - 259) <5C4061E4-8CBB-3F25-8DCD-C012EC09D2BA> /System/Library/PrivateFrameworks/CascadeSets.framework/Versions/A/CascadeSets
+       0x19570c000 -        0x195711caf  libswiftCoreFoundation.dylib (2412) <9089145C-1294-3880-9DA4-A3F5CA934103> /usr/lib/swift/libswiftCoreFoundation.dylib
+       0x19572d000 -        0x195b71a03  com.apple.vImage (8.1 - 650.40.4) <D12DC73E-0B86-3344-92CD-E21B7B6B81AD> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vImage.framework/Versions/A/vImage
+       0x195e79000 -        0x195e80edf  libsystem_symptoms.dylib (2394.40.17) <DF6A7970-1174-31F7-AB3F-95CDB3D7473A> /usr/lib/system/libsystem_symptoms.dylib
+       0x195ed5000 -        0x195fbb5bb  libxml2.2.dylib (40.1) <09DA402E-57F2-355A-8D1B-F7A29E89B36D> /usr/lib/libxml2.2.dylib
+       0x195fbc000 -        0x19625c96f  libFontParser.dylib (463.1.0.1) <A2F1A0A0-7199-3E62-8CED-9ECA4A34C2E1> /System/Library/PrivateFrameworks/FontServices.framework/libFontParser.dylib
+       0x19625d000 -        0x19629813f  com.apple.IOGPU (162.16.1 - 162.16.1) <6FFD96F3-6ACD-3246-8BC4-2B4CAD23D86D> /System/Library/PrivateFrameworks/IOGPU.framework/Versions/A/IOGPU
+       0x196299000 -        0x19651ef37  com.apple.Metal (383.1 - 383.1) <4309245A-A57C-32FE-A6F9-54918647F25D> /System/Library/Frameworks/Metal.framework/Versions/A/Metal
+       0x19651f000 -        0x1965285c3  com.apple.IOAccelerator (491 - 491) <CDA19256-A8C3-3EF1-8665-570BDA3ED819> /System/Library/PrivateFrameworks/IOAccelerator.framework/Versions/A/IOAccelerator
+       0x196529000 -        0x1965cdbc3  com.apple.CoreVideo (1.8 - 776.2) <1C19C4F7-99C8-3451-AC2E-60F3401E0BF4> /System/Library/Frameworks/CoreVideo.framework/Versions/A/CoreVideo
+       0x1965ce000 -        0x1967ffe6f  com.apple.CoreMedia (1.0 - 3385.14.5.2) <16BDEA63-5AAA-37B7-9669-63C61C70B14A> /System/Library/Frameworks/CoreMedia.framework/Versions/A/CoreMedia
+       0x196a23000 -        0x196a55193  com.apple.pluginkit.framework (1.0 - 1) <C9802865-AED4-3E7C-AB9E-ED8E8635C4E8> /System/Library/PrivateFrameworks/PlugInKit.framework/Versions/A/PlugInKit
+       0x1970b1000 -        0x1970ba513  com.apple.DiskArbitration (2.7 - 2.7) <E9E2E36E-753C-32D7-803F-25C6DC298772> /System/Library/Frameworks/DiskArbitration.framework/Versions/A/DiskArbitration
+       0x1970bb000 -        0x19713b41f  com.apple.Metadata (27.2 - 2465.1.9) <31DEF578-F246-3D33-9505-7CE63144705A> /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Metadata
+       0x197a1b000 -        0x197a1dbab  com.apple.loginsupport (3.0 - 273.2.1) <145F1CC4-D9FC-3AF4-972F-E160E282BF4A> /System/Library/PrivateFrameworks/login.framework/Versions/A/Frameworks/loginsupport.framework/Versions/A/loginsupport
+       0x197aaa000 -        0x197ae43b3  com.apple.AppSupport (1.0.0 - 29) <D7681B85-234E-3789-B432-53201B5056AC> /System/Library/PrivateFrameworks/AppSupport.framework/Versions/A/AppSupport
+       0x197be0000 -        0x197cfc0bf  com.apple.CoreNLP (1.0 - 313) <19F446C8-C867-389E-9D6D-D897D7CE7338> /System/Library/PrivateFrameworks/CoreNLP.framework/Versions/A/CoreNLP
+       0x197cfd000 -        0x197cfe35b  liblangid.dylib (140) <B249A067-5886-391C-BE8C-944EF4621CEA> /usr/lib/liblangid.dylib
+       0x197f20000 -        0x197f28023  com.apple.ReflectionInternal (1.0.0 - 5027.1.6) <0E25CCAF-FA8D-3596-95AB-C20303F3AA15> /System/Library/PrivateFrameworks/ReflectionInternal.framework/Versions/A/ReflectionInternal
+       0x197f29000 -        0x197f3c3c7  com.apple.RuntimeInternal (1.0.0 - 5027.1.6) <F691E9CF-A0F9-3691-AF9E-256E2E0702A8> /System/Library/PrivateFrameworks/RuntimeInternal.framework/Versions/A/RuntimeInternal
+       0x197f3d000 -        0x197fd623f  libswift_RegexParser.dylib (6.4.2 - 6.4.2.1.9) <7612189F-7775-3EF0-BEB7-7980E0914FD8> /usr/lib/swift/libswift_RegexParser.dylib
+       0x198004000 -        0x1980150a7  com.apple.CrashReporterSupport (10.13 - 15146) <8DD000DF-4854-342F-A190-241F19EF11FB> /System/Library/PrivateFrameworks/CrashReporterSupport.framework/Versions/A/CrashReporterSupport
+       0x198021000 -        0x198051db7  com.apple.CoreServices.OSServices (1141.1 - 1141.1) <EA675A4C-F2C4-30CC-8888-D9BF85CBFF47> /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/OSServices.framework/Versions/A/OSServices
+       0x198390000 -        0x1983e094f  com.apple.biome.BiomePubSub (1.0 - 259) <B3A0692D-244D-3E55-B333-F323A361CF42> /System/Library/PrivateFrameworks/BiomePubSub.framework/Versions/A/BiomePubSub
+       0x19877e000 -        0x1987f076f  com.apple.BackBoardServices (1.0 - 1.0) <E1FFB48F-C528-32C9-AC84-E306890D32FA> /System/Library/PrivateFrameworks/BackBoardServices.framework/Versions/A/BackBoardServices
+       0x1987f1000 -        0x19882f4e7  com.apple.CoreAutoLayout (1.0 - 35) <98535763-3248-3164-B02A-24ED4924DCF1> /System/Library/PrivateFrameworks/CoreAutoLayout.framework/Versions/A/CoreAutoLayout
+       0x198830000 -        0x198832e47  libapp_launch_measurement.dylib (17) <7D3281D7-2A1B-381E-AAFD-9A4F637BB569> /usr/lib/libapp_launch_measurement.dylib
+       0x198833000 -        0x198d90a47  com.apple.Gestures (9127.1.13.1.411 - 9127.1.13.1.411) <A072FD2C-FD04-364C-9408-B455111018AA> /System/Library/PrivateFrameworks/Gestures.framework/Versions/A/Gestures
+       0x198f3c000 -        0x198f5d54b  com.apple.coreservices.SharedFileList (225 - 225) <2950A0C8-0967-31FC-A34E-C76E8FF9E73A> /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/SharedFileList.framework/Versions/A/SharedFileList
+       0x198f5e000 -        0x1994e8047  com.apple.VideoToolbox (1.0 - 3385.14.5.2) <5E3FA95F-B257-39A2-A7C6-97625AE6201D> /System/Library/Frameworks/VideoToolbox.framework/Versions/A/VideoToolbox
+       0x199622000 -        0x1997dd9ab  com.apple.SwiftData (1.0 - 187) <EE91B922-0705-3D19-8A65-D73A394D424F> /System/Library/Frameworks/SwiftData.framework/Versions/A/SwiftData
+       0x19995d000 -        0x19998709f  libPng.dylib (2851.1.8) <C48C0F31-29FA-3DC2-B846-D4CF8BF819BA> /System/Library/Frameworks/ImageIO.framework/Versions/A/Resources/libPng.dylib
+       0x199988000 -        0x1999c46c7  com.apple.FramePacing (1.0 - 1) <34372500-1FBA-315F-A697-D2F689F60341> /System/Library/PrivateFrameworks/FramePacing.framework/Versions/A/FramePacing
+       0x1999c5000 -        0x199f857ef  com.apple.CoreImage (27.0.0 - 1667.40.6) <F87BA1EC-ADF3-31C4-B443-B67A9BA9D2F8> /System/Library/Frameworks/CoreImage.framework/Versions/A/CoreImage
+       0x19a105000 -        0x19a110bdb  com.apple.CoreServices.FSEvents (1433 - 1433) <77EF40A2-7709-3B9E-BA82-4EF092989C86> /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/FSEvents
+       0x19a2ca000 -        0x19a2d74e7  libswiftUniformTypeIdentifiers.dylib (917.1.12.406) <887BEA74-CB37-308F-9295-037A1104044E> /usr/lib/swift/libswiftUniformTypeIdentifiers.dylib
+       0x19a2d8000 -        0x19a2ed09f  com.apple.MobileKeyBag (2.0 - 1.0) <F8DABD00-4B39-37A7-A26F-D4A5A5846A42> /System/Library/PrivateFrameworks/MobileKeyBag.framework/Versions/A/MobileKeyBag
+       0x19a2ee000 -        0x19a2f227f  libsystem_configuration.dylib (1453.40.1) <A24B3482-14E6-31AC-98CC-5B791865EB7B> /usr/lib/system/libsystem_configuration.dylib
+       0x19a340000 -        0x19a340f2f  libobjcMsgSend2.dylib (973.1) <6EA207E5-CF66-3C48-8E3C-1AA3019AA361> /usr/lib/objc/libobjcMsgSend2.dylib
+       0x19b575000 -        0x19c7b0a37  libBNNS.dylib (2212.41.1) <F8F9CAF6-A3C8-351A-9982-0ADCDB5BBF55> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libBNNS.dylib
+       0x19efc4000 -        0x19f0b2cc7  libquic.dylib (6681.41.1) <287C45AB-3630-3C54-99AA-D3C2E9D56311> /usr/lib/libquic.dylib
+       0x1a0292000 -        0x1a02a5893  com.apple.biome.BiomeDSL (1.0 - 259) <7F9E6B91-839B-37F0-BFC7-4978F813D877> /System/Library/PrivateFrameworks/BiomeDSL.framework/Versions/A/BiomeDSL
+       0x1a0738000 -        0x1a0739643  libDiagnosticMessagesClient.dylib (113) <0D6432D0-1600-3062-B496-1698F311F838> /usr/lib/libDiagnosticMessagesClient.dylib
+       0x1a0b9c000 -        0x1a0f6859f  com.apple.audio.AudioToolboxCore (1.0 - 1638.213) <F426D977-1E92-3495-85E2-58EB28678629> /System/Library/PrivateFrameworks/AudioToolboxCore.framework/Versions/A/AudioToolboxCore
+       0x1a1b25000 -        0x1a1b31437  com.apple.MallocStackLogging (1.0 - 65000) <443AB13E-0F90-3EBA-8F58-979368BB9280> /System/Library/PrivateFrameworks/MallocStackLogging.framework/Versions/A/MallocStackLogging
+       0x1a1b32000 -        0x1a1b4fef3  libswiftSystem.dylib (5027.0.67) <2D57D177-1DF8-39BC-9423-72DB33053AEE> /usr/lib/swift/libswiftSystem.dylib
+       0x1a1b50000 -        0x1a1b5a427  libswiftRegexBuilder.dylib (6.4.2 - 6.4.2.1.9) <E3BD2A01-80A5-36D1-84A6-8228A6799F40> /usr/lib/swift/libswiftRegexBuilder.dylib
+       0x1a1b74000 -        0x1a1c7b6cf  com.apple.InternalSwiftProtobuf (1.0 - 1.26.0) <F19A63B8-3684-3B24-BD0A-629A02B3269C> /System/Library/PrivateFrameworks/InternalSwiftProtobuf.framework/Versions/A/InternalSwiftProtobuf
+       0x1a1ea1000 -        0x1a1ecb053  com.apple.audio.caulk (1.0 - 247) <7C6CD256-F380-30CC-8C27-3C967B0A6592> /System/Library/PrivateFrameworks/caulk.framework/Versions/A/caulk
+       0x1a200c000 -        0x1a20973bf  com.apple.CryptoTokenKit (1.0 - 1) <3DC278C8-B2FB-324A-9E9C-78A0768BAF39> /System/Library/Frameworks/CryptoTokenKit.framework/Versions/A/CryptoTokenKit
+       0x1a2221000 -        0x1a222aa73  com.apple.CoreTime (340.0.14 - 340.0.14) <67193817-A482-3152-9B69-F668E44213CA> /System/Library/PrivateFrameworks/CoreTime.framework/Versions/A/CoreTime
+       0x1a22a3000 -        0x1a22a976f  libspindump.dylib (453.1) <32B5C218-8932-36DD-A38A-3F7ACDE374B7> /usr/lib/libspindump.dylib
+       0x1a2340000 -        0x1a2340f2f  libobjcMsgSend3.dylib (973.1) <BCB340D6-66C2-37A7-885E-389E166E39DF> /usr/lib/objc/libobjcMsgSend3.dylib
+       0x1a5ddd000 -        0x1a65b0347  libBLAS.dylib (1617.40.9) <7BA53698-3FCA-38CB-9112-35BAD3260015> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libBLAS.dylib
+       0x1a65b1000 -        0x1a6d53833  com.apple.audio.CoreAudio (5.0 - 5.0) <4BCFC5E5-8A5D-3DC5-B980-CBB672593BA6> /System/Library/Frameworks/CoreAudio.framework/Versions/A/CoreAudio
+       0x1a980a000 -        0x1a981f22b  com.apple.RemoteServiceDiscovery (1.0 - 245.40.9) <B8E8539D-38D6-38C5-A877-A4507B76ED2C> /System/Library/PrivateFrameworks/RemoteServiceDiscovery.framework/Versions/A/RemoteServiceDiscovery
+       0x1a9820000 -        0x1a982cb13  com.apple.SymptomDiagnosticReporter (1.0 - 469.40.3) <C83FC41A-5635-3D5C-BB89-5861E8CA50EE> /System/Library/PrivateFrameworks/SymptomDiagnosticReporter.framework/Versions/A/SymptomDiagnosticReporter
+       0x1a982d000 -        0x1a98706b7  com.apple.MultitouchSupport.framework (10410.4 - 10410.4) <0FD84E7D-CCDF-3970-8DE9-AE757F76A79C> /System/Library/PrivateFrameworks/MultitouchSupport.framework/Versions/A/MultitouchSupport
+       0x1a9c6f000 -        0x1a9ccceb7  com.apple.osanalytics.OSAnalytics (1.0 - 1) <C57C5263-F47F-3309-808C-6F99A30CB176> /System/Library/PrivateFrameworks/OSAnalytics.framework/Versions/A/OSAnalytics
+       0x1aa232000 -        0x1aa2365c7  com.apple.IOSurfaceAccelerator (1.0.0 - 1.0.0) <7B3643D7-868B-3365-8436-33970DC93F66> /System/Library/PrivateFrameworks/IOSurfaceAccelerator.framework/Versions/A/IOSurfaceAccelerator
+       0x1aa237000 -        0x1aa2380ff  com.apple.VideoToolboxParavirtualizationSupport (71.0.14 - 71.0.14) <A1C75A23-9332-3448-B23B-FC60CE1F10C7> /System/Library/PrivateFrameworks/VideoToolboxParavirtualizationSupport.framework/Versions/A/VideoToolboxParavirtualizationSupport
+       0x1aa2e7000 -        0x1aa2ecd6b  com.apple.LinguisticData (1.0 - 483.10) <3031E4D7-4556-3A37-BEEB-C206E50D991E> /System/Library/PrivateFrameworks/LinguisticData.framework/Versions/A/LinguisticData
+       0x1aa340000 -        0x1aa340f2f  libobjcMsgSend4.dylib (973.1) <CBCE5322-7B74-37F3-AECE-7B6CFC07E0D8> /usr/lib/objc/libobjcMsgSend4.dylib
+       0x1b002a000 -        0x1b020bfe7  com.apple.audio.toolbox.AudioToolbox (1.14 - 1.14) <2396A6D2-B5C2-31CE-A4D7-2C74C2110B0E> /System/Library/Frameworks/AudioToolbox.framework/Versions/A/AudioToolbox
+       0x1b05a6000 -        0x1b0669dfb  com.apple.MediaExperience (1.0 - 1) <170A83AC-1F3A-34A6-8AFC-14F6B9CFAAFA> /System/Library/PrivateFrameworks/MediaExperience.framework/Versions/A/MediaExperience
+       0x1b2000000 -        0x1b200eef7  com.apple.CorePhoneNumbers (1.0 - 1) <3736732A-9911-34F6-A432-DA347CD751DA> /System/Library/PrivateFrameworks/CorePhoneNumbers.framework/Versions/A/CorePhoneNumbers
+       0x1b2340000 -        0x1b2340f2f  libobjcMsgSend5.dylib (973.1) <F928C2E1-E53A-3FEA-A87D-9E08A74C5185> /usr/lib/objc/libobjcMsgSend5.dylib
+       0x1b4512000 -        0x1b451771b  com.apple.MSUDataAccessor (1.0 - 1) <CFF37B67-D8E4-3BA0-ACF9-8596A72755EB> /System/Library/PrivateFrameworks/MSUDataAccessor.framework/Versions/A/MSUDataAccessor
+       0x1b4518000 -        0x1b4528cf7  com.apple.SoftwareUpdateCoreConnect (1.0 - 1) <D8552062-54BF-396E-8EE2-27288CC438AF> /System/Library/PrivateFrameworks/SoftwareUpdateCoreConnect.framework/Versions/A/SoftwareUpdateCoreConnect
+       0x1b4583000 -        0x1b4694493  com.apple.Lexicon-framework (1.0 - 219) <AE47ADF8-E952-3441-9E04-08FC37C17AF0> /System/Library/PrivateFrameworks/Lexicon.framework/Versions/A/Lexicon
+       0x1b5c10000 -        0x1b5c1a35b  com.apple.AssertionServices (1.0 - 1084.40.7) <39465A9F-2C4A-371B-B67C-E9A3186B8D3A> /System/Library/PrivateFrameworks/AssertionServices.framework/Versions/A/AssertionServices
+       0x1b698a000 -        0x1b69cf04f  com.apple.AppleJPEG (1.0 - 1) <94E6AAB8-CEF6-320C-A3D4-C55660C8ACEB> /System/Library/PrivateFrameworks/AppleJPEG.framework/Versions/A/AppleJPEG
+       0x1b737c000 -        0x1b7388c0f  com.apple.GraphicsServices (1.0 - 1.0) <5AA704A0-0D83-3C33-86DF-B03D4058877C> /System/Library/PrivateFrameworks/GraphicsServices.framework/Versions/A/GraphicsServices
+       0x1b7389000 -        0x1b73a5923  com.apple.StreamingZip (1.0 - 1) <79C15905-AF13-3C8F-95E3-0BBD08C3432B> /System/Library/PrivateFrameworks/StreamingZip.framework/Versions/A/StreamingZip
+       0x1b752f000 -        0x1b75330a7  com.apple.AppleSystemInfo (3.1.5 - 3.1.5) <B3FB13A8-5C5F-3BB6-B51E-19E53DD04972> /System/Library/PrivateFrameworks/AppleSystemInfo.framework/Versions/A/AppleSystemInfo
+       0x1b7b2f000 -        0x1b7b31fe3  com.apple.security.CryptoKit-C-Bridging (1.0 - 1) <A20C089D-34D7-3BB7-8D9F-DC6BC8E524E5> /System/Library/PrivateFrameworks/CryptoKitCBridging.framework/Versions/A/CryptoKitCBridging
+       0x1b7db9000 -        0x1b7e00c6f  com.apple.IOMobileFramebuffer (343.0.0 - 343.0.0) <2053D536-5C18-3B12-A969-D08686CBE478> /System/Library/PrivateFrameworks/IOMobileFramebuffer.framework/Versions/A/IOMobileFramebuffer
+       0x1b8153000 -        0x1b81cc0d3  com.apple.LoggingSupport (1.0 - 1966.40.15.0.2) <251A2507-9CBA-3FB0-A602-AB2435558B82> /System/Library/PrivateFrameworks/LoggingSupport.framework/Versions/A/LoggingSupport
+       0x1b8283000 -        0x1b8289fe5  liboah.dylib (385) <5C834D15-B729-3F75-AFDA-30B19B63DC44> /usr/lib/liboah.dylib
+       0x1b8377000 -        0x1b838e51f  com.apple.DeviceRecovery (1.0 - 1) <7F31C0B3-EB22-3CC7-B98F-9A93684CD28D> /System/Library/PrivateFrameworks/DeviceRecovery.framework/Versions/A/DeviceRecovery
+       0x1b8600000 -        0x1b86c09a3  com.apple.Heimdal (4.0 - 2.0) <C8994BBA-44F2-3DE7-9067-E21884F3B5DA> /System/Library/PrivateFrameworks/Heimdal.framework/Versions/A/Heimdal
+       0x1b8949000 -        0x1b89f8787  com.apple.MetalPerformanceShaders.MPSCore (1.0 - 130.1.4) <814D202D-0D25-393F-8037-6D92CBA6C199> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSCore.framework/Versions/A/MPSCore
+       0x1b89f9000 -        0x1b8b354eb  libvDSP.dylib (1155) <79FFEC1C-BD65-3324-907A-7FEFC636A526> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libvDSP.dylib
+       0x1b8b36000 -        0x1b8b8899b  libSessionUtility.dylib (449.205) <2C2EFC3A-82D3-3FBB-8C9A-DFC9B37C6BE3> /System/Library/PrivateFrameworks/AudioSession.framework/libSessionUtility.dylib
+       0x1b8b89000 -        0x1b8ba764f  com.apple.imgaudio.AudioAnalytics (1.0 - 1) <A8E8CE8C-2697-3DBF-A0AE-3C7F99A96F0B> /System/Library/PrivateFrameworks/AudioAnalytics.framework/Versions/A/AudioAnalytics
+       0x1b96bc000 -        0x1b971d4b3  libTIFF.dylib (2851.1.8) <A951139A-A168-3FF3-ABEE-830AB76A5294> /System/Library/Frameworks/ImageIO.framework/Versions/A/Resources/libTIFF.dylib
+       0x1ba1c3000 -        0x1ba1cbaf7  libsystem_dnssd.dylib (3111.40.45) <B45D8BC6-6E29-33AA-8A81-11F69B4A4809> /usr/lib/system/libsystem_dnssd.dylib
+       0x1ba1cc000 -        0x1ba2132cf  libbootpolicy.dylib (304.40.3) <8CF45201-BEEF-37B4-A2A9-1A42969CB342> /usr/lib/libbootpolicy.dylib
+       0x1ba340000 -        0x1ba340f2f  libobjcMsgSend6.dylib (973.1) <2D3B1A7D-6831-374A-8B66-40B27CB9A62D> /usr/lib/objc/libobjcMsgSend6.dylib
+       0x1c014e000 -        0x1c02b5523  com.apple.CoreSymbolication (64578.104.1) <D4EA4C18-86AA-3355-9B8E-DD7ABFAE4D8D> /System/Library/PrivateFrameworks/CoreSymbolication.framework/Versions/A/CoreSymbolication
+       0x1c02b6000 -        0x1c0335307  com.apple.securityfoundation (6.0 - 55294.0.2) <6A844A4D-126E-3183-8EE0-80DDCEA1F606> /System/Library/Frameworks/SecurityFoundation.framework/Versions/A/SecurityFoundation
+       0x1c038e000 -        0x1c0485b67  libarchive.2.dylib (182.40.6) <B8FB8B01-F0DE-35A4-A2D0-01DFD9A14932> /usr/lib/libarchive.2.dylib
+       0x1c06d1000 -        0x1c06d3f73  libquarantine.dylib (217.40.5) <2ECF6314-D521-331B-9916-2E960002EC0D> /usr/lib/system/libquarantine.dylib
+       0x1c0b02000 -        0x1c0b03043  com.apple.AggregateDictionary (1.0 - 1) <484B4633-8A25-37C4-9D80-FA5E24C06055> /System/Library/PrivateFrameworks/AggregateDictionary.framework/Versions/A/AggregateDictionary
+       0x1c0c85000 -        0x1c0cac743  com.apple.coreservices.BackgroundTaskManagement (1.0 - 104) <E97C57B3-5906-3060-94B1-48DC3DC85974> /System/Library/PrivateFrameworks/BackgroundTaskManagement.framework/Versions/A/BackgroundTaskManagement
+       0x1c0cad000 -        0x1c0cb816f  com.apple.xpc.AppServerSupport (1.0 - 3298.40.28) <5890BF53-8D39-3EF4-9E4C-7C94E642DDBA> /System/Library/PrivateFrameworks/AppServerSupport.framework/Versions/A/AppServerSupport
+       0x1c0cb9000 -        0x1c0d2415f  com.apple.audio.AudioSession (1.0 - 449.205) <CC060428-EAE4-3DBE-9EA2-98F3E0CF5113> /System/Library/PrivateFrameworks/AudioSession.framework/Versions/A/AudioSession
+       0x1c0d25000 -        0x1c0f41e0f  com.apple.MetalPerformanceShaders.MPSNeuralNetwork (1.0 - 130.1.4) <78B1C2DB-808E-3E8F-B7E7-24226650EC7F> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSNeuralNetwork.framework/Versions/A/MPSNeuralNetwork
+       0x1c1769000 -        0x1c176b943  com.apple.InternationalTextSearch (1.0 - 1) <BFA8CED7-C60C-338F-BD3E-611A4F6D4D6C> /System/Library/PrivateFrameworks/InternationalTextSearch.framework/Versions/A/InternationalTextSearch
+       0x1c2162000 -        0x1c216c837  libcopyfile.dylib (260.40.4) <6EE8B677-06A9-37C5-AC08-7767D5EF5BBE> /usr/lib/system/libcopyfile.dylib
+       0x1c2340000 -        0x1c2340f2f  libobjcMsgSend7.dylib (973.1) <AF8B3B4F-4E02-3956-9060-D971ECF3FF75> /usr/lib/objc/libobjcMsgSend7.dylib
+       0x1c3f0d000 -        0x1c3f19977  libperfcheck.dylib (46.40.2) <68A6E980-C496-303E-A186-7311E1EA6B9D> /usr/lib/libperfcheck.dylib
+       0x1c5271000 -        0x1c5282677  libswiftDistributed.dylib (6.4.2 - 6.4.2.1.9) <12ED3E54-D13A-377B-8F73-1CDE6DB02EF7> /usr/lib/swift/libswiftDistributed.dylib
+       0x1c5bf1000 -        0x1c5bf3277  libAudioStatistics.dylib (300.205) <3A78DABE-D31A-399C-8CE9-49D7AD6AA5BE> /usr/lib/libAudioStatistics.dylib
+       0x1c5bf4000 -        0x1c5c824df  com.apple.MetalPerformanceShaders.MPSImage (1.0 - 130.1.4) <AE7BE7B0-C70B-3CE0-90F6-C54125A8B108> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSImage.framework/Versions/A/MPSImage
+       0x1c5c83000 -        0x1c5ce0a97  com.apple.MessageSecurity (1.0 - 341.40.12) <21576D9F-FDC8-31C1-BA0D-8EE100B0340E> /System/Library/PrivateFrameworks/MessageSecurity.framework/Versions/A/MessageSecurity
+       0x1c5ce1000 -        0x1c5cf4887  com.apple.xpc.RemoteXPC (1.0 - 3298.40.28) <1BA51B7B-B1DC-3BD2-A812-33DC91F61ED4> /System/Library/PrivateFrameworks/RemoteXPC.framework/Versions/A/RemoteXPC
+       0x1c62b6000 -        0x1c62bcfe5  libRosetta.dylib (385) <5C834D15-B729-3F75-AFDA-30B19B63DC44> /usr/lib/libRosetta.dylib
+       0x1c6406000 -        0x1c6413d1b  com.apple.NetFS (6.0 - 4.0) <85BECA3B-9B7E-3837-A2D7-ED83775F3FF2> /System/Library/Frameworks/NetFS.framework/Versions/A/NetFS
+       0x1c642a000 -        0x1c6444157  com.apple.HID (1.0 - 1) <72694B22-372F-3D82-B48B-7D39969DAF95> /System/Library/PrivateFrameworks/HID.framework/Versions/A/HID
+       0x1c85c4000 -        0x1c85c9633  com.apple.biome.BiomeSync (1.0 - 259) <F9B1BAF7-D771-3B64-977E-C2B37E017195> /System/Library/PrivateFrameworks/BiomeSync.framework/Versions/A/BiomeSync
+       0x1c85ca000 -        0x1c85ea647  com.apple.private.SystemPolicy (1.0 - 1) <E257A732-0E78-3097-BF7E-3E6D842F641D> /System/Library/PrivateFrameworks/SystemPolicy.framework/Versions/A/SystemPolicy
+       0x1c921c000 -        0x1c924f5f7  com.apple.PoirotUDFs (1.0 - 1) <C9A1DCB5-27B8-3D96-8243-2065E8B72879> /System/Library/PrivateFrameworks/PoirotUDFs.framework/Versions/A/PoirotUDFs
+       0x1ca340000 -        0x1ca340f2f  libobjcMsgSend8.dylib (973.1) <658E3612-5716-3180-9EE8-83D96DE6E7F2> /usr/lib/objc/libobjcMsgSend8.dylib
+       0x1cb684000 -        0x1cb7374bf  libFDR.dylib (1636.40.11) <3C53BDC9-27C7-3AB9-A637-1787BC1EA4EB> /usr/lib/libFDR.dylib
+       0x1cb858000 -        0x1cb950ba7  com.apple.InstalledContentLibrary (1.0 - 1.0) <A0DDFC17-1142-3E5E-9BB4-9CA9A663E242> /System/Library/PrivateFrameworks/InstalledContentLibrary.framework/Versions/A/InstalledContentLibrary
+       0x1ce8da000 -        0x1ce8dbc67  com.apple.WatchdogClient.framework (1.0 - 334.40.4) <98F30D02-5595-39DC-A4DD-F3582DA7DFEA> /System/Library/PrivateFrameworks/WatchdogClient.framework/Versions/A/WatchdogClient
+       0x1ce948000 -        0x1ce9c2d9f  com.apple.PoirotSchematizer (1.0 - 1) <04F354D7-252A-34FB-A92F-460FB385A344> /System/Library/PrivateFrameworks/PoirotSchematizer.framework/Versions/A/PoirotSchematizer
+       0x1ce9c3000 -        0x1ce9d63c7  com.apple.accessibility.PhotosensitivityProcessing (1.0 - 1) <0F617782-E7C3-3A54-8D5C-823A5120BFA0> /System/Library/PrivateFrameworks/PhotosensitivityProcessing.framework/Versions/A/PhotosensitivityProcessing
+       0x1cf679000 -        0x1cf68117f  libGFXShared.dylib (24.0.2) <A4EA00BC-40EF-3740-A90C-9CD6BCD49736> /System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libGFXShared.dylib
+       0x1cf7e4000 -        0x1cf7f3857  com.apple.opengl (24.0.2 - 24.0.2) <DBF7BA57-873A-31FE-9755-128C0EE18D2A> /System/Library/Frameworks/OpenGL.framework/Versions/A/OpenGL
+       0x1cf817000 -        0x1cf820bc7  libGL.dylib (24.0.2) <0D8E00AC-7451-3DB8-BEB3-B31E5DF03E20> /System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libGL.dylib
+       0x1cf821000 -        0x1cf8262ef  libCoreVMClient.dylib (405) <60DCB2F5-BB7A-3241-B255-748B8675DB35> /System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libCoreVMClient.dylib
+       0x1cf827000 -        0x1cf82969f  libCVMSPluginSupport.dylib (24.0.2) <B23FE68F-3E7A-337D-A21C-776EE6F1A961> /System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libCVMSPluginSupport.dylib
+       0x1cf95a000 -        0x1cf9619fb  com.apple.IOAccelMemoryInfo (1.0 - 1) <015EA53F-CD90-33A6-9E63-29998A4B204F> /System/Library/PrivateFrameworks/IOAccelMemoryInfo.framework/Versions/A/IOAccelMemoryInfo
+       0x1cf962000 -        0x1cfa2ae27  com.apple.audio.midi.CoreMIDI (2.0 - 88) <6B69FBB6-9826-3C3B-9872-94907ADE7CC3> /System/Library/Frameworks/CoreMIDI.framework/Versions/A/CoreMIDI
+       0x1d0406000 -        0x1d04073d3  com.apple.MetalPerformanceShaders.MetalPerformanceShaders (1.0 - 130.1.4) <7FD94842-2FBA-3A08-9B75-EE546ACD6359> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/MetalPerformanceShaders
+       0x1d096c000 -        0x1d096e2fb  libgermantok.dylib (31) <1EF4248D-3893-30A1-8298-508BD0427080> /usr/lib/libgermantok.dylib
+       0x1d13a0000 -        0x1d148c0f7  com.apple.Symbolication (64578.132.1) <F73A7C69-3FE2-362E-B6DF-FDAEFDB12BF4> /System/Library/PrivateFrameworks/Symbolication.framework/Versions/A/Symbolication
+       0x1d148d000 -        0x1d154d00b  libswiftAccelerate.dylib (82) <2E0E3E31-C048-3F80-8661-07997BFCA1B1> /usr/lib/swift/libswiftAccelerate.dylib
+       0x1d1b77000 -        0x1d1b7cd0f  libpam.2.dylib (35) <85539581-5859-3541-B57A-E60C81747303> /usr/lib/libpam.2.dylib
+       0x1d1b7d000 -        0x1d1bacc2f  com.apple.security.SwiftASN1Internal (1.0 - 1) <B989D425-8E9D-3318-9BD8-4FABA2ED7571> /System/Library/PrivateFrameworks/SwiftASN1Internal.framework/Versions/A/SwiftASN1Internal
+       0x1d1bad000 -        0x1d1bb5ad3  libTLE.dylib (94) <C6D98367-24E0-321E-84BA-0E36509EC88B> /usr/lib/libTLE.dylib
+       0x1d2340000 -        0x1d2340f2f  libobjcMsgSend9.dylib (973.1) <AD31DFEA-A911-3B57-AB36-83C141C0D8BF> /usr/lib/objc/libobjcMsgSend9.dylib
+       0x1da20d000 -        0x1da29d3a7  libate.dylib (3.0.11) <6B40FA0A-C0FD-3EC8-A5DE-DE825AEF96F1> /usr/lib/libate.dylib
+       0x1da340000 -        0x1da340f2f  libobjcMsgSend10.dylib (973.1) <23386B45-C079-3D2E-BAED-B398BF97A29F> /usr/lib/objc/libobjcMsgSend10.dylib
+       0x1deda5000 -        0x1dedaeceb  com.apple.AFKUser (1) <308552B4-34C6-39CE-A9FE-8699E99C83F0> /System/Library/PrivateFrameworks/AFKUser.framework/Versions/A/AFKUser
+       0x1dedaf000 -        0x1dee2f10f  com.apple.SILManager (68.8.4 - 68.8.4) <DAC7604B-10CF-328E-9C4B-9FD8A0BBE427> /System/Library/PrivateFrameworks/SILManager.framework/Versions/A/SILManager
+       0x1dee30000 -        0x1def8d133  com.apple.ProDisplayLibrary (11.1.2 - 11.1.2) <522B08F2-2848-3177-A862-E0808EDAF000> /System/Library/PrivateFrameworks/ProDisplayLibrary.framework/Versions/A/ProDisplayLibrary
+       0x1def8e000 -        0x1defdf34f  com.apple.BackBoardHIDEventFoundation (1.0 - 1) <E58C02A6-F741-309A-93B0-6491AD89758D> /System/Library/PrivateFrameworks/BackBoardHIDEventFoundation.framework/Versions/A/BackBoardHIDEventFoundation
+       0x1defe0000 -        0x1df0056b3  libamsupport.dylib (475.40.7) <273658C0-26C0-372D-ABBD-EB29E0C9D4BA> /usr/lib/libamsupport.dylib
+       0x1df2e3000 -        0x1df2e5ab3  libswift_DarwinFoundation1.dylib (428.40.1) <53AA2D81-3447-36C2-B48D-9A92C579BD7F> /usr/lib/swift/libswift_DarwinFoundation1.dylib
+       0x1df56b000 -        0x1df5dc03b  com.apple.APFS (3288.41.1 - 3288.41.1) <FBCD3B25-D56E-367E-B101-83CA8C2D52DE> /System/Library/PrivateFrameworks/APFS.framework/Versions/A/APFS
+       0x1df630000 -        0x1df6702f7  com.apple.LightweightCodeRequirements (1.0 - 1) <634C4541-F5D2-334A-9E97-DC0EEEE58966> /System/Library/Frameworks/LightweightCodeRequirements.framework/Versions/A/LightweightCodeRequirements
+       0x1df671000 -        0x1df6776df  libswiftCompression.dylib (18) <42490112-C37E-3A8E-AF30-295917CAC69D> /usr/lib/swift/libswiftCompression.dylib
+       0x1df678000 -        0x1df6d9dd3  libmis.dylib (487.0.2) <51441FC5-F2D8-311E-B24C-555D39987FDF> /usr/lib/libmis.dylib
+       0x1df6da000 -        0x1df7ec26f  libcrypto.46.dylib (111.0.5) <F8926A2A-CB93-3178-B0CB-7FF1531ED833> /usr/lib/libcrypto.46.dylib
+       0x1df7ed000 -        0x1df7fbf53  libpartition2_dynamic.dylib (3696.40.14.0.1) <33B207F5-AAF7-337F-8EE2-5C7C30508090> /usr/lib/libpartition2_dynamic.dylib
+       0x1dfe63000 -        0x1dfe7a16b  libcoretls.dylib (189.40.2) <DF9C6175-7BEB-30EA-9771-61DC9C51EE24> /usr/lib/libcoretls.dylib
+       0x1e2340000 -        0x1e2340f2f  libobjcMsgSend11.dylib (973.1) <82969568-5718-3C22-B36A-B348DF322515> /usr/lib/objc/libobjcMsgSend11.dylib
+       0x2068f7000 -        0x2068f8deb  libswiftQuartzCore.dylib (5) <135AA1F9-C596-3F9B-A1AC-15BF2BE99279> /usr/lib/swift/libswiftQuartzCore.dylib
+       0x20711a000 -        0x207128207  libxar.1.dylib (516.40.4) <E46D4F63-8FBA-3C6B-BABA-FF9BD7952929> /usr/lib/libxar.1.dylib
+       0x2086dc000 -        0x2086ecfb3  libbsm.0.dylib (91.40.2) <A01677AB-BD20-3C62-8B0F-C805062F95BD> /usr/lib/libbsm.0.dylib
+       0x2086ed000 -        0x2086f02bb  libutil.dylib (78) <91A2A977-92D4-345D-AD81-55A0A9253378> /usr/lib/libutil.dylib
+       0x209829000 -        0x20983b8f7  com.apple.AppleDeviceQuerySupport (1.0 - 459.40.2) <66A96471-EC77-39EA-9E02-E3238565691B> /System/Library/PrivateFrameworks/AppleDeviceQuerySupport.framework/Versions/A/AppleDeviceQuerySupport
+       0x20983c000 -        0x20988c76f  com.apple.tightbeam (1.0 - 631.40.4) <7DFFDE18-2139-3C35-A46D-4C8722D1AE16> /System/Library/PrivateFrameworks/Tightbeam.framework/Versions/A/Tightbeam
+       0x20988d000 -        0x209895dc7  libswiftCoreMIDI.dylib (6) <148A1129-01BD-35F4-B9A4-DB91B84552A0> /usr/lib/swift/libswiftCoreMIDI.dylib
+       0x209896000 -        0x2098b4c13  libswiftCoreAudio.dylib (482.208) <339F9DDE-7D0A-3CB2-A582-6B6FC19DAB53> /usr/lib/swift/libswiftCoreAudio.dylib
+       0x2098b5000 -        0x2098f1bd7  com.apple.PoirotSQLite (1.0 - 1) <5DA70CCB-64B2-3B99-AA6E-E448563B33D2> /System/Library/PrivateFrameworks/PoirotSQLite.framework/Versions/A/PoirotSQLite
+       0x2098f2000 -        0x20990caff  libhvf.dylib (14) <387F7BB0-25EF-39DB-99CF-24144CF6E0FE> /usr/lib/libhvf.dylib
+       0x20a340000 -        0x20a340f2f  libobjcMsgSend12.dylib (973.1) <17C2F368-D514-3BD8-B246-BC090B818B06> /usr/lib/objc/libobjcMsgSend12.dylib
+       0x20cb3f000 -        0x20cb949df  com.apple.DictionaryServices (1.2 - 383.8) <B9391B08-6C8B-3395-8AB4-1A8982756F7C> /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/DictionaryServices.framework/Versions/A/DictionaryServices
+       0x212340000 -        0x212340f2f  libobjcMsgSend13.dylib (973.1) <C332A9C4-E29E-32B8-97D4-29A70A65D4F8> /usr/lib/objc/libobjcMsgSend13.dylib
+       0x215ed4000 -        0x215ed6857  libswiftDarwin.dylib (428.40.1) <D8ED1CC1-69DC-368C-9E7C-6B408E8403D8> /usr/lib/swift/libswiftDarwin.dylib
+       0x21a340000 -        0x21a340f2f  libobjcMsgSend14.dylib (973.1) <A497729E-0C57-35FC-B013-50AA706E031E> /usr/lib/objc/libobjcMsgSend14.dylib
+       0x21c3d2000 -        0x21c3db15f  com.apple.HIDDisplay (1.0 - 1) <53D3561C-19A3-3608-B4F5-63FC6293AE51> /System/Library/PrivateFrameworks/HIDDisplay.framework/Versions/A/HIDDisplay
+       0x21c3dc000 -        0x21c42f58f  com.apple.MetalPerformanceShaders.MPSRayIntersector (1.0 - 130.1.4) <C54743E6-A0C4-3C6D-9BC1-1D3D997F301E> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSRayIntersector.framework/Versions/A/MPSRayIntersector
+       0x21c430000 -        0x21c443a2b  libLinearAlgebra.dylib (1617.40.9) <20B11AEF-2043-3554-85D4-C9D53D8D4719> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libLinearAlgebra.dylib
+       0x21c444000 -        0x21c458be3  com.apple.private.AppleMobileFileIntegrity-fmk (1.0 - 1) <E91C0C3B-523F-348F-B54A-78F059553185> /System/Library/PrivateFrameworks/AppleMobileFileIntegrity.framework/Versions/A/AppleMobileFileIntegrity
+       0x21c459000 -        0x21c4636f7  com.apple.perfdata (1.0 - 135.40.4) <4664B4D3-AA8B-37BC-8034-3304C89FE87E> /System/Library/PrivateFrameworks/perfdata.framework/Versions/A/perfdata
+       0x21c464000 -        0x21c467ebf  com.apple.MobileSystemServices (1.0 - 1) <7E401808-689F-309D-87D9-1D42DE815BD4> /System/Library/PrivateFrameworks/MobileSystemServices.framework/Versions/A/MobileSystemServices
+       0x21c468000 -        0x21c48feef  com.apple.ASEProcessing (1.59.0 - 1.59.0) <27B73B8C-561E-3400-A625-627D6AE6C024> /System/Library/PrivateFrameworks/ASEProcessing.framework/Versions/A/ASEProcessing
+       0x21c490000 -        0x21c496273  libReverseProxyDevice.dylib (114.40.2) <C62DEBC5-C634-3489-B5D6-D2CE4B2D8603> /usr/lib/libReverseProxyDevice.dylib
+       0x21c497000 -        0x21c66a727  com.apple.MetalPerformanceShaders.MPSNDArray (1.0 - 130.1.4) <259C0498-15CA-3784-B427-8654856634C9> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSNDArray.framework/Versions/A/MPSNDArray
+       0x21c66b000 -        0x21c66fc8b  com.apple.MPSHost (1.0 - 130.1.4) <31471C62-B99C-3B48-A638-D231CC6F7A1C> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSHost.framework/Versions/A/MPSHost
+       0x21c670000 -        0x21c81e543  com.apple.gpusw.MetalTools (1.0 - 1) <4D8FCD9B-05FF-3EDB-96DB-4CBB55CA3CBC> /System/Library/PrivateFrameworks/MetalTools.framework/Versions/A/MetalTools
+       0x21c81f000 -        0x21c82cb9f  com.apple.OSLog (1.0 - 1966.40.15.0.2) <A438A31D-AB89-3BDE-9448-27DD53315E67> /System/Library/Frameworks/OSLog.framework/Versions/A/OSLog
+       0x21ce1e000 -        0x21ce2366f  com.apple.kperf (1.0 - 1) <0DA1F57C-84BF-39E6-A769-0437E619995B> /System/Library/PrivateFrameworks/kperf.framework/Versions/A/kperf
+       0x22050b000 -        0x220526c33  libresolv.9.dylib (99) <E41E6899-C9E5-36BF-923E-471C48C14127> /usr/lib/libresolv.9.dylib
+       0x222340000 -        0x222340f2f  libobjcMsgSend15.dylib (973.1) <5156CA8E-B192-394C-A66D-4B47F4219FFC> /usr/lib/objc/libobjcMsgSend15.dylib
+       0x22a232000 -        0x22a2726bf  libllvm-flatbuffers.dylib (32023.922.4) <B7BA9B09-FA94-3170-BC8B-3E01975D7655> /System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/libllvm-flatbuffers.dylib
+       0x22a340000 -        0x22a340f2f  libobjcMsgSend16.dylib (973.1) <C81F7E7F-1CD7-36DC-A83B-BCDFF4EEA863> /usr/lib/objc/libobjcMsgSend16.dylib
+       0x22f4da000 -        0x22f50d78b  libGLImage.dylib (24.0.2) <36CC1008-1528-3AD7-83C6-00DE4C8CAF35> /System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libGLImage.dylib
+       0x2313b7000 -        0x2313e1017  libxslt.1.dylib (22) <01A6452E-DA39-36D4-9BA2-15EBCA212BC4> /usr/lib/libxslt.1.dylib
+       0x232340000 -        0x232340f2f  libobjcMsgSend17.dylib (973.1) <6226B8A9-985F-3275-8A2E-D88F748F7B59> /usr/lib/objc/libobjcMsgSend17.dylib
+       0x238825000 -        0x2388353f7  com.apple.Kerberos (3.0 - 1) <E5FDB96A-A87F-341B-8A79-2AF23B56EF9B> /System/Library/Frameworks/Kerberos.framework/Versions/A/Kerberos
+       0x23a1e2000 -        0x23a1e92bb  com.apple.audio.IOKitten (300.1 - 300.1) <91318565-A98D-328D-ACA3-00E7F8A44342> /System/Library/PrivateFrameworks/IOKitten.framework/Versions/A/IOKitten
+       0x23a340000 -        0x23a340f2f  libobjcMsgSend18.dylib (973.1) <BF6781B2-12A7-3658-AC63-EC81A1879CAE> /usr/lib/objc/libobjcMsgSend18.dylib
+       0x23a9ac000 -        0x23aa55077  libSparseBLAS.dylib (196.0.1) <D3E8E9C5-320B-3DEF-859D-F9653F1EB82A> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libSparseBLAS.dylib
+       0x23ada1000 -        0x23ada8003  libiconv.2.dylib (123) <4FF0A750-C631-3959-8C50-030C5B02A61E> /usr/lib/libiconv.2.dylib
+       0x23c77e000 -        0x23c7f2d4f  com.apple.TimeSync (1.0 - 1510.9) <221BC358-FCBC-324B-A00F-0B2582331917> /System/Library/PrivateFrameworks/TimeSync.framework/Versions/A/TimeSync
+       0x23e862000 -        0x23e8c6ca7  com.apple.SearchKit (1.4.2 - 1.4.2) <D60D2695-3522-3DF9-B5C2-51DEF25558C3> /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/SearchKit.framework/Versions/A/SearchKit
+       0x242340000 -        0x242340f2f  libobjcMsgSend19.dylib (973.1) <B2368B3C-7008-357E-B973-AD4D0F30F24B> /usr/lib/objc/libobjcMsgSend19.dylib
+       0x2457e6000 -        0x2458806fb  libAppleArchive.dylib (469.40.4) <84C95D5B-7B2A-3D24-A4EE-7F3DD8FC6A38> /usr/lib/libAppleArchive.dylib
+       0x247c97000 -        0x247ce6b6f  com.apple.GSS (4.0 - 2.0) <10F0AC0E-431A-376C-9B7A-255B47CB4F8F> /System/Library/Frameworks/GSS.framework/Versions/A/GSS
+       0x247ce7000 -        0x247d17687  com.apple.MediaKit (16 - 944) <F90F6A9D-954A-3435-8F74-07720E5B2607> /System/Library/PrivateFrameworks/MediaKit.framework/Versions/A/MediaKit
+       0x24885f000 -        0x248897e73  com.apple.OTSVG (1.0 - 910) <6168C154-1723-3584-B9B6-730BE82D8E5F> /System/Library/PrivateFrameworks/OTSVG.framework/Versions/A/OTSVG
+       0x248942000 -        0x24894488f  com.apple.gpusw.GPURawCounter (35 - 35) <0D42FD83-C351-3BFC-BA8A-985A75F1C178> /System/Library/PrivateFrameworks/GPURawCounter.framework/Versions/A/GPURawCounter
+       0x248945000 -        0x24895770f  com.apple.MPSFunctions (1.0 - 130.1.4) <58C1A79F-8E53-3E8F-8F24-46A4581F5484> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSFunctions.framework/Versions/A/MPSFunctions
+       0x248958000 -        0x24898f00f  libssl.48.dylib (111.0.5) <4359960F-6B29-319A-8B2B-EE63E15B9457> /usr/lib/libssl.48.dylib
+       0x248990000 -        0x2489be1b7  com.apple.MetalPerformanceShaders.MPSMatrix (1.0 - 130.1.4) <4F63853C-8AE2-34EB-9CAA-3A7710347641> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSMatrix.framework/Versions/A/MPSMatrix
+       0x2489f2000 -        0x248aa7f77  com.apple.DiskImagesFramework (710 - 710) <17561BC8-B994-33A4-94D3-3FD32339161B> /System/Library/PrivateFrameworks/DiskImages.framework/Versions/A/DiskImages
+       0x248ab1000 -        0x248ac7c87  com.apple.GraphVisualizer (1.0 - 310) <E4D4184F-2EAC-39A7-B981-89B58BB0B7B0> /System/Library/PrivateFrameworks/GraphVisualizer.framework/Versions/A/GraphVisualizer
+       0x248ac8000 -        0x248ad9177  com.apple.MPSBenchmarkLoop (1.0 - 130.1.4) <9520C784-6D07-3FD9-A3C0-F2D339145463> /System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSBenchmarkLoop.framework/Versions/A/MPSBenchmarkLoop
+       0x24a10b000 -        0x24a10b417  com.apple.Accelerate (1.11 - Accelerate 1.11) <58C5EB95-18CD-3B3A-8482-8BFB2BCFDDBC> /System/Library/Frameworks/Accelerate.framework/Versions/A/Accelerate
+       0x24a10c000 -        0x24a110437  libQuadrature.dylib (10) <C3096057-51E7-3C4A-932D-5C24D343690C> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libQuadrature.dylib
+       0x24a111000 -        0x24a27d107  libSparse.dylib (196.0.1) <0244D260-08CA-3CF1-8054-3A1670966C91> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libSparse.dylib
+       0x24a27e000 -        0x24a2f7d07  libvMisc.dylib (1155) <03145896-A639-3106-877A-BA13B56119A0> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libvMisc.dylib
+       0x24a2f8000 -        0x24a2f886f  com.apple.Accelerate.vecLib (3.11 - vecLib 3.11) <1E7988DD-A468-3C1F-B856-0BC127E06D23> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/vecLib
+       0x24a340000 -        0x24a340f2f  libobjcMsgSend20.dylib (973.1) <FA79D27E-71FE-39C7-9379-8FA044F0E812> /usr/lib/objc/libobjcMsgSend20.dylib
+       0x250129000 -        0x250c7bd23  com.apple.AGXMetalG16G-B0 (362.5.1 - 362.5.1) <0E41E588-A394-3118-964E-0B8A06AF138B> /System/Library/Extensions/AGXMetalG16G_B0.bundle/Contents/MacOS/AGXMetalG16G_B0
+       0x252340000 -        0x252340f2f  libobjcMsgSend21.dylib (973.1) <B8FDD041-87E1-353B-871E-F960D33C8EFC> /usr/lib/objc/libobjcMsgSend21.dylib
+       0x2569ce000 -        0x257c8f92f  libLAPACK.dylib (1617.40.9) <D4E84ADB-45C1-3986-8308-306FE56A8F5E> /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libLAPACK.dylib
+       0x257cee000 -        0x257cee98f  com.apple.CoreServices (1226 - 1226) <0EAAD9C0-EB23-3206-91E0-9EF09C9B1C1E> /System/Library/Frameworks/CoreServices.framework/Versions/A/CoreServices
+       0x257f02000 -        0x257fab8b3  com.apple.DiscRecording (9.0.3 - 9030.4.5) <681B4EF6-7490-3AE2-926D-76E4CCD4A13A> /System/Library/Frameworks/DiscRecording.framework/Versions/A/DiscRecording
+       0x2588f8000 -        0x2588fdb8f  libGIF.dylib (2851.1.8) <95E70748-64E5-387F-8C09-4A9416436EDE> /System/Library/Frameworks/ImageIO.framework/Versions/A/Resources/libGIF.dylib
+       0x2588fe000 -        0x258a04737  libJP2.dylib (2851.1.8) <1DC11FE7-EDF5-36FE-951C-3FC614749A99> /System/Library/Frameworks/ImageIO.framework/Versions/A/Resources/libJP2.dylib
+       0x258a05000 -        0x258a2ff47  libJPEG.dylib (2851.1.8) <F31D63D5-FA35-3C48-B5F4-54CF06B18335> /System/Library/Frameworks/ImageIO.framework/Versions/A/Resources/libJPEG.dylib
+       0x258a30000 -        0x258a322cf  libRadiance.dylib (2851.1.8) <2E474646-8EF8-331C-B6CA-EC12A0D17D21> /System/Library/Frameworks/ImageIO.framework/Versions/A/Resources/libRadiance.dylib
+       0x258df7000 -        0x258df73f7  libHeimdalProxy.dylib (88) <C469A947-F065-314F-8CF3-F30E15696ED7> /System/Library/Frameworks/Kerberos.framework/Versions/A/Libraries/libHeimdalProxy.dylib
+       0x258df8000 -        0x258e32a4f  com.apple.LDAPFramework (2.4.28 - 194.5) <66A489FE-10C4-3655-9614-6E5164BF1B81> /System/Library/Frameworks/LDAP.framework/Versions/A/LDAP
+       0x25a03f000 -        0x25a045fc7  libCoreFSCache.dylib (405) <FE2E26CF-3130-361B-80B0-072990ED1D58> /System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libCoreFSCache.dylib
+       0x25a046000 -        0x25a07f26f  libGLU.dylib (24.0.2) <506DBBEB-F5E9-3603-831D-5D6D95E5C843> /System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libGLU.dylib
+       0x25a340000 -        0x25a340f2f  libobjcMsgSend22.dylib (973.1) <6B1DA446-7FCF-36A1-9179-D1D824DDDB90> /usr/lib/objc/libobjcMsgSend22.dylib
+       0x262340000 -        0x262340f2f  libobjcMsgSend23.dylib (973.1) <60FB2667-7C9D-3311-8D3A-CCDE42F1C951> /usr/lib/objc/libobjcMsgSend23.dylib
+       0x263912000 -        0x26391ceab  com.apple.AppleFSCompression (182.40.4 - 1.0) <BC2AD436-C368-3C40-A110-74AF9FB13BE7> /System/Library/PrivateFrameworks/AppleFSCompression.framework/Versions/A/AppleFSCompression
+       0x263e70000 -        0x263e89633  com.apple.AppleMSG (1.0 - 1) <6FD25218-F676-3395-BA24-04A3725BF5C3> /System/Library/PrivateFrameworks/AppleMSG.framework/Versions/A/AppleMSG
+       0x2640de000 -        0x26410152f  com.apple.applesauce (1.0 - 17.7) <52EA9498-6DCC-3F0F-BF77-9B43B506D1EE> /System/Library/PrivateFrameworks/AppleSauce.framework/Versions/A/AppleSauce
+       0x2641ee000 -        0x2642370cf  com.apple.AppleVAFramework (6.2.10 - 6.2.10) <C76A062A-859C-35BC-A8B2-E113C8D8BFC0> /System/Library/PrivateFrameworks/AppleVA.framework/Versions/A/AppleVA
+       0x265055000 -        0x2650a11c3  com.apple.BackBoardHIDTouchEventProcessor (1.0 - 1) <4C196C89-F1AF-3E74-BEB6-8DC1A1261E14> /System/Library/PrivateFrameworks/BackBoardHIDTouchEventProcessor.framework/Versions/A/BackBoardHIDTouchEventProcessor
+       0x26598b000 -        0x26599cf4b  com.apple.CMCaptureCore (1.0 - 764.41.11) <86E8D97E-C66D-3D10-AABE-337AB094384B> /System/Library/PrivateFrameworks/CMCaptureCore.framework/Versions/A/CMCaptureCore
+       0x2669ef000 -        0x2669ffab7  com.apple.CommonAuth (4.0 - 2.0) <7DF5DBD8-3132-3E87-8BE9-659F43084CA3> /System/Library/PrivateFrameworks/CommonAuth.framework/Versions/A/CommonAuth
+       0x266aca000 -        0x266acc067  com.apple.ConfigProfileHelper (18.0 - 1800) <C35725AC-2396-34FB-B50B-54ECA81BE0F1> /System/Library/PrivateFrameworks/ConfigProfileHelper.framework/Versions/A/ConfigProfileHelper
+       0x266b4a000 -        0x266b57707  com.apple.ConnectedMode (1.0 - 1) <C5BD4205-A714-3DD0-842B-BBC9D3758760> /System/Library/PrivateFrameworks/ConnectedMode.framework/Versions/A/ConnectedMode
+       0x26a340000 -        0x26a340f2f  libobjcMsgSend24.dylib (973.1) <19CCC5A5-0A8B-36C0-8F48-0CECB87241A7> /usr/lib/objc/libobjcMsgSend24.dylib
+       0x28a340000 -        0x28a340f2f  libobjcMsgSend25.dylib (973.1) <2A8B86D1-94AD-3956-AB1A-2B05E082FF00> /usr/lib/objc/libobjcMsgSend25.dylib
+       0x28b2f6000 -        0x28b2fab13  com.apple.DSExternalDisplay (3.1 - 380) <2BA997E1-6E2F-3F7A-B9A2-C35E864B145F> /System/Library/PrivateFrameworks/DSExternalDisplay.framework/Versions/A/DSExternalDisplay
+       0x28ccd6000 -        0x28ccd6ae3  com.apple.FeatureFlags (1.0 - 111) <88E13DD9-F0B6-3A32-8A40-CE766A51D67C> /System/Library/PrivateFrameworks/FeatureFlags.framework/Versions/A/FeatureFlags
+       0x28d572000 -        0x28d574baf  com.apple.FontServices (1.0 - 1) <143F7D4E-7BAB-3461-83A3-8586E56365DE> /System/Library/PrivateFrameworks/FontServices.framework/Versions/A/FontServices
+       0x28d575000 -        0x28d683a5f  libXTFontStaticRegistryData.dylib (353) <DB8FD870-4351-3295-9C5A-EA80ED6A4F0D> /System/Library/PrivateFrameworks/FontServices.framework/libXTFontStaticRegistryData.dylib
+       0x28db54000 -        0x28db59fb7  libGPUCompilerUtils.dylib (32023.922.4) <1C2FF3A2-DBE8-31BF-ACAB-3455216445BC> /System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/libGPUCompilerUtils.dylib
+       0x28f6b6000 -        0x28f6ba3a7  com.apple.GPUWrangler (8.1.12 - 8.1.12) <7F5A0D28-E703-3EF5-9BF9-2E6F61DE1028> /System/Library/PrivateFrameworks/GPUWrangler.framework/Versions/A/GPUWrangler
+       0x292340000 -        0x292340f2f  libobjcMsgSend26.dylib (973.1) <FC71F8AA-332D-37B3-8455-B0EE8A59CF5B> /usr/lib/objc/libobjcMsgSend26.dylib
+       0x296945000 -        0x29696356f  com.apple.IOPresentment (67 - 67) <EFD32002-0A17-3A71-A241-890CCA57C28E> /System/Library/PrivateFrameworks/IOPresentment.framework/Versions/A/IOPresentment
+       0x298a0e000 -        0x2990cb107  com.apple.MIL (3605.1 - 3605.1.1) <5CE8DCAA-CD7E-330D-BB98-7F91983CC410> /System/Library/PrivateFrameworks/MIL.framework/Versions/A/MIL
+       0x2994c0000 -        0x2994cb32b  com.apple.gpusw.MTL3On4 (1.0 - 1) <F995CC88-A998-3CBD-8D0B-253A3DC12FB1> /System/Library/PrivateFrameworks/MTL3On4.framework/Versions/A/MTL3On4
+       0x29a340000 -        0x29a340f2f  libobjcMsgSend27.dylib (973.1) <FD74E202-C0E6-3368-9609-69DA09F23711> /usr/lib/objc/libobjcMsgSend27.dylib
+       0x2a0990000 -        0x2a099a54f  com.apple.sear.NSPredicateSecurityPolicy (1.0 - 1) <DD1B063A-B729-3684-A29E-859AB58038A9> /System/Library/PrivateFrameworks/NSPredicateSecurityPolicy.framework/Versions/A/NSPredicateSecurityPolicy
+       0x2a0c11000 -        0x2a0c1ddb7  com.apple.NetAuth (6.2 - 6.2) <0BAC7B53-E408-348B-BA2C-97C93319A342> /System/Library/PrivateFrameworks/NetAuth.framework/Versions/A/NetAuth
+       0x2a2179000 -        0x2a21a45df  com.apple.OSEligibility (446.41.1) <A528B260-82B1-3309-9CC2-2789103588A8> /System/Library/PrivateFrameworks/OSEligibility.framework/Versions/A/OSEligibility
+       0x2a2340000 -        0x2a2340f2f  libobjcMsgSend28.dylib (973.1) <43791422-EA8E-34A9-B3FB-429DA1C13635> /usr/lib/objc/libobjcMsgSend28.dylib
+       0x2a3f6a000 -        0x2a3fc2357  com.apple.ParsingInternal (0.0.1 - 5027.1.6) <4B424CF3-7C6E-364E-A866-694B93790653> /System/Library/PrivateFrameworks/ParsingInternal.framework/Versions/A/ParsingInternal
+       0x2aa340000 -        0x2aa340f2f  libobjcMsgSend29.dylib (973.1) <0DEC0355-9D46-39AB-BA10-6D12BC54E809> /usr/lib/objc/libobjcMsgSend29.dylib
+       0x2af976000 -        0x2af976963  com.apple.SoftLinking (1.0 - 72) <84A5BB8E-530A-3FE3-9649-6C15F4088AD6> /System/Library/PrivateFrameworks/SoftLinking.framework/Versions/A/SoftLinking
+       0x2b2340000 -        0x2b2340f2f  libobjcMsgSend30.dylib (973.1) <135A8216-EDAA-375D-9CFE-6D060E9B76FD> /usr/lib/objc/libobjcMsgSend30.dylib
+       0x2b309d000 -        0x2b309e637  com.apple.TrustEvaluationAgent (2.0 - 40.40.1) <86B6DE2B-D4C5-350D-964D-5CFF5F9F41BB> /System/Library/PrivateFrameworks/TrustEvaluationAgent.framework/Versions/A/TrustEvaluationAgent
+       0x2ba340000 -        0x2ba340f2f  libobjcMsgSend31.dylib (973.1) <B17E30B3-B38A-3606-8B49-06D5DD6340B8> /usr/lib/objc/libobjcMsgSend31.dylib
+       0x2c2340000 -        0x2c2340f2f  libobjcMsgSend32.dylib (973.1) <F3EF7513-6B57-3613-92EB-9A6CCE530CB1> /usr/lib/objc/libobjcMsgSend32.dylib
+       0x2ca340000 -        0x2ca340f2f  libobjcMsgSend33.dylib (973.1) <1B0D5975-9F13-30A1-B356-02C655CFE91A> /usr/lib/objc/libobjcMsgSend33.dylib
+       0x2cdf98000 -        0x2cdfcc52f  libCRFSuite.dylib (55) <C229EAFB-28F7-3EDA-B5A6-62FBE0339DA3> /usr/lib/libCRFSuite.dylib
+       0x2cdfd4000 -        0x2cdfde00b  libCoreEntitlements.dylib (94) <872AD98D-29A8-3572-9B06-AAA5E248A3E1> /usr/lib/libCoreEntitlements.dylib
+       0x2ce2e4000 -        0x2ce3c3eaf  libSMC.dylib (40) <964EF198-C38F-35A7-9F8F-9DD1BB3042F9> /usr/lib/libSMC.dylib
+       0x2ce404000 -        0x2ce4058f3  libSystem.B.dylib (1359.40.3) <DEAF2098-8EDD-3E5D-A821-F63A14D6C055> /usr/lib/libSystem.B.dylib
+       0x2ce409000 -        0x2ce410ed7  libThaiTokenizer.dylib (28) <A091A4B0-4C7C-35D0-B621-F6510BC5ED68> /usr/lib/libThaiTokenizer.dylib
+       0x2ce460000 -        0x2ce4787b3  libapple_nghttp2.dylib (43) <EA82898A-344D-3911-A249-294448415087> /usr/lib/libapple_nghttp2.dylib
+       0x2cea8a000 -        0x2cea9648b  libbz2.1.0.dylib (49) <57343F36-1BF6-3100-8DEA-9137C6808219> /usr/lib/libbz2.1.0.dylib
+       0x2cea9c000 -        0x2cea9cbdf  libcharset.1.dylib (123) <23686A9F-86A4-3E76-8638-C725A789C2F7> /usr/lib/libcharset.1.dylib
+       0x2ceab4000 -        0x2ceb911bf  libcompression.dylib (212.40.2) <D169CF88-79EB-3B4A-9C3E-3504C34D72C9> /usr/lib/libcompression.dylib
+       0x2ceb92000 -        0x2ceb93547  libcoretls_cfhelpers.dylib (189.40.2) <3E335AE0-24B6-3657-BDD5-4A19C7980C0A> /usr/lib/libcoretls_cfhelpers.dylib
+       0x2ceff7000 -        0x2cf07696b  libcurl.4.dylib (168.40.2) <171876D5-4FFE-300F-AB61-AB3A2B97E21A> /usr/lib/libcurl.4.dylib
+       0x2cf0fe000 -        0x2cf118eb7  libexpat.1.dylib (49) <AAE16685-0830-3ACE-8F27-491FE1CDF99C> /usr/lib/libexpat.1.dylib
+       0x2cf127000 -        0x2cf128df7  libfakelink.dylib (5) <2A39BF2D-F4C8-3361-9FD0-3B9E29A8C49F> /usr/lib/libfakelink.dylib
+       0x2cf133000 -        0x2cf13cb63  libheimdal-asn1.dylib (725.40.6) <E97B4437-1A63-34F0-BC8B-9F2C9A2017DA> /usr/lib/libheimdal-asn1.dylib
+       0x2cf583000 -        0x2cf5a1617  liblzma.5.dylib (21) <35F7F41E-9A23-36DA-A586-047B5D9B6EF1> /usr/lib/liblzma.5.dylib
+       0x2cf5fb000 -        0x2cf65b2ff  libmecab.dylib (1160.1.5) <49F443EF-2EF2-39B0-B017-A4694FD49978> /usr/lib/libmecab.dylib
+       0x2cfb02000 -        0x2cfb1457f  libsasl2.2.dylib (219) <5EF6D491-580C-3C83-A64B-286881435ABC> /usr/lib/libsasl2.2.dylib
+       0x2cfc2e000 -        0x2cfc674fa  libswiftPrespecialized.dylib (0) <519C4639-D7C6-3462-A766-89CB67CA1A2C> /usr/lib/libswiftPrespecialized.dylib
+       0x2cfe2d000 -        0x2cfe3bb87  libz.1.dylib (105) <548B2469-4461-315F-A596-063ED214B073> /usr/lib/libz.1.dylib
+       0x2cff1b000 -        0x2cff39287  libswiftAppleArchive.dylib (469.40.4) <E816FE2E-780A-3C4B-BBB3-0C840BAF168A> /usr/lib/swift/libswiftAppleArchive.dylib
+       0x2cffb0000 -        0x2cffb08a3  libswiftIOKit.dylib (1) <5E463932-B509-3BB9-8457-FBD9508E555E> /usr/lib/swift/libswiftIOKit.dylib
+       0x2cffc2000 -        0x2cffc9f5f  libswiftMetal.dylib (383.1) <A71B6AA7-2ECA-3013-BBEE-93F0074B741B> /usr/lib/swift/libswiftMetal.dylib
+       0x2cffd0000 -        0x2cffd18e7  libswiftOSLog.dylib (10) <0EC53025-044F-33F4-BCBA-7C49566C3F6B> /usr/lib/swift/libswiftOSLog.dylib
+       0x2d017a000 -        0x2d017a669  libswift_Builtin_float.dylib (6.4.2.1.9) <4310F8AA-3ADE-338B-A529-CC91AFF61D23> /usr/lib/swift/libswift_Builtin_float.dylib
+       0x2d017b000 -        0x2d017bd2b  libswift_DarwinFoundation2.dylib (428.40.1) <0A03E87E-8201-3B67-BDC0-DE44C10146D0> /usr/lib/swift/libswift_DarwinFoundation2.dylib
+       0x2d017c000 -        0x2d017c79f  libswift_DarwinFoundation3.dylib (428.40.1) <2229879C-EBD7-3D8B-AE2B-76420EAE9E48> /usr/lib/swift/libswift_DarwinFoundation3.dylib
+       0x2d0183000 -        0x2d019a4a3  libswiftsimd.dylib (25) <586A5524-9558-3952-B199-280B30E45F03> /usr/lib/swift/libswiftsimd.dylib
+       0x2d019d000 -        0x2d01a1f1b  libcache.dylib (95) <F4C38893-98FF-369D-A029-12D5EB5F6EF3> /usr/lib/system/libcache.dylib
+       0x2d01a2000 -        0x2d01ae737  libcommonCrypto.dylib (600041.40.3) <EA957905-B0F9-37F1-A46A-709729B06F1D> /usr/lib/system/libcommonCrypto.dylib
+       0x2d01af000 -        0x2d01b28bf  libcompiler_rt.dylib (103.4) <02546E21-E652-3DCC-AD99-D9E07DC6F9D5> /usr/lib/system/libcompiler_rt.dylib
+       0x2d031c000 -        0x2d031ce27  libkeymgr.dylib (31) <03BA9BC5-4D21-368F-BF2E-18FDF0B8CB9B> /usr/lib/system/libkeymgr.dylib
+       0x2d031d000 -        0x2d0335c4f  libkxld.dylib (13432.41.4) <3953BAFB-9F09-3229-8E01-5EBB882C47B6> /usr/lib/system/libkxld.dylib
+       0x2d0337000 -        0x2d033a4f7  libmacho.dylib (27104) <7CEA0703-3291-3697-84A9-E127BF93D284> /usr/lib/system/libmacho.dylib
+       0x2d033b000 -        0x2d033d987  libremovefile.dylib (96.40.3) <C21865A5-BE38-3A53-BAC4-7077D66BCAA4> /usr/lib/system/libremovefile.dylib
+       0x2d033e000 -        0x2d034307f  libsystem_collections.dylib (1786.40.6) <CF9D77A4-F719-3A57-ADE7-3077B28642ED> /usr/lib/system/libsystem_collections.dylib
+       0x2d0344000 -        0x2d034775b  libsystem_darwindirectory.dylib (129.0.1) <12774D59-1A1E-3B7C-BCDC-5A391B39BBD8> /usr/lib/system/libsystem_darwindirectory.dylib
+       0x2d0348000 -        0x2d0352f1b  libsystem_eligibility.dylib (446.41.1) <BF729533-95A7-3A1D-A13F-B95649FA3D88> /usr/lib/system/libsystem_eligibility.dylib
+       0x2d0353000 -        0x2d0390b67  libsystem_m.dylib (3326.40.2) <CA94FD98-6F85-3A92-84CD-F7DCA12C11F7> /usr/lib/system/libsystem_m.dylib
+       0x2d0391000 -        0x2d039a42b  libsystem_sanitizers.dylib (32) <18C1008F-4D9F-3736-ABF5-02B613F44A3A> /usr/lib/system/libsystem_sanitizers.dylib
+       0x2d039b000 -        0x2d039df1f  libsystem_secinit.dylib (182.40.2) <56FFB40F-A7BF-39F7-BB0D-D1D464E026FB> /usr/lib/system/libsystem_secinit.dylib
+       0x2d039e000 -        0x2d039ea1b  libsystem_trial.dylib (511.1.2) <AD4C6ADB-6566-3F9C-8F4D-2525BAAE2156> /usr/lib/system/libsystem_trial.dylib
+       0x2d03a0000 -        0x2d03a9c87  libunwind.dylib (2200.5) <C65DAC0C-6058-3F79-ABC3-06B7D1B54CD2> /usr/lib/system/libunwind.dylib
+       0x2d2340000 -        0x2d2340f2f  libobjcMsgSend34.dylib (973.1) <12502285-E2B1-3E0A-8475-278D2BF6DEB8> /usr/lib/objc/libobjcMsgSend34.dylib
+       0x2da340000 -        0x2da340f2f  libobjcMsgSend35.dylib (973.1) <3F84A789-91E0-36FF-8D95-884F84961AFE> /usr/lib/objc/libobjcMsgSend35.dylib

@@ -1,0 +1,20 @@
+[OMP] qwen36: 4 physical-core threads instead of 10 logical CPUs; SMT can halve decode throughput on some CPUs (#718); set OMP_NUM_THREADS=<n> to override
+[gguf] /Users/creemac/.lmstudio/models/unsloth/Qwen3.6-27B-MTP-GGUF/Qwen3.6-27B-UD-IQ2_XXS.gguf: 1 file(s), 866 tensors, read in place (native ggml types, no conversion)
+== qwen36 Phase-2 engine | cache=auto/layer bits=4 ctx=8192 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248320 pieces, 247587 merges, 33 added tokens from the GGUF
+[enc] prompt tokens: 8 | generating 8 new tokens
+[gguf] qwen35 (dense): 64 layers (16 attention), hidden 5120, MLP 17408, vocab 248320, DeltaNet v/k heads 48/16
+resident weights loaded in 18.5s | RSS after load: 1.41 GB
+[qwen36] expert format on disk: GGUF native ggml types (the CUDA and Vulkan tiers hold the file's blocks)
+[mtp] Q36_MTP=1: the head stays off
+Generated (8 new tokens):
+Text : [qwen36] KV cache: float16, 0.06 GiB at 1024 positions (half of float32; Q36_KV=f32 keeps float32)
+
+TTFT: 4.102 s (time to first token)
+[qwen36 phase2] run: MTP proposed 0, verified 0, accepted 0 (0.0% of verified; 0.00 accepted/MTP verify) | verify forwards 0 (0 rows, 0.00 target rows/s), MTP verifies 0, ordinary decode forwards 7 | draft 0.000 s (0.00 proposed/s), verify 0.000 s
+[qwen36 phase2] run: MTP head 0.000 s/0 rows, feed K/V 0.000 s/0 rows
+[qwen36 phase2] run: IQ2_XXS GEMV Metal/CPU fallback by phase 0:1554/0 (phase index: decode=0 feed=1 draft=2 verify=3 other=4)
+
+PEAK RSS: 8.39 GB
+Expert cache hit rate: 0.0% (hit=0 miss=0)
+Speed: 0.98 tok/s (8.1s for 8 tokens)
