@@ -211,6 +211,9 @@ typedef struct {
     int bits;                      /* 4: experts-int4g64/; 2: experts-int2g32/, whose record holds
                                     * the u8 group scales at q_off and one f32 per row at scale_off */
     int64_t q_off, q_bytes[3];
+    int mir_n;                     /* replicas holding the sidecar, the primary counted (COLI_MODEL_MIRROR) */
+    int mir_cut[1+ST_MAX_MIR];     /* cumulative shares of 256 per replica, primary first */
+    uint64_t mir_reads[1+ST_MAX_MIR],mir_bytes[1+ST_MAX_MIR];
 } Q38Int4Experts;
 
 typedef enum {
@@ -2031,6 +2034,90 @@ static int q38_try_load_native_fp8_expert(Model *m,int layer,int expert,Slot *sl
     return 1;
 }
 
+/* COLI_MODEL_MIRROR=<dir>[;<dir>...]: copies of the snapshot on other drives. The
+ * files of each copy's <dir>/<sidecar>/ become read replicas of the sidecar's
+ * (st_mirror_add takes a file only when its size and safetensors header equal the
+ * primary's, so every record offset holds on every copy; a copy may be partial),
+ * and each record is read from the replica a hash of its (layer, expert) picks,
+ * the shares set by COLI_DISK_WEIGHTS=<primary>,<mirror>[,...] (relative read
+ * bandwidth, equal shares when unset). The same expert always comes from the same
+ * drive, and the bytes are the same on all of them, so the tokens do not move.
+ * The snapshot's own FP8 experts stay on the primary. */
+static void q38_x4_mirrors(Q38Int4Experts *x,const char *snap,const char *sub) {
+    x->mir_n=1;x->mir_cut[0]=256;
+    const char *dirs=getenv("COLI_MODEL_MIRROR");
+    if(!dirs||!*dirs)return;
+    char list[4096],path[1024];
+    snprintf(list,sizeof list,"%s",dirs);
+    for(char *p=list,*next;p;p=next){
+        next=strpbrk(p,";,");
+        if(next)*next++=0;
+        while(*p==' ')p++;
+        for(size_t n=strlen(p);n&&p[n-1]==' ';)p[--n]=0;
+        if(!*p)continue;
+        if(!strcmp(p,snap)){fprintf(stderr,"[qwen38 MIRROR] %s is the model's own directory -- ignored\n",p);continue;}
+        snprintf(path,sizeof path,"%s/%s",p,sub);
+        int files=x->S.nrep<ST_MAX_MIR?st_mirror_add(&x->S,path):-1;
+        if(files>0)fprintf(stderr,"[qwen38 MIRROR] %s: %d of %d files (replica %d)\n",path,files,x->S.nfd,x->S.nrep);
+        else fprintf(stderr,"[qwen38 MIRROR] %s: %s -- skipped\n",path,
+                     files<0?"more mirrors than the engine keeps":"no file equal to the primary's");
+    }
+    const int n=1+x->S.nrep;
+    if(n<2)return;
+    double w[1+ST_MAX_MIR],sum=0;
+    const char *spec=getenv("COLI_DISK_WEIGHTS");
+    int k=0;
+    if(spec&&*spec){
+        const char *p=spec;char *end=NULL;
+        for(;;k++){
+            double v=strtod(p,&end);
+            if(end==p||!(v>0)||v>1e6||k>=n){k=-1;break;}
+            w[k]=v;
+            while(*end==' ')end++;
+            if(*end!=','){k++;break;}
+            p=end+1;
+        }
+        if(k!=n||*end){
+            fprintf(stderr,"[qwen38 MIRROR] COLI_DISK_WEIGHTS='%s': want %d positive comma-separated weights, "
+                           "the primary's first\n",spec,n);exit(1);
+        }
+    } else for(;k<n;k++)w[k]=1;
+    for(k=0;k<n;k++)sum+=w[k];
+    double at=0;int prev=0;
+    for(k=0;k<n;k++){
+        at+=w[k];
+        int cut=k==n-1?256:(int)(256.0*at/sum+0.5);
+        if(cut<=prev)cut=prev+1;   /* every replica keeps a share */
+        if(cut>256-(n-1-k))cut=256-(n-1-k);
+        x->mir_cut[k]=prev=cut;
+    }
+    x->mir_n=n;
+    fprintf(stderr,"[qwen38 MIRROR] %d replicas of %s/, split %s:",n,sub,spec&&*spec?"COLI_DISK_WEIGHTS":"even (COLI_DISK_WEIGHTS unset)");
+    for(k=0;k<n;k++)fprintf(stderr," %s %d/256",k?"mirror":"primary",x->mir_cut[k]-(k?x->mir_cut[k-1]:0));
+    fprintf(stderr,"\n");
+}
+
+/* The replica of a sidecar record: 0 = the primary. */
+static int q38_x4_replica(Model *m,int layer,int expert) {
+    Q38Int4Experts *x=m->x4;
+    if(x->mir_n<2)return 0;
+    uint32_t h=(uint32_t)((int64_t)layer*m->c.experts+expert)*2654435761u;   /* the flat index, as V4.1 hashes it */
+    int r=0;
+    for(int hv=(int)((h>>16)&255);hv>=x->mir_cut[r];)r++;
+    return st_fd_rep(&x->S,x->fd[layer],r)>=0?r:0;   /* a partial copy leaves the file on the primary */
+}
+
+/* One sidecar record into out, from its replica. */
+static void q38_x4_read(Model *m,int layer,int expert,void *out,int64_t cap,const char *tag) {
+    Q38Int4Experts *x=m->x4;
+    int rep=q38_x4_replica(m,layer,expert);
+    st_read_range_rep(&x->S,x->fd[layer],rep,x->off[(int64_t)layer*m->c.experts+expert],x->record_bytes,out,cap,1,0,tag);
+    if(x->mir_n>1){
+        __atomic_fetch_add(&x->mir_reads[rep],1,__ATOMIC_RELAXED);
+        __atomic_fetch_add(&x->mir_bytes[rep],(uint64_t)x->record_bytes,__ATOMIC_RELAXED);
+    }
+}
+
 /* Whether a layer's routed experts come from the int4-g64 sidecar. It holds
  * the model's layers only: the MTP head's layer (index c.layers) keeps the
  * snapshot's FP8 experts with a sidecar or without one. */
@@ -2047,8 +2134,8 @@ static void q38_prefetch_experts(Model *m,int layer,const int *experts,int count
         for(int index=0;index<count;index++){
             int expert=experts[index];
             if(expert<0||expert>=m->c.experts||cache->by_expert[expert]>=0)continue;
-            posix_fadvise(m->x4->fd[layer],m->x4->off[(int64_t)layer*m->c.experts+expert],
-                          m->x4->record_bytes,POSIX_FADV_WILLNEED);
+            posix_fadvise(st_fd_rep(&m->x4->S,m->x4->fd[layer],q38_x4_replica(m,layer,expert)),
+                          m->x4->off[(int64_t)layer*m->c.experts+expert],m->x4->record_bytes,POSIX_FADV_WILLNEED);
             m->expert_prefetch_ranges++;
         }
         return;
@@ -2409,6 +2496,7 @@ static void q38_expert_int4_attach(Model *m,const char *snap) {
             x->fd[layer]=fd;x->off[(int64_t)layer*c->experts+expert]=start;
         }
     free(have);
+    q38_x4_mirrors(x,snap,int2?lb->dir:Q38_INT4_DIR);
     m->x4=x;
 }
 
@@ -2512,7 +2600,7 @@ static void q38_load_int4_record(Model *m,int layer,int expert,Slot *slot) {
     const int lr=q38_lb_r16(m);
     if(lr){   /* int2/int3-g16, vq2, int4-g64: read beside, interleave into the slot (each loader thread its buffer) */
         uint8_t *raw=q38_scratch(Q38_SCRATCH_INT4,x->record_bytes);
-        st_read_range_raw_cap(&x->S,fd,off,x->record_bytes,raw,x->record_bytes,1,"pread Qwen3.8 int4 expert");
+        q38_x4_read(m,layer,expert,raw,x->record_bytes,"pread Qwen3.8 int4 expert");
         q38_bind_int4_record(m,slot,raw);   /* the three matrices' fields, then their interleaved form */
         Q38Weight *dst[3]={&slot->gate,&slot->up,&slot->down}; uint8_t *o=(uint8_t*)slot->int4_slab;
         for(int k=0;k<3;k++){
@@ -2532,8 +2620,7 @@ static void q38_load_int4_record(Model *m,int layer,int expert,Slot *slot) {
         return;
     }
     q38_bind_int4_record(m,slot,(uint8_t*)slot->int4_slab);
-    st_read_range_raw_cap(&x->S,fd,off,x->record_bytes,slot->int4_slab,
-                          slot->int4_slab_bytes,1,"pread Qwen3.8 int4 expert");
+    q38_x4_read(m,layer,expert,slot->int4_slab,slot->int4_slab_bytes,"pread Qwen3.8 int4 expert");
 }
 
 /* GGUF mode: expert eid's three matrices, each a slice of its projection's 3D tensor
@@ -6421,6 +6508,14 @@ static void tm_report(const Model *m) {
         decode.forwards-=g_tm_prefill_snapshot.forwards;
         q38_tm_report_bank(&g_tm_prefill_snapshot,"prefill");
         q38_tm_report_bank(&decode,"decode");
+    }
+    if(m->x4&&m->x4->mir_n>1){   /* where the sidecar's records came from (COLI_MODEL_MIRROR) */
+        fprintf(stderr,"[qwen38 MIRROR] reads:");
+        for(int r=0;r<m->x4->mir_n;r++){
+            if(r)fprintf(stderr," | mirror%d",r);else fprintf(stderr," primary");
+            fprintf(stderr," %llu (%.3f GB)",(unsigned long long)m->x4->mir_reads[r],m->x4->mir_bytes[r]/1e9);
+        }
+        fprintf(stderr,"\n");
     }
     if(q38_tm_enabled())
         fprintf(stderr,"[qwen38 expert I/O] weight-ranges=%llu scale-ranges=%llu "

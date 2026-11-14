@@ -7,6 +7,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### New
 
+- **Qwen3.8's expert sidecar from several drives** (`COLI_MODEL_MIRROR`, `COLI_DISK_WEIGHTS`):
+  copies of `experts-int4g64/` (or the low-bit sidecar in use) on other drives become read
+  replicas, each record read from the drive a hash of its (layer, expert) picks, in the shares
+  `COLI_DISK_WEIGHTS` sets (equal when unset). Tokens and logits are those of one drive;
+  `make -C c qwen38-tiny-mirror-check` checks it on the int4 fixture.
 - **Qwen3.8's MXFP4 experts as a sidecar** (`tools/convert_qwen38_experts_mxfp4.py`): AMD's
   Quark MXFP4 checkpoint's routed experts, copied byte for byte into `<model>/experts-mxfp4/`
   next to the FP8 release, one 4096-aligned record per expert (2,613,248 bytes on the release,

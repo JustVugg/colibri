@@ -359,6 +359,29 @@ reference of the dequantized sidecar through every expert path with the last
 logits identical to the bit across them, and the CUDA tier declining the int4
 experts on the fake backend.
 
+### The sidecar on several drives
+
+A sidecar can be read from copies on other drives. `COLI_MODEL_MIRROR` lists
+directories that each hold a copy of the sidecar directory (`<dir>/experts-int4g64/`
+or the low-bit one in use; the FP8 shards need not be there). A file of a copy is used
+only when its size and safetensors header equal the primary's, so a partial or stale
+copy leaves those files on the primary. Each record is read from the drive a hash of
+its (layer, expert) picks, in shares set by `COLI_DISK_WEIGHTS=<primary>,<mirror>[,...]`
+(relative read bandwidth; equal shares when unset, no probe; a list that is not one
+positive weight per drive is refused). The same expert always comes from the same
+drive and every copy holds the same bytes, so tokens and logits do not move. The
+startup prints the split and the run's end the reads each drive served:
+
+```
+[qwen38 MIRROR] 2 replicas of experts-int4g64/, split COLI_DISK_WEIGHTS: primary 64/256 mirror 192/256
+[qwen38 MIRROR] reads: primary 18 (0.000 GB) | mirror1 44 (0.000 GB)
+```
+
+The snapshot's own FP8 experts, and `COLI_MAP_EXPERTS=1`'s mappings, stay on the
+primary. `make -C c qwen38-tiny-mirror-check` runs the int4 fixture with one and two
+copies (tokens and last logits equal to the run without them, every drive serving
+reads), a differing file, and bad weights.
+
 ## Routed experts as MXFP4 (AMD Quark)
 
 AMD publishes the model with its routed experts quantized to MXFP4 with Quark

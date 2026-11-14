@@ -1882,6 +1882,13 @@ qwen38-tiny-mxfp4-generate:
 	$(PYTHON) tools/make_qwen38_tiny.py --out ./qwen38_tiny_mxfp4 --mxfp4-experts --expert-gain 3
 	$(PYTHON) tests/test_qwen38_mxfp4_convert.py --model ./qwen38_tiny_mxfp4 --exact
 
+# The int4 fixture's sidecar read from COLI_MODEL_MIRROR copies in temporary directories: the
+# tokens and last logits of the run without a mirror, every replica serving records, a differing
+# file left on the primary, bad COLI_DISK_WEIGHTS refused (tests/qwen38_mirror_check.py).
+.PHONY: qwen38-tiny-mirror-check
+qwen38-tiny-mirror-check: qwen38-tiny-int4-generate qwen38$(EXE)
+	$(PYTHON) tests/qwen38_mirror_check.py --model ./qwen38_tiny_int4 --engine ./qwen38$(EXE)
+
 # Speculative decoding with the checkpoint's MTP head (Q38_MTP=1; qwen38_core.h,
 # "the MTP head"). The fixtures are the three above plus an MTP head (--mtp:
 # random head weights from their own seed under the release's mtp.* names; the
