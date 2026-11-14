@@ -7083,6 +7083,10 @@ def engine_chats(engine):
     return getattr(engine, "chats", True) is not False
 
 
+# Request-scoped frames that show the engine is still working on that request.
+_PROGRESS_FRAMES = frozenset(("ACCEPT", "DATA", "ECHO", "TOOL", "DECISION"))
+
+
 class _Pending:
     """One in-flight engine request: the queue its frames are delivered on, whether it asked
     for the per-token numeric channel, and any fault the dispatcher has recorded against it.
@@ -7097,9 +7101,12 @@ class _Pending:
     keeps holding it until the engine says the turn is over. Dropping the entry instead
     would free the admission while the engine is still generating, and the next request
     would submit into a pipe nobody is reading."""
-    __slots__ = ("events", "logprob_channel", "failed")
+    __slots__ = ("events", "logprob_channel", "failed", "progress_at", "decoding_at", "cancel_at")
 
     def __init__(self, logprob_channel=False):
+        self.progress_at = time.monotonic()
+        self.decoding_at = None   # the first DATA frame: the prompt is read, tokens follow
+        self.cancel_at = None
         self.events = queue.Queue()
         self.logprob_channel = logprob_channel
         self.failed = None
@@ -7149,6 +7156,18 @@ class Engine:
         self.supports_tok_ids = (arch == "glm")
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
+        # 0 = off: an engine streaming from disk can prefill silently for many minutes,
+        # while once decoding it sends a DATA frame every token, a second or two at worst
+        self.stall_timeout = float(child_env.get("COLI_ENGINE_STALL_TIMEOUT", "0"))
+        self.decode_stall_timeout = float(child_env.get("COLI_ENGINE_DECODE_STALL_TIMEOUT", "300"))
+        self.cancel_timeout = float(child_env.get("COLI_ENGINE_CANCEL_TIMEOUT", "30"))
+        for name, value in (("COLI_ENGINE_STALL_TIMEOUT", self.stall_timeout),
+                            ("COLI_ENGINE_DECODE_STALL_TIMEOUT", self.decode_stall_timeout)):
+            if not (math.isfinite(value) and value >= 0):
+                raise ValueError(f"{name} must be finite and not negative")
+        if not (math.isfinite(self.cancel_timeout) and self.cancel_timeout > 0):
+            raise ValueError("COLI_ENGINE_CANCEL_TIMEOUT must be finite and positive")
+        self._stall_error = None
         tune_child_env(child_env, arch)
         decision_head_env(child_env, model)
         # before the cap: the RAM plan reserves the context it is given
@@ -7255,6 +7274,45 @@ class Engine:
         request fails, so an engine whose process outlived its reader counts as gone too."""
         return not self.closed and self.dispatcher_error is None and self.process.poll() is None
 
+    def stalled_reason(self):
+        """A request with no frame for stall_timeout (decode_stall_timeout once it is
+        decoding), or no terminal frame cancel_timeout after CANCEL/STOP once it is
+        decoding. Before the first DATA frame an engine may read a CANCEL only when the
+        prompt is done, so the cancel deadline starts there. Timed here, not on stdout,
+        so a blocked pipe write counts too."""
+        with self.pending_lock:
+            if self._stall_error is not None:
+                return self._stall_error
+            now = time.monotonic()
+            for request_id, entry in self.pending.items():
+                decoding = entry.decoding_at is not None
+                if (entry.cancel_at is not None and decoding
+                        and now - max(entry.cancel_at, entry.decoding_at) >= self.cancel_timeout):
+                    self._stall_error = f"engine cancellation timed out for request {request_id}"
+                    return self._stall_error
+                limit = self.decode_stall_timeout if decoding else self.stall_timeout
+                if limit and now - entry.progress_at >= limit:
+                    self._stall_error = (f"engine sent nothing for request {request_id} "
+                                         f"in {limit:g} s while "
+                                         f"{'decoding' if decoding else 'reading the prompt'}")
+                    return self._stall_error
+        return None
+
+    def abort_stalled(self, reason):
+        """Do not admit work on a replacement until the old process is reaped."""
+        with self.pending_lock:
+            self.closed = True
+        if self.process.poll() is None:
+            try:
+                self.process.kill()
+                self.process.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                return False
+        if self.process.poll() is None:
+            return False
+        self._fail_pending(RuntimeError(reason))
+        return True
+
     @staticmethod
     def _stats(fields):
         if len(fields) < 5 or fields[0] != "STAT":
@@ -7291,6 +7349,11 @@ class Engine:
         silent connection close instead of the 500 engine_error the failure
         actually is. _write_all's own RuntimeError is already the named
         error this raises for an OSError, so it is re-raised as-is."""
+        if frame in ("CANCEL", "STOP"):
+            with self.pending_lock:
+                entry = self.pending.get(request_id)
+                if entry is not None and entry.cancel_at is None:
+                    entry.cancel_at = time.monotonic()
         try:
             with self.write_lock:
                 _write_all(self.process.stdin, data, frame)
@@ -7365,6 +7428,14 @@ class Engine:
         if entry.failed is None:
             entry.failed = error
 
+    def _progressed(self, request_id, decoding):
+        with self.pending_lock:
+            entry = self.pending.get(request_id)
+            if entry is not None:
+                entry.progress_at = time.monotonic()
+                if decoding and entry.decoding_at is None:
+                    entry.decoding_at = entry.progress_at
+
     def _dispatch_stdout(self):
         try:
             while True:
@@ -7375,6 +7446,8 @@ class Engine:
                 if not fields:
                     continue
                 kind = fields[0]
+                if kind in _PROGRESS_FRAMES and len(fields) >= 2:
+                    self._progressed(fields[1], kind == "DATA")
                 if kind == "DATA" and len(fields) >= 3:
                     # 3 fields: the legacy frame. More: the U7a per-token
                     # numeric channel ("DATA <id> <n> <lp> <k> [tid tlp]*k"),
@@ -10563,9 +10636,15 @@ def keep_engine(server, start, stopping, watch=ENGINE_WATCH_S, delays=ENGINE_RES
     is set; serve() runs it on its own thread."""
     while not stopping.wait(watch):
         dead = server.engine
-        if engine_alive(dead):
+        stalled = getattr(dead, "stalled_reason", lambda: None)()
+        if not stalled and engine_alive(dead):
             continue
         server.scheduler.pause()
+        if stalled:
+            print(f"[gateway] {stalled}; retiring the engine", file=sys.stderr)
+            if not dead.abort_stalled(stalled):
+                continue  # retry reaping; never load a second engine over a live one
+
         if stopping.wait(grace):
             return
         cause = (getattr(dead, "dispatcher_error", None) or getattr(dead, "dead", None)
