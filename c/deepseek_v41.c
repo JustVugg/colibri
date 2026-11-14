@@ -5109,9 +5109,12 @@ static void model_reset_rows(Model *m, int n) {
      * the pointer, not a row count, so a stale buffer would still be read (a reader that ran
      * before this conversation's source layer refreshed it -- unreachable today, because the
      * source runs before its consumers in every forward, and kept that way by inspection
-     * rather than by a gate). Freeing is also the honest accounting: this is the one state a
-     * reset drops that scales with the prompt (2 GiB at 262144 rows), and the rows the state
-     * keeps apart (park, a short request) were already saved by v41_park before this runs. */
+     * rather than by a gate). Freeing is also the honest accounting: this and the shared
+     * list are the state a reset drops that scales with the prompt (2 GiB of blocks at
+     * 262144 rows), the blocks being the half whose next publisher is a whole forward away
+     * -- the shared list's buffer keeps its older habit of waiting for its next publisher
+     * to resize it -- and the rows the state keeps apart (park, a short request) were
+     * already saved by v41_park before this runs. */
     free(m->candidates);
     m->candidates = NULL;
     m->candidate_topk = m->candidate_width = m->candidate_rows = 0;

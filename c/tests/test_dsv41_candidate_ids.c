@@ -142,8 +142,8 @@ static int truncated_row(void) {
     candidate_keep_row(ids, slots, block, width, back);
     for (int j = 0; j < 6; j++) CHECK(back[j] == 1);   /* blocks 0..2 repainted */
     for (int j = 6; j < width; j++) CHECK(back[j] == 0);   /* blocks 3..5 dropped, visibly */
-    /* and the drop is visible to the padding-sensitive check too: the kept prefix is not the
-     * whole row, so a stale slot past `kept` (there is none: kept == slots) cannot hide it */
+    /* and the truncation cannot hide, unlike a stale padding slot: the kept prefix repaints
+     * six of the twelve positions, so any other fallback choice shows up as another row */
     return 0;
 }
 
