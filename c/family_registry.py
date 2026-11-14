@@ -907,9 +907,14 @@ def _host_kv_packed(head_dim, index_hd):
     """The packed cache engaged on the host (the engine's v41_host_kvq, mirrored):
     COLI_VK_KV_FP32 unset/0 -- the default, which packs the host's KV state exactly when
     it packs the device mirrors -- AND the geometry the formats are defined at. `1`
-    (or true/false's kin) is the exact fp32 opt-out: the fp32 layout, priced fp32."""
+    (or true's kin) is the exact fp32 opt-out: the fp32 layout, priced fp32. The
+    parse is the C parsers' own, character for character (v41_host_kvq and v41c_kvq_on
+    read the same string): any value whose FIRST character is 0 is packed -- "00" and
+    "0x1" too -- and only the exact spellings false/off/no are names, so the planner and
+    the engine cannot sit on opposite sides of one flag value."""
     flag = os.environ.get("COLI_VK_KV_FP32")
-    if flag and flag not in ("0", "false", "off", "no"):
+    fp32 = bool(flag) and flag[0] != "0" and flag not in ("false", "off", "no")
+    if fp32:
         return False
     return head_dim == 512 and index_hd == 128
 
@@ -919,6 +924,16 @@ def _host_kv_packed(head_dim, index_hd):
 _KVQ_WIN_BYTES = 528
 _KVQ_CKV_BYTES = 288
 _KVQ_IKEY_BYTES = 68
+# The index-key mirror's block (c/dsv41_kvq.h: KVQ_IKEY_BLOCK): whole rows of data then
+# whole rows of scales, so the mirror allocates whole blocks whatever the cap.
+_KVQ_IKEY_BLOCK = 32
+
+
+def _kvq_ikey_mirror_bytes(cap):
+    """kvq_ikey_mirror_bytes (c/dsv41_kvq.h), the index-key mirror's allocation: whole
+    KVQ_IKEY_BLOCK rows, a partial last block's scales still at its block's own mark --
+    68 B a row on average, the buffer rounded up to the block."""
+    return -(-cap // _KVQ_IKEY_BLOCK) * _KVQ_IKEY_BLOCK * _KVQ_IKEY_BYTES
 
 
 def _dsv41_geometry(config, context, _model_dir):
@@ -1018,7 +1033,16 @@ def _dsv41_geometry(config, context, _model_dir):
         if not isinstance(ratio, int) or isinstance(ratio, bool) or ratio < 1:
             raise ValueError("deepseek_v41: a kv source layer must compress")
         compressed = (context + ratio - 1) // ratio
-        state += compressed * ((_KVQ_CKV_BYTES + _KVQ_IKEY_BYTES) if kvq_host else (head_dim + index_hd) * 4)
+        # the index-key mirror allocates whole 32-row blocks (kvq_ikey_mirror_bytes,
+        # c/dsv41_kvq.h: a partial last block's scales sit at its block's own mark, so
+        # cap * 68 alone would cut them off), so its packed term rounds the rows up to
+        # the block -- a no-op wherever the rows are already block multiples, every
+        # power-of-two context among them. The compressed rows stay linear: the engine
+        # itself prices them slots * 288 (v41_row_ckv at model_load).
+        if kvq_host:
+            state += compressed * _KVQ_CKV_BYTES + _kvq_ikey_mirror_bytes(compressed)
+        else:
+            state += compressed * (head_dim + index_hd) * 4
 
     # Price the workspace at the CONTEXT, with the engine's own per-row closed form.
     # A V4.1 prompt is prefilled in one forward -- deepseek_v41.c's forward_with_image is

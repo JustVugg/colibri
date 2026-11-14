@@ -319,6 +319,79 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertIn("prompt workspace", err.getvalue())
         self.assertIn("CTX=262144", err.getvalue())
 
+    def test_the_packed_default_buys_the_ladders_expert_slots(self):
+        """#2712's headline ladder -- 0/+1/+2 expert slots at 64K/128K/256K -- in-tree.
+
+        The PR measured the packed default against COLI_VK_KV_FP32=1 only through the
+        serve smoke's "[v41] RAM plan" line. The ladder is floor arithmetic: a freed
+        budget buys the WHOLE cache's cache_bytes // per_cap, not the freed bytes' own
+        quotient, so what the 5,510 B/position the packed host frees (and the fixed
+        term's 8,730,880 B) buys depends on where it falls inside the last slot. The
+        synthetic checkpoint here pins it: a released-geometry config (so the freed
+        bytes are the PR's own: 2.5 compressed rows a position, 6,400 against 890 B)
+        behind one expert of exactly the ladder's 771.14 MiB per-capacity, and a RAM
+        budget whose remainder after the fp32 side's two whole slots at 256K straddles
+        the slot boundaries the way the measured box's did: 352.6 MiB freed buys nothing
+        at 64K, 697.1 MiB one slot at 128K, 1,385.9 MiB two at 256K.
+        """
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        model = Path(other.name)
+        ratios = [0] * 43
+        for layer, ratio in ((2, 2), (8, 2), (14, 2), (20, 1)):
+            ratios[layer] = ratio
+        (model / "config.json").write_text(json.dumps({
+            "model_type": "deepseek_v41", "num_hidden_layers": 40,
+            "n_routed_experts": 128, "hidden_size": 5120, "head_dim": 512,
+            "window_size": 128, "index_head_dim": 128, "hc_mult": 4,
+            "num_attention_heads": 64, "q_lora_rank": 1280, "index_topk": 512,
+            "compress_ratios": ratios, "kv_source_layer_ids": [2, 8, 14, 20],
+            "num_nextn_predict_layers": 3, "dspark_block_size": 5,
+            "dspark_target_layer_ids": [37, 38, 39],
+        }))
+        per_cap = int(771.14 * 1024 * 1024)   # one expert, one layer: per_cap IS the ladder's slot
+        write_shard(model / "model.safetensors", [
+            ("layers.0.ffn.experts.0.w1.weight", per_cap)])
+
+        def plan(context, fp32, ram_bytes):
+            env = dict(os.environ)
+            env.pop("COLI_VK_KV_FP32", None)
+            if fp32:
+                env["COLI_VK_KV_FP32"] = "1"
+            old = os.environ
+            try:
+                # the flag is family_registry's own os.environ read, the rest of the plan
+                # hermetic under env={}
+                os.environ = env
+                return build_plan(model, ram_gb=ram_bytes / GB, context=context, env={},
+                                  available_memory=256 * GB, available_disk=100 * GB,
+                                  gpus=[], physical_cpus=8, cpu_sockets=1)
+            finally:
+                os.environ = old
+
+        # the budget from the fp32 side's own terms at 256K: the runtime reservation
+        # (resource_plan.py's runtime_bytes: 3.7 GB and 64 of the largest expert beside
+        # the KV state and the prompt workspace), then two whole slots and a remainder
+        # that puts the freed bytes inside 256K's last fp32 slot and across one boundary
+        # at 128K and two at 256K
+        ctx = 262144
+        runtime = int(1.2 * GB + 2.5 * GB + 64 * per_cap
+                      + (6400 * ctx + 11763712) + (ctx * 416368 + 5120 * 4))
+        ram_bytes = runtime + 2 * per_cap + 300000000
+        for ctx, ladder in ((65536, 0), (131072, 1), (262144, 2)):
+            with self.subTest(context=ctx):
+                fp32 = plan(ctx, True, ram_bytes)
+                packed = plan(ctx, False, ram_bytes)
+                self.assertFalse(
+                    [w for w in fp32["warnings"] if "cannot hold one expert slot" in w],
+                    "the fp32 side must stay feasible for the ladder to mean anything")
+                self.assertEqual(
+                    packed["tiers"]["ram"]["cache_slots_per_layer"]
+                    - fp32["tiers"]["ram"]["cache_slots_per_layer"], ladder,
+                    "the packed default's freed bytes buy the ladder's slots")
+        self.assertEqual(plan(262144, True, ram_bytes)["tiers"]["ram"]["cache_slots_per_layer"], 2)
+        self.assertEqual(plan(262144, False, ram_bytes)["tiers"]["ram"]["cache_slots_per_layer"], 4)
+
     def test_sibling_plan_advises_no_colibri_knob(self):
         other = tempfile.TemporaryDirectory()
         self.addCleanup(other.cleanup)

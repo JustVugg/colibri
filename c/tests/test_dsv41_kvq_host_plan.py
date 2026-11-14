@@ -13,6 +13,7 @@ context.
 """
 import importlib.util
 import os
+import re
 import unittest
 from pathlib import Path
 
@@ -199,6 +200,22 @@ class Dsv41KvqHostPlanTest(unittest.TestCase):
         both = _geometry(16384, False, n_heads=32, num_attention_heads=64)
         self.assertEqual(both.workspace_bytes, 16384 * (104092 - 32 * 512) * 4 + 5120 * 4,
                          "n_heads wins, as it does in the engine")
+
+    def test_the_row_widths_are_the_codecs_own_macros(self):
+        # The row widths are one number written twice -- the codec's #defines (the widths
+        # the engine's arrays really hold a row at) and the planner's literals (the bytes
+        # the re-price sums). Parse the header and hold them equal, so a codec that moves
+        # a width cannot leave the Python price behind it (the file-reading idiom is
+        # tests/test_cuchain_host_strides.py's).
+        header = (_HERE.parent / "dsv41_kvq.h").read_text()
+        for macro, literal in (("KVQ_WIN_BYTES", fr._KVQ_WIN_BYTES),
+                               ("KVQ_CKV_BYTES", fr._KVQ_CKV_BYTES),
+                               ("KVQ_IKEY_BYTES", fr._KVQ_IKEY_BYTES),
+                               ("KVQ_IKEY_BLOCK", fr._KVQ_IKEY_BLOCK)):
+            found = re.search(rf"^#define {macro}\s+(\d+)", header, re.MULTILINE)
+            self.assertIsNotNone(found, f"{macro} is not #defined in c/dsv41_kvq.h")
+            self.assertEqual(int(found.group(1)), literal,
+                             f"{macro}: the codec's width and the planner's literal parted")
 
     def test_the_geometry_guard_keeps_the_fp32_price(self):
         # the formats are defined at head_dim 512 / index_head_dim 128: at any other
