@@ -7,6 +7,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### New
 
+- **Qwen3.8's expert sidecar from several drives** (`COLI_MODEL_MIRROR`, `COLI_DISK_WEIGHTS`):
+  copies of `experts-int4g64/` (or the low-bit sidecar in use) on other drives become read
+  replicas, each record read from the drive a hash of its (layer, expert) picks, in the shares
+  `COLI_DISK_WEIGHTS` sets (equal when unset). Tokens and logits are those of one drive;
+  `make -C c qwen38-tiny-mirror-check` checks it on the int4 fixture.
+- **Qwen3.8's MXFP4 experts as a sidecar** (`tools/convert_qwen38_experts_mxfp4.py`): AMD's
+  Quark MXFP4 checkpoint's routed experts, copied byte for byte into `<model>/experts-mxfp4/`
+  next to the FP8 release, one 4096-aligned record per expert (2,613,248 bytes on the release,
+  53% of the FP8 expert). Resumable; dtypes, shapes and the E8M0 NaN are checked, and sampled
+  experts are compared with the FP8 release's so a nibble or scale mix-up is refused.
+  `make -C c qwen38-tiny-mxfp4-generate` builds a tiny fixture with MXFP4 experts
+  (`tools/make_qwen38_tiny.py --mxfp4-experts`) whose FP8 shards hold the same values exactly.
 - **Kimi K3.1 Pro** (`coli pull kimi-k3.1-pro`): the checkpoint as it ships, on the Kimi K3
   engine. K3.1 is K3's weights plus DeepSeek Sparse Attention on its 24 gated MLA layers: a
   token whose context passes 2048 positions attends to the 2048 its indexer picks, and up to
