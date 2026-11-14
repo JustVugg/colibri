@@ -234,6 +234,31 @@ The current ARM fused-row path explicitly accelerates IQ2_XXS and IQ3_XXS. Q4_K 
 
 **Acceptance:** proceed with C8 or related Metal work only if the dense workload has a repeatable end-to-end gain. A kernel-level win without request-latency improvement is insufficient.
 
+### C18 — ARM expert-matmul kernel profile (the fused IQ2/IQ3 grid dot)
+
+**Priority:** P1 · **Status:** Phase 1 microbenchmark complete (2026-11-14) — decode-once rewrite identified as the lever, bit-exact; engine change not yet made
+
+**Goal:** Profile the ARM fused `gq_dot_arm_iq2_xxs` / `gq_dot_arm_iq3_xxs` inner loop — measured in C14 phase 0 as 92% of a 12K prefill's MoE time at only ~77–93 GFLOPS over 6 threads — and decide whether a kernel rewrite is worth its correctness story.
+
+**Where it runs:** on Apple silicon, the CPU-GGUF expert prefill path (`moe_gq_run` → `gq_matmul2_act`/`gq_matmul` → `gq_matmul_act`) falls through to the final dispatch (`schedule(static)` over output rows → `gq_row_all` → fused grid dot): the x86-only `GQ_R16_ON`/tile16/f8 unpack-once kernels ("unpack 16 file rows once") do not compile here, so **the ARM path re-decodes each weight row once per activation row** (`for s { for blk { grid-decode; dot } }` — `GQ_DOT_GRID_ARM`, ggml_quants.h ~1876). Per sub-block of 32 elements the decode costs ~4 grid-table loads + 4 sign-table loads + 4 lane multiplies — comparable instruction count to the dot itself.
+
+**Phase 1 microbenchmark (`researchLogs/logs/colibri-c12-workloads/c16_kernel_bench.c`, results in-session; shapes = the model's: gate/up IQ2_XXS I=2048 O=512, down IQ3_XXS I=512 O=2048; S sweeps C14's measured per-expert row counts):**
+
+- Cells: `matmul` = the engine's exact entry point (`gq_matmul`, OMP per env); `rowall` = per-row dispatch without quantize (single-thread); `decode` = the kernel's weight work with the dot removed; `pre_dot` = the kernel's exact float steps with decode hoisted out of the row loop (bit-exactness verified: `precheck_maxdiff = 0.0` against `gq_row_all`); `pre_dot_omp` = the same under the engine's dispatch shape.
+- **Per-thread rates are flat in S** (1 → 455 rows): the fused kernel runs **36 GFLOPS/thread (gate/up IQ2_XXS)** and **24 (down IQ3_XXS)** — decode is 40% / 27% of kernel time and is paid per activation row.
+- **The decode-once variant is bit-identical and much faster:** per-thread 52 / 76–79 GFLOPS → 1.44× (IQ2) and 3.2× (IQ3) headroom per thread. For IQ3 the win is mostly that the interleaved decode stalls the dot pipeline; a clean `vdotq` loop on pre-decoded int8 runs at ~78 GFLOPS/thread vs the fused kernel's 24.
+- **The fused kernel has a ~115 GFLOPS aggregate cap regardless of thread count** (4/5/6 threads all land at 113–116; 2 threads scale 2×): the gather-heavy decode saturates a shared resource (load ports / L2-SLC), not the cores. The decode-once variant blows past it: **208 GFLOPS (gate/up) and 273 (down) aggregate at 6 threads** under the engine's dispatch shape.
+- **Net verdict: a decode-once ARM kernel is worth ~2.2× on expert-matmul aggregate** (flops-weighted mix of the two shapes: ~102 → ~226 GFLOPS), with the float steps unchanged (the microbenchmark's hoisted loop reproduces the fused kernel's bits exactly — same `p·scale` FMA order).
+- Quantization (`gq_act_set`) is negligible (≤2% even at S=455); the OMP region overhead per expert is small.
+- **Projected end-to-end (arithmetic on C14's measured shares, not yet an engine A/B):** matmul is 92% of MoE (322.6 s of 349.7 s at 12K). At 2.2×, matmul → ~147 s, MoE → ~174 s, 12K prefill ~692 → ~517 s (**≈ −25% TTFT at 12K**); MoE ms/token at 1K similarly ~24 → ~12, 1K prefill ~33 → ~21 s. Attention and deltanet unchanged.
+- **Engine-vs-bench gap noted:** the engine's in-situ matmul rate (~93 GFLOPS aggregate at 1K, 77–93 at 12K) is slightly below the bench's fused-kernel rate (~102–116) — expert variety (each expert's weights cold in cache), X gathers, silu, out-accumulation and per-expert OMP churn explain the remainder. The 2.2× headroom claim rests on the *paired* bench cells (same data, same shape, only decode placement differs), not on the absolute levels.
+
+**Phase 2 (proposed, next): implement decode-once in-tree** — an ARM tile/row path for the grid types that decodes each weight row once into an int8 + per-32-scale scratch (per row: 2,048 B for gate/up, 512 B for down — L1-resident), then runs the clean dot loop over all activation rows; keep the same float op order (bit-exactness is achievable, as the microbenchmark shows). Gates before adoption: the 16-test prefix-serve contract + full python suite with the path forced on, then the C15-style real-model A/B (interleaved, `COLI_PROMPT_CACHE=0`, all output shas must match) with the ≥20% `prefill_moe_s` reduction rule and decode no-regression. Watch: scratch allocation per OMP thread (reuse the per-thread scratch pattern the tile16 block uses), and the S==1 decode path must keep the current fused kernel (it is already decode-per-row optimal).
+
+**Deliverables:** per-component kernel rates (done); in-tree decode-once kernel + fixture/real-model A/B verdicts; updated C12/C13/C14 baseline shares after adoption.
+
+**Acceptance:** adopt only on a measured ≥20% `prefill_moe_s` reduction at 4K/12K with sha-identical outputs and no decode regression; otherwise record as a negative result with the bench as evidence.
+
 ## 5. Cross-phase test protocol
 
 Every report should include:
