@@ -3761,19 +3761,28 @@ def _stop_proc_table(port):
     try:
         pids=[int(d) for d in os.listdir("/proc") if d.isdigit()]
     except OSError:
-        pids=None
-    if pids is not None:
-        table=[]
-        for pid in pids:
-            try:
-                with open(f"/proc/{pid}/cmdline","rb") as f: cmd=f.read()
-                with open(f"/proc/{pid}/comm") as f: comm=f.read().strip()
-            except (OSError,PermissionError): continue
-            table.append((pid,cmd,comm))
-        return table
+        pids=[]
+    table=[]
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/cmdline","rb") as f: cmd=f.read()
+            with open(f"/proc/{pid}/comm") as f: comm=f.read().strip()
+        except (OSError,PermissionError): continue
+        table.append((pid,cmd,comm))
+    # A Linux /proc always lists this process at least. An empty table is no /proc
+    # (macOS), an unmounted one (FreeBSD has the directory, empty, unless procfs is
+    # mounted) or one without `comm` (FreeBSD's own procfs): `ps` then. -ww, or ps
+    # cuts each line at the terminal's width when any of its descriptors is a tty.
+    # One -o per column: FreeBSD's ps takes everything after a `=` as that column's
+    # header, so `pid=,comm=,command=` there is the pid alone.
+    if table: return table
     try:
-        out=subprocess.run(["ps","-Ao","pid=,comm=,command="],capture_output=True,text=True,
-                           timeout=10).stdout
+        # ucomm, not comm: macOS's comm is the executable's whole path cut at 16
+        # characters ("/Users/risner/tm" for an engine in a home folder), which named no
+        # engine, so one whose launcher was gone was never found. ucomm is the name alone
+        # on macOS and the BSDs, and Linux's ps takes it as comm.
+        out=subprocess.run(["ps","-Aww","-o","pid=","-o","ucomm=","-o","command="],
+                           capture_output=True,text=True,timeout=10).stdout
     except (OSError,subprocess.SubprocessError):
         return []
     table=[]
