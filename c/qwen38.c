@@ -4232,8 +4232,7 @@ static int q38_vk_read_direct(Model *m,int layer,int e,uint8_t *buf,int64_t cap,
     if(q38_layer_int4(m,layer)){
         Q38Int4Experts *x=m->x4;
         if(x->record_bytes>cap)return 0;
-        st_read_range_raw_cap(&x->S,x->fd[layer],x->off[(int64_t)layer*c->experts+e],x->record_bytes,buf,cap,1,
-                              "pread Qwen3.8 int4 expert (Vulkan tier)");
+        q38_x4_read(m,layer,e,buf,cap,"pread Qwen3.8 int4 expert (Vulkan tier)");
         const float *sc=(const float*)(buf+x->scale_off);
         *src=(VktExpertSrc){buf,buf+x->code_bytes[0],buf+x->code_bytes[0]+x->code_bytes[1],
                             sc,sc+x->scale_count[0],sc+x->scale_count[0]+x->scale_count[1]};
@@ -4370,8 +4369,9 @@ static void q38_vk_tier_start(Model *m,int cap){
     /* a GGUF's types by layer, for the tier when they differ */
     VktFmt *lgu=g_q38_gguf?(VktFmt*)malloc((size_t)c->layers*sizeof(VktFmt)):NULL,
            *ldn=g_q38_gguf?(VktFmt*)malloc((size_t)c->layers*sizeof(VktFmt)):NULL;
-    if(m->x4&&m->x4->lb&&m->x4->lb->vq==2){
-        fprintf(stderr,"[VK] tier qwen38: the vq1 experts have no device form yet; they stay on the CPU\n");
+    if(m->x4&&m->x4->lb&&(m->x4->lb->vq==2||m->x4->lb->mx)){
+        fprintf(stderr,"[VK] tier qwen38: the %s experts have no device form yet; they stay on the CPU\n",
+                m->x4->lb->vq==2?"vq1":m->x4->lb->name);
         free(lgu);free(ldn);return;
     }
     if(m->x4&&m->x4->lb&&m->x4->lb->vq&&coli_vk_set_vq2_books(&m->x4->vqb->a[0][0],&m->x4->vqb->b[0][0])){
