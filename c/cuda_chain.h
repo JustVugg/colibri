@@ -266,6 +266,16 @@ typedef struct { int S, pos_base, IH, ID, topk, force, q_off, q_row, w_off, w_ro
  * vkc_situ with the same fields in the same order (vk_chain.h has their contract; the mix's dot
  * and squares in double, as kimi_k3.c's res_mix). nb <= 15, y apart from x and blk. */
 typedef struct { int S, D, nb, x_off, x_row, b_off, b_row, w_off, y_off, y_row; float eps; } CcAres;
+/* Inkling's and Inkling-2's ops (cuda_inkc.cuh), the Vulkan chain's vkc_sconv, vkc_relattn and
+ * vkc_ink2_* with the same fields in the same order (vk_chain.h has their contracts) */
+typedef struct { int mode, S, C, CK, x_off, x_row, w_off, ring_off, n; float fc; } CcSconv;
+typedef struct { int S, H, KVH, hd, pos_base, cap, window, ext, d_rel;
+                 int q_off, q_row, o_off, o_row, k_off, v_off, ks_off, vs_off, kv_row;
+                 int r_off, r_row, relp_off, tau_off; float scale;
+                 int has_sink, sink_off; } CcRelAttn;
+typedef struct { int S, D, nb, x_off, x_row, b_off, b_row, w_off, y_off, y_row; float eps, scale; } CcInk2Mix;
+typedef struct { int nseg, n, per_row, x_off, x_row, has_w, w_off; float thr; } CcInk2Clip;
+typedef struct { int S, C, K, hd, x_off, x_row, d_off, d_row, st_off, ring_off; float fc; } CcInk2Dconv;
 typedef struct { int n, g_off, u_off, y_off; float b1, b2; } CcSitu;
 /* DFlash2's two-tap dynamic depthwise convolution (cuda_dflash.cuh): y[r][c] = k0 x[r][c] + k1 x[r-1][c] over
  * blocks of B rows (x[r-1] 0 at a block's first row), k_t = prm[b_off + t C + c] plus (flags 2: times 1 plus)
@@ -458,6 +468,12 @@ typedef struct ColiCudaChainOps {
      * without the host's word; else it waits for the word as wait_host does */
     int  (*wait_host_if)(CcBuf *flag, size_t word, unsigned v, CcBuf *tab, size_t t_off, CcBuf *ids, size_t i_off,
                          int nk, int E, CcBuf *hy, size_t hn);
+    /* Inkling's and Inkling-2's (cuda_inkc.cuh) */
+    int  (*sconv)(CcBuf *x, CcBuf *w, CcBuf *ring, const CcSconv *p);
+    int  (*relattn)(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *kvs, CcBuf *r, CcBuf *relp, CcBuf *tau, const CcRelAttn *p);
+    int  (*ink2_mix)(CcBuf *x, CcBuf *blk, CcBuf *prm, CcBuf *y, const CcInk2Mix *p);
+    int  (*ink2_clip)(CcBuf *x, CcBuf *prm, const CcInk2Clip *p);
+    int  (*ink2_dconv)(CcBuf *x, CcBuf *dyn, CcBuf *prm, CcBuf *ring, const CcInk2Dconv *p);
 } ColiCudaChainOps;
 /* the table's size without the optional ops: a backend at least this big has the chain */
 #define CC_OPS_BASE_SIZE (offsetof(ColiCudaChainOps, route))
@@ -632,6 +648,23 @@ static inline int cc_ares_mix(CcBuf *x, CcBuf *blk, CcBuf *prm, CcBuf *y, const 
     return cc_k3_ready() ? cc_ops()->ares_mix(x, blk, prm, y, p) : 0;
 }
 static inline int cc_situ(CcBuf *g, CcBuf *u, CcBuf *y, const CcSitu *p) { return cc_k3_ready() ? cc_ops()->situ(g, u, y, p) : 0; }
+/* Inkling's and Inkling-2's ops: 0 from a backend that predates them */
+static inline int cc_ink_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, ink2_dconv) + sizeof t->ink2_dconv && t->sconv && t->relattn &&
+           t->ink2_mix && t->ink2_clip && t->ink2_dconv;
+}
+static inline int cc_sconv(CcBuf *x, CcBuf *w, CcBuf *ring, const CcSconv *p) { return cc_ink_ready() ? cc_ops()->sconv(x, w, ring, p) : 0; }
+static inline int cc_relattn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *kvs, CcBuf *r, CcBuf *relp, CcBuf *tau, const CcRelAttn *p) {
+    return cc_ink_ready() ? cc_ops()->relattn(q, kc, vc, o, kvs, r, relp, tau, p) : 0;
+}
+static inline int cc_ink2_mix(CcBuf *x, CcBuf *blk, CcBuf *prm, CcBuf *y, const CcInk2Mix *p) {
+    return cc_ink_ready() ? cc_ops()->ink2_mix(x, blk, prm, y, p) : 0;
+}
+static inline int cc_ink2_clip(CcBuf *x, CcBuf *prm, const CcInk2Clip *p) { return cc_ink_ready() ? cc_ops()->ink2_clip(x, prm, p) : 0; }
+static inline int cc_ink2_dconv(CcBuf *x, CcBuf *dyn, CcBuf *prm, CcBuf *ring, const CcInk2Dconv *p) {
+    return cc_ink_ready() ? cc_ops()->ink2_dconv(x, dyn, prm, ring, p) : 0;
+}
 /* DFlash2's drafter's op: the module has it */
 static inline int cc_dflash_ready(void) {
     const ColiCudaChainOps *t = cc_ops();
