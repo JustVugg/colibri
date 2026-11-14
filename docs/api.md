@@ -3,7 +3,9 @@
 ## `coli serve`
 
 `coli serve` keeps one model process loaded and exposes a text-only
-OpenAI-compatible HTTP API. The gateway uses only the Python standard library;
+OpenAI-compatible HTTP API. (Clients that speak Ollama's API instead -- Open WebUI,
+the Ollama libraries -- get it from `coli gateway`, which sits in front of this
+server: [openwebui.md](openwebui.md).) The gateway uses only the Python standard library;
 inference still runs in the same dependency-free C engine.
 
 ```bash

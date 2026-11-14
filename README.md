@@ -449,6 +449,11 @@ Who answers:
   (Cloudflare; it also chats). Their sizes and speeds are in
   [the decision models table](#which-model-for-my-machine).
 
+**Open WebUI and the Ollama clients.** `coli gateway` is Ollama's API (port 11434,
+`/api/chat`, `/api/tags`, `/api/pull`, ...) in front of `coli serve`: Open WebUI, the
+Ollama libraries and the editors that talk to Ollama run on colibri unchanged, with
+the model switched by the request's name. [docs/openwebui.md](docs/openwebui.md).
+
 **Switching from Jev.** The request and the reply are those of TypeSafe's Jev
 API, so a Jev client switches to colibri by changing its base URL and nothing
 else: `TYPESAFE_BASE_URL=http://127.0.0.1:8000` (the key it already sends is
