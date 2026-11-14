@@ -199,8 +199,12 @@ left out the OpenMP tuning every other build takes (an active wait, a thread a c
 Inkling's 727 dense calls a token on the CUDA backend starved its driver with a spinning team. It
 was the binary, not the card: with `NOGPU=1` the same build took 0.72 ms a pair. A CUDA build now
 takes the tuning for Inkling-2 (the snapshot's `config.json` says so before the engine re-executes
-itself); Inkling keeps the exception. The same session, 48 tokens on two prompts: 1.55-1.59 ->
-1.91 tok/s, as the Vulkan build.
+itself). The same session, 48 tokens on two prompts: 1.55-1.59 -> 1.91 tok/s, as the Vulkan build.
+
+Inkling keeps the exception, measured: Inkling-Small (sabrewing-engine's int4 container, 141 GB)
+with the CUDA build on the same machine, its dense matrices on the card, 48 tokens on two prompts,
+each setting twice in rotation, decoded at 1.33-1.37 tok/s with the tuning against 1.35-1.39
+without it and 1.36-1.39 with the binding alone. Its tiny oracle matches 24/24 either way.
 
 ### Inkling-2: pictures
 

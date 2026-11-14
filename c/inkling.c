@@ -4893,7 +4893,9 @@ int main(int argc, char **argv) {
      * Inkling-2 under CUDA takes it: passive and unbound, its routed experts on the CPU
      * ran 0.98-1.00 ms a pair against 0.85 tuned (an RTX PRO 4000, an i5-13500, the int4
      * g64 container, 48 tokens on two prompts), the decode 1.55-1.59 -> 1.91-1.92 tok/s;
-     * the binding alone 1.85-1.86. */
+     * the binding alone 1.85-1.86. Inkling measured the other way on the same machine
+     * (Inkling-Small, its dense matrices on the card): 1.33-1.37 tok/s tuned against
+     * 1.35-1.39 untuned, so it keeps the exception. */
 #if defined(COLI_CUDA) && !defined(__APPLE__)
     const int omp_tune = ink_snap_v2(getenv("SNAP"));
 #else
