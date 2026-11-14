@@ -989,14 +989,16 @@ def ink2_weights(rng):
     return t
 
 
-def write_inkling2(path, t, experts="F32"):
+def write_inkling2(path, t, experts="F32", dense="F32"):
     """The model of ink2_weights as unsloth's Inkling-2 GGUFs lay it out (llama.cpp's inkling2):
     the short convolutions folded with their residual and scale (a global layer's static taps in
     convolution order, its dynamic projection scaled), each layer's attention-residual queries
     under the layer, and the experts of the INK2_SCALED layers stored divided by a global scale an
     expert, which comes as ffn_*_exps.scale (gate's and up's one number, as the NVFP4 w13's amax
-    gives it). experts: the routed experts' ggml type, F32 or Q8_0. Returns the model the file
-    holds: t with each layer's experts as the engine reads them back (dequantized, scale applied)."""
+    gives it). experts: the routed experts' ggml type, F32 or Q8_0; dense: the attention's
+    matrices' and the head's, F32 or Q8_0 (unsloth's are Q6_K and Q8_0). Returns the model the
+    file holds: t with each layer's experts and quantized matrices as the engine reads them back
+    (dequantized, scale applied)."""
     g = INK2
     D, E, I, CK = g["D"], g["E"], g["I"], g["CK"]
     held = dict(t)
@@ -1020,18 +1022,19 @@ def write_inkling2(path, t, experts="F32"):
     w.add_token_types([1] * (g["V"] - 3) + [3, 3, 3]); w.add_token_merges([])
     w.add_bos_token_id(g["V"] - 3); w.add_eos_token_id(g["V"] - 2)
     add = lambda name, a: w.add_tensor(name, np.ascontiguousarray(a, dtype=np.float32))
-    def exps(name, a):   # the tensor, and its values as the file gives them back
+    def exps(name, a, qt=experts):   # the tensor, and its values as the file gives them back
         a = np.ascontiguousarray(a, dtype=np.float32)
-        if experts == "F32":
+        if qt == "F32":
             add(name, a)
             return a
-        q = gguf.quants.quantize(a, QT[experts])
-        w.add_tensor(name, q, raw_dtype=QT[experts])
-        return gguf.quants.dequantize(q, QT[experts]).reshape(a.shape).astype(np.float32)
+        q = gguf.quants.quantize(a, QT[qt])
+        w.add_tensor(name, q, raw_dtype=QT[qt])
+        return gguf.quants.dequantize(q, QT[qt]).reshape(a.shape).astype(np.float32)
     fold = lambda c, k: (c + (np.arange(CK) == CK - 1)) / np.sqrt(k)
     m = "model.llm."
     add("token_embd.weight", t[m + "embed.weight"]); add("token_embd_norm.weight", t[m + "embed_norm.weight"])
-    add("output_norm.weight", t[m + "norm.weight"]); add("output.weight", t[m + "unembed.weight"])
+    add("output_norm.weight", t[m + "norm.weight"])
+    held[m + "unembed.weight"] = exps("output.weight", t[m + "unembed.weight"], dense)
     add("output_res_score.weight", t[m + "attn_res.output_query"])
     for i, local in enumerate(INK2_LOCAL):
         s, b = f"{m}layers.{i}.", f"blk.{i}."
@@ -1051,7 +1054,10 @@ def write_inkling2(path, t, experts="F32"):
                        ("attn_gate", "attn.gate_attn.weight"), ("attn_sink_proj", "attn.attn_sink_proj.weight"),
                        ("attn_q_clip", "attn.q_l2_clip.scale"), ("attn_r_clip", "attn.rel_l2_clip.scale"),
                        ("attn_rel_proj", "attn.rel_logits_proj.proj"), ("ffn_gate_inp", "mlp.gate.weight")):
-            add(b + gg + ".weight", t[s + hf])
+            if gg in ("attn_q", "attn_k", "attn_v", "attn_r", "attn_output", "attn_gate"):
+                held[s + hf] = exps(b + gg + ".weight", t[s + hf], dense)
+            else:
+                add(b + gg + ".weight", t[s + hf])
         add(b + "exp_probs_b.bias", t[s + "mlp.gate.bias"])
         add(b + "shortconv_attn.weight", fold(t[s + "attn_sconv.weight"], CK + 1))
         add(b + "shortconv_mlp.weight", fold(t[s + "mlp_sconv.weight"], CK + 1))
@@ -1075,14 +1081,14 @@ def write_inkling2(path, t, experts="F32"):
     return held
 
 
-def write_inkling2_pair(root, experts="F32", seed=11):
+def write_inkling2_pair(root, experts="F32", seed=11, dense="F32"):
     """root/ink2.gguf imported into root/gg, and root/snap: the model the file holds as a
     checkpoint (safetensors under the official names, its experts as the file gives them back,
     the config the import wrote). Returns (gg, snap)."""
     sys.path.insert(0, str(HERE / "tools"))
     import convert_inkling2_int4 as cv
     root = Path(root)
-    t = write_inkling2(root / "ink2.gguf", ink2_weights(np.random.default_rng(seed)), experts)
+    t = write_inkling2(root / "ink2.gguf", ink2_weights(np.random.default_rng(seed)), experts, dense)
     p = subprocess.run([sys.executable, str(HERE / "tools" / "gguf_import.py"), str(root / "ink2.gguf"), str(root / "gg")],
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     if p.returncode:
@@ -1150,6 +1156,16 @@ class Inkling2Gguf(unittest.TestCase):
         the logits: their tokens are the device gates' business (tests/vulkan_engines.sh)."""
         with tempfile.TemporaryDirectory() as tmp:
             gg, snap = write_inkling2_pair(tmp, experts="Q8_0")
+            tg, lg = inkling_run(gg, {"GQ_EXACT": "1"})
+            ts, ls = inkling_run(snap)
+            self.assertEqual(tg, ts)
+            self.assertLess(float(np.abs(lg - ls).max()), 1e-3 * max(1.0, float(np.abs(ls).max())))
+
+    def test_q8_0_dense(self):
+        """The attention's matrices and the head as Q8_0 blocks too, as unsloth's files hold them
+        quantized: the float kernels on the file against its weights as f32."""
+        with tempfile.TemporaryDirectory() as tmp:
+            gg, snap = write_inkling2_pair(tmp, experts="Q8_0", dense="Q8_0")
             tg, lg = inkling_run(gg, {"GQ_EXACT": "1"})
             ts, ls = inkling_run(snap)
             self.assertEqual(tg, ts)

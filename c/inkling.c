@@ -2591,8 +2591,10 @@ static size_t ink_vk_dense_bytes_mats(const Model *m) {
     if (g_inkc_fit.L && ink_is_gguf(m))   /* a GGUF's whole chain, placed already: its layers' buffers and the head to come */
         return inkc_fit_later(m) + (g_inkc_fit.tail ? g_inkc_fit.tail_b : 0);
     if (g_ink_dho) return 0;   /* placed already (ink_dho_place): the free memory the tier reads counts them */
+    /* a GGUF's blocks: Inkling-2's chain takes them up itself (inkc_tensor), their bytes */
     #define INK_VKB(w, n) do { const Wt *w_ = (w); int f_ = w_->vk ? ink_vk_fmt(w_) : 0; \
-        b += (double)(n) * (f_ == 1 ? 1.0 : f_ == 4 ? 0.5625 : f_ == 10 ? 4.0 : f_ == 11 ? 2.0 : 0.0); } while (0)
+        if (!f_ && w_->gq && c->v2 && g_ink2c_want) b += (double)w_->qn; \
+        else b += (double)(n) * (f_ == 1 ? 1.0 : f_ == 4 ? 0.5625 : f_ == 10 ? 4.0 : f_ == 11 ? 2.0 : 0.0); } while (0)
     INK_VKB(&m->lm_head, (double)c->vocab * c->hidden);
     for (int i = 0; i < c->n_layers; i++) {
         const Layer *l = &m->L[i];
@@ -2793,8 +2795,42 @@ static void ink_vk_tier_start(Model *m) {
  * holds there (load_w), whose memory the budget it reads leaves them. Inkling keeps the
  * backend alone, as before: its experts on the CPU. */
 static size_t ink2cc_plan_bytes(const Model *m);   /* inkling2_cuchain.h */
+static ColiCudaTensor *ink2cc_mat(Wt *w, int I, int O);   /* inkling2_cuchain.h */
+/* Inkling-2 from a GGUF on the CUDA build: the attention's block-format matrices and the head on
+ * the device as the file has them (cuda_bd.cuh; matmul_w reads W.cut), before the tier measures
+ * what memory is left. The backend's bf16 path (load_w) takes none of them. */
+static void ink2_cuda_gguf_dense(Model *m) {
+    Cfg *c = &m->c;
+    int dev = g_ink_cuda_dev, n = 0, up = 0;
+    double bytes = 0;
+    if (!coli_cuda_init(&dev, 1)) return;
+    for (int i = 0; i <= c->n_layers; i++) {
+        Layer *l = i < c->n_layers ? &m->L[i] : NULL;
+        const int D = c->hidden, H = l ? L_HEADS(c, i) : 0, hd = l ? L_HD(c, i) : 0, kvo = l ? L_KV(c, i) * hd : 0;
+        Wt *w6[6] = {NULL};
+        int I6[6] = {0}, O6[6] = {0}, k = 0;
+        if (l) {
+            w6[0] = &l->q; I6[0] = D;      O6[0] = H * hd;
+            w6[1] = &l->k; I6[1] = D;      O6[1] = kvo;
+            w6[2] = &l->v; I6[2] = D;      O6[2] = kvo;
+            w6[3] = &l->r; I6[3] = D;      O6[3] = H * c->d_rel;
+            w6[4] = &l->o; I6[4] = H * hd; O6[4] = D;
+            w6[5] = &l->ag; I6[5] = D;     O6[5] = H * hd;
+            k = 6;
+        } else { w6[0] = &m->lm_head; I6[0] = D; O6[0] = c->unpad_vocab; k = 1; }
+        for (int j = 0; j < k; j++) {
+            Wt *w = w6[j];
+            if (!w->gq || w->cut) continue;
+            n++;
+            if (ink2cc_mat(w, I6[j], O6[j])) { up++; bytes += (double)w->qn; }
+        }
+    }
+    if (n) fprintf(stderr, "[CUDA] inkling2: %d of the GGUF's %d dense matrices on the device as the file has them (%.2f GB)%s\n",
+                   up, n, bytes / 1e9, up < n ? "; the others on the CPU" : "");
+}
 static void ink_cu_tier_start(Model *m) {
     Cfg *c = &m->c;
+    if (c->v2 && g_cuda && !XT(ready)()) ink2_cuda_gguf_dense(m);
     /* Inkling-2's CUDA chain (COLI_CUDA_CHAIN=1 or 2, inkling2_cuchain.h; off by default: it measured
      * no faster than the matrices a call at a time) planned here, before the tier sizes itself: the
      * tier leaves its buffers and K/V mirrors */
