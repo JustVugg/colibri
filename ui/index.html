@@ -1410,7 +1410,7 @@ async function generate(cont){
   const t1=performance.now();clearInterval(metaTimer);OWN=null;
   /* no usage (stopped, failed): the delta count stands in, marked as an estimate */
   const out=sawUsage?outTot:(nTok||null);
-  a.stats={prompt:usage?.prompt_tokens,out,approx:!sawUsage&&!!nTok,ttft:tFirst?(tFirst-t0)/1000:null,tps:out&&tFirst&&t1-tFirst>500?out/((t1-tFirst)/1000):null};
+  a.stats={prompt:usage?.prompt_tokens,out,approx:!sawUsage&&!!nTok,ttft:tFirst?(tFirst-t0)/1000:null,tps:out&&tFirst&&t1-tFirst>2?(out>1?out-1:out)/((t1-tFirst)/1000):null};
   if(raf)cancelAnimationFrame(raf);busy=false;phase=a.finish==='error'?'error':'idle';abortCtl=null;LM.end();
   saveConvs();renderThread();renderConvList();if(stick)toBottom();else updateJump();
   send.classList.remove('stop');$('#sendIcon').setAttribute('href','#i-up');$('#hintText').textContent='Invio per inviare · Shift+Invio per andare a capo';fit();
