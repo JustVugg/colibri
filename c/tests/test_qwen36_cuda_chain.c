@@ -35,6 +35,10 @@
  *     model's heat file); COLI_CUDA_CHAIN_PROMOTE_HITS, when set, wins;
  *   - the staging buffer for a prompt chunk's host-pool experts grows into the old one's place: a small card
  *     has no room for both (q36cc_stage_reserve).
+ *   - the staged table puts the host pool's experts in the staging's one or two banks (q36cc_stage_table):
+ *     two where two layers' worth fit in a layer's and the card has room, the staged layers taking them in
+ *     turn, each expert at its bank's offset in both layouts; the chain's calls (first copy of each bank, then
+ *     one after each layer) never write a bank before its layer is done with it.
  * Include order as in test_qwen36_tier_int8_engine.c. */
 #define main qwen36_main_unused
 #include "../qwen36.c"
@@ -190,6 +194,126 @@ static void hp_route(int l, int a, int b) {   /* a row's routes, the misses offe
     for (int k = 0; k < 2; k++) if (!qt_is_resident(l, ids[k])) hp_note(l, ids[k], 2);
 }
 
+/* M's tier: HL layers of the same experts, to see where q36cc_stage_table puts the host pool's in the staging */
+enum { HL = 5 };
+static unsigned char sq_w[HL][HE][3 * HMB];
+static float sq_sc[HL][HE][HSC];
+/* the staging's ops on the fake, a state machine for each bank: the layer a fetch put in it, which the layer's
+ * wait must find and its done must release before the next fetch lands there */
+static struct { int hold[2], bad, fetches, waits, expect, maxend, firstat[HL]; Q36CChain *ch; } sg;
+static int sg_layer(const CcFetch *r) {   /* the layer whose copies these are */
+    for (int i = 0; i < HL; i++) if (sg.ch->dm_frn[i] > 0 && r == sg.ch->dm_fr + sg.ch->dm_fro[i]) return i;
+    return -1;
+}
+static int sg_fetch_at(CcBuf *dst, const CcFetch *r, int n, int bank) {
+    int i = sg_layer(r);
+    if (bank < 0 || bank > 1 || i < 0 || sg.hold[bank] >= 0) sg.bad++;   /* a bank still unread, or copies of no layer */
+    else { sg.hold[bank] = i; sg.fetches++; sg.firstat[i] = n ? (int)r[0].dst : -1; }
+    for (int k = 0; k < n; k++) {
+        if (r[k].dst + r[k].bytes > cc_bytes(dst)) sg.bad++;   /* past the buffer */
+        if (r[k].dst + r[k].bytes > (size_t)sg.maxend) sg.maxend = (int)(r[k].dst + r[k].bytes);
+    }
+    return 1;
+}
+static int sg_wait_at(int bank) { sg.waits++; if (bank < 0 || bank > 1 || sg.hold[bank] != sg.expect) sg.bad++; return 1; }
+static int sg_done_at(int bank) { if (bank < 0 || bank > 1 || sg.hold[bank] != sg.expect) sg.bad++; else sg.hold[bank] = -1; return 1; }
+static int sg_fetch(CcBuf *dst, const CcFetch *r, int n) { return sg_fetch_at(dst, r, n, 0); }
+static int sg_wait(void) { return sg_wait_at(0); }
+static int sg_done(void) { return sg_done_at(0); }
+
+/* A tier of HL layers with `res` experts of the HE on the card (the first ones, in every layer) and the rest in the
+ * host pool, `cap` bytes of device memory for the staging (0: no limit), one layer (unstaged_l, -1: none) with an
+ * expert in neither, a backend whose table has the banks' ops (at_ops) or ends before them. Builds the staged table,
+ * then runs the staged layers as the chain does: the first copy of each bank, and after a layer's experts the copy
+ * of the layer that takes its bank. */
+static void stage_table_case(int res, int planar, int unstaged_l, size_t cap, int at_ops, int want_banks, const char *what) {
+    char gb[64], msg[240];
+    setenv("HEAT_FILE", "", 1); setenv("COLI_PLACE", "off", 1); setenv("QT_UPLOAD_SYNC", "", 1);
+    fake_host_reg_ok = 1; fake_planar_rows = planar;
+    for (int i = 0; i < HL; i++) for (int e = 0; e < HE; e++) {
+        for (size_t k = 0; k < sizeof sq_w[i][e]; k++) sq_w[i][e][k] = (unsigned char)((k * 31u + (unsigned)i * 11u + (unsigned)e * 5u) & 0xFFu);
+        for (int k = 0; k < HSC; k++) sq_sc[i][e][k] = 0.5f * (float)(k + e + i + 1);
+    }
+    size_t xb = 3 * dev_alloc_footprint(HMB) + 3 * dev_alloc_footprint((HSC / 3) * sizeof(float));
+    snprintf(gb, sizeof gb, "%.15f", (double)((size_t)HL * res * xb + xb / 2) / 1073741824.0);
+    setenv("CUDA_EXPERT_GB", gb, 1);
+    qt_source_planar(planar);
+    int up = qt_init(HL, HE, D, HI, HE, TOPK, 64, 1);
+    for (int e = 0; e < HE; e++) for (int i = 0; i < HL; i++) {
+        const unsigned char *g = sq_w[i][e]; const float *s = sq_sc[i][e];
+        qt_note_block(i, e, g, g + HMB, g + 2 * HMB, s, s + HI, s + 2 * HI);
+    }
+    qt_fill_wait();
+    int pool = 0, resident = 0;
+    for (int i = 0; i < HL; i++) for (int e = 0; e < HE; e++) {
+        if (qt_is_resident(i, e)) { resident++; continue; }
+        if (i == unstaged_l && e == HE - 1) continue;   /* in neither */
+        const unsigned char *g = sq_w[i][e]; const float *s = sq_sc[i][e];
+        qt_note_host(i, e, g, g + HMB, g + 2 * HMB, s, s + HI, s + 2 * HI);
+        pool++;
+    }
+    snprintf(msg, sizeof msg, "%s: %d experts a layer on the card, the rest in the pool", what, res);
+    ck(up && resident == HL * res && qt_chain_host_count() == pool, msg);
+
+    static Q36CChain ch; static Model sm;
+    memset(&ch, 0, sizeof ch); memset(&sm, 0, sizeof sm);
+    sm.c.n_layers = HL; sm.c.n_experts = HE; sm.c.hidden = D; sm.c.inter = HI;
+    ch.dm_fmt = 4; ch.dm_gs = 64;
+    ch.dm_host = calloc((size_t)HL * HE, sizeof(CcExpert)); ch.dm_res = calloc((size_t)HL * HE, 1);
+    for (int i = 0; i < HL; i++) for (int e = 0; e < HE; e++) ch.dm_res[i * HE + e] = (uint8_t)qt_is_resident(i, e);
+    memset(&sg, 0, sizeof sg); sg.hold[0] = sg.hold[1] = -1; sg.ch = &ch;
+    ColiCudaChainOps saved = fake_chain_table;
+    fake_chain_table.size = at_ops ? sizeof fake_chain_table : offsetof(ColiCudaChainOps, fetch_at);
+    fake_chain_table.fetch = sg_fetch; fake_chain_table.fetch_wait = sg_wait; fake_chain_table.fetch_done = sg_done;
+    fake_chain_table.fetch_at = at_ops ? sg_fetch_at : NULL; fake_chain_table.fetch_wait_at = at_ops ? sg_wait_at : NULL;
+    fake_chain_table.fetch_done_at = at_ops ? sg_done_at : NULL;
+    fake_chain_dev_cap = cap ? fake_chain_dev_bytes + cap : 0;
+
+    const int hmax = HE - res, staged = HL - (unstaged_l >= 0);
+    const size_t wb = 3 * HMB, wa = (wb + 255) / 256 * 256, stride = wa + (HSC * sizeof(float) + 255) / 256 * 256, bank = (size_t)hmax * stride;
+    ck(q36cc_stage_table(&ch, &sm), what);
+    snprintf(msg, sizeof msg, "%s: %d bank%s of %d experts", what, want_banks, want_banks == 1 ? "" : "s", hmax);
+    ck(ch.dm_banks == want_banks && cc_bytes(ch.dm_stage) >= want_banks * bank, msg);
+    int banks_ok = 1, seen = 0, at_ok = 1;
+    const char *base = (const char *)cc_dev_addr(ch.dm_stage);
+    for (int i = 0; i < HL; i++) {
+        const int st = q36cc_stages(&ch, ch.dm_tabb, i);
+        banks_ok = banks_ok && (st == (i != unstaged_l)) && ch.dm_bank[i] == (st ? seen % want_banks : -1);
+        for (int e = 0; e < HE && st; e++) {   /* the staged expert h of a layer at (bank * hmax + h) * stride, as the pool holds it */
+            const CcExpert *x = &ch.dm_hostb[(size_t)i * HE + e];
+            if (ch.dm_res[i * HE + e]) continue;
+            const size_t off = (size_t)((const char *)x->g - base), h = off / stride - (size_t)ch.dm_bank[i] * hmax;
+            at_ok = at_ok && off % stride == 0 && h < (size_t)hmax && x->u == (const char *)x->g + HMB && x->d == (const char *)x->g + 2 * HMB &&
+                    (const char *)x->gs == base + off + wa && x->us == x->gs + HI && x->ds == x->gs + 2 * HI && x->planar == planar;
+        }
+        seen += st;
+    }
+    snprintf(msg, sizeof msg, "%s: the staged layers take the banks in turn, an unstaged layer takes none", what);
+    ck(banks_ok && seen == staged, msg);
+    snprintf(msg, sizeof msg, "%s: each expert in its layer's bank, its matrices and scales after it (%s)", what, planar ? "planar" : "pairs");
+    ck(at_ok, msg);
+
+    const int banks = q36cc_banks(&ch);
+    int ok = 1, first_ok = 1;
+    for (int s = 1; s <= banks; s++) ok = ok && q36cc_stage_from(&ch, &sm, 0, s);
+    for (int i = 0; i < HL; i++) {
+        if (!q36cc_stages(&ch, ch.dm_tabb, i)) continue;
+        sg.expect = i;
+        ok = ok && q36cc_fetch_wait(&ch, i) && q36cc_fetch_done(&ch, i) && q36cc_stage_from(&ch, &sm, i + 1, banks);
+        first_ok = first_ok && sg.firstat[i] == ch.dm_bank[i] * (int)bank;   /* the layer's copy starts at its bank */
+    }
+    snprintf(msg, sizeof msg, "%s: each copy lands in a free bank at its layer's offset and is waited for by its layer", what);
+    ck(ok && sg.bad == 0 && sg.fetches == staged && sg.waits == staged && sg.hold[0] < 0 && sg.hold[1] < 0 &&
+       sg.maxend <= (int)(want_banks * bank) && first_ok, msg);
+
+    fake_chain_dev_cap = 0;
+    cc_free(ch.dm_stage); cc_free(ch.dm_tabb); free(ch.dm_hostb); free(ch.dm_partb); free(ch.dm_fro); free(ch.dm_frn);
+    free(ch.dm_bank); free(ch.dm_fr); free(ch.dm_host); free(ch.dm_res);
+    fake_chain_table = saved;
+    qt_source_planar(0);
+    qt_shutdown();
+}
+
 /* the reference's resident copies, matrix by matrix (sections G and H write the same lines out) */
 static void share_trunk(Model *to, const Model *from) {
     for (int i = 0; i < NL; i++) {
@@ -244,6 +368,15 @@ int main(void) {
     const int ids[12] = {3, 17, 42, 9, 21, 60, 5, 33, 12, 48, 7, 29};   /* the verify reads three from index 6 */
 
     ck(qt_init(NL, E, D, INTER, E, TOPK, 0, 0), "the tier is up");
+    /* the staging's second bank: only where both fit in the 256 experts q36cc_rows_max sets aside for it
+     * (a Colab T4 with the residents spread, 91 a layer: two; whole layers, 256: one; 190 a layer: one) */
+    ck(q36cc_stage_banks(91, 256) == 2 && q36cc_stage_banks(128, 256) == 2 && q36cc_stage_banks(129, 256) == 1 &&
+       q36cc_stage_banks(190, 256) == 1 && q36cc_stage_banks(256, 256) == 1 && q36cc_stage_banks(0, 256) == 1,
+       "the staging has two banks where two layers' worth fit in a layer's, else one");
+    static Q36CChain zp;   /* zeroed, as a staged table that writes no banks leaves it */
+    ck(q36cc_banks(&zp) == 1, "a staged table that sets no banks copies its layers in one");
+    zp.dm_banks = 2; ck(q36cc_banks(&zp) == 2, "two banks stay two");
+    zp.dm_banks = 1; ck(q36cc_banks(&zp) == 1, "one bank stays one");
     Model ref; build_model(&ref, &w);
     place_trunk(&ref, &w);        /* the reference uses the same resident copies, matrix by matrix */
     Model m; build_model(&m, &w);
@@ -601,6 +734,13 @@ int main(void) {
         qt_shutdown();
     }
     remove(heat);
+    printf(" M. the staged table: the host pool's experts in the staging's banks\n");
+    stage_table_case(4, 1, -1, 0, 1, 2, "planar, half the experts in the pool (two layers' worth fit in a layer's)");
+    stage_table_case(4, 0, -1, 0, 1, 2, "the residents' pairs, the same");
+    stage_table_case(4, 1, 2, 0, 1, 2, "planar, a layer with an expert in neither");
+    stage_table_case(3, 1, -1, 0, 1, 1, "planar, five of eight in the pool (two would not fit in a layer's)");
+    stage_table_case(4, 1, -1, 40000, 1, 1, "planar, room for one bank only");
+    stage_table_case(4, 1, -1, 0, 0, 1, "planar, a backend whose table ends before the banks' ops");
     if (fails) { printf("test_qwen36_cuda_chain: %d failure(s)\n", fails); return 1; }
     printf("OK test_qwen36_cuda_chain: the CUDA chain gives the CPU path's logits; host and device state agree; a lost device rebuilds; the host pool follows before a large prompt chunk only; the promotions' brake only with a history\n");
     return 0;

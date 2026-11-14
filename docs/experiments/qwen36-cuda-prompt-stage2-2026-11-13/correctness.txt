@@ -1,0 +1,212 @@
+# correctness.txt: the checks of this PR's code against dev fd7ed68a. Lines are taken from the runs' logs as printed.
+# T4 runs: a Colab Tesla T4 (sm_75), CUDA 13.0 (nvcc 13.0.88), driver 580.82.07, 13 November 2026.
+# The speed measure, make cuda-test and tests/cuda_tier_engines.sh ran on local commit 0a6fcca3; make cuda-chain-check
+# on local commit f145dd31. The commit of this PR differs from 0a6fcca3 in two comments (qwen36_cuda_chain.h,
+# tests/test_qwen36_cuda_chain.c), the word "controprova" (a comment and a printed line of tests/test_cuda_chain.cu,
+# now "counter-proof"), the name of a test function there (test_two_banks), a sentence of docs/qwen36-cuda-tier.md and
+# a sixth case of section M in tests/test_qwen36_cuda_chain.c (a backend whose table ends before the banks' ops); from
+# f145dd31 it differs in that sixth case only, which runs on the fake backend.
+# Mac runs: macOS arm64, on the commit of this PR, but for the counter-proofs A to F (0a6fcca3 and just before it).
+
+## make cuda-chain-check CUDA=1 CUDA_ARCH=sm_75 on local commit f145dd31: the five lines dev does not have
+## (the two banks, each with its counter-proof inside the test, and the refused third bank), then the failures
+  ok   forty rows, three layers in two banks (the first and the third in bank 0): the other bank is copied while the first waits to be read, the third layer's copy waits for the first's fetch_done_at
+  ok   counter-proof: without fetch_done_at(0) the third layer's copy lands on the first's bank before it is read (the check above fails)
+  ok   forty rows, three layers in two banks (the first and the third in bank 1): the other bank is copied while the first waits to be read, the third layer's copy waits for the first's fetch_done_at
+  ok   counter-proof: without fetch_done_at(1) the third layer's copy lands on the first's bank before it is read (the check above fails)
+  ok   a third bank refused
+  FAIL 300 rows: the up projection and the mix in one pass, those of the two ops to the bit
+  FAIL 100 rows: the up projection and the mix in one pass, those of the two ops to the bit
+lost
+  FAIL the counters saw the frames, ops and matmuls
+  ok   a failed launch loses the device to the chain
+  ok   every later call returns 0
+test_cuda_chain: 3 failure(s)
+make: *** [Makefile:1479: cuda-chain-check] Error 1
+
+## the same on dev: the same three FAIL lines
+  FAIL 300 rows: the up projection and the mix in one pass, those of the two ops to the bit
+  FAIL 100 rows: the up projection and the mix in one pass, those of the two ops to the bit
+lost
+  FAIL the counters saw the frames, ops and matmuls
+  ok   a failed launch loses the device to the chain
+  ok   every later call returns 0
+test_cuda_chain: 3 failure(s)
+make: *** [Makefile:1479: cuda-chain-check] Error 1
+
+## "ok" lines of the test (lines starting with two spaces and ok): dev 241, this PR 246; the difference between the
+## two logs' ok and FAIL lines (diff <(dev) <(this PR)) is these five lines and nothing else
+dev: 241   this PR: 246
+184a185,189
+>   ok   forty rows, three layers in two banks (the first and the third in bank 0): the other bank is copied while the first waits to be read, the third layer's copy waits for the first's fetch_done_at
+>   ok   counter-proof: without fetch_done_at(0) the third layer's copy lands on the first's bank before it is read (the check above fails)
+>   ok   forty rows, three layers in two banks (the first and the third in bank 1): the other bank is copied while the first waits to be read, the third layer's copy waits for the first's fetch_done_at
+>   ok   counter-proof: without fetch_done_at(1) the third layer's copy lands on the first's bank before it is read (the check above fails)
+>   ok   a third bank refused
+
+## make cuda-chain-check stops at the failed test: the three checks after it in the target (cuda-dsv4c-check,
+## cuda-glm53c-check, cuda-k3c-check) did not run on dev or on this PR. The warnings of the build are the same 11 lines
+## on both (only the line numbers of tests/test_cuda_chain.cu move).
+
+## make cuda-test CUDA=1 CUDA_ARCH=sm_75 on this PR (the tree's /content/w-p24): the run's receipt and the last line of
+## its tests. (This target's tests do not build cuda_chain.cu; the chain's test is the one above.)
+[21:52:15] 10-cuda-test rc=0 1692 s
+cuda backend: q8/q4/q2/f32/e8 correctness ok on 1 device(s)
+cuda fmt trap tests: ok
+weights_owned upload-failure test passed (8 fail cycles, 0 bytes cumulative)
+test_mxfp4_cuda: ok
+test_alloc_footprint_cuda: ok
+
+## the engine's own lines on the T4 (qwen36-bench, Qwen3.6-35B-A3B int4-g64, 6605 of the 10240 experts on the card),
+## run 1 of this PR: the banks line, which the dev runs do not print; then the staged layer steps of dev's run 1 and of
+## this PR's run 1. Both print the same count and bytes in all 9 runs of each (warm-up included): the same copies
+[chain] qwen36: a prompt chunk stages the host pool's experts in 2 banks of 91 experts
+[chain] qwen36: 83 prompt layer steps staged the host pool's experts (12.41 GB copied over the bus)
+[chain] qwen36: 83 prompt layer steps staged the host pool's experts (12.41 GB copied over the bus)
+
+## the chain's own report of memory on the device, run 1 of each (the same value in all 4 + 4 runs; the warm-up, a dev run, 396.0)
+dev:     396.0 MiB on the device
+this PR: 559.7 MiB on the device
+
+## fingerprints of the logits, nll and top1, every run of both versions (4 + 4 runs, count of runs by line)
+ctx_tokens,fingerprint,nll,top1
+   8 512,e82105bcd0bd1efa,2.96212,0.469
+   8 64,4e0d1505a6060a16,2.69270,0.469
+   8 64,9d8c5feaaca51a44,2.69070,0.469
+
+## Mac: make -C c check (macOS arm64) on the commit of this PR
+Ran 3290 tests in 282.605s
+
+OK (skipped=582)
+
+## Mac: tests/test_qwen36_cuda_chain on the fake backend (103 ok on dev, 143 ok and 0 FAIL on this PR): the staging's
+## banks and section M, the staged table (6 cases, 6 checks each)
+  ok   the staging has two banks where two layers' worth fit in a layer's, else one
+  ok   a staged table that sets no banks copies its layers in one
+  ok   two banks stay two
+  ok   one bank stays one
+ M. the staged table: the host pool's experts in the staging's banks
+  ok   planar, half the experts in the pool (two layers' worth fit in a layer's): 4 experts a layer on the card, the rest in the pool
+  ok   planar, half the experts in the pool (two layers' worth fit in a layer's)
+  ok   planar, half the experts in the pool (two layers' worth fit in a layer's): 2 banks of 4 experts
+  ok   planar, half the experts in the pool (two layers' worth fit in a layer's): the staged layers take the banks in turn, an unstaged layer takes none
+  ok   planar, half the experts in the pool (two layers' worth fit in a layer's): each expert in its layer's bank, its matrices and scales after it (planar)
+  ok   planar, half the experts in the pool (two layers' worth fit in a layer's): each copy lands in a free bank at its layer's offset and is waited for by its layer
+  ok   the residents' pairs, the same: 4 experts a layer on the card, the rest in the pool
+  ok   the residents' pairs, the same
+  ok   the residents' pairs, the same: 2 banks of 4 experts
+  ok   the residents' pairs, the same: the staged layers take the banks in turn, an unstaged layer takes none
+  ok   the residents' pairs, the same: each expert in its layer's bank, its matrices and scales after it (pairs)
+  ok   the residents' pairs, the same: each copy lands in a free bank at its layer's offset and is waited for by its layer
+  ok   planar, a layer with an expert in neither: 4 experts a layer on the card, the rest in the pool
+  ok   planar, a layer with an expert in neither
+  ok   planar, a layer with an expert in neither: 2 banks of 4 experts
+  ok   planar, a layer with an expert in neither: the staged layers take the banks in turn, an unstaged layer takes none
+  ok   planar, a layer with an expert in neither: each expert in its layer's bank, its matrices and scales after it (planar)
+  ok   planar, a layer with an expert in neither: each copy lands in a free bank at its layer's offset and is waited for by its layer
+  ok   planar, five of eight in the pool (two would not fit in a layer's): 3 experts a layer on the card, the rest in the pool
+  ok   planar, five of eight in the pool (two would not fit in a layer's)
+  ok   planar, five of eight in the pool (two would not fit in a layer's): 1 bank of 5 experts
+  ok   planar, five of eight in the pool (two would not fit in a layer's): the staged layers take the banks in turn, an unstaged layer takes none
+  ok   planar, five of eight in the pool (two would not fit in a layer's): each expert in its layer's bank, its matrices and scales after it (planar)
+  ok   planar, five of eight in the pool (two would not fit in a layer's): each copy lands in a free bank at its layer's offset and is waited for by its layer
+  ok   planar, room for one bank only: 4 experts a layer on the card, the rest in the pool
+  ok   planar, room for one bank only
+  ok   planar, room for one bank only: 1 bank of 4 experts
+  ok   planar, room for one bank only: the staged layers take the banks in turn, an unstaged layer takes none
+  ok   planar, room for one bank only: each expert in its layer's bank, its matrices and scales after it (planar)
+  ok   planar, room for one bank only: each copy lands in a free bank at its layer's offset and is waited for by its layer
+  ok   planar, a backend whose table ends before the banks' ops: 4 experts a layer on the card, the rest in the pool
+  ok   planar, a backend whose table ends before the banks' ops
+  ok   planar, a backend whose table ends before the banks' ops: 1 bank of 4 experts
+  ok   planar, a backend whose table ends before the banks' ops: the staged layers take the banks in turn, an unstaged layer takes none
+  ok   planar, a backend whose table ends before the banks' ops: each expert in its layer's bank, its matrices and scales after it (planar)
+  ok   planar, a backend whose table ends before the banks' ops: each copy lands in a free bank at its layer's offset and is waited for by its layer
+OK test_qwen36_cuda_chain: the CUDA chain gives the CPU path's logits; host and device state agree; a lost device rebuilds; the host pool follows before a large prompt chunk only; the promotions' brake only with a history
+
+## Mac: counter-proofs on the test, each a change made by hand to c/qwen36_cuda_chain.h, the binary rebuilt, the file put
+## back. A: q36cc_stage_banks always 2 (re-run with the bank names); B: the staged layers take the banks `% 2` with one
+## bank; C: the offset without the bank's `* hmax`; D: q36cc_banks returning the table's count as it is (0 for a table that sets none, a GGUF's); F: no return
+## to one bank when the reserve of two fails; G: no cc_fetch_at_ready() in q36cc_stage_table (two banks on a backend
+## without their ops). B, C, D and F were run before the places were renamed banks (their lines say "place"); G on the
+## commit of this PR. The FAIL lines and the run's last line:
+### A: q36cc_stage_banks always 2
+  FAIL the staging has two banks where two layers' worth fit in a layer's, else one
+  FAIL planar, five of eight in the pool (two would not fit in a layer's): 1 bank of 5 experts
+  FAIL planar, five of eight in the pool (two would not fit in a layer's): the staged layers take the banks in turn, an unstaged layer takes none
+  FAIL planar, five of eight in the pool (two would not fit in a layer's): each copy lands in a free bank at its layer's offset and is waited for by its layer
+test_qwen36_cuda_chain: 4 failure(s)
+### B: the banks taken `% 2` with one bank
+  FAIL planar, five of eight in the pool (two would not fit in a layer's): the staged layers take the places in turn, an unstaged layer takes none
+  FAIL planar, five of eight in the pool (two would not fit in a layer's): each copy lands in a free place at its layer's offset and is waited for by its layer
+  FAIL planar, room for one place only: the staged layers take the places in turn, an unstaged layer takes none
+  FAIL planar, room for one place only: each copy lands in a free place at its layer's offset and is waited for by its layer
+test_qwen36_cuda_chain: 4 failure(s)
+### C: the offset without the bank's `* hmax`
+  FAIL planar, half the experts in the pool (two layers' worth fit in a layer's): each expert in its layer's place, its matrices and scales after it (planar)
+  FAIL planar, half the experts in the pool (two layers' worth fit in a layer's): each copy lands in a free place at its layer's offset and is waited for by its layer
+  FAIL the residents' pairs, the same: each expert in its layer's place, its matrices and scales after it (pairs)
+  FAIL the residents' pairs, the same: each copy lands in a free place at its layer's offset and is waited for by its layer
+  FAIL planar, a layer with an expert in neither: each expert in its layer's place, its matrices and scales after it (planar)
+  FAIL planar, a layer with an expert in neither: each copy lands in a free place at its layer's offset and is waited for by its layer
+test_qwen36_cuda_chain: 6 failure(s)
+### D: q36cc_banks returning the table's count as it is
+  FAIL a staged table that sets no places copies its layers in one
+test_qwen36_cuda_chain: 1 failure(s)
+### F: no return to one bank when the reserve of two fails
+  FAIL planar, room for one place only: 1 place of 4 experts
+  FAIL planar, room for one place only: the staged layers take the places in turn, an unstaged layer takes none
+  FAIL planar, room for one place only: each copy lands in a free place at its layer's offset and is waited for by its layer
+test_qwen36_cuda_chain: 3 failure(s)
+### G: no cc_fetch_at_ready() in q36cc_stage_table
+  FAIL planar, a backend whose table ends before the banks' ops: 1 bank of 4 experts
+  FAIL planar, a backend whose table ends before the banks' ops: the staged layers take the banks in turn, an unstaged layer takes none
+  FAIL planar, a backend whose table ends before the banks' ops: each copy lands in a free bank at its layer's offset and is waited for by its layer
+test_qwen36_cuda_chain: 3 failure(s)
+
+## tests/cuda_tier_engines.sh on this PR (the other engines)
+# On the Tesla T4 (sm_75), local commit 0a6fcca3 in a fresh worktree, `PY=python3 bash tests/cuda_tier_engines.sh`: rc=0,
+# 42 OK lines and the last line, as printed:
+OK glm53 decode: tokens = CPU, device 56
+OK glm53 evict: tokens = CPU, device 16
+OK glm53 chain decode: tokens = CPU, max |logit diff| 4.77e-07 of 1.82e+00, 9 chain forwards
+OK glm53 chain 100-token prompt, 32-bit trunk: tokens = CPU, max |logit diff| 7.15e-07 of 1.97e+00, 5 chain forwards
+OK glm53 chain 100-token prompt, 4-bit trunk, exact GEMMs: tokens = CPU, max |logit diff| 5.96e-07 of 1.89e+00, 5 chain forwards
+OK glm53 chain 100-token prompt, 4-bit trunk, tensor cores: tokens = CPU, max |logit diff| 6.05e-04 of 1.89e+00, 5 chain forwards
+OK glm53 chain prefill chunks of 7, one cache slot: tokens = CPU, max |logit diff| 4.79e-07 of 1.89e+00, 19 chain forwards
+OK glm53 chain chunks of 3: tokens = CPU, max |logit diff| 5.96e-07 of 1.97e+00, 38 chain forwards
+OK qwen36 GGUF dense, DeltaNet qkv and gate in two types, a 12-row step: tokens = CPU, max |logit diff| 2.47e-02 of 3.14e+00, 2 in_proj as two tensors, the chain on
+OK qwen36 GGUF dense, DeltaNet qkv and gate in two types, chunks of 5: tokens = CPU, max |logit diff| 4.77e-07 of 3.14e+00, 2 in_proj as two tensors, the chain on
+OK qwen36 GGUF hybrid steps: tokens = CPU (48 hybrid layer steps)
+OK qwen36 GGUF hybrid steps, each signal sent at once: tokens = CPU (48 hybrid layer steps)
+OK qwen36 GGUF the host's word lost: tokens = CPU (0 hybrid layer steps)
+OK deepseek_v41 cap=1: output = CPU, oracle passed, device 287
+OK deepseek_v41 cap=2: output = CPU, oracle passed, device 287
+OK deepseek_v41 cap=8: output = CPU, oracle passed, device 287
+OK deepseek_v41 GGUF: tokens = CPU, device 228, 68 dense matrices on the card
+OK colibri GGUF chain decode: tokens = CPU, max |logit diff| 8.05e-07 of 1.81e+00, 8 chain forwards, device 90
+OK colibri GGUF chain decode, cap=1: tokens = CPU, max |logit diff| 8.05e-07 of 1.81e+00, 8 chain forwards, device 90
+OK colibri GGUF chain DSA top-4, the dense part at 8 bits (the serve's: the indexer's F32 head weights in int8): tokens = CPU, max |logit diff| 7.75e-07 of 1.46e+00, 8 chain forwards, device 282
+OK colibri GGUF chain 40-token prompt: tokens = CPU, max |logit diff| 7.75e-07 of 1.82e+00, 8 chain forwards, device 294
+OK colibri GGUF chain 40-token prompt in chunks of 3: tokens = CPU, max |logit diff| 7.75e-07 of 1.82e+00, 8 chain forwards, device 294
+OK colibri GGUF chain DSA top-4: tokens = CPU, max |logit diff| 7.15e-07 of 1.90e+00, 8 chain forwards, device 90
+OK colibri GGUF chain DSA top-4, 40-token prompt in chunks of 5: tokens = CPU, max |logit diff| 1.39e-06 of 1.69e+00, 8 chain forwards, device 282
+OK colibri GGUF chain DSA_FORCE: tokens = CPU, max |logit diff| 8.94e-07 of 1.82e+00, 8 chain forwards, device 294
+OK colibri GGUF chain 40-token prompt, tensor cores: tokens = CPU, max |logit diff| 1.39e-06 of 1.69e+00, 8 chain forwards, device 282
+OK colibri GGUF chain DSA top-4 over shared indexer layers (layers 2 and 3 reuse layer 1's selection): tokens = CPU, max |logit diff| 7.75e-07 of 1.77e+00, 8 chain forwards, device 90
+OK colibri GGUF chain DSA top-4 over shared indexer layers, 40-token prompt in chunks of 5: tokens = CPU, max |logit diff| 8.34e-07 of 1.73e+00, 7 chain forwards, device 288
+OK colibri int4 container dense on the card: tokens = CPU, max |logit diff| 1.22e-06 of 2.03e+00, 41 tensors on the card, 0 expert group calls
+OK colibri int4 container dense on the card, 40-token prompt: tokens = CPU, max |logit diff| 1.34e-06 of 1.86e+00, 41 tensors on the card, 0 expert group calls
+OK colibri int4 container dense and every expert on the card: tokens = CPU, max |logit diff| 1.16e-06 of 2.03e+00, 89 tensors on the card, 40 expert group calls
+OK colibri int4 container dense and every expert on the card, 40-token prompt: tokens = CPU, max |logit diff| 1.16e-06 of 1.86e+00, 89 tensors on the card, 40 expert group calls
+OK mimo dense bits 32: tokens = CPU, device 260, 16 dense matrices on the card
+OK mimo dense bits 0: tokens = CPU, device 260, 0 dense matrices on the card
+OK kimi_k3 GGUF all: tokens = CPU, logits within 2.0e-06 of the largest, device 120
+OK kimi_k3 GGUF budget of two: tokens = CPU, logits within 2.0e-06 of the largest, device 120
+OK kimi_k3 GGUF host pool: tokens = CPU, logits within 2.0e-06 of the largest, device 120
+OK glm53 dev2 decode: tokens = CPU, second device Tesla T4 (the same card): resident 2 (budget 14, 54.0 KiB of 13.96 GiB), 87 rows in 7 batches (1 beside prompt steps), uploads 2, 9.1 ms
+OK glm53 dev2 evict: tokens = CPU, second device Tesla T4 (the same card): resident 1 (budget 1, 27.0 KiB of 13.96 GiB), 44 rows in 4 batches (1 beside prompt steps), uploads 1, 8.9 ms
+OK glm53 dev2 fault: tokens = CPU, second device Tesla T4 (the same card): resident 0 (budget 0, 0.0 KiB of 13.96 GiB), 80 rows in 1 batches (1 beside prompt steps), uploads 2, 8.9 ms (stopped)
+OK deepseek_v41 dev2 decode: output = CPU, oracle passed, second device Tesla T4 (the same card): resident 46 (budget 46, 690.0 KiB of 13.96 GiB), 211 rows in 48 batches (0 beside prompt steps), uploads 46, 2.6 ms
+OK deepseek_v41 dev2 fault: output = CPU, oracle passed, second device Tesla T4 (the same card): resident 0 (budget 0, 0.0 KiB of 13.96 GiB), 17 rows in 1 batches (0 beside prompt steps), uploads 46, 0.1 ms (stopped)
+fails: 0

@@ -458,6 +458,12 @@ typedef struct ColiCudaChainOps {
      * without the host's word; else it waits for the word as wait_host does */
     int  (*wait_host_if)(CcBuf *flag, size_t word, unsigned v, CcBuf *tab, size_t t_off, CcBuf *ids, size_t i_off,
                          int nk, int E, CcBuf *hy, size_t hn);
+    /* fetch_at, fetch_wait_at, fetch_done_at: fetch, fetch_wait and fetch_done for the bank
+     * numbered `bank` (0 or 1), each bank with its own pair of events: a second staging bank
+     * is filled while the first is read. fetch, fetch_wait and fetch_done are bank 0's. */
+    int  (*fetch_at)(CcBuf *dst, const CcFetch *r, int n, int bank);
+    int  (*fetch_wait_at)(int bank);
+    int  (*fetch_done_at)(int bank);
 } ColiCudaChainOps;
 /* the table's size without the optional ops: a backend at least this big has the chain */
 #define CC_OPS_BASE_SIZE (offsetof(ColiCudaChainOps, route))
@@ -752,6 +758,13 @@ static inline int cc_matmul_glu(ColiCudaTensor *wg, ColiCudaTensor *wu, CcBuf *x
     if (!(t && t->size >= offsetof(ColiCudaChainOps, matmul_glu) + sizeof t->matmul_glu && t->matmul_glu)) return -1;
     return t->matmul_glu(wg, wu, x, y, S);
 }
+static inline int cc_fetch_at_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, fetch_done_at) + sizeof t->fetch_done_at && t->fetch_at && t->fetch_wait_at && t->fetch_done_at;
+}
+static inline int cc_fetch_at(CcBuf *dst, const CcFetch *r, int n, int bank) { return cc_fetch_at_ready() ? cc_ops()->fetch_at(dst, r, n, bank) : 0; }
+static inline int cc_fetch_wait_at(int bank) { return cc_fetch_at_ready() ? cc_ops()->fetch_wait_at(bank) : 0; }
+static inline int cc_fetch_done_at(int bank) { return cc_fetch_at_ready() ? cc_ops()->fetch_done_at(bank) : 0; }
 #endif
 
 #ifdef __cplusplus
