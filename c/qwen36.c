@@ -9644,10 +9644,10 @@ static void serve_mux(Model *m){
                     free(m->vis_rows); free(m->vis_map); m->vis_rows = NULL; m->vis_map = NULL;
                     m->vis_rows_n = m->vis_map_len = 0;
                     if (ok) { t->active = 1; t->limited = 1; t->forwards = 1; }
+                    else { free(m->mpos); m->mpos = NULL; m->mpos_len = m->rope_delta = 0; }
 #ifdef COLI_CUDA
                     if (ok && mux_drafts) q36_mtp_vocab_begin(t->ids, t->np);   /* the draft vocabulary, as a lone request's */
 #endif
-                    else { free(m->mpos); m->mpos = NULL; m->mpos_len = m->rope_delta = 0; }
                     free(t->q.payload); t->q.payload = NULL;
                     if (ok) emap_emit(m);
                 }
