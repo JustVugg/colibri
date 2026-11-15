@@ -482,6 +482,13 @@ _SALVAGE = os.environ.get("COLI_TOOL_SALVAGE", "0") == "1"
 # output the parser may or may not recognise.
 _TOOL_FALLBACK = os.environ.get("COLI_TOOL_FALLBACK", "0") == "1"
 
+# COLI_LOG_TIMINGS: append one JSON line per finished request with its timings
+# dict (and stream flag / completion_tokens) to a file. Some clients (e.g.
+# GitHub Copilot) discard the response's timings, so this is the way to keep
+# per-request evidence server-side. Value "1" -> ./timings-log.jsonl; any other
+# non-empty value is used as the path. Default OFF.
+_TIMINGS_LOG = os.environ.get("COLI_LOG_TIMINGS", "").strip()
+
 
 # ---- raw-stream span maps ---------------------------------------------------------------
 # Every transformation between the engine's raw stream and the string a client receives is
@@ -9425,6 +9432,17 @@ class APIHandler(BaseHTTPRequestHandler):
                         timings[name] = value
                 result = dict(stats)
                 result["timings"] = timings
+                if _TIMINGS_LOG:
+                    try:
+                        path = _TIMINGS_LOG if _TIMINGS_LOG != "1" else "timings-log.jsonl"
+                        with open(path, "a") as fh:
+                            fh.write(json.dumps({
+                                "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                                "stream": bool(stream),
+                                "completion_tokens": stats.get("completion_tokens"),
+                                "timings": timings}) + "\n")
+                    except OSError:
+                        pass
                 return result
 
             queue_headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000))}
