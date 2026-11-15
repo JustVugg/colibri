@@ -7,6 +7,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### New
 
+- **Qwen3.8 on AMD Quark's MXFP4 experts** (`Q38_EXPERT_LOWBIT=mxfp4`): the routed experts
+  from the `experts-mxfp4/` sidecar, one read of 2.6 MB per miss instead of 4.9 MB, computed by
+  `quant.h`'s `matmul_mxfp4`; the trunk and the shared expert stay FP8. CPU only for now (the
+  expert tiers keep them on the CPU). `make -C c qwen38-tiny-mxfp4-check`: the tiny fixture's
+  tokens and logits through every expert path, its FP8 run's within cosine 0.99999.
 - **Qwen3.8's expert sidecar from several drives** (`COLI_MODEL_MIRROR`, `COLI_DISK_WEIGHTS`):
   copies of `experts-int4g64/` (or the low-bit sidecar in use) on other drives become read
   replicas, each record read from the drive a hash of its (layer, expert) picks, in the shares

@@ -426,6 +426,25 @@ the same values exactly, converted, and checked record by record against the
 Quark bytes and value by value against the FP8 shards. Its `ref.json` is the
 float32 reference of those values.
 
+`Q38_EXPERT_LOWBIT=mxfp4` runs the routed experts from the sidecar: one read
+per miss of 2.6 MB instead of 4.9 MB, multiplied by `quant.h`'s
+`matmul_mxfp4`, the kernel the other MXFP4 engines use; a row's result does
+not depend on how many rows the call carries, so decode and the prompt batch
+give the same bits. The sidecar is used only when asked for (the int4-g64 one
+is the only sidecar picked up unasked), refused when its `index.json` or a
+record disagrees with `config.json`, and an incomplete one is refused rather
+than falling back to FP8. The trunk, the shared expert and the MTP head stay
+the FP8 snapshot's. The CUDA and the Vulkan expert tiers do not take MXFP4
+experts yet: with `COLI_CUDA=1` or `COLI_VULKAN=1` they stay on the CPU, with a
+line saying so.
+
+`make -C c qwen38-tiny-mxfp4-check` runs the engine on the fixture's sidecar
+through the single, batched, prompt-batch and mapped expert paths at caps 1, 2
+and 4: every run reproduces `ref.json` with the last logits identical to the
+bit across paths, the same fixture's FP8 experts give the same tokens and
+last logits within cosine 0.99999, and every refusal above is checked in its
+own process.
+
 ## Speculative decoding with the MTP head
 
 On by default from 1.13.0 when the checkpoint has it (`Q38_MTP=0` turns it off, and
