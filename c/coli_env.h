@@ -885,7 +885,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"SCHEMA",                           CE_STR   , CE_COLIBRI                                      , 0             , NULL},
     {"SCORE",                            CE_STR   , CE_COLIBRI                                      , 0             , NULL},
     {"SCORE_PREFIX",                     CE_INT   , CE_COLIBRI                                      , 0             , NULL},
-    {"SEED", CE_INT, CE_COLIBRI | CE_DSV41 | CE_INKLING | CE_MIMO, 0, NULL},
+    {"SEED", CE_INT, CE_COLIBRI | CE_DSV41 | CE_INKLING | CE_MIMO | CE_QWEN | CE_QWEN38, 0, NULL},
     {"SERVE", CE_INT, CE_COLIBRI | CE_DSV4 | CE_DSV41 | CE_GLM53 | CE_INKLING | CE_KIMI | CE_OLMOE | CE_QWEN | CE_QWEN38 | CE_QWENIMAGE | CE_MIMO | CE_LAYA | CE_GLINER, CE_LAUNCHER, NULL},
     {"SERVE_BATCH",                      CE_INT   , CE_COLIBRI | CE_GLM53 | CE_OLMOE, CE_LAUNCHER             , NULL},
     {"SMOOTH",                           CE_FLOAT , CE_OLMOE | CE_QWEN                              , 0             , NULL},

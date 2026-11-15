@@ -942,6 +942,8 @@ jobs:
           done
       - name: Qwen3.6 checkpoint MTP (reference logits, exact verifies, multi-turn serve)
         run: make -C c qwen36-tiny-mtp-check
+      - name: Qwen3.6 SEED seeds the sampler (same seed same draws, another seed other draws, greedy unchanged)
+        run: make -C c qwen36-seed-check
       - name: Qwen3.8-2.4T geometry, fused experts + mtp head (converter contract + token-exact)
         run: |
           cd c
