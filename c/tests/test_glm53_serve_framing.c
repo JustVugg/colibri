@@ -1,6 +1,7 @@
-/* Freeze glm53's serve request framing before it adopts serve_codec.h: what the reader
- * makes of each frame the gateway sends, what is left in the stream after it, and what
- * the turn's poll answers. No model is loaded: the frames are synthetic bytes. */
+/* glm53's serve request framing: what the reader makes of each frame the gateway sends,
+ * what is left in the stream after it, and what the turn's poll answers (frozen before it
+ * adopted serve_codec.h), and the malformed frames that now end the session instead of
+ * reading the rest of the stream as commands. No model is loaded: the frames are synthetic. */
 #define GLM53_NO_MAIN
 #include "../glm53.c"
 
@@ -180,6 +181,68 @@ static void test_turn_poll(void)
     pending_clear(); fclose(out);
 }
 
+/* the session after a frame the stream cannot be trusted after: BAD_FRAME, then nothing. A
+ * body that broke off comes back without its id (the codec drops the frame whole), so its
+ * BAD_FRAME names 0; the session ends either way, and the gateway fails what was in flight. */
+static void expect_session_ends(const char *frames, unsigned long long id)
+{
+    FILE *in = text_input(frames);
+    ServeReq q; char verb[16];
+    assert(serve_read_req(in, &q, verb, sizeof verb) == 1 && !strcmp(verb, "BAD_FRAME") && q.id == id && !q.payload);
+    assert(serve_read_req(in, &q, verb, sizeof verb) == 0);
+    g53_input_lost = 0;
+    fclose(in);
+}
+
+static void test_malformed_frames_end_the_session(void)
+{
+    expect_session_ends("SUBMIT 1 0 3 4 0 1\nabcXSTOP 1\n", 0);          /* the payload's newline is missing */
+    expect_session_ends("SUBMIT 2 0 9 4 0 1\nshort", 0);                  /* the payload is cut short */
+    expect_session_ends("SUBMIT 3 0 2 0 0 1\nhi\nSTOP 3\n", 3);          /* max_tokens 0 without logprobs */
+    expect_session_ends("SUBMIT 4 0 5 4 0 1 ids=1\n1 2 3\nSTOP 4\n", 4); /* token ids are GLM-5.2's */
+    expect_session_ends("SUBMIT 5 0 2 4 0 1 logprobs=x\nhi\nSTOP 5\n", 5);   /* a malformed key, once ignored */
+    expect_session_ends("SUBMIT x 0 2 4 0 1\nhi\nSTOP 5\n", 0);          /* the id is not a number */
+    expect_session_ends("IMAGE 6 4 0 1\nabcd\nSTOP 6\n", 6);             /* a grid of no rows */
+}
+
+/* a header longer than the line is one refused line, not a second command made of its tail */
+static void test_overlong_line_is_one_line(void)
+{
+    char frame[1024]; size_t n = 600 - strlen("STOP 1");
+    memset(frame, 'x', n);
+    memcpy(frame + n, "STOP 1\nCANCEL 2\n", 16); n += 16;
+    FILE *in = bytes_input(frame, n);
+    ServeReq q; char verb[16];
+    assert(serve_read_req(in, &q, verb, sizeof verb) == 1 && strcmp(verb, "STOP") && strcmp(verb, "BAD_FRAME"));
+    assert(serve_read_req(in, &q, verb, sizeof verb) == 1 && !strcmp(verb, "CANCEL") && q.id == 2);
+    assert(fgetc(in) == EOF);
+    fclose(in);
+}
+
+/* a DECIDE (no decision head here) is consumed and skipped */
+static void test_decide_is_skipped(void)
+{
+    FILE *in = text_input("DECIDE 8 0 2\n{}\nSTOP 8\n");
+    ServeReq q; char verb[16];
+    assert(serve_read_req(in, &q, verb, sizeof verb) == 1 && strcmp(verb, "SUBMIT") && !q.payload);
+    assert(serve_read_req(in, &q, verb, sizeof verb) == 1 && !strcmp(verb, "STOP") && q.id == 8);
+    assert(fgetc(in) == EOF);
+    fclose(in);
+}
+
+/* mid-turn, a frame that broke off is answered and the input then ends: what follows it is
+ * left unread, not taken for the turn's CANCEL */
+static void test_turn_poll_after_a_broken_frame(void)
+{
+    int eof = 0; FILE *out = output_stream();
+    g_poll_in = text_input("SUBMIT 9 0 3 4 0 1\nabcXCANCEL 7\n");
+    assert(serve_cancel_read(g_poll_in, out, poll_ready, 7, &eof) == SERVE_CTL_NONE && eof);
+    assert(fgetc(g_poll_in) == 'C');
+    assert(!strcmp(written(out), "ERROR 0 BAD_FRAME\n"));
+    fclose(g_poll_in); g_poll_in = NULL;
+    g53_input_lost = 0; fclose(out);
+}
+
 int main(void)
 {
     test_submit_payload_and_fields();
@@ -190,6 +253,10 @@ int main(void)
     test_image_then_submit();
     test_frames_in_sequence();
     test_turn_poll();
+    test_malformed_frames_end_the_session();
+    test_overlong_line_is_one_line();
+    test_decide_is_skipped();
+    test_turn_poll_after_a_broken_frame();
     puts("test_glm53_serve_framing: OK");
     return 0;
 }
