@@ -944,6 +944,8 @@ jobs:
         run: make -C c qwen36-tiny-mtp-check
       - name: Qwen3.6 SEED seeds the sampler (same seed same draws, another seed other draws, greedy unchanged)
         run: make -C c qwen36-seed-check
+      - name: Qwen3.6 DUMP writes every sampled row (one row a token, argmax = the token, requests append)
+        run: make -C c qwen36-dump-check
       - name: Qwen3.8-2.4T geometry, fused experts + mtp head (converter contract + token-exact)
         run: |
           cd c

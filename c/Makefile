@@ -2052,7 +2052,7 @@ qwen36-tiny-mtp-check: qwen36-tiny-mtp-generate qwen36$(EXE)
 # vocabulary (--vocab 128), so a reply resent as text reads back as the ids the
 # engine generated. SPEC_ENV passes more settings to every run (the Vulkan family
 # in tests/vulkan_engines.sh runs the same gates in the dense chain).
-.PHONY: qwen36-tiny-v128-generate qwen36-seed-check spec-drafts-check spec-drafts-run
+.PHONY: qwen36-tiny-v128-generate qwen36-seed-check qwen36-dump-check spec-drafts-check spec-drafts-run
 qwen36-tiny-v128-generate:
 	$(PYTHON) tools/make_qwen36_tiny.py --out ./qwen36_tiny_v128 --ref-mode full --vocab 128 \
 		--emit-ref ./qwen36_tiny_v128/ref_full.json
@@ -2070,6 +2070,10 @@ qwen36-seed-check: qwen36-tiny-v128-generate qwen36$(EXE)
 qwen36-echo-serve-check: qwen36-tiny-v128-generate qwen36$(EXE)
 	$(PYTHON) tests/qwen36_echo_serve_harness.py ./qwen36_tiny_v128_c
 	$(PYTHON) tests/qwen36_echo_serve_harness.py ./qwen36_tiny64_v128_c
+
+# DUMP on the generated fixture: one row a sampled token, the argmax the token sent, requests append.
+qwen36-dump-check: qwen36-tiny-v128-generate qwen36$(EXE)
+	QWEN36_TINY=./qwen36_tiny_v128_c QWEN36_TINY_REQUIRED=1 $(PYTHON) -m unittest -v tests.test_qwen36_dump
 
 tests/test_spec_draft$(EXE): tests/test_spec_draft.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)

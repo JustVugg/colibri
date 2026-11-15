@@ -8395,10 +8395,17 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S) {
     free(logits);
 }
 
-/* When DUMP=<path> is set, generate() copies the last-token logits here so main()
- * can write them to <path> (raw float32, length = vocab). Lets a torch-free
- * cosine comparison against tools/_ref_dn.py's numpy logits validate the port. */
-static float *g_last_logit = NULL;
+/* DUMP=<path>: every logits row a token is sampled from, appended to <path> as raw float32
+ * (vocab floats a row), as colibri.c's dump_logits writes them: generate()'s rows (the
+ * prompt's last position first, then each step's) and serve's (each request's rows in
+ * turn). It used to hold the last row only, which left a torch-free comparison one
+ * position to look at and nothing of the path there (#I4 of the audit). The file is
+ * opened at the first row and closed at exit, with a line saying how many rows it got. */
+static FILE *g_dump = NULL; static int g_dump_init = 0; static long g_dump_rows = 0;
+static void dump_logits(const float *lo, int n) {
+    if (!g_dump_init) { g_dump_init = 1; const char *p = getenv("DUMP"); if (p && *p) g_dump = fopen(p, "wb"); }
+    if (g_dump) { fwrite(lo, sizeof(float), (size_t)n, g_dump); fflush(g_dump); g_dump_rows++; }
+}
 
 /* Zero the DeltaNet recurrent state so a new request doesn't inherit the
  * previous conversation's hidden state. Must be called at the start of every
@@ -9655,17 +9662,12 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     Q36Spec *sp = &g_q36_run_spec;
     q36_spec_begin(m, sp, prompt, np);   /* COLI_LOOKUP=1: drafts, every token still the argmax below */
     for (int s = 0; s < n_new; s++) {
+        dump_logits(logit, c->vocab);
         int best = 0; float bv = logit[0];
         for (int i = 1; i < c->vocab; i++) if (logit[i] > bv) { bv = logit[i]; best = i; }
         if (s == 0 && g_ttft < 0) g_ttft = now_s() - g_gen_t0;   /* record TTFT */
         if (g_stream) { stream_token(best); fflush(stdout); }
-        if (s == n_new - 1) {
-            if (getenv("DUMP")) {
-                g_last_logit = malloc((size_t)c->vocab * sizeof(float));
-                memcpy(g_last_logit, logit, (size_t)c->vocab * sizeof(float));
-            }
-            free(logit); out[len++] = best; break;
-        }
+        if (s == n_new - 1) { free(logit); out[len++] = best; break; }
         free(logit); out[len++] = best;
         { extern double g_tm_step; double _s0 = tm_now();
           logit = q36_spec_step(m, sp, best, len - 1, n_new - 1 - s);
@@ -10359,6 +10361,7 @@ static void serve_one_turn(Model *m, ServeReq *q){
     unsigned char sbuf[16]; int sbn=0;
     Q36Spec spec; q36_spec_begin(m, &spec, ids, np);   /* COLI_LOOKUP=1: drafts, every token still sampled from the exact logits */
     for(int s=0;s<q->max_tok;s++){
+        dump_logits(lo, m->c.vocab);
         int tk = serve_sample(lo, m->c.vocab, q->temp, q->top_p);
         /* La coda si calcola PRIMA della free: dopo, lo non c'e piu. */
         char lptail[1024]; lptail[0]=0;
@@ -10858,6 +10861,7 @@ static void q36_mux_finish(Model *m, Q36MuxReq *r){
 static int q36_mux_pick(Model *m, Q36MuxReq *r, const int *eos_ids, int n_eos, int *tk_out){
     if (r->stop) r->limited = 0;
     if (r->cancel || r->stop || r->gen >= r->q.max_tok) { q36_mux_finish(m, r); return 0; }
+    dump_logits(r->lo, m->c.vocab);
     int tk = serve_sample(r->lo, m->c.vocab, r->q.temp, r->q.top_p);
     char lptail[1024]; lptail[0] = 0;
     if (r->q.logprobs > 0) coli_logprob_tail(lptail, sizeof lptail, r->lo, m->c.vocab, tk, r->q.logprobs);
@@ -10890,6 +10894,7 @@ static void q36_mux_settle(Model *m, Q36MuxReq *r, int slot, const float *hid, c
     if (r->dn) {
         const float *row = r->lo;
         while (acc < r->dn && !r->stop && !r->cancel && r->gen + acc + 1 < r->q.max_tok) {
+            dump_logits(row, V);
             const int t = serve_sample(row, V, r->q.temp, r->q.top_p);
             int end = t != r->d[acc];
             for (int e = 0; e < n_eos && !end; e++) end = t == eos_ids[e];
@@ -11519,7 +11524,8 @@ int main(int argc, char **argv) {
     { const char *seed = getenv("SEED");
       srand(seed && *seed ? (unsigned)strtoul(seed, NULL, 10) : (unsigned)(time(NULL) ^ (unsigned)getpid())); }
     const char *snap = getenv("SNAP");
-    if (!snap) { coli_print_launcher_help("Qwen3.6", "SNAP=<model directory> ./qwen36 ..."); return 1; }
+    if (!snap || !*snap) snap = getenv("COLI_MODEL");   /* the launcher's name for it, as colibri.c takes it */
+    if (!snap || !*snap) { coli_print_launcher_help("Qwen3.6", "SNAP=<model directory> ./qwen36 ..."); return 1; }
     static char gguf_path[4096], mmproj_path[4096], mtp_path[4096]; int gguf_dir = 0;
     {   /* a model directory made by tools/gguf_import.py: gguf.json names the file */
         char gj[4096]; snprintf(gj, sizeof gj, "%s/gguf.json", snap);
@@ -12167,15 +12173,10 @@ int main(int argc, char **argv) {
     generate(&m, prompt, np, n_new, out);
     double dt = now_s() - t;
 
-    /* DUMP=<path>: write last-token logits (raw float32, vocab) for a torch-free
-     * cosine comparison against tools/_ref_dn.py --dump. */
-    if (g_last_logit) {
-        const char *dp = getenv("DUMP");
-        FILE *df = fopen(dp && *dp ? dp : "qwen36_logits.f32", "wb");
-        if (df) { fwrite(g_last_logit, sizeof(float), (size_t)m.c.vocab, df); fclose(df);
-                  fprintf(stderr, "[dump] wrote %d logits -> %s\n", m.c.vocab, dp && *dp ? dp : "qwen36_logits.f32"); }
-        else fprintf(stderr, "[dump] cannot open %s\n", dp ? dp : "qwen36_logits.f32");
-    }
+    /* DUMP=<path>: the rows went out as they were sampled (dump_logits); say how many */
+    if (g_dump) { fclose(g_dump); g_dump = NULL;
+                  fprintf(stderr, "[dump] wrote %ld rows of %d logits -> %s\n", g_dump_rows, m.c.vocab, getenv("DUMP")); }
+    else if (getenv("DUMP") && *getenv("DUMP") && g_dump_init) fprintf(stderr, "[dump] cannot open %s\n", getenv("DUMP"));
 
     int ref_match = 0;
     if (is_ref) {

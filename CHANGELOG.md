@@ -657,6 +657,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **qwen36, qwen38: `DUMP` writes every sampled row, `SNAP` falls back to `COLI_MODEL`.** `DUMP=<path>` used
+  to keep the last token's logits only; it now appends every row a token is sampled from, raw f32,
+  vocab floats a row, as colibri.c's `dump_logits` does, so a comparison sees the whole path, not
+  its end (the CI gates that `cmp` two runs' dumps compare the same rows as before, there are
+  just more of them). Both engines take the model directory from `COLI_MODEL` when `SNAP` is
+  unset, as colibri.c does.
 - **A GGUF's reads no longer queue one behind the other on Windows.** `gguf_read` read through the
   descriptor `open()` gives, a synchronous file object, and Windows runs one I/O at a time on one:
   the OpenMP team that reads a prompt's PLE rows ahead (`q38_ple_prefetch`) read them in turn. Each

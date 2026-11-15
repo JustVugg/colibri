@@ -630,7 +630,7 @@ class GraphRuns(unittest.TestCase):
     def assert_ran(self, run, graph):
         self.assertEqual(run["code"], 0, run["stderr"][-3000:])
         self.assertEqual(len(run["layers"]), 3 * LAYERS * HIDDEN, run["stderr"][-3000:])
-        self.assertEqual(len(run["logits"]), VOCAB, run["stderr"][-3000:])
+        self.assertEqual(len(run["logits"]), VOCAB * run["n_new"], run["stderr"][-3000:])   # one row a sampled token
         self.assertEqual("graph ready" in run["stderr"], graph, run["stderr"][-3000:])
 
     def assert_close(self, a, b, tol, what):
