@@ -338,7 +338,8 @@ class NvidiaParsing(unittest.TestCase):
             {"name": "Tesla P40", "pci_bus_id": "0000:3B:00.0", "compute_cap": "6.1"},
             {"name": "Tesla V100-SXM2-16GB", "pci_bus_id": "0000:1a:00.0", "compute_cap": "7.0"}]}
         gpus, seen, child = self.run_detect(answers, "/usr/bin/nvidia-smi", probe)
-        self.assertEqual([cmd[1] for cmd in seen], [query, old_query])
+        # (on Windows a third query reads the driver model)
+        self.assertEqual([cmd[1] for cmd in seen if "driver_model" not in cmd[1]], [query, old_query])
         child.assert_called_once()
         self.assertEqual([(g["name"], g["compute_cap"]) for g in gpus],
                          [("Tesla V100-SXM2-16GB", "7.0"), ("Tesla P40", "6.1")])   # matched by slot

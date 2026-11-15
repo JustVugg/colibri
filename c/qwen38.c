@@ -2493,7 +2493,15 @@ static int q38_psd_on(Model *m){
         }
         /* the kernels loaded at run time: this binary, the backend DLL, the Vulkan shaders */
 #ifdef _WIN32
-        static const char *dlls[]={NULL,"coli_cuda.dll","coli_hip.dll"};
+        /* only the DLL this build loads (backend_loader.c's name for it): a DLL name in
+           the image is how coli setup and doctor tell a CUDA, HIP or CPU build apart */
+#if defined(COLI_HIP_DLL)
+        static const char *dlls[]={NULL,"coli_hip.dll"};
+#elif defined(COLI_CUDA)
+        static const char *dlls[]={NULL,"coli_cuda.dll"};
+#else
+        static const char *dlls[]={NULL};
+#endif
         for(size_t k=0;k<sizeof dlls/sizeof *dlls;k++){
             HMODULE mod=dlls[k]?GetModuleHandleA(dlls[k]):NULL;
             const DWORD n=dlls[k]&&!mod?0:GetModuleFileNameA(mod,path,(DWORD)sizeof path);

@@ -764,6 +764,50 @@ class WindowsCudaPackage(unittest.TestCase):
                 self.assertIn(artifact, uploaded)
                 self.assertIn(artifact, setup_flow.TEXT_HINTS["cuda-win32-release"])
 
+    def test_a_backend_library_is_named_only_by_the_build_that_loads_it(self):
+        """coli setup and doctor tell a CUDA, HIP and CPU engine apart by the library names
+        in its image (binary_backends, doctor.windows_backend_dll). A string naming both
+        DLLs in qwen38.c made the Vulkan qwen38.exe read as CUDA and the CUDA one as HIP:
+        an engine source names a library only inside the #if of the build that loads it.
+        backend_loader.c links into the GPU hosts only (CUDA_OBJ)."""
+        guards = {"coli_hip.dll": "COLI_HIP_DLL", "coli_cuda.dll": "COLI_CUDA",
+                  "libcudart": "COLI_CUDA", "libamdhip64": "COLI_CUDA"}
+        token = re.compile(r'//[^\n]*|/\*.*?\*/|"(?:[^"\\\n]|\\.)*"|\'(?:[^\'\\\n]|\\.)*\'', re.S)
+
+        def without_comments(text):
+            return token.sub(lambda m: m.group(0) if m.group(0)[0] in "\"'" else "\n" * m.group(0).count("\n"),
+                             text)
+
+        def holds(guard, condition):
+            return (not condition.startswith("!") and re.search(rf"\b{guard}\b", condition)
+                    and not re.search(rf"!\s*(defined\s*\(?\s*)?{guard}\b", condition))
+
+        sources = sorted(p for pattern in ("*.c", "*.h", "*.inc") for p in C_DIR.glob(pattern))
+        self.assertIn(C_DIR / "qwen38.c", sources)
+        for path in sources:
+            if path.name == "backend_loader.c":
+                continue
+            branches = []        # the condition of each open #if's current branch
+            text = without_comments(path.read_text(encoding="utf-8", errors="replace"))
+            for number, line in enumerate(text.splitlines(), 1):
+                directive = re.match(r"\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b(.*)", line)
+                if directive:
+                    word, rest = directive.group(1), directive.group(2).strip()
+                    if word in ("if", "ifdef", "ifndef"):
+                        branches.append(("!" if word == "ifndef" else "") + rest)
+                    elif word == "elif" and branches:
+                        branches[-1] = rest
+                    elif word == "else" and branches:
+                        branches[-1] = "!" + branches[-1]
+                    elif word == "endif" and branches:
+                        branches.pop()
+                    continue
+                for literal in re.findall(r'"(?:[^"\\\n]|\\.)*"', line):
+                    for name, guard in guards.items():
+                        if name in literal.lower():
+                            self.assertTrue(any(holds(guard, c) for c in branches),
+                                            f"{path.name}:{number} names {name} outside #if {guard}")
+
 
 class PackageHints(unittest.TestCase):
     def test_one_command_per_system(self):

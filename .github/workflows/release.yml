@@ -411,8 +411,9 @@ jobs:
           python3 -c "import sys; sys.path.insert(0, '.'); from openai_server import APIHandler as A; d = A.WEB_DIST; assert (d / 'index.html').is_file(), 'server resolved WEB_DIST to %s, which has no index.html' % d; assert (d / 'experts.json').is_file(), 'no expert atlas under %s' % d; print('OK: the packaged server resolves the dashboard at', d)"
 
       # The GPU backends in the archive, by behaviour as above. Vulkan (Linux, Windows):
-      # every shader the build compiled is in shaders/, every engine is a Vulkan build
-      # (what coli setup reads to offer the GPU), none links the Vulkan loader (a
+      # every shader the build compiled is in shaders/, every engine is a Vulkan build and
+      # nothing else (what coli setup reads to offer the GPU: a CUDA or HIP DLL name in the
+      # image would make it offer CUDA), none links the Vulkan loader (a
       # machine without one has to run them on the CPU), and the packaged engine, started
       # from another directory, finds its shaders and a device (Lavapipe on Linux) or,
       # with no loader, says so instead of failing to start.
@@ -430,10 +431,11 @@ jobs:
           sys.path.insert(0, ".")
           from setup_flow import binary_backends
           exe = ".exe" if os.name == "nt" else ""
-          bad = [e for e in os.environ["COLI_ENGINES"].split() if "vulkan" not in binary_backends(e + exe)]
+          bad = [e for e in os.environ["COLI_ENGINES"].split() if binary_backends(e + exe) != {"vulkan"}]
           if bad:
-              sys.exit("FAIL: not Vulkan builds: " + ", ".join(bad))
-          print("OK: every engine is a Vulkan build")
+              sys.exit("FAIL: not Vulkan-only builds: " + ", ".join(
+                  f"{e} {sorted(binary_backends(e + exe))}" for e in bad))
+          print("OK: every engine is a Vulkan build and nothing else")
           PYCHK
           for e in $ENGINES; do
             if [ "${{ matrix.ext }}" = ".exe" ]; then deps=$(objdump -p $e.exe | grep 'DLL Name'); else deps=$(ldd $e); fi
