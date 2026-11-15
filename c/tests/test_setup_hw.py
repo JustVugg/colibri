@@ -566,6 +566,24 @@ class Report(unittest.TestCase):
         report["cpu"]["features"] = ["avx2"]
         self.assertNotIn("no AVX2", setup_hw.format_report(report))
 
+    def test_features_that_were_not_read_are_not_reported_missing(self):
+        # FreeBSD lacks /proc/cpuinfo: detect_cpu finds no features there, and the
+        # report said "no AVX2" on a Xeon Gold 6230, which has it the feature
+        with mock.patch.object(setup_hw.sys, "platform", "freebsd15"), \
+             mock.patch("builtins.open", side_effect=FileNotFoundError("/proc/cpuinfo")), \
+             mock.patch.object(setup_hw.platform, "machine", return_value="amd64"):
+            cpu = setup_hw.detect_cpu()
+        self.assertEqual(cpu["features"], [])
+        self.assertIs(cpu["features_known"], False)
+        report = {"os": {"platform": "freebsd15", "pretty_name": "FreeBSD 15.1"}, "cpu": cpu,
+                  "memory": {"total": 910e9, "available": 512e9}, "disk": None,
+                  "vulkan": {"devices": []}, "nvidia": [], "windows_video": [],
+                  "gpu": setup_hw.gpu_summary({"devices": []}, [])}
+        self.assertNotIn("no AVX2", setup_hw.format_report(report))
+        # the processor of a host whose features were read still gets the note
+        cpu = dict(cpu, features_known=True)
+        self.assertIn("no AVX2", setup_hw.format_report(dict(report, cpu=cpu)))
+
     def test_detect_without_gpu_probe_is_plain_data(self):
         import json
         with tempfile.TemporaryDirectory() as tmp:
