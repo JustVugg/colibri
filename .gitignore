@@ -188,6 +188,7 @@ c/qwen38_vision_tiny/
 c/qwen38_mm_tiny/
 c/qwen38_tiny_fp8/
 c/qwen38_tiny_int4/
+c/qwen38_tiny_mxfp4/
 c/qwen38_tiny_mtp/
 c/qwen38_tiny_fp8_mtp/
 c/qwen38_tiny_int4_mtp/
