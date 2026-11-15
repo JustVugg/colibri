@@ -3760,7 +3760,10 @@ extern "C" void dsv4_cuda_graph_free(Dsv4CudaGraph*g){if(!g)return;cudaSetDevice
  * cache's recycling timing (expert slabs past DSV4_CUDA_PIN_CAP_GB, or all of
  * them with DSV4_CUDA_PIN_HOST=0, are pageable). Same blocking contract for
  * the caller as cudaMemcpy. */
+static bool host_pinned(const void*p,size_t len);
+static bool host_pin_straddled(const void*p,size_t len);
 static int h2d(Dev*c,void*dst,const void*src,size_t n,const char*what){
+    if(host_pin_straddled(src,n))host_pinned(src,n);   /* one registration under the whole source */
     return ok(cudaMemcpyAsync(dst,src,n,cudaMemcpyHostToDevice,c->stream),what)&&ok(cudaStreamSynchronize(c->stream),what);}
 static int upload(Dsv4CudaTensor **pt,const void *w,size_t wb,const uint8_t *sc,size_t sb,int O,int I,int d,int fmt){if(*pt)return 1;Dev *c=ctx(d);if(!c||!ok(cudaSetDevice(d),"select upload device"))return 0;Dsv4CudaTensor *t=(Dsv4CudaTensor*)calloc(1,sizeof(*t));t->O=O;t->I=I;t->device=d;t->fmt=fmt;t->bytes=wb+sb;
     if(!alloc_ok(cudaMalloc(&t->w,wb),"weight allocation")){dsv4_cuda_tensor_free(t);return 0;}t->own_w=1;if(!h2d(c,t->w,w,wb,"weight upload")){dsv4_cuda_tensor_free(t);return 0;}
@@ -5041,12 +5044,19 @@ static size_t pin_cap_bytes(){
     const char*e=getenv("DSV4_CUDA_PIN_CAP_GB");char*end=nullptr;double gb=e&&*e?strtod(e,&end):20.0;
     if(e&&*e&&(end==e||gb!=gb))gb=20.0;if(gb<0)gb=0;if(gb>1048576.0)gb=1048576.0;
     return (size_t)(gb*(double)(1ULL<<30));}
+/* The source starts inside a registered range and ends outside it: a first
+ * upload (h2d) from a slab whose earlier record was registered at another
+ * offset. host_pinned then puts one registration under all of it. */
+static bool host_pin_straddled(const void*p,size_t len){
+    uintptr_t a=(uintptr_t)p;
+    for(auto&r:g_pin_regions)if(a>=r.base&&a<r.base+r.size&&a+len>r.base+r.size)return true;
+    return false;}
 static bool host_pinned(const void*p,size_t len){
     if(g_pin_enabled<0){const char*e=getenv("DSV4_CUDA_PIN_HOST");g_pin_enabled=!(e&&*e=='0');}
     if(!g_pin_enabled||!p||!len)return false;
     uintptr_t a=(uintptr_t)p;
     for(auto&r:g_pin_regions)if(a>=r.base&&a+len<=r.base+r.size)return true;
-    for(auto&r:g_pin_failed)if(a>=r.base&&a+len<=r.base+r.size)return false;
+    if(!host_pin_straddled(p,len))for(auto&r:g_pin_failed)if(a>=r.base&&a+len<=r.base+r.size)return false;
 #ifdef _WIN32
     MEMORY_BASIC_INFORMATION mbi;
     if(!VirtualQuery(p,&mbi,sizeof mbi)||mbi.State!=MEM_COMMIT)return false;
@@ -5064,14 +5074,23 @@ static bool host_pinned(const void*p,size_t len){
      * whole pages, so register the requested range rounded out to page
      * boundaries. The slot slabs are stable for the process lifetime (one
      * posix_memalign per slot, freed only at store destroy), exactly like the
-     * Windows branch assumes. Overlapping ranges collapse into the
-     * already-registered success case; any failure (WSL builds without
-     * pinning support included) lands in g_pin_failed and every later upload
-     * from that slab takes the pageable path, same as before this branch
-     * existed. */
+     * Windows branch assumes. A record does not start at the same byte of
+     * its slab every time (V4_SLAB_SHIFT), so a range can run across the end
+     * of one registered earlier: that one is released and the two are
+     * registered as one range, because a copy whose source starts inside a
+     * registration and ends outside it is refused (HIP: invalid argument).
+     * Any failure (WSL builds without pinning support included) lands in
+     * g_pin_failed and every later upload from that slab takes the pageable
+     * path, same as before this branch existed. */
     long page=sysconf(_SC_PAGESIZE);if(page<=0)page=4096;
-    uintptr_t base=a&~((uintptr_t)page-1);
-    size_t size=((a+len+page-1)&~((uintptr_t)page-1))-base;
+    uintptr_t base=a&~((uintptr_t)page-1),end=(a+len+page-1)&~((uintptr_t)page-1);
+    for(size_t i=0;i<g_pin_regions.size();){PinRegion r=g_pin_regions[i];
+        if(r.base>=end||r.base+r.size<=base){i++;continue;}
+        (void)cudaDeviceSynchronize();   /* no copy in flight from the pages released */
+        if(cudaHostUnregister((void*)r.base)!=cudaSuccess)(void)cudaGetLastError();else g_pin_bytes-=r.size;
+        if(r.base<base)base=r.base;if(r.base+r.size>end)end=r.base+r.size;
+        g_pin_regions.erase(g_pin_regions.begin()+i);i=0;}
+    size_t size=end-base;
     static const size_t cap=pin_cap_bytes();
     if(g_pin_bytes+size>cap){g_pin_failed.push_back({base,size});return false;}
     cudaError_t err=cudaHostRegister((void*)base,size,cudaHostRegisterPortable);
