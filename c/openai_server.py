@@ -6879,7 +6879,7 @@ def _engine_extension_args(engine_k):
     only for the families whose SUBMIT header carries it (`submit_gbytes`):
     coli_submit_parse reads seven fields, while a sibling engine's parser reads six and
     takes its keys straight after top_p, so the extra field would land where it wants a
-    key and be answered with "bad submit extension".
+    key and the header be refused ("bad submit header").
 
     /v1/systemone's scoring sends its keys through the same rule (`_engine_gbytes_args`):
     without the field, colibri.c refused its header and the request waited for an answer

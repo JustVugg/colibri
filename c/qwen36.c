@@ -75,6 +75,7 @@ static int qwen36_max_ctx(void) {
 #include "spec_draft.h" /* prompt-lookup drafts and the gate that decides when they pay (COLI_LOOKUP=1) */
 #include "pin_pool.h"   /* riuso del prefisso tra turni (shared) */
 #include "decode_batch.h" /* ColiSubmit + coli_submit_ext: le chiavi key=value di SUBMIT */
+#include "serve_codec.h"  /* the request frames, as the sibling engines read them */
 #include "json.h"   /* tokenizer.json parsing (reuse minimal parser) */
 #include "tok_unicode.h"        /* is_S/is_L/is_N: the exact pre-tokenizer classes (Clef) */
 #include "tok_unicode_o200k.h"  /* is_U/is_X: the case classes of o200k's letter rules (Flint) */
@@ -8469,102 +8470,71 @@ static void q36_pending_image_clear(void){
     memset(&g_pending_image, 0, sizeof g_pending_image);
 }
 
-static int serve_read_req(ServeReq *q){
-    char line[512], cmd[16], id[64];
-    if(!fgets(line,sizeof(line),stdin)) return -1;
-    if(sscanf(line,"%15s %63s",cmd,id)<2) return 0;
-    if(!strcmp(cmd,"IMAGE")){
-        /* The payload is consumed whatever happens next: left in the stream it
-         * would be read as the following frame's header. A header that does not
-         * say how long the payload is cannot be skipped, so it ends the session. */
-        unsigned long long bytes; int gh, gw;
-        if(sscanf(line,"%*s %*s %llu %d %d",&bytes,&gh,&gw)!=3 || bytes>(1ull<<30) || gh<1 || gw<1){
-            printf("ERROR %s bad image header\n",id); fflush(stdout); return -1;
-        }
-        unsigned char *buf = malloc((size_t)bytes + 1);
-        if(!buf){ printf("ERROR %s out of memory\n",id); fflush(stdout); return -1; }
-        if(bytes && fread(buf,1,(size_t)bytes,stdin)!=(size_t)bytes){ free(buf); return -1; }
-        int t = fgetc(stdin); if(t=='\r') t = fgetc(stdin);
-        if(t!='\n'){ free(buf); return -1; }
+/* The frames go through serve_codec.h, as for the sibling engines: a header longer than
+ * the line, a payload that does not end on its newline or a short read end the session
+ * instead of reading the rest of the stream as commands. The limits are the ones this
+ * reader always had (an image up to 1 GiB, a prompt up to 16 MiB, a decision record up
+ * to 64 MiB), the last two checked once the payload is consumed, so a refusal leaves the
+ * next frame where it starts. */
+#define Q36_MAX_PROMPT_BYTES (1ull << 24)
+#define Q36_MAX_DECIDE_BYTES (64ull << 20)
+static const ColiServeWireProfile q36_wire = {
+    .max_header_bytes = 511,
+    .max_payload_bytes = 1ull << 30,
+    .require_exact_lf = 1,
+};
+
+/* 2: SUBMIT, 3: DECIDE, 4: CANCEL, 5: STOP (a lone serve reads these mid-turn),
+ * 0: nothing to run, -1: end of input or a frame the stream cannot recover from. */
+static int g_q36_input_lost;   /* a frame broke off: what follows is no longer a header */
+static int serve_read_req(FILE *in, FILE *out, ServeReq *q){
+    if(g_q36_input_lost) return -1;
+    ColiServeCommand c;
+    ColiServeReadResult r = coli_serve_read_command(in, &q36_wire, &c);
+    if(r == COLI_SERVE_READ_BAD_FRAME) g_q36_input_lost = 1;
+    if(r == COLI_SERVE_READ_EOF || r == COLI_SERVE_READ_BAD_FRAME) return -1;
+    if(r == COLI_SERVE_READ_NOMEM){
+        coli_serve_write_error(out, c.id, c.kind == COLI_SERVE_COMMAND_DECIDE ? "DECIDE_FAILED out of memory" : "out of memory");
+        return -1;
+    }
+    if(r == COLI_SERVE_READ_BAD_REQUEST){
+        const ColiServeCommandKind kind = c.kind; int rc = 0;
+        if(kind == COLI_SERVE_COMMAND_SUBMIT) coli_serve_write_error(out, c.id, "bad submit header");
+        /* their payload's length is unknown: it cannot be skipped */
+        else if(kind == COLI_SERVE_COMMAND_IMAGE){ coli_serve_write_error(out, c.id, "bad image header"); rc = -1; }
+        else if(kind == COLI_SERVE_COMMAND_DECIDE && g_clef){ coli_serve_write_error(out, c.id, "BAD_FRAME"); rc = -1; }
+        coli_serve_command_dispose(&c);
+        return rc;
+    }
+    if(r != COLI_SERVE_READ_OK) return 0;
+    snprintf(q->id, sizeof(q->id), "%s", c.id);
+    switch(c.kind){
+    case COLI_SERVE_COMMAND_CANCEL: return 4;
+    case COLI_SERVE_COMMAND_STOP: return 5;
+    case COLI_SERVE_COMMAND_IMAGE:
         if(g_pending_image.present) fprintf(stderr,"[qwen36] a second image arrived before its SUBMIT; dropping the first\n");
         q36_pending_image_clear();
-        g_pending_image.patches = buf; g_pending_image.bytes = bytes;
-        g_pending_image.grid_h = gh; g_pending_image.grid_w = gw; g_pending_image.present = 1;
+        g_pending_image.bytes = c.payload_bytes; g_pending_image.grid_h = c.grid_h; g_pending_image.grid_w = c.grid_w;
+        g_pending_image.patches = coli_serve_command_take_payload(&c); g_pending_image.present = 1;
+        return 0;
+    case COLI_SERVE_COMMAND_DECIDE:
+        /* an engine without a Clef head never announced decide=1: nothing to answer */
+        if(!g_clef){ coli_serve_command_dispose(&c); return 0; }
+        if(c.payload_bytes > Q36_MAX_DECIDE_BYTES){ coli_serve_command_dispose(&c); coli_serve_write_error(out, q->id, "BAD_FRAME"); return 0; }
+        q->slot = c.slot; q->plen = (int)c.payload_bytes;
+        q->payload = (char *)coli_serve_command_take_payload(&c);
+        return 3;
+    case COLI_SERVE_COMMAND_SUBMIT:
+        if(c.payload_bytes > Q36_MAX_PROMPT_BYTES){ coli_serve_command_dispose(&c); coli_serve_write_error(out, q->id, "bad submit header"); return 0; }
+        q->slot = c.slot; q->max_tok = c.max_tokens; q->temp = c.temperature; q->top_p = c.top_p;
+        q->logprobs = c.logprobs; q->pin = c.pin;
+        q->plen = (int)c.payload_bytes;
+        q->payload = (char *)coli_serve_command_take_payload(&c);
+        return 2;
+    default:
+        coli_serve_command_dispose(&c);
         return 0;
     }
-    if(g_clef && !strcmp(cmd,"DECIDE")){
-        /* DECIDE <id> <slot> <bytes>, then the record and a newline (Clef only:
-         * an engine without the head never announced decide=1). As for IMAGE, a
-         * header that does not say how long the payload is ends the session. */
-        int dslot; unsigned long long bytes;
-        if(sscanf(line,"%*s %*s %d %llu",&dslot,&bytes)!=2 || dslot<0 || bytes>(64ull<<20)){
-            printf("ERROR %s BAD_FRAME\n",id); fflush(stdout); return -1;
-        }
-        char *payload=malloc((size_t)bytes+1);
-        if(!payload){ printf("ERROR %s DECIDE_FAILED out of memory\n",id); fflush(stdout); return -1; }
-        if(bytes && fread(payload,1,(size_t)bytes,stdin)!=(size_t)bytes){ free(payload); return -1; }
-        int t = fgetc(stdin); if(t=='\r') t = fgetc(stdin);
-        if(t!='\n'){ free(payload); return -1; }
-        payload[bytes]=0;
-        snprintf(q->id,sizeof(q->id),"%s",id);
-        q->payload=payload; q->plen=(int)bytes; q->slot=dslot;
-        return 3;
-    }
-    /* 4: cancelled; 5: normal stop (a lone serve reads these mid-turn). */
-    if(!strcmp(cmd,"CANCEL")||!strcmp(cmd,"STOP")){
-        snprintf(q->id,sizeof(q->id),"%s",id); return !strcmp(cmd,"CANCEL") ? 4 : 5;
-    }
-    if(strcmp(cmd,"SUBMIT")) return 0;
-    int slot, plen, max_tok; float temp, top_p;
-    if(sscanf(line,"%*s %*s %d %d %d %f %f",&slot,&plen,&max_tok,&temp,&top_p)!=5 ||
-       plen<0||plen>(1<<24)||max_tok<0){   /* 0 = modalita jev, vedi sotto */
-        printf("ERROR %s bad submit header\n",id); fflush(stdout); return 0;
-    }
-    q->slot = slot;
-    /* Le chiavi key=value stanno dopo i campi fissi. Si riusa il parser
-     * condiviso di decode_batch.h invece di scriverne un secondo: e lo stesso
-     * namespace che colibri.c gia accetta, quindi i due motori non divergono.
-     * Un client vecchio non manda nessuna chiave e finisce a logprobs=0. */
-    q->logprobs = 0;
-    q->pin = 0;
-    {
-        /* Stessa tecnica di coli_submit_parse: %n da l'offset dopo i campi
-         * numerici, e la chiave deve essere separata da spazio (altrimenti
-         * "1logprobs=5" sarebbe un campo malformato, non un opt-in). Qui i
-         * campi fissi sono 6 e non 7, perche questo header non ha gbytes. */
-        int base = 0;
-        int sd, sp_, smt; float st, stp;
-        if (sscanf(line, "%*s %*s %d %d %d %f %f%n", &sd, &sp_, &smt, &st, &stp, &base) == 5 &&
-            base > 0 && (line[base] == ' ' || line[base] == '\t')) {
-            /* coli_submit_ext rifiuta qualunque byte non-spazio dopo il valore,
-             * e fgets lascia il '\n' in fondo: va tolto, o "logprobs=5\n" e
-             * un valore con spazzatura attaccata. Si lavora su una copia per
-             * non toccare la riga che il chiamante ha gia parsato. */
-            char ext_buf[256];
-            snprintf(ext_buf, sizeof ext_buf, "%s", line + base);
-            for (char *e = ext_buf; *e; e++) if (*e == '\n' || *e == '\r') { *e = 0; break; }
-            const char *tail = ext_buf;
-            while (*tail == ' ' || *tail == '\t') tail++;
-            if (*tail) {
-                ColiSubmit ext; memset(&ext, 0, sizeof ext);
-                if (coli_submit_ext(ext_buf, &ext)) { q->logprobs = ext.logprobs; q->pin = ext.pin; }
-                else { printf("ERROR %s bad submit extension\n", id); fflush(stdout); return 0; }
-            }
-        }
-    }
-    /* La convalida di max_tok si chiude QUI, non sopra: 0 e legittimo solo in
-     * modalita jev, e se logprobs c'e si sa solo dopo aver letto le chiavi. */
-    if(max_tok < 1 && !(max_tok == 0 && q->logprobs > 0)){
-        printf("ERROR %s bad submit header\n",id); fflush(stdout); return 0;
-    }
-    char *payload=malloc((size_t)plen+1);
-    if(!payload){ printf("ERROR %s out of memory\n",id); fflush(stdout); return 0; }
-    if(fread(payload,1,(size_t)plen,stdin)!=(size_t)plen){ free(payload); return -1; }
-    (void)fgetc(stdin); payload[plen]=0;
-    snprintf(q->id,sizeof(q->id),"%s",id);
-    q->max_tok=max_tok; q->temp=temp; q->top_p=top_p;
-    q->payload=payload; q->plen=plen;
-    return 2;
 }
 
 /* Coda numerica di un token, formato IDENTICO a logprob_tail di colibri.c:
@@ -8634,27 +8604,32 @@ static int serve_eos_ids(int *ids, int cap){
  * disconnette non liberava niente.
  *
  * Returns CANCEL or STOP for `id`; STOP must finish with DONE, not an error.
- * Le righe che non
- * riconosciamo si scartano, com'e' sempre stato: la regola di compatibilita'
- * del protocollo vale in tutte e due le direzioni. Un SUBMIT non puo'
- * legalmente arrivare mentre l'unico slot e' occupato; se arriva viene
- * ignorato qui e sara' la lettura normale a rifiutarlo.
  *
  * Non legge MAI se stdin non e' pronto: una getline bloccante qui fermerebbe la
  * generazione in attesa di un comando che potrebbe non arrivare mai. */
 static int g_q36_mux_slots = 1;
 enum { Q36_CONTROL_NONE, Q36_CONTROL_STOP, Q36_CONTROL_CANCEL };
-static int serve_control_pending(const char *id){
+/* Whole frames, as serve_read_req reads them between turns: a SUBMIT or DECIDE that
+ * arrives while the one slot is busy is consumed and refused, so its payload is never
+ * read as the next header, and an IMAGE is held for the SUBMIT it belongs to. The end
+ * of input, or a frame that broke off, lets the turn finish; the next read ends the
+ * session. */
+static int serve_control_read(FILE *in, FILE *out, int (*ready)(void), const char *id){
     int control = Q36_CONTROL_NONE;
-    while(coli_serve_stdin_ready()){
-        char line[512], cmd[16], who[64];
-        if(!fgets(line,sizeof(line),stdin)) break;
-        if(sscanf(line,"%15s %63s",cmd,who)<2) continue;
-        if(strcmp(who,id)) continue;
-        if(!strcmp(cmd,"CANCEL")) control = Q36_CONTROL_CANCEL;
-        else if(!strcmp(cmd,"STOP") && control == Q36_CONTROL_NONE) control = Q36_CONTROL_STOP;
+    while(ready()){
+        ServeReq q = {0};
+        const int r = serve_read_req(in, out, &q);
+        if(r < 0) break;
+        if(r == 2 || r == 3) coli_serve_write_error(out, q.id, "SLOT_BUSY");
+        free(q.payload);
+        if(strcmp(q.id, id)) continue;
+        if(r == 4) control = Q36_CONTROL_CANCEL;
+        else if(r == 5 && control == Q36_CONTROL_NONE) control = Q36_CONTROL_STOP;
     }
     return control;
+}
+static int serve_control_pending(const char *id){
+    return serve_control_read(stdin, stdout, coli_serve_stdin_ready, id);
 }
 
 /* A served prompt's checks for its STOP or CANCEL: the one before its forward, then one before
@@ -9573,7 +9548,7 @@ static void serve_mux(Model *m){
         /* idle: wait for a command; decoding: take one only when one is there */
         if (!input_eof && (!active || coli_serve_stdin_ready())) {
             ServeReq q = {0};
-            int r = serve_read_req(&q);
+            int r = serve_read_req(stdin, stdout, &q);
             if (r < 0) input_eof = 1;
             else if (r == 4 || r == 5) {
                 for (int i = 0; i < n; i++) if (rq[i].active && !strcmp(rq[i].q.id, q.id)) {
@@ -9730,7 +9705,7 @@ static void serve_loop(Model *m){
     if(g_q36_mux_slots>1){ serve_mux(m); q36_ps_report(); return; }
     for(;;){
         ServeReq q={0}; int r;
-        do r=serve_read_req(&q); while(r==0||r==4||r==5);
+        do r=serve_read_req(stdin,stdout,&q); while(r==0||r==4||r==5);
         if(r<0){ q36_mtp_vocab_save(); q36_ps_report(); return; }
         /* Resend the grid after EVERY turn, not only after READY: at boot the
          * expert cache is empty by definition, and that cold snapshot stayed

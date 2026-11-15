@@ -6951,8 +6951,8 @@ class LogprobsHTTPTest(unittest.TestCase):
         # The extension keys must land where the engine's own SUBMIT parser expects them:
         # coli_submit_parse reads seven numeric fields, while a sibling engine's parser
         # reads six and takes its keys straight after top_p. Sending the field to that one
-        # puts a bare `0` where its parser wants `key=value`, and the engine answers
-        # "bad submit extension" before it ever sees the prompt.
+        # puts a bare `0` where its parser wants `key=value`, and the engine refuses the
+        # header ("bad submit header") before it ever sees the prompt.
         original = openai_server.ARCH
         try:
             openai_server.ARCH = "glm"

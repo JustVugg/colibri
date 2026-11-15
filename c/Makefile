@@ -1995,6 +1995,10 @@ tests/test_qwen36_ctx$(EXE): tests/test_qwen36_ctx.c qwen36.c $(QWEN36_TIER_OBJ)
 tests/test_qwen36_prefill_control$(EXE): tests/test_qwen36_prefill_control.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
 
+# qwen36's serve request framing, frozen on synthetic frames (no model)
+tests/test_qwen36_serve_framing$(EXE): tests/test_qwen36_serve_framing.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
+
 tests/test_qwen36_weight_alloc$(EXE): tests/test_qwen36_weight_alloc.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
 
