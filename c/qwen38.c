@@ -4232,8 +4232,7 @@ static int q38_vk_read_direct(Model *m,int layer,int e,uint8_t *buf,int64_t cap,
     if(q38_layer_int4(m,layer)){
         Q38Int4Experts *x=m->x4;
         if(x->record_bytes>cap)return 0;
-        st_read_range_raw_cap(&x->S,x->fd[layer],x->off[(int64_t)layer*c->experts+e],x->record_bytes,buf,cap,1,
-                              "pread Qwen3.8 int4 expert (Vulkan tier)");
+        q38_x4_read(m,layer,e,buf,cap,"pread Qwen3.8 int4 expert (Vulkan tier)");
         const float *sc=(const float*)(buf+x->scale_off);
         *src=(VktExpertSrc){buf,buf+x->code_bytes[0],buf+x->code_bytes[0]+x->code_bytes[1],
                             sc,sc+x->scale_count[0],sc+x->scale_count[0]+x->scale_count[1]};
