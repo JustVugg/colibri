@@ -4966,9 +4966,9 @@ static void serve_data_lp(unsigned long long id, const char *text, int n,
 
 /* Una richiesta intera, o 0 su EOF. Il payload si legge a byte contati, non a
  * righe: puo' contenerne. */
-static int serve_read_req(ServeReq *q, char *verb, size_t verb_size) {
+static int serve_read_req(FILE *in, ServeReq *q, char *verb, size_t verb_size) {
     char header[512];
-    if (!fgets(header, sizeof(header), stdin)) return 0;
+    if (!fgets(header, sizeof(header), in)) return 0;
     memset(q, 0, sizeof(*q));
     if (sscanf(header, "%15s", verb) != 1) { verb[0] = 0; return 1; }
     if (!strcmp(verb, "STOP") || !strcmp(verb, "CANCEL")) {
@@ -4984,12 +4984,12 @@ static int serve_read_req(ServeReq *q, char *verb, size_t verb_size) {
         }
         pending_clear();
         float *patches = malloc((size_t)bytes);
-        if (!patches || fread(patches, 1, (size_t)bytes, stdin) != (size_t)bytes) {
+        if (!patches || fread(patches, 1, (size_t)bytes, in) != (size_t)bytes) {
             free(patches);
             strcpy(verb, "BAD_FRAME");
             return 1;
         }
-        (void)fgetc(stdin);                       /* il '\n' di chiusura */
+        (void)fgetc(in);                       /* il '\n' di chiusura */
         g_pending.id = id;
         g_pending.patches = patches;
         g_pending.bytes = (size_t)bytes;
@@ -5024,13 +5024,13 @@ static int serve_read_req(ServeReq *q, char *verb, size_t verb_size) {
     if (q->plen < 0 || q->plen > (1 << 24)) { strcpy(verb, "BAD_FRAME"); return 1; }
     q->payload = malloc((size_t)q->plen + 1);
     if (!q->payload) { strcpy(verb, "BAD_FRAME"); return 1; }
-    if (q->plen && fread(q->payload, 1, (size_t)q->plen, stdin) != (size_t)q->plen) {
+    if (q->plen && fread(q->payload, 1, (size_t)q->plen, in) != (size_t)q->plen) {
         free(q->payload); q->payload = NULL;
         strcpy(verb, "BAD_FRAME");
         return 1;
     }
     q->payload[q->plen] = 0;
-    int trailing = fgetc(stdin);
+    int trailing = fgetc(in);
     (void)trailing;                        /* il '\n' di chiusura del frame */
     /* max_tokens=0 vale solo in modalita jev ("leggi e fermati"), e lo si sa
      * solo dopo aver letto le chiavi. Il rifiuto sta DOPO che payload e '\n'
@@ -5096,26 +5096,29 @@ enum { SERVE_CTL_NONE = 0, SERVE_CTL_CANCEL = 1, SERVE_CTL_STOP = 2 };
  * Non legge MAI se stdin non e' pronto: una fgets bloccante qui fermerebbe la
  * generazione in attesa di un comando che potrebbe non arrivare mai -- un
  * guasto peggiore di quello che questa funzione cura. */
-static int serve_cancel_pending(unsigned long long id, int *input_eof) {
+static int serve_cancel_read(FILE *in, FILE *out, int (*ready)(void), unsigned long long id, int *input_eof) {
     int cancelled = 0, stopped = 0;
-    while (coli_serve_stdin_ready()) {
+    while (ready()) {
         ServeReq n; char verb[16];
-        if (!serve_read_req(&n, verb, sizeof(verb))) { *input_eof = 1; break; }
+        if (!serve_read_req(in, &n, verb, sizeof(verb))) { *input_eof = 1; break; }
         if (!strcmp(verb, "CANCEL")) {
             if (n.id == id) cancelled = 1;
-            else serve_line("ERROR %llu NOT_FOUND\n", n.id);
+            else { fprintf(out, "ERROR %llu NOT_FOUND\n", n.id); fflush(out); }
         } else if (!strcmp(verb, "STOP")) {
             if (n.id == id) stopped = 1;
         } else if (!strcmp(verb, "SUBMIT")) {
-            serve_line("ERROR %llu SLOT_BUSY\n", n.id);
+            fprintf(out, "ERROR %llu SLOT_BUSY\n", n.id); fflush(out);
             free(n.payload);
         } else if (!strcmp(verb, "BAD_FRAME")) {
-            serve_line("ERROR %llu BAD_FRAME\n", n.id);
+            fprintf(out, "ERROR %llu BAD_FRAME\n", n.id); fflush(out);
         }
         /* IMAGE non risponde niente, come nel ciclo principale. */
     }
     if (cancelled) return SERVE_CTL_CANCEL;
     return stopped ? SERVE_CTL_STOP : SERVE_CTL_NONE;
+}
+static int serve_cancel_pending(unsigned long long id, int *input_eof) {
+    return serve_cancel_read(stdin, stdout, coli_serve_stdin_ready, id, input_eof);
 }
 
 /* La stessa guardata, fra un pezzo di prefill e l'altro.
@@ -5968,7 +5971,7 @@ static void serve_loop(GModel *m, Tok *tokenizer) {
     emap_emit(m);
     for (;;) {
         ServeReq q; char verb[16];
-        if (!serve_read_req(&q, verb, sizeof(verb))) break;   /* EOF: si esce */
+        if (!serve_read_req(stdin, &q, verb, sizeof(verb))) break;   /* EOF: si esce */
         if (!strcmp(verb, "SUBMIT")) {
             /* < 0: stdin e' finito mentre il turno girava. Il turno e' stato
              * servito per intero (e' la regola: "in-flight requests finish

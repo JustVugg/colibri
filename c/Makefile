@@ -3011,6 +3011,10 @@ tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c
 tests/test_glm53_live_prefix$(EXE): tests/test_glm53_live_prefix.c glm53.c
 	$(CC) $(NOCUDA_CFLAGS) -UCOLI_METAL -UCOLI_VULKAN $< -o $@ $(NOCUDA_LDFLAGS)
 
+# glm53's serve request framing, frozen on synthetic frames (no model)
+tests/test_glm53_serve_framing$(EXE): tests/test_glm53_serve_framing.c glm53.c
+	$(CC) $(NOCUDA_CFLAGS) -UCOLI_METAL -UCOLI_VULKAN $< -o $@ $(NOCUDA_LDFLAGS)
+
 # Exact sampler order, cumulative mass, selected token and RNG-use regression.
 tests/glm53_nucleus_reference.o: tests/glm53_nucleus_reference.c
 	$(CC) $(NOCUDA_CFLAGS) -c $< -o $@
