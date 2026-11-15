@@ -891,6 +891,13 @@ GQ_SB_FN __m256i gq_sbk_q3_k(const uint8_t *b, int ib, float *s, float *m) {
     const __m256i sub = _mm256_andnot_si256(_mm256_cmpeq_epi8(_mm256_and_si256(hv, bit), bit), _mm256_set1_epi8(4));
     return _mm256_sub_epi8(_mm256_and_si256(_mm256_srli_epi16(q, 2 * sh), _mm256_set1_epi8(3)), sub);
 }
+GQ_SB_FN __m256i gq_sbk_q2_k(const uint8_t *b, int ib, float *s, float *m) {
+    const uint8_t *sc = b, *qs = b + 16; const float d = gq_f16(gq_rd16(b + 80)), dmin = gq_f16(gq_rd16(b + 82));
+    for (int h = 0; h < 2; h++) { s[h] = d * (float)(sc[2 * ib + h] & 0xF); m[h] = dmin * (float)(sc[2 * ib + h] >> 4); }
+    const int c = ib >> 2, sh = ib & 3;   /* element 32*ib + j: bits 2*sh of qs[32c + j] */
+    const __m256i q = _mm256_loadu_si256((const __m256i *)(qs + 32 * c));
+    return _mm256_and_si256(_mm256_srli_epi16(q, 2 * sh), _mm256_set1_epi8(3));
+}
 #define GQ_UNPACK_SBK(SB) { \
         for (int ib = 0; ib < 8; ib++) { float s2[2], m2[2]; _mm256_storeu_si256((__m256i *)(w + 32 * ib), SB(b, ib, s2, m2)); \
             sw[2 * ib] = s2[0]; sw[2 * ib + 1] = s2[1]; mw[2 * ib] = m2[0]; mw[2 * ib + 1] = m2[1]; } \
@@ -1761,6 +1768,7 @@ GQ_DOT_SBK(gq_dot_q4_k, 144, gq_sbk_q4_k, 1)
 GQ_DOT_SBK(gq_dot_q5_k, 176, gq_sbk_q5_k, 1)
 GQ_DOT_SBK(gq_dot_q6_k, 210, gq_sbk_q6_k, 0)
 GQ_DOT_SBK(gq_dot_q3_k, 110, gq_sbk_q3_k, 0)
+GQ_DOT_SBK(gq_dot_q2_k, 84, gq_sbk_q2_k, 1)
 typedef void (*gq_fdot_fn)(float *, int, const uint8_t *, const int8_t *, const float *, int, int);
 static inline gq_fdot_fn gq_fdot_sb256(int t) {
     switch (t) {
@@ -1961,6 +1969,7 @@ static inline void gq_row_all(float *y, int ystride, const gq_act *a, const uint
         if (t == GQ_Q5_K) { gq_dot_q5_k(y, ystride, row, a->q, a->d, a->s, I, a->S); return; }
         if (t == GQ_Q6_K) { gq_dot_q6_k(y, ystride, row, a->q, a->d, a->s, I, a->S); return; }
         if (t == GQ_Q3_K) { gq_dot_q3_k(y, ystride, row, a->q, a->d, a->s, I, a->S); return; }
+        if (t == GQ_Q2_K) { gq_dot_q2_k(y, ystride, row, a->q, a->d, a->s, I, a->S); return; }
     }
 #else
     if (t == GQ_Q8_0) {
