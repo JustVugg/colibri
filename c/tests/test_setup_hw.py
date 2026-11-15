@@ -301,9 +301,30 @@ class NvidiaParsing(unittest.TestCase):
             with self.subTest(exe=exe):
                 gpus, seen, child = self.run_detect({query: NVIDIA_SMI_CC.splitlines()[0] + "\n"}, exe)
                 self.assertEqual(seen[0][:2], [exe, query])
-                self.assertEqual(len(seen), 1)
+                # one query for the cards (on Windows a second one reads the driver model)
+                self.assertEqual(len([cmd for cmd in seen if "driver_model" not in cmd[1]]), 1)
                 self.assertEqual(gpus[0]["compute_cap"], "7.0")
                 child.assert_not_called()                         # nvidia-smi answered
+
+    def test_the_driver_model_on_windows(self):
+        """#2846: on Windows a separate query reads each card's driver model, so the
+        setup can say that a card in TCC mode has no Vulkan device. Elsewhere, and when
+        the answer does not parse, nothing is asked or the model stays None."""
+        query = setup_hw.nvidia_smi_query()[0]
+        rows = ("0, NVIDIA A100-PCIE-40GB, 40960, 40000, 595.97, 8.0, 00000000:01:00.0\n"
+                "1, NVIDIA RTX A4000, 16376, 16000, 595.97, 8.6, 00000000:02:00.0\n")
+        answers = {query: rows, "--query-gpu=index,driver_model.current": "0, TCC\n1, WDDM\n"}
+        with mock.patch.object(setup_hw.sys, "platform", "win32"):
+            gpus, seen, _child = self.run_detect(answers, r"C:\Windows\System32\nvidia-smi.exe")
+        self.assertEqual([g["driver_model"] for g in gpus], ["TCC", "WDDM"])
+        self.assertEqual(seen[1][1:], ["--query-gpu=index,driver_model.current", "--format=csv,noheader"])
+        with mock.patch.object(setup_hw.sys, "platform", "linux"):
+            gpus, seen, _child = self.run_detect(answers, "/usr/bin/nvidia-smi")
+        self.assertEqual(len(seen), 1)
+        self.assertNotIn("driver_model", gpus[0])
+        self.assertEqual([g["driver_model"] for g in setup_hw.fill_driver_models(
+            [{"index": 0}, {"index": 1}, {"index": 2}], "0, [N/A]\nnot a row\n2, mcdm\n")],
+            [None, None, "MCDM"])
 
     def test_an_old_driver_is_asked_again_and_the_cuda_driver_fills_in(self):
         query = setup_hw.nvidia_smi_query()[0]
@@ -317,7 +338,8 @@ class NvidiaParsing(unittest.TestCase):
             {"name": "Tesla P40", "pci_bus_id": "0000:3B:00.0", "compute_cap": "6.1"},
             {"name": "Tesla V100-SXM2-16GB", "pci_bus_id": "0000:1a:00.0", "compute_cap": "7.0"}]}
         gpus, seen, child = self.run_detect(answers, "/usr/bin/nvidia-smi", probe)
-        self.assertEqual([cmd[1] for cmd in seen], [query, old_query])
+        # (on Windows a third query reads the driver model)
+        self.assertEqual([cmd[1] for cmd in seen if "driver_model" not in cmd[1]], [query, old_query])
         child.assert_called_once()
         self.assertEqual([(g["name"], g["compute_cap"]) for g in gpus],
                          [("Tesla V100-SXM2-16GB", "7.0"), ("Tesla P40", "6.1")])   # matched by slot

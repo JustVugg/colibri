@@ -469,6 +469,25 @@ def detect_nvidia():
         probe = _probe_cuda_child()
         if probe:
             fill_compute_caps(gpus, probe.get("devices"))
+    if gpus and sys.platform == "win32":
+        fill_driver_models(gpus, _run([exe, "--query-gpu=index,driver_model.current",
+                                       "--format=csv,noheader"], timeout=10))
+    return gpus
+
+
+def fill_driver_models(gpus, text):
+    """Windows only: each card's driver model from `nvidia-smi --query-gpu=index,
+    driver_model.current --format=csv,noheader`. A data-center card runs in TCC (or MCDM)
+    mode, where Windows offers no Vulkan device, so the setup can say why Vulkan found
+    none. A separate query: a driver that refused the field would otherwise drop the
+    card's whole row. Unreadable rows leave driver_model None."""
+    models = {}
+    for line in (text or "").splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) == 2 and parts[0].isdigit() and parts[1] and not parts[1].startswith("["):
+            models[int(parts[0])] = parts[1].upper()
+    for gpu in gpus:
+        gpu["driver_model"] = models.get(gpu.get("index"))
     return gpus
 
 

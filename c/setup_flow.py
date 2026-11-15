@@ -408,7 +408,8 @@ TEXT_HINTS = {
     "cuda": "install the CUDA Toolkit from https://developer.nvidia.com/cuda-downloads",
     "cuda-win32": "the Windows CUDA build needs the CUDA Toolkit and MSVC: see docs/windows.md",
     "cuda-win32-release": ("unpack the release's windows-x86_64-cuda.zip next to the engines "
-                           "(coli_cuda.dll and the CUDA builds of colibri, glm53, qwen36 and kimi_k3)"),
+                           "(coli_cuda.dll and the CUDA builds of colibri, glm53, qwen36, qwen38 "
+                           "and kimi_k3)"),
     "build-other": "install gcc (with OpenMP) and make from your distribution",
     "vulkan-other": ("install the Vulkan loader development files, glslc (shaderc) and the "
                      "Mesa Vulkan drivers from your distribution"),
@@ -648,14 +649,56 @@ def choose_backend(hw, family, tc, requested="auto", exclude=()):
             return decision
         needs = ["vulkan"] if tc.get("can_build") else ["build", "vulkan"]
         decision["missing"].append(("vulkan", _gpu_hint(needs, hw, tc)))
+    if requested == "vulkan" and not vk:
+        # Asked for by name, as an explicit --backend cuda that cannot run stops: a CPU
+        # run under a Vulkan setup would look like a GPU one (#2846).
+        raise SetupError(f"--backend vulkan: no Vulkan device answered{_no_vulkan_detail(nvidia)}; "
+                         "run with --backend auto to see what this machine can use")
     if not vk and not nvidia:
         decision["reason"] = "no GPU found: the engine runs on the CPU"
-    elif requested == "vulkan" and not vk:
-        decision["reason"] = "no Vulkan GPU answered: the engine runs on the CPU"
+    elif nvidia and blocked is None and not decision["missing"]:
+        # An NVIDIA card with no path to it and nothing to install that would open one:
+        # say which card and why, and the setup asks before the download (#2846).
+        card = nvidia[0]
+        decision["gpu_unused"] = card["name"]
+        decision["reason"] = (f"{nvidia_name(card)} found, but {_no_cuda_why(family, exclude)} and "
+                              f"{_no_vulkan_why(vk, nvidia, exclude)}: the engine runs on the CPU")
     else:
         decision["reason"] = because("the CPU",
                                      "the GPU build is not possible yet: the engine runs on the CPU")
     return decision
+
+
+def _no_cuda_why(family, exclude=()):
+    """Why an NVIDIA card gets no CUDA path for this engine here (choose_backend)."""
+    if "cuda" in exclude:
+        return "its CUDA build failed"
+    if host_os() == "win32":
+        if family.id not in WINDOWS_CUDA_ENGINES:
+            return f"{family.display_name} has no CUDA build for Windows"
+        if release_cuda_lacks(family.id, current_version()):
+            return (f"the {RELEASE_CUDA_WIN32} of release {current_version()} has no "
+                    f"{family.engine_artifact}.exe")
+    elif family.id not in CUDA_ENGINES:
+        return f"{family.display_name} has no CUDA path"
+    return "no CUDA build of it can run here"
+
+
+def _no_vulkan_detail(nvidia):
+    """A data-center card on Windows in TCC or MCDM mode: Windows offers no Vulkan
+    device in those modes (setup_hw.fill_driver_models)."""
+    mode = next((c.get("driver_model") for c in nvidia or [] if c.get("driver_model")), None)
+    if host_os() == "win32" and mode in ("TCC", "MCDM"):
+        return f" (the NVIDIA card runs in {mode} mode, where Windows offers no Vulkan device)"
+    return ""
+
+
+def _no_vulkan_why(vk, nvidia, exclude=()):
+    if vk is None:
+        return "no Vulkan device answered" + _no_vulkan_detail(nvidia)
+    if "vulkan" in exclude:
+        return "the Vulkan build failed"
+    return "Vulkan cannot run it here"
 
 
 def _gpu_hint(needs, hw, tc):
@@ -716,12 +759,13 @@ RELEASE_VULKAN = ("linux-x86_64.tar.gz", "windows-x86_64.zip")
 #: The engines the release's windows-x86_64-cuda.zip (RELEASE_CUDA_WIN32) carries, built against
 #: coli_cuda.dll (release.yml, the cuda-windows job), and the oldest card its DLL
 #: runs on: CUDA_ARCH=portable is SASS for sm_80 and newer plus compute_120 PTX.
-WINDOWS_CUDA_ENGINES = ("glm", "glm53", "qwen36", "kimi")
+WINDOWS_CUDA_ENGINES = ("glm", "glm53", "qwen36", "qwen38", "kimi")
 WINDOWS_CUDA_FLOOR = 80
 RELEASE_CUDA_WIN32 = "windows-x86_64-cuda.zip"
 #: The engines the package got later, each with the last release whose package lacks it:
-#: v2.1.0's has no glm53.exe (#2541). With such a release the engine stays on Vulkan.
-WINDOWS_CUDA_LATER = {"glm53": "2.1.0"}
+#: v2.1.0's has no glm53.exe (#2541) and no qwen38.exe (#2846). With such a release the
+#: engine stays on Vulkan.
+WINDOWS_CUDA_LATER = {"glm53": "2.1.0", "qwen38": "2.1.0"}
 
 
 def prebuilt_vulkan(family, tc):
@@ -2235,6 +2279,11 @@ def cmd_setup(a, ui=None):
     if decision["missing"] and ui.interactive and decision["backend"] == "cpu":
         if not ui.confirm("  Continue on the CPU for now (rerun after installing to switch)?", True):
             raise SetupError("stopped so you can install the GPU packages; rerun afterwards")
+    elif decision.get("gpu_unused") and ui.interactive and decision["backend"] == "cpu":
+        # nothing to install would change it: ask before the download, not after (#2846)
+        if not ui.confirm(f"  Continue with {family.display_name} on the CPU?", True):
+            raise SetupError("stopped before the download; `coli setup --reconfigure` "
+                             "picks another model")
     engine_info, decision, failed = resolve_with_fallback(ui, family, entry, decision, tc, hw,
                                                           requested, failed)
     if failed:
