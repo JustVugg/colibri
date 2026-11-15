@@ -102,6 +102,75 @@ class UIProxyDisconnectTest(unittest.TestCase):
                 self.next_request(server)
                 self.assert_monitors_finished()
 
+    def test_pipelined_bytes_then_reset_cancel_prefill(self):
+        engine = PrefillEngine()
+        self.addCleanup(engine.release.set)
+        backend = urlsplit(_spawn_test_server(self, engine))
+        server, errors, finished = self.proxy(backend)
+        connection = self.connect(server)
+        try:
+            self.assertTrue(engine.entered.wait(2))
+            connection.sendall(b"GET /health HTTP/1.1\r\nX-Padding: " + b"x" * 20000 + b"\r\n\r\n")
+            self.assertFalse(engine.cancelled.wait(0.2))
+            reset_connection(connection)
+            self.assertTrue(engine.cancelled.wait(2), "queued data hid the frontend reset")
+            self.assertTrue(engine.finished.wait(1))
+            self.assertTrue(finished.wait(1))
+            self.assertEqual(errors, [])
+            self.next_request(server)
+            self.assert_monitors_finished()
+        finally:
+            connection.close()
+            engine.release.set()
+
+    def test_pipelined_requests_are_both_forwarded(self):
+        entered, release, release_second = threading.Event(), threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        self.addCleanup(release_second.set)
+        observed = []
+
+        class Backend(BaseHTTPRequestHandler):
+            def do_POST(self):
+                observed.append(self.rfile.read(int(self.headers["Content-Length"])))
+                if len(observed) == 1:
+                    entered.set()
+                    release.wait(3)
+                else:
+                    release_second.wait(3)
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, *args):
+                pass
+
+        backend = self.server(Backend)
+        server, errors, _ = self.proxy(urlsplit("http://127.0.0.1:%d" % backend.server_port))
+        connection = socket.create_connection(server.server_address, timeout=3)
+        try:
+            connection.sendall(b"POST /v1/fixture HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\n\r\none")
+            self.assertTrue(entered.wait(2))
+            connection.sendall(b"POST /v1/fixture HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\nConnection: close\r\n\r\ntwo")
+            release.set()
+            for index in range(2):
+                if index:
+                    release_second.set()
+                response = http.client.HTTPResponse(connection)
+                try:
+                    response.begin()
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(response.read(), b"ok")
+                finally:
+                    response.close()
+            self.assertEqual(observed, [b"one", b"two"])
+            self.assertEqual(errors, [])
+            self.assert_monitors_finished()
+        finally:
+            release.set()
+            release_second.set()
+            connection.close()
+
     def test_half_closed_request_still_reads_response_and_next_request(self):
         for streaming in (False, True):
             with self.subTest(streaming=streaming):
