@@ -65,6 +65,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   decodes 3.1x faster on that laptop; the issue measured 1.5x on the full model with an LTO
   clang build. With the CUDA tier the Windows team now really spins (not measured).
   `c/Makefile` now recognises clang's `x86_64-w64-windows-gnu` target.
+- **DeepSeek V4.1: a block's engram rows read on reader threads** (`V41_ENGRAM_STAGE=1`, off by
+  default). The rows the engram cache did not hold came one pread at a time as the lookup reached
+  them; `V41_ENGRAM_ADVISE` asks the OS for a block's rows first, but only on POSIX and not for a
+  decode step. With the switch on, the block's missing rows (a decode step's too) are read on
+  `V41_ENGRAM_STAGE_THREADS` threads (8) before the lookup, the same bits.
 - **CPU without FMA: FP8 and int4-g64 experts read once for a prompt's rows** (#2715). On a
   CPU without AVX2 or FMA (Sandy and Ivy Bridge, a build for the x86-64 baseline or v2),
   quant.h's FP8 kernel decoded every weight again for each row and waited on one chain of adds:
