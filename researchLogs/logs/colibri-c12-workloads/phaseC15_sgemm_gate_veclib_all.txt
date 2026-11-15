@@ -1,0 +1,21 @@
+c15 sgemm gate: HD=256 H=16 KVH=2 block=512 omp_threads=6
+scalar = engine loop (kv16_dot_lanes scores, softmax_row, kv16_axpy ctx)
+sgemm  = widen K/V once + pack Q, per-head causal 512-row blocks, Accelerate cblas_sgemm
+
+shape S=T=2048: scalar wall 0.34s | sgemm wall 0.06s (+aux 0.003s)
+  scalar (wall, 6 threads): scores 0.44s (39.2 GFLOPS) | softmax 0.04s | ctx 0.45s (37.9 GFLOPS) | total 0.94s
+  sgemm  (wall): scores 0.02s (1036.1 GFLOPS) | softmax+mask 0.02s | ctx 0.02s (1066.5 GFLOPS) | aux 0.006s | total 0.06s
+  combined scalar/sgemm speedup: 15.40x
+
+shape S=T=4096: scalar wall 1.43s | sgemm wall 0.21s (+aux 0.006s)
+  scalar (wall, 6 threads): scores 1.22s (56.4 GFLOPS) | softmax 0.12s | ctx 1.32s (52.0 GFLOPS) | total 2.66s
+  sgemm  (wall): scores 0.06s (1077.7 GFLOPS) | softmax+mask 0.08s | ctx 0.06s (1115.9 GFLOPS) | aux 0.008s | total 0.21s
+  combined scalar/sgemm speedup: 12.38x
+
+  maxdiff @S=4096 (all 16 heads): scaled scores abs 1.669e-06 rel-to-rowmax 1.843e-05 | ctx abs 2.384e-07 rel 2.353e-06
+
+shape S=T=12288: scalar wall 14.27s | sgemm wall 1.73s (+aux 0.016s)
+  scalar (wall, 6 threads): scores 6.09s (101.5 GFLOPS) | softmax 0.59s | ctx 6.63s (93.3 GFLOPS) | total 13.31s
+  sgemm  (wall): scores 0.51s (1212.1 GFLOPS) | softmax+mask 0.69s | ctx 0.53s (1171.1 GFLOPS) | aux 0.016s | total 1.75s
+  combined scalar/sgemm speedup: 7.61x
+
