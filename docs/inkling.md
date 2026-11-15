@@ -5,7 +5,9 @@
 dense weights resident (RAM or VRAM), routed experts streamed from disk with an
 LRU + pinned cache. Audio input is supported when the audio tensors are present
 (see [Audio input](#audio-input-dmel) below); the vision encoder and the MTP
-head are not loaded.
+head are not loaded. The same engine runs
+[Inkling-2-Small](#inkling-2-small) (594B total / 17B active), from its GGUFs or
+from the official checkpoint converted to int4 g64.
 
 ## Quickstart
 
@@ -78,6 +80,175 @@ residency is ~1.7% of the 464 GB expert bank, so decode is disk-bound — tens o
 seconds per token on a single NVMe, not interactive. This path is what makes the model
 *runnable and testable* on a small host, not fast. Pinning (`PIN`) and a larger cache
 help in proportion to the RAM you can give them.
+
+## Inkling-2-Small
+
+[thinkingmachines/Inkling-2-Small](https://huggingface.co/thinkingmachines/Inkling-2-Small)
+(594B total / 17B active, Apache 2.0) is a new architecture on the same engine: 48 layers of
+384 routed experts (top 8, no shared expert, no dense layer), 40 sliding-window layers and 8
+global ones, attention residuals over blocks of six layers, short convolutions after attention
+and after the MLP. The engine reads it under the official tensor names, its vision tower
+included ([pictures](#inkling-2-pictures) below); the MTP drafter is not loaded
+([why](#inkling-2-the-mtp-drafter)).
+
+Two ways to run it:
+
+- **A GGUF.** unsloth's files ([unsloth/Inkling-2-Small-GGUF](https://huggingface.co/unsloth/Inkling-2-Small-GGUF))
+  import like any other ([gguf.md](gguf.md)); point `coli import` at the first part:
+
+  ```sh
+  ./coli import ~/models/Inkling-2-Small-UD-Q2_K_XL-00001-of-00006.gguf   # every part next to it
+  ```
+
+- **The official checkpoint as int4 g64.** Thinking Machines publish the experts in NVFP4
+  (layers 0-39) and MXFP8 (layers 40-47), 393.5 GB. `c/tools/convert_inkling2_int4.py` turns
+  them into colibri's int4 with one f32 scale per 64 weights (the planar layout of
+  `expert_ffn.h`) and copies every other tensor as it is, one `layer-NN.safetensors` per layer:
+
+  ```sh
+  hf download thinkingmachines/Inkling-2-Small --local-dir ~/Models/ink2-nvfp4
+  python3 c/tools/convert_inkling2_int4.py --indir ~/Models/ink2-nvfp4 --outdir ~/Models/ink2-int4g64
+  ```
+
+  The container is 347.6 GB (the MTP drafter's 3.4 GB included). Without room for both, run
+  the converter next to the download with `--watch --delete-src`: each layer is converted as soon as its shards are complete, and
+  a shard is removed once every output that reads it is written. `--min-free-gb N` (default
+  20) waits before a write would leave less than N GB free (without `--watch` it stops
+  instead). A second run converts only what is missing. The MTP drafter goes to `mtp/`
+  untouched.
+
+  Relative L2 error against the source weights, measured on every layer of the real
+  checkpoint: 9.5-9.7%. The scale of each group of 64 is the one of nine candidates around
+  absmax/7 and absmax/8 with the least squared error; absmax/7 alone gives 11.3%.
+
+Build and run as for Inkling:
+
+```sh
+make -C c inkling                # CPU
+make -C c inkling CUDA=1         # + the expert tier and the dense matrices on a CUDA card
+make -C c inkling VK=1           # + the same on Vulkan (run with COLI_VULKAN=1)
+
+SNAP=~/Models/ink2-int4g64 ./c/inkling --chat -p "What is the capital of France?" -n 64
+```
+
+`--chat` and the gateway (`coli chat`, `coli serve`, `coli web`, model id
+`inkling-2-small-colibri`) use Inkling-2's own template: the effort level goes in a system
+message before the first message, and with thinking off the model's turn is opened for it as
+text. Tools as the template declares them: the specs in a `tool_declare` system message before
+everything else, a call a model message of its own under the tool's name
+(`<|content_invoke_tool_json|>` and `{"name": ..., "args": {...}}`), a result a tool message
+under the name of the call it answers; streamed or not, OpenAI's and Anthropic's APIs, and
+`tool_choice` (`required` or a name adds the instruction the other families get). With tools
+declared the model opens its turn itself even with thinking off: a turn opened as text never
+called a tool, and it reasons a few words first (they come back as `reasoning_content`). The
+engine's repetition penalty is off for Inkling-2 (`REP_PEN`): a call repeats the declaration's
+tokens, and with the penalty it came out broken.
+
+On a GPU, the CUDA build (`CUDA=1`) or the Vulkan one (`VK=1`, `COLI_VULKAN=1`):
+
+- the routed experts go to the expert tier, CUDA's or Vulkan's
+  ([vulkan.md](vulkan.md#the-routed-expert-tier-vk_tierc)): the history's hottest at start, then
+  the ones the CPU computes as you chat, while the CPU computes the rest from its RAM cache.
+  The int4 g64 container's experts go up as they are; a GGUF's as the file has them. A GGUF's
+  NVFP4 layers keep each expert's global scale outside its blocks (one number for gate and up,
+  as the checkpoint's w13 has one amax an expert); the engine folds it into the row the device
+  reads and into the pair's weight.
+- the bf16 dense matrices (the attention projections, its gate and the unembedding) go to the
+  device. With Vulkan the layers run as a dense chain there (`COLI_VK_CHAIN`, on by default on
+  a discrete GPU, [vulkan.md](vulkan.md#inkling-2-on-the-chain)): the attention, the residual
+  mixes and the convolutions on the device, one frame a layer, the routed experts on the host;
+  with CUDA, or `COLI_VK_CHAIN=0`, the matrices go a call at a time and the rest runs on the CPU
+  (a CUDA build has the same chain with `COLI_CUDA_CHAIN=1`, off by default: it measured no
+  faster there, [cuda.md](cuda.md#inkling-2-on-cuda-inkling2_cuchainh)).
+- the RAM cache's pinned experts that the tier holds go back to its LRU after the warm start,
+  so that RAM and VRAM hold different experts. The tier's host pool is off for Inkling-2
+  (`COLI_VK_TIER_HOST=1` turns it on): the RAM it takes from the expert cache cost more than
+  the device gained (numbers below).
+- a build with both backends runs Inkling-2 on Vulkan, as it runs Inkling (`COLI_VULKAN=0`
+  keeps CUDA): measured ahead below. Metal leaves Inkling-2 on the CPU.
+
+Measured on an RTX PRO 4000 Blackwell (24 GB), an i5-13500 (the engine's six P-cores) and
+62 GB of RAM, the container on two NVMe in RAID0: `--chat`, a prompt of 26-27 tokens and 64
+generated, three prompts, the expert history of earlier runs:
+
+| Build | Prompt | Decode | Decode, reads first (`INK_FILL_ASYNC=0`) |
+|---|---|---|---|
+| CPU | 16.1-16.6 s | 1.15-1.19 tok/s | 1.11-1.12 tok/s |
+| CUDA (`CUDA=1`) | 14.8-15.6 s | 1.64-1.68 tok/s | 1.50-1.56 tok/s |
+| Vulkan (`VK=1`, `COLI_VULKAN=1`) | 14.6-16.3 s | 1.89-1.92 tok/s | 1.43-1.81 tok/s |
+
+A decode step reads the experts it misses on a thread of its own while the CPU computes the
+ones it found in RAM, then computes the read ones (`INK_FILL_ASYNC`, on by default); before,
+it read them all first. The two columns are the same session, each prompt run both ways one
+after the other (and again in the other order); the fill the step waits for went from 29-38 s
+of a run to 19-24 s. The prompt that gains most (1.43-1.44 -> 1.91-1.92 on Vulkan, both orders)
+is the one whose experts come most from the disk. Each expert's output has a row of its own and
+the CPU's sum keeps its order, so the bits do not change: the oracles match either way.
+
+At this size the disk sets the pace: of the routed experts the card's 587 serve 24%, the RAM
+cache 48%, and the other 28% come from the disk (17.9 MB an expert, 2.7-3.1 ms each with
+`INK_FILL_THREADS` readers), about half of a decode step. unsloth's UD-Q2_K_XL GGUF (191 GB,
+its experts about half the bytes) ran the CPU build at 1.40 tok/s here on 8 tokens, before the
+GPU tiers and the reads above; it was not measured since. The host pool on
+(`COLI_VK_TIER_HOST=1`) gave CUDA 1.27-1.29 tok/s against 1.60-1.61 off, and Vulkan 1.33-1.41
+against 1.26-1.63, before the pieced reads.
+
+The CUDA build's CPU used to compute its share of the experts more slowly than the Vulkan build's
+(0.72-0.76 ms a pair against 0.52, the same experts, the reads first): a CUDA build of the engine
+left out the OpenMP tuning every other build takes (an active wait, a thread a core), because
+Inkling's 727 dense calls a token on the CUDA backend starved its driver with a spinning team. It
+was the binary, not the card: with `NOGPU=1` the same build took 0.72 ms a pair. A CUDA build now
+takes the tuning for Inkling-2 (the snapshot's `config.json` says so before the engine re-executes
+itself). The same session, 48 tokens on two prompts: 1.55-1.59 -> 1.91 tok/s, as the Vulkan build.
+
+Inkling keeps the exception, measured: Inkling-Small (sabrewing-engine's int4 container, 141 GB)
+with the CUDA build on the same machine, its dense matrices on the card, 48 tokens on two prompts,
+each setting twice in rotation, decoded at 1.33-1.37 tok/s with the tuning against 1.35-1.39
+without it and 1.36-1.39 with the binding alone. Its tiny oracle matches 24/24 either way.
+
+### Inkling-2: pictures
+
+The container carries the vision tower (`model.visual.*`, 655 MB, the converter copies it), and
+the engine loads it with the rest: a ViT of 23 layers, 1024 wide, 20-pixel patches merged 2 x 2,
+so that each 40 x 40 tile of a picture is one token of the prompt (`c/inkling2_vision.h`). The
+gateway takes pictures in user and tool messages, as the template does (`image_url` parts,
+data URIs), and prepares them as Inkling-2's processor does (`c/tools/inkling2_image.py`, Pillow
+and numpy): the picture keeps its size, padded to whole tiles, transparency on the processor's
+checkerboard. A picture of more than 256 tiles (`INK2_MAX_IMAGE_TOKENS`) is scaled down until it
+fits, since the tower runs on the CPU and the prompt pays for every tile. One picture a request.
+
+A picture of 320 x 200 (5 x 8 tiles) went through the tower in 0.51 s on the machine below, and
+the model described what it showed (two shapes, their colors and places). An engine started
+from a container without the tower says so at its handshake, and the gateway refuses pictures by
+name.
+
+### Inkling-2: the MTP drafter
+
+The checkpoint ships a drafter (`mtp/mtp.safetensors`, 3.4 GB: five decoder layers fed by eight
+of the model's layers, blocks of 8 tokens, a recurrent head over the vocabulary). Drafting pays
+when checking k drafted tokens in one forward costs much less than k forwards. Here it does not:
+a forward over n tokens at the decode position, the same prompt and text fed n at a time, the
+Vulkan build on the machine below, cost 0.51-0.69 s for one token, 1.01 s for two, 2.58 s for four
+and 4.56 s for eight. Each token brings experts of its own, and most of the step is reading them
+(a decode step reads its misses from the disk and computes the rest from RAM). A block of 8
+would lose even with every draft accepted, so the drafter is not wired. On a machine that holds
+every expert in memory the reads go away and the answer may change; it has not been measured
+there.
+
+Validation: `c/tools/make_tiny_inkling2.py` builds a random-weight model with transformers'
+`Inkling2ForCausalLM` (sliding and global layers, two blocks of the attention residuals, every
+parameter drawn at random) and its oracle, and the engine reproduces it token for token; `--g64`
+and `--int4-ref` do the same through the converter, from a fabricated NVFP4/MXFP8 checkpoint to
+the container. A GGUF as unsloth's lay it out (`tests/test_gguf_import.py`: folded convolutions,
+queries by layer, the NVFP4 layers' experts without their global scale) reads as the checkpoint
+it was written from, tokens and logits. CI runs these (`inkling2-oracle`), and the expert tier
+against the CPU on Lavapipe for the f32 fixture, the container and a Q8_0 GGUF
+(`tests/vulkan_engines.sh inkling2`). `tests/test_inkling2_kernels.c` holds the bf16 and int4 g64
+kernels to their references. The gateway's renderer matches the official chat template's output.
+`--vision` adds a tiny random tower (`Inkling2ForConditionalGeneration`) and one 2 x 3-tile
+picture among the prompt's tokens; the engine's generation matches transformers' token for token
+(CI runs it), and the last prompt position's logits agree to 3e-6. `tests/test_inkling2_chat.py`
+holds the picture preparation to the processor's rules.
 
 ## Modes
 

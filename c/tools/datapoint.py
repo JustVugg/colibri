@@ -30,6 +30,7 @@ Usage:
 """
 
 import argparse
+import math
 import os
 import platform
 import re
@@ -734,8 +735,8 @@ def main(argv=None):
         ap.error("--warmup-runs cannot be negative")
     if args.warm_runs < 1:
         ap.error("--warm-runs must be positive")
-    if args.memory_gb is not None and args.memory_gb <= 0:
-        ap.error("--memory-gb must be positive")
+    if args.memory_gb is not None and (not math.isfinite(args.memory_gb) or args.memory_gb <= 0):
+        ap.error("--memory-gb must be positive and finite")
     if args.mode == "persistent":
         if args.rotating_runs < 2:
             ap.error("--rotating-runs must be at least 2")

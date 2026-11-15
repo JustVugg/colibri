@@ -647,6 +647,9 @@ static void q38c_prewarm(Model *m, const Q38Chain *ch) {
     }
     pw.moe_d = c->hidden; pw.moe_i = c->inter;
     pw.ex_ours = c->experts > 0 && !g_q38_gguf;   /* our formats' experts: their grouped GEMMs */
+    /* and the formats q38_vk_tier_start gives them on the device: experts-int4g64/'s 4; the
+     * low-bit, FP8, BF16 and f32 ones and the MTP head's none of their own (bit 0) */
+    if (pw.ex_ours) pw.moe_fmts = (m->x4 && !m->x4->lb ? 1u << 4 : 1u) | (m->mtp ? 1u : 0u);
     /* a GGUF's experts, as the file has them: a prompt chunk's grouped GEMMs (vk_dmoe.h) */
     for (int i = 0; g_q38_gguf && i < c->layers; i++) {
         const char *kn[2] = {"ffn_gate_exps", "ffn_down_exps"};

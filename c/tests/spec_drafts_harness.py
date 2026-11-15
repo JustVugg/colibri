@@ -138,7 +138,8 @@ def expected(n_new, depth, mode, row=0, room_cap=MAX_ROWS - 1):
 
 
 def engine_tokens(stdout):
-    m = re.search(rb"^C engine :([^\n]*?)(?:Text|$)", stdout, re.M)
+    # ids only: with a tokenizer the decoded text is on its own "Text      :" line
+    m = re.search(rb"^C engine :([0-9 ]*)\r?$", stdout, re.M)
     return [int(t) for t in m.group(1).split()] if m else None
 
 

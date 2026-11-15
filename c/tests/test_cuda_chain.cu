@@ -28,6 +28,14 @@
 #include <atomic>
 #include <chrono>
 
+#ifdef _WIN32
+/* MSVC has no POSIX setenv/unsetenv */
+static int setenv(const char *name, const char *value, int overwrite) {
+    (void)overwrite; return _putenv_s(name, value);
+}
+static int unsetenv(const char *name) { return _putenv_s(name, ""); }
+#endif
+
 static int fails;
 static void ck(int ok, const char *what) { if (ok) { printf("  ok   %s\n", what); return; } printf("  FAIL %s\n", what); fails++; }
 static float frand(unsigned *s) { *s = *s * 1664525u + 1013904223u; return ((*s >> 8) & 0xFFFF) / 65535.f * 2.f - 1.f; }
@@ -356,6 +364,66 @@ static void prompt_rows_one_pass_long(void) {
         T->free(khb); T->free(vhb); T->free(o16);
     }
     T->free(qb); T->free(kb); T->free(vb); T->free(ob);
+}
+
+/* cc_attn_fk's 16-byte staging (cc_fa_stage16), where cc_attn_fk takes a prompt chunk: sm_70,
+ * or COLI_CUDA_CHAIN_FLASH2=0 from sm_75 (cc_attn_f2 takes it otherwise, and this says so).
+ * The same chunk as above: K and V 16-byte aligned take the staging, the same K and V one
+ * element further on take the scalar loop, and the two give the same bits, from a float32
+ * cache (four floats a load, rounded: values that are not float16 numbers, so the rounding
+ * shows) and from a float16 one (eight halves a load, copied). Four rows against the
+ * reference. (The float16 cache against the float32 one, on this path too: the test above.) */
+static void prompt_rows_16byte_staging(void) {
+#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
+    printf("  (16-byte staging: no cc_attn_fk on HIP)\n");
+#else
+    int dev = 0, ma = 0, mi = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&ma, cudaDevAttrComputeCapabilityMajor, dev);
+    cudaDeviceGetAttribute(&mi, cudaDevAttrComputeCapabilityMinor, dev);
+    const char *f2 = getenv("COLI_CUDA_CHAIN_FLASH2");
+    if (ma < 7 || (ma * 10 + mi >= 75 && !(f2 && *f2 == '0'))) {
+        printf("  (16-byte staging: no cc_attn_fk for a prompt chunk on sm_%d%d; COLI_CUDA_CHAIN_FLASH2=0 runs it from sm_75)\n", ma, mi);
+        return;
+    }
+    const int H = 16, KV = 2, hd = 256, S = 2043, pos = 6144, cap = 8384, qdim = 2 * hd, k_off = 32;
+    const size_t nkv = (size_t)k_off + 1 + (size_t)KV * cap * hd, n = (size_t)S * H * hd;
+    std::vector<float> q = rnd((size_t)S * H * qdim, 71), kc = rnd(nkv, 72), vc = rnd(nkv, 73), kc1(nkv), vc1(nkv);
+    memcpy(kc1.data() + 1, kc.data(), (nkv - 1) * 4); memcpy(vc1.data() + 1, vc.data(), (nkv - 1) * 4);   /* one element on */
+    CcAttn p = {S, H, KV, hd, pos, cap, 0, H * qdim, qdim, hd, H * qdim, qdim, 1, 0, H * hd, 0, 0, 1.f / sqrtf((float)hd), k_off, k_off};
+    CcAttn p1 = p; p1.k_off = p1.v_off = k_off + 1;
+    auto finite = [](const std::vector<float> &v) { for (float x : v) if (!std::isfinite(x)) return false; return true; };
+    CcBuf *qb = up(q), *kb = up(kc), *vb = up(vc), *kb1 = up(kc1), *vb1 = up(vc1);
+    CcBuf *ob = T->buf(n * 4, CC_DEV), *ob1 = T->buf(n * 4, CC_DEV);
+    int ran = T->begin() && T->attn(qb, kb, vb, ob, qb, NULL, &p) && T->attn(qb, kb1, vb1, ob1, qb, NULL, &p1) && T->submit(1);
+    std::vector<float> o = down(ob, n), o1 = down(ob1, n);
+    ck(ran && finite(o) && !memcmp(o.data(), o1.data(), n * 4),
+       "16-byte staging, a float32 cache: H 16 KV 2 hd 256, 2043 rows after 6144: the scalar loop's bits");
+    double d = 0;
+    for (int r : {0, 1, 1024, 2042}) {   /* a row alone: one position more each */
+        CcAttn pr = p; pr.S = 1; pr.pos_base = pos + r; pr.q_off = r * p.q_row; pr.g_off = p.g_off + r * p.g_row; pr.o_off = 0;
+        std::vector<float> ref((size_t)H * hd);
+        ref_attn(q.data(), kc.data(), vc.data(), ref.data(), q.data(), NULL, &pr);
+        d = fmax(d, maxdiff(o.data() + (size_t)r * H * hd, ref.data(), ref.size()));
+    }
+    ck(ran && finite(o) && d < 1e-4, "and rows 0, 1, 1024 and 2042 within 1e-4 of the reference");
+    printf("  16-byte staging, rows 0, 1, 1024 and 2042: max |diff| %.2e\n", d);
+    if (T->size < offsetof(ColiCudaChainOps, copy_regions_h) + sizeof T->copy_regions_h || !T->kvh()) printf("  (no float16 cache here)\n");
+    else {
+        std::vector<uint16_t> kh(nkv), vh(nkv), kh1(nkv), vh1(nkv);
+        kv16_pack(kh.data(), kc.data(), (int64_t)nkv); kv16_pack(vh.data(), vc.data(), (int64_t)nkv);
+        kv16_pack(kh1.data(), kc1.data(), (int64_t)nkv); kv16_pack(vh1.data(), vc1.data(), (int64_t)nkv);
+        CcBuf *khb = T->buf(nkv * 2, CC_DEV), *vhb = T->buf(nkv * 2, CC_DEV), *khb1 = T->buf(nkv * 2, CC_DEV), *vhb1 = T->buf(nkv * 2, CC_DEV);
+        CcBuf *oh = T->buf(n * 4, CC_DEV), *oh1 = T->buf(n * 4, CC_DEV);
+        int ok = ran && khb && vhb && khb1 && vhb1 && oh && oh1 && T->begin() && T->write(khb, 0, kh.data(), nkv * 2) &&
+                 T->write(vhb, 0, vh.data(), nkv * 2) && T->write(khb1, 0, kh1.data(), nkv * 2) && T->write(vhb1, 0, vh1.data(), nkv * 2) &&
+                 T->attn_h(qb, khb, vhb, oh, qb, NULL, &p) && T->attn_h(qb, khb1, vhb1, oh1, qb, NULL, &p1) && T->submit(1);
+        std::vector<float> h = down(oh, n), h1 = down(oh1, n);
+        ck(ok && finite(h) && !memcmp(h.data(), h1.data(), n * 4), "16-byte staging, a float16 cache: the scalar loop's bits");
+        T->free(khb); T->free(vhb); T->free(khb1); T->free(vhb1); T->free(oh); T->free(oh1);
+    }
+    T->free(qb); T->free(kb); T->free(vb); T->free(kb1); T->free(vb1); T->free(ob); T->free(ob1);
+#endif
 }
 
 /* the router's pick (chain_route.comp's rules: the lower expert on a tie, groups by their two best) */
@@ -1101,6 +1169,7 @@ int main(void) {
         }
     }
     prompt_rows_one_pass_long();
+    prompt_rows_16byte_staging();
     {   /* a float16 KV cache (kvh: attn_h, attn_wh, copy_regions_h): K and V of float16 values give
          * attn's bits from a float32 cache of the same values on every path: a decode's blocks by KV
          * head and by head, a prompt chunk on the tensor cores, a window with sinks, linear and in a ring */
@@ -1196,6 +1265,44 @@ int main(void) {
         ref_dnrec(KD, cv.data(), ab.data(), z.data(), rst.data(), prm.data(), ry.data(), rs.data(), &p2);
         ck(T->begin() && T->dnrec(KD, cb, bb, zb, sb, pb, yb, NULL, &p2) && T->submit(1) && maxdiff(down(yb, y.size()).data(), ry.data(), y.size()) < 1e-4 && maxdiff(down(sb, st.size()).data(), rst.data(), st.size()) < 1e-4, "the sigmoid gate, from the carried state");
         T->free(cb); T->free(bb); T->free(zb); T->free(sb); T->free(pb); T->free(yb); T->free(nb);
+    }
+    /* a verify's rows with a copy after each (snap_n, the copies' addresses in a mapped table): one
+     * dispatch of the convolution and one of the recurrence give the bits of a dispatch a row (each
+     * ending on its row, snap_row 0), outputs, the carried state and ring, and every copy */
+    if (T->size >= offsetof(ColiCudaChainOps, dev_addr) + sizeof T->dev_addr && T->dev_addr) {
+        printf("dnconv and dnrec: a verify's copies in one dispatch\n");
+        const int KD = 128, S = 8, NS = 7, VH = 4, KH = 2, VD = 128, Ktot = KH * KD, CD = 2 * Ktot + VH * VD, vd = VH * VD, CK = 4, nh = CK - 1;
+        std::vector<float> in = rnd((size_t)S * CD, 91), w = rnd((size_t)CD * CK, 92), ring = rnd((size_t)CD * nh, 93);
+        std::vector<float> ab = rnd((size_t)S * 2 * VH, 94), z = rnd((size_t)S * vd, 95), st = rnd((size_t)VH * KD * VD, 96, 0.1f);
+        std::vector<float> prm(2 * VH + VD); unsigned sd = 97; for (int h = 0; h < VH; h++) { prm[h] = -1.f + 0.5f * frand(&sd); prm[VH + h] = 0.2f * frand(&sd); } for (int v = 0; v < VD; v++) prm[2 * VH + v] = 1.f + 0.2f * frand(&sd);
+        std::vector<float> out[2], ys[2], sts[2], rings[2], rs[2][NS], cs[2][NS];
+        for (int one = 0; one < 2; one++) {
+            CcBuf *ib = up(in), *wb = up(w), *rb = up(ring), *ob = T->buf((size_t)S * CD * 4, CC_DEV), *bb = up(ab), *zb = up(z), *sb = up(st), *pb = up(prm);
+            CcBuf *yb = T->buf((size_t)S * vd * 4, CC_DEV), *rsb[NS], *csb[NS], *tab = T->buf((size_t)2 * NS * 8 + 16, CC_UP);
+            for (int r = 0; r < NS; r++) { rsb[r] = T->buf((size_t)VH * KD * VD * 4, CC_DEV); csb[r] = T->buf((size_t)CD * nh * 4, CC_DEV); }
+            int ok = tab != NULL && T->begin();
+            if (one) {
+                unsigned long long *t = (unsigned long long *)T->ptr(tab) + 1;   /* at float 2: an offset into the table */
+                for (int r = 0; r < NS; r++) { t[r] = (unsigned long long)(uintptr_t)T->dev_addr(rsb[r]); t[NS + r] = (unsigned long long)(uintptr_t)T->dev_addr(csb[r]); }
+                CcDnConv cp = {S, CD, CK, 0, CD, 0, CD, -1, 0, 0, 0, 2 + 2 * NS, NS};
+                CcDnRec rp = {S, VH, KH, VD, Ktot, 0, CD, 0, 2 * VH, VH, 2 * VH, 0, vd, 0, vd, -1, 0, 1e-6f, 1.f / sqrtf((float)KD), 0, 2, 0, NS};
+                ok = ok && T->dnconv(ib, wb, rb, ob, tab, &cp) && T->dnrec(KD, ob, bb, zb, sb, pb, yb, tab, &rp);
+            } else
+                for (int r = 0; r < NS && ok; r++) {   /* the engines' segments: a row each, the last the rest */
+                    int s0 = r, len = r < NS - 1 ? 1 : S - s0;
+                    CcDnConv cp = {len, CD, CK, s0 * CD, CD, s0 * CD, CD, 0, 0, 0, 0, 0};
+                    CcDnRec rp = {len, VH, KH, VD, Ktot, s0 * CD, CD, s0 * 2 * VH, 2 * VH, VH + s0 * 2 * VH, 2 * VH, s0 * vd, vd, s0 * vd, vd, 0, 0, 1e-6f, 1.f / sqrtf((float)KD), 0, 0, 0};
+                    ok = T->dnconv(ib, wb, rb, ob, csb[r], &cp) && T->dnrec(KD, ob, bb, zb, sb, pb, yb, rsb[r], &rp);
+                }
+            ck(ok && T->submit(1), one ? "one dispatch each, seven copies" : "a dispatch a copy");
+            out[one] = down(ob, (size_t)S * CD); ys[one] = down(yb, (size_t)S * vd); sts[one] = down(sb, st.size()); rings[one] = down(rb, ring.size());
+            for (int r = 0; r < NS; r++) { rs[one][r] = down(rsb[r], (size_t)VH * KD * VD); cs[one][r] = down(csb[r], (size_t)CD * nh); }
+            T->free(ib); T->free(wb); T->free(rb); T->free(ob); T->free(bb); T->free(zb); T->free(sb); T->free(pb); T->free(yb); T->free(tab);
+            for (int r = 0; r < NS; r++) { T->free(rsb[r]); T->free(csb[r]); }
+        }
+        int same = out[0] == out[1] && ys[0] == ys[1] && sts[0] == sts[1] && rings[0] == rings[1];
+        for (int r = 0; r < NS; r++) same = same && rs[0][r] == rs[1][r] && cs[0][r] == cs[1][r];
+        ck(same, "the same bits: outputs, the state and the ring carried, the seven states and rings copied");
     }
     printf("ew\n");
     {
@@ -1520,6 +1627,50 @@ int main(void) {
         for (int r = 0; r < 8; r++) for (int i = 0; i < 64; i++) same &= got[r * 64 + i] == (float)(r * 1000 + i);
         ck(ok && same, "eight rounds: each answer read after its word, before the next");
         T->free(df); T->free(hf); T->free(ans); T->free(dst);
+    }
+    printf("wait_host_if\n");
+    {
+        /* wait_host for a step whose host may have no slots: a table of eight experts, 6 and 7 the
+         * host's (no g); six rounds of four routes, the host's slots in rounds 1 and 4 only (an id
+         * of -1 and one past the table count as the device's). Without a slot the device zeroes
+         * the host's rows and goes on, the host writing nothing; with one it waits for the word */
+        const int E = 8, R = 6, NK = 4;
+        CcExpert tab[E]; memset(tab, 0, sizeof tab);
+        for (int e = 0; e < 6; e++) tab[e].g = tab[e].u = tab[e].d = (const void *)(uintptr_t)(64 * (e + 1));
+        static const int ids[R][NK] = {{0, 1, 2, 3}, {4, 6, 5, 0}, {5, -1, 2, 9}, {1, 1, 1, 1}, {7, 2, 3, 4}, {0, 5, 9, -1}};
+        const int host[R] = {0, 1, 0, 0, 1, 0};
+        CcBuf *tb = T->buf(sizeof tab, CC_DEV), *ib = T->buf(sizeof ids, CC_DEV), *df = T->buf(64, CC_DOWN), *hf = T->buf(64, CC_UP),
+              *hy = T->buf(64 * 4, CC_UP), *dst = T->buf((size_t)R * 64 * 4, CC_DEV);
+        volatile unsigned *dw = (volatile unsigned *)T->ptr(df), *hw = (volatile unsigned *)T->ptr(hf);
+        float *aw = (float *)T->ptr(hy);
+        int ok = T->wait_host_if && tb && ib && df && hf && hy && dst;
+        if (ok) { for (int i = 0; i < 64; i++) aw[i] = 7.f; hw[5] = 0; hw[6] = 0; }
+        ok = ok && T->begin() && T->write(tb, 0, tab, sizeof tab) && T->write(ib, 0, ids, sizeof ids);
+        for (int r = 0; r < R && ok; r++)
+            ok = T->signal(df, 3, 100 + r) && T->wait_host_if(hf, 5, 100 + r, tb, 0, ib, (size_t)r * NK, NK, E, hy, 64) &&
+                 T->copy(dst, (size_t)r * 64, hy, 0, 64);
+        const auto t0 = std::chrono::steady_clock::now();
+        ok = ok && T->submit(0);
+        std::thread hostt([&] {
+            for (int r = 0; r < R; r++) {
+                if (!host[r]) continue;   /* nothing written: a device that waited would wait for good */
+                while (dw[3] < (unsigned)(100 + r)) { }
+                for (int i = 0; i < 64; i++) aw[i] = (float)(r * 1000 + i);
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                hw[5] = 100 + r;
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                if (r < R - 1) while (dw[3] < (unsigned)(101 + r)) { }   /* the copy read it */
+            }
+        });
+        ok = ok && T->finish();
+        hostt.join();
+        const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::vector<float> gotv = down(dst, (size_t)R * 64); const float *got = gotv.data(); int same = 1;
+        for (int r = 0; r < R; r++) for (int i = 0; i < 64; i++) same &= got[r * 64 + i] == (host[r] ? (float)(r * 1000 + i) : 0.f);
+        ck(ok && same && hw[6] == 0 && el < 5.0, "without a slot of the host's: its rows zero, no wait; with one: its rows after its word");
+        ck(!T->wait_host_if(hf, 5, 1, tb, 0, ib, 0, NK, 16, hy, 64) && !T->wait_host_if(hf, 5, 1, tb, 0, ib, 0, NK, E, hy, 65) &&
+           !T->wait_host_if(df, 5, 1, tb, 0, ib, 0, NK, E, hy, 64), "wait_host_if past its buffers, or on a DOWN flag, refused");
+        T->free(tb); T->free(ib); T->free(df); T->free(hf); T->free(hy); T->free(dst);
     }
     printf("pick\n");
     {

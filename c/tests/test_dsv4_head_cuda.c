@@ -90,8 +90,9 @@ int main(int argc,char **argv) {
     int devices[2];
     dsv4_test_devices(devices);
     assert(dsv4_cuda_init(devices, 2));
-    int shapes[][2] = {{32, 256}, {160, 4104}, {129280, 4096}};
-    int shape_count = argc == 2 && !strcmp(argv[1], "--small") ? 2 : 3;
+    // 2080 rows: two full 1024-row upload chunks and a 32-row tail.
+    int shapes[][2] = {{32, 256}, {160, 4104}, {2080, 256}, {129280, 4096}};
+    int shape_count = argc == 2 && !strcmp(argv[1], "--small") ? 3 : 4;
     for (int dev = 0; dev < 2; dev++) test_nonfinite(devices[dev]);
     for (int dev = 0; dev < 2; dev++) for (int shape = 0; shape < shape_count; shape++) {
         int rows = shapes[shape][0], cols = shapes[shape][1];

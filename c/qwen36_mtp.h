@@ -247,7 +247,9 @@ static int q36_mtp_kv(Model *m) {
         p->Vp = malloc(sizeof(void *) * (size_t)(c->n_layers + 1));
         if (!p->Kp || !p->Vp) { p->on = 0; return 0; }
     }
-    for (int i = 0; i < c->n_layers; i++) { p->Kp[i] = m->K[i]; p->Vp[i] = m->V[i]; }
+    /* the trunk's pointers, the CPU head's (a multiplexed step runs the device head with every
+     * conversation parked, the Model's own K and V unset) */
+    for (int i = 0; i < c->n_layers; i++) { p->Kp[i] = m->K ? m->K[i] : NULL; p->Vp[i] = m->V ? m->V[i] : NULL; }
     p->Kp[c->n_layers] = p->Kc; p->Vp[c->n_layers] = p->Vc;
     return 1;
 }

@@ -1,0 +1,11 @@
+# Deps for the Inkling-2 tiny-model oracle (tools/make_tiny_inkling2.py): the ci.yml
+# `inkling2-oracle` job installs exactly this file. transformers has Inkling2ForCausalLM on main
+# only (models/inkling2, after 5.23), so it is pinned to the commit the oracle was built against;
+# move to the first release that carries it.
+--index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://pypi.org/simple
+torch
+transformers @ git+https://github.com/huggingface/transformers@0d7a6219179b24586089ae81b45cf725078e681f
+safetensors
+numpy
+gguf>=0.19   # tests/test_gguf_import.py's Inkling-2 GGUF

@@ -7,8 +7,10 @@ purpose: every character is prompt the engine has to read.
 
 A page is opened only at a public address (no loopback, private, link-local or reserved one,
 redirects checked the same way), so a page the model asks for cannot reach this machine's own
-services or its network."""
+services or its network. The address checked is the one connected to: a name that answers a
+public address to the check and this machine to the connection (DNS rebinding) is refused."""
 import html
+import http.client
 import ipaddress
 import json
 import re
@@ -123,16 +125,58 @@ def search(q, n=6):
     return {"q": q, "results": results, "answers": answers}
 
 
+def _public_addresses(host, port):
+    """host's addresses, every one of them public"""
+    infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0].split("%")[0])
+        if not ip.is_global:
+            raise ValueError("not a public address: %s" % host)
+    return infos
+
+
 def _public_url(url):
     """http(s) to a public address only"""
     u = urllib.parse.urlsplit(url)
     if u.scheme not in ("http", "https") or not u.hostname:
         raise ValueError("http and https links only")
-    for info in socket.getaddrinfo(u.hostname, u.port or (443 if u.scheme == "https" else 80)):
-        ip = ipaddress.ip_address(info[4][0].split("%")[0])
-        if not ip.is_global:
-            raise ValueError("not a public address: %s" % u.hostname)
+    _public_addresses(u.hostname, u.port or (443 if u.scheme == "https" else 80))
     return url
+
+
+def _connect_public(address, *args, **kw):
+    """socket.create_connection to an address of the same lookup that checked it: resolving the
+    name again to connect would let it answer this machine the second time"""
+    host, port = address
+    error = OSError("no address for %s" % host)
+    for *_, addr in _public_addresses(host, port):
+        try:
+            return socket.create_connection((addr[0], addr[1]), *args, **kw)
+        except OSError as e:
+            error = e
+    raise error
+
+
+class _PublicHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, *args, **kw):
+        super().__init__(*args, **kw)
+        self._create_connection = _connect_public
+
+
+class _PublicHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, *args, **kw):   # the handshake still checks the certificate against the name
+        super().__init__(*args, **kw)
+        self._create_connection = _connect_public
+
+
+class _PublicHTTPHandler(urllib.request.HTTPHandler):
+    def do_open(self, http_class, req, **kw):   # through a proxy, the proxy resolves the name
+        return super().do_open(http_class if req.has_proxy() else _PublicHTTPConnection, req, **kw)
+
+
+class _PublicHTTPSHandler(urllib.request.HTTPSHandler):
+    def do_open(self, http_class, req, **kw):   # a CONNECT tunnel: the proxy resolves the name
+        return super().do_open(http_class if req._tunnel_host else _PublicHTTPSConnection, req, **kw)
 
 
 class _CheckedRedirect(urllib.request.HTTPRedirectHandler):
@@ -213,7 +257,7 @@ def page(url, max_chars=5000):
     whole body, scripts and navigation dropped, cut to max_chars."""
     _public_url(url)
     max_chars = max(200, min(int(max_chars), 20000))
-    opener = urllib.request.build_opener(_CheckedRedirect)
+    opener = urllib.request.build_opener(_CheckedRedirect, _PublicHTTPHandler, _PublicHTTPSHandler)
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "text/html,text/plain;q=0.9"})
     with opener.open(req, timeout=10) as r:
         ctype = r.headers.get("Content-Type", "")

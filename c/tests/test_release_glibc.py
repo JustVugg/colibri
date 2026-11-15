@@ -9,7 +9,7 @@ runner that had just built them, where they always start.
 
 This pins the fix on the real workflow:
 
-- the Linux row runs on a fixed image, not a moving `-latest` label, and
+- every Linux row runs on a fixed image, not a moving `-latest` label, and
   declares the glibc the archive is held to, no newer than 24.04's;
 - every `matrix.os` condition names an `os` the matrix has, so the apt steps
   cannot be skipped by a runner renamed in one place only;
@@ -63,21 +63,23 @@ class LinuxArchiveGlibcFloor(unittest.TestCase):
         self.job = build_job(RELEASE.read_text(encoding="utf-8"))
         self.assertTrue(self.job, "release.yml: the build job is gone")
         self.rows = matrix_rows(self.job)
-        linux = [r for r in self.rows if r.get("name") == "linux-x86_64"]
-        self.assertEqual(len(linux), 1, "release.yml: no single linux-x86_64 row")
-        self.linux = linux[0]
+        self.linux = [r for r in self.rows if r.get("name", "").startswith("linux-")]
+        self.assertIn("linux-x86_64", [r["name"] for r in self.linux],
+                      "release.yml: no linux-x86_64 row")
 
-    def test_the_linux_row_runs_on_a_fixed_image_with_its_floor(self):
-        os_label = self.linux.get("os", "")
-        self.assertRegex(os_label, r"^ubuntu-\d\d\.\d\d$",
-                         f"linux-x86_64 runs on '{os_label}': a moving label "
-                         f"changes the glibc the archive needs under a tag build")
-        self.assertIn("glibc", self.linux,
-                      "linux-x86_64 declares no glibc: nothing holds the archive to one")
-        floor = tuple(int(p) for p in self.linux["glibc"].split("."))
-        self.assertLessEqual(floor, GLIBC_FLOOR,
-                             f"glibc {self.linux['glibc']} is newer than Ubuntu "
-                             f"24.04's: the archive would not start there")
+    def test_every_linux_row_runs_on_a_fixed_image_with_its_floor(self):
+        for row in self.linux:
+            name, os_label = row["name"], row.get("os", "")
+            with self.subTest(name=name):
+                self.assertRegex(os_label, r"^ubuntu-\d\d\.\d\d(-arm)?$",
+                                 f"{name} runs on '{os_label}': a moving label "
+                                 f"changes the glibc the archive needs under a tag build")
+                self.assertIn("glibc", row,
+                              f"{name} declares no glibc: nothing holds the archive to one")
+                floor = tuple(int(p) for p in row["glibc"].split("."))
+                self.assertLessEqual(floor, GLIBC_FLOOR,
+                                     f"glibc {row['glibc']} is newer than Ubuntu "
+                                     f"24.04's: the archive would not start there")
 
     def test_every_os_condition_names_a_matrix_row(self):
         named = {r.get("os") for r in self.rows}

@@ -189,6 +189,13 @@ make cuda-dll CUDA_ARCH=sm_120        # match your GPU: sm_120 Blackwell, sm_89 
 make colibri.exe CUDA_DLL=1 ARCH=native   # relink host with the runtime loader
 ```
 
+> **No CUDA Toolkit installer (for example, no admin rights)?** A conda-layout CUDA tree works as well. Put its `Library\bin` on PATH (that is where `nvcc.exe` and `cudart64_12.dll` are) and pass `CUDA_HOME` with forward slashes:
+> ```cmd
+> set PATH=C:\path\to\env\Library\bin;%PATH%
+> make cuda-dll CUDA_HOME=C:/path/to/env/Library CUDA_ARCH=sm_89
+> ```
+> `coli_cuda.dll` imports `cudart64_12.dll`, which lives in that same `Library\bin`: keep it on PATH at run time, or copy the DLL next to `coli_cuda.dll`. Built this way with nvcc 12.8.93 and the MSVC 14.44 Build Tools on an RTX 4090 Laptop (sm_89). If the Build Tools are installed outside the default folder, `vcvars64.bat` prints `'vswhere.exe' is not recognized`; that message is harmless.
+
 Two pitfalls, both fixed on current `dev` (#314) but worth knowing on older checkouts:
 
 - **Spaces in `CUDA_HOME`** (`C:\Program Files\...`) used to break the recipe → fixed; nvcc now comes from PATH and `"$(NVCC)"` is quoted.

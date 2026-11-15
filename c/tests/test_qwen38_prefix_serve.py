@@ -30,7 +30,8 @@ from prefix_serve_harness import PromptCancelContract, ServeEngine  # noqa: E402
 HERE = Path(__file__).resolve().parent.parent
 ENGINE = Path(os.environ.get("QWEN38_BINARY", HERE / ("qwen38.exe" if sys.platform == "win32" else "qwen38")))
 FIXTURE = Path(os.environ.get("QWEN38_TINY", HERE / "qwen38_tiny"))
-REUSED = re.compile(r"\[PREFIX\] reusing (\d+) of (\d+) prompt tokens \(\d+%\) from (.+)")
+# Windows: the engine's stderr lines end in \r\n, and the harness keeps the \r
+REUSED = re.compile(r"\[PREFIX\] reusing (\d+) of (\d+) prompt tokens \(\d+%\) from ([^\r\n]+)")
 
 
 @unittest.skipUnless(ENGINE.exists(), "qwen38 is not built")

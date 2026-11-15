@@ -2298,6 +2298,16 @@ void qt_stats_mark(void){
     pthread_mutex_unlock(&G.mx);
 }
 
+int qt_counters(QtCounters *out){
+    memset(out,0,sizeof *out);
+    if(!G.on) return 0;
+    pthread_mutex_lock(&G.mx);
+    for(int i=0;i<G.ndev;i++) out->hits+=G.hits[i];
+    out->miss=G.miss; out->uploads=G.uploads; out->swaps=G.swaps; out->q_full_skips=G.q_full_skips;
+    pthread_mutex_unlock(&G.mx);
+    return 1;
+}
+
 static void qt_lfru_tick_locked(void){
     if(G_chain_own) return;   /* the chain's to move */
     size_t n=(size_t)G.nl*G.ne;

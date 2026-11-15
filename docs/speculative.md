@@ -13,6 +13,7 @@ What runs where:
 |---|---|---|
 | `qwen38` (Qwen3.8 Flash Next) | the checkpoint's MTP head, up to 3 drafts (on by default when the checkpoint has it; `Q38_MTP=0` off, `Q38_MTP_DRAFTS`); prompt lookup, up to 5 (on by default; `COLI_LOOKUP=0` off) | up to 6 rows, on the CPU or in the Vulkan dense chain |
 | `qwen36` (Qwen3.6, Qwen3-Coder, Qwen3.8-27B) | prompt lookup, up to 5 (on by default; `COLI_LOOKUP=0` off) | up to 6 rows, on the CPU or in the Vulkan dense chain |
+| `qwen36` and `qwen38` on the CUDA chain | a DFlash2 drafter (`COLI_DFLASH=<dir>`, [below](#dflash2)) in the MTP head's place: a block of up to 7 drafts in one pass | up to 8 rows (qwen36), 6 (qwen38) |
 | `colibri` (GLM-5.2) | its MTP head (`DRAFT`), carried by the gate below (`COLI_SPEC_GATE=0`: the acceptance guard of `COLI_MTP_GUARD_PCT` instead); without a head, the n-gram drafts come from the prompt lookup below and its gate by default (`COLI_LOOKUP=0`: its own n-gram drafts as before) | as before |
 
 ## How a verify works
@@ -168,6 +169,57 @@ logits at every depth, forced rejection/acceptance/mixed rows, and multi-turn
 serve including prefix reuse, pin restore and sampling. The reference uses
 Qwen's Transformers decoder with the converted int8 or int4-g64 weights.
 
+## DFlash2
+
+`COLI_DFLASH=<dir>` (a drafter's directory: its `config.json` and `model.safetensors`,
+`z-lab/Qwen3.8-27B-DFlash2` or `incoai/Qwen3.8-Flash-Next-DFlash2`) drafts with DFlash2 in
+the MTP head's place, on the CUDA chain's device (`dflash_cuda.h`). Written from the DFlash
+paper and the DFlash2 description, and the checkpoint's tensor names and shapes:
+
+- Context: for every position the target runs, its rows after the drafter's target layers
+  (`dflash_config.target_layer_ids`; Flash-Next: the four hyper-connection streams' sum)
+  side by side, through `fc` and `hidden_norm`, give each drafter layer that position's key
+  and value. The chain copies those rows during its own forward (`cc_dftap`) and adds them
+  to the drafter's cache in the same frames: no rows come back to the host.
+- A block: the verified token and `block_size - 1` mask tokens (the target's embeddings),
+  five decoder layers attending to the cache and, bidirectionally, to each other. Before and
+  after each sublayer a two-tap convolution mixes a row with the one before it in the block,
+  its coefficients a learned base plus a correction the sublayer's normed input gives each
+  group of 16 channels (`cc_dfconv`). The mask rows through the drafter's norm and the
+  target's `lm_head` are the drafts' logits.
+- The selector: each position's 16 best candidates (`cc_dftopk`), each scored with its
+  predecessor through the drafter's codebooks, the path walked greedily from the verified
+  token (`COLI_DFLASH_SELECT=0`: each position's best).
+- The verify, its rollback and the gate are the MTP head's: `Q36_MTP_DRAFTS` (7 by default
+  with the drafter) and `Q38_MTP_DRAFTS` (5), `Q36_MTP_PSTEP` / `Q38_MTP_PSTEP` trim each
+  block by its drafts' probabilities among their candidates. The drafter's cache holds one
+  conversation's positions: a forward the chain did not run, or a state the target took from
+  another conversation's prefix, leaves it empty until the next prompt from position 0.
+
+The matrices go to the device as Q8_0 blocks (the chain's block GEMVs), the codebooks stay in
+RAM. Each choice above was checked offline against the target's own greedy text and features
+(the drafts the target accepts); the alternatives measured fell to 1 to 3 tokens a block.
+Measured on an RTX PRO 4000 SFF, greedy, thinking off, every text identical to plain decoding:
+
+| Qwen3.8-27B (GGUF, CUDA chain), code / prose / list, tok/s | plain | MTP, 3 drafts | DFlash2 |
+|---|---|---|---|
+| unsloth v3.1 UD-Q4_K_XL | 20.3 / 20.3 / 20.0 | 48.8 / 32.7 / 35.3 | 61.1 / 32.1 / 36.9 |
+| unsloth v3.1 UD-IQ2_XXS (`MTP/mtp-*.gguf`) | 31.1 / 30.9 / 30.2 | 56.8 / 41.2 / 45.4 | 54.4 / 36.8 / 38.7 |
+
+With a verify's rows on the tensor cores for every type of those files (the later commits,
+[qwen36.md](qwen36.md)): UD-Q4_K_XL MTP 50.9 / 31.6 / 35.4, DFlash2 67.8 / 34.4 / 37.5;
+UD-IQ2_XXS MTP 63.8 / 41.7 / 46.3, DFlash2 73.0 / 40.8 / 42.5. DFlash2 leads on code on both
+files, the head on the IQ2_XXS file's prose and lists.
+
+A block costs 10.3 ms on the 27B (the layers 5.6, its `lm_head` rows 4.2, the selector 0.3)
+and carries 4.9 to 5.8 tokens a verify on code; a fixed depth of 7 (`Q36_MTP_PSTEP=0`) took
+code to 65.4 tok/s and prose down to 28.8. Offline, tokens a verify of 7 drafts (with the
+target's own): code 6.16, math 6.02, C++ 5.80, an essay 3.30, a list 2.95, Italian prose
+2.63. Where a verify's rows are dear the MTP head stays ahead: Qwen3.8-Flash-Next IQ2_XS (a MoE:
+each row brings its experts), where the drafter's 3 drafts
+gave 92.0 / 70.5 / 71.8 against the head's 91 to 97 / 70 to 71 / 80 to 90. `[dflash]` lines
+report the blocks and the context rows, `[qwen36 mtp]` / `[qwen38 dflash]` the acceptance.
+
 ## Prompt lookup
 
 Prompt lookup (on by default; `COLI_LOOKUP=0` turns it off) looks for the longest n-gram of
@@ -271,6 +323,13 @@ holds nothing of this text.
 When the gate decided anything, a run prints what it measured on a `[qwen38 spec gate]`
 or `[qwen36 spec gate]` line: `T(1)`, the cost of each row count it saw in units of
 `T(1)`, `rho`, the MTP head's cost per extra draft and the acceptance by position.
+
+With DFlash2 each request takes a plain step first: a request too short to reach the plain
+step every 64 forwards otherwise priced every verify with the prior `rho` (eight rows at 4.5
+decode steps), and cut its blocks at about four drafts (Qwen3.8-27B UD-Q4_K_XL, code: 56.4
+tok/s against 59.9 with the step). Carrying a request's measurements into the next was tried
+and left out: the costs alone moved prose and lists by up to 3 % each way, and the acceptance
+is the text's (code's carried into prose verified 13 % more drafts for the same tokens).
 
 ## Report lines
 
@@ -464,5 +523,10 @@ did not make.
   rows run; colibri's lookup against its oracle on the CPU and in the chain.
 - `qwen-spec-sanitize`: the harness's subset under ASan and UBSan, on the CPU and in the
   chain.
+- `make -C c CUDA=1 cuda-dflash-check`: the drafter's ops (`cc_dfconv`, `cc_dftopk`,
+  `cc_dftap`) against the CPU's bits; `make -C c CUDA=1 cuda-chain-check`: a verify's DeltaNet
+  copies in one dispatch against a dispatch a copy, every output and copy the same bits. On
+  the real 27B the drafter's own drafts and the forced ones (`Q36_MTP_FORCE` accept, reject,
+  mixed, cycle; depth 3 without the selector; causal) gave plain decoding's 96 tokens.
 - The existing gates of the S = 2 verify (`make -C c qwen38-tiny-mtp-check`, the
   `qwen-chain` family) run unchanged.

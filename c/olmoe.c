@@ -338,8 +338,9 @@ static double mem_available_gb(void) {
      * box it returned 0.0 and the auto budget collapsed to the dense resident
      * footprint -- a one-slot-per-layer cache with no warning (#1601).
      * Dev already had a fallback to half physical (7ed6084), but it missed the
-     * warm-macOS case where free+inactive+purgeable is 0.x GB on a 128 GB box:
-     * not zero, but implausible. The 2% floor treats that as unmeasured too. */
+     * warm-macOS case where the old free+inactive+purgeable probe read 0.x GB
+     * on a 128 GB box: not zero, but implausible. The 2% floor treats that as
+     * unmeasured too. */
     double total = 0, avail = 0;
     compat_meminfo_gb(&total, &avail);
     static int warned = 0;

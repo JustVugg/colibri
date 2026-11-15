@@ -10,7 +10,7 @@
 <p align="center">
   <a href="https://justvugg.github.io/colibri"><b>Website</b></a> ·
   <a href="https://discord.gg/RXV83nSZdk"><b>Discord</b></a> ·
-  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.it.md">Italiano</a> · <a href="README.ja.md">日本語</a> · <a href="README.id.md">Bahasa Indonesia</a> · Português (Brasil)
+  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.it.md">Italiano</a> · <a href="README.ja.md">日本語</a> · <a href="README.id.md">Bahasa Indonesia</a> · Português (Brasil) · <a href="README.es.md">Español</a> · <a href="README.fr.md">Français</a> · <a href="README.de.md">Deutsch</a> · <a href="README.ru.md">Русский</a>
 </p>
 
 **Motor minúsculo, modelo imenso.** O colibri roda modelos abertos muito grandes
@@ -21,7 +21,7 @@ disco, quando o modelo os pede. C puro, um arquivo por família de modelos, sem
 necessidade de GPU.
 
 Treze motores rodam hoje. Dez são para modelos de linguagem: **GLM-5.2/5.3** (que
-também roda o **Mistral-Large-4**), **GLM-5.3-Flash**, **Inkling**, **Kimi K3**,
+também roda o **Mistral-Large-4**), **GLM-5.3-Flash**, **Inkling**, **Kimi K3** (e K3.1 Pro),
 **DeepSeek V4 Flash**, **DeepSeek V4.1 Flash**, **MiMo-V2.6 Flash** (e Pro),
 **Qwen3.8-Flash-Next**, **Qwen3.6** (que também roda o Qwen3-Coder, o denso
 Qwen3.8-27B, o **Flint**, o **Muse Spark Open** e o **LFM3-VL**) e **OLMoE**. Um
@@ -232,6 +232,7 @@ velocidade: um NVMe rápido ajuda mais)
 | **Inkling** (975B): especialistas int4, pesos densos bf16 | `inkling` | 514 GB | 120 / 128 GB como baixado; 25 GB após uma [conversão para denso](docs/inkling.md) | CUDA, Vulkan | 0,25 tok/s (Ryzen 9 7900, 187 GB, RTX A6000) |
 | MiMo-V2.6 Pro (1,02T): visão e ferramentas | `mimo-v2.6-pro` | 564 GB | 54 / 64 GB | Vulkan | 0,66-0,79 tok/s (A, CPU) |
 | **Kimi K3** (2,8T): o maior | `kimi-k3` | 1,56 TB | 32 / 64 GB | CUDA, Vulkan | cerca de 9,4 s por token, especialistas lidos a 6,3 GB/s |
+| **Kimi K3.1 Pro** (2.8T): K3 com atenção esparsa além de 2048 tokens | `kimi-k3.1-pro` | 1.56 TB | 32 / 64 GB | CUDA, Vulkan | |
 
 <a id="other-supported-models"></a>
 
@@ -253,7 +254,7 @@ escreve um diretório de modelo ao lado dele; depois esse diretório vai em `--m
 qualquer outro ([gguf.md](docs/gguf.md)). Nada é convertido nem quantizado de novo: os blocos
 rodam como o arquivo os guarda, de IQ1_S a Q8_0, F16, BF16 e MXFP4. Os motores de todos os
 modelos de chat acima também leem GGUFs ([as arquiteturas](docs/gguf.md#supported-architectures));
-estes quatro modelos vêm como GGUF:
+estes modelos vêm como GGUF:
 
 | Modelo | GGUF | GPU | Medido |
 |---|---|---|---|
@@ -261,6 +262,7 @@ estes quatro modelos vêm como GGUF:
 | **Muse Spark Open** (816B, 42B ativos): texto e ferramentas, sob o acordo de licença da Meta | unsloth, de UD-IQ1_S 176 GB a UD-Q4_K_XL 505 GB | CUDA, Vulkan | 1,55-1,58 tok/s com Vulkan, 1,34-1,40 com CUDA, 0,83-0,89 na CPU (D) |
 | **Flint** (40B, 2.5B ativos): texto e ferramentas, Apache 2,0 | unsloth, de UD-IQ1_M 11,4 GB a BF16 79,6 GB | CUDA, Vulkan | UD-Q4_K_XL: 77,4 tok/s com CUDA, 77,7 com Vulkan, 15,8 na CPU (D) |
 | **LFM3-VL-2B**: texto, figuras e ferramentas, LFM Open License | LiquidAI, de QAD-Q4_0 a BF16 (ou o checkpoint, convertido) | CUDA, Vulkan | Q4_K_M: 235,1 tok/s com CUDA, 214,1 com Vulkan, 34,5 na CPU (D) |
+| **Qwen-Image-2.1** e o seu **Turbo**: texto para figura, licença não comercial ([qwen-image.md](docs/qwen-image.md#gguf-unsloth)) | unsloth, Q2_K 2.5 GB a F16 14.2 GB, com um GGUF Qwen3-VL-8B-Instruct como codificador de texto | Vulkan | Turbo Q4_K_M, 1024x1024 em 8 passos: 37 s de denoising com Vulkan (D); a 512x512, 8.4-9.3 s por passo na CPU (A) |
 
 Os modelos maiores das tabelas acima a partir dos seus GGUFs, na mesma máquina: [Benchmarks](#large-models-on-the-same-machine).
 
@@ -404,7 +406,7 @@ do arquivo principal e o setup escolhe CUDA.
   ([benchmarks.md](docs/benchmarks.md)); o DeepSeek V4 Flash numa RTX 5080, 1,5-1,6
   tok/s e um prompt de 3.324 tokens em 90 s
   ([deepseek-v4.md](docs/deepseek-v4.md)).
-- **Novidade no Qwen3.6: as camadas DeltaNet na placa** (`Q36_DN_GPU=1`,
+- **As camadas DeltaNet do Qwen3.6 na placa** (`Q36_DN_GPU=1`,
   opcional). Cada uma das 30 camadas DeltaNet do Qwen3.6 copiava seus dados entre
   a placa e a CPU quatro vezes por token; agora um token de decodificação roda a
   camada inteira na placa, com o estado recorrente guardado na VRAM. Numa RTX 3070
@@ -511,7 +513,9 @@ escolhido neste passo, âmbar quando usado nesta resposta.</em></p>
 lê um pull request que quebra o limite de tamanho de um cache: <strong>request changes a 81%</strong>, entropia 0,56 (incerto), 98 tokens lidos, 0 gerados.</em></p>
 
 A página **Profiling** mostra onde cada turno gasta o seu tempo, fase por fase,
-com os últimos 30 turnos como tendência.
+com os últimos 30 turnos como tendência. Com o [joules](https://pypi.org/project/landauer-gap/)
+instalado junto ao gateway (`pip install landauer-gap`), ela também mostra os watts da
+máquina e os joules por token do último turno.
 
 ### A interface no terminal
 
@@ -541,6 +545,12 @@ O `coli serve` (que a configuração inicia para você) é um servidor com vári
   Qwen3.8-Flash-Next, Qwen3.8-27B, LFM3-VL e Mistral-Large-4 (de um GGUF, com o
   arquivo `mmproj` ao lado): um caminho numa mensagem do `coli chat`, um anexo no
   `coli web` ou no `coli ui`, ou uma parte `image_url`;
+- **documentos de entrada** em todo motor de chat: `/file PATH` no `coli chat` (ou
+  `coli chat --file PATH`) envia o texto de um arquivo de texto ou de um PDF com a
+  próxima mensagem. Só é lido um arquivo nomeado assim, nunca um caminho dentro de uma
+  mensagem; ele precisa ser um arquivo regular com sufixo de texto ou `.pdf`, de até
+  64 MiB e 2 milhões de caracteres. Um PDF é analisado num processo separado, com limite
+  de tempo e de memória, por `pdftotext` (poppler) ou `pypdf`;
 - **figuras de saída** com o Qwen-Image-2.1 em `POST /v1/images/generations`,
   e desenhadas dentro do terminal pelo `coli chat`
   ([qwen-image.md](docs/qwen-image.md));
@@ -799,7 +809,7 @@ controlada vale mais aqui do que um número rápido sem explicação.
 | Vulkan: o tier de especialistas, a cadeia densa, placas sem Resizable BAR | [vulkan.md](docs/vulkan.md) |
 | CUDA, e o tier CUDA do Qwen3.6 | [cuda.md](docs/cuda.md), [qwen36-cuda-tier.md](docs/qwen36-cuda-tier.md) |
 | Apple Silicon, Windows | [metal.md](docs/metal.md), [windows.md](docs/windows.md) |
-| Ajuste, o cache que aprende, prefetch, especulação | [tuning.md](docs/tuning.md) |
+| Ajuste, o cache que aprende, prefetch | [tuning.md](docs/tuning.md) |
 | Decodificação especulativa: os cabeçotes MTP, o prompt lookup, a verificação | [speculative.md](docs/speculative.md) |
 | Vários SSDs, várias máquinas | [multidisk.md](docs/multidisk.md), [cluster.md](docs/cluster.md) |
 | Benchmarks e como medir | [benchmarks.md](docs/benchmarks.md), [benchmarking.md](docs/benchmarking.md) |

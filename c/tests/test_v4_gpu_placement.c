@@ -44,10 +44,20 @@ int dsv4_cuda_expert_bank_slots(int experts) { (void)experts; return 0; }
 long long dsv4_cuda_expert_bank_slot_bytes(int hidden, int intermediate) { (void)hidden; (void)intermediate; return 0; }
 void dsv4_cuda_activation_free(Dsv4CudaActivation *a) { (void)a; }
 int dsv4_cuda_device_unified(int device) { (void)device; return 0; }
-long long dsv4_cuda_mem_free_mb(int device) { free_queries[device]++; return device == low_memory_device ? 0 : 32000; }
+/* fake_free_mb >= 0: a card with that much free, plus 13 MiB for every
+ * mirror (three tensors) freed since fake_free_tensors was taken */
+static long long fake_free_mb = -1;
+static int fake_free_tensors;
+long long dsv4_cuda_mem_free_mb(int device) {
+    free_queries[device]++;
+    if (fake_free_mb >= 0)
+        return fake_free_mb + 13LL * ((fake_free_tensors - live_tensors) / 3);
+    return device == low_memory_device ? 0 : 32000;
+}
 int dsv4_cuda_stream_drain(int device) { drained[device]++; return device != 3; }
 void dsv4_cuda_tensor_free(Dsv4CudaTensor *t) { if (t) { live_tensors--; free(t); } }
 void dsv4_cuda_proj_batch_release(void) {}
+static int fp4_uploads, fp4_refills;
 int dsv4_cuda_upload_fp4(Dsv4CudaTensor **t, const uint8_t *w,
                           const uint8_t *scale, int rows, int cols, int device) {
     (void)w; (void)scale; (void)rows; (void)cols;
@@ -57,12 +67,68 @@ int dsv4_cuda_upload_fp4(Dsv4CudaTensor **t, const uint8_t *w,
     assert(*t);
     (*t)->device = device;
     live_tensors++;
+    fp4_uploads++;
     return 1;
 }
+/* the sync of every refill, and the thread it came from (V4_UPLOAD_THREAD) */
+static int refill_sync[4], refill_calls, refill_off_main;
+static pthread_t main_thread;
 int dsv4_cuda_tensor_refill_fp4(Dsv4CudaTensor *t, const uint8_t *w,
                                  const uint8_t *scale, int rows, int cols, int sync) {
-    (void)t; (void)w; (void)scale; (void)rows; (void)cols; (void)sync;
+    (void)t; (void)w; (void)scale; (void)rows; (void)cols;
+    fp4_refills++;
+    if (sync >= 0 && sync < 4) refill_sync[sync]++;
+    refill_calls++;
+    if (!pthread_equal(pthread_self(), main_thread)) refill_off_main++;
     return 1;
+}
+/* dsv4_cuda_upload_fence: the events and the drains per device; fence_ok 0 is
+ * a backend without the entry, 2 one whose event fails */
+static int fence_ok = 1, fences[16], fence_drains[16];
+int dsv4_cuda_upload_fence(int device, int drain) {
+    if (!fence_ok) return 0;
+    if (drain) { fence_drains[device]++; return 1; }
+    if (fence_ok == 2) return 0;
+    fences[device]++;
+    return 1;
+}
+/* V4_MIRROR_BLOCK: one allocation call makes the three tensors, one refill
+ * call takes the record's two runs */
+static int mirror_allocs, mirror_refills, mirror_alloc_ok = 1, mirror_refill_ok = 1;
+static long long mirror_check_weights = -1;
+static const uint8_t *mirror_scales, *mirror_weights;
+static long long mirror_scale_bytes, mirror_weight_bytes, mirror_weight_offset[3];
+int dsv4_cuda_mirror_alloc(Dsv4CudaTensor **gate, Dsv4CudaTensor **up, Dsv4CudaTensor **down,
+                           int Og, int Ig, int Od, int Id, int device) {
+    assert(Og > 0 && Ig > 0 && Od > 0 && Id > 0);
+    if (!mirror_alloc_ok) return 0;
+    Dsv4CudaTensor **all[3] = {gate, up, down};
+    for (int k = 0; k < 3; k++) {
+        *all[k] = malloc(sizeof(**all[k]));
+        assert(*all[k]);
+        (*all[k])->device = device;
+        live_tensors++;
+    }
+    mirror_allocs++;
+    return 1;
+}
+int dsv4_cuda_mirror_refill(Dsv4CudaTensor *gate, Dsv4CudaTensor *up, Dsv4CudaTensor *down,
+                            const uint8_t *scales, long long S, const long long *soff,
+                            const uint8_t *weights, long long Wb, const long long *woff,
+                            int sync) {
+    (void)sync;
+    assert(gate && up && down && scales && weights && soff && woff);
+    if (!mirror_refill_ok) return 0;
+    mirror_scales = scales; mirror_weights = weights;
+    mirror_scale_bytes = S; mirror_weight_bytes = Wb;
+    for (int k = 0; k < 3; k++) mirror_weight_offset[k] = woff[k];
+    mirror_refills++;
+    return 1;
+}
+long long dsv4_cuda_mirror_check(Dsv4CudaTensor *gate, int run, const uint8_t *src,
+                                 long long len) {
+    assert(gate && src && len > 0);
+    return run ? mirror_check_weights : -1;
 }
 
 static int head_upload_ok = 1, head_scores_ok = 1, head_uploads;
@@ -131,6 +197,89 @@ static void test_head(void) {
     assert(coli_v4_gpu_head_batch(engine, &input, 3, NULL, ids, values) == -1);
     unsetenv("DSV4_CUDA_HEAD_BATCH");
     coli_v4_gpu_engine_close(engine); assert(shutdowns == before + 1);
+    /* DSV4_CUDA_HEAD_LAZY (default): the first head call uploads; a refused
+     * upload is not retried within the same open; 0 leaves it to engine open. */
+    engine->gpu.enabled = 1; head_scores_ok = 1; head_upload_ok = 1;
+    int uploads = head_uploads;
+    assert(!coli_v4_gpu_head_scores(engine, &input, &scores) && scores == input);
+    assert(engine->gpu.head && head_uploads == uploads + 1 && engine->gpu.head_tried);
+    assert(!coli_v4_gpu_head_scores(engine, &input, &scores) && head_uploads == uploads + 1);
+    coli_v4_gpu_engine_close(engine);
+    assert(!engine->gpu.head && !engine->gpu.head_tried);
+    engine->gpu.enabled = 1; head_upload_ok = 0; uploads = head_uploads;
+    assert(coli_v4_gpu_head_scores(engine, &input, &scores) == -1);
+    assert(!engine->gpu.head && head_uploads == uploads + 1);
+    head_upload_ok = 1;
+    assert(coli_v4_gpu_head_batch(engine, &input, 3, NULL, ids, values) == -1);
+    assert(!engine->gpu.head && head_uploads == uploads + 1);
+    coli_v4_gpu_engine_close(engine);
+    setenv("DSV4_CUDA_HEAD_LAZY", "0", 1);
+    engine->gpu.enabled = 1; uploads = head_uploads;
+    assert(coli_v4_gpu_head_scores(engine, &input, &scores) == -1);
+    assert(!engine->gpu.head && head_uploads == uploads && !engine->gpu.head_tried);
+    unsetenv("DSV4_CUDA_HEAD_LAZY");
+    coli_v4_gpu_engine_close(engine);
+    free(engine);
+#endif
+}
+
+/* A head the RAM plan streams: read for the upload through these, then freed. */
+static int head_exact = 1, head_reads, head_read_fail;
+static uint64_t host_free = UINT64_C(64) << 30;
+static ColiSafetensorsTensor head_tensor = {.dtype = COLI_ST_BF16, .nbytes = 512, .rank = 2};
+int dsv4_cuda_head_exact_available(void) { return head_exact; }
+uint64_t coli_v4_os_available_memory(void) { return host_free; }
+const ColiSafetensorsTensor *coli_st_find(const ColiSafetensorsIndex *index, const char *name) {
+    assert(index && !strcmp(name, "head.weight"));
+    return &head_tensor;
+}
+int coli_v4_head_cache_load(ColiV4Engine *engine, const ColiSafetensorsIndex *index,
+                            char *error, size_t error_size) {
+    assert(engine && index && !engine->head_cache.data);
+    head_reads++;
+    if (head_read_fail) { snprintf(error, error_size, "cannot load resident BF16 head.weight"); return -1; }
+    engine->head_cache.data = calloc(1, 512); assert(engine->head_cache.data);
+    engine->head_cache.bytes = 512;
+    return 0;
+}
+static void test_head_borrowed(void) {
+#if defined(__AVX2__)
+    ColiV4Engine *engine = calloc(1, sizeof(*engine)); assert(engine);
+    static int index_storage;
+    engine->target_index = (ColiSafetensorsIndex *)&index_storage;
+    engine->gpu.enabled = 1;
+    engine->config.vocab_size = 32; engine->config.hidden_size = 8;
+    head_uploads = 0; head_upload_ok = 1; head_scores_ok = 1;
+    /* nothing is read when the upload cannot happen */
+    head_exact = 0;
+    coli_v4_gpu_head_upload(engine);
+    head_exact = 1; low_memory_device = 0;
+    coli_v4_gpu_head_upload(engine);
+    low_memory_device = -1; host_free = 512;
+    coli_v4_gpu_head_upload(engine);
+    host_free = UINT64_C(64) << 30; head_tensor.dtype = COLI_ST_F16;
+    coli_v4_gpu_head_upload(engine);
+    head_tensor.dtype = COLI_ST_BF16;
+    assert(!head_reads && !head_uploads && !engine->gpu.head && !engine->head_cache.data);
+    /* unreadable head.weight: no upload */
+    head_read_fail = 1;
+    coli_v4_gpu_head_upload(engine);
+    assert(head_reads == 1 && !head_uploads && !engine->gpu.head && !engine->head_cache.data);
+    head_read_fail = 0;
+    /* refused: the host copy is freed, the CPU keeps streaming */
+    head_upload_ok = 0;
+    coli_v4_gpu_head_upload(engine);
+    assert(head_reads == 2 && head_uploads == 1 && !engine->gpu.head);
+    assert(!engine->head_cache.data && !engine->head_cache.bytes);
+    /* uploaded: the device holds the head, the host copy is freed */
+    head_upload_ok = 1;
+    coli_v4_gpu_head_upload(engine);
+    assert(head_reads == 3 && head_uploads == 2 && engine->gpu.head && live_tensors == 1);
+    assert(!engine->head_cache.data && !engine->head_cache.bytes);
+    float input = 7, scores = -1;
+    assert(!coli_v4_gpu_head_scores(engine, &input, &scores) && scores == input);
+    coli_v4_gpu_engine_close(engine);
+    assert(!live_tensors && !engine->gpu.head);
     free(engine);
 #endif
 }
@@ -371,6 +520,289 @@ int dsv4_cuda_resident_route_moe(Dsv4CudaExpertSet *set,Dsv4CudaTensor *gate,
     if(route_ok)*out=*in;
     return route_ok;
 }
+/* An expert record as the store keeps it: the three scale tensors together,
+ * then (16-byte aligned) the three weight tensors together, in the file's
+ * order, which here is up, gate, down. gate and up are 2 x 32, down 1 x 32. */
+static uint8_t block_record[256];
+static ColiExpertView block_view(int expert, int scattered) {
+    ColiExpertView view = {0};
+    view.key = (ColiExpertKey){3, expert};
+    view.gate.rows = view.up.rows = 2; view.down.rows = 1;
+    view.gate.columns = view.up.columns = view.down.columns = 32;
+    view.gate.block_rows = view.up.block_rows = view.down.block_rows = 1;
+    view.gate.format = view.up.format = view.down.format = COLI_TENSOR_FP4_NATIVE_BLOCK;
+    view.up.scales = block_record;            /* 2 bytes */
+    view.gate.scales = block_record + 2;      /* 2 bytes */
+    view.down.scales = block_record + 4;      /* 1 byte */
+    view.up.data = block_record + 16;         /* 32 bytes */
+    view.gate.data = block_record + 48;       /* 32 bytes */
+    view.down.data = block_record + (scattered ? 96 : 80);   /* 16 bytes; 96 leaves a gap */
+    return view;
+}
+static void test_mirror_block(void) {
+    V4GpuExpertMirrorCache *cache = v4_gpu_expert_mirrors_create_capacity(0, 8);
+    int tensors = live_tensors;
+    fp4_uploads = fp4_refills = mirror_allocs = mirror_refills = 0;
+    /* the switch unset: three tensors, as before */
+    unsetenv("V4_MIRROR_BLOCK");
+    ColiExpertView view = block_view(0, 0);
+    assert(v4_gpu_expert_attach_cached_ex(cache, &view, 1) == 0);
+    assert(fp4_uploads == 3 && !mirror_allocs && !cache->entries[0].block);
+    /* on: a block, filled with one call from the record's two runs */
+    setenv("V4_MIRROR_BLOCK", "1", 1);
+    view = block_view(1, 0);
+    assert(v4_gpu_expert_attach_cached_ex(cache, &view, 1) == 0);
+    assert(fp4_uploads == 3 && mirror_allocs == 1 && mirror_refills == 1);
+    assert(cache->entries[1].block && cache->block_made == 1);
+    assert(mirror_scales == block_record && mirror_scale_bytes == 5);
+    assert(mirror_weights == block_record + 16 && mirror_weight_bytes == 80);
+    /* gate, up, down, wherever the record put them */
+    assert(mirror_weight_offset[0] == 32 && mirror_weight_offset[1] == 0 &&
+           mirror_weight_offset[2] == 64);
+    assert(view.gate.gpu == cache->entries[1].gate && view.down.gpu == cache->entries[1].down);
+    /* a hit uploads nothing */
+    assert(v4_gpu_expert_attach_cached_ex(cache, &view, 1) == 0 && mirror_refills == 1);
+    for (int expert = 2; expert < 8; expert++) {
+        view = block_view(expert, 0);
+        assert(v4_gpu_expert_attach_cached_ex(cache, &view, 1) == 0);
+    }
+    assert(cache->count == 8 && mirror_allocs == 7 && mirror_refills == 7);
+    /* the cache is full. The oldest entry is the three-tensor one: a block
+     * replaces it (its tensors freed, one more allocation) */
+    view = block_view(8, 0);
+    assert(v4_gpu_expert_attach_cached_ex(cache, &view, 1) == 0);
+    assert(mirror_allocs == 8 && mirror_refills == 8 && !fp4_refills && fp4_uploads == 3);
+    assert(live_tensors == tensors + 24 && !cache->block_refills);
+    /* the next victim is a block: refilled in place, no allocation */
+    view = block_view(9, 0);
+    assert(v4_gpu_expert_attach_cached_ex(cache, &view, 1) == 0);
+    assert(mirror_allocs == 8 && mirror_refills == 9 && cache->block_refills == 1);
+    /* an expert whose tensors are not two runs takes three tensors, in the
+     * same cache, in a block victim's place */
+    view = block_view(10, 1);
+    assert(v4_gpu_expert_attach_cached_ex(cache, &view, 1) == 0);
+    assert(mirror_refills == 9 && fp4_uploads == 6 && cache->block_scattered == 1);
+    assert(live_tensors == tensors + 24);
+    int slot = -1;
+    for (int i = 0; i < cache->count; i++)
+        if (cache->entries[i].expert == 10) slot = i;
+    assert(slot >= 0 && !cache->entries[slot].block);
+    /* a refill the backend refuses falls back to a fresh mirror */
+    mirror_refill_ok = 0;
+    view = block_view(11, 0);
+    assert(v4_gpu_expert_attach_cached_ex(cache, &view, 1) == 0);
+    assert(fp4_uploads == 9 && live_tensors == tensors + 24);
+    mirror_refill_ok = 1;
+    /* V4_MIRROR_BLOCK_VERIFY: every fill read back, a difference counted */
+    setenv("V4_MIRROR_BLOCK_VERIFY", "1", 1);
+    view = block_view(12, 0);
+    assert(v4_gpu_expert_attach_cached_ex(cache, &view, 1) == 0);
+    assert(cache->block_verified == 1 && !cache->block_mismatches);
+    mirror_check_weights = 7;
+    view = block_view(13, 0);
+    assert(v4_gpu_expert_attach_cached_ex(cache, &view, 1) == 0);
+    assert(cache->block_verified == 2 && cache->block_mismatches == 1);
+    mirror_check_weights = -1;
+    unsetenv("V4_MIRROR_BLOCK_VERIFY");
+    unsetenv("V4_MIRROR_BLOCK");
+    v4_gpu_expert_mirrors_free(cache);
+    assert(live_tensors == tensors);
+}
+
+/* V4_UPLOAD_THREAD: a full cache of 8 on device 2, so every attach recycles a
+ * mirror in place and the backend sees the sync the uploader chose. */
+static uint8_t upload_bytes[64];
+static ColiExpertView upload_view(int expert) {
+    ColiExpertView view = {0};
+    view.key = (ColiExpertKey){1, expert};
+    view.gate.rows = view.up.rows = view.down.rows = 1;
+    view.gate.columns = view.up.columns = view.down.columns = 32;
+    view.gate.block_rows = view.up.block_rows = view.down.block_rows = 1;
+    view.gate.format = view.up.format = view.down.format = COLI_TENSOR_FP4_NATIVE_BLOCK;
+    view.gate.data = view.up.data = view.down.data = upload_bytes;
+    view.gate.scales = view.up.scales = view.down.scales = upload_bytes + 32;
+    return view;
+}
+static void upload_counts_reset(void) {
+    memset(refill_sync, 0, sizeof(refill_sync));
+    memset(fences, 0, sizeof(fences));
+    memset(fence_drains, 0, sizeof(fence_drains));
+    refill_calls = refill_off_main = 0;
+}
+static void test_upload_thread(void) {
+    V4GpuExpertMirrorCache *cache = v4_gpu_expert_mirrors_create_capacity(2, 8);
+    cache->first_layer = 0; cache->end_layer = 4;
+    ColiExpertStore store = {0};
+    store.gpu = cache;
+    main_thread = pthread_self();
+    int tensors = live_tensors;
+    ColiExpertView fill[8];
+    for (int expert = 0; expert < 8; expert++) {
+        fill[expert] = upload_view(expert);
+        assert(coli_v4_gpu_expert_attach(&store, &fill[expert]) == 0);
+    }
+    assert(cache->count == 8 && live_tensors == tensors + 24);
+    /* the switch: unset and 0 are off */
+    unsetenv("V4_UPLOAD_THREAD");
+    assert(!coli_v4_upload_thread_on());
+    setenv("V4_UPLOAD_THREAD", "0", 1);
+    assert(!coli_v4_upload_thread_on());
+    setenv("V4_UPLOAD_THREAD", "1", 1);
+    assert(coli_v4_upload_thread_on());
+    /* a view of a layer no cache owns is the caller's */
+    ColiExpertView stray = upload_view(90);
+    stray.key.layer = 7;
+    assert(coli_v4_gpu_expert_attach_queued(&store, &stray) == -1);
+
+    /* fenced, the default: three views handed over; their copies are enqueued
+     * on the second stream (sync 3) by the uploader, not by this thread */
+    unsetenv("V4_UPLOAD_FENCE");
+    upload_counts_reset();
+    unsigned long long uploads = coli_v4_gpu_expert_uploads();
+    ColiExpertView views[3];
+    for (int i = 0; i < 3; i++) {
+        views[i] = upload_view(20 + i);
+        assert(coli_v4_gpu_expert_attach_queued(&store, &views[i]) == 0);
+    }
+    coli_v4_gpu_expert_upload_join();
+    for (int i = 0; i < 3; i++)
+        assert(views[i].gate.gpu && views[i].up.gpu && views[i].down.gpu);
+    assert(coli_v4_gpu_expert_uploads() == uploads + 3);
+    assert(refill_calls == 9 && refill_sync[3] == 9 && refill_off_main == 9);
+    /* the first hand-over asked the backend once (a drain of nothing); the
+     * join fenced the card, once, and waited for no copy */
+    assert(fences[2] == 1 && fence_drains[2] == 1);
+    /* the settle waits for the copies, before the leases go */
+    coli_v4_gpu_expert_upload_settle();
+    assert(fences[2] == 1 && fence_drains[2] == 2);
+    assert(cache->count == 8 && live_tensors == tensors + 24);
+    /* a hit is reported by the uploader too, and copies nothing */
+    upload_counts_reset();
+    ColiExpertView again = upload_view(21);
+    assert(coli_v4_gpu_expert_attach_queued(&store, &again) == 0);
+    coli_v4_gpu_expert_upload_join();
+    coli_v4_gpu_expert_upload_settle();
+    assert(again.gate.gpu == views[1].gate.gpu && !refill_calls);
+
+    /* V4_UPLOAD_FENCE=0: the uploader drains the second stream itself (the
+     * last copy of each mirror with sync 2); no event, nothing left to settle */
+    setenv("V4_UPLOAD_FENCE", "0", 1);
+    upload_counts_reset();
+    for (int i = 0; i < 2; i++) {
+        views[i] = upload_view(30 + i);
+        assert(coli_v4_gpu_expert_attach_queued(&store, &views[i]) == 0);
+    }
+    coli_v4_gpu_expert_upload_join();
+    coli_v4_gpu_expert_upload_settle();
+    assert(views[0].down.gpu && views[1].down.gpu);
+    assert(refill_sync[3] == 4 && refill_sync[2] == 2 && refill_off_main == 6);
+    assert(!fences[2] && !fence_drains[2]);
+    unsetenv("V4_UPLOAD_FENCE");
+
+    /* an event that fails: the join waits for the copies instead */
+    fence_ok = 2;
+    upload_counts_reset();
+    views[0] = upload_view(40);
+    assert(coli_v4_gpu_expert_attach_queued(&store, &views[0]) == 0);
+    coli_v4_gpu_expert_upload_join();
+    assert(!fences[2] && fence_drains[2] == 1 && refill_sync[3] == 3);
+    coli_v4_gpu_expert_upload_settle();
+    assert(fence_drains[2] == 2);
+    fence_ok = 1;
+
+    /* a backend without the entry (asked once per process, so the answer is
+     * reset here): the uploader copies on the compute stream and drains it,
+     * as the inline attach does */
+    g_v4_up.backend = -1;
+    fence_ok = 0;
+    upload_counts_reset();
+    views[0] = upload_view(50);
+    assert(coli_v4_gpu_expert_attach_queued(&store, &views[0]) == 0);
+    coli_v4_gpu_expert_upload_join();
+    coli_v4_gpu_expert_upload_settle();
+    assert(views[0].gate.gpu && refill_sync[0] == 2 && refill_sync[1] == 1);
+    assert(refill_off_main == 3 && !fences[2] && !fence_drains[2]);
+    fence_ok = 1;
+    g_v4_up.backend = -1;
+
+    /* the inline attach is unchanged: its copies on the compute stream, from
+     * this thread */
+    upload_counts_reset();
+    views[0] = upload_view(60);
+    assert(coli_v4_gpu_expert_attach(&store, &views[0]) == 0);
+    assert(refill_sync[0] == 2 && refill_sync[1] == 1 && !refill_off_main);
+    assert(g_v4_up.jobs == 8 && g_v4_up.attached == 8);
+    unsetenv("V4_UPLOAD_THREAD");
+    v4_gpu_expert_mirrors_free(cache);
+    assert(live_tensors == tensors);
+}
+
+/* V4_BANK_MAKE_ROOM: the reserve is the headroom, and a bank about to be
+ * created releases the oldest mirrors on its device until it fits. */
+static V4GpuExpertMirrorCache *room_cache(int device, int mirrors, uint64_t first_clock) {
+    V4GpuExpertMirrorCache *cache = v4_gpu_expert_mirrors_create_capacity(device, 16);
+    for (int i = 0; i < mirrors; i++) {
+        V4GpuExpertMirror *entry = &cache->entries[cache->count++];
+        entry->layer = 1; entry->expert = i; entry->clock = first_clock + (uint64_t)i;
+        entry->gate = calloc(1, sizeof(Dsv4CudaTensor));
+        entry->up = calloc(1, sizeof(Dsv4CudaTensor));
+        entry->down = calloc(1, sizeof(Dsv4CudaTensor));
+        assert(entry->gate && entry->up && entry->down); live_tensors += 3;
+    }
+    return cache;
+}
+static void test_bank_make_room(void) {
+    long long bank = v4_reserve_bank_bytes, mirror = v4_reserve_mirror_bytes;
+    int start_tensors = live_tensors;
+    v4_reserve_bank_bytes = 100LL << 20;      /* a 100 MiB bank */
+    v4_reserve_mirror_bytes = 13LL << 20;     /* 13 MiB mirrors */
+    long long margin = -1;
+    unsetenv("V4_BANK_MAKE_ROOM");
+    long long reserved = v4_gpu_mirror_reserve_mb(64, &margin);
+    assert(reserved > COLI_V4_RESERVE_HEADROOM_MB && margin > 0);
+    V4GpuExpertMirrorCache *cache = room_cache(0, 10, 100);
+    V4GpuExpertMirrorCache *other = room_cache(1, 4, 1);          /* another device */
+    V4GpuExpertMirrorCache *resident = room_cache(0, 4, 1);       /* an immutable table */
+    resident->experts_per_layer = 4; resident->first_layer = 1; resident->end_layer = 2;
+    cache->next = other; other->next = resident;
+    ColiExpertStore store = {.gpu = cache};
+    int tensors = live_tensors;
+    /* the card is 100 MiB short of the bank and the 600 MiB headroom */
+    fake_free_mb = 600; fake_free_tensors = live_tensors;
+    /* off: nothing is released */
+    assert(v4_gpu_mirrors_make_room(&store, 0) == 0 && live_tensors == tensors);
+    setenv("V4_BANK_MAKE_ROOM", "1", 1);
+    /* on: the reserve is the headroom alone */
+    margin = -1;
+    assert(v4_gpu_mirror_reserve_mb(64, &margin) == COLI_V4_RESERVE_HEADROOM_MB && margin == 0);
+    /* 100 MiB short at 13 MiB a mirror: the 8 oldest go, the 2 newest stay */
+    cache->last_free_mb = 1; cache->grown_bytes = 5; cache->upload_failed = 1;
+    assert(v4_gpu_mirrors_make_room(&store, 0) == 8);
+    assert(cache->count == 2 && live_tensors == tensors - 24);
+    assert(cache->entries[0].clock >= 108 && cache->entries[1].clock >= 108);
+    /* the growth guard asks the card again */
+    assert(cache->last_free_mb == -1 && !cache->grown_bytes && !cache->upload_failed);
+    /* the other device's cache and the resident table are untouched */
+    assert(other->count == 4 && resident->count == 4);
+    /* enough room already: nothing more goes */
+    assert(v4_gpu_mirrors_make_room(&store, 0) == 0 && cache->count == 2);
+    /* a bank on the other device takes that device's mirrors only */
+    fake_free_mb = 690; fake_free_tensors = live_tensors;
+    assert(v4_gpu_mirrors_make_room(&store, 1) == 1 && other->count == 3 && cache->count == 2);
+    /* a card that never has the room gives up every mirror and stops */
+    fake_free_mb = 0; fake_free_tensors = live_tensors;
+    assert(v4_gpu_mirrors_make_room(&store, 0) == 2 && cache->count == 0);
+    assert(resident->count == 4);
+    /* no bank for this model: nothing to make room for */
+    v4_reserve_bank_bytes = 0;
+    assert(v4_gpu_mirrors_make_room(&store, 1) == 0 && other->count == 3);
+    fake_free_mb = -1;
+    unsetenv("V4_BANK_MAKE_ROOM");
+    v4_reserve_bank_bytes = bank; v4_reserve_mirror_bytes = mirror;
+    v4_gpu_expert_mirrors_free(cache);   /* frees the chain */
+    assert(live_tensors == start_tensors);
+}
+
 static void test_resident_route(void) {
     V4GpuExpertMirrorCache *cache=v4_gpu_expert_mirrors_create_capacity(0,256);
     cache->first_layer=7; cache->end_layer=8; cache->experts_per_layer=256;
@@ -456,9 +888,13 @@ int main(void) {
     assert(!store.gpu && shutdowns == 1);
     free(engine);
     test_preload();
+    test_mirror_block();
+    test_upload_thread();
     test_resident_route();
+    test_bank_make_room();
     test_wo_decode();
     test_head();
+    test_head_borrowed();
     puts("test_v4_gpu_placement: ok");
     return 0;
 }

@@ -36,12 +36,20 @@
 
 #include "backend_cuda_dsv4.h"
 
+/* Only for a clang build whose link leaves libomp.a's weak omp_get_num_devices
+ * unresolved (MSYS2's llvm-openmp 22.1.7 or binutils 2.46, #2286; Makefile.deepseek-v4
+ * probes for it). No offload runtime is linked, so 0 non-host devices: what libomp
+ * itself returns without one. */
+#ifdef COLI_OMP_NUM_DEVICES_STUB
+int omp_get_num_devices(void) { return 0; }
+#endif
+
 /* Two builds of the same source ship side by side: coli_cuda_dsv4_dg.dll
  * (DeepGEMM, sm_120a tensor-core paths) and coli_cuda_dsv4.dll (portable
  * generic kernels, sm_80+). The loader tries the DeepGEMM one first and asks
  * it whether the device fits (dsv4_cuda_backend_arch_ok); on refusal it
  * unloads and takes the generic one, so one install adapts to whatever GPU
- * is present. COLI_DSV4_DLL=<file name> forces a specific DLL. */
+ * is present. COLI_DSV4_DLL=<file name or path> forces a specific DLL. */
 #define DSV4_BACKEND_DLL "coli_cuda_dsv4.dll"
 #define DSV4_BACKEND_DLL_DG "coli_cuda_dsv4_dg.dll"
 #define DSV4_VENDOR_TAG  "[DSV4 CUDA]"
@@ -170,9 +178,29 @@ typedef int             (*fn_indexer_score_batch)(int device, const float *queri
 typedef int             (*fn_fp8_ref_matmul)(int device, const uint8_t *w, const float *bscale,
                                              int rows, int cols, int packed_rows8, const float *x,
                                              int tokens, float *y);
+typedef int             (*fn_indexer_resident)(int device, int layer, const uint8_t *w, const float *bscale,
+                                               int rows, int cols, int packed_rows8, const uint16_t *head_w,
+                                               int heads, int hidden);
+typedef int             (*fn_indexer_keys_sync)(int device, int layer, unsigned long long owner,
+                                                const float *keys, int count, int dim);
+typedef int             (*fn_matmul_bf16_multi)(Dsv4CudaTensor *const *ts, int n, const float *x,
+                                                int tokens, float *const *ys);
+typedef int             (*fn_decode_proj_multi)(Dsv4CudaTensor *const *ts, int n, const float *x,
+                                                float *const *ys);
+typedef int             (*fn_attn_decode_fused)(const Dsv4FusedArgs *a);
+typedef int             (*fn_attn_decode_chain)(int device, int layer, const float *q, const float *chunk,
+                                                int chunk_start, const float *sinks, const int *meta,
+                                                const int *sel, int selstride, int abs_base, int comp_limit,
+                                                int heads, int dim, float scale, const float *icos,
+                                                const float *isin, int rope_dim, int rope_fma,
+                                                Dsv4CudaTensor *wa, int groups, Dsv4CudaTensor *wb,
+                                                float *out, float *att_out, float *oa_out,
+                                                const float *qa, int q_rank, Dsv4CudaTensor *wqb,
+                                                float eps, int norm_fma, float *q_out);
 typedef int             (*fn_tensor_refill_fp4)(Dsv4CudaTensor *t, const uint8_t *w, const uint8_t *scale,
                                                 int O, int I, int sync);
 typedef int (*fn_head_scores_exact)(Dsv4CudaTensor*,const float*,float*);
+typedef int (*fn_head_exact_available)(void);
 typedef int (*fn_head_scores_batch_exact)(Dsv4CudaTensor*,const float*,int,float*);
 typedef int (*fn_head_argmax_batch_exact)(Dsv4CudaTensor*,const float*,int,int*,float*);
 typedef int (*fn_indexer_prepare)(Dsv4CudaTensor*,const float*,float*,float*,int);
@@ -185,6 +213,14 @@ typedef const char     *(*fn_backend_name)(void);
 typedef long long       (*fn_mem_free_mb)(int device);
 typedef int             (*fn_device_unified)(int device);
 typedef int             (*fn_stream_drain)(int device);
+typedef int             (*fn_mirror_alloc)(Dsv4CudaTensor **gate, Dsv4CudaTensor **up, Dsv4CudaTensor **down,
+                                           int Og, int Ig, int Od, int Id, int device);
+typedef int             (*fn_mirror_refill)(Dsv4CudaTensor *gate, Dsv4CudaTensor *up, Dsv4CudaTensor *down,
+                                            const uint8_t *scales, long long S, const long long *soff,
+                                            const uint8_t *weights, long long Wb, const long long *woff,
+                                            int sync);
+typedef long long       (*fn_mirror_check)(Dsv4CudaTensor *gate, int run, const uint8_t *src, long long len);
+typedef int             (*fn_upload_fence)(int device, int drain);
 typedef int             (*fn_kv_ring_append)(int device, int layer, const float *rows,
                                              int start_pos, int count, int window, int dim);
 typedef int             (*fn_kv_comp_append)(int device, int layer, const float *rows,
@@ -331,10 +367,18 @@ static struct {
     fn_proj_batch proj_batch;                       /* optional (V4_ATTN_BATCH_PROJ, older DLLs: 0) */
     fn_proj_batch_release proj_batch_release;       /* optional */
     fn_fp8_ref_matmul fp8_ref_matmul;
+    /* optional, V4_LAYER_FUSED: a decode token's attention on the device */
+    fn_indexer_resident indexer_resident;
+    fn_indexer_keys_sync indexer_keys_sync;
+    fn_attn_decode_chain attn_decode_chain;
+    fn_attn_decode_fused attn_decode_fused;
+    fn_matmul_bf16_multi matmul_bf16_multi;
+    fn_decode_proj_multi decode_proj_multi;
     fn_indexer_prepare indexer_prepare;
     fn_upload_compressor upload_compressor;
     fn_upload_compressor upload_head_exact;
     fn_head_scores_exact head_scores_exact;
+    fn_head_exact_available head_exact_available;   /* optional (older DLLs: 0) */
     fn_head_scores_batch_exact head_scores_batch_exact;
     fn_head_argmax_batch_exact head_argmax_batch_exact;
     fn_compressor_project compressor_project;
@@ -347,6 +391,10 @@ static struct {
     fn_mem_free_mb mem_free_mb;
     fn_device_unified device_unified;     /* optional: older DLLs answer 0 (discrete) */
     fn_stream_drain stream_drain;                /* optional (older DLLs) */
+    fn_mirror_alloc mirror_alloc;                /* optional: block mirrors (V4_MIRROR_BLOCK) */
+    fn_mirror_refill mirror_refill;
+    fn_mirror_check mirror_check;
+    fn_upload_fence upload_fence;                /* optional: the decode uploader thread (V4_UPLOAD_THREAD) */
     fn_kv_ring_append kv_ring_append;
     fn_kv_comp_append kv_comp_append;
     fn_head_argmax     head_argmax;
@@ -386,30 +434,49 @@ static struct {
     fn_tensor_device   tensor_device;
 } g_dsv4;
 
-/* One-shot loader: mirror of coli_cuda_load(). The DLL is loaded from the
- * engine's OWN directory by absolute path — never a bare name — so the
- * dependency search anchors to the trusted install directory and an attacker
- * cannot plant a same-named DLL in the CWD (classic DLL hijacking). */
-/* *present: whether the file is in the engine's folder at all, so a failure can
- * say "not in this folder" apart from "a DLL it needs is missing" -- Windows
- * reports both as error 126 (#2047). */
-static HMODULE dsv4_load_one(const char *name, int *present){
-    char dllpath[MAX_PATH];
+/* One-shot loader: mirror of coli_cuda_load(). A bare name is loaded from the
+ * engine's OWN directory by absolute path, never from the CWD (classic DLL
+ * hijacking); so is a relative path (sub\x.dll), as before. An absolute path
+ * (COLI_DSV4_DLL=C:\x\coli_cuda_dsv4_dg.dll, C:/x/..., \\server\share\...) is
+ * the user's explicit choice: that file is loaded, never glued onto the
+ * engine's folder. Either way its imports (the CUDA runtime) resolve
+ * from the DLL's own folder, System32 and PATH, never the CWD: dsv4_cuda_load
+ * takes the CWD out of the search order first (SetDllDirectoryA("")). */
+/* *present: whether the file exists at all, so a failure can say "not there"
+ * apart from "a DLL it needs is missing" -- Windows reports both as error 126
+ * (#2047). dllpath receives the path that was tried. */
+static HMODULE dsv4_load_one(const char *name, int *present, char *dllpath, DWORD size){
     HMODULE dll = NULL;
     *present = 0;
-    DWORD mn = GetModuleFileNameA(NULL, dllpath, (DWORD)sizeof(dllpath));
-    if(mn > 0 && mn < sizeof(dllpath)){
-        char *slash = strrchr(dllpath, '\\');
-        if(slash && (size_t)(slash + 1 - dllpath) + strlen(name) + 1 <= sizeof(dllpath)){
-            strcpy(slash + 1, name);
-            *present = GetFileAttributesA(dllpath) != INVALID_FILE_ATTRIBUTES;
-            dll = LoadLibraryExA(dllpath, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+    snprintf(dllpath, size, "%s", name);
+    /* absolute: a drive letter and a separator, or a UNC / \\?\ prefix; never CWD-relative */
+    int absolute = (name[0] && name[1] == ':' && (name[2] == '\\' || name[2] == '/'))
+                || ((name[0] == '\\' || name[0] == '/') && (name[1] == '\\' || name[1] == '/'));
+    if(absolute){
+        /* GetFullPathNameA also turns '/' into '\', which LOAD_WITH_ALTERED_SEARCH_PATH needs */
+        DWORD n = GetFullPathNameA(name, size, dllpath, NULL);
+        if(n == 0 || n >= size){
+            if(n >= size) SetLastError(ERROR_FILENAME_EXCED_RANGE);   /* GetFullPathNameA leaves it stale */
+            snprintf(dllpath, size, "%s", name);
+            return NULL;
         }
+        *present = GetFileAttributesA(dllpath) != INVALID_FILE_ATTRIBUTES;
+        return LoadLibraryExA(dllpath, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
     }
-    if(!dll)
+    DWORD mn = GetModuleFileNameA(NULL, dllpath, size);
+    char *slash = mn > 0 && mn < size ? strrchr(dllpath, '\\') : NULL;
+    if(slash && (size_t)(slash + 1 - dllpath) + strlen(name) + 1 <= size){
+        strcpy(slash + 1, name);
+        *present = GetFileAttributesA(dllpath) != INVALID_FILE_ATTRIBUTES;
+        dll = LoadLibraryExA(dllpath, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+    } else snprintf(dllpath, size, "%s", name);
+    if(!dll){
+        DWORD err = GetLastError();
         /* Fallback by name, restricted to the app dir and System32 — never CWD. */
         dll = LoadLibraryExA(name, NULL,
             LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if(!dll) SetLastError(err);   /* the cause of the engine-folder attempt, which the message names */
+    }
     return dll;
 }
 
@@ -424,16 +491,24 @@ static int dsv4_cuda_load(void){
     if(forced && *forced) candidates[n++] = forced;
     else { candidates[n++] = DSV4_BACKEND_DLL_DG; candidates[n++] = DSV4_BACKEND_DLL; }
     /* why each candidate was passed over, for the closing line (#1906: it named no cause) */
-    char why[512]; size_t wn = 0; why[0] = 0;
+    char why[2048]; size_t wn = 0; why[0] = 0;
+    char dllpath[MAX_PATH];
+    /* LOAD_WITH_ALTERED_SEARCH_PATH looks in the CWD before PATH, where the CUDA runtime
+     * often lives: a cudart64_*.dll planted in the CWD would run inside the engine. ""
+     * drops the CWD from this process's search orders and keeps PATH. */
+    SetDllDirectoryA("");
     for(int i = 0; i < n; i++){
         int present = 0;
-        g_dsv4.dll = dsv4_load_one(candidates[i], &present);
+        g_dsv4.dll = dsv4_load_one(candidates[i], &present, dllpath, (DWORD)sizeof(dllpath));
         if(!g_dsv4.dll){
             DWORD err = GetLastError();
-            int w = snprintf(why + wn, sizeof(why) - wn, "%s%s: %s (Windows error %lu)", wn ? "; " : "", candidates[i],
-                             !present ? "not in the engine's folder (the Windows CUDA package carries it)"
-                             : err == ERROR_MOD_NOT_FOUND ? "present, but a DLL it needs is missing (cudart64_12.dll beside it, or the NVIDIA driver's nvcuda.dll)"
-                             : err == ERROR_BAD_EXE_FORMAT ? "not a 64-bit DLL" : "not loadable", (unsigned long)err);
+            int w = snprintf(why + wn, sizeof(why) - wn, "%s%s: %s (tried %s, Windows error %lu)", wn ? "; " : "", candidates[i],
+                             err == ERROR_FILENAME_EXCED_RANGE || err == ERROR_INVALID_NAME ? "path too long or invalid"
+                             : !present ? "no such file (the Windows CUDA package carries it)"
+                             : err == ERROR_MOD_NOT_FOUND ? "present, but a DLL it needs is missing (the CUDA runtime "
+                               "cudart64_*.dll, and cublasLt64_*.dll for a DSV4_TC=1 build, beside it or on PATH, "
+                               "or the NVIDIA driver's nvcuda.dll)"
+                             : err == ERROR_BAD_EXE_FORMAT ? "not a 64-bit DLL" : "not loadable", dllpath, (unsigned long)err);
             if(w > 0 && (size_t)w < sizeof(why) - wn) wn += (size_t)w;
             continue;
         }
@@ -453,15 +528,19 @@ static int dsv4_cuda_load(void){
             memset(&g_dsv4, 0, sizeof(g_dsv4)); g_dsv4.loaded = 1;
             continue;
         }
-        snprintf(g_dsv4.loaded_name, sizeof(g_dsv4.loaded_name), "%s", candidates[i]);
-        fprintf(stderr, DSV4_VENDOR_TAG " backend=%s (%s)\n", candidates[i],
-                g_dsv4.backend_name ? g_dsv4.backend_name() : "unknown");
+        const char *base = candidates[i];   /* the file name; path= says where */
+        for(const char *p = base; *p; p++) if(*p == '\\' || *p == '/' || *p == ':') base = p + 1;
+        snprintf(g_dsv4.loaded_name, sizeof(g_dsv4.loaded_name), "%s", base);
+        DWORD pn = GetModuleFileNameA(g_dsv4.dll, dllpath, (DWORD)sizeof(dllpath));
+        fprintf(stderr, DSV4_VENDOR_TAG " backend=%s (%s) path=%s\n", base,
+                g_dsv4.backend_name ? g_dsv4.backend_name() : "unknown",
+                pn > 0 && pn < sizeof(dllpath) ? dllpath : "?");
         g_dsv4.available = 1;
         return 1;
     }
     fprintf(stderr, DSV4_VENDOR_TAG " no usable backend DLL (%s); GPU tier disabled (CPU path remains active). "
                     "The DLLs need an sm_80+ GPU (Ampere or newer); Pascal and Turing take a build with "
-                    "CUDA_ARCH=portable-pre-ampere NO_TC=1 (docs/deepseek-v4.md).\n",
+                    "CUDA_ARCH=portable-pre-ampere NO_TC=1 and CUDA <= 12.9 (docs/deepseek-v4.md).\n",
             wn ? why : DSV4_BACKEND_DLL_DG " / " DSV4_BACKEND_DLL);
     return 0;
 }
@@ -527,8 +606,17 @@ static int dsv4_cuda_resolve(const char *dllname){
     RESOLVE(sparse_attn_batch_cached_idx, fn_sparse_attn_batch_cached_idx);
     RESOLVE(indexer_score_batch, fn_indexer_score_batch);
     RESOLVE(fp8_ref_matmul, fn_fp8_ref_matmul);
+    /* optional (V4_LAYER_FUSED): a DLL without these exports keeps the tier
+     * alive, and the engine keeps the paths it had */
+    g_dsv4.indexer_resident = (fn_indexer_resident)GetProcAddress(g_dsv4.dll, "dsv4_cuda_indexer_resident");
+    g_dsv4.indexer_keys_sync = (fn_indexer_keys_sync)GetProcAddress(g_dsv4.dll, "dsv4_cuda_indexer_keys_sync");
+    g_dsv4.attn_decode_chain = (fn_attn_decode_chain)GetProcAddress(g_dsv4.dll, "dsv4_cuda_attn_decode_chain");
+    g_dsv4.attn_decode_fused = (fn_attn_decode_fused)GetProcAddress(g_dsv4.dll, "dsv4_cuda_attn_decode_fused");
+    g_dsv4.matmul_bf16_multi = (fn_matmul_bf16_multi)GetProcAddress(g_dsv4.dll, "dsv4_cuda_matmul_bf16_multi");
+    g_dsv4.decode_proj_multi = (fn_decode_proj_multi)GetProcAddress(g_dsv4.dll, "dsv4_cuda_decode_proj_multi");
     g_dsv4.upload_head_exact = (fn_upload_compressor)GetProcAddress(g_dsv4.dll, "dsv4_cuda_upload_head_exact");
     g_dsv4.head_scores_exact = (fn_head_scores_exact)GetProcAddress(g_dsv4.dll, "dsv4_cuda_head_scores_exact");
+    g_dsv4.head_exact_available = (fn_head_exact_available)GetProcAddress(g_dsv4.dll, "dsv4_cuda_head_exact_available");
     g_dsv4.head_scores_batch_exact = (fn_head_scores_batch_exact)GetProcAddress(g_dsv4.dll, "dsv4_cuda_head_scores_batch_exact");
     g_dsv4.head_argmax_batch_exact = (fn_head_argmax_batch_exact)GetProcAddress(g_dsv4.dll, "dsv4_cuda_head_argmax_batch_exact");
     g_dsv4.indexer_prepare = (fn_indexer_prepare)GetProcAddress(g_dsv4.dll, "dsv4_cuda_indexer_prepare");
@@ -575,6 +663,10 @@ static int dsv4_cuda_resolve(const char *dllname){
     /* optional: an older DLL without the export keeps the whole tier alive;
      * the engine probes this and simply stays on synchronous attaches. */
     g_dsv4.stream_drain = (fn_stream_drain)GetProcAddress(g_dsv4.dll, "dsv4_cuda_stream_drain");
+    g_dsv4.mirror_alloc = (fn_mirror_alloc)GetProcAddress(g_dsv4.dll, "dsv4_cuda_mirror_alloc");
+    g_dsv4.mirror_refill = (fn_mirror_refill)GetProcAddress(g_dsv4.dll, "dsv4_cuda_mirror_refill");
+    g_dsv4.mirror_check = (fn_mirror_check)GetProcAddress(g_dsv4.dll, "dsv4_cuda_mirror_check");
+    g_dsv4.upload_fence = (fn_upload_fence)GetProcAddress(g_dsv4.dll, "dsv4_cuda_upload_fence");
     g_dsv4.expert_bank_upload_aux = (fn_expert_bank_upload_aux)GetProcAddress(g_dsv4.dll, "dsv4_cuda_expert_bank_upload_aux");
     g_dsv4.expert_bank_slots = (fn_expert_bank_slots)GetProcAddress(g_dsv4.dll, "dsv4_cuda_expert_bank_slots");
     g_dsv4.expert_bank_slot_bytes = (fn_expert_bank_slot_bytes)GetProcAddress(g_dsv4.dll, "dsv4_cuda_expert_bank_slot_bytes");
@@ -927,9 +1019,59 @@ int dsv4_cuda_fp8_ref_matmul(int device, const uint8_t *w, const float *bscale,
     return g_dsv4.fp8_ref_matmul(device, w, bscale, rows, cols, packed_rows8, x, tokens, y);
 }
 
+int dsv4_cuda_indexer_resident(int device, int layer, const uint8_t *w, const float *bscale,
+                               int rows, int cols, int packed_rows8, const uint16_t *head_w,
+                               int heads, int hidden){
+    if(!g_dsv4.available||!g_dsv4.indexer_resident) return 0;
+    return g_dsv4.indexer_resident(device, layer, w, bscale, rows, cols, packed_rows8, head_w,
+                                   heads, hidden);
+}
+
+int dsv4_cuda_indexer_keys_sync(int device, int layer, unsigned long long owner,
+                                const float *keys, int count, int dim){
+    if(!g_dsv4.available||!g_dsv4.indexer_keys_sync) return 0;
+    return g_dsv4.indexer_keys_sync(device, layer, owner, keys, count, dim);
+}
+
+
+int dsv4_cuda_matmul_bf16_multi(Dsv4CudaTensor *const *ts, int n, const float *x, int tokens,
+                                float *const *ys){
+    if(!g_dsv4.available||!g_dsv4.matmul_bf16_multi) return 0;
+    return g_dsv4.matmul_bf16_multi(ts, n, x, tokens, ys);
+}
+int dsv4_cuda_decode_proj_multi(Dsv4CudaTensor *const *ts, int n, const float *x, float *const *ys){
+    if(!g_dsv4.available||!g_dsv4.decode_proj_multi) return 0;   /* a DLL without it: the separate calls */
+    return g_dsv4.decode_proj_multi(ts, n, x, ys);
+}
+
+int dsv4_cuda_attn_decode_fused(const Dsv4FusedArgs *a){
+    if(!g_dsv4.available||!g_dsv4.attn_decode_fused) return 0;   /* a DLL without it: the chained forms */
+    return g_dsv4.attn_decode_fused(a);
+}
+
+int dsv4_cuda_attn_decode_chain(int device, int layer, const float *q, const float *chunk,
+                                int chunk_start, const float *sinks, const int *meta,
+                                const int *sel, int selstride, int abs_base, int comp_limit,
+                                int heads, int dim, float scale, const float *icos,
+                                const float *isin, int rope_dim, int rope_fma,
+                                Dsv4CudaTensor *wa, int groups, Dsv4CudaTensor *wb,
+                                float *out, float *att_out, float *oa_out,
+                                const float *qa, int q_rank, Dsv4CudaTensor *wqb, float eps,
+                                int norm_fma, float *q_out){
+    if(!g_dsv4.available||!g_dsv4.attn_decode_chain) return 0;
+    return g_dsv4.attn_decode_chain(device, layer, q, chunk, chunk_start, sinks, meta, sel, selstride,
+                                    abs_base, comp_limit, heads, dim, scale, icos, isin, rope_dim,
+                                    rope_fma, wa, groups, wb, out, att_out, oa_out, qa, q_rank, wqb,
+                                    eps, norm_fma, q_out);
+}
+
 int dsv4_cuda_upload_head_exact(Dsv4CudaTensor **t,const uint16_t *w,int rows,int cols,int device){
     return g_dsv4.available && g_dsv4.upload_head_exact && g_dsv4.head_scores_exact
         ? g_dsv4.upload_head_exact(t,w,rows,cols,device) : 0;
+}
+int dsv4_cuda_head_exact_available(void){
+    return g_dsv4.available && g_dsv4.head_exact_available && g_dsv4.upload_head_exact &&
+           g_dsv4.head_scores_exact ? g_dsv4.head_exact_available() : 0;
 }
 int dsv4_cuda_head_scores_exact(Dsv4CudaTensor *t,const float *input,float *scores){
     return g_dsv4.available && g_dsv4.head_scores_exact ? g_dsv4.head_scores_exact(t,input,scores) : 0;
@@ -967,6 +1109,23 @@ int dsv4_cuda_tensor_refill_fp4(Dsv4CudaTensor *t, const uint8_t *w, const uint8
     return g_dsv4.tensor_refill_fp4(t, w, scale, O, I, sync);
 }
 
+/* V4_MIRROR_BLOCK: a DLL without these keeps the three-tensor mirrors */
+int dsv4_cuda_mirror_alloc(Dsv4CudaTensor **gate, Dsv4CudaTensor **up, Dsv4CudaTensor **down,
+                           int Og, int Ig, int Od, int Id, int device){
+    if(!g_dsv4.available||!g_dsv4.mirror_alloc||!g_dsv4.mirror_refill) return 0;
+    return g_dsv4.mirror_alloc(gate, up, down, Og, Ig, Od, Id, device);
+}
+int dsv4_cuda_mirror_refill(Dsv4CudaTensor *gate, Dsv4CudaTensor *up, Dsv4CudaTensor *down,
+                            const uint8_t *scales, long long S, const long long *soff,
+                            const uint8_t *weights, long long Wb, const long long *woff, int sync){
+    if(!g_dsv4.available||!g_dsv4.mirror_refill) return 0;
+    return g_dsv4.mirror_refill(gate, up, down, scales, S, soff, weights, Wb, woff, sync);
+}
+long long dsv4_cuda_mirror_check(Dsv4CudaTensor *gate, int run, const uint8_t *src, long long len){
+    if(!g_dsv4.available||!g_dsv4.mirror_check) return -2;
+    return g_dsv4.mirror_check(gate, run, src, len);
+}
+
 int dsv4_cuda_backend_arch_ok(int device){
     if(!g_dsv4.available) return 0;
     return g_dsv4.backend_arch_ok ? g_dsv4.backend_arch_ok(device) : 1;
@@ -995,6 +1154,14 @@ int dsv4_cuda_stream_drain(int device){
     if(!g_dsv4.available) return 1;
     if(!g_dsv4.stream_drain) return 0;
     return g_dsv4.stream_drain(device);
+}
+
+/* V4_UPLOAD_THREAD. A DLL without the export answers 0: the engine asks once
+ * and its uploader then copies on the compute stream and drains it, as the
+ * inline attach does (an older DLL reads any non-zero sync as "drain"). */
+int dsv4_cuda_upload_fence(int device, int drain){
+    if(!g_dsv4.available || !g_dsv4.upload_fence) return 0;
+    return g_dsv4.upload_fence(device, drain);
 }
 
 int dsv4_cuda_kv_ring_append(int device, int layer, const float *rows, int start_pos,

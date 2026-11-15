@@ -587,6 +587,20 @@ static void q36c_prewarm(Model *m, const Q36Chain *ch) {
     }
     pw.moe_d = c->hidden; pw.moe_i = c->inter;
     pw.ex_ours = c->n_experts > 0 && !g_gguf;   /* our formats' experts: their grouped GEMMs */
+    if (pw.ex_ours) {   /* and the formats vk_tier_start gives them on the device: int4 2 (4 in groups), int8 1 (13: bit 0) */
+        int i4 = g_expert_is_int4 || g_expert_mixed, gs = c->expert_gs;
+        int fg = i4 ? (gs ? 4 : 2) : gs ? 0 : 1, fd = g_expert_mixed && !xf_mode(m) ? (down_gs_of(c) ? 0 : 1) : fg;
+        pw.moe_fmts = 1u << fg | 1u << fd;
+        /* Q36_MTP=1: the head's experts run in this chain too (q36_mg_dmoe), in the forms
+         * q36_mtp_expert_qw gives them: int4 at gs 64 4, int8 rows 1, f32 otherwise (bit 0) */
+        const char *mtp = getenv("Q36_MTP");
+        if (mtp && !strcmp(mtp, "1") && mt_has(m, "mtp.fc.weight")) {
+            int dgs = g_expert_mixed ? g_expert_down_gs : gs, id = dense_idot_on();
+            int hg = i4 && gs == 64 && c->hidden % 64 == 0 && id ? 4 : gs ? 0 : 1;
+            int hd = g_expert_is_int4 && dgs == 64 && c->inter % 64 == 0 && id ? 4 : dgs ? 0 : 1;
+            pw.moe_fmts |= 1u << hg | 1u << hd;
+        }
+    }
     /* a GGUF's experts, as the file has them: a prompt chunk's grouped GEMMs (vk_dmoe.h) */
     for (int i = 0; g_gguf && m->gqx && i < c->n_layers; i++) {
         int bg = gq_r16_base(m->gqx[i].tg), bd = gq_r16_base(m->gqx[i].td);

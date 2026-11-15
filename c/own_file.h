@@ -79,6 +79,13 @@ static inline FILE *coli_own_fopen(const char *path, const char *mode){
     /* O_NONBLOCK so a planted FIFO cannot hang the open; cleared once the
      * descriptor is known to be a regular file. */
     int fd = open(path, fl | O_NOFOLLOW | O_NONBLOCK, 0666);
+#ifdef __FreeBSD__
+    /* FreeBSD reports O_NOFOLLOW on a symlink as EMLINK, not POSIX's ELOOP (see
+     * open(2), STANDARDS). Report ELOOP as every other platform does: it is what
+     * this header promises, and coli_own_fopen_tmp() checks for it before it
+     * replaces a link planted under the temp name. */
+    if(fd < 0 && errno == EMLINK) errno = ELOOP;
+#endif
     if(fd < 0) return NULL;
     struct stat st;
     if(fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)){ close(fd); errno = EINVAL; return NULL; }

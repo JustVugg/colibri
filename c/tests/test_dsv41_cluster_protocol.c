@@ -11,6 +11,7 @@
 
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/wait.h>
+#include <signal.h>   /* signal(), SIGPIPE: FreeBSD's <sys/wait.h> does not pull it in, glibc's and macOS's do */
 
 static void test_disconnected_peer_is_an_io_error(void)
 {

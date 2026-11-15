@@ -201,14 +201,79 @@ norms (each stored as 1 + w, as the trunk's are). `Q36_MTP=1` reads it from the
 file the container links; its MLP is the layer's dense gate, up and down with no
 router and no gate. On the CUDA chain it runs on the card, its matrices placed
 as the trunk's. unsloth's UD-Q3_K_XL and UD-Q4_K_XL files carry the head; their
-UD-IQ2_XXS does not. Measured on the 27B, greedy, thinking off, every text
-identical to plain decoding:
+UD-IQ2_XXS does not. Their Dynamic v3.1 files ship the head apart too, in
+`MTP/mtp-Qwen3.8-27B-Q4_0.gguf` (the same architecture, `block_count` one more,
+the layer's tensors only): `tools/gguf_import.py` links the `mtp-*.gguf` it finds
+beside the model (its folder, the parent, an `MTP/` folder in either; `--mtp`
+names one) when its architecture, its dimensions and its layer match, and the
+engine reads the head's tensors from that file and the rest from the model's.
+Measured on the 27B, greedy, thinking off, every text identical to plain decoding:
 
 | | code | prose |
 |---|---|---|
 | CPU (Ryzen 7 8700GE, UD-Q3_K_XL): plain / one draft / three | 3.27 / 4.99 / 6.02 tok/s | 3.40 / 4.88 / 5.10 tok/s |
 | one draft, drafts accepted | 97.5 % | 80.7 % |
 | RTX PRO 4000 SFF (UD-Q4_K_XL, whole card): plain / two drafts / three | 20.7 / 43.4 / 45.0 tok/s | 20.6 / 30.9 / 30.0 tok/s |
+| RTX PRO 4000 SFF, v3.1 UD-Q4_K_XL (head inside): plain / three drafts | 20.3 / 47.1 tok/s | 20.3 / 31.1 tok/s |
+| RTX PRO 4000 SFF, v3.1 UD-IQ2_XXS with `MTP/mtp-Qwen3.8-27B-Q4_0.gguf`: plain / three drafts | 30.5 / 55.8 tok/s | 30.2 / 41.2 tok/s |
+
+**DFlash2.** `COLI_DFLASH=<dir>` drafts with a DFlash2 drafter (`z-lab/Qwen3.8-27B-DFlash2`)
+in the head's place on the CUDA chain: a block of 7 drafts in one pass, its context the
+chain's own rows. On the v3.1 UD-Q4_K_XL file code went from 48.8 tok/s (MTP, 3 drafts) to
+61.1; see [speculative.md](speculative.md#dflash2).
+
+**A verify's rows on the tensor cores.** On the CUDA chain (sm_80 on) a verify of 4 to 8
+rows, and several conversations' decode rows, go to the tensor cores' integer steps
+(`bd_mmg_k`, `COLI_CUDA_BD_MMQ`) with each row the bits the GEMV gives it alone, so the
+texts do not change. The 27B on the RTX PRO 4000 SFF (UD-Q4_K_XL, greedy, thinking off,
+tok/s; the MTP and the two-conversation runs alternated with the GEMV alone,
+`COLI_CUDA_BD_MMQ=0`):
+
+| | GEMV alone | default |
+|---|---|---|
+| three MTP drafts (whole vocabulary): code / prose / list | 40.5 / 33.4 / 35.7 | 42.8 / 33.4 / 35.9 |
+| `--kv-slots 8`, 2 / 8 conversations at once, together | 36.4 / 60.4 | 36.3 / 86.5 |
+
+The grid types (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S) and Q2_K and Q3_K take the same
+steps: each step's weights decoded from the grids (in shared memory) and signs as the GEMV
+decodes them, IQ1_S's and Q3_K's offsets folded into the weights (8 times the grid plus the
+delta's sign, the code less 4) so the integer dots are the GEMV's, and the GEMV's float update
+written out (`bdi_upd_*`) on both. unsloth's v3.1 UD-IQ2_XXS mixes all of them (its lm_head
+Q3_K). A verify of 4 rows went from 1.75 to 1.61 decode steps, of 8 from about 2.9 to 2.0;
+code / prose / list, tok/s, every text plain decoding's:
+
+| UD-IQ2_XXS v3.1 | GEMV | tensor cores |
+|---|---|---|
+| MTP, 3 drafts | 56.8 / 41.2 / 45.4 | 60.7 / 40.6 / 46.5 |
+| DFlash2 (`COLI_DFLASH`) | 54.4 / 36.8 / 38.7 | 65.2 / 38.9 / 40.7 |
+
+A warp's super-block then took its x side in vector loads before the steps, the steps no
+branch, the decode offsets known when it compiles, Q4_K's and Q5_K's scales a table instead of
+shuffles, and IQ2_XXS and IQ3_XXS a k order where a thread holds a whole grid entry: at 8 rows
+Q4_K 5120 x 17408 177 -> 147 us (the GEMV's one row 128), Q6_K 17408 x 5120 282 -> 226 (217),
+IQ2_XXS 144 -> 117 (71), the same bits. The first row count it takes was measured again by
+type and shape (`COLI_CUDA_BD_MMQ` in [ENVIRONMENT.md](ENVIRONMENT.md)); Q3_K takes it from one
+row. Alternated with the kernel before, code / prose / list, tok/s, every text plain decoding's:
+
+| v3.1 | MTP, 3 drafts | DFlash2 |
+|---|---|---|
+| UD-Q4_K_XL | 47.9 / 31.0 / 34.9 -> 50.9 / 31.6 / 35.4 | 62.2 / 32.6 / 35.6 -> 67.8 / 34.4 / 37.5 |
+| UD-IQ2_XXS | 59.7 / 40.8 / 45.3 -> 63.8 / 41.7 / 46.3 | 64.7 / 38.1 / 40.2 -> 73.0 / 40.8 / 42.5 |
+
+**Several conversations drafting (`--kv-slots` with `Q36_MTP=1`).** On the CUDA chain each
+conversation keeps an MTP head state of its own (its KV cache on the card, swapped as the
+trunk's), and a step's rows verify the greedy conversations' drafts as one conversation's
+verify does: each draft row's DeltaNet state is copied for its rollback, a rejected draft's
+conversation goes back to the state after its last standing row, and the head reads the rows
+that stand. The drafts share a budget of rows a step (`Q36_MUX_ROWS`, 8): 8 rows cost 1.2 to
+1.4 decode steps on the tensor cores and 32 rows 4 to 5 on this card, so more conversations
+leave fewer drafts, and eight leave none. Code prompts, 256 tokens, each request on its own
+slot, tok/s together; every conversation's text is the same as without drafts:
+
+| conversations at once | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|
+| no drafts | 20.6 | 37.3 | 57.0 | 89.1 |
+| drafts within 8 rows | 48.6 | 70.3 | 80.8 | 88.2 |
 
 The computation follows Qwen's MTP module: at position p, concatenate the
 normalized embedding of token p+1 with the normalized backbone output h_p,

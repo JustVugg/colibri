@@ -524,6 +524,14 @@ it replaces gave each (head, row) a block that read every K and V row again. On 
 35B, a 1024-token prompt: 226 ms of attention -> 23 ms; a 467-token prompt 819-837 ->
 890-903 tok/s; the loss above 3.2223 -> 3.2271.
 
+Where `cc_attn_fk` takes a prompt chunk (sm_70, or `COLI_CUDA_CHAIN_FLASH2=0`), at head
+dim 256 and with K and V 16-byte aligned (the chain's mirrors are), a thread stages them
+16 bytes a load, eight loads before it stores any (`cc_fa_stage16`): eight halves of a
+float16 cache copied as they are, or four floats rounded as the one-element loop rounds
+them, so the same bits. Groups of 16 loads spilled on sm_70, where the kernel already
+holds 230 registers; groups of 8 take 242 and no stack. Qwen3.6-35B on a V100 (every
+expert on the card): a 2048-token prompt 2442 -> 2595 tok/s, 8192 tokens 2218 -> 3015.
+
 From sm_75 (a T4) `cc_attn_f2` takes it instead (one pass, FlashAttention-2's running max
 and sum): a block of four warps takes 64 query rows (the query heads of a kv head dividing
 64), so a block of keys is staged once for four times the rows, and its scores never leave

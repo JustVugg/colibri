@@ -518,8 +518,26 @@ of them on the device the way a GPU-equipped PC should use its card:
   | Inkling-Small UD-IQ2_XXS (77 GB), before | 2375, 5431 | 99.8% | 186 | 7.87, 8.11 tok/s | 12.2, 22.8 tok/s |
   | the same, now | 3098, 7003 | 100.0% | 14 | 11.53, 10.92 tok/s | 15.1, 33.1 tok/s |
 
-  The startup line says `N layers in M forms other than most layers', their experts in
-  the room of the biggest of those, the rest at their own size`.
+- **Every form's experts in rooms of its own size.** That left one room for every
+  form but the most common, and a file may give most of its layers other forms than
+  that one: Flint 40B-A2.5B UD-Q4_K_XL has Q5_K experts on 16 of its 49 layers and six
+  other forms on the 33 others, each of those in the room of the biggest. The main
+  layers now fall in one class of rooms for each size their forms' tensors take (forms
+  of the same bytes share one), so no tensor sits in a bigger form's room. A newcomer
+  displaces a resident of its own class first, then one of a class whose rooms hold
+  it, the tightest first; a bigger form's never takes a smaller one's room. A file
+  with two sizes is held as before. Measured on a Radeon RX 9060 XT (16 GB) with 32 GB
+  of RAM, `COLI_VK_STAGED=1 COLI_VK_TIER_HOST=0`, each server on a copy of one history,
+  a 5899-token prompt and 128 tokens, three runs each, medians
+  ([the record](experiments/vk-tier-rooms-per-size-2026-11-12/)):
+
+  | model | experts in VRAM (12.11 GiB) | disk loads of the prompt | decode | prompt |
+  |---|---|---|---|---|
+  | Flint 40B-A2.5B UD-Q4_K_XL (25 GB), before | 5263 of 2.3 MiB | 16050 | 8.2 tok/s | 109.8 tok/s |
+  | the same, now | 6717 of 1.8 MiB | 8562 | 11.5 tok/s | 167.5 tok/s |
+
+  The startup line says `N layers in M forms other than most layers', every expert in
+  a room of its own form's size (K sizes)`.
 - **A fresh install starts warm.** A model downloaded a minute ago has no history,
   so its first runs would fill the tier one routing at a time. `coli setup` copies a
   starting history into the model folder when it has none, for the catalog models
@@ -1771,6 +1789,55 @@ dashboard and Brio tests with the chain on. `inkling-olmoe-chain-sanitize` runs 
 chain's ops, a set of those configurations and a serve session of each engine under
 ASan and UBSan. On the 780M (RADV) every one of those configurations and serve sessions
 gave the CPU's tokens.
+
+### Inkling-2 on the chain
+
+Inkling-2 (`inkling2_chain.h`) has a chain of its own beside Inkling's, with the same knobs,
+default rule and line (`[VK] inkling2 chain: ...`), and the same split of work: per layer one
+frame on the device and the routed experts on the host (`moe_ex`, the tier's batch and the
+CPU's share), the K/V rows coming back to the host's cache, which stays canonical, and the
+four short-convolution states coming back at the end of every step, all of them in one
+buffer and one copy. What the frame runs, after the layer before's MoE output joined the
+stream (its short convolution, the residual add): the attention residuals' input mix of the
+block states and the stream (one query on a sliding layer, three on a global one), the
+norms, q, k, v, the relative states, the gate and the sinks, the short convolutions of K and
+V (static, or on a global layer the per-token taps projected from the normed input), the L2
+clips of q, the relative states and k, V normalised without a weight, the attention, the
+gate, o_proj and its convolution, the block state where a block starts, the residual, the
+MLP's input mix, its norm and the router logits. The last frame mixes the output and runs
+the final norm and lm_head; the host softcaps the logits.
+
+Three ops are Inkling-2's own, in `chain_ink2.comp` (made on first use): the residual mix of
+normalised states (one pass over the vectors for every sum, the subgroups' sums joined in
+order), the L2 clip of each head, and the dynamic convolution over a step's rows with its
+state. `chain_relattn.comp` takes the sink: a logit per (row, head) that starts the online
+softmax (m = sink, l = 1), as `ink2_attention` starts its maximum and sum, and follows its
+rows over the slices of a long prompt chunk. The dense matrices are the per-matrix path's
+copies; the router, the sink projection and the dynamic taps' projections go up as f32 (the
+router as bf16 where that is exact), and the tier's budget leaves the chain's buffers and
+its K/V mirrors at the served context (`ink2c_plan_bytes`). It declines, and the per-matrix
+path runs, with several conversations (`KV_SLOTS`), on a geometry outside its shaders, or
+when the device refuses its memory; a device lost mid-step rebuilds the state on the CPU
+from the prefix record, as Inkling's.
+
+The tiny oracles match token for token with it, their logits within 1.2e-5 of the CPU's
+(`tests/vulkan_engines.sh inkling2`); `tests/test_vk_chain.c` holds the three ops and the
+sink to CPU references. On the RTX PRO 4000 with Inkling-2-Small int4 g64 (62 GB of RAM, the
+experts mostly from RAM and disk) the dense part of a run of 64 tokens went from 6.1-6.3 s
+(the per-matrix path: 289 matrices a token a call at a time, the attention and the mixes on
+the CPU) to 5.1-5.5 s, about 14 ms a token of 510; whole runs vary more than that between
+two disk-bound runs. Most of the device's time is the bf16 GEMVs: `chain_gemv.comp`'s bf16 and
+f16 rows now issue four steps' loads before using the first, as its int8 rows do (the same
+sums in the same order, the same bits): Inkling-2's 6144 x 4608 went from 223 to 188 us a
+decode row in the run, 147 to 142 us alone.
+
+The GEMVs run slower in a decode than alone because the card is idle between frames (most of
+the step is the host's experts and the disk) and the driver clocks it down: through a decode,
+38% of the samples found it in P8 (405 MHz memory, 180 MHz cores) and 19% in P0. lm_head
+(200058 x 4608 bf16) takes 4.45 ms alone, at 414 GB/s, and 7.4 to 12.3 ms there. With the
+clocks locked high (`nvidia-smi -lgc` / `-lmc`, root) the chain's device time went from 4.48 to
+2.98 s a run and lm_head to 4.45 ms, but the decode stayed within its noise (1.83 -> 1.85 and
+1.82 -> 1.83 tok/s): the disk sets the pace here.
 
 ### GLM-5.2 and GLM-5.3 Flash on the chain
 

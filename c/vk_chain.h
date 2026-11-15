@@ -416,10 +416,27 @@ int  vkc_sconv(VkcBuf *x, VkcBuf *w, VkcBuf *ring, const VkcSconv *p);
  * tau and a sliding window over a ring cache, the step's own rows read from kvs */
 typedef struct { int S, H, KVH, hd, pos_base, cap, window, ext, d_rel;
                  int q_off, q_row, o_off, o_row, k_off, v_off, ks_off, vs_off, kv_row;
-                 int r_off, r_row, relp_off, tau_off; float scale; } VkcRelAttn;
+                 int r_off, r_row, relp_off, tau_off; float scale;
+                 int has_sink, sink_off; } VkcRelAttn;   /* Inkling-2: a sink logit per (row, head) in tau at sink_off */
 int  vkc_relattn_ready(void);
 int  vkc_relattn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *kvs, VkcBuf *r, VkcBuf *relp, VkcBuf *tau,
                  const VkcRelAttn *p);
+/* Inkling-2's ops (chain_ink2.comp, made on first use; inkling2_chain.h):
+ *   vkc_ink2_mix   the attention residuals' mix of nb block states (b_off + s*b_row + e*D) and
+ *                  the partial stream (x_off + s*x_row), each RMS-normalised without a weight,
+ *                  weighted by softmax((q . n_e) * scale), q at w_off in prm; into y
+ *   vkc_ink2_clip  the L2 clip of nseg segments of n floats in place (per_row segments a row of
+ *                  x_row), each first times a learned scale (has_w: prm at w_off + (g % per_row)*n)
+ *   vkc_ink2_dconv a global layer's dynamic short convolution over S rows in place: static taps
+ *                  [K][C] at st_off in prm plus the rows' own (dyn at d_off + s*d_row, K a head of
+ *                  hd channels), (conv + input) / fc, the state of K-1 inputs a channel in ring */
+typedef struct { int S, D, nb, x_off, x_row, b_off, b_row, w_off, y_off, y_row; float eps, scale; } VkcInk2Mix;
+typedef struct { int nseg, n, per_row, x_off, x_row, has_w, w_off; float thr; } VkcInk2Clip;
+typedef struct { int S, C, K, hd, x_off, x_row, d_off, d_row, st_off, ring_off; float fc; } VkcInk2Dconv;
+int  vkc_ink2_ready(void);
+int  vkc_ink2_mix(VkcBuf *x, VkcBuf *blk, VkcBuf *prm, VkcBuf *y, const VkcInk2Mix *p);
+int  vkc_ink2_clip(VkcBuf *x, VkcBuf *prm, const VkcInk2Clip *p);
+int  vkc_ink2_dconv(VkcBuf *x, VkcBuf *dyn, VkcBuf *prm, VkcBuf *ring, const VkcInk2Dconv *p);
 
 /* ---- the router's pick (chain_route.comp) -------------------------------------------
  * Every MoE engine's routing on the device, for S rows of E logits (l_off + s*l_row):
@@ -494,6 +511,10 @@ typedef struct {
     int gemv_i[16], n_gemv_i;   /* the GEMV's widths of x (a matrix's I) the types meet: its staging sizes */
     int moe_d, moe_i;           /* the experts' D and I: chain_moe's staging size (0: the device's largest) */
     int attn_hd, attn_gq;       /* the attention's head dim and query heads per kv head: chain_attn_flash's (0: none) */
+    /* moe 1: the formats the experts' gate/up and down take on the device, bit f for 1, 2
+     * and 4 (chain_moe's pipeline of that format), bit 0 for any other (its pipeline of
+     * every format); 0 not known: all four */
+    unsigned moe_fmts;
 } VkcPrewarm;
 /* a width of x the model's GEMVs meet, once (vkc_prewarm makes the staging size it takes) */
 static inline void vkc_prewarm_width(VkcPrewarm *pw, int I) {
@@ -929,6 +950,7 @@ typedef struct {
     unsigned long long tile_wide;      /* of the tile GEMMs, a GGUF's on 128 x 128 tiles (qmatmul_gemm_bdcw.comp) */
     unsigned long long grp_wide;       /* of the grouped expert GEMMs, those at the wider item (qmatmul_grp*_bdcw.comp) */
     unsigned long long dsa_tiled;      /* DeepSeek V4's indexer scores in tiles of rows (chain_dsv4_idx.comp, mode 11) */
+    unsigned long long moe_pipes;      /* chain_moe.comp's pipelines made (a driver's compile each: 20 minutes on a Radeon RX 580) */
 } VkcStats;
 void vkc_stats(VkcStats *st);
 /* One of the chain's three pools (VKC_DEV, VKC_UP, VKC_DOWN): the blocks it holds on the

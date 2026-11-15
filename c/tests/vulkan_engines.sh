@@ -347,8 +347,11 @@ dense_where() {
     # inkling places none when the host keeps them by design (bf16 weights under the
     # AVX512-BF16 dot, which rounds the activations as the shader does not): its
     # placement line then says "0 resident matrices go to the GPU", and the count is
-    # not required, as in family_inkling_olmoe's own bf16 check.
-    grep -qa "^\[VK\] $eng: 0 resident matrices go to the GPU" "$log" || need_gpu "$eng" "$log" "$tag"
+    # not required, as in family_inkling_olmoe's own bf16 check. A dense chain that ran (on by
+    # default on a discrete GPU: "[VK] <engine> chain: N forwards", Inkling-2's "inkling2
+    # chain") ran the trunk there without the per-matrix path's count.
+    grep -qa "^\[VK\] $eng: 0 resident matrices go to the GPU" "$log" || [ "$(chain_count "$eng" "$log")" -gt 0 ] ||
+      [ "$(chain_count "${eng}2" "$log")" -gt 0 ] || need_gpu "$eng" "$log" "$tag"
     where=device
   else
     [ "$(vk_count "$eng" "$log")" = 0 ] || { cat "$log"; fail "$tag: dense matmuls ran on the device with the trunk on the CPU"; }
@@ -568,6 +571,57 @@ family_qwen_sanitize() {
   mtp_on_device "asan qwen38 MTP" san.log
   san qwen38 "asan qwen38 tier alone" COLI_VK_DENSE=0 SNAP=qwen38_tiny_int4 ./qwen38 4 8 qwen38_tiny_int4/ref_int4.json
   make clean >/dev/null 2>&1 || true
+}
+
+# Inkling-2 on the routed-expert tier: its dense matrices a call at a time (it has no dense
+# chain), its softcapped SwiGLU as the tier's SITU. The f32 fixture (fmt 10); the int4 g64
+# container tools/convert_inkling2_int4.py writes from a checkpoint laid out as Thinking Machines
+# publish theirs (NVFP4 and MXFP8 experts, fmt 4 gs 64); and a GGUF as unsloth's lay it out
+# (tests/test_gguf_import.py, Q8_0 experts), whose NVFP4 layers' experts come without their global
+# scale: the engine folds it into the rows the device reads and into the pair's weight. At cap 1
+# with the trunk where the default puts it and at cap 8 with it on the device, and a budget of
+# two experts, which must evict. The fixtures need transformers' Inkling-2 and gguf-py
+# (tools/oracle-inkling2-requirements.txt); an ink2_gguf/ made beforehand is used as it is.
+family_inkling2() {
+  make inkling VK=1
+  $PY tools/make_tiny_inkling2.py tiny_inkling2
+  $PY tools/make_tiny_inkling2.py tiny_g64 --g64
+  rm -rf fab_g64 cont_g64 ref_g64
+  $PY tools/convert_inkling2_int4.py --fabricate tiny_g64 fab_g64 --nvfp4-layers 6
+  $PY tools/convert_inkling2_int4.py --indir fab_g64 --outdir cont_g64 --jobs 2 --min-free-gb 0
+  $PY tools/make_tiny_inkling2.py --int4-ref cont_g64 tiny_g64 ref_g64
+  if [ ! -d ink2_gguf/gg ]; then
+    rm -rf ink2_gguf && mkdir ink2_gguf
+    $PY - <<'PY' || fail "gguf-py (pip install gguf) is needed for the Inkling-2 GGUF gate"
+import json, sys
+sys.path.insert(0, "tests")
+from test_gguf_import import write_inkling2_pair
+write_inkling2_pair("ink2_gguf", experts="Q8_0")
+p = [5, 77, 13, 201, 42, 9, 150, 33, 61, 18, 240, 7]
+json.dump({"prompt_ids": p, "full_ids": p + [0] * 16}, open("ink2_gguf/ref.json", "w"))
+PY
+  fi
+  local cap D R2=tiny_inkling2/ref_inkling2.json RG=ref_g64/ref_inkling2.json
+  for cap in 1 8; do
+    D=; [ $cap = 8 ] && D=COLI_VK_DENSE=1
+    tier_gate inkling "inkling2 tier f32 cap=$cap" $D SNAP=tiny_inkling2 -- $cap 0 $R2
+    tier_gate inkling "inkling2 tier int4 g64 container cap=$cap" $D SNAP=cont_g64 -- $cap 0 $RG
+    # the float forms on both sides (GQ_EXACT=1, COLI_VK_IDOT=0): the integer ones quantize the
+    # activations, and this small random net turns that noise into other tokens
+    tier_gate inkling "inkling2 tier GGUF Q8_0 cap=$cap" $D GQ_EXACT=1 COLI_VK_IDOT=0 SNAP=ink2_gguf/gg -- $cap 0 ink2_gguf/ref.json
+  done
+  EVICT=1 tier_gate inkling "inkling2 tier, a budget of two experts" COLI_VK_TIER_GB=0.00003 SNAP=cont_g64 -- 8 0 $RG
+  # the CPU's pairs' reads held back (INK_FILL_DELAY_US): none may compute before its expert lands
+  EVICT=1 tier_gate inkling "inkling2 tier, eviction, reads held back" COLI_VK_TIER_GB=0.00003 INK_FILL_DELAY_US=3000 SNAP=cont_g64 -- 8 0 $RG
+  tier_gate inkling "inkling2 tier int4 g64 container cap=4, reads held back" INK_FILL_DELAY_US=3000 SNAP=cont_g64 -- 4 0 $RG
+  # Inkling-2's dense chain (inkling2_chain.h, its line "[VK] inkling2 chain: ..."): every layer
+  # on the device, the routed experts on the host; then prompts only, the state handed to the
+  # CPU's decode and back
+  for cap in 1 8; do
+    CHAINNAME=inkling2 chain_gate inkling "chain inkling2 f32 cap=$cap" 1 COLI_VK_DENSE=1 SNAP=tiny_inkling2 -- $cap 0 $R2
+    CHAINNAME=inkling2 chain_gate inkling "chain inkling2 int4 g64 container cap=$cap" 1 COLI_VK_DENSE=1 SNAP=cont_g64 -- $cap 0 $RG
+  done
+  CHAINMODE=2 CHAINNAME=inkling2 chain_gate inkling "chain inkling2 prompts only" 1 COLI_VK_DENSE=1 SNAP=tiny_inkling2 -- 8 0 $R2
 }
 
 family_inkling_olmoe() {
@@ -1830,10 +1884,10 @@ chain_gate() {  # <engine> <tag> <tol 0|1> <env...> -- <argv...>   (CPUENV: the 
   env "${envs[@]}" DUMP=vk.f32 COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=${CHAINMODE:-1} \
     ./"$eng" "$@" > vk.log 2>&1 || { [ $rc_cpu != 0 ] || { cat vk.log; fail "$tag: the chain misses the oracle the CPU passes"; }; }
   same_tokens cpu.log vk.log "$tag"
-  [ "$(chain_count "$eng" vk.log)" -gt 0 ] || { cat vk.log; fail "$tag: the chain never ran"; }
+  [ "$(chain_count "${CHAINNAME:-$eng}" vk.log)" -gt 0 ] || { cat vk.log; fail "$tag: the chain never ran"; }
   local lg=""
   if [ "$tol" = 1 ]; then lg=$(logits_close cpu.f32 vk.f32) || { echo "$lg"; fail "$tag: logits"; }; lg=", $lg"; fi
-  echo "OK $tag: tokens = CPU$lg, $(chain_count "$eng" vk.log) chain forwards"
+  echo "OK $tag: tokens = CPU$lg, $(chain_count "${CHAINNAME:-$eng}" vk.log) chain forwards"
 }
 
 # dmoe_gate <engine> <tag> all|some|rows|none <env...> -- <argv...>: chain_gate, and how many
@@ -5417,6 +5471,7 @@ case "${1:-}" in
   qwen-sanitize)  family_qwen_sanitize ;;
   inkling-olmoe)  family_inkling_olmoe ;;
   inkling-olmoe-sanitize) family_inkling_olmoe_sanitize ;;
+  inkling2)       family_inkling2 ;;
   mimo-qwenimage) family_mimo_qwenimage ;;
   deepseek)       family_deepseek ;;
   deepseek-sanitize) family_deepseek_sanitize ;;
@@ -5483,5 +5538,4 @@ case "${1:-}" in
   partial-*)      g=${1#partial-}; fn=ptl_family_${g//-/_}
                   declare -F "$fn" >/dev/null || { echo "no partial-chain group ${g}" >&2; exit 2; }
                   "$fn" ;;
-  *) echo "usage: $0 mux|mux-sanitize|mux-deepseek|mux-deepseek-sanitize|decide|decide-sanitize|staged|<family>-staged|shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize|qwen-chain|qwen-chain-sanitize|qwen-spec|qwen-spec-sanitize|mimo-chain|mimo-chain-sanitize|inkling-olmoe-chain|inkling-olmoe-chain-sanitize|glm-chain|glm-chain-sanitize|kimi-chain|kimi-chain-sanitize|deepseek-chain|deepseek-chain-sanitize|dense-only-<group>[-sanitize]|partial-<group>[-sanitize]|prefill-qwen|prefill-qwen-sanitize|prefill-inkling-olmoe|prefill-mimo-kimi|prefill-glm|prefill-deepseek|kv-split|kv-split-sanitize|kv-split-cold|kv-split-cold-sanitize|layers-dev2[-mla|-deepseek][-sanitize]|layers-dev2-<engine>|kv-split-deepseek|kv-split-deepseek-sanitize|kv-quant-deepseek|kv-quant-deepseek-sanitize|dev2|dev2-deepseek-kimi-mimo|dev2-sanitize" >&2; exit 2 ;;
-esac
+  *) echo "usage: $0 mux|mux-sanitize|mux-deepseek|mux-deepseek-sanitize|decide|decide-sanitize|staged|<family>-staged|shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|inkling2|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize|qwen-chain|qwen-chain-sanitize|qwen-spec|qwen-spec-sanitize|mimo-chain|mimo-chain-sanitize|inkling-olmoe-chain|inkling-olmoe-chain-sanitize|glm-chain|glm-chain-sanitize|kimi-chain|kimi-chain-sanitize|deepseek-chain|deepseek-chain-sanitize|dense-only-<group>[-sanitize]|partial-<group>[-sanitize]|prefill-qwen|prefill-qwen-sanitize|prefill-inkling-olmoe|prefill-mimo-kimi|prefill-glm|prefill-deepseek|kv-split|kv-split-sanitize|kv-split-cold|kv-split-cold-sanitize|layers-dev2[-mla|-deepseek][-sanitize]|layers-dev2-<engine>|kv-split-deepseek|kv-split-deepseek-sanitize|kv-quant-deepseek|kv-quant-deepseek-sanitize|dev2|dev2-deepseek-kimi-mimo|dev2-sanitize" >&2; exit 2 ;;esac

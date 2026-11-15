@@ -1,0 +1,2082 @@
+===== run vpr2a_stripe_up (V4_HC_TEAM unset (GPU tier on: the mix on 8 threads, the column loops on the calling thread)) =====
+----- stderr -----
+[env] COLI_CUDA_PIPE is not read by deepseek-v4 (it belongs to colibri) -- it will have no effect
+[env] COLI_GPU is not read by deepseek-v4 (it belongs to colibri olmoe qwen36 qwen38 laya gliner_decide) -- it will have no effect
+[env] CUDA_DENSE is not read by deepseek-v4 (it belongs to colibri) -- it will have no effect
+[env] TEMP is not read by deepseek-v4 (it belongs to colibri kimi_k3 olmoe qwen36 glm53 qwen38 deepseek-v41 mimo laya gliner_decide) -- it will have no effect
+[env] unknown variable V4_READ_STRIPE
+[OMP] deepseek-v4: 16 compute threads (the physical cores of 32 logical CPUs; the 3 expert-loader workers take the SMT siblings); OMP_NUM_THREADS=<n> overrides, COLI_NO_OMP_TUNE=1 disables
+ram_tiers available=16.00GiB dense=resident(6.27GiB) target_slots=14 target_cache=7.50GiB head=resident-bf16 projected=15.64GiB
+v4_open index=0.13s plan=0.00s (index built once, reused by plan/inventory/head)
+[MIRROR] D:\llm_models\DeepSeek-V4-Flash-0731-Abliterated: 48/48 shards (replica 1)
+[MIRROR] probe: primary 6.11 GB/s | mirror 5.43 GB/s
+[MIRROR] 2 drives | read split 53% / 47% (measured)
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_autopin history=C:\colibri\models\DeepSeek-V4-Flash-0731-Abliterated/.coli_usage selections=1732231
+v4_hot_policy pin_slots_per_layer=8 repin_interval=6 mode=resident-ram rows16=hot-pins
+[DSV4 CUDA] backend=coli_cuda_dsv4_dg.dll (deepgemm-sm120)
+[DSV4 CUDA] device 0: NVIDIA GeForce RTX 5080 17.1 GB sm_120
+v4_gpu mirror-reserve=8329MiB (256-slot bank 3456MiB x2 + 600MiB headroom + 64 mirrors; DSV4_CUDA_VRAM_RESERVE_MB overrides)
+v4_gpu tier=dense-matvec device=0
+v4_gpu layer=0 uploaded=134.024MiB in 0.077s wall=1794471655
+v4_gpu layer=1 uploaded=134.024MiB in 0.077s wall=1794471655
+v4_gpu indexer-resident=on device=0 layer=2 bytes=8390656
+v4_gpu layer=2 uploaded=183.025MiB in 0.086s wall=1794471655
+v4_gpu layer=3 uploaded=150.024MiB in 0.078s wall=1794471656
+v4_gpu indexer-resident=on device=0 layer=4 bytes=8390656
+v4_gpu layer=4 uploaded=183.026MiB in 0.087s wall=1794471656
+v4_gpu layer=5 uploaded=150.024MiB in 0.078s wall=1794471656
+v4_gpu indexer-resident=on device=0 layer=6 bytes=8390656
+v4_gpu layer=6 uploaded=183.026MiB in 0.086s wall=1794471656
+v4_gpu layer=7 uploaded=150.024MiB in 0.078s wall=1794471656
+v4_gpu indexer-resident=on device=0 layer=8 bytes=8390656
+v4_gpu layer=8 uploaded=183.026MiB in 0.083s wall=1794471656
+v4_gpu layer=9 uploaded=150.024MiB in 0.079s wall=1794471656
+v4_gpu indexer-resident=on device=0 layer=10 bytes=8390656
+v4_gpu layer=10 uploaded=183.026MiB in 0.086s wall=1794471657
+v4_gpu layer=11 uploaded=150.024MiB in 0.078s wall=1794471657
+v4_gpu indexer-resident=on device=0 layer=12 bytes=8390656
+v4_gpu layer=12 uploaded=183.026MiB in 0.085s wall=1794471657
+v4_gpu layer=13 uploaded=150.024MiB in 0.078s wall=1794471657
+v4_gpu indexer-resident=on device=0 layer=14 bytes=8390656
+v4_gpu layer=14 uploaded=183.026MiB in 0.086s wall=1794471657
+v4_gpu layer=15 uploaded=150.024MiB in 0.079s wall=1794471657
+v4_gpu indexer-resident=on device=0 layer=16 bytes=8390656
+v4_gpu layer=16 uploaded=183.026MiB in 0.087s wall=1794471658
+v4_gpu layer=17 uploaded=150.024MiB in 0.079s wall=1794471658
+v4_gpu indexer-resident=on device=0 layer=18 bytes=8390656
+v4_gpu layer=18 uploaded=183.026MiB in 0.086s wall=1794471658
+v4_gpu layer=19 uploaded=150.024MiB in 0.077s wall=1794471658
+v4_gpu indexer-resident=on device=0 layer=20 bytes=8390656
+v4_gpu layer=20 uploaded=183.026MiB in 0.086s wall=1794471658
+v4_gpu layer=21 uploaded=150.024MiB in 0.081s wall=1794471658
+v4_gpu indexer-resident=on device=0 layer=22 bytes=8390656
+v4_gpu layer=22 uploaded=183.026MiB in 0.086s wall=1794471658
+v4_gpu layer=23 uploaded=150.024MiB in 0.078s wall=1794471659
+v4_gpu indexer-resident=on device=0 layer=24 bytes=8390656
+v4_gpu layer=24 uploaded=183.026MiB in 0.086s wall=1794471659
+v4_gpu layer=25 uploaded=150.024MiB in 0.078s wall=1794471659
+v4_gpu indexer-resident=on device=0 layer=26 bytes=8390656
+v4_gpu layer=26 uploaded=183.026MiB in 0.087s wall=1794471659
+v4_gpu layer=27 uploaded=150.024MiB in 0.078s wall=1794471659
+v4_gpu indexer-resident=on device=0 layer=28 bytes=8390656
+v4_gpu layer=28 uploaded=183.026MiB in 0.094s wall=1794471659
+v4_gpu layer=29 uploaded=150.024MiB in 0.079s wall=1794471660
+v4_gpu indexer-resident=on device=0 layer=30 bytes=8390656
+v4_gpu layer=30 uploaded=183.026MiB in 0.087s wall=1794471660
+v4_gpu layer=31 uploaded=150.024MiB in 0.078s wall=1794471660
+v4_gpu indexer-resident=on device=0 layer=32 bytes=8390656
+v4_gpu layer=32 uploaded=183.026MiB in 0.086s wall=1794471660
+v4_gpu layer=33 uploaded=150.024MiB in 0.079s wall=1794471660
+v4_gpu indexer-resident=on device=0 layer=34 bytes=8390656
+v4_gpu layer=34 uploaded=183.026MiB in 0.087s wall=1794471660
+v4_gpu layer=35 uploaded=150.024MiB in 0.073s wall=1794471660
+v4_gpu indexer-resident=on device=0 layer=36 bytes=8390656
+v4_gpu layer=36 uploaded=183.026MiB in 0.080s wall=1794471661
+v4_gpu layer=37 uploaded=150.024MiB in 0.072s wall=1794471661
+v4_gpu indexer-resident=on device=0 layer=38 bytes=8390656
+v4_gpu layer=38 uploaded=183.026MiB in 0.088s wall=1794471661
+v4_gpu layer=39 uploaded=150.024MiB in 0.078s wall=1794471661
+v4_gpu indexer-resident=on device=0 layer=40 bytes=8390656
+v4_gpu layer=40 uploaded=183.026MiB in 0.079s wall=1794471661
+v4_gpu layer=41 uploaded=150.024MiB in 0.079s wall=1794471661
+v4_gpu indexer-resident=on device=0 layer=42 bytes=8390656
+v4_gpu layer=42 uploaded=183.026MiB in 0.086s wall=1794471661
+v4_dense_resident layers=43 bytes=6.267GiB
+v4_gpu resident-experts=cache-fallback (resident experts exceed device 0 budget (free=7837 MiB reserve=2800 MiB))
+v4_gpu head=resident device=0 bytes=1059061760 arithmetic=separate-mul-add
+v4_cli mode=chat memory=limited target_only=1
+v4_gpu moe-batch=on bank=256-experts
+v4_gpu moe-double=on
+v4_gpu moe-batch refill layer=0 missing=184 lookup=0.02s upload=0.70s (sequential retries)
+v4_gpu moe-batch refill layer=0 missing=5 lookup=0.01s upload=0.01s
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+v4_gpu moe-double swaps=42 prefetched=10752
+decprof position=3278 layers=43 hc=16 attn=112 moe=729 ms
+decprof position=3279 layers=43 hc=18 attn=98 moe=697 ms
+decprof position=3280 layers=43 hc=16 attn=80 moe=519 ms
+decprof position=3281 layers=43 hc=17 attn=81 moe=571 ms
+decprof position=3282 layers=43 hc=17 attn=80 moe=553 ms
+decprof position=3283 layers=43 hc=18 attn=99 moe=521 ms
+decprof position=3284 layers=43 hc=17 attn=80 moe=529 ms
+decprof position=3285 layers=43 hc=17 attn=80 moe=515 ms
+decprof position=3286 layers=43 hc=17 attn=80 moe=531 ms
+decprof position=3287 layers=43 hc=18 attn=99 moe=517 ms
+decprof position=3288 layers=43 hc=17 attn=80 moe=561 ms
+decprof position=3289 layers=43 hc=17 attn=79 moe=537 ms
+decprof position=3290 layers=43 hc=17 attn=80 moe=504 ms
+decprof position=3291 layers=43 hc=18 attn=97 moe=520 ms
+decprof position=3292 layers=43 hc=17 attn=80 moe=528 ms
+decprof position=3293 layers=43 hc=16 attn=80 moe=547 ms
+decprof position=3294 layers=43 hc=16 attn=78 moe=507 ms
+decprof position=3295 layers=43 hc=19 attn=97 moe=542 ms
+decprof position=3296 layers=43 hc=16 attn=80 moe=546 ms
+decprof position=3297 layers=43 hc=16 attn=80 moe=466 ms
+decprof position=3298 layers=43 hc=16 attn=80 moe=516 ms
+decprof position=3299 layers=43 hc=18 attn=97 moe=501 ms
+decprof position=3300 layers=43 hc=16 attn=80 moe=484 ms
+decprof position=3301 layers=43 hc=17 attn=80 moe=513 ms
+decprof position=3302 layers=43 hc=17 attn=81 moe=508 ms
+decprof position=3303 layers=43 hc=18 attn=98 moe=506 ms
+decprof position=3304 layers=43 hc=16 attn=80 moe=479 ms
+decprof position=3305 layers=43 hc=16 attn=81 moe=487 ms
+decprof position=3306 layers=43 hc=16 attn=81 moe=530 ms
+decprof position=3307 layers=43 hc=18 attn=100 moe=480 ms
+decprof position=3308 layers=43 hc=17 attn=80 moe=488 ms
+decprof position=3309 layers=43 hc=16 attn=79 moe=483 ms
+decprof position=3310 layers=43 hc=16 attn=80 moe=467 ms
+decprof position=3311 layers=43 hc=18 attn=98 moe=484 ms
+v4_tokens prompt=3278 generated=36 total=3314 expert_requests=20025 hits=4330 misses=15641 hit_rate=21.623 bytes=209109909504 target_only=1
+v4_mirror drives=2 primary=102.90GiB/16528 mirror=91.85GiB/14754
+generated_text=The history of computing progressed through successive hardware generations, from mechanical calculators to cloud data centers. Each new generation dramatically increased performance while reducing cost and size, enabling more ambitious software.
+timing time_to_first_token=81.369s after_first=22.294s
+v4_rows16 packed_slots=0
+v4_direct reads=15641 flock_reads=0 fallbacks=0 payload_bytes=196809326592
+
+----- stdout -----
+The history of computing progressed through successive hardware generations, from mechanical calculators to cloud data centers. Each new generation dramatically increased performance while reducing cost and size, enabling more ambitious software.<｜end▁of▁sentence｜>
+TUNE decode: 36 tokens in 103.726s
+
+===== run vpr2b_stripe_up (V4_HC_TEAM unset (GPU tier on: the mix on 8 threads, the column loops on the calling thread)) =====
+----- stderr -----
+[env] COLI_CUDA_PIPE is not read by deepseek-v4 (it belongs to colibri) -- it will have no effect
+[env] COLI_GPU is not read by deepseek-v4 (it belongs to colibri olmoe qwen36 qwen38 laya gliner_decide) -- it will have no effect
+[env] CUDA_DENSE is not read by deepseek-v4 (it belongs to colibri) -- it will have no effect
+[env] TEMP is not read by deepseek-v4 (it belongs to colibri kimi_k3 olmoe qwen36 glm53 qwen38 deepseek-v41 mimo laya gliner_decide) -- it will have no effect
+[env] unknown variable V4_READ_STRIPE
+[OMP] deepseek-v4: 16 compute threads (the physical cores of 32 logical CPUs; the 3 expert-loader workers take the SMT siblings); OMP_NUM_THREADS=<n> overrides, COLI_NO_OMP_TUNE=1 disables
+ram_tiers available=16.00GiB dense=resident(6.27GiB) target_slots=14 target_cache=7.50GiB head=resident-bf16 projected=15.64GiB
+v4_open index=0.13s plan=0.00s (index built once, reused by plan/inventory/head)
+[MIRROR] D:\llm_models\DeepSeek-V4-Flash-0731-Abliterated: 48/48 shards (replica 1)
+[MIRROR] probe: primary 6.11 GB/s | mirror 5.51 GB/s
+[MIRROR] 2 drives | read split 53% / 47% (measured)
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_autopin history=C:\colibri\models\DeepSeek-V4-Flash-0731-Abliterated/.coli_usage selections=1732231
+v4_hot_policy pin_slots_per_layer=8 repin_interval=6 mode=resident-ram rows16=hot-pins
+[DSV4 CUDA] backend=coli_cuda_dsv4_dg.dll (deepgemm-sm120)
+[DSV4 CUDA] device 0: NVIDIA GeForce RTX 5080 17.1 GB sm_120
+v4_gpu mirror-reserve=8329MiB (256-slot bank 3456MiB x2 + 600MiB headroom + 64 mirrors; DSV4_CUDA_VRAM_RESERVE_MB overrides)
+v4_gpu tier=dense-matvec device=0
+v4_gpu layer=0 uploaded=134.024MiB in 0.077s wall=1794471884
+v4_gpu layer=1 uploaded=134.024MiB in 0.071s wall=1794471884
+v4_gpu indexer-resident=on device=0 layer=2 bytes=8390656
+v4_gpu layer=2 uploaded=183.025MiB in 0.087s wall=1794471884
+v4_gpu layer=3 uploaded=150.024MiB in 0.078s wall=1794471884
+v4_gpu indexer-resident=on device=0 layer=4 bytes=8390656
+v4_gpu layer=4 uploaded=183.026MiB in 0.086s wall=1794471884
+v4_gpu layer=5 uploaded=150.024MiB in 0.083s wall=1794471884
+v4_gpu indexer-resident=on device=0 layer=6 bytes=8390656
+v4_gpu layer=6 uploaded=183.026MiB in 0.088s wall=1794471885
+v4_gpu layer=7 uploaded=150.024MiB in 0.080s wall=1794471885
+v4_gpu indexer-resident=on device=0 layer=8 bytes=8390656
+v4_gpu layer=8 uploaded=183.026MiB in 0.087s wall=1794471885
+v4_gpu layer=9 uploaded=150.024MiB in 0.078s wall=1794471885
+v4_gpu indexer-resident=on device=0 layer=10 bytes=8390656
+v4_gpu layer=10 uploaded=183.026MiB in 0.087s wall=1794471885
+v4_gpu layer=11 uploaded=150.024MiB in 0.073s wall=1794471885
+v4_gpu indexer-resident=on device=0 layer=12 bytes=8390656
+v4_gpu layer=12 uploaded=183.026MiB in 0.087s wall=1794471885
+v4_gpu layer=13 uploaded=150.024MiB in 0.072s wall=1794471886
+v4_gpu indexer-resident=on device=0 layer=14 bytes=8390656
+v4_gpu layer=14 uploaded=183.026MiB in 0.086s wall=1794471886
+v4_gpu layer=15 uploaded=150.024MiB in 0.079s wall=1794471886
+v4_gpu indexer-resident=on device=0 layer=16 bytes=8390656
+v4_gpu layer=16 uploaded=183.026MiB in 0.085s wall=1794471886
+v4_gpu layer=17 uploaded=150.024MiB in 0.079s wall=1794471886
+v4_gpu indexer-resident=on device=0 layer=18 bytes=8390656
+v4_gpu layer=18 uploaded=183.026MiB in 0.091s wall=1794471886
+v4_gpu layer=19 uploaded=150.024MiB in 0.078s wall=1794471886
+v4_gpu indexer-resident=on device=0 layer=20 bytes=8390656
+v4_gpu layer=20 uploaded=183.026MiB in 0.086s wall=1794471887
+v4_gpu layer=21 uploaded=150.024MiB in 0.078s wall=1794471887
+v4_gpu indexer-resident=on device=0 layer=22 bytes=8390656
+v4_gpu layer=22 uploaded=183.026MiB in 0.087s wall=1794471887
+v4_gpu layer=23 uploaded=150.024MiB in 0.080s wall=1794471887
+v4_gpu indexer-resident=on device=0 layer=24 bytes=8390656
+v4_gpu layer=24 uploaded=183.026MiB in 0.086s wall=1794471887
+v4_gpu layer=25 uploaded=150.024MiB in 0.071s wall=1794471887
+v4_gpu indexer-resident=on device=0 layer=26 bytes=8390656
+v4_gpu layer=26 uploaded=183.026MiB in 0.087s wall=1794471888
+v4_gpu layer=27 uploaded=150.024MiB in 0.078s wall=1794471888
+v4_gpu indexer-resident=on device=0 layer=28 bytes=8390656
+v4_gpu layer=28 uploaded=183.026MiB in 0.086s wall=1794471888
+v4_gpu layer=29 uploaded=150.024MiB in 0.079s wall=1794471888
+v4_gpu indexer-resident=on device=0 layer=30 bytes=8390656
+v4_gpu layer=30 uploaded=183.026MiB in 0.079s wall=1794471888
+v4_gpu layer=31 uploaded=150.024MiB in 0.089s wall=1794471888
+v4_gpu indexer-resident=on device=0 layer=32 bytes=8390656
+v4_gpu layer=32 uploaded=183.026MiB in 0.087s wall=1794471888
+v4_gpu layer=33 uploaded=150.024MiB in 0.078s wall=1794471889
+v4_gpu indexer-resident=on device=0 layer=34 bytes=8390656
+v4_gpu layer=34 uploaded=183.026MiB in 0.086s wall=1794471889
+v4_gpu layer=35 uploaded=150.024MiB in 0.079s wall=1794471889
+v4_gpu indexer-resident=on device=0 layer=36 bytes=8390656
+v4_gpu layer=36 uploaded=183.026MiB in 0.086s wall=1794471889
+v4_gpu layer=37 uploaded=150.024MiB in 0.079s wall=1794471889
+v4_gpu indexer-resident=on device=0 layer=38 bytes=8390656
+v4_gpu layer=38 uploaded=183.026MiB in 0.087s wall=1794471889
+v4_gpu layer=39 uploaded=150.024MiB in 0.079s wall=1794471890
+v4_gpu indexer-resident=on device=0 layer=40 bytes=8390656
+v4_gpu layer=40 uploaded=183.026MiB in 0.080s wall=1794471890
+v4_gpu layer=41 uploaded=150.024MiB in 0.080s wall=1794471890
+v4_gpu indexer-resident=on device=0 layer=42 bytes=8390656
+v4_gpu layer=42 uploaded=183.026MiB in 0.088s wall=1794471890
+v4_dense_resident layers=43 bytes=6.267GiB
+v4_gpu resident-experts=cache-fallback (resident experts exceed device 0 budget (free=7837 MiB reserve=2800 MiB))
+v4_gpu head=resident device=0 bytes=1059061760 arithmetic=separate-mul-add
+v4_cli mode=chat memory=limited target_only=1
+v4_gpu moe-batch=on bank=256-experts
+v4_gpu moe-double=on
+v4_gpu moe-batch refill layer=0 missing=184 lookup=0.02s upload=0.71s (sequential retries)
+v4_gpu moe-batch refill layer=0 missing=5 lookup=0.01s upload=0.01s
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+v4_gpu moe-double swaps=42 prefetched=10752
+decprof position=3278 layers=43 hc=16 attn=111 moe=735 ms
+decprof position=3279 layers=43 hc=18 attn=97 moe=681 ms
+decprof position=3280 layers=43 hc=16 attn=80 moe=522 ms
+decprof position=3281 layers=43 hc=17 attn=81 moe=572 ms
+decprof position=3282 layers=43 hc=17 attn=81 moe=546 ms
+decprof position=3283 layers=43 hc=18 attn=97 moe=520 ms
+decprof position=3284 layers=43 hc=16 attn=81 moe=528 ms
+decprof position=3285 layers=43 hc=16 attn=81 moe=515 ms
+decprof position=3286 layers=43 hc=17 attn=81 moe=533 ms
+decprof position=3287 layers=43 hc=18 attn=99 moe=521 ms
+decprof position=3288 layers=43 hc=17 attn=79 moe=560 ms
+decprof position=3289 layers=43 hc=17 attn=79 moe=533 ms
+decprof position=3290 layers=43 hc=17 attn=79 moe=506 ms
+decprof position=3291 layers=43 hc=19 attn=97 moe=525 ms
+decprof position=3292 layers=43 hc=17 attn=80 moe=529 ms
+decprof position=3293 layers=43 hc=16 attn=78 moe=544 ms
+decprof position=3294 layers=43 hc=16 attn=78 moe=509 ms
+decprof position=3295 layers=43 hc=18 attn=99 moe=538 ms
+decprof position=3296 layers=43 hc=16 attn=79 moe=546 ms
+decprof position=3297 layers=43 hc=16 attn=79 moe=469 ms
+decprof position=3298 layers=43 hc=16 attn=78 moe=512 ms
+decprof position=3299 layers=43 hc=18 attn=96 moe=504 ms
+decprof position=3300 layers=43 hc=17 attn=81 moe=488 ms
+decprof position=3301 layers=43 hc=16 attn=81 moe=510 ms
+decprof position=3302 layers=43 hc=17 attn=81 moe=512 ms
+decprof position=3303 layers=43 hc=18 attn=96 moe=503 ms
+decprof position=3304 layers=43 hc=16 attn=80 moe=483 ms
+decprof position=3305 layers=43 hc=17 attn=80 moe=494 ms
+decprof position=3306 layers=43 hc=17 attn=81 moe=530 ms
+decprof position=3307 layers=43 hc=18 attn=98 moe=487 ms
+decprof position=3308 layers=43 hc=16 attn=79 moe=490 ms
+decprof position=3309 layers=43 hc=16 attn=79 moe=482 ms
+decprof position=3310 layers=43 hc=17 attn=81 moe=469 ms
+decprof position=3311 layers=43 hc=18 attn=99 moe=480 ms
+v4_tokens prompt=3278 generated=36 total=3314 expert_requests=20025 hits=4341 misses=15630 hit_rate=21.678 bytes=208962846720 target_only=1
+v4_mirror drives=2 primary=102.01GiB/16386 mirror=92.60GiB/14874
+generated_text=The history of computing progressed through successive hardware generations, from mechanical calculators to cloud data centers. Each new generation dramatically increased performance while reducing cost and size, enabling more ambitious software.
+timing time_to_first_token=81.233s after_first=22.292s
+v4_rows16 packed_slots=0
+v4_direct reads=15630 flock_reads=0 fallbacks=0 payload_bytes=196670914560
+
+----- stdout -----
+The history of computing progressed through successive hardware generations, from mechanical calculators to cloud data centers. Each new generation dramatically increased performance while reducing cost and size, enabling more ambitious software.<｜end▁of▁sentence｜>
+TUNE decode: 36 tokens in 103.588s
+
+===== run vpr2c_stripe_up (V4_HC_TEAM unset (GPU tier on: the mix on 8 threads, the column loops on the calling thread)) =====
+----- stderr -----
+[env] COLI_CUDA_PIPE is not read by deepseek-v4 (it belongs to colibri) -- it will have no effect
+[env] COLI_GPU is not read by deepseek-v4 (it belongs to colibri olmoe qwen36 qwen38 laya gliner_decide) -- it will have no effect
+[env] CUDA_DENSE is not read by deepseek-v4 (it belongs to colibri) -- it will have no effect
+[env] TEMP is not read by deepseek-v4 (it belongs to colibri kimi_k3 olmoe qwen36 glm53 qwen38 deepseek-v41 mimo laya gliner_decide) -- it will have no effect
+[env] unknown variable V4_READ_STRIPE
+[OMP] deepseek-v4: 16 compute threads (the physical cores of 32 logical CPUs; the 3 expert-loader workers take the SMT siblings); OMP_NUM_THREADS=<n> overrides, COLI_NO_OMP_TUNE=1 disables
+ram_tiers available=16.00GiB dense=resident(6.27GiB) target_slots=14 target_cache=7.50GiB head=resident-bf16 projected=15.64GiB
+v4_open index=0.14s plan=0.00s (index built once, reused by plan/inventory/head)
+[MIRROR] D:\llm_models\DeepSeek-V4-Flash-0731-Abliterated: 48/48 shards (replica 1)
+[MIRROR] probe: primary 6.10 GB/s | mirror 5.40 GB/s
+[MIRROR] 2 drives | read split 53% / 47% (measured)
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_autopin history=C:\colibri\models\DeepSeek-V4-Flash-0731-Abliterated/.coli_usage selections=1732231
+v4_hot_policy pin_slots_per_layer=8 repin_interval=6 mode=resident-ram rows16=hot-pins
+[DSV4 CUDA] backend=coli_cuda_dsv4_dg.dll (deepgemm-sm120)
+[DSV4 CUDA] device 0: NVIDIA GeForce RTX 5080 17.1 GB sm_120
+v4_gpu mirror-reserve=8329MiB (256-slot bank 3456MiB x2 + 600MiB headroom + 64 mirrors; DSV4_CUDA_VRAM_RESERVE_MB overrides)
+v4_gpu tier=dense-matvec device=0
+v4_gpu layer=0 uploaded=134.024MiB in 0.078s wall=1794472112
+v4_gpu layer=1 uploaded=134.024MiB in 0.084s wall=1794472112
+v4_gpu indexer-resident=on device=0 layer=2 bytes=8390656
+v4_gpu layer=2 uploaded=183.025MiB in 0.087s wall=1794472112
+v4_gpu layer=3 uploaded=150.024MiB in 0.079s wall=1794472113
+v4_gpu indexer-resident=on device=0 layer=4 bytes=8390656
+v4_gpu layer=4 uploaded=183.026MiB in 0.088s wall=1794472113
+v4_gpu layer=5 uploaded=150.024MiB in 0.078s wall=1794472113
+v4_gpu indexer-resident=on device=0 layer=6 bytes=8390656
+v4_gpu layer=6 uploaded=183.026MiB in 0.087s wall=1794472113
+v4_gpu layer=7 uploaded=150.024MiB in 0.079s wall=1794472113
+v4_gpu indexer-resident=on device=0 layer=8 bytes=8390656
+v4_gpu layer=8 uploaded=183.026MiB in 0.088s wall=1794472113
+v4_gpu layer=9 uploaded=150.024MiB in 0.072s wall=1794472114
+v4_gpu indexer-resident=on device=0 layer=10 bytes=8390656
+v4_gpu layer=10 uploaded=183.026MiB in 0.088s wall=1794472114
+v4_gpu layer=11 uploaded=150.024MiB in 0.078s wall=1794472114
+v4_gpu indexer-resident=on device=0 layer=12 bytes=8390656
+v4_gpu layer=12 uploaded=183.026MiB in 0.086s wall=1794472114
+v4_gpu layer=13 uploaded=150.024MiB in 0.079s wall=1794472114
+v4_gpu indexer-resident=on device=0 layer=14 bytes=8390656
+v4_gpu layer=14 uploaded=183.026MiB in 0.088s wall=1794472114
+v4_gpu layer=15 uploaded=150.024MiB in 0.080s wall=1794472114
+v4_gpu indexer-resident=on device=0 layer=16 bytes=8390656
+v4_gpu layer=16 uploaded=183.026MiB in 0.087s wall=1794472115
+v4_gpu layer=17 uploaded=150.024MiB in 0.079s wall=1794472115
+v4_gpu indexer-resident=on device=0 layer=18 bytes=8390656
+v4_gpu layer=18 uploaded=183.026MiB in 0.087s wall=1794472115
+v4_gpu layer=19 uploaded=150.024MiB in 0.073s wall=1794472115
+v4_gpu indexer-resident=on device=0 layer=20 bytes=8390656
+v4_gpu layer=20 uploaded=183.026MiB in 0.086s wall=1794472115
+v4_gpu layer=21 uploaded=150.024MiB in 0.087s wall=1794472115
+v4_gpu indexer-resident=on device=0 layer=22 bytes=8390656
+v4_gpu layer=22 uploaded=183.026MiB in 0.087s wall=1794472115
+v4_gpu layer=23 uploaded=150.024MiB in 0.079s wall=1794472116
+v4_gpu indexer-resident=on device=0 layer=24 bytes=8390656
+v4_gpu layer=24 uploaded=183.026MiB in 0.086s wall=1794472116
+v4_gpu layer=25 uploaded=150.024MiB in 0.079s wall=1794472116
+v4_gpu indexer-resident=on device=0 layer=26 bytes=8390656
+v4_gpu layer=26 uploaded=183.026MiB in 0.081s wall=1794472116
+v4_gpu layer=27 uploaded=150.024MiB in 0.079s wall=1794472116
+v4_gpu indexer-resident=on device=0 layer=28 bytes=8390656
+v4_gpu layer=28 uploaded=183.026MiB in 0.087s wall=1794472116
+v4_gpu layer=29 uploaded=150.024MiB in 0.079s wall=1794472117
+v4_gpu indexer-resident=on device=0 layer=30 bytes=8390656
+v4_gpu layer=30 uploaded=183.026MiB in 0.087s wall=1794472117
+v4_gpu layer=31 uploaded=150.024MiB in 0.078s wall=1794472117
+v4_gpu indexer-resident=on device=0 layer=32 bytes=8390656
+v4_gpu layer=32 uploaded=183.026MiB in 0.081s wall=1794472117
+v4_gpu layer=33 uploaded=150.024MiB in 0.078s wall=1794472117
+v4_gpu indexer-resident=on device=0 layer=34 bytes=8390656
+v4_gpu layer=34 uploaded=183.026MiB in 0.089s wall=1794472117
+v4_gpu layer=35 uploaded=150.024MiB in 0.080s wall=1794472117
+v4_gpu indexer-resident=on device=0 layer=36 bytes=8390656
+v4_gpu layer=36 uploaded=183.026MiB in 0.086s wall=1794472118
+v4_gpu layer=37 uploaded=150.024MiB in 0.078s wall=1794472118
+v4_gpu indexer-resident=on device=0 layer=38 bytes=8390656
+v4_gpu layer=38 uploaded=183.026MiB in 0.089s wall=1794472118
+v4_gpu layer=39 uploaded=150.024MiB in 0.073s wall=1794472118
+v4_gpu indexer-resident=on device=0 layer=40 bytes=8390656
+v4_gpu layer=40 uploaded=183.026MiB in 0.087s wall=1794472118
+v4_gpu layer=41 uploaded=150.024MiB in 0.079s wall=1794472118
+v4_gpu indexer-resident=on device=0 layer=42 bytes=8390656
+v4_gpu layer=42 uploaded=183.026MiB in 0.087s wall=1794472119
+v4_dense_resident layers=43 bytes=6.267GiB
+v4_gpu resident-experts=cache-fallback (resident experts exceed device 0 budget (free=7837 MiB reserve=2800 MiB))
+v4_gpu head=resident device=0 bytes=1059061760 arithmetic=separate-mul-add
+v4_cli mode=chat memory=limited target_only=1
+v4_gpu moe-batch=on bank=256-experts
+v4_gpu moe-double=on
+v4_gpu moe-batch refill layer=0 missing=184 lookup=0.02s upload=0.70s (sequential retries)
+v4_gpu moe-batch refill layer=0 missing=5 lookup=0.01s upload=0.01s
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv comp allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+[DSV4 CUDA] kv ring allocation: out of memory
+v4_gpu moe-double swaps=42 prefetched=10752
+decprof position=3278 layers=43 hc=16 attn=112 moe=733 ms
+decprof position=3279 layers=43 hc=18 attn=98 moe=696 ms
+decprof position=3280 layers=43 hc=16 attn=81 moe=520 ms
+decprof position=3281 layers=43 hc=16 attn=80 moe=569 ms
+decprof position=3282 layers=43 hc=17 attn=81 moe=546 ms
+decprof position=3283 layers=43 hc=18 attn=97 moe=524 ms
+decprof position=3284 layers=43 hc=17 attn=81 moe=532 ms
+decprof position=3285 layers=43 hc=17 attn=80 moe=517 ms
+decprof position=3286 layers=43 hc=17 attn=80 moe=529 ms
+decprof position=3287 layers=43 hc=18 attn=98 moe=512 ms
+decprof position=3288 layers=43 hc=17 attn=79 moe=562 ms
+decprof position=3289 layers=43 hc=17 attn=79 moe=542 ms
+decprof position=3290 layers=43 hc=17 attn=79 moe=506 ms
+decprof position=3291 layers=43 hc=18 attn=96 moe=523 ms
+decprof position=3292 layers=43 hc=17 attn=78 moe=523 ms
+decprof position=3293 layers=43 hc=17 attn=79 moe=542 ms
+decprof position=3294 layers=43 hc=17 attn=79 moe=510 ms
+decprof position=3295 layers=43 hc=18 attn=98 moe=541 ms
+decprof position=3296 layers=43 hc=17 attn=79 moe=545 ms
+decprof position=3297 layers=43 hc=16 attn=78 moe=468 ms
+decprof position=3298 layers=43 hc=17 attn=79 moe=516 ms
+decprof position=3299 layers=43 hc=18 attn=97 moe=512 ms
+decprof position=3300 layers=43 hc=17 attn=81 moe=486 ms
+decprof position=3301 layers=43 hc=17 attn=81 moe=510 ms
+decprof position=3302 layers=43 hc=17 attn=80 moe=506 ms
+decprof position=3303 layers=43 hc=18 attn=98 moe=503 ms
+decprof position=3304 layers=43 hc=17 attn=81 moe=483 ms
+decprof position=3305 layers=43 hc=16 attn=80 moe=486 ms
+decprof position=3306 layers=43 hc=17 attn=79 moe=521 ms
+decprof position=3307 layers=43 hc=18 attn=96 moe=479 ms
+decprof position=3308 layers=43 hc=17 attn=81 moe=488 ms
+decprof position=3309 layers=43 hc=17 attn=81 moe=486 ms
+decprof position=3310 layers=43 hc=17 attn=80 moe=470 ms
+decprof position=3311 layers=43 hc=18 attn=96 moe=484 ms
+v4_tokens prompt=3278 generated=36 total=3314 expert_requests=20025 hits=4336 misses=15635 hit_rate=21.653 bytes=209029693440 target_only=1
+v4_mirror drives=2 primary=102.80GiB/16512 mirror=91.88GiB/14758
+generated_text=The history of computing progressed through successive hardware generations, from mechanical calculators to cloud data centers. Each new generation dramatically increased performance while reducing cost and size, enabling more ambitious software.
+timing time_to_first_token=81.432s after_first=22.292s
+v4_rows16 packed_slots=0
+v4_direct reads=15635 flock_reads=0 fallbacks=0 payload_bytes=196733829120
+
+----- stdout -----
+The history of computing progressed through successive hardware generations, from mechanical calculators to cloud data centers. Each new generation dramatically increased performance while reducing cost and size, enabling more ambitious software.<｜end▁of▁sentence｜>
+TUNE decode: 36 tokens in 103.786s
+

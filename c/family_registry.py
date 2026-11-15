@@ -1163,9 +1163,11 @@ _V4_EXPERT = re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.")
 _GLM53_EXPERT = re.compile(
     r"^model\.(?:language_model\.)?layers\.(\d+)\.mlp\.experts\.(\d+)\."
 )
+# Inkling's fused experts; Inkling-2's under model.llm, in a container (gate_up_proj/down_proj,
+# tools/convert_inkling2_int4.py) or as the checkpoint names them (w13_weight/w2_weight)
 _INKLING_EXPERT = re.compile(
-    r"^model\.layers\.(\d+)\.mlp\.experts\."
-    r"(?:gate_up_proj|down_proj)(?:\.|$)"
+    r"^model\.(?:llm\.)?layers\.(\d+)\.mlp\.experts\."
+    r"(?:gate_up_proj|down_proj|w13_weight|w2_weight)(?:\.|$)"
 )
 _QWEN38_EXPERT = re.compile(
     r"^(?:model\.)?(?:language_model\.)?layers\.(\d+)\.mlp\.experts\."
@@ -1559,9 +1561,20 @@ FAMILIES = (
     ),
     FamilyDescriptor(
         id="inkling",
-        model_types=("inkling_mm_model", "inkling"),
+        # inkling2 / inkling2_text: Inkling-2 (inkling.c's v2: attention residuals, gated
+        # attention with a sink, dynamic convolutions), the root model_type of the checkpoint
+        # and the one of a flat text snapshot or a GGUF import
+        model_types=("inkling_mm_model", "inkling", "inkling2", "inkling2_text"),
         display_name="Inkling",
         display_scale="975B",
+        display_variants=(
+            DisplayVariant((("model_type", "inkling2"),), "Inkling-2-Small", "594B",
+                           model_id="inkling-2-small-colibri"),
+            DisplayVariant((("model_type", "inkling2_text"),), "Inkling-2-Small", "594B",
+                           model_id="inkling-2-small-colibri"),
+            DisplayVariant((("model_type", "inkling_mm_model"),), "Inkling", "975B"),
+            DisplayVariant((("model_type", "inkling"),), "Inkling", "975B"),
+        ),
         engine_artifact="inkling",
         engine_aliases=(),
         engine_group="inkling",
@@ -1583,7 +1596,9 @@ FAMILIES = (
         # turno senza risposta (#1278). 16384 e' il valore che hanno gia' tutte
         # le famiglie con lo stesso contesto massimo di 1048576.
         limits=FamilyLimits(8192, 1048576, 1024, 16384, 16, 8, "CTX_MAX"),
-        capabilities=FamilyCapabilities(False, False, True, True),
+        # image: Inkling-2's pictures (expand_inkling2_images); the engine says CAPS vision=1
+        # only when it loaded the tower, and Inkling's handshake says nothing (text)
+        capabilities=FamilyCapabilities(False, False, True, True, image=True),
         has_gateway_adapter=True,
         tune_prompt_template="<|user|>{prompt}<|assistant|>",
     ),

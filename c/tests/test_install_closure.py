@@ -31,6 +31,9 @@ HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HERE / "tools"))
 import pack_python  # noqa: E402
 
+# GNU make: the BSDs' own make cannot read this Makefile, and they install GNU make as gmake.
+MAKE = shutil.which("gmake" if sys.platform.startswith(("freebsd", "openbsd", "netbsd", "dragonfly")) else "make")
+
 
 def installed_root_modules(makefile):
     """The .py files the install recipe copies into $(LIBEXECDIR)/ itself."""
@@ -78,7 +81,7 @@ class InstallClosure(unittest.TestCase):
 
 
 @unittest.skipIf(sys.platform == "win32", "make install uses POSIX install")
-@unittest.skipUnless(shutil.which("make") and shutil.which("install"), "make and install required")
+@unittest.skipUnless(MAKE and shutil.which("install"), "make and install required")
 class InstalledRuntime(unittest.TestCase):
     def test_staged_install_keeps_runtime_assets_outside_source_tree(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -106,7 +109,7 @@ class InstalledRuntime(unittest.TestCase):
                 (source / name).write_text("unused engine fixture\n", encoding="utf-8")
             prefix = root / "installed"
             result = subprocess.run(
-                [shutil.which("make"), "--no-print-directory", "install",
+                [MAKE, "--no-print-directory", "install",
                  "COLI_V4_SUPPORTED=0", "EXE=", f"PREFIX={prefix}",
                  *[f"--old-file={name}" for name in engines]],
                 cwd=source, capture_output=True, text=True, timeout=60)

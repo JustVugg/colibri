@@ -56,6 +56,10 @@
 #include <sched.h>
 #include <unistd.h>
 #endif
+#if defined(__FreeBSD__)
+#include <sys/types.h>
+#include <sys/sysctl.h>
+#endif
 
 /* Numero di core FISICI, o 0 se non determinabile. Mai un valore inventato. */
 #if defined(_WIN32)
@@ -277,6 +281,23 @@ static inline int coli_omp_env_on(const char *name)
  * served, Q4_K_M on the CPU: OLMoE decode 43.3 and 42.7 -> 47.9 and 47.6 tok/s, LFM3 33.7
  * and 33.8 -> 34.5 and 34.5, Qwen3.6 13.5 -> 13.9, Qwen3.8 IQ2_XS from the disk 7.9-8.1 -> 9.0-9.1
  * (its prompt 4% slower) (docs/tuning.md). */
+#if defined(__FreeBSD__)
+/* The running executable's path on FreeBSD, for the hot-team re-exec (here and in
+ * colibri.c). The re-exec used /proc/curproc/file, which exists only when procfs is
+ * mounted, and a default FreeBSD install does not mount it: execv failed, the engine
+ * printed "re-exec failed, running untuned" and ran without the hot team. The kernel
+ * gives the same path through the kern.proc.pathname sysctl (what `procstat -b`
+ * reads), procfs or not. 1 with a NUL-terminated path in buf, else 0. */
+static inline int coli_self_exe_path(char *buf, size_t n)
+{
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1 };
+    size_t len = n;
+    if (n < 2 || sysctl(mib, 4, buf, &len, NULL, 0) != 0 || len < 2) return 0;
+    buf[n - 1] = 0;
+    return 1;
+}
+#endif
+
 static void coli_omp_hot_team(char **argv, const char *engine, int gpu_on)
 {
 #if defined(_OPENMP) && !defined(__APPLE__) && (defined(__linux__) || defined(__FreeBSD__))
@@ -305,7 +326,10 @@ static void coli_omp_hot_team(char **argv, const char *engine, int gpu_on)
     if (k > 0) { self[k] = 0; execv(self, argv); }
     execv("/proc/self/exe", argv);
 #else
-    execv("/proc/curproc/file", argv);
+    {   char self[4096];   /* FreeBSD: the path from the kernel, no procfs needed */
+        if (coli_self_exe_path(self, sizeof self)) execv(self, argv);
+    }
+    execv("/proc/curproc/file", argv);   /* the old path, for a system that mounts procfs */
 #endif
     perror("[OMP] re-exec failed, running untuned");
 #else

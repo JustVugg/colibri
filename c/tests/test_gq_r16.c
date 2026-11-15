@@ -14,7 +14,9 @@
 #include <string.h>
 #include <time.h>
 #include <math.h>
+#ifdef _OPENMP
 #include <omp.h>
+#endif
 #include "../ggml_quants.h"
 
 #ifndef GQ_R16_ON

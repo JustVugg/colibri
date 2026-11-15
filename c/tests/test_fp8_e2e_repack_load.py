@@ -69,9 +69,10 @@ def _cc_flags():
         # becomes a -Wunknown-pragmas warning (-Wall enables it), and the assertion
         # below requires an empty stderr -- so on Linux this test failed for a
         # reason that had nothing to do with what it is testing. macOS gets the
-        # libomp probe just below.
-        cflags += ["-fopenmp"]
-        ldflags += ["-fopenmp"]
+        # libomp probe just below. -pthread as the Makefile builds the engines too:
+        # FreeBSD keeps the threads in libthr, which nothing links without it.
+        cflags += ["-fopenmp", "-pthread"]
+        ldflags += ["-fopenmp", "-pthread"]
     if sys.platform == "win32":
         # MinGW mirrors CFLAGS too, rather than being left alone. compat.h
         # refuses to compile a Windows off_t that is not 64-bit, and the

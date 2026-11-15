@@ -843,6 +843,8 @@ def release_asset_suffix(os_name=None, machine=None):
     machine = (machine or host_machine()).lower()
     if os_name.startswith("linux") and machine in ("x86_64", "amd64"):
         return "linux-x86_64.tar.gz"
+    if os_name.startswith("linux") and machine in ("aarch64", "arm64"):
+        return "linux-aarch64.tar.gz"
     if os_name == "darwin" and machine in ("arm64", "aarch64"):
         return "macos-arm64.tar.gz"
     if os_name == "win32" and machine in ("amd64", "x86_64"):

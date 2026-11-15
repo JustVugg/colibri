@@ -316,3 +316,46 @@ static int q36_mc_row(Model *m, int tok, const float *hid, int pos, float *logit
     return 1;
 }
 static int q36_mc_on(void) { return g_q36_mc.on; }
+
+/* KV_SLOTS > 1 with drafts (serve_mux): each conversation's head state of its own, swapped with the
+ * head's fields (g_q36_mtp's place and rows, g_q36_mc's KV cache) as q36_seq_swap swaps the trunk's.
+ * Slot 0's is the head's own at the start; another slot's is made the first time it is bound. */
+typedef struct { int made, len, has_pend, done_pos, done_tok, last_base, last_n, last_cap; float *pend, *last; CcBuf *kc, *vc; } Q36MtpConv;
+static Q36MtpConv *g_q36_mcv;
+static int g_q36_mcv_n, g_q36_mcv_cur = -1;
+static void q36_mtp_conv_swap(Q36MtpConv *v) {
+    Q36Mtp *p = &g_q36_mtp; Q36MtpCuda *g = &g_q36_mc;
+#define Q36MV_SWAP(T, a, b) do { T t_ = (a); (a) = (b); (b) = t_; } while (0)
+    Q36MV_SWAP(int, p->len, v->len); Q36MV_SWAP(int, p->has_pend, v->has_pend);
+    Q36MV_SWAP(int, p->done_pos, v->done_pos); Q36MV_SWAP(int, p->done_tok, v->done_tok);
+    Q36MV_SWAP(int, p->last_base, v->last_base); Q36MV_SWAP(int, p->last_n, v->last_n); Q36MV_SWAP(int, p->last_cap, v->last_cap);
+    Q36MV_SWAP(float *, p->pend, v->pend); Q36MV_SWAP(float *, p->last, v->last);
+    Q36MV_SWAP(CcBuf *, g->kc, v->kc); Q36MV_SWAP(CcBuf *, g->vc, v->vc);
+#undef Q36MV_SWAP
+}
+/* the head's state for n mux slots, slot 0 the head's own: 0 when the head is not on the card */
+static int q36_mtp_conv_init(Model *m, int n) {
+    if (g_q36_mcv) return 1;
+    if (!q36_mc_init(m) || !q36_mc_bufs(m, 1) || !(g_q36_mcv = (Q36MtpConv *)calloc((size_t)n, sizeof *g_q36_mcv))) return 0;
+    g_q36_mcv_n = n; g_q36_mcv_cur = 0; g_q36_mcv[0].made = 1;
+    return 1;
+}
+/* the head's state the conversation of mux slot `slot`'s: 0 when its state could not be made */
+static int q36_mtp_conv_bind(Model *m, int slot) {
+    if (!g_q36_mcv || slot < 0 || slot >= g_q36_mcv_n) return 0;
+    if (slot == g_q36_mcv_cur) return 1;
+    Q36MtpConv *v = &g_q36_mcv[slot];
+    if (!v->made) {   /* a new conversation's: nothing read yet, a cache as the head's own */
+        const size_t kn = (size_t)m->c.kv_heads * g_q36_mc.cap * m->c.k_head_dim;
+        v->pend = falloc(m->c.hidden); v->len = -1; v->has_pend = 0; v->done_pos = -1; v->last = NULL; v->last_n = v->last_cap = 0;
+        if (!q36_mc_res(&v->kc, kn, CC_DEV) || !q36_mc_res(&v->vc, kn, CC_DEV)) {
+            cc_free(v->kc); cc_free(v->vc); v->kc = v->vc = NULL; free(v->pend); v->pend = NULL;
+            return 0;
+        }
+        v->made = 1;
+    }
+    q36_mtp_conv_swap(&g_q36_mcv[g_q36_mcv_cur]);   /* the bound one's state back to its slot */
+    q36_mtp_conv_swap(v);
+    g_q36_mcv_cur = slot;
+    return 1;
+}

@@ -71,6 +71,24 @@ class MachineInfoWin32Test(unittest.TestCase):
         self.assertEqual(info["ram"], "?")
 
 
+class MemoryBudgetTest(unittest.TestCase):
+    def test_invalid_memory_budgets_stop_before_machine_or_engine_work(self):
+        for value in ("nan", "inf", "-inf", "0", "-1"):
+            with self.subTest(value=value), \
+                 mock.patch.object(datapoint, "machine_info") as machine, \
+                 contextlib.redirect_stderr(io.StringIO()) as error:
+                with self.assertRaises(SystemExit) as result:
+                    datapoint.main(["--snap", "/model", "--memory-gb=" + value])
+                self.assertEqual(result.exception.code, 2)
+                self.assertIn("--memory-gb must be positive and finite", error.getvalue())
+                machine.assert_not_called()
+
+    def test_positive_fractional_memory_is_accepted(self):
+        with mock.patch.object(datapoint, "machine_info", side_effect=RuntimeError("reached")):
+            with self.assertRaisesRegex(RuntimeError, "reached"):
+                datapoint.main(["--snap", "/model", "--memory-gb", "1.5"])
+
+
 class IOBenchDatapointTest(unittest.TestCase):
     def test_missing_iobench_omits_result_without_losing_report(self):
         with tempfile.TemporaryDirectory() as directory:

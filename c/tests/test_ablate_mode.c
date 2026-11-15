@@ -324,6 +324,21 @@ static void t_lenient_framing(Cfg *c){
 /* Refusals must say why.  stderr is redirected to a file for the duration and
  * left there: everything this test reports goes to stdout. */
 
+/* Windows refuses to delete a file that is still open, and the capture file is
+ * still open as stderr when a case is done with it, so remove() alone left
+ * tmp_test_ablate_stderr.<pid>.txt behind on every run there.  Move stderr to
+ * the null device first.  If that fails, freopen has closed the stream anyway. */
+#ifdef _WIN32
+#define NULL_DEVICE "NUL"
+#else
+#define NULL_DEVICE "/dev/null"
+#endif
+static void stderr_capture_remove(void){
+    FILE *f=freopen(NULL_DEVICE,"w",stderr);
+    (void)f;
+    remove(STDERR_PATH);
+}
+
 static long stderr_bytes_of(Cfg *c, const char *manifest_body, void (*damage)(Cfg *)){
     Cfg local=*c;
     if(damage) damage(&local);
@@ -362,7 +377,7 @@ static void t_named_refusals(Cfg *c){
         long bytes=stderr_bytes_of(c,cases[i].body,cases[i].damage);
         CHECK(bytes>0, cases[i].why);
     }
-    remove(STDERR_PATH);
+    stderr_capture_remove();
 }
 
 /* Run once with stderr captured, and hand the captured text back. */
@@ -402,7 +417,7 @@ static void t_refusal_names_the_offender(Cfg *c){
     CHECK(text && strstr(text,"at line 2")!=NULL,
           "a malformed record names its own line");
     free(text);
-    remove(STDERR_PATH);
+    stderr_capture_remove();
 }
 
 static void t_bounded_item_length(Cfg *c){
@@ -420,7 +435,7 @@ static void t_bounded_item_length(Cfg *c){
     CHECK(text!=NULL, "one token past the documented limit is refused");
     CHECK(text && strstr(text,"above the")!=NULL, "and names the limit");
     free(text);
-    remove(STDERR_PATH);
+    stderr_capture_remove();
 }
 
 /* "item T n_prompt mode ncells" (mode 0, ncells 0) followed by T real token
@@ -472,7 +487,7 @@ static void t_ctx_derived_item_limit(Cfg *c){
         free(ev);
         remove(EVIDENCE_PATH);
     }
-    remove(STDERR_PATH);
+    stderr_capture_remove();
     unsetenv("CTX");
 }
 

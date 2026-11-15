@@ -43,6 +43,7 @@ import os
 import re
 import shlex
 import shutil
+import sys
 import subprocess
 import unittest
 from unittest import mock
@@ -51,7 +52,8 @@ from pathlib import Path
 from family_registry import FAMILIES
 
 C_DIR = Path(__file__).resolve().parent.parent
-MAKE = shutil.which("make")
+# GNU make: the BSDs' own make cannot read this Makefile, and they install GNU make as gmake.
+MAKE = shutil.which("gmake" if sys.platform.startswith(("freebsd", "openbsd", "netbsd", "dragonfly")) else "make")
 
 RULE_RE = re.compile(r"(?m)^([A-Za-z0-9_]+)\$\(EXE\):[ \t]*(.*)$")
 INCLUDE_RE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*"([^"]+)"')
