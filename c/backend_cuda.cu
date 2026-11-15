@@ -1269,6 +1269,103 @@ __global__ static void grouped_down_f8w(float *y,const float *x,const GroupDesc 
     }
 }
 
+/* fmt=7 (MXFP4) expert groups: one WARP owns one (expert, output row) and its
+ * lanes take the row's 32-input groups in turn (16 bytes of e2m1 nibbles and one
+ * ue8m0 byte each), each decoded once for a tile of up to 4 activation rows. As
+ * in quant.h's matmul_mxfp4, a group's products are summed unscaled in column
+ * order and scaled once by mx4_scale_dev (s=0 gives +0, s=255 +inf, as on the
+ * CPU); the lanes' sums then fold across the warp, so the result matches the CPU
+ * to rounding, not to the bit. K%32==0 rows on 16-byte boundaries take vector
+ * loads, any other K (a short last group) a byte at a time. The 16 decoded
+ * values sit in shared memory, filled from mx4_decode itself. Grid
+ * (ceil(O/8), count) of 256 threads, like the fmt=8 warp kernels. */
+__device__ __forceinline__ void mx4_lut_fill(float *lut){
+    if(threadIdx.x<16)lut[threadIdx.x]=mx4_decode((int)threadIdx.x);
+    __syncthreads();
+}
+__device__ __forceinline__ void mx4_group(const float *lut,const uint8_t *row,int g,int glen,int vec,float *w){
+    if(vec){
+        uint4 q=*(const uint4*)(row+(size_t)g*16);
+        uint32_t v[4]={q.x,q.y,q.z,q.w};
+#pragma unroll
+        for(int j=0;j<4;j++)
+#pragma unroll
+            for(int k=0;k<8;k++)w[j*8+k]=lut[(v[j]>>(4*k))&15];   /* low nibble: the even column */
+        return;
+    }
+#pragma unroll
+    for(int k=0;k<32;k++){int i=(g<<5)+k;w[k]=k<glen?lut[(row[i>>1]>>((i&1)*4))&15]:0.f;}
+}
+/* Up to 4 rows of xs (K wide) against row a (and b, DUAL); pa/pb hold the warp's sums on every lane. */
+template<int DUAL>
+__device__ __forceinline__ void mx4_rows(const float *lut,const uint8_t *a,const uint8_t *as,
+                                         const uint8_t *b,const uint8_t *bs,const float *xs,
+                                         int K,int ns,float *pa,float *pb){
+    int lane=threadIdx.x&31,ng=(K+31)>>5;
+    int vec=!(K&31)&&!((size_t)a&15)&&(!DUAL||!((size_t)b&15))&&!((size_t)xs&15);
+    float sa_[4]={0,0,0,0},sb_[4]={0,0,0,0};
+    for(int g=lane;g<ng;g+=32){
+        int glen=K-(g<<5)<32?K-(g<<5):32;
+        float wa[32],wb[32];
+        mx4_group(lut,a,g,glen,vec,wa);
+        if(DUAL)mx4_group(lut,b,g,glen,vec,wb);
+        float ka=mx4_scale_dev(as[g]),kb=DUAL?mx4_scale_dev(bs[g]):0.f;
+#pragma unroll
+        for(int s=0;s<4;s++){
+            if(s>=ns)break;
+            const float *xr=xs+(size_t)s*K+((size_t)g<<5);
+            float ga=0.f,gb=0.f;
+            if(vec){
+                const float4 *xp=(const float4*)xr;
+#pragma unroll
+                for(int q=0;q<8;q++){
+                    float4 xv=xp[q];
+                    ga+=xv.x*wa[4*q];ga+=xv.y*wa[4*q+1];ga+=xv.z*wa[4*q+2];ga+=xv.w*wa[4*q+3];
+                    if(DUAL){gb+=xv.x*wb[4*q];gb+=xv.y*wb[4*q+1];gb+=xv.z*wb[4*q+2];gb+=xv.w*wb[4*q+3];}
+                }
+            }else{
+#pragma unroll
+                for(int k=0;k<32;k++)if(k<glen){ga+=xr[k]*wa[k];if(DUAL)gb+=xr[k]*wb[k];}
+            }
+            sa_[s]+=ga*ka;if(DUAL)sb_[s]+=gb*kb;
+        }
+    }
+#pragma unroll
+    for(int s=0;s<4;s++){
+        for(int off=16;off;off>>=1){sa_[s]+=f8_shfl_down(sa_[s],off);if(DUAL)sb_[s]+=f8_shfl_down(sb_[s],off);}
+        pa[s]=sa_[s];if(DUAL)pb[s]=sb_[s];
+    }
+}
+__global__ static void grouped_hidden_mx4_dual(float *gate,const float *x,const GroupDesc *desc,int I,int D){
+    __shared__ float lut[16];mx4_lut_fill(lut);
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int o=blockIdx.x*(blockDim.x>>5)+warp,c=blockIdx.y;GroupDesc d=desc[c];
+    if(o>=I)return;
+    size_t rb=(size_t)(D+1)/2,sb=(size_t)(D+31)/32;
+    const uint8_t *gr=(const uint8_t*)d.g+(size_t)o*rb,*ur=(const uint8_t*)d.u+(size_t)o*rb;
+    const uint8_t *gs=(const uint8_t*)d.gs+(size_t)o*sb,*us=(const uint8_t*)d.us+(size_t)o*sb;   /* ue8m0 bytes */
+    for(int s0=0;s0<d.rows;s0+=4){
+        int ns=d.rows-s0<4?d.rows-s0:4;
+        float g[4],u[4];
+        mx4_rows<1>(lut,gr,gs,ur,us,x+(size_t)(d.offset+s0)*D,D,ns,g,u);
+        /* the duals' fused epilogue: silu(gate)*up lands in gate[] */
+        if(!lane)for(int s=0;s<ns;s++)gate[(size_t)(d.offset+s0+s)*I+o]=(g[s]/(1.f+expf(-g[s])))*u[s];
+    }
+}
+__global__ static void grouped_down_mx4(float *y,const float *x,const GroupDesc *desc,int D,int I){
+    __shared__ float lut[16];mx4_lut_fill(lut);
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int o=blockIdx.x*(blockDim.x>>5)+warp,c=blockIdx.y;GroupDesc d=desc[c];
+    if(o>=D)return;
+    const uint8_t *row=(const uint8_t*)d.d+(size_t)o*((I+1)/2),*sc=(const uint8_t*)d.ds+(size_t)o*((I+31)/32);
+    for(int s0=0;s0<d.rows;s0+=4){
+        int ns=d.rows-s0<4?d.rows-s0:4;
+        float p[4];
+        mx4_rows<0>(lut,row,sc,nullptr,nullptr,x+(size_t)(d.offset+s0)*I,I,ns,p,nullptr);
+        if(!lane)for(int s=0;s<ns;s++)y[(size_t)(d.offset+s0+s)*D+o]=p[s];
+    }
+}
+
 __global__ static void attention_absorb_kernel(float *ctx,const float *q,const float *latent,
                                                 const float *rope,const void *weights,const float *wscale,
                                                 int fmt,int H,int Q,int R,int V,int K,int T,float scale,
@@ -2563,6 +2660,13 @@ static void f8_group_launch(DeviceContext *ctx,GroupDesc *dev,int I,int D,
     grouped_down_f8<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
 }
 
+/* fmt=7 groups, the sync and the issue dispatch alike (silu fused in the dual) */
+static void mx4_group_launch(DeviceContext *ctx,GroupDesc *dev,int I,int D,int count){
+    dim3 hg((unsigned)((I+7)/8),(unsigned)count),og((unsigned)((D+7)/8),(unsigned)count);
+    grouped_hidden_mx4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->x,dev,I,D);
+    grouped_down_mx4<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+}
+
 /* The kernels the CUDA chain runs a decode step's routed experts on (coli_cuda_moe_async: a
  * block of output rows of one (row, slot) pair a launch, its input row in shared memory,
  * 16-byte weight loads), for a small group whose experts share one format: every row of the
@@ -2632,7 +2736,7 @@ static int expert_group_impl(ColiCudaTensor *const *gates,
     if (!first) return 0;
     int device=first->device,D=first->I,I=first->O,total=0,max_rows=0;
     GroupDesc host[64]; if(count>64) return 0;
-    int all_s4=1,all_q4=1,any_g4=0,any_e8=0,all_e8=1,any_f8=0,all_f8=1;
+    int all_s4=1,all_q4=1,any_g4=0,any_e8=0,all_e8=1,any_f8=0,all_f8=1,all_mx4=1;
     for(int c=0;c<count;c++){
         ColiCudaTensor *g=gates[c],*u=ups[c],*d=downs[c];
         if(!g||!u||!d||rows[c]<1||g->device!=device||u->device!=device||d->device!=device||
@@ -2648,6 +2752,7 @@ static int expert_group_impl(ColiCudaTensor *const *gates,
         all_e8&=g->fmt==6&&u->fmt==6&&d->fmt==6;
         any_f8|=g->fmt==8||u->fmt==8||d->fmt==8;
         all_f8&=g->fmt==8&&u->fmt==8&&d->fmt==8;
+        all_mx4&=g->fmt==7&&u->fmt==7&&d->fmt==7;
         total+=rows[c]; if(rows[c]>max_rows) max_rows=rows[c];
     }
     /* Mixed E8/FP8 groups cannot use a homogeneous grouped kernel. */
@@ -2704,6 +2809,8 @@ static int expert_group_impl(ColiCudaTensor *const *gates,
     }else if(all_f8){
         /* fp8-e4m3 groups: silu fused in the dual epilogue, like the w4/g4 duals. */
         f8_group_launch(ctx,dev,I,D,max_rows,count);
+    }else if(all_mx4){
+        mx4_group_launch(ctx,dev,I,D,count);
     }else if(tc){
         size_t qb=(size_t)(total+7)*(size_t)(D>I?D:I)/2;
         if(!reserve_bytes((void**)&ctx->qx,&ctx->qx_cap,qb)||
@@ -2855,7 +2962,7 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
     ColiCudaTensor *first=gates[0];
     if (!first) return 0;
     int device=first->device,D=first->I,I=first->O,total=0,max_rows=0,all_s4=1,any_e8=0,all_e8=1,
-        all_q4=1,any_g4=0,any_f8=0,all_f8=1;
+        all_q4=1,any_g4=0,any_f8=0,all_f8=1,all_mx4=1;
     GroupDesc host[64];
     for(int c=0;c<count;c++){
         ColiCudaTensor *g=gates[c],*u=ups[c],*d=downs[c];
@@ -2872,6 +2979,7 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
         any_g4|=g->fmt==4||u->fmt==4||d->fmt==4;
         any_f8|=g->fmt==8||u->fmt==8||d->fmt==8;
         all_f8&=g->fmt==8&&u->fmt==8&&d->fmt==8;
+        all_mx4&=g->fmt==7&&u->fmt==7&&d->fmt==7;
         total+=rows[c]; if(rows[c]>max_rows) max_rows=rows[c];
     }
     if(any_e8&&!all_e8) return 0;
@@ -2901,6 +3009,8 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
         /* fp8-e4m3 groups on the async decode path: same launch helper as the
          * sync dispatch, silu fused in the dual epilogue. */
         f8_group_launch(ctx,(GroupDesc*)ctx->group_desc,I,D,max_rows,count);
+    }else if(all_mx4){
+        mx4_group_launch(ctx,(GroupDesc*)ctx->group_desc,I,D,count);
     }else if(group_moe_ok(host,count,total,D,I)){
         /* pin 1: the warp kernels at any row count, so 9..32 rows give the bits of the
          * same experts issued 8 rows at a time (the tensor-core family past
