@@ -236,6 +236,29 @@ static const st_gg_name st_gg_ink2_layer[] = {
     {"ffn_gate_exps.scale", "mlp.experts.gate_scale"}, {"ffn_up_exps.scale", "mlp.experts.up_scale"},
     {"ffn_down_exps.scale", "mlp.experts.down_scale"},
     {NULL, NULL}};
+/* Inkling-2's vision tower from its own GGUF (unsloth's mmproj-*.gguf: architecture clip,
+ * projector inkling2, gguf.json "mmproj"), under the checkpoint's model.visual.* names. The same
+ * values as the checkpoint's but for the patch embedding, which the file keeps as a convolution
+ * [D][3][P][P]: it comes as patch_embedding.weight.gguf, and inkling2_vision.h takes its pixels
+ * in the checkpoint's order (rows, columns, channels). */
+static const st_gg_name st_gg_ink2v_glob[] = {
+    {"v.class_embd", "model.visual.backbone.embeddings.class_embedding"},
+    {"v.class_pos_embd", "model.visual.backbone.embeddings.cls_position_embedding"},
+    {"v.patch_embd.weight", "model.visual.backbone.embeddings.patch_embedding.weight.gguf"},
+    {"v.position_embd.weight", "model.visual.backbone.embeddings.position_embedding"},
+    {"v.pre_ln.weight", "model.visual.backbone.ln_pre.weight"}, {"v.pre_ln.bias", "model.visual.backbone.ln_pre.bias"},
+    {"mm.up.weight", "model.visual.proj_in.weight"}, {"mm.down.weight", "model.visual.proj_out.weight"},
+    {NULL, NULL}};
+static const st_gg_name st_gg_ink2v_layer[] = {
+    {"ln1.weight", "ln_1.weight"}, {"ln1.bias", "ln_1.bias"}, {"ln2.weight", "ln_2.weight"}, {"ln2.bias", "ln_2.bias"},
+    {"ls1.weight", "ls_1.gamma"}, {"ls2.weight", "ls_2.gamma"},
+    {"attn_q.weight", "self_attn.q_proj.weight"}, {"attn_q.bias", "self_attn.q_proj.bias"},
+    {"attn_k.weight", "self_attn.k_proj.weight"}, {"attn_k.bias", "self_attn.k_proj.bias"},
+    {"attn_v.weight", "self_attn.v_proj.weight"}, {"attn_v.bias", "self_attn.v_proj.bias"},
+    {"attn_out.weight", "self_attn.out_proj.weight"}, {"attn_out.bias", "self_attn.out_proj.bias"},
+    {"ffn_up.weight", "mlp.c_fc.weight"}, {"ffn_up.bias", "mlp.c_fc.bias"},
+    {"ffn_down.weight", "mlp.c_proj.weight"}, {"ffn_down.bias", "mlp.c_proj.bias"},
+    {NULL, NULL}};
 
 /* GLM-5.3-Flash (glm5-next): conversion/glm.py Glm5NextModel. MLA's kv_b comes split the way
  * glm53.c absorbs it (k_b = W_k^T per head, v_b = W_v); KDA's A_log comes as ssm_a = -exp(A_log);
@@ -403,6 +426,7 @@ static const st_gg_map st_gguf_maps[] = {
     {"kimi-k3", "model.layers.%d.", st_gg_k3_glob, st_gg_k3_layer, NULL, NULL},
     {"inkling", "model.layers.%d.", st_gg_ink_glob, st_gg_ink_layer, NULL, NULL},
     {"inkling2", "model.llm.layers.%d.", st_gg_ink2_glob, st_gg_ink2_layer, NULL, NULL},
+    {"inkling2_clip", "model.visual.backbone.layers.%d.", st_gg_ink2v_glob, st_gg_ink2v_layer, NULL, "v.blk.%d.%n"},
     {"qwen_image", "transformer_blocks.%d.", st_gg_qimg_glob, st_gg_qimg_layer,
      "model.diffusion_model.", "transformer_blocks.%d.%n"},
     {"qwen3vl", "model.language_model.layers.%d.", st_gg_q3vl_glob, st_gg_q3vl_layer, NULL, NULL},
@@ -418,6 +442,7 @@ static const st_gg_map *st_gguf_map(const char *arch) {
  * engine reads its config from here or from the config.json the importer wrote. */
 static gguf_ctx st_gguf_meta;
 static gguf_ctx st_gguf_head;   /* gguf.json "dspark": a draft head's own GGUF, when there is one */
+static gguf_ctx st_gguf_vis;    /* gguf.json "mmproj": Inkling-2's vision tower, when there is one */
 static int st_gguf_active;
 
 static int st_gguf_dtype(int type) {
@@ -591,13 +616,14 @@ static int st_init_gguf(shards *S, const char *snap_dir) {
     char buf[16384]; size_t nb = fread(buf, 1, sizeof buf - 1, f); fclose(f); buf[nb] = 0;
     char *arena = NULL; jval *root = json_parse(buf, &arena);
     jval *gv = root ? json_get(root, "gguf") : NULL, *hv = root ? json_get(root, "dspark") : NULL;
-    jval *av = root ? json_get(root, "arch") : NULL;
+    jval *av = root ? json_get(root, "arch") : NULL, *mv = root ? json_get(root, "mmproj") : NULL;
     const char *g = gv && gv->t == J_STR ? gv->str : NULL;
     if (!g || !*g) coli_load_fail(COLI_LOAD_FAIL_FORMAT, "%s: no \"gguf\" path", gj);
-    char path[4096], hpath[4096] = "", jarch[64] = "";
+    char path[4096], hpath[4096] = "", jarch[64] = "", mpath[4096] = "";
     if (av && av->t == J_STR) snprintf(jarch, sizeof jarch, "%s", av->str);
     gguf_path_join(path, sizeof path, snap_dir, g);
     if (hv && hv->t == J_STR && hv->str[0]) gguf_path_join(hpath, sizeof hpath, snap_dir, hv->str);
+    if (mv && mv->t == J_STR && mv->str[0]) gguf_path_join(mpath, sizeof mpath, snap_dir, mv->str);
     free(arena);
     if (getenv("GGUF_CHECK")) gguf_header_only = 1;
     gguf_ctx *G = &st_gguf_meta;
@@ -623,6 +649,24 @@ static int st_init_gguf(shards *S, const char *snap_dir) {
         st_gguf_index(S, H, st_gguf_map("dflash"), hpath, ha, (int)stages - 1, &experts, &renamed, &kept);
         head = S->n - was;
     }
+    int vis = 0;
+    if (mpath[0] && arch && !strcmp(arch, "inkling2")) {   /* the vision tower's own file (the other engines read theirs) */
+        gguf_ctx *V = &st_gguf_vis;
+        if (gguf_open(V, mpath)) coli_load_fail(COLI_LOAD_FAIL_FORMAT, "GGUF %s: %s", mpath, V->err);
+        const char *va = gguf_get_str(V, "general.architecture"), *vp = gguf_get_str(V, "clip.projector_type");
+        if (!va || strcmp(va, "clip") || !vp || strcmp(vp, "inkling2"))
+            coli_load_fail(COLI_LOAD_FAIL_FORMAT, "%s: not Inkling-2's vision tower (architecture '%s', projector '%s')", mpath,
+                           va ? va : "?", vp ? vp : "?");
+        const int was = S->n;
+        if (S->n + V->n_tensors + 16 > S->cap) {
+            S->cap = S->n + V->n_tensors + 16;
+            st_tensor *t = (st_tensor *)realloc(S->t, (size_t)S->cap * sizeof(st_tensor));
+            if (!t) coli_load_fail(COLI_LOAD_FAIL_NOMEM, "out of memory indexing the GGUF");
+            S->t = t;
+        }
+        st_gguf_index(S, V, st_gguf_map("inkling2_clip"), mpath, va, 0, &experts, &renamed, &kept);
+        vis = S->n - was;
+    }
     S->hcap = 1; while (S->hcap < S->n * 2) S->hcap <<= 1;
     S->hidx = (int *)malloc((size_t)S->hcap * sizeof(int));
     if (!S->hidx) coli_load_fail(COLI_LOAD_FAIL_NOMEM, "out of memory indexing the GGUF");
@@ -639,6 +683,7 @@ static int st_init_gguf(shards *S, const char *snap_dir) {
             path, arch, G->n_files, S->n, renamed, experts,
             packed ? "matrices of the container's expert slots" : "fused expert tensors split", kept);
     if (head) fprintf(stderr, "[gguf] the DSpark head from %s: %d of those tensors\n", hpath, head);
+    if (vis) fprintf(stderr, "[gguf] the vision tower from %s: %d of those tensors\n", mpath, vis);
     return 1;
 }
 

@@ -1164,8 +1164,31 @@ DSPARK_PREFERENCE = ("Q8_0", "BF16")
 # LFM3-VL's vision tower and projector ship as their own GGUF (mmproj-*.gguf, arch clip, projector
 # lfm3vl): one next to the model is linked, the engine runs it through lfm3_vision.h.
 # Mistral-Large-4's Pixtral tower too (projector pixtral): mistral_vision.h, its geometry for the
-# gateway's tools/mistral_image.py in preprocessor_config.json beside the link.
-MMPROJ_PROJECTORS = {"lfm3": "lfm3vl", "mistral-large4": "pixtral"}
+# gateway's tools/mistral_image.py in preprocessor_config.json beside the link. Inkling-2's
+# (projector inkling2): st_gguf.h reads it under the checkpoint's model.visual.* names for
+# inkling2_vision.h, and its geometry goes in config.json's vision_config.
+MMPROJ_PROJECTORS = {"lfm3": "lfm3vl", "mistral-large4": "pixtral", "inkling2": "inkling2"}
+
+
+def write_inkling2_vision_config(out_dir, mmproj):
+    """config.json's vision_config, as Inkling-2's checkpoint has it, from the mmproj's numbers."""
+    with GGUFReader(mmproj) as r:
+        meta = r.metadata
+        shapes = {t["name"]: [int(x) for x in t["dims"]] for t in r.tensors}   # ggml's order: columns first
+    pos = shapes.get("v.position_embd.weight", [0, 32, 32])
+    vc = {"native_patch_size": int(meta["clip.vision.patch_size"]),
+          "adapter_merge_size": int(meta.get("clip.vision.projector.scale_factor", 2)),
+          "projection_hidden_dim": int(shapes["mm.up.weight"][1]),
+          "hidden_size": int(meta["clip.vision.embedding_length"]),
+          "num_hidden_layers": int(meta["clip.vision.block_count"]),
+          "num_attention_heads": int(meta["clip.vision.attention.head_count"]),
+          "intermediate_size": int(meta["clip.vision.feed_forward_length"]),
+          "posemb_grid_size": int(pos[-1]),
+          "layer_norm_eps": float("%.7g" % float(meta.get("clip.vision.attention.layer_norm_epsilon", 1e-5)))}   # f32's 1e-5
+    cfg_path = Path(out_dir) / "config.json"
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    cfg["vision_config"] = vc
+    cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
 
 
 def write_pixtral_preprocessor(out_dir, mmproj):
@@ -1778,9 +1801,9 @@ def main():
                          "(dspark-*.gguf, arch dflash), which drafts only when named")
     ap.add_argument("--no-mtp", action="store_true", help="qwen4exp, deepseek41: no draft head, plain decoding")
     ap.add_argument("--mmproj", type=Path, default=None,
-                    help="lfm3, mistral-large4: the vision tower's GGUF (mmproj-*.gguf), unset one next to the model (its folder, "
+                    help="lfm3, mistral-large4, inkling2: the vision tower's GGUF (mmproj-*.gguf), unset one next to the model (its folder, "
                          "then the parent; BF16 and F16 first)")
-    ap.add_argument("--no-mmproj", action="store_true", help="lfm3, mistral-large4: text only, no vision tower linked")
+    ap.add_argument("--no-mmproj", action="store_true", help="lfm3, mistral-large4, inkling2: text only, no vision tower linked")
     ap.add_argument("--text-encoder", type=Path, default=None,
                     help="Qwen-Image: the text encoder, a Qwen3-VL-8B-Instruct GGUF or an official Qwen-Image-2.1 folder; "
                          "unset, a Qwen3-VL-8B GGUF next to the denoiser (its folder, then the parent; UD-Q4_K_XL first)")
@@ -1877,6 +1900,8 @@ def main():
         print(f"  vision tower: {link.get('mmproj', 'none found next to the model (--mmproj names one): text only')}")
         if link.get("mmproj") and MMPROJ_PROJECTORS[arch] == "pixtral":
             write_pixtral_preprocessor(args.out, link["mmproj"])
+        if link.get("mmproj") and arch == "inkling2":
+            write_inkling2_vision_config(args.out, link["mmproj"])
     (args.out / "gguf.json").write_text(json.dumps(link, indent=1), encoding="utf-8")
     for r in readers:
         r.close()

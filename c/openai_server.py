@@ -1450,6 +1450,55 @@ def split_inkling2(text, keep_calls=False):
     return "".join(out), "".join(why)
 
 
+class InklingMarkerStrip:
+    """/v1/completions on Inkling and Inkling-2: the continuation as the model wrote it, every
+    part's text in its order (its reasoning, its answer, a call's JSON), only the markers
+    dropped (Inkling's _INK_MARKER, any <|...|> for Inkling-2). The chat splitters keep the
+    answer alone, so a raw prompt whose continuation reasoned or called a tool came back
+    empty. A marker split across chunks is held until it completes."""
+
+    def __init__(self, on_text, marker=None):
+        self.on_text = on_text
+        self.marker = marker or (_INK2_TOKEN if chat_flavor() == "inkling2" else _INK_MARKER)
+        self.buf = ""
+
+    def feed(self, piece):
+        self.buf += piece
+        out, pos = [], 0
+        for m in _INK2_TOKEN.finditer(self.buf):
+            out.append(self.buf[pos:m.start()])
+            if not self.marker.fullmatch(m.group(0)):
+                out.append(m.group(0))
+            pos = m.end()
+        rest = self.buf[pos:]
+        cut = rest.rfind("<")
+        if cut >= 0 and _INK2_PREFIX.match(rest, cut):
+            out.append(rest[:cut])
+            self.buf = rest[cut:]
+        else:
+            out.append(rest)
+            self.buf = ""
+        text = "".join(out)
+        if text:
+            self.on_text(text)
+
+    def close(self):
+        tail, self.buf = self.buf, ""
+        if tail:
+            self.on_text(tail)
+
+    finish = close
+
+
+def ink_completion_text(text):
+    """InklingMarkerStrip over a whole continuation."""
+    out = []
+    strip = InklingMarkerStrip(out.append)
+    strip.feed(text or "")
+    strip.close()
+    return "".join(out)
+
+
 def parse_inkling2_tool_calls(reply, tools=None):
     """The calls Inkling2StreamSplit left in the content as INK2_CALL_OPEN + JSON +
     INK2_CALL_CLOSE back into OpenAI tool_calls; the rest is the content. A call whose JSON
@@ -9942,8 +9991,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 raw_text = text
                 reasoning = ""
                 answer_spans = tool_spans = None
-                if ARCH == "inkling":
-                    text, reasoning = ink_split(text, tools if chat else None)
+                if ARCH == "inkling" and chat:
+                    text, reasoning = ink_split(text, tools)
+                elif ARCH == "inkling":
+                    text = ink_completion_text(text)
                 elif chat:
                     # #597 item 4: GLM emits reasoning then </think> then the answer. Route the
                     # reasoning to reasoning_content instead of dumping it (or the raw </think>)
@@ -10070,7 +10121,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 event([{"index": 0, "delta": {"reasoning_content": text},
                         "logprobs": None, "finish_reason": None}])
 
-            splitter = (ink_stream_split(emit, emit_reasoning if chat else None)
+            splitter = ((ink_stream_split(emit, emit_reasoning) if chat else InklingMarkerStrip(emit))
                         if ARCH == "inkling" else None)
             # #597 item 4: GLM (chat) streams reasoning then </think> then the answer. Split the
             # reasoning into reasoning_content deltas instead of leaking it — and the raw </think> —

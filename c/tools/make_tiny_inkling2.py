@@ -20,7 +20,13 @@ weights decoded to f32): the engine reading the container must reproduce it.
 --vision adds a tiny vision tower and one image among the prompt's tokens
 (Inkling2ForConditionalGeneration); the oracle carries the image's pixels.
 
+--mtp <snapshot> adds a random drafter to a snapshot this tool wrote: mtp/mtp.safetensors with the
+shapes of Inkling-2-Small's (DFlare layers over fused target layers, DSpark's rnn head) and the
+config's mtp_config. Its drafts are noise; the engine's tokens with INK2_MTP=1 must still be the
+oracle's (the verify keeps only what the target would have chosen).
+
 Usage: python3 make_tiny_inkling2.py <outdir> [--g64 | --vision]
+       python3 make_tiny_inkling2.py --mtp <snapshot>
        python3 make_tiny_inkling2.py --int4-ref <container> <snapshot> <outdir>
 """
 import glob
@@ -189,8 +195,52 @@ def int4_ref(container, snap, out):
     print(f"{n} expert tensors from {container}: oracle in {out}/ref_inkling2.json")
 
 
+def add_mtp(snap):
+    """A random drafter beside the snapshot (see --mtp)."""
+    from safetensors.numpy import save_file
+    with open(os.path.join(snap, "config.json")) as f:
+        cfg = json.load(f)
+    D, V, NL = cfg["hidden_size"], cfg["vocab_size"], cfg["num_hidden_layers"]
+    mc = {"hidden_size": D, "num_hidden_layers": 3, "num_attention_heads": 4, "num_key_value_heads": 2,
+          "head_dim": 16, "intermediate_size": 96, "rms_norm_eps": 1e-6, "rope_theta": 10000.0,
+          "local_layer_ids": [0, 2], "sliding_window_size": 8, "block_size": 4, "markov_rank": 8,
+          "markov_head_type": "rnn_hidden", "target_layer_ids": [2, 5, 8, NL]}
+    L, H, KV, hd, I, R = (mc[k] for k in ("num_hidden_layers", "num_attention_heads", "num_key_value_heads",
+                                          "head_dim", "intermediate_size", "markov_rank"))
+    rng = np.random.default_rng(5)
+    mat = lambda *shape: (0.2 * rng.standard_normal(shape)).astype(np.float32)
+    gain = lambda n: (1.0 + 0.2 * rng.standard_normal(n)).astype(np.float32)
+    t = {"fuse_weight": mat(L + 1, len(mc["target_layer_ids"])), "mask_embed": mat(D), "norm.weight": gain(D),
+         "markov_head.dflare_norm.weight": gain(D), "markov_head.markov_w1.weight": mat(V, R),
+         "markov_head.rnn_proj.weight": mat(3 * R, 2 * R + 2 * D), "markov_head.rnn_proj.bias": mat(3 * R),
+         "markov_head.hidden_out.weight": mat(D, R), "markov_head.hidden_out.bias": mat(D)}
+    for i in range(L):
+        p = f"layers.{i}."
+        for n in ("dflare_norm", "input_layernorm", "post_attention_layernorm"):
+            t[p + n + ".weight"] = gain(D)
+        for n in ("q_norm", "k_norm", "k_norm_ctx"):
+            t[p + "self_attn." + n + ".weight"] = gain(hd)
+        t[p + "self_attn.q_proj.weight"] = mat(H * hd, D)
+        for n in ("k_proj", "v_proj", "k_proj_ctx", "v_proj_ctx"):
+            t[p + "self_attn." + n + ".weight"] = mat(KV * hd, D)
+        t[p + "self_attn.o_proj.weight"] = mat(D, H * hd)
+        t[p + "mlp.gate_proj.weight"], t[p + "mlp.up_proj.weight"] = mat(I, D), mat(I, D)
+        t[p + "mlp.down_proj.weight"] = mat(D, I)
+    os.makedirs(os.path.join(snap, "mtp"), exist_ok=True)
+    save_file(t, os.path.join(snap, "mtp", "mtp.safetensors"), metadata={"format": "pt"})
+    cfg["mtp_config"] = mc
+    with open(os.path.join(snap, "config.json"), "w") as f:
+        json.dump(cfg, f, indent=2)
+    print(f"a random drafter in {snap}/mtp/ ({L} layers, blocks of {mc['block_size']})")
+
+
 def main():
     a = sys.argv[1:]
+    if a and a[0] == "--mtp":
+        if len(a) != 2:
+            sys.exit(__doc__)
+        add_mtp(a[1])
+        return
     if a and a[0] == "--int4-ref":
         if len(a) != 4:
             sys.exit(__doc__)

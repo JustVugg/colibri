@@ -169,6 +169,24 @@ class ToolCallingInkling2E2E(unittest.TestCase):
         self.assertEqual([(b["name"], b["input"]) for b in uses], [("get_weather", {"city": "Rome"})])
         self.assertEqual(out["stop_reason"], "tool_use")
 
+    def test_completions_keep_every_part(self):
+        # a raw prompt: the continuation's reasoning and call are text, the markers dropped
+        # (the chat split kept the answer alone, so this came back empty)
+        want = 'I should look it up.get_weather{"name":"get_weather","args":{"city":"Rome"}}'
+        body = {"model": self.model_id(), "prompt": "weather in Rome?", "max_tokens": 64}
+        self.assertEqual(self.post(body, "/completions")["choices"][0]["text"], want)
+        req = urllib.request.Request(self.base + "/completions", json.dumps(dict(body, stream=True)).encode(),
+                                     {"Content-Type": "application/json"})
+        text = ""
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            for raw in resp:
+                line = raw.decode().strip()
+                if line.startswith("data: {"):
+                    text += "".join(c.get("text") or "" for c in json.loads(line[6:])["choices"])
+        self.assertEqual(text, want)
+        plain = self.post({"model": self.model_id(), "prompt": "hello", "max_tokens": 64}, "/completions")
+        self.assertEqual(plain["choices"][0]["text"], "Hello from the mock Inkling-2 engine.")
+
     def test_no_tools_plain_text(self):
         out = self.post({"model": self.model_id(), "messages": [{"role": "user", "content": "hello"}],
                          "temperature": 0, "max_tokens": 64})

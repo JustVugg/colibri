@@ -1818,6 +1818,19 @@ jobs:
           for cap in 1 8; do
             SNAP=tiny_vis ./inkling "$cap" 0 tiny_vis/ref_inkling2.json
           done
+      - name: Inkling-2's drafter (INK2_MTP) keeps the oracle's tokens
+        run: |
+          cd c
+          # A random drafter beside the tiny model: its drafts are noise, so the verify rejects
+          # them and the state rolls back every step; then the oracle's own tokens as drafts, one
+          # changed on most steps (INK2_MTP_ORACLE), so that it keeps all, some or none of a block.
+          # Either way the tokens are the oracle's.
+          python3 tools/make_tiny_inkling2.py --mtp tiny_inkling2
+          for k in 1 3; do
+            INK2_MTP=1 INK2_MTP_K=$k SNAP=tiny_inkling2 ./inkling 8 0 tiny_inkling2/ref_inkling2.json
+            INK2_MTP=1 INK2_MTP_K=$k INK2_MTP_ORACLE=1 SNAP=tiny_inkling2 ./inkling 8 0 tiny_inkling2/ref_inkling2.json
+          done
+          INK2_MTP=1 INK2_MTP_ORACLE=1 SNAP=tiny_inkling2 ./inkling 1 0 tiny_inkling2/ref_inkling2.json
       - name: An Inkling-2 GGUF as unsloth's lay it out reads as the checkpoint it came from
         run: |
           cd c
