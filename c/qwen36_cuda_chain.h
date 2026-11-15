@@ -1396,7 +1396,9 @@ static void q36cc_kv_down(Q36CChain *ch, Model *m, int i, int n, int pb) {
 /* The host pool follows the residents (qt_chain_host_follow) before a prompt chunk of
  * Q36CC_FOLLOW_ROWS rows or more: the experts that left the card join it, those that came in
  * leave it, or a layer holding one that left goes to the host's step whole. A smaller chunk
- * leaves it behind for the next large one. On the Colab T4 high-RAM VM of the measures
+ * leaves it behind for the next large one. Where the warm start pooled every expert, the
+ * residents' too (qt_chain_host_all), the follow does nothing: an expert that left is in the
+ * pool already, and the staged table follows the residents by the tier's epoch. On the Colab T4 high-RAM VM of the measures
  * (docs/experiments/qwen36-cuda-host-pool-follow-2026-10-26) a follow costs about 0.3 ms an
  * expert moved. On another VM of the same shape an earlier version, which followed before
  * every chunk of more than 32 rows, moved 317 + 317 experts in 193 ms before a 36-row chunk
