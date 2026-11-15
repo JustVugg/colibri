@@ -562,6 +562,29 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   the cache itself. The plan reserves olmoe.c's 0.5 GB and still the KV of the planned context:
   `coli plan` and `coli doctor` show, and `coli tune` starts from, the cache olmoe keeps at a full
   context, which is the KV's worth of slots below the size it starts with.
+- **DeepSeek V4.1's candidate blocks cost the square of the context** (a 262144-token prompt
+  allocated 64 GiB). The candidate source layer published the blocks it keeps as a dense mask,
+  one byte per compressed position per query row, and the layers after it read one bit of it: at
+  ratio 1 that is `n²` bytes. It now publishes the blocks themselves -- `rows ×
+  candidate_topk_blocks` int32 ids in the source's own coordinates, `-1` past the ones a row
+  keeps (`cross_layer.py`'s `block_candidate_idxs` in DI), with the same reach kept as the paint
+  bound. 2 GiB at 262144 tokens instead of 64 GiB (that is the prompt's rows, as the mask was;
+  `v41_take_tail` then keeps only 19.8 MB of ids live, and the allocation stays the prompt's),
+  and 320 B instead of 1600 B on a `--prompt-len 40` fixture (`dsv41_long`). The reallocation
+  went with the reach, not the rows: the mask grew every token at ratio 1, the ids do not follow
+  the reach (a plain decode allocates at the prompt and once at its first token; a speculative
+  step resizes it to its batch's rows, and the plain step after it back to one). The bits a reader
+  consults are unchanged: a row's ids name the blocks its mask held, and where a repainted row the
+  chain's device wrote differs it does so past the chunk's reach, where the score is already
+  `-inf`; `c/tests/test_dsv41_candidate_ids.c` holds the selection and the repaint against a
+  frozen copy of the pre-change writer, on 11,760 cases (2,464 of them sensitive to a stale
+  padding slot), and pins the extraction's truncation fallback (more set blocks than slots,
+  which no writer produces: the first topk in block order, every slot written). A conversation
+  reset and a prefix-store take now drop the blocks too, as they already dropped the shared
+  top-k list: the rows a reset keeps apart were saved by park first, and a new conversation
+  no longer holds the last one's allocation (2 GiB at 262144) live. The device masks the
+  chain still paints stay dense (a separate change), and so does allocating the prompt's
+  rows rather than the tail's (2 GiB to 19.8 MB at 262144), which is named there.
 - **CUDA on Windows: the answer stopped a few tokens in with the card at 100%** (#2696). Windows'
   WDDM driver model, which WSL2 drives the card through too, holds CUDA launches back and sends
   them in batches. A hybrid step (a layer whose experts are partly in RAM) has the card signal the
