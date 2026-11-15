@@ -775,6 +775,8 @@ static const ColiEnvVar coli_env_table[] = {
     {"Q36_MTP_VOCAB_IDS", CE_STR, CE_QWEN, 0, NULL},
     {"Q36_MUX_ROWS", CE_INT, CE_QWEN, 0, NULL},
     {"Q36_OFFER_SHEXP", CE_STR, CE_QWEN, 0, NULL},
+    {"Q36_PRELOAD", CE_INT, CE_QWEN, 0, NULL},
+    {"Q36_PRELOAD_THREADS", CE_INT, CE_QWEN, 0, NULL},
     {"Q36_VIS_DUMP", CE_STR, CE_QWEN, 0, NULL},
     {"Q38_ACT_COV", CE_STR, CE_QWEN38, 0, NULL},
     {"Q38_ACT_DUMP", CE_STR, CE_QWEN38, 0, NULL},

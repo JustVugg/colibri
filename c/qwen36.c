@@ -64,6 +64,10 @@ static int qwen36_max_ctx(void) {
 }
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/resource.h>
+#ifdef __linux__
+#include <sched.h>
+#include <sys/syscall.h>   /* the preload workers' own priority (q36_preload_worker) */
+#endif
 #include <unistd.h>
 #endif
 #include "cpu_check.h"   /* the processor runs what this build assumes, or it says so (#1979) */
@@ -5703,10 +5707,34 @@ static void ehit_mark(Model *m, int layer, int eid){
 }
 /* hold=1 marks the slot busy before the lock drops, so nothing can evict it
  * between this lookup and the caller's slot_release. */
+/* ---- Background preload (Q36_PRELOAD=1) -----------------------------------
+ * A cache with a slot for every expert still fills on demand: an expert's
+ * first use reads and unpacks it on the engine's thread, in the middle of a
+ * token. Measured on 2x Xeon E5-2670 with every expert in the page cache:
+ * the routed-expert phase fell from 455 to 57 ms/token over the first ~700
+ * tokens of a fresh server and was still falling. With Q36_PRELOAD=1, loader
+ * threads fill the free slots of every layer at startup, in file order, at
+ * low priority, while the server already answers. They only take free slots
+ * (never evict), and an expert is loaded once: the engine waits for a preload
+ * of the expert it wants (g_pl_busy), and the loaders skip the one the engine
+ * is reading (g_pl_engine). Placement only: the bytes a slot holds are
+ * load_expert_merged's either way. q36_preload_start says where it runs. */
+#define Q36_PL_MAX 16
+static int g_pl_on = 0, g_pl_threads = 0;
+static struct { int layer, eid; } g_pl_busy[Q36_PL_MAX], g_pl_engine = { -1, -1 };   /* under g_pilot_mx */
+static int pl_busy_locked(int layer, int eid) {
+    for (int i = 0; i < g_pl_threads; i++) if (g_pl_busy[i].layer == layer && g_pl_busy[i].eid == eid) return 1;
+    return 0;
+}
 static void expert_fetch(Model *m, int layer, int eid, Slot **out, int hold) {
     ehit_mark(m, layer, eid);   /* tocca solo m->ehit[layer][eid] */
     LCache *lc = &m->cache[layer];
     pthread_mutex_lock(&g_pilot_mx);
+    while (g_pl_on && pl_busy_locked(layer, eid)) {   /* a loader is reading this very expert: take its copy */
+        pthread_mutex_unlock(&g_pilot_mx);
+        usleep(100);
+        pthread_mutex_lock(&g_pilot_mx);
+    }
     Slot *hit = slot_indexed(m, layer, eid);
     if (hit) {
         m->hits++; hit->used = ++m->clock; *out = hit;
@@ -5750,6 +5778,7 @@ static void expert_fetch(Model *m, int layer, int eid, Slot **out, int hold) {
         if (vkt_ram_first(layer, s->eid)) vkt_ram_gave();
     }
     cache_hide(m, layer, s); s->used = ++m->clock;
+    g_pl_engine.layer = layer; g_pl_engine.eid = eid;
     pthread_mutex_unlock(&g_pilot_mx);
     double t_read0 = now_s();
     load_expert_merged(m, layer, eid, s);
@@ -5757,8 +5786,88 @@ static void expert_fetch(Model *m, int layer, int eid, Slot **out, int hold) {
     pthread_mutex_lock(&g_pilot_mx);
     m->t_disk += t_read;        /* sotto lock: qui arrivano anche i thread del PILOT */
     cache_publish(m, layer, s, eid); s->pinned = m->is_pinned[layer * c->n_experts + eid]; s->used = ++m->clock;
+    g_pl_engine.layer = -1; g_pl_engine.eid = -1;
     if (hold) slot_hold(s);
     *out = s; pthread_mutex_unlock(&g_pilot_mx);
+}
+static Model *g_pl_m; static int g_pl_next = 0, g_pl_done = 0, g_pl_loaded = 0; static double g_pl_t0;
+static void *q36_preload_worker(void *arg) {
+    int me = (int)(intptr_t)arg; Model *m = g_pl_m; Cfg *c = &m->c;
+#if defined(__linux__) && defined(CPU_SETSIZE)   /* as omp_tune.h: only where the including source asked for the GNU names */
+    {   /* the engine's thread is bound to one core (OMP_PROC_BIND): do not inherit that, and stay out of its way */
+        cpu_set_t all; CPU_ZERO(&all);
+        long n = sysconf(_SC_NPROCESSORS_ONLN); if (n > CPU_SETSIZE) n = CPU_SETSIZE;
+        for (long i = 0; i < n; i++) CPU_SET((int)i, &all);
+        sched_setaffinity(0, sizeof all, &all);
+#ifdef SYS_gettid
+        setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 19);
+#endif
+    }
+#endif
+#ifdef _OPENMP
+    omp_set_num_threads(1);   /* load_expert_merged's parallel loops: no second team beside the engine's */
+#endif
+    const int total = c->n_layers * c->n_experts;
+    for (;;) {
+        int w = __atomic_fetch_add(&g_pl_next, 1, __ATOMIC_ACQ_REL);
+        if (w >= total) break;
+        int layer = w / c->n_experts, eid = w % c->n_experts;
+        if (c->dense_layer && c->dense_layer[layer]) continue;
+        LCache *lc = &m->cache[layer];
+        pthread_mutex_lock(&g_pilot_mx);
+        if (lc->n >= lc->cap || slot_indexed(m, layer, eid) || pl_busy_locked(layer, eid) ||
+            (g_pl_engine.layer == layer && g_pl_engine.eid == eid)) { pthread_mutex_unlock(&g_pilot_mx); continue; }
+        Slot *s = &lc->slots[lc->n++]; slot_ensure_allocated(m, s);
+        cache_hide(m, layer, s); s->used = 0;          /* never used yet: the first to go if the cache must evict */
+        g_pl_busy[me].layer = layer; g_pl_busy[me].eid = eid;
+        pthread_mutex_unlock(&g_pilot_mx);
+        load_expert_merged(m, layer, eid, s);
+        pthread_mutex_lock(&g_pilot_mx);
+        cache_publish(m, layer, s, eid); s->pinned = m->is_pinned[layer * c->n_experts + eid];
+        g_pl_busy[me].layer = -1; g_pl_busy[me].eid = -1; g_pl_loaded++;
+        pthread_mutex_unlock(&g_pilot_mx);
+    }
+    if (__atomic_add_fetch(&g_pl_done, 1, __ATOMIC_ACQ_REL) == g_pl_threads)
+        fprintf(stderr, "[qwen36] preload: %d experts loaded in %.1f s, RSS %.2f GB\n", g_pl_loaded, now_s() - g_pl_t0, rss_gb());
+    return NULL;
+}
+static void q36_preload_start(Model *m) {
+    const char *e = getenv("Q36_PRELOAD");
+    if (!e || *e != '1' || m->c.n_experts == 0) return;
+    {   /* the CPU's cache of a safetensors container only: what was measured. A device tier keeps
+         * pointers into the slots or copies of them, the Metal graph reads its own records, PILOT's
+         * worker loads experts itself, and a GGUF's slots take another path through the loader. */
+        int dev = qt_ready();
+#ifdef COLI_VULKAN
+        dev = dev || g_vk_ready;
+#endif
+        if (dev || QWEN_GRAPH(m) || g_pilot || g_gguf) {
+            fprintf(stderr, "[qwen36] preload: Q36_PRELOAD=1 is for the CPU expert cache of a safetensors container (no device tier, no PILOT): off\n");
+            return;
+        }
+    }
+    int nt = getenv("Q36_PRELOAD_THREADS") ? atoi(getenv("Q36_PRELOAD_THREADS")) : 4;
+    if (nt < 1) nt = 1; if (nt > Q36_PL_MAX) nt = Q36_PL_MAX;
+    for (int i = 0; i < Q36_PL_MAX; i++) { g_pl_busy[i].layer = -1; g_pl_busy[i].eid = -1; }
+    /* The slots' buffers are allocated here, on the engine's thread, and the loaders only fill
+     * them. A loader that allocates takes the buffer from its own thread's malloc arena, and with
+     * four loaders that cost the routed experts 5 ms a token for as long as the server ran (41.3
+     * against 36.3 ms, three runs each on 2x Xeon E5-2670; one or two loaders, or one arena, did
+     * not show it, and neither page migration nor the buffers' alignment explains it). Untouched
+     * memory is address space only: a slot the loaders never reach costs nothing. */
+    for (int l = 0; l < m->c.n_layers; l++) {
+        if (m->c.dense_layer && m->c.dense_layer[l]) continue;
+        LCache *lc = &m->cache[l];
+        for (int i = lc->n; i < lc->cap; i++) slot_ensure_allocated(m, &lc->slots[i]);
+    }
+    g_pl_m = m; g_pl_t0 = now_s();
+    pthread_mutex_lock(&g_pilot_mx); g_pl_threads = nt; g_pl_on = 1; pthread_mutex_unlock(&g_pilot_mx);
+    fprintf(stderr, "[qwen36] preload: filling the expert cache in the background (%d threads, Q36_PRELOAD=0 to skip)\n", nt);
+    for (int i = 0; i < nt; i++) {
+        pthread_t t;
+        if (pthread_create(&t, NULL, q36_preload_worker, (void *)(intptr_t)i) != 0) { __atomic_add_fetch(&g_pl_done, 1, __ATOMIC_ACQ_REL); continue; }
+        pthread_detach(t);
+    }
 }
 static void expert_get(Model *m, int layer, int eid, Slot **out) { expert_fetch(m, layer, eid, out, 0); }
 /* expert_get for a caller that computes from the slot after the lock drops:
@@ -11956,6 +12065,7 @@ int main(int argc, char **argv) {
     }
     if (getenv("SERVE") && getenv("SERVE")[0] == '1') {
         if (!g_tok) { fprintf(stderr, "[serve] tokenizer.json required (put in SNAP or set TOK)\n"); return 1; }
+        q36_preload_start(&m);
         serve_loop(&m);
         return 0;
     }
