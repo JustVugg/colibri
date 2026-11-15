@@ -2961,17 +2961,23 @@ class LoaderPreInitAvailabilityTest(unittest.TestCase):
         self.assertEqual(out.get("backend_loaded"), "0", detail)
         self.assertEqual(out.get("loader_init"), "0", detail)
 
-    def test_the_probe_falls_back_for_a_dll_without_the_export(self):
-        """An older DLL answers through device_count(), not through a crash."""
+    def test_the_probe_names_a_dll_without_the_export(self):
+        """An older DLL answers 0 and says why, not through a crash (#1542).
+
+        device_count() counts the contexts init made, so before init it was 0
+        on a real DLL whatever the fake here returns: the fallback chose the
+        CPU without a word. The message names the export and the two ways out.
+        """
         f = self.fixture
         proc, out = self._probe("probe_older_dll", vendor="cuda",
                                 backend_override=f.cuda_backend_old)
         detail = self._detail(proc)
         self.assertEqual(proc.returncode, 0, "harness failed" + detail)
         self.assertEqual(out.get("backend_loaded_after_probe"), "1", detail)
-        self.assertEqual(out.get("available_before_init"),
-                         str(_DEVICE_COUNT_PROBE),
-                         "the fallback did not reach device_count()" + detail)
+        self.assertEqual(out.get("available_before_init"), "0", detail)
+        err = proc.stderr or ""
+        self.assertIn("missing symbol coli_cuda_available_device_count", err, detail)
+        self.assertIn("COLI_GPUS", err, detail)
 
     def test_the_probe_keeps_the_hip_refusal_before_init(self):
         """A HIP host still refuses without a runtime directory, before init.

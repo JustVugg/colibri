@@ -16,9 +16,13 @@
 // The softmax runs online over tiles of 128 positions, as chain_attn.comp's does; the
 // CPU normalizes first, so the two agree to rounding.
 // Limits: hd <= 256 (two dims per thread), d_rel <= 64.
+// has_sink (Inkling-2): a sink logit per (row, head) in the tau buffer at
+// sink_off + s*H + h, which joins the softmax's denominator only: the online softmax starts
+// from it (m = sink, l = 1), as attention's CPU loop starts its maximum and sum there.
 // s0 (the last push constant, 0 for a whole step): the step's row of this dispatch's
 // first row, when vk_chain.c cuts a prompt chunk's rows over several submissions; q, o,
-// r and tau's offsets then point at that row, pos_base stays the step's first position.
+// r, tau's and the sinks' offsets then point at that row, pos_base stays the step's first
+// position.
 layout(local_size_x = 128) in;
 
 layout(std430, binding = 0) readonly buffer QB { float q[]; };
@@ -36,6 +40,7 @@ layout(push_constant) uniform P {
     int k_off, v_off, ks_off, vs_off, kv_row;
     int r_off, r_row, relp_off, tau_off;
     float scale;
+    int has_sink, sink_off;
     int s0;
 } p;
 
@@ -58,6 +63,7 @@ void main() {
     float ts = tau[p.tau_off + s];
     barrier();
     float m = -3.0e38, l = 0.0, acc0 = 0.0, acc1 = 0.0;
+    if (p.has_sink != 0) { m = tau[p.sink_off + s * p.H + h]; l = 1.0; }
     for (int b0 = 0; b0 < n; b0 += 128) {
         int i = b0 + tid;
         float sv = -3.0e38;

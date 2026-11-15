@@ -84,6 +84,17 @@ class OpenMPTeamSizingWiringTest(unittest.TestCase):
                 self.assertTrue("omp_set_num_threads" in source,
                                 f"{name} neither calls the shared helper nor sets a team")
 
+    def test_v41_expert_reads_run_at_the_team_width(self):
+        """expert_fetch's region must not ask for fewer threads than the other regions: a narrower
+        team makes libgomp retire and respawn pool threads on every call (a thread-local buffer
+        per worker leaked that way). The readers are capped by a counter, not by the team size."""
+        source = strip_comments((ROOT / "deepseek_v41.c").read_text(encoding="utf-8"))
+        body = source[source.index("static void expert_fetch("):]
+        pragma = re.search(r"#pragma omp parallel[^\n]*", body).group(0)
+        self.assertTrue("num_threads(team)" in pragma, "expert_fetch's region is not at the team width")
+        self.assertTrue("omp_get_max_threads()" in body[:body.index(pragma)])
+        self.assertTrue("__atomic_fetch_add(&next_read" in body, "the readers are not capped by a counter")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,8 +3,8 @@
 A client's title or summary request between two turns of a conversation (Hermes asks for the
 title after the first) shares a few tokens with the conversation and wrote its rows over the
 slot's from there: the conversation's next turn read everything again. The slot's first rows
-are parked for it (park.h) and come back with the next request: the conversation continues
-from the whole prefix it held, and both answer as a cold engine does.
+are parked for it (park.h), and the next request decides (#2703): back, kept or dropped. The
+conversation continues from the whole prefix it held, and both answer as a cold engine does.
 
 Through the multiplexed protocol the gateway speaks (SERVE=1 SERVE_BATCH=1, one KV slot),
 against the tiny GLM oracle model (tools/make_glm_oracle.py), with the byte-level tokenizer
@@ -72,6 +72,40 @@ class GlmParkTest(unittest.TestCase):
         self.assertIn("conversation is back", log, "the parked conversation did not come back:\n" + log)
         self.assertEqual(side, self.cold(self.SIDE), "the short request answered otherwise beside a parked conversation")
         self.assertEqual(got, self.cold(self.SECOND), "the conversation answered otherwise after it was parked")
+        held = [(int(m.group(1)), int(m.group(2))) for m in SLOT_PREFIX.finditer(log)]
+        self.assertGreaterEqual(held[-1][0], held[0][1], "the next turn read the parked conversation again:\n" + log)
+
+    def test_a_new_shorter_conversation_keeps_its_own_state(self):
+        """#2703: a new conversation shorter than the last parks it; the conversation's fate is the
+        next request's to decide, so the new one's second turn continues from its own first turn
+        instead of the old conversation brought back after it, and answers as a cold engine does."""
+        new = b"Five times five is twenty-five, and six times six is"
+        new2 = new + b" thirty-six. Seven times seven is"
+        engine = self.spawn(COLI_PARK_MIN="16")
+        engine.ask("1", self.OPENING + b" Spain is Madrid, and the capital of Germany is")
+        engine.ask("2", new)
+        got = engine.ask("3", new2, max_tok=8)
+        log = engine.close()
+        self.assertIn("conversation parked for a", log, "the shorter conversation did not park the old one:\n" + log)
+        self.assertNotIn("conversation is back", log, "the old conversation came back after the new one's turn:\n" + log)
+        self.assertEqual(got, self.cold(new2), "the new conversation's second turn answered otherwise")
+        held = [(int(m.group(1)), int(m.group(2))) for m in SLOT_PREFIX.finditer(log)]
+        self.assertGreaterEqual(held[-1][0], len(new) // 2, "the new conversation's second turn read its first again:\n" + log)
+
+    def test_two_short_requests_keep_the_conversation_parked(self):
+        """A second short request that fits the rows kept apart leaves the conversation parked; the
+        conversation's next turn brings it back whole and answers as a cold engine does."""
+        side2 = b"Five plus five is"   # its start is the first short request's, not the conversation's
+        engine = self.spawn(COLI_PARK_MIN="16")
+        engine.ask("1", self.OPENING)
+        engine.ask("2", self.SIDE, max_tok=8)
+        aside = engine.ask("3", side2, max_tok=8)
+        got = engine.ask("4", self.SECOND, max_tok=8)
+        log = engine.close()
+        self.assertIn("conversation stays parked", log, "the second short request did not keep it parked:\n" + log)
+        self.assertEqual(log.count("conversation is back"), 1, "the conversation did not come back once:\n" + log)
+        self.assertEqual(aside, self.cold(side2), "the second short request answered otherwise")
+        self.assertEqual(got, self.cold(self.SECOND), "the conversation answered otherwise after two short requests")
         held = [(int(m.group(1)), int(m.group(2))) for m in SLOT_PREFIX.finditer(log)]
         self.assertGreaterEqual(held[-1][0], held[0][1], "the next turn read the parked conversation again:\n" + log)
 

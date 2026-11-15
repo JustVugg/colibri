@@ -50,7 +50,7 @@ def blocks(name, shape, rng, std=0.02):
     return raw.reshape(*shape[:-1], nb * size)
 
 
-def write_model(path, rng, dense=False, same_gate_up=False, token=None, ollama=False):
+def write_model(path, rng, dense=False, same_gate_up=False, token=None, ollama=False, dn_types=None, mtp=False, mtp_file=None):
     """dense: llama.cpp's qwen35 (a dense model of the family): an MLP per layer instead of the
     experts, and no output.weight (the head tied to token_embd), as the small checkpoints ship.
     same_gate_up: every layer's expert up in its gate's type (layer 0 IQ2_XXS, the others
@@ -59,19 +59,34 @@ def write_model(path, rng, dense=False, same_gate_up=False, token=None, ollama=F
     an array per layer (0 on the DeltaNet layers), rope.dimension_sections of three, the flags
     ssm.v_head_reordered and rope.mrope_interleaved, the DeltaNet's dt bias named ssm_dt, the
     shared expert's gate as F16 of shape [H, 1], and the MTP head (mtp.*) and the vision tower
-    (v.*) in the model's file. The same weights as without."""
+    (v.*) in the model's file. The same weights as without.
+    dn_types: {layer: (qkv's type, the gate's)} for DeltaNet layers, Q8_0 for both elsewhere: a
+    layer of two types is how unsloth's dynamic mixes ship about half of Qwen3.8-27B's.
+    mtp (dense): the checkpoint's MTP head as llama.cpp writes it, one more layer (blk.LAYERS) with
+    nextn_predict_layers 1: a full-attention layer with its MLP, nextn.eh_proj and the nextn
+    norms, in the types unsloth's Qwen3.8-27B files give them (norms stored as 1 + w).
+    mtp_file (with mtp): that head in a file of its own instead, as unsloth's Dynamic v3.1 files ship
+    it (MTP/mtp-*.gguf: the same architecture, block_count one more and nextn_predict_layers 1, the
+    layer's tensors only); the model's file then has neither the layer nor the key. The same
+    weights as with the head inside."""
     arch = "qwen35" if dense else "qwen35moe"
     w = gguf.GGUFWriter(str(path), arch)
+    hw = gguf.GGUFWriter(str(mtp_file), arch) if mtp and mtp_file else None
     p = arch + "."
     moe = (("feed_forward_length", I),) if dense else \
         (("expert_count", E), ("expert_used_count", TOPK), ("expert_feed_forward_length", I), ("expert_shared_feed_forward_length", I))
-    for k, v in (("block_count", LAYERS), ("embedding_length", H), ("attention.head_count", QH),
-                 *(() if ollama else (("attention.head_count_kv", KVH),)), ("attention.key_length", HD), ("attention.value_length", HD),
-                 *moe, ("full_attention_interval", 4),
-                 ("rope.dimension_count", HD // 4), ("ssm.conv_kernel", 4), ("ssm.state_size", KD),
-                 ("ssm.group_count", KH), ("ssm.time_step_rank", VH), ("ssm.inner_size", VH * KD),
-                 ("context_length", 4096)):
-        w.add_uint32(p + k, v)
+    for wr, inside in ((w, mtp and hw is None), (hw, True)):
+        if wr is None:
+            continue
+        if inside:
+            wr.add_uint32(p + "nextn_predict_layers", 1)
+        for k, v in (("block_count", LAYERS + (1 if inside else 0)), ("embedding_length", H), ("attention.head_count", QH),
+                     *(() if ollama else (("attention.head_count_kv", KVH),)), ("attention.key_length", HD), ("attention.value_length", HD),
+                     *moe, ("full_attention_interval", 4),
+                     ("rope.dimension_count", HD // 4), ("ssm.conv_kernel", 4), ("ssm.state_size", KD),
+                     ("ssm.group_count", KH), ("ssm.time_step_rank", VH), ("ssm.inner_size", VH * KD),
+                     ("context_length", 4096)):
+            wr.add_uint32(p + k, v)
     if ollama:
         w.add_array(p + "attention.head_count_kv", [KVH if (L + 1) % 4 == 0 else 0 for L in range(LAYERS)])
         w.add_array(p + "rope.dimension_sections", [HD // 16, HD // 16, HD // 8])
@@ -114,12 +129,27 @@ def write_model(path, rng, dense=False, same_gate_up=False, token=None, ollama=F
             q(b + "attn_v.weight", (KVH * HD, H), "Q8_0"); q(b + "attn_output.weight", (H, QH * HD), "Q8_0")
             w.add_tensor(b + "attn_q_norm.weight", np.ones(HD, np.float32)); w.add_tensor(b + "attn_k_norm.weight", np.ones(HD, np.float32))
         else:
-            q(b + "attn_qkv.weight", (conv, H), "Q8_0"); q(b + "attn_gate.weight", (VH * KD, H), "Q8_0")
+            qkv_t, gate_t = (dn_types or {}).get(L, ("Q8_0", "Q8_0"))
+            q(b + "attn_qkv.weight", (conv, H), qkv_t); q(b + "attn_gate.weight", (VH * KD, H), gate_t)
             w.add_tensor(b + "ssm_a", -np.exp(rng.standard_normal(VH).astype(np.float32) * 0.1))
             f32(b + "ssm_alpha.weight", (VH, H)); f32(b + "ssm_beta.weight", (VH, H))
             f32(b + "ssm_conv1d.weight", (conv, 4)); w.add_tensor(b + ("ssm_dt" if ollama else "ssm_dt.bias"), np.zeros(VH, np.float32))
             w.add_tensor(b + "ssm_norm.weight", np.ones(KD, np.float32))
             q(b + "ssm_out.weight", (H, VH * KD), "Q8_0")
+    if mtp:   # llama.cpp's nextn layer
+        b = f"blk.{LAYERS}."
+        o = hw or w
+        def norm(name, n): o.add_tensor(name, (1 + rng.standard_normal(n) * 0.1).astype(np.float32))
+        def qh(name, shape, t): o.add_tensor(name, blocks(t, shape, rng), raw_dtype=QT[t])
+        norm(b + "attn_norm.weight", H); norm(b + "post_attention_norm.weight", H)
+        norm(b + "attn_q_norm.weight", HD); norm(b + "attn_k_norm.weight", HD)
+        qh(b + "attn_q.weight", (QH * HD * 2, H), "Q6_K"); qh(b + "attn_k.weight", (KVH * HD, H), "Q8_0")
+        qh(b + "attn_v.weight", (KVH * HD, H), "Q8_0"); qh(b + "attn_output.weight", (H, QH * HD), "Q6_K")
+        qh(b + "ffn_gate.weight", (I, H), "Q6_K"); qh(b + "ffn_up.weight", (I, H), "Q6_K"); qh(b + "ffn_down.weight", (H, I), "Q6_K")
+        qh(b + "nextn.eh_proj.weight", (H, 2 * H), "Q6_K")
+        norm(b + "nextn.enorm.weight", H); norm(b + "nextn.hnorm.weight", H); norm(b + "nextn.shared_head_norm.weight", H)
+        if hw is not None:
+            hw.write_header_to_file(); hw.write_kv_data_to_file(); hw.write_tensors_to_file(); hw.close()
     if ollama:   # the MTP head and the vision tower, in the model's file
         f32("mtp.fc.weight", (H, 2 * H)); f32("mtp.layers.0.attn_norm.weight", (H,)); f32("mtp.layers.0.ffn_gate_inp.weight", (E, H))
         f32("v.blk.0.attn_q.weight", (H, H)); f32("v.blk.0.attn_q.bias", (H,)); f32("v.patch_embd.weight", (H, 3, 2, 2))
@@ -177,11 +207,13 @@ def write_mimo2(path, rng, types=None):
     w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
 
 
-def write_glmdsa(path, rng):
+def write_glmdsa(path, rng, copies=()):
     """llama.cpp's glm-dsa (GLM-5.2), small: a dense first layer, then MoE layers with a shared
     expert; MLA with kv_b split as k_b and v_b in Q8_0 (the colibri engine keeps them as the
     file's blocks), the DSA indexer, experts in Q4_K and IQ2_XXS with Q5_K and Q6_K down, a
-    Q4_K and Q8_0 trunk, the head Q6_K and the embedding Q8_0 (colibri's GGUF chain gates)."""
+    Q4_K and Q8_0 trunk, the head Q6_K and the embedding Q8_0 (colibri's GGUF chain gates).
+    copies: the layers whose indexer is the layer before's, byte for byte (unsloth's GLM-5.3
+    holds a shared layer's so)."""
     w = gguf.GGUFWriter(str(path), "glm-dsa")
     p = "glm-dsa."
     layers, h, mi, e, k, heads, ql, kvl, nope, rope, vd, ih, idh = 4, 256, 256, 8, 2, 4, 64, 32, 32, 8, 32, 2, 16
@@ -211,8 +243,12 @@ def write_glmdsa(path, rng):
         q(b + "attn_kv_a_mqa.weight", (kvl + rope, h), "Q4_K"); ones(b + "attn_kv_a_norm.weight", kvl)
         q(b + "attn_k_b.weight", (heads * kvl, nope), "Q8_0"); q(b + "attn_v_b.weight", (heads * vd, kvl), "Q8_0")
         q(b + "attn_output.weight", (h, heads * vd), "Q8_0")
-        q(b + "indexer.attn_q_b.weight", (ih * idh, ql), "Q8_0"); q(b + "indexer.attn_k.weight", (idh, h), "Q8_0")
-        f32(b + "indexer.proj.weight", (ih, h)); ones(b + "indexer.k_norm.weight", idh)
+        if L not in copies:
+            ix = (blocks("Q8_0", (ih * idh, ql), rng), blocks("Q8_0", (idh, h), rng),
+                  (rng.standard_normal((ih, h)) * 0.02).astype(np.float32))
+        w.add_tensor(b + "indexer.attn_q_b.weight", ix[0], raw_dtype=QT["Q8_0"])
+        w.add_tensor(b + "indexer.attn_k.weight", ix[1], raw_dtype=QT["Q8_0"])
+        w.add_tensor(b + "indexer.proj.weight", ix[2]); ones(b + "indexer.k_norm.weight", idh)
         w.add_tensor(b + "indexer.k_norm.bias", np.zeros(idh, np.float32))
         if L == 0:
             q(b + "ffn_gate.weight", (256, h), "Q4_K"); q(b + "ffn_up.weight", (256, h), "Q4_K"); q(b + "ffn_down.weight", (h, 256), "Q6_K")
@@ -226,13 +262,54 @@ def write_glmdsa(path, rng):
     w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
 
 
-def write_deepseek41(path, rng):
+def _engram_exact(rows, ehd):
+    """A table both Q8_0 and MXFP8 (ggml type 43) hold exactly, each block's 32 values small integers
+    times a power of two: (the Q8_0 rows, the MXFP8 rows) as bytes. Its own generator, so the rest of
+    the file draws the same."""
+    erng = np.random.default_rng(11)
+    nb = ehd // 32
+    ints = erng.integers(-15, 16, (rows, nb, 32))
+    ex = erng.integers(122, 130, (rows, nb))                      # 2^-5 .. 2^2
+    code = {}
+    for x in range(256):                                          # E4M3: integers -15 .. 15 exactly
+        e, m = (x >> 3) & 15, x & 7
+        v = (m / 8 * 2 ** -6) if e == 0 else (1 + m / 8) * 2 ** (e - 7)
+        v = -v if x & 0x80 else v
+        if v == int(v) and abs(v) <= 15 and int(v) not in code and not (e == 15 and m == 7):
+            code[int(v)] = x
+    q8 = np.zeros((rows, nb, 34), np.uint8); mx = np.zeros((rows, nb, 33), np.uint8)
+    q8[:, :, 0:2] = np.ldexp(1.0, ex - 127).astype(np.float16)[..., None].view(np.uint8)
+    q8[:, :, 2:] = ints.astype(np.int8).view(np.uint8)
+    mx[:, :, 0] = ex
+    mx[:, :, 1:] = np.vectorize(code.get)(ints)
+    return q8.reshape(rows, nb * 34), mx.reshape(rows, nb * 33)
+
+
+def gguf_retype(path, name, ne0, ggml_type):
+    """A tensor's first dimension and type rewritten in a written GGUF's header (gguf-py has no type 43:
+    its rows go in as I8 of the same bytes)."""
+    with open(path, "rb") as f:
+        b = bytearray(f.read())
+    key = len(name).to_bytes(8, "little") + name.encode()
+    at = b.find(key)
+    assert at > 0 and b.find(key, at + 1) < 0, name
+    o = at + len(key)
+    nd = int.from_bytes(b[o:o + 4], "little")
+    b[o + 4:o + 12] = int(ne0).to_bytes(8, "little")
+    b[o + 4 + 8 * nd:o + 8 + 8 * nd] = int(ggml_type).to_bytes(4, "little")
+    with open(path, "wb") as f:
+        f.write(bytes(b))
+
+
+def write_deepseek41(path, rng, engram="IQ4_NL"):
     """A published deepseek41 GGUF (DeepSeek V4.1 Flash), small: no deepseek41.config, the
     config as keys; the compressors (KV sources 1 and 3, a gate where the ratio is 2) and
     the indexer (1, 3 and 4) in BF16; the experts in IQ1_S as the UD-IQ1_S file has them,
     with IQ2_XXS, Q4_K and Q5_K in other layers; the trunk in Q5_K, Q6_K and Q8_0; every
     engram table in one IQ4_NL per_layer_token_embd under global head offsets, and each
-    engram layer's gate as one engram_gate (deepseek_v41's GGUF gates)."""
+    engram layer's gate as one engram_gate (deepseek_v41's GGUF gates).
+    engram "Q8_0" or "MXFP8": the table in that type instead, the same values in both
+    (_engram_exact); MXFP8 is ggml type 43, as unsloth's UD-IQ3_S and larger files ship it."""
     w = gguf.GGUFWriter(str(path), "deepseek41")
     p = "deepseek41."
     VT = gguf.GGUFValueType
@@ -294,7 +371,12 @@ def write_deepseek41(path, rng):
     def q(name, shape, t): w.add_tensor(name, blocks(t, shape, rng), raw_dtype=QT[t])
     q("token_embd.weight", (VOCAB, h), "Q8_0"); q("output.weight", (VOCAB, h), "Q6_K")
     w.add_tensor("output_norm.weight", np.ones(h, np.float32))
-    q("per_layer_token_embd.weight", (sum(primes), ehd), "IQ4_NL")
+    if engram == "IQ4_NL":
+        q("per_layer_token_embd.weight", (sum(primes), ehd), "IQ4_NL")
+    else:
+        q8, mx = _engram_exact(sum(primes), ehd)
+        if engram == "Q8_0": w.add_tensor("per_layer_token_embd.weight", q8, raw_dtype=QT.Q8_0)
+        else: w.add_tensor("per_layer_token_embd.weight", mx.view(np.int8))
     mix = (2 + hc) * hc
     for L in range(layers):
         b = f"blk.{L}."
@@ -332,6 +414,8 @@ def write_deepseek41(path, rng):
             f32(b + "engram_gate.weight", (hc, h), 0.05, 1.0)
             q(b + "engram_kv.weight", (h * (hc + 1), (ngram - 1) * eh * ehd), "Q8_0")
     w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
+    if engram == "MXFP8":
+        gguf_retype(path, "per_layer_token_embd.weight", ehd, 43)
 
 
 def write_dflash(path, rng, targets=(3, 4, 5)):
@@ -862,6 +946,315 @@ class InklingConfig(unittest.TestCase):
         self.assertEqual((cfg["unpadded_vocab_size"], cfg["eos_token_id"]), (200058, 200006))
 
 
+INK2 = dict(D=128, L=4, E=8, K=2, I=64, H=4, HD=32, KVL=2, KVG=1, DR=8, WIN=8, EXT=16, CK=4, V=300, UV=290)
+INK2_LOCAL = [True, True, False, True]   # layer 2 global
+INK2_SCALED = (0, 1)                     # the NVFP4 layers: experts without their global scale
+
+
+def ink2_weights(rng):
+    """A small Inkling-2 under the checkpoint's own names (model.llm.*), f32, every parameter
+    drawn at random: the snapshot's tensors."""
+    g = INK2
+    D, E, I, H, HD, DR, CK = g["D"], g["E"], g["I"], g["H"], g["HD"], g["DR"], g["CK"]
+    r = lambda *s, std=0.08, base=0.0: (base + rng.standard_normal(s) * std).astype(np.float32)
+    t = {"model.llm.embed.weight": r(g["V"], D, std=0.5), "model.llm.embed_norm.weight": r(D, std=0.1, base=1.0),
+         "model.llm.norm.weight": r(D, std=0.1, base=1.0), "model.llm.unembed.weight": r(g["V"], D, std=0.1),
+         "model.llm.attn_res.output_query": r(D, std=0.3)}
+    for i, local in enumerate(INK2_LOCAL):
+        p = f"model.llm.layers.{i}."
+        kv = (g["KVL"] if local else g["KVG"]) * HD
+        if local:
+            t[p + "attn_norm.weight"] = r(D, std=0.1, base=1.0)
+            t[p + "attn.k_sconv.weight"] = r(kv, CK, std=0.3); t[p + "attn.v_sconv.weight"] = r(kv, CK, std=0.3)
+        else:
+            for n in "qkv":
+                t[p + f"{n}_input_norm.weight"] = r(D, std=0.1, base=1.0)
+            for n in "kv":
+                t[p + f"attn.{n}_sconv.static_w"] = r(CK, kv, std=0.3)
+                t[p + f"attn.{n}_sconv.weight_proj"] = r(kv // HD * CK, D, std=0.05)
+        t[p + "mlp_norm.weight"] = r(D, std=0.1, base=1.0)
+        t[p + "attn.wq_du.weight"] = r(H * HD, D); t[p + "attn.wk_dv.weight"] = r(kv, D)
+        t[p + "attn.wv_dv.weight"] = r(kv, D); t[p + "attn.wr_du.weight"] = r(H * DR, D)
+        t[p + "attn.wo_ud.weight"] = r(D, H * HD); t[p + "attn.gate_attn.weight"] = r(H * HD, D)
+        t[p + "attn.attn_sink_proj.weight"] = r(H, D)
+        t[p + "attn.q_l2_clip.scale"] = r(H, HD, std=0.3, base=1.0); t[p + "attn.rel_l2_clip.scale"] = r(H, DR, std=0.3, base=1.0)
+        t[p + "attn.rel_logits_proj.proj"] = r(DR, g["WIN"] if local else g["EXT"], std=0.3)
+        t[p + "attn_sconv.weight"] = r(D, CK, std=0.3); t[p + "mlp_sconv.weight"] = r(D, CK, std=0.3)
+        t[p + "mlp.gate.weight"] = r(E, D, std=0.2); t[p + "mlp.gate.bias"] = r(E, std=0.1)
+        t[p + "mlp.experts.gate_up_proj"] = r(E, 2 * I, D)   # gate rows, then up rows
+        t[p + "mlp.experts.down_proj"] = r(E, D, I)
+        if i > 0:
+            t[f"model.llm.attn_res.attn_queries.{i - 1}"] = r(D, std=0.3) if local else r(3, D, std=0.3)
+        t[f"model.llm.attn_res.mlp_queries.{i}"] = r(D, std=0.3)
+    return t
+
+
+def write_inkling2(path, t, experts="F32", dense="F32"):
+    """The model of ink2_weights as unsloth's Inkling-2 GGUFs lay it out (llama.cpp's inkling2):
+    the short convolutions folded with their residual and scale (a global layer's static taps in
+    convolution order, its dynamic projection scaled), each layer's attention-residual queries
+    under the layer, and the experts of the INK2_SCALED layers stored divided by a global scale an
+    expert, which comes as ffn_*_exps.scale (gate's and up's one number, as the NVFP4 w13's amax
+    gives it). experts: the routed experts' ggml type, F32 or Q8_0; dense: the attention's
+    matrices' and the head's, F32 or Q8_0 (unsloth's are Q6_K and Q8_0). Returns the model the
+    file holds: t with each layer's experts and quantized matrices as the engine reads them back
+    (dequantized, scale applied)."""
+    g = INK2
+    D, E, I, CK = g["D"], g["E"], g["I"], g["CK"]
+    held = dict(t)
+    w = gguf.GGUFWriter(str(path), "inkling2")
+    p = "inkling2."
+    for key, v in (("block_count", g["L"]), ("context_length", 4096), ("embedding_length", D),
+                   ("attention.head_count", g["H"]), ("attention.key_length", g["HD"]), ("vocab_size", g["V"]),
+                   ("unpadded_vocab_size", g["UV"]), ("expert_count", E), ("expert_used_count", g["K"]),
+                   ("expert_feed_forward_length", I), ("attention.sliding_window", g["WIN"]), ("d_rel", g["DR"]),
+                   ("rel_extent", g["EXT"]), ("shortconv_kernel", CK), ("attn_res.block_size", 2),
+                   ("log_scaling_n_floor", 4)):
+        w.add_uint32(p + key, v)
+    w.add_array(p + "attention.head_count_kv", [g["KVL"] if l else g["KVG"] for l in INK2_LOCAL])
+    w.add_array(p + "attention.sliding_window_pattern", INK2_LOCAL)
+    for key, v in (("expert_weights_scale", 2.0), ("log_scaling_alpha", 0.1), ("qk_clip_threshold", 3.0),
+                   ("rel_clip_threshold", 2.0), ("mlp_gate_softcap", 4.0), ("mlp_up_softcap", 25.0),
+                   ("final_logit_softcapping", 30.0), ("attention.layer_norm_rms_epsilon", 1e-6)):
+        w.add_float32(p + key, v)
+    toks = [f"<0x{b:02X}>" if b < 256 else f"t{b}" for b in range(g["V"] - 3)] + ["<|bos|>", "<|eos|>", "<|pad|>"]
+    w.add_tokenizer_model("gpt2"); w.add_tokenizer_pre("inkling"); w.add_token_list(toks)
+    w.add_token_types([1] * (g["V"] - 3) + [3, 3, 3]); w.add_token_merges([])
+    w.add_bos_token_id(g["V"] - 3); w.add_eos_token_id(g["V"] - 2)
+    add = lambda name, a: w.add_tensor(name, np.ascontiguousarray(a, dtype=np.float32))
+    def exps(name, a, qt=experts):   # the tensor, and its values as the file gives them back
+        a = np.ascontiguousarray(a, dtype=np.float32)
+        if qt == "F32":
+            add(name, a)
+            return a
+        q = gguf.quants.quantize(a, QT[qt])
+        w.add_tensor(name, q, raw_dtype=QT[qt])
+        return gguf.quants.dequantize(q, QT[qt]).reshape(a.shape).astype(np.float32)
+    fold = lambda c, k: (c + (np.arange(CK) == CK - 1)) / np.sqrt(k)
+    m = "model.llm."
+    add("token_embd.weight", t[m + "embed.weight"]); add("token_embd_norm.weight", t[m + "embed_norm.weight"])
+    add("output_norm.weight", t[m + "norm.weight"])
+    held[m + "unembed.weight"] = exps("output.weight", t[m + "unembed.weight"], dense)
+    add("output_res_score.weight", t[m + "attn_res.output_query"])
+    for i, local in enumerate(INK2_LOCAL):
+        s, b = f"{m}layers.{i}.", f"blk.{i}."
+        if local:
+            add(b + "attn_norm.weight", t[s + "attn_norm.weight"])
+            for n in "kv":
+                add(b + f"shortconv_{n}.weight", fold(t[s + f"attn.{n}_sconv.weight"], CK + 1))
+        else:
+            for n in "qkv":
+                add(b + f"attn_{n}_in_norm.weight", t[s + f"{n}_input_norm.weight"])
+            for n in "kv":
+                add(b + f"shortconv_{n}.weight", fold(t[s + f"attn.{n}_sconv.static_w"][::-1].T, 2 * CK + 1))
+                add(b + f"shortconv_{n}_dyn.weight", t[s + f"attn.{n}_sconv.weight_proj"] / np.sqrt(2 * CK + 1))
+        add(b + "ffn_norm.weight", t[s + "mlp_norm.weight"])
+        for gg, hf in (("attn_q", "attn.wq_du.weight"), ("attn_k", "attn.wk_dv.weight"), ("attn_v", "attn.wv_dv.weight"),
+                       ("attn_r", "attn.wr_du.weight"), ("attn_output", "attn.wo_ud.weight"),
+                       ("attn_gate", "attn.gate_attn.weight"), ("attn_sink_proj", "attn.attn_sink_proj.weight"),
+                       ("attn_q_clip", "attn.q_l2_clip.scale"), ("attn_r_clip", "attn.rel_l2_clip.scale"),
+                       ("attn_rel_proj", "attn.rel_logits_proj.proj"), ("ffn_gate_inp", "mlp.gate.weight")):
+            if gg in ("attn_q", "attn_k", "attn_v", "attn_r", "attn_output", "attn_gate"):
+                held[s + hf] = exps(b + gg + ".weight", t[s + hf], dense)
+            else:
+                add(b + gg + ".weight", t[s + hf])
+        add(b + "exp_probs_b.bias", t[s + "mlp.gate.bias"])
+        add(b + "shortconv_attn.weight", fold(t[s + "attn_sconv.weight"], CK + 1))
+        add(b + "shortconv_mlp.weight", fold(t[s + "mlp_sconv.weight"], CK + 1))
+        if i > 0:
+            add(b + "attn_res_score.weight", t[f"{m}attn_res.attn_queries.{i - 1}"])
+        add(b + "ffn_res_score.weight", t[f"{m}attn_res.mlp_queries.{i}"])
+        gu, dn = t[s + "mlp.experts.gate_up_proj"], t[s + "mlp.experts.down_proj"]
+        gate, up = gu[:, :I], gu[:, I:]
+        if i in INK2_SCALED:
+            sg = (np.abs(gu).max(axis=(1, 2)) / 2688.0).astype(np.float32)
+            sd = (np.abs(dn).max(axis=(1, 2)) / 2688.0).astype(np.float32)
+            gate, up, dn = gate / sg[:, None, None], up / sg[:, None, None], dn / sd[:, None, None]
+            add(b + "ffn_gate_exps.scale", sg); add(b + "ffn_up_exps.scale", sg); add(b + "ffn_down_exps.scale", sd)
+        else:
+            sg = sd = np.ones(E, np.float32)
+        hg, hu = exps(b + "ffn_gate_exps.weight", gate), exps(b + "ffn_up_exps.weight", up)
+        hd = exps(b + "ffn_down_exps.weight", dn)
+        held[s + "mlp.experts.gate_up_proj"] = np.concatenate([hg, hu], axis=1) * sg[:, None, None]
+        held[s + "mlp.experts.down_proj"] = hd * sd[:, None, None]
+    w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
+    return held
+
+
+INK2V = dict(D=32, L=2, H=2, I=64, P=4, M=2, G=4, PROJ=64, IMG=292)   # IMG: the picture's token, past the unpadded vocabulary
+
+
+def write_inkling2_mmproj(path, rng):
+    """A tiny vision tower as unsloth's mmproj-*.gguf lays Inkling-2's out (architecture clip,
+    projector inkling2, v.* and mm.* names, the patch embedding a convolution [D][3][P][P], the
+    matrices F16). Returns its tensors under the checkpoint's names as the file gives them back,
+    and the checkpoint's vision_config."""
+    g = INK2V
+    D, L, H, I, P, M, G, PROJ = g["D"], g["L"], g["H"], g["I"], g["P"], g["M"], g["G"], g["PROJ"]
+    r = lambda *s, std=0.08, base=0.0: (base + rng.standard_normal(s) * std).astype(np.float32)
+    w = gguf.GGUFWriter(str(path), "clip")
+    w.add_string("clip.projector_type", "inkling2"); w.add_bool("clip.has_vision_encoder", True)
+    for key, v in (("patch_size", P), ("embedding_length", D), ("feed_forward_length", I), ("block_count", L),
+                   ("attention.head_count", H), ("projector.scale_factor", M), ("image_size", P * G),
+                   ("projection_dim", INK2["D"])):
+        w.add_uint32("clip.vision." + key, v)
+    w.add_float32("clip.vision.attention.layer_norm_epsilon", 1e-5)
+    held, V = {}, "model.visual."
+    def mat(name, hf, a):
+        q = np.ascontiguousarray(a).astype(np.float16)
+        w.add_tensor(name, q); held[hf] = q.astype(np.float32)
+    def vec(name, hf, a):
+        w.add_tensor(name, np.ascontiguousarray(a, dtype=np.float32)); held[hf] = a
+    vec("v.class_embd", V + "backbone.embeddings.class_embedding", r(D, std=0.3))
+    vec("v.class_pos_embd", V + "backbone.embeddings.cls_position_embedding", r(D, std=0.3))
+    conv = r(D, 3, P, P, std=0.1).astype(np.float16)   # the file's; the checkpoint's rows are [P][P][3]
+    w.add_tensor("v.patch_embd.weight", conv)
+    held[V + "backbone.embeddings.patch_embedding.weight"] = conv.astype(np.float32).transpose(0, 2, 3, 1).reshape(D, -1)
+    pos = r(G, G, D, std=0.3)
+    w.add_tensor("v.position_embd.weight", pos)
+    held[V + "backbone.embeddings.position_embedding"] = pos.reshape(G * G, D)
+    vec("v.pre_ln.weight", V + "backbone.ln_pre.weight", r(D, std=0.1, base=1.0))
+    vec("v.pre_ln.bias", V + "backbone.ln_pre.bias", r(D, std=0.1))
+    for i in range(L):
+        b, h = f"v.blk.{i}.", f"{V}backbone.layers.{i}."
+        for gg_, hf in (("ln1", "ln_1"), ("ln2", "ln_2")):
+            vec(b + gg_ + ".weight", h + hf + ".weight", r(D, std=0.1, base=1.0)); vec(b + gg_ + ".bias", h + hf + ".bias", r(D, std=0.1))
+        vec(b + "ls1.weight", h + "ls_1.gamma", r(D, std=0.3, base=1.0)); vec(b + "ls2.weight", h + "ls_2.gamma", r(D, std=0.3, base=1.0))
+        for gg_, hf, o, n in (("attn_q", "self_attn.q_proj", D, D), ("attn_k", "self_attn.k_proj", D, D),
+                              ("attn_v", "self_attn.v_proj", D, D), ("attn_out", "self_attn.out_proj", D, D),
+                              ("ffn_up", "mlp.c_fc", I, D), ("ffn_down", "mlp.c_proj", D, I)):
+            mat(b + gg_ + ".weight", h + hf + ".weight", r(o, n, std=0.15)); vec(b + gg_ + ".bias", h + hf + ".bias", r(o, std=0.05))
+    mat("mm.up.weight", V + "proj_in.weight", r(PROJ, M * M * D, std=0.1))
+    mat("mm.down.weight", V + "proj_out.weight", r(INK2["D"], PROJ, std=0.1))
+    w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
+    vc = {"native_patch_size": P, "adapter_merge_size": M, "projection_hidden_dim": PROJ, "hidden_size": D,
+          "num_hidden_layers": L, "num_attention_heads": H, "intermediate_size": I, "posemb_grid_size": G,
+          "layer_norm_eps": 1e-5}
+    return held, vc
+
+
+def write_inkling2_pair(root, experts="F32", seed=11, dense="F32", vision=False):
+    """root/ink2.gguf imported into root/gg, and root/snap: the model the file holds as a
+    checkpoint (safetensors under the official names, its experts as the file gives them back,
+    the config the import wrote). Returns (gg, snap)."""
+    sys.path.insert(0, str(HERE / "tools"))
+    import convert_inkling2_int4 as cv
+    root = Path(root)
+    t = write_inkling2(root / "ink2.gguf", ink2_weights(np.random.default_rng(seed)), experts, dense)
+    if vision:   # the tower's own GGUF next to the model, which the import links
+        vt, vc = write_inkling2_mmproj(root / "mmproj-ink2.gguf", np.random.default_rng(seed + 1))
+        t.update(vt)
+    p = subprocess.run([sys.executable, str(HERE / "tools" / "gguf_import.py"), str(root / "ink2.gguf"), str(root / "gg")],
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if p.returncode:
+        raise AssertionError(p.stdout.decode())
+    cfg = json.loads((root / "gg" / "config.json").read_text())
+    if vision:
+        if cfg.get("vision_config") != vc:
+            raise AssertionError(f"the import's vision_config {cfg.get('vision_config')} is not {vc}")
+        cfg["image_token_id"] = INK2V["IMG"]   # the real model's is the engine's default (200054)
+        (root / "gg" / "config.json").write_text(json.dumps(cfg))
+    snap = root / "snap"
+    snap.mkdir()
+    cv.write_safetensors(str(snap / "model.safetensors"), {k: ("F32", v.shape, v.tobytes()) for k, v in t.items()})
+    (snap / "config.json").write_text(json.dumps(cfg))
+    return root / "gg", snap
+
+
+class Inkling2Config(unittest.TestCase):
+    """llama.cpp's inkling2 as the inkling engine's flat inkling2_text config.json."""
+    @unittest.skipIf(gguf is None, "gguf-py (pip install gguf) is not installed")
+    def test_the_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gg, _ = write_inkling2_pair(tmp)
+            cfg = json.loads((gg / "config.json").read_text())
+            self.assertEqual(cfg["model_type"], "inkling2_text")
+            self.assertEqual(cfg["layer_types"], ["hybrid_sliding", "hybrid_sliding", "hybrid", "hybrid_sliding"])
+            self.assertEqual((cfg["num_key_value_heads"], cfg["swa_num_key_value_heads"]), (1, 2))
+            self.assertEqual((cfg["d_rel"], cfg["rel_extent"], cfg["sliding_window_size"], cfg["conv_kernel_size"]), (8, 16, 8, 4))
+            self.assertEqual((cfg["n_routed_experts"], cfg["num_experts_per_tok"], cfg["route_scale"]), (8, 2, 2.0))
+            self.assertEqual((cfg["mlp_gate_softcap"], cfg["mlp_up_softcap"], cfg["n_layers_per_attn_res_block"]), (4.0, 25.0, 2))
+            self.assertEqual((cfg["vocab_size"], cfg["unpadded_vocab_size"]), (300, 290))
+
+
+INKLING = HERE / ("inkling.exe" if sys.platform == "win32" else "inkling")
+
+
+def inkling_run(snap, env=None, image=None):
+    """The inkling engine's greedy tokens for a fixed prompt (oracle mode on a reference with
+    the prompt only) and its last prompt position's logits. image: (pixel_values, rows, cols), a
+    picture of rows x cols tokens among the prompt's."""
+    with tempfile.TemporaryDirectory() as tmp:
+        ref, dump = Path(tmp) / "ref.json", Path(tmp) / "logits.bin"
+        prompt = [5, 77, 13, 201, 42, 9, 150, 33, 61, 18, 240, 7]
+        extra = {}
+        if image is not None:
+            pix, rows, cols = image
+            prompt = prompt[:4] + [INK2V["IMG"]] * (rows * cols) + prompt[4:]
+            extra = {"pixel_values": [float(v) for v in pix], "image_grid_thw": [1, rows, cols]}
+        ref.write_text(json.dumps({"prompt_ids": prompt, "full_ids": prompt + [0] * 12, **extra}))
+        p = subprocess.run([str(INKLING), "4", "0", str(ref)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           env=dict(os.environ, SNAP=str(snap), DUMP=str(dump), NOGPU="1", OMP_NUM_THREADS="2", **(env or {})))
+        out = p.stdout.decode("utf-8", "replace")
+        line = [l for l in out.splitlines() if l.startswith("C engine")]
+        if not line:
+            raise AssertionError(f"inkling produced no tokens (rc {p.returncode}):\n{out[-2000:]}")
+        return line[-1].split(":", 1)[1].split(), np.fromfile(dump, np.float32)
+
+
+@unittest.skipIf(gguf is None, "gguf-py (pip install gguf) is not installed")
+@unittest.skipUnless(INKLING.is_file(), "inkling is not built")
+class Inkling2Gguf(unittest.TestCase):
+    """An Inkling-2 GGUF reads as the checkpoint it came from: the engine's tokens and logits
+    from the imported GGUF (folded convolutions, queries by layer, experts without their global
+    scale) against the same model as safetensors under the official names."""
+    def test_the_gguf_is_the_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gg, snap = write_inkling2_pair(tmp)
+            tg, lg = inkling_run(gg)
+            ts, ls = inkling_run(snap)
+            self.assertEqual(tg, ts)
+            self.assertLess(float(np.abs(lg - ls).max()), 1e-3 * max(1.0, float(np.abs(ls).max())))
+
+    def test_q8_0_experts(self):
+        """Q8_0 blocks, the NVFP4 layers' holding W / scale: the float kernels (GQ_EXACT=1) on the
+        file against its weights as f32. The integer kernels quantize the activations too, and
+        this small random net makes about 1% of that noise a call anything from 2% to 100% of
+        the logits: their tokens are the device gates' business (tests/vulkan_engines.sh)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            gg, snap = write_inkling2_pair(tmp, experts="Q8_0")
+            tg, lg = inkling_run(gg, {"GQ_EXACT": "1"})
+            ts, ls = inkling_run(snap)
+            self.assertEqual(tg, ts)
+            self.assertLess(float(np.abs(lg - ls).max()), 1e-3 * max(1.0, float(np.abs(ls).max())))
+
+    def test_the_vision_tower_from_its_mmproj(self):
+        """unsloth's mmproj-*.gguf beside the model: the import links it and writes vision_config,
+        the engine reads the tower under the checkpoint's names (the patch embedding from the
+        file's convolution); a picture in the prompt gives the checkpoint's tokens and logits."""
+        with tempfile.TemporaryDirectory() as tmp:
+            gg, snap = write_inkling2_pair(tmp, vision=True)
+            tile = INK2V["P"] * INK2V["M"]
+            pix = np.random.default_rng(3).uniform(-1, 1, 2 * tile * tile * 3).astype(np.float32)
+            tg, lg = inkling_run(gg, image=(pix, 1, 2))
+            ts, ls = inkling_run(snap, image=(pix, 1, 2))
+            self.assertEqual(tg, ts)
+            self.assertLess(float(np.abs(lg - ls).max()), 1e-4 * max(1.0, float(np.abs(ls).max())))
+            other = np.random.default_rng(4).uniform(-1, 1, pix.size).astype(np.float32)
+            _, lo = inkling_run(gg, image=(other, 1, 2))   # another picture, other logits: the tower ran
+            self.assertGreater(float(np.abs(lo - lg).max()), 1e-3)
+
+    def test_q8_0_dense(self):
+        """The attention's matrices and the head as Q8_0 blocks too, as unsloth's files hold them
+        quantized: the float kernels on the file against its weights as f32."""
+        with tempfile.TemporaryDirectory() as tmp:
+            gg, snap = write_inkling2_pair(tmp, experts="Q8_0", dense="Q8_0")
+            tg, lg = inkling_run(gg, {"GQ_EXACT": "1"})
+            ts, ls = inkling_run(snap)
+            self.assertEqual(tg, ts)
+            self.assertLess(float(np.abs(lg - ls).max()), 1e-3 * max(1.0, float(np.abs(ls).max())))
+
+
 class GlmDsaConfig(unittest.TestCase):
     """llama.cpp's glm-dsa as the colibri engine's config.json, from unsloth's GLM-5.3 header:
     MLA's head dims from the _mla lengths, the NextN block past the model's layers, every
@@ -895,6 +1288,59 @@ class GlmDsaConfig(unittest.TestCase):
         self.assertFalse(cfg["tie_word_embeddings"])
         del tensors["blk.78.nextn.eh_proj.weight"]   # a file without its NextN block: every block a layer
         self.assertEqual(gi.glmdsa_config(meta, tensors)[1], 79)
+
+
+COLIBRI = HERE / ("colibri.exe" if sys.platform == "win32" else "colibri")
+
+
+@unittest.skipUnless(np is not None and gguf is not None, "numpy and gguf-py are needed")
+class GlmDsaSharedIndexer(unittest.TestCase):
+    """unsloth's GLM-5.3 holds a shared indexer layer's weights as a copy of the full layer's it
+    reuses: the import reads such a layer as shared, and the engine, given a folder imported
+    before (every layer full), finds the copies and computes what the shared folder does, the
+    DSA selection on past the fourth position (DSA_TOPK=4)."""
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory(); d = Path(cls.tmp.name)
+        cls.src = d / "glm.gguf"
+        write_glmdsa(cls.src, np.random.default_rng(9), copies=(2, 3))
+        cls.dir = d / "glm"
+        p = subprocess.run([sys.executable, str(HERE / "tools" / "gguf_import.py"), str(cls.src), str(cls.dir)],
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        assert p.returncode == 0, p.stdout.decode(errors="replace")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_import_reads_the_copies_as_shared(self):
+        cfg = json.loads((self.dir / "config.json").read_text())
+        self.assertEqual(cfg["indexer_types"], ["full", "full", "shared", "shared"])
+
+    @unittest.skipUnless(COLIBRI.is_file(), "colibri is not built")
+    def test_engine_finds_the_copies_in_an_older_folder(self):
+        import shutil
+        old = Path(self.tmp.name) / "glm_old"
+        shutil.copytree(self.dir, old)
+        cfg = json.loads((old / "config.json").read_text())
+        cfg["indexer_types"] = ["full"] * 4
+        (old / "config.json").write_text(json.dumps(cfg))
+        ref = Path(self.tmp.name) / "ref.json"
+        ref.write_text(json.dumps({"prompt_ids": [5, 6, 7, 8, 20, 21, 22, 23],
+                                   "full_ids": [5, 6, 7, 8, 20, 21, 22, 23, 1, 2, 3, 4, 5, 6, 7, 8]}))
+        out = {}
+        for tag, snap in (("new", self.dir), ("old", old)):
+            dump = Path(self.tmp.name) / f"{tag}.f32"
+            p = subprocess.run([str(COLIBRI), "64", "16", "16"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               env=dict(os.environ, SNAP=str(snap), REF=str(ref), DSA_TOPK="4", DUMP=str(dump), USAGE_SAVE="0",
+                                        COLI_USAGE=str(Path(self.tmp.name) / f"{tag}.usage"), OMP_NUM_THREADS="2",
+                                        COLI_NO_OMP_TUNE="1", COLI_SPEC_GATE="0"))
+            text = p.stdout.decode(errors="replace")
+            out[tag] = (text, dump.read_bytes() if dump.is_file() else b"")
+        self.assertNotIn("hold the indexer of the layer before", out["new"][0])
+        self.assertIn("[DSA] 2 layers hold the indexer of the layer before as a copy", out["old"][0])
+        self.assertTrue(out["new"][1])
+        self.assertEqual(out["new"][1], out["old"][1])
 
 
 class Mimo2Config(unittest.TestCase):
@@ -1055,6 +1501,39 @@ class DeepSeek41Config(unittest.TestCase):
         self.assertEqual(resident("blk.1.engram_embd.weight", 10 ** 11, {}), 0)          # a GGUF's table
         self.assertEqual(resident("layers.1.engram.embed.weight", 10 ** 11, {}), 0)      # the checkpoint's
         self.assertEqual(resident("blk.1.engram_kv.weight", 1000, {}), 1000)             # its projection is resident
+
+
+V41 = HERE / ("deepseek_v41.exe" if sys.platform == "win32" else "deepseek_v41")
+
+
+@unittest.skipIf(gguf is None, "gguf-py (pip install gguf) is not installed")
+@unittest.skipUnless(V41.exists(), "deepseek_v41 is not built")
+class DeepSeek41EngramMXFP8(unittest.TestCase):
+    """unsloth's DeepSeek V4.1 UD-IQ3_S, UD-Q3_K_XL, UD-Q4_K_XL and UD-Q8_K_XL keep the Engram table
+    as ggml type 43 (MXFP8: an E8M0 exponent, 32 E4M3 values a block, the checkpoint's encoding),
+    which no reader took: the import and the engine stopped. The tiny model with its table as MXFP8
+    and as Q8_0 holding the same values: the import takes both, and the engine's tokens and last
+    logits are the same bits."""
+    def test_the_table_as_mxfp8_is_the_table_as_q8_0(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp); got = {}
+            for t in ("Q8_0", "MXFP8"):
+                gg, out = d / f"ds41-{t}.gguf", d / t
+                write_deepseek41(gg, np.random.default_rng(3), engram=t)
+                p = subprocess.run([sys.executable, str(HERE / "tools" / "gguf_import.py"), str(gg), str(out)],
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                self.assertEqual(p.returncode, 0, p.stdout.decode())
+                (out / "ref.json").write_text(json.dumps({"prompt_ids": [5, 6, 7, 8, 20, 21, 22, 23, 30, 31, 32, 33],
+                                                          "output_ids": [0] * 8}))
+                e = dict(os.environ, SNAP=str(out), GQ_EXACT="1", V41_DSPARK="0", OMP_NUM_THREADS="2", COLI_CUDA="0",
+                         COLI_VULKAN="0", USAGE_SAVE="0", DUMP=str(d / f"{t}.logits"))
+                r = subprocess.run([str(V41), "8", str(out / "ref.json")], env=e, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, timeout=600)
+                self.assertNotIn(b"no row reader", r.stderr)
+                self.assertTrue(r.stdout.strip(), r.stderr.decode()[-2000:])
+                got[t] = (r.stdout, (d / f"{t}.logits").read_bytes() if (d / f"{t}.logits").exists() else None)
+            self.assertEqual(got["MXFP8"][0], got["Q8_0"][0], "the tokens differ")
+            self.assertEqual(got["MXFP8"][1], got["Q8_0"][1], "the last logits differ")
 
 
 @unittest.skipIf(gguf is None, "gguf-py (pip install gguf) is not installed")

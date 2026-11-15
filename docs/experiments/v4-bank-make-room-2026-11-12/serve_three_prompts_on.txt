@@ -1,0 +1,298 @@
+===== three prompts in a row on one serve engine (V4_BANK_MAKE_ROOM=1) =====
+SERVE=1 RAM_GB=16 CTX=4096 COLI_V4_PREWARM=0 V4_SERVE_STATS_LOG=1 DSV4_CUDA_HEAD=0 and the bench environment of the manifest;
+turn 1 and 3: prompt3k.txt; turn 2: its sentences in reverse order (no common prefix); 36 tokens each, greedy.
+Times are the driver's: SUBMIT to the first DATA frame, first DATA to DONE.
+----- per turn -----
+{
+ "tag": "pr5b_on",
+ "extra": {
+  "DSV4_CUDA_HEAD": "0",
+  "V4_BANK_MAKE_ROOM": "1"
+ },
+ "ready_s": 7.7,
+ "turns": [
+  {
+   "turn": 1,
+   "prompt": "A",
+   "ttft_s": 66.844,
+   "after_first_s": 23.702,
+   "done": "DONE 1 STAT 36 1.519 17.5 0.00 3274 1 0",
+   "text_md5": "623c35c3f9d8",
+   "moe_ms_per_token": 538.2,
+   "released": [],
+   "oom_lines": 0,
+   "bank_lines": [
+    "v4_gpu moe-batch=on bank=256-experts"
+   ],
+   "stderr_bytes": [
+    5748,
+    8365
+   ]
+  },
+  {
+   "turn": 2,
+   "prompt": "B",
+   "ttft_s": 64.042,
+   "after_first_s": 24.145,
+   "done": "DONE 2 STAT 36 1.491 17.3 0.00 3273 1 0",
+   "text_md5": "093f3fb191f2",
+   "moe_ms_per_token": 547.9,
+   "released": [
+    "278",
+    "250"
+   ],
+   "oom_lines": 0,
+   "bank_lines": [
+    "v4_gpu mirror-cache: released 278 decode mirrors for the prompt's expert bank on device 0 (250 left)",
+    "v4_gpu moe-batch=on bank=256-experts",
+    "v4_gpu mirror-cache: released 250 decode mirrors for the prompt's expert bank on device 0 (0 left)"
+   ],
+   "stderr_bytes": [
+    8365,
+    11269
+   ]
+  },
+  {
+   "turn": 3,
+   "prompt": "A",
+   "ttft_s": 64.254,
+   "after_first_s": 23.054,
+   "done": "DONE 3 STAT 36 1.562 19.8 0.00 3274 1 0",
+   "text_md5": "623c35c3f9d8",
+   "moe_ms_per_token": 519.6,
+   "released": [
+    "277",
+    "251"
+   ],
+   "oom_lines": 0,
+   "bank_lines": [
+    "v4_gpu mirror-cache: released 277 decode mirrors for the prompt's expert bank on device 0 (251 left)",
+    "v4_gpu moe-batch=on bank=256-experts",
+    "v4_gpu mirror-cache: released 251 decode mirrors for the prompt's expert bank on device 0 (0 left)"
+   ],
+   "stderr_bytes": [
+    11269,
+    14151
+   ]
+  }
+ ],
+ "exit": 0
+}
+----- stderr -----
+[env] COLI_CUDA_PIPE is not read by deepseek-v4 (it belongs to colibri) -- it will have no effect
+[env] COLI_GPU is not read by deepseek-v4 (it belongs to colibri olmoe qwen36 qwen38 laya gliner_decide) -- it will have no effect
+[env] CUDA_DENSE is not read by deepseek-v4 (it belongs to colibri) -- it will have no effect
+[env] TEMP is not read by deepseek-v4 (it belongs to colibri kimi_k3 olmoe qwen36 glm53 qwen38 deepseek-v41 mimo laya gliner_decide) -- it will have no effect
+[OMP] deepseek-v4: 16 compute threads (the physical cores of 32 logical CPUs; the 3 expert-loader workers take the SMT siblings); OMP_NUM_THREADS=<n> overrides, COLI_NO_OMP_TUNE=1 disables
+ram_tiers available=16.00GiB dense=resident(6.27GiB) target_slots=14 target_cache=7.50GiB head=resident-bf16 projected=15.64GiB
+v4_open index=0.15s plan=0.00s (index built once, reused by plan/inventory/head)
+[MIRROR] D:\llm_models\DeepSeek-V4-Flash-0731-Abliterated: 48/48 shards (replica 1)
+[MIRROR] probe: primary 6.09 GB/s | mirror 5.57 GB/s
+[MIRROR] 2 drives | read split 52% / 48% (measured)
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_autopin history=C:\colibri\models\DeepSeek-V4-Flash-0731-Abliterated/.coli_usage selections=1732231
+v4_hot_policy pin_slots_per_layer=8 repin_interval=6 mode=resident-ram rows16=hot-pins
+[DSV4 CUDA] backend=coli_cuda_dsv4_dg.dll (deepgemm-sm120)
+[DSV4 CUDA] device 0: NVIDIA GeForce RTX 5080 17.1 GB sm_120
+v4_gpu mirror-reserve=600MiB headroom; the 256-slot bank (3456MiB x2) releases the oldest decode mirrors when a prompt creates it (V4_BANK_MAKE_ROOM)
+v4_gpu tier=dense-matvec device=0
+v4_gpu layer=0 uploaded=134.024MiB in 0.077s wall=1794499194
+v4_gpu layer=1 uploaded=134.024MiB in 0.077s wall=1794499194
+v4_gpu indexer-resident=on device=0 layer=2 bytes=8390656
+v4_gpu layer=2 uploaded=183.025MiB in 0.083s wall=1794499195
+v4_gpu layer=3 uploaded=150.024MiB in 0.079s wall=1794499195
+v4_gpu indexer-resident=on device=0 layer=4 bytes=8390656
+v4_gpu layer=4 uploaded=183.026MiB in 0.082s wall=1794499195
+v4_gpu layer=5 uploaded=150.024MiB in 0.079s wall=1794499195
+v4_gpu indexer-resident=on device=0 layer=6 bytes=8390656
+v4_gpu layer=6 uploaded=183.026MiB in 0.082s wall=1794499195
+v4_gpu layer=7 uploaded=150.024MiB in 0.085s wall=1794499195
+v4_gpu indexer-resident=on device=0 layer=8 bytes=8390656
+v4_gpu layer=8 uploaded=183.026MiB in 0.082s wall=1794499195
+v4_gpu layer=9 uploaded=150.024MiB in 0.079s wall=1794499196
+v4_gpu indexer-resident=on device=0 layer=10 bytes=8390656
+v4_gpu layer=10 uploaded=183.026MiB in 0.084s wall=1794499196
+v4_gpu layer=11 uploaded=150.024MiB in 0.079s wall=1794499196
+v4_gpu indexer-resident=on device=0 layer=12 bytes=8390656
+v4_gpu layer=12 uploaded=183.026MiB in 0.084s wall=1794499196
+v4_gpu layer=13 uploaded=150.024MiB in 0.079s wall=1794499196
+v4_gpu indexer-resident=on device=0 layer=14 bytes=8390656
+v4_gpu layer=14 uploaded=183.026MiB in 0.089s wall=1794499196
+v4_gpu layer=15 uploaded=150.024MiB in 0.075s wall=1794499196
+v4_gpu indexer-resident=on device=0 layer=16 bytes=8390656
+v4_gpu layer=16 uploaded=183.026MiB in 0.087s wall=1794499197
+v4_gpu layer=17 uploaded=150.024MiB in 0.082s wall=1794499197
+v4_gpu indexer-resident=on device=0 layer=18 bytes=8390656
+v4_gpu layer=18 uploaded=183.026MiB in 0.083s wall=1794499197
+v4_gpu layer=19 uploaded=150.024MiB in 0.082s wall=1794499197
+v4_gpu indexer-resident=on device=0 layer=20 bytes=8390656
+v4_gpu layer=20 uploaded=183.026MiB in 0.084s wall=1794499197
+v4_gpu layer=21 uploaded=150.024MiB in 0.087s wall=1794499197
+v4_gpu indexer-resident=on device=0 layer=22 bytes=8390656
+v4_gpu layer=22 uploaded=183.026MiB in 0.088s wall=1794499198
+v4_gpu layer=23 uploaded=150.024MiB in 0.080s wall=1794499198
+v4_gpu indexer-resident=on device=0 layer=24 bytes=8390656
+v4_gpu layer=24 uploaded=183.026MiB in 0.084s wall=1794499198
+v4_gpu layer=25 uploaded=150.024MiB in 0.083s wall=1794499198
+v4_gpu indexer-resident=on device=0 layer=26 bytes=8390656
+v4_gpu layer=26 uploaded=183.026MiB in 0.088s wall=1794499198
+v4_gpu layer=27 uploaded=150.024MiB in 0.091s wall=1794499198
+v4_gpu indexer-resident=on device=0 layer=28 bytes=8390656
+v4_gpu layer=28 uploaded=183.026MiB in 0.085s wall=1794499198
+v4_gpu layer=29 uploaded=150.024MiB in 0.084s wall=1794499199
+v4_gpu indexer-resident=on device=0 layer=30 bytes=8390656
+v4_gpu layer=30 uploaded=183.026MiB in 0.085s wall=1794499199
+v4_gpu layer=31 uploaded=150.024MiB in 0.080s wall=1794499199
+v4_gpu indexer-resident=on device=0 layer=32 bytes=8390656
+v4_gpu layer=32 uploaded=183.026MiB in 0.085s wall=1794499199
+v4_gpu layer=33 uploaded=150.024MiB in 0.083s wall=1794499199
+v4_gpu indexer-resident=on device=0 layer=34 bytes=8390656
+v4_gpu layer=34 uploaded=183.026MiB in 0.085s wall=1794499199
+v4_gpu layer=35 uploaded=150.024MiB in 0.086s wall=1794499200
+v4_gpu indexer-resident=on device=0 layer=36 bytes=8390656
+v4_gpu layer=36 uploaded=183.026MiB in 0.088s wall=1794499200
+v4_gpu layer=37 uploaded=150.024MiB in 0.081s wall=1794499200
+v4_gpu indexer-resident=on device=0 layer=38 bytes=8390656
+v4_gpu layer=38 uploaded=183.026MiB in 0.119s wall=1794499200
+v4_gpu layer=39 uploaded=150.024MiB in 0.102s wall=1794499200
+v4_gpu indexer-resident=on device=0 layer=40 bytes=8390656
+v4_gpu layer=40 uploaded=183.026MiB in 0.082s wall=1794499200
+v4_gpu layer=41 uploaded=150.024MiB in 0.083s wall=1794499201
+v4_gpu indexer-resident=on device=0 layer=42 bytes=8390656
+v4_gpu layer=42 uploaded=183.026MiB in 0.092s wall=1794499201
+v4_dense_resident layers=43 bytes=6.267GiB
+v4_gpu resident-experts=cache-fallback (resident experts exceed device 0 budget (free=7837 MiB reserve=2800 MiB))
+v4_gpu moe-batch=on bank=256-experts
+v4_gpu moe-double=on
+v4_gpu moe-batch refill layer=0 missing=181 lookup=0.02s upload=0.72s (sequential retries)
+v4_gpu moe-batch refill layer=0 missing=3 lookup=0.01s upload=0.00s
+v4_gpu moe-double swaps=42 prefetched=10752
+decprof position=3274 layers=43 hc=31 attn=82 moe=844 ms
+decprof position=3275 layers=43 hc=30 attn=86 moe=584 ms
+decprof position=3276 layers=43 hc=30 attn=79 moe=582 ms
+decprof position=3277 layers=43 hc=32 attn=80 moe=664 ms
+decprof position=3278 layers=43 hc=31 attn=80 moe=472 ms
+decprof position=3279 layers=43 hc=31 attn=85 moe=580 ms
+decprof position=3280 layers=43 hc=31 attn=78 moe=539 ms
+decprof position=3281 layers=43 hc=31 attn=79 moe=581 ms
+decprof position=3282 layers=43 hc=31 attn=80 moe=526 ms
+decprof position=3283 layers=43 hc=31 attn=86 moe=542 ms
+decprof position=3284 layers=43 hc=30 attn=79 moe=563 ms
+decprof position=3285 layers=43 hc=31 attn=81 moe=548 ms
+decprof position=3286 layers=43 hc=31 attn=82 moe=549 ms
+decprof position=3287 layers=43 hc=30 attn=85 moe=562 ms
+decprof position=3288 layers=43 hc=31 attn=79 moe=535 ms
+decprof position=3289 layers=43 hc=31 attn=79 moe=502 ms
+decprof position=3290 layers=43 hc=31 attn=81 moe=507 ms
+decprof position=3291 layers=43 hc=31 attn=86 moe=552 ms
+decprof position=3292 layers=43 hc=31 attn=80 moe=549 ms
+decprof position=3293 layers=43 hc=31 attn=79 moe=504 ms
+decprof position=3294 layers=43 hc=31 attn=79 moe=499 ms
+decprof position=3295 layers=43 hc=32 attn=86 moe=508 ms
+decprof position=3296 layers=43 hc=32 attn=80 moe=516 ms
+decprof position=3297 layers=43 hc=31 attn=80 moe=493 ms
+decprof position=3298 layers=43 hc=31 attn=79 moe=465 ms
+decprof position=3299 layers=43 hc=32 attn=86 moe=525 ms
+decprof position=3300 layers=43 hc=31 attn=80 moe=523 ms
+decprof position=3301 layers=43 hc=31 attn=78 moe=549 ms
+decprof position=3302 layers=43 hc=31 attn=79 moe=495 ms
+decprof position=3303 layers=43 hc=31 attn=84 moe=435 ms
+decprof position=3304 layers=43 hc=31 attn=80 moe=506 ms
+decprof position=3305 layers=43 hc=31 attn=81 moe=494 ms
+decprof position=3306 layers=43 hc=31 attn=80 moe=475 ms
+decprof position=3307 layers=43 hc=31 attn=84 moe=530 ms
+v4_dec_moe calls=1491 total_s=18.74 fetch_wait_s=8.88 attach_s=7.17 uploads=5927 gpu_s=1.67 (cumulative)
+v4_serve_turn prompt=3274 completion=36 decode_s=23.70 tok_s=1.519 hit=17.5% expert_disk_s=66.93 expert_wait_s=9.17 expert_matmul_s=0.00 attention_s=80.15 rss_gb=0.0 vram_first_hits_total=0 store_fetches_total=8946
+v4_mirror primary=107.58GiB/17280 mirror=96.67GiB/15528
+v4_gpu mirror-cache: released 278 decode mirrors for the prompt's expert bank on device 0 (250 left)
+v4_gpu moe-batch=on bank=256-experts
+v4_gpu mirror-cache: released 250 decode mirrors for the prompt's expert bank on device 0 (0 left)
+v4_gpu moe-double=on
+v4_gpu moe-batch refill layer=0 missing=161 lookup=0.01s upload=0.49s (sequential retries)
+v4_gpu moe-batch refill layer=0 missing=18 lookup=0.01s upload=0.03s (sequential retries)
+v4_gpu moe-double swaps=42 prefetched=10752
+decprof position=3272 layers=43 hc=31 attn=79 moe=473 ms
+decprof position=3273 layers=43 hc=31 attn=80 moe=745 ms
+decprof position=3274 layers=43 hc=31 attn=80 moe=705 ms
+decprof position=3275 layers=43 hc=31 attn=86 moe=610 ms
+decprof position=3276 layers=43 hc=31 attn=81 moe=547 ms
+decprof position=3277 layers=43 hc=31 attn=79 moe=510 ms
+decprof position=3278 layers=43 hc=31 attn=80 moe=593 ms
+decprof position=3279 layers=43 hc=31 attn=86 moe=525 ms
+decprof position=3280 layers=43 hc=31 attn=80 moe=501 ms
+decprof position=3281 layers=43 hc=31 attn=79 moe=610 ms
+decprof position=3282 layers=43 hc=30 attn=79 moe=486 ms
+decprof position=3283 layers=43 hc=31 attn=86 moe=551 ms
+decprof position=3284 layers=43 hc=31 attn=80 moe=541 ms
+decprof position=3285 layers=43 hc=31 attn=80 moe=488 ms
+decprof position=3286 layers=43 hc=31 attn=79 moe=514 ms
+decprof position=3287 layers=43 hc=31 attn=85 moe=581 ms
+decprof position=3288 layers=43 hc=31 attn=79 moe=508 ms
+decprof position=3289 layers=43 hc=31 attn=81 moe=488 ms
+decprof position=3290 layers=43 hc=31 attn=79 moe=464 ms
+decprof position=3291 layers=43 hc=31 attn=84 moe=530 ms
+decprof position=3292 layers=43 hc=31 attn=80 moe=579 ms
+decprof position=3293 layers=43 hc=31 attn=79 moe=543 ms
+decprof position=3294 layers=43 hc=31 attn=81 moe=531 ms
+decprof position=3295 layers=43 hc=31 attn=84 moe=494 ms
+decprof position=3296 layers=43 hc=31 attn=79 moe=515 ms
+decprof position=3297 layers=43 hc=32 attn=82 moe=557 ms
+decprof position=3298 layers=43 hc=31 attn=80 moe=571 ms
+decprof position=3299 layers=43 hc=31 attn=85 moe=559 ms
+decprof position=3300 layers=43 hc=31 attn=79 moe=571 ms
+decprof position=3301 layers=43 hc=31 attn=80 moe=568 ms
+decprof position=3302 layers=43 hc=31 attn=81 moe=592 ms
+decprof position=3303 layers=43 hc=31 attn=84 moe=551 ms
+decprof position=3304 layers=43 hc=31 attn=79 moe=566 ms
+decprof position=3305 layers=43 hc=31 attn=79 moe=567 ms
+decprof position=3306 layers=43 hc=31 attn=80 moe=441 ms
+v4_dec_moe calls=2995 total_s=37.94 fetch_wait_s=18.37 attach_s=14.18 uploads=12345 gpu_s=3.36 (cumulative)
+v4_serve_turn prompt=3273 completion=36 decode_s=24.15 tok_s=1.491 hit=17.3% expert_disk_s=65.47 expert_wait_s=9.74 expert_matmul_s=0.00 attention_s=77.27 rss_gb=0.0 vram_first_hits_total=0 store_fetches_total=17970
+v4_mirror primary=216.05GiB/34704 mirror=193.57GiB/31092
+v4_gpu mirror-cache: released 277 decode mirrors for the prompt's expert bank on device 0 (251 left)
+v4_gpu moe-batch=on bank=256-experts
+v4_gpu mirror-cache: released 251 decode mirrors for the prompt's expert bank on device 0 (0 left)
+v4_gpu moe-double=on
+v4_gpu moe-batch refill layer=0 missing=181 lookup=0.02s upload=0.54s (sequential retries)
+v4_gpu moe-batch refill layer=0 missing=3 lookup=0.01s upload=0.00s
+v4_gpu moe-double swaps=42 prefetched=10752
+decprof position=3273 layers=43 hc=31 attn=86 moe=516 ms
+decprof position=3274 layers=43 hc=31 attn=80 moe=786 ms
+decprof position=3275 layers=43 hc=31 attn=86 moe=542 ms
+decprof position=3276 layers=43 hc=30 attn=78 moe=573 ms
+decprof position=3277 layers=43 hc=31 attn=80 moe=538 ms
+decprof position=3278 layers=43 hc=31 attn=79 moe=395 ms
+decprof position=3279 layers=43 hc=31 attn=87 moe=527 ms
+decprof position=3280 layers=43 hc=31 attn=78 moe=506 ms
+decprof position=3281 layers=43 hc=31 attn=79 moe=555 ms
+decprof position=3282 layers=43 hc=31 attn=80 moe=514 ms
+decprof position=3283 layers=43 hc=31 attn=85 moe=512 ms
+decprof position=3284 layers=43 hc=31 attn=80 moe=539 ms
+decprof position=3285 layers=43 hc=31 attn=79 moe=524 ms
+decprof position=3286 layers=43 hc=31 attn=81 moe=526 ms
+decprof position=3287 layers=43 hc=31 attn=85 moe=552 ms
+decprof position=3288 layers=43 hc=31 attn=79 moe=522 ms
+decprof position=3289 layers=43 hc=31 attn=78 moe=494 ms
+decprof position=3290 layers=43 hc=31 attn=79 moe=498 ms
+decprof position=3291 layers=43 hc=31 attn=86 moe=557 ms
+decprof position=3292 layers=43 hc=32 attn=81 moe=528 ms
+decprof position=3293 layers=43 hc=31 attn=80 moe=506 ms
+decprof position=3294 layers=43 hc=30 attn=79 moe=496 ms
+decprof position=3295 layers=43 hc=30 attn=85 moe=520 ms
+decprof position=3296 layers=43 hc=31 attn=80 moe=513 ms
+decprof position=3297 layers=43 hc=31 attn=80 moe=497 ms
+decprof position=3298 layers=43 hc=31 attn=80 moe=453 ms
+decprof position=3299 layers=43 hc=31 attn=84 moe=517 ms
+decprof position=3300 layers=43 hc=31 attn=80 moe=513 ms
+decprof position=3301 layers=43 hc=31 attn=79 moe=555 ms
+decprof position=3302 layers=43 hc=31 attn=80 moe=496 ms
+decprof position=3303 layers=43 hc=30 attn=84 moe=419 ms
+decprof position=3304 layers=43 hc=31 attn=79 moe=488 ms
+decprof position=3305 layers=43 hc=31 attn=79 moe=507 ms
+decprof position=3306 layers=43 hc=31 attn=80 moe=475 ms
+decprof position=3307 layers=43 hc=31 attn=86 moe=526 ms
+v4_dec_moe calls=4486 total_s=56.05 fetch_wait_s=27.29 attach_s=20.68 uploads=18272 gpu_s=5.03 (cumulative)
+v4_serve_turn prompt=3274 completion=36 decode_s=23.05 tok_s=1.562 hit=19.8% expert_disk_s=62.89 expert_wait_s=9.18 expert_matmul_s=0.00 attention_s=76.93 rss_gb=0.0 vram_first_hits_total=0 store_fetches_total=26916
+v4_mirror primary=320.77GiB/51524 mirror=287.30GiB/46148
+v4_rows16 packed_slots=0
+v4_direct reads=48836 flock_reads=0 fallbacks=0 payload_bytes=614499090432

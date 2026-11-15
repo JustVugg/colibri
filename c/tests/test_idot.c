@@ -66,7 +66,73 @@ static int check_driver(int fmt,int O,int I,int S){
     return rc;
 }
 
+/* K1b's gate (planar_on, qt_planarize): an x86 CPU build with SSSE3 planarizes a gs64 fmt=4
+ * tensor under IDOT_GS=1, a pre-AVX2 one (Sandy/Ivy Bridge, test_idot_ssse3) as well, and
+ * matmul_qt then gives the pure-C reference's bits: the integer dot of each group, fmaf with
+ * its scale, times the row's scale. fmt=2 is planarized only where matmul_i4p's f32 arm is,
+ * an AVX2 build that is not AVX-512. */
+static int check_k1b_gate(void){
+    const int O=37, I=320, S=3, gs=64, ng=I/gs, rb=I/2;
+#if (defined(__x86_64__)||defined(_M_X64)) && defined(__SSSE3__) && \
+    !defined(COLI_CUDA) && !defined(COLI_METAL) && !defined(COLI_VULKAN)
+    const char *pe=getenv("PLANAR"), *xe=getenv("XEXP");
+    const int want4=!(pe&&*pe=='0') && !(xe&&*xe=='1');
+#else
+    const int want4=0;
+#endif
+#if defined(__AVX2__) && !(defined(__AVX512F__)&&defined(__AVX512BW__))
+    const int want2=want4;
+#else
+    const int want2=0;
+#endif
+    QT w; memset(&w,0,sizeof w);
+    w.fmt=4; w.O=O; w.I=I; w.gs=gs;
+    w.q4=malloc((size_t)O*rb); w.s=malloc((size_t)O*ng*sizeof(float));
+    uint8_t *pairs=malloc((size_t)O*rb);
+    for(size_t i=0;i<(size_t)O*rb;i++) pairs[i]=w.q4[i]=(uint8_t)(xr()&0xFF);
+    for(int i=0;i<O*ng;i++) w.s[i]=0.0005f+(float)(xr()%911)*1e-6f;
+    qt_planarize(&w);
+    QT w2; fill_qt(&w2,2,O,I);
+    qt_planarize(&w2);
+    int rc=0;
+    if(w.planar!=want4 || w2.planar!=want2){
+        fprintf(stderr,"FAIL K1b gate: fmt=4 gs64 planar %d (want %d), fmt=2 planar %d (want %d)\n",
+                w.planar,want4,w2.planar,want2);
+        rc=1;
+    }
+    if(!rc && w.planar){
+        float *x=malloc((size_t)S*I*sizeof(float)), *y=malloc((size_t)S*O*sizeof(float)), *yref=malloc((size_t)S*O*sizeof(float));
+        int8_t *xq=malloc((size_t)S*I); float *sx=malloc((size_t)S*sizeof(float));
+        for(int64_t i=0;i<(int64_t)S*I;i++) x[i]=((float)(xr()%4001)-2000.f)/500.f;
+        matmul_qt_ex(y,x,&w,S,1);
+        for(int s=0;s<S;s++) sx[s]=qrow_i8(x+(int64_t)s*I, xq+(int64_t)s*I, I);
+        for(int o=0;o<O;o++) for(int s=0;s<S;s++){
+            float a=0;
+            for(int g=0;g<ng;g++){
+                int32_t d=0, xs=0;
+                for(int i=g*gs;i<(g+1)*gs;i++){
+                    uint8_t b=pairs[(int64_t)o*rb+(i>>1)];
+                    d+=(int32_t)((i&1)?(b>>4):(b&0xF))*xq[(int64_t)s*I+i]; xs+=xq[(int64_t)s*I+i];
+                }
+                a=fmaf((float)(d-8*xs),w.s[(int64_t)o*ng+g],a);
+            }
+            yref[(int64_t)s*O+o]=a*sx[s];
+        }
+        for(int64_t i=0;i<(int64_t)S*O;i++)
+            if(memcmp(&y[i],&yref[i],sizeof(float))!=0){
+                fprintf(stderr,"FAIL K1b planar fmt=4 gs64 idx=%lld: %.9g != %.9g\n",(long long)i,(double)y[i],(double)yref[i]);
+                rc=1; break;
+            }
+        free(x); free(y); free(yref); free(xq); free(sx);
+    }
+    if(!rc) printf("K1b gate (%s): fmt=4 gs64 %s, fmt=2 %s\n", IDOT_KERNEL,
+                   w.planar?"planar, the reference's bits":"pairs", w2.planar?"planar":"pairs");
+    free(w.q4); free(w.s); free(pairs); free(w2.s); free(w2.q8); free(w2.q4);
+    return rc;
+}
+
 int main(void){
+    setenv("IDOT_GS","1",1);   /* K1b's opt-in, before the first matmul reads it (check_k1b_gate) */
     static const int sizes[]={1,2,15,16,17,31,32,33,63,64,65,100,127,128,1408,4096,4097};
     static int8_t w[8192], x[8192]; static uint8_t w4[4096];
     for(unsigned t=0;t<sizeof(sizes)/sizeof(sizes[0]);t++){
@@ -95,5 +161,5 @@ int main(void){
         for(int fmt=1;fmt<=2;fmt++)
          if(check_driver(fmt,Os[a],Is[b],Ss[c])) return 1;
     printf("idot driver exactness (%s): ok\n", IDOT_KERNEL);
-    return 0;
+    return check_k1b_gate();
 }

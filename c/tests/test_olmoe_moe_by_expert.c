@@ -106,6 +106,14 @@ static void prompt_vs_rows(Model *m, const char *mode) {
             snprintf(what, sizeof what, "%s: prompt of %d rows (norm_topk %d) == %d one-row steps, memcmp",
                      mode, S, norm, S);
             check(!memcmp(oa, ob, (size_t)S * D * sizeof(float)), what);
+            /* Optional byte-for-byte artifact for before/after storage adapters. */
+            const char *dump = getenv("OLMOE_TEST_OUTPUT");
+            if (dump) {
+                FILE *f = fopen(dump, "ab");
+                if (!f || fwrite(oa, sizeof(float), (size_t)S * D, f) != (size_t)S * D)
+                    exit(1);
+                fclose(f);
+            }
             snprintf(what, sizeof what, "%s: prompt of %d rows counts %d requests (%llu)",
                      mode, S, S * K, (unsigned long long)req);
             check(req == (uint64_t)S * K, what);

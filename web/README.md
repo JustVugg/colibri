@@ -20,7 +20,10 @@ npm run build
 Besides Chat and Brain, the **Profiling** tab charts where the engine spent
 each turn's wall time (I/O wait, expert matmul, attention, LM head) from the
 server's `/profile` endpoint — a rolling window of per-turn `PROF` snapshots
-emitted by the engine.
+emitted by the engine. When the gateway has joules installed (`pip install
+landauer-gap`), `/power` adds the machine's watts and each turn's `energy_j`,
+shown as joules per token; without it `/power` answers `available: false` and
+the tiles stay hidden.
 
 When `/v1/models` marks the selected model with `"capabilities":
 ["image_generation"]` (Qwen-Image-2.1 under `coli serve`), the chat view

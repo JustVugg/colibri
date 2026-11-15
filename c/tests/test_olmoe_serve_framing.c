@@ -65,6 +65,23 @@ static void test_submit_moves_exact_payload_into_queue(void)
     reset_queue();
 }
 
+static void test_token_ids_never_enter_text_queue(void)
+{
+    const char frame[]="SUBMIT ids 0 3 4 0 1 ids=1\n1 2\nCANCEL live\n";
+    FILE *in=bytes_input(frame,sizeof(frame)-1), *out=tmpfile();
+    assert(out); binary_stream(out);
+    reset_queue();
+    assert(serve_read_cmd(in,out,NULL)==-1);
+    assert(g_qn==0);
+    char output[80];
+    size_t count=read_output(out,output,sizeof(output));
+    const char want[]="ERROR ids bad submit header\n";
+    assert(count==sizeof(want)-1 && !memcmp(output,want,count));
+    /* The reader consumed only this SUBMIT, not the following control. */
+    assert(fgetc(in)=='C');
+    fclose(in); fclose(out);
+}
+
 static void test_cancel_only_matches_active_request(void)
 {
     static const char cancel[] = "CANCEL req-7\n";
@@ -186,6 +203,7 @@ static void test_max_tokens_is_a_ceiling(void)
 int main(void)
 {
     test_submit_moves_exact_payload_into_queue();
+    test_token_ids_never_enter_text_queue();
     test_cancel_only_matches_active_request();
     test_errors_are_byte_exact_and_frames_are_consumed();
     test_invalid_submit_does_not_parse_its_payload_as_control();

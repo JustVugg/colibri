@@ -78,8 +78,10 @@
 #define ST_GGUF   /* a gguf_import folder reads as the checkpoint (st_gguf.h) */
 #include "st.h"
 #include "ggml_view.h"
+#include "coli_env.h"
 #include "quant.h"
 #include "sparse_attn.h"
+#include "index_topk.h"
 #include "omp_tune.h"
 #include "kv_prefix.h"
 #include "park.h"   /* a short request keeps the conversation aside (COLI_PARK) */
@@ -1885,6 +1887,47 @@ static int expert_direct(void) {
     return on != 0;
 }
 
+/* Scratch for a GGUF expert matrix the slot holds in another form. A `static __thread` buffer
+ * here leaked once per retired OpenMP worker (docs/experiments/dsv41-read-team-2026-11-03.md);
+ * this capped shared pool reuses buffers whatever the threads do. Over the cap, a returned
+ * buffer is freed. */
+#define V41_SCRATCH_POOL 64
+static pthread_mutex_t g_scratch_mx = PTHREAD_MUTEX_INITIALIZER;
+static struct { uint8_t *p; int64_t n; } g_scratch[V41_SCRATCH_POOL];
+static int g_scratch_cnt;
+
+static uint8_t *scratch_get(int64_t need, int64_t *got) {
+    uint8_t *recycled = NULL, *traded = NULL;
+    pthread_mutex_lock(&g_scratch_mx);
+    for (int i = 0; i < g_scratch_cnt; i++)
+        if (g_scratch[i].n >= need) {   /* first fit */
+            recycled = g_scratch[i].p; *got = g_scratch[i].n;
+            g_scratch[i] = g_scratch[--g_scratch_cnt];
+            break;
+        }
+    if (!recycled && g_scratch_cnt > 0) {   /* all too small: trade one in rather than keep both */
+        traded = g_scratch[--g_scratch_cnt].p;
+    }
+    pthread_mutex_unlock(&g_scratch_mx);
+    if (traded) compat_aligned_free(traded);    /* the unmap stays out of the lock */
+    if (recycled) return recycled;
+    uint8_t *p = NULL;
+    if (posix_memalign((void **)&p, ST_DIRECT_ALIGN, (size_t)need)) {
+        fprintf(stderr, "OOM reading a GGUF expert\n"); exit(1); }
+    *got = need;
+    return p;
+}
+
+static void scratch_put(uint8_t *p, int64_t n) {
+    pthread_mutex_lock(&g_scratch_mx);
+    if (g_scratch_cnt < V41_SCRATCH_POOL) {
+        g_scratch[g_scratch_cnt].p = p; g_scratch[g_scratch_cnt].n = n; g_scratch_cnt++;
+        p = NULL;
+    }
+    pthread_mutex_unlock(&g_scratch_mx);
+    if (p) compat_aligned_free(p);
+}
+
 /* Read `n` reserved experts at once. The slot ids are stamped only after every
  * read has landed, so a slot never advertises an expert it does not yet hold. */
 static void expert_fetch(Model *m, const char *kind, int layer,
@@ -1911,26 +1954,33 @@ static void expert_fetch(Model *m, const char *kind, int layer,
         }
     }
     double started = now_s();
-    int threads = expert_read_depth();
-    if (threads > total) threads = total;
+    const int depth = expert_read_depth();
+    const int threads = depth < total ? depth : total;
     uint64_t bytes = 0;
+    int next_read = 0;
 #if defined(_OPENMP)
-    #pragma omp parallel for schedule(dynamic, 1) num_threads(threads) reduction(+:bytes)
+    /* Run at the default team width: a narrower region makes libgomp retire and respawn pool
+     * threads on every call. Only `threads` of the team read; the counter hands out the work. */
+    const int team = depth > omp_get_max_threads() ? depth : omp_get_max_threads();
+    #pragma omp parallel num_threads(team) reduction(+:bytes)
 #endif
-    for (int i = 0; i < total; i++) {
+    {
+#if defined(_OPENMP)
+    const int tid = omp_get_thread_num();
+#else
+    const int tid = 0;
+#endif
+    if (tid < threads)
+    for (;;) {
+        const int i = __atomic_fetch_add(&next_read, 1, __ATOMIC_RELAXED);
+        if (i >= total) break;
         const ExpertRead *r = &list[i];
         int64_t pad = r->t->off % ST_DIRECT_ALIGN;
         if (r->gx_layer >= 0 && v41_gx_conv(m, r->gx_layer, r->part / 2)) {
-            /* A GGUF matrix the slot holds in another form: read into a buffer of this
-             * thread's, then interleaved by 16 rows or laid out as FP4 and scales. */
-            static __thread uint8_t *raw; static __thread int64_t raw_n;
-            const int64_t need = r->t->nbytes + 2 * ST_DIRECT_ALIGN;
-            if (raw_n < need) {
-                compat_aligned_free(raw); raw = NULL; raw_n = 0;
-                if (posix_memalign((void **)&raw, ST_DIRECT_ALIGN, (size_t)need)) {
-                    fprintf(stderr, "OOM reading a GGUF expert\n"); exit(1); }
-                raw_n = need;
-            }
+            /* A GGUF matrix the slot holds in another form: read into a pooled scratch
+             * buffer, then interleaved by 16 rows or laid out as FP4 and scales. */
+            int64_t raw_n = 0;
+            uint8_t *raw = scratch_get(r->t->nbytes + 2 * ST_DIRECT_ALIGN, &raw_n);
             st_read_range_rep(&m->S, r->t->fd, r->rep, r->t->off, r->t->nbytes, raw + pad,
                               r->t->nbytes, 1, expert_direct(), "pread expert");
             const int k = r->part / 2, held = m->gx_h[3 * r->gx_layer + k];
@@ -1939,6 +1989,7 @@ static void expert_fetch(Model *m, const char *kind, int layer,
             if (held < 0) coli_mxfp4_unblock(r->slot->base[r->part + 1], r->slot->base[r->part], raw + pad,
                                              shape[0] * shape[1] / 32);
             else gq_r16_pack(held, r->slot->base[r->part], raw + pad, (int)shape[0], (int)shape[1]);
+            scratch_put(raw, raw_n);
         } else
         /* The payload pointer carries the slack st_read_range_rep needs to read
          * from the enclosing block boundary, so an O_DIRECT transfer lands the
@@ -1953,6 +2004,7 @@ static void expert_fetch(Model *m, const char *kind, int layer,
         __atomic_fetch_add(&g_mir_bytes[rep], (uint64_t)r->t->nbytes, __ATOMIC_RELAXED);
         __atomic_fetch_add(&g_mir_nread[rep], 1, __ATOMIC_RELAXED);
         bytes += (uint64_t)r->t->nbytes;
+    }
     }
     /* Publish the payload pointers only now. A slot that advertises an expert has
      * to address that expert, and until the read landed the window base was the
@@ -2189,6 +2241,12 @@ static void v41_dho_open(Model *m) {
     if (!on || !atoi(on) || (keep && *keep && atoi(keep) != 0)) return;
     g_vk_opened = 1;
     g_vk_thread = pthread_self();
+    /* The trunk goes up before the mapped-weights window is asked: the fit below reads the
+     * device's real free memory (a 9/10-of-the-heap probe first left it a few hundred MiB on
+     * this box), and the ask — main, once v41c_start has placed the trunk — sizes the window
+     * around it (the heap less the trunk and COLI_VK_FREE_RESERVE_GB) instead of taking
+     * 9/10 of the heap the tier then has to fit inside. */
+    coli_vk_window_trunk_first();
     g_vk_ready = coli_vk_init_env_tier("deepseek_v41", vkt_wanted() && m->c.n_routed > 0);
     if (!g_vk_ready) return;
     int chain = v41c_decide(m);
@@ -2688,6 +2746,7 @@ static void indexer_run(Model *m, int layer, const float *x, const float *qr, in
     float *qblk = xmalloc((size_t)block * nh * ihd * sizeof(float), "indexer queries");
     float *wblk = xmalloc((size_t)block * nh * sizeof(float), "indexer weights");
     float *score = xmalloc((size_t)compress_len * sizeof(float), "indexer scores");
+    uint64_t *work = xmalloc((size_t)(compress_len > 0 ? compress_len : 1) * 2 * sizeof(uint64_t), "indexer order");
     float scale = (1.0f / sqrtf((float)ihd)) * (1.0f / sqrtf((float)nh));
 
     for (int t = 0; t < n; t++) {
@@ -2717,8 +2776,12 @@ static void indexer_run(Model *m, int layer, const float *x, const float *qr, in
          * before its own position, which is one expression for prefill and decode
          * alike -- and, for a speculative step, per row rather than per step */
         int lens = (start_pos + t + 1) / ratio;
-        for (int j = 0; j < compress_len; j++) {
-            if (j >= lens) { score[j] = -INFINITY; continue; }
+        /* each position's score is its own sum over the heads, in head order, so splitting
+         * the reachable positions across threads gives the same bits */
+        const int reach = lens < compress_len ? lens : compress_len;
+        for (int j = reach; j < compress_len; j++) score[j] = -INFINITY;
+        #pragma omp parallel for schedule(static) if (reach >= 256)
+        for (int j = 0; j < reach; j++) {
             float total = 0.0f;
             for (int h = 0; h < nh; h++) {
                 const float *qh = q + (size_t)h * ihd;
@@ -2746,27 +2809,11 @@ static void indexer_run(Model *m, int layer, const float *x, const float *qr, in
          * independently, but keeping them sorted makes the concatenated index list
          * readable and matches the reference's `.sort()`. */
         int *row = out + (size_t)t * stride;   /* the compressed half of this query's list */
-        for (int k = 0; k < topk; k++) row[k] = -1;
-        int taken = 0;
-        for (int k = 0; k < topk; k++) {
-            int best = -1;
-            for (int j = 0; j < compress_len; j++) {
-                if (score[j] == -INFINITY) continue;
-                int already = 0;
-                for (int u = 0; u < taken; u++) if (row[u] == j) { already = 1; break; }
-                if (already) continue;
-                if (best < 0 || score[j] > score[best]) best = j;
-            }
-            if (best < 0) break;
-            row[taken++] = best;
-        }
-        for (int a = 0; a < taken; a++)          /* insertion sort: taken <= index_topk */
-            for (int b = a + 1; b < taken; b++)
-                if (row[b] < row[a]) { int swap = row[a]; row[a] = row[b]; row[b] = swap; }
+        int taken = coli_index_topk(score, compress_len, topk, row, work);   /* index_topk.h */
         for (int k = 0; k < topk; k++)
             row[k] = (k < taken && row[k] < lens) ? row[k] + offset : -1;
     }
-    free(qblk); free(wblk); free(score);
+    free(qblk); free(wblk); free(score); free(work);
 }
 
 /* wo_a is block diagonal over o_groups: each group projects only its own heads, and
@@ -3697,6 +3744,39 @@ static void moe_run_at(Model *m, Layer *l, LCache *cache, const char *kind, int 
     }
 }
 
+/* The rows a block of positions will look up asked of the OS before engram_row reads them
+ * (POSIX_FADV_WILLNEED), those the cache does not hold: engram_row reads a missing row with one
+ * pread and waits for it, so a prompt's rows came from the disk one at a time. Nothing on
+ * Windows. */
+static void engram_advise(const EngramTable *t, int64_t id, int head_dim) {
+#if defined(POSIX_FADV_WILLNEED) && !defined(_WIN32)
+    if (id < 0 || id >= t->rows) return;   /* engram_row reports it */
+    int slot = (int)((uint64_t)(id * 0x9E3779B97F4A7C15ull) >> 40) & t->mask;
+    for (int probe = 0; probe < 4; probe++) if (t->key[(slot + probe) & t->mask] == id) return;
+    int groups = head_dim / 32;
+    if (t->gt >= 0) (void)posix_fadvise(t->fd_w, (off_t)(t->off_w + id * t->rb), (off_t)t->rb, POSIX_FADV_WILLNEED);
+    else if (t->inline_scales)
+        (void)posix_fadvise(t->fd_w, (off_t)(t->off_w + id * (head_dim + groups)), (off_t)(head_dim + groups), POSIX_FADV_WILLNEED);
+    else {
+        (void)posix_fadvise(t->fd_w, (off_t)(t->off_w + id * head_dim), (off_t)head_dim, POSIX_FADV_WILLNEED);
+        (void)posix_fadvise(t->fd_s, (off_t)(t->off_s + id * groups), (off_t)groups, POSIX_FADV_WILLNEED);
+    }
+#else
+    (void)t; (void)id; (void)head_dim;
+#endif
+}
+/* engram_advise for every row of positions pos .. pos + n - 1 of a table (V41_ENGRAM_ADVISE=0: none) */
+static void engram_advise_rows(const Engram *e, int table, int pos, int n) {
+    static int on = -1;
+    if (on < 0) { const char *v = getenv("V41_ENGRAM_ADVISE"); on = !(v && *v == '0'); }
+    if (!on || n < 2) return;   /* a decode step's few rows: as they come */
+    int64_t ids[V41_MAX_NGRAM * V41_MAX_EHEADS];
+    for (int r = 0; r < n; r++) {
+        engram_hash(e, table, pos + r, ids);
+        for (int col = 0; col < e->cols; col++) engram_advise(&e->table[table], ids[col], e->head_dim);
+    }
+}
+
 static void moe_run(Model *m, int layer, const float *x, int n, float *out) {
     moe_run_at(m, &m->L[layer], &m->cache[layer], "layers", layer,
                m->c.n_routed, m->c.n_activated, x, n, out, 1);
@@ -3722,6 +3802,7 @@ static void engram_run(Model *m, int layer, float *h, int n, int start_pos) {
     int64_t ids[V41_MAX_NGRAM * V41_MAX_EHEADS];
     for (int t0 = 0; t0 < n; t0 += chunk) {
         int rows_here = n - t0 < chunk ? n - t0 : chunk;
+        engram_advise_rows(e, table, start_pos + t0, rows_here);
         for (int r = 0; r < rows_here; r++) {
             engram_hash(e, table, start_pos + t0 + r, ids);
             for (int col = 0; col < e->cols; col++) {
@@ -4398,6 +4479,9 @@ static void forward_batch(Model *m, const int *ids, int n, float *logits) {
 #ifdef COLI_VULKAN
 #include "deepseek_v41_chain.h"   /* the layers as a dense chain on the device (COLI_VK_CHAIN) */
 #endif
+#ifdef COLI_CUDA
+#include "deepseek_v41_cuchain.h" /* a prompt's layers on the CUDA chain (COLI_CUDA_CHAIN) */
+#endif
 
 /* The prompt's tail past the cross-layer source (DeepSeek's "decoder SWA bounded replay"
  * in its deployment notes). From the first layer with compress_ratio 1 on
@@ -4408,7 +4492,9 @@ static void forward_batch(Model *m, const int *ids, int n, float *logits) {
  * reaches the answer only through those windows, W - 1 rows back a layer: with D layers
  * after it, the last D * (W - 1) + 1 rows give the last row and every window the next step
  * reads exactly as all the rows do (2414 of a prompt in V4.1: 19 layers, a window of 128).
- * The layers after it run on that tail only, with the same bits.
+ * The layers after it run on that tail only, with the same bits (on the Vulkan chain chunk by chunk;
+ * layer by layer, COLI_VK_V41_LAYERWISE, its routed experts' step over the tail's rows rounds
+ * apart from every row's in the last bits, the text the same).
  *
  * V41_PREFILL_TAIL=<rows> sets the tail instead: 140 is what DeepSeek serves with
  * (a window and its backtracking), below the exact tail
@@ -4435,7 +4521,8 @@ static int v41_prefill_tail(const Cfg *c, int n, int spec_batch, int keep_rows, 
 
 /* Past the source layer: the rows of the tail to the front of every per-row buffer the
  * later layers read (the streams and their mix, the DSpark input a target layer at or
- * before the source wrote, the candidate mask), the forward's rows and start the tail's. */
+ * before the source wrote, the candidate mask, the index list the last index source
+ * published), the forward's rows and start the tail's. */
 static void v41_take_tail(Model *m, float *h, float *pre_mix, int *n, int *start_pos, int tail, int targets, int *trace_row) {
     const Cfg *c = &m->c;
     int dim = c->dim, hc = c->hc_mult, r0 = *n - tail;
@@ -4446,6 +4533,19 @@ static void v41_take_tail(Model *m, float *h, float *pre_mix, int *n, int *start
     if (m->candidates && m->candidate_rows == *n) {
         memmove(m->candidates, m->candidates + (size_t)r0 * m->candidate_width, (size_t)tail * m->candidate_width);
         m->candidate_rows = tail;
+    }
+    /* The layers past the source that run no indexer of their own read this list. Its
+     * entries count past the rows of kv_all's window half: every row of a prompt read from
+     * position 0, the window ring's otherwise (attention_run). The tail starts past 0 and
+     * reads the ring: each row's list to the front, its entries moved onto the ring's
+     * rows. Kept as it was, the tail's rows read the first rows' lists, shifted past the
+     * compressed rows the attention holds. */
+    if (m->shared_topk && m->shared_topk_rows == *n && m->shared_topk_width > 0) {
+        const int w = m->shared_topk_width, shift = c->window - (*start_pos == 0 ? *n : c->window);
+        int *list = m->shared_topk;
+        memmove(list, list + (size_t)r0 * w, (size_t)tail * w * sizeof(int));
+        for (size_t i = 0; i < (size_t)tail * w; i++) if (list[i] >= 0) list[i] += shift;
+        m->shared_topk_rows = tail;
     }
     *n = tail; *start_pos += r0;
     if (*trace_row >= tail) *trace_row = tail - 1;
@@ -4559,13 +4659,24 @@ static void forward_full(Model *m, const int *ids, int n, float *logits, int spe
 
     int rows_out = spec_batch || keep_rows;
     m->ptail_after = tail_after; m->ptail_rows = tail;
+    int chained = 0;
 #ifdef COLI_VULKAN
     /* the dense chain runs its layers on the device (every layer, or a partial chain's
      * first N, the streams of every row then back here); 0: the CPU runs them all */
-    int chained = v41c_forward(m, h, pre_mix, n, start_pos, spec_batch, rows_out);
-    if (!chained && !coli_prompt_broken()) v41c_cpu_step(m, start_pos);   /* stopped: no CPU redo */
-#else
-    int chained = 0;
+    chained = v41c_forward(m, h, pre_mix, n, start_pos, spec_batch, rows_out);
+    const int vk_chained = chained;
+#endif
+#ifdef COLI_CUDA
+    /* on the CUDA tier, a prompt's layers on the CUDA chain; the host's state it leaves as the
+     * CPU would, and a step it does not take makes its copies from start_pos stale */
+    if (!chained) {
+        int lost = 0;
+        chained = v41u_forward(m, h, pre_mix, n, start_pos, spec_batch, rows_out, &lost);
+        if (!chained) v41u_lower(m, start_pos);
+    }
+#endif
+#ifdef COLI_VULKAN
+    if (!vk_chained && !coli_prompt_broken()) v41c_cpu_step(m, start_pos);   /* stopped: no CPU redo */
 #endif
     if (tail > 0 && tail < n && chained > tail_after)   /* the chain took the tail past the source: its rows from here on */
         v41_take_tail(m, h, pre_mix, &n, &start_pos, tail, targets, &trace_row);
@@ -4901,6 +5012,9 @@ static void model_reset_rows(Model *m, int n) {
 #ifdef COLI_VULKAN
     v41c_reset(m);   /* nothing on the device describes the new sequence */
 #endif
+#ifdef COLI_CUDA
+    v41u_lower(m, 0);
+#endif
     /* Paired with the reset on purpose: whoever drops the state must also forget
      * what it was built from, or the two disagree in favour of the one nobody
      * can check. */
@@ -4922,7 +5036,23 @@ static int sample_desc(const void *a, const void *b) {
     return (pb > pa) - (pa > pb);
 }
 
+/* COLI_LOGIT_DUMP=1: each served step's top five id:logit to stderr, as sample.h's pick_tok writes
+ * them (comparing two configurations on the same context: a stored prefix against a fresh read) */
+static void serve_logit_dump(const float *lo, int V) {
+    static int dump = -1;
+    if (dump < 0) dump = getenv("COLI_LOGIT_DUMP") ? 1 : 0;
+    if (!dump) return;
+    int id[5] = {-1, -1, -1, -1, -1}; float v[5] = {-3e38f, -3e38f, -3e38f, -3e38f, -3e38f};
+    for (int t = 0; t < V; t++) {
+        const float x = lo[t];
+        for (int k = 0; k < 5; k++) if (x > v[k]) { for (int j = 4; j > k; j--) { v[j] = v[j - 1]; id[j] = id[j - 1]; } v[k] = x; id[k] = t; break; }
+    }
+    fprintf(stderr, "[LOGITS]");
+    for (int k = 0; k < 5; k++) fprintf(stderr, " %d:%.6f", id[k], v[k]);
+    fprintf(stderr, "\n");
+}
 static int serve_sample(const float *logits, int vocab, float temperature, float top_p) {
+    serve_logit_dump(logits, vocab);
     if (temperature <= 0.0f) return argmax(logits, vocab);
     SampleProb *rank = xmalloc((size_t)vocab * sizeof(SampleProb), "sampling");
     float top = logits[0];
@@ -5003,6 +5133,9 @@ static void spec_rollback(Model *m, int start_pos, int committed, int rows) {
     m->last_rows = committed;
 #ifdef COLI_VULKAN
     v41c_rollback(m, m->pos);   /* the dense chain's copies of the rejected rows go stale */
+#endif
+#ifdef COLI_CUDA
+    v41u_lower(m, m->pos);
 #endif
     if (m->engram.active && m->engram.history_len > m->pos) m->engram.history_len = m->pos;
     /* The record follows the rollback for the same reason the engram history
@@ -5215,9 +5348,10 @@ static int v41_prompt_poll(ColiPromptBreak *b) {
  * layer's window ring rows and their positions, the compressed rows and index keys of the
  * positions the request may write (a row for `ratio` of them), the compressor's partial
  * group, the engram history's first entries, and what crosses forwards (the index keys
- * published last, the shared top-k list, the candidate mask); back when the next request
- * arrives. The host's state stays canonical: the chains' watermarks come down to 0. The draft
- * head's windows are not kept: no prompt resets them either, and a draft is only verified. */
+ * published last, the shared top-k list, the candidate mask); the next request brings them
+ * back, keeps them parked or drops them (v41_park_decide). The host's state stays canonical:
+ * the chains' watermarks come down to 0. The draft head's windows are not kept: no prompt
+ * resets them either, and a draft is only verified. */
 #define V41_PARK_SPEC 16   /* the rows a verify writes past the tokens that stand */
 static ColiPark g_v41_park;
 static struct { int history_len, published_layer, topk_rows, topk_width, cand_width, cand_rows;
@@ -5283,10 +5417,185 @@ static void v41_unpark(Model *m) {
 #ifdef COLI_VULKAN
         v41c_reset(m);   /* the host's rows from 0 are the conversation's again: the mirrors go up again */
 #endif
+#ifdef COLI_CUDA
+        v41u_lower(m, 0);
+#endif
     } else coli_park_free(&g_v41_park);
     free(g_v41_park_x.topk); free(g_v41_park_x.cand);
     memset(&g_v41_park_x, 0, sizeof g_v41_park_x);
     free(p);
+}
+/* the next request decides a conversation the last one parked (park.h, #2703): back, kept or
+ * dropped; an image's request takes the state from its start, so it drops it */
+static void v41_park_decide(Model *m, const int *ids, int np, int max_tok, int image) {
+    int d = image ? (g_v41_park.on ? -1 : 0) : coli_park_decide(&g_v41_park, &m->kvp, ids, np, max_tok, V41_PARK_SPEC);
+    if (d > 0) v41_unpark(m);
+    else if (d < 0) {
+        coli_park_free(&g_v41_park);
+        free(g_v41_park_x.topk); free(g_v41_park_x.cand);
+        memset(&g_v41_park_x, 0, sizeof g_v41_park_x);
+    }
+}
+
+/* ---- every prompt read, kept by content for later requests (prefix_store.h) -----------------
+ * An agent starts each task as a new conversation on the same system prompt and tools. The state
+ * the slot holds cannot be wound back to where the new conversation parts from the old one (the
+ * window rings, the compressor's filling group), so the new one read its whole prompt again; and a
+ * conversation's next turn did too, since resuming the live state is opt-in here (kv_prefix_on: a
+ * position decoded attends otherwise than the same text prefilled). The store keeps the compressed
+ * rows and index keys in blocks named by their tokens, shared by every prompt that starts with
+ * them, and checkpoints of the rest (every layer's window ring and its positions, the compressor's
+ * filling group, the layer whose index keys were published last) where a prompt's messages start
+ * and where it ends. A prompt's rows read past a checkpoint publish their own top-k lists and
+ * candidate masks before any layer reads them, so those are not kept (a decoded position would
+ * read the last forward's, and nothing here resumes one). Only what a prompt read put there: a
+ * request that started from nothing or from the store saves, one that resumed the live state (with
+ * decoded positions) or a photo does not, so a request that takes a checkpoint computes what the
+ * same prompt read cold computes. It keeps two positions at least to read (a single one reads the
+ * keys published last, as a decoded one does). The engram history is the prompt's ids again.
+ * COLI_PREFIX_STORE=0 or COLI_KV_PREFIX=0 off; COLI_PREFIX_STORE_MB its budget;
+ * COLI_PREFIX_STORE_BLOCK the tokens a block (a multiple of every compression ratio). Off for a
+ * picture's prompt and for a read-out (logprobs). */
+#include "prefix_store.h"
+static ColiPrefixStore g_v41_ps;
+static int g_v41_ps_init;
+static int v41_ps_on(void) {
+    if (!g_v41_ps_init) {
+        const char *e = getenv("COLI_KV_PREFIX");
+        g_v41_ps_init = 1;
+        coli_ps_init_env(&g_v41_ps, e && *e == '0', compat_mem_available_gb() * 1024.0);
+    }
+    return g_v41_ps.on;
+}
+/* the store's budget, decided when the engine plans its RAM: a tier's host pool leaves it (ram_later) */
+static size_t v41_ps_plan(void) { v41_ps_on(); return g_v41_ps.on ? g_v41_ps.budget : 0; }
+/* the compressed rows and index keys, a row for `ratio` positions */
+static int v41_ps_parts(const Model *m, ColiPsPart *parts) {
+    const Cfg *c = &m->c; int n = 0;
+    for (int i = 0; i < c->n_layers; i++) {
+        const Layer *l = &m->L[i]; const int r = c->compress_ratio[i] > 0 ? c->compress_ratio[i] : 1;
+        if (!c->kv_source[i] || !l->ckv || !l->ikey) continue;
+        const int slots = c->max_positions / r;
+        parts[n++] = (ColiPsPart){l->ckv, (size_t)c->head_dim * sizeof(float), slots, 1, 0, r};
+        parts[n++] = (ColiPsPart){l->ikey, (size_t)c->index_head_dim * sizeof(float), slots, 1, 0, r};
+    }
+    return n;
+}
+typedef struct {
+    int n_layers, window, pos, pub_layer;
+    float **win, **cs_kv, **cs_score; int **win_pos;
+} V41PsState;
+static void v41_ps_state_free(void *v) {
+    V41PsState *x = (V41PsState *)v;
+    if (!x) return;
+    for (int i = 0; i < x->n_layers; i++) {
+        if (x->win) free(x->win[i]);
+        if (x->win_pos) free(x->win_pos[i]);
+        if (x->cs_kv) free(x->cs_kv[i]);
+        if (x->cs_score) free(x->cs_score[i]);
+    }
+    free(x->win); free(x->win_pos); free(x->cs_kv); free(x->cs_score); free(x);
+}
+/* a checkpoint's state: the host's, which every chain leaves canonical after a forward */
+static V41PsState *v41_ps_state_save(const Model *m, size_t *bytes) {
+    const Cfg *c = &m->c; const int L = c->n_layers, W = c->window, hd = c->head_dim;
+    V41PsState *x = (V41PsState *)calloc(1, sizeof *x);
+    if (!x) return NULL;
+    x->n_layers = L; x->window = W; x->pos = m->pos;
+    x->pub_layer = m->published_index_k ? m->published_index_layer : -1;
+    int ok = (x->win = (float **)calloc((size_t)L, sizeof(float *))) && (x->win_pos = (int **)calloc((size_t)L, sizeof(int *))) &&
+             (x->cs_kv = (float **)calloc((size_t)L, sizeof(float *))) && (x->cs_score = (float **)calloc((size_t)L, sizeof(float *)));
+    *bytes = sizeof *x;
+    for (int i = 0; ok && i < L; i++) {
+        const Layer *l = &m->L[i]; const int r = c->compress_ratio[i];
+        const size_t wb = (size_t)W * hd * sizeof(float);
+        ok = (x->win[i] = (float *)malloc(wb)) && (x->win_pos[i] = (int *)malloc((size_t)W * sizeof(int)));
+        if (!ok) break;
+        memcpy(x->win[i], l->window, wb); memcpy(x->win_pos[i], l->window_pos, (size_t)W * sizeof(int));
+        *bytes += wb + (size_t)W * sizeof(int);
+        if (c->kv_source[i] && r > 1) {
+            const size_t cb = (size_t)r * hd * sizeof(float);
+            ok = (x->cs_kv[i] = (float *)malloc(cb)) && (x->cs_score[i] = (float *)malloc(cb));
+            if (!ok) break;
+            memcpy(x->cs_kv[i], l->cstate_kv, cb); memcpy(x->cs_score[i], l->cstate_score, cb);
+            *bytes += 2 * cb;
+        }
+    }
+    if (!ok) { v41_ps_state_free(x); return NULL; }
+    return x;
+}
+/* ids[0, P) as the Model holds them now, with its state at P */
+static void v41_ps_save(Model *m, const int *ids, int P) {
+    if (!v41_ps_on() || P < g_v41_ps.B || m->kvp.tainted || m->pos != P) return;
+    ColiPsPart *parts = (ColiPsPart *)malloc((size_t)2 * m->c.n_layers * sizeof *parts + 1);
+    if (!parts) return;
+    int np = v41_ps_parts(m, parts);
+    size_t sb = 0;
+    V41PsState *st = v41_ps_state_save(m, &sb);
+    if (st) coli_ps_save(&g_v41_ps, ids, P, parts, np, st, sb, v41_ps_state_free, compat_mem_available_gb() * 1024.0);
+    free(parts);
+}
+/* The deepest prefix the store holds of ids[0, np), two positions short of its end at most, when
+ * it reaches past `held` positions: its rows and state put back, the record and the chains told.
+ * The positions now held; 0 when nothing. */
+static int v41_ps_take(Model *m, const int *ids, int np, int held) {
+    if (!v41_ps_on() || np < 3) return 0;
+    const Cfg *c = &m->c;
+    ColiPsPart *parts = (ColiPsPart *)malloc((size_t)2 * c->n_layers * sizeof *parts + 1);
+    if (!parts) return 0;
+    int nparts = v41_ps_parts(m, parts);
+    if (!coli_ps_layout(&g_v41_ps, parts, nparts)) { free(parts); return 0; }
+    ColiPsHit h;
+    int P = coli_ps_lookup(&g_v41_ps, ids, np, np - 2, 1, &h);
+    const V41PsState *x = P > 0 && h.ck >= 0 ? (const V41PsState *)g_v41_ps.ck[h.ck].state : NULL;
+    if (P <= held + coli_ps_min_gain(&g_v41_ps) || !x || x->n_layers != c->n_layers || x->window != c->window || x->pos != P ||
+        !coli_ps_parts_hold(parts, nparts, P)) { coli_ps_hit_free(&h); free(parts); return 0; }
+    coli_ps_load(&g_v41_ps, &h, parts, nparts);
+    free(parts);
+    const int W = c->window, hd = c->head_dim;
+    for (int i = 0; i < c->n_layers; i++) {
+        Layer *l = &m->L[i]; const int r = c->compress_ratio[i];
+        memcpy(l->window, x->win[i], (size_t)W * hd * sizeof(float));
+        memcpy(l->window_pos, x->win_pos[i], (size_t)W * sizeof(int));
+        if (c->kv_source[i] && r > 1 && x->cs_kv[i]) {
+            memcpy(l->cstate_kv, x->cs_kv[i], (size_t)r * hd * sizeof(float));
+            memcpy(l->cstate_score, x->cs_score[i], (size_t)r * hd * sizeof(float));
+        }
+    }
+    m->published_index_k = x->pub_layer >= 0 ? m->L[x->pub_layer].ikey : NULL;
+    m->published_index_layer = x->pub_layer >= 0 ? x->pub_layer : m->published_index_layer;
+    m->shared_topk_rows = m->shared_topk_width = 0;   /* as model_reset_rows: the prompt's rows publish their own */
+    m->engram.history_len = 0;
+    if (m->engram.active) engram_push(&m->engram, ids, P, NULL);   /* the history is the ids' */
+    m->pos = P;
+    kv_prefix_clear(&m->kvp);
+    kv_prefix_record(&m->kvp, ids, 0, P);
+#ifdef COLI_VULKAN
+    v41c_reset(m);   /* the host's rows and state are the conversation's: the mirrors go up again */
+#endif
+#ifdef COLI_CUDA
+    v41u_lower(m, 0);
+#endif
+    if (getenv("COLI_PREFIX_LOG")) {
+        fprintf(stderr, "[PREFIX] %d of %d prompt tokens from the store (%d blocks of %d and a checkpoint; the slot held %d)\n",
+                P, np, h.depth, g_v41_ps.B, held);
+        fflush(stderr);
+    }
+    coli_ps_hit_free(&h);
+    return P;
+}
+/* where a prompt read from `from` keeps checkpoints (coli_ps_marks): where its messages start */
+static int v41_ps_marks(const Tok *T, const int *ids, int np, int from, int *marks) {
+    static int opens[3], nopen = -1;
+    if (nopen < 0) {
+        static const char *names[] = {"<\xef\xbd\x9cUser\xef\xbd\x9c>", "<\xef\xbd\x9c" "Assistant\xef\xbd\x9c>", "<\xef\xbd\x9cSystem\xef\xbd\x9c>"};
+        nopen = 0;
+        for (size_t o = 0; o < sizeof names / sizeof *names; o++)
+            for (int k = 0; k < T->nsp; k++)
+                if (T->sp[k].len == (int)strlen(names[o]) && !memcmp(T->sp[k].str, names[o], (size_t)T->sp[k].len)) { opens[nopen++] = T->sp[k].id; break; }
+    }
+    if (!nopen || !v41_ps_on()) return 0;
+    return coli_ps_marks(ids, np, from, g_v41_ps.B, opens, nopen, marks);
 }
 
 static int v41_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int *ids, float *logits,
@@ -5318,6 +5627,8 @@ static int v41_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int 
         fprintf(stderr, "[serve] max_tokens %d clamped to %d (context %d - prompt %d); "
                         "raise CTX for longer answers\n",
                 cmd->max_tokens, budget, c->max_positions, n_prompt);
+    if (lone) v41_park_decide(m, ids, n_prompt, cmd->max_tokens, *pending_image != NULL);   /* back, kept or dropped */
+    else if (g_v41_park.on) v41_park_decide(m, ids, n_prompt, cmd->max_tokens, 1);
     /* Decided BEFORE the reset, because the reset is what it decides about.
      * A chat client resends the whole transcript every turn; if this prompt
      * begins with the ids the state was built from, that state already IS
@@ -5352,7 +5663,17 @@ static int v41_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int 
             ps = coli_pin_best(&g_pins, ids, n_prompt);
         }
     }
-    if (getenv("COLI_PREFIX_LOG")) {
+    /* the prompt the store holds further than the slot does: another conversation's on the same
+     * system prompt, this one's last turn (v41_ps_take). A request whose state is what its prompt
+     * read put there, from nothing or from the store, keeps what it reads (ps_keep). */
+    const int had_image = *pending_image != NULL;
+    int ps_from = 0;
+    if (cmd->logprobs == 0 && !had_image) {
+        int got = v41_ps_take(m, ids, n_prompt, reuse);
+        if (got) { reuse = got; ps_from = 1; g_pin_use_logit = 0; g_pin_logit = NULL; }
+    }
+    const int ps_keep = (ps_from || !reuse) && cmd->logprobs == 0 && !had_image;
+    if (getenv("COLI_PREFIX_LOG") && !ps_from) {
         if (reuse)
             fprintf(stderr, "[PREFIX] reusing %d of %d prompt tokens (%.0f%%)\n",
                     reuse, n_prompt, 100.0 * reuse / n_prompt);
@@ -5366,9 +5687,10 @@ static int v41_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int 
     }
     if (!reuse && getenv("COLI_PREFIX_LOG")) { g_v41_log_tok = tokenizer; kv_prefix_miss_log(&m->kvp, ids, n_prompt, v41_decode_one); }
     if (!reuse) {
-        /* a short request keeps the conversation (v41_unpark): only the rows it reaches start over */
+        /* a short request keeps the conversation (v41_park_decide): only the rows it reaches start
+         * over, the rows kept apart when the conversation stays parked from the last request */
         int parked = lone && !(*pending_image) ? v41_park(m, n_prompt, cmd->max_tokens) : 0;
-        model_reset_rows(m, parked ? parked : -1);
+        model_reset_rows(m, parked ? parked : g_v41_park.on ? g_v41_park.n : -1);
     }
     coli_serve_write_accept(stdout, cmd->id, n_prompt);
     float *aligned = NULL;
@@ -5429,9 +5751,20 @@ static int v41_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int 
     ColiPromptBreak brk = { .poll = v41_prompt_poll, .id = cmd->id };
     if (!echoed) {
         if (lone) g_coli_prompt_break = &brk;
-        forward_with_image(m, ids + reuse, n_prompt - reuse, logits, aligned,
-                           image_at, image_h, image_w, image_mask);
+        int at = reuse;
+        if (ps_keep) {   /* the prompt in pieces where its messages start, each kept for later requests */
+            int marks[2], nm = v41_ps_marks(tokenizer, ids, n_prompt, reuse, marks);
+            for (int k = 0; k < nm && !brk.control; k++) {
+                forward_with_image(m, ids + at, marks[k] - at, logits, NULL, -1, 0, 0, NULL);
+                at = marks[k];
+                if (!brk.control) v41_ps_save(m, ids, at);
+            }
+        }
+        if (!brk.control)
+            forward_with_image(m, ids + at, n_prompt - at, logits, aligned,
+                               image_at, image_h, image_w, image_mask);
         g_coli_prompt_break = NULL;
+        if (ps_keep && !brk.control) v41_ps_save(m, ids, n_prompt);   /* and where it ends */
     }
     free(aligned); free(image_mask);
     if (brk.control) {
@@ -5606,7 +5939,7 @@ static void serve_mux(Model *m, Tok *tokenizer, const char *snap) {
 }
 
 static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
-    if (g_v41_mux_slots > 1) { serve_mux(m, tokenizer, snap); return; }
+    if (g_v41_mux_slots > 1) { serve_mux(m, tokenizer, snap); coli_ps_report(&g_v41_ps); return; }
     Cfg *c = &m->c;
     coli_serve_stdio_init();
     int eos_ids[8];
@@ -5666,7 +5999,6 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
             continue;
         }
         V41Req rq;
-        v41_unpark(m);   /* a conversation the last request parked: back first */
         if (!v41_serve_start(m, tokenizer, &command, ids, logits, &pending_image, &pending_h, &pending_w, &rq, 1)) continue;
         double turn_started = rq.turn_started;
         double disk0 = rq.disk0, expert0 = rq.expert0, attn0 = rq.attn0, engram0 = rq.engram0;
@@ -5852,6 +6184,7 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
         serve_emap(m);
         coli_serve_command_dispose(&command);
     }
+    coli_ps_report(&g_v41_ps);
     free(ids); free(logits);
 }
 
@@ -5940,8 +6273,20 @@ static int v41_tier_block_elems(int fmt) {
 }
 #ifdef COLI_CUDA
 /* a GGUF's dense matrices as the CUDA device would hold them (cu_dense.h): the head and the layers' */
-static size_t v41_cu_w8(const W8 *w) { return w->gx ? cud_bytes(100 + w->gt, w->O, w->I, 0) : 0; }
-static size_t v41_cu_wb(const WB *w) { return w->gx ? cud_bytes(100 + w->gt, w->O, w->I, 0) : 0; }
+/* a float matrix (a GGUF's F32, F16 or BF16 tensor, or the bf16 rows the loader keeps of one) the
+ * CUDA chain's, as f32 rows (deepseek_v41_cuchain.h, cu_dense.h's cud_tensor); COLI_CUDA_CHAIN=0: none */
+static size_t v41_cu_float(int O, int I) {
+    const char *e = getenv("COLI_CUDA_CHAIN");
+    return e && *e == '0' ? 0 : (size_t)O * I * 4;
+}
+static size_t v41_cu_w8(const W8 *w) {
+    if (!w->gx) return 0;
+    return cud_float(100 + w->gt) ? v41_cu_float(w->O, w->I) : cud_bytes(100 + w->gt, w->O, w->I, 0);
+}
+static size_t v41_cu_wb(const WB *w) {
+    if (w->gx) return cud_float(100 + w->gt) ? v41_cu_float(w->O, w->I) : cud_bytes(100 + w->gt, w->O, w->I, 0);
+    return w->w ? v41_cu_float(w->O, w->I) : 0;
+}
 static size_t v41_cu_dense_bytes(const Model *m) {
     size_t b = v41_cu_wb(&m->head);
     for (int i = 0; i < m->c.n_layers; i++) {
@@ -5954,6 +6299,16 @@ static size_t v41_cu_dense_bytes(const Model *m) {
     return b;
 }
 #endif
+/* what a prompt's chain allocates on the tier's device: the CUDA chain's at most (a GGUF on the
+ * CUDA tier, one conversation, COLI_CUDA_CHAIN not 0); the tier leaves it */
+static size_t v41_tier_chain_bytes(Model *m) {
+#ifdef COLI_CUDA
+    const char *e = getenv("COLI_CUDA_CHAIN");
+    if (xt_cuda() && m->gguf && !(e && *e == '0') && g_v41_mux_slots <= 1) return v41u_plan_bytes(m, m->c.max_positions);
+#endif
+    (void)m;
+    return 0;
+}
 static size_t v41_tier_dense_bytes(Model *m) {
 #ifdef COLI_CUDA
     if (xt_cuda()) return g_v41_cud;
@@ -6120,8 +6475,8 @@ static void vk_tier_start(Model *m, const char *snap, int cap) {
                     .max_rows = MOE_ROW_CHUNK * c->n_activated,
                     .ram_reserve = expert * (size_t)cap * (size_t)c->n_layers,
                     .ram_floor = expert * (size_t)c->n_activated * (size_t)c->n_layers, .ram_given = vk_ram_given,
-                    .ram_later = v41_state_later(m),
-                    .dense_bytes = v41_tier_dense_bytes(m), .in_ram = vk_in_ram, .ram_ctx = m,
+                    .ram_later = v41_state_later(m) + v41_ps_plan(),
+                    .dense_bytes = v41_tier_dense_bytes(m), .chain_bytes = v41_tier_chain_bytes(m), .in_ram = vk_in_ram, .ram_ctx = m,
                     .load = vk_load, .release = vk_unhold, .load_ctx = m, .load_batch = vk_load_batch};
     rt_init("deepseek_v41", c->n_layers, c->n_routed);
     rt_drop_row(c->n_layers);   /* no MTP row: the history is the backbone's */
@@ -6215,6 +6570,8 @@ int main(int argc, char **argv) {
         }
     }
 #endif
+    coli_env_check(CE_DSV41, "deepseek-v41");
+    coli_env_dump(CE_DSV41, "deepseek-v41");
     /* Size the team to PHYSICAL cores before anything else touches the model.
      * This engine issues ~720 OpenMP regions per decoded token -- three per
      * expert application, 240 applications a token -- and every one of them is
@@ -6279,6 +6636,7 @@ int main(int argc, char **argv) {
      * The matrices go up on their first multiply (see vk_mul), from this thread. */
     if (!g_vk_opened) {          /* opened while the weights loaded when they may live on the device only */
         g_vk_thread = pthread_self();
+        coli_vk_window_trunk_first();   /* the trunk first here too (a GGUF's, or host copies kept): the window asked around it below */
         g_vk_ready = coli_vk_init_env_tier("deepseek_v41", vkt_wanted() && c->n_routed > 0);
         if (g_vk_ready) v41c_fit_now(&m);   /* how many layers the chain places, before any upload */
         const char *keep = getenv("COLI_VK_DENSE_HOST");
@@ -6292,6 +6650,7 @@ int main(int argc, char **argv) {
             ? "the embedding, the head, the router, norms and mixers, DSpark's stages, the vision tower; and matrices the device refused"
             : "the embedding, the head, the router, norms and mixers, DSpark's stages, the vision tower");
     v41c_start(&m);              /* COLI_VK_CHAIN: the trunk on the device, before the tier sizes itself */
+    coli_vk_window_trunk_ask();  /* trunk-first: the mapped-weights window asked around the trunk, before the tier sizes itself */
     vk_tier_start(&m, snap, cap);
     v41c_atexit();               /* after the tier's: the chain goes before the device */
     if (g_vk_ready && !vkt_ready() && !coli_vk_dense())

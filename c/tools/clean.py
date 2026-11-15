@@ -41,6 +41,7 @@ FILES = [
     "tests/compat_prefetch_module.dll",
     "libcoli_xdna.so",                      # `make xdna-helper` (Linux)
     "deepseek_v4", "deepseek_v4.exe", "deepseek_v4.cflags", "deepseek_v4.cudaflags",
+    "deepseek_v4.ldflags",
     "deepseek_v41", "deepseek_v41.exe",
     "mimo", "mimo.exe",
     "qwenimage", "qwenimage.exe",

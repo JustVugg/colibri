@@ -23,6 +23,7 @@ from gguf_reader import (
     GGML_TYPE_Q5_K,
     GGML_TYPE_Q6_K,
     GGML_TYPE_Q8_0,
+    GGML_TYPE_MXFP8,
     GGUFError,
     ggml_block_spec,
     ggml_type_name,
@@ -116,6 +117,30 @@ def dequantize_q8_0(blocks):
     d = _f16_to_f32(blocks[:, 0:2])
     packed_q = blocks[:, 2:34].view(np.int8)
     return d[:, None] * packed_q.astype(np.float32)
+
+
+def _e4m3_table():
+    v = np.zeros(256, dtype=np.float32)
+    for x in range(256):
+        e, m = (x >> 3) & 15, x & 7
+        if e == 15 and m == 7:
+            v[x] = np.nan
+            continue
+        mag = np.ldexp(np.float32(m), -9) if e == 0 else np.ldexp(np.float32(8 + m), e - 10)
+        v[x] = -mag if x & 0x80 else mag
+    return v
+
+
+_E4M3 = _e4m3_table()
+
+
+def dequantize_mxfp8(blocks):
+    # MXFP8 (ggml type 43, 33 bytes/32 elems): an E8M0 exponent byte, then 32 E4M3
+    # values; every value is e4m3 * 2^(e - 127) (0xFF a NaN scale).
+    e = blocks[:, 0].astype(np.uint32)
+    bits = np.where(e == 0, np.uint32(0x00400000), np.where(e == 255, np.uint32(0x7FC00000), e << 23))
+    d = bits.astype(np.uint32).view(np.float32)
+    return _E4M3[blocks[:, 1:33]] * d[:, None]
 
 
 def dequantize_q2_K(blocks):
@@ -237,6 +262,7 @@ _DEQUANTIZERS = {
     GGML_TYPE_Q5_K: dequantize_q5_K,
     GGML_TYPE_Q6_K: dequantize_q6_K,
     GGML_TYPE_Q8_0: dequantize_q8_0,
+    GGML_TYPE_MXFP8: dequantize_mxfp8,
 }
 
 

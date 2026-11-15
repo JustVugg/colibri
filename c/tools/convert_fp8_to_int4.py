@@ -150,9 +150,14 @@ OTHER_FAMILY_PATHS = {
                        "GGUF as the file has it (coli import), see docs/gguf.md",
     "inkling_mm_model":"Inkling: use tools/convert_inkling_int4.py",
     "inkling":         "Inkling: use tools/convert_inkling_int4.py",
+    "inkling2":        "Inkling-2: use tools/convert_inkling2_int4.py, or run one of its GGUFs "
+                       "(coli import), see docs/inkling.md",
+    "inkling2_text":   "Inkling-2: use tools/convert_inkling2_int4.py, or run one of its GGUFs "
+                       "(coli import), see docs/inkling.md",
     "olmoe":           "OLMoE: use tools/convert_olmoe.py",
     "kimi_k3":         "Kimi K3: see docs/kimi_k3.md for its container pipeline",
     "kimi_linear":     "Kimi K3: see docs/kimi_k3.md for its container pipeline",
+    "kimi_k31":        "Kimi K3.1: see docs/kimi_k3.md for its container pipeline",
     "deepseek_v4":     "DeepSeek V4: see docs/deepseek-v4.md, section Download",
     "deepseek_v41":    "DeepSeek V4.1: no conversion needed -- its experts already ship fp4 and its dense fp8; run tools/prepare_dsv41.py once, see docs/deepseek-v41.md",
     "deepseek_v41_text": "DeepSeek V4.1: no conversion needed -- see docs/deepseek-v41.md",
@@ -968,15 +973,15 @@ def main():
         if _pool is not None:
             _pool.close(); _pool.join()
         if skipped: print(f"[RESUME] {skipped} shard(s) already done in {a.outdir}, skipped")
-        # metadati per la conversione principale: gli stessi quattro file del download
+        # metadati per la conversione principale: gli stessi file del download
         # path — senza tokenizer.json chat/serve non partono. I passaggi mtp/idx vanno
         # nella stessa outdir di un container gia' completo di metadati.
-        # EN: metadata for the main pass: the same four files as the download path —
+        # EN: metadata for the main pass: the same metadata files as the download path —
         # EN: chat/serve won't start without tokenizer.json. The mtp/idx passes target
         # EN: an outdir whose container already has its metadata.
         if not a.mtp and not a.indexer:
             copied, missing = [], []
-            for fn in ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json"] + \
+            for fn in ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json", "chat_template.jinja"] + \
                       (["processor_config.json"] if ML4 else []):
                 src = os.path.join(a.indir, fn)
                 if os.path.exists(src): shutil.copy(src, a.outdir); copied.append(fn)
@@ -1221,7 +1226,7 @@ def main():
     if not shards:
         print("ERROR: no .safetensors shards found in this repository.", flush=True)
         return
-    for fn in ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json"] + \
+    for fn in ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json", "chat_template.jinja"] + \
               (["processor_config.json"] if ML4 else []):
         try: shutil.copy(hf_hub_download(a.repo, fn, local_dir=a.outdir+"/_meta"), a.outdir)
         except Exception: pass

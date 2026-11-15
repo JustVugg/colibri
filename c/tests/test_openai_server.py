@@ -685,6 +685,29 @@ class TemplateTest(unittest.TestCase):
         self.assertIn("\ntool-choiceThe system is invoked with `tool_choice=required`.", prompt)
         self.assertTrue(prompt.endswith("G 0\n"))
 
+    def test_kimi_renders_the_thinking_effort_as_the_reference_does(self):
+        """K3 and K3.1's template: a thinking-effort system message after the tools, its
+        values low, high and max; nothing without thinking or without an effort."""
+        body = ("`thinking_effort` guides on how much to think in your thinking channel "
+                "(not including the response channel), supported values include `low`, "
+                "`medium`, `high`, and `max`.\n"
+                "Now the system is invoked with `thinking_effort=max`.")
+        prompt = render_chat_kimi([{"role": "user", "content": "Hi"}], True, "max")
+        self.assertEqual(prompt, "K3CHAT1\n"
+                         f"Y 15 {len(body.encode('utf-8'))}\nthinking-effort{body}"
+                         "M user 2\nHiG 1\n")
+        for asked, sent in (("minimal", "low"), ("low", "low"), ("medium", "high"),
+                            ("high", "high"), ("xhigh", "max")):
+            self.assertIn(f"`thinking_effort={sent}`.", render_chat_kimi(
+                [{"role": "user", "content": "Hi"}], True, asked))
+        for thinking, effort in ((False, "max"), (True, None), (True, "none"), (True, "bogus")):
+            self.assertNotIn("thinking-effort", render_chat_kimi(
+                [{"role": "user", "content": "Hi"}], thinking, effort))
+        tools = [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]
+        prompt = render_chat_kimi([{"role": "user", "content": "Hi"}], True, "low", tools)
+        self.assertLess(prompt.index("tool-declare"), prompt.index("thinking-effort"))
+        self.assertLess(prompt.index("thinking-effort"), prompt.index("M user"))
+
     def test_kimi_renders_tool_calls_and_results(self):
         messages = [
             {"role": "user", "content": "Weather in Rome?"},
@@ -1831,6 +1854,29 @@ class SchedulerTest(unittest.TestCase):
                 self.assertEqual(list(scheduler.queue), [older])
                 self.assertEqual(scheduler.snapshot()["rejected"], 1)
 
+    def test_preferred_slot_is_taken_when_free_and_left_when_busy(self):
+        # conversation_cache_slot's slot is a preference: free, it is the pick; busy with
+        # another conversation, a free slot is taken at once instead of waiting for it.
+        scheduler = GenerationScheduler(max_queue=0, queue_timeout=0.01, capacity=3)
+        with scheduler.admit(prefer=2) as (_, slot):
+            self.assertEqual(slot, 2)
+            with patch.object(scheduler.condition, "wait", side_effect=AssertionError("waited for a busy preferred slot")):
+                with scheduler.admit(prefer=2) as (_, other):
+                    self.assertEqual(other, 0)
+                    self.assertEqual(scheduler.snapshot()["active"], 2)
+        stats = scheduler.snapshot()
+        self.assertEqual((stats["rejected"], stats["timed_out"], stats["completed"]), (0, 0, 2))
+
+    def test_preference_does_not_bypass_older_any_slot_waiter(self):
+        scheduler = GenerationScheduler(max_queue=1, capacity=2)
+        older = (object(), None)
+        scheduler.queue.append(older)
+        with self.assertRaises(APIError) as caught:
+            with scheduler.admit(prefer=1):
+                self.fail("bypassed older waiter")
+        self.assertEqual(caught.exception.code, "queue_full")
+        self.assertEqual(list(scheduler.queue), [older])
+
     def test_zero_queue_rejects_busy_pinned_slot_with_spare_capacity(self):
         scheduler = GenerationScheduler(max_queue=0, queue_timeout=0.01, capacity=2)
         with scheduler.admit(slot=0):
@@ -2918,6 +2964,10 @@ class CapSentinelShimTest(unittest.TestCase):
             "qwen38", None, {"COLI_PLAN_CAP": "11", "COLI_PROFILE_CAP": "7"}), 7)
         self.assertEqual(cap_for_arch(
             "qwen38", 5, {"COLI_PLAN_CAP": "11", "COLI_PROFILE_CAP": "7"}), 5)
+        # #2785: OLMoE sizes its own cache from the plan's RAM_GB
+        self.assertEqual(cap_for_arch("olmoe", None, planned), 0)
+        self.assertEqual(cap_for_arch(
+            "olmoe", None, {"COLI_PLAN_CAP": "11", "COLI_PROFILE_CAP": "7"}), 7)
 
     def test_engine_consumes_profile_cap_without_leaking_private_env(self):
         process = FakeProcess(lambda _process, _frame: None)
@@ -3057,6 +3107,26 @@ class CapSentinelShimTest(unittest.TestCase):
         self.assertEqual(env["V4_MTP_CONF"], "0.7")  # explicit override wins
         self.assertEqual(env["V4_MTP_GPU"], "0")     # GPU drafting opt-in, off by default
 
+    def test_direct_v4_server_libomp_team_sleeps_when_idle(self):
+        # an idle served engine must not spin: OMP_WAIT_POLICY=active alone is
+        # an infinite KMP_BLOCKTIME in LLVM's libomp (#341, #2286)
+        env = {}
+        explicit = {"KMP_BLOCKTIME": "0"}
+        passive = {"OMP_WAIT_POLICY": "PASSIVE"}
+        with patch("openai_server.sys.platform", "win32"):
+            for e in (env, explicit, passive):
+                tune_child_env(e, "deepseek_v4")
+        self.assertEqual(env["OMP_WAIT_POLICY"], "active")
+        self.assertEqual(env["KMP_BLOCKTIME"], "200")
+        self.assertEqual(explicit["KMP_BLOCKTIME"], "0")
+        # libomp gives passive its blocktime 0 only while KMP_BLOCKTIME is unset
+        self.assertNotIn("KMP_BLOCKTIME", passive)
+        # macOS's libomp is left as it was (#707)
+        mac = {}
+        with patch("openai_server.sys.platform", "darwin"):
+            tune_child_env(mac, "deepseek_v4")
+        self.assertNotIn("KMP_BLOCKTIME", mac)
+
     def test_direct_v4_server_preserves_explicit_omp_threads(self):
         env = {"OMP_NUM_THREADS": "3"}
         tune_child_env(env, "deepseek_v4")
@@ -3065,7 +3135,7 @@ class CapSentinelShimTest(unittest.TestCase):
     def test_direct_v4_server_honours_omp_kill_switch(self):
         env = {"COLI_NO_OMP_TUNE": "1"}
         tune_child_env(env, "deepseek_v4")
-        for key in ("OMP_NUM_THREADS", "OMP_WAIT_POLICY", "GOMP_SPINCOUNT",
+        for key in ("OMP_NUM_THREADS", "OMP_WAIT_POLICY", "GOMP_SPINCOUNT", "KMP_BLOCKTIME",
                     "OMP_DYNAMIC", "OMP_PROC_BIND", "OMP_PLACES"):
             self.assertNotIn(key, env)
 
@@ -3169,6 +3239,27 @@ class EngineRestartTest(unittest.TestCase):
         self.assertEqual(dead.closed, 1)
         self.assertEqual(fresh.closed, 0)
         self.assertEqual(server.pinned_prefixes, {})   # the photos lived in the dead KV
+
+    def test_keep_engine_takes_the_context_the_new_engine_holds(self):
+        # a restart with less free RAM plans a smaller context: /health and the request
+        # clamp must say so, not the first engine's figures
+        dead, fresh = _DeadableEngine("dead"), _DeadableEngine("fresh")
+        dead.context_limit, dead.max_tokens = 31744, 31744
+        fresh.context_limit, fresh.max_tokens = 20480, 20480
+        server = self._server(dead)
+        server.context_limit, server.max_tokens = 31744, 31744
+        stopping = threading.Event()
+        thread = threading.Thread(target=openai_server.keep_engine,
+                                  args=(server, lambda: fresh, stopping, 0.01, (0.01, 0.02), 0.01),
+                                  daemon=True)
+        thread.start()
+        dead.alive = False
+        deadline = time.monotonic() + 2
+        while server.engine is not fresh and time.monotonic() < deadline:
+            time.sleep(0.01)
+        stopping.set()
+        thread.join(timeout=2)
+        self.assertEqual((server.context_limit, server.max_tokens), (20480, 20480))
 
     def test_keep_engine_tries_a_failed_start_again(self):
         dead, fresh = _DeadableEngine("dead"), _DeadableEngine("fresh")
@@ -3933,6 +4024,28 @@ class HTTPTest(unittest.TestCase):
                 self.assertEqual(response.status, 200)
         self.assertEqual(self.engine.calls[-1][0], render_chat_qwen38(history, True, "xhigh"))
 
+    def test_chat_template_kwargs_reach_the_template(self):
+        """Many OpenAI-compatible clients turn a Qwen model's thinking off with
+        chat_template_kwargs; it was ignored, and Qwen3.8 reasoned at xhigh. The body's own
+        key still wins, and a chat_template_kwargs that is not an object is refused."""
+        history = [{"role": "user", "content": "Capital of France?"}]
+        off = {"chat_template_kwargs": {"enable_thinking": False}}
+        cases = ((off, render_chat_qwen38(history, False, None)),
+                 (dict(off, enable_thinking=True), render_chat_qwen38(history, True, "xhigh")),
+                 ({"chat_template_kwargs": {"reasoning_effort": "low"}}, render_chat_qwen38(history, True, "low")))
+        with patch("openai_server.ARCH", "qwen36"), patch("openai_server.CHAT_FLAVOR", "qwen38"):
+            for extra, expected in cases:
+                with self.subTest(extra=extra):
+                    with self.request("/v1/chat/completions", {
+                            "model": "test-model", "messages": history, **extra}) as response:
+                        self.assertEqual(response.status, 200)
+                    self.assertEqual(self.engine.calls[-1][0], expected)
+            with self.assertRaises(HTTPError) as caught:
+                self.request("/v1/chat/completions", {
+                    "model": "test-model", "messages": history, "chat_template_kwargs": [1]})
+            self.addCleanup(caught.exception.close)
+            self.assertEqual(caught.exception.code, 400)
+
     def test_a_well_formed_forced_tool_choice_still_runs(self):
         """The read above must not change the shape clients actually send."""
         with self.request("/v1/chat/completions", {
@@ -4107,7 +4220,9 @@ class HTTPTest(unittest.TestCase):
                 with patch("openai_server.ARCH", arch):
                     with self.request("/v1/chat/completions", request("this")) as response:
                         self.assertEqual(response.status, 200)
-                self.assertIn("look at this", self.engine.calls[-1][0])
+                # V4.1 joins content blocks on a blank line, as its encoding.py does
+                joined = "look at \n\nthis" if arch == "deepseek_v41" else "look at this"
+                self.assertIn(joined, self.engine.calls[-1][0])
 
 class ClientHangupTest(unittest.TestCase):
     """A client that disconnects mid-response must not print a traceback.
@@ -6836,8 +6951,8 @@ class LogprobsHTTPTest(unittest.TestCase):
         # The extension keys must land where the engine's own SUBMIT parser expects them:
         # coli_submit_parse reads seven numeric fields, while a sibling engine's parser
         # reads six and takes its keys straight after top_p. Sending the field to that one
-        # puts a bare `0` where its parser wants `key=value`, and the engine answers
-        # "bad submit extension" before it ever sees the prompt.
+        # puts a bare `0` where its parser wants `key=value`, and the engine refuses the
+        # header ("bad submit header") before it ever sees the prompt.
         original = openai_server.ARCH
         try:
             openai_server.ARCH = "glm"

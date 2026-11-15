@@ -217,6 +217,34 @@ after the first turn), the second turn after the title: Qwen3.6-35B on the CPU 5
 conversation without the title. OLMoE, attention alone, also resumes where a prompt leaves the
 held state (an answer sent back without its reasoning, a changed turn) instead of reading it all.
 
+### Every prompt kept: the prefix store
+
+The live state, the prompt-end snapshot, the system prompt's pin and a parked conversation each hold
+one place, and a pin only the recurrent state: its rows must still be where they were. An agent with
+two system prompts (two roles, two tool sets) wrote one over the other, so each new conversation read
+its system prompt again; a conversation back after another system prompt took the slot, or sent by
+the gateway to the other slot, read everything. `prefix_store.h` keeps every prompt read, as qwen36
+does ([qwen36.md](qwen36.md#the-prefix-store)): the attention layers' K/V and index rows (the MTP
+head's with them) in blocks of 256 tokens named by their tokens, shared by every prompt that starts
+with them, and checkpoints of the rest (the DeltaNet recurrences and conv windows, the PLE ring and
+history, the MTP head's place) where a prompt's messages start (`<|im_start|>`) and where a turn ends.
+A request takes the deepest checkpoint its prompt starts with when it reaches further than what the
+slot holds, in any slot. The MTP head's rows stand below its own length, so a checkpoint is kept
+only when its whole blocks hold every head row: a block other prompts share is whole.
+
+MEASURED
+
+`tests/test_qwen38_prefix_store.py` holds every request that took the store to a fresh engine
+reading the same prompt with the store off, each step's top five logits to the last digit: a new
+conversation on the same system prompt, the first conversation back after another system prompt
+took the slot, two slots with the conversation on the other one, the MTP head on (the same bytes),
+a budget of nothing, the store off, a read-out reading everything; `QWEN38_PS_BACKEND=vulkan` runs
+both engines on the dense chain (Lavapipe in `tests/vulkan_engines.sh`). Leaving out the rows or
+the state makes it fail. `COLI_PREFIX_STORE=0` or `COLI_KV_PREFIX=0` turns it off.
+
+A parked conversation that comes back now lowers the MTP head's device mirror too: it held the short
+request's rows, and the head's drafts read them (the answer the same, the drafts worse).
+
 ## Routed experts as int4-g64
 
 Optional. Decode waits on routed experts: a miss is a disk read, and how many
@@ -433,6 +461,13 @@ cost of a verify by its rows. Prompt lookup (on by default) adds drafts (up to 5
 the context's n-grams), and a verify carries whichever proposal is worth more. The
 output stays that of plain decoding. Measured on the release with the int4-g64 sidecar: 4.94 tok/s at two drafts against 4.71 at one and 4.12 without MTP on the CPU (2.75 tokens per forward), 4.55 against 4.39 and 3.91 with the Vulkan tier and chain on a Radeon 780M, so two drafts is the default (one on an integrated GPU with 32 or more compute units, the tier and the chain on). The details, the settings and the
 tests are in [speculative.md](speculative.md).
+
+`COLI_DFLASH=<dir>` drafts with a DFlash2 drafter (`incoai/Qwen3.8-Flash-Next-DFlash2`) in
+the head's place on the CUDA chain, its context the four streams after its target layers
+(their sum). On Qwen3.8-Flash-Next IQ2_XS it is at the head's pace at best (3 drafts: 92.0 /
+70.5 / 71.8 tok/s code, prose, a list, the head 91 to 97 / 70 to 71 / 80 to 90): each verify
+row brings its own experts, so the head's cheaper drafts stay the default; see
+[speculative.md](speculative.md#dflash2).
 
 `make -C c qwen38-tiny-mtp-check` adds a head with random weights under the
 release's names to the three tiny fixtures and gates on the head's draft

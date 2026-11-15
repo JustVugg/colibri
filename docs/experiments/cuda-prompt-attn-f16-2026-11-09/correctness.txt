@@ -1,0 +1,149 @@
+# correctness.txt: the CUDA checks of this PR's code (c/ tree 61e4fa38, measured as local commit a37779ed) against dev
+# bf0b0eae on one Tesla V100-SXM2-32GB (sm_70), CUDA 12.8 (nvidia/cuda:12.8.1-devel-ubuntu24.04), Vast.ai, 9 November
+# 2026. Lines taken from the run's logs as printed.
+
+## make cuda-chain-check CUDA=1 CUDA_ARCH=sm_70 on this PR: the prompt rows and every FAIL
+  ok   prompt rows: H 4 KV 2 hd 64, 40 rows after 0, the gate
+  prompt rows: H 4 KV 2 hd 64, 40 rows after 0, the gate: max |diff| 1.52e-04
+  ok   prompt rows: H 16 KV 2 hd 256, 70 rows after 33, the gate
+  prompt rows: H 16 KV 2 hd 256, 70 rows after 33, the gate: max |diff| 7.48e-05
+  ok   prompt rows: H 8 KV 8 hd 128, 17 rows after 200
+  prompt rows: H 8 KV 8 hd 128, 17 rows after 200: max |diff| 4.84e-05
+  ok   prompt rows: H 16 KV 4 hd 128, 64 rows after 0
+  prompt rows: H 16 KV 4 hd 128, 64 rows after 0: max |diff| 3.16e-04
+  ok   prompt rows: H 24 KV 4 hd 256, 70 rows after 33, the gate
+  prompt rows: H 24 KV 4 hd 256, 70 rows after 33, the gate: max |diff| 8.94e-08
+  ok   prompt rows: H 24 KV 4 hd 256, 100 rows after 0
+  prompt rows: H 24 KV 4 hd 256, 100 rows after 0: max |diff| 2.38e-07
+  ok   prompt rows: H 48 KV 4 hd 256, 37 rows after 5, the gate
+  prompt rows: H 48 KV 4 hd 256, 37 rows after 5, the gate: max |diff| 1.19e-07
+  ok   prompt rows, window 129 and sinks: H 32 KV 4 hd 128, 300 rows after 700
+  prompt rows, window 129 and sinks: H 32 KV 4 hd 128, 300 rows after 700: max |diff| 7.03e-05
+  ok   prompt rows, window 129 and sinks: H 32 KV 4 hd 128, 90 rows after 900, a ring
+  prompt rows, window 129 and sinks: H 32 KV 4 hd 128, 90 rows after 900, a ring: max |diff| 6.89e-05
+  ok   prompt rows, window 100 and sinks: H 16 KV 2 hd 256, 70 rows after 300
+  prompt rows, window 100 and sinks: H 16 KV 2 hd 256, 70 rows after 300: max |diff| 7.41e-05
+  ok   prompt rows, window 20 and sinks: H 8 KV 8 hd 64, 33 rows after 0
+  prompt rows, window 20 and sinks: H 8 KV 8 hd 64, 33 rows after 0: max |diff| 2.64e-04
+  ok   prompt rows, window 513 and sinks: H 32 KV 4 hd 128, 200 rows after 0
+  prompt rows, window 513 and sinks: H 32 KV 4 hd 128, 200 rows after 0: max |diff| 3.20e-04
+  ok   prompt rows, a long chunk: H 16 KV 2 hd 256, 2043 rows after 6144, rows 0, 1, 1024 and 2042
+  ok   and from a float16 cache of the same values, the float32 cache's bits
+  ok   16-byte staging, a float32 cache: H 16 KV 2 hd 256, 2043 rows after 6144: the scalar loop's bits
+  16-byte staging, rows 0, 1, 1024 and 2042: max |diff| 9.13e-06
+  ok   16-byte staging, a float16 cache: the scalar loop's bits
+  ok   a float16 cache: H 16 KV 2 hd 256, 3 rows after 2500: a float32 cache's bits
+  ok   a float16 cache: H 8 KV 8 hd 128, 4 rows after 700: a float32 cache's bits
+  ok   a float16 cache: H 16 KV 2 hd 256, 70 rows after 33: a float32 cache's bits
+  ok   a float16 cache: H 4 KV 2 hd 64, 40 rows after 0: a float32 cache's bits
+  ok   a float16 cache: H 32 KV 4 hd 128, 1 rows after 4000, a window and sinks in a ring: a float32 cache's bits
+  ok   a float16 cache: H 32 KV 4 hd 128, 90 rows after 900, a window and sinks in a ring: a float32 cache's bits
+  ok   a float16 cache: H 32 KV 4 hd 128, 3 rows after 5000, a window and sinks: a float32 cache's bits
+  FAIL 300 rows: the up projection and the mix in one pass, those of the two ops to the bit
+  FAIL 100 rows: the up projection and the mix in one pass, those of the two ops to the bit
+  FAIL the counters saw the frames, ops and matmuls
+test_cuda_chain: 3 failure(s)
+
+## the same on dev (an earlier run on the same machine): the same three FAIL lines (the hyper-connection mix and
+## the counters, outside this change)
+  FAIL 300 rows: the up projection and the mix in one pass, those of the two ops to the bit
+  FAIL 100 rows: the up projection and the mix in one pass, those of the two ops to the bit
+  FAIL the counters saw the frames, ops and matmuls
+test_cuda_chain: 3 failure(s)
+
+## counter-tests on this PR: red-h swaps the halves a float16 load copies, red-f rounds floats toward zero; each
+## fails the staging's line of its cache (and the older tests that take the staging too), as dev's three do
+### red-h
+  FAIL and from a float16 cache of the same values, the float32 cache's bits
+  ok   16-byte staging, a float32 cache: H 16 KV 2 hd 256, 2043 rows after 6144: the scalar loop's bits
+  16-byte staging, rows 0, 1, 1024 and 2042: max |diff| 9.13e-06
+  FAIL 16-byte staging, a float16 cache: the scalar loop's bits
+  FAIL a float16 cache: H 16 KV 2 hd 256, 70 rows after 33: a float32 cache's bits
+  FAIL 300 rows: the up projection and the mix in one pass, those of the two ops to the bit
+  FAIL 100 rows: the up projection and the mix in one pass, those of the two ops to the bit
+  FAIL the counters saw the frames, ops and matmuls
+test_cuda_chain: 6 failure(s)
+### red-f
+    -    __half2 lo = __floats2half2_rn(__uint_as_float(r.x), __uint_as_float(r.y)),
+    -            hi = __floats2half2_rn(__uint_as_float(r.z), __uint_as_float(r.w));
+    +    __half2 lo = __halves2half2(__float2half_rz(__uint_as_float(r.x)), __float2half_rz(__uint_as_float(r.y))),
+    +            hi = __halves2half2(__float2half_rz(__uint_as_float(r.z)), __float2half_rz(__uint_as_float(r.w)));
+  FAIL 16-byte staging, a float32 cache: H 16 KV 2 hd 256, 2043 rows after 6144: the scalar loop's bits
+  16-byte staging, rows 0, 1, 1024 and 2042: max |diff| 3.49e-05
+  ok   16-byte staging, a float16 cache: the scalar loop's bits
+  FAIL 300 rows: the up projection and the mix in one pass, those of the two ops to the bit
+  FAIL 100 rows: the up projection and the mix in one pass, those of the two ops to the bit
+  FAIL the counters saw the frames, ops and matmuls
+test_cuda_chain: 4 failure(s)
+
+## registers and stack of cc_attn_fk at head dim 256 (cuobjdump -res-usage, sm_70): dev first (names without Lb),
+## then this PR (Lb0 the loop, Lb1 the staging)
+ Function _Z10cc_attn_fkILi256E6__halfEvPKfPKT0_S5_PfS2_6CcAttniiS2_ii:   REG:230 STACK:0 SHARED:40576 LOCAL:0
+ Function _Z10cc_attn_fkILi256EfEvPKfPKT0_S4_PfS1_6CcAttniiS1_ii:   REG:230 STACK:0 SHARED:40576 LOCAL:0
+ Function _Z10cc_attn_fkILi256E6__halfLb0EEvPKfPKT0_S5_PfS2_6CcAttniiS2_ii:   REG:230 STACK:0 SHARED:40576 LOCAL:0
+ Function _Z10cc_attn_fkILi256E6__halfLb1EEvPKfPKT0_S5_PfS2_6CcAttniiS2_ii:   REG:242 STACK:0 SHARED:40576 LOCAL:0
+ Function _Z10cc_attn_fkILi256EfLb0EEvPKfPKT0_S4_PfS1_6CcAttniiS1_ii:   REG:230 STACK:0 SHARED:40576 LOCAL:0
+ Function _Z10cc_attn_fkILi256EfLb1EEvPKfPKT0_S4_PfS1_6CcAttniiS1_ii:   REG:242 STACK:0 SHARED:40576 LOCAL:0
+
+## the first port to the float16 cache, groups of 16 loads (local commit 20060b8c, an earlier run on the same machine):
+## registers and stack, and its prompt against dev (4 + 4 runs in ABBA order, medians)
+ Function _Z10cc_attn_fkILi256E6__halfLb1EEvPKfPKT0_S5_PfS2_6CcAttniiS2_ii:   REG:255 STACK:392 SHARED:40576 LOCAL:0
+ Function _Z10cc_attn_fkILi256EfLb1EEvPKfPKT0_S4_PfS1_6CcAttniiS1_ii:   REG:255 STACK:96 SHARED:40576 LOCAL:0
+prompt  2048 | -1.2%, every run slower 
+prompt  4096 | -4.4%, every run slower 
+prompt  8192 | -4.5%, every run slower 
+
+## every arch builds cuda_chain.cu (one nvcc): the staging's registers per arch (float16 cache, then float32)
+10-arch.log:make rc=0
+lto>_75' will be removed in a future release (Use -Wno-deprecated-gpu-targets to suppress warning).
+sm_70	  REG:242 STACK:0 SHARED:40576 LOCAL:0	  REG:242 STACK:0 SHARED:40576 LOCAL:0
+sm_75	  REG:173 STACK:0 SHARED:40576 LOCAL:0	  REG:173 STACK:0 SHARED:40576 LOCAL:0
+sm_80	  REG:166 STACK:0 SHARED:40576 LOCAL:0	  REG:166 STACK:0 SHARED:40576 LOCAL:0
+sm_86	  REG:171 STACK:0 SHARED:40576 LOCAL:0	  REG:171 STACK:0 SHARED:40576 LOCAL:0
+sm_89	  REG:166 STACK:0 SHARED:40576 LOCAL:0	  REG:166 STACK:0 SHARED:40576 LOCAL:0
+sm_120	  REG:168 STACK:0 SHARED:41600 LOCAL:0	  REG:168 STACK:0 SHARED:41600 LOCAL:0
+
+## the kernel each version runs, a 2048-token prompt under nsys (cuda_gpu_kern_sum: share %, total ns, launches, name)
+dev: 6.6,83944646,10 void cc_attn_fk<(int)256, __half>
+this PR: 2.6,31347887,10 void cc_attn_fk<(int)256, __half, (bool)1>
+
+## tests/cuda_tier_engines.sh on this PR (the fixtures' pinned packages from tools/requirements-*.txt)
+OK glm53 decode: tokens = CPU, device 56
+OK glm53 evict: tokens = CPU, device 16
+OK glm53 chain decode: tokens = CPU, max |logit diff| 4.77e-07 of 1.82e+00, 9 chain forwards
+OK glm53 chain 100-token prompt, 32-bit trunk: tokens = CPU, max |logit diff| 7.15e-07 of 1.97e+00, 5 chain forwards
+OK glm53 chain 100-token prompt, 4-bit trunk, exact GEMMs: tokens = CPU, max |logit diff| 5.96e-07 of 1.89e+00, 5 chain forwards
+OK glm53 chain 100-token prompt, 4-bit trunk, tensor cores: tokens = CPU, max |logit diff| 5.71e-04 of 1.89e+00, 5 chain forwards
+OK glm53 chain prefill chunks of 7, one cache slot: tokens = CPU, max |logit diff| 4.79e-07 of 1.89e+00, 19 chain forwards
+OK glm53 chain chunks of 3: tokens = CPU, max |logit diff| 5.96e-07 of 1.97e+00, 38 chain forwards
+OK qwen36 GGUF dense, DeltaNet qkv and gate in two types, a 12-row step: tokens = CPU, max |logit diff| 2.64e-02 of 3.14e+00, 2 in_proj as two tensors, the chain on
+OK qwen36 GGUF dense, DeltaNet qkv and gate in two types, chunks of 5: tokens = CPU, max |logit diff| 4.77e-07 of 3.14e+00, 2 in_proj as two tensors, the chain on
+OK qwen36 GGUF hybrid steps: tokens = CPU (48 hybrid layer steps)
+OK qwen36 GGUF hybrid steps, each signal sent at once: tokens = CPU (48 hybrid layer steps)
+OK qwen36 GGUF the host's word lost: tokens = CPU (0 hybrid layer steps)
+OK deepseek_v41 cap=1: output = CPU, oracle passed, device 287
+OK deepseek_v41 cap=2: output = CPU, oracle passed, device 287
+OK deepseek_v41 cap=8: output = CPU, oracle passed, device 287
+OK deepseek_v41 GGUF: tokens = CPU, device 228, 68 dense matrices on the card
+OK colibri GGUF chain decode: tokens = CPU, max |logit diff| 8.05e-07 of 1.81e+00, 8 chain forwards, device 90
+OK colibri GGUF chain decode, cap=1: tokens = CPU, max |logit diff| 8.05e-07 of 1.81e+00, 8 chain forwards, device 90
+OK colibri GGUF chain DSA top-4, the dense part at 8 bits (the serve's: the indexer's F32 head weights in int8): tokens = CPU, max |logit diff| 7.75e-07 of 1.46e+00, 8 chain forwards, device 282
+OK colibri GGUF chain 40-token prompt: tokens = CPU, max |logit diff| 7.75e-07 of 1.82e+00, 8 chain forwards, device 294
+OK colibri GGUF chain 40-token prompt in chunks of 3: tokens = CPU, max |logit diff| 7.75e-07 of 1.82e+00, 8 chain forwards, device 294
+OK colibri GGUF chain DSA top-4: tokens = CPU, max |logit diff| 7.15e-07 of 1.90e+00, 8 chain forwards, device 90
+OK colibri GGUF chain DSA top-4, 40-token prompt in chunks of 5: tokens = CPU, max |logit diff| 1.39e-06 of 1.69e+00, 8 chain forwards, device 282
+OK colibri GGUF chain DSA_FORCE: tokens = CPU, max |logit diff| 8.94e-07 of 1.82e+00, 8 chain forwards, device 294
+OK colibri GGUF chain 40-token prompt, tensor cores: tokens = CPU, max |logit diff| 1.39e-06 of 1.69e+00, 8 chain forwards, device 282
+OK colibri GGUF chain DSA top-4 over shared indexer layers (layers 2 and 3 reuse layer 1's selection): tokens = CPU, max |logit diff| 7.75e-07 of 1.77e+00, 8 chain forwards, device 90
+OK colibri GGUF chain DSA top-4 over shared indexer layers, 40-token prompt in chunks of 5: tokens = CPU, max |logit diff| 8.34e-07 of 1.73e+00, 7 chain forwards, device 288
+OK mimo dense bits 32: tokens = CPU, device 260, 16 dense matrices on the card
+OK mimo dense bits 0: tokens = CPU, device 260, 0 dense matrices on the card
+OK kimi_k3 GGUF all: tokens = CPU, logits within 2.0e-06 of the largest, device 120
+OK kimi_k3 GGUF budget of two: tokens = CPU, logits within 2.0e-06 of the largest, device 120
+OK kimi_k3 GGUF host pool: tokens = CPU, logits within 2.0e-06 of the largest, device 120
+OK glm53 dev2 decode: tokens = CPU, second device Tesla V100-SXM2-32GB (the same card): resident 2 (budget 14, 54.0 KiB of 30.93 GiB), 87 rows in 7 batches (1 beside prompt steps), uploads 2, 7.2 ms
+OK glm53 dev2 evict: tokens = CPU, second device Tesla V100-SXM2-32GB (the same card): resident 1 (budget 1, 27.0 KiB of 30.93 GiB), 44 rows in 4 batches (1 beside prompt steps), uploads 1, 7.4 ms
+OK glm53 dev2 fault: tokens = CPU, second device Tesla V100-SXM2-32GB (the same card): resident 0 (budget 0, 0.0 KiB of 30.93 GiB), 80 rows in 1 batches (1 beside prompt steps), uploads 2, 7.1 ms (stopped)
+OK deepseek_v41 dev2 decode: output = CPU, oracle passed, second device Tesla V100-SXM2-32GB (the same card): resident 46 (budget 46, 690.0 KiB of 30.93 GiB), 211 rows in 48 batches (0 beside prompt steps), uploads 46, 2.4 ms
+OK deepseek_v41 dev2 fault: output = CPU, oracle passed, second device Tesla V100-SXM2-32GB (the same card): resident 0 (budget 0, 0.0 KiB of 30.93 GiB), 17 rows in 1 batches (0 beside prompt steps), uploads 46, 0.1 ms (stopped)
+fails: 0

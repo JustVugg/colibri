@@ -53,7 +53,9 @@ typedef struct {
 } MistralVision;
 
 typedef float mv_v8 __attribute__((vector_size(32)));
-static inline float mv_hsum(mv_v8 v) { float a = 0.f; for (int i = 0; i < 8; i++) a += v[i]; return a; }
+/* By pointer: clang warns (-Wpsabi) at every call that passes a 32-byte vector by
+ * value in a build without AVX, which is any x86-64 build with no -march. */
+static inline float mv_hsum(const mv_v8 *v) { float a = 0.f; for (int i = 0; i < 8; i++) a += (*v)[i]; return a; }
 
 /* y[S, O] = x[S, I] . w^T, both rows contiguous: 1 done on the device, 0 left to the CPU */
 typedef int (*mv_device_mm_fn)(MvMat *w, float *y, const float *x, int S);
@@ -90,7 +92,7 @@ static void mv_gemm(float *y, int ldy, const float *x, int ldx, MvMat *w, int S)
                     }
                     for (int a = 0; a < ns; a++)
                         for (int b = 0; b < no; b++) {
-                            float t = mv_hsum(acc[a][b]);
+                            float t = mv_hsum(&acc[a][b]);
                             for (int k = i; k < I; k++) t += xr[a][k] * wr[b][k];
                             y[(size_t)(s + a) * ldy + o0 + o + b] = t;
                         }
@@ -174,7 +176,7 @@ static int mistral_vision_forward(MistralVision *v, const float *patches, int gh
                         const float *kj = k + (size_t)j * D + hh * hd;
                         mv_v8 acc = {0};
                         for (int d = 0; d < hd; d += 8) { mv_v8 a, b; memcpy(&a, qi + d, 32); memcpy(&b, kj + d, 32); acc += a * b; }
-                        sc[j] = mv_hsum(acc) * scale;
+                        sc[j] = mv_hsum(&acc) * scale;
                         if (sc[j] > mx) mx = sc[j];
                     }
                     double sum = 0;

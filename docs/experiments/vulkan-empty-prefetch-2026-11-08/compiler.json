@@ -1,0 +1,4 @@
+{
+  "gcc": "gcc (Ubuntu 15.2.0-16ubuntu1) 15.2.0\nCopyright (C) 2025 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n",
+  "glslc": "shaderc 2026.1-1\nspirv-tools \nglslang 16.1.0-1\n\nTarget: SPIR-V 1.0\n"
+}

@@ -1,0 +1,103 @@
+{
+  "version": 1,
+  "hypothesis": "With formats by layer, a room class for each size the forms' tensors take (instead of one class for every form but the most common, at the biggest of them) holds more experts in the same device budget, so a model that does not fit reads fewer experts from disk and runs faster",
+  "commit": "b92eccd79ac60f196146f784c241ea076adda6f6",
+  "model": "Flint 40B-A2.5B UD-Q4_K_XL (GGUF, 25.05 GB; Q5_K experts on 16 of 49 layers, six other forms on the 33 others)",
+  "command": "make -C c qwen36 VK=1 in both trees; campaign.sh (coli serve --ctx 16384 --no-tune-profile --no-think --ngen 200; bench.py: a warm-up, a 5899-token prompt with max_tokens 4, a 21-token prompt with max_tokens 128, temperature 0; tok/s by wall clock; three interleaved runs per arm, each server started on a copy of one .coli_usage history)",
+  "prompt_hash": "b0f4aa6de9d3a9c7a8c7737039a19fb3e94a9be45cf51cd9ec70a04d33afb435",
+  "hardware": {
+    "cpu": "AMD Ryzen 7 7800X3D, 8 cores / 16 threads",
+    "ram": "32 GB DDR5, about 15.5 GiB available at each start (logged per run)",
+    "storage": "ZFS on LUKS2 over two NVMe SSDs (Samsung 980 PRO 2TB, WD Blue SN580 2TB), the GGUF read in place",
+    "os": "NixOS, Linux 7.2.9, gcc 16.2.0, Mesa 26.2.5 RADV, AMD Radeon RX 9060 XT 16 GB (the desktop is drawn by the iGPU)"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "engine_build"
+  ],
+  "baseline": {
+    "config": {
+      "model": "Flint 40B-A2.5B UD-Q4_K_XL GGUF, imported with tools/gguf_import.py --mode link",
+      "COLI_VULKAN": "1",
+      "COLI_VK_STAGED": "1",
+      "COLI_VK_TIER_HOST": "0",
+      "MESA_VK_DEVICE_SELECT": "1002:7590",
+      "ctx": 16384,
+      "ngen": 200,
+      "prompt_tokens": 5899,
+      "engine_build": "origin/dev b92eccd7"
+    },
+    "samples": {
+      "tok_s": [
+        109.7,
+        110.4,
+        109.8
+      ],
+      "decode_tok_s": [
+        8.2,
+        8.3,
+        8.1
+      ]
+    },
+    "median_tok_s": 109.8,
+    "median_decode_tok_s": 8.2,
+    "experts_resident": 5263,
+    "expert_room_avg": "2.3 MiB",
+    "prompt_disk_loads": [
+      16553,
+      15858,
+      16050
+    ],
+    "quality": {
+      "method": "make -C c vk-tier-check VK=1 on the RX 9060 XT (RADV): every device row against the CPU reference within 2e-3 in every case, the new rooms case included (it fails on the baseline: 29 of 30 experts resident in a budget of their own bytes); no upload refused in any run (failed 0)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/vk-tier-rooms-per-size-2026-11-12/baseline-raw.txt",
+      "sha256": "f2603d9d081226038e902ea0bb621eb12ab4f3212a1897a72d5f7c24967acd19"
+    }
+  },
+  "trial": {
+    "config": {
+      "model": "Flint 40B-A2.5B UD-Q4_K_XL GGUF, imported with tools/gguf_import.py --mode link",
+      "COLI_VULKAN": "1",
+      "COLI_VK_STAGED": "1",
+      "COLI_VK_TIER_HOST": "0",
+      "MESA_VK_DEVICE_SELECT": "1002:7590",
+      "ctx": 16384,
+      "ngen": 200,
+      "prompt_tokens": 5899,
+      "engine_build": "b92eccd7 + this change"
+    },
+    "samples": {
+      "tok_s": [
+        169.0,
+        167.5,
+        167.1
+      ],
+      "decode_tok_s": [
+        11.5,
+        11.1,
+        11.9
+      ]
+    },
+    "median_tok_s": 167.5,
+    "median_decode_tok_s": 11.5,
+    "experts_resident": 6717,
+    "expert_room_avg": "1.8 MiB",
+    "prompt_disk_loads": [
+      8369,
+      8641,
+      8562
+    ],
+    "quality": {
+      "method": "make -C c vk-tier-check VK=1 on the RX 9060 XT (RADV): every device row against the CPU reference within 2e-3 in every case, the new rooms case included (it fails on the baseline: 29 of 30 experts resident in a budget of their own bytes); no upload refused in any run (failed 0)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/vk-tier-rooms-per-size-2026-11-12/trial-raw.txt",
+      "sha256": "86f01d1072e0b4a717ed50fb523c45611fa36ef0b3ddb84471916350de5923bd"
+    }
+  },
+  "outcome": "improvement"
+}

@@ -6,6 +6,8 @@ measured warm and published as cold. These tests run on any host by
 mocking sys.platform and the two win32 probes.
 """
 import ctypes
+import contextlib
+import io
 import os
 import subprocess
 import sys
@@ -69,7 +71,35 @@ class MachineInfoWin32Test(unittest.TestCase):
         self.assertEqual(info["ram"], "?")
 
 
+class MemoryBudgetTest(unittest.TestCase):
+    def test_invalid_memory_budgets_stop_before_machine_or_engine_work(self):
+        for value in ("nan", "inf", "-inf", "0", "-1"):
+            with self.subTest(value=value), \
+                 mock.patch.object(datapoint, "machine_info") as machine, \
+                 contextlib.redirect_stderr(io.StringIO()) as error:
+                with self.assertRaises(SystemExit) as result:
+                    datapoint.main(["--snap", "/model", "--memory-gb=" + value])
+                self.assertEqual(result.exception.code, 2)
+                self.assertIn("--memory-gb must be positive and finite", error.getvalue())
+                machine.assert_not_called()
+
+    def test_positive_fractional_memory_is_accepted(self):
+        with mock.patch.object(datapoint, "machine_info", side_effect=RuntimeError("reached")):
+            with self.assertRaisesRegex(RuntimeError, "reached"):
+                datapoint.main(["--snap", "/model", "--memory-gb", "1.5"])
+
+
 class IOBenchDatapointTest(unittest.TestCase):
+    def test_missing_iobench_omits_result_without_losing_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            missing = str(Path(directory) / "missing-iobench")
+            error = io.StringIO()
+            with contextlib.redirect_stderr(error):
+                result = datapoint.run_iobench(missing, "shard.safetensors", 1)
+        self.assertIsNone(result)
+        self.assertIn("iobench", error.getvalue())
+        self.assertIn("disk result omitted", error.getvalue())
+
     def test_direct_result_is_reported_as_cold_disk_throughput(self):
         result = subprocess.CompletedProcess(
             args=["iobench"], returncode=0,

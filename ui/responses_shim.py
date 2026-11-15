@@ -7,6 +7,8 @@ go to the model as a function of one string argument, "input", and come back as
 custom_tool_call items; hosted tools (web search, image generation) are left out. Reasoning
 items Codex sends back are not part of a chat history and are dropped."""
 import http.client, json, time, uuid
+import select, socket, threading
+from contextlib import contextmanager
 
 MAX_BODY = 32 << 20
 
@@ -107,8 +109,20 @@ def to_chat(body):
         chat["tools"] = tools
     if body.get("tool_choice") in ("auto", "none", "required"):
         chat["tool_choice"] = body["tool_choice"]
+    choice = body.get("tool_choice")
+    if isinstance(choice, dict) and choice.get("type") in ("function", "custom") and choice.get("name"):
+        chat["tool_choice"] = {"type": "function", "function": {"name": choice["name"]}}
     if body.get("parallel_tool_calls") is not None:
         chat["parallel_tool_calls"] = bool(body["parallel_tool_calls"])
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict) and reasoning.get("effort") is not None:
+        chat["reasoning_effort"] = reasoning["effort"]
+    text = body.get("text")
+    fmt = text.get("format") if isinstance(text, dict) else None
+    if fmt is not None:
+        chat["response_format"] = ({"type": "json_schema", "json_schema": {
+            k: v for k, v in fmt.items() if k != "type"}}
+            if isinstance(fmt, dict) and fmt.get("type") == "json_schema" else fmt)
     for a, b in (("max_output_tokens", "max_tokens"), ("temperature", "temperature"), ("top_p", "top_p")):
         if body.get(a) is not None:
             chat[b] = body[a]
@@ -123,6 +137,8 @@ class Events:
         self.seq, self.items, self.n = 0, [], 0
         self.msg = self.rsn = None
         self.calls, self.usage = {}, None
+        self.incomplete_reason = None
+        self.error = None
 
     def ev(self, typ, **kw):
         kw = {"type": typ, "sequence_number": self.seq, **kw}
@@ -130,9 +146,17 @@ class Events:
         return "event: %s\ndata: %s\n\n" % (typ, json.dumps(kw))
 
     def response(self, status):
+        if status == "completed" and self.error:
+            status = "failed"
+        if status == "completed" and self.incomplete_reason:
+            status = "incomplete"
         r = {"id": self.rid, "object": "response", "created_at": int(time.time()), "status": status, "model": self.model,
              "output": list(self.items)}
-        if status == "completed":
+        if status == "failed":
+            r["error"] = self.error
+        if status == "incomplete":
+            r["incomplete_details"] = {"reason": self.incomplete_reason}
+        if status in ("completed", "incomplete"):
             u = self.usage or {}
             pt, ct = int(u.get("prompt_tokens") or 0), int(u.get("completion_tokens") or 0)
             r["usage"] = {"input_tokens": pt, "input_tokens_details": {"cached_tokens": 0}, "output_tokens": ct,
@@ -157,7 +181,7 @@ class Events:
             return ""
         m, self.msg = self.msg, None
         part = {"type": "output_text", "text": m["text"], "annotations": []}
-        item = {"type": "message", "id": m["id"], "role": "assistant", "status": "completed", "content": [part]}
+        item = {"type": "message", "id": m["id"], "role": "assistant", "status": "incomplete" if self.incomplete_reason or self.error else "completed", "content": [part]}
         self.items.append(item)
         return self.ev("response.output_text.done", item_id=m["id"], output_index=m["i"], content_index=0, text=m["text"]) + \
             self.ev("response.content_part.done", item_id=m["id"], output_index=m["i"], content_index=0, part=part) + \
@@ -168,6 +192,9 @@ class Events:
         if isinstance(d.get("usage"), dict):
             self.usage = d["usage"]
         for ch in d.get("choices") or []:
+            reason = ch.get("finish_reason")
+            if reason in ("length", "content_filter"):
+                self.incomplete_reason = "max_output_tokens" if reason == "length" else reason
             delta = ch.get("delta") or {}
             r = delta.get("reasoning_content") or delta.get("reasoning")
             if isinstance(r, str) and r:
@@ -220,14 +247,91 @@ class Events:
                 out.append(self.ev("response.custom_tool_call_input.delta", item_id=iid, output_index=i, delta=item["input"]))
                 out.append(self.ev("response.custom_tool_call_input.done", item_id=iid, output_index=i, input=item["input"]))
             else:
-                item = {"type": "function_call", "id": iid, "call_id": cid, "name": e["name"], "arguments": e["args"] or "{}", "status": "completed"}
+                item = {"type": "function_call", "id": iid, "call_id": cid, "name": e["name"], "arguments": e["args"] or "{}", "status": "incomplete" if self.incomplete_reason or self.error else "completed"}
                 out.append(self.ev("response.output_item.added", output_index=i, item=dict(item, arguments="", status="in_progress")))
                 out.append(self.ev("response.function_call_arguments.delta", item_id=iid, output_index=i, delta=item["arguments"]))
                 out.append(self.ev("response.function_call_arguments.done", item_id=iid, output_index=i, arguments=item["arguments"]))
             self.items.append(item)
             out.append(self.ev("response.output_item.done", output_index=i, item=item))
-        out.append(self.ev("response.completed", response=self.response("completed")))
+        response = self.response("completed")
+        out.append(self.ev("response." + response["status"], response=response))
         return "".join(out)
+
+
+def _chat_events(response):
+    """Complete SSE data events, including multiline fields and split reads."""
+    buf, data = b"", []
+    while True:
+        chunk = response.read1(65536)
+        if not chunk:
+            return
+        buf += chunk
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            line = line.rstrip(b"\r")
+            if not line:
+                if data:
+                    yield b"\n".join(data)
+                    data = []
+                continue
+            field, _, value = line.partition(b":")
+            if field == b"data":
+                data.append(value[1:] if value.startswith(b" ") else value)
+
+
+@contextmanager
+def _cancel_on_disconnect(h, conn):
+    # Capture the connected socket: getresponse may clear conn.sock for a
+    # Connection: close response while its file still owns this same descriptor.
+    upstream = conn.sock
+    stopped, disconnected = threading.Event(), threading.Event()
+
+    def watch():
+        while not stopped.wait(0.05):
+            try:
+                readable, _, _ = select.select([h.connection], [], [], 0)
+                if not readable:
+                    continue
+                # On systems that retain unread data after a reset, peeking
+                # only the queue head never reaches the pending socket error.
+                # SO_ERROR retrieves and clears it, so treat any error as a
+                # failed frontend connection before inspecting queued data.
+                if h.connection.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR):
+                    raise ConnectionResetError("frontend socket error")
+                if h.connection.recv(1, socket.MSG_PEEK) == b"":
+                    # FIN closes only the peer's write side. It may still be
+                    # reading its response; do not cancel that valid request.
+                    return
+                continue
+            except ConnectionResetError:
+                disconnected.set()
+            except (OSError, ValueError):
+                return
+            try:
+                upstream.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            return
+
+    watcher = threading.Thread(target=watch, name="responses-disconnect", daemon=True)
+    watcher.start()
+    try:
+        yield disconnected
+    except (OSError, http.client.HTTPException):
+        if not disconnected.is_set():
+            raise
+    finally:
+        stopped.set()
+        conn.close()
+        watcher.join()
+
+
+def gateway_connection(backend, timeout=3600):
+    """A connection to the gateway at `backend` (a parsed URL): TLS for an https:// one (a TLS
+    front for the gateway), with the scheme's own port when the URL names none."""
+    if backend.scheme == "https":
+        return http.client.HTTPSConnection(backend.hostname, backend.port or 443, timeout=timeout)
+    return http.client.HTTPConnection(backend.hostname, backend.port or 80, timeout=timeout)
 
 
 def serve(h, backend):
@@ -243,66 +347,95 @@ def serve(h, backend):
     headers = {"Content-Type": "application/json"}
     if h.headers.get("Authorization"):
         headers["Authorization"] = h.headers["Authorization"]
-    conn = http.client.HTTPConnection(backend.hostname, backend.port or 80, timeout=3600)
+    conn = gateway_connection(backend)
     try:
         conn.request("POST", "/v1/chat/completions", body=json.dumps(chat), headers=headers)
-        resp = conn.getresponse()
     except OSError as e:
         conn.close()
         return _err(h, 502, "colibri non risponde su %s: %s" % (backend.netloc, e))
-    if resp.status != 200:
-        msg = resp.read().decode("utf-8", "replace")[:2000]
-        conn.close()
-        return _err(h, resp.status, msg)
-    ev = Events(body.get("model") or chat.get("model") or "colibri", custom)
-    streaming = body.get("stream", False)
-    if streaming:
-        h.send_response(200)
-        h.send_header("Content-Type", "text/event-stream")
-        h.send_header("Cache-Control", "no-store")
-        h.send_header("Transfer-Encoding", "chunked")
-        h.end_headers()
+    with _cancel_on_disconnect(h, conn) as disconnected:
+        try:
+            resp = conn.getresponse()
+        except OSError as e:
+            if disconnected.is_set():
+                return
+            return _err(h, 502, "colibri non risponde su %s: %s" % (backend.netloc, e))
+        try:
+            if resp.status != 200:
+                msg = resp.read().decode("utf-8", "replace")[:2000]
+                if not disconnected.is_set():
+                    return _err(h, resp.status, msg)
+                return
+            ev = Events(body.get("model") or chat.get("model") or "colibri", custom)
+            streaming = body.get("stream", False)
 
-    def send(s):
-        if streaming and s:
-            b = s.encode()
-            h.wfile.write(b"%x\r\n%s\r\n" % (len(b), b))
-            h.wfile.flush()
-    try:
-        send(ev.start())
-        buf = b""
-        while True:
-            chunk = resp.read1(65536)
-            if not chunk:
-                break
-            buf += chunk
-            while b"\n" in buf:
-                line, buf = buf.split(b"\n", 1)
-                line = line.strip()
-                if not line.startswith(b"data:"):
-                    continue
-                data = line[5:].strip()
-                if data == b"[DONE]":
-                    continue
+            def send(s):
+                if streaming and s:
+                    b = s.encode()
+                    h.wfile.write(b"%x\r\n%s\r\n" % (len(b), b))
+                    h.wfile.flush()
+            try:
+                if streaming:
+                    h.send_response(200)
+                    h.send_header("Content-Type", "text/event-stream")
+                    h.send_header("Cache-Control", "no-store")
+                    h.send_header("Transfer-Encoding", "chunked")
+                    h.end_headers()
+                send(ev.start())
+                done = finished = False
                 try:
-                    send(ev.chunk(json.loads(data)))
-                except ValueError:
-                    continue
-        send(ev.finish())
-        if streaming:
-            h.wfile.write(b"0\r\n\r\n")
-            h.wfile.flush()
-        else:
-            out = json.dumps(ev.response("completed")).encode()
-            h.send_response(200)
-            h.send_header("Content-Type", "application/json")
-            h.send_header("Content-Length", str(len(out)))
-            h.end_headers()
-            h.wfile.write(out)
-    except (BrokenPipeError, ConnectionResetError):
-        pass   # Codex went away: closing upstream stops the engine
-    finally:
-        conn.close()
+                    for data in _chat_events(resp):
+                        if data.strip() == b"[DONE]":
+                            done = True
+                            break
+                        chunk = json.loads(data)
+                        if not isinstance(chunk, dict):
+                            raise ValueError("invalid upstream chat chunk")
+                        if "error" in chunk:
+                            error = chunk["error"]
+                            message = error.get("message") if isinstance(error, dict) else None
+                            raise ValueError("upstream error: " + (message if isinstance(message, str) else "request failed"))
+                        choices = chunk.get("choices") or []
+                        if not isinstance(choices, list):
+                            raise ValueError("invalid upstream choices")
+                        for choice in choices:
+                            if not isinstance(choice, dict):
+                                raise ValueError("invalid upstream choice")
+                            reason = choice.get("finish_reason")
+                            if reason is not None:
+                                if reason not in ("stop", "length", "tool_calls", "function_call", "content_filter"):
+                                    raise ValueError("invalid upstream finish reason")
+                                finished = True
+                        usage = chunk.get("usage")
+                        if usage is not None:
+                            if not isinstance(usage, dict):
+                                raise ValueError("invalid upstream usage")
+                            for field in ("prompt_tokens", "completion_tokens"):
+                                count = usage.get(field)
+                                if count is not None and (type(count) is not int or count < 0):
+                                    raise ValueError("invalid upstream " + field)
+                        send(ev.chunk(chunk))
+                    if not done or not finished:
+                        raise ValueError("upstream stream ended before completion")
+                except (ValueError, TypeError, AttributeError, OSError, http.client.HTTPException) as error:
+                    if disconnected.is_set():
+                        return   # the client reset: nobody to report the cut upstream to
+                    ev.error = {"code": "server_error", "message": str(error)}
+                send(ev.finish())
+                if streaming:
+                    h.wfile.write(b"0\r\n\r\n")
+                    h.wfile.flush()
+                else:
+                    out = json.dumps(ev.response("completed")).encode()
+                    h.send_response(200)
+                    h.send_header("Content-Type", "application/json")
+                    h.send_header("Content-Length", str(len(out)))
+                    h.end_headers()
+                    h.wfile.write(out)
+            except (BrokenPipeError, ConnectionResetError):
+                pass   # Codex went away: closing upstream stops the engine
+        finally:
+            resp.close()
 
 
 def _err(h, code, msg):

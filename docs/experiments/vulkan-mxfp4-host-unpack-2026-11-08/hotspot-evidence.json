@@ -1,0 +1,14 @@
+{
+  "profile": "deepseek-v4-flash-reap-profile-20261108-105256",
+  "phase": "decode request including its prompt",
+  "cpu_sampling": "cpu-clock, 199 Hz, engine PID only; no lost samples",
+  "host_rows_total_cpu_sample_percent": 60.79,
+  "fp4_lookup_percent_of_host_rows": 79.15,
+  "fp4_lookup_percent_of_total_cpu": 48.115285,
+  "addresses": [
+    "0x2346ac",
+    "0x2346d7"
+  ],
+  "interpretation": "Inlined dev_codes_fp4 scalar MXFP4 nibble-table expansion dominates CPU samples; motivates exact SIMD expansion. Samples are CPU time, not wall-time speedup.",
+  "trace_loss": "0 per CPU"
+}

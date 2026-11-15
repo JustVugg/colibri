@@ -26,7 +26,7 @@ static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
 static uint64_t rng = 88172645463325252ULL;
 static inline uint32_t rnd(void) { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return (uint32_t)rng; }
 static uint16_t f16_of(float v) { return (uint16_t)_cvtss_sh(v, 0); }
-static const int TYPES[] = {GQ_IQ4_XS, GQ_IQ2_XXS, GQ_IQ2_XS, GQ_IQ2_S, GQ_IQ3_XXS, GQ_IQ3_S, GQ_Q4_K, GQ_Q5_K, GQ_Q6_K, GQ_Q3_K, GQ_Q8_0};
+static const int TYPES[] = {GQ_IQ4_XS, GQ_IQ2_XXS, GQ_IQ2_XS, GQ_IQ2_S, GQ_IQ3_XXS, GQ_IQ3_S, GQ_Q4_K, GQ_Q5_K, GQ_Q6_K, GQ_Q3_K, GQ_Q8_0, GQ_IQ4_NL, GQ_Q2_0, GQ_Q5_0, GQ_Q5_1};
 /* rows of type t with random codes and sane f16 scales */
 static void fill(int t, uint8_t *w, int rows, int I) {
     const int bb = GQ_TYPES[t].bytes, nb = I / GQ_TYPES[t].blck;
@@ -34,7 +34,7 @@ static void fill(int t, uint8_t *w, int rows, int I) {
     for (int64_t k = 0; k < (int64_t)rows * nb; k++) {
         uint8_t *b = w + k * bb; uint16_t d = f16_of(1e-3f + (rnd() % 1000) * 1e-5f), m = f16_of(1e-3f + (rnd() % 1000) * 1e-5f);
         switch (t) {
-        case GQ_Q4_K: case GQ_Q5_K: memcpy(b, &d, 2); memcpy(b + 2, &m, 2); break;
+        case GQ_Q4_K: case GQ_Q5_K: case GQ_Q5_1: memcpy(b, &d, 2); memcpy(b + 2, &m, 2); break;
         case GQ_Q6_K: memcpy(b + 208, &d, 2); break;
         case GQ_Q3_K: memcpy(b + 108, &d, 2); break;
         default: memcpy(b, &d, 2); break;
@@ -58,7 +58,7 @@ static void ref(int t, float *y, int ys, const uint8_t *w, const gq_act *a, int 
                 if (per16(t)) acc = fmaf(fmaf((float)p1, sw[2 * k + 1], (float)p0 * sw[2 * k]), d, acc);
                 else {
                     acc = fmaf((float)(p0 + p1), sw[2 * k] * d, acc);
-                    if (t == GQ_Q4_K || t == GQ_Q5_K) {
+                    if (t == GQ_Q4_K || t == GQ_Q5_K || t == GQ_Q5_1) {
                         const int32_t x32 = a->s[(int64_t)s * (I / 16) + 2 * g32] + a->s[(int64_t)s * (I / 16) + 2 * g32 + 1];
                         acc = fmaf(-mw[2 * k], d * (float)x32, acc);
                     }

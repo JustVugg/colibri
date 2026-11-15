@@ -28,6 +28,14 @@
 #include <atomic>
 #include <chrono>
 
+#ifdef _WIN32
+/* MSVC has no POSIX setenv/unsetenv */
+static int setenv(const char *name, const char *value, int overwrite) {
+    (void)overwrite; return _putenv_s(name, value);
+}
+static int unsetenv(const char *name) { return _putenv_s(name, ""); }
+#endif
+
 static int fails;
 static void ck(int ok, const char *what) { if (ok) { printf("  ok   %s\n", what); return; } printf("  FAIL %s\n", what); fails++; }
 static float frand(unsigned *s) { *s = *s * 1664525u + 1013904223u; return ((*s >> 8) & 0xFFFF) / 65535.f * 2.f - 1.f; }
@@ -358,6 +366,66 @@ static void prompt_rows_one_pass_long(void) {
     T->free(qb); T->free(kb); T->free(vb); T->free(ob);
 }
 
+/* cc_attn_fk's 16-byte staging (cc_fa_stage16), where cc_attn_fk takes a prompt chunk: sm_70,
+ * or COLI_CUDA_CHAIN_FLASH2=0 from sm_75 (cc_attn_f2 takes it otherwise, and this says so).
+ * The same chunk as above: K and V 16-byte aligned take the staging, the same K and V one
+ * element further on take the scalar loop, and the two give the same bits, from a float32
+ * cache (four floats a load, rounded: values that are not float16 numbers, so the rounding
+ * shows) and from a float16 one (eight halves a load, copied). Four rows against the
+ * reference. (The float16 cache against the float32 one, on this path too: the test above.) */
+static void prompt_rows_16byte_staging(void) {
+#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
+    printf("  (16-byte staging: no cc_attn_fk on HIP)\n");
+#else
+    int dev = 0, ma = 0, mi = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&ma, cudaDevAttrComputeCapabilityMajor, dev);
+    cudaDeviceGetAttribute(&mi, cudaDevAttrComputeCapabilityMinor, dev);
+    const char *f2 = getenv("COLI_CUDA_CHAIN_FLASH2");
+    if (ma < 7 || (ma * 10 + mi >= 75 && !(f2 && *f2 == '0'))) {
+        printf("  (16-byte staging: no cc_attn_fk for a prompt chunk on sm_%d%d; COLI_CUDA_CHAIN_FLASH2=0 runs it from sm_75)\n", ma, mi);
+        return;
+    }
+    const int H = 16, KV = 2, hd = 256, S = 2043, pos = 6144, cap = 8384, qdim = 2 * hd, k_off = 32;
+    const size_t nkv = (size_t)k_off + 1 + (size_t)KV * cap * hd, n = (size_t)S * H * hd;
+    std::vector<float> q = rnd((size_t)S * H * qdim, 71), kc = rnd(nkv, 72), vc = rnd(nkv, 73), kc1(nkv), vc1(nkv);
+    memcpy(kc1.data() + 1, kc.data(), (nkv - 1) * 4); memcpy(vc1.data() + 1, vc.data(), (nkv - 1) * 4);   /* one element on */
+    CcAttn p = {S, H, KV, hd, pos, cap, 0, H * qdim, qdim, hd, H * qdim, qdim, 1, 0, H * hd, 0, 0, 1.f / sqrtf((float)hd), k_off, k_off};
+    CcAttn p1 = p; p1.k_off = p1.v_off = k_off + 1;
+    auto finite = [](const std::vector<float> &v) { for (float x : v) if (!std::isfinite(x)) return false; return true; };
+    CcBuf *qb = up(q), *kb = up(kc), *vb = up(vc), *kb1 = up(kc1), *vb1 = up(vc1);
+    CcBuf *ob = T->buf(n * 4, CC_DEV), *ob1 = T->buf(n * 4, CC_DEV);
+    int ran = T->begin() && T->attn(qb, kb, vb, ob, qb, NULL, &p) && T->attn(qb, kb1, vb1, ob1, qb, NULL, &p1) && T->submit(1);
+    std::vector<float> o = down(ob, n), o1 = down(ob1, n);
+    ck(ran && finite(o) && !memcmp(o.data(), o1.data(), n * 4),
+       "16-byte staging, a float32 cache: H 16 KV 2 hd 256, 2043 rows after 6144: the scalar loop's bits");
+    double d = 0;
+    for (int r : {0, 1, 1024, 2042}) {   /* a row alone: one position more each */
+        CcAttn pr = p; pr.S = 1; pr.pos_base = pos + r; pr.q_off = r * p.q_row; pr.g_off = p.g_off + r * p.g_row; pr.o_off = 0;
+        std::vector<float> ref((size_t)H * hd);
+        ref_attn(q.data(), kc.data(), vc.data(), ref.data(), q.data(), NULL, &pr);
+        d = fmax(d, maxdiff(o.data() + (size_t)r * H * hd, ref.data(), ref.size()));
+    }
+    ck(ran && finite(o) && d < 1e-4, "and rows 0, 1, 1024 and 2042 within 1e-4 of the reference");
+    printf("  16-byte staging, rows 0, 1, 1024 and 2042: max |diff| %.2e\n", d);
+    if (T->size < offsetof(ColiCudaChainOps, copy_regions_h) + sizeof T->copy_regions_h || !T->kvh()) printf("  (no float16 cache here)\n");
+    else {
+        std::vector<uint16_t> kh(nkv), vh(nkv), kh1(nkv), vh1(nkv);
+        kv16_pack(kh.data(), kc.data(), (int64_t)nkv); kv16_pack(vh.data(), vc.data(), (int64_t)nkv);
+        kv16_pack(kh1.data(), kc1.data(), (int64_t)nkv); kv16_pack(vh1.data(), vc1.data(), (int64_t)nkv);
+        CcBuf *khb = T->buf(nkv * 2, CC_DEV), *vhb = T->buf(nkv * 2, CC_DEV), *khb1 = T->buf(nkv * 2, CC_DEV), *vhb1 = T->buf(nkv * 2, CC_DEV);
+        CcBuf *oh = T->buf(n * 4, CC_DEV), *oh1 = T->buf(n * 4, CC_DEV);
+        int ok = ran && khb && vhb && khb1 && vhb1 && oh && oh1 && T->begin() && T->write(khb, 0, kh.data(), nkv * 2) &&
+                 T->write(vhb, 0, vh.data(), nkv * 2) && T->write(khb1, 0, kh1.data(), nkv * 2) && T->write(vhb1, 0, vh1.data(), nkv * 2) &&
+                 T->attn_h(qb, khb, vhb, oh, qb, NULL, &p) && T->attn_h(qb, khb1, vhb1, oh1, qb, NULL, &p1) && T->submit(1);
+        std::vector<float> h = down(oh, n), h1 = down(oh1, n);
+        ck(ok && finite(h) && !memcmp(h.data(), h1.data(), n * 4), "16-byte staging, a float16 cache: the scalar loop's bits");
+        T->free(khb); T->free(vhb); T->free(khb1); T->free(vhb1); T->free(oh); T->free(oh1);
+    }
+    T->free(qb); T->free(kb); T->free(vb); T->free(kb1); T->free(vb1); T->free(ob); T->free(ob1);
+#endif
+}
+
 /* the router's pick (chain_route.comp's rules: the lower expert on a tie, groups by their two best) */
 static void ref_route(const float *l, const float *bias, int *ids, float *w, const CcRoute *p) {
     std::vector<float> sc(p->E), pk(p->E);
@@ -522,6 +590,7 @@ int main(void) {
     if (!T) return 1;
     ck(T->init(0), "a context on device 0");
     ck(T->ready() && !T->lost(), "ready, not lost");
+    ck(T->preload && T->preload() && T->ready() && !T->lost(), "the chain's and the backend's kernels loaded before their first launch");
     const char *be = getenv("COLI_CUDA_CHAIN_BENCH");
     if (be && !strcmp(be, "adec")) { bench_adec(); return 0; }
     if (be && !strcmp(be, "route")) { bench_route(); return 0; }
@@ -609,6 +678,32 @@ int main(void) {
         ck(ok && maxdiff(down(db, n).data(), b.data(), n) == 0, "host_up: the bytes where they were sent");
         T->free(db); T->free(hb2);
     }
+    if (T->size >= offsetof(ColiCudaChainOps, host_up_n) + sizeof T->host_up_n && T->host_up_n) {
+        /* host_up_n: 96 pieces of a page-locked buffer, sizes 4 bytes to 11 KiB and apart, to places of a device
+         * buffer in another order, one call and one ticket; after a zero the frame recorded first */
+        const int np = 96; const size_t n = 1 << 18;
+        std::vector<float> b = rnd(n, 43);
+        CcBuf *db = T->buf(n * 4, CC_DEV), *hb2 = T->buf(n * 4, CC_UP);
+        int ok = db && hb2;
+        if (ok) memcpy(T->ptr(hb2), b.data(), n * 4);
+        float *dd = ok ? (float *)T->dev_addr(db) : NULL;
+        void *dst[np]; const void *src[np]; size_t by[np];
+        std::vector<float> want(n, 0.f);
+        for (int i = 0; i < np && ok; i++) {   /* piece i: floats [2730 i, +len) of the host buffer to the place of piece np-1-i */
+            const size_t len = 1 + (size_t)(i * 97) % 2730, from = (size_t)i * 2730, to = (size_t)(np - 1 - i) * 2730;
+            dst[i] = dd + to; src[i] = (const float *)T->ptr(hb2) + from; by[i] = len * 4;
+            for (size_t j = 0; j < len; j++) want[to + j] = b[from + j];
+        }
+        unsigned t = 0;
+        ok = ok && T->begin() && T->zero(db, 0, n) && T->host_up_n(dst, src, by, np, &t) && T->submit(1);
+        int landed = 0;
+        auto t0 = std::chrono::steady_clock::now();
+        while (ok && !landed && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5)) landed = T->host_up_done(t);
+        ck(ok && landed, "host_up_n: 96 copies in one call, their one ticket landed");
+        ck(ok && landed && maxdiff(down(db, n).data(), want.data(), n) == 0, "host_up_n: each piece where it was sent, after the frame's zero");
+        ck(!T->host_up_n(dst, src, by, 0, &t) && !T->host_up_n(NULL, src, by, 1, &t), "host_up_n: no copies, or none to, refused");
+        T->free(db); T->free(hb2);
+    }
     printf("matmul\n");
     {
         const int I = 96, O = 40, S = 3; unsigned s = 5;
@@ -627,6 +722,30 @@ int main(void) {
             std::vector<float> one((size_t)S * O);
             for (int r = 0; r < S; r++) { T->begin(); T->matmul(t, xb, 7 + (size_t)r * I, yb, 0, 1); T->submit(1); std::vector<float> yr = down(yb, O); memcpy(&one[(size_t)r * O], yr.data(), O * 4); }
             ck(maxdiff(y.data() + 3, one.data(), (size_t)S * O) == 0, "three rows at once are bit for bit the three one-row calls");
+        }
+        {   /* few outputs of long int8 rows (Qwen3.8's hyper-connection read, 10240 x 320): the inputs split
+             * (gemv_i8_sk), a verify's four rows each the bits of its one-row call, and the CPU's dot */
+            const int I5 = 10240, O5 = 320, S5 = 4;
+            std::vector<int8_t> q5((size_t)I5 * O5); for (auto &v : q5) v = (int8_t)(frand(&s) * 60);
+            std::vector<float> sc5(O5), x5 = rnd((size_t)S5 * I5, 19), r5((size_t)S5 * O5);
+            for (int o = 0; o < O5; o++) sc5[o] = 0.01f + 0.001f * (o % 7);
+            for (int r = 0; r < S5; r++) for (int o = 0; o < O5; o++) {
+                double a = 0; for (int i = 0; i < I5; i++) a += (double)x5[(size_t)r * I5 + i] * q5[(size_t)o * I5 + i]; r5[(size_t)r * O5 + o] = (float)(a * sc5[o]);
+            }
+            ColiCudaTensor *t5 = NULL;
+            CcBuf *x5b = up(x5), *y5b = T->buf((size_t)S5 * O5 * 4, CC_DEV), *y1b = T->buf((size_t)O5 * 4, CC_DEV);
+            int ok5 = coli_cuda_tensor_upload(&t5, q5.data(), sc5.data(), 1, I5, O5, 0) && T->begin() && T->matmul(t5, x5b, 0, y5b, 0, S5) && T->submit(1);
+            std::vector<float> all5 = ok5 ? down(y5b, (size_t)S5 * O5) : std::vector<float>();
+            double mx5 = 0; for (float v : r5) mx5 = fmax(mx5, fabs(v));
+            ck(ok5 && maxdiff(all5.data(), r5.data(), r5.size()) < 1e-4 * mx5, "few outputs of long int8 rows, four rows: the CPU's dot");
+            int same5 = ok5;
+            for (int r = 0; r < S5 && same5; r++) {
+                same5 = T->begin() && T->matmul(t5, x5b, (size_t)r * I5, y1b, 0, 1) && T->submit(1);
+                if (same5) same5 = !memcmp(down(y1b, O5).data(), all5.data() + (size_t)r * O5, (size_t)O5 * 4);
+            }
+            ck(same5, "and each row the bits of its one-row call");
+            if (t5) coli_cuda_tensor_free(t5);
+            T->free(x5b); T->free(y5b); T->free(y1b);
         }
         {   /* a width the warp GEMV does not take (not a multiple of 16): the block kernel */
             const int I2 = 100; std::vector<int8_t> q2((size_t)I2 * O); for (auto &v : q2) v = (int8_t)(frand(&s) * 60);
@@ -686,6 +805,17 @@ int main(void) {
                 same = T->begin() && T->matmul(t4, xb4, (size_t)s * I4, yb1, 0, 1) && T->submit(1) &&
                        !memcmp(T->ptr(yb1), (const float *)T->ptr(yb4) + (size_t)s * O4, (size_t)O4 * 4);
             ck(same, "and each of its three rows the one-row call's bits");
+            {   /* a prompt chunk's 100 rows of it (f32_few_k, a block a row): each row the one-row call's bits */
+                const int S8 = 100;
+                std::vector<float> x8 = rnd((size_t)S8 * I4, 16);
+                CcBuf *xb8 = T->buf((size_t)S8 * I4 * 4, CC_DEV), *yb8 = T->buf((size_t)S8 * O4 * 4, CC_DOWN);
+                int ok8 = xb8 && yb8 && T->begin() && T->write(xb8, 0, x8.data(), x8.size() * 4) && T->matmul(t4, xb8, 0, yb8, 0, S8) && T->submit(1);
+                for (int r = 0; r < S8 && ok8; r += 11)   /* ten of them */
+                    ok8 = T->begin() && T->matmul(t4, xb8, (size_t)r * I4, yb1, 0, 1) && T->submit(1) &&
+                          !memcmp(T->ptr(yb1), (const float *)T->ptr(yb8) + (size_t)r * O4, (size_t)O4 * 4);
+                ck(ok8, "f32 rows, 4 outputs of 10240, a prompt chunk's 100 rows: each the one-row call's bits");   /* 11 matmuls */
+                T->free(xb8); T->free(yb8);
+            }
             coli_cuda_tensor_free(t4); T->free(xb4); T->free(yb4); T->free(yb1);
         }
         {   /* BF16 rows (a GGUF's type 30, fmt 130): a decode step's and a verify's rows (bd_gemv_bf16_k, each row
@@ -845,24 +975,75 @@ int main(void) {
         std::vector<float> o((size_t)S * H * hd), ref = o;
         ref_attn(q.data(), kc.data(), vc.data(), ref.data(), q.data(), sel.data(), &p);
         CcBuf *qb = up(q), *kb = up(kc), *vb = up(vc), *ob = T->buf(o.size() * 4, CC_DEV), *sb = T->buf(sel.size() * 4, CC_DEV);
+        setenv("COLI_CUDA_ATTN_SEL_TC", "0", 1);   /* cc_attn_gk: these lists are in no order, with repeats */
         int ok = T->begin() && T->write(sb, 0, sel.data(), sel.size() * 4) && T->attn(qb, kb, vb, ob, qb, sb, &p) && T->submit(1);
         std::vector<float> all = down(ob, o.size());
         ck(ok && maxdiff(all.data(), ref.data(), o.size()) < 1e-4, "40 rows with selection lists, a block per kv head, against the reference");
         CcBuf *o1 = T->buf((size_t)H * hd * 4, CC_DEV);
         int same = 1;
+        setenv("COLI_CUDA_ATTN_DEC_SEL", "0", 1);   /* a row alone through cc_attn_k */
         for (int r = 0; r < S && same; r++) {
             CcAttn p1 = p; p1.S = 1; p1.pos_base = pos_base + r; p1.q_off = r * p.q_row; p1.g_off = p.g_off + r * p.g_row; p1.o_off = 0; p1.sel_off = r * SR;
             std::vector<float> one;
             same = T->begin() && T->attn(qb, kb, vb, o1, qb, sb, &p1) && T->submit(1);
             if (same) { one = down(o1, (size_t)H * hd); same = !memcmp(one.data(), all.data() + (size_t)r * H * hd, (size_t)H * hd * 4); }
         }
-        ck(same, "each row the bits of that row alone (a block per query head)");
+        unsetenv("COLI_CUDA_ATTN_DEC_SEL");
+        ck(same, "each row the bits of that row alone (a block per query head, COLI_CUDA_ATTN_DEC_SEL=0)");
+        /* a verify's rows with their lists in blocks of positions (cc_attn_dec_k): 1 to 4 rows from row 3 on
+         * (row 3 without a list: its causal positions; row 5's list 97 long, the others 400), against the reference */
+        double worst = 0;
+        int okd = 1;
+        for (int S2 = 1; S2 <= 4 && okd; S2++) {
+            CcAttn p2 = p; p2.S = S2; p2.pos_base = pos_base + 3; p2.q_off = 3 * p.q_row; p2.g_off = p.g_off + 3 * p.g_row; p2.o_off = 0;
+            p2.sel_off = 3 * SR;
+            CcBuf *o2 = T->buf((size_t)S2 * H * hd * 4, CC_DEV);
+            okd = o2 && T->begin() && T->attn(qb, kb, vb, o2, qb, sb, &p2) && T->submit(1);
+            std::vector<float> got = okd ? down(o2, (size_t)S2 * H * hd) : std::vector<float>();
+            if (okd) { double d = maxdiff(got.data(), ref.data() + (size_t)3 * H * hd, (size_t)S2 * H * hd); if (d > worst) worst = d; }
+            T->free(o2);
+        }
+        ck(okd && worst < 1e-4, "a verify's rows with selection lists in blocks of positions, against the reference");
+        unsetenv("COLI_CUDA_ATTN_SEL_TC");
         T->free(qb); T->free(kb); T->free(vb); T->free(ob); T->free(sb); T->free(o1);
+    }
+    {   /* a prompt chunk's rows with selection lists on the tensor cores (cc_attn_f2 with them, three warps
+         * for 12 query heads a kv head): lists in ascending order as cc_qsa writes them, blocks of four
+         * positions and the row's own last ones, a row without a list, short lists, key blocks no row of a
+         * block selects, 41 rows (a block of tokens cut short); against the reference, f16's error */
+        const int H = 24, KV = 2, hd = 256, qdim = 2 * hd, cap = 1600, pos_base = 1100, S = 41, NS = 520, SR = NS + 1;
+        std::vector<float> q = rnd((size_t)S * H * qdim, 71), kc = rnd((size_t)KV * cap * hd, 72), vc = rnd((size_t)KV * cap * hd, 73);
+        std::vector<int> sel((size_t)S * SR, 0);
+        for (int r = 0; r < S; r++) {
+            const int vis = pos_base + r + 1;
+            if (r == 5) { sel[(size_t)r * SR] = -1; continue; }   /* no list: every position up to the row's */
+            std::vector<int> pos;
+            const int want = r % 7 == 0 ? 37 : NS - 8;
+            for (int b = 0; b * 4 < vis - 4 && (int)pos.size() + 4 <= want; b++)   /* blocks of 4, two in five, more near the end */
+                if ((b * 2654435761u + (unsigned)r * 40503u) % 5 < 2 || b * 4 > vis - 200)
+                    for (int i = 0; i < 4; i++) pos.push_back(b * 4 + i);
+            for (int t = (vis - 4) / 4 * 4; t < vis && (int)pos.size() < want; t++) if (pos.empty() || t > pos.back()) pos.push_back(t);
+            sel[(size_t)r * SR] = (int)pos.size();
+            for (size_t i = 0; i < pos.size(); i++) sel[(size_t)r * SR + 1 + i] = pos[i];
+        }
+        CcAttn p = {S, H, KV, hd, pos_base, cap, 0, H * qdim, qdim, hd, H * qdim, qdim, 1, 0, H * hd, 0, SR, 1.f / sqrtf((float)hd), 0, 0};
+        std::vector<float> ref((size_t)S * H * hd);
+        ref_attn(q.data(), kc.data(), vc.data(), ref.data(), q.data(), sel.data(), &p);
+        CcBuf *qb = up(q), *kb = up(kc), *vb = up(vc), *ob = T->buf(ref.size() * 4, CC_DEV), *sb = T->buf(sel.size() * 4, CC_DEV);
+        int ok = qb && kb && vb && ob && sb && T->begin() && T->write(sb, 0, sel.data(), sel.size() * 4) && T->attn(qb, kb, vb, ob, qb, sb, &p) && T->submit(1);
+        const double d = ok ? maxdiff(down(ob, ref.size()).data(), ref.data(), ref.size()) : 1;
+        char what[160]; snprintf(what, sizeof what, "41 rows with ascending selection lists on the tensor cores, against the reference (|d| %.1e)", d);
+        ck(ok && d < 4e-3, what);
+        T->free(qb); T->free(kb); T->free(vb); T->free(ob); T->free(sb);
     }
     {   /* a decode's or a verify's rows over many positions: in blocks of positions (cc_attn_dec_k) */
         struct { int H, KV, hd, S, pos_base, cap, gate; } cs[] = {{16, 2, 256, 3, 2500, 3000, 1}, {4, 2, 32, 1, 140, 300, 1},
                                                                    {8, 8, 128, 4, 700, 800, 0}, {16, 2, 256, 6, 700, 800, 1},
-                                                                   {16, 2, 128, 6, 125, 300, 1}, {16, 2, 128, 6, 4093, 4200, 0}};
+                                                                   {16, 2, 128, 6, 125, 300, 1}, {16, 2, 128, 6, 4093, 4200, 0},
+                                                                   /* six and twelve query heads a kv head (Qwen3.8-27B): in
+                                                                    * blocks too, a kv head's heads a block */
+                                                                   {24, 4, 256, 1, 3000, 3100, 1}, {24, 4, 256, 4, 700, 800, 1},
+                                                                   {48, 4, 256, 3, 1500, 1600, 0}};
         for (auto &k : cs) {
             const int qdim = 2 * k.hd, k_off = 32;
             std::vector<float> q = rnd((size_t)k.S * k.H * qdim, 51), kc = rnd((size_t)k_off + (size_t)k.KV * k.cap * k.hd, 52),
@@ -897,7 +1078,10 @@ int main(void) {
     {   /* a prompt chunk's rows (COLI_CUDA_CHAIN_FLASH, 16 rows): the tensor cores where the device has them
          * (f16 Q, K and V: within 4e-3 of the reference), cc_attn_k elsewhere */
         struct { int H, KV, hd, S, pos_base, gate; } cs[] = {{4, 2, 64, 40, 0, 1}, {16, 2, 256, 70, 33, 1}, {8, 8, 128, 17, 200, 0},
-                                                              {16, 4, 128, 64, 0, 0}};
+                                                              {16, 4, 128, 64, 0, 0},
+                                                              /* six and twelve query heads a kv head (Qwen3.8-27B, Qwen3.8
+                                                               * without a selection list): three or six warps a block */
+                                                              {24, 4, 256, 70, 33, 1}, {24, 4, 256, 100, 0, 0}, {48, 4, 256, 37, 5, 1}};
         for (auto &k : cs) {
             const int qdim = 2 * k.hd, cap = k.pos_base + k.S + 9, k_off = 32;
             std::vector<float> q = rnd((size_t)k.S * k.H * qdim, 51), kc = rnd((size_t)k_off + (size_t)k.KV * cap * k.hd, 52),
@@ -985,6 +1169,7 @@ int main(void) {
         }
     }
     prompt_rows_one_pass_long();
+    prompt_rows_16byte_staging();
     {   /* a float16 KV cache (kvh: attn_h, attn_wh, copy_regions_h): K and V of float16 values give
          * attn's bits from a float32 cache of the same values on every path: a decode's blocks by KV
          * head and by head, a prompt chunk on the tensor cores, a window with sinks, linear and in a ring */
@@ -1081,6 +1266,44 @@ int main(void) {
         ck(T->begin() && T->dnrec(KD, cb, bb, zb, sb, pb, yb, NULL, &p2) && T->submit(1) && maxdiff(down(yb, y.size()).data(), ry.data(), y.size()) < 1e-4 && maxdiff(down(sb, st.size()).data(), rst.data(), st.size()) < 1e-4, "the sigmoid gate, from the carried state");
         T->free(cb); T->free(bb); T->free(zb); T->free(sb); T->free(pb); T->free(yb); T->free(nb);
     }
+    /* a verify's rows with a copy after each (snap_n, the copies' addresses in a mapped table): one
+     * dispatch of the convolution and one of the recurrence give the bits of a dispatch a row (each
+     * ending on its row, snap_row 0), outputs, the carried state and ring, and every copy */
+    if (T->size >= offsetof(ColiCudaChainOps, dev_addr) + sizeof T->dev_addr && T->dev_addr) {
+        printf("dnconv and dnrec: a verify's copies in one dispatch\n");
+        const int KD = 128, S = 8, NS = 7, VH = 4, KH = 2, VD = 128, Ktot = KH * KD, CD = 2 * Ktot + VH * VD, vd = VH * VD, CK = 4, nh = CK - 1;
+        std::vector<float> in = rnd((size_t)S * CD, 91), w = rnd((size_t)CD * CK, 92), ring = rnd((size_t)CD * nh, 93);
+        std::vector<float> ab = rnd((size_t)S * 2 * VH, 94), z = rnd((size_t)S * vd, 95), st = rnd((size_t)VH * KD * VD, 96, 0.1f);
+        std::vector<float> prm(2 * VH + VD); unsigned sd = 97; for (int h = 0; h < VH; h++) { prm[h] = -1.f + 0.5f * frand(&sd); prm[VH + h] = 0.2f * frand(&sd); } for (int v = 0; v < VD; v++) prm[2 * VH + v] = 1.f + 0.2f * frand(&sd);
+        std::vector<float> out[2], ys[2], sts[2], rings[2], rs[2][NS], cs[2][NS];
+        for (int one = 0; one < 2; one++) {
+            CcBuf *ib = up(in), *wb = up(w), *rb = up(ring), *ob = T->buf((size_t)S * CD * 4, CC_DEV), *bb = up(ab), *zb = up(z), *sb = up(st), *pb = up(prm);
+            CcBuf *yb = T->buf((size_t)S * vd * 4, CC_DEV), *rsb[NS], *csb[NS], *tab = T->buf((size_t)2 * NS * 8 + 16, CC_UP);
+            for (int r = 0; r < NS; r++) { rsb[r] = T->buf((size_t)VH * KD * VD * 4, CC_DEV); csb[r] = T->buf((size_t)CD * nh * 4, CC_DEV); }
+            int ok = tab != NULL && T->begin();
+            if (one) {
+                unsigned long long *t = (unsigned long long *)T->ptr(tab) + 1;   /* at float 2: an offset into the table */
+                for (int r = 0; r < NS; r++) { t[r] = (unsigned long long)(uintptr_t)T->dev_addr(rsb[r]); t[NS + r] = (unsigned long long)(uintptr_t)T->dev_addr(csb[r]); }
+                CcDnConv cp = {S, CD, CK, 0, CD, 0, CD, -1, 0, 0, 0, 2 + 2 * NS, NS};
+                CcDnRec rp = {S, VH, KH, VD, Ktot, 0, CD, 0, 2 * VH, VH, 2 * VH, 0, vd, 0, vd, -1, 0, 1e-6f, 1.f / sqrtf((float)KD), 0, 2, 0, NS};
+                ok = ok && T->dnconv(ib, wb, rb, ob, tab, &cp) && T->dnrec(KD, ob, bb, zb, sb, pb, yb, tab, &rp);
+            } else
+                for (int r = 0; r < NS && ok; r++) {   /* the engines' segments: a row each, the last the rest */
+                    int s0 = r, len = r < NS - 1 ? 1 : S - s0;
+                    CcDnConv cp = {len, CD, CK, s0 * CD, CD, s0 * CD, CD, 0, 0, 0, 0, 0};
+                    CcDnRec rp = {len, VH, KH, VD, Ktot, s0 * CD, CD, s0 * 2 * VH, 2 * VH, VH + s0 * 2 * VH, 2 * VH, s0 * vd, vd, s0 * vd, vd, 0, 0, 1e-6f, 1.f / sqrtf((float)KD), 0, 0, 0};
+                    ok = T->dnconv(ib, wb, rb, ob, csb[r], &cp) && T->dnrec(KD, ob, bb, zb, sb, pb, yb, rsb[r], &rp);
+                }
+            ck(ok && T->submit(1), one ? "one dispatch each, seven copies" : "a dispatch a copy");
+            out[one] = down(ob, (size_t)S * CD); ys[one] = down(yb, (size_t)S * vd); sts[one] = down(sb, st.size()); rings[one] = down(rb, ring.size());
+            for (int r = 0; r < NS; r++) { rs[one][r] = down(rsb[r], (size_t)VH * KD * VD); cs[one][r] = down(csb[r], (size_t)CD * nh); }
+            T->free(ib); T->free(wb); T->free(rb); T->free(ob); T->free(bb); T->free(zb); T->free(sb); T->free(pb); T->free(yb); T->free(tab);
+            for (int r = 0; r < NS; r++) { T->free(rsb[r]); T->free(csb[r]); }
+        }
+        int same = out[0] == out[1] && ys[0] == ys[1] && sts[0] == sts[1] && rings[0] == rings[1];
+        for (int r = 0; r < NS; r++) same = same && rs[0][r] == rs[1][r] && cs[0][r] == cs[1][r];
+        ck(same, "the same bits: outputs, the state and the ring carried, the seven states and rings copied");
+    }
     printf("ew\n");
     {
         const int R = 3, D = 40, C = 4, n = R * D;
@@ -1122,6 +1345,40 @@ int main(void) {
         ref_qsa(iq.data(), NULL, rpk.data(), NULL, rsc.data(), rsel.data(), &p2);
         ok = T->begin() && T->qsa(qb, NULL, pb, NULL, sb, lb, &p2) && T->submit(1) && T->read(lb, 0, got.data(), got.size() * 4);
         ck(ok && got[0] == -1 && got[selrow] == -1 && got[2 * selrow] == -1, "few positions: every row attends to all of them (-1)");
+        {   /* 1100 blocks (Qwen3.8's 4400 positions, budget 2048): of 37 keys and some zero ones, so many
+             * scores tie, the take-th among them; the device's select against the CPU's ranking */
+            const int NB = 1100, S3 = 2, B3 = 2048, nbm3 = NB + 4, sr3 = 1 + B3 + R - 1;
+            std::vector<float> kk = rnd((size_t)37 * ID, 94), pk3((size_t)nbm3 * ID, 0.f);
+            for (int b = 0; b < NB; b++) if (b % 11) for (int d = 0; d < ID; d++) pk3[(size_t)b * ID + d] = kk[(size_t)(b % 37) * ID + d];
+            std::vector<float> iq3 = rnd((size_t)S3 * (IQ + 1) * ID, 95), sc3((size_t)S3 * 2 * nbm3), rsc3 = sc3;
+            std::vector<int> sel3((size_t)S3 * sr3), rsel3 = sel3, got3(sel3.size());
+            CcQsa p3 = {1, ID, R, 0, 0, S3, NB * R + 1, B3, IQ, 0, (IQ + 1) * ID, nbm3, sr3, 1e-6f, 0, 0, 0, 0};
+            ref_qsa(iq3.data(), NULL, pk3.data(), NULL, rsc3.data(), rsel3.data(), &p3);
+            CcBuf *pb3 = up(pk3), *qb3 = up(iq3), *sb3 = T->buf(sc3.size() * 4, CC_DEV), *lb3 = T->buf(sel3.size() * 4, CC_DEV);
+            ok = T->begin() && T->qsa(qb3, NULL, pb3, NULL, sb3, lb3, &p3) && T->submit(1) && T->read(lb3, 0, got3.data(), got3.size() * 4);
+            same = 1; for (size_t i = 0; i < got3.size(); i++) if (got3[i] != rsel3[i]) same = 0;
+            ck(ok && same && rsel3[0] == B3 + 2 && rsel3[sr3] == B3 + 3, "1100 blocks of tied scores: the take-th key's blocks by index, then the tail, as the CPU ranks them");
+            T->free(pb3); T->free(qb3); T->free(sb3); T->free(lb3);
+        }
+        {   /* a prompt chunk's 70 rows (cc_qsa_score_t, tiles of 64 rows by 64 blocks), Qwen3.8's index heads (4 of 128):
+             * the same selections as a thread a (row, block) (COLI_CUDA_QSA_TILES=0) and as the CPU ranks them */
+            const int ID4 = 128, IQ4 = 4, S4 = 70, PB4 = 2000, B4 = 512, nbm4 = 600, sr4 = 1 + B4 + R - 1, NB4 = (PB4 + S4) / R;
+            std::vector<float> pk4 = rnd((size_t)nbm4 * ID4, 96), iq4 = rnd((size_t)S4 * (IQ4 + 1) * ID4, 97);
+            for (int b = NB4; b < nbm4; b++) for (int d = 0; d < ID4; d++) pk4[(size_t)b * ID4 + d] = 0.f;
+            std::vector<float> rsc4((size_t)S4 * 2 * nbm4);
+            std::vector<int> rsel4((size_t)S4 * sr4), t4(rsel4.size()), k4(rsel4.size());
+            CcQsa p4 = {1, ID4, R, 0, 0, S4, PB4, B4, IQ4, 0, (IQ4 + 1) * ID4, nbm4, sr4, 1e-6f, 0, 0, 0, 0};
+            ref_qsa(iq4.data(), NULL, pk4.data(), NULL, rsc4.data(), rsel4.data(), &p4);
+            CcBuf *pb4 = up(pk4), *qb4 = up(iq4), *sb4 = T->buf(rsc4.size() * 4, CC_DEV), *lb4 = T->buf(rsel4.size() * 4, CC_DEV);
+            ok = T->begin() && T->qsa(qb4, NULL, pb4, NULL, sb4, lb4, &p4) && T->submit(1) && T->read(lb4, 0, t4.data(), t4.size() * 4);
+            setenv("COLI_CUDA_QSA_TILES", "0", 1);
+            ok = ok && T->begin() && T->qsa(qb4, NULL, pb4, NULL, sb4, lb4, &p4) && T->submit(1) && T->read(lb4, 0, k4.data(), k4.size() * 4);
+            unsetenv("COLI_CUDA_QSA_TILES");
+            ck(ok && !memcmp(t4.data(), k4.data(), t4.size() * 4), "70 rows' selections in tiles: those of a thread a (row, block), to the bit");
+            same = 1; for (size_t i = 0; i < t4.size(); i++) if (t4[i] != rsel4[i]) same = 0;
+            ck(ok && same, "and as the CPU ranks them");
+            T->free(pb4); T->free(qb4); T->free(sb4); T->free(lb4);
+        }
         T->free(ib); T->free(wb); T->free(cb); T->free(pb); T->free(qb); T->free(sb); T->free(lb);
     }
     printf("ple\n");
@@ -1371,6 +1628,50 @@ int main(void) {
         ck(ok && same, "eight rounds: each answer read after its word, before the next");
         T->free(df); T->free(hf); T->free(ans); T->free(dst);
     }
+    printf("wait_host_if\n");
+    {
+        /* wait_host for a step whose host may have no slots: a table of eight experts, 6 and 7 the
+         * host's (no g); six rounds of four routes, the host's slots in rounds 1 and 4 only (an id
+         * of -1 and one past the table count as the device's). Without a slot the device zeroes
+         * the host's rows and goes on, the host writing nothing; with one it waits for the word */
+        const int E = 8, R = 6, NK = 4;
+        CcExpert tab[E]; memset(tab, 0, sizeof tab);
+        for (int e = 0; e < 6; e++) tab[e].g = tab[e].u = tab[e].d = (const void *)(uintptr_t)(64 * (e + 1));
+        static const int ids[R][NK] = {{0, 1, 2, 3}, {4, 6, 5, 0}, {5, -1, 2, 9}, {1, 1, 1, 1}, {7, 2, 3, 4}, {0, 5, 9, -1}};
+        const int host[R] = {0, 1, 0, 0, 1, 0};
+        CcBuf *tb = T->buf(sizeof tab, CC_DEV), *ib = T->buf(sizeof ids, CC_DEV), *df = T->buf(64, CC_DOWN), *hf = T->buf(64, CC_UP),
+              *hy = T->buf(64 * 4, CC_UP), *dst = T->buf((size_t)R * 64 * 4, CC_DEV);
+        volatile unsigned *dw = (volatile unsigned *)T->ptr(df), *hw = (volatile unsigned *)T->ptr(hf);
+        float *aw = (float *)T->ptr(hy);
+        int ok = T->wait_host_if && tb && ib && df && hf && hy && dst;
+        if (ok) { for (int i = 0; i < 64; i++) aw[i] = 7.f; hw[5] = 0; hw[6] = 0; }
+        ok = ok && T->begin() && T->write(tb, 0, tab, sizeof tab) && T->write(ib, 0, ids, sizeof ids);
+        for (int r = 0; r < R && ok; r++)
+            ok = T->signal(df, 3, 100 + r) && T->wait_host_if(hf, 5, 100 + r, tb, 0, ib, (size_t)r * NK, NK, E, hy, 64) &&
+                 T->copy(dst, (size_t)r * 64, hy, 0, 64);
+        const auto t0 = std::chrono::steady_clock::now();
+        ok = ok && T->submit(0);
+        std::thread hostt([&] {
+            for (int r = 0; r < R; r++) {
+                if (!host[r]) continue;   /* nothing written: a device that waited would wait for good */
+                while (dw[3] < (unsigned)(100 + r)) { }
+                for (int i = 0; i < 64; i++) aw[i] = (float)(r * 1000 + i);
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                hw[5] = 100 + r;
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                if (r < R - 1) while (dw[3] < (unsigned)(101 + r)) { }   /* the copy read it */
+            }
+        });
+        ok = ok && T->finish();
+        hostt.join();
+        const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::vector<float> gotv = down(dst, (size_t)R * 64); const float *got = gotv.data(); int same = 1;
+        for (int r = 0; r < R; r++) for (int i = 0; i < 64; i++) same &= got[r * 64 + i] == (host[r] ? (float)(r * 1000 + i) : 0.f);
+        ck(ok && same && hw[6] == 0 && el < 5.0, "without a slot of the host's: its rows zero, no wait; with one: its rows after its word");
+        ck(!T->wait_host_if(hf, 5, 1, tb, 0, ib, 0, NK, 16, hy, 64) && !T->wait_host_if(hf, 5, 1, tb, 0, ib, 0, NK, E, hy, 65) &&
+           !T->wait_host_if(df, 5, 1, tb, 0, ib, 0, NK, E, hy, 64), "wait_host_if past its buffers, or on a DOWN flag, refused");
+        T->free(tb); T->free(ib); T->free(df); T->free(hf); T->free(hy); T->free(dst);
+    }
     printf("pick\n");
     {
         const int V = 248320;
@@ -1407,6 +1708,33 @@ int main(void) {
         }
         ck(tie_ok, "equal maxima (across warps, within a warp, same thread): lowest index wins");
         ck(!T->pick(lb, small, V) && !T->pick(lb, pb, V + 1), "pick past its buffers refused");
+        T->free(lb); T->free(pb); T->free(small);
+    }
+    printf("pick_rows\n");
+    {
+        const int V = 248320, R = 4, off = 3;   /* rows from float off: a buffer's rows past the first */
+        std::vector<float> lg = rnd((size_t)(off + R * V), 93, 10.f);
+        lg[off + 173421] = 22.f; lg[off + V + 9] = 30.f; lg[off + 2 * V + 248319] = 25.f;
+        lg[off + 3 * V + 5000] = 28.f; lg[off + 3 * V + 4000] = 28.f;   /* a tie: the lower place */
+        int ids_ref[R]; float p_ref[R];
+        for (int r = 0; r < R; r++) {
+            const float *x = lg.data() + off + (size_t)r * V;
+            int best = 0;
+            for (int i = 1; i < V; i++) if (x[i] > x[best]) best = i;
+            double z = 0.0;
+            for (int i = 0; i < V; i++) if (x[i] - x[best] > -20.f) z += expf(x[i] - x[best]);
+            ids_ref[r] = best; p_ref[r] = (float)(1.0 / z);
+        }
+        CcBuf *lb = up(lg), *pb = T->buf(8 * R, CC_DOWN), *small = T->buf(8 * R - 8, CC_DOWN);
+        int ok = T->size >= offsetof(ColiCudaChainOps, pick_rows) + sizeof T->pick_rows && T->pick_rows &&
+                 T->begin() && T->pick_rows(lb, off, pb, V, R) && T->submit(1);
+        const void *pk = T->ptr(pb);
+        int same = ok && pk;
+        for (int r = 0; same && r < R; r++)
+            same = ((const int *)pk)[2 * r] == ids_ref[r] && fabsf(((const float *)pk)[2 * r + 1] - p_ref[r]) <= 1e-5f * p_ref[r];
+        ck(same, "four rows of 248320 logits from an offset: each row's argmax (the lower place on a tie) and probability, pick's");
+        ck(ok && ids_ref[3] == 4000, "the tie row's reference is the lower place");
+        ck(ok && !T->pick_rows(lb, off, small, V, R) && !T->pick_rows(lb, off + 1, pb, V, R), "pick_rows past its buffers refused");
         T->free(lb); T->free(pb); T->free(small);
     }
     printf("matmul_rows\n");
@@ -1590,10 +1918,39 @@ int main(void) {
             T->free(xb); T->free(pb); T->free(yb);
         }
     }
+    printf("hyper-connection mix\n");
+    {   /* a hyper-connection read's up projection and mix in one pass (matmul_hcmix): Q8_0 rows of 320 inputs, four
+         * streams of 256, 300 rows (tiles of 256 rows) and 100 (of 128); against matmul then CC_EW_HC_MIX, to the bit */
+        const int I = 320, H = 256, C = 4, O = C * H;
+        unsigned sd = 31;
+        std::vector<uint8_t> q8((size_t)O * (I / 32) * 34);
+        for (int o = 0; o < O; o++)
+            for (int b = 0; b < I / 32; b++) {
+                uint8_t *blk = q8.data() + ((size_t)o * (I / 32) + b) * 34;
+                const uint16_t dh = (uint16_t)(0x2000u + (unsigned)(frand(&sd) * 2048.f + 2048.f));   /* a small positive half */
+                memcpy(blk, &dh, 2);
+                for (int k = 0; k < 32; k++) blk[2 + k] = (uint8_t)(int8_t)(frand(&sd) * 120.f);
+            }
+        ColiCudaTensor *tq = NULL;
+        ck(coli_cuda_tensor_upload(&tq, q8.data(), NULL, 108, I, O, 0), "a Q8_0 tensor of 320 inputs and 4 x 256 outputs resident");
+        for (int S : {300, 100}) {
+            std::vector<float> x = rnd((size_t)S * I, 41), hn = rnd((size_t)S * O, 42);
+            CcBuf *xb = up(x), *hb = up(hn), *mb = T->buf((size_t)S * O * 4, CC_DEV), *ya = T->buf((size_t)S * H * 4, CC_DEV), *yb = T->buf((size_t)S * H * 4, CC_DEV);
+            CcEw mx = {CC_EW_HC_MIX, S * H, H, C, 0, 1, 0, 0, 0, 0, 0, (float)C};
+            int ok = T->begin() && T->matmul(tq, xb, 0, mb, 0, S) && T->ew(ya, mb, hb, NULL, NULL, &mx) && T->submit(1);
+            int r = ok && T->matmul_hcmix ? T->matmul_hcmix(tq, xb, 0, hb, yb, S, H, C, (float)C) : 0;
+            ok = ok && r == 1 && T->submit(1);
+            std::vector<float> a = down(ya, (size_t)S * H), b = down(yb, (size_t)S * H);
+            char what[128]; snprintf(what, sizeof what, "%d rows: the up projection and the mix in one pass, those of the two ops to the bit", S);
+            ck(ok && !memcmp(a.data(), b.data(), a.size() * 4), what);
+            T->free(xb); T->free(hb); T->free(mb); T->free(ya); T->free(yb);
+        }
+        coli_cuda_tensor_free(tq);
+    }
     printf("lost\n");
     {
         CcStats st; T->stats(&st);
-        ck(st.frames > 10 && st.ops > 30 && st.matmuls == 30, "the counters saw the frames, ops and matmuls");
+        ck(st.frames > 10 && st.ops > 30 && st.matmuls == 50, "the counters saw the frames, ops and matmuls");
         setenv("COLI_GPU_FAIL_AFTER", "0", 1);
         std::vector<float> w = rnd(64, 81), ones(8, 1.f);
         ColiCudaTensor *t = NULL;

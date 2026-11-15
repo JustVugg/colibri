@@ -141,6 +141,15 @@ CATALOG = (
         post_install=(("k3_tokenizer", "tokenizer.json"),),
         doc="docs/kimi_k3.md"),
     CatalogModel(
+        id="kimi-k3.1-pro", family="kimi", name="Kimi K3.1 Pro",
+        repo="moonshotai/Kimi-K3.1-Pro", disk_gb=1561.3,
+        # K3's weights plus the DSA indexer (120 BF16 tensors, 0.36 GB)
+        ram_min_gb=32, ram_good_gb=64, dense_gb=20.2, rank=11, size_class="large",
+        summary="2.8T, K3 with sparse attention past 2048 tokens, native MXFP4 experts",
+        # the same tiktoken.model as K3 (one sha256): the same tokenizer.json
+        post_install=(("k3_tokenizer", "tokenizer.json"),),
+        prebuilt_since="2.1.1", doc="docs/kimi_k3.md#kimi-k31-pro"),
+    CatalogModel(
         id="qwen-image-2.1", family="qwen_image", name="Qwen-Image-2.1",
         repo="Qwen/Qwen-Image-2.1", disk_gb=33.1,
         # docs/qwen-image.md: 9.0 GB peak for one 768x512 image with the text
@@ -149,6 +158,15 @@ CATALOG = (
         modality="image", summary="text to image (pictures, not chat)",
         license_note="Qwen Research License: non-commercial use only",
         prebuilt_since="2.0.0", doc="docs/qwen-image.md"),
+    CatalogModel(
+        id="qwen-image-2.1-turbo", family="qwen_image", name="Qwen-Image-2.1-Turbo",
+        repo="Qwen/Qwen-Image-2.1-Turbo", disk_gb=32.5,
+        # the base model's text encoder (byte for byte) and the same DiT shapes, so the
+        # same RAM; its VAE is the bf16 one (0.7 GB on disk, f32 in RAM as the base's)
+        ram_min_gb=12, ram_good_gb=18, dense_gb=8.5, rank=1, size_class="small",
+        modality="image", summary="text to image in 8 steps (Qwen-Image-2.1 distilled)",
+        license_note="Qwen Research License: non-commercial use only",
+        prebuilt_since="2.1.1", doc="docs/qwen-image.md#turbo"),
 )
 
 

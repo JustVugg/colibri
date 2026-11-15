@@ -1,0 +1,233 @@
+DeepSeek-V4.1-Flash-1017 UD-Q2_K_XL (Unsloth GGUF, 311 GiB), coli serve, CUDA tier, --ram 18 --ctx 4096 --gpu 0 --kv-slots 1 --no-think, greedy.
+Box: i7-13700KF (16C/24T; coli sets OMP_NUM_THREADS to the P-core count, 8), 31 GiB RAM + 8 GiB swap file, RTX 4070 Ti 12 GB (driver 580.126.20, CUDA 13.2), Samsung 990 PRO NVMe, Ubuntu 24.04, gcc 13.3.
+Arms (the ENGINE lines below are what the case script read from /proc/PID/exe when the server was up):
+  baseline = scratch pool only (first commit)                     runs FIN_B1 FIN_B2 FIN_B3   binary bc72f1f0e013
+  trial    = pool + expert reads at the team width (second commit)  runs FIN_T1 FIN_T2 FIN_T3   binary 90b45f62293c
+Both binaries were built on the box from the committed sources. The runs were alternated T B T B T B, each on a fresh server with four 128-token requests in this order:
+decode_a, decode_b, decode_a_again, decode_c (so three requests warm the server before the sampled one). The sampled metric is decode_c: its text hash is the same in 5 of the 6 runs, and the odd run has the same length and read the same bytes from disk.
+The GPU tier warm-starts from .coli_usage, which every run rewrites; it was not restored between runs.
+Section MEMORY: the original engine (AB_A1..3, SOAK_A) against the pool (SOAK_B ran the pool binary bc72f1f0e013, as do the speed runs FIN_B1..3). Three earlier runs of an older revision of the pool (12.4 GiB peak as well) are left out.
+RSS series are sampled every 5 s by the case script; the memory runs show every 30 s, the speed runs one summary line, and the author keeps the full series. Swap was sampled only in the later runs (SOAK_*, FIN_*).
+Quality: the CUDA tier's text is not reproducible run to run even for one binary, so identity is checked on the CPU path (COLI_CUDA=0 --gpu none), 3 prompts, SHA-256 of the full text (X_base1 original engine, X_fix2 first commit, X_trim second commit):
+X_base1: 097672f987333761 a29f17853f2fcc33 6c407cccdd887569
+X_fix2: 097672f987333761 a29f17853f2fcc33 6c407cccdd887569
+X_trim: 097672f987333761 a29f17853f2fcc33 6c407cccdd887569
+
+Threads created per request (/proc/sys/kernel/ns_last_pid sampled each second), baseline = original engine without the pool, trial = second commit (binary 90b45f62293c):
+NP_A decode_a: 128 tokens, 7522 thread/process ids created, 58.8 per token
+NP_A decode_b: 128 tokens, 6557 thread/process ids created, 51.2 per token
+NP_T decode_a: 128 tokens, 334 thread/process ids created, 2.6 per token
+NP_T decode_b: 128 tokens, 325 thread/process ids created, 2.5 per token
+
+######## AB_A1
+[00:34:58] ENGINE exe=/home/broth/bench/colibri/c/deepseek_v41 md5=aeaf4f95803e root=/home/broth/bench/colibri
+--- requests.jsonl
+{"req": "decode_a", "t_start": 1793662498, "t_end": 1793662565, "ttft_s": 5.8, "total_s": 66.7, "chunks": 128, "decode_tps": 2.09, "disk_gb": 179.8, "text_head": "1. The word \"computer\" originally referred to a person who p", "text_sha": "de9651aa338dd0e6", "text_len": 559}
+{"req": "decode_b", "t_start": 1793662565, "t_end": 1793662635, "ttft_s": 6.8, "total_s": 70.7, "chunks": 128, "decode_tps": 1.99, "disk_gb": 199.8, "text_head": "Mixture-of-experts (MoE) models are memory-bandwidth bound d", "text_sha": "edcdd22e1c486157", "text_len": 637}
+{"req": "decode_a_again", "t_start": 1793662635, "t_end": 1793662703, "ttft_s": 5.3, "total_s": 67.4, "chunks": 128, "decode_tps": 2.05, "disk_gb": 174.6, "text_head": "1. The Antikythera mechanism, an ancient Greek analog comput", "text_sha": "a8ceb306cd2e5fd1", "text_len": 607}
+{"req": "decode_c", "t_start": 1793662703, "t_end": 1793662782, "ttft_s": 5.8, "total_s": 78.9, "chunks": 128, "decode_tps": 1.74, "disk_gb": 235.6, "text_head": "# Reversing a Singly Linked List in Python\n\n## Implementatio", "text_sha": "6d7cfcba6dd2fced", "text_len": 532}
+{"req": "prompt_650tok", "t_start": 1793662782, "t_end": 1793662897, "ttft_s": 115.3, "total_s": 115.3, "chunks": 0, "decode_tps": null, "disk_gb": 367.9, "text_head": "", "text_sha": "e3b0c44298fc1c14", "text_len": 0}
+--- rss.csv every 30 s (epoch, RssAnon kB, MemAvailable kB[, VmSwap kB, Threads])
+1793662498,8569872,22371808
+1793662528,15065868,15842980
+1793662558,18313832,12593620
+1793662588,20745804,10152304
+1793662618,23697100,7225672
+1793662648,26173728,4704164
+1793662678,29494512,1399480
+1793662708,30810228,143912
+1793662739,30849512,155616
+1793662769,30732828,214664
+1793662799,30633604,280824
+1793662829,30504232,420908
+1793662859,30552088,379688
+1793662889,30793004,212656
+
+######## AB_A2
+[00:51:53] ENGINE exe=/home/broth/bench/colibri/c/deepseek_v41 md5=aeaf4f95803e root=/home/broth/bench/colibri
+--- requests.jsonl
+{"req": "decode_a", "t_start": 1793663514, "t_end": 1793663580, "ttft_s": 5.8, "total_s": 66.6, "chunks": 128, "decode_tps": 2.09, "disk_gb": 181.5, "text_head": "1. The word \"computer\" originally referred to a person who p", "text_sha": "e41b3a85ab6c35be", "text_len": 583}
+{"req": "decode_b", "t_start": 1793663580, "t_end": 1793663651, "ttft_s": 6.7, "total_s": 70.7, "chunks": 128, "decode_tps": 1.99, "disk_gb": 199.3, "text_head": "Mixture-of-experts (MoE) models are memory-bandwidth bound d", "text_sha": "5080b3b5c232ad19", "text_len": 602}
+{"req": "decode_a_again", "t_start": 1793663651, "t_end": 1793663720, "ttft_s": 5.3, "total_s": 69.1, "chunks": 128, "decode_tps": 1.99, "disk_gb": 177.7, "text_head": "1. The word \"computer\" originally referred to a person who p", "text_sha": "387e7ae9b533a0aa", "text_len": 536}
+{"req": "decode_c", "t_start": 1793663720, "t_end": 1793663798, "ttft_s": 5.7, "total_s": 78.3, "chunks": 128, "decode_tps": 1.75, "disk_gb": 234.7, "text_head": "# Reversing a Singly Linked List in Python\n\n## Implementatio", "text_sha": "6d7cfcba6dd2fced", "text_len": 532}
+{"req": "prompt_650tok", "t_start": 1793663798, "t_end": 1793663808, "ttft_s": 9.9, "total_s": 9.9, "chunks": 0, "decode_tps": null, "disk_gb": 25.6, "text_head": "", "text_sha": "e3b0c44298fc1c14", "text_len": 0}
+--- rss.csv every 30 s (epoch, RssAnon kB, MemAvailable kB[, VmSwap kB, Threads])
+1793663513,8574532,22372664
+1793663543,15126072,15819136
+1793663573,18300896,12661596
+1793663603,20714944,10219516
+1793663633,23856044,7077000
+1793663664,26600432,4311856
+1793663694,30017072,891624
+1793663724,30692120,231192
+1793663754,30680772,241820
+1793663784,30723140,189072
+
+######## AB_A3
+[01:07:06] ENGINE exe=/home/broth/bench/colibri/c/deepseek_v41 md5=aeaf4f95803e root=/home/broth/bench/colibri
+--- requests.jsonl
+{"req": "decode_a", "t_start": 1793664426, "t_end": 1793664494, "ttft_s": 5.8, "total_s": 67.3, "chunks": 128, "decode_tps": 2.07, "disk_gb": 182.8, "text_head": "1. The word \"computer\" originally referred to a person who p", "text_sha": "e41b3a85ab6c35be", "text_len": 583}
+{"req": "decode_b", "t_start": 1793664494, "t_end": 1793664565, "ttft_s": 6.7, "total_s": 71.1, "chunks": 128, "decode_tps": 1.97, "disk_gb": 204.0, "text_head": "Mixture-of-experts (MoE) models are memory-bandwidth bound d", "text_sha": "06e71e66555b5427", "text_len": 636}
+{"req": "decode_a_again", "t_start": 1793664565, "t_end": 1793664634, "ttft_s": 5.4, "total_s": 69.1, "chunks": 128, "decode_tps": 1.99, "disk_gb": 174.1, "text_head": "1. The word \"computer\" originally referred to a person who p", "text_sha": "e41b3a85ab6c35be", "text_len": 583}
+{"req": "decode_c", "t_start": 1793664634, "t_end": 1793664714, "ttft_s": 5.6, "total_s": 80.1, "chunks": 128, "decode_tps": 1.7, "disk_gb": 234.6, "text_head": "# Reversing a Singly Linked List in Python\n\n## Implementatio", "text_sha": "6d7cfcba6dd2fced", "text_len": 532}
+{"req": "prompt_650tok", "t_start": 1793664714, "t_end": 1793664715, "ttft_s": 1.4, "total_s": 1.4, "chunks": 0, "decode_tps": null, "disk_gb": 0.1, "text_head": "", "text_sha": "e3b0c44298fc1c14", "text_len": 0}
+--- rss.csv every 30 s (epoch, RssAnon kB, MemAvailable kB[, VmSwap kB, Threads])
+1793664426,8574896,22440804
+1793664456,15018708,15979836
+1793664486,18150200,12837628
+1793664516,20441624,10541928
+1793664546,23619892,7354268
+1793664576,26229652,4741256
+1793664606,29612528,1352592
+1793664637,29505972,220804
+1793664667,30053448,238948
+1793664697,30149696,232828
+
+######## SOAK_A
+[01:38:43] ENGINE exe=/home/broth/bench/colibri/c/deepseek_v41 md5=aeaf4f95803e root=/home/broth/bench/colibri src_md5=4aa89096eead
+--- requests.jsonl
+{"req": "soak_decode", "t_start": 1793666324, "t_end": 1793666594, "ttft_s": 6.7, "total_s": 270.5, "chunks": 512, "decode_tps": 1.94, "disk_gb": 651.8, "text_head": "# From Abacus to Artificial Intelligence: A Comprehensive Hi", "text_sha": "e6d74c9d620f519a", "text_len": 2910}
+{"req": "prompt_2300tok", "t_start": 1793666594, "t_end": 1793666594, "failed": "HTTP Error 500: Internal Server Error"}
+--- rss.csv every 30 s (epoch, RssAnon kB, MemAvailable kB[, VmSwap kB, Threads])
+1793666323,8583480,22224712,0,12
+1793666353,14625024,16323680,0,12
+1793666383,17787052,13122412,0,12
+1793666413,20929880,9995416,0,12
+1793666443,24028076,6893584,0,12
+1793666474,27058312,3855604,0,12
+1793666504,30007472,901964,0,12
+1793666534,30807508,217620,2142476,12
+1793666564,30787088,301916,5294460,12
+
+######## SOAK_B
+[01:43:24] ENGINE exe=/home/broth/bench/colibri-fix/c/deepseek_v41 md5=bc72f1f0e013 root=/home/broth/bench/colibri-fix src_md5=4720c354970c
+--- requests.jsonl
+{"req": "soak_decode", "t_start": 1793666605, "t_end": 1793667511, "ttft_s": 6.6, "total_s": 906.6, "chunks": 1500, "decode_tps": 1.67, "disk_gb": 1806.2, "text_head": "# From Abacus to Artificial Intelligence: A Comprehensive Hi", "text_sha": "f62f777e05f9d9f4", "text_len": 8181}
+{"req": "prompt_2300tok", "t_start": 1793667511, "t_end": 1793668750, "ttft_s": 1222.7, "total_s": 1238.1, "chunks": 16, "decode_tps": 0.97, "disk_gb": 2541.3, "text_head": "llama.cpp is a C/C++ library for running LLM and VLM", "text_sha": "d977909a1bcfdbc9", "text_len": 52}
+--- rss.csv every 30 s (epoch, RssAnon kB, MemAvailable kB[, VmSwap kB, Threads])
+1793666604,8578248,22354072,0,12
+1793666634,12550180,18407008,0,12
+1793666665,12562216,18427384,0,12
+1793666695,12573520,18412296,0,12
+1793666725,12583068,18404380,0,12
+1793666755,12591996,18397268,0,12
+1793666785,12599484,18388024,0,12
+1793666815,12606744,18380988,0,12
+1793666845,12613028,18368916,0,7
+1793666875,12618064,18343916,0,12
+1793666905,12622840,18350972,0,12
+1793666936,12626736,18348100,0,12
+1793666966,12630276,18345276,0,10
+1793666996,12633164,18342148,0,12
+1793667026,12635980,18338484,0,12
+1793667056,12638740,18335032,0,12
+1793667086,12641200,18332836,0,12
+1793667116,12643428,18332592,0,7
+1793667146,12645496,18329276,0,12
+1793667176,12647360,18323724,0,12
+1793667207,12648944,18318928,0,12
+1793667237,12650520,18318096,0,10
+1793667267,12651824,18314192,0,12
+1793667297,12653020,18313592,0,12
+1793667327,12654048,18308356,0,12
+1793667357,12655060,18304688,0,12
+1793667387,12655940,18305904,0,12
+1793667417,12656832,18303480,0,12
+1793667447,12657464,18304204,0,12
+1793667477,12658156,18298668,0,7
+1793667508,12658860,18297984,0,12
+1793667538,13216544,17775832,0,12
+1793667568,13564348,17445436,0,12
+1793667598,13238460,17769616,0,12
+1793667628,13240812,17757492,0,12
+1793667658,13240812,17750620,0,12
+1793667688,13570800,17422284,0,12
+1793667718,13240812,17751088,0,12
+1793667749,13240812,17746760,0,12
+1793667779,13243976,17719064,0,12
+1793667809,13574224,17410984,0,12
+1793667839,13244236,17740596,0,12
+1793667869,13244236,17736720,0,12
+1793667899,13244236,17716668,0,12
+1793667929,13244236,17737932,0,12
+1793667959,13574428,17408668,0,12
+1793667989,13576384,17402220,0,12
+1793668020,13577708,17400120,0,12
+1793668050,13258460,17694420,0,12
+1793668080,13258460,17718740,0,12
+1793668110,13567456,17411516,0,12
+1793668140,13567456,17409824,0,12
+1793668170,13567456,17408472,0,12
+1793668200,13567456,17411008,0,12
+1793668230,13258460,17716808,0,12
+1793668260,13567456,17410860,0,12
+1793668291,13567456,17406852,0,12
+1793668321,13567456,17406488,0,12
+1793668351,13258460,17714220,0,12
+1793668381,13258460,17711440,0,12
+1793668411,13567456,17408248,0,12
+1793668441,13567456,17405564,0,12
+1793668471,13567456,17404192,0,12
+1793668501,13258460,17713320,0,12
+1793668531,13258460,17720904,0,12
+1793668562,13258460,17717924,0,12
+1793668592,13567456,17409592,0,12
+1793668622,13567456,17406548,0,12
+1793668652,13567456,17405868,0,12
+1793668682,13258460,17715892,0,12
+1793668712,13258460,17712028,0,12
+1793668742,12742828,18227840,0,12
+
+######## FIN_B1
+[11:08:10] ENGINE exe=/home/broth/bench/colibri-fix2/c/deepseek_v41 md5=bc72f1f0e013 root=/home/broth/bench/colibri-fix2 src_md5=4461f24755de
+--- requests.jsonl
+{"req": "decode_a", "t_start": 1793700491, "t_end": 1793700559, "ttft_s": 6.0, "total_s": 68.2, "chunks": 128, "decode_tps": 2.04, "disk_gb": 185.6, "text_head": "1. The word \"computer\" originally referred to a person who p", "text_sha": "de9651aa338dd0e6", "text_len": 559}
+{"req": "decode_b", "t_start": 1793700559, "t_end": 1793700630, "ttft_s": 6.8, "total_s": 71.2, "chunks": 128, "decode_tps": 1.97, "disk_gb": 200.6, "text_head": "Mixture-of-experts (MoE) models are memory-bandwidth bound d", "text_sha": "616cc97235341320", "text_len": 666}
+{"req": "decode_a_again", "t_start": 1793700630, "t_end": 1793700695, "ttft_s": 5.5, "total_s": 65.1, "chunks": 128, "decode_tps": 2.13, "disk_gb": 172.7, "text_head": "1. The Antikythera mechanism, an ancient Greek analog comput", "text_sha": "a8ceb306cd2e5fd1", "text_len": 607}
+{"req": "decode_c", "t_start": 1793700695, "t_end": 1793700771, "ttft_s": 5.8, "total_s": 76.0, "chunks": 128, "decode_tps": 1.81, "disk_gb": 232.4, "text_head": "# Reversing a Singly Linked List in Python\n\n## Implementatio", "text_sha": "6d7cfcba6dd2fced", "text_len": 532}
+rss summary (56 samples, 5 s apart): peak anon 12.0 GiB, min MemAvailable 17.4 GiB, peak VmSwap 0.00 GiB
+
+######## FIN_B2
+[11:17:08] ENGINE exe=/home/broth/bench/colibri-fix2/c/deepseek_v41 md5=bc72f1f0e013 root=/home/broth/bench/colibri-fix2 src_md5=4461f24755de
+--- requests.jsonl
+{"req": "decode_a", "t_start": 1793701029, "t_end": 1793701096, "ttft_s": 5.8, "total_s": 67.1, "chunks": 128, "decode_tps": 2.07, "disk_gb": 180.4, "text_head": "1. The Antikythera mechanism, an ancient Greek analog comput", "text_sha": "5915c29b02a116c3", "text_len": 582}
+{"req": "decode_b", "t_start": 1793701096, "t_end": 1793701167, "ttft_s": 6.7, "total_s": 71.1, "chunks": 128, "decode_tps": 1.97, "disk_gb": 202.8, "text_head": "Mixture-of-experts (MoE) models are memory-bandwidth bound d", "text_sha": "909f8fb27eb9b3fe", "text_len": 677}
+{"req": "decode_a_again", "t_start": 1793701167, "t_end": 1793701232, "ttft_s": 5.3, "total_s": 64.6, "chunks": 128, "decode_tps": 2.14, "disk_gb": 173.4, "text_head": "1. The word \"computer\" originally referred to a person who p", "text_sha": "c02a5a80d9b7d6c2", "text_len": 538}
+{"req": "decode_c", "t_start": 1793701232, "t_end": 1793701308, "ttft_s": 5.8, "total_s": 76.1, "chunks": 128, "decode_tps": 1.81, "disk_gb": 232.6, "text_head": "# Reversing a Singly Linked List in Python\n\n## Implementatio", "text_sha": "7706a61438b288d1", "text_len": 532}
+rss summary (56 samples, 5 s apart): peak anon 12.0 GiB, min MemAvailable 17.4 GiB, peak VmSwap 0.00 GiB
+
+######## FIN_B3
+[11:26:04] ENGINE exe=/home/broth/bench/colibri-fix2/c/deepseek_v41 md5=bc72f1f0e013 root=/home/broth/bench/colibri-fix2 src_md5=4461f24755de
+--- requests.jsonl
+{"req": "decode_a", "t_start": 1793701564, "t_end": 1793701632, "ttft_s": 5.8, "total_s": 68.0, "chunks": 128, "decode_tps": 2.04, "disk_gb": 183.2, "text_head": "1. The Antikythera mechanism, an ancient Greek analog comput", "text_sha": "a8ceb306cd2e5fd1", "text_len": 607}
+{"req": "decode_b", "t_start": 1793701632, "t_end": 1793701704, "ttft_s": 6.8, "total_s": 71.7, "chunks": 128, "decode_tps": 1.96, "disk_gb": 204.0, "text_head": "Mixture-of-experts (MoE) models are memory-bandwidth bound d", "text_sha": "6c3f5bcd2351cfcb", "text_len": 620}
+{"req": "decode_a_again", "t_start": 1793701704, "t_end": 1793701768, "ttft_s": 5.5, "total_s": 64.6, "chunks": 128, "decode_tps": 2.15, "disk_gb": 173.7, "text_head": "1. The word \"computer\" originally referred to a person who p", "text_sha": "e41b3a85ab6c35be", "text_len": 583}
+{"req": "decode_c", "t_start": 1793701768, "t_end": 1793701844, "ttft_s": 5.7, "total_s": 75.8, "chunks": 128, "decode_tps": 1.81, "disk_gb": 232.0, "text_head": "# Reversing a Singly Linked List in Python\n\n## Implementatio", "text_sha": "6d7cfcba6dd2fced", "text_len": 532}
+rss summary (56 samples, 5 s apart): peak anon 12.0 GiB, min MemAvailable 17.5 GiB, peak VmSwap 0.00 GiB
+
+######## FIN_T1
+[11:04:01] ENGINE exe=/home/broth/bench/colibri-c2/c/deepseek_v41 md5=90b45f62293c root=/home/broth/bench/colibri-c2 src_md5=b5c18c4dc5f2
+--- requests.jsonl
+{"req": "decode_a", "t_start": 1793700241, "t_end": 1793700299, "ttft_s": 5.8, "total_s": 57.8, "chunks": 128, "decode_tps": 2.44, "disk_gb": 184.8, "text_head": "1. The Antikythera mechanism, an ancient Greek analog comput", "text_sha": "907a2d3ee0d64b1d", "text_len": 609}
+{"req": "decode_b", "t_start": 1793700299, "t_end": 1793700361, "ttft_s": 6.7, "total_s": 61.8, "chunks": 128, "decode_tps": 2.3, "disk_gb": 205.0, "text_head": "Mixture-of-experts (MoE) models are memory-bandwidth bound d", "text_sha": "06e71e66555b5427", "text_len": 636}
+{"req": "decode_a_again", "t_start": 1793700361, "t_end": 1793700414, "ttft_s": 5.4, "total_s": 53.3, "chunks": 128, "decode_tps": 2.65, "disk_gb": 169.0, "text_head": "1. The Antikythera mechanism, an ancient Greek analog comput", "text_sha": "5915c29b02a116c3", "text_len": 582}
+{"req": "decode_c", "t_start": 1793700414, "t_end": 1793700482, "ttft_s": 5.7, "total_s": 68.0, "chunks": 128, "decode_tps": 2.04, "disk_gb": 232.3, "text_head": "# Reversing a Singly Linked List in Python\n\n## Implementatio", "text_sha": "6d7cfcba6dd2fced", "text_len": 532}
+rss summary (48 samples, 5 s apart): peak anon 12.0 GiB, min MemAvailable 17.4 GiB, peak VmSwap 0.00 GiB
+
+######## FIN_T2
+[11:13:00] ENGINE exe=/home/broth/bench/colibri-c2/c/deepseek_v41 md5=90b45f62293c root=/home/broth/bench/colibri-c2 src_md5=b5c18c4dc5f2
+--- requests.jsonl
+{"req": "decode_a", "t_start": 1793700780, "t_end": 1793700837, "ttft_s": 5.6, "total_s": 57.1, "chunks": 128, "decode_tps": 2.46, "disk_gb": 184.1, "text_head": "1. The word \"computer\" originally referred to a person who p", "text_sha": "e41b3a85ab6c35be", "text_len": 583}
+{"req": "decode_b", "t_start": 1793700837, "t_end": 1793700898, "ttft_s": 6.6, "total_s": 61.0, "chunks": 128, "decode_tps": 2.34, "disk_gb": 200.5, "text_head": "Mixture-of-experts (MoE) models are memory-bandwidth bound d", "text_sha": "3391fa1c38b60648", "text_len": 646}
+{"req": "decode_a_again", "t_start": 1793700898, "t_end": 1793700952, "ttft_s": 5.3, "total_s": 53.8, "chunks": 128, "decode_tps": 2.62, "disk_gb": 172.1, "text_head": "1. The word \"computer\" originally referred to a person who p", "text_sha": "5d9e1748e577fb8c", "text_len": 589}
+{"req": "decode_c", "t_start": 1793700952, "t_end": 1793701020, "ttft_s": 5.7, "total_s": 68.0, "chunks": 128, "decode_tps": 2.04, "disk_gb": 232.6, "text_head": "# Reversing a Singly Linked List in Python\n\n## Implementatio", "text_sha": "6d7cfcba6dd2fced", "text_len": 532}
+rss summary (48 samples, 5 s apart): peak anon 12.0 GiB, min MemAvailable 17.5 GiB, peak VmSwap 0.00 GiB
+
+######## FIN_T3
+[11:21:56] ENGINE exe=/home/broth/bench/colibri-c2/c/deepseek_v41 md5=90b45f62293c root=/home/broth/bench/colibri-c2 src_md5=b5c18c4dc5f2
+--- requests.jsonl
+{"req": "decode_a", "t_start": 1793701316, "t_end": 1793701374, "ttft_s": 5.7, "total_s": 57.3, "chunks": 128, "decode_tps": 2.46, "disk_gb": 184.9, "text_head": "1. The word \"computer\" originally referred to a person who p", "text_sha": "de9651aa338dd0e6", "text_len": 559}
+{"req": "decode_b", "t_start": 1793701374, "t_end": 1793701434, "ttft_s": 6.8, "total_s": 60.6, "chunks": 128, "decode_tps": 2.36, "disk_gb": 199.5, "text_head": "Mixture-of-experts (MoE) models are memory-bandwidth bound d", "text_sha": "83fc726757ed4a7c", "text_len": 653}
+{"req": "decode_a_again", "t_start": 1793701434, "t_end": 1793701488, "ttft_s": 5.5, "total_s": 53.9, "chunks": 128, "decode_tps": 2.62, "disk_gb": 172.8, "text_head": "1. The word \"computer\" originally referred to a person who p", "text_sha": "de9651aa338dd0e6", "text_len": 559}
+{"req": "decode_c", "t_start": 1793701488, "t_end": 1793701556, "ttft_s": 5.6, "total_s": 67.5, "chunks": 128, "decode_tps": 2.05, "disk_gb": 232.7, "text_head": "# Reversing a Singly Linked List in Python\n\n## Implementatio", "text_sha": "6d7cfcba6dd2fced", "text_len": 532}
+rss summary (48 samples, 5 s apart): peak anon 12.0 GiB, min MemAvailable 17.5 GiB, peak VmSwap 0.00 GiB

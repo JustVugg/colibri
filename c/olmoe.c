@@ -9,6 +9,7 @@
  * Matmul multi-thread con OpenMP (niente BLAS).
  *
  * ENV VARS:
+ *   COLI_MODEL_DIRS=<dir;dir>: extra shard directories (distinct shards, see st.h); config and tokenizer stay in SNAP
  *   PILOT=0/1/2/3 : 0=no prefetch, 1=1-layer lookahead, 2=2-layer, 3=3-layer lookahead
  *   HOT=N         : pin top-N hot experts per layer permanently (never evict)
  *   WARMUP=N      : tokens before hot pinning activates (default 5)
@@ -44,10 +45,12 @@
 #define ST_GGUF   /* a gguf_import folder reads as the checkpoint (st_gguf.h) */
 #include "st.h"
 #include "ggml_view.h"
+#include "expert_store.h"
 #ifdef _OPENMP
 #include <omp.h>   /* omp_set_num_threads/omp_get_max_threads per omp_tune.h */
 #endif
 #include "omp_tune.h"
+#include "coli_env.h"
 #include "route_trace.h"                    /* shared routing telemetry (#700) */
 #include "kv_prefix.h"
 #include "park.h"      /* a short request keeps the conversation aside (COLI_PARK) */
@@ -211,6 +214,13 @@ static volatile unsigned pilot_r = 0, pilot_w = 0;
 static Model *pilot_m = NULL;
 static int g_pilot = 0;
 static int g_wide  = 1;  /* IMPROVEMENT 4: top-K * g_wide candidates prefetched */
+/* PAR_LOAD=n (opt-in, default 0 = off): at decode, acquire a token's K routed
+ * experts before computing them, the cache misses with up to n threads, so their
+ * disk reads overlap instead of running one at a time. The experts are still
+ * computed one by one in routing order, so the output is the same bits; only
+ * the fetch overlaps. Used only when a layer's cache holds at least 2*K slots,
+ * so the K leases a token holds can never starve eviction. */
+static int g_par_load = 0;
 static int g_pilot_evict_guard = 1; /* PILOT_EVICT_GUARD=0 to disable LFRU prefetch eviction guard */
 static int g_expert_drop = 0;       /* EXPERT_DROP=1 restores fadvise(DONTNEED) after expert reads */
 #if defined(__AVX2__) || !defined(OLMOE_NO_MAIN)
@@ -328,8 +338,9 @@ static double mem_available_gb(void) {
      * box it returned 0.0 and the auto budget collapsed to the dense resident
      * footprint -- a one-slot-per-layer cache with no warning (#1601).
      * Dev already had a fallback to half physical (7ed6084), but it missed the
-     * warm-macOS case where free+inactive+purgeable is 0.x GB on a 128 GB box:
-     * not zero, but implausible. The 2% floor treats that as unmeasured too. */
+     * warm-macOS case where the old free+inactive+purgeable probe read 0.x GB
+     * on a 128 GB box: not zero, but implausible. The 2% floor treats that as
+     * unmeasured too. */
     double total = 0, avail = 0;
     compat_meminfo_gb(&total, &avail);
     static int warned = 0;
@@ -669,7 +680,7 @@ static void load_cfg(Cfg *c, const char *snap) {
     jval *th = json_get(r,"rope_theta");  c->theta = th ? (float)th->num : 10000.f;
     jval *ep = json_get(r,"rms_norm_eps"); c->eps   = ep ? (float)ep->num : 1e-5f;
     jval *nt = json_get(r,"norm_topk_prob"); c->norm_topk = (nt && nt->t==J_BOOL) ? nt->boolean : 0;
-    free(buf); free(arena);
+    json_free(r); free(buf); free(arena);
 }
 
 /* The parameters of an automatic cache size (cap <= 0), for olm_dho_grow_cap: with the
@@ -840,7 +851,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     memset(m, 0, sizeof(*m));
     m->quant_bits = bits;
     load_cfg(&m->c, snap);
-    st_init(&m->S, snap);
+    st_init_multi(&m->S, snap, getenv("COLI_MODEL_DIRS"));
     Cfg *c = &m->c;
     if (layer_end == 0) layer_end = c->n_layers;
     if (layer_begin < 0 || layer_end > c->n_layers ||
@@ -1443,6 +1454,85 @@ static void expert_put(Slot *s) {
     pthread_mutex_unlock(&g_pilot_mx);
 }
 
+/* Borrowed ExpertStore facade: the Model owns the cache and outlives every
+ * facade and lease. Lookup/release use the cache's existing lock and busy count;
+ * PILOT policy, allocation and model teardown remain with OLMoE. */
+static ColiTensorView olmoe_expert_tensor(const Model *m, const void *data,
+                                        const float *scales, int type, int rows, int cols) {
+    ColiTensorView v = {.data=data, .rows=rows, .columns=cols};
+    if (m->gx) {
+        v.format = COLI_TENSOR_GGML;
+        v.block_columns = (uint32_t)type;   /* held type, including GQ_*_R16 */
+        v.data_bytes = (size_t)rows * (size_t)gq_row_bytes(type, cols);
+    } else {
+        v.format = COLI_TENSOR_Q8_ROW;
+        v.scale_format = COLI_SCALE_F32;
+        v.scales = scales;
+        v.data_bytes = (size_t)rows * (size_t)cols;
+        v.scale_bytes = (size_t)rows * sizeof(float);
+        v.block_rows = 1;
+        v.block_columns = (uint32_t)cols;
+    }
+    return v;
+}
+static int olmoe_store_lookup(ColiExpertStore *store, ColiExpertKey key, ColiExpertView *view) {
+    Model *m = store->state;
+    if (!view) return -1;
+    memset(view, 0, sizeof(*view));
+    if (!m || !m->cache || key.layer < 0 || key.layer >= m->c.n_layers ||
+        key.expert < 0 || key.expert >= m->c.n_experts) return -1;
+    Slot *s;
+    expert_get(m, key.layer, key.expert, &s);
+    view->key = key;
+    view->lease = s;
+    view->gate = olmoe_expert_tensor(m, s->g, s->gs, s->gt[0], m->c.inter, m->c.hidden);
+    view->up = olmoe_expert_tensor(m, s->u, s->us, s->gt[1], m->c.inter, m->c.hidden);
+    view->down = olmoe_expert_tensor(m, s->d, s->ds, s->gt[2], m->c.hidden, m->c.inter);
+    return 0;
+}
+static void olmoe_store_release(ColiExpertStore *store, ColiExpertView *view) {
+    (void)store;
+    if (view && view->lease) expert_put(view->lease);
+    if (view) memset(view, 0, sizeof(*view));
+}
+static ColiExpertStore olmoe_expert_store(Model *m) {
+    static const ColiExpertStoreOps ops = {
+        .lookup = olmoe_store_lookup, .release = olmoe_store_release,
+    };
+    return (ColiExpertStore){.ops=&ops, .state=m};
+}
+static void olmoe_expert_acquire(ColiExpertStore *store, int layer, int expert,
+                                ColiExpertView *view) {
+    if (coli_expert_lookup(store, (ColiExpertKey){layer, expert}, view)) {
+        fprintf(stderr, "olmoe: invalid expert key %d/%d\n", layer, expert);
+        exit(1);
+    }
+}
+/* PAR_LOAD: acquire a decode token's K routed experts up front, the resident
+ * ones first (no disk, and so the loads below cannot evict them), then the
+ * misses with up to g_par_load threads through the same thread-safe lookup the
+ * PILOT worker uses. Returns 0 with nothing acquired when fewer than two of the
+ * K are misses: a token whose experts are all resident pays no thread start-up,
+ * and the caller acquires them one at a time as before. */
+static int olmoe_acquire_parallel(Model *m, ColiExpertStore *store, int layer,
+                                  const int *idx, int K, ColiExpertView *views) {
+    int miss[64], is_miss[64], nm = 0;
+    pthread_mutex_lock(&g_pilot_mx);
+    for (int k = 0; k < K; k++) {
+        is_miss[k] = slot_indexed(m, layer, idx[k]) == NULL;
+        if (is_miss[k]) miss[nm++] = k;
+    }
+    pthread_mutex_unlock(&g_pilot_mx);
+    if (nm < 2) return 0;
+    for (int k = 0; k < K; k++)
+        if (!is_miss[k]) olmoe_expert_acquire(store, layer, idx[k], &views[k]);
+    int nt = nm < g_par_load ? nm : g_par_load;
+    #pragma omp parallel for num_threads(nt) schedule(dynamic, 1)
+    for (int j = 0; j < nm; j++)
+        olmoe_expert_acquire(store, layer, idx[miss[j]], &views[miss[j]]);
+    return 1;
+}
+
 /* The bytes the KV's pages reach once `positions` are written: K and V of
  * every layer hold n_heads rows of max_t * head_dim floats, each written from
  * its start, and a row's first B bytes touch at most B / 4096 + 2 pages. */
@@ -1721,39 +1811,35 @@ static int moe_fused3(int D, int I) {
  * scratch of I floats. */
 /* A GGUF expert on n rows (x[t] for t < n, contiguous when n > 1 through the caller's copy):
  * gate and up on one quantization of the rows, then down, on ggml_quants.h's kernels. */
-static void moe_expert_rows_gx(const Model *m, const Slot *e, const float *x, int n, float *g, float *u, float *hh) {
-    const int D = m->c.hidden, I = m->c.inter;
-    ColiTensorView vg = {.format = COLI_TENSOR_GGML, .data = e->g, .rows = I, .columns = D, .block_columns = (uint32_t)e->gt[0]};
-    ColiTensorView vu = vg, vd = vg;
-    vu.data = e->u; vu.block_columns = (uint32_t)e->gt[1];
-    vd.data = e->d; vd.rows = D; vd.columns = I; vd.block_columns = (uint32_t)e->gt[2];
-    if (coli_ggml_matmul2(g, &vg, u, &vu, x, n)) { fprintf(stderr, "olmoe: no kernel for a GGUF expert of type %s\n", gq_type_name(e->gt[0])); exit(1); }
+static void moe_expert_rows_gx(const Model *m, const ColiExpertView *e, const float *x, int n, float *g, float *u, float *hh) {
+    const int I = m->c.inter;
+    if (coli_ggml_matmul2(g, &e->gate, u, &e->up, x, n)) { fprintf(stderr, "olmoe: no kernel for a GGUF expert of type %s\n", gq_type_name((int)e->gate.block_columns)); exit(1); }
     for (int64_t i = 0; i < (int64_t)n * I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
-    if (coli_ggml_matmul(hh, &vd, g, n)) { fprintf(stderr, "olmoe: no kernel for a GGUF expert of type %s\n", gq_type_name(e->gt[2])); exit(1); }
+    if (coli_ggml_matmul(hh, &e->down, g, n)) { fprintf(stderr, "olmoe: no kernel for a GGUF expert of type %s\n", gq_type_name((int)e->down.block_columns)); exit(1); }
 }
-static void moe_expert_row(const Model *m, const Slot *e, const float *xs, float *g, float *u, float *hh) {
+static void moe_expert_row(const Model *m, const ColiExpertView *e, const float *xs, float *g, float *u, float *hh) {
     const Cfg *c = &m->c; int D = c->hidden, I = c->inter;
-    if (m->gx) { moe_expert_rows_gx(m, e, xs, 1, g, u, hh); return; }   /* the model's, not the slot's: a zeroed slot reads as F32 */
+    if (e->gate.format == COLI_TENSOR_GGML) { moe_expert_rows_gx(m, e, xs, 1, g, u, hh); return; }
 #if defined(__AVX2__)
     if (moe_fused3(D, I)) {
-        matmul_q_idot_pair_v3(g, u, xs, e->g, e->gs, e->u, e->us, D, I);   /* gate+up share one quant of xs */
+        matmul_q_idot_pair_v3(g, u, xs, e->gate.data, e->gate.scales, e->up.data, e->up.scales, D, I);   /* gate+up share one quant of xs */
         for (int i = 0; i < I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
-        matmul_q_idot_v3(hh, g, e->d, e->ds, I, D);                        /* down_proj [D,I] */
+        matmul_q_idot_v3(hh, g, e->down.data, e->down.scales, I, D);                        /* down_proj [D,I] */
     } else
 #endif
     {
-    matmul_q(g, xs, e->g, e->gs, D, I);     /* gate_proj [I,D] */
-    matmul_q(u, xs, e->u, e->us, D, I);     /* up_proj   [I,D] */
+    matmul_q(g, xs, e->gate.data, e->gate.scales, D, I);     /* gate_proj [I,D] */
+    matmul_q(u, xs, e->up.data, e->up.scales, D, I);     /* up_proj   [I,D] */
     for (int i = 0; i < I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
-    matmul_q(hh, g, e->d, e->ds, I, D);     /* down_proj [D,I] */
+    matmul_q(hh, g, e->down.data, e->down.scales, I, D);     /* down_proj [D,I] */
     }
 }
 /* moe_expert_row on n rows of one expert: hh[t] = expert(xs[t]), the same bits;
  * g[t], u[t] are scratch of I floats each. */
-static void moe_expert_rows(const Model *m, const Slot *e, const float *const *xs, int n,
+static void moe_expert_rows(const Model *m, const ColiExpertView *e, const float *const *xs, int n,
                             float *const *g, float *const *u, float *const *hh) {
     const Cfg *c = &m->c; int D = c->hidden, I = c->inter;
-    if (m->gx) {   /* a GGUF's: the rows gathered, one call each, then scattered */
+    if (e->gate.format == COLI_TENSOR_GGML) {   /* GGML rows gathered, then scattered */
         float *xb = calloc((size_t)n * (2 * D + 2 * I), sizeof(float));   /* zeroed: gcc cannot see the gather write every row */
         if (!xb) { fprintf(stderr, "OOM gathering an expert's rows\n"); exit(1); }
         float *hb = xb + (int64_t)n * D, *gb = hb + (int64_t)n * D, *ub = gb + (int64_t)n * I;
@@ -1769,13 +1855,13 @@ static void moe_expert_rows(const Model *m, const Slot *e, const float *const *x
         return;
     }
 #endif
-    matmul_q_rows(g, xs, n, e->g, e->gs, D, I);     /* gate_proj [I,D] */
-    matmul_q_rows(u, xs, n, e->u, e->us, D, I);     /* up_proj   [I,D] */
+    matmul_q_rows(g, xs, n, e->gate.data, e->gate.scales, D, I);     /* gate_proj [I,D] */
+    matmul_q_rows(u, xs, n, e->up.data, e->up.scales, D, I);     /* up_proj   [I,D] */
     for (int t = 0; t < n; t++) {
         float *gt = g[t]; const float *ut = u[t];
         for (int i = 0; i < I; i++) { float gv = gt[i]; gt[i] = (gv / (1.f + expf(-gv))) * ut[i]; }
     }
-    matmul_q_rows(hh, (const float *const *)g, n, e->d, e->ds, I, D);   /* down_proj [D,I] */
+    matmul_q_rows(hh, (const float *const *)g, n, e->down.data, e->down.scales, I, D);   /* down_proj [D,I] */
 }
 
 /* A prompt's MoE, expert by expert (S > 1). Per block of OLMOE_PREFILL_ROWS rows:
@@ -1789,6 +1875,7 @@ static void moe_expert_rows(const Model *m, const Slot *e, const float *const *x
 #define OLMOE_PREFILL_ROWS 128
 static void moe_by_expert(Model *m, int layer, const float *x, int S, float *logits, float *out) {
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
+    ColiExpertStore store = olmoe_expert_store(m);
     int B = S < OLMOE_PREFILL_ROWS ? S : OLMOE_PREFILL_ROWS, P = B * K;
     int *idx = malloc((size_t)P * sizeof(int)), *pair = malloc((size_t)P * sizeof(int));
     int *at = malloc(((size_t)E + 1) * sizeof(int));
@@ -1815,9 +1902,10 @@ static void moe_by_expert(Model *m, int layer, const float *x, int S, float *log
                 xs[t] = x + (int64_t)(s0 + i / K) * D;
                 hp[t] = ctb + (int64_t)i * D;
             }
-            Slot *sl; expert_get(m, layer, e, &sl);
-            moe_expert_rows(m, sl, xs, cnt, gp, up, hp);
-            expert_put(sl);
+            ColiExpertView view;
+            olmoe_expert_acquire(&store, layer, e, &view);
+            moe_expert_rows(m, &view, xs, cnt, gp, up, hp);
+            coli_expert_release(&store, &view);
             if (cnt > 1) { pthread_mutex_lock(&g_pilot_mx); m->hits += cnt - 1; pthread_mutex_unlock(&g_pilot_mx); }
         }
         for (int s = 0; s < rows; s++) {
@@ -1849,14 +1937,17 @@ static void moe_by_expert(Model *m, int layer, const float *x, int S, float *log
 static void moe_vk_cpu(Model *m, int layer, const float *x, int n, const int *ib,
                        const uint8_t *want, float *ctb, float *g, float *u) {
     int D = m->c.hidden, K = m->c.topk;
+    ColiExpertStore store = olmoe_expert_store(m);
     for (int i = 0; i < n; i++) {
         if (!want[i]) continue;
-        Slot *e; expert_get(m, layer, ib[i], &e);
-        moe_expert_row(m, e, x + (int64_t)(i / K) * D, g, u, ctb + (int64_t)i * D);
+        ColiExpertView view;
+        olmoe_expert_acquire(&store, layer, ib[i], &view);
+        Slot *e = view.lease;
+        moe_expert_row(m, &view, x + (int64_t)(i / K) * D, g, u, ctb + (int64_t)i * D);
         pthread_mutex_lock(&g_pilot_mx);
         if (e->eid == ib[i]) { VktExpertSrc vs = olmoe_vk_src(e); vkt_note(layer, ib[i], &vs); }
-        e->busy--;   /* expert_put, under the lock already held */
         pthread_mutex_unlock(&g_pilot_mx);
+        coli_expert_release(&store, &view);
     }
 }
 static void moe_vk_run(Model *m, int layer, const float *x, int S, float *logits, float *out) {
@@ -1915,15 +2006,21 @@ static void moe_routed(Model *m, int layer, float *x, int S, float *logits, floa
         rt_trace_end();
         return;
     }
+    ColiExpertStore store = olmoe_expert_store(m);
     float *g = falloc(I), *u = falloc(I), *hh = falloc(D);
+    int par_ok = g_par_load > 1 && K <= 64 && m->cache[layer].cap >= 2 * K;
     for (int s = 0; s < S; s++) {
         int idx[64]; float val[64];
         moe_route_row(m, layer, s, logits + (int64_t)s*E, idx, val);
         const float *xs = x + (int64_t)s*D;
+        ColiExpertView pre[64];
+        int par = par_ok && olmoe_acquire_parallel(m, &store, layer, idx, K, pre);
         for (int kk = 0; kk < K; kk++) {
-            Slot *e; expert_get(m, layer, idx[kk], &e);
-            moe_expert_row(m, e, xs, g, u, hh);
-            expert_put(e);
+            ColiExpertView view;
+            if (par) view = pre[kk];
+            else olmoe_expert_acquire(&store, layer, idx[kk], &view);
+            moe_expert_row(m, &view, xs, g, u, hh);
+            coli_expert_release(&store, &view);
             float w = val[kk];
             float *os = out + (int64_t)s*D;
             for (int d = 0; d < D; d++) os[d] += w * hh[d];
@@ -2755,9 +2852,10 @@ static int kv_prefix_off(void){ const char *e = getenv("COLI_KV_PREFIX"); return
 typedef struct { double t0, attn0, moe0, head0; uint64_t h0, m0, disk0; long long fwd0; } OlmReqClock;
 
 /* A short request between two turns of the conversation the Model holds (park.h): the
- * conversation's first rows of every layer's K and V aside with its tokens, back when the
- * request's turn ends. The chains keep their rows on the device: the host's cache takes them
- * all first, and after the conversation is back every mirror goes up again from the host. */
+ * conversation's first rows of every layer's K and V aside with its tokens; the next request
+ * brings them back, keeps them parked or drops them (olm_park_decide). The chains keep their
+ * rows on the device: the host's cache takes them all first, and after the conversation is back
+ * every mirror goes up again from the host. */
 static ColiPark g_olm_park;
 /* a token's bytes for COLI_PREFIX_LOG (kv_prefix_miss_log), through the request's tokenizer */
 static void olm_decode_one(int id, unsigned char *out, int *n) {
@@ -2800,6 +2898,12 @@ static void olm_unpark(Model *m) {
     }
     free(p);
 }
+/* the next request decides a conversation the last one parked (park.h, #2703): back, kept or dropped */
+static void olm_park_decide(Model *m, const int *ids, int np, int max_tok) {
+    int d = coli_park_decide(&g_olm_park, &m->kvp, ids, np, max_tok, 1);
+    if (d > 0) olm_unpark(m);
+    else if (d < 0) coli_park_free(&g_olm_park);
+}
 
 /* A request's prompt into the KV the Model holds: its tokens, the budget, the
  * prefix reuse and the pins, the prefill and its read-out. 1 with the prompt's ids
@@ -2814,6 +2918,106 @@ static int olm_prompt_poll(ColiPromptBreak *b) {
         else if (r > 0) b->control = 1;
     }
     return b->control;
+}
+
+/* ---- every prompt read, kept by content for later requests (prefix_store.h) -----------------
+ * Attention alone resumes where a prompt leaves the slot's state, but only from what that one slot
+ * holds: an agent with two system prompts wrote one over the other, and a conversation the gateway
+ * sends to another slot read everything. The store keeps every layer's K/V rows in blocks named by
+ * their tokens, shared by every prompt that starts with them, and the rows past a prompt's last
+ * whole block where its messages start (<|system|>, <|user|>, <|assistant|>) and where a turn
+ * ends. A request takes the deepest prefix the store holds when it reaches further than its slot.
+ * COLI_PREFIX_STORE=0 or COLI_KV_PREFIX=0 off; COLI_PREFIX_STORE_MB, COLI_PREFIX_STORE_BLOCK as on
+ * qwen36. Not for a read-out (logprobs) or a pin, and not while a chain runs the layers. */
+#include "prefix_store.h"
+static ColiPrefixStore g_olm_ps;
+static int g_olm_ps_init;
+/* Not while a chain runs the layers: OLMoE-1B-7B on the CUDA chain reads a 1,856-token prompt in
+ * 0.15 s, and the store's copies of its float rows (256 KB a token) to the host and back cost more
+ * (a new conversation 0.15 -> 0.31 s, a prompt that keeps checkpoints 0.15 -> 0.43 s, RTX PRO 4000);
+ * on the CPU, where the same prompt takes 10.2 s, it is 0.73 s from the store. */
+static int olm_ps_chain(void) {
+    int chain = 0;
+#ifdef COLI_VULKAN
+    chain |= g_vk_chain != 0;
+#endif
+#ifdef COLI_CUDA
+    chain |= g_occ && g_occ->ok && !g_occ->failed;
+#endif
+    return chain;
+}
+static int olm_ps_on(void) {
+    if (!g_olm_ps_init) { g_olm_ps_init = 1; coli_ps_init_env(&g_olm_ps, kv_prefix_off() || olm_ps_chain(), compat_mem_available_gb() * 1024.0); }
+    return g_olm_ps.on && !olm_ps_chain();
+}
+static int olm_ps_parts(Model *m, ColiPsPart *parts) {
+    Cfg *c = &m->c; const size_t row = (size_t)c->head_dim * sizeof(float), hs = (size_t)m->max_t * row;
+    int n = 0;
+    for (int i = 0; i < c->n_layers; i++) {
+        parts[n++] = (ColiPsPart){m->K[i], row, m->max_t, c->n_heads, hs, 1};
+        parts[n++] = (ColiPsPart){m->V[i], row, m->max_t, c->n_heads, hs, 1};
+    }
+    return n;
+}
+static void olm_ps_none(void *v) { free(v); }
+/* ids[0, P) as the Model holds them now (the chains' rows to the host first); a checkpoint with no
+ * state keeps the rows past the last whole block */
+static void olm_ps_save(Model *m, const int *ids, int P) {
+    if (!olm_ps_on() || P < g_olm_ps.B || m->kvp.tainted || m->kv_len != P || !m->K || !m->V) return;
+#ifdef COLI_VULKAN
+    olc_host_all(m, m->kv_len);
+#endif
+#ifdef COLI_CUDA
+    occ_host_all(m, m->kv_len);
+#endif
+    ColiPsPart *parts = (ColiPsPart *)malloc((size_t)2 * m->c.n_layers * sizeof *parts + 1);
+    void *mark = malloc(1);
+    if (parts && mark) coli_ps_save(&g_olm_ps, ids, P, parts, olm_ps_parts(m, parts), mark, 1, olm_ps_none, compat_mem_available_gb() * 1024.0);
+    else free(mark);
+    free(parts);
+}
+/* The deepest prefix the store holds of ids[0, np), when it reaches past `held` positions: its rows
+ * put back, the record and the chains told. The positions now held; 0 when nothing. */
+static int olm_ps_take(Model *m, const int *ids, int np, int held) {
+    if (!olm_ps_on() || np < 2 || !m->K || !m->V) return 0;
+    ColiPsPart *parts = (ColiPsPart *)malloc((size_t)2 * m->c.n_layers * sizeof *parts + 1);
+    if (!parts) return 0;
+    const int nparts = olm_ps_parts(m, parts);
+    if (!coli_ps_layout(&g_olm_ps, parts, nparts)) { free(parts); return 0; }
+    ColiPsHit h;
+    const int P = coli_ps_lookup(&g_olm_ps, ids, np, np - 1, 0, &h);
+    if (P <= held + coli_ps_min_gain(&g_olm_ps) || !coli_ps_parts_hold(parts, nparts, P)) { coli_ps_hit_free(&h); free(parts); return 0; }
+    coli_ps_load(&g_olm_ps, &h, parts, nparts);
+    free(parts);
+    m->kv_len = P;
+    kv_prefix_clear(&m->kvp);
+    kv_prefix_record(&m->kvp, ids, 0, P);
+#ifdef COLI_VULKAN
+    olc_host_wrote(m, ids, P);   /* the host's rows are canonical below P: every mirror goes up again */
+#endif
+#ifdef COLI_CUDA
+    occ_host_wrote(m, ids, P);
+#endif
+    if (getenv("COLI_PREFIX_LOG")) {
+        fprintf(stderr, "[PREFIX] %d of %d prompt tokens from the store (%d blocks of %d%s; the slot held %d)\n",
+                P, np, h.depth, g_olm_ps.B, h.ck >= 0 ? " and the rows past them" : "", held);
+        fflush(stderr);
+    }
+    coli_ps_hit_free(&h);
+    return P;
+}
+/* where a prompt read from `from` keeps checkpoints (coli_ps_marks): where its messages start */
+static int olm_ps_marks(const Tok *T, const int *ids, int np, int from, int *marks) {
+    static int opens[3], nopen = -1;
+    if (nopen < 0) {
+        static const char *names[] = {"<|system|>", "<|user|>", "<|assistant|>"};
+        nopen = 0;
+        for (size_t o = 0; o < sizeof names / sizeof *names; o++)
+            for (int k = 0; k < T->nsp; k++)
+                if (T->sp[k].len == (int)strlen(names[o]) && !memcmp(T->sp[k].str, names[o], (size_t)T->sp[k].len)) { opens[nopen++] = T->sp[k].id; break; }
+    }
+    if (!nopen || !olm_ps_on()) return 0;
+    return coli_ps_marks(ids, np, from, g_olm_ps.B, opens, nopen, marks);
 }
 
 static int olm_serve_start(Model *m, Tok *T, SReq *q, int ctx_cap, int **ids_out, int *np_out,
@@ -2839,6 +3043,8 @@ static int olm_serve_start(Model *m, Tok *T, SReq *q, int ctx_cap, int **ids_out
                 q->max_tok, budget, ctx_cap, np);
         q->max_tok = budget;
     }
+    if (lone) olm_park_decide(m, ids, np, q->max_tok);   /* a conversation the last request parked: back, kept or dropped */
+    else coli_park_free(&g_olm_park);
     g_temp = q->temp; g_nuc = q->top_p;
     /* A chat client resends the whole transcript every turn. If this prompt
      * begins with the ids the cache was built from, those keys and values ARE
@@ -2880,7 +3086,7 @@ static int olm_serve_start(Model *m, Tok *T, SReq *q, int ctx_cap, int **ids_out
     g_echo_k = q->logprobs; g_echo_id = q->id; g_echo_tok = T;
     int partial = 0;
     if (!reuse && getenv("COLI_PREFIX_LOG")) kv_prefix_miss_log(&m->kvp, ids, np, olm_decode_one);
-    if (!reuse && lone) olm_park(m, np, q->max_tok);   /* a short request keeps the conversation (olm_unpark) */
+    if (!reuse && lone) olm_park(m, np, q->max_tok);   /* a short request keeps the conversation (olm_park_decide) */
     if (!reuse && !kv_prefix_off() && q->logprobs == 0) {
         /* Attention alone: the rows of the positions this prompt shares with what the cache
          * holds are its rows too, whatever followed them (a client that sends an answer back
@@ -2894,6 +3100,10 @@ static int olm_serve_start(Model *m, Tok *T, SReq *q, int ctx_cap, int **ids_out
             m->kv_len = d; reuse = d; partial = 1;
         }
     }
+    /* the prompt the store holds further than the slot does: another system prompt's, another
+     * slot's (olm_ps_take) */
+    const int ps_plain = q->logprobs == 0 && !q->pin && !kv_prefix_off();
+    if (ps_plain) { int got = olm_ps_take(m, ids, np, reuse); if (got) { reuse = got; partial = 0; g_pin_use_logit = 0; } }
     if (!reuse) kv_prefix_clear(&m->kvp);
     if (getenv("COLI_PREFIX_LOG")) {
         if (reuse)
@@ -2925,15 +3135,29 @@ static int olm_serve_start(Model *m, Tok *T, SReq *q, int ctx_cap, int **ids_out
         /* a chain is not stopped inside its forward: the prompt goes in segments, checked
          * between them, each a whole step (kv_len and the record follow it) */
         int seg = coli_prompt_segment_rows(2048);
+        int marks[2], nm = ps_plain ? olm_ps_marks(T, ids, np, reuse, marks) : 0, mk = 0;   /* each kept (olm_ps_save) */
         for (int at = reuse; at < np; ) {
             if (coli_prompt_poll(&brk)) { free(logit); logit = NULL; break; }
-            int n = np - at < seg ? np - at : seg;
+            if (mk < nm && at == marks[mk]) { olm_ps_save(m, ids, at); mk++; }
+            const int end = mk < nm ? marks[mk] : np;
+            int n = end - at < seg ? end - at : seg;
             float *next = step(m, ids + at, n, at);
             free(logit); logit = next; at += n;
         }
     } else {
         if (lone && q->logprobs == 0) g_coli_prompt_break = &brk;
-        logit = step(m, ids + reuse, np - reuse, reuse);
+        int at = reuse;
+        if (ps_plain) {   /* in pieces where its messages start, each kept (olm_ps_save) */
+            int marks[2], nm = olm_ps_marks(T, ids, np, reuse, marks);
+            for (int k = 0; k < nm && at >= 0; k++) {
+                float *lo = step(m, ids + at, marks[k] - at, at);
+                if (!lo) { at = -1; break; }
+                free(lo);
+                at = marks[k];
+                olm_ps_save(m, ids, at);
+            }
+        }
+        logit = at < 0 ? NULL : step(m, ids + at, np - at, at);
         g_coli_prompt_break = NULL;
     }
     if (!logit) {
@@ -3011,6 +3235,13 @@ static int serve_one_turn(Model *m, Tok *T, SReq *q, int ctx_cap) {
     printf("PROF %.6f %d %d %.6f 0.0 %.6f %.6f %.6f %lld\n", dt, np, gen, disk_s, matmul_s,
            g_prof_attn_s - attn0, g_prof_head_s - head0, g_prof_forwards - fwd0);
     fflush(stdout);
+    /* the conversation as the turn left it, for its next turn after another took the slot (one of
+     * COLI_PARK_MIN tokens at least) */
+    if (q->logprobs == 0 && !q->pin) {
+        const char *mn = getenv("COLI_PARK_MIN");
+        const int least = mn && atoi(mn) > 0 ? atoi(mn) : 1024;
+        if (m->kv_len >= least && m->kvp.len == m->kv_len) olm_ps_save(m, m->kvp.fed, m->kv_len);
+    }
 #ifdef COLI_VULKAN
     olmoe_vk_report(); vkt_report("turn", m->hits, m->miss); olc_report(m);
 #endif
@@ -3021,11 +3252,9 @@ static int serve_one_turn(Model *m, Tok *T, SReq *q, int ctx_cap) {
     free(ids);
     return 0;
 }
-/* one request on its own; a conversation it parked comes back when its turn ends */
+/* one request on its own; a conversation it parked waits for the next request (olm_park_decide) */
 static int serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
-    int r = serve_one_turn(m, T, q, ctx_cap);
-    olm_unpark(m);
-    return r;
+    return serve_one_turn(m, T, q, ctx_cap);
 }
 
 /* dashboard HWINFO/TIERS/EMAP: same lines the other serve-capable engines
@@ -3266,14 +3495,14 @@ static void serve_loop(Model *m, Tok *T, int ctx_cap) {
     coli_serve_write_ready(stdout, rss_gb());
     serve_hwinfo(m);
     serve_tiers_emap(m);
-    if (g_olm_mux_slots > 1) { serve_mux(m, T, ctx_cap); return; }
+    if (g_olm_mux_slots > 1) { serve_mux(m, T, ctx_cap); coli_ps_report(&g_olm_ps); return; }
     for (;;) {
-        while (!g_qn) if (serve_read_cmd(stdin, stdout, NULL) < 0) return;
+        while (!g_qn) if (serve_read_cmd(stdin, stdout, NULL) < 0) { coli_ps_report(&g_olm_ps); return; }
         SReq q = g_q[0];
         memmove(g_q, g_q + 1, (size_t)(--g_qn) * sizeof(SReq));
         int fatal = serve_one(m, T, &q, ctx_cap);
         free(q.payload);
-        if (fatal < 0) return;
+        if (fatal < 0) { coli_ps_report(&g_olm_ps); return; }
         /* Resend the grid after EVERY turn, not only after READY: at boot the
          * expert cache is empty by definition, and that cold snapshot stayed
          * the only one the dashboard ever saw -- all grey, RAM 0, everything
@@ -3342,10 +3571,18 @@ static int ref_fits(const int *prompt, int np, const int *full, int nfull, int v
 int main(int argc, char **argv) {
     coli_omp_hot_team(argv, "olmoe", coli_omp_env_on("COLI_CUDA") || coli_omp_env_on("COLI_METAL"));   /* omp_tune.h */
     coli_omp_tune_threads("olmoe");   /* squadra sui core fisici: vedi omp_tune.h */
+    /* Registry check: an unknown or wrong-engine variable is silently ignored
+     * otherwise, and the run then reports a plausible number for the WRONG
+     * configuration. See coli_env.h. */
+    coli_env_check(CE_OLMOE, "olmoe");
+    coli_env_dump(CE_OLMOE, "olmoe");
     const char *snap = getenv("SNAP");
     if (!snap) { coli_print_launcher_help("OLMoE", "SNAP=<model directory> ./olmoe ..."); return 1; }
     g_pilot = getenv("PILOT") ? atoi(getenv("PILOT")) : 0;
     g_wide  = getenv("WIDE")  ? atoi(getenv("WIDE"))  : 1;
+    g_par_load = getenv("PAR_LOAD") ? atoi(getenv("PAR_LOAD")) : 0;
+    if (g_par_load < 0) g_par_load = 0;
+    if (g_par_load > 16) g_par_load = 16;
     g_pilot_evict_guard = getenv("PILOT_EVICT_GUARD") ? atoi(getenv("PILOT_EVICT_GUARD")) : 1;
     g_expert_drop = getenv("EXPERT_DROP") ? atoi(getenv("EXPERT_DROP")) : 0;
     g_fused3     = getenv("FUSED3") ? atoi(getenv("FUSED3")) : 0;
@@ -3596,6 +3833,10 @@ static void olmoe_segment_model_destroy(OlmoeSegmentEngine *engine) {
         free(cache->slot_by_expert);
         free(cache->slots);
     }
+    if (model->ehit)
+        for (int layer = 0; layer < model->c.n_layers; layer++)
+            free(model->ehit[layer]);
+    free(model->ehit);
     free(model->last_access); free(model->is_queued); free(model->is_pinned);
     free(model->freq);
     free(model->momentum_logits);
@@ -3943,7 +4184,7 @@ static int olmoe_edge_engine_open(
         return coli_edge_adapter_error(error, error_size,
                                        "out of memory opening OLMoE Edge");
     load_cfg(&engine->model.c, options->model_dir);
-    st_init(&engine->model.S, options->model_dir);
+    st_init_multi(&engine->model.S, options->model_dir, getenv("COLI_MODEL_DIRS"));
     const Cfg *ec = &engine->model.c;
     engine->model.embed = load_t(&engine->model, "model.embed_tokens.weight", ec->vocab, ec->hidden);
 #ifdef OLM_DENSE_F16

@@ -19,8 +19,10 @@ typedef enum {
     COLI_TENSOR_FP4_NATIVE_BLOCK,
     COLI_TENSOR_INT8_BLOCK,
     COLI_TENSOR_INT4_BLOCK,
-    COLI_TENSOR_GGML      /* a GGUF tensor's blocks as the file has them; block_columns
-                           * holds their ggml type (ggml_quants.h GQ_*) */
+    COLI_TENSOR_GGML      /* GGML blocks; block_columns holds the actual stored type
+                           * (ggml_quants.h GQ_*), including GQ_*_R16 for CPU
+                           * interleaved rows. Never label repacked bytes with
+                           * their original on-disk type. */
 } ColiTensorFormat;
 
 typedef enum {

@@ -113,17 +113,28 @@ vec4 rowpart(int o, int nq, int q0, int qs, int nrow) {
             }
         }
     } else if (p.fmt == 11 || p.fmt == 14) {
-        for (int q = q0; q < nq; q += qs) {
-            uvec4 w = w4[rb + q]; int xb = q * 2;
-            vec2 b0, b1, b2, b3;
-            if (p.fmt == 11) { b0 = bf(w.x); b1 = bf(w.y); b2 = bf(w.z); b3 = bf(w.w); }
-            else { b0 = unpackHalf2x16(w.x); b1 = unpackHalf2x16(w.y); b2 = unpackHalf2x16(w.z); b3 = unpackHalf2x16(w.w); }
-            [[unroll]] for (int r = 0; r < NR; r++) if (r < nrow) {
-                vec4 x0 = XV(r, xb), x1 = XV(r, xb + 1);
-                a0[r] += x0.x * b0.x + x0.y * b0.y;
-                a1[r] += x0.z * b1.x + x0.w * b1.y;
-                a2[r] += x1.x * b2.x + x1.y * b2.y;
-                a3[r] += x1.z * b3.x + x1.w * b3.y;
+        // four steps' loads before the first is used, as int8's: the same sums into the same
+        // accumulators in the same order, so a row's bits are the one-load loop's (an RTX PRO 4000,
+        // Inkling-2-Small's bf16 6144 x 4608: 223 us a decode row at 254 GB/s of weights before)
+        for (int q = q0; q < nq; q += 4 * qs) {
+            uvec4 wv0 = w4[rb + q];
+            uvec4 wv1 = q + qs < nq ? w4[rb + q + qs] : uvec4(0u);
+            uvec4 wv2 = q + 2 * qs < nq ? w4[rb + q + 2 * qs] : uvec4(0u);
+            uvec4 wv3 = q + 3 * qs < nq ? w4[rb + q + 3 * qs] : uvec4(0u);
+            [[unroll]] for (int t = 0; t < 4; t++) {
+                int qq = q + t * qs;
+                if (qq >= nq) break;
+                uvec4 w = t == 0 ? wv0 : t == 1 ? wv1 : t == 2 ? wv2 : wv3; int xb = qq * 2;
+                vec2 b0, b1, b2, b3;
+                if (p.fmt == 11) { b0 = bf(w.x); b1 = bf(w.y); b2 = bf(w.z); b3 = bf(w.w); }
+                else { b0 = unpackHalf2x16(w.x); b1 = unpackHalf2x16(w.y); b2 = unpackHalf2x16(w.z); b3 = unpackHalf2x16(w.w); }
+                [[unroll]] for (int r = 0; r < NR; r++) if (r < nrow) {
+                    vec4 x0 = XV(r, xb), x1 = XV(r, xb + 1);
+                    a0[r] += x0.x * b0.x + x0.y * b0.y;
+                    a1[r] += x0.z * b1.x + x0.w * b1.y;
+                    a2[r] += x1.x * b2.x + x1.y * b2.y;
+                    a3[r] += x1.z * b3.x + x1.w * b3.y;
+                }
             }
         }
     } else {

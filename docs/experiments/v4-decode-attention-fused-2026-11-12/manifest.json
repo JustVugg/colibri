@@ -1,0 +1,91 @@
+{
+  "version": 1,
+  "hypothesis": "A decode token's attention layer is several device round trips with host arithmetic between them, and under WDDM the trips cost more than the kernels; running the layer as one round trip (one CUDA graph per layer, the CPU reference's order of operations) cuts the attention time per token without changing any result.",
+  "commit": "b6eb21b4bee08ca4bf2a798246cbbcfd41b17516",
+  "model": "DeepSeek-V4-Flash-0731 architecture, abliterated weights (same shapes), safetensors, native FP8/FP4",
+  "command": "make -C c cuda-dsv4-dg-dll cuda-dsv4-dll && make -C c -f Makefile.deepseek-v4 ARCH=native CUDA=1 deepseek-v4; deepseek_v4 <model> --prompt-file prompt3k.txt --max-tokens 36 --memory-gb 16 with the environment in config; tok_s = 35 / after_first from the engine's `timing` line (decode throughput after the first token)",
+  "prompt_hash": "3def6f25ca23ac992efe343ea4eec2c4a71ffe48dc66a95c93de91014b6923da",
+  "hardware": {
+    "cpu": "AMD Ryzen 9 5950X, 16 cores / 32 threads",
+    "ram": "32 GB DDR4-3600 (--memory-gb 16)",
+    "storage": "Samsung 9100 PRO 4TB NVMe (model) + Samsung 990 PRO 1TB NVMe (COLI_MODEL_MIRROR), NTFS, direct aligned reads",
+    "os": "Windows 11 Pro 10.0.26300, MSYS2 UCRT64 gcc 16.1.0, CUDA 13.3, driver 621.14, RTX 5080 16 GB (device 0; an RTX 3080 is present and unused)"
+  },
+  "warmup_runs": 3,
+  "changed_variables": [
+    "V4_LAYER_FUSED"
+  ],
+  "baseline": {
+    "config": {
+      "binary": "deepseek_v4 CUDA=1 ARCH=native, coli_cuda_dsv4_dg.dll (DeepGEMM sm_120)",
+      "args": "--prompt-file prompt3k.txt --max-tokens 36 --memory-gb 16",
+      "COLI_CUDA": "1",
+      "COLI_GPU": "0",
+      "CUDA_DENSE": "1",
+      "COLI_CUDA_PIPE": "2",
+      "COLI_CUDA_ATTN_BATCH": "1",
+      "COLI_CUDA_MOE_BATCH": "1",
+      "COLI_CUDA_MOE_DOUBLE": "1",
+      "V4_MOE_REFILL_GROUP": "12",
+      "V4_LOADER_LANES": "3",
+      "V4_PREFIX_CKPT": "0",
+      "COLI_V4_SAVE_USAGE": "0",
+      "DSV4_DECODE_PROF": "1",
+      "COLI_MODEL_MIRROR": "set (second NVMe)",
+      "V4_LAYER_FUSED": "unset"
+    },
+    "samples": {
+      "tok_s": [
+        1.5345,
+        1.5321,
+        1.5374
+      ]
+    },
+    "median_tok_s": 1.5345,
+    "quality": {
+      "method": "greedy text identical across the arm's runs and identical to the trial's (md5 of stdout)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/v4-decode-attention-fused-2026-11-12/baseline_runs.txt",
+      "sha256": "6a904bfd607fe9fae31006c09343d90f93cc97e47f0093e969a243544543b902"
+    }
+  },
+  "trial": {
+    "config": {
+      "binary": "deepseek_v4 CUDA=1 ARCH=native, coli_cuda_dsv4_dg.dll (DeepGEMM sm_120)",
+      "args": "--prompt-file prompt3k.txt --max-tokens 36 --memory-gb 16",
+      "COLI_CUDA": "1",
+      "COLI_GPU": "0",
+      "CUDA_DENSE": "1",
+      "COLI_CUDA_PIPE": "2",
+      "COLI_CUDA_ATTN_BATCH": "1",
+      "COLI_CUDA_MOE_BATCH": "1",
+      "COLI_CUDA_MOE_DOUBLE": "1",
+      "V4_MOE_REFILL_GROUP": "12",
+      "V4_LOADER_LANES": "3",
+      "V4_PREFIX_CKPT": "0",
+      "COLI_V4_SAVE_USAGE": "0",
+      "DSV4_DECODE_PROF": "1",
+      "COLI_MODEL_MIRROR": "set (second NVMe)",
+      "V4_LAYER_FUSED": "1"
+    },
+    "samples": {
+      "tok_s": [
+        1.7015,
+        1.7057,
+        1.7068
+      ]
+    },
+    "median_tok_s": 1.7057,
+    "quality": {
+      "method": "greedy text identical across the arm's runs and identical to the baseline's (md5 of stdout); V4_LAYER_FUSED_VERIFY=1 and DSV4_WO_VERIFY=1 compare every call against the usual path: no differing word in 1,505 calls each (verify_runs.txt)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/v4-decode-attention-fused-2026-11-12/trial_runs.txt",
+      "sha256": "833c6e756a5bb4c79e49f13227496ca9d48d457500d985b5aac1552c40ee8bc0"
+    }
+  },
+  "outcome": "improvement"
+}

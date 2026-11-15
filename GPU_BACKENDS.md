@@ -171,6 +171,7 @@ on real hardware is for (matrix below).
 | environment | result |
 |---|---|
 | AMD RX 9070 XT (gfx1201), ROCm 7.2.4, Linux 7.0 | `hip-test` **pass** (all cases above); GLM-5.2 end-to-end runs (0.32 tok/s @ 61% expert hit with CUDA_RELEASE_HOST=1); benchmark series in PR #112 |
+| AMD RX 6900 XT 16 GB (gfx1030, RDNA2, no WMMA), ROCm 7.1.1 distro packages (`ROCM_HOME=/usr`), Linux 7.0; colibri v1.1.0, field report #510 | `make HIP=1 HIP_ARCH=gfx1030 ROCM_HOME=/usr` builds; `hip-test` not reported; GLM-5.2 int4 (int8 MTP) end-to-end with routed experts on the VRAM tier (`COLI_CUDA=1 COLI_GPU=0 CUDA_EXPERT_GB=12`): 0.38–0.39 tok/s @ 63–64% expert hit vs 0.10 tok/s @ 46% on a cold CPU run (warm CPU alone ~0.37 tok/s; disk-bound); greedy tokens vs CPU differ at one near-tie step, see [Known behavior notes](#known-behavior-notes) |
 | NVIDIA | compile-verified in CI (`sm_80`); nvcc path is a pass-through include — **runtime run of `make cuda-test` on NVIDIA hardware welcomed**, the test source is vendor-neutral |
 
 ## Known behavior notes
@@ -180,6 +181,40 @@ on real hardware is for (matrix below).
   the shape-dependence documented in #100), and MTP draft acceptance measures
   lower on GPU-heavy configs (~40% → ~31% on the PR #112 machine). A
   numerics-matched integer GPU kernel is the planned follow-up.
+- Expert placement is meant to change only the speed, but it also changes
+  the last bits (#510). The CPU and GPU expert kernels sum in different
+  orders, so a routed expert's output on the GPU tier and on the CPU is not
+  bit-identical. With experts split across the two, a greedy step whose top
+  two logits differ by less than that rounding can pick a different token
+  than a CPU-only run (one token on the RX 6900 XT above). Identity under
+  mixed placement is **not** guaranteed on any GPU: the RDNA4 token-exact
+  result of #339 means no step of that test had so small a margin. Tokens
+  repeat within a fixed kernel family **and** a fixed placement.
+- In the GLM engine (`c/colibri.c`) with a colibri container, the
+  `CUDA_EXPERT_GB` tier is filled at startup with the hottest experts of a
+  usage history: `<model>/.coli_usage` through `AUTOPIN` (once it holds
+  5000 selections) or `PIN=auto`, or the file named by `PIN=<file>`. Each
+  run adds its routing to `.coli_usage`, so the next run can place other
+  experts on the GPU (#510: the pinned set grew from 1,083 to 1,335 tensors
+  between two runs). For run-to-run identity, freeze the history:
+  `USAGE_SAVE=0` (read, never written back), restore `.coli_usage` from a
+  copy before each run, or `PIN=<file>` on a frozen copy. Keep live re-pin
+  off as well (`REPIN=0`): it swaps VRAM experts for hotter ones during the
+  run, and `--repin`, `CUDA_EXPERT_GB=auto` with `PIN_GB=all`, and
+  `--policy balanced` where the launcher applies its plan (`--auto-tier`,
+  `coli tune`, the Windows GPU auto-enable) turn it on. To check that two
+  runs placed the same experts, compare the history file's checksum before
+  each run and the two counts in the `[PIN] placement: N VRAM + M RAM`
+  line. The line counts experts and does not name them. Its VRAM count is
+  capped by the free VRAM at startup, less `CUDA_RESERVE_GB` (2 GB by
+  default), even with a fixed `CUDA_EXPERT_GB`. So set `CUDA_EXPERT_GB` (not
+  `auto`) to a value the card has room for, and fix the RAM pin too:
+  `RAM_GB` under `AUTOPIN`, `PIN_GB` with `PIN=<file>`. Runs with the same
+  checksum, the same counts and `REPIN=0` whose tokens still differ are a
+  bug worth reporting with both logs. A GLM GGUF under `COLI_CUDA=1`, the Qwen3.6/3.8
+  `CUDA_EXPERT_GB` tier and the Vulkan tier move experts at run time, so a
+  frozen history does not fix their placement; for the Vulkan tier see
+  "Run to run" in [docs/vulkan.md](docs/vulkan.md#the-other-engines).
 - An earlier revision of this branch carried `CUDA_EXTEND=1` (VRAM tier
   holding experts beyond the RAM pin). It was superseded by upstream's
   `PIN=auto` + `PIN_FILL` + `CUDA_RELEASE_HOST`, which achieve the same

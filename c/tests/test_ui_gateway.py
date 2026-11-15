@@ -21,6 +21,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
@@ -121,6 +122,14 @@ class GatewayTest(unittest.TestCase):
     def get(self, path):
         with urlopen(Request(self.base + path, headers={"Authorization": "Bearer secret"}), timeout=5) as r:
             return json.load(r)
+
+    def test_power_needs_the_key(self):
+        with urlopen(self.base + "/power", timeout=5) as r:
+            self.assertEqual(json.load(r), {"available": False, "reason": "unauthorized"})
+
+    def test_power_from_joules(self):
+        with mock.patch.object(gw.power, "reading", return_value={"available": True, "watts": 12.5}):
+            self.assertEqual(self.get("/power"), {"available": True, "watts": 12.5})
 
     def test_health_carries_live_and_system(self):
         body = self.get("/health")
@@ -344,6 +353,10 @@ class UiServerTest(unittest.TestCase):
         with urlopen(self.base + "/health", timeout=5) as r:
             self.assertEqual(json.load(r), {"status": "ok", "path": "/health"})
 
+    def test_power_goes_to_the_gateway(self):
+        with urlopen(self.base + "/power", timeout=5) as r:
+            self.assertEqual(json.load(r), {"status": "ok", "path": "/power"})
+
     def test_no_models_service_is_a_404(self):
         with self.assertRaises(HTTPError) as caught:
             urlopen(self.base + "/models/list", timeout=5)
@@ -370,6 +383,92 @@ class UiServerTest(unittest.TestCase):
             urlopen(req, timeout=5)
         self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 403)
+
+
+class FakeJoules:
+    """the bit of joules ui/power.py uses: Session(), its devices and snapshot(), NoMeters"""
+    class NoMeters(RuntimeError):
+        pass
+
+    def __init__(self, watts=None, fail=None):
+        self.watts, self.fail = watts or {}, fail
+        fake = self
+
+        class Session:
+            def __init__(self, interval=0.1):
+                if fake.fail:
+                    raise fake.fail
+                self.devices = [{"name": n, "kind": "gpu" if n.startswith("GPU") else "cpu", "method": "fake"} for n in fake.watts]
+                self.discovery = type("D", (), {"simulated": False})()
+                self.t0 = time.monotonic()
+
+            def snapshot(self):
+                dt = time.monotonic() - self.t0
+                j = {n: w * dt for n, w in fake.watts.items()}
+                return {"at": time.time(), "devices_j": j, "total_j": sum(j.values())}
+        self.Session = Session
+
+
+class PowerTest(unittest.TestCase):
+    def setUp(self):
+        import power
+        self.p = power
+        self.addCleanup(self.reset)
+        self.reset()
+        self.saved = (sys.modules.get("joules"), power.INTERVAL)
+        power.INTERVAL = 0.05
+
+    def reset(self):
+        with self.p._lock:
+            self.p._state = self.p._session = None
+            self.p._history.clear()
+        if hasattr(self, "saved"):
+            joules, self.p.INTERVAL = self.saved
+            if joules is None:
+                sys.modules.pop("joules", None)
+            else:
+                sys.modules["joules"] = joules
+
+    def test_without_joules_the_page_is_told_why(self):
+        sys.modules["joules"] = None   # import joules raises ImportError
+        r = self.p.reading()
+        self.assertFalse(r["available"])
+        self.assertIn("pip install landauer-gap", r["reason"])
+
+    def test_no_counters(self):
+        fj = FakeJoules()
+        fj.fail = fj.NoMeters("RAPL needs root")
+        sys.modules["joules"] = fj
+        r = self.p.reading()
+        self.assertEqual((r["available"], r["reason"]), (False, "no power counters on this machine (RAPL needs root)"))
+
+    def test_watts_per_device_and_in_all(self):
+        sys.modules["joules"] = FakeJoules({"GPU 0 NVIDIA H200": 400.0, "CPU package 0": 60.0})
+        first = self.p.reading()
+        self.assertTrue(first["available"])
+        self.assertIsNone(first["watts"])   # no second reading yet
+        deadline = time.time() + 3
+        while self.p.reading()["watts"] is None and time.time() < deadline:
+            time.sleep(0.02)
+        r = self.p.reading()
+        self.assertEqual([(d["name"], d["kind"]) for d in r["devices"]], [("GPU 0 NVIDIA H200", "gpu"), ("CPU package 0", "cpu")])
+        self.assertAlmostEqual(r["devices"][0]["watts"], 400.0, delta=8)
+        self.assertAlmostEqual(r["devices"][1]["watts"], 60.0, delta=2)
+        self.assertAlmostEqual(r["watts"], 460.0, delta=10)
+        self.assertGreater(r["energy_j"], 0)
+        r["devices"][0]["watts"] = -1   # the caller gets a copy
+        self.assertNotEqual(self.p.reading()["devices"][0]["watts"], -1)
+
+    def test_a_turns_energy(self):
+        self.assertIsNone(self.p.energy_since(5.0))   # nothing asked for /power: no meters run
+        sys.modules["joules"] = FakeJoules({"GPU 0 NVIDIA H200": 400.0})
+        self.p.reading()
+        deadline = time.time() + 3
+        while len(self.p._history) < 4 and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertAlmostEqual(self.p.energy_since(0.1), 40.0, delta=4)    # 400 W for 0.1 s, between two readings
+        self.assertAlmostEqual(self.p.energy_since(0.0), 0.0, delta=0.5)
+        self.assertIsNone(self.p.energy_since(60.0))  # began before the meters started: not known
 
 
 if __name__ == "__main__":

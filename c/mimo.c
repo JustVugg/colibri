@@ -53,6 +53,7 @@
 #include "cpu_check.h"   /* the processor runs what this build assumes, or it says so (#1979) */
 #include "cli_args.h"
 #include "compat.h"
+#include "coli_env.h"
 #include "json.h"
 #define ST_GGUF   /* a gguf_import folder reads as the checkpoint (st_gguf.h) */
 #include "st.h"
@@ -2139,6 +2140,7 @@ static void vk_ram_given(void *ctx, size_t bytes) {
  * read as follows: 0 keeps the experts on the CPU (no tier), N > 0 sizes the
  * budget at N experts (COLI_VK_TIER_GB, which wins when set); unset, the tier's own
  * budget applies. */
+static size_t mimo_ps_plan(void);   /* the prefix store's budget (prefix_store.h), planned with the RAM */
 static void vk_tier_start(Model *m) {
     Cfg *c = &m->c;
     VktFmt f = {VKT_SRC_MXFP4_E8M0, 32}, fd = f, *lgu = NULL, *ldn = NULL;
@@ -2208,7 +2210,7 @@ static void vk_tier_start(Model *m) {
                     .max_rows = MIMO_VK_ROWS * c->topk,
                     .ram_reserve = (size_t)(m->e_bytes + 8192) * (size_t)cap * (size_t)nmoe,
                     .ram_floor = (size_t)(m->e_bytes + 8192) * (size_t)c->topk * (size_t)nmoe, .ram_given = vk_ram_given,
-                    .ram_later = later,
+                    .ram_later = later + mimo_ps_plan(),
                     .dense_bytes = mimo_tier_dense_bytes(m),
                     .in_ram = vk_in_ram, .ram_ctx = m,
                     .load = mimo_vk_load, .release = mimo_vk_release, .load_ctx = m, .load_batch = mimo_vk_load_batch};
@@ -2259,7 +2261,23 @@ static int sample_desc(const void *a, const void *b) {
     return (pb > pa) - (pa > pb);
 }
 
+/* COLI_LOGIT_DUMP=1: each served step's top five id:logit to stderr, as sample.h's pick_tok writes them
+ * (comparing two configurations on the same context: a stored prefix against a fresh read) */
+static void serve_logit_dump(const float *lo, int V) {
+    static int dump = -1;
+    if (dump < 0) dump = getenv("COLI_LOGIT_DUMP") ? 1 : 0;
+    if (!dump) return;
+    int id[5] = {-1, -1, -1, -1, -1}; float v[5] = {-3e38f, -3e38f, -3e38f, -3e38f, -3e38f};
+    for (int t = 0; t < V; t++) {
+        const float x = lo[t];
+        for (int k = 0; k < 5; k++) if (x > v[k]) { for (int j = 4; j > k; j--) { v[j] = v[j - 1]; id[j] = id[j - 1]; } v[k] = x; id[k] = t; break; }
+    }
+    fprintf(stderr, "[LOGITS]");
+    for (int k = 0; k < 5; k++) fprintf(stderr, " %d:%.6f", id[k], v[k]);
+    fprintf(stderr, "\n");
+}
 static int sample(const float *logits, int vocab, float temperature, float top_p) {
+    serve_logit_dump(logits, vocab);
     if (temperature <= 0.0f) return argmax(logits, vocab);
     SampleProb *rank = xmalloc((size_t)vocab * sizeof(SampleProb), "sampling");
     float top = logits[0];
@@ -2514,8 +2532,9 @@ static int mimo_prompt_poll(ColiPromptBreak *b) {
 }
 
 /* A short request between two turns of the conversation the lone serve holds (park.h): every
- * layer's first K and V rows (a sliding layer's ring rows) and their positions, back when the
- * next request arrives; the host's caches stay canonical, the chains' watermarks come down. */
+ * layer's first K and V rows (a sliding layer's ring rows) and their positions; the next request
+ * brings them back, keeps them parked or drops them (mimo_park_decide). The host's caches stay
+ * canonical, the chains' watermarks come down. */
 static ColiPark g_mimo_park;
 static ColiParkPart *mimo_park_parts(Model *m, int *n_out) {
     Cfg *c = &m->c; int n = 0;
@@ -2548,6 +2567,139 @@ static void mimo_unpark(Model *m) {
 #endif
     } else coli_park_free(&g_mimo_park);
     free(p);
+}
+/* the next request decides a conversation the last one parked (park.h, #2703): back, kept or
+ * dropped; an image's request takes the state from its start, so it drops it */
+static void mimo_park_decide(Model *m, const int *ids, int np, int max_tok, int image) {
+    int d = image ? (g_mimo_park.on ? -1 : 0) : coli_park_decide(&g_mimo_park, &m->kvp, ids, np, max_tok, 16);
+    if (d > 0) mimo_unpark(m);
+    else if (d < 0) coli_park_free(&g_mimo_park);
+}
+
+/* ---- every prompt read, kept by content for later requests (prefix_store.h) -----------------
+ * Most layers attend a sliding window kept as a ring, which cannot be wound back: the slot resumes
+ * only from the end of what it holds, or a photo whose full layers' rows must still be in the slot.
+ * An agent's new conversation on the same system prompt read its whole prompt again; so did a
+ * conversation back after another took the slot, or on another slot. The store keeps the full
+ * layers' K/V rows and positions in blocks named by their tokens, shared by every prompt that starts
+ * with them, and checkpoints of the sliding layers' rings (their rows and positions) where a
+ * prompt's messages start (<|im_start|>) and where a turn ends. A request takes the deepest
+ * checkpoint its prompt starts with when it reaches further than the slot. COLI_PREFIX_STORE=0 or
+ * COLI_KV_PREFIX=0 off; COLI_PREFIX_STORE_MB, COLI_PREFIX_STORE_BLOCK as on qwen36. Not for a
+ * picture's prompt or a read-out (logprobs). */
+#include "prefix_store.h"
+static ColiPrefixStore g_mimo_ps;
+static int g_mimo_ps_init;
+static int mimo_ps_on(void) {
+    if (!g_mimo_ps_init) {
+        const char *e = getenv("COLI_KV_PREFIX");
+        g_mimo_ps_init = 1;
+        coli_ps_init_env(&g_mimo_ps, e && *e == '0', compat_mem_available_gb() * 1024.0);
+    }
+    return g_mimo_ps.on;
+}
+/* the store's budget, decided when the engine plans its RAM: a tier's host pool leaves it (ram_later) */
+static size_t mimo_ps_plan(void) { mimo_ps_on(); return g_mimo_ps.on ? g_mimo_ps.budget : 0; }
+/* the full layers' K and V rows and their positions */
+static int mimo_ps_parts(Model *m, ColiPsPart *parts) {
+    Cfg *c = &m->c; int n = 0;
+    for (int li = 0; li < c->n_layers; li++) {
+        Layer *l = &m->L[li]; const int k = c->swa[li];
+        if (k) continue;
+        parts[n++] = (ColiPsPart){l->K, (size_t)c->kv_heads[k] * c->head_dim[k] * sizeof(float), l->rows, 1, 0, 1};
+        parts[n++] = (ColiPsPart){l->V, (size_t)c->kv_heads[k] * c->v_dim[k] * sizeof(float), l->rows, 1, 0, 1};
+        parts[n++] = (ColiPsPart){l->ring_pos, sizeof(int), l->rows, 1, 0, 1};
+    }
+    return n;
+}
+typedef struct { float **K, **V; int **rp; int n_layers; } MimoPsState;
+static void mimo_ps_state_free(void *v) {
+    MimoPsState *x = (MimoPsState *)v;
+    if (!x) return;
+    for (int i = 0; i < x->n_layers; i++) { if (x->K) free(x->K[i]); if (x->V) free(x->V[i]); if (x->rp) free(x->rp[i]); }
+    free(x->K); free(x->V); free(x->rp); free(x);
+}
+/* every sliding layer's ring, its rows and positions */
+static MimoPsState *mimo_ps_state_save(Model *m, size_t *bytes) {
+    Cfg *c = &m->c; const int L = c->n_layers;
+    MimoPsState *x = (MimoPsState *)calloc(1, sizeof *x);
+    if (!x) return NULL;
+    x->n_layers = L;
+    int ok = (x->K = (float **)calloc((size_t)L, sizeof(float *))) && (x->V = (float **)calloc((size_t)L, sizeof(float *))) &&
+             (x->rp = (int **)calloc((size_t)L, sizeof(int *)));
+    *bytes = sizeof *x;
+    for (int li = 0; ok && li < L; li++) {
+        Layer *l = &m->L[li]; const int k = c->swa[li];
+        if (!k) continue;
+        const size_t kb = (size_t)l->rows * c->kv_heads[k] * c->head_dim[k] * sizeof(float),
+                     vb = (size_t)l->rows * c->kv_heads[k] * c->v_dim[k] * sizeof(float), rb = (size_t)l->rows * sizeof(int);
+        ok = (x->K[li] = (float *)malloc(kb)) && (x->V[li] = (float *)malloc(vb)) && (x->rp[li] = (int *)malloc(rb));
+        if (!ok) break;
+        memcpy(x->K[li], l->K, kb); memcpy(x->V[li], l->V, vb); memcpy(x->rp[li], l->ring_pos, rb);
+        *bytes += kb + vb + rb;
+    }
+    if (!ok) { mimo_ps_state_free(x); return NULL; }
+    return x;
+}
+/* ids[0, P) as the Model holds them now, with its rings (the host's caches are canonical) */
+static void mimo_ps_save(Model *m, const int *ids, int P) {
+    if (!mimo_ps_on() || P < g_mimo_ps.B || m->kvp.tainted || m->pos != P) return;
+    ColiPsPart *parts = (ColiPsPart *)malloc((size_t)3 * m->c.n_layers * sizeof *parts + 1);
+    if (!parts) return;
+    const int np = mimo_ps_parts(m, parts);
+    size_t sb = 0;
+    MimoPsState *st = mimo_ps_state_save(m, &sb);
+    if (st) coli_ps_save(&g_mimo_ps, ids, P, parts, np, st, sb, mimo_ps_state_free, compat_mem_available_gb() * 1024.0);
+    free(parts);
+}
+/* The deepest prefix the store holds of ids[0, np), when it reaches past `held` positions: its rows
+ * and rings put back, the record and the chain told. The positions now held; 0 when nothing. */
+static int mimo_ps_take(Model *m, const int *ids, int np, int held) {
+    if (!mimo_ps_on() || np < 2) return 0;
+    Cfg *c = &m->c;
+    ColiPsPart *parts = (ColiPsPart *)malloc((size_t)3 * c->n_layers * sizeof *parts + 1);
+    if (!parts) return 0;
+    const int nparts = mimo_ps_parts(m, parts);
+    if (!coli_ps_layout(&g_mimo_ps, parts, nparts)) { free(parts); return 0; }
+    ColiPsHit h;
+    const int P = coli_ps_lookup(&g_mimo_ps, ids, np, np - 1, 1, &h);
+    const MimoPsState *x = P > 0 && h.ck >= 0 ? (const MimoPsState *)g_mimo_ps.ck[h.ck].state : NULL;
+    if (P <= held + coli_ps_min_gain(&g_mimo_ps) || !x || x->n_layers != c->n_layers || !coli_ps_parts_hold(parts, nparts, P)) {
+        coli_ps_hit_free(&h); free(parts); return 0;
+    }
+    coli_ps_load(&g_mimo_ps, &h, parts, nparts);
+    free(parts);
+    for (int li = 0; li < c->n_layers; li++) {
+        Layer *l = &m->L[li]; const int k = c->swa[li];
+        if (!k || !x->K[li]) continue;
+        memcpy(l->K, x->K[li], (size_t)l->rows * c->kv_heads[k] * c->head_dim[k] * sizeof(float));
+        memcpy(l->V, x->V[li], (size_t)l->rows * c->kv_heads[k] * c->v_dim[k] * sizeof(float));
+        memcpy(l->ring_pos, x->rp[li], (size_t)l->rows * sizeof(int));
+    }
+    m->pos = P;
+    kv_prefix_clear(&m->kvp);
+    kv_prefix_record(&m->kvp, ids, 0, P);
+#ifdef COLI_VULKAN
+    mc_cpu_step(m, 0);   /* the host's rows from 0 are the conversation's: the mirrors go up again */
+#endif
+    if (getenv("COLI_PREFIX_LOG")) {
+        fprintf(stderr, "[PREFIX] %d of %d prompt tokens from the store (%d blocks of %d and a checkpoint; the slot held %d)\n",
+                P, np, h.depth, g_mimo_ps.B, held);
+        fflush(stderr);
+    }
+    coli_ps_hit_free(&h);
+    return P;
+}
+/* where a prompt read from `from` keeps checkpoints (coli_ps_marks): where its messages start */
+static int mimo_ps_marks(const Tok *T, const int *ids, int np, int from, int *marks) {
+    static int open = -2;
+    if (open == -2) {
+        open = -1;
+        for (int k = 0; k < T->nsp && open < 0; k++)
+            if (T->sp[k].len == 12 && !memcmp(T->sp[k].str, "<|im_start|>", 12)) open = T->sp[k].id;
+    }
+    if (open < 0 || !mimo_ps_on()) return 0;
+    return coli_ps_marks(ids, np, from, g_mimo_ps.B, &open, 1, marks);
 }
 
 static int mimo_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int *ids, float *logits,
@@ -2602,6 +2754,8 @@ static int mimo_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int
      * that would leave the first option token without its predictor.
      *
      * An image refuses both: the pad ids do not describe the picture. */
+    if (lone) mimo_park_decide(m, ids, n_prompt, cmd->max_tokens, *pending != NULL);   /* back, kept or dropped */
+    else coli_park_free(&g_mimo_park);
     int prefix_on = env_int("COLI_KV_PREFIX", 1) != 0;
     int reuse = 0;
     const float *pin_logit = NULL;
@@ -2612,6 +2766,12 @@ static int mimo_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int
             if (!reuse) reuse = pin_restore(m, ids, n_prompt, &pin_logit);
         }
     }
+    /* the prompt the store holds further than the slot does: another conversation's on the same
+     * system prompt, this one's before another took the slot (mimo_ps_take) */
+    if (!(*pending) && cmd->logprobs == 0) {
+        int got = mimo_ps_take(m, ids, n_prompt, reuse);
+        if (got) { reuse = got; pin_logit = NULL; }
+    }
     if (getenv("COLI_PREFIX_LOG"))
         fprintf(stderr, "[PREFIX] %s %d of %d prompt tokens%s\n", reuse ? "reusing" : "no reuse,", reuse,
                 n_prompt, pin_logit ? " (photo)" : "");
@@ -2620,9 +2780,10 @@ static int mimo_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int
         fflush(stderr);
     }
     if (!reuse) {
-        /* a short request keeps the conversation (mimo_unpark): only the rows it reaches start over */
+        /* a short request keeps the conversation (mimo_park_decide): only the rows it reaches start
+         * over, the rows kept apart when the conversation stays parked from the last request */
         int parked = lone && !(*pending) ? mimo_park(m, n_prompt, cmd->max_tokens) : 0;
-        model_reset_rows(m, parked ? parked : -1);
+        model_reset_rows(m, parked ? parked : g_mimo_park.on ? g_mimo_park.n : -1);
     }
     coli_serve_write_accept(stdout, cmd->id, n_prompt);
     if ((*pending)) {
@@ -2633,7 +2794,16 @@ static int mimo_serve_start(Model *m, Tok *tokenizer, ColiServeCommand *cmd, int
     Echo echo = { cmd->id, cmd->logprobs, tokenizer, pin_logit };
     ColiPromptBreak brk = { .poll = mimo_prompt_poll, .id = cmd->id };
     if (lone && cmd->logprobs == 0) g_coli_prompt_break = &brk;
-    int read = prefill(m, ids + reuse, n_prompt - reuse, logits, NULL, image ? &img : NULL,
+    int read = 1, at = reuse;
+    if (!image && cmd->logprobs == 0) {   /* in pieces where its messages start, each kept (mimo_ps_save) */
+        int marks[2], nm = mimo_ps_marks(tokenizer, ids, n_prompt, reuse, marks);
+        for (int k = 0; k < nm && read; k++) {
+            read = prefill(m, ids + at, marks[k] - at, logits, NULL, NULL, NULL);
+            if (read) { at = marks[k]; mimo_ps_save(m, ids, at); }
+        }
+    }
+    if (read)
+        read = prefill(m, ids + at, n_prompt - at, logits, NULL, image ? &img : NULL,
                        cmd->logprobs > 0 ? &echo : NULL);
     g_coli_prompt_break = NULL;
     if (image) kv_prefix_taint(&m->kvp);
@@ -2820,7 +2990,7 @@ static void serve_mux(Model *m, Tok *tokenizer, const char *dir) {
 }
 
 static void serve_loop(Model *m, Tok *tokenizer, const char *dir) {
-    if (g_mimo_mux_slots > 1) { serve_mux(m, tokenizer, dir); return; }
+    if (g_mimo_mux_slots > 1) { serve_mux(m, tokenizer, dir); coli_ps_report(&g_mimo_ps); return; }
     Cfg *c = &m->c;
     coli_serve_stdio_init();
     int eos[8];
@@ -2868,7 +3038,6 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *dir) {
             continue;
         }
         MimoReq rq;
-        mimo_unpark(m);   /* a conversation the last request parked: back first */
         if (!mimo_serve_start(m, tokenizer, &command, ids, logits, &pending, &pending_h, &pending_w, &rq, 1)) continue;
         double started = rq.started;
         double disk0 = rq.disk0, expert0 = rq.expert0, attn0 = rq.attn0;
@@ -2916,6 +3085,13 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *dir) {
         serve_line("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %llu\n", wall, n_prompt, emitted,
                    m->t_disk - disk0, 0.0, m->t_expert - expert0, m->t_attn - attn0, 0.0,
                    (unsigned long long)(m->forwards - fw0));
+        /* the conversation as the turn left it, for its next turn after another took the slot (one
+         * of COLI_PARK_MIN tokens at least) */
+        if (command.logprobs == 0) {
+            const char *mn = getenv("COLI_PARK_MIN");
+            const int least = mn && atoi(mn) > 0 ? atoi(mn) : 1024;
+            if (m->pos >= least && m->kvp.len == m->pos) mimo_ps_save(m, m->kvp.fed, m->pos);
+        }
         serve_hits(m);
         serve_emap(m);
         XT(report)("turn", m->hits, m->miss);   /* the Vulkan tier's line, when it runs */
@@ -2924,6 +3100,7 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *dir) {
 #endif
         coli_serve_command_dispose(&command);
     }
+    coli_ps_report(&g_mimo_ps);
     free(ids); free(logits); free(pending);
 }
 
@@ -2980,6 +3157,8 @@ int main(int argc, char **argv) {
     }
 #endif
     coli_omp_tune_threads("mimo");
+    coli_env_check(CE_MIMO, "mimo");
+    coli_env_dump(CE_MIMO, "mimo");
     /* Two ways in. The gateway: SNAP=<dir> mimo <cap>, SERVE=1. By hand and in
      * the tests: mimo <dir> [--ids "..." | --prompt "..."] [--ngen N] [--cap N]. */
     const char *dir = getenv("SNAP");

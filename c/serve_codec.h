@@ -172,13 +172,29 @@ static inline void coli_serve_classify_line(
     }
 }
 
+/* Read an already-sized SUBMIT body into caller-owned buffers. Header dialect,
+ * allocation and NUL termination remain with the caller. EOF means a short
+ * payload/extension read; BAD_FRAME means a missing or invalid delimiter. */
+static inline ColiServeReadResult coli_serve_read_submit_body(
+    FILE *input, void *payload, size_t payload_bytes,
+    void *extension, size_t extension_bytes, int require_exact_lf)
+{
+    if ((payload_bytes && fread(payload, 1, payload_bytes, input) != payload_bytes) ||
+        (extension_bytes && fread(extension, 1, extension_bytes, input) != extension_bytes))
+        return COLI_SERVE_READ_EOF;
+    int terminator = fgetc(input);
+    if (terminator == EOF || (require_exact_lf && terminator != '\n'))
+        return COLI_SERVE_READ_BAD_FRAME;
+    return COLI_SERVE_READ_OK;
+}
+
 static inline ColiServeReadResult coli_serve_read_command_alloc(
     FILE *input, const ColiServeWireProfile *profile, ColiServeCommand *command,
     void *(*allocate)(size_t))
 {
     char *line;
     size_t count = 0;
-    char *fields[10];
+    char *fields[12];   /* command + eight positional fields + three extension keys */
     int nfields = 0;
 
     if (!input || !profile || !command) return COLI_SERVE_READ_BAD_FRAME;
@@ -317,6 +333,7 @@ static inline ColiServeReadResult coli_serve_read_command_alloc(
         if (strchr(fields[f], '=')) { positional = f; break; }
     command->logprobs = 0;
     command->pin = 0;
+    int token_ids = 0;
     if (positional < nfields) {
         char ext[128]; size_t used = 0; ext[0] = 0;
         for (int f = positional; f < nfields; f++) {
@@ -332,6 +349,7 @@ static inline ColiServeReadResult coli_serve_read_command_alloc(
             if (!coli_submit_ext(ext, &tmp)) { free(line); return COLI_SERVE_READ_BAD_REQUEST; }
             command->logprobs = tmp.logprobs;
             command->pin = tmp.pin;
+            token_ids = tmp.tok_ids;
         }
     }
     if (positional < minimum_fields || positional > maximum_fields ||
@@ -376,18 +394,21 @@ static inline ColiServeReadResult coli_serve_read_command_alloc(
     size_t extension_bytes = (size_t)command->extension_bytes;
     command->payload = allocate(payload_bytes + 1 + extension_bytes);
     if (!command->payload) return COLI_SERVE_READ_NOMEM;
-    if (fread(command->payload, 1, payload_bytes, input) != payload_bytes ||
-        (extension_bytes &&
-         fread(command->payload + payload_bytes + 1, 1, extension_bytes, input) !=
-             extension_bytes)) {
+    if (coli_serve_read_submit_body(input, command->payload, payload_bytes,
+            command->payload + payload_bytes + 1, extension_bytes,
+            profile->require_exact_lf) != COLI_SERVE_READ_OK) {
         coli_serve_command_dispose(command);
         return COLI_SERVE_READ_BAD_FRAME;
     }
     command->payload[payload_bytes] = 0;
-    int terminator = fgetc(input);
-    if (terminator == EOF || (profile->require_exact_lf && terminator != '\n')) {
-        coli_serve_command_dispose(command);
-        return COLI_SERVE_READ_BAD_FRAME;
+    /* Shared-reader consumers tokenize text; none implements ids=1. Consume a
+     * well-framed body before refusing it so callers that continue do not read
+     * its bytes as commands. Keep the request ID for their error response.
+     * GLM's numeric-header reader implements token IDs separately. */
+    if (token_ids) {
+        free(command->payload);
+        command->payload = NULL;
+        return COLI_SERVE_READ_BAD_REQUEST;
     }
     return COLI_SERVE_READ_OK;
 }
@@ -442,6 +463,19 @@ static inline int coli_serve_write_data_lp(
     FILE *output, const char *id, const void *data, size_t bytes, const char *tail)
 {
     if (fprintf(output, "DATA %s %zu%s\n", id, bytes, tail ? tail : "") < 0 ||
+        (bytes && fwrite(data, 1, bytes, output) != bytes) ||
+        fputc('\n', output) == EOF)
+        return 0;
+    return fflush(output) == 0;
+}
+
+/* Prompt read-out keeps the token position before the family-computed numeric
+ * tail. Token decoding and logprob arithmetic remain with the engine. */
+static inline int coli_serve_write_echo_lp(
+    FILE *output, const char *id, const void *data, size_t bytes,
+    int position, const char *tail)
+{
+    if (fprintf(output, "ECHO %s %zu %d%s\n", id, bytes, position, tail ? tail : "") < 0 ||
         (bytes && fwrite(data, 1, bytes, output) != bytes) ||
         fputc('\n', output) == EOF)
         return 0;

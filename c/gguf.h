@@ -245,7 +245,9 @@ static int gguf_parse_one(gguf_ctx *g, int part, const char *path, int want_kv) 
         t->type = (int)gguf_rd_u32(&r);
         uint64_t rel = gguf_rd_u64(&r);
         if (r.bad) { free(t->name); break; }
-        int64_t rb = gq_row_bytes(t->type, t->ne[0]);
+        /* 64.. are the engine's own interleaved forms (GQ_*_R16), built at load for whole groups
+         * of 16 rows: never a file's type, or its rows are read as groups they do not fill */
+        int64_t rb = (t->type >= 0 && t->type < GQ_TYPE_MAX) ? gq_row_bytes(t->type, t->ne[0]) : -1;
         if (rb < 0) { r.bad = 1; snprintf(g->err, sizeof g->err, "%s: tensor %s: type %d (%s) cannot hold rows of %lld", path, t->name, t->type, gq_type_name(t->type), (long long)t->ne[0]); free(t->name); break; }
         int64_t rows = numel / t->ne[0];
         if (rb > INT64_MAX / rows) {

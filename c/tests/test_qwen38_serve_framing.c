@@ -31,6 +31,14 @@ int main(void){
     CHECK(!strcmp(q.id,"req")&&q.slot==0&&q.max_tok==2&&q.plen==5&&!strcmp(q.payload,"Hello"));
     free(q.payload);fclose(in);
 
+    /* Unsupported token IDs cannot become a text request or desync controls. */
+    in=input_with("SUBMIT ids 0 3 2 0 1 ids=1\n1 2\nCANCEL live\n");CHECK(in!=NULL);
+    ServeReq rejected={0};
+    CHECK(serve_read_req(in,out,&rejected,NULL)==0);
+    CHECK(rejected.payload==NULL);
+    CHECK(serve_read_req(in,out,NULL,"live")==3);
+    fclose(in);
+
     /* The wire codec must consume a valid frame before the one-slot policy
      * rejects a nonzero cache slot, so the following command remains aligned. */
     in=input_with("SUBMIT wrong 7 5 1 0 1\nHello\nCANCEL wrong\n");CHECK(in!=NULL);

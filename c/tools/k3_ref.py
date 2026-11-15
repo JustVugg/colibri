@@ -8,6 +8,13 @@ exactly as modeling_kimi_linear.py does — KDA recurrence, gated NoPE MLA,
 AttnRes, LatentMoE with SiTU-GLU — and writes the same trace layout the C
 engine emits under K3_TRACE: per token, per layer, hidden[hidden] f32.
 
+Kimi K3.1 (text_config.dsa_config): the gated MLA layers in dsa_layers attend
+through DeepSeek Sparse Attention. Moonshot ships no modeling code for it; the
+indexer here is written from the definition, independently of the C engine:
+key k_s = LayerNorm(W_k x_s), queries q_h = W_qb qa, head weights w = W_p x,
+I_s = sum_h w_h ReLU(q_h . k_s / sqrt(d)) / sqrt(H), and a token whose context
+passes index_topk attends to its index_topk best positions (a tie: the earlier).
+
   gen   : k3_ref.py gen <x0.bin> --tokens 6 --dim 7168 [--seed 7]
   run   : k3_ref.py run <hf_dir> --x0 x0.bin --layers 4 --out ref.bin
   cmp   : k3_ref.py cmp <c_trace.bin> <ref.bin> --dim 7168 --layers 4
@@ -30,8 +37,14 @@ E2M1 = np.array([0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6],
 class Shards:
     def __init__(self, d):
         self.dir = d
-        idx = json.load(open(os.path.join(d, "model.safetensors.index.json")))
-        self.wmap = idx["weight_map"]
+        ix = os.path.join(d, "model.safetensors.index.json")
+        if os.path.exists(ix):
+            self.wmap = json.load(open(ix))["weight_map"]
+        else:   # one file (the tiny fixtures)
+            fn = "model.safetensors"
+            with open(os.path.join(d, fn), "rb") as f:
+                n = struct.unpack("<Q", f.read(8))[0]
+                self.wmap = {k: fn for k in json.loads(f.read(n)) if k != "__metadata__"}
         self.hdrs = {}
 
     def _hdr(self, fn):
@@ -62,7 +75,8 @@ class Shards:
 
 
 def sigmoid(x):
-    return 1.0 / (1.0 + np.exp(-x))
+    with np.errstate(over="ignore"):   # exp(-x) overflows to inf for a large negative x: sigmoid 0
+        return 1.0 / (1.0 + np.exp(-x))
 
 
 def silu(x):
@@ -126,6 +140,11 @@ class K3Ref:
         self.n_layers = n_layers
         self.pfx = "language_model." if any(
             k.startswith("language_model.") for k in list(self.S.wmap)[:5]) else ""
+        dsa = tc.get("dsa_config")
+        self.dsa_layers = set(x - 1 for x in dsa["dsa_layers"]) if dsa else set()
+        if dsa:
+            assert dsa.get("index_rope_dim", 0) == 0 and dsa.get("index_topk_freq", 1) == 1, dsa
+            self.idx_h, self.idx_d, self.idx_k = dsa["index_num_heads"], dsa["index_head_dim"], dsa["index_topk"]
 
     def t(self, name):
         return self.S.get(self.pfx + name)
@@ -196,6 +215,8 @@ class K3Ref:
         sc = (np.einsum("thd,shd->hts", q[..., :nope], k_pass) +
               np.einsum("thd,sd->hts", q[..., nope:], k_rot)) * scale
         mask = np.tril(np.ones((T, T), dtype=bool))
+        if li in self.dsa_layers:
+            mask = mask & self.dsa_keep(p, x, qa)
         sc = np.where(mask[None], sc, -np.inf)
         sc = sc - sc.max(-1, keepdims=True)
         w = np.exp(sc)
@@ -204,6 +225,29 @@ class K3Ref:
         g = sigmoid(x @ self.t(p + "g_proj.weight").T)
         ctx = ctx.reshape(T, H * vh) * g
         return ctx @ self.t(p + "o_proj.weight").T
+
+    def dsa_keep(self, p, x, qa):
+        """[T,T] bool: row t keeps the positions its indexer selects (all of 0..t
+        while t + 1 <= index_topk)."""
+        T = x.shape[0]
+        H, d, K = self.idx_h, self.idx_d, self.idx_k
+        k = x @ self.t(p + "indexer.wk.weight").T                        # [T,d]
+        mu = k.astype(np.float64).mean(-1, keepdims=True)
+        var = ((k.astype(np.float64) - mu) ** 2).mean(-1, keepdims=True)
+        k = ((k - mu) / np.sqrt(var + 1e-6)).astype(np.float32) * \
+            self.t(p + "indexer.k_norm.weight") + self.t(p + "indexer.k_norm.bias")
+        q = (qa @ self.t(p + "indexer.wq_b.weight").T).reshape(T, H, d)
+        w = x @ self.t(p + "indexer.weights_proj.weight").T              # [T,H]
+        dots = np.maximum(np.einsum("thd,sd->ths", q, k) / np.sqrt(d), 0)
+        score = np.einsum("th,ths->ts", w, dots) / np.sqrt(H)
+        keep = np.zeros((T, T), dtype=bool)
+        for t in range(T):
+            if t + 1 <= K:
+                keep[t, :t + 1] = True
+            else:   # the K best of 0..t, a tie to the earlier position
+                order = sorted(range(t + 1), key=lambda s: (-score[t, s], s))
+                keep[t, order[:K]] = True
+        return keep
 
     def moe(self, li, x):
         p = f"model.layers.{li}.block_sparse_moe."
@@ -312,6 +356,9 @@ def main():
     c.add_argument("b")
     c.add_argument("--dim", type=int, default=7168)
     c.add_argument("--layers", type=int, default=4)
+    c.add_argument("--head-rows", action="store_true",
+                   help="the first trace is the engine's over every layer: each token also has "
+                        "the final norm's row, which the reference does not write")
     a = ap.parse_args()
     if a.cmd == "gen":
         rng = np.random.default_rng(a.seed)
@@ -319,10 +366,12 @@ def main():
         x.tofile(a.out)
         print(f"wrote {a.out}: {a.tokens}x{a.dim}")
     elif a.cmd == "run":
-        x0 = np.fromfile(a.x0, dtype=np.float32).reshape(-1, 7168)
+        cfg = json.load(open(os.path.join(a.hf_dir, "config.json")))
+        x0 = np.fromfile(a.x0, dtype=np.float32).reshape(-1, cfg.get("text_config", cfg)["hidden_size"])
         K3Ref(a.hf_dir, a.layers).run(x0, a.out)
     else:
-        A = np.fromfile(a.a, dtype=np.float32).reshape(-1, a.layers, a.dim)
+        A = np.fromfile(a.a, dtype=np.float32)
+        A = A.reshape(-1, a.layers + 1, a.dim)[:, :a.layers] if a.head_rows else A.reshape(-1, a.layers, a.dim)
         B = np.fromfile(a.b, dtype=np.float32).reshape(-1, a.layers, a.dim)
         assert A.shape == B.shape, (A.shape, B.shape)
         worst = 0.0

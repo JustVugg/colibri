@@ -58,7 +58,10 @@ def turn(process, request_id, prompt_ids, patches, grid_h, grid_w, image_token):
             break
         text = line.decode("utf-8", "replace").strip("\r\n\x01")
         if text.startswith("DATA"):
-            collected.append(text)
+            # DATA <id> <n>, poi n byte e un a capo: anche i byte, cosi' due
+            # richieste con lo stesso id confrontano il testo e non solo le lunghezze.
+            size = int(text.split()[2])
+            collected.append(f"{text} {process.stdout.read(size + 1)[:size]!r}")
         if text.startswith("DONE") or text.startswith("ERROR"):
             return text, "\n".join(collected)
     return "senza DONE", "\n".join(collected)
@@ -139,6 +142,30 @@ def main() -> int:
         else:
             print(f"FAIL il solo testo si e' rotto: {verdict}")
             failures += 1
+
+        # Un'immagine la cui richiesta e' rifiutata per contesto non va al turno
+        # dopo: la mappa e' per posizione assoluta, e il prompt successivo
+        # prenderebbe le righe della foto al posto dei suoi primi token.
+        # Prima e dopo lo stesso id, cosi' le due risposte si confrontano byte per byte.
+        text_prompt = [3, 4, 5, 6, 7, 8]
+        verdict_before, text_before = turn(process, "f1", text_prompt, None, 0, 0, image_token)
+        # piu' lungo del contesto di default (QWEN38_DEFAULT_MAX_CTX, 8192 token)
+        too_long = [image_token] * tokens + [3] * 9000
+        verdict, _ = turn(process, "f2", too_long, first, grid_h, grid_w, image_token)
+        verdict_after, text_after = turn(process, "f1", text_prompt, None, 0, 0, image_token)
+        if "CONTEXT_EXCEEDED" not in verdict:
+            print(f"FAIL un prompt oltre il contesto non e' stato rifiutato: {verdict}")
+            failures += 1
+        elif not verdict_before.startswith("DONE") or not verdict_after.startswith("DONE"):
+            print(f"FAIL il solo testo intorno al rifiuto: {verdict_before} / {verdict_after}")
+            failures += 1
+        elif text_before != text_after:
+            print(f"FAIL dopo un CONTEXT_EXCEEDED con immagine lo stesso prompt di solo "
+                  f"testo risponde diverso ({text_before!r} -> {text_after!r}): "
+                  f"l'immagine rifiutata e' rimasta agganciata")
+            failures += 1
+        else:
+            print("ok   un'immagine rifiutata per contesto non passa alla richiesta dopo")
     finally:
         try:
             process.stdin.close()

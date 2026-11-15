@@ -1,0 +1,280 @@
+{
+  "label": "deepseek-v4-flash-reap-variant-20261108-135632",
+  "stage": "variant",
+  "knobs": {
+    "COLI_VK_TIER_SYNC": "1",
+    "COLI_VK_TIER_BALANCE": "0"
+  },
+  "production_before": {
+    "id": "020f3c816e7c72ee442ea006ebd1b4ac6a30104503df1079da47f73b989fc9fc",
+    "image": "sha256:879210ce15f16c0ce239fb2740b6c47055acfb7b3a358b12c9c9f5dad42d9c1e",
+    "started": "2026-11-07T23:06:21.725999313Z",
+    "running": true,
+    "restarts": 0,
+    "compose_sha256": "d6752e971d7f4b0deb655fc421520b132d035544ed9f83779c298e7f5eb003f8"
+  },
+  "q38_was_running": true,
+  "started": 1794146192.7066824,
+  "candidate_image": "colibri-vulkan:xe2-models-lazy-mesa26.2.6",
+  "source": "/opt/colibri/xe2-models-lazy",
+  "workloads": [
+    "decode_short",
+    "prefill_short",
+    "prefill_long"
+  ],
+  "reference": "deterministic-v1",
+  "serving_adoption_approved": false,
+  "effective_config": {
+    "name": "colibri-models",
+    "networks": {
+      "default": {
+        "name": "colibri-models_default",
+        "ipam": {}
+      }
+    },
+    "services": {
+      "engine": {
+        "restart": "no",
+        "container_name": "colibri-model-test",
+        "cpuset": "16-31",
+        "command": [
+          "serve",
+          "--host",
+          "0.0.0.0",
+          "--port",
+          "5000",
+          "--model",
+          "/models/current",
+          "--model-id",
+          "deepseek-v4-flash-reap"
+        ],
+        "devices": [
+          {
+            "source": "/dev/dri/renderD129",
+            "target": "/dev/dri/renderD129",
+            "permissions": "rwm"
+          },
+          {
+            "source": "/dev/dri/card2",
+            "target": "/dev/dri/card2",
+            "permissions": "rwm"
+          }
+        ],
+        "entrypoint": null,
+        "environment": {
+          "COLI_ALLOWED_HOSTS": "*",
+          "COLI_ALLOW_INSECURE_BIND": "1",
+          "COLI_ENGINE": "/app/deepseek_v4",
+          "COLI_MODEL": "/models/current",
+          "COLI_VK_CHAIN_ROWS": "auto",
+          "COLI_VK_DEV": "0",
+          "COLI_VK_DEV2": "",
+          "COLI_VK_HYBRID_BIG_ROWS": "2",
+          "COLI_VK_TIER_BALANCE": "0",
+          "COLI_VK_TIER_SYNC": "1",
+          "COLI_VULKAN": "1",
+          "CTX": "65536",
+          "HOME": "/cache",
+          "OMP_NUM_THREADS": "16",
+          "RAM_GB": "128",
+          "USAGE_SAVE": "0",
+          "V4_PREFIX_CKPT_DISK": "0",
+          "VK_DRIVER_FILES": "/usr/share/vulkan/icd.d/intel_icd.json",
+          "XDG_CACHE_HOME": "/cache"
+        },
+        "group_add": [
+          "991",
+          "44"
+        ],
+        "image": "colibri-vulkan:xe2-models-lazy-mesa26.2.6",
+        "logging": {
+          "driver": "json-file",
+          "options": {
+            "max-file": "3",
+            "max-size": "50m"
+          }
+        },
+        "mem_limit": "193273528320",
+        "memswap_limit": "193273528320",
+        "networks": {
+          "default": null
+        },
+        "security_opt": [
+          "no-new-privileges:true"
+        ],
+        "shm_size": "8589934592",
+        "stop_grace_period": "2m0s",
+        "user": "1001:1001",
+        "volumes": [
+          {
+            "type": "bind",
+            "source": "/srv/models/deepseek-v4-flash-reap",
+            "target": "/models/current",
+            "read_only": true,
+            "bind": {
+              "create_host_path": false
+            }
+          },
+          {
+            "type": "bind",
+            "source": "/var/cache/colibri-models/deepseek-v4-flash-reap",
+            "target": "/cache",
+            "bind": {
+              "create_host_path": false
+            }
+          }
+        ],
+        "ports": [
+          {
+            "mode": "ingress",
+            "host_ip": "127.0.0.1",
+            "target": 5000,
+            "published": "8002",
+            "protocol": "tcp"
+          }
+        ]
+      }
+    }
+  },
+  "image_id": "sha256:144f622250b86db3c3edfca7d11e602f8a8330b2c7a3b8d4f742a820cbf87a64",
+  "engine_sha256": "43de9fae716a72ddea33ac3c48c63152e95ce2b9d95efce627d8988cd418b262",
+  "smoke": {
+    "workload": "smoke",
+    "repetition": 1,
+    "warmup": false,
+    "status": "ok",
+    "error": "",
+    "started_utc": "2026-11-08T13:58:02.821457+00:00",
+    "max_tokens": 32,
+    "prompt": "What is 17 * 23? Reply with the number only.",
+    "output": "391",
+    "reasoning": "",
+    "usage": {
+      "prompt_tokens": 18,
+      "completion_tokens": 1,
+      "total_tokens": 19
+    },
+    "events_s": [
+      10.947235697007272
+    ],
+    "chunk_gaps_ms": [],
+    "finish_reason": "stop",
+    "http_status": 200,
+    "start_ts": 1794146282.8214753,
+    "wall_s": 11.81295522901928,
+    "end_ts": 1794146294.6345222,
+    "ttft_s": 10.947235697007272,
+    "chunk_mean_ms": null,
+    "chunk_p50_ms": null,
+    "chunk_p95_ms": null,
+    "chunk_p99_ms": null,
+    "chunk_max_ms": null,
+    "prompt_tokens": 18,
+    "completion_tokens": 1,
+    "total_tokens": 19,
+    "prefill_proxy_tps": 1.6442507038485337,
+    "decode_proxy_tps": null,
+    "tpot_proxy_ms": null,
+    "e2e_output_tps": 0.08465282231354233,
+    "output_chars": 3,
+    "reasoning_chars": 0
+  },
+  "answers": [
+    {
+      "answer": "\n---\nThe sky appears blue because of Rayleigh scattering, where molecules of air scatter sunlight in all directions. Since shorter wavelengths of light, like blue, are scattered more efficiently than longer wavelengths like red, the scattered blue light dominates our view of the sky. When we look at the sky, we see the scattered blue photons that have been deflected toward us, while the other colors are either absorbed or pass through less visibly.",
+      "exact": true
+    },
+    {
+      "answer": "\n---\nHere's a Python function that computes the n-th Fibonacci number iteratively with a proper docstring:\n\n```python\ndef fibonacci(n):\n    \"\"\"\n    Compute the n-th Fibonacci number iteratively.\n    \n    The Fibonacci sequence is defined as:\n    F(0) = 0, F(1) = 1, and F(n) = F(n-1) + F(n-2) for n > 1.\n    \n    Args:\n        n (int): The position in the Fibonacci sequence (non-negative integer)\n    \n    Returns:\n        int: The n-th Fibonacci number\n    \n    Raises:\n        ValueError: If n is negative\n    \n    Examples:\n        >>> fibonacci(0)\n        0\n        >>> fibonacci(1)\n        1\n        >>> fibonacci(10)\n        ",
+      "exact": true
+    },
+    {
+      "answer": "\n---\nHere are five European capitals with a short fact about each:\n\n1. **Paris** \u2013 The capital of France, and the city where the French and international courts of justice are headquartered; it is also known for its mild Mediterranean climate and the Seine's role in shaping its maritime culture.\n\n2. **Rome** \u2013 The capital of Italy, and the city that hosts the Vatican's headquarters; it is also the birthplace of the Roman Catholic tradition, which has shaped much of the continent's religious history.\n\n3. **Berlin** \u2013 The capital of Germany, and the city that serves as the seat of the German court of justice; it is also the center of the Prussian tradition, which has influenced the region's maritime and military history.\n\n4. **Madrid** \u2013 The capital of Spain, and",
+      "exact": true
+    }
+  ],
+  "original_reference_comparison": [
+    false,
+    false,
+    false
+  ],
+  "bench": {
+    "time": "2026-11-08T14:35:01+0000",
+    "experiment": "model-app",
+    "label": "deepseek-v4-flash-reap-variant-20261108-135632",
+    "note": "deepseek-v4-flash-reap: variant; {'COLI_VK_TIER_SYNC': '1', 'COLI_VK_TIER_BALANCE': '0'}; local verified files",
+    "run_id": "20261108-140146",
+    "workloads": [
+      "decode_short",
+      "prefill_short",
+      "prefill_long"
+    ],
+    "config_hash": "5761d4965406f856",
+    "engine_ready_s": 0,
+    "bench_s": 1995,
+    "layout": [
+      "CPU(s):                                  32",
+      "Thread(s) per core:                      1",
+      "Core(s) per socket:                      32",
+      "NUMA node(s):                            1",
+      "NUMA node0 CPU(s):                       0-31"
+    ],
+    "knobs": {
+      "app.OMP_NUM_THREADS": "16",
+      "app.GOMP_SPINCOUNT": "unset",
+      "app.COLI_NO_OMP_TUNE": "unset",
+      "app.COLI_VK_TIER_GB": "unset",
+      "app.COLI_VK_DEV2": "empty",
+      "app.COLI_VK_SUBGROUP": "unset",
+      "app.anv_enable_buffer_comp": "unset",
+      "app.COLI_LOOKUP": "unset",
+      "app.COLI_VK_CHAIN_PROF": "unset",
+      "app.COLI_VK_ATTN_SLICE": "unset",
+      "app.image": "colibri-vulkan:xe2-models-lazy-mesa26.2.6",
+      "app.cpuset": "16-31",
+      "app.RAM_GB": "128",
+      "app.CTX": "65536",
+      "app.V4_LOADER_LANES": "unset",
+      "app.V4_PREFILL_CHUNK": "unset",
+      "app.COLI_VK_HYBRID_BIG_ROWS": "2",
+      "app.COLI_VK_CHAIN_ROWS": "auto",
+      "app.COLI_VK_CHAIN_GEMM_ROWS": "unset",
+      "app.COLI_VK_CHAIN_ROWS_MAX": "unset",
+      "app.COLI_VK_TIER_RESERVE_GB": "unset",
+      "app.COLI_VK_TIER_SYNC": "1",
+      "app.COLI_VK_TIER_BALANCE": "0"
+    },
+    "tier": [
+      "[VK] tier deepseek_v4: on, Intel(R) Arc(tm) Pro B60 Graphics (BMG G21), budget 14.37 GiB = 913 experts of 15.0 MiB (fmt 7 gs 32, down fmt 7 gs 32), device memory, own queue, up to 16 promotions per token, uploads awaited (COLI_VK_TIER_SYNC)",
+      "[VK] tier deepseek_v4: warm start, 5676 experts in 40.4s (0 from the history, 5676 more to fill the device: every expert of the model)"
+    ],
+    "decode_tps": [
+      1.587909623240262,
+      1.8464388689800602,
+      1.6639051999420145
+    ],
+    "ttft_short_s": [
+      12.877480258001015,
+      12.50237858298351,
+      12.676768945995718
+    ],
+    "ttft_long_s": [
+      593.1024272310024,
+      525.9665138839919,
+      528.0002710880071
+    ]
+  },
+  "verdict": "measurement complete; no candidate adopted automatically",
+  "q38_restored": true,
+  "production_after": {
+    "id": "020f3c816e7c72ee442ea006ebd1b4ac6a30104503df1079da47f73b989fc9fc",
+    "image": "sha256:879210ce15f16c0ce239fb2740b6c47055acfb7b3a358b12c9c9f5dad42d9c1e",
+    "started": "2026-11-07T23:06:21.725999313Z",
+    "running": true,
+    "restarts": 0,
+    "compose_sha256": "d6752e971d7f4b0deb655fc421520b132d035544ed9f83779c298e7f5eb003f8"
+  },
+  "production_unchanged": true,
+  "finished": 1794148565.424993,
+  "exit_code": 0
+}

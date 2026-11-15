@@ -14,16 +14,17 @@ the Responses API over the gateway's chat API, for agents that speak only that).
 this machine, else a models service on the engine's machine (--models-backend);
 with neither it answers 404 and the page says the feature is not available.
 
-Streams (chat in SSE) are passed through chunk by chunk; when the browser goes
-away the upstream connection is closed, so the gateway stops the engine."""
-import argparse, http.client, json, os, sys, urllib.parse
+Streams (chat in SSE) are passed through chunk by chunk. A confirmed client reset
+or failed response write closes upstream. A client that only closes its request
+write side can still read its response."""
+import argparse, json, os, sys, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import agents, responses_shim, web   # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-PROXIED = ("/v1/", "/health", "/profile", "/experts")
+PROXIED = ("/v1/", "/health", "/profile", "/experts", "/power")
 MODELS = "/models/"   # the Models page: what fits this machine, search, download and switch models
 HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authorization", "proxy-authenticate", "host", "content-length"}
 
@@ -104,38 +105,51 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length) if length else None
         headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP and k.lower() != "origin"}
-        conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=3600)
-        try:
-            conn.request(self.command, self.path, body=body, headers=headers)
-            resp = conn.getresponse()
-        except OSError as e:
-            msg = ('{"error":{"message":"colibri non risponde su %s: %s"}}' % (u.netloc, e)).encode()
+        conn = responses_shim.gateway_connection(u)
+
+        def unavailable(error):
+            msg = ('{"error":{"message":"colibri non risponde su %s: %s"}}' % (u.netloc, error)).encode()
             self.send_response(502)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(msg)))
             self.end_headers()
             self.wfile.write(msg)
-            return
-        self.send_response(resp.status, resp.reason)
-        for k, v in resp.getheaders():
-            if k.lower() not in HOP:
-                self.send_header(k, v)
-        self.send_header("Transfer-Encoding", "chunked")
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
+
         try:
-            while True:
-                chunk = resp.read1(65536)
-                if not chunk:
-                    break
-                self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
-                self.wfile.flush()
-            self.wfile.write(b"0\r\n\r\n")
-            self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            pass  # the page stopped the request: closing upstream cancels the engine
-        finally:
+            conn.request(self.command, self.path, body=body, headers=headers)
+        except OSError as error:
             conn.close()
+            return unavailable(error)
+        with responses_shim._cancel_on_disconnect(self, conn) as disconnected:
+            try:
+                resp = conn.getresponse()
+            except OSError as error:
+                if disconnected.is_set():
+                    self.close_connection = True
+                    return
+                return unavailable(error)
+            try:
+                self.send_response(resp.status, resp.reason)
+                for k, v in resp.getheaders():
+                    if k.lower() not in HOP:
+                        self.send_header(k, v)
+                self.send_header("Transfer-Encoding", "chunked")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                while True:
+                    chunk = resp.read1(65536)
+                    if not chunk:
+                        break
+                    self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
+                    self.wfile.flush()
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                self.close_connection = True
+            finally:
+                resp.close()
+        if disconnected.is_set():
+            self.close_connection = True
 
     def _web(self, path):
         """the chat's web search: /web/status, /web/search?q=&n=, /web/page?url=&max="""

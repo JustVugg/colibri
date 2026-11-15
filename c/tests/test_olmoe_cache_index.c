@@ -195,13 +195,17 @@ static void check_prefetch_spares_busy(void) {
     g_io_loads = g_io_open = 0; g_io_release = 1;   /* no read is held */
     g_test_expert_load = held_load;
     Slot *e = NULL;
-    expert_get(&m, 0, 2, &e);
+    ColiExpertStore store = olmoe_expert_store(&m);
+    ColiExpertView view;
+    CHECK(coli_expert_lookup(&store, (ColiExpertKey){0, 2}, &view) == 0,
+          "ExpertStore lookup failed");
+    e = view.lease;
     m.is_queued[6] = 1;
     pilot_realload(&m, 0, 6);
     CHECK(io_get(&g_io_loads) == 1 && e && e->eid == 2 && slot_indexed(&m, 0, 2) == e,
           "the prefetch took the slot the forward pass was reading (%d reads)", io_get(&g_io_loads));
     CHECK(m.is_queued[6] == 0, "the skipped prefetch stayed queued");
-    expert_put(e);
+    coli_expert_release(&store, &view);
     m.is_queued[6] = 1;
     pilot_realload(&m, 0, 6);
     CHECK(io_get(&g_io_loads) == 2 && slot_indexed(&m, 0, 6) == e,

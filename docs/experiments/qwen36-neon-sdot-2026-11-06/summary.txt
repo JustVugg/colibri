@@ -1,0 +1,22 @@
+qwen36 expert_ffn SDOT on Apple M1 Air 8 GB
+base = 5cfb55bd (scalar xf_dot_i8_ref), trial = b591acb1 (SDOT xf_dot_i8_neon)
+prompt "The three primary colors are", N_NEW=16, cap=2, 4 threads, COLI_TIMERS=1
+
+run       decode   TTFT   total   fetch  compute      moe  out
+base1-1    1.441   3.89   14.30   196.7    414.7    620.3  b6076808
+base1-2    1.433   3.93   14.40   195.7    414.9    620.5  b6076808
+base1-3    1.521   3.74   13.60   177.7    411.2    597.1  b6076808
+base2-1    1.497   5.08   15.10   180.3    417.3    606.5  b6076808
+base2-2    1.507   3.75   13.70   179.5    411.6    599.4  b6076808
+base2-3    1.531   3.70   13.50   178.2    411.8    597.5  b6076808
+sdot1-1    3.598   1.83    6.00   179.2     31.9    218.9  b6076808
+sdot1-2    3.601   1.83    6.00   178.5     32.1    218.8  b6076808
+sdot1-3    3.475   1.78    6.10   188.7     29.0    226.0  b6076808
+sdot2-1    3.786   1.84    5.80   170.6     31.2    208.8  b6076808
+sdot2-2    3.606   1.84    6.00   185.4     32.1    224.8  b6076808
+sdot2-3    3.704   1.95    6.00   172.3     30.7    211.2  b6076808
+
+base: n=6 decode median 1.502 tok/s (1.433-1.531), TTFT median 3.82 s, compute median 413.2 ms/token, fetch median 179.9 ms/token, MoE median 603.0 ms/token
+SDOT: n=6 decode median 3.603 tok/s (3.475-3.786), TTFT median 1.84 s, compute median 31.5 ms/token, fetch median 178.9 ms/token, MoE median 218.8 ms/token
+decode: 2.40x, compute: 13.1x
+all 12 generated texts identical: sha256 b607680885f8d052118bcad32ffd9cb58986ead5df71340cd4e46f9ab4cb3af2

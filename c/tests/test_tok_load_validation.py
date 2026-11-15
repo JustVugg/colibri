@@ -25,8 +25,10 @@ class TokenizerLoadValidation(unittest.TestCase):
                           '  if (argc != 2) return 2;\n'
                           '  Tok t; tok_load(&t, argv[1]); tok_free(&t); return 0;\n}\n')
         cls.binary = cls.root / ("load.exe" if os.name == "nt" else "load")
+        # -lm as the Makefile links every engine: json.h calls isfinite(), which gcc
+        # builds in on Linux but FreeBSD's libc turns into a call into libm (__isfinite).
         subprocess.run(compiler + ["-O1", "-Wall", "-Wextra", "-Wno-unused-function",
-                                   "-I", str(C_DIR), str(source), "-o", str(cls.binary)],
+                                   "-I", str(C_DIR), str(source), "-o", str(cls.binary), "-lm"],
                        check=True, capture_output=True, text=True)
 
     def load(self, payload):

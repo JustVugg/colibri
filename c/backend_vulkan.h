@@ -456,6 +456,19 @@ const char *coli_vk_device_name(void);
  * coli_vk_init_env_tier(engine, 0). */
 int coli_vk_init_env(const char *engine);
 int coli_vk_init_env_tier(const char *engine, int tier_on);
+/* Trunk-first placement (backend_vulkan.c, vk_window_decide): an engine whose dense
+ * trunk is placed on the device before the mapped-weights window is asked. Call before
+ * coli_vk_init — the window's ask is then deferred (the chain fit reads the device's
+ * real free memory, not the hole a 9/10-of-the-heap probe leaves in the budget) — and
+ * coli_vk_window_trunk_ask() once the trunk is placed, before the expert tier sizes
+ * itself: the ask is the host-visible device-local heap less what the trunk took and
+ * COLI_VK_FREE_RESERVE_GB (1 GiB), not 9/10 of the heap. An engine that never asks
+ * keeps the order and the ask as before. */
+void coli_vk_window_trunk_first(void);
+void coli_vk_window_trunk_ask(void);
+/* 1 when the trunk-first ask ran and kept the mapped path on this device: the tier runs
+ * inside the window beside the trunk (vk_tier.c's host pool defaults off there). */
+int  coli_vk_window_trunk_first_on(void);
 /* "[VK] <engine>: COLI_VULKAN is not set: the Vulkan device stays unused", once a process
  * (coli_vk_init_env_tier says it; an engine that skips the call says it itself) */
 void coli_vk_say_unused(const char *engine);

@@ -1,0 +1,284 @@
+{
+ "src": "/mnt/models/deepseek-v4-flash-reap",
+ "dst": "/srv/models/deepseek-v4-flash-reap",
+ "files": {
+  "model-00015.safetensors": {
+   "size": 5003629992,
+   "source_mtime_ns": 1793815837603126500,
+   "sha256": "73048ac886ca527b7059ae5835c1b41aa096641f5b838f8e6afc964932980ade",
+   "seconds": 92.2,
+   "mb_s": 54.3,
+   "verified": true
+  },
+  "model-00000.safetensors": {
+   "size": 5014320856,
+   "source_mtime_ns": 1793815003206309100,
+   "sha256": "2c228d9cc605fa3488333577dd8c36f97b42b32f5ba922aeba3dff6ba778b8c1",
+   "seconds": 92.3,
+   "mb_s": 54.3,
+   "verified": true
+  },
+  "model-00009.safetensors": {
+   "size": 5003629992,
+   "source_mtime_ns": 1793815409706428200,
+   "sha256": "697452712dd93081f30cbae58b44ce121b568eba8da5eba557d5b44633854871",
+   "seconds": 92.5,
+   "mb_s": 54.1,
+   "verified": true
+  },
+  "model-00014.safetensors": {
+   "size": 5003629936,
+   "source_mtime_ns": 1793815838707096300,
+   "sha256": "cb5f31c4439f4d0766185b92255d0d3ba1c47a4acca9501e5aa02aaf5013a037",
+   "seconds": 92.5,
+   "mb_s": 54.1,
+   "verified": true
+  },
+  "model-00008.safetensors": {
+   "size": 5003629936,
+   "source_mtime_ns": 1793815376908459200,
+   "sha256": "b6ba071a2ec89cb1a49f0bab8be8309f481965c288f0fad6cdc80ba92e6bbf61",
+   "seconds": 91.6,
+   "mb_s": 54.6,
+   "verified": true
+  },
+  "model-00011.safetensors": {
+   "size": 5003629928,
+   "source_mtime_ns": 1793815572102891200,
+   "sha256": "cb95dd4faffe525b908ab0df31b2bfcd138d18a429778b0ee4ab8bed9fd40aeb",
+   "seconds": 91.7,
+   "mb_s": 54.6,
+   "verified": true
+  },
+  "model-00013.safetensors": {
+   "size": 5003629928,
+   "source_mtime_ns": 1793815676501788900,
+   "sha256": "5a1808cf7bcd16968d184abe98d756020515a9ae67842fae9631d808ceb799f0",
+   "seconds": 91.7,
+   "mb_s": 54.6,
+   "verified": true
+  },
+  "model-00007.safetensors": {
+   "size": 5003629928,
+   "source_mtime_ns": 1793815320267468900,
+   "sha256": "cc9b2c78710b23ae2131817972669aa9dcc98c82049a84b7140e0ab80822fa6f",
+   "seconds": 91.7,
+   "mb_s": 54.6,
+   "verified": true
+  },
+  "model-00010.safetensors": {
+   "size": 5003629904,
+   "source_mtime_ns": 1793815505032187600,
+   "sha256": "b0d8af26e525128326435d4a560e382730f18bed92ccc34b16d60f6dea182b86",
+   "seconds": 91.5,
+   "mb_s": 54.7,
+   "verified": true
+  },
+  "model-00005.safetensors": {
+   "size": 5003629304,
+   "source_mtime_ns": 1793815312962363700,
+   "sha256": "66a224c979b11e37efc7c769e027db25e89b497ef5b4799e6a61042f74b223ff",
+   "seconds": 91.8,
+   "mb_s": 54.5,
+   "verified": true
+  },
+  "model-00003.safetensors": {
+   "size": 5003627744,
+   "source_mtime_ns": 1793815002347012800,
+   "sha256": "c4d923ce59280afa391a4b6e91a02f3fc862ea7552de3ff1572af46b6f9afbee",
+   "seconds": 92.3,
+   "mb_s": 54.2,
+   "verified": true
+  },
+  "model-00004.safetensors": {
+   "size": 5003627648,
+   "source_mtime_ns": 1793815136865442500,
+   "sha256": "69f02422522145f75e392dc78c9dc613744bcbdb87b93ff908b93a0a75014255",
+   "seconds": 92.1,
+   "mb_s": 54.3,
+   "verified": true
+  },
+  "model-00002.safetensors": {
+   "size": 5002667696,
+   "source_mtime_ns": 1793815014147224700,
+   "sha256": "bc13845927637545cbfc66a00af4d13cd169c0df84039335295e7f250b77caf8",
+   "seconds": 91.1,
+   "mb_s": 54.9,
+   "verified": true
+  },
+  "model-00006.safetensors": {
+   "size": 5002547816,
+   "source_mtime_ns": 1793815226421371600,
+   "sha256": "50d395da9a072416859fa9c4e9b5859dc89af16c9e46d4379d9677cd9a6b0da6",
+   "seconds": 91.5,
+   "mb_s": 54.7,
+   "verified": true
+  },
+  "model-00012.safetensors": {
+   "size": 5002547816,
+   "source_mtime_ns": 1793815656476649000,
+   "sha256": "0e7e2dc372df1f978bc34c785446931b34c8f8f75fb9eebedb08d28a99c6a992",
+   "seconds": 92.4,
+   "mb_s": 54.1,
+   "verified": true
+  },
+  "model-00001.safetensors": {
+   "size": 5000134924,
+   "source_mtime_ns": 1793814998789912200,
+   "sha256": "41deca4967a1ed328679ad0b6c7c5323854932d6abcdf809539256c7c878c13f",
+   "seconds": 92.5,
+   "mb_s": 54.0,
+   "verified": true
+  },
+  "tokenizer.json": {
+   "size": 6367146,
+   "source_mtime_ns": 1793815686046920100,
+   "sha256": "8f9f37ca37fdc4f5fd36d5cf4d3b0e8392edb4e894fd10cc0d70b4957c8633cf",
+   "seconds": 0.7,
+   "mb_s": 9.6,
+   "verified": true
+  },
+  "model.safetensors.index.json": {
+   "size": 2430532,
+   "source_mtime_ns": 1793815678034396900,
+   "sha256": "e947278a737db02ed6025d7e10c030be11524cb3b792720bea213d25d734db52",
+   "seconds": 0.3,
+   "mb_s": 7.8,
+   "verified": true
+  },
+  "inference/model.py": {
+   "size": 45118,
+   "source_mtime_ns": 1793814732270361300,
+   "sha256": "c0c19e6c9fa439bac7fbb1c5bc1868232dfd5aa2f439a548d0e33dcc2a9edd3f",
+   "seconds": 0.3,
+   "mb_s": 0.2,
+   "verified": true
+  },
+  "encoding/encoding_dsv4.py": {
+   "size": 29001,
+   "source_mtime_ns": 1793814731431633200,
+   "sha256": "abc0d26120250dda0ae077dc64aa28836026e61e970854aaeb792445e6a0dde6",
+   "seconds": 0.4,
+   "mb_s": 0.1,
+   "verified": true
+  },
+  "inference/kernel.py": {
+   "size": 22198,
+   "source_mtime_ns": 1793814732164246800,
+   "sha256": "59b325083d7103975cba025bd0d60ea343bb82d8fff53088afb7c04bd380c0c2",
+   "seconds": 0.3,
+   "mb_s": 0.1,
+   "verified": true
+  },
+  "chat_template.jinja": {
+   "size": 13129,
+   "source_mtime_ns": 1793814731037119300,
+   "sha256": "0d9a7769e4a29b8d47d235bb9ba7435f78dc99faacc24cfdec838cecb254ca61",
+   "seconds": 0.1,
+   "mb_s": 0.1,
+   "verified": true
+  },
+  "encoding/README.md": {
+   "size": 9168,
+   "source_mtime_ns": 1793814731431107900,
+   "sha256": "294ed6493ebfe5a487f172154d60c494899997fed8806fdd3352dd8e3c33f9de",
+   "seconds": 0.0,
+   "mb_s": 4.1,
+   "verified": true
+  },
+  "README.md": {
+   "size": 8198,
+   "source_mtime_ns": 1793814731057539800,
+   "sha256": "98a51759fec12bdb7aab67c54101df90b0ae83a9a12e4109598454c2e016856c",
+   "seconds": 0.0,
+   "mb_s": 4.3,
+   "verified": true
+  },
+  "inference/convert.py": {
+   "size": 6639,
+   "source_mtime_ns": 1793814731884289600,
+   "sha256": "6efe65ebc66b18c9f2656816608f941cacfe20da79c2dee19040ecbee8b42bfe",
+   "seconds": 0.1,
+   "mb_s": 0.1,
+   "verified": true
+  },
+  "inference/generate.py": {
+   "size": 5804,
+   "source_mtime_ns": 1793814731839415000,
+   "sha256": "775fcfee2344e21a7b02c73161c517763e4348b84cf2eb266353e0857b9c8812",
+   "seconds": 0.3,
+   "mb_s": 0.0,
+   "verified": true
+  },
+  "config.json": {
+   "size": 2092,
+   "source_mtime_ns": 1793814731038365700,
+   "sha256": "44cdaf361e7157ed985496b2151662d6fc3aac76f8e7e3459a29f4bc1f785eb7",
+   "seconds": 0.3,
+   "mb_s": 0.0,
+   "verified": true
+  },
+  "inference/config.json": {
+   "size": 1566,
+   "source_mtime_ns": 1793814731815175400,
+   "sha256": "b34be46ca62dbd98c386d1556485e1728fb5d179616909a2bd9fb52794f1d80f",
+   "seconds": 0.4,
+   "mb_s": 0.0,
+   "verified": true
+  },
+  "inference/config.json.bak": {
+   "size": 1162,
+   "source_mtime_ns": 1793814731815606100,
+   "sha256": "c90861f3d10a9e4ef5954f8f1a34c529d480da1c5799f84660028f4e38e14e71",
+   "seconds": 0.3,
+   "mb_s": 0.0,
+   "verified": true
+  },
+  "inference/README.md": {
+   "size": 951,
+   "source_mtime_ns": 1793814731444716300,
+   "sha256": "b9fe8027f91f2160b46582b61eaaf7b9873b3da36ee9f98bc76a900e7c1fed94",
+   "seconds": 0.3,
+   "mb_s": 0.0,
+   "verified": true
+  },
+  "tokenizer_config.json": {
+   "size": 801,
+   "source_mtime_ns": 1793815686519507500,
+   "sha256": "6ac8c8dc065ed118161d02dd532749ae3f52c243deac27872134fae2f50d8547",
+   "seconds": 0.3,
+   "mb_s": 0.0,
+   "verified": true
+  },
+  "generation_config.json": {
+   "size": 170,
+   "source_mtime_ns": 1793814731431411900,
+   "sha256": "5fccff80f55a4d455bbe516bdd552edf3e9623df95e99fbf2a3c3389fdf91af0",
+   "seconds": 0.1,
+   "mb_s": 0.0,
+   "verified": true
+  },
+  "inference/requirements.txt": {
+   "size": 92,
+   "source_mtime_ns": 1793814732163834700,
+   "sha256": "857e0b8b58e41cabe16e55bf4ab7ff791677c53b25f0f3e104ef85227cd11eab",
+   "seconds": 0.0,
+   "mb_s": 0.0,
+   "verified": true
+  },
+  "model-00016.safetensors": {
+   "size": 4628449736,
+   "source_mtime_ns": 1793815844166712200,
+   "sha256": "9eaf9047c7a6994b896679b0c65643a002ccbc40b32f6b354022782d212d4412",
+   "seconds": 45.7,
+   "mb_s": 101.2,
+   "verified": true
+  }
+ },
+ "copied_utc": "2026-11-08T10:20:40Z",
+ "total_bytes": 84699536851,
+ "copy_s": 782,
+ "verify_s": 59,
+ "bad": [],
+ "all_verified": true
+}

@@ -291,11 +291,35 @@ def _cc_finds_vulkan_h(cc):
         return False
 
 
+def _cc_lacks_static_openmp(cc):
+    """True when `cc` is a gcc that has no libgomp.a to link -fopenmp -static with.
+
+    MSYS2's gcc 16 no longer pulls its OpenMP runtime in (#1900): the archive lives in
+    mingw-w64-ucrt-x86_64-libgomp, and without it the Windows link stops on a bare
+    "cannot find -lgomp" (#2612). gcc answers -print-file-name with the bare name when it
+    cannot find the file. Any other outcome (no gcc, a timeout, an odd answer) says
+    nothing, so it counts as "not missing" and never blocks a build that might work."""
+    try:
+        r = subprocess.run([cc, "-print-file-name=libgomp.a"], capture_output=True,
+                           text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0 and r.stdout.strip() == "libgomp.a"
+
+
+def gnu_make():
+    """GNU make's path, or None. On the BSDs `make` is BSD make, which cannot read the
+    Makefile here, and GNU make is `gmake` (the gmake package)."""
+    if host_os().startswith(("freebsd", "openbsd", "netbsd", "dragonfly")):
+        return shutil.which("gmake")
+    return shutil.which("make")
+
+
 def toolchain(here=None):
     """What can be built here, and with what."""
     here = here or HERE
     tc = {"source_checkout": os.path.isfile(os.path.join(here, "Makefile")),
-          "make": shutil.which("make"),
+          "make": gnu_make(),
           "cc": shutil.which("gcc") or shutil.which("cc") or shutil.which("clang"),
           "glslc": shutil.which("glslc"), "vulkan_headers": False, "nvcc": _nvcc(),
           "msys2": None, "npm": shutil.which("npm")}
@@ -334,6 +358,11 @@ def toolchain(here=None):
         tc["vulkan_headers"] = any(os.path.isfile(os.path.join(p, "vulkan", "vulkan.h"))
                                    for p in ("/usr/include", "/usr/local/include")) or _cc_finds_vulkan_h(tc["cc"])
     tc["can_build"] = bool(tc["source_checkout"] and tc["make"] and tc["cc"])
+    # A Windows gcc without libgomp.a cannot link the engine, so say "needs the build
+    # packages" and let package_hint print the libgomp one (#2612).
+    if tc["can_build"] and sys.platform == "win32" and _cc_lacks_static_openmp(tc["cc"]):
+        tc["can_build"] = False
+        tc["libgomp_missing"] = True
     tc["can_build_vulkan"] = bool(tc["can_build"] and tc["glslc"] and tc["vulkan_headers"])
     tc["can_build_cuda"] = bool(tc["can_build"] and tc["nvcc"] and sys.platform.startswith("linux"))
     # A toolkit is not enough: CUDA 13 cannot build for a V100 (#1852).
@@ -379,7 +408,8 @@ TEXT_HINTS = {
     "cuda": "install the CUDA Toolkit from https://developer.nvidia.com/cuda-downloads",
     "cuda-win32": "the Windows CUDA build needs the CUDA Toolkit and MSVC: see docs/windows.md",
     "cuda-win32-release": ("unpack the release's windows-x86_64-cuda.zip next to the engines "
-                           "(coli_cuda.dll and the CUDA builds of colibri, qwen36 and kimi_k3)"),
+                           "(coli_cuda.dll and the CUDA builds of colibri, glm53, qwen36, qwen38 "
+                           "and kimi_k3)"),
     "build-other": "install gcc (with OpenMP) and make from your distribution",
     "vulkan-other": ("install the Vulkan loader development files, glslc (shaderc) and the "
                      "Mesa Vulkan drivers from your distribution"),
@@ -569,7 +599,7 @@ def choose_backend(hw, family, tc, requested="auto", exclude=()):
                               f"newer, and the {card['name']} is "
                               + (f"compute {card['compute_cap']}" if sm is not None else "of unknown compute"),
                        "fix": ""}
-        elif win_cuda:
+        elif win_cuda and not release_cuda_lacks(family.id, current_version()):
             decision["missing"].append(("cuda", TEXT_HINTS["cuda-win32-release"]))
         elif cuda_engine and tc.get("can_build_cuda"):
             blocked = cuda_problem(nvidia, family, tc)
@@ -619,14 +649,56 @@ def choose_backend(hw, family, tc, requested="auto", exclude=()):
             return decision
         needs = ["vulkan"] if tc.get("can_build") else ["build", "vulkan"]
         decision["missing"].append(("vulkan", _gpu_hint(needs, hw, tc)))
+    if requested == "vulkan" and not vk:
+        # Asked for by name, as an explicit --backend cuda that cannot run stops: a CPU
+        # run under a Vulkan setup would look like a GPU one (#2846).
+        raise SetupError(f"--backend vulkan: no Vulkan device answered{_no_vulkan_detail(nvidia)}; "
+                         "run with --backend auto to see what this machine can use")
     if not vk and not nvidia:
         decision["reason"] = "no GPU found: the engine runs on the CPU"
-    elif requested == "vulkan" and not vk:
-        decision["reason"] = "no Vulkan GPU answered: the engine runs on the CPU"
+    elif nvidia and blocked is None and not decision["missing"]:
+        # An NVIDIA card with no path to it and nothing to install that would open one:
+        # say which card and why, and the setup asks before the download (#2846).
+        card = nvidia[0]
+        decision["gpu_unused"] = card["name"]
+        decision["reason"] = (f"{nvidia_name(card)} found, but {_no_cuda_why(family, exclude)} and "
+                              f"{_no_vulkan_why(vk, nvidia, exclude)}: the engine runs on the CPU")
     else:
         decision["reason"] = because("the CPU",
                                      "the GPU build is not possible yet: the engine runs on the CPU")
     return decision
+
+
+def _no_cuda_why(family, exclude=()):
+    """Why an NVIDIA card gets no CUDA path for this engine here (choose_backend)."""
+    if "cuda" in exclude:
+        return "its CUDA build failed"
+    if host_os() == "win32":
+        if family.id not in WINDOWS_CUDA_ENGINES:
+            return f"{family.display_name} has no CUDA build for Windows"
+        if release_cuda_lacks(family.id, current_version()):
+            return (f"the {RELEASE_CUDA_WIN32} of release {current_version()} has no "
+                    f"{family.engine_artifact}.exe")
+    elif family.id not in CUDA_ENGINES:
+        return f"{family.display_name} has no CUDA path"
+    return "no CUDA build of it can run here"
+
+
+def _no_vulkan_detail(nvidia):
+    """A data-center card on Windows in TCC or MCDM mode: Windows offers no Vulkan
+    device in those modes (setup_hw.fill_driver_models)."""
+    mode = next((c.get("driver_model") for c in nvidia or [] if c.get("driver_model")), None)
+    if host_os() == "win32" and mode in ("TCC", "MCDM"):
+        return f" (the NVIDIA card runs in {mode} mode, where Windows offers no Vulkan device)"
+    return ""
+
+
+def _no_vulkan_why(vk, nvidia, exclude=()):
+    if vk is None:
+        return "no Vulkan device answered" + _no_vulkan_detail(nvidia)
+    if "vulkan" in exclude:
+        return "the Vulkan build failed"
+    return "Vulkan cannot run it here"
 
 
 def _gpu_hint(needs, hw, tc):
@@ -687,9 +759,13 @@ RELEASE_VULKAN = ("linux-x86_64.tar.gz", "windows-x86_64.zip")
 #: The engines the release's windows-x86_64-cuda.zip (RELEASE_CUDA_WIN32) carries, built against
 #: coli_cuda.dll (release.yml, the cuda-windows job), and the oldest card its DLL
 #: runs on: CUDA_ARCH=portable is SASS for sm_80 and newer plus compute_120 PTX.
-WINDOWS_CUDA_ENGINES = ("glm", "qwen36", "kimi")
+WINDOWS_CUDA_ENGINES = ("glm", "glm53", "qwen36", "qwen38", "kimi")
 WINDOWS_CUDA_FLOOR = 80
 RELEASE_CUDA_WIN32 = "windows-x86_64-cuda.zip"
+#: The engines the package got later, each with the last release whose package lacks it:
+#: v2.1.0's has no glm53.exe (#2541) and no qwen38.exe (#2846). With such a release the
+#: engine stays on Vulkan.
+WINDOWS_CUDA_LATER = {"glm53": "2.1.0", "qwen38": "2.1.0"}
 
 
 def prebuilt_vulkan(family, tc):
@@ -703,12 +779,21 @@ def prebuilt_vulkan(family, tc):
 
 def release_cuda(family, tc):
     """Whether resolve_engine takes this engine from the Windows release, where the
-    CUDA backend comes with it (fetch_release_cuda): no engine here and nothing here
-    builds one. Before, the setup fetched only the main archive, whose engines run
+    CUDA backend comes with it (fetch_release_cuda): no engine here, nothing here
+    builds one, and the package of this version has its CUDA build (release_cuda_lacks).
+    Before, the setup fetched only the main archive, whose engines run
     Vulkan, and an NVIDIA card ran Vulkan with no word that CUDA was one zip away (#2091)."""
     return (host_os() == "win32" and family.id in WINDOWS_CUDA_ENGINES
             and not os.path.isfile(engine_path(HERE, family)) and not tc.get("can_build")
-            and release_asset_suffix() == "windows-x86_64.zip")
+            and release_asset_suffix() == "windows-x86_64.zip"
+            and not release_cuda_lacks(family.id, current_version()))
+
+
+def release_cuda_lacks(family_id, tag):
+    """Whether release `tag`'s windows-x86_64-cuda.zip came before this engine's CUDA
+    build joined it (WINDOWS_CUDA_LATER)."""
+    last = WINDOWS_CUDA_LATER.get(family_id)
+    return last is not None and setup_catalog.version_tuple(tag) <= setup_catalog.version_tuple(last)
 
 
 def engine_path(directory, family):
@@ -810,6 +895,8 @@ def release_asset_suffix(os_name=None, machine=None):
     machine = (machine or host_machine()).lower()
     if os_name.startswith("linux") and machine in ("x86_64", "amd64"):
         return "linux-x86_64.tar.gz"
+    if os_name.startswith("linux") and machine in ("aarch64", "arm64"):
+        return "linux-aarch64.tar.gz"
     if os_name == "darwin" and machine in ("arm64", "aarch64"):
         return "macos-arm64.tar.gz"
     if os_name == "win32" and machine in ("amd64", "x86_64"):
@@ -1060,6 +1147,11 @@ def resolve_engine(family, entry, decision, tc, out=print, allow_prebuilt=True):
     backend = decision["backend"]
     if backend == "cuda" and host_os() == "win32":
         try:
+            # a package without this engine (v2.1.0's has no glm53.exe): the release's
+            # Vulkan engine, as when there is no package, and nothing downloaded for it
+            if release_cuda_lacks(family.id, tag):
+                raise SetupError(f"the {RELEASE_CUDA_WIN32} of release {tag} has no CUDA build "
+                                 f"of {family.engine_artifact}")
             if not fetch_release_cuda(runtime, tag, out=out):
                 raise SetupError(f"release {tag} has no {RELEASE_CUDA_WIN32}")
         except SetupError as error:
@@ -1775,13 +1867,30 @@ def download_model(ui, entry, model_dir, *, via_windows="auto", verify=True, ext
     if have:
         ui.say(f"  resuming: {human_size(have)} of {human_size(total)} already here")
     started = time.time()
-    first = {"done": None}
+    # (time, bytes received this run). `done` counts everything on disk, so the
+    # percentage stays the fraction of the model that is here. Speed uses
+    # `fresh` only: a resume checks the files already present before any new
+    # bytes arrive, and those bytes are not transfer speed. While that check
+    # reports fresh == 0 the window slides forward, so its time is not part of
+    # the rate either.
+    samples = [(started, 0)]
+    window = 10.0
 
     def progress(event):
-        if first["done"] is None:
-            first["done"] = event["done"]
-        elapsed = max(time.time() - started, 1e-3)
-        rate = (event["done"] - first["done"]) / elapsed
+        now = time.time()
+        fresh = max(0, event.get("fresh", 0))
+        if fresh < samples[-1][1]:
+            samples[:] = [(now, fresh)]
+        elif fresh == 0:
+            samples[:] = [(now, 0)]
+        else:
+            samples.append((now, fresh))
+            cutoff = now - window
+            while len(samples) > 2 and samples[1][0] <= cutoff:
+                samples.pop(0)
+        span = samples[-1][0] - samples[0][0]
+        gained = samples[-1][1] - samples[0][1]
+        rate = gained / span if span >= 0.5 and gained > 0 else 0.0
         eta = (event["total"] - event["done"]) / rate if rate > 0 else None
         pct = 100.0 * event["done"] / event["total"] if event["total"] else 100.0
         width = 24
@@ -1948,7 +2057,8 @@ def release_cuda_missing(cfg):
     """The release tag whose CUDA backend the configured engine is missing, or None:
     the engine is the Windows release's (fetch_release_archive, in runtime/colibri-<tag>)
     without coli_cuda.dll, on a card that backend runs on, with the backend left to the
-    setup. A setup from before the backend came with the release left it so (#2091)."""
+    setup, and that release's package has this engine (release_cuda_lacks). A setup from
+    before the backend came with the release left it so (#2091)."""
     if host_os() != "win32" or cfg.get("backend") == "cuda" or \
             (cfg.get("requested_backend") or "auto") != "auto":
         return None
@@ -1960,7 +2070,8 @@ def release_cuda_missing(cfg):
         return None
     cards = cfg.get("nvidia") or []
     sm = setup_hw.compute_cap_sm(cards[0].get("compute_cap")) if cards else None
-    if cfg.get("family") not in WINDOWS_CUDA_ENGINES or sm is None or sm < WINDOWS_CUDA_FLOOR:
+    if cfg.get("family") not in WINDOWS_CUDA_ENGINES or release_cuda_lacks(cfg.get("family"), tag) \
+            or sm is None or sm < WINDOWS_CUDA_FLOOR:
         return None
     return tag
 
@@ -2168,6 +2279,11 @@ def cmd_setup(a, ui=None):
     if decision["missing"] and ui.interactive and decision["backend"] == "cpu":
         if not ui.confirm("  Continue on the CPU for now (rerun after installing to switch)?", True):
             raise SetupError("stopped so you can install the GPU packages; rerun afterwards")
+    elif decision.get("gpu_unused") and ui.interactive and decision["backend"] == "cpu":
+        # nothing to install would change it: ask before the download, not after (#2846)
+        if not ui.confirm(f"  Continue with {family.display_name} on the CPU?", True):
+            raise SetupError("stopped before the download; `coli setup --reconfigure` "
+                             "picks another model")
     engine_info, decision, failed = resolve_with_fallback(ui, family, entry, decision, tc, hw,
                                                           requested, failed)
     if failed:

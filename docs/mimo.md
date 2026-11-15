@@ -131,6 +131,22 @@ them, so a row depends on its own inputs only. A decode step adds in the same or
 before. A prefill now gives the bits that feeding the prompt one token at a time always
 gave.
 
+### The prefix store
+
+A snapshot is the client's: it keeps the rings, not the full layers' rows, which must still be in the
+slot. Without one, the slot resumes only from the end of what it holds: an agent's new conversation
+on the same system prompt read its whole prompt again, and so did a conversation back after another
+took the slot. `prefix_store.h` keeps every prompt read, as qwen36 does
+([qwen36.md](qwen36.md#the-prefix-store)): the full layers' K/V rows and positions in blocks of 256
+tokens named by their tokens, shared by every prompt that starts with them, and checkpoints of the
+sliding layers' rings (about 50 MB each on Flash, as a snapshot) where a prompt's messages start
+(`<|im_start|>`) and where a turn ends. A request takes the deepest checkpoint its prompt starts
+with when it reaches further than the slot. `COLI_PREFIX_STORE=0` or `COLI_KV_PREFIX=0` turns it
+off; not for a picture's prompt or a read-out. `tests/test_mimo_prefix_store.py` (in
+`make mimo-tiny-serve-check`) holds every request that took the store to a fresh engine reading the
+same prompt with the store off, each step's top five logits to the last digit (the per-row expert
+order above is what makes that hold); `MIMO_PS_BACKEND=vulkan` the same on the dense chain.
+
 ## Correctness
 
 `make -C c mimo-tiny-check` generates a tiny checkpoint (numpy, deterministic) stored

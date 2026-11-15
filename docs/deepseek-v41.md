@@ -445,7 +445,8 @@ and costs the contention. Anything that tries again has to start from that.
 
 | variable | default | what it does |
 |---|---|---|
-| `COLI_KV_PREFIX` | **off on this engine** | `1` reuses the previous turn's state when the new prompt begins with what that state was built from, instead of re-reading the transcript. Off by default here and on nowhere else: see "Reusing a turn" below for what it costs. |
+| `COLI_KV_PREFIX` | **off on this engine** | `1` reuses the previous turn's state when the new prompt begins with what that state was built from, instead of re-reading the transcript. Off by default here and on nowhere else: see "Reusing a turn" below for what it costs. `0` turns the prefix store off too. |
+| `COLI_PREFIX_STORE` | on | every prompt read is kept by content (see "The prefix store" below): a new conversation on the same system prompt, or a conversation's next turn, reads only what follows the deepest place an earlier prompt was kept, with the logits a cold read gives. `0` off; `COLI_PREFIX_STORE_MB` its budget, `COLI_PREFIX_STORE_BLOCK` its block ([ENVIRONMENT.md](ENVIRONMENT.md)). |
 | `V41_STATS` | off | per-turn accounting on stderr: the n-gram cache, the expert bytes and their rate, and how many drafts were accepted. Off by default because `coli chat` shows the engine's stderr next to the answer. |
 | `V41_READ_DEPTH` | 8 | expert tensors read at once when a step misses the cache (see above). `1` restores the serial read the engine used to do, for an A/B. |
 | `COLI_MODEL_MIRROR` | unset | `;`/`,`-separated read-only copies of the checkpoint on other drives; expert reads split across the primary and every replica (see above). `SNAP_MIRROR` is the legacy alias. |
@@ -461,7 +462,7 @@ and costs the contention. Anything that tries again has to start from that.
 | `V41_DSPARK_MAX` | the checkpoint's `dspark_block_size` | how many of the drafted tokens are put in front of the main model. Fewer means a cheaper rejected round and a lower ceiling on the win. |
 | `V41_DSPARK_MINACC` | 60 | percent of the drafts written that must be accepted over a window of ten for drafting to continue (a draft the gate left unverified counts as not accepted); below it, drafts pause for 64 tokens. 60 is the measured break-even, not a guess. |
 | `V41_DSPARK_GATE` | on | how many of a round's drafts are verified, from the head's confidence in each (see above). `0` verifies every draft. |
-| `V41_PREFILL_TAIL` | the exact tail (2414 rows on V4.1) | how many of a prompt's last rows the layers after layer 20 run on (see "The prompt's tail"). Unset: the exact tail, the same bits as every row. `0` runs every row; a smaller number (DeepSeek serves with 140) is faster and approximate. |
+| `V41_PREFILL_TAIL` | the exact tail (2414 rows on V4.1) | how many of a prompt's last rows the layers after layer 20 run on (see "The prompt's tail"). Unset: the exact tail, the same bits as every row (on the Vulkan chain chunk by chunk; layer by layer, `COLI_VK_V41_LAYERWISE`, the routed experts' step rounds apart in the last bits, the text the same). `0` runs every row; a smaller number (DeepSeek serves with 140) is faster and approximate. |
 | `V41_SPEC_FORCE` | unset | oracle mode only: draft the reference's tokens (`1`), corrupt the last one (`2`), use the head's own (`3`), corrupt the first one (`4`) or a different one each round (`5`), to exercise the verification path on a fixture whose draft head is random. |
 
 ## Vulkan (`VK=1`)
@@ -501,6 +502,41 @@ after every forward), so rollbacks, prefix reuse and a lost device need nothing 
 Off by default on an integrated GPU (not measured on a V4.1 checkpoint); on the tiny
 fixtures every configuration gives the CPU's tokens (`tests/vulkan_engines.sh
 deepseek-chain`, `deepseek-chain-sanitize`).
+
+### Trunk-first placement (a discrete card with Resizable BAR)
+
+On a discrete card whose host-visible device-local heap covers its memory (Resizable
+BAR), the engine places the **trunk first** and sizes everything else around it:
+
+1. the device opens, and the chain fit runs before anything is allocated — it reads the
+   device's real free memory, so every layer that fits goes up (the trunk of the Flash
+   checkpoint, 40 layers of fp8/bf16 matrices plus the chain's fixed buffers, held about
+   7.6 GiB of the heap once placed);
+2. the trunk is placed as the layers are read, its host copies given back
+   (`COLI_VK_DENSE_HOST`'s auto rule), and only then is the mapped-weights window asked:
+   the heap less what the trunk took and `COLI_VK_FREE_RESERVE_GB` (1 GiB), not 9/10 of
+   the heap. A driver that refuses what is left beside the trunk takes the staged path
+   for what follows, as a card without a window does; `COLI_VK_STAGED=1` still forces it;
+3. the expert tier sizes itself from what the device has left less
+   `COLI_VK_TIER_RESERVE_GB` (1 GiB) and the dense weights still to come — inside the
+   window, beside the trunk — and its **host pool stays off**: a mirror of the experts in
+   system RAM the GTT imports would double what the engine's own RAM cache holds.
+   `COLI_VK_TIER_HOST=1` or `COLI_VK_TIER_HOST_GB` turns it back on, and `COLI_VK_TIER_GB`
+   still caps the tier.
+
+The order matters because the window's probe allocates 1 GiB blocks and frees them, and
+a driver that reports the budget only once they are back shows the fit a few hundred
+MiB — which left the whole trunk on the CPU while the tier filled the window and an
+823-expert mirror of it sat in system RAM. The `[VK] memory: mapped weights` line says
+what was asked and why; other engines keep the order they had.
+
+What that leaves the tier is smaller than the window itself. On the 16 GiB card this
+was measured on, the driver's budget exposes about 90% of the heap (13.3 of 14.4 GiB),
+the trunk holds 7.62 GiB once placed, and the window asks the remaining 5 GiB; the
+tier's own sizing then sets aside its 1 GiB reserve, the ~1.4 GiB of bf16 dense tail
+still to be uploaded lazily, and the 64 streaming slots (~1.35 GiB), leaving a 3.31 GiB
+resident budget — 84 experts of 21.1 MiB — beside a trunk the whole prompt pays for on
+every token. `COLI_VK_TIER_RESERVE_GB=0` and `COLI_VK_TIER_HOST` trade that back.
 
 ## Reusing a turn, and why it is asked for rather than assumed
 
@@ -545,6 +581,55 @@ forward past position 0, which a resumed prefill overflows; `spec_step` decided
 0, so a resumed prefill fell into the drafting path with no draft buffer; and the
 record follows the speculative rollback, so it never claims rows the caches gave
 back.
+
+## The prefix store: a new conversation, and the next turn, without reading again
+
+Resuming the live state is opt-in here (above), and nothing can wind back the window rings
+or the compressor's filling group: so every request read its whole prompt. An agent
+starts each task as a new conversation on the same system prompt and tools, and a chat
+client resends the conversation every turn, so most of what a request read had been read
+before. `prefix_store.h` keeps it (qwen36 does the same, [qwen36.md](qwen36.md#the-prefix-store)):
+
+- **What is kept.** The compressed rows and index keys in blocks of 256 tokens named by
+  their tokens and the block before them (a row for `ratio` positions: 64 a block at
+  ratio 4, 2 at ratio 128), shared by every prompt that starts with them; and
+  checkpoints of the rest, every layer's window ring and its positions, the
+  compressor's filling group and the layer whose index keys were published last. The
+  engram history is the prompt's ids again, so it is rebuilt rather than kept.
+- **Where.** A prompt is read in pieces where its messages start (`<｜User｜>`,
+  `<｜Assistant｜>`, `<｜System｜>`): at the first one past what the slot held (after a new
+  conversation's system prompt, where the next conversation parts from it) and at the
+  last one, and a checkpoint is kept after each piece and where the prompt ends.
+- **Only a prompt read's.** A request that started from nothing or from the store
+  keeps what it reads; one that resumed the live state (`COLI_KV_PREFIX=1`: a decoded
+  reply in it) or a photo keeps nothing. A request takes the deepest checkpoint its
+  prompt starts with when it reaches further than its slot, two positions short of the
+  prompt's end at most: a single position read alone would score its index keys against
+  the keys published last, as a decoded one does. So taking a checkpoint is a resumed
+  prefill, which is exact: the logits are the ones the same prompt read cold gives.
+- **What it serves.** A new conversation on the same system prompt reads only its own
+  message; a conversation's next turn reads from where its last prompt ended (the
+  reply and the new message; with a thinking-mode reply, whose opening `<think>` the
+  next prompt writes as `</think>`, from where its last message started); a
+  conversation sent back to the other slot the same.
+- **Not kept or taken** for a picture's prompt (its placeholders are the same for every
+  picture) or a read-out (`logprobs`: every position's frame).
+
+A prompt's top-k lists and candidate masks are not in a checkpoint: the rows read past
+it publish their own before any layer reads them (a decoded position would read the last
+forward's, and nothing here resumes one). Leaving out any of the window rings, the
+filling group, the rows or the engram history makes `tests/test_dsv41_prefix_store.py`
+fail; leaving out those lists does not.
+
+`tests/test_dsv41_prefix_store.py` holds every request that took the store to a fresh
+engine reading the same prompt with the store off, each step's top five logits to the
+last digit: a new conversation on the same system prompt, a conversation's next turn
+after another, two slots with the conversation on the other one, the speculative
+decoder on (the same bytes), a budget of nothing, the store off, a request that resumed
+the live state keeping nothing, a read-out reading everything. `DSV41_PS_BACKEND=vulkan`
+and `cuda` run both engines on that chain, the same top five within 1e-4: Lavapipe in
+`tests/vulkan_engines.sh` (the safetensors fixture and the GGUF one), the CUDA chain on
+an RTX PRO 4000 (a GGUF's).
 
 ## How it is tested
 

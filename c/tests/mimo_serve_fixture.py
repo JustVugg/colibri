@@ -34,7 +34,9 @@ _served = None
 
 
 def available():
-    return ENGINE.is_file() and (FIXTURE / "config.json").is_file()
+    """The engine and the fixture's weights: the repository tracks the fixture's config.json
+    alone, so a checkout without tools/make_mimo_tiny.py's run has a config and no model."""
+    return ENGINE.is_file() and (FIXTURE / "model.safetensors.index.json").is_file()
 
 
 def has_vision():

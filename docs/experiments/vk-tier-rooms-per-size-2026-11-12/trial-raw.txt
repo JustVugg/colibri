@@ -1,0 +1,231 @@
+=== trial run 1 (MemAvailable 15746 MiB)
+up
+prefill 5899 tok 34.91s 169.0 tok/s
+decode 128 tok 11.13s 11.5 tok/s (wall, incl. 21 prompt tok)
+  ✓ stopped — RAM released
+[VK] tier qwen36: on, AMD Radeon RX 9060 XT (RADV GFX1200), budget 12.11 GiB = 6717 experts of 1.8 MiB (fmt 113, down fmt 113; 33 layers in 6 forms other than most layers', every expert in a room of its own form's size (7 sizes); 553.1 MiB left for the dense chain's KV mirror and a prompt chunk), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps 
+[VK] tier qwen36 turn: device 3148 of 5076 routed experts (62.0%; this turn 3148 of 5076) | CPU RAM hits 630, disk loads 1298 | resident 6717 (budget 6717, 11.98 GiB of 12.11 GiB, 48 blocks, frag 0.87) | uploads 6741 (12.03 GiB, 6717 warm), evictions 24, skipped 0 queue + 0 rate, failed 0 | device 100.5 ms, CPU share 3121.5 ms, waited 11.9 ms (88% of device time hidden) | balance: device share 1.00, 0 rows handed to 
+[VK] tier qwen36 turn: device 1628865 of 1669440 routed experts (97.6%; this turn 1625717 of 1664364) | CPU RAM hits 35080, disk loads 8369 | resident 6716 (budget 6717, 12.07 GiB of 12.11 GiB, 49 blocks, frag 0.99) | uploads 7314 (13.06 GiB, 6717 warm), evictions 598, skipped 0 queue + 0 rate, failed 0 | device 3673.6 ms, CPU share 25171.0 ms, waited 1954.1 ms (47% of device time hidden) | balance: device share 1.00
+[VK] tier qwen36 turn: device 1659524 of 1714842 routed experts (96.8%; this turn 30659 of 45402) | CPU RAM hits 47280, disk loads 10912 | resident 6712 (budget 6717, 12.04 GiB of 12.11 GiB, 49 blocks, frag 0.99) | uploads 7721 (13.77 GiB, 6717 warm), evictions 1009, skipped 0 queue + 0 rate, failed 0 | device 4476.8 ms, CPU share 33433.9 ms, waited 2086.2 ms (53% of device time hidden) | balance: device share 1.00,
+=== trial run 2 (MemAvailable 15568 MiB)
+up
+prefill 5899 tok 35.21s 167.5 tok/s
+decode 128 tok 11.50s 11.1 tok/s (wall, incl. 21 prompt tok)
+  ✓ stopped — RAM released
+[VK] tier qwen36: on, AMD Radeon RX 9060 XT (RADV GFX1200), budget 12.11 GiB = 6717 experts of 1.8 MiB (fmt 113, down fmt 113; 33 layers in 6 forms other than most layers', every expert in a room of its own form's size (7 sizes); 553.1 MiB left for the dense chain's KV mirror and a prompt chunk), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps 
+[VK] tier qwen36 turn: device 3148 of 5076 routed experts (62.0%; this turn 3148 of 5076) | CPU RAM hits 630, disk loads 1298 | resident 6717 (budget 6717, 11.98 GiB of 12.11 GiB, 48 blocks, frag 0.87) | uploads 6741 (12.03 GiB, 6717 warm), evictions 24, skipped 0 queue + 0 rate, failed 0 | device 104.7 ms, CPU share 3114.3 ms, waited 10.6 ms (90% of device time hidden) | balance: device share 1.00, 0 rows handed to 
+[VK] tier qwen36 turn: device 1628803 of 1669440 routed experts (97.6%; this turn 1625655 of 1664364) | CPU RAM hits 34973, disk loads 8641 | resident 6716 (budget 6717, 12.07 GiB of 12.11 GiB, 49 blocks, frag 0.95) | uploads 7296 (13.01 GiB, 6717 warm), evictions 580, skipped 0 queue + 0 rate, failed 0 | device 3674.1 ms, CPU share 25235.3 ms, waited 1953.7 ms (47% of device time hidden) | balance: device share 1.00
+[VK] tier qwen36 turn: device 1659431 of 1714560 routed experts (96.8%; this turn 30628 of 45120) | CPU RAM hits 46765, disk loads 11341 | resident 6717 (budget 6717, 12.05 GiB of 12.11 GiB, 49 blocks, frag 0.99) | uploads 7695 (13.71 GiB, 6717 warm), evictions 978, skipped 0 queue + 0 rate, failed 0 | device 4483.3 ms, CPU share 33728.5 ms, waited 2136.8 ms (52% of device time hidden) | balance: device share 0.89, 3
+=== trial run 3 (MemAvailable 15662 MiB)
+up
+prefill 5899 tok 35.29s 167.1 tok/s
+decode 128 tok 10.72s 11.9 tok/s (wall, incl. 21 prompt tok)
+  ✓ stopped — RAM released
+[VK] tier qwen36: on, AMD Radeon RX 9060 XT (RADV GFX1200), budget 12.11 GiB = 6717 experts of 1.8 MiB (fmt 113, down fmt 113; 33 layers in 6 forms other than most layers', every expert in a room of its own form's size (7 sizes); 553.1 MiB left for the dense chain's KV mirror and a prompt chunk), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps 
+[VK] tier qwen36 turn: device 3148 of 5076 routed experts (62.0%; this turn 3148 of 5076) | CPU RAM hits 630, disk loads 1298 | resident 6717 (budget 6717, 11.98 GiB of 12.11 GiB, 48 blocks, frag 0.83) | uploads 6741 (12.03 GiB, 6717 warm), evictions 24, skipped 0 queue + 0 rate, failed 0 | device 101.9 ms, CPU share 3244.5 ms, waited 11.0 ms (89% of device time hidden) | balance: device share 1.00, 0 rows handed to 
+[VK] tier qwen36 turn: device 1628585 of 1669440 routed experts (97.6%; this turn 1625437 of 1664364) | CPU RAM hits 35357, disk loads 8562 | resident 6717 (budget 6717, 12.07 GiB of 12.11 GiB, 49 blocks, frag 0.98) | uploads 7384 (13.19 GiB, 6717 warm), evictions 667, skipped 0 queue + 0 rate, failed 0 | device 3660.3 ms, CPU share 25467.9 ms, waited 1965.6 ms (46% of device time hidden) | balance: device share 0.86
+[VK] tier qwen36 turn: device 1659108 of 1714560 routed experts (96.8%; this turn 30523 of 45120) | CPU RAM hits 47608, disk loads 10908 | resident 6704 (budget 6717, 12.03 GiB of 12.11 GiB, 49 blocks, frag 0.99) | uploads 7837 (13.99 GiB, 6717 warm), evictions 1133, skipped 0 queue + 0 rate, failed 0 | device 4456.9 ms, CPU share 33368.3 ms, waited 2091.8 ms (53% of device time hidden) | balance: device share 1.00,
+----- server log, trial run 1 -----
+[gateway] qwen36 engine, flint chat template (from the checkpoint's chat_template.jinja)
+[qwen36] RAM plan: 59 expert cache slots/layer; --cap overrides
+[gguf] /persist/models/flint/flint-UD-Q4_K_XL.gguf: 1 file(s), 779 tensors, read in place (native ggml types, no conversion)
+== qwen36 Phase-2 engine | cache=59/layer bits=4 ctx=16384 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] Flint's pre-tokenizer (digits by three, CJK runs, o200k letters)
+[tok] loaded 150000 pieces (max id 150143) from /persist/models/flint/flint.colibri/tokenizer.json
+[gguf] flint: 35 sliding-window layers of 513 rows, 14 without RoPE, 2 dense in front (MLP 6144), sigmoid routing, a sink per head
+[gguf] flint: 49 layers (all attention), hidden 2048, 256 experts top-6, inter 512, vocab 150144
+[gguf] experts: layer 2 gate IQ3_S up IQ3_S down Q5_K, 2.44 MB per expert at most
+resident weights loaded in 1.1s | RSS after load: 1.98 GB
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+[VK] VRAM pressure-proofing: memory_priority on, memory_budget on
+[VK] staged uploads: copied straight from host memory where its pages import (4 KiB pages; COLI_VK_UP_IMPORT=0 stages every copy)
+[VK] memory: staged uploads, resident data in device-local memory (type 0, 16304 MiB heap) copied from host staging memory (type 2) on a queue of its own (COLI_VK_STAGED=1)
+[VK] ready: AMD Radeon RX 9060 XT (RADV GFX1200), compute qfam 0, memtype 3, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096 (cooperative matrix), staged uploads, subgroups of 64
+[VK] qwen36: device ready, dense matrices on the device (default)
+[VK] qwen36: dense chain on (a discrete GPU, beside the expert tier)
+[qwen36] expert format on disk: GGUF native ggml types (the CUDA and Vulkan tiers hold the file's blocks)
+[VK] qwen36 chain fit: free 16673087488 B, reserve 1073741824 B, fixed 584283136 B (the engine's 97743872 B, the pools' 486539264 B), tail 326713600 B, layers 60967808 60967808 28593280 28593280 28593280 28593280 28593280 28593280 28593280 28593280 28593280 28593280 28593280 28593280 28593280 28593280 28593280 28593280 28593280 21515392 28593280 28593280 28593280 28593280 26233984 26233984 21515392 28593280 26233984 28593280 28593280 28593280 26233984 28593280 26233984 19156096 28593280 26233984 26233984 19156096 26233984 28593280 25250944 19156096 26233984 21515392 21515392 28593280 28593280 B, matrices 60162076 60162076 27787296 27787296 27787296 27787296 27787296 27787296 27787296 27787296 27787296 27787296 27787296 27787296 27787296 27787296 27787296 27787296 27787296 20709408 27787296 27787296 27787296 27787296 25428000 25428000 20709408 27787296 25428000 27787296 27787296 27787296 25428000 27787296 25428000 18350112 27787296 25428000 25428000 18350112 25428000 27787296 24444960 18350112 25428000 20709408 20709408 27787296 27787296 B
+[VK] qwen36 chain: 49 of 49 layers on the device (1.29 GiB), 0 on the CPU (free 15.53 GiB, reserve 1.00 GiB)
+[VK] qwen36: dense weights on the device only (a discrete GPU with room for them: 0.09 of 14.46 GiB free; COLI_VK_DENSE_HOST=1 keeps the host copy)
+[VK] qwen36 chain: 49 of 49 layers placed: 1345127960 B of matrices on the device (the fit counted 1345127960 B for these layers), chain buffers 1916288 B, device memory held 1677721600 B
+[VK] qwen36 chain: 49 layers on the device (49 attention), 0.8 MiB of parameters
+[VK] chain: 101 pipelines made before the expert tier, in 0.0 s (COLI_VK_CHAIN_PREWARM=0: at first use)
+[VK] qwen36: 47 dense matrices on the device only, 94.0 MiB of host RAM given back; kept on the host: the embedding (its rows are gathered on the CPU), the DeltaNet's a/b rows and the shared expert's gate vector, norms, the vision tower, any imported pages; RSS now 2.005 GiB
+[VK] tier qwen36: the GGUF experts' blocks go to the device as the file has them (Q5_K gate/up, Q5_K down on 16 of 49 layers, the others their own types; COLI_VK_GGUF_RAW=0: int8 per 32)
+[PREFIX] store: up to 3819 MiB of the prompts read, kept by content for any later request (blocks of 256 tokens; COLI_PREFIX_STORE=0 off)
+[USAGE] expert history: 3427428 selections (/persist/models/flint/flint.colibri/.coli_usage)
+[VK] tier qwen36: on, AMD Radeon RX 9060 XT (RADV GFX1200), budget 12.11 GiB = 6717 experts of 1.8 MiB (fmt 113, down fmt 113; 33 layers in 6 forms other than most layers', every expert in a room of its own form's size (7 sizes); 553.1 MiB left for the dense chain's KV mirror and a prompt chunk), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[VK] tier qwen36: warm start, 6717 experts in 7.2s (6717 from the history, 0 more to fill the device)
+[gateway] input modalities: text (the engine loaded no vision tower; a picture gets a 400)
+OpenAI-compatible API listening on http://127.0.0.1:18112/v1
+[api] 127.0.0.1 - "GET /v1/models HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /v1/models HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /v1/models HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /v1/models HTTP/1.1" 200 -
+[qwen36] KV: 35 sliding-window layers keep a ring of 769 rows (window 513, 256 spare), not 1024: 0.05 GiB of their cache instead of 0.07
+[qwen36] KV cache: float16, 0.08 GiB at 1024 positions (half of float32; Q36_KV=f32 keeps float32)
+[VK] qwen36 chain: prompt chunks of up to 1536 rows (471 KiB a row; 1.58 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+[qwen36 spec gate] turn 1: T(1) 179.6 ms, rows, rho 0.50, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 1: 1.00 tokens/forward (15 forwards per 15 tokens) | acceptance 0.0% (0/0 drafts in 0 verifies) | gate on, 0 declined, 0 probes
+[VK] qwen36: 0 matmuls on the GPU (392 matrices resident, 1594.4 MiB; placed int8 0, int4 0, f32 391)
+[VK] qwen36 chain: 16 forwards, 1684 frames (16933 ops, 6256 matmuls, 0 tiled GEMM), 274.1 ms waiting for the device, 3174.7 ms of routed experts on the host, 0 layer steps with the routed experts in the frame (0 of them a prompt chunk's, 16 in the integer form), 150.9 MiB on the device
+[VK] tier qwen36 turn: device 3148 of 5076 routed experts (62.0%; this turn 3148 of 5076) | CPU RAM hits 630, disk loads 1298 | resident 6717 (budget 6717, 11.98 GiB of 12.11 GiB, 48 blocks, frag 0.87) | uploads 6741 (12.03 GiB, 6717 warm), evictions 24, skipped 0 queue + 0 rate, failed 0 | device 100.5 ms, CPU share 3121.5 ms, waited 11.9 ms (88% of device time hidden) | balance: device share 1.00, 0 rows handed to the CPU | exclusive: 0 RAM copies of device experts given up first
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[VK] qwen36 chain: the KV mirror grows from 2048 to 7168 positions (87.4 MiB more, 0.0 MiB of them from the expert tier)
+[VK] tier qwen36: 46 of 64 streaming slots
+[VK] tier qwen36 stream: a step of 1536 rows; cold experts with 16 rows or more go to the device (the GEMM's 16 rows: the upload and the CPU's rows not measured yet); layer 2: 156 resident, 7 streamed (0 of them copied from the host pool), 67 kept on the CPU (203 rows)
+[VK] tier qwen36 stream: a step of 1536 rows; cold experts with 16 rows or more go to the device (an upload of 1.8 MiB at 2.0 GB/s takes 0.941 ms, the CPU 0.6414 ms a row; the GEMM from 16 rows); layer 2: 153 resident, 1 streamed (0 of them copied from the host pool), 4 kept on the CPU (38 rows)
+[VK] tier qwen36 stream: a step of 1536 rows; cold experts with 16 rows or more go to the device (an upload of 1.8 MiB at 1.6 GB/s takes 1.177 ms, the CPU 0.3665 ms a row; the GEMM from 16 rows); layer 2: 152 resident, 0 streamed (0 of them copied from the host pool), 0 kept on the CPU (0 rows)
+[VK] tier qwen36 stream: a step of 1291 rows; cold experts with 16 rows or more go to the device (an upload of 1.8 MiB at 1.1 GB/s takes 1.661 ms, the CPU 0.3859 ms a row; the GEMM from 16 rows); layer 2: 163 resident, 0 streamed (0 of them copied from the host pool), 17 kept on the CPU (27 rows)
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[qwen36 spec gate] turn 2: T(1) 131.1 ms, rows, rho 0.50, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 2: 1.00 tokens/forward (3 forwards per 3 tokens) | acceptance 0.0% (0/0 drafts in 0 verifies) | gate on, 0 declined, 0 probes
+[VK] qwen36: 0 matmuls on the GPU (392 matrices resident, 1594.4 MiB; placed int8 0, int4 0, f32 391)
+[VK] qwen36 chain: 20 forwards, 2407 frames (25194 ops, 8990 matmuls, 1560 tiled GEMM), 1462.2 ms waiting for the device, 30743.9 ms of routed experts on the host, 0 layer steps with the routed experts in the frame (0 of them a prompt chunk's, 16 in the integer form), 878.9 MiB on the device
+[VK] tier qwen36 turn: device 1628865 of 1669440 routed experts (97.6%; this turn 1625717 of 1664364) | CPU RAM hits 35080, disk loads 8369 | resident 6716 (budget 6717, 12.07 GiB of 12.11 GiB, 49 blocks, frag 0.99) | uploads 7314 (13.06 GiB, 6717 warm), evictions 598, skipped 0 queue + 0 rate, failed 0 | device 3673.6 ms, CPU share 25171.0 ms, waited 1954.1 ms (47% of device time hidden) | balance: device share 1.00, 0 rows handed to the CPU | exclusive: 161 RAM copies of device experts given up first | stream: 188 steps, 1201 cold experts (5.10 GiB, 1.44 GB/s) and 29816 rows streamed in 524 sub-batches, prefetched 2086 (413 used), 8674 cold experts (38303 rows) kept on the CPU, 4 steps summed on the device
+[VK] tier qwen36 stream: a step of 21 rows; cold experts with 16 rows or more go to the device (an upload of 1.8 MiB at 1.0 GB/s takes 1.860 ms, the CPU 0.5512 ms a row; the GEMM from 16 rows); layer 2: 71 resident, 0 streamed (0 of them copied from the host pool), 13 kept on the CPU (19 rows)
+[qwen36 spec gate] turn 3: T(1) 88.2 ms, rows 2:1.06 3:1.60 4:1.72 5:2.54, rho 0.32, acceptance by position 0.56 0.80 0.33 0.50 0.50
+[qwen36 lookup] turn 3: 1.12 tokens/forward (113 forwards per 127 tokens) | acceptance 51.9% (14/27 drafts in 19 verifies) | gate on, 3 declined, 4 probes
+[VK] qwen36: 0 matmuls on the GPU (392 matrices resident, 1594.4 MiB; placed int8 0, int4 0, f32 391)
+[VK] qwen36 chain: 134 forwards, 13468 frames (145923 ops, 53564 matmuls, 1950 tiled GEMM), 3120.2 ms waiting for the device, 39418.6 ms of routed experts on the host, 0 layer steps with the routed experts in the frame (0 of them a prompt chunk's, 16 in the integer form), 881.2 MiB on the device
+[VK] tier qwen36 turn: device 1659524 of 1714842 routed experts (96.8%; this turn 30659 of 45402) | CPU RAM hits 47280, disk loads 10912 | resident 6712 (budget 6717, 12.04 GiB of 12.11 GiB, 49 blocks, frag 0.99) | uploads 7721 (13.77 GiB, 6717 warm), evictions 1009, skipped 0 queue + 0 rate, failed 0 | device 4476.8 ms, CPU share 33433.9 ms, waited 2086.2 ms (53% of device time hidden) | balance: device share 1.00, 3 rows handed to the CPU | exclusive: 714 RAM copies of device experts given up first | stream: 235 steps, 1201 cold experts (5.10 GiB, 1.44 GB/s) and 29816 rows streamed in 571 sub-batches, prefetched 2086 (413 used), 9787 cold experts (40033 rows) kept on the CPU, 4 steps summed on the device
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[PREFIX] store: 3 lookups, 0 from the store (0 prompt tokens not read again); 214.0 MiB in 23 blocks and 1 checkpoints, 0 evicted
+[VK] memory at exit: weights 1594.4 MiB, expert tier 12388.7 MiB (peaks), KV mirror 0.0 MiB in memory type 0 (device-local, not host-visible); the dense chain's state in type 0 (device-local); 21019.5 MiB staged in 64354 copies (8523 submits), 21019.5 MiB of them straight from host memory in 63962 copies (0 not imported), 56 blocks zero-filled; resident data in host memory: 0.0 MiB
+[VK] qwen36: dense weights at exit: 47 matrices on the device only (94.0 MiB of host copies dropped), 0 read back from disk for the CPU (0.0 MiB); RSS 5.480 GiB
+----- server log, trial run 2 -----
+[gateway] qwen36 engine, flint chat template (from the checkpoint's chat_template.jinja)
+[qwen36] RAM plan: 57 expert cache slots/layer; --cap overrides
+[gguf] /persist/models/flint/flint-UD-Q4_K_XL.gguf: 1 file(s), 779 tensors, read in place (native ggml types, no conversion)
+== qwen36 Phase-2 engine | cache=57/layer bits=4 ctx=16384 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] Flint's pre-tokenizer (digits by three, CJK runs, o200k letters)
+[tok] loaded 150000 pieces (max id 150143) from /persist/models/flint/flint.colibri/tokenizer.json
+[gguf] flint: 35 sliding-window layers of 513 rows, 14 without RoPE, 2 dense in front (MLP 6144), sigmoid routing, a sink per head
+[gguf] flint: 49 layers (all attention), hidden 2048, 256 experts top-6, inter 512, vocab 150144
+[gguf] experts: layer 2 gate IQ3_S up IQ3_S down Q5_K, 2.44 MB per expert at most
+resident weights loaded in 1.1s | RSS after load: 1.98 GB
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+[VK] VRAM pressure-proofing: memory_priority on, memory_budget on
+[VK] staged uploads: copied straight from host memory where its pages import (4 KiB pages; COLI_VK_UP_IMPORT=0 stages every copy)
+[VK] memory: staged uploads, resident data in device-local memory (type 0, 16304 MiB heap) copied from host staging memory (type 2) on a queue of its own (COLI_VK_STAGED=1)
+[VK] ready: AMD Radeon RX 9060 XT (RADV GFX1200), compute qfam 0, memtype 3, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096 (cooperative matrix), staged uploads, subgroups of 64
+[VK] qwen36: device ready, dense matrices on the device (default)
+[VK] qwen36: dense chain on (a discrete GPU, beside the expert tier)
+[qwen36] expert format on disk: GGUF native ggml types (the CUDA and Vulkan tiers hold the file's blocks)
+[VK] qwen36 chain fit: free 16673087488 B, reserve 1073741824 B, fixed 584283136 B (the engine's 97743872 B, the pools' 486539264 B), tail 326713600 B, layers 60967808 60967808 28593280 28593280 28593280 28593280 28593280 28593280 28593280 28593280 28593280 28593280 28593280 28593280 28593280 28593280 28593280 28593280 28593280 21515392 28593280 28593280 28593280 28593280 26233984 26233984 21515392 28593280 26233984 28593280 28593280 28593280 26233984 28593280 26233984 19156096 28593280 26233984 26233984 19156096 26233984 28593280 25250944 19156096 26233984 21515392 21515392 28593280 28593280 B, matrices 60162076 60162076 27787296 27787296 27787296 27787296 27787296 27787296 27787296 27787296 27787296 27787296 27787296 27787296 27787296 27787296 27787296 27787296 27787296 20709408 27787296 27787296 27787296 27787296 25428000 25428000 20709408 27787296 25428000 27787296 27787296 27787296 25428000 27787296 25428000 18350112 27787296 25428000 25428000 18350112 25428000 27787296 24444960 18350112 25428000 20709408 20709408 27787296 27787296 B
+[VK] qwen36 chain: 49 of 49 layers on the device (1.29 GiB), 0 on the CPU (free 15.53 GiB, reserve 1.00 GiB)
+[VK] qwen36: dense weights on the device only (a discrete GPU with room for them: 0.09 of 14.46 GiB free; COLI_VK_DENSE_HOST=1 keeps the host copy)
+[VK] qwen36 chain: 49 of 49 layers placed: 1345127960 B of matrices on the device (the fit counted 1345127960 B for these layers), chain buffers 1916288 B, device memory held 1677721600 B
+[VK] qwen36 chain: 49 layers on the device (49 attention), 0.8 MiB of parameters
+[VK] chain: 101 pipelines made before the expert tier, in 0.0 s (COLI_VK_CHAIN_PREWARM=0: at first use)
+[VK] qwen36: 47 dense matrices on the device only, 94.0 MiB of host RAM given back; kept on the host: the embedding (its rows are gathered on the CPU), the DeltaNet's a/b rows and the shared expert's gate vector, norms, the vision tower, any imported pages; RSS now 2.005 GiB
+[VK] tier qwen36: the GGUF experts' blocks go to the device as the file has them (Q5_K gate/up, Q5_K down on 16 of 49 layers, the others their own types; COLI_VK_GGUF_RAW=0: int8 per 32)
+[PREFIX] store: up to 4096 MiB of the prompts read, kept by content for any later request (blocks of 256 tokens; COLI_PREFIX_STORE=0 off)
+[USAGE] expert history: 3427428 selections (/persist/models/flint/flint.colibri/.coli_usage)
+[VK] tier qwen36: on, AMD Radeon RX 9060 XT (RADV GFX1200), budget 12.11 GiB = 6717 experts of 1.8 MiB (fmt 113, down fmt 113; 33 layers in 6 forms other than most layers', every expert in a room of its own form's size (7 sizes); 553.1 MiB left for the dense chain's KV mirror and a prompt chunk), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[VK] tier qwen36: warm start, 6717 experts in 8.4s (6717 from the history, 0 more to fill the device)
+[gateway] input modalities: text (the engine loaded no vision tower; a picture gets a 400)
+OpenAI-compatible API listening on http://127.0.0.1:18114/v1
+[api] 127.0.0.1 - "GET /v1/models HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /v1/models HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /v1/models HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /v1/models HTTP/1.1" 200 -
+[qwen36] KV: 35 sliding-window layers keep a ring of 769 rows (window 513, 256 spare), not 1024: 0.05 GiB of their cache instead of 0.07
+[qwen36] KV cache: float16, 0.08 GiB at 1024 positions (half of float32; Q36_KV=f32 keeps float32)
+[VK] qwen36 chain: prompt chunks of up to 1536 rows (471 KiB a row; 1.58 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+[qwen36 spec gate] turn 1: T(1) 181.9 ms, rows, rho 0.50, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 1: 1.00 tokens/forward (15 forwards per 15 tokens) | acceptance 0.0% (0/0 drafts in 0 verifies) | gate on, 0 declined, 0 probes
+[VK] qwen36: 0 matmuls on the GPU (392 matrices resident, 1594.4 MiB; placed int8 0, int4 0, f32 391)
+[VK] qwen36 chain: 16 forwards, 1684 frames (16933 ops, 6256 matmuls, 0 tiled GEMM), 279.8 ms waiting for the device, 3166.3 ms of routed experts on the host, 0 layer steps with the routed experts in the frame (0 of them a prompt chunk's, 16 in the integer form), 150.9 MiB on the device
+[VK] tier qwen36 turn: device 3148 of 5076 routed experts (62.0%; this turn 3148 of 5076) | CPU RAM hits 630, disk loads 1298 | resident 6717 (budget 6717, 11.98 GiB of 12.11 GiB, 48 blocks, frag 0.87) | uploads 6741 (12.03 GiB, 6717 warm), evictions 24, skipped 0 queue + 0 rate, failed 0 | device 104.7 ms, CPU share 3114.3 ms, waited 10.6 ms (90% of device time hidden) | balance: device share 1.00, 0 rows handed to the CPU | exclusive: 0 RAM copies of device experts given up first
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[VK] qwen36 chain: the KV mirror grows from 2048 to 7168 positions (87.4 MiB more, 0.0 MiB of them from the expert tier)
+[VK] tier qwen36: 46 of 64 streaming slots
+[VK] tier qwen36 stream: a step of 1536 rows; cold experts with 16 rows or more go to the device (the GEMM's 16 rows: the upload and the CPU's rows not measured yet); layer 2: 156 resident, 10 streamed (0 of them copied from the host pool), 64 kept on the CPU (186 rows)
+[VK] tier qwen36 stream: a step of 1536 rows; cold experts with 16 rows or more go to the device (an upload of 1.8 MiB at 1.9 GB/s takes 1.013 ms, the CPU 0.7370 ms a row; the GEMM from 16 rows); layer 2: 152 resident, 4 streamed (0 of them copied from the host pool), 0 kept on the CPU (0 rows)
+[VK] tier qwen36 stream: a step of 1536 rows; cold experts with 16 rows or more go to the device (an upload of 1.8 MiB at 1.7 GB/s takes 1.119 ms, the CPU 0.3790 ms a row; the GEMM from 16 rows); layer 2: 151 resident, 1 streamed (0 of them copied from the host pool), 2 kept on the CPU (4 rows)
+[VK] tier qwen36 stream: a step of 1291 rows; cold experts with 16 rows or more go to the device (an upload of 1.8 MiB at 1.1 GB/s takes 1.671 ms, the CPU 0.3997 ms a row; the GEMM from 16 rows); layer 2: 160 resident, 2 streamed (0 of them copied from the host pool), 19 kept on the CPU (22 rows)
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[qwen36 spec gate] turn 2: T(1) 127.4 ms, rows, rho 0.50, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 2: 1.00 tokens/forward (3 forwards per 3 tokens) | acceptance 0.0% (0/0 drafts in 0 verifies) | gate on, 0 declined, 0 probes
+[VK] qwen36: 0 matmuls on the GPU (392 matrices resident, 1594.4 MiB; placed int8 0, int4 0, f32 391)
+[VK] qwen36 chain: 20 forwards, 2407 frames (25194 ops, 8990 matmuls, 1560 tiled GEMM), 1523.8 ms waiting for the device, 30971.9 ms of routed experts on the host, 0 layer steps with the routed experts in the frame (0 of them a prompt chunk's, 16 in the integer form), 878.9 MiB on the device
+[VK] tier qwen36 turn: device 1628803 of 1669440 routed experts (97.6%; this turn 1625655 of 1664364) | CPU RAM hits 34973, disk loads 8641 | resident 6716 (budget 6717, 12.07 GiB of 12.11 GiB, 49 blocks, frag 0.95) | uploads 7296 (13.01 GiB, 6717 warm), evictions 580, skipped 0 queue + 0 rate, failed 0 | device 3674.1 ms, CPU share 25235.3 ms, waited 1953.7 ms (47% of device time hidden) | balance: device share 1.00, 0 rows handed to the CPU | exclusive: 174 RAM copies of device experts given up first | stream: 188 steps, 1271 cold experts (5.28 GiB, 1.46 GB/s) and 32078 rows streamed in 523 sub-batches, prefetched 2150 (444 used), 8696 cold experts (38382 rows) kept on the CPU, 3 steps summed on the device
+[VK] tier qwen36 stream: a step of 21 rows; cold experts with 16 rows or more go to the device (an upload of 1.8 MiB at 1.2 GB/s takes 1.596 ms, the CPU 0.5296 ms a row; the GEMM from 16 rows); layer 2: 68 resident, 0 streamed (0 of them copied from the host pool), 16 kept on the CPU (23 rows)
+[qwen36 spec gate] turn 3: T(1) 81.0 ms, rows 2:1.30 3:1.76 4:2.66 5:4.01, rho 0.40, acceptance by position 0.53 0.75 0.50 0.50 0.50
+[qwen36 lookup] turn 3: 1.08 tokens/forward (118 forwards per 127 tokens) | acceptance 42.9% (9/21 drafts in 13 verifies) | gate on, 12 declined, 4 probes
+[VK] qwen36: 0 matmuls on the GPU (392 matrices resident, 1594.4 MiB; placed int8 0, int4 0, f32 391)
+[VK] qwen36 chain: 139 forwards, 13954 frames (151173 ops, 55519 matmuls, 1950 tiled GEMM), 3273.7 ms waiting for the device, 39906.0 ms of routed experts on the host, 0 layer steps with the routed experts in the frame (0 of them a prompt chunk's, 16 in the integer form), 882.2 MiB on the device
+[VK] tier qwen36 turn: device 1659431 of 1714560 routed experts (96.8%; this turn 30628 of 45120) | CPU RAM hits 46765, disk loads 11341 | resident 6717 (budget 6717, 12.05 GiB of 12.11 GiB, 49 blocks, frag 0.99) | uploads 7695 (13.71 GiB, 6717 warm), evictions 978, skipped 0 queue + 0 rate, failed 0 | device 4483.3 ms, CPU share 33728.5 ms, waited 2136.8 ms (52% of device time hidden) | balance: device share 0.89, 3 rows handed to the CPU | exclusive: 730 RAM copies of device experts given up first | stream: 235 steps, 1271 cold experts (5.28 GiB, 1.46 GB/s) and 32078 rows streamed in 570 sub-batches, prefetched 2150 (444 used), 9805 cold experts (40072 rows) kept on the CPU, 3 steps summed on the device
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[PREFIX] store: 3 lookups, 0 from the store (0 prompt tokens not read again); 214.0 MiB in 23 blocks and 1 checkpoints, 0 evicted
+[VK] memory at exit: weights 1594.4 MiB, expert tier 12387.2 MiB (peaks), KV mirror 0.0 MiB in memory type 0 (device-local, not host-visible); the dense chain's state in type 0 (device-local); 21143.2 MiB staged in 64816 copies (8513 submits), 21143.2 MiB of them straight from host memory in 64424 copies (0 not imported), 56 blocks zero-filled; resident data in host memory: 0.0 MiB
+[VK] qwen36: dense weights at exit: 47 matrices on the device only (94.0 MiB of host copies dropped), 0 read back from disk for the CPU (0.0 MiB); RSS 5.337 GiB
+----- server log, trial run 3 -----
+[gateway] qwen36 engine, flint chat template (from the checkpoint's chat_template.jinja)
+[qwen36] RAM plan: 58 expert cache slots/layer; --cap overrides
+[gguf] /persist/models/flint/flint-UD-Q4_K_XL.gguf: 1 file(s), 779 tensors, read in place (native ggml types, no conversion)
+== qwen36 Phase-2 engine | cache=58/layer bits=4 ctx=16384 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] Flint's pre-tokenizer (digits by three, CJK runs, o200k letters)
+[tok] loaded 150000 pieces (max id 150143) from /persist/models/flint/flint.colibri/tokenizer.json
+[gguf] flint: 35 sliding-window layers of 513 rows, 14 without RoPE, 2 dense in front (MLP 6144), sigmoid routing, a sink per head
+[gguf] flint: 49 layers (all attention), hidden 2048, 256 experts top-6, inter 512, vocab 150144
+[gguf] experts: layer 2 gate IQ3_S up IQ3_S down Q5_K, 2.44 MB per expert at most
+resident weights loaded in 1.1s | RSS after load: 1.98 GB
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+[VK] VRAM pressure-proofing: memory_priority on, memory_budget on
+[VK] staged uploads: copied straight from host memory where its pages import (4 KiB pages; COLI_VK_UP_IMPORT=0 stages every copy)
+[VK] memory: staged uploads, resident data in device-local memory (type 0, 16304 MiB heap) copied from host staging memory (type 2) on a queue of its own (COLI_VK_STAGED=1)
+[VK] ready: AMD Radeon RX 9060 XT (RADV GFX1200), compute qfam 0, memtype 3, fused gate+up, absorb attention, tiled GEMM from S=2 and S*O>=4096 (cooperative matrix), staged uploads, subgroups of 64
+[VK] qwen36: device ready, dense matrices on the device (default)
+[VK] qwen36: dense chain on (a discrete GPU, beside the expert tier)
+[qwen36] expert format on disk: GGUF native ggml types (the CUDA and Vulkan tiers hold the file's blocks)
+[VK] qwen36 chain fit: free 16673087488 B, reserve 1073741824 B, fixed 584283136 B (the engine's 97743872 B, the pools' 486539264 B), tail 326713600 B, layers 60967808 60967808 28593280 28593280 28593280 28593280 28593280 28593280 28593280 28593280 28593280 28593280 28593280 28593280 28593280 28593280 28593280 28593280 28593280 21515392 28593280 28593280 28593280 28593280 26233984 26233984 21515392 28593280 26233984 28593280 28593280 28593280 26233984 28593280 26233984 19156096 28593280 26233984 26233984 19156096 26233984 28593280 25250944 19156096 26233984 21515392 21515392 28593280 28593280 B, matrices 60162076 60162076 27787296 27787296 27787296 27787296 27787296 27787296 27787296 27787296 27787296 27787296 27787296 27787296 27787296 27787296 27787296 27787296 27787296 20709408 27787296 27787296 27787296 27787296 25428000 25428000 20709408 27787296 25428000 27787296 27787296 27787296 25428000 27787296 25428000 18350112 27787296 25428000 25428000 18350112 25428000 27787296 24444960 18350112 25428000 20709408 20709408 27787296 27787296 B
+[VK] qwen36 chain: 49 of 49 layers on the device (1.29 GiB), 0 on the CPU (free 15.53 GiB, reserve 1.00 GiB)
+[VK] qwen36: dense weights on the device only (a discrete GPU with room for them: 0.09 of 14.46 GiB free; COLI_VK_DENSE_HOST=1 keeps the host copy)
+[VK] qwen36 chain: 49 of 49 layers placed: 1345127960 B of matrices on the device (the fit counted 1345127960 B for these layers), chain buffers 1916288 B, device memory held 1677721600 B
+[VK] qwen36 chain: 49 layers on the device (49 attention), 0.8 MiB of parameters
+[VK] chain: 101 pipelines made before the expert tier, in 0.1 s (COLI_VK_CHAIN_PREWARM=0: at first use)
+[VK] qwen36: 47 dense matrices on the device only, 94.0 MiB of host RAM given back; kept on the host: the embedding (its rows are gathered on the CPU), the DeltaNet's a/b rows and the shared expert's gate vector, norms, the vision tower, any imported pages; RSS now 2.005 GiB
+[VK] tier qwen36: the GGUF experts' blocks go to the device as the file has them (Q5_K gate/up, Q5_K down on 16 of 49 layers, the others their own types; COLI_VK_GGUF_RAW=0: int8 per 32)
+[PREFIX] store: up to 3729 MiB of the prompts read, kept by content for any later request (blocks of 256 tokens; COLI_PREFIX_STORE=0 off)
+[USAGE] expert history: 3427428 selections (/persist/models/flint/flint.colibri/.coli_usage)
+[VK] tier qwen36: on, AMD Radeon RX 9060 XT (RADV GFX1200), budget 12.11 GiB = 6717 experts of 1.8 MiB (fmt 113, down fmt 113; 33 layers in 6 forms other than most layers', every expert in a room of its own form's size (7 sizes); 553.1 MiB left for the dense chain's KV mirror and a prompt chunk), device memory, own queue, up to 16 promotions per token, balanced against the CPU, streaming cold experts of prompt steps through 64 slots
+[VK] tier qwen36: warm start, 6717 experts in 7.4s (6717 from the history, 0 more to fill the device)
+[gateway] input modalities: text (the engine loaded no vision tower; a picture gets a 400)
+OpenAI-compatible API listening on http://127.0.0.1:18116/v1
+[api] 127.0.0.1 - "GET /v1/models HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /v1/models HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /v1/models HTTP/1.1" 200 -
+[api] 127.0.0.1 - "GET /v1/models HTTP/1.1" 200 -
+[qwen36] KV: 35 sliding-window layers keep a ring of 769 rows (window 513, 256 spare), not 1024: 0.05 GiB of their cache instead of 0.07
+[qwen36] KV cache: float16, 0.08 GiB at 1024 positions (half of float32; Q36_KV=f32 keeps float32)
+[VK] qwen36 chain: prompt chunks of up to 1536 rows (471 KiB a row; 1.58 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
+[qwen36 spec gate] turn 1: T(1) 187.9 ms, rows, rho 0.50, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 1: 1.00 tokens/forward (15 forwards per 15 tokens) | acceptance 0.0% (0/0 drafts in 0 verifies) | gate on, 0 declined, 0 probes
+[VK] qwen36: 0 matmuls on the GPU (392 matrices resident, 1594.4 MiB; placed int8 0, int4 0, f32 391)
+[VK] qwen36 chain: 16 forwards, 1684 frames (16933 ops, 6256 matmuls, 0 tiled GEMM), 282.4 ms waiting for the device, 3301.0 ms of routed experts on the host, 0 layer steps with the routed experts in the frame (0 of them a prompt chunk's, 16 in the integer form), 150.9 MiB on the device
+[VK] tier qwen36 turn: device 3148 of 5076 routed experts (62.0%; this turn 3148 of 5076) | CPU RAM hits 630, disk loads 1298 | resident 6717 (budget 6717, 11.98 GiB of 12.11 GiB, 48 blocks, frag 0.83) | uploads 6741 (12.03 GiB, 6717 warm), evictions 24, skipped 0 queue + 0 rate, failed 0 | device 101.9 ms, CPU share 3244.5 ms, waited 11.0 ms (89% of device time hidden) | balance: device share 1.00, 0 rows handed to the CPU | exclusive: 0 RAM copies of device experts given up first
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[VK] qwen36 chain: the KV mirror grows from 2048 to 7168 positions (87.4 MiB more, 0.0 MiB of them from the expert tier)
+[VK] tier qwen36: 47 of 64 streaming slots
+[VK] tier qwen36 stream: a step of 1536 rows; cold experts with 16 rows or more go to the device (the GEMM's 16 rows: the upload and the CPU's rows not measured yet); layer 2: 156 resident, 13 streamed (0 of them copied from the host pool), 64 kept on the CPU (182 rows)
+[VK] tier qwen36 stream: a step of 1536 rows; cold experts with 16 rows or more go to the device (an upload of 1.8 MiB at 2.4 GB/s takes 0.789 ms, the CPU 0.6474 ms a row; the GEMM from 16 rows); layer 2: 150 resident, 6 streamed (0 of them copied from the host pool), 3 kept on the CPU (33 rows)
+[VK] tier qwen36 stream: a step of 1536 rows; cold experts with 16 rows or more go to the device (an upload of 1.8 MiB at 1.9 GB/s takes 1.004 ms, the CPU 0.3793 ms a row; the GEMM from 16 rows); layer 2: 152 resident, 5 streamed (0 of them copied from the host pool), 0 kept on the CPU (0 rows)
+[VK] tier qwen36 stream: a step of 1291 rows; cold experts with 16 rows or more go to the device (an upload of 1.8 MiB at 1.3 GB/s takes 1.458 ms, the CPU 0.3812 ms a row; the GEMM from 16 rows); layer 2: 160 resident, 3 streamed (0 of them copied from the host pool), 18 kept on the CPU (29 rows)
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[qwen36 spec gate] turn 2: T(1) 131.0 ms, rows, rho 0.50, acceptance by position 0.50 0.50 0.50 0.50 0.50
+[qwen36 lookup] turn 2: 1.00 tokens/forward (3 forwards per 3 tokens) | acceptance 0.0% (0/0 drafts in 0 verifies) | gate on, 0 declined, 0 probes
+[VK] qwen36: 0 matmuls on the GPU (392 matrices resident, 1594.4 MiB; placed int8 0, int4 0, f32 391)
+[VK] qwen36 chain: 20 forwards, 2407 frames (25194 ops, 8990 matmuls, 1560 tiled GEMM), 1378.0 ms waiting for the device, 31149.2 ms of routed experts on the host, 0 layer steps with the routed experts in the frame (0 of them a prompt chunk's, 16 in the integer form), 878.9 MiB on the device
+[VK] tier qwen36 turn: device 1628585 of 1669440 routed experts (97.6%; this turn 1625437 of 1664364) | CPU RAM hits 35357, disk loads 8562 | resident 6717 (budget 6717, 12.07 GiB of 12.11 GiB, 49 blocks, frag 0.98) | uploads 7384 (13.19 GiB, 6717 warm), evictions 667, skipped 0 queue + 0 rate, failed 0 | device 3660.3 ms, CPU share 25467.9 ms, waited 1965.6 ms (46% of device time hidden) | balance: device share 0.86, 0 rows handed to the CPU | exclusive: 180 RAM copies of device experts given up first | stream: 188 steps, 1373 cold experts (5.43 GiB, 1.49 GB/s) and 34444 rows streamed in 524 sub-batches, prefetched 2222 (531 used), 8654 cold experts (38588 rows) kept on the CPU, 5 steps summed on the device
+[VK] tier qwen36 stream: a step of 21 rows; cold experts with 16 rows or more go to the device (an upload of 1.8 MiB at 1.0 GB/s takes 1.838 ms, the CPU 0.5358 ms a row; the GEMM from 16 rows); layer 2: 68 resident, 0 streamed (0 of them copied from the host pool), 16 kept on the CPU (22 rows)
+[qwen36 spec gate] turn 3: T(1) 61.7 ms, rows 2:1.54 3:2.23 4:2.94, rho 0.33, acceptance by position 0.47 0.75 0.33 0.50 0.50
+[qwen36 lookup] turn 3: 1.09 tokens/forward (117 forwards per 127 tokens) | acceptance 45.5% (10/22 drafts in 17 verifies) | gate on, 12 declined, 4 probes
+[VK] qwen36: 0 matmuls on the GPU (392 matrices resident, 1594.4 MiB; placed int8 0, int4 0, f32 391)
+[VK] qwen36 chain: 138 forwards, 13856 frames (150123 ops, 55128 matmuls, 1950 tiled GEMM), 3043.5 ms waiting for the device, 39414.7 ms of routed experts on the host, 0 layer steps with the routed experts in the frame (0 of them a prompt chunk's, 16 in the integer form), 880.9 MiB on the device
+[VK] tier qwen36 turn: device 1659108 of 1714560 routed experts (96.8%; this turn 30523 of 45120) | CPU RAM hits 47608, disk loads 10908 | resident 6704 (budget 6717, 12.03 GiB of 12.11 GiB, 49 blocks, frag 0.99) | uploads 7837 (13.99 GiB, 6717 warm), evictions 1133, skipped 0 queue + 0 rate, failed 0 | device 4456.9 ms, CPU share 33368.3 ms, waited 2091.8 ms (53% of device time hidden) | balance: device share 1.00, 0 rows handed to the CPU | exclusive: 775 RAM copies of device experts given up first | stream: 235 steps, 1373 cold experts (5.43 GiB, 1.49 GB/s) and 34444 rows streamed in 571 sub-batches, prefetched 2222 (531 used), 9801 cold experts (40337 rows) kept on the CPU, 5 steps summed on the device
+[api] 127.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 -
+[PREFIX] store: 3 lookups, 0 from the store (0 prompt tokens not read again); 214.0 MiB in 23 blocks and 1 checkpoints, 0 evicted
+[VK] memory at exit: weights 1594.4 MiB, expert tier 12389.6 MiB (peaks), KV mirror 0.0 MiB in memory type 0 (device-local, not host-visible); the dense chain's state in type 0 (device-local); 21594.8 MiB staged in 66196 copies (8663 submits), 21594.8 MiB of them straight from host memory in 65804 copies (0 not imported), 56 blocks zero-filled; resident data in host memory: 0.0 MiB
+[VK] qwen36: dense weights at exit: 47 matrices on the device only (94.0 MiB of host copies dropped), 0 read back from disk for the CPU (0.0 MiB); RSS 5.508 GiB

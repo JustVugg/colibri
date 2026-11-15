@@ -6,6 +6,10 @@
  *   - an integrated GPU without such a heap, a discrete GPU with and without Resizable BAR
  *     and a CPU device get the types chosen for a discrete GPU;
  *   - an allocation of system memory is retried in a device-local type on an integrated GPU only;
+ *   - a type is chosen among those the buffers take: on the table of an Arc Pro B60 (Mesa ANV),
+ *     whose first device-local type is for images alone, the GPU-only type is the next one, and
+ *     a buffer asked for a type it does not take gets the first it takes with its properties,
+ *     in that type's heap first;
  *   - the size, budget and room of the device memory count every heap of an integrated GPU and
  *     the device-local heaps of the others.
  *
@@ -36,15 +40,21 @@ static VkPhysicalDeviceMemoryProperties table(const Heap *h, uint32_t nh, const 
     return m;
 }
 
-/* The types picked for the three uses, in the order of the enum. */
-static void expect(const char *name, const VkPhysicalDeviceMemoryProperties *m, int integrated, int gpu_only,
-                   int cpu_writes, int cpu_reads) {
+/* The types picked for the three uses, in the order of the enum, among the types the buffers
+ * take (`take`, their memoryTypeBits). */
+static void expect_in(const char *name, const VkPhysicalDeviceMemoryProperties *m, int integrated, uint32_t take,
+                      int gpu_only, int cpu_writes, int cpu_reads) {
     const int want[] = {gpu_only, cpu_writes, cpu_reads};
     const char *use[] = {"GPU only", "CPU writes", "CPU reads"};
     for (int u = COLI_VK_MEM_GPU_ONLY; u <= COLI_VK_MEM_CPU_READS; u++) {
-        const int got = vk_pick_memtype(m, integrated, (ColiVkMemUse)u);
+        const int got = vk_pick_memtype(m, take, integrated, (ColiVkMemUse)u);
         CHECK(got == want[u], "%s, %s: type %d, expected %d", name, use[u], got, want[u]);
     }
+}
+/* the same where the buffers take every type */
+static void expect(const char *name, const VkPhysicalDeviceMemoryProperties *m, int integrated, int gpu_only,
+                   int cpu_writes, int cpu_reads) {
+    expect_in(name, m, integrated, ~0u, gpu_only, cpu_writes, cpu_reads);
 }
 
 int main(void) {
@@ -107,6 +117,44 @@ int main(void) {
     const VkPhysicalDeviceMemoryProperties big = table(big_h, 2, apu_t, 6);
     expect("integrated, large device-local heap", &big, 1, 3, 1, 3);
 
+    /* An Arc Pro B60 (Battlemage) under Mesa ANV 26.0.8, its heaps as the driver reports them:
+     * type 0 is the CCS-only (compressed) device-local type, which ANV keeps for images unless
+     * the driconf anv_enable_buffer_comp is on, and types 4 to 6 repeat 1 to 3. Its buffers'
+     * memoryTypeBits leave type 0 out: the GPU-only type is type 1, where it was type 0 (the
+     * dense chain's buffers refused it, and the chain stayed off). On the card (an SR-IOV VF)
+     * the backend's probe buffer takes types 1 to 3 ("they take types 0xe"), not 0 or 4 to 6;
+     * 0x7e gives the same choice. */
+    const Heap xe2_h[] = {{25490882560ull, LOCAL_HEAP}, {199211848704ull, 0}};
+    const Type xe2_t[] = {{DL, 0}, {DL, 0}, {HV | COH | CACHED, 1}, {DL | HV | COH, 0},
+                          {DL, 0}, {HV | COH | CACHED, 1}, {DL | HV | COH, 0}};
+    const VkPhysicalDeviceMemoryProperties xe2 = table(xe2_h, 2, xe2_t, 7);
+    expect_in("Xe2, buffers take every type but 0", &xe2, 0, 0x7e, 1, 3, 2);
+    expect_in("Xe2, buffers take types 1 to 3", &xe2, 0, 0x0e, 1, 3, 2);
+    /* anv_enable_buffer_comp=true: type 0 takes buffers, and the choice is the one before */
+    expect_in("Xe2 with anv_enable_buffer_comp", &xe2, 0, 0x7f, 0, 3, 2);
+    expect("Xe2 from the properties alone", &xe2, 0, 0, 3, 2);
+
+    /* where every type takes buffers, their bits change nothing (the other tables above) */
+    expect_in("APU, integrated, every type's bit", &apu, 1, 0x3f, 3, 1, 3);
+    expect_in("discrete with Resizable BAR, every type's bit", &bar, 0, 0x0f, 0, 1, 3);
+    expect_in("discrete without Resizable BAR, every type's bit", &win, 0, 0x0f, 0, 2, 3);
+    /* an integrated GPU whose buffers refuse its cached system type (3): every use falls to the
+     * write-combined one */
+    expect_in("APU, buffers refuse the cached system type", &apu, 1, 0x37, 1, 1, 1);
+
+    /* a buffer asked for a type it does not take: that type where it takes it, else the first
+     * it takes with every property of it (in that type's heap first), else none */
+    CHECK(vk_allowed_memtype(&xe2, 0x7e, 0) == 1, "Xe2: type 0 refused, type 1 instead (device-local as well)");
+    CHECK(vk_allowed_memtype(&xe2, 0x7f, 0) == 0 && vk_allowed_memtype(&xe2, 0x7e, 3) == 3 &&
+          vk_allowed_memtype(&xe2, 0x7e, 2) == 2, "a type the buffer takes stays");
+    CHECK(vk_allowed_memtype(&xe2, 0x08, 0) == 3, "device-local asked, only a host-visible device-local type taken: that one");
+    CHECK(vk_allowed_memtype(&xe2, 0x03, 3) == -1, "host-visible asked, no host-visible type taken: none");
+    CHECK(vk_allowed_memtype(&xe2, 0x7e, 7) == -1, "a type past the table: none");
+    CHECK(vk_allowed_memtype(&apu, 0x38, 1) == 3 && vk_allowed_memtype(&apu, 0x30, 1) == -1,
+          "an AMD-specific type is never the stand-in for a plain one");
+    CHECK(vk_allowed_memtype(&win, 0x0c, 1) == 3, "no Resizable BAR, system memory asked: the other system type, not the window");
+    CHECK(vk_allowed_memtype(&win, 0x0e, 0) == 2, "no Resizable BAR, device-local asked, none left in its heap: the window");
+
     /* the device memory */
     CHECK(vk_heap_is_device_memory(&apu, 1, 0) && vk_heap_is_device_memory(&apu, 1, 1),
           "every heap of an integrated GPU is device memory");
@@ -116,13 +164,15 @@ int main(void) {
     CHECK(vk_device_memory_size(&apu, 0) == 69 * GIB, "another GPU: the device-local heap");
     CHECK(vk_device_memory_size(&win, 0) == 8 * GIB, "another GPU: the largest device-local heap");
 
-    /* the retry of an allocation that is out of memory: system memory types only, integrated only */
-    CHECK(vk_retry_memtype(&apu, 1, 1) == 2 && vk_retry_memtype(&apu, 1, 3) == 2 &&
-          vk_retry_memtype(&big, 1, 1) == 2, "system memory retries in the device-local host-visible type");
-    CHECK(vk_retry_memtype(&apu, 1, 0) == -1 && vk_retry_memtype(&apu, 1, 2) == -1,
+    /* the retry of an allocation that is out of memory: system memory types only, integrated only,
+     * among the types the buffers take */
+    CHECK(vk_retry_memtype(&apu, ~0u, 1, 1) == 2 && vk_retry_memtype(&apu, ~0u, 1, 3) == 2 &&
+          vk_retry_memtype(&big, ~0u, 1, 1) == 2, "system memory retries in the device-local host-visible type");
+    CHECK(vk_retry_memtype(&apu, ~0u, 1, 0) == -1 && vk_retry_memtype(&apu, ~0u, 1, 2) == -1,
           "a device-local type has no retry");
-    CHECK(vk_retry_memtype(&apu, 0, 1) == -1, "another GPU has no retry");
-    CHECK(vk_retry_memtype(&uncached_only, 1, 1) == -1, "no host-visible device-local type to retry in");
+    CHECK(vk_retry_memtype(&apu, ~0u, 0, 1) == -1, "another GPU has no retry");
+    CHECK(vk_retry_memtype(&uncached_only, ~0u, 1, 1) == -1, "no host-visible device-local type to retry in");
+    CHECK(vk_retry_memtype(&apu, 0x1b, 1, 1) == -1, "no host-visible device-local type the buffers take: no retry");
 
     /* budget and room: the usage of the system heap exceeds the budget reported for it, as on
      * RADV once a tier is larger than the heap, and the device-local heap has room. */

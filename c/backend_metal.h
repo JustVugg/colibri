@@ -327,6 +327,25 @@ ColiMetalMoeHandle* coli_metal_moe_block_begin(int nb, int D, int Iinter, int fm
                          const int *rows, const float *rw);
 int coli_metal_moe_block_end(ColiMetalMoeHandle *h, float *out);
 
+/* The same blocks with the activation and the formats named: act 0 SwiGLU, 1 GLM-5.3's
+ * clamped one (a0 the limit), 2 Inkling-2's softcap(g, a0) * sigmoid(g) * softcap(u, a1);
+ * fmt as above, or 9 = int4 g64 planar (expert_ffn.h: per 64-block, byte k holds element k
+ * low and k+32 high as v+8; scales [O][I/64]; D and Iinter multiples of 64, qgs ignored).
+ * Inkling-2's path (INK2_METAL=1) is the only caller of act 2 and fmt 9, and it has not been
+ * measured on a Mac yet. */
+int coli_metal_moe_block_act(int nb, int D, int Iinter, int fmt, int qgs,
+                         int act, float a0, float a1,
+                         const void *const *g, const void *const *u, const void *const *d,
+                         const float *const *gs, const float *const *us, const float *const *ds,
+                         const float *xg, const int *xoff, const int *nr,
+                         const int *rows, const float *rw, float *out);
+ColiMetalMoeHandle* coli_metal_moe_block_begin_act(int nb, int D, int Iinter, int fmt, int qgs,
+                         int act, float a0, float a1,
+                         const void *const *g, const void *const *u, const void *const *d,
+                         const float *const *gs, const float *const *us, const float *const *ds,
+                         const float *xg, const int *xoff, const int *nr,
+                         const int *rows, const float *rw);
+
 /*
  * KDA state recurrence for one token (decode: C=1). Replaces the serial per-head
  * sweep in kda_forward(): decay state by alpha, accumulate kS, expand by kn*vt,

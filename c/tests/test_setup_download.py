@@ -114,6 +114,7 @@ class DownloadTest(unittest.TestCase):
             self.assertEqual(Path(self.dst, *name.split("/")).read_bytes(), data)
         self.assertTrue(setup_download.is_complete(self.dst))
         self.assertEqual(events[-1]["done"], events[-1]["total"])
+        self.assertTrue(all(event["fresh"] == event["done"] for event in events))
         self.assertEqual(events[0]["file"], "README.md")        # small files first
         # A rerun fetches nothing.
         before = len(self.hub.requests)
@@ -206,8 +207,12 @@ class DownloadTest(unittest.TestCase):
         os.makedirs(self.dst, exist_ok=True)
         Path(dest + ".part").write_bytes(self.files[name][:70_000])
         self.hub.ignore_range = True
-        setup_download.download_file(self.url(name), dest, self.spec(name), retries=0)
+        seen = []
+        setup_download.download_file(self.url(name), dest, self.spec(name), retries=0,
+                                     progress=lambda have, size, fresh: seen.append(fresh))
         self.assertEqual(Path(dest).read_bytes(), self.files[name])
+        # The prefix was discarded, so the whole file counts as received this call.
+        self.assertEqual(seen[-1], len(self.files[name]))
 
     def test_corrupt_partial_is_removed_not_kept(self):
         name = "model-00000.safetensors"
@@ -239,6 +244,35 @@ class DownloadTest(unittest.TestCase):
         cdn_side = [r for r in self.hub.requests if "/cdn/" in r["path"]]
         self.assertEqual(hub_side[-1]["headers"].get("Authorization"), "Bearer hf_secret")
         self.assertIsNone(cdn_side[-1]["headers"].get("Authorization"))
+
+    def test_resume_progress_counts_only_bytes_fetched_this_run(self):
+        # The partial shard sorts before the larger one that is already whole.
+        # fresh must follow the partial, not jump when that later shard is checked.
+        readme, partial, whole = "README.md", "model-00001.safetensors", "model-00000.safetensors"
+        prefix = 50_000
+        os.makedirs(self.dst)
+        Path(self.dst, readme).write_bytes(self.files[readme])
+        Path(self.dst, whole).write_bytes(self.files[whole])
+        Path(self.dst, partial + ".part").write_bytes(self.files[partial][:prefix])
+        files = self.listing(include=(readme, partial, whole))
+        events = []
+        setup_download.download_repo(REPO, "main", self.dst, files, base=self.hub.base,
+                                     progress=events.append)
+        new_bytes = len(self.files[partial]) - prefix
+        for event in events:
+            if event["file"] == readme:
+                self.assertEqual((event["fresh"], event["done"]), (0, len(self.files[readme])))
+            elif event["file"] == partial:
+                self.assertEqual(event["fresh"], event["file_done"] - prefix)
+                self.assertEqual(event["done"], len(self.files[readme]) + event["file_done"])
+            else:
+                self.assertEqual(event["file"], whole)
+                self.assertEqual(event["fresh"], new_bytes)
+                self.assertEqual(event["done"], len(self.files[readme]) + len(self.files[partial])
+                                 + event["file_done"])
+        self.assertEqual(events[-1]["done"], events[-1]["total"])
+        self.assertEqual(events[-1]["fresh"], new_bytes)
+        self.assertEqual(Path(self.dst, partial).read_bytes(), self.files[partial])
 
     def test_bytes_present_counts_partials(self):
         files = self.listing()
@@ -431,7 +465,7 @@ class DownloadTest(unittest.TestCase):
         with mock.patch.object(setup_download, "wsl_windows_path", side_effect=lambda p: p):
             result = setup_download.download_file_windows(
                 self.url(name), dest, self.spec(name), fake_curl,
-                progress=lambda done, total: seen.append((done, total)))
+                progress=lambda done, total, fresh=0: seen.append((done, total)))
         self.assertEqual(result, "downloaded")
         self.assertEqual(Path(dest).read_bytes(), self.files[name])
         self.assertEqual(seen[-1], (300_000, 300_000))

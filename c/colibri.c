@@ -80,6 +80,7 @@
 #include "lora.h"                                 /* ADAPTER=<dir>: LoRA residual on frozen base */
 #include "schema_gbnf.h"                          /* SCHEMA=: JSON-Schema -> GBNF for method F */
 #include "decode_batch.h"
+#include "serve_codec.h"
 #include "pin_pool.h"   /* piu scatti annidati dello stato */
 #include "park.h"       /* a short request keeps the one slot's conversation aside (COLI_PARK) */
 #include "prompt_break.h"   /* a served prompt that a STOP or CANCEL stops between two layers */
@@ -110,6 +111,7 @@ static inline void omp_set_num_threads(int n){ (void)n; }
 #include "edge_adapters.h"
 #include "edge_tok_internal.h"
 #endif
+#include "coli_env.h"
 #ifdef COLI_CUDA
 #include "backend_cuda.h"
 #endif
@@ -775,7 +777,9 @@ static int g_cuda_expert_auto;
 static int g_cuda_dense;
 static int g_cuda_release_host;
 static double g_cuda_reserve_gb;   /* CUDA_RESERVE_GB: VRAM headroom kept free of expert tier (default 2 GB) */
+#ifdef COLI_ANS   /* read and set only under COLI_ANS: unguarded, a CUDA build warns -Wunused-variable */
 static int g_cuda_raw_experts=-1;   /* experimental ANS tier: keep this global hot prefix raw */
+#endif
 static int g_cuda_devices[COLI_CUDA_MAX_DEVICES], g_cuda_ndev, g_cuda_rr;
 static int64_t g_cuda_dense_projected[COLI_CUDA_MAX_DEVICES];
 static void qt_cuda_reset(QT *t){
@@ -1268,13 +1272,17 @@ static int planar_on(void){
     if(g_planar<0){
 #if defined(COLI_CUDA)||defined(COLI_METAL)||defined(COLI_VULKAN)
         g_planar=0;
-#elif !defined(__AVX2__)
+#elif !defined(__AVX2__) && !defined(__SSSE3__)
         g_planar=0;   /* matmul_i4p non ha (ancora) un ramo NEON: su ARM il path
                        * f32 planare degraderebbe a scalare E cambierebbe l'ordine
                        * di accumulo rispetto al gemello NEON a coppie — il claim
                        * bit-identico vale solo dove i gemelli esistono entrambi.
                        * EN: no NEON arm in matmul_i4p yet — planar stays off on
-                       * non-AVX2 builds until one lands with matching order. */
+                       * ARM and pre-SSSE3 builds until one lands with matching order.
+                       * An SSSE3 build without AVX2 (Sandy/Ivy Bridge) has the K1b
+                       * integer dot (dot_i4p_u's SSSE3 arm: integer sums, exact at any
+                       * width) and planarizes fmt=4 under IDOT_GS=1; its fmt=2 keeps the
+                       * pair layout (qt_planarize), as matmul_i4p's f32 arm is AVX2's. */
 #else
         const char *e=getenv("PLANAR"); g_planar=!(e&&*e=='0');
         const char *xe=getenv("XEXP"); if(xe&&*xe=='1') g_planar=0;
@@ -1300,6 +1308,11 @@ static void qt_planarize(QT *t){
         planarize_i4(t->q4,t->O,t->I); t->planar=1; return;
     }
     if(t->fmt!=2) return;
+#if !defined(__AVX2__)
+    /* fmt=2's planar arm is matmul_i4p's f32 one, AVX2's: an SSSE3 build keeps the pairs.
+     * EN: planar_on() is on there for fmt=4's integer K1b only. */
+    return;
+#endif
 #if defined(__AVX512F__)&&defined(__AVX512BW__)
     /* fmt=2 stays a coppie qui: il gemello f32 planare replica l'ordine di
      * accumulo AVX2, non quello del ramo dot_i4f_avx512 a 512 bit — il claim
@@ -1413,8 +1426,10 @@ static void qt_kvb_absorb(const QT *w, int h, const float *q_nope, float *q_lat)
     qt_ggml_rows_f32(&w->kvb->kb,h*w->kvb->L,w->kvb->L,q_nope,q_lat);
 }
 static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot){
-#if defined(COLI_CUDA) && defined(COLI_VULKAN)
-    /* a GGUF's resident dense matrix on the CUDA tier's device, once it took it (cu_dense.h) */
+#ifdef COLI_CUDA
+    /* a GGUF's resident dense matrix on the CUDA tier's device, once it took it (cu_dense.h): a
+     * CUDA build's too, which reserved the budget for it (colibri_cu_tier_start) and ran it on
+     * the CPU */
     if(w->fmt==QT_GGML && w->cud_dense && xt_cuda() &&
        cud_mm((void **)&w->cuda,&w->cud_no,y,x,S,100+w->gt,w->q4,NULL,w->O,w->I,0)) return;
 #endif
@@ -2570,6 +2585,27 @@ static int qt_load_mmap(Model *m, const char *name, int O, int I, QT *t){
  * its bytes in what cud_open is asked for */
 static void qt_cud_mark(QT *t){ if(t->fmt==QT_GGML){ t->cud_dense=1; g_cud_dense_bytes+=(size_t)qt_bytes(t); } }
 #endif
+/* layers a and b of a GGUF hold the same DSA indexer, its key projection, head weights and key
+ * norm byte for byte (a GGUF only: a checkpoint's are its own) */
+static int dsa_same_indexer(Model *m, int a, int b){
+    static const char *const part[3]={"wk.weight","weights_proj.weight","k_norm.weight"};
+    for(int k=0;k<3;k++){
+        char na[300], nb[300];
+        snprintf(na,sizeof na,"model.layers.%d.self_attn.indexer.%s",a,part[k]);
+        snprintf(nb,sizeof nb,"model.layers.%d.self_attn.indexer.%s",b,part[k]);
+        st_tensor *ta=st_find(&m->S,na), *tb=st_find(&m->S,nb);
+        if(!ta || !tb || ta->dtype!=tb->dtype || ta->nbytes!=tb->nbytes || ta->nbytes<1) return 0;
+        if(k==0 && !st_is_ggml(ta->dtype)) return 0;
+        if(ta->fd==tb->fd && ta->off==tb->off) continue;
+        char *x=malloc((size_t)ta->nbytes), *y=malloc((size_t)tb->nbytes);
+        if(!x || !y){ free(x); free(y); return 0; }
+        st_pread_full(ta->fd,x,ta->nbytes,ta->off,na); st_pread_full(tb->fd,y,tb->nbytes,tb->off,nb);
+        const int same=!memcmp(x,y,(size_t)ta->nbytes);
+        free(x); free(y);
+        if(!same) return 0;
+    }
+    return 1;
+}
 static QT qt_load(Model *m, const char *name, int O, int I, int bits){
     QT t; memset(&t,0,sizeof(t)); qt_from_disk(m,name,O,I,bits,0,&t);
 #ifdef COLI_VULKAN
@@ -2861,6 +2897,10 @@ static void model_init_range(Model *m, const char *snap, int cap,
     int io_bits = dbits>=8 ? 16 : dbits;
     if(load_boundaries){
         m->embed   = qt_load(m,"model.embed_tokens.weight", c->vocab, D, io_bits);
+#ifdef COLI_CUDA
+        /* the embedding is read a row at a time, never multiplied: no device copy, none of cud_open's ask */
+        if(m->embed.cud_dense){ m->embed.cud_dense=0; g_cud_dense_bytes-=(size_t)qt_bytes(&m->embed); }
+#endif
         m->lm_head = qt_load(m,"lm_head.weight", c->vocab, D, io_bits);
         m->final_norm = ld(m,"model.norm.weight");
     }
@@ -3046,6 +3086,18 @@ static void model_init_range(Model *m, const char *snap, int cap,
             if(!st_has(&m->S,inm)) m->has_dsa=0;
         }
         if(getenv("DSA") && atoi(getenv("DSA"))==0) m->has_dsa=0;
+        /* unsloth's GLM-5.3 GGUFs hold a shared indexer layer's weights as a copy of the full
+         * layer's it reuses (the model's config.json: indexer_types, index_topk_freq), and a
+         * folder imported before tools/gguf_import.py told the two apart reads every layer as
+         * full: each would select again from its own rows where the model reuses the full
+         * layer's selection. A layer whose indexer is the layer before's byte for byte reuses
+         * its selection, as the model has it. */
+        if(m->has_dsa && !c->ml4){
+            int dup=0;
+            for(int i=layer_begin+1;i<layer_end;i++) if(c->idx_type[i] && dsa_same_indexer(m,i-1,i)){ c->idx_type[i]=0; dup++; }
+            if(dup) fprintf(stderr,"[DSA] %d layers hold the indexer of the layer before as a copy: they reuse its selection, "
+                                   "as the model's indexer_types has them\n",dup);
+        }
         if(m->has_dsa){
             m->ix_wq=calloc(c->n_layers,sizeof(QT)); m->ix_wk=calloc(c->n_layers,sizeof(QT));
             m->ix_wp=calloc(c->n_layers,sizeof(QT));
@@ -3211,7 +3263,15 @@ static void *map_of_fd(int fd){
 #endif
         }
     }
+#elif defined(_WIN32)
+    /* the whole shard as one read-only view, kept for the life of the process like the mmap above */
+    struct stat st; compat_ro_map wm; const void *wp;
+    if(g_nmaps<512 && fstat(fd,&st)==0 && compat_map_readonly(fd,0,(size_t)st.st_size,&wm,&wp)==0){
+        base=(void*)wp; g_maps[g_nmaps].fd=fd; g_maps[g_nmaps].base=base; g_maps[g_nmaps].len=wm.len; g_nmaps++;
+    }
 #endif
+    if(!base){ static int warned;      /* under g_map_mtx: one line per process */
+        if(!warned){ warned=1; fprintf(stderr,"[MMAP] a model shard could not be mapped: TRUNK_RESIDENT_LAYERS / COLI_MMAP read its weights into RAM instead\n"); } }
     pthread_mutex_unlock(&g_map_mtx);
     return base;
 }
@@ -5267,6 +5327,9 @@ static void kv_lc_rows_f32(Model *m, int layer, int64_t t0, int64_t n, float *ds
 #ifdef COLI_VULKAN
 static void glmc_cpu_rows(Model *m, int layer, KVState *const *kvs, const int *positions, int pos_base, int S);
 #endif
+#ifdef COLI_CUDA
+static void glmu_cpu_rows(Model *m, int layer, KVState *const *kvs, const int *positions, int pos_base, int S);
+#endif
 /* Mistral-Large-4's attention (model_type mistral_large4), on the CPU: GLM-5.2's MLA without the
  * query LoRA (q_proj straight from the input), the layer's own key width (a NoPE layer's whole
  * key unrotated, no rotary cache row), the queries times SSMax (s * log(pos + 1) + b per head)
@@ -5424,6 +5487,9 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
     double ta0=now_s();
 #ifdef COLI_VULKAN
     glmc_cpu_rows(m,layer,kvs,positions,pos_base,S);   /* the dense chain's KV mirror: these rows change here */
+#endif
+#ifdef COLI_CUDA
+    glmu_cpu_rows(m,layer,kvs,positions,pos_base,S);   /* the CUDA chain's too */
 #endif
 #ifdef COLI_METAL
     /* Fused decode attention on GPU: whole layer in one command buffer (keeps the GPU hot).
@@ -8536,11 +8602,25 @@ static void glm_dho_drop_layer(Model *m, int i);
 static void glm_dho_finish(Model *m);
 #include "glm_chain.h"   /* COLI_VK_CHAIN: every layer's dense chain on the device */
 #endif
+#ifdef COLI_CUDA
+#include "colibri_cuchain.h"   /* COLI_CUDA_CHAIN: a GGUF's every layer on the CUDA chain */
+#endif
 static void layers_forward_rows_range(Model *m, float *x, int S, int pos_base,
                                       KVState *const *kvs,
                                       const int *positions,
                                       int layer_begin, int layer_end){
     Cfg *c=&m->c; int D=c->hidden;
+#ifdef COLI_CUDA
+    /* a GGUF on the CUDA device: the whole forward on the CUDA chain (colibri_cuchain.h), for the
+     * bound KV state's rows (a single-slot serve's decode batch of one row included); 0: the CPU
+     * path below, as before */
+    if(layer_begin==0 && layer_end==c->n_layers && glmu_wanted(m)){
+        int done=0;
+        if(!kvs && !positions) done=glmu_forward(m,x,S,pos_base);
+        else if(kvs && S==1 && kvs[0]==m->kv) done=glmu_forward(m,x,1,positions?positions[0]:pos_base);
+        if(done>=c->n_layers) return;
+    }
+#endif
 #ifdef COLI_VULKAN
     /* the whole forward on the device (glm_chain.h); 0: the CPU path below, as before.
      * A decode batch of one row of the bound KV state (a single-slot serve) is a step
@@ -8671,6 +8751,9 @@ static void kv_alloc(Model *m, int max_t){
     }
     glmc_kv_reset(m);                                    /* the dense chain's mirror too */
 #endif
+#ifdef COLI_CUDA
+    glmu_kv_reset(m);                                    /* the CUDA chain's */
+#endif
     if(k->Lc){ for(int i=0;i<c->n_layers+1;i++){
 #ifdef COLI_METAL
         if(g_metal_enabled){ coli_metal_unregister(k->Lc[i]); coli_metal_unregister(k->Rc[i]); }
@@ -8774,7 +8857,7 @@ static int mlv_vk_mm(MvMat *w, float *y, const float *x, int S){
     return ok;
 }
 #endif
-static struct { float *patches; unsigned long long bytes; int gh, gw, present; } g_mlv_pending;
+static struct { float *patches; unsigned long long bytes, id; int gh, gw, present; } g_mlv_pending;   /* id: its IMAGE frame's */
 static float *g_vis_rows; static int *g_vis_map, g_vis_map_len;
 static void vis_apply(Model *m, float *x, int S, int pos_base){
     if(!g_vis_map) return;
@@ -11162,14 +11245,15 @@ static int logprob_tail(char *dst, size_t cap, const float *lo, int V, int token
  * paired with requests that never opt in, so it never sees the extended form. */
 static void mux_data(Tok *T, unsigned long long id, int token,
                      const float *lo, int V, int topk){
-    char out[256]; int n=tok_decode(T,&token,1,out,sizeof(out));
+    char out[256], request_id[32], tail[1024];
+    int n=tok_decode(T,&token,1,out,sizeof(out));
+    snprintf(request_id,sizeof(request_id),"%llu",id);
+    const char *numeric=NULL;
     if(topk>0 && lo){
-        char tail[1024]; logprob_tail(tail,sizeof(tail),lo,V,token,topk);
-        printf("DATA %llu %d%s\n",id,n,tail);
-    } else
-        printf("DATA %llu %d\n",id,n);
-    if(n>0) fwrite(out,1,(size_t)n,stdout); putchar('\n');
-    fflush(stdout);
+        logprob_tail(tail,sizeof(tail),lo,V,token,topk);
+        numeric=tail;
+    }
+    coli_serve_write_data_lp(stdout,request_id,out,(size_t)n,numeric);
 }
 
 /* Echoed-prompt read-out frame (U7a, opt-in only): "ECHO <id> <n> <pos> <lp>
@@ -11179,11 +11263,11 @@ static void mux_data(Tok *T, unsigned long long id, int token,
  * the request set SUBMIT logprobs=k, so an old server can never receive one. */
 static void mux_echo(Tok *T, unsigned long long id, int pos, int token,
                      const float *lo, int V, int topk){
-    char out[256]; int n=tok_decode(T,&token,1,out,sizeof(out));
-    char tail[1024]; logprob_tail(tail,sizeof(tail),lo,V,token,topk);
-    printf("ECHO %llu %d %d%s\n",id,n,pos,tail);
-    if(n>0) fwrite(out,1,(size_t)n,stdout); putchar('\n');
-    fflush(stdout);
+    char out[256], request_id[32], tail[1024];
+    int n=tok_decode(T,&token,1,out,sizeof(out));
+    snprintf(request_id,sizeof(request_id),"%llu",id);
+    logprob_tail(tail,sizeof(tail),lo,V,token,topk);
+    coli_serve_write_echo_lp(stdout,request_id,out,(size_t)n,pos,tail);
 }
 
 /* Opt-in prefill read-out (U7a, SUBMIT logprobs=k): one full-prompt forward
@@ -11399,10 +11483,10 @@ static void coli_kv_share_adopt_rows(Cfg *cc, KVState *sc, KVState *dn,
  * slot's from there on; the conversation's next turn then read it all again (minutes on the
  * largest models). The slot's first rows of every KV array (the latent and rope rows, the DSA
  * index keys, the coded rows and their scales, the MTP layer's), its tokens and its layers'
- * first rows go aside before the request reads its prompt; the next request finds them back,
- * and the devices' copies go up again from the host, whose rows stay the canonical ones. One
- * slot only (KV_SLOTS=1), never under a cluster (its workers hold their layers' rows), a
- * picture or a read-out. */
+ * first rows go aside before the request reads its prompt; the next request brings them back,
+ * keeps them parked or drops them (glm_park_decide), and the devices' copies go up again from
+ * the host, whose rows stay the canonical ones. One slot only (KV_SLOTS=1), never under a
+ * cluster (its workers hold their layers' rows), a picture or a read-out. */
 #define GLM_PARK_SPEC 16   /* the rows a speculative turn writes past the tokens that stand */
 static ColiPark g_glm_park;
 static int g_glm_park_from;   /* the request's shared prefix: the KV file's rows past it are the request's */
@@ -11450,9 +11534,21 @@ static void glm_unpark(Model *m, ServeCtx *sc, int maxctx){
         if(m->kv==&sc->kv && m->vk_kv_valid) for(int i=0;i<m->c.n_layers+1;i++) m->vk_kv_valid[i]=0;
         glmc_host_rows(m,&sc->kv,0);
 #endif
+#ifdef COLI_CUDA
+        glmu_host_rows(m,&sc->kv,0);
+#endif
         kv_disk_truncate(m,g_glm_park_from);   /* the next append writes the conversation's rows past it */
     }
     free(p);
+}
+/* the next request decides a conversation the last one parked (park.h, #2703): back, kept or
+ * dropped; a picture's request and a cluster's take the slot as they always did, so they drop it */
+static void glm_park_decide(Model *m, ServeCtx *sc, const int *ids, int nt, int max_tokens, int maxctx, int take){
+    if(!g_glm_park.on) return;
+    kv_prefix v={sc->hist,sc->len,maxctx,0};
+    int d=take ? -1 : coli_park_decide(&g_glm_park,&v,ids,nt,max_tokens,GLM_PARK_SPEC);
+    if(d>0) glm_unpark(m,sc,maxctx);
+    else if(d<0) coli_park_free(&g_glm_park);
 }
 
 /* Read and prefill one request. Returns -1 on EOF, 0 for a rejected frame and
@@ -11487,7 +11583,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
         if(g_mlv_pending.present) fprintf(stderr,"[ml4] a second picture came before its SUBMIT; the first is dropped\n");
         mlv_pending_clear();
         g_mlv_pending.patches=(float*)buf; g_mlv_pending.bytes=bytes;
-        g_mlv_pending.gh=gh; g_mlv_pending.gw=gw; g_mlv_pending.present=1;
+        g_mlv_pending.gh=gh; g_mlv_pending.gw=gw; g_mlv_pending.id=iid; g_mlv_pending.present=1;
         free(line); return 0;
     }
     if(!strncmp(line,"STOP ",5)){
@@ -11535,21 +11631,21 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
     }
     char *raw=malloc((size_t)sub.bytes+1);
     if(!raw){ fprintf(stderr,"OOM multiplex payload\n"); exit(1); }
-    if(fread(raw,1,(size_t)sub.bytes,stdin)!=(size_t)sub.bytes){ free(raw); free(line); return -1; }
     char *gtxt=NULL;                     /* optional per-request grammar/schema text */
     if(sub.gbytes){
         gtxt=malloc((size_t)sub.gbytes+1);
         if(!gtxt){ fprintf(stderr,"OOM multiplex payload\n"); exit(1); }
-        if(fread(gtxt,1,(size_t)sub.gbytes,stdin)!=(size_t)sub.gbytes){
-            free(gtxt); free(raw); free(line); return -1; }
-        gtxt[sub.gbytes]=0;
     }
-    int delim=fgetc(stdin);
-    if(delim!='\n'){
-        printf("ERROR %llu BAD_FRAME\n",sub.id); fflush(stdout);
+    ColiServeReadResult body=coli_serve_read_submit_body(
+        stdin,raw,(size_t)sub.bytes,gtxt,(size_t)sub.gbytes,1);
+    if(body!=COLI_SERVE_READ_OK){
+        if(body==COLI_SERVE_READ_BAD_FRAME){
+            printf("ERROR %llu BAD_FRAME\n",sub.id); fflush(stdout);
+        }
         free(gtxt); free(raw); free(line); return -1;
     }
     raw[sub.bytes]=0;
+    if(gtxt) gtxt[sub.gbytes]=0;
     if(sub.slot>=nctx || memchr(raw,0,(size_t)sub.bytes)){
         printf("ERROR %llu BAD_REQUEST\n",sub.id); fflush(stdout); free(gtxt); free(raw); free(line); return 0;
     }
@@ -11578,7 +11674,6 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
         }
     }
     ServeCtx *sc=&ctx[sub.slot]; kv_bind(m,&sc->kv);
-    if(nctx==1) glm_unpark(m,sc,maxctx);   /* a conversation the last request parked: back first */
     int *tmp=malloc(maxctx*sizeof(int));
     if(!tmp){ fprintf(stderr,"OOM mux_submit tmp\n"); free(raw); free(line); exit(1); }
     /* Encode with one token of headroom (maxctx-1, buffer is maxctx) purely to DETECT overflow:
@@ -11614,6 +11709,12 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
         fflush(stdout); return 0;
     }
     int vis_first=-1;   /* the prompt's first [IMG], when an IMAGE frame came before it */
+    if(g_mlv_pending.present && g_mlv_pending.id!=sub.id){
+        /* its own SUBMIT was refused before this point (CONTEXT_EXCEEDED, EMPTY_PROMPT, SLOT_BUSY, ...) */
+        fprintf(stderr,"[ml4] the picture of request %llu was not used; request %llu goes without it\n",
+                g_mlv_pending.id,sub.id);
+        mlv_pending_clear();
+    }
     if(g_mlv_pending.present){
         int bad=mlv_attach(m,T,tmp,nt,&vis_first);
         mlv_pending_clear();
@@ -11624,6 +11725,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
      * first with an ERROR, so a request yields exactly one of ACCEPT or an early ERROR -- which
      * lets a CONTEXT_EXCEEDED become a clean HTTP 400 instead of a broken already-200 stream. */
     printf("ACCEPT %llu %d\n",sub.id,nt); fflush(stdout);
+    if(nctx==1) glm_park_decide(m,sc,tmp,nt,sub.max_tokens,maxctx,vis_first>=0||g_cluster_n);   /* back, kept or dropped */
     /* Echo read-out (U7a): needs logits at EVERY prompt position, so the whole
      * prompt re-prefills from position 0 -- no cached-prefix skip and no
      * cross-slot adoption below (either would leave positions with no logits). */
@@ -11665,8 +11767,11 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
     if(vis_first>=0 && prefix>vis_first) prefix=vis_first;
     if(sc->vis_end>0 && prefix>sc->vis_end-1) prefix=sc->vis_end-1;
     if(nctx==1 && !echo && vis_first<0 && sc->vis_end==0 && !g_cluster_n && prefix<sc->len)
-        glm_park(m,sc,nt,sub.max_tokens,prefix,maxctx);   /* a short request keeps the conversation (glm_unpark) */
+        glm_park(m,sc,nt,sub.max_tokens,prefix,maxctx);   /* a short request keeps the conversation (glm_park_decide) */
     if(prefix<sc->len){ sc->len=prefix; if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
+        /* kept parked from the last request: the disk's rows past this prefix are no longer the
+         * conversation's either, so its return truncates from here */
+        if(g_glm_park.on && prefix<g_glm_park_from) g_glm_park_from=prefix;
         kv_disk_truncate(m,sc->len); }
     /* Cross-slot prefix adoption (COLI_KV_SHARE=1): if another slot's history
      * shares a longer prefix with this prompt, copy its KV rows instead of
@@ -11692,6 +11797,9 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
             coli_kv_share_adopt_rows(cc,&sc->kv,&dn->kv,sc->hist,tmp,from,n);
 #ifdef COLI_VULKAN
             glmc_host_rows(m,&sc->kv,from);   /* the dense chain's mirror of this slot, from `from` on */
+#endif
+#ifdef COLI_CUDA
+            glmu_host_rows(m,&sc->kv,from);
 #endif
             sc->len=blen;
             if(m->has_mtp) m->kv_start[cc->n_layers]=-1;   /* MTP rows are per-slot decode state */
@@ -12336,7 +12444,7 @@ static void vk_tmp_slot_free(ESlot *t,int rtq){
 }
 static Model *g_vk_model;                    /* the run's report at exit */
 #ifdef COLI_CUDA
-static void colibri_cu_report(void){ cud_report("colibri"); }
+static void colibri_cu_report(void){ cud_report("colibri"); glmu_report(); }
 #endif
 static void vk_tier_report_run(void){
     if(g_vk_model) XT(report)("run",g_vk_model->hit_pin+g_vk_model->hit_ecache,g_vk_model->miss);
@@ -12362,7 +12470,14 @@ static void colibri_cu_tier_start(Model *m){
         st_tensor *g0=st_find(&m->S,gn); gguf = g0 && st_is_ggml(g0->dtype); break; }
     if(!gguf) return;
     xt_use_cuda(1);
-    g_cl_cud=cud_open("colibri",coli_cuda_device_at(0),g_cud_dense_bytes);   /* the tier leaves it room */
+    /* the CUDA chain (colibri_cuchain.h) runs every layer on the card: every dense matrix goes
+     * there when it fits beside the chain's own bytes, as the Vulkan chain's fit has it; else
+     * cu_dense.h's rule, and the chain, without the matrices, stays off */
+    if(glmu_planned(m)){
+        int ctx=getenv("CTX")?atoi(getenv("CTX")):4096; if(ctx<1) ctx=4096;
+        g_cl_cud=cud_open_whole("colibri",coli_cuda_device_at(0),g_cud_dense_bytes,glmu_plan_bytes(m,ctx));
+    }
+    if(!g_cud.on) g_cl_cud=cud_open("colibri",coli_cuda_device_at(0),g_cud_dense_bytes);   /* the tier leaves it room */
     vk_tier_start(m);
     if(!cut_ready()){ xt_use_cuda(0); g_cud.on=0; return; }
     atexit(colibri_cu_report);
@@ -12458,6 +12573,10 @@ static void vk_tier_start(Model *m){
     double dense=0;
 #ifdef COLI_CUDA
     if(xt_cuda()) dense+=(double)g_cl_cud;   /* cu_dense.h's budget, taken before the tier's */
+    if(xt_cuda() && glmu_wanted(m)){   /* the CUDA chain's own (colibri_cuchain.h): kv_b's floats, the KV mirror, a chunk */
+        int ctx=getenv("CTX")?atoi(getenv("CTX")):4096; if(ctx<1) ctx=4096;
+        dense+=(double)glmu_plan_bytes(m,ctx);
+    }
 #endif
 #ifdef COLI_VULKAN   /* the absorb core's KV mirror, and a partial dense chain: Vulkan's */
     if(g_vk_attn){ int ctx=getenv("CTX")?atoi(getenv("CTX")):4096; if(ctx<1) ctx=4096;
@@ -13240,8 +13359,8 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
 
 static double g_mem_avail_boot=0;   /* MemAvailable all'avvio, prima di caricare il modello */
 /* RAM disponibile ADESSO (GB): e' il tetto vero, non il totale. Linux: MemAvailable
- * da /proc/meminfo. macOS: pagine free+inactive+purgeable da host_statistics64
- * (stessa semantica: recuperabili senza swap). Senza questo ramo il fallback
+ * da /proc/meminfo. macOS: pagine free+file-backed+purgeable da host_statistics64
+ * (recuperabili senza comprimere ne' swappare, compat_meminfo_gb). Senza questo ramo il fallback
  * "assumo 8 GB" castrava la cache expert proprio sulle macchine con piu' RAM. */
 static double mem_available_gb(void){
     /* Era la sola copia giusta di questa misura; glm53.c ne aveva una che
@@ -14153,10 +14272,17 @@ int main(int argc, char **argv){
 #endif
 #ifdef __FreeBSD__
         fprintf(stderr,"[OMP] hot-thread tuning: re-exec once (COLI_NO_OMP_TUNE=1 to skip)\n");
+        /* the path from the kernel (omp_tune.h): /proc/curproc/file needs procfs mounted */
+        { char self[4096]; if(coli_self_exe_path(self,sizeof(self))) execv(self, argv); }
         execv("/proc/curproc/file", argv);         /* returns only on failure -> fall through and run untuned */
         perror("[OMP] execv self-reexec failed, running untuned");
 #endif
     }
+    /* Registry check: an unknown or wrong-engine variable is silently ignored
+     * otherwise, and the run then reports a plausible number for the WRONG
+     * configuration. See coli_env.h. */
+    coli_env_check(CE_COLIBRI, "colibri");
+    coli_env_dump(CE_COLIBRI, "colibri");
     /* #718: the hot-team block above tunes wake latency but historically left
      * GLM at libgomp's logical-CPU default.  Memory-bound quantized matmuls can
      * collapse when SMT siblings share each core, measured 2.3x on a 5950X.
@@ -14182,11 +14308,11 @@ int main(int argc, char **argv){
     const char *snap=getenv("SNAP");
     if(!snap){ coli_print_launcher_help("GLM-5.2", "SNAP=<model directory> ./colibri ..."); return 1; }
 #ifdef COLI_CUDA
-    {   /* A GGUF (a gguf_import folder, its gguf.json) under CUDA kept every matrix and routed
-         * expert on the CPU (QT_GGML: the CUDA backend takes no ggml block types, see
-         * qt_cuda_upload); Vulkan's tier and chain take them. A build with both backends
-         * runs a GGUF on Vulkan, the same card, when CUDA was asked for and COLI_VULKAN was not
-         * set (qwen38.c's way); COLI_VULKAN=0 keeps CUDA. */
+    {   /* A GGUF (a gguf_import folder, its gguf.json) under CUDA: its routed experts on the
+         * CUDA tier, its dense matrices on the card (cu_dense.h) and every layer on the CUDA
+         * chain (colibri_cuchain.h), colibri_cu_tier_start's. A build with both backends runs a
+         * GGUF on Vulkan, the same card, when CUDA was asked for and COLI_VULKAN was not set
+         * (qwen38.c's way); COLI_VULKAN=0 keeps CUDA. */
         char gj[4096]; snprintf(gj,sizeof gj,"%s/gguf.json",snap);
         const char *cu=getenv("COLI_CUDA"), *vk=getenv("COLI_VULKAN");
         FILE *gf=fopen(gj,"rb");
@@ -14196,11 +14322,8 @@ int main(int argc, char **argv){
 #ifdef COLI_VULKAN
                 setenv("COLI_VULKAN","1",1); setenv("COLI_CUDA","0",1);
                 fprintf(stderr,"[gguf] this GGUF runs on Vulkan, the same card, its attention in the dense chain "
-                               "(COLI_VULKAN=0 keeps CUDA: the routed experts on the CUDA tier, the dense matrices "
-                               "on the card, the attention on the CPU)\n");
-#else
-                fprintf(stderr,"[gguf] the CUDA backend has no ggml block types: this GGUF's matrices and experts run on the CPU "
-                               "(a VK=1 build runs them on the card through Vulkan)\n");
+                               "(COLI_VULKAN=0 keeps CUDA: the routed experts on the CUDA tier, every layer on the CUDA "
+                               "chain)\n");
 #endif
             }
         }
@@ -14867,6 +14990,12 @@ int main(int argc, char **argv){
      * OMP-parallel pin warmup already streams from both drives. */
     mirror_setup(&m);
     gguf_experts_random(&m);
+    /* The expert-usage history: COLI_USAGE names it, as in the sibling engines (glm53.c,
+     * qwen36.c), default <SNAP>/.coli_usage. Resolved before PIN=auto, which seeds from it;
+     * the load, AUTOPIN and every usage_save() below use the same path (#1078). */
+    { const char *up=getenv("COLI_USAGE");
+      if(up&&*up) snprintf(g_usage_path,sizeof(g_usage_path),"%s",up);
+      else        snprintf(g_usage_path,sizeof(g_usage_path),"%s/.coli_usage",snap); }
     /* HOT-STORE: PIN=<statsfile> [PIN_GB=g] -> top expert per frequenza fissi in RAM.
      * Va PRIMA di cap_for_ram: i pinnati contano nel residente. */
     if(getenv("PIN")){
@@ -14879,14 +15008,14 @@ int main(int argc, char **argv){
              * nessuno dei due -> nessun pin (AUTOPIN piu' sotto resta escluso: PIN e' settato).
              * EN: prefer the live usage history over the frozen one-shot profile, so each
              * reload's pin placement follows the accumulated real workload. */
-            snprintf(pauto,sizeof(pauto),"%s/.coli_usage",snap);
+            snprintf(pauto,sizeof(pauto),"%s",g_usage_path);
             FILE *pf=fopen(pauto,"rb"); long psz=0;
             if(pf){ fseek(pf,0,SEEK_END); psz=ftell(pf); fclose(pf); }
             if(psz<=0){ snprintf(pauto,sizeof(pauto),"%s/stats.txt",snap);
                 pf=fopen(pauto,"rb"); psz=0;
                 if(pf){ fseek(pf,0,SEEK_END); psz=ftell(pf); fclose(pf); } }
             if(psz>0){ pin=pauto; fprintf(stderr,"[PIN] auto: seeding from %s\n",pauto); }
-            else { pin=NULL; fprintf(stderr,"[PIN] auto: no .coli_usage or stats.txt in %s yet (no pin this run)\n",snap); }
+            else { pin=NULL; fprintf(stderr,"[PIN] auto: no %s or stats.txt in %s yet (no pin this run)\n",g_usage_path,snap); }
         }
         if(pin){
             const char *pin_gb=getenv("PIN_GB");
@@ -14912,7 +15041,6 @@ int main(int argc, char **argv){
      * conosce la TUA storia, la LRU si adatta alla sessione). AUTOPIN=0 disattiva. */
     { double ram_env = getenv("RAM_GB")?atof(getenv("RAM_GB")):0.0;
       int est_ctx = getenv("CTX")?atoi(getenv("CTX")):4096;   /* stesso default di run_serve */
-      snprintf(g_usage_path,sizeof(g_usage_path),"%s/.coli_usage",snap);
       /* An integrated GPU's expert tier is RAM too. It is not reserved here: the shared
        * tier (vk_tier_start, at the end of init) sizes itself from what MemAvailable has
        * left once this LRU has grown to its cap (VktConfig.ram_reserve). */
@@ -14946,17 +15074,25 @@ int main(int argc, char **argv){
            * plan    = 0.5 * budget * confidence(history), the autopin quota
            * reserve = cap * per-row width, held back for the adaptive LRU (#815)
            * max_pin = budget - reserve, the ceiling the plan is clamped to
+           * pinning = the RAM pin quota pin_load() gets below: min(plan, max_pin),
+           *           or 0 under the 0.5 GB floor (#1078: it printed the unfloored one)
            *
            * A reserve near the budget means the pin is being starved by a
            * reservation the LRU may never claim, since the LRU is demand-filled
            * and only allocates on a miss. That is visible here at a glance. */
+          double pin_gb=pin_bytes/1e9;
+          /* whole MB, rounded down: a 0.499 GB pin must not read as the 0.5 GB floor itself */
+          char under_floor[96]="";
+          if(pin_bytes>0.0&&pin_gb<0.5)
+            snprintf(under_floor,sizeof under_floor,"  [a %.0f MB pin is under the 0.5 GB floor: no RAM pin]",
+                     floor(pin_bytes/1e6));
           fprintf(stderr,"[PIN] auto: budget %.1f GB | plan %.1f GB (conf %.2f, %lld selections) | "
-              "LRU reserve %.1f GB (cap %d/layer x %.1f MB/row-set) | max_pin %.1f GB -> pinning %.1f GB%s\n",
+              "LRU reserve %.1f GB (cap %d/layer x %.1f MB/row-set) | max_pin %.1f GB -> pinning %.1f GB%s%s\n",
               expert_available/1e9, planned_pin/1e9, conf, (long long)hist,
               lru_reserve/1e9, preserved_cap, expert_cache_bytes_per_slot(&m,ebits)/1e6,
-              (expert_available-lru_reserve)/1e9, pin_bytes/1e9,
-              pin_bytes+1.0<planned_pin ? "  [CAPPED by the LRU reserve]" : "");
-          double pin_gb=pin_bytes/1e9;
+              (expert_available-lru_reserve)/1e9, pin_gb>=0.5 ? pin_gb : 0.0,
+              pin_bytes+1.0<planned_pin ? "  [CAPPED by the LRU reserve]" : "",
+              under_floor);
           /* #1409: the VRAM prefix is loaded by the same pin_load, priced against
            * the VRAM budget (CUDA_RELEASE_HOST). A RAM pin under the 0.5 GB floor
            * used to skip the call, and with it the whole VRAM tier. */
@@ -14980,6 +15116,9 @@ int main(int argc, char **argv){
 #endif
 #ifdef COLI_CUDA
     colibri_cu_tier_start(&m);   /* COLI_CUDA=1 with no Vulkan device and a GGUF: the same tier on CUDA */
+    /* the CUDA chain's matrices and parameters up now, after the tier took its room, rather than in
+     * the first request's time (13 GiB of GLM-5.3 UD-IQ1_S's and its k_b and v_b as floats) */
+    if(glmu_wanted(&m)) glmu_setup(&m);
 #endif
     const char *stats=getenv("STATS");   /* STATS=<file> -> istogramma uso expert a fine run */
 

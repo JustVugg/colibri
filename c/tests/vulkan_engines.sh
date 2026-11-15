@@ -81,6 +81,13 @@ vk_count() {
 need_gpu() {  # <engine> <log> <tag>
   [ "$(vk_count "$1" "$2")" -gt 0 ] || { cat "$2"; fail "$3: no matmul ran on the device"; }
 }
+# need_int8 <engine> <log> <tag>: need_gpu, and the engine's report placed int8 rows on the
+# device ("placed int8 N", N > 0). qwen36's dense chain uploads through the same counter
+# (vk_qw_tensor), so this holds with the chain on, where the per-matrix count stays 0.
+need_int8() {
+  need_gpu "$1" "$2" "$3"
+  grep -qaE "^\[VK\] $1: [0-9]+ matmuls on the GPU.*placed int8 [1-9]" "$2" || { cat "$2"; fail "$3: no int8 matrix placed"; }
+}
 same_tokens() {  # <cpu log> <vk log> <tag>: the engines' "C engine" token lines
   grep -a '^C engine' "$1" > cpu.tok || true
   grep -a '^C engine' "$2" > vk.tok || true
@@ -336,8 +343,11 @@ dense_where() {
     # inkling places none when the host keeps them by design (bf16 weights under the
     # AVX512-BF16 dot, which rounds the activations as the shader does not): its
     # placement line then says "0 resident matrices go to the GPU", and the count is
-    # not required, as in family_inkling_olmoe's own bf16 check.
-    grep -qa "^\[VK\] $eng: 0 resident matrices go to the GPU" "$log" || need_gpu "$eng" "$log" "$tag"
+    # not required, as in family_inkling_olmoe's own bf16 check. A dense chain that ran (on by
+    # default on a discrete GPU: "[VK] <engine> chain: N forwards", Inkling-2's "inkling2
+    # chain") ran the trunk there without the per-matrix path's count.
+    grep -qa "^\[VK\] $eng: 0 resident matrices go to the GPU" "$log" || [ "$(chain_count "$eng" "$log")" -gt 0 ] ||
+      [ "$(chain_count "${eng}2" "$log")" -gt 0 ] || need_gpu "$eng" "$log" "$tag"
     where=device
   else
     [ "$(vk_count "$eng" "$log")" = 0 ] || { cat "$log"; fail "$tag: dense matmuls ran on the device with the trunk on the CPU"; }
@@ -390,7 +400,7 @@ vk_gate() {
   same_tokens cpu.log vk.log "$tag"
   need_gpu "$eng" vk.log "$tag"
   grep -qE "\[VK\] $eng: .*placed .*$placed" vk.log || { grep '\[VK\]' vk.log; fail "$tag: expected placement '$placed'"; }
-  echo "OK $tag: $(grep -a -o 'Matching tokens: [0-9/]*' vk.log), tokens = CPU, $(grep -o '[0-9]* matmuls on the GPU.*' vk.log | tail -1)"
+  echo "OK $tag: $(grep -a -o 'Matching tokens: [0-9/]*' vk.log), tokens = CPU, $(vk_count "$eng" vk.log) matmuls on the GPU $(sed -n "s/^\[VK\] $eng: [0-9]* matmuls on the GPU //p" vk.log | tail -1)"
 }
 
 family_qwen() {
@@ -420,8 +430,8 @@ family_qwen() {
     COLI_DENSE_IDOT=0 SNAP=${fx}_c ./qwen36 8 8 $fx/ref_full.json > cpu.log 2>&1 || true
     COLI_DENSE_IDOT=0 COLI_VK_DENSE=1 COLI_VULKAN=1 SNAP=${fx}_c ./qwen36 8 8 $fx/ref_full.json > vk.log 2>&1 || true
     same_tokens cpu.log vk.log "qwen36 $fx int8"
-    grep -qE '\[VK\] qwen36: [1-9][0-9]* matmuls on the GPU.*placed int8 [1-9]' vk.log || { cat vk.log; fail "qwen36 $fx int8: nothing placed"; }
-    echo "OK qwen36 $fx int8: tokens = CPU, $(grep -o '[0-9]* matmuls on the GPU.*' vk.log | tail -1)"
+    need_int8 qwen36 vk.log "qwen36 $fx int8"
+    echo "OK qwen36 $fx int8: tokens = CPU, $(vk_count qwen36 vk.log) matmuls on the GPU $(sed -n 's/^\[VK\] qwen36: [0-9]* matmuls on the GPU //p' vk.log | tail -1)"
   done
 
   # The routed-expert tier on every expert container qwen36 reads (COLI_VULKAN=1 turns
@@ -455,7 +465,7 @@ family_qwen() {
   same_tokens cpu.log vk.log "qwen36 COLI_VK_TIER=0"
   ! grep -q '^\[VK\] tier' vk.log || { cat vk.log; fail "qwen36 COLI_VK_TIER=0: the tier started"; }
   need_gpu qwen36 vk.log "qwen36 COLI_VK_TIER=0"
-  echo "OK qwen36 COLI_VK_TIER=0: tokens = CPU, no tier, $(grep -o '[0-9]* matmuls on the GPU' vk.log | tail -1)"
+  echo "OK qwen36 COLI_VK_TIER=0: tokens = CPU, no tier, $(vk_count qwen36 vk.log) matmuls on the GPU"
 
   # qwen38: one fixture, every resident format, with and without prefill batching
   $PY tools/make_qwen38_tiny.py --out qwen38_tiny
@@ -557,6 +567,75 @@ family_qwen_sanitize() {
   mtp_on_device "asan qwen38 MTP" san.log
   san qwen38 "asan qwen38 tier alone" COLI_VK_DENSE=0 SNAP=qwen38_tiny_int4 ./qwen38 4 8 qwen38_tiny_int4/ref_int4.json
   make clean >/dev/null 2>&1 || true
+}
+
+# Inkling-2 on the routed-expert tier: its dense matrices a call at a time (it has no dense
+# chain), its softcapped SwiGLU as the tier's SITU. The f32 fixture (fmt 10); the int4 g64
+# container tools/convert_inkling2_int4.py writes from a checkpoint laid out as Thinking Machines
+# publish theirs (NVFP4 and MXFP8 experts, fmt 4 gs 64); and a GGUF as unsloth's lay it out
+# (tests/test_gguf_import.py, Q8_0 experts), whose NVFP4 layers' experts come without their global
+# scale: the engine folds it into the rows the device reads and into the pair's weight. At cap 1
+# with the trunk where the default puts it and at cap 8 with it on the device, and a budget of
+# two experts, which must evict. The fixtures need transformers' Inkling-2 and gguf-py
+# (tools/oracle-inkling2-requirements.txt); an ink2_gguf/ made beforehand is used as it is.
+family_inkling2() {
+  make inkling VK=1
+  $PY tools/make_tiny_inkling2.py tiny_inkling2
+  $PY tools/make_tiny_inkling2.py tiny_g64 --g64
+  rm -rf fab_g64 cont_g64 ref_g64
+  $PY tools/convert_inkling2_int4.py --fabricate tiny_g64 fab_g64 --nvfp4-layers 6
+  $PY tools/convert_inkling2_int4.py --indir fab_g64 --outdir cont_g64 --jobs 2 --min-free-gb 0
+  $PY tools/make_tiny_inkling2.py --int4-ref cont_g64 tiny_g64 ref_g64
+  if [ ! -d ink2_gguf/gg ]; then
+    rm -rf ink2_gguf && mkdir ink2_gguf
+    $PY - <<'PY' || fail "gguf-py (pip install gguf) is needed for the Inkling-2 GGUF gate"
+import json, sys
+sys.path.insert(0, "tests")
+from test_gguf_import import write_inkling2_pair
+write_inkling2_pair("ink2_gguf", experts="Q8_0")
+p = [5, 77, 13, 201, 42, 9, 150, 33, 61, 18, 240, 7]
+json.dump({"prompt_ids": p, "full_ids": p + [0] * 16}, open("ink2_gguf/ref.json", "w"))
+PY
+  fi
+  if [ ! -d ink2_ggufd/gg ]; then   # the attention's matrices and the head as Q8_0 blocks too
+    rm -rf ink2_ggufd && mkdir ink2_ggufd
+    $PY - <<'PY' || fail "gguf-py (pip install gguf) is needed for the Inkling-2 GGUF gate"
+import json, sys
+sys.path.insert(0, "tests")
+from test_gguf_import import write_inkling2_pair
+write_inkling2_pair("ink2_ggufd", experts="Q8_0", dense="Q8_0")
+p = [5, 77, 13, 201, 42, 9, 150, 33, 61, 18, 240, 7]
+json.dump({"prompt_ids": p, "full_ids": p + [0] * 16}, open("ink2_ggufd/ref.json", "w"))
+PY
+  fi
+  local cap D R2=tiny_inkling2/ref_inkling2.json RG=ref_g64/ref_inkling2.json
+  for cap in 1 8; do
+    D=; [ $cap = 8 ] && D=COLI_VK_DENSE=1
+    tier_gate inkling "inkling2 tier f32 cap=$cap" $D SNAP=tiny_inkling2 -- $cap 0 $R2
+    tier_gate inkling "inkling2 tier int4 g64 container cap=$cap" $D SNAP=cont_g64 -- $cap 0 $RG
+    # the float forms on both sides (GQ_EXACT=1, COLI_VK_IDOT=0): the integer ones quantize the
+    # activations, and this small random net turns that noise into other tokens
+    tier_gate inkling "inkling2 tier GGUF Q8_0 cap=$cap" $D GQ_EXACT=1 COLI_VK_IDOT=0 SNAP=ink2_gguf/gg -- $cap 0 ink2_gguf/ref.json
+  done
+  EVICT=1 tier_gate inkling "inkling2 tier, a budget of two experts" COLI_VK_TIER_GB=0.00003 SNAP=cont_g64 -- 8 0 $RG
+  # the CPU's pairs' reads held back (INK_FILL_DELAY_US): none may compute before its expert lands
+  EVICT=1 tier_gate inkling "inkling2 tier, eviction, reads held back" COLI_VK_TIER_GB=0.00003 INK_FILL_DELAY_US=3000 SNAP=cont_g64 -- 8 0 $RG
+  tier_gate inkling "inkling2 tier int4 g64 container cap=4, reads held back" INK_FILL_DELAY_US=3000 SNAP=cont_g64 -- 4 0 $RG
+  # Inkling-2's dense chain (inkling2_chain.h, its line "[VK] inkling2 chain: ..."): every layer
+  # on the device, the routed experts on the host; then prompts only, the state handed to the
+  # CPU's decode and back
+  for cap in 1 8; do
+    CHAINNAME=inkling2 chain_gate inkling "chain inkling2 f32 cap=$cap" 1 COLI_VK_DENSE=1 SNAP=tiny_inkling2 -- $cap 0 $R2
+    CHAINNAME=inkling2 chain_gate inkling "chain inkling2 int4 g64 container cap=$cap" 1 COLI_VK_DENSE=1 SNAP=cont_g64 -- $cap 0 $RG
+  done
+  CHAINMODE=2 CHAINNAME=inkling2 chain_gate inkling "chain inkling2 prompts only" 1 COLI_VK_DENSE=1 SNAP=tiny_inkling2 -- 8 0 $R2
+  # a GGUF's: the attention's matrices and the head as Q8_0 blocks the chain takes up itself;
+  # the block GEMVs' logits against the CPU's float kernels, then the prompt's rows through the
+  # tiled GEMM (its own rounding, 6e-4 here): the same tokens
+  CHAINNAME=inkling2 chain_gate inkling "chain inkling2 GGUF Q8_0 dense" 1 COLI_VK_DENSE=1 GQ_EXACT=1 COLI_VK_IDOT=0 COLI_VK_CHAIN_GEMM=0 \
+    SNAP=ink2_ggufd/gg -- 8 0 ink2_ggufd/ref.json
+  CHAINNAME=inkling2 chain_gate inkling "chain inkling2 GGUF Q8_0 dense, tiled GEMM" 0 COLI_VK_DENSE=1 GQ_EXACT=1 COLI_VK_IDOT=0 \
+    SNAP=ink2_ggufd/gg -- 8 0 ink2_ggufd/ref.json
 }
 
 family_inkling_olmoe() {
@@ -947,6 +1026,28 @@ _, _, _, b = e.decode_png(open("qi-vk.png", "rb").read())
 d = [abs(x - y) for x, y in zip(a, b)]
 assert len(a) == len(b) and max(d) <= 2 and sum(t > 0 for t in d) <= len(d) // 1000, (max(d), sum(t > 0 for t in d))
 print(f"OK qwenimage chain picture: {sum(t > 0 for t in d)} of {len(d)} bytes differ from the CPU's, max {max(d)}")
+QIPY
+  # GGUFs (tools/make_qwenimage_gguf_tiny.py: unsloth's layout of the denoiser, K-quant types,
+  # a Qwen3-VL text encoder): the blocks' matrices go up as the file's blocks (fmt 100 + the
+  # ggml type, the chain's block GEMM), the picture against the CPU's
+  $PY tools/make_qwenimage_gguf_tiny.py qwenimage_tiny qwenimage_gguf_tiny
+  rm -rf qwenimage_gguf_tiny/gg
+  $PY tools/gguf_import.py qwenimage_gguf_tiny/dit.gguf qwenimage_gguf_tiny/gg --text-encoder qwenimage_gguf_tiny/te.gguf \
+    --vae qwenimage_tiny
+  COLI_IMG_ACT8=0 ./qwenimage --model qwenimage_gguf_tiny/gg --prompt "a red fox in the snow" \
+    --width 256 --height 256 --steps 2 --seed 1 --out qi-cpu.png
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_IMG_ACT8=0 ./qwenimage --model qwenimage_gguf_tiny/gg --prompt "a red fox in the snow" \
+    --width 256 --height 256 --steps 2 --seed 1 --out qi-vk.png 2> qi-vk-gen.err
+  grep -qa "matrices in the GGUF's blocks" qi-vk-gen.err || { cat qi-vk-gen.err; fail "qwenimage GGUF chain: no matrix kept in the file's blocks"; }
+  grep -qa 'qwenimage chain: [0-9]* steps' qi-vk-gen.err || { cat qi-vk-gen.err; fail "qwenimage GGUF chain: the chain never ran"; }
+  $PY - <<'QIPY'
+import sys; sys.path.insert(0, ".")
+import image_engine as e
+_, _, _, a = e.decode_png(open("qi-cpu.png", "rb").read())
+_, _, _, b = e.decode_png(open("qi-vk.png", "rb").read())
+d = [abs(x - y) for x, y in zip(a, b)]
+assert len(a) == len(b) and max(d) <= 2 and sum(t > 0 for t in d) <= len(d) // 1000, (max(d), sum(t > 0 for t in d))
+print(f"OK qwenimage GGUF chain picture: {sum(t > 0 for t in d)} of {len(d)} bytes differ from the CPU's, max {max(d)}")
 QIPY
 }
 
@@ -1451,6 +1552,10 @@ family_mimo_chain() {
   # mirrors), compared bit for bit with a cold engine: the per-row GEMV and no tier, so
   # a resumed prompt's rows get the bits of the same rows computed cold
   COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER=0 COLI_VK_GEMM_MIN_S=0 COLI_VK_ATTN_BLOCK=0 $PY -m unittest tests.test_mimo_prefix_serve
+  # the prefix store on the chain: a new conversation on the same system prompt, a conversation back
+  # after another system prompt took the slot; the logits of a fresh read on the same chain
+  MIMO_PS_BACKEND=vulkan $PY -m unittest tests.test_mimo_prefix_store || fail "chain mimo: the prefix store"
+  echo "OK chain mimo the prefix store: a stored prefix's logits a fresh read's, the same top five within 1e-3"
   # a serve session against the CPU's, frame for frame, in both modes and with the
   # device lost mid-session. The fixture's logits run to 300 (its head is scaled for wide
   # greedy margins), so its logprobs compare within 1e-3: about 3e-6 of the largest logit
@@ -1738,10 +1843,10 @@ chain_gate() {  # <engine> <tag> <tol 0|1> <env...> -- <argv...>   (CPUENV: the 
   env "${envs[@]}" DUMP=vk.f32 COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=${CHAINMODE:-1} \
     ./"$eng" "$@" > vk.log 2>&1 || { [ $rc_cpu != 0 ] || { cat vk.log; fail "$tag: the chain misses the oracle the CPU passes"; }; }
   same_tokens cpu.log vk.log "$tag"
-  [ "$(chain_count "$eng" vk.log)" -gt 0 ] || { cat vk.log; fail "$tag: the chain never ran"; }
+  [ "$(chain_count "${CHAINNAME:-$eng}" vk.log)" -gt 0 ] || { cat vk.log; fail "$tag: the chain never ran"; }
   local lg=""
   if [ "$tol" = 1 ]; then lg=$(logits_close cpu.f32 vk.f32) || { echo "$lg"; fail "$tag: logits"; }; lg=", $lg"; fi
-  echo "OK $tag: tokens = CPU$lg, $(chain_count "$eng" vk.log) chain forwards"
+  echo "OK $tag: tokens = CPU$lg, $(chain_count "${CHAINNAME:-$eng}" vk.log) chain forwards"
 }
 
 # dmoe_gate <engine> <tag> all|some|rows|none <env...> -- <argv...>: chain_gate, and how many
@@ -1763,6 +1868,36 @@ dmoe_gate() {
     *) [ "${n:-0}" = 0 ] ;;
   esac || { cat vk.log; fail "$tag: ${n:-?} layer steps in the frame (${c:-?} a prompt chunk's), ${h:-?} ms of routed experts on the host (wanted $want)"; }
   echo "OK $tag: ${n:-0} layer steps with the routed experts in the frame (${c:-0} a prompt chunk's), ${h:-?} ms of routed experts on the host"
+}
+
+# sync_gate <engine> <tag> <env...> -- <argv...>: the chain's run under the Khronos validation
+# layer with its synchronization check (vulkan-validationlayers; said and skipped without it):
+# a hazard, or an event or barrier the specification forbids, fails. Lavapipe runs every
+# command in order and an NVIDIA card waits around an event, so neither shows a barrier that
+# is missing; the check sees it on any device (#2583: a hybrid step's sum read the experts'
+# rows with none, and a Radeon RX 9060 XT's answers fell into repetition). The device's
+# objects left at exit (VUID-vkDestroyDevice-device-05137) are not what it is for. Nor is
+# VUID-vkSetEvent-event-09543 (layers from 1.4 on), counted and said but not failed: the
+# specification now wants a host's event set before the frame that waits on it is submitted,
+# and a hybrid step sets it from the CPU while the frame runs, by design; a timeline
+# semaphore between two submits is the form it allows, a change of the chain's frames.
+sync_gate() {
+  local eng=$1 tag=$2; shift 2
+  local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  rm -f chain.usage
+  env "${envs[@]}" VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation VK_LOADER_DEBUG=layer \
+    VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true VK_KHRONOS_VALIDATION_REPORT_FLAGS=error \
+    VK_KHRONOS_VALIDATION_DUPLICATE_MESSAGE_LIMIT=100000 \
+    COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 ./"$eng" "$@" > vk.log 2>&1 || true
+  if ! grep -aq "Loading layer library libVkLayer_khronos_validation" vk.log; then
+    echo "SKIP $tag: no Khronos validation layer (apt install vulkan-validationlayers)"; return 0
+  fi
+  local bad known
+  known="^VUID-vkDestroyDevice-device-05137$|^VUID-vkSetEvent-event-09543$"
+  bad=$(grep -aoE "SYNC-HAZARD-[A-Z_-]+|VUID-[A-Za-z0-9_-]+" vk.log | grep -vE "$known" | sort | uniq -c || true)
+  [ -z "$bad" ] || { grep -aE "SYNC-HAZARD-|Hazard |VUID-" vk.log | grep -vE "vkDestroyDevice|VUID-vkSetEvent-event-09543" | head -20 || true; echo "$bad"; fail "$tag: the validation layer's synchronization check"; }
+  local late; late=$(grep -ac "VUID-vkSetEvent-event-09543" vk.log || true)
+  echo "OK $tag: no synchronization error (${late:-0} host event sets while their frame is pending, VUID-vkSetEvent-event-09543)"
 }
 
 # lost_gate <engine> <tag> <frame> <env...> -- <argv...>: the device "lost" at the given
@@ -1827,6 +1962,35 @@ qwen36_gguf_chain_gates() {
   grep -q "host pool on, [1-9].* of RAM left for the KV and state the engine allocates later" vk.log ||
     { cat vk.log; fail "chain qwen36 GGUF hybrid: the host pool left no room for the KV cache"; }
   grep -q "hybrid layer steps\( ([^)]*)\)\{0,1\}, [1-9][0-9]* host pool pairs on the CPU" vk.log || { cat vk.log; fail "chain qwen36 GGUF hybrid: no pair on the CPU"; }
+  # the same steps under the validation layer: the events' barriers (vk_chain.c vkc_ev_signal,
+  # vkc_ev_wait) order the device's work around the host's
+  sync_gate qwen36 "chain qwen36 GGUF hybrid, synchronization" GQ_EXACT=1 COLI_VK_TIER_GB=0.0004 \
+    COLI_VK_TIER_HOST=1 SNAP=qwen36_gguf_tiny -- 8 8 qwen36_gguf_tiny/ref.json
+  grep -q "hybrid layer steps (in the frame, on events), [1-9]" vk.log || { cat vk.log; fail "chain qwen36 GGUF hybrid, synchronization: no step on events"; }
+  # a driver that lets a frame through the event the host sets while it runs (#2583: the
+  # specification wants it set before the frame is submitted, VUID-vkSetEvent-event-09543, and a
+  # Radeon on AMD's own driver answered in loops): COLI_VK_TEST_EV_NOWAIT=1 drops the waits, the
+  # probe at the chain's start sees it, and the steps run on the timelines with the CPU's tokens.
+  # Without the probe the same run reads the host's rows before they are written (other tokens).
+  CPUENV=GQ_EXACT=1 dmoe_gate qwen36 "chain qwen36 GGUF hybrid, a driver that does not hold the frame" all GQ_EXACT=1 \
+    COLI_VK_TIER_GB=0.0004 COLI_VK_TIER_HOST=1 COLI_VK_TEST_EV_NOWAIT=1 SNAP=qwen36_gguf_tiny -- 8 8 qwen36_gguf_tiny/ref.json
+  grep -q "does not hold a frame at an event the host sets while it runs" vk.log ||
+    { cat vk.log; fail "chain qwen36 GGUF hybrid: the probe did not see the frame pass the event"; }
+  grep -q "hybrid layer steps (frames A/B/C, by timelines), [1-9]" vk.log ||
+    { cat vk.log; fail "chain qwen36 GGUF hybrid: the steps stayed on the events the frame does not wait for"; }
+  # AMD's own driver leaves the events off unprobed (#2583: a Radeon RX 9060 XT on it answered in
+  # loops with them and soundly without; COLI_VK_TEST_AMD_OWN=1 takes any driver for it): the
+  # steps on the timelines with the CPU's tokens, and COLI_VK_HYBRID_EVENTS=1 the events again
+  CPUENV=GQ_EXACT=1 dmoe_gate qwen36 "chain qwen36 GGUF hybrid, AMD's own driver" all GQ_EXACT=1 \
+    COLI_VK_TIER_GB=0.0004 COLI_VK_TIER_HOST=1 COLI_VK_TEST_AMD_OWN=1 SNAP=qwen36_gguf_tiny -- 8 8 qwen36_gguf_tiny/ref.json
+  grep -q "the hybrid steps run on the timelines on AMD's own driver" vk.log ||
+    { cat vk.log; fail "chain qwen36 GGUF hybrid: AMD's own driver kept the events"; }
+  grep -q "hybrid layer steps (frames A/B/C, by timelines), [1-9]" vk.log ||
+    { cat vk.log; fail "chain qwen36 GGUF hybrid: no step on the timelines on AMD's own driver"; }
+  CPUENV=GQ_EXACT=1 dmoe_gate qwen36 "chain qwen36 GGUF hybrid, AMD's own driver, the events asked for" all GQ_EXACT=1 \
+    COLI_VK_TIER_GB=0.0004 COLI_VK_TIER_HOST=1 COLI_VK_TEST_AMD_OWN=1 COLI_VK_HYBRID_EVENTS=1 SNAP=qwen36_gguf_tiny -- 8 8 qwen36_gguf_tiny/ref.json
+  grep -q "hybrid layer steps (in the frame, on events), [1-9]" vk.log ||
+    { cat vk.log; fail "chain qwen36 GGUF hybrid: COLI_VK_HYBRID_EVENTS=1 did not bring the events back"; }
   # the host pool within the driver's heap for it (#2314: Windows leaves about half the RAM,
   # and the blocks past it were refused): a heap whose room past the 2 GiB the staging keeps
   # holds a few experts, the pool takes those, the engine's cache keeps the rest (and so the
@@ -1980,6 +2144,22 @@ family_qwen_chain() {
   # one conversation past the places' first 2048 rows: its mirrors grow, the others' stay
   CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_PAIRS=1 CHAIN_SERVE_LONG=2600 CHAIN_SERVE_EXPECT='decode steps of several conversations in the chain \([0-9]* rows, [1-9]' \
     $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 KV_SLOTS=2
+  # one slot: a conversation past twice the mirror's start, then shorter ones: the mirror cut to
+  # them, what it held past that back to the expert tier (#2733)
+  CHAIN_SERVE_LONG=17000 CHAIN_SERVE_EXPECT='KV mirror cut to a shorter conversation [1-9]' \
+    $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 Q36_MAXT=32768
+  # a long conversation, then shorter ones in its slot: the place's mirrors cut to them, what they
+  # held past that back to the expert tier (#2733)
+  CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_PAIRS=1 CHAIN_SERVE_LONG=4500 CHAIN_SERVE_LONG_ONCE=1 \
+    CHAIN_SERVE_EXPECT="[1-9][0-9]* places' mirrors cut to a shorter conversation" \
+    $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 KV_SLOTS=2
+  # a place that cannot grow (COLI_VK_TEST_CONV_ROOM_MB=0: no room past the first 2048 rows): the
+  # places close, and the next conversation that enters opens them again (#2733); the text the CPU's
+  CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_PAIRS=1 CHAIN_SERVE_LONG=2600 CHAIN_SERVE_EXPECT='places open again' \
+    $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 KV_SLOTS=2 COLI_VK_TEST_CONV_ROOM_MB=0
+  # the prefix store on the chain: a new conversation on the same system prompt, a conversation back
+  # after another, two slots; the logits of a fresh read on the same chain (the rows go up again)
+  QWEN36_TINY=qwen36_tiny_c QWEN36_PS_BACKEND=vulkan $PY -m unittest tests.test_qwen36_prefix_store
   for k in 0 1; do
     CHAIN_SERVE_SLOTS=3 CHAIN_SERVE_PAIRS=1 CHAIN_SERVE_EXPECT='on the device, [1-9][0-9]* handed over' \
       $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 KV_SLOTS=3 COLI_VK_CHAIN_MUX=$k
@@ -2034,6 +2214,23 @@ family_qwen_chain() {
   for fx in qwen38_tiny_mtp qwen38_tiny_fp8_mtp qwen38_tiny_int4_mtp; do for f in "" reject accept mixed; do
     chain_gate qwen38 "chain qwen38 MTP $fx ${f:-drafting}" 1 OMP_NUM_THREADS=2 Q38_MTP=1 Q38_MTP_FORCE=$f SNAP=$fx -- 2 8 $fx/ref.json
   done; done
+  # a prompt layer by layer with the MTP head, which wants the rows' final streams back: the
+  # logits and the head's drafts (made from those streams) of the same prompt chunk by chunk
+  V38LWM="OMP_NUM_THREADS=2 COLI_VK_TIER_HOST=1 COLI_VK_TIER_GB=0.00005 COLI_VK_CHAIN_ROWS=3 Q38_MTP=1 SNAP=qwen38_tiny_mtp"
+  chain_gate qwen38 "chain qwen38 MTP, a prompt layer by layer" 1 $V38LWM COLI_VK_CHAIN_LAYERWISE=1 -- 2 8 qwen38_tiny_mtp/ref.json
+  grep -q "prompts layer by layer" vk.log || { cat vk.log; fail "chain qwen38 MTP, a prompt layer by layer: it ran chunk by chunk"; }
+  cp vk.f32 lw.f32; grep -a "^\[qwen38 MTP\] .*acceptance" vk.log > lw.mtp
+  [ -s lw.mtp ] || { cat vk.log; fail "chain qwen38 MTP, a prompt layer by layer: no MTP report"; }
+  chain_gate qwen38 "chain qwen38 MTP, the same prompt chunk by chunk" 1 $V38LWM COLI_VK_CHAIN_LAYERWISE=0 -- 2 8 qwen38_tiny_mtp/ref.json
+  cmp -s lw.f32 vk.f32 || fail "chain qwen38 MTP, a prompt layer by layer: other logits than chunk by chunk"
+  grep -a "^\[qwen38 MTP\] .*acceptance" vk.log | cmp -s - lw.mtp || { cat lw.mtp; fail "chain qwen38 MTP, a prompt layer by layer: other drafts than chunk by chunk"; }
+  # the prefix store on the chain: a new conversation on the same system prompt, a conversation back
+  # after another system prompt took the slot, two slots, the MTP head on; the logits of a fresh read
+  # on the same chain (the rows go up again)
+  $PY tools/make_edge_tiny_tokenizer.py --vocab-size 64 ./qwen38_tiny
+  QWEN38_TINY=qwen38_tiny QWEN38_TINY_MTP=qwen38_tiny_mtp QWEN38_PS_BACKEND=vulkan $PY -m unittest tests.test_qwen38_prefix_store ||
+    fail "chain qwen38: the prefix store"
+  echo "OK chain qwen38 the prefix store: a stored prefix's logits a fresh read's, the same top five within 1e-4"
   # the device lost mid-decode, once between steps and once inside an MTP verify
   dmoe_gate qwen38 "chain qwen38 the routed experts in the frame" all OMP_NUM_THREADS=2 SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
   dmoe_gate qwen38 "chain qwen38 the host's routing (COLI_VK_CHAIN_MOE=0)" none COLI_VK_CHAIN_MOE=0 OMP_NUM_THREADS=2 \
@@ -2442,8 +2639,13 @@ family_inkling_olmoe_chain() {
   # the tier's GEMM once, so the tier keeps every expert below it here.)
   COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 COLI_VK_ATTN_BLOCK=0 INKLING_TINY=tiny_inkling \
     $PY -m unittest tests.test_inkling_prefix_serve tests.test_inkling_dashboard_hits
+  # the prefix store on the chain: the logits of a fresh read on the same chain, within 1e-4
+  INKLING_TINY=tiny_inkling INK_PS_BACKEND=vulkan $PY -m unittest tests.test_inkling_prefix_store ||
+    fail "chain inkling: the prefix store"
   COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 COLI_VK_ATTN_BLOCK=0 COLI_VK_TIER_GEMM_ROWS=1000 \
     OLMOE_TINY=olmoe_tiny_c $PY -m unittest tests.test_olmoe_prefix_serve tests.test_olmoe_dashboard_hits tests.test_brio_serve
+  OLMOE_TINY=olmoe_tiny_c OLMOE_PS_BACKEND=vulkan $PY -m unittest tests.test_olmoe_prefix_store ||
+    fail "chain olmoe: the prefix store"
 }
 
 # inkling's and olmoe's chain under ASan and UBSan: memory safety is the gate (a
@@ -2675,6 +2877,11 @@ family_glm_chain() {
   CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=4 COLI_VK_CHAIN_ROWS=3
   CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=32 KV_SLOTS=2
   COLI_VK_CHAIN=2 CHAIN_SERVE_DIALECT=numeric $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=32
+  # the prefix store on the chain: a new conversation on the same system prompt, a conversation back
+  # after another system prompt took the slot, two slots; the logits of a fresh read on the same chain
+  COLI_GLM53_FIXTURE=glm53_stream-i4 GLM53_PS_BACKEND=vulkan $PY -m unittest tests.test_glm53_prefix_store ||
+    fail "chain glm53: the prefix store"
+  echo "OK chain glm53 the prefix store: a stored prefix's logits a fresh read's, the same top five within 1e-4"
   # a pin restored over rows another branch rewrote: the KDA state goes up from the pin,
   # the MLA rows' watermark comes down (the tier off and the scores within 1e-5: two
   # engine processes, see vulkan_partial_glm.sh; the per-row GEMV for every prompt
@@ -2879,6 +3086,30 @@ family_kimi_chain() {
   # in chain chunks of 5 rows (seven chunks a 32-row forward), the loss in the third
   # chunk of the second forward: the state its first chunks advanced is not used
   K3C_CASES=long FAULT_BACK=124 REBUILD=1 k3c_gate "chain kimi_k3 device lost inside a chunked forward" $O COLI_VK_CHAIN_ROWS=5
+  # Kimi K3.1: the DSA indexer on the chain (a top 4, so a 30-token prompt selects in every
+  # MLA layer): its test with the chain on, then the chain's tokens against the CPU's in
+  # chunks of 3 rows, a token at a time, a partial chain, quantized trunks and the KV split
+  $PY tools/make_kimi_k3_tiny.py --output ./kimi_k31_tiny --force --k31
+  COLI_USAGE=$PWD/k3c.usage USAGE_SAVE=0 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 \
+    $PY tests/kimi_k31_tiny_harness.py --binary ./kimi_k3 --fixture ./kimi_k31_tiny
+  local k31ids="5 7 9 11 13 17 19 23 29 31 37 41 43 47 53 59 61 67 71 73 79 83 89 97 101 103 107 109 113 127" k31cpu k31vk v q
+  for q in "$O" "K3_BITS=8 K3_MLA_BITS=8 K3_HEAD_BITS=8 K3_IDOT=0 COLI_TEMP=0" "K3_BITS=4 K3_IDOT=0 COLI_TEMP=0"; do
+    # shellcheck disable=SC2086
+    k31cpu=$(env $q USAGE_SAVE=0 ./kimi_k3 kimi_k31_tiny --ids "$k31ids" --ngen 12 2>/dev/null | sed 's/ *TUNE.*//')
+    for v in COLI_VK_CHAIN_ROWS=32 COLI_VK_CHAIN_ROWS=3 K3_CHUNK=1 COLI_VK_CHAIN_LAYERS=3 \
+             "COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4 COLI_VK_CHAIN_ROWS=3"; do
+      # shellcheck disable=SC2086
+      k31vk=$(env $q $v USAGE_SAVE=0 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 \
+              ./kimi_k3 kimi_k31_tiny --ids "$k31ids" --ngen 12 2> vk.log | sed 's/ *TUNE.*//')
+      grep -q 'kimi_k3: dense chain on' vk.log || { cat vk.log; fail "chain kimi_k3.1 ($q, $v): the chain did not run"; }
+      [ "$k31vk" = "$k31cpu" ] || fail "chain kimi_k3.1 ($q, $v): $k31vk, the CPU $k31cpu"
+    done
+  done
+  # shellcheck disable=SC2086
+  [ "$(env $O KIMI_DSA_INDEXER=0 USAGE_SAVE=0 COLI_VULKAN=1 COLI_VK_CHAIN=1 ./kimi_k3 kimi_k31_tiny --ids "$k31ids" --ngen 12 \
+       2>/dev/null | sed 's/ *TUNE.*//')" != "$(env $O USAGE_SAVE=0 ./kimi_k3 kimi_k31_tiny --ids "$k31ids" --ngen 12 \
+       2>/dev/null | sed 's/ *TUNE.*//')" ] || fail "chain kimi_k3.1: the dense attention gives the selection's tokens"
+  echo "OK chain kimi_k3.1: the indexer's selection on the device, the CPU's tokens"
   # a GGUF's blocks: the trunk on the chain, the experts in the tier, as the file has them
   k3_gguf_tiny
   local G="GQ_EXACT=1 COLI_VK_IDOT=0 COLI_VK_CHAIN_GEMM=0 K3_MLA_BITS=32 COLI_TEMP=0"
@@ -2916,6 +3147,11 @@ family_kimi_chain() {
     $PY tests/test_kimi_k3_ckpt.py --binary ./kimi_k3 --fixture ./kimi_k3_tiny
   COLI_USAGE=$PWD/k3c.usage USAGE_SAVE=0 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 \
     $PY tests/test_kimi_k3_dashboard.py --binary ./kimi_k3 --fixture ./kimi_k3_tiny
+  # the prefix store on the chain: a new conversation on the same system prompt, a conversation back
+  # after another system prompt took the slot; the logits of a fresh read on the same chain
+  KIMI_K3_TINY=./kimi_k3_tiny K3_PS_BACKEND=vulkan $PY -m unittest tests.test_kimi_k3_prefix_store ||
+    fail "chain kimi_k3: the prefix store"
+  echo "OK chain kimi_k3 the prefix store: a stored prefix's logits a fresh read's, the same top five within 1e-4"
   unset OMP_NUM_THREADS
 }
 
@@ -3394,6 +3630,11 @@ family_deepseek_chain() {
   DSV41_CHAIN=1 DSV41_TINY=dsv41_tiny $PY -m unittest tests.test_dsv41_prefill_tail.PrefillTailChainTest ||
     fail "chain deepseek_v41: the prompt's tail"
   echo "OK chain deepseek_v41 the prompt's tail: the logits of every row's run, fewer ops"
+  # the prefix store (prefix_store.h): a new conversation on the same system prompt and a
+  # conversation's next turn take what an earlier prompt read, both engines on the chain
+  DSV41_PS_BACKEND=vulkan DSV41_TINY=dsv41_tiny $PY -m unittest tests.test_dsv41_prefix_store ||
+    fail "chain deepseek_v41: the prefix store"
+  echo "OK chain deepseek_v41 the prefix store: a stored prefix's logits a fresh read's, the same top five within 1e-4"
   FAULT_BACK=100 v41_gate "chain deepseek_v41 device lost in the prompt" SNAP=dsv41_long COLI_VK_CHAIN_ROWS=7 -- 8 dsv41_long/ref.json
   FAULT_BACK=8 v41_gate "chain deepseek_v41 device lost between drafts" SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=5 -- 8 dsv41_tiny/ref.json
   # a GGUF's block types: the trunk on the chain, the experts in the tier, as the file has them
@@ -4851,6 +5092,7 @@ case "${1:-}" in
   qwen-sanitize)  family_qwen_sanitize ;;
   inkling-olmoe)  family_inkling_olmoe ;;
   inkling-olmoe-sanitize) family_inkling_olmoe_sanitize ;;
+  inkling2)       family_inkling2 ;;
   mimo-qwenimage) family_mimo_qwenimage ;;
   deepseek)       family_deepseek ;;
   deepseek-sanitize) family_deepseek_sanitize ;;
@@ -4915,5 +5157,5 @@ case "${1:-}" in
   partial-*)      g=${1#partial-}; fn=ptl_family_${g//-/_}
                   declare -F "$fn" >/dev/null || { echo "no partial-chain group ${g}" >&2; exit 2; }
                   "$fn" ;;
-  *) echo "usage: $0 mux|mux-sanitize|mux-deepseek|mux-deepseek-sanitize|decide|decide-sanitize|staged|<family>-staged|shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize|qwen-chain|qwen-chain-sanitize|qwen-spec|qwen-spec-sanitize|mimo-chain|mimo-chain-sanitize|inkling-olmoe-chain|inkling-olmoe-chain-sanitize|glm-chain|glm-chain-sanitize|kimi-chain|kimi-chain-sanitize|deepseek-chain|deepseek-chain-sanitize|dense-only-<group>[-sanitize]|partial-<group>[-sanitize]|prefill-qwen|prefill-qwen-sanitize|prefill-inkling-olmoe|prefill-mimo-kimi|prefill-glm|prefill-deepseek|kv-split|kv-split-sanitize|kv-split-cold|kv-split-cold-sanitize|layers-dev2[-mla|-deepseek][-sanitize]|layers-dev2-<engine>|kv-split-deepseek|kv-split-deepseek-sanitize|dev2|dev2-deepseek-kimi-mimo|dev2-sanitize" >&2; exit 2 ;;
+  *) echo "usage: $0 mux|mux-sanitize|mux-deepseek|mux-deepseek-sanitize|decide|decide-sanitize|staged|<family>-staged|shader|qwen|qwen-sanitize|inkling-olmoe|inkling-olmoe-sanitize|inkling2|mimo-qwenimage|deepseek|deepseek-sanitize|kimi|kimi-mimo-sanitize|glm|glm-sanitize|qwen-chain|qwen-chain-sanitize|qwen-spec|qwen-spec-sanitize|mimo-chain|mimo-chain-sanitize|inkling-olmoe-chain|inkling-olmoe-chain-sanitize|glm-chain|glm-chain-sanitize|kimi-chain|kimi-chain-sanitize|deepseek-chain|deepseek-chain-sanitize|dense-only-<group>[-sanitize]|partial-<group>[-sanitize]|prefill-qwen|prefill-qwen-sanitize|prefill-inkling-olmoe|prefill-mimo-kimi|prefill-glm|prefill-deepseek|kv-split|kv-split-sanitize|kv-split-cold|kv-split-cold-sanitize|layers-dev2[-mla|-deepseek][-sanitize]|layers-dev2-<engine>|kv-split-deepseek|kv-split-deepseek-sanitize|dev2|dev2-deepseek-kimi-mimo|dev2-sanitize" >&2; exit 2 ;;
 esac
