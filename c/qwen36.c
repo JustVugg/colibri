@@ -8351,7 +8351,11 @@ static void q36_unpark(Model *m) {
  * Scope, v1: single-slot serve, generation requests (a logprobs request still
  * pays a full prefill, the rule reuse itself follows), no vision payloads
  * (vis_map is set) and no sliding-window models (a ring's rows are per-turn
- * scratch in a stride a snapshot cannot assume). Eviction keeps MAX files and
+ * scratch in a stride a snapshot cannot assume). C20 (2026-11-15) lifted the
+ * single-slot gate: under KV_SLOTS>1 the disk cache now runs too, on the CPU
+ * chain (q36_pcache_ok) — restore/store touch only the bound slot's own
+ * Q36Seq state, and the device chains stay single-slot until their audit.
+ * Eviction keeps MAX files and
  * evicts the least-recently-used snapshot by modification time (restore touches
  * the file): recently reused deep conversations survive instead of always being
  * displaced by the next longer prompt. File timestamps have platform resolution,
@@ -9648,6 +9652,23 @@ static double q36_turn_hit(const Model *m, const Q36ReqClock *c) {
     return n > 0 ? 100.0 * h / n : 0.0;
 }
 
+/* C20: the disk prompt cache under mux. Restore/store touch only the bound
+ * slot's own Q36Seq state (the set q36_seq_swap trades), mux prefills never
+ * interleave, and a failed restore dirties only the bound slot -- what the
+ * `!reuse` reset rewrites, exactly the single-slot argument carried to slots.
+ * The Vulkan/CUDA chains keep each conversation's state on the DEVICE while it
+ * waits (q36c/cc_mux_*): a snapshot there must also fix the right slot's
+ * device rows, so those chains stay single-slot until their audit. */
+static int q36_pcache_ok(void) {
+#ifdef COLI_VULKAN
+    if (g_vk_chain) return g_q36_mux_slots == 1;
+#endif
+#ifdef COLI_CUDA
+    if (g_cuda_chain) return g_q36_mux_slots == 1;
+#endif
+    return 1;
+}
+
 /* A request's prompt into the conversation the Model holds: its tokens and image,
  * the budget, ACCEPT, the prefix reuse and the pins, the prefill and its read-out.
  * 1 with the prompt's ids and the logits after it; 0 when the request ended here,
@@ -9774,7 +9795,7 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
      * pays the full prefill it was always going to. */
     float *pc_logit = NULL;   /* full-length restore: the first fresh token's predictor */
     if (!reuse && g_pc_dir[0] && g_echo_k == 0 && !q->pin && !m->kvp.tainted &&
-        g_q36_mux_slots == 1 && q36_pcache_on()) {
+        q36_pcache_on() && q36_pcache_ok()) {
         int pr = q36_pcache_restore(m, ids, np, &pc_logit);
         if (pr > 0) {
             reuse = pr;   /* the state is the ids[0..pr)'s: the reset below is skipped */
@@ -9870,7 +9891,7 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
      * ids[0..np) again, so a deeper file for the same conversation gets
      * written here too. */
     if (g_pc_dir[0] && !q->pin && g_echo_k == 0 && !m->kvp.tainted &&
-        g_q36_mux_slots == 1 && np >= q36_pcache_min() && q36_pcache_on()) {
+        np >= q36_pcache_min() && q36_pcache_on() && q36_pcache_ok()) {
         double snapshot_store_started = now_s();
         q36_pcache_store(m, ids, np, lo);
         clk->snapshot_store_s = now_s() - snapshot_store_started;

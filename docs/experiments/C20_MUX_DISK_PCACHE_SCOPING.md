@@ -1,8 +1,8 @@
 # C20 — Disk prompt cache in mux mode (KV_SLOTS>1): scoping note
 
-**Status:** scoping only — no code written. Written 2026-11-15 after reading the
-engine paths; awaits the user's approval of the proposed design before any
-implementation.
+**Status:** scoped, then **implemented and validated (2026-11-15, PASS — see the C20 section of
+`DEV_PHASED_PLAN_TTFT_AND_THROUGHPUT.md`)**. The design below was approved by the user and shipped
+as proposed; the validation results supersede the open questions at the bottom.
 
 **Question:** the disk prompt cache (`Q36PC01` snapshot files: per-prompt state
 photographs with LRU eviction under a byte/count budget) is deliberately gated
