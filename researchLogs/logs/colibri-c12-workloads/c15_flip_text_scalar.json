@@ -1,0 +1,6 @@
+{
+ "text": "Based on the revision notes provided, the **writer** is the component that flushes the snapshot. It does so **only after the forward pass completes**.",
+ "prompt_tokens": 4090,
+ "prefill_s": 114.333508,
+ "engine_ttft_s": 114.34637691697571
+}
