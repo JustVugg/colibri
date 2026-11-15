@@ -338,6 +338,64 @@ class BackendChoice(unittest.TestCase):
             decision = self.choose(hw, family="glm53", platform="win32")
         self.assertEqual(decision["missing"], [("cuda", setup_flow.TEXT_HINTS["cuda-win32-release"])])
 
+    def test_an_nvidia_card_with_no_path_says_why(self):
+        # #2846: an A100 in TCC mode has no Vulkan device on Windows. Qwen3.8 takes the
+        # CUDA package from the release after v2.1.0; with v2.1.0, whose package has no
+        # qwen38.exe, or an engine with no Windows CUDA build, the reason names the card
+        # and both causes, and gpu_unused has the setup ask before the download
+        a100 = dict(RTX, name="NVIDIA A100-PCIE-40GB", compute_cap="8.0", driver_model="TCC")
+        hw = hw_report(nvidia=[a100])
+        tc = dict(TC_ALL, source_checkout=True, make=None, cc=None, can_build=False,
+                  can_build_vulkan=False, can_build_cuda=False)
+        with mock.patch.object(setup_flow, "current_version", return_value="2.2.0"):
+            decision = self.choose(hw, family="qwen38", tc=tc, platform="win32")
+            self.assertEqual(decision["backend"], "cuda")
+            self.assertIn("the release's CUDA backend (windows-x86_64-cuda.zip)", decision["reason"])
+            self.assertNotIn("gpu_unused", decision)
+            decision = self.choose(hw, family="mimo", tc=tc, platform="win32")
+            self.assertEqual(decision["backend"], "cpu")
+            self.assertEqual(decision["gpu_unused"], a100["name"])
+            self.assertEqual(decision["reason"],
+                             "NVIDIA A100-PCIE-40GB found, but MiMo-V2.6 Flash has no CUDA build for "
+                             "Windows and no Vulkan device answered (the NVIDIA card runs in TCC mode, "
+                             "where Windows offers no Vulkan device): the engine runs on the CPU")
+        with mock.patch.object(setup_flow, "current_version", return_value="2.1.0"):
+            decision = self.choose(hw, family="qwen38", tc=tc, platform="win32")
+        self.assertEqual(decision["backend"], "cpu")
+        self.assertEqual(decision["missing"], [])
+        self.assertIn("the windows-x86_64-cuda.zip of release 2.1.0 has no qwen38.exe", decision["reason"])
+        # a driver model that was not read, or Linux: no word on TCC
+        decision = self.choose(hw_report(nvidia=[dict(a100, driver_model=None)]), family="mimo", tc=tc,
+                               platform="win32")
+        self.assertIn("and no Vulkan device answered: the engine runs on the CPU", decision["reason"])
+        decision = self.choose(hw_report(nvidia=[a100]), family="olmoe")
+        self.assertEqual(decision["reason"],
+                         "NVIDIA A100-PCIE-40GB found, but OLMoE has no CUDA path and no Vulkan "
+                         "device answered: the engine runs on the CPU")
+        # something to install that opens a path: the hint and its question, as before
+        decision = self.choose(hw_report(nvidia=[RTX]), family="qwen36",
+                               tc=dict(TC_ALL, nvcc=None, can_build_cuda=False))
+        self.assertEqual(decision["missing"][0][0], "cuda")
+        self.assertNotIn("gpu_unused", decision)
+        # a card below the CUDA floor keeps its own reason
+        old = dict(RTX, name="NVIDIA GeForce RTX 2070", compute_cap="7.5")
+        decision = self.choose(hw_report(nvidia=[old]), family="kimi", tc=tc, platform="win32")
+        self.assertIn("runs on compute 8.0", decision["reason"])
+        self.assertNotIn("gpu_unused", decision)
+
+    def test_backend_vulkan_without_a_device_stops(self):
+        # #2846: asked for by name, as --backend cuda that cannot run stops
+        a100 = dict(RTX, name="NVIDIA A100-PCIE-40GB", compute_cap="8.0", driver_model="TCC")
+        with self.assertRaises(setup_flow.SetupError) as raised:
+            self.choose(hw_report(nvidia=[a100]), family="qwen38", requested="vulkan", platform="win32")
+        self.assertEqual(str(raised.exception),
+                         "--backend vulkan: no Vulkan device answered (the NVIDIA card runs in TCC mode, "
+                         "where Windows offers no Vulkan device); run with --backend auto to see what "
+                         "this machine can use")
+        with self.assertRaises(setup_flow.SetupError):
+            self.choose(hw_report(), requested="vulkan")
+        self.assertEqual(self.choose(hw_report(vulkan=DGPU), requested="vulkan")["backend"], "vulkan")
+
     def test_no_compiler_counts_on_the_release_vulkan_engine(self):
         # nothing here builds and no engine is here: resolve_engine downloads the
         # release's, which are Vulkan builds on Linux and Windows x86_64
@@ -673,6 +731,7 @@ class WindowsCudaPackage(unittest.TestCase):
     def test_the_package_carries_the_engines_the_setup_counts_on(self):
         expected = {family_by_id(fid).engine_artifact for fid in setup_flow.WINDOWS_CUDA_ENGINES}
         self.assertIn("glm53", expected)
+        self.assertIn("qwen38", expected)       # #2846
         for fid in setup_flow.WINDOWS_CUDA_ENGINES:      # the tier coli_cuda.dll's loader serves
             self.assertEqual(setup_flow.CUDA_ENGINES[fid]["object"], "backend_cuda.o", fid)
         def exes(text):
@@ -1674,6 +1733,26 @@ class WholeSetup(HomeTestCase):
         self.assertEqual(calls, ["cuda"])
         self.assertIn("Build for Vulkan instead?", asked.call_args[0][0])
         self.assertIn("build-cuda.log", setup_flow.read_state()["message"])
+
+    def test_an_unused_nvidia_card_is_asked_about_before_the_download(self):
+        # #2846: nothing to install would open a GPU path for the model, so the setup
+        # asks before the download; "no" stops there, with the way to pick another model
+        Path(self.engines, "qwen36").write_bytes(b"\x7fELF plain")
+        a100 = dict(RTX, name="NVIDIA A100-PCIE-40GB", compute_cap="8.0", driver_model="TCC")
+        decision = {"backend": "cpu", "reason": "NVIDIA A100-PCIE-40GB found, but ...",
+                    "missing": [], "gpu": None, "gpu_unused": a100["name"]}
+        out = io.StringIO()
+        ui = setup_flow.UI(True, stream=out)
+        with mock.patch.object(setup_hw, "detect", return_value=hw_report(nvidia=[a100])), \
+             mock.patch.object(setup_flow, "choose_backend", return_value=decision), \
+             mock.patch.object(setup_flow, "download_model") as download, \
+             mock.patch("builtins.input", side_effect=["n"]) as asked:
+            code = setup_flow.run(lambda a: setup_flow.cmd_setup(a, ui=ui),
+                                  setup_args(dir=self.models, pick="tiny", yes=False))
+        self.assertEqual(code, 1, out.getvalue())
+        self.assertIn("on the CPU?", asked.call_args[0][0])
+        download.assert_not_called()
+        self.assertIn("coli setup --reconfigure", setup_flow.read_state()["message"])
 
     def test_a_resumed_setup_does_not_build_the_failed_backend_again(self):
         build, calls = self.failing_build("cuda")
