@@ -359,6 +359,50 @@ reference of the dequantized sidecar through every expert path with the last
 logits identical to the bit across them, and the CUDA tier declining the int4
 experts on the fake backend.
 
+## Routed experts as MXFP4 (AMD Quark)
+
+AMD publishes the model with its routed experts quantized to MXFP4 with Quark
+(OCP microscaling: e2m1 values two to a byte, one E8M0 exponent per 32
+inputs, 4.25 bits a weight). `tools/convert_qwen38_experts_mxfp4.py` copies
+those bytes, unchanged, into `<model>/experts-mxfp4/` next to the FP8 release,
+which it only reads; nothing is quantized again.
+
+```sh
+python3 c/tools/convert_qwen38_experts_mxfp4.py --model ~/Models/Qwen3.8-Flash-Next-FP8 \
+    --quark ~/Models/Qwen3.8-Flash-Next-MXFP4 --plan
+python3 c/tools/convert_qwen38_experts_mxfp4.py --model ~/Models/Qwen3.8-Flash-Next-FP8 \
+    --quark ~/Models/Qwen3.8-Flash-Next-MXFP4
+```
+
+| | FP8 (release) | int4-g64 sidecar | MXFP4 sidecar |
+|---|---|---|---|
+| bytes per expert | 4,915,200 | 2,764,800 | 2,611,200 (2,613,248 with its pad) |
+
+The layout is the int4 sidecar's (one `layer-NNN.safetensors` per layer and
+`index.json`, resumable, refused when its index or files disagree with
+`config.json`), with one record per expert starting on a 4096-byte boundary:
+
+```
+gate scales U8 [I, H/32] | down scales U8 [H, I/32] | up scales U8 [I, H/32] |
+gate e2m1 U8 [I, H/2] | down e2m1 U8 [H, I/2] | up e2m1 U8 [I, H/2] | pad
+```
+
+named like Quark's tensors (`...experts.E.gate_proj.weight_scale` and
+`.weight`, under the release's prefix) and read as `quant.h`'s
+`matmul_mxfp4` reads them: w = e2m1(nibble) x 2^(scale - 127), the low nibble
+the even column. Before a layer is written the converter checks every
+expert's dtypes and shapes, refuses the E8M0 NaN (255), and compares four
+experts of the layer, dequantized, with the FP8 release's (cosine per matrix,
+`--min-cos`, 0.95 by default): a nibble order, a scale axis or a name mix-up
+shows as a cosine near 0.
+
+`make -C c qwen38-tiny-mxfp4-generate` builds the tiny fixture with MXFP4
+experts (`tools/make_qwen38_tiny.py --mxfp4-experts`): the experts rounded to
+MXFP4, written under `quark/` with Quark's names and as FP8 shards that hold
+the same values exactly, converted, and checked record by record against the
+Quark bytes and value by value against the FP8 shards. Its `ref.json` is the
+float32 reference of those values.
+
 ## Speculative decoding with the MTP head
 
 On by default from 1.13.0 when the checkpoint has it (`Q38_MTP=0` turns it off, and

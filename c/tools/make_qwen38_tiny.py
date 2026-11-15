@@ -20,6 +20,7 @@ Requires Transformers 5.16.1, the first release with Qwen4-Exp support.
 import argparse
 import hashlib
 import json
+import math
 import random
 import shutil
 import sys
@@ -124,13 +125,16 @@ FP8_BLOCK = 128
 FP8_E4M3_MAX = 448.0
 
 
-def _fp8_block_quant(w):
+def _fp8_block_quant(w, pow2=False):
     """Quantize a 2-D BF16/F32 matrix to e4m3 with one scale per 128x128 block,
     the released checkpoint's layout (`weight_block_size [128, 128]`,
     `weight_scale_inv` = the multiplier that restores the value). Returns
     (e4m3 tensor, scale_inv tensor [ceil(O/128), ceil(I/128)], dequantized w).
     The dequantized copy is what goes back into the model, so the reference
-    the fixture emits is the arithmetic of the bytes on disk."""
+    the fixture emits is the arithmetic of the bytes on disk. pow2: the scale
+    is the power of two that puts the block's largest value at or under 448,
+    and every value must come back exactly (MXFP4 values do: e2m1 times a
+    power of two)."""
     w32 = w.float()
     O, I = w32.shape
     nb_o, nb_i = (O + FP8_BLOCK - 1) // FP8_BLOCK, (I + FP8_BLOCK - 1) // FP8_BLOCK
@@ -142,14 +146,18 @@ def _fp8_block_quant(w):
             blk = w32[bo * FP8_BLOCK:(bo + 1) * FP8_BLOCK, bi * FP8_BLOCK:(bi + 1) * FP8_BLOCK]
             amax = blk.abs().max().clamp(min=1e-12)
             s = (amax / FP8_E4M3_MAX).item()
+            if pow2:
+                s = 2.0 ** math.ceil(math.log2(s))
             qb = (blk / s).to(torch.float8_e4m3fn)
+            if pow2 and not torch.equal(qb.float() * s, blk):
+                raise ValueError("an MXFP4 value is not exact in e4m3 under its block's power-of-two scale")
             q[bo * FP8_BLOCK:(bo + 1) * FP8_BLOCK, bi * FP8_BLOCK:(bi + 1) * FP8_BLOCK] = qb
             deq[bo * FP8_BLOCK:(bo + 1) * FP8_BLOCK, bi * FP8_BLOCK:(bi + 1) * FP8_BLOCK] = qb.float() * s
             scale_inv[bo, bi] = s
     return q, scale_inv, deq
 
 
-def _fp8_experts_in_model(model):
+def _fp8_experts_in_model(model, pow2=False):
     """Fake-quantize every routed expert matrix in place (dequantized values
     back into the BF16 parameters) and return {saved_name: (q, scale_inv)} for
     the shard rewrite. In memory the experts are two fused parameters per
@@ -166,14 +174,14 @@ def _fp8_experts_in_model(model):
                 E, twoI, H = param.shape; I = twoI // 2
                 for e in range(E):
                     for kind, sl in (("gate_proj", slice(0, I)), ("up_proj", slice(I, twoI))):
-                        q, scale_inv, deq = _fp8_block_quant(param.data[e, sl, :])
+                        q, scale_inv, deq = _fp8_block_quant(param.data[e, sl, :], pow2)
                         param.data[e, sl, :] = deq.to(param.dtype)
                         packed[f"{base}{e}.{kind}.weight"] = (q, scale_inv)
             elif name.endswith(".mlp.experts.down_proj"):
                 base = name[: -len("down_proj")]
                 E = param.shape[0]
                 for e in range(E):
-                    q, scale_inv, deq = _fp8_block_quant(param.data[e])
+                    q, scale_inv, deq = _fp8_block_quant(param.data[e], pow2)
                     param.data[e] = deq.to(param.dtype)
                     packed[f"{base}{e}.down_proj.weight"] = (q, scale_inv)
     if not packed:
@@ -323,6 +331,83 @@ def _int4_experts_in_model(model, out: Path):
     print(f"int4 experts: {sidecar} written, the model now holds its dequantized values")
 
 
+E2M1_GRID = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def _mxfp4_quant(w):
+    """[rows, cols] -> (e2m1 nibbles U8 [rows, ceil(cols/2)], E8M0 scales U8 [rows, ceil(cols/32)],
+    the values f32 [rows, cols]), rounded as the OCP MX spec says: per 32 inputs the exponent
+    floor(log2(amax)) - 2, each value to the nearest e2m1 (ties to the even code, above 6 to 6),
+    no -0. The low nibble is the even column; a short last group is padded with zeros."""
+    w = w.double()
+    rows, cols = w.shape
+    ng = -(-cols // 32)
+    g = torch.nn.functional.pad(w, (0, ng * 32 - cols)).reshape(rows, ng, 32)
+    amax = g.abs().amax(-1)
+    e = torch.where(amax > 0, torch.floor(torch.log2(amax.clamp(min=1e-300))) - 2, torch.full_like(amax, -127))
+    e = e.clamp(-127, 127)
+    x = (g / torch.exp2(e)[..., None]).abs().clamp(max=6.0)
+    grid = torch.tensor(E2M1_GRID, dtype=torch.float64)
+    d = (x[..., None] - grid).abs()
+    near = d == d.amin(-1, keepdim=True)
+    idx = torch.arange(8)
+    code = torch.where(near & (idx % 2 == 0), idx, torch.full_like(idx, 8)).amin(-1)
+    code = torch.where(code == 8, near.int().argmax(-1), code)
+    nib = torch.where((g < 0) & (code > 0), code | 8, code).to(torch.uint8).reshape(rows, ng * 32)
+    values = (torch.where(nib >= 8, -1.0, 1.0).double() * grid[(nib & 7).long()]).reshape(rows, ng, 32)
+    values = (values * torch.exp2(e)[..., None]).reshape(rows, ng * 32)[:, :cols].float()
+    nib = nib[:, : -(-cols // 2) * 2]
+    packed = (nib[:, 0::2] | (nib[:, 1::2] << 4)).contiguous()
+    return packed, (e + 127).to(torch.uint8).contiguous(), values
+
+
+def _mxfp4_experts_in_model(model):
+    """Round every routed expert matrix to MXFP4 in place (the values go back into the BF16
+    parameters, where they are exact) and return {saved name: (nibbles, scales)} for the Quark
+    shard, named as save_pretrained splits the fused parameters (see _fp8_experts_in_model)."""
+    packed = {}
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if name.endswith(".mlp.experts.gate_up_proj"):
+                base = name[: -len("gate_up_proj")]
+                I = param.shape[1] // 2
+                parts = (("gate_proj", slice(0, I)), ("up_proj", slice(I, 2 * I)))
+            elif name.endswith(".mlp.experts.down_proj"):
+                base = name[: -len("down_proj")]
+                parts = (("down_proj", slice(None)),)
+            else:
+                continue
+            for e in range(param.shape[0]):
+                for kind, rows in parts:
+                    nibbles, scales, values = _mxfp4_quant(param.data[e, rows, :])
+                    param.data[e, rows, :] = values.to(param.dtype)
+                    if not torch.equal(param.data[e, rows, :].float(), values):
+                        raise ValueError("an MXFP4 value is not exact in the model's dtype")
+                    packed[f"{base}{e}.{kind}.weight"] = (nibbles, scales)
+    if not packed:
+        raise RuntimeError("no routed expert parameters found to quantize")
+    return packed
+
+
+def _mxfp4_quark_and_sidecar(out: Path, packed):
+    """Write the experts as AMD's Quark checkpoint names them (quark/model.safetensors: U8 e2m1
+    nibbles <...>.weight and U8 E8M0 scales <...>.weight_scale, with config.json), then the
+    experts-mxfp4/ sidecar through the converter the real model goes through."""
+    from safetensors.torch import save_file
+    quark = out / "quark"
+    quark.mkdir()
+    tensors = {}
+    for name, (nibbles, scales) in packed.items():
+        tensors[name] = nibbles
+        tensors[name[: -len(".weight")] + ".weight_scale"] = scales
+    save_file(tensors, str(quark / "model.safetensors"), metadata={"format": "pt"})
+    shutil.copyfile(out / "config.json", quark / "config.json")
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import convert_qwen38_experts_mxfp4 as mxfp4
+    sidecar = mxfp4.convert(str(out), str(quark))
+    print(f"mxfp4 experts: {len(packed)} matrices in quark/, {sidecar} written")
+
+
 # --geometry gguf-256, for the GGUF oracle: every matrix whose rows a ggml type blocks
 # (the input width) is a whole number of 256 weights, so the K and i-quant types apply to
 # all of them, and 32 value : 16 key DeltaNet heads, so llama.cpp's value-head reorder is
@@ -337,9 +422,12 @@ GEOMETRIES = {
 
 
 def build(out: Path, prompt_ids=None, max_new=8, seed=SEED, emit_ref=True, fp8_experts=False,
-          int4_experts=False, expert_gain=1.0, mtp=False, ple_layer=1, geometry=None):
+          int4_experts=False, expert_gain=1.0, mtp=False, ple_layer=1, geometry=None, mxfp4_experts=False):
     if max_new < 1:
         raise ValueError("max_new must be at least 1")
+    if mxfp4_experts and int4_experts:
+        raise ValueError("--mxfp4-experts and --int4-experts make two different fixtures")
+    fp8_experts = fp8_experts or mxfp4_experts
     random.seed(seed)
     torch.manual_seed(seed)
     transformers, ModelCls, ConfigCls = _classes()
@@ -439,11 +527,16 @@ def build(out: Path, prompt_ids=None, max_new=8, seed=SEED, emit_ref=True, fp8_e
             for name, param in model.named_parameters():
                 if ".mlp.experts." in name:
                     param.mul_(expert_gain)
-    packed = _fp8_experts_in_model(model) if fp8_experts else None
+    # --mxfp4-experts: the experts become MXFP4 values first; the FP8 shards then hold exactly
+    # those values (power-of-two block scales), so ref.json is the reference of both the FP8
+    # snapshot and its experts-mxfp4/ sidecar.
+    mx_packed = _mxfp4_experts_in_model(model) if mxfp4_experts else None
+    packed = _fp8_experts_in_model(model, pow2=mxfp4_experts) if fp8_experts else None
     out.mkdir(parents=True, exist_ok=True)
     # A sidecar left by an earlier run belongs to the weights it was converted
     # from, and qwen38 picks it up by itself: regenerating the fixture drops it.
-    shutil.rmtree(out / "experts-int4g64", ignore_errors=True)
+    for stale in ("experts-int4g64", "experts-mxfp4", "quark"):
+        shutil.rmtree(out / stale, ignore_errors=True)
     model.save_pretrained(str(out), safe_serialization=True)
     if geometry:
         # Transformers saves "qwen_sparse_attention"; the release's config.json says
@@ -458,6 +551,8 @@ def build(out: Path, prompt_ids=None, max_new=8, seed=SEED, emit_ref=True, fp8_e
         _add_mtp(out, config, seed, fp8_experts=fp8_experts, expert_gain=expert_gain, model_base=bool(geometry))
     if packed:
         _rewrite_shard_fp8(out, packed)
+    if mx_packed:
+        _mxfp4_quark_and_sidecar(out, mx_packed)
 
     if prompt_ids is None:
         prompt_ids = [1, 3, 4, 5, 6]
@@ -471,6 +566,7 @@ def build(out: Path, prompt_ids=None, max_new=8, seed=SEED, emit_ref=True, fp8_e
         "transformers_version": transformers.__version__,
         "text_only": True,
         "fp8_experts": bool(fp8_experts),
+        **({"mxfp4_experts": True} if mxfp4_experts else {}),
         **({"expert_gain": expert_gain} if expert_gain != 1.0 else {}),
         "naming": "upstream Qwen4ExpForCausalLM (no model.language_model prefix)",
         "config_summary": {
@@ -483,6 +579,12 @@ def build(out: Path, prompt_ids=None, max_new=8, seed=SEED, emit_ref=True, fp8_e
             "tie_word_embeddings": config.tie_word_embeddings,
         },
     }
+    if mxfp4_experts:
+        # in float32, as the int4 reference: the weights widen exactly, and a BF16 reference
+        # rounds by more (cosine 0.9965 against the engine on this fixture) than the gap the
+        # gate has to see
+        model.float()
+        payload["reference_dtype"] = "float32"
     payload.update(_reference(model, prompt_ids, max_new))
     if emit_ref:
         ref_path = out / "ref.json"
@@ -519,6 +621,11 @@ def main():
     parser.add_argument("--int4-experts", action="store_true",
                         help="also convert the routed experts to the experts-int4g64/ sidecar "
                              "and write ref_int4.json, the reference of the dequantized sidecar")
+    parser.add_argument("--mxfp4-experts", action="store_true",
+                        help="round the routed experts to MXFP4, write them as AMD's Quark checkpoint "
+                             "names them (quark/) and as FP8 shards holding the same values exactly, "
+                             "and convert quark/ into the experts-mxfp4/ sidecar; ref.json is the "
+                             "reference of those values")
     parser.add_argument("--ple-layer", type=int, default=1,
                         help="the PLE layer, one-based as in the config (default 1: layer 0)")
     parser.add_argument("--geometry", choices=sorted(GEOMETRIES),
@@ -531,7 +638,7 @@ def main():
     build(args.out, prompt_ids=prompt, max_new=args.max_new, seed=args.seed, emit_ref=not args.no_ref,
           fp8_experts=args.fp8_experts, int4_experts=args.int4_experts,
           expert_gain=args.expert_gain, mtp=args.mtp, ple_layer=args.ple_layer,
-          geometry=args.geometry)
+          geometry=args.geometry, mxfp4_experts=args.mxfp4_experts)
 
 
 if __name__ == "__main__":
