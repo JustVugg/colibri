@@ -476,9 +476,18 @@ Tool use follows the per-engine matrix above. Unsupported engines reject active
 tool declarations and choices explicitly instead of feeding another
 architecture's markers to an incompatible tokenizer.
 
-Not supported, and refused explicitly rather than ignored: `stop_sequences`,
-`top_k`, and non-text content blocks (images, documents). Errors use Anthropic's own
-`{"type":"error","error":{...}}` envelope on this path. Architecture-local
+`stop_sequences` end the turn with `stop_reason: "stop_sequence"` and name the
+sequence in `stop_sequence`; the model family's own role markers still end it as
+`end_turn`. `POST /v1/messages/count_tokens` answers `{"input_tokens": N}`, an
+estimate from the rendered prompt and the tokens per character measured on the
+prompts served so far (nothing reaches the engine).
+
+Not supported, and refused explicitly rather than ignored: `top_k`, and non-text
+content blocks (images, documents). Errors use Anthropic's own
+`{"type":"error","error":{...}}` envelope on this path, with the `type` its HTTP
+status has in Anthropic's API (`authentication_error`, `not_found_error`,
+`rate_limit_error`, `overloaded_error`, `api_error`, ...); an error after a stream
+has started is sent as an `error` event before the close. Architecture-local
 features that have not been wired to this protocol are likewise rejected with
 an explicit error.
 
