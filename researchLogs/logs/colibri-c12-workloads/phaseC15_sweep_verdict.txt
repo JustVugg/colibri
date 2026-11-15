@@ -1,0 +1,16 @@
+output sha agreement (base vs sgemm, per turn):
+  16k: AGREE (ba72974c4d08)
+  24k: AGREE (af669f9748f9)
+  A_t1: DIVERGE base=['919b2a0f4fd3'] sgemm=['0aca30b929fd']
+  A_t2: AGREE (e3b0c44298fc)
+  A_t3: AGREE (e3b0c44298fc)
+  B_t1: DIVERGE base=['012df875d9e0'] sgemm=['ab506b37637b']
+  B_t2: AGREE (e3b0c44298fc)
+  B_t3: AGREE (e3b0c44298fc)
+turn agreement: 6 agree / 2 diverge
+
+paired cold timings (base -> sgemm):
+  r1 16k (16556 tok): attn 417.4 -> 88.5 s (+78.8%) | ttft 806.6 -> 510.6 s (+36.7%)
+  r1 24k (24851 tok): attn 971.2 -> 176.3 s (+81.8%) | ttft 1579.7 -> 814.6 s (+48.4%)
+  r2 16k (16556 tok): attn 442.8 -> 89.2 s (+79.9%) | ttft 856.2 -> 507.5 s (+40.7%)
+  r2 24k (24851 tok): attn 933.6 -> 182.4 s (+80.5%) | ttft 1523.3 -> 834.4 s (+45.2%)
