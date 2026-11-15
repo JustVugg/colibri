@@ -242,7 +242,24 @@ Investigation order:
 - **Speculative decode unaffected at every size** (`!g_q36_rowwise` exclusion working): acceptance 60–85%, 1.05–2.46 tokens/forward across all 24 completed turns. The trend worth recording: **T(1) grew ~190 ms @ 37K → ~500–860 ms @ 53–57K** — that is decode-forward cost growing with context (DeltaNet state + attention over a longer KV), not an sgemm effect, but it is the decode-side pressure point for future work.
 - **Disk pcache churned correctly under the byte budget**: saved a snapshot per turn (37,398 → 58,031 tokens) and pruned the previous file, sizes climbing 702.7 MB → 1,094.0 MB — retention policy working at 1 GB-scale files.
 - One benign anomaly: request 25 was cancelled by the client (Copilot closed the turn); the engine stopped 1.1 s after the cancel and the slot freed — the cancel path worked as designed.
-- **Client-side caveat — now closed (2026-11-15):** Copilot discards the timings dict, so that session produced no per-turn TTFT numbers. `COLI_LOG_TIMINGS` is now implemented in `c/openai_server.py` (env-gated, default OFF): when set, the gateway appends one JSON line per finished request (timestamp, stream flag, completion_tokens, the full timings dict) to a log file (`COLI_LOG_TIMINGS=1` → `./timings-log.jsonl`, any other value used as the path). Gateway fixture suite green (474 passed, 588 subtests); live smoke test on :8001 recorded a correct line. To capture per-turn timings during the next Copilot session, add `COLI_LOG_TIMINGS=<path>` to the serve launch.
+- **Client-side caveat — now closed (2026-11-15):** Copilot discards the timings dict, so that session produced no per-turn TTFT numbers. `COLI_LOG_TIMINGS` is now implemented in `c/openai_server.py` (env-gated, default OFF): when set, the gateway appends one JSON line per finished request (timestamp, stream flag, completion_tokens, the full timings dict) to a log file (`COLI_LOG_TIMINGS=1` → `./timings-log.jsonl`, any other value used as the path). Gateway fixture suite green (474 passed, 588 subtests); live smoke test on :8001 recorded a correct line.
+
+**Canonical serve command (2026-11-15, user's standard launch — sgemm is now the default, so no `Q36_ATTN_SGEMM` needed; `Q36_ATTN_SGEMM=0` restores the scalar fallback if ever wanted):**
+
+```bash
+pkill -f "colibri.cli serve"; pkill -f "c/qwen36"; sleep 3
+
+OMP_NUM_THREADS=6 COLI_PREFIX_LOG=1 COLI_PCACHE_LOG=1 \
+COLI_LOG_TIMINGS=/Users/creemac/colibri/colibri/researchLogs/logs/colibri-c12-workloads/timings-requests.jsonl \
+PYTHONPATH=/Users/creemac/colibri/colibri \
+nohup /opt/homebrew/bin/python3 -m colibri.cli serve \
+  --model /Users/creemac/.lmstudio/models/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-IQ2_XXS.colibri \
+  --host 0.0.0.0 --port 8001 --ctx 66000 \
+  --api-key='-4Jc6egKcHmI-1okTj4_MUWOU4etmppT8LLG-wxzUBk' \
+  > /Users/creemac/colibri/colibri/researchLogs/logs/colibri-c12-workloads/serve-agent-sgemm_brewer_agent.log 2>&1 &
+```
+
+The timings log appends across sessions, so per-turn TTFT/prefill/decode evidence from every real agent session accumulates in `timings-requests.jsonl` even though Copilot discards the response's timings.
 
 **Adoption status after the real session:** still default OFF pending the user's decision; the assistant's recommended pre-adoption sweep (agent-ext base-vs-sgemm sha check; 16K/24K cold base-vs-sgemm) remains the stated path to flipping the default, and this session adds qualitative confidence (structure, errors, interaction with reuse/pcache/spec) but no sha evidence, since no base-run twin exists for these prompts.
 
