@@ -32,6 +32,12 @@
 #if defined(__AVX2__)
 #include <immintrin.h>
 #endif
+#if defined(__APPLE__)
+#include <Accelerate/Accelerate.h>   /* C15: cblas_sgemm prefill attention (Q36_ATTN_SGEMM) */
+#define Q36_ATTN_SGEMM_AVAILABLE 1
+#else
+#define Q36_ATTN_SGEMM_AVAILABLE 0
+#endif
 
 /* Hard context ceiling: the model's max_position_embeddings. Every buffer that
  * scales with position (KV cache, attention score row) is allocated from max_t,
@@ -1664,6 +1670,38 @@ static int q36_attn_rowblock(void) {
     if (n < 0) n = 0;
     if (n > 64) n = 64;
     return n;
+}
+
+/* ---- C15 sgemm prefill attention (Q36_ATTN_SGEMM=1) ---------------------------
+ * A plain prompt prefill's score and context passes run as Accelerate cblas_sgemm
+ * calls instead of the per-(head, row) scalar loop: scores = query rows x K^T
+ * (fp32 query, the cache's K/V rows widened fp16->f32 once per pass), context =
+ * probs x V. Changes the summation order, so outputs are NOT bit-exact vs the
+ * scalar path -- this is the programme's first tolerance-contract kernel: the
+ * correctness gate is the measured score/context maxdiff (bench gate
+ * `researchLogs/logs/colibri-c12-workloads/c15_sgemm_gate.c`: rel 1.8e-05 scores,
+ * 2.4e-06 ctx) plus the real-model A/B, not sha identity. Off by default: the
+ * scalar loop stays the fallback and decode (S==1), multiplexed rows, a
+ * speculative verify's rows (g_q36_rowwise: decode-step bits), ring/window
+ * layers and sink heads keep the scalar loop untouched. macOS only (Accelerate
+ * framework); Q36_ATTN_SGEMM_CHECK=1 additionally computes the scalar reference
+ * per block and reports the per-layer maxdiff on real activations (doubles the
+ * attention work, a measurement aid only). */
+static int g_q36_attn_sgemm = -1, g_q36_attn_sgemm_check = -1;
+static inline int q36_attn_sgemm(void) {
+    if (!Q36_ATTN_SGEMM_AVAILABLE) return 0;
+    if (g_q36_attn_sgemm < 0) {
+        const char *e = getenv("Q36_ATTN_SGEMM");
+        g_q36_attn_sgemm = e && *e && *e != '0';
+    }
+    return g_q36_attn_sgemm;
+}
+static inline int q36_attn_sgemm_check(void) {
+    if (g_q36_attn_sgemm_check < 0) {
+        const char *e = getenv("Q36_ATTN_SGEMM_CHECK");
+        g_q36_attn_sgemm_check = e && *e && *e != '0';
+    }
+    return g_q36_attn_sgemm_check;
 }
 
 /* ---- C14 phase-0 MoE profile (Q36_MOE_PROF=1) --------------------------------
@@ -5337,6 +5375,111 @@ static inline void mrope_at(const Model *m, int p, int pos3[3]) {
     } else pos3[0] = pos3[1] = pos3[2] = p + m->rope_delta;
 }
 
+/* The C15 sgemm pass itself: causal row-blocks of up to 512 query rows per head.
+ * No query packing is needed: cblas's lda covers the [S][H][hd] layout's stride,
+ * and the context sgemm writes straight into ctx's strided per-head rows via
+ * ldc. blk holds one block's scores (and then its probabilities) over the full
+ * causal column range [0, pos_base+s1); columns past a row's own position are
+ * zeroed after the softmax so the context contraction skips them, exactly what
+ * the scalar loop's `t <= qpos` bound does. The scale is folded into the score
+ * sgemm's alpha, so the softmax sees the scaled scores as the engine does. */
+static void q36_attn_prefill_sgemm(Model *m, int layer, const float *query, float *ctx,
+                                   int S, int pos_base) {
+    Cfg *c = &m->c;
+    int H = c->q_heads, KV = c->kv_heads, hd = c->head_dim, kvd = c->k_head_dim;
+    int q_per_kv = H / KV;
+    int T = pos_base + S;                      /* rows [0, T) hold every key this call reads */
+    int rbmax = S < 512 ? S : 512;
+    const float scale = 1.f / sqrtf((float)hd);
+    const int chk = q36_attn_sgemm_check();
+    /* widen the cache's K and V rows once: the same bits the scalar path reads
+     * per dot, unpacked one row at a time into contiguous [T][kvd] per kv head */
+    float *Kf = falloc((int64_t)KV*T*kvd), *Vf = falloc((int64_t)KV*T*kvd);
+    const void *Kl = m->K[layer], *Vl = m->V[layer];
+    for (int kvh = 0; kvh < KV; kvh++) {
+        #pragma omp parallel for schedule(static)
+        for (int t = 0; t < T; t++) {
+            int64_t ki = q36_kv_at(m, layer, kvh, t);
+            if (q36_kv16()) {
+                kv16_unpack(Kf + ((int64_t)kvh*T + t)*kvd, (const uint16_t *)Kl + ki, kvd);
+                kv16_unpack(Vf + ((int64_t)kvh*T + t)*kvd, (const uint16_t *)Vl + ki, kvd);
+            } else {
+                memcpy(Kf + ((int64_t)kvh*T + t)*kvd, (const float *)Kl + ki, (size_t)kvd*sizeof(float));
+                memcpy(Vf + ((int64_t)kvh*T + t)*kvd, (const float *)Vl + ki, (size_t)kvd*sizeof(float));
+            }
+        }
+    }
+    float *blk = falloc((int64_t)rbmax*T);
+    float *scr = chk ? falloc((int64_t)T) : NULL;      /* check mode's scalar reference row */
+    float *cxr = chk ? falloc((int64_t)rbmax*kvd) : NULL;   /* check mode's per-row scalar ctx */
+
+    double sc_abs = 0, sc_rel = 0, cx_abs = 0, cx_rel = 0;
+    for (int hh = 0; hh < H; hh++) {
+        int kvh = hh / q_per_kv;
+        const float *Kk = Kf + (int64_t)kvh*T*kvd, *Vk = Vf + (int64_t)kvh*T*kvd;
+        for (int s0 = 0; s0 < S; s0 += rbmax) {
+            int rb = S - s0 < rbmax ? S - s0 : rbmax;
+            int s1 = s0 + rb;
+            int ncol = pos_base + s1;          /* row s attends t <= pos_base+s < ncol */
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, rb, ncol, hd,
+                        scale, query + ((int64_t)s0*H + hh)*hd, H*hd, Kk, kvd, 0.0f, blk, ncol);
+            if (chk) {
+                /* the scalar reference scores for this block, straight from the
+                 * cache: the engine's exact q36_kv_dot calls, compared BEFORE the
+                 * softmax touches blk. The scalar probs and ctx rows are kept for
+                 * the ctx comparison after the context sgemm below. */
+                for (int i = 0; i < rb; i++) {
+                    int s = s0 + i, qp = pos_base + s;
+                    const float *qv = query + ((int64_t)s*H + hh)*hd;
+                    float mx = 0;
+                    for (int t = 0; t <= qp; t++) {
+                        scr[t] = q36_kv_dot(qv, Kl, q36_kv_at(m, layer, kvh, t), kvd) * scale;
+                        float d = fabsf(scr[t] - blk[(int64_t)i*ncol + t]);
+                        if (d > sc_abs) sc_abs = d;
+                        if (fabsf(scr[t]) > mx) mx = fabsf(scr[t]);
+                    }
+                    for (int t = 0; t <= qp; t++) {
+                        float r = fabsf(scr[t] - blk[(int64_t)i*ncol + t]) / (mx > 0 ? mx : 1);
+                        if (r > sc_rel) sc_rel = r;
+                    }
+                    softmax_row(scr, qp + 1);
+                    float *cr = cxr + (int64_t)i*kvd;
+                    for (int dd = 0; dd < kvd; dd++) cr[dd] = 0;
+                    for (int t = 0; t <= qp; t++)
+                        q36_kv_axpy(cr, scr[t], Vl, q36_kv_at(m, layer, kvh, t), kvd);
+                }
+            }
+            #pragma omp parallel for schedule(static)
+            for (int i = 0; i < rb; i++) {
+                float *row = blk + (int64_t)i*ncol;
+                softmax_row(row, pos_base + s0 + i + 1);
+                for (int t = pos_base + s0 + i + 1; t < ncol; t++) row[t] = 0.f;
+            }
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, rb, kvd, ncol,
+                        1.0f, blk, ncol, Vk, kvd, 0.0f,
+                        ctx + ((int64_t)s0*H + hh)*hd, H*hd);
+            if (chk) {
+                for (int i = 0; i < rb; i++) {
+                    int s = s0 + i;
+                    const float *cr = cxr + (int64_t)i*kvd;
+                    float mxc = 0;
+                    for (int dd = 0; dd < kvd; dd++) if (fabsf(cr[dd]) > mxc) mxc = fabsf(cr[dd]);
+                    for (int dd = 0; dd < kvd; dd++) {
+                        float d = fabsf(cr[dd] - ctx[((int64_t)s*H + hh)*hd + dd]);
+                        if (d > cx_abs) cx_abs = d;
+                        float r = d / (mxc > 0 ? mxc : 1);
+                        if (r > cx_rel) cx_rel = r;
+                    }
+                }
+            }
+        }
+    }
+    if (chk)
+        fprintf(stderr, "[qwen36] attn-sgemm check layer %d: scores maxdiff abs %.3e rel %.3e | ctx abs %.3e rel %.3e\n",
+                layer, sc_abs, sc_rel, cx_abs, cx_rel);
+    free(Kf); free(Vf); free(blk); free(scr); free(cxr);
+}
+
 /* Gated Attention (GQA) matching HF Qwen3_5MoeAttention:
  *  - q_proj outputs query(head_dim) ++ attn_output_gate(head_dim); k/v are head_dim.
  *  - per-head q/k RMSNorm (weight [head_dim], 1.0+weight).
@@ -5431,7 +5574,14 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         }
     float *ctx = falloc((int64_t)S*H*hd);
     int rbn = q36_attn_rowblock();
-    if (rbn >= 2 && !mr && !ring && !win && !l->sinks && S > 1) {
+    if (q36_attn_sgemm() && !mr && !g_q36_rowwise && !ring && !win && !l->sinks
+        && hd == kvd && S > 1) {
+        /* C15 sgemm prefill attention (Q36_ATTN_SGEMM=1): the two GEMM-shaped
+         * passes go to Accelerate. Not bit-exact by design -- the tolerance
+         * contract is the correctness gate (see the helper's comment above).
+         * Runs serially here: cblas_sgemm drives its own thread pool. */
+        q36_attn_prefill_sgemm(m, layer, query, ctx, S, pos_base);
+    } else if (rbn >= 2 && !mr && !ring && !win && !l->sinks && S > 1) {
         /* Row-blocked prefill attention (Q36_ATTN_ROWBLOCK=N): the score and
          * context passes handle N query rows per trip over the cache, so each
          * K/V row is read ~N times less (16 q-heads share each of the 2 KV

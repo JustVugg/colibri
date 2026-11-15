@@ -115,6 +115,10 @@ CFLAGS += -mcpu=$(ARCH)
 endif
 endif
 LDFLAGS = -lm $(OMPL) $(EXTRA_LDFLAGS)
+# Q36_ATTN_SGEMM=1 (C15 prefill attention) links the system Accelerate framework
+# for cblas_sgemm; the env stays default-off, Windows/Linux never link it, and a
+# framework link does not change the object code of the bit-exact paths.
+LDFLAGS += -framework Accelerate
 # LTO is opt-in (LTO=1), not default: cross-TU inlining can change
 # floating-point contraction (FMA formation), and colibri's token-exactness
 # oracles are validated against the default build's optimization regime

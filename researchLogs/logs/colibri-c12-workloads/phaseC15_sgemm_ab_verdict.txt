@@ -1,0 +1,41 @@
+output sha agreement (base vs sgemm, per prompt):
+  r1_12k: base=['44dc6b752fd6'] sgemm=['44dc6b752fd6'] AGREE
+  r1_4k_a: base=['fb965acd73e5'] sgemm=['fb965acd73e5'] AGREE
+  r1_4k_b: base=['fb965acd73e5'] sgemm=['fb965acd73e5'] AGREE
+  r2_12k: base=['44dc6b752fd6'] sgemm=['44dc6b752fd6'] AGREE
+  r2_4k_a: base=['fb965acd73e5'] sgemm=['fb965acd73e5'] AGREE
+  r2_4k_b: base=['fb965acd73e5'] sgemm=['fb965acd73e5'] AGREE
+sha agreement: 6/6
+
+paired prefill_attention_s (base -> sgemm):
+  r1 4k_a: 25.3 -> 10.8 s  (+57.4%)
+  r2 4k_a: 29.3 -> 12.1 s  (+58.7%)
+  4k_a mean: +58.1%  (decision rule at 12K: PASS)
+  r1 4k_b: 32.5 -> 10.7 s  (+67.2%)
+  r2 4k_b: 29.4 -> 11.7 s  (+60.4%)
+  4k_b mean: +63.8%  (decision rule at 12K: PASS)
+  r1 12k: 239.7 -> 54.8 s  (+77.2%)
+  r2 12k: 247.6 -> 58.2 s  (+76.5%)
+  12k mean: +76.8%  (decision rule at 12K: PASS)
+
+paired prefill_s and engine_ttft_s (base -> sgemm):
+  r1 4k_a: prefill 112.2 -> 106.1 s | ttft 112.3 -> 106.1 s
+  r2 4k_a: prefill 124.5 -> 112.1 s | ttft 124.5 -> 112.1 s
+  r1 4k_b: prefill 138.7 -> 106.2 s | ttft 138.7 -> 106.2 s
+  r2 4k_b: prefill 126.5 -> 115.5 s | ttft 126.5 -> 115.5 s
+  r1 12k: prefill 540.3 -> 341.8 s | ttft 540.4 -> 341.8 s
+  r2 12k: prefill 549.5 -> 369.7 s | ttft 549.5 -> 369.8 s
+
+decode_tokens_per_sec (single turns; scatter +-40-95% at identical config):
+  base_r1_12k: 7.198647918317714
+  base_r1_4k_a: 8.341581296095999
+  base_r1_4k_b: 8.29501636048761
+  base_r2_12k: 6.374926408650997
+  base_r2_4k_a: 8.525081984422295
+  base_r2_4k_b: 8.256821875198293
+  sgemm_r1_12k: 7.419839268313789
+  sgemm_r1_4k_a: 8.552115862562951
+  sgemm_r1_4k_b: 8.569452363257033
+  sgemm_r2_12k: 6.304649910615884
+  sgemm_r2_4k_a: 7.8078835809420655
+  sgemm_r2_4k_b: 7.978182844750109
