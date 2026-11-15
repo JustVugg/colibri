@@ -4,10 +4,19 @@ Portions of `backend_cuda_dsv4.cu`, including the DeepSeek-V4 GPU router
 selection algorithm, are adapted from `ds4_cuda.cu` in the ds4 project:
 https://github.com/antirez/ds4
 
+Two parts of the qwen36 Metal kernels are adapted from ds4 at commit
+`0aaea5a238fb41a35106a551e73c8409dfb751ac`: the keep-alive (the
+`q36_keepalive` kernel in `c/metal/qwen36.metal`, and the thread and second
+command queue that run it in `c/qwen36_metal.m`) from ds4's tensor-parallel
+keep-alive (`kernel_dsv4_tp_keepalive` in `metal/dsv4_misc.metal`, and
+`ds4_metal.m`), and the fast delta-rule scan `q36_dn_scan` in
+`c/metal/qwen36.metal` from `kernel_qwen4_gdn_scan_r4` in `metal/qwen4.metal`.
+
 MIT License
 
 Copyright (c) 2026 The ds4.c authors
 Copyright (c) 2023-2026 The ggml authors
+Copyright (c) 2023 DeepSeek
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
