@@ -6754,7 +6754,12 @@ static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const 
         one.l4 = pah->l4 ? pah->l4 + (int64_t)k * (I / 4) : NULL;
         gq_rows_u(Y + (int64_t)k * D + o, u, &one, sl[k]->gqe + gx->hb_g + gx->hb_u + (int64_t)o * rbd, gx->hd, I);
     }
-    /* accumulate in expert-id order, as the general path does: same sums, same bits */
+    /* accumulate in expert-id order, as moe_gq_run's row path below does (it walks the experts
+     * e = 0..E-1): the same sums in the same order, so a decode step's logits are those of the
+     * row path bit for bit (measured: 64 tokens of Qwen3.6 UD-Q4_K_M, GQ_NODECODE=0 against 1,
+     * identical dumps). The planar-int4 and int8 paths (expert_ffn.h's xf_moe_run, moe_ex) and
+     * the device chains sum a token's experts in RANK order instead; a GGUF container and an
+     * int4 container therefore round the MoE sum differently, each consistently. */
     int ord[64]; for (int k = 0; k < n; k++) ord[k] = k;
     for (int a = 1; a < n; a++) { int v = ord[a], b = a; while (b > 0 && ids[ord[b - 1]] > ids[v]) { ord[b] = ord[b - 1]; b--; } ord[b] = v; }
     for (int j = 0; j < n; j++) {
