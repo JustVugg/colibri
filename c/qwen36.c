@@ -1680,8 +1680,12 @@ static int q36_attn_rowblock(void) {
  * scalar path -- this is the programme's first tolerance-contract kernel: the
  * correctness gate is the measured score/context maxdiff (bench gate
  * `researchLogs/logs/colibri-c12-workloads/c15_sgemm_gate.c`: rel 1.8e-05 scores,
- * 2.4e-06 ctx) plus the real-model A/B, not sha identity. Off by default: the
- * scalar loop stays the fallback and decode (S==1), multiplexed rows, a
+ * 2.4e-06 ctx) plus the real-model A/B, not sha identity. Adopted as the
+ * default (2026-11-15, user decision after the adoption sweep: cold prompts
+ * 4K/12K/16K/24K agree bit-for-bit, cold TTFT -37..-48% at 16K/24K, both
+ * configs deterministic per build, one valid-continuation argmax flip at an
+ * agent-session turn). Q36_ATTN_SGEMM=0 restores the scalar loop as fallback;
+ * decode (S==1), multiplexed rows, a
  * speculative verify's rows (g_q36_rowwise: decode-step bits), ring/window
  * layers and sink heads keep the scalar loop untouched. macOS only (Accelerate
  * framework); Q36_ATTN_SGEMM_CHECK=1 additionally computes the scalar reference
@@ -1692,7 +1696,7 @@ static inline int q36_attn_sgemm(void) {
     if (!Q36_ATTN_SGEMM_AVAILABLE) return 0;
     if (g_q36_attn_sgemm < 0) {
         const char *e = getenv("Q36_ATTN_SGEMM");
-        g_q36_attn_sgemm = e && *e && *e != '0';
+        g_q36_attn_sgemm = !(e && *e && *e == '0');
     }
     return g_q36_attn_sgemm;
 }
