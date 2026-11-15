@@ -817,9 +817,9 @@ int main(int argc, char **argv) {
         rmsnorm_row(last, xb + (size_t)(SC - 1) * D, mb.final_norm, D, mb.c.eps);
         if (!qt_lmhead_matmul(lb, last, D, V)) matmul_d(lb, last, &mb.lm_head, 1, D, V);
         q36_logits_out(&mb.c, lb, V);
-        int kv_same = 1;
-        for (int h = 0; h < KV; h++) {
-            const size_t o = (size_t)h * g_cap * HD, n = (size_t)SC * HD * sizeof(float);
+        int kv_same = ma.kv_cap == mb.kv_cap;   /* a head's rows start kv_cap rows apart (ensure_kv rounds it up from g_cap) */
+        for (int h = 0; kv_same && h < KV; h++) {
+            const size_t o = (size_t)h * ma.kv_cap * HD, n = (size_t)SC * HD * sizeof(float);
             kv_same &= !memcmp((float *)ma.K[1] + o, (float *)mb.K[1] + o, n) && !memcmp((float *)ma.V[1] + o, (float *)mb.V[1] + o, n);
         }
         ck(!memcmp(la, lb, sizeof lb) && kv_same && !memcmp(ma.DN_rec[0], mb.DN_rec[0], (size_t)VH * KD * VD * sizeof(float)) &&
