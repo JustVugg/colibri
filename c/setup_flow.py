@@ -307,11 +307,19 @@ def _cc_lacks_static_openmp(cc):
     return r.returncode == 0 and r.stdout.strip() == "libgomp.a"
 
 
+def gnu_make():
+    """GNU make's path, or None. On the BSDs `make` is BSD make, which cannot read the
+    Makefile here, and GNU make is `gmake` (the gmake package)."""
+    if host_os().startswith(("freebsd", "openbsd", "netbsd", "dragonfly")):
+        return shutil.which("gmake")
+    return shutil.which("make")
+
+
 def toolchain(here=None):
     """What can be built here, and with what."""
     here = here or HERE
     tc = {"source_checkout": os.path.isfile(os.path.join(here, "Makefile")),
-          "make": shutil.which("make"),
+          "make": gnu_make(),
           "cc": shutil.which("gcc") or shutil.which("cc") or shutil.which("clang"),
           "glslc": shutil.which("glslc"), "vulkan_headers": False, "nvcc": _nvcc(),
           "msys2": None, "npm": shutil.which("npm")}

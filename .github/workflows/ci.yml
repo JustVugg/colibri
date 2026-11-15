@@ -11,6 +11,12 @@ on:
 permissions:
   contents: read
 
+# A new push to a pull request cancels that PR's older run. Pushes to dev and
+# main each get their own group (run_id), so they are never queued or cancelled.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   # The environment-variable registry (c/coli_env.h) against the sources. No
   # build, no model, no GPU -- seconds, so it reports before anything else.
@@ -97,7 +103,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: C suite under ASan + UBSan
-        run: make -C c test-asan
+        run: make -C c -j"$(nproc)" test-asan
       - name: rANS fuzz round-trip (ASan + UBSan)
         # Already sanitized and already asserting byte identity across every
         # compiled decode arm; it just had no job to run in.
@@ -1882,6 +1888,11 @@ jobs:
           /tmp/tt16
           gcc -O3 -march=x86-64-v3 -fopenmp -I. tests/test_tile16.c -o /tmp/tt16v3 -lm
           /tmp/tt16v3
+          # Q2_K's fused row kernel against the unpack + gq_dot_i8 path: the same two ISAs
+          gcc -O3 -march=native -fopenmp -I. tests/test_gq_q2_k.c -o /tmp/tq2k -lm
+          /tmp/tq2k
+          gcc -O3 -march=x86-64-v3 -fopenmp -I. tests/test_gq_q2_k.c -o /tmp/tq2kv3 -lm
+          /tmp/tq2kv3
       - name: Generate the glm_tiny fixture
         run: cd c && python3 tools/make_glm_oracle.py
       - name: Oracle (30–32/32 teacher forcing + exact greedy)
@@ -2305,7 +2316,7 @@ jobs:
       # rieseguiva un binario non strumentato. Uno di quei test era rosso da
       # settimane senza che nessuno potesse vederlo.
       - name: Build the engines those tests exercise
-        run: make -C c kimi_k3 inkling colibri olmoe qwen38 qwen36 deepseek_v41 qwenimage glm53 mimo
+        run: make -C c -j"$(nproc)" kimi_k3 inkling colibri olmoe qwen38 qwen36 deepseek_v41 qwenimage glm53 mimo
       - name: Python test suite
         run: cd c && python3 -m unittest discover -s tests -p 'test_*.py'
 

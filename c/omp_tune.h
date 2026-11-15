@@ -47,7 +47,8 @@
 
 #if defined(_WIN32)
 #include <windows.h>
-#elif defined(__APPLE__)
+#elif defined(__APPLE__) || defined(__FreeBSD__)
+#include <sys/types.h>
 #include <sys/sysctl.h>
 #else
 #include <dirent.h>
@@ -139,6 +140,15 @@ static int coli_physical_cores(void)
     if (sysctlbyname("hw.perflevel0.logicalcpu", &v, &sz, NULL, 0) == 0 && v > 0) return v;
     v = 0; sz = sizeof(v);
     if (sysctlbyname("hw.physicalcpu", &v, &sz, NULL, 0) == 0 && v > 0) return v;
+    return 0;
+
+#elif defined(__FreeBSD__)
+    /* kern.smp.cores counts a core once, whatever kern.smp.threads_per_core is.
+     * There is no /sys to read here, and without this the team stayed at the
+     * logical count: both SMT siblings of every core (#718). */
+    int v = 0;
+    size_t sz = sizeof(v);
+    if (sysctlbyname("kern.smp.cores", &v, &sz, NULL, 0) == 0 && v > 0) return v;
     return 0;
 
 #else

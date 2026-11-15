@@ -224,7 +224,9 @@ def detect_cpu():
             with open("/proc/cpuinfo", encoding="utf-8", errors="replace") as handle:
                 cpu = cpu_from_cpuinfo(handle.read(1 << 20))
         except OSError:
-            cpu = {"name": None, "features": []}
+            # Systems without /proc/cpuinfo (the BSDs): failure to read the features, is not
+            # the same as a processor that reports none of them.
+            cpu = {"name": None, "features": [], "features_known": False}
     cpu["arch"] = platform.machine().lower() or None
     cpu["logical_cores"] = os.cpu_count()
     try:
@@ -941,7 +943,9 @@ def format_report(report):
                          ("avx2", "avx_vnni", "avx512f", "avx512_vnni", "avx512_bf16", "asimddp", "sve"))
     lines.append(f"  CPU     {cpu.get('name') or cpu.get('arch') or '?'}, {core_text}"
                  + (f", {features}" if features else ""))
-    missing = missing_for_prebuilt(cpu)
+    # When features are unknown (features_known False), do not report the "no AVX2"
+    # message because the processor could have the feature.
+    missing = missing_for_prebuilt(cpu) if cpu.get("features_known", True) else []
     if missing:
         lines.append(f"          note: no {', '.join(f.upper() for f in missing)}: the prebuilt "
                      "engines need it, so the engine is built for this processor (a compiler "

@@ -1122,12 +1122,17 @@ class Releases(HomeTestCase):
         # #2091: a CUDA choice on Windows with no engine here takes the release's
         # engines and unpacks its CUDA backend over them
         tc = dict(TC_ALL, source_checkout=False, can_build=False, can_build_vulkan=False)
+        # The modeled host's processor, not the one running the test (as in
+        # prebuilt_download above): a host whose detect_cpu reports no AVX2 is
+        # rightly refused the prebuilt engine, which this download must not hit.
+        modern = {"arch": "x86_64", "name": "a processor with AVX2", "features": ["avx2"]}
         for cuda in (True, False):
             with self.subTest(cuda=cuda):
                 empty = os.path.join(self.tmp.name, f"nothing-here-{cuda}")
                 os.makedirs(empty)
                 getter = self.windows_release("v2.1.0", f"release-{cuda}", cuda=cuda)
                 with modeled("win32"), mock.patch.object(setup_flow, "HERE", empty), \
+                     mock.patch.object(setup_hw, "detect_cpu", return_value=modern), \
                      mock.patch.dict(os.environ, {"COLI_SETUP_HOME": os.path.join(self.tmp.name, f"h-{cuda}")}), \
                      mock.patch.object(setup_flow, "_api_get", side_effect=getter):
                     out = []
@@ -2480,6 +2485,36 @@ class LinuxVulkanHeadersTests(unittest.TestCase):
             tc = setup_flow.toolchain(here=str(C_DIR))
         self.assertTrue(tc["vulkan_headers"])
         asked.assert_called_once()
+
+
+class BsdToolchainTests(unittest.TestCase):
+    """toolchain() on the BSDs: `make` there is BSD make, which stops at the first GNU
+    conditional of the Makefile, so the build is GNU make's, `gmake`."""
+
+    def which(self, found):
+        return lambda name, *a, **k: found.get(name)
+
+    def test_freebsd_builds_with_gmake(self):
+        found = {"make": "/usr/bin/make", "gmake": "/usr/local/bin/gmake", "gcc": "/usr/local/bin/gcc"}
+        with modeled("freebsd15"), mock.patch.object(setup_flow.shutil, "which", side_effect=self.which(found)):
+            tc = setup_flow.toolchain(here=str(C_DIR))
+            cmd, _cwd, _env = setup_flow.make_command(family_by_id("glm"), "cpu", tc)
+        self.assertEqual(tc["make"], "/usr/local/bin/gmake")
+        self.assertTrue(tc["can_build"])
+        self.assertEqual(cmd[0], "/usr/local/bin/gmake")
+
+    def test_bsd_make_alone_cannot_build(self):
+        found = {"make": "/usr/bin/make", "gcc": "/usr/local/bin/gcc"}
+        with modeled("freebsd15"), mock.patch.object(setup_flow.shutil, "which", side_effect=self.which(found)):
+            tc = setup_flow.toolchain(here=str(C_DIR))
+        self.assertIsNone(tc["make"])
+        self.assertFalse(tc["can_build"])
+
+    def test_linux_and_macos_keep_make(self):
+        found = {"make": "/usr/bin/make", "gmake": "/opt/homebrew/bin/gmake", "gcc": "/usr/bin/gcc"}
+        for os_name in ("linux", "darwin"):
+            with modeled(os_name), mock.patch.object(setup_flow.shutil, "which", side_effect=self.which(found)):
+                self.assertEqual(setup_flow.gnu_make(), "/usr/bin/make")
 
 
 class WindowsToolchainTests(unittest.TestCase):

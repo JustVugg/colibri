@@ -292,6 +292,12 @@ def _cancel_on_disconnect(h, conn):
                 readable, _, _ = select.select([h.connection], [], [], 0)
                 if not readable:
                     continue
+                # On systems that retain unread data after a reset, peeking
+                # only the queue head never reaches the pending socket error.
+                # SO_ERROR retrieves and clears it, so treat any error as a
+                # failed frontend connection before inspecting queued data.
+                if h.connection.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR):
+                    raise ConnectionResetError("frontend socket error")
                 if h.connection.recv(1, socket.MSG_PEEK) == b"":
                     # FIN closes only the peer's write side. It may still be
                     # reading its response; do not cancel that valid request.
