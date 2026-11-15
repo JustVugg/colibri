@@ -53,7 +53,7 @@ class FamilyCapabilities:
     # of the key=value extension keys -- the shape decode_batch.h's coli_submit_parse
     # reads. The siblings speak a 6-field header (c/qwen36.c takes its keys straight
     # after top_p), so handing them the extra field puts a bare `0` where their
-    # parser wants `key=value` and the engine answers "bad submit extension".
+    # parser wants `key=value` and the engine refuses the header ("bad submit header").
     submit_gbytes: bool = False
 
 

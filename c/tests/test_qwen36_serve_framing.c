@@ -1,6 +1,7 @@
-/* Freeze qwen36's serve request framing before it adopts serve_codec.h: what the
- * reader makes of each frame the gateway sends, and what is left in the stream after
- * it. No model is loaded: the frames are synthetic bytes. */
+/* qwen36's serve request framing: what the reader makes of each frame the gateway
+ * sends, and what is left in the stream after it (frozen before it adopted
+ * serve_codec.h), and the malformed frames the shared reader refuses without reading
+ * the rest of the stream as commands. No model is loaded: the frames are synthetic. */
 #define main qwen36_main_unused
 #include "../qwen36.c"
 #undef main
@@ -177,12 +178,21 @@ static int poll_ready(void)
     ungetc(c, g_poll_in); return 1;
 }
 
-static int poll_text(const char *text, const char *id)
+static int poll_into(const char *text, const char *id, FILE *out)
 {
     g_poll_in = text_input(text);
-    int control = serve_control_read(g_poll_in, poll_ready, id);
+    int control = serve_control_read(g_poll_in, out, poll_ready, id);
     assert(fgetc(g_poll_in) == EOF);
     fclose(g_poll_in); g_poll_in = NULL;
+    return control;
+}
+
+static int poll_text(const char *text, const char *id)
+{
+    FILE *out = output_stream();
+    int control = poll_into(text, id, out);
+    assert(!*written(out));
+    fclose(out);
     return control;
 }
 
@@ -197,6 +207,73 @@ static void test_turn_control_poll(void)
     assert(poll_text("CANCEL b\nSTOP a\n", "a") == Q36_CONTROL_STOP);
 }
 
+/* A payload that does not end on its newline has lost the frame: the session ends,
+ * and nothing after it is read as a command. */
+static void test_unterminated_payload_ends_the_session(void)
+{
+    FILE *in = text_input("SUBMIT a 0 3 4 0 1\nabcXSTOP a\n"), *out = output_stream();
+    ServeReq q = {0};
+    assert(serve_read_req(in, out, &q) == -1 && !q.payload);
+    assert(serve_read_req(in, out, &q) == -1);
+    assert(!*written(out));
+    g_q36_input_lost = 0;
+    fclose(in); fclose(out);
+}
+
+/* A header longer than the line is refused whole: its tail is not a second command. */
+static void test_overlong_line_is_one_line(void)
+{
+    char frame[1024]; size_t n = 0;
+    memset(frame, 'x', 600); n = 600 - strlen("STOP a");
+    memcpy(frame + n, "STOP a", strlen("STOP a")); n += strlen("STOP a");
+    frame[n++] = '\n';
+    memcpy(frame + n, "CANCEL b\n", 9); n += 9;
+    FILE *in = bytes_input(frame, n), *out = output_stream();
+    ServeReq q = {0};
+    assert(serve_read_req(in, out, &q) == 0);
+    assert(serve_read_req(in, out, &q) == 4 && !strcmp(q.id, "b"));
+    assert(fgetc(in) == EOF && !*written(out));
+    fclose(in); fclose(out);
+}
+
+/* ids=1 (pretokenized input) is GLM's: refused, its body consumed, the next frame read */
+static void test_token_ids_are_refused_in_step(void)
+{
+    FILE *in = text_input("SUBMIT i 0 5 4 0 1 ids=1\n1 2 3\nSTOP i\n"), *out = output_stream();
+    ServeReq q = {0};
+    assert(serve_read_req(in, out, &q) == 0 && !q.payload);
+    assert(!strcmp(written(out), "ERROR i bad submit header\n"));
+    memset(&q, 0, sizeof q);
+    assert(serve_read_req(in, out, &q) == 5 && !strcmp(q.id, "i"));
+    fclose(in); fclose(out);
+}
+
+/* A DECIDE to an engine without a Clef head is consumed and left unanswered */
+static void test_decide_without_clef_is_skipped(void)
+{
+    FILE *in = text_input("DECIDE d 0 2\n{}\nSTOP d\n"), *out = output_stream();
+    ServeReq q = {0};
+    assert(serve_read_req(in, out, &q) == 0 && !q.payload);
+    assert(serve_read_req(in, out, &q) == 5 && !strcmp(q.id, "d"));
+    assert(fgetc(in) == EOF && !*written(out));
+    fclose(in); fclose(out);
+}
+
+/* Mid-turn, a SUBMIT for the one busy slot is consumed and refused (its payload, which
+ * reads like a CANCEL, is not one), and the turn's own CANCEL after it still counts; an
+ * IMAGE is held for its SUBMIT. */
+static void test_turn_poll_reads_whole_frames(void)
+{
+    FILE *out = output_stream();
+    assert(poll_into("SUBMIT z 0 8 4 0 1\nCANCEL a\nCANCEL a\n", "a", out) == Q36_CONTROL_CANCEL);
+    assert(!strcmp(written(out), "ERROR z SLOT_BUSY\n"));
+    fclose(out);
+    out = output_stream();
+    assert(poll_into("IMAGE v 2 1 1\nab\nSTOP a\n", "a", out) == Q36_CONTROL_STOP);
+    assert(g_pending_image.present && g_pending_image.bytes == 2 && !*written(out));
+    q36_pending_image_clear(); fclose(out);
+}
+
 int main(void)
 {
     test_submit_payload_and_fields();
@@ -208,6 +285,11 @@ int main(void)
     test_decide_with_clef();
     test_frames_in_sequence();
     test_turn_control_poll();
+    test_unterminated_payload_ends_the_session();
+    test_overlong_line_is_one_line();
+    test_token_ids_are_refused_in_step();
+    test_decide_without_clef_is_skipped();
+    test_turn_poll_reads_whole_frames();
     puts("test_qwen36_serve_framing: OK");
     return 0;
 }
