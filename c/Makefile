@@ -833,6 +833,15 @@ VK_SPV   += shaders/chain_attn_full.spv shaders/chain_attn_coop.spv
 VK_SPV   += shaders/chain_vae.spv
 endif
 
+# The engines that read WEX containers include wex_decode.c, which opens the optional
+# CUDA helper with dlopen on Linux (docs/wex.md): -ldl for glibc before 2.34, as VK=1
+# adds above. Nothing links the helper itself.
+ifneq ($(LINUX),)
+ifneq ($(VK),1)
+LDFLAGS  += -ldl
+endif
+endif
+
 # Optional AMD XDNA2 (Ryzen AI NPU) lane, Windows. Same opt-in shape as VK=1:
 # a switch, a define, an object. Deliberately NOT a second executable -- the
 # capability compiles into the ordinary host and stays off until the user passes
@@ -3979,6 +3988,13 @@ tests/test_wex4_verify$(EXE): tests/test_wex4_verify.c
 # the in-place decode, changed records, several threads. Records made by the reference encoder.
 tests/test_wex_decode$(EXE): tests/test_wex_decode.c
 	$(CC) $(CFLAGS) $< -o $@ -pthread $(LDFLAGS)
+
+# The CUDA helper's loader in wex_decode.c (COLI_WEX_CUDA_LIB), no GPU: a CPU stand-in with
+# the helper's exports, a .dll on Windows and a position-independent .so elsewhere.
+tests/fake_wex_cuda$(XDNA_DLEXT): tests/fake_wex_cuda.c
+	$(CC) $(CFLAGS) $(XDNA_SHARED) $< -o $@
+tests/test_wex_cuda_loader$(EXE): tests/test_wex_cuda_loader.c tests/fake_wex_cuda$(XDNA_DLEXT)
+	$(CC) $(CFLAGS) $< -o $@ -pthread $(LDFLAGS) $(if $(IS_WIN),,-ldl)
 
 # The WNR3 encoder (docs/wex.md, "Making a WNR3 container"): tools/build_nr3.py loads this
 # library with ctypes. make wex-nr3-tools; tests/test_wex_nr3_tools.py builds its own copy.

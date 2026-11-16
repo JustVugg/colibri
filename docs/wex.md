@@ -281,9 +281,33 @@ reader threads are retired and respawned stay within that. The bytes and the ord
 [WNR3-SPEC](https://github.com/KairaCode/Wex-WRN2/blob/main/docs/WNR3-SPEC.md), sections 4.7
 and 4.8.
 
+### How an engine finds it
+
+Only when asked: `wex_decode.c` opens the helper `COLI_WEX_CUDA_LIB` names, once per process,
+the first time a WNR3 container's model is registered or a neural record decoded (so a RAW
+container, or no container, never loads it). Nothing is searched for:
+
+| `COLI_WEX_CUDA_LIB` | What is loaded |
+|---|---|
+| unset, or `0` | nothing: every record on the CPU |
+| a path | that file; one that does not load, or is not ABI 1, is not used, with a `[wex]` line |
+
+```sh
+make -C c wex-cuda-helper          # c/kaira_wex_cuda.so (Windows: c/kaira_wex_cuda.dll)
+COLI_WEX_CUDA_LIB=$PWD/c/kaira_wex_cuda.so COLI_WEX_PATH=experts.wex4 ./c/deepseek_v41 ...
+# [wex] CUDA helper .../c/kaira_wex_cuda.so: ABI 1, features 63
+```
+
+`coli_wex_decode_record` then sends each WNR2/WNR3 record whose model the helper holds to
+`wex_cuda_decode_to_host`, and decodes it on the CPU when the helper does not (status 1: no
+GPU, no memory; the helper wrote nothing). The bytes are the same either way, so tokens do not
+depend on the helper. On 16 records of the published DeepSeek V4.1 container, an RTX 3070
+decoded a record in 6-9 ms where the CPU reference decoder took about a second. The helper's
+other calls are `coli_wex_cuda_decode_to_device`, `_decode_batch_to_device`,
+`_decode_batch_to_host` and `_host_register` (`wex_decode.h`). Windows and Linux only.
+
 ## Status in colibri
 
 DeepSeek V4, DeepSeek V4.1 and Qwen3.8 read RAW and WNR3 records from a WEX4 container, WNR3
-decoded on the CPU (`wex_decode.c`). The CUDA helper builds and decodes WNR3 records on its own;
-no engine opens it yet. Its loader and the I/O switches (several drives, split reads) are the
-next PRs.
+decoded on the GPU when `COLI_WEX_CUDA_LIB` names the CUDA helper, on the CPU otherwise
+(`wex_decode.c`). The I/O switches (several drives, split reads) are the next PRs.

@@ -7,6 +7,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### New
 
+- **WNR3 records decoded on the GPU** (`COLI_WEX_CUDA_LIB`): `wex_decode.c` opens the CUDA helper
+  that `COLI_WEX_CUDA_LIB` names (and only then) the first time a WNR3 container is read, and `coli_wex_decode_record` hands it each record, decoding on the CPU when
+  it does not; the same bytes either way. Unset or `0`: the CPU. Windows and Linux.
+  `tests/test_wex_cuda_loader.c` in `make test-c` ([docs/wex.md](docs/wex.md)).
 - **The CUDA helper for WEX records** (`c/tools/wex_cuda_bridge.cu`, `c/wex_cuda.cuh`):
   `make wex-cuda-helper` builds `kaira_wex_cuda.dll` / `.so`, which decodes WNR1-WNR3 records
   on an NVIDIA GPU, to host slabs or into device buffers, one record or a batch; ABI 1 and six
