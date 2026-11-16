@@ -1,0 +1,50 @@
+C22 verdict — fused S==1 IQ2_S/IQ3_S kernels, real-model interleaved A/B (2026-11-16)
+
+Build: c/ggml_quants.h with gq_arm_sb_iq2_s / gq_arm_sb_iq3_s + gq_dot_arm_iq2_s /
+gq_dot_arm_iq3_s wired into gq_row_all's ARM block, gated a->S == 1 && I % 256 == 0
+behind Q36_EXPERT_FUSE (default ON; =0 restores the generic unpack path). Engine
+rebuilt; focused fixture suite: only the 4 known pre-existing failures
+(test_convert_guard, test_makefile_deps, 2x flaky test_qwen36_text_stops).
+In-engine bit-exactness re-check via the rebuilt C22 bench: precheck 0.0 both ways
+(rowall S=1 now 29.8/23.5 GFLOPS = the fused rates; Q36_EXPERT_FUSE=0 restores 13.2/14.0).
+
+Run: c22_fuse_ab_launch.sh — same UD-IQ3_XXS container both arms, 4 alternating
+fresh restarts (fuse1_r1 -> fuse0_r1 -> fuse1_r2 -> fuse0_r2), COLI_PROMPT_CACHE=0,
+OMP_NUM_THREADS=6, ctx 66000, port 8001, single slot; the C16 driver's calibrated
+colds (1K/4K/12K, greedy 128 tokens) + 3-question probe (greedy). Results
+phaseC22_fuse_{fuse1_r1,fuse0_r1,fuse1_r2,fuse0_r2}.jsonl; server logs
+serve-c22-fuse*.log (fuse1_r1 launcher attempt 1 failed on a bash env-prefix quirk
+before any server started; attempt 2 clean — note pkill had taken down the user's
+IQ2 server, restored after the run).
+
+GATE 1 — output correctness: PASS, 12/12.
+Every cell's output sha is identical across the arms in both rounds, and they are
+exactly C21's IQ3 shas: 1K/4K ce37c8ce16a4, 12K e591e8c34acb, q1 563643d5b84f,
+q2 b2bc973f8d80, q3 c886f8f3e3a1. The fused kernels do not change a single output
+token on the real model.
+
+GATE 2 — decode recovery: PASS.
+decode_tokens_per_sec, paired (fuse1 mean -> fuse0 mean, ratio):
+  12K anchor : 6.61 -> 5.68  = 1.16x   (r1 6.84/5.80, r2 6.38/5.56)
+  4K         : 8.04 -> 6.91  = 1.16x
+  1K         : 6.81 -> 6.50  = 1.05x  (fuse0_r2's 7.63 is the usual decode scatter)
+  q1 probe   : 11.07 -> 9.00 = 1.23x
+  q2 probe   : 8.27 -> 6.07  = 1.36x
+  q3 probe   : 7.56 -> 6.22  = 1.22x
+The short-prompt probe decodes are the cleanest S==1 read (no long-context
+attention in the denominator): +22-36%. Against C21's anchors: IQ3 decode at the
+12K cell goes from 0.74x of IQ2 to ~0.93x (6.61 vs the 7.11 IQ2 anchor), i.e. into
+the targeted 0.9-1.0x band; probe decode 8.97 mean vs IQ2's 9.97 = 0.90x.
+
+Prefill: unchanged, as designed (the fused kernels are S==1-only; prompts ride
+gq_rows_f8). 12K TTFT 300.6/354.2 (fuse1) vs 339.3/351.8 (fuse0), round-means
+327 vs 345 s — the r1 spread is same-session drift (C21 recorded the same class
+of uniform round drift), r2 is even; no systematic MoE-prefill difference
+(moe 164.1/191.5 vs 184.0/192.8). Memory: RSS after load 1.84-2.22 GB both arms,
+no cross-arm regression.
+
+VERDICT: PASS on both gates — adopt as default (Q36_EXPERT_FUSE default ON).
+The C21 conclusion flips: with decode recovered, UD-IQ3_XXS costs ~1.1x TTFT only
+and keeps its probe-quality win (its q2 Fibonacci output here is the same correct
+iterative loop C21 recorded). Whether the default container changes is still the
+user's call (C21 leaning: IQ2_XXS stays).
