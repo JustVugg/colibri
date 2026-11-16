@@ -2229,14 +2229,17 @@ static void matmul_h(float *y, const float *x, const uint16_t *W, int S, int I, 
     }
 }
 
-static int g_q36_codes;          /* q36_codes_now: a dense IQ3_S matrix's codes at its first product here */
+static long long g_q36_codes;    /* q36_codes_now: a dense IQ1/IQ2/IQ3 matrix's larger form at its first product here */
+static int g_q36_cap_arg;              /* the cache size asked for (argv[1], 0 = automatic) */
+static long long g_q36_exp_codes;
+static double g_q36_exp_bytes;
 static void q36_codes_now(QW *w);
 static void matmul_d(float *y, const float *x, const QW *w, int S, int I, int O){
 #ifdef COLI_QWEN_BATCH_TEST
     g_qwen_matmul_d_calls++;
 #endif
     if (w->gq) {
-        if (w->gq_type == GQ_IQ3_S && __atomic_load_n(&g_q36_codes, __ATOMIC_ACQUIRE) != 0) q36_codes_now((QW *)w);
+        if (gq_r16_of_grown(w->gq_type) >= 0 && __atomic_load_n(&g_q36_codes, __ATOMIC_ACQUIRE) != 0) q36_codes_now((QW *)w);
         if (gq_matmul(y, x, w->gq, w->gq_type, S, I, O)) {
             fprintf(stderr, "qwen36: GGUF matrix of type %s is not supported\n", gq_type_name(w->gq_type)); exit(1);
         }
@@ -3117,42 +3120,63 @@ static int q36_gq_held(int type, int rows, int cols) {
  * speed already: 2.4 -> 2.5. Made at a matrix's first product on the CPU (matmul_d), so a matrix a
  * device holds keeps the file's rows: made at load, the 27B on a card whose VRAM held it all took
  * 0.83 GB more RAM and 42 s instead of 9 to start (every matrix unpacked again for its upload).
- * Decided once for the model, at the first: when the RAM free then holds every dense IQ3_S matrix's
- * quarter more and 2 GB. Q36_IQ3S_CODES=0 (or Q36_ILV16=0) keeps the file's rows; never for experts
- * (gguf_expert_held): the RAM slots would hold fewer of them. */
-static int g_q36_codes = -1;   /* -1 undecided, 0 the file's rows, 1 codes */
+ * The other grid types the same way since: IQ3_XXS as codes too (1.4x its bytes), IQ2_XXS, IQ2_XS,
+ * IQ2_S, IQ1_S and IQ1_M as planes of two-bit levels with their signs or deltas (1.3 to 1.6x), each
+ * read by a kernel with no grid lookup: on the same 8700GE a 17408 x 5120 matrix on 16 threads,
+ * IQ2_XXS 0.94 -> 0.37 ms, IQ1_S 1.06 -> 0.21, IQ3_XXS 1.16 -> 0.56 (native; x86-64-v3 0.87 -> 0.48,
+ * 1.09 -> 0.34, 1.11 -> 0.56).
+ * Decided once for the model, at the first, type by type: the types whose larger form saves the most
+ * time per byte it adds first (measured on the 8700GE, 8 threads, a 27B's matrices: about 85 ms of
+ * decode a GB added for IQ1_M, 80 for IQ1_S and IQ3_S, 60 for IQ2_S, 40 for IQ2_XS, 27 for IQ3_XXS,
+ * 20 for IQ2_XXS), each while the RAM free then still holds its matrices' larger forms and 2 GB, so
+ * a machine with a little room gets the best of it. Q36_CODES_GB=<GB> caps the RAM they may add;
+ * Q36_IQ3S_CODES=0 (or Q36_ILV16=0) keeps the file's rows; never for experts (gguf_expert_held): the
+ * RAM slots would hold fewer of them. */
+static long long g_q36_codes = -1;   /* -1 undecided, else bit t: type t's dense matrices take their larger form */
 static pthread_mutex_t g_q36_codes_mx = PTHREAD_MUTEX_INITIALIZER;
-static int q36_codes_decide(void) {
+static long long q36_codes_decide(void) {
 #ifdef GQ_R16_ON
     const char *e = getenv("Q36_IQ3S_CODES"), *i16 = getenv("Q36_ILV16");
     if ((e && *e == '0') || (i16 && !strcmp(i16, "0")) || gq_exact_mode()) return 0;
-    double extra = 0;
+    double extra[64] = {0};   /* by type: the bytes its dense matrices' larger forms add */
     for (int k = 0; k < g_gg.n_tensors; k++) {
         const gguf_tensor *t = &g_gg.t[k];
-        if (t->type == GQ_IQ3_S && !strstr(t->name, "_exps"))   /* a block's 110 bytes -> its share of a group block, 2208 / 16 */
-            extra += (double)t->nbytes * (gq_r16_group_bytes(GQ_IQ3_S_R16) / 16.0 - GQ_TYPES[GQ_IQ3_S].bytes) / GQ_TYPES[GQ_IQ3_S].bytes;
+        const int ht = gq_r16_of_grown(t->type);
+        if (ht >= 0 && t->type < 64 && !strstr(t->name, "_exps"))   /* a block's bytes -> its share of a group block */
+            extra[t->type] += (double)t->nbytes * (gq_r16_group_bytes(ht) / 16.0 - GQ_TYPES[t->type].bytes) / GQ_TYPES[t->type].bytes;
     }
     const double avail = mem_available_gb() * 1e9;
-    if (avail > 0 && avail < extra + 2e9) {
-        fprintf(stderr, "[qwen36] IQ3_S matrices kept in the file's rows: %.1f GB free, their codes want up to %.2f GB more\n",
-                avail / 1e9, extra / 1e9);
-        return 0;
+    double budget = avail > 0 ? avail - 2e9 - g_q36_exp_bytes : 1e30;   /* less what the experts' larger forms will take */
+    const char *cap = getenv("Q36_CODES_GB");
+    if (cap && *cap && atof(cap) * 1e9 < budget) budget = atof(cap) * 1e9;
+    static const int rank[] = { GQ_IQ1_M, GQ_IQ1_S, GQ_IQ3_S, GQ_IQ2_S, GQ_IQ2_XS, GQ_IQ3_XXS, GQ_IQ2_XXS };
+    long long mask = 0; double used = 0, left = 0; char took[160] = "", kept[160] = "";
+    for (size_t i = 0; i < sizeof rank / sizeof rank[0]; i++) {
+        const int t = rank[i];
+        if (extra[t] <= 0) continue;
+        char *list = used + extra[t] <= budget ? took : kept;
+        if (list == took) { mask |= 1LL << t; used += extra[t]; } else left += extra[t];
+        snprintf(list + strlen(list), 160 - strlen(list), "%s%s", *list ? " " : "", gq_type_name(t));
     }
-    fprintf(stderr, "[qwen36] IQ3_S matrices the CPU computes held as codes: up to %.2f GB more RAM, no grid lookups "
-                    "(Q36_IQ3S_CODES=0 keeps the file's rows)\n", extra / 1e9);
-    return 1;
+    if (mask)
+        fprintf(stderr, "[qwen36] dense %s matrices held as codes and planes for the CPU: %.2f GB more RAM, no grid lookups "
+                        "(Q36_IQ3S_CODES=0 keeps the file's rows)\n", took, used / 1e9);
+    if (*kept)
+        fprintf(stderr, "[qwen36] dense %s matrices kept in the file's rows: %.2f GB allowed (%.1f GB free less 2%s), their larger "
+                        "forms would add %.2f GB more\n", kept, (budget > 0 ? budget : 0) / 1e9, avail / 1e9, cap && *cap ? ", Q36_CODES_GB" : "", left / 1e9);
+    return mask;
 #else
     return 0;
 #endif
 }
-/* matmul_d's first product of a dense IQ3_S matrix: its codes from here on (the file's rows freed) */
+/* matmul_d's first product of a dense matrix with a larger form: that form from here on (the file's rows freed) */
 static void q36_codes_now(QW *w) {
 #ifdef GQ_R16_ON
     pthread_mutex_lock(&g_q36_codes_mx);
     if (g_q36_codes < 0) __atomic_store_n(&g_q36_codes, q36_codes_decide(), __ATOMIC_RELEASE);
-    if (g_q36_codes && w->gq_type == GQ_IQ3_S && w->O % 16 == 0 && w->I % GQ_TYPES[GQ_IQ3_S].blck == 0) {
-        const int ht = gq_r16_of_grown(GQ_IQ3_S);
-        const int64_t rb = gq_row_bytes(GQ_IQ3_S, w->I), hb = gq_row_bytes(ht, w->I);
+    const int ht = gq_r16_of_grown(w->gq_type);
+    if (ht >= 0 && w->gq_type < 64 && ((g_q36_codes >> w->gq_type) & 1) && w->O % 16 == 0 && w->I % GQ_TYPES[w->gq_type].blck == 0) {
+        const int64_t rb = gq_row_bytes(w->gq_type, w->I), hb = gq_row_bytes(ht, w->I);
         uint8_t *h = malloc((size_t)(hb * w->O));
         if (h) {
             #pragma omp parallel for schedule(static)
@@ -3413,7 +3437,7 @@ static void load_tq(Model *m, const char *name, int I, int O, int quantize, cons
         out->gq = malloc((size_t)t->nbytes); out->gq_type = t->type;
         if (!out->gq || gguf_read(gg_ctx_of(t), t, out->gq, 0, t->nbytes)) { fprintf(stderr, "GGUF %s: read failed\n", t->name); exit(1); }
         if (rheads) q36_rope_unpermute(out->gq, (size_t)gq_row_bytes(t->type, I), rheads, O / rheads);
-        const int ht = q36_gq_held(t->type, O, I);   /* IQ3_S: its codes at its first product on the CPU (q36_codes_now) */
+        const int ht = q36_gq_held(t->type, O, I);   /* IQ1/IQ2/IQ3: their larger form at the first product on the CPU (q36_codes_now) */
         if (ht != t->type) {   /* interleaved by 16 for the CPU's kernels */
             const int64_t rb = gq_row_bytes(t->type, I), hb = gq_row_bytes(ht, I);
             uint8_t *h = malloc((size_t)(hb * O));
@@ -4066,11 +4090,23 @@ static void gguf_expert_scales(Model *m, int L) {
     }
 }
 
-/* Layer x's experts as a slot holds them (q36_gq_held; the Metal graph's kernels read the file's
- * rows) and the slot size that needs. */
+/* The experts' types held in their larger form (bit t, gq_r16_of_grown), decided in gguf_map_experts:
+ * only when the cache holds every expert (the cache size automatic or at least the experts' count:
+ * else they are read again, packed at every read and fewer would fit) and 88% of the RAM free, less
+ * 4 GB, holds all of them with what their larger forms add; type by type in q36_codes_decide's
+ * order. g_q36_exp_bytes: what they will take, which the dense decision leaves to them. */
+static int q36_exp_grown_type(int t, int rows, int cols) {
+    const int ht = gq_r16_of_grown(t);
+    return ht >= 0 && t < 64 && ((g_q36_exp_codes >> t) & 1) && rows % 16 == 0 && cols % GQ_TYPES[t].blck == 0 ? ht : -1;
+}
+/* Layer x's experts as a slot holds them (q36_gq_held, or the larger form q36_exp_grown_type picks; the
+ * Metal graph's kernels read the file's rows) and the slot size that needs. */
 static void gguf_expert_held(Model *m, GqExp *x) {
     const int D = q36_eh(&m->c), I = m->c.inter;
     x->hg = q36_gq_held(x->tg, I, D); x->hu = q36_gq_held(x->tu, I, D); x->hd = q36_gq_held(x->td, D, I);
+    int g; if ((g = q36_exp_grown_type(x->tg, I, D)) >= 0) x->hg = g;
+    if ((g = q36_exp_grown_type(x->tu, I, D)) >= 0) x->hu = g;
+    if ((g = q36_exp_grown_type(x->td, D, I)) >= 0) x->hd = g;
     if (QWEN_GRAPH(m)) { x->hg = x->tg; x->hu = x->tu; x->hd = x->td; }
     x->hb_g = x->hg == x->tg ? x->eb_g : gq_row_bytes(x->hg, D) * I;
     x->hb_u = x->hu == x->tu ? x->eb_u : gq_row_bytes(x->hu, D) * I;
@@ -4092,6 +4128,49 @@ static void gguf_hold_file_rows(Model *m) {
     }
 }
 
+/* q36_exp_codes_decide: the experts' larger forms, when they fit (g_q36_exp_codes above); then
+ * every layer held again and the slot size taken anew. */
+static void q36_exp_codes_decide(Model *m) {
+#ifdef GQ_R16_ON
+    const Cfg *c = &m->c;
+    const char *e = getenv("Q36_IQ3S_CODES"), *i16 = getenv("Q36_ILV16");
+    if ((e && *e == '0') || (i16 && !strcmp(i16, "0")) || gq_exact_mode() || QWEN_GRAPH(m)) return;
+    if (g_q36_cap_arg > 0 && g_q36_cap_arg < c->n_experts) return;
+    double file = 0, extra[64] = {0};
+    for (int i = 0; i < c->n_layers; i++) {
+        if (q36_dense_l(c, i)) continue;
+        const GqExp *x = &m->gqx[i]; const int ft[3] = { x->tg, x->tu, x->td }; const int64_t fb[3] = { x->eb_g, x->eb_u, x->eb_d };
+        for (int k = 0; k < 3; k++) {
+            file += (double)fb[k] * c->n_experts;
+            const int ht = gq_r16_of_grown(ft[k]);
+            if (ht >= 0 && ft[k] < 64) extra[ft[k]] += (double)fb[k] * c->n_experts * (gq_r16_group_bytes(ht) / 16.0 - GQ_TYPES[ft[k]].bytes) / GQ_TYPES[ft[k]].bytes;
+        }
+    }
+    const double avail = mem_available_gb() * 1e9, budget = avail * 0.88 - 4e9 - file;
+    static const int rank[] = { GQ_IQ1_M, GQ_IQ1_S, GQ_IQ3_S, GQ_IQ2_S, GQ_IQ2_XS, GQ_IQ3_XXS, GQ_IQ2_XXS };
+    long long mask = 0; double used = 0; char took[160] = "";
+    for (size_t r = 0; r < sizeof rank / sizeof rank[0]; r++) {
+        const int t = rank[r];
+        if (extra[t] <= 0 || used + extra[t] > budget) continue;
+        mask |= 1LL << t; used += extra[t];
+        snprintf(took + strlen(took), sizeof took - strlen(took), "%s%s", *took ? " " : "", gq_type_name(t));
+    }
+    if (!mask) return;
+    g_q36_exp_codes = mask; g_q36_exp_bytes = file + used;
+    m->gqe_max = 0;
+    for (int i = 0; i < c->n_layers; i++) {
+        if (q36_dense_l(c, i)) continue;
+        GqExp *x = &m->gqx[i];
+        const int64_t tot = x->eb_g + x->eb_u + x->eb_d;
+        if (tot > m->gqe_max) m->gqe_max = tot;
+        gguf_expert_held(m, x);
+    }
+    fprintf(stderr, "[qwen36] experts %s held as codes and planes for the CPU: every expert fits in RAM, %.2f GB more "
+                    "(Q36_IQ3S_CODES=0 keeps the file's rows)\n", took, used / 1e9);
+#else
+    (void)m;
+#endif
+}
 /* GGUF mode: locate every layer's fused expert tensors and size the slot. */
 static void gguf_map_experts(Model *m) {
     Cfg *c = &m->c; char nm[96];
@@ -4123,6 +4202,7 @@ static void gguf_map_experts(Model *m) {
             gguf_expert_held(m, x);
         }
         for (int i = 0; i < c->n_layers; i++) if (!q36_dense_l(c, i)) gguf_expert_scales(m, i);
+        q36_exp_codes_decide(m);
         fprintf(stderr, "[gguf] colibri container: experts packed, one read each (layer 0 gate %s up %s down %s, %.2f MB)\n",
                 gq_type_name(m->gqx[0].tg), gq_type_name(m->gqx[0].tu), gq_type_name(m->gqx[0].td), m->gqe_max / 1048576.0);
         return;
@@ -4154,6 +4234,7 @@ static void gguf_map_experts(Model *m) {
         gguf_expert_held(m, x);
     }
     if (first < 0) first = 0;
+    q36_exp_codes_decide(m);
     /* a dense layer takes the types of the first layer with experts and holds none: the
      * loops over layers (the tiers' forms) see one shape, and nothing ever routes there */
     for (int i = 0; i < c->n_layers; i++)
@@ -11368,6 +11449,7 @@ int main(int argc, char **argv) {
     const char *mv = getenv("MODEL"); if (mv && *mv) g_model = mv;
     int hot_n = getenv("HOT") ? atoi(getenv("HOT")) : 0;
     int cap   = argc > 1 ? coli_arg_int(argv[1], "cache/layer") : 0;
+    g_q36_cap_arg = cap;
     int bits  = argc > 2 ? coli_arg_int(argv[2], "expert bits") : 4;
     /* cap<=0 (explicit 0, or bare omission above) is the "auto-size from host
      * RAM" sentinel resolved later in model_init_range, once dense weights are
