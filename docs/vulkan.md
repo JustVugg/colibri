@@ -676,7 +676,7 @@ waits for that batch's join.
   keeps at the moment when the CPU holds them too, and the rows handed to the CPU
   since startup.
 
-The dashboard's expert map (`EMAP`) shows a device-resident expert as tier 2 (VRAM),
+The chat's expert map (`EMAP`) shows a device-resident expert as tier 2 (VRAM),
 the experts a device step served still light up in `HITS`, and qwen36's
 `CACHE_ROUTE` ranks them like CUDA-resident ones.
 

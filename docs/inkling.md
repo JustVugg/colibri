@@ -454,7 +454,7 @@ every rank in routing order, so the sum's order does not depend on what was resi
 - With the CUDA backend (`CUDA=1` and a device) or Metal on, the Vulkan tier stays
   off: the other backend wins.
 - One line per run and serve turn, `[VK] tier inkling run: device N of M routed
-  experts ...`; the dashboard's expert map shows a device-resident expert as tier 2.
+  experts ...`; the chat's expert map shows a device-resident expert as tier 2.
   The knobs are `COLI_VK_TIER*` in [ENVIRONMENT.md](ENVIRONMENT.md#vulkan-any-gpu-with-a-vulkan-12-driver).
 
 Status: correct, not yet measured for speed. CI checks the tiny fixture on Lavapipe in

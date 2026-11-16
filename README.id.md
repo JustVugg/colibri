@@ -101,7 +101,7 @@ menekan Enter akan menerima rekomendasi. Kemudian proses penyiapan:
 4. **mengunduh model** dengan indikator progres dan dukungan resume: hentikan
    kapan saja, jalankan kembali, dan unduhan akan dilanjutkan dari tempat
    sebelumnya berhenti;
-5. **menjalankan colibri dan membuka dashboard** di browser Anda, serta
+5. **menjalankan colibri dan membuka chat** di browser Anda, serta
    menampilkan alamat yang dapat digunakan aplikasi lain:
 
 ```
@@ -188,7 +188,7 @@ sebuah bobot memengaruhi seberapa cepat jawaban diberikan, bukan bobot atau
 keputusan router mana yang menghasilkannya.
 
 Mengapa: agar model sebesar ini dapat dijalankan pada hardware yang sudah
-dimiliki orang, agar cara kerjanya dapat diamati (dashboard menampilkan setiap
+dimiliki orang, agar cara kerjanya dapat diamati (peta pakar di chat menampilkan setiap
 pakar saat aktif), dan agar engine tetap cukup kecil sehingga siapa pun dapat
 mengukurnya dan membuatnya lebih cepat. colibri juga merupakan platform riset
 terbuka: sebuah optimisasi hanya layak digunakan jika didukung pengukuran
@@ -495,20 +495,18 @@ tanpa modifikasi, diuji terhadap `coli serve`.
 
 Mode yang sama juga tersedia di terminal
 (`/decide merge | request changes | close` dalam `coli chat`) dan pada halaman
-System One di dashboard. Request dan reply lengkap, aturan scoring, serta kapan
+System One di chat. Request dan reply lengkap, aturan scoring, serta kapan
 mode ini tidak membantu dijelaskan di
 [docs/systemone.md](docs/systemone.md).
 
-## Dashboard
+## Chat di browser
 
-`coli web` membukanya, begitu juga proses penyiapan satu langkah: chat, halaman
-System One, Brain, dan halaman Profiling, dalam tema terang atau gelap.
-
-### UI chat baru
-
-`coli ui` membuka chat baru di samping `coli serve` yang sedang berjalan: penalaran di bloknya sendiri,
-gambar untuk model dengan menara visi, pencarian web, peta pakar, monitor langsung, dan agen pemrograman
-yang sudah diarahkan ke colibri. Tujuh bahasa. Lihat [ui/README.md](ui/README.md).
+`coli web` menjalankan model dan chat di depannya, lalu membuka chat di browser; begitu juga
+proses penyiapan satu langkah. `coli ui` membuka chat yang sama di samping `coli serve` yang sudah
+berjalan, di mesin ini atau mesin lain. Penalaran di bloknya sendiri, gambar untuk model dengan
+menara visi, dokumen (PDF, Word, OpenDocument, PowerPoint, halaman web, teks) yang dibaca ke dalam
+pesan, pencarian web, peta pakar, monitor langsung, System One, halaman Model, dan agen pemrograman
+yang sudah diarahkan ke colibri. Tujuh bahasa, tema terang dan gelap. Lihat [ui/README.md](ui/README.md).
 
 <p align="center">
   <img src="docs/media/ui/ui-chat.png" width="900" alt="UI chat baru: sebuah pertanyaan, penalaran yang dilipat, jawaban, dan kecepatannya">
@@ -532,9 +530,8 @@ amber saat dipakai dalam jawaban ini.</em></p>
 <p align="center"><em><strong>System One</strong>: berikan model sebuah dokumen dan hanya jawaban yang boleh dipilihnya. Di sini Qwen3.6-35B pada RTX PRO 4000
 membaca pull request yang merusak batas ukuran cache: <strong>request changes pada 81%</strong>, entropy 0.56 (ragu), 98 token dibaca, 0 dihasilkan.</em></p>
 
-Halaman **Profiling** menunjukkan di mana waktu setiap turn digunakan, fase demi
-fase, dengan 30 turn terakhir sebagai tren. Dengan [joules](https://pypi.org/project/landauer-gap/)
-terpasang di samping gateway (`pip install landauer-gap`), halaman ini juga menampilkan watt mesin dan joule per token pada turn terakhir.
+**Profiling** di monitor menunjukkan di mana waktu setiap turn digunakan, fase demi fase
+(menunggu pakar, matmul mereka, attention, LM head), turn demi turn.
 
 ### Antarmuka terminal
 
@@ -771,13 +768,13 @@ chat template-nya, sehingga perintahnya sama untuk setiap model:
 
 ```bash
 ./coli chat  --model /nvme/qwen36          # chat in the terminal
-./coli web   --model /nvme/qwen36          # API + dashboard, opens a browser
-./coli serve --model /nvme/qwen36          # API + dashboard, no browser
+./coli web   --model /nvme/qwen36          # API + the chat UI, opens a browser
+./coli serve --model /nvme/qwen36          # the API alone
 ./coli plan  --model /nvme/qwen36          # where the model will live: VRAM, RAM, disk
 ./coli doctor --model /nvme/qwen36         # read-only check: is everything ready?
 ./coli tune  --model /nvme/qwen36          # measure and save this machine's fastest safe settings
 ./coli import /nvme/Flint-UD-Q4_K_XL.gguf  # a GGUF: writes Flint-UD-Q4_K_XL.colibri next to it
-./coli ui                                  # the chat UI, next to a running coli serve
+./coli ui                                  # the chat UI alone, next to a running coli serve
 ./coli tui                                 # the chat in the terminal, on a running coli serve (or --model)
 ```
 
@@ -822,7 +819,7 @@ penjelasan.
 |---|---|
 | Penyiapan satu langkah dan instalasi manual, untuk setiap platform | [quickstart.md](docs/quickstart.md) |
 | Penyiapan melalui asisten AI, dan server MCP | [AI_SETUP.md](docs/AI_SETUP.md), [MCP_SERVER.md](docs/MCP_SERVER.md) |
-| API: OpenAI, Anthropic, tools, KV slots, dashboard | [api.md](docs/api.md) |
+| API: OpenAI, Anthropic, tools, KV slots | [api.md](docs/api.md) |
 | System One dan model keputusan | [systemone.md](docs/systemone.md), [laya.md](docs/laya.md), [gliner_decide.md](docs/gliner_decide.md), [clef.md](docs/clef.md) |
 | File GGUF: arsitektur, dua mode, apa yang dilakukan setiap engine dengan bloknya | [gguf.md](docs/gguf.md) |
 | Model pada engine Qwen3.6 (Flint, Muse Spark Open, LFM3-VL) dan Mistral-Large-4 | [qwen36.md](docs/qwen36.md), [mistral-large4.md](docs/mistral-large4.md) |
@@ -878,9 +875,8 @@ c/
 ├── resource_plan.py      RAM/VRAM planner behind coli plan and coli doctor
 ├── tools/                conversion, fixtures and benchmarks
 └── tests/                dependency-free C and Python tests
-ui/                       the chat UI (coli ui)
-web/                      the dashboard (a pure API client)
-desktop/                  Tauri desktop shell around the dashboard
+ui/                       the chat UI (coli web, coli ui)
+desktop/                  Tauri desktop shell around the chat UI
 docker/                   container images
 docs/                     reference docs, experiments, media
 site/                     the website

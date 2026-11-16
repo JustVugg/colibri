@@ -54,7 +54,7 @@ request is refused, so `/v1/systemone` answers an error (the server log says
 why) and its scoring needs `COLI_METAL=0`. It keeps no pins (`pin=1` is ignored,
 with one line). The CPU engine's per-layer expert cache (the size argument
 above, `PILOT`, `HOT`, `COLIBRI_RESIDENT`) is not used: the graph has one cache,
-`QWEN_EXPERT_CACHE_BYTES`. In a serve the dashboard's expert map shows that
+`QWEN_EXPERT_CACHE_BYTES`. In a serve the chat's expert map shows that
 cache; its profile has the wall time, the counts and the disk time (summed over
 the readers, which read in parallel), and its phase columns stay 0 unless
 `COLI_TIMERS=1`.

@@ -68,7 +68,7 @@ cd colibri
 2. **рекомендует модель, которая подходит**: часть модели, которая всегда остаётся в RAM, плюс минимальный кэш экспертов должны поместиться в вашу RAM, а загрузка на ваш диск;
 3. **готовит движок**: собирает его для вашей машины, если есть компилятор, иначе скачивает уже собранный, который работает на CPU и, в Linux и Windows, также на GPU через Vulkan. Сборку под вашу GPU делает, когда это выгодно: CUDA для карты NVIDIA в Linux, если установлен CUDA toolkit, иначе Vulkan. На дискретной GPU это делается всегда; на встроенной, которая делит RAM с CPU, только для моделей, которые по измерениям там быстрее (Qwen3.6, Qwen3-Coder и Qwen3.8-Flash-Next). Если пакета не хватает, установка выводит точную команду для его установки и продолжает на CPU; запустите установку снова после этого, и движок пересоберётся под GPU;
 4. **загружает модель** с индикатором прогресса и возобновлением: останавливайте её когда угодно, запустите снова, и она продолжит с того места, где остановилась;
-5. **запускает colibri и открывает панель** в браузере, и выводит адреса, которые могут использовать другие приложения:
+5. **запускает colibri и открывает чат** в браузере, и выводит адреса, которые могут использовать другие приложения:
 
 ```
 Starting colibri
@@ -128,7 +128,7 @@ Starting colibri
 
 Поэтому модели не нужно помещаться в быструю память; её нужно **разместить**. Плотная часть (attention, общие эксперты, эмбеддинги) остаётся в RAM. Маршрутизируемые эксперты остаются на диске и читаются, когда роутер их запрашивает, через кэш, который учится, какие эксперты использует ваша работа. GPU, если она есть, держит самые горячие эксперты и плотные слои. Место, где лежит вес, меняет скорость получения ответа, но не то, какие веса и какие решения роутера его дают.
 
-Зачем: чтобы запускать модели такого размера на железе, которое у людей уже есть, чтобы наблюдать, как они работают (панель показывает каждый эксперт в момент его срабатывания), и держать движок достаточно маленьким, чтобы каждый мог его измерить и ускорить. colibri также открытая исследовательская платформа: оптимизация получает своё место, только если есть воспроизводимое сквозное измерение, а политика по умолчанию никогда молча не меняет точность модели или семантику роутера. Меньше быстрой памяти может стоить скорости, но не должно тихо переопределять модель. Подробности: [Как это работает](#how-it-works).
+Зачем: чтобы запускать модели такого размера на железе, которое у людей уже есть, чтобы наблюдать, как они работают (карта экспертов в чате показывает каждый эксперт в момент его срабатывания), и держать движок достаточно маленьким, чтобы каждый мог его измерить и ускорить. colibri также открытая исследовательская платформа: оптимизация получает своё место, только если есть воспроизводимое сквозное измерение, а политика по умолчанию никогда молча не меняет точность модели или семантику роутера. Меньше быстрой памяти может стоить скорости, но не должно тихо переопределять модель. Подробности: [Как это работает](#how-it-works).
 
 <a id="which-model-for-my-machine"></a>
 
@@ -287,15 +287,11 @@ curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -
 
 **Переход с Jev.** Запрос и ответ — те же, что у API Jev от TypeSafe, поэтому клиент Jev переходит на colibri, меняя только базовый URL и ничего больше: `TYPESAFE_BASE_URL=http://127.0.0.1:8000` (ключ, который он уже отправляет, принимается сервером, запущенным без `COLI_API_KEY`). Два официальных SDK без изменений протестированы против `coli serve`.
 
-Тот же режим есть в терминале (`/decide merge | request changes | close` в `coli chat`) и на странице System One панели. Полные запрос и ответ, правила подсчёта очков и случаи, где это не помогает: [docs/systemone.md](docs/systemone.md).
+Тот же режим есть в терминале (`/decide merge | request changes | close` в `coli chat`) и на странице System One в чате. Полные запрос и ответ, правила подсчёта очков и случаи, где это не помогает: [docs/systemone.md](docs/systemone.md).
 
-## Панель управления
+## Чат в браузере
 
-Её открывает `coli web`, и её открывает также однострочная установка: чат, страница System One, Brain и страница Profiling, в светлой или тёмной теме.
-
-### Новый чат
-
-`coli ui` открывает новый чат рядом с работающим `coli serve`: рассуждения в собственном блоке, картинки для моделей с визуальной башней, веб-поиск, карта экспертов, живой монитор и агенты для программирования, сразу направленные на colibri. Семь языков. См. [ui/README.md](ui/README.md).
+`coli web` запускает модель и перед ней чат и открывает чат в браузере; так же делает и однострочная установка. `coli ui` открывает тот же чат рядом с уже работающим `coli serve`, на этой машине или на другой. Рассуждения в собственном блоке, картинки для моделей с визуальной башней, документы (PDF, Word, OpenDocument, PowerPoint, веб-страницы, текст), прочитанные в сообщение, веб-поиск, карта экспертов, живой монитор, System One, страница моделей и агенты для программирования, сразу направленные на colibri. Семь языков, светлая и тёмная тема. См. [ui/README.md](ui/README.md).
 
 <p align="center">
   <img src="docs/media/ui/ui-chat.png" width="900" alt="новый чат: вопрос, свёрнутые рассуждения, ответ и его скорость">
@@ -317,7 +313,7 @@ curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -
 </p>
 <p align="center"><em><strong>System One</strong>: дайте модели документ и только те ответы, которые она может выбрать. Здесь Qwen3.6-35B на RTX PRO 4000 читает pull request, который ломает лимит размера кэша: <strong>request changes с вероятностью 81%</strong>, энтропия 0,56 (не уверена), 98 токенов прочитано, 0 сгенерировано.</em></p>
 
-Страница **Profiling** показывает, где каждый ход тратит время, фаза за фазой, с последними 30 ходами как трендом. Если рядом со шлюзом установлены [джоули](https://pypi.org/project/landauer-gap/) (`pip install landauer-gap`), она также показывает ватты машины и джоули на токен последнего хода.
+**Профилирование** в мониторе показывает, где каждый ход потратил время, фаза за фазой (ожидание экспертов, их матричные умножения, внимание, LM head), ход за ходом.
 
 ### Терминальный интерфейс
 
@@ -447,13 +443,13 @@ make qwen36 VK=1                          # one engine, here with Vulkan (CUDA=1
 
 ```bash
 ./coli chat  --model /nvme/qwen36          # chat in the terminal
-./coli web   --model /nvme/qwen36          # API + dashboard, opens a browser
-./coli serve --model /nvme/qwen36          # API + dashboard, no browser
+./coli web   --model /nvme/qwen36          # API + the chat UI, opens a browser
+./coli serve --model /nvme/qwen36          # the API alone
 ./coli plan  --model /nvme/qwen36          # where the model will live: VRAM, RAM, disk
 ./coli doctor --model /nvme/qwen36         # read-only check: is everything ready?
 ./coli tune  --model /nvme/qwen36          # measure and save this machine's fastest safe settings
 ./coli import /nvme/Flint-UD-Q4_K_XL.gguf  # a GGUF: writes Flint-UD-Q4_K_XL.colibri next to it
-./coli ui                                  # the chat UI, next to a running coli serve
+./coli ui                                  # the chat UI alone, next to a running coli serve
 ./coli tui                                 # the chat in the terminal, on a running coli serve (or --model)
 ```
 
@@ -482,7 +478,7 @@ colibri хочет, чтобы передовые модели меньше за
 |---|---|
 | Установка в один шаг и ручная установка на каждой платформе | [quickstart.md](docs/quickstart.md) |
 | Установка через ИИ-ассистента и MCP-сервер | [AI_SETUP.md](docs/AI_SETUP.md), [MCP_SERVER.md](docs/MCP_SERVER.md) |
-| API: OpenAI, Anthropic, инструменты, слоты KV, панель | [api.md](docs/api.md) |
+| API: OpenAI, Anthropic, инструменты, слоты KV | [api.md](docs/api.md) |
 | System One и модели решений | [systemone.md](docs/systemone.md), [laya.md](docs/laya.md), [gliner_decide.md](docs/gliner_decide.md), [clef.md](docs/clef.md) |
 | Файлы GGUF: архитектуры, два режима, что каждый движок делает с блоками | [gguf.md](docs/gguf.md) |
 | Модели на движке Qwen3.6 (Flint, Muse Spark Open, LFM3-VL) и Mistral-Large-4 | [qwen36.md](docs/qwen36.md), [mistral-large4.md](docs/mistral-large4.md) |
@@ -538,9 +534,8 @@ c/
 ├── resource_plan.py      RAM/VRAM planner behind coli plan and coli doctor
 ├── tools/                conversion, fixtures and benchmarks
 └── tests/                dependency-free C and Python tests
-ui/                       the chat UI (coli ui)
-web/                      the dashboard (a pure API client)
-desktop/                  Tauri desktop shell around the dashboard
+ui/                       the chat UI (coli web, coli ui)
+desktop/                  Tauri desktop shell around the chat UI
 docker/                   container images
 docs/                     reference docs, experiments, media
 site/                     the website

@@ -68,7 +68,7 @@ cd colibri
 2. **推荐一个装得下的模型**：模型中始终留在内存里的部分，加上最小的专家缓存，必须放得进你的内存，下载的文件必须放得进你的磁盘；
 3. **获取引擎**：如果机器上有编译器，就为你的机器编译引擎，否则下载预编译版本，该版本在 CPU 上运行，在 Linux 和 Windows 上也能在 Vulkan GPU 上运行。在值得的时候，它会为你的 GPU 编译：Linux 上的 NVIDIA 显卡在装有 CUDA toolkit 时用 CUDA，否则用 Vulkan。在独立显卡上总是这样做；集成显卡与 CPU 共用内存，只有实测在集成显卡上更快的模型（Qwen3.6、Qwen3-Coder 和 Qwen3.8-Flash-Next）才会这样做。如果缺少某个软件包，它会打印出安装该软件包的确切命令，并继续使用 CPU；之后再运行一次安装程序，它就会为 GPU 重新编译；
 4. **下载模型**，显示进度并支持断点续传：随时可以中断，再次运行就会从中断的地方继续；
-5. **启动 colibri，并在浏览器中打开仪表盘**，同时打印出其他应用可以使用的地址：
+5. **启动 colibri，并在浏览器中打开聊天界面**，同时打印出其他应用可以使用的地址：
 
 ```
 Starting colibri
@@ -128,7 +128,7 @@ Starting colibri
 
 所以模型不必完整装进高速内存，而是需要被正确地**放置**。稠密部分（注意力、共享专家、嵌入）留在内存中。路由专家留在磁盘上，在路由器需要时读取，中间经过一个缓存，它会学习你的工作用到哪些专家。如果有 GPU，它会保存最热的专家和稠密层。权重放在哪里，只改变回答出来的速度，不改变由哪些权重、哪些路由决策产生这个回答。
 
-为什么做它：为了在人们已有的硬件上运行这种规模的模型，为了看着它们工作（仪表盘会显示每一个被激活的专家），也为了让引擎保持足够小，让任何人都能测量它、把它变得更快。colibri 也是一个开放的研究平台：一项优化要靠可复现的端到端测量才能被采纳，默认策略绝不会在不告知的情况下改变模型精度或路由语义。高速内存少了，可以慢一些；但不能悄悄地重新定义模型。详见[工作原理](#how-it-works)。
+为什么做它：为了在人们已有的硬件上运行这种规模的模型，为了看着它们工作（聊天界面的专家地图会显示每一个被激活的专家），也为了让引擎保持足够小，让任何人都能测量它、把它变得更快。colibri 也是一个开放的研究平台：一项优化要靠可复现的端到端测量才能被采纳，默认策略绝不会在不告知的情况下改变模型精度或路由语义。高速内存少了，可以慢一些；但不能悄悄地重新定义模型。详见[工作原理](#how-it-works)。
 
 <a id="which-model-for-my-machine"></a>
 
@@ -279,15 +279,11 @@ curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -
 
 **从 Jev 切换过来。** 请求和回复与 TypeSafe 的 Jev API 相同，因此 Jev 客户端只需更改 base URL 即可切换到 colibri，其他什么都不用改：`TYPESAFE_BASE_URL=http://127.0.0.1:8000`（没有设置 `COLI_API_KEY` 就启动的服务器会接受客户端已经在发送的密钥）。两个官方 SDK 未经任何修改，已针对 `coli serve` 测试。
 
-同样的模式也可以在终端中使用（`coli chat` 中的 `/decide merge | request changes | close`），也可以在仪表盘的 System One 页面使用。完整的请求与回复、打分规则，以及它在哪些情况下帮不上忙：[docs/systemone.md](docs/systemone.md)。
+同样的模式也可以在终端中使用（`coli chat` 中的 `/decide merge | request changes | close`），也可以在聊天界面的 System One 页面使用。完整的请求与回复、打分规则，以及它在哪些情况下帮不上忙：[docs/systemone.md](docs/systemone.md)。
 
-## 仪表盘
+## 浏览器中的聊天
 
-`coli web` 会打开它，一步安装程序也会：包括聊天、System One 页面、大脑（Brain）页面和性能剖析（Profiling）页面，支持浅色和深色主题。
-
-### 新的聊天界面
-
-`coli ui` 在正在运行的 `coli serve` 旁边打开新的聊天界面：推理有自己的区块，带视觉塔的模型可以看图片，还有网页搜索、专家地图、实时监视器，以及已经指向 colibri 的编程智能体。支持七种语言。参见 [ui/README.md](ui/README.md)。
+`coli web` 会启动模型并在它前面启动聊天界面，然后在浏览器中打开聊天；一步安装程序也会这样做。`coli ui` 在已经运行的 `coli serve` 旁边打开同一个聊天界面，可以在本机，也可以在另一台机器上：推理有自己的区块，带视觉塔的模型可以看图片，文档（PDF、Word、OpenDocument、PowerPoint、网页、文本）会读入消息，还有网页搜索、专家地图、实时监视器、System One、模型页面，以及已经指向 colibri 的编程智能体。支持七种语言，浅色和深色主题。参见 [ui/README.md](ui/README.md)。
 
 <p align="center">
   <img src="docs/media/ui/ui-chat.png" width="900" alt="新的聊天界面：一个问题、折叠的推理、回答及其速度">
@@ -309,7 +305,7 @@ curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -
 </p>
 <p align="center"><em><strong>System One</strong>：给模型一份文档，以及它唯一可以选择的几个答案。图中 RTX PRO 4000 上的 Qwen3.6-35B 读取一个破坏了缓存大小上限的拉取请求：<strong>request changes 的概率为 81%</strong>，熵 0.56（不确定），读取 98 个 token，生成 0 个。</em></p>
 
-**性能剖析**（Profiling）页面按阶段显示每一轮的时间花在了哪里，并以最近 30 轮作为趋势。若在网关旁安装了 [joules](https://pypi.org/project/landauer-gap/)（`pip install landauer-gap`），它还会显示机器的功率（watts）以及上一轮每个 token 的焦耳数（joules）。
+监视器中的**性能剖析**按阶段（等待专家、专家的矩阵乘法、注意力、LM head）逐轮显示每一轮的时间花在了哪里。
 
 ### 终端界面
 
@@ -438,13 +434,13 @@ make qwen36 VK=1                          # one engine, here with Vulkan (CUDA=1
 
 ```bash
 ./coli chat  --model /nvme/qwen36          # chat in the terminal
-./coli web   --model /nvme/qwen36          # API + dashboard, opens a browser
-./coli serve --model /nvme/qwen36          # API + dashboard, no browser
+./coli web   --model /nvme/qwen36          # API + the chat UI, opens a browser
+./coli serve --model /nvme/qwen36          # the API alone
 ./coli plan  --model /nvme/qwen36          # where the model will live: VRAM, RAM, disk
 ./coli doctor --model /nvme/qwen36         # read-only check: is everything ready?
 ./coli tune  --model /nvme/qwen36          # measure and save this machine's fastest safe settings
 ./coli import /nvme/Flint-UD-Q4_K_XL.gguf  # a GGUF: writes Flint-UD-Q4_K_XL.colibri next to it
-./coli ui                                  # the chat UI, next to a running coli serve
+./coli ui                                  # the chat UI alone, next to a running coli serve
 ./coli tui                                 # the chat in the terminal, on a running coli serve (or --model)
 ```
 
@@ -471,7 +467,7 @@ colibri 希望前沿模型更少依赖稀缺硬件，运行成本更低。这意
 |---|---|
 | 一步安装与手动安装，所有平台 | [quickstart.md](docs/quickstart.md) |
 | 通过 AI 助手安装，以及 MCP 服务器 | [AI_SETUP.md](docs/AI_SETUP.md)、[MCP_SERVER.md](docs/MCP_SERVER.md) |
-| API：OpenAI、Anthropic、工具调用、KV slot、仪表盘 | [api.md](docs/api.md) |
+| API：OpenAI、Anthropic、工具调用、KV slot | [api.md](docs/api.md) |
 | System One 与决策模型 | [systemone.md](docs/systemone.md)、[laya.md](docs/laya.md)、[gliner_decide.md](docs/gliner_decide.md)、[clef.md](docs/clef.md) |
 | GGUF 文件：支持的架构、两种模式、各引擎如何处理这些块 | [gguf.md](docs/gguf.md) |
 | Qwen3.6 引擎上的模型（Flint、Muse Spark Open、LFM3-VL）和 Mistral-Large-4 | [qwen36.md](docs/qwen36.md)、[mistral-large4.md](docs/mistral-large4.md) |
@@ -527,9 +523,8 @@ c/
 ├── resource_plan.py      RAM/VRAM planner behind coli plan and coli doctor
 ├── tools/                conversion, fixtures and benchmarks
 └── tests/                dependency-free C and Python tests
-ui/                       the chat UI (coli ui)
-web/                      the dashboard (a pure API client)
-desktop/                  Tauri desktop shell around the dashboard
+ui/                       the chat UI (coli web, coli ui)
+desktop/                  Tauri desktop shell around the chat UI
 docker/                   container images
 docs/                     reference docs, experiments, media
 site/                     the website

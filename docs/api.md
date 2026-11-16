@@ -698,7 +698,7 @@ server's `context_length`.
 A chat request may opt into context compaction with the extension field
 `"context_compaction": "auto"` (`"off"` is the default, the standard behavior;
 `COLI_COMPACT=1` on the server makes `auto` the default for every client). The
-dashboard and `coli chat` send it, so a conversation there never ends in
+chat UI and `coli chat` send it, so a conversation there never ends in
 `context_length_exceeded`:
 
 1. When the conversation does not fit the context, or leaves the answer less
@@ -771,50 +771,26 @@ prompt lookup follow one conversation), and their Vulkan dense chain, DeltaNet o
 the GPU and Metal paths stay off; the Vulkan expert tier serves every
 conversation's experts.
 
-## Web dashboard
+## The chat in the browser
 
-One command serves the OpenAI-compatible API **and** the web console on the
-same port, then opens your browser when the engine is ready:
+One command serves the OpenAI-compatible API and starts the chat UI in front of
+it, then opens your browser on the chat when the engine is ready:
 
 ```bash
-cd web && npm install && npm run build   # once
-./coli web --model <model-dir>
+./coli web --model <model-dir>     # the API on :8000, the chat on :8790
 ```
 
-`coli web` differs from `coli serve` only in opening a browser — both serve the
-dashboard on the same port. On a headless host (no display, often no GPU at all)
-use `coli serve`, or `coli web --no-browser`, and point a browser at it from
-another machine. Nothing in the dashboard needs a desktop session on the host.
+`coli web` is `coli serve` plus the chat UI (`ui/server.py`, Python's standard
+library, no build step) on the API's port + 790 (`--ui-port` picks another); the
+UI stops with it. `coli serve` serves the API alone, and `coli ui` starts the
+chat next to a `coli serve` that already runs, on this machine or another
+(`--backend http://HOST:PORT`). On a headless host use `coli serve` or
+`coli web --no-browser` and point a browser at it from another machine.
 
-What you get is one workspace with a dock to switch page:
-
-- **Chat**: streaming answers, a reasoning toggle, image input where the engine
-  supports it, the KV slot to answer in, and the conversation exported as a file;
-- **System One**: closed-set answers. A document, a question and the only answers
-  allowed; the engine reads the probability of each answer, generates nothing,
-  and reports an entropy that says when it is not sure. Same thing as
-  `POST /v1/systemone` (see [systemone.md](systemone.md));
-- **Brain**, two views. *Explore* draws the
-  [measured expert atlas](https://github.com/JustVugg/colibri/issues/175) of GLM-5.2 as a cortex with ten regions to
-  enter (publish `experts.json` from `tools/expert_atlas/analyze.py --web`).
-  *Live routing* shows the model actually running: one cell per expert,
-  colour = tier, brightness = routing heat, and the experts routed in each
-  turn flash white and decay;
-- **Profiling**: where the engine spends each turn, by phase (I/O wait, expert
-  matmul, attention, LM head, other), the disk service overlapped with compute,
-  and the last 30 turns as a trend;
-- a light and a dark theme.
-
-The dashboard talks to the engine over a small line protocol and plain JSON
-endpoints — nothing heavier than the engine itself. `web/` is a pure OpenAI-API
-client (React + TypeScript) and also works against any other compatible
-endpoint; the terminal `coli chat` remains the first-class interface.
-
-The layout is responsive down to phone widths; the per-turn time breakdown and
-the tok/s trend live on the Profiling page:
-
-<p align="center">
-  <img src="media/colibri-mobile.png" width="270" alt="the dashboard on a phone-sized viewport" />
-  &nbsp;&nbsp;
-  <img src="media/colibri-profiling.png" width="560" alt="the Profiling page: where the engine spends each turn" />
-</p>
+The chat proxies `/v1/`, `/health`, `/profile` and `/experts` to the gateway, so
+the page and the API share one origin: streaming answers with the reasoning in
+its own block, pictures where the engine loaded a vision tower, documents (PDF,
+Word, OpenDocument, PowerPoint, web pages, text) read into the message, web
+search, the expert map, the monitor with each turn's profile, System One
+(`POST /v1/systemone`, see [systemone.md](systemone.md)), the Models page and
+coding agents. What it does and how: [ui/README.md](../ui/README.md).

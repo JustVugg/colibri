@@ -457,7 +457,7 @@ logprob channel: a prompt per question, a read-out per option. A **decision
 engine** is a model built for the question itself. It reads the state and the
 typed questions and returns a probability per option in one forward pass,
 with the calibration its authors fitted. colibri serves it on the same
-endpoint and with the same reply, so a Jev client, the SDKs and the dashboard
+endpoint and with the same reply, so a Jev client, the SDKs and the chat UI
 cannot tell which kind answered.
 
 | engine | model | doc |

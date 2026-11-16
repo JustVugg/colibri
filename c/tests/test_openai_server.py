@@ -4319,46 +4319,6 @@ class ClientHangupTest(unittest.TestCase):
             self.assertEqual(json.load(response)["status"], "ok")
 
 
-class StaticServingTest(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        root = Path(self.tmp.name)
-        dist = root / "dist"
-        dist.mkdir()
-        (dist / "index.html").write_text("dashboard", encoding="utf-8")
-        sibling = root / "dist-private"
-        sibling.mkdir()
-        (sibling / "secret.txt").write_text("private", encoding="utf-8")
-        self.web_dist = patch.object(APIHandler, "WEB_DIST", dist)
-        self.web_dist.start()
-        self.server = APIServer(("127.0.0.1", 0), FakeEngine(), "test-model")
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        self.thread.start()
-        self.base = f"http://127.0.0.1:{self.server.server_port}"
-
-    def tearDown(self):
-        self.server.scheduler.close()
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(timeout=2)
-        self.web_dist.stop()
-        self.tmp.cleanup()
-
-    def test_static_root_stays_inside_dist_directory(self):
-        with urlopen(self.base + "/", timeout=2) as response:
-            self.assertEqual(response.read(), b"dashboard")
-        with self.assertRaises(HTTPError) as caught:
-            urlopen(self.base + "/%2e%2e/dist-private/secret.txt", timeout=2)
-        self.addCleanup(caught.exception.close)
-        self.assertEqual(caught.exception.code, 404)
-
-    def test_nul_in_the_path_is_not_found(self):
-        with self.assertRaises(HTTPError) as caught:
-            urlopen(self.base + "/%00", timeout=2)
-        self.addCleanup(caught.exception.close)
-        self.assertEqual(caught.exception.code, 404)
-
-
 class SchedulerHTTPTest(unittest.TestCase):
     def setUp(self):
         self.engine = BlockingEngine()
