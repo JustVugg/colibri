@@ -2469,6 +2469,13 @@ tests/test_qwen38_wex4$(EXE): tests/test_qwen38_wex4.c qwen38.c $(VK_OBJ)
 tests/test_glm53_mxfp4$(EXE): tests/test_glm53_mxfp4.c glm53.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
+# GLM-5.3's MXFP4 experts from the shards and from a WEX4 container (COLI_WEX_PATH; docs/wex.md), no
+# model: a synthetic grid, its shards and its containers (RAW, WNR3), every expert read and checked,
+# the refusals in child processes; the fake CUDA helper decodes the WNR3 records once.
+tests/test_glm53_wex4$(EXE): tests/test_glm53_wex4.c tests/wex4_fixture.h tests/wnr3_fixture.h glm53.c wex4.h \
+		wex_decode.c wex_decode.h $(VK_OBJ) | tests/fake_wex_cuda$(XDNA_DLEXT)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
 tests/test_qwen38_igpu_defaults$(EXE): tests/test_qwen38_igpu_defaults.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 

@@ -7,6 +7,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### New
 
+- **GLM-5.3-Flash: the routed experts from a WEX4 container** (`COLI_WEX_PATH`, `COLI_WEX_ROOT`,
+  `COLI_WEX_VERIFY`, `COLI_WEX_CUDA_LIB`): for AMD's MXFP4 checkpoint, a container written by
+  Wex-WRN2's `pack --names qwen38` serves each expert as one record, RAW or WNR3 (decoded in the
+  slot, by the CUDA helper when one is named, else the CPU), the same bytes as the shards. Every
+  path that takes an expert reads it there. The run ends with a count of the records read and
+  decoded, by the helper and by the CPU. Unset, nothing changes. `tests/test_glm53_wex4.c`
+  ([docs/wex.md](docs/wex.md#glm-53-flash-glm53)).
 - **GLM-5.3-Flash: AMD's MXFP4 checkpoint as published** (`amd/GLM-5.3-Flash-Quark-MXFP4`): routed
   experts with a `weight_scale` beside them stream as MXFP4 (fmt 7, `matmul_mxfp4`, the file's bytes),
   and go to the Vulkan and CUDA expert tiers as `VKT_SRC_MXFP4_E8M0`; MXFP4 shared experts are
