@@ -540,11 +540,21 @@ def operator_cap(a, arch):
         cap=0
     return cap if cap else None
 
+def cuda_device_order(env):
+    """The engine's CUDA devices numbered as nvidia-smi numbers them (#2887). --gpu, COLI_GPUS and
+    the setup's own choice name nvidia-smi's indices, its PCI bus order; the CUDA runtime counts the
+    fastest device first unless CUDA_DEVICE_ORDER says otherwise. Two V100s beside a Quadro P2000
+    (nvidia-smi 1, 2 and 0) are CUDA 0, 1 and 2, so --gpu 1,2 opened a V100 and the P2000. A
+    CUDA_DEVICE_ORDER the user set is kept."""
+    env.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+    return env
+
+
 def env_for_engine(a, arch, plan=None):
     if arch == "glm":
         return env_for(a)
     explicit_env = set(os.environ)
-    env = os.environ.copy()
+    env = cuda_device_order(os.environ.copy())
     env.pop(_PROFILE_CAP_ENV,None)
     env.pop(_PLAN_CAP_ENV,None)
     family=family_by_id(arch)
@@ -997,7 +1007,7 @@ def report_unapplied_vram_tier(plan, gpu_off_by_request=False):
 
 def env_for(a):
     explicit_env = set(os.environ)
-    e = dict(os.environ, SNAP=a.model)
+    e = cuda_device_order(dict(os.environ, SNAP=a.model))
     e.pop(_PROFILE_CAP_ENV,None)
     e.pop(_PLAN_CAP_ENV,None)
     if getattr(a,"ram",0): explicit_env.add("RAM_GB")
