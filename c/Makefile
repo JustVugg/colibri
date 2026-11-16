@@ -3988,6 +3988,13 @@ tools/wex4_verify$(EXE): tools/wex4_verify.c
 tests/test_wex4_verify$(EXE): tests/test_wex4_verify.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# WNR3 decode and record read speed on N seeded records of a real container (docs/wex-bench.md):
+# the reference, the fast decoder per stream count, the CUDA helper when COLI_WEX_CUDA_LIB names it,
+# every arm checked against the reference's bytes. tools/wex_bench.py builds and runs it.
+tools/wex_decode_bench$(EXE): tools/wex_decode_bench.c wex_decode.c wex_decode.h wex_fast_decode.h wex_format.h \
+		wex_neural_rans.h wex4.h
+	$(CC) $(CFLAGS) $< -o $@ -pthread $(LDFLAGS) $(if $(IS_WIN),,-ldl)
+
 # WNR3 records on the CPU (wex_decode.c): the WNM2 model registry, a container's model blob,
 # the in-place decode, changed records, several threads. Records made by the reference encoder.
 tests/test_wex_decode$(EXE): tests/test_wex_decode.c

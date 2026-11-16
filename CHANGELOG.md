@@ -7,6 +7,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### New
 
+- **`c/tools/wex_bench.py`**: the WEX measurements in one command (machine, `wex4_verify`,
+  WNR3 decode per decoder and stream count with byte identity, record reads, an engine A/B of
+  shards against the container), and a report to paste into #2860; `c/tools/wex_decode_bench.c`
+  (`make -C c tools/wex_decode_bench`) is its C part ([docs/wex-bench.md](docs/wex-bench.md)).
 - **`COLI_WEX_STATS=1`**: one stderr line at exit, `[wex] stats: helper=... fast=...
   reference=... failed=...`, with what decoded the WNR3 records of a WEX4 container
   (deepseek_v4, qwen38, deepseek_v41; [docs/wex.md](docs/wex.md#counting-the-decodes)).
