@@ -7,6 +7,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### New
 
+- **`COLI_WEX_STATS=1`**: one stderr line at exit, `[wex] stats: helper=... fast=...
+  reference=... failed=...`, with what decoded the WNR3 records of a WEX4 container
+  (deepseek_v4, qwen38, deepseek_v41; [docs/wex.md](docs/wex.md#counting-the-decodes)).
 - **WNR3 records decode on the CPU with the fast decoder** (`COLI_WEX_FAST_DECODE`, default
   on): `coli_wex_decode_record` uses `wex_fast_decode.h` where the CPU has its kernel (AVX2 by
   CPUID, NEON), one thread a record; `0`, or another CPU: the reference, as before. Same bytes,

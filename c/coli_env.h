@@ -497,6 +497,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_WEX_FAST_DECODE", CE_BOOL, CE_DSV4 | CE_QWEN38 | CE_DSV41, 0, NULL},
     {"COLI_WEX_PATH", CE_STR, CE_DSV4 | CE_QWEN38 | CE_DSV41, 0, NULL},
     {"COLI_WEX_ROOT", CE_STR, CE_DSV4 | CE_QWEN38 | CE_DSV41, 0, NULL},
+    {"COLI_WEX_STATS", CE_BOOL, CE_DSV4 | CE_QWEN38 | CE_DSV41, 0, NULL},
     {"COLI_WEX_VERIFY", CE_BOOL, CE_DSV4 | CE_QWEN38 | CE_DSV41, 0, NULL},
     {"COLI_WORKER_WEIGHT", CE_INT, CE_GLM53, 0, NULL},
     {"COLI_XDNA",                        CE_BOOL  , CE_COLIBRI                                      , 0             , NULL},
