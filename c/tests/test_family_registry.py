@@ -129,8 +129,8 @@ class FamilyRegistryTest(unittest.TestCase):
         # `logprobs_echo` is the numeric logprobs/echo channel: the engine emits one ECHO
         # frame per prompt position it read out, position 0 included. `submit_gbytes` is
         # the header SHAPE -- the seventh numeric field coli_submit_parse reads, which a
-        # sibling engine's six-field parser would take for a malformed key and answer with
-        # "bad submit extension". Neither is published metadata: they describe the engine
+        # sibling engine's six-field parser would take for a malformed key and refuse
+        # ("bad submit header"). Neither is published metadata: they describe the engine
         # link, not the user surface.
         by_id, _ = _build_registry(FAMILIES)
         for family_id, echo, gbytes in (("glm", True, True), ("mimo", True, True),

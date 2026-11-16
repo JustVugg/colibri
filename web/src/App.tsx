@@ -49,7 +49,7 @@ import { Markdown } from "./components/Markdown"
 import { NavigationDock, type View } from "./components/NavigationDock"
 import { Profiling } from "./Profiling"
 import { persistPublicSettings, stored } from "@/lib/storage"
-import { appendDelta, continuable, continuation, setFinish } from "@/lib/transcript"
+import { appendDelta, continuable, continuation, setFinish, uncachedPromptTokens } from "@/lib/transcript"
 import { cn } from "@/lib/utils"
 import { useLocale } from "./i18n"
 
@@ -92,6 +92,7 @@ export default function App() {
   const [streamStart, setStreamStart] = useState<number | null>(null)
   const [tokenCount, setTokenCount] = useState(0)
   const [tokPerSec, setTokPerSec] = useState<number | null>(null)
+  const [ppPerSec, setPpPerSec] = useState<number | null>(null)
   const [ttft, setTtft] = useState<number | null>(null)
   const [totalTokens, setTotalTokens] = useState({ prompt: 0, completion: 0 })
   const [connecting, setConnecting] = useState(false)
@@ -293,7 +294,9 @@ export default function App() {
     setStreamStart(null)
     setTokenCount(0)
     let decodeStart = 0
+    let measuredTtft: number | null = null
     setTokPerSec(null)
+    setPpPerSec(null)
     setTtft(null)
     const t0 = performance.now()
     let firstToken = true
@@ -317,7 +320,13 @@ export default function App() {
            first one is the real time-to-first-token. The answer's first token
            arrives much later on a reasoning model. */
         onReasoning: (delta) => {
-          if (firstToken) { setTtft(performance.now() - t0); setStreamStart(performance.now()); decodeStart = performance.now(); firstToken = false }
+          if (firstToken) {
+            measuredTtft = performance.now() - t0
+            setTtft(measuredTtft)
+            setStreamStart(performance.now())
+            decodeStart = performance.now()
+            firstToken = false
+          }
           count++
           setTokenCount(count)
           const since = (performance.now() - decodeStart) / 1000
@@ -325,7 +334,13 @@ export default function App() {
           updateMessages((current) => appendDelta(current, targetId, "reasoning", delta))
         },
         onDelta: (delta) => {
-          if (firstToken) { setTtft(performance.now() - t0); setStreamStart(performance.now()); decodeStart = performance.now(); firstToken = false }
+          if (firstToken) {
+            measuredTtft = performance.now() - t0
+            setTtft(measuredTtft)
+            setStreamStart(performance.now())
+            decodeStart = performance.now()
+            firstToken = false
+          }
           count++
           setTokenCount(count)
           /* The live rate is DECODE speed: measured from the first token, not
@@ -341,12 +356,17 @@ export default function App() {
          badge does not jump to a different number the moment it stops moving. */
       const decodeElapsed = (performance.now() - (decodeStart || t0)) / 1000
       if (count > 1 && decodeElapsed > 0) setTokPerSec((count - 1) / decodeElapsed)
-      if (result.usage) setTotalTokens(prev => ({
-        prompt: prev.prompt + (result.usage?.prompt_tokens || 0),
-        completion: prev.completion + (result.usage?.completion_tokens || 0),
-      }))
+      if (result.usage) {
+        setTotalTokens(prev => ({
+          prompt: prev.prompt + (result.usage?.prompt_tokens || 0),
+          completion: prev.completion + (result.usage?.completion_tokens || 0),
+        }))
+        const pt = uncachedPromptTokens(payload, result.usage, Boolean(result.compaction))
+        const tSec = (measuredTtft ?? 0) / 1000
+        if (pt > 0 && tSec > 0) setPpPerSec(pt / tSec)
+      }
       setLastRun(result)
-      updateMessages((current) => setFinish(current, targetId, result.finishReason))
+      updateMessages((current) => setFinish(current, targetId, result.finishReason, result.usage))
       setConnected(true)
     } catch (cause) {
       /* Drop the target bubble only if it is empty -- a first turn that never got
@@ -468,7 +488,7 @@ export default function App() {
   const submit = () => { if (imageMode) void sendImage(); else void send() }
 
   const openSettings = (page = "general") => { setSettingsPage(page); setView("settings") }
-  const clearChat = () => { updateMessages([]); setLastRun(null); setTokPerSec(null); setTtft(null); setTokenCount(0); setTotalTokens({ prompt: 0, completion: 0 }); setError("") }
+  const clearChat = () => { updateMessages([]); setLastRun(null); setTokPerSec(null); setPpPerSec(null); setTtft(null); setTokenCount(0); setTotalTokens({ prompt: 0, completion: 0 }); setError("") }
   const newChat = () => {
     if (loading) return
     if (messages.length) setArchives(items => [{ id: message("system", "").id, slot: cacheSlot, messages: [...messages] }, ...items])
@@ -555,8 +575,10 @@ export default function App() {
             <div className="runtime-foot"><span className="runtime-dot" /> {t("sidebar.schedulerOnline")} <code>{kvSlots} KV</code></div>
           </> : <p className="runtime-unavailable">{connected ? (healthError ? t(healthError) : t("status.runtimeUnavailable")) : t("sidebar.runtimeProbe")}</p>}
         </section></>)
-  const metrics = (<div className="live-metrics" aria-live="polite">              {loading && tokenCount > 0 ? <Badge className="badge-live"><Zap className="size-3 flash" /> {t("topbar.tokens", { n: tokenCount })}</Badge> : null}
-              {tokPerSec != null ? <Badge className={cn("badge-speed", loading && "badge-live")}><Gauge className="size-3" /> {t("topbar.tokPerSec", { n: tokPerSec.toFixed(1) })}</Badge> : null}
+  const metrics = (<div className="live-metrics" aria-live="polite">
+              {loading && tokenCount > 0 ? <Badge className="badge-live"><Zap className="size-3 flash" /> {t("topbar.tokens", { n: tokenCount })}</Badge> : null}
+              {tokPerSec != null ? <Badge className={cn("badge-speed", loading && "badge-live")} title={t("topbar.tokPerSecHelp")}><Gauge className="size-3" /> {t("topbar.tokPerSec", { n: tokPerSec.toFixed(1) })}</Badge> : null}
+              {!loading && ppPerSec != null ? <Badge className="badge-speed" title={t("topbar.ppPerSecHelp")}><Zap className="size-3" /> {t("topbar.ppPerSec", { n: ppPerSec.toFixed(1) })}</Badge> : null}
               {!loading && ttft != null ? <Badge><Timer className="size-3" /> TTFT {(ttft/1000).toFixed(1)}s</Badge> : null}
               {!loading && lastRun?.usage ? <Badge><Layers className="size-3" /> {lastRun.usage.prompt_tokens}→{lastRun.usage.completion_tokens}</Badge> : null}
               {!loading && lastRun?.finishReason === "length" ? <Badge className="badge-warn" title={t("topbar.truncatedHelp")}><AlertTriangle className="size-3" /> {t("topbar.truncated")}</Badge> : null}

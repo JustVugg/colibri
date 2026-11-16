@@ -3,15 +3,54 @@
  * then reads the file instead of converting the matrices at every start.
  *
  *   qwen36-canonical <model-dir> [<output>]     default: <model-dir>/canonical.qc
+ *   qwen36-canonical --experts <model-dir> [<output>]  default: <model-dir>/experts.qc
  *
- * The conversion is the engine's own (qw_quantize), so the file holds the
- * bytes of a start without it. It is written as <output>.tmp, flushed to the
- * disk and renamed at the end; an interrupted file is refused by the engine
- * anyway (its size does not match). The dense matrices must be BF16, F16 or
- * F32 (a qpack container's affine matrices are not converted). */
+ * --experts can come anywhere; any other argument that starts with '-' is
+ * refused rather than taken for a path. The conversion is the engine's own
+ * (qw_quantize), so canonical.qc holds the bytes of a start without it. It is
+ * written as <output>.tmp, flushed to the disk and renamed at the end; an
+ * interrupted run leaves that temporary, which the next run overwrites, and
+ * the engine never reads it. experts.qc is written as <output>.tmp.XXXXXX,
+ * removed if a signal stops the run (see qwen36_expert_convert.h). The dense
+ * matrices must be BF16, F16 or F32 (a qpack container's affine matrices are
+ * not converted). */
 #define main qwen36_engine_main
 #include "../qwen36.c"
 #undef main
+#include "../qwen36_expert_convert.h"
+
+static int convert_experts_main(const char *model, const char *output) {
+    char path[2048], error[2300];
+    int n = output ? snprintf(path, sizeof path, "%s", output)
+                   : snprintf(path, sizeof path, "%s/experts.qc", model);
+    if (n < 0 || (size_t)n >= sizeof path) { fprintf(stderr, "output path is too long\n"); return 2; }
+    Cfg config = {0};
+    load_cfg(&config, model); int layers = config.n_layers;
+    load_meta(&config, model); validate_cfg(&config, layers);
+    QefGeometry geometry = {(uint32_t)config.n_layers, (uint32_t)config.n_experts,
+        (uint32_t)config.hidden, (uint32_t)config.inter, (uint32_t)config.expert_gs};
+    QefHeader layout;
+    if (!qef_layout(&geometry, 1, &layout, error, sizeof error)) {
+        fprintf(stderr, "%s\n", error); free(config.is_attn); return 1;
+    }
+    shards source; st_init(&source, model);
+    double started = now_s();
+    int ok = qec_convert(&source, &geometry, path, error, sizeof error);
+    st_destroy(&source); free(config.is_attn);
+    if (!ok) { fprintf(stderr, "%s: %s\n", path, error); return 1; }
+    struct stat info;
+    uint64_t bytes = stat(path, &info) ? 0 : (uint64_t)info.st_size;
+    /* The layout from the written header: with records padded to the same
+     * stride, both layouts can have the same size. */
+    QefHeader written; FILE *in = fopen(path, "rb");
+    int header = in && fread(&written, sizeof written, 1, in) == 1;
+    if (in) fclose(in);
+    printf("%s: %llu planar INT4 experts, %llu bytes, scales %s, %.1f s; no requantization\n", path,
+        (unsigned long long)layout.count, (unsigned long long)bytes,
+        !header ? "(header unreadable)" : written.layout == QEF_LAYOUT_CODES ? "as 16-bit codes" : "F32",
+        now_s() - started);
+    return 0;
+}
 
 /* One matrix: its rows read from the checkpoint `block` bytes of f32 at a time
  * and quantized by the engine's qw_quantize. Rows are independent, so a block
@@ -90,21 +129,30 @@ static int qwen36_canonical_write(const char *path, shards *S, const QdfSpec *sp
 
 #ifndef QWEN36_CANONICAL_NO_MAIN   /* tests/test_qwen36_dense_file.c includes the tool without its main */
 int main(int argc, char **argv) {
-    if (argc < 2 || argc > 3) {
+    const char *arg[2] = {NULL, NULL};
+    int experts = 0, n = 0, bad = 0;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--experts")) experts = 1;
+        else if (argv[i][0] == '-' || n == 2) bad = 1;
+        else arg[n++] = argv[i];
+    }
+    if (bad || !n) {
         fprintf(stderr, "usage: %s <model-dir> [<output>]   (default <model-dir>/canonical.qc)\n", argv[0]);
+        fprintf(stderr, "       %s --experts <model-dir> [<output>]   (default <model-dir>/experts.qc)\n", argv[0]);
         return 2;
     }
+    if (experts) return convert_experts_main(arg[0], arg[1]);
     char path[2048];
-    if (argc > 2) snprintf(path, sizeof path, "%s", argv[2]);
-    else snprintf(path, sizeof path, "%s/canonical.qc", argv[1]);
+    if (arg[1]) snprintf(path, sizeof path, "%s", arg[1]);
+    else snprintf(path, sizeof path, "%s/canonical.qc", arg[0]);
     Cfg c;
     memset(&c, 0, sizeof c);
-    load_cfg(&c, argv[1]);
+    load_cfg(&c, arg[0]);
     int layers = c.n_layers;
-    load_meta(&c, argv[1]);
+    load_meta(&c, arg[0]);
     validate_cfg(&c, layers);
     shards S;
-    st_init(&S, argv[1]);
+    st_init(&S, arg[0]);
     QwenDenseList l;
     if (!qwen_dense_list(&c, &l)) return 1;
     double started = now_s();

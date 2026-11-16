@@ -69,7 +69,7 @@ function TurnColumns({ turns, stacked, height, format, footLabel, footLabelOne }
       </svg>
       <div className="prof-plot-foot">
         <span>{turns.length > 1 ? footLabel : footLabelOne}</span>
-        <code>{hover !== null && turns[hover] ? format(turns[hover]) : `peak ${stacked ? seconds(peak) : peak.toFixed(1) + " tok/s"}`}</code>
+        <code>{hover !== null && turns[hover] ? format(turns[hover]) : `peak ${stacked ? seconds(peak) : peak.toFixed(1) + " tg/s"}`}</code>
       </div>
     </div>
   )
@@ -133,7 +133,7 @@ export function Profiling({ baseUrl, apiKey, connected }: { baseUrl: string; api
       ) : (
         <>
           <div className="prof-tiles">
-            <div><span><Gauge className="size-3" /> {t("profile.lastTurn")}</span><strong>{latest.toks.toFixed(1)}</strong><small>tok/s</small></div>
+            <div><span><Gauge className="size-3" /> {t("profile.lastTurn")}</span><strong>{latest.toks.toFixed(1)}</strong><small>tg/s</small></div>
             <div><span><Timer className="size-3" /> {t("profile.wallTime")}</span><strong>{seconds(latest.wall_s)}</strong><small>{latest.prompt_tokens} → {latest.completion_tokens} tokens</small></div>
             <div><span><Activity className="size-3" /> {t("profile.batching")}</span><strong>{latest.forwards > 0 ? (latest.completion_tokens / latest.forwards).toFixed(2) : "—"}</strong><small>{t("profile.tokensPerForward")}</small></div>
             <div><span><HardDrive className="size-3" /> {t("profile.diskService")}</span><strong>{seconds(latest.expert_disk_s)}</strong><small>{t("profile.overlapped")}</small></div>
@@ -159,7 +159,7 @@ export function Profiling({ baseUrl, apiKey, connected }: { baseUrl: string; api
           <div className="prof-charts">
             <div className="prof-chart">
               <div className="prof-chart-title">{t("profile.throughputTitle")}</div>
-              <TurnColumns turns={recent} stacked={false} height={36} footLabel={t("profile.turnsLabel", { n: recent.length })} footLabelOne={t("profile.oneTurn")} format={(turn) => `${turn.toks.toFixed(1)} tok/s · ${turn.completion_tokens} tokens`} />
+              <TurnColumns turns={recent} stacked={false} height={36} footLabel={t("profile.turnsLabel", { n: recent.length })} footLabelOne={t("profile.oneTurn")} format={(turn) => `${turn.toks.toFixed(1)} tg/s · ${turn.completion_tokens} tokens`} />
             </div>
             <div className="prof-chart">
               <div className="prof-chart-title">{t("profile.phaseTitle")}</div>
@@ -169,7 +169,7 @@ export function Profiling({ baseUrl, apiKey, connected }: { baseUrl: string; api
 
           <div className="prof-table-wrap">
             <table className="prof-table">
-              <thead><tr><th>{t("profile.turnCol")}</th><th>{t("profile.tokensCol")}</th><th>tok/s</th><th>{t("profile.wallCol")}</th>{PHASES.map((phase) => <th key={phase.key}><i style={{ background: phase.color }} />{t(phase.i18n)}</th>)}<th>{t("profile.diskService")}</th></tr></thead>
+              <thead><tr><th>{t("profile.turnCol")}</th><th>{t("profile.tokensCol")}</th><th>tg/s</th><th>{t("profile.wallCol")}</th>{PHASES.map((phase) => <th key={phase.key}><i style={{ background: phase.color }} />{t(phase.i18n)}</th>)}<th>{t("profile.diskService")}</th></tr></thead>
               <tbody>
                 {recent.slice().reverse().map((turn, index) => (
                   <tr key={turns.length - index}>

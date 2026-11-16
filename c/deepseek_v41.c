@@ -268,6 +268,17 @@ static void cfg_load(Cfg *c, const char *snap) {
         c->index_head_dim < 0 || (c->index_head_dim > 0 && c->rope_dim > c->index_head_dim)) {
         fprintf(stderr, "[cfg] rope_head_dim %d does not fit head_dim %d and index_head_dim %d\n",
                 c->rope_dim, c->head_dim, c->index_head_dim); exit(1); }
+    /* The candidate blocks' width: a row of ids is `candidate_topk_blocks` int32 slots, a
+     * number the host clamps to one and the chain hands the shader unclamped, so a value
+     * below one would make the host's stride and the device's topk disagree about the same
+     * forward. Above 1,048,576 (the family's registered maximum context,
+     * `family_registry.py`) a row cannot keep more blocks than it has positions, so refusing
+     * it loses nothing, and the allocation is rows x topk x 4 B: a config field is not the
+     * place to ask for more than that. */
+    if (c->candidate_source >= 0 &&
+        (c->candidate_topk_blocks < 1 || c->candidate_topk_blocks > (1 << 20))) {
+        fprintf(stderr, "[cfg] candidate_topk_blocks %d out of range (1..%d)\n",
+                c->candidate_topk_blocks, 1 << 20); exit(1); }
     int ratios[V41_MAX_LAYERS] = {0};
     int nr = jints(t, "compress_ratios", ratios, V41_MAX_LAYERS);
     if (nr < c->n_layers) {
@@ -987,6 +998,7 @@ typedef struct {
     uint64_t *used;
     float *value;      /* cap x head_dim */
     uint64_t clock, hits, misses;
+    uint64_t staged;   /* rows engram_stage_rows read into the cache (V41_ENGRAM_STAGE) */
 } EngramTable;
 
 typedef struct {
@@ -1152,13 +1164,53 @@ cache:;
     t->used = xmalloc((size_t)cap * sizeof(uint64_t), "engram row clocks");
     t->value = xmalloc((size_t)cap * head_dim * sizeof(float), "engram row cache");
     for (int i = 0; i < cap; i++) { t->key[i] = -1; t->used[i] = 0; }
-    t->clock = t->hits = t->misses = 0;
+    t->clock = t->hits = t->misses = t->staged = 0;
+}
+
+/* The slot holding `id`, or -1 with *victim the slot a fill takes (the probe's first empty
+ * one, else its least recently used). Moves no counter. */
+static int engram_find(const EngramTable *t, int64_t id, int *victim) {
+    int slot = (int)((uint64_t)(id * 0x9E3779B97F4A7C15ull) >> 40) & t->mask;
+    *victim = slot;
+    for (int probe = 0; probe < 4; probe++) {
+        int at = (slot + probe) & t->mask;
+        if (t->key[at] == id) return at;
+        if (t->key[at] == -1) { *victim = at; return -1; }
+        if (t->used[at] < t->used[*victim]) *victim = at;
+    }
+    return -1;
+}
+
+/* Row `id` read from the shard and dequantized into `out`: the row and its scales one pread
+ * each, 264 bytes for the released table. It touches no cache state, so engram_stage_rows'
+ * readers run it side by side. */
+static void engram_fetch(const EngramTable *t, int64_t id, int head_dim, float *out) {
+    int groups = head_dim / 32;
+    uint8_t row[2048 + 128], *bytes = row, *scales = row + 512;
+    if (head_dim > 512 || groups > 64) {
+        fprintf(stderr, "[engram] head_dim %d exceeds the row buffer\n", head_dim); exit(1); }
+    if (t->gt >= 0) {   /* a ggml row (the open checked rb against the buffer) */
+        st_pread_full(t->fd_w, row, (size_t)t->rb, t->off_w + id * t->rb, "engram row");
+        if (gq_dequant_row(t->gt, row, out, head_dim)) {
+            fprintf(stderr, "[engram] no row reader for ggml type %s\n", gq_type_name(t->gt)); exit(1); }
+        return;
+    }
+    if (t->inline_scales) {
+        st_pread_full(t->fd_w, row, head_dim + groups, t->off_w + id * (head_dim + groups), "engram row");
+        scales = row + head_dim;
+    } else {
+        st_pread_full(t->fd_w, bytes, head_dim, t->off_w + id * head_dim, "engram row");
+        st_pread_full(t->fd_s, scales, groups, t->off_s + id * groups, "engram scale");
+    }
+    for (int g = 0; g < groups; g++) {
+        float scale = ue8m0(scales[g]);
+        for (int i = 0; i < 32; i++) out[g * 32 + i] = e4m3_decode(bytes[g * 32 + i]) * scale;
+    }
 }
 
 /* The row for `id`, dequantized. Reads through a direct-mapped-with-probe cache: on a
- * miss the row and its scales are one pread each, 264 bytes for the released table. */
+ * miss the row and its scales are one pread each (engram_fetch). */
 static const float *engram_row(EngramTable *t, int64_t id, int head_dim) {
-    int groups = head_dim / 32;
     /* SEC: `id` is a hash bucket plus an offset, both from the sidecar; the row count
      * is the shard's. An id past either end read whatever the file holds there, and
      * -1 -- the empty-slot key -- "hit" an empty slot and returned a row never read.
@@ -1169,44 +1221,14 @@ static const float *engram_row(EngramTable *t, int64_t id, int head_dim) {
                 (long long)id, (long long)t->rows);
         exit(1);
     }
-    int slot = (int)((uint64_t)(id * 0x9E3779B97F4A7C15ull) >> 40) & t->mask;
-    int victim = slot;
-    for (int probe = 0; probe < 4; probe++) {
-        int at = (slot + probe) & t->mask;
-        if (t->key[at] == id) { t->used[at] = ++t->clock; t->hits++;
-                                return t->value + (size_t)at * head_dim; }
-        if (t->key[at] == -1) { victim = at; goto fill; }
-        if (t->used[at] < t->used[victim]) victim = at;
-    }
-fill:
+    int victim, at = engram_find(t, id, &victim);
+    if (at >= 0) { t->used[at] = ++t->clock; t->hits++;
+                   return t->value + (size_t)at * head_dim; }
     t->misses++;
-    {
-        uint8_t row[2048 + 128], *bytes = row, *scales = row + 512;
-        if (head_dim > 512 || groups > 64) {
-            fprintf(stderr, "[engram] head_dim %d exceeds the row buffer\n", head_dim); exit(1); }
-        if (t->gt >= 0) {   /* a ggml row (the open checked rb against the buffer) */
-            float *out = t->value + (size_t)victim * head_dim;
-            st_pread_full(t->fd_w, row, (size_t)t->rb, t->off_w + id * t->rb, "engram row");
-            if (gq_dequant_row(t->gt, row, out, head_dim)) {
-                fprintf(stderr, "[engram] no row reader for ggml type %s\n", gq_type_name(t->gt)); exit(1); }
-            t->key[victim] = id; t->used[victim] = ++t->clock;
-            return out;
-        }
-        if (t->inline_scales) {
-            st_pread_full(t->fd_w, row, head_dim + groups, t->off_w + id * (head_dim + groups), "engram row");
-            scales = row + head_dim;
-        } else {
-            st_pread_full(t->fd_w, bytes, head_dim, t->off_w + id * head_dim, "engram row");
-            st_pread_full(t->fd_s, scales, groups, t->off_s + id * groups, "engram scale");
-        }
-        float *out = t->value + (size_t)victim * head_dim;
-        for (int g = 0; g < groups; g++) {
-            float scale = ue8m0(scales[g]);
-            for (int i = 0; i < 32; i++) out[g * 32 + i] = e4m3_decode(bytes[g * 32 + i]) * scale;
-        }
-        t->key[victim] = id; t->used[victim] = ++t->clock;
-        return out;
-    }
+    float *out = t->value + (size_t)victim * head_dim;
+    engram_fetch(t, id, head_dim, out);
+    t->key[victim] = id; t->used[victim] = ++t->clock;
+    return out;
 }
 
 /* engram.py NgramHashState: the ids of the n-grams ending at `pos`, for one table.
@@ -1403,9 +1425,13 @@ typedef struct {
     /* rope tables: [max_pos, rope_dim/2] cos/sin pairs, one per theta in use */
     float *rope_window, *rope_compress;
     int pos;                    /* positions consumed so far */
-    /* candidate mask published by the candidate source layer, one row per query */
-    uint8_t *candidates;
-    int candidate_width, candidate_rows;
+    /* candidate blocks published by the candidate source layer, one row of block ids per
+     * query: `candidate_topk` int32 slots, -1 past the blocks that row keeps (P1), in the
+     * source's coordinates (DI's block_candidate_idxs, P5). `candidate_width` is no size
+     * any more -- it is the source's reach, the bound its row was painted to (P2/P3), and
+     * every source-layer row set refreshes it. */
+    int32_t *candidates;
+    int candidate_topk, candidate_width, candidate_rows;
     /* What an index source publishes for the layers after it (model.py's
      * shared_attn.topk_idxs): the compressed positions each query keeps, already
      * shifted by the window offset. A layer that compresses but does not index reads
@@ -1484,7 +1510,7 @@ typedef struct {
     int32_t *history; int history_len, history_cap;
     const uint8_t *published_index_k; int published_index_layer;
     int *shared_topk; int shared_topk_rows, shared_topk_width;
-    uint8_t *candidates; int candidate_width, candidate_rows;
+    int32_t *candidates; int candidate_topk, candidate_width, candidate_rows;
 } V41Seq;
 static int g_v41_mux_slots = 1;   /* KV_SLOTS: the conversations a serve decodes at once */
 
@@ -2834,7 +2860,9 @@ static int compressor_run(Model *m, int layer, const float *x, int n, int start_
     return produced;
 }
 
-/* model.py select_candidate_blocks, one query row. `keep` is `width` bytes. */
+/* model.py select_candidate_blocks, one query row. `keep` is `width` bytes, and it is
+ * also the source of the block ids the layers after the source read (candidate_row_ids):
+ * the selection stays here, in one place, and the ids are its re-encoding. */
 static void candidate_blocks(const Cfg *c, const float *score, int width, int lens, uint8_t *keep) {
     int block = c->candidate_block_size;
     int blocks = (width + block - 1) / block;
@@ -2858,6 +2886,61 @@ static void candidate_blocks(const Cfg *c, const float *score, int width, int le
         best[chosen] = -INFINITY;
     }
     free(best);
+}
+
+/* The blocks `row` keeps -- block b kept iff any of its positions is set -- in block order,
+ * and -1 in every slot from there to `topk`: the source's selection in the source's
+ * coordinates (DI's block_candidate_idxs). Every slot is written, so a reader scans all
+ * `topk` and skips -1 rather than trusting the count; -1 never names a block. Both writers
+ * paint at most `candidate_topk_blocks` blocks, so nothing is dropped here. */
+static int candidate_row_ids(const uint8_t *row, int block, int scan, int topk, int32_t *ids) {
+    int blocks = (scan + block - 1) / block, n = 0;
+    for (int b = 0; b < blocks; b++) {
+        int hit = 0;
+        for (int i = b * block; i < (b + 1) * block && i < scan; i++) hit |= row[i] != 0;
+        if (hit && n < topk) ids[n++] = b;
+    }
+    for (int k = n; k < topk; k++) ids[k] = -1;
+    return n;
+}
+
+/* Those ids back into one row's mask. `w` = candidate_paint_width(this layer's compress_len,
+ * the mask's candidate_width). A paint can set a position the published row held 0: a row the
+ * chain converted was clipped at the chunk's reach `wc`, so the block straddling `wc` is
+ * repainted out to `(b+1)*block`, up to a block past it. No reader consults those positions --
+ * a reader's reach `lens` is at most `wc` (v41c_unsupported refuses a consumer of another
+ * ratio) and indexer_run has set score[j] = -INFINITY past its own reach before the mask
+ * runs -- so the bits a reader masks on are the ones the source kept. Positions past `w` are
+ * left untouched. */
+static void candidate_keep_row(const int32_t *ids, int nids, int block, int w, uint8_t *keep) {
+    memset(keep, 0, (size_t)w);
+    for (int k = 0; k < nids; k++) {
+        int b = ids[k];
+        /* -1 is the padding, and a block that starts at or past `w` paints nothing. The bound
+         * is on the id, not on its product: `b * block` would wrap on a 32-bit long (Windows)
+         * and let a poisoned id through. `block < 1` names no blocks and would divide by
+         * zero here; candidate_blocks divides by it first, but the guard keeps this line
+         * defined on its own. */
+        if (block < 1 || b < 0 || b > (w - 1) / block) continue;
+        for (int i = b * block; i < (b + 1) * block && i < w; i++) keep[i] = 1;
+    }
+}
+
+/* The bound the reader paints its row to: this layer's reach, clipped to the source's (the
+ * width the source painted its row to). Extracted so the gate can assert the min where it is
+ * computed, not only where it is used. */
+static int candidate_paint_width(int compress_len, int candidate_width) {
+    return compress_len < candidate_width ? compress_len : candidate_width;
+}
+
+/* The candidate blocks' allocation: rows x topk int32 whatever the reach, and so independent
+ * of the prompt's length (it was rows x reach bytes). The ids are the source's blocks, so no
+ * width enters here; a topk of 0 keeps one slot a row, never a zero-byte one. `topk` is the
+ * caller's, never the config's: an allocation and the copy of it size the same slots, so a
+ * stored topk that differed from the config's can only be the difference between a copy that
+ * fits and one that does not. */
+static size_t v41_candidate_bytes(int topk, int rows) {
+    return (size_t)(rows > 0 ? rows : 1) * (size_t)(topk > 0 ? topk : 1) * sizeof(int32_t);
 }
 
 /* Does this layer complete a compression group at `pos`, and so republish its index
@@ -2908,6 +2991,9 @@ static void indexer_run(Model *m, int layer, const float *x, const float *qr, in
     float *ikd = hostq ? xmalloc((size_t)compress_len * ihd * sizeof(float), "index keys decoded") : NULL;
     const uint8_t *ikd_of = NULL;
     uint64_t *work = xmalloc((size_t)(compress_len > 0 ? compress_len : 1) * 2 * sizeof(uint64_t), "indexer order");
+    /* one row of the mask, this layer's reach long: the source paints there and a reader
+     * of the source's blocks reconstructs there (candidate_blocks, candidate_keep_row) */
+    uint8_t *maskrow = NULL;
     float scale = (1.0f / sqrtf((float)ihd)) * (1.0f / sqrtf((float)nh));
 
     for (int t = 0; t < n; t++) {
@@ -2963,17 +3049,37 @@ static void indexer_run(Model *m, int layer, const float *x, const float *qr, in
             score[j] = total;
         }
         if (layer == c->candidate_source) {
-            if (m->candidate_width != compress_len || m->candidate_rows != n) {
+            int topk = c->candidate_topk_blocks > 0 ? c->candidate_topk_blocks : 1;
+            if (m->candidate_topk != topk || m->candidate_rows != n) {
                 free(m->candidates);
-                m->candidates = xmalloc((size_t)n * compress_len, "candidate mask");
-                m->candidate_width = compress_len;
+                m->candidates = xmalloc(v41_candidate_bytes(topk, n), "candidate blocks");
+                m->candidate_topk = topk;
                 m->candidate_rows = n;
             }
-            candidate_blocks(c, score, compress_len, lens, m->candidates + (size_t)t * compress_len);
+            /* The ids' reach, and the bound the row is painted to -- refreshed on every row
+             * set, never a realloc trigger: a stale one would paint a different width. */
+            m->candidate_width = compress_len;
+            if (!maskrow) maskrow = xmalloc((size_t)(compress_len > 0 ? compress_len : 1), "candidate row");
+            candidate_blocks(c, score, compress_len, lens, maskrow);
+            candidate_row_ids(maskrow, c->candidate_block_size, compress_len, m->candidate_topk,
+                              m->candidates + (size_t)t * m->candidate_topk);
         } else if (c->candidate_source >= 0 && c->candidate_source < layer && m->candidates) {
-            const uint8_t *keep = m->candidates + (size_t)t * m->candidate_width;
-            for (int j = 0; j < compress_len && j < m->candidate_width; j++)
-                if (!keep[j]) score[j] = -INFINITY;
+            /* The ids carry no reach of their own: candidate_width is the source layer's, set
+             * from its compress_len on every row set and carried with the ids by v41_unpark,
+             * so it is there before any layer after the source reads. w = 0 would drop every
+             * position silently, so the order is checked rather than assumed -- a tripwire:
+             * the producers above make it unreachable, which is why it has no test. */
+            if (compress_len > 0 && m->candidate_width <= 0) {
+                fprintf(stderr, "[v41] candidate blocks at layer %d with no source reach "
+                                "(candidate_width %d)\n", layer, m->candidate_width);
+                exit(1);
+            }
+            int w = candidate_paint_width(compress_len, m->candidate_width);
+            if (!maskrow) maskrow = xmalloc((size_t)(compress_len > 0 ? compress_len : 1), "candidate row");
+            candidate_keep_row(m->candidates + (size_t)t * m->candidate_topk, m->candidate_topk,
+                               c->candidate_block_size, w, maskrow);
+            for (int j = 0; j < w; j++)
+                if (!maskrow[j]) score[j] = -INFINITY;
         }
         /* top-k, then back into position order: the attention kernel treats every slot
          * independently, but keeping them sorted makes the concatenated index list
@@ -2983,7 +3089,7 @@ static void indexer_run(Model *m, int layer, const float *x, const float *qr, in
         for (int k = 0; k < topk; k++)
             row[k] = (k < taken && row[k] < lens) ? row[k] + offset : -1;
     }
-    free(qblk); free(wblk); free(score); free(ikd); free(work);
+    free(qblk); free(wblk); free(score); free(ikd); free(work); free(maskrow);
 }
 
 /* wo_a is block diagonal over o_groups: each group projects only its own heads, and
@@ -3987,8 +4093,86 @@ static void engram_advise(const EngramTable *t, int64_t id, int head_dim) {
     (void)t; (void)id; (void)head_dim;
 #endif
 }
-/* engram_advise for every row of positions pos .. pos + n - 1 of a table (V41_ENGRAM_ADVISE=0: none) */
-static void engram_advise_rows(const Engram *e, int table, int pos, int n) {
+/* V41_ENGRAM_STAGE=1: engram_stage_rows' readers, V41_ENGRAM_STAGE_THREADS (default 8, at
+ * most 64); 0 when off */
+static int engram_stage_threads(void) {
+    static int threads = -1;
+    if (threads < 0) {
+        const char *on = getenv("V41_ENGRAM_STAGE"), *count = getenv("V41_ENGRAM_STAGE_THREADS");
+        int n = count && atoi(count) > 0 ? atoi(count) : 8;
+        threads = on && atoi(on) > 0 ? (n > 64 ? 64 : n) : 0;
+    }
+    return threads;
+}
+
+static int engram_id_order(const void *a, const void *b) {
+    int64_t x = *(const int64_t *)a, y = *(const int64_t *)b;
+    return (x > y) - (x < y);
+}
+
+/* The rows of positions pos .. pos + n - 1 of a table that the cache does not hold, read on
+ * `threads` readers and put in the cache before the gather looks them up, a decode step's
+ * too: engram_row reads a missing row with one pread and waits for it, and engram_advise
+ * asks the OS ahead only on POSIX and only for a block. A slot holds the same dequantized
+ * row whoever read it, so the gather returns the same bits; only which rows the cache keeps
+ * can differ. At most half the cache is read at once, so a block does not evict its own
+ * rows before their use; a row the gather does not find it reads itself, as before. */
+static void engram_stage_rows(Engram *e, int table, int pos, int n, int threads) {
+    EngramTable *t = &e->table[table];
+    const int hd = e->head_dim;
+    int64_t ids[V41_MAX_NGRAM * V41_MAX_EHEADS];
+    int64_t *want = xmalloc((size_t)n * e->cols * sizeof *want, "engram stage ids");
+    int count = 0, victim;
+    for (int r = 0; r < n; r++) {
+        engram_hash(e, table, pos + r, ids);
+        for (int col = 0; col < e->cols; col++) {
+            if (ids[col] < 0 || ids[col] >= t->rows) continue;   /* engram_row reports it */
+            int at = engram_find(t, ids[col], &victim);
+            if (at >= 0) t->used[at] = ++t->clock;   /* kept for its use below */
+            else want[count++] = ids[col];
+        }
+    }
+    qsort(want, (size_t)count, sizeof *want, engram_id_order);
+    int unique = 0;
+    for (int i = 0; i < count; i++)
+        if (!unique || want[i] != want[unique - 1]) want[unique++] = want[i];
+    if (unique > t->cap / 2) unique = t->cap / 2;
+    if (unique < 1) { free(want); return; }
+    float *rows = xmalloc((size_t)unique * hd * sizeof(float), "engram stage rows");
+    int next = 0;
+#if defined(_OPENMP)
+    /* at the default team width, as expert_fetch: a narrower region makes libgomp retire
+     * and respawn pool threads on every call. Only `threads` of the team read. */
+    const int team = threads > omp_get_max_threads() ? threads : omp_get_max_threads();
+    #pragma omp parallel num_threads(team) if (unique > 1)
+#endif
+    {
+#if defined(_OPENMP)
+        const int tid = omp_get_thread_num();
+#else
+        const int tid = 0;
+#endif
+        if (tid < threads)
+            for (;;) {
+                const int i = __atomic_fetch_add(&next, 1, __ATOMIC_RELAXED);
+                if (i >= unique) break;
+                engram_fetch(t, want[i], hd, rows + (size_t)i * hd);
+            }
+    }
+    for (int i = 0; i < unique; i++) {
+        engram_find(t, want[i], &victim);
+        memcpy(t->value + (size_t)victim * hd, rows + (size_t)i * hd, (size_t)hd * sizeof(float));
+        t->key[victim] = want[i]; t->used[victim] = ++t->clock;
+    }
+    t->staged += (uint64_t)unique;
+    free(rows); free(want);
+}
+
+/* engram_advise for every row of positions pos .. pos + n - 1 of a table (V41_ENGRAM_ADVISE=0:
+ * none); with V41_ENGRAM_STAGE=1 the rows are read instead (engram_stage_rows) */
+static void engram_advise_rows(Engram *e, int table, int pos, int n) {
+    const int threads = engram_stage_threads();
+    if (threads) { engram_stage_rows(e, table, pos, n, threads); return; }
     static int on = -1;
     if (on < 0) { const char *v = getenv("V41_ENGRAM_ADVISE"); on = !(v && *v == '0'); }
     if (!on || n < 2) return;   /* a decode step's few rows: as they come */
@@ -4750,7 +4934,7 @@ static int v41_prefill_tail(const Cfg *c, int n, int spec_batch, int keep_rows, 
 
 /* Past the source layer: the rows of the tail to the front of every per-row buffer the
  * later layers read (the streams and their mix, the DSpark input a target layer at or
- * before the source wrote, the candidate mask, the index list the last index source
+ * before the source wrote, the candidate blocks, the index list the last index source
  * published), the forward's rows and start the tail's. */
 static void v41_take_tail(Model *m, float *h, float *pre_mix, int *n, int *start_pos, int tail, int targets, int *trace_row) {
     const Cfg *c = &m->c;
@@ -4760,7 +4944,8 @@ static void v41_take_tail(Model *m, float *h, float *pre_mix, int *n, int *start
     if (targets && m->main_hidden)
         memmove(m->main_hidden, m->main_hidden + (size_t)r0 * targets * dim, (size_t)tail * targets * dim * sizeof(float));
     if (m->candidates && m->candidate_rows == *n) {
-        memmove(m->candidates, m->candidates + (size_t)r0 * m->candidate_width, (size_t)tail * m->candidate_width);
+        int topk = m->candidate_topk > 0 ? m->candidate_topk : 1;
+        memmove(m->candidates, m->candidates + (size_t)r0 * topk, (size_t)tail * topk * sizeof(int32_t));
         m->candidate_rows = tail;
     }
     /* The layers past the source that run no indexer of their own read this list. Its
@@ -5080,7 +5265,8 @@ static void v41_seq_swap(Model *m, V41Seq *q) {
     V41_SWAP(int, m->published_index_layer, q->published_index_layer);
     V41_SWAP(int *, m->shared_topk, q->shared_topk);
     V41_SWAP(int, m->shared_topk_rows, q->shared_topk_rows); V41_SWAP(int, m->shared_topk_width, q->shared_topk_width);
-    V41_SWAP(uint8_t *, m->candidates, q->candidates);
+    V41_SWAP(int32_t *, m->candidates, q->candidates);
+    V41_SWAP(int, m->candidate_topk, q->candidate_topk);
     V41_SWAP(int, m->candidate_width, q->candidate_width); V41_SWAP(int, m->candidate_rows, q->candidate_rows);
 #undef V41_SWAP
 }
@@ -5267,6 +5453,19 @@ static void model_reset_rows(Model *m, int n) {
     m->engram.history_len = 0;
     m->published_index_k = NULL;
     m->shared_topk_rows = m->shared_topk_width = 0;
+    /* The candidate blocks go further than the shared list's rows = 0: its readers key on
+     * the pointer, not a row count, so a stale buffer would still be read (a reader that ran
+     * before this conversation's source layer refreshed it -- unreachable today, because the
+     * source runs before its consumers in every forward, and kept that way by inspection
+     * rather than by a gate). Freeing is also the honest accounting: this and the shared
+     * list are the state a reset drops that scales with the prompt (2 GiB of blocks at
+     * 262144 rows), the blocks being the half whose next publisher is a whole forward away
+     * -- the shared list's buffer keeps its older habit of waiting for its next publisher
+     * to resize it -- and the rows the state keeps apart (park, a short request) were
+     * already saved by v41_park before this runs. */
+    free(m->candidates);
+    m->candidates = NULL;
+    m->candidate_topk = m->candidate_width = m->candidate_rows = 0;
     m->pos = 0;
 #ifdef COLI_VULKAN
     v41c_reset(m);   /* nothing on the device describes the new sequence */
@@ -5608,14 +5807,14 @@ static int v41_prompt_poll(ColiPromptBreak *b) {
  * layer's window ring rows and their positions, the compressed rows and index keys of the
  * positions the request may write (a row for `ratio` of them), the compressor's partial
  * group, the engram history's first entries, and what crosses forwards (the index keys
- * published last, the shared top-k list, the candidate mask); the next request brings them
+ * published last, the shared top-k list, the candidate blocks); the next request brings them
  * back, keeps them parked or drops them (v41_park_decide). The host's state stays canonical:
  * the chains' watermarks come down to 0. The draft head's windows are not kept: no prompt
  * resets them either, and a draft is only verified. */
 #define V41_PARK_SPEC 16   /* the rows a verify writes past the tokens that stand */
 static ColiPark g_v41_park;
-static struct { int history_len, published_layer, topk_rows, topk_width, cand_width, cand_rows;
-                const uint8_t *published; int *topk; uint8_t *cand; } g_v41_park_x;
+static struct { int history_len, published_layer, topk_rows, topk_width, cand_topk, cand_width, cand_rows;
+                const uint8_t *published; int *topk; int32_t *cand; } g_v41_park_x;
 static Tok *g_v41_log_tok;   /* the request's tokenizer, for COLI_PREFIX_LOG */
 static void v41_decode_one(int id, unsigned char *out, int *n) {
     *n = g_v41_log_tok ? tok_decode(g_v41_log_tok, &id, 1, (char *)out, 255) : 0;
@@ -5660,8 +5859,9 @@ static int v41_park(Model *m, int np, int max_tok) {   /* the rows kept apart, 0
         g_v41_park_x.published = m->published_index_k; g_v41_park_x.published_layer = m->published_index_layer;
         g_v41_park_x.topk_rows = m->shared_topk_rows; g_v41_park_x.topk_width = m->shared_topk_width;
         g_v41_park_x.topk = v41_dup(m->shared_topk, (size_t)m->shared_topk_rows * (m->shared_topk_width > 0 ? m->shared_topk_width : 1) * sizeof(int));
-        g_v41_park_x.cand_width = m->candidate_width; g_v41_park_x.cand_rows = m->candidate_rows;
-        g_v41_park_x.cand = v41_dup(m->candidates, (size_t)m->candidate_rows * m->candidate_width);
+        g_v41_park_x.cand_topk = m->candidate_topk; g_v41_park_x.cand_rows = m->candidate_rows;
+        g_v41_park_x.cand_width = m->candidate_width;
+        g_v41_park_x.cand = v41_dup(m->candidates, v41_candidate_bytes(m->candidate_topk, m->candidate_rows));
     }
     free(p);
     return g_v41_park.on ? n : 0;
@@ -5676,7 +5876,12 @@ static void v41_unpark(Model *m) {
         free(m->shared_topk); m->shared_topk = g_v41_park_x.topk; g_v41_park_x.topk = NULL;
         m->shared_topk_rows = m->shared_topk ? g_v41_park_x.topk_rows : 0; m->shared_topk_width = m->shared_topk ? g_v41_park_x.topk_width : 0;
         free(m->candidates); m->candidates = g_v41_park_x.cand; g_v41_park_x.cand = NULL;
-        m->candidate_width = m->candidates ? g_v41_park_x.cand_width : 0; m->candidate_rows = m->candidates ? g_v41_park_x.cand_rows : 0;
+        m->candidate_topk = m->candidates ? g_v41_park_x.cand_topk : 0;
+        /* The width is the bound the ids were painted to, not their size any more, and it
+         * travels with them: a reader that runs before the source layer is refreshed reads the
+         * reach the parked rows were selected at, as base's dense row did. */
+        m->candidate_width = m->candidates ? g_v41_park_x.cand_width : 0;
+        m->candidate_rows = m->candidates ? g_v41_park_x.cand_rows : 0;
 #ifdef COLI_VULKAN
         v41c_reset(m);   /* the host's rows from 0 are the conversation's again: the mirrors go up again */
 #endif
@@ -5710,7 +5915,7 @@ static void v41_park_decide(Model *m, const int *ids, int np, int max_tok, int i
  * them, and checkpoints of the rest (every layer's window ring and its positions, the compressor's
  * filling group, the layer whose index keys were published last) where a prompt's messages start
  * and where it ends. A prompt's rows read past a checkpoint publish their own top-k lists and
- * candidate masks before any layer reads them, so those are not kept (a decoded position would
+ * candidate blocks before any layer reads them, so those are not kept (a decoded position would
  * read the last forward's, and nothing here resumes one). Only what a prompt read put there: a
  * request that started from nothing or from the store saves, one that resumed the live state (with
  * decoded positions) or a photo does not, so a request that takes a checkpoint computes what the
@@ -5851,6 +6056,10 @@ static int v41_ps_take(Model *m, const int *ids, int np, int held) {
     m->published_index_k = x->pub_layer >= 0 ? m->L[x->pub_layer].ikey : NULL;
     m->published_index_layer = x->pub_layer >= 0 ? x->pub_layer : m->published_index_layer;
     m->shared_topk_rows = m->shared_topk_width = 0;   /* as model_reset_rows: the prompt's rows publish their own */
+    free(m->candidates);   /* ... and the candidate blocks are dropped, not kept: the state put back is the
+                            * store's positions, whose rows publish their own before any layer reads them */
+    m->candidates = NULL;
+    m->candidate_topk = m->candidate_width = m->candidate_rows = 0;
     m->engram.history_len = 0;
     if (m->engram.active) engram_push(&m->engram, ids, P, NULL);   /* the history is the ids' */
     m->pos = P;
@@ -6406,12 +6615,13 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *snap) {
             for (int t = 0; t < m->engram.n_layers; t++) {
                 EngramTable *tab = &m->engram.table[t];
                 uint64_t total = tab->hits + tab->misses;
+                uint64_t rows_read = tab->misses + tab->staged;   /* the gather's and the stager's */
                 fprintf(stderr, "[v41] engram table %d (layer %d): %llu lookups, "
                                 "%.0f%% cache hits, %llu rows read (%.1f MB)\n",
                         t, m->engram.layer_of[t], (unsigned long long)total,
                         total ? 100.0 * (double)tab->hits / (double)total : 0.0,
-                        (unsigned long long)tab->misses,
-                        tab->misses * (double)(m->engram.head_dim + m->engram.head_dim / 32) / 1e6);
+                        (unsigned long long)rows_read,
+                        rows_read * (double)(m->engram.head_dim + m->engram.head_dim / 32) / 1e6);
             }
         }
         if (stats) {
@@ -7176,7 +7386,7 @@ int main(int argc, char **argv) {
                             "%llu reads\n", t, m.engram.layer_of[t],
                     (long long)m.engram.table[t].rows,
                     (unsigned long long)m.engram.table[t].hits,
-                    (unsigned long long)m.engram.table[t].misses);
+                    (unsigned long long)(m.engram.table[t].misses + m.engram.table[t].staged));
     if (spec_checked)
         fprintf(stderr, "[v41] DSpark: checked %d draft round%s against the reference%s\n",
                 spec_checked, spec_checked == 1 ? "" : "s", spec_failed ? "  MISMATCH" : "");

@@ -601,6 +601,17 @@ p = [5, 77, 13, 201, 42, 9, 150, 33, 61, 18, 240, 7]
 json.dump({"prompt_ids": p, "full_ids": p + [0] * 16}, open("ink2_gguf/ref.json", "w"))
 PY
   fi
+  if [ ! -d ink2_ggufd/gg ]; then   # the attention's matrices and the head as Q8_0 blocks too
+    rm -rf ink2_ggufd && mkdir ink2_ggufd
+    $PY - <<'PY' || fail "gguf-py (pip install gguf) is needed for the Inkling-2 GGUF gate"
+import json, sys
+sys.path.insert(0, "tests")
+from test_gguf_import import write_inkling2_pair
+write_inkling2_pair("ink2_ggufd", experts="Q8_0", dense="Q8_0")
+p = [5, 77, 13, 201, 42, 9, 150, 33, 61, 18, 240, 7]
+json.dump({"prompt_ids": p, "full_ids": p + [0] * 16}, open("ink2_ggufd/ref.json", "w"))
+PY
+  fi
   local cap D R2=tiny_inkling2/ref_inkling2.json RG=ref_g64/ref_inkling2.json
   for cap in 1 8; do
     D=; [ $cap = 8 ] && D=COLI_VK_DENSE=1
@@ -622,6 +633,13 @@ PY
     CHAINNAME=inkling2 chain_gate inkling "chain inkling2 int4 g64 container cap=$cap" 1 COLI_VK_DENSE=1 SNAP=cont_g64 -- $cap 0 $RG
   done
   CHAINMODE=2 CHAINNAME=inkling2 chain_gate inkling "chain inkling2 prompts only" 1 COLI_VK_DENSE=1 SNAP=tiny_inkling2 -- 8 0 $R2
+  # a GGUF's: the attention's matrices and the head as Q8_0 blocks the chain takes up itself;
+  # the block GEMVs' logits against the CPU's float kernels, then the prompt's rows through the
+  # tiled GEMM (its own rounding, 6e-4 here): the same tokens
+  CHAINNAME=inkling2 chain_gate inkling "chain inkling2 GGUF Q8_0 dense" 1 COLI_VK_DENSE=1 GQ_EXACT=1 COLI_VK_IDOT=0 COLI_VK_CHAIN_GEMM=0 \
+    SNAP=ink2_ggufd/gg -- 8 0 ink2_ggufd/ref.json
+  CHAINNAME=inkling2 chain_gate inkling "chain inkling2 GGUF Q8_0 dense, tiled GEMM" 0 COLI_VK_DENSE=1 GQ_EXACT=1 COLI_VK_IDOT=0 \
+    SNAP=ink2_ggufd/gg -- 8 0 ink2_ggufd/ref.json
 }
 
 family_inkling_olmoe() {

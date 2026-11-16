@@ -224,7 +224,9 @@ def detect_cpu():
             with open("/proc/cpuinfo", encoding="utf-8", errors="replace") as handle:
                 cpu = cpu_from_cpuinfo(handle.read(1 << 20))
         except OSError:
-            cpu = {"name": None, "features": []}
+            # Systems without /proc/cpuinfo (the BSDs): failure to read the features, is not
+            # the same as a processor that reports none of them.
+            cpu = {"name": None, "features": [], "features_known": False}
     cpu["arch"] = platform.machine().lower() or None
     cpu["logical_cores"] = os.cpu_count()
     try:
@@ -467,6 +469,25 @@ def detect_nvidia():
         probe = _probe_cuda_child()
         if probe:
             fill_compute_caps(gpus, probe.get("devices"))
+    if gpus and sys.platform == "win32":
+        fill_driver_models(gpus, _run([exe, "--query-gpu=index,driver_model.current",
+                                       "--format=csv,noheader"], timeout=10))
+    return gpus
+
+
+def fill_driver_models(gpus, text):
+    """Windows only: each card's driver model from `nvidia-smi --query-gpu=index,
+    driver_model.current --format=csv,noheader`. A data-center card runs in TCC (or MCDM)
+    mode, where Windows offers no Vulkan device, so the setup can say why Vulkan found
+    none. A separate query: a driver that refused the field would otherwise drop the
+    card's whole row. Unreadable rows leave driver_model None."""
+    models = {}
+    for line in (text or "").splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) == 2 and parts[0].isdigit() and parts[1] and not parts[1].startswith("["):
+            models[int(parts[0])] = parts[1].upper()
+    for gpu in gpus:
+        gpu["driver_model"] = models.get(gpu.get("index"))
     return gpus
 
 
@@ -941,7 +962,9 @@ def format_report(report):
                          ("avx2", "avx_vnni", "avx512f", "avx512_vnni", "avx512_bf16", "asimddp", "sve"))
     lines.append(f"  CPU     {cpu.get('name') or cpu.get('arch') or '?'}, {core_text}"
                  + (f", {features}" if features else ""))
-    missing = missing_for_prebuilt(cpu)
+    # When features are unknown (features_known False), do not report the "no AVX2"
+    # message because the processor could have the feature.
+    missing = missing_for_prebuilt(cpu) if cpu.get("features_known", True) else []
     if missing:
         lines.append(f"          note: no {', '.join(f.upper() for f in missing)}: the prebuilt "
                      "engines need it, so the engine is built for this processor (a compiler "

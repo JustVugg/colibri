@@ -23,6 +23,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   arms, the KV split's give-way and the CPU host
   ([deepseek-v41.md](docs/deepseek-v41.md#quantized-kv-mirrors-coli_vk_kv_fp32)).
 
+- **Qwen3.8 on AMD Quark's MXFP4 experts** (`Q38_EXPERT_LOWBIT=mxfp4`): the routed experts
+  from the `experts-mxfp4/` sidecar, one read of 2.6 MB per miss instead of 4.9 MB, computed by
+  `quant.h`'s `matmul_mxfp4`; the trunk and the shared expert stay FP8. CPU only for now (the
+  expert tiers keep them on the CPU). `make -C c qwen38-tiny-mxfp4-check`: the tiny fixture's
+  tokens and logits through every expert path, its FP8 run's within cosine 0.99999.
+- **Qwen3.8's expert sidecar from several drives** (`COLI_MODEL_MIRROR`, `COLI_DISK_WEIGHTS`):
+  copies of `experts-int4g64/` (or the low-bit sidecar in use) on other drives become read
+  replicas, each record read from the drive a hash of its (layer, expert) picks, in the shares
+  `COLI_DISK_WEIGHTS` sets (equal when unset). Tokens and logits are those of one drive;
+  `make -C c qwen38-tiny-mirror-check` checks it on the int4 fixture.
+- **Qwen3.8's MXFP4 experts as a sidecar** (`tools/convert_qwen38_experts_mxfp4.py`): AMD's
+  Quark MXFP4 checkpoint's routed experts, copied byte for byte into `<model>/experts-mxfp4/`
+  next to the FP8 release, one 4096-aligned record per expert (2,613,248 bytes on the release,
+  53% of the FP8 expert). Resumable; dtypes, shapes and the E8M0 NaN are checked, and sampled
+  experts are compared with the FP8 release's so a nibble or scale mix-up is refused.
+  `make -C c qwen38-tiny-mxfp4-generate` builds a tiny fixture with MXFP4 experts
+  (`tools/make_qwen38_tiny.py --mxfp4-experts`) whose FP8 shards hold the same values exactly.
 - **Kimi K3.1 Pro** (`coli pull kimi-k3.1-pro`): the checkpoint as it ships, on the Kimi K3
   engine. K3.1 is K3's weights plus DeepSeek Sparse Attention on its 24 gated MLA layers: a
   token whose context passes 2048 positions attends to the 2048 its indexer picks, and up to
@@ -81,6 +98,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   decodes 3.1x faster on that laptop; the issue measured 1.5x on the full model with an LTO
   clang build. With the CUDA tier the Windows team now really spins (not measured).
   `c/Makefile` now recognises clang's `x86_64-w64-windows-gnu` target.
+- **DeepSeek V4.1: a block's engram rows read on reader threads** (`V41_ENGRAM_STAGE=1`, off by
+  default). The rows the engram cache did not hold came one pread at a time as the lookup reached
+  them; `V41_ENGRAM_ADVISE` asks the OS for a block's rows first, but only on POSIX and not for a
+  decode step. With the switch on, the block's missing rows (a decode step's too) are read on
+  `V41_ENGRAM_STAGE_THREADS` threads (8) before the lookup, the same bits.
 - **CPU without FMA: FP8 and int4-g64 experts read once for a prompt's rows** (#2715). On a
   CPU without AVX2 or FMA (Sandy and Ivy Bridge, a build for the x86-64 baseline or v2),
   quant.h's FP8 kernel decoded every weight again for each row and waited on one chain of adds:
@@ -578,6 +600,30 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   the cache itself. The plan reserves olmoe.c's 0.5 GB and still the KV of the planned context:
   `coli plan` and `coli doctor` show, and `coli tune` starts from, the cache olmoe keeps at a full
   context, which is the KV's worth of slots below the size it starts with.
+- **DeepSeek V4.1's candidate blocks cost the square of the context** (a 262144-token prompt
+  allocated 64 GiB). The candidate source layer published the blocks it keeps as a dense mask,
+  one byte per compressed position per query row, and the layers after it read one bit of it: at
+  ratio 1 that is `n²` bytes. It now publishes the blocks themselves -- `rows ×
+  candidate_topk_blocks` int32 ids in the source's own coordinates, `-1` past the ones a row
+  keeps (`cross_layer.py`'s `block_candidate_idxs` in DI), with the same reach kept as the paint
+  bound. 2 GiB at 262144 tokens instead of 64 GiB (that is the prompt's rows, as the mask was;
+  `v41_take_tail` then keeps only 19.8 MB of ids live, and the allocation stays the prompt's),
+  and 320 B instead of 1600 B on a `--prompt-len 40` fixture (`dsv41_long`). The reallocation
+  went with the reach, not the rows: the mask grew every token at ratio 1, the ids do not follow
+  the reach (a plain decode allocates at the prompt and once at its first token; a speculative
+  step resizes it to its batch's rows, and the plain step after it back to one). The bits a reader
+  consults are unchanged: a row's ids name the blocks its mask held, and where a repainted row the
+  chain's device wrote differs it does so past the chunk's reach, where the score is already
+  `-inf`; `c/tests/test_dsv41_candidate_ids.c` holds the selection and the repaint against a
+  frozen copy of the pre-change writer, on 11,760 cases (2,464 of them sensitive to a stale
+  padding slot), and pins the extraction's truncation fallback (more set blocks than slots,
+  which no writer produces: the first topk in block order, every slot written). A conversation
+  reset and a prefix-store take now drop the blocks too, as they already dropped the shared
+  top-k list: the rows a reset keeps apart were saved by park first, and a new conversation
+  no longer holds the last one's allocation (2 GiB at 262144) live. On the host this PR's
+  packed cache packs those device masks too (one bit a column, `v41c_mask_words`), so the
+  readback unpacks the bit row into the ids' keep row; allocating the prompt's rows rather
+  than the tail's stays as it was (2 GiB to 19.8 MB at 262144), which is named there.
 - **CUDA on Windows: the answer stopped a few tokens in with the card at 100%** (#2696). Windows'
   WDDM driver model, which WSL2 drives the card through too, holds CUDA launches back and sends
   them in batches. A hybrid step (a layer whose experts are partly in RAM) has the card signal the

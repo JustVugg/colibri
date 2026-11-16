@@ -1,0 +1,24 @@
+The MTP head these runs read: <model+head>/model-mtp.safetensors, a link to a file of 531,710,984 bytes, SHA-256
+c8a3779f7e95016f923d3686663061621ac0ab1d221dc677e0f8869357a1a4ac, written on 6 October 2026 by an earlier version of
+this branch (a tool it no longer has, tools/qwen36_mtp.py), from the 19 mtp.* tensors of Qwen/Qwen3.6-35B-A3B
+(Apache-2.0; revision 995ad96eacd98c81ed38be0c5b274b04031597b0, the repository's main branch since 24 April 2026),
+1.689 GB in bf16, fetched on 6 October with HTTP range requests from model-00025-of-00026.safetensors and
+model-00026-of-00026.safetensors and written, with their names, dtypes and shapes, to one safetensors file. The
+parent's exact-mode run (fingerprints.txt) read the container without it (<model>).
+
+tools/convert_qwen36.py writes the head too. On 21 October, run on a directory with that file of the head's bf16
+tensors and the checkpoint's config.json,
+
+  python3 c/tools/convert_qwen36.py --model <that directory> --base-container <the model's container> --out <a new
+  directory> --mtp-only
+
+wrote model-mtp.safetensors (531,710,416 bytes, SHA-256
+850acad5702fc8dfcdd1b2a05be72578adfd8d58d557a92448c6259e6a7d654f) beside links to the container's files, with the same
+529 tensors (the 17 dense ones in f16; for each of the 256 experts its int4 weights and f32 scales) as the file these
+runs read, byte for byte: the same names, dtypes, shapes and data, in another order in the file, whose header is 568
+bytes shorter. It also wrote the container's qwen36_meta.json with "mtp_num_hidden_layers": 1 added, which the qwen36
+engine does not read; <model+head> holds that qwen36_meta.json.
+
+The runs read the file of 6 October, as old as the model's own files: on this Mac's SSD a file written a few hours
+before reads faster than an older one (the last few GiB written are still in its fast cache), which would have
+favoured the drafts, the only runs that read the head.

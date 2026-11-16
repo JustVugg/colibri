@@ -42,14 +42,32 @@ drivers all install one) and on the CPU everywhere else, with nothing to build.
 **NVIDIA, CUDA.** For an RTX 30, 40 or 50 series card (compute capability 8.0
 and newer: A100, H100 and later too) the release also has
 **`colibri-<version>-windows-x86_64-cuda.zip`**. Unpack it into the same folder:
-it replaces `colibri.exe`, `glm53.exe`, `qwen36.exe` and `kimi_k3.exe` with the
-same engines plus CUDA, and adds `coli_cuda.dll` and NVIDIA's CUDA runtime
-(`cudart64_12.dll`), so no CUDA toolkit is needed, only an NVIDIA driver for
-CUDA 12. `coli.cmd setup` then picks CUDA for the models those four engines
-run; an older card keeps Vulkan. `glm53.exe` (GLM-5.3-Flash) is in the package
-from the release after v2.1.0; with v2.1.0, build it as below with
-`make glm53.exe CUDA_DLL=1`. To build the DLL yourself, for a card the
-package does not cover, see below.
+it replaces `colibri.exe`, `glm53.exe`, `qwen36.exe`, `qwen38.exe` and
+`kimi_k3.exe` with the same engines plus CUDA, and adds `coli_cuda.dll` and
+NVIDIA's CUDA runtime (`cudart64_12.dll`), so no CUDA toolkit is needed, only an
+NVIDIA driver for CUDA 12. `coli.cmd setup` then picks CUDA for the models those
+five engines run; an older card keeps Vulkan. `glm53.exe` (GLM-5.3-Flash) and
+`qwen38.exe` (Qwen3.8) are in the package from the release after v2.1.0; with
+v2.1.0, build them as below with `make glm53.exe CUDA_DLL=1` and
+`make qwen38.exe CUDA_DLL=1`. To build the DLL yourself, for a card the package
+does not cover, see below.
+
+| engine | family | CUDA on Windows |
+|---|---|---|
+| `colibri.exe` | GLM-5.2/5.3 | the CUDA package |
+| `glm53.exe` | GLM-5.3-Flash | the CUDA package, from the release after v2.1.0 |
+| `qwen36.exe` | Qwen3.6-35B-A3B | the CUDA package |
+| `qwen38.exe` | Qwen3.8-Flash-Next | the CUDA package, from the release after v2.1.0 |
+| `kimi_k3.exe` | Kimi K3 | the CUDA package |
+| `deepseek_v4.exe` | DeepSeek V4 Flash | its own DLLs, in the CUDA package |
+| the other engines | | none: Vulkan or the CPU |
+
+**Data-center cards in TCC or MCDM mode.** Windows can run a data-center card
+such as the A100 in TCC or MCDM mode, compute-only driver models with no
+graphics API: the card then has no Vulkan device, `vulkaninfo` fails and setup
+finds none (#2846). `nvidia-smi --query-gpu=driver_model.current --format=csv`
+prints the mode. On such a card only the CUDA column above is a GPU path; setup
+says so before it downloads a model that would run on the CPU, and asks.
 
 The rest of this page is for building from source.
 

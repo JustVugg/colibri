@@ -88,8 +88,9 @@ help in proportion to the RAM you can give them.
 384 routed experts (top 8, no shared expert, no dense layer), 40 sliding-window layers and 8
 global ones, attention residuals over blocks of six layers, short convolutions after attention
 and after the MLP. The engine reads it under the official tensor names, its vision tower
-included ([pictures](#inkling-2-pictures) below); the MTP drafter is not loaded
-([why](#inkling-2-the-mtp-drafter)).
+included ([pictures](#inkling-2-pictures) below), and its MTP drafter with `INK2_MTP=1`
+([below](#inkling-2-the-mtp-drafter): the same text, slower on a machine that reads experts from
+the disk).
 
 Two ways to run it:
 
@@ -99,6 +100,13 @@ Two ways to run it:
   ```sh
   ./coli import ~/models/Inkling-2-Small-UD-Q2_K_XL-00001-of-00006.gguf   # every part next to it
   ```
+
+  The vision tower is its own file in the repo, `mmproj-F16.gguf` (0.66 GB; BF16 and F32 too):
+  put it next to the parts (or name it with `--mmproj`) and the import links it and writes the
+  tower's `vision_config`. The engine reads it under the checkpoint's names: the same values
+  as the checkpoint's tower, the patch embedding a convolution there that it takes in the
+  checkpoint's pixel order. UD-IQ1_S with it, the red square and blue circle of the pictures
+  section below: "The image contains a red square and a blue circle."
 
 - **The official checkpoint as int4 g64.** Thinking Machines publish the experts in NVFP4
   (layers 0-39) and MXFP8 (layers 40-47), 393.5 GB. `c/tools/convert_inkling2_int4.py` turns
@@ -153,8 +161,8 @@ On a GPU, the CUDA build (`CUDA=1`) or the Vulkan one (`VK=1`, `COLI_VULKAN=1`):
   NVFP4 layers keep each expert's global scale outside its blocks (one number for gate and up,
   as the checkpoint's w13 has one amax an expert); the engine folds it into the row the device
   reads and into the pair's weight.
-- the bf16 dense matrices (the attention projections, its gate and the unembedding) go to the
-  device. With Vulkan the layers run as a dense chain there (`COLI_VK_CHAIN`, on by default on
+- the dense matrices (the attention projections, its gate and the unembedding) go to the
+  device: bf16 rows, or a GGUF's blocks as the file has them (Q6_K and Q8_0 in unsloth's). With Vulkan the layers run as a dense chain there (`COLI_VK_CHAIN`, on by default on
   a discrete GPU, [vulkan.md](vulkan.md#inkling-2-on-the-chain)): the attention, the residual
   mixes and the convolutions on the device, one frame a layer, the routed experts on the host;
   with CUDA, or `COLI_VK_CHAIN=0`, the matrices go a call at a time and the rest runs on the CPU
@@ -165,7 +173,13 @@ On a GPU, the CUDA build (`CUDA=1`) or the Vulkan one (`VK=1`, `COLI_VULKAN=1`):
   (`COLI_VK_TIER_HOST=1` turns it on): the RAM it takes from the expert cache cost more than
   the device gained (numbers below).
 - a build with both backends runs Inkling-2 on Vulkan, as it runs Inkling (`COLI_VULKAN=0`
-  keeps CUDA): measured ahead below. Metal leaves Inkling-2 on the CPU.
+  keeps CUDA): measured ahead below.
+- on a Mac, `INK2_METAL=1` beside `COLI_METAL=1` sends the int4 g64 container's routed experts
+  to the Apple GPU in batched blocks, as Inkling's go (`backend_metal.mm`: the planar rows as
+  format 9 and Inkling-2's softcapped SwiGLU); the rest runs on the CPU. It has not run on a
+  Mac yet: CI compiles it, and the format's loop transcribed to C matches `xf_dot_f32_ref`
+  within 1e-5, but no Metal device here executes it. So it stays off unless asked, and a
+  GGUF's experts stay on the CPU.
 
 Measured on an RTX PRO 4000 Blackwell (24 GB), an i5-13500 (the engine's six P-cores) and
 62 GB of RAM, the container on two NVMe in RAID0: `--chat`, a prompt of 26-27 tokens and 64
@@ -189,7 +203,10 @@ At this size the disk sets the pace: of the routed experts the card's 587 serve 
 cache 48%, and the other 28% come from the disk (17.9 MB an expert, 2.7-3.1 ms each with
 `INK_FILL_THREADS` readers), about half of a decode step. unsloth's UD-Q2_K_XL GGUF (191 GB,
 its experts about half the bytes) ran the CPU build at 1.40 tok/s here on 8 tokens, before the
-GPU tiers and the reads above; it was not measured since. The host pool on
+GPU tiers and the reads above. UD-IQ1_S (171.7 GB, IQ1_S and IQ3_XXS experts), 48 tokens on two
+prompts: the CUDA build 2.80-2.87 tok/s with its 289 dense matrices on the card (4.93 GB), 2.09-2.14
+before they went up (the attention on the CPU, 6.6 s of a run against 1.4), the Vulkan build
+2.75-2.82 tok/s, the CPU 1.84. The host pool on
 (`COLI_VK_TIER_HOST=1`) gave CUDA 1.27-1.29 tok/s against 1.60-1.61 off, and Vulkan 1.33-1.41
 against 1.26-1.63, before the pieced reads.
 
@@ -224,16 +241,50 @@ name.
 
 ### Inkling-2: the MTP drafter
 
-The checkpoint ships a drafter (`mtp/mtp.safetensors`, 3.4 GB: five decoder layers fed by eight
-of the model's layers, blocks of 8 tokens, a recurrent head over the vocabulary). Drafting pays
-when checking k drafted tokens in one forward costs much less than k forwards. Here it does not:
-a forward over n tokens at the decode position, the same prompt and text fed n at a time, the
-Vulkan build on the machine below, cost 0.51-0.69 s for one token, 1.01 s for two, 2.58 s for four
-and 4.56 s for eight. Each token brings experts of its own, and most of the step is reading them
-(a decode step reads its misses from the disk and computes the rest from RAM). A block of 8
-would lose even with every draft accepted, so the drafter is not wired. On a machine that holds
-every expert in memory the reads go away and the answer may change; it has not been measured
-there.
+The checkpoint ships a drafter (`mtp/mtp.safetensors`, 3.4 GB), and `INK2_MTP=1` decodes with it
+(`c/inkling2_mtp.h`). transformers has no drafter for Inkling-2, so the engine reads it from the
+papers its config names and the tensors' shapes:
+
+- the DFlare drafter (block diffusion over the target's states): eight of the target's streams
+  (`target_layer_ids`, counted as transformers' hidden states) fused per drafter layer by a
+  softmax of `fuse_weight` and an RMSNorm, projected to each layer's context keys and values
+  (`k_proj_ctx`, `v_proj_ctx`). A block of 8 rows at the decode position, the target's token and
+  `mask_embed` in the others, through five Qwen3-like layers that see the context and the whole
+  block;
+- DSpark's sequential head (`markov_head_type` `rnn_hidden`): over the block's rows in order, a
+  state updated from the previous token (`markov_w1`), the row and the previous token's
+  embedding, whose output (`hidden_out`) adds to the row before the target's `lm_head`.
+
+Which streams the ids name and the head's fourth input were chosen by measurement: the drafts of
+every position of two real generations, from the target's own states, against the target's next
+tokens. The forms that read the papers most directly kept 1.37 and 4.35 tokens of a block of 7
+(prose and code); the ones in the engine 1.45 and 4.65.
+
+One forward verifies the target's token and the drafts, and the target's greedy token after each
+row decides how many stay. A rejected draft leaves the convolution banks and the sliding layers'
+rings past what stays: they come back from a snapshot, and the kept rows run again. So the text
+is the target's own. On the CPU it is the same bits with and without the drafter, at every
+`INK2_MTP_K` (its kernels compute a row the same way whatever rows run beside it: the tiny
+oracle 24/24, and two served requests of the real model the same text both ways). On a GPU the
+verify's rows go through the kernels for several rows, whose sums round differently from one
+row's, so a near tie can go the other way: the runs below gave the same text, and one served
+request in four wrote `if n < 2` where the other three wrote `if n <= 1`. It runs
+for greedy decoding (`--chat -p`, the oracle harness, and served requests at temperature 0 with
+`REP_PEN=1` and one KV slot); the dense chains stay off with it.
+
+Measured on the machine below with the int4 g64 container and the CUDA build, 64 tokens (the
+same text in every run):
+
+| Prompt | Without | 1 draft | 3 drafts | 7 drafts |
+|---|---|---|---|---|
+| Code | 1.86 tok/s | 1.69 tok/s (29 of 34 kept) | 1.55 tok/s (3.32 tokens a verify) | 0.98 tok/s (4.92 tokens a verify) |
+| Prose | 2.01 tok/s | | 1.16 tok/s (2.44 tokens a verify) | |
+
+The drafter is good, the verify is what costs: a forward over n rows at the decode position took
+about n decode steps (1.9 s for four rows against 0.53 for one), because every row brings experts
+of its own and most of a step is reading them. So it stays off by default. The drafts kept do
+not depend on the machine (3.32 tokens a verify of 4 on the code prompt); what a verify costs
+where the experts sit in memory has not been measured.
 
 Validation: `c/tools/make_tiny_inkling2.py` builds a random-weight model with transformers'
 `Inkling2ForCausalLM` (sliding and global layers, two blocks of the attention residuals, every

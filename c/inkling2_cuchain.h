@@ -123,8 +123,9 @@ static void ink2cc_free_own(Model *m, Ink2CuChain *ch) {
 
 /* A dense matrix [O x I] as the backend's tensor, shared with the per-matrix path (W.cut): f32
  * rows as they are; bf16 rows as a GGUF's BF16 (type 30: the same bytes), read back once from the
- * CUDA build's own backend where it holds them, freed there before the upload. NULL: not this
- * form (a GGUF's blocks: the chain declines). */
+ * CUDA build's own backend where it holds them, freed there before the upload; a GGUF's blocks as
+ * the file has them (ink2_cuda_gguf_dense puts them up at the start). NULL: a form the backend
+ * does not take. */
 static ColiCudaTensor *ink2cc_mat(Wt *w, int I, int O) {
     if (w->cut) return (ColiCudaTensor *)w->cut;
     ColiCudaTensor *t = NULL;
@@ -146,6 +147,23 @@ static ColiCudaTensor *ink2cc_mat(Wt *w, int I, int O) {
         int ok = coli_cuda_tensor_upload(&t, src, NULL, 130, I, O, g_ink_cuda_dev);
         if (!ok && tmp) w->dev = ink_cuda_upload(tmp, n);   /* back where it was */
         free(tmp);
+        if (!ok) return NULL;
+    } else if (w->gq) {
+        /* a GGUF's blocks (cuda_bd.cuh), the rows the loader interleaved by 16 back to the file's
+         * first; the head's unpadded vocabulary stops inside the last group, whose rows qn holds.
+         * The host copy stays: the CPU's step reads it where the device declines one. */
+        const int b = gq_r16_base(w->gqt), ty = b >= 0 ? b : w->gqt, be = coli_cuda_block_elems(100 + ty);
+        if (be <= 0 || I % be || I % 32) return NULL;
+        fmt = 100 + ty;
+        const int Og = (O + 15) / 16 * 16;
+        uint8_t *rows = NULL;
+        if (b >= 0) {
+            if (w->qn < (int64_t)Og * gq_row_bytes(w->gqt, I) || !(rows = malloc((size_t)gq_row_bytes(ty, I) * (size_t)Og)))
+                return NULL;
+            gq_r16_unpack(w->gqt, rows, w->gq, Og, I);
+        }
+        int ok = coli_cuda_tensor_upload(&t, rows ? (const void *)rows : (const void *)w->gq, NULL, fmt, I, O, g_ink_cuda_dev);
+        free(rows);
         if (!ok) return NULL;
     } else return NULL;
     w->cut = t; w->cutf = fmt;

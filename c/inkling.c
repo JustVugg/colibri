@@ -235,6 +235,7 @@ typedef struct {
     Wt audio_enc;                         /* [mel_bins*mel_vocab, D] embedding table */
     float *audio_norm;                    /* audio tower RMSNorm [D]; NULL = no audio */
     struct Ink2Vision *vis;               /* Inkling-2's vision tower (inkling2_vision.h); NULL = none */
+    struct Ink2Mtp *mtp;                  /* Inkling-2's drafter (inkling2_mtp.h, INK2_MTP=1); NULL = none */
     float *img; int img_n, img_next;      /* a request's image rows [img_n][D], the next one step_mm takes */
     Layer *L;
     LCache *cache;
@@ -1528,6 +1529,8 @@ static void ink_vk_init_model(Model *m, int layer_begin, int layer_end) {
 
 static void ink2_load_layer(Model *m, int i, char *nm, size_t nmz);   /* inkling2.h */
 static struct Ink2Vision *ink2_vision_load(Model *m, const char *snap);   /* inkling2_vision.h */
+static int ink2m_wanted(void);                                     /* inkling2_mtp.h */
+static struct Ink2Mtp *ink2m_load(Model *m, const char *snap);
 /* The name of a layer's routed experts' gate/up (k 0) or down (k 1) tensor: Inkling's
  * gate_up_proj/down_proj; Inkling-2's under model.llm, gate_up_proj/down_proj in a container,
  * the checkpoint's w13_weight/w2_weight otherwise (x2_names) */
@@ -1552,7 +1555,17 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
      * mixes and convolutions run on the CPU: the Vulkan dense chain computes Inkling's layers
      * (ink_vk_init_model keeps it off), and the Metal expert path Inkling's SwiGLU. */
     if (m->c.v2 && !getenv("NOGPU")) {
-        setenv("COLI_METAL", "0", 1);
+        /* Metal: the int4 g64 container's routed experts on the Apple GPU (fmt 9 and
+         * Inkling-2's SwiGLU in backend_metal.mm), asked for with INK2_METAL=1 beside
+         * COLI_METAL=1: not measured on a Mac yet, so off unless asked */
+        const char *im = getenv("INK2_METAL");
+        if (!(im && *im == '1')) setenv("COLI_METAL", "0", 1);
+        /* INK2_MTP: the drafter reads the layers' streams on the host, and its verify rolls the
+         * state back, which the dense chains keep a copy of on the device: they stay off */
+        if (ink2m_wanted()) {
+            setenv("COLI_VK_CHAIN", "0", 1); unsetenv("COLI_CUDA_CHAIN");
+            fprintf(stderr, "[inkling2] INK2_MTP: the dense chains off (the drafter reads the layers on the host)\n");
+        }
 #if !defined(COLI_CUDA) && !defined(COLI_VULKAN)
         fprintf(stderr, "[inkling2] Inkling-2 runs on the CPU in this build\n");
         setenv("NOGPU", "1", 1);
@@ -1642,6 +1655,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         m->lm_head    = load_w(m, "model.llm.unembed.weight", 1);
         m->x2_out_query = load_t(m, "model.llm.attn_res.output_query");
         m->vis = ink2_vision_load(m, snap);
+        if (ink2m_wanted()) m->mtp = ink2m_load(m, snap);
     } else if (load_boundaries) {
         m->embed      = load_w(m, "model.embed_tokens.weight", 0);
         { const char *en = embed_norm_name(&m->S); m->embed_norm = en ? load_t(m, en) : NULL; }
@@ -2063,6 +2077,62 @@ static int ink_fill_threads(void) {
     if (n < 0) { const char *e = getenv("INK_FILL_THREADS"); n = e && atoi(e) > 0 ? atoi(e) : 12; }
     return n;
 }
+/* INK_FILL_DIRECT (default on, Linux): the pieces read with O_DIRECT, past the page cache, each
+ * piece's 4 KiB-aligned span into a buffer of the thread's and the piece copied out (a container's
+ * slices start wherever its header ends). Measured on two NVMe in RAID0, the engine's pieces of
+ * 2 MiB: 2.3 ms an expert against 3.0 buffered in rounds of three, 2.1-2.3 against 2.8-3.0 deeper
+ * (8.2 GB/s against 6.0); Inkling-2-Small's decode (the CUDA build, 48 tokens on two prompts,
+ * alternated) 1.96-2.01 -> 2.30-2.33 tok/s, the prompt 12.8-13.1 -> 11.0-11.2 s. A file system
+ * without O_DIRECT, or a read it refuses, falls back to the buffered read for good. */
+#if defined(__linux__) && defined(O_DIRECT)
+static int ink_fill_direct_on = -1;
+static int ink_dfd_of[1024];   /* the O_DIRECT twin of a shard's fd (index: the fd), 0 unknown, -1 none */
+static int ink_dfd(int fd) {
+    if (ink_fill_direct_on < 0) { const char *e = getenv("INK_FILL_DIRECT"); ink_fill_direct_on = !(e && *e == '0'); }
+    if (!ink_fill_direct_on || fd < 0 || fd >= 1024) return -1;
+    if (!ink_dfd_of[fd]) {
+        char lk[64], path[4096];
+        snprintf(lk, sizeof lk, "/proc/self/fd/%d", fd);
+        const ssize_t n = readlink(lk, path, sizeof path - 1);
+        int d = -1;
+        if (n > 0) { path[n] = 0; d = open(path, O_RDONLY | O_DIRECT); }
+        ink_dfd_of[fd] = d >= 0 ? d : -1;
+        static int said;
+        if (d >= 0 && !said) { said = 1; fprintf(stderr, "[inkling] the experts' reads with O_DIRECT, past the page cache (INK_FILL_DIRECT=0: buffered)\n"); }
+    }
+    return ink_dfd_of[fd];
+}
+/* The pieces' aligned buffers, one a reader, kept across rounds (a round's readers are a new team
+ * of the fill thread's each time: buffers of their own would leak); a round holds them all. */
+static uint8_t **ink_bb;
+static int ink_nbb;
+static pthread_mutex_t ink_bb_mu = PTHREAD_MUTEX_INITIALIZER;
+static int ink_bb_take(int n) {   /* locked on success: 1 */
+    pthread_mutex_lock(&ink_bb_mu);
+    if (n > ink_nbb) {
+        uint8_t **b = realloc(ink_bb, (size_t)n * sizeof *b);
+        if (!b) { pthread_mutex_unlock(&ink_bb_mu); return 0; }
+        ink_bb = b;
+        for (; ink_nbb < n; ink_nbb++)
+            if (posix_memalign((void **)&ink_bb[ink_nbb], 4096, INK_FILL_PIECE + 8192)) { pthread_mutex_unlock(&ink_bb_mu); return 0; }
+    }
+    return 1;
+}
+/* 1 when the piece came through O_DIRECT */
+static int ink_pread_direct(int dfd, uint8_t *bb, uint8_t *dst, int64_t n, int64_t off) {
+    const int64_t a = off & ~(int64_t)4095, e = (off + n + 4095) & ~(int64_t)4095, need = off + n - a;
+    if (e - a > INK_FILL_PIECE + 8192) return 0;
+    int64_t got = 0;
+    while (got < need) {
+        const ssize_t r = pread(dfd, bb + got, (size_t)(e - a - got), a + got);
+        if (r < 0 || (r == 0 && got < need)) return 0;
+        if (r == 0) break;
+        got += r;
+    }
+    memcpy(dst, bb + (off - a), (size_t)n);
+    return 1;
+}
+#endif
 static void ink_fill_slots(Model *m, int layer, const int *layers, Slot **fill, int nfill) {
     if (nfill < 1) return;
     if (!m->xg64) {
@@ -2097,11 +2167,33 @@ static void ink_fill_slots(Model *m, int layer, const int *layers, Slot **fill, 
                                     len[k] - o < INK_FILL_PIECE ? len[k] - o : INK_FILL_PIECE };
         }
     }
+#if defined(__linux__) && defined(O_DIRECT)
+    int *dfd = malloc((size_t)np * sizeof(int));   /* opened here, outside the threads */
+    if (!dfd) { fprintf(stderr, "OOM fill\n"); exit(1); }
+    const int nt = ink_fill_threads();
+    const int held = ink_bb_take(nt);
+    for (int i = 0; i < np; i++) dfd[i] = held ? ink_dfd(pc[i].fd) : -1;
+    int refused = 0;
+    #pragma omp parallel for schedule(dynamic,1) num_threads(nt) reduction(|:refused)
+    for (int i = 0; i < np; i++) {
+        if (dfd[i] >= 0 && ink_pread_direct(dfd[i], ink_bb[omp_get_thread_num()], pc[i].dst, pc[i].n, pc[i].off)) continue;
+        refused |= dfd[i] >= 0;
+        pread_all(pc[i].fd, pc[i].dst, pc[i].n, pc[i].off);
+        posix_fadvise(pc[i].fd, pc[i].off, pc[i].n, POSIX_FADV_DONTNEED);
+    }
+    if (held) pthread_mutex_unlock(&ink_bb_mu);
+    if (refused && ink_fill_direct_on) {
+        ink_fill_direct_on = 0;
+        fprintf(stderr, "[inkling] an O_DIRECT read was refused: the experts' reads go through the page cache from now on\n");
+    }
+    free(dfd);
+#else
     #pragma omp parallel for schedule(dynamic,1) num_threads(ink_fill_threads())
     for (int i = 0; i < np; i++) {
         pread_all(pc[i].fd, pc[i].dst, pc[i].n, pc[i].off);
         posix_fadvise(pc[i].fd, pc[i].off, pc[i].n, POSIX_FADV_DONTNEED);
     }
+#endif
     free(pc);
     for (int j = 0; j < nfill; j++) fill[j]->filled = 1;
 }
@@ -2337,6 +2429,9 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
     free(q); free(k); free(vv); free(rr); free(ctx);
 }
 
+static void ink2m_begin(Model *m, int S);                         /* inkling2_mtp.h */
+static void ink2m_capture(Model *m, int k, const float *x, int S);
+static void ink2m_end(Model *m, int pos0, int S);
 #include "inkling2.h"   /* Inkling-2: its attention, convolutions and attention residuals */
 #include "inkling2_vision.h"   /* Inkling-2: its vision tower */
 
@@ -2587,8 +2682,10 @@ static size_t ink_vk_dense_bytes_mats(const Model *m) {
     if (g_inkc_fit.L && ink_is_gguf(m))   /* a GGUF's whole chain, placed already: its layers' buffers and the head to come */
         return inkc_fit_later(m) + (g_inkc_fit.tail ? g_inkc_fit.tail_b : 0);
     if (g_ink_dho) return 0;   /* placed already (ink_dho_place): the free memory the tier reads counts them */
+    /* a GGUF's blocks: Inkling-2's chain takes them up itself (inkc_tensor), their bytes */
     #define INK_VKB(w, n) do { const Wt *w_ = (w); int f_ = w_->vk ? ink_vk_fmt(w_) : 0; \
-        b += (double)(n) * (f_ == 1 ? 1.0 : f_ == 4 ? 0.5625 : f_ == 10 ? 4.0 : f_ == 11 ? 2.0 : 0.0); } while (0)
+        if (!f_ && w_->gq && c->v2 && g_ink2c_want) b += (double)w_->qn; \
+        else b += (double)(n) * (f_ == 1 ? 1.0 : f_ == 4 ? 0.5625 : f_ == 10 ? 4.0 : f_ == 11 ? 2.0 : 0.0); } while (0)
     INK_VKB(&m->lm_head, (double)c->vocab * c->hidden);
     for (int i = 0; i < c->n_layers; i++) {
         const Layer *l = &m->L[i];
@@ -2789,8 +2886,42 @@ static void ink_vk_tier_start(Model *m) {
  * holds there (load_w), whose memory the budget it reads leaves them. Inkling keeps the
  * backend alone, as before: its experts on the CPU. */
 static size_t ink2cc_plan_bytes(const Model *m);   /* inkling2_cuchain.h */
+static ColiCudaTensor *ink2cc_mat(Wt *w, int I, int O);   /* inkling2_cuchain.h */
+/* Inkling-2 from a GGUF on the CUDA build: the attention's block-format matrices and the head on
+ * the device as the file has them (cuda_bd.cuh; matmul_w reads W.cut), before the tier measures
+ * what memory is left. The backend's bf16 path (load_w) takes none of them. */
+static void ink2_cuda_gguf_dense(Model *m) {
+    Cfg *c = &m->c;
+    int dev = g_ink_cuda_dev, n = 0, up = 0;
+    double bytes = 0;
+    if (!coli_cuda_init(&dev, 1)) return;
+    for (int i = 0; i <= c->n_layers; i++) {
+        Layer *l = i < c->n_layers ? &m->L[i] : NULL;
+        const int D = c->hidden, H = l ? L_HEADS(c, i) : 0, hd = l ? L_HD(c, i) : 0, kvo = l ? L_KV(c, i) * hd : 0;
+        Wt *w6[6] = {NULL};
+        int I6[6] = {0}, O6[6] = {0}, k = 0;
+        if (l) {
+            w6[0] = &l->q; I6[0] = D;      O6[0] = H * hd;
+            w6[1] = &l->k; I6[1] = D;      O6[1] = kvo;
+            w6[2] = &l->v; I6[2] = D;      O6[2] = kvo;
+            w6[3] = &l->r; I6[3] = D;      O6[3] = H * c->d_rel;
+            w6[4] = &l->o; I6[4] = H * hd; O6[4] = D;
+            w6[5] = &l->ag; I6[5] = D;     O6[5] = H * hd;
+            k = 6;
+        } else { w6[0] = &m->lm_head; I6[0] = D; O6[0] = c->unpad_vocab; k = 1; }
+        for (int j = 0; j < k; j++) {
+            Wt *w = w6[j];
+            if (!w->gq || w->cut) continue;
+            n++;
+            if (ink2cc_mat(w, I6[j], O6[j])) { up++; bytes += (double)w->qn; }
+        }
+    }
+    if (n) fprintf(stderr, "[CUDA] inkling2: %d of the GGUF's %d dense matrices on the device as the file has them (%.2f GB)%s\n",
+                   up, n, bytes / 1e9, up < n ? "; the others on the CPU" : "");
+}
 static void ink_cu_tier_start(Model *m) {
     Cfg *c = &m->c;
+    if (c->v2 && g_cuda && !XT(ready)()) ink2_cuda_gguf_dense(m);
     /* Inkling-2's CUDA chain (COLI_CUDA_CHAIN=1 or 2, inkling2_cuchain.h; off by default: it measured
      * no faster than the matrices a call at a time) planned here, before the tier sizes itself: the
      * tier leaves its buffers and K/V mirrors */
@@ -3266,8 +3397,13 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out, c
                 for (int j = 0; j < nb; j++) {
                     Slot *e = mslot[j];
                     mgp[j] = e->p13; mup[j] = e->p13 + (int64_t)I*m->rb13; mdp[j] = e->p2;
-                    mgs[j] = e->s13; mus[j] = e->s13 + I; mds[j] = e->s2;
+                    /* int4 g64: the up rows' scales after the gate's I x D/64 */
+                    mgs[j] = e->s13; mus[j] = e->s13 + (m->xg64 ? (int64_t)I * (D / XF_BLOCK) : I); mds[j] = e->s2;
                 }
+                /* Inkling: int4 (2) or int8 (1) rows and SwiGLU; Inkling-2: int4 g64 planar (9)
+                 * and its softcapped SwiGLU (act 2) */
+                const int mfmt = m->xg64 ? 9 : q4 ? 2 : 1, mact = c->v2 ? 2 : 0;
+                const float ma0 = c->v2 ? c->gate_cap : 0.f, ma1 = c->v2 ? c->up_cap : 0.f;
                 /* Last round: submit async and run the shared experts on the
                  * CPU while the GPU computes the routed ones — they are
                  * independent (both read x, both accumulate into out, and the
@@ -3275,8 +3411,8 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out, c
                  * On a GPU fault _end returns 0 and the CPU loop below redoes
                  * the round; shared_done stays set either way. */
                 if (base + round_cap >= npair && !sh_h) {
-                    ColiMetalMoeHandle *h = coli_metal_moe_block_begin(
-                        nb, D, I, q4 ? 2 : 1, 0, mgp, mup, mdp, mgs, mus, mds,
+                    ColiMetalMoeHandle *h = coli_metal_moe_block_begin_act(
+                        nb, D, I, mfmt, 0, mact, ma0, ma1, mgp, mup, mdp, mgs, mus, mds,
                         mxg, mxoff, mnr, mrows, mrw);
                     if (h) {
                         double ts = now_s();
@@ -3290,8 +3426,8 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out, c
                         te = now_s();                      /* fault: CPU redo below */
                     }
                 }
-                if (coli_metal_moe_block(nb, D, I, q4 ? 2 : 1, 0, mgp, mup, mdp, mgs, mus, mds,
-                                         mxg, mxoff, mnr, mrows, mrw, out, S)) {
+                if (coli_metal_moe_block_act(nb, D, I, mfmt, 0, mact, ma0, ma1, mgp, mup, mdp, mgs, mus, mds,
+                                             mxg, mxoff, mnr, mrows, mrw, out)) {
                     m->t_expert += now_s() - te;
                     continue;                              /* round done on the GPU */
                 }
@@ -3676,6 +3812,8 @@ static float *step(Model *m, const int *ids, int S, int pos0, int *tf_out) {
     return step_mm(m, ids, S, pos0, tf_out, NULL, 0);
 }
 
+#include "inkling2_mtp.h"   /* Inkling-2's drafter (INK2_MTP=1) */
+
 /* ---- several conversations at once (KV_SLOTS>1, serve_mux) ------------------- */
 static void ink_seq_swap(Model *m, InkSeq *q) {
     float **K = m->K, **V = m->V; int len = m->kv_len; kv_prefix p = m->kvp;
@@ -3826,7 +3964,22 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out,
     float *logit = step_mm(m, prompt, np, 0, NULL, dmel, naud);
     int len = np;
     Cfg *c = &m->c;
-    for (int s = 0; s < n_new; s++) {
+    if (m->mtp && n_new > 0) {   /* INK2_MTP: the same greedy tokens through the drafter's blocks */
+        int blk[INK2M_MAXB], nblk = 1, fed = np;
+        int best = 0; float bv = logit[0];
+        for (int i = 1; i < c->unpad_vocab; i++) if (logit[i] > bv) { bv = logit[i]; best = i; }
+        if (df) fwrite(logit, sizeof(float), (size_t)c->unpad_vocab, df);
+        free(logit); logit = NULL;
+        blk[0] = best;
+        for (;;) {
+            for (int j = 0; j < nblk && len - np < n_new; j++) out[len++] = blk[j];
+            if (len - np >= n_new) break;
+            const int last = blk[nblk - 1];
+            nblk = ink2m_step(m, last, fed, blk); fed += nblk;
+        }
+        ink2m_report(m);
+    }
+    for (int s = 0; s < n_new && logit; s++) {
         if (df) fwrite(logit, sizeof(float), (size_t)c->unpad_vocab, df);
         int best = 0; float bv = logit[0];
         for (int i = 1; i < c->unpad_vocab; i++) if (logit[i] > bv) { bv = logit[i]; best = i; }
@@ -3860,7 +4013,28 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new,
     float *logit = step_mm(m, ids, np, 0, NULL, dmel, naud);
     int len = np;
     char buf[512];
-    for (int s = 0; s < n_new; s++) {
+    if (m->mtp && n_new > 0) {   /* INK2_MTP: the drafter's blocks the target keeps (inkling2_mtp.h) */
+        int blk[INK2M_MAXB], nblk = 1, fed = np, s = 0, stop = 0;
+        int best = 0; float bv = logit[0];
+        for (int i = 1; i < c->unpad_vocab; i++) if (logit[i] > bv) { bv = logit[i]; best = i; }
+        free(logit); logit = NULL;
+        t1 = now_s();
+        blk[0] = best;
+        while (!stop) {
+            for (int j = 0; j < nblk && !stop; j++) {
+                if (blk[j] == c->eos) { printf("\n[eos after %d tokens]", s); stop = 1; break; }
+                int nb = tok_decode(T, &blk[j], 1, buf, sizeof(buf)-1);
+                buf[nb] = 0; fputs(buf, stdout); fflush(stdout);
+                len++; s++;
+                if (s >= n_new) stop = 1;
+            }
+            if (stop) break;
+            const int last = blk[nblk - 1];
+            nblk = ink2m_step(m, last, fed, blk); fed += nblk;
+        }
+        ink2m_report(m);
+    }
+    for (int s = 0; s < n_new && logit; s++) {
         int best = 0; float bv = logit[0];
         for (int i = 1; i < c->unpad_vocab; i++) if (logit[i] > bv) { bv = logit[i]; best = i; }
         free(logit);
@@ -4557,6 +4731,31 @@ static int serve_one(Model *m, Tok *T, SReq *q) {
     float rep = ink_rep_pen(m);
     int hist[128], nhist = 0;
     for (int i = (np > 128 ? np - 128 : 0); i < np; i++) hist[nhist++] = ids[i];
+    if (m->mtp && q->temp <= 0.f && rep == 1.f && q->logprobs == 0 && !m->mux_rows && q->max_tok > 0) {
+        /* INK2_MTP, a greedy request: the target's token, then the drafter's blocks it keeps
+         * (inkling2_mtp.h); each block's tokens go out in order */
+        int blk[INK2M_MAXB], nblk = 1, fed = np, stop = 0;
+        blk[0] = sample_logits(logit, c->unpad_vocab, 0.f, 1.f);
+        free(logit); logit = NULL;
+        while (!stop) {
+            for (int j = 0; j < nblk && !stop; j++) {
+                const int tk = blk[j];
+                if (tk == c->eos) { limited = 0; stop = 1; break; }
+                int nb = tok_decode(T, &tk, 1, buf, sizeof(buf)-1);
+                coli_serve_write_data(stdout,q->id,buf,(size_t)nb);
+                gen++; len++;
+                while (stdin_readable()) {
+                    int r = serve_read_cmd(stdin, stdout, q->id);
+                    if (r < 0) { free(ids); return -1; }
+                    if (r > 0) { cancelled = 1; limited = 0; }
+                }
+                if (cancelled || gen >= q->max_tok) stop = 1;
+            }
+            if (stop) break;
+            const int last = blk[nblk - 1];
+            nblk = ink2m_step(m, last, fed, blk); fed += nblk; forwards++;
+        }
+    } else
     for (int s = 0; s < q->max_tok && !cancelled; s++) {
         apply_rep_penalty(logit, c->unpad_vocab, hist, nhist, rep);
         int tk = sample_logits(logit, c->unpad_vocab, q->temp, q->top_p);
@@ -5178,6 +5377,9 @@ int main(int argc, char **argv) {
     }
 
     /* pass 2: greedy generation, token-for-token vs the oracle */
+    if (m.mtp && getenv("INK2_MTP_ORACLE") && *getenv("INK2_MTP_ORACLE") == '1') {   /* tests: see ink2m_draft */
+        g_ink2m_known = full; g_ink2m_nknown = nfull;
+    }
     int *out = malloc(nfull * sizeof(int));
     double t = now_s();
     INK_IMG_REWIND();

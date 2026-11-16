@@ -214,6 +214,23 @@ class ResponsesDisconnectTest(unittest.TestCase):
             engine.release.set()
             connection.close()
 
+    def test_pipelined_bytes_then_reset_cancel_prefill(self):
+        engine, endpoint, path = self.harness(True)
+        data = json.dumps({"input": "hello", "model": "test-model"}).encode()
+        connection = socket.create_connection((endpoint.hostname, endpoint.port), timeout=3)
+        try:
+            connection.sendall(("POST %s HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer secret\r\n"
+                                "Content-Length: %d\r\n\r\n" % (path, len(data))).encode() + data)
+            self.assertTrue(engine.entered.wait(2))
+            connection.sendall(b"GET /health HTTP/1.1\r\nX-Padding: " + b"x" * 20000 + b"\r\n\r\n")
+            self.assertFalse(engine.cancelled.wait(0.2))
+            reset_connection(connection)
+            self.assertTrue(engine.cancelled.wait(2), "queued data hid the frontend reset")
+            self.assertTrue(engine.finished.wait(1))
+        finally:
+            connection.close()
+            engine.release.set()
+
     def response_owned_socket(self, status=200, chunked=False, abort_upstream=False):
         gone, release, started = threading.Event(), threading.Event(), threading.Event()
         self.addCleanup(release.set)

@@ -1,4 +1,4 @@
-import type { ChatMessage } from "./api"
+import type { ChatMessage, TokenUsage } from "./api"
 
 /* Stream a delta into one bubble of the transcript. Both a fresh answer and a
    continued turn go through here; the only difference is which bubble. */
@@ -10,8 +10,8 @@ export function appendDelta(messages: ChatMessage[], targetId: string, field: "c
 /* Record how the generation streaming into `targetId` ended. A null finish is
    a stream that closed without a finish_reason: colibri always sends one last,
    so the reply was cut off, and is recorded as "incomplete", not as done. */
-export function setFinish(messages: ChatMessage[], targetId: string, finish: string | null): ChatMessage[] {
-  return messages.map((item) => item.id === targetId ? { ...item, finish: finish ?? "incomplete" } : item)
+export function setFinish(messages: ChatMessage[], targetId: string, finish: string | null, usage?: TokenUsage | null): ChatMessage[] {
+  return messages.map((item) => item.id === targetId ? { ...item, finish: finish ?? "incomplete", ...(usage ? { usage } : {}) } : item)
 }
 
 /* An assistant turn is open, and worth continuing, when it hit max_tokens or
@@ -37,4 +37,31 @@ export function continuation(messages: ChatMessage[]): { history: ChatMessage[];
     history: messages.map((item) => item.id === last.id ? { ...item, content: trimmed } : item),
     targetId: last.id,
   }
+}
+
+/* Prompt tokens actually prefilled on this turn, excluding the prefix reused
+   from the KV cache. Prefers the server's cached_tokens detail when present;
+   otherwise subtracts the previous assistant turn's prompt + completion tokens
+   (or prompt tokens alone if past reasoning was stripped), unless the turn
+   compacted the history. */
+export function uncachedPromptTokens(messages: ChatMessage[], usage: TokenUsage, compacted = false): number {
+  const pt = usage.prompt_tokens || 0
+  if (pt <= 0) return 0
+  if (usage.prompt_tokens_details?.cached_tokens != null) {
+    return Math.max(0, pt - usage.prompt_tokens_details.cached_tokens)
+  }
+  if (compacted) return pt
+  const prev = [...messages].reverse().find((item) => item.role === "assistant" && item.usage)?.usage
+  if (!prev) return pt
+  const prevPrompt = prev.prompt_tokens || 0
+  const prevTotal = prevPrompt + (prev.completion_tokens || 0)
+  const isContinuation = messages[messages.length - 1]?.role === "assistant"
+  const cached = isContinuation
+    ? Math.min(pt, prevTotal)
+    : pt > prevTotal
+      ? prevTotal
+      : pt > prevPrompt
+        ? prevPrompt
+        : 0
+  return Math.max(0, pt - cached)
 }

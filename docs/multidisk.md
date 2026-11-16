@@ -3,7 +3,8 @@
 Use extra drives when model reads limit inference. `COLI_MODEL_MIRROR` points
 to read-only copies of the primary model's shards; no RAID setup is required.
 These examples target the GLM-5.2 engine. Other engines have their own I/O
-paths, so check their model guides before applying the same settings.
+paths, so check their model guides before applying the same settings (qwen38
+mirrors its expert sidecar only: [qwen38.md](qwen38.md#the-sidecar-on-several-drives)).
 
 ## Run with two or more copies
 

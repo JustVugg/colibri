@@ -11,6 +11,12 @@ on:
 permissions:
   contents: read
 
+# A new push to a pull request cancels that PR's older run. Pushes to dev and
+# main each get their own group (run_id), so they are never queued or cancelled.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   # The environment-variable registry (c/coli_env.h) against the sources. No
   # build, no model, no GPU -- seconds, so it reports before anything else.
@@ -97,7 +103,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: C suite under ASan + UBSan
-        run: make -C c test-asan
+        run: make -C c -j"$(nproc)" test-asan
       - name: rANS fuzz round-trip (ASan + UBSan)
         # Already sanitized and already asserting byte identity across every
         # compiled decode arm; it just had no job to run in.
@@ -686,7 +692,7 @@ jobs:
         run: |
           cd c
           rc=0
-          for t in colibri inkling kimi_k3; do
+          for t in colibri inkling kimi_k3 qwen36; do
             echo "::group::$t METAL=1"
             make clean >/dev/null 2>&1 || true
             make $t METAL=1 || { echo "FAILED: $t METAL=1"; rc=1; }
@@ -709,6 +715,27 @@ jobs:
         run: |
           cd c
           make metal-test
+      - if: matrix.os == 'macos-latest'
+        name: qwen36 Metal kernels
+        # The kernels of the qwen36 Metal engine against a double-precision
+        # reference (tests/test_qwen36_kernels.c), not part of `make check`
+        # either. On the runner's Apple Paravirtual device it only compiles
+        # them and prints SKIPPED, as metal-test does.
+        timeout-minutes: 10
+        run: |
+          cd c
+          make test-qwen36-kernels
+      - if: matrix.os == 'macos-latest'
+        name: qwen36 Metal graph
+        # The graph against the CPU engine on a model the test writes
+        # (tests/test_qwen36_graph.py), not part of `make check` either. On the
+        # runner's Apple Paravirtual device the graph steps aside at start: the
+        # test checks that the CPU engine takes over with its line, and skips
+        # the comparisons.
+        timeout-minutes: 10
+        run: |
+          cd c
+          make test-qwen36-graph METAL=1 PYTHON=python3
 
       # macOS is the newest COLI_V4_SUPPORTED platform and the only one whose
       # engine coverage lives solely in this job (Linux has the v4-tiny job in
@@ -1539,8 +1566,10 @@ jobs:
         run: make -C c qwen38-tiny-check
       - name: Routed experts as the release ships them (FP8 shards), then the engine on the fake CUDA tier
         run: make -C c qwen38-tiny-fp8-check qwen38-tier-engine-check qwen38-dn-gpu-check qwen38-cuda-chain-check
-      - name: Routed experts as int4-g64 from the converter's sidecar
-        run: make -C c qwen38-tiny-int4-check
+      - name: Routed experts as int4-g64 from the converter's sidecar, then read from mirror copies
+        run: make -C c qwen38-tiny-int4-check qwen38-tiny-mirror-check
+      - name: Routed experts as AMD Quark's MXFP4 from the converter's sidecar
+        run: make -C c qwen38-tiny-mxfp4-check
       - name: MTP speculative decoding against plain decoding (lossless gate)
         run: make -C c qwen38-tiny-mtp-check
       - name: Repeat the eviction path under ASan and UBSan
@@ -1829,6 +1858,19 @@ jobs:
           for cap in 1 8; do
             SNAP=tiny_vis ./inkling "$cap" 0 tiny_vis/ref_inkling2.json
           done
+      - name: Inkling-2's drafter (INK2_MTP) keeps the oracle's tokens
+        run: |
+          cd c
+          # A random drafter beside the tiny model: its drafts are noise, so the verify rejects
+          # them and the state rolls back every step; then the oracle's own tokens as drafts, one
+          # changed on most steps (INK2_MTP_ORACLE), so that it keeps all, some or none of a block.
+          # Either way the tokens are the oracle's.
+          python3 tools/make_tiny_inkling2.py --mtp tiny_inkling2
+          for k in 1 3; do
+            INK2_MTP=1 INK2_MTP_K=$k SNAP=tiny_inkling2 ./inkling 8 0 tiny_inkling2/ref_inkling2.json
+            INK2_MTP=1 INK2_MTP_K=$k INK2_MTP_ORACLE=1 SNAP=tiny_inkling2 ./inkling 8 0 tiny_inkling2/ref_inkling2.json
+          done
+          INK2_MTP=1 INK2_MTP_ORACLE=1 SNAP=tiny_inkling2 ./inkling 1 0 tiny_inkling2/ref_inkling2.json
       - name: An Inkling-2 GGUF as unsloth's lay it out reads as the checkpoint it came from
         run: |
           cd c
@@ -1880,6 +1922,11 @@ jobs:
           /tmp/tt16
           gcc -O3 -march=x86-64-v3 -fopenmp -I. tests/test_tile16.c -o /tmp/tt16v3 -lm
           /tmp/tt16v3
+          # Q2_K's fused row kernel against the unpack + gq_dot_i8 path: the same two ISAs
+          gcc -O3 -march=native -fopenmp -I. tests/test_gq_q2_k.c -o /tmp/tq2k -lm
+          /tmp/tq2k
+          gcc -O3 -march=x86-64-v3 -fopenmp -I. tests/test_gq_q2_k.c -o /tmp/tq2kv3 -lm
+          /tmp/tq2kv3
       - name: Generate the glm_tiny fixture
         run: cd c && python3 tools/make_glm_oracle.py
       - name: Oracle (30–32/32 teacher forcing + exact greedy)
@@ -2214,15 +2261,19 @@ jobs:
           make qwen36.exe CUDA_DLL=1
           test -f qwen36.exe || { echo "qwen36 CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
           echo "qwen36.exe built against the DLL loader"
-          # kimi_k3 and glm53 link the same loader: four engines share coli_cuda.dll.
-          # deepseek_v4 has its own DLL (coli_cuda_dsv4.dll, Makefile.deepseek-v4)
-          # and joins in a later step; inkling's CUDA object has no Windows loader.
+          # kimi_k3, glm53 and qwen38 link the same loader: five engines share
+          # coli_cuda.dll. deepseek_v4 has its own DLL (coli_cuda_dsv4.dll,
+          # Makefile.deepseek-v4) and joins in a later step; inkling's CUDA object
+          # has no Windows loader.
           make kimi_k3.exe CUDA_DLL=1
           test -f kimi_k3.exe || { echo "kimi_k3 CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
           echo "kimi_k3.exe built against the DLL loader"
           make glm53.exe CUDA_DLL=1
           test -f glm53.exe || { echo "glm53 CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
           echo "glm53.exe built against the DLL loader"
+          make qwen38.exe CUDA_DLL=1
+          test -f qwen38.exe || { echo "qwen38 CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
+          echo "qwen38.exe built against the DLL loader"
       - name: make cuda-dsv4-dll and cuda-dsv4-dg-dll (DeepSeek V4, as the release ships them)
         shell: msys2 {0}
         run: |
@@ -2268,6 +2319,7 @@ jobs:
             c/qwen36.exe
             c/kimi_k3.exe
             c/glm53.exe
+            c/qwen38.exe
 
   web:
     name: Web UI
@@ -2303,7 +2355,7 @@ jobs:
       # rieseguiva un binario non strumentato. Uno di quei test era rosso da
       # settimane senza che nessuno potesse vederlo.
       - name: Build the engines those tests exercise
-        run: make -C c kimi_k3 inkling colibri olmoe qwen38 qwen36 deepseek_v41 qwenimage glm53 mimo
+        run: make -C c -j"$(nproc)" kimi_k3 inkling colibri olmoe qwen38 qwen36 deepseek_v41 qwenimage glm53 mimo
       - name: Python test suite
         run: cd c && python3 -m unittest discover -s tests -p 'test_*.py'
 

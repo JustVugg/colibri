@@ -721,6 +721,9 @@ endif
 # runtime, so no Xcode / offline metal compiler is required. Default build unchanged.
 METAL     ?= 0
 METAL_OBJ  =
+QWEN36_METAL_OBJ =
+QWEN36_GRAPH_CFLAGS =
+QWEN36_GRAPH_LDFLAGS =
 METALXX    = clang++ -x objective-c++ -std=gnu++17 -fobjc-arc -O3
 ifeq ($(METAL),1)
 ifeq (,$(DARWIN))
@@ -729,6 +732,9 @@ endif
 CFLAGS   += -DCOLI_METAL
 LDFLAGS  += -framework Metal -framework Foundation -lc++
 METAL_OBJ = backend_metal.o
+QWEN36_METAL_OBJ = qwen36_metal.o
+QWEN36_GRAPH_CFLAGS = -DQWEN36_METAL
+QWEN36_GRAPH_LDFLAGS = -framework Accelerate
 endif
 
 # VK=1 adds an opt-in Vulkan compute backend (any Vulkan 1.2 driver, e.g. Mesa/RADV)
@@ -1246,6 +1252,31 @@ metal-test: tests/test_backend_metal.mm backend_metal.mm backend_metal.h affine_
 	$(METALXX) tests/test_backend_metal.mm backend_metal.mm -framework Metal -framework Foundation -o backend_metal_test
 	./backend_metal_test
 
+# Qwen3.6 Metal layer: the kernels live in metal/qwen36.metal and are built
+# into qwen36_metal.o (#embed), so the executable needs no files at run time.
+QWEN36_METALC = clang -x objective-c -std=gnu2x -fobjc-arc -O2 -Wall -Wextra -Wno-unused-parameter
+qwen36_metal.o: qwen36_metal.m qwen36_gpu.h metal/qwen36.metal ggml_grids.h shaders/blockdec_table.h
+	$(QWEN36_METALC) -c qwen36_metal.m -o $@
+
+# Every Qwen3.6 kernel against a double-precision reference. No model needed.
+tests/test_qwen36_kernels: tests/test_qwen36_kernels.c qwen36_gpu.h qwen36_cpu_mm.h ggml_quants.h ggml_grids.h \
+                           matmul_f32.h qwen36_metal.o
+	$(CC) -O2 -Wall -Wextra -Wno-unused-function -std=c11 $< qwen36_metal.o -framework Metal -framework Foundation -framework Accelerate -lm -o $@
+
+.PHONY: test-qwen36-kernels
+test-qwen36-kernels: tests/test_qwen36_kernels
+	./tests/test_qwen36_kernels
+
+# The Metal graph against the CPU engine on a fixture the test writes (no
+# model needed). Needs a METAL=1 build of qwen36; where the graph cannot run
+# (the Apple Paravirtual device) it checks that the CPU engine takes over.
+# qwen36-canonical writes the fixture's experts.qc.
+.PHONY: test-qwen36-graph
+test-qwen36-graph: qwen36$(EXE) qwen36-canonical$(EXE)
+	$(if $(filter 1,$(METAL)),,$(error test-qwen36-graph needs METAL=1))
+	QWEN36_GRAPH_ENGINE=./qwen36$(EXE) QWEN36_CANONICAL_TOOL=./qwen36-canonical$(EXE) \
+		$(PYTHON) -m unittest -v tests.test_qwen36_graph
+
 # GLM-5.3 Metal correctness oracles. These exercise the clamped SwiGLU
 
 # primitive and the complete routed gate/up/SwiGLU/down/scatter MoE block
@@ -1626,8 +1657,11 @@ qpack.o: qpack.c .build-config
 	$(CC) $(QWEN36_CFLAGS) -c qpack.c -o $@
 # Rebuild when CUDA_DLL changes; otherwise an existing CPU-only executable can
 # be reported as up to date despite selecting the Windows CUDA DLL tier.
-qwen36$(EXE): qwen36.c $(QWEN36_TIER_OBJ) $(QWEN36_QPACK_OBJ) $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
-	$(CC) $(QWEN36_CFLAGS) qwen36.c $(QWEN36_TIER_OBJ) $(QWEN36_QPACK_OBJ) $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
+# METAL=1 also builds the Qwen3.6 Metal graph (QWEN36_GRAPH_CFLAGS, qwen36_metal.o,
+# Accelerate for the CPU's share of a prompt): the forward pass on the GPU,
+# docs/qwen36-metal.md. Tests that include qwen36.c keep the CPU engine.
+qwen36$(EXE): qwen36.c $(QWEN36_TIER_OBJ) $(QWEN36_QPACK_OBJ) $(CUDA_OBJ) $(METAL_OBJ) $(QWEN36_METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(QWEN36_CFLAGS) $(QWEN36_GRAPH_CFLAGS) qwen36.c $(QWEN36_TIER_OBJ) $(QWEN36_QPACK_OBJ) $(CUDA_OBJ) $(METAL_OBJ) $(QWEN36_METAL_OBJ) $(VK_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS) $(QWEN36_GRAPH_LDFLAGS)
 
 # Qwen-Image-2.1 text-to-image (docs/qwen-image.md). It reads the diffusers
 # checkpoint as it is: no conversion step. qi_gemm.h is its one matrix kernel.
@@ -1885,6 +1919,65 @@ qwen38-tiny-int4-check: qwen38-tiny-int4-generate qwen38-tiny-fp8-generate qwen3
 	echo "qwen38 int4-g64 experts: ref_int4.json reproduced in $$n configurations, last logits identical across paths; FP8 control ok"
 	./tests/test_qwen38_tier_engine$(EXE) ./qwen38_tiny_int4
 
+# The routed experts as AMD's Quark checkpoint ships them in MXFP4 (e2m1 nibbles, one E8M0
+# exponent per 32 inputs): --mxfp4-experts rounds the fixture's experts (scaled by 3, as the
+# int4 fixture's) to MXFP4, writes them under quark/ with Quark's tensor names and as FP8
+# shards that hold the same values exactly (e2m1 times a power of two is exact in e4m3 under a
+# power-of-two block scale), and tools/convert_qwen38_experts_mxfp4.py copies quark/ into the
+# experts-mxfp4/ sidecar. ref.json, in float32, is the reference of those values, so the FP8
+# shards and the sidecar answer to the same oracle. The test then checks every record against
+# the Quark bytes and every expert against the FP8 shards' values, to the bit.
+.PHONY: qwen38-tiny-mxfp4-generate
+qwen38-tiny-mxfp4-generate:
+	$(PYTHON) tools/make_qwen38_tiny.py --out ./qwen38_tiny_mxfp4 --mxfp4-experts --expert-gain 3
+	$(PYTHON) tests/test_qwen38_mxfp4_convert.py --model ./qwen38_tiny_mxfp4 --exact
+
+# The engine on that sidecar (Q38_EXPERT_LOWBIT=mxfp4, quant.h matmul_mxfp4). Gates:
+#  (a) the MXFP4 matmul equals a dequantized reference, every expert the single and the
+#      batch path load holds the sidecar's bytes, and every value is the FP8 shards' to the
+#      bit (tests/test_qwen38_mxfp4_experts);
+#  (b) ref.json reproduced through the single, batched, prefill-batch and mapped paths at
+#      caps 1, 2 and 4, the last logits identical to the bit across them; the FP8 experts
+#      of the same fixture reproduce it too, so both runs give the same tokens;
+#  (c) the two runs' last logits within cosine 0.99999, the refusals (another geometry, an
+#      incomplete conversion, a record not of the layout, no sidecar, an unknown
+#      Q38_EXPERT_LOWBIT) and the CUDA tier declining MXFP4 (tests/qwen38_mxfp4_engine_check.py);
+#  (d) the sidecar read from COLI_MODEL_MIRROR copies, as the int4 one (tests/qwen38_mirror_check.py).
+.PHONY: qwen38-tiny-mxfp4-check
+qwen38-tiny-mxfp4-check: qwen38-tiny-mxfp4-generate qwen38$(EXE) tests/test_qwen38_mxfp4_experts$(EXE)
+	OMP_NUM_THREADS=2 ./tests/test_qwen38_mxfp4_experts$(EXE) ./qwen38_tiny_mxfp4
+	@d=./qwen38_tiny_mxfp4/logits; rm -rf $$d; mkdir -p $$d; n=0; \
+	for trunk in 1024 0; do for cap in 1 2 4; do for mode in single batched prefill prefill-serial mapped; do \
+		case $$mode in \
+			single) e="Q38_PREFILL_BATCH=0 Q38_EXPERT_PARALLEL_READS=0";; \
+			batched) e="Q38_PREFILL_BATCH=0";; \
+			prefill) e="Q38_PREFILL_BATCH=1";; \
+			prefill-serial) e="Q38_PREFILL_BATCH=1 Q38_EXPERT_PARALLEL_READS=0";; \
+			mapped) e="COLI_MAP_EXPERTS=1";; \
+		esac; \
+		env $$e Q38_EXPERT_LOWBIT=mxfp4 Q38_TRUNK_MIN_KB=$$trunk DUMP=$$d/t$$trunk-c$$cap-$$mode.f32 OMP_NUM_THREADS=2 \
+			SNAP=./qwen38_tiny_mxfp4 ./qwen38$(EXE) $$cap 8 ./qwen38_tiny_mxfp4/ref.json > $$d/run.log 2>&1 \
+			|| { cat $$d/run.log; echo "FAIL mxfp4 experts, trunk=$$trunk cap=$$cap $$mode"; exit 1; }; \
+		grep -q 'routed experts: experts-mxfp4' $$d/run.log || { cat $$d/run.log; echo "FAIL the sidecar was not used"; exit 1; }; \
+		n=$$((n+1)); \
+	done; done; \
+	for f in $$d/t$$trunk-*.f32; do cmp -s $$f $$d/t$$trunk-c1-single.f32 \
+		|| { echo "FAIL $$f: last logits differ from the single path"; exit 1; }; done; done; \
+	Q38_EXPERT_INT4=0 DUMP=$$d/fp8.f32 OMP_NUM_THREADS=2 SNAP=./qwen38_tiny_mxfp4 \
+		./qwen38$(EXE) 2 8 ./qwen38_tiny_mxfp4/ref.json > $$d/run.log 2>&1 \
+		|| { cat $$d/run.log; echo "FAIL FP8 experts of the mxfp4 fixture"; exit 1; }; \
+	echo "qwen38 mxfp4 experts: ref.json reproduced in $$n configurations, last logits identical across paths; FP8 control ok"
+	$(PYTHON) tests/qwen38_mxfp4_engine_check.py --model ./qwen38_tiny_mxfp4 --engine ./qwen38$(EXE) \
+		--mxfp4 ./qwen38_tiny_mxfp4/logits/t1024-c2-batched.f32 --fp8 ./qwen38_tiny_mxfp4/logits/fp8.f32
+	$(PYTHON) tests/qwen38_mirror_check.py --model ./qwen38_tiny_mxfp4 --engine ./qwen38$(EXE) --lowbit mxfp4 --ref ref.json
+
+# The int4 fixture's sidecar read from COLI_MODEL_MIRROR copies in temporary directories: the
+# tokens and last logits of the run without a mirror, every replica serving records, a differing
+# file left on the primary, bad COLI_DISK_WEIGHTS refused (tests/qwen38_mirror_check.py).
+.PHONY: qwen38-tiny-mirror-check
+qwen38-tiny-mirror-check: qwen38-tiny-int4-generate qwen38$(EXE)
+	$(PYTHON) tests/qwen38_mirror_check.py --model ./qwen38_tiny_int4 --engine ./qwen38$(EXE)
+
 # Speculative decoding with the checkpoint's MTP head (Q38_MTP=1; qwen38_core.h,
 # "the MTP head"). The fixtures are the three above plus an MTP head (--mtp:
 # random head weights from their own seed under the release's mtp.* names; the
@@ -1993,6 +2086,10 @@ tests/test_qwen36_ctx$(EXE): tests/test_qwen36_ctx.c qwen36.c $(QWEN36_TIER_OBJ)
 	$(CC) $(CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_qwen36_prefill_control$(EXE): tests/test_qwen36_prefill_control.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# qwen36's serve request framing, frozen on synthetic frames (no model)
+tests/test_qwen36_serve_framing$(EXE): tests/test_qwen36_serve_framing.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_qwen36_weight_alloc$(EXE): tests/test_qwen36_weight_alloc.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
@@ -2280,6 +2377,12 @@ tests/test_dsv41_untrusted_load$(EXE): tests/test_dsv41_untrusted_load.c deepsee
 tests/test_dsv41_scratch_pool$(EXE): tests/test_dsv41_scratch_pool.c deepseek_v41.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
+tests/test_dsv41_candidate_ids$(EXE): tests/test_dsv41_candidate_ids.c deepseek_v41.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_dsv41_engram_stage$(EXE): tests/test_dsv41_engram_stage.c deepseek_v41.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
 tests/test_qwen38_idot$(EXE): tests/test_qwen38_idot.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
@@ -2294,6 +2397,11 @@ tests/test_qwen38_draft_head$(EXE): tests/test_qwen38_draft_head.c qwen38.c $(VK
 # The int4-g64 expert matmul with no model (part of test-c); given a converted
 # snapshot on argv it checks the sidecar's loaders too (qwen38-tiny-int4-check).
 tests/test_qwen38_int4_experts$(EXE): tests/test_qwen38_int4_experts.c qwen38.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+# The MXFP4 expert matmul with no model (part of test-c); given a converted snapshot on
+# argv it checks the experts-mxfp4/ sidecar's loaders too (qwen38-tiny-mxfp4-check).
+tests/test_qwen38_mxfp4_experts$(EXE): tests/test_qwen38_mxfp4_experts.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_qwen38_igpu_defaults$(EXE): tests/test_qwen38_igpu_defaults.c qwen38.c $(VK_OBJ)
@@ -2453,6 +2561,9 @@ tests/test_gq_r16$(EXE): tests/test_gq_r16.c
 # The grid types' dot product with the signs on the activation against the one it replaced
 tests/test_gq_signs$(EXE): tests/test_gq_signs.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+# Q2_K's fused row kernel against the unpack + gq_dot_i8 path it replaced, to the bit
+tests/test_gq_q2_k$(EXE): tests/test_gq_q2_k.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 # A matrix's file rows eight at a time (gq_rows_f8) against their scalar reference and the R16
 # forms' kernels, to the bit; a no-op on a build without AVX2. `tests/test_rows_f8 bench` times them.
 tests/test_rows_f8$(EXE): tests/test_rows_f8.c
@@ -2594,6 +2705,8 @@ tests/test_qwen36_dense_file$(EXE): tests/test_qwen36_dense_file.c tools/qwen36_
 # canonical.qc: the INT8 dense weights of a Qwen3.6 model converted once; the
 # engine reads the file beside the model instead of converting them at every start.
 #   ./qwen36-canonical <model-dir>
+# experts.qc: the routed experts in the Metal graph's slot layout, written once.
+#   ./qwen36-canonical --experts <model-dir> [<output>]
 # The name has a dash, so the automatic dependencies below do not cover it: its
 # own .d (written by -MMD) is included here.
 qwen36-canonical$(EXE): tools/qwen36_canonical.c qwen36.c qwen36_dense_file.h $(VK_OBJ)
@@ -3369,6 +3482,42 @@ tests/test_qwen36_trunk_dense$(EXE): tests/test_qwen36_trunk_dense.c qwen36.c qw
 # #1391: il decode path deve offrire gli esperti int8 al tier, non solo il warmstart
 tests/test_qwen36_tier_int8_decode$(EXE): tests/test_qwen36_tier_int8_decode.c qwen36.c qwen36_tier.c $(VK_OBJ)
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# The expert cache of the qwen36 Metal engine and its loaders, without a model:
+# eviction policies, leases, cancellation, the selected-expert loader thread,
+# the prompt layer's reader threads and the read-ahead advice schedule.
+tests/test_qwen36_cache_policy$(EXE): tests/test_qwen36_cache_policy.c
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_qwen36_global_cache$(EXE): tests/test_qwen36_global_cache.c
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_qwen36_selected_loader$(EXE): tests/test_qwen36_selected_loader.c
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_qwen36_layer_loader$(EXE): tests/test_qwen36_layer_loader.c
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_qwen36_advice_schedule$(EXE): tests/test_qwen36_advice_schedule.c
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
+# The Metal graph's fast experts without a model: which choices of a token stay.
+tests/test_qwen36_fast_experts$(EXE): tests/test_qwen36_fast_experts.c
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
+# The slots of QWEN36_PREFETCH's copies without a model: which entry a copy
+# takes, a copy lent before its load, and a load that takes a copy, or waits
+# for one still reading.
+tests/test_qwen36_prefetch_ring$(EXE): tests/test_qwen36_prefetch_ring.c
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
+# experts.qc without a model: the record format and its checked reads, and the
+# writer (qwen36-canonical --experts) against the checkpoint it repacks.
+tests/test_qwen36_expert_file$(EXE): tests/test_qwen36_expert_file.c
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_qwen36_expert_convert$(EXE): tests/test_qwen36_expert_convert.c
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
 # The qwen38 engine through its own main() on the fake backend: tier start
 # from the FP8 fixture, reduced CPU list, qt_note on recycled slots, oracle

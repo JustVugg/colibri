@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import { streamChat, type ChatMessage } from "./api"
-import { appendDelta, continuable, continuation, setFinish } from "./transcript"
+import { appendDelta, continuable, continuation, setFinish, uncachedPromptTokens } from "./transcript"
 
 afterEach(() => vi.unstubAllGlobals())
 
@@ -67,5 +67,62 @@ describe("continuing a trailing assistant turn", () => {
     const marked = setFinish(transcript, "a1", "stop")
     expect(marked[1].finish).toBe("stop")
     expect(marked[0].finish).toBeUndefined()
+  })
+})
+
+describe("uncachedPromptTokens", () => {
+  it("returns full prompt_tokens on the first turn without prior assistant usage", () => {
+    const history: ChatMessage[] = [{ id: "u1", role: "user", content: "hi" }]
+    expect(uncachedPromptTokens(history, { prompt_tokens: 120, completion_tokens: 30, total_tokens: 150 })).toBe(120)
+  })
+
+  it("subtracts previous prompt + completion tokens on follow-up turns", () => {
+    const history: ChatMessage[] = [
+      { id: "u1", role: "user", content: "hi" },
+      { id: "a1", role: "assistant", content: "hello", usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 } },
+      { id: "u2", role: "user", content: "follow up" },
+    ]
+    expect(uncachedPromptTokens(history, { prompt_tokens: 175, completion_tokens: 20, total_tokens: 195 })).toBe(25)
+  })
+
+  it("falls back to subtracting previous prompt_tokens when past reasoning was stripped", () => {
+    const history: ChatMessage[] = [
+      { id: "u1", role: "user", content: "hi" },
+      { id: "a1", role: "assistant", content: "ok", reasoning: "long thought", usage: { prompt_tokens: 100, completion_tokens: 80, total_tokens: 180 } },
+      { id: "u2", role: "user", content: "follow up" },
+    ]
+    expect(uncachedPromptTokens(history, { prompt_tokens: 130, completion_tokens: 10, total_tokens: 140 })).toBe(30)
+  })
+
+  it("prefers server-reported prompt_tokens_details.cached_tokens", () => {
+    const history: ChatMessage[] = [
+      { id: "u1", role: "user", content: "hi" },
+      { id: "a1", role: "assistant", content: "hello", usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 } },
+      { id: "u2", role: "user", content: "follow up" },
+    ]
+    expect(uncachedPromptTokens(history, {
+      prompt_tokens: 175,
+      completion_tokens: 20,
+      total_tokens: 195,
+      prompt_tokens_details: { cached_tokens: 160 },
+    })).toBe(15)
+  })
+
+  it("returns full prompt_tokens when the turn compacted the history", () => {
+    const history: ChatMessage[] = [
+      { id: "u1", role: "user", content: "hi" },
+      { id: "a1", role: "assistant", content: "hello", usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 } },
+      { id: "u2", role: "user", content: "follow up" },
+    ]
+    expect(uncachedPromptTokens(history, { prompt_tokens: 175, completion_tokens: 20, total_tokens: 195 }, true)).toBe(175)
+  })
+
+  it("subtracts cached prefix up to prevTotal on continuation turns", () => {
+    const history: ChatMessage[] = [
+      { id: "u1", role: "user", content: "hi" },
+      { id: "a1", role: "assistant", content: "partial", finish: "length", usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 } },
+    ]
+    expect(uncachedPromptTokens(history, { prompt_tokens: 148, completion_tokens: 20, total_tokens: 168 })).toBe(0)
+    expect(uncachedPromptTokens(history, { prompt_tokens: 165, completion_tokens: 20, total_tokens: 185 })).toBe(15)
   })
 })
