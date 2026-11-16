@@ -2232,7 +2232,7 @@ static void matmul_h(float *y, const float *x, const uint16_t *W, int S, int I, 
 static long long g_q36_codes;    /* q36_codes_now: a dense IQ1/IQ2/IQ3 matrix's larger form at its first product here */
 static int g_q36_cap_arg;              /* the cache size asked for (argv[1], 0 = automatic) */
 static long long g_q36_exp_codes;
-static double g_q36_exp_bytes;
+static double g_q36_exp_bytes __attribute__((unused));   /* read only where GQ_R16_ON (AVX2, AVX-512) */
 static void q36_codes_now(QW *w);
 static void matmul_d(float *y, const float *x, const QW *w, int S, int I, int O){
 #ifdef COLI_QWEN_BATCH_TEST
@@ -3133,7 +3133,7 @@ static int q36_gq_held(int type, int rows, int cols) {
  * Q36_IQ3S_CODES=0 (or Q36_ILV16=0) keeps the file's rows; never for experts (gguf_expert_held): the
  * RAM slots would hold fewer of them. */
 static long long g_q36_codes = -1;   /* -1 undecided, else bit t: type t's dense matrices take their larger form */
-static pthread_mutex_t g_q36_codes_mx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_q36_codes_mx __attribute__((unused)) = PTHREAD_MUTEX_INITIALIZER;   /* GQ_R16_ON only */
 static long long q36_codes_decide(void) {
 #ifdef GQ_R16_ON
     const char *e = getenv("Q36_IQ3S_CODES"), *i16 = getenv("Q36_ILV16");
