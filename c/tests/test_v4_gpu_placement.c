@@ -98,6 +98,8 @@ static int mirror_allocs, mirror_refills, mirror_alloc_ok = 1, mirror_refill_ok 
 static long long mirror_check_weights = -1;
 static const uint8_t *mirror_scales, *mirror_weights;
 static long long mirror_scale_bytes, mirror_weight_bytes, mirror_weight_offset[3];
+/* the sync of the last two-run refill, and whether the uploader thread made it */
+static int mirror_refill_sync = -1, mirror_refill_off_main;
 int dsv4_cuda_mirror_alloc(Dsv4CudaTensor **gate, Dsv4CudaTensor **up, Dsv4CudaTensor **down,
                            int Og, int Ig, int Od, int Id, int device) {
     assert(Og > 0 && Ig > 0 && Od > 0 && Id > 0);
@@ -116,9 +118,10 @@ int dsv4_cuda_mirror_refill(Dsv4CudaTensor *gate, Dsv4CudaTensor *up, Dsv4CudaTe
                             const uint8_t *scales, long long S, const long long *soff,
                             const uint8_t *weights, long long Wb, const long long *woff,
                             int sync) {
-    (void)sync;
     assert(gate && up && down && scales && weights && soff && woff);
     if (!mirror_refill_ok) return 0;
+    mirror_refill_sync = sync;
+    mirror_refill_off_main = !pthread_equal(pthread_self(), main_thread);
     mirror_scales = scales; mirror_weights = weights;
     mirror_scale_bytes = S; mirror_weight_bytes = Wb;
     for (int k = 0; k < 3; k++) mirror_weight_offset[k] = woff[k];
@@ -737,6 +740,60 @@ static void test_upload_thread(void) {
     assert(live_tensors == tensors);
 }
 
+/* The uploader thread with two-run mirrors (V4_MIRROR_BLOCK): the refill's two
+ * copies go where the three-tensor refill's do. A full cache of 8 block
+ * mirrors on device 2, so every attach recycles one in place. */
+static void test_upload_thread_block(void) {
+    V4GpuExpertMirrorCache *cache = v4_gpu_expert_mirrors_create_capacity(2, 8);
+    cache->first_layer = 0; cache->end_layer = 4;
+    ColiExpertStore store = {0};
+    store.gpu = cache;
+    main_thread = pthread_self();
+    int tensors = live_tensors;
+    setenv("V4_MIRROR_BLOCK", "1", 1);
+    setenv("V4_UPLOAD_THREAD", "1", 1);
+    unsetenv("V4_UPLOAD_FENCE");
+    unsetenv("V4_MIRROR_BLOCK_VERIFY");
+    ColiExpertView view;
+    for (int expert = 0; expert < 8; expert++) {
+        view = block_view(expert, 0);
+        assert(coli_v4_gpu_expert_attach(&store, &view) == 0);
+    }
+    assert(cache->count == 8);
+    /* handed to the uploader: enqueued on the second stream, fenced at the join */
+    memset(fences, 0, sizeof(fences));
+    view = block_view(20, 0);
+    assert(coli_v4_gpu_expert_attach_queued(&store, &view) == 0);
+    coli_v4_gpu_expert_upload_join();
+    assert(view.gate.gpu && mirror_refill_sync == 3 && mirror_refill_off_main && fences[2] == 1);
+    coli_v4_gpu_expert_upload_settle();
+    /* V4_UPLOAD_FENCE=0: the uploader drains the second stream */
+    setenv("V4_UPLOAD_FENCE", "0", 1);
+    view = block_view(21, 0);
+    assert(coli_v4_gpu_expert_attach_queued(&store, &view) == 0);
+    coli_v4_gpu_expert_upload_join();
+    coli_v4_gpu_expert_upload_settle();
+    assert(view.gate.gpu && mirror_refill_sync == 2 && mirror_refill_off_main);
+    unsetenv("V4_UPLOAD_FENCE");
+    /* the verifier reads the mirror back, so an enqueued copy is drained first */
+    setenv("V4_MIRROR_BLOCK_VERIFY", "1", 1);
+    unsigned long long verified = cache->block_verified;
+    view = block_view(22, 0);
+    assert(coli_v4_gpu_expert_attach_queued(&store, &view) == 0);
+    coli_v4_gpu_expert_upload_join();
+    coli_v4_gpu_expert_upload_settle();
+    assert(mirror_refill_sync == 2 && cache->block_verified == verified + 1);
+    unsetenv("V4_MIRROR_BLOCK_VERIFY");
+    /* the inline attach is unchanged: the compute stream, drained, this thread */
+    view = block_view(23, 0);
+    assert(coli_v4_gpu_expert_attach(&store, &view) == 0);
+    assert(mirror_refill_sync == 1 && !mirror_refill_off_main);
+    unsetenv("V4_UPLOAD_THREAD");
+    unsetenv("V4_MIRROR_BLOCK");
+    v4_gpu_expert_mirrors_free(cache);
+    assert(live_tensors == tensors);
+}
+
 /* V4_BANK_MAKE_ROOM: the reserve is the headroom, and a bank about to be
  * created releases the oldest mirrors on its device until it fits. */
 static V4GpuExpertMirrorCache *room_cache(int device, int mirrors, uint64_t first_clock) {
@@ -890,6 +947,7 @@ int main(void) {
     test_preload();
     test_mirror_block();
     test_upload_thread();
+    test_upload_thread_block();
     test_resident_route();
     test_bank_make_room();
     test_wo_decode();
