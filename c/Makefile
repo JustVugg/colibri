@@ -581,6 +581,8 @@ TEST_EXCLUDE += test_cu_tier
 TEST_EXCLUDE += test_qwen36_tier_stream_engine
 # links the DeepSeek V4 objects: a gate only where the V4 engine builds (below)
 TEST_EXCLUDE += test_v4_wex4
+# nvcc and an NVIDIA GPU: run by `make wex-cuda-test`, not by test-c
+TEST_EXCLUDE += test_wex_nr3_gpu
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
@@ -1241,6 +1243,35 @@ cuda-dsv4-dg-dll: backend_cuda_dsv4.cu backend_cuda_dsv4.h backend_cuda_dsv4_qua
 		-Xlinker /DEF:dsv4.def \
 		-L"$(CUDA_HOME)/lib/x64" $(DSV4_DLL_LIBS) \
 		backend_cuda_dsv4.cu -o coli_cuda_dsv4_dg.dll
+
+# The CUDA helper for WEX records (docs/wex.md): WNR3 (and WNR1/WNR2) records
+# decoded on an NVIDIA GPU, into a host slab or straight into device buffers.
+# Optional and never linked: an engine opens it at run time. One source file,
+# tools/wex_cuda_bridge.cu, over the kernels in wex_cuda.cuh; it needs only the
+# CUDA runtime. Windows: run from a vcvars64 shell, like cuda-dll (nvcc's host
+# compiler is cl.exe). CUDA_ARCH picks the target as for the other CUDA builds
+# (native by default; CUDA_ARCH=portable for a release build).
+#   make wex-cuda-helper     ->  kaira_wex_cuda.dll (Windows) / kaira_wex_cuda.so
+#   make wex-cuda-test       ->  the helper and tests/test_wex_nr3_gpu, run on synthetic records
+ifneq ($(IS_WIN),)
+WEX_CUDA_HELPER = kaira_wex_cuda.dll
+WEX_CUDA_SHARED = -shared
+else
+WEX_CUDA_HELPER = kaira_wex_cuda.so
+WEX_CUDA_SHARED = -shared -Xcompiler=-fPIC,-fvisibility=hidden
+endif
+WEX_CUDA_FLAGS = $(NVCCFLAGS)
+WEX_CUDA_DEPS = tools/wex_cuda_bridge.cu wex_cuda.cuh wex_format.h wex_neural_rans.h wex_palette.h
+.PHONY: wex-cuda-helper wex-cuda-test
+wex-cuda-helper: $(WEX_CUDA_HELPER)
+$(WEX_CUDA_HELPER): $(WEX_CUDA_DEPS)
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	"$(NVCC)" $(WEX_CUDA_FLAGS) $(WEX_CUDA_SHARED) tools/wex_cuda_bridge.cu -o $@
+tests/test_wex_nr3_gpu$(EXE): tests/test_wex_nr3_gpu.cu wex_format.h wex_neural_rans.h wex_palette.h
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	"$(NVCC)" $(WEX_CUDA_FLAGS) tests/test_wex_nr3_gpu.cu -o $@ $(if $(IS_WIN),,-ldl)
+wex-cuda-test: $(WEX_CUDA_HELPER) tests/test_wex_nr3_gpu$(EXE)
+	./tests/test_wex_nr3_gpu$(EXE) ./$(WEX_CUDA_HELPER) 0
 
 # Windows: the decode-path kernels validated through the runtime DLL loader.
 # deepseek-v4.exe is MinGW gcc; backend_loader_dsv4.c resolves the MSVC/nvcc
