@@ -7,6 +7,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### New
 
+- **A WEX4 container on several drives** (`COLI_MODEL_MIRROR`, `COLI_DISK_WEIGHTS`, qwen38 and
+  deepseek_v41): a byte copy of the container in a mirror directory, same file name, size and
+  header page, becomes a read replica; each expert's record comes from the drive a hash of its
+  (layer, expert) picks. The copy needs no shards beside it. Unset, nothing changes.
+  `tests/test_dsv41_wex4.c` and `tests/test_qwen38_wex4.c` cover it ([docs/wex.md](docs/wex.md)).
 - **WNR3 records decoded on the GPU** (`COLI_WEX_CUDA_LIB`): `wex_decode.c` opens the CUDA helper
   that `COLI_WEX_CUDA_LIB` names (and only then) the first time a WNR3 container is read, and `coli_wex_decode_record` hands it each record, decoding on the CPU when
   it does not; the same bytes either way. Unset or `0`: the CPU. Windows and Linux.

@@ -1605,13 +1605,20 @@ static double mirror_probe_bw(shards *S, int rep) {
 
 /* Register the replicas and derive the split. Runs after the shard index is
  * open and before the first expert read, so nothing is already cached from the
- * primary by the time the split exists. */
-static void mirror_setup(shards *S, const char *model_dir, int experts_per_layer) {
+ * primary by the time the split exists.
+ *
+ * W, when not NULL, is a WEX4 container's file set (COLI_WEX_PATH): a mirror dir
+ * may hold a byte copy of it under the same file name, with or without copies of
+ * the shards. Each dir that holds either becomes one replica of both sets
+ * (st_mirror_add_slot), so expert_route's replica numbers mean the same drive for
+ * a shard tensor and for a container record. */
+static void mirror_setup(shards *S, shards *W, const char *model_dir, int experts_per_layer) {
     if (experts_per_layer > 0) g_mir_epl = experts_per_layer;
     const char *dirs = getenv("COLI_MODEL_MIRROR");
     if (!dirs || !*dirs) dirs = getenv("SNAP_MIRROR");
     if (!dirs || !*dirs) return;
     st_mirror_reset(S);
+    if (W) st_mirror_reset(W);
     int nrep = 1;
     char buf[4096];
     snprintf(buf, sizeof(buf), "%s", dirs);
@@ -1628,7 +1635,7 @@ static void mirror_setup(shards *S, const char *model_dir, int experts_per_layer
                 fprintf(stderr, "[MIRROR] %s equals the model dir — ignored\n", p);
             else if (nrep >= V41_MIR_REPS)
                 fprintf(stderr, "[MIRROR] %s: too many mirrors (max %d) — ignored\n", p, ST_MAX_MIR);
-            else {
+            else if (!W) {
                 int nf = st_mirror_add(S, p);
                 if (nf <= 0)
                     fprintf(stderr, "[MIRROR] %s: no usable shard (missing or divergent "
@@ -1636,6 +1643,17 @@ static void mirror_setup(shards *S, const char *model_dir, int experts_per_layer
                 else {
                     fprintf(stderr, "[MIRROR] %s: %d/%d shards (replica %d)\n",
                             p, nf, S->nfd, nrep);
+                    nrep++;
+                }
+            } else {
+                int nf = st_mirror_add_slot(S, p), nw = st_mirror_add_slot(W, p);
+                if (nf <= 0 && nw <= 0) {
+                    S->nrep--; W->nrep--;   /* neither set has a copy there: no replica */
+                    fprintf(stderr, "[MIRROR] %s: no usable shard and no copy of the WEX4 container "
+                                    "(missing or divergent) — skipped\n", p);
+                } else {
+                    fprintf(stderr, "[MIRROR] %s: %d/%d shards, %s (replica %d)\n", p, nf, S->nfd,
+                            nw > 0 ? "the WEX4 container" : "no copy of the WEX4 container", nrep);
                     nrep++;
                 }
             }
@@ -1669,7 +1687,9 @@ static void mirror_setup(shards *S, const char *model_dir, int experts_per_layer
         how = "measured";
         have = 1;
         for (int r = 0; r < nrep; r++) {
-            weight[r] = mirror_probe_bw(S, r);
+            /* the container when the replica holds it: the experts' bytes are read there */
+            weight[r] = W ? mirror_probe_bw(W, r) : 0;
+            if (weight[r] <= 0) weight[r] = mirror_probe_bw(S, r);
             if (weight[r] <= 0) have = 0;
         }
         if (have) {
@@ -2099,7 +2119,7 @@ static int expert_read_list(Model *m, const char *kind, int layer, int eid, Slot
             out[n].S = wex ? &m->wex->S : &m->S;
             out[n].slot = s;
             out[n].part = which;
-            out[n].rep = wex ? 0 : rep;   /* the container has no replicas yet */
+            out[n].rep = rep;   /* the same drive for the shards' tensors and the container's record */
             out[n].gx_layer = gi;
             out[n].eid = eid;
             n++;
@@ -2215,7 +2235,7 @@ static const WexEntry *v41_wex_nr3(const Model *m, const ExpertRead *r, int laye
  * reader thread, and each part copied to its window at the offset expert_fetch publishes
  * (the part's offset in the record, mod ST_DIRECT_ALIGN). Returns the bytes read; a record
  * that fails is refused (v41_wex_refuse) and expert_fetch reads the expert from the shards. */
-static uint64_t v41_wex_fetch_nr3(Model *m, int layer, int eid, const WexEntry *e, Slot *s) {
+static uint64_t v41_wex_fetch_nr3(Model *m, int layer, int eid, const WexEntry *e, Slot *s, int rep) {
     V41Wex *w = m->wex;
     const size_t cell = (size_t)layer * m->c.n_routed + eid;
     uint64_t raw, aligned;
@@ -2223,7 +2243,7 @@ static uint64_t v41_wex_fetch_nr3(Model *m, int layer, int eid, const WexEntry *
     const size_t at = wex_record_read_offset(e);
     int64_t got = 0;
     uint8_t *page = scratch_get((int64_t)aligned, &got);
-    st_read_range_rep(&w->S, w->t[cell * 6].fd, 0, (int64_t)e->file_offset, (int64_t)e->total_bytes, page + at,
+    st_read_range_rep(&w->S, w->t[cell * 6].fd, rep, (int64_t)e->file_offset, (int64_t)e->total_bytes, page + at,
                       (int64_t)e->total_bytes, 1, expert_direct(), "pread WNR3 expert");
     const char *why = NULL;
     if (w->sha && !__atomic_load_n(&w->state[cell], __ATOMIC_ACQUIRE)) {
@@ -2299,9 +2319,10 @@ static void expert_fetch(Model *m, const char *kind, int layer,
         const WexEntry *nr3 = v41_wex_nr3(m, r, layer);
         if (nr3) {   /* a WNR3 record: one reader decodes it into all six windows, at its first part */
             if (r->part == 0) {
-                const uint64_t got = v41_wex_fetch_nr3(m, layer, r->eid, nr3, r->slot);
-                __atomic_fetch_add(&g_mir_bytes[0], got, __ATOMIC_RELAXED);
-                __atomic_fetch_add(&g_mir_nread[0], 1, __ATOMIC_RELAXED);
+                const int rep = st_fd_rep(r->S, r->t->fd, r->rep) < 0 ? 0 : r->rep;   /* the drive that answers */
+                const uint64_t got = v41_wex_fetch_nr3(m, layer, r->eid, nr3, r->slot, rep);
+                __atomic_fetch_add(&g_mir_bytes[rep], got, __ATOMIC_RELAXED);
+                __atomic_fetch_add(&g_mir_nread[rep], 1, __ATOMIC_RELAXED);
                 bytes += got;
             }
             continue;
@@ -2726,17 +2747,18 @@ static void model_load(Model *m, const char *snap, int ecap, int engram_cache_ro
     const char *extra_dirs = getenv("COLI_MODEL_DIRS");
     st_init_multi(&m->S, snap, (extra_dirs && *extra_dirs) ? extra_dirs : NULL);
     if (g_v41_dry) g_v41_used = xcalloc((size_t)m->S.n + 1, 1, "tensors read");
-    /* DUAL-SSD: register COLI_MODEL_MIRROR copies and settle the read split
-     * before the first expert read, so nothing has been pulled from the primary
-     * by the time the replicas exist. */
-    mirror_setup(&m->S, snap, c->n_routed);
-    engram_load_sidecar(&m->engram, snap);
     {   /* a GGUF (st_gguf.h): the trunk's matrices, and the experts, in ggml blocks */
         const st_tensor *t = st_find(&m->S, "layers.0.attn.wq_a.weight");
         m->gguf = t && st_ggml_type_any(t->dtype) >= 0;
         v41_gx_geometry(m);
     }
     v41_wex_open(m);   /* COLI_WEX_PATH: the backbone's routed experts from a WEX4 container */
+    /* DUAL-SSD: register COLI_MODEL_MIRROR copies (of the shards, and of the
+     * container when there is one) and settle the read split before the first
+     * expert read, so nothing has been pulled from the primary by the time the
+     * replicas exist. */
+    mirror_setup(&m->S, m->wex ? &m->wex->S : NULL, snap, c->n_routed);
+    engram_load_sidecar(&m->engram, snap);
 #ifdef COLI_VULKAN
     if (!m->gguf) v41_dho_open(m);   /* COLI_VK_DENSE_HOST: the trunk to the device as it is read, its host pages back */
 #endif
@@ -3931,7 +3953,7 @@ static int cluster_worker_run(const char *snap, int port) {
     cfg_load(&m.c, snap);
     const char *extra_dirs = getenv("COLI_MODEL_DIRS");   /* SPLIT across drives, as model_load */
     st_init_multi(&m.S, snap, (extra_dirs && *extra_dirs) ? extra_dirs : NULL);
-    mirror_setup(&m.S, snap, m.c.n_routed);                /* DUAL-SSD replicas, as model_load */
+    mirror_setup(&m.S, NULL, snap, m.c.n_routed);          /* DUAL-SSD replicas, as model_load (no container) */
     int nr_layers = m.c.n_layers;
     /* Cache depth: 1 slot/layer kept the worker honest but meant every routed read
      * after the first was a cold SSD read; the coordinator runs a RAM-plan cache

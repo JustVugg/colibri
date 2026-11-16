@@ -183,8 +183,8 @@ that every expert of the loaded layers is a record of exactly that layout; then 
 are read and bound by the sidecar's own code (`q38_x4_read`, `q38_bind_int4_record`), so the
 CPU kernels, the batch loader and the mapped path are the sidecar's. As with a sidecar that was
 asked for, anything that does not hold stops the engine with the reason; the qwen38 engine has
-no second copy of the MXFP4 experts to fall back to. `COLI_MODEL_MIRROR` copies are not applied
-to a container yet (one drive).
+no second copy of the MXFP4 experts to fall back to. A copy of the container on another drive
+splits the reads ([below](#the-container-on-several-drives)).
 
 A container of WNR3 records: at attach its one WNM2 blob is read, checked against the index's
 SHA-256 and registered (all or none of the records value-exact). `q38_x4_read` sends each WNR3
@@ -237,6 +237,39 @@ Vulkan tier's prewarm reads. With `V41_READ_DEPTH` readers (8 by default) up to 
 records decode at once; each holds a page of the decoded size from the reader pool and the
 decoder's own scratch of the same size while it runs. The run prints a last line
 `[v41_wex] container: N records read (M WNR3 decoded), K refused`.
+
+## The container on several drives
+
+`COLI_MODEL_MIRROR` (qwen38 and deepseek_v41) takes byte copies of the container too: a
+directory in the list that holds a file with the container's name, its size and its header
+page becomes a read replica of it, and each expert's record is read from the drive a hash of
+its (layer, expert) picks, in the shares `COLI_DISK_WEIGHTS` sets ([ENVIRONMENT.md](ENVIRONMENT.md)).
+The same expert always comes from the same drive; the bytes are the same on every copy, so the
+tokens do not change. The copy does not need the checkpoint's shards beside it.
+
+```sh
+cp experts.wex4 /mnt/second/                       # byte copy, same file name
+COLI_WEX_PATH=/mnt/first/experts.wex4 COLI_WEX_ROOT=<root> \
+COLI_MODEL_MIRROR=/mnt/second COLI_DISK_WEIGHTS=1,1 ./deepseek_v41 ...
+```
+
+A copy whose size or header page differs is skipped with a `[MIRROR]` line. The header page
+holds the index's hash, so two copies with the same page have the same index and the same
+record offsets; a record damaged on the copy only is caught by `COLI_WEX_VERIFY` (on with a
+pinned root) at its first read from that copy, and then handled as on the primary
+(deepseek_v41: read from the shards; qwen38: the engine stops).
+
+deepseek_v41 registers each directory once for both its shards and the container, so a
+directory may hold either or both, and an expert's tensors and its record are routed to the
+same replica. Without `COLI_DISK_WEIGHTS` it probes each drive at start, on the container's
+copy where there is one. qwen38 does not probe: equal shares, or the weights given.
+
+Pick the drives with care: the split helps when the drives are of comparable speed, or to add
+a fast drive to a container on a slow one. Reading the 192 experts of one DeepSeek V4.1 layer
+through `deepseek_v41`'s expert reader on a desktop with a SATA SSD and an NVMe drive (batches
+of 6 experts, O_DIRECT, Windows 10): about 0.5 GB/s from the SATA copy alone, 1.8-1.9 GB/s
+with the NVMe copy added (split 15/85 by the probe), and 2.5-2.7 GB/s from the NVMe copy alone,
+so there the NVMe drive alone was the better choice.
 
 ## The CUDA helper (WNR3 records on an NVIDIA GPU)
 
@@ -308,6 +341,8 @@ other calls are `coli_wex_cuda_decode_to_device`, `_decode_batch_to_device`,
 
 ## Status in colibri
 
-DeepSeek V4, DeepSeek V4.1 and Qwen3.8 read RAW and WNR3 records from a WEX4 container, WNR3
-decoded on the GPU when `COLI_WEX_CUDA_LIB` names the CUDA helper, on the CPU otherwise
-(`wex_decode.c`). The I/O switches (several drives, split reads) are the next PRs.
+DeepSeek V4, DeepSeek V4.1 and Qwen3.8 read RAW and WNR3 records from a WEX4 container; WNR3
+records decode on the GPU when `COLI_WEX_CUDA_LIB` names the CUDA helper, on the CPU
+otherwise. qwen38 and deepseek_v41 also read copies of the container on other drives. A
+container mirror for `deepseek_v4` and the engines' use of the helper's device and batch
+calls are the next PRs.

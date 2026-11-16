@@ -216,6 +216,50 @@ int main(int argc, char **argv) {
     ck(attach_and_load() == 0, "COLI_WEX_VERIFY=1 without a pin: the same");
     unsetenv("COLI_WEX_VERIFY");
 
+    /* COLI_MODEL_MIRROR: a byte copy of the container in another directory, same file name.
+     * COLI_DISK_WEIGHTS=1,1000 sends every record whose route hash is not 0 to the copy. */
+    char mirror[620], mirror_path[700];
+    snprintf(mirror, sizeof mirror, "%s/mirror", directory);
+    snprintf(mirror_path, sizeof mirror_path, "%s/experts.wex4", mirror);
+#ifdef _WIN32
+    mkdir(mirror);
+#else
+    mkdir(mirror, 0700);
+#endif
+    {   FILE *f = fopen(mirror_path, "wb");
+        assert(f && fwrite(w4, 1, w4_bytes, f) == w4_bytes && fclose(f) == 0); }
+    setenv("COLI_MODEL_MIRROR", mirror, 1); setenv("COLI_DISK_WEIGHTS", "1,1000", 1);
+    grid(&m); q38_expert_int4_attach(&m, directory);
+    int routed = 0;
+    for (int c = 0; m.x4 && c < CELLS; c++) routed += q38_x4_replica(&m, c / EXPERTS, c % EXPERTS) == 1;
+    ck(m.x4 && m.x4->mir_n == 2 && routed > 0 && q38_x4_replica(&m, 1, 1) == 1,
+       "a copy on a mirror: two replicas, records routed to the copy (layer 1 expert 1 among them)");
+    ck(load_all(&m) && m.x4->mir_reads[1] == (uint64_t)routed && m.x4->mir_reads[0] == (uint64_t)(CELLS - routed),
+       "every expert loaded holds its record, each read from the replica its route names");
+    drop(&m);
+    setenv("COLI_WEX_ROOT", root, 1);
+    ck(attach_and_load() == 0, "pinned, with the mirror: every record passes its hash, whichever copy served it");
+    unsetenv("COLI_WEX_ROOT");
+    w4[100] ^= 1u;
+    {   FILE *f = fopen(mirror_path, "wb");
+        assert(f && fwrite(w4, 1, w4_bytes, f) == w4_bytes && fclose(f) == 0); }
+    w4[100] ^= 1u;
+    grid(&m); q38_expert_int4_attach(&m, directory);
+    ck(m.x4 && m.x4->mir_n == 1 && load_all(&m), "a mirror copy whose header page differs: not used, every record from the primary");
+    drop(&m);
+    w4[offset[4] + 100] ^= 0x10u;
+    {   FILE *f = fopen(mirror_path, "wb");
+        assert(f && fwrite(w4, 1, w4_bytes, f) == w4_bytes && fclose(f) == 0); }
+    w4[offset[4] + 100] ^= 0x10u;
+    printf("one child process each, with the mirror\n");
+    setenv("COLI_WEX_ROOT", root, 1);
+    child_case(argv[0], 1, "layer 1 expert 1 changed on the mirror only, pinned: refused at its first read");
+    unsetenv("COLI_WEX_ROOT");
+    setenv("COLI_DISK_WEIGHTS", "1,2,3", 1);
+    child_case(argv[0], 1, "COLI_DISK_WEIGHTS with 3 weights for 2 copies: refused");
+    unsetenv("COLI_MODEL_MIRROR"); unsetenv("COLI_DISK_WEIGHTS");
+    remove(mirror_path); rmdir(mirror);
+
     printf("one child process each (the engine stops with exit 1 on a refusal)\n");
     setenv("COLI_WEX_ROOT", root, 1); setenv("COLI_MAP_EXPERTS", "1", 1);
     child_case(argv[0], 0, "pinned and mapped (COLI_MAP_EXPERTS=1): every mapped record checked and right");

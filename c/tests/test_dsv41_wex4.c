@@ -14,7 +14,9 @@
  * again from the shards once its first-read SHA-256 fails (pinned, or COLI_WEX_VERIFY=1) and
  * stays on them; another root, a bad root, a damaged header page or index, a truncated copy,
  * the WEX1 form, another grid, records of other shapes and a missing file leave every expert
- * on the shards. */
+ * on the shards. A byte copy of the container in a COLI_MODEL_MIRROR directory serves the
+ * records the route sends to it (a record changed there fails its hash and is read from the
+ * shards); a copy whose header page or size differs is not used. */
 #define main dsv41_main_unused
 #include "../deepseek_v41.c"
 #undef main
@@ -32,9 +34,10 @@ enum { LAYERS = 2, EXPERTS = 3, DIM = 256, INTER = 64 };
 #define ABSENT 4                             /* layer 1 expert 1: not in the container */
 
 static unsigned char source[CELLS][RAW];
-static char directory[] = "colibri-v41-wex4-XXXXXX", st_path[600], wex_path[600];
+static char directory[] = "colibri-v41-wex4-XXXXXX", st_path[600], wex_path[600], mirror[600], mirror_path[700];
 static int fails;
 static uint64_t last_decoded;   /* the last run's WNR3 records decoded */
+static uint64_t g_mirror_reads;   /* tensor reads the last run() sent to replica 1 */
 
 /* where each matrix sits in a record (and so in the safetensors data, laid out the same) */
 static size_t at_scale(int m) { return m == 0 ? 0 : m == 1 ? S13 : S13 + S2; }          /* w1, w2, w3 */
@@ -113,6 +116,9 @@ static int run(uint64_t *reads, uint64_t *refused) {
     m.c.dim = DIM; m.c.moe_inter = INTER; m.c.n_layers = LAYERS; m.c.n_routed = EXPERTS;
     st_init(&m.S, directory);
     v41_wex_open(&m);
+    g_mirror = 0; g_mir_nrep = 1; g_mir_cut[0] = 256;   /* mirror_setup keeps them when COLI_MODEL_MIRROR is unset */
+    mirror_setup(&m.S, m.wex ? &m.wex->S : NULL, directory, EXPERTS);
+    const uint64_t mirror_reads0 = g_mir_nread[1];
     int ok = 1;
     for (int layer = 0; layer < LAYERS; layer++) {
         LCache one, all;
@@ -136,6 +142,7 @@ static int run(uint64_t *reads, uint64_t *refused) {
     *reads = active ? m.wex->reads : 0;
     *refused = active ? m.wex->refused : 0;
     last_decoded = active ? m.wex->decoded : 0;
+    g_mirror_reads = g_mir_nread[1] - mirror_reads0;
     v41_wex_free(m.wex);
     st_destroy(&m.S);
     for (int i = 0; i < LAYERS; i++) free(m.ehit ? m.ehit[i] : NULL);
@@ -199,6 +206,47 @@ int main(void) {
     unsetenv("COLI_WEX_VERIFY");
     w4[offset[2] + 100] ^= 0x20u; write_file(wex_path, w4, w4_bytes);
 
+    /* COLI_MODEL_MIRROR: a byte copy of the container in another directory under the same
+     * file name, and no copy of the shards. COLI_DISK_WEIGHTS=1,1000 sends every expert whose
+     * route hash is not 0 to the copy (layer 0 expert 2 among them). Each expert is read 3
+     * times per layer, 6 tensors a read; the shards' reads of the absent expert stay on the
+     * primary, which is the only drive that has them. */
+    snprintf(mirror, sizeof mirror, "%s/mirror", directory);
+    snprintf(mirror_path, sizeof mirror_path, "%s/experts.wex4", mirror);
+#ifdef _WIN32
+    mkdir(mirror);
+#else
+    mkdir(mirror, 0700);
+#endif
+    write_file(mirror_path, w4, w4_bytes);
+    setenv("COLI_MODEL_MIRROR", mirror, 1); setenv("COLI_DISK_WEIGHTS", "1,1000", 1);
+    uint64_t on_mirror = 0;
+    {   uint64_t r, f;
+        run(&r, &f);   /* settles the route */
+        for (int c = 0; c < CELLS; c++) if (c != ABSENT && expert_route(c / EXPERTS, c % EXPERTS) == 1) on_mirror += 3 * 6;
+        if (expert_route(0, 2) != 1 || !on_mirror) { printf("  FAIL the route does not use the mirror\n"); fails++; } }
+    expect("a copy on a mirror: every expert still the checkpoint's", 1, held, 0);
+    printf("  %s   the records routed to the mirror read from it (%llu tensor reads, want %llu)\n",
+           g_mirror_reads == on_mirror ? "ok" : "FAIL", (unsigned long long)g_mirror_reads, (unsigned long long)on_mirror);
+    fails += g_mirror_reads != on_mirror;
+    setenv("COLI_WEX_ROOT", root, 1);
+    w4[offset[2] + 100] ^= 0x20u; write_file(mirror_path, w4, w4_bytes); w4[offset[2] + 100] ^= 0x20u;
+    expect("layer 0 expert 2 changed on the mirror only, pinned: refused at its first read there", 1, held - 3, 1);
+    printf("  %s   then read from the shards (%llu tensor reads on the mirror, want %llu)\n",
+           g_mirror_reads == on_mirror - 12 ? "ok" : "FAIL", (unsigned long long)g_mirror_reads,
+           (unsigned long long)(on_mirror - 12));
+    fails += g_mirror_reads != on_mirror - 12;
+    unsetenv("COLI_WEX_ROOT");
+    w4[100] ^= 1u; write_file(mirror_path, w4, w4_bytes); w4[100] ^= 1u;
+    expect("a mirror copy whose header page differs: not used, every record from the primary", 1, held, 0);
+    printf("  %s   no read on the mirror (%llu)\n", g_mirror_reads == 0 ? "ok" : "FAIL", (unsigned long long)g_mirror_reads);
+    fails += g_mirror_reads != 0;
+    write_file(mirror_path, w4, w4_bytes - WEX_ALIGN);
+    expect("a truncated mirror copy: not used", 1, held, 0);
+    fails += g_mirror_reads != 0;
+    unsetenv("COLI_MODEL_MIRROR"); unsetenv("COLI_DISK_WEIGHTS");
+    remove(mirror_path); rmdir(mirror);
+
     setenv("COLI_WEX_ROOT", "0123", 1);
     expect("COLI_WEX_ROOT not 64 hex digits: no container", 0, 0, 0);
     memset(other, 'c', 64); other[64] = 0;
@@ -242,6 +290,25 @@ int main(void) {
         expect4(line, 1, held, 0, held);
         unsetenv("COLI_WEX_ROOT");
         if (cz) { free(nr3); continue; }
+        /* a copy of the WNR3 container on a mirror: its records read from it (one read a record) */
+#ifdef _WIN32
+        mkdir(mirror);
+#else
+        mkdir(mirror, 0700);
+#endif
+        write_file(mirror_path, nr3, nr3_bytes);
+        setenv("COLI_MODEL_MIRROR", mirror, 1); setenv("COLI_DISK_WEIGHTS", "1,1000", 1);
+        expect4("WNR3, a copy on a mirror: every expert still the checkpoint's", 1, held, 0, held);
+        printf("  %s   the records routed to the mirror read from it (%llu reads, want %llu)\n",
+               g_mirror_reads == on_mirror / 6 ? "ok" : "FAIL", (unsigned long long)g_mirror_reads,
+               (unsigned long long)(on_mirror / 6));
+        fails += g_mirror_reads != on_mirror / 6;
+        nr3[at[2] + 5000] ^= 0x10u; write_file(mirror_path, nr3, nr3_bytes); nr3[at[2] + 5000] ^= 0x10u;
+        setenv("COLI_WEX_ROOT", nroot, 1);
+        expect4("WNR3 layer 0 expert 2 changed on the mirror only, pinned: refused at its first read there", 1,
+                held - 3, 1, held - 3);
+        unsetenv("COLI_WEX_ROOT"); unsetenv("COLI_MODEL_MIRROR"); unsetenv("COLI_DISK_WEIGHTS");
+        remove(mirror_path); rmdir(mirror);
         nr3[at[2] + 5000] ^= 0x10u; write_file(wex_path, nr3, nr3_bytes);
         expect4("WNR3 layer 0 expert 2 changed on disk, no hash check: refused by its stream check, from the shards "
                 "from then on", 1, held - 3, 1, held - 3);
