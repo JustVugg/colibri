@@ -7,6 +7,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### New
 
+- **DeepSeek V4 reads WNR3 records from a WEX4 container** (`COLI_WEX_PATH`): the container's
+  WNM2 model blob checked against its index hash and registered at open; each WNR3 record read
+  at the end of its page and decoded in the slot's slab on the CPU, after its owner (and its
+  SHA-256 at the first read, when asked); one that fails is served from the safetensors for the
+  run. RAW containers and an unset `COLI_WEX_PATH` behave as before. `tests/test_v4_wex4.c`.
 - **WNR3 records on the CPU** (`c/wex_decode.c`, `c/wex_decode.h`): the WNM2 model registry, a
   WEX4 container's model blob checked against its index hash, and the in-place decode of a WNR3
   (codec 5) record with the reference decoder. No engine reads WNR3 records yet.

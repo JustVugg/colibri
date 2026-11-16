@@ -11,7 +11,14 @@
  * page or index, a truncated copy, a WEX1 file, another grid or a record of
  * other shapes leave the store on the safetensors; a record changed on disk is
  * served from the safetensors once its first-read SHA-256 fails (on with the
- * pin, or COLI_WEX_VERIFY=1) and only then; nonzero padding is never served. */
+ * pin, or COLI_WEX_VERIFY=1) and only then; nonzero padding is never served.
+ *
+ * Then the same container with WNR3 records (tests/wnr3_fixture.h), plain and
+ * canonical zero: every record it holds decoded to the checkpoint's bytes; a
+ * record changed on disk refused by its stream check with the hash off and by
+ * its hash with it on, a record under another expert's name refused by its
+ * owner, both then served from the safetensors; a changed model blob, or a
+ * canonical-zero container under DSV4_CUDA_MOE_MASKED=1, not used. */
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,8 +27,9 @@
 #include "../compat.h"
 #include "../deepseek_v4_internal.h"
 #include "wex4_fixture.h"
+#include "wnr3_fixture.h"
 
-int coli_v4_test_wex(ColiExpertStore *store, uint64_t counters[4]);
+int coli_v4_test_wex(ColiExpertStore *store, uint64_t counters[5]);
 
 enum { LAYERS = 2, EXPERTS = 4, ROWS = 40, SCALE_COLS = 64, WEIGHT_COLS = 1024 };
 #define CELLS (LAYERS * EXPERTS)
@@ -112,7 +120,7 @@ static int same_matrix(const ColiTensorView *v, size_t cell, int m) {
 /* Open the store, look every expert up, compare with the checkpoint; counters: reads,
  * bytes, fallbacks, refused of the container (all 0 without one). Returns whether the
  * store had a container. */
-static int run(uint64_t counters[4]) {
+static int run(uint64_t counters[5]) {
     char error[256] = {0};
     ColiDeepSeekV4ExpertStoreOptions options = {directory, LAYERS, EXPERTS, (uint64_t)CELLS * 2 * RAW, -1, 0, 1, 0};
     ColiExpertStore *store = NULL;
@@ -151,17 +159,21 @@ static int run(uint64_t counters[4]) {
     return active;
 }
 
-static void expect(const char *what, int active, uint64_t reads, uint64_t fallbacks, uint64_t refused) {
-    uint64_t c[4];
+/* decoded: how many of the reads were WNR3 records decoded (0 for a RAW container) */
+static void expect5(const char *what, int active, uint64_t reads, uint64_t fallbacks, uint64_t refused,
+                    uint64_t decoded) {
+    uint64_t c[5];
     int got = run(c);
-    if (got != active || c[0] != reads || c[2] != fallbacks || c[3] != refused) {
+    if (got != active || c[0] != reads || c[2] != fallbacks || c[3] != refused || c[4] != decoded) {
         fprintf(stderr, "FAIL %s: container %d (want %d), reads %llu (want %llu), fallbacks %llu (want %llu), "
-                        "refused %llu (want %llu)\n", what, got, active, (unsigned long long)c[0],
-                (unsigned long long)reads, (unsigned long long)c[2], (unsigned long long)fallbacks,
-                (unsigned long long)c[3], (unsigned long long)refused);
+                        "refused %llu (want %llu), decoded %llu (want %llu)\n", what, got, active,
+                (unsigned long long)c[0], (unsigned long long)reads, (unsigned long long)c[2],
+                (unsigned long long)fallbacks, (unsigned long long)c[3], (unsigned long long)refused,
+                (unsigned long long)c[4], (unsigned long long)decoded);
         failures++;
     } else printf("ok   %s\n", what);
 }
+#define expect(what, active, reads, fallbacks, refused) expect5(what, active, reads, fallbacks, refused, 0)
 
 int main(void) {
     setenv("COLI_V4_AUTOPIN", "0", 1);
@@ -172,11 +184,16 @@ int main(void) {
     if (!mkdtemp(directory)) { perror("mkdtemp"); return 1; }
     snprintf(st_path, sizeof st_path, "%s/model.safetensors", directory);
     snprintf(wex_path, sizeof wex_path, "%s/experts.wex4", directory);
+    /* FP4 codes mostly small, as an expert's are (so that WNR3 records are smaller than RAW
+     * ones), and no -0: the canonical-zero container then decodes to the same bytes */
+    static const unsigned char magnitude[16] = {0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7};
     uint32_t seed = 20261116u;
     for (size_t c = 0; c < CELLS; c++)
         for (size_t j = 0; j < RAW; j++) {
             seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
-            source[c][j] = (unsigned char)(j < 3 * SCALE_M ? 118u + seed % 8u : seed);
+            unsigned lo = magnitude[seed & 15u], hi = magnitude[seed >> 4 & 15u];
+            lo |= lo ? (seed >> 8 & 8u) : 0u; hi |= hi ? (seed >> 9 & 8u) : 0u;
+            source[c][j] = (unsigned char)(j < 3 * SCALE_M ? 118u + seed % 8u : lo | hi << 4);
         }
     write_safetensors();
 
@@ -247,7 +264,57 @@ int main(void) {
     expect("COLI_WEX_PATH names no file: no container", 0, 0, 0, 0);
     unsetenv("COLI_WEX_PATH");
 
+    /* WNR3 records (codec 5), decoded on the CPU */
     snprintf(wex_path, sizeof wex_path, "%s/experts.wex4", directory);
+    setenv("COLI_WEX_PATH", wex_path, 1);
+    for (int cz = 0; cz < 2; cz++) {
+        size_t nr3_bytes, at[CELLS];
+        char nroot[65], line[200];
+        unsigned char *nr3 = wnr3f_from_wex4(w4, bytes, cz, &nr3_bytes, nroot, at);
+        CHECK(nr3 != NULL);
+        if (!nr3) break;
+        const char *form = cz ? "canonical-zero WNR3" : "WNR3";
+        write_file(wex_path, nr3, nr3_bytes);
+        snprintf(line, sizeof line, "%s container: the 7 records decoded from it to the checkpoint's bytes, the 8th "
+                                    "from the safetensors", form);
+        expect5(line, 1, HELD, 0, 0, HELD);
+        setenv("COLI_WEX_ROOT", nroot, 1);
+        snprintf(line, sizeof line, "%s, its root pinned (first-read SHA-256 on): the same", form);
+        expect5(line, 1, HELD, 0, 0, HELD);
+        unsetenv("COLI_WEX_ROOT");
+        if (cz) {
+            setenv("DSV4_CUDA_MOE_MASKED", "1", 1);
+            expect("canonical-zero WNR3 with DSV4_CUDA_MOE_MASKED=1: no container", 0, 0, 0, 0);
+            unsetenv("DSV4_CUDA_MOE_MASKED");
+            free(nr3);
+            continue;
+        }
+        nr3[at[2] + 3000] ^= 0x10u;                             /* a byte of record 2's streams */
+        write_file(wex_path, nr3, nr3_bytes);
+        expect5("WNR3 record 2 changed on disk, no hash check: refused by its stream check, from the safetensors",
+                1, HELD - 1, 0, 1, HELD - 1);
+        setenv("COLI_WEX_ROOT", nroot, 1);
+        expect5("the same, pinned: refused by its SHA-256 at its first read", 1, HELD - 1, 0, 1, HELD - 1);
+        unsetenv("COLI_WEX_ROOT");
+        nr3[at[2] + 3000] ^= 0x10u;
+        char renamed_root[65];
+        unsigned char *renamed = malloc(nr3_bytes);
+        assert(renamed);
+        memcpy(renamed, nr3, nr3_bytes);
+        CHECK(!wnr3f_rename(renamed, nr3_bytes, 0u << 16 | 2u, 0u << 16 | 3u, source[2], renamed_root));   /* says it is expert 3 */
+        write_file(wex_path, renamed, nr3_bytes);
+        setenv("COLI_WEX_ROOT", renamed_root, 1);
+        expect5("a whole WNR3 record under another expert's name (its hash in the index matches): refused, from the "
+                "safetensors", 1, HELD - 1, 0, 1, HELD - 1);
+        unsetenv("COLI_WEX_ROOT");
+        free(renamed);
+        nr3[WEX4_PAGE + 100] ^= 1u;                             /* a byte of the WNM2 model blob */
+        write_file(wex_path, nr3, nr3_bytes);
+        expect("the WNM2 model blob changed: no container", 0, 0, 0, 0);
+        nr3[WEX4_PAGE + 100] ^= 1u;
+        free(nr3);
+    }
+    unsetenv("COLI_WEX_PATH");
     remove(wex_path); remove(st_path);
     {
         char usage[600];
