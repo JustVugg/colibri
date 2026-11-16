@@ -32,6 +32,7 @@ carries and how to use it. The bytes are specified there, not here:
 | `c/tests/test_wex4_verify.c`, `c/tests/wex4_fixture.h` | the tool on synthetic WEX4 files; the fixture writes a WEX4 file in memory the way the in-place upgrade of a WEX1 file does |
 | `c/wex_decode.c`, `c/wex_decode.h` | WNR3 records on the CPU: the process's WNM2 model registry (`coli_wex_register_model`, and `coli_wex4_register_model` for a WEX4 container's blob, checked against its index hash) and the in-place decode of one record (`coli_wex_decode_record`) |
 | `c/tests/test_wex_decode.c`, `c/tests/wnr3_fixture.h` | the registry and the decode on records made by the reference encoder; the fixture trains a model and writes the WNR3 form of a WEX4 container |
+| `c/tools/wex_nr3_tools.c`, `c/tools/build_nr3.py`, `c/tests/test_wex_nr3_tools.py` | the WNR3 encoder: a C library and the Python builder that drives it ([below](#making-a-wnr3-container)), and their test |
 
 The files are kept byte for byte in step with Wex-WRN2's `c/` folder (only the line endings,
 that repository's licence header, and the include guards and two comments, reworded here, differ); a change to the format goes there first, with its
@@ -84,6 +85,39 @@ root.
 
 colibri does not write WEX4 files yet. Wex-WRN2's `wex4/wex4_convert.py` (Python, standard
 library only) writes them: `pack` from safetensors files, `upgrade` in place from a WEX1 file.
+
+### Making a WNR3 container
+
+The WNR3 encoder is here: `c/tools/wex_nr3_tools.c` (a small C library: prepare, train, encode
+and verify one expert record with the reference codec of `wex_neural_rans.h`) and
+`c/tools/build_nr3.py` (Python, standard library only, which drives it). Both are Wex-WRN2's
+copies.
+
+```sh
+make -C c wex-nr3-tools                       # tools/wex_nr3_tools.dll, libwex_nr3_tools.so or .dylib
+python3 -I c/tools/build_nr3.py c/tools/libwex_nr3_tools.so experts.wex container experts.nr3.wex \
+        --layers all --train-lab80 [--cz] [--save-model model.wnm2]
+```
+
+`build_nr3.py` reads the RAW records of a WEX1 container, trains one WNM2 model on the experts
+`--train L:E,...` lists (or `--train-lab80`: 80 seeded picks over every layer), encodes every
+record as WNR3 on 8 threads, decodes each one again on the CPU and compares it with its source
+before writing it, and writes a WEX3 container (header flags 33, 97 with `--cz`) with a JSON
+report beside it. A record that would not be smaller stays RAW. `--cz` (canonical zero) stores the
+FP4 code -0 as +0: smaller, value-exact, but the RAW bytes can then only be rebuilt from the
+checkpoint. Then make it WEX4, which the engines read:
+
+```sh
+python3 -I wex4/wex4_convert.py upgrade experts.nr3.wex       # Wex-WRN2: in place, records do not move
+c/tools/wex4_verify experts.nr3.wex                            # prints COLI_WEX_ROOT=<root>
+```
+
+or, with a model saved by `--save-model`, write the WEX4 file straight from the safetensors
+with Wex-WRN2's `wex4/wex4_convert.py pack OUT.wex4 SHARDS... --experts nr3 --nr3-dll <library>
+--model model.wnm2 [--cz]`. The WEX1 input comes from Wex-WRN2's `c/tools/repack_v4_wex.py`
+(DeepSeek V4/V4.1) or `repack_q38_mxfp4_wex.py` (Qwen3.8). On an i7-7700K, 8 DeepSeek V4.1
+records (150 MB) took 3.6 s, the training and the check decode included; a whole V4.1 REAP-192
+container is 7,680 such records.
 
 ## DeepSeek V4 (`deepseek_v4`)
 

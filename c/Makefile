@@ -3953,6 +3953,19 @@ tests/test_wex4_verify$(EXE): tests/test_wex4_verify.c
 tests/test_wex_decode$(EXE): tests/test_wex_decode.c
 	$(CC) $(CFLAGS) $< -o $@ -pthread $(LDFLAGS)
 
+# The WNR3 encoder (docs/wex.md, "Making a WNR3 container"): tools/build_nr3.py loads this
+# library with ctypes. make wex-nr3-tools; tests/test_wex_nr3_tools.py builds its own copy.
+ifneq (,$(DARWIN))
+NR3LIB = tools/libwex_nr3_tools.dylib
+else ifneq ($(IS_WIN),)
+NR3LIB = tools/wex_nr3_tools.dll
+else
+NR3LIB = tools/libwex_nr3_tools.so
+endif
+wex-nr3-tools: $(NR3LIB)
+$(NR3LIB): tools/wex_nr3_tools.c wex_format.h wex_neural_rans.h wex_palette.h
+	$(CC) $(CFLAGS) -fPIC -shared $< -o $@ $(LDFLAGS)
+
 # ---------------------------------------------------------------------------
 # Generated header prerequisites (#1741)
 #

@@ -7,6 +7,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### New
 
+- **The WNR3 encoder** (`c/tools/wex_nr3_tools.c`, `c/tools/build_nr3.py`, `make wex-nr3-tools`):
+  trains a WNM2 model on chosen experts of a WEX1 container, encodes every record as WNR3
+  (canonical zero with `--cz`), checks each one by decoding it again, and writes the WNR3
+  container (WEX3; Wex-WRN2's `wex4_convert.py upgrade` makes it WEX4). Wex-WRN2's copies.
+  `tests/test_wex_nr3_tools.py` ([docs/wex.md](docs/wex.md#making-a-wnr3-container)).
 - **DeepSeek V4.1 reads WNR3 records from a WEX4 container** (`COLI_WEX_PATH`): the published
   REAP-192 container (7,680 WNR3 records) runs end to end, the trunk from the shards; each
   record read whole by one reader thread and decoded on the CPU into the expert's six windows,
