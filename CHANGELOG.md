@@ -7,6 +7,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### New
 
+- **DeepSeek V4.1: a batch's first-read SHA-256 on the OpenMP team** (`COLI_WEX_VERIFY`, on
+  with `COLI_WEX_ROOT`): the records of one `expert_fetch` are hashed one expert a thread
+  instead of one after another on the calling thread. Same checks, same fallback; nothing
+  changes with the hash off.
 - **A WEX4 container on several drives** (`COLI_MODEL_MIRROR`, `COLI_DISK_WEIGHTS`, qwen38 and
   deepseek_v41): a byte copy of the container in a mirror directory, same file name, size and
   header page, becomes a read replica; each expert's record comes from the drive a hash of its

@@ -2360,8 +2360,16 @@ static void expert_fetch(Model *m, const char *kind, int layer,
     /* COLI_WEX_VERIFY: each RAW record the container served, hashed at its first read; one
      * that fails is read again, here, from the checkpoint's shards (v41_wex_check refused it,
      * so expert_read_list now names the shards' tensors). A WNR3 record was checked and
-     * decoded by its reader; one it refused is read again here the same way. */
-    for (int i = 0; m->wex && i < n; i++) {
+     * decoded by its reader; one it refused is read again here the same way. The RAW records
+     * of a batch are hashed on the default team, one expert a thread: on a CPU without SHA
+     * extensions the portable SHA-256 runs at a few hundred MB/s, so a batch of first reads
+     * hashed one after another on this thread took longer than reading it. Each iteration
+     * touches its own expert only. */
+#if defined(_OPENMP)
+    const int hashing = m->wex && m->wex->sha && n > 1;
+    #pragma omp parallel for schedule(dynamic, 1) if (hashing)
+#endif
+    for (int i = 0; i < (m->wex ? n : 0); i++) {
         ExpertRead *r = list + first[i];
         if (r->S != &m->wex->S) continue;
         const int coded = v41_wex_nr3(m, r, layer) != NULL;

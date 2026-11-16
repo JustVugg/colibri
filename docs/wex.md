@@ -222,8 +222,9 @@ open      v41_wex_open      header page, index, grid (n_layers x n_routed), COLI
 miss      expert_read_list  a backbone expert the container holds -> its six tensors in the container
           expert_fetch      RAW: the same windows, the same readers, O_DIRECT where there is one
           v41_wex_check     COLI_WEX_VERIFY, first read: the six parts in record order and the zero
-                            padding against the index's SHA-256; a mismatch -> that expert read again
-                            from the shards, and from the shards for the rest of the run
+                            padding against the index's SHA-256, the experts of a batch on the
+                            default OpenMP team; a mismatch -> that expert read again from the
+                            shards, and from the shards for the rest of the run
           v41_wex_fetch_nr3 WNR3: one reader takes the expert's first part and reads the whole stored
                             record into a pooled page (one O_DIRECT read), hashes it at the first read
                             (COLI_WEX_VERIFY), checks its owner and canonical-zero flag, decodes it in
