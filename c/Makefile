@@ -3918,6 +3918,15 @@ tests/test_kimi_cuda_expert$(EXE): tests/test_kimi_cuda_expert.c kimi_k3.c tests
 tests/test_wex_format$(EXE): tests/test_wex_format.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# One read-only pass over a WEX4 container: the header page and the index as the engines check
+# them at open, then every blob and record against its SHA-256 in the index; prints the root to
+# pin as COLI_WEX_ROOT. make tools/wex4_verify; ./tools/wex4_verify FILE [THREADS].
+# The test builds the tool's code into itself and runs it on synthetic WEX4 files.
+tools/wex4_verify$(EXE): tools/wex4_verify.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_wex4_verify$(EXE): tests/test_wex4_verify.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 # ---------------------------------------------------------------------------
 # Generated header prerequisites (#1741)
 #
