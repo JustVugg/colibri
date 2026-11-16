@@ -378,7 +378,10 @@ static void st_no_readahead(shards *S, int fd) {
 /* Registers <dir>/<basename> as read replica S->nrep+1 of every already-indexed
  * shard. A file is accepted ONLY if its size and safetensors header are
  * byte-identical to the primary: the data_offsets then match by construction,
- * so every pread is valid on any copy. Missing or divergent files simply stay
+ * so every pread is valid on any copy. A WEX4 container (docs/wex.md) has no
+ * safetensors header: its copy is accepted when its size and its 4096-byte
+ * header page equal the primary's, the page that holds the index's SHA-256 and
+ * the root, so the index and every record offset match. Missing or divergent files simply stay
  * on the primary (a mirror may be partial, e.g. a smaller SSD holding only the
  * expert shards). Returns the number of accepted files; a dir contributing 0
  * files claims no replica slot. Mirrors are NEVER written to: .coli_usage /
@@ -412,9 +415,15 @@ static int st_mirror_add(shards *S, const char *dir) {
             close(mfd); continue;
         }
         uint64_t ha = 0, hb = 0; int ok = 1;   /* identical header => identical data_offsets */
-        if (pread(S->fds[i], &ha, 8, 0) != 8 || pread(mfd, &hb, 8, 0) != 8 ||
-            ha != hb || ha == 0 || ha > (uint64_t)256 << 20 || (int64_t)(8 + ha) > sza) ok = 0;
-        if (ok) {
+        if (pread(S->fds[i], &ha, 8, 0) != 8 || pread(mfd, &hb, 8, 0) != 8) ok = 0;
+        if (ok && (uint32_t)ha == UINT32_C(0x57455834) && sza >= 4096) {   /* "WEX4": the header page */
+            char *pa = malloc(4096), *pb = malloc(4096);
+            ok = pa && pb && pread(S->fds[i], pa, 4096, 0) == 4096 && pread(mfd, pb, 4096, 0) == 4096 &&
+                 !memcmp(pa, pb, 4096);
+            free(pa); free(pb);
+            ha = 0;   /* no safetensors header to compare below */
+        } else if (ok && (ha != hb || ha == 0 || ha > (uint64_t)256 << 20 || (int64_t)(8 + ha) > sza)) ok = 0;
+        if (ok && ha) {
             char *ba = malloc(ha), *bb = malloc(ha);
             if (!ba || !bb || pread(S->fds[i], ba, ha, 8) != (ssize_t)ha ||
                 pread(mfd, bb, ha, 8) != (ssize_t)ha || memcmp(ba, bb, ha)) ok = 0;
@@ -436,6 +445,16 @@ static int st_mirror_add(shards *S, const char *dir) {
     if (S->nmirror[r] > 0) { S->nrep++; return S->nmirror[r]; }
     return 0;
 }
+/* st_mirror_add, except that the replica slot is taken even when dir holds none
+ * of S's files (they all stay on the primary): two file sets registered on the
+ * same dirs in the same order then keep the same replica numbers, so one route
+ * serves both (DeepSeek V4.1: the shards and a WEX4 container). */
+static int st_mirror_add_slot(shards *S, const char *dir) {
+    int n = st_mirror_add(S, dir);
+    if (n <= 0 && S->nrep < ST_MAX_MIR) S->nrep++;   /* st_mirror_add left every fd of the slot at -1 */
+    return n;
+}
+
 /* backward-compatible single-mirror entry point */
 static int st_mirror_init(shards *S, const char *dir) {
     st_mirror_reset(S);

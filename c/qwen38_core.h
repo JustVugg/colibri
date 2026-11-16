@@ -2055,7 +2055,10 @@ static int q38_try_load_native_fp8_expert(Model *m,int layer,int expert,Slot *sl
  * the shares set by COLI_DISK_WEIGHTS=<primary>,<mirror>[,...] (relative read
  * bandwidth, equal shares when unset). The same expert always comes from the same
  * drive, and the bytes are the same on all of them, so the tokens do not move.
- * The snapshot's own FP8 experts stay on the primary. */
+ * The snapshot's own FP8 experts stay on the primary. sub NULL: x->S's one file is a
+ * WEX4 container (COLI_WEX_PATH) and snap its directory; a copy of it is looked for in
+ * each <dir> itself, under the same file name, and taken when its size and header page
+ * equal the primary's (st_mirror_add). */
 static void q38_x4_mirrors(Q38Int4Experts *x,const char *snap,const char *sub) {
     x->mir_n=1;x->mir_cut[0]=256;
     const char *dirs=getenv("COLI_MODEL_MIRROR");
@@ -2068,8 +2071,9 @@ static void q38_x4_mirrors(Q38Int4Experts *x,const char *snap,const char *sub) {
         while(*p==' ')p++;
         for(size_t n=strlen(p);n&&p[n-1]==' ';)p[--n]=0;
         if(!*p)continue;
-        if(!strcmp(p,snap)){fprintf(stderr,"[qwen38 MIRROR] %s is the model's own directory -- ignored\n",p);continue;}
-        snprintf(path,sizeof path,"%s/%s",p,sub);
+        if(!strcmp(p,snap)){fprintf(stderr,"[qwen38 MIRROR] %s is the %s own directory -- ignored\n",p,
+                                    sub?"model's":"container's");continue;}
+        if(sub)snprintf(path,sizeof path,"%s/%s",p,sub);else snprintf(path,sizeof path,"%s",p);
         int files=x->S.nrep<ST_MAX_MIR?st_mirror_add(&x->S,path):-1;
         if(files>0)fprintf(stderr,"[qwen38 MIRROR] %s: %d of %d files (replica %d)\n",path,files,x->S.nfd,x->S.nrep);
         else fprintf(stderr,"[qwen38 MIRROR] %s: %s -- skipped\n",path,
@@ -2105,7 +2109,8 @@ static void q38_x4_mirrors(Q38Int4Experts *x,const char *snap,const char *sub) {
         x->mir_cut[k]=prev=cut;
     }
     x->mir_n=n;
-    fprintf(stderr,"[qwen38 MIRROR] %d replicas of %s/, split %s:",n,sub,spec&&*spec?"COLI_DISK_WEIGHTS":"even (COLI_DISK_WEIGHTS unset)");
+    if(sub)fprintf(stderr,"[qwen38 MIRROR] %d replicas of %s/, split %s:",n,sub,spec&&*spec?"COLI_DISK_WEIGHTS":"even (COLI_DISK_WEIGHTS unset)");
+    else fprintf(stderr,"[qwen38 MIRROR] %d replicas of the WEX4 container, split %s:",n,spec&&*spec?"COLI_DISK_WEIGHTS":"even (COLI_DISK_WEIGHTS unset)");
     for(k=0;k<n;k++)fprintf(stderr," %s %d/256",k?"mirror":"primary",x->mir_cut[k]-(k?x->mir_cut[k-1]:0));
     fprintf(stderr,"\n");
 }
@@ -2483,7 +2488,10 @@ static int q38_int4_record_at(Model *m,Q38Int4Experts *x,int layer,int expert,
  * hashes each record at its first use (q38_wex_check). Asked for, the container is required:
  * anything that does not hold stops the engine with the reason, as a sidecar that was asked
  * for does, and so does a WNR3 record that names another expert or does not decode.
- * COLI_MODEL_MIRROR copies are not applied to a container (one drive). */
+ * A byte copy of the container in a COLI_MODEL_MIRROR directory (same file name,
+ * same size and header page) becomes a read replica, split by COLI_DISK_WEIGHTS as the
+ * sidecar's copies are (q38_x4_mirrors, q38_x4_replica); COLI_WEX_VERIFY hashes a record
+ * at its first use from whichever copy served it. */
 static void q38_wex_refuse(const char *path,const char *why) {
     fprintf(stderr,"[qwen38] COLI_WEX_PATH %s: %s -- refusing (unset COLI_WEX_PATH to run without it)\n",path,why);
     exit(1);
@@ -2622,9 +2630,17 @@ static void q38_wex4_attach(Model *m,const char *path) {
         if(!(x->wex_seen=(unsigned char*)calloc(cells,1))){fprintf(stderr,"OOM WEX4 expert index\n");exit(1);}
     } else free(sha);
     if(!(x->wex=strdup(path))){fprintf(stderr,"OOM WEX4 expert index\n");exit(1);}
-    const char *mirrors=getenv("COLI_MODEL_MIRROR");
-    if(mirrors&&*mirrors)
-        fprintf(stderr,"[qwen38 MIRROR] COLI_MODEL_MIRROR is not applied to a WEX4 container: every record comes from %s\n",path);
+    {   /* COLI_MODEL_MIRROR: byte copies of the container, under its file name, in other directories */
+        char own[1024];
+        snprintf(own,sizeof own,"%s",path);
+        char *slash=strrchr(own,'/');
+#ifdef _WIN32
+        char *back=strrchr(own,'\\');
+        if(back&&(!slash||back>slash))slash=back;
+#endif
+        if(slash)*slash=0;else snprintf(own,sizeof own,".");
+        q38_x4_mirrors(x,own,NULL);
+    }
     fprintf(stderr,"[qwen38] MXFP4 experts from the WEX4 container %s: records of %lld bytes%s, root %s%s; "
                    "first-read SHA-256 %s\n",path,(long long)x->record_bytes,model,root,pinned?" (pinned)":"",
             x->wex_sha?"on":"off");
