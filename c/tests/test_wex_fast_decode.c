@@ -653,7 +653,7 @@ int main(int argc, char **argv) {
     setbuf(stdout, NULL);
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--mutate") && i + 1 < argc) mutations = atol(argv[++i]);
-        else if (!strcmp(argv[i], "--seed") && i + 1 < argc) rng_state = strtoull(argv[++i], NULL, 0) | 1u;
+        else if (!strcmp(argv[i], "--seed") && i + 1 < argc) { uint64_t s = strtoull(argv[++i], NULL, 0); rng_state = s ? s : 1u; } /* every nonzero seed is its own stream; 0 is 1 (xorshift needs a nonzero state) */
         else if (!strcmp(argv[i], "--bench")) bench = 1;
         else if (!container) container = argv[i];
         else real_count = atoi(argv[i]);
