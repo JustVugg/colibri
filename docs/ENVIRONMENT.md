@@ -536,7 +536,7 @@ See `docs/glm53-flash.md`. The expert-worker knobs shared with `colibri`
 
 | Variable | Default | Effect |
 |---|---|---|
-| `GLM53_BITS` | `4` | Precision of the resident dense weights: 4, 8 or 32. Routed experts are not affected — they arrive already quantized in the container and are never requantized. |
+| `GLM53_BITS` | `4` | Precision of the resident dense weights: 4, 8 or 32. Routed experts are not affected — they arrive already quantized in the container and are never requantized. The shared experts of an MXFP4 checkpoint are resident: decoded from MXFP4 at load, then held at this precision (exactly the MXFP4 values at 32). |
 | `GLM53_EXPERT_GB` | measured | RAM budget (GB) for the expert LRU cache; per-layer slots are derived from it. Unset, it is taken from reclaimable physical memory after the weights are loaded (Linux `MemAvailable`, Windows available physical memory, macOS free+file-backed+purgeable pages), minus a 3 GB margin. A fixed number is wrong in both directions: too small on a large machine leaves memory idle while the disk does all the work. |
 | `G53_DIRECT` | `1` (on) | GLM-5.3: the routed experts read from the disk with `O_DIRECT`, straight into the expert cache's slots. `0` reads them through the page cache, as before. With the RAM given to the expert tier's host pool the page cache keeps nothing for long, and a buffered read is reclaimed again at once. Falls back to buffered reads where the file system refuses `O_DIRECT`. |
 | `GLM53_MAXT` | `8192` | KV state capacity in tokens, and the session size in serve mode. |

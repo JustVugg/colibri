@@ -687,9 +687,17 @@ typedef struct {
                                            * dequantized, which that op reads (glm53_chain.h) */
     void *cu; int cu_no;                  /* COLI_CUDA: the device's copy (cu_dense.h), NULL before its
                                            * first use; cu_no once the matrix stays the CPU's */
+    const uint8_t *e8;                    /* fmt 7 (G53_MX): the ue8m0 scale bytes, one per 32 columns */
 } Mat;
 
-enum { G53_GGML = 32 };
+/* fmt 7 (G53_MX): an MXFP4 routed expert of an AMD Quark checkpoint, as the file has it: q4 the
+ * e2m1 codes [rows][columns/2] (low nibble the even column), e8 the ue8m0 exponents
+ * [rows][columns/32] (`name.weight_scale`); computed by quant.h's matmul_mxfp4, never re-encoded. */
+enum { G53_GGML = 32, G53_MX = 7 };
+static void g53_mx(float *out, const Mat *w, const float *x, int S, int row0, int rows) {
+    const size_t packed = (size_t)w->columns / 2, groups = (size_t)w->columns / 32;
+    matmul_mxfp4(out, x, w->q4 + (size_t)row0 * packed, w->e8 + (size_t)row0 * groups, S, w->columns, rows);
+}
 /* out[S][rows] = W[row0 .. row0+rows) x[S] for a GGUF matrix, on ggml_quants.h */
 static void g53_gq(float *out, const Mat *w, const float *x, int S, int row0, int rows) {
     const int64_t rb = gq_row_bytes(w->gs, w->columns);
@@ -769,6 +777,8 @@ typedef struct {
     int64_t *gx_len;                      /* ... and bytes; no scale pieces (1/3/5 stay empty) */
     int *gx_h;                            /* ... as the slots hold them: interleaved by 16 rows where
                                            * coli_ggml_held_type says so (G53_ILV16=0: the file's) */
+    int mx;                               /* MXFP4 experts (an AMD Quark checkpoint): each matrix `name.weight` U8
+                                           * e2m1 codes and `name.weight_scale` U8 ue8m0 exponents, fmt 7 (G53_MX) */
     uint64_t clock, ebytes;
     long hits, miss;
     /* Telemetria per la dashboard (#1376 follow-up: Brain e Profile erano
@@ -1031,6 +1041,37 @@ static Mat load_mat(GModel *m, int64_t rows, int64_t columns, const char *fmt, .
      * riquantizzare quello che e' gia' quantizzato perde bit per niente. */
     if (t->dtype == 3) {                  /* U8/I8 in st.h: il container int4 */
         char scales[544];
+        snprintf(scales, sizeof(scales), "%s_scale", name);
+        st_tensor *mx = st_find(&m->S, scales);
+        if (mx) {
+            /* MXFP4 (AMD Quark: `name` the e2m1 codes [rows][columns/2], `name_scale` the ue8m0
+             * exponents [rows][columns/32]): the shared experts of an MXFP4 checkpoint. Resident, so
+             * they take the dense matrices' form: decoded to f32 here, then GLM53_BITS as every
+             * other dense matrix (at GLM53_BITS=32 the MXFP4 values exactly). */
+            if (columns % 32 || t->rank != 2 || mx->rank != 2 || t->shape[0] != rows || t->shape[1] * 2 != columns ||
+                mx->shape[0] != rows || mx->shape[1] * 32 != columns || mx->dtype != 3) {
+                fprintf(stderr, "%s: not an MXFP4 matrix of %lld x %lld (codes [rows][columns/2], scales "
+                                "[rows][columns/32])\n", name, (long long)rows, (long long)columns);
+                exit(1);
+            }
+            uint8_t *codes = malloc((size_t)t->nbytes), *exps = malloc((size_t)mx->nbytes);
+            float *buffer = malloc((size_t)rows * (size_t)columns * sizeof(float));
+            if (!codes || !exps || !buffer) { fprintf(stderr, "OOM on %s\n", name); exit(1); }
+            st_read_raw(&m->S, name, codes, 1);
+            st_read_raw(&m->S, scales, exps, 1);
+            for (int64_t r = 0; r < rows; r++)
+                for (int64_t col = 0; col < columns; col++) {
+                    const uint8_t byte = codes[r * (columns / 2) + col / 2];
+                    buffer[r * columns + col] = mx4_lut[col & 1 ? byte >> 4 : byte & 15] *
+                                                mx4_scale(exps[r * (columns / 32) + col / 32]);
+                }
+            free(codes); free(exps);
+            mat = quantize_loaded(buffer, (int)rows, (int)columns);
+#ifdef COLI_VULKAN
+            if (!(mat.vk_name = strdup(name))) { fprintf(stderr, "OOM on %s\n", name); exit(1); }
+#endif
+            return mat;
+        }
         snprintf(scales, sizeof(scales), "%s.qs", name);
         st_tensor *qs = st_find(&m->S, scales);
         if (!qs) {
@@ -1174,6 +1215,7 @@ static void mv_rows(float *out, const Mat *w, const float *x, int row0, int rows
 #endif
     switch (w->fmt) {
     case G53_GGML: g53_gq(out, w, x, 1, row0, rows); break;
+    case G53_MX: g53_mx(out, w, x, 1, row0, rows); break;
     case 4: {
         const int packed = (w->columns + 1) / 2, groups = w->columns / w->gs;
         matmul_i4_grouped(out, x, w->q4 + (size_t)row0 * packed,
@@ -1233,6 +1275,7 @@ static void mv(float *out, const Mat *w, const float *x) {
 #endif
     switch (w->fmt) {
     case G53_GGML: g53_gq(out, w, x, 1, 0, w->rows); break;
+    case G53_MX: g53_mx(out, w, x, 1, 0, w->rows); break;
     case 4: matmul_i4_grouped(out, x, w->q4, w->s, 1, w->columns, w->rows, w->gs); break;
     case 1: matmul_q(out, x, w->q8, w->s, 1, w->columns, w->rows); break;
     default: matmul(out, x, w->f, 1, w->columns, w->rows); break;
@@ -1251,6 +1294,7 @@ static void mm(float *out, const Mat *w, const float *x, int S) {
     if (g53_cu_mm(w, out, x, S)) return;
 #endif
     if (w->fmt == G53_GGML) { g53_gq(out, w, x, S, 0, w->rows); return; }   /* GGUF: all S rows at once */
+    if (w->fmt == G53_MX) { g53_mx(out, w, x, S, 0, w->rows); return; }     /* MXFP4: all S rows at once */
     int gpu = 0;
 #ifdef COLI_METAL
     gpu |= g_metal_ready && w->resident && (w->fmt == 1 || w->fmt == 4);
@@ -1286,6 +1330,7 @@ static void mm_rows(float *out, const Mat *w, const float *x, int S, int row0, i
 #endif
     switch (w->fmt) {
     case G53_GGML: g53_gq(out, w, x, S, row0, rows); break;
+    case G53_MX: g53_mx(out, w, x, S, row0, rows); break;
     case 4: {
         const int packed = (w->columns + 1) / 2, groups = w->columns / w->gs;
         matmul_i4_grouped(out, x, w->q4 + (size_t)row0 * packed,
@@ -1662,7 +1707,8 @@ static void expert_geometry(GModel *m) {
         return;
     }
     const int64_t packed = inter * hidden / 2;
-    const int64_t scales = inter * hidden / 64 * (int64_t)sizeof(float);
+    /* int4 gs64: an f32 scale per 64 values; MXFP4: a ue8m0 byte per 32 */
+    const int64_t scales = m->mx ? inter * hidden / 32 : inter * hidden / 64 * (int64_t)sizeof(float);
     const int64_t length[GLM53_EXPERT_PIECES] = { packed, scales, packed, scales, packed, scales };
     int64_t at = 0;
     for (int p = 0; p < GLM53_EXPERT_PIECES; p++) {
@@ -1678,11 +1724,17 @@ static void expert_geometry(GModel *m) {
  * modello, e leggerlo lo stesso vorrebbe dire calcolare su byte a caso. */
 static void expert_table_init(GModel *m) {
     const Cfg *c = &m->c;
-    static const char *piece[GLM53_EXPERT_PIECES] = {
+    static const char *i4_piece[GLM53_EXPERT_PIECES] = {
         "gate_proj.weight", "gate_proj.weight.qs",
         "up_proj.weight",   "up_proj.weight.qs",
         "down_proj.weight", "down_proj.weight.qs",
     };
+    static const char *mx_piece[GLM53_EXPERT_PIECES] = {   /* AMD Quark MXFP4 */
+        "gate_proj.weight", "gate_proj.weight_scale",
+        "up_proj.weight",   "up_proj.weight_scale",
+        "down_proj.weight", "down_proj.weight_scale",
+    };
+    const char *const *piece = m->mx ? mx_piece : i4_piece;
     m->eref = calloc((size_t)c->n_layers * c->n_experts, sizeof(*m->eref));
     if (!m->eref) { fprintf(stderr, "OOM allocating expert table\n"); exit(1); }
     if (m->gx) {   /* a GGUF: three pieces, each its slice of the fused tensor */
@@ -2062,6 +2114,17 @@ static void glm53_mirror_setup(GModel *m, const char *primary_dir) {
             valid ? " (COLI_DISK_WEIGHTS)" : " (startup bandwidth probe)");
 }
 
+/* The routed experts' form, read off the first expert of the first sparse layer (`name` its
+ * gate_proj.weight): 1 when they stream from disk (the int4 container, a GGUF, or MXFP4: U8 codes
+ * with a `weight_scale` beside them), with m->gx and m->mx set. */
+static int g53_expert_form(GModel *m, const st_tensor *probe, const char *name) {
+    char scale[560];
+    snprintf(scale, sizeof scale, "%s_scale", name);
+    m->gx = st_is_ggml(probe->dtype);   /* a GGUF's quantized experts stream too */
+    m->mx = probe->dtype == 3 && st_find(&m->S, scale) != NULL;
+    return probe->dtype == 3 || m->gx;
+}
+
 static int glm53_expert_read_replica(GModel *m, const ERef *ref, int layer, int eid) {
     int rep = glm53_expert_replica(layer, eid);
 
@@ -2255,13 +2318,22 @@ static void expert_mats(const GModel *m, int layer, const Slot *slot, Mat *gate,
         down->q4 = slot->piece[4]; down->gs = t[2]; down->rows = hidden; down->columns = inter;
         return;
     }
+    if (m->mx) {   /* MXFP4: the codes and the ue8m0 bytes as the checkpoint (or the container) has them */
+        memset(gate, 0, sizeof *gate); memset(up, 0, sizeof *up); memset(down, 0, sizeof *down);
+        gate->fmt = up->fmt = down->fmt = G53_MX;
+        gate->gs = up->gs = down->gs = 32;
+        gate->q4 = slot->piece[0]; gate->e8 = slot->piece[1]; gate->rows = inter; gate->columns = hidden;
+        up->q4 = slot->piece[2]; up->e8 = slot->piece[3]; up->rows = inter; up->columns = hidden;
+        down->q4 = slot->piece[4]; down->e8 = slot->piece[5]; down->rows = hidden; down->columns = inter;
+        return;
+    }
     const Mat shape[3] = {
         { 4, NULL, NULL, slot->piece[0], (const float *)slot->piece[1],
-          inter, hidden, 64, NULL, 0, NULL, NULL, 0, 0, 0, NULL, 0 },
+          inter, hidden, 64, NULL, 0, NULL, NULL, 0, 0, 0, NULL, 0, NULL },
         { 4, NULL, NULL, slot->piece[2], (const float *)slot->piece[3],
-          inter, hidden, 64, NULL, 0, NULL, NULL, 0, 0, 0, NULL, 0 },
+          inter, hidden, 64, NULL, 0, NULL, NULL, 0, 0, 0, NULL, 0, NULL },
         { 4, NULL, NULL, slot->piece[4], (const float *)slot->piece[5],
-          hidden, inter, 64, NULL, 0, NULL, NULL, 0, 0, 0, NULL, 0 },
+          hidden, inter, 64, NULL, 0, NULL, NULL, 0, 0, 0, NULL, 0, NULL },
     };
     *gate = shape[0]; *up = shape[1]; *down = shape[2];
 }
@@ -3155,7 +3227,7 @@ static int glm53_worker_open(GModel *m, const char *dir) {
                         "this checkpoint's are resident\n", dir);
         return 2;
     }
-    m->streaming = 1;
+    m->streaming = g53_expert_form(m, probe, first);   /* int4 gs64, or MXFP4 */
     expert_geometry(m);
     expert_table_init(m);
     expert_cache_init(m);
@@ -3392,7 +3464,7 @@ static void ffn_layer_ex(GModel *m, const GLayer *l, int index, const float *x,
          * On any backend refusal/fault, run the original CPU loop unchanged. */
         int metal_done = 0;
 #ifdef COLI_METAL
-        if (g_metal_ready && !m->gx) {   /* GGUF experts: the CPU's ggml_quants.h only, for now */
+        if (g_metal_ready && !m->gx && !m->mx) {   /* GGUF and MXFP4 experts: the CPU's kernels only, for now */
             g_metal_moe_attempt++;
             const int max_rows = tokens * topk;
             const void **mg = malloc((size_t)here * sizeof(*mg));
@@ -3631,8 +3703,7 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
                  P, probe_layer);
         st_tensor *probe_expert = st_find(&m->S, first);
         if (!probe_expert) { fprintf(stderr, "missing %s\n", first); exit(1); }
-        m->gx = st_is_ggml(probe_expert->dtype);   /* a GGUF's quantized experts stream too */
-        m->streaming = probe_expert->dtype == 3 || m->gx;
+        m->streaming = g53_expert_form(m, probe_expert, first);
     }
     if (m->streaming) {
         expert_geometry(m);
@@ -5830,6 +5901,7 @@ static void glm53_vk_tier_start(GModel *m) {
         const int sparse = m->layer_end > from ? m->layer_end - from : 0;
         const int cap = m->ecache && sparse ? m->ecache[from].cap : 0;
         VktFmt gu = {VKT_SRC_I4U_PAIRS_GS, 64}, dn = gu, *lgu = NULL, *ldn = NULL;
+        if (m->mx) gu = dn = (VktFmt){VKT_SRC_MXFP4_E8M0, 32};   /* e2m1 pairs and a ue8m0 byte per 32: fmt 7 */
         const char *no = NULL;
         if (m->gx) {
             /* a GGUF's experts go to the device as the file has them (shaders/blockdec.glsl),

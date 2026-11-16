@@ -7,6 +7,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### New
 
+- **GLM-5.3-Flash: AMD's MXFP4 checkpoint as published** (`amd/GLM-5.3-Flash-Quark-MXFP4`): routed
+  experts with a `weight_scale` beside them stream as MXFP4 (fmt 7, `matmul_mxfp4`, the file's bytes),
+  and go to the Vulkan and CUDA expert tiers as `VKT_SRC_MXFP4_E8M0`; MXFP4 shared experts are
+  decoded at load and held at `GLM53_BITS`. The int4 container and GGUF checkpoints load as before
+  ([docs/glm53-flash.md](docs/glm53-flash.md)).
 - **`c/tools/wex_bench.py`**: the WEX measurements in one command (machine, `wex4_verify`,
   WNR3 decode per decoder and stream count with byte identity, record reads, an engine A/B of
   shards against the container), and a report to paste into #2860; `c/tools/wex_decode_bench.c`
