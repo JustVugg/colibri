@@ -30,11 +30,39 @@ carries and how to use it. The bytes are specified there, not here:
 | `c/tools/wex4_verify.c` | checks a WEX4 file and prints its root |
 | `c/tests/test_wex_format.c` | the codecs and validators on synthetic records, with corruption cases |
 | `c/tests/test_wex4_verify.c`, `c/tests/wex4_fixture.h` | the tool on synthetic WEX4 files; the fixture writes a WEX4 file in memory the way the in-place upgrade of a WEX1 file does |
+| `c/wex_decode.c`, `c/wex_decode.h` | WNR3 records on the CPU: the process's WNM2 model registry (`coli_wex_register_model`, and `coli_wex4_register_model` for a WEX4 container's blob, checked against its index hash) and the in-place decode of one record (`coli_wex_decode_record`) |
+| `c/tests/test_wex_decode.c`, `c/tests/wnr3_fixture.h` | the registry and the decode on records made by the reference encoder; the fixture trains a model and writes the WNR3 form of a WEX4 container |
 
 The files are kept byte for byte in step with Wex-WRN2's `c/` folder (only the line endings,
 that repository's licence header, and the include guards and two comments, reworded here, differ); a change to the format goes there first, with its
 specification and its conformance vectors. Comments in them that name a `docs/` or `wex4/` path
-mean a path of that repository.
+mean a path of that repository. `wex_decode.c` and `wex_decode.h` are the exception: Wex-WRN2's
+copy also loads an optional CUDA helper that decodes on the GPU, which is not here (the GPU decode
+comes later), and colibri's adds `coli_wex4_register_model` and the `COLI_WEX_DECODE_API` macro.
+
+### Linking `wex_decode.c`
+
+An engine that is one translation unit includes it:
+
+```c
+#define COLI_WEX_DECODE_API static inline
+#include "wex_decode.c"
+```
+
+so every engine has its own model registry and no two engines linked into one library (the
+segment adapters link qwen38 with DeepSeek V4) define the same symbol. A container registers its
+model at open and decodes in the same unit. Compiled on its own (`cc -c wex_decode.c`) the
+functions are ordinary external ones.
+
+### WNR3 on the CPU
+
+A WNR3 record (codec 5) is an MXFP4 expert record coded with rANS against a small model shared
+by the container (a WNM2 blob, 59,408 bytes). Every stream carries a 23-bit check, so a damaged
+record is refused rather than decoded to other bytes; a canonical-zero (`CZ`) record stores the
+FP4 value -0 as +0, so it decodes to the same values, not the same bytes (the container's records
+say so with their value-exact flag). The decoder here is the reference one of
+`wex_neural_rans.h`, one record per thread: on an Intel i7-7700K, 24.7 MB/s on one thread (761 ms
+for one 18.8 MB DeepSeek V4.1 Flash expert) and about 155 MB/s with 8 records at once.
 
 ## Checking a container
 
@@ -149,5 +177,6 @@ Vulkan tier's prewarm reads.
 
 ## Status in colibri
 
-DeepSeek V4, DeepSeek V4.1 and Qwen3.8 read RAW records from a WEX4 container. WNR3 records,
-their GPU decode and the I/O switches (several drives, split reads) are the next series.
+DeepSeek V4, DeepSeek V4.1 and Qwen3.8 read RAW records from a WEX4 container. `wex_decode.c`
+decodes WNR3 records on the CPU; the engines read them in the next PRs. Their GPU decode and the
+I/O switches (several drives, split reads) come after.

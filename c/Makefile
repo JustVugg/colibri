@@ -3943,6 +3943,11 @@ tools/wex4_verify$(EXE): tools/wex4_verify.c
 tests/test_wex4_verify$(EXE): tests/test_wex4_verify.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# WNR3 records on the CPU (wex_decode.c): the WNM2 model registry, a container's model blob,
+# the in-place decode, changed records, several threads. Records made by the reference encoder.
+tests/test_wex_decode$(EXE): tests/test_wex_decode.c
+	$(CC) $(CFLAGS) $< -o $@ -pthread $(LDFLAGS)
+
 # ---------------------------------------------------------------------------
 # Generated header prerequisites (#1741)
 #
