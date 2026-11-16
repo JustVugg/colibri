@@ -7,6 +7,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### New
 
+- **Qwen3.8 reads WNR3 records from a WEX4 container** (`COLI_WEX_PATH`): the WNM2 model blob
+  checked and registered at attach; each WNR3 record decoded on the CPU by the thread that reads
+  it, never mapped; one that names another expert or does not decode stops the engine, as a
+  damaged container does. RAW containers and an unset `COLI_WEX_PATH` behave as before.
+  `tests/test_qwen38_wex4.c`.
 - **DeepSeek V4 reads WNR3 records from a WEX4 container** (`COLI_WEX_PATH`): the container's
   WNM2 model blob checked against its index hash and registered at open; each WNR3 record read
   at the end of its page and decoded in the slot's slab on the CPU, after its owner (and its
