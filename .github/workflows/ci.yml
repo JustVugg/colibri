@@ -1,10 +1,21 @@
 name: CI
 
+# A change that touches only documentation skips this workflow; check.yml (make check,
+# the Python suite and the docs tests in it) still runs on it. A pull request that
+# changes any other file runs every job here, docs included (#2826).
 on:
   pull_request:
     branches: [dev, main]
+    paths-ignore:
+      - 'docs/**'
+      - 'site/**'
+      - '**/*.md'
   push:
     branches: [dev, main]
+    paths-ignore:
+      - 'docs/**'
+      - 'site/**'
+      - '**/*.md'
 
 # CI only reads the tree; no job here writes to the repo. Pin the token to
 # read-only so a compromised step (or action) cannot push, tag or release.
@@ -35,10 +46,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Every core: the suite is ~320 binaries, each built on its own (make test-c builds
+      # them all, then runs them one after the other, so -j changes no test's run).
       - name: Build colibri + inkling
-        run: cd c && make colibri inkling
+        run: cd c && make -j"$(nproc)" colibri inkling
       - name: C test suite
-        run: cd c && make test-c
+        run: cd c && make -j"$(nproc)" test-c
       - name: The CUDA engines' host side without AVX2 (as an ARM host with a card builds it)
         run: cd c && make cuda-host-syntax ARCH=x86-64
 
@@ -208,6 +221,11 @@ jobs:
     name: Vulkan engines (${{ matrix.family }}, Lavapipe)
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # The legs build several engines a call (`make qwen36 qwen38 ... VK=1`): on every core.
+    # vulkan_engines.sh runs each engine and test itself, one at a time; the fixture
+    # generators it calls through make keep -j1 there.
+    env:
+      MAKEFLAGS: -j4
     strategy:
       fail-fast: false
       matrix:
@@ -613,15 +631,18 @@ jobs:
           rc=0
           ENGINES="colibri glm53 inkling kimi_k3 olmoe qwen36 qwen38 deepseek_v41 mimo qwenimage laya gliner_decide"
           if [ "${{ matrix.v4 }}" = "1" ]; then ENGINES="$ENGINES deepseek-v4"; fi
+          # -j: deepseek-v4 is a dozen units, and the macOS and Windows runners have the cores
+          # (one engine a call, so a failure still names its engine)
+          JOBS=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)
           for t in $ENGINES; do
             echo "::group::$t"
-            make $t ${{ matrix.make_args }} || { echo "FAILED: $t"; rc=1; }
+            make -j"$JOBS" $t ${{ matrix.make_args }} || { echo "FAILED: $t"; rc=1; }
             echo "::endgroup::"
           done
           # the release's DeepSeek V4 as well (the flags stamp rebuilds its units)
           if [ -n "${{ matrix.v4_args }}" ]; then
             echo "::group::deepseek-v4 ${{ matrix.v4_args }}"
-            make deepseek-v4 ${{ matrix.make_args }} ${{ matrix.v4_args }} || { echo "FAILED: deepseek-v4 ${{ matrix.v4_args }}"; rc=1; }
+            make -j"$JOBS" deepseek-v4 ${{ matrix.make_args }} ${{ matrix.v4_args }} || { echo "FAILED: deepseek-v4 ${{ matrix.v4_args }}"; rc=1; }
             echo "::endgroup::"
           fi
           exit $rc
@@ -2241,7 +2262,8 @@ jobs:
           # plus PTX, one file for the 30xx, 40xx and 50xx cards (#1405). The
           # runner cannot execute it; the artifact below is for the people who
           # can, until the release ships it.
-          make cuda-dll CUDA_ARCH=portable
+          # --threads 0: nvcc compiles the portable fatbin's five architectures at once
+          NVCC_APPEND_FLAGS="--threads 0" make cuda-dll CUDA_ARCH=portable
           test -f coli_cuda.dll || { echo "cuda-dll reported success but produced no DLL" >&2; exit 1; }
           ls -l coli_cuda.dll
           echo "coli_cuda.dll built (MSVC host, portable gencode)"
@@ -2279,7 +2301,7 @@ jobs:
           # coli_cuda_dsv4.dll (portable: sm_80/86/89/90/120 + PTX). DSV4_TC=0
           # leaves out the opt-in cuBLASLt path, so neither needs more than the
           # cudart64_12.dll beside it and the driver (#2047).
-          make cuda-dsv4-dll CUDA_ARCH=portable DSV4_TC=0
+          NVCC_APPEND_FLAGS="--threads 0" make cuda-dsv4-dll CUDA_ARCH=portable DSV4_TC=0
           make cuda-dsv4-dg-dll DSV4_TC=0
           for d in coli_cuda_dsv4.dll coli_cuda_dsv4_dg.dll; do
             test -f $d || { echo "$d: the target reported success but produced no DLL" >&2; exit 1; }
