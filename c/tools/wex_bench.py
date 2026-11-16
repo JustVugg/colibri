@@ -49,8 +49,9 @@ class Scrubber:
     def __init__(self):
         self.pairs = []
         self.words = []
+        generic = {"root", "user", "admin", "administrator", "runner", "ubuntu", "guest", "localhost", "debian", "fedora"}
         for word in {self._safe(getpass.getuser), self._safe(socket.gethostname), self._safe(platform.node)}:
-            if word and len(word) >= 3:
+            if word and len(word) >= 3 and word.lower() not in generic:   # "root" names no one, and is a word of the report
                 self.words.append(word)
         self.add(os.path.expanduser("~"), "<home>")
         self.add(REPO, "<repo>")
