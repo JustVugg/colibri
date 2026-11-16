@@ -7,6 +7,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### New
 
+- **DeepSeek V4.1 reads WNR3 records from a WEX4 container** (`COLI_WEX_PATH`): the published
+  REAP-192 container (7,680 WNR3 records) runs end to end, the trunk from the shards; each
+  record read whole by one reader thread and decoded on the CPU into the expert's six windows,
+  after its owner (and its SHA-256 at the first read, when asked); one that fails is read from
+  the shards for the run. Same tokens as the shards; on a 4-core CPU about 3x slower (the
+  decode is the bottleneck). RAW containers and an unset `COLI_WEX_PATH` behave as before.
+  `tests/test_dsv41_wex4.c`.
 - **Qwen3.8 reads WNR3 records from a WEX4 container** (`COLI_WEX_PATH`): the WNM2 model blob
   checked and registered at attach; each WNR3 record decoded on the CPU by the thread that reads
   it, never mapped; one that names another expert or does not decode stops the engine, as a

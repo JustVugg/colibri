@@ -182,20 +182,30 @@ from one contiguous record:
 
 ```
 open      v41_wex_open      header page, index, grid (n_layers x n_routed), COLI_WEX_ROOT,
-                            every expert record RAW with the checkpoint's shapes and part sizes
+                            every expert record RAW or WNR3 with the checkpoint's shapes and part
+                            sizes; WNR3: the WNM2 blob checked against the index and registered
                             (any failure: a [v41_wex] line, and the shards serve every expert)
 miss      expert_read_list  a backbone expert the container holds -> its six tensors in the container
-          expert_fetch      the same windows, the same readers, O_DIRECT where there is one
+          expert_fetch      RAW: the same windows, the same readers, O_DIRECT where there is one
           v41_wex_check     COLI_WEX_VERIFY, first read: the six parts in record order and the zero
                             padding against the index's SHA-256; a mismatch -> that expert read again
                             from the shards, and from the shards for the rest of the run
+          v41_wex_fetch_nr3 WNR3: one reader takes the expert's first part and reads the whole stored
+                            record into a pooled page (one O_DIRECT read), hashes it at the first read
+                            (COLI_WEX_VERIFY), checks its owner and canonical-zero flag, decodes it in
+                            place (coli_wex_decode_record) and copies the six parts into the windows;
+                            a failure -> that expert read again from the shards, and from them for
+                            the rest of the run
 ```
 
 The DSpark stages, a GGUF's experts and every other tensor stay on the shards; so do the
-Vulkan tier's prewarm reads.
+Vulkan tier's prewarm reads. With `V41_READ_DEPTH` readers (8 by default) up to that many WNR3
+records decode at once; each holds a page of the decoded size from the reader pool and the
+decoder's own scratch of the same size while it runs. The run prints a last line
+`[v41_wex] container: N records read (M WNR3 decoded), K refused`.
 
 ## Status in colibri
 
-DeepSeek V4, DeepSeek V4.1 and Qwen3.8 read RAW records from a WEX4 container; DeepSeek V4 and
-Qwen3.8 also read WNR3 records, decoded on the CPU (`wex_decode.c`). DeepSeek V4.1 reads them in
-the next PR. Their GPU decode and the I/O switches (several drives, split reads) come after.
+DeepSeek V4, DeepSeek V4.1 and Qwen3.8 read RAW and WNR3 records from a WEX4 container, WNR3
+decoded on the CPU (`wex_decode.c`). Their GPU decode and the I/O switches (several drives,
+split reads) are the next series.
