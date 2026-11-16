@@ -2229,39 +2229,42 @@ static const WexEntry *v41_wex_nr3(const Model *m, const ExpertRead *r, int laye
     return e->flags == WEX_ENTRY_NEURAL_RANS3 ? e : NULL;
 }
 
-/* One WNR3 record into the six windows of slot s: its stored bytes read whole at the end of a
- * pooled page (one O_DIRECT read where there is one), hashed at the first read when
- * COLI_WEX_VERIFY is on, its owner and canonical-zero flag checked, decoded in place on this
- * reader thread, and each part copied to its window at the offset expert_fetch publishes
- * (the part's offset in the record, mod ST_DIRECT_ALIGN). Returns the bytes read; a record
- * that fails is refused (v41_wex_refuse) and expert_fetch reads the expert from the shards. */
+/* One WNR3 record into the six windows of slot s: its stored bytes read whole into a pooled
+ * buffer of that size (one O_DIRECT read where there is one), hashed at the first read when
+ * COLI_WEX_VERIFY is on, its owner and canonical-zero flag checked, and decoded on this reader
+ * thread straight into the windows (coli_wex_decode_record_to), each part at the offset
+ * expert_fetch publishes (the part's offset in the record, mod ST_DIRECT_ALIGN): no decoded
+ * page and no copy, so a reader holds the stored record only (about 16 MB on V4.1 Flash
+ * REAP-192 against 2 x 18.8 MB before). Returns the bytes read; a record that fails is refused
+ * (v41_wex_refuse) and expert_fetch reads the expert from the shards over whatever the decode
+ * left in the windows. */
 static uint64_t v41_wex_fetch_nr3(Model *m, int layer, int eid, const WexEntry *e, Slot *s, int rep) {
     V41Wex *w = m->wex;
     const size_t cell = (size_t)layer * m->c.n_routed + eid;
-    uint64_t raw, aligned;
-    if (wex_entry_raw_sizes(e, &raw, &aligned)) { v41_wex_refuse(w, layer, eid, "has an invalid entry"); return 0; }
-    const size_t at = wex_record_read_offset(e);
+    unsigned char *scales[3], *weights[3];
+    for (int j = 0; j < 6; j++) {   /* record order: w1, w2, w3 scales, then their weights */
+        const int part = v41_wex_part[j];
+        const st_tensor *t = &w->t[cell * 6 + part];
+        if (j < 3) scales[j] = s->base[part] + t->off % ST_DIRECT_ALIGN;
+        else weights[j - 3] = s->base[part] + t->off % ST_DIRECT_ALIGN;
+    }
     int64_t got = 0;
-    uint8_t *page = scratch_get((int64_t)aligned, &got);
-    st_read_range_rep(&w->S, w->t[cell * 6].fd, rep, (int64_t)e->file_offset, (int64_t)e->total_bytes, page + at,
+    uint8_t *record = scratch_get((int64_t)e->total_bytes, &got);
+    st_read_range_rep(&w->S, w->t[cell * 6].fd, rep, (int64_t)e->file_offset, (int64_t)e->total_bytes, record,
                       (int64_t)e->total_bytes, 1, expert_direct(), "pread WNR3 expert");
     const char *why = NULL;
     if (w->sha && !__atomic_load_n(&w->state[cell], __ATOMIC_ACQUIRE)) {
         unsigned char digest[32];
-        wex4_sha256(page + at, e->total_bytes, digest);
+        wex4_sha256(record, e->total_bytes, digest);
         if (memcmp(digest, w->sha + cell * 32, 32)) why = "does not match its SHA-256 in the index";
         else __atomic_store_n(&w->state[cell], (unsigned char)1, __ATOMIC_RELEASE);
     }
-    if (!why && !wex_nr3_owner_ok(e, page + at, (uint32_t)layer, (uint32_t)eid, w->nr3_flags))
+    if (!why && !wex_nr3_owner_ok(e, record, (uint32_t)layer, (uint32_t)eid, w->nr3_flags))
         why = "names another expert, or another canonical-zero form";
-    if (!why && coli_wex_decode_record(e, page, (size_t)aligned)) why = "does not decode (a WNR3 stream check failed)";
+    if (!why && coli_wex_decode_record_to(e, record, scales, weights))
+        why = "does not decode (a WNR3 stream check failed)";
     if (why) v41_wex_refuse(w, layer, eid, why);
-    else
-        for (int part = 0; part < 6; part++) {
-            const st_tensor *t = &w->t[cell * 6 + part];
-            memcpy(s->base[part] + t->off % ST_DIRECT_ALIGN, page + t->off, (size_t)t->nbytes);
-        }
-    scratch_put(page, got);
+    scratch_put(record, got);
     return why ? 0 : e->total_bytes;
 }
 

@@ -3,8 +3,8 @@
  * WNR3 records made by the reference encoder (tests/wnr3_fixture.h). The loader runs once per
  * process, so each case runs in a child process of its own with its own environment.
  *
- * With the helper, coli_wex_decode_record hands it a WNR3 record and gets the CPU decoder's
- * bytes; a record it does not decode (unavailable, or a feature it lacks) is decoded on the CPU,
+ * With the helper, coli_wex_decode_record (and coli_wex_decode_record_to, straight into
+ * six buffers) hands it a WNR3 record and gets the CPU decoder's bytes; a record it does not decode (unavailable, or a feature it lacks) is decoded on the CPU,
  * with the same bytes; a damaged record is refused either way. The device and batch calls give
  * each record's status, write only the destinations of records that decoded, and report 1 when
  * the helper lacks their feature. A missing library, one of another ABI, COLI_WEX_CUDA_LIB=0 or
@@ -95,6 +95,17 @@ static int decode(int i, int *same) {
     return status;
 }
 
+/* coli_wex_decode_record_to of record i into six buffers laid out as the slab: its status, *same as above */
+static int decode_to(int i, int *same) {
+    static unsigned char out[RAW];
+    unsigned char *scales[3], *weights[3];
+    memset(out, 0xA5, sizeof out);
+    for (unsigned m = 0; m < 3u; m++) { scales[m] = out + ent[i].scale_offsets[m]; weights[m] = out + ent[i].weight_offsets[m]; }
+    int status = coli_wex_decode_record_to(&ent[i], rec[i], scales, weights);
+    *same = !memcmp(out, raw[i], RAW);
+    return status;
+}
+
 static int untouched(const unsigned char *p, size_t n) {
     for (size_t i = 0; i < n; i++) if (p[i] != 0xA5) return 0;
     return 1;
@@ -121,6 +132,9 @@ static int child(const char *name) {
         CHECK(!decode(0, &same) && same && coli_wex_cuda_decode_count() == 1);
         CHECK(decode(1, &same) == -1);                                     /* refused by the helper, then the CPU */
         CHECK(!decode(2, &same) && same && coli_wex_cuda_decode_count() == 2);
+        CHECK(!decode_to(0, &same) && same && coli_wex_cuda_decode_count() == 3);   /* straight to buffers: the helper */
+        CHECK(decode_to(1, &same) == -1 && coli_wex_cuda_decode_count() == 3);
+        __atomic_store_n(&wex_cuda.host_decodes, UINT64_C(2), __ATOMIC_RELAXED);   /* the counts below, as before */
         device_views();
         CHECK(!coli_wex_cuda_decode_to_device(&ent[0], rec[0], 0, dscale, dweight) && !memcmp(dev[0], raw[0], RAW));
         CHECK(coli_wex_cuda_decode_to_device(&ent[1], rec[1], 0, dscale + 3, dweight + 3) == -1 && untouched(dev[1], RAW));
@@ -146,6 +160,8 @@ static int child(const char *name) {
         CHECK(bits == FEATURES);
         CHECK(!decode(0, &same) && same && coli_wex_cuda_decode_count() == 0);
         CHECK(decode(1, &same) == -1);
+        CHECK(!decode_to(2, &same) && same && coli_wex_cuda_decode_count() == 0);   /* the CPU after the helper's 1 */
+        CHECK(decode_to(1, &same) == -1);
     } else if (!strcmp(name, "batch-fail")) {     /* FAKE_WEX_BATCH_FAIL=0 */
         const WexEntry *es[2] = {&ent[0], &ent[2]};
         const unsigned char *rs[2] = {rec[0], rec[2]};
@@ -156,11 +172,13 @@ static int child(const char *name) {
     } else if (!strcmp(name, "no-nr3")) {         /* FAKE_WEX_FEATURES=5: no WNR3 in the helper */
         CHECK(bits == (1u | 4u));
         CHECK(!decode(0, &same) && same && coli_wex_cuda_decode_count() == 0);
+        CHECK(!decode_to(0, &same) && same && coli_wex_cuda_decode_count() == 0);
         device_views();
         CHECK(coli_wex_cuda_decode_to_device(&ent[0], rec[0], 0, dscale, dweight) == 1 && untouched(dev[0], RAW));
     } else if (!strcmp(name, "cpu")) {   /* no helper: every record on the CPU */
         CHECK(bits == 0);
         CHECK(!decode(0, &same) && same && decode(1, &same) == -1 && coli_wex_cuda_decode_count() == 0);
+        CHECK(!decode_to(0, &same) && same && decode_to(1, &same) == -1 && coli_wex_cuda_decode_count() == 0);
         device_views();
         CHECK(coli_wex_cuda_decode_to_device(&ent[0], rec[0], 0, dscale, dweight) == 1 && untouched(dev[0], RAW));
         CHECK(coli_wex_cuda_host_register(dev, sizeof dev) == 1);

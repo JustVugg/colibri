@@ -7,6 +7,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### New
 
+- **WNR3 records decoded straight into the expert's buffers, and the fast decoder's stream count
+  measured** (`coli_wex_decode_record_to`, `COLI_WEX_FAST_LANES`): DeepSeek V4.1 and Qwen3.8 read a
+  WNR3 record into a buffer of its stored size and decode it into the six windows / the expert
+  buffer, with no page of the decoded size, no decoder scratch and no copy (V4.1 REAP-192, 8
+  readers: about 301 MB of reader buffers -> 129 MB). The streams the fast decoder interleaves (4
+  fixed before) are measured on the first 16 records, on each thread's CPU clock: 6 on a 4-vCPU
+  Xeon VM, where real V4.1 records decode 18-19% faster with both changes (8 readers: 31.3 -> 25.6
+  ms a record), 4 where 4 is best; `COLI_WEX_FAST_LANES=N` fixes it. Same bytes, same refusals.
 - **GLM-5.3-Flash: the routed experts from a WEX4 container** (`COLI_WEX_PATH`, `COLI_WEX_ROOT`,
   `COLI_WEX_VERIFY`, `COLI_WEX_CUDA_LIB`): for AMD's MXFP4 checkpoint, a container written by
   Wex-WRN2's `pack --names qwen38` serves each expert as one record, RAW or WNR3 (decoded in the
