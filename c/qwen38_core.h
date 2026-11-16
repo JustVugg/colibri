@@ -2161,28 +2161,34 @@ static inline const WexEntry *q38_wex_nr3(const Model *m,int layer,int expert) {
     return e->flags==WEX_ENTRY_NEURAL_RANS3?e:NULL;
 }
 
-/* A WNR3 record into out (record_bytes): its stored bytes read at the end of its decoded page,
- * hashed (COLI_WEX_VERIFY, first use), its owner and canonical-zero flag checked, decoded in
- * place on this thread, copied out. A record that fails stops the engine, as a RAW one does. */
+/* A WNR3 record into out (record_bytes): its stored bytes read into a buffer of that size,
+ * hashed (COLI_WEX_VERIFY, first use), its owner and canonical-zero flag checked, and decoded
+ * on this thread straight into out (coli_wex_decode_record_to): no decoded page and no copy.
+ * A record that fails stops the engine, as a RAW one does. */
 static void q38_x4_read_nr3(Model *m,int layer,int expert,const WexEntry *e,void *out,int64_t cap,const char *tag) {
     Q38Int4Experts *x=m->x4;
-    const size_t page=(size_t)wex4_align((uint64_t)x->record_bytes),at=wex_record_read_offset(e);
+    const size_t stored=e->total_bytes;
     const char *why=NULL;
+    uint64_t raw=0,aligned=0;
     if(cap<x->record_bytes){fprintf(stderr,"%s: a buffer of %lld bytes for a record of %lld\n",tag,(long long)cap,(long long)x->record_bytes);exit(1);}
-    uint8_t *slab=NULL;
-    if(posix_memalign((void**)&slab,WEX4_PAGE,page)){fprintf(stderr,"OOM WNR3 expert record\n");exit(1);}
-    st_read_range_rep(&x->S,x->fd[layer],0,(int64_t)e->file_offset,(int64_t)e->total_bytes,slab+at,(int64_t)e->total_bytes,1,0,tag);
-    q38_wex_check(m,layer,expert,slab+at,(int64_t)e->total_bytes);
-    if(!wex_nr3_owner_ok(e,slab+at,(uint32_t)layer,(uint32_t)expert,x->wex_nr3_flags))
-        why="names another expert, or another canonical-zero form";
-    else if(coli_wex_decode_record(e,slab,page))why="does not decode (a WNR3 stream check failed)";
+    unsigned char *scales[3],*weights[3],*dst=(unsigned char*)out;
+    if(wex_entry_raw_sizes(e,&raw,&aligned)||raw!=(uint64_t)x->record_bytes)why="is not this sidecar's record size";
+    for(int k=0;k<3;k++){scales[k]=dst+e->scale_offsets[k];weights[k]=dst+e->weight_offsets[k];}
+    uint8_t *record=NULL;
+    if(posix_memalign((void**)&record,WEX4_PAGE,stored?stored:1)){fprintf(stderr,"OOM WNR3 expert record\n");exit(1);}
+    if(!why){
+        st_read_range_rep(&x->S,x->fd[layer],0,(int64_t)e->file_offset,(int64_t)stored,record,(int64_t)stored,1,0,tag);
+        q38_wex_check(m,layer,expert,record,(int64_t)stored);
+        if(!wex_nr3_owner_ok(e,record,(uint32_t)layer,(uint32_t)expert,x->wex_nr3_flags))
+            why="names another expert, or another canonical-zero form";
+        else if(coli_wex_decode_record_to(e,record,scales,weights))why="does not decode (a WNR3 stream check failed)";
+    }
+    compat_aligned_free(record);
     if(why){
         fprintf(stderr,"[qwen38] COLI_WEX_PATH %s: the record of layer %d expert %d %s -- the container is damaged; "
                        "refusing\n",x->wex,layer,expert,why);
         exit(1);
     }
-    memcpy(out,slab,(size_t)x->record_bytes);
-    compat_aligned_free(slab);
     __atomic_fetch_add(&x->wex_decoded,1,__ATOMIC_RELAXED);
 }
 

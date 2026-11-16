@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <pthread.h>
 
 /* ---- the CUDA helper (tools/wex_cuda_bridge.cu; docs/wex.md) -------------------
@@ -257,12 +258,103 @@ COLI_WEX_DECODE_API uint64_t coli_wex_fast_decode_count(void) {
     return __atomic_load_n(&wex_fast_decodes, __ATOMIC_RELAXED);
 }
 
+/* ---- streams a record (kernel 1's lanes) ----------------------------------------------
+ * How many streams kernel 1 interleaves is a matter of speed only (same bytes, same
+ * verdicts for every count), and the best count depends on the core: 4 on the i7-7700K
+ * where it was tuned, 6 on others. COLI_WEX_FAST_LANES = 1, 2, 3, 4, 6 or 8 fixes it;
+ * unset, 0 or anything else: measured on the process's first records. The first
+ * WEX_LANE_CHOICES x WEX_LANE_ROUNDS WNR3 records the fast decoder decodes (whichever
+ * threads decode them) take the counts in turn, each timed on its thread's CPU clock; once
+ * all are in, the count with the lowest time per decoded byte (best of its rounds) is used for every record
+ * after, and one stderr line says which. A record that is refused does not count (its
+ * turn goes to the next record). Records decoded meanwhile by other threads use
+ * WEX_FAST_LANES. The counts share one interleaved sample, so a busy machine slows each
+ * of them alike. */
+#define WEX_LANE_CHOICES 4
+#define WEX_LANE_ROUNDS 4
+static const int wex_lane_choice[WEX_LANE_CHOICES] = {3, 4, 6, 8};
+static struct {
+    int chosen;                              /* the count in use; 0 while measuring */
+    unsigned int ticket, done;               /* records handed a count to measure, and measured */
+    double best[WEX_LANE_CHOICES];           /* CPU time per decoded MB, best round; 0: none yet */
+} wex_lanes;
+static pthread_mutex_t wex_lanes_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* The calling thread's CPU time in ms (cycles on Windows, where the thread times tick at 15.6 ms; the
+ * counts are compared with each other only, so a cycle counts as a unit): time another thread took from
+ * this one on a busy machine, e.g. 8 readers on 4 cores, is not counted against the count being measured. */
+static double wex_now_ms(void) {
+#ifdef _WIN32
+    ULONG64 cycles = 0;
+    QueryThreadCycleTime(GetCurrentThread(), &cycles);
+    return (double)cycles * 1e-6;
+#else
+    struct timespec t;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t);
+    return (double)t.tv_sec * 1e3 + (double)t.tv_nsec * 1e-6;
+#endif
+}
+
+/* COLI_WEX_FAST_LANES: a count kernel 1 has, or 0 (measure). */
+static int wex_lanes_fixed(void) {
+    const char *value = getenv("COLI_WEX_FAST_LANES");
+    const int n = value && *value ? atoi(value) : 0;
+    return n == 1 || n == 2 || n == 3 || n == 4 || n == 6 || n == 8 ? n : 0;
+}
+
+/* The count for the next record; *choice >= 0 when that record is one of the measured. */
+static int wex_lanes_pick(int *choice) {
+    const int fixed = wex_lanes_fixed(), chosen = __atomic_load_n(&wex_lanes.chosen, __ATOMIC_ACQUIRE);
+    unsigned int ticket;
+    *choice = -1;
+    if (fixed) return fixed;
+    if (chosen) return chosen;
+    ticket = __atomic_fetch_add(&wex_lanes.ticket, 1u, __ATOMIC_RELAXED);
+    if (ticket >= WEX_LANE_CHOICES * WEX_LANE_ROUNDS) return WEX_FAST_LANES;
+    *choice = (int)(ticket % WEX_LANE_CHOICES);
+    return wex_lane_choice[*choice];
+}
+
+/* A measured record: decoded in ms, or refused (ms < 0): its ticket is handed out again, so every count gets its
+ * rounds from records that decode. The last of them picks the count. */
+static void wex_lanes_note(int choice, double ms, const WexEntry *entry) {
+    const double mb = (double)entry->scale_bytes / 1e6 + (double)entry->weight_bytes / 1e6;
+    int i, pick = 0;
+    if (ms < 0.0) {
+        __atomic_fetch_sub(&wex_lanes.ticket, 1u, __ATOMIC_RELAXED);
+        return;
+    }
+    pthread_mutex_lock(&wex_lanes_mutex);
+    if (!wex_lanes.best[choice] || ms / mb < wex_lanes.best[choice]) wex_lanes.best[choice] = ms / mb;
+    if (++wex_lanes.done == WEX_LANE_CHOICES * WEX_LANE_ROUNDS) {
+        for (i = 1; i < WEX_LANE_CHOICES; i++)
+            if (wex_lanes.best[i] > 0.0 && (!wex_lanes.best[pick] || wex_lanes.best[i] < wex_lanes.best[pick])) pick = i;
+        __atomic_store_n(&wex_lanes.chosen, wex_lane_choice[pick], __ATOMIC_RELEASE);
+        fprintf(stderr, "[wex] fast decoder: %d streams a record (measured on the first %d records, CPU time per byte "
+                        "against it:", wex_lane_choice[pick], WEX_LANE_CHOICES * WEX_LANE_ROUNDS);
+        for (i = 0; i < WEX_LANE_CHOICES; i++)
+            if (wex_lanes.best[i] > 0.0) fprintf(stderr, " %d: %.2f", wex_lane_choice[i], wex_lanes.best[i] / wex_lanes.best[pick]);
+        fprintf(stderr, "; COLI_WEX_FAST_LANES=N fixes it)\n");
+    }
+    pthread_mutex_unlock(&wex_lanes_mutex);
+}
+
+COLI_WEX_DECODE_API int coli_wex_fast_lanes(void) {
+    const int fixed = wex_lanes_fixed(), chosen = __atomic_load_n(&wex_lanes.chosen, __ATOMIC_ACQUIRE);
+    return fixed ? fixed : chosen;
+}
+
 /* Whether the helper decodes this neural record: its model registered with it, and
  * feature 16 for a WNR3 record. */
 static int wex_cuda_takes(const WexEntry *entry, int in_helper) {
     const unsigned int bits = wex_cuda_bits();
     return in_helper && (bits & COLI_WEX_CUDA_NR2) &&
            (entry->flags != WEX_ENTRY_NEURAL_RANS3 || (bits & COLI_WEX_CUDA_NR3));
+}
+
+static void wex_cuda_failed(int status) {
+    if (!__atomic_exchange_n(&wex_cuda.failure_reported, 1, __ATOMIC_ACQ_REL))
+        fprintf(stderr, "[wex] the CUDA helper did not decode a record (status %d); decoding it on the CPU\n", status);
 }
 
 COLI_WEX_DECODE_API int coli_wex_decode_record(const WexEntry *entry, unsigned char *slab, size_t capacity) {
@@ -283,9 +375,7 @@ COLI_WEX_DECODE_API int coli_wex_decode_record(const WexEntry *entry, unsigned c
             __atomic_fetch_add(&wex_cuda.host_decodes, UINT64_C(1), __ATOMIC_RELAXED);
             return 0;
         }
-        if (!__atomic_exchange_n(&wex_cuda.failure_reported, 1, __ATOMIC_ACQ_REL))
-            fprintf(stderr, "[wex] the CUDA helper did not decode a record (status %d); decoding it on the CPU\n",
-                    status);
+        wex_cuda_failed(status);
     }
     if (model && entry->flags == WEX_ENTRY_NEURAL_RANS3) {
         /* the CPU: the fast decoder where its tables were built (the CPU has its SIMD kernel) and
@@ -295,14 +385,72 @@ COLI_WEX_DECODE_API int coli_wex_decode_record(const WexEntry *entry, unsigned c
         const int fast = tables && wex_fast_wanted();
         wex_cpu_report(fast, tables != NULL);
         if (fast) {
-            static const WexFastOptions one = {1, 1, WEX_FAST_LANES, 1};
+            int choice;
+            const WexFastOptions one = {1, 1, wex_lanes_pick(&choice), 1};
+            const double started = wex_now_ms();
             const int status = wex_fast_decode_record(entry, slab, capacity, model, tables, &one);
             if (!status) __atomic_fetch_add(&wex_fast_decodes, UINT64_C(1), __ATOMIC_RELAXED);
+            if (choice >= 0) wex_lanes_note(choice, status ? -1.0 : wex_now_ms() - started, entry);
             return status;
         }
     }
     if (model) return wex_decode_nr2_record(entry, slab, capacity, model);
     return wex_decode_record(entry, slab, capacity);
+}
+
+COLI_WEX_DECODE_API int coli_wex_decode_record_to(const WexEntry *entry, const unsigned char *record,
+                                                  unsigned char *const scales[3], unsigned char *const weights[3]) {
+    const WexNr2Model *model;
+    WexNr2Layout layout;
+    WexNr2Record view;
+    uint64_t raw, aligned;
+    int in_helper = 0, m;
+    if (!entry || !record || !scales || !weights || !wex_entry_nr_model(entry) ||
+        entry->total_bytes < WEX_NR2_HEADER_BYTES || wex_entry_raw_sizes(entry, &raw, &aligned)) return -1;
+    for (m = 0; m < 3; m++) if (!scales[m] || !weights[m]) return -1;
+    model = wex_nr2_find(wex_read_u32_le(record + 4u), &in_helper);   /* the record names its model at bytes 4..7 */
+    if (!model) return -1;
+    if (wex_cuda_takes(entry, in_helper)) {
+        /* the helper decodes into a slab: the record at its end, as coli_wex_decode_record has it, the parts copied
+         * out on 0; on any other status the CPU decodes the record below */
+        const size_t at = wex_record_read_offset(entry);
+        unsigned char *slab = at ? (unsigned char *)malloc((size_t)aligned) : NULL;
+        if (slab) {
+            int status;
+            memcpy(slab + at, record, entry->total_bytes);
+            status = wex_cuda.to_host(entry, slab, (size_t)aligned);
+            if (!status) {
+                for (m = 0; m < 3; m++) {
+                    memcpy(scales[m], slab + entry->scale_offsets[m],
+                           (size_t)entry->scale_shapes[m][0] * entry->scale_shapes[m][1]);
+                    memcpy(weights[m], slab + entry->weight_offsets[m],
+                           (size_t)entry->weight_shapes[m][0] * entry->weight_shapes[m][1]);
+                }
+                free(slab);
+                __atomic_fetch_add(&wex_cuda.host_decodes, UINT64_C(1), __ATOMIC_RELAXED);
+                return 0;
+            }
+            free(slab);
+            wex_cuda_failed(status);
+        }
+    }
+    wex_nr2_layout(entry, &layout);
+    if (wex_nrx_parse(record, entry->total_bytes, &layout, model->id, wex_entry_nr_magic(entry), &view)) return -1;
+    if (entry->flags == WEX_ENTRY_NEURAL_RANS3) {   /* the fast decoder as in coli_wex_decode_record */
+        const WexFastModel *tables = wex_fast_models[model - wex_nr2_models];
+        const int fast = tables && wex_fast_wanted();
+        wex_cpu_report(fast, tables != NULL);
+        if (fast) {
+            int choice;
+            const WexFastOptions one = {1, 1, wex_lanes_pick(&choice), 1};
+            const double started = wex_now_ms();
+            const int status = wex_fast_decode_with(tables, &view, &layout, model, scales, weights, &one) ? -1 : 0;
+            if (!status) __atomic_fetch_add(&wex_fast_decodes, UINT64_C(1), __ATOMIC_RELAXED);
+            if (choice >= 0) wex_lanes_note(choice, status ? -1.0 : wex_now_ms() - started, entry);
+            return status;
+        }
+    }
+    return wex_nr2_decode(&view, &layout, model, scales, weights) ? -1 : 0;
 }
 
 /* A neural record the helper can take into device buffers: 0 yes, else the status 1 or -1. */

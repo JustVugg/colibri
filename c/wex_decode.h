@@ -64,6 +64,23 @@ COLI_WEX_DECODE_API int coli_wex4_register_model(const unsigned char *stored, si
  * canonical-zero flag first (wex_nr3_owner_ok). */
 COLI_WEX_DECODE_API int coli_wex_decode_record(const WexEntry *entry, unsigned char *slab, size_t capacity);
 
+/* Decode one neural record (WNR2 / WNR3) straight into the caller's buffers, with
+ * no slab: `record` holds its entry->total_bytes as stored (no alignment needed,
+ * not modified); matrix m's scales go to scales[m] (scale_shapes[m] bytes), its
+ * weights to weights[m] (weight_shapes[m] bytes). The same decoders, checks and
+ * bytes as coli_wex_decode_record, without the decoded page and the copy out of
+ * it (the CUDA helper, where it takes the record, still decodes through a slab of
+ * its own). 0 decoded; -1 as coli_wex_decode_record, and then the buffers may
+ * hold part of a decode: the caller must not use them. WNR3 records: the caller
+ * checks the owner and the canonical-zero flag first (wex_nr3_owner_ok). */
+COLI_WEX_DECODE_API int coli_wex_decode_record_to(const WexEntry *entry, const unsigned char *record,
+                                                  unsigned char *const scales[3], unsigned char *const weights[3]);
+
+/* The streams the fast decoder interleaves in a record (1, 2, 3, 4, 6 or 8):
+ * COLI_WEX_FAST_LANES when set to one of them, else the count measured on the
+ * process's first WNR3 records, 0 while that is still being measured. */
+COLI_WEX_DECODE_API int coli_wex_fast_lanes(void);
+
 /* The CPU decoder of WNR3 records now: "AVX2" or "NEON" (the fast decoder), or
  * "reference" (COLI_WEX_FAST_DECODE=0, or no kernel for this CPU). And the WNR3
  * records the fast decoder has decoded so far. */

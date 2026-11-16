@@ -30,7 +30,7 @@ carries and how to use it. The bytes are specified there, not here:
 | `c/tools/wex4_verify.c` | checks a WEX4 file and prints its root |
 | `c/tests/test_wex_format.c` | the codecs and validators on synthetic records, with corruption cases |
 | `c/tests/test_wex4_verify.c`, `c/tests/wex4_fixture.h` | the tool on synthetic WEX4 files; the fixture writes a WEX4 file in memory the way the in-place upgrade of a WEX1 file does |
-| `c/wex_decode.c`, `c/wex_decode.h` | WNR3 records on the CPU: the process's WNM2 model registry (`coli_wex_register_model`, and `coli_wex4_register_model` for a WEX4 container's blob, checked against its index hash) and the in-place decode of one record (`coli_wex_decode_record`) |
+| `c/wex_decode.c`, `c/wex_decode.h` | WNR3 records on the CPU: the process's WNM2 model registry (`coli_wex_register_model`, and `coli_wex4_register_model` for a WEX4 container's blob, checked against its index hash) and the in-place decode of one record (`coli_wex_decode_record`), and its decode straight into the caller's six buffers (`coli_wex_decode_record_to`) |
 | `c/tests/test_wex_decode.c`, `c/tests/wnr3_fixture.h` | the registry and the decode on records made by the reference encoder; the fixture trains a model and writes the WNR3 form of a WEX4 container |
 | `c/wex_fast_decode.h` | a fast CPU decoder of WNR3 records, the reference's bytes and verdicts ([below](#the-fast-cpu-decoder)) |
 | `c/tests/test_wex_fast_decode.c` | the fast decoder against the reference of `wex_decode.c`: synthetic records, mutated mini-records, and real records of a container named on its command line; `--bench` times both |
@@ -77,6 +77,18 @@ prints which one it is:
 [wex] WNR3 records decode on the CPU with the fast decoder (AVX2; COLI_WEX_FAST_DECODE=0: the reference)
 ```
 
+How many streams the fast decoder interleaves in a record is a matter of speed only, and the best
+count depends on the core (4 on the x86 desktops of Wex-WRN2's measurements, 6 on a Neoverse-N2
+and on a 4-vCPU Xeon VM, 8 on Apple M1 VMs). Unless `COLI_WEX_FAST_LANES` fixes it, the first 16
+records the fast decoder decodes try 3, 4, 6 and 8 in turn on whichever threads decode them,
+each timed on its thread's CPU clock (so other readers on a busy machine do not skew it), and the
+count with the lowest time per decoded byte is used from then on (DeepSeek V4.1 REAP-192 records,
+8 readers on a 4-vCPU Xeon VM, from memory: 6 streams, 25.6 ms a record against 29.0 with 4):
+
+```
+[wex] fast decoder: 6 streams a record (measured on the first 16 records, CPU time per byte against it: 3: 1.41 4: 1.17 6: 1.00 8: 1.31; COLI_WEX_FAST_LANES=N fixes it)
+```
+
 DeepSeek V4.1 Flash REAP-192 with the published WNR3 container on an NVMe drive (the trunk
 from the shards on a SATA SSD), CPU only, i7-7700K, 8 expert slots, 8 greedy tokens: decode
 in 71.1 s with the fast decoder against 293.2 s with the reference, the same tokens; the
@@ -99,7 +111,12 @@ where it was measured, is not carried.
 | little-endian AArch64 | the NEON kernel (NEON is in the base instruction set) |
 | anything else, or `-DWEX_FAST_SCALAR` | the scalar kernel: the reference's loop, stream by stream |
 
-`wex_fast_decode_record` takes a record in its slab as `wex_decode_nr2_record` does (same
+`coli_wex_decode_record_to` (wex_decode.c) decodes a record held in a buffer of its stored
+size straight into the caller's six buffers (the three matrices' scales and weights): the same
+decoders, checks and bytes, without the page of the decoded size the in-place call needs and
+without the copy out of it; DeepSeek V4.1 and Qwen3.8 read WNR3 records through it. On -1 the
+buffers may hold part of a decode, so the caller must not use them (both engines then read the
+expert again, or stop). `wex_fast_decode_record` takes a record in its slab as `wex_decode_nr2_record` does (same
 checks, scratch, slab untouched on -1). `tests/test_wex_fast_decode` checks it in three builds
 (default flags, the x86-64 baseline, scalar) against the reference: synthetic records with six
 chunk sizes, plain and canonical zero, every variant on 1 and 8 threads; 512 single-bit changes;
@@ -236,9 +253,9 @@ splits the reads ([below](#the-container-on-several-drives)).
 
 A container of WNR3 records: at attach its one WNM2 blob is read, checked against the index's
 SHA-256 and registered (all or none of the records value-exact). `q38_x4_read` sends each WNR3
-record to `q38_x4_read_nr3`, which reads the stored bytes at the end of the decoded page, checks
-its SHA-256 at the first use (`COLI_WEX_VERIFY`), its owner and canonical-zero flag, decodes it in
-place on the reading thread and copies the record out; the mapped path (`COLI_MAP_EXPERTS=1`)
+record to `q38_x4_read_nr3`, which reads the stored bytes into a buffer of their size, checks
+its SHA-256 at the first use (`COLI_WEX_VERIFY`), its owner and canonical-zero flag, and decodes it
+on the reading thread straight into the expert's buffer (`coli_wex_decode_record_to`); the mapped path (`COLI_MAP_EXPERTS=1`)
 reads and decodes a WNR3 record instead of mapping it. A record that names another expert or does
 not decode stops the engine, as a changed RAW record does under the check. Whether it pays:
 Wex-WRN2 measured WNR3 slowing Qwen3.8 down on its test machine (the records are 2.6 MB and
@@ -274,17 +291,18 @@ miss      expert_read_list  a backbone expert the container holds -> its six ten
                             default OpenMP team; a mismatch -> that expert read again from the
                             shards, and from the shards for the rest of the run
           v41_wex_fetch_nr3 WNR3: one reader takes the expert's first part and reads the whole stored
-                            record into a pooled page (one O_DIRECT read), hashes it at the first read
-                            (COLI_WEX_VERIFY), checks its owner and canonical-zero flag, decodes it in
-                            place (coli_wex_decode_record) and copies the six parts into the windows;
+                            record into a pooled buffer of its size (one O_DIRECT read), hashes it at
+                            the first read (COLI_WEX_VERIFY), checks its owner and canonical-zero flag
+                            and decodes it straight into the six windows (coli_wex_decode_record_to);
                             a failure -> that expert read again from the shards, and from them for
                             the rest of the run
 ```
 
 The DSpark stages, a GGUF's experts and every other tensor stay on the shards; so do the
 Vulkan tier's prewarm reads. With `V41_READ_DEPTH` readers (8 by default) up to that many WNR3
-records decode at once; each holds a page of the decoded size from the reader pool and the
-decoder's own scratch of the same size while it runs. The run prints a last line
+records decode at once; each holds only the stored record (about 16 MB on V4.1 Flash REAP-192)
+from the reader pool while it runs: the decode writes the windows directly, with no page of the
+decoded size and no decoder scratch (two 18.8 MB buffers a reader before). The run prints a last line
 `[v41_wex] container: N records read (M WNR3 decoded), K refused`.
 
 ## The container on several drives

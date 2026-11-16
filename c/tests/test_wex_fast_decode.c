@@ -784,6 +784,87 @@ int main(int argc, char **argv) {
        before);
 
     before = failures;
+    {   /* coli_wex_decode_record_to: the record in a buffer of its own (flush against a guard page, read only), each of
+         * the six parts in a buffer flush against a guard page; the reference's bytes with the variable unset, 1 and 0
+         * and with every fixed stream count; a damaged record refused, the record itself untouched */
+        uint64_t raw_b, aligned;
+        CHECK(!wex_entry_raw_sizes(&synth[0].entry, &raw_b, &aligned));
+        size_t most = 0;
+        for (int i = 0; i < 6; i++) if (synth[i].entry.total_bytes > most) most = synth[i].entry.total_bytes;
+        unsigned char *ref = malloc((size_t)aligned), *keep = malloc(most);
+        Guard part[6];
+        unsigned char *scales[3], *weights[3];
+        CHECK(ref && keep);
+        for (int m = 0; m < 3; m++) {
+            const size_t sb = (size_t)synth[0].entry.scale_shapes[m][0] * synth[0].entry.scale_shapes[m][1];
+            const size_t wb = (size_t)synth[0].entry.weight_shapes[m][0] * synth[0].entry.weight_shapes[m][1];
+            part[m] = guard_alloc(sb); part[3 + m] = guard_alloc(wb);
+            scales[m] = part[m].hi - sb; weights[m] = part[3 + m].hi - wb;
+        }
+        static const char *const lanes[] = {NULL, "1", "2", "3", "4", "6", "8"};
+        for (int mode = 0; mode < 3 + 6; mode++) {   /* unset, "1", "0", then COLI_WEX_FAST_LANES=1..8 */
+            const int fast = mode != 2 && wexf_cpu_simd();
+            const uint64_t before_count = coli_wex_fast_decode_count();
+            if (mode == 0 || mode > 2) unsetenv("COLI_WEX_FAST_DECODE");
+            else setenv("COLI_WEX_FAST_DECODE", mode == 1 ? "1" : "0", 1);
+            if (mode > 2) setenv("COLI_WEX_FAST_LANES", lanes[mode - 2], 1);
+            else unsetenv("COLI_WEX_FAST_LANES");
+            if (mode > 2) CHECK(coli_wex_fast_lanes() == atoi(lanes[mode - 2]));
+            for (int i = 0; i < 6; i++) {
+                const WexEntry *x = &synth[i].entry;
+                const size_t at = wex_record_read_offset(x);
+                Guard g = guard_alloc(x->total_bytes);
+                unsigned char *rec = g.hi - x->total_bytes;
+                memcpy(rec, synth[i].record, x->total_bytes);
+                memset(ref, 0x5a, (size_t)aligned);
+                memcpy(ref + at, synth[i].record, x->total_bytes);
+                CHECK(!wex_decode_nr2_record(x, ref, (size_t)aligned, i >= 3 ? &model_cz : &model));
+                for (int m = 0; m < 3; m++) {
+                    memset(scales[m], 0xa5, (size_t)x->scale_shapes[m][0] * x->scale_shapes[m][1]);
+                    memset(weights[m], 0xa5, (size_t)x->weight_shapes[m][0] * x->weight_shapes[m][1]);
+                }
+                CHECK(!coli_wex_decode_record_to(x, rec, scales, weights));
+                for (int m = 0; m < 3; m++) {
+                    CHECK(!memcmp(scales[m], ref + x->scale_offsets[m], (size_t)x->scale_shapes[m][0] * x->scale_shapes[m][1]));
+                    CHECK(!memcmp(weights[m], ref + x->weight_offsets[m], (size_t)x->weight_shapes[m][0] * x->weight_shapes[m][1]));
+                }
+                CHECK(!memcmp(rec, synth[i].record, x->total_bytes));
+                rec[4096u + (size_t)i * 977u] ^= 0x10u;   /* a bit changed: refused, the record as it was given */
+                memcpy(keep, rec, x->total_bytes);
+                CHECK(coli_wex_decode_record_to(x, rec, scales, weights) == -1 && !memcmp(rec, keep, x->total_bytes));
+                guard_free(g);
+            }
+            CHECK(coli_wex_fast_decode_count() - before_count == (fast ? 6u : 0u));
+        }
+        unsetenv("COLI_WEX_FAST_DECODE");
+        unsetenv("COLI_WEX_FAST_LANES");
+        {   /* a NULL part, a RAW entry, a record whose model is not registered: refused */
+            WexEntry raw_entry = synth[0].entry;
+            unsigned char *none[3] = {scales[0], NULL, scales[2]};
+            unsigned char *foreign = malloc(synth[0].entry.total_bytes);
+            CHECK(foreign);
+            memcpy(foreign, synth[0].record, synth[0].entry.total_bytes);
+            foreign[4] ^= 0xffu;   /* the model id at bytes 4..7 */
+            raw_entry.flags = 0;
+            CHECK(coli_wex_decode_record_to(&synth[0].entry, synth[0].record, none, weights) == -1);
+            CHECK(coli_wex_decode_record_to(&raw_entry, synth[0].record, scales, weights) == -1);
+            CHECK(coli_wex_decode_record_to(&synth[0].entry, foreign, scales, weights) == -1);
+            free(foreign);
+        }
+        /* the stream count measured on the first records (unset): one of the measured counts once enough were decoded */
+        if (wexf_cpu_simd()) {
+            const int n = coli_wex_fast_lanes();
+            CHECK(n == 3 || n == 4 || n == 6 || n == 8);
+            printf("     stream count measured here: %d\n", n);
+        }
+        for (int k = 0; k < 6; k++) guard_free(part[k]);
+        free(ref); free(keep);
+    }
+    ok("coli_wex_decode_record_to: the record decoded straight into six caller buffers (guarded), the reference's bytes "
+       "with COLI_WEX_FAST_DECODE unset, 1 and 0 and every COLI_WEX_FAST_LANES; a damaged record, a missing buffer, a RAW "
+       "entry or an unregistered model refused, the record untouched", before);
+
+    before = failures;
     for (int i = 0; i < 6; i++) source_of(&synth[i], i == 3 || i == 4 || i == 5 ? &model_cz : &model, &src[i]);
     {   /* plain sources under the plain model, CZ ones under the CZ model */
         long half = mutations / 2 > 0 ? mutations / 2 : 1;
