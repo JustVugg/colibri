@@ -7,6 +7,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### New
 
+- **WNR3 records decode on the CPU with the fast decoder** (`COLI_WEX_FAST_DECODE`, default
+  on): `coli_wex_decode_record` uses `wex_fast_decode.h` where the CPU has its kernel (AVX2 by
+  CPUID, NEON), one thread a record; `0`, or another CPU: the reference, as before. Same bytes,
+  same refusals. DeepSeek V4.1 on the published WNR3 container, CPU only, a 4-core i7-7700K:
+  8 tokens in 71 s against 293 s, the same tokens ([docs/wex.md](docs/wex.md#wnr3-on-the-cpu)).
 - **A fast CPU decoder for WNR3 records** (`c/wex_fast_decode.h`): Wex-WRN2's research decoder
   (AVX2 and NEON kernels, a scalar fallback), the reference's bytes and verdicts at several times its
   speed; on x86-64 the AVX2 kernel is chosen at run time by CPUID, so a build without `-mavx2`

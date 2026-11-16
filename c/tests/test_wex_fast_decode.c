@@ -36,6 +36,7 @@
 #endif
 #endif
 
+#include "../compat.h"   /* setenv / unsetenv on Windows */
 #define COLI_WEX_DECODE_API static inline
 #include "../wex_decode.c"
 #include "../wex_fast_decode.h"
@@ -742,6 +743,45 @@ int main(int argc, char **argv) {
     }
     ok("another model, a slab one byte short, 512 single-bit changes (the first 128 bits, then sampled): the same status as the reference, the same "
        "bytes, a refused record leaves the slab as it was", before);
+
+    before = failures;
+    {   /* coli_wex_decode_record: the fast decoder where the CPU has its kernel, the reference with
+         * COLI_WEX_FAST_DECODE=0; the reference's bytes and verdicts either way */
+        uint32_t id = 0;
+        uint64_t raw_b, aligned;
+        CHECK(!coli_wex_register_model(blob, WEX_NR2_MODEL_BYTES, &id) && id == model.id);
+        CHECK(!coli_wex_register_model(blob_cz, WEX_NR2_MODEL_BYTES, &id) && id == model_cz.id);
+        CHECK(!wex_entry_raw_sizes(&synth[0].entry, &raw_b, &aligned));
+        unsigned char *a = malloc((size_t)aligned), *b = malloc((size_t)aligned);
+        CHECK(a && b);
+        for (int mode = 0; mode < 3; mode++) {   /* unset, "1", "0" */
+            const int fast = mode < 2 && wexf_cpu_simd();
+            const uint64_t before_count = coli_wex_fast_decode_count();
+            if (mode == 0) unsetenv("COLI_WEX_FAST_DECODE");
+            else setenv("COLI_WEX_FAST_DECODE", mode == 1 ? "1" : "0", 1);
+            CHECK(!strcmp(coli_wex_cpu_decoder(), fast ? wex_fast_kernels() : "reference"));
+            for (int i = 0; i < 6; i++) {
+                const WexEntry *x = &synth[i].entry;
+                const size_t at = wex_record_read_offset(x);
+                memset(a, 0x5a, (size_t)aligned);
+                memcpy(a + at, synth[i].record, x->total_bytes);
+                memcpy(b, a, (size_t)aligned);
+                CHECK(!wex_decode_nr2_record(x, b, (size_t)aligned, i >= 3 ? &model_cz : &model));
+                CHECK(!coli_wex_decode_record(x, a, (size_t)aligned) && !memcmp(a, b, (size_t)raw_b));
+                memset(a, 0x5a, at);   /* a bit changed: refused, the slab as it was */
+                memcpy(a + at, synth[i].record, x->total_bytes);
+                a[at + 4096u + (size_t)i * 977u] ^= 0x10u;
+                memcpy(b, a, (size_t)aligned);
+                CHECK(coli_wex_decode_record(x, a, (size_t)aligned) == -1 && !memcmp(a, b, (size_t)aligned));
+            }
+            CHECK(coli_wex_fast_decode_count() - before_count == (fast ? 6u : 0u));
+        }
+        unsetenv("COLI_WEX_FAST_DECODE");
+        free(a); free(b);
+    }
+    ok("coli_wex_decode_record: the fast decoder where the CPU has its kernel (COLI_WEX_FAST_DECODE unset or 1), the "
+       "reference with COLI_WEX_FAST_DECODE=0; the reference's bytes, a damaged record refused and the slab as it was",
+       before);
 
     before = failures;
     for (int i = 0; i < 6; i++) source_of(&synth[i], i == 3 || i == 4 || i == 5 ? &model_cz : &model, &src[i]);

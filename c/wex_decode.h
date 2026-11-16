@@ -14,9 +14,12 @@
  * Linux, and only when COLI_WEX_CUDA_LIB=<path> names it (kaira_wex_cuda.dll /
  * kaira_wex_cuda.so); unset or "0", no library is looked for and every record
  * decodes on the CPU. coli_wex_decode_record then sends a neural record to the helper
- * and decodes it on the CPU (wex_neural_rans.h) when the helper is absent,
- * lacks the feature, or does not decode it: the bytes are the same either way.
- * The coli_wex_cuda_* calls below expose the helper's other entry points.
+ * and decodes it on the CPU when the helper is absent, lacks the feature, or does
+ * not decode it: the bytes are the same either way. On the CPU a WNR3 record goes
+ * to the fast decoder of wex_fast_decode.h (AVX2 where CPUID says the CPU has it,
+ * NEON on ARM64) unless COLI_WEX_FAST_DECODE=0; to the reference decoder of
+ * wex_neural_rans.h then, on other CPUs and for WNR2 records. Same bytes, same
+ * verdicts. The coli_wex_cuda_* calls below expose the helper's other entry points.
  *
  * Linkage: an engine that is one translation unit includes wex_decode.c with
  * COLI_WEX_DECODE_API defined as `static inline`, so every engine has its own
@@ -60,6 +63,12 @@ COLI_WEX_DECODE_API int coli_wex4_register_model(const unsigned char *stored, si
  * must not use the slab. WNR3 records: the caller checks the owner and the
  * canonical-zero flag first (wex_nr3_owner_ok). */
 COLI_WEX_DECODE_API int coli_wex_decode_record(const WexEntry *entry, unsigned char *slab, size_t capacity);
+
+/* The CPU decoder of WNR3 records now: "AVX2" or "NEON" (the fast decoder), or
+ * "reference" (COLI_WEX_FAST_DECODE=0, or no kernel for this CPU). And the WNR3
+ * records the fast decoder has decoded so far. */
+COLI_WEX_DECODE_API const char *coli_wex_cpu_decoder(void);
+COLI_WEX_DECODE_API uint64_t coli_wex_fast_decode_count(void);
 
 /* Every container open path calls this once: 1 (and a stderr line, prefixed by
  * `who`) when a canonical-zero container (header flag 64; for WEX4, any record

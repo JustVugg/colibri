@@ -66,9 +66,22 @@ A WNR3 record (codec 5) is an MXFP4 expert record coded with rANS against a smal
 by the container (a WNM2 blob, 59,408 bytes). Every stream carries a 23-bit check, so a damaged
 record is refused rather than decoded to other bytes; a canonical-zero (`CZ`) record stores the
 FP4 value -0 as +0, so it decodes to the same values, not the same bytes (the container's records
-say so with their value-exact flag). The decoder here is the reference one of
-`wex_neural_rans.h`, one record per thread: on an Intel i7-7700K, 24.7 MB/s on one thread (761 ms
-for one 18.8 MB DeepSeek V4.1 Flash expert) and about 155 MB/s with 8 records at once.
+say so with their value-exact flag). `coli_wex_decode_record` decodes a WNR3 record on the CPU
+with the fast decoder below, one record per thread, where the CPU has its kernel, and with the
+reference one of `wex_neural_rans.h` with `COLI_WEX_FAST_DECODE=0` or on other CPUs: on an Intel
+i7-7700K, one 18.8 MB DeepSeek V4.1 Flash expert takes about 100 ms on one thread with the fast
+decoder and 740-760 ms with the reference (24.7 MB/s), and the first WNR3 record an engine decodes
+prints which one it is:
+
+```
+[wex] WNR3 records decode on the CPU with the fast decoder (AVX2; COLI_WEX_FAST_DECODE=0: the reference)
+```
+
+DeepSeek V4.1 Flash REAP-192 with the published WNR3 container on an NVMe drive (the trunk
+from the shards on a SATA SSD), CPU only, i7-7700K, 8 expert slots, 8 greedy tokens: decode
+in 71.1 s with the fast decoder against 293.2 s with the reference, the same tokens; the
+shards alone took 62.5-91.6 s in the same session. The CUDA helper, when
+`COLI_WEX_CUDA_LIB` names it, still comes first.
 
 ### The fast CPU decoder
 
@@ -379,6 +392,6 @@ other calls are `coli_wex_cuda_decode_to_device`, `_decode_batch_to_device`,
 
 DeepSeek V4, DeepSeek V4.1 and Qwen3.8 read RAW and WNR3 records from a WEX4 container; WNR3
 records decode on the GPU when `COLI_WEX_CUDA_LIB` names the CUDA helper, on the CPU
-otherwise. qwen38 and deepseek_v41 also read copies of the container on other drives. A
+otherwise (the fast decoder where the CPU has its kernel). qwen38 and deepseek_v41 also read copies of the container on other drives. A
 container mirror for `deepseek_v4` and the engines' use of the helper's device and batch
 calls are the next PRs.
