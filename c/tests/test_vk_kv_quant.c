@@ -319,8 +319,16 @@ done:
  *   re-pack  a compressed row dequantized and packed again decodes to itself, on
  *            fill_rows' rows (its six band edges are where kvq_pack_ckv's demote does
  *            the work), here so a device-less box runs it (the codec's CHECK needs the
- *            device) */
+ *            device)
+ *   guard    a chain module is not the MAIN qmatmul shader coli_vk_init takes: refused
+ *            by name before any loader or device work, so the 4-binding pipeline is
+ *            never built from an 8-binding chain module (RADV runs that, MoltenVK
+ *            refuses it, and the bad pipeline lands in the shared on-disk cache) */
 static void host_block_tests(void) {
+    /* the guard arm: chain_dsv4 is a chain module, not the main qmatmul shader -- init
+     * refuses it by name, before any file or loader access, so this is deterministic on
+     * a device-less box too (main's note below says what the trap is) */
+    CHECK(!coli_vk_init("shaders/chain_dsv4.spv"), "vk init took chain_dsv4.spv for the main qmatmul shader");
     enum { R = 70, BLK = KVQ_IKEY_BLOCK, IKB = BLK * KVQ_IKEY_BYTES };   /* 3 blocks, a partial last */
     const size_t mb = kvq_ikey_mirror_bytes(R);
     float x[R * 128], a[128], b[128];
@@ -412,7 +420,7 @@ static void host_block_tests(void) {
     for (int p = N - W; p < N; p++) kvq_pack_win(ring + (size_t)(p % W) * KVQ_WIN_BYTES, kv + (size_t)p * 512);
     CHECK(memcmp(ring, ref, sizeof ring) == 0, "slide: the packed tail is not the per-position pack");
     printf("OK kv-quant host blocks: staging bit for bit, the prefix whole, park rounded, the slide linear, "
-           "the re-pack a fixpoint on the host\n");
+           "the re-pack a fixpoint on the host, the wrong main shader refused\n");
 }
 
 /* a row's attention as sparse_attn.h's formula (and chain_dsv4.comp's mode 0): the score
