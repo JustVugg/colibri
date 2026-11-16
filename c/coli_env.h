@@ -752,6 +752,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"PREFETCH",                         CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"PROF",                             CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"PROMPT",                           CE_STR   , CE_ALL | CE_COLIBRI, CE_LAUNCHER             , NULL},
+    {"Q36_CODES_GB", CE_FLOAT, CE_QWEN, 0, NULL},
     {"Q36_DN_GPU", CE_STR, CE_QWEN, 0, NULL},
     {"Q36_EOS",                          CE_STR   , CE_QWEN                                         , 0             , NULL},
     {"Q36_GGUF_ROPE_PERM", CE_INT, CE_QWEN, 0, NULL},

@@ -1917,6 +1917,12 @@ jobs:
           /tmp/tq2k
           gcc -O3 -march=x86-64-v3 -fopenmp -I. tests/test_gq_q2_k.c -o /tmp/tq2kv3 -lm
           /tmp/tq2kv3
+          # the grid types' and Q2_K's row kernels (AVX-512's where the runner has VNNI) against
+          # the unpack + gq_dot_i8 path, one to eight activation rows: the same two ISAs
+          gcc -O3 -march=native -fopenmp -I. tests/test_gq_grid512.c -o /tmp/tg512 -lm
+          /tmp/tg512
+          gcc -O3 -march=x86-64-v3 -fopenmp -I. tests/test_gq_grid512.c -o /tmp/tg512v3 -lm
+          /tmp/tg512v3
       - name: Generate the glm_tiny fixture
         run: cd c && python3 tools/make_glm_oracle.py
       - name: Oracle (30–32/32 teacher forcing + exact greedy)
@@ -2372,6 +2378,15 @@ jobs:
             tests.test_gguf_dequant \
             tests.test_gguf_olmoe_profile \
             tests.test_convert_gguf_to_olmoe
+      - name: qwen36 holds a GGUF's grid types larger and answers as the file's rows
+        run: |
+          # tests/test_qwen36_iq3s_codes.py needs the engine and the gguf package. The
+          # python job builds the engine without the package, this one had the package
+          # without the engine, so the test skipped in both. A skip fails the step here.
+          make -C c -j"$(nproc)" qwen36
+          cd c
+          python3 -m unittest -v tests.test_qwen36_iq3s_codes 2>&1 | tee ../q36codes.log
+          grep -q '\.\.\. ok$' ../q36codes.log
 
   windows-python-focused:
     name: Python tests (Windows focused)
