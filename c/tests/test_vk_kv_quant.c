@@ -294,10 +294,10 @@ static void score_case(int S, int pos_base, int IH, int topk) {
     /* the drift against the ORIGINAL rows is the FP4 format's own noise on random data
      * (a group's per-32 scale washes out its small values: 2 significant bits), which
      * the overlap below shows does not move the selection much. The thresholds are the
-     * measured band: 1.01-1.28e-1 / 89-100% for the five arms below, and 1.46-1.88e-1 /
-     * 81-92% with the scale rule floored instead of ceiled in BOTH the header and
-     * chain_dsv4.comp's ue8m0c (the mutation the old 2e-1 / 0.7 gates let through: the
-     * suite then printed PASS with all five arms in range) */
+     * measured band, the file's own RNG now: 8.95e-2-1.19e-1 / 81-100% for the five arms
+     * below, and 1.47-1.92e-1 / 72-100% with the scale rule floored instead of ceiled in
+     * BOTH the header and chain_dsv4.comp's ue8m0c (the mutation the old 2e-1 / 0.7
+     * gates let through: the suite then printed PASS with all five arms in range) */
     CHECK(rel0 <= 1.35e-1, "scores (S %d pos %d IH %d): rel_l2 to the original rows' scores %.3e", S, pos_base, IH, rel0);
     CHECK(ov >= 0.80, "scores (S %d pos %d IH %d): the top-%d overlap %.0f%% is below 80%%", S, pos_base, IH, topk, ov * 100);
     printf("OK kv-quant scores (S %d pos %d IH %d): the decoded rows' bits, rel_l2 %.2e vs the reference and %.2e vs the original rows, top-%d overlap %.0f%%\n",
