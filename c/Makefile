@@ -3053,6 +3053,9 @@ tests/test_qpack$(EXE): tests/test_qpack.c tests/qpack.o
 # same command line before (#1741): one unit per command keeps each .d whole.
 tests/qpack.o: qpack.c .build-config
 	$(CC) $(CFLAGS) -c qpack.c -o $@
+# qpack.c included, not linked: the test fails its callocs one at a time.
+tests/test_qpack_layout_oom$(EXE): tests/test_qpack_layout_oom.c qpack.c .build-config
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 # Loader-side expansion oracle for the same MLX affine contract: nibble/byte
 # order, scalar decodings, parity against coli_affine_matmul_ref, refusals.
