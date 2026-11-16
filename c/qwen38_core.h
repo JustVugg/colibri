@@ -215,6 +215,9 @@ typedef struct {
     int mir_n;                     /* replicas holding the sidecar, the primary counted (COLI_MODEL_MIRROR) */
     int mir_cut[1+ST_MAX_MIR];     /* cumulative shares of 256 per replica, primary first */
     uint64_t mir_reads[1+ST_MAX_MIR],mir_bytes[1+ST_MAX_MIR];
+    char *wex;                     /* COLI_WEX_PATH: the WEX4 container that holds the records (S's one file) */
+    unsigned char *wex_sha;        /* COLI_WEX_VERIFY: [cell * 32] the index's SHA-256 of each record, else NULL */
+    unsigned char *wex_seen;       /* [cell] 1 once that record's hash passed */
 } Q38Int4Experts;
 
 typedef enum {
@@ -2112,11 +2115,37 @@ static int q38_x4_replica(Model *m,int layer,int expert) {
     return st_fd_rep(&x->S,x->fd[layer],r)>=0?r:0;   /* a partial copy leaves the file on the primary */
 }
 
+#include "wex4.h"   /* the WEX4 container (q38_wex4_attach) */
+
+/* COLI_WEX_VERIFY on a WEX4 container (q38_wex4_attach): the first time a record is used,
+ * its bytes against the index's SHA-256, the record's zero padding included. A record that
+ * fails stops the engine: the container is damaged or not the one its index was written for. */
+static void q38_wex_check(Model *m,int layer,int expert,const uint8_t *bytes) {
+    Q38Int4Experts *x=m->x4;
+    if(!x->wex_sha)return;
+    const size_t cell=(size_t)layer*(size_t)m->c.experts+(size_t)expert;
+    if(__atomic_load_n(&x->wex_seen[cell],__ATOMIC_ACQUIRE))return;
+    static const unsigned char zero[WEX4_PAGE];
+    unsigned char digest[32];
+    Wex4Sha sha;
+    wex4_sha_init(&sha);
+    wex4_sha_update(&sha,bytes,(size_t)x->record_bytes);
+    wex4_sha_update(&sha,zero,(size_t)(wex4_align((uint64_t)x->record_bytes)-(uint64_t)x->record_bytes));
+    wex4_sha_final(&sha,digest);
+    if(memcmp(digest,x->wex_sha+cell*32,32)){
+        fprintf(stderr,"[qwen38] COLI_WEX_PATH %s: layer %d expert %d does not match its SHA-256 in the index -- "
+                       "the container is damaged; refusing\n",x->wex,layer,expert);
+        exit(1);
+    }
+    __atomic_store_n(&x->wex_seen[cell],(unsigned char)1,__ATOMIC_RELEASE);
+}
+
 /* One sidecar record into out, from its replica. */
 static void q38_x4_read(Model *m,int layer,int expert,void *out,int64_t cap,const char *tag) {
     Q38Int4Experts *x=m->x4;
     int rep=q38_x4_replica(m,layer,expert);
     st_read_range_rep(&x->S,x->fd[layer],rep,x->off[(int64_t)layer*m->c.experts+expert],x->record_bytes,out,cap,1,0,tag);
+    q38_wex_check(m,layer,expert,(const uint8_t*)out);   /* COLI_WEX_VERIFY on a container */
     if(x->mir_n>1){
         __atomic_fetch_add(&x->mir_reads[rep],1,__ATOMIC_RELAXED);
         __atomic_fetch_add(&x->mir_bytes[rep],(uint64_t)x->record_bytes,__ATOMIC_RELAXED);
@@ -2394,8 +2423,148 @@ static int q38_int4_record_at(Model *m,Q38Int4Experts *x,int layer,int expert,
  * sidecar for another geometry or format, or whose files disagree with the
  * index, is refused rather than ignored; one still being written is skipped
  * with a line saying so (or refused under Q38_EXPERT_INT4=1). */
+/* ---- the MXFP4 experts from a WEX4 container (COLI_WEX_PATH; docs/wex.md) ----------
+ * A WEX4 file of this model's routed experts, one RAW record per (layer, expert) whose six
+ * tensors are the experts-mxfp4/ record's (gate, down, up scales, then their e2m1 codes, the
+ * same bytes, padded to 4096): the container serves the records instead of the sidecar's
+ * layer files, read and bound exactly as theirs (q38_x4_read, q38_bind_int4_record). It is
+ * the MXFP4 sidecar in another file, so it implies Q38_EXPERT_LOWBIT=mxfp4 and refuses any
+ * other low-bit format.
+ *
+ * Checked at attach: the header page and the index (wex4.h), the model's grid, COLI_WEX_ROOT
+ * (64 hex digits) when set, every expert of the loaded layers present as a RAW record of the
+ * layout above, dtypes U8/E8M0 and U8/I8. COLI_WEX_VERIFY (on with COLI_WEX_ROOT, else off)
+ * hashes each record at its first use (q38_wex_check). Asked for, the container is required:
+ * anything that does not hold stops the engine with the reason, as a sidecar that was asked
+ * for does. COLI_MODEL_MIRROR copies are not applied to a container (one drive). */
+static void q38_wex_refuse(const char *path,const char *why) {
+    fprintf(stderr,"[qwen38] COLI_WEX_PATH %s: %s -- refusing (unset COLI_WEX_PATH to run without it)\n",path,why);
+    exit(1);
+}
+
+/* COLI_WEX_ROOT: 0 unset, 1 a root (in pin), -1 not 64 hex digits */
+static int q38_wex_pin(unsigned char pin[32]) {
+    const char *text=getenv("COLI_WEX_ROOT");
+    if(!text||!*text)return 0;
+    if(strlen(text)!=64)return -1;
+    for(int i=0;i<64;i++){
+        int ch=text[i],v=ch>='0'&&ch<='9'?ch-'0':ch>='a'&&ch<='f'?ch-'a'+10:ch>='A'&&ch<='F'?ch-'A'+10:-1;
+        if(v<0)return -1;
+        if(i&1)pin[i/2]|=(unsigned char)v;else pin[i/2]=(unsigned char)(v<<4);
+    }
+    return 1;
+}
+
+static void q38_wex4_attach(Model *m,const char *path) {
+    const Q38Lowbit *lb=q38_expert_lowbit_wanted();
+    char why[400],root[65];
+    if(lb&&!lb->mx){
+        snprintf(why,sizeof why,"a container holds MXFP4 experts, and Q38_EXPERT_LOWBIT=%s asks for another format",lb->name);
+        q38_wex_refuse(path,why);
+    }
+    Cfg *c=&m->c;
+    Q38Int4Experts *x=(Q38Int4Experts*)calloc(1,sizeof(*x));
+    unsigned char *page=(unsigned char*)malloc(WEX4_PAGE),pin[32];
+    if(!x||!page){fprintf(stderr,"OOM WEX4 expert index\n");exit(1);}
+    x->bits=4;x->lb=&Q38_MXFP4;x->mir_n=1;x->mir_cut[0]=256;
+    q38_mx4_sizes(x,c->hidden,c->inter);
+    const int fd=st_open_fd(&x->S,path);        /* stops with the path if it cannot be opened */
+    const int64_t size=x->S.sizes[0];
+    if(size<(int64_t)WEX4_PAGE)q38_wex_refuse(path,"no header page (shorter than 4096 bytes)");
+    st_pread_full(fd,page,WEX4_PAGE,0,"pread WEX4 header page");
+    Wex4Header h;Wex4View view;
+    int rc=wex4_parse_header(page,(uint64_t)size,&h);
+    if(rc){
+        const uint32_t magic=wex_read_u32_le(page);
+        if(magic==WEX_MAGIC_V1||magic==WEX_MAGIC_V2||magic==WEX_MAGIC_V3)
+            q38_wex_refuse(path,"a WEX1-WEX3 container, not WEX4");
+        snprintf(why,sizeof why,"not a valid WEX4 container (header page: wex4.h error %d)",rc);
+        q38_wex_refuse(path,why);
+    }
+    for(int i=0;i<32;i++)snprintf(root+2*i,3,"%02x",h.root[i]);
+    if(h.layers!=(uint32_t)c->layers||h.experts!=(uint32_t)c->experts){
+        snprintf(why,sizeof why,"written for a grid of %u x %u experts, the model has %d x %d",h.layers,h.experts,
+                 c->layers,c->experts);
+        q38_wex_refuse(path,why);
+    }
+    const int pinned=q38_wex_pin(pin);
+    if(pinned<0)q38_wex_refuse(path,"COLI_WEX_ROOT is not 64 hex digits");
+    if(pinned&&memcmp(pin,h.root,32)){
+        snprintf(why,sizeof why,"its root %s is not the pinned COLI_WEX_ROOT",root);
+        q38_wex_refuse(path,why);
+    }
+    const size_t index_len=(size_t)wex4_align(h.index_bytes);
+    unsigned char *index=(unsigned char*)malloc(index_len?index_len:1);
+    if(!index){fprintf(stderr,"OOM WEX4 index\n");exit(1);}
+    if(index_len)st_pread_full(fd,index,(int64_t)index_len,(int64_t)h.index_offset,"pread WEX4 index");
+    if((rc=wex4_open(&h,index,index_len,&view))){
+        snprintf(why,sizeof why,"not a valid WEX4 container (index: wex4.h error %d)",rc);
+        q38_wex_refuse(path,why);
+    }
+    const size_t cells=(size_t)c->layers*(size_t)c->experts;
+    x->fd=(int*)malloc((size_t)c->layers*sizeof(int));
+    x->off=(int64_t*)malloc(cells*sizeof(int64_t));
+    unsigned char *sha=(unsigned char*)malloc(cells*32);
+    if(!x->fd||!x->off||!sha){fprintf(stderr,"OOM WEX4 expert index\n");exit(1);}
+    for(int layer=0;layer<c->layers;layer++)x->fd[layer]=-1;
+    for(size_t k=0;k<cells;k++)x->off[k]=-1;
+    const int rows[3]={c->inter,c->inter,c->hidden},cols[3]={c->hidden,c->hidden,c->inter};   /* gate, up, down */
+    int64_t code_off[3],scale_off[3];
+    q38_mx4_offsets(x,code_off,scale_off);
+    for(uint32_t r=0;r<h.records;r++){
+        Wex4Record rec;
+        wex4_get_record(&view,r,&rec);
+        if(!(rec.flags&WEX4_REC_EXPERT))continue;   /* other tensors: not the experts' */
+        const int layer=(int)(rec.owner>>16),expert=(int)(rec.owner&0xffffu);   /* bounded by wex4_open */
+        if(rec.codec!=WEX4_CODEC_RAW)
+            q38_wex_refuse(path,"it holds WNR3 records, which this build does not read (RAW records only)");
+        int ok=rec.decoded==(uint64_t)x->record_bytes&&rec.tensor_count==6;
+        for(int part=0;part<6&&ok;part++){   /* the record's order: gate, down, up scales, then their codes */
+            const int k=q38_mx4_order[part%3],scale=part<3;
+            Wex4Tensor t;
+            wex4_get_tensor(&view,rec.first_tensor+(uint32_t)part,&t);
+            const int64_t width=scale?(cols[k]+31)/32:(cols[k]+1)/2;
+            ok=t.rank==2&&t.record_count==1&&t.shape[0]==(uint64_t)rows[k]&&t.shape[1]==(uint64_t)width&&
+               (scale?t.dtype==WEX4_DT_U8||t.dtype==WEX4_DT_F8_E8M0:t.dtype==WEX4_DT_U8||t.dtype==WEX4_DT_I8)&&
+               t.offset==(uint64_t)(scale?scale_off[k]:code_off[k])&&
+               t.nbytes==(uint64_t)(scale?x->q_bytes[k]:x->code_bytes[k]);
+        }
+        if(!ok){
+            snprintf(why,sizeof why,"the record of layer %d expert %d is not an MXFP4 expert of this model "
+                                    "(%lld bytes: gate, down, up scales, then their e2m1 codes)",layer,expert,
+                     (long long)x->record_bytes);
+            q38_wex_refuse(path,why);
+        }
+        x->fd[layer]=fd;
+        x->off[(size_t)layer*c->experts+expert]=(int64_t)rec.offset;
+        memcpy(sha+((size_t)layer*c->experts+expert)*32,rec.sha,32);
+    }
+    for(int layer=m->range_begin;layer<m->range_end;layer++)
+        for(int expert=0;expert<c->experts;expert++)
+            if(x->off[(size_t)layer*c->experts+expert]<0){
+                snprintf(why,sizeof why,"layer %d expert %d is not in it",layer,expert);
+                q38_wex_refuse(path,why);
+            }
+    const char *verify=getenv("COLI_WEX_VERIFY");
+    if(verify&&*verify?atoi(verify)!=0:pinned>0){
+        x->wex_sha=sha;
+        if(!(x->wex_seen=(unsigned char*)calloc(cells,1))){fprintf(stderr,"OOM WEX4 expert index\n");exit(1);}
+    } else free(sha);
+    if(!(x->wex=strdup(path))){fprintf(stderr,"OOM WEX4 expert index\n");exit(1);}
+    const char *mirrors=getenv("COLI_MODEL_MIRROR");
+    if(mirrors&&*mirrors)
+        fprintf(stderr,"[qwen38 MIRROR] COLI_MODEL_MIRROR is not applied to a WEX4 container: every record comes from %s\n",path);
+    fprintf(stderr,"[qwen38] MXFP4 experts from the WEX4 container %s: records of %lld bytes, root %s%s; "
+                   "first-read SHA-256 %s\n",path,(long long)x->record_bytes,root,pinned?" (pinned)":"",
+            x->wex_sha?"on":"off");
+    free(index);free(page);
+    m->x4=x;
+}
+
 static void q38_expert_int4_attach(Model *m,const char *snap) {
     if(g_q38_gguf)return;   /* GGUF: the experts are the file's ggml blocks */
+    const char *wex=getenv("COLI_WEX_PATH");
+    if(wex&&*wex){q38_wex4_attach(m,wex);return;}   /* the MXFP4 records from a WEX4 container */
     const Q38Lowbit *lb=q38_expert_lowbit_wanted();
     const int int2=lb!=NULL;
     int wanted=int2?1:q38_expert_int4_wanted();
@@ -2646,6 +2815,7 @@ static void q38_load_int4_record(Model *m,int layer,int expert,Slot *slot) {
     int fd=x->fd[layer];int64_t off=x->off[(int64_t)layer*m->c.experts+expert];
     const uint8_t *mapped=(const uint8_t*)st_map_shard_range(fd,off,x->record_bytes);
     if(mapped){
+        q38_wex_check(m,layer,expert,mapped);   /* COLI_WEX_VERIFY on a container */
         q38_bind_int4_record(m,slot,(uint8_t*)mapped);
         free(slot->int4_slab);slot->int4_slab=NULL;slot->int4_slab_bytes=0;
         return;
@@ -6638,7 +6808,7 @@ static void q38_model_free(Model *m) {
     free(m->mtp_norm_emb); free(m->mtp_norm_hid);
     q38_weight_free(&m->mtp_fc_emb); q38_weight_free(&m->mtp_fc_hid);
     free(m->mtp_mixer.norm); q38_weight_free(&m->mtp_mixer.down); q38_weight_free(&m->mtp_mixer.up);
-    if(m->x4){st_destroy(&m->x4->S);free(m->x4->fd);free(m->x4->off);free(m->x4);}
+    if(m->x4){st_destroy(&m->x4->S);free(m->x4->fd);free(m->x4->off);free(m->x4->wex);free(m->x4->wex_sha);free(m->x4->wex_seen);free(m->x4);}
     free(m->L); free(m->cache); free(m->expert_scales); free(m->DN_rec); free(m->DN_conv); free(m->dn_dev_fresh); free(m->dn_host_stale); free(m->K); free(m->V); free(m->IK);
     q38_weight_free(&m->embed);q38_weight_free(&m->lm_head);
     free(m->draft_codes);free(m->draft_sc);m->draft_codes=NULL;m->draft_sc=NULL;

@@ -7,6 +7,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### New
 
+- **Qwen3.8's MXFP4 experts from a WEX4 container** (`COLI_WEX_PATH`): the `experts-mxfp4/`
+  records from one WEX4 file, read and computed as the sidecar's; `COLI_WEX_ROOT` pins the file
+  and `COLI_WEX_VERIFY` checks each record's SHA-256 at its first use. Asked for, the container
+  is required: anything that does not fit stops the engine with the reason. Unset, nothing
+  changes. `tests/test_qwen38_wex4.c` in `make test-c` ([docs/wex.md](docs/wex.md)).
 - **DeepSeek V4's routed experts from a WEX4 container** (`COLI_WEX_PATH`, `COLI_WEX_ROOT`,
   `COLI_WEX_VERIFY`): one read of one RAW record per miss instead of six ranges of the shards,
   the root pinned and each record's SHA-256 checked at its first read when asked; a bad or

@@ -445,6 +445,14 @@ bit across paths, the same fixture's FP8 experts give the same tokens and
 last logits within cosine 0.99999, and every refusal above is checked in its
 own process.
 
+### The same records from a WEX4 container (`COLI_WEX_PATH`)
+
+`COLI_WEX_PATH=<file>` reads the MXFP4 records from one WEX4 container instead of
+`experts-mxfp4/`: the same bytes, one 4096-aligned record per expert, bound and
+computed by the code above. `COLI_WEX_ROOT=<root>` (printed by
+`tools/wex4_verify`) refuses any other file and checks each record's SHA-256 the
+first time it is used. Details and the checks at attach: [wex.md](wex.md#qwen38-qwen38).
+
 ## Speculative decoding with the MTP head
 
 On by default from 1.13.0 when the checkpoint has it (`Q38_MTP=0` turns it off, and

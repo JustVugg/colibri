@@ -90,7 +90,38 @@ checkpoint must stay where it is. The store prints one `[v4_wex]` line at open (
 many experts it holds, its root, whether the hash check is on) and one at the end (records read,
 bytes, fallbacks, refusals). Only RAW records are read; a container with WNR3 records is not used.
 
+## Qwen3.8 (`qwen38`)
+
+The container takes the place of the `experts-mxfp4/` sidecar ([qwen38.md](qwen38.md)): its
+records are the same bytes (gate, down, up scales, then their e2m1 codes, 2,611,200 bytes on the
+release), one 4096-aligned record per expert in one file. The trunk, the shared expert and the
+MTP head stay the FP8 snapshot's.
+
+```sh
+COLI_WEX_PATH=experts-mxfp4.wex4 COLI_WEX_ROOT=<root> ./qwen38 ...
+```
+
+| Variable | Default | Effect |
+|---|---|---|
+| `COLI_WEX_PATH` | unset | the container, read as the MXFP4 experts (implies `Q38_EXPERT_LOWBIT=mxfp4`; any other low-bit format is refused); unset, nothing changes |
+| `COLI_WEX_ROOT` | unset | 64 hex digits: a container with another root stops the engine; turns `COLI_WEX_VERIFY` on |
+| `COLI_WEX_VERIFY` | on with `COLI_WEX_ROOT`, else off | `1`: each record's SHA-256 against the index at its first use, read or mapped (`COLI_MAP_EXPERTS=1`) |
+
+`q38_wex4_attach` (`qwen38_core.h`) checks the header page, the index, the grid, the root, and
+that every expert of the loaded layers is a RAW record of exactly that layout; then the records
+are read and bound by the sidecar's own code (`q38_x4_read`, `q38_bind_int4_record`), so the
+CPU kernels, the batch loader and the mapped path are the sidecar's. As with a sidecar that was
+asked for, anything that does not hold stops the engine with the reason; the qwen38 engine has
+no second copy of the MXFP4 experts to fall back to. `COLI_MODEL_MIRROR` copies are not applied
+to a container yet (one drive).
+
+A container for Qwen3.8 is written by Wex-WRN2's `wex4/wex4_convert.py pack --experts raw
+--names qwen38` from the sidecar's layer files or from AMD's Quark checkpoint. Its record layout
+needs the experts' widths to be multiples of 32 (true of the release: hidden 2560,
+moe_intermediate 640), so the tiny fixture (`qwen38_tiny_mxfp4`, moe_intermediate 8) has no
+container form; `tests/test_qwen38_wex4.c` uses a synthetic grid instead.
+
 ## Status in colibri
 
-DeepSeek V4 reads RAW records from a WEX4 container. Qwen3.8 and DeepSeek V4.1 come in the
-next pull requests of the series; WNR3 records after them.
+DeepSeek V4 and Qwen3.8 read RAW records from a WEX4 container. DeepSeek V4.1 comes in the next
+pull request of the series; WNR3 records after it.
