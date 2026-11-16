@@ -1,0 +1,79 @@
+{
+  "version": 1,
+  "hypothesis": "On a HIP card below 10 GiB of --vram the dense mirrors, and the shared experts with them, stay in RAM, so the prompt's VRAM bank (COLI_CUDA_MOE_BATCH=1) can never run; treating it as not asked for frees the bank-sized VRAM reserve for decode mirrors and keeps the prefill pool on, which cuts the prompt's expert reads several times and shortens the time to the first token.",
+  "commit": "0b74da0eb5f9923cab380afe97c290cc3ed41d09",
+  "model": "DeepSeek-V4-Flash architecture, REAP-pruned to 132 experts x 43 layers (79 GB), safetensors, native FP8/FP4",
+  "command": "make -C c -j16 deepseek-v4 HIP=1 HIP_ARCH=gfx1102 ROCM_HOME=/usr on dev (baseline) and on this commit (trial); deepseek_v4 <model> --prompt-file long_prompt.txt --max-tokens 12 with the environment in config; the arms alternate (trial, baseline) four times; tok_s = 2535 prompt tokens / time_to_first_token from the engine's `timing` line (prompt throughput); memory: the engine's automatic RAM budget (55 to 58 GiB available at start, 42 to 45 GiB expert cache in every run)",
+  "prompt_hash": "a62d4d2d4272346f8dc0e9a2b9f9bb2b6bb0a4d3fe0edd8818d43119c100295c",
+  "hardware": {
+    "cpu": "AMD Ryzen 9 7945HX, 16 cores / 32 threads, AVX-512",
+    "ram": "62 GB DDR5 (automatic memory budget)",
+    "storage": "Apacer AS2280Q4U 4TB NVMe, ext4 (rw,noatime), direct aligned reads",
+    "os": "Gentoo Linux 7.3.1, gcc 16.2.1, ROCm/HIP 7.16.0 (clang 23.1.5), AMD Radeon RX 7600M XT 8 GB (gfx1102; also the display GPU, desktop and other software running, load average 13 to 19 during the later runs)"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "engine"
+  ],
+  "baseline": {
+    "config": {
+      "engine": "dev c7752bf5",
+      "binary": "deepseek_v4 HIP=1 HIP_ARCH=gfx1102 ARCH=native",
+      "args": "--prompt-file long_prompt.txt --max-tokens 12 --vram 5 (as CUDA_EXPERT_GB=5)",
+      "COLI_CUDA": "1",
+      "CUDA_EXPERT_GB": "5",
+      "COLI_CUDA_MOE_BATCH": "1",
+      "V4_PREFIX_CKPT": "0",
+      "COLI_V4_SAVE_USAGE": "0",
+      "memory": "auto"
+    },
+    "samples": {
+      "tok_s": [
+        4.9843,
+        4.3614,
+        4.8241,
+        4.3254
+      ]
+    },
+    "median_tok_s": 4.59275,
+    "quality": {
+      "method": "greedy text identical across the arm's runs and identical to the trial's (md5 of stdout)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/v4-hip-bank-dense-ram-2026-11-16/baseline_runs.txt",
+      "sha256": "7be78693620a36986390f4819abe7a7ce0d26eba57063fac037d86cfbffbb7d7"
+    }
+  },
+  "trial": {
+    "config": {
+      "engine": "this commit",
+      "binary": "deepseek_v4 HIP=1 HIP_ARCH=gfx1102 ARCH=native",
+      "args": "--prompt-file long_prompt.txt --max-tokens 12 --vram 5 (as CUDA_EXPERT_GB=5)",
+      "COLI_CUDA": "1",
+      "CUDA_EXPERT_GB": "5",
+      "COLI_CUDA_MOE_BATCH": "1",
+      "V4_PREFIX_CKPT": "0",
+      "COLI_V4_SAVE_USAGE": "0",
+      "memory": "auto"
+    },
+    "samples": {
+      "tok_s": [
+        5.2863,
+        5.3174,
+        5.1969,
+        5.1989
+      ]
+    },
+    "median_tok_s": 5.2426,
+    "quality": {
+      "method": "greedy text identical across the arm's runs and identical to the baseline's (md5 of stdout)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/v4-hip-bank-dense-ram-2026-11-16/trial_runs.txt",
+      "sha256": "a909175062586c17876dababd0880c6f1e47da5df6bb59986196460659873500"
+    }
+  },
+  "outcome": "improvement"
+}
