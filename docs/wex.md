@@ -121,7 +121,33 @@ needs the experts' widths to be multiples of 32 (true of the release: hidden 256
 moe_intermediate 640), so the tiny fixture (`qwen38_tiny_mxfp4`, moe_intermediate 8) has no
 container form; `tests/test_qwen38_wex4.c` uses a synthetic grid instead.
 
+## DeepSeek V4.1 (`deepseek_v41`)
+
+```sh
+COLI_WEX_PATH=v4_flash_experts.wex4 COLI_WEX_ROOT=<root> ./deepseek_v41 ...
+```
+
+The variables and their defaults are DeepSeek V4's (above). The engine keeps an expert in six
+windows, one per tensor, and reads them on its reader threads (`V41_READ_DEPTH`); with a
+container, `v41_wex_open` turns each expert record's six tensors into six entries over the
+container's one file, so `expert_fetch` reads them exactly as it reads the shards' tensors, only
+from one contiguous record:
+
+```
+open      v41_wex_open      header page, index, grid (n_layers x n_routed), COLI_WEX_ROOT,
+                            every expert record RAW with the checkpoint's shapes and part sizes
+                            (any failure: a [v41_wex] line, and the shards serve every expert)
+miss      expert_read_list  a backbone expert the container holds -> its six tensors in the container
+          expert_fetch      the same windows, the same readers, O_DIRECT where there is one
+          v41_wex_check     COLI_WEX_VERIFY, first read: the six parts in record order and the zero
+                            padding against the index's SHA-256; a mismatch -> that expert read again
+                            from the shards, and from the shards for the rest of the run
+```
+
+The DSpark stages, a GGUF's experts and every other tensor stay on the shards; so do the
+Vulkan tier's prewarm reads.
+
 ## Status in colibri
 
-DeepSeek V4 and Qwen3.8 read RAW records from a WEX4 container. DeepSeek V4.1 comes in the next
-pull request of the series; WNR3 records after it.
+DeepSeek V4, DeepSeek V4.1 and Qwen3.8 read RAW records from a WEX4 container. WNR3 records,
+their GPU decode and the I/O switches (several drives, split reads) are the next series.

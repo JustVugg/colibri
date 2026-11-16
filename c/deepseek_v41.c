@@ -1440,6 +1440,7 @@ typedef struct {
      * the same id whatever the picture was, so consuming one taints the record
      * (see kv_prefix.h). */
     kv_prefix kvp;
+    struct V41Wex *wex;   /* COLI_WEX_PATH: the WEX4 container the backbone's experts come from, or NULL */
 } Model;
 
 /* One conversation's state for a multiplexed serve (KV_SLOTS>1, serve_mux below):
@@ -1732,6 +1733,7 @@ typedef struct {
     int part;
     int rep;
     int gx_layer;         /* a GGUF expert's matrix: its layer (its type and form), else -1 */
+    shards *S;            /* the file set t is in: the checkpoint's, or the WEX4 container's */
 } ExpertRead;
 
 /* Bytes one part of an expert occupies, from the config rather than the file:
@@ -1830,6 +1832,193 @@ static void v41_gx_geometry(Model *m) {
                 gq_type_name(m->gx_t[3 * L + 2]), m->gx_t[3 * L] == GQ_MXFP4 ? ", as the checkpoint's FP4" : "");
 }
 
+/* ---- routed experts from a WEX4 container (COLI_WEX_PATH; docs/wex.md) ----------
+ * A WEX4 file of the checkpoint's routed experts: one RAW record per (layer, expert),
+ * the w1, w2, w3 scales then the w1, w2, w3 weights, back to back, padded to 4096. The
+ * container's six tensors of an expert become six st_tensor entries over its one file
+ * (wex->t), so expert_fetch reads them as it reads the shards' (the same windows, O_DIRECT,
+ * reader threads), only from a contiguous record of one file. The backbone's experts only;
+ * the DSpark stages, a GGUF's experts and every other tensor stay on the shards.
+ *
+ * At open (v41_wex_open): the header page and the index (wex4.h), the grid (n_layers x
+ * n_routed), COLI_WEX_ROOT (64 hex digits) when set, and every expert record RAW with the
+ * checkpoint's shapes and part sizes. Any failure leaves every expert on the safetensors
+ * with a "[v41_wex]" line; an expert the container lacks is read from them too.
+ * COLI_WEX_VERIFY (on with COLI_WEX_ROOT, else off) hashes each record at its first read
+ * (v41_wex_check, the six parts in record order and its zero padding): one that fails is
+ * read again from the safetensors and stays on them for the run. */
+#include "wex4.h"
+
+typedef struct V41Wex {
+    shards S;                  /* the container: its one file */
+    st_tensor *t;              /* [cell * 6 + part]: the part's bytes in the file; fd < 0: not in it */
+    unsigned char *sha;        /* COLI_WEX_VERIFY: [cell * 32] the index's SHA-256 of each record, else NULL */
+    unsigned char *state;      /* [cell]: 0 not hashed yet, 1 passed, 2 refused (the shards serve it) */
+    int64_t pad;               /* a record's zero padding: stored - decoded */
+    uint64_t reads, refused;
+} V41Wex;
+
+/* the container's tensor order in a record (w1, w2, w3 scales, then weights) as expert_read_list's parts */
+static const int v41_wex_part[6] = {1, 5, 3, 0, 4, 2};
+
+static int v41_wex_pin(unsigned char pin[32]) {   /* COLI_WEX_ROOT: 0 unset, 1 a root, -1 not 64 hex digits */
+    const char *text = getenv("COLI_WEX_ROOT");
+    if (!text || !*text) return 0;
+    if (strlen(text) != 64) return -1;
+    for (int i = 0; i < 64; i++) {
+        int ch = text[i], v = ch >= '0' && ch <= '9' ? ch - '0' : ch >= 'a' && ch <= 'f' ? ch - 'a' + 10
+                            : ch >= 'A' && ch <= 'F' ? ch - 'A' + 10 : -1;
+        if (v < 0) return -1;
+        if (i & 1) pin[i / 2] |= (unsigned char)v; else pin[i / 2] = (unsigned char)(v << 4);
+    }
+    return 1;
+}
+
+static void v41_wex_free(V41Wex *w) {
+    if (!w) return;
+    st_destroy(&w->S);
+    free(w->t); free(w->sha); free(w->state); free(w);
+}
+
+static void v41_wex_open(Model *m) {
+    const char *path = getenv("COLI_WEX_PATH");
+    if (!path || !*path) return;
+    const Cfg *c = &m->c;
+    char why[300] = "", root[65] = "";
+    unsigned char *page = NULL, *index = NULL, pin[32];
+    V41Wex *w = NULL;
+    if (m->gx) { snprintf(why, sizeof why, "is not used with a GGUF's experts"); goto refuse; }
+    int probe = open(path, COMPAT_O_RDONLY);
+    if (probe < 0) { snprintf(why, sizeof why, "cannot be opened (%s)", strerror(errno)); goto refuse; }
+    close(probe);
+    w = xcalloc(1, sizeof *w, "WEX4 container");
+    const int fd = st_open_fd(&w->S, path);
+    const int64_t size = w->S.sizes[0];
+    page = xmalloc(WEX4_PAGE, "WEX4 header page");
+    if (size < (int64_t)WEX4_PAGE) { snprintf(why, sizeof why, "has no header page"); goto refuse; }
+    st_pread_full(fd, page, WEX4_PAGE, 0, "pread WEX4 header page");
+    Wex4Header h;
+    Wex4View view;
+    int rc = wex4_parse_header(page, (uint64_t)size, &h);
+    if (rc) {
+        const uint32_t magic = wex_read_u32_le(page);
+        if (magic == WEX_MAGIC_V1 || magic == WEX_MAGIC_V2 || magic == WEX_MAGIC_V3)
+            snprintf(why, sizeof why, "is a WEX1-WEX3 container, not WEX4");
+        else snprintf(why, sizeof why, "is not a valid WEX4 container (header page: wex4.h error %d)", rc);
+        goto refuse;
+    }
+    for (int i = 0; i < 32; i++) snprintf(root + 2 * i, 3, "%02x", h.root[i]);
+    if (h.layers != (uint32_t)c->n_layers || h.experts != (uint32_t)c->n_routed) {
+        snprintf(why, sizeof why, "was written for another model (a grid of %u x %u experts, the model has %d x %d)",
+                 h.layers, h.experts, c->n_layers, c->n_routed);
+        goto refuse;
+    }
+    const int pinned = v41_wex_pin(pin);
+    if (pinned < 0) { snprintf(why, sizeof why, "is not used: COLI_WEX_ROOT is not 64 hex digits"); goto refuse; }
+    if (pinned && memcmp(pin, h.root, 32)) {
+        snprintf(why, sizeof why, "is not the pinned COLI_WEX_ROOT (its root is %s)", root);
+        goto refuse;
+    }
+    const size_t index_len = (size_t)wex4_align(h.index_bytes);
+    index = xmalloc(index_len ? index_len : 1, "WEX4 index");
+    if (index_len) st_pread_full(fd, index, (int64_t)index_len, (int64_t)h.index_offset, "pread WEX4 index");
+    if ((rc = wex4_open(&h, index, index_len, &view))) {
+        snprintf(why, sizeof why, "is not a valid WEX4 container (index: wex4.h error %d)", rc);
+        goto refuse;
+    }
+    const size_t cells = (size_t)c->n_layers * (size_t)c->n_routed;
+    w->t = xcalloc(cells * 6, sizeof *w->t, "WEX4 expert tensors");
+    w->state = xcalloc(cells, 1, "WEX4 expert state");
+    unsigned char *sha = xmalloc(cells * 32, "WEX4 record hashes");
+    for (size_t k = 0; k < cells * 6; k++) w->t[k].fd = -1;
+    int64_t decoded = 0;
+    for (int part = 0; part < 6; part++) decoded += expert_part_bytes(c, part);
+    w->pad = (int64_t)wex4_align((uint64_t)decoded) - decoded;
+    int held = 0;
+    for (uint32_t r = 0; r < h.records; r++) {
+        Wex4Record rec;
+        wex4_get_record(&view, r, &rec);
+        if (!(rec.flags & WEX4_REC_EXPERT)) continue;   /* other tensors: not the experts' */
+        const int layer = (int)(rec.owner >> 16), eid = (int)(rec.owner & 0xffffu);   /* bounded by wex4_open */
+        if (rec.codec != WEX4_CODEC_RAW) {
+            snprintf(why, sizeof why, "holds WNR3 records, which this build does not read (RAW records only)");
+            free(sha);
+            goto refuse;
+        }
+        const size_t cell = (size_t)layer * c->n_routed + eid;
+        int ok = rec.tensor_count == 6 && (int64_t)rec.decoded == decoded;
+        for (int j = 0; j < 6 && ok; j++) {
+            Wex4Tensor t;
+            wex4_get_tensor(&view, rec.first_tensor + (uint32_t)j, &t);
+            const int part = v41_wex_part[j], scale = part & 1, down = part >= 4;
+            const int64_t rows = down ? c->dim : c->moe_inter, k = down ? c->moe_inter : c->dim;
+            const int64_t cols = scale ? k / 32 : k / 2;
+            ok = t.rank == 2 && t.record_count == 1 && (int64_t)t.shape[0] == rows && (int64_t)t.shape[1] == cols &&
+                 (int64_t)t.nbytes == expert_part_bytes(c, part) &&
+                 (scale ? t.dtype == WEX4_DT_U8 || t.dtype == WEX4_DT_F8_E8M0 : t.dtype == WEX4_DT_U8 || t.dtype == WEX4_DT_I8);
+            if (!ok) break;
+            st_tensor *dst = &w->t[cell * 6 + part];
+            dst->name = (char *)"a WEX4 record's tensor";
+            dst->fd = fd; dst->off = (int64_t)(rec.offset + t.offset); dst->nbytes = (int64_t)t.nbytes;
+            dst->dtype = 3; dst->rank = 2; dst->shape[0] = rows; dst->shape[1] = cols; dst->numel = rows * cols;
+        }
+        if (!ok) {
+            snprintf(why, sizeof why, "has a record (layer %d expert %d) that is not the checkpoint's expert "
+                                      "(shapes or sizes differ)", layer, eid);
+            free(sha);
+            goto refuse;
+        }
+        memcpy(sha + cell * 32, rec.sha, 32);
+        held++;
+    }
+    const char *verify = getenv("COLI_WEX_VERIFY");
+    if (verify && *verify ? atoi(verify) != 0 : pinned > 0) w->sha = sha; else free(sha);
+    fprintf(stderr, "[v41_wex] WEX4 container %s: %d of %zu experts, root %s%s; first-read SHA-256 %s\n", path,
+            held, cells, root, pinned ? " (pinned)" : "", w->sha ? "on" : "off");
+    free(page); free(index);
+    m->wex = w;
+    return;
+refuse:
+    fprintf(stderr, "[v41_wex] %s %s; the experts come from the safetensors\n", path, why);
+    free(page); free(index);
+    v41_wex_free(w);
+}
+
+/* Whether the container serves this backbone expert. */
+static int v41_wex_has(const Model *m, const char *kind, int layer, int eid) {
+    const V41Wex *w = m->wex;
+    if (!w || strcmp(kind, "layers")) return 0;
+    const size_t cell = (size_t)layer * m->c.n_routed + eid;
+    return w->t[cell * 6].fd >= 0 && __atomic_load_n(&w->state[cell], __ATOMIC_ACQUIRE) != 2;
+}
+
+/* COLI_WEX_VERIFY: the record of an expert just read from the container, hashed from its
+ * six windows in record order plus its zero padding. 1 = it is the index's record. */
+static int v41_wex_check(Model *m, int layer, int eid, Slot *s) {
+    V41Wex *w = m->wex;
+    const size_t cell = (size_t)layer * m->c.n_routed + eid;
+    if (!w->sha || __atomic_load_n(&w->state[cell], __ATOMIC_ACQUIRE) == 1) return 1;
+    static const unsigned char zero[WEX4_PAGE];
+    unsigned char digest[32];
+    Wex4Sha sha;
+    wex4_sha_init(&sha);
+    for (int j = 0; j < 6; j++) {
+        const st_tensor *t = &w->t[cell * 6 + v41_wex_part[j]];
+        wex4_sha_update(&sha, s->base[v41_wex_part[j]] + t->off % ST_DIRECT_ALIGN, (size_t)t->nbytes);
+    }
+    wex4_sha_update(&sha, zero, (size_t)w->pad);
+    wex4_sha_final(&sha, digest);
+    if (memcmp(digest, w->sha + cell * 32, 32)) {
+        __atomic_store_n(&w->state[cell], (unsigned char)2, __ATOMIC_RELEASE);
+        __atomic_fetch_add(&w->refused, UINT64_C(1), __ATOMIC_RELAXED);
+        fprintf(stderr, "[v41_wex] layer %d expert %d: the record does not match its SHA-256 in the index; "
+                        "this expert comes from the safetensors from now on\n", layer, eid);
+        return 0;
+    }
+    __atomic_store_n(&w->state[cell], (unsigned char)1, __ATOMIC_RELEASE);
+    return 1;
+}
+
 /* Fill in the six reads that make up one expert. Naming them into a list instead
  * of reading them on the spot is the whole point: the list is what lets a layer's
  * misses go to the device together rather than one behind another. Resolution
@@ -1844,16 +2033,23 @@ static int expert_read_list(Model *m, const char *kind, int layer, int eid, Slot
     char name[160];
     int n = 0;
     const int gi = v41_gx_index(m, kind, layer), gx = gi >= 0;   /* a GGUF's: the three matrices, no scales */
+    const int wex = !gx && v41_wex_has(m, kind, layer, eid);     /* COLI_WEX_PATH: the container's record */
     for (int i = 0; i < 3; i++) {
         for (int f = 0; f < 2 - gx; f++) {
-            snprintf(name, sizeof(name), "%s.%d.ffn.experts.%d.%s.%s",
-                     kind, layer, eid, part[i].suffix, leaf[f]);
-            const st_tensor *t = st_find(&m->S, name);
-            if (!t) st_die_missing(&m->S, name);
+            const int which = f ? part[i].scale_part : part[i].weight_part;
+            const st_tensor *t;
+            if (wex) t = &m->wex->t[((size_t)layer * m->c.n_routed + eid) * 6 + which];
+            else {
+                snprintf(name, sizeof(name), "%s.%d.ffn.experts.%d.%s.%s",
+                         kind, layer, eid, part[i].suffix, leaf[f]);
+                t = st_find(&m->S, name);
+                if (!t) st_die_missing(&m->S, name);
+            }
             out[n].t = t;
+            out[n].S = wex ? &m->wex->S : &m->S;
             out[n].slot = s;
-            out[n].part = f ? part[i].scale_part : part[i].weight_part;
-            out[n].rep = rep;
+            out[n].part = which;
+            out[n].rep = wex ? 0 : rep;   /* the container has no replicas yet */
             out[n].gx_layer = gi;
             n++;
         }
@@ -1962,9 +2158,12 @@ static void expert_fetch(Model *m, const char *kind, int layer,
     int total = 0;
     ExpertRead *list = xmalloc((size_t)n * V41_EXPERT_TENSORS * sizeof(ExpertRead),
                                "expert read list");
-    for (int i = 0; i < n; i++)
+    int *first = xmalloc((size_t)n * sizeof(int), "expert read list");   /* each expert's first read */
+    for (int i = 0; i < n; i++) {
+        first[i] = total;
         total += expert_read_list(m, kind, layer, eid[i], slot[i],
                                   expert_route(layer, eid[i]), list + total);
+    }
     /* The window is sized from the config, so a container whose tensor declares
      * more than that must not be read into it -- same refusal st_read_raw_cap
      * applied when the read went by name. */
@@ -2007,7 +2206,7 @@ static void expert_fetch(Model *m, const char *kind, int layer,
              * buffer, then interleaved by 16 rows or laid out as FP4 and scales. */
             int64_t raw_n = 0;
             uint8_t *raw = scratch_get(r->t->nbytes + 2 * ST_DIRECT_ALIGN, &raw_n);
-            st_read_range_rep(&m->S, r->t->fd, r->rep, r->t->off, r->t->nbytes, raw + pad,
+            st_read_range_rep(r->S, r->t->fd, r->rep, r->t->off, r->t->nbytes, raw + pad,
                               r->t->nbytes, 1, expert_direct(), "pread expert");
             const int k = r->part / 2, held = m->gx_h[3 * r->gx_layer + k];
             int64_t shape[2];
@@ -2020,18 +2219,32 @@ static void expert_fetch(Model *m, const char *kind, int layer,
         /* The payload pointer carries the slack st_read_range_rep needs to read
          * from the enclosing block boundary, so an O_DIRECT transfer lands the
          * data exactly where the slot wants it and nothing is copied afterwards. */
-        st_read_range_rep(&m->S, r->t->fd, r->rep, r->t->off, r->t->nbytes,
+        st_read_range_rep(r->S, r->t->fd, r->rep, r->t->off, r->t->nbytes,
                           r->slot->base[r->part] + pad, r->t->nbytes, 1, expert_direct(),
                           "pread expert");
         /* Which drive actually answered. A partial mirror leaves shards on the
          * primary, so the replica the route picked is not always the one that read. */
         int rep = r->rep;
-        if (st_fd_rep(&m->S, r->t->fd, rep) < 0) rep = 0;
+        if (st_fd_rep(r->S, r->t->fd, rep) < 0) rep = 0;
         __atomic_fetch_add(&g_mir_bytes[rep], (uint64_t)r->t->nbytes, __ATOMIC_RELAXED);
         __atomic_fetch_add(&g_mir_nread[rep], 1, __ATOMIC_RELAXED);
         bytes += (uint64_t)r->t->nbytes;
     }
     }
+    /* COLI_WEX_VERIFY: each record the container served, hashed at its first read; one that
+     * fails is read again, here, from the checkpoint's shards (v41_wex_check refused it, so
+     * expert_read_list now names the shards' tensors). */
+    for (int i = 0; m->wex && i < n; i++) {
+        ExpertRead *r = list + first[i];
+        if (r->S != &m->wex->S) continue;
+        if (v41_wex_check(m, layer, eid[i], slot[i])) { __atomic_fetch_add(&m->wex->reads, UINT64_C(1), __ATOMIC_RELAXED); continue; }
+        expert_read_list(m, kind, layer, eid[i], slot[i], expert_route(layer, eid[i]), r);
+        for (int k = 0; k < V41_EXPERT_TENSORS; k++)
+            st_read_range_rep(&m->S, r[k].t->fd, r[k].rep, r[k].t->off, r[k].t->nbytes,
+                              r[k].slot->base[r[k].part] + r[k].t->off % ST_DIRECT_ALIGN, r[k].t->nbytes, 1,
+                              expert_direct(), "pread expert");
+    }
+    free(first);
     /* Publish the payload pointers only now. A slot that advertises an expert has
      * to address that expert, and until the read landed the window base was the
      * only pointer that meant anything. */
@@ -2411,6 +2624,7 @@ static void model_load(Model *m, const char *snap, int ecap, int engram_cache_ro
         m->gguf = t && st_ggml_type_any(t->dtype) >= 0;
         v41_gx_geometry(m);
     }
+    v41_wex_open(m);   /* COLI_WEX_PATH: the backbone's routed experts from a WEX4 container */
 #ifdef COLI_VULKAN
     if (!m->gguf) v41_dho_open(m);   /* COLI_VK_DENSE_HOST: the trunk to the device as it is read, its host pages back */
 #endif
