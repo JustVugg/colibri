@@ -7,6 +7,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### New
 
+- **A fast CPU decoder for WNR3 records** (`c/wex_fast_decode.h`): Wex-WRN2's research decoder
+  (AVX2 and NEON kernels, a scalar fallback), the reference's bytes and verdicts at several times its
+  speed; on x86-64 the AVX2 kernel is chosen at run time by CPUID, so a build without `-mavx2`
+  carries it too. No engine uses it yet. `tests/test_wex_fast_decode.c` (three builds) in
+  `make test-c` checks it against the reference of `wex_decode.c` on synthetic records and
+  mutated mini-records; given a container, on real records too ([docs/wex.md](docs/wex.md)).
 - **DeepSeek V4.1: a batch's first-read SHA-256 on the OpenMP team** (`COLI_WEX_VERIFY`, on
   with `COLI_WEX_ROOT`): the records of one `expert_fetch` are hashed one expert a thread
   instead of one after another on the calling thread. Same checks, same fallback; nothing

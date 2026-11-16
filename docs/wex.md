@@ -32,6 +32,8 @@ carries and how to use it. The bytes are specified there, not here:
 | `c/tests/test_wex4_verify.c`, `c/tests/wex4_fixture.h` | the tool on synthetic WEX4 files; the fixture writes a WEX4 file in memory the way the in-place upgrade of a WEX1 file does |
 | `c/wex_decode.c`, `c/wex_decode.h` | WNR3 records on the CPU: the process's WNM2 model registry (`coli_wex_register_model`, and `coli_wex4_register_model` for a WEX4 container's blob, checked against its index hash) and the in-place decode of one record (`coli_wex_decode_record`) |
 | `c/tests/test_wex_decode.c`, `c/tests/wnr3_fixture.h` | the registry and the decode on records made by the reference encoder; the fixture trains a model and writes the WNR3 form of a WEX4 container |
+| `c/wex_fast_decode.h` | a fast CPU decoder of WNR3 records, the reference's bytes and verdicts ([below](#the-fast-cpu-decoder)) |
+| `c/tests/test_wex_fast_decode.c` | the fast decoder against the reference of `wex_decode.c`: synthetic records, mutated mini-records, and real records of a container named on its command line; `--bench` times both |
 | `c/tools/wex_nr3_tools.c`, `c/tools/build_nr3.py`, `c/tests/test_wex_nr3_tools.py` | the WNR3 encoder: a C library and the Python builder that drives it ([below](#making-a-wnr3-container)), and their test |
 
 The files are kept byte for byte in step with Wex-WRN2's `c/` folder (only the line endings,
@@ -40,6 +42,9 @@ specification and its conformance vectors. Comments in them that name a `docs/` 
 mean a path of that repository. `wex_decode.c` and `wex_decode.h` are the exception: Wex-WRN2's
 copy also loads an optional CUDA helper that decodes on the GPU, which is not here (the GPU decode
 comes later), and colibri's adds `coli_wex4_register_model` and the `COLI_WEX_DECODE_API` macro.
+`wex_fast_decode.h` is the other exception: it comes from that repository's research folder,
+without its gather kernel, with the AVX2 kernel chosen at run time, and with
+`wex_fast_decode_record` added ([below](#the-fast-cpu-decoder)).
 
 ### Linking `wex_decode.c`
 
@@ -64,6 +69,36 @@ FP4 value -0 as +0, so it decodes to the same values, not the same bytes (the co
 say so with their value-exact flag). The decoder here is the reference one of
 `wex_neural_rans.h`, one record per thread: on an Intel i7-7700K, 24.7 MB/s on one thread (761 ms
 for one 18.8 MB DeepSeek V4.1 Flash expert) and about 155 MB/s with 8 records at once.
+
+### The fast CPU decoder
+
+`c/wex_fast_decode.h` decodes the same WNR3 records to the same bytes, and refuses the same
+ones, several times faster than the reference: per-context lookup tables built once per model
+(224 KiB), a branchless symbol search (one AVX2 compare, or two NEON ones), four streams
+interleaved in one loop, the stream hash and the ceil inverse fused into it. It comes from
+Wex-WRN2's `wex4/research/fast-cpu-decode/` (whose RESULTS.md has its validation and
+measurements) with its kernels 0 and 1; the gather kernel (AVX2 and SVE), slower than kernel 1
+where it was measured, is not carried.
+
+| Target | What runs |
+|---|---|
+| x86-64, GCC or clang | the AVX2 kernel when CPUID says the CPU has AVX2, BMI1, BMI2 and LZCNT and the OS saves the YMM state; it is compiled with a target attribute, so a build without `-mavx2` (`ARCH=x86-64`) has it too. Otherwise the scalar kernel |
+| little-endian AArch64 | the NEON kernel (NEON is in the base instruction set) |
+| anything else, or `-DWEX_FAST_SCALAR` | the scalar kernel: the reference's loop, stream by stream |
+
+`wex_fast_decode_record` takes a record in its slab as `wex_decode_nr2_record` does (same
+checks, scratch, slab untouched on -1). `tests/test_wex_fast_decode` checks it in three builds
+(default flags, the x86-64 baseline, scalar) against the reference: synthetic records with six
+chunk sizes, plain and canonical zero, every variant on 1 and 8 threads; 512 single-bit changes;
+mini-records cut from decoded records, re-encoded, then damaged byte by byte (the same status,
+the same bytes when both accept), every buffer against a guard page. With a container it adds
+real records:
+
+```sh
+make -C c tests/test_wex_fast_decode
+c/tests/test_wex_fast_decode --mutate 3000 experts.nr3.wex 8   # 8 real records, mini-records cut from them
+c/tests/test_wex_fast_decode --bench experts.nr3.wex 16        # ms per record, reference against fast
+```
 
 ## Checking a container
 
