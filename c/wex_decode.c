@@ -155,10 +155,13 @@ static int wex_nr2_in_helper[WEX_NR2_MAX_MODELS];   /* 1: registered with the CU
  * is added and the CPU has the decoder's SIMD kernel; NULL: that model's records use the reference. */
 static WexFastModel *wex_fast_models[WEX_NR2_MAX_MODELS];
 
+static void wex_stats_arm(void);   /* COLI_WEX_STATS, below */
+
 COLI_WEX_DECODE_API int coli_wex_register_model(const unsigned char *blob, size_t bytes, uint32_t *id) {
     WexNr2Model probe;
     int i, index = -1, result = 0;
     if (wex_nr2_model_open(blob, bytes, &probe)) return -1;
+    wex_stats_arm();
     pthread_mutex_lock(&wex_nr2_mutex);
     for (i = 0; i < wex_nr2_model_count; i++)
         if (wex_nr2_models[i].id == probe.id) {
@@ -257,6 +260,29 @@ COLI_WEX_DECODE_API uint64_t coli_wex_fast_decode_count(void) {
     return __atomic_load_n(&wex_fast_decodes, __ATOMIC_RELAXED);
 }
 
+/* COLI_WEX_STATS=1: one stderr line when the process exits, with what decoded the neural records
+ * coli_wex_decode_record was given, in a form a script can read:
+ *   [wex] stats: helper=H device=D fast=F reference=R failed=X cpu=AVX2
+ * helper: by the CUDA helper into host slabs (with its host batch), device: by the helper into
+ * device buffers, fast / reference: on the CPU, failed: refused or not decoded (-1), cpu: the CPU
+ * decoder at exit. Armed by the first model registered or neural record decoded; unset or 0: nothing. */
+static uint64_t wex_ref_decodes, wex_failed_decodes;
+static int wex_stats_armed;
+static void wex_stats_line(void) {
+    fprintf(stderr, "[wex] stats: helper=%llu device=%llu fast=%llu reference=%llu failed=%llu cpu=%s\n",
+            (unsigned long long)coli_wex_cuda_decode_count(), (unsigned long long)coli_wex_cuda_device_decode_count(),
+            (unsigned long long)coli_wex_fast_decode_count(),
+            (unsigned long long)__atomic_load_n(&wex_ref_decodes, __ATOMIC_RELAXED),
+            (unsigned long long)__atomic_load_n(&wex_failed_decodes, __ATOMIC_RELAXED), coli_wex_cpu_decoder());
+}
+static void wex_stats_arm(void) {
+    const char *value;
+    if (__atomic_load_n(&wex_stats_armed, __ATOMIC_RELAXED)) return;
+    value = getenv("COLI_WEX_STATS");
+    if (!value || !*value || !atoi(value)) return;
+    if (!__atomic_exchange_n(&wex_stats_armed, 1, __ATOMIC_ACQ_REL)) atexit(wex_stats_line);
+}
+
 /* Whether the helper decodes this neural record: its model registered with it, and
  * feature 16 for a WNR3 record. */
 static int wex_cuda_takes(const WexEntry *entry, int in_helper) {
@@ -273,8 +299,9 @@ COLI_WEX_DECODE_API int coli_wex_decode_record(const WexEntry *entry, unsigned c
         size_t at = wex_record_read_offset(entry);
         if (!slab || !at || at > capacity || entry->total_bytes < WEX_NR2_HEADER_BYTES ||
             entry->total_bytes > capacity - at) return -1;
+        wex_stats_arm();
         model = wex_nr2_find(wex_read_u32_le(slab + at + 4u), &in_helper);
-        if (!model) return -1;
+        if (!model) { __atomic_fetch_add(&wex_failed_decodes, UINT64_C(1), __ATOMIC_RELAXED); return -1; }
     }
     if (model && wex_cuda_takes(entry, in_helper)) {
         /* on any status but 0 the helper left the slab as it was: the CPU decodes the same record */
@@ -297,11 +324,15 @@ COLI_WEX_DECODE_API int coli_wex_decode_record(const WexEntry *entry, unsigned c
         if (fast) {
             static const WexFastOptions one = {1, 1, WEX_FAST_LANES, 1};
             const int status = wex_fast_decode_record(entry, slab, capacity, model, tables, &one);
-            if (!status) __atomic_fetch_add(&wex_fast_decodes, UINT64_C(1), __ATOMIC_RELAXED);
+            __atomic_fetch_add(status ? &wex_failed_decodes : &wex_fast_decodes, UINT64_C(1), __ATOMIC_RELAXED);
             return status;
         }
     }
-    if (model) return wex_decode_nr2_record(entry, slab, capacity, model);
+    if (model) {
+        const int status = wex_decode_nr2_record(entry, slab, capacity, model);
+        __atomic_fetch_add(status ? &wex_failed_decodes : &wex_ref_decodes, UINT64_C(1), __ATOMIC_RELAXED);
+        return status;
+    }
     return wex_decode_record(entry, slab, capacity);
 }
 

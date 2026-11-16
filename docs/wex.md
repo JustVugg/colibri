@@ -113,6 +113,19 @@ c/tests/test_wex_fast_decode --mutate 3000 experts.nr3.wex 8   # 8 real records,
 c/tests/test_wex_fast_decode --bench experts.nr3.wex 16        # ms per record, reference against fast
 ```
 
+### Counting the decodes
+
+`COLI_WEX_STATS=1` makes `wex_decode.c` print one line on stderr when the engine exits:
+
+```
+[wex] stats: helper=2257 device=0 fast=0 reference=0 failed=0 cpu=AVX2
+```
+
+the neural records decoded by the CUDA helper into host memory (`helper`) and into device
+buffers (`device`), by the fast CPU decoder, by the reference decoder, the ones refused or not
+decoded (`failed`), and the CPU decoder at exit. It is the same for the three engines (the line
+comes from the one call they make); a RAW container prints no line. Unset or `0`: nothing.
+
 ## Checking a container
 
 ```sh

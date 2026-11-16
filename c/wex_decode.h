@@ -20,6 +20,8 @@
  * NEON on ARM64) unless COLI_WEX_FAST_DECODE=0; to the reference decoder of
  * wex_neural_rans.h then, on other CPUs and for WNR2 records. Same bytes, same
  * verdicts. The coli_wex_cuda_* calls below expose the helper's other entry points.
+ * COLI_WEX_STATS=1 prints one "[wex] stats: helper=... fast=... reference=..." line
+ * at exit: which decoder took the records.
  *
  * Linkage: an engine that is one translation unit includes wex_decode.c with
  * COLI_WEX_DECODE_API defined as `static inline`, so every engine has its own
