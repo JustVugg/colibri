@@ -7,6 +7,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### New
 
+- **WEX container format headers** (`c/wex_format.h`, `c/wex_palette.h`, `c/wex_neural_rans.h`):
+  the WEX1-WEX3 record entry, its validators and the lossless record codecs, header only, with
+  `tests/test_wex_format.c` in `make test-c`. No engine uses them yet ([docs/wex.md](docs/wex.md)).
 - **Qwen3.8 on AMD Quark's MXFP4 experts** (`Q38_EXPERT_LOWBIT=mxfp4`): the routed experts
   from the `experts-mxfp4/` sidecar, one read of 2.6 MB per miss instead of 4.9 MB, computed by
   `quant.h`'s `matmul_mxfp4`; the trunk and the shared expert stay FP8. CPU only for now (the
