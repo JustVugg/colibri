@@ -83,7 +83,7 @@ FILES = [
 # tools/ for the ctypes library; build/segment/ and build/ownership/ go as
 # whole directories below.
 ARTIFACT_GLOBS = ["tests/test_*", "tests/bench_*", "tests/fuzz_*",
-                  "tests/*_probe*", "tests/xdna_fake_helper*", "COLI_V4_UNIT_*.o",
+                  "tests/*_probe*", "tests/xdna_fake_helper*", "tests/fake_wex_cuda*", "COLI_V4_UNIT_*.o",
                   "*.d", "tests/*.d", "tools/*.d",
                   # helper objects the tests link (#1741), one unit per command
                   "tests/*.o"]
