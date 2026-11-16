@@ -579,6 +579,8 @@ TEST_EXCLUDE += test_vk_chain test_vk_memtype test_glm53_vk_f32 test_vk_dev2_win
 TEST_EXCLUDE += test_cu_tier
 # takes a fixture and the CPU build's logits on its command line (ci.yml, the int4 gs64 A/B step)
 TEST_EXCLUDE += test_qwen36_tier_stream_engine
+# links the DeepSeek V4 objects: a gate only where the V4 engine builds (below)
+TEST_EXCLUDE += test_v4_wex4
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
@@ -600,6 +602,7 @@ TEST_BINS += tests/test_deepseek_v4$(EXE) tests/test_v4_ownership$(EXE) \
 	tests/test_v4_serve_framing$(EXE) \
 	tests/test_segment_adapters_registration$(EXE) \
 	tests/test_edge_adapters_registration$(EXE)
+TEST_BINS += tests/test_v4_wex4$(EXE)
 endif
 
 # Windows CUDA/HIP DLL path: host links the loader, NOT cudart or amdhip64.
@@ -3284,6 +3287,13 @@ dsv4-route-scratch-test: tests/test_v4_route_scratch_cuda.c Makefile.deepseek-v4
 	./dsv4_route_scratch_cuda_test$(EXE) 1
 endif
 
+# The V4 expert store reading RAW records from a WEX4 container (COLI_WEX_PATH; docs/wex.md),
+# on a synthetic checkpoint and container. The objects are test_deepseek_v4's: built after it,
+# so the two sub-makes never write the same COLI_V4_UNIT_*.o at once under -j.
+tests/test_v4_wex4$(EXE): tests/test_v4_wex4.c tests/wex4_fixture.h wex4.h wex_format.h deepseek_v4.c \
+		deepseek_v4_internal.h Makefile.deepseek-v4.units Makefile.deepseek-v4 | tests/test_deepseek_v4$(EXE)
+	$(CC) $(CFLAGS) -DCOLI_V4_TEST_HOOKS $< $(V4_TEST_LINK_OBJS) -o $@ -pthread $(LDFLAGS)
+
 V4_OWN_DIR = build/ownership
 V4_OWN_CFLAGS = $(CFLAGS) -DCOLI_V4_TEST_HOOKS
 V4_OWNERSHIP_OBJS = \
@@ -3957,7 +3967,7 @@ tests/test_wex4_verify$(EXE): tests/test_wex4_verify.c
 # The same covers a .d deleted by hand.
 AUTODEP_ELSEWHERE = test_segment_adapters_registration test_segment_adapters_real \
 	test_edge_adapters_registration test_edge_adapters_real test_deepseek_v4 \
-	test_v4_serve_framing
+	test_v4_serve_framing test_v4_wex4
 AUTODEP_OWN_FLAGS = bench_cuda_resident_batch bench_load_tq_peak_rss \
 	bench_indexer_allocations
 ENGINE_RULES := $(foreach n,$(RULE_NAMES),$(if $(findstring /,$(n)),,$(if $(wildcard $(n).c),$(n))))
