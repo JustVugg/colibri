@@ -1296,6 +1296,10 @@ static int gq_exact_mode(void) { static int v = -1; if (v < 0) { const char *e =
  * against every activation row (same bits: microbenchmark precheck maxdiff 0.0).
  * Decode (S==1) keeps the fused kernel: there the register-resident decode wins. */
 static int gq_dec1(void) { static int v = -1; if (v < 0) { const char *e = getenv("Q36_EXPERT_DEC1"); v = !(e && *e == '0'); } return v; }
+/* C22: the fused S==1 dots for IQ2_S/IQ3_S (the decode regime the IQ3 file's experts
+ * pay the generic unpack path at). Default on; Q36_EXPERT_FUSE=0 restores the generic
+ * path for the A/B and as the fallback. */
+static int gq_fuse(void) { static int v = -1; if (v < 0) { const char *e = getenv("Q36_EXPERT_FUSE"); v = !(e && *e == '0'); } return v; }
 
 /* Q8_0 needs no unpack: the block already is 32 int8 codes and one scale. */
 static inline float gq_dot_q8_0(const uint8_t *row, const int8_t *xq, const float *dx, int64_t n) {
@@ -1864,6 +1868,38 @@ GQ_SB_ARM void gq_arm_sb_iq3_xxs(const uint8_t *b, float d, int ib, float *s, in
     }
     *w0 = vcombine_s8(g[0], g[1]); *w1 = vcombine_s8(g[2], g[3]);
 }
+/* C22: the same treatment for the two types unsloth's UD-IQ3_XXS ships in its experts
+ * (IQ2_S gate/up, IQ3_S down), where the generic unpack+gq_dot_i8 path measured 13-14
+ * GFLOPS at S == 1 with 62-66% of it the buffer round-trip (these hold 29.5/24.2 flat).
+ * The scale and index arithmetic mirrors the NEON unpack cases verbatim; the sign bytes
+ * are raw, so GQ_SIGN8 itself plays the KSIGNS role. */
+GQ_SB_ARM void gq_arm_sb_iq2_s(const uint8_t *b, float d, int ib, float *s, int8x16_t *w0, int8x16_t *w1) {
+    const uint8_t *qs = b + 2, *sg = b + 34, *qh = b + 66, *sc = b + 74;
+    /* the sub-block's two 16-lane dots each take their nibble of sc[ib] (sw[2*ib], sw[2*ib+1]) */
+    s[0] = d * (0.5f + (float)((sc[ib] & 0x0F))) * 0.25f;
+    s[1] = d * (0.5f + (float)(sc[ib] >> 4)) * 0.25f;
+    int8x8_t g[4];
+    for (int l = 0; l < 4; l++) {   /* the unpack's IQ2_S case, register to register */
+        const int k = 4 * ib + l;
+        const int idx = qs[k] | (((qh[k >> 2] >> (2 * (k & 3))) & 3) << 8);
+        g[l] = vmul_s8(vreinterpret_s8_u8(vld1_u8(GGML_IQ2S_GRID + 8 * idx)), vld1_s8(GQ_SIGN8(sg[k])));
+    }
+    *w0 = vcombine_s8(g[0], g[1]); *w1 = vcombine_s8(g[2], g[3]);
+}
+GQ_SB_ARM void gq_arm_sb_iq3_s(const uint8_t *b, float d, int ib, float *s, int8x16_t *w0, int8x16_t *w1) {
+    const uint8_t *qs = b + 2, *qh = b + 66, *sg = b + 74, *sc = b + 106;
+    const int sb = (sc[ib >> 1] >> (4 * (ib & 1))) & 0x0F;   /* one scale per 32 */
+    s[0] = s[1] = d * (float)(1 + 2 * sb);
+    int8x8_t g[4];
+    for (int l = 0; l < 4; l++) {
+        const int k0 = 8 * ib + 2 * l, k1 = k0 + 1;
+        uint8_t gb[8];
+        memcpy(gb, GGML_IQ3S_GRID + 4 * (qs[k0] | (((qh[k0 >> 3] >> (k0 & 7)) & 1) << 8)), 4);
+        memcpy(gb + 4, GGML_IQ3S_GRID + 4 * (qs[k1] | (((qh[k1 >> 3] >> (k1 & 7)) & 1) << 8)), 4);
+        g[l] = vmul_s8(vreinterpret_s8_u8(vld1_u8(gb)), vld1_s8(GQ_SIGN8(sg[4 * ib + l])));
+    }
+    *w0 = vcombine_s8(g[0], g[1]); *w1 = vcombine_s8(g[2], g[3]);
+}
 GQ_SB_ARM void gq_arm_dot2(const int8x16_t w0, const int8x16_t w1, const int8x16_t x0, const int8x16_t x1,
                            int32x4_t *p0, int32x4_t *p1) {   /* gq_dot_i8's lines, its two builds */
 #if defined(__ARM_FEATURE_DOTPROD)
@@ -1894,6 +1930,8 @@ static void NAME(float *y, int ystride, const uint8_t *row, const int8_t *xq, co
 }
 GQ_DOT_GRID_ARM(gq_dot_arm_iq2_xxs, 66, gq_arm_sb_iq2_xxs)
 GQ_DOT_GRID_ARM(gq_dot_arm_iq3_xxs, 98, gq_arm_sb_iq3_xxs)
+GQ_DOT_GRID_ARM(gq_dot_arm_iq2_s, 82, gq_arm_sb_iq2_s)
+GQ_DOT_GRID_ARM(gq_dot_arm_iq3_s, 110, gq_arm_sb_iq3_s)
 #endif
 static inline void gq_row_all(float *y, int ystride, const gq_act *a, const uint8_t *row, int t, int I) {
 #ifdef GQ_VNNI512
@@ -1922,13 +1960,20 @@ static inline void gq_row_all(float *y, int ystride, const gq_act *a, const uint
     }
 #else
 #if defined(__ARM_NEON) && defined(__aarch64__) && !defined(__AVX2__)
-    /* the fused grid dots: a weight row's registers, no unpack buffer */
-    if ((t == GQ_IQ2_XXS || t == GQ_IQ3_XXS) && I % 256 == 0) {
+    /* the fused grid dots: a weight row's registers, no unpack buffer. The XXS types
+     * at any S (dec1 serves their S > 1), and C22: IQ2_S/IQ3_S at S == 1 only -- the
+     * decode regime, where the generic unpack path measured 13-14 GFLOPS against the
+     * fused kernels' 29.5/24.2 flat (bit-exact, phaseC22_bench_*); from S = 4 the
+     * generic path is already faster, so it keeps every other S. */
+    if (((t == GQ_IQ2_XXS || t == GQ_IQ3_XXS) ||
+         ((t == GQ_IQ2_S || t == GQ_IQ3_S) && a->S == 1 && gq_fuse())) && I % 256 == 0) {
         /* C18 decode-once (Q36_EXPERT_DEC1): one grid decode serves every activation
          * row. The float steps are the fused kernel's, in its order, so the bits are
          * the fused kernel's. Stack scratch is bounded: the gate needs I % 256 == 0
-         * and I <= 16384 (2 KB int8 + 256 scales for the serving shapes). */
-        if (a->S > 1 && gq_dec1() && I <= 16384) {
+         * and I <= 16384 (2 KB int8 + 256 scales for the serving shapes). XXS only:
+         * their one scale per sub-block stores as a single ds[x]; IQ2_S's two scales
+         * per sub-block do not, and its S > 1 rows have no headroom (C22 phase 1). */
+        if (a->S > 1 && (t == GQ_IQ2_XXS || t == GQ_IQ3_XXS) && gq_dec1() && I <= 16384) {
             const int BYTES = GQ_TYPES[t].bytes;
             int8_t dw[I]; float ds[I / 32];
             int64_t xb = 0;
@@ -1957,8 +2002,10 @@ static inline void gq_row_all(float *y, int ystride, const gq_act *a, const uint
             }
             return;
         }
-        if (t == GQ_IQ2_XXS) gq_dot_arm_iq2_xxs(y, ystride, row, a->q, a->d, I, a->S);
-        else                 gq_dot_arm_iq3_xxs(y, ystride, row, a->q, a->d, I, a->S);
+        if (t == GQ_IQ2_XXS)      gq_dot_arm_iq2_xxs(y, ystride, row, a->q, a->d, I, a->S);
+        else if (t == GQ_IQ3_XXS) gq_dot_arm_iq3_xxs(y, ystride, row, a->q, a->d, I, a->S);
+        else if (t == GQ_IQ2_S)   gq_dot_arm_iq2_s(y, ystride, row, a->q, a->d, I, a->S);
+        else                      gq_dot_arm_iq3_s(y, ystride, row, a->q, a->d, I, a->S);
         return;
     }
 #endif
