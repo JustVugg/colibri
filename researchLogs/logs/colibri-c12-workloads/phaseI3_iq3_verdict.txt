@@ -1,0 +1,63 @@
+C21 verdict — UD-IQ3_XXS vs IQ2_XXS (2026-11-16)
+==================================================
+
+Design: interleaved A/B, 4 alternating fresh restarts (iq2_r1 -> iq3_r1 ->
+iq2_r2 -> iq3_r2), COLI_PROMPT_CACHE=0, sgemm default-on, single slot, ctx
+66000, OMP 6, port 8001. Per round: 1K/4K/12K calibrated matrix colds
+(greedy, 128 tokens) + 3-question quality probe (greedy, 256 tokens).
+Driver re-used from C16 (c16_q4k_ab.py); launcher i3_iq3_ab_launch.sh.
+
+File facts (measured from GGUF data offsets, active_bytes_calc.py):
+  IQ2 arm: 11.01 GiB, gate/up IQ2_XXS (2.0625 bpw) x39 + down IQ3_XXS
+           (3.0625 bpw) x37 -> fused decode-once covered.
+  IQ3 arm: 13.10 GiB, gate/up IQ2_S (2.5625 bpw) x39 + down IQ3_S
+           (3.4375 bpw) x37 -> NO XXS experts, generic int-dot path.
+  Expert pool/layer 240.6 -> 284.3 MB (+18.2%); active bytes/token
+  49 -> 60 MB (+21%); shared/token 41 -> 50.9 MB.
+
+Cold prefill (TTFT, mean of 2 rounds / r1-only ratio; phases in MoE):
+  1K:  IQ2 24.69 s, IQ3 27.21 s -> 1.10x (r1: 1.12x)   moe 1.11x (r1 1.14x)
+  4K:  IQ2 97.20 s, IQ3 109.89 s -> 1.13x (r1: 1.21x)  moe 1.12x (r1 1.20x)
+  12K: IQ2 341.19 s, IQ3 362.41 s -> 1.06x (r1: 1.15x) moe 1.07x (r1 1.16x)
+  Drift note: iq2_r2 was uniformly slower than iq2_r1 (12K TTFT 370.1 vs
+  312.3 s) while iq3 stayed flat (359.9 -> 364.9 s), so the round-mean
+  ratios are a lower bound and the r1 ratios the cleaner estimate.
+  Best estimate: whole TTFT ~1.1-1.2x, MoE phase ~1.16x (matches the
+  +18% expert-pool-bytes file arithmetic).
+
+Decode (mean of 2 rounds; 12K most trustworthy per the scatter rule):
+  1K:  IQ2 10.33 tok/s, IQ3 5.64 -> 0.55x
+  4K:  IQ2 8.70,  IQ3 6.51 -> 0.75x
+  12K: IQ2 7.11,  IQ3 5.28 -> 0.74x
+  Probe decode (256 tok): IQ2 ~9.97 tok/s, IQ3 ~6.56 -> 0.66x
+  Uniformly slower in all 8 decode observations; 12K anchor 0.74x —
+  the Q4_K-class generic-path signature as predicted (C16 Q4: 0.72x).
+
+Memory: RSS after load IQ2 1.83/1.67 GB, IQ3 1.76/1.42 GB (both arms far
+below C16's 2.53-2.64 GB line — different session memory context; no
+cross-arm regression either way). Disk 13.10 vs 11.01 GiB (+19%).
+
+Reproducibility: shas identical across rounds within each arm (IQ2: 1K
+fb965acd73e5, 4K a936fa5bdde2, 12K fb84825253e6 — same as C16; IQ3: 1K/4K
+ce37c8ce16a4, 12K e591e8c34acb). IQ3's 1K/4K cold shas equal C16's
+Q4_K_M 1K/4K shas exactly (cold cells record no text, so byte-level
+comparison is sha-only), while IQ2's differ — two non-IQ2 quants agree
+with each other and diverge from IQ2 on these cells.
+
+Quality probe (anecdote, not a benchmark — eval set deferred):
+  q1 train: both correct (6:35 PM); IQ3's reasoning slightly more detailed.
+  q2 Fibonacci: IQ2_XXS INVALID PYTHON again ("[a, b] := [b, a + b] if
+    n > 0 else None" — same walrus misuse as C16, reproducible failure);
+    IQ3 correct iterative loop + O(n) ("def fib(n): a, b = 0, 1 /
+    for _ in range(n): a, b = b, a + b / return a").
+  q3 imatrix: both correct; IQ3 marginally more precise ("larger
+    magnitudes or higher sensitivity").
+
+Verdict: UD-IQ3_XXS buys real probe quality (notably the q2 code
+correctness IQ2_XXS fails reproducibly) for ~+10-20% TTFT and a uniform
+~0.55-0.75x decode (0.74x at the trustworthy 12K anchor). Decode is the
+interactive bottleneck for this serving profile, so the default-container
+decision is the user's: IQ2_XXS = fastest; IQ3 = ~25% slower decode with
+measurably better probe outputs. No engine change is implied by either
+choice; a fused decode-once kernel for IQ2_S/IQ3_S would be the lever
+that could remove the decode penalty (C18-class work, not scheduled).
