@@ -3993,6 +3993,19 @@ tests/test_wex4_verify$(EXE): tests/test_wex4_verify.c
 tests/test_wex_decode$(EXE): tests/test_wex_decode.c
 	$(CC) $(CFLAGS) $< -o $@ -pthread $(LDFLAGS)
 
+# The fast CPU decoder of WNR3 records (wex_fast_decode.h) against the reference of wex_decode.c: the same
+# status and bytes on synthetic records and mini-records (a container path on the command line adds real
+# records). Three builds: the default flags; on x86-64 the baseline (-march=x86-64), where the AVX2 kernel is
+# compiled with a target attribute and chosen at run time by CPUID; and -DWEX_FAST_SCALAR (kernel 0 only).
+WEX_FAST_DEPS = tests/test_wex_fast_decode.c wex_fast_decode.h wex_decode.c wex_decode.h wex_format.h \
+	wex_neural_rans.h tests/wnr3_fixture.h
+tests/test_wex_fast_decode$(EXE): $(WEX_FAST_DEPS)
+	$(CC) $(CFLAGS) $< -o $@ -pthread $(LDFLAGS)
+tests/test_wex_fast_decode_x86_64$(EXE): $(WEX_FAST_DEPS)
+	$(CC) $(if $(X86_64),$(filter-out -march=% -mavx% -mfma%,$(CFLAGS)) -march=x86-64,$(CFLAGS)) $< -o $@ -pthread $(LDFLAGS)
+tests/test_wex_fast_decode_scalar$(EXE): $(WEX_FAST_DEPS)
+	$(CC) $(CFLAGS) -DWEX_FAST_SCALAR $< -o $@ -pthread $(LDFLAGS)
+
 # The CUDA helper's loader in wex_decode.c (COLI_WEX_CUDA_LIB), no GPU: a CPU stand-in with
 # the helper's exports, a .dll on Windows and a position-independent .so elsewhere.
 tests/fake_wex_cuda$(XDNA_DLEXT): tests/fake_wex_cuda.c
