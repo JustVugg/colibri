@@ -238,8 +238,52 @@ records decode at once; each holds a page of the decoded size from the reader po
 decoder's own scratch of the same size while it runs. The run prints a last line
 `[v41_wex] container: N records read (M WNR3 decoded), K refused`.
 
+## The CUDA helper (WNR3 records on an NVIDIA GPU)
+
+A WNR3 record is decoded on the CPU at tens of MB/s a thread (Wex-WRN2's
+[BENCHMARKS](https://github.com/KairaCode/Wex-WRN2/blob/main/docs/BENCHMARKS.md)); the CUDA
+helper decodes it on the GPU, into a host slab or straight into device buffers. It is an
+optional shared library, never linked into an engine:
+
+```sh
+make -C c wex-cuda-helper      # kaira_wex_cuda.dll (Windows, from a vcvars64 shell) / kaira_wex_cuda.so
+make -C c wex-cuda-test        # the helper and tests/test_wex_nr3_gpu, run on synthetic records
+```
+
+| File | What it is |
+|---|---|
+| `c/tools/wex_cuda_bridge.cu` | the helper: the exported functions below, the workspace pools, the model registry, the batch lanes |
+| `c/wex_cuda.cuh` | its kernels (WNR1, WNR2 and WNR3 records; the commit kernel) |
+| `c/tests/test_wex_nr3_gpu.cu` | every entry point against the CPU decoder of `wex_neural_rans.h`, on synthetic, crafted and (given a records file) real and mutated records |
+
+The ABI (`wex_cuda_helper_abi()` returns 1) is `wex_cuda_decode_to_host`; everything else is
+announced by a bit of `wex_cuda_helper_features()` and resolved by name, so a caller works with
+an older helper that lacks a bit:
+
+| Bit | Function | What it does |
+|---|---|---|
+| 1 | `wex_cuda_decode_to_device` | one record into six caller-owned device buffers (three matrices' scales and weights) |
+| 2 | `wex_cuda_host_register` / `_unregister` | page-lock a caller's staging buffer |
+| 4 | `wex_cuda_register_model` | WNR2 records (codec 4) after their WNM2 model is registered |
+| 8 | `wex_cuda_decode_batch_to_device` | n records into device buffers, pipelined over 8 lanes, one host wait |
+| 16 | (no new function) | WNR3 records (codec 5) in every decode entry point, with their per-stream hash, ceil-form and canonical-zero checks |
+| 32 | `wex_cuda_decode_batch_to_host` | n records into caller host buffers (each record's canonical slab) |
+
+Every entry point returns 0 (decoded and written), -1 (an invalid record or one that fails an
+integrity check: the destination is untouched) or 1 (CUDA or memory unavailable, or the model
+not registered: the caller decodes on the CPU). The device entry points write through a commit
+kernel that runs only when the decode's error word is 0; the host batch copies a record back
+only after the host has seen its error word. Each call takes a workspace from a pool and gives it
+back, so the helper holds one per call in flight at once, never one per thread that ever called
+it (VRAM outside any backend's accounting, kept until the process exits: on DeepSeek V4.1
+records, about 36 MiB per single-record call and 290 MiB per batch call in flight); engines whose
+reader threads are retired and respawned stay within that. The bytes and the order of the checks:
+[WNR3-SPEC](https://github.com/KairaCode/Wex-WRN2/blob/main/docs/WNR3-SPEC.md), sections 4.7
+and 4.8.
+
 ## Status in colibri
 
 DeepSeek V4, DeepSeek V4.1 and Qwen3.8 read RAW and WNR3 records from a WEX4 container, WNR3
-decoded on the CPU (`wex_decode.c`). Their GPU decode and the I/O switches (several drives,
-split reads) are the next series.
+decoded on the CPU (`wex_decode.c`). The CUDA helper builds and decodes WNR3 records on its own;
+no engine opens it yet. Its loader and the I/O switches (several drives, split reads) are the
+next PRs.

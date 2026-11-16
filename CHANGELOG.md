@@ -7,6 +7,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### New
 
+- **The CUDA helper for WEX records** (`c/tools/wex_cuda_bridge.cu`, `c/wex_cuda.cuh`):
+  `make wex-cuda-helper` builds `kaira_wex_cuda.dll` / `.so`, which decodes WNR1-WNR3 records
+  on an NVIDIA GPU, to host slabs or into device buffers, one record or a batch; ABI 1 and six
+  feature bits. A record it refuses leaves every destination untouched, the host batch included.
+  Its GPU workspaces come from a pool, one per call in flight, so threads that exit leave none
+  behind. No engine opens it yet. `make wex-cuda-test` checks it against the CPU decoder (needs a GPU;
+  not in `make test-c`) ([docs/wex.md](docs/wex.md)).
 - **The WNR3 encoder** (`c/tools/wex_nr3_tools.c`, `c/tools/build_nr3.py`, `make wex-nr3-tools`):
   trains a WNM2 model on chosen experts of a WEX1 container, encodes every record as WNR3
   (canonical zero with `--cz`), checks each one by decoding it again, and writes the WNR3

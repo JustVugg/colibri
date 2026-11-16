@@ -40,6 +40,9 @@ FILES = [
     "coli_hip.dll", "coli_hip.lib", "coli_hip.exp", "coli_hip.pdb",
     "tests/compat_prefetch_module.dll",
     "libcoli_xdna.so",                      # `make xdna-helper` (Linux)
+    # `make wex-cuda-helper` / `make wex-cuda-test`
+    "kaira_wex_cuda.dll", "kaira_wex_cuda.lib", "kaira_wex_cuda.exp", "kaira_wex_cuda.so",
+    "tests/test_wex_nr3_gpu", "tests/test_wex_nr3_gpu.exe",
     "deepseek_v4", "deepseek_v4.exe", "deepseek_v4.cflags", "deepseek_v4.cudaflags",
     "deepseek_v4.ldflags",
     "deepseek_v41", "deepseek_v41.exe",
