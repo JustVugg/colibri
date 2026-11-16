@@ -268,6 +268,40 @@ needs the experts' widths to be multiples of 32 (true of the release: hidden 256
 moe_intermediate 640), so the tiny fixture (`qwen38_tiny_mxfp4`, moe_intermediate 8) has no
 container form; `tests/test_qwen38_wex4.c` uses a synthetic grid instead.
 
+## GLM-5.3-Flash (`glm53`)
+
+glm53 reads AMD's MXFP4 checkpoint, `amd/GLM-5.3-Flash-Quark-MXFP4`, as it is published: each
+routed expert's three matrices are `name.weight` (U8 e2m1 codes, two per byte, low nibble first)
+and `name.weight_scale` (U8 ue8m0 exponents, one per 32 columns), streamed like the int4
+container's and computed by `matmul_mxfp4` (fmt 7); the shared experts, also MXFP4 there, are
+decoded at load and held at `GLM53_BITS` like the other dense matrices
+([glm53-flash.md](glm53-flash.md)). A WEX4 container of that checkpoint, written by Wex-WRN2's
+`wex4/wex4_convert.py pack --experts raw|nr3 --names qwen38`, then serves the routed experts:
+
+```sh
+COLI_WEX_PATH=glm53-wnr3.wex4 COLI_WEX_ROOT=<root> ./glm53 --model <checkpoint> --prompt "..."
+```
+
+| Variable | Default | Effect |
+|---|---|---|
+| `COLI_WEX_PATH` | unset | the container, read for the routed experts (an MXFP4 checkpoint's only; with the int4 container or a GGUF the engine stops); unset, nothing changes |
+| `COLI_WEX_ROOT` | unset | 64 hex digits: a container with another root stops the engine; turns `COLI_WEX_VERIFY` on |
+| `COLI_WEX_VERIFY` | on with `COLI_WEX_ROOT`, else off | `1`: each record's SHA-256 against the index at its first read |
+| `COLI_WEX_CUDA_LIB` | unset | the CUDA helper for the WNR3 records ([below](#the-cuda-helper-wnr3-records-on-an-nvidia-gpu)) |
+
+`g53_wex4_attach` (`glm53.c`) checks the header page, the index, the grid, the root, and that
+every expert of the loaded sparse layers is a record of the slab layout (gate, down, up scales,
+then their codes: 13,369,344 bytes on the release). `expert_read`, the one place every path takes
+an expert from (the CPU's MoE, the Vulkan and CUDA expert tiers and their warm start, an expert
+worker), then reads the record whole into the slot (`g53_wex_read`), hashes it at its first read
+when asked, decodes a WNR3 record in place through `coli_wex_decode_record` (the helper first when
+`COLI_WEX_CUDA_LIB` names it, the CPU otherwise) and points the six pieces into it. A record that
+fails its hash, names another expert or does not decode stops the engine: glm53 has no second
+copy of the experts to fall back to. The run's last line counts the records:
+`[glm53] WEX4 records: N read, M WNR3 decoded (CUDA helper H, CPU C)`. `COLI_MODEL_MIRROR`
+copies are for the shards; the container is read from its one path. `tests/test_glm53_wex4.c`
+covers the shards' MXFP4 experts, RAW and WNR3 containers and the refusals.
+
 ## DeepSeek V4.1 (`deepseek_v41`)
 
 ```sh
@@ -408,7 +442,7 @@ other calls are `coli_wex_cuda_decode_to_device`, `_decode_batch_to_device`,
 
 ## Status in colibri
 
-DeepSeek V4, DeepSeek V4.1 and Qwen3.8 read RAW and WNR3 records from a WEX4 container; WNR3
+DeepSeek V4, DeepSeek V4.1, Qwen3.8 and GLM-5.3-Flash read RAW and WNR3 records from a WEX4 container; WNR3
 records decode on the GPU when `COLI_WEX_CUDA_LIB` names the CUDA helper, on the CPU
 otherwise (the fast decoder where the CPU has its kernel). qwen38 and deepseek_v41 also read copies of the container on other drives. A
 container mirror for `deepseek_v4` and the engines' use of the helper's device and batch

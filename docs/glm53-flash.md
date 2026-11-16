@@ -50,6 +50,10 @@ CUDA expert tiers take them as MXFP4 (`VKT_SRC_MXFP4_E8M0`). The shared experts,
 decoded at load and held at `GLM53_BITS`; the attention, the dense layers 0-2, the routers and the
 head are BF16 there, as in the original release. The MTP layer (45) is not loaded, as before.
 
+A WEX4 container of the same checkpoint (Wex-WRN2's `pack --experts raw|nr3 --names qwen38`) can
+serve the routed experts instead of the shards: `COLI_WEX_PATH=<file>`, with `COLI_WEX_ROOT` to pin
+it and `COLI_WEX_CUDA_LIB` for the CUDA helper ([wex.md](wex.md#glm-53-flash-glm53)).
+
 ## Architecture notes
 
 Four pieces differ from everything else in this repository:

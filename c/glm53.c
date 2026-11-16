@@ -779,6 +779,7 @@ typedef struct {
                                            * coli_ggml_held_type says so (G53_ILV16=0: the file's) */
     int mx;                               /* MXFP4 experts (an AMD Quark checkpoint): each matrix `name.weight` U8
                                            * e2m1 codes and `name.weight_scale` U8 ue8m0 exponents, fmt 7 (G53_MX) */
+    struct G53Wex *wex;                   /* COLI_WEX_PATH: the routed experts from a WEX4 container (g53_wex4_attach) */
     uint64_t clock, ebytes;
     long hits, miss;
     /* Telemetria per la dashboard (#1376 follow-up: Brain e Profile erano
@@ -2125,6 +2126,266 @@ static int g53_expert_form(GModel *m, const st_tensor *probe, const char *name) 
     return probe->dtype == 3 || m->gx;
 }
 
+/* ---- the MXFP4 routed experts from a WEX4 container (COLI_WEX_PATH; docs/wex.md) -------------
+ * A WEX4 file made from this checkpoint (Wex-WRN2's wex4_convert.py pack --experts raw|nr3 --names
+ * qwen38) holds every MXFP4 routed expert as one record: its six tensors in the slab order, the
+ * gate, down and up scales, then their e2m1 codes, the checkpoint's bytes. The container then
+ * serves the experts' bytes instead of the shards; everything else still comes from the shards.
+ * A record is RAW (those bytes, padded to 4096) or WNR3 (codec 5, coded with the container's WNM2
+ * model): g53_wex_read reads it whole into the slot, decodes a WNR3 one in place on the thread that
+ * reads it (coli_wex_decode_record: the CUDA helper when COLI_WEX_CUDA_LIB names it, else the CPU),
+ * and points the six pieces into it, so every path that takes an expert (the CPU's MoE, the
+ * Vulkan and CUDA tiers, the warm start, an expert worker) gets the same bytes.
+ *
+ * Checked at attach: the header page and the index (wex4.h), the model's grid, COLI_WEX_ROOT (64
+ * hex digits) when set, every expert of the loaded sparse layers present as a record of the layout
+ * above, dtypes U8/E8M0 and U8/I8; WNR3 records: one WNM2 blob matching its SHA-256 in the index,
+ * and all or none value-exact. COLI_WEX_VERIFY (on with COLI_WEX_ROOT, else off) hashes each record
+ * at its first read. Anything that does not hold stops the engine with the reason, and so does a
+ * record that fails its hash, names another expert or does not decode. The container is read from
+ * its one path: COLI_MODEL_MIRROR copies are for the shards only. */
+#include "wex4.h"
+#define COLI_WEX_DECODE_API static inline
+#include "wex_decode.c"   /* WNR3 records decoded on the CPU, or by the CUDA helper (COLI_WEX_CUDA_LIB) */
+
+typedef struct G53Wex {
+    char *path;
+    shards S;                             /* the container, its one file */
+    int fd;
+    int64_t *off;                         /* [cell] the record's offset, -1 none */
+    int64_t at[GLM53_EXPERT_PIECES];      /* each piece's offset inside a decoded record */
+    unsigned char *sha;                   /* COLI_WEX_VERIFY: [cell * 32] the index's SHA-256, else NULL */
+    unsigned char *seen;                  /* [cell] 1 once its hash passed */
+    WexEntry *nr3;                        /* a container with WNR3 records: [cell] its entry, else NULL */
+    uint32_t nr3_flags;                   /* WEX_HEADER_CANONICAL_ZERO when they are value-exact */
+    uint64_t reads, decoded;              /* records read; WNR3 records decoded */
+} G53Wex;
+
+static void g53_wex_refuse(const char *path, const char *why) {
+    fprintf(stderr, "[glm53] COLI_WEX_PATH %s: %s -- refusing (unset COLI_WEX_PATH to run without it)\n", path, why);
+    exit(1);
+}
+
+/* COLI_WEX_ROOT: 0 unset, 1 a root (in pin), -1 not 64 hex digits */
+static int g53_wex_pin(unsigned char pin[32]) {
+    const char *text = getenv("COLI_WEX_ROOT");
+    if (!text || !*text) return 0;
+    if (strlen(text) != 64) return -1;
+    for (int i = 0; i < 64; i++) {
+        const int ch = text[i], v = ch >= '0' && ch <= '9' ? ch - '0' : ch >= 'a' && ch <= 'f' ? ch - 'a' + 10
+                                  : ch >= 'A' && ch <= 'F' ? ch - 'A' + 10 : -1;
+        if (v < 0) return -1;
+        if (i & 1) pin[i / 2] |= (unsigned char)v; else pin[i / 2] = (unsigned char)(v << 4);
+    }
+    return 1;
+}
+
+static void g53_wex4_attach(GModel *m, const char *path) {
+    const Cfg *c = &m->c;
+    char why[400], root[65];
+    if (!m->mx)
+        g53_wex_refuse(path, m->gx ? "this checkpoint's routed experts are a GGUF's; a container holds MXFP4 experts"
+                                   : "this checkpoint's routed experts are int4 gs64; a container holds MXFP4 experts");
+    G53Wex *w = calloc(1, sizeof *w);
+    unsigned char *page = malloc(WEX4_PAGE), pin[32];
+    if (!w || !page) { fprintf(stderr, "OOM WEX4 expert index\n"); exit(1); }
+    w->fd = st_open_fd(&w->S, path);   /* stops with the path if it cannot be opened */
+    const int64_t size = w->S.sizes[0];
+    if (size < (int64_t)WEX4_PAGE) g53_wex_refuse(path, "no header page (shorter than 4096 bytes)");
+    st_pread_full(w->fd, page, WEX4_PAGE, 0, "pread WEX4 header page");
+    Wex4Header h; Wex4View view;
+    int rc = wex4_parse_header(page, (uint64_t)size, &h);
+    if (rc) {
+        const uint32_t magic = wex_read_u32_le(page);
+        if (magic == WEX_MAGIC_V1 || magic == WEX_MAGIC_V2 || magic == WEX_MAGIC_V3)
+            g53_wex_refuse(path, "a WEX1-WEX3 container, not WEX4");
+        snprintf(why, sizeof why, "not a valid WEX4 container (header page: wex4.h error %d)", rc);
+        g53_wex_refuse(path, why);
+    }
+    for (int i = 0; i < 32; i++) snprintf(root + 2 * i, 3, "%02x", h.root[i]);
+    if (h.layers != (uint32_t)c->n_layers || h.experts != (uint32_t)c->n_experts) {
+        snprintf(why, sizeof why, "written for a grid of %u x %u experts, the model has %d x %d", h.layers, h.experts,
+                 c->n_layers, c->n_experts);
+        g53_wex_refuse(path, why);
+    }
+    const int pinned = g53_wex_pin(pin);
+    if (pinned < 0) g53_wex_refuse(path, "COLI_WEX_ROOT is not 64 hex digits");
+    if (pinned && memcmp(pin, h.root, 32)) {
+        snprintf(why, sizeof why, "its root %s is not the pinned COLI_WEX_ROOT", root);
+        g53_wex_refuse(path, why);
+    }
+    const size_t index_len = (size_t)wex4_align(h.index_bytes);
+    unsigned char *index = malloc(index_len ? index_len : 1);
+    if (!index) { fprintf(stderr, "OOM WEX4 index\n"); exit(1); }
+    if (index_len) st_pread_full(w->fd, index, (int64_t)index_len, (int64_t)h.index_offset, "pread WEX4 index");
+    if ((rc = wex4_open(&h, index, index_len, &view))) {
+        snprintf(why, sizeof why, "not a valid WEX4 container (index: wex4.h error %d)", rc);
+        g53_wex_refuse(path, why);
+    }
+    const size_t cells = (size_t)c->n_layers * (size_t)c->n_experts;
+    const int64_t H = c->hidden, I = c->moe_inter;
+    /* the record's six tensors (slab order: gate, down, up scales, then gate, down, up codes) */
+    const int64_t rows[6] = {I, H, I, I, H, I}, width[6] = {H / 32, I / 32, H / 32, H / 2, I / 2, H / 2};
+    int64_t at[6], cursor = 0;
+    for (int k = 0; k < 6; k++) { at[k] = cursor; cursor += rows[k] * width[k]; }
+    /* the slot's pieces: gate codes, gate scales, up codes, up scales, down codes, down scales */
+    w->at[0] = at[3]; w->at[1] = at[0]; w->at[2] = at[5]; w->at[3] = at[2]; w->at[4] = at[4]; w->at[5] = at[1];
+    if (cursor != m->e_slot) g53_wex_refuse(path, "the model's expert geometry is not an MXFP4 slab");
+    w->off = malloc(cells * sizeof(int64_t));
+    unsigned char *sha = malloc(cells * 32);
+    if (!w->off || !sha) { fprintf(stderr, "OOM WEX4 expert index\n"); exit(1); }
+    for (size_t k = 0; k < cells; k++) w->off[k] = -1;
+    int nr3 = 0, exact = 0;
+    uint32_t model_blob = 0;   /* the WNR3 records' WNM2 blob, 1-based */
+    for (uint32_t r = 0; r < h.records; r++) {
+        Wex4Record rec;
+        wex4_get_record(&view, r, &rec);
+        if (!(rec.flags & WEX4_REC_EXPERT)) continue;   /* the other tensors: the shards serve them */
+        const int layer = (int)(rec.owner >> 16), expert = (int)(rec.owner & 0xffffu);   /* bounded by wex4_open */
+        const size_t cell = (size_t)layer * c->n_experts + expert;
+        if (rec.codec == WEX4_CODEC_WNR3) {   /* wex4_open admits RAW and WNR3 expert records, a WNR3 one with a WNM2 blob */
+            if (model_blob && rec.blob != model_blob) g53_wex_refuse(path, "it has WNR3 records of two models (one is read)");
+            model_blob = rec.blob;
+            if (!w->nr3 && !(w->nr3 = calloc(cells, sizeof(WexEntry)))) { fprintf(stderr, "OOM WEX4 expert index\n"); exit(1); }
+            if (wex4_expert_entry(&view, r, &w->nr3[cell])) g53_wex_refuse(path, "it has an invalid WNR3 expert record");
+            nr3++;
+            exact += !!(rec.flags & WEX4_REC_VALUE_EXACT);
+        }
+        int ok = rec.decoded == (uint64_t)m->e_slot && rec.tensor_count == 6;
+        for (int part = 0; part < 6 && ok; part++) {
+            Wex4Tensor t;
+            wex4_get_tensor(&view, rec.first_tensor + (uint32_t)part, &t);
+            const int scale = part < 3;
+            ok = t.rank == 2 && t.record_count == 1 && t.shape[0] == (uint64_t)rows[part] &&
+                 t.shape[1] == (uint64_t)width[part] && t.offset == (uint64_t)at[part] &&
+                 t.nbytes == (uint64_t)(rows[part] * width[part]) &&
+                 (scale ? t.dtype == WEX4_DT_U8 || t.dtype == WEX4_DT_F8_E8M0 : t.dtype == WEX4_DT_U8 || t.dtype == WEX4_DT_I8);
+        }
+        if (!ok) {
+            snprintf(why, sizeof why, "the record of layer %d expert %d is not an MXFP4 expert of this model "
+                                      "(%lld bytes: gate, down, up scales, then their e2m1 codes)", layer, expert,
+                     (long long)m->e_slot);
+            g53_wex_refuse(path, why);
+        }
+        w->off[cell] = (int64_t)rec.offset;
+        memcpy(sha + cell * 32, rec.sha, 32);
+    }
+    const int from = c->first_dense > m->layer_begin ? c->first_dense : m->layer_begin;
+    for (int layer = from; layer < m->layer_end; layer++)
+        for (int expert = 0; expert < c->n_experts; expert++)
+            if (w->off[(size_t)layer * c->n_experts + expert] < 0) {
+                snprintf(why, sizeof why, "layer %d expert %d is not in it", layer, expert);
+                g53_wex_refuse(path, why);
+            }
+    char model[48] = "";
+    if (model_blob) {   /* the WNM2 model, checked against its SHA-256 in the index, registered for the decode */
+        if (exact && exact != nr3) g53_wex_refuse(path, "it has WNR3 records both value-exact and not (all or none are read)");
+        Wex4Blob blob;
+        wex4_get_blob(&view, model_blob - 1u, &blob);
+        const size_t stored = (size_t)wex4_align(blob.bytes);
+        unsigned char *bytes = malloc(stored);
+        if (!bytes) { fprintf(stderr, "OOM WEX4 model blob\n"); exit(1); }
+        st_pread_full(w->fd, bytes, (int64_t)stored, (int64_t)blob.offset, "pread WEX4 model blob");
+        if (coli_wex4_register_model(bytes, (size_t)blob.bytes, stored, blob.sha, blob.id))
+            g53_wex_refuse(path, "its WNM2 model blob does not match its SHA-256 in the index");
+        free(bytes);
+        w->nr3_flags = exact ? WEX_HEADER_CANONICAL_ZERO : 0u;
+        snprintf(model, sizeof model, " (%d WNR3, model %08x%s)", nr3, blob.id, exact ? ", value-exact" : "");
+    }
+    const char *verify = getenv("COLI_WEX_VERIFY");
+    if (verify && *verify ? atoi(verify) != 0 : pinned > 0) {
+        w->sha = sha;
+        if (!(w->seen = calloc(cells, 1))) { fprintf(stderr, "OOM WEX4 expert index\n"); exit(1); }
+    } else free(sha);
+    if (!(w->path = strdup(path))) { fprintf(stderr, "OOM WEX4 expert index\n"); exit(1); }
+    fprintf(stderr, "[glm53] MXFP4 experts from the WEX4 container %s: records of %lld bytes%s, root %s%s; "
+                    "first-read SHA-256 %s\n", path, (long long)m->e_slot, model, root, pinned ? " (pinned)" : "",
+            w->sha ? "on" : "off");
+    free(index); free(page);
+    m->wex = w;
+}
+
+static void g53_wex_maybe_attach(GModel *m) {
+    const char *path = getenv("COLI_WEX_PATH");
+    if (path && *path) g53_wex4_attach(m, path);
+}
+
+/* COLI_WEX_VERIFY: a record's n bytes as read (a RAW record's decoded bytes, a WNR3 record's stored
+ * ones) and its zero padding to the page, against the index's SHA-256, at its first read. */
+static void g53_wex_check(GModel *m, size_t cell, int layer, int eid, const uint8_t *bytes, int64_t n) {
+    G53Wex *w = m->wex;
+    if (!w->sha || __atomic_load_n(&w->seen[cell], __ATOMIC_ACQUIRE)) return;
+    static const unsigned char zero[WEX4_PAGE];
+    unsigned char digest[32];
+    Wex4Sha sha;
+    wex4_sha_init(&sha);
+    wex4_sha_update(&sha, bytes, (size_t)n);
+    wex4_sha_update(&sha, zero, (size_t)(wex4_align((uint64_t)n) - (uint64_t)n));
+    wex4_sha_final(&sha, digest);
+    if (memcmp(digest, w->sha + cell * 32, 32)) {
+        fprintf(stderr, "[glm53] COLI_WEX_PATH %s: layer %d expert %d does not match its SHA-256 in the index -- "
+                        "the container is damaged; refusing\n", w->path, layer, eid);
+        exit(1);
+    }
+    __atomic_store_n(&w->seen[cell], (unsigned char)1, __ATOMIC_RELEASE);
+}
+
+/* One expert's record into the slot's own aligned memory: read whole (a WNR3 record at the end of its
+ * decoded page, then decoded in place), checked, its six pieces pointed into it. */
+static void g53_wex_read(GModel *m, int layer, int eid, Slot *slot) {
+    G53Wex *w = m->wex;
+    const size_t cell = (size_t)layer * m->c.n_experts + eid, page = (size_t)wex4_align((uint64_t)m->e_slot);
+    const WexEntry *nr3 = w->nr3 && w->nr3[cell].flags == WEX_ENTRY_NEURAL_RANS3 ? &w->nr3[cell] : NULL;
+    if (slot->own && slot->own_len < page) g53_slot_free(slot);
+    if (!slot->own) {
+        void *p = NULL;
+        if (posix_memalign(&p, ST_DIRECT_ALIGN, page) != 0 || !p) {
+            fprintf(stderr, "OOM allocating expert slot (%.1f MB): the expert cache does not fit in memory; reduce it "
+                            "with --ram N or GLM53_EXPERT_GB=N (#1375)\n", page / 1e6);
+            exit(1);
+        }
+        slot->own = p; slot->own_len = page; slot->own_al = 1;
+    }
+    const int64_t n = nr3 ? (int64_t)nr3->total_bytes : m->e_slot;
+    uint8_t *dst = slot->own + (nr3 ? wex_record_read_offset(nr3) : 0);
+    st_read_range_rep(&w->S, w->fd, 0, w->off[cell], n, dst, n, 0, g53_direct(), "WEX4 expert record");
+    g53_wex_check(m, cell, layer, eid, dst, n);
+    if (nr3) {
+        const char *why = NULL;
+        if (!wex_nr3_owner_ok(nr3, dst, (uint32_t)layer, (uint32_t)eid, w->nr3_flags))
+            why = "names another expert, or another canonical-zero form";
+        else if (coli_wex_decode_record(nr3, slot->own, page)) why = "does not decode (a WNR3 stream check failed)";
+        if (why) {
+            fprintf(stderr, "[glm53] COLI_WEX_PATH %s: the record of layer %d expert %d %s -- the container is damaged; "
+                            "refusing\n", w->path, layer, eid, why);
+            exit(1);
+        }
+        __atomic_fetch_add(&w->decoded, 1, __ATOMIC_RELAXED);
+    }
+    __atomic_fetch_add(&w->reads, 1, __ATOMIC_RELAXED);
+    for (int p = 0; p < GLM53_EXPERT_PIECES; p++) slot->piece[p] = slot->own + w->at[p];
+    slot->eid = eid;
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
+    m->miss++;
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
+    m->ebytes += (uint64_t)n;
+}
+
+/* The run's line for the container: records read, WNR3 records decoded and by whom (a record the
+ * CUDA helper does not take, status 1, is decoded on the CPU and counted there). */
+static void g53_wex_report(const GModel *m) {
+    const G53Wex *w = m->wex;
+    if (!w) return;
+    const uint64_t decoded = __atomic_load_n(&w->decoded, __ATOMIC_RELAXED), helper = coli_wex_cuda_decode_count();
+    fprintf(stderr, "[glm53] WEX4 records: %llu read, %llu WNR3 decoded (CUDA helper %llu, CPU %llu)\n",
+            (unsigned long long)__atomic_load_n(&w->reads, __ATOMIC_RELAXED), (unsigned long long)decoded,
+            (unsigned long long)helper, (unsigned long long)(decoded > helper ? decoded - helper : 0));
+}
+
 static int glm53_expert_read_replica(GModel *m, const ERef *ref, int layer, int eid) {
     int rep = glm53_expert_replica(layer, eid);
 
@@ -2142,6 +2403,7 @@ static int glm53_expert_read_replica(GModel *m, const ERef *ref, int layer, int 
 }
 
 static void expert_read(GModel *m, int layer, int eid, Slot *slot) {
+    if (m->wex) { g53_wex_read(m, layer, eid, slot); return; }   /* COLI_WEX_PATH: the container's record */
     const ERef *ref = &m->eref[(size_t)layer * m->c.n_experts + eid];
     int metal_slot = 0;
 #ifdef COLI_METAL
@@ -3230,6 +3492,7 @@ static int glm53_worker_open(GModel *m, const char *dir) {
     m->streaming = g53_expert_form(m, probe, first);   /* int4 gs64, or MXFP4 */
     expert_geometry(m);
     expert_table_init(m);
+    g53_wex_maybe_attach(m);
     expert_cache_init(m);
     return 0;
 }
@@ -3708,6 +3971,7 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
     if (m->streaming) {
         expert_geometry(m);
         expert_table_init(m);
+        g53_wex_maybe_attach(m);   /* COLI_WEX_PATH: the experts' records from a WEX4 container */
     }
 
     for (int i = layer_begin; i < layer_end; i++) {
@@ -6160,6 +6424,7 @@ int main(int argc, char **argv) {
         arm_stops(snap, &serve_tok, batch && atoi(batch));
         coli_rt_term_arm();   /* SIGTERM must reach the save below (#1629) */
         serve_loop(&served, &serve_tok);
+        g53_wex_report(&served);
         glm53_telemetry_save();
         rt_destroy();
         tok_free(&serve_tok);
@@ -6318,6 +6583,7 @@ int main(int argc, char **argv) {
     if (model.streaming)
         printf("experts hits %ld miss %ld bytes %llu\n",
                model.hits, model.miss, (unsigned long long)model.ebytes);
+    g53_wex_report(&model);   /* COLI_WEX_PATH: records read and decoded, by the helper and by the CPU */
 #if defined(COLI_VULKAN) || defined(COLI_CUDA)
     glm53_vk_report(&model, "run");
 #endif
