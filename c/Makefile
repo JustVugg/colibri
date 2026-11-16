@@ -2570,6 +2570,10 @@ tests/test_gq_signs$(EXE): tests/test_gq_signs.c
 # Q2_K's fused row kernel against the unpack + gq_dot_i8 path it replaced, to the bit
 tests/test_gq_q2_k$(EXE): tests/test_gq_q2_k.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+# The grid types' and Q2_K's row kernels (AVX-512's on a VNNI build, AVX2's otherwise) against
+# the unpack + gq_dot_i8 path, to the bit, one to eight activation rows
+tests/test_gq_grid512$(EXE): tests/test_gq_grid512.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 # A matrix's file rows eight at a time (gq_rows_f8) against their scalar reference and the R16
 # forms' kernels, to the bit; a no-op on a build without AVX2. `tests/test_rows_f8 bench` times them.
 tests/test_rows_f8$(EXE): tests/test_rows_f8.c

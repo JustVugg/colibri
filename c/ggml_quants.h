@@ -1824,12 +1824,35 @@ GQ_SB_FN void NAME##_512(float *y, int ystride, const uint8_t *row, const int8_t
     } \
     for (int s = 0; s < S; s++) y[(int64_t)s * ystride] = GQ_HSUM8(vacc[s]); \
 }
+/* GQ_DOT_SB256_512 for the grid types, from their gq_sbu_* decoders, as the AVX2 kernels take
+ * them: the grid rows are |w| as they are (every grid byte is positive), and the sign bytes
+ * give the lanes to negate (-1 where w < 0), so vpdpbusd gets the same two operands as from the
+ * signed decoder, byte for byte, without the signs applied to the weights and taken off again.
+ * The same lanes and float steps: the AVX2 kernels' bits. */
+#define GQ_DOT_SBU256_512(NAME, BYTES, BD, SBU) \
+GQ_SB_FN void NAME##_512(float *y, int ystride, const uint8_t *row, const int8_t *xq, const float *dx, const int32_t *xs, int I, const int S) { \
+    (void)xs; __m256 vacc[GQ_FUSED_ROWS]; for (int s = 0; s < S; s++) vacc[s] = _mm256_setzero_ps(); \
+    for (int64_t blk = 0; blk < I / 256; blk++) { \
+        const uint8_t *b = row + blk * (BYTES); const float d = BD(b); \
+        for (int ib = 0; ib < 8; ib += 2) { \
+            float sa[2], sb[2]; __m256i ga, gb; const __m256i w0 = SBU(b, d, ib, sa, &ga), w1 = SBU(b, d, ib + 1, sb, &gb); \
+            const __m512i aw = gq_pair(w0, w1); const __mmask64 neg = _mm512_movepi8_mask(gq_pair(ga, gb)); \
+            const __m512 ws = gq_w16(sa[0], sa[1], sb[0], sb[1]); const int64_t xb = blk * 8 + ib; \
+            for (int s = 0; s < S; s++) { \
+                const __m512 pf = _mm512_cvtepi32_ps(gq_dp64(aw, neg, _mm512_loadu_si512((const void *)(xq + (int64_t)s * I + xb * 32)))); \
+                const __m512 sc = _mm512_mul_ps(ws, gq_x16(dx + (int64_t)s * (I / 32) + xb)); \
+                GQ_FMA2V(vacc[s], pf, sc) \
+            } \
+        } \
+    } \
+    for (int s = 0; s < S; s++) y[(int64_t)s * ystride] = GQ_HSUM8(vacc[s]); \
+}
 GQ_DOT_SB256_512(gq_dot_iq4_xs, 136, gq_bd_iq4_xs, gq_sb_iq4_xs)
-GQ_DOT_SB256_512(gq_dot_iq2_xxs, 66, gq_bd_f16, gq_sb_iq2_xxs)
-GQ_DOT_SB256_512(gq_dot_iq2_xs, 74, gq_bd_f16, gq_sb_iq2_xs)
-GQ_DOT_SB256_512(gq_dot_iq2_s, 82, gq_bd_f16, gq_sb_iq2_s)
-GQ_DOT_SB256_512(gq_dot_iq3_xxs, 98, gq_bd_f16, gq_sb_iq3_xxs)
-GQ_DOT_SB256_512(gq_dot_iq3_s, 110, gq_bd_f16, gq_sb_iq3_s)
+GQ_DOT_SBU256_512(gq_dot_iq2_xxs, 66, gq_bd_f16, gq_sbu_iq2_xxs)
+GQ_DOT_SBU256_512(gq_dot_iq2_xs, 74, gq_bd_f16, gq_sbu_iq2_xs)
+GQ_DOT_SBU256_512(gq_dot_iq2_s, 82, gq_bd_f16, gq_sbu_iq2_s)
+GQ_DOT_SBU256_512(gq_dot_iq3_xxs, 98, gq_bd_f16, gq_sbu_iq3_xxs)
+GQ_DOT_SBU256_512(gq_dot_iq3_s, 110, gq_bd_f16, gq_sbu_iq3_s)
 GQ_DOT_SB256_512(gq_dot_iq1_s, 50, gq_bd_f16, gq_sb_iq1_s)
 GQ_DOT_SB256_512(gq_dot_iq1_m, 56, gq_bd_iq1_m, gq_sb_iq1_m)
 #define GQ_DOT_SBK_512(NAME, BYTES, SB, HASMIN) \
@@ -1859,6 +1882,7 @@ GQ_DOT_SBK_512(gq_dot_q4_k, 144, gq_sbk_q4_k, 1)
 GQ_DOT_SBK_512(gq_dot_q5_k, 176, gq_sbk_q5_k, 1)
 GQ_DOT_SBK_512(gq_dot_q6_k, 210, gq_sbk_q6_k, 0)
 GQ_DOT_SBK_512(gq_dot_q3_k, 110, gq_sbk_q3_k, 0)
+GQ_DOT_SBK_512(gq_dot_q2_k, 84, gq_sbk_q2_k, 1)
 /* Q8_0: two blocks a register, each with its own scale */
 static inline __attribute__((always_inline)) void gq_dot_q8_0_512(float *y, int ystride, const uint8_t *row, const int8_t *xq,
                                                                  const float *dx, const int32_t *xs, int I, const int S) {
@@ -1933,6 +1957,7 @@ GQ_EXACT_FN static int gq_row_512(float *y, int ystride, const gq_act *a, const 
     case GQ_Q5_K: GQ_ROWS512(gq_dot_q5_k_512, y, ystride, row, a, I); return 1;
     case GQ_Q6_K: GQ_ROWS512(gq_dot_q6_k_512, y, ystride, row, a, I); return 1;
     case GQ_Q3_K: GQ_ROWS512(gq_dot_q3_k_512, y, ystride, row, a, I); return 1;
+    case GQ_Q2_K: GQ_ROWS512(gq_dot_q2_k_512, y, ystride, row, a, I); return 1;
     case GQ_IQ4_XS: GQ_ROWS512(gq_dot_iq4_xs_512, y, ystride, row, a, I); return 1;
     case GQ_IQ2_XXS: GQ_ROWS512(gq_dot_iq2_xxs_512, y, ystride, row, a, I); return 1;
     case GQ_IQ2_XS: GQ_ROWS512(gq_dot_iq2_xs_512, y, ystride, row, a, I); return 1;

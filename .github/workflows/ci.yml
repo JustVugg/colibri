@@ -1917,6 +1917,12 @@ jobs:
           /tmp/tq2k
           gcc -O3 -march=x86-64-v3 -fopenmp -I. tests/test_gq_q2_k.c -o /tmp/tq2kv3 -lm
           /tmp/tq2kv3
+          # the grid types' and Q2_K's row kernels (AVX-512's where the runner has VNNI) against
+          # the unpack + gq_dot_i8 path, one to eight activation rows: the same two ISAs
+          gcc -O3 -march=native -fopenmp -I. tests/test_gq_grid512.c -o /tmp/tg512 -lm
+          /tmp/tg512
+          gcc -O3 -march=x86-64-v3 -fopenmp -I. tests/test_gq_grid512.c -o /tmp/tg512v3 -lm
+          /tmp/tg512v3
       - name: Generate the glm_tiny fixture
         run: cd c && python3 tools/make_glm_oracle.py
       - name: Oracle (30–32/32 teacher forcing + exact greedy)
