@@ -1734,6 +1734,7 @@ typedef struct {
     int rep;
     int gx_layer;         /* a GGUF expert's matrix: its layer (its type and form), else -1 */
     shards *S;            /* the file set t is in: the checkpoint's, or the WEX4 container's */
+    int eid;              /* the expert */
 } ExpertRead;
 
 /* Bytes one part of an expert occupies, from the config rather than the file:
@@ -1833,29 +1834,40 @@ static void v41_gx_geometry(Model *m) {
 }
 
 /* ---- routed experts from a WEX4 container (COLI_WEX_PATH; docs/wex.md) ----------
- * A WEX4 file of the checkpoint's routed experts: one RAW record per (layer, expert),
- * the w1, w2, w3 scales then the w1, w2, w3 weights, back to back, padded to 4096. The
- * container's six tensors of an expert become six st_tensor entries over its one file
- * (wex->t), so expert_fetch reads them as it reads the shards' (the same windows, O_DIRECT,
- * reader threads), only from a contiguous record of one file. The backbone's experts only;
- * the DSpark stages, a GGUF's experts and every other tensor stay on the shards.
+ * A WEX4 file of the checkpoint's routed experts: one record per (layer, expert), the w1,
+ * w2, w3 scales then the w1, w2, w3 weights, back to back, padded to 4096. A RAW record's
+ * six tensors become six st_tensor entries over the container's one file (wex->t), so
+ * expert_fetch reads them as it reads the shards' (the same windows, O_DIRECT, reader
+ * threads), only from a contiguous record of one file. A WNR3 record (codec 5: those bytes
+ * coded with the container's WNM2 model) is read whole by one reader, decoded on its thread
+ * (v41_wex_fetch_nr3, wex_decode.c) and its six parts copied into the windows. The
+ * backbone's experts only; the DSpark stages, a GGUF's experts and every other tensor stay
+ * on the shards.
  *
  * At open (v41_wex_open): the header page and the index (wex4.h), the grid (n_layers x
- * n_routed), COLI_WEX_ROOT (64 hex digits) when set, and every expert record RAW with the
- * checkpoint's shapes and part sizes. Any failure leaves every expert on the safetensors
- * with a "[v41_wex]" line; an expert the container lacks is read from them too.
+ * n_routed), COLI_WEX_ROOT (64 hex digits) when set, and every expert record RAW or WNR3
+ * with the checkpoint's shapes and part sizes; WNR3 records need one WNM2 blob, matching its
+ * SHA-256 in the index, and all or none value-exact. Any failure leaves every expert on the
+ * safetensors with a "[v41_wex]" line; an expert the container lacks is read from them too.
  * COLI_WEX_VERIFY (on with COLI_WEX_ROOT, else off) hashes each record at its first read
- * (v41_wex_check, the six parts in record order and its zero padding): one that fails is
- * read again from the safetensors and stays on them for the run. */
+ * (RAW: v41_wex_check, the six parts in record order and its zero padding; WNR3: its stored
+ * bytes): one that fails is read again from the safetensors and stays on them for the run,
+ * as does a WNR3 record that names another expert or does not decode. */
 #include "wex4.h"
+#define COLI_WEX_DECODE_API static inline
+#include "wex_decode.c"
 
 typedef struct V41Wex {
     shards S;                  /* the container: its one file */
-    st_tensor *t;              /* [cell * 6 + part]: the part's bytes in the file; fd < 0: not in it */
+    st_tensor *t;              /* [cell * 6 + part]: the part's bytes in the file (RAW) or in the decoded
+                                * record (WNR3); fd < 0: not in it */
+    WexEntry *nr3;             /* WNR3 records: [cell] the record's entry (flags 5), else NULL */
+    uint32_t nr3_flags;        /* WEX_HEADER_CANONICAL_ZERO when the WNR3 records are value-exact, else 0 */
     unsigned char *sha;        /* COLI_WEX_VERIFY: [cell * 32] the index's SHA-256 of each record, else NULL */
     unsigned char *state;      /* [cell]: 0 not hashed yet, 1 passed, 2 refused (the shards serve it) */
-    int64_t pad;               /* a record's zero padding: stored - decoded */
-    uint64_t reads, refused;
+    int64_t pad;               /* a RAW record's zero padding: stored - decoded */
+    int experts;               /* n_routed: cell = layer * experts + expert */
+    uint64_t reads, refused, decoded;
 } V41Wex;
 
 /* the container's tensor order in a record (w1, w2, w3 scales, then weights) as expert_read_list's parts */
@@ -1877,7 +1889,7 @@ static int v41_wex_pin(unsigned char pin[32]) {   /* COLI_WEX_ROOT: 0 unset, 1 a
 static void v41_wex_free(V41Wex *w) {
     if (!w) return;
     st_destroy(&w->S);
-    free(w->t); free(w->sha); free(w->state); free(w);
+    free(w->t); free(w->nr3); free(w->sha); free(w->state); free(w);
 }
 
 static void v41_wex_open(Model *m) {
@@ -1892,6 +1904,7 @@ static void v41_wex_open(Model *m) {
     if (probe < 0) { snprintf(why, sizeof why, "cannot be opened (%s)", strerror(errno)); goto refuse; }
     close(probe);
     w = xcalloc(1, sizeof *w, "WEX4 container");
+    w->experts = c->n_routed;
     const int fd = st_open_fd(&w->S, path);
     const int64_t size = w->S.sizes[0];
     page = xmalloc(WEX4_PAGE, "WEX4 header page");
@@ -1934,18 +1947,31 @@ static void v41_wex_open(Model *m) {
     int64_t decoded = 0;
     for (int part = 0; part < 6; part++) decoded += expert_part_bytes(c, part);
     w->pad = (int64_t)wex4_align((uint64_t)decoded) - decoded;
-    int held = 0;
+    int held = 0, nr3 = 0, exact = 0;
+    uint32_t model_blob = 0;   /* the WNR3 records' WNM2 blob, 1-based */
     for (uint32_t r = 0; r < h.records; r++) {
         Wex4Record rec;
         wex4_get_record(&view, r, &rec);
         if (!(rec.flags & WEX4_REC_EXPERT)) continue;   /* other tensors: not the experts' */
         const int layer = (int)(rec.owner >> 16), eid = (int)(rec.owner & 0xffffu);   /* bounded by wex4_open */
-        if (rec.codec != WEX4_CODEC_RAW) {
-            snprintf(why, sizeof why, "holds WNR3 records, which this build does not read (RAW records only)");
-            free(sha);
-            goto refuse;
-        }
         const size_t cell = (size_t)layer * c->n_routed + eid;
+        const int coded = rec.codec == WEX4_CODEC_WNR3;   /* wex4_open admits RAW and WNR3 expert records */
+        if (coded) {
+            if (model_blob && rec.blob != model_blob) {
+                snprintf(why, sizeof why, "has WNR3 records of two models (one is read)");
+                free(sha);
+                goto refuse;
+            }
+            model_blob = rec.blob;
+            if (!w->nr3) w->nr3 = xcalloc(cells, sizeof *w->nr3, "WEX4 WNR3 entries");
+            if (wex4_expert_entry(&view, r, &w->nr3[cell])) {
+                snprintf(why, sizeof why, "has an invalid WNR3 record (layer %d expert %d)", layer, eid);
+                free(sha);
+                goto refuse;
+            }
+            nr3++;
+            exact += !!(rec.flags & WEX4_REC_VALUE_EXACT);
+        }
         int ok = rec.tensor_count == 6 && (int64_t)rec.decoded == decoded;
         for (int j = 0; j < 6 && ok; j++) {
             Wex4Tensor t;
@@ -1959,7 +1985,8 @@ static void v41_wex_open(Model *m) {
             if (!ok) break;
             st_tensor *dst = &w->t[cell * 6 + part];
             dst->name = (char *)"a WEX4 record's tensor";
-            dst->fd = fd; dst->off = (int64_t)(rec.offset + t.offset); dst->nbytes = (int64_t)t.nbytes;
+            /* RAW: where the part is in the file; WNR3: where it is in the decoded record */
+            dst->fd = fd; dst->off = (int64_t)((coded ? 0 : rec.offset) + t.offset); dst->nbytes = (int64_t)t.nbytes;
             dst->dtype = 3; dst->rank = 2; dst->shape[0] = rows; dst->shape[1] = cols; dst->numel = rows * cols;
         }
         if (!ok) {
@@ -1971,10 +1998,28 @@ static void v41_wex_open(Model *m) {
         memcpy(sha + cell * 32, rec.sha, 32);
         held++;
     }
+    char model[48] = "";
+    if (model_blob) {   /* the WNM2 model, checked against its SHA-256 in the index, registered for the decode */
+        Wex4Blob blob;
+        wex4_get_blob(&view, model_blob - 1u, &blob);
+        const size_t stored = (size_t)wex4_align(blob.bytes);
+        unsigned char *bytes = xmalloc(stored, "WEX4 model blob");
+        st_pread_full(fd, bytes, (int64_t)stored, (int64_t)blob.offset, "pread WEX4 model blob");
+        const int bad = coli_wex4_register_model(bytes, (size_t)blob.bytes, stored, blob.sha, blob.id);
+        free(bytes);
+        if (bad || (exact && exact != nr3)) {
+            snprintf(why, sizeof why, "%s", bad ? "has a WNM2 model blob that does not match its SHA-256 in the index"
+                                                : "has WNR3 records both value-exact and not (all or none are read)");
+            free(sha);
+            goto refuse;
+        }
+        w->nr3_flags = exact ? WEX_HEADER_CANONICAL_ZERO : 0u;
+        snprintf(model, sizeof model, " (%d WNR3, model %08x%s)", nr3, blob.id, exact ? ", value-exact" : "");
+    }
     const char *verify = getenv("COLI_WEX_VERIFY");
     if (verify && *verify ? atoi(verify) != 0 : pinned > 0) w->sha = sha; else free(sha);
-    fprintf(stderr, "[v41_wex] WEX4 container %s: %d of %zu experts, root %s%s; first-read SHA-256 %s\n", path,
-            held, cells, root, pinned ? " (pinned)" : "", w->sha ? "on" : "off");
+    fprintf(stderr, "[v41_wex] WEX4 container %s: %d of %zu experts%s, root %s%s; first-read SHA-256 %s\n", path,
+            held, cells, model, root, pinned ? " (pinned)" : "", w->sha ? "on" : "off");
     free(page); free(index);
     m->wex = w;
     return;
@@ -1990,6 +2035,14 @@ static int v41_wex_has(const Model *m, const char *kind, int layer, int eid) {
     if (!w || strcmp(kind, "layers")) return 0;
     const size_t cell = (size_t)layer * m->c.n_routed + eid;
     return w->t[cell * 6].fd >= 0 && __atomic_load_n(&w->state[cell], __ATOMIC_ACQUIRE) != 2;
+}
+
+/* A record that failed: refused for the run, the shards serve its expert from now on. */
+static void v41_wex_refuse(V41Wex *w, int layer, int eid, const char *why) {
+    __atomic_store_n(&w->state[(size_t)layer * (size_t)w->experts + (size_t)eid], (unsigned char)2, __ATOMIC_RELEASE);
+    __atomic_fetch_add(&w->refused, UINT64_C(1), __ATOMIC_RELAXED);
+    fprintf(stderr, "[v41_wex] layer %d expert %d: the record %s; this expert comes from the safetensors from now on\n",
+            layer, eid, why);
 }
 
 /* COLI_WEX_VERIFY: the record of an expert just read from the container, hashed from its
@@ -2009,10 +2062,7 @@ static int v41_wex_check(Model *m, int layer, int eid, Slot *s) {
     wex4_sha_update(&sha, zero, (size_t)w->pad);
     wex4_sha_final(&sha, digest);
     if (memcmp(digest, w->sha + cell * 32, 32)) {
-        __atomic_store_n(&w->state[cell], (unsigned char)2, __ATOMIC_RELEASE);
-        __atomic_fetch_add(&w->refused, UINT64_C(1), __ATOMIC_RELAXED);
-        fprintf(stderr, "[v41_wex] layer %d expert %d: the record does not match its SHA-256 in the index; "
-                        "this expert comes from the safetensors from now on\n", layer, eid);
+        v41_wex_refuse(w, layer, eid, "does not match its SHA-256 in the index");
         return 0;
     }
     __atomic_store_n(&w->state[cell], (unsigned char)1, __ATOMIC_RELEASE);
@@ -2051,6 +2101,7 @@ static int expert_read_list(Model *m, const char *kind, int layer, int eid, Slot
             out[n].part = which;
             out[n].rep = wex ? 0 : rep;   /* the container has no replicas yet */
             out[n].gx_layer = gi;
+            out[n].eid = eid;
             n++;
         }
     }
@@ -2150,6 +2201,50 @@ static void scratch_put(uint8_t *p, int64_t n) {
     if (p) compat_aligned_free(p);
 }
 
+/* The container's WNR3 entry of a backbone expert it serves, or NULL (RAW, or not the container's). */
+static const WexEntry *v41_wex_nr3(const Model *m, const ExpertRead *r, int layer) {
+    const V41Wex *w = m->wex;
+    if (!w || !w->nr3 || r->S != &w->S) return NULL;
+    const WexEntry *e = &w->nr3[(size_t)layer * m->c.n_routed + r->eid];
+    return e->flags == WEX_ENTRY_NEURAL_RANS3 ? e : NULL;
+}
+
+/* One WNR3 record into the six windows of slot s: its stored bytes read whole at the end of a
+ * pooled page (one O_DIRECT read where there is one), hashed at the first read when
+ * COLI_WEX_VERIFY is on, its owner and canonical-zero flag checked, decoded in place on this
+ * reader thread, and each part copied to its window at the offset expert_fetch publishes
+ * (the part's offset in the record, mod ST_DIRECT_ALIGN). Returns the bytes read; a record
+ * that fails is refused (v41_wex_refuse) and expert_fetch reads the expert from the shards. */
+static uint64_t v41_wex_fetch_nr3(Model *m, int layer, int eid, const WexEntry *e, Slot *s) {
+    V41Wex *w = m->wex;
+    const size_t cell = (size_t)layer * m->c.n_routed + eid;
+    uint64_t raw, aligned;
+    if (wex_entry_raw_sizes(e, &raw, &aligned)) { v41_wex_refuse(w, layer, eid, "has an invalid entry"); return 0; }
+    const size_t at = wex_record_read_offset(e);
+    int64_t got = 0;
+    uint8_t *page = scratch_get((int64_t)aligned, &got);
+    st_read_range_rep(&w->S, w->t[cell * 6].fd, 0, (int64_t)e->file_offset, (int64_t)e->total_bytes, page + at,
+                      (int64_t)e->total_bytes, 1, expert_direct(), "pread WNR3 expert");
+    const char *why = NULL;
+    if (w->sha && !__atomic_load_n(&w->state[cell], __ATOMIC_ACQUIRE)) {
+        unsigned char digest[32];
+        wex4_sha256(page + at, e->total_bytes, digest);
+        if (memcmp(digest, w->sha + cell * 32, 32)) why = "does not match its SHA-256 in the index";
+        else __atomic_store_n(&w->state[cell], (unsigned char)1, __ATOMIC_RELEASE);
+    }
+    if (!why && !wex_nr3_owner_ok(e, page + at, (uint32_t)layer, (uint32_t)eid, w->nr3_flags))
+        why = "names another expert, or another canonical-zero form";
+    if (!why && coli_wex_decode_record(e, page, (size_t)aligned)) why = "does not decode (a WNR3 stream check failed)";
+    if (why) v41_wex_refuse(w, layer, eid, why);
+    else
+        for (int part = 0; part < 6; part++) {
+            const st_tensor *t = &w->t[cell * 6 + part];
+            memcpy(s->base[part] + t->off % ST_DIRECT_ALIGN, page + t->off, (size_t)t->nbytes);
+        }
+    scratch_put(page, got);
+    return why ? 0 : e->total_bytes;
+}
+
 /* Read `n` reserved experts at once. The slot ids are stamped only after every
  * read has landed, so a slot never advertises an expert it does not yet hold. */
 static void expert_fetch(Model *m, const char *kind, int layer,
@@ -2201,6 +2296,16 @@ static void expert_fetch(Model *m, const char *kind, int layer,
         if (i >= total) break;
         const ExpertRead *r = &list[i];
         int64_t pad = r->t->off % ST_DIRECT_ALIGN;
+        const WexEntry *nr3 = v41_wex_nr3(m, r, layer);
+        if (nr3) {   /* a WNR3 record: one reader decodes it into all six windows, at its first part */
+            if (r->part == 0) {
+                const uint64_t got = v41_wex_fetch_nr3(m, layer, r->eid, nr3, r->slot);
+                __atomic_fetch_add(&g_mir_bytes[0], got, __ATOMIC_RELAXED);
+                __atomic_fetch_add(&g_mir_nread[0], 1, __ATOMIC_RELAXED);
+                bytes += got;
+            }
+            continue;
+        }
         if (r->gx_layer >= 0 && v41_gx_conv(m, r->gx_layer, r->part / 2)) {
             /* A GGUF matrix the slot holds in another form: read into a pooled scratch
              * buffer, then interleaved by 16 rows or laid out as FP4 and scales. */
@@ -2231,13 +2336,20 @@ static void expert_fetch(Model *m, const char *kind, int layer,
         bytes += (uint64_t)r->t->nbytes;
     }
     }
-    /* COLI_WEX_VERIFY: each record the container served, hashed at its first read; one that
-     * fails is read again, here, from the checkpoint's shards (v41_wex_check refused it, so
-     * expert_read_list now names the shards' tensors). */
+    /* COLI_WEX_VERIFY: each RAW record the container served, hashed at its first read; one
+     * that fails is read again, here, from the checkpoint's shards (v41_wex_check refused it,
+     * so expert_read_list now names the shards' tensors). A WNR3 record was checked and
+     * decoded by its reader; one it refused is read again here the same way. */
     for (int i = 0; m->wex && i < n; i++) {
         ExpertRead *r = list + first[i];
         if (r->S != &m->wex->S) continue;
-        if (v41_wex_check(m, layer, eid[i], slot[i])) { __atomic_fetch_add(&m->wex->reads, UINT64_C(1), __ATOMIC_RELAXED); continue; }
+        const int coded = v41_wex_nr3(m, r, layer) != NULL;
+        const size_t cell = (size_t)layer * m->c.n_routed + eid[i];
+        if (coded ? __atomic_load_n(&m->wex->state[cell], __ATOMIC_ACQUIRE) != 2 : v41_wex_check(m, layer, eid[i], slot[i])) {
+            __atomic_fetch_add(&m->wex->reads, UINT64_C(1), __ATOMIC_RELAXED);
+            if (coded) __atomic_fetch_add(&m->wex->decoded, UINT64_C(1), __ATOMIC_RELAXED);
+            continue;
+        }
         expert_read_list(m, kind, layer, eid[i], slot[i], expert_route(layer, eid[i]), r);
         for (int k = 0; k < V41_EXPERT_TENSORS; k++)
             st_read_range_rep(&m->S, r[k].t->fd, r[k].rep, r[k].t->off, r[k].t->nbytes,
@@ -7279,6 +7391,10 @@ int main(int argc, char **argv) {
             (unsigned long long)m.hits, (unsigned long long)m.miss,
             m.expert_bytes / 1e6, m.t_disk, m.t_expert, m.t_attn, m.t_engram);
     mirror_report(NULL, NULL);
+    if (m.wex)
+        fprintf(stderr, "[v41_wex] container: %llu records read (%llu WNR3 decoded), %llu refused\n",
+                (unsigned long long)m.wex->reads, (unsigned long long)m.wex->decoded,
+                (unsigned long long)m.wex->refused);
     if (m.engram.active)
         for (int t = 0; t < m.engram.n_layers; t++)
             fprintf(stderr, "[v41] engram table %d (layer %d): %lld rows, %llu cache hits, "

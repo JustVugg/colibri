@@ -305,7 +305,12 @@ expert's six tensors sit back to back in one 4096-aligned record of one file, an
 into the same windows by the same readers. `COLI_WEX_ROOT=<root>` (printed by
 `tools/wex4_verify`) refuses any other file and hashes each record at its first read; a
 record that fails is read from the shards instead. The DSpark stages and the rest of the
-checkpoint stay on the shards. Details: [wex.md](wex.md#deepseek-v41-deepseek_v41).
+checkpoint stay on the shards. A container of WNR3 records (the published REAP-192 one: 7,680
+records, 123.3 GB against 144.4 GB as RAW) is read a record at a time and decoded on the CPU by
+the reader threads. It gives the same tokens, but on a CPU the decode is the bottleneck: on an
+i7-7700K (4 cores) with both files on one SATA SSD, 8 prompt and 8 generated tokens took
+232.8 s and 293.6 s from the container against 102.4 s and 74.6 s from the shards (engram off,
+cap 8). Details: [wex.md](wex.md#deepseek-v41-deepseek_v41).
 
 ### The cheapest resident tier there is
 

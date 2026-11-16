@@ -827,7 +827,7 @@ Read **only** by `c/deepseek_v41.c`. See [deepseek-v41.md](deepseek-v41.md).
 
 | Variable | Default | Effect |
 |---|---|---|
-| `COLI_WEX_PATH` | unset | DeepSeek V4.1: a WEX4 container of the backbone's routed experts ([wex.md](wex.md#deepseek-v41-deepseek_v41)): an expert's six tensors are read from its one record instead of the shards. A file that does not open as WEX4, is for another grid, holds WNR3 records or records that are not the checkpoint's experts is not used, with a `[v41_wex]` line; the shards serve then. Unset: nothing changes. |
+| `COLI_WEX_PATH` | unset | DeepSeek V4.1: a WEX4 container of the backbone's routed experts ([wex.md](wex.md#deepseek-v41-deepseek_v41)): an expert's six tensors are read from its one record instead of the shards; a WNR3 record is read whole and decoded on the CPU by the reader thread. A file that does not open as WEX4, is for another grid, holds records that are not the checkpoint's experts or a WNR3 model blob that does not match the index is not used, with a `[v41_wex]` line; the shards serve then, and serve any record that fails. Unset: nothing changes. |
 | `COLI_WEX_ROOT` | unset | DeepSeek V4.1: 64 hex digits; a container with another root is not used. Also turns `COLI_WEX_VERIFY` on. |
 | `COLI_WEX_VERIFY` | on with `COLI_WEX_ROOT`, else off | DeepSeek V4.1: `1` hashes each record at its first read against the index; one that fails is read again from the shards, and stays on them for the run. |
 | `V41_ENGRAM_ROWS` | 65536 | DeepSeek V4.1: rows of engram cache per table. The n-gram traffic is Zipfian, so a small cache absorbs most of it; 65536 rows is 64 MB per table on the released head_dim. |
