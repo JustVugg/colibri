@@ -9,7 +9,7 @@
     "cpu": "2x Intel Xeon Gold 6230 (40 cores, hyper-threading off, AVX-512 VNNI), Cisco UCS C240 M5, no GPU",
     "ram": "848 GB, two NUMA domains",
     "storage": "two NVMe drives on PCIe x2 links, striped with gstripe, UFS, about 2.6 GB/s sequential; the engine reads with O_DIRECT",
-    "os": "FreeBSD 15.1 amd64; clang and libomp from the base system; gcc and libgomp from packages (compiler versions not recorded)"
+    "os": "FreeBSD 15.1 amd64; FreeBSD clang 19.1.7 and its libomp from the base system; gcc 14.2.0 (FreeBSD Ports Collection) and its libgomp from packages"
   },
   "warmup_runs": 0,
   "changed_variables": [
