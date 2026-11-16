@@ -103,20 +103,29 @@ What the expert store does with it (`deepseek_v4.c`, the `v4_wex_*` functions):
 ```
 open      v4_wex_open    read page 0 -> wex4_parse_header -> grid = the model's? root = COLI_WEX_ROOT?
                          read the index -> wex4_open -> for every expert record: wex4_expert_entry
+                         WNR3 records: their one WNM2 blob read, checked against the index's SHA-256
+                         and registered (coli_wex4_register_model); all or none value-exact
                          (any failure: a [v4_wex] line, and the safetensors serve every expert)
 build     build_record   every expert record in the per-matrix slab layout
                          (w1 w2 w3 scales, then w1 w2 w3 weights: a WEX record's layout)
 bind      v4_wex_bind    every container record must have its expert's shapes and sizes, else none is used
-miss      v4_wex_read    one read of the record (O_DIRECT where there is one) into the slot's slab;
+miss      v4_wex_read    RAW: one read of the record (O_DIRECT where there is one) into the slot's slab;
                          padding must be zero; first read: SHA-256 against the index (COLI_WEX_VERIFY)
                          failed read, bad padding or bad hash -> that expert from the safetensors
+          v4_wex_read_nr3  WNR3: the stored bytes read at the end of the decoded page, first read:
+                         SHA-256 (COLI_WEX_VERIFY); the record's owner and canonical-zero flag
+                         (wex_nr3_owner_ok); decoded in place (coli_wex_decode_record) on the
+                         thread that missed. Bad hash, another owner or a failed stream check ->
+                         that expert from the safetensors for the rest of the run
 prefetch                 the advice goes to the container's record instead of the shard ranges
 ```
 
 An expert the container does not hold, or one it refused, comes from the safetensors, so the
 checkpoint must stay where it is. The store prints one `[v4_wex]` line at open (the file, how
-many experts it holds, its root, whether the hash check is on) and one at the end (records read,
-bytes, fallbacks, refusals). Only RAW records are read; a container with WNR3 records is not used.
+many experts it holds, how many are WNR3 and their model, its root, whether the hash check is
+on) and one at the end (records read, WNR3 records decoded, bytes, fallbacks, refusals). A
+canonical-zero container is refused under `DSV4_CUDA_MOE_MASKED=1`, whose masked MoE path is
+not proven value-exact.
 
 ## Qwen3.8 (`qwen38`)
 
@@ -177,6 +186,6 @@ Vulkan tier's prewarm reads.
 
 ## Status in colibri
 
-DeepSeek V4, DeepSeek V4.1 and Qwen3.8 read RAW records from a WEX4 container. `wex_decode.c`
-decodes WNR3 records on the CPU; the engines read them in the next PRs. Their GPU decode and the
-I/O switches (several drives, split reads) come after.
+DeepSeek V4, DeepSeek V4.1 and Qwen3.8 read RAW records from a WEX4 container; DeepSeek V4 also
+reads WNR3 records, decoded on the CPU (`wex_decode.c`). Qwen3.8 and DeepSeek V4.1 read them in
+the next PRs. Their GPU decode and the I/O switches (several drives, split reads) come after.
