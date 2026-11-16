@@ -441,8 +441,8 @@ def run_fresh_engine(engine, snap, prompt, max_new, runs, cap, bits, memory_gb=N
             mem_str = str(int(memory_gb)) if memory_gb is not None else "32"
             cmd = [engine, snap, prompt, "--max-tokens", str(max_new), "--memory-gb", mem_str]
             stdin_input = None
-        elif engine_name in ("qwen38", "qwen38.exe"):
-            # Qwen3.8's direct CLI takes a prompt filename at argv[3]; stdin is
+        elif engine_name in ("qwen36", "qwen36.exe", "qwen38", "qwen38.exe"):
+            # Qwen3.6 and Qwen3.8 read a prompt filename at argv[3]; stdin is
             # reserved for its persistent SERVE protocol.  Close the temporary
             # file before launch so this path also works on Windows.
             handle = tempfile.NamedTemporaryFile(
@@ -482,9 +482,9 @@ def run_fresh_engine(engine, snap, prompt, max_new, runs, cap, bits, memory_gb=N
         m = LOAD_RE.search(output)
         if m:
             load_s, rss = float(m.group(1)), float(m.group(2))
-            speed = QWEN38_SPEED_RE.search(output) if engine_name in ("qwen38", "qwen38.exe") else None
-            if engine_name in ("qwen38", "qwen38.exe") and not speed:
-                sys.exit(f"could not parse Qwen3.8 generation count/speed:\n{output[-400:]}")
+            speed = QWEN38_SPEED_RE.search(output) if engine_name in ("qwen36", "qwen36.exe", "qwen38", "qwen38.exe") else None
+            if engine_name in ("qwen36", "qwen36.exe", "qwen38", "qwen38.exe") and not speed:
+                sys.exit(f"could not parse Qwen generation count/speed:\n{output[-400:]}")
             gen_s = float(speed.group(1)) if speed else wall - load_s
             tok_count = int(speed.group(2)) if speed else max_new
         else:
