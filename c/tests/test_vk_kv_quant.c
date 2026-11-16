@@ -33,6 +33,17 @@
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fails++; printf("FAIL: " __VA_ARGS__); putchar('\n'); } } while (0)
 
+/* the file's own RNG, not the libc's: the fixtures must be the same bytes on every
+ * platform, and the attention fixture's power leaned on glibc's rand() -- macOS's left
+ * the mutation arms' row with softmax weight exactly 0, so the arm false-failed there
+ * (the value-shaping arithmetic at the call sites is unchanged; only the draw is) */
+static uint32_t kvq_rs;
+static void kvq_srand(uint32_t seed) { kvq_rs = seed; }
+static unsigned kvq_rand(void) {   /* xorshift32: period 2^32-1, every bit usable */
+    kvq_rs ^= kvq_rs << 13; kvq_rs ^= kvq_rs >> 17; kvq_rs ^= kvq_rs << 5;
+    return kvq_rs;
+}
+
 static VkcBuf *upf(const void *v, size_t bytes) {   /* a device buffer holding v */
     VkcBuf *b = vkc_buf(bytes, VKC_DEV);
     if (!b) return NULL;
@@ -59,13 +70,13 @@ static double rel_l2(const float *a, const float *b, int n) {
 
 /* R rows of hd floats: random magnitudes, exact grid and tie values, then the edge rows */
 static void fill_rows(float *x, int R, int hd, int e4m3) {
-    srand(11);
+    kvq_srand(11);
     for (int i = 0; i < R * hd; i++) {
-        int k = rand() % 4;
-        if (k == 0) x[i] = (float)((rand() % 2001) - 1000) / 500.0f * ldexpf(1.0f, rand() % 7 - 3);
-        else if (k == 1) x[i] = (float)((rand() % 65) - 32) / 16.0f;          /* ties on both grids */
-        else if (k == 2) x[i] = (float)((rand() % 17) - 8) * 0.5f;
-        else x[i] = (float)((rand() % 33) - 16) / 512.0f;
+        int k = kvq_rand() % 4;
+        if (k == 0) x[i] = (float)((int)(kvq_rand() % 2001) - 1000) / 500.0f * ldexpf(1.0f, (int)(kvq_rand() % 7) - 3);
+        else if (k == 1) x[i] = (float)((int)(kvq_rand() % 65) - 32) / 16.0f;          /* ties on both grids */
+        else if (k == 2) x[i] = (float)((int)(kvq_rand() % 17) - 8) * 0.5f;
+        else x[i] = (float)((int)(kvq_rand() % 33) - 16) / 512.0f;
     }
     int e = 0;
 #define EDGE(f) do { if (e >= R) return; for (int i = 0; i < hd; i++) x[e * hd + i] = (f); e++; } while (0)
@@ -211,10 +222,10 @@ static void score_case(int S, int pos_base, int IH, int topk) {
     int *top1 = malloc((size_t)S * topk * sizeof(int)), *top0 = malloc((size_t)S * topk * sizeof(int));
     VkcBuf *qb = NULL, *wb = NULL, *kq = NULL, *kmq = NULL, *s1 = NULL, *s2 = NULL;
     if (!q || !w || !k || !kd || !km || !ref || !ref0 || !top1 || !top0) { CHECK(0, "scores: out of memory"); goto done; }
-    srand(13);
-    for (int i = 0; i < S * IH * ID; i++) q[i] = (float)((rand() % 33) - 16) / 16.0f;
-    for (int i = 0; i < S * IH; i++) w[i] = (float)((rand() % 9) - 4) * 0.5f;
-    for (int i = 0; i < width * ID; i++) k[i] = (float)((rand() % 33) - 16) / 16.0f * (float)(1 << (rand() % 3));
+    kvq_srand(13);
+    for (int i = 0; i < S * IH * ID; i++) q[i] = (float)((int)(kvq_rand() % 33) - 16) / 16.0f;
+    for (int i = 0; i < S * IH; i++) w[i] = (float)((int)(kvq_rand() % 9) - 4) * 0.5f;
+    for (int i = 0; i < width * ID; i++) k[i] = (float)((int)(kvq_rand() % 33) - 16) / 16.0f * (float)(1 << (kvq_rand() % 3));
     for (int t = 0; t < width; t++) { kvq_pack_ikey(km, t, k + (size_t)t * ID); kvq_unpack_ikey(kd + (size_t)t * ID, km, t); }
     for (int s = 0; s < S; s++) {                       /* the CPU's scores, over the decoded and the original rows
                                                          * (the sums in double: the device's are float and in its own
@@ -317,8 +328,8 @@ static void host_block_tests(void) {
     CHECK(m1 && m2, "staging: no memory");
     if (m1 && m2) {
         memset(m1, 0, mb); memset(m2, 0, mb);
-        srand(29);
-        for (int i = 0; i < R * 128; i++) x[i] = (float)((rand() % 2001) - 1000) / 500.0f * ldexpf(1.0f, rand() % 5 - 2);
+        kvq_srand(29);
+        for (int i = 0; i < R * 128; i++) x[i] = (float)((int)(kvq_rand() % 2001) - 1000) / 500.0f * ldexpf(1.0f, (int)(kvq_rand() % 5) - 2);
         for (int t = 0; t < R; t++) kvq_pack_ikey(m1, t, x + (size_t)t * 128);
         for (int t = 0; t < R; t++) {   /* every row through the staging, blocks apart */
             kvq_ikey_row_gather(row, m1, t);
@@ -393,8 +404,8 @@ static void host_block_tests(void) {
     enum { W = 8, N = 11 };
     float kv[N * 512];
     uint8_t ring[W * KVQ_WIN_BYTES], ref[W * KVQ_WIN_BYTES];
-    srand(31);
-    for (int i = 0; i < N * 512; i++) kv[i] = (float)((rand() % 2001) - 1000) / 500.0f;
+    kvq_srand(31);
+    for (int i = 0; i < N * 512; i++) kv[i] = (float)((int)(kvq_rand() % 2001) - 1000) / 500.0f;
     memset(ref, 0, sizeof ref);
     for (int p = 0; p < N; p++) kvq_pack_win(ref + (size_t)(p % W) * KVQ_WIN_BYTES, kv + (size_t)p * 512);
     memset(ring, 0, sizeof ring);
@@ -445,7 +456,8 @@ static void attn_row(float *o, const float *q, const float *kv, const int *idx, 
  * mut (VK_KV_QUANT_MUT=win|ckv): one scale byte of the packed mirror is changed by one
  * code AFTER the fp32 arm's rows were decoded from the original bytes, and the packed arm
  * must move -- the plain run's "the arms agree" is a test only if this run makes them
- * differ, so a run with the variable set fails where the plain one passes. */
+ * differ: the mut run is that agreement check's power proof, passing only by making the
+ * arms part and failing if the one-code change moves nothing. */
 static void attn_packed(const char *what, int S, int H, int nwin, int ncmp, int cnt, int one, int mut) {
     const int hd = 512;
     const size_t wby = (size_t)nwin * KVQ_WIN_BYTES, cby = (size_t)ncmp * KVQ_CKV_BYTES;
@@ -458,22 +470,26 @@ static void attn_packed(const char *what, int S, int H, int nwin, int ncmp, int 
     int *li = malloc((size_t)S * cnt * 4);
     VkcBuf *qd = NULL, *wd = NULL, *cd = NULL, *wf = NULL, *cf = NULL, *ld = NULL, *sd = NULL, *op = NULL, *of = NULL, *wm = NULL, *cd2 = NULL, *om = NULL;
     if (!pw || !pc || !kw || !kc || !kv || !qq || !sk || !ref || !sc || !li) { CHECK(0, "%s: out of memory", what); goto done; }
-    srand(41);
-    for (int i = 0; i < nwin * hd; i++) kw[i] = (float)((rand() % 2001) - 1000) / 500.0f * ldexpf(1.f, rand() % 7 - 3);
-    for (int i = 0; i < ncmp * hd; i++) kc[i] = (float)((rand() % 2001) - 1000) / 500.0f * ldexpf(1.f, rand() % 7 - 3);
+    kvq_srand(41);
+    for (int i = 0; i < nwin * hd; i++) kw[i] = (float)((int)(kvq_rand() % 2001) - 1000) / 500.0f * ldexpf(1.f, (int)(kvq_rand() % 7) - 3);
+    for (int i = 0; i < ncmp * hd; i++) kc[i] = (float)((int)(kvq_rand() % 2001) - 1000) / 500.0f * ldexpf(1.f, (int)(kvq_rand() % 7) - 3);
     if (nwin > 2) for (int i = 0; i < hd; i++) { kw[hd + i] = 0.0f; kw[2 * hd + i] = (i & 1) ? -448.0f : 448.0f; }
     if (ncmp > 1) for (int i = 0; i < hd; i++) kc[hd + i] = 0.0f;
-    srand(47);
-    for (int i = 0; i < S * H * hd; i++) qq[i] = (float)((rand() % 2001) - 1000) / 500.0f * ldexpf(1.f, rand() % 3 - 1);
-    srand(53);
-    for (int h = 0; h < H; h++) sk[h] = one ? -INFINITY : (float)((rand() % 9) - 4) * 0.5f;
-    srand(59);
+    /* row 0 of both mirrors is the mutation arms' target, so it takes the extreme pattern
+     * as well: its dot ties row 2's and dwarfs every random row's, so its softmax weight
+     * is never 0 on any platform's draws (the ckv row decodes to 432: 6 of scale 72) */
+    for (int i = 0; i < hd; i++) { kw[i] = (i & 1) ? -448.0f : 448.0f; kc[i] = (i & 1) ? -448.0f : 448.0f; }
+    kvq_srand(47);
+    for (int i = 0; i < S * H * hd; i++) qq[i] = (float)((int)(kvq_rand() % 2001) - 1000) / 500.0f * ldexpf(1.f, (int)(kvq_rand() % 3) - 1);
+    kvq_srand(53);
+    for (int h = 0; h < H; h++) sk[h] = one ? -INFINITY : (float)((int)(kvq_rand() % 9) - 4) * 0.5f;
+    kvq_srand(59);
     for (int s = 0; s < S; s++)
         for (int j = 0; j < cnt; j++) {
-            if (one) { li[(size_t)s * cnt + j] = j ? -1 : (int)(rand() % (unsigned)(nwin + ncmp)); continue; }
+            if (one) { li[(size_t)s * cnt + j] = j ? -1 : (int)(kvq_rand() % (unsigned)(nwin + ncmp)); continue; }
             if (s == 0 && j < nwin + ncmp) { li[j] = j; continue; }   /* every row of both, in a row */
-            int r = rand() % 6;
-            li[(size_t)s * cnt + j] = r == 0 ? -1 : r < 3 ? (int)(rand() % (unsigned)nwin) : nwin + (int)(rand() % (unsigned)ncmp);
+            int r = kvq_rand() % 6;
+            li[(size_t)s * cnt + j] = r == 0 ? -1 : r < 3 ? (int)(kvq_rand() % (unsigned)nwin) : nwin + (int)(kvq_rand() % (unsigned)ncmp);
         }
     for (int r = 0; r < nwin; r++) kvq_pack_win(pw + (size_t)r * KVQ_WIN_BYTES, kw + (size_t)r * hd);
     for (int r = 0; r < ncmp; r++) kvq_pack_ckv(pc + (size_t)r * KVQ_CKV_BYTES, kc + (size_t)r * hd);
@@ -571,12 +587,12 @@ static void index_quant(const char *what, int S, int pos_base, int ratio, int IH
     int *t1 = malloc((size_t)topk * 4), *t0 = malloc((size_t)topk * 4);
     VkcBuf *qb = NULL, *wb = NULL, *kq = NULL, *kmq = NULL, *s1 = NULL, *s2 = NULL, *kmut = NULL, *sm2 = NULL;
     if (!q || !w || !k || !kd || !ref || !ref0 || !zero || !km || !t1 || !t0) { CHECK(0, "%s: out of memory", what); goto done; }
-    srand(61);
-    for (int i = 0; i < S * qrow; i++) q[i] = (float)((rand() % 9) - 4) * 0.25f;
-    for (int i = 0; i < S * wrow; i++) w[i] = (float)((rand() % 9) - 4) * 0.5f;
+    kvq_srand(61);
+    for (int i = 0; i < S * qrow; i++) q[i] = (float)((int)(kvq_rand() % 9) - 4) * 0.25f;
+    for (int i = 0; i < S * wrow; i++) w[i] = (float)((int)(kvq_rand() % 9) - 4) * 0.5f;
     for (int i = 0; i < width * ID; i++)
-        k[i] = wide ? (float)((rand() % 33) - 16) / 16.0f * (float)(1 << (rand() % 7))   /* past FP4's grid */
-                    : (float)((rand() % 9) - 4) * 0.25f;
+        k[i] = wide ? (float)((int)(kvq_rand() % 33) - 16) / 16.0f * (float)(1 << (kvq_rand() % 7))   /* past FP4's grid */
+                    : (float)((int)(kvq_rand() % 9) - 4) * 0.25f;
     /* a power of two a token, cycling: the 32 tokens of a block then carry 32 different
      * scale bytes, so a reader that takes a neighbouring token's scales (an off-by-one on
      * the 4 scale bytes at block + 2048 + 4t) cannot agree by coincidence -- equal tokens
@@ -670,7 +686,13 @@ static void index_quant(const char *what, int S, int pos_base, int ratio, int IH
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);   /* a crash's prints must not sit in the buffer */
     host_block_tests();   /* no device needed -- and its failures are not a skip */
-    if (!coli_vk_init("shaders/chain_dsv4.spv") || !coli_vk_available()) return skip("no Vulkan device");
+    /* the argument is the MAIN qmatmul shader: coli_vk_init builds its 4-binding pipeline
+     * from it and derives the siblings beside it, while chain_dsv4 is vkc_init's own load
+     * (found beside whatever main shader this is). chain_dsv4.spv here built the 4-binding
+     * pipeline from an 8-binding module -- RADV tolerated that, MoltenVK refused every
+     * dispatch (all device checks rel_l2 1.0), and the bad pipeline sat in the on-disk
+     * pipeline cache -- keyed by the device only, not the shader -- that other tests read */
+    if (!coli_vk_init("shaders/qmatmul.spv") || !coli_vk_available()) return skip("no Vulkan device");
     if (!vkc_init() || !vkc_dsv4_ready()) {
         coli_vk_shutdown();
         return skip("the chain_dsv4 shader is missing");
