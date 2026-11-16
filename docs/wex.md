@@ -57,6 +57,40 @@ root.
 colibri does not write WEX4 files yet. Wex-WRN2's `wex4/wex4_convert.py` (Python, standard
 library only) writes them: `pack` from safetensors files, `upgrade` in place from a WEX1 file.
 
+## DeepSeek V4 (`deepseek_v4`)
+
+```sh
+c/tools/wex4_verify experts.wex4                    # once: prints COLI_WEX_ROOT=<root>
+COLI_WEX_PATH=experts.wex4 COLI_WEX_ROOT=<root> ./deepseek_v4 ...
+```
+
+| Variable | Default | Effect |
+|---|---|---|
+| `COLI_WEX_PATH` | unset | the container; unset, the store reads the safetensors as before |
+| `COLI_WEX_ROOT` | unset | 64 hex digits: a container with another root is not used; turns `COLI_WEX_VERIFY` on |
+| `COLI_WEX_VERIFY` | on with `COLI_WEX_ROOT`, else off | `1`: each record's SHA-256 against the index at its first read |
+
+What the expert store does with it (`deepseek_v4.c`, the `v4_wex_*` functions):
+
+```
+open      v4_wex_open    read page 0 -> wex4_parse_header -> grid = the model's? root = COLI_WEX_ROOT?
+                         read the index -> wex4_open -> for every expert record: wex4_expert_entry
+                         (any failure: a [v4_wex] line, and the safetensors serve every expert)
+build     build_record   every expert record in the per-matrix slab layout
+                         (w1 w2 w3 scales, then w1 w2 w3 weights: a WEX record's layout)
+bind      v4_wex_bind    every container record must have its expert's shapes and sizes, else none is used
+miss      v4_wex_read    one read of the record (O_DIRECT where there is one) into the slot's slab;
+                         padding must be zero; first read: SHA-256 against the index (COLI_WEX_VERIFY)
+                         failed read, bad padding or bad hash -> that expert from the safetensors
+prefetch                 the advice goes to the container's record instead of the shard ranges
+```
+
+An expert the container does not hold, or one it refused, comes from the safetensors, so the
+checkpoint must stay where it is. The store prints one `[v4_wex]` line at open (the file, how
+many experts it holds, its root, whether the hash check is on) and one at the end (records read,
+bytes, fallbacks, refusals). Only RAW records are read; a container with WNR3 records is not used.
+
 ## Status in colibri
 
-No engine opens a WEX4 container yet. The engine hooks come in the next pull requests of the series.
+DeepSeek V4 reads RAW records from a WEX4 container. Qwen3.8 and DeepSeek V4.1 come in the
+next pull requests of the series; WNR3 records after them.

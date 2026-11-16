@@ -7,6 +7,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### New
 
+- **DeepSeek V4's routed experts from a WEX4 container** (`COLI_WEX_PATH`, `COLI_WEX_ROOT`,
+  `COLI_WEX_VERIFY`): one read of one RAW record per miss instead of six ranges of the shards,
+  the root pinned and each record's SHA-256 checked at its first read when asked; a bad or
+  foreign file, or a record that fails, falls back to the safetensors. Unset, nothing changes.
+  `tests/test_v4_wex4.c` in `make test-c` ([docs/wex.md](docs/wex.md)).
 - **WEX container format headers** (`c/wex_format.h`, `c/wex_palette.h`, `c/wex_neural_rans.h`):
   the WEX1-WEX3 record entry, its validators and the lossless record codecs, header only, with
   `tests/test_wex_format.c` in `make test-c`. No engine uses them yet ([docs/wex.md](docs/wex.md)).

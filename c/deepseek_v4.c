@@ -9534,6 +9534,7 @@ typedef struct {
                         * (#1852): coli_v4_expert_store_add_wait */
     uint8_t *ehit;     /* layers*experts_per_layer: experts routed in the current turn */
     uint8_t *eheat;    /* layers*experts_per_layer: cumulative routing selections, capped 63 */
+    struct V4Wex *wex; /* COLI_WEX_PATH: the WEX4 container the records come from, or NULL */
 } V4ExpertStoreState;
 
 static int set_error(char *error, size_t size, const char *format, ...) {
@@ -9545,6 +9546,283 @@ static int set_error(char *error, size_t size, const char *format, ...) {
     }
     return -1;
 }
+
+/* ---- routed experts from a WEX4 container (docs/wex.md) -------------------
+ * COLI_WEX_PATH=<file>: a WEX4 container of this model's routed experts, one
+ * RAW record per (layer, expert), each the expert's w1, w2, w3 scales then its
+ * w1, w2, w3 weights, padded to a 4096-byte page: the per-matrix slab layout
+ * this store reads a REAP-style checkpoint into. A miss is then one read of one
+ * record (O_DIRECT where there is one) instead of six ranges of the shards.
+ *
+ * At open (v4_wex_open) the header page and the index are validated (wex4.h),
+ * the grid must be the model's and, with COLI_WEX_ROOT=<64 hex digits> set, the
+ * root must be that one. After the records are built (v4_wex_bind) every expert
+ * record of the container must have the shapes and sizes of the safetensors
+ * expert it replaces. Any of these failing, or a container with WNR3 records
+ * (not read by this build), leaves the store on the safetensors, with a line
+ * saying why: the safetensors stay the source of truth and stay open.
+ *
+ * COLI_WEX_VERIFY (default: on when COLI_WEX_ROOT is set, else off): 1 hashes
+ * each record the first time it is read against the index's SHA-256; a record
+ * that fails, or whose read fails, is served from the safetensors, and a failed
+ * hash keeps it there for the rest of the run. Unset COLI_WEX_PATH: nothing
+ * here runs and the store reads the shards as before. */
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include "wex4.h"
+
+typedef struct V4Wex {
+    int fd, dfd;               /* buffered and O_DIRECT descriptors; dfd -1: none */
+    int verify;                /* COLI_WEX_VERIFY */
+    int layers, experts;
+    WexEntry *entries;         /* [layer * experts + expert]; total_bytes 0: not in the container */
+    unsigned char *sha;        /* [cell * 32]: the index's SHA-256 of the record */
+    unsigned char *checked;    /* [cell]: 0 not hashed yet, 1 its hash passed, 2 refused */
+    uint64_t reads, bytes, fallbacks, refused;
+} V4Wex;
+
+static void v4_wex_close(V4Wex *w) {
+    if (!w) return;
+    if (w->dfd >= 0 && w->dfd != w->fd) close(w->dfd);
+    if (w->fd >= 0) close(w->fd);
+    free(w->entries); free(w->sha); free(w->checked); free(w);
+}
+
+static int v4_wex_pread(int fd, void *buffer, size_t length, uint64_t offset) {
+    unsigned char *output = buffer;
+    size_t done = 0;
+    while (done < length) {
+        ssize_t count = pread(fd, output + done, length - done, (off_t)(offset + done));
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) return -1;
+        done += (size_t)count;
+    }
+    return 0;
+}
+
+static int v4_wex_open_direct(const char *path) {
+#if defined(O_DIRECT)
+    return open(path, COMPAT_O_RDONLY | O_DIRECT);
+#elif defined(__APPLE__) || defined(_WIN32)
+    return compat_open_direct(path);
+#else
+    (void)path;
+    return -1;
+#endif
+}
+
+/* COLI_WEX_ROOT: 0 unset, 1 a root (in pin), -1 not 64 hex digits */
+static int v4_wex_pin(unsigned char pin[32]) {
+    const char *text = getenv("COLI_WEX_ROOT");
+    if (!text || !*text) return 0;
+    if (strlen(text) != 64) return -1;
+    for (int i = 0; i < 64; i++) {
+        int c = text[i], v = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10
+                           : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+        if (v < 0) return -1;
+        if (i & 1) pin[i / 2] |= (unsigned char)v; else pin[i / 2] = (unsigned char)(v << 4);
+    }
+    return 1;
+}
+
+/* The container COLI_WEX_PATH names, validated, or NULL (the safetensors serve). */
+static V4Wex *v4_wex_open(int layers, int experts) {
+    const char *path = getenv("COLI_WEX_PATH");
+    if (!path || !*path) return NULL;
+    V4Wex *w = calloc(1, sizeof(*w));
+    unsigned char *page = malloc(WEX4_PAGE), *index = NULL, pin[32];
+    const char *why = NULL;
+    char detail[160] = "", root[65];
+    Wex4Header h;
+    Wex4View view;
+    struct stat file;
+    int rc, pinned = v4_wex_pin(pin);
+    if (w) w->fd = w->dfd = -1;
+    if (!w || !page) { why = "cannot be read: out of memory"; goto refuse; }
+    w->layers = layers; w->experts = experts;
+    w->fd = open(path, COMPAT_O_RDONLY);
+    if (w->fd < 0) { why = "cannot be opened"; snprintf(detail, sizeof detail, " (%s)", strerror(errno)); goto refuse; }
+    if (fstat(w->fd, &file) || file.st_size < (off_t)WEX4_PAGE ||
+        v4_wex_pread(w->fd, page, WEX4_PAGE, 0)) { why = "has no header page"; goto refuse; }
+    if ((rc = wex4_parse_header(page, (uint64_t)file.st_size, &h))) {
+        uint32_t magic = wex_read_u32_le(page);
+        if (magic == WEX_MAGIC_V1 || magic == WEX_MAGIC_V2 || magic == WEX_MAGIC_V3)
+            why = "is a WEX1-WEX3 container, not WEX4";
+        else { why = "is not a valid WEX4 container"; snprintf(detail, sizeof detail, " (header page: wex4.h error %d)", rc); }
+        goto refuse;
+    }
+    for (int i = 0; i < 32; i++) snprintf(root + 2 * i, 3, "%02x", h.root[i]);
+    if (h.layers != (uint32_t)layers || h.experts != (uint32_t)experts) {
+        why = "was written for another model";
+        snprintf(detail, sizeof detail, " (a grid of %u x %u experts, the model has %d x %d)", h.layers, h.experts,
+                 layers, experts);
+        goto refuse;
+    }
+    if (pinned < 0) { why = "is not used: COLI_WEX_ROOT is not 64 hex digits"; goto refuse; }
+    if (pinned && memcmp(pin, h.root, 32)) {
+        why = "is not the pinned COLI_WEX_ROOT";
+        snprintf(detail, sizeof detail, " (its root is %s)", root);
+        goto refuse;
+    }
+    size_t index_len = (size_t)wex4_align(h.index_bytes);
+    if (!(index = malloc(index_len ? index_len : 1)) ||
+        (index_len && v4_wex_pread(w->fd, index, index_len, h.index_offset))) { why = "has an unreadable index"; goto refuse; }
+    if ((rc = wex4_open(&h, index, index_len, &view))) {
+        why = "is not a valid WEX4 container";
+        snprintf(detail, sizeof detail, " (index: wex4.h error %d)", rc);
+        goto refuse;
+    }
+    size_t cells = (size_t)layers * experts;
+    w->entries = calloc(cells, sizeof(*w->entries));
+    w->sha = malloc(cells * 32);
+    w->checked = calloc(cells, 1);
+    if (!w->entries || !w->sha || !w->checked) { why = "cannot be read: out of memory"; goto refuse; }
+    int held = 0;
+    for (uint32_t r = 0; r < h.records; r++) {
+        Wex4Record record;
+        wex4_get_record(&view, r, &record);
+        if (!(record.flags & WEX4_REC_EXPERT)) continue;   /* other tensors: not this store's */
+        if (record.codec != WEX4_CODEC_RAW) {
+            why = "holds WNR3 records, which this build does not read (RAW records only)";
+            goto refuse;
+        }
+        size_t cell = (size_t)(record.owner >> 16) * experts + (record.owner & 0xffffu);   /* bounded by wex4_open */
+        if (wex4_expert_entry(&view, r, &w->entries[cell])) { why = "has an invalid expert record"; goto refuse; }
+        memcpy(w->sha + cell * 32, record.sha, 32);
+        held++;
+    }
+    const char *verify = getenv("COLI_WEX_VERIFY");
+    w->verify = verify && *verify ? atoi(verify) != 0 : pinned > 0;
+    w->dfd = v4_wex_open_direct(path);
+    fprintf(stderr, "[v4_wex] WEX4 container %s: %d of %zu experts, root %s%s; first-read SHA-256 %s\n", path,
+            held, cells, root, pinned ? " (pinned)" : "", w->verify ? "on" : "off");
+    free(index); free(page);
+    return w;
+refuse:
+    fprintf(stderr, "[v4_wex] %s %s%s; the experts come from the safetensors\n", path, why, detail);
+    free(index); free(page);
+    v4_wex_close(w);
+    return NULL;
+}
+
+/* After build_record: every expert record of the container must be the expert
+ * it replaces (shapes, sizes, the per-matrix slab layout), else no record is
+ * used. 0 = bound, -1 = the container was dropped. */
+static int v4_wex_bind(V4ExpertStoreState *state) {
+    V4Wex *w = state->wex;
+    if (!w) return 0;
+    for (int layer = 0; layer < state->layers; layer++)
+        for (int expert = 0; expert < state->experts_per_layer; expert++) {
+            size_t cell = (size_t)layer * state->experts_per_layer + expert;
+            const WexEntry *e = &w->entries[cell];
+            const V4ExpertRecord *record = &state->records[cell];
+            if (!e->total_bytes) continue;
+            uint64_t scales = 0, weights = 0;
+            int same = !record->gguf && record->per_matrix;
+            for (int m = 0; same && m < V4_MATRIX_COUNT; m++) {
+                const ColiSafetensorsTensor *s = record->scale[m], *t = record->weight[m];
+                same = e->scale_shapes[m][0] == s->shape[0] && e->scale_shapes[m][1] == s->shape[1] &&
+                       e->weight_shapes[m][0] == t->shape[0] && e->weight_shapes[m][1] == t->shape[1] &&
+                       e->scale_offsets[m] == scales;
+                scales += record->m_scale_bytes[m];
+            }
+            for (int m = 0; same && m < V4_MATRIX_COUNT; m++) {
+                same = e->weight_offsets[m] == scales + weights;
+                weights += record->m_weight_bytes[m];
+            }
+            if (!same || e->scale_bytes != scales || e->weight_bytes != weights ||
+                record->record_bytes != scales + weights ||
+                e->total_bytes > record->record_bytes + COLI_V4_EXPERT_SLAB_SLACK) {
+                fprintf(stderr, "[v4_wex] layer %d expert %d of the container is not the checkpoint's expert "
+                                "(shapes or sizes differ); the experts come from the safetensors\n", layer, expert);
+                v4_wex_close(w);
+                state->wex = NULL;
+                return -1;
+            }
+        }
+    return 0;
+}
+
+/* The container's entry when it serves this record, else NULL. */
+static const WexEntry *v4_wex_entry(const V4ExpertStoreState *state, const V4ExpertRecord *record) {
+    const V4Wex *w = state->wex;
+    if (!w) return NULL;
+    size_t cell = (size_t)(record - state->records);
+    const WexEntry *e = &w->entries[cell];
+    return e->total_bytes && __atomic_load_n(&w->checked[cell], __ATOMIC_ACQUIRE) != 2 ? e : NULL;
+}
+
+/* One record from the container into the slot's slab, at its first byte.
+ * 0 = served; 1 = not (not in the container, refused, or the read or its hash
+ * failed): the caller reads the safetensors. An aligned slab (the hot store's,
+ * record_bytes + COLI_V4_EXPERT_SLAB_SLACK) takes the whole stored record; any
+ * other slab holds record_bytes, so only those are read and the hash is fed
+ * the zero padding a RAW record ends with. */
+static int v4_wex_read(V4ExpertStoreState *state, const V4ExpertRecord *record, V4ExpertSlot *slot) {
+    V4Wex *w = state->wex;
+    const WexEntry *e = w ? v4_wex_entry(state, record) : NULL;
+    if (!e) return 1;
+    size_t cell = (size_t)(record - state->records);
+    size_t decoded = (size_t)record->record_bytes, stored = e->total_bytes;
+    size_t length = slot->aligned_slab ? stored : decoded;
+    unsigned char *dst = slot->slab;
+    int ok = 0;
+    if (w->dfd >= 0 && slot->aligned_slab && WEX_IS_ALIGNED(dst, WEX4_PAGE))
+        ok = !v4_wex_pread(w->dfd, dst, stored, e->file_offset);
+    if (!ok) ok = !v4_wex_pread(w->fd, dst, length, e->file_offset);
+    for (size_t i = decoded; ok && i < length; i++) ok = !dst[i];   /* a RAW record's padding is zero */
+    if (ok && w->verify && !__atomic_load_n(&w->checked[cell], __ATOMIC_ACQUIRE)) {
+        static const unsigned char zero[WEX4_PAGE];
+        unsigned char digest[32];
+        Wex4Sha sha;
+        wex4_sha_init(&sha);
+        wex4_sha_update(&sha, dst, length);
+        for (size_t left = stored - length; left;) {
+            size_t n = left < sizeof zero ? left : sizeof zero;
+            wex4_sha_update(&sha, zero, n);
+            left -= n;
+        }
+        wex4_sha_final(&sha, digest);
+        if (memcmp(digest, w->sha + cell * 32, 32)) {
+            __atomic_store_n(&w->checked[cell], (unsigned char)2, __ATOMIC_RELEASE);
+            __atomic_fetch_add(&w->refused, UINT64_C(1), __ATOMIC_RELAXED);
+            fprintf(stderr, "[v4_wex] layer %zu expert %zu: the record does not match its SHA-256 in the index; "
+                            "this expert comes from the safetensors from now on\n",
+                    cell / (size_t)w->experts, cell % (size_t)w->experts);
+            return 1;
+        }
+        __atomic_store_n(&w->checked[cell], (unsigned char)1, __ATOMIC_RELEASE);
+    }
+    if (!ok) {
+        __atomic_fetch_add(&w->fallbacks, UINT64_C(1), __ATOMIC_RELAXED);
+        return 1;
+    }
+    __atomic_fetch_add(&w->reads, UINT64_C(1), __ATOMIC_RELAXED);
+    __atomic_fetch_add(&w->bytes, (uint64_t)stored, __ATOMIC_RELAXED);
+    return 0;
+}
+
+static void v4_wex_report(const V4Wex *w) {
+    if (!w) return;
+    fprintf(stderr, "[v4_wex] reads=%llu bytes=%llu fallbacks=%llu refused=%llu\n",
+            (unsigned long long)w->reads, (unsigned long long)w->bytes,
+            (unsigned long long)w->fallbacks, (unsigned long long)w->refused);
+}
+
+#ifdef COLI_V4_TEST_HOOKS
+/* tests/test_v4_wex4: whether the store reads a container, and its counters
+ * (reads, bytes, fallbacks, refused). */
+int coli_v4_test_wex(ColiExpertStore *store, uint64_t counters[4]) {
+    const V4ExpertStoreState *state = store ? store->state : NULL;
+    const V4Wex *w = state ? state->wex : NULL;
+    if (counters) {
+        counters[0] = w ? w->reads : 0; counters[1] = w ? w->bytes : 0;
+        counters[2] = w ? w->fallbacks : 0; counters[3] = w ? w->refused : 0;
+    }
+    return w != NULL;
+}
+#endif
 
 static int compare_tensors(const void *left, const void *right) {
     const ColiSafetensorsTensor *const *a = left;
@@ -9640,8 +9918,10 @@ static int build_record(V4ExpertStoreState *state, int layer, int expert,
     int weight_range_contiguous = contiguous_group(record->weight, state->index,
                                       &weight_shard, &record->weight_offset,
                                       &record->weight_bytes) == 0;
-    if (!scale_range_contiguous || !weight_range_contiguous) {
-        /* REAP-style packed checkpoint: fall back to per-matrix reads. */
+    if (state->wex || !scale_range_contiguous || !weight_range_contiguous) {
+        /* REAP-style packed checkpoint: fall back to per-matrix reads. A WEX4
+         * container's records are this layout too, so with one every record is
+         * per-matrix, whichever source serves it. */
         record->per_matrix = 1;
         uint64_t per_matrix_bytes = 0;
         for (int matrix = 0; matrix < V4_MATRIX_COUNT; matrix++) {
@@ -9943,7 +10223,9 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
         struct timespec disk_t0;
         clock_gettime(CLOCK_MONOTONIC, &disk_t0);
         int read_failed = 0;
-        if (record->per_matrix) {
+        if (!v4_wex_read(state, record, slot)) {
+            /* COLI_WEX_PATH served it */
+        } else if (record->per_matrix) {
             uint64_t scale_cursor = 0;
             for (int matrix = 0; matrix < V4_MATRIX_COUNT; matrix++) {
                 if (coli_st_read_at_streaming_rep(
@@ -10054,6 +10336,12 @@ static int prefetch(ColiExpertStore *store, const ColiExpertKey *keys,
     for (size_t i = 0; i < count; i++) {
         V4ExpertRecord *record = get_record(state, keys[i]);
         if (!record) continue;
+        const WexEntry *wex = v4_wex_entry(state, record);
+        if (wex) {   /* the container's record, not the shards' ranges */
+            posix_fadvise(state->wex->fd, (off_t)wex->file_offset, (off_t)wex->total_bytes, POSIX_FADV_WILLNEED);
+            accepted++;
+            continue;
+        }
         V4ExpertSlot *slot = indexed_expert_slot(state, keys[i]);
         int resident = slot && slot->slab && slot->expert == keys[i].expert;
         if (resident) continue;
@@ -10081,12 +10369,19 @@ static int prefetch(ColiExpertStore *store, const ColiExpertKey *keys,
     pthread_mutex_unlock(&state->mutex);
     if (candidates && !coli_st_prefetch_many(
             state->index, shards, offsets, lengths, ranges))
-        accepted = candidates;
+        accepted += candidates;   /* after any container records advised above */
     free(lengths); free(offsets); free(shards);
 #else
     for (size_t i = 0; i < count; i++) {
         V4ExpertRecord *record = get_record(state, keys[i]);
         if (!record) continue;
+        const WexEntry *wex = v4_wex_entry(state, record);
+        if (wex) {   /* the container's record, not the shards' ranges */
+            if (!posix_fadvise(state->wex->fd, (off_t)wex->file_offset, (off_t)wex->total_bytes,
+                               POSIX_FADV_WILLNEED))
+                accepted++;
+            continue;
+        }
         int rep = coli_st_expert_route(keys[i].layer, keys[i].expert);
         int all_weights_prefetched = 1;
         int matrix_count = record->per_matrix ? V4_MATRIX_COUNT : 1;
@@ -10156,6 +10451,8 @@ static void destroy(ColiExpertStore *store) {
                 free(state->slots[i].slab);
         pthread_cond_destroy(&state->load_ready);
         pthread_mutex_destroy(&state->mutex);
+        v4_wex_report(state->wex);
+        v4_wex_close(state->wex);
         coli_st_index_close(state->index);
         free(state->records);
         free(state->slots);
@@ -10207,6 +10504,7 @@ int coli_deepseek_v4_expert_store_open(
     if (!options->skip_mirror_setup)
         coli_st_mirror_setup(state->index, options->model_dir,
                              options->experts_per_layer);
+    state->wex = v4_wex_open(options->layers, options->experts_per_layer);   /* COLI_WEX_PATH */
     size_t record_count = (size_t)state->layers * state->experts_per_layer;
     state->records = malloc(record_count * sizeof(*state->records)); /* build_record zeroes each */
     if (!state->records) {
@@ -10239,6 +10537,7 @@ int coli_deepseek_v4_expert_store_open(
         if (ilv) fprintf(stderr, "v4_gguf experts interleaved by 16 rows on %d of %d layers "
                                  "(COLI_V4_ROWS16=0: the file's rows)\n", ilv, state->layers);
     }
+    v4_wex_bind(state);   /* drops the container when a record is not the checkpoint's expert */
     state->slots_per_layer = (int)(options->cache_bytes /
         ((uint64_t)state->layers * state->record_bytes));
     int minimum_slots = state->experts_per_layer < 6
@@ -10307,6 +10606,7 @@ fail:
     free(state->lru_tail);
     free(state->ehit);
     free(state->eheat);
+    v4_wex_close(state->wex);
     coli_st_index_close(state->index);
     pthread_cond_destroy(&state->load_ready);
     pthread_mutex_destroy(&state->mutex);
@@ -10668,6 +10968,7 @@ static int v4_read_expert_record(V4ExpertStoreState *state,
      * puts the record at the slab's first byte */
     slot->data_shift = 0;
     slot->weight_shift = 0;
+    if (!v4_wex_read(state, record, slot)) return 0;   /* COLI_WEX_PATH serves it */
     if (record->gguf) {
         int used_direct = 0, used_fallback = 0;
         uint64_t cursor = 0;
@@ -11687,7 +11988,8 @@ int COLI_V4_ROWS16_STORE_OPEN(
         coli_st_streaming_direct_available(
             state->index, state->records[0].weight_shard);
     fprintf(stderr, "v4_ssd_io mode=%s fallback=buffered-pread\n",
-            direct_io ? "direct-aligned" : "buffered-pread");
+            state->wex ? (state->wex->dfd >= 0 ? "wex4-direct-aligned" : "wex4-buffered")
+                       : direct_io ? "direct-aligned" : "buffered-pread");
     int minimum_slots = state->experts_per_layer < 6
         ? state->experts_per_layer : 6;
     int maximum_pins = state->slots_per_layer - minimum_slots;
