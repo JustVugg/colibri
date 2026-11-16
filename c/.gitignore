@@ -19,6 +19,8 @@ COLI_V4_UNIT_*.o
 expert_store_registry.o
 deepseek_v4
 tools/bench_dsv4_head_batch
+tools/wex4_verify
+tools/wex_decode_bench
 test_expert_store_registry
 tests/test_st_mirror
 tests/test_st_pread
