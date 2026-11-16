@@ -1,0 +1,63 @@
+C22 verdict — IQ2_S/IQ3_S decode-once microbenchmark (2026-11-16)
+
+Bench: c22_iq2s_iq3s_bench.c (engine entry points called directly; shapes are the
+IQ3 file's: gate/up I=2048 O=512 IQ2_S, down I=512 O=2048 IQ3_S; S sweep
+1/4/8/38/137/411/455 per C14). Runs saved as phaseC22_bench_omp1.jsonl and
+phaseC22_bench_omp6.jsonl (OMP_NUM_THREADS=1 and =6).
+
+Bit-exactness prechecks (maxdiff vs the current gq_row_all path, random blocks,
+S=2, 8 rows x 2 activation rows):
+  dec1 candidate   : 0.000e+00 both types, both thread counts
+  fused candidate  : 0.000e+00 both types, both thread counts
+  XXS calibration cells: 0.000e+00 (the shipped C18 kernels vs rowall)
+
+PHASE 1 — dec1 (the C18 prefill decode-once route) is a NULL:
+  speedup_pot (rowall / dec1, single thread), gate_up IQ2_S:
+    S=1: 1.02  S=4: 1.00  S=8: 1.00  S=38: 1.00  S=411: 0.99
+  down IQ3_S: 1.06 / 1.03 / 1.02 / 1.01 / 0.98 — same at 6 threads.
+  Reason: the generic path IQ2_S/IQ3_S take on ARM (gq_row_all fallthrough ->
+  gq_unpack_row once per weight row into the thread buffer, then gq_dot_i8 per
+  activation row) is ALREADY structurally decode-once at S>1. It runs 51-52
+  GFLOPS/thread (IQ2_S) and 66-71 (IQ3_S) at prefill-shaped S — the same class
+  as C18's dec1 kernels (52 / 76-79 on this machine state). The unpack is fully
+  amortized: unpack share 0.5-0.8% at S=411-455. C22 dec1 for prefill: dropped.
+  (Recorded as negative evidence; do not spend engine time here.)
+
+THE REAL GAP — S==1 (the decode regime, one activation row per active expert):
+  generic path at S=1: 13.2-13.5 GFLOPS (IQ2_S), 14.0 (IQ3_S), with 62-66% of
+  the time being the buffer unpack+store+reload (a whole weight row decoded for
+  one dot). The C18 fused XXS kernels hold 36/24 GFLOPS flat in S because they
+  never leave registers. This is the mechanism of C21's 0.74x decode regression:
+  at decode, IQ2_XXS/IQ3_XXS experts run fused (35.4/23.9 measured via rowall at
+  S=1), the IQ3 file's IQ2_S/IQ3_S experts run generic (13.2/14.0).
+
+PHASE 2 — fused register-resident SB decoders for IQ2_S/IQ3_S (the actual C22
+proposal, mirroring gq_arm_sb_iq2_xxs/iq3_xxs: per 32-element sub-block, grid
+gathers + sign bytes in registers, joined to gq_arm_dot2; floats follow
+gq_dot_i8's NEON order exactly; C22_SIGNS8 256x8 +-1 table for the sign bytes):
+  IQ2_S gate/up: fused 29.5-29.6 GFLOPS flat in S (vs generic 13.2 at S=1)
+                 -> fused_s1_gain 2.20x-2.23x (both thread counts)
+  IQ3_S down   : fused 24.1-24.4 flat (vs generic 14.0 at S=1)
+                 -> fused_s1_gain 1.72x
+  Calibration  : IQ2_XXS fused 36.3-36.7 flat, IQ3_XXS 24.5-25.3 flat — matches
+                 C18's 36/24; dec1 XXS 51.3/66-70 at large S matches C18's
+                 52/76-79 (same machine, same day).
+  Crossover    : fused wins ONLY at S=1. At S=4 generic already edges fused
+                 (IQ2_S 30.2 vs 29.5; IQ3_S 35.7 vs 24.2). Engine insertion must
+                 gate fused to a->S == 1 exactly, mirroring the C18 split (fused
+                 at S==1, dec1 at a->S > 1); S>1 keeps the generic path, which
+                 is already dec1-class there.
+
+Decode-regime wall-clock check (gq_matmul, 6 threads, S=1, whole-matrix): the
+current IQ2_S/IQ3_S path reaches 28.8 (gate/up) / 30.2 (down) GFLOPS wall vs the
+fused XXS path's 56.6 / 44.9 — the per-thread 2.2x/1.7x fused gain is the
+recovery lever for C21's 0.74x decode.
+
+VERDICT: C22 phase 1+2 PASS with a route correction.
+  - dec1 for IQ2_S/IQ3_S prefill: NULL, recorded negative, not implemented.
+  - Fused S==1 SB decoders: PASS (bit-exact, 2.20x-2.23x / 1.72x at S=1).
+    Dev route: insert c22_sb_iq2_s / c22_sb_iq3_s into gq_row_all's ARM block
+    behind the existing fused arm, gated a->S == 1 (and I % 256 == 0), generic
+    fallthrough for every other S. Expected effect: recover most of the C21
+    decode gap (0.74x -> ~0.9-1.0x of IQ2) while keeping IQ3's probe quality.
+    TTFT unaffected (prefill keeps the generic path).
