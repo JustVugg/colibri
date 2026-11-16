@@ -1,0 +1,225 @@
+# correctness.txt: the checks of this change (the host pool holds the residents' RAM copies too)
+# Lines taken from the runs' logs as printed. The code was measured as local commits 93d20516 (on dev fd7ed68a) and
+# 5ab88509 (on dev plus the routed-copy commit as measured); see the commit message. One Colab T4, 13 November 2026.
+
+## make cuda-chain-check and make cuda-test: NOT run on this change
+## This change does not touch cuda_chain.cu (c/qwen36_cuda_chain.h changes in a comment only). On this T4 (sm_75)
+## cuda-chain-check has three FAIL on dev itself; the lines, from the run on dev fd7ed68a:
+  FAIL 300 rows: the up projection and the mix in one pass, those of the two ops to the bit
+  FAIL 100 rows: the up projection and the mix in one pass, those of the two ops to the bit
+  FAIL the counters saw the frames, ops and matmuls
+test_cuda_chain: 3 failure(s)
+
+## make -C c check on macOS arm64, this change's code alone on dev as local commit 93d20516 (the end of the log)
+Ran 3290 tests in 273.697s
+
+OK (skipped=582)
+  nothing running — no serve on port 9123, no SERVE engines
+rc=0
+## make -C c check, this change on the routed-copy commit before the review's change (the published code's check is
+## further down):
+Ran 3290 tests in 275.650s
+OK (skipped=582)
+rc=0
+
+## tests/cuda_tier_engines.sh (the other engines), this change's code alone on dev as local commit 93d20516:
+# On the Tesla T4 (sm_75), local commit 93d20516 in a fresh worktree, `PY=python3 bash tests/cuda_tier_engines.sh`: rc=0,
+# 42 OK lines and the last line, as printed:
+OK glm53 decode: tokens = CPU, device 56
+OK glm53 evict: tokens = CPU, device 16
+OK glm53 chain decode: tokens = CPU, max |logit diff| 4.77e-07 of 1.82e+00, 9 chain forwards
+OK glm53 chain 100-token prompt, 32-bit trunk: tokens = CPU, max |logit diff| 7.15e-07 of 1.97e+00, 5 chain forwards
+OK glm53 chain 100-token prompt, 4-bit trunk, exact GEMMs: tokens = CPU, max |logit diff| 5.96e-07 of 1.89e+00, 5 chain forwards
+OK glm53 chain 100-token prompt, 4-bit trunk, tensor cores: tokens = CPU, max |logit diff| 6.05e-04 of 1.89e+00, 5 chain forwards
+OK glm53 chain prefill chunks of 7, one cache slot: tokens = CPU, max |logit diff| 4.79e-07 of 1.89e+00, 19 chain forwards
+OK glm53 chain chunks of 3: tokens = CPU, max |logit diff| 5.96e-07 of 1.97e+00, 38 chain forwards
+OK qwen36 GGUF dense, DeltaNet qkv and gate in two types, a 12-row step: tokens = CPU, max |logit diff| 2.47e-02 of 3.14e+00, 2 in_proj as two tensors, the chain on
+OK qwen36 GGUF dense, DeltaNet qkv and gate in two types, chunks of 5: tokens = CPU, max |logit diff| 4.77e-07 of 3.14e+00, 2 in_proj as two tensors, the chain on
+OK qwen36 GGUF hybrid steps: tokens = CPU (48 hybrid layer steps)
+OK qwen36 GGUF hybrid steps, each signal sent at once: tokens = CPU (48 hybrid layer steps)
+OK qwen36 GGUF the host's word lost: tokens = CPU (0 hybrid layer steps)
+OK deepseek_v41 cap=1: output = CPU, oracle passed, device 287
+OK deepseek_v41 cap=2: output = CPU, oracle passed, device 287
+OK deepseek_v41 cap=8: output = CPU, oracle passed, device 287
+OK deepseek_v41 GGUF: tokens = CPU, device 228, 68 dense matrices on the card
+OK colibri GGUF chain decode: tokens = CPU, max |logit diff| 8.05e-07 of 1.81e+00, 8 chain forwards, device 90
+OK colibri GGUF chain decode, cap=1: tokens = CPU, max |logit diff| 8.05e-07 of 1.81e+00, 8 chain forwards, device 90
+OK colibri GGUF chain DSA top-4, the dense part at 8 bits (the serve's: the indexer's F32 head weights in int8): tokens = CPU, max |logit diff| 7.75e-07 of 1.46e+00, 8 chain forwards, device 282
+OK colibri GGUF chain 40-token prompt: tokens = CPU, max |logit diff| 7.75e-07 of 1.82e+00, 8 chain forwards, device 294
+OK colibri GGUF chain 40-token prompt in chunks of 3: tokens = CPU, max |logit diff| 7.75e-07 of 1.82e+00, 8 chain forwards, device 294
+OK colibri GGUF chain DSA top-4: tokens = CPU, max |logit diff| 7.15e-07 of 1.90e+00, 8 chain forwards, device 90
+OK colibri GGUF chain DSA top-4, 40-token prompt in chunks of 5: tokens = CPU, max |logit diff| 1.39e-06 of 1.69e+00, 8 chain forwards, device 282
+OK colibri GGUF chain DSA_FORCE: tokens = CPU, max |logit diff| 8.94e-07 of 1.82e+00, 8 chain forwards, device 294
+OK colibri GGUF chain 40-token prompt, tensor cores: tokens = CPU, max |logit diff| 1.39e-06 of 1.69e+00, 8 chain forwards, device 282
+OK colibri GGUF chain DSA top-4 over shared indexer layers (layers 2 and 3 reuse layer 1's selection): tokens = CPU, max |logit diff| 7.75e-07 of 1.77e+00, 8 chain forwards, device 90
+OK colibri GGUF chain DSA top-4 over shared indexer layers, 40-token prompt in chunks of 5: tokens = CPU, max |logit diff| 8.34e-07 of 1.73e+00, 7 chain forwards, device 288
+OK colibri int4 container dense on the card: tokens = CPU, max |logit diff| 1.22e-06 of 2.03e+00, 41 tensors on the card, 0 expert group calls
+OK colibri int4 container dense on the card, 40-token prompt: tokens = CPU, max |logit diff| 1.34e-06 of 1.86e+00, 41 tensors on the card, 0 expert group calls
+OK colibri int4 container dense and every expert on the card: tokens = CPU, max |logit diff| 1.16e-06 of 2.03e+00, 89 tensors on the card, 40 expert group calls
+OK colibri int4 container dense and every expert on the card, 40-token prompt: tokens = CPU, max |logit diff| 1.16e-06 of 1.86e+00, 89 tensors on the card, 40 expert group calls
+OK mimo dense bits 32: tokens = CPU, device 260, 16 dense matrices on the card
+OK mimo dense bits 0: tokens = CPU, device 260, 0 dense matrices on the card
+OK kimi_k3 GGUF all: tokens = CPU, logits within 2.0e-06 of the largest, device 120
+OK kimi_k3 GGUF budget of two: tokens = CPU, logits within 2.0e-06 of the largest, device 120
+OK kimi_k3 GGUF host pool: tokens = CPU, logits within 2.0e-06 of the largest, device 120
+OK glm53 dev2 decode: tokens = CPU, second device Tesla T4 (the same card): resident 2 (budget 14, 54.0 KiB of 13.96 GiB), 87 rows in 7 batches (1 beside prompt steps), uploads 2, 9.1 ms
+OK glm53 dev2 evict: tokens = CPU, second device Tesla T4 (the same card): resident 1 (budget 1, 27.0 KiB of 13.96 GiB), 44 rows in 4 batches (1 beside prompt steps), uploads 1, 9.2 ms
+OK glm53 dev2 fault: tokens = CPU, second device Tesla T4 (the same card): resident 0 (budget 0, 0.0 KiB of 13.96 GiB), 80 rows in 1 batches (1 beside prompt steps), uploads 2, 8.7 ms (stopped)
+OK deepseek_v41 dev2 decode: output = CPU, oracle passed, second device Tesla T4 (the same card): resident 46 (budget 46, 690.0 KiB of 13.96 GiB), 211 rows in 48 batches (0 beside prompt steps), uploads 46, 2.7 ms
+OK deepseek_v41 dev2 fault: output = CPU, oracle passed, second device Tesla T4 (the same card): resident 0 (budget 0, 0.0 KiB of 13.96 GiB), 17 rows in 1 batches (0 beside prompt steps), uploads 46, 0.2 ms (stopped)
+fails: 0
+
+## the tests of this change on the fake backend (macOS arm64, local commit 93d20516; there the chain test's new section is M)
+OK test_qwen36_tier_host_pool: after promotions the host pool is the non-residents again, every page-lock released at the exit; a per-row container's pairs join it; memory back from the coldest residents, or by page; every expert pooled, the residents too, when the warm start says so
+OK test_qwen36_cuda_chain: the CUDA chain gives the CPU path's logits; host and device state agree; a lost device rebuilds; the host pool follows before a large prompt chunk only; the promotions' brake only with a history
+OK test_qwen36_tier_int8_engine
+qwen36 tier gguf: ok
+host pool at the warm start (test_qwen36_tier_int8_engine)
+  ok   planar, the chain on, two of four on the card: every expert pooled, the residents too
+  ok   planar: the follow keeps the residents in the pool
+  ok   planar, the chain off: only the two experts off the card pooled
+  ok   planar, every expert on the card: none pooled
+  ok   planar, page-locks for three of four: the two experts off the card first, then one resident
+  ok   per-row pairs, the chain on, two of four on the card: every expert pooled, the residents too
+  ok   per-row pairs: the follow keeps the residents in the pool
+  ok   per-row pairs, the chain off: only the two experts off the card pooled
+  ok   per-row pairs, every expert on the card: none pooled
+  ok   per-row pairs, page-locks for three of four: the two experts off the card first, then one resident
+the chain's staged table (test_qwen36_cuda_chain)
+  ok   before the moves: no layer goes to the host's step
+  ok   every expert pooled: the follow did nothing, the layers stay on the device
+  ok   the non-residents only (a 40-row chunk does not follow): a layer holding a victim goes to the host's step whole
+
+## counter-proofs: each break turns at least one test red (logs 04-* of the task; FAIL lines counted by test)
+## a  the follow ignores the flag:               host_pool 4, int8_engine 5, cuda_chain 1
+## b  qt_chain_host_all page-locks nothing:      host_pool 8, int8_engine 5, cuda_chain 3
+## c1 the warm start never pools all:            int8_engine 5
+## c2 the warm start always pools all:           int8_engine 5
+## d  qt_shutdown keeps the flag:                host_pool 2
+## e  the residents inside the loop (October's order): int8_engine 5; with the flag too: int8_engine 3
+
+## the engine's report lines, measure A (this change alone on dev), the first run of each version (the four runs print the same counts)
+### dev fd7ed68a
+[qtier] host pool: 3635 experts of the RAM cache page-locked for the device to copy a prompt chunk's experts from (COLI_CUDA_HOST_POOL=0 off)
+[qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 6605 in VRAM -- 9.2 s
+[bench] CUDA ready in 19.61 s; text 6182 tokens; lengths 64,512,64; gen 32; each length from an empty state
+[chain] qwen36: 83 prompt layer steps staged the host pool's experts (12.41 GB copied over the bus)
+[chain] qwen36: the host pool followed the residents before 1 prompt chunks: 130 experts joined it, 126 left it, 78.9 ms
+[bench] peak RSS 19.56 GB
+[qtier] host pool: 3639 experts (6.00 GB of the RAM cache) page-locked for the device's copies
+### this change alone
+[qtier] host pool: 10240 experts of the RAM cache page-locked for the device to copy a prompt chunk's experts from (6605 of them the residents', so an expert that leaves the card is in it; COLI_CUDA_HOST_POOL=0 off)
+[qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 6605 in VRAM -- 11.3 s
+[bench] CUDA ready in 21.71 s; text 6182 tokens; lengths 64,512,64; gen 32; each length from an empty state
+[chain] qwen36: 120 prompt layer steps staged the host pool's experts (17.98 GB copied over the bus)
+[bench] peak RSS 19.62 GB
+[qtier] host pool: 10240 experts (16.88 GB of the RAM cache) page-locked for the device's copies
+
+## the same, measure B (on the routed-copy commit)
+### dev plus the routed-copy commit
+[qtier] host pool: 3635 experts of the RAM cache page-locked for the device to copy a prompt chunk's experts from (COLI_CUDA_HOST_POOL=0 off)
+[qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 6605 in VRAM -- 9.4 s
+[bench] CUDA ready in 19.83 s; text 6182 tokens; lengths 64,512,64; gen 32; each length from an empty state
+[chain] qwen36: 83 prompt layer steps staged the host pool's experts, 43 of them only those their rows route to (8.09 GB copied over the bus)
+[chain] qwen36: the host pool followed the residents before 1 prompt chunks: 130 experts joined it, 126 left it, 74.6 ms
+[bench] peak RSS 19.57 GB
+[qtier] host pool: 3639 experts (6.00 GB of the RAM cache) page-locked for the device's copies
+### the same plus this change
+[qtier] host pool: 10240 experts of the RAM cache page-locked for the device to copy a prompt chunk's experts from (6605 of them the residents', so an expert that leaves the card is in it; COLI_CUDA_HOST_POOL=0 off)
+[qtier] warmstart (parallel): all 10240 experts in RAM (planar int4, the only copy), 6605 in VRAM -- 11.6 s
+[bench] CUDA ready in 22.11 s; text 6182 tokens; lengths 64,512,64; gen 32; each length from an empty state
+[chain] qwen36: 120 prompt layer steps staged the host pool's experts, 80 of them only those their rows route to (9.41 GB copied over the bus)
+[bench] peak RSS 19.60 GB
+[qtier] host pool: 10240 experts (16.88 GB of the RAM cache) page-locked for the device's copies
+
+## the 64-token prompt after the 512, every run (the runs' CSV: prefill_tps, gen_first_ms, gen_steady_tps, fingerprint, nll, top1, bus_mb)
+measure A v0 run1: 103.53 tok/s, first step 19.5 ms, decode 51.559 tok/s, 9d8c5feaaca51a44, nll 2.69070, top1 0.469, 646.0 MB
+measure A v0 run2: 103.24 tok/s, first step 19.3 ms, decode 51.768 tok/s, 9d8c5feaaca51a44, nll 2.69070, top1 0.469, 646.0 MB
+measure A v0 run3: 104.96 tok/s, first step 19.5 ms, decode 51.816 tok/s, 9d8c5feaaca51a44, nll 2.69070, top1 0.469, 646.0 MB
+measure A v0 run4: 103.63 tok/s, first step 19.5 ms, decode 52.014 tok/s, 9d8c5feaaca51a44, nll 2.69070, top1 0.469, 646.0 MB
+measure A v1 run1: 89.48 tok/s, first step 19.9 ms, decode 50.789 tok/s, 54bb171c568c376e, nll 2.69592, top1 0.469, 6358.1 MB
+measure A v1 run2: 89.60 tok/s, first step 20.0 ms, decode 51.825 tok/s, 54bb171c568c376e, nll 2.69592, top1 0.469, 6358.1 MB
+measure A v1 run3: 90.40 tok/s, first step 20.2 ms, decode 51.793 tok/s, 54bb171c568c376e, nll 2.69592, top1 0.469, 6358.1 MB
+measure A v1 run4: 90.28 tok/s, first step 19.9 ms, decode 52.077 tok/s, 54bb171c568c376e, nll 2.69592, top1 0.469, 6358.1 MB
+measure B v0 run1: 104.40 tok/s, first step 19.7 ms, decode 51.758 tok/s, 9d8c5feaaca51a44, nll 2.69070, top1 0.469, 391.1 MB
+measure B v0 run2: 104.86 tok/s, first step 19.5 ms, decode 51.762 tok/s, 9d8c5feaaca51a44, nll 2.69070, top1 0.469, 391.1 MB
+measure B v0 run3: 106.76 tok/s, first step 19.5 ms, decode 51.557 tok/s, 9d8c5feaaca51a44, nll 2.69070, top1 0.469, 391.1 MB
+measure B v0 run4: 104.72 tok/s, first step 19.5 ms, decode 51.668 tok/s, 9d8c5feaaca51a44, nll 2.69070, top1 0.469, 391.1 MB
+measure B v1 run1: 222.95 tok/s, first step 20.4 ms, decode 51.546 tok/s, 54bb171c568c376e, nll 2.69592, top1 0.469, 1737.8 MB
+measure B v1 run2: 222.51 tok/s, first step 20.3 ms, decode 51.439 tok/s, 54bb171c568c376e, nll 2.69592, top1 0.469, 1737.8 MB
+measure B v1 run3: 221.72 tok/s, first step 20.1 ms, decode 51.182 tok/s, 54bb171c568c376e, nll 2.69592, top1 0.469, 1737.8 MB
+measure B v1 run4: 221.13 tok/s, first step 20.2 ms, decode 51.201 tok/s, 54bb171c568c376e, nll 2.69592, top1 0.469, 1737.8 MB
+
+## the first 64 and the 512, every run of both measures: the same fingerprint, nll and top1 in both versions
+ctx 512: fingerprint e82105bcd0bd1efa, nll 2.96212, top1 0.469
+ctx 64: fingerprint 4e0d1505a6060a16, nll 2.69270, top1 0.469
+
+## the 64 after the 512: where its other fingerprint comes from. Dev fd7ed68a against dev built with
+## Q36CC_FOLLOW_ROWS at 33 instead of 128 (a throwaway local commit, 1bf5351d: the pool follows the residents
+## before every staged chunk, so it is whole before that prompt), the same T4, one run a version. The bench's rows
+## (tokens, new, prompt tok/s, first step ms, decode tok/s, experts read, reads' s, MB to the card, nll, top1,
+## fingerprint), dev's three then the build's three, and the engine's lines of dev then of the build:
+| 64 | 64 | 89.15 (89.15–89.15) | 60 (60–60) | 43.106 (43.106–43.106) | 0 | 0.00 | 6351.9 | 2.6927 | 0.469 | 4e0d1505a6060a16 |
+| 512 | 512 | 518.76 (518.76–518.76) | 24 (24–24) | 48.671 (48.671–48.671) | 0 | 0.00 | 6361.8 | 2.9621 | 0.469 | e82105bcd0bd1efa |
+| 64 after 512 | 64 | 102.54 (102.54–102.54) | 20 (20–20) | 51.953 (51.953–51.953) | 0 | 0.00 | 646.0 | 2.6907 | 0.469 | 9d8c5feaaca51a44 |
+| 64 | 64 | 89.11 (89.11–89.11) | 61 (61–61) | 42.543 (42.543–42.543) | 0 | 0.00 | 6351.9 | 2.6927 | 0.469 | 4e0d1505a6060a16 |
+| 512 | 512 | 518.84 (518.84–518.84) | 25 (25–25) | 49.586 (49.586–49.586) | 0 | 0.00 | 6361.8 | 2.9621 | 0.469 | e82105bcd0bd1efa |
+| 64 after 512 | 64 | 79.60 (79.60–79.60) | 20 (20–20) | 51.689 (51.689–51.689) | 0 | 0.00 | 6358.1 | 2.6959 | 0.469 | 54bb171c568c376e |
+[chain] qwen36: 83 prompt layer steps staged the host pool's experts (12.41 GB copied over the bus)
+[chain] qwen36: the host pool followed the residents before 1 prompt chunks: 130 experts joined it, 126 left it, 75.6 ms
+[chain] qwen36: 120 prompt layer steps staged the host pool's experts (17.98 GB copied over the bus)
+[chain] qwen36: the host pool followed the residents before 2 prompt chunks: 292 experts joined it, 288 left it, 172.4 ms
+
+## after the review: the flag raised only if no expert was left out (the published code). macOS arm64, the fake
+## backend; the three tests' last lines:
+OK test_qwen36_tier_host_pool: after promotions the host pool is the non-residents again, every page-lock released at the exit; a per-row container's pairs join it; memory back from the coldest residents, or by page; every expert pooled, the residents too, when the warm start says so
+OK test_qwen36_tier_int8_engine
+OK test_qwen36_cuda_chain: the CUDA chain gives the CPU path's logits; host and device state agree; a lost device rebuilds; the host pool follows before a large prompt chunk only; the promotions' brake only with a history
+## counter-proof f, the flag always raised as in the measured code: the FAIL lines of the two tests
+  FAIL: limited: the pool is not whole, the follow stays on
+  FAIL: limited: the follow works as without the residents' copies: the victims join, the residents leave, the pool is the non-residents
+  FAIL planar: the pool is not whole, so the follow still works (it takes the resident out)
+  FAIL per-row pairs: the pool is not whole, so the follow still works (it takes the resident out)
+FAILED 2
+## make -C c check on the published code (this change and the routed copy's code, without the two records):
+OK test_qwen36_tier_host_pool: after promotions the host pool is the non-residents again, every page-lock released at the exit; a per-row container's pairs join it; memory back from the coldest residents, or by page; every expert pooled, the residents too, when the warm start says so
+OK test_qwen36_tier_int8_engine
+OK test_qwen36_cuda_chain: the CUDA chain gives the CPU path's logits; host and device state agree; a lost device rebuilds; the host pool follows before a large prompt chunk only; the promotions' brake only with a history
+Ran 3290 tests in 315.436s
+OK (skipped=582)
+## the published code on a Tesla T4 (a second VM of the same kind, 13 November, 23:45 UTC), one run a version, base: dev
+## plus the routed copy's code; then this change on it. The bench's rows (tokens, new, prompt tok/s, first step ms,
+## decode tok/s, experts read, reads' s, MB to the card, nll, top1, fingerprint) and the engine's lines. The base's
+## run is one of the processes with other logits for the second and third prompt (see the last section)
+### the base
+| 64 | 64 | 183.36 (183.36–183.36) | 64 (64–64) | 41.631 (41.631–41.631) | 0 | 0.00 | 2192.3 | 2.6927 | 0.469 | 4e0d1505a6060a16 |
+| 512 | 512 | 522.39 (522.39–522.39) | 25 (25–25) | 48.602 (48.602–48.602) | 0 | 0.00 | 6361.8 | 2.9621 | 0.469 | 05536a06f919050c |
+| 64 after 512 | 64 | 99.74 (99.74–99.74) | 20 (20–20) | 50.969 (50.969–50.969) | 0 | 0.00 | 305.1 | 2.7073 | 0.469 | 7717096bc0b6404c |
+[qtier] host pool: 3635 experts of the RAM cache page-locked for the device to copy a prompt chunk's experts from (COLI_CUDA_HOST_POOL=0 off)
+[chain] qwen36: 81 prompt layer steps staged the host pool's experts, 41 of them only those their rows route to (8.01 GB copied over the bus)
+[chain] qwen36: the host pool followed the residents before 1 prompt chunks: 130 experts joined it, 126 left it, 73.9 ms
+[qtier] host pool: 3639 experts (6.00 GB of the RAM cache) page-locked for the device's copies
+### this change
+| 64 | 64 | 181.92 (181.92–181.92) | 71 (71–71) | 41.062 (41.062–41.062) | 0 | 0.00 | 2192.3 | 2.6927 | 0.469 | 4e0d1505a6060a16 |
+| 512 | 512 | 556.14 (556.14–556.14) | 25 (25–25) | 47.990 (47.990–47.990) | 0 | 0.00 | 6361.8 | 2.9621 | 0.469 | e82105bcd0bd1efa |
+| 64 after 512 | 64 | 223.46 (223.46–223.46) | 20 (20–20) | 50.535 (50.535–50.535) | 0 | 0.00 | 1737.8 | 2.6959 | 0.469 | 54bb171c568c376e |
+[qtier] host pool: 10240 experts of the RAM cache page-locked for the device to copy a prompt chunk's experts from (6605 of them the residents', so an expert that leaves the card is in it; COLI_CUDA_HOST_POOL=0 off)
+[chain] qwen36: 120 prompt layer steps staged the host pool's experts, 80 of them only those their rows route to (9.41 GB copied over the bus)
+[qtier] host pool: 10240 experts (16.88 GB of the RAM cache) page-locked for the device's copies
+
+## other logits in a process now and then: dev's (the routed copy's record has dev's own processes and what they
+## follow, the tier's uploader thread). The published code against itself on that second VM, a warm-up and 5 + 5
+## processes, 10 s of rest. A line a process: the fingerprint (its first 8 digits) and the nll of the three lengths, the
+## slots the host served in decode, the prompt layer steps staged, the tier's miss(CPU), the seconds to ready. In 3 of
+## the 11 the 512 has another fingerprint; the 64 after it has the same one in all
+warmup 4e0d1505/2.69270 e82105bc/2.96212 54bb171c/2.69592 | host-slots 4370 staged 120 miss 40003 ready 22.33
+v0-run1 4e0d1505/2.69270 e82105bc/2.96212 54bb171c/2.69592 | host-slots 4370 staged 120 miss 40003 ready 22.48
+v0-run2 4e0d1505/2.69270 318606fe/2.96250 54bb171c/2.69592 | host-slots 4368 staged 120 miss 40001 ready 23.20
+v0-run3 4e0d1505/2.69270 e82105bc/2.96212 54bb171c/2.69592 | host-slots 4370 staged 120 miss 40003 ready 23.03
+v0-run4 4e0d1505/2.69270 e82105bc/2.96212 54bb171c/2.69592 | host-slots 4370 staged 120 miss 40003 ready 22.69
+v0-run5 4e0d1505/2.69270 e82105bc/2.96212 54bb171c/2.69592 | host-slots 4370 staged 120 miss 40003 ready 22.69
+v1-run1 4e0d1505/2.69270 e82105bc/2.96212 54bb171c/2.69592 | host-slots 4370 staged 120 miss 40003 ready 22.30
+v1-run2 4e0d1505/2.69270 e82105bc/2.96212 54bb171c/2.69592 | host-slots 4370 staged 120 miss 40003 ready 22.46
+v1-run3 4e0d1505/2.69270 e82105bc/2.96212 54bb171c/2.69592 | host-slots 4370 staged 120 miss 40003 ready 23.28
+v1-run4 4e0d1505/2.69270 05536a06/2.96207 54bb171c/2.69592 | host-slots 4367 staged 120 miss 40000 ready 22.55
+v1-run5 4e0d1505/2.69270 9a4a9de2/2.96089 54bb171c/2.69592 | host-slots 4366 staged 120 miss 39999 ready 23.40
