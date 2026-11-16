@@ -2463,6 +2463,12 @@ tests/test_qwen38_mxfp4_experts$(EXE): tests/test_qwen38_mxfp4_experts.c qwen38.
 tests/test_qwen38_wex4$(EXE): tests/test_qwen38_wex4.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
+# GLM-5.3 on AMD's MXFP4 checkpoint (docs/glm53-flash.md), no model: a synthetic grid written as that
+# checkpoint writes its experts, every expert streamed as fmt 7 and its products checked, an MXFP4
+# shared expert through load_mat.
+tests/test_glm53_mxfp4$(EXE): tests/test_glm53_mxfp4.c glm53.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
 tests/test_qwen38_igpu_defaults$(EXE): tests/test_qwen38_igpu_defaults.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
