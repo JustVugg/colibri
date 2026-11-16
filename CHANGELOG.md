@@ -7,6 +7,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### New
 
+- **WNR3 records on the CPU** (`c/wex_decode.c`, `c/wex_decode.h`): the WNM2 model registry, a
+  WEX4 container's model blob checked against its index hash, and the in-place decode of a WNR3
+  (codec 5) record with the reference decoder. No engine reads WNR3 records yet.
+  `tests/test_wex_decode.c` in `make test-c` ([docs/wex.md](docs/wex.md)).
 - **DeepSeek V4.1's routed experts from a WEX4 container** (`COLI_WEX_PATH`, `COLI_WEX_ROOT`,
   `COLI_WEX_VERIFY`): a backbone expert's six tensors read from its one record, by the same
   readers into the same windows; the root pinned and each record's SHA-256 checked at its first
