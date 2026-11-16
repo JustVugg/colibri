@@ -2413,6 +2413,11 @@ tests/test_qwen38_int4_experts$(EXE): tests/test_qwen38_int4_experts.c qwen38.c 
 tests/test_qwen38_mxfp4_experts$(EXE): tests/test_qwen38_mxfp4_experts.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
+# The MXFP4 experts from a WEX4 container (COLI_WEX_PATH; docs/wex.md), no model: a synthetic
+# grid and its container, every record loaded and checked, the refusals in child processes.
+tests/test_qwen38_wex4$(EXE): tests/test_qwen38_wex4.c qwen38.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
 tests/test_qwen38_igpu_defaults$(EXE): tests/test_qwen38_igpu_defaults.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
