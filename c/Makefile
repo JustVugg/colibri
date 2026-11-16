@@ -2573,6 +2573,9 @@ tests/test_gq_r16$(EXE): tests/test_gq_r16.c
 # The grid types' dot product with the signs on the activation against the one it replaced
 tests/test_gq_signs$(EXE): tests/test_gq_signs.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+# a speculative verify's rows (up to GQ_EXACT_ROWS) get each row's bits alone, every block type (#2874)
+tests/test_gq_rows_exact$(EXE): tests/test_gq_rows_exact.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 # Q2_K's fused row kernel against the unpack + gq_dot_i8 path it replaced, to the bit
 tests/test_gq_q2_k$(EXE): tests/test_gq_q2_k.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
