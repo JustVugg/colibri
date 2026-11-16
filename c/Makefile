@@ -3993,13 +3993,12 @@ tests/test_wex_decode$(EXE): tests/test_wex_decode.c
 # status and bytes on synthetic records and mini-records (a container path on the command line adds real
 # records). Three builds: the default flags; on x86-64 the baseline (-march=x86-64), where the AVX2 kernel is
 # compiled with a target attribute and chosen at run time by CPUID; and -DWEX_FAST_SCALAR (kernel 0 only).
-WEX_FAST_DEPS = tests/test_wex_fast_decode.c wex_fast_decode.h wex_decode.c wex_decode.h wex_format.h \
-	wex_neural_rans.h tests/wnr3_fixture.h
-tests/test_wex_fast_decode$(EXE): $(WEX_FAST_DEPS)
+# Their headers come from -MMD, as every rule's here (tests/test_makefile_deps.py).
+tests/test_wex_fast_decode$(EXE): tests/test_wex_fast_decode.c
 	$(CC) $(CFLAGS) $< -o $@ -pthread $(LDFLAGS)
-tests/test_wex_fast_decode_x86_64$(EXE): $(WEX_FAST_DEPS)
+tests/test_wex_fast_decode_x86_64$(EXE): tests/test_wex_fast_decode.c
 	$(CC) $(if $(X86_64),$(filter-out -march=% -mavx% -mfma%,$(CFLAGS)) -march=x86-64,$(CFLAGS)) $< -o $@ -pthread $(LDFLAGS)
-tests/test_wex_fast_decode_scalar$(EXE): $(WEX_FAST_DEPS)
+tests/test_wex_fast_decode_scalar$(EXE): tests/test_wex_fast_decode.c
 	$(CC) $(CFLAGS) -DWEX_FAST_SCALAR $< -o $@ -pthread $(LDFLAGS)
 
 # The CUDA helper's loader in wex_decode.c (COLI_WEX_CUDA_LIB), no GPU: a CPU stand-in with
@@ -4054,7 +4053,7 @@ AUTODEP_ELSEWHERE = test_segment_adapters_registration test_segment_adapters_rea
 	test_edge_adapters_registration test_edge_adapters_real test_deepseek_v4 \
 	test_v4_serve_framing test_v4_wex4
 AUTODEP_OWN_FLAGS = bench_cuda_resident_batch bench_load_tq_peak_rss \
-	bench_indexer_allocations
+	bench_indexer_allocations test_wex_nr3_gpu
 ENGINE_RULES := $(foreach n,$(RULE_NAMES),$(if $(findstring /,$(n)),,$(if $(wildcard $(n).c),$(n))))
 AUTODEP_TESTS := $(patsubst tests/%,%,$(filter tests/%,$(RULE_NAMES)))
 AUTODEP_OBJS      = backend_vulkan.o vk_tier.o vk_chain.o backend_loader.o backend_xdna.o qwen36_tier.o \
