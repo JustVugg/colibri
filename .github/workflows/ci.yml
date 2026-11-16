@@ -2378,6 +2378,15 @@ jobs:
             tests.test_gguf_dequant \
             tests.test_gguf_olmoe_profile \
             tests.test_convert_gguf_to_olmoe
+      - name: qwen36 holds a GGUF's grid types larger and answers as the file's rows
+        run: |
+          # tests/test_qwen36_iq3s_codes.py needs the engine and the gguf package. The
+          # python job builds the engine without the package, this one had the package
+          # without the engine, so the test skipped in both. A skip fails the step here.
+          make -C c -j"$(nproc)" qwen36
+          cd c
+          python3 -m unittest -v tests.test_qwen36_iq3s_codes 2>&1 | tee ../q36codes.log
+          grep -q '\.\.\. ok$' ../q36codes.log
 
   windows-python-focused:
     name: Python tests (Windows focused)
