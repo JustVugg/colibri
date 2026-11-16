@@ -1,8 +1,9 @@
 /* qwen38's MXFP4 routed experts from a WEX4 container (COLI_WEX_PATH, qwen38_core.h
- * q38_wex4_attach), no model: a synthetic grid of 2 layers x 3 experts, hidden 64 and
- * moe_intermediate 32 (records of 3,264 bytes, not a whole page), written as the in-place
- * upgrade of a WEX1 file writes it (tests/wex4_fixture.h) from records laid out as
- * experts-mxfp4/ lays them out (gate, down, up scales, then their e2m1 codes).
+ * q38_wex4_attach), no model: a synthetic grid of 2 layers x 3 experts, hidden 256 and
+ * moe_intermediate 64 (records of 26,112 bytes, not a whole number of pages), written as the
+ * in-place upgrade of a WEX1 file writes it (tests/wex4_fixture.h) from records laid out as
+ * experts-mxfp4/ lays them out (gate, down, up scales, then their e2m1 codes), and its WNR3
+ * form (tests/wnr3_fixture.h), plain and canonical zero.
  *
  * In process: the container attaches without Q38_EXPERT_LOWBIT and with =mxfp4; every
  * expert the engine loads holds the record's bytes in the right matrix; a pinned root that
@@ -14,26 +15,32 @@
  * other shapes, another root, a root that is not 64 hex digits, and a record changed on
  * disk under the pin, read and mapped; with no check asked, the changed record is served
  * as it is (exit 4: the child sees the changed byte). Without COLI_WEX_PATH nothing
- * attaches. */
+ * attaches.
+ *
+ * WNR3: every expert loaded holds its record, decoded (plain, canonical zero, pinned, and
+ * with COLI_MAP_EXPERTS=1, which a WNR3 record does not take); the engine stops on a record
+ * changed on disk (its stream check with no pin, its hash with one), on a whole record under
+ * another expert's name, and on a changed model blob. */
 #define _GNU_SOURCE
 #define QWEN38_NO_MAIN
 #include "../qwen38.c"
 #include "../compat.h"   /* setenv/unsetenv: MinGW has neither */
 #include "wex4_fixture.h"
+#include "wnr3_fixture.h"
 #ifdef _WIN32
 #include <process.h>
 #else
 #include <sys/wait.h>
 #endif
 
-enum { LAYERS = 2, EXPERTS = 3, H = 64, I = 32 };
+enum { LAYERS = 2, EXPERTS = 3, H = 256, I = 64 };
 #define CELLS (LAYERS * EXPERTS)
 /* gate [I][H], down [H][I], up [I][H]: scale bytes per matrix, then code bytes */
 #define SG ((size_t)I * (H / 32))
 #define SD ((size_t)H * (I / 32))
 #define CG ((size_t)I * (H / 2))
 #define CD ((size_t)H * (I / 2))
-#define RAW (2 * SG + SD + 2 * CG + CD)          /* 3,264 bytes */
+#define RAW (2 * SG + SD + 2 * CG + CD)          /* 26,112 bytes */
 #define STORED ((size_t)WEX_ALIGN_UP(RAW, WEX_ALIGN))
 
 static unsigned char source[CELLS][RAW];
@@ -110,7 +117,7 @@ static int load_all(Model *m) {
 static void drop(Model *m) {   /* the test's Model holds only the grid and m->x4 */
     if (m->x4) {
         st_destroy(&m->x4->S); free(m->x4->fd); free(m->x4->off);
-        free(m->x4->wex); free(m->x4->wex_sha); free(m->x4->wex_seen); free(m->x4);
+        free(m->x4->wex); free(m->x4->wex_sha); free(m->x4->wex_seen); free(m->x4->wex_nr3); free(m->x4);
     }
     m->x4 = NULL;
 }
@@ -124,6 +131,7 @@ static int attach_and_load(void) {
     if (!m.x4) return 3;
     int rc = load_all(&m) ? 0 : 4;
     for (int c = 0; !rc && m.x4->wex_sha && c < CELLS; c++) if (m.x4->wex_seen[c] != 1) rc = 5;
+    if (!rc && m.x4->wex_nr3 && m.x4->wex_decoded != CELLS) rc = 6;   /* a WNR3 container: every record decoded */
     drop(&m);
     return rc;
 }
@@ -148,10 +156,18 @@ static void child_case(const char *self, int want, const char *what) {
     ck(rc == want, line);
 }
 
+/* scales near 2^-7, e2m1 codes mostly small and no -0 (so WNR3 records are smaller than RAW
+ * ones, and the canonical-zero form decodes to the same bytes) */
 static void fill_source(void) {
+    static const unsigned char magnitude[16] = {0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7};
     uint32_t seed = 20261116u;
     for (int c = 0; c < CELLS; c++)
-        for (size_t j = 0; j < RAW; j++) { seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5; source[c][j] = (unsigned char)seed; }
+        for (size_t j = 0; j < RAW; j++) {
+            seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+            unsigned lo = magnitude[seed & 15u], hi = magnitude[seed >> 4 & 15u];
+            lo |= lo ? (seed >> 8 & 8u) : 0u; hi |= hi ? (seed >> 9 & 8u) : 0u;
+            source[c][j] = (unsigned char)(j < 2 * SG + SD ? 118u + seed % 8u : lo | hi << 4);
+        }
 }
 
 int main(int argc, char **argv) {
@@ -184,7 +200,7 @@ int main(int argc, char **argv) {
     setenv("COLI_WEX_PATH", wex_path, 1);
     grid(&m); q38_expert_int4_attach(&m, directory);
     ck(m.x4 && m.x4->lb && m.x4->lb->mx && m.x4->record_bytes == (int64_t)RAW && !m.x4->wex_sha,
-       "COLI_WEX_PATH alone: the container attaches as the MXFP4 experts, records of 3,264 bytes, no hash check");
+       "COLI_WEX_PATH alone: the container attaches as the MXFP4 experts, records of 26,112 bytes, no hash check");
     ck(load_all(&m), "every expert loaded holds its record: gate, down and up scales and codes where they belong");
     drop(&m);
     setenv("Q38_EXPERT_LOWBIT", "mxfp4", 1);
@@ -238,6 +254,46 @@ int main(int argc, char **argv) {
     unsetenv("COLI_MAP_EXPERTS"); unsetenv("COLI_WEX_ROOT");
     child_case(argv[0], 4, "the changed record with no pin and no COLI_WEX_VERIFY: served as it is (no check was asked)");
     w4[offset[4] + 100] ^= 0x10u;
+
+    printf("WNR3 records (codec 5), decoded on the CPU\n");
+    size_t nr3_bytes, at[CELLS];
+    char nroot[65], zroot[65], renamed_root[65];
+    unsigned char *nr3 = wnr3f_from_wex4(w4, w4_bytes, 0, &nr3_bytes, nroot, at);
+    size_t cz_bytes;
+    unsigned char *cz = wnr3f_from_wex4(w4, w4_bytes, 1, &cz_bytes, zroot, NULL);
+    ck(nr3 && cz, "the WNR3 and canonical-zero forms of the container written (every record smaller than RAW)");
+    if (!nr3 || !cz) return 1;
+    put(nr3, nr3_bytes);
+    grid(&m); q38_expert_int4_attach(&m, directory);
+    ck(m.x4 && m.x4->wex_nr3 && m.x4->record_bytes == (int64_t)RAW && load_all(&m) && m.x4->wex_decoded == CELLS,
+       "the WNR3 container attaches; every expert loaded holds its record, decoded");
+    drop(&m);
+    setenv("COLI_WEX_ROOT", nroot, 1);
+    ck(attach_and_load() == 0, "pinned: every WNR3 record passes its hash at its first read and decodes");
+    setenv("COLI_MAP_EXPERTS", "1", 1);
+    child_case(argv[0], 0, "pinned, COLI_MAP_EXPERTS=1: every WNR3 record read and decoded, not mapped");
+    unsetenv("COLI_MAP_EXPERTS"); unsetenv("COLI_WEX_ROOT");
+    put(cz, cz_bytes);
+    ck(attach_and_load() == 0, "the canonical-zero WNR3 container: the same records");
+    nr3[at[4] + 5000] ^= 0x10u; put(nr3, nr3_bytes);
+    child_case(argv[0], 1, "WNR3 record of layer 1 expert 1 changed on disk, no hash check: its stream check stops the engine");
+    setenv("COLI_WEX_ROOT", nroot, 1);
+    child_case(argv[0], 1, "the same, pinned: its SHA-256 stops the engine at its first read");
+    unsetenv("COLI_WEX_ROOT");
+    nr3[at[4] + 5000] ^= 0x10u;
+    unsigned char *renamed = malloc(nr3_bytes);
+    assert(renamed);
+    memcpy(renamed, nr3, nr3_bytes);
+    ck(!wnr3f_rename(renamed, nr3_bytes, 1u << 16 | 1u, 1u << 16 | 2u, source[4], renamed_root),
+       "layer 1 expert 1's record written again under expert 2's name, the index resealed");
+    put(renamed, nr3_bytes);
+    setenv("COLI_WEX_ROOT", renamed_root, 1);
+    child_case(argv[0], 1, "that whole record, its hash right, pinned: its owner stops the engine");
+    unsetenv("COLI_WEX_ROOT");
+    free(renamed);
+    nr3[WEX4_PAGE + 100] ^= 1u; put(nr3, nr3_bytes); nr3[WEX4_PAGE + 100] ^= 1u;
+    child_case(argv[0], 1, "a bit of the WNM2 model blob changed: refused");
+    free(nr3); free(cz);
 
     unsetenv("COLI_WEX_PATH");
     remove(wex_path); rmdir(directory);

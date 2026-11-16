@@ -451,7 +451,10 @@ own process.
 `experts-mxfp4/`: the same bytes, one 4096-aligned record per expert, bound and
 computed by the code above. `COLI_WEX_ROOT=<root>` (printed by
 `tools/wex4_verify`) refuses any other file and checks each record's SHA-256 the
-first time it is used. Details and the checks at attach: [wex.md](wex.md#qwen38-qwen38).
+first time it is used. A container of WNR3 records (the same records, coded losslessly) is
+decoded on the CPU by the thread that reads each record, about 105 ms for a 2.6 MB record
+at the reference decoder's 25 MB/s: smaller on disk, slower to load. Details and the checks
+at attach: [wex.md](wex.md#qwen38-qwen38).
 
 ## Speculative decoding with the MTP head
 

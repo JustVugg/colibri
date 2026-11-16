@@ -145,12 +145,22 @@ COLI_WEX_PATH=experts-mxfp4.wex4 COLI_WEX_ROOT=<root> ./qwen38 ...
 | `COLI_WEX_VERIFY` | on with `COLI_WEX_ROOT`, else off | `1`: each record's SHA-256 against the index at its first use, read or mapped (`COLI_MAP_EXPERTS=1`) |
 
 `q38_wex4_attach` (`qwen38_core.h`) checks the header page, the index, the grid, the root, and
-that every expert of the loaded layers is a RAW record of exactly that layout; then the records
+that every expert of the loaded layers is a record of exactly that layout; then the records
 are read and bound by the sidecar's own code (`q38_x4_read`, `q38_bind_int4_record`), so the
 CPU kernels, the batch loader and the mapped path are the sidecar's. As with a sidecar that was
 asked for, anything that does not hold stops the engine with the reason; the qwen38 engine has
 no second copy of the MXFP4 experts to fall back to. `COLI_MODEL_MIRROR` copies are not applied
 to a container yet (one drive).
+
+A container of WNR3 records: at attach its one WNM2 blob is read, checked against the index's
+SHA-256 and registered (all or none of the records value-exact). `q38_x4_read` sends each WNR3
+record to `q38_x4_read_nr3`, which reads the stored bytes at the end of the decoded page, checks
+its SHA-256 at the first use (`COLI_WEX_VERIFY`), its owner and canonical-zero flag, decodes it in
+place on the reading thread and copies the record out; the mapped path (`COLI_MAP_EXPERTS=1`)
+reads and decodes a WNR3 record instead of mapping it. A record that names another expert or does
+not decode stops the engine, as a changed RAW record does under the check. Whether it pays:
+Wex-WRN2 measured WNR3 slowing Qwen3.8 down on its test machine (the records are 2.6 MB and
+are read often); the published Qwen3.8 container holds RAW records.
 
 A container for Qwen3.8 is written by Wex-WRN2's `wex4/wex4_convert.py pack --experts raw
 --names qwen38` from the sidecar's layer files or from AMD's Quark checkpoint. Its record layout
@@ -186,6 +196,6 @@ Vulkan tier's prewarm reads.
 
 ## Status in colibri
 
-DeepSeek V4, DeepSeek V4.1 and Qwen3.8 read RAW records from a WEX4 container; DeepSeek V4 also
-reads WNR3 records, decoded on the CPU (`wex_decode.c`). Qwen3.8 and DeepSeek V4.1 read them in
-the next PRs. Their GPU decode and the I/O switches (several drives, split reads) come after.
+DeepSeek V4, DeepSeek V4.1 and Qwen3.8 read RAW records from a WEX4 container; DeepSeek V4 and
+Qwen3.8 also read WNR3 records, decoded on the CPU (`wex_decode.c`). DeepSeek V4.1 reads them in
+the next PR. Their GPU decode and the I/O switches (several drives, split reads) come after.

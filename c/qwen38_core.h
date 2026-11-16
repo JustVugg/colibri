@@ -198,6 +198,8 @@ typedef struct {
     int ready;                     /* 0 unknown, 1 resident, -1 incompatible */
 } Q38ExpertScaleCache;
 
+#include "wex_format.h"            /* WexEntry: a WEX4 container's WNR3 records (q38_wex4_attach) */
+
 /* The routed experts as int4-g64 (q38_expert_int4_attach): where every
  * expert's record sits in the sidecar's layer files, and its geometry. */
 typedef struct {
@@ -218,6 +220,9 @@ typedef struct {
     char *wex;                     /* COLI_WEX_PATH: the WEX4 container that holds the records (S's one file) */
     unsigned char *wex_sha;        /* COLI_WEX_VERIFY: [cell * 32] the index's SHA-256 of each record, else NULL */
     unsigned char *wex_seen;       /* [cell] 1 once that record's hash passed */
+    WexEntry *wex_nr3;             /* a container with WNR3 records: [cell] its entry (flags 5: WNR3), else NULL */
+    uint32_t wex_nr3_flags;        /* WEX_HEADER_CANONICAL_ZERO when those records are value-exact, else 0 */
+    uint64_t wex_decoded;          /* WNR3 records decoded */
 } Q38Int4Experts;
 
 typedef enum {
@@ -2116,11 +2121,14 @@ static int q38_x4_replica(Model *m,int layer,int expert) {
 }
 
 #include "wex4.h"   /* the WEX4 container (q38_wex4_attach) */
+#define COLI_WEX_DECODE_API static inline
+#include "wex_decode.c"   /* WNR3 records of a container, decoded on the CPU */
 
 /* COLI_WEX_VERIFY on a WEX4 container (q38_wex4_attach): the first time a record is used,
- * its bytes against the index's SHA-256, the record's zero padding included. A record that
- * fails stops the engine: the container is damaged or not the one its index was written for. */
-static void q38_wex_check(Model *m,int layer,int expert,const uint8_t *bytes) {
+ * its n bytes as read (a RAW record's decoded bytes, a WNR3 record's stored ones) against the
+ * index's SHA-256, the record's zero padding to its page included. A record that fails stops
+ * the engine: the container is damaged or not the one its index was written for. */
+static void q38_wex_check(Model *m,int layer,int expert,const uint8_t *bytes,int64_t n) {
     Q38Int4Experts *x=m->x4;
     if(!x->wex_sha)return;
     const size_t cell=(size_t)layer*(size_t)m->c.experts+(size_t)expert;
@@ -2129,8 +2137,8 @@ static void q38_wex_check(Model *m,int layer,int expert,const uint8_t *bytes) {
     unsigned char digest[32];
     Wex4Sha sha;
     wex4_sha_init(&sha);
-    wex4_sha_update(&sha,bytes,(size_t)x->record_bytes);
-    wex4_sha_update(&sha,zero,(size_t)(wex4_align((uint64_t)x->record_bytes)-(uint64_t)x->record_bytes));
+    wex4_sha_update(&sha,bytes,(size_t)n);
+    wex4_sha_update(&sha,zero,(size_t)(wex4_align((uint64_t)n)-(uint64_t)n));
     wex4_sha_final(&sha,digest);
     if(memcmp(digest,x->wex_sha+cell*32,32)){
         fprintf(stderr,"[qwen38] COLI_WEX_PATH %s: layer %d expert %d does not match its SHA-256 in the index -- "
@@ -2140,12 +2148,47 @@ static void q38_wex_check(Model *m,int layer,int expert,const uint8_t *bytes) {
     __atomic_store_n(&x->wex_seen[cell],(unsigned char)1,__ATOMIC_RELEASE);
 }
 
+/* The container's WNR3 entry of an expert, or NULL (a RAW record, or no container). */
+static inline const WexEntry *q38_wex_nr3(const Model *m,int layer,int expert) {
+    const Q38Int4Experts *x=m->x4;
+    if(!x||!x->wex_nr3)return NULL;
+    const WexEntry *e=&x->wex_nr3[(size_t)layer*(size_t)m->c.experts+(size_t)expert];
+    return e->flags==WEX_ENTRY_NEURAL_RANS3?e:NULL;
+}
+
+/* A WNR3 record into out (record_bytes): its stored bytes read at the end of its decoded page,
+ * hashed (COLI_WEX_VERIFY, first use), its owner and canonical-zero flag checked, decoded in
+ * place on this thread, copied out. A record that fails stops the engine, as a RAW one does. */
+static void q38_x4_read_nr3(Model *m,int layer,int expert,const WexEntry *e,void *out,int64_t cap,const char *tag) {
+    Q38Int4Experts *x=m->x4;
+    const size_t page=(size_t)wex4_align((uint64_t)x->record_bytes),at=wex_record_read_offset(e);
+    const char *why=NULL;
+    if(cap<x->record_bytes){fprintf(stderr,"%s: a buffer of %lld bytes for a record of %lld\n",tag,(long long)cap,(long long)x->record_bytes);exit(1);}
+    uint8_t *slab=NULL;
+    if(posix_memalign((void**)&slab,WEX4_PAGE,page)){fprintf(stderr,"OOM WNR3 expert record\n");exit(1);}
+    st_read_range_rep(&x->S,x->fd[layer],0,(int64_t)e->file_offset,(int64_t)e->total_bytes,slab+at,(int64_t)e->total_bytes,1,0,tag);
+    q38_wex_check(m,layer,expert,slab+at,(int64_t)e->total_bytes);
+    if(!wex_nr3_owner_ok(e,slab+at,(uint32_t)layer,(uint32_t)expert,x->wex_nr3_flags))
+        why="names another expert, or another canonical-zero form";
+    else if(coli_wex_decode_record(e,slab,page))why="does not decode (a WNR3 stream check failed)";
+    if(why){
+        fprintf(stderr,"[qwen38] COLI_WEX_PATH %s: the record of layer %d expert %d %s -- the container is damaged; "
+                       "refusing\n",x->wex,layer,expert,why);
+        exit(1);
+    }
+    memcpy(out,slab,(size_t)x->record_bytes);
+    compat_aligned_free(slab);
+    __atomic_fetch_add(&x->wex_decoded,1,__ATOMIC_RELAXED);
+}
+
 /* One sidecar record into out, from its replica. */
 static void q38_x4_read(Model *m,int layer,int expert,void *out,int64_t cap,const char *tag) {
     Q38Int4Experts *x=m->x4;
+    const WexEntry *nr3=q38_wex_nr3(m,layer,expert);
+    if(nr3){q38_x4_read_nr3(m,layer,expert,nr3,out,cap,tag);return;}   /* a container's WNR3 record */
     int rep=q38_x4_replica(m,layer,expert);
     st_read_range_rep(&x->S,x->fd[layer],rep,x->off[(int64_t)layer*m->c.experts+expert],x->record_bytes,out,cap,1,0,tag);
-    q38_wex_check(m,layer,expert,(const uint8_t*)out);   /* COLI_WEX_VERIFY on a container */
+    q38_wex_check(m,layer,expert,(const uint8_t*)out,x->record_bytes);   /* COLI_WEX_VERIFY on a container */
     if(x->mir_n>1){
         __atomic_fetch_add(&x->mir_reads[rep],1,__ATOMIC_RELAXED);
         __atomic_fetch_add(&x->mir_bytes[rep],(uint64_t)x->record_bytes,__ATOMIC_RELAXED);
@@ -2424,19 +2467,23 @@ static int q38_int4_record_at(Model *m,Q38Int4Experts *x,int layer,int expert,
  * index, is refused rather than ignored; one still being written is skipped
  * with a line saying so (or refused under Q38_EXPERT_INT4=1). */
 /* ---- the MXFP4 experts from a WEX4 container (COLI_WEX_PATH; docs/wex.md) ----------
- * A WEX4 file of this model's routed experts, one RAW record per (layer, expert) whose six
+ * A WEX4 file of this model's routed experts, one record per (layer, expert) whose six
  * tensors are the experts-mxfp4/ record's (gate, down, up scales, then their e2m1 codes, the
  * same bytes, padded to 4096): the container serves the records instead of the sidecar's
  * layer files, read and bound exactly as theirs (q38_x4_read, q38_bind_int4_record). It is
  * the MXFP4 sidecar in another file, so it implies Q38_EXPERT_LOWBIT=mxfp4 and refuses any
- * other low-bit format.
+ * other low-bit format. A record is RAW (those bytes) or WNR3 (codec 5, the same bytes coded
+ * with the container's WNM2 model), which q38_x4_read_nr3 decodes on the CPU on the thread
+ * that reads it (wex_decode.c) and never maps.
  *
  * Checked at attach: the header page and the index (wex4.h), the model's grid, COLI_WEX_ROOT
- * (64 hex digits) when set, every expert of the loaded layers present as a RAW record of the
- * layout above, dtypes U8/E8M0 and U8/I8. COLI_WEX_VERIFY (on with COLI_WEX_ROOT, else off)
+ * (64 hex digits) when set, every expert of the loaded layers present as a record of the
+ * layout above, dtypes U8/E8M0 and U8/I8; WNR3 records: one WNM2 blob, matching its SHA-256
+ * in the index, and all or none value-exact. COLI_WEX_VERIFY (on with COLI_WEX_ROOT, else off)
  * hashes each record at its first use (q38_wex_check). Asked for, the container is required:
  * anything that does not hold stops the engine with the reason, as a sidecar that was asked
- * for does. COLI_MODEL_MIRROR copies are not applied to a container (one drive). */
+ * for does, and so does a WNR3 record that names another expert or does not decode.
+ * COLI_MODEL_MIRROR copies are not applied to a container (one drive). */
 static void q38_wex_refuse(const char *path,const char *why) {
     fprintf(stderr,"[qwen38] COLI_WEX_PATH %s: %s -- refusing (unset COLI_WEX_PATH to run without it)\n",path,why);
     exit(1);
@@ -2511,13 +2558,22 @@ static void q38_wex4_attach(Model *m,const char *path) {
     const int rows[3]={c->inter,c->inter,c->hidden},cols[3]={c->hidden,c->hidden,c->inter};   /* gate, up, down */
     int64_t code_off[3],scale_off[3];
     q38_mx4_offsets(x,code_off,scale_off);
+    int nr3=0,exact=0;
+    uint32_t model_blob=0;   /* the WNR3 records' WNM2 blob, 1-based */
     for(uint32_t r=0;r<h.records;r++){
         Wex4Record rec;
         wex4_get_record(&view,r,&rec);
         if(!(rec.flags&WEX4_REC_EXPERT))continue;   /* other tensors: not the experts' */
         const int layer=(int)(rec.owner>>16),expert=(int)(rec.owner&0xffffu);   /* bounded by wex4_open */
-        if(rec.codec!=WEX4_CODEC_RAW)
-            q38_wex_refuse(path,"it holds WNR3 records, which this build does not read (RAW records only)");
+        if(rec.codec==WEX4_CODEC_WNR3){   /* wex4_open admits RAW and WNR3 expert records, a WNR3 one with a WNM2 blob */
+            if(model_blob&&rec.blob!=model_blob)q38_wex_refuse(path,"it has WNR3 records of two models (one is read)");
+            model_blob=rec.blob;
+            if(!x->wex_nr3&&!(x->wex_nr3=(WexEntry*)calloc(cells,sizeof(WexEntry)))){fprintf(stderr,"OOM WEX4 expert index\n");exit(1);}
+            if(wex4_expert_entry(&view,r,&x->wex_nr3[(size_t)layer*c->experts+expert]))
+                q38_wex_refuse(path,"it has an invalid WNR3 expert record");
+            nr3++;
+            exact+=!!(rec.flags&WEX4_REC_VALUE_EXACT);
+        }
         int ok=rec.decoded==(uint64_t)x->record_bytes&&rec.tensor_count==6;
         for(int part=0;part<6&&ok;part++){   /* the record's order: gate, down, up scales, then their codes */
             const int k=q38_mx4_order[part%3],scale=part<3;
@@ -2545,6 +2601,21 @@ static void q38_wex4_attach(Model *m,const char *path) {
                 snprintf(why,sizeof why,"layer %d expert %d is not in it",layer,expert);
                 q38_wex_refuse(path,why);
             }
+    char model[48]="";
+    if(model_blob){   /* the WNM2 model, checked against its SHA-256 in the index, registered for the decode */
+        if(exact&&exact!=nr3)q38_wex_refuse(path,"it has WNR3 records both value-exact and not (all or none are read)");
+        Wex4Blob blob;
+        wex4_get_blob(&view,model_blob-1u,&blob);
+        const size_t stored=(size_t)wex4_align(blob.bytes);
+        unsigned char *bytes=(unsigned char*)malloc(stored);
+        if(!bytes){fprintf(stderr,"OOM WEX4 model blob\n");exit(1);}
+        st_pread_full(fd,bytes,(int64_t)stored,(int64_t)blob.offset,"pread WEX4 model blob");
+        if(coli_wex4_register_model(bytes,(size_t)blob.bytes,stored,blob.sha,blob.id))
+            q38_wex_refuse(path,"its WNM2 model blob does not match its SHA-256 in the index");
+        free(bytes);
+        x->wex_nr3_flags=exact?WEX_HEADER_CANONICAL_ZERO:0u;
+        snprintf(model,sizeof model," (%d WNR3, model %08x%s)",nr3,blob.id,exact?", value-exact":"");
+    }
     const char *verify=getenv("COLI_WEX_VERIFY");
     if(verify&&*verify?atoi(verify)!=0:pinned>0){
         x->wex_sha=sha;
@@ -2554,8 +2625,8 @@ static void q38_wex4_attach(Model *m,const char *path) {
     const char *mirrors=getenv("COLI_MODEL_MIRROR");
     if(mirrors&&*mirrors)
         fprintf(stderr,"[qwen38 MIRROR] COLI_MODEL_MIRROR is not applied to a WEX4 container: every record comes from %s\n",path);
-    fprintf(stderr,"[qwen38] MXFP4 experts from the WEX4 container %s: records of %lld bytes, root %s%s; "
-                   "first-read SHA-256 %s\n",path,(long long)x->record_bytes,root,pinned?" (pinned)":"",
+    fprintf(stderr,"[qwen38] MXFP4 experts from the WEX4 container %s: records of %lld bytes%s, root %s%s; "
+                   "first-read SHA-256 %s\n",path,(long long)x->record_bytes,model,root,pinned?" (pinned)":"",
             x->wex_sha?"on":"off");
     free(index);free(page);
     m->x4=x;
@@ -2813,9 +2884,10 @@ static uint8_t *q38_scratch(int which, int64_t bytes) {
 static void q38_load_int4_record(Model *m,int layer,int expert,Slot *slot) {
     Q38Int4Experts *x=m->x4;
     int fd=x->fd[layer];int64_t off=x->off[(int64_t)layer*m->c.experts+expert];
-    const uint8_t *mapped=(const uint8_t*)st_map_shard_range(fd,off,x->record_bytes);
+    /* a container's WNR3 record is decoded, never mapped */
+    const uint8_t *mapped=q38_wex_nr3(m,layer,expert)?NULL:(const uint8_t*)st_map_shard_range(fd,off,x->record_bytes);
     if(mapped){
-        q38_wex_check(m,layer,expert,mapped);   /* COLI_WEX_VERIFY on a container */
+        q38_wex_check(m,layer,expert,mapped,x->record_bytes);   /* COLI_WEX_VERIFY on a container */
         q38_bind_int4_record(m,slot,(uint8_t*)mapped);
         free(slot->int4_slab);slot->int4_slab=NULL;slot->int4_slab_bytes=0;
         return;
@@ -6808,7 +6880,7 @@ static void q38_model_free(Model *m) {
     free(m->mtp_norm_emb); free(m->mtp_norm_hid);
     q38_weight_free(&m->mtp_fc_emb); q38_weight_free(&m->mtp_fc_hid);
     free(m->mtp_mixer.norm); q38_weight_free(&m->mtp_mixer.down); q38_weight_free(&m->mtp_mixer.up);
-    if(m->x4){st_destroy(&m->x4->S);free(m->x4->fd);free(m->x4->off);free(m->x4->wex);free(m->x4->wex_sha);free(m->x4->wex_seen);free(m->x4);}
+    if(m->x4){st_destroy(&m->x4->S);free(m->x4->fd);free(m->x4->off);free(m->x4->wex);free(m->x4->wex_sha);free(m->x4->wex_seen);free(m->x4->wex_nr3);free(m->x4);}
     free(m->L); free(m->cache); free(m->expert_scales); free(m->DN_rec); free(m->DN_conv); free(m->dn_dev_fresh); free(m->dn_host_stale); free(m->K); free(m->V); free(m->IK);
     q38_weight_free(&m->embed);q38_weight_free(&m->lm_head);
     free(m->draft_codes);free(m->draft_sc);m->draft_codes=NULL;m->draft_sc=NULL;
