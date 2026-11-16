@@ -25,6 +25,7 @@
 #include <string.h>
 #include <math.h>
 #include "ggml_grids.h"
+#include "fma_compat.h"   /* coli_fmaf_exact: gq_dot_i8's min correction without libm (#2882) */
 
 #if defined(__AVX2__) || defined(__F16C__)
 #include <immintrin.h>
@@ -1380,9 +1381,11 @@ static float gq_dot_i8(const int8_t *w8, const float *sw, const float *mw, int h
         acc += dx[b] * (sw[2 * b] * (float)s0 + sw[2 * b + 1] * (float)s1);
     }
 #endif
-    if (has_min) {   /* explicit fmaf: the same bits in gq_dot_b32, whatever the compiler contracts */
+    if (has_min) {   /* explicit fmaf: the same bits in gq_dot_b32, whatever the compiler contracts; without
+                      * FMA its bits inline (coli_fmaf_exact), not two libm calls a block of 32 (#2882) */
         float m = 0.f;
-        for (int64_t b = 0; b < n / 32; b++) m = fmaf(dx[b], fmaf(mw[2 * b], (float)xs[2 * b], mw[2 * b + 1] * (float)xs[2 * b + 1]), m);
+        for (int64_t b = 0; b < n / 32; b++)
+            m = coli_fmaf_exact(dx[b], coli_fmaf_exact(mw[2 * b], (float)xs[2 * b], mw[2 * b + 1] * (float)xs[2 * b + 1]), m);
         acc -= m;
     }
     return acc;
