@@ -3341,7 +3341,7 @@ endif
 # docs/wex.md), on a synthetic checkpoint and container. The objects are test_deepseek_v4's: built after it,
 # so the two sub-makes never write the same COLI_V4_UNIT_*.o at once under -j.
 tests/test_v4_wex4$(EXE): tests/test_v4_wex4.c tests/wex4_fixture.h tests/wnr3_fixture.h wex4.h wex_format.h \
-		wex_decode.c wex_decode.h deepseek_v4.c \
+		wex_decode.c wex_decode.h wex_fast_decode.h deepseek_v4.c \
 		deepseek_v4_internal.h Makefile.deepseek-v4.units Makefile.deepseek-v4 | tests/test_deepseek_v4$(EXE)
 	$(CC) $(CFLAGS) -DCOLI_V4_TEST_HOOKS $< $(V4_TEST_LINK_OBJS) -o $@ -pthread $(LDFLAGS)
 
