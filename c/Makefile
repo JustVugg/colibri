@@ -3909,6 +3909,11 @@ tests/cu_tier_fake.o: cu_tier.c
 tests/test_kimi_cuda_expert$(EXE): tests/test_kimi_cuda_expert.c kimi_k3.c tests/cu_tier_fake.o $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) -DCOLI_CUDA $< tests/cu_tier_fake.o $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
+# WEX expert containers (docs/wex.md): the record table, the lossless scale and palette codecs
+# and the WNR rANS decoder of wex_format.h, on synthetic records. No model, no GPU.
+tests/test_wex_format$(EXE): tests/test_wex_format.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 # ---------------------------------------------------------------------------
 # Generated header prerequisites (#1741)
 #
