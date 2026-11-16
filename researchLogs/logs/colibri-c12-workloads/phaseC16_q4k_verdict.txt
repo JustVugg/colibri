@@ -1,0 +1,54 @@
+== C16: Q4_K_M vs IQ2_XXS, interleaved A/B (2 rounds per arm, cache off, sgemm on) ==
+
+== output reproducibility within arm (same prompt, both rounds) ==
+  iq2 cold_1k: {'fb965acd73e5'} AGREE
+  iq2 cold_4k: {'a936fa5bdde2'} AGREE
+  iq2 cold_12k: {'fb84825253e6'} AGREE
+  iq2 q1: {'41b652ec1776'} AGREE
+  iq2 q2: {'2b824d027387'} AGREE
+  iq2 q3: {'b010b8fd7612'} AGREE
+  q4 cold_1k: {'ce37c8ce16a4'} AGREE
+  q4 cold_4k: {'ce37c8ce16a4'} AGREE
+  q4 cold_12k: {'8f22a642b5e9'} AGREE
+  q4 q1: {'d61cedb98f7d'} AGREE
+  q4 q2: {'129cd9c93215'} AGREE
+  q4 q3: {'80ec1fd121f7'} AGREE
+
+== cross-quant: shas differ (different weights) — quality judged by reading the text ==
+  cold_1k: iq2=fb965acd73e5 q4=ce37c8ce16a4 DIFFER (expected)
+  cold_4k: iq2=a936fa5bdde2 q4=ce37c8ce16a4 DIFFER (expected)
+  cold_12k: iq2=fb84825253e6 q4=8f22a642b5e9 DIFFER (expected)
+  q1: iq2=41b652ec1776 q4=d61cedb98f7d DIFFER (expected)
+  q2: iq2=2b824d027387 q4=129cd9c93215 DIFFER (expected)
+  q3: iq2=b010b8fd7612 q4=80ec1fd121f7 DIFFER (expected)
+
+== cold prefill phases (mean of 2 rounds, seconds) ==
+  cell phase         IQ2_XXS    Q4_K_M   ratio
+    1k s                23.1      31.0   1.34x
+    1k attention_s       1.5       1.5   1.04x
+    1k deltanet_s        6.3       6.7   1.06x
+    1k moe_s            15.2      22.6   1.49x
+    1k TTFT             23.1      31.0   1.34x
+    4k s                89.3     117.3   1.31x
+    4k attention_s       8.6       9.3   1.08x
+    4k deltanet_s       26.8      28.3   1.06x
+    4k moe_s            53.2      79.0   1.48x
+    4k TTFT             89.3     117.3   1.31x
+   12k s               301.8     378.1   1.25x
+   12k attention_s      46.9      48.4   1.03x
+   12k deltanet_s       89.7      90.5   1.01x
+   12k moe_s           163.0     236.9   1.45x
+   12k TTFT            301.8     378.1   1.25x
+
+== decode tokens/s (per round; scatter rule applies, direction is what counts) ==
+  1k: iq2 ['12.9', '14.2']  q4 ['3.4', '4.1']  (mean 13.6 vs 3.7, 0.28x)
+  4k: iq2 ['10.2', '10.0']  q4 ['6.8', '5.4']  (mean 10.1 vs 6.1, 0.60x)
+  12k: iq2 ['7.8', '8.1']  q4 ['5.8', '5.7']  (mean 8.0 vs 5.7, 0.72x)
+
+== probe decode (256-tok answers, small prompts) ==
+  iq2 mean 10.9 tok/s (['14.5', '13.5', '8.2', '8.8', '7.3', '13.1'])
+  q4  mean 6.4 tok/s (['9.2', '10.0', '3.5', '3.0', '7.5', '5.3'])
+
+== memory (server logs, resident weights after load) ==
+  iq2: ['2.64 GB', '2.53 GB']
+  q4: ['2.90 GB', '2.90 GB']
