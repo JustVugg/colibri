@@ -2863,6 +2863,10 @@ tests/test_xf16$(EXE): tests/test_xf16.c
 # the SSE2 i8 expert kernel (no AVX2+FMA) against xf_dot_i8_ref, bit for bit.
 tests/test_xf_sse2_int16$(EXE): tests/test_xf_sse2_int16.c
 	$(CC) $(if $(X86_64),$(filter-out -march=% -mavx% -mfma%,$(CFLAGS)) -march=x86-64 -mno-avx -mno-avx2 -mno-fma -ffp-contract=off,$(CFLAGS)) $< -o $@ $(LDFLAGS)
+# the same source built for Sandy Bridge: the AVX i8 expert kernel (AVX, no AVX2+FMA) against
+# xf_dot_i8_ref, and its fmaf emulation in four lanes and by the short way against fmaf (#2882).
+tests/test_xf_avx_i8$(EXE): tests/test_xf_sse2_int16.c
+	$(CC) $(if $(X86_64),$(filter-out -march=% -mavx% -mfma%,$(CFLAGS)) -march=sandybridge -mno-avx2 -mno-fma -ffp-contract=off,$(CFLAGS)) $< -o $@ $(LDFLAGS)
 # coli_fmaf_exact (fma_compat.h) against fmaf, bit for bit, built without FMA where it is the
 # emulation the kernels take there (#2882).
 tests/test_fmaf_exact$(EXE): tests/test_fmaf_exact.c
