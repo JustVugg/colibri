@@ -39,9 +39,10 @@ int coli_v4_gpu_resident_first(void) { return 0; }
 void (*coli_v4_expert_store_vram_held)(ColiExpertStore *store, int layer,
                                        unsigned char *held, int experts);
 /* Backend entries dev gained after #1766's base (the bank-sized mirror reserve,
- * the prefill bank's activations): this test never reaches them. */
-int dsv4_cuda_expert_bank_slots(int experts) { (void)experts; return 0; }
-long long dsv4_cuda_expert_bank_slot_bytes(int hidden, int intermediate) { (void)hidden; (void)intermediate; return 0; }
+ * the prefill bank's activations): no bank unless a test sizes one. */
+static int fake_bank_slots;
+int dsv4_cuda_expert_bank_slots(int experts) { (void)experts; return fake_bank_slots; }
+long long dsv4_cuda_expert_bank_slot_bytes(int hidden, int intermediate) { (void)hidden; (void)intermediate; return fake_bank_slots ? 13LL << 20 : 0; }
 void dsv4_cuda_activation_free(Dsv4CudaActivation *a) { (void)a; }
 int dsv4_cuda_device_unified(int device) { (void)device; return 0; }
 /* fake_free_mb >= 0: a card with that much free, plus 13 MiB for every
@@ -803,6 +804,41 @@ static void test_bank_make_room(void) {
     assert(live_tensors == start_tensors);
 }
 
+#ifdef COLI_V4_HIP
+/* --vram below 10 GiB keeps the dense mirrors, and the shared experts with
+ * them, in RAM: COLI_CUDA_MOE_BATCH=1 then asks for a bank that cannot run,
+ * so it is not asked for -- no VRAM kept free for it, and the prefill pool
+ * stays on (coli_v4_expert_store_prefill_pool). 10 GiB or more: as asked. */
+static void test_hip_bank_dense_ram(void) {
+    long long bank = v4_reserve_bank_bytes, mirror = v4_reserve_mirror_bytes;
+    ColiV4Engine engine = {0};
+    ColiDeepSeekV4Config config = {.hidden_size = 4096, .moe_intermediate_size = 2048,
+                                   .n_routed_experts = 132};
+    setenv("COLI_CUDA_MOE_BATCH", "1", 1);
+    unsetenv("DSV4_CUDA_VRAM_RESERVE_MB");
+    unsetenv("V4_BANK_MAKE_ROOM");
+    fake_bank_slots = 132;
+    fake_free_mb = 16000; fake_free_tensors = live_tensors;
+    setenv("CUDA_EXPERT_GB", "12", 1);
+    v4_gpu_place(&engine, 0);
+    v4_gpu_mirror_reserve_size(&config, 1);
+    assert(!engine.gpu.dense_ram && coli_v4_gpu_moe_batch_wanted());
+    assert(v4_reserve_bank_bytes == 132 * (13LL << 20));
+    assert(v4_gpu_mirror_reserve_mb(64, NULL) > (132 * 13LL) + COLI_V4_RESERVE_HEADROOM_MB);
+    setenv("CUDA_EXPERT_GB", "5", 1);
+    v4_gpu_place(&engine, 0);
+    v4_gpu_mirror_reserve_size(&config, 1);
+    assert(engine.gpu.dense_ram && !coli_v4_gpu_moe_batch_wanted());
+    assert(v4_reserve_bank_bytes == 0);
+    /* the reserve is --vram's hold (16000 - 5120 MiB), not a bank's */
+    assert(v4_gpu_mirror_reserve_mb(64, NULL) == 16000 - 5120);
+    unsetenv("CUDA_EXPERT_GB");
+    unsetenv("COLI_CUDA_MOE_BATCH");
+    fake_free_mb = -1; fake_bank_slots = 0; g_v4_dense_ram = 0; g_v4_vram_hold_mb = 0;
+    v4_reserve_bank_bytes = bank; v4_reserve_mirror_bytes = mirror;
+}
+#endif
+
 static void test_resident_route(void) {
     V4GpuExpertMirrorCache *cache=v4_gpu_expert_mirrors_create_capacity(0,256);
     cache->first_layer=7; cache->end_layer=8; cache->experts_per_layer=256;
@@ -838,6 +874,9 @@ static void test_resident_route(void) {
 }
 
 int main(void) {
+#ifdef COLI_V4_HIP
+    test_hip_bank_dense_ram();   /* first: the bank switch is read once */
+#endif
     ColiV4Engine *engine = calloc(1, sizeof(*engine));
     ColiExpertStore store = {0};
     engine->config.num_hidden_layers = 43;
