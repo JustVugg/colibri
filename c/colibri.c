@@ -1237,13 +1237,13 @@ static void matmul_i4_grouped_pair(float *yg, float *yu, const float *x,
 #endif
                 for(; i+1<base+glen; i+=2){
                     uint8_t bg=wg[i>>1], bu=wu2[i>>1];
-                    ag+=(xs[i]*(float)((int)(bg&0xF)-8)+xs[i+1]*(float)((int)(bg>>4)-8))*scg;
-                    au+=(xs[i]*(float)((int)(bu&0xF)-8)+xs[i+1]*(float)((int)(bu>>4)-8))*scu;
+                    ag=i4g_step2(ag,xs[i],(float)((int)(bg&0xF)-8),xs[i+1],(float)((int)(bg>>4)-8),scg);
+                    au=i4g_step2(au,xs[i],(float)((int)(bu&0xF)-8),xs[i+1],(float)((int)(bu>>4)-8),scu);
                 }
                 if(i<base+glen){
                     uint8_t bg=wg[i>>1], bu=wu2[i>>1];
-                    ag+=xs[i]*(float)((int)(bg&0xF)-8)*scg;
-                    au+=xs[i]*(float)((int)(bu&0xF)-8)*scu;
+                    ag=i4g_step1(ag,xs[i],(float)((int)(bg&0xF)-8),scg);
+                    au=i4g_step1(au,xs[i],(float)((int)(bu&0xF)-8),scu);
                 }
             }
             yg[(int64_t)s*O+o]=ag; yu[(int64_t)s*O+o]=au;
