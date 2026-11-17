@@ -1271,8 +1271,8 @@ qwen38_metal.o: qwen38_metal.m qwen38_gpu.h qwen36_gpu.h qwen36_metal_internal.h
 	$(QWEN36_METALC) -c qwen38_metal.m -o $@
 
 # Every Qwen3.8 kernel against a double-precision reference. No model needed.
-tests/test_qwen38_metal_kernels: tests/test_qwen38_metal_kernels.c qwen38_gpu.h qwen36_gpu.h qwen38_metal.o \
-                                 qwen36_metal.o
+tests/test_qwen38_metal_kernels: tests/test_qwen38_metal_kernels.c qwen38_gpu.h qwen36_gpu.h ggml_quants.h ggml_grids.h \
+                                 qwen38_metal.o qwen36_metal.o
 	$(CC) -O2 -Wall -Wextra -Wno-unused-function -std=c11 $< qwen38_metal.o qwen36_metal.o -framework Metal -framework Foundation -lm -o $@
 
 .PHONY: test-qwen38-metal-kernels

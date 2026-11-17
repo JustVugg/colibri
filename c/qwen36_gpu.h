@@ -153,9 +153,11 @@ int q36_router_dot2(q36_tensor *y, q36_tensor *x, q36_tensor *q, q36_tensor *sc,
 /* Shared projections use router_dot in exact mode and q36_dot_i8's fast
  * vector or matrix kernels otherwise. */
 int q36_shared_dot(q36_tensor *y, q36_tensor *x, q36_tensor *q, q36_tensor *sc, int rows, int in, int out);
-/* softmax(logits + bias) per row; logits keeps the sum (bias added in place). */
+/* softmax(logits + bias) per row; logits keeps the sum (bias added in place). bias NULL: none. */
 int q36_router_softmax(q36_tensor *prob, q36_tensor *logits, q36_tensor *bias, int rows, int experts);
-/* With fewer eligible experts than topk (a NaN, or the groups), the missing
+/* Top-k of the probabilities: up to 256 experts and top-k 8 with groups, up to 512 experts
+ * and top-k 16 without (G == 1); ties go to the lowest id, the weights are the chosen
+ * probabilities over their sum. With fewer eligible experts than topk (a NaN, or the groups), the missing
  * entries get id -1 and weight -1e30, and the others are not renormalized: the
  * caller decides (the CPU engine degrades instead). */
 int q36_router_select(q36_tensor *ids, q36_tensor *weights, q36_tensor *prob, int rows, int experts,
@@ -165,7 +167,7 @@ int q36_shared_gate(q36_tensor *gate, q36_tensor *x, q36_tensor *w, int rows, in
 int q36_scale_rows(q36_tensor *x, q36_tensor *s, int rows, int hidden);
 
 /* Routed experts, by expert: hidden and inter multiples of 64, topk at most 8
- * (other shapes are refused). A slot holds planar int4 gate|up|down and, from
+ * (other shapes are refused; expert_sum and the GGUF experts below take topk up to 16). A slot holds planar int4 gate|up|down and, from
  * byte `scales`, their float scales. The uint32 entries pairs[first..first+n)
  * each name a slot (bits 28..30) and a choice row*topk+k (bits 0..27).
  * h: rows*topk x inter, y: rows*topk x hidden. expert_sum then writes, per

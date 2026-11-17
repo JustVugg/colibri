@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "../qwen38_gpu.h"
+#include "../ggml_quants.h"
 
 /* ---- helpers (copies of tests/test_qwen36_kernels.c's) ------------------- */
 
@@ -110,6 +111,250 @@ static void test_copy_declines(void) {
     q36_tensor_free(x); q36_tensor_free(y);
 }
 
+/* ---- router and experts at Qwen3.8's width (512 experts, top-k up to 16) --- */
+
+/* Qwen3.8's CPU router (qwen38_core.h's q38_moe_decode_ex): softmax with the maximum
+ * subtracted, top-k by K passes of "the largest unused" with a strict > (ties go to the
+ * lowest id), weights val / sum(top) (norm_topk). Weights in double. */
+static void ref_router(int *ids, double *w, const float *logits, int E, int K) {
+    float *p = malloc(sizeof(float) * E);
+    float mx = logits[0];
+    for (int e = 1; e < E; e++) if (logits[e] > mx) mx = logits[e];
+    for (int e = 0; e < E; e++) p[e] = expf(logits[e] - mx);
+    double top = 0;
+    for (int z = 0; z < K; z++) {
+        int best = -1;
+        float bv = -1.f;
+        for (int e = 0; e < E; e++) {
+            int used = 0;
+            for (int j = 0; j < z; j++) used |= ids[j] == e;
+            if (!used && p[e] > bv) { bv = p[e]; best = e; }
+        }
+        ids[z] = best;
+        w[z] = (double)expf(logits[best] - mx);
+        top += w[z];
+    }
+    for (int z = 0; z < K; z++) w[z] /= top;
+    free(p);
+}
+
+/* logits (rows x E) through q36_router_softmax and q36_router_select (one group):
+ * the ids identical to ref_router's, the weights within tol. */
+static void run_router(const char *what, const float *logits, int rows, int E, int K, int exact) {
+    q36_gpu_set_exact(exact);
+    size_t n = (size_t)rows * E, c = (size_t)rows * K;
+    q36_tensor *lg = q36_tensor_new(n * sizeof(float)), *prob = q36_tensor_new(n * sizeof(float));
+    q36_tensor *ids = q36_tensor_new(c * sizeof(int)), *wts = q36_tensor_new(c * sizeof(float));
+    memcpy(F(lg), logits, n * sizeof(float));
+    int *rid = malloc(sizeof(int) * c);
+    double *rw = malloc(sizeof(double) * c);
+    for (int r = 0; r < rows; r++) ref_router(rid + (size_t)r * K, rw + (size_t)r * K, logits + (size_t)r * E, E, K);
+    int ok = q36_router_softmax(prob, lg, NULL, rows, E) && q36_router_select(ids, wts, prob, rows, E, K, 1, 1);
+    sync_or_die();
+    char name[96];
+    snprintf(name, sizeof name, "%s %dx%d K=%d %s ids", what, rows, E, K, exact ? "exact" : "fast");
+    const int *gid = q36_tensor_data(ids);
+    int same = ok;
+    for (size_t i = 0; i < c && same; i++) same = gid[i] == rid[i];
+    expect(name, same);
+    if (ok && !same)
+        for (size_t i = 0; i < c; i++)
+            if (gid[i] != rid[i]) { printf("    first mismatch at %zu: got %d ref %d\n", i, gid[i], rid[i]); break; }
+    snprintf(name, sizeof name, "%s %dx%d K=%d %s weights", what, rows, E, K, exact ? "exact" : "fast");
+    if (!ok) expect(name, 0);
+    else check(name, F(wts), rw, NULL, c, exact ? 1e-5 : 3e-4);
+    free(rid); free(rw);
+    q36_tensor_free(lg); q36_tensor_free(prob); q36_tensor_free(ids); q36_tensor_free(wts);
+}
+
+/* Random logits, kept apart (a random permutation of a grid 0.01 apart, plus less
+ * than a tenth of that of noise) so the CPU's and the GPU's float softmax pick the
+ * same experts. */
+static void test_router_wide(int rows, int E, int K, int exact) {
+    float *l = malloc(sizeof(float) * (size_t)rows * E);
+    int *perm = malloc(sizeof(int) * E);
+    for (int r = 0; r < rows; r++) {
+        for (int e = 0; e < E; e++) perm[e] = e;
+        for (int e = E - 1; e > 0; e--) {
+            int j = (int)((frand() + 1.0f) * 0.5f * (float)(e + 1));
+            if (j > e) j = e;
+            int t = perm[e]; perm[e] = perm[j]; perm[j] = t;
+        }
+        for (int e = 0; e < E; e++) l[(size_t)r * E + e] = (float)perm[e] * 0.01f - 2.0f + frand() * 0.0009f;
+    }
+    run_router("router_wide", l, rows, E, K, exact);
+    free(l); free(perm);
+}
+
+/* Groups of equal logits: equal probabilities in both softmaxes, so the ids
+ * show the tie-break. Three experts at the top (ids 400, 7, 300), a group of
+ * 40 at the next value straddling the K boundary, the rest below. */
+static void test_router_tie(int rows, int E, int K, int exact) {
+    float *l = malloc(sizeof(float) * (size_t)rows * E);
+    for (int r = 0; r < rows; r++) {
+        float *lr = l + (size_t)r * E;
+        for (int e = 0; e < E; e++) lr[e] = -1.0f - 0.5f * (float)((e * 37 + r) % 5);
+        for (int e = 0; e < 40; e++) lr[(e * 13 + 5 * r + 3) % E] = 1.0f;
+        lr[400 % E] = lr[7] = lr[300 % E] = 2.0f;
+    }
+    run_router("router tie", l, rows, E, K, exact);
+    free(l);
+}
+
+/* q36_router_select declines more than 512 experts, more than 16, groups at the
+ * wide sizes; nothing is written. */
+static void test_router_wide_declines(void) {
+    q36_tensor *prob = rand_tensor(2 * 600, 1.0f), *ids = q36_tensor_new(2 * 20 * 4), *w = q36_tensor_new(2 * 20 * 4);
+    int took = q36_router_select(ids, w, prob, 2, 513, 10, 1, 1) + q36_router_select(ids, w, prob, 2, 512, 17, 1, 1) +
+               q36_router_select(ids, w, prob, 2, 512, 10, 2, 1) + q36_router_select(ids, w, prob, 2, 300, 9, 2, 1);
+    sync_or_die();
+    int clean = 1;
+    for (int i = 0; i < 40; i++) clean = clean && ((int *)q36_tensor_data(ids))[i] == 0 && F(w)[i] == 0.0f;
+    expect("router_wide declines E=513 K=17 G>1", took == 0 && clean);
+    q36_tensor_free(prob); q36_tensor_free(ids); q36_tensor_free(w);
+}
+
+/* q36_expert_sum with K choices: out = residual + sum_k w_k y_k + shared against a double
+ * reference, scaled by the magnitude of the terms (|residual| + sum |w y| + |shared|). */
+static void test_expert_sum(int rows, int H, int K, int exact) {
+    q36_gpu_set_exact(exact);
+    size_t cells = (size_t)rows * H;
+    q36_tensor *y = rand_tensor(cells * K, 2.0f), *wts = rand_tensor((size_t)rows * K, 0.5f);
+    q36_tensor *sh = rand_tensor(cells, 1.0f), *res = rand_tensor(cells, 4.0f), *out = q36_tensor_new(cells * 4);
+    double *ref = malloc(sizeof(double) * cells), *mag = malloc(sizeof(double) * cells);
+    for (int r = 0; r < rows; r++)
+        for (int o = 0; o < H; o++) {
+            size_t i = (size_t)r * H + o;
+            double s = 0, m = 0;
+            for (int k = 0; k < K; k++) {
+                double t = (double)F(wts)[r * K + k] * F(y)[((size_t)r * K + k) * H + o];
+                s += t; m += fabs(t);
+            }
+            ref[i] = F(res)[i] + s + F(sh)[i];
+            mag[i] = fabs(F(res)[i]) + m + fabs(F(sh)[i]) + 1e-3;
+        }
+    for (size_t i = 0; i < cells; i++) F(out)[i] = NAN;
+    int ok = q36_expert_sum(out, y, wts, sh, res, rows, H, K);
+    sync_or_die();
+    char name[80];
+    snprintf(name, sizeof name, "expert_sum %dx%d K=%d %s", rows, H, K, exact ? "exact" : "fast");
+    if (!ok) expect(name, 0);
+    else check(name, F(out), ref, mag, cells, exact ? 1e-5 : 3e-4);
+    free(ref); free(mag);
+    q36_tensor_free(y); q36_tensor_free(wts); q36_tensor_free(sh); q36_tensor_free(res); q36_tensor_free(out);
+}
+
+static uint8_t rand_byte(void) { return (uint8_t)((g_rng = g_rng * 1664525u + 1013904223u) >> 24); }
+
+static uint16_t f16_bits(float f) {
+    _Float16 h = (_Float16)f;
+    uint16_t b;
+    memcpy(&b, &h, 2);
+    return b;
+}
+
+/* rows of `in` IQ4_XS or IQ4_NL weights (type t) as test_qwen36_kernels.c's gq_fill_rows leaves
+ * them: random quants and packed scales, the block's f16 scale (its first two bytes in both
+ * types) of a sensible size and sign. */
+static void iq4_fill_rows(int t, uint8_t *p, int rows, int in) {
+    const int64_t rb = gq_row_bytes(t, in), blocks = (int64_t)rows * (in / GQ_TYPES[t].blck);
+    const int bytes = GQ_TYPES[t].bytes;
+    for (int64_t i = 0; i < rb * rows; i++) p[i] = rand_byte();
+    for (int64_t k = 0; k < blocks; k++) {
+        float d = (frand() + 1.5f) * 0.004f;
+        uint16_t dh = f16_bits(frand() < -0.6f ? -d : d);
+        memcpy(p + k * bytes, &dh, 2);
+    }
+}
+
+/* GGUF routed experts at Qwen3.8's width and in its IQ4_XS file's types (gate and up IQ4_XS;
+ * down IQ4_NL, as llama.cpp stores the 640-column ffn_down_exps of an IQ quant, 640 not being a
+ * multiple of IQ4_XS's 256-weight block): `rows` tokens each routing to the same
+ * NE = K experts (in a different order a row), bound in two groups of slots, slots 0..7 and
+ * then slots 0..NE-9: the choice index row*K+k runs past 8 a row. gate_up and down against a
+ * double reference of the dequantized SwiGLU experts (down from the GPU's h), scaled by
+ * the magnitude of the products. */
+static void test_expert_gq(int rows, int H, int I, int K, int exact) {
+    const int t = GQ_IQ4_XS, td = GQ_IQ4_NL, NE = K, choices = rows * K;
+    const int64_t rbg = gq_row_bytes(t, H), rbd = gq_row_bytes(td, I);
+    const size_t up = (size_t)(rbg * I), down = up + (size_t)(rbg * I), bytes = down + (size_t)(rbd * H);
+    q36_gpu_set_exact(exact);
+    q36_tensor **slot = calloc((size_t)NE, sizeof(*slot));
+    float sg[16], su[16], sd[16];
+    for (int e = 0; e < NE; e++) {
+        slot[e] = q36_tensor_new(bytes);
+        uint8_t *p = q36_tensor_data(slot[e]);
+        iq4_fill_rows(t, p, I, H);
+        iq4_fill_rows(t, p + up, I, H);
+        iq4_fill_rows(td, p + down, H, I);
+        sg[e] = 0.5f + 0.25f * (frand() + 1.0f);
+        su[e] = 0.5f + 0.25f * (frand() + 1.0f);
+        sd[e] = 0.5f + 0.25f * (frand() + 1.0f);
+    }
+    int *ids = malloc(sizeof(int) * choices);
+    for (int r = 0; r < rows; r++)
+        for (int k = 0; k < K; k++) ids[r * K + k] = (k * (2 * r + 1) + 3 * r) % NE;   /* a permutation a row */
+    q36_tensor *x = rand_tensor((size_t)rows * H, 1.0f), *pairs = q36_tensor_new((size_t)choices * 4);
+    q36_tensor *h = q36_tensor_new((size_t)choices * I * 4), *y = q36_tensor_new((size_t)choices * H * 4);
+    for (size_t i = 0; i < (size_t)choices * I; i++) F(h)[i] = NAN;
+    for (size_t i = 0; i < (size_t)choices * H; i++) F(y)[i] = NAN;
+    uint32_t *pp = q36_tensor_data(pairs);
+    int ok = 1, q = 0;
+    for (int g0 = 0; g0 < NE; g0 += 8) {
+        int ng = NE - g0 < 8 ? NE - g0 : 8, first = q;
+        q36_tensor *s8[8] = {0};
+        q36_gq_experts tt = {t, t, td, {0}, {0}, {0}};
+        for (int j = 0; j < ng; j++) {
+            int e = g0 + j;
+            s8[j] = slot[e];
+            tt.sg[j] = sg[e]; tt.su[j] = su[e]; tt.sd[j] = sd[e];
+            for (int p = 0; p < choices; p++)
+                if (ids[p] == e) pp[q++] = (uint32_t)p | (uint32_t)j << 28;
+        }
+        ok = q36_expert_gate_up_gq(h, x, pairs, first, q - first, s8, rows, H, I, K, &tt) && ok;
+        ok = q36_expert_down_gq(y, h, pairs, first, q - first, s8, rows, H, I, K, &tt) && ok;
+    }
+    sync_or_die();
+    double *rh = malloc(sizeof(double) * choices * I), *hm = malloc(sizeof(double) * choices * I);
+    double *ry = malloc(sizeof(double) * choices * H), *ym = malloc(sizeof(double) * choices * H);
+    float *gr = malloc(sizeof(float) * H), *ur = malloc(sizeof(float) * H), *dr = malloc(sizeof(float) * I);
+    for (int p = 0; p < choices; p++) {
+        int e = ids[p];
+        const uint8_t *w = q36_tensor_data(slot[e]);
+        const float *xr = F(x) + (size_t)(p / K) * H, *hr = F(h) + (size_t)p * I;
+        for (int i = 0; i < I; i++) {
+            gq_dequant_row(t, w + i * rbg, gr, H);
+            gq_dequant_row(t, w + up + i * rbg, ur, H);
+            double g = 0, u = 0, mg = 0, mu = 0;
+            for (int j = 0; j < H; j++) {
+                g += (double)gr[j] * xr[j]; mg += fabs((double)gr[j] * xr[j]);
+                u += (double)ur[j] * xr[j]; mu += fabs((double)ur[j] * xr[j]);
+            }
+            g *= sg[e]; u *= su[e]; mg *= sg[e]; mu *= su[e];
+            rh[(size_t)p * I + i] = g / (1.0 + exp(-g)) * u;
+            hm[(size_t)p * I + i] = (mg * fabs(u) + mu * fabs(g)) + 1e-9;
+        }
+        for (int o = 0; o < H; o++) {
+            gq_dequant_row(td, w + down + o * rbd, dr, I);
+            double v = 0, m = 0;
+            for (int j = 0; j < I; j++) { v += (double)dr[j] * hr[j]; m += fabs((double)dr[j] * hr[j]); }
+            ry[(size_t)p * H + o] = v * sd[e];
+            ym[(size_t)p * H + o] = m * sd[e] + 1e-9;
+        }
+    }
+    char name[96];
+    snprintf(name, sizeof name, "expert_gq IQ4_XS|IQ4_NL %dx%d I=%d K=%d %s gate_up", rows, H, I, K, exact ? "exact" : "fast");
+    if (!ok) expect(name, 0);
+    else check(name, F(h), rh, hm, (size_t)choices * I, exact ? 2e-5 : 3e-4);
+    snprintf(name, sizeof name, "expert_gq IQ4_XS|IQ4_NL %dx%d I=%d K=%d %s down", rows, H, I, K, exact ? "exact" : "fast");
+    if (!ok) expect(name, 0);
+    else check(name, F(y), ry, ym, (size_t)choices * H, exact ? 2e-5 : 3e-4);
+    free(rh); free(hm); free(ry); free(ym); free(gr); free(ur); free(dr); free(ids);
+    for (int e = 0; e < NE; e++) q36_tensor_free(slot[e]);
+    free(slot);
+    q36_tensor_free(x); q36_tensor_free(pairs); q36_tensor_free(h); q36_tensor_free(y);
+}
+
 int main(void) {
     /* As tests/test_qwen36_kernels.c: GitHub's Apple Paravirtual device never completes
      * command buffers, so nothing runs there. */
@@ -128,6 +373,19 @@ int main(void) {
         test_copy_interleaved(3, 32, exact);        /* tiny fixture: hidden 32 */
     }
     test_copy_declines();
+
+    for (int exact = 1; exact >= 0; exact--) {
+        int rr[3] = {1, 3, 8};
+        for (int i = 0; i < 3; i++) test_router_wide(rr[i], 512, 10, exact);   /* real: 512 experts, top-k 10 */
+        test_router_wide(2, 512, 16, exact);
+        test_router_wide(3, 4, 2, exact);                                        /* tiny fixture: 4 experts, top-k 2 */
+        test_router_tie(2, 512, 10, exact);
+        test_router_tie(1, 512, 16, exact);
+        test_expert_sum(3, 2560, 10, exact);
+        test_expert_sum(3, 32, 2, exact);
+        test_expert_gq(2, 2560, 640, 10, exact);
+    }
+    test_router_wide_declines();
 
     printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "PASSED", g_failures);
     q36_gpu_cleanup();
