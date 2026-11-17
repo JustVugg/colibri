@@ -287,6 +287,73 @@ def _glm53_dense_tensors(info, env):
     return dict(info, dense_bytes=total, embed_bytes=embedding, dense_tensors=adjusted)
 
 
+# The matrices qwen36.c loads through load_tq, by their name in the layer: the attention's
+# projections and gate, the router, the shared expert or a dense layer's MLP, the DeltaNet's
+# input and output projections, LFM3's short conv and Muse Spark's latent projections (and
+# the lm_head). The vectors and the small matrices beside them (norms, conv taps, in_proj_a
+# and in_proj_b, dt_bias, A_log, the shared expert's gate) go through load_t_n: float32.
+_Q36_LOAD_TQ = (_ATTENTION_PROJECTIONS | _MLP_PROJECTIONS |
+                frozenset(p.replace("shared_experts", "shared_expert") for p in _SHARED_PROJECTIONS) |
+                {"mlp.gate", "self_attn.gate_proj", "linear_attn.in_proj_qkv", "linear_attn.in_proj_z",
+                 "linear_attn.out_proj", "conv.in_proj", "conv.out_proj",
+                 "mlp.pre_expert_proj", "mlp.post_expert_proj"})
+_Q36_FLOAT32 = re.compile(r"(norm\.weight|layernorm\.weight|conv1d\.weight|conv\.conv\.weight|"
+                          r"in_proj_a\.weight|in_proj_b\.weight|shared_expert_gate\.weight|"
+                          r"dt_bias|A_log|e_score_correction_bias|softmax_offset)$")
+
+
+def _q36_dense_tensors(info, env):
+    """Price qwen36's dense weights as qwen36.c holds them, not as the checkpoint stores them.
+
+    With the int8 trunk (COLI_DENSE_I8 on, COLI_DENSE_BITS 8, no COLI_KEEP_F32: the
+    default) load_tq turns each matrix of _Q36_LOAD_TQ into int8 rows with a float32
+    scale a row while it loads, and the embedding's rows are read in place from the
+    checkpoint (qwen36_embedding.h) unless a Vulkan run or COLI_EMBED_MMAP=0 keeps the
+    float32 table. The vectors are read into float32. A GGUF's tensors, the other
+    trunks, macOS's Metal graph and the tensors not named here keep the checkpoint's
+    bytes, as before. Priced as the checkpoint stores them (4.56 GiB in BF16 on the 35B
+    int4 gs64 container), the plan kept 244 of its 256 experts a layer in the 30.5 GiB
+    a 32 GB box had free, and the CUDA tier pools the experts for a prompt chunk's copy
+    only when the RAM holds every one: a 5.6K-token prompt on an 8 GB card took 119 s,
+    7.9 with every expert in RAM (#2900). Held so, it is 2.34 GiB of RSS beside the experts.
+    """
+    if info["resolved_family"].descriptor.id != "qwen36" or sys.platform == "darwin":
+        return info
+    setting = re.match(r"\s*([+-]?\d+)", env.get("COLI_DENSE_BITS") or "8")
+    bits = int(setting[1]) if setting else 8   # dense_bits(): 4 and 16 are those, any other is 8
+    if (env.get("COLI_DENSE_I8") or "").startswith("0") or bits in (4, 16) or env.get("COLI_KEEP_F32") is not None:
+        return info
+    in_place = not (env.get("COLI_EMBED_MMAP") or "").startswith("0") and not _vk_flag(env, "COLI_VULKAN")
+    adjusted, total, embedding = [], 0, 0
+    for tensor in info.get("dense_tensors", []):
+        name, size, resident = _text_weight_name(tensor["name"]), tensor["size"], tensor["resident"]
+        element = {"BF16": 2, "F16": 2, "F32": 4}.get(tensor["dtype"])
+        shape = _matrix_shape(tensor)
+        if element and size % element == 0:
+            if _EMBED_TABLE.search(name):
+                resident = 0 if in_place and shape else size // element * 4
+            elif shape and (name == "lm_head.weight" or _layer_component(name) in _Q36_LOAD_TQ):
+                rows, columns = shape
+                resident = rows * columns + rows * 4
+            elif (name.startswith("model.layers.") or name == "model.norm.weight") and _Q36_FLOAT32.search(name):
+                resident = size // element * 4
+        adjusted.append(dict(tensor, resident=resident))
+        total += resident
+        if _EMBED_TABLE.search(name):
+            embedding += resident
+    return dict(info, dense_bytes=total, embed_bytes=embedding, dense_tensors=adjusted)
+
+
+def _engine_state_bytes(family_id, state_bytes, env):
+    """The KV the engine allocates for the planner's float32 state of a context: qwen36.c keeps
+    K and V as float16 (kv16.h) unless Q36_KV=f32. Only the cache's sizing takes it; chat_context
+    keeps the float32 steps, so the default context stays what it was: a wider one would grow
+    the CUDA chain's mirrors on the card further at a request without max_tokens (#2900)."""
+    if family_id == "qwen36" and (env.get("Q36_KV") or "").strip() != "f32":
+        return state_bytes // 2
+    return state_bytes
+
+
 def _q38_state_file(env, setting, default, model_dir):
     return os.path.realpath(env.get(setting) or os.path.join(model_dir, default))
 
@@ -3478,6 +3545,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     info = _q38_cpu_dense_tensors(info, env_now)
     info = _q38_mtp_head(info, env_now, vulkan)
     info = _glm53_dense_tensors(info, env_now)
+    info = _q36_dense_tensors(info, env_now)
     # Only the matrices a family's dho pass can release earn RAM credit. The
     # embedding, norms, CPU-only components and unrecognized formats stay reserved.
     family_id = info["resolved_family"].descriptor.id
@@ -3587,7 +3655,8 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     unified = placement_unified or _host_unified_memory() or bool(shared_dense_bytes)
     typical = info["typical_expert_bytes"]
     max_expert = info["max_expert_bytes"] or typical
-    kv_bytes = (geometry.context_state_bytes + geometry.fixed_state_bytes) * kv_slots
+    state_bytes = _engine_state_bytes(family_id, geometry.context_state_bytes, env_now)
+    kv_bytes = (state_bytes + geometry.fixed_state_bytes) * kv_slots
     kv_buffer = geometry.workspace_bytes
     # expert_fixed_bytes is retained once per model (currently Qwen3.8's
     # normalized FP8 scale bank), unlike per_cap_bytes which is paid for
@@ -3786,7 +3855,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                     "shared_device_dense_bytes": shared_dense_bytes,
                     "runtime_bytes": runtime_bytes,
                     "expert_fixed_bytes": info["expert_fixed_bytes"],
-                    "sequence_state_bytes": geometry.context_state_bytes,
+                    "sequence_state_bytes": state_bytes,
                     "fixed_state_bytes": geometry.fixed_state_bytes,
                     "workspace_bytes": geometry.workspace_bytes,
                     "expert_cache_bytes": cache_bytes,

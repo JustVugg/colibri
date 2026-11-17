@@ -8633,13 +8633,38 @@ static void q36_park_decide(Model *m, const int *ids, int np, int max_tok) {
 #include "prefix_store.h"
 static ColiPrefixStore g_q36_ps;
 static int g_q36_ps_init;
+/* The MiB the expert cache will still take: its slots not filled yet, at a slot's size as the
+ * cache was sized (qwen36_cap_for_ram; a GGUF's, its largest expert). Its slots fill as the
+ * experts are routed, so the RAM free at the first request still holds them: the store's
+ * budget, a quarter of that, took RAM the cache filled after it. The plan prices the cache
+ * from the engine's own sizes (resource_plan._q36_dense_tensors), no longer with the slack
+ * the checkpoint's sizes left, which had made room for both. */
+static double q36_cache_unfilled_mb(const Model *m) {
+    const Cfg *c = &m->c;
+    if (!m->cache || QWEN_GRAPH(m)) return 0;
+    const double slot = g_gguf ? (double)m->gqe_max
+                               : (double)q36_eh(c) * c->inter * (xf_mode((Model *)m) ? 1.5 : 3.0) +
+                                 (double)(c->inter * 2 + q36_eh(c)) * sizeof(float);
+    double n = 0;
+    for (int i = 0; i < c->n_layers; i++) if (m->cache[i].cap > m->cache[i].n) n += m->cache[i].cap - m->cache[i].n;
+    return n * slot / 1048576.0;
+}
+/* The store, set up once: less_mb, RAM the engine will still take that the free RAM holds now */
+static void q36_ps_open(double less_mb) {
+    if (g_q36_ps_init) return;
+    g_q36_ps_init = 1;
+    double avail = compat_mem_available_gb() * 1024.0;
+    if (avail > 0) { avail -= less_mb; if (avail < 1.0) avail = 1.0; }   /* known: what is left of it */
+    coli_ps_init_env(&g_q36_ps, kv_prefix_off(), avail);
+}
 static int q36_ps_on(const Model *m) {
-    if (!g_q36_ps_init) { g_q36_ps_init = 1; coli_ps_init_env(&g_q36_ps, kv_prefix_off(), compat_mem_available_gb() * 1024.0); }
+    q36_ps_open(q36_cache_unfilled_mb(m));
     /* the graph keeps its state on the GPU: the store's copies are the CPU engine's (QWEN_GRAPH) */
     return g_q36_ps.on && !g_q36_mtp.on && !m->vis_rows_n && !m->mpos && !m->rope_delta && !QWEN_GRAPH(m);
 }
-/* the store's budget, decided when the engine plans its RAM: a tier's host pool leaves it (ram_later) */
-static size_t q36_ps_plan(const Model *m) { q36_ps_on(m); return g_q36_ps.on ? g_q36_ps.budget : 0; }
+/* the store's budget, decided when the engine plans its RAM: a tier's host pool leaves it (ram_later),
+ * and the pool then sizes the cache, so the cache's slots are not taken off here */
+static size_t q36_ps_plan(const Model *m) { q36_ps_open(0); q36_ps_on(m); return g_q36_ps.on ? g_q36_ps.budget : 0; }
 /* whether a checkpoint needs more than rows by position: a recurrence, a ring */
 static int q36_ps_needs_state(const Model *m) {
     for (int i = 0; i < m->c.n_layers; i++) if (!m->c.is_attn[i] || (m->kv_ring && m->c.win_layer && m->c.win_layer[i])) return 1;

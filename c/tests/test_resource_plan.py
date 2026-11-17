@@ -14,6 +14,7 @@ from resource_plan import (
     CgroupFormatError,
     analyze_model,
     build_plan,
+    chat_context,
     cpu_socket_count,
     darwin_available_bytes,
     discover_gpus,
@@ -1474,9 +1475,11 @@ memInfo.free:                     23.50 GB (97%)
         kwargs = dict(context=32, available_memory=16 * GB, available_disk=16 * GB, gpus=[],
                       vulkan={"type": "discrete", "budget_bytes": 16 * GB})
         on = {"COLI_VULKAN": "1", "COLI_VK_DENSE_HOST": "0"}
-        host = build_plan(model, env=dict(on, COLI_VK_DENSE_HOST="1"), **kwargs)["tiers"]["ram"]
         for bits, credit in (("8", 4096), ("4", 2048), ("16", 0)):
             with self.subTest(bits=bits):
+                # the host copy at the same width (_q36_dense_tensors prices the int8 trunk's)
+                host = build_plan(model, env=dict(on, COLI_VK_DENSE_HOST="1", COLI_DENSE_BITS=bits),
+                                  **kwargs)["tiers"]["ram"]
                 ram = build_plan(model, env=dict(on, COLI_DENSE_BITS=bits), **kwargs)["tiers"]["ram"]
                 self.assertEqual(ram["dense_on_device_bytes"], credit)
                 self.assertEqual(ram["dense_bytes"], host["dense_bytes"] - credit)
@@ -2225,6 +2228,44 @@ class VulkanPartialChainQwenOlmoeTest(unittest.TestCase):
                 tensors.append((p + f"mlp.experts.{e}.qs", (2 * 32 + 64) * 4, "F32", [2 * 32 + 64]))
         write_shard(self.model / "model.safetensors", tensors, f32_fill=f32_fill)
         return analyze_model(self.model)
+
+    def test_qwen36_dense_weights_priced_as_the_engine_holds_them(self):
+        # qwen36.c's int8 trunk: load_tq's matrices as int8 rows and a float32 scale a row,
+        # the vectors and the small matrices (in_proj_a/b, conv taps, the shared expert's
+        # gate) in float32, the embedding read in place; the fixture is F16
+        info = self.write_qwen36()
+        attention = (8192 + 512) + 2 * (2048 + 128) + (4096 + 256) + 2 * 16 * 4   # q, k, v, o, q/k norms
+        deltanet = (2 * 8 + 512 + 2 * 512 + 8) * 4 + (8192 + 512) + 2 * (4096 + 256)   # vectors, taps, a/b; qkv, z, out
+        mlp = (512 + 32) + 2 * (2048 + 128) + (2048 + 256) + 64 * 4   # router, shared gate/up/down, its gate
+        held = (20480 + 1280) + 64 * 4 + 8 * 2 * 64 * 4 + 2 * attention + 6 * deltanet + 8 * mlp
+        kwargs = dict(context=64, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+        cpu = build_plan(self.model, env={}, **kwargs)
+        self.assertEqual(cpu["model"]["dense_bytes"], held)
+        self.assertEqual(cpu["model"]["embed_bytes"], 0)
+        self.assertLess(held, info["dense_disk_bytes"])
+        # a Vulkan run keeps the float32 table; another trunk keeps the checkpoint's bytes
+        vk = build_plan(self.model, env={"COLI_VULKAN": "1", "COLI_VK_DENSE_HOST": "1"}, **kwargs)
+        self.assertEqual(vk["model"]["embed_bytes"], 320 * 64 * 4)
+        for env in ({"COLI_DENSE_I8": "0"}, {"COLI_DENSE_BITS": "16"}, {"COLI_KEEP_F32": "1"}):
+            with self.subTest(env=env):
+                self.assertEqual(build_plan(self.model, env=env, **kwargs)["model"]["dense_bytes"],
+                                 info["dense_bytes"])
+        # what the held bytes give back goes to the experts' cache
+        f32 = build_plan(self.model, env={"COLI_DENSE_I8": "0"}, **kwargs)
+        self.assertEqual(cpu["tiers"]["ram"]["expert_cache_bytes"] - f32["tiers"]["ram"]["expert_cache_bytes"],
+                         info["dense_bytes"] - held)
+
+    def test_qwen36_kv_priced_as_float16_unless_q36_kv_f32(self):
+        # kv16.h: K and V as float16 by default; the default context keeps its float32 steps
+        self.write_qwen36()
+        kwargs = dict(context=4096, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+        half = build_plan(self.model, env={}, **kwargs)["tiers"]["ram"]
+        full = build_plan(self.model, env={"Q36_KV": "f32"}, **kwargs)["tiers"]["ram"]
+        self.assertEqual(2 * half["sequence_state_bytes"], full["sequence_state_bytes"])
+        self.assertEqual(full["runtime_bytes"] - half["runtime_bytes"], half["sequence_state_bytes"])
+        for avail in (8 * GB, 32 * GB):
+            self.assertEqual(chat_context(self.model, env={}, available=avail),
+                             chat_context(self.model, env={"Q36_KV": "f32"}, available=avail))
 
     def test_cuda_plan_leaves_qwen36_tier_to_size_each_card(self):
         # qwen36_tier.c reads CUDA_EXPERT_GB as GiB for each card: the plan's GB
