@@ -9112,6 +9112,13 @@ class APIHandler(BaseHTTPRequestHandler):
                                request_id)
             elif path.startswith("/v1/models/") and unquote(path[11:]) == self.server.model_id:
                 self.send_json(200, self.server.model_entry(), request_id)
+            elif path in ("/", "/index.html") and getattr(self.server, "chat_port", None):
+                # the dashboard was here before the chat UI: a bookmark of it opens the chat
+                self.send_response(302)
+                self.send_header("Location", chat_location(self.headers.get("Host"), self.server.chat_port))
+                self.send_header("Content-Length", "0")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
             else:
                 raise APIError(404, "Not found.", None, "not_found")
         except APIError as error:
@@ -11013,9 +11020,22 @@ def keep_engine(server, start, stopping, watch=ENGINE_WATCH_S, delays=ENGINE_RES
               file=sys.stderr)
 
 
+def chat_location(host_header, port):
+    """The chat UI's address as the browser reached the API: the same host (a name, an
+    IPv4 address or a bracketed IPv6 one), the UI's port."""
+    host = (host_header or "").strip() or "127.0.0.1"
+    if host.startswith("["):
+        host = host[:host.find("]") + 1] if "]" in host else host
+    elif host.count(":") == 1:
+        host = host.split(":", 1)[0]
+    elif ":" in host:
+        host = f"[{host}]"   # a bare IPv6 address, as _check_host reads one
+    return f"http://{host}:{int(port)}/"
+
+
 def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
           cap=None, max_tokens=1024, engine=None, env=None, cors_origins=None,
-          max_queue=8, queue_timeout=300, kv_slots=1, allowed_hosts=(), family=None):
+          max_queue=8, queue_timeout=300, kv_slots=1, allowed_hosts=(), family=None, chat_port=None):
     if not 0 <= max_tokens:
         raise ValueError("max_tokens cannot be negative (0: the context the engine holds)")
     if not 1 <= port <= 65535:
@@ -11066,6 +11086,7 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
                 pending_model_id = family.default_model_id
         model_id = pending_model_id
         server.model_id = model_id
+        server.chat_port = chat_port   # `coli web`'s chat UI: the API's own address sends a browser there
         try:          # what the checkpoint on disk is called (a Clef, a 27B), for the Jev card
             server.display_name = display_for(resolve_model(model))[0]
         except Exception:
