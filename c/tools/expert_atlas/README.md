@@ -8,12 +8,12 @@ cd c
 export COLI_MODEL=/path/to/glm52_i4
 ./tools/expert_atlas/sweep.sh                             # 30 probes (10 topics x 3 prompts)
 python3 tools/expert_atlas/analyze.py  --stats atlas_out/stats --out atlas_out/experts.json \
-        --web web/dist/experts.json                       # optional: feed the web dashboard Atlas
+        --web atlas_out/experts-web.json                  # optional: keyed layer:expert, with labels
 python3 tools/expert_atlas/validate.py atlas_out/stats 200 # leave-one-prompt-out check
 ```
 
-`--web` writes the same atlas in the shape the web dashboard consumes (the Atlas galaxy and the
-Brain hover tooltips): keyed `"layer:expert"` with `affinity`/`entropy`/`top`/`label`. It replaces
+`--web` writes the same atlas keyed `"layer:expert"` with `affinity`/`entropy`/`top`/`label`, the
+shape the old web dashboard read for its Atlas and Brain pages (the chat UI has no atlas view). It replaces
 the retired `tools/expert_atlas.py`, whose API-driven probing ran through a live server and was
 exposed to exactly the traps above (server-side `--topp`, speculative drafts, shared `.coli_usage`).
 

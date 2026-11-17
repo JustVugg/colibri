@@ -12,7 +12,7 @@ install it with winget), finds your hardware, recommends a model that fits,
 gets the engine (built with MSYS2 when it is installed, with Vulkan when your
 GPU can use it; otherwise the prebuilt one from the release, which runs on the
 CPU or with Vulkan), downloads
-the model with resume and opens the dashboard. Running it again starts colibri
+the model with resume and opens the chat. Running it again starts colibri
 directly. The same from a terminal: `py -3 c\coli setup`. See
 [quickstart.md](quickstart.md#the-one-step-way).
 

@@ -613,7 +613,7 @@ VRAM into a real tier:
 
 - `V4_GPU_RESIDENT_FIRST=1`: an expert already mirrored in VRAM is computed
   from the mirror without asking the store. The store still records the
-  routing (the `.coli_usage` history, the dashboard's HITS and heat), and its
+  routing (the `.coli_usage` history, the chat's expert map), and its
   RAM pin ranking leaves mirrored experts out, so their RAM slots are no
   longer pinned or refreshed, age out of the LRU, and the RAM tier holds
   experts that are not in VRAM. A routing served from VRAM is not a store

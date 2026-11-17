@@ -888,7 +888,7 @@ class RunConfiguration(HomeTestCase):
         self.assertEqual(loaded["model"]["repo"], entry.repo)
         self.assertEqual(loaded["launcher"], str(C_DIR / "coli"))
         self.assertEqual(loaded["env"]["COLI_VULKAN"], "1")
-        self.assertEqual(loaded["urls"], {"browser": "http://127.0.0.1:8123/",
+        self.assertEqual(loaded["urls"], {"browser": "http://127.0.0.1:8913/",
                                           "openai_base_url": "http://127.0.0.1:8123/v1",
                                           "anthropic_base_url": "http://127.0.0.1:8123"})
         with modeled("linux"):
@@ -1134,7 +1134,7 @@ class Releases(HomeTestCase):
             if vulkan else b"engine"
         members = [(name, engine if name.startswith("qwen36") else b"# launcher") for name in binaries]
         members += [(name, engine) for name in extra]
-        members += [("web/dist/index.html", b"<html></html>"), ("tools/k3_tokenizer.py", b"")]
+        members += [("ui/server.py", b"# the chat UI"), ("tools/k3_tokenizer.py", b"")]
         if vulkan:
             members.append(("shaders/qmatmul.spv", b"\x03\x02\x23\x07"))
         buffer = io.BytesIO()
@@ -1190,7 +1190,7 @@ class Releases(HomeTestCase):
             self.assertTrue(os.path.isfile(info["engine"]))
             self.assertEqual(os.path.basename(info["engine"]), engine_name(os_name))
             self.assertTrue(os.path.isfile(setup_flow.launcher_in(info["launcher_dir"])))
-            self.assertTrue(os.path.isfile(os.path.join(info["launcher_dir"], "web", "dist", "index.html")))
+            self.assertTrue(os.path.isfile(os.path.join(info["launcher_dir"], "ui", "server.py")))
             # A model newer than the release is refused with the way forward.
             with self.assertRaises(setup_flow.SetupError) as caught:
                 setup_flow.resolve_engine(family_by_id("qwen36"), setup_catalog.by_id("qwen3-coder-30b"),
@@ -1376,8 +1376,6 @@ class WholeSetup(HomeTestCase):
             "rank": 99, "size_class": "small", "summary": "fixture"}]))
         self.engines = os.path.join(self.tmp.name, "c")
         os.makedirs(os.path.join(self.engines, "shaders"))
-        os.makedirs(os.path.join(self.engines, "web", "dist"))
-        Path(self.engines, "web", "dist", "index.html").write_text("<html></html>")
         Path(self.engines, "qwen36").write_bytes(b"\x7fELF libvulkan.so.1")
         Path(self.engines, "coli").write_text("# launcher\n")
         self.models = os.path.join(self.tmp.name, "models")
@@ -1541,6 +1539,17 @@ class WholeSetup(HomeTestCase):
             self.shard,
         )
 
+    def test_printed_browser_address_is_the_chat_for_an_older_setup(self):
+        # a setup from before the chat UI saved the API's port as the browser's address
+        old = {"host": "127.0.0.1", "port": 8000,
+               "urls": {"browser": "http://127.0.0.1:8000/", "openai_base_url": "http://127.0.0.1:8000/v1",
+                        "anthropic_base_url": "http://127.0.0.1:8000"}}
+        lines = []
+        setup_flow.print_urls(old, lines.append)
+        self.assertEqual(lines, ["  Browser:             http://127.0.0.1:8790/",
+                                 "  OpenAI base URL:     http://127.0.0.1:8000/v1",
+                                 "  Anthropic base URL:  http://127.0.0.1:8000"])
+
     def test_ready_setup_honors_explicit_host(self):
         code, text = self.run_setup(pick="tiny")
         self.assertEqual(code, 0, text)
@@ -1551,7 +1560,7 @@ class WholeSetup(HomeTestCase):
         current = setup_flow.load_config()
         self.assertEqual(current["host"], "127.0.0.2")
         self.assertEqual(current["args"][current["args"].index("--host") + 1], "127.0.0.2")
-        self.assertEqual(current["urls"]["browser"], "http://127.0.0.2:8000/")
+        self.assertEqual(current["urls"]["browser"], "http://127.0.0.2:8790/")
         self.assertEqual(current["model_dir"], previous["model_dir"])
         self.assertEqual(
             Path(current["model_dir"], "model-00000.safetensors").read_bytes(),
@@ -1568,7 +1577,7 @@ class WholeSetup(HomeTestCase):
         current = setup_flow.load_config()
         self.assertEqual(current["port"], 8123)
         self.assertEqual(current["args"][current["args"].index("--port") + 1], "8123")
-        self.assertEqual(current["urls"]["browser"], "http://127.0.0.1:8123/")
+        self.assertEqual(current["urls"]["browser"], "http://127.0.0.1:8913/")
         self.assertEqual(current["model_dir"], previous["model_dir"])
         self.assertEqual(
             Path(current["model_dir"], "model-00000.safetensors").read_bytes(),

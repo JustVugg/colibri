@@ -4,7 +4,7 @@ colibri — tiny engine, immense model.
 Run GLM-5.2 (744B) locally on CPU with roughly 15-26 GB of RAM.
 
   coli setup                one step: find the hardware, pick a model, build or fetch
-                            the engine, download, then start the dashboard
+                            the engine, download, then start the chat
   coli start / status / logs  start, inspect, or read the log of what setup configured
   coli chat                 interactive chat (loads the model once)
   coli serve                OpenAI-compatible HTTP API (persistent engine)
@@ -308,7 +308,7 @@ def decision_refusal(family):
     answers = "calibrated probabilities" if family.id == "laya" else "a probability per option"
     return (f"{C.yel}{family.display_name} is a decision model:{C.r} it answers typed questions "
             f"(choice, score, noul) with {answers} and does not chat.\n"
-            f"  Start it with: coli serve --model <dir>   (or coli web for the dashboard)\n"
+            f"  Start it with: coli serve --model <dir>   (or coli web for the chat, its System One page)\n"
             f"  then POST /v1/systemone (docs/systemone.md, \"Decision engines\")")
 
 def image_banner_line(model):
@@ -3891,13 +3891,17 @@ def cmd_stop(a):
     except OSError: pass
     print(f"  {C.grn}✓ stopped{C.r} — RAM released")
 
-def cmd_ui(a):
-    """the chat UI (ui/server.py) against a running gateway (`coli serve`), the browser
-    opened on it once it answers"""
+def ui_server():
+    """ui/server.py: next to coli (a release archive), one level up (a source checkout) or in libexec"""
     cands = [os.path.join(HERE, "ui", "server.py"),
              os.path.join(os.path.dirname(os.path.abspath(HERE)), "ui", "server.py"),
              os.path.join(_LIBEXEC, "ui", "server.py")]
-    server = next((c for c in cands if os.path.exists(c)), None)
+    return next((c for c in cands if os.path.exists(c)), None)
+
+def cmd_ui(a):
+    """the chat UI (ui/server.py) against a running gateway (`coli serve`), the browser
+    opened on it once it answers"""
+    server = ui_server()
     if server is None:
         sys.exit(f"{C.yel}the chat UI is not in this tree{C.r} (ui/server.py next to coli, one level up, or in libexec)")
     shown = "127.0.0.1" if a.host in ("0.0.0.0", "") else a.host
@@ -3925,20 +3929,26 @@ def cmd_ui(a):
         sys.exit(0)
 
 def cmd_web(a):
-    """serve + open the dashboard in the browser once the API answers."""
+    """serve, and the chat UI (ui/server.py) in front of it: the browser opens on the UI once
+    the engine answers. The UI is what `coli ui` serves, with the gateway as its backend."""
     need_model(a.model)
-    # Same two layouts openai_server.py resolves: next to this script (release
-    # archive / installed tree) or one level up (source checkout, where this is c/coli).
-    cands = [os.path.join(HERE, "web", "dist"),
-             os.path.join(os.path.dirname(os.path.abspath(HERE)), "web", "dist")]
-    dist = next((d for d in cands if os.path.exists(os.path.join(d, "index.html"))), cands[-1])
-    if not os.path.exists(os.path.join(dist, "index.html")):
-        print(f"{C.yel}web UI not built:{C.r} run  cd web && npm install && npm run build  first;")
-        print("serving the API anyway (the dashboard will 404 until built).")
     # A wildcard bind is not an address to connect to (Windows refuses 0.0.0.0).
     shown = "127.0.0.1" if a.host in ("0.0.0.0", "") else a.host
-    url = f"http://{shown}:{a.port}/"
-    if not getattr(a, "no_browser", False):
+    api = f"http://{shown}:{a.port}/"
+    from setup_flow import port_free, ui_port_for
+    ui_port = getattr(a, "ui_port", None) or ui_port_for(a.port)
+    url = f"http://{shown}:{ui_port}/"
+    server, ui = ui_server(), None
+    if server is None:
+        print(f"{C.yel}the chat UI is not in this tree{C.r} (ui/server.py); serving the API only, at {api}v1", flush=True)
+    elif not port_free(a.host, ui_port):
+        print(f"{C.yel}port {ui_port} is taken{C.r}: no chat UI (--ui-port picks another); serving the API only, at {api}v1", flush=True)
+    else:
+        # stdin a pipe this process holds: the UI exits when it closes, so `coli stop` (which
+        # ends this process by its pid) or a crash does not leave it holding its port
+        ui = subprocess.Popen([sys.executable, server, "--host", a.host, "--port", str(ui_port), "--backend", api.rstrip("/"),
+                               "--exit-with-stdin"], stdin=subprocess.PIPE)
+    if ui is not None and not getattr(a, "no_browser", False):
         import threading, urllib.request, webbrowser
         def opener():
             # No iteration cap. It used to be `for _ in range(600)` with a 2 s sleep --
@@ -3956,17 +3966,20 @@ def cmd_web(a):
             while True:
                 time.sleep(2); waited += 2
                 try:
-                    urllib.request.urlopen(f"{url}health", timeout=5)
+                    urllib.request.urlopen(f"{api}health", timeout=5)
                 except OSError:
                     # Say something once, rather than looking hung. A 93-layer K3 load
                     # is 40+ minutes and the user has no way to tell waiting from stuck.
                     if waited == 300:
-                        print(f"still loading; the dashboard will open at {url} when the "
+                        print(f"still loading; the chat will open at {url} when the "
                               f"engine is ready (Ctrl-C to stop, or --no-browser to skip)")
                     continue
                 webbrowser.open(url); return
         threading.Thread(target=opener, daemon=True).start()
-    print(f"dashboard: {url}  (opens automatically when the engine is ready)")
+    if ui is not None:
+        print(f"chat: {url}  (opens automatically when the engine is ready); the API: {api}v1", flush=True)
+    # No terminate() when the serve ends: the UI exits when this process's end closes its stdin,
+    # and the Models page, which stops this process to switch models, keeps it on through that.
     cmd_serve(a)
 
 def project_python():
@@ -4351,7 +4364,9 @@ def main():
     pst.add_argument("--port",type=int,default=None,
                      help="port of the server to stop (default 8000, or the one `coli setup` configured)")
     pst.add_argument("--dry-run",action="store_true")
-    pw=sub.add_parser("web", parents=[common], help="serve + open the dashboard in a browser")
+    pw=sub.add_parser("web", parents=[common], help="serve + the chat UI in front of it, opened in a browser")
+    pw.add_argument("--ui-port", type=int, default=None,
+                    help="the chat UI's port (default: the API's --port + 790, 8790 for 8000)")
     for arg,kw in (("--host",dict(default="127.0.0.1")),("--port",dict(type=int,default=8000)),
                    ("--model-id",dict(default=os.environ.get("COLI_MODEL_ID"))),
                    ("--api-key",dict(default=os.environ.get("COLI_API_KEY"))),
@@ -4381,7 +4396,7 @@ def main():
     # One-step setup (setup_flow.py). No `common` parent: --model here names a
     # catalog entry, not a model directory, and nothing below loads an engine.
     pset=sub.add_parser("setup",help="one step: detect hardware, pick a model, build or fetch "
-                        "the engine, download with resume, then start the dashboard")
+                        "the engine, download with resume, then start the chat")
     pset.add_argument("--yes","-y",action="store_true",
                       help="non-interactive: take the recommendation and every default")
     pset.add_argument("--model",dest="pick",default=None,metavar="ID",

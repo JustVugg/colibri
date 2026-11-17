@@ -9,7 +9,6 @@ import contextlib
 import hashlib
 import json
 import math
-import mimetypes
 import os
 import select
 import queue
@@ -4111,7 +4110,7 @@ def _image_bytes_from_url(url):
     left every absolute path readable on the default install (the variable is
     unset out of the box). So local paths are now denied unless the operator
     sets COLI_IMAGE_ROOT, and then only inside it (resolve() follows symlinks
-    before the relative_to() check, the same one serve_static uses). The
+    before the relative_to() check). The
     clients that used to send paths read the file themselves with the user's
     own rights and send a data: URI: `coli chat` since this change, `coli web`
     always did. Errors stay generic so a reply never confirms a path or its
@@ -5903,7 +5902,7 @@ def conversation_cache_slot(messages, kv_slots):
 # ---- context compaction -------------------------------------------------------------------
 # A chat that outgrows the engine's context used to end in a 400 the user could do nothing
 # with but start over. A request that asks for it (`context_compaction: "auto"`, which the
-# dashboard and `coli chat` send) is compacted instead: the oldest turns are summarized by
+# chat UI and `coli chat` send) is compacted instead: the oldest turns are summarized by
 # the model itself, the summary joins the system message, and the turn runs on the summary
 # plus the last exchanges, which stay verbatim.
 #
@@ -9008,53 +9007,6 @@ class APIHandler(BaseHTTPRequestHandler):
         if model != self.server.model_id:
             raise APIError(404, f"The model `{model}` does not exist.", "model", "model_not_found")
 
-    # The dashboard ships in two layouts and the old single path only knew one:
-    # a source checkout puts this file in c/ (so web/dist is one level UP), while
-    # a release archive and an installed tree put it next to web/dist. Probing for
-    # index.html rather than the directory keeps an empty leftover web/dist from
-    # shadowing a real one.
-    WEB_DIST = next(
-        (c for c in (Path(__file__).resolve().parent / "web" / "dist",
-                     Path(__file__).resolve().parent.parent / "web" / "dist")
-         if (c / "index.html").is_file()),
-        Path(__file__).resolve().parent.parent / "web" / "dist")
-
-    def serve_static(self, path):
-        """Serve the built web UI (web/dist) so `coli web` is one process.
-        Read-only, no auth (same trust level as /health), traversal-safe."""
-        if path.startswith("/v1/") or path == "/health":
-            return False
-        base = self.WEB_DIST.resolve()
-        if not base.is_dir():
-            return False
-        rel = unquote(path).lstrip("/") or "index.html"
-        # unquote('%00') embeds a NUL. Path raises ValueError, which do_GET
-        # does not catch, and a NUL with no dot also matches the SPA fallback
-        # if the exception is swallowed. Either way it is not a file.
-        if "\x00" in rel:
-            return False
-        target = (base / rel).resolve()
-        try:
-            target.relative_to(base)
-        except ValueError:
-            target = None
-        if target is None or not target.is_file():
-            if path == "/" or "." not in rel:      # SPA fallback
-                target = base / "index.html"
-                if not target.is_file():
-                    return False
-            else:
-                return False
-        ctype = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
-        data = target.read_bytes()
-        self.send_response(200)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(data)))
-        self.send_cors_headers()
-        self.end_headers()
-        self.wfile.write(data)
-        return True
-
     def do_GET(self):
         request_id = "req_" + uuid.uuid4().hex
         try:
@@ -9150,8 +9102,6 @@ class APIHandler(BaseHTTPRequestHandler):
                 # first request starts the meters. Gated like /profile: it says how busy the box is.
                 payload = power.reading() if self._is_authed() else power._unavailable("unauthorized")
                 self.send_json(200, payload, request_id)
-                return
-            if self.serve_static(path):
                 return
             self.require_auth()
             if path == "/v1/models":

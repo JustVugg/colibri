@@ -232,7 +232,7 @@ seconds to minutes depending on the model). Then give the user:
 
 | Field in `status --json` | Use |
 |---|---|
-| `server.urls.browser` | the dashboard, for the user |
+| `server.urls.browser` | the chat, for the user |
 | `server.urls.openai_base_url` | `.../v1`, for OpenAI-compatible clients |
 | `server.urls.anthropic_base_url` | for Anthropic-compatible clients (they append `/v1/messages`) |
 | `server.model_id` | the `model` value API requests must send |

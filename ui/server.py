@@ -17,11 +17,11 @@ with neither it answers 404 and the page says the feature is not available.
 Streams (chat in SSE) are passed through chunk by chunk. A confirmed client reset
 or failed response write closes upstream. A client that only closes its request
 write side can still read its response."""
-import argparse, json, os, sys, urllib.parse
+import argparse, json, os, sys, time, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import agents, responses_shim, web   # noqa: E402
+import agents, docs, responses_shim, web   # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROXIED = ("/v1/", "/health", "/profile", "/experts", "/power")
@@ -185,9 +185,29 @@ class Handler(BaseHTTPRequestHandler):
         code, obj = self.models.handle(self.command, u.path, u.query, self.rfile.read(n) if n else b"")
         return self._json(code, obj)
 
+    def _doc(self):
+        """a document's text for the chat (docs.py): only this page, which sends X-Colibri-UI (a
+        page elsewhere cannot without a CORS preflight this server never grants)"""
+        if not self._local_ok(False) or self.headers.get("X-Colibri-UI") != "1":
+            return self._json(403, {"error": "solo dalla pagina di colibri su questa macchina"})
+        n = int(self.headers.get("Content-Length") or 0)
+        if n <= 0:
+            return self._json(400, {"error": "file vuoto"})
+        if n > docs.MAX_BYTES:
+            self.close_connection = True   # the body stays unread
+            return self._json(413, {"error": "file troppo grande (al massimo %d MB)" % (docs.MAX_BYTES >> 20)})
+        data = self.rfile.read(n)
+        name = urllib.parse.unquote(self.headers.get("X-File-Name") or "documento")
+        try:
+            return self._json(200, docs.extract(name, data))
+        except Exception as e:   # noqa: BLE001 - a file it cannot read, said to the page
+            return self._json(400, {"error": str(e) or type(e).__name__})
+
     def _route(self):
         path = urllib.parse.urlparse(self.path).path
-        if path.startswith("/web/") and self.command == "GET":
+        if path == "/doc/extract" and self.command == "POST":
+            self._doc()
+        elif path.startswith("/web/") and self.command == "GET":
             self._web(path)
         elif path == "/v1/responses" and self.command == "POST":
             responses_shim.serve(self, self.backend)   # Codex: the Responses API over colibri's chat API
@@ -210,6 +230,19 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
 
+def _alive(pid):
+    """a process that runs: the gateway a model switch started is this process's child, and once
+    it exits it stays in /proc as a zombie until reaped"""
+    try:
+        if os.waitpid(pid, os.WNOHANG)[0] == pid:
+            return False
+    except ChildProcessError:
+        pass
+    except OSError:
+        return False
+    return os.path.exists("/proc/%d" % pid)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8790)
@@ -223,7 +256,28 @@ def main():
                     help="where models are, for the Models page (default: colibri's own folder)")
     ap.add_argument("--searx", default=os.environ.get("COLIBRI_SEARX", ""),
                     help="a SearXNG instance for web search (default: DuckDuckGo's HTML results)")
+    ap.add_argument("--exit-with-stdin", action="store_true",
+                    help="exit when stdin closes: `coli web` holds it open, so the UI ends with the launcher "
+                         "however that ends (coli stop, Ctrl-C, a crash)")
     a = ap.parse_args()
+    if a.exit_with_stdin:
+        import threading
+
+        def watch():
+            try:
+                while sys.stdin.read(4096):
+                    pass
+            except (OSError, ValueError):
+                pass
+            # `coli web` is gone. The Models page may have stopped it to start the gateway on
+            # another model (models.LIFE): then this UI follows the new gateway's process instead
+            life = getattr(Handler.models, "LIFE", None) or {}
+            while life.get("switching") or life.get("pid"):
+                if not life.get("switching") and not _alive(life["pid"]):
+                    break
+                time.sleep(1)
+            os._exit(0)
+        threading.Thread(target=watch, daemon=True).start()
     web.SEARX = a.searx
     Handler.backend = urllib.parse.urlparse(a.backend)
     Handler.models_backend = urllib.parse.urlparse(a.models_backend) if a.models_backend else None
