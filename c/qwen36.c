@@ -4113,6 +4113,15 @@ static void gguf_load_cfg(Cfg *c) {
     snprintf(nm, sizeof nm, "blk.0.exp_probs_b.bias");
     c->has_bias = gguf_find(g, nm) != NULL;
     if (!lfm3 && !plain && g_mmproj_open && q36_mmproj_cfg(c)) {   /* Qwen3.5/3.6/3.8 and unsloth's mmproj */
+        /* a picture's rows rotate by three positions (M-RoPE): the sections the GGUF names */
+        snprintf(key, sizeof key, "%s.rope.dimension_sections", arch);
+        const gguf_kv *rs = gguf_get(g, key);
+        if (rs && rs->type == GGUF_T_ARRAY && rs->n >= 3 && (rs->atype == GGUF_T_I32 || rs->atype == GGUF_T_U32))
+            for (int k = 0; k < 3; k++) c->mrope_section[k] = ((const int32_t *)rs->arr)[k];
+        if (2 * (c->mrope_section[0] + c->mrope_section[1] + c->mrope_section[2]) != c->rotary_dim) {
+            fprintf(stderr, "[gguf] an mmproj but no rope.dimension_sections covering %d rotary dimensions; text only\n", c->rotary_dim);
+            c->vis_depth = 0;
+        }
         const gguf_kv *tk = gguf_get(g, "tokenizer.ggml.tokens");
         for (uint64_t i = 0; tk && tk->type == GGUF_T_ARRAY && tk->atype == GGUF_T_STRING && i < tk->n; i++)
             if (tk->strs[i] && !strcmp(tk->strs[i], "<|image_pad|>")) { c->image_token = (int)i; break; }
