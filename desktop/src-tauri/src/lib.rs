@@ -343,9 +343,10 @@ fn backend(state: &State, py: &Path, coli: &Path) -> Result<(String, bool), Fail
     // recorded before the start: a window closed meanwhile still stops it
     state.lock().unwrap().started = port_of(&base);
     // the API alone: this window shows its own UI. A coli from before --no-ui refuses the
-    // flag, and starts as it did then, its own chat UI beside this one.
+    // flag (argparse: "unrecognized arguments: --no-ui"), and starts as it did then, its own
+    // chat UI beside this one; any other failure is the start's own.
     let mut run = coli_run(state, py, coli, &["start", "--json", "--no-browser", "--no-ui"]);
-    if matches!(&run, Some((false, out)) if out.contains("--no-ui")) {
+    if matches!(&run, Some((false, out)) if out.contains("unrecognized arguments") && out.contains("--no-ui")) {
         run = coli_run(state, py, coli, &["start", "--json", "--no-browser"]);
     }
     let (ok, text) = run.ok_or(("start_failed", String::new()))?;
