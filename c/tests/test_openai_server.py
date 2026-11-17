@@ -1681,6 +1681,43 @@ class ProtocolTest(unittest.TestCase):
             listener.close()
 
 
+class ChatRedirectTest(unittest.TestCase):
+    """The API's own address, where the dashboard was before the chat UI, sends a browser on to
+    `coli web`'s chat: at the host the browser used, the UI's port. A plain `coli serve`, or
+    `coli web --no-ui`, has no chat to send it to: a 404 as before."""
+
+    def _get(self, chat_port, host):
+        server = APIServer(("127.0.0.1", 0), FakeEngine(), "test")
+        server.chat_port = chat_port
+        thread = threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, timeout=2)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.scheduler.close)
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+        conn.request("GET", "/", headers={"Host": host % server.server_port})
+        response = conn.getresponse()
+        response.read()
+        conn.close()
+        return response.status, response.getheader("Location")
+
+    def test_the_root_sends_a_browser_to_the_chat(self):
+        self.assertEqual(self._get(8790, "127.0.0.1:%d"), (302, "http://127.0.0.1:8790/"))
+        self.assertEqual(self._get(8790, "localhost:%d"), (302, "http://localhost:8790/"))
+        self.assertEqual(self._get(9001, "[::1]:%d"), (302, "http://[::1]:9001/"))
+
+    def test_without_a_chat_the_root_is_not_found(self):
+        self.assertEqual(self._get(None, "127.0.0.1:%d")[0], 404)
+
+    def test_the_chat_location_keeps_the_host(self):
+        for host, want in (("192.168.1.20:8000", "http://192.168.1.20:8790/"), ("box.lan:8000", "http://box.lan:8790/"),
+                           ("[fe80::1]:8000", "http://[fe80::1]:8790/"), ("::1", "http://[::1]:8790/"),
+                           ("example", "http://example:8790/"), ("", "http://127.0.0.1:8790/"), (None, "http://127.0.0.1:8790/")):
+            with self.subTest(host=host):
+                self.assertEqual(openai_server.chat_location(host, 8790), want)
+
+
 class GenerationMetricsTest(unittest.TestCase):
     def setUp(self):
         self.server = APIServer(("127.0.0.1", 0), FakeEngine(), "test")

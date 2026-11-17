@@ -1522,9 +1522,10 @@ def server_status(cfg):
     return out
 
 
-def start_server(cfg, *, background=False, open_browser=True, out=print, wait=5.0):
+def start_server(cfg, *, background=False, open_browser=True, out=print, wait=5.0, ui=True):
     """Start what the configuration describes. Foreground returns the server's
-    exit code; background returns the status after `wait` seconds."""
+    exit code; background returns the status after `wait` seconds. ui=False: the
+    API alone (`coli web --no-ui`), for the desktop app, which shows its own UI."""
     status = server_status(cfg)
     if status["state"] in ("ready", "loading"):
         out(f"  colibri is already running ({status['state']}) on port {cfg['port']}")
@@ -1549,11 +1550,13 @@ def start_server(cfg, *, background=False, open_browser=True, out=print, wait=5.
     cmd = [sys.executable, launcher] + args
     if not open_browser and "--no-browser" not in cmd:
         cmd.append("--no-browser")
+    if not ui and "--no-ui" not in cmd:
+        cmd.append("--no-ui")
     env = dict(cfg.get("env") or {})
     env.update(os.environ)          # what the user sets explicitly wins
     env["PYTHONUNBUFFERED"] = "1"
     if not background:
-        print_urls(cfg, out)
+        print_urls(cfg, out, ui)
         out("  stop: press Ctrl+C here (or close this window)\n")
         sys.stdout.flush()      # ours before the server's, when the output is a file
         process = subprocess.Popen(cmd, env=env)
@@ -1596,7 +1599,7 @@ def start_server(cfg, *, background=False, open_browser=True, out=print, wait=5.
     out(f"  started in the background (pid {process.pid}); "
         + ("ready. " if status["state"] == "ready" else "the model is loading (`coli status` "
            "says when it is ready). ") + f"Log: {log}")
-    print_urls(cfg, out)
+    print_urls(cfg, out, ui)
     return status
 
 
@@ -1636,12 +1639,13 @@ def _replace_arg(args, flag, value):
     return args
 
 
-def print_urls(cfg, out=print):
+def print_urls(cfg, out=print, ui=True):
     # from the host and port, not the saved "urls": a setup from before the chat UI
     # saved the API's port as the browser's address (a setup with no port keeps its own)
     port = cfg.get("port")
     link = urls(cfg.get("host", DEFAULT_HOST), port) if port else cfg["urls"]
-    out(f"  Browser:             {link['browser']}")
+    if ui:
+        out(f"  Browser:             {link['browser']}")
     out(f"  OpenAI base URL:     {link['openai_base_url']}")
     out(f"  Anthropic base URL:  {link['anthropic_base_url']}")
 
@@ -2356,15 +2360,16 @@ def cmd_start(a):
     if reason:
         cfg = use_cuda(cfg, reason, out=say)
     refresh_configured(cfg, out=say)
+    ui = not getattr(a, "no_ui", False)
     if getattr(a, "json", False):
         print(json.dumps(start_server(cfg, background=True, open_browser=not a.no_browser,
-                                      out=lambda *_: None), indent=2))
+                                      out=lambda *_: None, ui=ui), indent=2))
         return 0
     if a.background:
-        start_server(cfg, background=True, open_browser=not a.no_browser)
+        start_server(cfg, background=True, open_browser=not a.no_browser, ui=ui)
         print("  stop: coli stop")
         return 0
-    return start_server(cfg, background=False, open_browser=not a.no_browser)
+    return start_server(cfg, background=False, open_browser=not a.no_browser, ui=ui)
 
 
 def status_report():

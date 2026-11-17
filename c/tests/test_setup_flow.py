@@ -1539,6 +1539,13 @@ class WholeSetup(HomeTestCase):
             self.shard,
         )
 
+    def test_no_ui_prints_no_browser_address(self):
+        cfg = {"host": "127.0.0.1", "port": 8000, "urls": setup_flow.urls("127.0.0.1", 8000)}
+        lines = []
+        setup_flow.print_urls(cfg, lines.append, ui=False)
+        self.assertEqual(lines, ["  OpenAI base URL:     http://127.0.0.1:8000/v1",
+                                 "  Anthropic base URL:  http://127.0.0.1:8000"])
+
     def test_printed_browser_address_is_the_chat_for_an_older_setup(self):
         # a setup from before the chat UI saved the API's port as the browser's address
         old = {"host": "127.0.0.1", "port": 8000,
@@ -2061,6 +2068,15 @@ class ServerControl(HomeTestCase):
         result = setup_flow.stop_server(self.cfg, out=lambda *_: None)
         self.assertTrue(result["stopped"], result)
         self.assertEqual(self.wait_state(self.cfg, "stopped")["state"], "stopped")
+
+    def test_no_ui_reaches_the_launcher(self):
+        # `coli start --no-ui` (the desktop app): `coli web --no-ui`, the API without the chat UI
+        status = setup_flow.start_server(self.cfg, background=True, open_browser=False,
+                                         out=lambda *_: None, wait=10, ui=False)
+        self.pids.append(status["pid"])
+        self.wait_state(self.cfg, "ready")
+        seen = json.loads(Path(self.env_out).read_text())
+        self.assertIn("--no-ui", seen["argv"])
 
     def test_a_taken_port_moves_to_the_next_free_one(self):
         self.port = quiet_port_pair()      # pick_port tries the next one: keep it out of reach
