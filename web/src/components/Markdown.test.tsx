@@ -53,6 +53,32 @@ describe("rendering a chat table", () => {
 })
 
 describe("the rest of the subset still renders", () => {
+  it("keeps a shorter backtick fence inside a longer code fence", () => {
+    const html = render("````markdown\n# literal\n```python\nprint(1)\n```\n````\n\nAfter.")
+    expect(html).toContain("<pre><code># literal\n```python\nprint(1)\n```</code></pre>")
+    expect(html).toContain("<p>After.</p>")
+    expect(html.match(/<figure/g)).toHaveLength(1)
+  })
+
+  it("requires a closing fence to occupy its line", () => {
+    const html = render("```text\na ``` inside a line\n``` not a closer\nz\n```")
+    expect(html).toContain("<pre><code>a ``` inside a line\n``` not a closer\nz</code></pre>")
+  })
+
+  it("does not open a fenced block in the middle of prose", () => {
+    expect(render("Use ``` around a block of code.")).not.toContain("<figure")
+  })
+
+  it("still displays a fence whose closing line has not streamed yet", () => {
+    expect(render("````text\nfirst\n```\nstill code")).toContain("<pre><code>first\n```\nstill code</code></pre>")
+  })
+
+  it("keeps an empty unclosed fence at the end of a streamed answer", () => {
+    for (const opener of ["```", "```python", "````text"]) {
+      expect(render(opener)).toContain("<pre><code></code></pre>")
+    }
+  })
+
   it("keeps ordinary text with a single pipe as a paragraph", () => {
     const html = render("choose a | b at the prompt")
     expect(html).toContain("<p>")
