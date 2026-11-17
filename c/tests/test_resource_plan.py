@@ -2233,6 +2233,10 @@ class VulkanPartialChainQwenOlmoeTest(unittest.TestCase):
         # qwen36.c's int8 trunk: load_tq's matrices as int8 rows and a float32 scale a row,
         # the vectors and the small matrices (in_proj_a/b, conv taps, the shared expert's
         # gate) in float32, the embedding read in place; the fixture is F16
+        import resource_plan
+        on_linux = mock.patch.object(resource_plan.sys, "platform", "linux")   # macOS keeps the old pricing (below)
+        on_linux.start()
+        self.addCleanup(on_linux.stop)
         info = self.write_qwen36()
         attention = (8192 + 512) + 2 * (2048 + 128) + (4096 + 256) + 2 * 16 * 4   # q, k, v, o, q/k norms
         deltanet = (2 * 8 + 512 + 2 * 512 + 8) * 4 + (8192 + 512) + 2 * (4096 + 256)   # vectors, taps, a/b; qkv, z, out
@@ -2250,6 +2254,9 @@ class VulkanPartialChainQwenOlmoeTest(unittest.TestCase):
             with self.subTest(env=env):
                 self.assertEqual(build_plan(self.model, env=env, **kwargs)["model"]["dense_bytes"],
                                  info["dense_bytes"])
+        # the Metal graph reads the checkpoint's dense weights in place: macOS keeps the checkpoint's bytes
+        with mock.patch.object(resource_plan.sys, "platform", "darwin"):
+            self.assertEqual(build_plan(self.model, env={}, **kwargs)["model"]["dense_bytes"], info["dense_bytes"])
         # what the held bytes give back goes to the experts' cache
         f32 = build_plan(self.model, env={"COLI_DENSE_I8": "0"}, **kwargs)
         self.assertEqual(cpu["tiers"]["ram"]["expert_cache_bytes"] - f32["tiers"]["ram"]["expert_cache_bytes"],
