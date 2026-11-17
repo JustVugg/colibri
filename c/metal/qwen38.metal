@@ -139,3 +139,99 @@ kernel void q38_hc_norm(device const float *x [[buffer(0)]],
     float r = rs;
     for (uint j = t; j < p.D; j += 256) y[row * p.D + j] = xr[j] * r * (1.0f + wr[j]);
 }
+
+/* ---- PLE (qwen38_core.h's q38_ple from the gate on; shaders/chain_ple.comp) ---- */
+
+struct q38_ple_args { uint S, C, W, H, CK, NG, snap_rows, accumulate; float eps; };
+
+/* The sum of the 256 partials in part[], added in order by thread 0 and returned to all
+ * (fixed, deterministic order: exact and fast are the same kernel). */
+static inline float q38_tg_sum256(threadgroup float *part, threadgroup float *out, float v, uint t) {
+    part[t] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (t == 0) {
+        float s = 0.0f;
+        for (uint l = 0; l < 256; l++) s += part[l];
+        *out = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float s = *out;
+    threadgroup_barrier(mem_flags::mem_threadgroup);   /* part[] is reused by the next sum */
+    return s;
+}
+
+/* The gate, one 256-thread group a (row s, stream k), g = s*C + k; H floats of each:
+ * kn = rms0(keys[s][k], norm_key[k]), qn = rms0(hyper[s][k], norm_query[k]),
+ * dot = kn.qn / sqrt(H), g = sigmoid(copysign(sqrt(max(|dot|, 1e-6)), dot)),
+ * gated[s][k] = g * value[s], normv[s][k] = rms0(gated[s][k], norm_conv[k]).
+ * prm = norm_key[W] | norm_query[W] | norm_conv[W]. */
+kernel void q38_ple_gate(device const float *keys [[buffer(0)]],
+                         device const float *hyper [[buffer(1)]],
+                         device const float *value [[buffer(2)]],
+                         device const float *prm [[buffer(3)]],
+                         device float *gated [[buffer(4)]],
+                         device float *normv [[buffer(5)]],
+                         constant q38_ple_args &p [[buffer(6)]],
+                         uint g [[threadgroup_position_in_grid]],
+                         uint t [[thread_index_in_threadgroup]]) {
+    threadgroup float part[256];
+    threadgroup float sum;
+    uint s = g / p.C, k = g % p.C;
+    ulong o = (ulong)s * p.W + (ulong)k * p.H;
+    device const float *kr = keys + o, *hr = hyper + o, *vr = value + (ulong)s * p.H;
+    device const float *wk = prm + (ulong)k * p.H, *wq = prm + p.W + (ulong)k * p.H, *wc = prm + 2 * (ulong)p.W + (ulong)k * p.H;
+    float a = 0.0f, b = 0.0f;
+    for (uint d = t; d < p.H; d += 256) { a += kr[d] * kr[d]; b += hr[d] * hr[d]; }
+    float rk = 1.0f / sqrt(q38_tg_sum256(part, &sum, a, t) / (float)p.H + p.eps);
+    float rq = 1.0f / sqrt(q38_tg_sum256(part, &sum, b, t) / (float)p.H + p.eps);
+    float dt = 0.0f;
+    for (uint d = t; d < p.H; d += 256) dt += (kr[d] * rk * (1.0f + wk[d])) * (hr[d] * rq * (1.0f + wq[d]));
+    float dot = q38_tg_sum256(part, &sum, dt, t) / sqrt((float)p.H);
+    float gt = q38_sigmoid(copysign(sqrt(max(fabs(dot), 1e-6f)), dot));
+    float c = 0.0f;
+    for (uint d = t; d < p.H; d += 256) {
+        float u = gt * vr[d];
+        gated[o + d] = u;
+        c += u * u;
+    }
+    float rc = 1.0f / sqrt(q38_tg_sum256(part, &sum, c, t) / (float)p.H + p.eps);
+    for (uint d = t; d < p.H; d += 256) normv[o + d] = (gt * vr[d]) * rc * (1.0f + wc[d]);
+}
+
+/* The dilated conv, one thread per channel d < W, rows in order. The ring of d holds SL =
+ * (CK-1)*NG entries (oldest first) and the taps read every NG-th:
+ * a = conv[d][CK-1]*normv[s][d] + sum_{k<CK-1} conv[d][k]*ring[k*NG]; v = gated[s][d] + silu(a);
+ * out[s][d] = v or += v (accumulate); the ring drops its oldest and takes normv[s][d]; for
+ * s < snap_rows the ring is copied to snap[s]. */
+kernel void q38_ple_conv(device float *out [[buffer(0)]],
+                         device float *ring [[buffer(1)]],
+                         device float *snap [[buffer(2)]],
+                         device const float *gated [[buffer(3)]],
+                         device const float *normv [[buffer(4)]],
+                         device const float *conv [[buffer(5)]],
+                         constant q38_ple_args &p [[buffer(6)]],
+                         uint d [[thread_position_in_grid]]) {
+    if (d >= p.W) return;
+    uint SL = (p.CK - 1) * p.NG;
+    float rg[32];
+    device float *rd = ring + (ulong)d * SL;
+    for (uint j = 0; j < SL; j++) rg[j] = rd[j];
+    device const float *cw = conv + (ulong)d * p.CK;
+    float wl = cw[p.CK - 1];
+    for (uint s = 0; s < p.S; s++) {
+        ulong i = (ulong)s * p.W + d;
+        float nv = normv[i];
+        float a = wl * nv;
+        for (uint k = 0; k + 1 < p.CK; k++) a += cw[k] * rg[k * p.NG];
+        float v = gated[i] + a * q38_sigmoid(a);
+        if (p.accumulate) out[i] += v;
+        else out[i] = v;
+        for (uint j = 0; j + 1 < SL; j++) rg[j] = rg[j + 1];
+        rg[SL - 1] = nv;
+        if (s < p.snap_rows) {
+            device float *sd = snap + ((ulong)s * p.W + d) * SL;
+            for (uint j = 0; j < SL; j++) sd[j] = rg[j];
+        }
+    }
+    for (uint j = 0; j < SL; j++) rd[j] = rg[j];
+}

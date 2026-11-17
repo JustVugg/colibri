@@ -17,7 +17,8 @@ static const char q38_source[] = {
     , 0
 };
 
-enum { K38_COPY, K38_DOT_BF16_EXACT, K38_DOT_BF16_FAST, K38_HC_LOW, K38_HC_MIX, K38_HC_INJ, K38_HC_APPLY, K38_HC_NORM, K38_COUNT };
+enum { K38_COPY, K38_DOT_BF16_EXACT, K38_DOT_BF16_FAST, K38_HC_LOW, K38_HC_MIX, K38_HC_INJ, K38_HC_APPLY, K38_HC_NORM,
+       K38_PLE_GATE, K38_PLE_CONV, K38_COUNT };
 
 static const char *const q38_kernel_names[K38_COUNT] = {
     "q38_copy",
@@ -28,6 +29,8 @@ static const char *const q38_kernel_names[K38_COUNT] = {
     "q38_hc_inj",
     "q38_hc_apply",
     "q38_hc_norm",
+    "q38_ple_gate",
+    "q38_ple_conv",
 };
 
 static id<MTLComputePipelineState> g_q38_pipe[K38_COUNT];
@@ -197,6 +200,69 @@ int q38_hc_norm(q36_tensor *y, q36_tensor *x, q36_tensor *w, int rows, int D, in
         q36_metal_bind(e, y, 2);
         [e setBytes:&p length:sizeof(p) atIndex:3];
         [e dispatchThreadgroups:MTLSizeMake((NSUInteger)rows * C, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
+    return 1;
+}
+
+/* ---- PLE gate and dilated conv -------------------------------------------- */
+
+typedef struct { uint32_t S, C, W, H, CK, NG, snap_rows, accumulate; float eps; } q38_ple_args;
+
+/* The shape both PLE kernels share: W = C*H, every count positive, sizes within 32 bits. */
+static int q38_ple_shape_ok(const q38_ple_shape *s) {
+    return s && s->S >= 1 && s->C >= 1 && s->H >= 1 && s->W >= 1 && (int64_t)s->C * s->H == s->W &&
+           (uint64_t)s->S * s->W <= UINT32_MAX;
+}
+
+static q38_ple_args q38_ple_pack(const q38_ple_shape *s) {
+    q38_ple_args p = {(uint32_t)s->S, (uint32_t)s->C, (uint32_t)s->W, (uint32_t)s->H, (uint32_t)s->CK,
+                      (uint32_t)s->NG, (uint32_t)s->snap_rows, s->accumulate ? 1u : 0u, s->eps};
+    return p;
+}
+
+int q38_ple_gate(q36_tensor *gated, q36_tensor *normv, q36_tensor *keys, q36_tensor *hyper,
+                 q36_tensor *value, q36_tensor *prm, const q38_ple_shape *s) {
+    if (!q38_ready() || !q38_ple_shape_ok(s) || !(s->eps > 0.0f)) return 0;
+    uint64_t n = (uint64_t)s->S * s->W * F4;
+    if (!q36_metal_fits(keys, n) || !q36_metal_fits(hyper, n) || !q36_metal_fits(gated, n) ||
+        !q36_metal_fits(normv, n) || !q36_metal_fits(value, (uint64_t)s->S * s->H * F4) ||
+        !q36_metal_fits(prm, (uint64_t)3 * s->W * F4)) return 0;
+    @autoreleasepool {
+        q38_ple_args p = q38_ple_pack(s);
+        id<MTLComputePipelineState> pso = g_q38_pipe[K38_PLE_GATE];
+        id<MTLComputeCommandEncoder> e = q36_metal_encoder(pso);
+        q36_metal_bind(e, keys, 0);
+        q36_metal_bind(e, hyper, 1);
+        q36_metal_bind(e, value, 2);
+        q36_metal_bind(e, prm, 3);
+        q36_metal_bind(e, gated, 4);
+        q36_metal_bind(e, normv, 5);
+        [e setBytes:&p length:sizeof(p) atIndex:6];
+        [e dispatchThreadgroups:MTLSizeMake((NSUInteger)s->S * s->C, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
+    return 1;
+}
+
+int q38_ple_conv(q36_tensor *out, q36_tensor *ring, q36_tensor *snap, q36_tensor *gated,
+                 q36_tensor *normv, q36_tensor *conv, const q38_ple_shape *s) {
+    if (!q38_ready() || !q38_ple_shape_ok(s) || s->CK < 2 || s->NG < 1 || (int64_t)(s->CK - 1) * s->NG > 32 ||
+        s->snap_rows < 0 || s->snap_rows > s->S) return 0;
+    uint64_t SL = (uint64_t)(s->CK - 1) * s->NG, n = (uint64_t)s->S * s->W * F4, nr = (uint64_t)s->W * SL * F4;
+    if (!q36_metal_fits(out, n) || !q36_metal_fits(gated, n) || !q36_metal_fits(normv, n) ||
+        !q36_metal_fits(ring, nr) || !q36_metal_fits(conv, (uint64_t)s->W * s->CK * F4) ||
+        (s->snap_rows > 0 && !q36_metal_fits(snap, (uint64_t)s->snap_rows * nr))) return 0;
+    @autoreleasepool {
+        q38_ple_args p = q38_ple_pack(s);
+        id<MTLComputePipelineState> pso = g_q38_pipe[K38_PLE_CONV];
+        id<MTLComputeCommandEncoder> e = q36_metal_encoder(pso);
+        q36_metal_bind(e, out, 0);
+        q36_metal_bind(e, ring, 1);
+        q36_metal_bind(e, s->snap_rows > 0 ? snap : ring, 2);   /* not written without snap rows */
+        q36_metal_bind(e, gated, 3);
+        q36_metal_bind(e, normv, 4);
+        q36_metal_bind(e, conv, 5);
+        [e setBytes:&p length:sizeof(p) atIndex:6];
+        q38_threads(e, pso, (uint64_t)s->W);
     }
     return 1;
 }

@@ -585,6 +585,141 @@ static void test_gr_read(int S, int H, int C, int R, int exact) {
     for (size_t i = 0; i < sizeof ts / sizeof *ts; i++) q36_tensor_free(ts[i]);
 }
 
+/* ---- PLE gate and dilated conv -------------------------------------------- */
+
+/* qwen38_core.h's q38_ple from the gate on, ported literally in double. W = C*H. */
+static void ref_rms0(double *out, const double *x, const float *w, int n, double eps) {
+    double ss = 0;
+    for (int i = 0; i < n; i++) ss += x[i] * x[i];
+    double r = 1.0 / sqrt(ss / n + eps);
+    for (int i = 0; i < n; i++) out[i] = x[i] * r * (1.0 + w[i]);
+}
+
+static void test_ple_gate(int S, int H, int C, int exact) {
+    q36_gpu_set_exact(exact);
+    const int W = C * H;
+    const float eps = 1e-6f;
+    q38_ple_shape sh = {S, C, W, H, 4, 3, 0, eps, 0};
+    size_t n = (size_t)S * W;
+    q36_tensor *keys = rand_tensor(n, 2.0f), *hyper = rand_tensor(n, 3.0f), *value = rand_tensor((size_t)S * H, 1.0f);
+    q36_tensor *prm = rand_tensor((size_t)3 * W, 0.5f);
+    q36_tensor *gated = q36_tensor_new(n * 4), *normv = q36_tensor_new(n * 4);
+    for (size_t i = 0; i < n; i++) F(gated)[i] = F(normv)[i] = NAN;
+    const float *nk = F(prm), *nq = F(prm) + W, *nc = F(prm) + 2 * W;
+    double *x = malloc(sizeof(double) * H), *kn = malloc(sizeof(double) * H), *qn = malloc(sizeof(double) * H);
+    double *rg = malloc(sizeof(double) * n), *rn = malloc(sizeof(double) * n), *sg = malloc(sizeof(double) * n);
+    for (int s = 0; s < S; s++)
+        for (int b = 0; b < C; b++) {
+            size_t o = (size_t)s * W + (size_t)b * H;
+            for (int d = 0; d < H; d++) x[d] = F(keys)[o + d];
+            ref_rms0(kn, x, nk + (size_t)b * H, H, eps);
+            for (int d = 0; d < H; d++) x[d] = F(hyper)[o + d];
+            ref_rms0(qn, x, nq + (size_t)b * H, H, eps);
+            double dot = 0, mag = 0;
+            for (int d = 0; d < H; d++) { dot += kn[d] * qn[d]; mag += fabs(kn[d] * qn[d]); }
+            dot /= sqrt((double)H); mag /= sqrt((double)H);
+            double root = sqrt(fmax(fabs(dot), 1e-6)), g = ref_sigmoid(copysign(root, dot));
+            for (int d = 0; d < H; d++) {
+                double v = F(value)[(size_t)s * H + d];
+                rg[o + d] = g * v;
+                /* Ruling 9: the dot's error is relative to sum |terms|; it reaches gated through
+                 * sqrt (slope 1/(2 root)) and sigmoid (slope <= 1/4) */
+                sg[o + d] = fabs(g * v) + 1e-3 + fabs(v) * 0.25 * mag / (2.0 * root);
+            }
+            ref_rms0(rn + o, rg + o, nc + (size_t)b * H, H, eps);
+        }
+    int ok = q38_ple_gate(gated, normv, keys, hyper, value, prm, &sh);
+    sync_or_die();
+    char name[80];
+    snprintf(name, sizeof name, "ple_gate S%d H%d C%d %s gated", S, H, C, exact ? "exact" : "fast");
+    if (!ok) expect(name, 0);
+    else check(name, F(gated), rg, sg, n, exact ? 2e-5 : 3e-4);
+    snprintf(name, sizeof name, "ple_gate S%d H%d C%d %s normv", S, H, C, exact ? "exact" : "fast");
+    if (!ok) expect(name, 0);
+    else check(name, F(normv), rn, NULL, n, exact ? 1e-5 : 3e-4);
+    free(x); free(kn); free(qn); free(rg); free(rn); free(sg);
+    q36_tensor *ts[] = {keys, hyper, value, prm, gated, normv};
+    for (size_t i = 0; i < sizeof ts / sizeof *ts; i++) q36_tensor_free(ts[i]);
+}
+
+/* The conv on random gated/normv/ring/conv, rows in order, against q38_ple's loop in double:
+ * out (written or accumulated), the ring after the last row and, for s < snap_rows, the ring
+ * after row s. The ring and the snaps hold copies of normv: identical bits. */
+static void test_ple_conv(int S, int H, int C, int snap_rows, int accumulate, int exact) {
+    q36_gpu_set_exact(exact);
+    const int W = C * H, CK = 4, NG = 3, SL = (CK - 1) * NG;
+    q38_ple_shape sh = {S, C, W, H, CK, NG, snap_rows, 1e-6f, accumulate};
+    size_t n = (size_t)S * W, nr = (size_t)W * SL;
+    q36_tensor *gated = rand_tensor(n, 1.0f), *normv = rand_tensor(n, 2.0f), *ring = rand_tensor(nr, 2.0f);
+    q36_tensor *conv = rand_tensor((size_t)W * CK, 0.5f), *out = rand_tensor(n, 3.0f);
+    q36_tensor *snap = snap_rows ? q36_tensor_new((size_t)snap_rows * nr * 4) : NULL;
+    if (!accumulate) for (size_t i = 0; i < n; i++) F(out)[i] = NAN;
+    for (size_t i = 0; i < (size_t)snap_rows * nr; i++) F(snap)[i] = NAN;
+    double *ro = malloc(sizeof(double) * n), *so = malloc(sizeof(double) * n), *rr = malloc(sizeof(double) * nr);
+    double *rs = malloc(sizeof(double) * (snap_rows ? snap_rows : 1) * nr);
+    for (size_t i = 0; i < nr; i++) rr[i] = F(ring)[i];
+    const float *cw = F(conv), *nv = F(normv), *gt = F(gated);
+    for (int s = 0; s < S; s++) {
+        for (int d = 0; d < W; d++) {
+            size_t i = (size_t)s * W + d;
+            double t0 = (double)cw[(size_t)d * CK + CK - 1] * nv[i], a = t0, m = fabs(t0);
+            for (int k = 0; k < CK - 1; k++) {
+                double t = cw[(size_t)d * CK + k] * rr[(size_t)d * SL + k * NG];
+                a += t; m += fabs(t);
+            }
+            double v = gt[i] + a * ref_sigmoid(a), base = accumulate ? F(out)[i] : 0.0;
+            ro[i] = base + v;
+            so[i] = fabs(base) + fabs(gt[i]) + fabs(v) + m + 1e-3;   /* Ruling 9: a is a CK-term sum */
+            double *rgd = rr + (size_t)d * SL;
+            for (int k = 0; k < SL - 1; k++) rgd[k] = rgd[k + 1];
+            rgd[SL - 1] = nv[i];
+        }
+        if (s < snap_rows) memcpy(rs + (size_t)s * nr, rr, sizeof(double) * nr);
+    }
+    int ok = q38_ple_conv(out, ring, snap, gated, normv, conv, &sh);
+    sync_or_die();
+    char name[96], tag[64];
+    snprintf(tag, sizeof tag, "S%d H%d C%d snap%d acc%d %s", S, H, C, snap_rows, accumulate, exact ? "exact" : "fast");
+    snprintf(name, sizeof name, "ple_conv %s out", tag);
+    if (!ok) expect(name, 0);
+    else check(name, F(out), ro, so, n, exact ? 2e-5 : 3e-4);
+    snprintf(name, sizeof name, "ple_conv %s ring", tag);
+    if (!ok) expect(name, 0);
+    else check(name, F(ring), rr, NULL, nr, 0.0);
+    for (int s = 0; s < snap_rows; s++) {
+        snprintf(name, sizeof name, "ple_conv %s snap[%d]", tag, s);
+        if (!ok) expect(name, 0);
+        else check(name, F(snap) + (size_t)s * nr, rs + (size_t)s * nr, NULL, nr, 0.0);
+    }
+    free(ro); free(so); free(rr); free(rs);
+    q36_tensor *ts[] = {gated, normv, ring, conv, out};
+    for (size_t i = 0; i < sizeof ts / sizeof *ts; i++) q36_tensor_free(ts[i]);
+    if (snap) q36_tensor_free(snap);
+}
+
+static void test_ple_declines(void) {
+    const int H = 8, C = 4, W = 32, S = 2;
+    q36_tensor *big = rand_tensor(4096, 1.0f), *y = q36_tensor_new((size_t)S * W * 4), *z = q36_tensor_new((size_t)S * W * 4);
+    q36_tensor *small = q36_tensor_new(16 * 4);
+    q38_ple_shape ok_s = {S, C, W, H, 4, 3, 0, 1e-6f, 0};
+    q38_ple_shape bad_w = ok_s, bad_eps = ok_s, bad_sl = ok_s, bad_snap = ok_s, bad_s = ok_s;
+    bad_w.W = 24; bad_eps.eps = 0.0f; bad_sl.CK = 12; bad_snap.snap_rows = 1; bad_s.S = 0;
+    q38_ple_shape over_snap = ok_s;
+    over_snap.snap_rows = 3;
+    int took = q38_ple_gate(y, z, big, big, big, big, &bad_w) + q38_ple_gate(y, z, big, big, big, big, &bad_eps) +
+               q38_ple_gate(y, z, big, big, big, big, &bad_s) + q38_ple_gate(y, z, big, big, big, small, &ok_s) +
+               q38_ple_gate(y, small, big, big, big, big, &ok_s) + q38_ple_gate(y, z, big, big, big, big, NULL) +
+               q38_ple_conv(y, big, NULL, big, big, big, &bad_w) + q38_ple_conv(y, big, NULL, big, big, big, &bad_sl) +
+               q38_ple_conv(y, big, NULL, big, big, big, &bad_snap) + q38_ple_conv(y, big, big, big, big, big, &over_snap) +
+               q38_ple_conv(y, small, NULL, big, big, big, &ok_s) + q38_ple_conv(small, big, NULL, big, big, big, &ok_s) +
+               q38_ple_conv(y, big, NULL, big, big, big, NULL);
+    sync_or_die();
+    int clean = 1;
+    for (int i = 0; i < S * W; i++) clean = clean && F(y)[i] == 0.0f && F(z)[i] == 0.0f;
+    expect("ple declines W!=C*H SL>32 snaps sizes", took == 0 && clean);
+    q36_tensor_free(big); q36_tensor_free(y); q36_tensor_free(z); q36_tensor_free(small);
+}
+
 int main(void) {
     /* As tests/test_qwen36_kernels.c: GitHub's Apple Paravirtual device never completes
      * command buffers, so nothing runs there. */
@@ -641,6 +776,21 @@ int main(void) {
         test_gr_read(3, 32, 4, 8, exact);
     }
     test_hc_declines();
+
+    for (int exact = 1; exact >= 0; exact--) {
+        test_ple_gate(3, 32, 4, exact);                     /* tiny: H 32, C 4 (W 128) */
+        test_ple_conv(3, 32, 4, 0, 0, exact);
+        test_ple_conv(3, 32, 4, 0, 1, exact);
+        test_ple_conv(4, 32, 4, 3, 0, exact);               /* snapshots after rows 0..2 */
+        int rr[2] = {1, 4};
+        for (int i = 0; i < 2; i++) {                       /* real: H 2560, C 4 (W 10240), convk 4, ngram 3 */
+            test_ple_gate(rr[i], 2560, 4, exact);
+            test_ple_conv(rr[i], 2560, 4, 0, 0, exact);
+            test_ple_conv(rr[i], 2560, 4, 0, 1, exact);
+        }
+        test_ple_conv(4, 2560, 4, 3, 1, exact);
+    }
+    test_ple_declines();
 
     printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "PASSED", g_failures);
     q36_gpu_cleanup();

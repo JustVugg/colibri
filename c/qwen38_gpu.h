@@ -40,6 +40,28 @@ int q38_hc_apply(q36_tensor *hyper, q36_tensor *inject, q36_tensor *block, int r
  * (q38_rms0 per stream, as q38_gr_read). x, y rows x (C*D). Same fixed-order arithmetic in both modes. */
 int q38_hc_norm(q36_tensor *y, q36_tensor *x, q36_tensor *w, int rows, int D, int C, float eps);
 
+/* The per-layer n-gram embedding (PLE) after its key and value projections: qwen38_core.h's
+ * q38_ple from the per-stream gate on, and shaders/chain_ple.comp on Vulkan. W is the
+ * hyper-connection width C*H (cfg hc_width), not H: keys, hyper, gated, normv and out are
+ * S x W (C streams of H each), value is S x H (one row shared by every stream). The ring
+ * is W x SL with SL = (CK-1)*NG <= 32; snap is snap_rows x W x SL. */
+typedef struct { int S, C, W, H, CK, NG; int snap_rows; float eps; int accumulate; } q38_ple_shape;
+/* gate, per row s and stream k (slices k*H of keys/hyper/gated/normv and of each norm):
+ *   dot = rms0(keys[s][k], norm_key) . rms0(hyper[s][k], norm_query) / sqrt(H);
+ *   g = sigmoid(copysign(sqrt(max(|dot|, 1e-6)), dot)); gated[s][k] = g * value[s];
+ *   normv[s][k] = rms0(gated[s][k], norm_conv). prm = norm_key[W] | norm_query[W] | norm_conv[W].
+ * One 256-thread group a (s, k), fixed-order sums: exact and fast are the same kernel. */
+int q38_ple_gate(q36_tensor *gated, q36_tensor *normv, q36_tensor *keys, q36_tensor *hyper,
+                 q36_tensor *value, q36_tensor *prm, const q38_ple_shape *s);
+/* conv, one thread per channel d < W, rows s in order (conv is W x CK):
+ *   a = conv[d*CK+CK-1]*normv[s][d] + sum_{k<CK-1} conv[d*CK+k]*ring[d*SL+k*NG];
+ *   v = gated[s][d] + silu(a); out[s][d] = v (accumulate 0, the CPU's out) or out[s][d] += v
+ *   (accumulate 1, Vulkan's hyper += form); then ring[d] shifts left by one and its last
+ *   entry takes normv[s][d]; for s < snap_rows the whole ring is copied to snap[s].
+ * snap may be NULL when snap_rows is 0. */
+int q38_ple_conv(q36_tensor *out, q36_tensor *ring, q36_tensor *snap, q36_tensor *gated,
+                 q36_tensor *normv, q36_tensor *conv, const q38_ple_shape *s);
+
 #ifdef __cplusplus
 }
 #endif
