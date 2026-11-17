@@ -2788,6 +2788,124 @@ static int test_fp8_decode_batch_order(void) {
     return 0;
 }
 
+/* V4_COMP_BATCH: a chunk's compressor advances at once against the per-token
+ * walk (coli_v4_compressor_advance), for the attention's compressor (512
+ * columns) and the indexer's (128, fp4 after a hadamard), over chunks that
+ * start off the group of four: the emits, the state rows and, for the
+ * indexer, the keys and the visible counts must match bit for bit. */
+static unsigned comp_batch_seed = 77;
+static float comp_batch_rand(float scale) {
+    comp_batch_seed = comp_batch_seed * 1664525u + 1013904223u;
+    return (((comp_batch_seed >> 8) & 0xffff) / 65536.0f - 0.5f) * scale;
+}
+static int test_compressor_advance_batch(void) {
+    enum { HIDDEN = 256, MAX_N = 128 };
+    static const int chunks[] = {5, 128, 3, 128, 64, 1, 127, 128};
+    for (int indexer = 0; indexer < 2; indexer++) {
+        const int dim = indexer ? 128 : 512, projection = 2 * dim;
+        const char *prefix = indexer ? "attn.indexer.compressor" : "attn.compressor";
+        ColiDeepSeekV4LayerWeights *w = calloc(1, sizeof(*w));
+        if (!w) return 1;
+        w->plan.layer = 2;
+        w->plan.compression_ratio = 4;
+        w->plan.has_indexer = indexer;
+        w->plan.tensor_count = 4;
+        const char *keys[] = {"wkv.weight", "wgate.weight", "ape", "norm.weight"};
+        for (int i = 0; i < 4; i++)
+            snprintf(w->plan.tensors[i].name, COLI_V4_MAX_TENSOR_NAME, "layers.2.%s.%s", prefix, keys[i]);
+        w->data[0] = calloc((size_t)projection * HIDDEN, 2);
+        w->data[1] = calloc((size_t)projection * HIDDEN, 2);
+        float *ape = malloc((size_t)4 * projection * sizeof(float));
+        uint16_t *norm = malloc((size_t)dim * sizeof(uint16_t));
+        float *kv = malloc((size_t)MAX_N * projection * sizeof(float));
+        float *gate = malloc((size_t)MAX_N * projection * sizeof(float));
+        float *walk_out = malloc((size_t)(MAX_N / 4 + 2) * dim * sizeof(float));
+        float *batch_out = malloc((size_t)(MAX_N / 4 + 2) * dim * sizeof(float));
+        int *counts = malloc(MAX_N * sizeof(int)), *walk_counts = malloc(MAX_N * sizeof(int));
+        if (!w->data[0] || !w->data[1] || !ape || !norm || !kv || !gate || !walk_out || !batch_out ||
+            !counts || !walk_counts) return 1;
+        for (int i = 0; i < 4 * projection; i++) ape[i] = comp_batch_rand(0.5f);
+        for (int i = 0; i < dim; i++) norm[i] = (uint16_t)(0x3f60 + i % 64);
+        w->data[2] = ape;
+        w->data[3] = norm;
+        ColiDeepSeekV4Config config = {0};
+        config.hidden_size = HIDDEN; config.head_dim = 512; config.qk_rope_head_dim = 64;
+        config.rms_norm_eps = 1e-6f; config.original_max_position_embeddings = 4096;
+        config.compress_rope_theta = 160000; config.rope_factor = 16;
+        config.rope_beta_fast = 32; config.rope_beta_slow = 1;
+        config.index_head_dim = 128; config.index_n_heads = 4;
+        ColiDeepSeekV4CompressorOptions options = {prefix, dim, indexer};
+        ColiDeepSeekV4CompressorState *walk = NULL, *batch = NULL;
+        ColiDeepSeekV4Indexer *iwalk = NULL, *ibatch = NULL;
+        char error[256] = {0};
+        if (coli_v4_compressor_create_with_options(&walk, w, &config, &options, error, sizeof(error)) ||
+            coli_v4_compressor_create_with_options(&batch, w, &config, &options, error, sizeof(error)) ||
+            (indexer && (coli_v4_indexer_create(&iwalk, w, &config, 40, error, sizeof(error)) ||
+                         coli_v4_indexer_create(&ibatch, w, &config, 40, error, sizeof(error))))) {
+            fprintf(stderr, "compressor batch: create failed: %s\n", error);
+            return 1;
+        }
+        int start = 0, emits = 0;
+        for (size_t c = 0; c < sizeof chunks / sizeof chunks[0]; c++) {
+            int n = chunks[c], walk_emits = 0;
+            for (int i = 0; i < n * projection; i++) {
+                kv[i] = coli_bf16_round(comp_batch_rand(2.0f));
+                gate[i] = comp_batch_rand(6.0f);
+            }
+            for (int i = 0; i < n; i++) {
+                int produced = 0;
+                if (coli_v4_compressor_advance(walk, walk_out + (size_t)walk_emits * dim, &produced,
+                                               kv + (size_t)i * projection, gate + (size_t)i * projection,
+                                               start + i, error, sizeof(error))) return 1;
+                walk_emits += produced;
+                if (indexer) {
+                    walk_counts[i] = coli_v4_indexer_advance(iwalk, kv, start + i, kv + (size_t)i * projection,
+                                                             gate + (size_t)i * projection, error, sizeof(error));
+                    if (walk_counts[i] < 0) return 1;
+                }
+            }
+            int got = coli_v4_compressor_advance_batch(batch, batch_out, MAX_N / 4 + 2, kv, gate, projection,
+                                                       start, n);
+            if (got != walk_emits) {
+                fprintf(stderr, "compressor batch: dim=%d chunk at %d (%d tokens): %d emits against the walk's %d\n",
+                        dim, start, n, got, walk_emits);
+                return 1;
+            }
+            for (int i = 0; i < got * dim; i++)
+                if (memcmp(&walk_out[i], &batch_out[i], sizeof(float))) {
+                    fprintf(stderr, "compressor batch: dim=%d chunk at %d (%d tokens): emit %d column %d is %.9g, "
+                            "the walk's %.9g\n", dim, start, n, i / dim, i % dim, batch_out[i], walk_out[i]);
+                    return 1;
+                }
+            if (!coli_v4_compressor_state_equal(walk, batch)) {
+                fprintf(stderr, "compressor batch: dim=%d chunk at %d (%d tokens): the state rows differ\n",
+                        dim, start, n);
+                return 1;
+            }
+            if (indexer) {
+                if (coli_v4_indexer_advance_batch(ibatch, kv, gate, projection, start, n, counts,
+                                                  error, sizeof(error)) ||
+                    memcmp(counts, walk_counts, (size_t)n * sizeof(int)) ||
+                    coli_v4_indexer_compressed_count(ibatch) != coli_v4_indexer_compressed_count(iwalk) ||
+                    memcmp(coli_v4_indexer_compressed_values(ibatch), coli_v4_indexer_compressed_values(iwalk),
+                           (size_t)coli_v4_indexer_compressed_count(iwalk) * dim * sizeof(float))) {
+                    fprintf(stderr, "indexer batch: chunk at %d (%d tokens) differs from the walk\n", start, n);
+                    return 1;
+                }
+            }
+            emits += got;
+            start += n;
+        }
+        if (indexer) { coli_v4_indexer_destroy(ibatch); coli_v4_indexer_destroy(iwalk); }
+        coli_v4_compressor_destroy(batch); coli_v4_compressor_destroy(walk);
+        free(walk_counts); free(counts); free(batch_out); free(walk_out); free(gate); free(kv);
+        free(norm); free(ape); free(w->data[1]); free(w->data[0]); free(w);
+        printf("DeepSeek-V4 compressor batch (%s, %d emits over %d positions): bit-identical to the walk\n",
+               indexer ? "indexer" : "attention", emits, start);
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (test_fp8_decode_batch_order() || test_sparse_attention_parallel_order() ||
         test_route_bf16_parallel_order() || test_fp8_grouped_projection()) return 1;
@@ -2873,6 +2991,10 @@ int main(int argc, char **argv) {
     }
     if (test_sparse_attention() != 0) {
         fprintf(stderr, "FAIL: test_sparse_attention\n");
+        return 1;
+    }
+    if (test_compressor_advance_batch() != 0) {
+        fprintf(stderr, "FAIL: test_compressor_advance_batch\n");
         return 1;
     }
     puts("DeepSeek-V4 tests: ok");
