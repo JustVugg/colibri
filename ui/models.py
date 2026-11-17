@@ -35,17 +35,12 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 _UP = os.path.dirname(HERE)
-# Support modules sit next to ui/ in an archive or libexec installation,
-# and in c/ in a source checkout. An installed launcher lives in bin/.
-COLI_DIR = _UP if os.path.isfile(os.path.join(_UP, "setup_flow.py")) else os.path.join(_UP, "c")
-COLI = os.path.join(COLI_DIR, "coli")
-if not os.path.isfile(COLI):
-    COLI = os.path.join(os.path.dirname(os.path.dirname(COLI_DIR)), "bin", "coli")
+# the release archive keeps coli next to ui/, a source checkout keeps it in c/
+COLI_DIR = _UP if os.path.isfile(os.path.join(_UP, "coli")) else os.path.join(_UP, "c")
 sys.path.insert(0, COLI_DIR)
 import setup_catalog  # noqa: E402
 import setup_download  # noqa: E402
@@ -194,31 +189,6 @@ def _argval(argv, flag):
     return None
 
 
-def coli_command(argv):
-    """`serve` or `web` when argv is coli's (`coli web` serves too, with this UI as its child), else None"""
-    for i, a in enumerate(argv[:3]):
-        if os.path.basename(a) == "coli" and i + 1 < len(argv) and argv[i + 1] in ("serve", "web"):
-            return argv[i + 1]
-    return None
-
-
-def serve_argv(argv):
-    """the command that starts a gateway like this one again: a `coli web` becomes `coli serve`
-    with its options, without the UI's own (this UI stays and follows the new process)"""
-    cmd = coli_command(argv)
-    if cmd != "web":
-        return list(argv)
-    at = next(i for i, a in enumerate(argv[:3]) if os.path.basename(a) == "coli") + 1
-    rest = [a for a in _without(argv[at + 1:], ("--ui-port",)) if a != "--no-browser"]
-    return argv[:at] + ["serve"] + rest
-
-
-# This UI as `coli web`'s child: it exits when that process does (server.py, --exit-with-stdin),
-# but a model switch stops it on purpose. While `switching`, the UI stays; after, it follows `pid`,
-# the gateway the switch started (or the previous one brought back).
-LIFE = {"switching": False, "pid": None}
-
-
 def _without(argv, flags):
     """argv without these options and their values"""
     out, skip = [], False
@@ -267,14 +237,33 @@ _gw = {"pid": None, "at": 0, "info": None}
 
 
 def gateway_proc():
-    """{pid, argv, cwd, env, key} of the process listening on the gateway's port, when it is
-    on this machine and /proc shows it (Linux); None otherwise. Found, it is kept a few seconds."""
-    if not LINUX or CFG.host not in ("127.0.0.1", "localhost", "::1", "0.0.0.0"):
+    if CFG.host not in ("127.0.0.1", "localhost", "::1", "0.0.0.0"):
         return None
     now = time.time()
     if _gw["info"] and now - _gw["at"] < 3:
         return _gw["info"]
-    inodes = _listening_inodes(CFG.port)     # nobody listening: known at once, nothing cached
+    if os.name == "nt":
+        import shlex
+        pid, info = None, None
+        try:
+            out = subprocess.check_output(["netstat", "-ano", "-p", "TCP"], text=True, stderr=subprocess.DEVNULL)
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 5 and parts[3] == "LISTENING" and parts[1].endswith(":" + str(CFG.port)):
+                    pid = int(parts[4]); break
+            if pid:
+                cmd_out = subprocess.check_output(["powershell", "-NoProfile", "-Command", f"(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine"], text=True, stderr=subprocess.DEVNULL).strip()
+                argv = shlex.split(cmd_out, posix=False) if cmd_out else []
+                argv = [a.strip('"') for a in argv]
+                is_coli = any("coli" in os.path.basename(a).lower() for a in argv[:4]) and ("serve" in argv or "web" in argv)
+                info = {"pid": pid, "argv": argv, "cwd": COLI_DIR, "env": dict(os.environ), "coli": is_coli, "key": _argval(argv, "--api-key") or os.environ.get("COLI_API_KEY")}
+        except Exception:
+            info = None
+        _gw.update(pid=pid, at=now, info=info)
+        return info
+    if not LINUX:
+        return None
+    inodes = _listening_inodes(CFG.port)
     pid = None
     if inodes:
         if _gw["pid"] and _holds(_gw["pid"], inodes):
@@ -289,7 +278,7 @@ def gateway_proc():
             with open("/proc/%d/environ" % pid, "rb") as f:
                 env = dict(x.split("=", 1) for x in f.read().decode(errors="replace").split("\0") if "=" in x)
             info = {"pid": pid, "argv": argv, "cwd": os.readlink("/proc/%d/cwd" % pid), "env": env,
-                    "coli": coli_command(argv) is not None}
+                    "coli": any(os.path.basename(a) == "coli" for a in argv[:3]) and "serve" in argv}
             info["key"] = _argval(argv, "--api-key") or env.get("COLI_API_KEY")
         except OSError:
             info = None
@@ -395,19 +384,54 @@ def biggest_file(dirs, depth=3):
 
 
 def measure_disk(seconds=2.0, block=1 << 20, threads=16):
-    """Random 1 MiB direct reads (past the page cache) from the biggest model file, 16 in
-    flight: how fast experts come from the SSD. Linux only (O_DIRECT)."""
+    """Random 1 MiB direct reads (past the page cache) from the biggest model file, 16 in flight."""
+    path = biggest_file([r for r in roots() if os.path.isdir(r)])
+    if not path:
+        raise RuntimeError("no model file on disk to measure")
+    size = os.path.getsize(path)
+    if os.name == 'nt':
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.windll.kernel32
+        k32.CreateFileW.restype = wintypes.HANDLE
+        k32.VirtualAlloc.restype = ctypes.c_void_p
+        h = k32.CreateFileW(path, 0x80000000, 1, None, 3, 0x20000000 | 0x40000000, None)
+        if h in (None, -1, wintypes.HANDLE(-1).value):
+            raise OSError("CreateFileW failed")
+        class OV(ctypes.Structure):
+            _fields_ = [("Internal", ctypes.c_void_p), ("InternalHigh", ctypes.c_void_p), ("Offset", wintypes.DWORD), ("OffsetHigh", wintypes.DWORD), ("hEvent", wintypes.HANDLE)]
+        tot, stop = [0] * threads, time.time() + seconds
+        def work_win(i):
+            buf = k32.VirtualAlloc(None, block, 0x3000, 0x04)
+            ev = k32.CreateEventW(None, True, False, None)
+            r, n, br = random.Random(i), 0, wintypes.DWORD(0)
+            ov = OV(hEvent=ev)
+            try:
+                while time.time() < stop:
+                    off = r.randrange(0, max(1, (size - block) // 4096)) * 4096
+                    ov.Offset, ov.OffsetHigh = off & 0xFFFFFFFF, off >> 32
+                    ok = k32.ReadFile(h, ctypes.c_void_p(buf), block, ctypes.byref(br), ctypes.byref(ov))
+                    if not ok and k32.GetLastError() == 997:
+                        k32.GetOverlappedResult(h, ctypes.byref(ov), ctypes.byref(br), True)
+                    n += br.value
+            finally:
+                k32.CloseHandle(ev)
+                k32.VirtualFree(ctypes.c_void_p(buf), 0, 0x8000)
+            tot[i] = n
+        th = [threading.Thread(target=work_win, args=(i,)) for i in range(threads)]
+        t0 = time.time()
+        try:
+            for t in th: t.start()
+            for t in th: t.join()
+        finally:
+            k32.CloseHandle(h)
+        return sum(tot) / (time.time() - t0) / GB
     import mmap
     if not LINUX:
         raise RuntimeError("le letture dirette dal disco si misurano solo su Linux")
-    path = biggest_file([r for r in roots() if os.path.isdir(r)])
-    if not path:
-        raise RuntimeError("nessun modello sul disco da leggere: rimisura dopo il primo download")
-    size = os.path.getsize(path)
     fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
     tot = [0] * threads
     stop = time.time() + seconds
-
     def work(i):
         buf, r, n = mmap.mmap(-1, block), random.Random(i), 0
         while time.time() < stop:
@@ -416,10 +440,8 @@ def measure_disk(seconds=2.0, block=1 << 20, threads=16):
     th = [threading.Thread(target=work, args=(i,)) for i in range(threads)]
     t0 = time.time()
     try:
-        for t in th:
-            t.start()
-        for t in th:
-            t.join()
+        for t in th: t.start()
+        for t in th: t.join()
     finally:
         os.close(fd)
     return sum(tot) / (time.time() - t0) / GB
@@ -1065,7 +1087,7 @@ class Cancelled(BaseException):
 
 
 def new_job(kind, title, **kw):
-    jid = uuid.uuid4().hex
+    jid = "%x" % int(time.time() * 1000)
     job = {"id": jid, "kind": kind, "title": title, "state": "queued", "done": 0, "total": 0, "rate": 0, "eta": None,
            "msg": "", "started": time.time(), "cancel": False, **kw}
     with _jlock:
@@ -1097,15 +1119,11 @@ def run_download(job, repo, revision, files, dest, after=None):
                 raise Cancelled()
             now = time.time()
             job["done"], job["file"] = ev["done"], ev["file"]
-            # `done` includes bytes already on disk. `fresh` is this run only,
-            # so a resume does not report the whole model as one second of speed.
-            fresh = ev.get("fresh", ev["done"])
             if now - mark[0] >= 1.0:
-                gained = max(0, fresh - mark[1])
-                rate = gained / (now - mark[0])
+                rate = (ev["done"] - mark[1]) / (now - mark[0])
                 job["rate"] = rate if not job["rate"] else 0.7 * job["rate"] + 0.3 * rate
                 job["eta"] = (total - ev["done"]) / job["rate"] if job["rate"] > 0 else None
-                mark[0], mark[1] = now, fresh
+                mark[0], mark[1] = now, ev["done"]
         setup_download.download_repo(repo, revision, dest, files, token=setup_download.hf_token(), progress=progress)
         job["done"] = total
         if after:
@@ -1161,7 +1179,7 @@ def start_gguf_download(repo, stem):
     job = new_job("download", "%s %s" % (repo.split("/")[-1], v["quant"]), repo=repo, dest=out)
 
     def after(j):
-        r = subprocess.run([sys.executable, COLI, "import", os.path.join(dest, v["files"][0]["path"]),
+        r = subprocess.run([sys.executable, os.path.join(COLI_DIR, "coli"), "import", os.path.join(dest, v["files"][0]["path"]),
                             "--out", out, "--mode", "link"], capture_output=True, text=True, cwd=COLI_DIR)
         if r.returncode:
             raise RuntimeError("coli import: %s" % (r.stderr or r.stdout)[-400:])
@@ -1184,20 +1202,21 @@ def proc_children(pid):
 
 
 def stop_gateway(p, job):
-    kids = [k for k in proc_children(p["pid"]) if k != os.getpid()]   # under `coli web` this UI is one
-    job.update(state="stopping", msg="fermo il server attuale")
+    job.update(state="stopping", msg="stopping current server")
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(p["pid"])], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(1)
+        _gw["at"] = 0
+        return
+    kids = proc_children(p["pid"])
     os.kill(p["pid"], signal.SIGTERM)
     for _ in range(60):
-        try:
-            reaped, _ = os.waitpid(p["pid"], os.WNOHANG)
-        except ChildProcessError:
-            reaped = 0
-        if reaped == p["pid"] or not os.path.exists("/proc/%d" % p["pid"]):
+        if not os.path.exists("/proc/%d" % p["pid"]):
             break
         time.sleep(1)
     else:
         os.kill(p["pid"], signal.SIGKILL)
-    for k in kids:                     # the engine, if the gateway left it behind
+    for k in kids:
         if os.path.exists("/proc/%d" % k):
             os.kill(k, signal.SIGTERM)
     _gw["at"] = 0
@@ -1240,35 +1259,27 @@ def switch_model(path, force=False, tier=None):
     folder and environment) with --model changed; `tier` ram or gpu also turns the GPU off or
     on. A model that does not start brings the previous one back."""
     path = os.path.realpath(path)
-    if not os.path.isdir(path):
+    if not os.path.isdir(path) or not under_roots(path):
         raise ValueError("cartella del modello non valida")
+    old = gateway_proc()
+    answering = False
+    try:
+        gw_json("/health", timeout=3)
+        answering = True
+    except urllib.error.HTTPError:
+        answering = True
+    except (OSError, ValueError):
+        pass
+    if answering and old and not old["coli"]:
+        raise RuntimeError("la porta %d è di un altro processo (%d): non lo tocco" % (CFG.port, old["pid"]))
+    if answering and not old:
+        raise RuntimeError("non trovo il processo di coli serve sulla porta %d su questa macchina: fermalo e "
+                           "riavvialo con coli serve --model %s" % (CFG.port, path))
+    if answering and not force and not gw_idle():
+        raise RuntimeError("il motore sta rispondendo a una richiesta: riprova quando ha finito")
     if not _switching.acquire(blocking=False):
         raise RuntimeError("sto già cambiando modello: aspetta che finisca")
-    try:
-        # The current gateway and its health must belong to this admitted
-        # operation, not a snapshot from before another switch completed.
-        if not under_roots(path):
-            raise ValueError("cartella del modello non valida")
-        old = gateway_proc()
-        answering = False
-        try:
-            gw_json("/health", timeout=3)
-            answering = True
-        except urllib.error.HTTPError:
-            answering = True
-        except (OSError, ValueError):
-            pass
-        if answering and old and not old["coli"]:
-            raise RuntimeError("la porta %d è di un altro processo (%d): non lo tocco" % (CFG.port, old["pid"]))
-        if answering and not old:
-            raise RuntimeError("non trovo il processo di coli serve sulla porta %d su questa macchina: fermalo e "
-                               "riavvialo con coli serve --model %s" % (CFG.port, path))
-        if answering and not force and not gw_idle():
-            raise RuntimeError("il motore sta rispondendo a una richiesta: riprova quando ha finito")
-        job = new_job("switch", os.path.basename(path), dest=path)
-    except BaseException:
-        _switching.release()
-        raise
+    job = new_job("switch", os.path.basename(path), dest=path)
 
     def go():
         try:
@@ -1285,11 +1296,11 @@ def switch_model(path, force=False, tier=None):
                 if r.returncode or not os.path.exists(binary):
                     raise RuntimeError("make %s non riuscito: %s" % (d.build_target, (r.stderr or r.stdout)[-300:]))
             if old and old["coli"]:
-                argv, cwd, env = serve_argv(old["argv"]), old["cwd"], dict(old["env"])
-                at = argv.index("serve") + 1
+                argv, cwd, env = list(old["argv"]), old["cwd"], dict(old["env"])
+                at = (argv.index("serve") if "serve" in argv else argv.index("web")) + 1
                 argv = argv[:at] + ["--model", path] + _without(argv[at:], ("--model",))
             else:
-                argv = [sys.executable, COLI, "serve", "--model", path,
+                argv = [sys.executable, os.path.join(COLI_DIR, "coli"), "serve", "--model", path,
                         "--host", CFG.host, "--port", str(CFG.port)]
                 cwd, env = COLI_DIR, dict(os.environ)
             if tier == "ram":
@@ -1304,14 +1315,10 @@ def switch_model(path, force=False, tier=None):
                 if nvidia and env.get("COLI_CUDA") != "1" and not _argval(argv, "--gpu"):
                     argv += ["--gpu", "auto"]
             if old and old["coli"]:
-                if old["pid"] == os.getppid():
-                    LIFE["switching"] = True   # `coli web` started this UI: it stays while that stops
                 stop_gateway(old, job)
             log = spath("serve.log")
             job.update(state="starting", msg="avvio il nuovo modello")
             proc = launch(argv, cwd, env, log)
-            if LIFE["switching"]:
-                LIFE["pid"] = proc.pid
             try:
                 wait_up(proc, log, job)
             except RuntimeError as e:
@@ -1320,9 +1327,7 @@ def switch_model(path, force=False, tier=None):
                 if not (old and old["coli"]):
                     raise
                 job.update(state="starting", msg=str(e)[:400], note="non parte: riavvio il modello di prima")
-                back = launch(serve_argv(old["argv"]), old["cwd"], old["env"], spath("serve-previous.log"))
-                if LIFE["switching"]:
-                    LIFE["pid"] = back.pid
+                back = launch(old["argv"], old["cwd"], old["env"], spath("serve-previous.log"))
                 try:
                     wait_up(back, spath("serve-previous.log"), job)
                     job["note"] = "riavviato il modello di prima"
@@ -1335,14 +1340,8 @@ def switch_model(path, force=False, tier=None):
         except Exception as e:   # noqa: BLE001 - said on the page
             job.update(state="error", msg=str(e)[:400])
         finally:
-            LIFE["switching"] = False
             _switching.release()
-    try:
-        threading.Thread(target=go, daemon=True).start()
-    except BaseException as error:
-        job.update(state="error", msg=str(error)[:400])
-        _switching.release()
-        raise
+    threading.Thread(target=go, daemon=True).start()
     return job
 
 
@@ -1357,7 +1356,7 @@ def get(path, q):
         return 200, {"machine": MACHINE, "eta": CAL["eta"], "cal": CAL, "catalog": rows, "installed": inst,
                      "best": best_per_tier(rows + [r for r in inst if r.get("tiers")]),
                      "in_use": gateway_model_dir(), "in_use_tier": gateway_tier(), "roots": roots(),
-                     "can_switch": LINUX, "gguf_arches": sorted(gguf_arches())}
+                     "can_switch": (LINUX or os.name == "nt"), "gguf_arches": sorted(gguf_arches())}
     if path == "/models/search":
         return 200, {"q": q.get("q", ""), "results": hf_search(q.get("q", ""))}
     if path == "/models/files":
