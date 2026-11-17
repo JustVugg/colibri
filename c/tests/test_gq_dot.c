@@ -1,7 +1,8 @@
 /* The integer matmul against the same product in double precision, with the
  * activation ALREADY rounded to int8: this isolates the kernel (unpack, the
  * AVX2 dot, the min term, the per-group scales) from the activation's own
- * rounding. Reads: int32 type, int32 O, int32 I, int32 S, W bytes, S*I floats.
+ * rounding. A type with no integer form (MXFP8: gq_int_ok) takes gq_matmul_f32 on
+ * the activation as it is, and is checked against that. Reads: int32 type, int32 O, int32 I, int32 S, W bytes, S*I floats.
  * Prints the max error relative to sum|w*x| over all outputs. */
 #ifdef _WIN32
 #include <fcntl.h>
@@ -28,7 +29,7 @@ int main(void) {
         for (int o = 0; o < O; o++) {
             gq_dequant_row(t, W + (int64_t)o * rb, wf, I);
             double ref = 0, mag = 0;
-            for (int i = 0; i < I; i++) { double xv = (double)xq[i] * dx[i / 32]; ref += (double)wf[i] * xv; mag += fabs((double)wf[i] * xv); }
+            for (int i = 0; i < I; i++) { double xv = gq_int_ok(t, I) ? (double)xq[i] * dx[i / 32] : (double)x[(int64_t)s * I + i]; ref += (double)wf[i] * xv; mag += fabs((double)wf[i] * xv); }
             double e = fabs((double)y[(int64_t)s * O + o] - ref) / (mag > 0 ? mag : 1);
             if (e > worst) worst = e;
         }
