@@ -109,3 +109,33 @@ kernel void q38_hc_apply(device float *hyper [[buffer(0)]],
     ulong rk = i / p.D, d = i % p.D, r = rk / p.C;
     hyper[i] += inject[rk] * block[r * p.D + d];
 }
+
+/* y[r*C+b][j] = x * r * (1 + w[b*D + j]), r = 1/sqrt(mean(x^2) + eps) (q38_rms0 per stream).
+ * One 256-thread group a (row, stream); thread t sums squares t, t+256, ... and thread 0 adds the
+ * 256 partials in order (fixed, deterministic), so exact and fast are the same kernel. */
+struct q38_hcn_args { uint D, C; float eps; };
+
+kernel void q38_hc_norm(device const float *x [[buffer(0)]],
+                        device const float *w [[buffer(1)]],
+                        device float *y [[buffer(2)]],
+                        constant q38_hcn_args &p [[buffer(3)]],
+                        uint g [[threadgroup_position_in_grid]],
+                        uint t [[thread_index_in_threadgroup]]) {
+    threadgroup float part[256];
+    threadgroup float rs;
+    ulong row = g;                                  /* rows * C of them */
+    device const float *xr = x + row * p.D;
+    device const float *wr = w + (row % p.C) * p.D;
+    float s = 0.0f;
+    for (uint j = t; j < p.D; j += 256) s += xr[j] * xr[j];
+    part[t] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (t == 0) {
+        float ss = 0.0f;
+        for (uint l = 0; l < 256; l++) ss += part[l];
+        rs = 1.0f / sqrt(ss / (float)p.D + p.eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float r = rs;
+    for (uint j = t; j < p.D; j += 256) y[row * p.D + j] = xr[j] * r * (1.0f + wr[j]);
+}

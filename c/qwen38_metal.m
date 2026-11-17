@@ -17,7 +17,7 @@ static const char q38_source[] = {
     , 0
 };
 
-enum { K38_COPY, K38_DOT_BF16_EXACT, K38_DOT_BF16_FAST, K38_HC_LOW, K38_HC_MIX, K38_HC_INJ, K38_HC_APPLY, K38_COUNT };
+enum { K38_COPY, K38_DOT_BF16_EXACT, K38_DOT_BF16_FAST, K38_HC_LOW, K38_HC_MIX, K38_HC_INJ, K38_HC_APPLY, K38_HC_NORM, K38_COUNT };
 
 static const char *const q38_kernel_names[K38_COUNT] = {
     "q38_copy",
@@ -27,6 +27,7 @@ static const char *const q38_kernel_names[K38_COUNT] = {
     "q38_hc_mix",
     "q38_hc_inj",
     "q38_hc_apply",
+    "q38_hc_norm",
 };
 
 static id<MTLComputePipelineState> g_q38_pipe[K38_COUNT];
@@ -179,6 +180,23 @@ int q38_hc_apply(q36_tensor *hyper, q36_tensor *inject, q36_tensor *block, int r
         q36_metal_bind(e, block, 2);
         [e setBytes:&p length:sizeof(p) atIndex:3];
         q38_threads(e, pso, (uint64_t)rows * D * C);
+    }
+    return 1;
+}
+
+int q38_hc_norm(q36_tensor *y, q36_tensor *x, q36_tensor *w, int rows, int D, int C, float eps) {
+    if (!q38_ready() || rows < 1 || D < 1 || C < 1 || !(eps > 0.0f) || (uint64_t)rows * C > UINT32_MAX ||
+        (uint64_t)rows * D * C > UINT32_MAX || !q36_metal_fits(x, (uint64_t)rows * D * C * F4) ||
+        !q36_metal_fits(y, (uint64_t)rows * D * C * F4) || !q36_metal_fits(w, (uint64_t)D * C * F4)) return 0;
+    @autoreleasepool {
+        struct { uint32_t D, C; float eps; } p = {(uint32_t)D, (uint32_t)C, eps};
+        id<MTLComputePipelineState> pso = g_q38_pipe[K38_HC_NORM];
+        id<MTLComputeCommandEncoder> e = q36_metal_encoder(pso);
+        q36_metal_bind(e, x, 0);
+        q36_metal_bind(e, w, 1);
+        q36_metal_bind(e, y, 2);
+        [e setBytes:&p length:sizeof(p) atIndex:3];
+        [e dispatchThreadgroups:MTLSizeMake((NSUInteger)rows * C, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     }
     return 1;
 }

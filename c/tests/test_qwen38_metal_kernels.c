@@ -478,11 +478,32 @@ static void test_hc_apply(int rows, int D, int C, int exact) {
     q36_tensor_free(h); q36_tensor_free(inj); q36_tensor_free(blk);
 }
 
+static void test_hc_norm(int rows, int D, int C, int exact) {
+    q36_gpu_set_exact(exact);
+    size_t W = (size_t)C * D, n = (size_t)rows * W;
+    q36_tensor *x = rand_tensor(n, 3.0f), *w = rand_tensor(W, 0.5f), *y = q36_tensor_new(n * 4);
+    double *xd = malloc(sizeof(double) * n), *ref = malloc(sizeof(double) * n);
+    for (size_t i = 0; i < n; i++) { xd[i] = F(x)[i]; F(y)[i] = NAN; }
+    for (int r = 0; r < rows; r++)
+        for (int b = 0; b < C; b++)
+            ref_norm(ref + r * W + (size_t)b * D, xd + r * W + (size_t)b * D, F(w) + (size_t)b * D, 1, D, 1e-6);
+    int ok = q38_hc_norm(y, x, w, rows, D, C, 1e-6f);
+    sync_or_die();
+    char name[64];
+    snprintf(name, sizeof name, "hc_norm %dx%d C%d %s", rows, D, C, exact ? "exact" : "fast");
+    if (!ok) expect(name, 0);
+    else check(name, F(y), ref, NULL, n, exact ? 1e-5 : 3e-4);
+    free(xd); free(ref);
+    q36_tensor_free(x); q36_tensor_free(w); q36_tensor_free(y);
+}
+
 static void test_hc_declines(void) {
     q36_tensor *a = rand_tensor(64, 1.0f), *y = q36_tensor_new(16 * 4);
     int ok = !q38_hc_low(y, a, 0, 4.f) && !q38_hc_low(y, a, 32, 4.f) && !q38_hc_inj(NULL, a, 4, 4.f) &&
              !q38_hc_mix(y, a, a, 2, 16, 4, 4.f) && !q38_hc_mix(y, a, a, 2, 8, 0, 4.f) &&
-             !q38_hc_apply(a, y, y, 2, 16, 4);
+             !q38_hc_apply(a, y, y, 2, 16, 4) && !q38_hc_norm(y, a, a, 0, 4, 4, 1e-6f) &&
+             !q38_hc_norm(y, a, a, 1, 4, 4, 0.f) && !q38_hc_norm(y, a, a, 1, 4, 4, NAN) &&
+             !q38_hc_norm(y, a, a, 2, 16, 4, 1e-6f);
     sync_or_die();
     for (int i = 0; i < 16; i++) ok = ok && F(y)[i] == 0.0f;
     expect("hc declines bad sizes", ok);
@@ -490,14 +511,14 @@ static void test_hc_declines(void) {
 }
 
 /* The CPU's q38_gr_read in double, with the dot products on the f32 weights:
- * rms0 per stream (weight w, shared across streams here: q36_rmsnorm takes one weight row),
+ * rms0 per stream (stream b uses weight row b of the W-long nw),
  * low = silu((down.norm)/C), mix = up.low, mixed = sum_b sigmoid(mix)*norm / C,
  * inject = 2 sigmoid((inj.norm)/C). */
 static void test_gr_read(int S, int H, int C, int R, int exact) {
     q36_gpu_set_exact(exact);
     const float eps = 1e-6f;
     size_t W = (size_t)C * H;
-    q36_tensor *hyper = rand_tensor((size_t)S * W, 2.0f), *nw = rand_tensor((size_t)H, 0.5f);
+    q36_tensor *hyper = rand_tensor((size_t)S * W, 2.0f), *nw = rand_tensor(W, 0.5f);
     q36_tensor *down = rand_tensor((size_t)R * W, 1.0f / sqrtf((float)W));
     q36_tensor *up = rand_tensor(W * R, 1.0f / sqrtf((float)R)), *injw = rand_tensor((size_t)C * W, 1.0f / sqrtf((float)W));
     q36_tensor *norm = q36_tensor_new((size_t)S * W * 4), *low0 = q36_tensor_new((size_t)S * R * 4);
@@ -511,7 +532,9 @@ static void test_gr_read(int S, int H, int C, int R, int exact) {
     double *smix = malloc(sizeof(double) * S * H), *sinj = malloc(sizeof(double) * S * C);
     double *xin = malloc(sizeof(double) * S * W);
     for (size_t i = 0; i < (size_t)S * W; i++) xin[i] = F(hyper)[i];
-    ref_norm(nm, xin, F(nw), S * C, H, eps);
+    for (int s = 0; s < S; s++)
+        for (int b = 0; b < C; b++)
+            ref_norm(nm + s * W + (size_t)b * H, xin + s * W + (size_t)b * H, F(nw) + (size_t)b * H, 1, H, eps);
     for (int s = 0; s < S; s++)
         for (int r = 0; r < R; r++) {
             double v = 0;
@@ -543,7 +566,7 @@ static void test_gr_read(int S, int H, int C, int R, int exact) {
             sinj[s * C + c] = fabs(rinj[s * C + c]) + 1e-3;
         }
 
-    int ok = q36_rmsnorm(norm, hyper, nw, S * C, H, eps, 0) &&
+    int ok = q38_hc_norm(norm, hyper, nw, S, H, C, eps) &&
              q36_dot_f32(low0, norm, down, S, (int)W, R) && q38_hc_low(low, low0, S * R, (float)C) &&
              q36_dot_f32(mix0, low, up, S, R, (int)W) && q38_hc_mix(mixed, mix0, norm, S, H, C, (float)C) &&
              q36_dot_f32(inj0, norm, injw, S, (int)W, C) && q38_hc_inj(inj, inj0, S * C, (float)C);
@@ -605,12 +628,14 @@ int main(void) {
         test_hc_unary(0, 96, exact); test_hc_unary(1, 96, exact);       /* tiny: rows 3 x C 4 x ... */
         test_hc_mix(3, 32, 4, exact);
         test_hc_apply(3, 32, 4, exact);
+        test_hc_norm(3, 32, 4, exact);
         int rr[2] = {1, 8};
         for (int i = 0; i < 2; i++) {                                    /* real: H 2560, C 4, rank 320 */
             test_hc_unary(0, rr[i] * 320, exact);
             test_hc_unary(1, rr[i] * 4, exact);
             test_hc_mix(rr[i], 2560, 4, exact);
             test_hc_apply(rr[i], 2560, 4, exact);
+            test_hc_norm(rr[i], 2560, 4, exact);
             test_gr_read(rr[i], 2560, 4, 320, exact);
         }
         test_gr_read(3, 32, 4, 8, exact);

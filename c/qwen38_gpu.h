@@ -36,6 +36,9 @@ int q38_hc_mix(q36_tensor *y, q36_tensor *a, q36_tensor *b, int rows, int D, int
 int q38_hc_inj(q36_tensor *y, q36_tensor *a, int n, float fc);
 /* hyper[r][k][d] += inject[r][k] * block[r][d]; hyper rows x (C*D), inject rows x C, block rows x D. */
 int q38_hc_apply(q36_tensor *hyper, q36_tensor *inject, q36_tensor *block, int rows, int D, int C);
+/* y[r*C+b] = rms0(x[r*C+b]) over D, weight row b of the C*D-long w: x * rsqrt(mean(x^2)+eps) * (1+w[b*D+j])
+ * (q38_rms0 per stream, as q38_gr_read). x, y rows x (C*D). Same fixed-order arithmetic in both modes. */
+int q38_hc_norm(q36_tensor *y, q36_tensor *x, q36_tensor *w, int rows, int D, int C, float eps);
 
 #ifdef __cplusplus
 }
