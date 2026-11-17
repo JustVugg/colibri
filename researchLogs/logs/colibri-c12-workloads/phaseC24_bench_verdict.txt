@@ -1,0 +1,46 @@
+C24 bench verdict — fused S==1 for Q4_K (c24_q4k_bench.c, OMP=1 + OMP=6,
+phaseC24_bench_omp{1,6}.jsonl, 2026-11-17)
+
+ROUTE GATE: PASS — proceed to engine insertion.
+
+1. Bit-exactness: fused precheck maxdiff 0.000e+00 on every shape, both thread
+   counts (fused decoder vs the current generic path, 8 random rows, S=2 act).
+   The min term rides gq_dot_i8's exact fmaf chain; codes are unsigned nibbles
+   0..15 (no -8 offset — the min carries it via the activation's per-16 sums).
+
+2. The S==1 gap is real and C22's mechanism transfers:
+   generic rowall at S=1: gate/up 18.5/17.7 GFLOPS (unpack 42%), down
+   23.5/23.5 (unpack 56%) — the whole 144-byte row decoded to the thread
+   buffer and reloaded for one activation row.
+   fused register-resident: 41.1 / 46.6 GFLOPS flat in S (39.9-41.7 / 46.6-52.2
+   across S at OMP=6).
+   fused_s1_gain: 2.22/2.26x (gate/up), 1.98x (down) at OMP=1 and OMP=6.
+
+3. Q4_K fused is the fastest decode-regime kernel measured on this stack:
+   40-42 / 47-52 GFLOPS at S==1, ahead of C22's fused IQ2_S (29.5) and IQ3_S
+   (24.2) — the unsigned-nibble decoder has no grid tables and no sign bytes,
+   just one nibble split and one gq_scale_min_k4 pair per sub-block.
+
+4. Crossover confirmed (same as C22): at S >= 4 the generic path wins
+   (matmul rides gq_rows_f8: 65-125 gate / 95-176 down GFLOPS at OMP=6;
+   fused_vs_matmul 0.33-0.64) -> engine gate must be a->S == 1 exactly,
+   behind Q36_EXPERT_FUSE like the C22 kernels.
+
+5. Straggler sizing (rowall/unpack only, no fused candidates yet):
+   Q2_K S=1: 18.3/23.5 GFLOPS (unpack 36-48%) — same class as Q4_K, min terms.
+   IQ4_XS S=1: 19.4/28.0 (unpack 46-67%).
+   Q3_K S=1: 3.0/3.0 GFLOPS (unpack 92-95%!) — catastrophic; the 3-bit
+   hmask/quan decode dominates everything. ~10x headroom if ever fused, but
+   the IQ3 file ships only 1-2 such early layers, so it stays an optional
+   follow-up, not part of C24's engine step.
+
+6. Calibration (machine-state tie to C18/C22): shipped fused XXS kernels
+   35.8 / 23.5-25.0 GFLOPS flat; rowall XXS at large S 52.7-52.8 / 77.9-78.5
+   (the dec1 class, within drift of C18's 51.7/71.8 and C22's rerun).
+
+Next: engine insertion of gq_arm_sbk_q4_k + gq_dot_arm_q4_k in gq_row_all's
+ARM block behind the C22 arm, gate (t == GQ_Q4_K && a->S == 1 && gq_fuse()),
+then rebuild + fixture suite + in-engine revalidation (bench cell_rowall at
+S=1 must show the fused rates; Q36_EXPERT_FUSE=0 restores 17.7/23.5), then
+the real-model interleaved A/B on the Q4_K_M container targeting the C16
+0.72x 12K decode recovery.
