@@ -17,10 +17,12 @@ static const char q38_source[] = {
     , 0
 };
 
-enum { K38_COPY, K38_COUNT };
+enum { K38_COPY, K38_DOT_BF16_EXACT, K38_DOT_BF16_FAST, K38_COUNT };
 
 static const char *const q38_kernel_names[K38_COUNT] = {
     "q38_copy",
+    "q38_dot_bf16_exact",
+    "q38_dot_bf16_fast",
 };
 
 static id<MTLComputePipelineState> g_q38_pipe[K38_COUNT];
@@ -99,6 +101,24 @@ int q38_copy(q36_tensor *y, q36_tensor *x, size_t n) {
         q36_metal_bind(e, y, 1);
         [e setBytes:&count length:sizeof(count) atIndex:2];
         q38_threads(e, pso, (uint64_t)n);
+    }
+    return 1;
+}
+
+/* y (rows x out) = x (rows x in) . w^T, w raw BF16 out x in. One 32-lane threadgroup a cell. */
+int q38_dot_bf16(q36_tensor *y, q36_tensor *x, q36_tensor *w, int rows, int in, int out) {
+    if (!q38_ready() || rows < 1 || in < 1 || out < 1 || in % 8 != 0 || out > 65535 || rows > 65535 ||
+        !q36_metal_fits(x, (uint64_t)rows * in * F4) || !q36_metal_fits(y, (uint64_t)rows * out * F4) ||
+        !q36_metal_fits(w, (uint64_t)out * in * 2)) return 0;
+    @autoreleasepool {
+        uint32_t args[3] = {(uint32_t)rows, (uint32_t)in, (uint32_t)out};
+        id<MTLComputePipelineState> pso = g_q38_pipe[q36_gpu_is_exact() ? K38_DOT_BF16_EXACT : K38_DOT_BF16_FAST];
+        id<MTLComputeCommandEncoder> e = q36_metal_encoder(pso);
+        q36_metal_bind(e, x, 0);
+        q36_metal_bind(e, w, 1);
+        q36_metal_bind(e, y, 2);
+        [e setBytes:args length:sizeof(args) atIndex:3];
+        [e dispatchThreadgroups:MTLSizeMake((NSUInteger)out, (NSUInteger)rows, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     }
     return 1;
 }

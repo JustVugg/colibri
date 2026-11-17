@@ -355,6 +355,57 @@ static void test_expert_gq(int rows, int H, int I, int K, int exact) {
     q36_tensor_free(x); q36_tensor_free(pairs); q36_tensor_free(h); q36_tensor_free(y);
 }
 
+/* ---- BF16 dense dot (indexer projections) --------------------------------- */
+
+static void test_dot_bf16(int rows, int in, int out, int exact) {
+    q36_gpu_set_exact(exact);
+    q36_tensor *x = rand_tensor((size_t)rows * in, 1.0f), *w = q36_tensor_new((size_t)out * in * 2);
+    q36_tensor *y = q36_tensor_new((size_t)rows * out * 4);
+    uint16_t *wb = q36_tensor_data(w);
+    for (size_t i = 0; i < (size_t)out * in; i++) {
+        float f = frand() * 0.1f;
+        uint32_t u;
+        memcpy(&u, &f, 4);
+        wb[i] = (uint16_t)(u >> 16);
+    }
+    size_t cells = (size_t)rows * out;
+    for (size_t i = 0; i < cells; i++) F(y)[i] = NAN;
+    /* scaled by the magnitude of the terms, sum |w x|: a random-sign dot cancels to far below its
+     * terms, and float error follows the terms, not the result */
+    double *ref = malloc(sizeof(double) * cells), *mag = malloc(sizeof(double) * cells);
+    for (int r = 0; r < rows; r++)
+        for (int o = 0; o < out; o++) {
+            double s = 0, m = 0;
+            for (int j = 0; j < in; j++) {
+                uint32_t u = (uint32_t)wb[(size_t)o * in + j] << 16;
+                float wf;
+                memcpy(&wf, &u, 4);
+                double t = (double)wf * F(x)[(size_t)r * in + j];
+                s += t; m += fabs(t);
+            }
+            ref[(size_t)r * out + o] = s;
+            mag[(size_t)r * out + o] = m + 1e-3;
+        }
+    int ok = q38_dot_bf16(y, x, w, rows, in, out);
+    sync_or_die();
+    char name[80];
+    snprintf(name, sizeof name, "dot_bf16 %dx%d->%d %s", rows, in, out, exact ? "exact" : "fast");
+    if (!ok) expect(name, 0);
+    else check(name, F(y), ref, mag, cells, exact ? 2e-5 : 3e-4);
+    free(ref); free(mag);
+    q36_tensor_free(x); q36_tensor_free(w); q36_tensor_free(y);
+}
+
+static void test_dot_bf16_declines(void) {
+    q36_tensor *x = rand_tensor(2 * 32, 1.0f), *w = q36_tensor_new(4 * 32 * 2), *y = q36_tensor_new(2 * 4 * 4);
+    int ok = !q38_dot_bf16(y, x, w, 2, 30, 4) && !q38_dot_bf16(y, x, w, 2, 32, 5) && !q38_dot_bf16(y, x, w, 0, 32, 4) &&
+             !q38_dot_bf16(y, NULL, w, 2, 32, 4);
+    sync_or_die();
+    for (int i = 0; i < 8; i++) ok = ok && F(y)[i] == 0.0f;
+    expect("dot_bf16 declines in=30", ok);
+    q36_tensor_free(x); q36_tensor_free(w); q36_tensor_free(y);
+}
+
 int main(void) {
     /* As tests/test_qwen36_kernels.c: GitHub's Apple Paravirtual device never completes
      * command buffers, so nothing runs there. */
@@ -386,6 +437,13 @@ int main(void) {
         test_expert_gq(2, 2560, 640, 10, exact);
     }
     test_router_wide_declines();
+
+    for (int exact = 1; exact >= 0; exact--) {
+        test_dot_bf16(2, 32, 12, exact);            /* tiny: IQ*ID + ID = 12 */
+        int rr[3] = {1, 4, 64};
+        for (int i = 0; i < 3; i++) test_dot_bf16(rr[i], 2560, 640, exact);   /* real: (4+1)*128 */
+    }
+    test_dot_bf16_declines();
 
     printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "PASSED", g_failures);
     q36_gpu_cleanup();

@@ -21,6 +21,11 @@ int q38_gpu_init(void);
 /* y[i] = x[i] for n floats. Plumbing test only. */
 int q38_copy(q36_tensor *y, q36_tensor *x, size_t n);
 
+/* y (rows x out) = x (rows x in) . w^T. w is out x in raw BF16 (uint16, the GGUF
+ * layout, read in place), x and y f32. 0 (nothing enqueued) if in % 8 != 0 or a
+ * size does not fit. Exact mode sums in a fixed order; fast uses simd_sum. */
+int q38_dot_bf16(q36_tensor *y, q36_tensor *x, q36_tensor *w, int rows, int in, int out);
+
 #ifdef __cplusplus
 }
 #endif
