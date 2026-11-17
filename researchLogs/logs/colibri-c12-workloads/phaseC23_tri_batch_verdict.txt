@@ -1,0 +1,76 @@
+C23 graded three-container batch verdict — IQ2_XXS vs UD-IQ3_XXS vs Q4_K_M
+(c23_tri_batch_launch.sh, phaseC23_eval_{iq2,iq3,q4km}_r{1,2}.jsonl,
+c23_tri_summary.py, 2026-11-18; the C24 build, cache ON, interleaved
+rounds iq2 -> iq3 -> q4km -> iq2 -> iq3 -> q4km, one container resident
+at a time, fresh restart per round)
+
+HEADLINE: quality is a three-way dead heat — 21/25 for every container in
+both rounds, with every task's output sha12 identical across a container's
+two rounds (25/25 each; greedy determinism verified end to end). The
+default-container decision therefore moves entirely to speed, memory and
+failure profile.
+
+1. Scores (identical across rounds per container):
+   iq2   21/25: code 7/7 math 6/6 format 2/5 recall 2/3 longctx 4/4
+                 fails: json_cities, hexmix(#7b3746), sortlist, heapify
+   iq3   21/25: code 7/7 math 6/6 format 3/5 recall 2/3 longctx 3/4
+                 fails: json_cities, hexmix(#7d3747), heapify, ledger_rotapril
+   q4km  21/25: code 7/7 math 5/6 format 4/5 recall 2/3 longctx 3/4
+                 fails: trains(got=8), json_cities, heapify, ledger_rotapril
+   Notes:
+   - json_cities and heapify fail on ALL THREE containers, and json_cities'
+     wrong output is byte-identical across containers -- model-level quirks,
+     not quant-level. heapify's missing keyword ('linear') likewise universal.
+   - Q4_K_M ACES the two format tasks IQ2/IQ3 flub (hexmix -> correct
+     #7e3647, sortlist -> correct order) but drops the trains math word
+     problem (greedy, deterministic, both rounds) and the rotapril ledger
+     question. IQ3 drops rotapril (got=2025); Q4_K_M gets it wrong
+     differently (got=4291). Net: a wash at 21 = 21 = 21.
+
+2. Decode (paired round means on the graded set, ratio vs IQ2). The
+   trusted cells are the long-output tasks (code/math budgets, longctx):
+   ledger anchor (ledger_total/revenue/rotapril means):
+     iq2 ~10.3 tok/s | iq3 ~8.9 (0.86x) | q4km ~6.6 (0.64x)
+   code/math cells: iq3 0.71-0.94x, q4km 0.45-0.61x.
+   Per-cell scatter is large on short-output tasks (output length varies
+   per container; e.g. q4km toolcall 2.9 vs math 7.4-8.1 within one round),
+   so cell-level reads outside the long cells are indicative only.
+   Consistency with the dedicated anchors: C24's 12K A/B read Q4_K_M at
+   0.83x of IQ2 on the c16 driver; the graded set (different prompts,
+   lengths, cache-on) reads 0.45-0.68x. Both agree on the ordering and on
+   IQ3 in between; the spread across sets is the remaining measurement
+   uncertainty, not a contradiction.
+
+3. TTFT (short prompts, engine ttft_s round means): iq2 ~1.3-4.0 s,
+   iq3 ~1.8-5.5 s (~1.4x), q4km ~2.9-7.3 s (~2.1x). On the 99%-reused
+   ledger tail questions (maxcost/rotapril/revenue: only ~40-55 new
+   tokens): iq2 2.1-2.6 s | iq3 3.0-3.8 s | q4km 4.4-5.8 s -- the gap is
+   per-request overhead, not prefill compute (the prompts are cache hits).
+   Cold longctx prefill (r1 ledger_total, same 5502-token doc):
+   iq3 137.3 s vs q4km 183.5 s (1.34x); iq2's r1 was WARM -- see 4.
+
+4. Measurement note (free finding): the engine's prompt cache is
+   DISK-BACKED (SNAP/.promptcache snapshots persist across restarts --
+   q36_pcache_*). IQ2's cache still held the ledger doc from yesterday's
+   iq2_val2 run, so iq2_r1's ledger_total restored in 0.31 s (100% reuse)
+   while iq3/q4km r1 prefilled it cold (137.3/183.5 s) and stored it for
+   their r2. Verify: pfx_5bb4a1a5047f16bf... (179,560,000 B) present in
+   all three containers. Consequences: quality/decode reads unaffected
+   (greedy; decode excludes prefill); TTFT fair cells are the tail
+   ledger questions (99% reuse in all arms/rounds) and r2's ledger_total.
+   For future cold-TTFT batches: point COLI_PROMPT_CACHE_DIR at a scratch
+   dir or set COLI_PROMPT_CACHE=0 per round, or wipe .promptcache first.
+
+5. RSS after load (one container resident): iq2 2.64/2.27 GB,
+   iq3 2.14/2.07 GB, q4km 2.54/2.34 GB -- all fine; link-mode keeps
+   weights on disk.
+
+6. DECISION INPUT (the user's call): on this evidence IQ2_XXS dominates
+   -- equal score (21/25), fastest decode (1.00 / 0.86 / 0.64 on the
+   ledger anchor), fastest TTFT (1.00 / ~1.4x / ~2.1x), smallest GGUF
+   (11.8 vs 14.1 vs 22.7 GB). Q4_K_M buys +66% expert bytes and two
+   format-task wins it gives back on trains -- no net quality gain, at
+   half the decode speed and 2x the disk. IQ3 splits the difference on
+   speed (0.86x) at equal score; its unique loss vs IQ2 is rotapril, its
+   unique win is sortlist. Unless a use case values Q4_K_M's hexmix/
+   sortlist wins specifically, IQ2_XXS stays the default container.
