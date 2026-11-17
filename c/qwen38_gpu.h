@@ -26,6 +26,17 @@ int q38_copy(q36_tensor *y, q36_tensor *x, size_t n);
  * size does not fit. Exact mode sums in a fixed order; fast uses simd_sum. */
 int q38_dot_bf16(q36_tensor *y, q36_tensor *x, q36_tensor *w, int rows, int in, int out);
 
+/* Hyper-connection element-wise ops (the CPU's q38_gr_read / q38_gr_apply; fc = the stream
+ * count C as a float). All return 0, enqueueing nothing, for a bad shape or size.
+ * y[i] = silu(a[i] / fc), n floats. */
+int q38_hc_low(q36_tensor *y, q36_tensor *a, int n, float fc);
+/* y[r][d] = sum_k sigmoid(a[r][k][d]) * b[r][k][d] / fc; a, b are rows x (C*D), y rows x D. */
+int q38_hc_mix(q36_tensor *y, q36_tensor *a, q36_tensor *b, int rows, int D, int C, float fc);
+/* y[i] = 2 * sigmoid(a[i] / fc), n floats. */
+int q38_hc_inj(q36_tensor *y, q36_tensor *a, int n, float fc);
+/* hyper[r][k][d] += inject[r][k] * block[r][d]; hyper rows x (C*D), inject rows x C, block rows x D. */
+int q38_hc_apply(q36_tensor *hyper, q36_tensor *inject, q36_tensor *block, int rows, int D, int C);
+
 #ifdef __cplusplus
 }
 #endif

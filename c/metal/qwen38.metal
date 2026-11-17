@@ -55,3 +55,57 @@ kernel void q38_dot_bf16_fast(device const float *x [[buffer(0)]],
     float s = simd_sum(q38_dot_lane(x + (ulong)r * a.in, w + (ulong)o * a.in, a.in, lane));
     if (lane == 0) y[(ulong)r * a.out + o] = s;
 }
+
+/* Hyper-connection element-wise ops (the CPU's q38_gr_read / q38_gr_apply). One kernel each:
+ * the same arithmetic in exact and fast mode. sigmoid is q38_sigmoid's two-branch form. */
+static inline float q38_sigmoid(float x) {
+    if (x >= 0.0f) { float z = exp(-x); return 1.0f / (1.0f + z); }
+    float z = exp(x);
+    return z / (1.0f + z);
+}
+
+struct q38_hc_args { uint n, D, C; float fc; };
+
+/* y[i] = silu(a[i] / fc) */
+kernel void q38_hc_low(device const float *a [[buffer(0)]],
+                       device float *y [[buffer(1)]],
+                       constant q38_hc_args &p [[buffer(2)]],
+                       uint i [[thread_position_in_grid]]) {
+    if (i >= p.n) return;
+    float v = a[i] / p.fc;
+    y[i] = v * q38_sigmoid(v);
+}
+
+/* y[i] = 2 * sigmoid(a[i] / fc) */
+kernel void q38_hc_inj(device const float *a [[buffer(0)]],
+                       device float *y [[buffer(1)]],
+                       constant q38_hc_args &p [[buffer(2)]],
+                       uint i [[thread_position_in_grid]]) {
+    if (i >= p.n) return;
+    y[i] = 2.0f * q38_sigmoid(a[i] / p.fc);
+}
+
+/* y[r][d] = (sum_k sigmoid(a[r][k][d]) * b[r][k][d]) / fc, k ascending; n = rows * D */
+kernel void q38_hc_mix(device const float *a [[buffer(0)]],
+                       device const float *b [[buffer(1)]],
+                       device float *y [[buffer(2)]],
+                       constant q38_hc_args &p [[buffer(3)]],
+                       uint i [[thread_position_in_grid]]) {
+    if (i >= p.n) return;
+    ulong r = i / p.D, d = i % p.D;
+    ulong base = r * p.C * p.D + d;
+    float v = 0.0f;
+    for (uint k = 0; k < p.C; k++) v += q38_sigmoid(a[base + (ulong)k * p.D]) * b[base + (ulong)k * p.D];
+    y[i] = v / p.fc;
+}
+
+/* hyper[r][k][d] += inject[r][k] * block[r][d]; n = rows * C * D */
+kernel void q38_hc_apply(device float *hyper [[buffer(0)]],
+                         device const float *inject [[buffer(1)]],
+                         device const float *block [[buffer(2)]],
+                         constant q38_hc_args &p [[buffer(3)]],
+                         uint i [[thread_position_in_grid]]) {
+    if (i >= p.n) return;
+    ulong rk = i / p.D, d = i % p.D, r = rk / p.C;
+    hyper[i] += inject[rk] * block[r * p.D + d];
+}
