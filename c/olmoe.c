@@ -27,6 +27,7 @@
  *   (expert queue is sorted by eid for SSD read locality)
  */
 #define _GNU_SOURCE
+#define TOK_NFC   /* tok.h applies tokenizer.json's NFC normalizer, as HF does */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

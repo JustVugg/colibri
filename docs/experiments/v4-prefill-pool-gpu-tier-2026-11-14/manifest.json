@@ -1,0 +1,77 @@
+{
+  "version": 1,
+  "hypothesis": "With the GPU tier's decode mirrors on the store and the prompt on the CPU union (no VRAM bank: the card keeps dense and shared experts in RAM below 10 GiB), the prefill pool lets a layer's experts stay cached from one prompt chunk to the next instead of being read again from the SSD every chunk, which cuts the prompt's expert reads about tenfold and shortens the time to the first token.",
+  "commit": "7fd006f904786df9f12e0af9c5918d2d45063c17",
+  "model": "DeepSeek-V4-Flash architecture, REAP-pruned to 132 experts x 43 layers (79 GB), safetensors, native FP8/FP4",
+  "command": "make -C c -j16 deepseek-v4 HIP=1 HIP_ARCH=gfx1102 ROCM_HOME=/usr; deepseek_v4 <model> --prompt-file long_prompt.txt --max-tokens 12 with the environment in config; the arms alternate (trial, baseline) three times on one binary; tok_s = 2535 prompt tokens / time_to_first_token from the engine's `timing` line (prompt throughput); the pool is the engine's own kill switch, so COLI_V4_PREFILL_POOL=0 is the engine before this change",
+  "prompt_hash": "a62d4d2d4272346f8dc0e9a2b9f9bb2b6bb0a4d3fe0edd8818d43119c100295c",
+  "hardware": {
+    "cpu": "AMD Ryzen 9 7945HX, 16 cores / 32 threads, AVX-512",
+    "ram": "62 GB DDR5 (auto memory budget, about 33 GiB available)",
+    "storage": "Apacer AS2280Q4U 4TB NVMe, ext4 (rw,noatime), direct aligned reads",
+    "os": "Gentoo Linux 7.3.0, gcc 16.2.1, ROCm/HIP 7.16.0 (clang 23.1.5), AMD Radeon RX 7600M XT 8 GB (gfx1102; also the display GPU, desktop running)"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "COLI_V4_PREFILL_POOL"
+  ],
+  "baseline": {
+    "config": {
+      "binary": "deepseek_v4 HIP=1 HIP_ARCH=gfx1102 ARCH=native",
+      "args": "--prompt-file long_prompt.txt --max-tokens 12 --vram 5 (as CUDA_EXPERT_GB=5)",
+      "COLI_CUDA": "1",
+      "CUDA_EXPERT_GB": "5",
+      "DSV4_CUDA_VRAM_RESERVE_MB": "1024",
+      "DSV4_CUDA_PIN_HOST": "0",
+      "V4_PREFIX_CKPT": "0",
+      "COLI_V4_SAVE_USAGE": "0",
+      "COLI_V4_PREFILL_POOL": "0"
+    },
+    "samples": {
+      "tok_s": [
+        4.8176,
+        5.0038,
+        5.0436
+      ]
+    },
+    "median_tok_s": 5.0038,
+    "quality": {
+      "method": "greedy text identical across the arm's runs and identical to the trial's (md5 of stdout)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/v4-prefill-pool-gpu-tier-2026-11-14/baseline_runs.txt",
+      "sha256": "080313443053692d67b464b086d584b52f11a25b44be1c7ef2509c1c1fb64b20"
+    }
+  },
+  "trial": {
+    "config": {
+      "binary": "deepseek_v4 HIP=1 HIP_ARCH=gfx1102 ARCH=native",
+      "args": "--prompt-file long_prompt.txt --max-tokens 12 --vram 5 (as CUDA_EXPERT_GB=5)",
+      "COLI_CUDA": "1",
+      "CUDA_EXPERT_GB": "5",
+      "DSV4_CUDA_VRAM_RESERVE_MB": "1024",
+      "DSV4_CUDA_PIN_HOST": "0",
+      "V4_PREFIX_CKPT": "0",
+      "COLI_V4_SAVE_USAGE": "0",
+      "COLI_V4_PREFILL_POOL": "1"
+    },
+    "samples": {
+      "tok_s": [
+        5.4342,
+        5.219,
+        5.2751
+      ]
+    },
+    "median_tok_s": 5.2751,
+    "quality": {
+      "method": "greedy text identical across the arm's runs and identical to the baseline's (md5 of stdout)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/v4-prefill-pool-gpu-tier-2026-11-14/trial_runs.txt",
+      "sha256": "3dda47b82f7668b401c315892dd6657a617478cbb9014bae9cded0963137b134"
+    }
+  },
+  "outcome": "improvement"
+}

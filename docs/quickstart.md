@@ -49,7 +49,7 @@ Both run `coli setup`, which does the rest:
    the build log is.
 4. **Downloads the model** with progress and resume. Interrupt it whenever you
    like: running it again continues where it stopped.
-5. **Starts colibri** and opens the dashboard in your browser, and prints the
+5. **Starts colibri** and opens the chat in your browser, and prints the
    addresses other apps can use.
 
 What you see on Linux (on Windows the same, in the window `START-HERE.bat` opens):
@@ -393,5 +393,5 @@ emulator or a hypervisor that reports fewer features than it runs).
 |---|---|
 | Windows native build (and CUDA DLL) | [docs/windows.md](windows.md) |
 | Tuning: cache, prefetch, speculation | [docs/tuning.md](tuning.md) |
-| OpenAI-compatible API + web dashboard | [docs/api.md](api.md) |
+| OpenAI-compatible API + the chat in the browser | [docs/api.md](api.md) |
 | Every environment variable | [docs/ENVIRONMENT.md](ENVIRONMENT.md) |

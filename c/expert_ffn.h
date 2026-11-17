@@ -209,8 +209,8 @@ static inline float xf_dot_i8_ref(const uint8_t *w, const float *sc, const int8_
             lane[k >> 2] += (int32_t)(blk[k] & 0xF) * xb[k];
             lane[k >> 2] += (int32_t)(blk[k] >> 4)  * xb[k + 32];
         }
-        for (int l = 0; l < 8; l++) acc[l] = fmaf((float)lane[l], sc[g], acc[l]);
-        corr = fmaf(sc[g], xsum[g], corr);
+        for (int l = 0; l < 8; l++) acc[l] = coli_fmaf_exact((float)lane[l], sc[g], acc[l]);   /* fmaf's bits, inline without FMA */
+        corr = coli_fmaf_exact(sc[g], xsum[g], corr);
     }
     return (xf_hsum8_scalar(acc) - 8.f * corr) * sx;
 }

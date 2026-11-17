@@ -723,11 +723,56 @@ a layer's non-resident experts into VRAM and runs them with the residents:
   back to a chunk of a few dozen rows: a smaller chunk leaves the pool behind for the next
   large one, its layers holding an expert that left on the host's step as before. An expert
   whose page-lock is refused stays out until the next follow.
-- The staging (`cc_fetch`, `cc_fetch_wait`, `cc_fetch_done`): one layer's worth of VRAM,
-  the most non-resident experts any layer has, filled on a copy stream of its own. The copy
-  of the next such layer starts once the layer before has run its experts' GEMMs, so it
-  overlaps that layer's sum and the next layer's attention; one buffer, because the copy
-  is the longer of the two and a second one would buy little.
+- The residents' copies go to the pool too when the card holds fewer than every expert and
+  the chain runs (`tier_warmstart`, which calls `qt_chain_host_all` once the loop that
+  pools the experts off the card has ended): an expert the promotions, the swaps or the KV
+  mirrors' give-back move off the card is in the pool already, for any prompt chunk that
+  stages, and the follow has nothing to do (once every expert is in, it returns at once; the chain's staged table
+  still follows the residents, by the tier's epoch). The copies are the slots' own, in
+  whichever layout the pool takes (planar blocks, int4 pairs, a GGUF's rows). It costs the
+  RAM page-locked, every expert's instead of those off the card, and a pass over the
+  residents at the warm start: on a Colab T4, 16.88 GB of the RAM cache page-locked
+  instead of 6.00, the model ready in 21.96 s instead of 19.73. A short chunk gains from
+  it because it copies only its routed experts (above): with a whole layer's copy for
+  each of those layers, a 64-token prompt after a long one was slower than with the
+  host's step (89.94 against 103.58 tok/s on that T4, on the code before the routed
+  copy). They come last: where the driver refuses page-locks, the
+  experts off the card, which the pool is for, have theirs and the residents get what is
+  left. If the driver refused any page-lock, the pool is not whole and the follow stays on
+  as without this: the pooled residents leave it, the experts that leave the card join it,
+  and the startup line says the page-locks did not reach every expert. A card that holds
+  every expert pools nothing, as before. The startup line `host pool` says how many of its
+  experts are the residents'.
+- The staging (`cc_fetch`, `cc_fetch_wait`, `cc_fetch_done`): VRAM for the most
+  non-resident experts any layer has, filled on a copy stream of its own. The copy of the
+  next such layer starts once the layer before has run its experts' GEMMs, so it overlaps
+  that layer's sum and the next layer's attention. With whole layers off the card (the
+  warm start in index order, before the spread residents) a staged layer has 256 experts
+  to copy, the copy is the longer of the two and one bank is all there is. With the
+  residents spread over the layers (a Colab T4: 91 experts a layer) the buffer has two
+  banks, the staged
+  layers taking them in turn (`cc_fetch_at`, `cc_fetch_wait_at`, `cc_fetch_done_at`, a pair
+  of events each): a layer's copy runs beside the layer before's experts. Two banks only
+  where both fit in the `n_experts` experts that `q36cc_rows_max` and `q36cc_mirror_room`
+  already set aside for the staging (`2 * hmax <= n_experts`), so the residents and the
+  chunk size are what they were. Where the card has no room for the second bank the
+  staging has one, and where the mirrors later need the memory `q36cc_stage_drop` gives
+  both back. The line `stages the host pool's experts in` says how many banks and how
+  many experts each. The layout is the same for the planar pool and for a per-row
+  container's pairs (only `CcExpert.planar` differs). A staged table that sets no banks
+  (a GGUF's, `q36cc_stage_table_gguf`, which writes none) has one (`q36cc_banks`).
+- On an int4 container (per row or per group, planar blocks or pairs: an expert's two
+  regions in the pool, its matrices and its scales), a chunk of up to 256 rows
+  (`Q36CC_ROUTED_ROWS`) routes to only a part of a layer's experts: each staged layer
+  copies just those, right after its router (the host reads the routes down, then queues
+  the copies). That copy no longer overlaps the layer before, so a longer chunk, which
+  routes to nearly every expert, keeps the whole copy. The chain says the rule at its
+  first staging; its report counts the layer steps that copied only their routes. With two banks
+  the routed copy goes into the layer's own bank, with that bank's events (`cc_fetch_at`, the layer's
+  `cc_fetch_wait_at` and `cc_fetch_done_at`), and the next layer's copy is not started ahead: a routed
+  chunk uses the banks for their addresses, not to overlap. A GGUF's chunk copies whole layers: its staged experts take one or three regions,
+  which the routed copy's list of an expert's two regions cannot describe
+  (`q36cc_routes_only`).
 - The prompt chunk's table points each staged expert at its place in the staging; a
   decode step keeps the table of the residents and the CPU's share (a row at a time,
   the CPU's kernel is faster than a copy).
@@ -843,7 +888,8 @@ the mirrors grow, the chain now makes room for them, a chunk's scratch and stagi
 yet allocated, and 256 MiB for the driver (a kernel's first launch loads its code into device
 memory), out of the expert tier where the card lacks it (`q36cc_mirror_room`,
 `qt_chain_give_back`): residents leave the card, the tier's budget comes down by as much, the
-CPU computes them from their RAM copy and the host pool takes them at its next follow.
+CPU computes them from their RAM copy and the host pool takes them at its next follow (they
+are in it already where the warm start pooled the residents' copies too).
 
 The driver packs allocations under 2 MiB into 2 MiB pages and releases a page only when
 nothing in it is left. The 35B's expert matrices are 512 KiB each, so the coldest residents,

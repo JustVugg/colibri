@@ -1,0 +1,307 @@
+GLM-5.3 on FreeBSD 15.1: gcc (libgomp) against clang (libomp), same source, 2026-11-15
+Raw output of colibri-suite2.csh, three rounds, gcc then clang in each. ANSI colour codes removed,
+[prefill] progress lines and trailing spaces removed, nothing else changed.
+
+== source (git log --oneline -1; grep -n KMP_BLOCKTIME colibri.c) ==
+581298ed FreeBSD: KMP_BLOCKTIME=0 for the GLM engine's hot team
+14098:         * OMP_WAIT_POLICY=active alone +122% decode, KMP_BLOCKTIME=200 alone
+14111:         * read GOMP_*: with OMP_WAIT_POLICY=active it sets KMP_BLOCKTIME=infinite,
+14122:        setenv("KMP_BLOCKTIME","0",0);
+14124:        setenv("KMP_BLOCKTIME","200",0);
+
+== start and end (date) ==
+Sun Nov 15 19:06:11 EST 2026
+Sun Nov 15 19:52:36 EST 2026
+
+== build gcc ==
+gcc -O3 -march=native -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function  -MMD -MP colibri.c     -o colibri -lm -fopenmp -pthread
+
+== build clang ==
+clang -O3 -march=native -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function  -MMD -MP colibri.c     -o colibri -lm -fopenmp -pthread
+
+== each run ==
+cp /usr/local/src/colibri.<gcc|clang> colibri
+cp -Rp /usr/local/src/coli_usage.keep /models/colibri-models/glm-5.3/.coli_usage
+env DIRECT=1 PIPE=1 python3 coli run --model /models/colibri-models/glm-5.3 --ngen 64 --temp 0 "Explain what a hash table is."
+
+==================== round 1, gcc ====================
+[OMP] hot-thread tuning: re-exec once (COLI_NO_OMP_TUNE=1 to skip)
+
+libgomp: Affinity not supported on this configuration
+[KV16] latent KV cache in float16 (half the RAM of float32; KV16=0 keeps float32)
+[MTP] absent (draft=5)
+[USAGE] expert history: 1438200 selections (/models/colibri-models/glm-5.3/.coli_usage)
+[PIN] auto: budget 730.3 GB | plan 365.2 GB (conf 1.00, 1438200 selections) | LRU reserve 12.7 GB (cap 8/layer x 1592.5 MB/row-set) | max_pin 717.6 GB -> pinning 365.2 GB
+[PIN] placement: 0 VRAM + 17197 RAM expert (365.2 GB warm) in 375s da /models/colibri-models/glm-5.3/.coli_usage
+[RAM_GB=747.4 auto] cap raised 8->229: budget allows it (projected peak 746.9 GB; set CAP_RAISE=0 to disable)
+[stop] 18 stop tokens: 154820 154827 154829 154821 154822 154823 154824 154825 154826 154828 154830 154831 154832 154833 154834 154835 154836 154837 (15 from the tokenizer's special set)
+== GLM C engine (glm_moe_dsa), cache=8 experts/layer | compute experts@8-bit dense@8-bit | idot: avx512-vnni ==
+loaded in 10.70s | resident dense: 10604.26 MB | layers=78 experts=256 | MTP absent (draft=5)
+prompt: 14 tokens | generating up to 64 (EOS stop=154820) | n-gram draft=5
+[gMASK]<sop><|user|>Explain what a hash table is.<|assistant|><think></think>
+PROFILO PREFILL (9.40s):
+PROFILE: expert-disk 14975.233s service / 0.000s wait | expert-matmul 6.739s | attention 1.767s (including kvb 0.160s) | lm_head 0.030s | other 0.861s
+ATTENTION: projection/RoPE 0.667s | score-softmax-value 0.032s | output projection 0.908s
+# Hash Tables
+
+A **hash table** (also called a hash map)
+[t=16  RSS 352.13 GB  hit 100%  0.76 tok/s  1.00 tok/fw]
+ is a data structure that stores key-value pairs and provides fast data retrieval. It
+[t=32  RSS 352.14 GB  hit 100%  0.73 tok/s  1.00 tok/fw]
+'s one of the most widely used data structures in programming.
+
+## How It Works
+[t=48  RSS 352.14 GB  hit 100%  0.71 tok/s  1.00 tok/fw]
+
+
+1. **Storage**: Data is stored in an array-like structure
+2
+[t=64  RSS 352.14 GB  hit 100%  0.71 tok/s  1.00 tok/fw]
+
+---
+prefill 14 tokens in 9.40s | decode 64 tokens in 90.33s (0.71 tok/s) | expert hit rate 100.0% (pin 100.0% + lru 0.0%) | RSS 352.14 GB
+experts loaded/token: 590.6 (per-layer 7.88 across 75; baseline topk=8) | TOPK=0 TOPP=0.00
+speculation: 1.02 tokens/forward (63 forwards per 64 tokens) | MTP acceptance 0% (0/0)
+PROFILE: expert-disk 0.000s service / 0.000s wait | expert-matmul 49.526s | attention 30.149s (including kvb 0.000s) | lm_head 0.000s | other 10.660s
+ATTENTION: projection/RoPE 7.900s | score-softmax-value 11.274s | output projection 10.953s
+
+    (\      colibri v2.1.0
+     )·>     tiny engine, immense model
+    / \      GLM-5.2/5.3 · 744B MoE · 419 GB on disk
+             run
+
+  ──────────────────────────────────────────────────────────
+
+==================== round 1, clang ====================
+[OMP] hot-thread tuning: re-exec once (COLI_NO_OMP_TUNE=1 to skip)
+[KV16] latent KV cache in float16 (half the RAM of float32; KV16=0 keeps float32)
+[MTP] absent (draft=5)
+[USAGE] expert history: 1438200 selections (/models/colibri-models/glm-5.3/.coli_usage)
+[PIN] auto: budget 729.6 GB | plan 364.8 GB (conf 1.00, 1438200 selections) | LRU reserve 12.7 GB (cap 8/layer x 1592.5 MB/row-set) | max_pin 716.9 GB -> pinning 364.8 GB
+[PIN] placement: 0 VRAM + 17181 RAM expert (364.8 GB warm) in 362s da /models/colibri-models/glm-5.3/.coli_usage
+[RAM_GB=746.7 auto] cap raised 8->229: budget allows it (projected peak 746.5 GB; set CAP_RAISE=0 to disable)
+[stop] 18 stop tokens: 154820 154827 154829 154821 154822 154823 154824 154825 154826 154828 154830 154831 154832 154833 154834 154835 154836 154837 (15 from the tokenizer's special set)
+== GLM C engine (glm_moe_dsa), cache=8 experts/layer | compute experts@8-bit dense@8-bit | idot: avx512-vnni ==
+loaded in 10.37s | resident dense: 10604.26 MB | layers=78 experts=256 | MTP absent (draft=5)
+prompt: 14 tokens | generating up to 64 (EOS stop=154820) | n-gram draft=5
+[gMASK]<sop><|user|>Explain what a hash table is.<|assistant|><think></think>
+PROFILO PREFILL (8.03s):
+PROFILE: expert-disk 14447.076s service / 0.000s wait | expert-matmul 6.010s | attention 1.427s (including kvb 0.110s) | lm_head 0.029s | other 0.562s
+ATTENTION: projection/RoPE 0.437s | score-softmax-value 0.024s | output projection 0.855s
+# Hash Tables
+
+A **hash table** (also called a hash map)
+[t=16  RSS 351.82 GB  hit 100%  0.93 tok/s  1.00 tok/fw]
+ is a data structure that stores key-value pairs and provides fast data retrieval. It
+[t=32  RSS 351.82 GB  hit 100%  0.91 tok/s  1.00 tok/fw]
+'s one of the most widely used data structures in programming.
+
+## How It Works
+[t=48  RSS 351.82 GB  hit 100%  0.90 tok/s  1.00 tok/fw]
+
+
+1. **Storage**: Data is stored in an array-like structure
+2
+[t=64  RSS 351.82 GB  hit 100%  0.90 tok/s  1.00 tok/fw]
+
+---
+prefill 14 tokens in 8.03s | decode 64 tokens in 71.21s (0.90 tok/s) | expert hit rate 100.0% (pin 100.0% + lru 0.0%) | RSS 351.82 GB
+experts loaded/token: 590.6 (per-layer 7.88 across 75; baseline topk=8) | TOPK=0 TOPP=0.00
+speculation: 1.02 tokens/forward (63 forwards per 64 tokens) | MTP acceptance 0% (0/0)
+PROFILE: expert-disk 0.000s service / 0.000s wait | expert-matmul 39.218s | attention 24.605s (including kvb 0.000s) | lm_head 0.000s | other 7.389s
+ATTENTION: projection/RoPE 5.504s | score-softmax-value 6.838s | output projection 12.247s
+
+    (\      colibri v2.1.0
+     )·>     tiny engine, immense model
+    / \      GLM-5.2/5.3 · 744B MoE · 419 GB on disk
+             run
+
+  ──────────────────────────────────────────────────────────
+
+==================== round 2, gcc ====================
+[OMP] hot-thread tuning: re-exec once (COLI_NO_OMP_TUNE=1 to skip)
+
+libgomp: Affinity not supported on this configuration
+[KV16] latent KV cache in float16 (half the RAM of float32; KV16=0 keeps float32)
+[MTP] absent (draft=5)
+[USAGE] expert history: 1438200 selections (/models/colibri-models/glm-5.3/.coli_usage)
+[PIN] auto: budget 729.7 GB | plan 364.9 GB (conf 1.00, 1438200 selections) | LRU reserve 12.7 GB (cap 8/layer x 1592.5 MB/row-set) | max_pin 717.0 GB -> pinning 364.9 GB
+[PIN] placement: 0 VRAM + 17183 RAM expert (364.9 GB warm) in 310s da /models/colibri-models/glm-5.3/.coli_usage
+[RAM_GB=746.8 auto] cap raised 8->229: budget allows it (projected peak 746.6 GB; set CAP_RAISE=0 to disable)
+[stop] 18 stop tokens: 154820 154827 154829 154821 154822 154823 154824 154825 154826 154828 154830 154831 154832 154833 154834 154835 154836 154837 (15 from the tokenizer's special set)
+== GLM C engine (glm_moe_dsa), cache=8 experts/layer | compute experts@8-bit dense@8-bit | idot: avx512-vnni ==
+loaded in 10.66s | resident dense: 10604.26 MB | layers=78 experts=256 | MTP absent (draft=5)
+prompt: 14 tokens | generating up to 64 (EOS stop=154820) | n-gram draft=5
+[gMASK]<sop><|user|>Explain what a hash table is.<|assistant|><think></think>
+PROFILO PREFILL (9.17s):
+PROFILE: expert-disk 12378.635s service / 0.000s wait | expert-matmul 6.728s | attention 1.662s (including kvb 0.148s) | lm_head 0.043s | other 0.739s
+ATTENTION: projection/RoPE 0.566s | score-softmax-value 0.030s | output projection 0.918s
+# Hash Tables
+
+A **hash table** (also called a hash map)
+[t=16  RSS 351.86 GB  hit 100%  0.76 tok/s  1.00 tok/fw]
+ is a data structure that stores key-value pairs and provides fast data retrieval. It
+[t=32  RSS 351.86 GB  hit 100%  0.73 tok/s  1.00 tok/fw]
+'s one of the most widely used data structures in programming.
+
+## How It Works
+[t=48  RSS 351.86 GB  hit 100%  0.73 tok/s  1.00 tok/fw]
+
+
+1. **Storage**: Data is stored in an array-like structure
+2
+[t=64  RSS 351.86 GB  hit 100%  0.72 tok/s  1.00 tok/fw]
+
+---
+prefill 14 tokens in 9.17s | decode 64 tokens in 88.57s (0.72 tok/s) | expert hit rate 100.0% (pin 100.0% + lru 0.0%) | RSS 351.86 GB
+experts loaded/token: 590.6 (per-layer 7.88 across 75; baseline topk=8) | TOPK=0 TOPP=0.00
+speculation: 1.02 tokens/forward (63 forwards per 64 tokens) | MTP acceptance 0% (0/0)
+PROFILE: expert-disk 0.000s service / 0.000s wait | expert-matmul 48.217s | attention 29.791s (including kvb 0.000s) | lm_head 0.000s | other 10.567s
+ATTENTION: projection/RoPE 7.810s | score-softmax-value 11.248s | output projection 10.711s
+
+    (\      colibri v2.1.0
+     )·>     tiny engine, immense model
+    / \      GLM-5.2/5.3 · 744B MoE · 419 GB on disk
+             run
+
+  ──────────────────────────────────────────────────────────
+
+==================== round 2, clang ====================
+[OMP] hot-thread tuning: re-exec once (COLI_NO_OMP_TUNE=1 to skip)
+[KV16] latent KV cache in float16 (half the RAM of float32; KV16=0 keeps float32)
+[MTP] absent (draft=5)
+[USAGE] expert history: 1438200 selections (/models/colibri-models/glm-5.3/.coli_usage)
+[PIN] auto: budget 729.7 GB | plan 364.9 GB (conf 1.00, 1438200 selections) | LRU reserve 12.7 GB (cap 8/layer x 1592.5 MB/row-set) | max_pin 717.0 GB -> pinning 364.9 GB
+[PIN] placement: 0 VRAM + 17183 RAM expert (364.9 GB warm) in 319s da /models/colibri-models/glm-5.3/.coli_usage
+[RAM_GB=746.8 auto] cap raised 8->229: budget allows it (projected peak 746.6 GB; set CAP_RAISE=0 to disable)
+[stop] 18 stop tokens: 154820 154827 154829 154821 154822 154823 154824 154825 154826 154828 154830 154831 154832 154833 154834 154835 154836 154837 (15 from the tokenizer's special set)
+== GLM C engine (glm_moe_dsa), cache=8 experts/layer | compute experts@8-bit dense@8-bit | idot: avx512-vnni ==
+loaded in 10.50s | resident dense: 10604.26 MB | layers=78 experts=256 | MTP absent (draft=5)
+prompt: 14 tokens | generating up to 64 (EOS stop=154820) | n-gram draft=5
+[gMASK]<sop><|user|>Explain what a hash table is.<|assistant|><think></think>
+PROFILO PREFILL (7.41s):
+PROFILE: expert-disk 12736.136s service / 0.000s wait | expert-matmul 5.417s | attention 1.402s (including kvb 0.116s) | lm_head 0.029s | other 0.564s
+ATTENTION: projection/RoPE 0.423s | score-softmax-value 0.019s | output projection 0.842s
+# Hash Tables
+
+A **hash table** (also called a hash map)
+[t=16  RSS 351.86 GB  hit 100%  1.00 tok/s  1.00 tok/fw]
+ is a data structure that stores key-value pairs and provides fast data retrieval. It
+[t=32  RSS 351.86 GB  hit 100%  0.97 tok/s  1.00 tok/fw]
+'s one of the most widely used data structures in programming.
+
+## How It Works
+[t=48  RSS 351.86 GB  hit 100%  0.95 tok/s  1.00 tok/fw]
+
+
+1. **Storage**: Data is stored in an array-like structure
+2
+[t=64  RSS 351.86 GB  hit 100%  0.95 tok/s  1.00 tok/fw]
+
+---
+prefill 14 tokens in 7.41s | decode 64 tokens in 67.65s (0.95 tok/s) | expert hit rate 100.0% (pin 100.0% + lru 0.0%) | RSS 351.86 GB
+experts loaded/token: 590.6 (per-layer 7.88 across 75; baseline topk=8) | TOPK=0 TOPP=0.00
+speculation: 1.02 tokens/forward (63 forwards per 64 tokens) | MTP acceptance 0% (0/0)
+PROFILE: expert-disk 0.000s service / 0.000s wait | expert-matmul 38.826s | attention 21.690s (including kvb 0.000s) | lm_head 0.000s | other 7.133s
+ATTENTION: projection/RoPE 5.167s | score-softmax-value 6.792s | output projection 9.715s
+
+    (\      colibri v2.1.0
+     )·>     tiny engine, immense model
+    / \      GLM-5.2/5.3 · 744B MoE · 419 GB on disk
+             run
+
+  ──────────────────────────────────────────────────────────
+
+==================== round 3, gcc ====================
+[OMP] hot-thread tuning: re-exec once (COLI_NO_OMP_TUNE=1 to skip)
+
+libgomp: Affinity not supported on this configuration
+[KV16] latent KV cache in float16 (half the RAM of float32; KV16=0 keeps float32)
+[MTP] absent (draft=5)
+[USAGE] expert history: 1438200 selections (/models/colibri-models/glm-5.3/.coli_usage)
+[PIN] auto: budget 729.7 GB | plan 364.9 GB (conf 1.00, 1438200 selections) | LRU reserve 12.7 GB (cap 8/layer x 1592.5 MB/row-set) | max_pin 717.0 GB -> pinning 364.9 GB
+[PIN] placement: 0 VRAM + 17183 RAM expert (364.9 GB warm) in 306s da /models/colibri-models/glm-5.3/.coli_usage
+[RAM_GB=746.7 auto] cap raised 8->229: budget allows it (projected peak 746.6 GB; set CAP_RAISE=0 to disable)
+[stop] 18 stop tokens: 154820 154827 154829 154821 154822 154823 154824 154825 154826 154828 154830 154831 154832 154833 154834 154835 154836 154837 (15 from the tokenizer's special set)
+== GLM C engine (glm_moe_dsa), cache=8 experts/layer | compute experts@8-bit dense@8-bit | idot: avx512-vnni ==
+loaded in 9.64s | resident dense: 10604.26 MB | layers=78 experts=256 | MTP absent (draft=5)
+prompt: 14 tokens | generating up to 64 (EOS stop=154820) | n-gram draft=5
+[gMASK]<sop><|user|>Explain what a hash table is.<|assistant|><think></think>
+PROFILO PREFILL (9.74s):
+PROFILE: expert-disk 12213.571s service / 0.000s wait | expert-matmul 7.070s | attention 1.781s (including kvb 0.151s) | lm_head 0.029s | other 0.856s
+ATTENTION: projection/RoPE 0.633s | score-softmax-value 0.031s | output projection 0.966s
+# Hash Tables
+
+A **hash table** (also called a hash map)
+[t=16  RSS 351.86 GB  hit 100%  0.70 tok/s  1.00 tok/fw]
+ is a data structure that stores key-value pairs and provides fast data retrieval. It
+[t=32  RSS 351.86 GB  hit 100%  0.68 tok/s  1.00 tok/fw]
+'s one of the most widely used data structures in programming.
+
+## How It Works
+[t=48  RSS 351.86 GB  hit 100%  0.67 tok/s  1.00 tok/fw]
+
+
+1. **Storage**: Data is stored in an array-like structure
+2
+[t=64  RSS 351.86 GB  hit 100%  0.68 tok/s  1.00 tok/fw]
+
+---
+prefill 14 tokens in 9.74s | decode 64 tokens in 94.73s (0.68 tok/s) | expert hit rate 100.0% (pin 100.0% + lru 0.0%) | RSS 351.86 GB
+experts loaded/token: 590.6 (per-layer 7.88 across 75; baseline topk=8) | TOPK=0 TOPP=0.00
+speculation: 1.02 tokens/forward (63 forwards per 64 tokens) | MTP acceptance 0% (0/0)
+PROFILE: expert-disk 0.000s service / 0.000s wait | expert-matmul 46.684s | attention 36.558s (including kvb 0.000s) | lm_head 0.000s | other 11.491s
+ATTENTION: projection/RoPE 8.922s | score-softmax-value 10.813s | output projection 16.801s
+
+    (\      colibri v2.1.0
+     )·>     tiny engine, immense model
+    / \      GLM-5.2/5.3 · 744B MoE · 419 GB on disk
+             run
+
+  ──────────────────────────────────────────────────────────
+
+==================== round 3, clang ====================
+[OMP] hot-thread tuning: re-exec once (COLI_NO_OMP_TUNE=1 to skip)
+[KV16] latent KV cache in float16 (half the RAM of float32; KV16=0 keeps float32)
+[MTP] absent (draft=5)
+[USAGE] expert history: 1438200 selections (/models/colibri-models/glm-5.3/.coli_usage)
+[PIN] auto: budget 729.7 GB | plan 364.9 GB (conf 1.00, 1438200 selections) | LRU reserve 12.7 GB (cap 8/layer x 1592.5 MB/row-set) | max_pin 717.0 GB -> pinning 364.9 GB
+[PIN] placement: 0 VRAM + 17183 RAM expert (364.9 GB warm) in 284s da /models/colibri-models/glm-5.3/.coli_usage
+[RAM_GB=746.7 auto] cap raised 8->229: budget allows it (projected peak 746.6 GB; set CAP_RAISE=0 to disable)
+[stop] 18 stop tokens: 154820 154827 154829 154821 154822 154823 154824 154825 154826 154828 154830 154831 154832 154833 154834 154835 154836 154837 (15 from the tokenizer's special set)
+== GLM C engine (glm_moe_dsa), cache=8 experts/layer | compute experts@8-bit dense@8-bit | idot: avx512-vnni ==
+loaded in 10.77s | resident dense: 10604.26 MB | layers=78 experts=256 | MTP absent (draft=5)
+prompt: 14 tokens | generating up to 64 (EOS stop=154820) | n-gram draft=5
+[gMASK]<sop><|user|>Explain what a hash table is.<|assistant|><think></think>
+PROFILO PREFILL (7.45s):
+PROFILE: expert-disk 11328.848s service / 0.000s wait | expert-matmul 5.326s | attention 1.484s (including kvb 0.120s) | lm_head 0.047s | other 0.596s
+ATTENTION: projection/RoPE 0.482s | score-softmax-value 0.020s | output projection 0.861s
+# Hash Tables
+
+A **hash table** (also called a hash map)
+[t=16  RSS 351.86 GB  hit 100%  1.05 tok/s  1.00 tok/fw]
+ is a data structure that stores key-value pairs and provides fast data retrieval. It
+[t=32  RSS 351.86 GB  hit 100%  1.01 tok/s  1.00 tok/fw]
+'s one of the most widely used data structures in programming.
+
+## How It Works
+[t=48  RSS 351.86 GB  hit 100%  1.00 tok/s  1.00 tok/fw]
+
+
+1. **Storage**: Data is stored in an array-like structure
+2
+[t=64  RSS 351.87 GB  hit 100%  1.00 tok/s  1.00 tok/fw]
+
+---
+prefill 14 tokens in 7.45s | decode 64 tokens in 63.99s (1.00 tok/s) | expert hit rate 100.0% (pin 100.0% + lru 0.0%) | RSS 351.87 GB
+experts loaded/token: 590.6 (per-layer 7.88 across 75; baseline topk=8) | TOPK=0 TOPP=0.00
+speculation: 1.02 tokens/forward (63 forwards per 64 tokens) | MTP acceptance 0% (0/0)
+PROFILE: expert-disk 0.000s service / 0.000s wait | expert-matmul 38.856s | attention 18.739s (including kvb 0.000s) | lm_head 0.000s | other 6.399s
+ATTENTION: projection/RoPE 4.293s | score-softmax-value 6.696s | output projection 7.735s
+
+    (\      colibri v2.1.0
+     )·>     tiny engine, immense model
+    / \      GLM-5.2/5.3 · 744B MoE · 419 GB on disk
+             run
+
+  ──────────────────────────────────────────────────────────

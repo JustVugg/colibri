@@ -58,7 +58,8 @@ def _searx(q, n):
 
 
 class _DDG(HTMLParser):
-    """result__a links (title, href) and result__snippet texts of DuckDuckGo's HTML page"""
+    """the result links (title, href) and snippets of DuckDuckGo's HTML page (result__a,
+    result__snippet) and of its lite page (result-link, result-snippet)"""
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.rows, self.cur, self.mode = [], None, None
@@ -66,11 +67,11 @@ class _DDG(HTMLParser):
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
         cls = a.get("class") or ""
-        if tag == "a" and "result__a" in cls.split():
+        if tag == "a" and ("result__a" in cls.split() or "result-link" in cls.split()):
             self.cur = {"title": "", "url": a.get("href") or "", "snippet": ""}
             self.rows.append(self.cur)
             self.mode = "title"
-        elif "result__snippet" in cls.split() and self.cur is not None:
+        elif ("result__snippet" in cls.split() or "result-snippet" in cls.split()) and self.cur is not None:
             self.mode = "snippet"
 
     def handle_endtag(self, tag):
@@ -92,16 +93,37 @@ def _ddg_url(u):
     return u
 
 
-def _duckduckgo(q, n):
+# DuckDuckGo's two plain pages, the second where the first answers with its bot check: from some
+# addresses html.duckduckgo.com returns 202 and a challenge page ("anomaly", "Unfortunately, bots
+# use DuckDuckGo too") instead of results, which read as no results at all while lite answered
+_DDG_PAGES = ("https://html.duckduckgo.com/html/", "https://lite.duckduckgo.com/lite/")
+
+
+def _ddg_page(url, q):
+    """the rows of one DuckDuckGo page, None when it answered with its bot check"""
     body = urllib.parse.urlencode({"q": q}).encode()
-    req = urllib.request.Request("https://html.duckduckgo.com/html/", data=body,
-                                 headers={"User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded"})
+    req = urllib.request.Request(url, data=body, headers={"User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded"})
     with urllib.request.urlopen(req, timeout=15) as r:
+        status = r.status
         page = r.read(2 << 20).decode("utf-8", errors="replace")
+    if status == 202 or "anomaly-modal" in page or "Unfortunately, bots use DuckDuckGo too" in page:
+        return None
     p = _DDG()
     p.feed(page)
+    return p.rows
+
+
+def _duckduckgo(q, n):
+    rows = None
+    for url in _DDG_PAGES:
+        rows = _ddg_page(url, q)
+        if rows:
+            break
+    if rows is None:
+        raise RuntimeError("DuckDuckGo answered with its bot check instead of results; give the chat a "
+                           "SearXNG instance (COLIBRI_SEARX=URL, or coli ui --searx URL)")
     out, seen = [], set()
-    for row in p.rows:
+    for row in rows:
         u = _ddg_url(row["url"])
         if not u.startswith(("http://", "https://")) or u in seen:
             continue

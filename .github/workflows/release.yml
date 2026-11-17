@@ -171,26 +171,6 @@ jobs:
           make deepseek-v4 ${{ matrix.make_args }} ${{ matrix.v4_args }}
           ls -lh deepseek_v4${{ matrix.ext }}
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: npm
-          cache-dependency-path: web/package-lock.json
-
-      # The dashboard is what README shows and what serves the Expert Atlas, but it
-      # was never packaged: a release user has no web/ to build from, so `coli web`
-      # pointed them at a directory the archive does not contain. Built here rather
-      # than committed, so dist/ stays a build artifact.
-      # shell: bash — on Windows the job default is msys2, but setup-node installs
-      # the native node/npm, which msys2's minimal PATH does not see.
-      - name: Build web dashboard
-        shell: bash
-        run: |
-          cd web
-          npm ci
-          npm run build
-          ls -lh dist/index.html dist/experts.json
-
       - name: Package
         run: |
           mkdir -p dist
@@ -258,13 +238,9 @@ jobs:
           # semplicemente non era stato spedito.
           python3 c/tools/pack_python.py c dist
           cp LICENSE dist/
-          # web/dist sits NEXT TO coli in the archive; both coli and openai_server.py
-          # probe that layout as well as the source checkout's one-level-up form.
-          mkdir -p dist/web
-          cp -r web/dist dist/web/dist
-          # the chat UI (coli ui) sits next to coli as well: its page and its server
+          # the chat UI (coli web, coli ui) sits next to coli: its page and its server
           mkdir -p dist/ui
-          cp ui/index.html ui/server.py ui/agents.py ui/responses_shim.py ui/web.py ui/models.py ui/README.md dist/ui/
+          cp ui/index.html ui/server.py ui/agents.py ui/responses_shim.py ui/web.py ui/models.py ui/docs.py ui/README.md dist/ui/
           cd dist
           if [ "${{ matrix.ext }}" = ".exe" ]; then
             7z a colibri-${TAG}-${{ matrix.name }}.zip *
@@ -399,16 +375,13 @@ jobs:
           # (The v1.1.0 tag build failed here when the banner still said "colibrì".)
           echo "$out" | grep -q "colibri" || { echo "FAIL: coli did not run"; exit 1; }
           echo "OK: coli locates the engine in the published archive"
-          # Same reasoning for the dashboard: assert the files are there AND that the
-          # server resolves them, since a right-looking archive with an unresolvable
-          # path is exactly the failure this whole step exists to catch.
-          test -f web/dist/index.html   || { echo "FAIL: dashboard missing from archive"; exit 1; }
-          test -f web/dist/experts.json || { echo "FAIL: expert atlas missing from archive"; exit 1; }
-          test -f ui/index.html && test -f ui/server.py || { echo "FAIL: chat UI missing from archive"; exit 1; }
+          # Same reasoning for the chat UI: the files are there and its modules import.
+          test -f ui/index.html && test -f ui/server.py && test -f ui/docs.py || { echo "FAIL: chat UI missing from archive"; exit 1; }
           # the Models page imports colibri's setup modules from next to coli: packaged too
           python3 -c "import sys; sys.path.insert(0, 'ui'); import models, os; assert os.path.samefile(models.COLI_DIR, '.'); print('OK: ui/models.py imports from', models.COLI_DIR)" \
             || { echo "FAIL: packaged ui/models.py does not import"; exit 1; }
-          python3 -c "import sys; sys.path.insert(0, '.'); from openai_server import APIHandler as A; d = A.WEB_DIST; assert (d / 'index.html').is_file(), 'server resolved WEB_DIST to %s, which has no index.html' % d; assert (d / 'experts.json').is_file(), 'no expert atlas under %s' % d; print('OK: the packaged server resolves the dashboard at', d)"
+          python3 -c "import sys; sys.path.insert(0, 'ui'); import docs, web; print('OK: ui/docs.py and ui/web.py import')" \
+            || { echo "FAIL: packaged ui/docs.py or ui/web.py does not import"; exit 1; }
 
       # The GPU backends in the archive, by behaviour as above. Vulkan (Linux, Windows):
       # every shader the build compiled is in shaders/, every engine is a Vulkan build and

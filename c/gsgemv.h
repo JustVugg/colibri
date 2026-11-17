@@ -21,6 +21,7 @@
  * primitives header olmoe.c uses -- rather than inlining its own copy. */
 #include <stdint.h>
 #include <math.h>
+#include "fma_compat.h"   /* coli_fmaf_exact: the SSE4.1 tier's group step without libm (#2882) */
 #if (defined(__AVX2__) && defined(__FMA__)) || defined(__SSE4_1__)
 #include <immintrin.h>
 #endif
@@ -168,10 +169,10 @@ static void matmul_q_gs(float *y, const float *x, const int8_t *q, const float *
                     a30 = COLIBRI_FMA(xl, _mm_cvtepi32_ps(_mm_cvtepi8_epi32(b3)), a30);
                     a31 = COLIBRI_FMA(xh, _mm_cvtepi32_ps(_mm_cvtepi8_epi32(_mm_srli_si128(b3,4))), a31);
                 }
-                acc0 = fmaf(gs_group_sum_sse41(a00, a01), sc0[gi], acc0);
-                acc1 = fmaf(gs_group_sum_sse41(a10, a11), sc1[gi], acc1);
-                acc2 = fmaf(gs_group_sum_sse41(a20, a21), sc2[gi], acc2);
-                acc3 = fmaf(gs_group_sum_sse41(a30, a31), sc3[gi], acc3);
+                acc0 = coli_fmaf_exact(gs_group_sum_sse41(a00, a01), sc0[gi], acc0);
+                acc1 = coli_fmaf_exact(gs_group_sum_sse41(a10, a11), sc1[gi], acc1);
+                acc2 = coli_fmaf_exact(gs_group_sum_sse41(a20, a21), sc2[gi], acc2);
+                acc3 = coli_fmaf_exact(gs_group_sum_sse41(a30, a31), sc3[gi], acc3);
             }
             y[ob+0] = acc0; y[ob+1] = acc1; y[ob+2] = acc2; y[ob+3] = acc3;
         }
@@ -187,7 +188,7 @@ static void matmul_q_gs(float *y, const float *x, const int8_t *q, const float *
                     a0 = COLIBRI_FMA(colibri_sse41_loadu_ps(x+i),   _mm_cvtepi32_ps(_mm_cvtepi8_epi32(b0)), a0);
                     a1 = COLIBRI_FMA(colibri_sse41_loadu_ps(x+i+4), _mm_cvtepi32_ps(_mm_cvtepi8_epi32(_mm_srli_si128(b0,4))), a1);
                 }
-                acc = fmaf(gs_group_sum_sse41(a0, a1), sc[gi], acc);
+                acc = coli_fmaf_exact(gs_group_sum_sse41(a0, a1), sc[gi], acc);
             }
             y[o] = acc;
         }

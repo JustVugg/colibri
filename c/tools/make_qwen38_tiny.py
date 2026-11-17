@@ -197,7 +197,13 @@ def _rewrite_shard_fp8(out: Path, packed):
     other -- the adjacency the engine's native FP8 path requires."""
     from safetensors.torch import load_file, save_file
     path = out / "model.safetensors"
-    tensors = load_file(str(path))
+    source_tensors = load_file(str(path))
+    # load_file returns tensors backed by a mapping of the source shard. On
+    # Windows that mapping keeps the file open, so path.unlink() below fails.
+    # Copy the small fixture tensors into independent storage, then release the
+    # mapped tensors before replacing their source file.
+    tensors = {name: tensor.clone() for name, tensor in source_tensors.items()}
+    del source_tensors
     for name, (q, scale_inv) in packed.items():
         assert name in tensors, name
         tensors[name] = q.contiguous()

@@ -16,6 +16,7 @@ MINGW  := $(findstring mingw,$(TRIPLET))$(findstring windows-gnu,$(TRIPLET))
 CYGWIN := $(findstring cygwin,$(TRIPLET))
 DARWIN := $(findstring darwin,$(TRIPLET))
 LINUX  := $(findstring linux,$(TRIPLET))
+FREEBSD := $(findstring freebsd,$(TRIPLET))
 IS_WIN := $(MINGW)$(CYGWIN)
 
 # A gcc that targets the MSYS or Cygwin runtime (MSYS2's "MSYS" shell, or its plain
@@ -48,6 +49,7 @@ ifeq ($(IS_WIN),)
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 DARWIN  := $(findstring Darwin,$(UNAME_S))
+FREEBSD := $(findstring FreeBSD,$(UNAME_S))
 endif
 endif
 
@@ -236,7 +238,11 @@ endif
 EXE     =
 else
 # --- Linux / *BSD x86-64 (percorso originale, invariato) ---
-CC      = gcc
+# FreeBSD: clang, the base system's compiler, whose -fopenmp links the base system's
+# libomp. gcc is a package there, and its libgomp has no thread affinity on FreeBSD
+# ("libgomp: Affinity not supported on this configuration") and decodes slower.
+# CC=gcc on the command line still builds with gcc.
+CC      = $(if $(FREEBSD),clang,gcc)
 # ARCH=native -> ottimizzato per QUESTA macchina (default, piu' veloce).
 # ARCH=x86-64-v3 -> binario PORTABILE su qualsiasi x86-64 moderno con AVX2 (per distribuire).
 # ARCH=x86-64 -> massima compatibilita' (niente AVX2: usa il path scalare di fallback).
@@ -1356,7 +1362,7 @@ expert-group-rows-test: tests/test_expert_group_rows_cuda.cu backend_cuda.cu bac
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_expert_group_rows_cuda.cu -o expert_group_rows_test$(EXE) $(GPU_TEST_LIBS)
 	./expert_group_rows_test$(EXE)
 
-cuda-test: tests/test_mxfp4_expert_cuda.cu backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu tests/test_cuda_fmt_trap_cuda.cu tests/test_alloc_footprint_cuda.cu tests/test_cuda_init_failure.cu tests/test_expert_group_rows_cuda.cu
+cuda-test: tests/test_mxfp4_expert_cuda.cu tests/test_mxfp4_group_cuda.cu backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu tests/test_cuda_fmt_trap_cuda.cu tests/test_alloc_footprint_cuda.cu tests/test_cuda_init_failure.cu tests/test_expert_group_rows_cuda.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	./backend_cuda_test$(EXE)
@@ -1429,6 +1435,10 @@ cuda-test: tests/test_mxfp4_expert_cuda.cu backend_cuda.cu backend_cuda.h fp8_fo
 	./mxfp4_cuda_test$(EXE)
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_mxfp4_expert_cuda.cu $(if $(filter 1,$(HIP)),-x none) tests/mxfp4_ref.o -o mxfp4_expert_cuda_test$(EXE) $(GPU_TEST_LIBS)
 	./mxfp4_expert_cuda_test$(EXE)
+	# fmt=7 expert groups (grouped_hidden_mx4_dual / grouped_down_mx4): the sync, pinned and
+	# issue/take calls against the expert MLP through quant.h, K%32==0 and short K, 1-9 rows
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_mxfp4_group_cuda.cu $(if $(filter 1,$(HIP)),-x none) tests/mxfp4_ref.o -o mxfp4_group_cuda_test$(EXE) $(GPU_TEST_LIBS)
+	./mxfp4_group_cuda_test$(EXE)
 	# Allocator footprint (#687): what a cudaMalloc really takes off the card,
 	# which is what the expert tier has to be charged rather than the logical
 	# byte count. Runs LAST on purpose - it is the only test here that
@@ -1450,13 +1460,15 @@ cuda-test: tests/test_mxfp4_expert_cuda.cu backend_cuda.cu backend_cuda.h fp8_fo
 # context exists), then the decode MoE with experts on a peer GPU (peer
 # compute and in-place reads vs one GPU, and an injected peer failure; skips
 # without two peer-capable GPUs).
-dsv4-cuda-test: tests/test_dsv4_dense_batch_cuda.c tests/test_dsv4_attention_batch_cuda.c tests/test_dsv4_moe_batch_cuda.c tests/test_dsv4_generic_bitwise_cuda.c tests/test_dsv4_bank_bytes_cuda.c tests/test_dsv4_peer_init_cuda.cu tests/test_dsv4_peer_moe_cuda.c tests/test_dsv4_act_quant_cuda.c tests/deepseek_v4_native_quant.o backend_cuda_dsv4.cu backend_cuda_dsv4.h $(DSV4_CUDA_OBJ)
+dsv4-cuda-test: tests/test_dsv4_dense_batch_cuda.c tests/test_dsv4_attention_batch_cuda.c tests/test_dsv4_moe_batch_cuda.c tests/test_dsv4_generic_bitwise_cuda.c tests/test_dsv4_bank_bytes_cuda.c tests/test_dsv4_pin_overlap_cuda.c tests/test_dsv4_peer_init_cuda.cu tests/test_dsv4_peer_moe_cuda.c tests/test_dsv4_act_quant_cuda.c tests/deepseek_v4_native_quant.o backend_cuda_dsv4.cu backend_cuda_dsv4.h $(DSV4_CUDA_OBJ)
 	"$(NVCC)" $(NVCCFLAGS) tests/test_dsv4_peer_init_cuda.cu -o dsv4_peer_init_cuda_test$(EXE) -lcuda -lcublasLt $(if $(filter 1,$(NCCL)),-lnccl)
 	./dsv4_peer_init_cuda_test$(EXE)
 	$(CC) $(CFLAGS) tests/test_dsv4_peer_moe_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_peer_moe_cuda_test$(EXE) $(LDFLAGS)
 	./dsv4_peer_moe_cuda_test$(EXE)
 	$(CC) $(CFLAGS) tests/test_dsv4_bank_bytes_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_bank_bytes_cuda_test$(EXE) $(LDFLAGS)
 	./dsv4_bank_bytes_cuda_test$(EXE)
+	$(CC) $(CFLAGS) tests/test_dsv4_pin_overlap_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_pin_overlap_cuda_test$(EXE) $(LDFLAGS)
+	./dsv4_pin_overlap_cuda_test$(EXE)
 	$(CC) $(CFLAGS) tests/test_dsv4_dense_batch_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_cuda_test$(EXE) $(LDFLAGS)
 	./dsv4_cuda_test$(EXE)
 	$(CC) $(CFLAGS) tests/test_dsv4_attention_batch_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_attention_cuda_test$(EXE) $(LDFLAGS)
@@ -2561,8 +2573,15 @@ tests/test_gq_r16$(EXE): tests/test_gq_r16.c
 # The grid types' dot product with the signs on the activation against the one it replaced
 tests/test_gq_signs$(EXE): tests/test_gq_signs.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+# a speculative verify's rows (up to GQ_EXACT_ROWS) get each row's bits alone, every block type (#2874)
+tests/test_gq_rows_exact$(EXE): tests/test_gq_rows_exact.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 # Q2_K's fused row kernel against the unpack + gq_dot_i8 path it replaced, to the bit
 tests/test_gq_q2_k$(EXE): tests/test_gq_q2_k.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+# The grid types' and Q2_K's row kernels (AVX-512's on a VNNI build, AVX2's otherwise) against
+# the unpack + gq_dot_i8 path, to the bit, one to eight activation rows
+tests/test_gq_grid512$(EXE): tests/test_gq_grid512.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 # A matrix's file rows eight at a time (gq_rows_f8) against their scalar reference and the R16
 # forms' kernels, to the bit; a no-op on a build without AVX2. `tests/test_rows_f8 bench` times them.
@@ -2844,6 +2863,10 @@ tests/test_xf16$(EXE): tests/test_xf16.c
 # the SSE2 i8 expert kernel (no AVX2+FMA) against xf_dot_i8_ref, bit for bit.
 tests/test_xf_sse2_int16$(EXE): tests/test_xf_sse2_int16.c
 	$(CC) $(if $(X86_64),$(filter-out -march=% -mavx% -mfma%,$(CFLAGS)) -march=x86-64 -mno-avx -mno-avx2 -mno-fma -ffp-contract=off,$(CFLAGS)) $< -o $@ $(LDFLAGS)
+# coli_fmaf_exact (fma_compat.h) against fmaf, bit for bit, built without FMA where it is the
+# emulation the kernels take there (#2882).
+tests/test_fmaf_exact$(EXE): tests/test_fmaf_exact.c
+	$(CC) $(if $(X86_64),$(filter-out -march=% -mavx% -mfma%,$(CFLAGS)) -march=x86-64 -mno-avx -mno-avx2 -mno-fma,$(CFLAGS)) $< -o $@ $(LDFLAGS)
 # the kernels a build without FMA takes (quant.h's FP8 rows in lanes, expert_ffn.h's int4-g64 f32 in
 # doubles, #2715) against the references they reproduce, bit for bit: one source built for the x86-64
 # baseline (SSE2) and for Sandy Bridge (AVX); on another architecture, what its dispatch gives.
@@ -3056,6 +3079,9 @@ tests/test_qpack$(EXE): tests/test_qpack.c tests/qpack.o
 # same command line before (#1741): one unit per command keeps each .d whole.
 tests/qpack.o: qpack.c .build-config
 	$(CC) $(CFLAGS) -c qpack.c -o $@
+# qpack.c included, not linked: the test fails its callocs one at a time.
+tests/test_qpack_layout_oom$(EXE): tests/test_qpack_layout_oom.c qpack.c .build-config
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 # Loader-side expansion oracle for the same MLX affine contract: nibble/byte
 # order, scalar decodings, parity against coli_affine_matmul_ref, refusals.
@@ -3455,7 +3481,7 @@ tests/test_qwen36_tier_replan$(EXE): tests/test_qwen36_tier_replan.c qwen36_tier
 tests/test_qwen36_tier_promote$(EXE): tests/test_qwen36_tier_promote.c qwen36_tier.c
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
-# qt_chain_host_follow: after the promotions the host pool is the non-residents again (fake backend).
+# qt_chain_host_follow: after the promotions the host pool is the non-residents again, or every expert when the warm start pooled them all (qt_chain_host_all; fake backend).
 tests/test_qwen36_tier_host_pool$(EXE): tests/test_qwen36_tier_host_pool.c qwen36_tier.c
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
@@ -3869,15 +3895,6 @@ install: colibri-tui$(EXE) colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE)
 	$(INSTALL) -m 644 tools/*.py tools/iq3xxs_grid.json $(DESTDIR)$(LIBEXECDIR)/tools/
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)/ui
 	$(INSTALL) -m 644 ../ui/*.py ../ui/index.html $(DESTDIR)$(LIBEXECDIR)/ui/
-	@# The dashboard is an optional build artifact (cd web && npm run build), so install
-	@# it only when it exists. It goes NEXT TO openai_server.py, which probes ./web/dist.
-	@if [ -f ../web/dist/index.html ]; then \
-	  $(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)/web/dist; \
-	  cp -R ../web/dist/. $(DESTDIR)$(LIBEXECDIR)/web/dist/; \
-	  echo "installed the web dashboard"; \
-	else \
-	  echo "web/dist absent -- skipping the dashboard (build it with: cd web && npm run build)"; \
-	fi
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/coli

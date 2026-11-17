@@ -196,6 +196,12 @@ static size_t g53u_plan_bytes(const GModel *m, int ctx) {
     b += r * row * 4 + L * r * (K + 2 * ID) * 4;
     return b + ((size_t)64 << 20);
 }
+/* the chain could run, before the dense part is placed: switched on, the device's ops there, the
+ * shapes it takes (glm53_cu_tier_start asks it to place every dense matrix for it) */
+static int g53u_possible(const GModel *m) {
+    const char *e = getenv("COLI_CUDA_CHAIN");
+    return !(e && *e == '0') && !g_g53u_off && cc_available() && cc_glm53_ready() && cc_dsv4_ready() && !g53u_check(m);
+}
 static int g53u_wanted(const GModel *m) {
     static int on = -1, said;
     if (on < 0) { const char *e = getenv("COLI_CUDA_CHAIN"); on = !(e && *e == '0'); }

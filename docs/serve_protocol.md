@@ -189,8 +189,6 @@ All telemetry is advisory: servers render what they know and skip the rest.
   `"colibri"` field.
 - `GET /experts` — the latest `EMAP`/`HITS` state: `{rows, cols, map, hits, seq,
   gpus, entropy, repin}`.
-- `GET /*` — static hosting of `web/dist` (SPA fallback, path-traversal-safe), plus
-  `experts.json` if published there (the measured expert atlas, #175/#218).
 
 ## Legacy protocol (`run_serve`, `coli chat`)
 

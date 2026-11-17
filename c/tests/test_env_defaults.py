@@ -304,6 +304,31 @@ class CudaAutoEnableTest(unittest.TestCase):
         self.assertNotIn("CUDA_EXPERT_GB", e)
 
 
+class CudaDeviceOrderTest(unittest.TestCase):
+    """#2887: --gpu and the setup name nvidia-smi's indices (the PCI bus order); the CUDA runtime counts
+    the fastest device first unless CUDA_DEVICE_ORDER says otherwise, so on two V100s beside a Quadro
+    P2000 --gpu 1,2 opened a V100 and the P2000. Every engine's environment asks for the bus order."""
+
+    def test_the_bus_order_unless_the_user_set_one(self):
+        self.assertEqual(coli.cuda_device_order({})["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
+        self.assertEqual(coli.cuda_device_order({"CUDA_DEVICE_ORDER": "FASTEST_FIRST"})["CUDA_DEVICE_ORDER"],
+                         "FASTEST_FIRST")
+
+    def test_glm_engine_environment(self):
+        e = CudaAutoEnableTest()._env_for("win32", cuda=True, gpus=[
+            {"index": 1, "name": "Tesla V100-SXM2-16GB", "total_bytes": 16 << 30, "free_bytes": 15 << 30},
+            {"index": 2, "name": "Tesla V100-SXM2-16GB", "total_bytes": 16 << 30, "free_bytes": 15 << 30}])
+        self.assertEqual(e["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
+        self.assertEqual(e["COLI_GPUS"], "1,2")
+
+    def test_sibling_engine_environment(self):
+        a = args(cluster_workers=None, cluster_coordinator=None)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(coli.env_for_engine(a, "glm53")["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
+        with mock.patch.dict(os.environ, {"CUDA_DEVICE_ORDER": "FASTEST_FIRST"}, clear=True):
+            self.assertEqual(coli.env_for_engine(a, "glm53")["CUDA_DEVICE_ORDER"], "FASTEST_FIRST")
+
+
 class Dsv4CudaDetectTest(unittest.TestCase):
     """dsv4_cuda_available: the Windows check is a DLL next to the engine, but
     Linux links the tier straight into the binary (nvcc, -lcudart), so the DLL

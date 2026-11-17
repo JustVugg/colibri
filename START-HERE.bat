@@ -4,7 +4,7 @@ rem
 rem First run: finds your hardware, recommends a model that fits, gets the
 rem engine (prebuilt, or built with MSYS2 when it is installed), downloads the
 rem model (safe to interrupt: run this file again to continue), then opens the
-rem dashboard in your browser.
+rem chat in your browser.
 rem Later runs: start colibri straight away.
 rem
 rem Options are passed through to `coli setup`, for example:

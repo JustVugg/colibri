@@ -27,7 +27,7 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 | `run "<prompt>"` | One-shot generation for the given prompt (positional, may be multi-word). |
 | `chat` | Interactive REPL chat. |
 | `serve` | Start the OpenAI-compatible HTTP server. |
-| `web` | `serve`, then open the dashboard in the browser. |
+| `web` | `serve`, and the chat UI in front of it (`ui/server.py`, on the API's port + 790), opened in the browser. |
 | `stop` | Shut down a running `coli serve` and its engine (default port: the one `coli setup` configured, else `8000`). |
 | `setup` | One step: detect the hardware, recommend a model, build or fetch the engine (Vulkan/CUDA when usable), download with resume, write the run configuration, start. A rerun starts directly, once `make` has brought the engine up to date with the sources (a rebuild only when they changed, as after `git pull`). See [AI_SETUP.md](AI_SETUP.md). |
 | `start` | Start what `coli setup` configured (`--background`, `--no-browser`, `--json`). |
