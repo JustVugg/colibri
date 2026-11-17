@@ -524,6 +524,25 @@ needs `ROUTE_J<2` to show any swap at all. A/B it the way the GLM doc does:
 same prompt and seed, tok/s and hit rate against agreement and KL, and treat
 `PPL=1` on a teacher-forced reference as the quality bar.
 
+## Teacher forcing (`TF=1`)
+
+The greedy oracle (`SNAP=... ./qwen36 8 8 ref.json`) compares the tokens the
+engine generates after the prompt. `TF=1` on the same reference compares every
+position instead: the reference's `full_ids` go through the model as a prompt,
+256 rows at a time, every row's logits are read out, and the argmax at position
+`s` is checked against `tf_pred[s]`, the torch model's argmax over one forward
+of the whole sequence (`tools/make_qwen36_tiny.py --emit-ref` and
+`tools/make_qwen36_oracle.py` write it). The prompt's own positions are in the
+comparison, which the greedy run never looks at: this is the prefill path
+checked apart from the decode. A mismatch is named on stderr and exits 1,
+`ORACLE_TF_MAX_MISMATCHES=<n>` allows that many, `DEBUG_LOGITS=1` prints a
+mismatched position's top five logits and its top1-top2 gap (a near tie shows
+as the small gap it is), and `DUMP=<file>` takes one row a position. The CI
+gate on the generated fixture is `make -C c qwen36-tf-check`:
+
+    COLI_DENSE_I8=0 SNAP=qwen36_tiny_v128_c TF=1 ./qwen36 8 8 qwen36_tiny_v128/ref_full.json
+    TEACHER-FORCING: 21/21 positions match the reference | 338.0 pos/s
+
 ## Which container?
 
 The gs64 container carries one scale per 64-weight group instead of one per

@@ -8411,6 +8411,12 @@ static void dump_logits(const float *lo, int n) {
     if (!g_dump_init) { g_dump_init = 1; const char *p = getenv("DUMP"); if (p && *p) g_dump = fopen(p, "wb"); }
     if (g_dump) { fwrite(lo, sizeof(float), (size_t)n, g_dump); fflush(g_dump); g_dump_rows++; }
 }
+/* At the end of an argv run: close the file and say how many rows it got (or that it never opened). */
+static void dump_close(int vocab) {
+    if (g_dump) { fclose(g_dump); g_dump = NULL;
+                  fprintf(stderr, "[dump] wrote %ld rows of %d logits -> %s\n", g_dump_rows, vocab, getenv("DUMP")); }
+    else if (getenv("DUMP") && *getenv("DUMP") && g_dump_init) fprintf(stderr, "[dump] cannot open %s\n", getenv("DUMP"));
+}
 
 /* Zero the DeltaNet recurrent state so a new request doesn't inherit the
  * previous conversation's hidden state. Must be called at the start of every
@@ -9706,6 +9712,103 @@ static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out)
     if (logit) free(logit);
     *nll_out = nll / scored;
     return scored;
+}
+
+#include "argmax_first.h"
+/* DEBUG_LOGITS=1 under TF: a mismatched position's top five logits and its top1-top2 gap
+ * (colibri.c's dump_top5_logits), so a near tie shows as the small gap it is and not as a
+ * bare token mismatch. */
+static void tf_top5(int pos, const float *lo, int V, int expected, int got) {
+    int idx[5]; float val[5];
+    for (int k = 0; k < 5; k++) { idx[k] = -1; val[k] = -INFINITY; }
+    for (int i = 0; i < V; i++) { float v = lo[i];
+        for (int k = 0; k < 5; k++) if (v > val[k]) {
+            for (int j = 4; j > k; j--) { val[j] = val[j-1]; idx[j] = idx[j-1]; }
+            val[k] = v; idx[k] = i; break; } }
+    double gap = idx[1] >= 0 ? (double)(val[0] - val[1]) : 0.0;
+    fprintf(stderr, "[LOGITS] pos=%d top1-top2 gap=%.3e | expected=%d (%.5f)  got=%d (%.5f) | top5:",
+            pos, gap, expected, (expected >= 0 && expected < V) ? (double)lo[expected] : 0.0,
+            got, (got >= 0 && got < V) ? (double)lo[got] : 0.0);
+    for (int k = 0; k < 5 && idx[k] >= 0; k++) fprintf(stderr, " %d:%.5f", idx[k], (double)val[k]);
+    fprintf(stderr, "\n");
+}
+
+#define Q36_TF_ROWS 256   /* rows of logits held at once (256 x vocab floats) */
+
+/* TF=1 on a .json reference: teacher forcing, colibri.c's forward_all for this engine. The
+ * reference's full_ids go through the model as a prompt, Q36_TF_ROWS rows at a time, every
+ * row's logits read out (step_ex's nlogits): the argmax at position s is the engine's
+ * prediction for full_ids[s+1], the prompt's positions included, which the greedy oracle
+ * never looks at. Each position is compared with the reference's tf_pred (the torch model's
+ * argmax over one forward of the whole sequence; tools/make_qwen36_tiny.py --emit-ref and
+ * tools/make_qwen36_oracle.py write it): a mismatch fails the run, ORACLE_TF_MAX_MISMATCHES
+ * of them allowed. A reference without tf_pred gets its predictions printed and fails too,
+ * as colibri's does: nothing was validated. DUMP takes every row as it is read; DEBUG_LOGITS=1
+ * prints a mismatched position's top five. Returns the exit status. */
+static int tf_run(Model *m, const int *full, int nfull, const int *tf, int ntf) {
+    Cfg *c = &m->c; int V = c->vocab;
+    if (nfull > QWEN36_ATTN_MAX_CTX) {
+        fprintf(stderr, "[ctx] %d tokens exceed the %d-token ceiling\n", nfull, QWEN36_ATTN_MAX_CTX);
+        exit(1);
+    }
+    if (tf && ntf != nfull) {
+        fprintf(stderr, "[tf] tf_pred has %d entries, full_ids %d: not the same sequence\n", ntf, nfull);
+        return 1;
+    }
+    int allowed = 0;
+    { const char *a = getenv("ORACLE_TF_MAX_MISMATCHES");
+      if (a && *a) {
+          char *end = NULL; long v = strtol(a, &end, 10);
+          if (end == a || *end || v < 0 || v >= nfull) {
+              fprintf(stderr, "[tf] ORACLE_TF_MAX_MISMATCHES must be an integer in [0,%d)\n", nfull);
+              return 1;
+          }
+          allowed = (int)v;
+      } }
+    int dbg = tf && getenv("DEBUG_LOGITS") && *getenv("DEBUG_LOGITS");
+    m->max_t = nfull;
+    reset_recurrent(m);
+    ensure_kv(m);
+    m->kv_len = 0;
+    int *pred = malloc((size_t)nfull * sizeof(int));
+    if (!pred) { fprintf(stderr, "[tf] out of memory\n"); return 1; }
+    int finite = 1, mism = 0;
+    double t0 = now_s();
+    for (int at = 0; at < nfull; at += Q36_TF_ROWS) {
+        int S = nfull - at < Q36_TF_ROWS ? nfull - at : Q36_TF_ROWS;
+        float *lo = step_ex(m, full + at, S, at, S);
+        for (int r = 0; r < S; r++) {
+            const float *row = lo + (int64_t)r * V; int s = at + r;
+            dump_logits(row, V);
+            int ok = 1; for (int v = 0; v < V; v++) if (!isfinite(row[v])) { ok = 0; break; }
+            if (!ok) {
+                fprintf(stderr, "[tf] non-finite logits at position %d\n", s);
+                finite = 0; pred[s] = -1; continue;
+            }
+            pred[s] = argmax_first(row, V);
+            if (tf && pred[s] != tf[s]) {
+                mism++;
+                fprintf(stderr, "[tf] mismatch pos=%d expected=%d got=%d\n", s, tf[s], pred[s]);
+                if (dbg) tf_top5(s, row, V, tf[s], pred[s]);
+            }
+        }
+        free(lo);
+    }
+    double dt = now_s() - t0;
+    int rc;
+    if (!tf) {
+        printf("TF pred  : "); for (int s = 0; s < nfull; s++) printf("%d ", pred[s]); printf("\n");
+        fprintf(stderr, "[tf] the reference has no tf_pred: %d predictions and nothing to compare them with "
+                        "(tools/make_qwen36_tiny.py --emit-ref and tools/make_qwen36_oracle.py write it)\n", nfull);
+        rc = 1;
+    } else {
+        printf("TEACHER-FORCING: %d/%d positions match the reference | %.1f pos/s\n", nfull - mism, nfull, nfull / dt);
+        if (mism) fprintf(stderr, "[tf] %d/%d mismatches, %d allowed%s\n", mism, nfull, allowed,
+                          dbg ? "" : " (DEBUG_LOGITS=1 for the top five logits of each)");
+        rc = (!finite || mism > allowed) ? 1 : 0;
+    }
+    free(pred);
+    return rc;
 }
 
 static int *read_int_array(jval *o, const char *key, int *n_out) {
@@ -11675,6 +11778,7 @@ int main(int argc, char **argv) {
 
 
     int is_ref = 0;
+    jval *ref_root = NULL;       /* the parsed reference (TF reads its tf_pred) */
     jval *ref_image = NULL;      /* {"grid_h", "grid_w", "patches": [...]}: one image for the oracle */
     int rplen = (int)strlen(refpath);
     if (rplen>=5 && strcmp(refpath+rplen-5, ".json")==0) is_ref = 1;
@@ -11718,6 +11822,7 @@ int main(int argc, char **argv) {
         fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
         buf=malloc(n+1); if (fread(buf,1,n,f)!=(size_t)n) {} buf[n]=0; fclose(f);
         jval *ref = json_parse(buf, &arena);
+        ref_root = ref;
         ref_image = ref ? json_get(ref, "image") : NULL;
         prompt = read_int_array(ref,"prompt_ids",&np);
         full   = read_int_array(ref,"full_ids",&nfull);
@@ -12131,6 +12236,28 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    if (is_ref && getenv("TF") && *getenv("TF")) {
+        /* teacher forcing: every position's argmax against the reference's tf_pred */
+        int ntf = 0; int *tf = NULL;
+        if (ref_root && json_get(ref_root, "tf_pred")) tf = read_int_array(ref_root, "tf_pred", &ntf);
+        int rc = tf_run(&m, full, nfull, tf, ntf);
+        dump_close(m.c.vocab);
+        double tot = m.hits + m.miss;
+        printf("Expert cache hit rate: %.1f%% (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
+               (unsigned long long)m.hits, (unsigned long long)m.miss);
+        route_footer(stdout, &m);
+        printf("PEAK RSS: %.2f GB\n", rss_gb());
+#ifdef COLI_CUDA
+        q36cc_report(&m);
+#endif
+#ifdef COLI_VULKAN
+        vk_report();
+        q36c_report(&m);
+        vk_tier_turn(&m, "run");
+#endif
+        free(tf); free(buf); free(arena); return rc;
+    }
+
     if (is_ref && getenv("PPL") && atoi(getenv("PPL")) == 1) {
         double nll; double t = now_s();
         int scored = tf_nll(&m, full, nfull, np, &nll);
@@ -12179,9 +12306,7 @@ int main(int argc, char **argv) {
     double dt = now_s() - t;
 
     /* DUMP=<path>: the rows went out as they were sampled (dump_logits); say how many */
-    if (g_dump) { fclose(g_dump); g_dump = NULL;
-                  fprintf(stderr, "[dump] wrote %ld rows of %d logits -> %s\n", g_dump_rows, m.c.vocab, getenv("DUMP")); }
-    else if (getenv("DUMP") && *getenv("DUMP") && g_dump_init) fprintf(stderr, "[dump] cannot open %s\n", getenv("DUMP"));
+    dump_close(m.c.vocab);
 
     int ref_match = 0;
     if (is_ref) {

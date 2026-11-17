@@ -9,6 +9,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### New
 
+- **qwen36: teacher forcing (`TF=1`), colibri's for this engine.** On a `.json` reference the
+  engine feeds `full_ids` through the model as a prompt, 256 rows at a time, reads every row's
+  logits out and compares each position's argmax with the reference's `tf_pred`, the prompt's
+  positions included, which the greedy oracle never looks at: the prefill path checked apart
+  from the decode. A mismatch is named and exits 1 (`ORACLE_TF_MAX_MISMATCHES` allows some),
+  `DEBUG_LOGITS=1` prints a mismatched position's top five logits and top1-top2 gap, `DUMP`
+  takes one row a position. `tools/make_qwen36_tiny.py --emit-ref` and
+  `tools/make_qwen36_oracle.py` write `tf_pred` (one cache-free forward, the argmax at every
+  position), `c/ref_qwen36.json` carries it, and `make -C c qwen36-tf-check` is the gate on the
+  generated fixture (CI): 21/21 positions, one dump row a position, a wrong entry fails.
+
 - **`coli setup` (START-HERE) picks the model that runs best on the machine**, not the most
   capable one that fits in RAM. It measures the RAM's read bandwidth (two seconds, standard
   library only: a process a core scanning its own buffer, within 3% of numpy on three machines),
