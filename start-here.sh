@@ -6,7 +6,7 @@
 # First run: finds your hardware, recommends a model that fits, builds the
 # engine (with Vulkan or CUDA when a GPU is usable) or fetches a prebuilt one,
 # downloads the model (safe to interrupt: run this again to continue), then
-# opens the dashboard in your browser. Later runs start colibri straight away.
+# opens the chat in your browser. Later runs start colibri straight away.
 #
 # Options go to `coli setup` (c/coli setup --help lists them), for example:
 #   ./start-here.sh --yes                     no questions, take the recommendation

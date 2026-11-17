@@ -1539,6 +1539,17 @@ class WholeSetup(HomeTestCase):
             self.shard,
         )
 
+    def test_printed_browser_address_is_the_chat_for_an_older_setup(self):
+        # a setup from before the chat UI saved the API's port as the browser's address
+        old = {"host": "127.0.0.1", "port": 8000,
+               "urls": {"browser": "http://127.0.0.1:8000/", "openai_base_url": "http://127.0.0.1:8000/v1",
+                        "anthropic_base_url": "http://127.0.0.1:8000"}}
+        lines = []
+        setup_flow.print_urls(old, lines.append)
+        self.assertEqual(lines, ["  Browser:             http://127.0.0.1:8790/",
+                                 "  OpenAI base URL:     http://127.0.0.1:8000/v1",
+                                 "  Anthropic base URL:  http://127.0.0.1:8000"])
+
     def test_ready_setup_honors_explicit_host(self):
         code, text = self.run_setup(pick="tiny")
         self.assertEqual(code, 0, text)

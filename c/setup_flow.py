@@ -1637,7 +1637,9 @@ def _replace_arg(args, flag, value):
 
 
 def print_urls(cfg, out=print):
-    link = cfg["urls"]
+    # from the host and port, not the saved "urls": a setup from before the chat UI
+    # saved the API's port as the browser's address
+    link = urls(cfg.get("host", DEFAULT_HOST), cfg["port"])
     out(f"  Browser:             {link['browser']}")
     out(f"  OpenAI base URL:     {link['openai_base_url']}")
     out(f"  Anthropic base URL:  {link['anthropic_base_url']}")
