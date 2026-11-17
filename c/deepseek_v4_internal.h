@@ -1146,6 +1146,17 @@ int coli_v4_gpu_attention_decode_chain(
     const float *sines, int rope_dim, const ColiTensorView *wo_a, int groups,
     const ColiTensorView *wo_b, float *output, float *attended_out, float *oa_out,
     const float *qa, int q_rank, const ColiTensorView *wq_b, float eps, float *q_out);
+/* V4_PREFILL_CHAIN: a prompt chunk's attention after the indexer on the card,
+ * from the normalized query ranks qa [batch][q_rank] to outputs
+ * [batch][hidden] (not yet bf16-rounded); the kv rows of the chunk (kv) are
+ * read, not appended. 0 = done, -1 = declined. */
+int coli_v4_gpu_attention_prefill_chain(
+    const ColiDeepSeekV4LayerWeights *weights, const float *qa, int q_rank,
+    const ColiTensorView *wq_b, float eps, const float *cosines, const float *sines,
+    int rope_dim, const float *kv, int start_position, const float *sinks,
+    const int *meta, const int *sel, int selstride, int first, int comp_total,
+    int heads, int head_dim, int batch, const ColiTensorView *wo_a, int groups,
+    const ColiTensorView *wo_b, float *outputs);
 int coli_v4_gpu_sparse_attention_batch_cached_idx(
     const ColiDeepSeekV4LayerWeights *weights, float *attended,
     const float *q, const float *chunk, int chunk_start, const float *sinks,

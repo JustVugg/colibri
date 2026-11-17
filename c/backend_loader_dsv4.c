@@ -197,6 +197,14 @@ typedef int             (*fn_attn_decode_chain)(int device, int layer, const flo
                                                 float *out, float *att_out, float *oa_out,
                                                 const float *qa, int q_rank, Dsv4CudaTensor *wqb,
                                                 float eps, int norm_fma, float *q_out);
+typedef int             (*fn_attn_prefill_chain)(int device, int layer, const float *qa, int q_rank,
+                                                 Dsv4CudaTensor *wqb, float eps, int norm_fma,
+                                                 const float *icos, const float *isin, int rope_dim,
+                                                 int rope_fma, const float *chunk, int chunk_start,
+                                                 const float *sinks, const int *meta, const int *sel,
+                                                 int selstride, int abs_base, int comp_limit, int heads,
+                                                 int dim, float scale, int tokens, Dsv4CudaTensor *wa,
+                                                 int groups, Dsv4CudaTensor *wb, float *out);
 typedef int             (*fn_tensor_refill_fp4)(Dsv4CudaTensor *t, const uint8_t *w, const uint8_t *scale,
                                                 int O, int I, int sync);
 typedef int (*fn_head_scores_exact)(Dsv4CudaTensor*,const float*,float*);
@@ -371,6 +379,7 @@ static struct {
     fn_indexer_resident indexer_resident;
     fn_indexer_keys_sync indexer_keys_sync;
     fn_attn_decode_chain attn_decode_chain;
+    fn_attn_prefill_chain attn_prefill_chain;   /* optional, V4_PREFILL_CHAIN */
     fn_attn_decode_fused attn_decode_fused;
     fn_matmul_bf16_multi matmul_bf16_multi;
     fn_decode_proj_multi decode_proj_multi;
@@ -611,6 +620,7 @@ static int dsv4_cuda_resolve(const char *dllname){
     g_dsv4.indexer_resident = (fn_indexer_resident)GetProcAddress(g_dsv4.dll, "dsv4_cuda_indexer_resident");
     g_dsv4.indexer_keys_sync = (fn_indexer_keys_sync)GetProcAddress(g_dsv4.dll, "dsv4_cuda_indexer_keys_sync");
     g_dsv4.attn_decode_chain = (fn_attn_decode_chain)GetProcAddress(g_dsv4.dll, "dsv4_cuda_attn_decode_chain");
+    g_dsv4.attn_prefill_chain = (fn_attn_prefill_chain)GetProcAddress(g_dsv4.dll, "dsv4_cuda_attn_prefill_chain");
     g_dsv4.attn_decode_fused = (fn_attn_decode_fused)GetProcAddress(g_dsv4.dll, "dsv4_cuda_attn_decode_fused");
     g_dsv4.matmul_bf16_multi = (fn_matmul_bf16_multi)GetProcAddress(g_dsv4.dll, "dsv4_cuda_matmul_bf16_multi");
     g_dsv4.decode_proj_multi = (fn_decode_proj_multi)GetProcAddress(g_dsv4.dll, "dsv4_cuda_decode_proj_multi");
@@ -1063,6 +1073,18 @@ int dsv4_cuda_attn_decode_chain(int device, int layer, const float *q, const flo
                                     abs_base, comp_limit, heads, dim, scale, icos, isin, rope_dim,
                                     rope_fma, wa, groups, wb, out, att_out, oa_out, qa, q_rank, wqb,
                                     eps, norm_fma, q_out);
+}
+
+int dsv4_cuda_attn_prefill_chain(int device, int layer, const float *qa, int q_rank, Dsv4CudaTensor *wqb,
+                                 float eps, int norm_fma, const float *icos, const float *isin, int rope_dim,
+                                 int rope_fma, const float *chunk, int chunk_start, const float *sinks,
+                                 const int *meta, const int *sel, int selstride, int abs_base, int comp_limit,
+                                 int heads, int dim, float scale, int tokens, Dsv4CudaTensor *wa, int groups,
+                                 Dsv4CudaTensor *wb, float *out){
+    if(!g_dsv4.available||!g_dsv4.attn_prefill_chain) return 0;   /* a DLL without it: the host's path */
+    return g_dsv4.attn_prefill_chain(device, layer, qa, q_rank, wqb, eps, norm_fma, icos, isin, rope_dim,
+                                     rope_fma, chunk, chunk_start, sinks, meta, sel, selstride, abs_base,
+                                     comp_limit, heads, dim, scale, tokens, wa, groups, wb, out);
 }
 
 int dsv4_cuda_upload_head_exact(Dsv4CudaTensor **t,const uint16_t *w,int rows,int cols,int device){

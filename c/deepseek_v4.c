@@ -3477,7 +3477,7 @@ static double v4_attn_prof_now(void) {
  * cached arena per slot amortizes them to zero; explicit memset keeps the old
  * calloc semantics where the algorithm may read before writing. */
 static void *v4_attn_scratch(int slot, size_t bytes, int zero) {
-    enum { V4_ATTN_SCRATCH_SLOTS = 24 };
+    enum { V4_ATTN_SCRATCH_SLOTS = 25 };
     static void *arena[V4_ATTN_SCRATCH_SLOTS];
     static size_t capacity[V4_ATTN_SCRATCH_SLOTS];
     if (slot < 0 || slot >= V4_ATTN_SCRATCH_SLOTS || !bytes) return NULL;
@@ -3488,6 +3488,54 @@ static void *v4_attn_scratch(int slot, size_t bytes, int zero) {
     }
     if (arena[slot] && zero) memset(arena[slot], 0, bytes);
     return arena[slot];
+}
+
+/* V4_PREFILL_CHAIN (opt-in): a prompt chunk's attention after the indexer as
+ * one device chain (coli_v4_gpu_attention_prefill_chain): the normalized
+ * query ranks go up once and the outputs come down once. The query's
+ * projection, norm and RoPE, the attention, the inverse RoPE and wo run on
+ * the card; the query no longer comes down for its norm and RoPE and goes up
+ * again, nor the attended for its inverse RoPE. 1: on; 2: verify (the chain
+ * runs beside the host's path and every output is compared, "pfchain" lines;
+ * the host's outputs are kept). */
+static int v4_prefill_chain_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("V4_PREFILL_CHAIN");
+        mode = e && *e ? atoi(e) : 0;
+        if (mode < 0 || mode > 2) mode = 0;
+    }
+    return mode;
+}
+/* the prompt chunk's query on the host (wq_b, bf16 round, per-head rmsnorm,
+ * RoPE): what the chain does on the card, for a chunk it declined */
+static int v4_prefill_q_host(float *q, const ColiTensorView *wq_b, const float *qa, int batch,
+                             int heads, int head_dim, int rope_dim, float eps,
+                             const float *cosines, const float *sines) {
+    size_t q_width = (size_t)heads * head_dim;
+    size_t rope_pairs = (size_t)rope_dim / 2;
+    int result = coli_fp8_matmul_batch_ref(q, wq_b, qa, batch);
+    if (!result) coli_bf16_round_array(q, (size_t)batch * q_width);
+    for (int item = 0; !result && item < batch; item++)
+        for (int head = 0; head < heads; head++) {
+            float *values = q + (size_t)item * q_width + (size_t)head * head_dim;
+            float square = 0.0f;
+            for (int i = 0; i < head_dim; i++) square += values[i] * values[i];
+            float scale = 1.0f / sqrtf(square / head_dim + eps);
+            for (int i = 0; i < head_dim; i++)
+                values[i] = coli_bf16_round(values[i] * scale);
+        }
+    for (int item = 0; !result && item < batch; item++) {
+        const float *item_cos = cosines + (size_t)item * rope_pairs;
+        const float *item_sin = sines + (size_t)item * rope_pairs;
+        float *item_q = q + (size_t)item * q_width;
+        for (int head = 0; head < heads; head++) {
+            float *rope = item_q + (size_t)head * head_dim + head_dim - rope_dim;
+            coli_v4_rope_apply(rope, 1, rope_dim, item_cos, item_sin, 0);
+            coli_bf16_round_array(rope, (size_t)rope_dim);
+        }
+    }
+    return result;
 }
 
 int coli_v4_attention_window_batch_ref(
@@ -3535,7 +3583,8 @@ int coli_v4_attention_window_batch_ref(
 
     double prof_t = v4_attn_prof_enabled() ? v4_attn_prof_now() : 0.0;
     double prof_qa = 0, prof_comp = 0, prof_idx = 0, prof_qb = 0,
-           prof_kv = 0, prof_rope = 0, prof_attn = 0, prof_wo = 0;
+           prof_kv = 0, prof_rope = 0, prof_attn = 0, prof_wo = 0,
+           prof_sync = 0, prof_chain = 0, prof_adv = 0;   /* parts of attn */
 #define V4_ATTN_PROF_MARK(slot) do { if (prof_t) { \
         double _now = v4_attn_prof_now(); (slot) += _now - prof_t; \
         prof_t = _now; } } while (0)
@@ -3708,10 +3757,20 @@ int coli_v4_attention_window_batch_ref(
         V4_ATTN_PROF_MARK(prof_idx);
     }
 
-
-    if (!result) result = coli_fp8_matmul_batch_ref(q, &wq_b, qa, batch);
-    if (!result) coli_bf16_round_array(q, (size_t)batch * q_width);
-    for (int item = 0; !result && item < batch; item++)
+    /* V4_PREFILL_CHAIN: the query stays on the card when the chain takes the
+     * chunk below; made on the host only if it declines (q_defer cleared).
+     * Verify (2) keeps the host's query and runs the chain beside it. */
+    int q_defer = 0;
+#ifdef COLI_V4_GPU_TIER
+    int chain_mode = gpu_batch && state && weights->plan.compression_ratio &&
+                 wq_b.gpu && wo_a.gpu && wo_b.gpu &&
+                 layer_data(weights, "attn.attn_sink", NULL) != NULL
+        ? v4_prefill_chain_mode() : 0;
+    q_defer = chain_mode == 1;
+#endif
+    if (!result && !q_defer) result = coli_fp8_matmul_batch_ref(q, &wq_b, qa, batch);
+    if (!result && !q_defer) coli_bf16_round_array(q, (size_t)batch * q_width);
+    for (int item = 0; !result && !q_defer && item < batch; item++)
         for (int head = 0; head < heads; head++) {
             float *values = q + (size_t)item * q_width + (size_t)head * head_dim;
             float square = 0.0f;
@@ -3745,7 +3804,7 @@ int coli_v4_attention_window_batch_ref(
         const float *item_sin = sines + (size_t)item * rope_pairs;
         float *item_q = q + (size_t)item * q_width;
         float *item_kv = kv + (size_t)item * head_dim;
-        for (int head = 0; head < heads; head++) {
+        for (int head = 0; !q_defer && head < heads; head++) {
             float *rope = item_q + (size_t)head * head_dim + head_dim - rope_dim;
             coli_v4_rope_apply(rope, 1, rope_dim, item_cos, item_sin, 0);
             coli_bf16_round_array(rope, (size_t)rope_dim);
@@ -3766,7 +3825,8 @@ int coli_v4_attention_window_batch_ref(
     V4_ATTN_PROF_MARK(prof_rope);
 
     const float *sinks = layer_data(weights, "attn.attn_sink", NULL);
-    int gpu_attn_done = 0;
+    int gpu_attn_done = 0, chain_done = 0;
+    float *chain_check = NULL;   /* verify: the chain's outputs */
 #ifdef COLI_V4_GPU_TIER
     /* Whole-chunk GPU sparse attention. Requires the indexer selection to be
      * the full compressed set (always true while compressed_count fits under
@@ -3805,10 +3865,49 @@ int coli_v4_attention_window_batch_ref(
              * separate buffer and enter the ring only AFTER attention (with
              * slots indexed position%window, appending first would overwrite
              * the oldest rows early chunk tokens still attend to). */
-            if (meta && coli_v4_gpu_kv_cache_sync(
+            V4_ATTN_PROF_MARK(prof_attn);
+            int synced = meta && coli_v4_gpu_kv_cache_sync(
                     weights, state->kv, state->window_size, head_dim,
-                    start_position, state->compressed, comp_total)) {
-                if ((use_idx
+                    start_position, state->compressed, comp_total);
+            V4_ATTN_PROF_MARK(prof_sync);
+            if (synced) {
+                /* V4_PREFILL_CHAIN: the query, the attention and wo on the
+                 * card in one chain; the kv rows enter the ring below as
+                 * usual. The chain reads the cache and appends nothing, so
+                 * under verify the host's path runs after it unchanged. */
+                if (chain_mode) {
+                    float *chain_out = chain_mode == 2
+                        ? v4_attn_scratch(24, (size_t)batch * hidden * sizeof(float), 0)
+                        : outputs;
+                    if (chain_out && coli_v4_gpu_attention_prefill_chain(
+                            weights, qa, q_rank, &wq_b, config->rms_norm_eps, cosines,
+                            sines, rope_dim, kv, start_position, sinks, meta,
+                            use_idx ? compressed_indices : NULL, config->index_topk,
+                            first, comp_total, heads, head_dim, batch, &wo_a, groups,
+                            &wo_b, chain_out) == 0) {
+                        coli_bf16_round_array(chain_out, (size_t)batch * hidden);
+                        V4_ATTN_PROF_MARK(prof_chain);
+                        if (chain_mode == 2) chain_check = chain_out;
+                        else {
+                            chain_done = 1;
+                            gpu_attn_done = 1;
+                            q_defer = 0;   /* the query was the chain's: no host one */
+                            coli_v4_gpu_kv_cache_advance(weights, kv, start_position,
+                                                         batch, state->window_size,
+                                                         head_dim, comp_total);
+                            V4_ATTN_PROF_MARK(prof_adv);
+                        }
+                    }
+                    if (!chain_done && q_defer) {
+                        result = v4_prefill_q_host(q, &wq_b, qa, batch, heads, head_dim,
+                                                   rope_dim, config->rms_norm_eps,
+                                                   cosines, sines);
+                        q_defer = 0;
+                    }
+                }
+                if (chain_done || result) {
+                    /* the chain took the chunk, or its host query failed */
+                } else if ((use_idx
                          ? coli_v4_gpu_sparse_attention_batch_cached_idx(
                                weights, attended, q, kv, start_position,
                                sinks, meta, compressed_indices,
@@ -3825,6 +3924,12 @@ int coli_v4_attention_window_batch_ref(
                 } else {
                     coli_v4_gpu_kv_cache_poison(weights);
                 }
+            }
+            if (!result && q_defer) {
+                /* no device cache for the chunk, so no chain: the host's query */
+                result = v4_prefill_q_host(q, &wq_b, qa, batch, heads, head_dim, rope_dim,
+                                           config->rms_norm_eps, cosines, sines);
+                q_defer = 0;
             }
             /* The legacy slab path assumes identity selection — with use_idx
              * a cache failure falls through to the CPU loop instead. */
@@ -3851,15 +3956,22 @@ int coli_v4_attention_window_batch_ref(
 
         }
     }
+    if (!result && q_defer) {
+        /* the chain never ran (no device cache for the chunk): the host's query */
+        result = v4_prefill_q_host(q, &wq_b, qa, batch, heads, head_dim, rope_dim,
+                                   config->rms_norm_eps, cosines, sines);
+        q_defer = 0;
+    }
     if (gpu_attn_done) {
         /* Commit the chunk into the window ring and finish with the same
-         * inverse RoPE the CPU loop applies. */
+         * inverse RoPE the CPU loop applies (the chain did its own). */
         for (int item = 0; !result && item < batch; item++) {
             int position = start_position + item;
             memcpy(state->kv +
                        (size_t)(position % state->window_size) * head_dim,
                    kv + (size_t)item * head_dim,
                    (size_t)head_dim * sizeof(*kv));
+            if (chain_done) continue;
             float *item_attended = attended + (size_t)item * q_width;
             const float *item_cos = cosines + (size_t)item * rope_pairs;
             const float *item_sin = sines + (size_t)item * rope_pairs;
@@ -3933,12 +4045,12 @@ int coli_v4_attention_window_batch_ref(
     int group_width = heads_per_group * head_dim;
     int scale_columns = (group_width + 127) / 128;
     int scale_rows = (o_rank + 127) / 128;
-    int gpu_wo_done = 0;
+    int gpu_wo_done = chain_done;
 #ifdef COLI_V4_GPU_TIER
     /* Whole-chunk grouped wo_a + wo_b on the GPU (fp8-bf16 wo_a mirror). The
      * backend rounds through bf16 between the two GEMMs exactly where the CPU
      * reference rounds oa. */
-    if (!result && gpu_batch &&
+    if (!result && gpu_batch && !chain_done &&
         coli_v4_gpu_attention_wo_batch(weights, outputs, attended, groups,
                                        (int)q_width, hidden, batch) == 0) {
         coli_bf16_round_array(outputs, (size_t)batch * hidden);
@@ -3995,12 +4107,38 @@ int coli_v4_attention_window_batch_ref(
         if (!result) coli_bf16_round_array(outputs, (size_t)batch * hidden);
     }
     V4_ATTN_PROF_MARK(prof_wo);
+    if (!result && chain_check) {
+        /* V4_PREFILL_CHAIN=2: the chain's outputs against the host's, bit for bit */
+        static long long calls, bad_calls, elements, bad_elements;
+        static double worst;
+        long long bad = 0;
+        size_t count = (size_t)batch * hidden;
+        for (size_t i = 0; i < count; i++)
+            if (memcmp(&outputs[i], &chain_check[i], sizeof(float))) {
+                double d = fabs((double)outputs[i] - chain_check[i]);
+                if (d > worst) worst = d;
+                bad++;
+            }
+        calls++;
+        elements += (long long)count;
+        bad_elements += bad;
+        if (bad) {
+            bad_calls++;
+            fprintf(stderr, "pfchain verify layer=%d start=%d n=%d MISMATCH %lld of %zu outputs\n",
+                    weights->plan.layer, start_position, batch, bad, count);
+        }
+        if (calls % 43 == 0)
+            fprintf(stderr, "pfchain verify calls=%lld mismatched_calls=%lld outputs=%lld differing=%lld max_abs=%g\n",
+                    calls, bad_calls, elements, bad_elements, worst);
+    }
     if (prof_t)
         fprintf(stderr, "attnprof layer=%d start=%d n=%d qa=%.0f comp=%.0f "
-                "idx=%.0f qb=%.0f kv=%.0f rope=%.0f attn=%.0f wo=%.0f ms\n",
+                "idx=%.0f qb=%.0f kv=%.0f rope=%.0f attn=%.0f wo=%.0f ms "
+                "(attn: sync=%.1f chain=%.1f adv=%.1f)\n",
                 weights->plan.layer, start_position, batch, prof_qa * 1e3,
                 prof_comp * 1e3, prof_idx * 1e3, prof_qb * 1e3, prof_kv * 1e3,
-                prof_rope * 1e3, prof_attn * 1e3, prof_wo * 1e3);
+                prof_rope * 1e3, (prof_attn + prof_sync + prof_chain + prof_adv) * 1e3,
+                prof_wo * 1e3, prof_sync * 1e3, prof_chain * 1e3, prof_adv * 1e3);
 #undef V4_ATTN_PROF_MARK
 
     free(inputs_act_scales); free(inputs_act);
@@ -16144,6 +16282,29 @@ int coli_v4_gpu_attention_decode_chain(
                output, attended_out, oa_out, qa, q_rank,
                qa ? (Dsv4CudaTensor *)wq_b->gpu : NULL, eps,
                1, q_out)
+        ? 0 : -1;
+}
+
+int coli_v4_gpu_attention_prefill_chain(
+    const ColiDeepSeekV4LayerWeights *weights, const float *qa, int q_rank,
+    const ColiTensorView *wq_b, float eps, const float *cosines, const float *sines,
+    int rope_dim, const float *kv, int start_position, const float *sinks,
+    const int *meta, const int *sel, int selstride, int first, int comp_total,
+    int heads, int head_dim, int batch, const ColiTensorView *wo_a, int groups,
+    const ColiTensorView *wo_b, float *outputs) {
+    if (!coli_v4_gpu_attn_batch_wanted() || !weights || !qa || !wq_b || !wq_b->gpu ||
+        !cosines || !sines || !kv || !sinks || !meta || !wo_a || !wo_b || !wo_a->gpu ||
+        !wo_b->gpu || !outputs || batch < 1 || first < 0 || heads < 1 || head_dim < 1 ||
+        groups < 1 || q_rank < 1)
+        return -1;
+    int device = v4_gpu_layer_device(weights);
+    if (device < 0) return -1;
+    /* the fma forms: those of the decode chain (the host build contracts) */
+    return dsv4_cuda_attn_prefill_chain(
+               device, weights->plan.layer, qa, q_rank, (Dsv4CudaTensor *)wq_b->gpu, eps, 1,
+               cosines, sines, rope_dim, 1, kv, start_position, sinks, meta, sel, selstride,
+               first, comp_total, heads, head_dim, 1.0f / sqrtf((float)head_dim), batch,
+               (Dsv4CudaTensor *)wo_a->gpu, groups, (Dsv4CudaTensor *)wo_b->gpu, outputs)
         ? 0 : -1;
 }
 

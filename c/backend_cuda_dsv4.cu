@@ -61,7 +61,7 @@ struct Dsv4CudaExpertSet { ExpertPtr *table;int64_t *hash;Dsv4CudaTensor *sg,*su
 #if COLI_DSV4_TC
 struct TcPlan {int O,I,ok;cublasLtMatmulDesc_t op;cublasLtMatrixLayout_t a,b,c,d;cublasLtMatmulHeuristicResult_t algo;};
 #endif
-struct Dev { int id,sms,sm; cudaStream_t stream,aux; cudaEvent_t ready,fork,join,upfence;float *dx,*dy,*p1,*p2,*p3,*p4,*aux1,*aux2,*aux3; size_t xcap,ycap,p1cap,p2cap,p3cap,p4cap,aux1cap,aux2cap,aux3cap; float *hx,*hy; void *pjh; size_t pjhcap; float *ssc; size_t ssccap; void *chp; size_t chpcap; void *dchp; size_t dchpcap; void *lfh; size_t lfhcap; void *lfd; size_t lfdcap; void *lfhp; size_t lfhpcap;
+struct Dev { int id,sms,sm; cudaStream_t stream,aux; cudaEvent_t ready,fork,join,upfence;float *dx,*dy,*p1,*p2,*p3,*p4,*aux1,*aux2,*aux3; size_t xcap,ycap,p1cap,p2cap,p3cap,p4cap,aux1cap,aux2cap,aux3cap; float *hx,*hy; void *pjh; size_t pjhcap; float *ssc; size_t ssccap; void *chp; size_t chpcap; void *dchp; size_t dchpcap; void *lfh; size_t lfhcap; void *lfd; size_t lfdcap; void *lfhp; size_t lfhpcap; void *pfstg; size_t pfstgcap;
 #ifdef COLI_DSV4_NCCL
     ncclComm_t ep_comm;
 #endif
@@ -2590,6 +2590,135 @@ __global__ void head_rmsnorm_ref_kernel(float*q,int dim,float eps,int fma_on){
     __syncthreads();
     for(int i=threadIdx.x;i<dim;i+=blockDim.x)v[i]=bf16_round_dev(__fmul_rn(sv[i],sc));
 }
+/* V4_PREFILL_CHAIN: the batched prefill attention on the card end to end.
+ * qa [tokens][q_rank] (the normalized query ranks) goes up once; the wq_b
+ * GEMM (the batched dense path dsv4_cuda_matmul_batch takes), the bf16 round,
+ * the per-head rmsnorm and the forward RoPE (the decode chain's kernels over
+ * the batch), the cached sparse attention over the chunk's kv rows, the
+ * inverse RoPE and the grouped wo_a + wo_b follow on the stream; out
+ * [tokens][hidden] comes down once (the host rounds it to bf16 as it does for
+ * its own wo). The query's two crossings of the link, its norm and RoPE on
+ * the host and the attended's inverse RoPE on the host are gone. The seven
+ * inputs go up as one copy from a page-locked block and the output comes
+ * down into it (pageable copies when that block cannot be had); the chain's
+ * own sync retires both. 0 = refused (the host takes its usual path). */
+__global__ void attn_rope_batch_kernel(float*att,const float*cosv,const float*sinv,int dim,int rope_dim,int fma_mode,int inverse,int heads){
+    int t=blockIdx.y,h=blockIdx.x,i=threadIdx.x,pairs=rope_dim/2;
+    if(i>=pairs)return;
+    float*v=att+((long long)t*heads+h)*dim+dim-rope_dim+2*i;
+    const float*cr=cosv+(long long)t*pairs,*sr=sinv+(long long)t*pairs;
+    float re=v[0],im=v[1],c=cr[i],sn=inverse?-sr[i]:sr[i];
+    float a,b;
+    if(fma_mode==1){a=fmaf(re,c,-__fmul_rn(im,sn));b=fmaf(im,c,__fmul_rn(re,sn));}
+    else if(fma_mode==2){a=fmaf(-im,sn,__fmul_rn(re,c));b=fmaf(re,sn,__fmul_rn(im,c));}
+    else{a=__fsub_rn(__fmul_rn(re,c),__fmul_rn(im,sn));b=__fadd_rn(__fmul_rn(re,sn),__fmul_rn(im,c));}
+    v[0]=bf16_round_dev(a);v[1]=bf16_round_dev(b);
+}
+/* the chain's page-locked staging block, grown by doubling; NULL: pageable copies */
+static void *pf_stage(Dev*c,size_t n){
+    if(c->pfstgcap<n){
+        size_t cap=c->pfstgcap?c->pfstgcap:((size_t)1<<20);while(cap<n)cap*=2;
+        if(c->pfstg)cudaFreeHost(c->pfstg);
+        c->pfstg=nullptr;c->pfstgcap=0;
+        if(!alloc_ok(cudaHostAlloc(&c->pfstg,cap,cudaHostAllocPortable),"prefill chain staging"))return nullptr;
+        c->pfstgcap=cap;
+    }
+    return c->pfstg;
+}
+extern "C" int dsv4_cuda_attn_prefill_chain(int device,int layer,const float*qa,int q_rank,Dsv4CudaTensor*wqb,float eps,int norm_fma,
+        const float*icos,const float*isin,int rope_dim,int rope_fma,const float*chunk,int chunk_start,const float*sinks,
+        const int*meta,const int*sel,int selstride,int abs_base,int comp_limit,int heads,int dim,float scale,int tokens,
+        Dsv4CudaTensor*wa,int groups,Dsv4CudaTensor*wb,float*out){
+    static int kprof=-1;
+    if(kprof<0){const char*e=getenv("DSV4_PF_KPROF");kprof=e&&*e&&*e!='0';}
+    std::chrono::steady_clock::time_point t_in;
+    if(kprof)t_in=std::chrono::steady_clock::now();
+    Dev*c=ctx(device);
+    if(!c||layer<0||layer>=DSV4_KV_CACHE_LAYERS||!g_kv_ring[layer]||!qa||!wqb||!icos||!isin||!chunk||!sinks||!meta||!out||
+       !wa||!wb||q_rank<1||tokens<1||heads<1||dim<1||rope_dim<2||rope_dim>dim||(rope_dim&1)||!(scale>0.f)||
+       abs_base<0||chunk_start<0||(sel&&selstride<1)||
+       wqb->device!=device||(wqb->fmt!=8&&wqb->fmt!=9)||wqb->I!=q_rank||(long long)wqb->O!=(long long)heads*dim||
+       wa->device!=device||wb->device!=device||groups<1||wa->O%groups||(long long)wa->I*groups!=(long long)heads*dim||wb->I!=wa->O)return 0;
+    if(comp_limit>0&&(!g_kv_comp[layer]||g_kv_comp_cap[layer]<comp_limit))return 0;
+    int window=g_kv_ring_rows[layer],max_total=0,pairs=rope_dim/2;
+    for(int t=0;t<tokens;t++){
+        int wn=meta[3*t+1],cn=meta[3*t+2],tt=wn+cn;
+        if(meta[3*t]<0||wn<1||wn>window||cn<0||cn>comp_limit||(sel&&cn>selstride))return 0;
+        if(abs_base+meta[3*t]+wn>chunk_start+tokens)return 0;
+        if(sel)for(int i=0;i<cn;i++){int o=sel[(long long)t*selstride+i];if(o<0||o>=comp_limit)return 0;}
+        if(tt>max_total)max_total=tt;
+    }
+    size_t qab=(size_t)tokens*q_rank*4,rb=(size_t)tokens*pairs*4,qb=(size_t)tokens*heads*dim*4,cb=(size_t)tokens*dim*4,
+           sb=(size_t)heads*4,mb=(size_t)tokens*3*sizeof(int),ib=sel?(size_t)tokens*selstride*sizeof(int):0,
+           hb=(size_t)tokens*wb->O*4,sm=(size_t)max_total*4,upb=qab+2*rb+cb+sb+mb+ib;
+    if(sm>96*1024||!ok(cudaSetDevice(device),"select prefill chain device"))return 0;
+    /* p1: the inputs (all consumed before wo_b reuses p1); p2: q; p4: attended; dx: the output */
+    if(!buf((void**)&c->p1,&c->p1cap,upb)||!buf((void**)&c->p2,&c->p2cap,qb)||!buf((void**)&c->p4,&c->p4cap,qb)||
+       !buf((void**)&c->dx,&c->xcap,hb))return 0;
+    char*d=(char*)c->p1;
+    const float*dqa=(const float*)d,*dcos=(const float*)(d+qab),*dsin=(const float*)(d+qab+rb),*dchunk=(const float*)(d+qab+2*rb),
+               *dsink=(const float*)(d+qab+2*rb+cb);
+    const int*dmeta=(const int*)(d+qab+2*rb+cb+sb),*dsel=ib?(const int*)(d+qab+2*rb+cb+sb+mb):nullptr;
+    cudaEvent_t ev[8];
+    if(kprof){for(int i=0;i<8;i++)cudaEventCreate(&ev[i]);cudaEventRecord(ev[0],c->stream);}
+    char*stg=(char*)pf_stage(c,upb>hb?upb:hb);
+    if(stg){
+        char*h=stg;
+        memcpy(h,qa,qab);h+=qab;memcpy(h,icos,rb);h+=rb;memcpy(h,isin,rb);h+=rb;memcpy(h,chunk,cb);h+=cb;
+        memcpy(h,sinks,sb);h+=sb;memcpy(h,meta,mb);h+=mb;if(ib)memcpy(h,sel,ib);
+        if(!ok(cudaMemcpyAsync(d,stg,upb,cudaMemcpyHostToDevice,c->stream),"prefill chain staged upload"))return 0;
+    }else if(!ok(cudaMemcpyAsync(d,qa,qab,cudaMemcpyHostToDevice,c->stream),"prefill chain qa upload")||
+             !ok(cudaMemcpyAsync(d+qab,icos,rb,cudaMemcpyHostToDevice,c->stream),"prefill chain cos upload")||
+             !ok(cudaMemcpyAsync(d+qab+rb,isin,rb,cudaMemcpyHostToDevice,c->stream),"prefill chain sin upload")||
+             !ok(cudaMemcpyAsync(d+qab+2*rb,chunk,cb,cudaMemcpyHostToDevice,c->stream),"prefill chain kv upload")||
+             !ok(cudaMemcpyAsync(d+qab+2*rb+cb,sinks,sb,cudaMemcpyHostToDevice,c->stream),"prefill chain sink upload")||
+             !ok(cudaMemcpyAsync(d+qab+2*rb+cb+sb,meta,mb,cudaMemcpyHostToDevice,c->stream),"prefill chain meta upload")||
+             (ib&&!ok(cudaMemcpyAsync(d+qab+2*rb+cb+sb+mb,sel,ib,cudaMemcpyHostToDevice,c->stream),"prefill chain index upload")))return 0;
+    if(kprof)cudaEventRecord(ev[1],c->stream);
+    /* the query projection: the batched dense path dsv4_cuda_matmul_batch takes */
+#ifdef COLI_DSV4_DEEPGEMM
+    if(!dg_dense_batch_dispatch(c,wqb,dqa,c->p2,tokens))return 0;
+#else
+    /* as dsv4_cuda_matmul_batch: the input rounded first where the tensor wants it (in place: qa is not read again) */
+    if(act_quant_wanted(wqb))act_quant_input(wqb,(float*)dqa,tokens,wqb->I,c->stream);
+    run_mm_batch(wqb,dqa,c->p2,tokens,c->stream);if(!ok(cudaGetLastError(),"prefill chain wq_b launch"))return 0;
+#endif
+    if(kprof)cudaEventRecord(ev[2],c->stream);
+    long long qn=(long long)tokens*heads*dim;
+    bf16_round_ref_kernel<<<(unsigned)((qn+255)/256),256,0,c->stream>>>(c->p2,(int)qn);
+    head_rmsnorm_ref_kernel<<<(unsigned)(tokens*heads),256,(size_t)dim*4,c->stream>>>(c->p2,dim,eps,norm_fma);
+    attn_rope_batch_kernel<<<dim3(heads,tokens),pairs,0,c->stream>>>(c->p2,dcos,dsin,dim,rope_dim,rope_fma,0,heads);
+    if(!ok(cudaGetLastError(),"prefill chain query launch"))return 0;
+    if(kprof)cudaEventRecord(ev[3],c->stream);
+    if(dsel){
+        if(sattn_v2_on())launch_sattn_v2<1>(heads,tokens,sm,c->stream,c->p4,c->p2,g_kv_ring[layer],dchunk,g_kv_comp[layer],dsink,dmeta,dsel,selstride,abs_base,chunk_start,window,dim,scale);
+        else sparse_attn_batch_cached_idx_kernel<<<dim3(heads,tokens),256,sm,c->stream>>>(c->p4,c->p2,g_kv_ring[layer],dchunk,g_kv_comp[layer],dsink,dmeta,dsel,selstride,abs_base,chunk_start,window,heads,dim,scale);
+    }else{
+        if(sattn_v2_on())launch_sattn_v2<0>(heads,tokens,sm,c->stream,c->p4,c->p2,g_kv_ring[layer],dchunk,g_kv_comp[layer],dsink,dmeta,nullptr,0,abs_base,chunk_start,window,dim,scale);
+        else sparse_attn_batch_cached_kernel<<<dim3(heads,tokens),256,sm,c->stream>>>(c->p4,c->p2,g_kv_ring[layer],dchunk,g_kv_comp[layer],dsink,dmeta,abs_base,chunk_start,window,heads,dim,scale);
+    }
+    if(!ok(cudaGetLastError(),"prefill chain attention launch"))return 0;
+    if(kprof)cudaEventRecord(ev[4],c->stream);
+    attn_rope_batch_kernel<<<dim3(heads,tokens),pairs,0,c->stream>>>(c->p4,dcos,dsin,dim,rope_dim,rope_fma,1,heads);
+    if(!ok(cudaGetLastError(),"prefill chain inverse rope launch"))return 0;
+    if(kprof)cudaEventRecord(ev[5],c->stream);
+    Dsv4CudaActivation ctxa={c->p4,qn,device},outa={c->dx,(long long)tokens*wb->O,device};
+    if(!dsv4_cuda_attention_output_batch(&ctxa,wa,wb,groups,tokens,&outa))return 0;
+    if(kprof)cudaEventRecord(ev[6],c->stream);
+    if(!ok(cudaMemcpyAsync(stg?(void*)stg:(void*)out,c->dx,hb,cudaMemcpyDeviceToHost,c->stream),"prefill chain output download"))return 0;
+    if(kprof)cudaEventRecord(ev[7],c->stream);
+    int done=ok(cudaStreamSynchronize(c->stream),"prefill chain sync");
+    if(stg&&done)memcpy(out,stg,hb);
+    if(kprof){
+        float ms[7];
+        for(int i=0;i<7;i++)cudaEventElapsedTime(&ms[i],ev[i],ev[i+1]);
+        double host=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t_in).count();
+        fprintf(stderr,"pfkprof layer=%d tokens=%d total=%d up=%.3f qb=%.3f qk=%.3f attn=%.3f rope=%.3f wo=%.3f down=%.3f host=%.3f ms\n",
+                layer,tokens,max_total,ms[0],ms[1],ms[2],ms[3],ms[4],ms[5],ms[6],host);
+        for(int i=0;i<8;i++)cudaEventDestroy(ev[i]);
+    }
+    return done;
+}
 /* The one-token cached sparse attention launch over device pointers (the
  * split kernels, else v2, else the first kernels): out [heads][dim] from
  * q, the ring and comp cache of `layer`, chunk (the token's kv row), the
@@ -3668,7 +3797,7 @@ static void dev_release(int n){
 #ifdef COLI_DSV4_DEEPGEMM
         if(g[i].dga1)cudaFree(g[i].dga1);if(g[i].dga2)cudaFree(g[i].dga2);if(g[i].dgsfa1)cudaFree(g[i].dgsfa1);if(g[i].dgsfa2)cudaFree(g[i].dgsfa2);if(g[i].dglayout)cudaFree(g[i].dglayout);if(g[i].dgrowmap)cudaFree(g[i].dgrowmap);if(g[i].dgmm1)cudaFree(g[i].dgmm1);if(g[i].dgmm2)cudaFree(g[i].dgmm2);if(g[i].dgref)cudaFree(g[i].dgref);if(g[i].dgdensews)cudaFree(g[i].dgdensews);
 #endif
-        tc_dev_free(&g[i]);if(g[i].hx)cudaFreeHost(g[i].hx);if(g[i].hy)cudaFreeHost(g[i].hy);if(g[i].ready)cudaEventDestroy(g[i].ready);if(g[i].fork)cudaEventDestroy(g[i].fork);if(g[i].join)cudaEventDestroy(g[i].join);if(g[i].upfence)cudaEventDestroy(g[i].upfence);if(g[i].aux)cudaStreamDestroy(g[i].aux);if(g[i].stream)cudaStreamDestroy(g[i].stream);
+        tc_dev_free(&g[i]);if(g[i].pfstg)cudaFreeHost(g[i].pfstg);if(g[i].hx)cudaFreeHost(g[i].hx);if(g[i].hy)cudaFreeHost(g[i].hy);if(g[i].ready)cudaEventDestroy(g[i].ready);if(g[i].fork)cudaEventDestroy(g[i].fork);if(g[i].join)cudaEventDestroy(g[i].join);if(g[i].upfence)cudaEventDestroy(g[i].upfence);if(g[i].aux)cudaStreamDestroy(g[i].aux);if(g[i].stream)cudaStreamDestroy(g[i].stream);
         /* zero the slot: every buffer above is grown lazily through buf(), which
          * would cudaFree a stale pointer (and trust its cap) after a re-init */
         memset(&g[i],0,sizeof g[i]);}ng=0;
