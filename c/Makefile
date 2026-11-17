@@ -1291,15 +1291,17 @@ test-qwen38-metal-counter: qwen38_gpu.h qwen36_gpu.h qwen36_metal_internal.h met
 	@missed=0; \
 	for n in 1 2 3 4 5; do \
 	  echo "== counter-test $$n"; \
-	  $(QWEN36_METALC) -DQ38_COUNTER_TEST=$$n -c qwen36_metal.m -o tests/ct$${n}_qwen36_metal.o && \
-	  $(QWEN36_METALC) -DQ38_COUNTER_TEST=$$n -c qwen38_metal.m -o tests/ct$${n}_qwen38_metal.o && \
-	  $(CC) -O2 -Wall -Wextra -Wno-unused-function -std=c11 -DQ38_COUNTER_TEST=$$n tests/test_qwen38_metal_kernels.c \
-	      tests/ct$${n}_qwen38_metal.o tests/ct$${n}_qwen36_metal.o -framework Metal -framework Foundation -lm \
-	      -o tests/test_ct$${n}_qwen38_kernels || { echo "counter-test $$n: build failed"; exit 1; }; \
-	  if ./tests/test_ct$${n}_qwen38_kernels > tests/ct$${n}.log 2>&1; then \
-	    echo "counter-test $$n: test PASSED (not caught)"; missed=1; \
+	  { $(QWEN36_METALC) -DQ38_COUNTER_TEST=$$n -c qwen36_metal.m -o tests/ct$${n}_qwen36_metal.o && \
+	    $(QWEN36_METALC) -DQ38_COUNTER_TEST=$$n -c qwen38_metal.m -o tests/ct$${n}_qwen38_metal.o && \
+	    $(CC) -O2 -Wall -Wextra -Wno-unused-function -std=c11 -DQ38_COUNTER_TEST=$$n tests/test_qwen38_metal_kernels.c \
+	        tests/ct$${n}_qwen38_metal.o tests/ct$${n}_qwen36_metal.o -framework Metal -framework Foundation -lm \
+	        -o tests/test_ct$${n}_qwen38_kernels; } || { echo "counter n=$$n: build failed"; exit 1; }; \
+	  ./tests/test_ct$${n}_qwen38_kernels > tests/ct$${n}.log 2>&1; \
+	  if grep -q 'SKIPPED' tests/ct$${n}.log; then echo "counter n=$$n: skipped: no Metal device"; exit 1; fi; \
+	  if grep -q ' FAIL' tests/ct$${n}.log; then \
+	    echo "counter-test $$n: caught ($$(grep -c ' FAIL' tests/ct$${n}.log) FAIL lines)"; \
 	  else \
-	    echo "counter-test $$n: test FAILED as required ($$(grep -c ' FAIL' tests/ct$${n}.log) failing cases)"; \
+	    echo "counter-test $$n: NOT caught (no FAIL line in log)"; missed=1; \
 	  fi; \
 	done; \
 	if [ $$missed = 0 ]; then echo "counter-tests: all 5 caught"; else echo "counter-tests: NOT ALL CAUGHT"; exit 1; fi

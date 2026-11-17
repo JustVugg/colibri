@@ -168,7 +168,7 @@ int q38_hc_mix(q36_tensor *y, q36_tensor *a, q36_tensor *b, int rows, int D, int
         (uint64_t)rows * D * C > UINT32_MAX || !q36_metal_fits(a, (uint64_t)rows * D * C * F4) ||
         !q36_metal_fits(b, (uint64_t)rows * D * C * F4) || !q36_metal_fits(y, (uint64_t)rows * D * F4)) return 0;
     @autoreleasepool {
-        q38_hc_args p = {(uint32_t)(rows * D), (uint32_t)D, (uint32_t)C, fc};
+        q38_hc_args p = {(uint32_t)((uint64_t)rows * D), (uint32_t)D, (uint32_t)C, fc};
         id<MTLComputePipelineState> pso = g_q38_pipe[K38_HC_MIX];
         id<MTLComputeCommandEncoder> e = q36_metal_encoder(pso);
         q36_metal_bind(e, a, 0);
@@ -185,7 +185,7 @@ int q38_hc_apply(q36_tensor *hyper, q36_tensor *inject, q36_tensor *block, int r
         !q36_metal_fits(hyper, (uint64_t)rows * D * C * F4) || !q36_metal_fits(inject, (uint64_t)rows * C * F4) ||
         !q36_metal_fits(block, (uint64_t)rows * D * F4)) return 0;
     @autoreleasepool {
-        q38_hc_args p = {(uint32_t)(rows * D * C), (uint32_t)D, (uint32_t)C, 1.0f};
+        q38_hc_args p = {(uint32_t)((uint64_t)rows * D * C), (uint32_t)D, (uint32_t)C, 1.0f};
         id<MTLComputePipelineState> pso = g_q38_pipe[K38_HC_APPLY];
         id<MTLComputeCommandEncoder> e = q36_metal_encoder(pso);
         q36_metal_bind(e, hyper, 0);
@@ -197,8 +197,10 @@ int q38_hc_apply(q36_tensor *hyper, q36_tensor *inject, q36_tensor *block, int r
     return 1;
 }
 
+static int q38_tg256(int kernel) { return g_q38_pipe[kernel].maxTotalThreadsPerThreadgroup >= 256; }
+
 int q38_hc_norm(q36_tensor *y, q36_tensor *x, q36_tensor *w, int rows, int D, int C, float eps) {
-    if (!q38_ready() || rows < 1 || D < 1 || C < 1 || !(eps > 0.0f) || (uint64_t)rows * C > UINT32_MAX ||
+    if (!q38_ready() || rows < 1 || D < 1 || C < 1 || !(eps > 0.0f) || !q38_tg256(K38_HC_NORM) || (uint64_t)rows * C > UINT32_MAX ||
         (uint64_t)rows * D * C > UINT32_MAX || !q36_metal_fits(x, (uint64_t)rows * D * C * F4) ||
         !q36_metal_fits(y, (uint64_t)rows * D * C * F4) || !q36_metal_fits(w, (uint64_t)D * C * F4)) return 0;
     @autoreleasepool {
@@ -232,7 +234,7 @@ static q38_ple_args q38_ple_pack(const q38_ple_shape *s) {
 
 int q38_ple_gate(q36_tensor *gated, q36_tensor *normv, q36_tensor *keys, q36_tensor *hyper,
                  q36_tensor *value, q36_tensor *prm, const q38_ple_shape *s) {
-    if (!q38_ready() || !q38_ple_shape_ok(s) || !(s->eps > 0.0f)) return 0;
+    if (!q38_ready() || !q38_ple_shape_ok(s) || !(s->eps > 0.0f) || !q38_tg256(K38_PLE_GATE)) return 0;
     uint64_t n = (uint64_t)s->S * s->W * F4;
     if (!q36_metal_fits(keys, n) || !q36_metal_fits(hyper, n) || !q36_metal_fits(gated, n) ||
         !q36_metal_fits(normv, n) || !q36_metal_fits(value, (uint64_t)s->S * s->H * F4) ||
@@ -288,7 +290,6 @@ static int q38_qsa_shape_ok(const q38_qsa_shape *s) {
 }
 
 /* The pipeline runs 256-thread groups. */
-static int q38_tg256(int kernel) { return g_q38_pipe[kernel].maxTotalThreadsPerThreadgroup >= 256; }
 
 int q38_qsa_pool(q36_tensor *pk, q36_tensor *ikraw, q36_tensor *idx_kn, int b0, int nb, const q38_qsa_shape *s) {
     if (!q38_ready() || !q38_qsa_shape_ok(s) || b0 < 0 || nb < 1 || !q38_tg256(K38_QSA_POOL)) return 0;
