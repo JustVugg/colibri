@@ -3148,6 +3148,13 @@ def run_tui(a, base):
     travels in the environment, not on the command line, where `ps` would show it."""
     env = dict(os.environ)
     if getattr(a, "api_key", None): env["COLI_API_KEY"] = a.api_key
+    # the chat page's document reader, for the files dropped on the TUI (PDF, Word, ...)
+    docs = next((d for d in (os.path.join(HERE, "ui", "docs.py"),
+                             os.path.join(os.path.dirname(os.path.abspath(HERE)), "ui", "docs.py"),
+                             os.path.join(_LIBEXEC, "ui", "docs.py")) if os.path.isfile(d)), None)
+    if docs:
+        env.setdefault("COLI_DOCS", docs)
+        env.setdefault("COLI_PYTHON", sys.executable)
     return subprocess.call([tui_binary(), "--server", base], env=env)
 
 def cmd_tui(a):

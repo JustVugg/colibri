@@ -251,6 +251,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_DFLASH_SELECT", CE_BOOL, CE_QWEN | CE_QWEN38, 0, NULL},
     {"COLI_DISKCLASS_WINDOW",            CE_STR   , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_DISK_WEIGHTS",                CE_STR   , CE_COLIBRI | CE_DSV4 | CE_DSV41 | CE_GLM53 | CE_QWEN38, 0, NULL},
+    {"COLI_DOCS", CE_STR, 0, 0, NULL},   /* colibri-tui: the chat's document reader (ui/docs.py), set by coli tui */
     {"COLI_DRAFT_CORPUS",                CE_STR   , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_DSA_GATHER",                  CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_DSV4_DLL",                    CE_STR   , CE_DSV4                                         , 0             , NULL},
@@ -322,6 +323,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_PROMPT_BREAK_AFTER", CE_INT, CE_COLIBRI | CE_INKLING | CE_OLMOE | CE_QWEN38 | CE_DSV41 | CE_MIMO, 0, NULL},
     {"COLI_PROMPT_SEGMENT", CE_INT, CE_COLIBRI | CE_INKLING | CE_OLMOE | CE_QWEN38 | CE_DSV41 | CE_MIMO, 0, NULL},
     {"COLI_PROMPT_SNAPSHOT", CE_STR, CE_QWEN, 0, NULL},
+    {"COLI_PYTHON", CE_STR, 0, 0, NULL},   /* colibri-tui: the Python that runs COLI_DOCS */
     {"COLI_RAM_OVERCOMMIT",              CE_INT   , CE_COLIBRI | CE_KIMI                            , 0             , NULL},
     {"COLI_RTOP8",                       CE_STR   , CE_ALL                                          , 0             , NULL},
     {"COLI_SERVER", CE_STR, 0, 0, NULL},
@@ -515,6 +517,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"DEGRADE_ZERO", CE_BOOL, CE_COLIBRI, 0, NULL},
     {"DIRECT",                           CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"DISK_SPLIT",                       CE_INT   , CE_COLIBRI                                      , 0             , NULL},
+    {"DISPLAY", CE_STR, 0, 0, NULL},   /* colibri-tui: an X11 desktop, its clipboard through xclip or xsel */
     {"DN_DBG",                           CE_STR   , CE_QWEN                                         , 0             , NULL},
     {"DRAFT",                            CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"DROP",                             CE_STR   , CE_COLIBRI                                      , 0             , NULL},
@@ -956,6 +959,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"V4_WO_CHAIN", CE_INT, CE_DSV4, 0, NULL},
     {"VK_PROF", CE_STR, CE_ALL | CE_DSV4 | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_QWENIMAGE | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"WARMUP",                           CE_INT   , CE_OLMOE | CE_QWEN                              , 0             , NULL},
+    {"WAYLAND_DISPLAY", CE_STR, 0, 0, NULL},   /* colibri-tui: a Wayland desktop, its clipboard through wl-copy */
     {"WIDE",                             CE_INT   , CE_OLMOE | CE_QWEN                              , 0             , NULL},
     {"XDG_CACHE_HOME", CE_STR, CE_COLIBRI | CE_KIMI | CE_INKLING | CE_OLMOE | CE_DSV4 | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_QWENIMAGE | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},   /* the system's: where the Vulkan pipeline cache goes (vk_pcache.h) */
     {"XEXP",                             CE_INT   , CE_COLIBRI                                      , 0             , NULL},
