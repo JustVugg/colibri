@@ -1668,8 +1668,11 @@ extern "C" int coli_cuda_init(const int *devices, int count) {
         }
 #endif
         g_nctx++;
-        std::fprintf(stderr, "[CUDA] device %d: %s, %.1f GB VRAM, sm_%d%d\n",
-                     device, prop.name, prop.totalGlobalMem / 1e9, prop.major, prop.minor);
+        /* the PCI address too: nvidia-smi's numbering is the bus order, the runtime's the
+         * CUDA_DEVICE_ORDER the process started with (coli sets PCI_BUS_ID, #2887) */
+        std::fprintf(stderr, "[CUDA] device %d: %s, %.1f GB VRAM, sm_%d%d, PCI %04x:%02x:%02x\n",
+                     device, prop.name, prop.totalGlobalMem / 1e9, prop.major, prop.minor,
+                     (unsigned)prop.pciDomainID, (unsigned)prop.pciBusID, (unsigned)prop.pciDeviceID);
     }
     return 1;
 }
