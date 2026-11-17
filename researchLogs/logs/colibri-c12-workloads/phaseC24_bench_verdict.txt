@@ -1,12 +1,20 @@
-C24 bench verdict — fused S==1 for Q4_K (c24_q4k_bench.c, OMP=1 + OMP=6,
-phaseC24_bench_omp{1,6}.jsonl, 2026-11-17)
+C24 bench verdict — fused S==1 for Q4_K/Q5_K (c24_q4k_bench.c, OMP=1 + OMP=6,
+phaseC24_bench_omp{1,6}.jsonl pre-insertion gate, phaseC24_bench_postinsert_omp{1,6}.jsonl
+post-insertion in-engine, 2026-11-17)
 
 ROUTE GATE: PASS — proceed to engine insertion.
 
-1. Bit-exactness: fused precheck maxdiff 0.000e+00 on every shape, both thread
-   counts (fused decoder vs the current generic path, 8 random rows, S=2 act).
-   The min term rides gq_dot_i8's exact fmaf chain; codes are unsigned nibbles
-   0..15 (no -8 offset — the min carries it via the activation's per-16 sums).
+0. Scope correction (C16 file facts, caught mid-phase): Q4_K_M ships
+   gate/up Q4_K (144 B) but DOWN Q5_K (176 B, the 5-bit code from qh@16) --
+   the 12K decode anchor rides both types. The bench gained a fused Q5_K
+   candidate (same decoder plus the qh bit test) and the engine step covers
+   both.
+
+1. Bit-exactness: fused precheck maxdiff 0.000e+00 on every shape, both
+   thread counts, Q4_K and Q5_K (fused decoder vs the current generic path,
+   8 random rows, S=2 act). The min term rides gq_dot_i8's exact fmaf chain;
+   codes are unsigned nibbles 0..15 (Q4_K) / 0..31 (Q5_K), no -8 offset --
+   the min carries it via the activation's per-16 sums.
 
 2. The S==1 gap is real and C22's mechanism transfers:
    generic rowall at S=1: gate/up 18.5/17.7 GFLOPS (unpack 42%), down
@@ -44,3 +52,30 @@ then rebuild + fixture suite + in-engine revalidation (bench cell_rowall at
 S=1 must show the fused rates; Q36_EXPERT_FUSE=0 restores 17.7/23.5), then
 the real-model interleaved A/B on the Q4_K_M container targeting the C16
 0.72x 12K decode recovery.
+
+=== Engine insertion results (post-insertion, same day) ===
+
+Inserted: gq_arm_sbk_q4_k/gq_arm_sbk_q5_k + gq_dot_arm_q4_k/gq_dot_arm_q5_k
+via the GQ_DOT_K_ARM macro in gq_row_all's ARM block, gate
+(t == GQ_Q4_K || t == GQ_Q5_K) && a->S == 1 && gq_fuse(), I % 256 == 0.
+Rebuild green; in-engine revalidation (bench cell_rowall S=1, OMP=6):
+
+  Q4_K gate/up: 17.4 generic -> 40.1 live  (2.30x)
+  Q4_K down:    23.7 generic -> 44.1 live  (1.86x)
+  Q5_K down:    23.6 generic -> 27.4 live  (1.16x)
+  Q36_EXPERT_FUSE=0 restores the generic rates everywhere (17.4/23.7/23.6).
+
+Q5_K note: the fused gain is only 1.16-1.20x (vs Q4_K's 1.86-2.30x) -- the
+qh bit expansion makes the decoder costlier and the 176 B block has worse
+arithmetic intensity than 144 B. It is inserted anyway: bit-exact, positive,
+and the down projection is ~38% of Q4_K_M's expert bytes, so skipping it
+would leave the 12K decode anchor partially unrecovered.
+
+Fixture suite after the engine edit (pytest c/tests from c/, 2026-11-17):
+2553 passed, 550 skipped, only the 3 known pre-existing failures
+(test_makefile_deps, 2x flaky test_qwen36_text_stops) -- no new failures.
+
+Real-model A/B: c24_fuse_ab_launch.sh (fuse1 vs fuse0, 4 alternating
+restarts on the Q4_K_M container, c16_q4k_ab.py per round) -- PENDING the
+Q4_K_M container re-import (the 22.66 GB gguf was cleaned from disk after
+C16; link-mode import via c/tools/gguf_import.py).

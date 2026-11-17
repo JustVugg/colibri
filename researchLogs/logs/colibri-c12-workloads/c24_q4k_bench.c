@@ -18,7 +18,9 @@
  * and at S == 1 dec1 IS the generic path.
  *
  * Shapes are Q4_K_M's serving shapes (same geometry as the IQ3 file):
- * gate/up I=2048 O=512, down I=512 O=2048, 144-byte blocks.
+ * gate/up I=2048 O=512 in Q4_K (144-byte blocks) and down I=512 O=2048 in
+ * Q5_K (176-byte blocks, the 5-bit code from qh@16) -- C16's file facts:
+ * gate Q4_K / up Q4_K / down Q5_K. The 12K decode anchor rides both types.
  * S sweeps the C14-measured per-expert row counts.
  * Straggler sizing (no fused candidate here, rowall/unpack only): the
  * Q2_K/Q3_K/IQ4_XS early-layer types the IQ3 file ships (1-2 layers).
@@ -87,34 +89,66 @@ static inline void c24_sb_q4_k(const uint8_t *b, float d, float dmin, int ib,
     }
 }
 
-/* the fused dot: per activation row, decode each sub-block in registers and dot
- * at once, the min term in gq_dot_i8's exact fmaf chain and final order. */
-static void c24_dot_fused_q4_k(float *y, int ystride, const uint8_t *row,
-                               const int8_t *xq, const float *dx, const int32_t *xs, int I, int S) {
-    for (int s = 0; s < S; s++) {
-        float32x4_t vacc = vdupq_n_f32(0.f);
-        float mm = 0.f;
-        const int8_t *xs8 = xq + (int64_t)s * I;
-        const float *dxs = dx + (int64_t)s * (I / 32);
-        const int32_t *xss = xs + (int64_t)s * (I / 16);
-        int64_t xb = 0;
-        for (int64_t blk = 0; blk < I / 256; blk++) {
-            const uint8_t *b = row + blk * 144;
-            const float d = gq_f16(gq_rd16(b)), dmin = gq_f16(gq_rd16(b + 2));
-            for (int ib = 0; ib < 8; ib++, xb++) {
-                float s2[2], m2[2]; int8x16_t w0, w1;
-                c24_sb_q4_k(b, d, dmin, ib, s2, m2, &w0, &w1);
-                int32x4_t p0, p1;
-                gq_arm_dot2(w0, w1, vld1q_s8(xs8 + 32 * xb), vld1q_s8(xs8 + 32 * xb + 16), &p0, &p1);
-                const float dd = dxs[xb];
-                vacc = vmlaq_n_f32(vacc, vcvtq_f32_s32(p0), s2[0] * dd);
-                vacc = vmlaq_n_f32(vacc, vcvtq_f32_s32(p1), s2[1] * dd);
-                mm = fmaf(dd, fmaf(m2[0], (float)xss[2 * xb], m2[1] * (float)xss[2 * xb + 1]), mm);
-            }
-        }
-        y[(int64_t)s * ystride] = vaddvq_f32(vacc) - mm;
+/* Q5_K (Q4_K_M's down-projection type, 176 bytes): Q4_K plus the 5th code bit
+ * from qh@16 (32 bytes; element j of chunk c = byte j, bit 2c for the even
+ * sub-block, 2c+1 for the odd one) -- codes unsigned 0..31, same scales/mins
+ * and min term as Q4_K. Layout: d@0 dmin@2 sc[12]@4 qh[32]@16 qs[128]@48. */
+
+static inline void c24_sb_q5_k(const uint8_t *b, float d, float dmin, int ib,
+                               float *s2, float *m2, int8x16_t *w0, int8x16_t *w1) {
+    const uint8_t *sc = b + 4, *qh = b + 16, *qs = b + 48;
+    int s, m; gq_scale_min_k4(sc, ib, &s, &m);
+    s2[0] = s2[1] = d * (float)s;
+    m2[0] = m2[1] = dmin * (float)m;
+    const int c = ib >> 1;
+    const uint8_t *q = qs + 32 * c;
+    const uint8x16_t m4 = vdupq_n_u8(0x0F), sixteen = vdupq_n_u8(16);
+    const uint8x16_t qh0 = vld1q_u8(qh), qh1 = vld1q_u8(qh + 16);
+    const uint8x16_t v0 = vld1q_u8(q), v1 = vld1q_u8(q + 16);
+    if (ib & 1) {   /* odd sub-block: high nibbles, qh bit 2c+1 */
+        const uint8x16_t bit = vdupq_n_u8((uint8_t)(1 << (2 * c + 1)));
+        const uint8x16_t b5_0 = vtstq_u8(qh0, bit), b5_1 = vtstq_u8(qh1, bit);
+        *w0 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(v0, 4), vandq_u8(b5_0, sixteen)));
+        *w1 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(v1, 4), vandq_u8(b5_1, sixteen)));
+    } else {        /* even sub-block: low nibbles, qh bit 2c */
+        const uint8x16_t bit = vdupq_n_u8((uint8_t)(1 << (2 * c)));
+        const uint8x16_t b5_0 = vtstq_u8(qh0, bit), b5_1 = vtstq_u8(qh1, bit);
+        *w0 = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(v0, m4), vandq_u8(b5_0, sixteen)));
+        *w1 = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(v1, m4), vandq_u8(b5_1, sixteen)));
     }
 }
+
+/* the fused dot: per activation row, decode each sub-block in registers and dot
+ * at once, the min term in gq_dot_i8's exact fmaf chain and final order. */
+#define C24_DOT_FUSED_K(NAME, BYTES, SB) \
+static void NAME(float *y, int ystride, const uint8_t *row, \
+                 const int8_t *xq, const float *dx, const int32_t *xs, int I, int S) { \
+    for (int s = 0; s < S; s++) { \
+        float32x4_t vacc = vdupq_n_f32(0.f); \
+        float mm = 0.f; \
+        const int8_t *xs8 = xq + (int64_t)s * I; \
+        const float *dxs = dx + (int64_t)s * (I / 32); \
+        const int32_t *xss = xs + (int64_t)s * (I / 16); \
+        int64_t xb = 0; \
+        for (int64_t blk = 0; blk < I / 256; blk++) { \
+            const uint8_t *b = row + blk * (BYTES); \
+            const float d = gq_f16(gq_rd16(b)), dmin = gq_f16(gq_rd16(b + 2)); \
+            for (int ib = 0; ib < 8; ib++, xb++) { \
+                float s2[2], m2[2]; int8x16_t w0, w1; \
+                SB(b, d, dmin, ib, s2, m2, &w0, &w1); \
+                int32x4_t p0, p1; \
+                gq_arm_dot2(w0, w1, vld1q_s8(xs8 + 32 * xb), vld1q_s8(xs8 + 32 * xb + 16), &p0, &p1); \
+                const float dd = dxs[xb]; \
+                vacc = vmlaq_n_f32(vacc, vcvtq_f32_s32(p0), s2[0] * dd); \
+                vacc = vmlaq_n_f32(vacc, vcvtq_f32_s32(p1), s2[1] * dd); \
+                mm = fmaf(dd, fmaf(m2[0], (float)xss[2 * xb], m2[1] * (float)xss[2 * xb + 1]), mm); \
+            } \
+        } \
+        y[(int64_t)s * ystride] = vaddvq_f32(vacc) - mm; \
+    } \
+}
+C24_DOT_FUSED_K(c24_dot_fused_q4_k, 144, c24_sb_q4_k)
+C24_DOT_FUSED_K(c24_dot_fused_q5_k, 176, c24_sb_q5_k)
 
 static double cell_fused(int reps, void *p) {
     Ctx *c = p; const int64_t rb = gq_row_bytes(c->t, c->I); double t0 = now();
@@ -123,6 +157,7 @@ static double cell_fused(int reps, void *p) {
             const uint8_t *row = c->W + (int64_t)o * rb;
             switch (c->t) {
             case GQ_Q4_K:    c24_dot_fused_q4_k(c->y + o, c->O, row, c->a.q, c->a.d, c->a.s, c->I, c->S); break;
+            case GQ_Q5_K:    c24_dot_fused_q5_k(c->y + o, c->O, row, c->a.q, c->a.d, c->a.s, c->I, c->S); break;
             case GQ_IQ2_XXS: gq_dot_arm_iq2_xxs(c->y + o, c->O, row, c->a.q, c->a.d, c->I, c->S); break;
             case GQ_IQ3_XXS: gq_dot_arm_iq3_xxs(c->y + o, c->O, row, c->a.q, c->a.d, c->I, c->S); break;
             default: fprintf(stderr, "no fused kernel for this type\n"); exit(1);
@@ -195,12 +230,13 @@ static void run_shape(const char *name, int t, int I, int O, const int *Ss, int 
      * (same sub-block scales/mins/codes, gq_dot_i8's NEON float order and
      * fmaf min chain). NaN scales compare as "not greater", as in C22. */
     double fused_maxdiff = 0;
-    if (has_fused && t == GQ_Q4_K) {
+    if (has_fused && (t == GQ_Q4_K || t == GQ_Q5_K)) {
         if (gq_act_set(&c.a, c.x, 2, I)) exit(1);
         for (int o = 0; o < 8; o++) {
             float yk[2] = {0, 0}, yp[2] = {0, 0};
             gq_row_all(yk, 1, &c.a, c.W + (int64_t)o * rb, t, I);
-            c24_dot_fused_q4_k(yp, 1, c.W + (int64_t)o * rb, c.a.q, c.a.d, c.a.s, I, c.a.S);
+            if (t == GQ_Q4_K) c24_dot_fused_q4_k(yp, 1, c.W + (int64_t)o * rb, c.a.q, c.a.d, c.a.s, I, c.a.S);
+            else              c24_dot_fused_q5_k(yp, 1, c.W + (int64_t)o * rb, c.a.q, c.a.d, c.a.s, I, c.a.S);
             for (int s = 0; s < 2; s++) {
                 double d = fabs((double)yk[s] - yp[s]);
                 if (d > fused_maxdiff) fused_maxdiff = d;
@@ -263,10 +299,11 @@ int main(void) {
 #endif
     );
     const int Ss[] = { 1, 4, 8, 38, 137, 411, 455 };
-    /* the target: Q4_K_M's expert shapes */
+    /* the target: Q4_K_M's expert shapes -- gate/up Q4_K, down Q5_K (C16 file facts) */
     run_shape("gate_up", GQ_Q4_K, 2048, 512, Ss, 7, threads, 1);
-    run_shape("down",    GQ_Q4_K, 512,  2048, Ss, 7, threads, 1);
+    run_shape("down_q5k", GQ_Q5_K, 512,  2048, Ss, 7, threads, 1);
     /* straggler sizing: the IQ3 file's early-layer types (no fused candidate yet) */
+    run_shape("down_q4k_stray", GQ_Q4_K, 512, 2048, Ss, 7, threads, 1);
     run_shape("gate_up_q2k", GQ_Q2_K,  2048, 512, Ss, 7, threads, 0);
     run_shape("down_q2k",    GQ_Q2_K,  512,  2048, Ss, 7, threads, 0);
     run_shape("gate_up_q3k", GQ_Q3_K,  2048, 512, Ss, 7, threads, 0);

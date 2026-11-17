@@ -1900,6 +1900,59 @@ GQ_SB_ARM void gq_arm_sb_iq3_s(const uint8_t *b, float d, int ib, float *s, int8
     }
     *w0 = vcombine_s8(g[0], g[1]); *w1 = vcombine_s8(g[2], g[3]);
 }
+/* C24: Q4_K the same way (the Q4_K_M container's expert type, and the min-term
+ * K-quant the C22 family skipped). The codes are UNSIGNED nibbles 0..15 (no -8
+ * offset: the min carries it via the activation's per-16 sums), one scale/min
+ * pair per 32 from gq_scale_min_k4. Sub-block ib: one nibble half of the 32
+ * bytes qs + (ib>>1)*32 -- even ib low nibble, odd ib high -- exactly as the
+ * NEON unpack stores them; the min term rides gq_dot_i8's explicit fmaf chain
+ * (bench-verified bit-exact: phaseC24_bench_*, 2.22-2.26x / 1.98x at S == 1). */
+GQ_SB_ARM void gq_arm_sbk_q4_k(const uint8_t *b, float d, float dmin, int ib,
+                               float *s2, float *m2, int8x16_t *w0, int8x16_t *w1) {
+    const uint8_t *sc = b + 4, *qs = b + 16;
+    int s, m; gq_scale_min_k4(sc, ib, &s, &m);
+    s2[0] = s2[1] = d * (float)s;
+    m2[0] = m2[1] = dmin * (float)m;
+    const uint8_t *q = qs + (ib >> 1) * 32;
+    const uint8x16_t m4 = vdupq_n_u8(0x0F);
+    const uint8x16_t v0 = vld1q_u8(q), v1 = vld1q_u8(q + 16);
+    if (ib & 1) {   /* odd sub-block: the high nibbles */
+        *w0 = vreinterpretq_s8_u8(vshrq_n_u8(v0, 4));
+        *w1 = vreinterpretq_s8_u8(vshrq_n_u8(v1, 4));
+    } else {        /* even sub-block: the low nibbles */
+        *w0 = vreinterpretq_s8_u8(vandq_u8(v0, m4));
+        *w1 = vreinterpretq_s8_u8(vandq_u8(v1, m4));
+    }
+}
+/* C24: Q5_K (Q4_K_M's down-projection type, 176 B) -- Q4_K plus the 5th code
+ * bit from qh@16 (element j of chunk c = byte j, bit 2c for the even sub-block,
+ * 2c+1 for the odd one; bit index == the sub-block index either way), codes
+ * unsigned 0..31, the same scale/min pairs and min term. The qh bit test makes
+ * this decoder costlier than Q4_K's, so the fused gain is 1.20x at S == 1
+ * (bench-verified bit-exact, phaseC24_bench_*). */
+GQ_SB_ARM void gq_arm_sbk_q5_k(const uint8_t *b, float d, float dmin, int ib,
+                               float *s2, float *m2, int8x16_t *w0, int8x16_t *w1) {
+    const uint8_t *sc = b + 4, *qh = b + 16, *qs = b + 48;
+    int s, m; gq_scale_min_k4(sc, ib, &s, &m);
+    s2[0] = s2[1] = d * (float)s;
+    m2[0] = m2[1] = dmin * (float)m;
+    const int c = ib >> 1;
+    const uint8_t *q = qs + 32 * c;
+    const uint8x16_t m4 = vdupq_n_u8(0x0F), sixteen = vdupq_n_u8(16);
+    const uint8x16_t qh0 = vld1q_u8(qh), qh1 = vld1q_u8(qh + 16);
+    const uint8x16_t v0 = vld1q_u8(q), v1 = vld1q_u8(q + 16);
+    if (ib & 1) {   /* odd sub-block: high nibbles, qh bit 2c+1 */
+        const uint8x16_t bit = vdupq_n_u8((uint8_t)(1 << (2 * c + 1)));
+        const uint8x16_t b5_0 = vtstq_u8(qh0, bit), b5_1 = vtstq_u8(qh1, bit);
+        *w0 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(v0, 4), vandq_u8(b5_0, sixteen)));
+        *w1 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(v1, 4), vandq_u8(b5_1, sixteen)));
+    } else {        /* even sub-block: low nibbles, qh bit 2c */
+        const uint8x16_t bit = vdupq_n_u8((uint8_t)(1 << (2 * c)));
+        const uint8x16_t b5_0 = vtstq_u8(qh0, bit), b5_1 = vtstq_u8(qh1, bit);
+        *w0 = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(v0, m4), vandq_u8(b5_0, sixteen)));
+        *w1 = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(v1, m4), vandq_u8(b5_1, sixteen)));
+    }
+}
 GQ_SB_ARM void gq_arm_dot2(const int8x16_t w0, const int8x16_t w1, const int8x16_t x0, const int8x16_t x1,
                            int32x4_t *p0, int32x4_t *p1) {   /* gq_dot_i8's lines, its two builds */
 #if defined(__ARM_FEATURE_DOTPROD)
@@ -1932,6 +1985,37 @@ GQ_DOT_GRID_ARM(gq_dot_arm_iq2_xxs, 66, gq_arm_sb_iq2_xxs)
 GQ_DOT_GRID_ARM(gq_dot_arm_iq3_xxs, 98, gq_arm_sb_iq3_xxs)
 GQ_DOT_GRID_ARM(gq_dot_arm_iq2_s, 82, gq_arm_sb_iq2_s)
 GQ_DOT_GRID_ARM(gq_dot_arm_iq3_s, 110, gq_arm_sb_iq3_s)
+/* C24: Q4_K/Q5_K's fused dot — the C22 structure plus gq_dot_i8's min term in
+ * its exact fmaf chain and final order (vaddvq minus the min accumulator). */
+#define GQ_DOT_K_ARM(NAME, BYTES, SB) \
+static void NAME(float *y, int ystride, const uint8_t *row, \
+                 const int8_t *xq, const float *dx, const int32_t *xs, int I, int S) { \
+    for (int s = 0; s < S; s++) { \
+        float32x4_t vacc = vdupq_n_f32(0.f); \
+        float mm = 0.f; \
+        const int8_t *xs8 = xq + (int64_t)s * I; \
+        const float *dxs = dx + (int64_t)s * (I / 32); \
+        const int32_t *xss = xs + (int64_t)s * (I / 16); \
+        int64_t xb = 0; \
+        for (int64_t blk = 0; blk < I / 256; blk++) { \
+            const uint8_t *b = row + blk * (BYTES); \
+            const float d = gq_f16(gq_rd16(b)), dmin = gq_f16(gq_rd16(b + 2)); \
+            for (int ib = 0; ib < 8; ib++, xb++) { \
+                float s2[2], m2[2]; int8x16_t w0, w1; \
+                SB(b, d, dmin, ib, s2, m2, &w0, &w1); \
+                int32x4_t p0, p1; \
+                gq_arm_dot2(w0, w1, vld1q_s8(xs8 + 32 * xb), vld1q_s8(xs8 + 32 * xb + 16), &p0, &p1); \
+                const float dd = dxs[xb]; \
+                vacc = vmlaq_n_f32(vacc, vcvtq_f32_s32(p0), s2[0] * dd); \
+                vacc = vmlaq_n_f32(vacc, vcvtq_f32_s32(p1), s2[1] * dd); \
+                mm = fmaf(dd, fmaf(m2[0], (float)xss[2 * xb], m2[1] * (float)xss[2 * xb + 1]), mm); \
+            } \
+        } \
+        y[(int64_t)s * ystride] = vaddvq_f32(vacc) - mm; \
+    } \
+}
+GQ_DOT_K_ARM(gq_dot_arm_q4_k, 144, gq_arm_sbk_q4_k)
+GQ_DOT_K_ARM(gq_dot_arm_q5_k, 176, gq_arm_sbk_q5_k)
 #endif
 static inline void gq_row_all(float *y, int ystride, const gq_act *a, const uint8_t *row, int t, int I) {
 #ifdef GQ_VNNI512
@@ -1961,12 +2045,13 @@ static inline void gq_row_all(float *y, int ystride, const gq_act *a, const uint
 #else
 #if defined(__ARM_NEON) && defined(__aarch64__) && !defined(__AVX2__)
     /* the fused grid dots: a weight row's registers, no unpack buffer. The XXS types
-     * at any S (dec1 serves their S > 1), and C22: IQ2_S/IQ3_S at S == 1 only -- the
-     * decode regime, where the generic unpack path measured 13-14 GFLOPS against the
-     * fused kernels' 29.5/24.2 flat (bit-exact, phaseC22_bench_*); from S = 4 the
-     * generic path is already faster, so it keeps every other S. */
+     * at any S (dec1 serves their S > 1), and C22/C24: IQ2_S/IQ3_S and Q4_K at
+     * S == 1 only -- the decode regime, where the generic unpack path measured
+     * 13-18/23 GFLOPS against the fused kernels' 29.5/24.2 (C22) and 40-42/47-52
+     * (C24, bit-exact, phaseC22/phaseC24_bench_*); from S = 4 the generic path
+     * rides gq_rows_f8 and is already faster, so it keeps every other S. */
     if (((t == GQ_IQ2_XXS || t == GQ_IQ3_XXS) ||
-         ((t == GQ_IQ2_S || t == GQ_IQ3_S) && a->S == 1 && gq_fuse())) && I % 256 == 0) {
+         ((t == GQ_IQ2_S || t == GQ_IQ3_S || t == GQ_Q4_K || t == GQ_Q5_K) && a->S == 1 && gq_fuse())) && I % 256 == 0) {
         /* C18 decode-once (Q36_EXPERT_DEC1): one grid decode serves every activation
          * row. The float steps are the fused kernel's, in its order, so the bits are
          * the fused kernel's. Stack scratch is bounded: the gate needs I % 256 == 0
@@ -2005,6 +2090,8 @@ static inline void gq_row_all(float *y, int ystride, const gq_act *a, const uint
         if (t == GQ_IQ2_XXS)      gq_dot_arm_iq2_xxs(y, ystride, row, a->q, a->d, I, a->S);
         else if (t == GQ_IQ3_XXS) gq_dot_arm_iq3_xxs(y, ystride, row, a->q, a->d, I, a->S);
         else if (t == GQ_IQ2_S)   gq_dot_arm_iq2_s(y, ystride, row, a->q, a->d, I, a->S);
+        else if (t == GQ_Q4_K)    gq_dot_arm_q4_k(y, ystride, row, a->q, a->d, a->s, I, a->S);
+        else if (t == GQ_Q5_K)    gq_dot_arm_q5_k(y, ystride, row, a->q, a->d, a->s, I, a->S);
         else                      gq_dot_arm_iq3_s(y, ystride, row, a->q, a->d, I, a->S);
         return;
     }
