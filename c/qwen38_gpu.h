@@ -62,6 +62,39 @@ int q38_ple_gate(q36_tensor *gated, q36_tensor *normv, q36_tensor *keys, q36_ten
 int q38_ple_conv(q36_tensor *out, q36_tensor *ring, q36_tensor *snap, q36_tensor *gated,
                  q36_tensor *normv, q36_tensor *conv, const q38_ple_shape *s);
 
+/* QSA, the sparse attention of Qwen3.8's indexer layers: qwen38_core.h's q38_attention and
+ * shaders/chain_qsa.comp (pool, score, select) / chain_attn.comp (attention over the list).
+ * rope(x, pos) is q38_rope: the first `rotary` dims, pairs (i, i + rotary/2), angle
+ * pos / theta^(2i/rotary) (the base powf'd on the host, as the CPU does). rms0 is q38_rms0:
+ * x * rsqrt(mean(x^2) + eps) * (1 + w). Row s of a step is at position pos_base + s and sees
+ * nblk(s) = (pos_base + s + 1) / R complete blocks of R index keys. */
+typedef struct { int IQ, ID, R, budget, rotary; float theta, eps; } q38_qsa_shape;
+/* pool blocks [b0, b0+nb): pk[b] = rope(rms0(mean_{r<R} ikraw[b*R+r], idx_kn), pos = b*R).
+ * ikraw is [positions][ID] (at least (b0+nb)*R rows), pk [blocks][ID]. ID <= 256. One
+ * 256-thread group a block, fixed-order sums: exact and fast are the same kernel. */
+int q38_qsa_pool(q36_tensor *pk, q36_tensor *ikraw, q36_tensor *idx_kn, int b0, int nb, const q38_qsa_shape *s);
+/* score: sc[s*nbmax + b] = sum_h max(0, dot(q[s][h], pk[b])) / sqrt(ID) for b < nblk(s); the
+ * rest of the row is not written. q is [S][IQ][ID], already rms0'd and roped (the indexer
+ * queries); nbmax >= nblk(S-1). One thread a (s, b), dots in d order, both modes. */
+int q38_qsa_score(q36_tensor *sc, q36_tensor *q, q36_tensor *pk, int S, int pos_base, int nbmax, const q38_qsa_shape *s);
+/* select per row (sel row s at s*sel_row): take = min(nblk, budget/R) blocks by score desc,
+ * ties -> lower block (q38_block_desc); sel[s] = [count, positions...]: each taken block's R
+ * positions in rank order, then the tail nblk*R .. pos; count = -1 when take == nblk (every
+ * position 0..pos, contiguous). Scores must be >= 0 and not NaN (their bits are ranked).
+ * One 256-thread group a row: a radix select of the cutoff, then a bitonic sort of the taken
+ * blocks, so the list is the CPU's exactly. budget/R <= 2048; sel_row >= budget/R*R + R. */
+int q38_qsa_select(q36_tensor *sel, q36_tensor *sc, int S, int pos_base, int nbmax, int sel_row, const q38_qsa_shape *s);
+/* attention over the selection, per row s and query head h (KV head h / (heads/kv_heads)):
+ * softmax_j(q[s][h] . K[sel_j] / sqrt(D)) . V[sel_j], then *= sigmoid(gate[s][h]). q (already
+ * rms0'd and roped), gate and out are [S][heads][D]; kc, vc [kv_heads][cap][D] floats, or
+ * halves when kv_half. A count of -1 means positions 0..pos_base+s. Online softmax over tiles
+ * of 256 positions in list order, fixed-order sums: exact and fast are the same kernel.
+ * D <= 256. (pos_base and cap are not in the plan's signature; the contiguous rows and the
+ * cache layout need them.) */
+int q38_attn_sel(q36_tensor *out, q36_tensor *q, q36_tensor *gate, q36_tensor *kc, q36_tensor *vc,
+                 q36_tensor *sel, int S, int pos_base, int heads, int kv_heads, int D, int cap, int sel_row,
+                 int kv_half);
+
 #ifdef __cplusplus
 }
 #endif

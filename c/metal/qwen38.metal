@@ -235,3 +235,276 @@ kernel void q38_ple_conv(device float *out [[buffer(0)]],
     }
     for (uint j = 0; j < SL; j++) rd[j] = rg[j];
 }
+
+/* ---- QSA: block keys, scores, selection, sparse attention ----------------- */
+/* qwen38_core.h's q38_attention (the indexer at 3482-3533, attention at 3543-3590) and
+ * shaders/chain_qsa.comp / chain_attn.comp. rope is q38_rope: the first `rotary` dims, pairs
+ * (i, i + half), angle pos / base[i] with base[i] = theta^(2i/rotary) powf'd on the host (the
+ * CPU's bits). The division is rounded correctly (a reciprocal and one fma correction), as
+ * the CPU's float division is: one ulp of an angle near 9000 is 1e-3 radians. */
+struct q38_rope_table { float base[128], inv[128]; };
+
+static inline float q38_rope_angle(float pos, float base, float inv) {
+    float q0 = pos * inv;
+    float r = fma(-q0, base, pos);
+    return fma(r, inv, q0);
+}
+
+/* pk[b] = rope(rms0(mean_{r<R} ik[b*R+r], kn), b*R), b = b0 + group. One 256-thread group a
+ * block, thread d < ID one dim; the mean sums raw/R in r order from 0 as the CPU does. */
+struct q38_pool_args { uint ID, R, b0, half_; float eps; };
+
+kernel void q38_qsa_pool(device const float *ik [[buffer(0)]],
+                         device const float *kn [[buffer(1)]],
+                         device float *pk [[buffer(2)]],
+                         constant q38_pool_args &p [[buffer(3)]],
+                         constant q38_rope_table &rt [[buffer(4)]],
+                         uint g [[threadgroup_position_in_grid]],
+                         uint t [[thread_index_in_threadgroup]]) {
+    threadgroup float pool[256], part[256], sum;
+    uint b = p.b0 + g;
+    float v = 0.0f;
+    if (t < p.ID) {
+        for (uint r = 0; r < p.R; r++) v += ik[((ulong)b * p.R + r) * p.ID + t] / (float)p.R;
+    }
+    float rr = 1.0f / sqrt(q38_tg_sum256(part, &sum, v * v, t) / (float)p.ID + p.eps);
+    if (t < p.ID) pool[t] = v * rr * (1.0f + kn[t]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (t >= p.ID) return;
+    float x = pool[t];
+    float pos = (float)(b * p.R);
+    if (t < p.half_) {
+        float ang = q38_rope_angle(pos, rt.base[t], rt.inv[t]);
+        x = pool[t] * cos(ang) - pool[t + p.half_] * sin(ang);
+    } else if (t < 2 * p.half_) {
+        uint i = t - p.half_;
+        float ang = q38_rope_angle(pos, rt.base[i], rt.inv[i]);
+        x = pool[t] * cos(ang) + pool[i] * sin(ang);
+    }
+    pk[(ulong)b * p.ID + t] = x;
+}
+
+/* sc[s*nbmax + b] = sum_h max(0, q[s][h] . pk[b]) / sqrt(ID) for b < nblk(s): one thread a
+ * (b, s), each dot in d order (both modes). */
+struct q38_score_args { uint ID, R, S, pos_base, IQ, nbmax; };
+
+kernel void q38_qsa_score(device const float *q [[buffer(0)]],
+                          device const float *pk [[buffer(1)]],
+                          device float *sc [[buffer(2)]],
+                          constant q38_score_args &p [[buffer(3)]],
+                          uint2 id [[thread_position_in_grid]]) {
+    uint b = id.x, s = id.y;
+    if (s >= p.S || b >= (p.pos_base + s + 1) / p.R) return;
+    device const float *qs = q + (ulong)s * p.IQ * p.ID, *kb = pk + (ulong)b * p.ID;
+    float score = 0.0f;
+    for (uint h = 0; h < p.IQ; h++) {
+        float a = 0.0f;
+        for (uint d = 0; d < p.ID; d++) a = fma(qs[h * p.ID + d], kb[d], a);
+        if (a > 0.0f) score += a;
+    }
+    sc[(ulong)s * p.nbmax + b] = score / sqrt((float)p.ID);
+}
+
+/* The selection, one 256-thread group a row s at pos = pos_base + s: visible = pos + 1,
+ * blocks = visible / R, take = min(blocks, budget / R). take == blocks: sel = [-1] (every
+ * position). Otherwise chain_qsa.comp's radix select (a byte a pass from the top over the
+ * score bits, which order like the scores: they are >= 0) finds the last block taken's score
+ * and how many blocks with that score are taken (the lowest ones); the taken blocks are then
+ * sorted as q38_block_desc orders them (score desc, block asc) by a bitonic sort of the keys
+ * bits << 32 | ~block, so sel = [count, the blocks' R positions in rank order, the tail]. */
+#define Q38_SEL_MAX 2048
+struct q38_select_args { uint R, S, pos_base, budget, nbmax, sel_row; };
+
+/* The inclusive prefix sum of v over the 256 threads, in thread order. Uniform control flow. */
+static inline uint q38_scan256(threadgroup uint *sums, uint v, uint t) {
+    sums[t] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint off = 1; off < 256; off <<= 1) {
+        uint a = t >= off ? sums[t - off] : 0u;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        sums[t] += a;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    uint r = sums[t];
+    threadgroup_barrier(mem_flags::mem_threadgroup);   /* sums is reused by the next scan */
+    return r;
+}
+
+kernel void q38_qsa_select(device const float *sc [[buffer(0)]],
+                           device int *sel [[buffer(1)]],
+                           constant q38_select_args &p [[buffer(2)]],
+                           uint g [[threadgroup_position_in_grid]],
+                           uint t [[thread_index_in_threadgroup]]) {
+    threadgroup atomic_uint hist[256];
+    threadgroup uint sums[256];
+    threadgroup uint picked_digit, picked_take;
+    threadgroup ulong keys[Q38_SEL_MAX];
+    uint visible = p.pos_base + g + 1, blocks = visible / p.R, take = min(blocks, p.budget / p.R);
+    device int *row = sel + (ulong)g * p.sel_row;
+    device const uint *bits = (device const uint *)(sc + (ulong)g * p.nbmax);
+    if (take >= blocks) {
+        if (t == 0) row[0] = -1;
+        return;
+    }
+    uint cutoff = 0u, mask = 0u, to_take = take;
+    if (take > 0) {
+        for (uint pass = 0; pass < 4; pass++) {
+            uint shift = (3u - pass) * 8u;
+            atomic_store_explicit(&hist[t], 0u, memory_order_relaxed);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint b = t; b < blocks; b += 256) {
+                uint u = bits[b];
+                if ((u & mask) == cutoff) atomic_fetch_add_explicit(&hist[(u >> shift) & 255u], 1u, memory_order_relaxed);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint bin = 255u - t, count = atomic_load_explicit(&hist[bin], memory_order_relaxed);
+            uint above = q38_scan256(sums, count, t) - count;   /* blocks in the bins above this one */
+            if (above < to_take && to_take <= above + count) {
+                picked_digit = bin;
+                picked_take = to_take - above;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            cutoff |= picked_digit << shift;
+            mask |= 255u << shift;
+            to_take = picked_take;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+    /* Thread t's contiguous run of blocks: the ties taken are the lowest blocks. */
+    uint per = (blocks + 255u) / 256u, first = t * per, end = min(blocks, first + per);
+    uint higher = 0u, ties = 0u;
+    if (take > 0) {
+        for (uint b = first; b < end; b++) {
+            uint u = bits[b];
+            higher += u > cutoff ? 1u : 0u;
+            ties += u == cutoff ? 1u : 0u;
+        }
+    }
+    uint ties_before = q38_scan256(sums, ties, t) - ties;
+    uint ties_taken = to_take > ties_before ? min(ties, to_take - ties_before) : 0u;
+    uint slot = q38_scan256(sums, higher + ties_taken, t) - higher - ties_taken;
+    if (take > 0) {
+        for (uint b = first; b < end; b++) {
+            uint u = bits[b];
+            bool tie = u == cutoff && ties_taken > 0u;
+            if (tie) ties_taken--;
+            if (u > cutoff || tie) keys[slot++] = (ulong(u) << 32) | ulong(0xffffffffu - b);
+        }
+    }
+    uint P = 1u;
+    while (P < take) P <<= 1;
+    for (uint i = take + t; i < P; i += 256) keys[i] = 0ul;   /* below every real key */
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint k = 2; k <= P; k <<= 1) {
+        for (uint j = k >> 1; j > 0; j >>= 1) {
+            for (uint i = t; i < P; i += 256) {
+                uint l = i ^ j;
+                if (l > i) {
+                    ulong a = keys[i], c = keys[l];
+                    bool down = (i & k) == 0u;   /* the whole list ends descending */
+                    if (down ? a < c : a > c) { keys[i] = c; keys[l] = a; }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+    for (uint i = t; i < take * p.R; i += 256) {
+        uint blk = 0xffffffffu - uint(keys[i / p.R] & 0xfffffffful);
+        row[1 + i] = int(blk * p.R + i % p.R);
+    }
+    uint tail = visible - blocks * p.R;
+    for (uint i = t; i < tail; i += 256) row[1 + take * p.R + i] = int(blocks * p.R + i);
+    if (t == 0) row[0] = int(take * p.R + tail);
+}
+
+/* Attention over a row's list, one 256-thread group a (head h, row s), KV head h / (heads /
+ * kv_heads): thread i scores the tile's position i (q . k in d order, / sqrt(D) as the CPU),
+ * an online softmax over tiles of 256 (fixed-order max and sum), thread d < D accumulates
+ * p_j v_j[d] in list order; out = acc / l * sigmoid(gate). Count -1: positions 0..pos. */
+struct q38_attn_args { uint S, pos_base, heads, kv_heads, D, cap, sel_row; };
+
+static inline float q38_tg_max256(threadgroup float *part, threadgroup float *out, float v, uint t) {
+    part[t] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (t == 0) {
+        float m = part[0];
+        for (uint l = 1; l < 256; l++) m = max(m, part[l]);
+        *out = m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float m = *out;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return m;
+}
+
+template <typename KT>
+static inline void q38_attn_sel_body(device const float *q, device const float *gate, device const KT *kc,
+                                     device const KT *vc, device const int *sel, device float *out,
+                                     constant q38_attn_args &p, uint h, uint s, uint t,
+                                     threadgroup float *qs, threadgroup float *pe, threadgroup uint *pt,
+                                     threadgroup float *part, threadgroup float *red) {
+    uint kvh = h / (p.heads / p.kv_heads), D = p.D;
+    ulong qo = ((ulong)s * p.heads + h) * D;
+    if (t < D) qs[t] = q[qo + t];
+    device const int *row = sel + (ulong)s * p.sel_row;
+    int c = row[0];
+    bool list = c >= 0;
+    uint n = list ? min(uint(c), p.sel_row - 1) : p.pos_base + s + 1;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    ulong kbase = (ulong)kvh * p.cap;
+    float m = -INFINITY, l = 0.0f, acc = 0.0f, sd = sqrt((float)D);
+    for (uint t0 = 0; t0 < n; t0 += 256) {
+        uint i = t0 + t;
+        float sv = -INFINITY;
+        if (i < n) {
+            uint pos = list ? uint(row[1 + i]) : i;
+            pt[t] = pos;
+            device const KT *kr = kc + (kbase + pos) * D;
+            float a = 0.0f;
+            for (uint d = 0; d < D; d++) a = fma(qs[d], float(kr[d]), a);
+            sv = a / sd;
+        }
+        float mn = max(m, q38_tg_max256(part, red, sv, t));
+        float e = i < n ? exp(sv - mn) : 0.0f;
+        pe[t] = e;
+        float ts = q38_tg_sum256(part, red, e, t);   /* its barriers publish pe and pt */
+        float corr = exp(m - mn);
+        l = l * corr + ts;
+        acc *= corr;
+        uint cnt = min(256u, n - t0);
+        if (t < D) {
+            for (uint j = 0; j < cnt; j++) acc = fma(pe[j], float(vc[(kbase + pt[j]) * D + t]), acc);
+        }
+        m = mn;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (t < D) out[qo + t] = (l > 0.0f ? acc / l : 0.0f) * q38_sigmoid(gate[qo + t]);
+}
+
+kernel void q38_attn_sel(device const float *q [[buffer(0)]],
+                         device const float *gate [[buffer(1)]],
+                         device const float *kc [[buffer(2)]],
+                         device const float *vc [[buffer(3)]],
+                         device const int *sel [[buffer(4)]],
+                         device float *out [[buffer(5)]],
+                         constant q38_attn_args &p [[buffer(6)]],
+                         uint2 g [[threadgroup_position_in_grid]],
+                         uint t [[thread_index_in_threadgroup]]) {
+    threadgroup float qs[256], pe[256], part[256], red;
+    threadgroup uint pt[256];
+    q38_attn_sel_body<float>(q, gate, kc, vc, sel, out, p, g.x, g.y, t, qs, pe, pt, part, &red);
+}
+
+kernel void q38_attn_sel_half(device const float *q [[buffer(0)]],
+                              device const float *gate [[buffer(1)]],
+                              device const half *kc [[buffer(2)]],
+                              device const half *vc [[buffer(3)]],
+                              device const int *sel [[buffer(4)]],
+                              device float *out [[buffer(5)]],
+                              constant q38_attn_args &p [[buffer(6)]],
+                              uint2 g [[threadgroup_position_in_grid]],
+                              uint t [[thread_index_in_threadgroup]]) {
+    threadgroup float qs[256], pe[256], part[256], red;
+    threadgroup uint pt[256];
+    q38_attn_sel_body<half>(q, gate, kc, vc, sel, out, p, g.x, g.y, t, qs, pe, pt, part, &red);
+}

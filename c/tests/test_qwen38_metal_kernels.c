@@ -720,6 +720,332 @@ static void test_ple_declines(void) {
     q36_tensor_free(big); q36_tensor_free(y); q36_tensor_free(z); q36_tensor_free(small);
 }
 
+/* ---- QSA: block-key pooling, scoring, selection, sparse attention -------- */
+/* References: qwen38_core.h's q38_attention (QSA 3482-3533, attention 3543-3590), q38_rope,
+ * q38_rms0, q38_block_desc, ported into doubles. */
+
+static const float QSA_THETA = 1e7f, QSA_EPS = 1e-6f;
+
+/* q38_rope on doubles; the angle in float as the CPU makes it (powf base, float division).
+ * mag (when not NULL) gets the rotated pairs' sum |terms| + 1e-3 (the default elsewhere). */
+static void ref_rope(double *x, double *mag, int dim, int rotary, int pos, float theta) {
+    int half = rotary / 2;
+    if (mag)
+        for (int d = 0; d < dim; d++) mag[d] = fabs(x[d]) + 1e-3;
+    for (int i = 0; i < half; i++) {
+        float base = powf(theta, (float)(2 * i) / rotary);
+        float ang = (float)pos / base;
+        double co = cos((double)ang), si = sin((double)ang), a = x[i], b = x[i + half];
+        x[i] = a * co - b * si;
+        x[i + half] = b * co + a * si;
+        if (mag) {
+            mag[i] = fabs(a * co) + fabs(b * si) + 1e-3;
+            mag[i + half] = fabs(b * co) + fabs(a * si) + 1e-3;
+        }
+    }
+    if (mag)   /* the non-rotated tail keeps |ref| + 1e-3 */
+        for (int d = 2 * half; d < dim; d++) mag[d] = fabs(x[d]) + 1e-3;
+}
+
+static q38_qsa_shape qsa_shape(int IQ, int ID, int R, int budget, int rotary) {
+    q38_qsa_shape s = {IQ, ID, R, budget, rotary, QSA_THETA, QSA_EPS};
+    return s;
+}
+
+/* pk[b] = rope(rms0(mean_r ik[b*R+r], kn), b*R) for b in [b0, b0+nb). */
+static void test_qsa_pool(int ID, int R, int rotary, int b0, int nb, int exact) {
+    q36_gpu_set_exact(exact);
+    q38_qsa_shape sh = qsa_shape(4, ID, R, 2048, rotary);
+    int nbk = b0 + nb;
+    q36_tensor *ik = rand_tensor((size_t)nbk * R * ID, 2.0f), *kn = rand_tensor((size_t)ID, 0.5f);
+    q36_tensor *pk = q36_tensor_new((size_t)nbk * ID * sizeof(float));
+    for (size_t i = 0; i < (size_t)nbk * ID; i++) F(pk)[i] = NAN;
+    size_t n = (size_t)nb * ID;
+    double *ref = malloc(n * sizeof(double)), *mag = malloc(n * sizeof(double));
+    for (int k = 0; k < nb; k++) {
+        int b = b0 + k;
+        double *x = ref + (size_t)k * ID, ss = 0;
+        for (int d = 0; d < ID; d++) {
+            double v = 0;
+            for (int r = 0; r < R; r++) v += (double)F(ik)[((size_t)b * R + r) * ID + d] / R;
+            x[d] = v;
+            ss += v * v;
+        }
+        double rr = 1.0 / sqrt(ss / ID + QSA_EPS);
+        for (int d = 0; d < ID; d++) x[d] = x[d] * rr * (1.0 + F(kn)[d]);
+        ref_rope(x, mag + (size_t)k * ID, ID, rotary, b * R, QSA_THETA);
+    }
+    int ok = q38_qsa_pool(pk, ik, kn, b0, nb, &sh);
+    sync_or_die();
+    char name[96];
+    snprintf(name, sizeof name, "qsa_pool ID=%d R=%d b%d+%d %s", ID, R, b0, nb, exact ? "exact" : "fast");
+    if (!ok) expect(name, 0);
+    else check(name, F(pk) + (size_t)b0 * ID, ref, mag, n, exact ? 1e-5 : 3e-4);
+    int untouched = 1;   /* blocks below b0 are not written */
+    for (size_t i = 0; i < (size_t)b0 * ID; i++) untouched = untouched && isnan(F(pk)[i]);
+    snprintf(name, sizeof name, "qsa_pool b%d+%d leaves below b0 %s", b0, nb, exact ? "exact" : "fast");
+    if (b0) expect(name, untouched);
+    free(ref); free(mag);
+    q36_tensor_free(ik); q36_tensor_free(kn); q36_tensor_free(pk);
+}
+
+/* sc[s][b] = sum_h max(0, q[s][h] . pk[b]) / sqrt(ID), b < nblk(s); scale sum |q pk| / sqrt(ID). */
+static void test_qsa_score(int IQ, int ID, int R, int S, int pos_base, int exact) {
+    q36_gpu_set_exact(exact);
+    q38_qsa_shape sh = qsa_shape(IQ, ID, R, 2048, ID / 2);
+    int nbmax = (pos_base + S) / R;
+    q36_tensor *q = rand_tensor((size_t)S * IQ * ID, 1.0f), *pk = rand_tensor((size_t)nbmax * ID, 1.0f);
+    q36_tensor *sc = q36_tensor_new((size_t)S * nbmax * sizeof(float));
+    for (size_t i = 0; i < (size_t)S * nbmax; i++) F(sc)[i] = NAN;
+    size_t cnt = 0;
+    double *ref = malloc((size_t)S * nbmax * sizeof(double)), *mag = malloc((size_t)S * nbmax * sizeof(double));
+    float *got = malloc((size_t)S * nbmax * sizeof(float));
+    int ok = q38_qsa_score(sc, q, pk, S, pos_base, nbmax, &sh);
+    sync_or_die();
+    int untouched = 1;
+    for (int s = 0; s < S; s++) {
+        int nblk = (pos_base + s + 1) / R;
+        for (int b = 0; b < nbmax; b++) {
+            if (b >= nblk) { untouched = untouched && isnan(F(sc)[(size_t)s * nbmax + b]); continue; }
+            double score = 0, m = 0;
+            for (int h = 0; h < IQ; h++) {
+                double a = 0;
+                for (int d = 0; d < ID; d++) {
+                    double t = (double)F(q)[((size_t)s * IQ + h) * ID + d] * F(pk)[(size_t)b * ID + d];
+                    a += t;
+                    m += fabs(t);
+                }
+                if (a > 0) score += a;
+            }
+            ref[cnt] = score / sqrt((double)ID);
+            mag[cnt] = m / sqrt((double)ID) + 1e-3;
+            got[cnt++] = F(sc)[(size_t)s * nbmax + b];
+        }
+    }
+    char name[96];
+    snprintf(name, sizeof name, "qsa_score IQ=%d ID=%d S=%d pos%d %s", IQ, ID, S, pos_base, exact ? "exact" : "fast");
+    if (!ok) expect(name, 0);
+    else check(name, got, ref, mag, cnt, exact ? 2e-5 : 3e-4);
+    snprintf(name, sizeof name, "qsa_score S=%d pos%d past nblk unwritten %s", S, pos_base, exact ? "exact" : "fast");
+    expect(name, ok && untouched);
+    free(ref); free(mag); free(got);
+    q36_tensor_free(q); q36_tensor_free(pk); q36_tensor_free(sc);
+}
+
+typedef struct { float score; int block; } ref_block;
+static int ref_block_desc(const void *aa, const void *bb) {   /* q38_block_desc */
+    const ref_block *a = aa, *b = bb;
+    if (a->score > b->score) return -1;
+    if (a->score < b->score) return 1;
+    return a->block - b->block;
+}
+
+/* The CPU's selection of the row at pos (q38_attention 3519-3530): n positions into list,
+ * in its order; *all set when take == blocks (the GPU's count -1). */
+static int ref_select(int *list, int *all, const float *scr, int pos, int R, int budget) {
+    int visible = pos + 1, blocks = visible / R, tail = blocks * R, cap = budget / R;
+    int take = blocks < cap ? blocks : cap, n = 0;
+    ref_block *rk = malloc(sizeof(ref_block) * (size_t)(blocks ? blocks : 1));
+    for (int b = 0; b < blocks; b++) rk[b] = (ref_block){scr[b], b};
+    if (blocks) qsort(rk, (size_t)blocks, sizeof(ref_block), ref_block_desc);
+    for (int z = 0; z < take; z++)
+        for (int r = 0; r < R; r++) list[n++] = rk[z].block * R + r;
+    for (int t = tail; t < visible; t++) list[n++] = t;
+    *all = take == blocks;
+    free(rk);
+    return n;
+}
+
+static int qsa_sel_row(int R, int budget) { return budget / R * R + R; }
+
+/* q38_qsa_select over the scores sch (S x nbmax) against ref_select, row by row: identical
+ * lists, and count -1 exactly where the CPU takes every block (its list then a permutation
+ * of 0..pos). */
+static void run_select(const char *what, const float *sch, int S, int pos_base, int nbmax, int R, int budget, int exact) {
+    q36_gpu_set_exact(exact);
+    q38_qsa_shape sh = qsa_shape(4, 4, R, budget, 2);
+    int sel_row = qsa_sel_row(R, budget);
+    q36_tensor *sc = q36_tensor_new((size_t)S * nbmax * sizeof(float) + 4);
+    q36_tensor *sel = q36_tensor_new((size_t)S * sel_row * sizeof(int));
+    memcpy(F(sc), sch, (size_t)S * nbmax * sizeof(float));
+    int *gs = q36_tensor_data(sel);
+    for (size_t i = 0; i < (size_t)S * sel_row; i++) gs[i] = 0x7eadbeef;
+    int ok = q38_qsa_select(sel, sc, S, pos_base, nbmax, sel_row, &sh);
+    sync_or_die();
+    int *list = malloc(sizeof(int) * (size_t)sel_row), *seen = calloc((size_t)(pos_base + S + 1), sizeof(int));
+    int same = ok, contig = 0, lists = 0;
+    for (int s = 0; s < S && same; s++) {
+        int pos = pos_base + s, all, n = ref_select(list, &all, sch + (size_t)s * nbmax, pos, R, budget);
+        const int *g = gs + (size_t)s * sel_row;
+        if (all) {
+            memset(seen, 0, sizeof(int) * (size_t)(pos + 1));
+            int perm = n == pos + 1;
+            for (int i = 0; i < n && perm; i++) perm = list[i] >= 0 && list[i] <= pos && !seen[list[i]]++;
+            same = g[0] == -1 && perm;
+            contig++;
+            if (!same) printf("    row %d pos %d: got count %d, want -1 (cpu n %d perm %d)\n", s, pos, g[0], n, perm);
+        } else {
+            same = g[0] == n && !memcmp(g + 1, list, sizeof(int) * (size_t)n);
+            lists++;
+            if (!same) {
+                printf("    row %d pos %d: got count %d want %d\n", s, pos, g[0], n);
+                for (int i = 0; i < n; i++)
+                    if (g[1 + i] != list[i]) { printf("    first mismatch at %d: got %d ref %d\n", i, g[1 + i], list[i]); break; }
+            }
+        }
+    }
+    char name[128];
+    snprintf(name, sizeof name, "%s S=%d pos%d R=%d bud=%d (%d list %d all) %s", what, S, pos_base, R, budget, lists,
+             contig, exact ? "exact" : "fast");
+    expect(name, same);
+    free(list); free(seen);
+    q36_tensor_free(sc); q36_tensor_free(sel);
+}
+
+/* kind 0: random scores >= 0, a fifth of them 0 (no head positive); 1: eight levels (many
+ * ties across the cutoff); 2: all equal; 3: all equal but every seventh block higher. */
+static void test_qsa_select(const char *what, int kind, int S, int pos_base, int R, int budget, int exact) {
+    int nbmax = (pos_base + S) / R;
+    if (nbmax < 1) nbmax = 1;
+    float *sch = malloc(sizeof(float) * (size_t)S * nbmax);
+    for (size_t i = 0; i < (size_t)S * nbmax; i++) {
+        float u = frand();
+        int b = (int)(i % (size_t)nbmax);
+        sch[i] = kind == 0 ? (u < -0.6f ? 0.0f : (u + 1.0f) * 0.75f)
+               : kind == 1 ? floorf((u + 1.0f) * 4.0f) * 0.125f
+               : kind == 2 ? 0.5f
+                           : (b % 7 == 3 ? 0.75f : 0.5f);
+    }
+    run_select(what, sch, S, pos_base, nbmax, R, budget, exact);
+    free(sch);
+}
+
+/* The edge positions, one row each at pos: random scores. */
+static void test_qsa_select_edges(const int *pos, int np, int R, int budget, int exact) {
+    for (int i = 0; i < np; i++) {
+        char what[48];
+        snprintf(what, sizeof what, "qsa_select edge pos=%d", pos[i]);
+        test_qsa_select(what, 0, 1, pos[i], R, budget, exact);
+    }
+}
+
+/* The CPU's attention of one (row, head) over a list, in double: softmax(q.k / sqrt(D)) . v
+ * then * sigmoid(gate); mag = sigmoid(gate) * sum_j p_j |v_j| + 1e-3 (Ruling 9). */
+static void ref_attn_head(double *o, double *mag, const float *q, const float *g, const float *K, const float *V,
+                          const int *list, int n, int D) {
+    double *sc = malloc(sizeof(double) * (size_t)n), mx = -INFINITY, den = 0;
+    for (int j = 0; j < n; j++) {
+        double a = 0;
+        for (int d = 0; d < D; d++) a += (double)q[d] * K[(size_t)list[j] * D + d];
+        sc[j] = a / sqrt((double)D);
+        if (sc[j] > mx) mx = sc[j];
+    }
+    for (int j = 0; j < n; j++) { sc[j] = exp(sc[j] - mx); den += sc[j]; }
+    for (int d = 0; d < D; d++) {
+        double a = 0, m = 0;
+        for (int j = 0; j < n; j++) {
+            double t = sc[j] / den * V[(size_t)list[j] * D + d];
+            a += t;
+            m += fabs(t);
+        }
+        double sg = ref_sigmoid(g[d]);
+        o[d] = a * sg;
+        mag[d] = m * sg + 1e-3;
+    }
+    free(sc);
+}
+
+/* mode 0: the lists ref_select makes from random scores (count -1 where it takes every
+ * block); mode 1: every row -1 (contiguous 0..pos). K and V random, rounded to f16 for kv_half
+ * (the reference reads the rounded values). */
+static void test_attn_sel(int S, int pos_base, int heads, int kv, int D, int R, int budget, int cap, int kv_half,
+                          int mode, int exact) {
+    q36_gpu_set_exact(exact);
+    int sel_row = qsa_sel_row(R, budget), nbmax = (pos_base + S) / R + 1;
+    size_t cn = (size_t)kv * cap * D, qn = (size_t)S * heads * D;
+    float *Kf = malloc(sizeof(float) * cn), *Vf = malloc(sizeof(float) * cn);
+    q36_tensor *kc = q36_tensor_new(cn * (kv_half ? 2 : 4)), *vc = q36_tensor_new(cn * (kv_half ? 2 : 4));
+    for (size_t i = 0; i < cn; i++) {
+        Kf[i] = frand();
+        Vf[i] = frand() * 2.0f;
+        if (kv_half) {
+            uint16_t kb = f16_bits(Kf[i]), vb = f16_bits(Vf[i]);
+            ((uint16_t *)q36_tensor_data(kc))[i] = kb;
+            ((uint16_t *)q36_tensor_data(vc))[i] = vb;
+            _Float16 hk, hv;
+            memcpy(&hk, &kb, 2); memcpy(&hv, &vb, 2);
+            Kf[i] = (float)hk; Vf[i] = (float)hv;
+        } else {
+            F(kc)[i] = Kf[i];
+            F(vc)[i] = Vf[i];
+        }
+    }
+    q36_tensor *q = rand_tensor(qn, 4.0f), *g = rand_tensor(qn, 3.0f), *out = q36_tensor_new(qn * sizeof(float));
+    q36_tensor *sel = q36_tensor_new((size_t)S * sel_row * sizeof(int));
+    int *gs = q36_tensor_data(sel), *full = malloc(sizeof(int) * (size_t)(pos_base + S + sel_row));
+    float *scr = malloc(sizeof(float) * (size_t)nbmax);
+    double *ref = malloc(sizeof(double) * qn), *mag = malloc(sizeof(double) * qn);
+    int lists = 0;
+    for (int s = 0; s < S; s++) {
+        int pos = pos_base + s, *row = gs + (size_t)s * sel_row, n = pos + 1, all = 1;
+        for (int b = 0; b < nbmax; b++) scr[b] = (frand() + 1.0f) * 0.5f;
+        if (mode == 0) n = ref_select(row + 1, &all, scr, pos, R, budget);
+        if (all) {
+            row[0] = -1;
+            n = pos + 1;
+            for (int t = 0; t < n; t++) full[t] = t;
+        } else {
+            row[0] = n;
+            memcpy(full, row + 1, sizeof(int) * (size_t)n);
+            lists++;
+        }
+        for (int h = 0; h < heads; h++) {
+            size_t o = ((size_t)s * heads + h) * D;
+            int kvh = h / (heads / kv);
+            ref_attn_head(ref + o, mag + o, F(q) + o, F(g) + o, Kf + (size_t)kvh * cap * D, Vf + (size_t)kvh * cap * D,
+                          full, n, D);
+        }
+    }
+    int ok = q38_attn_sel(out, q, g, kc, vc, sel, S, pos_base, heads, kv, D, cap, sel_row, kv_half);
+    sync_or_die();
+    char name[128];
+    snprintf(name, sizeof name, "attn_sel S=%d pos%d h%d/%d D%d %s%s (%d list) %s", S, pos_base, heads, kv, D,
+             kv_half ? "f16 " : "", mode ? "contig" : "sel", lists, exact ? "exact" : "fast");
+    if (!ok) expect(name, 0);
+    else check(name, F(out), ref, mag, qn, exact ? 2e-5 : 3e-4);
+    free(Kf); free(Vf); free(full); free(scr); free(ref); free(mag);
+    q36_tensor_free(kc); q36_tensor_free(vc); q36_tensor_free(q); q36_tensor_free(g); q36_tensor_free(out);
+    q36_tensor_free(sel);
+}
+
+/* Bad shapes and sizes enqueue nothing. */
+static void test_qsa_declines(void) {
+    q38_qsa_shape ok = qsa_shape(2, 4, 2, 4, 2), bad;
+    q36_tensor *big = q36_tensor_new(1 << 16), *y = q36_tensor_new(256), *small = q36_tensor_new(8);
+    int took = 0;
+    took += q38_qsa_pool(y, big, big, 0, 4, NULL);
+    bad = ok; bad.ID = 300; took += q38_qsa_pool(y, big, big, 0, 1, &bad);           /* ID > 256 */
+    bad = ok; bad.rotary = 3; took += q38_qsa_pool(y, big, big, 0, 1, &bad);         /* odd rotary */
+    bad = ok; bad.rotary = 6; took += q38_qsa_pool(y, big, big, 0, 1, &bad);         /* rotary > ID */
+    took += q38_qsa_pool(small, big, big, 0, 4, &ok);                                 /* pk too small */
+    took += q38_qsa_pool(y, small, big, 0, 4, &ok);                                   /* ikraw too small */
+    took += q38_qsa_pool(y, big, big, -1, 4, &ok);
+    took += q38_qsa_score(y, big, big, 4, 9, 2, &ok);                                 /* nbmax < nblk */
+    took += q38_qsa_score(small, big, big, 2, 5, 3, &ok);                             /* sc too small */
+    took += q38_qsa_select(y, big, 2, 9, 5, 3, &ok);                                  /* sel_row < budget/R*R + R */
+    bad = ok; bad.budget = 2 * 4097; took += q38_qsa_select(big, big, 1, 9, 5, 9000, &bad);   /* budget/R > 2048 */
+    took += q38_qsa_select(small, big, 2, 9, 5, 6, &ok);                              /* sel too small */
+    took += q38_attn_sel(y, big, big, big, big, big, 1, 3, 2, 1, 8, 2, 7, 0);         /* cap < pos + S */
+    took += q38_attn_sel(y, big, big, big, big, big, 1, 1, 3, 2, 8, 4, 7, 0);         /* heads % kv */
+    took += q38_attn_sel(y, big, big, big, big, big, 1, 1, 2, 1, 300, 4, 7, 0);       /* D > 256 */
+    took += q38_attn_sel(y, big, big, small, big, big, 1, 1, 2, 1, 8, 4, 7, 1);       /* kc too small */
+    sync_or_die();
+    int clean = 1;
+    for (int i = 0; i < 64; i++) clean = clean && F(y)[i] == 0.0f;
+    expect("qsa declines bad shapes and sizes", took == 0 && clean);
+    q36_tensor_free(big); q36_tensor_free(y); q36_tensor_free(small);
+}
+
 int main(void) {
     /* As tests/test_qwen36_kernels.c: GitHub's Apple Paravirtual device never completes
      * command buffers, so nothing runs there. */
@@ -791,6 +1117,41 @@ int main(void) {
         test_ple_conv(4, 2560, 4, 3, 1, exact);
     }
     test_ple_declines();
+
+    for (int exact = 1; exact >= 0; exact--) {
+        /* tiny: IQ 2, ID 4, R 2, budget 4, heads 2, kv 1, D 8 (rotary 2 = 0.25 * 8) */
+        test_qsa_pool(4, 2, 2, 0, 6, exact);
+        test_qsa_pool(4, 2, 2, 3, 2, exact);
+        test_qsa_score(2, 4, 2, 3, 5, exact);
+        test_qsa_select("qsa_select rand", 0, 4, 5, 2, 4, exact);
+        test_qsa_select("qsa_select levels", 1, 4, 9, 2, 4, exact);
+        test_qsa_select("qsa_select tie", 2, 2, 7, 2, 4, exact);
+        int tiny_edges[5] = {0, 1, 1, 2, 5};                 /* 0, 1, R-1, R, 2R+1 */
+        test_qsa_select_edges(tiny_edges, 5, 2, 4, exact);
+        test_qsa_select("qsa_select rows 0..5", 0, 6, 0, 2, 4, exact);
+        for (int kh = 0; kh < 2; kh++) {
+            test_attn_sel(3, 5, 2, 1, 8, 2, 4, 16, kh, 0, exact);
+            test_attn_sel(2, 1, 2, 1, 8, 2, 4, 16, kh, 1, exact);
+        }
+        /* real: IQ 4, ID 128 (rotary 64), R 4, budget 2048, heads 24, kv 2, D 256, positions to 9000 */
+        test_qsa_pool(128, 4, 64, 0, 2250, exact);
+        test_qsa_pool(128, 4, 64, 2240, 10, exact);
+        test_qsa_score(4, 128, 4, 4, 8996, exact);
+        test_qsa_score(4, 128, 4, 1, 100, exact);
+        test_qsa_select("qsa_select rand", 0, 4, 8996, 4, 2048, exact);
+        test_qsa_select("qsa_select levels", 1, 4, 8996, 4, 2048, exact);
+        test_qsa_select("qsa_select rand", 0, 8, 2044, 4, 2048, exact);     /* 511..513 blocks: -1 and lists */
+        test_qsa_select("qsa_select tie", 2, 2, 8996, 4, 2048, exact);
+        test_qsa_select("qsa_select tie+7th", 3, 2, 8996, 4, 2048, exact);
+        int real_edges[9] = {0, 1, 3, 4, 9, 2047, 2048, 2051, 2052};
+        test_qsa_select_edges(real_edges, 9, 4, 2048, exact);
+        for (int kh = 0; kh < 2; kh++) {
+            test_attn_sel(4, 8996, 24, 2, 256, 4, 2048, 9008, kh, 0, exact);
+            test_attn_sel(3, 2050, 24, 2, 256, 4, 2048, 9008, kh, 0, exact);
+            test_attn_sel(2, 8999, 24, 2, 256, 4, 2048, 9008, kh, 1, exact);
+        }
+    }
+    test_qsa_declines();
 
     printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "PASSED", g_failures);
     q36_gpu_cleanup();

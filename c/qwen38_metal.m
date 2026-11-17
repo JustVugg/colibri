@@ -7,6 +7,7 @@
  * commit and wait for both. */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include "qwen38_gpu.h"
@@ -18,7 +19,8 @@ static const char q38_source[] = {
 };
 
 enum { K38_COPY, K38_DOT_BF16_EXACT, K38_DOT_BF16_FAST, K38_HC_LOW, K38_HC_MIX, K38_HC_INJ, K38_HC_APPLY, K38_HC_NORM,
-       K38_PLE_GATE, K38_PLE_CONV, K38_COUNT };
+       K38_PLE_GATE, K38_PLE_CONV, K38_QSA_POOL, K38_QSA_SCORE, K38_QSA_SELECT, K38_ATTN_SEL, K38_ATTN_SEL_HALF,
+       K38_COUNT };
 
 static const char *const q38_kernel_names[K38_COUNT] = {
     "q38_copy",
@@ -31,6 +33,11 @@ static const char *const q38_kernel_names[K38_COUNT] = {
     "q38_hc_norm",
     "q38_ple_gate",
     "q38_ple_conv",
+    "q38_qsa_pool",
+    "q38_qsa_score",
+    "q38_qsa_select",
+    "q38_attn_sel",
+    "q38_attn_sel_half",
 };
 
 static id<MTLComputePipelineState> g_q38_pipe[K38_COUNT];
@@ -263,6 +270,117 @@ int q38_ple_conv(q36_tensor *out, q36_tensor *ring, q36_tensor *snap, q36_tensor
         q36_metal_bind(e, conv, 5);
         [e setBytes:&p length:sizeof(p) atIndex:6];
         q38_threads(e, pso, (uint64_t)s->W);
+    }
+    return 1;
+}
+
+/* ---- QSA: block keys, scores, selection, sparse attention ----------------- */
+
+#define Q38_SEL_MAX 2048   /* qwen38.metal's: the most blocks a row takes (budget / R) */
+
+/* A shape the QSA kernels take: positive counts, ID <= 256, an even rotary <= ID. */
+static int q38_qsa_shape_ok(const q38_qsa_shape *s) {
+    return s && s->IQ >= 1 && s->ID >= 1 && s->ID <= 256 && s->R >= 1 && s->budget >= 0 && s->rotary >= 0 &&
+           s->rotary % 2 == 0 && s->rotary <= s->ID && s->eps > 0.0f && s->theta > 0.0f;
+}
+
+/* The pipeline runs 256-thread groups. */
+static int q38_tg256(int kernel) { return g_q38_pipe[kernel].maxTotalThreadsPerThreadgroup >= 256; }
+
+int q38_qsa_pool(q36_tensor *pk, q36_tensor *ikraw, q36_tensor *idx_kn, int b0, int nb, const q38_qsa_shape *s) {
+    if (!q38_ready() || !q38_qsa_shape_ok(s) || b0 < 0 || nb < 1 || !q38_tg256(K38_QSA_POOL)) return 0;
+    uint64_t blocks = (uint64_t)b0 + (uint64_t)nb;
+    if (blocks * (uint64_t)s->R > UINT32_MAX || !q36_metal_fits(ikraw, blocks * s->R * s->ID * F4) ||
+        !q36_metal_fits(pk, blocks * s->ID * F4) || !q36_metal_fits(idx_kn, (uint64_t)s->ID * F4)) return 0;
+    @autoreleasepool {
+        /* q38_rope's bases, the CPU's powf in float, and their reciprocals */
+        struct { float base[128], inv[128]; } rt;
+        int half = s->rotary / 2;
+        for (int i = 0; i < 128; i++) {
+            rt.base[i] = i < half ? powf(s->theta, (float)(2 * i) / s->rotary) : 1.0f;
+            rt.inv[i] = 1.0f / rt.base[i];
+        }
+        struct { uint32_t ID, R, b0, half_; float eps; } p = {(uint32_t)s->ID, (uint32_t)s->R, (uint32_t)b0,
+                                                               (uint32_t)half, s->eps};
+        id<MTLComputePipelineState> pso = g_q38_pipe[K38_QSA_POOL];
+        id<MTLComputeCommandEncoder> e = q36_metal_encoder(pso);
+        q36_metal_bind(e, ikraw, 0);
+        q36_metal_bind(e, idx_kn, 1);
+        q36_metal_bind(e, pk, 2);
+        [e setBytes:&p length:sizeof(p) atIndex:3];
+        [e setBytes:&rt length:sizeof(rt) atIndex:4];
+        [e dispatchThreadgroups:MTLSizeMake((NSUInteger)nb, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
+    return 1;
+}
+
+int q38_qsa_score(q36_tensor *sc, q36_tensor *q, q36_tensor *pk, int S, int pos_base, int nbmax, const q38_qsa_shape *s) {
+    if (!q38_ready() || !q38_qsa_shape_ok(s) || S < 1 || pos_base < 0 || nbmax < 0 ||
+        (uint64_t)pos_base + S > INT32_MAX) return 0;
+    uint64_t most = ((uint64_t)pos_base + S) / s->R;   /* the last row's blocks */
+    if (most > (uint64_t)nbmax || !q36_metal_fits(q, (uint64_t)S * s->IQ * s->ID * F4) ||
+        !q36_metal_fits(pk, most * s->ID * F4) || !q36_metal_fits(sc, (uint64_t)S * nbmax * F4)) return 0;
+    if (!most) return 1;   /* no row has a block yet: nothing to score */
+    @autoreleasepool {
+        struct { uint32_t ID, R, S, pos_base, IQ, nbmax; } p = {(uint32_t)s->ID, (uint32_t)s->R, (uint32_t)S,
+                                                                (uint32_t)pos_base, (uint32_t)s->IQ, (uint32_t)nbmax};
+        id<MTLComputePipelineState> pso = g_q38_pipe[K38_QSA_SCORE];
+        id<MTLComputeCommandEncoder> e = q36_metal_encoder(pso);
+        q36_metal_bind(e, q, 0);
+        q36_metal_bind(e, pk, 1);
+        q36_metal_bind(e, sc, 2);
+        [e setBytes:&p length:sizeof(p) atIndex:3];
+        uint64_t group = pso.maxTotalThreadsPerThreadgroup < 256 ? pso.maxTotalThreadsPerThreadgroup : 256;
+        [e dispatchThreads:MTLSizeMake((NSUInteger)most, (NSUInteger)S, 1)
+            threadsPerThreadgroup:MTLSizeMake(most < group ? (NSUInteger)most : (NSUInteger)group, 1, 1)];
+    }
+    return 1;
+}
+
+int q38_qsa_select(q36_tensor *sel, q36_tensor *sc, int S, int pos_base, int nbmax, int sel_row, const q38_qsa_shape *s) {
+    if (!q38_ready() || !q38_qsa_shape_ok(s) || S < 1 || pos_base < 0 || nbmax < 0 ||
+        (uint64_t)pos_base + S > INT32_MAX || s->budget / s->R > Q38_SEL_MAX || !q38_tg256(K38_QSA_SELECT)) return 0;
+    uint64_t most = ((uint64_t)pos_base + S) / s->R;
+    if (most > (uint64_t)nbmax || sel_row < s->budget / s->R * s->R + s->R ||
+        !q36_metal_fits(sc, (uint64_t)S * nbmax * F4) || !q36_metal_fits(sel, (uint64_t)S * sel_row * F4)) return 0;
+    @autoreleasepool {
+        struct { uint32_t R, S, pos_base, budget, nbmax, sel_row; } p = {
+            (uint32_t)s->R, (uint32_t)S, (uint32_t)pos_base, (uint32_t)s->budget, (uint32_t)nbmax, (uint32_t)sel_row};
+        id<MTLComputePipelineState> pso = g_q38_pipe[K38_QSA_SELECT];
+        id<MTLComputeCommandEncoder> e = q36_metal_encoder(pso);
+        q36_metal_bind(e, sc, 0);
+        q36_metal_bind(e, sel, 1);
+        [e setBytes:&p length:sizeof(p) atIndex:2];
+        [e dispatchThreadgroups:MTLSizeMake((NSUInteger)S, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
+    return 1;
+}
+
+int q38_attn_sel(q36_tensor *out, q36_tensor *q, q36_tensor *gate, q36_tensor *kc, q36_tensor *vc,
+                 q36_tensor *sel, int S, int pos_base, int heads, int kv_heads, int D, int cap, int sel_row,
+                 int kv_half) {
+    int kernel = kv_half ? K38_ATTN_SEL_HALF : K38_ATTN_SEL;
+    if (!q38_ready() || S < 1 || S > 65535 || pos_base < 0 || heads < 1 || kv_heads < 1 || heads % kv_heads ||
+        D < 1 || D > 256 || cap < 1 || (int64_t)pos_base + S > cap || sel_row < 1 || !q38_tg256(kernel)) return 0;
+    uint64_t qn = (uint64_t)S * heads * D * F4, cache = (uint64_t)kv_heads * cap * D * (kv_half ? 2 : F4);
+    if (!q36_metal_fits(q, qn) || !q36_metal_fits(gate, qn) || !q36_metal_fits(out, qn) ||
+        !q36_metal_fits(kc, cache) || !q36_metal_fits(vc, cache) ||
+        !q36_metal_fits(sel, (uint64_t)S * sel_row * F4)) return 0;
+    @autoreleasepool {
+        struct { uint32_t S, pos_base, heads, kv_heads, D, cap, sel_row; } p = {
+            (uint32_t)S, (uint32_t)pos_base, (uint32_t)heads, (uint32_t)kv_heads, (uint32_t)D, (uint32_t)cap,
+            (uint32_t)sel_row};
+        id<MTLComputePipelineState> pso = g_q38_pipe[kernel];
+        id<MTLComputeCommandEncoder> e = q36_metal_encoder(pso);
+        q36_metal_bind(e, q, 0);
+        q36_metal_bind(e, gate, 1);
+        q36_metal_bind(e, kc, 2);
+        q36_metal_bind(e, vc, 3);
+        q36_metal_bind(e, sel, 4);
+        q36_metal_bind(e, out, 5);
+        [e setBytes:&p length:sizeof(p) atIndex:6];
+        [e dispatchThreadgroups:MTLSizeMake((NSUInteger)heads, (NSUInteger)S, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     }
     return 1;
 }
