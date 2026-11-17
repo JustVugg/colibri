@@ -1,0 +1,52 @@
+C24 real-model A/B verdict — fused S==1 Q4_K/Q5_K vs generic on the Q4_K_M container
+(c24_fuse_ab_launch.sh, phaseC24_fuse_{fuse1,fuse0}_r{1,2}.jsonl, c24_ab_summary.py,
+2026-11-17; canonical anchor: IQ2_XXS ~7.11 tok/s decode, C22; C16 generic Q4_K_M
+12K read 0.72x of IQ2)
+
+VERDICT: correctness PASS — decode recovery PARTIAL. Keep Q36_EXPERT_FUSE default
+ON (bit-exact, positive at the anchor, no downside); the default-container decision
+still goes to the graded three-container batch.
+
+1. Correctness gate: PASS, 12/12. Every cell's output sha12 is identical across
+   both arms and all 4 rounds:
+   1K/4K ce37c8ce16a4 (= C21's IQ3 sha), 12K 8f22a642b5e9, q1 d61cedb98f7d,
+   q2 129cd9c93215 (correct iterative fib — Q4_K_M keeps C16's q2 win),
+   q3 80ec1fd121f7. The fused Q4_K/Q5_K kernels are bit-exact in the live model.
+
+2. Decode (paired round means, fuse1 | fuse0):
+   12K anchor: 5.88 | 5.31 = 1.11x  — the stable read: positive in BOTH rounds
+     (r1 6.10/5.32, r2 5.65/5.30; spread within arms <= 0.45).
+   4K: 5.82 | 6.25 = 0.93x; 1K: 3.50 | 3.84 = 0.91x — scatter-dominated
+     (1K spans 2.26-4.88 within arms, per-turn decode drift the C13 finding).
+   probes: q1 7.88 | 8.23 (0.96x), q2 2.87 | 3.40 (0.84x), q3 5.17 | 5.07 (1.02x)
+     — all inside the scatter band, no signal either way.
+   Reading: only the 12K anchor is trustworthy (largest rows, tightest spread),
+   and it is positive: 1.11x fused vs generic. But vs the target it is short —
+   5.88 tok/s is ~0.83x of IQ2's 7.11 anchor (target was ~0.9-1.0x), up from
+   C16's 0.72x. Recovery is real but partial.
+
+3. Why partial (mechanism, not drift): at S == 1 the fused kernel reads the
+   same ~1.95 MB/expert (144+176 B blocks) from DRAM as the generic path —
+   the decode regime is bandwidth-bound at Q4_K_M's +66% expert bytes vs
+   IQ2's 1.17 MB, so the compute-side 2.3x (Q4_K) / 1.16x (Q5_K) GFLOPS win
+   translates to only ~1.1x end-to-end. The residual gap to IQ2 is the extra
+   bytes, which a kernel cannot recover. This matches C16's bandwidth-bound
+   diagnosis of the container.
+
+4. Prefill unchanged as designed: the fused kernels are S == 1 only, and the
+   12K r2 prefill_moe_s is identical across arms (279.57 vs 279.49). Round
+   means (fuse1 404.9 | fuse0 437.8 TTFT at 12K) carry r1 thermal drift —
+   fuse1_r1 ran first (moe 228.7 vs 279.6 in r2), the same ~30% same-session
+   drift the paired design exists for.
+
+5. RSS: 1.89-2.84 GB across all rounds, both arms — no memory change.
+
+6. TTFT side-read (fuse1 r2 vs C16 record, unpaired): no regression beyond
+   drift; prefill path untouched.
+
+7. Decision: keep Q36_EXPERT_FUSE default ON. The kernels are bit-exact, the
+   only trustworthy read is positive (12K 1.11x), and FUSE=0 is strictly worse
+   at the anchor. Do NOT schedule further Q4_K decode work on kernel grounds:
+   the remaining gap to IQ2 is expert bytes, not compute. The
+   default-container decision belongs to the graded three-container batch
+   (C23 set on IQ2 / IQ3 / Q4_K_M, interleaved rounds).
