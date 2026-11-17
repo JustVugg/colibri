@@ -1,0 +1,468 @@
+===== run sx_chain (V4_PREFILL_CHAIN=1, V4_COMP_BATCH unset) =====
+----- stderr -----
+[env] CUDA_DENSE is not read by deepseek-v4 (it belongs to colibri) -- it will have no effect
+[env] COLI_CUDA_PIPE is not read by deepseek-v4 (it belongs to colibri) -- it will have no effect
+[OMP] deepseek-v4: 12 compute threads (the physical cores of 24 logical CPUs; the 3 expert-loader workers take the SMT siblings); OMP_NUM_THREADS=<n> overrides, COLI_NO_OMP_TUNE=1 disables
+ram_tiers available=16.00GiB dense=resident(6.27GiB) target_slots=14 target_cache=7.50GiB head=resident-bf16 projected=15.64GiB
+v4_open index=0.09s plan=0.00s (index built once, reused by plan/inventory/head)
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_autopin history=/mnt/bsc_disk/LLM-Models/DeepSeek-V4-Flash-0731-Abliterated-lovesenko/.coli_usage selections=3507655
+v4_hot_policy pin_slots_per_layer=8 repin_interval=6 mode=resident-ram rows16=hot-pins
+[DSV4 CUDA] device 0: NVIDIA GeForce RTX 5080 16.6 GB sm_120
+v4_gpu mirror-reserve=600MiB headroom; the 256-slot bank (3456MiB x2) releases the oldest decode mirrors when a prompt creates it (V4_BANK_MAKE_ROOM)
+v4_gpu tier=dense-matvec device=0
+v4_gpu layer=0 uploaded=134.024MiB in 0.108s wall=1794927104
+v4_gpu layer=1 uploaded=134.024MiB in 0.103s wall=1794927105
+v4_gpu layer=2 uploaded=155.024MiB in 0.106s wall=1794927105
+v4_gpu layer=3 uploaded=142.024MiB in 0.104s wall=1794927105
+v4_gpu layer=4 uploaded=155.024MiB in 0.107s wall=1794927105
+v4_gpu layer=5 uploaded=142.024MiB in 0.103s wall=1794927105
+v4_gpu layer=6 uploaded=155.024MiB in 0.107s wall=1794927106
+v4_gpu layer=7 uploaded=142.024MiB in 0.104s wall=1794927106
+v4_gpu layer=8 uploaded=155.024MiB in 0.107s wall=1794927106
+v4_gpu layer=9 uploaded=142.024MiB in 0.104s wall=1794927106
+v4_gpu layer=10 uploaded=155.024MiB in 0.107s wall=1794927106
+v4_gpu layer=11 uploaded=142.024MiB in 0.103s wall=1794927106
+v4_gpu layer=12 uploaded=155.024MiB in 0.107s wall=1794927107
+v4_gpu layer=13 uploaded=142.024MiB in 0.104s wall=1794927107
+v4_gpu layer=14 uploaded=155.024MiB in 0.107s wall=1794927107
+v4_gpu layer=15 uploaded=142.024MiB in 0.103s wall=1794927107
+v4_gpu layer=16 uploaded=155.024MiB in 0.107s wall=1794927107
+v4_gpu layer=17 uploaded=142.024MiB in 0.103s wall=1794927108
+v4_gpu layer=18 uploaded=155.024MiB in 0.107s wall=1794927108
+v4_gpu layer=19 uploaded=142.024MiB in 0.103s wall=1794927108
+v4_gpu layer=20 uploaded=155.024MiB in 0.107s wall=1794927108
+v4_gpu layer=21 uploaded=142.024MiB in 0.103s wall=1794927108
+v4_gpu layer=22 uploaded=155.024MiB in 0.107s wall=1794927108
+v4_gpu layer=23 uploaded=142.024MiB in 0.104s wall=1794927109
+v4_gpu layer=24 uploaded=155.024MiB in 0.107s wall=1794927109
+v4_gpu layer=25 uploaded=142.024MiB in 0.103s wall=1794927109
+v4_gpu layer=26 uploaded=155.024MiB in 0.106s wall=1794927109
+v4_gpu layer=27 uploaded=142.024MiB in 0.103s wall=1794927109
+v4_gpu layer=28 uploaded=155.024MiB in 0.107s wall=1794927109
+v4_gpu layer=29 uploaded=142.024MiB in 0.103s wall=1794927110
+v4_gpu layer=30 uploaded=155.024MiB in 0.107s wall=1794927110
+v4_gpu layer=31 uploaded=142.024MiB in 0.103s wall=1794927110
+v4_gpu layer=32 uploaded=155.024MiB in 0.107s wall=1794927110
+v4_gpu layer=33 uploaded=142.024MiB in 0.103s wall=1794927110
+v4_gpu layer=34 uploaded=155.024MiB in 0.107s wall=1794927111
+v4_gpu layer=35 uploaded=142.024MiB in 0.103s wall=1794927111
+v4_gpu layer=36 uploaded=155.024MiB in 0.107s wall=1794927111
+v4_gpu layer=37 uploaded=142.024MiB in 0.103s wall=1794927111
+v4_gpu layer=38 uploaded=155.024MiB in 0.107s wall=1794927111
+v4_gpu layer=39 uploaded=142.024MiB in 0.104s wall=1794927111
+v4_gpu layer=40 uploaded=155.024MiB in 0.107s wall=1794927112
+v4_gpu layer=41 uploaded=142.024MiB in 0.103s wall=1794927112
+v4_gpu layer=42 uploaded=155.024MiB in 0.107s wall=1794927112
+v4_dense_resident layers=43 bytes=6.267GiB
+v4_gpu resident-experts=cache-fallback (resident experts exceed device 0 budget (free=8990 MiB reserve=2800 MiB))
+v4_cli mode=chat memory=limited target_only=1
+v4_gpu moe-batch=on bank=256-experts
+v4_gpu moe-double=on
+v4_gpu moe-batch refill layer=0 missing=184 lookup=0.01s upload=0.41s (sequential retries)
+v4_gpu moe-batch refill layer=0 missing=5 lookup=0.01s upload=0.00s
+v4_gpu moe-double swaps=42 prefetched=10752
+v4_gpu head=resident device=0 bytes=1059061760 arithmetic=separate-mul-add
+v4_tokens prompt=3278 generated=36 total=3314 expert_requests=19857 hits=4369 misses=15434 hit_rate=22.002 bytes=206342455296 target_only=1
+generated_text=The history of computing progressed through successive hardware generations, from mechanical calculators to cloud data centers. Each new generation dramatically increased performance while reducing cost and size, enabling more ambitious software.
+timing time_to_first_token=35.328s after_first=9.485s
+v4_gpu uploader: jobs=8862 attached=8862 avg=0.394 ms copies=second-stream, fenced fences=1477 fence-drains=0
+v4_gpu mirror-block device=0 made=533 refills=4814 three-tensor=0
+v4_rows16 packed_slots=0
+v4_direct reads=15434 flock_reads=0 fallbacks=0 payload_bytes=194204663808
+
+
+----- stdout -----
+The history of computing progressed through successive hardware generations, from mechanical calculators to cloud data centers. Each new generation dramatically increased performance while reducing cost and size, enabling more ambitious software.<｜end▁of▁sentence｜>
+TUNE decode: 36 tokens in 44.886s
+
+===== run sx_both (V4_PREFILL_CHAIN=1 V4_COMP_BATCH=1) =====
+----- stderr -----
+[env] CUDA_DENSE is not read by deepseek-v4 (it belongs to colibri) -- it will have no effect
+[env] COLI_CUDA_PIPE is not read by deepseek-v4 (it belongs to colibri) -- it will have no effect
+[OMP] deepseek-v4: 12 compute threads (the physical cores of 24 logical CPUs; the 3 expert-loader workers take the SMT siblings); OMP_NUM_THREADS=<n> overrides, COLI_NO_OMP_TUNE=1 disables
+ram_tiers available=16.00GiB dense=resident(6.27GiB) target_slots=14 target_cache=7.50GiB head=resident-bf16 projected=15.64GiB
+v4_open index=0.09s plan=0.00s (index built once, reused by plan/inventory/head)
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_autopin history=/mnt/bsc_disk/LLM-Models/DeepSeek-V4-Flash-0731-Abliterated-lovesenko/.coli_usage selections=3507655
+v4_hot_policy pin_slots_per_layer=8 repin_interval=6 mode=resident-ram rows16=hot-pins
+[DSV4 CUDA] device 0: NVIDIA GeForce RTX 5080 16.6 GB sm_120
+v4_gpu mirror-reserve=600MiB headroom; the 256-slot bank (3456MiB x2) releases the oldest decode mirrors when a prompt creates it (V4_BANK_MAKE_ROOM)
+v4_gpu tier=dense-matvec device=0
+v4_gpu layer=0 uploaded=134.024MiB in 0.117s wall=1794927160
+v4_gpu layer=1 uploaded=134.024MiB in 0.111s wall=1794927160
+v4_gpu layer=2 uploaded=155.024MiB in 0.114s wall=1794927161
+v4_gpu layer=3 uploaded=142.024MiB in 0.109s wall=1794927161
+v4_gpu layer=4 uploaded=155.024MiB in 0.107s wall=1794927161
+v4_gpu layer=5 uploaded=142.024MiB in 0.104s wall=1794927161
+v4_gpu layer=6 uploaded=155.024MiB in 0.107s wall=1794927161
+v4_gpu layer=7 uploaded=142.024MiB in 0.104s wall=1794927162
+v4_gpu layer=8 uploaded=155.024MiB in 0.107s wall=1794927162
+v4_gpu layer=9 uploaded=142.024MiB in 0.103s wall=1794927162
+v4_gpu layer=10 uploaded=155.024MiB in 0.107s wall=1794927162
+v4_gpu layer=11 uploaded=142.024MiB in 0.103s wall=1794927162
+v4_gpu layer=12 uploaded=155.024MiB in 0.107s wall=1794927162
+v4_gpu layer=13 uploaded=142.024MiB in 0.103s wall=1794927163
+v4_gpu layer=14 uploaded=155.024MiB in 0.107s wall=1794927163
+v4_gpu layer=15 uploaded=142.024MiB in 0.103s wall=1794927163
+v4_gpu layer=16 uploaded=155.024MiB in 0.107s wall=1794927163
+v4_gpu layer=17 uploaded=142.024MiB in 0.103s wall=1794927163
+v4_gpu layer=18 uploaded=155.024MiB in 0.107s wall=1794927163
+v4_gpu layer=19 uploaded=142.024MiB in 0.103s wall=1794927164
+v4_gpu layer=20 uploaded=155.024MiB in 0.107s wall=1794927164
+v4_gpu layer=21 uploaded=142.024MiB in 0.104s wall=1794927164
+v4_gpu layer=22 uploaded=155.024MiB in 0.108s wall=1794927164
+v4_gpu layer=23 uploaded=142.024MiB in 0.104s wall=1794927164
+v4_gpu layer=24 uploaded=155.024MiB in 0.108s wall=1794927165
+v4_gpu layer=25 uploaded=142.024MiB in 0.103s wall=1794927165
+v4_gpu layer=26 uploaded=155.024MiB in 0.106s wall=1794927165
+v4_gpu layer=27 uploaded=142.024MiB in 0.103s wall=1794927165
+v4_gpu layer=28 uploaded=155.024MiB in 0.107s wall=1794927165
+v4_gpu layer=29 uploaded=142.024MiB in 0.103s wall=1794927165
+v4_gpu layer=30 uploaded=155.024MiB in 0.107s wall=1794927166
+v4_gpu layer=31 uploaded=142.024MiB in 0.103s wall=1794927166
+v4_gpu layer=32 uploaded=155.024MiB in 0.107s wall=1794927166
+v4_gpu layer=33 uploaded=142.024MiB in 0.103s wall=1794927166
+v4_gpu layer=34 uploaded=155.024MiB in 0.107s wall=1794927166
+v4_gpu layer=35 uploaded=142.024MiB in 0.103s wall=1794927166
+v4_gpu layer=36 uploaded=155.024MiB in 0.107s wall=1794927167
+v4_gpu layer=37 uploaded=142.024MiB in 0.103s wall=1794927167
+v4_gpu layer=38 uploaded=155.024MiB in 0.107s wall=1794927167
+v4_gpu layer=39 uploaded=142.024MiB in 0.104s wall=1794927167
+v4_gpu layer=40 uploaded=155.024MiB in 0.106s wall=1794927167
+v4_gpu layer=41 uploaded=142.024MiB in 0.104s wall=1794927168
+v4_gpu layer=42 uploaded=155.024MiB in 0.107s wall=1794927168
+v4_dense_resident layers=43 bytes=6.267GiB
+v4_gpu resident-experts=cache-fallback (resident experts exceed device 0 budget (free=8990 MiB reserve=2800 MiB))
+v4_cli mode=chat memory=limited target_only=1
+v4_gpu moe-batch=on bank=256-experts
+v4_gpu moe-double=on
+v4_gpu moe-batch refill layer=0 missing=184 lookup=0.01s upload=0.42s (sequential retries)
+v4_gpu moe-batch refill layer=0 missing=5 lookup=0.01s upload=0.00s
+v4_gpu moe-double swaps=42 prefetched=10752
+v4_gpu head=resident device=0 bytes=1059061760 arithmetic=separate-mul-add
+v4_tokens prompt=3278 generated=36 total=3314 expert_requests=19857 hits=4381 misses=15422 hit_rate=22.063 bytes=206182023168 target_only=1
+generated_text=The history of computing progressed through successive hardware generations, from mechanical calculators to cloud data centers. Each new generation dramatically increased performance while reducing cost and size, enabling more ambitious software.
+timing time_to_first_token=35.258s after_first=9.554s
+v4_gpu uploader: jobs=8862 attached=8862 avg=0.394 ms copies=second-stream, fenced fences=1477 fence-drains=0
+v4_gpu mirror-block device=0 made=533 refills=4814 three-tensor=0
+v4_rows16 packed_slots=0
+v4_direct reads=15422 flock_reads=0 fallbacks=0 payload_bytes=194053668864
+
+
+----- stdout -----
+The history of computing progressed through successive hardware generations, from mechanical calculators to cloud data centers. Each new generation dramatically increased performance while reducing cost and size, enabling more ambitious software.<｜end▁of▁sentence｜>
+TUNE decode: 36 tokens in 44.885s
+
+===== run sy_chain (V4_PREFILL_CHAIN=1, V4_COMP_BATCH unset) =====
+----- stderr -----
+[env] CUDA_DENSE is not read by deepseek-v4 (it belongs to colibri) -- it will have no effect
+[env] COLI_CUDA_PIPE is not read by deepseek-v4 (it belongs to colibri) -- it will have no effect
+[OMP] deepseek-v4: 12 compute threads (the physical cores of 24 logical CPUs; the 3 expert-loader workers take the SMT siblings); OMP_NUM_THREADS=<n> overrides, COLI_NO_OMP_TUNE=1 disables
+ram_tiers available=16.00GiB dense=resident(6.27GiB) target_slots=14 target_cache=7.50GiB head=resident-bf16 projected=15.64GiB
+v4_open index=0.09s plan=0.00s (index built once, reused by plan/inventory/head)
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_autopin history=/mnt/bsc_disk/LLM-Models/DeepSeek-V4-Flash-0731-Abliterated-lovesenko/.coli_usage selections=3507655
+v4_hot_policy pin_slots_per_layer=8 repin_interval=6 mode=resident-ram rows16=hot-pins
+[DSV4 CUDA] device 0: NVIDIA GeForce RTX 5080 16.6 GB sm_120
+v4_gpu mirror-reserve=600MiB headroom; the 256-slot bank (3456MiB x2) releases the oldest decode mirrors when a prompt creates it (V4_BANK_MAKE_ROOM)
+v4_gpu tier=dense-matvec device=0
+v4_gpu layer=0 uploaded=134.024MiB in 0.109s wall=1794927216
+v4_gpu layer=1 uploaded=134.024MiB in 0.103s wall=1794927216
+v4_gpu layer=2 uploaded=155.024MiB in 0.106s wall=1794927216
+v4_gpu layer=3 uploaded=142.024MiB in 0.104s wall=1794927216
+v4_gpu layer=4 uploaded=155.024MiB in 0.107s wall=1794927217
+v4_gpu layer=5 uploaded=142.024MiB in 0.104s wall=1794927217
+v4_gpu layer=6 uploaded=155.024MiB in 0.107s wall=1794927217
+v4_gpu layer=7 uploaded=142.024MiB in 0.104s wall=1794927217
+v4_gpu layer=8 uploaded=155.024MiB in 0.107s wall=1794927217
+v4_gpu layer=9 uploaded=142.024MiB in 0.105s wall=1794927217
+v4_gpu layer=10 uploaded=155.024MiB in 0.107s wall=1794927218
+v4_gpu layer=11 uploaded=142.024MiB in 0.104s wall=1794927218
+v4_gpu layer=12 uploaded=155.024MiB in 0.108s wall=1794927218
+v4_gpu layer=13 uploaded=142.024MiB in 0.104s wall=1794927218
+v4_gpu layer=14 uploaded=155.024MiB in 0.108s wall=1794927218
+v4_gpu layer=15 uploaded=142.024MiB in 0.104s wall=1794927219
+v4_gpu layer=16 uploaded=155.024MiB in 0.107s wall=1794927219
+v4_gpu layer=17 uploaded=142.024MiB in 0.104s wall=1794927219
+v4_gpu layer=18 uploaded=155.024MiB in 0.108s wall=1794927219
+v4_gpu layer=19 uploaded=142.024MiB in 0.103s wall=1794927219
+v4_gpu layer=20 uploaded=155.024MiB in 0.107s wall=1794927219
+v4_gpu layer=21 uploaded=142.024MiB in 0.104s wall=1794927220
+v4_gpu layer=22 uploaded=155.024MiB in 0.107s wall=1794927220
+v4_gpu layer=23 uploaded=142.024MiB in 0.104s wall=1794927220
+v4_gpu layer=24 uploaded=155.024MiB in 0.108s wall=1794927220
+v4_gpu layer=25 uploaded=142.024MiB in 0.104s wall=1794927220
+v4_gpu layer=26 uploaded=155.024MiB in 0.108s wall=1794927221
+v4_gpu layer=27 uploaded=142.024MiB in 0.105s wall=1794927221
+v4_gpu layer=28 uploaded=155.024MiB in 0.108s wall=1794927221
+v4_gpu layer=29 uploaded=142.024MiB in 0.104s wall=1794927221
+v4_gpu layer=30 uploaded=155.024MiB in 0.108s wall=1794927221
+v4_gpu layer=31 uploaded=142.024MiB in 0.104s wall=1794927221
+v4_gpu layer=32 uploaded=155.024MiB in 0.107s wall=1794927222
+v4_gpu layer=33 uploaded=142.024MiB in 0.104s wall=1794927222
+v4_gpu layer=34 uploaded=155.024MiB in 0.108s wall=1794927222
+v4_gpu layer=35 uploaded=142.024MiB in 0.104s wall=1794927222
+v4_gpu layer=36 uploaded=155.024MiB in 0.107s wall=1794927222
+v4_gpu layer=37 uploaded=142.024MiB in 0.104s wall=1794927222
+v4_gpu layer=38 uploaded=155.024MiB in 0.108s wall=1794927223
+v4_gpu layer=39 uploaded=142.024MiB in 0.104s wall=1794927223
+v4_gpu layer=40 uploaded=155.024MiB in 0.108s wall=1794927223
+v4_gpu layer=41 uploaded=142.024MiB in 0.104s wall=1794927223
+v4_gpu layer=42 uploaded=155.024MiB in 0.107s wall=1794927223
+v4_dense_resident layers=43 bytes=6.267GiB
+v4_gpu resident-experts=cache-fallback (resident experts exceed device 0 budget (free=8990 MiB reserve=2800 MiB))
+v4_cli mode=chat memory=limited target_only=1
+v4_gpu moe-batch=on bank=256-experts
+v4_gpu moe-double=on
+v4_gpu moe-batch refill layer=0 missing=184 lookup=0.01s upload=0.42s (sequential retries)
+v4_gpu moe-batch refill layer=0 missing=5 lookup=0.01s upload=0.01s
+v4_gpu moe-double swaps=42 prefetched=10752
+v4_gpu head=resident device=0 bytes=1059061760 arithmetic=separate-mul-add
+v4_tokens prompt=3278 generated=36 total=3314 expert_requests=19856 hits=4376 misses=15427 hit_rate=22.039 bytes=206248869888 target_only=1
+generated_text=The history of computing progressed through successive hardware generations, from mechanical calculators to cloud data centers. Each new generation dramatically increased performance while reducing cost and size, enabling more ambitious software.
+timing time_to_first_token=35.315s after_first=9.556s
+v4_gpu uploader: jobs=8862 attached=8862 avg=0.397 ms copies=second-stream, fenced fences=1477 fence-drains=0
+v4_gpu mirror-block device=0 made=533 refills=4814 three-tensor=0
+v4_rows16 packed_slots=0
+v4_direct reads=15427 flock_reads=0 fallbacks=0 payload_bytes=194116583424
+
+
+----- stdout -----
+The history of computing progressed through successive hardware generations, from mechanical calculators to cloud data centers. Each new generation dramatically increased performance while reducing cost and size, enabling more ambitious software.<｜end▁of▁sentence｜>
+TUNE decode: 36 tokens in 44.944s
+
+===== run sy_both (V4_PREFILL_CHAIN=1 V4_COMP_BATCH=1) =====
+----- stderr -----
+[env] CUDA_DENSE is not read by deepseek-v4 (it belongs to colibri) -- it will have no effect
+[env] COLI_CUDA_PIPE is not read by deepseek-v4 (it belongs to colibri) -- it will have no effect
+[OMP] deepseek-v4: 12 compute threads (the physical cores of 24 logical CPUs; the 3 expert-loader workers take the SMT siblings); OMP_NUM_THREADS=<n> overrides, COLI_NO_OMP_TUNE=1 disables
+ram_tiers available=16.00GiB dense=resident(6.27GiB) target_slots=14 target_cache=7.50GiB head=resident-bf16 projected=15.64GiB
+v4_open index=0.09s plan=0.00s (index built once, reused by plan/inventory/head)
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_autopin history=/mnt/bsc_disk/LLM-Models/DeepSeek-V4-Flash-0731-Abliterated-lovesenko/.coli_usage selections=3507655
+v4_hot_policy pin_slots_per_layer=8 repin_interval=6 mode=resident-ram rows16=hot-pins
+[DSV4 CUDA] device 0: NVIDIA GeForce RTX 5080 16.6 GB sm_120
+v4_gpu mirror-reserve=600MiB headroom; the 256-slot bank (3456MiB x2) releases the oldest decode mirrors when a prompt creates it (V4_BANK_MAKE_ROOM)
+v4_gpu tier=dense-matvec device=0
+v4_gpu layer=0 uploaded=134.024MiB in 0.109s wall=1794927272
+v4_gpu layer=1 uploaded=134.024MiB in 0.103s wall=1794927272
+v4_gpu layer=2 uploaded=155.024MiB in 0.107s wall=1794927272
+v4_gpu layer=3 uploaded=142.024MiB in 0.104s wall=1794927272
+v4_gpu layer=4 uploaded=155.024MiB in 0.108s wall=1794927272
+v4_gpu layer=5 uploaded=142.024MiB in 0.104s wall=1794927273
+v4_gpu layer=6 uploaded=155.024MiB in 0.107s wall=1794927273
+v4_gpu layer=7 uploaded=142.024MiB in 0.104s wall=1794927273
+v4_gpu layer=8 uploaded=155.024MiB in 0.108s wall=1794927273
+v4_gpu layer=9 uploaded=142.024MiB in 0.104s wall=1794927273
+v4_gpu layer=10 uploaded=155.024MiB in 0.107s wall=1794927273
+v4_gpu layer=11 uploaded=142.024MiB in 0.104s wall=1794927274
+v4_gpu layer=12 uploaded=155.024MiB in 0.107s wall=1794927274
+v4_gpu layer=13 uploaded=142.024MiB in 0.104s wall=1794927274
+v4_gpu layer=14 uploaded=155.024MiB in 0.108s wall=1794927274
+v4_gpu layer=15 uploaded=142.024MiB in 0.104s wall=1794927274
+v4_gpu layer=16 uploaded=155.024MiB in 0.107s wall=1794927275
+v4_gpu layer=17 uploaded=142.024MiB in 0.104s wall=1794927275
+v4_gpu layer=18 uploaded=155.024MiB in 0.107s wall=1794927275
+v4_gpu layer=19 uploaded=142.024MiB in 0.104s wall=1794927275
+v4_gpu layer=20 uploaded=155.024MiB in 0.108s wall=1794927275
+v4_gpu layer=21 uploaded=142.024MiB in 0.104s wall=1794927275
+v4_gpu layer=22 uploaded=155.024MiB in 0.107s wall=1794927276
+v4_gpu layer=23 uploaded=142.024MiB in 0.104s wall=1794927276
+v4_gpu layer=24 uploaded=155.024MiB in 0.107s wall=1794927276
+v4_gpu layer=25 uploaded=142.024MiB in 0.104s wall=1794927276
+v4_gpu layer=26 uploaded=155.024MiB in 0.108s wall=1794927276
+v4_gpu layer=27 uploaded=142.024MiB in 0.104s wall=1794927276
+v4_gpu layer=28 uploaded=155.024MiB in 0.108s wall=1794927277
+v4_gpu layer=29 uploaded=142.024MiB in 0.103s wall=1794927277
+v4_gpu layer=30 uploaded=155.024MiB in 0.107s wall=1794927277
+v4_gpu layer=31 uploaded=142.024MiB in 0.105s wall=1794927277
+v4_gpu layer=32 uploaded=155.024MiB in 0.108s wall=1794927277
+v4_gpu layer=33 uploaded=142.024MiB in 0.105s wall=1794927278
+v4_gpu layer=34 uploaded=155.024MiB in 0.108s wall=1794927278
+v4_gpu layer=35 uploaded=142.024MiB in 0.104s wall=1794927278
+v4_gpu layer=36 uploaded=155.024MiB in 0.107s wall=1794927278
+v4_gpu layer=37 uploaded=142.024MiB in 0.104s wall=1794927278
+v4_gpu layer=38 uploaded=155.024MiB in 0.108s wall=1794927278
+v4_gpu layer=39 uploaded=142.024MiB in 0.104s wall=1794927279
+v4_gpu layer=40 uploaded=155.024MiB in 0.107s wall=1794927279
+v4_gpu layer=41 uploaded=142.024MiB in 0.104s wall=1794927279
+v4_gpu layer=42 uploaded=155.024MiB in 0.108s wall=1794927279
+v4_dense_resident layers=43 bytes=6.267GiB
+v4_gpu resident-experts=cache-fallback (resident experts exceed device 0 budget (free=8990 MiB reserve=2800 MiB))
+v4_cli mode=chat memory=limited target_only=1
+v4_gpu moe-batch=on bank=256-experts
+v4_gpu moe-double=on
+v4_gpu moe-batch refill layer=0 missing=184 lookup=0.01s upload=0.44s (sequential retries)
+v4_gpu moe-batch refill layer=0 missing=5 lookup=0.01s upload=0.01s
+v4_gpu moe-double swaps=42 prefetched=10752
+v4_gpu head=resident device=0 bytes=1059061760 arithmetic=separate-mul-add
+v4_tokens prompt=3278 generated=36 total=3314 expert_requests=19857 hits=4376 misses=15427 hit_rate=22.038 bytes=206248869888 target_only=1
+generated_text=The history of computing progressed through successive hardware generations, from mechanical calculators to cloud data centers. Each new generation dramatically increased performance while reducing cost and size, enabling more ambitious software.
+timing time_to_first_token=35.281s after_first=9.539s
+v4_gpu uploader: jobs=8862 attached=8862 avg=0.397 ms copies=second-stream, fenced fences=1477 fence-drains=0
+v4_gpu mirror-block device=0 made=533 refills=4814 three-tensor=0
+v4_rows16 packed_slots=0
+v4_direct reads=15427 flock_reads=0 fallbacks=0 payload_bytes=194116583424
+
+
+----- stdout -----
+The history of computing progressed through successive hardware generations, from mechanical calculators to cloud data centers. Each new generation dramatically increased performance while reducing cost and size, enabling more ambitious software.<｜end▁of▁sentence｜>
+TUNE decode: 36 tokens in 44.892s
+
+===== run sz_chain (V4_PREFILL_CHAIN=1, V4_COMP_BATCH unset) =====
+----- stderr -----
+[env] CUDA_DENSE is not read by deepseek-v4 (it belongs to colibri) -- it will have no effect
+[env] COLI_CUDA_PIPE is not read by deepseek-v4 (it belongs to colibri) -- it will have no effect
+[OMP] deepseek-v4: 12 compute threads (the physical cores of 24 logical CPUs; the 3 expert-loader workers take the SMT siblings); OMP_NUM_THREADS=<n> overrides, COLI_NO_OMP_TUNE=1 disables
+ram_tiers available=16.00GiB dense=resident(6.27GiB) target_slots=14 target_cache=7.50GiB head=resident-bf16 projected=15.64GiB
+v4_open index=0.09s plan=0.00s (index built once, reused by plan/inventory/head)
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_autopin history=/mnt/bsc_disk/LLM-Models/DeepSeek-V4-Flash-0731-Abliterated-lovesenko/.coli_usage selections=3507655
+v4_hot_policy pin_slots_per_layer=8 repin_interval=6 mode=resident-ram rows16=hot-pins
+[DSV4 CUDA] device 0: NVIDIA GeForce RTX 5080 16.6 GB sm_120
+v4_gpu mirror-reserve=600MiB headroom; the 256-slot bank (3456MiB x2) releases the oldest decode mirrors when a prompt creates it (V4_BANK_MAKE_ROOM)
+v4_gpu tier=dense-matvec device=0
+v4_gpu layer=0 uploaded=134.024MiB in 0.109s wall=1794927327
+v4_gpu layer=1 uploaded=134.024MiB in 0.103s wall=1794927328
+v4_gpu layer=2 uploaded=155.024MiB in 0.106s wall=1794927328
+v4_gpu layer=3 uploaded=142.024MiB in 0.104s wall=1794927328
+v4_gpu layer=4 uploaded=155.024MiB in 0.107s wall=1794927328
+v4_gpu layer=5 uploaded=142.024MiB in 0.104s wall=1794927328
+v4_gpu layer=6 uploaded=155.024MiB in 0.107s wall=1794927328
+v4_gpu layer=7 uploaded=142.024MiB in 0.104s wall=1794927329
+v4_gpu layer=8 uploaded=155.024MiB in 0.107s wall=1794927329
+v4_gpu layer=9 uploaded=142.024MiB in 0.103s wall=1794927329
+v4_gpu layer=10 uploaded=155.024MiB in 0.108s wall=1794927329
+v4_gpu layer=11 uploaded=142.024MiB in 0.104s wall=1794927329
+v4_gpu layer=12 uploaded=155.024MiB in 0.107s wall=1794927330
+v4_gpu layer=13 uploaded=142.024MiB in 0.105s wall=1794927330
+v4_gpu layer=14 uploaded=155.024MiB in 0.108s wall=1794927330
+v4_gpu layer=15 uploaded=142.024MiB in 0.104s wall=1794927330
+v4_gpu layer=16 uploaded=155.024MiB in 0.108s wall=1794927330
+v4_gpu layer=17 uploaded=142.024MiB in 0.104s wall=1794927330
+v4_gpu layer=18 uploaded=155.024MiB in 0.107s wall=1794927331
+v4_gpu layer=19 uploaded=142.024MiB in 0.104s wall=1794927331
+v4_gpu layer=20 uploaded=155.024MiB in 0.107s wall=1794927331
+v4_gpu layer=21 uploaded=142.024MiB in 0.104s wall=1794927331
+v4_gpu layer=22 uploaded=155.024MiB in 0.107s wall=1794927331
+v4_gpu layer=23 uploaded=142.024MiB in 0.104s wall=1794927331
+v4_gpu layer=24 uploaded=155.024MiB in 0.107s wall=1794927332
+v4_gpu layer=25 uploaded=142.024MiB in 0.103s wall=1794927332
+v4_gpu layer=26 uploaded=155.024MiB in 0.107s wall=1794927332
+v4_gpu layer=27 uploaded=142.024MiB in 0.104s wall=1794927332
+v4_gpu layer=28 uploaded=155.024MiB in 0.108s wall=1794927332
+v4_gpu layer=29 uploaded=142.024MiB in 0.103s wall=1794927333
+v4_gpu layer=30 uploaded=155.024MiB in 0.107s wall=1794927333
+v4_gpu layer=31 uploaded=142.024MiB in 0.104s wall=1794927333
+v4_gpu layer=32 uploaded=155.024MiB in 0.107s wall=1794927333
+v4_gpu layer=33 uploaded=142.024MiB in 0.104s wall=1794927333
+v4_gpu layer=34 uploaded=155.024MiB in 0.107s wall=1794927333
+v4_gpu layer=35 uploaded=142.024MiB in 0.103s wall=1794927334
+v4_gpu layer=36 uploaded=155.024MiB in 0.107s wall=1794927334
+v4_gpu layer=37 uploaded=142.024MiB in 0.103s wall=1794927334
+v4_gpu layer=38 uploaded=155.024MiB in 0.107s wall=1794927334
+v4_gpu layer=39 uploaded=142.024MiB in 0.104s wall=1794927334
+v4_gpu layer=40 uploaded=155.024MiB in 0.107s wall=1794927335
+v4_gpu layer=41 uploaded=142.024MiB in 0.104s wall=1794927335
+v4_gpu layer=42 uploaded=155.024MiB in 0.107s wall=1794927335
+v4_dense_resident layers=43 bytes=6.267GiB
+v4_gpu resident-experts=cache-fallback (resident experts exceed device 0 budget (free=8990 MiB reserve=2800 MiB))
+v4_cli mode=chat memory=limited target_only=1
+v4_gpu moe-batch=on bank=256-experts
+v4_gpu moe-double=on
+v4_gpu moe-batch refill layer=0 missing=184 lookup=0.01s upload=0.41s (sequential retries)
+v4_gpu moe-batch refill layer=0 missing=5 lookup=0.01s upload=0.01s
+v4_gpu moe-double swaps=42 prefetched=10752
+v4_gpu head=resident device=0 bytes=1059061760 arithmetic=separate-mul-add
+v4_tokens prompt=3278 generated=36 total=3314 expert_requests=19857 hits=4378 misses=15425 hit_rate=22.048 bytes=206222131200 target_only=1
+generated_text=The history of computing progressed through successive hardware generations, from mechanical calculators to cloud data centers. Each new generation dramatically increased performance while reducing cost and size, enabling more ambitious software.
+timing time_to_first_token=35.331s after_first=9.482s
+v4_gpu uploader: jobs=8862 attached=8862 avg=0.391 ms copies=second-stream, fenced fences=1477 fence-drains=0
+v4_gpu mirror-block device=0 made=533 refills=4814 three-tensor=0
+v4_rows16 packed_slots=0
+v4_direct reads=15425 flock_reads=0 fallbacks=0 payload_bytes=194091417600
+
+
+----- stdout -----
+The history of computing progressed through successive hardware generations, from mechanical calculators to cloud data centers. Each new generation dramatically increased performance while reducing cost and size, enabling more ambitious software.<｜end▁of▁sentence｜>
+TUNE decode: 36 tokens in 44.886s
+
+===== run sz_both (V4_PREFILL_CHAIN=1 V4_COMP_BATCH=1) =====
+----- stderr -----
+[env] CUDA_DENSE is not read by deepseek-v4 (it belongs to colibri) -- it will have no effect
+[env] COLI_CUDA_PIPE is not read by deepseek-v4 (it belongs to colibri) -- it will have no effect
+[OMP] deepseek-v4: 12 compute threads (the physical cores of 24 logical CPUs; the 3 expert-loader workers take the SMT siblings); OMP_NUM_THREADS=<n> overrides, COLI_NO_OMP_TUNE=1 disables
+ram_tiers available=16.00GiB dense=resident(6.27GiB) target_slots=14 target_cache=7.50GiB head=resident-bf16 projected=15.64GiB
+v4_open index=0.09s plan=0.00s (index built once, reused by plan/inventory/head)
+v4_ssd_io mode=direct-aligned fallback=buffered-pread
+v4_autopin history=/mnt/bsc_disk/LLM-Models/DeepSeek-V4-Flash-0731-Abliterated-lovesenko/.coli_usage selections=3507655
+v4_hot_policy pin_slots_per_layer=8 repin_interval=6 mode=resident-ram rows16=hot-pins
+[DSV4 CUDA] device 0: NVIDIA GeForce RTX 5080 16.6 GB sm_120
+v4_gpu mirror-reserve=600MiB headroom; the 256-slot bank (3456MiB x2) releases the oldest decode mirrors when a prompt creates it (V4_BANK_MAKE_ROOM)
+v4_gpu tier=dense-matvec device=0
+v4_gpu layer=0 uploaded=134.024MiB in 0.117s wall=1794927383
+v4_gpu layer=1 uploaded=134.024MiB in 0.111s wall=1794927383
+v4_gpu layer=2 uploaded=155.024MiB in 0.115s wall=1794927384
+v4_gpu layer=3 uploaded=142.024MiB in 0.113s wall=1794927384
+v4_gpu layer=4 uploaded=155.024MiB in 0.116s wall=1794927384
+v4_gpu layer=5 uploaded=142.024MiB in 0.112s wall=1794927384
+v4_gpu layer=6 uploaded=155.024MiB in 0.115s wall=1794927384
+v4_gpu layer=7 uploaded=142.024MiB in 0.112s wall=1794927384
+v4_gpu layer=8 uploaded=155.024MiB in 0.115s wall=1794927385
+v4_gpu layer=9 uploaded=142.024MiB in 0.112s wall=1794927385
+v4_gpu layer=10 uploaded=155.024MiB in 0.115s wall=1794927385
+v4_gpu layer=11 uploaded=142.024MiB in 0.112s wall=1794927385
+v4_gpu layer=12 uploaded=155.024MiB in 0.116s wall=1794927385
+v4_gpu layer=13 uploaded=142.024MiB in 0.112s wall=1794927386
+v4_gpu layer=14 uploaded=155.024MiB in 0.116s wall=1794927386
+v4_gpu layer=15 uploaded=142.024MiB in 0.112s wall=1794927386
+v4_gpu layer=16 uploaded=155.024MiB in 0.116s wall=1794927386
+v4_gpu layer=17 uploaded=142.024MiB in 0.112s wall=1794927386
+v4_gpu layer=18 uploaded=155.024MiB in 0.112s wall=1794927387
+v4_gpu layer=19 uploaded=142.024MiB in 0.104s wall=1794927387
+v4_gpu layer=20 uploaded=155.024MiB in 0.119s wall=1794927387
+v4_gpu layer=21 uploaded=142.024MiB in 0.111s wall=1794927387
+v4_gpu layer=22 uploaded=155.024MiB in 0.115s wall=1794927387
+v4_gpu layer=23 uploaded=142.024MiB in 0.111s wall=1794927388
+v4_gpu layer=24 uploaded=155.024MiB in 0.115s wall=1794927388
+v4_gpu layer=25 uploaded=142.024MiB in 0.112s wall=1794927388
+v4_gpu layer=26 uploaded=155.024MiB in 0.116s wall=1794927388
+v4_gpu layer=27 uploaded=142.024MiB in 0.112s wall=1794927388
+v4_gpu layer=28 uploaded=155.024MiB in 0.116s wall=1794927388
+v4_gpu layer=29 uploaded=142.024MiB in 0.106s wall=1794927389
+v4_gpu layer=30 uploaded=155.024MiB in 0.109s wall=1794927389
+v4_gpu layer=31 uploaded=142.024MiB in 0.105s wall=1794927389
+v4_gpu layer=32 uploaded=155.024MiB in 0.107s wall=1794927389
+v4_gpu layer=33 uploaded=142.024MiB in 0.104s wall=1794927389
+v4_gpu layer=34 uploaded=155.024MiB in 0.107s wall=1794927390
+v4_gpu layer=35 uploaded=142.024MiB in 0.104s wall=1794927390
+v4_gpu layer=36 uploaded=155.024MiB in 0.107s wall=1794927390
+v4_gpu layer=37 uploaded=142.024MiB in 0.104s wall=1794927390
+v4_gpu layer=38 uploaded=155.024MiB in 0.109s wall=1794927390
+v4_gpu layer=39 uploaded=142.024MiB in 0.104s wall=1794927390
+v4_gpu layer=40 uploaded=155.024MiB in 0.107s wall=1794927391
+v4_gpu layer=41 uploaded=142.024MiB in 0.104s wall=1794927391
+v4_gpu layer=42 uploaded=155.024MiB in 0.107s wall=1794927391
+v4_dense_resident layers=43 bytes=6.267GiB
+v4_gpu resident-experts=cache-fallback (resident experts exceed device 0 budget (free=8990 MiB reserve=2800 MiB))
+v4_cli mode=chat memory=limited target_only=1
+v4_gpu moe-batch=on bank=256-experts
+v4_gpu moe-double=on
+v4_gpu moe-batch refill layer=0 missing=184 lookup=0.02s upload=0.44s (sequential retries)
+v4_gpu moe-batch refill layer=0 missing=5 lookup=0.01s upload=0.01s
+v4_gpu moe-double swaps=42 prefetched=10752
+v4_gpu head=resident device=0 bytes=1059061760 arithmetic=separate-mul-add
+v4_tokens prompt=3278 generated=36 total=3314 expert_requests=19856 hits=4378 misses=15425 hit_rate=22.049 bytes=206222131200 target_only=1
+generated_text=The history of computing progressed through successive hardware generations, from mechanical calculators to cloud data centers. Each new generation dramatically increased performance while reducing cost and size, enabling more ambitious software.
+timing time_to_first_token=35.246s after_first=9.521s
+v4_gpu uploader: jobs=8862 attached=8862 avg=0.396 ms copies=second-stream, fenced fences=1477 fence-drains=0
+v4_gpu mirror-block device=0 made=533 refills=4814 three-tensor=0
+v4_rows16 packed_slots=0
+v4_direct reads=15425 flock_reads=0 fallbacks=0 payload_bytes=194091417600
+
+
+----- stdout -----
+The history of computing progressed through successive hardware generations, from mechanical calculators to cloud data centers. Each new generation dramatically increased performance while reducing cost and size, enabling more ambitious software.<｜end▁of▁sentence｜>
+TUNE decode: 36 tokens in 44.839s
+
