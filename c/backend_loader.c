@@ -112,6 +112,7 @@ typedef const ColiCudaChainOps *(*fn_chain_ops)(void);
 typedef const CuTierOps *(*fn_tier_ops)(void);
 typedef int            (*fn_e8_set_grid)(const void *grid);
 typedef int            (*fn_fp8_set_lut)(const float *lut);
+typedef int            (*fn_vision_attention)(int device, float *out, const float *qkv, int n, int heads, int D, float scale);
 typedef int            (*fn_matmul)(ColiCudaTensor **tensor, float *y, const float *x,
                                     const void *weights, const float *scales,
                                     int fmt, int S, int I, int O, int device, int gs);
@@ -206,6 +207,7 @@ static struct {
     fn_fp8_set_lut     fp8_set_lut;
     fn_matmul          matmul;
     fn_matmul_mxfp4    matmul_mxfp4;
+    fn_vision_attention vision_attention;
     fn_expert_mxfp4    expert_mxfp4;
     fn_tensor_free     tensor_free;
     fn_tensor_bytes    tensor_bytes;
@@ -1473,6 +1475,7 @@ static int coli_cuda_load(void){
      * nothing by this name, and the wrapper's 0 is the engine's own "fall back
      * to CPU" result, so an older DLL still serves GLM and Qwen3.6 (#1405). */
     RESOLVE_OPT(matmul_mxfp4,   fn_matmul_mxfp4)
+    RESOLVE_OPT(vision_attention, fn_vision_attention)
     RESOLVE_OPT(expert_mxfp4,   fn_expert_mxfp4)
     RESOLVE_OPT(available_device_count, fn_available_device_count)   /* older DLLs still support explicit device selection */
     RESOLVE(tensor_free,    fn_tensor_free)
@@ -1739,6 +1742,11 @@ int coli_cuda_matmul(ColiCudaTensor **tensor, float *y, const float *x,
                      int fmt, int S, int I, int O, int device, int gs){
     if(!g_cuda.available) return 0;
     return g_cuda.matmul(tensor, y, x, weights, scales, fmt, S, I, O, device, gs);
+}
+
+int coli_cuda_vision_attention(int device, float *out, const float *qkv, int n, int heads, int D, float scale){
+    if(!g_cuda.available || !g_cuda.vision_attention) return 0;   /* an older backend: the CPU's */
+    return g_cuda.vision_attention(device, out, qkv, n, heads, D, scale);
 }
 
 int coli_cuda_matmul_mxfp4(float *y, const float *x, const unsigned char *q4,

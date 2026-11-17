@@ -71,6 +71,8 @@ typedef struct {
 /* A device the engine has (qwen36: the CUDA card) can take the tower's matrices: 1 when it did,
  * 0 and the CPU computes them. NULL: always the CPU. */
 static int (*q38v_device_linear)(float *out, const float *in, const Q38Linear *l, int rows);
+/* the same for the blocks' attention: qkv [n][3][heads][D] rotated, into att [n][heads][D] */
+static int (*q38v_device_attention)(float *att, const float *qkv, int n, int heads, int D, float scale);
 
 static void q38v_linear(float *out, const float *in, const Q38Linear *l, int rows)
 {
@@ -234,6 +236,7 @@ static int q38_vision_forward_dbg(const Q38Vision *v, const float *patches,
         }
 
         const float scale = 1.f / sqrtf((float)D);
+        if (q38v_device_attention && q38v_device_attention(att, qkv, n, nh, D, scale)) goto attended;
         memset(att, 0, (size_t)n * H * sizeof(float));
         /* each (head, query) pair owns its slice of att and its own score row */
         #pragma omp parallel
@@ -262,6 +265,7 @@ static int q38_vision_forward_dbg(const Q38Vision *v, const float *patches,
         free(scores);
         }
 
+    attended:
         q38v_linear(tmp, att, &blk->proj, n);
         #pragma omp parallel for schedule(static)
         for (size_t i = 0; i < (size_t)n * H; i++) x[i] += tmp[i];

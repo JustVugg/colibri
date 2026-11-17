@@ -1279,6 +1279,9 @@ int qt_vision_matmul(float *y, const float *x, const float *w, int rows, int in,
     if(t) coli_cuda_tensor_free(t);
     return ok;
 }
+int qt_vision_attention(float *out, const float *qkv, int n, int heads, int D, float scale){
+    return G.on && G.ndev > 0 && coli_cuda_vision_attention(G.dev[0], out, qkv, n, heads, D, scale);
+}
 int qt_streaming(void){ return G.on && G_stream; }
 int qt_experts_on(void){
     if(!G.on || G_trunk_only) return 0;

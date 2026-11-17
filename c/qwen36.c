@@ -3786,6 +3786,9 @@ static void q36_vision_detach(Model *m) {
 static int q36_vis_device(float *out, const float *in, const Q38Linear *l, int rows) {
     return qt_vision_matmul(out, in, l->w, rows, l->in, l->out);
 }
+static int q36_vis_device_attention(float *att, const float *qkv, int n, int heads, int D, float scale) {
+    return qt_vision_attention(att, qkv, n, heads, D, scale);
+}
 #endif
 static int q36_vision_attach(Model *m, const float *patches, int grid_h, int grid_w,
                              const int *ids, int n) {
@@ -3827,6 +3830,7 @@ static int q36_vision_attach(Model *m, const float *patches, int grid_h, int gri
     {
         const char *e = getenv("COLI_CUDA_VISION");
         q38v_device_linear = qt_ready() && !(e && *e == '0') ? q36_vis_device : NULL;
+        q38v_device_attention = q38v_device_linear ? q36_vis_device_attention : NULL;
         if (q38v_device_linear) where = "the CUDA card";
     }
 #endif
