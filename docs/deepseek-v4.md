@@ -784,6 +784,42 @@ checkpoint. The record is in `docs/experiments/v4-slab-shift-2026-11-13/`.
   loaded lazily on the first request after a restart — a fresh serve no
   longer re-prefills the system prompt.
 
+### A prompt chunk's attention as one device chain (`V4_PREFILL_CHAIN`, opt-in)
+
+With the CUDA tier, a prompt chunk's attention made the query on the card
+(wq_b), brought it down for its bf16 round, per-head norm and RoPE on the host,
+sent it up again for the cached sparse attention, brought the attended down for
+its inverse RoPE and sent it up again for wo_a + wo_b. `V4_PREFILL_CHAIN=1`
+runs that stretch as one chain on the card (`dsv4_cuda_attn_prefill_chain`):
+the normalized query ranks go up once (with the chunk's kv rows, the RoPE
+tables, the sinks and the selection, as one copy from a page-locked block) and
+the outputs come down once. The query's projection takes the batched dense path
+the host's call took, the norm and the RoPE are the decode chain's kernels over
+the batch, the attention is the same cached kernel (plain or indexed), so the
+outputs are the same bits. A chunk the chain declines makes its query on the
+host and takes the usual paths.
+
+`V4_PREFILL_CHAIN=2` runs the chain beside the host's path on every chunk and
+layer and compares each output (`pfchain verify` lines); the host's outputs are
+kept. `DSV4_PF_KPROF=1` prints the chain's stage times (`pfkprof`).
+`make -C c dsv4-prefill-chain-test` (or the engine makefile's
+`dsv4-cuda-tests`) compares the chain with the separate calls on the same
+inputs, plain and indexed.
+
+Measured on an RTX 5080 (Linux, Ryzen 9 3900X, `--memory-gb 16`, the 3,278-token
+prompt, `V4_LAYER_FUSED=1` and the other merged decode switches): time to the
+first token 43.9 → 35.1 s (medians of three alternated runs), the same text in
+every run; the verify mode found no differing output over the prompt's 989
+chunk-layers. The profiled attention stage drops from 31.4 to 17.1 s (the
+query's stage 7.7 → 0.3 s, the RoPE 1.5 → 0.1 s, wo 2.3 → 0.2 s, the attention
+itself, now the chain, 6.2 → 2.9 s), and part of the gain goes back to the
+expert bank: with the attention faster, the next layer's bank upload is less
+hidden behind it (the MoE's bank switch 2.0 → 7.1 s). At this budget the
+prompt is now mostly bound by that upload.
+The record is in `docs/experiments/v4-prefill-chain-2026-11-17/`, with the two
+profiled runs (`DSV4_ATTN_PROF=1 V4_MOE_BATCH_PROF=1`, this change's parent and the
+chain) beside the timed ones.
+
 ## Performance (RTX 5080 16 GB, 2× NVMe mirror, 32 GB RAM, i9-class CPU)
 
 | scenario | before this tier | now |
@@ -1031,6 +1067,8 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 **Prefill / checkpoints**
 | var | meaning |
 |---|---|
+| `V4_PREFILL_CHAIN` (0) | `1` = a prompt chunk's attention after the indexer as one device chain (see above); `2` = run the chain beside the host's path and compare every output (`pfchain verify`) |
+| `DSV4_PF_KPROF` (0, `.cu`) | `1` = the prompt chain's stage times per call (`pfkprof`) |
 | `V4_PREFILL_CHUNK` (128) | chunk width, clamp [1,128] |
 | `V4_PREFILL_SEGMENT` (4096) | atomic segment length (cancel/resume granularity, expert re-sweeps) |
 | `V4_PREFIX_CKPT` (1) / `V4_PREFIX_CKPT_MIN` (512) / `V4_PREFIX_CKPT_SLOTS` (4) / `V4_PREFIX_CKPT_DISK` (1) | prefix checkpoints, see above |
