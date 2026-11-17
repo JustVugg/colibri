@@ -3940,9 +3940,9 @@ def cmd_web(a):
     url = f"http://{shown}:{ui_port}/"
     server, ui = ui_server(), None
     if server is None:
-        print(f"{C.yel}the chat UI is not in this tree{C.r} (ui/server.py); serving the API only, at {api}v1")
+        print(f"{C.yel}the chat UI is not in this tree{C.r} (ui/server.py); serving the API only, at {api}v1", flush=True)
     elif not port_free(a.host, ui_port):
-        print(f"{C.yel}port {ui_port} is taken{C.r}: no chat UI (--ui-port picks another); serving the API only, at {api}v1")
+        print(f"{C.yel}port {ui_port} is taken{C.r}: no chat UI (--ui-port picks another); serving the API only, at {api}v1", flush=True)
     else:
         # stdin a pipe this process holds: the UI exits when it closes, so `coli stop` (which
         # ends this process by its pid) or a crash does not leave it holding its port
@@ -3977,7 +3977,7 @@ def cmd_web(a):
                 webbrowser.open(url); return
         threading.Thread(target=opener, daemon=True).start()
     if ui is not None:
-        print(f"chat: {url}  (opens automatically when the engine is ready); the API: {api}v1")
+        print(f"chat: {url}  (opens automatically when the engine is ready); the API: {api}v1", flush=True)
     # No terminate() when the serve ends: the UI exits when this process's end closes its stdin,
     # and the Models page, which stops this process to switch models, keeps it on through that.
     cmd_serve(a)
