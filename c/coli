@@ -3918,7 +3918,8 @@ def cmd_ui(a):
     cmd = [sys.executable, server, "--host", a.host, "--port", str(a.port), "--backend", a.backend]
     if a.models_backend: cmd += ["--models-backend", a.models_backend]
     for d in a.models_dir or []: cmd += ["--models-dir", d]
-    if a.searx: cmd += ["--searx", a.searx]
+    if a.parallel_search: cmd += ["--parallel-search"]
+    elif a.searx: cmd += ["--searx", a.searx]
     try:
         sys.exit(subprocess.call(cmd))
     except KeyboardInterrupt:
@@ -4375,8 +4376,11 @@ def main():
     pui.add_argument("--models-dir",action="append",default=[],metavar="DIR",
                      help="where models are, for the Models page (default: the folder coli setup "
                      "uses, ~/colibri-models)")
-    pui.add_argument("--searx",default=os.environ.get("COLIBRI_SEARX",""),
+    search = pui.add_mutually_exclusive_group()
+    search.add_argument("--searx",default=os.environ.get("COLIBRI_SEARX",""),
                      help="a SearXNG instance for the chat's web search (default: DuckDuckGo's HTML results)")
+    search.add_argument("--parallel-search", action="store_true",
+                        help="send web search queries to Parallel's public MCP server")
     pui.add_argument("--no-browser",action="store_true",help="don't open the browser")
     # One-step setup (setup_flow.py). No `common` parent: --model here names a
     # catalog entry, not a model directory, and nothing below loads an engine.

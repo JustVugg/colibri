@@ -39,6 +39,10 @@ and when the page stops a request the upstream connection closes, which stops th
 - **Web search**: the chat can search and read pages before it answers (`web.py`): results
   from a SearXNG instance when `coli ui --searx URL` names one, else DuckDuckGo's plain HTML
   results (no key); the pages' readable text only, at public addresses only.
+  To use [Parallel Search MCP](https://docs.parallel.ai/integrations/mcp/installation)
+  without an API key, run `coli ui --parallel-search`. While the chat's Web switch is on,
+  this sends the search queries to Parallel. Page reads still go through Colibri's public
+  address checks. The flag takes precedence over `COLIBRI_SEARX`.
 - **Mascot**: the hummingbird follows the turn (reading, reasoning, writing, done, stopped).
 
 - **Models**: what fits the machine the gateway runs on and how fast it would go, each model

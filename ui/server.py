@@ -9,7 +9,7 @@ origin (the gateway sends no CORS headers). Standard library only.
 Besides the proxy it answers /agents (ui/agents.py: a coding agent opened in a
 new terminal window, pointed at colibri) and /v1/responses (ui/responses_shim.py:
 the Responses API over the gateway's chat API, for agents that speak only that).
-/web/ is the chat's web search (ui/web.py: SearXNG with --searx, else DuckDuckGo).
+/web/ is the chat's web search (ui/web.py).
 /models/ is the Models page (ui/models.py): in this process when the gateway is on
 this machine, else a models service on the engine's machine (--models-backend);
 with neither it answers 404 and the page says the feature is not available.
@@ -221,10 +221,14 @@ def main():
                          "when the gateway is elsewhere")
     ap.add_argument("--models-dir", action="append", default=[],
                     help="where models are, for the Models page (default: colibri's own folder)")
-    ap.add_argument("--searx", default=os.environ.get("COLIBRI_SEARX", ""),
+    search = ap.add_mutually_exclusive_group()
+    search.add_argument("--searx", default=os.environ.get("COLIBRI_SEARX", ""),
                     help="a SearXNG instance for web search (default: DuckDuckGo's HTML results)")
+    search.add_argument("--parallel-search", action="store_true",
+                        help="send web search queries to Parallel's public MCP server")
     a = ap.parse_args()
     web.SEARX = a.searx
+    web.PARALLEL_SEARCH = a.parallel_search
     Handler.backend = urllib.parse.urlparse(a.backend)
     Handler.models_backend = urllib.parse.urlparse(a.models_backend) if a.models_backend else None
     Handler.port = a.port

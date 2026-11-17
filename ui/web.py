@@ -1,9 +1,10 @@
 """Web search for the chat (the page's search step): results for a query, then the readable text
 of the pages the model chooses to open. Standard library only.
 
-The results come from a SearXNG instance when one is named (--searx URL or COLIBRI_SEARX),
-else from DuckDuckGo's plain HTML page, which needs no key. What the model reads is short on
-purpose: every character is prompt the engine has to read.
+The results come from Parallel's public MCP server with --parallel-search, a SearXNG
+instance when one is named (--searx URL or COLIBRI_SEARX), or DuckDuckGo's plain HTML page
+by default. What the model reads is short on purpose: every character is prompt the
+engine has to read.
 
 A page is opened only at a public address (no loopback, private, link-local or reserved one,
 redirects checked the same way), so a page the model asks for cannot reach this machine's own
@@ -17,14 +18,20 @@ import re
 import socket
 import urllib.parse
 import urllib.request
+from contextlib import closing
 from html.parser import HTMLParser
 
 UA = "Mozilla/5.0 (colibri local search)"
 SEARX = ""   # set by server.py from --searx
+PARALLEL_SEARCH = False
+MCP_VERSION = "2025-03-26"
+MCP_MAX_BODY = 2 << 20
 
 
 def status():
-    """{"search": bool, "engine": name}: SearXNG when it answers, else DuckDuckGo"""
+    """{"search": bool, "engine": name}: the selected search engine"""
+    if PARALLEL_SEARCH:
+        return {"search": True, "engine": "parallel"}
     if SEARX:
         try:
             with urllib.request.urlopen(SEARX.rstrip("/") + "/healthz", timeout=3) as r:
@@ -116,12 +123,119 @@ def _duckduckgo(q, n):
     return out, []
 
 
+def _mcp_reply(response, request_id):
+    """Read the matching JSON-RPC reply from a JSON body or an SSE event."""
+    content_type = response.headers.get_content_type()
+    if content_type == "application/json":
+        body = response.read(MCP_MAX_BODY + 1)
+        if len(body) <= MCP_MAX_BODY:
+            reply = json.loads(body)
+            if isinstance(reply, dict) and reply.get("id") == request_id:
+                return reply
+    elif content_type == "text/event-stream":
+        remaining, fields = MCP_MAX_BODY, []
+        while remaining:
+            line = response.readline(remaining + 1)
+            remaining -= len(line)
+            if not line or remaining < 0:
+                break
+            line = line.rstrip(b"\r\n")
+            if line.startswith(b"data:"):
+                fields.append(line[5:].removeprefix(b" "))
+            elif not line and fields:
+                reply = json.loads(b"\n".join(fields))
+                if isinstance(reply, dict) and reply.get("id") == request_id:
+                    return reply
+                fields.clear()
+    raise RuntimeError("Parallel MCP did not return a matching reply")
+
+
+def _parallel_rows(q):
+    headers = {"User-Agent": "colibri", "Content-Type": "application/json",
+               "Accept": "application/json, text/event-stream"}
+
+    def post(method, params, request_id=None):
+        body = {"jsonrpc": "2.0", "method": method, "params": params}
+        if request_id is not None:
+            body["id"] = request_id
+        # A fixed HTTPS destination, with no redirects. Each POST owns its
+        # connection so we can close an SSE stream after the matching reply.
+        with closing(http.client.HTTPSConnection("mcp.parallel.ai", timeout=15)) as conn:
+            conn.request("POST", "/mcp", json.dumps(body).encode(), headers)
+            with conn.getresponse() as response:
+                if response.status != (202 if request_id is None else 200):
+                    raise RuntimeError("Parallel MCP returned HTTP %d" % response.status)
+                if method == "initialize":
+                    session = response.getheader("Mcp-Session-Id")
+                    if session:
+                        headers["Mcp-Session-Id"] = session
+                if request_id is None:
+                    return None
+                reply = _mcp_reply(response, request_id)
+        result = reply.get("result")
+        if "error" in reply or not isinstance(result, dict) or result.get("isError"):
+            raise RuntimeError("Parallel MCP failed to %s" % method)
+        return result
+
+    try:
+        init = post("initialize", {"protocolVersion": MCP_VERSION, "capabilities": {},
+                                   "clientInfo": {"name": "colibri", "version": "1"}}, 1)
+        if init.get("protocolVersion") != MCP_VERSION:
+            raise RuntimeError("Parallel MCP returned an unsupported protocol version")
+        headers["MCP-Protocol-Version"] = MCP_VERSION
+        post("notifications/initialized", {})
+        reply = post("tools/call", {"name": "web_search", "arguments": {
+            "objective": q, "search_queries": [q]}}, 2)
+    except ValueError as e:
+        raise RuntimeError("Parallel MCP returned an invalid reply") from e
+    finally:
+        if "Mcp-Session-Id" in headers:
+            try:
+                with closing(http.client.HTTPSConnection("mcp.parallel.ai", timeout=2)) as conn:
+                    conn.request("DELETE", "/mcp", headers=headers)
+                    conn.getresponse().close()
+            except (OSError, ValueError, http.client.HTTPException):
+                pass   # the search result is independent of session cleanup
+
+    data = reply.get("structuredContent")
+    rows = data.get("results") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        raise RuntimeError("Parallel MCP returned invalid search results")
+    return rows
+
+
+def _parallel(q, n):
+    out, seen = [], set()
+    for row in _parallel_rows(q):
+        u = row.get("url") if isinstance(row, dict) else None
+        if not isinstance(u, str) or u in seen or re.search(r"[\s\\\x00-\x1f\x7f]", u):
+            continue
+        try:
+            if urllib.parse.urlsplit(u).username is not None:
+                continue
+            _public_url(u)
+        except (ValueError, OSError):
+            continue
+        seen.add(u)
+        title, date, excerpts = row.get("title"), row.get("publish_date"), row.get("excerpts")
+        snippet = " ".join(x for x in excerpts if isinstance(x, str)) if isinstance(excerpts, list) else ""
+        out.append({"title": _clean(title if isinstance(title, str) else u, 160), "url": u,
+                    "snippet": _clean(snippet, 320), "engine": "parallel",
+                    "date": date[:10] if isinstance(date, str) and date else None})
+        if len(out) >= n:
+            break
+    return out, []
+
+
 def search(q, n=6):
     q = (q or "").strip()[:400]
     if not q:
         raise ValueError("an empty query")
     n = max(1, min(int(n), 10))
-    results, answers = _searx(q, n) if status()["engine"] == "searxng" else _duckduckgo(q, n)
+    if PARALLEL_SEARCH:
+        results, answers = _parallel(q, n)
+    else:
+        results, answers = _searx(q, n) if status()["engine"] == "searxng" else _duckduckgo(q, n)
     return {"q": q, "results": results, "answers": answers}
 
 
