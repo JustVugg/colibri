@@ -22778,6 +22778,26 @@ const void *coli_v4_layer_data(const ColiDeepSeekV4LayerWeights *weights,
     }
     return NULL;
 }
+
+/* The resident unit's lookup of a tensor's device mirror. The compressor and
+ * indexer units call it when built with COLI_V4_GPU_TIER (the Windows test
+ * link); this loader attaches no mirror, so it finds the NULL a mirrorless
+ * tensor has and those units take their host path. */
+void *coli_v4_layer_gpu(const ColiDeepSeekV4LayerWeights *weights,
+                        const char *suffix) {
+    if (!weights || !suffix) return NULL;
+    char name[COLI_V4_MAX_TENSOR_NAME];
+    snprintf(name, sizeof(name), "layers.%d.%s.weight", weights->plan.layer,
+             suffix);
+    for (size_t i = 0; i < weights->plan.tensor_count; i++)
+        if (strcmp(weights->plan.tensors[i].name, name) == 0)
+            return weights->gpu[i];
+    snprintf(name, sizeof(name), "layers.%d.%s", weights->plan.layer, suffix);
+    for (size_t i = 0; i < weights->plan.tensor_count; i++)
+        if (strcmp(weights->plan.tensors[i].name, name) == 0)
+            return weights->gpu[i];
+    return NULL;
+}
 #endif /* COLI_V4_UNIT_LAYER */
 
 #ifdef COLI_V4_UNIT_CONFIG
