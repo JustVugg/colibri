@@ -1279,6 +1279,31 @@ tests/test_qwen38_metal_kernels: tests/test_qwen38_metal_kernels.c qwen38_gpu.h 
 test-qwen38-metal-kernels: tests/test_qwen38_metal_kernels
 	./tests/test_qwen38_metal_kernels
 
+# Counter-tests: for n = 1..5 build the test and both Metal objects with
+# -DQ38_COUNTER_TEST=n (1 hc_mix fc, 2 ple ring shift, 3 qsa tie order, 4 router
+# tie, 5 bf16 rounding; the macro reaches the Metal sources through
+# preprocessorMacros, only in these builds) and require the test to FAIL. Exit 0
+# only if all five failed. The objects stay in tests/ct<n>_*, never linked into
+# anything else.
+.PHONY: test-qwen38-metal-counter
+test-qwen38-metal-counter: qwen38_gpu.h qwen36_gpu.h qwen36_metal_internal.h metal/qwen38.metal metal/qwen36.metal \
+                           tests/test_qwen38_metal_kernels.c qwen38_metal.m qwen36_metal.m
+	@missed=0; \
+	for n in 1 2 3 4 5; do \
+	  echo "== counter-test $$n"; \
+	  $(QWEN36_METALC) -DQ38_COUNTER_TEST=$$n -c qwen36_metal.m -o tests/ct$${n}_qwen36_metal.o && \
+	  $(QWEN36_METALC) -DQ38_COUNTER_TEST=$$n -c qwen38_metal.m -o tests/ct$${n}_qwen38_metal.o && \
+	  $(CC) -O2 -Wall -Wextra -Wno-unused-function -std=c11 -DQ38_COUNTER_TEST=$$n tests/test_qwen38_metal_kernels.c \
+	      tests/ct$${n}_qwen38_metal.o tests/ct$${n}_qwen36_metal.o -framework Metal -framework Foundation -lm \
+	      -o tests/test_ct$${n}_qwen38_kernels || { echo "counter-test $$n: build failed"; exit 1; }; \
+	  if ./tests/test_ct$${n}_qwen38_kernels > tests/ct$${n}.log 2>&1; then \
+	    echo "counter-test $$n: test PASSED (not caught)"; missed=1; \
+	  else \
+	    echo "counter-test $$n: test FAILED as required ($$(grep -c ' FAIL' tests/ct$${n}.log) failing cases)"; \
+	  fi; \
+	done; \
+	if [ $$missed = 0 ]; then echo "counter-tests: all 5 caught"; else echo "counter-tests: NOT ALL CAUGHT"; exit 1; fi
+
 # Every Qwen3.6 kernel against a double-precision reference. No model needed.
 tests/test_qwen36_kernels: tests/test_qwen36_kernels.c qwen36_gpu.h qwen36_cpu_mm.h ggml_quants.h ggml_grids.h \
                            matmul_f32.h qwen36_metal.o

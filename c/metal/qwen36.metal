@@ -1630,6 +1630,11 @@ kernel void q36_router_select_row(device const float *prob [[buffer(0)]],
 // and weight -1e30, unnormalized, as q36_router_select.
 #define Q36_WIDE_E 512
 #define Q36_WIDE_K 16
+#if Q38_COUNTER_TEST == 4   /* test-only: equal experts go to the higher id (a build with the macro unset is untouched) */
+#define Q36_WIDE_TIE(o, i) ((o) > (i))
+#else
+#define Q36_WIDE_TIE(o, i) ((o) < (i))
+#endif
 kernel void q36_router_select_wide(device const float *prob [[buffer(0)]],
                                    device int *ids [[buffer(1)]],
                                    device float *weights [[buffer(2)]],
@@ -1659,13 +1664,13 @@ kernel void q36_router_select_wide(device const float *prob [[buffer(0)]],
         for (ushort d = 16; d > 0; d >>= 1) {
             float ov = simd_shuffle_down(bv, d);
             uint oi = simd_shuffle_down(bi, d);
-            if (lane + d < 32 && (ov > bv || (ov == bv && oi < bi))) { bv = ov; bi = oi; }
+            if (lane + d < 32 && (ov > bv || (ov == bv && Q36_WIDE_TIE(oi, bi)))) { bv = ov; bi = oi; }
         }
         if (lane == 0) { bestv[sg] = bv; besti[sg] = bi; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (tid == 0) {
             for (uint g = 1; g < groups; g++)
-                if (bestv[g] > bv || (bestv[g] == bv && besti[g] < bi)) { bv = bestv[g]; bi = besti[g]; }
+                if (bestv[g] > bv || (bestv[g] == bv && Q36_WIDE_TIE(besti[g], bi))) { bv = bestv[g]; bi = besti[g]; }
             if (bi == 0xffffffffu) {            /* fewer eligible experts than K */
                 chosen[k] = -1;
                 val[k] = -1e30f;

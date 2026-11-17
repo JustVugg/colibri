@@ -140,6 +140,9 @@ static id<MTLLibrary> q36_compile(id<MTLDevice> device) {
         options.fastMathEnabled = NO;
 #pragma clang diagnostic pop
     }
+#ifdef Q38_COUNTER_TEST   /* test-only: counter-test 4 perturbs q36_router_select_wide; never set in production */
+    options.preprocessorMacros = @{@"Q38_COUNTER_TEST" : @(Q38_COUNTER_TEST)};
+#endif
     NSError *error = nil;
     id<MTLLibrary> library = [device newLibraryWithSource:[NSString stringWithUTF8String:q36_source]
                                                   options:options error:&error];

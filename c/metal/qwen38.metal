@@ -18,7 +18,11 @@ kernel void q38_copy(device const float *x [[buffer(0)]],
  * (fixed, deterministic order), the fast one with simd_sum. */
 struct q38_dot_args { uint rows, in, out; };
 
+#if Q38_COUNTER_TEST == 5   /* counter-test 5: bf16 expands with a half-ulp bias */
+static inline float q38_bf16(ushort w) { return as_type<float>((uint(w) << 16) | 0x8000u); }
+#else
 static inline float q38_bf16(ushort w) { return as_type<float>(uint(w) << 16); }
+#endif
 
 static inline float q38_dot_lane(device const float *xr, device const ushort *wo, uint in, uint lane) {
     float s = 0.0f;
@@ -96,7 +100,11 @@ kernel void q38_hc_mix(device const float *a [[buffer(0)]],
     ulong base = r * p.C * p.D + d;
     float v = 0.0f;
     for (uint k = 0; k < p.C; k++) v += q38_sigmoid(a[base + (ulong)k * p.D]) * b[base + (ulong)k * p.D];
+#if Q38_COUNTER_TEST == 1   /* counter-test 1: hc_mix divides by the wrong fc */
+    y[i] = v / (p.fc + 1.0f);
+#else
     y[i] = v / p.fc;
+#endif
 }
 
 /* hyper[r][k][d] += inject[r][k] * block[r][d]; n = rows * C * D */
@@ -226,7 +234,11 @@ kernel void q38_ple_conv(device float *out [[buffer(0)]],
         float v = gated[i] + a * q38_sigmoid(a);
         if (p.accumulate) out[i] += v;
         else out[i] = v;
+#if Q38_COUNTER_TEST == 2   /* counter-test 2: the ring shifts one entry short */
+        for (uint j = 0; j + 2 < SL; j++) rg[j] = rg[j + 1];
+#else
         for (uint j = 0; j + 1 < SL; j++) rg[j] = rg[j + 1];
+#endif
         rg[SL - 1] = nv;
         if (s < p.snap_rows) {
             device float *sd = snap + ((ulong)s * p.W + d) * SL;
@@ -330,6 +342,11 @@ static inline uint q38_scan256(threadgroup uint *sums, uint v, uint t) {
     return r;
 }
 
+#if Q38_COUNTER_TEST == 3   /* counter-test 3: equal scores rank the higher block first */
+#define Q38_TIE_KEY(b) (b)
+#else
+#define Q38_TIE_KEY(b) (0xffffffffu - (b))
+#endif
 kernel void q38_qsa_select(device const float *sc [[buffer(0)]],
                            device int *sel [[buffer(1)]],
                            constant q38_select_args &p [[buffer(2)]],
@@ -388,7 +405,7 @@ kernel void q38_qsa_select(device const float *sc [[buffer(0)]],
             uint u = bits[b];
             bool tie = u == cutoff && ties_taken > 0u;
             if (tie) ties_taken--;
-            if (u > cutoff || tie) keys[slot++] = (ulong(u) << 32) | ulong(0xffffffffu - b);
+            if (u > cutoff || tie) keys[slot++] = (ulong(u) << 32) | ulong(Q38_TIE_KEY(b));
         }
     }
     uint P = 1u;
@@ -409,7 +426,7 @@ kernel void q38_qsa_select(device const float *sc [[buffer(0)]],
         }
     }
     for (uint i = t; i < take * p.R; i += 256) {
-        uint blk = 0xffffffffu - uint(keys[i / p.R] & 0xfffffffful);
+        uint blk = Q38_TIE_KEY(uint(keys[i / p.R] & 0xfffffffful));
         row[1 + i] = int(blk * p.R + i % p.R);
     }
     uint tail = visible - blocks * p.R;

@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "../qwen38_gpu.h"
 #include "../ggml_quants.h"
 
@@ -1046,6 +1047,238 @@ static void test_qsa_declines(void) {
     q36_tensor_free(big); q36_tensor_free(y); q36_tensor_free(small);
 }
 
+/* ---- exact mode is deterministic: every op twice, same bits ------------------ */
+
+static void fill_ff(q36_tensor *t, size_t bytes) { memset(q36_tensor_data(t), 0xff, bytes); }
+
+/* pass 0 keeps a copy of p, pass 1 compares: byte-identical (same_bits) or FAIL. */
+static void det_step(const char *name, int pass, void **saved, const void *p, size_t bytes, int ok) {
+    if (pass == 0) {
+        *saved = ok ? malloc(bytes) : NULL;
+        if (*saved) memcpy(*saved, p, bytes);
+        return;
+    }
+    expect(name, ok && *saved && memcmp(*saved, p, bytes) == 0);
+    free(*saved);
+}
+
+static void test_exact_twice(void) {
+    q36_gpu_set_exact(1);
+    void *sv = NULL, *sv2 = NULL, *sv3 = NULL;
+    int ok;
+
+    {   /* dot_bf16: 4 rows, 2560 -> 640 */
+        int rows = 4, in = 2560, out = 640;
+        q36_tensor *x = rand_tensor((size_t)rows * in, 2.0f), *w = q36_tensor_new((size_t)out * in * 2);
+        q36_tensor *y = q36_tensor_new((size_t)rows * out * 4);
+        for (size_t i = 0; i < (size_t)out * in; i++) { float f = frand(); uint32_t b; memcpy(&b, &f, 4); ((uint16_t *)q36_tensor_data(w))[i] = (uint16_t)(b >> 16); }
+        for (int pass = 0; pass < 2; pass++) {
+            fill_ff(y, (size_t)rows * out * 4);
+            ok = q38_dot_bf16(y, x, w, rows, in, out); sync_or_die();
+            det_step("twice dot_bf16", pass, &sv, F(y), (size_t)rows * out * 4, ok);
+        }
+        q36_tensor_free(x); q36_tensor_free(w); q36_tensor_free(y);
+    }
+    {   /* hc_low, hc_inj, hc_mix, hc_apply, hc_norm */
+        int rows = 4, D = 2560, C = 4;
+        size_t W = (size_t)C * D, n = 1280;
+        q36_tensor *a = rand_tensor((size_t)rows * W, 4.0f), *b = rand_tensor((size_t)rows * W, 2.0f);
+        q36_tensor *y = q36_tensor_new((size_t)rows * W * 4), *h = q36_tensor_new((size_t)rows * W * 4);
+        q36_tensor *inj = rand_tensor((size_t)rows * C, 2.0f), *blk = rand_tensor((size_t)rows * D, 2.0f);
+        q36_tensor *hs = rand_tensor((size_t)rows * W, 3.0f), *nw = rand_tensor(W, 0.5f);
+        for (int pass = 0; pass < 2; pass++) {
+            fill_ff(y, n * 4);
+            ok = q38_hc_low(y, a, (int)n, 4.0f); sync_or_die();
+            det_step("twice hc_low", pass, &sv, F(y), n * 4, ok);
+            fill_ff(y, n * 4);
+            ok = q38_hc_inj(y, a, (int)n, 4.0f); sync_or_die();
+            det_step("twice hc_inj", pass, &sv2, F(y), n * 4, ok);
+            fill_ff(y, (size_t)rows * D * 4);
+            ok = q38_hc_mix(y, a, b, rows, D, C, 4.0f); sync_or_die();
+            det_step("twice hc_mix", pass, &sv3, F(y), (size_t)rows * D * 4, ok);
+        }
+        for (int pass = 0; pass < 2; pass++) {
+            memcpy(F(h), F(hs), (size_t)rows * W * 4);
+            ok = q38_hc_apply(h, inj, blk, rows, D, C); sync_or_die();
+            det_step("twice hc_apply", pass, &sv, F(h), (size_t)rows * W * 4, ok);
+            fill_ff(y, (size_t)rows * W * 4);
+            ok = q38_hc_norm(y, a, nw, rows, D, C, 1e-6f); sync_or_die();
+            det_step("twice hc_norm", pass, &sv2, F(y), (size_t)rows * W * 4, ok);
+        }
+        q36_tensor_free(a); q36_tensor_free(b); q36_tensor_free(y); q36_tensor_free(h);
+        q36_tensor_free(inj); q36_tensor_free(blk); q36_tensor_free(hs); q36_tensor_free(nw);
+    }
+    {   /* ple_gate, ple_conv: H 2560, C 4, convk 4, ngram 3 */
+        int S = 4, H = 2560, C = 4, SL = 9, snap_rows = 3;
+        size_t W = (size_t)C * H, n = (size_t)S * W, nr = W * SL;
+        q38_ple_shape sh = {S, C, (int)W, H, 4, 3, snap_rows, 1e-6f, 1};
+        q36_tensor *keys = rand_tensor(n, 2.0f), *hyper = rand_tensor(n, 3.0f), *value = rand_tensor((size_t)S * H, 1.0f);
+        q36_tensor *prm = rand_tensor(3 * W, 0.5f), *gated = q36_tensor_new(n * 4), *normv = q36_tensor_new(n * 4);
+        q36_tensor *conv = rand_tensor(W * 4, 0.5f), *out0 = rand_tensor(n, 3.0f), *ring0 = rand_tensor(nr, 2.0f);
+        q36_tensor *out = q36_tensor_new(n * 4), *ring = q36_tensor_new(nr * 4), *snap = q36_tensor_new((size_t)snap_rows * nr * 4);
+        for (int pass = 0; pass < 2; pass++) {
+            fill_ff(gated, n * 4); fill_ff(normv, n * 4);
+            ok = q38_ple_gate(gated, normv, keys, hyper, value, prm, &sh); sync_or_die();
+            det_step("twice ple_gate gated", pass, &sv, F(gated), n * 4, ok);
+            det_step("twice ple_gate normv", pass, &sv2, F(normv), n * 4, ok);
+        }
+        for (int pass = 0; pass < 2; pass++) {
+            memcpy(F(out), F(out0), n * 4); memcpy(F(ring), F(ring0), nr * 4); fill_ff(snap, (size_t)snap_rows * nr * 4);
+            ok = q38_ple_conv(out, ring, snap, gated, normv, conv, &sh); sync_or_die();
+            det_step("twice ple_conv out", pass, &sv, F(out), n * 4, ok);
+            det_step("twice ple_conv ring", pass, &sv2, F(ring), nr * 4, ok);
+            det_step("twice ple_conv snap", pass, &sv3, F(snap), (size_t)snap_rows * nr * 4, ok);
+        }
+        q36_tensor_free(keys); q36_tensor_free(hyper); q36_tensor_free(value); q36_tensor_free(prm); q36_tensor_free(gated);
+        q36_tensor_free(normv); q36_tensor_free(conv); q36_tensor_free(out0); q36_tensor_free(ring0);
+        q36_tensor_free(out); q36_tensor_free(ring); q36_tensor_free(snap);
+    }
+    {   /* QSA: pool, score, select, attention. IQ 4, ID 128, R 4, budget 256 (64 blocks), 24 heads, kv 2, D 256 */
+        int ID = 128, R = 4, budget = 256, S = 3, pos_base = 1200, nb = 300, heads = 24, kv = 2, D = 256, cap = 1300;
+        int nbmax = (pos_base + S) / R + 1, sel_row = qsa_sel_row(R, budget);
+        q38_qsa_shape sh = qsa_shape(4, ID, R, budget, 64);
+        q36_tensor *ik = rand_tensor((size_t)nb * R * ID, 2.0f), *kn = rand_tensor(ID, 0.5f);
+        q36_tensor *pk = q36_tensor_new((size_t)nbmax * ID * 4), *q = rand_tensor((size_t)S * 4 * ID, 1.0f);
+        q36_tensor *pk2 = rand_tensor((size_t)nbmax * ID, 1.0f), *sc = q36_tensor_new((size_t)S * nbmax * 4);
+        q36_tensor *scq = q36_tensor_new((size_t)S * nbmax * 4), *sel = q36_tensor_new((size_t)S * sel_row * 4);
+        for (size_t i = 0; i < (size_t)S * nbmax; i++) F(scq)[i] = floorf(fabsf(frand()) * 16.0f) / 16.0f;   /* ties */
+        for (int pass = 0; pass < 2; pass++) {
+            fill_ff(pk, (size_t)nb * ID * 4);
+            ok = q38_qsa_pool(pk, ik, kn, 0, nb, &sh); sync_or_die();
+            det_step("twice qsa_pool", pass, &sv, F(pk), (size_t)nb * ID * 4, ok);
+            fill_ff(sc, (size_t)S * nbmax * 4);
+            ok = q38_qsa_score(sc, q, pk2, S, pos_base, nbmax, &sh); sync_or_die();
+            det_step("twice qsa_score", pass, &sv2, F(sc), (size_t)S * nbmax * 4, ok);
+            fill_ff(sel, (size_t)S * sel_row * 4);
+            ok = q38_qsa_select(sel, scq, S, pos_base, nbmax, sel_row, &sh); sync_or_die();
+            det_step("twice qsa_select", pass, &sv3, q36_tensor_data(sel), (size_t)S * sel_row * 4, ok);
+        }
+        size_t cn = (size_t)kv * cap * D, qn = (size_t)S * heads * D;
+        q36_tensor *kc = rand_tensor(cn, 1.0f), *vc = rand_tensor(cn, 2.0f);
+        q36_tensor *aq = rand_tensor(qn, 4.0f), *g = rand_tensor(qn, 3.0f), *ao = q36_tensor_new(qn * 4);
+        for (int pass = 0; pass < 2; pass++) {
+            fill_ff(ao, qn * 4);
+            ok = q38_attn_sel(ao, aq, g, kc, vc, sel, S, pos_base, heads, kv, D, cap, sel_row, 0); sync_or_die();
+            det_step("twice attn_sel", pass, &sv, F(ao), qn * 4, ok);
+        }
+        q36_tensor_free(ik); q36_tensor_free(kn); q36_tensor_free(pk); q36_tensor_free(q); q36_tensor_free(pk2);
+        q36_tensor_free(sc); q36_tensor_free(scq); q36_tensor_free(sel); q36_tensor_free(kc); q36_tensor_free(vc);
+        q36_tensor_free(aq); q36_tensor_free(g); q36_tensor_free(ao);
+    }
+    {   /* wide router select and the lifted expert sum: 512 experts, top-k 10, H 2560 */
+        int rows = 3, E = 512, K = 10, H = 2560;
+        q36_tensor *lg = rand_tensor((size_t)rows * E, 3.0f), *prob = q36_tensor_new((size_t)rows * E * 4);
+        q36_tensor *ids = q36_tensor_new((size_t)rows * K * 4), *wts = q36_tensor_new((size_t)rows * K * 4);
+        for (size_t i = 0; i < (size_t)rows * E; i++) F(lg)[i] = floorf(F(lg)[i] * 4.0f) / 4.0f;   /* ties */
+        for (int pass = 0; pass < 2; pass++) {
+            fill_ff(ids, (size_t)rows * K * 4); fill_ff(wts, (size_t)rows * K * 4);
+            ok = q36_router_softmax(prob, lg, NULL, rows, E) && q36_router_select(ids, wts, prob, rows, E, K, 1, 1); sync_or_die();
+            det_step("twice router ids", pass, &sv, q36_tensor_data(ids), (size_t)rows * K * 4, ok);
+            det_step("twice router weights", pass, &sv2, F(wts), (size_t)rows * K * 4, ok);
+        }
+        size_t cells = (size_t)rows * H;
+        q36_tensor *y = rand_tensor(cells * K, 2.0f), *ew = rand_tensor((size_t)rows * K, 0.5f);
+        q36_tensor *shd = rand_tensor(cells, 1.0f), *res = rand_tensor(cells, 4.0f), *eo = q36_tensor_new(cells * 4);
+        for (int pass = 0; pass < 2; pass++) {
+            fill_ff(eo, cells * 4);
+            ok = q36_expert_sum(eo, y, ew, shd, res, rows, H, K); sync_or_die();
+            det_step("twice expert_sum", pass, &sv3, F(eo), cells * 4, ok);
+        }
+        q36_tensor_free(lg); q36_tensor_free(prob); q36_tensor_free(ids); q36_tensor_free(wts);
+        q36_tensor_free(y); q36_tensor_free(ew); q36_tensor_free(shd); q36_tensor_free(res); q36_tensor_free(eo);
+    }
+}
+
+/* ---- QWEN38_BENCH=1: report-only microbench, median of 20 dispatches (each
+ * enqueued and q36_gpu_sync'd), exact mode, decode (1 row) and a 4-row step. ---- */
+
+static double now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+static int cmp_d(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
+#define BENCH(label, ...) do { \
+    double t_[20]; \
+    for (int i_ = 0; i_ < 20; i_++) { double t0_ = now_ms(); if (!(__VA_ARGS__)) { puts("bench: call declined"); exit(1); } sync_or_die(); t_[i_] = now_ms() - t0_; } \
+    qsort(t_, 20, sizeof(double), cmp_d); \
+    printf("bench %-44s median %8.3f ms (min %.3f max %.3f)\n", label, (t_[9] + t_[10]) / 2, t_[0], t_[19]); \
+} while (0)
+
+static void bench_all(void) {
+    q36_gpu_set_exact(1);
+    for (int rows = 1; rows <= 4; rows += 3) {
+        char l[96];
+        int H = 2560, C = 4, D = 2560, out = 640, in = 2560;
+        size_t W = (size_t)C * H;
+        q36_tensor *x = rand_tensor((size_t)rows * in, 2.0f), *w = q36_tensor_new((size_t)out * in * 2), *y = q36_tensor_new((size_t)rows * W * 4);
+        for (size_t i = 0; i < (size_t)out * in; i++) { float f = frand(); uint32_t b; memcpy(&b, &f, 4); ((uint16_t *)q36_tensor_data(w))[i] = (uint16_t)(b >> 16); }
+        snprintf(l, sizeof l, "dot_bf16 rows %d 2560->640", rows);
+        BENCH(l, q38_dot_bf16(y, x, w, rows, in, out));
+        q36_tensor *a = rand_tensor((size_t)rows * W, 4.0f), *b = rand_tensor((size_t)rows * W, 2.0f);
+        q36_tensor *inj = rand_tensor((size_t)rows * C, 2.0f), *blk = rand_tensor((size_t)rows * D, 2.0f), *nw = rand_tensor(W, 0.5f);
+        snprintf(l, sizeof l, "hc_low rows %d x 320", rows);   BENCH(l, q38_hc_low(y, a, rows * 320, 4.0f));
+        snprintf(l, sizeof l, "hc_inj rows %d x 4", rows);     BENCH(l, q38_hc_inj(y, a, rows * 4, 4.0f));
+        snprintf(l, sizeof l, "hc_mix rows %d H2560 C4", rows);  BENCH(l, q38_hc_mix(y, a, b, rows, D, C, 4.0f));
+        snprintf(l, sizeof l, "hc_apply rows %d H2560 C4", rows); BENCH(l, q38_hc_apply(a, inj, blk, rows, D, C));
+        snprintf(l, sizeof l, "hc_norm rows %d H2560 C4", rows); BENCH(l, q38_hc_norm(y, b, nw, rows, D, C, 1e-6f));
+        {
+            int SL = 9, snap_rows = 0;
+            size_t nr = W * SL, n = (size_t)rows * W;
+            q38_ple_shape sh = {rows, C, (int)W, H, 4, 3, snap_rows, 1e-6f, 0};
+            q36_tensor *keys = rand_tensor(n, 2.0f), *value = rand_tensor((size_t)rows * H, 1.0f), *prm = rand_tensor(3 * W, 0.5f);
+            q36_tensor *gated = q36_tensor_new(n * 4), *normv = q36_tensor_new(n * 4), *conv = rand_tensor(W * 4, 0.5f);
+            q36_tensor *ring = rand_tensor(nr, 2.0f), *po = q36_tensor_new(n * 4);
+            snprintf(l, sizeof l, "ple_gate rows %d H2560 C4", rows); BENCH(l, q38_ple_gate(gated, normv, keys, a, value, prm, &sh));
+            snprintf(l, sizeof l, "ple_conv rows %d W10240 k4 ng3", rows); BENCH(l, q38_ple_conv(po, ring, NULL, gated, normv, conv, &sh));
+            q36_tensor_free(keys); q36_tensor_free(value); q36_tensor_free(prm); q36_tensor_free(gated);
+            q36_tensor_free(normv); q36_tensor_free(conv); q36_tensor_free(ring); q36_tensor_free(po);
+        }
+        q36_tensor_free(x); q36_tensor_free(w); q36_tensor_free(y); q36_tensor_free(a); q36_tensor_free(b);
+        q36_tensor_free(inj); q36_tensor_free(blk); q36_tensor_free(nw);
+    }
+    {   /* QSA at the real shapes: ID 128, IQ 4, R 4, budget 2048, 24 heads, kv 2, D 256, position 8996 */
+        int ID = 128, R = 4, budget = 2048, heads = 24, kv = 2, D = 256, cap = 9008, pos_base = 8996;
+        int sel_row = qsa_sel_row(R, budget);
+        for (int S = 1; S <= 4; S += 3) {
+            char l[96];
+            int nbmax = (pos_base + S) / R + 1, nb = nbmax;
+            q38_qsa_shape sh = qsa_shape(4, ID, R, budget, 64);
+            q36_tensor *ik = rand_tensor((size_t)nb * R * ID, 2.0f), *kn = rand_tensor(ID, 0.5f), *pk = q36_tensor_new((size_t)nb * ID * 4);
+            q36_tensor *q = rand_tensor((size_t)S * 4 * ID, 1.0f), *pk2 = rand_tensor((size_t)nbmax * ID, 1.0f), *sc = q36_tensor_new((size_t)S * nbmax * 4);
+            q36_tensor *scq = q36_tensor_new((size_t)S * nbmax * 4), *sel = q36_tensor_new((size_t)S * sel_row * 4);
+            for (size_t i = 0; i < (size_t)S * nbmax; i++) F(scq)[i] = fabsf(frand());
+            snprintf(l, sizeof l, "qsa_pool 1 block (decode)");
+            if (S == 1) BENCH(l, q38_qsa_pool(pk, ik, kn, nb - 1, 1, &sh));
+            snprintf(l, sizeof l, "qsa_pool %d blocks", nb);
+            if (S == 1) BENCH(l, q38_qsa_pool(pk, ik, kn, 0, nb, &sh));
+            snprintf(l, sizeof l, "qsa_score S %d blocks %d", S, nbmax); BENCH(l, q38_qsa_score(sc, q, pk2, S, pos_base, nbmax, &sh));
+            snprintf(l, sizeof l, "qsa_select S %d blocks %d budget 2048", S, nbmax); BENCH(l, q38_qsa_select(sel, scq, S, pos_base, nbmax, sel_row, &sh));
+            size_t cn = (size_t)kv * cap * D, qn = (size_t)S * heads * D;
+            q36_tensor *kc = rand_tensor(cn, 1.0f), *vc = rand_tensor(cn, 2.0f), *aq = rand_tensor(qn, 4.0f), *g = rand_tensor(qn, 3.0f), *ao = q36_tensor_new(qn * 4);
+            snprintf(l, sizeof l, "attn_sel S %d 24h kv2 D256 list 2048", S);
+            BENCH(l, q38_attn_sel(ao, aq, g, kc, vc, sel, S, pos_base, heads, kv, D, cap, sel_row, 0));
+            q36_tensor_free(ik); q36_tensor_free(kn); q36_tensor_free(pk); q36_tensor_free(q); q36_tensor_free(pk2);
+            q36_tensor_free(sc); q36_tensor_free(scq); q36_tensor_free(sel); q36_tensor_free(kc); q36_tensor_free(vc);
+            q36_tensor_free(aq); q36_tensor_free(g); q36_tensor_free(ao);
+        }
+    }
+    {   /* wide router select (512 experts, top-k 10) and the lifted expert sum (H 2560, top-k 10) */
+        int rows = 1, E = 512, K = 10, H = 2560;
+        q36_tensor *lg = rand_tensor((size_t)rows * E, 3.0f), *prob = q36_tensor_new((size_t)rows * E * 4);
+        q36_tensor *ids = q36_tensor_new((size_t)rows * K * 4), *wts = q36_tensor_new((size_t)rows * K * 4);
+        if (!q36_router_softmax(prob, lg, NULL, rows, E)) { puts("bench: softmax declined"); exit(1); }
+        sync_or_die();
+        BENCH("router_select_wide 1 row E512 K10", q36_router_select(ids, wts, prob, rows, E, K, 1, 1));
+        size_t cells = (size_t)rows * H;
+        q36_tensor *y = rand_tensor(cells * K, 2.0f), *ew = rand_tensor((size_t)rows * K, 0.5f), *shd = rand_tensor(cells, 1.0f);
+        q36_tensor *res = rand_tensor(cells, 4.0f), *eo = q36_tensor_new(cells * 4);
+        BENCH("expert_sum 1 row H2560 K10", q36_expert_sum(eo, y, ew, shd, res, rows, H, K));
+        q36_tensor_free(lg); q36_tensor_free(prob); q36_tensor_free(ids); q36_tensor_free(wts);
+        q36_tensor_free(y); q36_tensor_free(ew); q36_tensor_free(shd); q36_tensor_free(res); q36_tensor_free(eo);
+    }
+}
+
 int main(void) {
     /* As tests/test_qwen36_kernels.c: GitHub's Apple Paravirtual device never completes
      * command buffers, so nothing runs there. */
@@ -1152,6 +1385,9 @@ int main(void) {
         }
     }
     test_qsa_declines();
+
+    test_exact_twice();
+    if (getenv("QWEN38_BENCH") && *getenv("QWEN38_BENCH") == '1') bench_all();
 
     printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "PASSED", g_failures);
     q36_gpu_cleanup();

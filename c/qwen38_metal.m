@@ -57,6 +57,9 @@ static MTLCompileOptions *q38_compile_options(void) {
         options.fastMathEnabled = NO;
 #pragma clang diagnostic pop
     }
+#ifdef Q38_COUNTER_TEST   /* test-only: tests/test_qwen38_metal_kernels counter builds */
+    options.preprocessorMacros = @{@"Q38_COUNTER_TEST" : @(Q38_COUNTER_TEST)};
+#endif
     return options;
 }
 
