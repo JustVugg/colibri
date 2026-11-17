@@ -340,6 +340,18 @@ int main(int argc, char **argv) {
     Model ref; build_model(&ref, &w);
     place_trunk(&ref, &w);        /* the reference uses the same resident copies, matrix by matrix */
     Model m; build_model(&m, &w);
+    /* #2900: the tier's reserve for the KV mirrors (q36cc_mirror_bytes) must cover
+     * every model the chain mirrors, not only a window's or sinks' model: the chain
+     * mirrors the KV of every attention layer (q36cc_mirror), so a plain model with
+     * no sliding layer and no sinks reserved nothing, the tier filled the card, and
+     * the first request's mirrors had no room (an 8 GB card, 64k of context: the
+     * serve stalled after one token). This model is exactly that shape: one full
+     * attention layer, no win_layer, no attn_sinks. */
+    ck(!m.c.win_layer && !m.c.attn_sinks, "the model has no sliding layer and no sinks");
+    ck(q36cc_mirror_bytes(&m, CAP) == q36cc_mirror_at(&m, CAP),
+       "the mirrors' reserve is the f32 size at the context");
+    ck(q36cc_mirror_bytes(&m, CAP) >= q36cc_conv_kv_bytes(&m, CAP),
+       "the mirrors' reserve covers the mirrors the chain allocates");
     for (int i = 0; i < NL; i++) { m.L[i].qth_dnout = ref.L[i].qth_dnout; m.L[i].qth_q = ref.L[i].qth_q; m.L[i].qth_k = ref.L[i].qth_k; m.L[i].qth_v = ref.L[i].qth_v;
                                    m.L[i].qth_o = ref.L[i].qth_o; m.L[i].qth_shg = ref.L[i].qth_shg; m.L[i].qth_shu = ref.L[i].qth_shu; m.L[i].qth_shd = ref.L[i].qth_shd; }
 

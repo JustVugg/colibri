@@ -291,8 +291,12 @@ static size_t q36cc_mirror_at(Model *m, int ctx) {
     return kv;
 }
 static size_t q36cc_mirror_bytes(Model *m, int ctx) {
-    Cfg *c = &m->c;
-    if (ctx < 1 || !(c->win_layer || c->attn_sinks)) return 0;
+    /* No gate on the layer kinds: the chain mirrors the KV of every attention
+     * layer (q36cc_mirror), so the reserve must cover every model, not only a
+     * window's or sinks' one. Gated, a plain model reserved nothing, the tier
+     * filled the card, and the first request's mirrors had no room (#2900: an
+     * 8 GB card, 64k of context, the serve stalled after one token). */
+    if (ctx < 1) return 0;
     size_t kv = q36cc_mirror_at(m, ctx), fr = 0, tot = 0;
     if (coli_cuda_mem_info(0, &fr, &tot) && tot && kv > tot / 2) kv = tot / 2;
     return kv;
