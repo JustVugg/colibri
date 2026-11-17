@@ -1,0 +1,146 @@
+CONSOLIDATED SHIPPING LEDGER — REGIONAL OPERATIONS, Q2 2025
+This ledger records every consignment handled by the regional desk between March and May 2025. Each entry lists the shipment identifier, the departure and arrival points, the commodity, the quantity of units, and the contracted unit cost in USD. All quantities are finished units as packed; unit costs are net of insurance.
+
+Shipment SHP-4100 — 2025-03-04
+Route: Long Beach -> Long Beach   Item: gear reducers   Quantity: 840 units   Unit cost: $2380
+Notes: A spot check of 25 cartons found all seals intact; the surveyor countersigned the report. Stevedores noted a 55-minute delay at the gate and 30 pallets staged overnight. The freight forwarder consolidated this with 35 smaller parcels from the same region. The freight forwarder consolidated this with 55 smaller parcels from the same region. Carrier reported 40 containers loaded, of which 23 were reefer units running at 8 degrees.
+
+Shipment SHP-4109 — 2025-03-06
+Route: Busan -> Rotterdam   Item: circuit breakers   Quantity: 660 units   Unit cost: $1430
+Notes: The freight forwarder consolidated this with 40 smaller parcels from the same region. Carrier reported 55 containers loaded, of which 6 were reefer units running at -18 degrees. Port authority levied a standard $500 handling fee, waived under the annual agreement. Customs paperwork cleared without incident; the broker flagged no irregularities in the manifest. Insurance surveyor valued the consignment near $50000 and noted no warranty exclusions. The freight forwarder consolidated this with 40 smaller parcels from the same region.
+
+Shipment SHP-4116 — 2025-03-08
+Route: Singapore -> Long Beach   Item: servo motors   Quantity: 880 units   Unit cost: $1680
+Notes: Insurance surveyor valued the consignment near $400000 and noted no warranty exclusions. Stevedores noted a 45-minute delay at the gate and 110 pallets staged overnight. Carrier reported 150 containers loaded, of which 12 were reefer units running at 2 degrees. Insurance surveyor valued the consignment near $575000 and noted no warranty exclusions. A spot check of 20 cartons found all seals intact; the surveyor countersigned the report.
+
+Shipment SHP-4124 — 2025-03-10
+Route: Jebel Ali -> Houston   Item: circuit breakers   Quantity: 600 units   Unit cost: $2180
+Notes: The freight forwarder consolidated this with 45 smaller parcels from the same region. Terminal weather delayed departure by 2 hours; no damage was recorded on arrival inspection. Port authority levied a standard $3000 handling fee, waived under the annual agreement. The receiving warehouse logged 75 units into bay H and scheduled 5 for outbound transfer.
+
+Shipment SHP-4131 — 2025-03-12
+Route: Jebel Ali -> Rotterdam   Item: ceramic bearings   Quantity: 800 units   Unit cost: $2405
+Notes: The freight forwarder consolidated this with 55 smaller parcels from the same region. Carrier reported 195 containers loaded, of which 20 were reefer units running at 2 degrees. Insurance surveyor valued the consignment near $750000 and noted no warranty exclusions. Carrier reported 165 containers loaded, of which 37 were reefer units running at 4 degrees.
+
+Shipment SHP-4135 — 2025-03-14
+Route: Singapore -> Singapore   Item: gear reducers   Quantity: 560 units   Unit cost: $1355
+Notes: A routine audit found 8 units short-listed for repackaging, later cleared for transit. The receiving warehouse logged 25 units into bay E and scheduled 30 for outbound transfer. Carrier reported 130 containers loaded, of which 9 were reefer units running at 2 degrees. A routine audit found 9 units short-listed for repackaging, later cleared for transit.
+
+Shipment SHP-4142 — 2025-03-17
+Route: Singapore -> Houston   Item: circuit breakers   Quantity: 140 units   Unit cost: $1430
+Notes: The receiving warehouse logged 10 units into bay B and scheduled 25 for outbound transfer. Port authority levied a standard $5500 handling fee, waived under the annual agreement. Carrier reported 110 containers loaded, of which 38 were reefer units running at 4 degrees. Insurance surveyor valued the consignment near $150000 and noted no warranty exclusions. Terminal weather delayed departure by 2 hours; no damage was recorded on arrival inspection.
+
+Shipment SHP-4151 — 2025-03-21
+Route: Long Beach -> Felixstowe   Item: ceramic bearings   Quantity: 340 units   Unit cost: $880
+Notes: Customs paperwork cleared without incident; the broker flagged no irregularities in the manifest. Customs paperwork cleared without incident; the broker flagged no irregularities in the manifest. A routine audit found 22 units short-listed for repackaging, later cleared for transit. Carrier reported 135 containers loaded, of which 32 were reefer units running at 8 degrees. Customs paperwork cleared without incident; the broker flagged no irregularities in the manifest. Stevedores noted a 10-minute delay at the gate and 100 pallets staged overnight.
+
+Shipment SHP-4157 — 2025-03-25
+Route: Hamburg -> Jebel Ali   Item: turbine blades   Quantity: 620 units   Unit cost: $2530
+Notes: A spot check of 25 cartons found all seals intact; the surveyor countersigned the report. A routine audit found 10 units short-listed for repackaging, later cleared for transit. The receiving warehouse logged 75 units into bay D and scheduled 15 for outbound transfer. Carrier reported 135 containers loaded, of which 16 were reefer units running at 4 degrees.
+
+Shipment SHP-4165 — 2025-03-28
+Route: Long Beach -> Hamburg   Item: gear reducers   Quantity: 580 units   Unit cost: $1480
+Notes: Stevedores noted a 65-minute delay at the gate and 40 pallets staged overnight. The freight forwarder consolidated this with 25 smaller parcels from the same region. Port authority levied a standard $7250 handling fee, waived under the annual agreement. The freight forwarder consolidated this with 35 smaller parcels from the same region.
+
+Shipment SHP-4172 — 2025-03-02
+Route: Hamburg -> Hamburg   Item: turbine blades   Quantity: 820 units   Unit cost: $355
+Notes: A routine audit found 14 units short-listed for repackaging, later cleared for transit. Stevedores noted a 30-minute delay at the gate and 40 pallets staged overnight. Customs paperwork cleared without incident; the broker flagged no irregularities in the manifest. Stevedores noted a 60-minute delay at the gate and 20 pallets staged overnight.
+
+Shipment SHP-4177 — 2025-04-06
+Route: Jebel Ali -> Antwerp   Item: ceramic bearings   Quantity: 580 units   Unit cost: $1330
+Notes: Customs paperwork cleared without incident; the broker flagged no irregularities in the manifest. A spot check of 15 cartons found all seals intact; the surveyor countersigned the report. Stevedores noted a 85-minute delay at the gate and 80 pallets staged overnight. Carrier reported 40 containers loaded, of which 5 were reefer units running at 8 degrees. Stevedores noted a 65-minute delay at the gate and 50 pallets staged overnight. Port authority levied a standard $6000 handling fee, waived under the annual agreement.
+
+Shipment SHP-4186 — 2025-04-09
+Route: Singapore -> Houston   Item: circuit breakers   Quantity: 660 units   Unit cost: $2480
+Notes: Carrier reported 195 containers loaded, of which 30 were reefer units running at -18 degrees. Stevedores noted a 75-minute delay at the gate and 100 pallets staged overnight. A spot check of 35 cartons found all seals intact; the surveyor countersigned the report. Customs paperwork cleared without incident; the broker flagged no irregularities in the manifest. Customs paperwork cleared without incident; the broker flagged no irregularities in the manifest.
+
+Shipment SHP-4191 — 2025-04-13
+Route: Busan -> Felixstowe   Item: ceramic bearings   Quantity: 620 units   Unit cost: $455
+Notes: A routine audit found 18 units short-listed for repackaging, later cleared for transit. Terminal weather delayed departure by 6 hours; no damage was recorded on arrival inspection. A routine audit found 29 units short-listed for repackaging, later cleared for transit. A routine audit found 3 units short-listed for repackaging, later cleared for transit.
+
+Shipment SHP-4200 — 2025-04-16
+Route: Houston -> Hamburg   Item: heat exchangers   Quantity: 280 units   Unit cost: $1455
+Notes: Customs paperwork cleared without incident; the broker flagged no irregularities in the manifest. Carrier reported 90 containers loaded, of which 26 were reefer units running at 4 degrees. A routine audit found 16 units short-listed for repackaging, later cleared for transit. The freight forwarder consolidated this with 30 smaller parcels from the same region.
+
+Shipment SHP-4207 — 2025-04-19
+Route: Felixstowe -> Kobe   Item: servo motors   Quantity: 200 units   Unit cost: $1305
+Notes: Terminal weather delayed departure by 6 hours; no damage was recorded on arrival inspection. Insurance surveyor valued the consignment near $275000 and noted no warranty exclusions. The freight forwarder consolidated this with 25 smaller parcels from the same region. A routine audit found 9 units short-listed for repackaging, later cleared for transit.
+
+Shipment SHP-4215 — 2025-04-23
+Route: Rotterdam -> Jebel Ali   Item: hydraulic pumps   Quantity: 840 units   Unit cost: $555
+Notes: Stevedores noted a 60-minute delay at the gate and 80 pallets staged overnight. A spot check of 30 cartons found all seals intact; the surveyor countersigned the report. The receiving warehouse logged 75 units into bay G and scheduled 25 for outbound transfer. Customs paperwork cleared without incident; the broker flagged no irregularities in the manifest.
+
+Shipment SHP-4221 — 2025-04-27
+Route: Rotterdam -> Singapore   Item: circuit breakers   Quantity: 160 units   Unit cost: $2455
+Notes: A routine audit found 27 units short-listed for repackaging, later cleared for transit. Customs paperwork cleared without incident; the broker flagged no irregularities in the manifest. Customs paperwork cleared without incident; the broker flagged no irregularities in the manifest. A spot check of 25 cartons found all seals intact; the surveyor countersigned the report. Stevedores noted a 60-minute delay at the gate and 80 pallets staged overnight. A spot check of 25 cartons found all seals intact; the surveyor countersigned the report.
+
+Shipment SHP-4229 — 2025-04-02
+Route: Singapore -> Antwerp   Item: pressure valves   Quantity: 380 units   Unit cost: $355
+Notes: Stevedores noted a 75-minute delay at the gate and 50 pallets staged overnight. Terminal weather delayed departure by 5 hours; no damage was recorded on arrival inspection. A routine audit found 6 units short-listed for repackaging, later cleared for transit. Terminal weather delayed departure by 6 hours; no damage was recorded on arrival inspection. The freight forwarder consolidated this with 35 smaller parcels from the same region. Customs paperwork cleared without incident; the broker flagged no irregularities in the manifest.
+
+Shipment SHP-4234 — 2025-05-06
+Route: Rotterdam -> Hamburg   Item: servo motors   Quantity: 260 units   Unit cost: $2155
+Notes: Customs paperwork cleared without incident; the broker flagged no irregularities in the manifest. Customs paperwork cleared without incident; the broker flagged no irregularities in the manifest. The freight forwarder consolidated this with 15 smaller parcels from the same region. The receiving warehouse logged 20 units into bay F and scheduled 5 for outbound transfer. Port authority levied a standard $9000 handling fee, waived under the annual agreement.
+
+Shipment SHP-4242 — 2025-05-10
+Route: Busan -> Houston   Item: heat exchangers   Quantity: 400 units   Unit cost: $680
+Notes: Customs paperwork cleared without incident; the broker flagged no irregularities in the manifest. A spot check of 30 cartons found all seals intact; the surveyor countersigned the report. A spot check of 5 cartons found all seals intact; the surveyor countersigned the report. Stevedores noted a 25-minute delay at the gate and 100 pallets staged overnight. The receiving warehouse logged 30 units into bay F and scheduled 10 for outbound transfer.
+
+Shipment SHP-4249 — 2025-05-14
+Route: Kobe -> Kobe   Item: pressure valves   Quantity: 280 units   Unit cost: $480
+Notes: Insurance surveyor valued the consignment near $375000 and noted no warranty exclusions. Customs paperwork cleared without incident; the broker flagged no irregularities in the manifest. Terminal weather delayed departure by 5 hours; no damage was recorded on arrival inspection. Carrier reported 185 containers loaded, of which 34 were reefer units running at -18 degrees. Carrier reported 55 containers loaded, of which 7 were reefer units running at 4 degrees.
+
+Shipment SHP-4254 — 2025-05-18
+Route: Rotterdam -> Houston   Item: servo motors   Quantity: 140 units   Unit cost: $2205
+Notes: Terminal weather delayed departure by 8 hours; no damage was recorded on arrival inspection. Carrier reported 140 containers loaded, of which 23 were reefer units running at 4 degrees. The freight forwarder consolidated this with 40 smaller parcels from the same region. A spot check of 5 cartons found all seals intact; the surveyor countersigned the report. Stevedores noted a 35-minute delay at the gate and 50 pallets staged overnight.
+
+Shipment SHP-4264 — 2025-05-20
+Route: Felixstowe -> Antwerp   Item: pressure valves   Quantity: 880 units   Unit cost: $880
+Notes: Stevedores noted a 25-minute delay at the gate and 70 pallets staged overnight. Terminal weather delayed departure by 3 hours; no damage was recorded on arrival inspection. Stevedores noted a 60-minute delay at the gate and 110 pallets staged overnight. The receiving warehouse logged 60 units into bay A and scheduled 40 for outbound transfer. Customs paperwork cleared without incident; the broker flagged no irregularities in the manifest.
+
+Shipment SHP-4268 — 2025-05-22
+Route: Rotterdam -> Jebel Ali   Item: turbine blades   Quantity: 760 units   Unit cost: $2555
+Notes: Port authority levied a standard $4000 handling fee, waived under the annual agreement. Stevedores noted a 85-minute delay at the gate and 30 pallets staged overnight. The freight forwarder consolidated this with 25 smaller parcels from the same region. The freight forwarder consolidated this with 25 smaller parcels from the same region. A spot check of 10 cartons found all seals intact; the surveyor countersigned the report.
+
+Shipment SHP-4277 — 2025-05-26
+Route: Houston -> Felixstowe   Item: circuit breakers   Quantity: 520 units   Unit cost: $1580
+Notes: Terminal weather delayed departure by 1 hours; no damage was recorded on arrival inspection. A routine audit found 9 units short-listed for repackaging, later cleared for transit. A routine audit found 13 units short-listed for repackaging, later cleared for transit. Terminal weather delayed departure by 6 hours; no damage was recorded on arrival inspection.
+
+Shipment SHP-4284 — 2025-05-02
+Route: Long Beach -> Long Beach   Item: gear reducers   Quantity: 560 units   Unit cost: $655
+Notes: The freight forwarder consolidated this with 15 smaller parcels from the same region. The receiving warehouse logged 50 units into bay B and scheduled 15 for outbound transfer. Terminal weather delayed departure by 1 hours; no damage was recorded on arrival inspection. Stevedores noted a 65-minute delay at the gate and 110 pallets staged overnight.
+
+Shipment SHP-4291 — 2025-05-05
+Route: Kobe -> Hamburg   Item: gear reducers   Quantity: 400 units   Unit cost: $880
+Notes: Customs paperwork cleared without incident; the broker flagged no irregularities in the manifest. The freight forwarder consolidated this with 40 smaller parcels from the same region. The receiving warehouse logged 75 units into bay E and scheduled 25 for outbound transfer. The freight forwarder consolidated this with 20 smaller parcels from the same region. Stevedores noted a 65-minute delay at the gate and 110 pallets staged overnight. Stevedores noted a 65-minute delay at the gate and 110 pallets staged overnight.
+
+Shipment SHP-4297 — 2025-06-07
+Route: Kobe -> Rotterdam   Item: servo motors   Quantity: 520 units   Unit cost: $255
+Notes: A spot check of 5 cartons found all seals intact; the surveyor countersigned the report. The receiving warehouse logged 40 units into bay C and scheduled 45 for outbound transfer. Terminal weather delayed departure by 4 hours; no damage was recorded on arrival inspection. A routine audit found 28 units short-listed for repackaging, later cleared for transit.
+
+Shipment SHP-4305 — 2025-06-11
+Route: Antwerp -> Rotterdam   Item: gear reducers   Quantity: 400 units   Unit cost: $1505
+Notes: A spot check of 20 cartons found all seals intact; the surveyor countersigned the report. Port authority levied a standard $4000 handling fee, waived under the annual agreement. The freight forwarder consolidated this with 10 smaller parcels from the same region. Customs paperwork cleared without incident; the broker flagged no irregularities in the manifest. Terminal weather delayed departure by 7 hours; no damage was recorded on arrival inspection. Terminal weather delayed departure by 1 hours; no damage was recorded on arrival inspection.
+
+Shipment SHP-4311 — 2025-06-15
+Route: Rotterdam -> Antwerp   Item: gear reducers   Quantity: 180 units   Unit cost: $355
+Notes: A spot check of 25 cartons found all seals intact; the surveyor countersigned the report. Port authority levied a standard $8250 handling fee, waived under the annual agreement. A routine audit found 20 units short-listed for repackaging, later cleared for transit. Carrier reported 75 containers loaded, of which 28 were reefer units running at 4 degrees.
+
+Shipment SHP-4319 — 2025-06-18
+Route: Houston -> Busan   Item: circuit breakers   Quantity: 140 units   Unit cost: $2305
+Notes: The freight forwarder consolidated this with 30 smaller parcels from the same region. The freight forwarder consolidated this with 15 smaller parcels from the same region. A spot check of 25 cartons found all seals intact; the surveyor countersigned the report. Terminal weather delayed departure by 7 hours; no damage was recorded on arrival inspection. The freight forwarder consolidated this with 45 smaller parcels from the same region.
+
+Shipment SHP-4325 — 2025-06-21
+Route: Antwerp -> Rotterdam   Item: circuit breakers   Quantity: 260 units   Unit cost: $2505
+Notes: A spot check of 10 cartons found all seals intact; the surveyor countersigned the report. Carrier reported 195 containers loaded, of which 30 were reefer units running at 4 degrees. A routine audit found 18 units short-listed for repackaging, later cleared for transit. Insurance surveyor valued the consignment near $400000 and noted no warranty exclusions. Stevedores noted a 50-minute delay at the gate and 100 pallets staged overnight.
+
+Shipment SHP-4334 — 2025-06-24
+Route: Hamburg -> Kobe   Item: hydraulic pumps   Quantity: 700 units   Unit cost: $1630
+Notes: The receiving warehouse logged 80 units into bay A and scheduled 10 for outbound transfer. Port authority levied a standard $3750 handling fee, waived under the annual agreement. Insurance surveyor valued the consignment near $525000 and noted no warranty exclusions. A routine audit found 10 units short-listed for repackaging, later cleared for transit. A spot check of 30 cartons found all seals intact; the surveyor countersigned the report.
+
+Shipment SHP-4338 — 2025-06-28
+Route: Felixstowe -> Kobe   Item: circuit breakers   Quantity: 120 units   Unit cost: $2455
+Notes: Port authority levied a standard $500 handling fee, waived under the annual agreement. Customs paperwork cleared without incident; the broker flagged no irregularities in the manifest. Carrier reported 175 containers loaded, of which 17 were reefer units running at 2 degrees. Port authority levied a standard $8750 handling fee, waived under the annual agreement.
+
+Shipment SHP-4346 — 2025-06-04
+Route: Singapore -> Singapore   Item: hydraulic pumps   Quantity: 720 units   Unit cost: $1855
+Notes: Insurance surveyor valued the consignment near $150000 and noted no warranty exclusions. Terminal weather delayed departure by 1 hours; no damage was recorded on arrival inspection. A spot check of 25 cartons found all seals intact; the surveyor countersigned the report. Terminal weather delayed departure by 8 hours; no damage was recorded on arrival inspection.
