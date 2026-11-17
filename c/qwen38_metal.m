@@ -1,0 +1,104 @@
+/* Metal glue for the Qwen3.8 kernels.
+ *
+ * A second library, compiled from metal/qwen38.metal (built into this object),
+ * on the device qwen36_metal.m opened. Its wrappers check sizes, bind
+ * q36_tensors and dispatch through q36_metal_encoder, so they join qwen36's
+ * current batch and encoder in call order; q36_gpu_flush and q36_gpu_sync
+ * commit and wait for both. */
+#import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include "qwen38_gpu.h"
+#include "qwen36_metal_internal.h"
+
+static const char q38_source[] = {
+#embed "metal/qwen38.metal"
+    , 0
+};
+
+enum { K38_COPY, K38_COUNT };
+
+static const char *const q38_kernel_names[K38_COUNT] = {
+    "q38_copy",
+};
+
+static id<MTLComputePipelineState> g_q38_pipe[K38_COUNT];
+static id<MTLDevice> g_q38_device;              /* the device g_q38_pipe was built on */
+
+/* The one place the qwen38 library's compile options are made: the options of
+ * qwen36's library (IEEE float, no fast-math shortcuts). Test-only macros reach
+ * the source from here (preprocessorMacros). */
+static MTLCompileOptions *q38_compile_options(void) {
+    MTLCompileOptions *options = [MTLCompileOptions new];
+    if (@available(macOS 15.0, *)) {
+        options.mathMode = MTLMathModeSafe;
+        options.mathFloatingPointFunctions = MTLMathFloatingPointFunctionsPrecise;
+    } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        options.fastMathEnabled = NO;
+#pragma clang diagnostic pop
+    }
+    return options;
+}
+
+int q38_gpu_init(void) {
+    if (!q36_gpu_init()) return 0;
+    id<MTLDevice> device = q36_metal_device();
+    if (g_q38_device == device) return 1;
+    @autoreleasepool {
+        g_q38_device = nil;
+        for (int i = 0; i < K38_COUNT; i++) g_q38_pipe[i] = nil;
+        NSError *error = nil;
+        id<MTLLibrary> library = [device newLibraryWithSource:[NSString stringWithUTF8String:q38_source]
+                                                      options:q38_compile_options() error:&error];
+        if (!library) {
+            fprintf(stderr, "[qwen38-metal] kernel compilation failed: %s\n",
+                    error ? error.localizedDescription.UTF8String : "unknown error");
+            return 0;
+        }
+        for (int i = 0; i < K38_COUNT; i++) {
+            id<MTLFunction> fn = [library newFunctionWithName:@(q38_kernel_names[i])];
+            g_q38_pipe[i] = fn ? [device newComputePipelineStateWithFunction:fn error:&error] : nil;
+            /* The SIMD reductions assume 32-lane groups, as qwen36's do. */
+            if (!g_q38_pipe[i] || g_q38_pipe[i].threadExecutionWidth != 32) {
+                fprintf(stderr, "[qwen38-metal] pipeline %s unavailable\n", q38_kernel_names[i]);
+                for (int j = 0; j <= i; j++) g_q38_pipe[j] = nil;
+                return 0;
+            }
+        }
+        g_q38_device = device;
+    }
+    return 1;
+}
+
+/* ---- wrappers ------------------------------------------------------------- */
+
+#define F4 (uint64_t)sizeof(float)
+
+/* q38_gpu_init has built the pipelines, and q36_gpu_cleanup has not closed the device since. */
+static int q38_ready(void) {
+    return g_q38_device && g_q38_device == q36_metal_device();
+}
+
+/* n threads in groups of up to 256 (the pipeline's limit if lower). */
+static void q38_threads(id<MTLComputeCommandEncoder> e, id<MTLComputePipelineState> pso, uint64_t n) {
+    uint64_t group = pso.maxTotalThreadsPerThreadgroup < 256 ? pso.maxTotalThreadsPerThreadgroup : 256;
+    [e dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(n < group ? n : group, 1, 1)];
+}
+
+int q38_copy(q36_tensor *y, q36_tensor *x, size_t n) {
+    if (!q38_ready() || n < 1 || n > UINT32_MAX || !q36_metal_fits(x, (uint64_t)n * F4) ||
+        !q36_metal_fits(y, (uint64_t)n * F4)) return 0;
+    @autoreleasepool {
+        uint32_t count = (uint32_t)n;
+        id<MTLComputePipelineState> pso = g_q38_pipe[K38_COPY];
+        id<MTLComputeCommandEncoder> e = q36_metal_encoder(pso);
+        q36_metal_bind(e, x, 0);
+        q36_metal_bind(e, y, 1);
+        [e setBytes:&count length:sizeof(count) atIndex:2];
+        q38_threads(e, pso, (uint64_t)n);
+    }
+    return 1;
+}

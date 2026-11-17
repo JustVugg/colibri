@@ -1261,8 +1261,23 @@ metal-test: tests/test_backend_metal.mm backend_metal.mm backend_metal.h affine_
 # Qwen3.6 Metal layer: the kernels live in metal/qwen36.metal and are built
 # into qwen36_metal.o (#embed), so the executable needs no files at run time.
 QWEN36_METALC = clang -x objective-c -std=gnu2x -fobjc-arc -O2 -Wall -Wextra -Wno-unused-parameter
-qwen36_metal.o: qwen36_metal.m qwen36_gpu.h metal/qwen36.metal ggml_grids.h shaders/blockdec_table.h
+qwen36_metal.o: qwen36_metal.m qwen36_gpu.h qwen36_metal_internal.h metal/qwen36.metal ggml_grids.h \
+               shaders/blockdec_table.h
 	$(QWEN36_METALC) -c qwen36_metal.m -o $@
+
+# Qwen3.8's own kernels (metal/qwen38.metal, #embed), on qwen36's device and
+# command batch. Not linked into qwen38 yet.
+qwen38_metal.o: qwen38_metal.m qwen38_gpu.h qwen36_gpu.h qwen36_metal_internal.h metal/qwen38.metal
+	$(QWEN36_METALC) -c qwen38_metal.m -o $@
+
+# Every Qwen3.8 kernel against a double-precision reference. No model needed.
+tests/test_qwen38_metal_kernels: tests/test_qwen38_metal_kernels.c qwen38_gpu.h qwen36_gpu.h qwen38_metal.o \
+                                 qwen36_metal.o
+	$(CC) -O2 -Wall -Wextra -Wno-unused-function -std=c11 $< qwen38_metal.o qwen36_metal.o -framework Metal -framework Foundation -lm -o $@
+
+.PHONY: test-qwen38-metal-kernels
+test-qwen38-metal-kernels: tests/test_qwen38_metal_kernels
+	./tests/test_qwen38_metal_kernels
 
 # Every Qwen3.6 kernel against a double-precision reference. No model needed.
 tests/test_qwen36_kernels: tests/test_qwen36_kernels.c qwen36_gpu.h qwen36_cpu_mm.h ggml_quants.h ggml_grids.h \

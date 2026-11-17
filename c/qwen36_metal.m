@@ -15,6 +15,7 @@
 #include <time.h>
 #include <unistd.h>
 #include "qwen36_gpu.h"
+#include "qwen36_metal_internal.h"
 #include "ggml_grids.h"
 #include "shaders/blockdec_table.h"
 
@@ -384,14 +385,20 @@ void q36_map_free(q36_map *m) {
  * encoded before it, so no explicit barriers are needed. */
 static int g_concurrent;                        /* q36_gpu_concurrent */
 
-static id<MTLComputeCommandEncoder> q36_encoder(int kernel) {
+/* The current batch's encoder with pso set; q36's kernels and other libraries'
+ * (q36_metal_encoder) share it. */
+static id<MTLComputeCommandEncoder> q36_encoder_pso(id<MTLComputePipelineState> pso) {
     if (!g_encoder) {
         if (!g_batch) g_batch = [g_queue commandBuffer];
         g_encoder = [g_batch computeCommandEncoderWithDispatchType:g_concurrent ? MTLDispatchTypeConcurrent
                                                                                 : MTLDispatchTypeSerial];
     }
-    [g_encoder setComputePipelineState:g_pipe[kernel]];
+    [g_encoder setComputePipelineState:pso];
     return g_encoder;
+}
+
+static id<MTLComputeCommandEncoder> q36_encoder(int kernel) {
+    return q36_encoder_pso(g_pipe[kernel]);
 }
 
 void q36_gpu_concurrent(int on) {
@@ -584,6 +591,20 @@ static void q36_bind(id<MTLComputeCommandEncoder> e, q36_tensor *t, NSUInteger i
 static void q36_bind_at(id<MTLComputeCommandEncoder> e, q36_tensor *t, uint64_t skip, NSUInteger index) {
     [e setBuffer:t->buffer offset:t->offset + skip atIndex:index];
 }
+
+/* ---- qwen36_metal_internal.h: the device and stream for other Metal layers -- */
+
+id<MTLDevice> q36_metal_device(void) { return g_device; }
+
+id<MTLComputeCommandEncoder> q36_metal_encoder(id<MTLComputePipelineState> pso) {
+    return q36_encoder_pso(pso);
+}
+
+void q36_metal_bind(id<MTLComputeCommandEncoder> e, q36_tensor *t, int index) {
+    q36_bind(e, t, (NSUInteger)index);
+}
+
+int q36_metal_fits(q36_tensor *t, uint64_t bytes) { return q36_fits(t, bytes); }
 
 static void q36_threads(id<MTLComputeCommandEncoder> e, uint64_t n) {
     [e dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(n < 64 ? n : 64, 1, 1)];
