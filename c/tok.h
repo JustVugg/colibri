@@ -25,6 +25,12 @@
 #include "tok_unicode.h"
 #include "tok_unicode_o200k.h"
 #include "tok_unicode_deepseek.h"
+/* A tokenizer.json normalizer of type NFC is applied only in an engine that
+ * defines TOK_NFC before including this file (olmoe.c, mimo.c): the tables are
+ * ~330 KB, and the other tok.h engines' tokenizers declare no NFC. */
+#ifdef TOK_NFC
+#include "qwen38_nfc.h"     /* q38_nfc_normalize */
+#endif
 
 /* ---------- hash map (chiavi binarie con lunghezza) ---------- */
 typedef struct { const char *k; int klen; int v; int used; } ment;
@@ -72,6 +78,9 @@ typedef struct {
     int rankbpe;         /* 1 = no merges list (tiktoken-derived vocab): merge the adjacent
                           * pair whose CONCATENATION has the lowest vocab id — exactly
                           * tiktoken's byte_pair_encode, no recovered merges to diverge */
+    int nfc;             /* 1 = tokenizer.json's normalizer is {"type":"NFC"} (OLMoE, MiMo):
+                          * with TOK_NFC, the text between added tokens is composed before
+                          * pre-tokenizing */
 } Tok;
 
 /* ---------- UTF-8 ---------- */
@@ -259,6 +268,14 @@ static void tok_load(Tok *T, const char *path){
             if(rx&&rx->t==J_STR&&strstr(rx->str,"][A-Za-z]+|")&&strstr(rx->str,"[\\p{L}\\p{M}]+"))
                 T->deepseek=1;
         }
+    }
+    /* normalizer: HF applies it to the text between added tokens before the
+     * pre_tokenizer sees it. NFC alone is what OLMoE and MiMo declare (as laya.c
+     * reads it); any other normalizer is left as before. Applied under TOK_NFC. */
+    jval *nz=json_get(root,"normalizer");
+    if(nz && nz->t==J_OBJ){
+        jval *nty=json_get(nz,"type");
+        if(nty && nty->t==J_STR && nty->str && !strcmp(nty->str,"NFC")) T->nfc=1;
     }
     T->json_root=root;
 }
@@ -740,11 +757,24 @@ static int tok_encode(Tok *T, const char *text, int len, int *out, int max){
         }
         int chunk_end = (hitpos<0) ? len : hitpos;
         if(chunk_end>i){
-            if(T->gpt2)       pretok_chunk_gpt2(T,p,i,chunk_end,out,&no,max);
-            else if(T->deepseek) pretok_chunk_deepseek(T,p,i,chunk_end,out,&no,max);
-            else if(T->kimi)  pretok_chunk_kimi(T,p,i,chunk_end,out,&no,max);
-            else if(T->o200k) pretok_chunk_o200k(T,p,i,chunk_end,out,&no,max);
-            else              pretok_chunk(T,p,i,chunk_end,out,&no,max);
+            /* added tokens are matched on the raw bytes above (normalized:false);
+             * only the ordinary span between them is normalized, as HF does */
+            const unsigned char *s=p; int a=i, b=chunk_end; char *norm=NULL;
+#ifdef TOK_NFC
+            if(T->nfc){
+                size_t nl=0;
+                if(q38_nfc_normalize(text+i,(size_t)(chunk_end-i),&norm,&nl) || nl>(size_t)INT_MAX){
+                    free(norm); fprintf(stderr,"tok_encode: NFC normalization failed\n"); exit(1);
+                }
+                s=(const unsigned char*)norm; a=0; b=(int)nl;
+            }
+#endif
+            if(T->gpt2)       pretok_chunk_gpt2(T,s,a,b,out,&no,max);
+            else if(T->deepseek) pretok_chunk_deepseek(T,s,a,b,out,&no,max);
+            else if(T->kimi)  pretok_chunk_kimi(T,s,a,b,out,&no,max);
+            else if(T->o200k) pretok_chunk_o200k(T,s,a,b,out,&no,max);
+            else              pretok_chunk(T,s,a,b,out,&no,max);
+            free(norm);
         }
         if(hitpos<0) break;
         if(no<max) out[no++]=hitid;

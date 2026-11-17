@@ -16,6 +16,7 @@ MINGW  := $(findstring mingw,$(TRIPLET))$(findstring windows-gnu,$(TRIPLET))
 CYGWIN := $(findstring cygwin,$(TRIPLET))
 DARWIN := $(findstring darwin,$(TRIPLET))
 LINUX  := $(findstring linux,$(TRIPLET))
+FREEBSD := $(findstring freebsd,$(TRIPLET))
 IS_WIN := $(MINGW)$(CYGWIN)
 
 # A gcc that targets the MSYS or Cygwin runtime (MSYS2's "MSYS" shell, or its plain
@@ -48,6 +49,7 @@ ifeq ($(IS_WIN),)
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 DARWIN  := $(findstring Darwin,$(UNAME_S))
+FREEBSD := $(findstring FreeBSD,$(UNAME_S))
 endif
 endif
 
@@ -236,7 +238,11 @@ endif
 EXE     =
 else
 # --- Linux / *BSD x86-64 (percorso originale, invariato) ---
-CC      = gcc
+# FreeBSD: clang, the base system's compiler, whose -fopenmp links the base system's
+# libomp. gcc is a package there, and its libgomp has no thread affinity on FreeBSD
+# ("libgomp: Affinity not supported on this configuration") and decodes slower.
+# CC=gcc on the command line still builds with gcc.
+CC      = $(if $(FREEBSD),clang,gcc)
 # ARCH=native -> ottimizzato per QUESTA macchina (default, piu' veloce).
 # ARCH=x86-64-v3 -> binario PORTABILE su qualsiasi x86-64 moderno con AVX2 (per distribuire).
 # ARCH=x86-64 -> massima compatibilita' (niente AVX2: usa il path scalare di fallback).
@@ -2567,6 +2573,9 @@ tests/test_gq_r16$(EXE): tests/test_gq_r16.c
 # The grid types' dot product with the signs on the activation against the one it replaced
 tests/test_gq_signs$(EXE): tests/test_gq_signs.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+# a speculative verify's rows (up to GQ_EXACT_ROWS) get each row's bits alone, every block type (#2874)
+tests/test_gq_rows_exact$(EXE): tests/test_gq_rows_exact.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 # Q2_K's fused row kernel against the unpack + gq_dot_i8 path it replaced, to the bit
 tests/test_gq_q2_k$(EXE): tests/test_gq_q2_k.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -2854,6 +2863,10 @@ tests/test_xf16$(EXE): tests/test_xf16.c
 # the SSE2 i8 expert kernel (no AVX2+FMA) against xf_dot_i8_ref, bit for bit.
 tests/test_xf_sse2_int16$(EXE): tests/test_xf_sse2_int16.c
 	$(CC) $(if $(X86_64),$(filter-out -march=% -mavx% -mfma%,$(CFLAGS)) -march=x86-64 -mno-avx -mno-avx2 -mno-fma -ffp-contract=off,$(CFLAGS)) $< -o $@ $(LDFLAGS)
+# coli_fmaf_exact (fma_compat.h) against fmaf, bit for bit, built without FMA where it is the
+# emulation the kernels take there (#2882).
+tests/test_fmaf_exact$(EXE): tests/test_fmaf_exact.c
+	$(CC) $(if $(X86_64),$(filter-out -march=% -mavx% -mfma%,$(CFLAGS)) -march=x86-64 -mno-avx -mno-avx2 -mno-fma,$(CFLAGS)) $< -o $@ $(LDFLAGS)
 # the kernels a build without FMA takes (quant.h's FP8 rows in lanes, expert_ffn.h's int4-g64 f32 in
 # doubles, #2715) against the references they reproduce, bit for bit: one source built for the x86-64
 # baseline (SSE2) and for Sandy Bridge (AVX); on another architecture, what its dispatch gives.
@@ -3053,6 +3066,9 @@ tests/test_qpack$(EXE): tests/test_qpack.c tests/qpack.o
 # same command line before (#1741): one unit per command keeps each .d whole.
 tests/qpack.o: qpack.c .build-config
 	$(CC) $(CFLAGS) -c qpack.c -o $@
+# qpack.c included, not linked: the test fails its callocs one at a time.
+tests/test_qpack_layout_oom$(EXE): tests/test_qpack_layout_oom.c qpack.c .build-config
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 # Loader-side expansion oracle for the same MLX affine contract: nibble/byte
 # order, scalar decodings, parity against coli_affine_matmul_ref, refusals.

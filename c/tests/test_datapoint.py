@@ -389,6 +389,21 @@ class PersistentDatapointTest(unittest.TestCase):
 
 
 class FreshDatapointTest(unittest.TestCase):
+    def test_qwen36_reads_a_utf8_prompt_file_and_actual_token_count(self):
+        for name in ("qwen36", "qwen36.exe"):
+            with self.subTest(name=name):
+                def fake_run(command, **kwargs):
+                    self.assertEqual(Path(command[3]).read_text(encoding="utf-8"), "caffè 世界")
+                    self.assertIsNone(kwargs["input"])
+                    self.assertEqual(kwargs["env"]["N_NEW"], "7")
+                    return subprocess.CompletedProcess(command, 0, stdout="", stderr=(
+                        "resident weights loaded in 1.5s | RSS after load: 19.0 GB\n"
+                        "Speed: 2.00 tok/s (1.5s for 3 tokens)\n"))
+                with mock.patch.object(datapoint.subprocess, "run", side_effect=fake_run):
+                    rows = datapoint.run_fresh_engine(name, "/model", "caffè 世界", 7, 1, 3, 8)
+                self.assertEqual(rows[0]["tokens"], 3)
+                self.assertEqual(rows[0]["gen_s"], 1.5)
+
     def test_qwen38_receives_a_temporary_prompt_file_and_exact_generation_cap(self):
         observed = {}
 

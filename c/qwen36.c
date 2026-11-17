@@ -2232,7 +2232,7 @@ static void matmul_h(float *y, const float *x, const uint16_t *W, int S, int I, 
 static long long g_q36_codes;    /* q36_codes_now: a dense IQ1/IQ2/IQ3 matrix's larger form at its first product here */
 static int g_q36_cap_arg;              /* the cache size asked for (argv[1], 0 = automatic) */
 static long long g_q36_exp_codes;
-static double g_q36_exp_bytes;
+static double g_q36_exp_bytes __attribute__((unused));   /* read only where GQ_R16_ON (AVX2, AVX-512) */
 static void q36_codes_now(QW *w);
 static void matmul_d(float *y, const float *x, const QW *w, int S, int I, int O){
 #ifdef COLI_QWEN_BATCH_TEST
@@ -3133,7 +3133,7 @@ static int q36_gq_held(int type, int rows, int cols) {
  * Q36_IQ3S_CODES=0 (or Q36_ILV16=0) keeps the file's rows; never for experts (gguf_expert_held): the
  * RAM slots would hold fewer of them. */
 static long long g_q36_codes = -1;   /* -1 undecided, else bit t: type t's dense matrices take their larger form */
-static pthread_mutex_t g_q36_codes_mx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_q36_codes_mx __attribute__((unused)) = PTHREAD_MUTEX_INITIALIZER;   /* GQ_R16_ON only */
 static long long q36_codes_decide(void) {
 #ifdef GQ_R16_ON
     const char *e = getenv("Q36_IQ3S_CODES"), *i16 = getenv("Q36_ILV16");
@@ -6595,13 +6595,16 @@ static inline void gq_rows_u(float *y, int u, const gq_act *a, const uint8_t *W,
     if (u == 8 && gq_f8_ok(t, I)) { gq_rows_f8(y, 8, a, W, rb, t, I, 8); return; }
     for (int j = 0; j < u; j++) gq_row_all(y + j, 1, a, W + (int64_t)j * rb, t, I);
 }
+/* the rows moe_gq_decode reads at once: rows interleaved by 16 (q36_gq_held) a group at a time, and
+ * then every matrix's rows by 16; the file's rows by eight where all three types have gq_rows_f8 */
+static int moe_gq_unit(const GqExp *gx, int D, int I) {
+    return gguf_expert_ilv(gx) ? 16 : I % 8 == 0 && D % 8 == 0 && gq_f8_ok(gx->hg, D) && gq_f8_ok(gx->hu, D) && gq_f8_ok(gx->hd, I) ? 8 : 1;
+}
 static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const int *idx, const float *val) {
     Cfg *c = &m->c; const int D = q36_eh(c), K = c->topk, I = c->inter;
     const GqExp *gx = &m->gqx[layer];
     if (m->cache[layer].cap < K || K > 64 || !gq_int_ok(gx->hg, D) || !gq_int_ok(gx->hu, D) || !gq_int_ok(gx->hd, I)) return -1;
-    /* rows interleaved by 16 (q36_gq_held) go a group at a time, and then every matrix's rows by 16;
-     * the file's rows by eight where all three types have gq_rows_f8 */
-    const int u = gguf_expert_ilv(gx) ? 16 : I % 8 == 0 && D % 8 == 0 && gq_f8_ok(gx->hg, D) && gq_f8_ok(gx->hu, D) && gq_f8_ok(gx->hd, I) ? 8 : 1;
+    const int u = moe_gq_unit(gx, D, I);
     if (u == 16 && (I % 16 || D % 16)) return -1;
     Slot *sl[64]; int ids[64]; float w[64]; int n = 0;
     for (int k = 0; k < K; k++) if (idx[k] >= 0) { ids[n] = idx[k]; w[n] = val[k]; n++; }
@@ -6670,13 +6673,25 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
     for (int r = 0; r < S * K; r++) if (idx[r] >= 0) { int p = fill[idx[r]]++; tok[p] = r / K; wt[p] = val[r]; }
     int nmax = 0; for (int e = 0; e < E; e++) { int n = cnt[e + 1] - cnt[e]; if (n > nmax) nmax = n; }
     float *X = falloc((int64_t)nmax * D), *G = falloc((int64_t)nmax * I), *U = falloc((int64_t)nmax * I), *Y = falloc((int64_t)nmax * D);
-    gq_act act; memset(&act, 0, sizeof act);
+    gq_act act, ah; memset(&act, 0, sizeof act); memset(&ah, 0, sizeof ah);
+    /* a speculative verify's rows (S <= GQ_EXACT_ROWS) read the experts as a decode step does, the
+     * file's rows by eight where moe_gq_decode does: a row's bits are then a plain step's (#2874) */
+    const int f8 = S <= GQ_EXACT_ROWS && moe_gq_unit(gx, D, I) == 8;
     for (int e = 0; e < E; e++) {
         int n = cnt[e + 1] - cnt[e]; if (!n) continue;
         const int *tl = tok + cnt[e]; const float *wl = wt + cnt[e];
         Slot *sl; expert_get(m, layer, e, &sl);
         for (int r = 0; r < n; r++) memcpy(X + (int64_t)r * D, x + (int64_t)tl[r] * D, sizeof(float) * (size_t)D);
-        if (gq_int_ok(gx->hg, D) && gq_int_ok(gx->hu, D) && !gq_act_set(&act, X, n, D))
+        const int ex = f8 && !gq_act_set(&act, X, n, D);
+        if (ex) {
+            const uint8_t *wg = sl->gqe, *wu = sl->gqe + gx->hb_g;
+            const int64_t rbg = gq_row_bytes(gx->hg, D), rbu = gq_row_bytes(gx->hu, D);
+            #pragma omp parallel for schedule(static)
+            for (int r = 0; r < 2 * (I / 8); r++) {
+                if (r < I / 8) gq_rows_f8(G + 8 * r, I, &act, wg + (int64_t)8 * r * rbg, rbg, gx->hg, D, 8);
+                else gq_rows_f8(U + 8 * (r - I / 8), I, &act, wu + (int64_t)8 * (r - I / 8) * rbu, rbu, gx->hu, D, 8);
+            }
+        } else if (gq_int_ok(gx->hg, D) && gq_int_ok(gx->hu, D) && !gq_act_set(&act, X, n, D))
             gq_matmul2_act(G, sl->gqe, gx->hg, U, sl->gqe + gx->hb_g, gx->hu, &act, I);   /* x quantized once */
         else {
             gq_matmul(G, X, sl->gqe, gx->hg, n, D, I);
@@ -6685,6 +6700,11 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
         if (gx->sg) for (int64_t q = 0; q < (int64_t)n * I; q++) G[q] *= gx->sg[e];
         if (gx->su) for (int64_t q = 0; q < (int64_t)n * I; q++) U[q] *= gx->su[e];
         for (int64_t q = 0; q < (int64_t)n * I; q++) { float gv = G[q]; G[q] = (gv / (1.f + expf(-gv))) * U[q]; }
+        if (ex && !gq_act_set(&ah, G, n, I)) {
+            const uint8_t *wd = sl->gqe + gx->hb_g + gx->hb_u; const int64_t rbd = gq_row_bytes(gx->hd, I);
+            #pragma omp parallel for schedule(static)
+            for (int r = 0; r < D / 8; r++) gq_rows_f8(Y + 8 * r, D, &ah, wd + (int64_t)8 * r * rbd, rbd, gx->hd, I, 8);
+        } else
         gq_matmul(Y, G, sl->gqe + gx->hb_g + gx->hb_u, gx->hd, n, I, D);
         if (gx->sd) for (int64_t q = 0; q < (int64_t)n * D; q++) Y[q] *= gx->sd[e];
         if (m->L[layer].post_en)   /* Muse Spark: every expert's output scaled, then normalised */
@@ -6694,7 +6714,7 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
             for (int d = 0; d < D; d++) os[d] += w * ys[d];
         }
     }
-    gq_act_free(&act);
+    gq_act_free(&act); gq_act_free(&ah);
     free(cnt); free(tok); free(wt); free(fill); free(X); free(G); free(U); free(Y);
 }
 

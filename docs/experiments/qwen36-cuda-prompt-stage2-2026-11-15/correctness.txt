@@ -1,0 +1,123 @@
+# correctness.txt: the checks of this PR's code against dev after #2855. Lines are taken from the runs' logs as printed.
+# T4 runs: a Colab Tesla T4 (sm_75), CUDA 13.0 (nvcc 13.0.88), driver 580.82.07, 15 November 2026.
+# "dev" on the T4 is local commit d5bc6700: dev b0461490 with #2855's three qwen36 PRs merged (#2428, #2433, #2821),
+# taken before #2855 was in dev. Its tree for the files this PR touches equals #2855's but for one line of
+# docs/ENVIRONMENT.md (#2847's) and #2855's fix of section O's check (2fabb24d, a K/V stride in the test).
+# The T4 runs are on local commit a143ab34 (this PR over d5bc6700); the commit of this PR is the same change rebased
+# onto dev after #2855, with this record in place of the Nov 13 one.
+
+## make cuda-chain-check CUDA=1 CUDA_ARCH=sm_75 on a143ab34: the five lines dev does not have
+## (the two banks, each with its counter-proof inside the test, and the refused third bank), then the failures
+  ok   forty rows, three layers in two banks (the first and the third in bank 0): the other bank is copied while the first waits to be read, the third layer's copy waits for the first's fetch_done_at
+  ok   counter-proof: without fetch_done_at(0) the third layer's copy lands on the first's bank before it is read (the check above fails)
+  ok   forty rows, three layers in two banks (the first and the third in bank 1): the other bank is copied while the first waits to be read, the third layer's copy waits for the first's fetch_done_at
+  ok   counter-proof: without fetch_done_at(1) the third layer's copy lands on the first's bank before it is read (the check above fails)
+  ok   a third bank refused
+  FAIL 300 rows: the up projection and the mix in one pass, those of the two ops to the bit
+  FAIL 100 rows: the up projection and the mix in one pass, those of the two ops to the bit
+  FAIL the counters saw the frames, ops and matmuls
+test_cuda_chain: 3 failure(s)
+make: *** [Makefile:1488: cuda-chain-check] Error 1
+
+## the same on dev: the same three FAIL lines
+  FAIL 300 rows: the up projection and the mix in one pass, those of the two ops to the bit
+  FAIL 100 rows: the up projection and the mix in one pass, those of the two ops to the bit
+  FAIL the counters saw the frames, ops and matmuls
+test_cuda_chain: 3 failure(s)
+make: *** [Makefile:1488: cuda-chain-check] Error 1
+
+## "ok" lines of the test: dev 241, this PR 246; the difference between the two logs' ok and
+## FAIL lines is the five lines above and nothing else
+
+## make cuda-test CUDA=1 CUDA_ARCH=sm_75 on a143ab34: rc=0 in 1701 s; its last lines
+     per-expert unaccounted (x3 matrices): 0.7500 MiB
+     #687 measured 0.741 MiB/expert, sigma 0.019
+
+test_alloc_footprint_cuda: ok
+
+## the engine's own lines on the T4 (qwen36-bench, Qwen3.6-35B-A3B int4-g64): this PR's banks line, which dev's runs
+## do not print; then the staged layer steps, the same line in all 9 runs (warm-up included) of both
+[chain] qwen36: a prompt chunk stages the host pool's experts in 2 banks of 91 experts
+[chain] qwen36: 120 prompt layer steps staged the host pool's experts, 80 of them only those their rows route to (9.41 GB copied over the bus)
+
+## the chain's own report of memory on the device (the same value in all 4 + 4 runs)
+dev: 436.5 MiB on the device
+this PR: 640.7 MiB on the device
+
+## fingerprints of the logits, nll and top1, every run of both versions (count of runs by line: version, tokens, fingerprint, nll, top1)
+   4 dev 512 e82105bcd0bd1efa 2.96212 0.469
+   4 dev 64 4e0d1505a6060a16 2.69270 0.469
+   4 dev 64 54bb171c568c376e 2.69592 0.469
+   4 this-PR 512 e82105bcd0bd1efa 2.96212 0.469
+   4 this-PR 64 4e0d1505a6060a16 2.69270 0.469
+   4 this-PR 64 54bb171c568c376e 2.69592 0.469
+
+## tests/cuda_tier_engines.sh on a143ab34 (the other engines), in a fresh worktree, PY=python3: rc=0, 42 OK lines,
+## 0 FAIL. (A first run stopped before its tests on the VM's packages: Colab's torchvision against the
+## pinned torch, and a huggingface-hub upgraded after the pins; fixed as on Nov 13 and run again.) The last line:
+fails: 0
+
+## Mac: make -C c check PYTHON=python3.12 (macOS arm64) on the commit of this PR
+Ran 3363 tests in 275.568s
+OK (skipped=596)
+
+## Mac: tests/test_qwen36_cuda_chain on the fake backend (149 ok on dev after #2855, 195 ok and 0 FAIL on this PR):
+## the staging's banks, then section P, the staged table (6 cases)
+  ok   the staging has two banks where two layers' worth fit in a layer's, else one
+  ok   a staged table that sets no banks copies its layers in one
+  ok   two banks stay two
+  ok   one bank stays one
+ P. the staged table: the host pool's experts in the staging's banks
+  ok   planar, half the experts in the pool (two layers' worth fit in a layer's): 4 experts a layer on the card, the rest in the pool
+  ok   planar, half the experts in the pool (two layers' worth fit in a layer's)
+  ok   planar, half the experts in the pool (two layers' worth fit in a layer's): 2 banks of 4 experts
+  ok   planar, half the experts in the pool (two layers' worth fit in a layer's): the staged layers take the banks in turn, an unstaged layer takes none
+  ok   planar, half the experts in the pool (two layers' worth fit in a layer's): each expert in its layer's bank, its matrices and scales after it (planar)
+  ok   planar, half the experts in the pool (two layers' worth fit in a layer's): each copy lands in a free bank at its layer's offset and is [qtier] host pool: 20 experts (0.00 GB of the RAM cache) page-locked for the device's copies
+  ok   planar, half the experts in the pool (two layers' worth fit in a layer's): a short chunk's routed copy takes its layer's bank, with that bank's events
+  ok   the residents' pairs, the same: 4 experts a layer on the card, the rest in the pool
+  ok   the residents' pairs, the same
+  ok   the residents' pairs, the same: 2 banks of 4 experts
+  ok   the residents' pairs, the same: the staged layers take the banks in turn, an unstaged layer takes none
+  ok   the residents' pairs, the same: each expert in its layer's bank, its matrices and scales after it (pairs)
+  ok   the residents' pairs, the same: each copy lands in a free bank at its layer's offset and is waited for by its layer
+  ok   the residents' pairs, the same: a short chunk's routed copy takes its layer's bank, with that bank's events
+  ok   planar, a layer with an expert in neither: 4 experts a layer on the card, the rest in the pool
+  ok   planar, a layer with an expert in neither
+  ok   planar, a layer with an expert in neither: 2 banks of 4 experts
+  ok   planar, a layer with an expert in neither: the staged layers take the banks in turn, an unstaged layer takes none
+  ok   planar, a layer with an expert in neither: each expert in its layer's bank, its matrices and scales after it (planar)
+  ok   planar, a layer with an expert in neither: each copy lands in a free bank at its layer's offset and is waited for by its layer
+  ok   planar, a layer with an expert in neither: a short chunk's routed copy takes its layer's bank, with that bank's events
+  ok   planar, five of eight in the pool (two would not fit in a layer's): 3 experts a layer on the card, the rest in the pool
+  ok   planar, five of eight in the pool (two would not fit in a layer's)
+  ok   planar, five of eight in the pool (two would not fit in a layer's): 1 bank of 5 experts
+  ok   planar, five of eight in the pool (two would not fit in a layer's): the staged layers take the banks in turn, an unstaged layer takes none
+  ok   planar, five of eight in the pool (two would not fit in a layer's): each expert in its layer's bank, its matrices and scales after it (planar)
+  ok   planar, five of eight in the pool (two would not fit in a layer's): each copy lands in a free bank at its layer's offset and is waited for by its layer
+  ok   planar, five of eight in the pool (two would not fit in a layer's): a short chunk's routed copy takes its layer's bank, with that bank's events
+  ok   planar, room for one bank only: 4 experts a layer on the card, the rest in the pool
+  ok   planar, room for one bank only
+  ok   planar, room for one bank only: 1 bank of 4 experts
+  ok   planar, room for one bank only: the staged layers take the banks in turn, an unstaged layer takes none
+  ok   planar, room for one bank only: each expert in its layer's bank, its matrices and scales after it (planar)
+  ok   planar, room for one bank only: each copy lands in a free bank at its layer's offset and is waited for by its layer
+  ok   planar, room for one bank only: a short chunk's routed copy takes its layer's bank, with that bank's events
+  ok   planar, a backend whose table ends before the banks' ops: 4 experts a layer on the card, the rest in the pool
+  ok   planar, a backend whose table ends before the banks' ops
+  ok   planar, a backend whose table ends before the banks' ops: 1 bank of 4 experts
+  ok   planar, a backend whose table ends before the banks' ops: the staged layers take the banks in turn, an unstaged layer takes none
+  ok   planar, a backend whose table ends before the banks' ops: each expert in its layer's bank, its matrices and scales after it (planar)
+  ok   planar, a backend whose table ends before the banks' ops: each copy lands in a free bank at its layer's offset and is waited for by its layer
+  ok   planar, a backend whose table ends before the banks' ops: a short chunk's routed copy takes its layer's bank, with that bank's events
+OK test_qwen36_cuda_chain: the CUDA chain gives the CPU path's logits; host and device state agree; a lost device rebuilds; the host pool follows before a large prompt chunk only; the promotions' brake only with a history; the MTP head and the CPU's layers read a long prompt a chunk at a time
+
+## Mac: counter-proof, a change made by hand to c/qwen36_cuda_chain.h, the binary rebuilt, the file put back:
+## q36cc_stage_routed with cc_fetch in place of cc_fetch_at(..., dm_bank[i]). The routed copy's lines and the last line:
+  FAIL planar, half the experts in the pool (two layers' worth fit in a layer's): a short chunk's routed copy takes its layer's bank, with that bank's events
+  FAIL the residents' pairs, the same: a short chunk's routed copy takes its layer's bank, with that bank's events
+  FAIL planar, a layer with an expert in neither: a short chunk's routed copy takes its layer's bank, with that bank's events
+  ok   planar, five of eight in the pool (two would not fit in a layer's): a short chunk's routed copy takes its layer's bank, with that bank's events
+  ok   planar, room for one bank only: a short chunk's routed copy takes its layer's bank, with that bank's events
+  ok   planar, a backend whose table ends before the banks' ops: a short chunk's routed copy takes its layer's bank, with that bank's events
+test_qwen36_cuda_chain: 3 failure(s)
