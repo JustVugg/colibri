@@ -3778,6 +3778,15 @@ static void q36_vision_detach(Model *m) {
  * axes; the image's token (row, col) sits at (start, start+row, start+col); the
  * text after it resumes at start + max(rows, cols); past the prompt every axis
  * is pos + rope_delta, rope_delta = max position + 1 - n. */
+#ifdef COLI_CUDA
+/* The Qwen tower's matrices on the CUDA card (q38v_device_linear): each uploaded for its call and freed
+ * after it, so a picture takes the room of one matrix at a time (the largest of Qwen3.8-27B's tower,
+ * its merger's, 85 MB), never the tier's; 0 where the card refuses, and the CPU computes it.
+ * COLI_CUDA_VISION=0 keeps the tower on the CPU. */
+static int q36_vis_device(float *out, const float *in, const Q38Linear *l, int rows) {
+    return qt_vision_matmul(out, in, l->w, rows, l->in, l->out);
+}
+#endif
 static int q36_vision_attach(Model *m, const float *patches, int grid_h, int grid_w,
                              const int *ids, int n) {
     Cfg *c = &m->c;
@@ -3813,7 +3822,18 @@ static int q36_vision_attach(Model *m, const float *patches, int grid_h, int gri
     m->vis_map = malloc((size_t)n * sizeof(int));
     m->mpos = malloc((size_t)n * 3 * sizeof(int));
     if (!m->vis_rows || !m->vis_map || !m->mpos) { q36_vision_detach(m); return -1; }
+    const char *where = "the CPU";
+#ifdef COLI_CUDA
+    {
+        const char *e = getenv("COLI_CUDA_VISION");
+        q38v_device_linear = qt_ready() && !(e && *e == '0') ? q36_vis_device : NULL;
+        if (q38v_device_linear) where = "the CUDA card";
+    }
+#endif
+    double tv = now_s();
     if (q38_vision_forward(&m->vis, patches, grid_h, grid_w, m->vis_rows) != tokens) { q36_vision_detach(m); return -1; }
+    fprintf(stderr, "[qwen36] picture: %d x %d patches, %d rows, the tower %.2f s (its matrices on %s)\n",
+            grid_h, grid_w, tokens, now_s() - tv, where);
     int cur = 0, maxpos = -1;
     for (int i = 0; i < n; i++) {
         int *pp = m->mpos + (size_t)i * 3;
