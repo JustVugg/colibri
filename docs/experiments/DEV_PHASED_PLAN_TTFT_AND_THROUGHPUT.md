@@ -6,7 +6,7 @@
 **Baseline inspected:** `bc4b92509b214687423294a1ee320d3933faa018`
 **Scope:** Interactive and agent inference performance, primarily Qwen3.6 35B-A3B MoE and 27B dense.
 
-> **▶ RESUME POINT (2026-11-18; plan continued on current branch HEAD `97dffc6e`) — start any new session here.**
+> **▶ RESUME POINT (2026-11-18, C25 MTP probe recorded) — start any new session here.**
 > The user's three-step plan is **COMPLETE**:
 > ① eval set built + graded harness (C23) → ② C24 fused S==1 Q4_K/Q5_K (bench + engine + A/B, adopted, `Q36_EXPERT_FUSE` default ON) → ③ **graded three-container batch (C23 set, iq2→iq3→q4km × 2 interleaved rounds): 21/25 dead heat × 3 containers × 2 rounds — quality does not separate the containers.**
 > **Speed verdict (paired, same session): IQ2_XXS dominates** — ledger decode ~10.3 / 8.9 (0.86×) / 6.6 (0.64×) tok/s, short-prompt TTFT 1.00× / ~1.4× / ~2.1×, disk 11.8 / 14.1 / 22.7 GB. Full evidence: `researchLogs/logs/colibri-c12-workloads/phaseC23_tri_batch_verdict.txt` + `phaseC23_eval_*.jsonl`; batch verdict summarized in the C23 section and Section 9 items 16–17.
