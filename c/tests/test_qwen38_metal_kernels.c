@@ -1334,6 +1334,44 @@ static void test_exact_twice(void) {
         q36_tensor_free(sc); q36_tensor_free(scq); q36_tensor_free(sel); q36_tensor_free(kc); q36_tensor_free(vc);
         q36_tensor_free(aq); q36_tensor_free(g); q36_tensor_free(ao);
     }
+    {   /* attention glue (Task 4): rope_half, qgate_split, kv_append (floats and halves),
+         * idx_prep. 24 heads, kv 2, D 256, rotary 64, theta 1e7; IQ 4, ID 128; 3 rows at 1200 */
+        int rows = 3, heads = 24, kv = 2, D = 256, rot = 64, pb = 1200, cap = 1300, ID = 128;
+        size_t qn = (size_t)rows * heads * D, kn = (size_t)rows * kv * D, cn = (size_t)kv * cap * D;
+        q38_qsa_shape sh = qsa_shape(4, ID, 4, 256, rot);
+        sh.theta = 1e7f;
+        q36_tensor *x0 = rand_tensor(qn, 3.0f), *x = q36_tensor_new(qn * 4);
+        q36_tensor *qraw = rand_tensor(2 * qn, 2.0f), *qq = q36_tensor_new(qn * 4), *gg = q36_tensor_new(qn * 4);
+        q36_tensor *k = rand_tensor(kn, 2.0f), *v = rand_tensor(kn, 70000.0f);   /* v past the half range */
+        q36_tensor *kc = q36_tensor_new(cn * 4), *vc = q36_tensor_new(cn * 4);
+        q36_tensor *ip = rand_tensor((size_t)rows * 5 * ID, 2.0f), *iqn = rand_tensor(ID, 0.5f);
+        q36_tensor *iq = q36_tensor_new((size_t)rows * 4 * ID * 4), *ikc = q36_tensor_new((size_t)cap * ID * 4);
+        for (int pass = 0; pass < 2; pass++) {
+            memcpy(F(x), F(x0), qn * 4);
+            ok = q38_rope_half(x, rows, heads, D, rot, pb, 1e7f); sync_or_die();
+            det_step("twice rope_half", pass, &sv, F(x), qn * 4, ok);
+            fill_ff(qq, qn * 4); fill_ff(gg, qn * 4);
+            ok = q38_qgate_split(qq, gg, qraw, rows, heads, D); sync_or_die();
+            det_step("twice qgate_split q", pass, &sv2, F(qq), qn * 4, ok);
+            det_step("twice qgate_split gate", pass, &sv3, F(gg), qn * 4, ok);
+        }
+        for (int half = 0; half < 2; half++)
+            for (int pass = 0; pass < 2; pass++) {
+                fill_ff(kc, cn * 4); fill_ff(vc, cn * 4);
+                ok = q38_kv_append(kc, vc, k, v, rows, pb, kv, D, cap, half); sync_or_die();
+                det_step(half ? "twice kv_append half k" : "twice kv_append k", pass, &sv, F(kc), cn * 4, ok);
+                det_step(half ? "twice kv_append half v" : "twice kv_append v", pass, &sv2, F(vc), cn * 4, ok);
+            }
+        for (int pass = 0; pass < 2; pass++) {
+            fill_ff(iq, (size_t)rows * 4 * ID * 4); fill_ff(ikc, (size_t)cap * ID * 4);
+            ok = q38_idx_prep(iq, ikc, ip, iqn, rows, pb, cap, &sh); sync_or_die();
+            det_step("twice idx_prep q", pass, &sv, F(iq), (size_t)rows * 4 * ID * 4, ok);
+            det_step("twice idx_prep ikc", pass, &sv2, F(ikc), (size_t)cap * ID * 4, ok);
+        }
+        q36_tensor_free(x0); q36_tensor_free(x); q36_tensor_free(qraw); q36_tensor_free(qq); q36_tensor_free(gg);
+        q36_tensor_free(k); q36_tensor_free(v); q36_tensor_free(kc); q36_tensor_free(vc);
+        q36_tensor_free(ip); q36_tensor_free(iqn); q36_tensor_free(iq); q36_tensor_free(ikc);
+    }
     {   /* wide router select and the lifted expert sum: 512 experts, top-k 10, H 2560 */
         int rows = 3, E = 512, K = 10, H = 2560;
         q36_tensor *lg = rand_tensor((size_t)rows * E, 3.0f), *prob = q36_tensor_new((size_t)rows * E * 4);

@@ -5594,7 +5594,7 @@ static float *q38_forward(Model *m,const int *ids,int S,int pos_base,int nlogits
             free(m->ple_pref); m->ple_pref=NULL; m->ple_pref_rows=0;   /* consumed, as q38_layer_forward does */
         } else {
             free(chain_logit); chain_logit=NULL;
-            q38m_sync_host(m);   /* the CPU runs the step from the host state */
+            q38m_cpu_step(m,pos_base);   /* the CPU runs the step from the host state */
             for(int s=0;s<S;s++){
                 float *e=hyper+(int64_t)s*W;
                 q38_embed_row(m,ids[s],pos_base+s,e);
@@ -6646,6 +6646,9 @@ static void q38_layer_free(Layer *l) {
 
 static void q38_model_free(Model *m) {
     if(!m) return;
+#ifdef QWEN38_METAL
+    q38m_free(m);   /* first: its in-place maps read the GGUF blocks freed below */
+#endif
     q38_tstats_write();g_q38_tstats_path[0]=0;   /* Q38_TRUNK_STATS: while the sums still exist */
     kv_prefix_free(&m->kvp);
     int rows=q38_layer_rows(m);

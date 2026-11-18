@@ -3,19 +3,21 @@
  * q38_* kernels (qwen36_gpu.h, qwen38_gpu.h), as qwen38_chain.h does on Vulkan and
  * qwen38_cuda_chain.h on CUDA. Included by qwen38_core.h; one conversation only.
  *
- * Startup (qwen38.c, after the Vulkan block): q38m_decide picks the chain or prints
- * the one line that says why the CPU engine runs the model, then q38m_start sets up
- * its device state. q38_forward offers every step to q38m_forward; a 0 there means
- * the CPU runs that step from the host state (q38m_sync_host brings it down first).
+ * Startup (qwen38.c, before q38_trunk_cpu_int8): q38m_decide picks the chain or prints
+ * the one line that says why the CPU engine runs the model, then q38m_start puts the
+ * dense weights, norms and state on the GPU. q38_forward offers every step to
+ * q38m_forward; a 0 there means the CPU runs that step from the host state
+ * (q38m_cpu_step brings it down first). M2: the routed experts run on the CPU, inside
+ * the step (q38_moe_ex), from the router logits the GPU computed.
  *
- * So far: the decision, the report and the dense weights on the GPU (q38m_start) are
- * real; q38m_forward declines every step. */
+ * Switches: COLI_METAL=0 the CPU engine; QWEN38_METAL_EXACT=1 (or QWEN36_METAL_EXACT=1)
+ * the exact kernels; QWEN38_METAL_EXPERTS=0 the routed experts on the CPU (M2 always
+ * does). Debug only (read once, no effect unset): Q38M_CHECK_WEIGHTS, Q38M_LAYER_CHECK,
+ * Q38M_DECLINE_EVERY. */
 #ifndef QWEN38_METAL_CHAIN_H
 #define QWEN38_METAL_CHAIN_H
 #include "qwen36_gpu.h"
 #include "qwen38_gpu.h"
-
-#define Q38M_UNUSED __attribute__((unused))
 
 static int g_mtl_chain;                        /* 1 when the chain runs steps */
 static unsigned long long g_q38m_forwards, g_q38m_declined;
@@ -83,18 +85,35 @@ static const Q38Weight *q38m_dense_unsupported(const Model *m) {
     return NULL;
 }
 
-static int q38m_decide(Model *m) {
+/* A geometry the kernels take: head sizes (q38_attn_sel, q38_idx_prep: 256), the DeltaNet's key
+ * size (q36_dn_delta: 128), the PLE ring (q38_ple_conv: 32 a channel), the QSA budget
+ * (q38_qsa_select: 2048 blocks), one indexer key head (q38_idx_prep). NULL when it fits. */
+static const char *q38m_geometry(const Cfg *c) {
+    if (c->idx_kheads != 1) return "idx_kheads != 1";
+    if (c->head_dim > 256 || c->idx_dim > 256 || c->rotary_dim % 2 || c->rotary_dim > c->head_dim ||
+        c->rotary_dim > c->idx_dim || c->dn_kdim > 128 || c->idx_ratio < 1 || c->idx_budget / c->idx_ratio > 2048 ||
+        c->ngram_heads * c->ngram_head_dim != c->ple_dim || (c->ple_convk - 1) * c->ngram_size > 32 ||
+        c->q_heads % (c->kv_heads > 0 ? c->kv_heads : 1) || (c->dn_kheads > 0 && c->dn_vheads % c->dn_kheads))
+        return "a layer shape the Metal kernels do not take";
+    return NULL;
+}
+
+/* slots: the serve's conversations (g_q38_mux_slots; 1 outside a serve, whatever KV_SLOTS says) */
+static int q38m_decide(Model *m, int slots) {
     const char *why = NULL;
     char buf[96];
     const char *opt = getenv("COLI_METAL");
-    const char *ks = getenv("KV_SLOTS");
     const char *mtp = getenv("Q38_MTP");
     const Q38Weight *bad;
     if (opt && *opt && !strcmp(opt, "0")) why = "COLI_METAL=0";
-    /* KV_SLOTS as the serve reads it (g_q38_mux_slots); a run that is not a serve ignores
-     * it, and the chain steps aside for it there too */
-    else if (ks && *ks && atoi(ks) > 1) why = "KV_SLOTS>1 (one conversation on the GPU)";
+    else if (slots > 1) why = "KV_SLOTS>1 (one conversation on the GPU)";
+#ifdef COLI_VULKAN
+    /* one GPU backend a process: a build with both takes Metal only where Vulkan is not asked for */
+    else if (getenv("COLI_VULKAN") && *getenv("COLI_VULKAN") && strcmp(getenv("COLI_VULKAN"), "0"))
+        why = "COLI_VULKAN is on (one GPU backend at a time)";
+#endif
     else if (m->vis_ready) why = "vision tower";
+    else if ((why = q38m_geometry(&m->c))) {}
     else if (mtp && *mtp && strcmp(mtp, "0")) why = "MTP (Q38_MTP=1) needs the CPU engine until M5";
     else if ((bad = q38m_dense_unsupported(m))) {
         char kind[32];
@@ -259,8 +278,11 @@ static void q38m_check_weights(Model *m) {
 
 /* The chain's device state: every dense matrix on the GPU (above). Called before
  * q38_trunk_cpu_int8 frees the BF16 rows it uploads. 0, with the off line, on a failure. */
+static int q38m_setup(Model *m, char *why, size_t nwhy);   /* below */
 static int q38m_start(Model *m) {
     const int L = m->c.layers;
+    const char *ex = getenv("QWEN38_METAL_EXACT");
+    if (ex && !strcmp(ex, "1")) q36_gpu_set_exact(1);   /* before the state's planes are chosen (q36_dn_high_only) */
     const Q38Weight *src[Q38M_NW], *tail[Q38M_NT];
     char kind[32], why[160];
     g_q38m.L = (Q38mW (*)[Q38M_NW])calloc((size_t)(L > 0 ? L : 1), sizeof *g_q38m.L);
@@ -285,6 +307,7 @@ static int q38m_start(Model *m) {
             q38m_free_weights(); q38m_off(why); return 0;
         }
     }
+    if (!q38m_setup(m, why, sizeof why)) { q38m_free_weights(); q38m_off(why); return 0; }
     fprintf(stderr, "[qwen38-metal] dense weights: %d mapped in place (%.1f MiB), %d uploaded (%.1f MiB%s)\n",
             g_q38m.n_mapped, g_q38m.mapped / 1048576.0, g_q38m.n_uploaded, g_q38m.uploaded / 1048576.0,
             g_q38m.n_f32_from_bf16 ? ", some BF16 as F32" : "");
@@ -293,27 +316,642 @@ static int q38m_start(Model *m) {
     return 1;
 }
 
+/* ---- the forward (M2): the trunk on the GPU, the routed experts on the CPU --------------
+ * Per step of S rows, in chunks of at most Q38M_CHUNK rows (a chunk sees the K/V rows of
+ * the chunks before it, the DeltaNet and PLE state they left, as one step of their rows):
+ *   the streams the host embedded (hyper_h) and the PLE rows the host gathers (its n-gram
+ *   history stays on the host, q38m_ple_rows) go up; then every layer: the PLE step on its
+ *   layer, the gated-residual read, the attention (QSA) or DeltaNet mixer, the gated
+ *   residual's apply, the MLP's read, the router logits and the shared expert. Then one sync:
+ *   the CPU's q38_moe_ex routes from the GPU's logits and sums the routed experts (routed
+ *   only), straight from and into the shared buffers, and the GPU adds the shared expert and
+ *   applies the residual. After the last layer the final mixer and lm_head.
+ * The CPU's code and the GPU's op for each piece (qwen38_core.h):
+ *   q38_gr_read 1815        q38_hc_norm, q38m_mm down, q38_hc_low, q38m_mm up, q38_hc_mix;
+ *                           q38m_mm inject, q38_hc_inj
+ *   q38_gr_apply 1841       q38_hc_apply
+ *   q38_ple 3115            q38m_mm key/value, q38_ple_gate, q38_ple_conv (accumulate: hyper +=)
+ *   q38_attention 3473      q38m_mm q/k/v/idx_qk, q38_qgate_split, q38_hc_norm (C 1: rms0 by head,
+ *                           qn/kn), q38_rope_half, q38_kv_append (f16 where q38_kv16), q38_idx_prep,
+ *                           q38_qsa_pool (the blocks this step completes), q38_qsa_score,
+ *                           q38_qsa_select, q38_attn_sel, q38m_mm o
+ *   q38_deltanet 3262       q38m_mm qkv/z/b/a; q36_dn_aux twice over identity weights (decay
+ *                           from a, beta from b: the projections are the matrices' kinds,
+ *                           q36_dn_aux's dot then reads one weight 1 a lane, exact);
+ *                           q36_dn_conv, q36_dn_l2, q36_dn_delta (tiled / a_direct = the GGUF's
+ *                           g_q38_dn_tiled / g_q38_a_direct); q36_rmsnorm plain (dn_norm),
+ *                           q36_gate sigmoid (q38_rmsg's sigmoid_gate 1), q38m_mm out
+ *   q38_moe_decode_ex 4972  q38m_mm router; q38m_mm sh_g/sh_u, q36_silu_mul, q38m_mm sh_d,
+ *                           q36_shared_gate + q36_scale_rows; the CPU: q38_moe_ex(.., logits,
+ *                           routed_only 1) (its own top-k, so the routes are the CPU's rule);
+ *                           q36_add (routed + gate x shared, the CPU's order)
+ *   q38_forward 5520        final q38_gr_read (no inject), q38m_mm lm_head
+ * State: the device holds the DeltaNet states and rings, the PLE ring (`where`: HOST, DEV or
+ * BOTH) and the K/V/IK rows and pooled index keys of every attention layer. The host's K, V
+ * and IK rows are written after every chunk (the host's caches are always current; the
+ * device's below kv_valid are the host's); the recurrent state comes down only when the host
+ * needs it (q38m_sync_host). A CPU step (a declined one) or a host that rewrote its state
+ * (q38m_host_wrote, q38m_rollback) moves the state's authority to the host: it goes up again
+ * before the next chain step. */
+#define Q38M_CHUNK 256
+enum { Q38M_HOST = 0, Q38M_DEV, Q38M_BOTH };
+
+typedef struct {
+    q36_tensor *attn_norm, *mlp_norm;                /* the gated residuals' norms [W] */
+    q36_tensor *qn, *kn, *idx_qn, *idx_kn;           /* attention */
+    q36_tensor *dn_conv, *alog, *dt, *dn_norm;       /* DeltaNet */
+    q36_tensor *sh_gate;                             /* the shared expert's gate [H], NULL: none */
+    q36_tensor *ple_prm, *ple_conv;                  /* the PLE layer: norms key|query|conv [3W], conv [W][CK] */
+    q36_tensor *state, *ring;                        /* DeltaNet state (dn_planes planes) and conv ring */
+    q36_tensor *kc, *vc, *ikc, *pk;                  /* attention: [KVH][dcap][D] (f16 when half), [dcap][ID], [dcap/R][ID] */
+    int kv_valid, pk_valid;                          /* device rows (blocks) equal to the host's */
+} Q38mL;
+
+static struct {
+    int on;
+    Q38mL *L;
+    q36_tensor *final_norm, *eye, *ple_ring;
+    int dn_planes, dcap, half, where, host_zero;
+    int rows;   /* the scratch's rows */
+    q36_tensor *hyper, *hn, *low, *mix, *mixed, *inj_a, *inj_m, *blk, *routed;
+    q36_tensor *qraw, *qs, *gate, *qno, *kraw, *kno, *vraw, *ip, *qidx, *heads, *sel;
+    q36_tensor *qkv, *z, *aa, *bb, *decay, *beta, *junk, *convo, *qk, *core, *normo, *gated;
+    q36_tensor *emb, *keys, *val, *pg, *pn;
+    q36_tensor *lg, *sg, *su, *sh, *shd, *sgate;
+    q36_tensor *sc, *logits;
+    size_t sc_floats, logit_floats;
+    long decline_every;   /* Q38M_DECLINE_EVERY (debug): every k-th step offered is declined */
+    int layer_check;      /* Q38M_LAYER_CHECK (debug): the first step against q38_layer_forward */
+} g_q38f;
+
+static void q38_layer_forward(Model *m,int i,float *hyper,const int *ids,int S,int pos_base,
+                              float *mixed,float *inject,float *block);   /* qwen38_core.h, after this file */
+
+static q36_tensor *q38m_new(size_t floats) { return q36_tensor_new((floats ? floats : 1) * sizeof(float)); }
+static q36_tensor *q38m_up(const float *p, size_t floats) {
+    return p ? q36_tensor_upload(p, floats * sizeof(float)) : NULL;
+}
+static float *q38m_f(q36_tensor *t) { return (float *)q36_tensor_data(t); }
+static int q38m_selrow(const Cfg *c) { return c->idx_budget + c->idx_ratio; }
+static size_t q38m_ple_cells(const Cfg *c) { return (size_t)c->hc_width * (c->ple_convk - 1) * c->ngram_size; }
+static int q38m_has_ple(const Cfg *c) { return c->ple_layer >= 0 && c->ple_layer < c->layers; }
+static size_t q38m_dn_cells(const Cfg *c) { return (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim; }
+static size_t q38m_conv_cells(const Cfg *c) { return (size_t)c->dn_conv_dim * (c->dn_convk - 1); }
+
+/* a layer's DeltaNet shape for the q36_dn_* kernels */
+static q36_shape q38m_dn_shape(const Cfg *c, int rows) {
+    q36_shape s;
+    memset(&s, 0, sizeof s);
+    s.rows = rows; s.hidden = c->hidden;
+    s.v_heads = c->dn_vheads; s.k_heads = c->dn_kheads; s.k_dim = c->dn_kdim; s.v_dim = c->dn_vdim;
+    s.conv_kernel = c->dn_convk; s.conv_dim = c->dn_conv_dim;
+    s.tiled = g_q38_dn_tiled; s.a_direct = g_q38_a_direct;
+    return s;
+}
+static q38_qsa_shape q38m_qsa_shape(const Cfg *c) {
+    q38_qsa_shape s = { c->idx_qheads, c->idx_dim, c->idx_ratio, c->idx_budget, c->rotary_dim, c->theta, c->eps };
+    return s;
+}
+
+static void q38m_free_scratch(void) {
+    q36_tensor **t[] = { &g_q38f.hyper, &g_q38f.hn, &g_q38f.low, &g_q38f.mix, &g_q38f.mixed, &g_q38f.inj_a,
+        &g_q38f.inj_m, &g_q38f.blk, &g_q38f.routed, &g_q38f.qraw, &g_q38f.qs, &g_q38f.gate, &g_q38f.qno,
+        &g_q38f.kraw, &g_q38f.kno, &g_q38f.vraw, &g_q38f.ip, &g_q38f.qidx, &g_q38f.heads, &g_q38f.sel,
+        &g_q38f.qkv, &g_q38f.z, &g_q38f.aa, &g_q38f.bb, &g_q38f.decay, &g_q38f.beta, &g_q38f.junk,
+        &g_q38f.convo, &g_q38f.qk, &g_q38f.core, &g_q38f.normo, &g_q38f.gated, &g_q38f.emb, &g_q38f.keys,
+        &g_q38f.val, &g_q38f.pg, &g_q38f.pn, &g_q38f.lg, &g_q38f.sg, &g_q38f.su, &g_q38f.sh, &g_q38f.shd,
+        &g_q38f.sgate };
+    for (size_t i = 0; i < sizeof t / sizeof t[0]; i++) { q36_tensor_free(*t[i]); *t[i] = NULL; }
+    g_q38f.rows = 0;
+}
+
+/* scratch for n rows (the GPU idle: called between chunks, after a sync) */
+static int q38m_scratch(const Cfg *c, int n) {
+    if (n <= g_q38f.rows) return 1;
+    q38m_free_scratch();
+    const size_t r = (size_t)n, W = c->hc_width, H = c->hidden, C = c->hc_count, R = c->hc_rank;
+    const size_t QD = (size_t)c->q_heads * c->head_dim, KD = (size_t)c->kv_heads * c->head_dim;
+    const size_t IP = (size_t)(c->idx_qheads + 1) * c->idx_dim, IQ = (size_t)c->idx_qheads * c->idx_dim;
+    const size_t CD = c->dn_conv_dim, V = (size_t)c->dn_vheads * c->dn_vdim, VH = c->dn_vheads;
+    const size_t SI = c->shared_inter, E = c->experts, PE = c->ple_dim;
+    g_q38f.hyper = q38m_new(r * W); g_q38f.hn = q38m_new(r * W); g_q38f.low = q38m_new(r * R);
+    g_q38f.mix = q38m_new(r * W); g_q38f.mixed = q38m_new(r * H); g_q38f.inj_a = q38m_new(r * C);
+    g_q38f.inj_m = q38m_new(r * C); g_q38f.blk = q38m_new(r * H); g_q38f.routed = q38m_new(r * H);
+    g_q38f.qraw = q38m_new(r * 2 * QD); g_q38f.qs = q38m_new(r * QD); g_q38f.gate = q38m_new(r * QD);
+    g_q38f.qno = q38m_new(r * QD); g_q38f.kraw = q38m_new(r * KD); g_q38f.kno = q38m_new(r * KD);
+    g_q38f.vraw = q38m_new(r * KD); g_q38f.ip = q38m_new(r * IP); g_q38f.qidx = q38m_new(r * IQ);
+    g_q38f.heads = q38m_new(r * QD); g_q38f.sel = q38m_new(r * (size_t)q38m_selrow(c));
+    g_q38f.qkv = q38m_new(r * CD); g_q38f.z = q38m_new(r * V); g_q38f.aa = q38m_new(r * VH);
+    g_q38f.bb = q38m_new(r * VH); g_q38f.decay = q38m_new(r * VH); g_q38f.beta = q38m_new(r * VH);
+    g_q38f.junk = q38m_new(r * VH); g_q38f.convo = q38m_new(r * CD); g_q38f.qk = q38m_new(r * CD);
+    g_q38f.core = q38m_new(r * V); g_q38f.normo = q38m_new(r * V); g_q38f.gated = q38m_new(r * V);
+    g_q38f.emb = q38m_new(r * PE); g_q38f.keys = q38m_new(r * W); g_q38f.val = q38m_new(r * H);
+    g_q38f.pg = q38m_new(r * W); g_q38f.pn = q38m_new(r * W);
+    g_q38f.lg = q38m_new(r * E); g_q38f.sg = q38m_new(r * SI); g_q38f.su = q38m_new(r * SI);
+    g_q38f.sh = q38m_new(r * SI); g_q38f.shd = q38m_new(r * H); g_q38f.sgate = q38m_new(r);
+    q36_tensor *all[] = { g_q38f.hyper, g_q38f.hn, g_q38f.low, g_q38f.mix, g_q38f.mixed, g_q38f.inj_a, g_q38f.inj_m,
+        g_q38f.blk, g_q38f.routed, g_q38f.qraw, g_q38f.qs, g_q38f.gate, g_q38f.qno, g_q38f.kraw, g_q38f.kno,
+        g_q38f.vraw, g_q38f.ip, g_q38f.qidx, g_q38f.heads, g_q38f.sel, g_q38f.qkv, g_q38f.z, g_q38f.aa, g_q38f.bb,
+        g_q38f.decay, g_q38f.beta, g_q38f.junk, g_q38f.convo, g_q38f.qk, g_q38f.core, g_q38f.normo, g_q38f.gated,
+        g_q38f.emb, g_q38f.keys, g_q38f.val, g_q38f.pg, g_q38f.pn, g_q38f.lg, g_q38f.sg, g_q38f.su, g_q38f.sh,
+        g_q38f.shd, g_q38f.sgate };
+    for (size_t i = 0; i < sizeof all / sizeof all[0]; i++)
+        if (!all[i]) { q38m_free_scratch(); return 0; }
+    g_q38f.rows = n;
+    return 1;
+}
+
+/* a buffer of at least `floats` floats in *t (cap in *have); contents not kept */
+static int q38m_grow(q36_tensor **t, size_t *have, size_t floats) {
+    if (*t && *have >= floats) return 1;
+    q36_tensor_free(*t);
+    *t = q38m_new(floats);
+    *have = *t ? floats : 0;
+    return *t != NULL;
+}
+
+/* The device's K/V/IK rows for `need` positions: 256, doubled to 1024, then 1024 more at a
+ * time (qwen36's qg_reserve), the valid rows copied (the GPU idle). */
+static int q38m_kv_reserve(Model *m, int need) {
+    const Cfg *c = &m->c;
+    if (need <= g_q38f.dcap) return 1;
+    int cap = g_q38f.dcap ? g_q38f.dcap : 256;
+    while (cap < need) cap = cap < 1024 ? 2 * cap : cap + 1024;
+    const size_t D = c->head_dim, KVH = c->kv_heads, ID = c->idx_dim, R = c->idx_ratio, es = g_q38f.half ? 2 : 4;
+    for (int i = 0; i < c->layers; i++) {
+        if (!c->is_attn[i]) continue;
+        Q38mL *L = &g_q38f.L[i];
+        q36_tensor *kc = q36_tensor_new(KVH * cap * D * es), *vc = q36_tensor_new(KVH * cap * D * es);
+        q36_tensor *ikc = q38m_new((size_t)cap * ID), *pk = q38m_new(((size_t)cap / R + 1) * ID);
+        if (!kc || !vc || !ikc || !pk) { q36_tensor_free(kc); q36_tensor_free(vc); q36_tensor_free(ikc); q36_tensor_free(pk); return 0; }
+        int rows = L->kv_valid < g_q38f.dcap ? L->kv_valid : g_q38f.dcap;
+        if (L->kc && rows > 0) {
+            for (size_t h = 0; h < KVH; h++) {
+                memcpy((char *)q36_tensor_data(kc) + h * cap * D * es, (char *)q36_tensor_data(L->kc) + h * g_q38f.dcap * D * es, (size_t)rows * D * es);
+                memcpy((char *)q36_tensor_data(vc) + h * cap * D * es, (char *)q36_tensor_data(L->vc) + h * g_q38f.dcap * D * es, (size_t)rows * D * es);
+            }
+            memcpy(q38m_f(ikc), q38m_f(L->ikc), (size_t)rows * ID * sizeof(float));
+            memcpy(q38m_f(pk), q38m_f(L->pk), (size_t)L->pk_valid * ID * sizeof(float));
+        } else L->kv_valid = L->pk_valid = 0;
+        q36_tensor_free(L->kc); q36_tensor_free(L->vc); q36_tensor_free(L->ikc); q36_tensor_free(L->pk);
+        L->kc = kc; L->vc = vc; L->ikc = ikc; L->pk = pk;
+    }
+    g_q38f.dcap = cap;
+    return 1;
+}
+
+/* f32 <-> the device cache's element (f16 when half: the host's rows are kv16-rounded
+ * already, so both ways are exact) */
+static void q38m_kv_put(void *dst, const float *src, size_t n) {
+    if (!g_q38f.half) { memcpy(dst, src, n * sizeof(float)); return; }
+    _Float16 *d = (_Float16 *)dst;
+    for (size_t i = 0; i < n; i++) d[i] = (_Float16)src[i];
+}
+static void q38m_kv_get(float *dst, const void *src, size_t n) {
+    if (!g_q38f.half) { memcpy(dst, src, n * sizeof(float)); return; }
+    const _Float16 *s = (const _Float16 *)src;
+    for (size_t i = 0; i < n; i++) dst[i] = (float)s[i];
+}
+
+/* rows [t0, t1) of attention layer i, host -> device (up) or device -> host */
+static void q38m_kv_rows(Model *m, int i, int t0, int t1, int up) {
+    const Cfg *c = &m->c;
+    const size_t D = c->head_dim, ID = c->idx_dim, es = g_q38f.half ? 2 : 4;
+    Q38mL *L = &g_q38f.L[i];
+    if (t1 <= t0) return;
+    for (int h = 0; h < c->kv_heads; h++) {
+        size_t hs = ((size_t)h * m->kv_cap + t0) * D, ds = ((size_t)h * g_q38f.dcap + t0) * D;
+        char *kd = (char *)q36_tensor_data(L->kc) + ds * es, *vd = (char *)q36_tensor_data(L->vc) + ds * es;
+        size_t n = (size_t)(t1 - t0) * D;
+        if (up) { q38m_kv_put(kd, m->K[i] + hs, n); q38m_kv_put(vd, m->V[i] + hs, n); }
+        else { q38m_kv_get(m->K[i] + hs, kd, n); q38m_kv_get(m->V[i] + hs, vd, n); }
+    }
+    float *ik = q38m_f(L->ikc) + (size_t)t0 * ID, *hk = m->IK[i] + (size_t)t0 * ID;
+    if (up) memcpy(ik, hk, (size_t)(t1 - t0) * ID * sizeof(float));
+    else memcpy(hk, ik, (size_t)(t1 - t0) * ID * sizeof(float));
+}
+
+/* Before a chunk of rows from pb (the GPU idle): the recurrent state up where the host holds
+ * it, and every attention layer's rows below pb that the device does not have. */
+static void q38m_push(Model *m, int pb) {
+    const Cfg *c = &m->c;
+    const int R = c->idx_ratio;
+    if (g_q38f.where == Q38M_HOST) {
+        const size_t nr = q38m_dn_cells(c), nc = q38m_conv_cells(c);
+        for (int i = 0; i < c->layers; i++) {
+            if (c->is_attn[i]) continue;
+            Q38mL *L = &g_q38f.L[i];
+            memset(q36_tensor_data(L->state), 0, (size_t)g_q38f.dn_planes * nr * sizeof(float));
+            if (g_q38f.host_zero) memset(q36_tensor_data(L->ring), 0, nc * sizeof(float));
+            else {
+                memcpy(q36_tensor_data(L->state), m->DN_rec[i], nr * sizeof(float));
+                memcpy(q36_tensor_data(L->ring), m->DN_conv[i], nc * sizeof(float));
+            }
+        }
+        if (g_q38f.ple_ring) {
+            if (g_q38f.host_zero || !m->PLE_conv_state) memset(q36_tensor_data(g_q38f.ple_ring), 0, q38m_ple_cells(c) * sizeof(float));
+            else memcpy(q36_tensor_data(g_q38f.ple_ring), m->PLE_conv_state, q38m_ple_cells(c) * sizeof(float));
+        }
+        g_q38f.where = Q38M_BOTH;
+    }
+    for (int i = 0; i < c->layers; i++) {
+        if (!c->is_attn[i]) continue;
+        Q38mL *L = &g_q38f.L[i];
+        if (L->pk_valid > pb / R) L->pk_valid = pb / R;   /* the blocks this step rewrites */
+        if (L->kv_valid < pb) {
+            q38m_kv_rows(m, i, L->kv_valid, pb, 1);
+            if (L->pk_valid > L->kv_valid / R) L->pk_valid = L->kv_valid / R;
+            L->kv_valid = pb;
+        }
+    }
+}
+
+/* device -> host: DN_rec (the high plane plus the low), DN_conv, the PLE ring. The K/V/IK
+ * rows are the host's already (written after every chunk). */
+static void q38m_sync_host(Model *m) {
+    if (!g_q38f.on || g_q38f.where != Q38M_DEV) return;
+    const Cfg *c = &m->c;
+    const size_t nr = q38m_dn_cells(c), nc = q38m_conv_cells(c);
+    for (int i = 0; i < c->layers; i++) {
+        if (c->is_attn[i]) continue;
+        const float *st = q38m_f(g_q38f.L[i].state);
+        if (g_q38f.dn_planes == 2) for (size_t k = 0; k < nr; k++) m->DN_rec[i][k] = st[k] + st[nr + k];
+        else memcpy(m->DN_rec[i], st, nr * sizeof(float));
+        memcpy(m->DN_conv[i], q36_tensor_data(g_q38f.L[i].ring), nc * sizeof(float));
+    }
+    if (g_q38f.ple_ring && m->PLE_conv_state)
+        memcpy(m->PLE_conv_state, q36_tensor_data(g_q38f.ple_ring), q38m_ple_cells(c) * sizeof(float));
+    g_q38f.where = Q38M_BOTH;
+}
+
+/* The host state is authoritative (a restored prefix, a reset): the next forward uploads it
+ * again; zero, when it is all zeros. */
+static void q38m_host_wrote(Model *m, int zero) {
+    (void)m;
+    if (!g_q38f.on) return;
+    g_q38f.where = Q38M_HOST; g_q38f.host_zero = zero;
+}
+
+/* A CPU step from pos_base (q38_forward, a declined step): the host's state current first,
+ * then the host's; the device's rows from pos_base on are the CPU's to write. */
+static void q38m_cpu_step(Model *m, int pos_base) {
+    if (!g_q38f.on) return;
+    q38m_sync_host(m);
+    g_q38f.where = Q38M_HOST; g_q38f.host_zero = 0;
+    const Cfg *c = &m->c;
+    for (int i = 0; i < c->layers; i++) {
+        if (!c->is_attn[i]) continue;
+        Q38mL *L = &g_q38f.L[i];
+        if (L->kv_valid > pos_base) L->kv_valid = pos_base;
+        if (L->pk_valid > pos_base / c->idx_ratio) L->pk_valid = pos_base / c->idx_ratio;
+    }
+}
+
+/* len positions stand: the KV and pooled-key watermarks come down to them (the rows past len
+ * go up again from the host). slot >= 0 (a speculative verify's rollback, which the CPU ran:
+ * the chain declines a verify) swaps the host's state in: the host's again. */
+static void q38m_rollback(Model *m, int slot, int len) {
+    if (!g_q38f.on) return;
+    const Cfg *c = &m->c;
+    for (int i = 0; i < c->layers; i++) {
+        if (!c->is_attn[i]) continue;
+        Q38mL *L = &g_q38f.L[i];
+        if (L->kv_valid > len) L->kv_valid = len;
+        if (L->pk_valid > len / c->idx_ratio) L->pk_valid = len / c->idx_ratio;
+    }
+    if (slot >= 0) { q38m_sync_host(m); g_q38f.where = Q38M_HOST; g_q38f.host_zero = 0; }
+}
+
+static void q38m_free_forward(const Cfg *c) {
+    if (g_q38f.L)
+        for (int i = 0; i < c->layers; i++) {
+            Q38mL *L = &g_q38f.L[i];
+            q36_tensor *t[] = { L->attn_norm, L->mlp_norm, L->qn, L->kn, L->idx_qn, L->idx_kn, L->dn_conv, L->alog,
+                                L->dt, L->dn_norm, L->sh_gate, L->ple_prm, L->ple_conv, L->state, L->ring, L->kc,
+                                L->vc, L->ikc, L->pk };
+            for (size_t k = 0; k < sizeof t / sizeof t[0]; k++) q36_tensor_free(t[k]);
+        }
+    free(g_q38f.L);
+    q36_tensor_free(g_q38f.final_norm); q36_tensor_free(g_q38f.eye); q36_tensor_free(g_q38f.ple_ring);
+    q36_tensor_free(g_q38f.sc); q36_tensor_free(g_q38f.logits);
+    q38m_free_scratch();
+    memset(&g_q38f, 0, sizeof g_q38f);
+}
+
+/* the chain's whole device state, before q38_model_free (the in-place maps read the model's
+ * bytes) */
+static void q38m_free(Model *m) {
+    if (!g_q38f.on && !g_q38m.layers) return;
+    q36_gpu_sync();
+    q38m_free_forward(&m->c);
+    q38m_free_weights();
+    g_mtl_chain = 0;
+}
+
+/* the norms, small vectors and state of every layer on the GPU; 0 with the reason in why */
+static int q38m_setup(Model *m, char *why, size_t nwhy) {
+    const Cfg *c = &m->c;
+    const int W = c->hc_width, H = c->hidden, VH = c->dn_vheads;
+    memset(&g_q38f, 0, sizeof g_q38f);
+    g_q38f.L = (Q38mL *)calloc((size_t)c->layers, sizeof *g_q38f.L);
+    if (!g_q38f.L) { snprintf(why, nwhy, "no memory for the layers' table"); return 0; }
+    q36_shape ds = q38m_dn_shape(c, 1);
+    g_q38f.dn_planes = q36_dn_high_only(&ds) ? 1 : 2;
+    g_q38f.half = q38_kv16();
+    g_q38f.where = Q38M_HOST; g_q38f.host_zero = 1;
+    int ok = (g_q38f.final_norm = q38m_up(m->final_gr.norm, (size_t)W)) != NULL;
+    if (ok && VH > 0) {   /* q36_dn_aux over a and b already projected: identity weights */
+        float *e = (float *)calloc((size_t)VH * VH, sizeof(float));
+        ok = e != NULL;
+        if (ok) { for (int h = 0; h < VH; h++) e[(size_t)h * VH + h] = 1.f; g_q38f.eye = q38m_up(e, (size_t)VH * VH); ok = g_q38f.eye != NULL; }
+        free(e);
+    }
+    if (ok && q38m_has_ple(c)) {
+        Layer *l = &m->L[c->ple_layer];
+        Q38mL *L = &g_q38f.L[c->ple_layer];
+        float *prm = (float *)malloc((size_t)3 * W * sizeof(float));
+        ok = prm && l->ple_norm_key && l->ple_norm_query && l->ple_norm_conv && l->ple_conv;
+        if (ok) {
+            memcpy(prm, l->ple_norm_key, (size_t)W * sizeof(float));
+            memcpy(prm + W, l->ple_norm_query, (size_t)W * sizeof(float));
+            memcpy(prm + 2 * W, l->ple_norm_conv, (size_t)W * sizeof(float));
+            ok = (L->ple_prm = q38m_up(prm, (size_t)3 * W)) && (L->ple_conv = q38m_up(l->ple_conv, (size_t)W * c->ple_convk)) &&
+                 (g_q38f.ple_ring = q38m_new(q38m_ple_cells(c)));
+        }
+        free(prm);
+    }
+    for (int i = 0; ok && i < c->layers; i++) {
+        Layer *l = &m->L[i];
+        Q38mL *L = &g_q38f.L[i];
+        ok = (L->attn_norm = q38m_up(l->attn_gr.norm, (size_t)W)) && (L->mlp_norm = q38m_up(l->mlp_gr.norm, (size_t)W));
+        if (ok && l->sh_gate) ok = (L->sh_gate = q38m_up(l->sh_gate, (size_t)H)) != NULL;
+        if (!ok) break;
+        if (c->is_attn[i])
+            ok = (L->qn = q38m_up(l->qn, (size_t)c->head_dim)) && (L->kn = q38m_up(l->kn, (size_t)c->head_dim)) &&
+                 (L->idx_qn = q38m_up(l->idx_qn, (size_t)c->idx_dim)) && (L->idx_kn = q38m_up(l->idx_kn, (size_t)c->idx_dim));
+        else
+            ok = (L->dn_conv = q38m_up(l->dn_conv, (size_t)c->dn_conv_dim * c->dn_convk)) &&
+                 (L->alog = q38m_up(l->dn_alog, (size_t)VH)) && (L->dt = q38m_up(l->dn_dtbias, (size_t)VH)) &&
+                 (L->dn_norm = q38m_up(l->dn_norm, (size_t)c->dn_vdim)) &&
+                 (L->state = q38m_new((size_t)g_q38f.dn_planes * q38m_dn_cells(c))) &&
+                 (L->ring = q38m_new(q38m_conv_cells(c)));
+    }
+    if (!ok) { q38m_free_forward(c); snprintf(why, nwhy, "the layers' norms and state did not reach the GPU"); return 0; }
+    const char *d = getenv("Q38M_DECLINE_EVERY"), *lc = getenv("Q38M_LAYER_CHECK");
+    g_q38f.decline_every = d && *d ? atol(d) : 0;
+    g_q38f.layer_check = lc && !strcmp(lc, "1");
+    g_q38f.on = 1;
+    return 1;
+}
+
+/* the n-gram rows of the chunk's rows [c0, c0+n) into emb, the host's history moved on, as
+ * q38_ple does it (qwen38_chain.h's q38c_ple_rows) */
+static void q38m_ple_rows(Model *m, const int *ids, int c0, int n, float *emb) {
+    const Cfg *c = &m->c;
+    const int E = c->ngram_heads * c->ngram_head_dim;
+    for (int r = 0; r < n; r++) {
+        int s = c0 + r;
+        float *e = emb + (size_t)r * E;
+        int64_t p1 = m->ple_history_len >= 1 ? m->ple_history[m->ple_history_len - 1] : c->eos_id;
+        int64_t p2 = m->ple_history_len >= 2 ? m->ple_history[m->ple_history_len - 2] : c->eos_id;
+        if (m->ple_pref && s < m->ple_pref_rows)
+            memcpy(e, m->ple_pref + (int64_t)s * E, (size_t)E * sizeof(float));
+        else for (int h = 0; h < c->ngram_heads; h++) {
+            int ng = h < c->heads_per_ngram ? 2 : 3;
+            q38_ple_row(m, q38_hash_row(m, h, ng, ids[s], p1, p2), e + (int64_t)h * c->ngram_head_dim);
+        }
+        if (ids[s] == c->eos_id) m->ple_history_len = 0;
+        else if (m->ple_history_len == 0) { m->ple_history[0] = ids[s]; m->ple_history_len = 1; }
+        else if (m->ple_history_len == 1) { m->ple_history[1] = ids[s]; m->ple_history_len = 2; }
+        else { m->ple_history[0] = m->ple_history[1]; m->ple_history[1] = ids[s]; }
+    }
+}
+
+/* q38_gr_read: mixed [n][H] from the streams, inject [n][C] when inj */
+static int q38m_gr_read(const Cfg *c, const Q38mW *w /* down, up, inject */, q36_tensor *norm, int n, q36_tensor *inj) {
+    const int H = c->hidden, C = c->hc_count, R = c->hc_rank;
+    int ok = q38_hc_norm(g_q38f.hn, g_q38f.hyper, norm, n, H, C, c->eps) && q38m_mm(g_q38f.low, g_q38f.hn, &w[0], n) &&
+             q38_hc_low(g_q38f.low, g_q38f.low, n * R, (float)C) && q38m_mm(g_q38f.mix, g_q38f.low, &w[1], n) &&
+             q38_hc_mix(g_q38f.mixed, g_q38f.mix, g_q38f.hn, n, H, C, (float)C);
+    if (ok && inj) ok = q38m_mm(inj, g_q38f.hn, &w[2], n) && q38_hc_inj(inj, inj, n * C, (float)C);
+    return ok;
+}
+
+/* q38_attention over mixed into blk, rows at pb.. */
+static int q38m_attention(Model *m, int i, int n, int pb) {
+    const Cfg *c = &m->c;
+    const Q38mW *w = g_q38m.L[i];
+    Q38mL *L = &g_q38f.L[i];
+    const int QH = c->q_heads, KVH = c->kv_heads, D = c->head_dim, R = c->idx_ratio, selrow = q38m_selrow(c);
+    const float theta = c->theta;   /* the MTP head (mtp_theta) stays on the CPU, off beside the chain */
+    q38_qsa_shape qs = q38m_qsa_shape(c);
+    int ok = q38m_mm(g_q38f.qraw, g_q38f.mixed, &w[10], n) && q38m_mm(g_q38f.kraw, g_q38f.mixed, &w[11], n) &&
+             q38m_mm(g_q38f.vraw, g_q38f.mixed, &w[12], n) && q38m_mm(g_q38f.ip, g_q38f.mixed, &w[14], n) &&
+             q38_qgate_split(g_q38f.qs, g_q38f.gate, g_q38f.qraw, n, QH, D) &&
+             q38_hc_norm(g_q38f.qno, g_q38f.qs, L->qn, n * QH, D, 1, c->eps) &&
+             q38_hc_norm(g_q38f.kno, g_q38f.kraw, L->kn, n * KVH, D, 1, c->eps) &&
+             q38_rope_half(g_q38f.qno, n, QH, D, c->rotary_dim, pb, theta) &&
+             q38_rope_half(g_q38f.kno, n, KVH, D, c->rotary_dim, pb, theta) &&
+             q38_kv_append(L->kc, L->vc, g_q38f.kno, g_q38f.vraw, n, pb, KVH, D, g_q38f.dcap, g_q38f.half) &&
+             q38_idx_prep(g_q38f.qidx, L->ikc, g_q38f.ip, L->idx_qn, n, pb, g_q38f.dcap, &qs);
+    const int blocks = (pb + n) / R, nbmax = blocks > 0 ? blocks : 1;
+    if (ok && blocks > L->pk_valid) {   /* the blocks this chunk completes */
+        ok = q38_qsa_pool(L->pk, L->ikc, L->idx_kn, L->pk_valid, blocks - L->pk_valid, &qs);
+        if (ok) L->pk_valid = blocks;
+    }
+    ok = ok && q38m_grow(&g_q38f.sc, &g_q38f.sc_floats, (size_t)n * nbmax) &&
+         q38_qsa_score(g_q38f.sc, g_q38f.qidx, L->pk, n, pb, nbmax, &qs) &&
+         q38_qsa_select(g_q38f.sel, g_q38f.sc, n, pb, nbmax, selrow, &qs) &&
+         q38_attn_sel(g_q38f.heads, g_q38f.qno, g_q38f.gate, L->kc, L->vc, g_q38f.sel, n, pb, QH, KVH, D, g_q38f.dcap,
+                      selrow, g_q38f.half) &&
+         q38m_mm(g_q38f.blk, g_q38f.heads, &w[13], n);
+    return ok;
+}
+
+/* q38_deltanet over mixed into blk */
+static int q38m_deltanet(Model *m, int i, int n) {
+    const Cfg *c = &m->c;
+    const Q38mW *w = g_q38m.L[i];
+    Q38mL *L = &g_q38f.L[i];
+    q36_shape s = q38m_dn_shape(c, n), sa = s;
+    sa.hidden = c->dn_vheads;   /* q36_dn_aux over the projections, identity weights */
+    const int VH = c->dn_vheads, VD = c->dn_vdim;
+    return q38m_mm(g_q38f.qkv, g_q38f.mixed, &w[15], n) && q38m_mm(g_q38f.z, g_q38f.mixed, &w[16], n) &&
+           q38m_mm(g_q38f.bb, g_q38f.mixed, &w[17], n) && q38m_mm(g_q38f.aa, g_q38f.mixed, &w[18], n) &&
+           q36_dn_aux(g_q38f.decay, g_q38f.junk, g_q38f.aa, g_q38f.eye, g_q38f.eye, L->alog, L->dt, &sa) &&
+           q36_dn_aux(g_q38f.junk, g_q38f.beta, g_q38f.bb, g_q38f.eye, g_q38f.eye, L->alog, L->dt, &sa) &&
+           q36_dn_conv(g_q38f.convo, L->ring, g_q38f.qkv, L->dn_conv, NULL, &s) &&
+           q36_dn_l2(g_q38f.qk, g_q38f.convo, &s) &&
+           q36_dn_delta(g_q38f.core, L->state, g_q38f.qk, g_q38f.convo, g_q38f.decay, g_q38f.beta, NULL, &s) &&
+           q36_rmsnorm(g_q38f.normo, g_q38f.core, L->dn_norm, n * VH, VD, c->eps, 1) &&
+           q36_gate(g_q38f.gated, g_q38f.normo, g_q38f.z, n * VH * VD, 0) &&
+           q38m_mm(g_q38f.blk, g_q38f.gated, &w[19], n);
+}
+
+/* the PLE step on its layer: hyper += gated + silu(conv) (q38_ple, then hyper += ple) */
+static int q38m_ple(Model *m, int n) {
+    const Cfg *c = &m->c;
+    const Q38mW *w = g_q38m.L[c->ple_layer];
+    Q38mL *L = &g_q38f.L[c->ple_layer];
+    q38_ple_shape ps = { n, c->hc_count, c->hc_width, c->hidden, c->ple_convk, c->ngram_size, 0, c->eps, 1 };
+    return q38m_mm(g_q38f.keys, g_q38f.emb, &w[20], n) && q38m_mm(g_q38f.val, g_q38f.emb, &w[21], n) &&
+           q38_ple_gate(g_q38f.pg, g_q38f.pn, g_q38f.keys, g_q38f.hyper, g_q38f.val, L->ple_prm, &ps) &&
+           q38_ple_conv(g_q38f.hyper, g_q38f.ple_ring, NULL, g_q38f.pg, g_q38f.pn, L->ple_conv, &ps);
+}
+
+/* router logits and the shared expert (gate x shared in shd) */
+static int q38m_mlp_dense(Model *m, int i, int n) {
+    const Cfg *c = &m->c;
+    const Q38mW *w = g_q38m.L[i];
+    Q38mL *L = &g_q38f.L[i];
+    int ok = q38m_mm(g_q38f.lg, g_q38f.mixed, &w[6], n);
+    if (ok && c->shared_inter > 0 && w[7].t)
+        ok = q38m_mm(g_q38f.sg, g_q38f.mixed, &w[7], n) && q38m_mm(g_q38f.su, g_q38f.mixed, &w[8], n) &&
+             q36_silu_mul(g_q38f.sh, g_q38f.sg, g_q38f.su, n * c->shared_inter) &&
+             q38m_mm(g_q38f.shd, g_q38f.sh, &w[9], n) &&
+             q36_shared_gate(g_q38f.sgate, g_q38f.mixed, L->sh_gate, n, c->hidden) &&
+             q36_scale_rows(g_q38f.shd, g_q38f.sgate, n, c->hidden);
+    return ok;
+}
+
+/* Q38M_LAYER_CHECK: the CPU's streams after each layer for the first step (q38_layer_forward on
+ * a copy of the embedded rows, the PLE history and prefetched rows put back after), and the
+ * worst |gpu - cpu| and max |cpu| of each layer */
+static float *g_q38m_lc_ref;
+static double *g_q38m_lc_diff, *g_q38m_lc_max;
+static void q38m_layer_check_ref(Model *m, const int *ids, int S, int pos_base, const float *hyper_h) {
+    const Cfg *c = &m->c;
+    const size_t SW = (size_t)S * c->hc_width;
+    g_q38m_lc_ref = (float *)malloc((size_t)c->layers * SW * sizeof(float));
+    g_q38m_lc_diff = (double *)calloc((size_t)c->layers, sizeof(double));
+    g_q38m_lc_max = (double *)calloc((size_t)c->layers, sizeof(double));
+    float *hy = (float *)malloc(SW * sizeof(float)), *mixed = falloc((int64_t)S * c->hidden);
+    float *inject = falloc((int64_t)S * c->hc_count), *block = falloc((int64_t)S * c->hidden);
+    if (!g_q38m_lc_ref || !g_q38m_lc_diff || !g_q38m_lc_max || !hy) { fprintf(stderr, "[q38m-layer] OOM\n"); exit(1); }
+    memcpy(hy, hyper_h, SW * sizeof(float));
+    int64_t hist[2] = { m->ple_history[0], m->ple_history[1] };
+    int hlen = m->ple_history_len, pref_rows = m->ple_pref_rows;
+    float *pref = m->ple_pref;
+    m->ple_pref = NULL; m->ple_pref_rows = 0;   /* q38_ple reads its rows itself and frees none of ours */
+    for (int i = 0; i < c->layers; i++) {
+        q38_layer_forward(m, i, hy, ids, S, pos_base, mixed, inject, block);
+        memcpy(g_q38m_lc_ref + (size_t)i * SW, hy, SW * sizeof(float));
+    }
+    m->ple_pref = pref; m->ple_pref_rows = pref_rows;
+    m->ple_history[0] = hist[0]; m->ple_history[1] = hist[1]; m->ple_history_len = hlen;
+    free(hy); free(mixed); free(inject); free(block);
+}
+
 /* 0: not taken (the CPU runs the step from the host state) | 1: done, the logits of
  * the last nlogits rows in logit, the final streams in hyper_h when want_streams,
- * every row's mixed in mixed_h when it is not NULL. */
+ * every row's mixed in mixed_h when it is not NULL. hyper_h holds the rows' embedded
+ * streams on the way in. */
 static int q38m_forward(Model *m, const int *ids, int S, int pos_base, int nlogits,
                         float *hyper_h, int want_streams, float *mixed_h, float *logit) {
-    (void)m; (void)ids; (void)S; (void)pos_base; (void)nlogits;
-    (void)hyper_h; (void)want_streams; (void)mixed_h; (void)logit;
+    const Cfg *c = &m->c;
+    const int H = c->hidden, W = c->hc_width, C = c->hc_count, V = c->vocab, L = c->layers;
+    static unsigned long long offered;
+    offered++;
+    /* a verify's per-row copies (snap_rows) and several conversations' rows stay on the CPU */
+    if (!g_q38f.on || S < 1 || nlogits < 1 || nlogits > S || m->snap_rows > 0 || m->mux_rows ||
+        (g_q38f.decline_every > 0 && offered % (unsigned long long)g_q38f.decline_every == 0)) {
+        g_q38m_declined++;
+        return 0;
+    }
+    const int was_dev = g_q38f.where == Q38M_DEV;
+    const int64_t hist0[2] = { m->ple_history[0], m->ple_history[1] };
+    const int hlen0 = m->ple_history_len;
+    const int check = g_q38f.layer_check && !g_q38m_forwards && pos_base == 0 && g_q38f.where == Q38M_HOST && g_q38f.host_zero;
+    if (check) q38m_layer_check_ref(m, ids, S, pos_base, hyper_h);
+    if (!q38m_grow(&g_q38f.logits, &g_q38f.logit_floats, (size_t)nlogits * V)) { g_q38m_declined++; return 0; }
+    const char *what = NULL;
+    int failed_layer = -1, lo_first = S - nlogits, c0;
+    for (c0 = 0; c0 < S; c0 += Q38M_CHUNK) {
+        if (coli_prompt_break()) { g_q38m_declined++; return 0; }   /* a served prompt's stop, between two chunks */
+        const int n = S - c0 < Q38M_CHUNK ? S - c0 : Q38M_CHUNK, pb = pos_base + c0;
+        if (!q38m_scratch(c, n) || !q38m_kv_reserve(m, pb + n)) { what = "device memory for a chunk"; goto fail; }
+        memcpy(q36_tensor_data(g_q38f.hyper), hyper_h + (size_t)c0 * W, (size_t)n * W * sizeof(float));
+        q38m_push(m, pb);
+        if (q38m_has_ple(c)) q38m_ple_rows(m, ids, c0, n, q38m_f(g_q38f.emb));
+        for (int i = 0; i < L; i++) {
+            const Q38mW *w = g_q38m.L[i];
+            Q38mL *Ld = &g_q38f.L[i];
+            failed_layer = i;
+            if (i == c->ple_layer && !q38m_ple(m, n)) { what = "the PLE step"; goto fail; }
+            if (!q38m_gr_read(c, &w[0], Ld->attn_norm, n, g_q38f.inj_a)) { what = "the attention's gated-residual read"; goto fail; }
+            if (c->is_attn[i] ? !q38m_attention(m, i, n, pb) : !q38m_deltanet(m, i, n)) { what = c->is_attn[i] ? "the attention" : "the DeltaNet"; goto fail; }
+            if (!q38_hc_apply(g_q38f.hyper, g_q38f.inj_a, g_q38f.blk, n, H, C) ||
+                !q38m_gr_read(c, &w[3], Ld->mlp_norm, n, g_q38f.inj_m) || !q38m_mlp_dense(m, i, n)) { what = "the MLP's dense part"; goto fail; }
+            if (!q36_gpu_sync()) { what = "a GPU batch"; goto fail; }
+            q38_moe_ex(m, &m->L[i], i, q38m_f(g_q38f.mixed), n, q38m_f(g_q38f.routed), q38m_f(g_q38f.lg), 1);
+            int sh = c->shared_inter > 0 && w[7].t;
+            if ((sh ? !q36_add(g_q38f.blk, g_q38f.routed, g_q38f.shd, n * H) : 0) ||
+                !q38_hc_apply(g_q38f.hyper, g_q38f.inj_m, sh ? g_q38f.blk : g_q38f.routed, n, H, C)) { what = "the MoE's sum"; goto fail; }
+            if (check) {
+                if (!q36_gpu_sync()) { what = "a GPU batch"; goto fail; }
+                const float *g = q38m_f(g_q38f.hyper), *r = g_q38m_lc_ref + (size_t)i * S * W + (size_t)c0 * W;
+                for (size_t k = 0; k < (size_t)n * W; k++) {
+                    double d = fabs((double)g[k] - r[k]), a = fabs((double)r[k]);
+                    if (!(d <= g_q38m_lc_diff[i])) g_q38m_lc_diff[i] = d;   /* a NaN is the worst */
+                    if (a > g_q38m_lc_max[i]) g_q38m_lc_max[i] = a;
+                }
+            }
+        }
+        failed_layer = L;
+        /* the final mixer for the rows that need it: the read-out wants every row, the logits
+         * the last nlogits */
+        int lo0 = lo_first > c0 ? lo_first - c0 : 0;
+        if (mixed_h || lo0 < n) {
+            if (!q38m_gr_read(c, g_q38m.tail, g_q38f.final_norm, n, NULL)) { what = "the final mixer"; goto fail; }
+            if (lo0 < n) {
+                size_t rows = (size_t)(n - lo0), dst = (size_t)(c0 + lo0 - lo_first);
+                q36_tensor *xv = q36_tensor_view(g_q38f.mixed, (size_t)lo0 * H * sizeof(float), rows * H * sizeof(float));
+                q36_tensor *yv = q36_tensor_view(g_q38f.logits, dst * V * sizeof(float), rows * V * sizeof(float));
+                int ok = xv && yv && q38m_mm(yv, xv, &g_q38m.tail[3], (int)rows);
+                q36_tensor_free(xv); q36_tensor_free(yv);
+                if (!ok) { what = "lm_head"; goto fail; }
+            }
+        }
+        if (!q36_gpu_sync()) { what = "a GPU batch"; goto fail; }
+        if (want_streams) memcpy(hyper_h + (size_t)c0 * W, q36_tensor_data(g_q38f.hyper), (size_t)n * W * sizeof(float));
+        if (mixed_h) memcpy(mixed_h + (size_t)c0 * H, q36_tensor_data(g_q38f.mixed), (size_t)n * H * sizeof(float));
+        for (int i = 0; i < L; i++)
+            if (c->is_attn[i]) { q38m_kv_rows(m, i, pb, pb + n, 0); g_q38f.L[i].kv_valid = pb + n; }
+        g_q38f.where = Q38M_DEV; g_q38f.host_zero = 0;
+    }
+    memcpy(logit, q36_tensor_data(g_q38f.logits), (size_t)nlogits * V * sizeof(float));
+    if (check) {
+        for (int i = 0; i < L; i++) {
+            double e = g_q38m_lc_diff[i] / (g_q38m_lc_max[i] > 0 ? g_q38m_lc_max[i] : 1.0);
+            fprintf(stderr, "[q38m-layer] L%d worst=%.3g (max |cpu| %.3g)%s\n", i, e, g_q38m_lc_max[i], e <= 1e-4 ? "" : " FAIL");
+        }
+        free(g_q38m_lc_ref); free(g_q38m_lc_diff); free(g_q38m_lc_max);
+        g_q38m_lc_ref = NULL; g_q38m_lc_diff = g_q38m_lc_max = NULL;
+    }
+    g_q38m_forwards++;
+    return 1;
+fail:
+    /* A kernel that declined: a shape or a size the chain does not take. The device's state
+     * may have moved past the host's: the step can be handed to the CPU only when the host
+     * held the whole state at the step's start (its first chunk). */
+    q36_gpu_sync();
+    {
+        char why[192];
+        snprintf(why, sizeof why, "%s of layer %d at position %d did not run on the GPU", what ? what : "a step", failed_layer, pos_base);
+        q38m_off(why);
+    }
+    if (was_dev || c0 > 0) {
+        fprintf(stderr, "[qwen38-metal] the recurrent state is on the GPU only: stopping\n");
+        exit(1);
+    }
+    m->ple_history[0] = hist0[0]; m->ple_history[1] = hist0[1]; m->ple_history_len = hlen0;
+    g_q38f.where = Q38M_HOST; g_q38f.host_zero = 0;
+    for (int i = 0; i < L; i++)
+        if (c->is_attn[i]) { if (g_q38f.L[i].kv_valid > pos_base) g_q38f.L[i].kv_valid = pos_base; }
+    g_mtl_chain = 0;
     g_q38m_declined++;
     return 0;
 }
-
-/* device -> host: DN_rec, DN_conv, the PLE ring, K/V/IK up to kv_len. Nothing lives on
- * the device yet. */
-static void q38m_sync_host(Model *m) { (void)m; }
-
-/* The host state is authoritative (a restored prefix, a reset): the next forward
- * uploads it again; zero, when it is all zeros. */
-static Q38M_UNUSED void q38m_host_wrote(Model *m, int zero) { (void)m; (void)zero; }
-
-/* slot == -1 only (MTP off, one conversation): lower the KV watermarks to len. */
-static Q38M_UNUSED void q38m_rollback(Model *m, int slot, int len) { (void)m; (void)slot; (void)len; }
 
 static void q38m_report(void) {
     if (!g_mtl_chain) return;

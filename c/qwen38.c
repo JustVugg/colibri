@@ -3771,7 +3771,7 @@ int main(int argc, char **argv) {
      * Q38_MTP leaves it off beside the chain; Q38_MTP=1 keeps it and the chain off. */
     /* Before q38_trunk_cpu_int8: q38m_start uploads the BF16/F32 matrices that frees (and maps
      * a GGUF's blocks in place, which the CPU keeps). */
-    if (q38m_decide(&m) && q38m_start(&m)) g_mtl_chain = 1;
+    if (q38m_decide(&m, g_q38_mux_slots) && q38m_start(&m)) g_mtl_chain = 1;
     if (g_mtl_chain && m.mtp && !(getenv("Q38_MTP") && *getenv("Q38_MTP"))) {
         m.mtp = 0;
         fprintf(stderr, "[qwen38-metal] speculative decoding with the MTP head: off (the Metal chain runs every layer; "
