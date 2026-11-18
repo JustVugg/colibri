@@ -2236,6 +2236,82 @@ static int test_expert_store_union_recency(void) {
          "reads, base store no-op)");
     return 0;
 }
+/* V4_RAM_PROMPT_COLD: while a prompt is read (prompt_sweep on), an uncounted
+ * miss goes to the oldest end of the LRU, so the next one reuses its slot and
+ * the rest of the cache stays; a counted miss, and every miss once the sweep is
+ * off, is inserted as the most recent as before. Another backend and NULL are
+ * no-ops. */
+static int test_expert_store_prompt_cold(void) {
+    char directory[] = "colibri-v4-cold-XXXXXX";
+    char path[256], error[256];
+    setenv("COLI_V4_AUTOPIN", "0", 1);
+    setenv("COLI_V4_SAVE_USAGE", "0", 1);
+    setenv("COLI_V4_ROWS16", "0", 1);
+    setenv("V4_RAM_PROMPT_COLD", "1", 1);
+    if (!mkdtemp(directory)) { perror("mkdtemp cold"); return 1; }
+    snprintf(path, sizeof(path), "%s/model.safetensors", directory);
+    if (write_fixture_experts(path, RECENCY_EXPERTS)) {
+        perror("write cold fixture");
+        rmdir(directory);
+        return 1;
+    }
+    int failed = 0;
+    /* Six slots holding 0..5, 0 the oldest; no pins at this size. */
+    ColiExpertStore *store = recency_store(directory, 6);
+    if (!store) {
+        failed = 1;
+    } else {
+        coli_v4_expert_store_prompt_sweep(store, 1);
+        /* 6 evicts 0 and goes cold; 7 then evicts 6, not 1 */
+        int missed = recency_miss(store, 6) | recency_miss(store, 7);
+        int swept = !recency_resident(store, 0) && !recency_resident(store, 6) &&
+                    recency_resident(store, 1) && recency_resident(store, 5) &&
+                    recency_resident(store, 7);
+        /* a counted miss during the sweep is the most recent: 8 evicts the
+         * cold 7 and stays over 1 */
+        ColiExpertView view;
+        int counted = coli_expert_lookup(store, (ColiExpertKey){0, 8}, &view);
+        if (!counted) coli_expert_release(store, &view);
+        /* sweep off: plain LRU again, 9 evicts 1, 10 evicts 2 */
+        coli_v4_expert_store_prompt_sweep(store, 0);
+        missed |= recency_miss(store, 9) | recency_miss(store, 10);
+        int after = !recency_resident(store, 7) && !recency_resident(store, 1) &&
+                    !recency_resident(store, 2) && recency_resident(store, 3) &&
+                    recency_resident(store, 8) && recency_resident(store, 9) &&
+                    recency_resident(store, 10);
+        if (missed || counted || !swept || !after) {
+            fprintf(stderr, "prompt cold: missed=%d counted=%d swept=%d after=%d "
+                            "resident 0:%d 1:%d 2:%d 3:%d 6:%d 7:%d 8:%d 9:%d 10:%d\n",
+                    missed, counted, swept, after, recency_resident(store, 0),
+                    recency_resident(store, 1), recency_resident(store, 2),
+                    recency_resident(store, 3), recency_resident(store, 6),
+                    recency_resident(store, 7), recency_resident(store, 8),
+                    recency_resident(store, 9), recency_resident(store, 10));
+            failed = 1;
+        }
+        store->ops->destroy(store);
+    }
+    ColiDeepSeekV4ExpertStoreOptions options = {
+        directory, 1, RECENCY_EXPERTS, 6 * 51, -1, 0, 0, 0
+    };
+    ColiExpertStore *base = NULL;
+    if (coli_deepseek_v4_expert_store_open_base(&options, &base,
+                                                error, sizeof(error))) {
+        fprintf(stderr, "cold base store open failed: %s\n", error);
+        failed = 1;
+    } else {
+        coli_v4_expert_store_prompt_sweep(base, 1);
+        coli_v4_expert_store_prompt_sweep(NULL, 1);
+        base->ops->destroy(base);
+    }
+    unsetenv("V4_RAM_PROMPT_COLD");
+    failed |= scratch_remove(directory, path);
+    if (failed) return 1;
+    puts("DeepSeek-V4 ExpertStore prompt cold: ok (a swept miss reuses the "
+         "cold slot, counted misses and misses after the sweep are recent, "
+         "base store no-op)");
+    return 0;
+}
 /* ==== end test_deepseek_v4_expert_store.c ==== */
 
 /* ==== begin test_deepseek_v4_kv_cache.c ==== */
@@ -2849,6 +2925,10 @@ int main(int argc, char **argv) {
     }
     if (test_expert_store_union_recency() != 0) {
         fprintf(stderr, "FAIL: test_expert_store_union_recency\n");
+        return 1;
+    }
+    if (test_expert_store_prompt_cold() != 0) {
+        fprintf(stderr, "FAIL: test_expert_store_prompt_cold\n");
         return 1;
     }
     if (test_kv_cache() != 0) {

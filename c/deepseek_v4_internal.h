@@ -783,6 +783,9 @@ int coli_v4_expert_store_lease_capacity(ColiExpertStore *store, int layer);
 int coli_v4_expert_store_lookup_uncounted(ColiExpertStore *store,
                                           ColiExpertKey key,
                                           ColiExpertView *view);
+/* V4_RAM_PROMPT_COLD (opt-in): while on, the bank's reads during a prompt go
+ * to the oldest end of the RAM cache's recency list (deepseek_v4.c). */
+void coli_v4_expert_store_prompt_sweep(ColiExpertStore *store, int on);
 void coli_v4_expert_store_touch_union(ColiExpertStore *store, int layer,
                                       const int *ids, int count);
 void coli_v4_expert_store_note_union(ColiExpertStore *store, int layer,
