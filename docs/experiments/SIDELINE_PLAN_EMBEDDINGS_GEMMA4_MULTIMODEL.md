@@ -623,10 +623,31 @@ The standalone engine now also runs the mux protocol:
   selects the `nomic` engine. Extensionless Ollama blob paths are accepted
   because Ollama stores canonical blobs under SHA-256 filenames.
 
+#### Working local command
+
+From the repository root, build the engine and start the API on port 8004:
+
+```bash
+make -C c nomic
+python3 c/coli serve \
+  --model "$HOME/.ollama/models/blobs/sha256-970aa74c0a90ef7482477cf803618e776e173c007bf957f635f1015bfcfef0e6" \
+  --port 8004
+```
+
+Then request a vector:
+
+```bash
+curl http://127.0.0.1:8004/v1/embeddings \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"nomic-embed-text-v1.5","input":"The quick brown fox!"}'
+```
+
 End-to-end verification through `coli serve` passed: single and batch requests
 returned 768-dimensional vectors, and the single-input vector matched Ollama
-at cosine `0.99999994`. Clean engine shutdown and repeated mux requests were
-also verified.
+at cosine `0.99999994`. A real local run on port 8004 returned HTTP 200,
+`capabilities=["embeddings"]`, a 768-dimensional vector, and
+`prompt_tokens=7`. Clean engine shutdown and repeated mux requests were also
+verified.
 
 ### 7.5 Remaining for the embedding capability
 

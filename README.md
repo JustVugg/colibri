@@ -910,4 +910,15 @@ these is used or reimplemented in the tree today:
 
 Apache 2.0, Copyright 2026 Vincenzo Fornaro. See [LICENSE](LICENSE) and [NOTICE](NOTICE). Each model keeps the licence its authors gave it (GLM-5.2 weights are released by Z.ai under MIT; Qwen-Image-2.1 is for non-commercial use only).
 
-**nomic-embed-text-v1.5** is available as an embedding service via `coli serve`.
+**nomic-embed-text-v1.5** is available as an embedding service. From the
+repository root:
+
+```bash
+make -C c nomic
+python3 c/coli serve \
+  --model "$HOME/.ollama/models/blobs/sha256-970aa74c0a90ef7482477cf803618e776e173c007bf957f635f1015bfcfef0e6" \
+  --port 8004
+```
+
+Use `POST http://127.0.0.1:8004/v1/embeddings` with an OpenAI-compatible
+`input` string or array of strings.
