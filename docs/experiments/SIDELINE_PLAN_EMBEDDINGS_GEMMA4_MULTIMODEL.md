@@ -596,9 +596,10 @@ F16 file; the accumulation order differs). Token ids for
 - **Loader:** `gguf.h` in-place reads of the Ollama blob; all 112 tensors
   converted to f32 and held in RAM (~550 MB, the laya.c convention).
 - **Tokenizer:** WordPiece from the embedded vocab (30522 entries,
-  insertion-sort + binary search), UTF-8 aware lowercase plus dependency-free
-  Latin accent decomposition/combining-mark removal. Non-Latin Unicode is
-  preserved for lookup in the embedded vocabulary.
+  insertion-sort + binary search), UTF-8 aware Unicode lowercase plus
+  dependency-free full-scalar-range canonical decomposition (NFD) and
+  combining-mark removal. Non-Latin Unicode is preserved for lookup in the
+  embedded vocabulary.
 - **Forward:** post-norm BERT loop using laya.c's primitive shapes: fused
   QKV (no bias), per-sequence full attention, half-split rotary on every
   layer, biased layernorms, SiLU-gated MLP, no final norm.
@@ -652,9 +653,33 @@ verified.
 
 ### 7.5 Remaining for the embedding capability
 
-- Full Unicode normalization beyond the dependency-free Latin decomposition
-  currently implemented.
+- The normalization gap is closed for the current Unicode database used to
+  generate `c/nomic_unicode.h`: canonical decomposition, combining-mark
+  removal, and lowercase mappings cover every Unicode scalar value. The
+  generated table is maintained by `c/tools/gen_nomic_unicode.py`; the runtime
+  has no ICU/libunistring dependency.
+- BasicTokenizer punctuation splitting remains deliberately conservative
+  (ASCII punctuation); expanding Unicode punctuation boundaries is separate
+  tokenizer behavior, not normalization.
 - Permanent API contract tests now cover single input, batch input, and invalid
   empty batches. A model-backed tokenizer/oracle fixture remains optional
   because the Ollama blob is not part of the repository.
-- Then the Section 5.7 router, and Gemma 4 E2B (still parked).
+- With this gap closed, the next planned investigation is the Section 5.7
+  router, followed by Gemma 4 E2B. Neither has started.
+
+### 7.6 Unicode normalization follow-up (2026-11-18)
+
+The earlier Latin-only normalizer was replaced with generated Unicode data:
+
+- `c/tools/gen_nomic_unicode.py` uses Python's Unicode database at maintenance
+  time to emit canonical decomposition, `Mn` combining-mark ranges, and
+  lowercase mappings.
+- `c/nomic_unicode.h` is checked-in generated data; `nomic_check.c` performs
+  binary-search lookups and recursive canonical decomposition at runtime.
+- No ICU or other runtime Unicode library is required.
+- Local model-backed checks produced identical IDs for NFC/NFD pairs:
+  `Café`/`Cafe\u0301`, `Ångström`/`A\u030Angstro\u0308m`, and
+  `İstanbul`/`I\u0307stanbul`.
+
+The remaining tokenizer limitation is Unicode punctuation boundary handling;
+the current split rule still recognizes ASCII punctuation only.

@@ -2000,11 +2000,11 @@ qpack-inspect$(EXE): qpack_inspect.c qpack.c qpack.h affine_quant.h json.h compa
 	$(CC) $(CFLAGS) qpack_inspect.c qpack.c -o qpack-inspect$(EXE) $(LDFLAGS)
 
 .PHONY: nomic-check
-nomic-check: nomic_check.c gguf.h ggml_quants.h ggml_grids.h
+nomic-check: nomic_check.c nomic_unicode.h gguf.h ggml_quants.h ggml_grids.h
 	$(CC) $(CFLAGS) nomic_check.c -o nomic-check$(EXE) $(LDFLAGS)
 
 .PHONY: nomic
-nomic: nomic_check.c gguf.h ggml_quants.h ggml_grids.h
+nomic: nomic_check.c nomic_unicode.h gguf.h ggml_quants.h ggml_grids.h
 	$(CC) $(CFLAGS) nomic_check.c -o nomic $(LDFLAGS)
 
 tests/test_serve_sentinel$(EXE): tests/test_serve_sentinel.c
