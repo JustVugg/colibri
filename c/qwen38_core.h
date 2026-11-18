@@ -336,6 +336,9 @@ typedef struct {
 #ifdef COLI_CUDA
     void *cchain;                  /* the CUDA dense chain's device state (qwen38_cuda_chain.h), NULL until it runs */
 #endif
+#ifdef QWEN38_METAL
+    void *mtlchain;                /* the Metal dense chain's device state (qwen38_metal_chain.h), NULL until it runs */
+#endif
 } Model;
 
 /* Layer rows of storage: the c.layers decoder layers, plus the MTP head's at
@@ -5387,6 +5390,9 @@ static void q38_embed_row(Model *m,int id,int abs_pos,float *out);   /* below; t
 static DfDrafter g_q38_df;
 #include "qwen38_cuda_chain.h"  /* COLI_CUDA_CHAIN: every layer's dense chain on the CUDA device */
 #endif
+#ifdef QWEN38_METAL
+#include "qwen38_metal_chain.h" /* METAL=1: every layer's dense chain on the Apple GPU */
+#endif
 
 static void reset_recurrent(Model *m) {
     kv_prefix_clear(&m->kvp);
@@ -5557,6 +5563,25 @@ static float *q38_forward(Model *m,const int *ids,int S,int pos_base,int nlogits
         } else {
             free(chain_logit); chain_logit=NULL;
             q38cc_cpu_step(m,pos_base);
+            for(int s=0;s<S;s++){
+                float *e=hyper+(int64_t)s*W;
+                q38_embed_row(m,ids[s],pos_base+s,e);
+                for(int b=1;b<C;b++)memcpy(e+(int64_t)b*H,e,(size_t)H*sizeof(float));
+            }
+        }
+    }
+#endif
+#ifdef QWEN38_METAL
+    /* METAL=1: the same on the Apple GPU (qwen38_metal_chain.h), every layer */
+    if(g_mtl_chain&&!chain_logit){
+        int echo=g_echo_k>0&&g_echo_id&&S>1;
+        chain_logit=falloc((int64_t)nlogits*c->vocab);
+        int took=q38m_forward(m,ids,S,pos_base,nlogits,hyper,streams!=NULL,echo?mixed:NULL,chain_logit);
+        if(took){
+            free(m->ple_pref); m->ple_pref=NULL; m->ple_pref_rows=0;   /* consumed, as q38_layer_forward does */
+        } else {
+            free(chain_logit); chain_logit=NULL;
+            q38m_sync_host(m);   /* the CPU runs the step from the host state */
             for(int s=0;s<S;s++){
                 float *e=hyper+(int64_t)s*W;
                 q38_embed_row(m,ids[s],pos_base+s,e);

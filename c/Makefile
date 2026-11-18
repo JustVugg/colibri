@@ -730,6 +730,9 @@ METAL_OBJ  =
 QWEN36_METAL_OBJ =
 QWEN36_GRAPH_CFLAGS =
 QWEN36_GRAPH_LDFLAGS =
+QWEN38_METAL_OBJ =
+QWEN38_GRAPH_CFLAGS =
+QWEN38_GRAPH_LDFLAGS =
 METALXX    = clang++ -x objective-c++ -std=gnu++17 -fobjc-arc -O3
 ifeq ($(METAL),1)
 ifeq (,$(DARWIN))
@@ -741,6 +744,10 @@ METAL_OBJ = backend_metal.o
 QWEN36_METAL_OBJ = qwen36_metal.o
 QWEN36_GRAPH_CFLAGS = -DQWEN36_METAL
 QWEN36_GRAPH_LDFLAGS = -framework Accelerate
+# qwen38's dense chain on the GPU (qwen38_metal_chain.h): its kernels and qwen36's
+QWEN38_METAL_OBJ = qwen38_metal.o qwen36_metal.o
+QWEN38_GRAPH_CFLAGS = -DQWEN38_METAL
+QWEN38_GRAPH_LDFLAGS = -framework Metal -framework Foundation -framework Accelerate
 endif
 
 # VK=1 adds an opt-in Vulkan compute backend (any Vulkan 1.2 driver, e.g. Mesa/RADV)
@@ -1266,7 +1273,7 @@ qwen36_metal.o: qwen36_metal.m qwen36_gpu.h qwen36_metal_internal.h metal/qwen36
 	$(QWEN36_METALC) -c qwen36_metal.m -o $@
 
 # Qwen3.8's own kernels (metal/qwen38.metal, #embed), on qwen36's device and
-# command batch. Not linked into qwen38 yet.
+# command batch. Linked into qwen38 by METAL=1 (QWEN38_METAL_OBJ).
 qwen38_metal.o: qwen38_metal.m qwen38_gpu.h qwen36_gpu.h qwen36_metal_internal.h metal/qwen38.metal
 	$(QWEN36_METALC) -c qwen38_metal.m -o $@
 
@@ -1278,6 +1285,13 @@ tests/test_qwen38_metal_kernels: tests/test_qwen38_metal_kernels.c qwen38_gpu.h 
 .PHONY: test-qwen38-metal-kernels
 test-qwen38-metal-kernels: tests/test_qwen38_metal_kernels
 	./tests/test_qwen38_metal_kernels
+
+# The qwen38 engine's Metal chain on the tiny fixtures (tests/metal_qwen38.sh):
+# its startup decision and the CPU engine it leaves unchanged.
+.PHONY: test-qwen38-metal-engine
+test-qwen38-metal-engine: qwen38$(EXE)
+	$(if $(filter 1,$(METAL)),,$(error test-qwen38-metal-engine needs METAL=1))
+	PYTHON="$(PYTHON)" sh tests/metal_qwen38.sh
 
 # Counter-tests: for n = 1..5 build the test and both Metal objects with
 # -DQ38_COUNTER_TEST=n (1 hc_mix fc, 2 ple ring shift, 3 qsa tie order, 4 router
@@ -1863,8 +1877,10 @@ ifneq ($(EXE),)
 .PHONY: qwen38
 qwen38: qwen38$(EXE)
 endif
-qwen38$(EXE): qwen38.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
-	$(CC) $(QWEN36_CFLAGS) qwen38.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o qwen38$(EXE) $(QWEN36_LDFLAGS)
+# METAL=1 adds the dense chain on the Apple GPU (QWEN38_GRAPH_CFLAGS, qwen38_metal.o and
+# qwen36_metal.o); COLI_METAL=0 runs the CPU engine.
+qwen38$(EXE): qwen38.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) $(QWEN38_METAL_OBJ) .build-config
+	$(CC) $(QWEN36_CFLAGS) $(QWEN38_GRAPH_CFLAGS) qwen38.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) $(QWEN38_METAL_OBJ) -o qwen38$(EXE) $(QWEN36_LDFLAGS) $(QWEN38_GRAPH_LDFLAGS)
 
 .PHONY: qwen38-tiny-generate qwen38-tiny-check
 qwen38-tiny-generate:

@@ -3512,6 +3512,9 @@ static void serve_loop(Model *m){
             q38c_report(m);
             vkt_report("turn", m->hits, m->miss);
 #endif
+#ifdef QWEN38_METAL
+            q38m_report();
+#endif
             if(status<0){q38_prefix_cache_release(m);q38_psd_join();coli_ps_report(&g_q38_ps);return;}
             serve_emap(m);
         }
@@ -3808,6 +3811,18 @@ int main(int argc, char **argv) {
     if(g_vk_chain&&!vkc_init())g_vk_chain=0;
     q38_dho_start(&m);   /* COLI_VK_DENSE_HOST: the trunk on the device only, before the tier sizes its budget */
 #endif
+#ifdef QWEN38_METAL
+    /* METAL=1: every layer's dense chain on the Apple GPU (qwen38_metal_chain.h), on by
+     * default; COLI_METAL=0, and every case it does not run, leave the CPU engine with a
+     * line. The MTP head stays on the CPU and costs more than it saves (Plan 1), so unset,
+     * Q38_MTP leaves it off beside the chain; Q38_MTP=1 keeps it and the chain off. */
+    if (q38m_decide(&m) && q38m_start(&m)) g_mtl_chain = 1;
+    if (g_mtl_chain && m.mtp && !(getenv("Q38_MTP") && *getenv("Q38_MTP"))) {
+        m.mtp = 0;
+        fprintf(stderr, "[qwen38-metal] speculative decoding with the MTP head: off (the Metal chain runs every layer; "
+                        "Q38_MTP=1 drafts on the CPU engine)\n");
+    }
+#endif
     if(is_ref)ref_logits=read_reference_logits(ref_root,m.c.vocab);
     g_capture_last_logit=ref_logits!=NULL||getenv("DUMP")!=NULL;
     if(is_ref){g_q38_mtp_oracle=full;g_q38_mtp_oracle_n=nfull;}   /* Q38_MTP_FORCE=accept|mixed */
@@ -3826,6 +3841,9 @@ int main(int argc, char **argv) {
         int dev=qt_ready();
 #ifdef COLI_VULKAN
         dev=dev||g_vk_ready;
+#endif
+#ifdef QWEN38_METAL
+        dev=dev||g_mtl_chain;
 #endif
         if(!dev)q38_trunk_q8_interleave(&m);
     }
@@ -3863,6 +3881,9 @@ int main(int argc, char **argv) {
         q38_vk_report();
         q38c_report(&m);
         vkt_report("run", m.hits, m.miss);
+#endif
+#ifdef QWEN38_METAL
+        q38m_report();
 #endif
         rt_save(g_q38_usage,0);
         q38_vocab_save(&m);
@@ -3953,6 +3974,9 @@ int main(int argc, char **argv) {
     q38_vk_report();
     q38c_report(&m);
     vkt_report("run", m.hits, m.miss);
+#endif
+#ifdef QWEN38_METAL
+    q38m_report();
 #endif
     rt_save(g_q38_usage, 0);
     q38_vocab_save(&m);
