@@ -815,9 +815,9 @@ which model to call, so the Qwen/Gemma tokenizer vocabularies do not need to
 match. The earlier draft-tokenizer mismatch finding is irrelevant to this
 serving mode and must not block it.
 
-The current router already provides the client-choice surface when each model
-is served independently. The next value-add is a Colibri-managed generic GGUF
-delegate for architectures not yet native to Colibri:
+The current router provides the client-choice surface when each model is
+served independently. A Colibri-managed generic GGUF delegate is now
+implemented for architectures not yet native to Colibri:
 
 - launch a local `llama-server` child for the unsupported GGUF;
 - use `--load-mode mlock` (or an equivalent no-mmap/full-RAM policy) for the
@@ -859,3 +859,24 @@ python3 -m colibri.cli router --config /path/to/qwen-gemma-router.json \
 
 The delegate is started and stopped with the router. Clients select either
 `"qwen3.6-colibri"` or `"gemma-4-e2b"` in the request's `model` field.
+
+### 7.11 Managed delegate implementation status (2026-11-18)
+
+Implemented in commit `2250d250`:
+
+- `c/router.py` accepts a top-level `delegates` array in addition to native
+  `backends`.
+- Each delegate launches `llama-server --model ... --host ... --port ...`
+  with `--load-mode mlock`, keeping the quantized GGUF resident in host RAM.
+- The router supervises the child process, reports it in `/health`, registers
+  its model in `/v1/models`, forwards OpenAI-compatible requests, and stops
+  the child during router shutdown.
+- Delegate models and native Colibri models share the same public endpoint but
+  remain independent inference backends; no tokenizer or speculative-draft
+  compatibility is required.
+- Router lifecycle and resident-load-mode behavior are covered by
+  `c/tests/test_router.py`; all seven router tests pass.
+
+This completes the supporting-model delegation milestone. Native Gemma
+compatibility, direct Colibri Gemma inference, and multimodal `mmproj`
+support remain optional future work.
