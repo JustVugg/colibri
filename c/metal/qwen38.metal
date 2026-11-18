@@ -262,6 +262,21 @@ static inline float q38_rope_angle(float pos, float base, float inv) {
     return fma(r, inv, q0);
 }
 
+/* Dim t of rope(v, pos), v a whole vector in threadgroup memory: t < half pairs with t + half. */
+static inline float q38_rope_tg(threadgroup const float *v, uint t, uint half_, float pos,
+                                constant q38_rope_table &rt) {
+    if (t < half_) {
+        float ang = q38_rope_angle(pos, rt.base[t], rt.inv[t]);
+        return v[t] * cos(ang) - v[t + half_] * sin(ang);
+    }
+    if (t < 2 * half_) {
+        uint i = t - half_;
+        float ang = q38_rope_angle(pos, rt.base[i], rt.inv[i]);
+        return v[t] * cos(ang) + v[i] * sin(ang);
+    }
+    return v[t];
+}
+
 /* pk[b] = rope(rms0(mean_{r<R} ik[b*R+r], kn), b*R), b = b0 + group. One 256-thread group a
  * block, thread d < ID one dim; the mean sums raw/R in r order from 0 as the CPU does. */
 struct q38_pool_args { uint ID, R, b0, half_; float eps; };
@@ -283,17 +298,7 @@ kernel void q38_qsa_pool(device const float *ik [[buffer(0)]],
     if (t < p.ID) pool[t] = v * rr * (1.0f + kn[t]);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (t >= p.ID) return;
-    float x = pool[t];
-    float pos = (float)(b * p.R);
-    if (t < p.half_) {
-        float ang = q38_rope_angle(pos, rt.base[t], rt.inv[t]);
-        x = pool[t] * cos(ang) - pool[t + p.half_] * sin(ang);
-    } else if (t < 2 * p.half_) {
-        uint i = t - p.half_;
-        float ang = q38_rope_angle(pos, rt.base[i], rt.inv[i]);
-        x = pool[t] * cos(ang) + pool[i] * sin(ang);
-    }
-    pk[(ulong)b * p.ID + t] = x;
+    pk[(ulong)b * p.ID + t] = q38_rope_tg(pool, t, p.half_, (float)(b * p.R), rt);
 }
 
 /* sc[s*nbmax + b] = sum_h max(0, q[s][h] . pk[b]) / sqrt(ID) for b < nblk(s): one thread a
@@ -524,4 +529,99 @@ kernel void q38_attn_sel_half(device const float *q [[buffer(0)]],
     threadgroup float qs[256], pe[256], part[256], red;
     threadgroup uint pt[256];
     q38_attn_sel_body<half>(q, gate, kc, vc, sel, out, p, g.x, g.y, t, qs, pe, pt, part, &red);
+}
+
+/* ---- attention glue (q38_attention 3464-3504, 3568-3592) ------------------ */
+/* Element-wise, and idx_prep's one fixed-order rms0 sum: exact and fast are the same kernels. */
+
+/* x [rows][heads][D] in place, one thread a rotated pair (row, head, i < half): q38_rope at
+ * pos_base + row. */
+struct q38_rope_args { uint n, heads, D, half_, pos_base; };
+
+kernel void q38_rope_half(device float *x [[buffer(0)]],
+                          constant q38_rope_args &p [[buffer(1)]],
+                          constant q38_rope_table &rt [[buffer(2)]],
+                          uint id [[thread_position_in_grid]]) {
+    if (id >= p.n) return;
+    uint i = id % p.half_, rh = id / p.half_, r = rh / p.heads;
+    device float *v = x + (ulong)rh * p.D;
+    float ang = q38_rope_angle((float)(p.pos_base + r), rt.base[i], rt.inv[i]);
+    float co = cos(ang), si = sin(ang), a = v[i], b = v[i + p.half_];
+    v[i] = a * co - b * si;
+    v[i + p.half_] = b * co + a * si;
+}
+
+/* qraw [rows*heads][q D | gate D] -> q, gate [rows*heads][D], one thread an element. */
+struct q38_split_args { uint n, D; };
+
+kernel void q38_qgate_split(device const float *qraw [[buffer(0)]],
+                            device float *q [[buffer(1)]],
+                            device float *gate [[buffer(2)]],
+                            constant q38_split_args &p [[buffer(3)]],
+                            uint id [[thread_position_in_grid]]) {
+    if (id >= p.n) return;
+    ulong rh = id / p.D, d = id % p.D, o = rh * 2 * p.D + d;
+    q[id] = qraw[o];
+    gate[id] = qraw[o + p.D];
+}
+
+/* k, v [rows][kv_heads][D] -> caches [kv_heads][cap][D] at pos_base + row, one thread an
+ * element. The half form is kv16_round: clamped to +-65504, then the conversion, which rounds
+ * to nearest even. */
+static inline float q38_kv16_clamp(float x) { return x > 65504.0f ? 65504.0f : x < -65504.0f ? -65504.0f : x; }   /* NaN stays */
+
+struct q38_kva_args { uint n, kv_heads, D, cap, pos_base; };
+
+kernel void q38_kv_append(device float *kc [[buffer(0)]],
+                          device float *vc [[buffer(1)]],
+                          device const float *k [[buffer(2)]],
+                          device const float *v [[buffer(3)]],
+                          constant q38_kva_args &p [[buffer(4)]],
+                          uint id [[thread_position_in_grid]]) {
+    if (id >= p.n) return;
+    uint d = id % p.D, rh = id / p.D, h = rh % p.kv_heads, r = rh / p.kv_heads;
+    ulong c = ((ulong)h * p.cap + p.pos_base + r) * p.D + d;
+    kc[c] = k[id];
+    vc[c] = v[id];
+}
+
+kernel void q38_kv_append_half(device half *kc [[buffer(0)]],
+                               device half *vc [[buffer(1)]],
+                               device const float *k [[buffer(2)]],
+                               device const float *v [[buffer(3)]],
+                               constant q38_kva_args &p [[buffer(4)]],
+                               uint id [[thread_position_in_grid]]) {
+    if (id >= p.n) return;
+    uint d = id % p.D, rh = id / p.D, h = rh % p.kv_heads, r = rh / p.kv_heads;
+    ulong c = ((ulong)h * p.cap + p.pos_base + r) * p.D + d;
+    kc[c] = half(q38_kv16_clamp(k[id]));
+    vc[c] = half(q38_kv16_clamp(v[id]));
+}
+
+/* One 256-thread group a (head h, row r) of ip [rows][(IQ+1)*ID]: h < IQ, q[r][h] =
+ * rope(rms0(ip[r][h], qn), pos_base + r) (q38_qsa_pool's sum and rope); h == IQ copies the raw
+ * key ip[r][IQ] to ikc[pos_base + r]. */
+struct q38_idx_args { uint IQ, ID, half_, pos_base; float eps; };
+
+kernel void q38_idx_prep(device const float *ip [[buffer(0)]],
+                         device const float *qn [[buffer(1)]],
+                         device float *q [[buffer(2)]],
+                         device float *ikc [[buffer(3)]],
+                         constant q38_idx_args &p [[buffer(4)]],
+                         constant q38_rope_table &rt [[buffer(5)]],
+                         uint2 g [[threadgroup_position_in_grid]],
+                         uint t [[thread_index_in_threadgroup]]) {
+    threadgroup float v[256], part[256], sum;
+    uint h = g.x, r = g.y, pos = p.pos_base + r;
+    device const float *src = ip + ((ulong)r * (p.IQ + 1) + h) * p.ID;
+    if (h == p.IQ) {   /* uniform across the group */
+        if (t < p.ID) ikc[(ulong)pos * p.ID + t] = src[t];
+        return;
+    }
+    float x = t < p.ID ? src[t] : 0.0f;
+    float rr = 1.0f / sqrt(q38_tg_sum256(part, &sum, x * x, t) / (float)p.ID + p.eps);
+    if (t < p.ID) v[t] = x * rr * (1.0f + qn[t]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (t >= p.ID) return;
+    q[((ulong)r * p.IQ + h) * p.ID + t] = q38_rope_tg(v, t, p.half_, (float)pos, rt);
 }

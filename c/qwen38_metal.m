@@ -20,7 +20,7 @@ static const char q38_source[] = {
 
 enum { K38_COPY, K38_DOT_BF16_EXACT, K38_DOT_BF16_FAST, K38_HC_LOW, K38_HC_MIX, K38_HC_INJ, K38_HC_APPLY, K38_HC_NORM,
        K38_PLE_GATE, K38_PLE_CONV, K38_QSA_POOL, K38_QSA_SCORE, K38_QSA_SELECT, K38_ATTN_SEL, K38_ATTN_SEL_HALF,
-       K38_COUNT };
+       K38_ROPE_HALF, K38_QGATE_SPLIT, K38_KV_APPEND, K38_KV_APPEND_HALF, K38_IDX_PREP, K38_COUNT };
 
 static const char *const q38_kernel_names[K38_COUNT] = {
     "q38_copy",
@@ -38,6 +38,11 @@ static const char *const q38_kernel_names[K38_COUNT] = {
     "q38_qsa_select",
     "q38_attn_sel",
     "q38_attn_sel_half",
+    "q38_rope_half",
+    "q38_qgate_split",
+    "q38_kv_append",
+    "q38_kv_append_half",
+    "q38_idx_prep",
 };
 
 static id<MTLComputePipelineState> g_q38_pipe[K38_COUNT];
@@ -289,7 +294,18 @@ static int q38_qsa_shape_ok(const q38_qsa_shape *s) {
            s->rotary % 2 == 0 && s->rotary <= s->ID && s->eps > 0.0f && s->theta > 0.0f;
 }
 
-/* The pipeline runs 256-thread groups. */
+/* q38_rope's bases, the CPU's powf in float, and their reciprocals (qwen38.metal's
+ * q38_rope_table); returns rotary / 2. rotary <= 256. */
+typedef struct { float base[128], inv[128]; } q38_rope_table;
+static int q38_rope_fill(q38_rope_table *rt, float theta, int rotary) {
+    int half = rotary / 2;
+    for (int i = 0; i < 128; i++) {
+        rt->base[i] = i < half ? powf(theta, (float)(2 * i) / rotary) : 1.0f;
+        rt->inv[i] = 1.0f / rt->base[i];
+    }
+    return half;
+}
+
 
 int q38_qsa_pool(q36_tensor *pk, q36_tensor *ikraw, q36_tensor *idx_kn, int b0, int nb, const q38_qsa_shape *s) {
     if (!q38_ready() || !q38_qsa_shape_ok(s) || b0 < 0 || nb < 1 || !q38_tg256(K38_QSA_POOL)) return 0;
@@ -297,13 +313,8 @@ int q38_qsa_pool(q36_tensor *pk, q36_tensor *ikraw, q36_tensor *idx_kn, int b0, 
     if (blocks * (uint64_t)s->R > UINT32_MAX || !q36_metal_fits(ikraw, blocks * s->R * s->ID * F4) ||
         !q36_metal_fits(pk, blocks * s->ID * F4) || !q36_metal_fits(idx_kn, (uint64_t)s->ID * F4)) return 0;
     @autoreleasepool {
-        /* q38_rope's bases, the CPU's powf in float, and their reciprocals */
-        struct { float base[128], inv[128]; } rt;
-        int half = s->rotary / 2;
-        for (int i = 0; i < 128; i++) {
-            rt.base[i] = i < half ? powf(s->theta, (float)(2 * i) / s->rotary) : 1.0f;
-            rt.inv[i] = 1.0f / rt.base[i];
-        }
+        q38_rope_table rt;
+        int half = q38_rope_fill(&rt, s->theta, s->rotary);
         struct { uint32_t ID, R, b0, half_; float eps; } p = {(uint32_t)s->ID, (uint32_t)s->R, (uint32_t)b0,
                                                                (uint32_t)half, s->eps};
         id<MTLComputePipelineState> pso = g_q38_pipe[K38_QSA_POOL];
@@ -384,6 +395,96 @@ int q38_attn_sel(q36_tensor *out, q36_tensor *q, q36_tensor *gate, q36_tensor *k
         q36_metal_bind(e, out, 5);
         [e setBytes:&p length:sizeof(p) atIndex:6];
         [e dispatchThreadgroups:MTLSizeMake((NSUInteger)heads, (NSUInteger)S, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
+    return 1;
+}
+
+/* ---- attention glue: RoPE, q/gate split, KV and indexer append ------------ */
+
+int q38_rope_half(q36_tensor *x, int rows, int heads, int D, int rotary, int pos_base, float theta) {
+    if (!q38_ready() || rows < 1 || heads < 1 || D < 1 || rotary < 0 || rotary % 2 || rotary > D || rotary > 256 ||
+        pos_base < 0 || (int64_t)pos_base + rows > INT32_MAX || !(theta > 0.0f)) return 0;
+    uint64_t n = (uint64_t)rows * heads * (rotary / 2);
+    if ((uint64_t)rows * heads * D > UINT32_MAX || !q36_metal_fits(x, (uint64_t)rows * heads * D * F4)) return 0;
+    if (!n) return 1;   /* rotary 0: nothing turns */
+    @autoreleasepool {
+        q38_rope_table rt;
+        int half = q38_rope_fill(&rt, theta, rotary);
+        struct { uint32_t n, heads, D, half_, pos_base; } p = {(uint32_t)n, (uint32_t)heads, (uint32_t)D,
+                                                               (uint32_t)half, (uint32_t)pos_base};
+        id<MTLComputePipelineState> pso = g_q38_pipe[K38_ROPE_HALF];
+        id<MTLComputeCommandEncoder> e = q36_metal_encoder(pso);
+        q36_metal_bind(e, x, 0);
+        [e setBytes:&p length:sizeof(p) atIndex:1];
+        [e setBytes:&rt length:sizeof(rt) atIndex:2];
+        q38_threads(e, pso, n);
+    }
+    return 1;
+}
+
+int q38_qgate_split(q36_tensor *q, q36_tensor *gate, q36_tensor *qraw, int rows, int heads, int D) {
+    if (!q38_ready() || rows < 1 || heads < 1 || D < 1) return 0;
+    uint64_t n = (uint64_t)rows * heads * D;
+    if (2 * n > UINT32_MAX || !q36_metal_fits(qraw, 2 * n * F4) || !q36_metal_fits(q, n * F4) ||
+        !q36_metal_fits(gate, n * F4)) return 0;
+    @autoreleasepool {
+        struct { uint32_t n, D; } p = {(uint32_t)n, (uint32_t)D};
+        id<MTLComputePipelineState> pso = g_q38_pipe[K38_QGATE_SPLIT];
+        id<MTLComputeCommandEncoder> e = q36_metal_encoder(pso);
+        q36_metal_bind(e, qraw, 0);
+        q36_metal_bind(e, q, 1);
+        q36_metal_bind(e, gate, 2);
+        [e setBytes:&p length:sizeof(p) atIndex:3];
+        q38_threads(e, pso, n);
+    }
+    return 1;
+}
+
+int q38_kv_append(q36_tensor *kc, q36_tensor *vc, q36_tensor *k, q36_tensor *v, int rows, int pos_base,
+                  int kv_heads, int D, int cap, int half) {
+    if (!q38_ready() || rows < 1 || pos_base < 0 || kv_heads < 1 || D < 1 || cap < 1 ||
+        (int64_t)pos_base + rows > cap) return 0;
+    uint64_t n = (uint64_t)rows * kv_heads * D, cache = (uint64_t)kv_heads * cap * D * (half ? 2 : F4);
+    if (n > UINT32_MAX || !q36_metal_fits(k, n * F4) || !q36_metal_fits(v, n * F4) ||
+        !q36_metal_fits(kc, cache) || !q36_metal_fits(vc, cache)) return 0;
+    @autoreleasepool {
+        struct { uint32_t n, kv_heads, D, cap, pos_base; } p = {(uint32_t)n, (uint32_t)kv_heads, (uint32_t)D,
+                                                                (uint32_t)cap, (uint32_t)pos_base};
+        id<MTLComputePipelineState> pso = g_q38_pipe[half ? K38_KV_APPEND_HALF : K38_KV_APPEND];
+        id<MTLComputeCommandEncoder> e = q36_metal_encoder(pso);
+        q36_metal_bind(e, kc, 0);
+        q36_metal_bind(e, vc, 1);
+        q36_metal_bind(e, k, 2);
+        q36_metal_bind(e, v, 3);
+        [e setBytes:&p length:sizeof(p) atIndex:4];
+        q38_threads(e, pso, n);
+    }
+    return 1;
+}
+
+int q38_idx_prep(q36_tensor *q, q36_tensor *ikc, q36_tensor *ip, q36_tensor *idx_qn, int rows, int pos_base,
+                 int cap, const q38_qsa_shape *s) {
+    if (!q38_ready() || !q38_qsa_shape_ok(s) || rows < 1 || rows > 65535 || pos_base < 0 || cap < 1 ||
+        (int64_t)pos_base + rows > cap || !q38_tg256(K38_IDX_PREP)) return 0;
+    uint64_t ID = (uint64_t)s->ID;
+    if (!q36_metal_fits(ip, (uint64_t)rows * (s->IQ + 1) * ID * F4) ||
+        !q36_metal_fits(q, (uint64_t)rows * s->IQ * ID * F4) || !q36_metal_fits(ikc, (uint64_t)cap * ID * F4) ||
+        !q36_metal_fits(idx_qn, ID * F4)) return 0;
+    @autoreleasepool {
+        q38_rope_table rt;
+        int half = q38_rope_fill(&rt, s->theta, s->rotary);
+        struct { uint32_t IQ, ID, half_, pos_base; float eps; } p = {(uint32_t)s->IQ, (uint32_t)s->ID, (uint32_t)half,
+                                                                     (uint32_t)pos_base, s->eps};
+        id<MTLComputePipelineState> pso = g_q38_pipe[K38_IDX_PREP];
+        id<MTLComputeCommandEncoder> e = q36_metal_encoder(pso);
+        q36_metal_bind(e, ip, 0);
+        q36_metal_bind(e, idx_qn, 1);
+        q36_metal_bind(e, q, 2);
+        q36_metal_bind(e, ikc, 3);
+        [e setBytes:&p length:sizeof(p) atIndex:4];
+        [e setBytes:&rt length:sizeof(rt) atIndex:5];
+        [e dispatchThreadgroups:MTLSizeMake((NSUInteger)s->IQ + 1, (NSUInteger)rows, 1)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     }
     return 1;

@@ -1047,6 +1047,175 @@ static void test_qsa_declines(void) {
     q36_tensor_free(big); q36_tensor_free(y); q36_tensor_free(small);
 }
 
+/* ---- attention glue: RoPE, q/gate split, KV and indexer append ----------- */
+/* qwen38_core.h's q38_attention 3464-3504 (projections, K/V/IK writes, indexer queries) and
+ * 3568-3592 (q = rope(rms0(qraw[0..D)), gate = qraw[D..2D)), q38_rope, kv16_round. */
+
+/* x rows x heads x D roped in place at pos_base + r; ref_rope per (row, head). */
+static void test_rope_half(int rows, int heads, int D, int rotary, int pos_base, int exact) {
+    q36_gpu_set_exact(exact);
+    size_t n = (size_t)rows * heads * D;
+    q36_tensor *x = rand_tensor(n, 2.0f);
+    double *ref = malloc(n * sizeof(double)), *mag = malloc(n * sizeof(double));
+    for (size_t i = 0; i < n; i++) ref[i] = F(x)[i];
+    for (int r = 0; r < rows; r++)
+        for (int h = 0; h < heads; h++) {
+            size_t o = ((size_t)r * heads + h) * D;
+            ref_rope(ref + o, mag + o, D, rotary, pos_base + r, QSA_THETA);
+        }
+    int ok = q38_rope_half(x, rows, heads, D, rotary, pos_base, QSA_THETA);
+    sync_or_die();
+    char name[96];
+    snprintf(name, sizeof name, "rope_half %dx%dx%d rot%d pos%d %s", rows, heads, D, rotary, pos_base,
+             exact ? "exact" : "fast");
+    if (!ok) expect(name, 0);
+    else check(name, F(x), ref, mag, n, exact ? 1e-5 : 3e-4);
+    free(ref); free(mag);
+    q36_tensor_free(x);
+}
+
+/* qraw [rows][heads][q D | gate D] -> q, gate [rows][heads][D], bit for bit. */
+static void test_qgate_split(int rows, int heads, int D, int exact) {
+    q36_gpu_set_exact(exact);
+    size_t n = (size_t)rows * heads * D;
+    q36_tensor *raw = rand_tensor(2 * n, 3.0f), *q = q36_tensor_new(n * 4), *g = q36_tensor_new(n * 4);
+    int ok = q38_qgate_split(q, g, raw, rows, heads, D);
+    sync_or_die();
+    int same = ok;
+    for (int r = 0; r < rows; r++)
+        for (int h = 0; h < heads; h++) {
+            const float *qr = F(raw) + ((size_t)r * heads + h) * 2 * D;   /* qp + (s*QH + h)*2D */
+            size_t o = ((size_t)r * heads + h) * D;
+            same = same && !memcmp(F(q) + o, qr, (size_t)D * 4) && !memcmp(F(g) + o, qr + D, (size_t)D * 4);
+        }
+    char name[96];
+    snprintf(name, sizeof name, "qgate_split %dx%dx%d %s", rows, heads, D, exact ? "exact" : "fast");
+    expect(name, same);
+    q36_tensor_free(raw); q36_tensor_free(q); q36_tensor_free(g);
+}
+
+/* The CPU's kv16_round: clamp to +-65504, round to nearest even. */
+static uint16_t kv16_ref(float f) { return f16_bits(f > 65504.0f ? 65504.0f : f < -65504.0f ? -65504.0f : f); }
+
+/* k, v rows x kv x D into [kv][cap][D] at pos_base + r; every other cache entry untouched. half:
+ * the values include past-range, subnormal and tie cases. */
+static void test_kv_append(int rows, int pos_base, int kv, int D, int cap, int half, int exact) {
+    q36_gpu_set_exact(exact);
+    size_t n = (size_t)rows * kv * D, cn = (size_t)kv * cap * D, es = half ? 2 : 4;
+    q36_tensor *k = rand_tensor(n, 4.0f), *v = rand_tensor(n, 4.0f);
+    for (size_t i = 0; i < n; i += 7) {   /* edges for the f16 rounding */
+        static const float edge[6] = {70000.0f, -65520.0f, 65519.0f, 3e-6f, -1e-8f, 1.0f + 1.0f / 2048.0f};
+        F(k)[i] = edge[(i / 7) % 6];
+        F(v)[i] = -edge[(i / 7 + 3) % 6];
+    }
+    q36_tensor *kc = q36_tensor_new(cn * es), *vc = q36_tensor_new(cn * es);
+    memset(q36_tensor_data(kc), 0xa5, cn * es);
+    memset(q36_tensor_data(vc), 0x5a, cn * es);
+    int ok = q38_kv_append(kc, vc, k, v, rows, pos_base, kv, D, cap, half);
+    sync_or_die();
+    int same = ok;
+    for (int h = 0; h < kv; h++)
+        for (int p = 0; p < cap; p++)
+            for (int d = 0; d < D; d++) {
+                size_t c = ((size_t)h * cap + p) * D + d;   /* Kl + (h*kv_cap + pos)*D */
+                int r = p - pos_base, in = r >= 0 && r < rows;
+                size_t s = ((size_t)r * kv + h) * D + d;
+                for (int w = 0; w < 2; w++) {
+                    const uint8_t *cb = (const uint8_t *)q36_tensor_data(w ? vc : kc) + c * es;
+                    if (!in) {
+                        for (size_t b = 0; b < es; b++) same = same && cb[b] == (w ? 0x5a : 0xa5);
+                        continue;
+                    }
+                    float x = F(w ? v : k)[s];
+                    if (half) {
+                        uint16_t want = kv16_ref(x), got;
+                        memcpy(&got, cb, 2);
+                        same = same && got == want;
+                    } else {
+                        same = same && !memcmp(cb, &x, 4);
+                    }
+                }
+            }
+    char name[96];
+    snprintf(name, sizeof name, "kv_append %d rows at %d kv%d D%d cap%d %s %s", rows, pos_base, kv, D, cap,
+             half ? "f16" : "f32", exact ? "exact" : "fast");
+    expect(name, same);
+    q36_tensor_free(k); q36_tensor_free(v); q36_tensor_free(kc); q36_tensor_free(vc);
+}
+
+/* ip rows x (IQ+1)*ID: q[r][h] = rope(rms0(ip[r][h], qn), pos), ikc[pos] = ip[r][IQ] raw. */
+static void test_idx_prep(int rows, int pos_base, int IQ, int ID, int rotary, int cap, int exact) {
+    q36_gpu_set_exact(exact);
+    q38_qsa_shape sh = qsa_shape(IQ, ID, 4, 2048, rotary);
+    size_t row = (size_t)(IQ + 1) * ID, qn = (size_t)rows * IQ * ID;
+    q36_tensor *ip = rand_tensor((size_t)rows * row, 3.0f), *w = rand_tensor((size_t)ID, 0.5f);
+    q36_tensor *q = q36_tensor_new(qn * 4), *ikc = q36_tensor_new((size_t)cap * ID * 4);
+    for (size_t i = 0; i < (size_t)cap * ID; i++) F(ikc)[i] = NAN;
+    double *ref = malloc(qn * sizeof(double)), *mag = malloc(qn * sizeof(double)), *x = malloc(ID * sizeof(double));
+    for (int r = 0; r < rows; r++)
+        for (int h = 0; h < IQ; h++) {
+            size_t o = ((size_t)r * IQ + h) * ID;
+            for (int d = 0; d < ID; d++) x[d] = F(ip)[(size_t)r * row + (size_t)h * ID + d];
+            ref_rms0(ref + o, x, F(w), ID, QSA_EPS);
+            ref_rope(ref + o, mag + o, ID, rotary, pos_base + r, QSA_THETA);
+        }
+    int ok = q38_idx_prep(q, ikc, ip, w, rows, pos_base, cap, &sh);
+    sync_or_die();
+    char name[112];
+    snprintf(name, sizeof name, "idx_prep q %d rows at %d IQ%d ID%d rot%d %s", rows, pos_base, IQ, ID, rotary,
+             exact ? "exact" : "fast");
+    if (!ok) expect(name, 0);
+    else check(name, F(q), ref, mag, qn, exact ? 1e-5 : 3e-4);
+    int same = ok;   /* IKl + pos*ID = ip + s*(IQ+1)*ID + IQ*ID, bit for bit; the rest untouched */
+    for (int p = 0; p < cap; p++) {
+        int r = p - pos_base;
+        for (int d = 0; d < ID; d++) {
+            float got = F(ikc)[(size_t)p * ID + d];
+            if (r >= 0 && r < rows) same = same && !memcmp(&got, F(ip) + (size_t)r * row + (size_t)IQ * ID + d, 4);
+            else same = same && isnan(got);
+        }
+    }
+    snprintf(name, sizeof name, "idx_prep ik %d rows at %d IQ%d ID%d %s", rows, pos_base, IQ, ID,
+             exact ? "exact" : "fast");
+    expect(name, same);
+    free(ref); free(mag); free(x);
+    q36_tensor_free(ip); q36_tensor_free(w); q36_tensor_free(q); q36_tensor_free(ikc);
+}
+
+/* Bad shapes and sizes enqueue nothing. */
+static void test_glue_declines(void) {
+    q38_qsa_shape ok = qsa_shape(2, 4, 4, 2048, 4), bad;
+    q36_tensor *big = q36_tensor_new(1 << 16), *y = q36_tensor_new(256), *small = q36_tensor_new(8);
+    memset(q36_tensor_data(big), 0, 1 << 16);
+    int took = 0;
+    took += q38_rope_half(y, 1, 2, 8, 3, 0, QSA_THETA);              /* odd rotary */
+    took += q38_rope_half(y, 1, 2, 8, 10, 0, QSA_THETA);             /* rotary > D */
+    took += q38_rope_half(big, 1, 1, 512, 258, 0, QSA_THETA);        /* rotary > 256 */
+    took += q38_rope_half(small, 1, 2, 8, 4, 0, QSA_THETA);          /* x too small */
+    took += q38_rope_half(y, 1, 2, 8, 4, -1, QSA_THETA);
+    took += q38_rope_half(y, 0, 2, 8, 4, 0, QSA_THETA);
+    took += q38_qgate_split(y, y, small, 1, 2, 8);                     /* qraw too small */
+    took += q38_qgate_split(small, y, big, 1, 2, 8);                   /* q too small */
+    took += q38_qgate_split(y, small, big, 1, 2, 8);                   /* gate too small */
+    took += q38_kv_append(y, y, big, big, 2, 7, 1, 8, 8, 0);           /* pos_base + rows > cap */
+    took += q38_kv_append(y, y, big, big, 1, -1, 1, 8, 8, 0);
+    took += q38_kv_append(small, y, big, big, 1, 0, 1, 8, 8, 1);       /* kc too small for halves */
+    took += q38_kv_append(big, y, big, big, 1, 0, 1, 8, 16, 0);        /* vc too small for floats */
+    took += q38_kv_append(big, big, small, big, 1, 0, 1, 8, 16, 0);    /* k too small */
+    took += q38_idx_prep(y, big, big, big, 1, 0, 4, NULL);
+    bad = ok; bad.ID = 300; took += q38_idx_prep(y, big, big, big, 1, 0, 4, &bad);   /* ID > 256 */
+    bad = ok; bad.rotary = 6; took += q38_idx_prep(y, big, big, big, 1, 0, 4, &bad); /* rotary > ID */
+    took += q38_idx_prep(y, big, big, big, 2, 3, 4, &ok);                             /* pos_base + rows > cap */
+    took += q38_idx_prep(y, small, big, big, 1, 0, 4, &ok);                           /* ikc too small */
+    took += q38_idx_prep(small, big, big, big, 1, 0, 4, &ok);                         /* q too small */
+    took += q38_idx_prep(y, big, small, big, 1, 0, 4, &ok);                           /* ip too small */
+    sync_or_die();
+    int clean = 1;
+    for (int i = 0; i < 64; i++) clean = clean && F(y)[i] == 0.0f;
+    expect("glue declines bad shapes and sizes", took == 0 && clean);
+    q36_tensor_free(big); q36_tensor_free(y); q36_tensor_free(small);
+}
+
 /* ---- exact mode is deterministic: every op twice, same bits ------------------ */
 
 static void fill_ff(q36_tensor *t, size_t bytes) { memset(q36_tensor_data(t), 0xff, bytes); }
@@ -1385,6 +1554,34 @@ int main(void) {
         }
     }
     test_qsa_declines();
+
+    for (int exact = 1; exact >= 0; exact--) {
+        /* tiny: D 8, rotary 4, heads 2, kv 1; IQ 2, ID 4 */
+        test_rope_half(3, 2, 8, 4, 0, exact);
+        test_rope_half(3, 1, 8, 4, 5, exact);
+        test_qgate_split(3, 2, 8, exact);
+        for (int kh = 0; kh < 2; kh++) {
+            test_kv_append(3, 0, 1, 8, 16, kh, exact);
+            test_kv_append(3, 13, 1, 8, 16, kh, exact);       /* the last rows of the cache */
+        }
+        test_idx_prep(3, 5, 2, 4, 4, 16, exact);
+        test_idx_prep(3, 5, 2, 4, 2, 16, exact);
+        /* real: D 256, rotary 64, theta 1e7, heads 24, kv 2; IQ 4, ID 128; positions to 9000 */
+        test_rope_half(1, 24, 256, 64, 8999, exact);
+        test_rope_half(4, 24, 256, 64, 8996, exact);
+        test_rope_half(64, 2, 256, 64, 0, exact);
+        test_rope_half(2, 24, 256, 64, 99999, exact);          /* sampled: position 100,000 */
+        test_qgate_split(1, 24, 256, exact);
+        test_qgate_split(5, 24, 256, exact);
+        for (int kh = 0; kh < 2; kh++) {
+            test_kv_append(1, 8999, 2, 256, 9008, kh, exact);
+            test_kv_append(4, 9004, 2, 256, 9008, kh, exact);  /* ends at cap */
+            test_kv_append(7, 0, 2, 256, 9008, kh, exact);
+        }
+        test_idx_prep(1, 8999, 4, 128, 64, 9008, exact);
+        test_idx_prep(4, 9004, 4, 128, 64, 9008, exact);
+    }
+    test_glue_declines();
 
     test_exact_twice();
     if (getenv("QWEN38_BENCH") && *getenv("QWEN38_BENCH") == '1') bench_all();

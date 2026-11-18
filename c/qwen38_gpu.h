@@ -95,6 +95,29 @@ int q38_attn_sel(q36_tensor *out, q36_tensor *q, q36_tensor *gate, q36_tensor *k
                  q36_tensor *sel, int S, int pos_base, int heads, int kv_heads, int D, int cap, int sel_row,
                  int kv_half);
 
+/* Attention glue (qwen38_core.h's q38_attention, 3460-3504 and 3568-3592). Element-wise, no
+ * reductions but idx_prep's rms0 (fixed order): exact and fast are the same kernels. */
+/* x is rows x heads x D, in place: q38_rope at position pos_base + r (row r), the NeoX half
+ * layout: dims i < rotary/2 pair with i + rotary/2, angle pos / base_i with base_i =
+ * powf(theta, 2i/rotary) on the host and the division rounded as the CPU's (q38_rope_angle);
+ * dims >= rotary unchanged. rotary even, <= D, <= 256. */
+int q38_rope_half(q36_tensor *x, int rows, int heads, int D, int rotary, int pos_base, float theta);
+/* The q_proj output qraw is rows x heads x 2D, each head [q (D) | gate (D)] (the CPU reads q at
+ * qp + (s*heads + h)*2D and the gate D after it): q and gate get rows x heads x D. */
+int q38_qgate_split(q36_tensor *q, q36_tensor *gate, q36_tensor *qraw, int rows, int heads, int D);
+/* k, v rows x kv_heads x D (k already rms0'd and roped) into the caches [kv_heads][cap][D] at
+ * position pos_base + r. half = 0: floats; half = 1: halves (kc, vc 2 bytes an entry), the CPU's
+ * kv16_round (clamped to +-65504, then rounded to nearest even), as q38_attn_sel's kv_half reads.
+ * pos_base + rows <= cap. */
+int q38_kv_append(q36_tensor *kc, q36_tensor *vc, q36_tensor *k, q36_tensor *v, int rows, int pos_base,
+                  int kv_heads, int D, int cap, int half);
+/* The indexer's per-row prep from its projection ip, rows x (IQ+1)*ID ([IQ query heads | one key]):
+ * q[r][h] = rope(rms0(ip[r][h], idx_qn), pos) for h < IQ (rope over s->rotary dims, s->theta),
+ * and ikc[pos] = ip[r][IQ], the raw key (no norm, no rope), pos = pos_base + r < cap. q is rows x
+ * IQ x ID, ikc cap x ID. One 256-thread group a (row, head); ID <= 256. */
+int q38_idx_prep(q36_tensor *q, q36_tensor *ikc, q36_tensor *ip, q36_tensor *idx_qn, int rows, int pos_base,
+                 int cap, const q38_qsa_shape *s);
+
 #ifdef __cplusplus
 }
 #endif
