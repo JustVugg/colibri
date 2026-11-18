@@ -6761,6 +6761,7 @@ def _write_all(stream, data, frame):
 # gets back into the /v1/systemone reply, the same reply an LLM gives there.
 
 MAX_DECISION_BYTES = 16 << 20
+MAX_EMBED_BYTES = 1 << 20
 
 
 def decision_text(value):
@@ -6907,6 +6908,11 @@ def engine_decides(engine):
 def engine_chats(engine):
     """False only for an engine that said chat=0: it has no generating endpoint."""
     return getattr(engine, "chats", True) is not False
+
+
+def engine_embeds(engine):
+    """The engine announced embed=1: it answers POST /v1/embeddings."""
+    return getattr(engine, "embeds", False) is True
 
 
 class _Pending:
@@ -7067,6 +7073,10 @@ class Engine:
         # means it has nothing else: the generating endpoints answer 400.
         self.decides = self.caps.get("decide") == "1"
         self.chats = self.caps.get("chat") != "0"
+        # An embedding engine said embed=1: /v1/embeddings goes to it as an EMBED
+        # round trip (texts in, {"embedding":[...],"input_tokens":N} back). chat=0
+        # means it has nothing else: the generating endpoints answer 400.
+        self.embeds = self.caps.get("embed") == "1"
         # decide_record=raw: the engine renders the request the way its own reference
         # does (Clef), so the record carries the caller's values, not the gateway's
         # defaults (systemone_decision_record). None: the default form.
@@ -7328,6 +7338,26 @@ class Engine:
                         entry = self.pending.get(request_id)
                     if entry is not None and entry.failed is None:
                         entry.events.put(("decision", data))
+                elif kind == "EMBED" and len(fields) == 3:
+                    # An embedding engine's answer to EMBED: one JSON payload, then the
+                    # turn ends (no DONE: an embedding is one forward pass, and the
+                    # engine's answer is the EMBED reply itself).
+                    request_id = fields[1]
+                    size = int(fields[2])
+                    if not 0 <= size <= MAX_EMBED_BYTES:
+                        raise RuntimeError("invalid engine EMBED size")
+                    data = self._read_exact(size)
+                    if self._read_exact(1) != b"\n":
+                        raise RuntimeError("invalid engine EMBED terminator")
+                    with self.pending_lock:
+                        entry = self.pending.get(request_id)
+                    if entry is not None and entry.failed is None:
+                        entry.events.put(("embed", data))
+                        # One embedding round trip is complete: the terminal frame
+                        # arrived, so the admission (there is no KV residency for an
+                        # embedding, but the pending slot is still the turn's) is done.
+                        with self.pending_lock:
+                            self.pending.pop(request_id, None)
                 elif kind == "ACCEPT" and len(fields) >= 3:
                     # #597: the engine validated the submission (fits context) before prefill.
                     # Keep it pending — DATA/DONE still follow — and let generate() commit the
@@ -7512,6 +7542,63 @@ class Engine:
                 continue
             else:
                 raise value
+
+    def embed(self, texts, cache_slot=0, cancelled=None):
+        """One embedding round trip: the texts out, the engine's EMBED back.
+
+        Returns the engine's parsed answer {"embedding": [...], "input_tokens": N}
+        -- one vector per text, in order. An engine that cannot embed refuses
+        before sending anything; a refusal names the endpoint for a client that
+        does not know what it is talking to.
+        """
+        if not self.embeds:
+            raise APIError(400, "This engine does not embed.", "model", "unsupported_endpoint")
+        if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.kv_slots:
+            raise APIError(400, "Invalid cache slot.", "cache_slot")
+        payload = json.dumps(list(texts)).encode("utf-8")   # a bare JSON array of strings: the engine's EMBED payload is the input list
+        pending = _Pending(False)
+        with self.pending_lock:
+            if self.closed:
+                raise RuntimeError("colibri engine is shutting down")
+            if self.dispatcher_error is not None:
+                raise RuntimeError(f"colibri engine dispatcher stopped: {self.dispatcher_error}") \
+                    from self.dispatcher_error
+            if self.process.poll() is not None:
+                raise RuntimeError("colibri engine is not running")
+            request_id = str(self.next_request_id)
+            self.next_request_id += 1
+            self.pending[request_id] = pending
+        try:
+            self._write_frame(request_id, f"EMBED {request_id} {cache_slot} {len(payload)}\n".encode()
+                              + payload + b"\n", "EMBED")
+        except Exception:
+            with self.pending_lock:
+                self.pending.pop(request_id, None)
+            raise
+        data = None
+        events = pending.events
+        while True:
+            try:
+                kind, value = events.get(timeout=0.05)
+            except queue.Empty:
+                if pending.failed is not None:
+                    # A fault was recorded for this request: nothing it computes from
+                    # here can reach the client. The embedding engine holds no KV
+                    # residency, so there is no turn to keep running -- stop the
+                    # engine and surface the fault.
+                    self._write_frame(request_id, f"STOP {request_id}\n".encode(), "STOP")
+                continue
+            if kind == "embed":
+                data = value
+                break
+            if kind == "error":
+                raise value
+            raise RuntimeError(f"the engine sent an unexpected embedding event: {kind}")
+        try:
+            parsed = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as error:
+            raise RuntimeError(f"the engine sent an unreadable EMBED answer ({error})") from error
+        return parsed
 
     def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0,
                  cancelled=None, grammar=None, stopped=None, on_accept=None, audio=None,
@@ -7979,7 +8066,10 @@ class APIServer(ThreadingHTTPServer):
     def capabilities(self):
         """What the served model does, for /v1/models and /health: an image model
         draws (image_generation); every text engine answers POST /v1/systemone
-        (systemone), and a decision engine does only that (decision)."""
+        (systemone), and a decision engine does only that (decision); an embedding
+        engine answers POST /v1/embeddings (embeddings)."""
+        if engine_embeds(self.engine):
+            return ["embeddings"]
         if is_image_engine(self.engine):
             return ["image_generation"]
         if engine_decides(self.engine) and not engine_chats(self.engine):
@@ -7993,8 +8083,11 @@ class APIServer(ThreadingHTTPServer):
             name = getattr(self, "display_name", None) or family_by_id(ARCH).display_name
         except Exception:
             name = self.model_id
+        purpose = ("POST /v1/embeddings returns text vectors."
+                   if engine_embeds(self.engine)
+                   else "POST /v1/systemone answers typed questions.")
         return {"name": self.model_id,
-                "description": f"{name}, served by colibri; POST /v1/systemone answers typed questions.",
+                "description": f"{name}, served by colibri; {purpose}",
                 "release_date": time.strftime("%Y-%m-%d", time.gmtime(self.created))}
 
     def input_modalities(self):
@@ -8612,11 +8705,17 @@ class APIHandler(BaseHTTPRequestHandler):
                                     "does not chat: POST /v1/images/generations instead.",
                                "model", "unsupported_endpoint")
             if not engine_chats(self.server.engine) and path in GENERATING_ENDPOINTS:
+                if engine_embeds(self.server.engine):
+                    raise APIError(400, f"`{self.server.model_id}` is an embedding model and does not generate "
+                                        "text: POST /v1/embeddings instead.",
+                                   "model", "unsupported_endpoint")
                 raise APIError(400, f"`{self.server.model_id}` is a decision model: it answers typed "
                                     "questions with calibrated probabilities and does not generate "
                                     "text. POST /v1/systemone instead.",
                                "model", "unsupported_endpoint")
-            if path == "/v1/images/generations":
+            if path == "/v1/embeddings":
+                self.embeddings(body, request_id)
+            elif path == "/v1/images/generations":
                 self.image_generation(body, request_id)
             elif path == "/v1/chat/completions":
                 self.chat_completion(body, request_id)
@@ -9094,6 +9193,39 @@ class APIHandler(BaseHTTPRequestHandler):
         engine_ms = decision.get("engine_ms")
         if isinstance(engine_ms, (int, float)) and math.isfinite(engine_ms):
             headers["x-colibri-engine-ms"] = str(round(engine_ms, 1))
+        self.send_json(200, reply, request_id, headers)
+
+    # POST /v1/embeddings, the OpenAI shape for the embedding engine: one
+    # request, a list of vectors back. The engine answered the EMBED round trip
+    # (one forward pass per text; the answer is one closed EMBED reply). The
+    # input is a single string or a non-empty array of strings; the reply is
+    # OpenAI's {"object":"list","data":[{"object":"embedding","index":i,
+    # "embedding":[...]}, ...]} shape with a usage block. There is no streaming
+    # here: an embedding is one pass, and the engine's answer is a closed reply.
+    def embeddings(self, body, request_id):
+        engine = self.server.engine
+        if not engine_embeds(engine):
+            raise APIError(400, f"`{self.server.model_id}` does not embed: it generates text "
+                                "(POST /v1/chat/completions) or decides (POST /v1/systemone).",
+                           "model", "unsupported_endpoint")
+        raw = body.get("input") if isinstance(body, dict) else None
+        if isinstance(raw, str):
+            texts = [raw]
+        elif isinstance(raw, list) and raw and all(isinstance(t, str) for t in raw):
+            texts = list(raw)
+        else:
+            raise APIError(400, "`input` must be a string or a non-empty array of strings.",
+                           "input", "invalid_value")
+        result = engine.embed(texts, cache_slot=0, cancelled=None)
+        vectors = result.get("embedding") if isinstance(result, dict) else None
+        if (not isinstance(vectors, list) or len(vectors) != len(texts)
+                or not all(isinstance(v, list) and len(v) > 0 and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in v)
+                            for v in vectors)):
+            raise APIError(500, "The colibri engine returned a malformed embedding.", None, "engine_error")
+        data = [{"object": "embedding", "index": i, "embedding": vectors[i]} for i, v in enumerate(vectors)]
+        reply = {"object": "list", "data": data, "model": self.server.model_id,
+                 "usage": {"prompt_tokens": int(result.get("input_tokens") or 0), "total_tokens": int(result.get("input_tokens") or 0)}}
+        headers = {"x-colibri-queue-wait-ms": "0", "x-colibri-elapsed-ms": "0"}
         self.send_json(200, reply, request_id, headers)
 
     # ------------------------------------------------------------- images
@@ -10540,7 +10672,12 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
     stopping = threading.Event()
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     try:
-        family = pending_family or resolve_model(model).descriptor
+        if pending_family is not None:
+            family = pending_family
+        elif os.path.isfile(model):
+            family = family_by_id("nomic_embed")
+        else:
+            family = resolve_model(model).descriptor
         global ARCH, CHAT_FLAVOR
         ARCH = family.id
         CHAT_FLAVOR = detect_chat_flavor(family.id, model)
@@ -10550,13 +10687,17 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
         engine = pending_engine or default_engine(family)
         if not pending_model_id:
             try:
-                pending_model_id = registry_default_model_id(resolve_model(model))
+                if family.id == "nomic_embed":
+                    pending_model_id = family.default_model_id
+                else:
+                    pending_model_id = registry_default_model_id(resolve_model(model))
             except Exception:
                 pending_model_id = family.default_model_id
         model_id = pending_model_id
         server.model_id = model_id
         try:          # what the checkpoint on disk is called (a Clef, a 27B), for the Jev card
-            server.display_name = display_for(resolve_model(model))[0]
+            server.display_name = (family.display_name if family.id == "nomic_embed"
+                                   else display_for(resolve_model(model))[0])
         except Exception:
             server.display_name = None
         if kv_slots > family.limits.max_kv_slots:
@@ -10660,10 +10801,10 @@ def main():
              "or set COLI_ALLOWED_HOSTS as a comma-separated list")
     args = parser.parse_args()
     try:
-        resolved = resolve_model(args.model)
+        resolved = None if os.path.isfile(args.model) else resolve_model(args.model)
     except (FamilyConfigError, UnknownFamilyError) as error:
         parser.error(str(error))
-    family = resolved.descriptor
+    family = family_by_id("nomic_embed") if resolved is None else resolved.descriptor
     if args.arch != "auto" and args.arch != family.id:
         parser.error(f"--arch {args.arch} conflicts with model family {family.id}")
     global ARCH
@@ -10671,7 +10812,7 @@ def main():
     if args.engine is None:
         args.engine = str(default_engine(family))
     if args.model_id is None:
-        args.model_id = registry_default_model_id(resolved)
+        args.model_id = family.default_model_id if resolved is None else registry_default_model_id(resolved)
     serve(args.model, args.host, args.port, args.model_id, args.api_key,
           args.cap,args.max_tokens,args.engine,cors_origins=args.cors_origin,
           max_queue=args.max_queue,queue_timeout=args.queue_timeout,kv_slots=args.kv_slots,

@@ -949,3 +949,5 @@ di questi è usato o reimplementato oggi nel repository:
 ## Licenza
 
 Apache 2.0, Copyright 2026 Vincenzo Fornaro. Vedi [LICENSE](LICENSE) e [NOTICE](NOTICE). Ogni modello mantiene la licenza che gli hanno dato i suoi autori (i pesi di GLM-5.2 sono rilasciati da Z.ai sotto licenza MIT; Qwen-Image-2.1 è solo per uso non commerciale).
+
+**nomic-embed-text-v1.5** is available as an embedding service via `coli serve`.

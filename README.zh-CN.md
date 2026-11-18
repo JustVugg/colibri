@@ -589,3 +589,5 @@ colibri 只是一个引擎；它运行的智慧是一份馈赠。感谢以开放
 ## 许可证
 
 Apache 2.0，Copyright 2026 Vincenzo Fornaro。详见 [LICENSE](LICENSE) 与 [NOTICE](NOTICE)。每个模型保留其作者给出的许可证（GLM-5.2 权重由 Z.ai 以 MIT 许可发布；Qwen-Image-2.1 仅限非商业用途）。
+
+**nomic-embed-text-v1.5** is available as an embedding service via `coli serve`.

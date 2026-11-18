@@ -40,6 +40,8 @@ class FamilyCapabilities:
     # command) and generates nothing. The engine confirms it at start-up with
     # `CAPS decide=1 chat=0`, which is what the gateway routes on.
     decision: bool = False
+    # Text-input encoder service: POST /v1/embeddings, not generation.
+    embedding: bool = False
     # The numeric logprobs/echo channel (the SUBMIT `logprobs=` key): the engine
     # emits one ECHO frame per prompt position it read out, position 0 included
     # (" nan 0"), so the gateway can serve a run that starts at 0 -- which is what
@@ -1314,6 +1316,34 @@ def _qwen38_resident_inventory(name, size, _config, dtype=None):
 COMMON_CAP = FamilyCapabilities(False, False, False, True)
 
 FAMILIES = (
+    FamilyDescriptor(
+        id="nomic_embed",
+        model_types=("nomic-bert", "nomic_bert"),
+        display_name="nomic-embed-text-v1.5",
+        display_scale="137M",
+        engine_artifact="nomic",
+        engine_aliases=(),
+        engine_group="nomic_embed",
+        internal_arch="nomic_embed",
+        build_target="nomic",
+        process_names=("nomic",),
+        default_model_id="nomic-embed-text-v1.5",
+        cli_adapter="nomic_embed",
+        gateway_adapter="nomic_embed",
+        planner_id="nomic_embed",
+        planner_geometry=None,
+        planner_unsupported_reason=(
+            "an embedding model has no KV cache or generation; its encoder weights "
+            "are resident and each request is a bounded forward pass"),
+        expert_inventory=lambda _name, _size, _config, _dtype=None: (),
+        config_section="root",
+        limits=FamilyLimits(1, 1, 1, 1, 1, 0, ""),
+        capabilities=FamilyCapabilities(False, False, False, False, embedding=True),
+        has_gateway_adapter=True,
+        has_cli_adapter=True,
+        supports_accelerator=False,
+        modality="text",
+    ),
     FamilyDescriptor(
         id="glm53",
         # "glm5_next" e' il tipo della radice, che e' il wrapper vision; un

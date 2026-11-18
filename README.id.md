@@ -976,3 +976,5 @@ Apache 2.0, Copyright 2026 Vincenzo Fornaro. Lihat [LICENSE](LICENSE) dan
 [NOTICE](NOTICE). Setiap model tetap menggunakan lisensi yang diberikan oleh
 pembuatnya (bobot GLM-5.2 dirilis oleh Z.ai di bawah MIT; Qwen-Image-2.1 hanya
 untuk penggunaan nonkomersial).
+
+**nomic-embed-text-v1.5** is available as an embedding service via `coli serve`.

@@ -27,6 +27,12 @@ typedef enum {
      * vede come un comando che non sa trattare e lo rifiuta, che e' la risposta
      * giusta: meglio dire di no che accettare una foto e ignorarla. */
     COLI_SERVE_COMMAND_IMAGE,
+    /* EMBED <id> <slot> <bytes>\n<payload>\n: the engine's answer for one embedding
+     * request. The payload is JSON {"embedding":[...],"input_tokens":N} and the
+     * engine answers with one EMBED frame carrying that JSON. An engine that
+     * cannot embed never receives it: the gateway sends EMBED only after the
+     * engine announced embed=1 in its CAPS line. */
+    COLI_SERVE_COMMAND_EMBED,
     /* DECIDE <id> <slot> <bytes>\n<payload>\n: one closed decision for a decision
      * engine (docs/serve_protocol.md). The payload is a JSON record -- the state and
      * the typed questions with their options in order -- and the answer comes back
@@ -160,6 +166,8 @@ static inline void coli_serve_classify_line(
         command->kind = COLI_SERVE_COMMAND_IMAGE;
     else if (name_size == 6 && !memcmp(name, "DECIDE", 6))
         command->kind = COLI_SERVE_COMMAND_DECIDE;
+    else if (name_size == 5 && !memcmp(name, "EMBED", 5))
+        command->kind = COLI_SERVE_COMMAND_EMBED;
     else
         return;
     while (*cursor == ' ' || *cursor == '\t') cursor++;
@@ -228,6 +236,7 @@ static inline ColiServeReadResult coli_serve_read_command_alloc(
     else if (!strcmp(fields[0], "CANCEL")) command->kind = COLI_SERVE_COMMAND_CANCEL;
     else if (!strcmp(fields[0], "IMAGE")) command->kind = COLI_SERVE_COMMAND_IMAGE;
     else if (!strcmp(fields[0], "DECIDE")) command->kind = COLI_SERVE_COMMAND_DECIDE;
+    else if (!strcmp(fields[0], "EMBED")) command->kind = COLI_SERVE_COMMAND_EMBED;
     else {
         free(line);
         return COLI_SERVE_READ_IGNORED;
@@ -280,6 +289,37 @@ static inline ColiServeReadResult coli_serve_read_command_alloc(
         /* DECIDE <id> <slot> <bytes>\n<payload>\n. Same rule as IMAGE: the payload
          * is consumed whenever the header parses, so an engine that cannot decide
          * answers with an ERROR and the next frame still starts on a header. */
+        if (nfields != 4 ||
+            !coli_serve_parse_i32(fields[2], &command->slot) ||
+            !coli_serve_parse_u64(fields[3], &command->payload_bytes) ||
+            command->payload_bytes > profile->max_payload_bytes ||
+            command->slot < 0) {
+            free(line);
+            return COLI_SERVE_READ_BAD_REQUEST;
+        }
+        free(line);
+        command->payload = (unsigned char *)allocate((size_t)command->payload_bytes + 1);
+        if (!command->payload) return COLI_SERVE_READ_NOMEM;
+        if (command->payload_bytes &&
+            fread(command->payload, 1, (size_t)command->payload_bytes, input)
+                != (size_t)command->payload_bytes) {
+            coli_serve_command_dispose(command);
+            return COLI_SERVE_READ_BAD_FRAME;
+        }
+        command->payload[command->payload_bytes] = 0;
+        int terminator = fgetc(input);
+        if (terminator != '\n' && !(terminator == '\r' && fgetc(input) == '\n')) {
+            coli_serve_command_dispose(command);
+            return COLI_SERVE_READ_BAD_FRAME;
+        }
+        return COLI_SERVE_READ_OK;
+    }
+    if (command->kind == COLI_SERVE_COMMAND_EMBED) {
+        /* EMBED <id> <slot> <bytes>\n<payload>\n. Same frame shape as DECIDE (the
+         * slot is the gateway's admission slot; an embedding has no KV
+         * residency but keeps the field for uniform accounting). The engine
+         * answers with one EMBED reply; an engine that cannot embed never gets
+         * this command. */
         if (nfields != 4 ||
             !coli_serve_parse_i32(fields[2], &command->slot) ||
             !coli_serve_parse_u64(fields[3], &command->payload_bytes) ||
@@ -469,6 +509,19 @@ static inline int coli_serve_write_decision(
     FILE *output, const char *id, const void *data, size_t bytes)
 {
     if (fprintf(output, "DECISION %s %zu\n", id, bytes) < 0 ||
+        (bytes && fwrite(data, 1, bytes, output) != bytes) ||
+        fputc('\n', output) == EOF)
+        return 0;
+    return fflush(output) == 0;
+}
+
+/* EMBED <id> <bytes>\n<payload>\n: the engine's embedding answer -- JSON
+ * {"embedding":[...],"input_tokens":N} (the vector is the payload). The reply
+ * is a complete turn: the caller reads it and the stream is back on command
+ * boundaries. */
+static inline int coli_serve_write_embed(FILE *output, const char *id, const void *data, size_t bytes)
+{
+    if (fprintf(output, "EMBED %s %zu\n", id, bytes) < 0 ||
         (bytes && fwrite(data, 1, bytes, output) != bytes) ||
         fputc('\n', output) == EOF)
         return 0;

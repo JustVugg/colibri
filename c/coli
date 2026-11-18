@@ -431,6 +431,8 @@ def model_arch(model):
     return resolve_model(model).descriptor.id
 
 def engine_for(model):
+    if os.path.isfile(model):
+        return os.path.join(HERE, "nomic" + _EXE)
     family = resolve_model(model).descriptor
     if os.environ.get("COLI_ENGINE"):
         if (family.id != "glm" and
@@ -3491,16 +3493,23 @@ def serve_model_id(a):
     named the larger sibling as the smaller one. `coli chat` already asks the
     registry the same way."""
     from family_registry import default_model_id
+    if os.path.isfile(a.model):
+        return a.model_id or "nomic-embed-text-v1.5"
     return a.model_id or default_model_id(resolve_model(a.model))
 
 def cmd_serve(a):
-    need_model(a.model)
-    family=resolve_model(a.model).descriptor
+    if os.path.isfile(a.model):
+        from family_registry import family_by_id
+        family = family_by_id("nomic_embed")
+    else:
+        need_model(a.model)
+        family=resolve_model(a.model).descriptor
     arch=family.id
     if not family.has_gateway_adapter:
         sys.exit(f"{family.display_name}: gateway adapter is not wired")
     engine=engine_for(a.model)
-    need_model(a.model,engine)
+    if os.path.isdir(a.model):
+        need_model(a.model,engine)
     if a.kv_slots>family.limits.max_kv_slots:
         sys.exit(f"{arch} currently supports at most {family.limits.max_kv_slots} KV slot(s)")
     # pidfile: cosi' `coli stop` spegne tutto con un comando, senza pkill a mano.

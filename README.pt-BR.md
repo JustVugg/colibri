@@ -947,3 +947,5 @@ Apache 2.0, Copyright 2026 Vincenzo Fornaro. Veja [LICENSE](LICENSE) e
 [NOTICE](NOTICE). Cada modelo mantém a licença que os seus autores lhe deram (os
 pesos do GLM-5.2 são publicados pela Z.ai sob MIT; o Qwen-Image-2.1 é apenas para
 uso não comercial).
+
+**nomic-embed-text-v1.5** is available as an embedding service via `coli serve`.

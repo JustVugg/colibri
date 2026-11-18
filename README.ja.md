@@ -604,3 +604,5 @@ colibri はエンジンにすぎず、それが動かす知性は贈り物です
 ## ライセンス
 
 Apache 2.0、Copyright 2026 Vincenzo Fornaro。[LICENSE](LICENSE) と [NOTICE](NOTICE) を参照してください。各モデルには、その作者が付けたライセンスがそのまま適用されます（GLM-5.2 の重みは Z.ai により MIT ライセンスで公開されています。Qwen-Image-2.1 は非商用利用に限られます）。
+
+**nomic-embed-text-v1.5** is available as an embedding service via `coli serve`.

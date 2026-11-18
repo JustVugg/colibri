@@ -909,3 +909,5 @@ these is used or reimplemented in the tree today:
 ## License
 
 Apache 2.0, Copyright 2026 Vincenzo Fornaro. See [LICENSE](LICENSE) and [NOTICE](NOTICE). Each model keeps the licence its authors gave it (GLM-5.2 weights are released by Z.ai under MIT; Qwen-Image-2.1 is for non-commercial use only).
+
+**nomic-embed-text-v1.5** is available as an embedding service via `coli serve`.

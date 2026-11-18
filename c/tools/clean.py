@@ -46,6 +46,7 @@ FILES = [
     "qwenimage", "qwenimage.exe",
     "laya", "laya.exe",
     "gliner_decide", "gliner_decide.exe",
+    "nomic", "nomic.exe",
     "colibri-tui", "colibri-tui.exe",
     "native_quant.o", "native_quant_parallel.o", "native_quant_dual.o",
     "native_quant_batch_avx512.o", "native_quant_fp4_rows16.o",

@@ -1999,6 +1999,14 @@ iobench$(EXE): iobench.c
 qpack-inspect$(EXE): qpack_inspect.c qpack.c qpack.h affine_quant.h json.h compat.h
 	$(CC) $(CFLAGS) qpack_inspect.c qpack.c -o qpack-inspect$(EXE) $(LDFLAGS)
 
+.PHONY: nomic-check
+nomic-check: nomic_check.c gguf.h ggml_quants.h ggml_grids.h
+	$(CC) $(CFLAGS) nomic_check.c -o nomic-check$(EXE) $(LDFLAGS)
+
+.PHONY: nomic
+nomic: nomic_check.c gguf.h ggml_quants.h ggml_grids.h
+	$(CC) $(CFLAGS) nomic_check.c -o nomic $(LDFLAGS)
+
 tests/test_serve_sentinel$(EXE): tests/test_serve_sentinel.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -3407,7 +3415,7 @@ check:
 	$(MAKE) portable
 	$(MAKE) test
 
-install: colibri-tui$(EXE) colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen36$(EXE) qwen38$(EXE) deepseek_v41$(EXE) mimo$(EXE) qwenimage$(EXE) laya$(EXE) gliner_decide$(EXE) \
+install: colibri-tui$(EXE) colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) qwen36$(EXE) qwen38$(EXE) deepseek_v41$(EXE) mimo$(EXE) qwenimage$(EXE) laya$(EXE) gliner_decide$(EXE) nomic$(EXE) \
 	$(if $(filter 1,$(COLI_V4_SUPPORTED)),deepseek-v4,)
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)
@@ -3423,6 +3431,7 @@ install: colibri-tui$(EXE) colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE)
 	$(INSTALL) -m 755 qwenimage$(EXE) $(DESTDIR)$(LIBEXECDIR)/qwenimage$(EXE)
 	$(INSTALL) -m 755 laya$(EXE) $(DESTDIR)$(LIBEXECDIR)/laya$(EXE)
 	$(INSTALL) -m 755 gliner_decide$(EXE) $(DESTDIR)$(LIBEXECDIR)/gliner_decide$(EXE)
+	$(INSTALL) -m 755 nomic$(EXE) $(DESTDIR)$(LIBEXECDIR)/nomic$(EXE)
 	$(INSTALL) -m 755 deepseek_v41$(EXE) $(DESTDIR)$(LIBEXECDIR)/deepseek_v41$(EXE)
 	$(INSTALL) -m 755 mimo$(EXE) $(DESTDIR)$(LIBEXECDIR)/mimo$(EXE)
 	$(INSTALL) -m 755 colibri-tui$(EXE) $(DESTDIR)$(LIBEXECDIR)/colibri-tui$(EXE)
