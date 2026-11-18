@@ -81,6 +81,10 @@ Establish whether Colibri can load and serve Gemma 4 E2B.
 - **Intended purpose:** Gemma will act as a *supporting* generation model.
   Qwen 3.6 35B remains the **primary reasoning model**.
 - Both should eventually be available through the Colibri serving architecture.
+- **Residency requirement:** Gemma is a supporting model and should be loaded
+  fully into host RAM. The first milestone is not a general mmap/lazy-page
+  loader. Quantized Q4_K/Q6_K tensors may remain quantized in RAM, with
+  dequantized tiles and scratch allocated only for computation.
 
 ### Open questions on resume
 
@@ -762,9 +766,9 @@ must not be done.
 
 1. Obtain a representative text-only E2B GGUF and record its complete GGUF
    metadata/tensor inventory, tokenizer, and chat template.
-2. Add a standalone `gemma4` loader/CPU reference forward path first, covering
-   PLE, Q/K RMS norms, layer-specific RoPE, sliding masks, shared KV sources,
-   GELU-tanh double-wide MLP, and logit soft-capping.
+2. Add a standalone `gemma4` full-RAM loader/CPU reference forward path first,
+   covering PLE, Q/K RMS norms, layer-specific RoPE, sliding masks, shared KV
+   sources, GELU-tanh double-wide MLP, and logit soft-capping.
 3. Compare a short greedy generation against llama.cpp before adding Colibri
    mux serving.
 4. Register the family and add `coli serve` only after parity passes.
@@ -772,7 +776,7 @@ must not be done.
    supporting-model milestone.
 
 The representative GGUF is now available, so implementation can begin with
-the text-only loader/reference path. Multimodal support and the main
+the text-only full-RAM loader/reference path. Multimodal support and the main
 performance roadmap remain separate follow-up work.
 
 ### 7.9 Local Gemma artifact validation (2026-11-18)
@@ -788,6 +792,7 @@ weight payload. The local model passes:
 
 The validator checks the token/output/PLE tensors, every layer's attention
 head width, the 6144-to-12288 MLP transition, and all per-layer PLE
-projection tensors. The next code milestone is now the text-only reference
-forward path, using this exact Q4_K_M artifact and `llama-cli` as the output
-oracle.
+projection tensors. The next code milestone is now the text-only, full-RAM
+reference forward path, using this exact Q4_K_M artifact and `llama-cli` as
+the output oracle. The `mmproj` file is intentionally excluded from this
+supporting-model milestone.
