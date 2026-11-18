@@ -30,6 +30,8 @@
 #   drafts; COLI_LOOKUP=1 with forced drafts runs its verifies on the CPU: the CPU's tokens.
 # kv growth: a 1,300-token prompt (qwen38_tiny with max_position_embeddings raised, a
 #   generated prompt): the device caches grow 256, 512, 1024, 2048; the CPU's tokens and logits.
+# long prompt, fast mode: 3,000 tokens on qwen38_decay with the fast kernels: the CPU's tokens
+#   and logits, and Q38M_LAYER_CHECK=2 (each layer, the routes, the CPU's own one-ulp lines).
 # layer test: Q38M_LAYER_CHECK=1 (debug) runs the CPU's q38_layer_forward beside the first
 #   step and compares each layer's output streams, `[q38m-layer] L<i> worst=<e>` (max
 #   |gpu-cpu| over max |cpu|), FAIL over 1e-4, exact mode.
@@ -258,6 +260,43 @@ if eng long_cpu "$tmp/long" "$tmp/long/ref.json" COLI_METAL=0 $REFP DUMP=$tmp/lo
         echo "FAIL [kv growth 1300 tokens] '$(toks long_mtl)' vs the CPU's '$(toks long_cpu)'"; fail=1
     elif logits_ok long_cpu long_mtl; then
         echo "ok   [kv growth 1300 tokens] the CPU's tokens, logits within $(relerr "$tmp/long_cpu.bin" "$tmp/long_mtl.bin") x max: $(toks long_mtl)"
+    fi
+fi
+
+echo "== long prompt, fast mode"
+# Plan 2 Task 7a: the fast kernels (QWEN38_METAL_EXPERTS=0, QWEN38_METAL_EXACT unset: one DeltaNet
+# state plane) over a 3,000-token prompt on qwen38_decay (its recurrent state counts): 12 chunks
+# of 256 rows, the QSA past its budget, the caches grown to 4096. The CPU's tokens and final
+# logits (1e-4 x max), and the layer check with Q38M_LAYER_CHECK=2: every layer of the chain
+# within 1e-4 of the CPU, with the routes the reference run took, and the CPU's own one-ulp
+# lines printed (the floor a real model's long prompt is read against: a top-k near-tie the
+# CPU itself flips from one ulp, see docs/ENVIRONMENT.md Q38M_LAYER_CHECK)
+mkdir -p "$tmp/lfast"
+for f in "$tmp"/qwen38_decay/*; do ln -s "$f" "$tmp/lfast/"; done
+rm -f "$tmp/lfast/config.json" "$tmp/lfast/ref.json" "$tmp/lfast/.coli_usage"
+"${PYTHON:-python3}" -c '
+import json, sys
+c = json.load(open(sys.argv[1] + "/config.json"))
+(c.get("text_config") or c)["max_position_embeddings"] = 4096
+json.dump(c, open(sys.argv[2] + "/config.json", "w"))
+x, ids = 777, []
+for _ in range(3000):
+    x = (x * 1103515245 + 12345) % 2**31
+    ids.append(3 + x % 61)
+json.dump({"schema_version": 1, "prompt_ids": ids, "full_ids": ids + [3] * 8}, open(sys.argv[2] + "/ref.json", "w"))' "$tmp/qwen38_decay" "$tmp/lfast"
+if eng lfast_cpu "$tmp/lfast" "$tmp/lfast/ref.json" COLI_METAL=0 $REFP DUMP=$tmp/lfast_cpu.bin &&
+   eng lfast_mtl "$tmp/lfast" "$tmp/lfast/ref.json" QWEN38_METAL_EXPERTS=0 Q38M_LAYER_CHECK=2 $REFP DUMP=$tmp/lfast_mtl.bin &&
+   chain_on lfast_mtl; then
+    n=$(grep -c '^\[q38m-layer\] L.*routes off the reference run.s in 0 rows' "$tmp/lfast_mtl.log")
+    u=$(grep -c '^\[q38m-cpu-ulp\] L' "$tmp/lfast_mtl.log")
+    if [ -z "$(toks lfast_cpu)" ] || [ "$(toks lfast_mtl)" != "$(toks lfast_cpu)" ]; then
+        echo "FAIL [long fast 3000 tokens] '$(toks lfast_mtl)' vs the CPU's '$(toks lfast_cpu)'"; fail=1
+    elif [ "$n" -lt 4 ] || [ "$u" -lt 4 ] || grep '^\[q38m-layer\] L' "$tmp/lfast_mtl.log" | grep -qF FAIL; then
+        echo "FAIL [long fast 3000 tokens] layer check: $n clean layer lines, $u one-ulp lines"
+        grep -E '^\[q38m-(layer|cpu-ulp)\]' "$tmp/lfast_mtl.log"; fail=1
+    elif logits_ok lfast_cpu lfast_mtl; then
+        worst=$(grep '^\[q38m-layer\] L' "$tmp/lfast_mtl.log" | sed 's/.*worst=\([^ ]*\).*/\1/' | sort -g | tail -1)
+        echo "ok   [long fast 3000 tokens] the CPU's tokens, logits within $(relerr "$tmp/lfast_cpu.bin" "$tmp/lfast_mtl.bin") x max, layers within $worst, routes the reference's"
     fi
 fi
 
