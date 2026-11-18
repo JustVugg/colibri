@@ -1,13 +1,15 @@
 # Colibri Sideline Plan: Embeddings, Gemma 4 E2B and Multi-Model Serving
 
-**Status:** Sideline plan — embedding oracle and first serving surface implemented; router and Gemma 4 E2B remain parked.
+**Status:** Sideline plan — embeddings, Unicode normalization, and the first
+static router baseline implemented; Gemma 4 E2B compatibility investigation
+active.
 **Prepared:** 2026-11-18
 **Related:** `docs/experiments/DEV_PHASED_PLAN_TTFT_AND_THROUGHPUT.md` (main performance roadmap — kept separate; do not merge)
 **Priority order when resumed:**
 1. Embedding support in `coli.serve` (first priority, must-have capability)
 2. Embedding model compatibility and serving requirements
-3. Gemma 4 E2B compatibility
-4. Unified multi-model serving architecture
+3. Gemma 4 E2B compatibility (active)
+4. Unified multi-model serving architecture (router baseline started)
 
 > Sections 1–5 record the original objectives and investigation. Sections 6–7
 > record verified implementation and oracle results; remaining items are marked
@@ -202,12 +204,12 @@ on the next pass.
 
 ### 5.2 Gemma 4 E2B
 
-- No `gemma` entry in `family_registry.py`; the registry is the first gate a
-  checkpoint hits (root `config.json` `model_type` lookup, line ~1973).
+- No `gemma` entry exists in `family_registry.py`; the registry is the first
+  gate a checkpoint hits (root `config.json` `model_type` lookup).
 - Serving a new decoder family has historically meant a new engine artifact
   + chain (`c/qwen38.c` + `c/qwen38_chain.h` pattern, `FamilyDescriptor`
-  fields `engine_artifact` / `build_target` / `process_names`). E2B would
-  follow that pattern. Rough size of that lift is unmeasured — next pass.
+  fields `engine_artifact` / `build_target` / `process_names`). E2B must
+  follow that pattern; it cannot safely inherit an existing family.
 
 ### 5.3 Multi-model serving
 
@@ -703,3 +705,59 @@ Implemented and tested the first router slice:
 Still open for the router: dynamic cluster registration, backend lifecycle
 management, CORS parity, and richer aggregate telemetry. Gemma 4 E2B remains
 the next major model investigation.
+
+### 7.8 Gemma 4 E2B compatibility investigation (2026-11-18)
+
+The requested local path is not present in this checkout:
+`/Users/creemac/.lmstudio/models/lmstudio-community/gemma-4-E2B-it-GGUF`.
+The architecture was therefore checked against the published Gemma 4 E2B
+configuration and llama.cpp's Gemma 4 loader/graph rather than by opening a
+local GGUF.
+
+Reference artifacts:
+`https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/raw/main/config.json`
+and
+`https://raw.githubusercontent.com/ggml-org/llama.cpp/master/src/models/gemma4.cpp`.
+
+**Verified model shape (`gemma-4-E2B-it`):**
+
+- Text backbone: `gemma4_text`, 35 dense decoder layers, hidden size 1536,
+  vocabulary 262,144, context 131,072, and 8 query heads / 1 KV head.
+- Hybrid attention: 30 sliding-window layers with a 512-token window and
+  five full-attention layers. Full-attention layers use proportional RoPE
+  (theta 1,000,000); sliding layers use ordinary RoPE (theta 10,000).
+- KV sharing: only the first 15 layers own KV; later layers reuse KV from an
+  earlier compatible layer. This is distinct from ordinary GQA and requires
+  explicit cache-source wiring.
+- Dense MLP: GELU-tanh, 6144 intermediate width, double-wide MLP handling,
+  RMS norms before and after attention/FFN sub-blocks, and final-logit
+  soft-capping at 30.
+- Per-layer embeddings (PLE): each of the 35 layers receives a dedicated
+  256-dimensional token embedding, projected from the main 1536-dimensional
+  stream. This is a major memory and forward-graph feature, not a metadata
+  alias.
+- The published model is multimodal (text, image, audio), although a first
+  Colibri milestone can deliberately target text-only GGUF serving.
+
+**Compatibility verdict:** **not loadable by an existing Colibri family.**
+Current engines do not provide the combined PLE + hybrid sliding/full
+attention + shared-KV graph, and `family_registry.py` has no `gemma4` entry.
+Adding a descriptor alone would create a false-positive model selection and
+must not be done.
+
+**Required implementation order:**
+
+1. Obtain a representative text-only E2B GGUF and record its complete GGUF
+   metadata/tensor inventory, tokenizer, and chat template.
+2. Add a standalone `gemma4` loader/CPU reference forward path first, covering
+   PLE, Q/K RMS norms, layer-specific RoPE, sliding masks, shared KV sources,
+   GELU-tanh double-wide MLP, and logit soft-capping.
+3. Compare a short greedy generation against llama.cpp before adding Colibri
+   mux serving.
+4. Register the family and add `coli serve` only after parity passes.
+5. Add image/audio support separately; text-only support is the first useful
+   supporting-model milestone.
+
+This investigation is now concrete, but implementation is blocked on the
+representative GGUF artifact and remains separate from the main performance
+roadmap.
