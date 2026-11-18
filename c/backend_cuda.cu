@@ -2311,6 +2311,73 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
     return 1;
 }
 
+/* ---- a vision tower's attention (see backend_cuda.h) ---------------------- */
+/* One thread a query of one head, the block's 128 queries sharing each tile of VA_KT keys and values
+ * through shared memory; the softmax online, in float32, the keys in their order: the result does
+ * not depend on the launch. qkv is [n][3][heads][D] (q, k, v of a row side by side, as the tower's
+ * qkv matrix writes them), out [n][heads][D]. */
+#define VA_KT 32
+template <int D>
+__global__ static void vis_attn_k(const float *__restrict__ qkv, float *__restrict__ out, int n, int heads, float scale) {
+    __shared__ float ks[VA_KT][D], vs[VA_KT][D];
+    const int h = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x, H = heads * D;
+    const size_t row = (size_t)3 * H;
+    const bool live = i < n;
+    float q[D], acc[D], m = -INFINITY, l = 0.f;
+    for (int d = 0; d < D; d++) { q[d] = live ? qkv[(size_t)i * row + (size_t)h * D + d] * scale : 0.f; acc[d] = 0.f; }
+    for (int j0 = 0; j0 < n; j0 += VA_KT) {
+        const int tn = n - j0 < VA_KT ? n - j0 : VA_KT;
+        for (int t = threadIdx.x; t < tn * D; t += blockDim.x) {
+            const int jj = t / D, d = t % D;
+            const float *r = qkv + (size_t)(j0 + jj) * row + (size_t)h * D + d;
+            ks[jj][d] = r[H];
+            vs[jj][d] = r[2 * H];
+        }
+        __syncthreads();
+        if (live)
+            for (int jj = 0; jj < tn; jj++) {
+                float s = 0.f;
+                for (int d = 0; d < D; d++) s = fmaf(q[d], ks[jj][d], s);
+                if (s > m) {
+                    const float c = expf(m - s);
+                    l *= c;
+                    for (int d = 0; d < D; d++) acc[d] *= c;
+                    m = s;
+                }
+                const float p = expf(s - m);
+                l += p;
+                for (int d = 0; d < D; d++) acc[d] = fmaf(p, vs[jj][d], acc[d]);
+            }
+        __syncthreads();
+    }
+    if (live) {
+        const float inv = 1.f / l;
+        for (int d = 0; d < D; d++) out[(size_t)i * H + (size_t)h * D + d] = acc[d] * inv;
+    }
+}
+
+extern "C" int coli_cuda_vision_attention(int device, float *out, const float *qkv, int n, int heads, int D, float scale) {
+    if (fault_injected()) return 0;
+    if (n < 1 || heads < 1 || !out || !qkv) return 0;
+    if (D != 64 && D != 72 && D != 80 && D != 96 && D != 128) return 0;   /* another head width: the CPU's */
+    DeviceContext *ctx = find_ctx(device);
+    if (!select_ctx(ctx)) return 0;
+    const size_t xb = (size_t)n * 3 * heads * D * sizeof(float), yb = (size_t)n * heads * D * sizeof(float);
+    if (!reserve(&ctx->dx, &ctx->dx_cap, xb) || !reserve(&ctx->dy, &ctx->dy_cap, yb)) return 0;
+    if (!cuda_ok(cudaMemcpy(ctx->dx, qkv, xb, cudaMemcpyHostToDevice), "vision qkv upload")) return 0;
+    dim3 grid((unsigned)((n + 127) / 128), (unsigned)heads);
+    switch (D) {
+    case 64: coli_launch(vis_attn_k<64>, grid, 128, 0, 0, (const float *)ctx->dx, ctx->dy, n, heads, scale); break;
+    case 72: coli_launch(vis_attn_k<72>, grid, 128, 0, 0, (const float *)ctx->dx, ctx->dy, n, heads, scale); break;
+    case 80: coli_launch(vis_attn_k<80>, grid, 128, 0, 0, (const float *)ctx->dx, ctx->dy, n, heads, scale); break;
+    case 96: coli_launch(vis_attn_k<96>, grid, 128, 0, 0, (const float *)ctx->dx, ctx->dy, n, heads, scale); break;
+    default: coli_launch(vis_attn_k<128>, grid, 128, 0, 0, (const float *)ctx->dx, ctx->dy, n, heads, scale); break;
+    }
+    if (!cuda_ok(cudaGetLastError(), "vision attention launch") ||
+        !cuda_ok(cudaMemcpy(out, ctx->dy, yb, cudaMemcpyDeviceToHost), "vision attention download")) return 0;
+    return 1;
+}
+
 /* ---- gated delta layer on the device (see backend_cuda.h) ---------------- */
 #define DN_MAX_HEADS 64
 struct DnGates { float egh[DN_MAX_HEADS]; float beta[DN_MAX_HEADS]; };

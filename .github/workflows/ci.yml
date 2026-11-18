@@ -1026,6 +1026,18 @@ jobs:
           done
           QWEN36_VL_TINY=qwen38_27b_vl_tiny_c QWEN36_VL_REF=qwen38_27b_vl_tiny/ref.json \
             python3 -m unittest -v tests.test_qwen36_vision_serve
+          # The same tower from an mmproj (llama.cpp's names, as unsloth's mmproj-*.gguf carry
+          # it: the way a GGUF of the family gets its pictures), the container's own tower
+          # removed: held to the same tokens.
+          python3 tools/qwen_vision_mmproj.py --model qwen38_27b_vl_tiny --out qwen38_27b_vl_tiny_mmproj.gguf
+          cp -r qwen38_27b_vl_tiny_c qwen38_27b_vl_tiny_nv
+          rm qwen38_27b_vl_tiny_nv/model-vision.safetensors
+          for cap in 1 8; do
+            echo "::group::27B vision from an mmproj cap=$cap"
+            COLI_DENSE_I8=0 SNAP=qwen38_27b_vl_tiny_nv Q36_MMPROJ=qwen38_27b_vl_tiny_mmproj.gguf \
+              ./qwen36 "$cap" 8 qwen38_27b_vl_tiny/ref.json
+            echo "::endgroup::"
+          done
       - name: Same run under ASan + UBSan
         run: |
           cd c

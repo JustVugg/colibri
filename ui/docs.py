@@ -190,3 +190,18 @@ def extract(name, data):
     if not out["text"].strip() and not out["images"]:
         raise ValueError("nel file non c'e testo da leggere")
     return out
+
+
+if __name__ == "__main__":
+    # `python docs.py FILE`: the reader for colibri-tui (c/tui.c), one JSON object on stdout,
+    # ASCII only (a Windows console's code page cannot garble it): extract()'s, or {"error": ...}
+    import json
+    import sys
+    if len(sys.argv) != 2:
+        sys.exit("usage: docs.py FILE")
+    try:
+        with open(sys.argv[1], "rb") as f:
+            print(json.dumps(extract(os.path.basename(sys.argv[1]), f.read())))
+    except Exception as error:   # the reader's own refusals and an unreadable file alike
+        print(json.dumps({"error": str(error)}))
+        sys.exit(1)
