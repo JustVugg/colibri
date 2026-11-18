@@ -708,11 +708,12 @@ the next major model investigation.
 
 ### 7.8 Gemma 4 E2B compatibility investigation (2026-11-18)
 
-The requested local path is not present in this checkout:
+The local artifact is present at
 `/Users/creemac/.lmstudio/models/lmstudio-community/gemma-4-E2B-it-GGUF`.
-The architecture was therefore checked against the published Gemma 4 E2B
-configuration and llama.cpp's Gemma 4 loader/graph rather than by opening a
-local GGUF.
+It contains `gemma-4-E2B-it-Q4_K_M.gguf` (3.2 GiB, 601 tensors) and the
+separate `mmproj-gemma-4-E2B-it-BF16.gguf` (941 MiB). The architecture was
+checked both against this GGUF and against the published configuration and
+llama.cpp's Gemma 4 loader/graph.
 
 Reference artifacts:
 `https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/raw/main/config.json`
@@ -723,21 +724,33 @@ and
 
 - Text backbone: `gemma4_text`, 35 dense decoder layers, hidden size 1536,
   vocabulary 262,144, context 131,072, and 8 query heads / 1 KV head.
-- Hybrid attention: 30 sliding-window layers with a 512-token window and
-  five full-attention layers. Full-attention layers use proportional RoPE
+- The actual GGUF declares `general.architecture = "gemma4"` and
+  `tokenizer.ggml.model = "gemma4"`, with 262,144 tokens and 514,906 merge
+  records. It is not a standard Llama tokenizer path.
+- Hybrid attention: 28 sliding-window layers with a 512-token window and
+  seven full-attention layers (`4, 9, 14, 19, 24, 29, 34`). Full-attention layers use proportional RoPE
   (theta 1,000,000); sliding layers use ordinary RoPE (theta 10,000).
-- KV sharing: only the first 15 layers own KV; later layers reuse KV from an
-  earlier compatible layer. This is distinct from ordinary GQA and requires
-  explicit cache-source wiring.
-- Dense MLP: GELU-tanh, 6144 intermediate width, double-wide MLP handling,
-  RMS norms before and after attention/FFN sub-blocks, and final-logit
-  soft-capping at 30.
+- KV sharing: the GGUF declares 20 shared KV layers; the runtime must reuse
+  compatible earlier KV sources rather than treating this as ordinary GQA.
+  The tensor inventory still contains per-layer K/V tensors, so the loader
+  must follow the metadata/runtime sharing rule rather than infer it from
+  tensor presence.
+- Dense MLP: GELU-tanh, 6144 intermediate width in layers 0–14 and 12288
+  in layers 15–34 (the GGUF's double-wide MLP layout), RMS norms before and
+  after attention/FFN sub-blocks, and final-logit soft-capping at 30.
 - Per-layer embeddings (PLE): each of the 35 layers receives a dedicated
   256-dimensional token embedding, projected from the main 1536-dimensional
   stream. This is a major memory and forward-graph feature, not a metadata
   alias.
 - The published model is multimodal (text, image, audio), although a first
   Colibri milestone can deliberately target text-only GGUF serving.
+
+**Actual tensor evidence:** the GGUF has `per_layer_token_embd.weight`
+`[8960,262144]` in Q6_K (`8960 = 35 × 256`), the BF16
+`per_layer_model_proj.weight` `[1536,8960]`, and per-layer `inp_gate` /
+`proj` tensors. Sliding layers use 256-wide K/V heads; full layers use
+512-wide K/V heads. The model file is therefore sufficient to begin a
+text-only loader; the mmproj can remain out of the first milestone.
 
 **Compatibility verdict:** **not loadable by an existing Colibri family.**
 Current engines do not provide the combined PLE + hybrid sliding/full
@@ -758,6 +771,23 @@ must not be done.
 5. Add image/audio support separately; text-only support is the first useful
    supporting-model milestone.
 
-This investigation is now concrete, but implementation is blocked on the
-representative GGUF artifact and remains separate from the main performance
-roadmap.
+The representative GGUF is now available, so implementation can begin with
+the text-only loader/reference path. Multimodal support and the main
+performance roadmap remain separate follow-up work.
+
+### 7.9 Local Gemma artifact validation (2026-11-18)
+
+Added `c/gemma4_check.c` and the `make -C c gemma4-check` target. It performs
+a read-only GGUF metadata/tensor-shape check without loading the 3.2 GiB
+weight payload. The local model passes:
+
+```json
+{"architecture":"gemma4","layers":35,"hidden":1536,"vocab":262144,
+ "full_attention_layers":7,"ple_width":256,"status":"compatible"}
+```
+
+The validator checks the token/output/PLE tensors, every layer's attention
+head width, the 6144-to-12288 MLP transition, and all per-layer PLE
+projection tensors. The next code milestone is now the text-only reference
+forward path, using this exact Q4_K_M artifact and `llama-cli` as the output
+oracle.

@@ -2007,6 +2007,10 @@ nomic-check: nomic_check.c nomic_unicode.h gguf.h ggml_quants.h ggml_grids.h
 nomic: nomic_check.c nomic_unicode.h gguf.h ggml_quants.h ggml_grids.h
 	$(CC) $(CFLAGS) nomic_check.c -o nomic $(LDFLAGS)
 
+.PHONY: gemma4-check
+gemma4-check: gemma4_check.c gguf.h ggml_quants.h ggml_grids.h
+	$(CC) $(CFLAGS) gemma4_check.c -o gemma4-check$(EXE) $(LDFLAGS)
+
 tests/test_serve_sentinel$(EXE): tests/test_serve_sentinel.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
