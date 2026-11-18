@@ -85,6 +85,10 @@ Establish whether Colibri can load and serve Gemma 4 E2B.
   fully into host RAM. The first milestone is not a general mmap/lazy-page
   loader. Quantized Q4_K/Q6_K tensors may remain quantized in RAM, with
   dequantized tiles and scratch allocated only for computation.
+- **Intended integration clarification:** the desired interface is analogous
+  to llama.cpp's `--draft-model`: Gemma should propose tokens for the primary
+  Qwen server's speculative verification, not merely appear as an unrelated
+  routed backend.
 
 ### Open questions on resume
 
@@ -796,3 +800,38 @@ projection tensors. The next code milestone is now the text-only, full-RAM
 reference forward path, using this exact Q4_K_M artifact and `llama-cli` as
 the output oracle. The `mmproj` file is intentionally excluded from this
 supporting-model milestone.
+
+### 7.10 External draft-model compatibility gate (2026-11-18)
+
+The requested command shape is:
+
+```text
+coli serve --model <Qwen target> --draft-model <Gemma E2B>
+```
+
+That is **not directly implementable as standard token-level speculative
+decoding** with these two checkpoints:
+
+- Qwen 3.6 target tokenizer vocabulary: **248,320** entries
+  (`qwen3_5_moe_text`).
+- Gemma 4 E2B draft vocabulary: **262,144** entries (`gemma4`).
+- The difference is **13,824** entries, and the token ID spaces are not
+  interchangeable. llama.cpp's external draft path requires matching token
+  identity and only tolerates a very small vocabulary-size difference.
+
+Therefore a Gemma token proposal cannot be fed directly into Qwen's verifier
+while preserving speculative-decoding correctness. A text-level bridge would
+need to detokenize Gemma proposals, retokenize them with Qwen's tokenizer, and
+define new acceptance/rollback semantics; that is a different algorithm, not
+the llama.cpp `--draft-model` contract.
+
+**Decision gate:** do not add a `--draft-model` flag that appears to work but
+silently loses verification correctness. The viable paths are:
+
+1. use a Qwen-tokenized draft checkpoint for true speculative decoding;
+2. use Gemma as an independent supporting backend through the router; or
+3. explicitly design and measure a new text-bridge proposal algorithm.
+
+The full-RAM Gemma loader remains useful for option 2 and for investigating
+option 3, but it will not be wired as a standard Qwen draft until tokenizer
+compatibility is solved.
