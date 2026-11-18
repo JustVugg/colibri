@@ -757,6 +757,64 @@ The prompt gains too, a tenth of its time, because the bank refills read
 experts through the same path. Not measured: a CPU-only run, Linux, a contiguous (FLOCK-packed)
 checkpoint. The record is in `docs/experiments/v4-slab-shift-2026-11-13/`.
 
+### A prompt's expert reads at the cold end of the RAM cache (`V4_RAM_PROMPT_COLD`, opt-in)
+
+With `COLI_CUDA_MOE_BATCH=1 COLI_CUDA_MOE_DOUBLE=1` a prompt's expert bank reads
+every routed expert of every layer once (the second bank prefetches the whole
+next layer), in the same order on every prompt. The RAM expert cache keeps one
+recency list per layer, and a layer has fewer slots than experts (133 of 256 at
+`--ram 80` on a 94 GiB box). A sweep larger than the list, in a fixed order, is
+the case recency handles worst: each read evicts an expert the same sweep needs
+further on. Measured on the service below, one prompt read in six hit RAM (122
+GB from disk per 3.3k-token turn, though RAM held half the experts), and the
+sweep pushed out the experts decode had just used: decode then missed RAM about
+1,550 times per turn.
+
+With `V4_RAM_PROMPT_COLD=1`, a slot the bank reads into while a prompt is read
+(from the request's start until the bank is released for decode) is linked at
+the oldest end of its layer's list, so the next such read reuses it and the
+rest of the cache stays as it was. The prompt hits whatever RAM holds; decode
+finds what it used. Hits keep their recency touch; decode, the read-ahead
+lanes and the CPU union's lookups (counted lookups) are unchanged. The bank
+holds each view's lease until its upload, so a cold slot is never reused before
+the bank has its copy. Only which slot a read reuses changes, never what is
+read or computed: the replies are the same. Without the bank (a CPU build, or
+`COLI_CUDA_MOE_BATCH` unset) nothing changes.
+
+The policy was picked by replaying one service's RAM-cache events (every hit,
+miss, victim, touch and pin set, recorded by a local trace build) against
+candidates. The replay of plain recency reproduced the engine's misses within
+a few per turn. Over five turns an oracle that knows the future misses 26,121
+times on the prompts; this policy 26,400 (recency 45,425), with 2,175 decode
+misses against recency's 7,776.
+
+Measured on the RTX 5080 server (`coli serve --ram 80 --ctx 20000`, five
+3,282-token turns per service, `max_tokens` 36, three services per arm
+alternating, medians; the replies are the same in all twelve services). On
+upstream dev with the merged switches (`V4_LAYER_FUSED`, `V4_MIRROR_BLOCK`,
+`V4_BANK_MAKE_ROOM`, `V4_UPLOAD_THREAD`, `DSV4_CUDA_MOE_FUSED6`):
+
+| turn | 1 | 2 | 3 | 4 | 5 |
+|---|---|---|---|---|---|
+| request (s), unset | 52.11 | 56.68 | 55.63 | 55.21 | 54.31 |
+| request (s), `V4_RAM_PROMPT_COLD=1` | 50.77 | 53.17 | 53.46 | 52.94 | 53.33 |
+| decode (s), unset | 10.06 | 8.01 | 7.42 | 7.05 | 6.53 |
+| decode (s), `=1` | 9.77 | 5.12 | 5.24 | 5.00 | 5.35 |
+| RAM hit rate of the turn, unset / `=1` | 49.5 / 69.1 % | 46.6 / 72.3 % | 46.6 / 72.3 % | 46.5 / 72.4 % | 46.7 / 71.5 % |
+
+Decode on turns 2 to 5: 4.82 -> 6.87 tok/s (medians of twelve). The expert
+disk seconds the engine reports per turn fall from about 19.8 to 10.4. Turn 1
+starts from the cache the engine read before the first request, and gains least.
+With a faster prompt path in front (the local deployment, same box, same
+service), the requests take 31.23 26.83 25.12 24.11 23.10 s unset and 29.57
+23.30 22.86 22.16 22.37 s with the switch; a counting build there logged prompt
+reads from disk per turn falling from about 9,150 to 5,450 (122 to 73 GB) and
+decode misses from about 1,550 to 220-436.
+
+Not measured: a smaller `--ram` (fewer slots per layer, the same sweep),
+prompts longer than a segment (each segment sweeps again), Windows, HIP. The
+record is in `docs/experiments/v4-ram-prompt-cold-2026-11-18/`.
+
 ## Prefill: segments, chunks, checkpoints
 
 - **Chunks/segments.** Prefill runs layer-major over 128-token chunks
@@ -1048,6 +1106,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_LOADER_LANES` (9, max 16) | persistent expert-loader threads for decode. The default suits the CPU path (1.41× decode, #1097); **with the GPU tier set `3`**: mirrors/RAM absorb most decode misses (9 lanes ≈ +4 % decode) while the extra readers contend with the MoE bank refill for the NVMe queues (~10 % slower prefill; measured on the reference box, v1.7.0) |
 | `V4_EXPERT_UNION` (1) | per-chunk expert union batching on the CPU path |
 | `COLI_V4_DIRECT` (1) | O_DIRECT streaming reads |
+| `V4_RAM_PROMPT_COLD` (0) | `1` = while a prompt is read, the expert bank's reads go to the oldest end of the RAM cache's recency list, so the sweep over every expert keeps what RAM held and decode finds its experts (see [A prompt's expert reads at the cold end of the RAM cache](#a-prompts-expert-reads-at-the-cold-end-of-the-ram-cache-v4_ram_prompt_cold-opt-in)) |
 | `V4_SLAB_SHIFT` (1) | an expert record stays where its direct read landed and the views point there; `0` = moved to the slab's first byte after every read, as before (see [An expert record stays where its read landed](#an-expert-record-stays-where-its-read-landed-v4_slab_shift-on)) |
 | `COLI_V4_AUTOPIN`, `COLI_V4_SAVE_USAGE` | hot-expert pinning from `.coli_usage` history |
 | `COLI_V4_PREWARM` (unset) | the expert cache filled before the first request: unset, a serve (chat, web) reads every expert its RAM plan holds, or with a smaller cache each layer's most used ones in `.coli_usage`, before it says ready, in parallel with a progress line, and stops short of the RAM the plan keeps for the system; a one-shot run fills it as experts are used. `0` skips it, `1` fills it in every run (#2109) |
