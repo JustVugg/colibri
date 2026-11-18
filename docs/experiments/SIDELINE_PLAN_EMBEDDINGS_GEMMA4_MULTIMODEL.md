@@ -801,37 +801,30 @@ reference forward path, using this exact Q4_K_M artifact and `llama-cli` as
 the output oracle. The `mmproj` file is intentionally excluded from this
 supporting-model milestone.
 
-### 7.10 External draft-model compatibility gate (2026-11-18)
+### 7.10 Independent supporting-model integration (2026-11-18)
 
-The requested command shape is:
+The intended command shape is conceptually:
 
 ```text
-coli serve --model <Qwen target> --draft-model <Gemma E2B>
+coli serve --model <Qwen target> --supporting-model <Gemma E2B>
 ```
 
-That is **not directly implementable as standard token-level speculative
-decoding** with these two checkpoints:
+Here “supporting model” means an independently addressable generation model;
+it is **not** a token-level speculative draft for Qwen. The client chooses
+which model to call, so the Qwen/Gemma tokenizer vocabularies do not need to
+match. The earlier draft-tokenizer mismatch finding is irrelevant to this
+serving mode and must not block it.
 
-- Qwen 3.6 target tokenizer vocabulary: **248,320** entries
-  (`qwen3_5_moe_text`).
-- Gemma 4 E2B draft vocabulary: **262,144** entries (`gemma4`).
-- The difference is **13,824** entries, and the token ID spaces are not
-  interchangeable. llama.cpp's external draft path requires matching token
-  identity and only tolerates a very small vocabulary-size difference.
+The current router already provides the client-choice surface when each model
+is served independently. The next value-add is a Colibri-managed generic GGUF
+delegate for architectures not yet native to Colibri:
 
-Therefore a Gemma token proposal cannot be fed directly into Qwen's verifier
-while preserving speculative-decoding correctness. A text-level bridge would
-need to detokenize Gemma proposals, retokenize them with Qwen's tokenizer, and
-define new acceptance/rollback semantics; that is a different algorithm, not
-the llama.cpp `--draft-model` contract.
+- launch a local `llama-server` child for the unsupported GGUF;
+- use `--load-mode mlock` (or an equivalent no-mmap/full-RAM policy) for the
+  supporting model;
+- register its OpenAI endpoint and model ID with the Colibri router;
+- keep the native Qwen `coli serve` process independent.
 
-**Decision gate:** do not add a `--draft-model` flag that appears to work but
-silently loses verification correctness. The viable paths are:
-
-1. use a Qwen-tokenized draft checkpoint for true speculative decoding;
-2. use Gemma as an independent supporting backend through the router; or
-3. explicitly design and measure a new text-bridge proposal algorithm.
-
-The full-RAM Gemma loader remains useful for option 2 and for investigating
-option 3, but it will not be wired as a standard Qwen draft until tokenizer
-compatibility is solved.
+The local machine has `/opt/homebrew/bin/llama-server`, and its help confirms
+`--load-mode mlock` for resident RAM loading. This gives the desired
+supporting-model behavior without pretending Gemma is a native Colibri family.
