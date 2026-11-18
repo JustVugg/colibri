@@ -596,8 +596,9 @@ F16 file; the accumulation order differs). Token ids for
 - **Loader:** `gguf.h` in-place reads of the Ollama blob; all 112 tensors
   converted to f32 and held in RAM (~550 MB, the laya.c convention).
 - **Tokenizer:** WordPiece from the embedded vocab (30522 entries,
-  insertion-sort + binary search), ASCII lowercase only — **no NFD accent
-  stripping yet** (documented limitation; keep oracle inputs ASCII).
+  insertion-sort + binary search), UTF-8 aware lowercase plus dependency-free
+  Latin accent decomposition/combining-mark removal. Non-Latin Unicode is
+  preserved for lookup in the embedded vocabulary.
 - **Forward:** post-norm BERT loop using laya.c's primitive shapes: fused
   QKV (no bias), per-sequence full attention, half-split rotary on every
   layer, biased layernorms, SiLU-gated MLP, no final norm.
@@ -651,8 +652,9 @@ verified.
 
 ### 7.5 Remaining for the embedding capability
 
-- WordPiece accent handling (NFD strip) and general UTF-8 normalization beyond
-  the current ASCII-lowercase implementation.
-- Tests should be promoted from the local oracle harness into the repository's
-  normal test suite.
+- Full Unicode normalization beyond the dependency-free Latin decomposition
+  currently implemented.
+- Permanent API contract tests now cover single input, batch input, and invalid
+  empty batches. A model-backed tokenizer/oracle fixture remains optional
+  because the Ollama blob is not part of the repository.
 - Then the Section 5.7 router, and Gemma 4 E2B (still parked).

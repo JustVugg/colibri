@@ -7,7 +7,7 @@
  *   1. loader: read the llama.cpp GGUF in place (gguf.h; nothing is mapped,
  *      tensors are converted to f32 and held in RAM, the laya.c convention);
  *   2. tokenizer: BERT WordPiece, built from the vocab embedded in the GGUF
- *      (ASCII lowercasing only -- no NFD accent stripping yet, documented);
+ *      (UTF-8 lowercasing with NFD-style Latin accent stripping);
  *   3. forward: the BERT post-norm encoder loop -- laya.c's primitives
  *      (fused-QKV gemm, full bidirectional attention, rotary, layernorm with
  *      optional bias, gated gelu MLP) composed in nomic-bert's order:
@@ -208,9 +208,159 @@ static void load_model(Nomic *M, gguf_ctx *G, const char *path)
 
 /* ------------------------------------------------------- tokenizer ------ */
 
-/* BERT WordPiece (bert-base-uncased style), ASCII-only lowercasing for now.
- * Accent stripping (NFD + combining-mark removal) is not implemented; the
- * oracle inputs avoid accented characters. Documented limitation. */
+/* BERT's BasicTokenizer applies NFD, removes combining marks, lowercases, and
+ * then lets WordPiece consume the result.  We keep this dependency-free:
+ * decode UTF-8 ourselves, cover the Latin blocks used by bert-base-uncased,
+ * and preserve other valid Unicode code points for the embedded vocabulary.
+ * This is intentionally not a general Unicode normalization library. */
+
+static int utf8_next(const char *s, size_t len, size_t *pos, uint32_t *out)
+{
+    size_t i = *pos;
+    uint32_t c;
+    int n;
+    if (i >= len) return 0;
+    unsigned char b = (unsigned char)s[i++];
+    if (b < 0x80) { c = b; n = 1; }
+    else if (b >= 0xc2 && b <= 0xdf && i < len &&
+             ((unsigned char)s[i] & 0xc0) == 0x80) {
+        c = ((uint32_t)(b & 0x1f) << 6) | ((unsigned char)s[i++] & 0x3f); n = 2;
+    } else if (b >= 0xe0 && b <= 0xef && i + 1 < len &&
+               ((unsigned char)s[i] & 0xc0) == 0x80 &&
+               ((unsigned char)s[i + 1] & 0xc0) == 0x80) {
+        c = ((uint32_t)(b & 0x0f) << 12) |
+            ((uint32_t)((unsigned char)s[i] & 0x3f) << 6) |
+            ((unsigned char)s[i + 1] & 0x3f);
+        i += 2; n = 3;
+    } else if (b >= 0xf0 && b <= 0xf4 && i + 2 < len &&
+               ((unsigned char)s[i] & 0xc0) == 0x80 &&
+               ((unsigned char)s[i + 1] & 0xc0) == 0x80 &&
+               ((unsigned char)s[i + 2] & 0xc0) == 0x80) {
+        c = ((uint32_t)(b & 7) << 18) |
+            ((uint32_t)((unsigned char)s[i] & 0x3f) << 12) |
+            ((uint32_t)((unsigned char)s[i + 1] & 0x3f) << 6) |
+            ((unsigned char)s[i + 2] & 0x3f);
+        i += 3; n = 4;
+    } else {
+        *pos = *pos + 1; *out = 0xfffd; return 1;
+    }
+    *pos = i; *out = c; return n;
+}
+
+static int utf8_put(char *out, size_t cap, size_t *n, uint32_t c)
+{
+    if (c < 0x80) {
+        if (*n + 1 >= cap) return 0; out[(*n)++] = (char)c;
+    } else if (c < 0x800) {
+        if (*n + 2 >= cap) return 0;
+        out[(*n)++] = (char)(0xc0 | (c >> 6));
+        out[(*n)++] = (char)(0x80 | (c & 0x3f));
+    } else if (c < 0x10000) {
+        if (*n + 3 >= cap) return 0;
+        out[(*n)++] = (char)(0xe0 | (c >> 12));
+        out[(*n)++] = (char)(0x80 | ((c >> 6) & 0x3f));
+        out[(*n)++] = (char)(0x80 | (c & 0x3f));
+    } else {
+        if (*n + 4 >= cap) return 0;
+        out[(*n)++] = (char)(0xf0 | (c >> 18));
+        out[(*n)++] = (char)(0x80 | ((c >> 12) & 0x3f));
+        out[(*n)++] = (char)(0x80 | ((c >> 6) & 0x3f));
+        out[(*n)++] = (char)(0x80 | (c & 0x3f));
+    }
+    return 1;
+}
+
+static int unicode_mark(uint32_t c)
+{
+    return (c >= 0x0300 && c <= 0x036f) ||
+           (c >= 0x1ab0 && c <= 0x1aff) ||
+           (c >= 0x1dc0 && c <= 0x1dff) ||
+           (c >= 0x20d0 && c <= 0x20ff) ||
+           (c >= 0xfe20 && c <= 0xfe2f);
+}
+
+/* Return the ASCII base for the Latin-1/Latin Extended-A letters commonly
+ * present in English-language BERT inputs, or zero when no decomposition is
+ * provided. */
+static uint32_t latin_base(uint32_t c)
+{
+    if (c >= 0x00c0 && c <= 0x00ff) {
+        switch (c) {
+        case 0x00c0 ... 0x00c5: case 0x00e0 ... 0x00e5: return 'a';
+        case 0x00c7: case 0x00e7: return 'c';
+        case 0x00c8 ... 0x00cb: case 0x00e8 ... 0x00eb: return 'e';
+        case 0x00cc ... 0x00cf: case 0x00ec ... 0x00ef: return 'i';
+        case 0x00d1: case 0x00f1: return 'n';
+        case 0x00d2 ... 0x00d6: case 0x00f2 ... 0x00f6:
+        case 0x00d8: case 0x00f8: return 'o';
+        case 0x00d9 ... 0x00dc: case 0x00f9 ... 0x00fc: return 'u';
+        case 0x00dd: case 0x00fd: case 0x00ff: return 'y';
+        default: return 0;
+        }
+    }
+    /* Extended-A is mostly alternating accented variants.  These mappings
+     * cover the precomposed characters emitted by common NFC input. */
+    switch (c) {
+    case 0x0100: case 0x0101: case 0x0102: case 0x0103: case 0x0104: case 0x0105: return 'a';
+    case 0x0106: case 0x0107: case 0x0108: case 0x0109: case 0x010a: case 0x010b:
+    case 0x010c: case 0x010d: return 'c';
+    case 0x010e: case 0x010f: case 0x0110: case 0x0111: return 'd';
+    case 0x0112: case 0x0113: case 0x0114: case 0x0115: case 0x0116: case 0x0117:
+    case 0x0118: case 0x0119: case 0x011a: case 0x011b: return 'e';
+    case 0x011c: case 0x011d: case 0x011e: case 0x011f: case 0x0120: case 0x0121:
+    case 0x0122: case 0x0123: return 'g';
+    case 0x0124: case 0x0125: case 0x0126: case 0x0127: return 'h';
+    case 0x0128: case 0x0129: case 0x012a: case 0x012b: case 0x012c: case 0x012d:
+    case 0x012e: case 0x012f: case 0x0130: case 0x0131: return 'i';
+    case 0x0132: case 0x0133: return 'i';
+    case 0x0134: case 0x0135: return 'j';
+    case 0x0136: case 0x0137: case 0x0138: return 'k';
+    case 0x0139: case 0x013a: case 0x013b: case 0x013c: case 0x013d: case 0x013e:
+    case 0x013f: case 0x0140: case 0x0141: case 0x0142: return 'l';
+    case 0x0143: case 0x0144: case 0x0145: case 0x0146: case 0x0147: case 0x0148:
+    case 0x0149: return 'n';
+    case 0x014a: case 0x014b: return 'n';
+    case 0x014c: case 0x014d: case 0x014e: case 0x014f: case 0x0150: case 0x0151: return 'o';
+    case 0x0152: case 0x0153: return 'o';
+    case 0x0154: case 0x0155: case 0x0156: case 0x0157: case 0x0158: case 0x0159: return 'r';
+    case 0x015a: case 0x015b: case 0x015c: case 0x015d: case 0x015e: case 0x015f:
+    case 0x0160: case 0x0161: return 's';
+    case 0x0162: case 0x0163: case 0x0164: case 0x0165: case 0x0166: case 0x0167: return 't';
+    case 0x0168: case 0x0169: case 0x016a: case 0x016b: case 0x016c: case 0x016d:
+    case 0x016e: case 0x016f: case 0x0170: case 0x0171: case 0x0172: case 0x0173: return 'u';
+    case 0x0174: case 0x0175: return 'w';
+    case 0x0176: case 0x0177: case 0x0178: return 'y';
+    case 0x0179: case 0x017a: case 0x017b: case 0x017c: case 0x017d: case 0x017e: return 'z';
+    default: return 0;
+    }
+}
+
+static int is_space_cp(uint32_t c)
+{
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
+           c == '\f' || c == '\v' || c == 0x00a0;
+}
+
+static int is_punct_cp(uint32_t c)
+{
+    return c < 128 && ispunct((int)c);
+}
+
+static size_t normalize_word(const char *src, size_t len, char *out, size_t cap)
+{
+    size_t pos = 0, n = 0;
+    while (pos < len) {
+        uint32_t c;
+        utf8_next(src, len, &pos, &c);
+        if (unicode_mark(c)) continue;
+        uint32_t base = latin_base(c);
+        if (base) c = base;
+        else if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+        if (!utf8_put(out, cap, &n, c)) break;
+    }
+    out[n] = 0;
+    return n;
+}
 
 static int vocab_find(Nomic *M, const char *s)
 {
@@ -275,7 +425,7 @@ static int wordpiece(Nomic *M, const char *w, int *ids, int cap)
     return n;
 }
 
-/* One input string -> ids with [CLS] ... [SEP]. ASCII input assumed. */
+/* One input string -> ids with [CLS] ... [SEP]. */
 static int tokenize(Nomic *M, const char *text, int *ids, int cap)
 {
     int n = 0;
@@ -285,17 +435,25 @@ static int tokenize(Nomic *M, const char *text, int *ids, int cap)
     char word[128];
     size_t i = 0;
     while (i < len) {
-        size_t w = 0;
-        if (is_space(text[i])) { i++; continue; }
-        if (is_punct(text[i])) {              /* punctuation: one token per char */
-            word[w++] = text[i]; i++;
-        } else {
-            size_t wstart = i;
-            while (i < len && !is_space(text[i]) && !is_punct(text[i])) {
-                if (w + 1 < sizeof word && (size_t)(i - wstart) < 100)
-                    word[w++] = (char)tolower((unsigned char)text[i]);
-                i++;
+        size_t w = 0, start = i;
+        uint32_t c;
+        size_t next = i;
+        utf8_next(text, len, &next, &c);
+        if (is_space_cp(c)) { i = next; continue; }
+        if (is_punct_cp(c)) {                 /* punctuation: one token per char */
+            if (next - i < sizeof word) {
+                memcpy(word, text + i, next - i);
+                w = next - i;
             }
+            i = next;
+        } else {
+            while (i < len) {
+                size_t p = i;
+                utf8_next(text, len, &p, &c);
+                if (is_space_cp(c) || is_punct_cp(c)) break;
+                i = p;
+            }
+            w = normalize_word(text + start, i - start, word, sizeof word);
         }
         word[w] = 0;
         int out[128], r = wordpiece(M, word, out, 128);
