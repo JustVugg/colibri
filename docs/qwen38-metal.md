@@ -1,8 +1,12 @@
 # Qwen3.8 on Metal: kernels (status)
 
-Status: the Metal kernels of the Qwen3.8 (`qwen38`) engine are written and tested. The
-engine does not use them yet: `qwen38` has no Metal graph, and `qwen38_metal.o` is not
-linked into it. Wiring the kernels into the engine is the next plan.
+Status: the Metal kernels of the Qwen3.8 (`qwen38`) engine are written and tested, and a
+`METAL=1` build runs the model's dense layers on them (`c/qwen38_metal_chain.h`, on by
+default, `COLI_METAL=0` the CPU engine): every layer, the final mixer and lm_head on the
+GPU, the routed experts on the CPU (M2). Prompt-lookup drafts are off beside the chain
+unless `COLI_LOOKUP=1`: the chain hands a verify to the CPU, the recurrent state down and up
+again. Debug-only switches: `Q38M_CHECK_WEIGHTS`, `Q38M_LAYER_CHECK`, `Q38M_DECLINE_EVERY`
+([ENVIRONMENT.md](ENVIRONMENT.md)).
 
 The kernels share the device, the command batch and the exact/fast switch of the Qwen3.6
 Metal path ([qwen36-metal.md](qwen36-metal.md)). `q38_gpu_init()` initializes qwen36's
@@ -51,8 +55,7 @@ builds): 1 hc_mix divisor, 2 PLE ring shift, 3 QSA tie order, 4 router tie order
 ## Exact and fast
 
 `q36_gpu_set_exact(1)` selects the exact kernels (fixed summation order, no `simd_sum`);
-the default is fast. `QWEN38_METAL_EXACT=1` will map to it once the engine uses these
-kernels ([ENVIRONMENT.md](ENVIRONMENT.md)). Kernels without a reduction that differs
+the default is fast. `QWEN38_METAL_EXACT=1` maps to it ([ENVIRONMENT.md](ENVIRONMENT.md)). Kernels without a reduction that differs
 (`hc_norm`, `ple_gate`, `qsa_*`, `attn_sel`) are the same kernel in both modes.
 
 ## Tolerances

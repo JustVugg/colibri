@@ -1129,6 +1129,9 @@ static void q38_df_attach(Model *m) {
 #else
 static int q38_df_on(void) { return 0; }
 #endif
+/* COLI_LOOKUP's default: on, off beside the Metal chain (Ruling P2-5: its verifies run on the CPU,
+ * each one the whole state down and up again); COLI_LOOKUP=1 drafts anyway */
+static int g_q38_lookup_default = 1;
 static Q38Spec q38_spec_begin(Model *m, const int *prompt, int np) {
     Q38Spec sp; memset(&sp, 0, sizeof sp);
     sp.on = m->mtp || q38_df_on();
@@ -1141,7 +1144,7 @@ static Q38Spec q38_spec_begin(Model *m, const int *prompt, int np) {
         else if (depth[0] >= '1' && depth[0] <= '0' + dmax && !depth[1]) sp.depth = depth[0] - '0';
         else { fprintf(stderr, "Q38_MTP_DRAFTS must be 1 to %d, or 0 (auto: the gate picks)\n", dmax); exit(1); }
     }
-    sp.lookup = q38_env_bool("COLI_LOOKUP", 1);   /* on by default, always gated (docs/speculative.md) */
+    sp.lookup = q38_env_bool("COLI_LOOKUP", g_q38_lookup_default);   /* on by default, always gated (docs/speculative.md) */
     sp.lookup_max = q38_env_positive_int("COLI_LOOKUP_DRAFTS", Q38_SPEC_ROWS - 1, Q38_SPEC_ROWS - 1);
     sp.lk_force = q38_spec_force_mode("COLI_LOOKUP_FORCE", getenv("COLI_LOOKUP_FORCE"), Q38_SPEC_ROWS - 1, 1,
                                       &sp.lk_force_row);
@@ -3795,6 +3798,13 @@ int main(int argc, char **argv) {
         m.mtp = 0;
         fprintf(stderr, "[qwen38-metal] speculative decoding with the MTP head: off (the Metal chain runs every layer; "
                         "Q38_MTP=1 drafts on the CPU engine)\n");
+    }
+    /* the chain declines a verify (its per-row state copies are the CPU's): prompt-lookup drafts
+     * would send every verify to the CPU, the recurrent state down and up again (Ruling P2-5) */
+    if (g_mtl_chain && !(getenv("COLI_LOOKUP") && *getenv("COLI_LOOKUP"))) {
+        g_q38_lookup_default = 0;
+        fprintf(stderr, "[qwen38-metal] prompt-lookup drafts: off (their verifies run on the CPU beside the Metal chain; "
+                        "COLI_LOOKUP=1 drafts anyway)\n");
     }
 #endif
     q38_trunk_cpu_int8(&m);    /* the trunk's int8 rows on the CPU, BF16 released (Q38_TRUNK_CPU_INT8=0 keeps BF16) */

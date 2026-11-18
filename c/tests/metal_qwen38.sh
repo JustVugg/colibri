@@ -24,9 +24,12 @@
 #   line, the chain's report with forwards > 0.
 # metal_state_handoff: Q38M_DECLINE_EVERY=2 (debug) declines every second step, so the CPU
 #   and the chain hand the state back and forth (q38m_cpu_step, the KV watermarks): the
-#   CPU's tokens.
+#   CPU's tokens and final logits (within 1e-4 x max), also on qwen38_decay (the tiny fixture
+#   with its DeltaNet decay raised to about 0.9, so the recurrent state counts).
+# lookup policy (Ruling P2-5): COLI_LOOKUP unset beside the chain gives one note line and no
+#   drafts; COLI_LOOKUP=1 with forced drafts runs its verifies on the CPU: the CPU's tokens.
 # kv growth: a 1,300-token prompt (qwen38_tiny with max_position_embeddings raised, a
-#   generated prompt): the device caches grow 256, 512, 1024, 2048; the CPU's tokens.
+#   generated prompt): the device caches grow 256, 512, 1024, 2048; the CPU's tokens and logits.
 # layer test: Q38M_LAYER_CHECK=1 (debug) runs the CPU's q38_layer_forward beside the first
 #   step and compares each layer's output streams, `[q38m-layer] L<i> worst=<e>` (max
 #   |gpu-cpu| over max |cpu|), FAIL over 1e-4, exact mode.
@@ -162,6 +165,12 @@ if len(a) != len(b) or not a: print("inf"); sys.exit()
 m = max(abs(x) for x in a)
 print("%.3g" % (max(abs(x - y) for x, y in zip(a, b)) / (m or 1.0)))' "$1" "$2"
 }
+# logits_ok <cpu name> <metal name>: DUMP logits within 1e-4 x max|logit|, or a FAIL line
+logits_ok() {
+    e=$(relerr "$tmp/$1.bin" "$tmp/$2.bin")
+    if awk -v e="$e" 'BEGIN { exit !(e <= 1e-4) }'; then return 0; fi
+    echo "FAIL [$2] final logits off by $e x max|logit| against $1"; fail=1; return 1
+}
 # chain_on <name>: no off line, the report with forwards > 0
 chain_on() {
     if grep -qF "$PREFIX" "$tmp/$1.log"; then echo "FAIL [$1] the chain is off:"; grep -F "$PREFIX" "$tmp/$1.log"; fail=1; return 1; fi
@@ -196,15 +205,38 @@ done
 eng m2_kvslots ./qwen38_tiny ./qwen38_tiny/ref.json KV_SLOTS=2 && chain_on m2_kvslots && echo "ok   [m2 KV_SLOTS=2 not a serve] chain on"
 
 echo "== metal_state_handoff"
-for fx in qwen38_tiny qwen38_tiny_256_gguf; do
+# qwen38_decay: qwen38_tiny with A_log = -1.88 and dt_bias = 0 in its DeltaNet layers, so the
+# recurrent state decays by about 0.9 a token (the fixture's own: about 1e-6, the state hardly
+# matters): a state the hand-off loses or applies twice moves the logits
+"${PYTHON:-python3}" -c '
+import struct, sys
+sys.path.insert(0, "tests")
+import safetensors_edit as se
+d = se.copy_fixture("qwen38_tiny", sys.argv[1])
+(d / ".coli_usage").unlink(missing_ok=True)
+bf = lambda x: struct.pack("<H", struct.unpack("<I", struct.pack("<f", x))[0] >> 16)
+for i in (0, 2):
+    for name, v in (("A_log", -1.88), ("dt_bias", 0.0)):
+        t = "model.layers.%d.linear_attn.%s" % (i, name)
+        n = se.shape_of(d, t)[0]
+        se.put(d, t, "BF16", [n], bf(v) * n)' "$tmp/qwen38_decay"
+eng cpu_decay "$tmp/qwen38_decay" "$tmp/qwen38_decay/ref.json" COLI_METAL=0 $REFP DUMP=$tmp/cpu_decay.bin
+for fx in qwen38_tiny qwen38_tiny_256_gguf decay; do
     nm=handoff_$fx
-    eng $nm ./$fx ./$fx/ref.json Q38M_DECLINE_EVERY=2 QWEN38_METAL_EXACT=1 $REFP || continue
+    case $fx in decay) dir=$tmp/qwen38_decay;; *) dir=./$fx;; esac
+    eng $nm $dir $dir/ref.json Q38M_DECLINE_EVERY=2 QWEN38_METAL_EXACT=1 $REFP DUMP=$tmp/$nm.bin || continue
     chain_on $nm || continue
     f=$(forwards $nm)
     if [ "${f#* }" -eq 0 ]; then echo "FAIL [$nm] nothing declined ($f)"; fail=1; continue; fi
     if [ "$(toks $nm)" != "$(toks cpu_$fx)" ]; then echo "FAIL [$nm] tokens '$(toks $nm)' vs '$(toks cpu_$fx)'"; fail=1; continue; fi
-    echo "ok   [$nm] the CPU's tokens (forwards, declined: $f)"
+    logits_ok cpu_$fx $nm || continue
+    echo "ok   [$nm] the CPU's tokens, logits within $(relerr "$tmp/cpu_$fx.bin" "$tmp/$nm.bin") x max (forwards, declined: $f)"
 done
+# the decay fixture's chain without declines, against the same CPU run
+if eng m2_decay $tmp/qwen38_decay $tmp/qwen38_decay/ref.json QWEN38_METAL_EXACT=1 $REFP DUMP=$tmp/m2_decay.bin && chain_on m2_decay &&
+   [ "$(toks m2_decay)" = "$(toks cpu_decay)" ] && logits_ok cpu_decay m2_decay; then
+    echo "ok   [m2_decay] the CPU's tokens, logits within $(relerr "$tmp/cpu_decay.bin" "$tmp/m2_decay.bin") x max"
+else [ "$(toks m2_decay)" = "$(toks cpu_decay)" ] || { echo "FAIL [m2_decay] tokens differ"; fail=1; }; fi
 
 echo "== kv growth"
 mkdir -p "$tmp/long"
@@ -220,10 +252,31 @@ for _ in range(1300):
     x = (x * 1103515245 + 12345) % 2**31
     ids.append(3 + x % 61)
 json.dump({"schema_version": 1, "prompt_ids": ids, "full_ids": ids + [3] * 8}, open(sys.argv[1] + "/ref.json", "w"))' "$tmp/long"
-if eng long_cpu "$tmp/long" "$tmp/long/ref.json" COLI_METAL=0 $REFP &&
-   eng long_mtl "$tmp/long" "$tmp/long/ref.json" QWEN38_METAL_EXACT=1 $REFP && chain_on long_mtl; then
-    if [ -n "$(toks long_cpu)" ] && [ "$(toks long_mtl)" = "$(toks long_cpu)" ]; then echo "ok   [kv growth 1300 tokens] the CPU's tokens: $(toks long_mtl)"
-    else echo "FAIL [kv growth 1300 tokens] '$(toks long_mtl)' vs the CPU's '$(toks long_cpu)'"; fail=1; fi
+if eng long_cpu "$tmp/long" "$tmp/long/ref.json" COLI_METAL=0 $REFP DUMP=$tmp/long_cpu.bin &&
+   eng long_mtl "$tmp/long" "$tmp/long/ref.json" QWEN38_METAL_EXACT=1 $REFP DUMP=$tmp/long_mtl.bin && chain_on long_mtl; then
+    if [ -z "$(toks long_cpu)" ] || [ "$(toks long_mtl)" != "$(toks long_cpu)" ]; then
+        echo "FAIL [kv growth 1300 tokens] '$(toks long_mtl)' vs the CPU's '$(toks long_cpu)'"; fail=1
+    elif logits_ok long_cpu long_mtl; then
+        echo "ok   [kv growth 1300 tokens] the CPU's tokens, logits within $(relerr "$tmp/long_cpu.bin" "$tmp/long_mtl.bin") x max: $(toks long_mtl)"
+    fi
+fi
+
+echo "== lookup policy"
+# Ruling P2-5: beside the chain, COLI_LOOKUP unset turns prompt-lookup drafts off with one note
+# (their verifies would run on the CPU); COLI_LOOKUP=1 keeps them, the verifies on the CPU
+NOTE='[qwen38-metal] prompt-lookup drafts: off'
+eng lk_default ./qwen38_tiny ./qwen38_tiny/ref.json
+n=$(grep -cF "$NOTE" "$tmp/lk_default.log")
+if [ "$n" -eq 1 ] && chain_on lk_default; then echo "ok   [lookup unset beside the chain] one note line"
+else echo "FAIL [lookup unset beside the chain] note lines: $n"; fail=1; fi
+eng lk_cpu ./qwen38_tiny ./qwen38_tiny/ref.json COLI_METAL=0 COLI_LOOKUP=1 COLI_LOOKUP_FORCE=mixed $REFP DUMP=$tmp/lk_cpu.bin
+eng lk_on ./qwen38_tiny ./qwen38_tiny/ref.json COLI_LOOKUP=1 COLI_LOOKUP_FORCE=mixed QWEN38_METAL_EXACT=1 $REFP DUMP=$tmp/lk_on.bin
+if grep -qF "$NOTE" "$tmp/lk_on.log" || grep -qF "$NOTE" "$tmp/lk_cpu.log"; then echo "FAIL [COLI_LOOKUP=1] the note with lookup asked for"; fail=1
+elif chain_on lk_on; then
+    f=$(forwards lk_on)
+    if [ "${f#* }" -eq 0 ]; then echo "FAIL [COLI_LOOKUP=1] no verify declined ($f)"; fail=1
+    elif [ -z "$(toks lk_cpu)" ] || [ "$(toks lk_on)" != "$(toks lk_cpu)" ]; then echo "FAIL [COLI_LOOKUP=1] '$(toks lk_on)' vs the CPU's '$(toks lk_cpu)'"; fail=1
+    elif logits_ok lk_cpu lk_on; then echo "ok   [COLI_LOOKUP=1 forced mixed drafts] the CPU's tokens, verifies on the CPU (forwards, declined: $f)"; fi
 fi
 
 echo "== layer test"

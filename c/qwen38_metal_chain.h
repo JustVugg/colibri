@@ -70,6 +70,21 @@ static void q38m_tail_srcs(const Model *m, const Q38Weight *w[Q38M_NT]) {
     w[0] = &m->final_gr.down; w[1] = &m->final_gr.up; w[2] = &m->final_gr.inject; w[3] = &m->lm_head;
 }
 
+/* A BF16 matrix q38_dot_bf16 does not take: more than 65535 outputs (its grid's rows; a
+ * checkpoint's BF16 lm_head over a large vocabulary). One with in % 8 != 0 goes up as F32. */
+static const Q38Weight *q38m_bf16_too_wide(const Model *m) {
+    const Q38Weight *w[Q38M_NW], *t[Q38M_NT];
+    for (int i = 0; i < m->c.layers; i++) {
+        q38m_layer_srcs(&m->L[i], w);
+        for (int j = 0; j < Q38M_NW; j++)
+            if (w[j]->kind == Q38_WEIGHT_BF16 && w[j]->cols % 8 == 0 && w[j]->rows > 65535) return w[j];
+    }
+    q38m_tail_srcs(m, t);
+    for (int j = 0; j < Q38M_NT; j++)
+        if (t[j]->kind == Q38_WEIGHT_BF16 && t[j]->cols % 8 == 0 && t[j]->rows > 65535) return t[j];
+    return NULL;
+}
+
 /* The first dense weight the chain cannot read, NULL when it reads them all. The
  * embedding stays on the host (its rows are gathered on the CPU). */
 static const Q38Weight *q38m_dense_unsupported(const Model *m) {
@@ -118,6 +133,9 @@ static int q38m_decide(Model *m, int slots) {
     else if ((bad = q38m_dense_unsupported(m))) {
         char kind[32];
         snprintf(buf, sizeof buf, "a dense weight of kind %s is not supported", q38m_kind_name(bad, kind, sizeof kind));
+        why = buf;
+    } else if ((bad = q38m_bf16_too_wide(m))) {
+        snprintf(buf, sizeof buf, "a BF16 matrix with %d outputs (the BF16 kernel takes 65535)", bad->rows);
         why = buf;
     } else {
         const char *device = q36_gpu_default_device_name();
@@ -478,12 +496,24 @@ static int q38m_kv_reserve(Model *m, int need) {
     int cap = g_q38f.dcap ? g_q38f.dcap : 256;
     while (cap < need) cap = cap < 1024 ? 2 * cap : cap + 1024;
     const size_t D = c->head_dim, KVH = c->kv_heads, ID = c->idx_dim, R = c->idx_ratio, es = g_q38f.half ? 2 : 4;
+    /* every layer's new buffers first: a refusal leaves every layer as it was */
+    q36_tensor **nb = (q36_tensor **)calloc((size_t)c->layers * 4, sizeof *nb);
+    int ok = nb != NULL;
+    for (int i = 0; ok && i < c->layers; i++) {
+        if (!c->is_attn[i]) continue;
+        q36_tensor **t = nb + (size_t)i * 4;
+        ok = (t[0] = q36_tensor_new(KVH * cap * D * es)) && (t[1] = q36_tensor_new(KVH * cap * D * es)) &&
+             (t[2] = q38m_new((size_t)cap * ID)) && (t[3] = q38m_new(((size_t)cap / R + 1) * ID));
+    }
+    if (!ok) {
+        if (nb) for (size_t k = 0; k < (size_t)c->layers * 4; k++) q36_tensor_free(nb[k]);
+        free(nb);
+        return 0;
+    }
     for (int i = 0; i < c->layers; i++) {
         if (!c->is_attn[i]) continue;
         Q38mL *L = &g_q38f.L[i];
-        q36_tensor *kc = q36_tensor_new(KVH * cap * D * es), *vc = q36_tensor_new(KVH * cap * D * es);
-        q36_tensor *ikc = q38m_new((size_t)cap * ID), *pk = q38m_new(((size_t)cap / R + 1) * ID);
-        if (!kc || !vc || !ikc || !pk) { q36_tensor_free(kc); q36_tensor_free(vc); q36_tensor_free(ikc); q36_tensor_free(pk); return 0; }
+        q36_tensor *kc = nb[(size_t)i * 4], *vc = nb[(size_t)i * 4 + 1], *ikc = nb[(size_t)i * 4 + 2], *pk = nb[(size_t)i * 4 + 3];
         int rows = L->kv_valid < g_q38f.dcap ? L->kv_valid : g_q38f.dcap;
         if (L->kc && rows > 0) {
             for (size_t h = 0; h < KVH; h++) {
@@ -496,6 +526,7 @@ static int q38m_kv_reserve(Model *m, int need) {
         q36_tensor_free(L->kc); q36_tensor_free(L->vc); q36_tensor_free(L->ikc); q36_tensor_free(L->pk);
         L->kc = kc; L->vc = vc; L->ikc = ikc; L->pk = pk;
     }
+    free(nb);
     g_q38f.dcap = cap;
     return 1;
 }
@@ -862,14 +893,24 @@ static int q38m_forward(Model *m, const int *ids, int S, int pos_base, int nlogi
     const int64_t hist0[2] = { m->ple_history[0], m->ple_history[1] };
     const int hlen0 = m->ple_history_len;
     const int check = g_q38f.layer_check && !g_q38m_forwards && pos_base == 0 && g_q38f.where == Q38M_HOST && g_q38f.host_zero;
+    /* every buffer the step needs, before anything is encoded or the host's state moves: a
+     * refusal here leaves the state as the step found it, and the CPU takes over (q38_forward
+     * then runs q38m_cpu_step, which brings the GPU's state down) */
+    if (!q38m_scratch(c, S < Q38M_CHUNK ? S : Q38M_CHUNK) || !q38m_kv_reserve(m, pos_base + S) ||
+        !q38m_grow(&g_q38f.logits, &g_q38f.logit_floats, (size_t)nlogits * V)) {
+        char why[128];
+        snprintf(why, sizeof why, "device memory for a step of %d rows at position %d was refused", S, pos_base);
+        q38m_off(why);
+        g_mtl_chain = 0;
+        g_q38m_declined++;
+        return 0;
+    }
     if (check) q38m_layer_check_ref(m, ids, S, pos_base, hyper_h);
-    if (!q38m_grow(&g_q38f.logits, &g_q38f.logit_floats, (size_t)nlogits * V)) { g_q38m_declined++; return 0; }
     const char *what = NULL;
     int failed_layer = -1, lo_first = S - nlogits, c0;
     for (c0 = 0; c0 < S; c0 += Q38M_CHUNK) {
         if (coli_prompt_break()) { g_q38m_declined++; return 0; }   /* a served prompt's stop, between two chunks */
         const int n = S - c0 < Q38M_CHUNK ? S - c0 : Q38M_CHUNK, pb = pos_base + c0;
-        if (!q38m_scratch(c, n) || !q38m_kv_reserve(m, pb + n)) { what = "device memory for a chunk"; goto fail; }
         memcpy(q36_tensor_data(g_q38f.hyper), hyper_h + (size_t)c0 * W, (size_t)n * W * sizeof(float));
         q38m_push(m, pb);
         if (q38m_has_ple(c)) q38m_ple_rows(m, ids, c0, n, q38m_f(g_q38f.emb));
@@ -938,11 +979,12 @@ fail:
     {
         char why[192];
         snprintf(why, sizeof why, "%s of layer %d at position %d did not run on the GPU", what ? what : "a step", failed_layer, pos_base);
+        if (was_dev || c0 > 0) {   /* the recurrent state moved on the GPU only: nothing to hand the CPU */
+            fprintf(stderr, "[qwen38-metal] the Metal chain failed: %s; the recurrent state is on the GPU only, "
+                            "stopping\n", why);
+            exit(1);
+        }
         q38m_off(why);
-    }
-    if (was_dev || c0 > 0) {
-        fprintf(stderr, "[qwen38-metal] the recurrent state is on the GPU only: stopping\n");
-        exit(1);
     }
     m->ple_history[0] = hist0[0]; m->ple_history[1] = hist0[1]; m->ple_history_len = hlen0;
     g_q38f.where = Q38M_HOST; g_q38f.host_zero = 0;
