@@ -1286,6 +1286,20 @@ tests/test_qwen38_metal_kernels: tests/test_qwen38_metal_kernels.c qwen38_gpu.h 
 test-qwen38-metal-kernels: tests/test_qwen38_metal_kernels
 	./tests/test_qwen38_metal_kernels
 
+# The 256-wide tiny fixture as a GGUF (qwen4exp, Q8_0 experts and trunk, BF16 indexer, F32
+# norms), imported in link mode: qwen38_tiny_256_gguf/ holds model.gguf, the importer's
+# config.json and tokenizer, and a ref.json rebased onto the CPU engine's tokens and logits
+# on that GGUF (--rebase-ref; the safetensors source's own ref.json is left alone). PYTHON needs
+# gguf, torch, transformers 5.16.1 and safetensors (local-llm/.venv-fixtures).
+.PHONY: qwen38-tiny-gguf-generate
+qwen38-tiny-gguf-generate: qwen38$(EXE)
+	@test -f qwen38_tiny_256/model.safetensors || $(PYTHON) tools/make_qwen38_tiny.py --out ./qwen38_tiny_256 --geometry gguf-256
+	rm -rf qwen38_tiny_256_gguf && mkdir qwen38_tiny_256_gguf
+	$(PYTHON) tools/make_qwen38_tiny_gguf.py ./qwen38_tiny_256 ./qwen38_tiny_256_gguf/model.gguf
+	$(PYTHON) tools/gguf_import.py ./qwen38_tiny_256_gguf/model.gguf ./qwen38_tiny_256_gguf --mode link
+	cp qwen38_tiny_256/ref.json qwen38_tiny_256_gguf/ref.json
+	$(PYTHON) tools/make_qwen38_tiny_gguf.py --rebase-ref ./qwen38$(EXE) ./qwen38_tiny_256_gguf
+
 # The qwen38 engine's Metal chain on the tiny fixtures (tests/metal_qwen38.sh):
 # its startup decision and the CPU engine it leaves unchanged.
 .PHONY: test-qwen38-metal-engine

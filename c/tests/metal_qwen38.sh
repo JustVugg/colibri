@@ -6,6 +6,9 @@
 # decide reasons: every startup case the Metal chain does not run turns it off with
 #   its one line, and the CPU engine's tokens are the reference's.
 # cpu unchanged: qwen38-tiny-check passes on the METAL=1 binary with COLI_METAL=0.
+# gguf fixture cpu: the CPU engine on the tiny GGUF (qwen38_tiny_256_gguf, imported in
+#   link mode from the safetensors fixture qwen38_tiny_256) gives the same tokens as on
+#   its safetensors source, and matches the GGUF's own ref.json (rebased onto the CPU).
 set -u
 cd "$(dirname "$0")/.." || exit 1
 fail=0
@@ -53,5 +56,19 @@ else
     echo "FAIL [qwen38-tiny-check COLI_METAL=0]"; tail -5 "$log"; fail=1
 fi
 rm -f "$log"
+
+echo "== gguf fixture cpu"
+if make -s qwen38-tiny-gguf-generate PYTHON="${PYTHON:-python3}" >/dev/null 2>&1; then
+    # the GGUF against the safetensors source: the same tokens from the CPU engine
+    # (the source's ref.json is the PyTorch reference, which the engine itself does not
+    # reproduce past token 5 on this geometry; the GGUF's ref.json is the CPU's on it)
+    toks() { env COLI_METAL=0 OMP_NUM_THREADS=2 SNAP=./$1 ./qwen38 1 8 ./$1/ref.json 2>&1 | grep '^C engine'; }
+    a=$(toks qwen38_tiny_256); b=$(toks qwen38_tiny_256_gguf)
+    if [ -n "$a" ] && [ "$a" = "$b" ]; then echo "ok   [gguf fixture cpu] same tokens as the safetensors source: $b"
+    else echo "FAIL [gguf fixture cpu] source '$a' vs gguf '$b'"; fail=1; fi
+    run qwen38_tiny_256_gguf "COLI_METAL=0" COLI_METAL=0
+else
+    echo "FAIL gguf fixture generation"; fail=1
+fi
 
 [ $fail -eq 0 ] && echo "metal_qwen38: PASS" || { echo "metal_qwen38: FAIL"; exit 1; }
