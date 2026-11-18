@@ -30,6 +30,9 @@
 # layer test: Q38M_LAYER_CHECK=1 (debug) runs the CPU's q38_layer_forward beside the first
 #   step and compares each layer's output streams, `[q38m-layer] L<i> worst=<e>` (max
 #   |gpu-cpu| over max |cpu|), FAIL over 1e-4, exact mode.
+# serve: tests/metal_qwen38_serve.py (two turns, a regenerated answer, a parked conversation:
+#   every served step's logits against a fresh engine's; KV_SLOTS=2 in a serve), then
+#   tests/test_qwen38_prefix_serve.py and test_qwen38_prefix_store.py with the chain on.
 set -u
 cd "$(dirname "$0")/.." || exit 1
 fail=0
@@ -233,6 +236,22 @@ for fx in qwen38_tiny qwen38_tiny_256_gguf; do
     fi
     worst=$(grep '^\[q38m-layer\] L' "$tmp/$nm.log" | sed 's/.*worst=\([^ ]*\).*/\1/' | sort -g | tail -1)
     echo "ok   [$nm] $n layers, worst $worst"
+done
+
+echo "== serve"
+"${PYTHON:-python3}" tests/metal_qwen38_serve.py || fail=1
+# the engine's own prefix suites (the live state, the snapshot, the pins, the parked
+# conversation, the cancels; the store's checkpoints and rows) with the chain on: they reach
+# every state hook (q38m_sync_host, q38m_host_wrote, q38m_rollback)
+mkdir -p "$tmp/tok"
+for f in qwen38_tiny/*; do ln -s "$PWD/$f" "$tmp/tok/"; done
+"${PYTHON:-python3}" tools/make_edge_tiny_tokenizer.py --vocab-size 64 "$tmp/tok" >/dev/null
+for t in test_qwen38_prefix_serve test_qwen38_prefix_store; do
+    if QWEN38_TINY="$tmp/tok" "${PYTHON:-python3}" -W ignore tests/$t.py > "$tmp/$t.log" 2>&1; then
+        echo "ok   [$t on the chain] $(grep '^Ran' "$tmp/$t.log")"
+    else
+        echo "FAIL [$t on the chain]"; grep -E '^(FAIL|ERROR):' "$tmp/$t.log"; fail=1
+    fi
 done
 
 [ $fail -eq 0 ] && echo "metal_qwen38: PASS" || { echo "metal_qwen38: FAIL"; exit 1; }

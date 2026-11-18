@@ -5423,6 +5423,9 @@ static void reset_recurrent(Model *m) {
 #ifdef COLI_CUDA
     q38cc_host_wrote(m,1);
 #endif
+#ifdef QWEN38_METAL
+    q38m_host_wrote(m,1);
+#endif
 }
 
 static void ensure_kv(Model *m) {
@@ -6159,6 +6162,9 @@ static void q38_spec_rollback(Model *m,int len,int keep) {
 #endif
 #ifdef COLI_CUDA
     q38cc_rollback(m,slot,len);
+#endif
+#ifdef QWEN38_METAL
+    q38m_rollback(m,slot,len);   /* the verify ran on the CPU (the chain declines one): the host's state */
 #endif
     for(int i=0;i<c->layers;i++)if(!c->is_attn[i]){
         float *t=m->DN_rec[i];m->DN_rec[i]=m->snap_rec[slot][i];m->snap_rec[slot][i]=t;

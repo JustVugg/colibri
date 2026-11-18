@@ -1658,6 +1658,9 @@ static int q38_pin_state_copy(Model *m, Q38PinState **slot, int to_state){
 #ifdef COLI_CUDA
     if (to_state) q38cc_sync_host(m);
 #endif
+#ifdef QWEN38_METAL
+    if (to_state) q38m_sync_host(m);   /* the Metal chain keeps the newest state on the GPU */
+#endif
     if (!q38_prefix_geometry(m, &rec, &conv, &ple)) return 0;
     Q38PinState *st = *slot;
     if (st && st->n_layers != c->layers){ q38_pin_state_free(st); st = NULL; }
@@ -1713,6 +1716,9 @@ static int q38_pin_state_copy(Model *m, Q38PinState **slot, int to_state){
 #endif
 #ifdef COLI_CUDA
     if (!to_state) q38cc_host_wrote(m, 0);
+#endif
+#ifdef QWEN38_METAL
+    if (!to_state) q38m_host_wrote(m, 0);
 #endif
     return 1;
 }
@@ -1840,6 +1846,10 @@ static void q38_prefix_copy_state(Model *m,int to_cache){
 #ifdef COLI_CUDA
     if(to_cache)q38cc_sync_host(m);
     else q38cc_host_wrote(m,0);
+#endif
+#ifdef QWEN38_METAL
+    if(to_cache)q38m_sync_host(m);
+    else q38m_host_wrote(m,0);
 #endif
     }
     for(int i=0;i<m->c.layers&&!dev;i++)if(!m->c.is_attn[i]){
@@ -2233,6 +2243,9 @@ static void q38_unpark(Model *m){
     q38cc_rollback(m,-1,0);
     q38cc_mtp_host(m,0);
 #endif
+#ifdef QWEN38_METAL
+    q38m_rollback(m,-1,0);   /* the rows came back on the host: the GPU takes them all up again */
+#endif
     if(getenv("COLI_PREFIX_LOG"))fprintf(stderr,"[PREFIX] the %d-token conversation is back\n",g_q38_park.len);
     q38_park_free_rows();
 }
@@ -2373,6 +2386,9 @@ static int q38_ps_take_ram(Model *m,const int *ids,int np,int held,int floor){
 #ifdef COLI_CUDA
     q38cc_rollback(m,-1,keep);
     q38cc_mtp_host(m,keep);
+#endif
+#ifdef QWEN38_METAL
+    q38m_rollback(m,-1,keep);   /* the GPU's rows past what stayed go up again */
 #endif
     if(getenv("COLI_PREFIX_LOG")){
         fprintf(stderr,"[PREFIX] %d of %d prompt tokens from the store (%d blocks of %d and a checkpoint, %d rows in place; the slot held %d)\n",
@@ -2783,6 +2799,9 @@ static int q38_psd_restore(Model *m,const char *path,const int *ids,int P,int np
 #ifdef COLI_CUDA
     q38cc_rollback(m,-1,0);
     q38cc_mtp_host(m,0);
+#endif
+#ifdef QWEN38_METAL
+    q38m_rollback(m,-1,0);   /* every row came from the file */
 #endif
     rc=ok?P:-1;
 out:
