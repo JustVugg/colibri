@@ -1,0 +1,59 @@
+C25 MTP re-quantification verdict — IQ2_XXS, current C24 build
+(2026-11-18; `c25_mtp_probe_launch.sh`, `c25_mtp_probe.py`,
+`phaseC25_mtp_probe.jsonl`; OMP=6; two alternating pairs)
+
+QUESTION
+Does the existing GGUF-native MTP head now pay on the C24-fused IQ2_XXS
+verify path, despite the pre-C18 negative result?
+
+DESK / FILE / LOADER CHECK: PASS
+- IQ2 GGUF metadata: `qwen35moe.nextn_predict_layers=1`.
+- 753 indexed tensors, including 20 MTP-related tensors; complete
+  `blk.40.nextn.*` head metadata/tensors present.
+- `qwen36_mtp.h` has the GGUF-native loader. Historical logs for this exact
+  file/model show successful attach and drafting. Runtime A/B again logged
+  `[mtp] GGUF-native head (blk.40.nextn)` and 278 MB of resident routed
+  expert weights.
+- No implementation work was needed. MTP is opt-in with `Q36_MTP=1`;
+  canonical service leaves it off.
+
+PROTOCOL
+- Same selected IQ2_XXS container and current engine binary for every arm.
+- MTP off/on/off/on was interleaved as off1 → on1 → on2 → off2, each arm a
+  fresh server process; OMP_NUM_THREADS=6, `COLI_PROMPT_CACHE=0`,
+  `COLI_LOOKUP=0`, greedy temperature 0.
+- One identical 39-token prompt, 256 output tokens each run (completion
+  usage 256); all four responses SHA-256
+  `395832522d8d57afa11fbda85aaac1fc0d5789b9b5542df61b6f5508b07abc0b`.
+- This is a focused probe (one prompt, two paired reads), not a broad
+  workload distribution. TTFT is not judged here: prompt is short and the
+  measured prefill varied between restarts.
+
+RESULT: MTP LOSES
+                         MTP off     MTP on
+  pair 1 decode tok/s     11.444      9.629   (on/off 0.841x, -15.9%)
+  pair 2 decode tok/s     11.111      9.767   (on/off 0.879x, -12.1%)
+  mean decode tok/s       11.278      9.698   (on/off 0.860x, -14.0%)
+  mean client duration    25.607 s    28.986 s (+13.2%)
+
+MTP mechanics on this prompt:
+- 132 drafts; 122 accepted (92.4%), yielding 1.92 tokens/forward over
+  255 engine-counted output tokens.
+- Head row 10.00–10.14 ms; fed KV row 0.19–0.20 ms.
+- Gate T(1) 82.4–85.2 ms; 278 MB expert slab resident.
+- Greedy response was byte-identical with MTP enabled and disabled.
+
+INTERPRETATION / DECISION
+High acceptance and fewer backbone forwards did not translate to request
+throughput: both paired reads show MTP 12–16% slower. This agrees with the
+historical pre-C18 result (plain 14.43–14.59 vs MTP 12.99–13.59 tok/s);
+the C24 fused verify path has not flipped the sign. Keep `Q36_MTP` off.
+Do not expand to IQ3/Q4_K_M or optimize the head absent a new mechanism
+that materially reduces verify/draft cost. The single-prompt result is
+directional, but the paired loss is larger than observed within-run
+variation and consistent with prior evidence.
+
+SERVICE RESTORE
+Canonical IQ2_XXS service restored on :8001 with OMP=6, Q36_MTP=0,
+prompt cache ON, and `/health` returned `{"status":"ok"}`. Log:
+`serve-restored-c25-mtp.log`.
