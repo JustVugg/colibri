@@ -2722,6 +2722,50 @@ static int test_route_bf16_parallel_order(void) {
     return 0;
 }
 
+/* V4_ROUTE_FORCED_ONLY: a hash layer's router computes only the forced
+ * experts' gate logits; the weights and ids are the same bits as the full
+ * computation, a bad forced id still fails, and unforced routing is untouched. */
+static int test_route_bf16_forced_only(void) {
+    enum { EXPERTS = 64, DIM = 256, TOPK = 6 };
+    static uint16_t packed[EXPERTS * DIM];
+    float hidden[DIM], bias[EXPERTS];
+    float full[2][TOPK], only[2][TOPK];
+    int full_ids[2][TOPK], only_ids[2][TOPK];
+    int forced[TOPK] = {41, 3, 17, 63, 0, 29};
+    int bad[TOPK] = {41, 3, 17, 64, 0, 29};
+    for (int i = 0; i < EXPERTS * DIM; i++) {
+        float value = (i * 37 % 53 - 26) * 0.0117f;
+        uint32_t bits; memcpy(&bits, &value, sizeof(bits));
+        packed[i] = (uint16_t)(bits >> 16);
+    }
+    for (int i = 0; i < DIM; i++) hidden[i] = (i % 19 - 9) * 0.0213f;
+    for (int i = 0; i < EXPERTS; i++) bias[i] = (i % 7) * 0.01f;
+    int failed = 0;
+    setenv("V4_ROUTE_FORCED_ONLY", "0", 1);
+    if (coli_v4_route_forced_only_reload() != 0) failed = 1;
+    for (int mode = 0; mode < 2 && !failed; mode++)
+        if (coli_v4_route_bf16(full[mode], full_ids[mode], hidden, packed, bias,
+                               mode ? forced : NULL, EXPERTS, DIM, TOPK, 2.5f))
+            failed = 1;
+    for (int setting = 1; setting <= 2 && !failed; setting++) {
+        setenv("V4_ROUTE_FORCED_ONLY", setting == 1 ? "1" : "2", 1);
+        if (coli_v4_route_forced_only_reload() != setting) { failed = 1; break; }
+        for (int mode = 0; mode < 2 && !failed; mode++)
+            if (coli_v4_route_bf16(only[mode], only_ids[mode], hidden, packed,
+                                   bias, mode ? forced : NULL, EXPERTS, DIM,
+                                   TOPK, 2.5f) ||
+                memcmp(only[mode], full[mode], sizeof(only[mode])) ||
+                memcmp(only_ids[mode], full_ids[mode], sizeof(only_ids[mode])))
+                failed = 1;
+        if (!failed && !coli_v4_route_bf16(only[1], only_ids[1], hidden, packed,
+                                           bias, bad, EXPERTS, DIM, TOPK, 2.5f))
+            failed = 1;
+    }
+    unsetenv("V4_ROUTE_FORCED_ONLY");
+    coli_v4_route_forced_only_reload();
+    return failed;
+}
+
 static int test_sparse_attention_parallel_order(void) {
     enum { HEADS = 7, DIM = 32, KV = 19, TOPK = 17 };
     float query[HEADS * DIM], kv[KV * DIM], sinks[HEADS];
@@ -2790,7 +2834,8 @@ static int test_fp8_decode_batch_order(void) {
 
 int main(int argc, char **argv) {
     if (test_fp8_decode_batch_order() || test_sparse_attention_parallel_order() ||
-        test_route_bf16_parallel_order() || test_fp8_grouped_projection()) return 1;
+        test_route_bf16_parallel_order() || test_route_bf16_forced_only() ||
+        test_fp8_grouped_projection()) return 1;
     if (test_attention_cache() != 0) {
         fprintf(stderr, "FAIL: test_attention_cache\n");
         return 1;

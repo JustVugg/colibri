@@ -12116,6 +12116,7 @@ int coli_v4_expert_forward_batch_ref(float *outputs,
 /* ######## deepseek_v4_route_bf16.c ######## */
 #include <math.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #ifdef COLI_VULKAN
@@ -12133,12 +12134,36 @@ static float route_softplus(float value) {
     return fmaxf(value, 0.0f) + log1pf(expf(-fabsf(value)));
 }
 
+/* V4_ROUTE_FORCED_ONLY (off): a hash layer's router (forced indices: the
+ * experts come from the token table) uses only the forced experts' scores, yet
+ * computed all `experts` gate dot products. 1 = compute only the forced ones
+ * on the CPU path (each score is the same serial dot product, so the weights
+ * are the same bits); 2 = 1 and also the full set, compared bit for bit
+ * (`routeforced verify` lines: every mismatch, and a count every 4,096
+ * checks). Device and precomputed logits are unchanged. */
+static int route_forced_mode = -1;
+
+int coli_v4_route_forced_only_reload(void) {
+    const char *setting = getenv("V4_ROUTE_FORCED_ONLY");
+    int value = setting && *setting ? atoi(setting) : 0;
+    route_forced_mode = value == 1 || value == 2 ? value : 0;
+    return route_forced_mode;
+}
+
+static int route_forced_only_mode(void) {
+    return route_forced_mode < 0 ? coli_v4_route_forced_only_reload()
+                                 : route_forced_mode;
+}
+
 /* `logits`, when not NULL, are this position's gate logits already computed (a
- * prefill's batch projects them in one device call); NULL computes them here. */
-static int route_bf16_impl(float *weights, int *indices, const float *hidden,
+ * prefill's batch projects them in one device call); NULL computes them here.
+ * `forced_only`: with forced indices and CPU logits, only the forced experts'
+ * dot products are computed (the others' scores are never read). */
+static int route_bf16_core(float *weights, int *indices, const float *hidden,
                            const uint16_t *gate, const float *bias,
                            const int *forced_indices, int experts, int dimension,
-                           int topk, float route_scale, const float *logits) {
+                           int topk, float route_scale, const float *logits,
+                           int forced_only) {
     if (!weights || !indices || !hidden || !gate || experts < 1 ||
         dimension < 1 || topk < 1 || topk > experts) return -1;
     float scores_buf[COLI_V4_ROUTE_STACK_EXPERTS];
@@ -12163,8 +12188,19 @@ static int route_bf16_impl(float *weights, int *indices, const float *hidden,
 #else
     int cpu_logits = !logits;
 #endif
-    #pragma omp parallel for schedule(static) if(cpu_logits && experts >= 32 && dimension >= 128)
+    /* `selected` is the top-k's mask, unused with forced indices: here it
+     * marks the forced experts (range-checked again below). */
+    forced_only = forced_only && forced_indices && cpu_logits;
+    if (forced_only)
+        for (int rank = 0; rank < topk; rank++)
+            if (forced_indices[rank] >= 0 && forced_indices[rank] < experts)
+                selected[forced_indices[rank]] = 1;
+    #pragma omp parallel for schedule(static) if(cpu_logits && !forced_only && experts >= 32 && dimension >= 128)
     for (int expert = 0; expert < experts; expert++) {
+        if (forced_only && !selected[expert]) {
+            scores[expert] = selection[expert] = 0.0f;
+            continue;
+        }
         float sum = 0.0f;
         const uint16_t *row = gate + (size_t)expert * dimension;
         if (logits) sum = logits[expert];
@@ -12208,6 +12244,35 @@ static int route_bf16_impl(float *weights, int *indices, const float *hidden,
         weights[rank] = scores[indices[rank]] / total * route_scale;
     if (!on_stack) { free(selected); free(selection); free(scores); }
     return 0;
+}
+
+static int route_bf16_impl(float *weights, int *indices, const float *hidden,
+                           const uint16_t *gate, const float *bias,
+                           const int *forced_indices, int experts, int dimension,
+                           int topk, float route_scale, const float *logits) {
+    int mode = forced_indices && !logits ? route_forced_only_mode() : 0;
+    int result = route_bf16_core(weights, indices, hidden, gate, bias,
+                                 forced_indices, experts, dimension, topk,
+                                 route_scale, logits, mode != 0);
+    if (mode == 2 && !result && topk <= 32) {
+        static unsigned long long checked, mismatched;
+        float full_weights[32];
+        int full_indices[32];
+        int full = route_bf16_core(full_weights, full_indices, hidden, gate,
+                                   bias, forced_indices, experts, dimension,
+                                   topk, route_scale, logits, 0);
+        int differ = full != 0 ||
+            memcmp(full_weights, weights, (size_t)topk * sizeof(*weights)) ||
+            memcmp(full_indices, indices, (size_t)topk * sizeof(*indices));
+        unsigned long long n = __atomic_add_fetch(&checked, 1, __ATOMIC_RELAXED);
+        unsigned long long bad = differ ?
+            __atomic_add_fetch(&mismatched, 1, __ATOMIC_RELAXED) :
+            __atomic_load_n(&mismatched, __ATOMIC_RELAXED);
+        if (differ || (n & 4095) == 0)
+            fprintf(stderr, "routeforced verify checked=%llu mismatches=%llu%s\n",
+                    n, bad, differ ? " (this one differs)" : "");
+    }
+    return result;
 }
 
 int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
