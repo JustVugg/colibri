@@ -1,0 +1,41 @@
+{
+  "prompt_tokens": 10924,
+  "completion_tokens": 1,
+  "timings": {
+    "request_prepare_s": 0.0007674990338273346,
+    "queue_wait_s": 2.516701351851225e-05,
+    "engine_submit_to_accept_s": 0.025373666954692453,
+    "accept_to_first_output_s": 344.2370023750118,
+    "engine_ttft_s": 344.2623760419665,
+    "engine_call_s": 344.2650671249721,
+    "request_to_engine_done_s": 344.26585979101947,
+    "decode_tokens_per_sec": 371.5976050935994,
+    "prefill_s": 344.225276,
+    "prompt_tokens": 10924,
+    "reused_prompt_tokens": 0,
+    "tokenize_s": 0.025171,
+    "prefix_match_s": 0.0,
+    "snapshot_restore_s": 0.0,
+    "snapshot_store_s": 0.0,
+    "prefill_embedding_s": 0.010716,
+    "prefill_chunk_count": 1,
+    "prefill_chunk_avg_s": 344.177802,
+    "prefill_chunk_max_s": 344.177802,
+    "prefill_deltanet_s": 102.345453,
+    "prefill_attention_s": 54.404797,
+    "prefill_moe_s": 184.849125,
+    "prefill_shared_s": 12.920134,
+    "prefill_router_s": 7.788696,
+    "prefill_lm_head_s": 0.036716,
+    "first_sample_s": 2.8e-05,
+    "first_emit_after_prefill_s": 0.000449,
+    "prefix_reuse_source": "none",
+    "prefix_reuse_miss": "no_live_state"
+  },
+  "usage": {
+    "prompt_tokens": 10924,
+    "completion_tokens": 1,
+    "total_tokens": 10925
+  },
+  "answer": "$"
+}

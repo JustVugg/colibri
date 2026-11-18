@@ -1,0 +1,48 @@
+C25 DeltaNet prefill profiling verdict — IQ2_XXS
+(2026-11-18; cold cache-off request, OMP=6)
+
+Question
+--------
+How much of a representative cold prefill is DeltaNet, and which broad
+DeltaNet stages warrant further study before any kernel change?
+
+Workload and outcome
+--------------------
+- One fixed ledger prompt; 10,924 prompt tokens, 1 generated token.
+- Cold prefill: 344.2 s (0 reused prompt tokens); TTFT 344.3 s.
+- Component timers: DeltaNet 102.3 s (~29.7%), attention 54.4 s, MoE
+  184.8 s, shared 12.9 s, router 7.8 s. These diagnostics overlap and
+  are not additive.
+- Request-scoped DeltaNet stage timers:
+  input projections 56.0 s; convolution 10.7 s; recurrent state update
+  plus norm 16.0 s; output projection 19.6 s.
+- The input projection bucket includes the large qkv/z projections and
+  the smaller alpha/beta projections. It is therefore a direction for
+  further study, not a subprojection-level attribution.
+- A 30-second macOS `sample` was captured during the request. Its samples
+  were predominantly MoE; `gq_row_all` and `matmul_q_idot` were hot in the
+  process but cannot be attributed to DeltaNet from this sample.
+
+Verdict
+-------
+DeltaNet is material to cold-prefill time, and input projections are its
+largest measured stage. No production optimization or kernel A/B was run:
+the evidence does not isolate an individual input projection or establish
+a correctness-preserving optimization opportunity / expected gain. The
+profiling-only timers are gated by COLI_TIMERS and inactive by default, so
+retain them for a future subprojection study. If pursuing that study, first
+split qkv, z, alpha, and beta timings, then require bit-exact validation and
+a representative A/B before adopting any kernel.
+
+Artifacts
+---------
+- phaseC25_dn_profile_12k.json — request-level timings and answer.
+- phaseC25_dn_profile.sample.txt — 30-second CPU sample.
+- serve-c25-dn-profile.log — instrumented server log (contains request stage
+  timers).
+- serve-restored-c25-dn.log — restored canonical service startup.
+- c25_dn_profile.py / c25_dn_profile_launch.sh — reproducible request and
+  launch/restore scripts.
+
+Canonical IQ2_XXS service was restored with prompt cache enabled and
+verified healthy on 127.0.0.1:8001 after the profiling run.

@@ -1585,6 +1585,7 @@ static double tm_now(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&t
 static int tm_on(void){ if(g_timers<0){ const char *e=getenv("COLI_TIMERS"); g_timers = (e && *e=='1'); } return g_timers; }
 double g_qt_iss=0, g_qt_cpu=0, g_qt_tak=0;   /* QTIER-Phasen (Decode) */
 double g_dn_sub[4];                           /* DN: proj, conv+split, l2n+rec, norm+out */
+static double g_dn_pre_sub[4];                 /* prefill DN: proj, conv, state+norm, out_proj */
 double g_tm_step=0;                           /* step() total (decode) */
 static double g_xf_load=0, g_xf_run=0;        /* expert_ffn path: expert fetch (misses) vs compute, decode */
 static double g_tm_win_moe=0; static int g_tm_win_n=0;
@@ -1616,6 +1617,9 @@ static void tm_report(void){
     if(g_dn_sub[0]+g_dn_sub[1]+g_dn_sub[2]+g_dn_sub[3]>0)
         fprintf(stderr,"[timers]   dn-sub: proj %.1f | conv %.1f | l2n+rec %.1f | norm+out %.1f ms/token\n",
             g_dn_sub[0]/g_tm_dec_tokens,g_dn_sub[1]/g_tm_dec_tokens,g_dn_sub[2]/g_tm_dec_tokens,g_dn_sub[3]/g_tm_dec_tokens);
+    if(g_dn_pre_sub[0]+g_dn_pre_sub[1]+g_dn_pre_sub[2]+g_dn_pre_sub[3]>0)
+        fprintf(stderr,"[timers] prefill dn-sub: proj %.1f | conv %.1f | state+norm %.1f | out_proj %.1f ms\n",
+            g_dn_pre_sub[0],g_dn_pre_sub[1],g_dn_pre_sub[2],g_dn_pre_sub[3]);
     if(g_xf_load+g_xf_run>0)
         fprintf(stderr,"[timers]   expert kernel: fetch %.2f | compute %.2f ms/token\n",
                 g_xf_load/g_tm_dec_tokens, g_xf_run/g_tm_dec_tokens);
@@ -6972,6 +6976,8 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
         const float *xb = x + (int64_t)base * H;
         extern double g_dn_sub[4];
         double _d0 = tm_now();
+        double _dn_stage = (S > 1 && rows > 1 && !m->mux_rows && !dbg &&
+                            m->snap_rows <= 0 && tm_on()) ? tm_now() : 0.0;
         int gpu_block = qt_dnproj_ready(layer) && qt_dnproj_matmul_batch(layer, qkvz, xb, rows, H, proj_dim);
         if (!gpu_block) {
             matmul_d(qkvb, xb, &l->dn_qkv, rows, H, conv_dim);
@@ -6979,6 +6985,7 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
         }
         matmul(bb, xb, l->dn_b, rows, H, vh);
         matmul(ab, xb, l->dn_a, rows, H, vh);
+        if (_dn_stage) { g_dn_pre_sub[0] += tm_now() - _dn_stage; _dn_stage = tm_now(); }
         if (tm_on() && S==1){ double t=tm_now(); g_dn_sub[0]+=t-_d0; _d0=t; }
         /* A prompt's block (not a multiplexed step, a verify or DN_DBG): the conv by channel with
          * every row in order, then each value head with every row in turn while its state is in
@@ -7002,6 +7009,7 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
                     rg[convk - 2] = qkv[cc];
                 }
             }
+            if (_dn_stage) { g_dn_pre_sub[1] += tm_now() - _dn_stage; _dn_stage = tm_now(); }
             #pragma omp parallel for schedule(static)
             for (int h = 0; h < vh; h++) {
                 float qh[512], kh[512], kvl[512], dl[512], ov[512];   /* kdim, vdim <= 512 */
@@ -7044,6 +7052,7 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
                     }
                 }
             }
+            if (_dn_stage) { g_dn_pre_sub[2] += tm_now() - _dn_stage; _dn_stage = tm_now(); }
             free(conv_all);
         } else
         for (int r = 0; r < rows; r++) {
@@ -7164,6 +7173,7 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
         if (rows == 1 ? !qtd(l->qth_dnout, ob, outrb, value_dim, H)
                       : !qtd_batch(l->qth_dnout, ob, outrb, rows, value_dim, H))
             matmul_d(ob, outrb, &l->dn_out, rows, value_dim, H);
+        if (_dn_stage) g_dn_pre_sub[3] += tm_now() - _dn_stage;
         if (tm_on() && S==1){ g_dn_sub[3]+=tm_now()-_d0; }
         if (dbg && base == 0) {       /* ... its out_proj row and gates, then done */
             fwrite(ob, sizeof(float), H, dbg);
@@ -9846,10 +9856,12 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     }
     double prefill_started = now_s();
     double prefill_tm_start[6];
+    double dn_pre_sub_start[4];
     Q36PrefillTiming prefill_timing = {0};
     double mp_hold0 = g_mp_hold, mp_mm0 = g_mp_mm, mp_act0 = g_mp_act, mp_bytes0 = g_mp_bytes;
     long mp_experts0 = g_mp_experts, mp_pairs0 = g_mp_pairs, mp_calls0 = g_mp_calls;
     memcpy(prefill_tm_start, g_tm_pre, sizeof prefill_tm_start);
+    memcpy(dn_pre_sub_start, g_dn_pre_sub, sizeof dn_pre_sub_start);
     g_q36_prefill_timing = &prefill_timing;
     if (!prefill_control && reuse < np) {
         lo = step_ex_control(m, ids + reuse, np - reuse, reuse, 1,
@@ -9864,6 +9876,10 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     clk->prefill_shared_s = (g_tm_pre[3] - prefill_tm_start[3]) / 1000.0;
     clk->prefill_router_s = (g_tm_pre[4] - prefill_tm_start[4]) / 1000.0;
     clk->prefill_lm_head_s = (g_tm_pre[5] - prefill_tm_start[5]) / 1000.0;
+    if (tm_on())
+        fprintf(stderr,"[timers] request prefill dn-sub: proj %.1f | conv %.1f | state+norm %.1f | out_proj %.1f ms\n",
+                g_dn_pre_sub[0]-dn_pre_sub_start[0],g_dn_pre_sub[1]-dn_pre_sub_start[1],
+                g_dn_pre_sub[2]-dn_pre_sub_start[2],g_dn_pre_sub[3]-dn_pre_sub_start[3]);
     clk->prefill_moe_hold_s = (g_mp_hold - mp_hold0) / 1000.0;
     clk->prefill_moe_mm_s = (g_mp_mm - mp_mm0) / 1000.0;
     clk->prefill_moe_act_s = (g_mp_act - mp_act0) / 1000.0;
