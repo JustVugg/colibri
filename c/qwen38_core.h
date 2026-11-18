@@ -1317,6 +1317,19 @@ static int q38_gg_held_type(int type,int rows,int cols) {
 #endif
     return type;
 }
+/* The heap copy of a GGUF matrix's blocks (the file is read, not mapped). METAL=1: page
+ * aligned and page rounded, so the Metal chain maps these very bytes in place
+ * (qwen38_metal_chain.h, q38m_weight); free() releases it either way. */
+static void *q38_gg_alloc(size_t bytes) {
+#ifdef QWEN38_METAL
+    long page=sysconf(_SC_PAGESIZE); void *p=NULL;
+    if(page<=0)return malloc(bytes);
+    size_t rounded=(bytes+(size_t)page-1)&~((size_t)page-1);
+    return posix_memalign(&p,(size_t)page,rounded?rounded:(size_t)page)?NULL:p;
+#else
+    return malloc(bytes);
+#endif
+}
 /* A matrix [rows][cols] from the GGUF: f32/f16 as f32, bf16 as bf16, any other ggml
  * type as its blocks (Q38_WEIGHT_GGML; with `held`, in q38_gg_held_type's form). `parts`
  * tensors of the same type are stacked by rows (the indexer's q and k projections). */
@@ -1344,12 +1357,12 @@ static Q38Weight q38_gg_weight_parts(Model *m,const gguf_tensor *const *parts,in
         for(int i=0;i<n;i++){q38_gg_read(parts[i],p,0,parts[i]->nbytes);p+=parts[i]->nbytes;}
     } else if(gq_blk_decoder(type)){
         int64_t rb=gq_row_bytes(type,cols);
-        w.data=malloc((size_t)(rb*rows)); if(!w.data){fprintf(stderr,"OOM GGUF weight\n");exit(1);}
+        w.data=q38_gg_alloc((size_t)(rb*rows)); if(!w.data){fprintf(stderr,"OOM GGUF weight\n");exit(1);}
         uint8_t *p=(uint8_t*)w.data;
         for(int i=0;i<n;i++){q38_gg_read(parts[i],p,0,parts[i]->nbytes);p+=parts[i]->nbytes;}
         const int ht=held?q38_gg_held_type(type,rows,cols):type;
         if(ht!=type){   /* interleaved by 16 for the CPU's kernels */
-            const int64_t hb=gq_row_bytes(ht,cols); uint8_t *h=(uint8_t*)malloc((size_t)(hb*rows));
+            const int64_t hb=gq_row_bytes(ht,cols); uint8_t *h=(uint8_t*)q38_gg_alloc((size_t)(hb*rows));
             if(!h){fprintf(stderr,"OOM GGUF weight\n");exit(1);}
             #pragma omp parallel for schedule(static)
             for(int g=0;g<rows/16;g++)gq_r16_pack(ht,h+(int64_t)g*16*hb,(const uint8_t*)w.data+(int64_t)g*16*rb,16,cols);

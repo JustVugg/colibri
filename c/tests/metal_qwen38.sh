@@ -9,6 +9,11 @@
 # gguf fixture cpu: the CPU engine on the tiny GGUF (qwen38_tiny_256_gguf, imported in
 #   link mode from the safetensors fixture qwen38_tiny_256) gives the same tokens as on
 #   its safetensors source, and matches the GGUF's own ref.json (rebased onto the CPU).
+# weights match: with Q38M_CHECK_WEIGHTS=1 the chain's start runs one random row through
+#   every dense matrix of layers 0 and 3 on the GPU (q38m_mm) and through the CPU's
+#   q38_dense_matmul, and prints `[q38m-check] <name> worst=<e>` (Ruling 9 scale, FAIL over
+#   2e-5): the BF16 safetensors qwen38_tiny, and the tiny GGUF (Q8_0 trunk, BF16 indexer,
+#   F32), in fast and exact mode.
 set -u
 cd "$(dirname "$0")/.." || exit 1
 fail=0
@@ -70,5 +75,46 @@ if make -s qwen38-tiny-gguf-generate PYTHON="${PYTHON:-python3}" >/dev/null 2>&1
 else
     echo "FAIL gguf fixture generation"; fail=1
 fi
+
+echo "== weights match"
+# check <tokens: 1 = assert the reference's> <fixture> <env...>: check lines for both layers,
+# none over the tolerance, and the CPU engine's tokens unchanged (the chain still declines
+# every step)
+check() {
+    tok=$1; fx=$2; shift 2
+    out=$(env Q38M_CHECK_WEIGHTS=1 "$@" OMP_NUM_THREADS=2 SNAP=./$fx ./qwen38 1 8 ./$fx/ref.json 2>&1)
+    rc=$?
+    what="$fx $*"
+    # a ref.json mismatch exits 1 after the run: only a crash counts when tokens are not asserted
+    if [ $rc -ne 0 ] && { [ "$tok" = 1 ] || [ $rc -ne 1 ]; }; then
+        echo "FAIL [weights $what] exit $rc"; echo "$out" | tail -5; fail=1; return
+    fi
+    n0=$(printf '%s\n' "$out" | grep -c '^\[q38m-check\] L0\.')
+    n3=$(printf '%s\n' "$out" | grep -c '^\[q38m-check\] L3\.')
+    bad=$(printf '%s\n' "$out" | grep '^\[q38m-check\]' | grep -F 'FAIL')
+    if [ "$n0" -lt 5 ] || [ "$n3" -lt 5 ]; then
+        echo "FAIL [weights $what] check lines: layer 0 $n0, layer 3 $n3"; printf '%s\n' "$out" | grep -F 'q38m'; fail=1; return
+    fi
+    if [ -n "$bad" ]; then echo "FAIL [weights $what]"; printf '%s\n' "$bad"; fail=1; return; fi
+    if [ "$tok" = 1 ] && ! printf '%s\n' "$out" | grep -qF 'Matching tokens: 8/8'; then
+        echo "FAIL [weights $what] tokens differ from the reference"; fail=1; return
+    fi
+    # a GGUF's blocks are the CPU's own bytes, mapped in place (q38m_weight), not copied
+    case $fx in *_gguf)
+        if ! printf '%s\n' "$out" | grep -qE '^\[qwen38-metal\] dense weights: [1-9][0-9]* mapped in place'; then
+            echo "FAIL [weights $what] no matrix mapped in place"; printf '%s\n' "$out" | grep -F 'dense weights'; fail=1; return
+        fi;;
+    esac
+    worst=$(printf '%s\n' "$out" | grep '^\[q38m-check\]' | sed 's/.*worst=\([^ ]*\).*/\1/' | sort -g | tail -1)
+    echo "ok   [weights $what] $n0 + $n3 matrices, worst $worst"
+}
+for exact in 0 1; do
+    check 1 qwen38_tiny QWEN36_METAL_EXACT=$exact
+    # GQ_EXACT=1: the CPU's float sums for the GGUF's blocks, as q36_dot_gq's. By default
+    # gq_matmul quantizes the activation to int8 per 32 (gq_act), which q36_dot_gq does not:
+    # about 1e-3 on this scale, the activation's rounding and not the weights'. The GGUF's
+    # ref.json is the CPU's default mode, which GQ_EXACT=1 leaves at token 6: no token check
+    check 0 qwen38_tiny_256_gguf QWEN36_METAL_EXACT=$exact GQ_EXACT=1
+done
 
 [ $fail -eq 0 ] && echo "metal_qwen38: PASS" || { echo "metal_qwen38: FAIL"; exit 1; }

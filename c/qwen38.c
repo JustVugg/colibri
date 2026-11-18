@@ -3764,6 +3764,20 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[qwen38] KV_SLOTS=%d: DeltaNet on the CPU (Q38_DN_GPU keeps one conversation's state on the card)\n",
                 g_q38_mux_slots);
     }
+#ifdef QWEN38_METAL
+    /* METAL=1: every layer's dense chain on the Apple GPU (qwen38_metal_chain.h), on by
+     * default; COLI_METAL=0, and every case it does not run, leave the CPU engine with a
+     * line. The MTP head stays on the CPU and costs more than it saves (Plan 1), so unset,
+     * Q38_MTP leaves it off beside the chain; Q38_MTP=1 keeps it and the chain off. */
+    /* Before q38_trunk_cpu_int8: q38m_start uploads the BF16/F32 matrices that frees (and maps
+     * a GGUF's blocks in place, which the CPU keeps). */
+    if (q38m_decide(&m) && q38m_start(&m)) g_mtl_chain = 1;
+    if (g_mtl_chain && m.mtp && !(getenv("Q38_MTP") && *getenv("Q38_MTP"))) {
+        m.mtp = 0;
+        fprintf(stderr, "[qwen38-metal] speculative decoding with the MTP head: off (the Metal chain runs every layer; "
+                        "Q38_MTP=1 drafts on the CPU engine)\n");
+    }
+#endif
     q38_trunk_cpu_int8(&m);    /* the trunk's int8 rows on the CPU, BF16 released (Q38_TRUNK_CPU_INT8=0 keeps BF16) */
     q38_draft_head_build(&m);  /* Q38_DRAFT_HEAD=int4: the MTP drafts' lm_head in int4 */
 #ifdef COLI_CUDA
@@ -3810,18 +3824,6 @@ int main(int argc, char **argv) {
     q38c_start(&m);      /* the layers that fit the device, before anything of the chain goes up (a partial chain placed now; qwen38_chain.h) */
     if(g_vk_chain&&!vkc_init())g_vk_chain=0;
     q38_dho_start(&m);   /* COLI_VK_DENSE_HOST: the trunk on the device only, before the tier sizes its budget */
-#endif
-#ifdef QWEN38_METAL
-    /* METAL=1: every layer's dense chain on the Apple GPU (qwen38_metal_chain.h), on by
-     * default; COLI_METAL=0, and every case it does not run, leave the CPU engine with a
-     * line. The MTP head stays on the CPU and costs more than it saves (Plan 1), so unset,
-     * Q38_MTP leaves it off beside the chain; Q38_MTP=1 keeps it and the chain off. */
-    if (q38m_decide(&m) && q38m_start(&m)) g_mtl_chain = 1;
-    if (g_mtl_chain && m.mtp && !(getenv("Q38_MTP") && *getenv("Q38_MTP"))) {
-        m.mtp = 0;
-        fprintf(stderr, "[qwen38-metal] speculative decoding with the MTP head: off (the Metal chain runs every layer; "
-                        "Q38_MTP=1 drafts on the CPU engine)\n");
-    }
 #endif
     if(is_ref)ref_logits=read_reference_logits(ref_root,m.c.vocab);
     g_capture_last_logit=ref_logits!=NULL||getenv("DUMP")!=NULL;
