@@ -3618,6 +3618,10 @@ def cmd_cluster_coordinator(a):
     from cluster import serve
     serve(a.host, a.port, a.stale_after, a.allowed_host)
 
+def cmd_router(a):
+    from router import serve
+    serve(a.config, a.host, a.port, a.api_key, a.timeout)
+
 def cmd_cluster_worker(a):
     engine=need_worker_model(a.model)
     coordinator=a.coordinator or os.environ.get("CLUSTER_COORDINATOR")
@@ -4226,6 +4230,12 @@ def main():
     ps.add_argument("--allowed-host",action="append",
         default=[h.strip() for h in os.environ.get("COLI_ALLOWED_HOSTS","").split(",") if h.strip()],
         help="additional Host header accepted by the DNS-rebinding guard; repeat as needed")
+    pro=sub.add_parser("router", help="route OpenAI requests to independent backend servers")
+    pro.add_argument("--config", required=True, help="JSON backend registry")
+    pro.add_argument("--host", default="127.0.0.1")
+    pro.add_argument("--port", type=int, default=8000)
+    pro.add_argument("--api-key", default=os.environ.get("COLI_API_KEY"))
+    pro.add_argument("--timeout", type=float, default=300.0)
     pcluster=sub.add_parser("cluster", help="run the local-cluster control plane or an expert worker")
     cluster_sub=pcluster.add_subparsers(dest="cluster_cmd")
     pcoord=cluster_sub.add_parser("coordinator", help="serve worker registration and discovery")
@@ -4351,7 +4361,8 @@ def main():
     handler={"build":cmd_build,"info":cmd_info,"plan":cmd_plan,"mirror":cmd_mirror,
              "doctor":cmd_doctor,"tune":cmd_tune,
              "run":cmd_run,"chat":cmd_chat,"tui":cmd_tui,"serve":cmd_serve,"stop":cmd_stop,"bench":cmd_bench,
-             "convert":cmd_convert,"import":cmd_import,"web":cmd_web,"ui":cmd_ui}.get(a.cmd)
+             "convert":cmd_convert,"import":cmd_import,"web":cmd_web,"ui":cmd_ui,
+             "router":cmd_router}.get(a.cmd)
     if a.cmd in ("setup","start","status","logs"):
         import setup_flow
         flow={"setup":setup_flow.cmd_setup,"start":setup_flow.cmd_start,

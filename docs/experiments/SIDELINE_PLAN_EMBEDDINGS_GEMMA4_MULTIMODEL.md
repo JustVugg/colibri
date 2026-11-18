@@ -371,8 +371,8 @@ handler.
    tokens and drop engine timing metadata — the passthrough is also the
    cheap option.
 
-**Minimum router inventory (requirements for a future design; nothing
-decided or built):**
+**Minimum router inventory (the v1 implementation now covers the static
+configuration slice; dynamic registration and lifecycle remain open):**
 
 - **Backend registry.** Static config at first (list of {base URL, model
   id(s), capability}); dynamic registration can come later via the existing
@@ -399,12 +399,10 @@ decided or built):**
   servers. v1 router can assume operators start backends (as they do
   today); lifecycle management is a later concern, not a prerequisite.
 
-**Deliberately not answered in this pass:** whether the router lives in
-`c/openai_server.py`, a sibling module, or a standalone script; how Gemma 4
-E2B or an embedding model becomes a backend (that is Sections 1–2's work);
-and whether timing/telemetry headers survive passthrough (they are emitted
-in-band in JSON today, so passthrough preserves them — verify when a second
-backend exists to compare against).
+The v1 router lives in `c/router.py` as a sibling HTTP service. It assumes
+operators start the backends separately. Dynamic cluster registration,
+backend lifecycle management, CORS parity, and richer telemetry aggregation
+remain open.
 
 ### 5.8 Round 4 (2026-11-18): `laya.c`'s encoder vs. the actual reference model
 
@@ -664,8 +662,7 @@ verified.
 - Permanent API contract tests now cover single input, batch input, and invalid
   empty batches. A model-backed tokenizer/oracle fixture remains optional
   because the Ollama blob is not part of the repository.
-- With this gap closed, the next planned investigation is the Section 5.7
-  router, followed by Gemma 4 E2B. Neither has started.
+- With normalization complete, the router is now the active work item.
 
 ### 7.6 Unicode normalization follow-up (2026-11-18)
 
@@ -683,3 +680,26 @@ The earlier Latin-only normalizer was replaced with generated Unicode data:
 
 The remaining tokenizer limitation is Unicode punctuation boundary handling;
 the current split rule still recognizes ASCII punctuation only.
+
+### 7.7 Static router baseline (2026-11-18)
+
+Implemented and tested the first router slice:
+
+- `c/router.py` provides a static JSON backend registry. Each backend declares
+  its base URL, model IDs, capabilities, and optional backend-only API key.
+- `coli router --config <file> --port <port>` starts the router. Public
+  authentication is optional; configured backend keys are not exposed or
+  forwarded from the client.
+- `/v1/embeddings`, `/v1/chat/completions`, `/v1/completions`,
+  `/v1/messages`, and `/v1/systemone` dispatch by endpoint capability and
+  request `model`.
+- `/v1/models` merges configured models; `/health` probes every backend and
+  reports per-backend availability.
+- JSON responses are buffered and SSE responses are streamed byte-for-byte.
+  Unknown models return an OpenAI-shaped `404 model_not_found`.
+- `c/tests/test_router.py` covers embedding dispatch, model/health reporting,
+  authentication setup, and unknown-model refusal.
+
+Still open for the router: dynamic cluster registration, backend lifecycle
+management, CORS parity, and richer aggregate telemetry. Gemma 4 E2B remains
+the next major model investigation.
