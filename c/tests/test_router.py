@@ -4,14 +4,16 @@ import http.client
 import json
 import pathlib
 import sys
+import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = pathlib.Path(__file__).resolve()
 sys.path.insert(0, str(HERE.parents[1]))
 
-from router import Router, RouterHandler  # noqa: E402
+from router import LlamaDelegate, Router, RouterHandler  # noqa: E402
 
 
 class BackendHandler(BaseHTTPRequestHandler):
@@ -105,6 +107,43 @@ class RouterTest(unittest.TestCase):
                 {"url": "http://a", "models": ["m"], "capabilities": ["chat"]},
                 {"url": "http://b", "models": ["m"], "capabilities": ["chat"]},
             ]})
+
+    def test_managed_delegate_registers_without_starting_in_constructor(self):
+        with tempfile.NamedTemporaryFile() as model:
+            router = Router({"delegates": [{
+                "model": "gemma-4-e2b", "model_path": model.name,
+                "binary": "/custom/llama-server", "port": 8123,
+            }]})
+            self.assertEqual(router.models()["data"][0]["id"], "gemma-4-e2b")
+            delegate = router.delegates[0]
+            self.assertIsInstance(delegate, LlamaDelegate)
+            self.assertEqual(delegate.command(), [
+                "/custom/llama-server", "--model", model.name,
+                "--host", "127.0.0.1", "--port", "8123",
+                "--load-mode", "mlock"])
+            router.close()
+
+    def test_delegate_is_forced_to_resident_load_mode(self):
+        with tempfile.NamedTemporaryFile() as model:
+            with self.assertRaises(ValueError):
+                Router({"delegates": [{
+                    "model": "gemma", "model_path": model.name,
+                    "load_mode": "mmap",
+                }]})
+
+    @patch("router.os.killpg")
+    @patch("router.subprocess.Popen")
+    def test_delegate_start_and_stop(self, popen, killpg):
+        process = popen.return_value
+        process.poll.return_value = None
+        with tempfile.NamedTemporaryFile() as model:
+            delegate = LlamaDelegate({"model": "gemma",
+                                      "model_path": model.name})
+            delegate.start()
+            popen.assert_called_once()
+            self.assertTrue(delegate.alive())
+            delegate.stop()
+            process.wait.assert_called_once_with(timeout=10)
 
 
 if __name__ == "__main__":

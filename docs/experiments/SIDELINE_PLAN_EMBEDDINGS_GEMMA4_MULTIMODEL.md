@@ -828,3 +828,34 @@ delegate for architectures not yet native to Colibri:
 The local machine has `/opt/homebrew/bin/llama-server`, and its help confirms
 `--load-mode mlock` for resident RAM loading. This gives the desired
 supporting-model behavior without pretending Gemma is a native Colibri family.
+
+The managed router configuration is:
+
+```json
+{
+  "backends": [{
+    "url": "http://127.0.0.1:8001",
+    "models": ["qwen3.6-colibri"],
+    "capabilities": ["chat"]
+  }],
+  "delegates": [{
+    "model": "gemma-4-e2b",
+    "model_path": "/Users/creemac/.lmstudio/models/lmstudio-community/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf",
+    "binary": "/opt/homebrew/bin/llama-server",
+    "host": "127.0.0.1",
+    "port": 8002,
+    "load_mode": "mlock"
+  }]
+}
+```
+
+Launch the unified endpoint with:
+
+```bash
+PYTHONPATH=/Users/creemac/colibri/colibri \
+python3 -m colibri.cli router --config /path/to/qwen-gemma-router.json \
+  --host 0.0.0.0 --port 8000 --api-key "$COLI_API_KEY"
+```
+
+The delegate is started and stopped with the router. Clients select either
+`"qwen3.6-colibri"` or `"gemma-4-e2b"` in the request's `model` field.

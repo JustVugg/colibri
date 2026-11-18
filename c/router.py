@@ -4,14 +4,21 @@
 Config:
   {"backends": [{"url": "http://127.0.0.1:8000",
                  "models": ["qwen3.6-colibri"],
-                 "capabilities": ["chat"]}]}
+                  "capabilities": ["chat"]}],
+   "delegates": [{"model": "gemma-4-e2b",
+                  "model_path": "/path/to/model.gguf",
+                  "port": 8002}]}
 
 The router owns the public API key and calls configured backends without
 forwarding that key by default. Backends are operator-managed processes.
+Delegates are llama.cpp processes managed for the lifetime of the router.
 """
 
 import argparse
 import json
+import os
+import signal
+import subprocess
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -44,6 +51,7 @@ class Backend:
         self.models = tuple(str(model) for model in raw.get("models", ()))
         self.capabilities = frozenset(str(cap) for cap in raw.get("capabilities", ()))
         self.api_key = raw.get("api_key")
+        self.owner = str(raw.get("owner", "colibri"))
         if not self.url or not self.models:
             raise ValueError("each backend needs a url and at least one model")
 
@@ -51,12 +59,75 @@ class Backend:
         return model in self.models and capability in self.capabilities
 
 
+class LlamaDelegate:
+    """A router-owned llama-server process for an unsupported GGUF."""
+
+    def __init__(self, raw):
+        self.model = str(raw.get("model", "")).strip()
+        self.model_path = os.path.abspath(os.path.expanduser(
+            str(raw.get("model_path", "")).strip()))
+        self.binary = str(raw.get("binary", "/opt/homebrew/bin/llama-server"))
+        self.host = str(raw.get("host", "127.0.0.1"))
+        self.port = int(raw.get("port", 8002))
+        self.load_mode = str(raw.get("load_mode", "mlock"))
+        self.process = None
+        if not self.model or not self.model_path:
+            raise ValueError("each delegate needs model and model_path")
+        if self.load_mode not in {"mlock", "mmap+mlock"}:
+            raise ValueError("delegate load_mode must keep the model resident")
+        self.backend = Backend({
+            "url": f"http://{self.host}:{self.port}",
+            "models": [self.model],
+            "capabilities": raw.get("capabilities", ["chat"]),
+            "owner": "llama.cpp",
+        })
+
+    def command(self):
+        return [self.binary, "--model", self.model_path, "--host", self.host,
+                "--port", str(self.port), "--load-mode", self.load_mode]
+
+    def start(self):
+        if self.process is not None:
+            return
+        if not os.path.isfile(self.model_path):
+            raise ValueError(f"delegate model does not exist: {self.model_path}")
+        self.process = subprocess.Popen(
+            self.command(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=None, start_new_session=(os.name != "nt"))
+
+    def alive(self):
+        return self.process is not None and self.process.poll() is None
+
+    def stop(self):
+        process, self.process = self.process, None
+        if process is None or process.poll() is not None:
+            return
+        try:
+            if os.name != "nt":
+                os.killpg(process.pid, signal.SIGTERM)
+            else:
+                process.terminate()
+            process.wait(timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                process.kill()
+            except OSError:
+                pass
+
+
 class Router:
     def __init__(self, config, timeout=300.0):
         raw = config.get("backends") if isinstance(config, dict) else None
-        if not isinstance(raw, list) or not raw:
-            raise ValueError("config needs a non-empty backends array")
+        if not isinstance(raw, list):
+            raw = []
+        delegate_raw = config.get("delegates", []) if isinstance(config, dict) else []
+        if not isinstance(delegate_raw, list):
+            raise ValueError("config delegates must be an array")
+        if not raw and not delegate_raw:
+            raise ValueError("config needs backends or delegates")
+        self.delegates = [LlamaDelegate(item) for item in delegate_raw]
         self.backends = [Backend(item) for item in raw]
+        self.backends.extend(delegate.backend for delegate in self.delegates)
         seen = set()
         for backend in self.backends:
             for model in backend.models:
@@ -66,6 +137,21 @@ class Router:
                         raise ValueError(f"duplicate backend route: {model} ({capability})")
                     seen.add(key)
         self.timeout = float(timeout)
+
+    def start_delegates(self):
+        started = []
+        try:
+            for delegate in self.delegates:
+                delegate.start()
+                started.append(delegate)
+        except Exception:
+            for delegate in reversed(started):
+                delegate.stop()
+            raise
+
+    def close(self):
+        for delegate in reversed(self.delegates):
+            delegate.stop()
 
     def find(self, model, capability):
         for backend in self.backends:
@@ -79,7 +165,7 @@ class Router:
         for backend in self.backends:
             for model in backend.models:
                 caps = sorted(backend.capabilities)
-                data.append({"id": model, "object": "model", "owned_by": "colibri",
+                data.append({"id": model, "object": "model", "owned_by": backend.owner,
                              "capabilities": caps})
                 purpose = ", ".join(caps) or "no advertised capability"
                 cards.append({"name": model,
@@ -90,6 +176,12 @@ class Router:
     def health(self):
         rows = []
         for backend in self.backends:
+            delegate = next((item for item in self.delegates
+                             if item.backend is backend), None)
+            if delegate is not None and not delegate.alive():
+                rows.append({"url": backend.url, "status": "unavailable",
+                             "error": "managed llama.cpp process is not running"})
+                continue
             try:
                 request = Request(backend.url + "/health")
                 if backend.api_key:
@@ -216,14 +308,17 @@ class RouterHandler(BaseHTTPRequestHandler):
 def serve(config_path, host="127.0.0.1", port=8000, api_key=None, timeout=300.0):
     with open(config_path, encoding="utf-8") as stream:
         config = json.load(stream)
+    router = Router(config, timeout)
+    router.start_delegates()
     server = ThreadingHTTPServer((host, port), RouterHandler)
-    server.router = Router(config, timeout)
+    server.router = router
     server.api_key = api_key
     print(f"colibri router listening on http://{host}:{port}", flush=True)
     try:
         server.serve_forever()
     finally:
         server.server_close()
+        router.close()
 
 
 def main(argv=None):
