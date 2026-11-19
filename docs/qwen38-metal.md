@@ -21,14 +21,21 @@ default, `0` off) in decode: each layer also runs the next layer's router on its
 layer's six likeliest experts the cache does not hold to the OS (`F_RDADVISE`), once the
 next trunk is submitted, so the SSD reads them while the GPU computes; the report then adds
 `[metal] qwen38 read-ahead: guesses: G, right: R`. Advice only, the tokens and logits are
-the same. Measured on the real model (24 GB M4 Pro): decode 4.53 → 5.18 tok/s (medians of
+the same; a read-ahead that cannot run (its buffers refused at the start, or its router
+declining mid-run) turns itself off with one `[qwen38-metal] read-ahead off: <reason>` line
+and the steps and the GPU experts go on. Measured on the real model (24 GB M4 Pro): decode 4.53 → 5.18 tok/s (medians of
 3), 80% of the guesses right, prefill unchanged
 ([docs/experiments/qwen38-metal-ahead-2026-11-19](experiments/qwen38-metal-ahead-2026-11-19/manifest.json)). Prompt-lookup drafts are off beside the chain
 unless `COLI_LOOKUP=1`: the chain hands a verify to the CPU, the recurrent state down and up
 again. Debug-only switches: `Q38M_CHECK_WEIGHTS`, `Q38M_LAYER_CHECK`, `Q38M_DECLINE_EVERY`,
 `Q38M_FORCE_ROUTES`, `Q38M_FAIL_SLOT_ALLOC`, `Q38M_REFUSE_AT` (refuses the k-th step's device
-memory: the off path's test), `Q38M_AHEAD_EARLY` ([ENVIRONMENT.md](ENVIRONMENT.md)). Each is
-read once and has no effect unset.
+memory: the off path's test), `Q38M_AHEAD_EARLY`, `Q38M_AHEAD_FAIL` (read-ahead's degrade
+path) ([ENVIRONMENT.md](ENVIRONMENT.md)). Each is read once and has no effect unset.
+
+The device's K/V/IK caches grow in steps (256, 512, 1024, then 1024 more at a time). A
+growth drops the device's rows and uploads them again from the host's, which are always
+current, and pools the index keys again; the report's `[metal] qwen38 kv:` line counts the
+growths and the rows uploaded again.
 
 ## Measured (real model, Plan 2)
 
@@ -36,15 +43,18 @@ Heretic-2 IQ4_XS GGUF (125 GB, experts streamed from the SSD), 24 GB M4 Pro, `be
 (64 tokens on a 61-token chat prompt for decode, the 12,689-token `long12k` prompt for
 prefill, medians of 3, one warm-up), fast kernels:
 
-| build | decode tok/s | prefill 12.7K s | peak footprint GiB |
+| build | decode tok/s | prefill 12.7K s | peak footprint, GiB (GB) |
 |---|---|---|---|
-| CPU engine, MTP off (the baseline) | 3.28 | 1076 | 12.6 |
-| M2: GPU trunk, experts on the CPU (`QWEN38_METAL_EXPERTS=0`) | 3.20 | 1239 | 11.8 |
-| M3: GPU experts, read-ahead off (`QWEN38_METAL_AHEAD=0`) | 4.53 | 751 | |
-| **M3, the default** (GPU experts + read-ahead) | **5.07** | **758** | 14.7 (15.8 GB, in prefill) |
+| CPU engine, MTP off (the baseline) | 3.28 | 1076 | 12.6 (13.5) |
+| M2: GPU trunk, experts on the CPU (`QWEN38_METAL_EXPERTS=0`) | 3.20 | 1239 | 11.8 (12.7) |
+| M3: GPU experts, read-ahead off (`QWEN38_METAL_AHEAD=0`) | 4.53 | 751 | not measured |
+| **M3, the default** (GPU experts + read-ahead) | **5.07** | **758** | 14.7 (15.8), in prefill |
 
-A same-day CPU recheck ran 3.50 tok/s and 1052 s. So M3 decodes 1.45–1.55× faster than
-the CPU engine and prefills 1.39–1.42× faster. Read-ahead alone is +14% on decode (interleaved single runs: 4.40–4.52 off, 5.09–5.17 on), 80% of
+GiB = 2^30 bytes, GB = 10^9 bytes. A same-day CPU recheck ran 3.50 tok/s and 1052 s. So M3
+decodes 1.54× faster than the baseline (5.07 / 3.28) and 1.45× faster than the same-day CPU
+run (5.07 / 3.50), and prefills 1.42× and 1.39× faster (1076 / 758, 1052 / 758). How busy
+the GPU is (its residency) was not measured; `sudo powermetrics --samplers gpu_power -i 2000
+-n 3` shows it during a run. Read-ahead alone is +14% on decode (interleaved single runs: 4.40–4.52 off, 5.09–5.17 on), 80% of
 its guesses right. The SSD is still the main cost: the report's `expert reads waited` is
 about 12.5 s of a 22 s decode run (the 61-token prompt, then 64 tokens).
 
@@ -66,8 +76,17 @@ unforced, long12k agrees 12 of 14 scored steps, the misses after router near-tie
   `[qwen38-metal] the Metal chain is off: <reason>` line.
 - In `coli serve`, prompt segments are 2048 rows for the Metal build (the serve prefill does
   not know the chain is on); prefill also re-reads the routed experts for every 256-row
-  chunk, since the cache (6.8 GiB) is far smaller than one chunk's experts. Streaming
+  chunk, since the cache (6.8 GiB here) is far smaller than one chunk's experts. Streaming
   prefill is planned (M4).
+- A few failures stop the engine (exit), since the recurrent state then lives only on the
+  GPU and cannot be handed to the CPU: a GPU command batch that fails, or a kernel that
+  declines, once the state has moved on the GPU (any step after the first, or a later chunk
+  of the first: `the Metal chain failed: ...; stopping`, exit 1),
+  and an SSD read of an expert that fails (`GPU experts: reading ... failed: <error>`, then
+  `... stopping`, exit 3). They are rare; the server reports `engine exited` and must be
+  restarted (`COLI_METAL=0` runs the CPU engine). A step whose device memory is refused,
+  or a step the chain declines at its start, is not fatal: the CPU runs it.
+- GPU residency was not measured (see above).
 - macOS only (Metal).
 
 The kernels share the device, the command batch and the exact/fast switch of the Qwen3.6
