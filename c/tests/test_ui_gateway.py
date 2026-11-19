@@ -89,6 +89,88 @@ class LiveSnapshotTest(unittest.TestCase):
         self.assertGreaterEqual(stats["cores"], 1)
 
 
+SYSCTL = "25769803776\n12\n"
+VM_STAT = """Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                                     8620.
+Pages active:                                 294317.
+Pages inactive:                               293226.
+Pages speculative:                               520.
+Pages throttled:                                   0.
+"""
+PS_OUT = "  37.5 2097152\n"
+IOREG = ('    | |   "PerformanceStatistics" = {"In use system memory (driver)"=0,"Tiler Utilization %"=0,'
+         '"Device Utilization %"=45,"In use system memory"=343597384}\n'
+         '    | |   "model" = "Apple M4 Pro"\n')
+
+
+def fake_run(table):
+    def run(cmd, **kw):
+        assert kw.get("timeout") == 0.5, kw
+        out = table.get(cmd[0])
+        if isinstance(out, Exception):
+            raise out
+        return mock.Mock(stdout=out or "", returncode=0 if out is not None else 1)
+    return run
+
+
+class DarwinStatsTest(unittest.TestCase):
+    def setUp(self):
+        gw._GPU_DARWIN.update(t=0.0, v=None)
+        self.eng = mock.Mock(process=mock.Mock(pid=4242))
+        self.table = {"sysctl": SYSCTL, "vm_stat": VM_STAT, "ps": PS_OUT, "ioreg": IOREG}
+
+    def stats(self, table=None):
+        with mock.patch.object(sys, "platform", "darwin"), \
+             mock.patch.object(gw.subprocess, "run", fake_run(table or self.table)), \
+             mock.patch.object(gw.os, "getloadavg", return_value=(2.345, 1.0, 1.0)):
+            return gw._system_stats(self.eng)
+
+    def test_darwin_system_stats(self):
+        s = self.stats()
+        self.assertEqual(s["ram_total_gb"], 24.0)
+        self.assertEqual(s["cores"], 12)
+        self.assertEqual(s["ram_avail_gb"], round((8620 + 293226 + 520) * 16384 / 2**30, 2))
+        self.assertEqual(s["load1"], 2.35)
+        self.assertEqual(s["engine_cpu_pct"], 37.5)
+        self.assertEqual(s["engine_rss_gb"], 2.0)
+
+    def test_darwin_gpu_stats(self):
+        g = self.stats()["gpus"]
+        self.assertEqual(len(g), 1)
+        self.assertEqual((g[0]["name"], g[0]["util_pct"]), ("Apple M4 Pro", 45))
+        self.assertAlmostEqual(g[0]["mem_used_gb"], 0.32, places=2)
+
+    def test_gpu_cached_one_second(self):
+        calls = []
+        base = fake_run(self.table)
+        def counting(cmd, **kw):
+            calls.append(cmd[0])
+            return base(cmd, **kw)
+        with mock.patch.object(sys, "platform", "darwin"), mock.patch.object(gw.subprocess, "run", counting), \
+             mock.patch.object(gw.os, "getloadavg", return_value=(1, 1, 1)):
+            gw._system_stats(self.eng)
+            gw._system_stats(self.eng)
+        self.assertEqual(calls.count("ioreg"), 1)
+
+    def test_darwin_stats_degrade(self):
+        import subprocess
+        bad = {"sysctl": subprocess.TimeoutExpired("sysctl", 0.5), "vm_stat": "garbage\n",
+               "ps": "x y\n", "ioreg": "nothing here"}
+        s = self.stats(bad)
+        for k in ("ram_total_gb", "cores", "ram_avail_gb", "engine_cpu_pct", "engine_rss_gb", "gpus"):
+            self.assertNotIn(k, s)
+        self.assertEqual(s["load1"], 2.35)
+        gw._GPU_DARWIN.update(t=0.0, v=None)
+        self.assertEqual(self.stats({"ps": None, "ioreg": OSError("x")}).get("load1"), 2.35)
+
+    def test_linux_unchanged(self):
+        with mock.patch.object(sys, "platform", "linux"), \
+             mock.patch.object(gw, "_system_stats_darwin", side_effect=AssertionError), \
+             mock.patch.object(gw, "_gpu_stats", return_value=None), \
+             mock.patch("builtins.open", side_effect=OSError):
+            self.assertEqual(gw._system_stats(self.eng), {})
+
+
 class LiveEngine:
     """what /health and /experts read of an engine"""
     supports_logprobs_echo = supports_tok_ids = False

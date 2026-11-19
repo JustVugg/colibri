@@ -5163,6 +5163,79 @@ _CPU_LAST = {}
 _GPU_LAST = {"t": 0.0, "v": None}
 
 
+def _run_quick(cmd):
+    """stdout of a local command (macOS stats), or None on any failure; never raises, 0.5 s cap."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=0.5)
+        return r.stdout if r.returncode == 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+_GPU_DARWIN = {"t": 0.0, "v": None}
+
+
+def _gpu_stats_darwin():
+    """The Apple GPU from ioreg's IOAccelerator statistics (use %, system memory in use), at most
+    once a second. None when ioreg gives nothing usable."""
+    now = time.monotonic()
+    if now - _GPU_DARWIN["t"] < 1.0:
+        return _GPU_DARWIN["v"]
+    _GPU_DARWIN["t"] = now
+    _GPU_DARWIN["v"] = None
+    txt = _run_quick(["ioreg", "-r", "-d", "1", "-c", "IOAccelerator"])
+    if txt:
+        g = {}
+        m = re.search(r'"model"\s*=\s*"([^"]+)"', txt)
+        g["name"] = m.group(1) if m else "Apple GPU"
+        m = re.search(r'"Device Utilization %"\s*=\s*(\d+)', txt)
+        if m:
+            g["util_pct"] = int(m.group(1))
+        m = re.search(r'"In use system memory"\s*=\s*(\d+)', txt)
+        if m:
+            g["mem_used_gb"] = round(int(m.group(1)) / 1073741824, 2)
+        if len(g) > 1:
+            _GPU_DARWIN["v"] = [g]
+    return _GPU_DARWIN["v"]
+
+
+def _system_stats_darwin(engine):
+    out = {}
+    try:
+        mem = _run_quick(["sysctl", "-n", "hw.memsize", "hw.ncpu"])
+        if mem:
+            a = mem.split()
+            out["ram_total_gb"] = round(int(a[0]) / 1073741824, 2)
+            out["cores"] = int(a[1])
+    except (ValueError, IndexError):
+        pass
+    try:
+        vm = _run_quick(["vm_stat"])
+        if vm:
+            ps = int(re.search(r"page size of (\d+) bytes", vm).group(1))
+            pages = sum(int(re.search(rf"^Pages {k}:\s+(\d+)", vm, re.M).group(1))
+                        for k in ("free", "inactive", "speculative"))
+            out["ram_avail_gb"] = round(pages * ps / 1073741824, 2)
+    except (AttributeError, ValueError):
+        pass
+    try:
+        out["load1"] = round(os.getloadavg()[0], 2)
+    except OSError:
+        pass
+    gpus = _gpu_stats_darwin()
+    if gpus:
+        out["gpus"] = gpus
+    pid = getattr(getattr(engine, "process", None), "pid", None)
+    if pid:
+        try:
+            f = (_run_quick(["ps", "-o", "%cpu=,rss=", "-p", str(int(pid))]) or "").split()
+            out["engine_cpu_pct"] = round(float(f[0]), 1)
+            out["engine_rss_gb"] = round(int(f[1]) / 1048576, 2)
+        except (ValueError, IndexError):
+            out.pop("engine_cpu_pct", None)
+    return out
+
+
 def _gpu_stats():
     """The NVIDIA cards as nvidia-smi sees them (use, memory, temperature, power), at most once a
     second: the monitors (the TUI's, the chat page's) poll /health every second or two. None when
@@ -5196,7 +5269,10 @@ def _gpu_stats():
 
 def _system_stats(engine):
     """RAM of the box and of the engine process, and the engine's CPU since the last call
-    (100 = one core busy). Read from /proc, so empty fields off Linux."""
+    (100 = one core busy). Read from /proc on Linux, from local commands on macOS, so empty
+    fields elsewhere."""
+    if sys.platform == "darwin":
+        return _system_stats_darwin(engine)
     out = {}
     try:
         mi = {}
