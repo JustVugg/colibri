@@ -38,6 +38,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include "matmul_f32.h"   /* matmul, dot_f32_lanes: fixed lanes, vectorized, the same bits on every ISA */
 #include <string.h>
 
 typedef struct {
@@ -67,20 +68,25 @@ typedef struct {
 
 /* ---- primitive ---------------------------------------------------------- */
 
+/* A device the engine has (qwen36: the CUDA card) can take the tower's matrices: 1 when it did,
+ * 0 and the CPU computes them. NULL: always the CPU. */
+static int (*q38v_device_linear)(float *out, const float *in, const Q38Linear *l, int rows);
+/* the same for the blocks' attention: qkv [n][3][heads][D] rotated, into att [n][heads][D] */
+static int (*q38v_device_attention)(float *att, const float *qkv, int n, int heads, int D, float scale);
+
 static void q38v_linear(float *out, const float *in, const Q38Linear *l, int rows)
 {
-    /* Every output is one dot product in a fixed order, so splitting (row, output)
-     * pairs across threads changes the time and not a bit of the result. A real
-     * image is hundreds of rows through 27 blocks: single-threaded it was minutes
-     * per picture (#1757). */
-    #pragma omp parallel for collapse(2) schedule(static)
-    for (int r = 0; r < rows; r++) {
-        for (int o = 0; o < l->out; o++) {
-            const float *x = in + (size_t)r * l->in;
-            const float *w = l->w + (size_t)o * l->in;
-            float acc = l->b ? l->b[o] : 0.f;
-            for (int i = 0; i < l->in; i++) acc += w[i] * x[i];
-            out[(size_t)r * l->out + o] = acc;
+    /* Every output is one dot product in matmul_f32.h's fixed lanes: the compiler vectorizes it and
+     * the bits depend neither on the threads nor on the vector width. One scalar chain a dot
+     * product (each add waiting for the one before) took 109 s for a 320 x 200 picture through
+     * Qwen3.8-27B's 27 blocks on 20 threads. */
+    if (!(q38v_device_linear && q38v_device_linear(out, in, l, rows)))
+        matmul(out, in, l->w, rows, l->in, l->out);
+    if (l->b) {
+        #pragma omp parallel for schedule(static)
+        for (int r = 0; r < rows; r++) {
+            float *o = out + (size_t)r * l->out;
+            for (int j = 0; j < l->out; j++) o[j] += l->b[j];
         }
     }
 }
@@ -88,6 +94,7 @@ static void q38v_linear(float *out, const float *in, const Q38Linear *l, int row
 static void q38v_layernorm(float *out, const float *in, const Q38Norm *n, int rows,
                            int width, float eps)
 {
+    #pragma omp parallel for schedule(static)
     for (int r = 0; r < rows; r++) {
         const float *x = in + (size_t)r * width;
         float *y = out + (size_t)r * width;
@@ -229,6 +236,7 @@ static int q38_vision_forward_dbg(const Q38Vision *v, const float *patches,
         }
 
         const float scale = 1.f / sqrtf((float)D);
+        if (q38v_device_attention && q38v_device_attention(att, qkv, n, nh, D, scale)) goto attended;
         memset(att, 0, (size_t)n * H * sizeof(float));
         /* each (head, query) pair owns its slice of att and its own score row */
         #pragma omp parallel
@@ -241,9 +249,7 @@ static int q38_vision_forward_dbg(const Q38Vision *v, const float *patches,
                 float best = -INFINITY;
                 for (int j = 0; j < n; j++) {
                     const float *k = qkv + ((size_t)j * 3 + 1) * H + (size_t)h * D;
-                    float acc = 0.f;
-                    for (int d = 0; d < D; d++) acc += q[d] * k[d];
-                    scores[j] = acc * scale;
+                    scores[j] = dot_f32_lanes(q, k, D) * scale;   /* fixed lanes, as the matrices */
                     if (scores[j] > best) best = scores[j];
                 }
                 float sum = 0.f;
@@ -259,13 +265,17 @@ static int q38_vision_forward_dbg(const Q38Vision *v, const float *patches,
         free(scores);
         }
 
+    attended:
         q38v_linear(tmp, att, &blk->proj, n);
+        #pragma omp parallel for schedule(static)
         for (size_t i = 0; i < (size_t)n * H; i++) x[i] += tmp[i];
 
         q38v_layernorm(tmp, x, &blk->norm2, n, H, v->eps);
         q38v_linear(mlp, tmp, &blk->fc1, n);
+        #pragma omp parallel for schedule(static)
         for (size_t i = 0; i < (size_t)n * v->inter; i++) mlp[i] = q38v_gelu_tanh(mlp[i]);
         q38v_linear(tmp, mlp, &blk->fc2, n);
+        #pragma omp parallel for schedule(static)
         for (size_t i = 0; i < (size_t)n * H; i++) x[i] += tmp[i];
     }
 
@@ -284,6 +294,7 @@ static int q38_vision_forward_dbg(const Q38Vision *v, const float *patches,
         }
         memcpy(grouped, tmp, (size_t)tokens * wide * sizeof(float));
         q38v_linear(hidden, grouped, &v->merger_fc1, tokens);
+        #pragma omp parallel for schedule(static)
         for (size_t i = 0; i < (size_t)tokens * wide; i++) hidden[i] = q38v_gelu_exact(hidden[i]);
         q38v_linear(out, hidden, &v->merger_fc2, tokens);
         free(grouped); free(hidden);

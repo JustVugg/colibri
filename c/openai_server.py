@@ -9,7 +9,6 @@ import contextlib
 import hashlib
 import json
 import math
-import mimetypes
 import os
 import select
 import queue
@@ -4111,7 +4110,7 @@ def _image_bytes_from_url(url):
     left every absolute path readable on the default install (the variable is
     unset out of the box). So local paths are now denied unless the operator
     sets COLI_IMAGE_ROOT, and then only inside it (resolve() follows symlinks
-    before the relative_to() check, the same one serve_static uses). The
+    before the relative_to() check). The
     clients that used to send paths read the file themselves with the user's
     own rights and send a data: URI: `coli chat` since this change, `coli web`
     always did. Errors stay generic so a reply never confirms a path or its
@@ -5903,7 +5902,7 @@ def conversation_cache_slot(messages, kv_slots):
 # ---- context compaction -------------------------------------------------------------------
 # A chat that outgrows the engine's context used to end in a 400 the user could do nothing
 # with but start over. A request that asks for it (`context_compaction: "auto"`, which the
-# dashboard and `coli chat` send) is compacted instead: the oldest turns are summarized by
+# chat UI and `coli chat` send) is compacted instead: the oldest turns are summarized by
 # the model itself, the summary joins the system message, and the turn runs on the summary
 # plus the last exchanges, which stay verbatim.
 #
@@ -9008,53 +9007,6 @@ class APIHandler(BaseHTTPRequestHandler):
         if model != self.server.model_id:
             raise APIError(404, f"The model `{model}` does not exist.", "model", "model_not_found")
 
-    # The dashboard ships in two layouts and the old single path only knew one:
-    # a source checkout puts this file in c/ (so web/dist is one level UP), while
-    # a release archive and an installed tree put it next to web/dist. Probing for
-    # index.html rather than the directory keeps an empty leftover web/dist from
-    # shadowing a real one.
-    WEB_DIST = next(
-        (c for c in (Path(__file__).resolve().parent / "web" / "dist",
-                     Path(__file__).resolve().parent.parent / "web" / "dist")
-         if (c / "index.html").is_file()),
-        Path(__file__).resolve().parent.parent / "web" / "dist")
-
-    def serve_static(self, path):
-        """Serve the built web UI (web/dist) so `coli web` is one process.
-        Read-only, no auth (same trust level as /health), traversal-safe."""
-        if path.startswith("/v1/") or path == "/health":
-            return False
-        base = self.WEB_DIST.resolve()
-        if not base.is_dir():
-            return False
-        rel = unquote(path).lstrip("/") or "index.html"
-        # unquote('%00') embeds a NUL. Path raises ValueError, which do_GET
-        # does not catch, and a NUL with no dot also matches the SPA fallback
-        # if the exception is swallowed. Either way it is not a file.
-        if "\x00" in rel:
-            return False
-        target = (base / rel).resolve()
-        try:
-            target.relative_to(base)
-        except ValueError:
-            target = None
-        if target is None or not target.is_file():
-            if path == "/" or "." not in rel:      # SPA fallback
-                target = base / "index.html"
-                if not target.is_file():
-                    return False
-            else:
-                return False
-        ctype = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
-        data = target.read_bytes()
-        self.send_response(200)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(data)))
-        self.send_cors_headers()
-        self.end_headers()
-        self.wfile.write(data)
-        return True
-
     def do_GET(self):
         request_id = "req_" + uuid.uuid4().hex
         try:
@@ -9151,8 +9103,6 @@ class APIHandler(BaseHTTPRequestHandler):
                 payload = power.reading() if self._is_authed() else power._unavailable("unauthorized")
                 self.send_json(200, payload, request_id)
                 return
-            if self.serve_static(path):
-                return
             self.require_auth()
             if path == "/v1/models":
                 # `data` is OpenAI's list; `models` is Jev's (name, description,
@@ -9162,6 +9112,13 @@ class APIHandler(BaseHTTPRequestHandler):
                                request_id)
             elif path.startswith("/v1/models/") and unquote(path[11:]) == self.server.model_id:
                 self.send_json(200, self.server.model_entry(), request_id)
+            elif path in ("/", "/index.html") and getattr(self.server, "chat_port", None):
+                # the dashboard was here before the chat UI: a bookmark of it opens the chat
+                self.send_response(302)
+                self.send_header("Location", chat_location(self.headers.get("Host"), self.server.chat_port))
+                self.send_header("Content-Length", "0")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
             else:
                 raise APIError(404, "Not found.", None, "not_found")
         except APIError as error:
@@ -11063,9 +11020,22 @@ def keep_engine(server, start, stopping, watch=ENGINE_WATCH_S, delays=ENGINE_RES
               file=sys.stderr)
 
 
+def chat_location(host_header, port):
+    """The chat UI's address as the browser reached the API: the same host (a name, an
+    IPv4 address or a bracketed IPv6 one), the UI's port."""
+    host = (host_header or "").strip() or "127.0.0.1"
+    if host.startswith("["):
+        host = host[:host.find("]") + 1] if "]" in host else host
+    elif host.count(":") == 1:
+        host = host.split(":", 1)[0]
+    elif ":" in host:
+        host = f"[{host}]"   # a bare IPv6 address, as _check_host reads one
+    return f"http://{host}:{int(port)}/"
+
+
 def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
           cap=None, max_tokens=1024, engine=None, env=None, cors_origins=None,
-          max_queue=8, queue_timeout=300, kv_slots=1, allowed_hosts=(), family=None):
+          max_queue=8, queue_timeout=300, kv_slots=1, allowed_hosts=(), family=None, chat_port=None):
     if not 0 <= max_tokens:
         raise ValueError("max_tokens cannot be negative (0: the context the engine holds)")
     if not 1 <= port <= 65535:
@@ -11116,6 +11086,7 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
                 pending_model_id = family.default_model_id
         model_id = pending_model_id
         server.model_id = model_id
+        server.chat_port = chat_port   # `coli web`'s chat UI: the API's own address sends a browser there
         try:          # what the checkpoint on disk is called (a Clef, a 27B), for the Jev card
             server.display_name = display_for(resolve_model(model))[0]
         except Exception:

@@ -943,30 +943,27 @@ def _safe_members(names):
             raise SetupError(f"refusing an archive member outside the folder: {name!r}")
 
 
-def extract_archive(archive, dest, only_prefix=None):
+def extract_archive(archive, dest):
     """Unpack a release archive (.zip or .tar.gz), refusing any member that
-    would land outside `dest`. `only_prefix` keeps one subtree (web/dist/)."""
+    would land outside `dest`."""
     os.makedirs(dest, exist_ok=True)
     if archive.endswith(".zip"):
         with zipfile.ZipFile(archive) as zf:
-            names = [n for n in zf.namelist() if not only_prefix or n.startswith(only_prefix)]
+            names = zf.namelist()
             _safe_members(names)
             for name in names:
                 zf.extract(name, dest)
     else:
         with tarfile.open(archive, "r:gz") as tf:
-            members = [m for m in tf.getmembers()
-                       if (not only_prefix or m.name.lstrip("./").startswith(only_prefix))
-                       and (m.isfile() or m.isdir())]
+            members = [m for m in tf.getmembers() if m.isfile() or m.isdir()]
             _safe_members([m.name for m in members])
             extra = {"filter": "data"} if hasattr(tarfile, "data_filter") else {}
             for member in members:
                 tf.extract(member, dest, **extra)
-    if not only_prefix:
-        for name in os.listdir(dest):
-            path = os.path.join(dest, name)
-            if os.path.isfile(path) and os.name == "posix" and "." not in name:
-                os.chmod(path, 0o755)
+    for name in os.listdir(dest):
+        path = os.path.join(dest, name)
+        if os.path.isfile(path) and os.name == "posix" and "." not in name:
+            os.chmod(path, 0o755)
 
 
 def _download_asset(release, name, folder):
@@ -1055,37 +1052,6 @@ def fetch_release_cuda(directory, tag, out=print, getter=None):
     for entry in sorted(os.listdir(staging), key=lambda entry: entry == "coli_cuda.dll"):
         os.replace(os.path.join(staging, entry), os.path.join(directory, entry))
     shutil.rmtree(staging, ignore_errors=True)
-    return True
-
-
-def web_dist_dir(launcher_dir):
-    for candidate in (os.path.join(launcher_dir, "web", "dist"),
-                      os.path.join(os.path.dirname(launcher_dir), "web", "dist")):
-        if os.path.isfile(os.path.join(candidate, "index.html")):
-            return candidate
-    return None
-
-
-def ensure_web_dist(launcher_dir, version, out=print):
-    """The dashboard is a build artifact: a source checkout has none until
-    `npm run build`. Take it from the matching release archive instead (it is
-    the same app, prebuilt), so the browser has something to open."""
-    if web_dist_dir(launcher_dir):
-        return True
-    try:
-        runtime, _tag = fetch_release_archive(version, out=out)
-    except SetupError as error:
-        out(f"  the web dashboard is not built and could not be fetched ({error});")
-        out("  the API still works. To build it: cd web && npm ci && npm run build")
-        return False
-    source = os.path.join(runtime, "web", "dist")
-    if not os.path.isfile(os.path.join(source, "index.html")):
-        return False
-    root = os.path.dirname(launcher_dir)
-    target = os.path.join(root, "web", "dist") if os.path.isdir(os.path.join(root, "web")) \
-        else os.path.join(launcher_dir, "web", "dist")
-    shutil.copytree(source, target, dirs_exist_ok=True)
-    out(f"  web dashboard: {target} (from the release archive)")
     return True
 
 
@@ -1283,10 +1249,17 @@ def resolve_with_fallback(ui, family, entry, decision, tc, hw, requested, failed
 # ---------------------------------------------------------------- the run configuration
 
 
+def ui_port_for(port):
+    """the chat UI's port beside an API's (`coli web`): 790 above it, 8790 for the usual 8000, so two
+    gateways on one machine get two UIs; below it where that would pass 65535"""
+    port = int(port)
+    return port + 790 if port + 790 <= 65535 else port - 790
+
+
 def urls(host, port):
     shown = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
     base = f"http://{shown}:{port}"
-    return {"browser": f"{base}/", "openai_base_url": f"{base}/v1",
+    return {"browser": f"http://{shown}:{ui_port_for(port)}/", "openai_base_url": f"{base}/v1",
             "anthropic_base_url": base}
 
 
@@ -1549,9 +1522,10 @@ def server_status(cfg):
     return out
 
 
-def start_server(cfg, *, background=False, open_browser=True, out=print, wait=5.0):
+def start_server(cfg, *, background=False, open_browser=True, out=print, wait=5.0, ui=True):
     """Start what the configuration describes. Foreground returns the server's
-    exit code; background returns the status after `wait` seconds."""
+    exit code; background returns the status after `wait` seconds. ui=False: the
+    API alone (`coli web --no-ui`), for the desktop app, which shows its own UI."""
     status = server_status(cfg)
     if status["state"] in ("ready", "loading"):
         out(f"  colibri is already running ({status['state']}) on port {cfg['port']}")
@@ -1576,11 +1550,13 @@ def start_server(cfg, *, background=False, open_browser=True, out=print, wait=5.
     cmd = [sys.executable, launcher] + args
     if not open_browser and "--no-browser" not in cmd:
         cmd.append("--no-browser")
+    if not ui and "--no-ui" not in cmd:
+        cmd.append("--no-ui")
     env = dict(cfg.get("env") or {})
     env.update(os.environ)          # what the user sets explicitly wins
     env["PYTHONUNBUFFERED"] = "1"
     if not background:
-        print_urls(cfg, out)
+        print_urls(cfg, out, ui)
         out("  stop: press Ctrl+C here (or close this window)\n")
         sys.stdout.flush()      # ours before the server's, when the output is a file
         process = subprocess.Popen(cmd, env=env)
@@ -1623,7 +1599,7 @@ def start_server(cfg, *, background=False, open_browser=True, out=print, wait=5.
     out(f"  started in the background (pid {process.pid}); "
         + ("ready. " if status["state"] == "ready" else "the model is loading (`coli status` "
            "says when it is ready). ") + f"Log: {log}")
-    print_urls(cfg, out)
+    print_urls(cfg, out, ui)
     return status
 
 
@@ -1663,9 +1639,13 @@ def _replace_arg(args, flag, value):
     return args
 
 
-def print_urls(cfg, out=print):
-    link = cfg["urls"]
-    out(f"  Browser:             {link['browser']}")
+def print_urls(cfg, out=print, ui=True):
+    # from the host and port, not the saved "urls": a setup from before the chat UI
+    # saved the API's port as the browser's address (a setup with no port keeps its own)
+    port = cfg.get("port")
+    link = urls(cfg.get("host", DEFAULT_HOST), port) if port else cfg["urls"]
+    if ui:
+        out(f"  Browser:             {link['browser']}")
     out(f"  OpenAI base URL:     {link['openai_base_url']}")
     out(f"  Anthropic base URL:  {link['anthropic_base_url']}")
 
@@ -2305,9 +2285,6 @@ def cmd_setup(a, ui=None):
         run_post_install(entry, engine_info["launcher_dir"], model_dir, ui)
         seed_expert_profile(entry, model_dir, out=ui.say)
 
-    if not web_dist_dir(engine_info["launcher_dir"]):
-        ensure_web_dist(engine_info["launcher_dir"], current_version(), out=ui.say)
-
     line, warnings = plan_summary(model_dir, ctx)
     ui.say(f"\nPlan: {line}")
     for warning in warnings:
@@ -2383,15 +2360,16 @@ def cmd_start(a):
     if reason:
         cfg = use_cuda(cfg, reason, out=say)
     refresh_configured(cfg, out=say)
+    ui = not getattr(a, "no_ui", False)
     if getattr(a, "json", False):
         print(json.dumps(start_server(cfg, background=True, open_browser=not a.no_browser,
-                                      out=lambda *_: None), indent=2))
+                                      out=lambda *_: None, ui=ui), indent=2))
         return 0
     if a.background:
-        start_server(cfg, background=True, open_browser=not a.no_browser)
+        start_server(cfg, background=True, open_browser=not a.no_browser, ui=ui)
         print("  stop: coli stop")
         return 0
-    return start_server(cfg, background=False, open_browser=not a.no_browser)
+    return start_server(cfg, background=False, open_browser=not a.no_browser, ui=ui)
 
 
 def status_report():

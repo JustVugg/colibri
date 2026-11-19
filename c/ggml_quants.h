@@ -25,6 +25,7 @@
 #include <string.h>
 #include <math.h>
 #include "ggml_grids.h"
+#include "fma_compat.h"   /* coli_fmaf_exact: gq_dot_i8's min correction without libm (#2882) */
 
 #if defined(__AVX2__) || defined(__F16C__)
 #include <immintrin.h>
@@ -1380,9 +1381,11 @@ static float gq_dot_i8(const int8_t *w8, const float *sw, const float *mw, int h
         acc += dx[b] * (sw[2 * b] * (float)s0 + sw[2 * b + 1] * (float)s1);
     }
 #endif
-    if (has_min) {   /* explicit fmaf: the same bits in gq_dot_b32, whatever the compiler contracts */
+    if (has_min) {   /* explicit fmaf: the same bits in gq_dot_b32, whatever the compiler contracts; without
+                      * FMA its bits inline (coli_fmaf_exact), not two libm calls a block of 32 (#2882) */
         float m = 0.f;
-        for (int64_t b = 0; b < n / 32; b++) m = fmaf(dx[b], fmaf(mw[2 * b], (float)xs[2 * b], mw[2 * b + 1] * (float)xs[2 * b + 1]), m);
+        for (int64_t b = 0; b < n / 32; b++)
+            m = coli_fmaf_exact(dx[b], coli_fmaf_exact(mw[2 * b], (float)xs[2 * b], mw[2 * b + 1] * (float)xs[2 * b + 1]), m);
         acc -= m;
     }
     return acc;
@@ -1496,6 +1499,13 @@ static inline int gq_tbuf(int I) {
  * Every build has it: the paths without the fused kernels give a row the bits of its row alone
  * as well, and the CUDA chains group a verify's rows by it (an ARM host with a card) */
 #define GQ_FUSED_ROWS 4
+/* Up to this many activation rows (a speculative verify: the token and up to seven drafts) a matrix
+ * gives each row the bits that row gets alone: the fused kernels, GQ_FUSED_ROWS rows at a time. The
+ * prompt's kernels (gq_rows_f8, the tiles of 16) sum in another order and start above it: a verify of
+ * five or six rows took them, and a token's bits then depended on how many drafts came with it, so a
+ * greedy answer with drafts differed from plain decoding, and from run to run as the gate drafts by
+ * the time a step takes (#2874; Qwen3.6-35B UD-IQ2_XXS on the CPU, 3 different texts of 64 tokens). */
+#define GQ_EXACT_ROWS 8
 /* one output row of W against every activation row */
 #if defined(__AVX2__) && defined(__FMA__)
 /* The 32-element block types without the unpack (Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL,
@@ -2119,18 +2129,25 @@ static inline void gq_row_all(float *y, int ystride, const gq_act *a, const uint
         }
         return;
     }
-    if (a->S <= GQ_FUSED_ROWS) {
-        if (t == GQ_Q4_0 || t == GQ_Q4_1 || t == GQ_Q5_0 || t == GQ_Q5_1 || t == GQ_IQ4_NL || t == GQ_MXFP4) {
-            gq_dot_b32(t, y, ystride, row, a->q, a->d, a->s, I, a->S); return;
-        }
+    if (a->S <= GQ_EXACT_ROWS) {   /* a verify's rows too: the fused kernels GQ_FUSED_ROWS at a time, each row's bits its own */
+        const int b32 = t == GQ_Q4_0 || t == GQ_Q4_1 || t == GQ_Q5_0 || t == GQ_Q5_1 || t == GQ_IQ4_NL || t == GQ_MXFP4;
         const gq_fdot_fn f = gq_fdot_sb256(t);
-        if (f) { f(y, ystride, row, a->q, a->d, I, a->S); return; }
-        if (t == GQ_Q4_K) { gq_dot_q4_k(y, ystride, row, a->q, a->d, a->s, I, a->S); return; }
-        if (t == GQ_Q2_0) { gq_dot_q2_0(y, ystride, row, a->q, a->d, I, a->S); return; }
-        if (t == GQ_Q5_K) { gq_dot_q5_k(y, ystride, row, a->q, a->d, a->s, I, a->S); return; }
-        if (t == GQ_Q6_K) { gq_dot_q6_k(y, ystride, row, a->q, a->d, a->s, I, a->S); return; }
-        if (t == GQ_Q3_K) { gq_dot_q3_k(y, ystride, row, a->q, a->d, a->s, I, a->S); return; }
-        if (t == GQ_Q2_K) { gq_dot_q2_k(y, ystride, row, a->q, a->d, a->s, I, a->S); return; }
+        if (b32 || f || t == GQ_Q4_K || t == GQ_Q2_0 || t == GQ_Q5_K || t == GQ_Q6_K || t == GQ_Q3_K || t == GQ_Q2_K) {
+            for (int s0 = 0; s0 < a->S; s0 += GQ_FUSED_ROWS) {
+                const int n = a->S - s0 < GQ_FUSED_ROWS ? a->S - s0 : GQ_FUSED_ROWS;
+                float *ys = y + (int64_t)s0 * ystride; const int8_t *xq = a->q + (int64_t)s0 * I;
+                const float *dx = a->d + (int64_t)s0 * (I / 32); const int32_t *xs = a->s + (int64_t)s0 * (I / 16);
+                if (b32) gq_dot_b32(t, ys, ystride, row, xq, dx, xs, I, n);
+                else if (f) f(ys, ystride, row, xq, dx, I, n);
+                else if (t == GQ_Q4_K) gq_dot_q4_k(ys, ystride, row, xq, dx, xs, I, n);
+                else if (t == GQ_Q2_0) gq_dot_q2_0(ys, ystride, row, xq, dx, I, n);
+                else if (t == GQ_Q5_K) gq_dot_q5_k(ys, ystride, row, xq, dx, xs, I, n);
+                else if (t == GQ_Q6_K) gq_dot_q6_k(ys, ystride, row, xq, dx, xs, I, n);
+                else if (t == GQ_Q3_K) gq_dot_q3_k(ys, ystride, row, xq, dx, xs, I, n);
+                else gq_dot_q2_k(ys, ystride, row, xq, dx, xs, I, n);
+            }
+            return;
+        }
     }
 #else
     if (t == GQ_Q8_0) {
@@ -4086,7 +4103,9 @@ static inline int gq_int_ok(int t, int I) {
  * for these types), lays them out as the R16 kernels read, and every activation row goes
  * through gq_r16_tile: per row and per 16 elements the exact integer dot, then its scale,
  * the R16 kernels' float steps (a TF-NLL check, not their bits). */
-#define GQ_TILE16_MIN_S 8   /* activation rows from which one unpack for all pays */
+/* activation rows from which one unpack for all pays; below it, a verify's rows (GQ_EXACT_ROWS) keep
+ * the row kernels' bits */
+#define GQ_TILE16_MIN_S (GQ_EXACT_ROWS + 1)
 static inline int gq_tile16_ok(int t, int I) {
     return !gq_exact_mode() && gq_r16_of(t) < 0 && gq_has_int(t) && !gq_has_min(t) && I % 32 == 0 && I % GQ_TYPES[t].blck == 0;
 }
@@ -4155,12 +4174,12 @@ static void gq_matmul_act(float *y, const gq_act *a, const uint8_t *W, int t, in
     }
 #endif
 #ifdef GQ_F8_ON
-    /* a prompt's rows (more than a fused kernel takes): the file's rows by eight, gq_rows_f8,
+    /* a prompt's rows (more than a verify takes, GQ_EXACT_ROWS): the file's rows by eight, gq_rows_f8,
      * where the type has that kernel. gq_row_all unpacks a row once and then pays a convert
      * and an fma per 32 elements for every row and activation row: on a prompt of Flint
      * (UD-Q3_K_XL, IQ2_S experts) that was 29% of the CPU's time. Decode keeps the fused row
      * kernels. */
-    if (a->S > GQ_FUSED_ROWS && gq_f8_ok(t, I)) {
+    if (a->S > GQ_EXACT_ROWS && gq_f8_ok(t, I)) {
         const int G8 = O / 8;
         #pragma omp parallel for schedule(dynamic, 1)
         for (int g = 0; g < G8; g++) gq_rows_f8(y + 8 * g, O, a, W + (int64_t)8 * g * rb, rb, t, I, 8);
@@ -4178,7 +4197,7 @@ static void gq_matmul2_act(float *y1, const uint8_t *W1, int t1, float *y2, cons
     if (gq_r16_base(t1) >= 0 || gq_r16_base(t2) >= 0) { gq_matmul_act(y1, a, W1, t1, O); gq_matmul_act(y2, a, W2, t2, O); return; }
 #endif
 #ifdef GQ_F8_ON
-    if (a->S > GQ_FUSED_ROWS && (gq_f8_ok(t1, I) || gq_f8_ok(t2, I))) { gq_matmul_act(y1, a, W1, t1, O); gq_matmul_act(y2, a, W2, t2, O); return; }
+    if (a->S > GQ_EXACT_ROWS && (gq_f8_ok(t1, I) || gq_f8_ok(t2, I))) { gq_matmul_act(y1, a, W1, t1, O); gq_matmul_act(y2, a, W2, t2, O); return; }
 #endif
     #pragma omp parallel for schedule(static)
     for (int r = 0; r < 2 * O; r++) {

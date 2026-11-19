@@ -179,6 +179,11 @@ int  qt_init_gguf(int n_layers, int n_experts, int hidden, int inter,
                   int cap_experts_per_layer, int topk, const int *tg, const int *td,
                   const size_t *gu_bytes, const size_t *d_bytes, int copy);
 int  qt_ready(void);
+/* y[rows, out] = x @ w^T in float32 on the tier's first card, w uploaded for the call and freed after
+ * it (the Qwen vision tower's matrices): 1 when the card computed it, 0 and y untouched otherwise */
+int  qt_vision_matmul(float *y, const float *x, const float *w, int rows, int in, int out);
+/* the tower's attention on the same card (coli_cuda_vision_attention): 1 when the card did it */
+int  qt_vision_attention(float *out, const float *qkv, int n, int heads, int D, float scale);
 int  qt_streaming(void);   /* copy mode: no pointer into the engine's slots is kept */
 int  qt_experts_on(void);  /* some device has room for experts (not trunk-only) */
 int  qt_is_resident(int layer, int eid);
@@ -367,6 +372,8 @@ static inline void *qt_dnproj_tensor(int a,int*b){(void)a;(void)b;return NULL;}
 static inline void *qt_dnproj_z_tensor(int a,int*b){(void)a;(void)b;return NULL;}
 static inline void *qt_lmhead_tensor(int*b){(void)b;return NULL;}
 static inline int  qt_ready(void){return 0;}
+static inline int  qt_vision_matmul(float *y,const float *x,const float *w,int r,int i,int o){(void)y;(void)x;(void)w;(void)r;(void)i;(void)o;return 0;}
+static inline int  qt_vision_attention(float *o,const float *q,int n,int h,int d,float s){(void)o;(void)q;(void)n;(void)h;(void)d;(void)s;return 0;}
 static inline unsigned qt_chain_epoch(void){return 0;}
 struct ColiCudaTensor;
 static inline int  qt_chain_resident(int a,int b,int c,struct ColiCudaTensor**g,struct ColiCudaTensor**u,struct ColiCudaTensor**d){(void)a;(void)b;(void)c;(void)g;(void)u;(void)d;return 0;}

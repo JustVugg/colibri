@@ -4,12 +4,13 @@ One page (`index.html`, no build step) and a small server (`server.py`, Python's
 library only) in front of a colibri gateway.
 
 ```
-coli serve --model ~/colibri-models/qwen36-35b     # the gateway, on 127.0.0.1:8000
-coli ui                                            # the UI on http://127.0.0.1:8790, the browser opened on it
+coli web --model ~/colibri-models/qwen36-35b       # the gateway on 127.0.0.1:8000 and the UI on :8790, the browser opened on it
 ```
 
-`coli ui --backend http://HOST:PORT` points it at a gateway elsewhere (`coli web` is the older
-dashboard the gateway serves itself). The server proxies
+`coli web` (and `coli start`, after `coli setup`) starts the UI beside the gateway, on the
+gateway's port + 790 (`--ui-port` picks another), and stops it with the gateway. `coli ui`
+starts the UI alone, next to a gateway that already runs (`coli serve`), here or elsewhere
+with `--backend http://HOST:PORT`. The server proxies
 `/v1/`, `/health`, `/profile` and `/experts` to the gateway, so the page and the API share
 one origin (the gateway sends no CORS headers); a chat stream passes through chunk by chunk,
 and when the page stops a request the upstream connection closes, which stops the engine.
@@ -23,6 +24,13 @@ and when the page stops a request the upstream connection closes, which stops th
 - **Pictures**: "attach an image" appears only when the model card lists image input, which
   the gateway does only when the engine loaded its vision tower; pictures are resized to
   1280 px in the browser.
+- **Documents**: "attach a document" (or a file dropped on the chat) reads a PDF, a Word
+  (`.docx`), OpenDocument (`.odt`) or PowerPoint (`.pptx`) file, a web page or any text file
+  (`docs.py`, `POST /doc/extract`, this page only) and puts its text in the message, with the
+  file's name; the message shows it as a chip. A PDF's pages without text (scans) come as
+  pictures, at most 6, for a model with a vision tower; a PDF needs PyMuPDF or pypdf, and
+  pypdf reads text only. The old binary formats (`.doc`, `.xls`, `.ppt`) are refused with the
+  way forward. At most 80 MB a file.
 - **Expert map**: one card per transformer block, its experts in a grid, colored by where
   they live (RAM or VRAM) and by what this answer used. Engines that send per-step frames
   light the experts each step routes (`/experts?since=N`).
@@ -36,9 +44,11 @@ and when the page stops a request the upstream connection closes, which stops th
   on Windows itself; from Windows, a WSL agent needs WSL to reach the server on 127.0.0.1,
   `networkingMode=mirrored`). Codex speaks
   only the Responses API: `responses_shim.py` translates it to the gateway's chat API.
-- **Web search**: the chat can search and read pages before it answers (`web.py`): results
-  from a SearXNG instance when `coli ui --searx URL` names one, else DuckDuckGo's plain HTML
-  results (no key); the pages' readable text only, at public addresses only.
+- **Web search**: with it on, the model can search and read pages before it answers
+  (`web.py`), and decides itself when and what to search; a small model does so more often
+  with reasoning on. Results from a SearXNG instance when `--searx URL` or `COLIBRI_SEARX`
+  names one, else DuckDuckGo's plain HTML results (no key), its lite page where the first
+  answers with its bot check; the pages' readable text only, at public addresses only.
 - **Mascot**: the hummingbird follows the turn (reading, reasoning, writing, done, stopped).
 
 - **Models**: what fits the machine the gateway runs on and how fast it would go, each model

@@ -113,6 +113,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   of a WEX4 container, validated in place; `wex4_verify FILE` checks every record against the
   index's SHA-256 and prints the root to pin (`COLI_WEX_ROOT=...`). `tests/test_wex4_verify.c` in
   `make test-c`.
+- **`coli web` opens the chat UI**: it serves the API and starts the chat (`ui/server.py`, the
+  page `coli ui` serves) in front of it, on the API's port + 790 (8790 for 8000, `--ui-port`
+  picks another), opened in the browser when the engine answers; `coli start` and the one-step
+  setup open it too. The UI ends with `coli web`, and the Models page switches models under it
+  (the gateway starts again as `coli serve`, the UI stays). The React dashboard (`web/`) is
+  removed, with its npm build in the release and CI and the gateway's static hosting of
+  `web/dist`; the expert atlas's Brain page and the Profiling page's watts went with it.
+- **Documents in the chat**: "attach a document" (or a file dropped on the chat) reads a PDF,
+  Word (`.docx`), OpenDocument (`.odt`), PowerPoint (`.pptx`), a web page or a text file into
+  the message (`ui/docs.py`, `POST /doc/extract`, this page only); a PDF's scanned pages come
+  as pictures, at most 6, for a model with a vision tower. Up to 80 MB a file.
+
 - **Qwen3.8 on AMD Quark's MXFP4 experts** (`Q38_EXPERT_LOWBIT=mxfp4`): the routed experts
   from the `experts-mxfp4/` sidecar, one read of 2.6 MB per miss instead of 4.9 MB, computed by
   `quant.h`'s `matmul_mxfp4`; the trunk and the shared expert stay FP8. CPU only for now (the
@@ -662,6 +674,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **The chat's web search answered nothing from some addresses**: DuckDuckGo's HTML page answers
+  202 with its bot check there, which read as no results; the search now asks its lite page
+  then, and says so when both check. The chat's instructions tell the model to search for
+  facts and to cite only the numbers of results it received.
 - **Qwen3.8 decode on HIP slower since the verify's DeltaNet copies** (#2757). #2765 put the copy
   of each verify row's DeltaNet state (`snap_n`) into `cc_dnrec_k` and `cc_dnconv_k`, the kernels a
   decode step runs too. On a Radeon AI PRO R9700, where decode with the pool read over the bus had

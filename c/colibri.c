@@ -14233,7 +14233,15 @@ int main(int argc, char **argv){
          * 200 ms of blocktime keeps the team hot across back-to-back expert matmuls
          * and lets it sleep at the prompt. libgomp ignores KMP_*; overwrite=0 keeps
          * the user's own setting authoritative. */
+#ifdef __FreeBSD__
+        /* FreeBSD: 0, so libomp's team sleeps as soon as a region ends. With 200 a
+         * GLM-5.3 decode began at about 0.9 tok/s and fell to 0.3-0.4 within 64
+         * tokens (2x Xeon Gold 6230, 40 threads, every core at 100% user); with 0 it
+         * held 0.92-0.98. libgomp ignores KMP_*, so a gcc build is not affected. */
+        setenv("KMP_BLOCKTIME","0",0);
+#else
         setenv("KMP_BLOCKTIME","200",0);
+#endif
 #else
         fprintf(stderr,"[OMP] hot-thread tuning skipped on macOS (#707): spin-wait knobs "
                        "measured slower on Apple Silicon (COLI_NO_OMP_TUNE=1 to skip)\n");

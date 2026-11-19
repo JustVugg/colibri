@@ -29,7 +29,7 @@ def main():
     ap.add_argument("--min-count", type=int, default=30)
     ap.add_argument("--min-runs", type=int, default=2, help="must fire in >= this many of the top category's runs")
     ap.add_argument("--out", default="experts.json")
-    ap.add_argument("--web", default="", help="also write the web-dashboard experts.json (Atlas/Brain hover)")
+    ap.add_argument("--web", default="", help="also write the atlas keyed layer:expert with labels (the old web dashboard's shape)")
     a = ap.parse_args()
 
     # run[(cat,idx)][(layer,expert)] = count ; run_tot[(cat,idx)] = total

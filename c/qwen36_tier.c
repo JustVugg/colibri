@@ -1272,6 +1272,16 @@ fail_storage:
 }
 
 int qt_ready(void){ return G.on; }
+int qt_vision_matmul(float *y, const float *x, const float *w, int rows, int in, int out){
+    if(!G.on || G.ndev < 1) return 0;
+    ColiCudaTensor *t = NULL;
+    int ok = coli_cuda_matmul(&t, y, x, w, NULL, 0, rows, in, out, G.dev[0], 0);
+    if(t) coli_cuda_tensor_free(t);
+    return ok;
+}
+int qt_vision_attention(float *out, const float *qkv, int n, int heads, int D, float scale){
+    return G.on && G.ndev > 0 && coli_cuda_vision_attention(G.dev[0], out, qkv, n, heads, D, scale);
+}
 int qt_streaming(void){ return G.on && G_stream; }
 int qt_experts_on(void){
     if(!G.on || G_trunk_only) return 0;

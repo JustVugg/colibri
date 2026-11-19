@@ -2232,7 +2232,7 @@ static void matmul_h(float *y, const float *x, const uint16_t *W, int S, int I, 
 static long long g_q36_codes;    /* q36_codes_now: a dense IQ1/IQ2/IQ3 matrix's larger form at its first product here */
 static int g_q36_cap_arg;              /* the cache size asked for (argv[1], 0 = automatic) */
 static long long g_q36_exp_codes;
-static double g_q36_exp_bytes;
+static double g_q36_exp_bytes __attribute__((unused));   /* read only where GQ_R16_ON (AVX2, AVX-512) */
 static void q36_codes_now(QW *w);
 static void matmul_d(float *y, const float *x, const QW *w, int S, int I, int O){
 #ifdef COLI_QWEN_BATCH_TEST
@@ -3133,7 +3133,7 @@ static int q36_gq_held(int type, int rows, int cols) {
  * Q36_IQ3S_CODES=0 (or Q36_ILV16=0) keeps the file's rows; never for experts (gguf_expert_held): the
  * RAM slots would hold fewer of them. */
 static long long g_q36_codes = -1;   /* -1 undecided, else bit t: type t's dense matrices take their larger form */
-static pthread_mutex_t g_q36_codes_mx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_q36_codes_mx __attribute__((unused)) = PTHREAD_MUTEX_INITIALIZER;   /* GQ_R16_ON only */
 static long long q36_codes_decide(void) {
 #ifdef GQ_R16_ON
     const char *e = getenv("Q36_IQ3S_CODES"), *i16 = getenv("Q36_ILV16");
@@ -3541,18 +3541,25 @@ static void q36_dho_each(Model *m, void (*f)(QW *, size_t *, int *), size_t *byt
 /* ---------- vision (#1757) ----------
  * The weights are the checkpoint's own model.visual.*, copied by the converter,
  * read as f32 like every other small tensor here. */
-static void q36_vis_linear(Model *m, Q38Linear *l, const char *stem, int out, int in) {
+static float *l3v_load(Model *m, const char *hf, const char *gg, int64_t want);
+/* a tower's matrix and its bias: the container's (model.visual.<stem>), or an mmproj's (<gg>, llama.cpp's names) */
+static void q36_vis_linear(Model *m, Q38Linear *l, const char *stem, const char *gg, int out, int in) {
     char nm[256];
-    snprintf(nm, sizeof nm, "model.visual.%s.weight", stem);
-    l->w = load_t_n(m, nm, (int64_t)out * in);
-    snprintf(nm, sizeof nm, "model.visual.%s.bias", stem);
-    l->b = st_has(&m->S, nm) ? load_t_n(m, nm, out) : NULL;
+    if (g_mmproj_open) {
+        snprintf(nm, sizeof nm, "%s.weight", gg); l->w = l3v_load(m, NULL, nm, (int64_t)out * in);
+        snprintf(nm, sizeof nm, "%s.bias", gg);   l->b = gguf_find(&g_mmproj, nm) ? l3v_load(m, NULL, nm, out) : NULL;
+    } else {
+        snprintf(nm, sizeof nm, "model.visual.%s.weight", stem);
+        l->w = load_t_n(m, nm, (int64_t)out * in);
+        snprintf(nm, sizeof nm, "model.visual.%s.bias", stem);
+        l->b = st_has(&m->S, nm) ? load_t_n(m, nm, out) : NULL;
+    }
     l->out = out; l->in = in;
 }
-static void q36_vis_norm(Model *m, Q38Norm *n, const char *stem, int width) {
-    char nm[256];
-    snprintf(nm, sizeof nm, "model.visual.%s.weight", stem); n->w = load_t_n(m, nm, width);
-    snprintf(nm, sizeof nm, "model.visual.%s.bias", stem);   n->b = load_t_n(m, nm, width);
+static void q36_vis_norm(Model *m, Q38Norm *n, const char *stem, const char *gg, int width) {
+    char nm[256], g2[256];
+    snprintf(nm, sizeof nm, "model.visual.%s.weight", stem); snprintf(g2, sizeof g2, "%s.weight", gg); n->w = l3v_load(m, nm, g2, width);
+    snprintf(nm, sizeof nm, "model.visual.%s.bias", stem);   snprintf(g2, sizeof g2, "%s.bias", gg);   n->b = l3v_load(m, nm, g2, width);
 }
 static void q36_load_lfm3_vision(Model *m);
 static void q36_load_vision(Model *m) {
@@ -3566,7 +3573,7 @@ static void q36_load_vision(Model *m) {
         q36_load_lfm3_vision(m);
         return;
     }
-    if (!st_has(&m->S, "model.visual.pos_embed.weight")) {
+    if (!g_mmproj_open && !st_has(&m->S, "model.visual.pos_embed.weight")) {
         fprintf(stderr, "[qwen36] qwen36_meta.json describes a vision tower but the container has none; text only\n");
         c->vis_depth = 0; return;
     }
@@ -3582,26 +3589,44 @@ static void q36_load_vision(Model *m) {
         fprintf(stderr, "[qwen36] vision num_position_embeddings %d is not a square grid -- refusing\n", v->num_pos);
         exit(1);
     }
-    q36_vis_linear(m, &v->patch_embed, "patch_embed.proj", v->hidden, v->in_ch * v->temporal * v->patch * v->patch);
-    v->pos_embed = load_t_n(m, "model.visual.pos_embed.weight", (int64_t)v->num_pos * v->hidden);
+    if (g_mmproj_open) {   /* one [hidden, C, P, P] kernel a frame: proj[o][c][t][p] = frame t's [o][c][p] (as LFM3's mmproj) */
+        const int PP = v->patch * v->patch, PD = v->in_ch * v->temporal * PP;
+        float *pw = falloc((int64_t)v->hidden * PD);
+        for (int t = 0; t < v->temporal; t++) {
+            char nm[64];
+            if (t) snprintf(nm, sizeof nm, "v.patch_embd.weight.%d", t); else snprintf(nm, sizeof nm, "v.patch_embd.weight");
+            float *f = l3v_load(m, NULL, nm, (int64_t)v->hidden * v->in_ch * PP);
+            for (int o = 0; o < v->hidden; o++)
+                for (int ch = 0; ch < v->in_ch; ch++)
+                    memcpy(pw + (size_t)o * PD + ((size_t)ch * v->temporal + t) * PP, f + ((size_t)o * v->in_ch + ch) * PP, PP * sizeof(float));
+            free(f);
+        }
+        v->patch_embed.w = pw;
+        v->patch_embed.b = gguf_find(&g_mmproj, "v.patch_embd.bias") ? l3v_load(m, NULL, "v.patch_embd.bias", v->hidden) : NULL;
+        v->patch_embed.out = v->hidden; v->patch_embed.in = PD;
+    } else q36_vis_linear(m, &v->patch_embed, "patch_embed.proj", NULL, v->hidden, v->in_ch * v->temporal * v->patch * v->patch);
+    v->pos_embed = l3v_load(m, "model.visual.pos_embed.weight", "v.position_embd.weight", (int64_t)v->num_pos * v->hidden);
     v->blocks = calloc((size_t)v->depth, sizeof(Q38VBlock));
     if (!v->blocks) { fprintf(stderr, "OOM vision blocks\n"); exit(1); }
     for (int i = 0; i < v->depth; i++) {
-        char stem[96];
-        snprintf(stem, sizeof stem, "blocks.%d.norm1", i);          q36_vis_norm(m, &v->blocks[i].norm1, stem, v->hidden);
-        snprintf(stem, sizeof stem, "blocks.%d.norm2", i);          q36_vis_norm(m, &v->blocks[i].norm2, stem, v->hidden);
-        snprintf(stem, sizeof stem, "blocks.%d.attn.qkv", i);       q36_vis_linear(m, &v->blocks[i].qkv, stem, 3 * v->hidden, v->hidden);
-        snprintf(stem, sizeof stem, "blocks.%d.attn.proj", i);      q36_vis_linear(m, &v->blocks[i].proj, stem, v->hidden, v->hidden);
-        snprintf(stem, sizeof stem, "blocks.%d.mlp.linear_fc1", i); q36_vis_linear(m, &v->blocks[i].fc1, stem, v->inter, v->hidden);
-        snprintf(stem, sizeof stem, "blocks.%d.mlp.linear_fc2", i); q36_vis_linear(m, &v->blocks[i].fc2, stem, v->hidden, v->inter);
+        char stem[96], gg[64];
+#define VB(field, fn, hf, ggs, ...) snprintf(stem, sizeof stem, "blocks.%d." hf, i); snprintf(gg, sizeof gg, "v.blk.%d." ggs, i); \
+        fn(m, &v->blocks[i].field, stem, gg, __VA_ARGS__)
+        VB(norm1, q36_vis_norm, "norm1", "ln1", v->hidden);
+        VB(norm2, q36_vis_norm, "norm2", "ln2", v->hidden);
+        VB(qkv, q36_vis_linear, "attn.qkv", "attn_qkv", 3 * v->hidden, v->hidden);
+        VB(proj, q36_vis_linear, "attn.proj", "attn_out", v->hidden, v->hidden);
+        VB(fc1, q36_vis_linear, "mlp.linear_fc1", "ffn_up", v->inter, v->hidden);
+        VB(fc2, q36_vis_linear, "mlp.linear_fc2", "ffn_down", v->hidden, v->inter);
+#undef VB
     }
     int wide = v->hidden * v->merge * v->merge;
-    q36_vis_norm(m, &v->merger_norm, "merger.norm", v->hidden);
-    q36_vis_linear(m, &v->merger_fc1, "merger.linear_fc1", wide, wide);
-    q36_vis_linear(m, &v->merger_fc2, "merger.linear_fc2", v->out_hidden, wide);
+    q36_vis_norm(m, &v->merger_norm, "merger.norm", "v.post_ln", v->hidden);
+    q36_vis_linear(m, &v->merger_fc1, "merger.linear_fc1", "mm.0", wide, wide);
+    q36_vis_linear(m, &v->merger_fc2, "merger.linear_fc2", "mm.2", v->out_hidden, wide);
     m->vis_ready = 1;
-    fprintf(stderr, "[qwen36] vision tower: %d blocks, hidden %d, %d heads, patch %d, merge %d\n",
-            v->depth, v->hidden, v->heads, v->patch, v->merge);
+    fprintf(stderr, "[qwen36] vision tower%s: %d blocks, hidden %d, %d heads, patch %d, merge %d\n",
+            g_mmproj_open ? " (mmproj)" : "", v->depth, v->hidden, v->heads, v->patch, v->merge);
 }
 
 /* LFM3-VL's tower (lfm3_vision.h): from the container (model.vision_tower.*, the converter's
@@ -3679,12 +3704,44 @@ static void q36_load_lfm3_vision(Model *m) {
     fprintf(stderr, "[qwen36] LFM3 vision tower%s: %d layers (%d attention, %d convolution), hidden %d, %d heads over %d, patch %d, merge %d\n",
             g_mmproj_open ? " (mmproj)" : "", v->depth, na, v->depth - na, D, v->heads, v->kv_heads, v->patch, v->merge);
 }
+/* The Qwen family's tower (Qwen3.5, 3.6, 3.8: q36_load_vision) from llama.cpp's mmproj
+ * (projector qwen3vl_merger, unsloth's mmproj-*.gguf), its shape from clip.vision.*: the frames
+ * the patch embedding has (v.patch_embd.weight.1: two), the positions the table has. Its rows
+ * must be the model's width; a tower with deepstack mergers is another one. 0: text only. */
+static int q36_mmproj_qwen(Cfg *c) {
+    const gguf_ctx *g = &g_mmproj;
+    for (int i = 0; i < g->n_tensors; i++)
+        if (!strncmp(g->t[i].name, "v.deepstack", 11)) {
+            fprintf(stderr, "[qwen36] mmproj: a tower with deepstack mergers, not this family's; text only\n");
+            return 0;
+        }
+    int out = (int)gguf_get_int(g, "clip.vision.projection_dim", 0), hid = (int)gguf_get_int(g, "clip.vision.embedding_length", 0);
+    const gguf_tensor *pe = gguf_find(g, "v.position_embd.weight");
+    if (out != c->hidden || hid <= 0 || !pe) {
+        fprintf(stderr, "[qwen36] mmproj: rows %d wide for a %d-wide model; text only\n", out, c->hidden);
+        return 0;
+    }
+    c->vis_lfm3 = 0;
+    c->vis_depth = (int)gguf_get_int(g, "clip.vision.block_count", 0);
+    c->vis_hidden = hid;
+    c->vis_inter = (int)gguf_get_int(g, "clip.vision.feed_forward_length", 0);
+    c->vis_heads = (int)gguf_get_int(g, "clip.vision.attention.head_count", 0);
+    c->vis_patch = (int)gguf_get_int(g, "clip.vision.patch_size", 16);
+    c->vis_merge = (int)gguf_get_int(g, "clip.vision.spatial_merge_size", 2);
+    c->vis_temporal = gguf_find(g, "v.patch_embd.weight.1") ? 2 : 1;
+    c->vis_in_ch = 3;
+    c->vis_out_hidden = out;
+    c->vis_num_pos = (int)(gg_numel(pe) / hid);
+    return c->vis_depth > 0;
+}
 /* an mmproj's shape (clip.vision.*) into the config: LFM3's tower, the layers with attention
- * those that carry attn_q. 0 when the file is not one. */
+ * those that carry attn_q; the Qwen family's (q36_mmproj_qwen). 0 when the file is not one. */
 static int q36_mmproj_cfg(Cfg *c) {
     const gguf_ctx *g = &g_mmproj;
     const char *pt = gguf_get_str(g, "clip.vision.projector_type");
-    if (!pt || strcmp(pt, "lfm3vl")) { fprintf(stderr, "[qwen36] mmproj projector %s: not LFM3's, text only\n", pt ? pt : "(none)"); return 0; }
+    if (!pt) pt = gguf_get_str(g, "clip.projector_type");
+    if (pt && !strcmp(pt, "qwen3vl_merger")) return q36_mmproj_qwen(c);
+    if (!pt || strcmp(pt, "lfm3vl")) { fprintf(stderr, "[qwen36] mmproj projector %s: not LFM3's or Qwen's, text only\n", pt ? pt : "(none)"); return 0; }
     c->vis_lfm3 = 1;
     c->vis_depth = (int)gguf_get_int(g, "clip.vision.block_count", 0);
     c->vis_hidden = (int)gguf_get_int(g, "clip.vision.embedding_length", 0);
@@ -3721,6 +3778,18 @@ static void q36_vision_detach(Model *m) {
  * axes; the image's token (row, col) sits at (start, start+row, start+col); the
  * text after it resumes at start + max(rows, cols); past the prompt every axis
  * is pos + rope_delta, rope_delta = max position + 1 - n. */
+#ifdef COLI_CUDA
+/* The Qwen tower's matrices on the CUDA card (q38v_device_linear): each uploaded for its call and freed
+ * after it, so a picture takes the room of one matrix at a time (the largest of Qwen3.8-27B's tower,
+ * its merger's, 85 MB), never the tier's; 0 where the card refuses, and the CPU computes it.
+ * COLI_CUDA_VISION=0 keeps the tower on the CPU. */
+static int q36_vis_device(float *out, const float *in, const Q38Linear *l, int rows) {
+    return qt_vision_matmul(out, in, l->w, rows, l->in, l->out);
+}
+static int q36_vis_device_attention(float *att, const float *qkv, int n, int heads, int D, float scale) {
+    return qt_vision_attention(att, qkv, n, heads, D, scale);
+}
+#endif
 static int q36_vision_attach(Model *m, const float *patches, int grid_h, int grid_w,
                              const int *ids, int n) {
     Cfg *c = &m->c;
@@ -3756,7 +3825,19 @@ static int q36_vision_attach(Model *m, const float *patches, int grid_h, int gri
     m->vis_map = malloc((size_t)n * sizeof(int));
     m->mpos = malloc((size_t)n * 3 * sizeof(int));
     if (!m->vis_rows || !m->vis_map || !m->mpos) { q36_vision_detach(m); return -1; }
+    const char *where = "the CPU";
+#ifdef COLI_CUDA
+    {
+        const char *e = getenv("COLI_CUDA_VISION");
+        q38v_device_linear = qt_ready() && !(e && *e == '0') ? q36_vis_device : NULL;
+        q38v_device_attention = q38v_device_linear ? q36_vis_device_attention : NULL;
+        if (q38v_device_linear) where = "the CUDA card";
+    }
+#endif
+    double tv = now_s();
     if (q38_vision_forward(&m->vis, patches, grid_h, grid_w, m->vis_rows) != tokens) { q36_vision_detach(m); return -1; }
+    fprintf(stderr, "[qwen36] picture: %d x %d patches, %d rows, the tower %.2f s (its matrices on %s)\n",
+            grid_h, grid_w, tokens, now_s() - tv, where);
     int cur = 0, maxpos = -1;
     for (int i = 0; i < n; i++) {
         int *pp = m->mpos + (size_t)i * 3;
@@ -4055,6 +4136,21 @@ static void gguf_load_cfg(Cfg *c) {
     }
     snprintf(nm, sizeof nm, "blk.0.exp_probs_b.bias");
     c->has_bias = gguf_find(g, nm) != NULL;
+    if (!lfm3 && !plain && g_mmproj_open && q36_mmproj_cfg(c)) {   /* Qwen3.5/3.6/3.8 and unsloth's mmproj */
+        /* a picture's rows rotate by three positions (M-RoPE): the sections the GGUF names */
+        snprintf(key, sizeof key, "%s.rope.dimension_sections", arch);
+        const gguf_kv *rs = gguf_get(g, key);
+        if (rs && rs->type == GGUF_T_ARRAY && rs->n >= 3 && (rs->atype == GGUF_T_I32 || rs->atype == GGUF_T_U32))
+            for (int k = 0; k < 3; k++) c->mrope_section[k] = ((const int32_t *)rs->arr)[k];
+        if (2 * (c->mrope_section[0] + c->mrope_section[1] + c->mrope_section[2]) != c->rotary_dim) {
+            fprintf(stderr, "[gguf] an mmproj but no rope.dimension_sections covering %d rotary dimensions; text only\n", c->rotary_dim);
+            c->vis_depth = 0;
+        }
+        const gguf_kv *tk = gguf_get(g, "tokenizer.ggml.tokens");
+        for (uint64_t i = 0; tk && tk->type == GGUF_T_ARRAY && tk->atype == GGUF_T_STRING && i < tk->n; i++)
+            if (tk->strs[i] && !strcmp(tk->strs[i], "<|image_pad|>")) { c->image_token = (int)i; break; }
+        if (c->image_token < 0) { fprintf(stderr, "[gguf] an mmproj but no <|image_pad|> token; text only\n"); c->vis_depth = 0; }
+    }
     if (lfm3) {
         if (g_mmproj_open && q36_mmproj_cfg(c)) {   /* the picture's placeholder, by its piece */
             const gguf_kv *tk = gguf_get(g, "tokenizer.ggml.tokens");
@@ -4399,6 +4495,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         load_cfg(&m->c, snap);
         int n_layers_from_config = m->c.n_layers;
         load_meta(&m->c, snap);
+        if (g_mmproj_open && !m->c.lfm3 && !q36_mmproj_qwen(&m->c)) m->c.vis_depth = 0;   /* Q36_MMPROJ */
         validate_cfg(&m->c, n_layers_from_config);
     }
     /* load_cfg and validate_cfg both guard n_layers, but the compiler can't see
@@ -6595,13 +6692,16 @@ static inline void gq_rows_u(float *y, int u, const gq_act *a, const uint8_t *W,
     if (u == 8 && gq_f8_ok(t, I)) { gq_rows_f8(y, 8, a, W, rb, t, I, 8); return; }
     for (int j = 0; j < u; j++) gq_row_all(y + j, 1, a, W + (int64_t)j * rb, t, I);
 }
+/* the rows moe_gq_decode reads at once: rows interleaved by 16 (q36_gq_held) a group at a time, and
+ * then every matrix's rows by 16; the file's rows by eight where all three types have gq_rows_f8 */
+static int moe_gq_unit(const GqExp *gx, int D, int I) {
+    return gguf_expert_ilv(gx) ? 16 : I % 8 == 0 && D % 8 == 0 && gq_f8_ok(gx->hg, D) && gq_f8_ok(gx->hu, D) && gq_f8_ok(gx->hd, I) ? 8 : 1;
+}
 static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const int *idx, const float *val) {
     Cfg *c = &m->c; const int D = q36_eh(c), K = c->topk, I = c->inter;
     const GqExp *gx = &m->gqx[layer];
     if (m->cache[layer].cap < K || K > 64 || !gq_int_ok(gx->hg, D) || !gq_int_ok(gx->hu, D) || !gq_int_ok(gx->hd, I)) return -1;
-    /* rows interleaved by 16 (q36_gq_held) go a group at a time, and then every matrix's rows by 16;
-     * the file's rows by eight where all three types have gq_rows_f8 */
-    const int u = gguf_expert_ilv(gx) ? 16 : I % 8 == 0 && D % 8 == 0 && gq_f8_ok(gx->hg, D) && gq_f8_ok(gx->hu, D) && gq_f8_ok(gx->hd, I) ? 8 : 1;
+    const int u = moe_gq_unit(gx, D, I);
     if (u == 16 && (I % 16 || D % 16)) return -1;
     Slot *sl[64]; int ids[64]; float w[64]; int n = 0;
     for (int k = 0; k < K; k++) if (idx[k] >= 0) { ids[n] = idx[k]; w[n] = val[k]; n++; }
@@ -6670,13 +6770,25 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
     for (int r = 0; r < S * K; r++) if (idx[r] >= 0) { int p = fill[idx[r]]++; tok[p] = r / K; wt[p] = val[r]; }
     int nmax = 0; for (int e = 0; e < E; e++) { int n = cnt[e + 1] - cnt[e]; if (n > nmax) nmax = n; }
     float *X = falloc((int64_t)nmax * D), *G = falloc((int64_t)nmax * I), *U = falloc((int64_t)nmax * I), *Y = falloc((int64_t)nmax * D);
-    gq_act act; memset(&act, 0, sizeof act);
+    gq_act act, ah; memset(&act, 0, sizeof act); memset(&ah, 0, sizeof ah);
+    /* a speculative verify's rows (S <= GQ_EXACT_ROWS) read the experts as a decode step does, the
+     * file's rows by eight where moe_gq_decode does: a row's bits are then a plain step's (#2874) */
+    const int f8 = S <= GQ_EXACT_ROWS && moe_gq_unit(gx, D, I) == 8;
     for (int e = 0; e < E; e++) {
         int n = cnt[e + 1] - cnt[e]; if (!n) continue;
         const int *tl = tok + cnt[e]; const float *wl = wt + cnt[e];
         Slot *sl; expert_get(m, layer, e, &sl);
         for (int r = 0; r < n; r++) memcpy(X + (int64_t)r * D, x + (int64_t)tl[r] * D, sizeof(float) * (size_t)D);
-        if (gq_int_ok(gx->hg, D) && gq_int_ok(gx->hu, D) && !gq_act_set(&act, X, n, D))
+        const int ex = f8 && !gq_act_set(&act, X, n, D);
+        if (ex) {
+            const uint8_t *wg = sl->gqe, *wu = sl->gqe + gx->hb_g;
+            const int64_t rbg = gq_row_bytes(gx->hg, D), rbu = gq_row_bytes(gx->hu, D);
+            #pragma omp parallel for schedule(static)
+            for (int r = 0; r < 2 * (I / 8); r++) {
+                if (r < I / 8) gq_rows_f8(G + 8 * r, I, &act, wg + (int64_t)8 * r * rbg, rbg, gx->hg, D, 8);
+                else gq_rows_f8(U + 8 * (r - I / 8), I, &act, wu + (int64_t)8 * (r - I / 8) * rbu, rbu, gx->hu, D, 8);
+            }
+        } else if (gq_int_ok(gx->hg, D) && gq_int_ok(gx->hu, D) && !gq_act_set(&act, X, n, D))
             gq_matmul2_act(G, sl->gqe, gx->hg, U, sl->gqe + gx->hb_g, gx->hu, &act, I);   /* x quantized once */
         else {
             gq_matmul(G, X, sl->gqe, gx->hg, n, D, I);
@@ -6685,6 +6797,11 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
         if (gx->sg) for (int64_t q = 0; q < (int64_t)n * I; q++) G[q] *= gx->sg[e];
         if (gx->su) for (int64_t q = 0; q < (int64_t)n * I; q++) U[q] *= gx->su[e];
         for (int64_t q = 0; q < (int64_t)n * I; q++) { float gv = G[q]; G[q] = (gv / (1.f + expf(-gv))) * U[q]; }
+        if (ex && !gq_act_set(&ah, G, n, I)) {
+            const uint8_t *wd = sl->gqe + gx->hb_g + gx->hb_u; const int64_t rbd = gq_row_bytes(gx->hd, I);
+            #pragma omp parallel for schedule(static)
+            for (int r = 0; r < D / 8; r++) gq_rows_f8(Y + 8 * r, D, &ah, wd + (int64_t)8 * r * rbd, rbd, gx->hd, I, 8);
+        } else
         gq_matmul(Y, G, sl->gqe + gx->hb_g + gx->hb_u, gx->hd, n, I, D);
         if (gx->sd) for (int64_t q = 0; q < (int64_t)n * D; q++) Y[q] *= gx->sd[e];
         if (m->L[layer].post_en)   /* Muse Spark: every expert's output scaled, then normalised */
@@ -6694,7 +6811,7 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
             for (int d = 0; d < D; d++) os[d] += w * ys[d];
         }
     }
-    gq_act_free(&act);
+    gq_act_free(&act); gq_act_free(&ah);
     free(cnt); free(tok); free(wt); free(fill); free(X); free(G); free(U); free(Y);
 }
 
@@ -8613,13 +8730,38 @@ static void q36_park_decide(Model *m, const int *ids, int np, int max_tok) {
 #include "prefix_store.h"
 static ColiPrefixStore g_q36_ps;
 static int g_q36_ps_init;
+/* The MiB the expert cache will still take: its slots not filled yet, at a slot's size as the
+ * cache was sized (qwen36_cap_for_ram; a GGUF's, its largest expert). Its slots fill as the
+ * experts are routed, so the RAM free at the first request still holds them: the store's
+ * budget, a quarter of that, took RAM the cache filled after it. The plan prices the cache
+ * from the engine's own sizes (resource_plan._q36_dense_tensors), no longer with the slack
+ * the checkpoint's sizes left, which had made room for both. */
+static double q36_cache_unfilled_mb(const Model *m) {
+    const Cfg *c = &m->c;
+    if (!m->cache || QWEN_GRAPH(m)) return 0;
+    const double slot = g_gguf ? (double)m->gqe_max
+                               : (double)q36_eh(c) * c->inter * (xf_mode((Model *)m) ? 1.5 : 3.0) +
+                                 (double)(c->inter * 2 + q36_eh(c)) * sizeof(float);
+    double n = 0;
+    for (int i = 0; i < c->n_layers; i++) if (m->cache[i].cap > m->cache[i].n) n += m->cache[i].cap - m->cache[i].n;
+    return n * slot / 1048576.0;
+}
+/* The store, set up once: less_mb, RAM the engine will still take that the free RAM holds now */
+static void q36_ps_open(double less_mb) {
+    if (g_q36_ps_init) return;
+    g_q36_ps_init = 1;
+    double avail = compat_mem_available_gb() * 1024.0;
+    if (avail > 0) { avail -= less_mb; if (avail < 1.0) avail = 1.0; }   /* known: what is left of it */
+    coli_ps_init_env(&g_q36_ps, kv_prefix_off(), avail);
+}
 static int q36_ps_on(const Model *m) {
-    if (!g_q36_ps_init) { g_q36_ps_init = 1; coli_ps_init_env(&g_q36_ps, kv_prefix_off(), compat_mem_available_gb() * 1024.0); }
+    q36_ps_open(q36_cache_unfilled_mb(m));
     /* the graph keeps its state on the GPU: the store's copies are the CPU engine's (QWEN_GRAPH) */
     return g_q36_ps.on && !g_q36_mtp.on && !m->vis_rows_n && !m->mpos && !m->rope_delta && !QWEN_GRAPH(m);
 }
-/* the store's budget, decided when the engine plans its RAM: a tier's host pool leaves it (ram_later) */
-static size_t q36_ps_plan(const Model *m) { q36_ps_on(m); return g_q36_ps.on ? g_q36_ps.budget : 0; }
+/* the store's budget, decided when the engine plans its RAM: a tier's host pool leaves it (ram_later),
+ * and the pool then sizes the cache, so the cache's slots are not taken off here */
+static size_t q36_ps_plan(const Model *m) { q36_ps_open(0); q36_ps_on(m); return g_q36_ps.on ? g_q36_ps.budget : 0; }
 /* whether a checkpoint needs more than rows by position: a recurrence, a ring */
 static int q36_ps_needs_state(const Model *m) {
     for (int i = 0; i < m->c.n_layers; i++) if (!m->c.is_attn[i] || (m->kv_ring && m->c.win_layer && m->c.win_layer[i])) return 1;
@@ -11431,6 +11573,12 @@ int main(int argc, char **argv) {
                                 "(a VK=1 build runs them on the card through Vulkan)\n");
 #endif
             }
+        }
+    } else {   /* a container: Q36_MMPROJ names a tower to read from an mmproj (its shape too) */
+        const char *e = getenv("Q36_MMPROJ");
+        if (e && *e && strcmp(e, "0")) {
+            if (gguf_open(&g_mmproj, e)) fprintf(stderr, "[qwen36] mmproj %s: %s; the container's own tower\n", e, g_mmproj.err);
+            else g_mmproj_open = 1;
         }
     }
     g_pilot = getenv("PILOT") ? atoi(getenv("PILOT")) : 0;

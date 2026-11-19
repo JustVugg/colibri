@@ -6283,7 +6283,17 @@ static void glm53_cu_tier_start(GModel *m) {
     if (!coli_cuda_init(&dev, 1)) { fprintf(stderr, "[CUDA] glm53: no CUDA device, the routed experts stay on the CPU\n"); return; }
     g_g53_cu = 1;
     xt_use_cuda(1);
-    g_g53_cud = cud_open("glm53", coli_cuda_device_at(0), glm53_cu_dense_bytes(m));   /* the tier leaves it room */
+    /* the CUDA chain (glm53_cuchain.h) runs every layer on the card and wants every dense matrix
+     * there: all of it with the chain's own bytes where they fit, as colibri.c and kimi_k3.c open
+     * theirs; else cu_dense.h's half of the free memory, and the tier leaves either room. A V100 of
+     * 16 GB kept GLM-5.3-Flash UD-Q4_K_XL's 8.11 GiB on the CPU under the half alone, and the chain,
+     * which runs only with every matrix on the card, stayed off: the CPU ran the layers (#2608). */
+    const int dev0 = coli_cuda_device_at(0);
+    const size_t dense = glm53_cu_dense_bytes(m);
+    g_g53_cud = 0;
+    if (g53u_possible(m))
+        g_g53_cud = cud_open_whole("glm53", dev0, dense, g53u_plan_bytes(m, getenv("GLM53_MAXT") ? atoi(getenv("GLM53_MAXT")) : 8192));
+    if (!g_cud.on) g_g53_cud = cud_open("glm53", dev0, dense);
     glm53_vk_tier_start(m);
     if (!cut_ready()) { xt_use_cuda(0); g_g53_cu = 0; g_cud.on = 0; }
 }
