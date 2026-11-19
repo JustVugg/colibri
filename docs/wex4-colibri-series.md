@@ -272,4 +272,3 @@ with the hardware, the `c/tools/wex_bench.py` command, and what to expect.
   - One read per V4.1 record instead of six (+10% on NVMe, -11% on a SATA SSD).
   - Sub-reads and the batched tier prewarm.
 
-No further PRs are planned from this fork; this branch stays for reference and review.
