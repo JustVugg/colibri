@@ -116,6 +116,7 @@ def fake_run(table):
 class DarwinStatsTest(unittest.TestCase):
     def setUp(self):
         gw._GPU_DARWIN.update(t=0.0, v=None)
+        getattr(gw, "_CPU_DARWIN", {}).clear()
         self.eng = mock.Mock(process=mock.Mock(pid=4242))
         self.table = {"sysctl": SYSCTL, "vm_stat": VM_STAT, "ps": PS_OUT, "ioreg": IOREG}
 
@@ -162,6 +163,33 @@ class DarwinStatsTest(unittest.TestCase):
         self.assertEqual(s["load1"], 2.35)
         gw._GPU_DARWIN.update(t=0.0, v=None)
         self.assertEqual(self.stats({"ps": None, "ioreg": OSError("x")}).get("load1"), 2.35)
+
+    def test_ps_time_parse(self):
+        self.assertEqual(gw._ps_time_s("0:00.03"), 0.03)
+        self.assertEqual(gw._ps_time_s("12:34.50"), 754.5)
+        self.assertEqual(gw._ps_time_s("1:02:03.25"), 3723.25)
+        self.assertEqual(gw._ps_time_s("2-01:00:00"), 2 * 86400 + 3600)
+        self.assertIsNone(gw._ps_time_s("x"))
+        self.assertIsNone(gw._ps_time_s(""))
+
+    def test_darwin_cpu_instantaneous(self):
+        """%cpu on macOS is a decayed lifetime average; the engine's CPU is the delta of its
+        cumulative CPU time over the wall time since the previous sample (first call: %cpu)."""
+        clock = [100.0]
+        def at(t, cpu_time):
+            clock[0] = t
+            table = dict(self.table, ps="  37.5 2097152 %s\n" % cpu_time)
+            with mock.patch.object(gw.time, "monotonic", lambda: clock[0]):
+                return self.stats(table).get("engine_cpu_pct")
+        self.assertEqual(at(100.0, "1:00.00"), 37.5)        # no previous sample: ps's %cpu
+        self.assertEqual(at(102.0, "1:03.00"), 150.0)       # 3 s of CPU in 2 s: 1.5 cores
+        self.assertEqual(at(102.2, "1:03.10"), 150.0)       # < 0.5 s since: the last value
+        self.assertEqual(at(104.0, "1:02.00"), 0.0)         # a smaller time (pid reused): never negative
+        self.assertEqual(at(106.0, "1:04.00"), 100.0)
+
+    def test_darwin_cpu_without_time_column(self):
+        self.assertEqual(self.stats(dict(self.table, ps="  12.5 2097152\n"))["engine_cpu_pct"], 12.5)
+        self.assertEqual(self.stats(dict(self.table, ps="  12.5 2097152\n"))["engine_cpu_pct"], 12.5)
 
     def test_linux_unchanged(self):
         with mock.patch.object(sys, "platform", "linux"), \

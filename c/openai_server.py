@@ -5228,12 +5228,49 @@ def _system_stats_darwin(engine):
     pid = getattr(getattr(engine, "process", None), "pid", None)
     if pid:
         try:
-            f = (_run_quick(["ps", "-o", "%cpu=,rss=", "-p", str(int(pid))]) or "").split()
-            out["engine_cpu_pct"] = round(float(f[0]), 1)
+            f = (_run_quick(["ps", "-o", "%cpu=,rss=,time=", "-p", str(int(pid))]) or "").split()
+            out["engine_cpu_pct"] = _darwin_cpu_pct(int(pid), float(f[0]), _ps_time_s(f[2] if len(f) > 2 else ""))
             out["engine_rss_gb"] = round(int(f[1]) / 1048576, 2)
         except (ValueError, IndexError):
             out.pop("engine_cpu_pct", None)
     return out
+
+
+_CPU_DARWIN = {}   # pid -> (monotonic s, cumulative CPU s, last pct)
+
+
+def _ps_time_s(txt):
+    """ps's cumulative CPU time ([dd-][hh:]mm:ss[.ss]) in seconds, None when unreadable."""
+    try:
+        days, _, rest = txt.rpartition("-")
+        parts = [float(x) for x in rest.split(":")]
+        if not 2 <= len(parts) <= 3:
+            return None
+        s = 0.0
+        for p in parts:
+            s = s * 60 + p
+        return round(s + (int(days) * 86400 if days else 0), 3)
+    except ValueError:
+        return None
+
+
+def _darwin_cpu_pct(pid, ps_pct, cpu_s):
+    """The engine's CPU now (100 = one core), from its CPU time over the wall time since the
+    previous sample at least 0.5 s old: macOS ps's %cpu is a decayed lifetime average, which
+    lags a turn by many seconds. ps's %cpu on the first sample or without a time column."""
+    now = time.monotonic()
+    last = _CPU_DARWIN.get(pid)
+    if cpu_s is None:
+        return round(ps_pct, 1)
+    if last is None:
+        _CPU_DARWIN.clear()   # one engine at a time: a restarted engine drops the old pid
+        _CPU_DARWIN[pid] = (now, cpu_s, round(ps_pct, 1))
+        return round(ps_pct, 1)
+    if now - last[0] < 0.5:
+        return last[2]
+    pct = round(max(0.0, 100.0 * (cpu_s - last[1]) / (now - last[0])), 1)
+    _CPU_DARWIN[pid] = (now, cpu_s, pct)
+    return pct
 
 
 def _gpu_stats():
