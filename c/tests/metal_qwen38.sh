@@ -33,6 +33,9 @@
 #   release's expert shape on a variant (16 experts, top-k 10, IQ4_XS/IQ4_NL: sub-groups of 8 and
 #   2), exact, fast and the layer check; a 1,300-token prompt on the GGUF (chunks of 256 rows),
 #   exact and fast.
+# ahead fail: Q38M_AHEAD_FAIL=5 (debug: the fifth ahead router declines, mid-decode) and =start
+#   (its buffers refused at the start): one `read-ahead off` line, the chain and the GPU experts
+#   on, logits bit-identical to QWEN38_METAL_AHEAD=0 and the CPU's tokens.
 # metal_state_handoff: Q38M_DECLINE_EVERY=2 (debug) declines every second step, so the CPU
 #   and the chain hand the state back and forth (q38m_cpu_step, the KV watermarks): the
 #   CPU's tokens and final logits (within 1e-4 x max), also on qwen38_decay (the tiny fixture
@@ -41,6 +44,9 @@
 #   drafts; COLI_LOOKUP=1 with forced drafts runs its verifies on the CPU: the CPU's tokens.
 # kv growth: a 1,300-token prompt (qwen38_tiny with max_position_embeddings raised, a
 #   generated prompt): the device caches grow 256, 512, 1024, 2048; the CPU's tokens and logits.
+#   Then growth with valid rows: qwen38_decay served a 1,020-token prompt in segments of 300 rows
+#   and 8 tokens across position 1024 (tests/metal_qwen38_serve.py --segments): two growths drop
+#   valid device rows and upload them again; every step's logits the CPU's.
 # long prompt, fast mode: 3,000 tokens on qwen38_decay with the fast kernels: the CPU's tokens
 #   and logits, and Q38M_LAYER_CHECK=2 (each layer, the routes, the CPU's own one-ulp lines).
 # layer test: Q38M_LAYER_CHECK=1 (debug) runs the CPU's q38_layer_forward beside the first
@@ -180,10 +186,13 @@ if len(a) != len(b) or not a: print("inf"); sys.exit()
 m = max(abs(x) for x in a)
 print("%.3g" % (max(abs(x - y) for x, y in zip(a, b)) / (m or 1.0)))' "$1" "$2"
 }
+# within <relerr>: a plain non-negative number, at most 1e-4 (empty, nan or inf fail: macOS awk
+# compares a NaN equal to anything, so the format is checked first)
+within() { [ -n "$1" ] && awk -v e="$1" 'BEGIN { exit !(e ~ /^[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?$/ && e + 0 <= 1e-4) }'; }
 # logits_ok <cpu name> <metal name>: DUMP logits within 1e-4 x max|logit|, or a FAIL line
 logits_ok() {
     e=$(relerr "$tmp/$1.bin" "$tmp/$2.bin")
-    if awk -v e="$e" 'BEGIN { exit !(e <= 1e-4) }'; then return 0; fi
+    if within "$e"; then return 0; fi
     echo "FAIL [$2] final logits off by $e x max|logit| against $1"; fail=1; return 1
 }
 # chain_on <name>: no off line, the report with forwards > 0
@@ -207,7 +216,7 @@ for fx in qwen38_tiny qwen38_tiny_256_gguf; do
         if [ -z "$want" ] || [ "$got" != "$want" ]; then echo "FAIL [$nm] tokens '$got' vs the CPU's '$want'"; fail=1; continue; fi
         if [ $exact = 1 ]; then
             e=$(relerr "$tmp/cpu_$fx.bin" "$tmp/$nm.bin")
-            if ! awk -v e="$e" 'BEGIN { exit !(e <= 1e-4) }'; then echo "FAIL [$nm] final logits off by $e x max|logit|"; fail=1; continue; fi
+            if ! within "$e"; then echo "FAIL [$nm] final logits off by $e x max|logit|"; fail=1; continue; fi
             echo "ok   [$nm] the CPU's tokens, logits within $e x max, forwards $(forwards $nm)"
         else
             echo "ok   [$nm] the CPU's tokens, forwards $(forwards $nm) (logits within $(relerr "$tmp/cpu_$fx.bin" "$tmp/$nm.bin") x max, not gated)"
@@ -398,6 +407,32 @@ for fx in gguf iq4; do
     done
 done
 
+# read-ahead that cannot run degrades (final review): Q38M_AHEAD_FAIL=5 (debug) makes the fifth
+# ahead router decline (the second decode step: 3 a step on 4 layers), =start refuses its buffers
+# at the start: one `read-ahead off` line, the chain and the GPU experts on, and the tokens and
+# final logits bit-identical to QWEN38_METAL_AHEAD=0 (so the CPU's, within 1e-4)
+AOFF='[qwen38-metal] read-ahead off: '
+for af in 5 start; do
+    nm=ahead_fail_$af; aref=ahead_gguf_exact1_off; fx=qwen38_tiny_256_gguf
+    [ -s "$tmp/$aref.bin" ] || { echo "FAIL [$nm] no read-ahead-off run to compare"; fail=1; continue; }
+    eng $nm ./$fx ./$fx/ref.json Q38M_AHEAD_FAIL=$af QWEN38_METAL_AHEAD=1 QWEN38_METAL_EXACT=1 $REFP DUMP=$tmp/$nm.bin &&
+        chain_on $nm && gx_on $nm || continue
+    case $af in start) line="${AOFF}no device memory for its router (Q38M_AHEAD_FAIL=start); the GPU experts run without it";;
+                *) line="${AOFF}its router did not run on the GPU; the GPU experts run without it";; esac
+    g=$(ah_n $nm)
+    if [ "$(grep -cF "$line" "$tmp/$nm.log")" -ne 1 ] || [ "$(grep -cF "$AOFF" "$tmp/$nm.log")" -ne 1 ]; then
+        echo "FAIL [$nm] expected one line: $line"; grep -F '[qwen38-metal]' "$tmp/$nm.log"; fail=1
+    elif [ -z "$(toks cpu_$fx)" ] || [ "$(toks $nm)" != "$(toks cpu_$fx)" ] || [ "$(toks $nm)" != "$(toks $aref)" ]; then
+        echo "FAIL [$nm] tokens '$(toks $nm)' vs the CPU's '$(toks cpu_$fx)'"; fail=1
+    elif ! cmp -s "$tmp/$aref.bin" "$tmp/$nm.bin"; then
+        echo "FAIL [$nm] final logits differ from QWEN38_METAL_AHEAD=0 ($(relerr "$tmp/$aref.bin" "$tmp/$nm.bin") x max)"; fail=1
+    elif [ $af = start ] && [ -n "$g" ] && [ "${g%% *}" -ne 0 ]; then echo "FAIL [$nm] guesses without read-ahead: $g"; fail=1
+    elif [ $af != start ] && { [ -z "$g" ] || [ "${g%% *}" -eq 0 ]; }; then echo "FAIL [$nm] no guess before the decline ('${g:-no report}')"; fail=1
+    elif logits_ok cpu_$fx $nm; then
+        echo "ok   [$nm] one read-ahead-off line, the chain and GPU experts on, logits bit-identical to read-ahead off and within $(relerr "$tmp/cpu_$fx.bin" "$tmp/$nm.bin") of the CPU (guesses, right: ${g:-0})"
+    fi
+done
+
 echo "== metal_state_handoff"
 # qwen38_decay: qwen38_tiny with A_log = -1.88 and dt_bias = 0 in its DeltaNet layers, so the
 # recurrent state decays by about 0.9 a token (the fixture's own: about 1e-6, the state hardly
@@ -422,15 +457,18 @@ for fx in qwen38_tiny qwen38_tiny_256_gguf decay; do
     chain_on $nm || continue
     f=$(forwards $nm)
     if [ "${f#* }" -eq 0 ]; then echo "FAIL [$nm] nothing declined ($f)"; fail=1; continue; fi
-    if [ "$(toks $nm)" != "$(toks cpu_$fx)" ]; then echo "FAIL [$nm] tokens '$(toks $nm)' vs '$(toks cpu_$fx)'"; fail=1; continue; fi
+    if [ -z "$(toks cpu_$fx)" ] || [ "$(toks $nm)" != "$(toks cpu_$fx)" ]; then echo "FAIL [$nm] tokens '$(toks $nm)' vs '$(toks cpu_$fx)'"; fail=1; continue; fi
     logits_ok cpu_$fx $nm || continue
     echo "ok   [$nm] the CPU's tokens, logits within $(relerr "$tmp/cpu_$fx.bin" "$tmp/$nm.bin") x max (forwards, declined: $f)"
 done
 # the decay fixture's chain without declines, against the same CPU run
-if eng m2_decay $tmp/qwen38_decay $tmp/qwen38_decay/ref.json QWEN38_METAL_EXACT=1 $REFP DUMP=$tmp/m2_decay.bin && chain_on m2_decay &&
-   [ "$(toks m2_decay)" = "$(toks cpu_decay)" ] && logits_ok cpu_decay m2_decay; then
-    echo "ok   [m2_decay] the CPU's tokens, logits within $(relerr "$tmp/cpu_decay.bin" "$tmp/m2_decay.bin") x max"
-else [ "$(toks m2_decay)" = "$(toks cpu_decay)" ] || { echo "FAIL [m2_decay] tokens differ"; fail=1; }; fi
+if eng m2_decay $tmp/qwen38_decay $tmp/qwen38_decay/ref.json QWEN38_METAL_EXACT=1 $REFP DUMP=$tmp/m2_decay.bin && chain_on m2_decay; then
+    if [ -z "$(toks cpu_decay)" ] || [ "$(toks m2_decay)" != "$(toks cpu_decay)" ]; then
+        echo "FAIL [m2_decay] tokens '$(toks m2_decay)' vs the CPU's '$(toks cpu_decay)'"; fail=1
+    elif logits_ok cpu_decay m2_decay; then
+        echo "ok   [m2_decay] the CPU's tokens, logits within $(relerr "$tmp/cpu_decay.bin" "$tmp/m2_decay.bin") x max"
+    fi
+fi
 
 echo "== kv growth"
 mkdir -p "$tmp/long"
@@ -454,6 +492,20 @@ if eng long_cpu "$tmp/long" "$tmp/long/ref.json" COLI_METAL=0 $REFP DUMP=$tmp/lo
         echo "ok   [kv growth 1300 tokens] the CPU's tokens, logits within $(relerr "$tmp/long_cpu.bin" "$tmp/long_mtl.bin") x max: $(toks long_mtl)"
     fi
 fi
+# growth with valid rows (final review): qwen38_decay with 2048 positions and a byte tokenizer, served
+# with a 1,020-token prompt in segments of 300 rows and 8 tokens decoded across position 1024: the
+# device caches grow twice with valid rows (dropped, uploaded again from the host); every served
+# step's logits the CPU's (tests/metal_qwen38_serve.py --segments)
+mkdir -p "$tmp/dseg"
+for f in "$tmp"/qwen38_decay/*; do ln -s "$f" "$tmp/dseg/"; done
+rm -f "$tmp/dseg/config.json" "$tmp/dseg/ref.json" "$tmp/dseg/.coli_usage" "$tmp/dseg/tokenizer.json"
+"${PYTHON:-python3}" -c '
+import json, sys
+c = json.load(open(sys.argv[1] + "/config.json"))
+(c.get("text_config") or c)["max_position_embeddings"] = 2048
+json.dump(c, open(sys.argv[2] + "/config.json", "w"))' "$tmp/qwen38_decay" "$tmp/dseg"
+"${PYTHON:-python3}" tools/make_edge_tiny_tokenizer.py --vocab-size 64 "$tmp/dseg" >/dev/null
+"${PYTHON:-python3}" tests/metal_qwen38_serve.py --segments "$tmp/dseg" || fail=1
 
 echo "== long prompt, fast mode"
 # Plan 2 Task 7a: the fast kernels (QWEN38_METAL_EXPERTS=0, QWEN38_METAL_EXACT unset: one DeltaNet

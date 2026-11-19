@@ -16,7 +16,7 @@
  * the exact kernels; QWEN38_METAL_EXPERTS=0 the routed experts on the CPU (M2);
  * QWEN38_EXPERT_CACHE_BYTES the GPU expert cache. Debug only (read once, no effect unset):
  * Q38M_CHECK_WEIGHTS, Q38M_LAYER_CHECK (1, 2), Q38M_FORCE_ROUTES, Q38M_DECLINE_EVERY,
- * Q38M_FAIL_SLOT_ALLOC, Q38M_REFUSE_AT. */
+ * Q38M_FAIL_SLOT_ALLOC, Q38M_REFUSE_AT, Q38M_AHEAD_EARLY, Q38M_AHEAD_FAIL. */
 #ifndef QWEN38_METAL_CHAIN_H
 #define QWEN38_METAL_CHAIN_H
 #include "qwen36_gpu.h"
@@ -500,7 +500,10 @@ static int q38m_grow(q36_tensor **t, size_t *have, size_t floats) {
 }
 
 /* The device's K/V/IK rows for `need` positions: 256, doubled to 1024, then 1024 more at a
- * time (qwen36's qg_reserve), the valid rows copied (the GPU idle). */
+ * time (qwen36's qg_reserve), the GPU idle. The device's rows are dropped (kv_valid = pk_valid =
+ * 0): q38m_push uploads them again from the host's K/V/IK, which are always current, and
+ * q38m_attention pools the index keys again from them (q38_qsa_pool from block 0). */
+static unsigned long long g_q38m_kv_grown, g_q38m_kv_regrow, g_q38m_kv_regrow_rows;   /* growths; those with valid rows, the rows */
 static int q38m_kv_reserve(Model *m, int need) {
     const Cfg *c = &m->c;
     if (need <= g_q38f.dcap) return 1;
@@ -521,24 +524,20 @@ static int q38m_kv_reserve(Model *m, int need) {
         free(nb);
         return 0;
     }
+    int dropped = 0;
     for (int i = 0; i < c->layers; i++) {
         if (!c->is_attn[i]) continue;
         Q38mL *L = &g_q38f.L[i];
         q36_tensor *kc = nb[(size_t)i * 4], *vc = nb[(size_t)i * 4 + 1], *ikc = nb[(size_t)i * 4 + 2], *pk = nb[(size_t)i * 4 + 3];
-        int rows = L->kv_valid < g_q38f.dcap ? L->kv_valid : g_q38f.dcap;
-        if (L->kc && rows > 0) {
-            for (size_t h = 0; h < KVH; h++) {
-                memcpy((char *)q36_tensor_data(kc) + h * cap * D * es, (char *)q36_tensor_data(L->kc) + h * g_q38f.dcap * D * es, (size_t)rows * D * es);
-                memcpy((char *)q36_tensor_data(vc) + h * cap * D * es, (char *)q36_tensor_data(L->vc) + h * g_q38f.dcap * D * es, (size_t)rows * D * es);
-            }
-            memcpy(q38m_f(ikc), q38m_f(L->ikc), (size_t)rows * ID * sizeof(float));
-            memcpy(q38m_f(pk), q38m_f(L->pk), (size_t)L->pk_valid * ID * sizeof(float));
-        } else L->kv_valid = L->pk_valid = 0;
+        if (L->kv_valid > dropped) dropped = L->kv_valid;
+        L->kv_valid = L->pk_valid = 0;
         q36_tensor_free(L->kc); q36_tensor_free(L->vc); q36_tensor_free(L->ikc); q36_tensor_free(L->pk);
         L->kc = kc; L->vc = vc; L->ikc = ikc; L->pk = pk;
     }
     free(nb);
     g_q38f.dcap = cap;
+    g_q38m_kv_grown++;
+    if (dropped > 0) { g_q38m_kv_regrow++; g_q38m_kv_regrow_rows += (unsigned long long)dropped; }
     return 1;
 }
 
@@ -873,8 +872,11 @@ static int q38m_mlp_dense(Model *m, int i, int n) {
     int ok = q38m_mm(g_q38f.lg, g_q38f.mixed, &g_q38m.L[i][6], n);
     if (g_q38x.on) {
         ok = ok && q38x_route(g_q38f.lg, n);
-        /* read-ahead (decode): the next layer's router on this row (qwen38_metal_experts.h) */
-        if (ok && q38x_ahead_wanted(i, n)) ok = q38m_mm(g_q38x.alg, g_q38f.mixed, &g_q38m.L[i + 1][6], 1) && q38x_ahead_route(i);
+        /* read-ahead (decode): the next layer's router on this row (qwen38_metal_experts.h); advice
+         * only, so a router that declines turns read-ahead off and the step goes on */
+        if (ok && q38x_ahead_wanted(i, n) &&
+            !(q38m_mm(g_q38x.alg, g_q38f.mixed, &g_q38m.L[i + 1][6], 1) && q38x_ahead_route(i)))
+            q38x_ahead_off("its router did not run on the GPU");
         return ok;
     }
     return ok && q38m_mlp_shared(m, i, n);
@@ -1330,13 +1332,18 @@ fail:
     return 0;
 }
 
+/* the chain's stats, also after it turned off mid-run (the steps it ran) */
 static void q38m_report(void) {
-    if (!g_mtl_chain) return;
-    if (!g_q38x.on) { fprintf(stderr, "[metal] qwen38 chain: %llu forwards, %llu declined\n", g_q38m_forwards, g_q38m_declined); return; }
-    QgcStats s = qgc_snapshot(&g_q38x.cache);
+    if (!g_mtl_chain && !g_q38m_forwards) return;
+    if (g_q38m_kv_grown)
+        fprintf(stderr, "[metal] qwen38 kv: device caches grown %llu times to %d rows, %llu of them with valid rows "
+                        "(%llu rows uploaded again from the host)\n", g_q38m_kv_grown, g_q38f.dcap, g_q38m_kv_regrow, g_q38m_kv_regrow_rows);
+    if (!g_q38x.on && !g_q38x.choices) { fprintf(stderr, "[metal] qwen38 chain: %llu forwards, %llu declined\n", g_q38m_forwards, g_q38m_declined); return; }
+    unsigned long long loads = g_q38x.loads, hits = g_q38x.hits;   /* q38x_free's, when the chain turned off */
+    if (g_q38x.on) { QgcStats s = qgc_snapshot(&g_q38x.cache); loads = s.loads; hits = s.hits; }
     fprintf(stderr, "[metal] qwen38 chain: %llu forwards, %llu declined, experts on GPU: %llu, loads: %llu, hits: %llu; "
                     "cache groups %llu, most experts in one layer %d, expert reads waited %.2f s%s\n",
-            g_q38m_forwards, g_q38m_declined, g_q38x.choices, (unsigned long long)s.loads, (unsigned long long)s.hits,
+            g_q38m_forwards, g_q38m_declined, g_q38x.choices, loads, hits,
             g_q38x.groups, g_q38x.most, g_q38x.wait_s, g_q38x.cpu_layers ? " (some layers' routes on the CPU: non-finite logits)" : "");
     if (g_q38x.guesses)
         fprintf(stderr, "[metal] qwen38 read-ahead: guesses: %llu, right: %llu (%.1f%%), announced (not cached): %llu\n",

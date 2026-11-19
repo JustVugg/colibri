@@ -16,6 +16,15 @@ serve park: a short request between two turns parks the conversation (its rows a
   a fresh engine, and the short request as it would alone.
 kv slots: KV_SLOTS=2 in serve mode turns the chain off with its one line.
 
+--segments <dir> (a fixture with a tokenizer and 2048 positions; metal_qwen38.sh gives it
+  qwen38_decay's weights) runs only this case: a 1,020-token prompt read in segments of 300
+  rows (COLI_PROMPT_SEGMENT=300, the serve's own prompt segments), then 8 tokens decoded
+  across position 1024. The device caches grow with valid rows twice (512 -> 1024 at the
+  second segment, 300 rows; 1024 -> 2048 in decode, 1024 rows), each growth dropping the
+  device's rows and uploading them again from the host; the report's `kv:` line must count
+  both. Every served step against the CPU engine's (COLI_METAL=0), both in reference
+  precision (Ruling P2-4) with the same segments: the same ids, logits within 1e-4.
+
 Prints `ok   [...]` / `FAIL [...]` lines like the shell test; exit 1 on a failure.
 """
 import os
@@ -59,9 +68,9 @@ class Engine:
         self.e = ServeEngine(ENGINE, ["1", "8"], env)
         self.steps = []   # the [LOGITS] lines of each request
 
-    def ask(self, rid, prompt, max_tok=8):
+    def ask(self, rid, prompt, max_tok=8, temp=None):
         before = len(LOGITS.findall("".join(self.e._err)))
-        reply = self.e.ask(rid, prompt, max_tok=max_tok)
+        reply = self.e.ask(rid, prompt, max_tok=max_tok) if temp is None else self.ask_temp(rid, prompt, max_tok, temp)
         # stderr is drained by a thread: wait until its step lines stop coming
         n, still = -1, 0
         while still < 5:
@@ -71,6 +80,30 @@ class Engine:
             n = m
         self.steps.append(LOGITS.findall("".join(self.e._err))[before:])
         return reply
+
+    def ask_temp(self, rid, prompt, max_tok, temp):
+        """ServeEngine.ask at a temperature: a greedy request (temperature 0) takes the step's
+        argmax without the dump, so only its first step's logits would be seen; logprobs
+        would read the prompt in one call (no segments). A temperature of 1e-4 samples the
+        argmax (rand() unseeded: the same draws in both engines) through serve_sample, which
+        dumps every step."""
+        p = self.e.p
+        p.stdin.write(f"SUBMIT {rid} 0 {len(prompt)} {max_tok} {temp} 1\n".encode() + prompt + b"\n")
+        p.stdin.flush()
+        chunks = []
+        while True:
+            line = p.stdout.readline()
+            if not line:
+                raise RuntimeError("engine closed mid-request:\n" + "".join(self.e._err)[-2000:])
+            text = line.decode("latin-1").rstrip("\n")
+            kind = text.split(" ", 1)[0]
+            if kind == "DATA":
+                chunks.append(p.stdout.read(int(text.split()[2])))
+                p.stdout.readline()
+            elif kind in ("DONE", "END"):
+                return b"".join(chunks)
+            elif kind == "ERROR":
+                raise RuntimeError(f"engine error: {text}")
 
     def close(self):
         return self.e.close()
@@ -110,7 +143,48 @@ def fresh(tok, prompt):
     return reply, e.steps[0], log
 
 
+SEG_ENV = {"GQ_EXACT": "1", "Q38_TRUNK_CPU_INT8": "0", "Q38_NATIVE_BF16": "1", "COLI_PROMPT_SEGMENT": "300",
+           "Q38_MAXT": "2048"}
+KV = re.compile(r"\[metal\] qwen38 kv: device caches grown (\d+) times to (\d+) rows, (\d+) of them with valid rows "
+                r"\((\d+) rows uploaded again from the host\)")
+
+
+def segments(fixture):
+    global FIXTURE
+    FIXTURE = Path(fixture)
+    x, prompt = 4711, bytearray()
+    for _ in range(1020):   # bytes 33..63: one token each in the fixture's byte vocabulary
+        x = (x * 1103515245 + 12345) % 2**31
+        prompt.append(33 + x % 31)
+    prompt = bytes(prompt)
+    runs = {}
+    for name, extra in (("cpu", {"COLI_METAL": "0"}), ("metal", {"QWEN38_METAL_EXACT": "1"})):
+        e = Engine(FIXTURE / "tokenizer.json", **SEG_ENV, **extra)
+        reply = e.ask("1", prompt, temp="0.0001")
+        runs[name] = (reply, e.steps[0], e.close())
+    log = runs["metal"][2]
+    if not chain_ran("serve segments", log):
+        return failed
+    kv = KV.findall(log)
+    grown = [int(v) for v in kv[-1]] if kv else None
+    ok, detail = same_steps(runs["metal"][1], runs["cpu"][1])
+    regrown = grown is not None and grown[2] >= 2 and grown[3] >= 1024 + 300 and grown[1] >= 2048
+    fw = [int(m.group(1)) for m in REPORT.finditer(log)]
+    regrown = regrown and fw and fw[-1] >= 4 + 7   # four segments, seven decode steps
+    say(ok and regrown and runs["metal"][0] == runs["cpu"][0] and len(runs["metal"][1]) == 8,
+        "serve segments 1020 tokens, kv growth with valid rows",
+        "reply %r vs the CPU's %r, %d steps %s, %s forwards; kv grown %s" % (runs["metal"][0], runs["cpu"][0], len(runs["metal"][1]), detail,
+                                                                        fw[-1] if fw else "no",
+                                                               "%d times to %d rows, %d with valid rows (%d rows uploaded again)"
+                                                               % tuple(grown) if grown else "no kv line"))
+    if not regrown:
+        print("\n".join(line for line in log.splitlines() if "metal" in line or "segment" in line))
+    return failed
+
+
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--segments":
+        return segments(sys.argv[2])
     with tempfile.TemporaryDirectory() as d:
         subprocess.run([sys.executable, str(HERE / "tools" / "make_edge_tiny_tokenizer.py"), "--vocab-size", "64", d],
                        check=True, stdout=subprocess.DEVNULL)
