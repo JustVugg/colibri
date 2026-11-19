@@ -775,7 +775,7 @@ static int q38m_gr_read(const Cfg *c, const Q38mW *w /* down, up, inject */, q36
 
 /* Q38M_FORCE_ROUTES=2 (layer check): the chunk's rows past the budget take the reference run's
  * selection (the GPU's batch flushed first) */
-static int g_q38m_lc_qforced, g_q38m_lc_qset, g_q38m_lc_qswap;
+static int g_q38m_lc_qforced, g_q38m_lc_qset, g_q38m_lc_qswap, g_q38m_lc_qrows;   /* qrows: the rows past the budget held */
 static double g_q38m_lc_qgap;   /* the largest |score| gap between two blocks the two selections swapped */
 static int q38m_lc_force_sel(int i, int n, int pb);   /* below, beside the layer check */
 
@@ -1049,6 +1049,7 @@ static int q38m_lc_force_sel(int i, int n, int pb) {
     for (int r = 0; r < n; r++) {
         const int *src = g_q38m_lc_sel[i] + (size_t)(pb + r) * g_q38m_lc_selrow;
         if (src[0] < 0) continue;
+        g_q38m_lc_qrows++;
         int *dst = sel + (size_t)r * g_q38m_lc_selrow;
         if (dst[0] != src[0] || memcmp(dst + 1, src + 1, (size_t)src[0] * sizeof(int))) {
             g_q38m_lc_qforced++;
@@ -1225,9 +1226,9 @@ static int q38m_forward(Model *m, const int *ids, int S, int pos_base, int nlogi
                         i, lc->qmargin, lc->qrow, lc->qzero);
         }
         if (g_q38m_lc_sel) {
-            fprintf(stderr, "[q38m-layer] QSA forced: %d rows' selections differed from the reference run's (%d in their blocks, "
+            fprintf(stderr, "[q38m-layer] QSA forced: %d rows past the budget held; %d rows' selections differed from the reference run's (%d in their blocks, "
                             "%d blocks swapped, the largest score gap between swapped blocks %.3g; the rest in order only)\n",
-                    g_q38m_lc_qforced, g_q38m_lc_qset, g_q38m_lc_qswap, g_q38m_lc_qgap);
+                    g_q38m_lc_qrows, g_q38m_lc_qforced, g_q38m_lc_qset, g_q38m_lc_qswap, g_q38m_lc_qgap);
             for (int i = 0; i < L; i++) free(g_q38m_lc_sel[i]);
             free(g_q38m_lc_sel); g_q38m_lc_sel = NULL;
         }

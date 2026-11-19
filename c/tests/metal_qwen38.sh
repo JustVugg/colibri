@@ -34,7 +34,8 @@
 #   and logits, and Q38M_LAYER_CHECK=2 (each layer, the routes, the CPU's own one-ulp lines).
 # layer test: Q38M_LAYER_CHECK=1 (debug) runs the CPU's q38_layer_forward beside the first
 #   step and compares each layer's output streams, `[q38m-layer] L<i> worst=<e>` (max
-#   |gpu-cpu| over max |cpu|), FAIL over 1e-4, exact mode.
+#   |gpu-cpu| over max |cpu|), FAIL over 1e-4, exact mode; then Q38M_FORCE_ROUTES=1 and 2 on the
+#   1,300-token prompt: rows held to the reference run's routes and selections (counted > 0).
 # serve: tests/metal_qwen38_serve.py (two turns, a regenerated answer, a parked conversation:
 #   every served step's logits against a fresh engine's; KV_SLOTS=2 in a serve), then
 #   tests/test_qwen38_prefix_serve.py and test_qwen38_prefix_store.py with the chain on.
@@ -332,16 +333,36 @@ fi
 echo "== layer test"
 for fx in qwen38_tiny qwen38_tiny_256_gguf; do
     nm=layers_$fx
-    # Q38M_FORCE_ROUTES=2: the reference run's routes and QSA selections past the budget (the
-    # same as the chain's here: no FAIL, and no selection replaced, so the two formats agree)
-    eng $nm ./$fx ./$fx/ref.json Q38M_LAYER_CHECK=1 Q38M_FORCE_ROUTES=2 QWEN38_METAL_EXACT=1 $REFP || continue
-    n=$(grep -c '^\[q38m-layer\] L.*worst=.*; forced$' "$tmp/$nm.log")
-    if [ "$n" -lt 4 ] || grep '^\[q38m-layer\]' "$tmp/$nm.log" | grep -qF FAIL ||
-       ! grep -qF "[q38m-layer] QSA forced: 0 rows' selections differed" "$tmp/$nm.log"; then
+    eng $nm ./$fx ./$fx/ref.json Q38M_LAYER_CHECK=1 QWEN38_METAL_EXACT=1 $REFP || continue
+    n=$(grep -c '^\[q38m-layer\] L.*worst=' "$tmp/$nm.log")
+    if [ "$n" -lt 4 ] || grep '^\[q38m-layer\]' "$tmp/$nm.log" | grep -qF FAIL; then
         echo "FAIL [$nm] $n layer lines"; grep '^\[q38m-layer\]' "$tmp/$nm.log"; fail=1; continue
     fi
     worst=$(grep '^\[q38m-layer\] L.*worst=' "$tmp/$nm.log" | sed 's/.*worst=\([^ ]*\).*/\1/' | sort -g | tail -1)
     echo "ok   [$nm] $n layers, worst $worst"
+done
+# Q38M_FORCE_ROUTES on the kv-growth prompt (1,300 tokens on qwen38_tiny: its QSA budget is 4
+# positions, so nearly every row is past it): =1 holds rows to the reference run's routes (some
+# rows' router logits moved), =2 also writes the reference run's selection into every row past
+# the budget; the chain's own picks are the reference's here, so no selection may differ (the
+# two formats agree) and nothing FAILs
+for force in 1 2; do
+    nm=forced$force
+    eng $nm "$tmp/long" "$tmp/long/ref.json" Q38M_LAYER_CHECK=1 Q38M_FORCE_ROUTES=$force QWEN38_METAL_EXACT=1 $REFP || continue
+    n=$(grep -c '^\[q38m-layer\] L.*worst=.*; forced$' "$tmp/$nm.log")
+    held=$(sed -n 's/^\[q38m-layer\] L[0-9]* forced: \([0-9]*\) rows held.*/\1/p' "$tmp/$nm.log" | awk '{s += $1} END {print s + 0}')
+    q=$(sed -n "s/^\[q38m-layer\] QSA forced: \([0-9]*\) rows past the budget held; \([0-9]*\) rows' selections differed.*/\1 \2/p" "$tmp/$nm.log")
+    bad=""
+    [ "$n" -lt 4 ] && bad="$n forced layer lines"
+    [ "$held" -gt 0 ] || bad="$bad; no row held to the reference run's routes"
+    grep '^\[q38m-layer\]' "$tmp/$nm.log" | grep -qF FAIL && bad="$bad; a layer FAILs"
+    if [ $force = 2 ]; then
+        if [ -z "$q" ] || [ "${q%% *}" -eq 0 ]; then bad="$bad; no row past the budget held ('${q:-no QSA line}')"
+        elif [ "${q#* }" -ne 0 ]; then bad="$bad; ${q#* } rows' selections differ from the reference run's"; fi
+    elif [ -n "$q" ]; then bad="$bad; a QSA line with Q38M_FORCE_ROUTES=1"; fi
+    if [ -n "$bad" ]; then echo "FAIL [$nm]${bad#;}"; grep '^\[q38m-layer\]' "$tmp/$nm.log" | grep -v ' by chunk' | head -20; fail=1; continue; fi
+    worst=$(grep '^\[q38m-layer\] L.*worst=' "$tmp/$nm.log" | sed 's/.*worst=\([^ ]*\).*/\1/' | sort -g | tail -1)
+    echo "ok   [$nm 1300 tokens] $n layers, worst $worst, $held rows held to the reference's routes${q:+, ${q%% *} QSA rows held, ${q#* } differing}"
 done
 
 echo "== serve"
