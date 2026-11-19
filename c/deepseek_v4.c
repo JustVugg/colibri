@@ -20920,6 +20920,17 @@ static int v4_omp_reserve_loader_cpus(void) {
     int team = logical - COLI_V4_EXPERT_LOADER_COUNT;
     if (team < 2) return 0; /* tiny machine: leave the OpenMP default alone */
     int phys = coli_physical_cores();   /* 0: not known, and then no guess */
+    /* A container's CPU quota (#2914): the compute team no larger than the CPUs it lets
+     * run at once (the loader lanes block in pread and need no whole CPU, see above). */
+    double cg_quota = 0.0;
+    const int cg = compat_cgroup_cpu_limit(&cg_quota);
+    if (cg > 0 && cg < (phys > 0 && phys < logical && phys < team ? phys : team)) {
+        omp_set_num_threads(cg);
+        fprintf(stderr, "[OMP] deepseek-v4: %d compute threads, bounded by the container's CPU quota "
+                        "(%.2f CPUs, %d logical); OMP_NUM_THREADS=<n> overrides, COLI_NO_OMP_TUNE=1 disables\n",
+                cg, cg_quota, logical);
+        return 1;
+    }
     if (phys > 0 && phys < logical && phys < team) {
         omp_set_num_threads(phys);
         fprintf(stderr, "[OMP] deepseek-v4: %d compute threads (the physical cores of %d logical "

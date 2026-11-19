@@ -1779,7 +1779,7 @@ static void q38cc_pool_init(Model *m) {
         int teams[2] = {0, 0}, nt = 1;
 #ifdef _OPENMP
         teams[0] = omp_get_max_threads();
-        if (omp_get_num_procs() > teams[0]) teams[nt++] = omp_get_num_procs();
+        if (coli_cpu_budget() > teams[0]) teams[nt++] = coli_cpu_budget();   /* never past a container's CPU quota (#2914) */
 #endif
         for (int ti = 0; ti < nt; ti++) {
             g_q38cc_pg_team = teams[ti];
@@ -2738,7 +2738,8 @@ static const uint8_t *q38cc_srv_where(void *ctx, int k) {
     if (ch->hd_base && k >= ch->hd_k0) return ch->hd_base + (size_t)(k - ch->hd_k0) * ch->hd_stride;   /* the MTP head's */
     return (const uint8_t *)q38cc_pool_host(ch, k);
 }
-/* COLI_CUDA_CHAIN_SERVE_THREADS, else the logical CPUs less four (the recording thread, the
+/* COLI_CUDA_CHAIN_SERVE_THREADS, else the logical CPUs (no more than a container's CPU quota
+ * lets run, coli_cpu_budget) less four (the recording thread, the
  * driver's, the system's), at most 16, none below two: on an i5-13500 (20 logical CPUs) a decode
  * after a 452-token prompt took 49.7-50.2 tok/s on the recording thread, 52.4-52.7 with 12
  * threads, 52.3-52.9 with 16 and 46.1-46.9 with 20 */
@@ -2746,7 +2747,7 @@ static int q38cc_srv_threads(void) {
     const char *e = getenv("COLI_CUDA_CHAIN_SERVE_THREADS");
     if (e && *e) return atoi(e) > 0 ? atoi(e) : 0;
 #ifdef _OPENMP
-    const int n = omp_get_num_procs() - 4;
+    const int n = coli_cpu_budget() - 4;
     return n < 2 ? 0 : n > 16 ? 16 : n;
 #else
     return 0;
@@ -2829,10 +2830,12 @@ static int q38cc_head_card(Q38CChain *ch, Model *m) {
     uint8_t *hb = base ? (uint8_t *)malloc((size_t)B * stride) : NULL;
     CcExpert *tab = hb ? (CcExpert *)calloc((size_t)E, sizeof *tab) : NULL;
     int ok = tab != NULL;
+    const int nthr = coli_cpu_budget();   /* the CPUs, no more than a container's quota lets run (#2914) */
+    (void)nthr;   /* a build without OpenMP ignores the pragma */
     for (int e0 = 0; e0 < E && ok; e0 += B) {
         const int ne = E - e0 < B ? E - e0 : B;
         int bad = 0;
-        #pragma omp parallel for schedule(dynamic, 1) reduction(| : bad) num_threads(omp_get_num_procs())
+        #pragma omp parallel for schedule(dynamic, 1) reduction(| : bad) num_threads(nthr)
         for (int k = 0; k < ne * 3; k++) {   /* an expert's matrix */
             const int x = k / 3, q = k % 3, rows = q < 2 ? I : H, cols = q < 2 ? H : I;
             const int64_t rb = gq_row_bytes(t[q]->type, cols), qb = q < 2 ? qg : qd;

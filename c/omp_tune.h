@@ -263,7 +263,9 @@ static inline void coli_omp_tune_threads(const char *engine)
         bounded_by_cgroup = 1;
     }
 
-    if (team >= logical && !bounded_by_cgroup) return;   /* niente SMT da evitare: silenzio */
+    /* never above OpenMP's own default: that is the affinity mask, a container's cpuset
+     * (a quota of 7 CPUs on a cpuset of 4 stays at the 4) */
+    if (team >= logical) return;           /* niente da evitare: silenzio */
 
     omp_set_num_threads(team);
     if (bounded_by_cgroup)
@@ -283,6 +285,22 @@ static inline void coli_omp_tune_threads(const char *engine)
                 engine, phys, logical);
 #else
     (void)engine;
+#endif
+}
+
+/* The CPUs a team sized from the machine may keep busy: OpenMP's processor count (the
+ * affinity mask), no more than a container's CPU quota lets run at once
+ * (compat_cgroup_cpu_limit, #2914). For the teams a probe or a serving thread pool
+ * sizes from the CPU count instead of taking coli_omp_tune_threads's team: under a
+ * quota of 7.65 CPUs on a 96-CPU host, omp_get_num_procs() says 96. */
+static inline int coli_cpu_budget(void)
+{
+#ifdef _OPENMP
+    const int n = omp_get_num_procs();
+    const int q = compat_cgroup_cpu_limit(NULL);
+    return q > 0 && q < n ? q : n;
+#else
+    return 1;
 #endif
 }
 

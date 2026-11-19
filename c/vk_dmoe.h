@@ -696,7 +696,7 @@ static void vkc_dmoe_pc_probe(VkcDmoe *d) {
     for (size_t k = 0; k < (size_t)R * D; k++) x[k] = (float)((k * 2654435761u >> 16) & 1023) / 512.f - 1.f;
     int teams[2] = {vkc_hyb_threads(), 0}, nt = 1;
 #ifdef _OPENMP
-    if (omp_get_num_procs() > teams[0]) teams[nt++] = omp_get_num_procs();
+    if (coli_cpu_budget() > teams[0]) teams[nt++] = coli_cpu_budget();   /* never past a container's CPU quota (#2914) */
 #endif
     double kept = 0;
     for (int ti = 0; ti < nt; ti++) {
