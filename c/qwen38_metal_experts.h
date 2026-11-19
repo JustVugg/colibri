@@ -25,7 +25,18 @@
  *
  * Size: QWEN38_EXPERT_CACHE_BYTES, else min(all experts' bytes, max(6 GiB, physical RAM - the
  * dense resident bytes - 12 GiB)); slots = bytes / payload, at most keys + group (that many when the
- * bytes hold every expert: no expert is read twice). */
+ * bytes hold every expert: no expert is read twice).
+ *
+ * Read-ahead (QWEN38_METAL_AHEAD, decode only: a step of one row): with layer i's router the GPU
+ * also runs layer i + 1's router on the same MLP row (q38m_mm + q36_router_softmax +
+ * q36_router_select, top Q38X_AHEAD_GUESSES; the residual changes little from one layer to the
+ * next, so its likeliest experts are mostly the ones layer i + 1 chooses). After the sync the
+ * guesses the cache does not hold are announced to the OS (gguf_advise: posix_fadvise
+ * WILLNEED, on macOS fcntl F_RDADVISE through compat.h) for their three GGUF byte ranges, once
+ * layer i + 1's trunk is submitted (qwen36's qg_advise_ahead and qwen36_advice_schedule.h), so
+ * the SSD reads them while the GPU computes it and the loader's preads find the page cache
+ * warm. Advice only: a wrong guess costs a read, never a result. The report's `guesses: G,
+ * right: R` counts the guesses compared with layer i + 1's routes. */
 #ifndef QWEN38_METAL_EXPERTS_H
 #define QWEN38_METAL_EXPERTS_H
 #include <dispatch/dispatch.h>
@@ -34,6 +45,11 @@
 #include "qwen36_selected_loader.h"
 
 #define Q38X_CHUNK_BYTES ((size_t)256 << 20)   /* slots are views of buffers of up to this size */
+#define Q38X_AHEAD_GUESSES 6     /* as qwen36's QG_AHEAD_GUESSES */
+#define Q38X_AHEAD_DEFAULT 0     /* QWEN38_METAL_AHEAD unset (docs/experiments/qwen38-metal-ahead-*) */
+#if defined(__APPLE__) && !defined(POSIX_FADV_WILLNEED)
+#error "qwen38 read-ahead: compat.h (posix_fadvise -> F_RDADVISE) must come before this header"
+#endif
 
 static struct {
     int on, E, K, H, I, layers, group;
@@ -53,6 +69,12 @@ static struct {
     double wait_s;
     Model *m;       /* the model whose CPU expert caches were cut to one slot */
     int *cap0;      /* [layer]: their capacities before, put back by q38x_free */
+    /* read-ahead: on, guesses a row (min(top-k, 6)), the guesses' GPU scratch (one row), the
+     * layer whose router ran ahead (-1: none this layer), the guesses waiting to be compared with
+     * their layer's routes and to be announced (their layer, -1: none), early (Q38M_AHEAD_EARLY) */
+    int ahead, ahead_k, ahead_from, guess_layer, guess_n, guess[Q38X_AHEAD_GUESSES], adv_layer, early;
+    q36_tensor *alg, *aprob, *aids, *awts;
+    unsigned long long guesses, right, advised;
 } g_q38x;
 
 static void q38x_off(const char *why) {
@@ -143,6 +165,10 @@ static void q38x_free(void) {
     for (int i = 0; i < g_q38x.nchunks; i++) q36_tensor_free(g_q38x.chunk[i]);
     free(g_q38x.slot); free(g_q38x.chunk); free(g_q38x.t); free(g_q38x.eb); free(g_q38x.ty);
     q38x_free_scratch();
+    q36_tensor *at[] = { g_q38x.alg, g_q38x.aprob, g_q38x.aids, g_q38x.awts };
+    for (size_t k = 0; k < sizeof at / sizeof at[0]; k++) q36_tensor_free(at[k]);
+    g_q38x.alg = g_q38x.aprob = g_q38x.aids = g_q38x.awts = NULL;
+    g_q38x.ahead = 0; g_q38x.ahead_from = g_q38x.guess_layer = g_q38x.adv_layer = -1;
     g_q38x.slot = g_q38x.chunk = NULL; g_q38x.t = NULL; g_q38x.eb = NULL; g_q38x.ty = NULL;
     g_q38x.nslots = 0; g_q38x.nchunks = 0;
     g_q38x.on = g_q38x.cache_on = g_q38x.loader_on = g_q38x.pending = 0;
@@ -257,6 +283,19 @@ static int q38x_start(Model *m) {
     }
     if (!qsl_init(&g_q38x.loader, &g_q38x.cache)) { q38x_free(); q38x_off("the expert loader's thread did not start"); return 0; }
     g_q38x.loader_on = 1;
+    g_q38x.ahead_from = g_q38x.guess_layer = g_q38x.adv_layer = -1;
+    const char *ah = getenv("QWEN38_METAL_AHEAD");
+    if (ah && *ah ? strcmp(ah, "0") != 0 : Q38X_AHEAD_DEFAULT) {
+        const size_t A = (size_t)(K < Q38X_AHEAD_GUESSES ? K : Q38X_AHEAD_GUESSES);
+        g_q38x.alg = q36_tensor_new((size_t)E * 4); g_q38x.aprob = q36_tensor_new((size_t)E * 4);
+        g_q38x.aids = q36_tensor_new(A * 4); g_q38x.awts = q36_tensor_new(A * 4);
+        if (!g_q38x.alg || !g_q38x.aprob || !g_q38x.aids || !g_q38x.awts) {
+            q38x_free(); q38x_off("no device memory for the read-ahead's router"); return 0;
+        }
+        g_q38x.ahead = 1; g_q38x.ahead_k = (int)A;
+        const char *ea = getenv("Q38M_AHEAD_EARLY");   /* debug: announce while the layer's own reads run */
+        g_q38x.early = ea && !strcmp(ea, "1");
+    }
     g_q38x.on = 1;
     /* the CPU's own expert cache serves only a step the chain hands back: one slot a layer
      * (its slot table stays: q38x_free puts the capacity back) */
@@ -267,8 +306,10 @@ static int q38x_start(Model *m) {
         g_q38x.cap0[l] = lc->cap;
         if (lc->slots && lc->cap > 1) lc->cap = lc->n > 1 ? lc->n : 1;
     }
-    fprintf(stderr, "[qwen38-metal] GPU experts: %zu slots of %zu bytes (%.2f GiB%s), groups of %d; the CPU's expert cache: 1 slot a layer\n",
-            slots, payload, (double)slots * payload / 1073741824.0, cb && *cb ? ", QWEN38_EXPERT_CACHE_BYTES" : "", K);
+    fprintf(stderr, "[qwen38-metal] GPU experts: %zu slots of %zu bytes (%.2f GiB%s), groups of %d; the CPU's expert cache: 1 slot a layer; "
+                    "read-ahead %s\n",
+            slots, payload, (double)slots * payload / 1073741824.0, cb && *cb ? ", QWEN38_EXPERT_CACHE_BYTES" : "", K,
+            !g_q38x.ahead ? "off" : g_q38x.early ? "on (early, Q38M_AHEAD_EARLY)" : "on");
     return 1;
 }
 
@@ -290,6 +331,57 @@ static int q38x_route(q36_tensor *lg, int n) {
            q36_router_select(g_q38x.ids, g_q38x.wts, g_q38x.prob, n, g_q38x.E, g_q38x.K, 1, 1);
 }
 
+/* read-ahead: does layer i's step of n rows run layer i + 1's router too (decode, not the last) */
+static int q38x_ahead_wanted(int i, int n) { return g_q38x.on && g_q38x.ahead && n == 1 && i + 1 < g_q38x.layers; }
+/* its routes from the logits q38m_mm wrote into alg (encoded after layer i's own router) */
+static int q38x_ahead_route(int i) {
+    g_q38x.ahead_from = i;
+    return q36_router_softmax(g_q38x.aprob, g_q38x.alg, NULL, 1, g_q38x.E) &&
+           q36_router_select(g_q38x.aids, g_q38x.awts, g_q38x.aprob, 1, g_q38x.E, g_q38x.ahead_k, 1, 1);
+}
+/* a new step: nothing carried over from the last one */
+static void q38x_ahead_reset(void) { g_q38x.ahead_from = g_q38x.guess_layer = g_q38x.adv_layer = -1; }
+/* the guesses for layer i against its routes (row 0, a step of one row) */
+static void q38x_ahead_score(int i, const int32_t *ids, int n) {
+    if (g_q38x.guess_layer != i) return;
+    g_q38x.guess_layer = -1;
+    if (n != 1) return;
+    for (int j = 0; j < g_q38x.guess_n; j++)
+        for (int z = 0; z < g_q38x.K; z++)
+            if (ids[z] == g_q38x.guess[j]) { g_q38x.right++; break; }
+    g_q38x.guesses += (unsigned long long)g_q38x.guess_n;
+}
+/* after layer i's sync: layer i's guesses scored against its routes, then the guesses for layer
+ * i + 1, if its router ran ahead */
+static void q38x_ahead_take(int i, int n) {
+    if (g_q38x.guess_layer == i) q38x_ahead_score(i, (const int32_t *)q36_tensor_data(g_q38x.ids), n);
+    if (g_q38x.ahead_from != i) return;
+    g_q38x.ahead_from = -1;
+    const int32_t *a = (const int32_t *)q36_tensor_data(g_q38x.aids);
+    int k = 0;
+    for (int j = 0; j < g_q38x.ahead_k; j++)
+        if (a[j] >= 0 && a[j] < g_q38x.E) g_q38x.guess[k++] = a[j];
+    g_q38x.guess_n = k;
+    g_q38x.guess_layer = g_q38x.adv_layer = k ? i + 1 : -1;
+}
+/* the guesses for `layer` the cache does not hold, announced to the OS: their gate, up and down
+ * bytes in the GGUF (advice only; flush first submits what is encoded, so the GPU runs it while
+ * the SSD reads) */
+static void q38x_ahead_emit(int layer, int flush) {
+    if (g_q38x.adv_layer != layer || layer < 0) return;
+    g_q38x.adv_layer = -1;
+    if (flush) q36_gpu_flush();
+    for (int j = 0; j < g_q38x.guess_n; j++) {
+        const int e = g_q38x.guess[j];
+        if (qgc_contains(&g_q38x.cache, layer * g_q38x.E + e)) continue;
+        for (int k = 0; k < 3; k++) {
+            const gguf_tensor *t = g_q38x.t[layer][k];
+            const int64_t eb = (int64_t)g_q38x.eb[layer][k];
+            gguf_advise(q38_gg_ctx_of(t), t, (int64_t)e * eb, eb);
+        }
+        g_q38x.advised++;
+    }
+}
 /* the routed experts of layer i's n rows on the GPU, after the sync: their sum with the shared
  * expert into blk. 1 done, 0 a kernel refused, -1 the routes are not valid ids (the caller runs
  * the M2 path; nothing encoded). shared() encodes the shared expert (gate x shared in shd). */
@@ -334,7 +426,10 @@ static int q38x_moe(Model *m, int i, int n, q36_tensor *x, q36_tensor *shd, q36_
             exit(3);
         }
         g_q38x.groups++;
-        if (g0 == 0) ok = (!shared || shared(m, i, n)) && q36_gpu_flush();   /* while the reads run */
+        if (g0 == 0) {
+            ok = (!shared || shared(m, i, n)) && q36_gpu_flush();   /* while the reads run */
+            if (g_q38x.early) q38x_ahead_emit(i + 1, 0);   /* debug: behind this group's reads */
+        }
         double t0 = now_s();
         int got = qsl_wait(&g_q38x.loader, NULL, NULL, payload);
         g_q38x.wait_s += now_s() - t0;

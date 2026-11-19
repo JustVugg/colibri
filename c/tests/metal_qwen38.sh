@@ -370,6 +370,34 @@ if eng glong_cpu "$tmp/glong" "$tmp/glong/ref.json" COLI_METAL=0 $REFP DUMP=$tmp
     done
 fi
 
+echo "== ahead tokens"
+# Plan 2 Task 9: QWEN38_METAL_AHEAD=1 runs the next layer's router on each decode layer's MLP
+# rows and announces the uncached guesses' GGUF bytes to the OS (F_RDADVISE): advice only, so
+# the tokens and the final logits are bit-identical to QWEN38_METAL_AHEAD=0, fast and exact, on
+# the tiny GGUF (top-k 2: two guesses) and the IQ4 variant (top-k 10: six guesses). With it on
+# the report says `guesses: G, right: R` with G > 0 and R <= G; off, no guess.
+ah_n() { sed -n 's/.*guesses: \([0-9]*\), right: \([0-9]*\).*/\1 \2/p' "$tmp/$1.log" | tail -1; }
+for fx in gguf iq4; do
+    case $fx in gguf) dir=./qwen38_tiny_256_gguf;; *) dir=$iq;; esac
+    [ -f "$dir/ref.json" ] || { echo "FAIL [ahead $fx] no fixture"; fail=1; continue; }
+    for exact in 1 0; do
+        an=ahead_${fx}_exact$exact   # eng sets nm
+        eng ${an}_off "$dir" "$dir/ref.json" QWEN38_METAL_AHEAD=0 QWEN38_METAL_EXACT=$exact $REFP DUMP=$tmp/${an}_off.bin &&
+            eng ${an}_on "$dir" "$dir/ref.json" QWEN38_METAL_AHEAD=1 QWEN38_METAL_EXACT=$exact $REFP DUMP=$tmp/${an}_on.bin &&
+            chain_on ${an}_off && chain_on ${an}_on && gx_on ${an}_on || continue
+        g=$(ah_n ${an}_on); g0=$(ah_n ${an}_off)
+        if [ -z "$(toks ${an}_off)" ] || [ "$(toks ${an}_on)" != "$(toks ${an}_off)" ]; then
+            echo "FAIL [$an] tokens with read-ahead '$(toks ${an}_on)' vs without '$(toks ${an}_off)'"; fail=1
+        elif ! cmp -s "$tmp/${an}_off.bin" "$tmp/${an}_on.bin"; then
+            echo "FAIL [$an] final logits differ with read-ahead ($(relerr "$tmp/${an}_off.bin" "$tmp/${an}_on.bin") x max)"; fail=1
+        elif [ -z "$g" ] || [ "${g%% *}" -eq 0 ] || [ "${g#* }" -gt "${g%% *}" ]; then
+            echo "FAIL [$an] guesses, right: '${g:-no report}'"; fail=1
+        elif [ -n "$g0" ] && [ "${g0%% *}" -ne 0 ]; then
+            echo "FAIL [$an] guesses with QWEN38_METAL_AHEAD=0: $g0"; fail=1
+        else echo "ok   [$an] the same tokens and bit-identical logits with read-ahead; guesses: ${g%% *}, right: ${g#* }"; fi
+    done
+done
+
 echo "== metal_state_handoff"
 # qwen38_decay: qwen38_tiny with A_log = -1.88 and dt_bias = 0 in its DeltaNet layers, so the
 # recurrent state decays by about 0.9 a token (the fixture's own: about 1e-6, the state hardly

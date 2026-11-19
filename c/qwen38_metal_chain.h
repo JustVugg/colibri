@@ -871,7 +871,12 @@ static int q38m_mlp_shared(Model *m, int i, int n) {
  * the sync (with the GPU experts it runs while their reads do, q38x_moe) */
 static int q38m_mlp_dense(Model *m, int i, int n) {
     int ok = q38m_mm(g_q38f.lg, g_q38f.mixed, &g_q38m.L[i][6], n);
-    if (g_q38x.on) return ok && q38x_route(g_q38f.lg, n);
+    if (g_q38x.on) {
+        ok = ok && q38x_route(g_q38f.lg, n);
+        /* read-ahead (decode): the next layer's router on this row (qwen38_metal_experts.h) */
+        if (ok && q38x_ahead_wanted(i, n)) ok = q38m_mm(g_q38x.alg, g_q38f.mixed, &g_q38m.L[i + 1][6], 1) && q38x_ahead_route(i);
+        return ok;
+    }
     return ok && q38m_mlp_shared(m, i, n);
 }
 
@@ -1178,7 +1183,7 @@ static int q38m_forward(Model *m, const int *ids, int S, int pos_base, int nlogi
         return 0;
     }
     if (check) q38m_layer_check_ref(m, ids, S, pos_base, hyper_h);
-    if (g_q38x.on) qgc_expected_phase(&g_q38x.cache, S, pos_base);   /* no lease in flight between steps */
+    if (g_q38x.on) { qgc_expected_phase(&g_q38x.cache, S, pos_base); q38x_ahead_reset(); }   /* no lease in flight between steps */
     const char *what = NULL;
     int failed_layer = -1, lo_first = S - nlogits, c0;
     for (c0 = 0; c0 < S; c0 += Q38M_CHUNK) {
@@ -1196,8 +1201,10 @@ static int q38m_forward(Model *m, const int *ids, int S, int pos_base, int nlogi
             if (c->is_attn[i] ? !q38m_attention(m, i, n, pb) : !q38m_deltanet(m, i, n)) { what = c->is_attn[i] ? "the attention" : "the DeltaNet"; goto fail; }
             if (!q38_hc_apply(g_q38f.hyper, g_q38f.inj_a, g_q38f.blk, n, H, C) ||
                 !q38m_gr_read(c, &w[3], Ld->mlp_norm, n, g_q38f.inj_m) || !q38m_mlp_dense(m, i, n)) { what = "the MLP's dense part"; goto fail; }
+            q38x_ahead_emit(i, 1);   /* the guesses for this layer, once its trunk is submitted */
             if (!q36_gpu_sync()) { what = "a GPU batch"; goto fail; }
             q38x_settle(0);   /* the GPU is past the last layer's experts */
+            q38x_ahead_take(i, n);
             if (check) {
                 if (c->is_attn[i]) q38m_lc_qsa(m, i, n, pb);
                 q38m_lc_routes(m, i, n, c0);
@@ -1331,6 +1338,9 @@ static void q38m_report(void) {
                     "cache groups %llu, most experts in one layer %d, expert reads waited %.2f s%s\n",
             g_q38m_forwards, g_q38m_declined, g_q38x.choices, (unsigned long long)s.loads, (unsigned long long)s.hits,
             g_q38x.groups, g_q38x.most, g_q38x.wait_s, g_q38x.cpu_layers ? " (some layers' routes on the CPU: non-finite logits)" : "");
+    if (g_q38x.guesses)
+        fprintf(stderr, "[metal] qwen38 read-ahead: guesses: %llu, right: %llu (%.1f%%), announced (not cached): %llu\n",
+                g_q38x.guesses, g_q38x.right, 100.0 * (double)g_q38x.right / (double)g_q38x.guesses, g_q38x.advised);
 }
 
 #endif
