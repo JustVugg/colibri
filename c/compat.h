@@ -902,7 +902,9 @@ static inline int compat_cgroup_cpu_quota(const char *root, const char *proc_cgr
 
 /* Returns the maximum safe OpenMP thread count under container cgroup CPU quota,
  * or 0 if unconstrained / not measurable. Uses the floor of fractional quota
- * (e.g. 7.65 -> 7) to avoid CFS quota throttling (#2914). */
+ * (e.g. 7.65 -> 7) to avoid CFS quota throttling (#2914). COLIBRI_CGROUP_ROOT and
+ * COLIBRI_PROC_CGROUP point it at a fixture tree (tests/test_omp_tune.c); nothing
+ * else sets them. */
 static inline int compat_cgroup_cpu_limit(double *quota_out){
     const char *root = getenv("COLIBRI_CGROUP_ROOT");
     const char *proc = getenv("COLIBRI_PROC_CGROUP");

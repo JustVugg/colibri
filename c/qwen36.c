@@ -7646,7 +7646,7 @@ static int trunk_probe_gpu_wins(Model *m){
         if (tc < cpu) cpu = tc;
     }
     free(x); free(y);
-    /* The trunk stays on the CPU only when the CPU is clearly faster, by QT_PROBE_CPU_MARGIN.
+    /* The trunk stays on the CPU only when the CPU is clearly faster, by QT_PROBE_CPU_MARGIN_PCT.
      * A burst this short flatters the CPU: in a container under a CPU quota (#2914, 7.65 CPUs
      * of a 48-core host) a team of 48 timed 0.114-0.169 ms against the card's 0.131-0.136,
      * before the quota throttled it, and three starts of four kept the trunk on the CPU at
