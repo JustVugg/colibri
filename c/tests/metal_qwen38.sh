@@ -22,6 +22,13 @@
 # m2 tiny: qwen38_tiny (BF16) and the tiny GGUF, exact mode (QWEN38_METAL_EXACT=1: the same
 #   tokens, final logits within 1e-4 x max|logit|) and fast mode (the same tokens); no off
 #   line, the chain's report with forwards > 0.
+# m3 gpu experts (Plan 2 Task 8): the routed experts on the GPU from the GPU expert cache, on
+#   the tiny GGUF (Q8_0 experts), against the same CPU run: exact mode the same tokens and
+#   logits within 1e-4, fast mode the same tokens; the report's `experts on GPU: N, loads: L,
+#   hits: H` with N, L > 0 and a layer with more experts than one group of top-k; a cache of two
+#   payloads (QWEN38_EXPERT_CACHE_BYTES, one group: every group evicts the last) within 120 s;
+#   Q38M_FAIL_SLOT_ALLOC=1 (debug) and QWEN38_METAL_EXPERTS=0 one off line each and the CPU's
+#   experts; a 1,300-token prompt on the GGUF (chunks of 256 rows), exact and fast.
 # metal_state_handoff: Q38M_DECLINE_EVERY=2 (debug) declines every second step, so the CPU
 #   and the chain hand the state back and forth (q38m_cpu_step, the KV watermarks): the
 #   CPU's tokens and final logits (within 1e-4 x max), also on qwen38_decay (the tiny fixture
@@ -34,7 +41,8 @@
 #   and logits, and Q38M_LAYER_CHECK=2 (each layer, the routes, the CPU's own one-ulp lines).
 # layer test: Q38M_LAYER_CHECK=1 (debug) runs the CPU's q38_layer_forward beside the first
 #   step and compares each layer's output streams, `[q38m-layer] L<i> worst=<e>` (max
-#   |gpu-cpu| over max |cpu|), FAIL over 1e-4, exact mode; then Q38M_FORCE_ROUTES=1 and 2 on the
+#   |gpu-cpu| over max |cpu|), FAIL over 1e-4, exact mode (on the GGUF with the GPU experts,
+#   whose GPU routes must be the CPU's rule on the same logits in every row); then Q38M_FORCE_ROUTES=1 and 2 on the
 #   1,300-token prompt: rows held to the reference run's routes and selections (counted > 0).
 # serve: tests/metal_qwen38_serve.py (two turns, a regenerated answer, a parked conversation:
 #   every served step's logits against a fresh engine's; KV_SLOTS=2 in a serve), then
@@ -207,6 +215,89 @@ done
 # KV_SLOTS outside a serve: the chain stays on
 eng m2_kvslots ./qwen38_tiny ./qwen38_tiny/ref.json KV_SLOTS=2 && chain_on m2_kvslots && echo "ok   [m2 KV_SLOTS=2 not a serve] chain on"
 
+echo "== m3 gpu experts"
+# M3 (Plan 2 Task 8): the routed experts on the GPU, from a GPU expert cache, on the tiny GGUF
+# (its Q8_0 experts), against the same CPU run as m2 tiny (reference precision, Ruling P2-4).
+# The chain's report says `experts on GPU: N, loads: L, hits: H` and the cache's groups.
+GX='[qwen38-metal] GPU experts are off: '
+gx_n() { sed -n 's/.*experts on GPU: \([0-9]*\), loads: \([0-9]*\), hits: \([0-9]*\).*/\1 \2 \3/p' "$tmp/$1.log" | tail -1; }
+gx_most() { sed -n 's/.*most experts in one layer \([0-9]*\).*/\1/p' "$tmp/$1.log" | tail -1; }
+gx_on() {   # <name>: no off line for the GPU experts, N > 0 experts computed on the GPU, L > 0 loads
+    if grep -qF "$GX" "$tmp/$1.log"; then echo "FAIL [$1] GPU experts off:"; grep -F "$GX" "$tmp/$1.log"; fail=1; return 1; fi
+    c=$(gx_n "$1")
+    if [ -z "$c" ] || [ "${c%% *}" -eq 0 ] || [ "$(echo "$c" | cut -d' ' -f2)" -eq 0 ]; then
+        echo "FAIL [$1] experts on GPU, loads, hits: '${c:-no report}'"; fail=1; return 1; fi
+    return 0
+}
+fx=qwen38_tiny_256_gguf
+want=$(toks cpu_$fx)
+for exact in 1 0; do
+    nm=m3_exact$exact
+    eng $nm ./$fx ./$fx/ref.json QWEN38_METAL_EXACT=$exact $REFP DUMP=$tmp/$nm.bin || continue
+    chain_on $nm || continue
+    gx_on $nm || continue
+    got=$(toks $nm)
+    if [ -z "$want" ] || [ "$got" != "$want" ]; then echo "FAIL [$nm] tokens '$got' vs the CPU's '$want'"; fail=1; continue; fi
+    most=$(gx_most $nm)
+    # the prompt's rows (5 rows, top-k 2 of 8 experts) touch more experts than one group of top-k
+    if [ -z "$most" ] || [ "$most" -le 2 ]; then echo "FAIL [$nm] no layer with more experts than one group ('${most:-none}')"; fail=1; continue; fi
+    if [ $exact = 1 ]; then logits_ok cpu_$fx $nm || continue; fi
+    echo "ok   [$nm] the CPU's tokens, logits within $(relerr "$tmp/cpu_$fx.bin" "$tmp/$nm.bin") x max$([ $exact = 1 ] || echo ' (not gated)'); experts on GPU, loads, hits: $(gx_n $nm); most in one layer $most"
+done
+# tiny cache: two payloads (one group of top-k 2), smaller than one step's working set: every
+# group evicts the last; the CPU's tokens, and it finishes (120 s)
+pay=$(sed -n 's/^\[qwen38-metal\] GPU experts: .* slots of \([0-9]*\) bytes.*/\1/p' "$tmp/m3_exact1.log" | tail -1)
+if [ -z "$pay" ]; then echo "FAIL [m3 tiny cache] no payload in the GPU experts' line"; fail=1
+else
+    nm=m3_tinycache
+    if eng $nm ./$fx ./$fx/ref.json perl -e 'alarm shift; exec @ARGV' 120 env QWEN38_EXPERT_CACHE_BYTES=$((2 * pay)) QWEN38_METAL_EXACT=1 $REFP DUMP=$tmp/$nm.bin &&
+       chain_on $nm && gx_on $nm; then
+        if ! grep -qE '^\[qwen38-metal\] GPU experts: 2 slots' "$tmp/$nm.log"; then echo "FAIL [$nm] not 2 slots:"; grep -F 'GPU experts' "$tmp/$nm.log"; fail=1
+        elif [ "$(toks $nm)" != "$want" ]; then echo "FAIL [$nm] tokens '$(toks $nm)' vs the CPU's '$want'"; fail=1
+        elif logits_ok cpu_$fx $nm; then echo "ok   [$nm 2 slots] the CPU's tokens, logits within $(relerr "$tmp/cpu_$fx.bin" "$tmp/$nm.bin") x max; experts on GPU, loads, hits: $(gx_n $nm)"; fi
+    fi
+fi
+# slot alloc failure (debug): the GPU experts off with one line, the chain on, the CPU's tokens
+nm=m3_allocfail
+if eng $nm ./$fx ./$fx/ref.json Q38M_FAIL_SLOT_ALLOC=1 QWEN38_METAL_EXACT=1 $REFP DUMP=$tmp/$nm.bin && chain_on $nm; then
+    n=$(grep -cF "${GX}a slot of the GPU expert cache could not be allocated (Q38M_FAIL_SLOT_ALLOC); the routed experts run on the CPU" "$tmp/$nm.log")
+    c=$(gx_n $nm)
+    if [ "$n" -ne 1 ] || [ "$(grep -cF "$GX" "$tmp/$nm.log")" -ne 1 ]; then echo "FAIL [$nm] expected one off line:"; grep -F 'GPU experts' "$tmp/$nm.log"; fail=1
+    elif [ -n "$c" ] && [ "${c%% *}" -ne 0 ]; then echo "FAIL [$nm] experts on the GPU: $c"; fail=1
+    elif [ "$(toks $nm)" != "$want" ]; then echo "FAIL [$nm] tokens '$(toks $nm)' vs the CPU's '$want'"; fail=1
+    elif logits_ok cpu_$fx $nm; then echo "ok   [$nm] one off line, the CPU's tokens, logits within $(relerr "$tmp/cpu_$fx.bin" "$tmp/$nm.bin") x max"; fi
+fi
+# QWEN38_METAL_EXPERTS=0: the M2 path, with its line
+nm=m3_off
+if eng $nm ./$fx ./$fx/ref.json QWEN38_METAL_EXPERTS=0 && chain_on $nm; then
+    if [ "$(grep -cF "${GX}QWEN38_METAL_EXPERTS=0; the routed experts run on the CPU" "$tmp/$nm.log")" -ne 1 ]; then echo "FAIL [$nm] expected one off line"; grep -F 'GPU experts' "$tmp/$nm.log"; fail=1
+    else echo "ok   [$nm] QWEN38_METAL_EXPERTS=0 keeps the routed experts on the CPU, one line"; fi
+fi
+# a long prompt on the GGUF (1,300 tokens: chunks of 256 rows, every expert of a layer in a chunk,
+# groups of top-k through the cache), exact and fast: the CPU's tokens; exact, its logits
+mkdir -p "$tmp/glong"
+for f in qwen38_tiny_256_gguf/*; do ln -s "$PWD/$f" "$tmp/glong/"; done
+rm -f "$tmp/glong/config.json" "$tmp/glong/ref.json" "$tmp/glong/.coli_usage"
+"${PYTHON:-python3}" -c '
+import json, sys
+c = json.load(open("qwen38_tiny_256_gguf/config.json"))
+(c.get("text_config") or c)["max_position_embeddings"] = 2048
+json.dump(c, open(sys.argv[1] + "/config.json", "w"))
+x, ids = 4242, []
+for _ in range(1300):
+    x = (x * 1103515245 + 12345) % 2**31
+    ids.append(3 + x % 61)
+json.dump({"schema_version": 1, "prompt_ids": ids, "full_ids": ids + [3] * 8}, open(sys.argv[1] + "/ref.json", "w"))' "$tmp/glong"
+if eng glong_cpu "$tmp/glong" "$tmp/glong/ref.json" COLI_METAL=0 $REFP DUMP=$tmp/glong_cpu.bin; then
+    for exact in 1 0; do
+        nm=glong_m3_exact$exact
+        eng $nm "$tmp/glong" "$tmp/glong/ref.json" QWEN38_METAL_EXACT=$exact $REFP DUMP=$tmp/$nm.bin && chain_on $nm && gx_on $nm || continue
+        if [ -z "$(toks glong_cpu)" ] || [ "$(toks $nm)" != "$(toks glong_cpu)" ]; then echo "FAIL [$nm] '$(toks $nm)' vs the CPU's '$(toks glong_cpu)'"; fail=1; continue; fi
+        if [ $exact = 1 ]; then logits_ok glong_cpu $nm || continue; fi
+        echo "ok   [$nm 1300 tokens] the CPU's tokens, logits within $(relerr "$tmp/glong_cpu.bin" "$tmp/$nm.bin") x max; experts on GPU, loads, hits: $(gx_n $nm); most in one layer $(gx_most $nm)"
+    done
+fi
+
 echo "== metal_state_handoff"
 # qwen38_decay: qwen38_tiny with A_log = -1.88 and dt_bias = 0 in its DeltaNet layers, so the
 # recurrent state decays by about 0.9 a token (the fixture's own: about 1e-6, the state hardly
@@ -339,6 +430,10 @@ for fx in qwen38_tiny qwen38_tiny_256_gguf; do
         echo "FAIL [$nm] $n layer lines"; grep '^\[q38m-layer\]' "$tmp/$nm.log"; fail=1; continue
     fi
     worst=$(grep '^\[q38m-layer\] L.*worst=' "$tmp/$nm.log" | sed 's/.*worst=\([^ ]*\).*/\1/' | sort -g | tail -1)
+    case $fx in *_gguf)   # the GPU experts: the GPU's routes are the CPU's rule on the same logits
+        g=$(grep -c '^\[q38m-layer\] L[0-9]* GPU routes: 0 rows unlike' "$tmp/$nm.log")
+        if [ "$g" -lt 4 ]; then echo "FAIL [$nm] GPU routes lines: $g clean"; grep '^\[q38m-layer\] L[0-9]* GPU routes' "$tmp/$nm.log"; fail=1; continue; fi;;
+    esac
     echo "ok   [$nm] $n layers, worst $worst"
 done
 # Q38M_FORCE_ROUTES on the kv-growth prompt (1,300 tokens on qwen38_tiny: its QSA budget is 4

@@ -3,10 +3,20 @@
 Status: the Metal kernels of the Qwen3.8 (`qwen38`) engine are written and tested, and a
 `METAL=1` build runs the model's dense layers on them (`c/qwen38_metal_chain.h`, on by
 default, `COLI_METAL=0` the CPU engine): every layer, the final mixer and lm_head on the
-GPU, the routed experts on the CPU (M2). Prompt-lookup drafts are off beside the chain
+GPU. With a GGUF whose routed experts are Q8_0, IQ4_NL or IQ4_XS, the routed experts run on
+the GPU too (M3, `c/qwen38_metal_experts.h`): the GPU routes (softmax over all experts,
+top-k with ties to the lowest id, weights over the top-k's sum: the CPU's rule), a GPU expert
+cache for the whole model (`QWEN38_EXPERT_CACHE_BYTES`; by default min(all experts,
+max(6 GiB, RAM − dense − 12 GiB))) holds the experts the GGUF's rows read into it, groups of
+top-k at a time on a loader thread while the GPU runs the shared expert, and
+`q36_expert_sum` adds them in the router's order, then the shared expert, as the CPU does.
+The CPU's own expert cache drops to one slot a layer. `QWEN38_METAL_EXPERTS=0`, a
+safetensors checkpoint or another expert type keep the routed experts on the CPU (M2), with
+one `[qwen38-metal] GPU experts are off: <reason>` line. The chain's report at exit adds
+`experts on GPU: N, loads: L, hits: H`. Prompt-lookup drafts are off beside the chain
 unless `COLI_LOOKUP=1`: the chain hands a verify to the CPU, the recurrent state down and up
-again. Debug-only switches: `Q38M_CHECK_WEIGHTS`, `Q38M_LAYER_CHECK`, `Q38M_DECLINE_EVERY`
-([ENVIRONMENT.md](ENVIRONMENT.md)).
+again. Debug-only switches: `Q38M_CHECK_WEIGHTS`, `Q38M_LAYER_CHECK`, `Q38M_DECLINE_EVERY`,
+`Q38M_FORCE_ROUTES`, `Q38M_FAIL_SLOT_ALLOC` ([ENVIRONMENT.md](ENVIRONMENT.md)).
 
 The kernels share the device, the command batch and the exact/fast switch of the Qwen3.6
 Metal path ([qwen36-metal.md](qwen36-metal.md)). `q38_gpu_init()` initializes qwen36's

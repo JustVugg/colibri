@@ -7,17 +7,21 @@
  * the one line that says why the CPU engine runs the model, then q38m_start puts the
  * dense weights, norms and state on the GPU. q38_forward offers every step to
  * q38m_forward; a 0 there means the CPU runs that step from the host state
- * (q38m_cpu_step brings it down first). M2: the routed experts run on the CPU, inside
- * the step (q38_moe_ex), from the router logits the GPU computed.
+ * (q38m_cpu_step brings it down first). M3: the routed experts on the GPU from a GPU
+ * expert cache (qwen38_metal_experts.h) where the GGUF's expert types allow; M2 (else, and
+ * QWEN38_METAL_EXPERTS=0): on the CPU, inside the step (q38_moe_ex), from the router logits
+ * the GPU computed.
  *
  * Switches: COLI_METAL=0 the CPU engine; QWEN38_METAL_EXACT=1 (or QWEN36_METAL_EXACT=1)
- * the exact kernels; QWEN38_METAL_EXPERTS=0 the routed experts on the CPU (M2 always
- * does). Debug only (read once, no effect unset): Q38M_CHECK_WEIGHTS, Q38M_LAYER_CHECK (1, 2), Q38M_FORCE_ROUTES,
- * Q38M_DECLINE_EVERY. */
+ * the exact kernels; QWEN38_METAL_EXPERTS=0 the routed experts on the CPU (M2);
+ * QWEN38_EXPERT_CACHE_BYTES the GPU expert cache. Debug only (read once, no effect unset):
+ * Q38M_CHECK_WEIGHTS, Q38M_LAYER_CHECK (1, 2), Q38M_FORCE_ROUTES, Q38M_DECLINE_EVERY,
+ * Q38M_FAIL_SLOT_ALLOC. */
 #ifndef QWEN38_METAL_CHAIN_H
 #define QWEN38_METAL_CHAIN_H
 #include "qwen36_gpu.h"
 #include "qwen38_gpu.h"
+#include "qwen38_metal_experts.h"   /* M3: the routed experts on the GPU */
 
 static int g_mtl_chain;                        /* 1 when the chain runs steps */
 static unsigned long long g_q38m_forwards, g_q38m_declined;
@@ -326,6 +330,8 @@ static int q38m_start(Model *m) {
         }
     }
     if (!q38m_setup(m, why, sizeof why)) { q38m_free_weights(); q38m_off(why); return 0; }
+    if (!m->c.norm_topk) q38x_off("norm_topk_prob is off (the GPU router's weights are over the top-k)");
+    else q38x_start(m);
     fprintf(stderr, "[qwen38-metal] dense weights: %d mapped in place (%.1f MiB), %d uploaded (%.1f MiB%s)\n",
             g_q38m.n_mapped, g_q38m.mapped / 1048576.0, g_q38m.n_uploaded, g_q38m.uploaded / 1048576.0,
             g_q38m.n_f32_from_bf16 ? ", some BF16 as F32" : "");
@@ -677,6 +683,7 @@ static void q38m_free_forward(const Cfg *c) {
 static void q38m_free(Model *m) {
     if (!g_q38f.on && !g_q38m.layers) return;
     q36_gpu_sync();
+    q38x_free();
     q38m_free_forward(&m->c);
     q38m_free_weights();
     g_mtl_chain = 0;
@@ -842,19 +849,26 @@ static int q38m_ple(Model *m, int n) {
            q38_ple_conv(g_q38f.hyper, g_q38f.ple_ring, NULL, g_q38f.pg, g_q38f.pn, L->ple_conv, &ps);
 }
 
-/* router logits and the shared expert (gate x shared in shd) */
-static int q38m_mlp_dense(Model *m, int i, int n) {
+/* the shared expert (gate x shared in shd), when the layer has one */
+static int q38m_has_shared(const Model *m, int i) { return m->c.shared_inter > 0 && g_q38m.L[i][7].t; }
+static int q38m_mlp_shared(Model *m, int i, int n) {
     const Cfg *c = &m->c;
     const Q38mW *w = g_q38m.L[i];
     Q38mL *L = &g_q38f.L[i];
-    int ok = q38m_mm(g_q38f.lg, g_q38f.mixed, &w[6], n);
-    if (ok && c->shared_inter > 0 && w[7].t)
-        ok = q38m_mm(g_q38f.sg, g_q38f.mixed, &w[7], n) && q38m_mm(g_q38f.su, g_q38f.mixed, &w[8], n) &&
-             q36_silu_mul(g_q38f.sh, g_q38f.sg, g_q38f.su, n * c->shared_inter) &&
-             q38m_mm(g_q38f.shd, g_q38f.sh, &w[9], n) &&
-             q36_shared_gate(g_q38f.sgate, g_q38f.mixed, L->sh_gate, n, c->hidden) &&
-             q36_scale_rows(g_q38f.shd, g_q38f.sgate, n, c->hidden);
-    return ok;
+    if (!q38m_has_shared(m, i)) return 1;
+    return q38m_mm(g_q38f.sg, g_q38f.mixed, &w[7], n) && q38m_mm(g_q38f.su, g_q38f.mixed, &w[8], n) &&
+           q36_silu_mul(g_q38f.sh, g_q38f.sg, g_q38f.su, n * c->shared_inter) &&
+           q38m_mm(g_q38f.shd, g_q38f.sh, &w[9], n) &&
+           q36_shared_gate(g_q38f.sgate, g_q38f.mixed, L->sh_gate, n, c->hidden) &&
+           q36_scale_rows(g_q38f.shd, g_q38f.sgate, n, c->hidden);
+}
+
+/* router logits (and, with the GPU experts, the GPU's routes); M2: the shared expert too, before
+ * the sync (with the GPU experts it runs while their reads do, q38x_moe) */
+static int q38m_mlp_dense(Model *m, int i, int n) {
+    int ok = q38m_mm(g_q38f.lg, g_q38f.mixed, &g_q38m.L[i][6], n);
+    if (g_q38x.on) return ok && q38x_route(g_q38f.lg, n);
+    return ok && q38m_mlp_shared(m, i, n);
 }
 
 /* Q38M_LAYER_CHECK: the CPU's streams after each layer for the first step (q38_layer_forward on
@@ -868,7 +882,7 @@ static int q38m_mlp_dense(Model *m, int i, int n) {
  * row, and the smallest k-th/(k+1)-th margin. Q38M_LAYER_CHECK=2 also runs the CPU step again
  * from the embedded rows one ulp away (`[q38m-cpu-ulp]` lines): the CPU's own sensitivity,
  * the floor the chain is measured against (Plan 2 Task 7a). */
-typedef struct { double diff, max, margin, diff_lo, diff_hi, qmargin, chunk[64]; int wrow, mrow, off_ref, off_cpu, forced, qrow, qzero; } Q38mLc;
+typedef struct { double diff, max, margin, diff_lo, diff_hi, qmargin, chunk[64]; int wrow, mrow, off_ref, off_cpu, forced, qrow, qzero, gpu_off; } Q38mLc;
 static float *g_q38m_lc_ref;
 static int *g_q38m_lc_idx, g_q38m_lc_S;   /* the reference run's routes [layer][S][topk] */
 static Q38mLc *g_q38m_lc;
@@ -1014,6 +1028,22 @@ static void q38m_lc_routes(Model *m, int i, int n, int c0) {
     free(a); free(cpu);
 }
 
+/* the GPU experts: rows whose GPU routes (q38x_route, in order) are not the CPU's rule over the
+ * same logits (q38_moe_decode_ex's top-k of the softmax: the logits' order) */
+static int q38m_lc_gpu_routes(Model *m, int n) {
+    const int E = m->c.experts, K = m->c.topk;
+    const float *gl = q38m_f(g_q38f.lg);
+    const int32_t *ids = (const int32_t *)q36_tensor_data(g_q38x.ids);
+    int *a = (int *)malloc((size_t)K * sizeof(int)), off = 0;
+    if (!a) { fprintf(stderr, "[q38m-layer] OOM\n"); exit(1); }
+    for (int r = 0; r < n; r++) {
+        q38m_lc_topk(gl + (size_t)r * E, E, K, a);
+        for (int z = 0; z < K; z++) if (a[z] != ids[(size_t)r * K + z]) { off++; break; }
+    }
+    free(a);
+    return off;
+}
+
 static int q38m_lc_fdesc(const void *a, const void *b) {
     float x = *(const float *)a, y = *(const float *)b;
     return x > y ? -1 : x < y;
@@ -1131,7 +1161,8 @@ static int q38m_forward(Model *m, const int *ids, int S, int pos_base, int nlogi
      * refusal here leaves the state as the step found it, and the CPU takes over (q38_forward
      * then runs q38m_cpu_step, which brings the GPU's state down) */
     if (!q38m_scratch(c, S < Q38M_CHUNK ? S : Q38M_CHUNK) || !q38m_kv_reserve(m, pos_base + S) ||
-        !q38m_grow(&g_q38f.logits, &g_q38f.logit_floats, (size_t)nlogits * V)) {
+        !q38m_grow(&g_q38f.logits, &g_q38f.logit_floats, (size_t)nlogits * V) ||
+        !q38x_scratch(S < Q38M_CHUNK ? S : Q38M_CHUNK)) {
         char why[128];
         snprintf(why, sizeof why, "device memory for a step of %d rows at position %d was refused", S, pos_base);
         q38m_off(why);
@@ -1140,6 +1171,7 @@ static int q38m_forward(Model *m, const int *ids, int S, int pos_base, int nlogi
         return 0;
     }
     if (check) q38m_layer_check_ref(m, ids, S, pos_base, hyper_h);
+    if (g_q38x.on) qgc_expected_phase(&g_q38x.cache, S, pos_base);   /* no lease in flight between steps */
     const char *what = NULL;
     int failed_layer = -1, lo_first = S - nlogits, c0;
     for (c0 = 0; c0 < S; c0 += Q38M_CHUNK) {
@@ -1158,17 +1190,36 @@ static int q38m_forward(Model *m, const int *ids, int S, int pos_base, int nlogi
             if (!q38_hc_apply(g_q38f.hyper, g_q38f.inj_a, g_q38f.blk, n, H, C) ||
                 !q38m_gr_read(c, &w[3], Ld->mlp_norm, n, g_q38f.inj_m) || !q38m_mlp_dense(m, i, n)) { what = "the MLP's dense part"; goto fail; }
             if (!q36_gpu_sync()) { what = "a GPU batch"; goto fail; }
+            q38x_settle(0);   /* the GPU is past the last layer's experts */
             if (check) {
                 if (c->is_attn[i]) q38m_lc_qsa(m, i, n, pb);
                 q38m_lc_routes(m, i, n, c0);
-                if (g_q38f.force_routes) g_q38m_lc[i].forced += q38m_lc_force(m, i, n, c0);
+                if (g_q38f.force_routes) {
+                    g_q38m_lc[i].forced += q38m_lc_force(m, i, n, c0);
+                    /* the GPU routes again from the logits held */
+                    if (g_q38x.on && (!q38x_route(g_q38f.lg, n) || !q36_gpu_sync())) { what = "the router"; goto fail; }
+                }
+                if (g_q38x.on) g_q38m_lc[i].gpu_off += q38m_lc_gpu_routes(m, n);
             }
-            q38_moe_ex(m, &m->L[i], i, q38m_f(g_q38f.mixed), n, q38m_f(g_q38f.routed), q38m_f(g_q38f.lg), 1);
-            int sh = c->shared_inter > 0 && w[7].t;
-            if ((sh ? !q36_add(g_q38f.blk, g_q38f.routed, g_q38f.shd, n * H) : 0) ||
-                !q38_hc_apply(g_q38f.hyper, g_q38f.inj_m, sh ? g_q38f.blk : g_q38f.routed, n, H, C)) { what = "the MoE's sum"; goto fail; }
+            int sh = q38m_has_shared(m, i), r = -1;
+            if (g_q38x.on) {
+                r = q38x_moe(m, i, n, g_q38f.mixed, sh ? g_q38f.shd : NULL, g_q38f.blk, q38m_mlp_shared);
+                if (!r) { what = "the routed experts"; goto fail; }
+                if (r < 0) {   /* routes that are not valid ids (non-finite logits): the CPU's, as M2 */
+                    g_q38x.cpu_layers++;
+                    if (!q38m_mlp_shared(m, i, n) || !q36_gpu_sync()) { what = "the shared expert"; goto fail; }
+                }
+            }
+            if (r > 0) {
+                if (!q38_hc_apply(g_q38f.hyper, g_q38f.inj_m, g_q38f.blk, n, H, C)) { what = "the MoE's sum"; goto fail; }
+            } else {
+                q38_moe_ex(m, &m->L[i], i, q38m_f(g_q38f.mixed), n, q38m_f(g_q38f.routed), q38m_f(g_q38f.lg), 1);
+                if ((sh ? !q36_add(g_q38f.blk, g_q38f.routed, g_q38f.shd, n * H) : 0) ||
+                    !q38_hc_apply(g_q38f.hyper, g_q38f.inj_m, sh ? g_q38f.blk : g_q38f.routed, n, H, C)) { what = "the MoE's sum"; goto fail; }
+            }
             if (check) {
                 if (!q36_gpu_sync()) { what = "a GPU batch"; goto fail; }
+                q38x_settle(0);
                 const float *g = q38m_f(g_q38f.hyper), *r = g_q38m_lc_ref + (size_t)i * S * W + (size_t)c0 * W;
                 for (size_t k = 0; k < (size_t)n * W; k++) {
                     double d = fabs((double)g[k] - r[k]), a = fabs((double)r[k]);
@@ -1196,6 +1247,7 @@ static int q38m_forward(Model *m, const int *ids, int S, int pos_base, int nlogi
             }
         }
         if (!q36_gpu_sync()) { what = "a GPU batch"; goto fail; }
+        q38x_settle(0);
         if (want_streams) memcpy(hyper_h + (size_t)c0 * W, q36_tensor_data(g_q38f.hyper), (size_t)n * W * sizeof(float));
         if (mixed_h) memcpy(mixed_h + (size_t)c0 * H, q36_tensor_data(g_q38f.mixed), (size_t)n * H * sizeof(float));
         for (int i = 0; i < L; i++)
@@ -1213,6 +1265,7 @@ static int q38m_forward(Model *m, const int *ids, int S, int pos_base, int nlogi
                     i, e, lc->max, e <= 1e-4 ? "" : " FAIL", lc->wrow, lc->diff_lo / mx, lc->diff_hi / mx, lc->off_ref, lc->off_cpu,
                     lc->margin, lc->mrow, g_q38f.force_routes ? "; forced" : "");
             if (g_q38f.force_routes) fprintf(stderr, "[q38m-layer] L%d forced: %d rows held to the reference run's routes\n", i, lc->forced);
+            if (g_q38x.on) fprintf(stderr, "[q38m-layer] L%d GPU routes: %d rows unlike the CPU's rule on the same logits\n", i, lc->gpu_off);
             if (S > Q38M_CHUNK) {   /* the worst of each chunk of rows, over max |cpu| */
                 char line[1024]; int o = 0;
                 for (int k = 0; k * Q38M_CHUNK < S && k < 64 && o < (int)sizeof line - 16; k++)
@@ -1242,6 +1295,7 @@ fail:
      * may have moved past the host's: the step can be handed to the CPU only when the host
      * held the whole state at the step's start (its first chunk). */
     q36_gpu_sync();
+    q38x_settle(1);
     {
         char why[192];
         snprintf(why, sizeof why, "%s of layer %d at position %d did not run on the GPU", what ? what : "a step", failed_layer, pos_base);
@@ -1263,7 +1317,12 @@ fail:
 
 static void q38m_report(void) {
     if (!g_mtl_chain) return;
-    fprintf(stderr, "[metal] qwen38 chain: %llu forwards, %llu declined\n", g_q38m_forwards, g_q38m_declined);
+    if (!g_q38x.on) { fprintf(stderr, "[metal] qwen38 chain: %llu forwards, %llu declined\n", g_q38m_forwards, g_q38m_declined); return; }
+    QgcStats s = qgc_snapshot(&g_q38x.cache);
+    fprintf(stderr, "[metal] qwen38 chain: %llu forwards, %llu declined, experts on GPU: %llu, loads: %llu, hits: %llu; "
+                    "cache groups %llu, most experts in one layer %d, expert reads waited %.2f s%s\n",
+            g_q38m_forwards, g_q38m_declined, g_q38x.choices, (unsigned long long)s.loads, (unsigned long long)s.hits,
+            g_q38x.groups, g_q38x.most, g_q38x.wait_s, g_q38x.cpu_layers ? " (some layers' routes on the CPU: non-finite logits)" : "");
 }
 
 #endif
