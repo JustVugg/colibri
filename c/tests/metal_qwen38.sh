@@ -284,7 +284,18 @@ for _ in range(3000):
     x = (x * 1103515245 + 12345) % 2**31
     ids.append(3 + x % 61)
 json.dump({"schema_version": 1, "prompt_ids": ids, "full_ids": ids + [3] * 8}, open(sys.argv[2] + "/ref.json", "w"))' "$tmp/qwen38_decay" "$tmp/lfast"
+# the same run with no debug switch: the CPU's tokens and logits
 if eng lfast_cpu "$tmp/lfast" "$tmp/lfast/ref.json" COLI_METAL=0 $REFP DUMP=$tmp/lfast_cpu.bin &&
+   eng lfast_plain "$tmp/lfast" "$tmp/lfast/ref.json" QWEN38_METAL_EXPERTS=0 $REFP DUMP=$tmp/lfast_plain.bin && chain_on lfast_plain; then
+    if [ -z "$(toks lfast_cpu)" ] || [ "$(toks lfast_plain)" != "$(toks lfast_cpu)" ]; then
+        echo "FAIL [long fast 3000 tokens, no debug] '$(toks lfast_plain)' vs the CPU's '$(toks lfast_cpu)'"; fail=1
+    elif grep -qF '[q38m-' "$tmp/lfast_plain.log"; then
+        echo "FAIL [long fast 3000 tokens, no debug] debug lines with the switches unset"; fail=1
+    elif logits_ok lfast_cpu lfast_plain; then
+        echo "ok   [long fast 3000 tokens, no debug] the CPU's tokens, logits within $(relerr "$tmp/lfast_cpu.bin" "$tmp/lfast_plain.bin") x max"
+    fi
+fi
+if [ -s "$tmp/lfast_cpu.bin" ] &&
    eng lfast_mtl "$tmp/lfast" "$tmp/lfast/ref.json" QWEN38_METAL_EXPERTS=0 Q38M_LAYER_CHECK=2 $REFP DUMP=$tmp/lfast_mtl.bin &&
    chain_on lfast_mtl; then
     n=$(grep -c '^\[q38m-layer\] L.*routes off the reference run.s in 0 rows' "$tmp/lfast_mtl.log")
@@ -321,12 +332,15 @@ fi
 echo "== layer test"
 for fx in qwen38_tiny qwen38_tiny_256_gguf; do
     nm=layers_$fx
-    eng $nm ./$fx ./$fx/ref.json Q38M_LAYER_CHECK=1 QWEN38_METAL_EXACT=1 $REFP || continue
-    n=$(grep -c '^\[q38m-layer\] L' "$tmp/$nm.log")
-    if [ "$n" -lt 4 ] || grep '^\[q38m-layer\]' "$tmp/$nm.log" | grep -qF FAIL; then
+    # Q38M_FORCE_ROUTES=2: the reference run's routes and QSA selections past the budget (the
+    # same as the chain's here: no FAIL, and no selection replaced, so the two formats agree)
+    eng $nm ./$fx ./$fx/ref.json Q38M_LAYER_CHECK=1 Q38M_FORCE_ROUTES=2 QWEN38_METAL_EXACT=1 $REFP || continue
+    n=$(grep -c '^\[q38m-layer\] L.*worst=.*; forced$' "$tmp/$nm.log")
+    if [ "$n" -lt 4 ] || grep '^\[q38m-layer\]' "$tmp/$nm.log" | grep -qF FAIL ||
+       ! grep -qF "[q38m-layer] QSA forced: 0 rows' selections differed" "$tmp/$nm.log"; then
         echo "FAIL [$nm] $n layer lines"; grep '^\[q38m-layer\]' "$tmp/$nm.log"; fail=1; continue
     fi
-    worst=$(grep '^\[q38m-layer\] L' "$tmp/$nm.log" | sed 's/.*worst=\([^ ]*\).*/\1/' | sort -g | tail -1)
+    worst=$(grep '^\[q38m-layer\] L.*worst=' "$tmp/$nm.log" | sed 's/.*worst=\([^ ]*\).*/\1/' | sort -g | tail -1)
     echo "ok   [$nm] $n layers, worst $worst"
 done
 

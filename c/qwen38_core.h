@@ -3470,6 +3470,9 @@ static inline int q38_kv16(void){
     return g_q38_kv16;
 }
 
+/* Debug (the Metal chain's Q38M_FORCE_ROUTES=2): every row's QSA selection, when set; NULL
+ * otherwise (a step of several conversations never calls it) */
+static void (*g_q38_sel_hook)(int layer,int pos_base,int S,const int *sel,const int *nsel,int maxsel);
 static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int pos_base,float *out) {
     Cfg *c=&m->c;int H=c->hidden,QH=c->q_heads,KVH=c->kv_heads,D=c->head_dim;
     float theta=layer<c->layers?c->theta:c->mtp_theta;   /* the MTP head has its own RoPE base */
@@ -3550,6 +3553,7 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
             nsel[s]=n;
         }
     }
+    if(g_q38_sel_hook&&!mr)g_q38_sel_hook(layer,pos_base,S,selected,nsel,maxsel);
     double index_dt=now_s()-qsa_started;qsa_started=now_s();
     /* C by (row, KV head): the query heads that share a KV head read its selected K and V rows
      * once between them, not once each (Qwen3.8: 24 heads over 2 KV heads, so every row was

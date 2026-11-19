@@ -12,7 +12,7 @@
  *
  * Switches: COLI_METAL=0 the CPU engine; QWEN38_METAL_EXACT=1 (or QWEN36_METAL_EXACT=1)
  * the exact kernels; QWEN38_METAL_EXPERTS=0 the routed experts on the CPU (M2 always
- * does). Debug only (read once, no effect unset): Q38M_CHECK_WEIGHTS, Q38M_LAYER_CHECK (1, 2),
+ * does). Debug only (read once, no effect unset): Q38M_CHECK_WEIGHTS, Q38M_LAYER_CHECK (1, 2), Q38M_FORCE_ROUTES,
  * Q38M_DECLINE_EVERY. */
 #ifndef QWEN38_METAL_CHAIN_H
 #define QWEN38_METAL_CHAIN_H
@@ -401,6 +401,8 @@ static struct {
     long decline_every;   /* Q38M_DECLINE_EVERY (debug): every k-th step offered is declined */
     int layer_check;      /* Q38M_LAYER_CHECK (debug): the first step against q38_layer_forward;
                            * 2: also the CPU against itself from inputs one ulp away */
+    int force_routes;     /* Q38M_FORCE_ROUTES (debug, with the layer check): 1 the reference run's
+                           * routes, 2 also its QSA selections past the budget */
 } g_q38f;
 
 static void q38_layer_forward(Model *m,int i,float *hyper,const int *ids,int S,int pos_base,
@@ -732,6 +734,8 @@ static int q38m_setup(Model *m, char *why, size_t nwhy) {
     const char *d = getenv("Q38M_DECLINE_EVERY"), *lc = getenv("Q38M_LAYER_CHECK");
     g_q38f.decline_every = d && *d ? atol(d) : 0;
     g_q38f.layer_check = lc && (!strcmp(lc, "1") || !strcmp(lc, "2")) ? atoi(lc) : 0;
+    const char *fr = getenv("Q38M_FORCE_ROUTES");
+    g_q38f.force_routes = fr && (!strcmp(fr, "1") || !strcmp(fr, "2")) ? atoi(fr) : 0;
     g_q38f.on = 1;
     return 1;
 }
@@ -769,6 +773,12 @@ static int q38m_gr_read(const Cfg *c, const Q38mW *w /* down, up, inject */, q36
     return ok;
 }
 
+/* Q38M_FORCE_ROUTES=2 (layer check): the chunk's rows past the budget take the reference run's
+ * selection (the GPU's batch flushed first) */
+static int g_q38m_lc_qforced, g_q38m_lc_qset, g_q38m_lc_qswap;
+static double g_q38m_lc_qgap;   /* the largest |score| gap between two blocks the two selections swapped */
+static int q38m_lc_force_sel(int i, int n, int pb);   /* below, beside the layer check */
+
 /* q38_attention over mixed into blk, rows at pb.. */
 static int q38m_attention(Model *m, int i, int n, int pb) {
     const Cfg *c = &m->c;
@@ -794,6 +804,7 @@ static int q38m_attention(Model *m, int i, int n, int pb) {
     ok = ok && q38m_grow(&g_q38f.sc, &g_q38f.sc_floats, (size_t)n * nbmax) &&
          q38_qsa_score(g_q38f.sc, g_q38f.qidx, L->pk, n, pb, nbmax, &qs) &&
          q38_qsa_select(g_q38f.sel, g_q38f.sc, n, pb, nbmax, selrow, &qs) &&
+         q38m_lc_force_sel(i, n, pb) &&
          q38_attn_sel(g_q38f.heads, g_q38f.qno, g_q38f.gate, L->kc, L->vc, g_q38f.sel, n, pb, QH, KVH, D, g_q38f.dcap,
                       selrow, g_q38f.half) &&
          q38m_mm(g_q38f.blk, g_q38f.heads, &w[13], n);
@@ -857,10 +868,25 @@ static int q38m_mlp_dense(Model *m, int i, int n) {
  * row, and the smallest k-th/(k+1)-th margin. Q38M_LAYER_CHECK=2 also runs the CPU step again
  * from the embedded rows one ulp away (`[q38m-cpu-ulp]` lines): the CPU's own sensitivity,
  * the floor the chain is measured against (Plan 2 Task 7a). */
-typedef struct { double diff, max, margin; int wrow, mrow, off_ref, off_cpu; } Q38mLc;
+typedef struct { double diff, max, margin, diff_lo, diff_hi, qmargin, chunk[64]; int wrow, mrow, off_ref, off_cpu, forced, qrow, qzero; } Q38mLc;
 static float *g_q38m_lc_ref;
 static int *g_q38m_lc_idx, g_q38m_lc_S;   /* the reference run's routes [layer][S][topk] */
 static Q38mLc *g_q38m_lc;
+static int **g_q38m_lc_sel;   /* Q38M_FORCE_ROUTES=2: the reference run's selections [layer][S][selrow], the chain's format */
+static int g_q38m_lc_selrow, g_q38m_lc_take, g_q38m_lc_R;
+
+/* g_q38_sel_hook: the rows past the budget as [count, positions], the others [-1] (the chain's own) */
+static void q38m_lc_sel_hook(int layer, int pos_base, int S, const int *sel, const int *nsel, int maxsel) {
+    if (!g_q38m_lc_sel || S != g_q38m_lc_S) return;
+    int *d = g_q38m_lc_sel[layer] = (int *)malloc((size_t)S * g_q38m_lc_selrow * sizeof(int));
+    if (!d) { fprintf(stderr, "[q38m-layer] OOM\n"); exit(1); }
+    for (int s = 0; s < S; s++) {
+        int *row = d + (size_t)s * g_q38m_lc_selrow;
+        if ((pos_base + s + 1) / g_q38m_lc_R <= g_q38m_lc_take || nsel[s] > g_q38m_lc_selrow - 1) { row[0] = -1; continue; }
+        row[0] = nsel[s];
+        memcpy(row + 1, sel + (size_t)s * maxsel, (size_t)nsel[s] * sizeof(int));
+    }
+}
 
 static void q38m_lc_topk(const float *lg, int E, int K, int *idx) {   /* q38_moe_decode_ex's rule */
     for (int z = 0; z < K; z++) {
@@ -913,7 +939,13 @@ static void q38m_layer_check_ref(Model *m, const int *ids, int S, int pos_base, 
     float *hy = (float *)malloc(SW * sizeof(float)), *mixed = falloc((int64_t)S * c->hidden);
     float *inject = falloc((int64_t)S * c->hc_count), *block = falloc((int64_t)S * c->hidden);
     if (!g_q38m_lc_ref || !g_q38m_lc || !g_q38m_lc_idx || !idx || !hy) { fprintf(stderr, "[q38m-layer] OOM\n"); exit(1); }
-    for (int i = 0; i < c->layers; i++) g_q38m_lc[i].margin = INFINITY;
+    for (int i = 0; i < c->layers; i++) g_q38m_lc[i].margin = g_q38m_lc[i].qmargin = INFINITY;
+    if (g_q38f.force_routes == 2) {
+        g_q38m_lc_sel = (int **)calloc((size_t)c->layers, sizeof *g_q38m_lc_sel);
+        if (!g_q38m_lc_sel) { fprintf(stderr, "[q38m-layer] OOM\n"); exit(1); }
+        g_q38m_lc_selrow = q38m_selrow(c); g_q38m_lc_take = c->idx_budget / c->idx_ratio; g_q38m_lc_R = c->idx_ratio;
+        g_q38_sel_hook = q38m_lc_sel_hook;
+    }
     memcpy(hy, hyper_h, SW * sizeof(float));
     int64_t hist[2] = { m->ple_history[0], m->ple_history[1] };
     int hlen = m->ple_history_len, pref_rows = m->ple_pref_rows;
@@ -924,6 +956,7 @@ static void q38m_layer_check_ref(Model *m, const int *ids, int S, int pos_base, 
         memcpy(g_q38m_lc_ref + (size_t)i * SW, hy, SW * sizeof(float));
         q38m_lc_route_rows(m, i, mixed, S, g_q38m_lc_idx + (size_t)i * S * K);   /* mixed: the MLP's */
     }
+    g_q38_sel_hook = NULL;
     m->ple_pref = pref; m->ple_pref_rows = pref_rows;
     m->ple_history[0] = hist[0]; m->ple_history[1] = hist[1]; m->ple_history_len = hlen;
     if (g_q38f.layer_check == 2) {
@@ -981,6 +1014,98 @@ static void q38m_lc_routes(Model *m, int i, int n, int c0) {
     free(a); free(cpu);
 }
 
+static int q38m_lc_fdesc(const void *a, const void *b) {
+    float x = *(const float *)a, y = *(const float *)b;
+    return x > y ? -1 : x < y;
+}
+/* an attention layer's QSA selection past the budget: per row the gap between the last block
+ * taken and the first left out (the GPU's scores), the smallest over the step, and the rows
+ * whose cut falls between two scores of 0 (blocks with no positive head: an exact tie the
+ * block order breaks) */
+static void q38m_lc_qsa(Model *m, int i, int n, int pb) {
+    const Cfg *c = &m->c;
+    const int R = c->idx_ratio, take = c->idx_budget / R;
+    const int nbmax = (pb + n) / R > 0 ? (pb + n) / R : 1;
+    const float *sc = q38m_f(g_q38f.sc);
+    float *v = (float *)malloc((size_t)nbmax * sizeof(float));
+    if (!v) { fprintf(stderr, "[q38m-layer] OOM\n"); exit(1); }
+    Q38mLc *lc = &g_q38m_lc[i];
+    for (int r = 0; r < n; r++) {
+        const int blocks = (pb + r + 1) / R;
+        if (blocks <= take) continue;
+        memcpy(v, sc + (size_t)r * nbmax, (size_t)blocks * sizeof(float));
+        qsort(v, (size_t)blocks, sizeof(float), q38m_lc_fdesc);
+        double gap = (double)v[take - 1] - v[take];
+        if (v[take - 1] == 0.f) lc->qzero++;
+        if (gap < lc->qmargin) { lc->qmargin = gap; lc->qrow = pb + r; }
+    }
+    free(v);
+}
+
+static int q38m_lc_force_sel(int i, int n, int pb) {
+    if (!g_q38m_lc_sel || !g_q38m_lc_sel[i]) return 1;
+    if (!q36_gpu_sync()) return 0;
+    int *sel = (int *)q36_tensor_data(g_q38f.sel);
+    for (int r = 0; r < n; r++) {
+        const int *src = g_q38m_lc_sel[i] + (size_t)(pb + r) * g_q38m_lc_selrow;
+        if (src[0] < 0) continue;
+        int *dst = sel + (size_t)r * g_q38m_lc_selrow;
+        if (dst[0] != src[0] || memcmp(dst + 1, src + 1, (size_t)src[0] * sizeof(int))) {
+            g_q38m_lc_qforced++;
+            /* the same blocks in another order, or other blocks: by block (a block's R positions
+             * are taken together), the GPU's scores of the blocks only one side took */
+            const int R = g_q38m_lc_R, nb = (pb + n) / R, take = g_q38m_lc_take;
+            const float *sc = q38m_f(g_q38f.sc) + (size_t)r * (nb > 0 ? nb : 1);
+            unsigned char *in = (unsigned char *)calloc((size_t)nb + 1, 1);
+            if (!in) { fprintf(stderr, "[q38m-layer] OOM\n"); exit(1); }
+            int cnt = dst[0] < 0 ? 0 : dst[0];
+            for (int z = 0; z < cnt && z < take * R; z += R) if (dst[1 + z] / R < nb) in[dst[1 + z] / R] |= 1;
+            for (int z = 0; z < src[0] && z < take * R; z += R) if (src[1 + z] / R < nb) in[src[1 + z] / R] |= 2;
+            double hi_g = -INFINITY, lo_c = INFINITY, hi_c = -INFINITY, lo_g = INFINITY;
+            int sw = 0;
+            for (int b = 0; b < nb; b++) {
+                if (in[b] == 1) { sw++; if (sc[b] > hi_g) hi_g = sc[b]; if (sc[b] < lo_g) lo_g = sc[b]; }
+                if (in[b] == 2) { if (sc[b] > hi_c) hi_c = sc[b]; if (sc[b] < lo_c) lo_c = sc[b]; }
+            }
+            if (sw) {
+                g_q38m_lc_qset++; g_q38m_lc_qswap += sw;
+                double gap = fmax(fabs(hi_g - lo_c), fabs(hi_c - lo_g));
+                if (gap > g_q38m_lc_qgap) g_q38m_lc_qgap = gap;
+            }
+            free(in);
+        }
+        memcpy(dst, src, (size_t)(1 + src[0]) * sizeof(int));
+    }
+    return 1;
+}
+
+/* Q38M_FORCE_ROUTES: the chunk's router logits moved so the CPU's top-k rule picks the
+ * reference run's experts: every expert outside them is held under the smallest of them
+ * (by 1e-3 of it, so the softmax's expf keeps them apart). The chosen experts' logits stay
+ * the GPU's, so with norm_topk their gates are the GPU's; without it the denominator moves
+ * on the rows held. Router near-ties then cannot flip, and the check measures the rest. */
+static int q38m_lc_force(Model *m, int i, int n, int c0) {
+    const Cfg *c = &m->c;
+    const int E = c->experts, K = c->topk;
+    float *gl = q38m_f(g_q38f.lg);
+    int held = 0;
+    for (int r = 0; r < n; r++) {
+        float *g = gl + (size_t)r * E;
+        const int *rr = g_q38m_lc_idx + ((size_t)i * g_q38m_lc_S + c0 + r) * K;
+        float lo = INFINITY;
+        for (int z = 0; z < K; z++) if (g[rr[z]] < lo) lo = g[rr[z]];
+        const float cap = lo - 1e-3f * (1.f + fabsf(lo));
+        int moved = 0;
+        for (int e = 0; e < E; e++) {
+            int in = 0;
+            for (int z = 0; z < K; z++) in |= rr[z] == e;
+            if (!in && g[e] > cap) { g[e] = cap; moved = 1; }
+        }
+        held += moved;
+    }
+    return held;
+}
+
 /* 0: not taken (the CPU runs the step from the host state) | 1: done, the logits of
  * the last nlogits rows in logit, the final streams in hyper_h when want_streams,
  * every row's mixed in mixed_h when it is not NULL. hyper_h holds the rows' embedded
@@ -1032,7 +1157,11 @@ static int q38m_forward(Model *m, const int *ids, int S, int pos_base, int nlogi
             if (!q38_hc_apply(g_q38f.hyper, g_q38f.inj_a, g_q38f.blk, n, H, C) ||
                 !q38m_gr_read(c, &w[3], Ld->mlp_norm, n, g_q38f.inj_m) || !q38m_mlp_dense(m, i, n)) { what = "the MLP's dense part"; goto fail; }
             if (!q36_gpu_sync()) { what = "a GPU batch"; goto fail; }
-            if (check) q38m_lc_routes(m, i, n, c0);
+            if (check) {
+                if (c->is_attn[i]) q38m_lc_qsa(m, i, n, pb);
+                q38m_lc_routes(m, i, n, c0);
+                if (g_q38f.force_routes) g_q38m_lc[i].forced += q38m_lc_force(m, i, n, c0);
+            }
             q38_moe_ex(m, &m->L[i], i, q38m_f(g_q38f.mixed), n, q38m_f(g_q38f.routed), q38m_f(g_q38f.lg), 1);
             int sh = c->shared_inter > 0 && w[7].t;
             if ((sh ? !q36_add(g_q38f.blk, g_q38f.routed, g_q38f.shd, n * H) : 0) ||
@@ -1043,6 +1172,9 @@ static int q38m_forward(Model *m, const int *ids, int S, int pos_base, int nlogi
                 for (size_t k = 0; k < (size_t)n * W; k++) {
                     double d = fabs((double)g[k] - r[k]), a = fabs((double)r[k]);
                     if (!(d <= g_q38m_lc[i].diff)) { g_q38m_lc[i].diff = d; g_q38m_lc[i].wrow = c0 + (int)(k / W); }   /* a NaN is the worst */
+                    double *part = c0 + (int)(k / W) < 2048 ? &g_q38m_lc[i].diff_lo : &g_q38m_lc[i].diff_hi;
+                    if (!(d <= *part)) *part = d;
+                    if (c0 / Q38M_CHUNK < 64 && !(d <= g_q38m_lc[i].chunk[c0 / Q38M_CHUNK])) g_q38m_lc[i].chunk[c0 / Q38M_CHUNK] = d;
                     if (a > g_q38m_lc[i].max) g_q38m_lc[i].max = a;
                 }
             }
@@ -1074,9 +1206,30 @@ static int q38m_forward(Model *m, const int *ids, int S, int pos_base, int nlogi
         for (int i = 0; i < L; i++) {
             const Q38mLc *lc = &g_q38m_lc[i];
             double e = lc->diff / (lc->max > 0 ? lc->max : 1.0);
-            fprintf(stderr, "[q38m-layer] L%d worst=%.3g (max |cpu| %.3g)%s at row %d; routes off the reference run's in %d rows, "
-                            "off the CPU's on the same rows in %d, smallest margin %.3g at row %d\n",
-                    i, e, lc->max, e <= 1e-4 ? "" : " FAIL", lc->wrow, lc->off_ref, lc->off_cpu, lc->margin, lc->mrow);
+            const double mx = lc->max > 0 ? lc->max : 1.0;
+            fprintf(stderr, "[q38m-layer] L%d worst=%.3g (max |cpu| %.3g)%s at row %d (rows < 2048 %.3g, from 2048 %.3g); routes off the reference run's in %d rows, "
+                            "off the CPU's on the same rows in %d, smallest margin %.3g at row %d%s\n",
+                    i, e, lc->max, e <= 1e-4 ? "" : " FAIL", lc->wrow, lc->diff_lo / mx, lc->diff_hi / mx, lc->off_ref, lc->off_cpu,
+                    lc->margin, lc->mrow, g_q38f.force_routes ? "; forced" : "");
+            if (g_q38f.force_routes) fprintf(stderr, "[q38m-layer] L%d forced: %d rows held to the reference run's routes\n", i, lc->forced);
+            if (S > Q38M_CHUNK) {   /* the worst of each chunk of rows, over max |cpu| */
+                char line[1024]; int o = 0;
+                for (int k = 0; k * Q38M_CHUNK < S && k < 64 && o < (int)sizeof line - 16; k++)
+                    o += snprintf(line + o, sizeof line - o, " %.2g", lc->chunk[k] / mx);
+                fprintf(stderr, "[q38m-layer] L%d by chunk of %d rows:%s\n", i, Q38M_CHUNK, line);
+            }
+            if (c->is_attn[i] && g_q38m_lc_sel)
+                fprintf(stderr, "[q38m-layer] L%d QSA forced: the reference run's selection on the rows past the budget\n", i);
+            if (c->is_attn[i] && lc->qmargin < INFINITY)
+                fprintf(stderr, "[q38m-layer] L%d QSA past the budget: smallest gap at the cut %.3g at row %d; cut between zero scores in %d rows\n",
+                        i, lc->qmargin, lc->qrow, lc->qzero);
+        }
+        if (g_q38m_lc_sel) {
+            fprintf(stderr, "[q38m-layer] QSA forced: %d rows' selections differed from the reference run's (%d in their blocks, "
+                            "%d blocks swapped, the largest score gap between swapped blocks %.3g; the rest in order only)\n",
+                    g_q38m_lc_qforced, g_q38m_lc_qset, g_q38m_lc_qswap, g_q38m_lc_qgap);
+            for (int i = 0; i < L; i++) free(g_q38m_lc_sel[i]);
+            free(g_q38m_lc_sel); g_q38m_lc_sel = NULL;
         }
         free(g_q38m_lc_ref); free(g_q38m_lc); free(g_q38m_lc_idx);
         g_q38m_lc_ref = NULL; g_q38m_lc = NULL; g_q38m_lc_idx = NULL;
