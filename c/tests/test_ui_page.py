@@ -80,6 +80,17 @@ class MonitorPageTest(unittest.TestCase):
         """The gateway sends numbers, but a field may be missing or a string: coerced in JS."""
         self.assertRegex(js_function(page(), "renderMetal"), r"Number\(")
 
+    def test_page_has_no_external_requests(self):
+        """The page must work fully offline: no href/src/url()/@import pointing at http(s)."""
+        html = re.sub(r"<!--.*?-->", "", page(), flags=re.S)
+        pats = (r"""(?:href|src)\s*=\s*["']?\s*https?://""", r"""url\(\s*["']?\s*https?://""",
+                r"""@import\s+(?:url\()?\s*["']?\s*https?://""",
+                r"""fetch\(\s*["'`]https?://""", r"""new URL\(\s*["'`]https?://""")
+        for p in pats:
+            hits = [m.group(0) for m in re.finditer(p, html)]
+            self.assertEqual(hits, [], "external request: " + p)
+
+
 
 if __name__ == "__main__":
     unittest.main()
