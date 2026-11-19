@@ -64,6 +64,7 @@ static int qwen38_max_ctx(void) {
 #include "cli_args.h"
 #include "st.h"
 #include "omp_tune.h"
+#include "platform_defaults.h"   /* the SYCL build's measured configuration for unset switches (main) */
 #include "qwen38_vision.h"
 #include "json.h"   /* tokenizer.json parsing (reuse minimal parser) */
 #include "tok_unicode.h"
@@ -3726,6 +3727,40 @@ int main(int argc, char **argv) {
 
     Model m; model_init(&m, snap, cap, bits);
     q38_expert_int4_attach(&m, snap);   /* <snap>/experts-int4g64/ when present (Q38_EXPERT_INT4) */
+#ifdef COLI_SYCL
+    /* The SYCL build's default where the expert tier will stream the native FP8 checkpoint's experts to Data Center
+     * GPU Max cards: the hybrid the fork qualified (the trunk on the CPU, the CPU's FP8 order and SiLU on the card, the
+     * rank-order sum: greedy NLL 0.3030 and human 2.6323 against the CPU reference), no drafting (COLI_LOOKUP=0,
+     * Q38_MTP=0: a draft's verify is a step of several rows, which that configuration never ran), the kernels and the
+     * prompt path accepted on a Max 1100 (CPU order 4: warm decode 16.8 -> 19.1 tok/s; a prompt chunk's resident
+     * experts on the card at the measured split: first token -9 %, the same bits) and the tier settings they were
+     * measured with. Only (1) where q38_tier_start will start the FP8 tier (q38_tier_takes_fp8), (2) where the backend
+     * says every card this process will open is one it was measured on (coli_cuda_tuned_default "Q38_SYCL_HYBRID",
+     * read from the listed devices before any is opened: on any other card the CPU-order kernels may not run -- they
+     * need FP64 -- while the prompt path would still take the card's word for its bits), and (3) not under an explicit
+     * COLI_CUDA_CHAIN=1 or Q38_DN_GPU=1 (the trunk on the card, asked for). Only variables the environment leaves unset
+     * are filled; COLI_PLATFORM_DEFAULTS=0 keeps every code default (the trunk on the card, which failed that gate:
+     * 0.3288). Here, after the checkpoint and its sidecar are known and before anything reads these: the MTP head,
+     * the KV type, the drafts, the tier, the trunk placer and the backend read them later. */
+    if (q38_tier_takes_fp8(&m)) {
+        const char *chain = getenv("COLI_CUDA_CHAIN"), *dng = getenv("Q38_DN_GPU");
+        if ((chain && !strcmp(chain, "1")) || (dng && !strcmp(dng, "1")))
+            fprintf(stderr, "[qwen38] SYCL defaults not applied: COLI_CUDA_CHAIN=1 or Q38_DN_GPU=1 asks for the trunk on the card\n");
+        else if (coli_cuda_tuned_default("Q38_SYCL_HYBRID", 0) == 1) {
+            static const ColiDefaultKV q38_sycl[] = {
+                {"COLI_SYCL_F8_CPU_ORDER", "4"},       {"COLI_SYCL_F8_HOST_SILU", "1"}, {"COLI_SYCL_SILU_CPU", "1"},
+                {"Q38_TIER_RANK_ORDER", "1"},          {"Q38_TRUNK_GPU", "0"},          {"Q38_KV", "f16"},
+                {"Q38_MTP", "0"},                      {"COLI_LOOKUP", "0"},            {"COLI_CUDA_EXPERT_ARENA", "2"},
+                {"Q38_PREFILL_BATCH_ROWS", "128"},     {"Q38_PREFILL_WORKSPACE_MIB", "2048"},
+                {"Q38_PREFILL_GPU", "1"},              {"Q38_PREFILL_GPU_BALANCE", "1"},
+            };
+            char got[768];
+            if (coli_platform_defaults_apply(q38_sycl, (int)(sizeof q38_sycl / sizeof q38_sycl[0]), got, sizeof got))
+                fprintf(stderr, "[qwen38] SYCL defaults for the switches left unset (the qualified hybrid with the accepted "
+                                "kernels, measured on these cards; COLI_PLATFORM_DEFAULTS=0 keeps the code's own): %s\n", got);
+        }
+    }
+#endif
     if (serve_mode) {   /* KV_SLOTS: how many conversations the serve decodes at once */
         const char *ks=getenv("KV_SLOTS");
         if (ks && *ks) {
@@ -3824,6 +3859,12 @@ int main(int argc, char **argv) {
 #endif
     {   /* the trunk's int8 rows interleaved for the CPU, when no device reads them as rows */
         int dev=qt_ready();
+        /* Q38_ILV16_TIER=1: the CUDA tier holding only routed experts (Q38_TRUNK_GPU=0, no chain)
+         * reads no trunk row, so the CPU's trunk takes the 16-row layout as a CPU-only run does
+         * (the same int32 sums and the same final scaling: the CPU reference was made this way) */
+#ifdef COLI_CUDA
+        if(dev&&q38_ilv16_tier_on()&&!g_cuda_chain&&!q38_trunk_any_on_device())dev=0;
+#endif
 #ifdef COLI_VULKAN
         dev=dev||g_vk_ready;
 #endif

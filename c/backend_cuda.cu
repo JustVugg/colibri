@@ -13,7 +13,7 @@ static_assert(FP8_BLOCK == 128, "fmt=8 on-disk containers carry ceil(dim/128)-ed
 /* Optional fmt=8 decode candidate (COLI_CUDA_F8_WARP=2): cuda_fp8.h maps
  * __nv_cvt_fp8_to_halfraw to an sm_89+ cvt instruction, with a bit-manip
  * fallback below 890. CUDA-only; the HIP build keeps the LUT decode. */
-#if !(defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)) && defined(CUDART_VERSION) && CUDART_VERSION >= 11080
+#if !(defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)) && defined(CUDART_VERSION) && CUDART_VERSION >= 11080 && !defined(COLI_GPU_PORTABLE_ONLY)
 #include <cuda_fp8.h>
 #define COLI_F8_HWCVT 1
 #else
@@ -403,7 +403,7 @@ __global__ static void offset_to_signed_s4(uint8_t *q,size_t n){
  * with fast-math: nvcc's --use_fast_math implies -ftz=true, which flushes the
  * scale*subnormal contributions the denormal-scale test pins down. (-ftz has
  * no macro of its own to test; the Makefile pins -ftz=false on the nvcc line.) */
-#if defined(__USE_FAST_MATH__) || defined(__FAST_MATH__)
+#if (defined(__USE_FAST_MATH__) && !defined(COLI_GPU_PORTABLE_ONLY)) || defined(__FAST_MATH__)   /* the migration tool predefines nvcc's */
 #error "backend_cuda.cu: fmt=8 kernels forbid fast-math builds (FTZ breaks CPU parity)"
 #endif
 
@@ -704,7 +704,7 @@ __global__ static void situ_mul(float *gate, const float *up, size_t n, float b1
  * prefill: the first prototype reloaded/converter A once per 16 output cols. */
 __global__ static void w4a16_matmul(float *y,const float *x,const uint8_t *w,
                                     const float *scale,int M,int K,int N){
-#if __CUDA_ARCH__ >= 700
+#if __CUDA_ARCH__ >= 700 && !defined(COLI_GPU_PORTABLE_ONLY)
     using namespace nvcuda;int warp=threadIdx.x>>5,lane=threadIdx.x&31;
     int m0=blockIdx.y*16,n0=blockIdx.x*64+warp*16;
     __shared__ __half ah[256],bh[4][256];
@@ -738,7 +738,7 @@ __global__ static void w4a16_matmul(float *y,const float *x,const uint8_t *w,
 __global__ static void w4a16_gate_up(float *gate,float *up,const float *x,
         const uint8_t *gw,const uint8_t *uw,const float *gs,const float *us,
         int M,int K,int N){
-#if __CUDA_ARCH__ >= 700
+#if __CUDA_ARCH__ >= 700 && !defined(COLI_GPU_PORTABLE_ONLY)
     using namespace nvcuda;int warp=threadIdx.x>>5,lane=threadIdx.x&31,which=warp&1,tile=warp>>1;
     int m0=blockIdx.y*16,n0=blockIdx.x*64+tile*16;const uint8_t *w=which?uw:gw;
     const float *scale=which?us:gs;float *y=which?up:gate;size_t rb=(size_t)(K+1)/2;
@@ -777,7 +777,7 @@ __global__ static void quantize_s4_rows(uint8_t *q,float *scale,const float *x,i
 
 __global__ static void grouped_s4_wmma(float *y,const uint8_t *x,const float *xscale,
                                         const GroupDesc *desc,int K,int O,int which){
-#if __CUDA_ARCH__ >= 750
+#if __CUDA_ARCH__ >= 750 && !defined(COLI_GPU_PORTABLE_ONLY)
     using namespace nvcuda;
     int warp=threadIdx.x/32,lane=threadIdx.x%32,tile=blockIdx.x*8+warp,c=blockIdx.y;
     if(tile*8>=O)return; GroupDesc d=desc[c];
@@ -1641,7 +1641,7 @@ extern "C" int coli_cuda_init(const int *devices, int count) {
         if (!cuda_ok(cudaGetDeviceProperties(&prop, device), "device properties")) { coli_cuda_shutdown(); return 0; }
         ctx->compute_major=prop.major;ctx->compute_minor=prop.minor;
         ctx->sms=prop.multiProcessorCount>0?prop.multiProcessorCount:1;
-#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
+#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__) || defined(COLI_GPU_PORTABLE_ONLY)
         ctx->smem_optin=48*1024;
 #else
         ctx->smem_optin=prop.sharedMemPerBlockOptin>48*1024?(size_t)prop.sharedMemPerBlockOptin:48*1024;
@@ -1649,7 +1649,7 @@ extern "C" int coli_cuda_init(const int *devices, int count) {
         if(!cuda_ok(cudaStreamCreateWithFlags(&ctx->stream,cudaStreamNonBlocking),"stream creation")){
             coli_cuda_shutdown();return 0;
         }
-#if !(defined(__HIP__) || defined(__HIP_PLATFORM_AMD__))
+#if !(defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)) && !defined(COLI_GPU_PORTABLE_ONLY)
         {   /* the scratch the kernels take with cudaMallocAsync stays in the device's pool up to 64 MiB:
              * with the default threshold of 0 every synchronization handed it back and the next
              * allocation went to the driver again (300 us between two MTP drafts on an RTX PRO 4000) */
@@ -1936,6 +1936,28 @@ static int bd_tensor_gemv(DeviceContext *ctx, ColiCudaTensor *t, float *y, const
     if (!exact && S > BD_GEMV_MAX_S && bd_tensor_gemm(ctx, t, y, x, S, st)) return 1;
     if (!bd_gemv_launch(y, x, (const bd_u32 *)t->weights, tab, t->fmt, t->I, t->O, t->row_words, S, ctx->smem_optin, exact, st)) return 0;
     return cuda_ok(cudaGetLastError(), "block gemv launch");
+}
+/* page-locked staging for the tier's uploads (backend_cuda.h): the SYCL backend's; not offered here */
+extern "C" void *coli_cuda_host_alloc(int device, size_t bytes) { (void)device; (void)bytes; return NULL; }
+extern "C" void coli_cuda_host_free(int device, void *p) { (void)device; (void)p; }
+/* the native int4 format in an arena's slot (backend_cuda.h): the SYCL backend's; not offered here,
+ * so the tier keeps a cudaMalloc a matrix on this backend */
+extern "C" int coli_cuda_slot_fill_s4(int device, void *dev_w, const void *w, size_t nw,
+                                      float *dev_s, const float *s, size_t ns) {
+    (void)device; (void)dev_w; (void)w; (void)nw; (void)dev_s; (void)s; (void)ns;
+    return 0;
+}
+extern "C" int coli_cuda_tensor_at_g(ColiCudaTensor **tensor, void *dev_w, float *dev_s,
+                                     int I, int O, int device, int gs) {
+    (void)tensor; (void)dev_w; (void)dev_s; (void)I; (void)O; (void)device; (void)gs;
+    return 0;
+}
+/* the fp8 format over an arena's slot (backend_cuda.h): the SYCL backend's; not offered here, so the
+ * tier's question at qt_init is answered 0 and it keeps a cudaMalloc a matrix on this backend */
+extern "C" int coli_cuda_tensor_at_f8(ColiCudaTensor **tensor, void *dev_w, float *dev_s,
+                                      int I, int O, int device) {
+    (void)tensor; (void)dev_w; (void)dev_s; (void)I; (void)O; (void)device;
+    return 0;
 }
 /* a block-format tensor in device memory the caller owns (an arena's slot of cap bytes):
  * coli_cuda_tensor_free leaves the memory, and its bytes are counted where it was allocated */
@@ -2309,6 +2331,21 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
     if (!cuda_ok(cudaGetLastError(), "matmul launch") ||
         !cuda_ok(cudaMemcpy(y, ctx->dy, yb, cudaMemcpyDeviceToHost), "output download")) return 0;
     return 1;
+}
+
+/* coli_cuda_matmul_i8act (backend_cuda.h): the SYCL backend's exact int8 product (Qwen3.8's Q38_TRUNK_GPU_I8); here
+ * 0, so an engine asking for it keeps the CPU path */
+extern "C" int coli_cuda_matmul_i8act(ColiCudaTensor *tensor, float *y, const signed char *xq, const float *sx,
+                                      int S, int I, int O) {
+    (void)tensor; (void)y; (void)xq; (void)sx; (void)S; (void)I; (void)O;
+    return 0;
+}
+
+/* coli_cuda_tuned_default (backend_cuda.h): the SYCL backend's per-architecture defaults; no table here, so every
+ * switch keeps the code's own default */
+extern "C" int coli_cuda_tuned_default(const char *knob, int generic) {
+    (void)knob;
+    return generic;
 }
 
 /* ---- a vision tower's attention (see backend_cuda.h) ---------------------- */
@@ -3514,7 +3551,7 @@ extern "C" int coli_cuda_tensor_shape(const ColiCudaTensor *t, int *fmt, int *I,
 #define TCG_BN 64
 #define TCG_BK 32
 #define TCG_LD (TCG_BK + 4)
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__) && !defined(COLI_GPU_PORTABLE_ONLY)
 #define TCG_BODY 1
 #else
 #define TCG_BODY 0
@@ -3650,7 +3687,7 @@ __device__ __forceinline__ void tcg_tile(float *__restrict__ Y, int yld, const i
  * a multiple of 64. */
 #define HCG_BK 64
 #define HCG_LDH (HCG_BK + 8)   /* halves a staged row: 144 bytes, the warps' rows on other banks */
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__) && !defined(COLI_GPU_PORTABLE_ONLY)
 #define HCG_BODY 1
 #else
 #define HCG_BODY 0
@@ -4022,7 +4059,7 @@ static int hcm_type(int fmt, int I) {
  * no faster on that card and ten times the error: the scales are per element there, here per
  * weight once a tile. */
 #define HCM_BK 32
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__) && !defined(COLI_GPU_PORTABLE_ONLY)
 #define HCM_BODY 1
 #else
 #define HCM_BODY 0
@@ -4502,7 +4539,7 @@ __global__ static void hcm_sum_k(float *__restrict__ y, const float *__restrict_
  * on an RTX PRO 4000. COLI_CUDA_HCG_SPLIT=n: n splits always (1 none). */
 struct HcgPart { float *yp; void *scr; int ns, kc; };
 static HcgPart hcg_part(const DeviceContext *ctx, float *y, long long blocks, int per_sm, int S, int I, int O, int can, cudaStream_t st) {
-#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)   /* the f16 tiles are off there (hcg_ok) */
+#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__) || defined(COLI_GPU_PORTABLE_ONLY)   /* the f16 tiles are off there (hcg_ok) */
     (void)ctx; (void)blocks; (void)per_sm; (void)S; (void)O; (void)can; (void)st;
     HcgPart h = {y, nullptr, 1, I};
     return h;
@@ -4526,7 +4563,7 @@ static HcgPart hcg_part(const DeviceContext *ctx, float *y, long long blocks, in
 }
 static void hcg_part_sum(const HcgPart &h, float *y, int S, int O, cudaStream_t st) {
     if (h.ns <= 1) return;
-#if !(defined(__HIP__) || defined(__HIP_PLATFORM_AMD__))
+#if !(defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)) && !defined(COLI_GPU_PORTABLE_ONLY)
     const long long ny = (long long)S * O;
     hcm_sum_k<<<(unsigned)((ny + 255) / 256), 256, 0, st>>>(y, h.yp, ny, h.ns);
     (void)cudaFreeAsync(h.scr, st);
@@ -4534,7 +4571,7 @@ static void hcg_part_sum(const HcgPart &h, float *y, int S, int O, cudaStream_t 
     (void)y; (void)S; (void)O; (void)st;
 #endif
 }
-#if !(defined(__HIP__) || defined(__HIP_PLATFORM_AMD__))   /* HIP has no carveout attribute; hcm_gemm is off there */
+#if !(defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)) && !defined(COLI_GPU_PORTABLE_ONLY)   /* HIP has no carveout attribute; hcm_gemm is off there */
 template<int T, int BM, int BN, bool GLU = false>
 static void hcm_launch(dim3 g, cudaStream_t st, float *y, const __half *xh, const bd_u32 *w, int rw, int S, int I, int O, int kc,
                        const bd_u32 *wu = nullptr, const bd_u32 *tab = nullptr) {
@@ -4557,7 +4594,7 @@ static void hcm_launch(dim3 g, cudaStream_t st, float *y, const __half *xh, cons
  * the other tiles. */
 static int hcm_gemm(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float *x, int S, cudaStream_t st,
                     ColiCudaTensor *tu = nullptr) {
-#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
+#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__) || defined(COLI_GPU_PORTABLE_ONLY)
     (void)ctx; (void)t; (void)y; (void)x; (void)S; (void)st; (void)tu; return 0;
 #else
     static int on = -1, ftile = 0, fsplit = 0;
@@ -4635,7 +4672,7 @@ static int hcm_gemm(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float
  * then read again. 1 done, -1 not taken (another type, few rows, a K the tiles would split), 0 a failure */
 extern "C" int coli_cuda_tensor_gemm_hcmix_async(ColiCudaTensor *t, float *mixed, const float *x, const float *hn, int S, int H, int C,
                                                  float fc, void *stream) {
-#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
+#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__) || defined(COLI_GPU_PORTABLE_ONLY)
     (void)t; (void)mixed; (void)x; (void)hn; (void)S; (void)H; (void)C; (void)fc; (void)stream; return -1;
 #else
     if (fault_injected()) return 0;
@@ -4739,7 +4776,7 @@ extern "C" void coli_cuda_host_unregister(void *p) {
 }
 /* the f16 GEMMs (sm_70 and later; not under HIP); COLI_CUDA_TC_F16=0 keeps TF32 where it runs */
 static int hcg_ok(const DeviceContext *ctx) {
-#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
+#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__) || defined(COLI_GPU_PORTABLE_ONLY)
     (void)ctx; return 0;
 #else
     static int off = -1;
@@ -4765,7 +4802,7 @@ __global__ static void __launch_bounds__(128) tcg_dense_k(float *__restrict__ y,
 }
 /* the device takes TF32 fragments (sm_80 and later; not under HIP); COLI_CUDA_TC_GEMM=0: the block kernel */
 static int tcg_ok(const DeviceContext *ctx) {
-#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
+#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__) || defined(COLI_GPU_PORTABLE_ONLY)
     (void)ctx; return 0;
 #else
     static int off = -1;
@@ -5028,7 +5065,7 @@ __global__ static void __launch_bounds__(256) f32_gemv_k(float *__restrict__ y, 
  * outputs 32 (w >> 1): 2 x 4 products of 16 x 8 a k8, the fragments by ldmatrix. blockIdx.z: a
  * split K's part, its partial sums into its own S x O of y. Qwen3.6's router (2048 x 257) at
  * 512 rows took f32_gemm_k 251 us, its DeltaNet b and a rows (2048 x 64, 32 blocks) 173. */
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__) && !defined(COLI_GPU_PORTABLE_ONLY)
 #define F32T_BODY 1
 #else
 #define F32T_BODY 0
@@ -5135,7 +5172,7 @@ __global__ static void __launch_bounds__(128) f32t_gemm_k(float *__restrict__ y,
  * the blocks fill less than a wave, 256 inputs a split at least. 0: not taken. COLI_CUDA_F32T=0
  * keeps f32_gemm_k. */
 static int f32t_gemm(DeviceContext *ctx, float *y, const float *x, const float *w, int S, int I, int O, cudaStream_t st) {
-#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
+#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__) || defined(COLI_GPU_PORTABLE_ONLY)
     (void)ctx; (void)y; (void)x; (void)w; (void)S; (void)I; (void)O; (void)st; return 0;
 #else
     static int on = -1;
@@ -5384,7 +5421,7 @@ extern "C" int coli_cuda_tensor_dev(const ColiCudaTensor *t, const void **w, con
  * inside a server's first long prompt on an RTX PRO 4000. A kernel's attributes asked for on the
  * current device load the module there now (cuda_chain.cu's cc_preload, before the first request). */
 extern "C" int coli_cuda_load_module(void) {
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__) || defined(COLI_GPU_PORTABLE_ONLY)
     return 1;
 #else
     cudaFuncAttributes fa;
@@ -5729,7 +5766,7 @@ __global__ static void hcm_half_rows_k(const float *__restrict__ x, int x_row, u
 /* the experts through hcm_moe_*_k where their types and rows let them; 0: not taken (hcg_tile's) */
 /* whether hcm_moe takes this call's experts (their types and rows), before any allocation */
 static int hcm_moe_able(DeviceContext *ctx, const CcMoe *p, const bd_u32 *btab) {
-#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
+#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__) || defined(COLI_GPU_PORTABLE_ONLY)
     (void)ctx; (void)p; (void)btab; return 0;
 #else
     static int on = -1;
@@ -5747,7 +5784,7 @@ static int hcm_moe_able(DeviceContext *ctx, const CcMoe *p, const bd_u32 *btab) 
  * slice's down into hid after the gate's and up's (S*K rows of cols), then its sums into y's columns */
 static int hcm_moe(DeviceContext *ctx, const CcExpert *tab, const float *x, float *hid, MoeSort m, const CcMoe *p, cudaStream_t st,
                    const bd_u32 *btab, int cols = 0, const float *w = nullptr, float *y = nullptr) {
-#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
+#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__) || defined(COLI_GPU_PORTABLE_ONLY)
     (void)ctx; (void)tab; (void)x; (void)hid; (void)m; (void)p; (void)st; (void)btab; (void)cols; (void)w; (void)y; return 0;
 #else
     if (!hcm_moe_able(ctx, p, btab)) return 0;

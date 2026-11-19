@@ -718,6 +718,31 @@ static void q38_xf16_rows(float *y,int ys,const Q38Weight *w,const gq_act *ga,in
     }
 }
 #endif
+/* Q38_TRUNK_GPU_I8=1 (default 0): a trunk matrix the tier placed on the card (Q38_TRUNK_GPU) answers through
+ * qt_dense_matmul_i8act: the activations quantized here exactly as the CPU path does (dense_act_i8), the card's
+ * integer dots exact, the same final scaling -- the CPU's bits, where the card's float path (the default with the trunk
+ * on the card) is not. Up to Q38_TRUNK_GPU_I8_ROWS rows a call (default 8: decode and several conversations); more
+ * rows (a prompt chunk) take the CPU path. */
+static int q38_trunk_gpu_i8_on(void) {
+    static int v=-1;
+    if(v<0){
+        const char *e=getenv("Q38_TRUNK_GPU_I8"),*dn=getenv("Q38_DN_GPU"),*ch=getenv("COLI_CUDA_CHAIN");
+        v=e&&e[0]=='1'&&!e[1];
+        /* Q38_DN_GPU's DeltaNet step and the CUDA chain read the same int8 matrices on the card in float: with either
+         * the trunk's bits would not be the CPU's whatever this switch does, so it stands down and says so */
+        if(v&&((dn&&dn[0]=='1'&&!dn[1])||(ch&&ch[0]=='1'&&!ch[1]))){
+            fprintf(stderr,"[qwen38] Q38_TRUNK_GPU_I8=1 is off: Q38_DN_GPU=1 or COLI_CUDA_CHAIN=1 computes the trunk on the "
+                           "card in float (not the CPU's bits); unset them for the exact path\n");
+            v=0;
+        }
+    }
+    return v;
+}
+static int q38_trunk_gpu_i8_rows(void) {
+    static int v=-1;
+    if(v<0){const char *e=getenv("Q38_TRUNK_GPU_I8_ROWS");v=e&&*e?atoi(e):8;if(v<1)v=1;}
+    return v;
+}
 static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
                               int S,int I,int O) {
     /* Every CPU kernel below computes a row the same way whatever S is, so an
@@ -759,7 +784,7 @@ static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
     /* A matrix the tier placed in VRAM (q38_trunk_place) answers a decode
      * GEMV from there; prefill rows and any failure take the CPU path below,
      * so the BF16 copy stays the reference for everything but S == 1. */
-    if(S==1&&weight&&weight->gpu&&weight->rows==O&&weight->cols==I&&
+    if(S==1&&weight&&weight->gpu&&weight->rows==O&&weight->cols==I&&!q38_trunk_gpu_i8_on()&&
        qt_dense_matmul(weight->gpu-1,y,x,I,O))return;
 #ifdef COLI_VULKAN
     if(g_vk_ready&&g_vk_dense&&weight&&weight->rows==O&&weight->cols==I&&q38_vk_dense_ok(weight)&&
@@ -776,6 +801,11 @@ static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
         int8_t *xq=(int8_t*)malloc((size_t)S*I); float *sx=(float*)malloc((size_t)S*sizeof(float));
         if(!xq||!sx){fprintf(stderr,"OOM activation quantization\n");exit(1);}
         for(int s=0;s<S;s++)sx[s]=dense_act_i8(x+(int64_t)s*I,I,xq+(int64_t)s*I,NULL);
+        if(weight->gpu&&q38_trunk_gpu_i8_on()&&S<=q38_trunk_gpu_i8_rows()&&
+           qt_dense_matmul_i8act(weight->gpu-1,y,(const signed char*)xq,sx,S,I,O)){   /* the card, the CPU's bits */
+            free(xq);free(sx);
+            return;
+        }
 #ifdef IDOT_R16
         if(weight->q8r16){   /* interleaved rows: 128 * each activation row's sum comes off */
             int32_t xsum[64],*xs=S<=64?xsum:(int32_t*)malloc((size_t)S*sizeof(int32_t));
@@ -3243,6 +3273,9 @@ static void q38_dn_gpu_invalidate(Model *m) {   /* the host state was rewritten:
     memset(m->dn_dev_fresh,0,(size_t)m->c.layers); memset(m->dn_host_stale,0,(size_t)m->c.layers);
 }
 
+/* Set only around a selected single-row host DeltaNet diagnostic call. */
+static int g_q38_boundary_dn=-1;
+static void q38_boundary_save(int layer,int row,const char *stage,const float *data,int count);
 static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
                          float *out) {
     double phase_started=now_s();
@@ -3302,6 +3335,12 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
         q38_dense_matmul(m,z,chunk,&l->dn_z,rows,H,V);
         q38_dense_matmul(m,bb,chunk,&l->dn_b,rows,H,VH);
         q38_dense_matmul(m,aa,chunk,&l->dn_a,rows,H,VH);
+        if(g_q38_boundary_dn==layer&&base==0&&rows==1){
+            q38_boundary_save(layer,0,"dn-qkv",qkv,CD);
+            q38_boundary_save(layer,0,"dn-z",z,V);
+            q38_boundary_save(layer,0,"dn-b",bb,VH);
+            q38_boundary_save(layer,0,"dn-a",aa,VH);
+        }
 
         double recur_started=now_s(),snap_s=0.0;
         /* One parallel region for all the rows. The causal conv by channel, each
@@ -3380,6 +3419,10 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
                 q38_rmsg(norm_row+(int64_t)h*VD,current,z_row+(int64_t)h*VD,l->dn_norm,VD,c->eps,1);
             }
         }
+        }
+        if(g_q38_boundary_dn==layer&&base==0&&rows==1){
+            q38_boundary_save(layer,0,"dn-conv",convs,CD);
+            q38_boundary_save(layer,0,"dn-norm",norm,V);
         }
         m->timers.seconds[Q38_TM_DN_RECUR]+=now_s()-recur_started-snap_s;
         m->timers.seconds[Q38_TM_DN_SNAP]+=snap_s;
@@ -3611,6 +3654,25 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
  * next token. Only native FP8 slots are reported: gate.data at the slab start
  * is what q38_bind_fp8_slot() produces, an expanded slot points elsewhere. */
 static int g_q38_gguf_tier;   /* the tier holds a GGUF's experts as the file has them (q38_tier_start) */
+static int g_q38_tier_rank_order;   /* native FP8 row merge, opt-in and reset on every tier start */
+static unsigned g_q38_tier_rank_logged;
+/* Q38_PREFILL_TIER_NOTE=1 (default 0): the prompt pass reports its experts to the CUDA tier too */
+static int q38_prefill_tier_note_on(void) {
+    static int v=-1;
+    if(v<0){const char *e=getenv("Q38_PREFILL_TIER_NOTE");v=e&&e[0]=='1'&&!e[1];}
+    return v;
+}
+static void q38_tier_note(int layer,int eid,const Slot *ex);
+/* a prompt chunk's expert, reported the way decode reports a CPU expert: copied to the tier only
+ * when the tier would take it now (qt_note_wanted, lock-free), else counted as heat (none under the
+ * CUDA chain or a trunk-only tier). Placement only; the same bits as without it only where the place
+ * an expert runs changes none (rank-order merging, Q38_TIER_RANK_ORDER=1, with device kernels that
+ * reproduce the CPU's: COLI_SYCL_F8_CPU_ORDER and COLI_SYCL_F8_HOST_SILU) -- as for decode's tier. */
+static void q38_tier_note_prefill(int layer,int eid,const Slot *ex) {
+    if(!qt_ready())return;
+    if(qt_note_wanted(layer,eid))q38_tier_note(layer,eid,ex);
+    else qt_note_heat_pass(layer,eid);
+}
 static void q38_tier_note(int layer,int eid,const Slot *ex) {
     if(g_q38_gguf_tier){
         /* the file's rows: as the slot holds them, or back from its interleaved copy into a
@@ -3926,6 +3988,15 @@ static void q38_trunk_cpu_int8(Model *m) {
  * of 16 rows at a time (a group's rows and its interleaved form are the same byte range).
  * After the draft head has read the rows, and only when no device reads them: the caller
  * skips it under a GPU tier or the Vulkan dense path. Q38_ILV16=0 keeps the rows. */
+/* Q38_ILV16_TIER=1 (default 0): see the interleave decision in qwen38.c's main */
+static int q38_ilv16_tier_on(void) {
+    const char *e=getenv("Q38_ILV16_TIER"); return e&&e[0]=='1'&&!e[1];
+}
+/* 1 when the placer put any trunk matrix on a device (its int8 rows are read there as rows) */
+static int q38_trunk_any_on_device(void) {
+    for(int i=0;i<g_trunk_n;i++) if(g_trunk[i].w&&g_trunk[i].w->gpu) return 1;
+    return 0;
+}
 static void q38_trunk_q8_interleave(Model *m) {
     (void)m;
 #ifdef IDOT_R16
@@ -4203,7 +4274,18 @@ static int q38_tier_offer_chain(Model *m) {
     return 1;
 }
 #endif
+/* Whether q38_tier_start will start the FP8 expert tier: COLI_CUDA exactly 1, the snapshot's own native FP8
+ * experts -- no GGUF, no int4/low-bit sidecar (m->x4), Q38_NATIVE_FP8 on, every layer's scale bank -- its own
+ * checks without its messages (a layer's bank is prepared once; the tier finds it ready). qwen38.c's SYCL
+ * defaults apply only where this holds. */
+static int q38_tier_takes_fp8(Model *m) {
+    const char *on=getenv("COLI_CUDA");
+    if(!on||on[0]!='1'||on[1]||g_q38_gguf||m->x4||!m->native_fp8)return 0;
+    for(int layer=0;layer<m->c.layers;layer++) if(!q38_prepare_expert_scale_bank(m,layer))return 0;
+    return 1;
+}
 static void q38_tier_start(Model *m,int cap) {
+    g_q38_tier_rank_order=0;g_q38_tier_rank_logged=0;
     const char *on=getenv("COLI_CUDA");
     if(!on||on[0]!='1'||on[1])return;
     Cfg *c=&m->c;
@@ -4286,6 +4368,8 @@ static void q38_tier_start(Model *m,int cap) {
 #endif
     if(qt_init_fp8(c->layers,c->experts,c->hidden,c->inter,cap,c->topk,E4M3_LUT)){
         atexit(qt_shutdown);
+        const char *rank=getenv("Q38_TIER_RANK_ORDER");
+        g_q38_tier_rank_order=rank&&!strcmp(rank,"1");
         fprintf(stderr,"[qtier] qwen38: fp8 expert tier on (RAM LRU %d/layer stays; experts stream to VRAM as they get hot)\n",cap);
         q38_trunk_place_all(m);
         /* Q38_DN_GPU=1: where dnqkv, dnz and dnout of a DeltaNet layer all sit
@@ -4953,6 +5037,12 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
  * router runs here; routed_only = 1: `out` gets the routed experts' rank-order sum
  * without the shared expert (the Vulkan dense chain runs the router and the shared
  * expert on the device and adds them there). q38_moe passes NULL, 0: unchanged. */
+/* Q38_MUX_TIER=1 (default 0): see the dispatch in q38_moe_ex */
+static int q38_mux_tier_on(void) {
+    static int v=-1;
+    if(v<0){const char *e=getenv("Q38_MUX_TIER");v=e&&e[0]=='1'&&!e[1];}
+    return v;
+}
 static void q38_moe_decode_ex(Model *m,Layer *l,int layer,const float *x,int S,float *out,
                               const float *logits_in,int routed_only) {
     if(q38_moe_decode_grouped(m,l,layer,x,S,out,logits_in,routed_only,0,NULL,NULL,NULL))return;
@@ -4960,7 +5050,8 @@ static void q38_moe_decode_ex(Model *m,Layer *l,int layer,const float *x,int S,f
     float *logits=falloc(E),*sg=falloc(SI),*su=falloc(SI),*sh=falloc(SI),*shared=falloc(H);
     float *eg=falloc(I),*eu=falloc(I),*eh=falloc(I),*eo=falloc(H);
     int vk=vkt_ready()&&layer<vkt_layers();   /* the Vulkan tier: outputs buffered per rank */
-    float *ebuf=vk?falloc((int64_t)K*H):NULL;
+    int ordered=!vk&&g_q38_tier_rank_order&&qt_ready()&&layer<c->layers&&K<=32;
+    float *ebuf=(vk||ordered)?falloc((int64_t)K*H):NULL;
     for(int s=0;s<S;s++){
         const float *xs=x+(int64_t)s*H;float *ys=out+(int64_t)s*H;memset(ys,0,(size_t)H*sizeof(float));
         if(g_q38_cov)q38_cov_add(layer,xs,1);
@@ -5003,9 +5094,9 @@ static void q38_moe_decode_ex(Model *m,Layer *l,int layer,const float *x,int S,f
             for(int j=0;j<I;j++)eh[j]=q38_silu(eg[j])*eu[j];
             if(g_q38_act)q38_act_add(layer,cpu_idx[i],xs,eh,1);
             q38_weight_matmul(eo,eh,&ex->down,1,I,H);
-            if(vk){
+            if(vk||ordered){
                 memcpy(ebuf+(int64_t)z*H,eo,(size_t)H*sizeof(float));
-                q38_vk_note(layer,cpu_idx[i],ex);
+                if(vk)q38_vk_note(layer,cpu_idx[i],ex);
             }
             else for(int d=0;d<H;d++)ys[d]+=route_gates[z]*eo[d];
             q38_tm_add(m,Q38_TM_ROUTED_EXPERT,phase_started);
@@ -5024,11 +5115,27 @@ static void q38_moe_decode_ex(Model *m,Layer *l,int layer,const float *x,int S,f
                 for(int d=0;d<H;d++)ys[d]+=route_gates[z]*e[d];
             }
         }
-        /* GPU experts land after the CPU ones: same values, one more group in
-         * the float sum (that is the only ordering difference to a CPU run). */
-        if(tiered&&!qt_take(qmask,route_gates,K,ys)){
+        /* Default: CPU misses followed by GPU hits. Optional native FP8 path:
+         * copy all raw GPU rows before releasing the issue, then merge both
+         * sources in the CPU reference's rank order with the same float loop. */
+        int collected=ordered?qt_take_rows(qmask,K,ebuf,(size_t)H):
+                      !tiered||qt_take(qmask,route_gates,K,ys);
+        if(!collected){
             fprintf(stderr,"qwen38: CUDA expert collection failed at layer %d; stopping inference\n",layer);
             exit(1);
+        }
+        if(ordered){
+            for(int z=0;z<K;z++){
+                const float *e=ebuf+(int64_t)z*H;
+                for(int d=0;d<H;d++)ys[d]+=route_gates[z]*e[d];
+            }
+            uint32_t full=K==32?UINT32_MAX:(1u<<K)-1;
+            unsigned kind=!qmask?1:qmask==full?2:4;
+            if(!(g_q38_tier_rank_logged&kind)){
+                fprintf(stderr,"[qtier] qwen38: rank-order native FP8 row K=%d H=%d GPU-mask=%08x (%s)\n",
+                        K,H,qmask,kind==1?"all CPU":kind==2?"all GPU":"mixed CPU/GPU");
+                g_q38_tier_rank_logged|=kind;
+            }
         }
         if(!routed_only)for(int d=0;d<H;d++)ys[d]+=gate*shared[d];
     }
@@ -5085,6 +5192,89 @@ static void q38_prefill_expert_rows(Model *m,Slot *expert,const float *xc,int K,
     q38_tm_add(m,Q38_TM_ROUTED_EXPERT,started);
 }
 
+/* Q38_PREFILL_GPU=1 (default 0): a prompt chunk's experts that are resident on the CUDA tier's card run there, on a
+ * worker thread, while this thread runs the others (as the Vulkan tier's hooks in q38_moe_prefill): groups of up to
+ * 64 experts with all their rows of the chunk (qt_prefill_group, synchronous), the outputs copied to routed_out in the
+ * grouped order, so the rank-order reduction is the same. An expert the card did not compute (no longer resident, the
+ * backend refused) runs here after the join. The same bits as the CPU only where the card's expert kernels reproduce
+ * the CPU's for every row (COLI_SYCL_F8_CPU_ORDER with COLI_SYCL_F8_HOST_SILU), as for decode's tier. */
+static int q38_prefill_gpu_on(void) {
+    static int v=-1;
+    if(v<0){const char *e=getenv("Q38_PREFILL_GPU");v=e&&e[0]=='1'&&!e[1];}
+    return v;
+}
+/* the switch engages only where the card's FP8 kernels reproduce the CPU's (the GGUF tier's do not, nor FP8 without
+ * these): said once when it is set and cannot */
+static int q38_prefill_gpu_exact(void) {
+    static int v=-1;
+    if(v<0){
+        const char *o=getenv("COLI_SYCL_F8_CPU_ORDER"),*h=getenv("COLI_SYCL_F8_HOST_SILU");
+        const char *wp=getenv("COLI_CUDA_F8_WARP");
+        v=o&&(o[0]=='1'||o[0]=='2'||o[0]=='3'||o[0]=='4')&&!o[1]&&h&&h[0]=='1'&&!h[1]&&!(wp&&wp[0]=='0'&&!wp[1]);
+        if(v&&g_q38_gguf_tier)v=0;   /* the GGUF tier's kernels are not the CPU's */
+        if(!v&&q38_prefill_gpu_on())
+            fprintf(stderr,"[qtier] qwen38: Q38_PREFILL_GPU=1 needs the card's FP8 kernels to give the CPU's bits "
+                           "(native FP8 experts, COLI_SYCL_F8_CPU_ORDER=1|2|3|4, COLI_SYCL_F8_HOST_SILU=1, not COLI_CUDA_F8_WARP=0): "
+                           "a prompt's experts stay on the CPU\n");
+    }
+    return v;
+}
+typedef struct {
+    int layer,K,H,n;                  /* n experts, grouped by the card they are resident on */
+    const int *eids,*counts,*firsts;  /* each: its id, its rows, its first position in the grouped order */
+    const int *devs;                  /* each: the card (the tier's device index) it is resident on */
+    const int *assignments;           /* grouped position -> assignment (row*K+rank) */
+    const float *xc;                  /* the chunk's rows */
+    float *routed_out,*gx,*gy;        /* outputs by grouped position; scratch for a group's inputs and outputs */
+    uint8_t *done;                    /* each: computed on the card */
+    double seconds;
+} Q38PrefillGpu;
+static void *q38_prefill_gpu_run(void *arg) {
+    Q38PrefillGpu *w=(Q38PrefillGpu*)arg;
+    const double t0=now_s();
+    for(int i0=0;i0<w->n;){
+        int n=1;   /* a group: up to 64 experts of one card (qt_prefill_group takes one device's) */
+        while(n<64 && i0+n<w->n && w->devs[i0+n]==w->devs[i0]) n++;
+        size_t off=0;
+        for(int i=i0;i<i0+n;i++){
+            for(int a=0;a<w->counts[i];a++)
+                memcpy(w->gx+(off+(size_t)a)*w->H,w->xc+(size_t)(w->assignments[w->firsts[i]+a]/w->K)*w->H,
+                       (size_t)w->H*sizeof(float));
+            off+=(size_t)w->counts[i];
+        }
+        if(qt_prefill_group(w->layer,w->eids+i0,w->counts+i0,n,w->gx,w->gy)){
+            off=0;
+            for(int i=i0;i<i0+n;i++){
+                memcpy(w->routed_out+(size_t)w->firsts[i]*w->H,w->gy+off*w->H,(size_t)w->counts[i]*w->H*sizeof(float));
+                w->done[i]=1; off+=(size_t)w->counts[i];
+            }
+        }
+        i0+=n;
+    }
+    w->seconds=now_s()-t0;
+    return NULL;
+}
+static uint64_t g_q38_pg_chunks,g_q38_pg_gpu_experts,g_q38_pg_gpu_rows,g_q38_pg_cpu_experts,g_q38_pg_fallback;
+/* Q38_PREFILL_GPU_BALANCE=1 (with Q38_PREFILL_GPU=1): the card gets the share of a chunk's rows it can finish while the
+ * CPU does the rest -- the measured rows a second of each (smoothed over chunk-layers), the experts with the most rows
+ * first; the first chunk-layers measure with every resident on the card. Placement only. */
+static double g_q38_pg_gpu_rate,g_q38_pg_cpu_rate;   /* rows a second, smoothed */
+static int q38_prefill_gpu_balance_on(void) {
+    static int v=-1;
+    if(v<0){const char *e=getenv("Q38_PREFILL_GPU_BALANCE");v=e&&e[0]=='1'&&!e[1];}
+    return v;
+}
+static double g_q38_pg_gpu_s,g_q38_pg_wait_s;
+static void q38_prefill_gpu_report(void) {
+    if(!g_q38_pg_chunks)return;
+    fprintf(stderr,"[qtier] qwen38: prompt experts on the card: %llu chunk-layers, %llu experts (%llu rows) on the card, "
+                   "%llu on the CPU, %llu fallen back to the CPU; card worker %.1f s, the CPU waited %.1f s for it; "
+                   "rows a second: card %.0f, CPU %.0f\n",
+            (unsigned long long)g_q38_pg_chunks,(unsigned long long)g_q38_pg_gpu_experts,(unsigned long long)g_q38_pg_gpu_rows,
+            (unsigned long long)g_q38_pg_cpu_experts,(unsigned long long)g_q38_pg_fallback,g_q38_pg_gpu_s,g_q38_pg_wait_s,
+            g_q38_pg_gpu_rate,g_q38_pg_cpu_rate);
+}
+
 /* Prefill MoE: route a bounded row chunk first, then execute each distinct
  * expert's assignments as one batched SwiGLU.  Grouping is an I/O optimization
  * only.  Expert outputs are placed back in assignment order and the final
@@ -5122,6 +5312,21 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
     int *vk_cpu=vk?(int*)malloc((size_t)E*sizeof(int)):NULL;
     int *vk_sub=vk?(int*)malloc((size_t)max_assign*sizeof(int)):NULL;
     if(vk&&(!vk_idx||!vk_taken||!vk_dev||!vk_cpu||!vk_sub)){fprintf(stderr,"OOM Qwen3.8 MoE prefill metadata\n");exit(1);}
+    /* Q38_PREFILL_GPU=1: the chunk's resident experts on the card (q38_prefill_gpu_run) */
+    const int pg=!vk&&q38_prefill_gpu_on()&&q38_prefill_gpu_exact()&&qt_ready()&&layer<c->layers;
+    int *pg_eids=NULL,*pg_counts=NULL,*pg_firsts=NULL,*pg_cpu=NULL,*pg_pos=NULL,*pg_devs=NULL,*pg_home=NULL; uint8_t *pg_done=NULL;
+    float *pg_gx=NULL,*pg_gy=NULL;
+    if(pg){
+        pg_eids=(int*)malloc((size_t)E*sizeof(int));pg_counts=(int*)malloc((size_t)E*sizeof(int));
+        pg_firsts=(int*)malloc((size_t)E*sizeof(int));pg_cpu=(int*)malloc((size_t)E*sizeof(int));
+        pg_pos=(int*)malloc((size_t)max_assign*sizeof(int));pg_done=(uint8_t*)malloc((size_t)E);
+        pg_devs=(int*)malloc((size_t)E*sizeof(int));pg_home=(int*)malloc((size_t)E*sizeof(int));
+        pg_gx=falloc(max_assign*H);pg_gy=falloc(max_assign*H);
+        if(!pg_eids||!pg_counts||!pg_firsts||!pg_cpu||!pg_pos||!pg_done||!pg_devs||!pg_home){fprintf(stderr,"OOM Qwen3.8 MoE prefill metadata\n");exit(1);}
+        static int noted;
+        if(!noted){noted=1;atexit(q38_prefill_gpu_report);
+            fprintf(stderr,"[qtier] qwen38: Q38_PREFILL_GPU=1: a prompt chunk's experts resident on the card run there beside the CPU's\n");}
+    }
 
     float *logits=falloc((int64_t)rows_capacity*E);
     float *shared_gate=falloc(rows_capacity);
@@ -5217,6 +5422,58 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
             }
             cpu_unique=vk_cpu;
         }
+        /* Q38_PREFILL_GPU=1: the experts resident on the card now go to the worker, the rest stay here */
+        pthread_t pg_thread; int pg_started=0,pg_n=0; Q38PrefillGpu pgw;
+        if(pg){
+            int nc=0,maxdev=-1;
+            for(int u=0;u<unique_count;u++)pg_home[u]=qt_resident_home(layer,unique[u]);
+            if(q38_prefill_gpu_balance_on()&&g_q38_pg_gpu_rate>0&&g_q38_pg_cpu_rate>0){
+                /* the card's share of the chunk's rows, its experts with the most rows first */
+                long total=0; for(int u=0;u<unique_count;u++)total+=group_counts[unique[u]];
+                const double want=(double)total*g_q38_pg_gpu_rate/(g_q38_pg_gpu_rate+g_q38_pg_cpu_rate);
+                for(int u=0;u<unique_count;u++)pg_pos[u]=u;
+                for(int i=1;i<unique_count;i++){   /* by rows, descending (insertion: at most a few hundred) */
+                    const int v=pg_pos[i]; int j=i-1;
+                    while(j>=0&&group_counts[unique[pg_pos[j]]]<group_counts[unique[v]]){pg_pos[j+1]=pg_pos[j];j--;}
+                    pg_pos[j+1]=v;
+                }
+                long taken=0;
+                for(int i=0;i<unique_count;i++){
+                    const int u=pg_pos[i];
+                    if(pg_home[u]<0)continue;
+                    if((double)taken>=want)pg_home[u]=-1;   /* past the card's share: the CPU's */
+                    else taken+=group_counts[unique[u]];
+                }
+            }
+            for(int u=0;u<unique_count;u++){
+                if(pg_home[u]<0)pg_cpu[nc++]=unique[u];
+                else if(pg_home[u]>maxdev)maxdev=pg_home[u];
+            }
+            for(int dv=0;dv<=maxdev;dv++)   /* the card's experts together: a group never spans two cards */
+                for(int u=0;u<unique_count;u++){
+                    if(pg_home[u]!=dv)continue;
+                    const int e=unique[u];
+                    pg_eids[pg_n]=e;pg_counts[pg_n]=group_counts[e];pg_firsts[pg_n]=group_offsets[e];pg_devs[pg_n]=dv;
+                    pg_done[pg_n]=0;pg_n++;
+                    q38_ehit_mark(m,layer,e);
+                }
+            if(pg_n){
+                pgw=(Q38PrefillGpu){layer,K,H,pg_n,pg_eids,pg_counts,pg_firsts,pg_devs,assignments,x+(int64_t)base*H,
+                                    routed_out,pg_gx,pg_gy,pg_done,0.0};
+                /* every online CPU for the worker: a thread inherits its creator's mask, and with OMP_PROC_BIND the
+                 * OpenMP master is bound to one core (the tier's uploader had the same, qt_aff_widen) */
+                pthread_attr_t pga; pthread_attr_init(&pga);
+#if defined(__linux__) && defined(CPU_SETSIZE)
+                { cpu_set_t all; CPU_ZERO(&all); long ncpu=sysconf(_SC_NPROCESSORS_ONLN);
+                  for(long i=0;i<ncpu&&i<CPU_SETSIZE;i++)CPU_SET((int)i,&all);
+                  pthread_attr_setaffinity_np(&pga,sizeof all,&all); }
+#endif
+                pg_started=!pthread_create(&pg_thread,&pga,q38_prefill_gpu_run,&pgw);
+                pthread_attr_destroy(&pga);
+            }
+            if(pg_started){cpu_unique=pg_cpu;cpu_count=nc;}
+            else pg_n=0;   /* no worker: every expert here, as without the switch */
+        }
 
         /* One advice range per distinct expert is enough for this chunk. */
         q38_prefetch_experts(m,layer,cpu_unique,cpu_count);
@@ -5254,6 +5511,11 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
          * slots because the preceding outputs already live in routed_out. */
         int load_limit=m->cache[layer].cap;
         if(load_limit<1)load_limit=1;
+        /* Q38_PREFILL_TIER_NOTE=1: the chunk's experts are reported to the CUDA tier as they are
+         * computed (no tick runs in a prompt pass, so the coldest resident is recomputed first) */
+        const int pt_note=!vk&&q38_prefill_tier_note_on()&&qt_ready()&&layer<m->c.layers;
+        if(pt_note)qt_cold_refresh();
+        const double pg_cpu_t0=now_s();
         for(int unique_base=0;unique_base<cpu_count;) {
             int load_count=cpu_count-unique_base;
             if(load_count>load_limit)load_count=load_limit;
@@ -5293,8 +5555,32 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
                 q38_weight_matmul(routed_out+(int64_t)first*H,expert_gate,
                                   &expert->down,count,I,H);
                 q38_tm_add(m,Q38_TM_ROUTED_EXPERT,phase_started);
+                if(pt_note)q38_tier_note_prefill(layer,e,expert);
             }
             unique_base+=load_count;
+        }
+
+        if(pg_started){
+            const double wait0=now_s();
+            const double pg_cpu_s=wait0-pg_cpu_t0;
+            pthread_join(pg_thread,NULL);
+            {   /* the rates the balance uses: rows a second of the card's worker and of this thread's experts */
+                long gr=0,cr=0;
+                for(int i=0;i<pg_n;i++)if(pg_done[i])gr+=pg_counts[i];
+                for(int u=0;u<cpu_count;u++)cr+=group_counts[cpu_unique[u]];
+                if(gr>0&&pgw.seconds>0){const double r=gr/pgw.seconds;g_q38_pg_gpu_rate=g_q38_pg_gpu_rate>0?0.8*g_q38_pg_gpu_rate+0.2*r:r;}
+                if(cr>0&&pg_cpu_s>0){const double r=cr/pg_cpu_s;g_q38_pg_cpu_rate=g_q38_pg_cpu_rate>0?0.8*g_q38_pg_cpu_rate+0.2*r:r;}
+            }
+            g_q38_pg_wait_s+=now_s()-wait0; g_q38_pg_gpu_s+=pgw.seconds; g_q38_pg_chunks++;
+            g_q38_pg_cpu_experts+=(uint64_t)cpu_count;
+            for(int i=0;i<pg_n;i++){
+                if(pg_done[i]){g_q38_pg_gpu_experts++;g_q38_pg_gpu_rows+=(uint64_t)pg_counts[i];continue;}
+                /* not computed on the card: here, row for row the grouped loop's arithmetic */
+                for(int a=0;a<pg_counts[i];a++)pg_pos[a]=pg_firsts[i]+a;
+                q38_prefill_expert_rows(m,q38_expert_get(m,layer,pg_eids[i]),x+(int64_t)base*H,K,assignments,pg_pos,
+                                        pg_counts[i],expert_input,expert_gate,expert_up,routed_out);
+                g_q38_pg_fallback++;
+            }
         }
 
         if(ndev&&!vkt_join(vk_dev)){
@@ -5332,6 +5618,8 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
     free(expert_up);free(routed_out);free(routes);free(assignments);
     free(assignment_positions);free(group_counts);free(group_offsets);
     free(group_cursor);free(unique);free(batch_slots);
+    free(pg_eids);free(pg_counts);free(pg_firsts);free(pg_cpu);free(pg_pos);free(pg_done);free(pg_gx);free(pg_gy);
+    free(pg_devs);free(pg_home);
     free(vk_idx);free(vk_taken);free(vk_dev);free(vk_cpu);free(vk_sub);
 }
 
@@ -5368,8 +5656,14 @@ static void q38_moe_ex(Model *m,Layer *l,int layer,const float *x,int S,float *o
         }
     }
     /* An MTP verify on the CUDA tier routes row by row as decode does, so
-     * the tier's resident experts serve it (the batched path is CPU only). */
-    if(S<=1||!m->prefill_batch||(g_q38_rowwise&&qt_ready()&&layer<m->c.layers))
+     * the tier's resident experts serve it (the batched path is CPU only).
+     * Q38_MUX_TIER=1: a decode step of several conversations (KV_SLOTS > 1,
+     * q38_forward_rows) does the same, where the batched path would run every
+     * routed expert of every row on the CPU and leave the tier idle. Each row
+     * takes the one-row path a lone request takes (the CPU kernels give a row
+     * the same bits whatever S), so a conversation's text is its own. */
+    if(S<=1||!m->prefill_batch||(g_q38_rowwise&&qt_ready()&&layer<m->c.layers)||
+       (m->mux_rows&&q38_mux_tier_on()&&qt_ready()&&layer<m->c.layers))
         q38_moe_decode_ex(m,l,layer,x,S,out,logits_in,routed_only);
     else q38_moe_prefill(m,l,layer,x,S,out,logits_in,routed_only);
 }
@@ -5420,6 +5714,46 @@ static void ensure_kv(Model *m) {
     m->mtp_len=0;m->mtp_pend_n=0;
 }
 
+/* Optional one-row layer-boundary trace for diagnosing numerical drift. This
+ * runs only in the host layer path and does not alter its computations. The
+ * per-layer row index follows calls to this function, including prefill rows;
+ * compare the recorded MoE input with Q38_ACT_DUMP before correlating runs. */
+static int q38_boundary_row(int layer,int S) {
+    static int initialized,enabled,lo,hi,target;
+    static int64_t seen[Q38_MAX_LAYERS+1];
+    if(!initialized){
+        initialized=1;
+        const char *dir=getenv("Q38_BOUNDARY_TRACE");
+        if(dir&&*dir){
+            const char *rr=getenv("Q38_BOUNDARY_ROW"),*ll=getenv("Q38_BOUNDARY_LAYERS");
+            char extra;
+            if(!rr||!ll||sscanf(rr,"%d%c",&target,&extra)!=1||
+               sscanf(ll,"%d-%d%c",&lo,&hi,&extra)!=2||target<0||
+               lo<0||hi<lo||hi>Q38_MAX_LAYERS||strlen(dir)>4000){
+                fprintf(stderr,"Q38_BOUNDARY_TRACE requires Q38_BOUNDARY_ROW>=0 and Q38_BOUNDARY_LAYERS=lo-hi\n");exit(1);
+            }
+            enabled=1;
+            fprintf(stderr,"[boundary] row %d layers %d-%d into %s (diagnostic)\n",target,lo,hi,dir);
+        }
+    }
+    if(!enabled||layer<lo||layer>hi||S<=0)return -1;
+    int64_t base=seen[layer];seen[layer]+=S;
+    return target>=base&&target<base+S?(int)(target-base):-1;
+}
+static void q38_boundary_save(int layer,int row,const char *stage,const float *data,int count) {
+    if(row<0)return;
+    char path[4200];const char *dir=getenv("Q38_BOUNDARY_TRACE");
+    int n=snprintf(path,sizeof path,"%s/layer-%03d-%s.bin",dir,layer,stage);
+    if(n<0||(size_t)n>=sizeof path||count<0){fprintf(stderr,"Q38_BOUNDARY_TRACE: invalid output\n");exit(1);}
+    FILE *f=fopen(path,"wx");
+    if(!f){perror("Q38_BOUNDARY_TRACE open");exit(1);}
+    int32_t dims[2]={layer,count};
+    if(fwrite("Q38TRC1\0",1,8,f)!=8||fwrite(dims,sizeof(int32_t),2,f)!=2||
+       fwrite(data,sizeof(float),(size_t)count,f)!=(size_t)count||fclose(f)){
+        perror("Q38_BOUNDARY_TRACE write");exit(1);
+    }
+}
+
 /* One decoder layer over the four hyper-connection streams: PLE where the
  * model has it, the token mixer, then the MoE, each read from the streams
  * and written back through its GatedResidual. step(), the Segment range and
@@ -5427,6 +5761,8 @@ static void ensure_kv(Model *m) {
 static void q38_layer_forward(Model *m,int i,float *hyper,const int *ids,int S,int pos_base,
                               float *mixed,float *inject,float *block) {
     Cfg *c=&m->c; Layer *l=&m->L[i]; int W=c->hc_width;
+    int tr=q38_boundary_row(i,S);
+    q38_boundary_save(i,tr,"hyper-before-ple",hyper+(int64_t)(tr<0?0:tr)*W,W);
     if(i==c->ple_layer){
         float *ple=falloc((int64_t)S*W); q38_ple(m,ids,S,hyper,ple);
         for(int64_t z=0;z<(int64_t)S*W;z++) hyper[z]+=ple[z];
@@ -5436,13 +5772,42 @@ static void q38_layer_forward(Model *m,int i,float *hyper,const int *ids,int S,i
          * silenzio invece di dare errore. */
         free(m->ple_pref); m->ple_pref=NULL; m->ple_pref_rows=0;
     }
+    q38_boundary_save(i,tr,"hyper-before-attn",hyper+(int64_t)(tr<0?0:tr)*W,W);
     q38_gr_read(m,&l->attn_gr,hyper,S,mixed,inject);
+    q38_boundary_save(i,tr,"attn-input",mixed+(int64_t)(tr<0?0:tr)*c->hidden,c->hidden);
+    q38_boundary_save(i,tr,"attn-inject",inject+(int64_t)(tr<0?0:tr)*c->hc_count,c->hc_count);
     if(i>=c->layers||c->is_attn[i]) q38_attention(m,l,i,mixed,S,pos_base,block);
-    else q38_deltanet(m,l,i,mixed,S,block);
+    else {
+        const char *ds=tr>=0?getenv("Q38_BOUNDARY_STATE"):NULL;
+        int state=ds&&!strcmp(ds,"1");
+        uint64_t nr=(uint64_t)c->dn_vheads*c->dn_kdim*c->dn_vdim;
+        uint64_t nc=(uint64_t)c->dn_conv_dim*(c->dn_convk-1);
+        if(state&&(S!=1||m->dn_dev||m->mux_rows||!m->DN_rec||!m->DN_conv||
+                   !m->DN_rec[i]||!m->DN_conv[i]||nr>2147483647u||nc>2147483647u)){
+            fprintf(stderr,"[boundary] DeltaNet state skipped at layer %d: requires one host-owned row\n",i);state=0;
+        }
+        if(state){
+            q38_boundary_save(i,tr,"dn-rec-before",m->DN_rec[i],(int)nr);
+            q38_boundary_save(i,tr,"dn-ring-before",m->DN_conv[i],(int)nc);
+            g_q38_boundary_dn=i;
+        }
+        q38_deltanet(m,l,i,mixed,S,block);
+        if(state){
+            g_q38_boundary_dn=-1;
+            q38_boundary_save(i,tr,"dn-rec-after",m->DN_rec[i],(int)nr);
+            q38_boundary_save(i,tr,"dn-ring-after",m->DN_conv[i],(int)nc);
+        }
+    }
+    q38_boundary_save(i,tr,"attn-output",block+(int64_t)(tr<0?0:tr)*c->hidden,c->hidden);
     q38_gr_apply(c,hyper,block,inject,S);
+    q38_boundary_save(i,tr,"hyper-after-attn",hyper+(int64_t)(tr<0?0:tr)*W,W);
     q38_gr_read(m,&l->mlp_gr,hyper,S,mixed,inject);
+    q38_boundary_save(i,tr,"moe-input",mixed+(int64_t)(tr<0?0:tr)*c->hidden,c->hidden);
+    q38_boundary_save(i,tr,"moe-inject",inject+(int64_t)(tr<0?0:tr)*c->hc_count,c->hc_count);
     q38_moe(m,l,i,mixed,S,block);
+    q38_boundary_save(i,tr,"moe-output",block+(int64_t)(tr<0?0:tr)*c->hidden,c->hidden);
     q38_gr_apply(c,hyper,block,inject,S);
+    q38_boundary_save(i,tr,"hyper-after-moe",hyper+(int64_t)(tr<0?0:tr)*W,W);
 }
 
 /* Run only the requested native layer interval over hyper-residual activations.

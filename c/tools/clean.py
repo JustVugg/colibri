@@ -83,7 +83,13 @@ ARTIFACT_GLOBS = ["tests/test_*", "tests/bench_*", "tests/fuzz_*",
                   "tests/*_probe*", "tests/xdna_fake_helper*", "COLI_V4_UNIT_*.o",
                   "*.d", "tests/*.d", "tools/*.d",
                   # helper objects the tests link (#1741), one unit per command
-                  "tests/*.o"]
+                  "tests/*.o",
+                  # SYCL=1: the fat objects and the device-link object in sycl/, the
+                  # host-only profile test and the dispatch test (sycl/README.md)
+                  "sycl/*.o", "sycl/*.d", "sycl/tests/test_*", "cuda_chain_test*",
+                  # the Qwen3.8 FP8 stage exporters (tests/export_qwen38_fp8_*), built on demand like the
+                  # probe: one outliving its .d would be a built target whose headers are untracked
+                  "tests/export_*"]
 KEEP_EXT = (".c", ".h", ".cc", ".cpp", ".cu", ".mm", ".py", ".txt", ".json",
             ".md", ".bin", ".sh", ".toml", ".yml", ".yaml")
 # Directories to remove. build/segment/ holds only build output (the

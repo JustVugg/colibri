@@ -133,6 +133,7 @@ typedef struct {
     unsigned long long dm_steps, dm_hyb, dm_pairs;   /* layer steps in the frame, the hybrid ones, slots the host computed */
     double dm_host_ms, dm_spin_ms;
     unsigned long long forwards, frames, fault_at, dec_n;   /* dec_n: one-row forwards (decode tokens) */
+    CcStats stats_base;   /* exclude an earlier resident placement probe */
     double wait_ms, host_ms, dec_wait_ms, dec_host_ms;      /* and their shares of the waits and the host's experts */
     /* KV_SLOTS > 1: the conversations' states, and a multiplexed step's rows while it runs */
     Q36ccConv *conv; int nconv, conv_cur, conv_full;
@@ -374,6 +375,7 @@ static Q36CChain *q36cc_setup(Model *m, int mux_slots) {
     }
     Q36CChain *ch = (Q36CChain *)calloc(1, sizeof *ch);
     if (!ch) return NULL;
+    cc_stats(&ch->stats_base);
     m->cchain = ch;
     ch->dev = -1;
     ch->o_in = calloc(L, sizeof(size_t)); ch->o_post = calloc(L, sizeof(size_t)); ch->o_qn = calloc(L, sizeof(size_t));
@@ -1203,6 +1205,8 @@ static int q36cc_deltanet(Q36CChain *ch, Model *m, Layer *l, int i, int n, int c
     }
     return ok && cc_matmul(ch->t_dno[i], ch->dny, 0, ch->tmp, 0, n);
 }
+static int q36cc_mux_batch(void);
+static int q36cc_mux_batch_min(void);
 /* A multiplexed step's rows (ch->mx_rows from c0): q36c_attention_mx's twin */
 static int q36cc_attention_mx(Q36CChain *ch, Model *m, Layer *l, int i, int n, int c0) {
     Cfg *c = &m->c;
@@ -1214,6 +1218,47 @@ static int q36cc_attention_mx(Q36CChain *ch, Model *m, Layer *l, int i, int n, i
     CcRegion *rg = malloc(sizeof *rg * (size_t)KV);
     int ok = rg && cc_copy(ch->kvd, ko, ch->k, 0, (size_t)n * kvo) &&
              cc_copy(ch->kvd, ko + (size_t)ch->rows * kvo, ch->v, 0, (size_t)n * kvo);
+    /* COLI_CUDA_MUX_BATCH's 8 and 4 (q36cc_mux_batch): on a full layer (no window, no sinks, no ring) over
+     * float16 mirrors, the conversations' K and V rows into their mirrors as one launch a cache
+     * (cc_copy_regions_h_mx) and their attention as one call (cc_attn_h_mx; CC_MX_ATTN_N rows a call).
+     * Every row into its mirrors, then every attention: a conversation's attention reads its own mirrors
+     * and its own rows only. What the backend does not take (-1) keeps a launch a conversation. */
+    const int mb = n >= q36cc_mux_batch_min() && n <= CC_MX_N && !win && !l->sinks && !R && q36cc_kvh() ? q36cc_mux_batch() & 12 : 0;
+    if (mb && ok) {
+        CcBuf *kc[CC_MX_N], *vc[CC_MX_N]; int pos[CC_MX_N], cap[CC_MX_N];
+        CcRegion *rm = malloc(sizeof *rm * (size_t)n * KV);
+        ok = rm != NULL;
+        for (int s = 0; s < n && ok; s++) {
+            Q36ccConv *v = ch->mx_conv[c0 + s];
+            kc[s] = v->kc[i]; vc[s] = v->vc[i]; pos[s] = ch->mx_rows[c0 + s].pos; cap[s] = v->kv_rows[i];
+            for (int h = 0; h < KV; h++)
+                rm[s * KV + h] = (CcRegion){((size_t)h * cap[s] + pos[s]) * kvd, (size_t)s * kvo + (size_t)h * kvd, (size_t)kvd};
+        }
+        int rk = -1, rv = -1;
+        if (ok && (mb & 8)) {
+            rk = cc_copy_regions_h_mx(kc, n, ch->k, rm, KV);
+            if (rk) rv = cc_copy_regions_h_mx(vc, n, ch->v, rm, KV);
+            ok = rk != 0 && rv != 0;
+        }
+        for (int s = 0; s < n && ok; s++)
+            ok = (rk > 0 || q36cc_kv_put(kc[s], ch->k, rm + s * KV, KV)) && (rv > 0 || q36cc_kv_put(vc[s], ch->v, rm + s * KV, KV));
+        for (int s0 = 0; s0 < n && ok; s0 += CC_MX_ATTN_N) {
+            int nc = n - s0 < CC_MX_ATTN_N ? n - s0 : CC_MX_ATTN_N, ra = -1;
+            if (mb & 4) {
+                CcAttn a = {1, H, KV, hd, 0, 0, s0 * qo, qo, qdim, s0 * qo + hd, qo, qdim, gate_dim > 0, s0 * H * hd, H * hd, 0, 0,
+                            1.f / sqrtf((float)hd), 0, 0};
+                ra = cc_attn_h_mx(ch->q, kc + s0, vc + s0, pos + s0, cap + s0, nc, ch->ctx, ch->q, &a);
+                ok = ra != 0;
+            }
+            for (int s = s0; s < s0 + nc && ok && ra < 0; s++) {
+                CcAttn a = {1, H, KV, hd, pos[s], cap[s], s * qo, qo, qdim, s * qo + hd, qo, qdim, gate_dim > 0, s * H * hd, H * hd, 0, 0,
+                            1.f / sqrtf((float)hd), 0, 0};
+                ok = q36cc_attn_c(ch->q, kc[s], vc[s], ch->ctx, ch->q, &a);
+            }
+        }
+        free(rm); free(rg);
+        return ok && q36cc_attn_out(ch, m, i, n);
+    }
     for (int s = 0; s < n && ok; s++) {
         Q36ccConv *v = ch->mx_conv[c0 + s];
         int pos = ch->mx_rows[c0 + s].pos, rows = v->kv_rows[i];
@@ -1230,6 +1275,29 @@ static int q36cc_attention_mx(Q36CChain *ch, Model *m, Layer *l, int i, int n, i
     free(rg);
     return ok && q36cc_attn_out(ch, m, i, n);
 }
+/* COLI_CUDA_MUX_BATCH (a mask, the code's default 0: a launch a conversation, as before; unset, the
+ * platform's measured default -- 15 on a Data Center GPU Max, coli_cuda_tuned_default): a step of several
+ * conversations gives the backend their DeltaNet convolutions (1) and recurrences (2) as one launch a
+ * layer, a full layer's attention over float16 mirrors as one call (4) and the step's K and V rows into
+ * those mirrors as one launch a cache (8), where it takes them (cc_dnconv_mx, cc_dnrec_mx, cc_attn_h_mx,
+ * cc_copy_regions_h_mx: the same arithmetic a conversation). */
+static int q36cc_mux_batch(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("COLI_CUDA_MUX_BATCH");
+        v = e && *e ? atoi(e) : coli_cuda_tuned_default("COLI_CUDA_MUX_BATCH", 0);
+        if (v < 0) v = 0;
+    }
+    return v;
+}
+/* COLI_CUDA_MUX_BATCH_MIN (3): the conversations from which a step is given as one launch. The launch of
+ * all has a higher fixed cost than a conversation's own: on a Max 1100 two conversations lost 1.6 % of the
+ * card's rate to it where four gained 7.4 % and eight 11.8 % (g5-evidence/h10-mux-batch). */
+static int q36cc_mux_batch_min(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("COLI_CUDA_MUX_BATCH_MIN"); v = e && *e ? atoi(e) : 3; if (v < 2) v = 2; }
+    return v;
+}
 static int q36cc_deltanet_mx(Q36CChain *ch, Model *m, Layer *l, int i, int n, int c0) {
     Cfg *c = &m->c; (void)l;
     int vh = c->dn_vheads, CD = c->dn_conv_dim, vd = vh * c->dn_vdim, PD = CD + vd;
@@ -1238,6 +1306,37 @@ static int q36cc_deltanet_mx(Q36CChain *ch, Model *m, Layer *l, int i, int n, in
     int ok = cc_matmul(ch->t_dnp[i], ch->nrm, 0, ch->qkvz, 0, n) &&
              (!two || cc_matmul(ch->t_dnz[i], ch->nrm, 0, ch->qkvz, z0, n)) &&
              cc_matmul(ch->t_ab[i], ch->nrm, 0, ch->ab, 0, n);
+    const int mb = n >= q36cc_mux_batch_min() && n <= CC_MX_N ? q36cc_mux_batch() & 3 : 0;
+    if (mb && ok) {   /* every conversation's convolution, then every recurrence: the rows are independent */
+        CcBuf *ring[CC_MX_N], *rec[CC_MX_N];
+        for (int s = 0; s < n; s++) { ring[s] = ch->mx_conv[c0 + s]->ring[i]; rec[s] = ch->mx_conv[c0 + s]->rec[i]; }
+        int cb = 0, rb = 0;
+        if (mb & 1) {
+            CcDnConv cp = {1, CD, c->dn_convk, 0, PD, 0, CD, -1, 0, (int)ch->o_conv[i], 0, 0};
+            int r = cc_dnconv_mx(ch->qkvz, ch->prm, ring, n, ch->cv, &cp);
+            ok = r != 0; cb = r > 0;
+        }
+        for (int s = 0; s < n && ok && !cb; s++) {
+            CcDnConv cp = {1, CD, c->dn_convk, s * PD, PD, s * CD, CD, -1, 0, (int)ch->o_conv[i], 0, 0};
+            ok = cc_dnconv(ch->qkvz, ch->prm, ring[s], ch->cv, NULL, &cp);
+        }
+        if (ok && (mb & 2)) {
+            CcDnRec rp = {1, vh, c->dn_kheads, c->dn_vdim, c->dn_kheads * c->dn_kdim, 0, CD, 0, 2 * vh,
+                          vh, 2 * vh, CD, PD, 0, vd, -1,
+                          (g_ssm_a_direct ? 2 : 0) | (g_dn_tiled ? 4 : 0), c->eps,
+                          1.f / sqrtf((float)c->dn_kdim), 0, 0, (int)ch->o_dn[i]};
+            int r = cc_dnrec_mx(c->dn_kdim, ch->cv, ch->ab, ch->qkvz, rec, n, ch->prm, ch->dny, &rp);
+            ok = r != 0; rb = r > 0;
+        }
+        for (int s = 0; s < n && ok && !rb; s++) {
+            CcDnRec rp = {1, vh, c->dn_kheads, c->dn_vdim, c->dn_kheads * c->dn_kdim, s * CD, CD, s * 2 * vh, 2 * vh,
+                          vh + s * 2 * vh, 2 * vh, CD + s * PD, PD, s * vd, vd, -1,
+                          (g_ssm_a_direct ? 2 : 0) | (g_dn_tiled ? 4 : 0), c->eps,
+                          1.f / sqrtf((float)c->dn_kdim), 0, 0, (int)ch->o_dn[i]};
+            ok = cc_dnrec(c->dn_kdim, ch->cv, ch->ab, ch->qkvz, rec[s], ch->prm, ch->dny, NULL, &rp);
+        }
+        return ok && cc_matmul(ch->t_dno[i], ch->dny, 0, ch->tmp, 0, n);
+    }
     for (int s = 0; s < n && ok; s++) {
         Q36ccConv *v = ch->mx_conv[c0 + s];
         /* a verify's row: the state after it copied to its snapshot slot (q36cc_mux_rollback) */
@@ -1534,8 +1633,9 @@ static void q36cc_promote(Q36CChain *ch, Model *m, int rows) {
     }
     unsigned tk = 0;
     if (nu && cc_host_up_many(ud, us, ub, nu, &tk)) for (int p = p0; p < ch->pr_npend; p++) ch->pr_pend[p].tk = tk;
-    else if (nu) {   /* refused: the victims' buffers hold neither now */
-        for (int p = p0; p < ch->pr_npend; p++) { qt_chain_promote_done(ch->pr_pend[p].ci, ch->pr_pend[p].vi, 0); ch->pr_busy[ch->pr_pend[p].slot] = 0; ch->dm_promoted--; }
+    else if (nu) {   /* refused, maybe after some copies went (cc_host_up_many): the victims' buffers hold neither now,
+                      * and a late copy may still land in them, so the tier leaves their slots out of use (-1) */
+        for (int p = p0; p < ch->pr_npend; p++) { qt_chain_promote_done(ch->pr_pend[p].ci, ch->pr_pend[p].vi, -1); ch->pr_busy[ch->pr_pend[p].slot] = 0; ch->dm_promoted--; }
         ch->pr_npend = p0;
     }
     ch->promo_ms += tm_now() - t0;
@@ -2342,6 +2442,9 @@ static void q36cc_report(Model *m) {
     Q36CChain *ch = q36cc_of(m);
     if (!ch || !ch->ok || !ch->forwards) return;
     CcStats st; cc_stats(&st);
+    st.frames -= ch->stats_base.frames;
+    st.ops -= ch->stats_base.ops;
+    st.matmuls -= ch->stats_base.matmuls;
     fprintf(stderr, "[chain] qwen36: %llu forwards, %llu frames (%llu ops, %llu matmuls), %.1f ms waiting for the device, "
                     "%.1f ms of routed experts on the host, %.1f MiB on the device; per decode token %.2f ms waiting, %.2f ms of experts (%llu tokens)\n",
             ch->forwards, st.frames, st.ops, st.matmuls, ch->wait_ms, ch->host_ms, st.dev_bytes / 1048576.0,
