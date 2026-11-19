@@ -16,7 +16,7 @@
  * the exact kernels; QWEN38_METAL_EXPERTS=0 the routed experts on the CPU (M2);
  * QWEN38_EXPERT_CACHE_BYTES the GPU expert cache. Debug only (read once, no effect unset):
  * Q38M_CHECK_WEIGHTS, Q38M_LAYER_CHECK (1, 2), Q38M_FORCE_ROUTES, Q38M_DECLINE_EVERY,
- * Q38M_FAIL_SLOT_ALLOC. */
+ * Q38M_FAIL_SLOT_ALLOC, Q38M_REFUSE_AT. */
 #ifndef QWEN38_METAL_CHAIN_H
 #define QWEN38_METAL_CHAIN_H
 #include "qwen36_gpu.h"
@@ -407,6 +407,8 @@ static struct {
     long decline_every;   /* Q38M_DECLINE_EVERY (debug): every k-th step offered is declined */
     int layer_check;      /* Q38M_LAYER_CHECK (debug): the first step against q38_layer_forward;
                            * 2: also the CPU against itself from inputs one ulp away */
+    long refuse_at;       /* Q38M_REFUSE_AT (debug): the k-th step offered has its device memory
+                           * refused, so the chain turns off mid-run (the off path's test) */
     int force_routes;     /* Q38M_FORCE_ROUTES (debug, with the layer check): 1 the reference run's
                            * routes, 2 also its QSA selections past the budget */
 } g_q38f;
@@ -740,6 +742,8 @@ static int q38m_setup(Model *m, char *why, size_t nwhy) {
     if (!ok) { q38m_free_forward(c); snprintf(why, nwhy, "the layers' norms and state did not reach the GPU"); return 0; }
     const char *d = getenv("Q38M_DECLINE_EVERY"), *lc = getenv("Q38M_LAYER_CHECK");
     g_q38f.decline_every = d && *d ? atol(d) : 0;
+    const char *ra = getenv("Q38M_REFUSE_AT");
+    g_q38f.refuse_at = ra && *ra ? atol(ra) : 0;
     g_q38f.layer_check = lc && (!strcmp(lc, "1") || !strcmp(lc, "2")) ? atoi(lc) : 0;
     const char *fr = getenv("Q38M_FORCE_ROUTES");
     g_q38f.force_routes = fr && (!strcmp(fr, "1") || !strcmp(fr, "2")) ? atoi(fr) : 0;
@@ -1160,12 +1164,15 @@ static int q38m_forward(Model *m, const int *ids, int S, int pos_base, int nlogi
     /* every buffer the step needs, before anything is encoded or the host's state moves: a
      * refusal here leaves the state as the step found it, and the CPU takes over (q38_forward
      * then runs q38m_cpu_step, which brings the GPU's state down) */
-    if (!q38m_scratch(c, S < Q38M_CHUNK ? S : Q38M_CHUNK) || !q38m_kv_reserve(m, pos_base + S) ||
+    if ((g_q38f.refuse_at > 0 && offered == (unsigned long long)g_q38f.refuse_at) ||
+        !q38m_scratch(c, S < Q38M_CHUNK ? S : Q38M_CHUNK) || !q38m_kv_reserve(m, pos_base + S) ||
         !q38m_grow(&g_q38f.logits, &g_q38f.logit_floats, (size_t)nlogits * V) ||
         !q38x_scratch(S < Q38M_CHUNK ? S : Q38M_CHUNK)) {
         char why[128];
         snprintf(why, sizeof why, "device memory for a step of %d rows at position %d was refused", S, pos_base);
         q38m_off(why);
+        q36_gpu_sync();
+        q38x_chain_off();
         g_mtl_chain = 0;
         g_q38m_declined++;
         return 0;
@@ -1310,6 +1317,7 @@ fail:
     g_q38f.where = Q38M_HOST; g_q38f.host_zero = 0;
     for (int i = 0; i < L; i++)
         if (c->is_attn[i]) { if (g_q38f.L[i].kv_valid > pos_base) g_q38f.L[i].kv_valid = pos_base; }
+    q38x_chain_off();
     g_mtl_chain = 0;
     g_q38m_declined++;
     return 0;

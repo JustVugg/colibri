@@ -28,7 +28,11 @@
 #   hits: H` with N, L > 0 and a layer with more experts than one group of top-k; a cache of two
 #   payloads (QWEN38_EXPERT_CACHE_BYTES, one group: every group evicts the last) within 120 s;
 #   Q38M_FAIL_SLOT_ALLOC=1 (debug) and QWEN38_METAL_EXPERTS=0 one off line each and the CPU's
-#   experts; a 1,300-token prompt on the GGUF (chunks of 256 rows), exact and fast.
+#   experts; Q38M_REFUSE_AT=3 (debug) turns the chain off mid-run: the GPU cache released, the
+#   CPU's expert cache back to its size; the usage history and route trace the CPU's; the
+#   release's expert shape on a variant (16 experts, top-k 10, IQ4_XS/IQ4_NL: sub-groups of 8 and
+#   2), exact, fast and the layer check; a 1,300-token prompt on the GGUF (chunks of 256 rows),
+#   exact and fast.
 # metal_state_handoff: Q38M_DECLINE_EVERY=2 (debug) declines every second step, so the CPU
 #   and the chain hand the state back and forth (q38m_cpu_step, the KV watermarks): the
 #   CPU's tokens and final logits (within 1e-4 x max), also on qwen38_decay (the tiny fixture
@@ -159,7 +163,7 @@ done
 # another code fails
 eng() {
     nm=$1; dir=$2; ref=$3; shift 3
-    env "$@" OMP_NUM_THREADS=2 SNAP=$dir ./qwen38 1 8 "$ref" > "$tmp/$nm.log" 2>&1
+    env "$@" OMP_NUM_THREADS=2 SNAP=$dir ./qwen38 "${ENG_CAP:-1}" 8 "$ref" > "$tmp/$nm.log" 2>&1
     rc=$?
     if [ $rc -ne 0 ] && [ $rc -ne 1 ]; then echo "FAIL [$nm $*] exit $rc"; tail -5 "$tmp/$nm.log"; fail=1; return 1; fi
     return 0
@@ -272,6 +276,74 @@ nm=m3_off
 if eng $nm ./$fx ./$fx/ref.json QWEN38_METAL_EXPERTS=0 && chain_on $nm; then
     if [ "$(grep -cF "${GX}QWEN38_METAL_EXPERTS=0; the routed experts run on the CPU" "$tmp/$nm.log")" -ne 1 ]; then echo "FAIL [$nm] expected one off line"; grep -F 'GPU experts' "$tmp/$nm.log"; fail=1
     else echo "ok   [$nm] QWEN38_METAL_EXPERTS=0 keeps the routed experts on the CPU, one line"; fi
+fi
+# off mid-run (Q38M_REFUSE_AT=3, debug: the third step's device memory refused): the chain's
+# off line, the GPU experts release their cache and the CPU's expert cache gets its slots back
+# (4 a layer here), whose hits the CPU's steps then use; the CPU's tokens and logits
+nm=m3_refused
+if ENG_CAP=4 eng $nm ./$fx ./$fx/ref.json Q38M_REFUSE_AT=3 QWEN38_METAL_EXACT=1 $REFP DUMP=$tmp/$nm.bin; then
+    hits=$(sed -n 's/^Expert cache hit rate: .*(hit=\([0-9]*\) miss=.*/\1/p' "$tmp/$nm.log" | tail -1)
+    if [ "$(grep -cF "${PREFIX}device memory for a step of 1 rows at position 6 was refused$SUFFIX" "$tmp/$nm.log")" -ne 1 ]; then
+        echo "FAIL [$nm] no off line for the refused step"; grep -F '[qwen38-metal]' "$tmp/$nm.log"; fail=1
+    elif ! grep -qF "[qwen38-metal] GPU experts released (the chain is off): the CPU's expert cache is back to 4 slots a layer" "$tmp/$nm.log"; then
+        echo "FAIL [$nm] the GPU experts not released, or the CPU's cache not back to 4"; grep -F 'GPU experts' "$tmp/$nm.log"; fail=1
+    elif [ -z "$hits" ] || [ "$hits" -eq 0 ]; then echo "FAIL [$nm] the CPU's expert cache has no hit ('${hits:-no line}')"; fail=1
+    elif [ "$(toks $nm)" != "$want" ]; then echo "FAIL [$nm] tokens '$(toks $nm)' vs the CPU's '$want'"; fail=1
+    elif logits_ok cpu_$fx $nm; then echo "ok   [$nm] off at step 3: GPU cache released, the CPU's cache back to 4 slots ($hits hits), the CPU's tokens and logits ($(relerr "$tmp/cpu_$fx.bin" "$tmp/$nm.bin"))"; fi
+fi
+# usage accounting: the GPU-routed steps count in the usage history and the route trace as the
+# CPU's do (rt_route): fresh model dirs, USAGE_SAVE=1, ROUTE_TRACE; the same history file and the
+# same routes (row, layer, experts and gates; the call numbers aside)
+for u in cpu m3; do
+    mkdir -p "$tmp/use_$u"
+    for f in qwen38_tiny_256_gguf/*; do ln -s "$PWD/$f" "$tmp/use_$u/"; done
+    rm -f "$tmp/use_$u/.coli_usage"
+done
+eng use_cpu "$tmp/use_cpu" ./$fx/ref.json COLI_METAL=0 $REFP USAGE_SAVE=1 ROUTE_TRACE=$tmp/use_cpu.tr
+eng use_m3 "$tmp/use_m3" ./$fx/ref.json QWEN38_METAL_EXACT=1 $REFP USAGE_SAVE=1 ROUTE_TRACE=$tmp/use_m3.tr
+if chain_on use_m3 && gx_on use_m3; then
+    a=$(sed -n 's/^\[STATS\] \([0-9]* selections across [0-9]* distinct experts\).*/\1/p' "$tmp/use_cpu.log")
+    b=$(sed -n 's/^\[STATS\] \([0-9]* selections across [0-9]* distinct experts\).*/\1/p' "$tmp/use_m3.log")
+    for u in cpu m3; do awk '{$1 = ""; print}' "$tmp/use_$u.tr" | sort > "$tmp/use_$u.routes"; done
+    if [ -z "$a" ] || [ "$a" != "$b" ]; then echo "FAIL [m3 usage] the chain's '$b' vs the CPU's '$a'"; fail=1
+    elif ! cmp -s "$tmp/use_cpu/.coli_usage" "$tmp/use_m3/.coli_usage"; then echo "FAIL [m3 usage] the usage files differ"; fail=1
+    elif [ ! -s "$tmp/use_m3.routes" ] || ! cmp -s "$tmp/use_cpu.routes" "$tmp/use_m3.routes"; then
+        echo "FAIL [m3 usage] route traces differ ($(wc -l < "$tmp/use_cpu.tr") vs $(wc -l < "$tmp/use_m3.tr") lines)"; fail=1
+    else echo "ok   [m3 usage] $b, the same usage file and the same $(wc -l < "$tmp/use_m3.tr" | tr -d ' ') route-trace lines as the CPU"; fi
+fi
+# the release's expert shape (Task 8 review): a variant of the tiny GGUF with 16 experts, top-k 10
+# (one group of 10 = kernel sub-groups of 8 and 2; the prompt's rows touch more than one group) and
+# IQ4_XS gate/up, IQ4_NL down experts, its ref.json the CPU's on it; exact mode the CPU's tokens
+# and logits (1e-4), fast mode its tokens, and the layer check: every layer within 1e-4 and the
+# GPU's routes the CPU's rule
+iq=$tmp/qwen38_tiny_256_gguf_iq4
+mkdir -p "$iq"
+if "${PYTHON:-python3}" tools/make_qwen38_tiny_gguf.py --experts 16 --topk 10 --iq4 ./qwen38_tiny_256 "$iq/model.gguf" >/dev/null 2>&1 &&
+   "${PYTHON:-python3}" tools/gguf_import.py "$iq/model.gguf" "$iq" --mode link >/dev/null 2>&1 &&
+   cp qwen38_tiny_256/ref.json "$iq/ref.json" &&
+   "${PYTHON:-python3}" tools/make_qwen38_tiny_gguf.py --rebase-ref ./qwen38 "$iq" >/dev/null 2>&1; then
+    eng iq4_cpu "$iq" "$iq/ref.json" COLI_METAL=0 $REFP DUMP=$tmp/iq4_cpu.bin
+    if ! grep -qF 'routed experts: GGUF IQ4_XS/IQ4_XS/IQ4_NL' "$tmp/iq4_cpu.log"; then echo "FAIL [iq4 fixture] not IQ4 experts"; fail=1; fi
+    for exact in 1 0; do
+        nm=iq4_m3_exact$exact
+        eng $nm "$iq" "$iq/ref.json" QWEN38_METAL_EXACT=$exact $REFP DUMP=$tmp/$nm.bin && chain_on $nm && gx_on $nm || continue
+        most=$(gx_most $nm)
+        if [ -z "$(toks iq4_cpu)" ] || [ "$(toks $nm)" != "$(toks iq4_cpu)" ]; then echo "FAIL [$nm] '$(toks $nm)' vs the CPU's '$(toks iq4_cpu)'"; fail=1; continue; fi
+        if ! grep -qE '^\[qwen38-metal\] GPU experts: .*groups of 10' "$tmp/$nm.log" || [ -z "$most" ] || [ "$most" -le 10 ]; then
+            echo "FAIL [$nm] not groups of 10 or no layer past one group ('${most:-none}')"; fail=1; continue; fi
+        if [ $exact = 1 ]; then logits_ok iq4_cpu $nm || continue; fi
+        echo "ok   [$nm 16 experts, top-k 10, IQ4] the CPU's tokens, logits within $(relerr "$tmp/iq4_cpu.bin" "$tmp/$nm.bin") x max; experts on GPU, loads, hits: $(gx_n $nm); most in one layer $most"
+    done
+    nm=iq4_layers
+    if eng $nm "$iq" "$iq/ref.json" Q38M_LAYER_CHECK=1 QWEN38_METAL_EXACT=1 $REFP; then
+        n=$(grep -c '^\[q38m-layer\] L.*worst=' "$tmp/$nm.log")
+        g=$(grep -c '^\[q38m-layer\] L[0-9]* GPU routes: 0 rows unlike' "$tmp/$nm.log")
+        if [ "$n" -lt 4 ] || [ "$g" -lt 4 ] || grep '^\[q38m-layer\]' "$tmp/$nm.log" | grep -qF FAIL; then
+            echo "FAIL [$nm] $n layer lines, $g clean GPU-route lines"; grep '^\[q38m-layer\]' "$tmp/$nm.log"; fail=1
+        else echo "ok   [$nm] 4 layers, worst $(grep '^\[q38m-layer\] L.*worst=' "$tmp/$nm.log" | sed 's/.*worst=\([^ ]*\).*/\1/' | sort -g | tail -1), the GPU's routes the CPU's rule"; fi
+    fi
+else
+    echo "FAIL [iq4 fixture] generation"; fail=1
 fi
 # a long prompt on the GGUF (1,300 tokens: chunks of 256 rows, every expert of a layer in a chunk,
 # groups of top-k through the cache), exact and fast: the CPU's tokens; exact, its logits

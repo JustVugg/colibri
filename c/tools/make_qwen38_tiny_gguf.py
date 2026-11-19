@@ -18,7 +18,8 @@ the engine undoes (see "GGUF mode" there) are applied here:
   * the indexer's fused q|k projection is two tensors, the experts one 3D tensor
     per projection, the PLE shards one table (its hash constants metadata).
 
-Usage: make_qwen38_tiny_gguf.py SRC_DIR OUT.gguf   (SRC_DIR: model.safetensors + config.json)
+Usage: make_qwen38_tiny_gguf.py [--experts N --topk K --iq4] SRC_DIR OUT.gguf
+       (SRC_DIR: model.safetensors + config.json)
        make_qwen38_tiny_gguf.py --rebase-ref ENGINE GGUF_DIR   (ref.json from the CPU engine)
 
 The second form rewrites GGUF_DIR/ref.json (a copy of the source's) with what the CPU
@@ -26,6 +27,13 @@ engine produces on the GGUF: Q8_0 rounding and the engine's float routing can mo
 late tokens and the last logits off the PyTorch reference's, and the Metal gates compare
 the GPU to the CPU engine, so the CPU's tokens and logits on this very file are the
 fixture's reference. The source fixture's ref.json is not touched.
+
+The production-shape variant (the Metal chain's GPU experts at the release's shapes):
+--experts N widens the routed experts to N (the source's experts and router rows, then
+copies of them under a fixed random scaling, so every expert differs), --topk K routes K
+of them, and --iq4 writes the experts as the release does: gate and up IQ4_XS, down IQ4_NL
+(a plain nearest-value quantizer below; the gguf package only decodes these types). The
+CPU engine's run on the file is its reference either way (--rebase-ref).
 """
 import json
 import sys
@@ -42,6 +50,49 @@ except ImportError as exc:
     sys.exit(f"Missing dependency: {exc}. Needs gguf, torch and safetensors (local-llm/.venv-fixtures).")
 
 Q8, BF16, F32 = QT.Q8_0, QT.BF16, QT.F32
+
+# IQ4_NL / IQ4_XS blocks (ggml's layouts): a nearest-value quantizer on the IQ4 grid, valid
+# blocks whose decode both engines share (checked against gguf.quants.dequantize)
+IQ4_GRID = np.array([-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113], dtype=np.float32)
+
+
+def _iq4_nearest(v):
+    return np.abs(v[..., None] - IQ4_GRID).argmin(-1).astype(np.uint8)
+
+
+def _iq4_pack(q):   # [..., 32] nibbles -> [..., 16] bytes: low nibble j, high nibble j + 16
+    return (q[..., :16] | (q[..., 16:] << 4)).astype(np.uint8)
+
+
+def _safe_div(a, b):
+    return np.where(b > 0, a / np.where(b > 0, b, 1), 0)
+
+
+def quant_iq4_nl(x):   # [..., n], n % 32 == 0 -> bytes [..., n / 32 * 18]
+    b = x.reshape(*x.shape[:-1], -1, 32).astype(np.float32)
+    d = (np.abs(b).max(-1, keepdims=True) / 127.0).astype(np.float16)
+    q = _iq4_nearest(_safe_div(b, d.astype(np.float32)))
+    out = np.concatenate([d.view(np.uint8).reshape(*b.shape[:-1], 2), _iq4_pack(q)], -1)
+    return out.reshape(*x.shape[:-1], -1)
+
+
+def quant_iq4_xs(x):   # [..., n], n % 256 == 0 -> bytes [..., n / 256 * 136]
+    sb = x.reshape(*x.shape[:-1], -1, 8, 32).astype(np.float32)
+    sub = np.abs(sb).max(-1) / 127.0
+    d = (sub.max(-1, keepdims=True) / 31.0).astype(np.float16)
+    ls = np.clip(np.round(_safe_div(sub, d.astype(np.float32))), 0, 31).astype(np.int32) + 32
+    eff = (d.astype(np.float32) * (ls - 32))[..., None]
+    q = _iq4_nearest(_safe_div(sb, eff))
+    lo = (ls & 15).astype(np.uint8)
+    scales_l = (lo[..., 0::2] | (lo[..., 1::2] << 4)).astype(np.uint8)
+    hi = ((ls >> 4) & 3).astype(np.uint16)
+    scales_h = np.zeros(hi.shape[:-1], np.uint16)
+    for ib in range(8):
+        scales_h |= hi[..., ib] << (2 * ib)
+    lead = sb.shape[:-2]
+    out = np.concatenate([d.view(np.uint8).reshape(*lead, 2), scales_h[..., None].view(np.uint8).reshape(*lead, 2),
+                          scales_l, _iq4_pack(q).reshape(*lead, 128)], -1)
+    return out.reshape(*x.shape[:-1], -1)
 
 
 def rebase_ref(engine, snap):
@@ -65,7 +116,7 @@ def rebase_ref(engine, snap):
     ref["generated_ids"] = gen
     ref["full_ids"] = ref["prompt_ids"] + gen
     ref["final_logits"] = [float(v) for v in logits]
-    ref["model"] = "qwen38_tiny_256_gguf"
+    ref["model"] = snap.name
     ref["rebased_from_cpu_engine"] = {"source_generated_ids": old}
     (snap / "ref.json").write_text(json.dumps(ref))
     print(f"ref.json: CPU engine tokens {gen} (source reference {old})")
@@ -74,10 +125,30 @@ def rebase_ref(engine, snap):
 def main():
     if len(sys.argv) == 4 and sys.argv[1] == "--rebase-ref":
         return rebase_ref(sys.argv[2], sys.argv[3])
-    if len(sys.argv) != 3:
+    args, n_experts, topk, iq4 = sys.argv[1:], None, None, False
+    while args and args[0].startswith("--"):
+        if args[0] == "--iq4":
+            iq4, args = True, args[1:]
+        elif args[0] in ("--experts", "--topk") and len(args) > 1:
+            if args[0] == "--experts":
+                n_experts = int(args[1])
+            else:
+                topk = int(args[1])
+            args = args[2:]
+        else:
+            sys.exit(__doc__)
+    if len(args) != 2:
         sys.exit(__doc__)
-    src, out = Path(sys.argv[1]), Path(sys.argv[2])
+    src, out = Path(args[0]), Path(args[1])
     cfg = json.loads((src / "config.json").read_text())
+    src_experts = cfg["num_experts"]
+    if n_experts:
+        cfg["num_experts"] = n_experts
+    if topk:
+        cfg["num_experts_per_tok"] = topk
+    if cfg["num_experts_per_tok"] > cfg["num_experts"]:
+        sys.exit("top-k above the expert count")
+    rng = np.random.default_rng(38)   # the widened experts' scalings: the same file every time
     st = safe_open(str(src / "model.safetensors"), "pt")
     get = lambda k: st.get_tensor(k).to(torch.float32).numpy()
 
@@ -169,6 +240,18 @@ def main():
 
     norm = lambda a: a + 1.0   # f32 add, as the converter does
 
+    def widen(a):   # [src_experts, ...] -> [num_experts, ...]: copies under a random scaling
+        extra = [a[e % src_experts] * rng.uniform(0.5, 1.5, a.shape[1:]).astype(np.float32)
+                 for e in range(src_experts, cfg["num_experts"])]
+        return np.concatenate([a] + [x[None] for x in extra]) if extra else a
+
+    def put_expert(name, arr, kind):
+        arr = np.ascontiguousarray(arr, dtype=np.float32)
+        if not iq4:
+            return put(name, arr, Q8)
+        w.add_tensor(name, quant_iq4_xs(arr) if kind == "xs" else quant_iq4_nl(arr),
+                     raw_dtype=QT.IQ4_XS if kind == "xs" else QT.IQ4_NL)
+
     put("token_embd.weight", get("model.embed_tokens.weight"), Q8)
     put("output.weight", get("lm_head.weight"), Q8)
     hm = "model.hyper_connection_mixer."
@@ -215,14 +298,14 @@ def main():
             put(b + "indexer.q_norm.weight", norm(get(sa + "indexer.q_layernorm.weight")), F32)
             put(b + "indexer.k_norm.weight", norm(get(sa + "indexer.k_layernorm.weight")), F32)
         mlp = L + "mlp."
-        put(b + "ffn_gate_inp.weight", get(mlp + "gate.weight"), F32)
+        put(b + "ffn_gate_inp.weight", widen(get(mlp + "gate.weight")), F32)
         put(b + "ffn_gate_inp_shexp.weight", get(mlp + "shared_expert_gate.weight").reshape(-1), F32)
         put(b + "ffn_gate_shexp.weight", get(mlp + "shared_expert.gate_proj.weight"), Q8)
         put(b + "ffn_up_shexp.weight", get(mlp + "shared_expert.up_proj.weight"), Q8)
         put(b + "ffn_down_shexp.weight", get(mlp + "shared_expert.down_proj.weight"), Q8)
         for proj, g in (("gate_proj", "gate"), ("up_proj", "up"), ("down_proj", "down")):
-            ex = np.stack([get(f"{mlp}experts.{e}.{proj}.weight") for e in range(cfg["num_experts"])])
-            put(f"{b}ffn_{g}_exps.weight", ex, Q8)
+            ex = widen(np.stack([get(f"{mlp}experts.{e}.{proj}.weight") for e in range(src_experts)]))
+            put_expert(f"{b}ffn_{g}_exps.weight", ex, "nl" if g == "down" else "xs")
         if i in ple_layers:
             pp = L + "ple."
             put(b + "ple_conv1d.weight", get(pp + "conv1d.weight")[:, 0, :], F32)

@@ -51,6 +51,8 @@ static struct {
     unsigned long long choices, groups, loads, hits, cpu_layers;
     int most;
     double wait_s;
+    Model *m;       /* the model whose CPU expert caches were cut to one slot */
+    int *cap0;      /* [layer]: their capacities before, put back by q38x_free */
 } g_q38x;
 
 static void q38x_off(const char *why) {
@@ -124,7 +126,13 @@ static int q38x_scratch(int n) {
     return 1;
 }
 
+/* everything the GPU experts hold, and the CPU's expert caches back to their size: at the
+ * model's free, and whenever the chain turns off mid-run (the CPU runs the rest) */
 static void q38x_free(void) {
+    if (g_q38x.cap0 && g_q38x.m)
+        for (int l = 0; l < g_q38x.layers; l++)
+            if (g_q38x.m->cache[l].slots) g_q38x.m->cache[l].cap = g_q38x.cap0[l];
+    free(g_q38x.cap0); g_q38x.cap0 = NULL; g_q38x.m = NULL;
     if (g_q38x.loader_on) { q38x_settle(1); qsl_destroy(&g_q38x.loader); }
     if (g_q38x.cache_on) {
         QgcStats s = qgc_snapshot(&g_q38x.cache);
@@ -250,14 +258,28 @@ static int q38x_start(Model *m) {
     if (!qsl_init(&g_q38x.loader, &g_q38x.cache)) { q38x_free(); q38x_off("the expert loader's thread did not start"); return 0; }
     g_q38x.loader_on = 1;
     g_q38x.on = 1;
-    /* the CPU's own expert cache serves only a step the chain hands back: one slot a layer */
+    /* the CPU's own expert cache serves only a step the chain hands back: one slot a layer
+     * (its slot table stays: q38x_free puts the capacity back) */
+    if (!(g_q38x.cap0 = (int *)calloc((size_t)L, sizeof(int)))) { q38x_free(); q38x_off("no memory for the expert caches' sizes"); return 0; }
+    g_q38x.m = m;
     for (int l = 0; l < L; l++) {
         LCache *lc = &m->cache[l];
+        g_q38x.cap0[l] = lc->cap;
         if (lc->slots && lc->cap > 1) lc->cap = lc->n > 1 ? lc->n : 1;
     }
     fprintf(stderr, "[qwen38-metal] GPU experts: %zu slots of %zu bytes (%.2f GiB%s), groups of %d; the CPU's expert cache: 1 slot a layer\n",
             slots, payload, (double)slots * payload / 1073741824.0, cb && *cb ? ", QWEN38_EXPERT_CACHE_BYTES" : "", K);
     return 1;
+}
+
+/* The chain turned off mid-run (after a sync, no lease in use): the GPU cache goes, the CPU's
+ * expert caches get their slots back, one line. */
+static void q38x_chain_off(void) {
+    if (!g_q38x.on) return;
+    const int cap = g_q38x.cap0 && g_q38x.layers > 0 ? g_q38x.cap0[0] : 0;
+    q38x_settle(1);
+    q38x_free();
+    fprintf(stderr, "[qwen38-metal] GPU experts released (the chain is off): the CPU's expert cache is back to %d slots a layer\n", cap);
 }
 
 /* the GPU's routes of n rows from the router logits (lg): softmax over all E, top-k by strict >
@@ -293,6 +315,12 @@ static int q38x_moe(Model *m, int i, int n, q36_tensor *x, q36_tensor *shd, q36_
     for (int j = 0; j < ne; j++)
         for (int q = first[experts[j]]; q < first[experts[j] + 1]; q++) pairs[q] |= (uint32_t)((j % K) % 8) << 28;
     if (ne > g_q38x.most) g_q38x.most = ne;
+    /* the CPU path's bookkeeping (q38_moe_decode_ex): the usage counts and the route trace per
+     * row (ids in the router's order, the gates applied), the turn's HITS bitmap per expert */
+    const float *wts = (const float *)q36_tensor_data(g_q38x.wts);
+    for (int r = 0; r < n; r++) rt_route(i, r, ids + (size_t)r * K, wts + (size_t)r * K, K);
+    rt_trace_end();
+    for (int j = 0; j < ne; j++) q38_ehit_mark(m, i, experts[j]);
     g_q38x.choices += (unsigned long long)nc;
     const int G = g_q38x.group;
     int ok = 1;
