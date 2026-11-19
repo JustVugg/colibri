@@ -411,6 +411,43 @@ class ModelsServiceTest(unittest.TestCase):
         self.assertFalse(t["gpu"]["fits"])          # an engine coli setup keeps on the CPU there
         self.assertIn("resta sulla CPU", t["gpu"]["why"])
 
+    APPLE = [{"name": "Apple M3 Max GPU", "kind": "integrated", "vendor": "Apple", "vram_gb": 0}]
+
+    def test_apple_metal_qwen38_fits_gpu_tier(self):
+        self.machine(self.APPLE, ram_gb=64)
+        t = self.m.tiers_for(self.geo(dense=4, experts=100), 0, have=True, family="qwen38")
+        self.assertFalse(t["ram"]["fits"])
+        self.assertTrue(t["gpu"]["fits"])           # dense resident, experts cached or streamed
+        self.assertEqual(t["gpu"]["label"], "GPU Metal + SSD")
+        self.assertIn("dall'SSD", t["gpu"]["why"])
+        self.assertIn("GPU calcola", t["gpu"]["why"])
+        self.machine(self.APPLE, ram_gb=8)          # the dense part alone does not fit
+        t = self.m.tiers_for(self.geo(dense=10, experts=100), 0, have=True, family="qwen38")
+        self.assertFalse(t["gpu"]["fits"])
+
+    def test_apple_other_family_unchanged(self):
+        self.machine(self.APPLE, ram_gb=64)
+        t = self.m.tiers_for(self.geo(dense=4, experts=100), 0, have=True, family="olmoe")
+        self.assertFalse(t["gpu"]["fits"])
+        self.assertNotIn("label", t["gpu"])
+        self.assertIn("servono", t["gpu"]["why"])
+
+    def test_tier_follows_gateway_metal_state(self):
+        self.machine(self.APPLE)
+        for health, tier in (({"metal": {"chain": 1}}, "gpu"), ({"metal": {"chain": 0}}, "ram"), ({"status": "ok"}, "ram")):
+            with mock.patch.object(self.m, "gateway_proc", return_value=None), \
+                 mock.patch.object(self.m, "gw_json", return_value=health):
+                self.assertEqual(self.m.gateway_tier(), tier)
+
+    def test_coli_metal_0_is_not_gpu(self):
+        self.machine(self.APPLE)
+        self.assertEqual(self.m.tier_of(["coli"], {"COLI_METAL": "0"}), "ram")
+        self.assertEqual(self.m.tier_of(["coli"], {}), "gpu")
+        proc = {"coli": True, "argv": ["coli"], "env": {"COLI_METAL": "0"}, "pid": 1}
+        with mock.patch.object(self.m, "gateway_proc", return_value=proc), \
+             mock.patch.object(self.m, "gw_json", return_value={"metal": {"chain": 1}}):
+            self.assertEqual(self.m.gateway_tier(), "ram")
+
     def test_a_cpu_only_engine_has_no_gpu_way(self):
         self.machine([{"name": "Card", "kind": "discrete", "vendor": "NVIDIA", "vram_gb": 24}])
         t = self.m.tiers_for(self.geo(), 0, have=True, family="x", accel=False)
