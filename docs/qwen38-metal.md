@@ -1,4 +1,4 @@
-# Qwen3.8 on Metal: kernels (status)
+# Qwen3.8 on Metal (status)
 
 Status: the Metal kernels of the Qwen3.8 (`qwen38`) engine are written and tested, and a
 `METAL=1` build runs the model's dense layers on them (`c/qwen38_metal_chain.h`, on by
@@ -10,7 +10,10 @@ cache for the whole model (`QWEN38_EXPERT_CACHE_BYTES`; by default min(all exper
 max(6 GiB, RAM − dense − 12 GiB))) holds the experts the GGUF's rows read into it, groups of
 top-k at a time on a loader thread while the GPU runs the shared expert, and
 `q36_expert_sum` adds them in the router's order, then the shared expert, as the CPU does.
-The CPU's own expert cache drops to one slot a layer. `QWEN38_METAL_EXPERTS=0`, a
+The CPU's own expert cache drops to one slot a layer; if the chain turns off mid-run (a
+step the device cannot take memory for, for example), the GPU experts release their cache
+(one `GPU experts released` line) and the CPU's expert cache gets its slots back before the
+CPU runs the rest. `QWEN38_METAL_EXPERTS=0`, a
 safetensors checkpoint or another expert type keep the routed experts on the CPU (M2), with
 one `[qwen38-metal] GPU experts are off: <reason>` line. The chain's report at exit adds
 `experts on GPU: N, loads: L, hits: H`. Expert read-ahead (`QWEN38_METAL_AHEAD`, on by
@@ -23,7 +26,49 @@ the same. Measured on the real model (24 GB M4 Pro): decode 4.53 → 5.18 tok/s 
 ([docs/experiments/qwen38-metal-ahead-2026-11-19](experiments/qwen38-metal-ahead-2026-11-19/manifest.json)). Prompt-lookup drafts are off beside the chain
 unless `COLI_LOOKUP=1`: the chain hands a verify to the CPU, the recurrent state down and up
 again. Debug-only switches: `Q38M_CHECK_WEIGHTS`, `Q38M_LAYER_CHECK`, `Q38M_DECLINE_EVERY`,
-`Q38M_FORCE_ROUTES`, `Q38M_FAIL_SLOT_ALLOC`, `Q38M_AHEAD_EARLY` ([ENVIRONMENT.md](ENVIRONMENT.md)).
+`Q38M_FORCE_ROUTES`, `Q38M_FAIL_SLOT_ALLOC`, `Q38M_REFUSE_AT` (refuses the k-th step's device
+memory: the off path's test), `Q38M_AHEAD_EARLY` ([ENVIRONMENT.md](ENVIRONMENT.md)). Each is
+read once and has no effect unset.
+
+## Measured (real model, Plan 2)
+
+Heretic-2 IQ4_XS GGUF (125 GB, experts streamed from the SSD), 24 GB M4 Pro, `bench/q38_bench.sh`
+(64 tokens on a 61-token chat prompt for decode, the 12,689-token `long12k` prompt for
+prefill, medians of 3, one warm-up), fast kernels:
+
+| build | decode tok/s | prefill 12.7K s | peak footprint GiB |
+|---|---|---|---|
+| CPU engine, MTP off (the baseline) | 3.28 | 1076 | 12.6 |
+| M2: GPU trunk, experts on the CPU (`QWEN38_METAL_EXPERTS=0`) | 3.20 | 1239 | 11.8 |
+| M3: GPU experts, read-ahead off (`QWEN38_METAL_AHEAD=0`) | 4.53 | 751 | |
+| **M3, the default** (GPU experts + read-ahead) | **5.07** | **758** | 14.7 (15.8 GB, in prefill) |
+
+A same-day CPU recheck ran 3.50 tok/s and 1052 s. So M3 decodes 1.45–1.55× faster than
+the CPU engine and prefills 1.39–1.42× faster. Read-ahead alone is +14% on decode (interleaved single runs: 4.40–4.52 off, 5.09–5.17 on), 80% of
+its guesses right. The SSD is still the main cost: the report's `expert reads waited` is
+about 12.5 s of a 22 s decode run (the 61-token prompt, then 64 tokens).
+
+Agreement with the CPU engine in reference precision (`GQ_EXACT=1 Q38_TRUNK_CPU_INT8=0`),
+teacher-forced on the CPU's tokens (`bench/q38_agree.sh`): 128/128 on the two short
+prompts. Long prompts: with routes and QSA selections forced to the reference run
+(`Q38M_FORCE_ROUTES=2`), every layer of a 3K-token prompt is within 5.3e-5 of the CPU;
+unforced, long12k agrees 12 of 14 scored steps, the misses after router near-ties
+(top-k margin about 2e-6) that a one-ulp change flips in the CPU itself.
+
+## Limits of the chain
+
+- MTP is off beside the chain (`Q38_MTP=1` turns the chain off with its line); GPU MTP is
+  planned (M5).
+- Prompt-lookup drafts are off beside the chain unless `COLI_LOOKUP=1` (their verifies run
+  on the CPU).
+- `KV_SLOTS > 1` (`mux_rows`), the vision tower, and dense weight types other than Q8_0,
+  Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS, BF16 and F32 keep the whole model on the CPU, with one
+  `[qwen38-metal] the Metal chain is off: <reason>` line.
+- In `coli serve`, prompt segments are 2048 rows for the Metal build (the serve prefill does
+  not know the chain is on); prefill also re-reads the routed experts for every 256-row
+  chunk, since the cache (6.8 GiB) is far smaller than one chunk's experts. Streaming
+  prefill is planned (M4).
+- macOS only (Metal).
 
 The kernels share the device, the command batch and the exact/fast switch of the Qwen3.6
 Metal path ([qwen36-metal.md](qwen36-metal.md)). `q38_gpu_init()` initializes qwen36's
@@ -89,7 +134,6 @@ meaningful for element-wise and norm ops). The tolerance values themselves are u
 
 ## Known limits
 
-- Not wired into the engine: nothing in `qwen38` calls these kernels yet.
 - End-to-end QSA selections and router ids can differ from the CPU near ties: the dot order,
   float against double `rms0` and Metal's trig differ, and the router selects on a
   normalized probability whose Metal `exp` differs from libm's by a few ulps. The tests use
