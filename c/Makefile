@@ -921,7 +921,7 @@ endif
 .build-config: ;
 
 colibri$(EXE): colibri.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) $(XDNA_OBJ) .build-config
-	$(CC) $(CFLAGS) colibri.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(XDNA_OBJ) -o colibri$(EXE) $(LDFLAGS)
+	$(CC) $(CFLAGS) colibri.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(XDNA_OBJ) expert_store_wex.o wex_decode.o -o colibri$(EXE) $(LDFLAGS)
 
 # Vulkan backend object (plain C + vulkan headers) and its SPIR-V shaders.
 backend_vulkan.o: backend_vulkan.c .build-config
