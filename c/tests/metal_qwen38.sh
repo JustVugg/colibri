@@ -57,6 +57,8 @@
 # serve: tests/metal_qwen38_serve.py (two turns, a regenerated answer, a parked conversation:
 #   every served step's logits against a fresh engine's; KV_SLOTS=2 in a serve), then
 #   tests/test_qwen38_prefix_serve.py and test_qwen38_prefix_store.py with the chain on.
+# serve metal frame: tests/metal_qwen38_serve.py --metal-frame on the tiny GGUF (the gateway's
+#   METAL frame: one a turn, per-turn deltas, GPU-resident experts as EMAP tier 2; COLI_METAL=0).
 set -u
 cd "$(dirname "$0")/.." || exit 1
 fail=0
@@ -614,6 +616,8 @@ done
 
 echo "== serve"
 "${PYTHON:-python3}" tests/metal_qwen38_serve.py || fail=1
+echo "== serve metal frame"
+"${PYTHON:-python3}" tests/metal_qwen38_serve.py --metal-frame ./qwen38_tiny_256_gguf || fail=1
 # the engine's own prefix suites (the live state, the snapshot, the pins, the parked
 # conversation, the cancels; the store's checkpoints and rows) with the chain on: they reach
 # every state hook (q38m_sync_host, q38m_host_wrote, q38m_rollback)

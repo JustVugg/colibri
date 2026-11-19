@@ -16,6 +16,12 @@ serve park: a short request between two turns parks the conversation (its rows a
   a fresh engine, and the short request as it would alone.
 kv slots: KV_SLOTS=2 in serve mode turns the chain off with its one line.
 
+--metal-frame <fixture> (the tiny GGUF) runs only this case: serve metal frame, two turns, each
+  followed by exactly one METAL line (chain=1, experts_gpu=1, loads + hits > 0) whose loads and
+  hits are that turn's (the stderr report's cumulative counts are their running sum), and EMAP
+  cells with tier 2 (in the GPU expert cache) after turn 1; then COLI_METAL=0, whose frame says
+  chain=0 reason=COLI_METAL%3D0.
+
 --segments <dir> (a fixture with a tokenizer and 2048 positions; metal_qwen38.sh gives it
   qwen38_decay's weights) runs only this case: a 1,020-token prompt read in segments of 300
   rows (COLI_PROMPT_SEGMENT=300, the serve's own prompt segments), then 8 tokens decoded
@@ -182,9 +188,69 @@ def segments(fixture):
     return failed
 
 
+CUMUL = re.compile(r"\[metal\] qwen38 chain: .*?, loads: (\d+), hits: (\d+)")
+
+
+def metal_turn(e, rid, prompt):
+    """One turn, then the frames after DONE up to its EMAP: (METAL lines, the EMAP hex)."""
+    e.ask(rid, prompt, max_tok=8)
+    metal = []
+    while True:
+        line = e.p.stdout.readline()
+        if not line:
+            raise RuntimeError("engine closed after DONE:\n" + "".join(e._err)[-2000:])
+        text = line.decode("latin-1").rstrip("\n")
+        if text.startswith("METAL "):
+            metal.append(dict(kv.split("=", 1) for kv in text.split()[1:] if "=" in kv))
+        elif text.startswith("EMAP "):
+            return metal, text.split()[3]
+
+
+def metal_frame(fixture):
+    """serve metal frame: one METAL line per turn on the tiny GGUF, its deltas per turn (the
+    stderr report's cumulative loads and hits are their running sum), GPU-resident experts as
+    EMAP tier 2; with COLI_METAL=0 the frame says why the chain is off."""
+    env = {"SNAP": str(fixture), "SERVE": "1", "OMP_NUM_THREADS": "2", "COLI_NO_OMP_TUNE": "1", "COLI_CUDA": "0",
+           "Q38_MAXT": "128"}
+    e = ServeEngine(ENGINE, ["1", "8"], env)
+    turns, cumul = [], []
+    for rid, prompt in (("1", OPENING), ("2", OPENING + b" 5+5=")):
+        metal, emap = metal_turn(e, rid, prompt)
+        deadline = time.time() + 10   # the report's stderr line, drained by a thread
+        while len(CUMUL.findall("".join(e._err))) < len(turns) + 1 and time.time() < deadline:
+            time.sleep(0.05)
+        turns.append((metal, emap))
+        c = CUMUL.findall("".join(e._err))
+        cumul.append(tuple(int(v) for v in c[-1]) if c else None)
+    log = e.close()
+    ok = all(len(m) == 1 for m, _ in turns) and None not in cumul
+    detail = "METAL lines per turn %s" % [len(m) for m, _ in turns]
+    if ok:
+        f1, f2 = turns[0][0][0], turns[1][0][0]
+        n = lambda f, k: int(f.get(k, -1))
+        ok = all(f.get("chain") == "1" and f.get("experts_gpu") == "1" and n(f, "loads") + n(f, "hits") > 0
+                 and n(f, "guesses") >= 0 and f.get("reason") == "-" for f in (f1, f2))
+        # per turn, not cumulative: turn 2's are the report's growth over turn 2
+        ok = ok and (n(f1, "loads"), n(f1, "hits")) == cumul[0] \
+            and (n(f2, "loads"), n(f2, "hits")) == (cumul[1][0] - cumul[0][0], cumul[1][1] - cumul[0][1])
+        tier2 = sum(1 for i in range(0, len(turns[0][1]), 2) if int(turns[0][1][i:i + 2], 16) >> 6 == 2)
+        ok = ok and tier2 > 0
+        detail = "turn 1 %s, turn 2 %s, report %s, EMAP tier-2 cells after turn 1: %d" % (f1, f2, cumul, tier2)
+    say(ok and OFF not in log, "serve metal frame", detail)
+    off = ServeEngine(ENGINE, ["1", "8"], dict(env, COLI_METAL="0"))
+    metal, _ = metal_turn(off, "1", OPENING)
+    off.close()
+    f = metal[0] if len(metal) == 1 else {}
+    say(f.get("chain") == "0" and f.get("reason") == "COLI_METAL%3D0" and f.get("experts_gpu") == "0",
+        "serve metal frame COLI_METAL=0", "frames %s" % metal)
+    return failed
+
+
 def main():
     if len(sys.argv) == 3 and sys.argv[1] == "--segments":
         return segments(sys.argv[2])
+    if len(sys.argv) == 3 and sys.argv[1] == "--metal-frame":
+        return metal_frame(sys.argv[2])
     with tempfile.TemporaryDirectory() as d:
         subprocess.run([sys.executable, str(HERE / "tools" / "make_edge_tiny_tokenizer.py"), "--vocab-size", "64", d],
                        check=True, stdout=subprocess.DEVNULL)

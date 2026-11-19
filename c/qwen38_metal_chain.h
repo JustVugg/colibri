@@ -26,7 +26,9 @@
 static int g_mtl_chain;                        /* 1 when the chain runs steps */
 static unsigned long long g_q38m_forwards, g_q38m_declined;
 
+static char g_q38m_off_why[192];               /* the off line's reason, for the METAL frame */
 static void q38m_off(const char *why) {
+    snprintf(g_q38m_off_why, sizeof g_q38m_off_why, "%s", why);
     fprintf(stderr, "[qwen38-metal] the Metal chain is off: %s; the CPU engine runs the model\n", why);
 }
 
@@ -1348,6 +1350,34 @@ static void q38m_report(void) {
     if (g_q38x.guesses)
         fprintf(stderr, "[metal] qwen38 read-ahead: guesses: %llu, right: %llu (%.1f%%), announced (not cached): %llu\n",
                 g_q38x.guesses, g_q38x.right, 100.0 * (double)g_q38x.right / (double)g_q38x.guesses, g_q38x.advised);
+}
+
+/* The METAL frame (docs/serve_protocol.md): the chain's state for the gateway's /health, one
+ * line on stdout after every finished request. loads, hits, wait_s, guesses and right are the
+ * turn's (since the previous frame); forwards, declined and kv_regrow the run's. reason: why
+ * the chain is off, URL-encoded, or "-". */
+static void q38m_frame(void) {
+    static unsigned long long p_loads, p_hits, p_guesses, p_right;
+    static double p_wait;
+    unsigned long long loads = g_q38x.loads, hits = g_q38x.hits;   /* q38x_free's, once the cache is gone */
+    if (g_q38x.cache_on) { QgcStats s = qgc_snapshot(&g_q38x.cache); loads = s.loads; hits = s.hits; }
+    char reason[3 * sizeof g_q38m_off_why + 1];
+    size_t w = 0;
+    for (const unsigned char *p = (const unsigned char *)g_q38m_off_why; *p; p++) {
+        if ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') || strchr("-._~", *p))
+            reason[w++] = (char)*p;
+        else { reason[w++] = '%'; reason[w++] = "0123456789ABCDEF"[*p >> 4]; reason[w++] = "0123456789ABCDEF"[*p & 15]; }
+    }
+    if (!w) reason[w++] = '-';
+    reason[w] = 0;
+    printf("METAL chain=%d reason=%s forwards=%llu declined=%llu experts_gpu=%d cache_gb=%.3f slots=%zu loads=%llu hits=%llu "
+           "wait_s=%.4f ahead=%d guesses=%llu right=%llu kv_regrow=%llu\n",
+           g_mtl_chain, reason, g_q38m_forwards, g_q38m_declined, g_q38x.on,
+           (double)g_q38x.nslots * (double)g_q38x.payload / 1073741824.0, g_q38x.nslots,
+           loads - p_loads, hits - p_hits, g_q38x.wait_s - p_wait, g_q38x.ahead,
+           g_q38x.guesses - p_guesses, g_q38x.right - p_right, g_q38m_kv_regrow);
+    fflush(stdout);
+    p_loads = loads; p_hits = hits; p_wait = g_q38x.wait_s; p_guesses = g_q38x.guesses; p_right = g_q38x.right;
 }
 
 #endif

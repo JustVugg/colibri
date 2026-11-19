@@ -1950,21 +1950,34 @@ static int q38_format_prof(char *out,size_t capacity,double wall_s,int prompt_to
  * Same stdout lines colibri.c emits for the web dashboard's Brain tab. Every
  * layer here is a MoE layer, so rows are all layers, columns the experts.
  * EMAP: one byte per expert as two hex digits, tier<<6 | heat (tier 1 =
- * resident in the layer cache; heat 0, no usage counter here). Printed after
+ * resident in the layer cache, 2 = on a GPU: the Vulkan tier's, or the Metal chain's GPU
+ * expert cache; heat 0, no usage counter here). Printed after
  * READY and STAT, and again after every turn. HITS: one bit per expert routed
  * in the turn, packed 8 per hex pair, printed after DONE next to PROF. */
 static void serve_emap(Model *m){
     const Cfg *c=&m->c; int E=c->experts, rows=c->layers;
     char *hex=(char*)malloc((size_t)rows*E*2+1); int w=0;
+#ifdef QWEN38_METAL
+    unsigned char *gpu=(unsigned char*)calloc((size_t)E,1);
+#endif
     for(int i=0;i<rows;i++){
         LCache *lc=&m->cache[i];
+#ifdef QWEN38_METAL
+        if(gpu&&g_q38x.cache_on)qgc_present(&g_q38x.cache,i*E,E,gpu);   /* key = layer * E + expert */
+#endif
         for(int e=0;e<E;e++){
             int si=lc->by_expert?lc->by_expert[e]:-1;
             int b=(vkt_resident(i,e)?2:si>=0&&si<lc->n&&lc->slots[si].eid==e?1:0)<<6;   /* 2 = on the Vulkan device */
+#ifdef QWEN38_METAL
+            if(gpu&&gpu[e])b=2<<6;   /* in the Metal chain's GPU expert cache */
+#endif
             hex[w++]="0123456789abcdef"[b>>4]; hex[w++]="0123456789abcdef"[b&15];
         }
     }
     hex[w]=0;
+#ifdef QWEN38_METAL
+    free(gpu);
+#endif
     printf("EMAP %d %d %s\n",rows,E,hex); fflush(stdout); free(hex);
 }
 static void serve_hits(Model *m){
@@ -3342,7 +3355,13 @@ static void q38_mux_free(Model *m){
  * ERROR of a cancel. */
 static void q38_mux_finish(Model *m,Q38MuxReq *r){
     free(r->lo);r->lo=NULL;free(r->ids);r->ids=NULL;r->active=0;
-    if(r->cancel){coli_serve_write_error(stdout,r->q.id,"CANCELLED");return;}
+    if(r->cancel){
+        coli_serve_write_error(stdout,r->q.id,"CANCELLED");
+#ifdef QWEN38_METAL
+        q38m_frame();   /* one a finished request, as the one-conversation loop's */
+#endif
+        return;
+    }
     if(r->stop)r->limited=0;
     unsigned char tail[3];int tail_n=0;
     if(utf8_finish(r->sbuf,&r->sbn,tail,sizeof tail,&tail_n)<0){
@@ -3361,6 +3380,9 @@ static void q38_mux_finish(Model *m,Q38MuxReq *r){
     else fprintf(stderr,"[qwen38] internal error: PROF frame overflow\n");
     fflush(stdout);
     serve_hits(m);
+#ifdef QWEN38_METAL
+    q38m_frame();   /* the chain is off with KV_SLOTS>1 (q38m_decide): chain=0 and why */
+#endif
     q38_tm_report_bank(&timers,"request");
     q38_report_request_split(m,&r->clk,r->q.id);
     /* the slot's conversation as the turn left it, for its next turn on another slot (one as long
@@ -3536,6 +3558,7 @@ static void serve_loop(Model *m){
 #endif
 #ifdef QWEN38_METAL
             q38m_report();
+            q38m_frame();   /* stdout: the gateway's /health (docs/serve_protocol.md, METAL) */
 #endif
             if(status<0){q38_prefix_cache_release(m);q38_psd_join();coli_ps_report(&g_q38_ps);return;}
             serve_emap(m);

@@ -6996,6 +6996,33 @@ def engine_illegal_instruction(status):
     return status == -4 or status == 0xC000001D
 
 
+# The METAL frame (docs/serve_protocol.md): the qwen38 Metal chain's state after each turn.
+# Integers, floats, and the URL-encoded reason ("-": none); keys not listed are ignored, so
+# the engine can add fields. METAL_DELTAS are the turn's own, summed into `totals`.
+METAL_INTS = ("chain", "forwards", "declined", "experts_gpu", "slots", "loads", "hits", "ahead",
+              "guesses", "right", "kv_regrow")
+METAL_FLOATS = ("cache_gb", "wait_s")
+METAL_DELTAS = ("loads", "hits", "wait_s", "guesses", "right")
+
+
+def _parse_metal(tokens):
+    out = {}
+    for token in tokens:
+        key, sep, value = token.partition("=")
+        if not sep:
+            continue
+        try:
+            if key in METAL_INTS:
+                out[key] = int(value)
+            elif key in METAL_FLOATS:
+                out[key] = float(value)
+            elif key == "reason":
+                out[key] = None if value == "-" else unquote(value)
+        except ValueError:
+            continue
+    return out
+
+
 class EngineLoadError(RuntimeError):
     """The engine said why it could not load, and exited before READY.
 
@@ -7665,6 +7692,8 @@ class Engine:
         self.kv_slots = kv_slots
         self.tiers = None
         self.hwinfo = None
+        self.metal = None         # the last METAL frame (qwen38 METAL=1 builds), None until one
+        self.metal_total = None   # its per-turn fields summed over the run
         self.emap = None
         self.hits = None
         self.hits_seq = 0                      # latest "TIERS" snapshot from the engine
@@ -8047,6 +8076,14 @@ class Engine:
                     self.tiers = {"vram": int(fields[1]), "ram": int(fields[2]),
                                   "disk": int(fields[3]), "vram_gb": float(fields[4]),
                                   "ram_gb": float(fields[5])}
+                elif kind == "METAL":
+                    # the qwen38 Metal chain after a turn: key=value, unknown keys ignored
+                    metal = _parse_metal(fields[1:])
+                    total = self.metal_total or {}
+                    for key in METAL_DELTAS:
+                        if key in metal:
+                            total[key] = round(total.get(key, 0) + metal[key], 6)
+                    self.metal, self.metal_total = metal, total
                 elif kind == "ERROR" and len(fields) >= 2:
                     request_id = fields[1]
                     message = " ".join(fields[2:]) or "engine request failed"
@@ -9128,6 +9165,9 @@ class APIHandler(BaseHTTPRequestHandler):
                     if tiers: payload["tiers"] = tiers
                     hwinfo = getattr(self.server.engine, "hwinfo", None) if self.server.engine else None
                     if hwinfo: payload["hwinfo"] = hwinfo
+                    metal = getattr(self.server.engine, "metal", None) if self.server.engine else None
+                    if metal:   # an engine that sent no METAL frame: /health as before
+                        payload["metal"] = {**metal, "totals": dict(self.server.engine.metal_total or {})}
                     payload["capabilities"] = self.server.capabilities()
                     eng = self.server.engine
                     payload["live"] = eng.live_snapshot() if hasattr(eng, "live_snapshot") else []

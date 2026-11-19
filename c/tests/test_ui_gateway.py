@@ -225,6 +225,85 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual(self.get("/experts")["live_seq"], 3)
 
 
+def dispatched(*frames):
+    """an Engine whose dispatcher read these stdout lines, then the engine's exit"""
+    import io
+    e = gw.Engine.__new__(gw.Engine)
+    e.__dict__.update(closed=False, dispatcher_error=None, pending={}, pending_lock=threading.Lock(),
+                      live={}, live_lock=threading.Lock(), tiers=None, hwinfo=None, emap=None, hits=None,
+                      hits_seq=0, hits_live=collections.deque(maxlen=256), hits_live_seq=0,
+                      profile=collections.deque(maxlen=8), profile_seq=0, metal=None, metal_total=None,
+                      process=mock.Mock(stdout=io.BytesIO(b"".join(f.encode() + b"\n" for f in frames)),
+                                        **{"wait.return_value": None, "poll.return_value": None}))
+    e._fail_pending = lambda error: None
+    with mock.patch("sys.stderr"):
+        e._dispatch_stdout()
+    assert str(e.dispatcher_error) == "colibri engine exited unexpectedly", e.dispatcher_error
+    return e
+
+
+FRAME1 = ("METAL chain=1 reason=- forwards=12 declined=0 experts_gpu=1 cache_gb=0.125 slots=64 loads=40 "
+          "hits=10 wait_s=0.5 ahead=1 guesses=30 right=20 kv_regrow=0")
+FRAME2 = ("METAL chain=1 reason=- forwards=20 declined=1 experts_gpu=1 cache_gb=0.125 slots=64 loads=2 "
+          "hits=48 wait_s=0.25 ahead=1 guesses=36 right=30 kv_regrow=1")
+
+
+class MetalFrameTest(unittest.TestCase):
+    """the engine's METAL frame (one per turn, METAL=1 builds) into /health's `metal`"""
+
+    def test_metal_frame_parsed(self):
+        e = dispatched(FRAME1, FRAME2)
+        self.assertEqual(e.metal, {"chain": 1, "reason": None, "forwards": 20, "declined": 1, "experts_gpu": 1,
+                                   "cache_gb": 0.125, "slots": 64, "loads": 2, "hits": 48, "wait_s": 0.25,
+                                   "ahead": 1, "guesses": 36, "right": 30, "kv_regrow": 1})
+        self.assertEqual(e.metal_total, {"loads": 42, "hits": 58, "wait_s": 0.75, "guesses": 66, "right": 50})
+        eng = LiveEngine()
+        eng.metal, eng.metal_total = e.metal, e.metal_total
+        server = gw.APIServer(("127.0.0.1", 0), eng, "test-model", "secret", 16)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with urlopen(Request(f"http://127.0.0.1:{server.server_port}/health",
+                                 headers={"Authorization": "Bearer secret"}), timeout=5) as r:
+                body = json.load(r)
+        finally:
+            server.scheduler.close(); server.shutdown(); server.server_close()
+        self.assertEqual(body["metal"], {**e.metal, "totals": e.metal_total})
+
+    def test_metal_frame_off_reason(self):
+        e = dispatched("METAL chain=0 reason=COLI_METAL%3D0 forwards=0 declined=0 experts_gpu=0 cache_gb=0.000 "
+                       "slots=0 loads=0 hits=0 wait_s=0.0000 ahead=0 guesses=0 right=0 kv_regrow=0")
+        self.assertEqual((e.metal["chain"], e.metal["reason"], e.metal["experts_gpu"]), (0, "COLI_METAL=0", 0))
+
+    def test_metal_frame_unknown_keys_ignored(self):
+        e = dispatched("METAL chain=1 future=7 reason=- loads=3 hits=1 bare wait_s=0.1 later=x%20y guesses=0 right=0")
+        self.assertNotIn("future", e.metal)
+        self.assertNotIn("later", e.metal)
+        self.assertEqual((e.metal["chain"], e.metal["loads"], e.metal["hits"]), (1, 3, 1))
+        self.assertEqual(e.metal_total["loads"], 3)
+
+    def test_no_metal_frame(self):
+        e = dispatched("TIERS 0 4 4 0.0 1.5")
+        self.assertIsNone(e.metal)
+        self.assertIsNone(e.metal_total)
+        eng = LiveEngine()   # no metal attributes at all: /health exactly as before
+        server = gw.APIServer(("127.0.0.1", 0), eng, "test-model", "secret", 16)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            def health():
+                with urlopen(Request(f"http://127.0.0.1:{server.server_port}/health",
+                                     headers={"Authorization": "Bearer secret"}), timeout=5) as r:
+                    return json.load(r)
+            before = health()
+            eng.metal, eng.metal_total = None, None   # an Engine that has seen no frame
+            after = health()
+        finally:
+            server.scheduler.close(); server.shutdown(); server.server_close()
+        self.assertNotIn("metal", before)
+        for body in (before, after):
+            body.pop("system", None)   # the box's numbers move between two reads
+        self.assertEqual(before, after)
+
+
 class WebSearchTest(unittest.TestCase):
     """ui/web.py without the network: DuckDuckGo's HTML parsed, its redirect links undone,
     only public addresses opened"""
