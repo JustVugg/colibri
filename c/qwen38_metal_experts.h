@@ -27,7 +27,7 @@
  * dense resident bytes - 12 GiB)); slots = bytes / payload, at most keys + group (that many when the
  * bytes hold every expert: no expert is read twice).
  *
- * Read-ahead (QWEN38_METAL_AHEAD, decode only: a step of one row): with layer i's router the GPU
+ * Read-ahead (QWEN38_METAL_AHEAD, on by default, 0 off; decode only: a step of one row): with layer i's router the GPU
  * also runs layer i + 1's router on the same MLP row (q38m_mm + q36_router_softmax +
  * q36_router_select, top Q38X_AHEAD_GUESSES; the residual changes little from one layer to the
  * next, so its likeliest experts are mostly the ones layer i + 1 chooses). After the sync the
@@ -46,7 +46,8 @@
 
 #define Q38X_CHUNK_BYTES ((size_t)256 << 20)   /* slots are views of buffers of up to this size */
 #define Q38X_AHEAD_GUESSES 6     /* as qwen36's QG_AHEAD_GUESSES */
-#define Q38X_AHEAD_DEFAULT 0     /* QWEN38_METAL_AHEAD unset (docs/experiments/qwen38-metal-ahead-*) */
+#define Q38X_AHEAD_DEFAULT 1     /* QWEN38_METAL_AHEAD unset: on, decode 4.53 -> 5.18 tok/s on the real model
+                                  * (docs/experiments/qwen38-metal-ahead-2026-11-19) */
 #if defined(__APPLE__) && !defined(POSIX_FADV_WILLNEED)
 #error "qwen38 read-ahead: compat.h (posix_fadvise -> F_RDADVISE) must come before this header"
 #endif

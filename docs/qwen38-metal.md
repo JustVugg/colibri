@@ -13,12 +13,14 @@ top-k at a time on a loader thread while the GPU runs the shared expert, and
 The CPU's own expert cache drops to one slot a layer. `QWEN38_METAL_EXPERTS=0`, a
 safetensors checkpoint or another expert type keep the routed experts on the CPU (M2), with
 one `[qwen38-metal] GPU experts are off: <reason>` line. The chain's report at exit adds
-`experts on GPU: N, loads: L, hits: H`. `QWEN38_METAL_AHEAD=1` adds expert read-ahead in
-decode: each layer also runs the next layer's router on its MLP row and announces that
+`experts on GPU: N, loads: L, hits: H`. Expert read-ahead (`QWEN38_METAL_AHEAD`, on by
+default, `0` off) in decode: each layer also runs the next layer's router on its MLP row and announces that
 layer's six likeliest experts the cache does not hold to the OS (`F_RDADVISE`), once the
 next trunk is submitted, so the SSD reads them while the GPU computes; the report then adds
 `[metal] qwen38 read-ahead: guesses: G, right: R`. Advice only, the tokens and logits are
-the same. Prompt-lookup drafts are off beside the chain
+the same. Measured on the real model (24 GB M4 Pro): decode 4.53 → 5.18 tok/s (medians of
+3), 80% of the guesses right, prefill unchanged
+([docs/experiments/qwen38-metal-ahead-2026-11-19](experiments/qwen38-metal-ahead-2026-11-19/manifest.json)). Prompt-lookup drafts are off beside the chain
 unless `COLI_LOOKUP=1`: the chain hands a verify to the CPU, the recurrent state down and up
 again. Debug-only switches: `Q38M_CHECK_WEIGHTS`, `Q38M_LAYER_CHECK`, `Q38M_DECLINE_EVERY`,
 `Q38M_FORCE_ROUTES`, `Q38M_FAIL_SLOT_ALLOC`, `Q38M_AHEAD_EARLY` ([ENVIRONMENT.md](ENVIRONMENT.md)).
