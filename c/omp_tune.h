@@ -45,6 +45,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "compat.h"
+
 #if defined(_WIN32)
 #include <windows.h>
 #elif defined(__APPLE__) || defined(__FreeBSD__)
@@ -240,7 +242,7 @@ static int coli_performance_cores(void)
 /* Dimensiona la squadra OpenMP sui core fisici. Rispetta OMP_NUM_THREADS se
  * l'utente l'ha impostata, e non fa nulla se il conteggio non e' affidabile.
  * `engine` finisce solo nella riga di log. */
-static void coli_omp_tune_threads(const char *engine)
+static inline void coli_omp_tune_threads(const char *engine)
 {
 #ifdef _OPENMP
     const char *off = getenv("COLI_NO_OMP_TUNE");
@@ -252,10 +254,24 @@ static void coli_omp_tune_threads(const char *engine)
     int perf = coli_performance_cores();   /* a hybrid CPU: its P-cores pace the team */
     int team = perf > 0 && perf < phys ? perf : phys;
     int logical = omp_get_max_threads();
-    if (team >= logical) return;           /* niente SMT da evitare: silenzio */
+
+    double cg_quota = 0.0;
+    int cg_threads = compat_cgroup_cpu_limit(&cg_quota);
+    int bounded_by_cgroup = 0;
+    if (cg_threads > 0 && cg_threads < team) {
+        team = cg_threads;
+        bounded_by_cgroup = 1;
+    }
+
+    if (team >= logical && !bounded_by_cgroup) return;   /* niente SMT da evitare: silenzio */
 
     omp_set_num_threads(team);
-    if (team < phys)
+    if (bounded_by_cgroup)
+        fprintf(stderr, "[OMP] %s: %d threads bounded by container CPU quota "
+                        "(cgroup: %.2f cores, %d physical cores on host); "
+                        "set OMP_NUM_THREADS=<n> to override\n",
+                engine, team, cg_quota, phys);
+    else if (team < phys)
         fprintf(stderr, "[OMP] %s: %d performance-core threads instead of %d logical CPUs "
                         "(%d physical cores, the efficiency cores left out: the slowest thread "
                         "sets the pace of every matmul); set OMP_NUM_THREADS=<n> to override\n",
@@ -308,7 +324,7 @@ static inline int coli_self_exe_path(char *buf, size_t n)
 }
 #endif
 
-static void coli_omp_hot_team(char **argv, const char *engine, int gpu_on)
+static inline void coli_omp_hot_team(char **argv, const char *engine, int gpu_on)
 {
 #if defined(_OPENMP) && !defined(__APPLE__) && (defined(__linux__) || defined(__FreeBSD__))
     if (getenv("COLI_OMP_TUNED") || getenv("COLI_NO_OMP_TUNE") || gpu_on || !argv || !argv[0]) return;

@@ -70,6 +70,52 @@ static int test_windows_hybrid_records(void)
 }
 #endif
 
+#ifdef _OPENMP
+static int test_cgroup_cpu_quota_bound(void)
+{
+    char base[256];
+    snprintf(base, sizeof(base), "test_omp_cg_XXXXXX");
+    if (!mkdtemp(base)) return 0;
+    char proc_path[512], max_path[512];
+    snprintf(proc_path, sizeof(proc_path), "%s/proc", base);
+    snprintf(max_path, sizeof(max_path), "%s/cpu.max", base);
+    FILE *fp = fopen(proc_path, "w");
+    if (!fp) { rmdir(base); return 0; }
+    fputs("0::/\n", fp);
+    fclose(fp);
+    fp = fopen(max_path, "w");
+    if (!fp) { remove(proc_path); rmdir(base); return 0; }
+    /* 1.0 core quota: 100000 us / 100000 us */
+    fputs("100000 100000\n", fp);
+    fclose(fp);
+
+    setenv("COLIBRI_CGROUP_ROOT", base, 1);
+    setenv("COLIBRI_PROC_CGROUP", proc_path, 1);
+    unsetenv("OMP_NUM_THREADS");
+    unsetenv("COLI_NO_OMP_TUNE");
+
+    int logical = omp_get_num_procs();
+    omp_set_num_threads(logical);
+    coli_omp_tune_threads("test_cg");
+
+    int got = omp_get_max_threads();
+    int fail = 0;
+    if (got != 1) {
+        fprintf(stderr, "cgroup cpu.max 1-core bound failed: got %d threads, want 1\n", got);
+        fail = 1;
+    }
+
+    unsetenv("COLIBRI_CGROUP_ROOT");
+    unsetenv("COLIBRI_PROC_CGROUP");
+    remove(max_path);
+    remove(proc_path);
+    rmdir(base);
+    return fail;
+}
+#else
+static int test_cgroup_cpu_quota_bound(void) { return 0; }
+#endif
+
 int main(void)
 {
 #ifndef _OPENMP
@@ -84,6 +130,8 @@ int main(void)
     fail |= test_windows_variable_records();
     fail |= test_windows_hybrid_records();
 #endif
+
+    fail |= test_cgroup_cpu_quota_bound();
 
     unsetenv("OMP_NUM_THREADS");
     unsetenv("COLI_NO_OMP_TUNE");
