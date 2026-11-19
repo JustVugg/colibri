@@ -2003,6 +2003,7 @@ static void cc_shutdown(void) {
         if (!c->up) continue;
         if (coli_sycl_is_open(c->device)) {   /* a device closed under the chain has nothing left to wait for or free */
             if (!c->lost) (void)cc_try(c, "shutdown", [&] { c->stream->wait_and_throw(); c->cs->wait_and_throw(); });
+            if (!c->lost) coli_sycl_dnnl_release(*c->stream);   /* oneDNN's partitions and buffers for this queue, if any */
             cc_release(c, c->adec);
             cc_adec_reap(c);
             coli_sycl_scratch_reap(c->device);
@@ -2805,7 +2806,20 @@ static int cc_attn_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBu
     static int fl = -1;
     if (fl < 0) { const char *e = getenv("COLI_CUDA_CHAIN_FLASH"); fl = e && *e ? atoi(e) : 16; if (fl < 0) fl = 0; }
     int G = p->H / p->KVH;
+    /* first oneDNN's fused attention where it is asked for (COLI_SYCL_DNNL_ATTN=1 or 2 in a
+     * SYCL_DNNL=1 build; coli_sycl_dnnl.cpp): the same chunks, a float16 cache; it declines (0,
+     * nothing written) elsewhere and the rows go on below. It does not count for the decode
+     * split's rule below (cc_attn_dec_on): the other call sites (cc_attn_w2_t, cc_attn_h_mx) key it
+     * on cc_attn_xmx_ok alone, and the rule must agree across them. */
     const int xmx = fl > 0 && cc_attn_xmx_ok(c, p, G, sizeof(KT) == 2, 0);
+    if (fl > 0 && sizeof(KT) == 2 && p->S >= fl && p->sel_row <= 0 && coli_sycl_dnnl_attn_on()) {
+        coli_sycl_attn a;
+        a.q = qp; a.kc = kp; a.vc = vp; a.kv_f16 = 1; a.o = op; a.gate = gp; a.p = *p; a.G = G;
+        a.win = 0; a.snk = nullptr; a.sink_off = 0; a.ring = 0; a.sel = nullptr;
+        int r = 0;
+        if (!cc_try(c, "attn (oneDNN)", [&] { r = coli_sycl_dnnl_attn(coli_sycl_profile_for(c->device), *c->stream, a); })) return 0;
+        if (r) return launched(c, "attn (oneDNN)");
+    }
     if (xmx && p->S >= fl && p->sel_row <= 0) {
         if (cc_attn_xmx<KT>(c, q, kc, vc, o, gate, p, G, 0, nullptr, 0, 0, nullptr)) return launched(c, "attn (matrix engines)");
         if (c->lost) return 0;

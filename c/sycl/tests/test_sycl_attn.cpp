@@ -2,7 +2,12 @@
  * the first run of a new kernel. No test continues after an exception/mismatch.
  * Large tests sample four query rows, but check ALL output padding/finite values.
  * --bench measures the actual chain dispatch (env0 fallback, env1 XMX), batches
- * of eight operations with one completion, after the same CPU reference check. */
+ * of eight operations with one completion, after the same CPU reference check.
+ * --dnnl runs the same direct cases on oneDNN's fused attention (coli_sycl_dnnl_attn;
+ * COLI_SYCL_DNNL_ATTN=2 in a SYCL_DNNL=1 build), the cache 16-byte aligned: the same
+ * declines, the profile's two replaced by a misaligned K and a misaligned V, a float32
+ * cache declined, the same limits. --bench with COLI_SYCL_DNNL_ATTN=2 times the chain's
+ * dispatch through it. */
 #include "../coli_sycl.h"
 #include <algorithm>
 #include <chrono>
@@ -77,7 +82,9 @@ template<class T> static T *upload(sycl::queue &q, const std::vector<T> &v) {
     q.memcpy(p,v.data(),v.size()*sizeof(T)).wait_and_throw(); return p;
 }
 
-static void direct(sycl::queue &q, const coli_sycl_profile &profile, Case &c, bool large) {
+using AttnEntry = int (*)(const coli_sycl_profile &, sycl::queue &, const coli_sycl_attn &);
+static void direct(sycl::queue &q, const coli_sycl_profile &profile, Case &c, bool large,
+                   AttnEntry run = coli_sycl_xmx_attn, bool dnnl = false) {
     auto x=upload(q,c.x),k=upload(q,c.k),v=upload(q,c.v),g=upload(q,c.g),out=upload(q,c.init);
     auto kh=upload(q,c.kh),vh=upload(q,c.vh);
     coli_sycl_attn a{x,k,v,0,out,g,c.p,c.p.H/c.p.KVH,0,nullptr,0,0,nullptr};
@@ -85,27 +92,35 @@ static void direct(sycl::queue &q, const coli_sycl_profile &profile, Case &c, bo
     // time; output must remain the sentinel before the first valid submission.
     for(int i=0;i<14;i++) {
         auto bad=a; auto pr=profile;
+        if(dnnl) {bad.kv_f16=1;bad.kc=kh;bad.vc=vh;}   // so that the field alone decides
         switch(i) {
         case 0: bad.win=1;break; case 1:bad.snk=g;break; case 2:bad.ring=c.p.cap;break;
         case 3:bad.sel=(int*)k;break;case 4:bad.p.sel_row=1;break;
         case 5:bad.p.pos_base=c.p.cap;break;case 6:bad.p.q_off=-1;break;
         case 7:bad.p.q_row=1;break;case 8:bad.G++;break;case 9:bad.p.hd=96;break;
         case 10:bad.q=out;break;case 11:bad.p.has_gate=1;bad.gate=nullptr;break;
-        case 12:pr.has_xmx=0;break;case 13:pr.slm_bytes=0;break;
+        // the profile's fields for XMX; for oneDNN (which does not read them) a K, then a V, not 16-byte aligned
+        case 12:if(dnnl)bad.p.k_off++;else pr.has_xmx=0;break;
+        case 13:if(dnnl)bad.p.v_off++;else pr.slm_bytes=0;break;
         }
-        need(!coli_sycl_xmx_attn(pr,q,bad),"unsupported attention submitted");
+        need(!run(pr,q,bad),"unsupported attention submitted");
     }
     std::vector<float> got(c.init.size()),first;
     q.memcpy(got.data(),out,got.size()*4).wait_and_throw();need(got==c.init,"declined dispatch touched output");
     for(int half=0;half<=1;half++) {
         a.kv_f16=half;a.kc=half?(void*)kh:(void*)k;a.vc=half?(void*)vh:(void*)v;
-        need(coli_sycl_xmx_attn(profile,q,a),"XMX not taken"); q.wait_and_throw();
+        if(dnnl&&!half) {   // a float32 cache is not oneDNN's: declined, nothing written
+            need(!run(profile,q,a),"oneDNN took a float32 cache"); q.wait_and_throw();
+            q.memcpy(got.data(),out,got.size()*4).wait_and_throw();need(got==c.init,"declined dispatch touched output");
+            continue;
+        }
+        need(run(profile,q,a),dnnl?"oneDNN not taken":"XMX not taken"); q.wait_and_throw();
         q.memcpy(got.data(),out,got.size()*4).wait_and_throw();
-        std::printf("ATTN direct S%d pos%d H%d KV%d hd%d gate%d kv_f16%d\n",c.p.S,c.p.pos_base,c.p.H,c.p.KVH,c.p.hd,c.p.has_gate,half);
+        std::printf("ATTN direct%s S%d pos%d H%d KV%d hd%d gate%d kv_f16%d\n",dnnl?" (oneDNN)":"",c.p.S,c.p.pos_base,c.p.H,c.p.KVH,c.p.hd,c.p.has_gate,half);
         // Probability rounding plus f32 reduction; original unrounded Q check
         // retained too. No existing chain tolerance is changed by this test.
         c.check(got,true,large,5e-4); c.check(got,false,large,1e-3);
-        if(!half) first=got;else need(!std::memcmp(first.data(),got.data(),got.size()*4),"cache formats differ in bits");
+        if(!half) first=got;else if(!dnnl) need(!std::memcmp(first.data(),got.data(),got.size()*4),"cache formats differ in bits");
     }
     for(auto p:{x,k,v,g,out}) sycl::free(p,q);sycl::free(kh,q);sycl::free(vh,q);
 }
@@ -133,14 +148,15 @@ static void bench(Case &c,int reps) {
 }
 
 int main(int argc,char **argv) {
-    int dev=0,reps=5,koff=3;bool small=false,benchmark=false;
+    int dev=0,reps=5,koff=3;bool small=false,benchmark=false,dnnl=false;
     for(int i=1;i<argc;i++) {
         if(!std::strcmp(argv[i],"--small"))small=true;
         else if(!std::strcmp(argv[i],"--bench"))benchmark=true;
+        else if(!std::strcmp(argv[i],"--dnnl"))dnnl=true;
         else if(!std::strcmp(argv[i],"--device")&&i+1<argc)dev=std::atoi(argv[++i]);
         else if(!std::strcmp(argv[i],"--reps")&&i+1<argc)reps=std::atoi(argv[++i]);
         else if(!std::strcmp(argv[i],"--koff")&&i+1<argc)koff=std::atoi(argv[++i]);
-        else {std::fprintf(stderr,"usage: %s [--device N] [--small|--bench] [--reps N] [--koff N]\n",argv[0]);return 2;}
+        else {std::fprintf(stderr,"usage: %s [--device N] [--small|--bench] [--dnnl] [--reps N] [--koff N]\n",argv[0]);return 2;}
     }
     try {
         need(dev>=0&&reps>0&&reps<=100,"invalid args");
@@ -148,6 +164,17 @@ int main(int argc,char **argv) {
         auto &q=coli_sycl_queue(dev);const auto &p=coli_sycl_profile_for(dev);
         if(benchmark) {
             for(int S:{256,2048}) {Case c(S,0,256,16,2,true,false,koff);bench(c,reps);}
+        } else if(dnnl) {
+            const char *dm=std::getenv("COLI_SYCL_DNNL_ATTN");
+            need(dm&&!std::strcmp(dm,"2")&&coli_sycl_dnnl_attn_on(),"--dnnl needs COLI_SYCL_DNNL_ATTN=2 (every call compiled on the caller) in a SYCL_DNNL=1 build");
+            // the cache 8 elements in (16 bytes): the least alignment oneDNN's path takes
+            for(int hd:{64,128,256}) {
+                Case one(1,0,hd,1,1,false,false,8);direct(q,p,one,false,coli_sycl_dnnl_attn,true);
+                Case tail(9,27,hd,4,2,true,false,8);direct(q,p,tail,false,coli_sycl_dnnl_attn,true);
+                Case zeros(17,33,hd,2,1,false,true,8);direct(q,p,zeros,false,coli_sycl_dnnl_attn,true);
+                Case keytail(9,59,hd,4,2,true,false,8);direct(q,p,keytail,false,coli_sycl_dnnl_attn,true);
+            }
+            if(!small)for(int S:{256,2048}) {Case c(S,S==2048?6144:0,256,16,2,true,false,8);direct(q,p,c,true,coli_sycl_dnnl_attn,true);}
         } else {
             need(coli_sycl_xmx_attn_ok(p,64,1,1,0),"opt-in/profile missing; direct test requires COLI_SYCL_XMX_ATTN=1");
             for(int hd:{64,128,256}) {

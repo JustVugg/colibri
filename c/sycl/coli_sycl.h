@@ -278,6 +278,13 @@ struct coli_sycl_attn {
 };
 extern int coli_sycl_xmx_attn(const coli_sycl_profile &p, sycl::queue &q, const coli_sycl_attn &a);
 extern int coli_sycl_xmx_attn_ok(const coli_sycl_profile &p, int hd, int G, int kv_f16, int sel);
+/* The same chunk through oneDNN's fused attention (coli_sycl_dnnl.cpp): only in a SYCL_DNNL=1 build,
+ * only with COLI_SYCL_DNNL_ATTN=1 (_on), a float16 cache, head sizes 64, 128 and 256, no selection
+ * list, window, sinks or ring; returns 1 when submitted, 0 (nothing written) otherwise, as
+ * coli_sycl_xmx_attn does. _release drops what it holds for a queue (the chain's shutdown). */
+extern int coli_sycl_dnnl_attn_on(void);
+extern int coli_sycl_dnnl_attn(const coli_sycl_profile &p, sycl::queue &q, const coli_sycl_attn &a);
+extern void coli_sycl_dnnl_release(sycl::queue &q);
 
 /* ---- 5. frame profiling (COLI_SYCL_FRAME_PROF) ------------------------------------------ */
 

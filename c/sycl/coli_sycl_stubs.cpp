@@ -6,6 +6,9 @@
  * the prompt rows). Sections 1 and 2 (the profile, the devices, the arena) are implemented by
  * coli_sycl_profile.cpp and coli_sycl_profile_rules.cpp and have no stub any more. */
 #include "coli_sycl.h"
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 #define COLI_SYCL_WEAK __attribute__((weak))
 
@@ -30,3 +33,17 @@ COLI_SYCL_WEAK int coli_sycl_xmx_attn(const coli_sycl_profile &p, sycl::queue &q
 COLI_SYCL_WEAK int coli_sycl_xmx_attn_ok(const coli_sycl_profile &p, int hd, int G, int kv_f16, int sel) {
     (void)p; (void)hd; (void)G; (void)kv_f16; (void)sel; return 0;
 }
+/* a build without SYCL_DNNL=1: oneDNN's attention is not there; said once if it is asked for */
+COLI_SYCL_WEAK int coli_sycl_dnnl_attn_on(void) {
+    static int said = 0;
+    const char *e = std::getenv("COLI_SYCL_DNNL_ATTN");
+    if (!said && e && (!std::strcmp(e, "1") || !std::strcmp(e, "2"))) {
+        said = 1;
+        std::fprintf(stderr, "[SYCL] COLI_SYCL_DNNL_ATTN needs a build with SYCL_DNNL=1: the chain's attention kernels\n");
+    }
+    return 0;
+}
+COLI_SYCL_WEAK int coli_sycl_dnnl_attn(const coli_sycl_profile &p, sycl::queue &q, const coli_sycl_attn &a) {
+    (void)p; (void)q; (void)a; return 0;
+}
+COLI_SYCL_WEAK void coli_sycl_dnnl_release(sycl::queue &q) { (void)q; }

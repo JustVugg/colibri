@@ -134,6 +134,13 @@ static const struct { coli_sycl_arch arch; const char *knob; int value; } tuned_
     { COLI_SYCL_ARCH_PVC, "COLI_CUDA_EXPERT_ARENA", 2 },
     { COLI_SYCL_ARCH_PVC, "COLI_EXPERT_PAGECACHE", 1 },
     { COLI_SYCL_ARCH_PVC, "COLI_CUDA_DENSE_CACHE", 1 },
+    /* a prompt chunk's attention through oneDNN's fused attention, in a SYCL_DNNL=1 build only (coli_sycl_dnnl.cpp;
+     * other builds never read this row), mode 1 (the first compile off the request's path): Qwen3.6-35B-A3B first
+     * token of a 32K prompt 25.99 -> 11.51 s, 16K 9.07 -> 5.89 s, 3K, 21 tokens and decode unchanged (campaign DNNL3).
+     * Unlike the rows above the attention's bits change (float16 Q, P and O, oneDNN's order), but the texts were
+     * identical to the switch off in every measured class, and the prompt-path loss was 2.759443 against the grouped
+     * kernel's 2.761657 (limit 2.775465). Taken from this row for head size 256 only (the one measured end to end). */
+    { COLI_SYCL_ARCH_PVC, "COLI_SYCL_DNNL_ATTN", 1 },
 };
 int coli_sycl_tuned_default(const coli_sycl_profile &p, const char *platform_defaults, const char *knob, int generic) {
     if (!knob || (platform_defaults && !strcmp(platform_defaults, "0"))) return generic;

@@ -770,6 +770,16 @@ endif
 # quoted includes; the ABI headers come from -I. and dpct's helpers from -Isycl/include.
 ICPXFLAGS ?= -O3 -std=c++17 $(SYCL_TARGET_FLAGS) -fp-model=precise -fPIE -Wall -Wextra \
              -Wno-unused-parameter -Wno-unused-function -I. -Isycl -Isycl/include -DCOLI_GPU_PORTABLE_ONLY=1
+# SYCL_DNNL=1: a prompt chunk's attention may go through oneDNN's fused attention
+# (sycl/coli_sycl_dnnl.cpp; COLI_SYCL_DNNL_ATTN=1 or 2, or unset on Max cards: sycl/README.md). Compiles that unit
+# with COLI_SYCL_DNNL and links the toolkit's libdnnl (setvars' DNNLROOT; the runtime image's
+# redist carries libdnnl.so.3). Without it the unit is empty and the stubs decline. Changing it
+# rebuilds the objects (it is in .build-config, below).
+SYCL_DNNL ?= 0
+ifeq ($(SYCL_DNNL),1)
+ICPXFLAGS     += -DCOLI_SYCL_DNNL=1 $(if $(DNNLROOT),-I$(DNNLROOT)/include)
+SYCL_DNNL_LIB  = $(if $(DNNLROOT),-L$(DNNLROOT)/lib) -ldnnl
+endif
 # every unit in sycl/: the migrated .dp.cpp and the hand-written .cpp (the profile, its
 # rules, the stubs, the XMX family when it lands), so a new unit needs no Makefile line
 SYCL_SRC     = $(sort $(wildcard sycl/*.dp.cpp) $(wildcard sycl/*.cpp))
@@ -789,7 +799,7 @@ endif
 # libraries an icpx-driven link would add (libimf, libsvml, libirng); all four are in the
 # basekit's LIBRARY_PATH (setvars) and in the runtime image's /opt/intel/oneapi/redist/lib.
 CFLAGS     += -DCOLI_CUDA -DCOLI_SYCL
-LDFLAGS    += -lsycl -lstdc++ -lintlc -limf -lsvml -lirng
+LDFLAGS    += -lsycl -lstdc++ -lintlc -limf -lsvml -lirng $(SYCL_DNNL_LIB)
 CUDA_OBJ    = $(SYCL_OBJ) cu_tier.o
 GPUCC       = $(ICPX)
 GPUFLAGS    = $(ICPXFLAGS)
@@ -1048,7 +1058,7 @@ glm: colibri$(EXE)
 # rewrite it ONLY when they change (evaluated here at parse time, so the file's
 # timestamp moves exactly when the config moves). The binary and CUDA/loader objects depend
 # on it, so they relink on a config change and stay put otherwise. (#306)
-BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|CUDA_GLIBC_MATH_COMPAT=$(CUDA_GLIBC_MATH_COMPAT)|METAL=$(METAL)|HIP=$(HIP)|HIP_DLL=$(HIP_DLL)|HIP_ARCH=$(HIP_ARCH)|VK=$(VK)|XDNA=$(XDNA)|SYCL=$(SYCL)|SYCL_TARGETS=$(SYCL_TARGETS)|SYCL_DEVICES=$(SYCL_DEVICES)|SYCL_IEEE_DIV_SQRT=$(SYCL_IEEE_DIV_SQRT)
+BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|CUDA_GLIBC_MATH_COMPAT=$(CUDA_GLIBC_MATH_COMPAT)|METAL=$(METAL)|HIP=$(HIP)|HIP_DLL=$(HIP_DLL)|HIP_ARCH=$(HIP_ARCH)|VK=$(VK)|XDNA=$(XDNA)|SYCL=$(SYCL)|SYCL_TARGETS=$(SYCL_TARGETS)|SYCL_DEVICES=$(SYCL_DEVICES)|SYCL_IEEE_DIV_SQRT=$(SYCL_IEEE_DIV_SQRT)|SYCL_DNNL=$(SYCL_DNNL)
 BUILD_CONFIG_OLD := $(shell cat .build-config 2>/dev/null)
 ifneq "$(BUILD_CONFIG)" "$(BUILD_CONFIG_OLD)"
 # $(file ...) writes via make's own primitive (GNU Make >= 4.0, 2013), NOT by
@@ -1716,11 +1726,11 @@ sycl/tests/test_qwen38_fp8_stages_hostlink$(EXE): sycl/tests/test_qwen38_fp8_sta
 	$(CC) $(CFLAGS) $< $(SYCL_OBJ) -o $@ $(LDFLAGS)
 endif
 sycl/tests/%$(EXE): sycl/tests/%.cpp $(SYCL_FAT_OBJ) $(SYCL_HDR) sycl/tests/sycl_test_args.h
-	"$(ICPX)" $(ICPXFLAGS) $< $(SYCL_FAT_OBJ) -o $@
+	"$(ICPX)" $(ICPXFLAGS) $< $(SYCL_FAT_OBJ) -o $@ $(SYCL_DNNL_LIB)
 cuda_chain_test$(EXE): sycl/tests/test_cuda_chain.dp.cpp $(SYCL_FAT_OBJ) $(SYCL_HDR) sycl/tests/sycl_test_args.h
-	"$(ICPX)" $(ICPXFLAGS) $< $(SYCL_FAT_OBJ) -o $@
+	"$(ICPX)" $(ICPXFLAGS) $< $(SYCL_FAT_OBJ) -o $@ $(SYCL_DNNL_LIB)
 backend_cuda_test$(EXE): sycl/tests/test_backend_cuda.dp.cpp $(SYCL_FAT_OBJ) $(SYCL_HDR) sycl/tests/sycl_test_args.h
-	"$(ICPX)" $(ICPXFLAGS) $< $(SYCL_FAT_OBJ) -o $@
+	"$(ICPX)" $(ICPXFLAGS) $< $(SYCL_FAT_OBJ) -o $@ $(SYCL_DNNL_LIB)
 sycl-test: sycl-profile-test sycl-host-sync-test sycl-matmul-plan-test cuda_chain_test$(EXE) backend_cuda_test$(EXE) $(SYCL_GPU_TEST_BIN)
 sycl-chain-check: sycl-test
 	./cuda_chain_test$(EXE)
@@ -2347,7 +2357,7 @@ inkling$(EXE): inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build
 # flags for these targets and say so once, loudly.
 comma := ,
 NOCUDA_CFLAGS  = $(filter-out -DCOLI_CUDA -DCOLI_ANS,$(CFLAGS))
-NOCUDA_LDFLAGS = $(filter-out -lcudart -lcublasLt -lcublas -lstdc++ -lcuda -lsycl -lintlc -limf -lsvml -lirng -L$(CUDA_HOME)/lib64 \
+NOCUDA_LDFLAGS = $(filter-out -lcudart -lcublasLt -lcublas -lstdc++ -lcuda -lsycl -lintlc -limf -lsvml -lirng $(SYCL_DNNL_LIB) -L$(CUDA_HOME)/lib64 \
                    -Wl$(comma)-rpath$(comma)$(CUDA_HOME)/lib64,$(LDFLAGS))
 
 # GLM-5.3-Flash: routed experts stream from the int4-gs64 container.

@@ -299,6 +299,7 @@ int main(void) {
             { "COLI_CUDA_MUX_BATCH", 0, 15 },          { "COLI_TRUNK_PROBE", 1, 0 },
             { "Q38_SYCL_HYBRID", 0, 1 },              { "COLI_CUDA_EXPERT_ARENA", 0, 2 },
             { "COLI_EXPERT_PAGECACHE", 0, 1 },         { "COLI_CUDA_DENSE_CACHE", 0, 1 },
+            { "COLI_SYCL_DNNL_ATTN", 0, 1 },
         };
         for (const auto &r : rows) {
             CHECK(coli_sycl_tuned_default(p_pvc, nullptr, r.knob, r.generic) == r.pvc);
