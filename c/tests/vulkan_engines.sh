@@ -651,6 +651,22 @@ PY
   else
     echo "  skip: the Inkling-2-Mini loop gates need transformers with Inkling2LoopForCausalLM (tools/oracle-inkling2-loop-requirements.txt)"
   fi
+  # a tiny Inkling-2-Mini GGUF as UD-Q4_K_XL lays it out (tests/test_gguf_import.py: NVFP4 experts
+  # with their global scales outside the blocks, Q8_0 ones elsewhere): the chain's experts in the
+  # frame (the scales in the table's entries, NVFP4 through the block step) against the CPU's
+  if [ ! -d ink2m_nv/gg ]; then
+    rm -rf ink2m_nv && mkdir ink2m_nv
+    $PY - <<'PY' || fail "gguf-py (pip install gguf) is needed for the Inkling-2-Mini GGUF gate"
+import json, sys
+sys.path.insert(0, "tests")
+from test_gguf_import import write_inkling2_mini_pair
+write_inkling2_mini_pair("ink2m_nv", experts="NVFP4")
+p = [5, 77, 13, 201, 42, 9, 150, 33, 61, 18, 240, 7]
+json.dump({"prompt_ids": p, "full_ids": p + [0] * 16}, open("ink2m_nv/ref.json", "w"))
+PY
+  fi
+  CHAINNAME=inkling2 chain_gate inkling "chain inkling2 loop GGUF NVFP4 experts in the frame" 1 COLI_VK_DENSE=1 GQ_EXACT=1 COLI_VK_IDOT=0 \
+    COLI_VK_CHAIN_GEMM=0 SNAP=ink2m_nv/gg -- 8 0 ink2m_nv/ref.json
 }
 
 family_inkling_olmoe() {

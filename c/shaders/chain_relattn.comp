@@ -19,10 +19,19 @@
 // has_sink (Inkling-2): a sink logit per (row, head) in the tau buffer at
 // sink_off + s*H + h, which joins the softmax's denominator only: the online softmax starts
 // from it (m = sink, l = 1), as attention's CPU loop starts its maximum and sum there.
-// s0 (the last push constant, 0 for a whole step): the step's row of this dispatch's
-// first row, when vk_chain.c cuts a prompt chunk's rows over several submissions; q, o,
-// r, tau's and the sinks' offsets then point at that row, pos_base stays the step's first
-// position.
+// s0 (0 for a whole step): the step's row of this dispatch's first row, when vk_chain.c cuts
+// a prompt chunk's rows over several submissions; q, o, r, tau's and the sinks' offsets then
+// point at that row, pos_base stays the step's first position.
+// mode (the last push constants, with nc): 0 the above, a workgroup a (head, row) over every
+// position. A decode step has a workgroup a head and so 24 on the device (Inkling-2-Mini),
+// each over every position in turn: at 648 positions 0.5 ms a layer, 24 ms of a token's 63
+// on an RTX PRO 4000. So a step of few rows over many positions splits them (vk_chain.c):
+//   mode 1  a workgroup a (head, row, chunk of 128 positions, WorkGroupID.z): its tile as
+//           mode 0 runs it, from m = -inf and l = 0, written at binding 3 (part) as
+//           [m, l, acc[hd]] at ((s*H + h)*nc + c)*(hd + 2), the step's rows read from kvs;
+//   mode 2  a workgroup a (head, row): the nc chunks of part (binding 4) combined, the sink
+//           (has_sink) one more term with l = 1 and no value, ctx = sum acc e^(m - M) / L.
+// The two agree with mode 0 to rounding (the sums' order).
 layout(local_size_x = 128) in;
 
 layout(std430, binding = 0) readonly buffer QB { float q[]; };
@@ -42,6 +51,7 @@ layout(push_constant) uniform P {
     float scale;
     int has_sink, sink_off;
     int s0;
+    int mode, nc;
 } p;
 
 shared float qs[256];
@@ -53,6 +63,25 @@ shared float red[128];
 void main() {
     int h = int(gl_WorkGroupID.x), s = int(gl_WorkGroupID.y);
     int tid = int(gl_LocalInvocationID.x);
+    if (p.mode == 2) {   // the chunks combined: the max, then the sums rescaled to it
+        int pr = p.hd + 2, base = ((p.s0 + s) * p.H + h) * p.nc * pr;
+        float M = p.has_sink != 0 ? tau[p.sink_off + s * p.H + h] : -3.0e38;
+        for (int c = 0; c < p.nc; c++) M = max(M, kvs[base + c * pr]);
+        float L = p.has_sink != 0 ? exp(tau[p.sink_off + s * p.H + h] - M) : 0.0, a0 = 0.0, a1 = 0.0;
+        int d0 = tid, d1 = tid + 128;
+        for (int c = 0; c < p.nc; c++) {
+            int b = base + c * pr;
+            float w = exp(kvs[b] - M);
+            L += w * kvs[b + 1];
+            if (d0 < p.hd) a0 += w * kvs[b + 2 + d0];
+            if (d1 < p.hd) a1 += w * kvs[b + 2 + d1];
+        }
+        float inv = L > 0.0 ? 1.0 / L : 0.0;
+        int ob = p.o_off + s * p.o_row + h * p.hd;
+        if (d0 < p.hd) o[ob + d0] = a0 * inv;
+        if (d1 < p.hd) o[ob + d1] = a1 * inv;
+        return;
+    }
     int kvh = h / (p.H / p.KVH);
     int qb = p.q_off + s * p.q_row + h * p.hd;
     for (int d = tid; d < p.hd; d += 128) qs[d] = q[qb + d];
@@ -63,8 +92,9 @@ void main() {
     float ts = tau[p.tau_off + s];
     barrier();
     float m = -3.0e38, l = 0.0, acc0 = 0.0, acc1 = 0.0;
-    if (p.has_sink != 0) { m = tau[p.sink_off + s * p.H + h]; l = 1.0; }
-    for (int b0 = 0; b0 < n; b0 += 128) {
+    if (p.has_sink != 0 && p.mode == 0) { m = tau[p.sink_off + s * p.H + h]; l = 1.0; }
+    int c = int(gl_WorkGroupID.z);   // mode 1: this workgroup's chunk, its only tile
+    for (int b0 = p.mode == 1 ? 128 * c : 0; b0 < (p.mode == 1 ? min(n, 128 * c + 1) : n); b0 += 128) {
         int i = b0 + tid;
         float sv = -3.0e38;
         if (i < n) {
@@ -117,6 +147,13 @@ void main() {
         }
         m = mn;
         barrier();
+    }
+    if (p.mode == 1) {   // the chunk's [m, l, acc]: m -inf and l 0 for a chunk past the row's positions
+        int pr = p.hd + 2, b = (((p.s0 + s) * p.H + h) * p.nc + c) * pr;
+        if (tid == 0) { o[b] = m; o[b + 1] = l; }
+        if (tid < p.hd) o[b + 2 + tid] = acc0;
+        if (tid + 128 < p.hd) o[b + 2 + tid + 128] = acc1;
+        return;
     }
     float inv = l > 0.0 ? 1.0 / l : 0.0;
     int ob = p.o_off + s * p.o_row + h * p.hd;

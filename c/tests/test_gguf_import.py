@@ -1095,6 +1095,35 @@ def write_inkling2(path, t, experts="F32", dense="F32"):
     return held
 
 
+_E2M1 = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], np.float32)
+
+
+def nvfp4_rows(a):
+    """a [rows, cols] (cols a multiple of 64) as ggml's NVFP4 blocks (gguf-py has no quantizer for
+    them): 64 values a block, four unsigned E4M3 scales then 8 bytes a group of 16, byte j its
+    values j (low nibble) and 8 + j (high), e2m1 codes. Returns (the bytes [rows, cols / 64 * 36],
+    the values they hold)."""
+    rows, cols = a.shape
+    sb = np.arange(127, dtype=np.int64)
+    sb = sb[sb != 0x7F]
+    e, m = (sb >> 3) & 15, sb & 7
+    sv = np.where(e == 0, m / 512.0, (8 + m) * 2.0 ** (e - 10.0)).astype(np.float32)   # the scales' values
+    g = a.reshape(rows, cols // 16, 16)
+    amax = np.abs(g).max(axis=2)
+    pick = np.abs(sv[None, None, :] - (amax / 6.0)[..., None]).argmin(axis=2)
+    pick = np.where(amax > 0, pick, 0)
+    scale = np.where(amax > 0, sv[pick], 0.0).astype(np.float32)
+    byte = np.where(amax > 0, sb[pick], 0).astype(np.uint8)
+    q = np.where(scale[..., None] > 0, np.abs(g) / np.where(scale > 0, scale, 1.0)[..., None], 0.0)
+    mag = np.abs(q[..., None] - _E2M1).argmin(axis=-1)
+    code = (mag | ((g < 0) & (mag > 0)).astype(np.int64) << 3).astype(np.uint8)
+    held = (np.where(code >> 3, -1.0, 1.0) * _E2M1[code & 7] * scale[..., None]).reshape(rows, cols).astype(np.float32)
+    code = code.reshape(rows, cols // 64, 4, 16)
+    packed = code[..., :8] | (code[..., 8:] << 4)                      # [rows, blocks, 4, 8]
+    out = np.concatenate([byte.reshape(rows, cols // 64, 4), packed.reshape(rows, cols // 64, 32)], axis=2)
+    return out.reshape(rows, cols // 64 * 36), held
+
+
 def write_inkling2_mini(path, t, experts="F32"):
     """The model of ink2_weights(INK2M, loop=INK2M_LOOP) as unsloth's Inkling-2-Mini GGUFs lay it
     out (llama.cpp's later inkling2 names): block_count and the per-layer arrays in application
@@ -1102,7 +1131,8 @@ def write_inkling2_mini(path, t, experts="F32"):
     them but a global layer's static taps in convolution order, the relative bias transposed, an
     expert's gate and up rows in one tensor, the loop's gates under blk.N.loop_* and the message
     queries global. The INK2_SCALED layers' experts divided by their global scale (.scale), as
-    the NVFP4 layers'. Returns the model the file holds (t with the experts as read back)."""
+    the NVFP4 layers'; experts "NVFP4" holds those layers' in NVFP4 blocks and the others' as Q8_0,
+    as unsloth's UD-Q4_K_XL does. Returns the model the file holds (t with the experts as read back)."""
     g, local_layers, lp = INK2M, INK2M_LOCAL, INK2M_LOOP
     D, E, I, CK, L = g["D"], g["E"], g["I"], g["CK"], g["L"]
     ls, le, P = lp["start"], lp["end"], lp["passes"]
@@ -1130,14 +1160,19 @@ def write_inkling2_mini(path, t, experts="F32"):
     w.add_token_types([1] * (g["V"] - 3) + [3, 3, 3]); w.add_token_merges([])
     w.add_bos_token_id(g["V"] - 3); w.add_eos_token_id(g["V"] - 2)
     add = lambda name, a: w.add_tensor(name, np.ascontiguousarray(a, dtype=np.float32))
-    def exps(name, a):
+    def exps(name, a, scaled=False):
         a = np.ascontiguousarray(a, dtype=np.float32)
-        if experts == "F32":
+        qt = experts if experts != "NVFP4" else ("NVFP4" if scaled else "Q8_0")
+        if qt == "F32":
             add(name, a)
             return a
-        q = gguf.quants.quantize(a, QT[experts])
-        w.add_tensor(name, q, raw_dtype=QT[experts])
-        return gguf.quants.dequantize(q, QT[experts]).reshape(a.shape).astype(np.float32)
+        if qt == "NVFP4":
+            q, held = nvfp4_rows(a.reshape(-1, a.shape[-1]))
+            w.add_tensor(name, q.reshape(*a.shape[:-1], -1), raw_dtype=QT.NVFP4)
+            return held.reshape(a.shape)
+        q = gguf.quants.quantize(a, QT[qt])
+        w.add_tensor(name, q, raw_dtype=QT[qt])
+        return gguf.quants.dequantize(q, QT[qt]).reshape(a.shape).astype(np.float32)
     m = "model.llm."
     add("token_embd.weight", t[m + "embed.weight"]); add("token_embd_norm.weight", t[m + "embed_norm.weight"])
     add("output_norm.weight", t[m + "norm.weight"]); add("output.weight", t[m + "unembed.weight"])
@@ -1181,8 +1216,9 @@ def write_inkling2_mini(path, t, experts="F32"):
             add(b + "ffn_gate_up_exps.scale", sg); add(b + "ffn_down_exps.scale", sd)
         else:
             sg = sd = np.ones(E, np.float32)
-        held[s + "mlp.experts.gate_up_proj"] = exps(b + "ffn_gate_up_exps.weight", gu) * sg[:, None, None]
-        held[s + "mlp.experts.down_proj"] = exps(b + "ffn_down_exps.weight", dn) * sd[:, None, None]
+        sc = i in INK2_SCALED
+        held[s + "mlp.experts.gate_up_proj"] = exps(b + "ffn_gate_up_exps.weight", gu, sc) * sg[:, None, None]
+        held[s + "mlp.experts.down_proj"] = exps(b + "ffn_down_exps.weight", dn, sc) * sd[:, None, None]
     w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
     return held
 
@@ -1365,6 +1401,16 @@ class Inkling2Gguf(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             gg, snap = write_inkling2_mini_pair(tmp)
             tg, lg = inkling_run(gg)
+            ts, ls = inkling_run(snap)
+            self.assertEqual(tg, ts)
+            self.assertLess(float(np.abs(lg - ls).max()), 1e-3 * max(1.0, float(np.abs(ls).max())))
+
+    def test_the_mini_nvfp4_experts(self):
+        """The scaled layers' experts as NVFP4 blocks, the others Q8_0 (UD-Q4_K_XL's layout): the
+        float kernels (GQ_EXACT=1) on the file against its weights as f32."""
+        with tempfile.TemporaryDirectory() as tmp:
+            gg, snap = write_inkling2_mini_pair(tmp, experts="NVFP4")
+            tg, lg = inkling_run(gg, {"GQ_EXACT": "1"})
             ts, ls = inkling_run(snap)
             self.assertEqual(tg, ts)
             self.assertLess(float(np.abs(lg - ls).max()), 1e-3 * max(1.0, float(np.abs(ls).max())))

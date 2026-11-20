@@ -422,6 +422,11 @@ typedef struct { int S, H, KVH, hd, pos_base, cap, window, ext, d_rel;
 int  vkc_relattn_ready(void);
 int  vkc_relattn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *kvs, VkcBuf *r, VkcBuf *relp, VkcBuf *tau,
                  const VkcRelAttn *p);
+/* The buffer of a decode step's split attention (up to 8 rows, more than 128 positions: the
+ * positions over workgroups, chain_relattn.comp's modes 1 and 2): S * H * ceil(positions / 128)
+ * * (hd + 2) floats at most, the engine's for its widest step (NULL: no split, as before).
+ * COLI_VK_RELATTN_SPLIT=0 keeps every step whole. */
+void vkc_relattn_part(VkcBuf *part);
 /* Inkling-2's ops (chain_ink2.comp, made on first use; inkling2_chain.h):
  *   vkc_ink2_mix   the attention residuals' mix of nb block states (b_off + s*b_row + e*D) and
  *                  the partial stream (x_off + s*x_row), each RMS-normalised without a weight,

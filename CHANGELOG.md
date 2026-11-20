@@ -24,6 +24,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   through the converter; `tests/test_gguf_import.py` the GGUF's layout.
 - **The CPU's NVFP4 blocks unpacked with AVX2**, their E4M3 scales from their bits instead of
   `ldexpf` (the same values): Inkling-2's NVFP4 experts from a GGUF.
+- **Inkling-2's Vulkan chain decodes in one frame**: the routed experts in the frame
+  (`vk_dmoe.h`: Inkling-2's router and SiTU-GLU experts, the K/V rows of those layers held for the
+  frame's end), a GGUF's NVFP4 experts with their global scales (the expert table's words 19 and
+  20, `chain_moe.comp` applies them; 0 is a scale of 1, so every other engine's entries read as
+  before) and NVFP4 in the block step decoder (`bdstep.glsl`), and a decode step's attention split
+  over its positions (`chain_relattn.comp` modes 1 and 2, `vkc_relattn_part`; at 648 positions
+  24 -> 7.6 ms of a token, `COLI_VK_RELATTN_SPLIT=0` keeps it whole). Inkling-2-Mini on an RTX PRO
+  4000 after a 570-token prompt: UD-Q4_K_XL 14.8-15.2 -> 39.2-39.3 tok/s, UD-IQ2_XXS 19.7-20.3 ->
+  45.5-45.7, the int4 g64 container 18.1-18.5 -> 36.3.
 
 - **`coli web` opens the chat UI**: it serves the API and starts the chat (`ui/server.py`, the
   page `coli ui` serves) in front of it, on the API's port + 790 (8790 for 8000, `--ui-port`

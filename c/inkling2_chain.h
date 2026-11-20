@@ -42,11 +42,23 @@
  * mixes each into the attention's inputs (a sliding layer's one mix three ways: its q, k and v
  * then normed apart) and the MLP's.
  *
+ * The routed experts in the frame (vk_dmoe.h): a step of up to VKC_DMOE_ROWS rows (decode) routes
+ * on the device and computes a layer's experts there when the tier holds all of that layer's on
+ * this device: Inkling-2's router (the sigmoids, the bias for the pick only, the K picks' sigmoids
+ * divided by their sum times route_scale) and its SiTU-GLU experts, then on to the next layer with
+ * no wait. With every layer so, a decode step is one frame. The K/V rows of such layers wait in
+ * kvl (a region a state layer) for the frame's end; the books (the history, the hits, the tier's
+ * heat) follow from the ids. A GGUF's NVFP4 layers keep each expert's global scale outside its
+ * blocks: their entries carry it (VkcDmoe.escale; gate's and up's one number, as the tier
+ * requires). TOPP and ROUTE_TRACE take the host's step.
+ *
  * The chain declines (the per-matrix path runs) with several conversations at once (KV_SLOTS),
  * on a geometry outside its shaders (head dim above 256, a bias bank wider than 64, more than 9
  * taps or 15 block states), when a matrix is not on the device, and when the device refuses its
  * memory. It needs the dense matrices on the device (the per-matrix path's copies); the router,
  * the sink projection and the dynamic taps' projections go up as f32. */
+
+#include "vk_dmoe.h"   /* the routed experts in the frame */
 
 #define INK2C_HOST 0   /* the host's convolution states are newer than the device's */
 #define INK2C_BOTH 1
@@ -66,6 +78,12 @@ typedef struct {
     VkcBuf *x, *res, *blk, *hq, *hk, *hv, *nq, *nk, *nv, *q, *kvs, *r, *gt, *ctx, *a, *mo, *dyn, *ts, *lg, *fin;
     VkcBuf *h2d, *lgd, *kvd, *csd, *outd, *xd, *routed;
     int NS;                                    /* state layers (n_state): kc, vc, cap, dlo, dhi, o_csd by them */
+    VkcDmoe dm;                                /* the routed experts in the frame (vk_dmoe.h) */
+    VkcBuf *kvl; int kvl_rows;                 /* their layers' K/V rows until the frame ends, a region a state layer */
+    size_t *o_rb;                              /* the router's bias in prm, by layer */
+    float *escale;                             /* [L][E][2] the experts' global scales (a GGUF's NVFP4 layers), NULL none */
+    VkcBuf *relpart;                           /* a decode step's split attention's partials (vkc_relattn_part), for max_t */
+    unsigned long long dm_layers;              /* layer steps whose experts ran in the frame */
     ColiVkTensor **t_lg;                       /* the loop's gates, [layer][q, k, v, mlp][down, forget, gain] */
     size_t o_lq;                               /* the loop's message queries, [loop layer][q, k, v, mlp][D] */
     VkcBuf *xpre, *xprev, *pblk, *msg[4], *hn2, *lz, *lf, *lgv;
@@ -126,6 +144,11 @@ static size_t ink2c_plan_bytes(const Model *m) {
         if (r1 > row) row = r1;
     }
     if (c->loop_p > 1) row += ((size_t)(7 + ink2c_maxb(c)) * D + (size_t)c->loop_r) * 4;   /* a row's loop scratch */
+    {   /* the split attention's partials at the whole context (ink2c_mirror) */
+        size_t hm = 0, hdm = 0;
+        for (int i = 0; i < c->n_layers; i++) { if ((size_t)L_HEADS(c, i) > hm) hm = L_HEADS(c, i); if ((size_t)L_HD(c, i) > hdm) hdm = L_HD(c, i); }
+        b += (size_t)VKC_DMOE_ROWS * hm * (((size_t)t + 127) / 128) * (hdm + 2) * 4;
+    }
     return b + row * 256 + (size_t)c->unpad_vocab * 4 + ((size_t)ink2c_maxb(c) * D * 4) * 256;
 }
 
@@ -142,7 +165,7 @@ static Ink2Chain *ink2c_new(Model *m) {
     if (!INK2C_ARR(o_n1, size_t) || !INK2C_ARR(o_n2, size_t) || !INK2C_ARR(o_n3, size_t) || !INK2C_ARR(o_post, size_t) ||
         !INK2C_ARR(o_qc, size_t) || !INK2C_ARR(o_rc, size_t) || !INK2C_ARR(o_relp, size_t) || !INK2C_ARR(o_cw[0], size_t) ||
         !INK2C_ARR(o_cw[1], size_t) || !INK2C_ARR(o_cw[2], size_t) || !INK2C_ARR(o_cw[3], size_t) || !INK2C_ARR(o_aq, size_t) ||
-        !INK2C_ARR(o_mq, size_t) || !INK2C_ARR(t_q, void *) || !INK2C_ARR(t_k, void *) || !INK2C_ARR(t_v, void *) ||
+        !INK2C_ARR(o_mq, size_t) || !INK2C_ARR(o_rb, size_t) || !INK2C_ARR(t_q, void *) || !INK2C_ARR(t_k, void *) || !INK2C_ARR(t_v, void *) ||
         !INK2C_ARR(t_r, void *) || !INK2C_ARR(t_o, void *) || !INK2C_ARR(t_ag, void *) || !INK2C_ARR(t_sink, void *) ||
         !INK2C_ARR(t_router, void *) || !INK2C_ARR(t_wp[0], void *) || !INK2C_ARR(t_wp[1], void *) ||
         !INK2C_ARS(kc, void *) || !INK2C_ARS(vc, void *) || !INK2C_ARS(cap, int) || !INK2C_ARS(dlo, int) ||
@@ -164,6 +187,10 @@ static void ink2c_free_own(Model *m, Ink2Chain *ch) {
     }
     for (int v = 0; v < ch->NS; v++) { vkc_free(ch->kc[v]); vkc_free(ch->vc[v]); ch->kc[v] = ch->vc[v] = NULL; }
     ch->t_lm = NULL;
+    vkc_dmoe_free(&ch->dm);
+    vkc_relattn_part(NULL); vkc_free(ch->relpart); ch->relpart = NULL;
+    free(ch->escale); ch->escale = NULL;
+    vkc_free(ch->kvl); ch->kvl = NULL; ch->kvl_rows = 0;
     vkc_free(ch->rings); ch->rings = NULL;
     vkc_free(ch->prm); ch->prm = NULL;
     ch->max_t = 0; ch->hostK = NULL;
@@ -230,6 +257,7 @@ static Ink2Chain *ink2c_setup(Model *m) {
         ch->o_cw[2][i] = n; n += (size_t)D * CK; ch->o_cw[3][i] = n; n += (size_t)D * CK;
         ch->o_aq[i] = n; n += (size_t)x2->naq * D;
         ch->o_mq[i] = n; n += D;
+        ch->o_rb[i] = n; n += (size_t)c->n_experts;
     }
     ch->o_outq = n; n += D;
     ch->o_final = n; n += D;
@@ -256,6 +284,7 @@ static Ink2Chain *ink2c_setup(Model *m) {
         memcpy(arena + ch->o_cw[3][i], l->m_cw, (size_t)D * CK * sizeof(float));
         if (x2->naq) memcpy(arena + ch->o_aq[i], x2->aq, (size_t)x2->naq * D * sizeof(float));
         memcpy(arena + ch->o_mq[i], x2->mq, D * sizeof(float));
+        memcpy(arena + ch->o_rb[i], l->rbias, (size_t)c->n_experts * sizeof(float));
     }
     memcpy(arena + ch->o_outq, m->x2_out_query, D * sizeof(float));
     memcpy(arena + ch->o_final, m->final_norm, D * sizeof(float));
@@ -325,6 +354,12 @@ static int ink2c_mirror(Ink2Chain *ch, Model *m) {
         ch->vc[i] = vkc_buf((size_t)KV * cap * hd * sizeof(float), VKC_DEV);
         if (!ch->kc[i] || !ch->vc[i]) { ch->max_t = 0; ch->hostK = NULL; return 0; }
     }
+    /* the split attention's partials: a decode step's rows (VKC_DMOE_ROWS) at the whole context;
+     * without them every step's attention runs whole, as before */
+    vkc_relattn_part(NULL); vkc_free(ch->relpart);
+    int hdmax = 0;
+    for (int i = 0; i < c->n_layers; i++) if (L_HD(c, i) > hdmax) hdmax = L_HD(c, i);
+    ch->relpart = vkc_buf((size_t)VKC_DMOE_ROWS * ch->hmax * ((m->max_t + 8 + 127) / 128) * (hdmax + 2) * sizeof(float), VKC_DEV);
     ch->max_t = m->max_t; ch->hostK = m->K;
     return 1;
 }
@@ -426,7 +461,7 @@ static int ink2c_dconv(Ink2Chain *ch, Model *m, int i, int v, int bank, VkcBuf *
 }
 /* the attention from nq (and nk, nv on a global layer, or with a loop pass's messages: sep): o_proj's
  * rows into a, the step's K/V rows into state layer v's cache on the device and into kvd */
-static int ink2c_attention(Ink2Chain *ch, Model *m, int i, int v, int sep, int n, int pb) {
+static int ink2c_attention(Ink2Chain *ch, Model *m, int i, int v, int sep, int n, int pb, VkcBuf *kvdst, size_t ko, size_t vstride) {
     Cfg *c = &m->c;
     int H = L_HEADS(c, i), KV = L_KV(c, i), hd = L_HD(c, i), kvo = KV * hd, dr = c->d_rel;
     int cap = ch->cap[v], local = c->local[i], R = ch->rows;
@@ -460,15 +495,16 @@ static int ink2c_attention(Ink2Chain *ch, Model *m, int i, int v, int sep, int n
         rv[(s - s0) * KV + h] = (VkcRegion){dst, vs + src, (size_t)hd};
     }
     ok = vkc_copy_regions(ch->kc[v], ch->kvs, rk, nr) && vkc_copy_regions(ch->vc[v], ch->kvs, rv, nr) &&
-         vkc_copy(ch->kvd, 0, ch->kvs, 0, (size_t)n * kvo) && vkc_copy(ch->kvd, (size_t)R * ch->kvo_max, ch->kvs, vs, (size_t)n * kvo);
+         vkc_copy(kvdst, ko, ch->kvs, 0, (size_t)n * kvo) && vkc_copy(kvdst, ko + vstride, ch->kvs, vs, (size_t)n * kvo);
     free(rk);
     return ok && vkc_matmul(ch->t_o[i], ch->ctx, 0, ch->a, 0, n);
 }
-/* state layer v's new K/V rows (in kvd) into the host's cache, as ink2_attention writes them */
-static void ink2c_kv_down(Ink2Chain *ch, Model *m, int v, int n, int pb) {
+/* state layer v's new K/V rows (kv: K, then V vstride floats on) into the host's cache, as
+ * ink2_attention writes them */
+static void ink2c_kv_down(Ink2Chain *ch, Model *m, int v, int n, int pb, const float *kv, size_t vstride) {
     Cfg *c = &m->c;
     int KV = L_KV(c, v), hd = L_HD(c, v), kvo = KV * hd, cap = ch->cap[v], s0 = n > cap ? n - cap : 0;
-    const float *kv = (const float *)vkc_ptr(ch->kvd), *vv = kv + (size_t)ch->rows * ch->kvo_max;
+    const float *vv = kv + vstride;
     for (int s = s0; s < n; s++) for (int h = 0; h < KV; h++) {
         size_t dst = ((size_t)h * cap + (size_t)(pb + s) % cap) * hd, src = (size_t)s * kvo + (size_t)h * hd;
         memcpy(m->K[v] + dst, kv + src, hd * sizeof(float));
@@ -476,10 +512,10 @@ static void ink2c_kv_down(Ink2Chain *ch, Model *m, int v, int n, int pb) {
     }
 }
 /* the MoE output of layer i, state layer v (the host's routed sum) joining the stream: x = res + sconv(mo) */
-static int ink2c_join(Ink2Chain *ch, Model *m, int i, int v, int n) {
+static int ink2c_join(Ink2Chain *ch, Model *m, int i, int v, int n, VkcBuf *routed) {
     Cfg *c = &m->c; int D = c->hidden;
     VkcEw add = {VKC_EW_ADD, n * D, D, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
-    return vkc_copy(ch->mo, 0, ch->routed, 0, (size_t)n * D) && ink2c_sconv(ch, ch->mo, 0, n, D, 3, i, v, c) &&
+    return vkc_copy(ch->mo, 0, routed, 0, (size_t)n * D) && ink2c_sconv(ch, ch->mo, 0, n, D, 3, i, v, c) &&
            vkc_ew(ch->x, ch->res, ch->mo, NULL, NULL, &add);
 }
 /* the residual mix of the nb block states (of blk: ch->blk, or a loop pass's pblk) and `part` into y
@@ -504,6 +540,51 @@ static int ink2c_loop_gate(Ink2Chain *ch, Model *m, int i, int g, VkcBuf *h, Vkc
            vkc_matmul(t[2], ch->lz, 0, ch->lgv, 0, n) && vkc_ew(y, ch->lf, ch->lgv, h, ch->msg[g], &mix);
 }
 
+/* ---- the routed experts in the frame (vk_dmoe.h) ---- */
+/* the step's table and buffers, 1 when a layer of it may run its experts here: not with TOPP (its
+ * kept ranks are the host's), ROUTE_TRACE, or shared experts (Inkling's first, not Inkling-2) */
+static int ink2c_dmoe(Ink2Chain *ch, Model *m, int rows) {
+    Cfg *c = &m->c; const int E = c->n_experts;
+    if (!ch->escale) {   /* the scales an expert outside its blocks, once */
+        int any = 0;
+        for (int i = 0; i < c->n_layers; i++) any |= m->L[i].xgsc != NULL;
+        if (any && (ch->escale = calloc((size_t)c->n_layers * E * 2, sizeof(float))))
+            for (int i = 0; i < c->n_layers; i++)
+                for (int e = 0; m->L[i].xgsc && e < E; e++) {
+                    ch->escale[((size_t)i * E + e) * 2] = m->L[i].xgsc[e];
+                    ch->escale[((size_t)i * E + e) * 2 + 1] = m->L[i].xdsc[e];
+                }
+        if (any && !ch->escale) return 0;
+        ch->dm.escale = ch->escale;
+    }
+    if ((g_topp > 0.f && g_topp < 1.f) || rt_fp || c->n_shared > 0 ||
+        !vkc_dmoe_prepare(&ch->dm, 0, c->n_layers, c->n_experts, c->topk, c->hidden, c->moe_inter, rows)) return 0;
+    if (!ch->kvl && !(ch->kvl = vkc_buf((size_t)ch->NS * 2 * VKC_DMOE_ROWS * ch->kvo_max * sizeof(float), VKC_DOWN))) return 0;
+    ch->kvl_rows = VKC_DMOE_ROWS;
+    return 1;
+}
+static int ink2c_dmoe_on(Ink2Chain *ch, Model *m, int i) {
+    /* a GGUF's NVFP4 layer: gate's and up's scale one number an expert (the tier's start checks) */
+    return vkc_dmoe_on(&ch->dm, i) && (!m->L[i].xgsc || ch->escale);
+}
+/* after the frame: a step whose experts ran there (layer i, state layer v), its K/V rows into the
+ * host's cache and its books, as moe_ex and ink_vk_moe keep them (a loop's later passes read the
+ * layer's ids as the frame left them: the last pass's) */
+static void ink2c_dmoe_done(Ink2Chain *ch, Model *m, int i, int v, int n, int pb) {
+    const int K = m->c.topk;
+    const size_t reg = (size_t)2 * ch->kvl_rows * ch->kvo_max;
+    ink2c_kv_down(ch, m, v, n, pb, (const float *)vkc_ptr(ch->kvl) + (size_t)v * reg, reg / 2);
+    const int *ids = vkc_dmoe_ids(&ch->dm, i);
+    m->ereq += (uint64_t)n * K; m->euse += (uint64_t)n * K;
+    for (int j = 0; j < n * K; j++) {
+        if (ids[j] < 0) continue;
+        if (m->eusage && m->eusage[i]) m->eusage[i][ids[j]]++;
+        ehit_mark(m, i, ids[j]);
+    }
+    vkt_dev_count(i, n, K, ids);
+    ch->dm_layers++;
+}
+
 /* Every layer for S rows from host rows xh, the last row's logits (softcapped) into `logit`;
  * xh gets the rows the final norm reads (the output mix applied) when want_x. 0 = not taken:
  * xh is as it was and the caller runs the step on the CPU (after ink2c_recover when the device
@@ -526,12 +607,18 @@ static int ink2c_forward(Model *m, float *xh, int S, int pos_base, int want_x, f
     }
     float *xfin = want_x ? malloc((size_t)S * D * sizeof(float)) : NULL;
     if (want_x && !xfin) return 0;
+    const int dmoe = ink2c_dmoe(ch, m, rows);
+    vkc_relattn_part(ch->relpart);   /* a decode step's attention split over its positions */
+    int *dq = dmoe ? malloc((size_t)2 * c->n_state * sizeof(int)) : NULL, ndq = 0;   /* this frame's in-frame steps (i, v) */
+    if (dmoe && !dq) { free(xfin); return 0; }
     vkc_gemm_rows(-1);
     for (int c0 = 0; c0 < S; c0 += rows) {
-        if (coli_prompt_break()) { free(xfin); return 0; }
+        if (coli_prompt_break()) { free(xfin); free(dq); return 0; }
         int n = S - c0 < rows ? S - c0 : rows, pb = pos_base + c0, R = ch->rows;
         if (!vkc_begin() || !vkc_write(ch->x, 0, xh + (size_t)c0 * D, (size_t)n * D * sizeof(float)) ||
             !ink2c_push_state(ch, m)) goto lost;
+        if (dmoe && !vkc_dmoe_upload(&ch->dm)) goto lost;   /* the tier's residents changed: the table again */
+        ndq = 0;
         {   /* attention's tau: the global layers' log-length scale, then 1 for the sliding ones */
             float tau[2 * 512];
             float *tp = n <= 512 ? tau : malloc((size_t)2 * R * sizeof(float));
@@ -546,7 +633,7 @@ static int ink2c_forward(Model *m, float *xh, int S, int pos_base, int want_x, f
             if (tp != tau) free(tp);
             if (!wok) goto lost;
         }
-        int ok = 1, pending = 0, B = 0, pi = 0, pv = 0, preB = 0, nprev = 0;
+        int ok = 1, pending = 0, B = 0, pi = 0, pv = 0, preB = 0, nprev = 0, prev_dev = 0, sent = 0;
         /* the steps in the CPU's order: the layers before the loop, its passes, the layers after */
         const int lp = c->loop_p > 1, ls = lp ? c->loop_s : L, le = lp ? c->loop_e : L;
         const int steps = L + (lp ? (c->loop_p - 1) * (le - ls) : 0);
@@ -558,7 +645,8 @@ static int ink2c_forward(Model *m, float *xh, int S, int pos_base, int want_x, f
             } else i = v = st - (lp ? (c->loop_p - 1) * (le - ls) : 0);
             Layer *l = &m->L[i]; Ink2Layer *x2 = l->x2;
             int local = c->local[i];
-            if (pending) ok = ink2c_join(ch, m, pi, pv, n);
+            if (pending) ok = ink2c_join(ch, m, pi, pv, n, prev_dev ? ch->dm.y : ch->routed);
+            const int dl = dmoe && n <= ch->kvl_rows && ink2c_dmoe_on(ch, m, i);   /* its experts here, no wait */
             const int msg = lp && pass > 0;   /* a later pass: this layer's four messages */
             if (ok && lp && i == ls) {
                 if (pass == 0) {   /* the loop's input stream, which every pass starts from */
@@ -598,7 +686,12 @@ static int ink2c_forward(Model *m, float *xh, int S, int pos_base, int want_x, f
             ok = ok && ink2c_norm(iq, ch->prm, ch->o_n1[i], ch->nq, n, D, c->eps);
             if (sep) ok = ok && ink2c_norm(ik, ch->prm, local ? ch->o_n1[i] : ch->o_n2[i], ch->nk, n, D, c->eps) &&
                               ink2c_norm(iv, ch->prm, local ? ch->o_n1[i] : ch->o_n3[i], ch->nv, n, D, c->eps);
-            ok = ok && ink2c_attention(ch, m, i, v, sep, n, pb) && ink2c_sconv(ch, ch->a, 0, n, D, 2, i, v, c);
+            {   /* the step's K/V rows: kvd for the host's step after this frame, kvl's region when the frame goes on */
+                const size_t reg = (size_t)2 * ch->kvl_rows * ch->kvo_max;
+                ok = ok && (dl ? ink2c_attention(ch, m, i, v, sep, n, pb, ch->kvl, (size_t)v * reg, reg / 2)
+                               : ink2c_attention(ch, m, i, v, sep, n, pb, ch->kvd, 0, (size_t)R * ch->kvo_max)) &&
+                     ink2c_sconv(ch, ch->a, 0, n, D, 2, i, v, c);
+            }
             /* a block boundary keeps this layer's input stream as a block state and starts the
              * stream over from the attention's output; elsewhere the output adds to it */
             if (ok && i % blkn == 0) {
@@ -616,23 +709,36 @@ static int ink2c_forward(Model *m, float *xh, int S, int pos_base, int want_x, f
             ok = ok && ink2c_mix(ch, ch->res, B, ch->o_mq[i], ch->hq, n, D) &&
                  (!msg || ink2c_loop_gate(ch, m, i, 3, ch->hq, ch->hq, n)) &&
                  ink2c_norm(ch->hq, ch->prm, ch->o_post[i], ch->nq, n, D, c->eps) &&
-                 vkc_matmul(ch->t_router[i], ch->nq, 0, ch->lg, 0, n) &&
-                 vkc_copy(ch->lgd, 0, ch->lg, 0, (size_t)n * E) && vkc_copy(ch->h2d, 0, ch->nq, 0, (size_t)n * D);
+                 vkc_matmul(ch->t_router[i], ch->nq, 0, ch->lg, 0, n);
+            if (dl) {   /* Inkling-2's routing and SiTU-GLU experts here (moe_ex's), and on */
+                VkcRoute rp = {.kind = 1, .b_off = (int)ch->o_rb[i], .has_bias = 1, .n_group = 1, .topk_group = 1, .norm = 1,
+                               .temp = 1.f, .scale = c->route_scale * l->rgs, .norm_eps = 0.f};
+                VkcMoe mp = {.D = D, .I = c->moe_inter, .act = 1, .a = c->gate_cap, .b = c->up_cap, .blocks = m->gx != 0};
+                ok = ok && vkc_dmoe_layer(&ch->dm, i, n, ch->lg, ch->prm, ch->nq, &rp, &mp);
+                if (ok) { dq[2 * ndq] = i; dq[2 * ndq + 1] = v; ndq++; }
+                pending = 1; pi = i; pv = v; prev_dev = 1;
+                if (ok && st + 1 < steps) ok = vkc_layer_recorded(&sent);   /* the device starts on these layers */
+                continue;
+            }
+            ok = ok && vkc_copy(ch->lgd, 0, ch->lg, 0, (size_t)n * E) && vkc_copy(ch->h2d, 0, ch->nq, 0, (size_t)n * D);
             double t0 = now_s();
             ok = ok && vkc_submit(0);
             if (ok) vkt_stream_prefetch(i, n);
             ok = ok && vkc_finish();
             m->t_attn += now_s() - t0;
             if (!ok) break;
-            ink2c_kv_down(ch, m, v, n, pb);
+            for (int k = 0; k < ndq; k++) ink2c_dmoe_done(ch, m, dq[2 * k], dq[2 * k + 1], n, pb);
+            ndq = 0;
+            ink2c_kv_down(ch, m, v, n, pb, (const float *)vkc_ptr(ch->kvd), (size_t)ch->rows * ch->kvo_max);
             double t1 = now_s();
             moe_ex(m, l, i, (float *)vkc_ptr(ch->h2d), n, ch->host_routed, (const float *)vkc_ptr(ch->lgd), NULL);
             memcpy(vkc_ptr(ch->routed), ch->host_routed, (size_t)n * D * sizeof(float));
             ch->host_ms += (now_s() - t1) * 1e3;
             ok = vkc_begin();
-            pending = 1; pi = i; pv = v;
+            if (ok && dmoe) ok = vkc_dmoe_upload(&ch->dm);   /* the host's step ran the tier: the table again */
+            pending = 1; pi = i; pv = v; prev_dev = 0;
         }
-        if (ok && pending) ok = ink2c_join(ch, m, pi, pv, n);
+        if (ok && pending) ok = ink2c_join(ch, m, pi, pv, n, prev_dev ? ch->dm.y : ch->routed);
         /* the output's mix of the block states and the last stream: the rows the final norm reads */
         ok = ok && ink2c_mix(ch, ch->x, B, ch->o_outq, ch->hq, n, D);
         if (ok && want_x) ok = vkc_copy(ch->xd, 0, ch->hq, 0, (size_t)n * D);
@@ -648,6 +754,8 @@ static int ink2c_forward(Model *m, float *xh, int S, int pos_base, int want_x, f
         ok = ok && vkc_submit(1);
         m->t_attn += now_s() - t0;
         if (!ok) goto lost;
+        for (int k = 0; k < ndq; k++) ink2c_dmoe_done(ch, m, dq[2 * k], dq[2 * k + 1], n, pb);
+        ndq = 0;
         const float *csd = (const float *)vkc_ptr(ch->csd);
         for (int i = 0; i < ch->NS; i++) for (int b = 0; b < 4; b++)
             memcpy(m->cs[b][i], csd + ch->o_csd[(size_t)b * ch->NS + i], (size_t)ink_cs_cells(c, b, i) * sizeof(float));
@@ -659,11 +767,14 @@ static int ink2c_forward(Model *m, float *xh, int S, int pos_base, int want_x, f
         }
     }
     if (want_x) { memcpy(xh, xfin, (size_t)S * D * sizeof(float)); free(xfin); }
+    free(dq);
+    vkc_relattn_part(NULL);
     ch->forwards++;
     return 1;
 lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */
     if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(0); }
-    free(xfin);
+    free(xfin); free(dq);
+    vkc_relattn_part(NULL);
     ink2c_recover(m, pos_base);
     return 0;
 }
@@ -673,8 +784,9 @@ static void ink2c_report(Model *m) {
     if (!ch || !ch->ok || !ch->forwards) return;
     VkcStats st; vkc_stats(&st);
     fprintf(stderr, "[VK] inkling2 chain: %llu forwards, %llu frames (%llu ops, %llu matmuls, %llu tiled GEMM), "
-                    "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %.1f MiB on the device\n",
-            ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, st.wait_ms, ch->host_ms, st.dev_bytes / 1048576.0);
+                    "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %llu layer steps' experts in the frame, "
+                    "%.1f MiB on the device\n",
+            ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, st.wait_ms, ch->host_ms, ch->dm_layers, st.dev_bytes / 1048576.0);
     vkc_prof_print();
 }
 
