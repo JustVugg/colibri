@@ -10,6 +10,7 @@ Besides the proxy it answers /agents (ui/agents.py: a coding agent opened in a
 new terminal window, pointed at colibri) and /v1/responses (ui/responses_shim.py:
 the Responses API over the gateway's chat API, for agents that speak only that).
 /web/ is the chat's web search (ui/web.py: SearXNG with --searx, else DuckDuckGo).
+/fs/ is passed to the gateway's file tools (COLI_FILE_TOOLS=1), only from this page.
 /models/ is the Models page (ui/models.py): in this process when the gateway is on
 this machine, else a models service on the engine's machine (--models-backend);
 with neither it answers 404 and the page says the feature is not available.
@@ -213,6 +214,12 @@ class Handler(BaseHTTPRequestHandler):
             responses_shim.serve(self, self.backend)   # Codex: the Responses API over colibri's chat API
         elif path == "/agents" or path.startswith("/agents/"):
             self._agents(path)
+        elif path.startswith("/fs/") and self.command == "POST":
+            # the file tools (the gateway's COLI_FILE_TOOLS): the proxy drops Origin, so this
+            # page's own guard stands in for the gateway's own-page check
+            if not self._local_ok(True):
+                return self._json(403, {"error": {"message": "solo dalla pagina di colibri su questa macchina"}})
+            self._proxy()
         elif path.startswith(PROXIED):
             self._proxy()
         elif path.startswith(MODELS):

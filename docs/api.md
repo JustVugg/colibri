@@ -797,3 +797,35 @@ Word, OpenDocument, PowerPoint, web pages, text) read into the message, web
 search, the expert map, the monitor with each turn's profile, System One
 (`POST /v1/systemone`, see [systemone.md](systemone.md)), the Models page and
 coding agents. What it does and how: [ui/README.md](../ui/README.md).
+
+### File tools
+
+With `./start-here.sh --files 1` (or `coli setup --files 1`, `coli start --files 1`),
+which sets `COLI_FILE_TOOLS=1` for the server that run starts (`--files 0`, the
+default, sets it to 0, so the switch is not kept for the next start), or with
+`COLI_FILE_TOOLS=1` in the environment of `coli serve` or `coli web`,
+`/health` reports `"file_tools": true` and the chat's **+** menu shows a **File**
+switch, on until it is turned off (a chip under the box says it is on). With it on,
+each request offers the model six OpenAI tools: `read_file`, `write_file`,
+`edit_file`, `list_dir`, `change_dir` and `run_command`. `change_dir` moves the
+working folder (at first the home folder), like `cd`, for every later call; it is
+checked to exist and the page keeps it. `edit_file` replaces one exact block
+(`old_text`, which must occur once in the file) with `new_text`, so a change to a
+large file costs only the block. The gateway renders them in the model's own format
+and returns its calls as `tool_calls` ([tool-calling support](#tool-calling-support)),
+so the same page works on every engine that takes tools; Inkling and OLMoE answer
+HTTP 400.
+
+The page runs each call on `POST /fs/<read|write|edit|list|cd|run>`, asks before every
+write, edit and command, shows each call's output folded under its line, sends the
+result back as a `tool` message and streams the next round, up to 25 rounds a turn.
+The calls run as the user who started the gateway: a relative path resolves against
+the working folder, a command runs there for at most 120 s with no input, and nothing
+confines a command to the folder.
+
+`/fs/*` is answered only with the variable set, only from this machine (a loopback
+peer, whatever `--host` binds), only with a JSON body, and only to the gateway's own
+page as `Origin`, whatever `--cors-origin` allows for the API; the Host guard and
+`COLI_API_KEY` apply as on every route. The chat's server (`ui/server.py`) passes
+`/fs/` on only from its own page: its own Host and Origin and the `X-Colibri-UI`
+header a page elsewhere cannot send.

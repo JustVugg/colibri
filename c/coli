@@ -4438,6 +4438,9 @@ def main():
     pset.add_argument("--ctx",type=int,default=None,metavar="TOKENS",
                       help="context the server starts with, kept for `coli start` (0: automatic, "
                       "from the memory there is)")
+    pset.add_argument("--files",type=int,choices=(0,1),default=0,
+                      help="1: the chat may read, write and list files and run commands, "
+                      "for this start only (COLI_FILE_TOOLS); default 0")
     pset.add_argument("--no-start",action="store_true",help="set up, but do not start the server")
     pset.add_argument("--background",action="store_true",
                       help="start the server in the background (log in the setup folder)")
@@ -4453,6 +4456,9 @@ def main():
                       help="machine-readable result; implies --yes and a background start")
     pstart=sub.add_parser("start",help="start what `coli setup` configured")
     pstart.add_argument("--background",action="store_true",help="run in the background")
+    pstart.add_argument("--files",type=int,choices=(0,1),default=0,
+                        help="1: the chat may read, write and list files and run commands, "
+                        "for this start only (COLI_FILE_TOOLS); default 0")
     pstart.add_argument("--no-browser",action="store_true",help="do not open the browser")
     pstart.add_argument("--no-ui",action="store_true",
                         help="the API alone, without the chat UI (the desktop app shows its own)")
