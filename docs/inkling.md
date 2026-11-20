@@ -347,19 +347,18 @@ expert of the model fits on the card:
 
 | Model | CUDA | Vulkan | CPU (6 threads) |
 |---|---|---|---|
-| UD-IQ2_XXS (8.5 GB) | 109.5-114.0, 20.2-20.5 | 51.5-54.2, 45.5-45.7 | 16.3-16.4, 8.4 |
-| UD-Q4_K_XL (17.6 GB) | 107.7-108.2, 18.3-18.6 | 32.2-32.9, 39.2-39.3 | 10.9-11.0, 6.4-6.5 |
-| int4 g64 (18 GB) | 64.4-65.4, 16.0-16.3 | 313.4-326.2, 36.3 | 14.6-14.7, 6.1-6.2 |
+| UD-IQ2_XXS (8.5 GB) | 109.5-114.0, 20.2-20.5 | 275.3-284.0, 46.0-46.2 | 16.3-16.4, 8.4 |
+| UD-Q4_K_XL (17.6 GB) | 107.7-108.2, 18.3-18.6 | 270.1-276.5, 39.2-39.4 | 10.9-11.0, 6.4-6.5 |
+| int4 g64 (18 GB) | 64.4-65.4, 16.0-16.3 | 314.6-327.6, 36.3-36.4 | 14.6-14.7, 6.1-6.2 |
 
 Vulkan runs the dense chain with the loop (`c/inkling2_chain.h`: the passes' own K/V mirrors and
 convolution states on the device, the messages through `chain_ink2`'s mix and the gates through
 `chain_ew`'s `LOOPGATE`), and a decode step is one frame: every layer routes and runs its experts
 on the device (`vk_dmoe.h`; a GGUF's NVFP4 experts with their global scales in the table's entries
 and through the block step decoder), and the attention splits its positions over workgroups. Before
-those three (each its own line of the table's history) the same decode was 19.7-20.3, 14.8-15.2
-and 18.1-18.5 tok/s. The prompt is fast on the container's bf16 matrices (the tiled GEMM) and
-slower on a GGUF: its NVFP4 layers' experts take the host's step there, each row once a rank
-times its expert's scale. CUDA runs the dense matrices a call at a time with the attention on the
+those three the same decode was 19.7-20.3, 14.8-15.2 and 18.1-18.5 tok/s. A prompt's experts are
+the tier's, through its grouped GEMMs (SiTU-GLU on the block formats' too, NVFP4 among their
+types): the GGUFs' prompts read at 51.5-54.2 and 32.2-32.9 tok/s before. CUDA runs the dense matrices a call at a time with the attention on the
 CPU: its chain (`COLI_CUDA_CHAIN`, off by default for Inkling-2) leaves a loop to that path; the
 release's CUDA package carries no inkling engine, so Inkling on an NVIDIA card is Vulkan there. Every answer above was the same: "The train arrives at 17:25.", then a palindrome
 check in Python. A picture (64 x 48, red on the left, blue on the right) with each of the three:

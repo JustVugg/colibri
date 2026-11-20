@@ -33,6 +33,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   24 -> 7.6 ms of a token, `COLI_VK_RELATTN_SPLIT=0` keeps it whole). Inkling-2-Mini on an RTX PRO
   4000 after a 570-token prompt: UD-Q4_K_XL 14.8-15.2 -> 39.2-39.3 tok/s, UD-IQ2_XXS 19.7-20.3 ->
   45.5-45.7, the int4 g64 container 18.1-18.5 -> 36.3.
+- **The Vulkan tier's grouped GEMMs on a GGUF's experts compute SiTU-GLU** (Kimi K3's and
+  Inkling-2's activation; `qmatmul_grp_bd*.comp` read the act, a and b the tier pushed them
+  already) and take NVFP4 (bdstep.glsl's): those prompts took the experts one at a time. Inkling-2-Mini
+  on an RTX PRO 4000, a 570-token prompt: UD-Q4_K_XL 32.2-32.9 -> 270.1-276.5 tok/s, UD-IQ2_XXS
+  51.5-54.2 -> 275.3-284.0.
 
 - **`coli web` opens the chat UI**: it serves the API and starts the chat (`ui/server.py`, the
   page `coli ui` serves) in front of it, on the API's port + 790 (8790 for 8000, `--ui-port`

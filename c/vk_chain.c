@@ -2830,7 +2830,7 @@ int vkc_prewarm(const VkcPrewarm *pw) {
         uint32_t et[16] = {0};
         et[14] = (uint32_t)ta; et[15] = (uint32_t)(ta >> 32);
         ok = ok && vkc_zero(w, 0, 4) && vkc_write(tab, 0, et, sizeof et);
-        struct { int I, O; float limit; int ibase, kgat, rpw; } gp = {0, 1, 0.f, 0, 0, 0};
+        struct { int I, O; float limit; int ibase, kgat, rpw; int act; float a, b; } gp = {0, 1, 0.f, 0, 0, 0, 0, 1.f, 1.f};   /* a prewarm: no rows, any activation */
         VkcBind gb[5] = {B(x, 0), B(w, 0), B(tab, 0), B(hid, 1), B(ids, 0)};
         for (int t = 0; t < 64 && ok; t++)
             for (int v = 0; v < 2 && ok; v++) {
@@ -3167,7 +3167,7 @@ int vkc_moe_rows(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcMoeRows *r
     pc.mode = 1; ok = ok && record(KC.rows, sb, 7, &pc, sizeof pc, 1, 1, 1);
     pc.mode = 2; ok = ok && record(KC.rows, sb, 7, &pc, sizeof pc, gp, 1, 1);
     /* gate+up: the tokens' rows gathered by amap into the packed hidden rows */
-    struct { int I, O; float limit; int ibase, kgat, rpw; } pg = {p->D, p->I, p->limit, 0, p->K, 0};
+    struct { int I, O; float limit; int ibase, kgat, rpw; int act; float a, b; } pg = {p->D, p->I, p->limit, 0, p->K, 0, p->act, p->a, p->b};
     size_t eb0 = (size_t)16 * E * 4;   /* the down pass's table */
     VkcBind gb[5] = {B(x, 0), B(r->items, 0), {r->etab->buf, 0, eb0, 0}, B(r->hid, 1), B(r->amap, 0)};
     r->etab->last_frame = KC.serial;
@@ -3177,7 +3177,7 @@ int vkc_moe_rows(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcMoeRows *r
                pdn = wide ? grpw_pipe(0, p->dfmt - 100) : rows_pipe(0, p->dfmt, !p->floats);
     ok = ok && record_indirect(pgu, gb, 5, &pg, sizeof pg, r->aux, 0);
     /* down: the packed hidden rows into the pairs' rows (amap) */
-    struct { int I, O; float limit; int ibase, kgat, rpw; } pd = {p->I, p->D, 0.f, (int)imax, p->K, 0};
+    struct { int I, O; float limit; int ibase, kgat, rpw; int act; float a, b; } pd = {p->I, p->D, 0.f, (int)imax, p->K, 0, p->act, p->a, p->b};
     VkcBind db[5] = {B(r->hid, 0), B(r->items, 0), {r->etab->buf, eb0, eb0, 0}, B(r->yk, 1), B(r->amap, 0)};
     ok = ok && record_indirect(pdn, db, 5, &pd, sizeof pd, r->aux, 16);
     if (ok) KC.st.grp_coop += wide ? 2 : rows_coop(1, p->gfmt, pgu) + rows_coop(0, p->dfmt, pdn);

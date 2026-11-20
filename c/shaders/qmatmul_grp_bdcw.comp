@@ -34,7 +34,15 @@ layout(std430, binding = 1) readonly buffer IT { uvec4 items[]; };  // (expert, 
 layout(std430, binding = 2) readonly buffer ET { uint etab[]; };    // 16 uints per expert (qmatmul_grp.comp's; [14..15] the table)
 layout(std430, binding = 3) writeonly buffer Y { float y[]; };      // packed output rows
 layout(std430, binding = 4) readonly buffer AM { int amap[]; };     // kgat > 0: qmatmul_grp.comp's
-layout(push_constant) uniform P { int I, O; float limit; int ibase; int kgat; int rpw; } p;
+layout(push_constant) uniform P { int I, O; float limit; int ibase; int kgat; int rpw; int act; float a, b; } p;
+// GATE_UP's activation: act 0 SwiGLU (limit as expert_act.comp's), 1 SiTU-GLU a*tanh(g/a)*sigmoid(g) *
+// b*tanh(u/b) (Kimi K3's, Inkling-2's: chain_moe.comp's formula); the host pushes act, a and b
+float situ_tanh(float v) { return abs(v) < 0.000244140625 ? v : tanh(v); }
+float glu(float g, float u) {
+    if (p.act == 1) return p.a * situ_tanh(g / p.a) * (1.0 / (1.0 + exp(-g))) * (p.b * situ_tanh(u / p.b));
+    if (p.limit > 0.0) { if (g > p.limit) g = p.limit; if (u > p.limit) u = p.limit; if (u < -p.limit) u = -p.limit; }
+    return (g / (1.0 + exp(-g))) * u;
+}
 
 #define TM 64u
 #define NR 128u                // decoded rows an item
@@ -154,8 +162,7 @@ void main() {
         coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> h = acc[2u * m];
         for (int i = 0; i < h.length(); i++) {
             float g = acc[2u * m][i], u = acc[2u * m + 1u][i];
-            if (p.limit > 0.0) { if (g > p.limit) g = p.limit; if (u > p.limit) u = p.limit; if (u < -p.limit) u = -p.limit; }
-            h[i] = (g / (1.0 + exp(-g))) * u;
+            h[i] = glu(g, u);
         }
         if (r0 + 16u <= S && n0 + 16u <= O) {
             coopMatStore(h, y, (xoff + r0) * O + n0, O, gl_CooperativeMatrixLayoutRowMajor);
