@@ -10650,7 +10650,7 @@ class APIHandler(BaseHTTPRequestHandler):
                                       default_effort if enable_thinking else None,
                                       tools, tool_choice,
                                       add_generation_prompt=add_generation_prompt,
-                                      preserve_thinking=not enable_thinking)
+                                      preserve_thinking=preserve_thinking_default(messages, enable_thinking))
         return translated, prompt, tools, enable_thinking, add_generation_prompt, image
 
     def anthropic_generation(self, body, prompt, request_id, tools, enable_thinking,
