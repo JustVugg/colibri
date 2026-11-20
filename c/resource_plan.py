@@ -1989,6 +1989,10 @@ def qwen38_int4_sidecar(info):
     2.01 MB at 3, 1.32 MB vq2, 0.82 MB vq1 on the release), priced the same way: by the
     record its index states, whatever the name, so a format this list does not know yet is
     never priced with the FP8 bytes (a 188-expert cap where RAM held 512, 2026-10-14).
+    A checkpoint whose shards carry no routed experts, the sidecar being their only copy,
+    takes its sparse layers from the index (which states the config's): priced by the
+    shards' layers it had none, a cap of 0 slots, or with the MTP head on one made of the
+    head's record alone (512 slots of 30 GiB on a 25 GiB budget, Qwen3.8 Flash Next on vq2g32).
     """
     resolved = info["resolved_family"]
     lowbit = (os.environ.get("Q38_EXPERT_LOWBIT") or "").strip()
@@ -2012,7 +2016,8 @@ def qwen38_int4_sidecar(info):
     if (any(index.get(key) != value for key, value in want.items()) or
             isinstance(record, bool) or not isinstance(record, int) or record < 1):
         return info
-    per_layer = {layer: record for layer in info["expert_bytes_by_layer"]}
+    layers = info["expert_bytes_by_layer"] or (range(want["layers"]) if isinstance(want["layers"], int) else ())
+    per_layer = {layer: record for layer in layers}
     return dict(info,
                 expert_bytes=record * want["experts"] * len(per_layer),
                 typical_expert_bytes=record, max_expert_bytes=record,

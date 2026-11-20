@@ -1714,6 +1714,28 @@ memInfo.free:                     23.50 GB (97%)
             plan = build_plan(self.model, context=64, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
             self.assertEqual(plan["model"]["per_cap_bytes"], 384)
 
+    def test_qwen38_sidecar_only_checkpoint_prices_every_layer(self):
+        # A checkpoint whose shards carry no routed experts, the sidecar being their only copy:
+        # its layers come from the index. Priced by the shards' layers (none) the cap came out
+        # 0 with the MTP head off, and with the head on it was the head's record alone.
+        self.write_qwen38()
+        write_shard(self.model / "model.safetensors",
+                    [("model.embed_tokens.weight", 256, "BF16", [16, 8]),
+                     ("model.layers.0.mlp.gate.weight", 1024, "BF16", [2, 256])])
+        geometry = {"version": 1, "complete": True, "layers": 2, "experts": 2,
+                    "hidden_size": 8, "moe_intermediate_size": 4, "record_bytes": 53}
+        (self.model / "experts-vq2g32").mkdir()
+        (self.model / "experts-vq2g32" / "index.json").write_text(
+            json.dumps(dict(geometry, format="colibri.qwen38.experts-vq2g32")))
+        with mock.patch.dict(os.environ, {"Q38_EXPERT_LOWBIT": "vq2g32", "Q38_MTP": "0"}):
+            os.environ.pop("Q38_EXPERT_INT4", None)
+            plan = build_plan(self.model, context=64, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+        model = plan["model"]
+        self.assertTrue(model["qwen38_int4_experts"])
+        self.assertEqual((model["per_cap_bytes"], model["expert_bytes"]), (106, 212))
+        self.assertEqual(plan["tiers"]["ram"]["cache_slots_per_layer"], 2)
+        self.assertNotIn("RAM budget cannot hold one expert slot per sparse layer", plan["warnings"])
+
     def test_cli_emits_versioned_json(self):
         cli = Path(__file__).parents[1] / "coli"
         run = subprocess.run([
