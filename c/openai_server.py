@@ -7096,7 +7096,10 @@ def cap_for_arch(arch, cap, env=None, model=None):
         # argv cap turns both off (#2785).
         if planned >= 1 and arch != "olmoe":
             return planned
-    if arch in ("deepseek_v41", "mimo", "qwen36", "qwen38") and model is not None:
+    # Inkling the same: its eight legacy slots read nearly every routed expert of a step
+    # (Inkling-2 routes eight) from the page cache on a model the RAM holds whole (Inkling-2-Mini
+    # at 17.6 GB: 4.3 tok/s of decode on the CPU, 28% of the time in the copies)
+    if arch in ("deepseek_v41", "mimo", "qwen36", "qwen38", "inkling") and model is not None:
         # V4.1, MiMo, Qwen3.6 and Qwen3.8 only read their argv cap, not RAM_GB.
         # Without --auto-tier the legacy eight slots silently discarded both --ram
         # and RAM_GB (#1666), and Qwen3.8's implicit one slot, Qwen3.6's eight, left
@@ -7127,9 +7130,9 @@ def cap_for_arch(arch, cap, env=None, model=None):
         # from the disk at every step: Qwen3.8's implicit cap is 1 and its route
         # 10, and a Windows box whose free RAM made the plan come out empty
         # decoded at 0.03 tok/s while the engine measured room for 99 (#2031).
-        floor = max(limits.implicit_cap, _route_top_k(model)) if arch in ("qwen36", "qwen38") else 1
+        floor = max(limits.implicit_cap, _route_top_k(model)) if arch in ("qwen36", "qwen38", "inkling") else 1
         if slots < floor:
-            if arch in ("qwen36", "qwen38"):
+            if arch in ("qwen36", "qwen38", "inkling"):
                 print(f"[{arch}] RAM plan: {max(slots, 0)} expert cache slots/layer, below one "
                       f"token's route; starting at {floor} (--cap or --ram sets more)", file=sys.stderr)
                 return floor
