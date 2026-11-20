@@ -6170,7 +6170,7 @@ int coli_v4_hybrid_enabled(void) {
     }
     return on;
 }
-/* V4_HOT_SPLIT=1 (opt-in, for a card that holds few experts): VRAM keeps the
+/* V4_HOT_SPLIT (for a card that holds few experts): VRAM keeps the
  * experts decode uses most and the CPU computes the others at the same time.
  * A token's mirrored experts start on the GPU as soon as the layer has routed
  * and are not read from the store; the CPU meanwhile computes the shared
@@ -6179,13 +6179,18 @@ int coli_v4_hybrid_enabled(void) {
  * the layer, at most one expert joins the cache, the most used of those the
  * CPU computed, if it has earned the place (coli_v4_gpu_expert_admit_hot).
  * Needs the shared experts in RAM: the backend runs one job at a time. */
+static int g_v4_hot_split_auto;
+/* V4_HOT_SPLIT unset: what the GPU unit picks at engine open (v4_gpu_place:
+ * on for one HIP card whose dense mirrors, the shared experts with them,
+ * stay in RAM); 0 or 1 decides. */
+void coli_v4_hot_split_auto(int on) { g_v4_hot_split_auto = on; }
 int coli_v4_hot_split_on(void) {
-    static int on = -1;
-    if (on < 0) {
-        const char *setting = getenv("V4_HOT_SPLIT");
-        on = setting && atoi(setting) != 0;
+    static int setting = -2;
+    if (setting == -2) {
+        const char *text = getenv("V4_HOT_SPLIT");
+        setting = text && *text ? atoi(text) != 0 : -1;
     }
-    return on;
+    return setting >= 0 ? setting : g_v4_hot_split_auto;
 }
 #define V4_HOT_MAX_EXPERTS 16
 typedef struct {
@@ -12863,6 +12868,15 @@ static void v4_gpu_place(ColiV4Engine *engine, int device) {
     engine->gpu.dense_ram = budget_mb < (10LL << 10);
     fprintf(stderr, "v4_gpu place device=%d budget=%lldMiB dense=%s\n", device,
             budget_mb, engine->gpu.dense_ram ? "ram" : "card");
+    /* The shared experts stay in RAM with the dense mirrors, so the card can
+     * take the hot experts while the CPU computes the rest (V4_HOT_SPLIT).
+     * A GGUF's experts are not mirrored. */
+    coli_v4_hot_split_auto(engine->gpu.dense_ram &&
+                           !coli_v4_index_gguf(engine->target_index));
+    const char *hot = getenv("V4_HOT_SPLIT");
+    if (coli_v4_hot_split_on() && !(hot && *hot))
+        fprintf(stderr, "v4_gpu hot-split=on (dense in RAM; V4_HOT_SPLIT=0 "
+                        "turns it off)\n");
 }
 #endif
 

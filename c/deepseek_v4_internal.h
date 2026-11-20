@@ -1250,6 +1250,7 @@ int coli_v4_gpu_resident_first(void);
  * unit, read by the serve unit's per-turn stderr line. */
 int coli_v4_hybrid_enabled(void);
 int coli_v4_hot_split_on(void);
+void coli_v4_hot_split_auto(int on);
 void coli_v4_gpu_hot_touch(int layer, const int *ids, int count);
 int coli_v4_gpu_hot_pick(int layer, const int *ids, const int *candidates, int count);
 int coli_v4_gpu_expert_admit_hot(ColiExpertStore *store, ColiExpertView *view);
