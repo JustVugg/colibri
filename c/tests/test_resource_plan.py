@@ -27,6 +27,7 @@ from resource_plan import (
     physical_cpu_count,
     read_ssd_probe,
     ssd_probe_state,
+    team_cpu_count,
 )
 
 
@@ -1094,6 +1095,8 @@ memInfo.free:                     23.50 GB (97%)
             with mock.patch("resource_plan.subprocess.run",
                             return_value=lscpu(blob)), \
                  mock.patch("resource_plan.performance_core_count", return_value=None), \
+                 mock.patch("resource_plan.cgroup_cpu_quota", return_value=None), \
+                 mock.patch("resource_plan.allowed_cpu_count", return_value=None), \
                  mock.patch.object(sys, "platform", "linux"):
                 plan = build_plan(self.model, available_memory=16 * GB,
                                   available_disk=1, gpus=[])
@@ -1103,12 +1106,42 @@ memInfo.free:                     23.50 GB (97%)
         # a hybrid CPU: the team is its performance cores, the physical count stays
         with mock.patch("resource_plan.subprocess.run", return_value=lscpu(layouts["2-col (-p=core,socket)"])), \
              mock.patch("resource_plan.performance_core_count", return_value=4), \
+             mock.patch("resource_plan.cgroup_cpu_quota", return_value=None), \
+             mock.patch("resource_plan.allowed_cpu_count", return_value=None), \
              mock.patch.object(sys, "platform", "linux"):
             plan = build_plan(self.model, available_memory=16 * GB, available_disk=1, gpus=[])
             env = environment_for_plan(plan)
         self.assertEqual((plan["cpu"]["physical_cores"], plan["cpu"]["team_threads"]), (12, 4))
         self.assertEqual(plan["cpu"]["thread_policy"], "performance-cores")
         self.assertEqual(env["OMP_NUM_THREADS"], "4")
+
+    def test_auto_tier_thread_count_stays_within_a_cpu_quota_and_the_affinity_mask(self):
+        # #2914: the launcher's default team sees a container's CPU quota and its
+        # cpuset (team_cpu_count). The plan's team is that default too: 48 cores
+        # under a cpu.max of 7.65 CPUs plan 7 threads, and the count of cores stays
+        # the hardware's.
+        def planned(quota, allowed, **named):
+            with mock.patch("resource_plan.physical_cpu_count", return_value=48), \
+                 mock.patch("resource_plan.performance_core_count", return_value=None), \
+                 mock.patch("resource_plan.cgroup_cpu_quota", return_value=quota), \
+                 mock.patch("resource_plan.allowed_cpu_count", return_value=allowed):
+                plan = build_plan(self.model, available_memory=16 * GB, available_disk=1,
+                                  gpus=[], cpu_sockets=1, **named)
+                return plan["cpu"], environment_for_plan(plan)["OMP_NUM_THREADS"], team_cpu_count()
+        cpu, threads, launcher_default = planned(7.65, None)
+        self.assertEqual((cpu["physical_cores"], cpu["team_threads"], cpu.get("limit_threads")), (48, 7, 7))
+        self.assertEqual((threads, launcher_default), ("7", 7))
+        cpu, threads, launcher_default = planned(None, 8)
+        self.assertEqual((cpu["team_threads"], cpu.get("limit_threads")), (8, 8))
+        self.assertEqual((threads, launcher_default), ("8", 8))
+        # no limit, or one looser than the cores: the block is the one it was, so the
+        # fingerprint of a tuning profile saved on such a machine does not move
+        unlimited = {"physical_cores": 48, "sockets": 1, "team_threads": 48,
+                     "thread_policy": "physical-cores"}
+        for quota, allowed in ((None, None), (64.0, None), (None, 96)):
+            self.assertEqual(planned(quota, allowed)[0], unlimited, (quota, allowed))
+        # a caller that names the cores is not probed, as for the performance cores
+        self.assertEqual(planned(7.65, 8, physical_cpus=48)[0], unlimited)
 
     def test_plan_does_not_set_omp_affinity_vars(self):
         # The real #325 regression: --auto-tier set OMP_PROC_BIND=spread +
@@ -3204,10 +3237,14 @@ class PerformanceCoreCountTest(unittest.TestCase):
     def test_team_falls_back_to_the_physical_cores(self):
         import resource_plan
         with mock.patch("resource_plan.performance_core_count", return_value=None), \
-             mock.patch("resource_plan.physical_cpu_count", return_value=8):
+             mock.patch("resource_plan.physical_cpu_count", return_value=8), \
+             mock.patch("resource_plan.cgroup_cpu_quota", return_value=None), \
+             mock.patch("resource_plan.allowed_cpu_count", return_value=None):
             self.assertEqual(resource_plan.team_cpu_count(), 8)
         with mock.patch("resource_plan.performance_core_count", return_value=6), \
-             mock.patch("resource_plan.physical_cpu_count", return_value=14):
+             mock.patch("resource_plan.physical_cpu_count", return_value=14), \
+             mock.patch("resource_plan.cgroup_cpu_quota", return_value=None), \
+             mock.patch("resource_plan.allowed_cpu_count", return_value=None):
             self.assertEqual(resource_plan.team_cpu_count(), 6)
 
 

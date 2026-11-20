@@ -149,6 +149,14 @@ class AutotuneUnitTest(unittest.TestCase):
                                 {"COLI_NO_OMP_TUNE": "1"}, "kimi")
         self.assertFalse(any(name.startswith("omp-") for name, _ in steps))
 
+    def test_thread_candidates_stay_within_a_cpu_limit(self):
+        # #2914's pod: 48 cores under a CPU quota of 7.65. The launcher's team is 7,
+        # and no candidate asks for more threads than the quota lets run at once.
+        limited = plan(cores=48, gpu=False)
+        limited["cpu"].update(team_threads=7, limit_threads=7)
+        steps = candidate_steps(limited, {"OMP_NUM_THREADS": "7"}, "qwen36")
+        self.assertEqual([name for name, _ in steps if name.startswith("omp-")], ["omp-3"])
+
     def test_resource_candidates_only_shrink_the_safe_expert_cache(self):
         p = plan(cores=16, gpu=False, cold=40 * (1024 ** 3))
         p["tiers"]["ram"] = {

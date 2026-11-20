@@ -186,7 +186,10 @@ def candidate_steps(plan: dict, base_env: dict, arch: str = "glm") -> list[tuple
     replay budget proving it, and report a 0% gain as if it were a measurement
     (#898)."""
     steps = []
-    cores = max(1, int(plan.get("cpu", {}).get("physical_cores", os.cpu_count() or 1)))
+    # limit_threads: fewer threads than the machine has cores may run at once (a
+    # container's CPU quota, the affinity mask), and a larger team is throttled (#2914)
+    cpu = plan.get("cpu", {})
+    cores = max(1, int(cpu.get("limit_threads", cpu.get("physical_cores", os.cpu_count() or 1))))
     current_threads = int(base_env.get("OMP_NUM_THREADS", cores))
     if not base_env.get("COLI_NO_OMP_TUNE"):
         for threads in dict.fromkeys((cores, max(1, cores // 2))):

@@ -3730,8 +3730,11 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                           if (vulkan or {}).get("type") in ("integrated", "cpu")
                           and _vk_dense_active(family_id, env_now, vulkan) else 0)
     # the team a launch defaults to (environment_for_plan): a hybrid CPU's performance
-    # cores, probed only when the caller did not name a count
+    # cores, and no more than a container's CPU quota or the affinity mask lets run at
+    # once (#2914, as team_cpu_count); probed only when the caller did not name a count
     team_cpus = (performance_core_count() if physical_cpus is None else None)
+    cpu_limits = ((cgroup_cpu_quota(), allowed_cpu_count()) if physical_cpus is None
+                  else (None, None))
     physical_cpus = physical_cpu_count() if physical_cpus is None else physical_cpus
     cpu_sockets = cpu_socket_count() if cpu_sockets is None else cpu_sockets
     resolved = info["resolved_family"]
@@ -3968,6 +3971,17 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     probe_state, probe_gbs = ssd_probe_state(info["path"])
     actions = _next_actions(bottleneck_class, projected_hit, probe_state,
                             probe_gbs, planning_gpus)
+    cpu = {"physical_cores": _resolve_physical_cores(physical_cpus),
+           "sockets": max(1, int(cpu_sockets)),
+           "team_threads": bound_team(_resolve_physical_cores(team_cpus or physical_cpus),
+                                      *cpu_limits),
+           "thread_policy": "performance-cores" if team_cpus else "physical-cores"}
+    # The most threads those limits let run at once, for a tuning sweep to stay within.
+    # Named only when that is fewer than the cores: a machine without limits keeps the
+    # block it had, and with it the fingerprint of its tuning profiles, which hashes it.
+    limit_threads = bound_team(cpu["physical_cores"], *cpu_limits)
+    if limit_threads < cpu["physical_cores"]:
+        cpu["limit_threads"] = limit_threads
 
     return {
         "version": 2,
@@ -3978,10 +3992,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                   "family_id": resolved.descriptor.id,
                   "model_type": resolved.model_type,
                   "configured_experts": configured_experts},
-        "cpu": {"physical_cores": _resolve_physical_cores(physical_cpus),
-                 "sockets": max(1, int(cpu_sockets)),
-                 "team_threads": _resolve_physical_cores(team_cpus or physical_cpus),
-                 "thread_policy": "performance-cores" if team_cpus else "physical-cores"},
+        "cpu": cpu,
         "memory": {"unified": unified, "available_bytes": available_memory},
         # the Vulkan device a COLI_VULKAN=1 run opens (its expert tier and dense chain
         # size themselves from its free memory at start)

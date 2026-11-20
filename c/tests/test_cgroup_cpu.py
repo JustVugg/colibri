@@ -8,8 +8,12 @@ use. Every kernel input is a file under a temporary directory, as in
 test_cgroup_memory.py; the expectations come from the fixture numbers.
 """
 
+import contextlib
 import importlib.util
+import io
+import json
 import os
+import struct
 import sys
 import tempfile
 import types
@@ -206,6 +210,61 @@ class LauncherTeamTest(unittest.TestCase):
              mock.patch("resource_plan.cgroup_cpu_quota", return_value=7.65):
             env = self.coli.env_for_engine(self.args(), "qwen36")
         self.assertEqual(env.get("OMP_NUM_THREADS"), "24")
+
+    def test_a_profile_measured_without_limits_stays_out_of_a_quota_container(self):
+        """--auto-tier lays a measured profile over the default team. A profile's
+        fingerprint hashes the plan's cpu block: one measured on the bare host (24
+        threads of 48 cores) is found again there, and not in the pod of #2914."""
+        import autotune
+        with tempfile.TemporaryDirectory() as tmp:
+            model = Path(tmp) / "model"       # the smallest model build_plan reads
+            model.mkdir()
+            (model / "config.json").write_text(json.dumps({
+                "model_type": "glm_moe_dsa", "num_hidden_layers": 2, "n_routed_experts": 2,
+                "kv_lora_rank": 4, "qk_rope_head_dim": 2, "qk_nope_head_dim": 3,
+                "v_head_dim": 5, "num_attention_heads": 2}), encoding="utf-8")
+            header, end = {}, 0
+            for name, size in (("model.embed_tokens.weight", 100),
+                               ("model.layers.0.self_attn.q_a_proj.weight", 200),
+                               ("model.layers.1.mlp.experts.0.gate_proj.weight", 30),
+                               ("model.layers.1.mlp.experts.0.up_proj.weight", 30)):
+                header[name] = {"dtype": "U8", "shape": [size], "data_offsets": [end, end + size]}
+                end += size
+            raw = json.dumps(header).encode()
+            (model / "model.safetensors").write_bytes(struct.pack("<Q", len(raw)) + raw + bytes(end))
+            engine = Path(tmp) / "engine"
+            engine.write_bytes(b"engine")
+            args = types.SimpleNamespace(model=str(model), ram=None, ctx=None, ngen=None,
+                                         temp=None, cap=None, auto_tier=True)
+
+            def launch(quota, save=None, **environ):
+                """The engine's team under `quota`, and whether a profile was applied;
+                `save` is a profile's winner, saved for that machine before the launch."""
+                log = io.StringIO()
+                with mock.patch("resource_plan.performance_core_count", return_value=None), \
+                     mock.patch("resource_plan.physical_cpu_count", return_value=48), \
+                     mock.patch("resource_plan.cgroup_cpu_quota", return_value=quota), \
+                     mock.patch("resource_plan.allowed_cpu_count", return_value=None), \
+                     mock.patch.object(self.coli, "engine_for", return_value=str(engine)), \
+                     mock.patch.object(self.coli, "plan_cuda_enabled", return_value=False), \
+                     contextlib.redirect_stderr(log):
+                    plan = resource_plan.build_plan(model, available_memory=16 * resource_plan.GB,
+                                                    available_disk=1, gpus=[], cpu_sockets=1)
+                    with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": tmp, "LOCALAPPDATA": tmp,
+                                                      **environ}, clear=True):
+                        if save:
+                            autotune.save_profile({
+                                "schema_version": autotune.SCHEMA_VERSION, "accepted": True,
+                                "gain": 0.10, "winner": {"env": save},
+                                "fingerprint": autotune.machine_fingerprint(plan, str(model),
+                                                                            str(engine))})
+                        env = self.coli.env_for_engine(args, "qwen36", plan=plan)
+                return env.get("OMP_NUM_THREADS"), "applied measured profile" in log.getvalue()
+
+            self.assertEqual(launch(None, save={"OMP_NUM_THREADS": "24"}), ("24", True))
+            self.assertEqual(launch(None), ("24", True))        # found again on the bare host
+            self.assertEqual(launch(7.65), ("7", False))        # and not in the pod
+            self.assertEqual(launch(7.65, OMP_NUM_THREADS="24"), ("24", False))  # asked for by name
 
 
 if __name__ == "__main__":
