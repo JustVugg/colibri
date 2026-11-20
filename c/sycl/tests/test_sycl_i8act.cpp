@@ -1,7 +1,7 @@
 /* coli_cuda_matmul_i8act (Qwen3.8's Q38_TRUNK_GPU_I8): a resident fmt=1 tensor (int8 rows, a float scale a row) times
  * int8 activations quantized on the host with a scale a row must give, byte for byte, the CPU's matmul_q_idot:
- * y[s][o] = ((float)dot_int32 * scale[o]) * sx[s]. Shapes of the Qwen3.8 trunk (2560 in, 8192/2560/12288 out) and odd
- * ones; 1 to 8 activation rows; extreme values (+-127 weights, -128..127 activations) to reach the int32 range; a
+ * y[s][o] = ((float)dot_int32 * scale[o]) * sx[s]. Shapes of the Qwen3.8 trunk (2560 in, 8192/2560/12288 out), its
+ * lm-head (248 320 out) and odd ones; 1 to 8 activation rows; extreme values (+-127 weights, -128..127 activations) to reach the int32 range; a
  * refused call for a non-int8 tensor and for I not a multiple of 4. */
 #include "../../backend_cuda.h"
 #include "sycl_test_args.h"
@@ -61,6 +61,8 @@ int main(int argc, char **argv) {
     shape(dev[0], 132, 37, 3, false);       /* odd output count */
     shape(dev[0], 2560, 257, 1, true);      /* extreme values */
     shape(dev[0], 131068, 4, 1, true);      /* near the int32 limit of a row */
+    shape(dev[0], 2560, 248320, 1, false);  /* the lm-head (vocabulary 248 320) at one row */
+    shape(dev[0], 2560, 248320, 4, false);  /* and at four rows (four conversations) */
     {   /* refusals */
         std::vector<float> wf(64 * 128, 0.f), scf(64, 1.f), yy(64);
         std::vector<int8_t> xq(130, 1); std::vector<float> sx(1, 1.f);

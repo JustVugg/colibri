@@ -3753,6 +3753,20 @@ int main(int argc, char **argv) {
      * about a million expf a token at one row -- on the OpenMP threads (Q38_HC_PAR=1: every element's operations
      * unchanged; 4.45 billion elements compared with the one-thread loops, 0 differ; one card 19.27 / 24.87 / 30.96 ->
      * 20.62 / 28.02 / 37.06 tok/s at 1 / 2 / 4 at once, two cards 20.98 / 24.56 / 33.42 -> 23.02 / 29.03 / 41.28).
+     * And the lm-head -- 248 320 rows, one product a token after the last layer, while the cards wait -- on the first
+     * card this process opens, with the CPU's bits: Q38_TRUNK_GPU=1 offers the trunk to the tier's placer,
+     * COLI_PLACE=lmhead=<that card>,experts=all places the lm-head alone there and keeps the experts on every card
+     * (the card from COLI_GPUS, else COLI_GPU, as the tier reads them, else 0: a card the placement names is opened
+     * too, so it must be one of the selected), and Q38_TRUNK_GPU_I8=1 -- a default of its own, for any trunk matrix
+     * on a card, the lm-head's or one placed by hand -- answers through qt_dense_matmul_i8act (the activation
+     * quantized as the CPU does, exact int32 dots, the CPU's final expression; byte-identical to the CPU's formula at
+     * the lm-head's shape). lm-head 2.59 -> 0.99 ms a token; two cards 23.12 / 28.51 / 40.92 -> 23.82 / 28.95 / 41.76
+     * tok/s, the same texts and NLL. Q38_TRUNK_GPU and COLI_PLACE are a group: both or neither, neither when one is
+     * set by hand (Q38_TRUNK_GPU=0 alone: the lm-head on the CPU), and neither where the placed lm-head would not
+     * give the CPU's bits or would override a choice: a BF16 trunk asked for (Q38_TRUNK_CPU_INT8=0: the placement
+     * quantizes what it places), Q38_TRUNK_GPU_I8 set to other than 1, a COLI_CUDA_CHAIN the chain reads as on (any
+     * value starting with 1: the placed lm-head would give the chain a card, and the chain computes in float), or
+     * layer homes (QT_HOME: read only by the automatic placement, which a hand-written COLI_PLACE turns off).
      * Only (1) where q38_tier_start will start the FP8 tier (q38_tier_takes_fp8), (2) where the backend
      * says every card this process will open is one it was measured on (coli_cuda_tuned_default "Q38_SYCL_HYBRID",
      * read from the listed devices before any is opened: on any other card the CPU-order kernels may not run -- they
@@ -3775,8 +3789,33 @@ int main(int argc, char **argv) {
                 {"Q38_PREFILL_GPU", "1"},              {"Q38_PREFILL_GPU_BALANCE", "1"},
                 {"Q38_PREFILL_GPU_PERCARD", "1"},      {"Q38_HC_PAR", "1"},
             };
-            char got[768];
-            if (coli_platform_defaults_apply(q38_sycl, (int)(sizeof q38_sycl / sizeof q38_sycl[0]), got, sizeof got))
+            /* Q38_TRUNK_GPU_I8=1 first, on its own; then the lm-head on the first selected card, a group placed only
+             * where Q38_TRUNK_GPU_I8 is then exactly 1 (and not under the comment's other conditions above), before the
+             * table (whose Q38_TRUNK_GPU=0 fills in only where the group did not apply) */
+            static const ColiDefaultKV q38_i8[] = { {"Q38_TRUNK_GPU_I8", "1"} };
+            char got[768], rest[640], i8got[64];
+            int nset = coli_platform_defaults_apply(q38_i8, 1, i8got, sizeof i8got);
+            const char *ci8 = getenv("Q38_TRUNK_CPU_INT8"), *ti8 = getenv("Q38_TRUNK_GPU_I8"), *home = getenv("QT_HOME");
+            int lm_ok = !(ci8 && !strcmp(ci8, "0")) && ti8 && !strcmp(ti8, "1") && !(chain && *chain == '1') &&
+                        !(home && *home);
+            const char *gl = getenv("COLI_GPUS");
+            if (!gl || !*gl) gl = getenv("COLI_GPU");
+            int lm_dev = 0;
+            if (gl && *gl) {   /* the tier's first strtok(",") token, through atoi */
+                while (*gl == ',') gl++;
+                if (*gl) lm_dev = atoi(gl); else lm_ok = 0;
+            }
+            char lm_place[48];
+            snprintf(lm_place, sizeof lm_place, "lmhead=%d,experts=all", lm_dev);
+            const ColiDefaultKV q38_lmhead[] = { {"Q38_TRUNK_GPU", "1"}, {"COLI_PLACE", lm_place} };
+            got[0] = 0;
+            if (lm_ok)
+                nset += coli_platform_defaults_apply_group(q38_lmhead, (int)(sizeof q38_lmhead / sizeof q38_lmhead[0]),
+                                                           got, sizeof got);
+            nset += coli_platform_defaults_apply(q38_sycl, (int)(sizeof q38_sycl / sizeof q38_sycl[0]), rest, sizeof rest);
+            if (i8got[0]) { size_t l = strlen(got); snprintf(got + l, sizeof got - l, "%s%s", l ? " " : "", i8got); }
+            if (rest[0]) { size_t l = strlen(got); snprintf(got + l, sizeof got - l, "%s%s", l ? " " : "", rest); }
+            if (nset)
                 fprintf(stderr, "[qwen38] SYCL defaults for the switches left unset (the qualified hybrid with the accepted "
                                 "kernels, measured on these cards; COLI_PLATFORM_DEFAULTS=0 keeps the code's own): %s\n", got);
         }
