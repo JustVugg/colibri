@@ -265,7 +265,8 @@ static int wex_cuda_nr2_decode(const WexEntry *entry,const unsigned char *record
     if(wex_entry_raw_sizes(entry,&raw,&aligned)) return -1;
     int device=-1;
     if(cudaGetDevice(&device)!=cudaSuccess) { (void)cudaGetLastError(); return 1; }
-    if(!workspace.ensure((size_t)aligned,(size_t)plan.streams+1u,4u) || !workspace.ensure_nr2()) {
+    /* a device destination (commit) never copies back: no page-locked host_raw */
+    if(!workspace.ensure((size_t)aligned,(size_t)plan.streams+1u,4u,commit==nullptr) || !workspace.ensure_nr2()) {
         (void)cudaGetLastError(); return 1;
     }
     WexCudaNr2Tables tables;
@@ -345,10 +346,10 @@ WEX_CUDA_EXPORT int wex_cuda_decode_to_host(const WexEntry *entry,
     WexCudaWorkspace &workspace=lease.w->workspace;
     size_t tiles=((size_t)entry->scale_bytes+255u)/256u;
     size_t lut_bytes=(size_t)view.classes*(view.scale_only?1u:17u)*WEX_CUDA_NR_LUT_SLOTS*4u;
-    if(!workspace.ensure((size_t)aligned,tiles,lut_bytes)) return 1;
+    if(!workspace.ensure((size_t)aligned,tiles,lut_bytes)) { (void)cudaGetLastError(); return 1; }
     if(wex_cuda_neural_tile_offsets(&view,entry->scale_bytes,workspace.host_offsets,tiles)) return -1;
     WexCudaWaitOnExit guard{workspace.stream};
-#define RUN_OK(call) do { if((call)!=cudaSuccess) return 1; } while(0)
+#define RUN_OK(call) do { if((call)!=cudaSuccess) { (void)cudaGetLastError(); return 1; } } while(0)
     /* The caller retains its slab until the stream is synchronized below.
      * CUDA can consume an already-registered cache slab directly, or stage a
      * pageable slab itself. Do not pin it here: the engine owns its lifetime.
@@ -433,7 +434,7 @@ WEX_CUDA_EXPORT int wex_cuda_decode_to_device(const WexEntry *entry,
     WexCudaWorkspace &workspace=lease.w->workspace;
     size_t tiles=((size_t)entry->scale_bytes+255u)/256u;
     size_t lut_bytes=(size_t)view.classes*(view.scale_only?1u:17u)*WEX_CUDA_NR_LUT_SLOTS*4u;
-    if(!workspace.ensure((size_t)aligned,tiles,lut_bytes)) return 1;
+    if(!workspace.ensure((size_t)aligned,tiles,lut_bytes,false)) { (void)cudaGetLastError(); return 1; }
     if(wex_cuda_neural_tile_offsets(&view,entry->scale_bytes,workspace.host_offsets,tiles)) return -1;
     WexCudaWaitOnExit guard{workspace.stream};
 #define RUN_OK(call) do { if((call)!=cudaSuccess) { (void)cudaGetLastError(); return 1; } } while(0)
@@ -648,6 +649,7 @@ static int wex_cuda_batch(int n,const WexEntry *const *entries,const unsigned ch
         for(int r=0;r<used;r++) if(status[round[r]]==-2) status[round[r]]=copied ? 0 : 1;
         synced=copied;
     }
+    if(broken_at<n) drain(lanes);   /* the lane whose queue() failed may still hold copies and kernels */
     finish(1);   /* not queued: a CUDA failure stopped the call first */
     return failures();
 }
