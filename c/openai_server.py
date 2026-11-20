@@ -634,6 +634,21 @@ def _tool_function(tool):
     return fn if isinstance(fn, dict) else {}
 
 
+def _forced_tools(tools, tool_choice):
+    """(tools, name) for a dict `tool_choice` that forces one function: the tools narrowed to
+    that function, as GLM-5.2 and DeepSeek V4 render them; (tools, None) otherwise. A renderer
+    that also has prose around its tool block names the function with forced_tool_instruction."""
+    forced = _tool_choice_name(tool_choice) if isinstance(tool_choice, dict) else None
+    if forced:
+        tools = [t for t in (tools or []) if _tool_function(t).get("name") == forced]
+    return tools, forced
+
+
+def forced_tool_instruction(name):
+    """The line DeepSeek V4 puts after its tool block when `tool_choice` names a function."""
+    return f"\n\nYou must call the function `{name}`. Do not answer directly."
+
+
 def _tool_param_order(tools):
     """name -> ordered param names (required first) from the request schema, for de-mangling."""
     out = {}
@@ -2220,6 +2235,7 @@ def render_chat_qwen(messages, enable_thinking=False, reasoning_effort=None, too
         tools = None
     if tools is not None and not isinstance(tools, list):
         raise APIError(400, "`tools` must be an array.", "tools")
+    tools, forced = _forced_tools(tools, tool_choice)
     # The template's last_query_index: the last user turn that is a real query and not a
     # tool result riding in as one. An assistant turn after it keeps its <think> block
     # with or without preserve_thinking. With no query at all the template raises; here
@@ -2247,7 +2263,9 @@ def render_chat_qwen(messages, enable_thinking=False, reasoning_effort=None, too
         start = 1
     if tools:
         block = _qwen_tool_block(tools)
-        if tool_choice == "required":
+        if forced:
+            block += forced_tool_instruction(forced)
+        elif tool_choice == "required":
             block += TOOL_CHOICE_REQUIRED_INSTRUCTION
         if system_text:
             block += "\n\n" + system_text
@@ -3454,13 +3472,16 @@ def render_chat_mimo(messages, enable_thinking=True, reasoning_effort=None, tool
         tools = None
     if tools is not None and not isinstance(tools, list):
         raise APIError(400, "`tools` must be an array.", "tools")
+    tools, forced = _forced_tools(tools, tool_choice)
     parts = []
     if tools:
         tools_text = _mimo_tools(tools)
         # In the tool turn, after </tools> and before its <|im_end|>: "the functions
         # above" has to be true, and MiMo's declaration block is a whole system turn
         # of its own, so there is nothing to put the line outside of but the frame.
-        if tool_choice == "required":
+        if forced:
+            tools_text += forced_tool_instruction(forced)
+        elif tool_choice == "required":
             tools_text += TOOL_CHOICE_REQUIRED_INSTRUCTION
         parts.append(f"<|im_start|>system\n{tools_text}<|im_end|>")
     last = len(messages) - 1
@@ -3596,6 +3617,7 @@ def render_chat_qwen38(messages, enable_thinking=True, reasoning_effort=None, to
         tools = None                              # the client forbade them: do not offer any
     if tools is not None and not isinstance(tools, list):
         raise APIError(400, "`tools` must be an array.", "tools")
+    tools, forced = _forced_tools(tools, tool_choice)
 
     instruction = ""
     if enable_thinking:
@@ -3634,7 +3656,9 @@ def render_chat_qwen38(messages, enable_thinking=True, reasoning_effort=None, to
         # text last -- not the other way round.
         head = (instruction + "\n\n") if instruction else ""
         block = head + _qwen_tool_block(tools)
-        if tool_choice == "required":
+        if forced:
+            block += forced_tool_instruction(forced)
+        elif tool_choice == "required":
             block += TOOL_CHOICE_REQUIRED_INSTRUCTION
         if system_text:
             block += "\n\n" + system_text
@@ -4630,7 +4654,9 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
         # Fuori dal blocco, non dentro: il blocco e' confrontato byte a byte con
         # jinja2 (glm53_chat_template_harness.py) e l'istruzione non c'e' nel
         # template, quindi va dopo -- come fa render_chat per GLM-5.2.
-        if tool_choice == "required":
+        if forced:
+            prompt.append(forced_tool_instruction(forced))
+        elif tool_choice == "required":
             prompt.append(TOOL_CHOICE_REQUIRED_INSTRUCTION)
 
     for index, message in enumerate(messages):
@@ -4942,6 +4968,11 @@ def render_chat_mistral_large4(messages, enable_thinking=True, reasoning_effort=
         elif kind == "json_object":
             schema = {"anyOf": [{"type": "object"}, {"type": "array"}]}
     settings = ([f'"json_schema": {_ml4_json(schema)}'] if schema is not None else []) + [f'"reasoning_effort": "{effort}"']
+    # As every other renderer: "none" offers no tools (generation() does not parse calls then, so
+    # a declared tool would come back as raw [TOOL_CALLS] text), a forced function only itself.
+    if tool_choice == "none":
+        tools = None
+    tools, _ = _forced_tools(tools, tool_choice)
     preamble = (f"[AVAILABLE_TOOLS]{_ml4_json(tools)}[/AVAILABLE_TOOLS]" if tools else "") + \
         "[MODEL_SETTINGS]{" + ", ".join(settings) + "}[/MODEL_SETTINGS]"
     turns = _ml4_merge(messages)
