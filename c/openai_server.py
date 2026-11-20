@@ -135,6 +135,12 @@ def _with_engine_reason(fault, message):
                     fault.param, fault.code, fault.error_type)
 
 
+class EngineReportedError(RuntimeError):
+    """An engine ERROR frame with no more specific meaning: the engine's own account of why the
+    turn ended. A committed OpenAI stream ends with an error chunk for it (APIHandler._fail),
+    unlike the gateway's own faults after the 200 (a pipe that broke), which still just close."""
+
+
 def _engine_error(fields, message):
     """Turn an engine ERROR frame into the right exception type.
 
@@ -183,7 +189,7 @@ def _engine_error(fields, message):
         except ValueError:
             error.context = None
         return error
-    return RuntimeError(message)
+    return EngineReportedError(message)
 
 
 class GenerationScheduler:
@@ -8578,6 +8584,8 @@ def engine_alive(engine):
 TEXT_ENDPOINTS = ("/v1/chat/completions", "/v1/completions", "/v1/messages",
                   "/v1/messages/count_tokens", "/v1/systemone")
 ANTHROPIC_ENDPOINTS = ("/v1/messages", "/v1/messages/count_tokens")
+# streamed OpenAI responses whose failure after the 200 ends with an error chunk (_fail)
+OPENAI_STREAM_ENDPOINTS = ("/v1/chat/completions", "/v1/completions")
 # Anthropic's error `type` follows the HTTP status; any other 5xx is api_error.
 ANTHROPIC_ERROR_TYPES = {400: "invalid_request_error", 401: "authentication_error",
                          403: "permission_error", 404: "not_found_error",
@@ -8953,6 +8961,7 @@ class APIHandler(BaseHTTPRequestHandler):
         Draining once at the request boundary covers every such path, present and future,
         instead of asking each early return to remember."""
         self._committed = False
+        self._event_stream = False
         self._body_read = False
         # Fresh budget per request: a keep-alive connection may serve many, and
         # each is entitled to its own read window -- but none may drip forever.
@@ -8990,6 +8999,12 @@ class APIHandler(BaseHTTPRequestHandler):
             # writes in the streaming path, which is where Ctrl-C lands.
             self.close_connection = True
             return
+
+    def send_header(self, keyword, value):
+        """Notes an SSE response, so _fail knows the body it would end is an event stream."""
+        if keyword.lower() == "content-type" and str(value).startswith("text/event-stream"):
+            self._event_stream = True
+        super().send_header(keyword, value)
 
     def send_response(self, code, message=None):
         """Single choke point for "the status line is out". Overriding here rather than
@@ -9348,7 +9363,8 @@ class APIHandler(BaseHTTPRequestHandler):
             self.log_error("request failed: %s", error)
             try:
                 self._fail(APIError(500, "The colibri engine failed to process the request.",
-                                    None, "engine_error", "server_error"), request_id)
+                                    None, "engine_error", "server_error"), request_id,
+                           tell_stream=isinstance(error, EngineReportedError))
             except OSError:
                 pass
 
@@ -9990,19 +10006,31 @@ class APIHandler(BaseHTTPRequestHandler):
         event("image_generation.completed", self._image_payload(result, created))
         write(b"data: [DONE]\n\n")
 
-    def _fail(self, error, request_id):
+    def _fail(self, error, request_id, tell_stream=True):
         """Report an error, unless the response is already on the wire. Once a streaming 200
         is committed, a second status line would be framed as SSE body -- clients saw a whole
         `HTTP/1.1 500` spliced into the event stream. All we can still do is stop talking; the
-        stream ends at the close, which the 200 already announced (#597 item 3)."""
+        stream ends at the close, which the 200 already announced (#597 item 3).
+
+        Except for saying why: Anthropic's stream has an `error` event, and an OpenAI stream
+        (chat/completions, completions) ends with a `data:` chunk carrying the error object,
+        which the OpenAI SDKs raise and the chat page shows. No `[DONE]` follows, so the
+        reply is never taken as complete: an APIError (a GPU failure mid-reply, an engine ERROR
+        frame) or another ERROR frame of the engine's (tell_stream). A fault of the gateway's own
+        after the 200 (an engine pipe that broke while the stream ran) still only closes, as the
+        #597 tests require."""
         if self._committed:
             self.close_connection = True
-            if urlsplit(self.path).path in ANTHROPIC_ENDPOINTS:
-                # Anthropic's stream has an `error` event for this: say why before the
-                # close, instead of a silent truncation.
+            path = urlsplit(self.path).path
+            frame = None
+            if path in ANTHROPIC_ENDPOINTS:
+                frame = "event: error\ndata: %s\n\n"
+            elif tell_stream and path in OPENAI_STREAM_ENDPOINTS and getattr(self, "_event_stream", False):
+                frame = "data: %s\n\n"
+            if frame:
                 data = json.dumps(self.error_body(error), ensure_ascii=False)
                 try:
-                    self.wfile.write(f"event: error\ndata: {data}\n\n".encode())
+                    self.wfile.write((frame % data).encode())
                     self.wfile.flush()
                 except OSError:
                     pass

@@ -1447,6 +1447,8 @@ async function generate(cont){
       for(const f of frames){const dls=f.split(/\r?\n/).filter(l=>l.startsWith('data:')).map(l=>l.slice(l.startsWith('data: ')?6:5));
         if(!dls.length)continue;const d=dls.join('\n').trim();if(d==='[DONE]'){ended=true;break}if(!d)continue;
         let ev;try{ev=JSON.parse(d)}catch(_){continue}
+        /* the gateway's error after the 200 (a GPU failure mid-reply, any engine error): the reply ends as an error, never as complete */
+        if(ev.error)throw new Error(ev.error.message||ev.error.code||JSON.stringify(ev.error));
         if(ev.compaction)a.compaction=ev.compaction;if(ev.usage)usage=ev.usage;
         const ch=ev.choices&&ev.choices[0];if(!ch)continue;const dl=ch.delta||{};
         if(dl.tool_calls)for(const tc of dl.tool_calls){const i=tc.index??calls.length,c=calls[i]||(calls[i]={id:'',name:'',args:''});if(tc.id)c.id=tc.id;if(tc.function?.name)c.name+=tc.function.name;if(tc.function?.arguments)c.args+=tc.function.arguments}

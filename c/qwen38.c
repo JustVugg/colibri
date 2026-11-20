@@ -2737,6 +2737,27 @@ static void q38_psd_flush(Model *m){
     if(pthread_create(&g_q38_psd_th,NULL,q38_psd_write,j))q38_psd_write(j);   /* no thread: here */
     else g_q38_psd_busy=1;
 }
+/* A serve's Metal chain lost its state (q38_chain_lost_end): every checkpoint of this identity on
+ * disk goes with the store's RAM, written by this run or an earlier one, and the marks not yet
+ * written, so no later request starts from a state the GPU computed. Called after q38_psd_join. */
+static void q38_psd_purge(void){
+    for(int i=0;i<g_q38_psd_n;i++)free(g_q38_psd_ids[i]);
+    g_q38_psd_n=0;
+    if(!g_q38_psd_dir[0]||g_q38_psd_dir[0]=='-')return;   /* never worked out, or none: nothing on disk */
+    char want[32],path[1200];
+    const int wl=snprintf(want,sizeof want,"q38_%016llx_",(unsigned long long)g_q38_psd_id);
+    DIR *d=opendir(g_q38_psd_dir);
+    if(!d)return;
+    struct dirent *de; struct stat st; int gone=0;
+    while((de=readdir(d))){
+        if(!q38_psd_ours(de->d_name)||strncmp(de->d_name,want,(size_t)wl))continue;
+        snprintf(path,sizeof path,"%s/%s",g_q38_psd_dir,de->d_name);
+        if(lstat(path,&st)||!S_ISREG(st.st_mode))continue;
+        if(!remove(path))gone++;
+    }
+    closedir(d);
+    if(gone)fprintf(stderr,"[PREFIX] disk: %d checkpoint file(s) removed (the GPU's state was lost)\n",gone);
+}
 /* The deepest file of this identity that ids[0, np) starts with, floor < P < np and P within the
  * context: its P (its path in out), 0 none. Reads the heads and ids only; every file the prompt
  * starts with gets this request's age (g_q38_psd_now). */
@@ -3008,7 +3029,7 @@ static void q38_prefix_miss_log(Model *m,const int *ids,int np){
  * is off (q38m_forward freed it and put the CPU's expert cache back), and every state that came
  * from the GPU goes, so the next request reads its whole prompt on the CPU: the recurrent state
  * and the K/V rows (reset_recurrent, kv_len), the prompt-end snapshot, a parked conversation and
- * the prefix store's prompts in RAM (the pins go with the live state's record, which no longer
+ * the prefix store's prompts in RAM and on disk (the pins go with the live state's record, which no longer
  * holds their tokens). Then the request's ERROR. 0 when the chain did not fail. */
 static int q38_chain_lost_end(Model *m,const char *id){
     if(!q38_chain_lost())return 0;
@@ -3021,8 +3042,9 @@ static int q38_chain_lost_end(Model *m,const char *id){
         q38_prefix_cache_dispose(&g_q38_park.snap);memset(&g_q38_park.snap,0,sizeof g_q38_park.snap);
         q38_park_free_rows();
     }
-    q38_psd_join();   /* a disk write in flight holds copies, not the store's entries */
+    q38_psd_join();   /* a disk write in flight holds copies, not the store's entries: it ends first */
     coli_ps_clear(&g_q38_ps);
+    q38_psd_purge();   /* and the store's checkpoints on disk (Q38_PREFIX_DISK=1) */
     coli_serve_write_error(stdout,id,"GPU_FAILED the GPU path failed; the conversation will be re-read on the CPU");
     fflush(stdout);
     return 1;

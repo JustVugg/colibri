@@ -637,6 +637,14 @@ fi
 mkdir -p "$tmp/tok"
 for f in qwen38_tiny/*; do ln -s "$PWD/$f" "$tmp/tok/"; done
 "${PYTHON:-python3}" tools/make_edge_tiny_tokenizer.py --vocab-size 64 "$tmp/tok" >/dev/null
+# serve gpu error, the store's files on disk: a lost GPU state removes them (the one Metal case of the disk suite)
+if QWEN38_TINY="$tmp/tok" "${PYTHON:-python3}" -W ignore -m unittest \
+        tests.test_qwen38_prefix_disk.Qwen38PrefixDiskTest.test_a_lost_gpu_state_removes_the_files > "$tmp/psd_lost.log" 2>&1 \
+        && ! grep -q "skipped" "$tmp/psd_lost.log"; then
+    echo "ok   [serve gpu error, files on disk] removed"
+else
+    echo "FAIL [serve gpu error, files on disk]"; grep -E '^(FAIL|ERROR)|Error|skipped' "$tmp/psd_lost.log" | head -5; fail=1
+fi
 for t in test_qwen38_prefix_serve test_qwen38_prefix_store; do
     if QWEN38_TINY="$tmp/tok" "${PYTHON:-python3}" -W ignore tests/$t.py > "$tmp/$t.log" 2>&1; then
         echo "ok   [$t on the chain] $(grep '^Ran' "$tmp/$t.log")"

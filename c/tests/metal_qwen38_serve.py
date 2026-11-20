@@ -359,7 +359,7 @@ def gpu_error(fixture):
     finally:
         cpu.close()
     ok = err1 is not None and "GPU_FAILED" in err1 and data1 == b"" and frame1.get("chain") == "0" \
-        and "at%20position%200%20" in frame1.get("reason", "") and alive and err2 is None \
+        and "at%20position%20256%20" in frame1.get("reason", "") and alive and err2 is None \
         and got == want and steps == want_steps and len(steps) == 8 and log.count(OFF) == 1
     say(ok, "serve gpu error in a prompt", "%s, %d bytes before it, reason %s; turn 2 %s, %d steps %s"
         % (err1, len(data1), frame1.get("reason"), "the CPU's" if got == want else "%r vs %r" % (got, want),

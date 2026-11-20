@@ -1328,7 +1328,8 @@ fail:
     int lost = 0;
     {
         char why[192];
-        snprintf(why, sizeof why, "%s of layer %d at position %d did not run on the GPU", what ? what : "a step", failed_layer, pos_base);
+        snprintf(why, sizeof why, "%s of layer %d at position %d did not run on the GPU", what ? what : "a step", failed_layer,
+                 pos_base + c0);   /* the failing chunk's first row */
         if (was_dev || c0 > 0) {   /* the recurrent state moved on the GPU only: nothing to hand the CPU */
             if (!g_q38m_serve) {
                 fprintf(stderr, "[qwen38-metal] the Metal chain failed: %s; the recurrent state is on the GPU only, "

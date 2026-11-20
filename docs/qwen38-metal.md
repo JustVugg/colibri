@@ -81,11 +81,17 @@ unforced, long12k agrees 12 of 14 scored steps, the misses after router near-tie
   prefill is planned (M4).
 - A GPU command batch that fails, or a kernel that declines, once the recurrent state has
   moved on the GPU (any step after the first, or a later chunk of the first) leaves no state
-  the CPU could take over. In serve mode the turn ends with `ERROR <id> GPU_FAILED ...` (the
-  gateway answers 503 `gpu_failed`): the chain turns off with its line and frees its device
-  memory, the CPU's expert cache gets its slots back, and every state that came from the GPU
-  goes (the live state, the prompt-end snapshot, a parked conversation, the prefix store's
-  prompts in RAM). The engine keeps serving: the next request reads its whole prompt on the
+  the CPU could take over. In serve mode the turn ends with `ERROR <id> GPU_FAILED ...`. The
+  client sees the error: a streamed reply (the gateway has already sent its 200 once the engine
+  accepts the prompt, also when the failure comes while the prompt is read) keeps the text sent
+  so far and ends with a final `data: {"error": {"code": "gpu_failed", "type": "server_error",
+  "message": "The GPU path failed and this reply was stopped. ..."}}` chunk and no `[DONE]` (the
+  OpenAI SDKs raise it; the chat page shows it as the reply's red error notice); a reply that is
+  not streamed is an HTTP 503 with the same error object. The chain turns off with its line and
+  frees its device memory, the CPU's expert cache gets its slots back, and every state that came
+  from the GPU goes (the live state, the prompt-end snapshot, a parked conversation, the prefix
+  store's prompts in RAM and, with `Q38_PREFIX_DISK=1`, this model's checkpoint files on disk,
+  those of earlier runs too). The engine keeps serving: the next request reads its whole prompt on the
   CPU, which runs the model until the server is restarted; the `METAL` frame says `chain=0`
   and why. Outside a serve the run stops as before (`the Metal chain failed: ...; stopping`,
   exit 1). An SSD read of an expert that fails stays fatal everywhere

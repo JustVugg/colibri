@@ -253,6 +253,75 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual(self.get("/experts")["live_seq"], 3)
 
 
+class FailingEngine(LiveEngine):
+    """ACCEPTs (the streaming 200 goes out), writes one piece, then fails as the engine's ERROR does"""
+
+    def __init__(self, error):
+        super().__init__()
+        self.error = error
+
+    def generate(self, prompt, maximum, temperature, top_p, on_text, *args, on_accept=None, **kwargs):
+        if on_accept is not None:
+            on_accept({"prompt_tokens": 5})
+        on_text("partial")
+        raise self.error
+
+
+class StreamErrorTest(unittest.TestCase):
+    """an engine error after the streaming 200 reaches an OpenAI client as a final `data:` chunk
+    with the error object (the SDKs raise it, the chat page shows it), never a faked [DONE]"""
+
+    def stream(self, error, path="/v1/chat/completions"):
+        server = gw.APIServer(("127.0.0.1", 0), FailingEngine(error), "test-model", "secret", 16)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.scheduler.close)
+        body = ({"model": "test-model", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+                if path == "/v1/chat/completions" else {"model": "test-model", "stream": True, "prompt": "hi"})
+        req = Request(f"http://127.0.0.1:{server.server_port}{path}", data=json.dumps(body).encode(),
+                      headers={"Content-Type": "application/json", "Authorization": "Bearer secret"})
+        with urlopen(req, timeout=10) as r:
+            self.assertEqual(r.status, 200)
+            raw = r.read().decode()
+        chunks = [line[6:] for line in raw.splitlines() if line.startswith("data: ")]
+        return raw, chunks
+
+    def test_gpu_failed_after_accept_ends_with_an_error_chunk(self):
+        raw, chunks = self.stream(gw._engine_error(["GPU_FAILED", "the", "GPU", "path", "failed"], "GPU_FAILED"))
+        self.assertIn("partial", raw)                 # what was written before stays
+        self.assertNotIn("[DONE]", raw)               # the reply is not passed off as complete
+        last = json.loads(chunks[-1])
+        self.assertEqual((last["error"]["code"], last["error"]["type"]), ("gpu_failed", "server_error"))
+        self.assertIn("read again on the CPU", last["error"]["message"])
+        self.assertEqual(raw.count("\"error\""), 1)
+
+    def test_any_engine_error_after_accept_ends_with_an_error_chunk(self):
+        raw, chunks = self.stream(gw._engine_error(["SOMETHING_ELSE", "went", "wrong"], "SOMETHING_ELSE went wrong"))
+        self.assertNotIn("[DONE]", raw)
+        self.assertEqual(json.loads(chunks[-1])["error"]["code"], "engine_error")
+
+    def test_a_gateway_fault_after_accept_still_only_closes(self):
+        """not an engine ERROR frame (a pipe that broke, #597): no error object, as before"""
+        raw, _ = self.stream(RuntimeError("failed to write STOP to the engine (broken pipe)"))
+        self.assertIn("partial", raw)
+        self.assertNotIn("[DONE]", raw)
+        self.assertNotIn("\"error\"", raw)
+
+    def test_completions_stream_too(self):
+        raw, chunks = self.stream(gw._engine_error(["GPU_FAILED"], "GPU_FAILED"), "/v1/completions")
+        self.assertNotIn("[DONE]", raw)
+        self.assertEqual(json.loads(chunks[-1])["error"]["code"], "gpu_failed")
+
+    def test_the_page_shows_an_error_chunk(self):
+        """ui/index.html's stream reader throws on a chunk's `error`, which its catch shows as the
+        reply's error (a.error, the error styling), instead of ending the reply as complete"""
+        page = (C.parent / "ui" / "index.html").read_text()
+        self.assertIn("if(ev.error)throw new Error(", page)
+        reader = page[page.index("let ev;try{ev=JSON.parse(d)}"):]
+        self.assertLess(reader.index("if(ev.error)throw new Error("), reader.index("const ch=ev.choices"))
+
+
 def dispatched(*frames):
     """an Engine whose dispatcher read these stdout lines, then the engine's exit"""
     import io
