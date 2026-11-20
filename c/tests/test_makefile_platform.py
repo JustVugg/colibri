@@ -160,6 +160,25 @@ class MakefilePlatformTests(unittest.TestCase):
                     self.assertEqual("-DCOLI_OMP_NUM_DEVICES_STUB" in compile_line,
                                      libomp == "22", compile_line)
 
+    def test_freebsd_x86_64_builds_with_clang(self):
+        # FreeBSD's own compiler is clang, with libomp in the base system; gcc is a
+        # package there. gcc names the target ...-portbld-freebsd, clang ...-unknown-freebsd.
+        cases = (
+            ("x86_64-unknown-freebsd15.1", {}, "clang"),
+            ("x86_64-portbld-freebsd15.1", {}, "clang"),
+            ("x86_64-unknown-freebsd15.1", {"CC": "gcc"}, "gcc"),
+            ("x86_64-unknown-linux-gnu", {}, "gcc"),
+        )
+
+        for triplet, variables, compiler in cases:
+            with self.subTest(triplet=triplet, variables=variables):
+                result = self._dry_run("colibri", triplet, **variables)
+                link = next(
+                    line for line in result.stdout.splitlines() if "-o colibri " in line
+                )
+                self.assertEqual(link.split()[0], compiler)
+                self.assertIn("-fopenmp", link)
+
     def test_darwin_portable_build_does_not_force_x86_architecture(self):
         missing_libomp = "/colibri-test/missing-libomp"
         result = self._dry_run(

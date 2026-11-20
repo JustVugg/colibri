@@ -1,0 +1,79 @@
+{
+  "version": 1,
+  "hypothesis": "A qwen36 CUDA chain prompt chunk of more than 32 rows copies each staged layer's host-pool experts over the bus, all of them. A chunk of up to 256 rows routes to only a part of them, so copying just the experts its rows route to, after each such layer's router, makes a short prompt faster, with the same logits.",
+  "commit": "4306f437ec97afd0fcd45166620c6a0175e0a5ed",
+  "model": "q36",
+  "metric": "prompt tok/s at 64 tokens, the prompt that opens the process (the first row of every run)",
+  "command": "env -i PATH=/usr/bin:/bin HOME=/root LD_LIBRARY_PATH=/usr/lib64-nvidia COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close OMP_DISPLAY_AFFINITY=TRUE OMP_AFFINITY_FORMAT=omp-thread:%n:cpus:%A /content/bin-p28/qwen36-bench --model /content/q36 --text /content/bench/promessi_sposi.txt --lengths 64,512,64 --gen 32 --teacher --steps /content/misura-p28/v1-runN.steps",
+  "prompt_hash": "f53e0d80cb2d4492",
+  "hardware": {
+    "cpu": "Intel(R) Xeon(R) CPU @ 2.00GHz",
+    "ram": "51 GiB",
+    "storage": "overlay         236G",
+    "os": "Ubuntu 24.04.4 LTS, kernel 6.6.159+",
+    "gpu": "Tesla T4"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "HARNESS"
+  ],
+  "baseline": {
+    "config": {
+      "HARNESS": "commit fd7ed68afa1f88706eae08ef172a5bc02c42bd77; harness qwen36_bench.c ca1bd9cc3d24; CUDA",
+      "COLI_CUDA": "1",
+      "COLI_GPUS": "0",
+      "CUDA_EXPERT_GB": "auto",
+      "OMP_WAIT_POLICY": "ACTIVE",
+      "OMP_PROC_BIND": "close",
+      "OMP_DISPLAY_AFFINITY": "TRUE",
+      "OMP_AFFINITY_FORMAT": "omp-thread:%n:cpus:%A"
+    },
+    "samples": {
+      "tok_s": [
+        88.03,
+        88.03,
+        88.02,
+        88.09
+      ]
+    },
+    "median_tok_s": 88.03,
+    "quality": {
+      "method": "the fingerprint of every logit is the same in every run of both versions, at every length",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-cuda-routed-copy-2026-11-13/base.md",
+      "sha256": "7f2d026ea1f4f1f27957222937bb380440ee29d9a6431aaf8d32776e6b18b936"
+    }
+  },
+  "trial": {
+    "config": {
+      "HARNESS": "commit 4306f437ec97afd0fcd45166620c6a0175e0a5ed; harness qwen36_bench.c ca1bd9cc3d24; CUDA",
+      "COLI_CUDA": "1",
+      "COLI_GPUS": "0",
+      "CUDA_EXPERT_GB": "auto",
+      "OMP_WAIT_POLICY": "ACTIVE",
+      "OMP_PROC_BIND": "close",
+      "OMP_DISPLAY_AFFINITY": "TRUE",
+      "OMP_AFFINITY_FORMAT": "omp-thread:%n:cpus:%A"
+    },
+    "samples": {
+      "tok_s": [
+        180.51,
+        181.73,
+        180.88,
+        180.63
+      ]
+    },
+    "median_tok_s": 180.755,
+    "quality": {
+      "method": "the fingerprint of every logit is the same in every run of both versions, at every length",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-cuda-routed-copy-2026-11-13/base.md",
+      "sha256": "7f2d026ea1f4f1f27957222937bb380440ee29d9a6431aaf8d32776e6b18b936"
+    }
+  },
+  "outcome": "improvement"
+}

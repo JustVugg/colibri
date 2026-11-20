@@ -98,7 +98,7 @@ Empfehlung. Dann die Einrichtung:
    weiter; danach führst du die Einrichtung erneut aus, und sie baut für die GPU neu;
 4. **lädt das Modell herunter**, mit Fortschrittsanzeige und Wiederaufnahme: stoppe
    es, wann du willst, starte es erneut, und es macht dort weiter, wo es aufgehört hat;
-5. **startet colibri und öffnet das Dashboard** im Browser und gibt die Adressen aus,
+5. **startet colibri und öffnet den Chat** im Browser und gibt die Adressen aus,
    die andere Apps nutzen können:
 
 ```
@@ -181,7 +181,7 @@ bestimmt, wie schnell die Antwort kommt, nicht, welche Gewichte oder welche
 Router-Entscheidungen sie erzeugen.
 
 Warum: um Modelle dieser Größe auf der Hardware laufen zu lassen, die Menschen ohnehin
-besitzen, um ihnen beim Arbeiten zuzusehen (das Dashboard zeigt jeden Expert in dem
+besitzen, um ihnen beim Arbeiten zuzusehen (die Expert-Karte des Chats zeigt jeden Expert in dem
 Moment, in dem er aktiv wird), und um die Engine klein genug zu halten, dass jeder sie
 messen und schneller machen kann. colibri ist außerdem eine offene Forschungsplattform:
 Eine Optimierung verdient ihren Platz durch eine reproduzierbare End-to-End-Messung,
@@ -472,20 +472,18 @@ von einem Server akzeptiert, der ohne `COLI_API_KEY` gestartet wurde). Die beide
 offiziellen SDKs sind unverändert gegen `coli serve` getestet.
 
 Derselbe Modus ist im Terminal verfügbar (`/decide merge | request changes | close` in
-`coli chat`) und auf der System-One-Seite des Dashboards. Anfrage und Antwort vollständig,
+`coli chat`) und auf der System-One-Seite des Chats. Anfrage und Antwort vollständig,
 die Bewertungsregeln und wo es nicht hilft: [docs/systemone.md](docs/systemone.md).
 
-## Das Dashboard
+## Der Chat im Browser
 
-`coli web` öffnet es, und das tut auch die Einrichtung in einem Schritt: den Chat, die
-System-One-Seite, das Brain und die Profiling-Seite, im hellen oder dunklen Design.
-
-### Der neue Chat
-
-`coli ui` öffnet den neuen Chat neben einem laufenden `coli serve`: das Reasoning in
-einem eigenen Block, Bilder für Modelle mit Vision-Tower, Websuche, die Expert-Karte,
-ein Live-Monitor und Coding-Agenten, die bereits auf colibri ausgerichtet geöffnet
-werden. Sieben Sprachen. Siehe [ui/README.md](ui/README.md).
+`coli web` startet das Modell und davor den Chat und öffnet den Chat im Browser; das tut auch
+die Einrichtung in einem Schritt. `coli ui` öffnet denselben Chat neben einem bereits laufenden
+`coli serve`, auf diesem oder einem anderen Rechner. Das Reasoning in einem eigenen Block, Bilder
+für Modelle mit Vision-Tower, Dokumente (PDF, Word, OpenDocument, PowerPoint, Webseiten, Text),
+die in die Nachricht gelesen werden, Websuche, die Expert-Karte, ein Live-Monitor, System One,
+die Modelle-Seite und Coding-Agenten, die bereits auf colibri ausgerichtet geöffnet werden.
+Sieben Sprachen, helles und dunkles Design. Siehe [ui/README.md](ui/README.md).
 
 <p align="center">
   <img src="docs/media/ui/ui-chat.png" width="900" alt="der neue Chat: eine Frage, das eingeklappte Reasoning, die Antwort und ihre Geschwindigkeit">
@@ -508,10 +506,8 @@ werden. Sieben Sprachen. Siehe [ui/README.md](ui/README.md).
 <p align="center"><em><strong>System One</strong>: Gib dem Modell ein Dokument und nur die Antworten, die es wählen darf. Hier liest Qwen3.6-35B auf einer RTX PRO 4000
 eine Pull Request, die das Größenlimit eines Caches bricht: <strong>request changes zu 81%</strong>, Entropie 0.56 (unsicher), 98 Token gelesen, 0 erzeugt.</em></p>
 
-Die **Profiling**-Seite zeigt, wo jeder Turn seine Zeit verbringt, Phase für Phase, mit
-den letzten 30 Turns als Trend. Mit [Joule](https://pypi.org/project/landauer-gap/),
-installiert neben dem Gateway (`pip install landauer-gap`), zeigt sie zusätzlich die
-Watt des Rechners und die Joule des letzten Turns pro Token.
+Das **Profiling** des Monitors zeigt, wo jeder Turn seine Zeit verbracht hat, Phase für Phase
+(das Warten auf Experts, ihre Matmuls, Attention, der LM-Head), Turn für Turn.
 
 ### Die Terminal-Oberfläche
 
@@ -739,13 +735,13 @@ daher sind die Befehle für jedes Modell gleich:
 
 ```bash
 ./coli chat  --model /nvme/qwen36          # chat in the terminal
-./coli web   --model /nvme/qwen36          # API + dashboard, opens a browser
-./coli serve --model /nvme/qwen36          # API + dashboard, no browser
+./coli web   --model /nvme/qwen36          # API + the chat UI, opens a browser
+./coli serve --model /nvme/qwen36          # the API alone
 ./coli plan  --model /nvme/qwen36          # where the model will live: VRAM, RAM, disk
 ./coli doctor --model /nvme/qwen36         # read-only check: is everything ready?
 ./coli tune  --model /nvme/qwen36          # measure and save this machine's fastest safe settings
 ./coli import /nvme/Flint-UD-Q4_K_XL.gguf  # a GGUF: writes Flint-UD-Q4_K_XL.colibri next to it
-./coli ui                                  # the chat UI, next to a running coli serve
+./coli ui                                  # the chat UI alone, next to a running coli serve
 ./coli tui                                 # the chat in the terminal, on a running coli serve (or --model)
 ```
 
@@ -787,7 +783,7 @@ kontrollierter Fehlschlag ist hier mehr wert als eine unerklärte schnelle Zahl.
 |---|---|
 | Die Einrichtung in einem Schritt und die manuelle Installation, jede Plattform | [quickstart.md](docs/quickstart.md) |
 | Einrichtung über einen KI-Assistenten, und der MCP-Server | [AI_SETUP.md](docs/AI_SETUP.md), [MCP_SERVER.md](docs/MCP_SERVER.md) |
-| Die API: OpenAI, Anthropic, Tools, KV-Slots, Dashboard | [api.md](docs/api.md) |
+| Die API: OpenAI, Anthropic, Tools, KV-Slots | [api.md](docs/api.md) |
 | System One und die Entscheidungsmodelle | [systemone.md](docs/systemone.md), [laya.md](docs/laya.md), [gliner_decide.md](docs/gliner_decide.md), [clef.md](docs/clef.md) |
 | GGUF-Dateien: die Architekturen, die beiden Modi, was jede Engine mit den Blöcken macht | [gguf.md](docs/gguf.md) |
 | Die Modelle auf der Qwen3.6-Engine (Flint, Muse Spark Open, LFM3-VL) und Mistral-Large-4 | [qwen36.md](docs/qwen36.md), [mistral-large4.md](docs/mistral-large4.md) |
@@ -843,9 +839,8 @@ c/
 ├── resource_plan.py      RAM/VRAM planner behind coli plan and coli doctor
 ├── tools/                conversion, fixtures and benchmarks
 └── tests/                dependency-free C and Python tests
-ui/                       the chat UI (coli ui)
-web/                      the dashboard (a pure API client)
-desktop/                  Tauri desktop shell around the dashboard
+ui/                       the chat UI (coli web, coli ui)
+desktop/                  Tauri desktop shell around the chat UI
 docker/                   container images
 docs/                     reference docs, experiments, media
 site/                     the website

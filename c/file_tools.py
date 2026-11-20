@@ -1,4 +1,4 @@
-"""The dashboard's file tools: read, write, edit and list files, change folder and run a command, as the user
+"""The chat's file tools: read, write, edit and list files, change folder and run a command, as the user
 who runs the gateway, in the working folder the page names. The gateway answers them on
 POST /fs/read, /fs/write, /fs/edit, /fs/list, /fs/cd and /fs/run, only with COLI_FILE_TOOLS=1, only to its own
 page and only from this machine (openai_server.py, file_tool). The page asks the user before

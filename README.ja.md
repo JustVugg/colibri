@@ -68,7 +68,7 @@ cd colibri
 2. **収まるモデルを推奨します**：モデルのうち常に RAM に置かれる部分と、最小限のエキスパートキャッシュが RAM に収まり、ダウンロードしたファイルがディスクに収まる必要があります。
 3. **エンジンを用意します**：コンパイラがあればこのマシン向けにビルドし、なければビルド済みのものをダウンロードします（CPU で動き、Linux と Windows では Vulkan GPU でも動きます）。GPU 向けのビルドは、それで速くなる場合に行います：Linux の NVIDIA カードで CUDA ツールキットがインストールされていれば CUDA、それ以外は Vulkan です。ディスクリート GPU では常に GPU 向けにビルドします。CPU と RAM を共有する内蔵 GPU では、そこで速くなることが計測されたモデル（Qwen3.6、Qwen3-Coder、Qwen3.8-Flash-Next）の場合だけです。足りないパッケージがある場合は、それをインストールするための正確なコマンドを表示して、CPU で続行します。あとでセットアップをもう一度実行すれば、GPU 向けにビルドし直します。
 4. **モデルをダウンロードします**。進捗を表示し、途中から再開できます：いつ止めてもかまいません。もう一度実行すれば、止まったところから続きます。
-5. **colibri を起動し、ブラウザでダッシュボードを開きます**。また、ほかのアプリが使えるアドレスを表示します：
+5. **colibri を起動し、ブラウザでチャットを開きます**。また、ほかのアプリが使えるアドレスを表示します：
 
 ```
 Starting colibri
@@ -128,7 +128,7 @@ Mixture-of-Experts モデルは、ディスク上では巨大でも、1 トー�
 
 つまり、モデルは高速メモリに収まる必要はなく、**配置** されればよいのです。密な部分（アテンション、共有エキスパート、埋め込み）は RAM に置かれます。ルーティングされるエキスパートはディスクに置かれ、ルーターが必要としたときに読み込まれます。読み込みは、あなたの作業がどのエキスパートを使うかを学習するキャッシュを通して行われます。GPU があれば、最もホットなエキスパートと密レイヤーを GPU が保持します。重みがどこにあるかで変わるのは答えが返ってくる速さであり、答えを生み出す重みやルーターの判断は変わりません。
 
-なぜ作るのか：このサイズのモデルを、人々がすでに持っているハードウェアで動かすため。モデルが動く様子を眺めるため（ダッシュボードは、発火するエキスパートをすべて表示します）。そして、誰もが計測して速くできるほど、エンジンを小さく保つためです。colibri はオープンな研究プラットフォームでもあります：最適化は、再現可能なエンドツーエンドの計測によって採用に値することを示さなければならず、デフォルトのポリシーがモデルの精度やルーターのセマンティクスを黙って変えることは決してありません。高速メモリが少なければ速度は落ちるかもしれませんが、それによってモデルが密かに別物になってはなりません。詳しくは[仕組み](#how-it-works)を参照してください。
+なぜ作るのか：このサイズのモデルを、人々がすでに持っているハードウェアで動かすため。モデルが動く様子を眺めるため（チャットのエキスパートマップは、発火するエキスパートをすべて表示します）。そして、誰もが計測して速くできるほど、エンジンを小さく保つためです。colibri はオープンな研究プラットフォームでもあります：最適化は、再現可能なエンドツーエンドの計測によって採用に値することを示さなければならず、デフォルトのポリシーがモデルの精度やルーターのセマンティクスを黙って変えることは決してありません。高速メモリが少なければ速度は落ちるかもしれませんが、それによってモデルが密かに別物になってはなりません。詳しくは[仕組み](#how-it-works)を参照してください。
 
 <a id="which-model-for-my-machine"></a>
 
@@ -284,15 +284,11 @@ curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -
 
 **Jev からの切り替え。** リクエストとレスポンスは TypeSafe の Jev API と同じなので、Jev のクライアントは base URL を変えるだけで、ほかは何も変えずに colibri に切り替えられます：`TYPESAFE_BASE_URL=http://127.0.0.1:8000`（クライアントがすでに送っているキーは、`COLI_API_KEY` なしで起動したサーバーなら受け入れられます）。2 つの公式 SDK は、改変なしのまま `coli serve` に対してテストされています。
 
-同じモードはターミナル（`coli chat` での `/decide merge | request changes | close`）と、ダッシュボードの System One ページにもあります。リクエストとレスポンスの全体、スコアリングのルール、そして役に立たない場面：[docs/systemone.md](docs/systemone.md)。
+同じモードはターミナル（`coli chat` での `/decide merge | request changes | close`）と、チャットの System One ページにもあります。リクエストとレスポンスの全体、スコアリングのルール、そして役に立たない場面：[docs/systemone.md](docs/systemone.md)。
 
-## ダッシュボード
+## ブラウザのチャット
 
-`coli web` で開きます。ワンステップのセットアップでも開きます：チャット、System One ページ、Brain、Profiling ページがあり、ライトテーマとダークテーマに対応しています。
-
-### 新しいチャット UI
-
-`coli ui` は、実行中の `coli serve` の横で新しいチャットを開きます：推論は専用のブロックに、ビジョンタワーを持つモデルでは画像、Web 検索、エキスパートマップ、ライブモニター、そして colibri に向けて設定済みのコーディングエージェント。7 言語に対応。[ui/README.md](ui/README.md) を参照してください。
+`coli web` はモデルとその前にチャットを起動し、ブラウザでチャットを開きます。ワンステップのセットアップでも同じです。`coli ui` は、このマシンまたは別のマシンですでに実行中の `coli serve` の横で同じチャットを開きます：推論は専用のブロックに、ビジョンタワーを持つモデルでは画像、メッセージに読み込まれるドキュメント（PDF、Word、OpenDocument、PowerPoint、Web ページ、テキスト）、Web 検索、エキスパートマップ、ライブモニター、System One、モデルページ、そして colibri に向けて設定済みのコーディングエージェント。7 言語、ライトテーマとダークテーマに対応。[ui/README.md](ui/README.md) を参照してください。
 
 <p align="center">
   <img src="docs/media/ui/ui-chat.png" width="900" alt="新しいチャット UI：質問、折りたたまれた推論、回答とその速度">
@@ -315,7 +311,7 @@ curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -
 <p align="center"><em><strong>System One</strong>：モデルに文書と、選んでよい回答だけを渡します。ここでは RTX PRO 4000 上の Qwen3.6-35B が、キャッシュのサイズ上限を壊すプルリクエストを読みます：
 <strong>request changes が 81%</strong>、エントロピー 0.56（不確か）、読み取り 98 トークン、生成 0 トークンです。</em></p>
 
-**Profiling** ページは、各ターンがどこで時間を使っているかをフェーズごとに示し、直近 30 ターンを推移として表示します。ゲートウェイと一緒に [joules](https://pypi.org/project/landauer-gap/) をインストールしておけば（`pip install landauer-gap`）、マシンのワット数と、直近のターンのトークンあたりのジュール数も表示されます。
+モニターの **プロファイリング** は、各ターンがどこで時間を使ったかを、フェーズごと（エキスパートの待ち、その matmul、アテンション、LM head）、ターンごとに示します。
 
 ### ターミナル UI
 
@@ -444,13 +440,13 @@ make qwen36 VK=1                          # one engine, here with Vulkan (CUDA=1
 
 ```bash
 ./coli chat  --model /nvme/qwen36          # chat in the terminal
-./coli web   --model /nvme/qwen36          # API + dashboard, opens a browser
-./coli serve --model /nvme/qwen36          # API + dashboard, no browser
+./coli web   --model /nvme/qwen36          # API + the chat UI, opens a browser
+./coli serve --model /nvme/qwen36          # the API alone
 ./coli plan  --model /nvme/qwen36          # where the model will live: VRAM, RAM, disk
 ./coli doctor --model /nvme/qwen36         # read-only check: is everything ready?
 ./coli tune  --model /nvme/qwen36          # measure and save this machine's fastest safe settings
 ./coli import /nvme/Flint-UD-Q4_K_XL.gguf  # a GGUF: writes Flint-UD-Q4_K_XL.colibri next to it
-./coli ui                                  # the chat UI, next to a running coli serve
+./coli ui                                  # the chat UI alone, next to a running coli serve
 ./coli tui                                 # the chat in the terminal, on a running coli serve (or --model)
 ```
 
@@ -477,7 +473,7 @@ colibri は、フロンティアモデルが希少なハードウェアに頼る
 |---|---|
 | ワンステップのセットアップと手動インストール、全プラットフォーム | [quickstart.md](docs/quickstart.md) |
 | AI アシスタントによるセットアップと MCP サーバー | [AI_SETUP.md](docs/AI_SETUP.md)、[MCP_SERVER.md](docs/MCP_SERVER.md) |
-| API：OpenAI、Anthropic、ツール、KV スロット、ダッシュボード | [api.md](docs/api.md) |
+| API：OpenAI、Anthropic、ツール、KV スロット | [api.md](docs/api.md) |
 | System One と判定モデル | [systemone.md](docs/systemone.md)、[laya.md](docs/laya.md)、[gliner_decide.md](docs/gliner_decide.md)、[clef.md](docs/clef.md) |
 | GGUF ファイル：アーキテクチャ、2 つのモード、各エンジンがブロックをどう扱うか | [gguf.md](docs/gguf.md) |
 | Qwen3.6 エンジン上のモデル（Flint、Muse Spark Open、LFM3-VL）と Mistral-Large-4 | [qwen36.md](docs/qwen36.md)、[mistral-large4.md](docs/mistral-large4.md) |
@@ -533,9 +529,8 @@ c/
 ├── resource_plan.py      RAM/VRAM planner behind coli plan and coli doctor
 ├── tools/                conversion, fixtures and benchmarks
 └── tests/                dependency-free C and Python tests
-ui/                       the chat UI (coli ui)
-web/                      the dashboard (a pure API client)
-desktop/                  Tauri desktop shell around the dashboard
+ui/                       the chat UI (coli web, coli ui)
+desktop/                  Tauri desktop shell around the chat UI
 docker/                   container images
 docs/                     reference docs, experiments, media
 site/                     the website

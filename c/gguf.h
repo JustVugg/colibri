@@ -152,12 +152,15 @@ static const gguf_kv *gguf_get(const gguf_ctx *g, const char *key) {
     for (int i = 0; i < g->n_kv; i++) if (!strcmp(g->kv[i].key, key)) return &g->kv[i];
     return NULL;
 }
-/* Integer/float/string getters: `def` when the key is absent or of the wrong kind. */
+/* Integer/float/string getters: `def` when the key is absent or of the wrong kind. gguf_get_int
+ * also returns `def` for a UINT64 above INT64_MAX, which int64_t cannot hold; gguf_get_float
+ * reads such a value as the positive number it is. */
 static int64_t gguf_get_int(const gguf_ctx *g, const char *key, int64_t def) {
     const gguf_kv *k = gguf_get(g, key);
     if (!k) return def;
     switch (k->type) {
-    case GGUF_T_U8: case GGUF_T_U16: case GGUF_T_U32: case GGUF_T_U64: case GGUF_T_BOOL: return (int64_t)k->v.u;
+    case GGUF_T_U8: case GGUF_T_U16: case GGUF_T_U32: case GGUF_T_U64: case GGUF_T_BOOL:
+        return k->v.u <= (uint64_t)INT64_MAX ? (int64_t)k->v.u : def;
     case GGUF_T_I8: case GGUF_T_I16: case GGUF_T_I32: case GGUF_T_I64: return k->v.i;
     default: return def;
     }
@@ -165,9 +168,12 @@ static int64_t gguf_get_int(const gguf_ctx *g, const char *key, int64_t def) {
 static double gguf_get_float(const gguf_ctx *g, const char *key, double def) {
     const gguf_kv *k = gguf_get(g, key);
     if (!k) return def;
-    if (k->type == GGUF_T_F32 || k->type == GGUF_T_F64) return k->v.f;
-    if (k->type == GGUF_T_ARRAY || k->type == GGUF_T_STRING) return def;
-    return (double)gguf_get_int(g, key, (int64_t)def);
+    switch (k->type) {
+    case GGUF_T_F32: case GGUF_T_F64: return k->v.f;
+    case GGUF_T_U8: case GGUF_T_U16: case GGUF_T_U32: case GGUF_T_U64: case GGUF_T_BOOL: return (double)k->v.u;
+    case GGUF_T_I8: case GGUF_T_I16: case GGUF_T_I32: case GGUF_T_I64: return (double)k->v.i;
+    default: return def;
+    }
 }
 static const char *gguf_get_str(const gguf_ctx *g, const char *key) {
     const gguf_kv *k = gguf_get(g, key); return (k && k->type == GGUF_T_STRING) ? k->s : NULL;
@@ -261,10 +267,19 @@ static int gguf_parse_one(gguf_ctx *g, int part, const char *path, int want_kv) 
     }
     if (!r.bad) {
         uint64_t data = (r.pos + alignment - 1) / alignment * alignment;
+        /* A header read alone (GGUF_CHECK) holds no tensor bytes, so a tensor need not lie in the
+         * file; its end must still be an offset the readers hold in an int64_t (st_tensor.off,
+         * gguf_read), or an expert's slice past its start (st_gguf_index) overflows one. */
+        const uint64_t end = gguf_header_only ? (uint64_t)INT64_MAX : r.size;
         for (int i = t0; i < g->n_tensors; i++) {
             gguf_tensor *t = &g->t[i];
-            if (t->off % alignment || (!gguf_header_only && (t->off > r.size || data > r.size - t->off || (uint64_t)t->nbytes > r.size - data - t->off))) {
-                r.bad = 1; snprintf(g->err, sizeof g->err, "%s: tensor %s lies outside the file (offset %llu, %lld bytes)", path, t->name, (unsigned long long)t->off, (long long)t->nbytes); break;
+            if (t->off % alignment || t->off > end || data > end - t->off || (uint64_t)t->nbytes > end - data - t->off) {
+                r.bad = 1;
+                if (gguf_header_only)
+                    snprintf(g->err, sizeof g->err, "%s: tensor %s ends past the largest file offset (offset %llu, %lld bytes)", path, t->name, (unsigned long long)t->off, (long long)t->nbytes);
+                else
+                    snprintf(g->err, sizeof g->err, "%s: tensor %s lies outside the file (offset %llu, %lld bytes)", path, t->name, (unsigned long long)t->off, (long long)t->nbytes);
+                break;
             }
             t->off += data;
         }

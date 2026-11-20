@@ -1681,6 +1681,43 @@ class ProtocolTest(unittest.TestCase):
             listener.close()
 
 
+class ChatRedirectTest(unittest.TestCase):
+    """The API's own address, where the dashboard was before the chat UI, sends a browser on to
+    `coli web`'s chat: at the host the browser used, the UI's port. A plain `coli serve`, or
+    `coli web --no-ui`, has no chat to send it to: a 404 as before."""
+
+    def _get(self, chat_port, host):
+        server = APIServer(("127.0.0.1", 0), FakeEngine(), "test")
+        server.chat_port = chat_port
+        thread = threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, timeout=2)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.scheduler.close)
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+        conn.request("GET", "/", headers={"Host": host % server.server_port})
+        response = conn.getresponse()
+        response.read()
+        conn.close()
+        return response.status, response.getheader("Location")
+
+    def test_the_root_sends_a_browser_to_the_chat(self):
+        self.assertEqual(self._get(8790, "127.0.0.1:%d"), (302, "http://127.0.0.1:8790/"))
+        self.assertEqual(self._get(8790, "localhost:%d"), (302, "http://localhost:8790/"))
+        self.assertEqual(self._get(9001, "[::1]:%d"), (302, "http://[::1]:9001/"))
+
+    def test_without_a_chat_the_root_is_not_found(self):
+        self.assertEqual(self._get(None, "127.0.0.1:%d")[0], 404)
+
+    def test_the_chat_location_keeps_the_host(self):
+        for host, want in (("192.168.1.20:8000", "http://192.168.1.20:8790/"), ("box.lan:8000", "http://box.lan:8790/"),
+                           ("[fe80::1]:8000", "http://[fe80::1]:8790/"), ("::1", "http://[::1]:8790/"),
+                           ("example", "http://example:8790/"), ("", "http://127.0.0.1:8790/"), (None, "http://127.0.0.1:8790/")):
+            with self.subTest(host=host):
+                self.assertEqual(openai_server.chat_location(host, 8790), want)
+
+
 class GenerationMetricsTest(unittest.TestCase):
     def setUp(self):
         self.server = APIServer(("127.0.0.1", 0), FakeEngine(), "test")
@@ -4317,46 +4354,6 @@ class ClientHangupTest(unittest.TestCase):
         with urlopen(f"http://127.0.0.1:{self.server.server_port}/health",
                      timeout=2) as response:
             self.assertEqual(json.load(response)["status"], "ok")
-
-
-class StaticServingTest(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        root = Path(self.tmp.name)
-        dist = root / "dist"
-        dist.mkdir()
-        (dist / "index.html").write_text("dashboard", encoding="utf-8")
-        sibling = root / "dist-private"
-        sibling.mkdir()
-        (sibling / "secret.txt").write_text("private", encoding="utf-8")
-        self.web_dist = patch.object(APIHandler, "WEB_DIST", dist)
-        self.web_dist.start()
-        self.server = APIServer(("127.0.0.1", 0), FakeEngine(), "test-model")
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        self.thread.start()
-        self.base = f"http://127.0.0.1:{self.server.server_port}"
-
-    def tearDown(self):
-        self.server.scheduler.close()
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(timeout=2)
-        self.web_dist.stop()
-        self.tmp.cleanup()
-
-    def test_static_root_stays_inside_dist_directory(self):
-        with urlopen(self.base + "/", timeout=2) as response:
-            self.assertEqual(response.read(), b"dashboard")
-        with self.assertRaises(HTTPError) as caught:
-            urlopen(self.base + "/%2e%2e/dist-private/secret.txt", timeout=2)
-        self.addCleanup(caught.exception.close)
-        self.assertEqual(caught.exception.code, 404)
-
-    def test_nul_in_the_path_is_not_found(self):
-        with self.assertRaises(HTTPError) as caught:
-            urlopen(self.base + "/%00", timeout=2)
-        self.addCleanup(caught.exception.close)
-        self.assertEqual(caught.exception.code, 404)
 
 
 class SchedulerHTTPTest(unittest.TestCase):

@@ -119,10 +119,14 @@ typedef struct {
     CcExpert *dm_host; uint8_t *dm_res; int *dm_part; uint8_t *dm_ran;   /* dm_ran: the step's layers that ran so */
     /* a prompt chunk's table (more than Q36CC_STAGE_ROWS rows): the residents, and the tier's host
      * pool staged a layer at a time into dm_stage (planar; dm_fr the copies, dm_fro and dm_frn each
-     * layer's), the layers with some expert in neither; dm_stage_off: no staging from here on */
-    CcExpert *dm_hostb; int *dm_partb, *dm_fro, *dm_frn; CcFetch *dm_fr; CcBuf *dm_tabb, *dm_stage;
-    int dm_stage_off; unsigned long long dm_staged, dm_stage_bytes;
+     * layer's), the layers with some expert in neither; dm_stage_off: no staging from here on;
+     * dm_banks banks in dm_stage, dm_bank each staged layer's (-1: none) */
+    CcExpert *dm_hostb; int *dm_partb, *dm_fro, *dm_frn, *dm_bank; CcFetch *dm_fr; CcBuf *dm_tabb, *dm_stage;
+    int dm_stage_off, dm_banks; unsigned long long dm_staged, dm_stage_bytes;
     unsigned long long hp_follows, hp_joined, hp_left; double hp_ms;   /* the pool following the residents */
+    /* a chunk of up to Q36CC_ROUTED_ROWS rows (dm_routed) copies only the experts its rows route
+     * to: dm_frx each expert's first region in dm_fr (-1: none), dm_used and dm_rfr a layer's list */
+    int dm_routed, dm_routed_said, *dm_frx; uint8_t *dm_used; CcFetch *dm_rfr; unsigned long long dm_routed_steps;
     int rows_max;   /* a prompt chunk's rows (q36cc_rows_max) */
     CcBuf *dm_tab, *dm_ids, *dm_w, *dm_idsd, *dm_wd, *dm_hid, *dm_y, *dm_hy, *dm_dfl, *dm_hfl;
     float *dm_g, *dm_u, *dm_hh;
@@ -179,7 +183,7 @@ static void q36cc_recover(Model *m, int upto) {
     for (int s = 0; s < upto; s++) q36_embed_row(m, ids[s], s, x + (int64_t)s * D);
     int snap = m->snap_rows, rowwise = g_q36_rowwise;
     m->snap_rows = 0; g_q36_rowwise = 0;
-    layers_forward_range(m, x, upto, 0, 0, c->n_layers, 0, NULL);
+    layers_forward_rows(m, x, upto, 0, 0, NULL, NULL);   /* a chunk's scratch, not the context's */
     m->snap_rows = snap; g_q36_rowwise = rowwise;
     free(ids); free(x);
 }
@@ -955,6 +959,18 @@ static int q36cc_spec_slots(Q36CChain *ch, Model *m, int rows) {
     }
     return 1;
 }
+/* A verify's copies on the device before its drafts are made (q36_spec_alloc): 0 when the device
+ * refuses them and the chain would run the verify, so the caller takes a plain step there. On the
+ * CPU (q36cc_forward's refusal) a long context's verifies ran on the host's path: Qwen3.8-27B at
+ * 93K tokens, 72 GB of commit and the process out of memory. */
+static int q36cc_verify_room(Model *m, int rows) {
+    Q36CChain *ch = q36cc_of(m);
+    if (!g_cuda_chain || qq_active() || g_pilot || m->mux_rows || !ch || !ch->ok || ch->failed ||
+        q36cc_spec_slots(ch, m, rows)) return 1;
+    static int told;
+    if (!told) { told = 1; fprintf(stderr, "[chain] qwen36: device memory for a verify's %d copies refused; plain steps, not the CPU\n", rows); }
+    return 0;
+}
 /* The uploads that make the device state the host's, as the step at pos_base needs it. */
 static int q36cc_push_state(Q36CChain *ch, Model *m, int pos_base) {
     Cfg *c = &m->c; int ok = 1;
@@ -1385,15 +1401,21 @@ static void q36cc_kv_down(Q36CChain *ch, Model *m, int i, int n, int pb) {
  * where a copy over the bus costs per expert: more than Q36CC_STAGE_ROWS rows copy a layer's
  * experts in the tier's host pool (its RAM cache, page-locked) into dm_stage and run them
  * with the residents, the copy of the next such layer on the copy stream while the device
- * works through the layers before it. dm_stage holds the most experts any layer has there
- * (one layer's: the copy is the longer of the two, a second buffer would buy little); the
- * table points each such expert at its place there (planar, as the RAM holds it). 0: no
- * VRAM for it. */
+ * works through the layers before it. dm_stage holds the most experts any layer has there, in
+ * two banks the staged layers take in turn: a layer's copy runs beside the layer before's
+ * experts (a Colab T4 with the residents spread has 91 experts a layer to copy, two banks of
+ * 91). Two banks only where both fit in the E experts
+ * q36cc_rows_max sets aside (and q36cc_mirror_room, where the staging is not yet there); with
+ * whole layers on the card (256 to copy) or few residents it is one, and the copy of a layer
+ * waits for the experts of the layer before. The table points each such expert at its bank
+ * there (planar, as the RAM holds it). 0: no VRAM for it. */
 #define Q36CC_STAGE_ROWS 32
 /* The host pool follows the residents (qt_chain_host_follow) before a prompt chunk of
  * Q36CC_FOLLOW_ROWS rows or more: the experts that left the card join it, those that came in
  * leave it, or a layer holding one that left goes to the host's step whole. A smaller chunk
- * leaves it behind for the next large one. On the Colab T4 high-RAM VM of the measures
+ * leaves it behind for the next large one. Where the warm start pooled every expert, the
+ * residents' too (qt_chain_host_all), the follow does nothing: an expert that left is in the
+ * pool already, and the staged table follows the residents by the tier's epoch. On the Colab T4 high-RAM VM of the measures
  * (docs/experiments/qwen36-cuda-host-pool-follow-2026-10-26) a follow costs about 0.3 ms an
  * expert moved. On another VM of the same shape an earlier version, which followed before
  * every chunk of more than 32 rows, moved 317 + 317 experts in 193 ms before a 36-row chunk
@@ -1401,6 +1423,20 @@ static void q36cc_kv_down(Q36CChain *ch, Model *m, int i, int n, int pb) {
  * those two points the follow pays from about 80 rows, and at 128 the copies save about
  * twice the 193 ms (threshold.txt there). */
 #define Q36CC_FOLLOW_ROWS 128
+/* A chunk of up to this many rows routes to only a part of a layer's experts: each staged layer
+ * copies just those, after its router (the host waits there for the routes, so the copy no
+ * longer overlaps the layer before). A longer chunk routes to nearly all of them and the whole
+ * copy, overlapped, is faster (the threshold is from a Colab T4 with 3635 experts in the host
+ * pool, before the pool followed the residents: there 384 rows gained nothing). */
+#define Q36CC_ROUTED_ROWS 256
+/* a chunk of n rows in format fmt copies only its routed experts: a short one on the int4 table (fmt 2 per
+ * row, 4 per group, planar blocks or pairs alike: q36cc_stage_table gives each expert the same two regions,
+ * its matrices then its scales, and dm_frx lists them); a GGUF's (fmt 100 and up) copies whole layers, its
+ * staged table keeping one or three regions an expert and no such list. The formats with no staged table
+ * (1, 8) never stage. */
+static int q36cc_routes_only(int n, int fmt) { return n <= Q36CC_ROUTED_ROWS && (fmt == 2 || fmt == 4); }
+/* the staging's banks: two where both fit in the E experts q36cc_rows_max sets aside, else one */
+static int q36cc_stage_banks(int hmax, int E) { return hmax > 0 && 2 * hmax <= E ? 2 : 1; }
 /* Promotions (qt_chain_promote): after a decode-sized step, up to this many of its misses move
  * into the buffers of the coldest residents by this conversation's routes. The chain copies
  * each newcomer's RAM bytes into a page-locked staging slot and from there into the victim's
@@ -1632,50 +1668,66 @@ static int q36cc_stage_table(Q36CChain *ch, Model *m) {
     size_t ne = (size_t)L * E, wb = 3 * mb, sb = (2 * nsc + nsd) * sizeof(float);
     size_t wa = (wb + 255) / 256 * 256, stride = wa + (sb + 255) / 256 * 256;
     int hmax = 0, tot = 0;
+    if (!ch->dm_hostb) {
+        ch->dm_hostb = malloc(ne * sizeof(CcExpert));
+        ch->dm_partb = calloc(L, sizeof(int)); ch->dm_fro = calloc(L, sizeof(int)); ch->dm_frn = calloc(L, sizeof(int));
+        ch->dm_bank = calloc(L, sizeof(int));
+        ch->dm_frx = malloc(ne * sizeof(int)); ch->dm_used = malloc((size_t)E); ch->dm_rfr = malloc((size_t)2 * E * sizeof(CcFetch));
+        if (!ch->dm_hostb || !ch->dm_partb || !ch->dm_fro || !ch->dm_frn || !ch->dm_bank || !ch->dm_frx || !ch->dm_used || !ch->dm_rfr) return 0;
+    }
     for (int i = 0; i < L; i++) {
-        int h = 0;
+        int h = 0, none = 0;
         for (int e = 0; e < E; e++) {
             const void *w; const float *sc; size_t a, b;
-            if (ch->dm_res[(size_t)i * E + e] || !qt_chain_host(i, e, &w, &a, &sc, &b)) continue;
+            if (ch->dm_res[(size_t)i * E + e]) continue;
+            if (!qt_chain_host(i, e, &w, &a, &sc, &b)) { none = 1; continue; }   /* in neither: the host's step */
             if (a != wb || b != sb) return 0;   /* not the layout the table describes */
             h++;
         }
         if (h > hmax) hmax = h;
         tot += h;
-    }
-    if (!ch->dm_hostb) {
-        ch->dm_hostb = malloc(ne * sizeof(CcExpert));
-        ch->dm_partb = calloc(L, sizeof(int)); ch->dm_fro = calloc(L, sizeof(int)); ch->dm_frn = calloc(L, sizeof(int));
-        if (!ch->dm_hostb || !ch->dm_partb || !ch->dm_fro || !ch->dm_frn) return 0;
+        ch->dm_bank[i] = h > 0 && !none ? 0 : -1;   /* a staged layer: its bank below */
     }
     CcFetch *fr = realloc(ch->dm_fr, (size_t)(2 * tot + 1) * sizeof(CcFetch));
     if (!fr) return 0;
     ch->dm_fr = fr;
-    if (!q36cc_stage_reserve(&ch->dm_stage, (size_t)(hmax ? hmax : 1) * stride) || !cc_reserve(&ch->dm_tabb, ne * sizeof(CcExpert), CC_DEV))
+    size_t bank = (size_t)(hmax ? hmax : 1) * stride;
+    int banks = cc_fetch_at_ready() ? q36cc_stage_banks(hmax, E) : 1;
+    if (banks > 1 && !q36cc_stage_reserve(&ch->dm_stage, 2 * bank)) banks = 1;
+    if (!q36cc_stage_reserve(&ch->dm_stage, bank) || !cc_reserve(&ch->dm_tabb, ne * sizeof(CcExpert), CC_DEV))
         return 0;
     const char *base = (const char *)cc_dev_addr(ch->dm_stage);
     if (!base) return 0;
-    int k = 0;
+    if (banks != ch->dm_banks)
+        fprintf(stderr, "[chain] qwen36: a prompt chunk stages the host pool's experts in %d bank%s of %d experts\n",
+                banks, banks == 1 ? "" : "s", hmax);
+    ch->dm_banks = banks;
+    int k = 0, ns = 0;
     for (int i = 0; i < L; i++) {
-        int h = 0, miss = 0;
+        int h = 0, miss = 0, sl = 0;
+        if (ch->dm_bank[i] >= 0) ch->dm_bank[i] = sl = ns++ % banks;   /* the staged layers take the banks in turn */
         ch->dm_fro[i] = k;
         for (int e = 0; e < E; e++) {
             size_t j = (size_t)i * E + e;
             CcExpert *x = &ch->dm_hostb[j];
             const void *w; const float *sc; size_t a, b;
             *x = ch->dm_host[j];
+            ch->dm_frx[j] = -1;
             if (ch->dm_res[j]) continue;
             memset(x, 0, sizeof *x);
             if (h >= hmax || k + 2 > 2 * tot || !qt_chain_host(i, e, &w, &a, &sc, &b) || a != wb || b != sb) { miss = 1; continue; }
-            const char *g = base + (size_t)h * stride;
+            size_t at = ((size_t)sl * hmax + h) * stride;
+            const char *g = base + at;
             x->g = g; x->u = g + mb; x->d = g + 2 * mb;
             x->gs = (const float *)(g + wa); x->us = x->gs + nsc; x->ds = x->gs + 2 * nsc;
             x->planar = planar;
-            fr[k++] = (CcFetch){w, (size_t)h * stride, wb};
-            fr[k++] = (CcFetch){sc, (size_t)h * stride + wa, sb};
+            ch->dm_frx[j] = k;
+            fr[k++] = (CcFetch){w, at, wb};
+            fr[k++] = (CcFetch){sc, at + wa, sb};
             h++;
         }
         ch->dm_frn[i] = k - ch->dm_fro[i]; ch->dm_partb[i] = miss;
+        if ((ch->dm_bank[i] >= 0) != (ch->dm_frn[i] > 0 && !miss)) return 0;   /* the two passes disagree */
     }
     return cc_begin() && cc_write(ch->dm_tabb, 0, ch->dm_hostb, ne * sizeof(CcExpert)) && cc_submit(1);
 }
@@ -1752,6 +1804,10 @@ static int q36cc_dm_begin(Q36CChain *ch, Model *m, int n) {
             fprintf(stderr, "[chain] qwen36: no VRAM to stage the host pool's experts in; a prompt chunk's go to the host's step\n");
             ch->dm_stage_off = 1;
             cc_free(ch->dm_stage); ch->dm_stage = NULL;
+        } else if (!ch->dm_routed_said && q36cc_routes_only(Q36CC_ROUTED_ROWS, ch->dm_fmt)) {   /* the rule where it runs */
+            ch->dm_routed_said = 1;
+            fprintf(stderr, "[chain] qwen36: a prompt chunk copies its layers' host-pool experts over the bus, "
+                            "one of up to %d rows only those its rows route to\n", Q36CC_ROUTED_ROWS);
         }
         ch->dm_stage_dirty = 0;
     }
@@ -1763,18 +1819,46 @@ static CcBuf *q36cc_dm_tab(Q36CChain *ch, int i, int n, int *part) {
     *part = ch->dm_part[i];
     return ch->dm_tab;
 }
-/* whether layer i of a step on table tab stages its experts, and the copy of the first such layer
- * from layer i on into the staging (none: nothing to copy) */
+/* the banks the staged layers take in turn: a staged table that writes none (dm_banks 0, a
+ * GGUF's) has one */
+static int q36cc_banks(const Q36CChain *ch) { return ch->dm_banks > 1 ? ch->dm_banks : 1; }
+/* whether layer i of a step on table tab stages its experts, and the copy of the skip-th such layer
+ * from layer i on (1: the first) into its bank in the staging (none: nothing to copy); with one
+ * bank the calls are fetch, fetch_wait and fetch_done, with two their _at ones */
 static int q36cc_stages(Q36CChain *ch, CcBuf *tab, int i) { return tab == ch->dm_tabb && ch->dm_frn[i] > 0 && !ch->dm_partb[i]; }
-static int q36cc_stage_from(Q36CChain *ch, Model *m, int i) {
+static int q36cc_stage_from(Q36CChain *ch, Model *m, int i, int skip) {
     for (; i < m->c.n_layers; i++) {
-        if (!q36cc_stages(ch, ch->dm_tabb, i)) continue;
+        if (!q36cc_stages(ch, ch->dm_tabb, i) || --skip) continue;
         ch->dm_staged++;
         for (int k = 0; k < ch->dm_frn[i]; k++) ch->dm_stage_bytes += ch->dm_fr[ch->dm_fro[i] + k].bytes;
-        return cc_fetch(ch->dm_stage, ch->dm_fr + ch->dm_fro[i], ch->dm_frn[i]);
+        return ch->dm_banks > 1 ? cc_fetch_at(ch->dm_stage, ch->dm_fr + ch->dm_fro[i], ch->dm_frn[i], ch->dm_bank[i])
+                                : cc_fetch(ch->dm_stage, ch->dm_fr + ch->dm_fro[i], ch->dm_frn[i]);
     }
     return 1;
 }
+/* a short chunk's copies for one layer: the experts some row routes to (ids, nk of them) that
+ * have regions in the table (frx: an expert's first, -1 none), two each (weights, scales), in
+ * the table's order; used: E bytes of scratch */
+static int q36cc_routed_fetches(const int *ids, int nk, int E, const int *frx, const CcFetch *fr, uint8_t *used, CcFetch *out) {
+    int k = 0;
+    memset(used, 0, (size_t)E);
+    for (int r = 0; r < nk; r++) if (ids[r] >= 0 && ids[r] < E) used[ids[r]] = 1;
+    for (int e = 0; e < E; e++)
+        if (used[e] && frx[e] >= 0) { out[k++] = fr[frx[e]]; out[k++] = fr[frx[e] + 1]; }
+    return k;
+}
+/* layer i's routes are down: its routed experts into the staging, into layer i's bank (the table
+ * points its experts there) and with its bank's events, the ones q36cc_fetch_wait and q36cc_fetch_done use */
+static int q36cc_stage_routed(Q36CChain *ch, Model *m, int i, int n) {
+    int E = m->c.n_experts, K = m->c.topk;
+    int k = q36cc_routed_fetches((const int *)cc_ptr(ch->dm_idsd) + (size_t)i * n * K, n * K, E, ch->dm_frx + (size_t)i * E,
+                                 ch->dm_fr, ch->dm_used, ch->dm_rfr);
+    ch->dm_staged++; ch->dm_routed_steps++;
+    for (int j = 0; j < k; j++) ch->dm_stage_bytes += ch->dm_rfr[j].bytes;
+    return ch->dm_banks > 1 ? cc_fetch_at(ch->dm_stage, ch->dm_rfr, k, ch->dm_bank[i]) : cc_fetch(ch->dm_stage, ch->dm_rfr, k);
+}
+static int q36cc_fetch_wait(Q36CChain *ch, int i) { return ch->dm_banks > 1 ? cc_fetch_wait_at(ch->dm_bank[i]) : cc_fetch_wait(); }
+static int q36cc_fetch_done(Q36CChain *ch, int i) { return ch->dm_banks > 1 ? cc_fetch_done_at(ch->dm_bank[i]) : cc_fetch_done(); }
 static void q36cc_dm_end(Q36CChain *ch) { if (ch->dm_held) { qt_chain_hold(0); ch->dm_held = 0; } }
 /* layer i's router, routing, shared expert and the device's experts; *v: the host's word
  * a hybrid layer waits for (0: none) */
@@ -1789,6 +1873,16 @@ static int q36cc_dm_layer(Q36CChain *ch, Model *m, Layer *l, int i, int n, unsig
     if (ch->dm_fmt >= 100) qt_chain_layer_format(i, &mp.fmt, &mp.fmt_d);   /* a GGUF's types change from layer to layer */
     int stg = q36cc_stages(ch, tab, i);
     int ok = cc_matmul(ch->t_gate[i], ch->h2, 0, ch->lg, 0, n) && cc_route(ch->lg, NULL, ch->dm_ids, ch->dm_w, &rp);
+    /* A short chunk: its routes down, the frame drained, then only their experts. The wait cannot block on
+     * the host: a staged chunk has more than Q36CC_STAGE_ROWS >= Q36CC_DM_ROWS rows, so no layer of it
+     * runs hybrid here (q36cc_forward sends a layer with an expert elsewhere to the host's step) and the
+     * host owes the device no word, nor does any layer before this one leave one pending. */
+    if (ok && stg && ch->dm_routed) {
+        double t0 = tm_now();
+        ok = cc_copy(ch->dm_idsd, io, ch->dm_ids, io, (size_t)n * K) && cc_submit(1);
+        ch->wait_ms += tm_now() - t0;   /* the host waited for the device's work up to this router */
+        ok = ok && q36cc_frame_begin(ch) && q36cc_stage_routed(ch, m, i, n);
+    }
     *v = 0;
     /* a layer whose experts are all on the device needs no weights on the host, and its route ids
      * only after the frame (one copy for the chunk before cc_submit); a hybrid layer copies both
@@ -1799,9 +1893,10 @@ static int q36cc_dm_layer(Q36CChain *ch, Model *m, Layer *l, int i, int n, unsig
              cc_copy(ch->dm_wd, io, ch->dm_w, io, (size_t)n * K) &&
              cc_copy(ch->h2d, 0, ch->h2, 0, (size_t)n * D) && cc_signal(ch->dm_dfl, 0, *v);
     }
-    ok = ok && q36cc_shared(ch, m, l, i, n) && (!stg || cc_fetch_wait()) &&
+    ok = ok && q36cc_shared(ch, m, l, i, n) && (!stg || q36cc_fetch_wait(ch, i)) &&
          cc_moe(tab, ch->h2, ch->dm_ids, ch->dm_w, ch->dm_hid, ch->dm_y, NULL, &mp);
-    if (ok && stg) ok = cc_fetch_done() && q36cc_stage_from(ch, m, i + 1);   /* the sum below reads no weights */
+    if (ok && stg) ok = q36cc_fetch_done(ch, i) && (ch->dm_routed || q36cc_stage_from(ch, m, i + 1, q36cc_banks(ch)));   /* the sum below reads no weights;
+                                                                          * the next layer for this bank: q36cc_banks staged layers on */
     if (ok && *v) ok = cc_wait_host(ch->dm_hfl, 0, *v);
     CcMoe ms = mp; ms.parts = 2; ms.h_off = *v ? 0 : -1;
     ok = ok && cc_moe(tab, NULL, ch->dm_ids, ch->dm_w, ch->dm_hid, ch->dm_y, ch->dm_hy, &ms);
@@ -2019,7 +2114,9 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
         if (half && !cc_copy(ch->csd, 0, ch->cs, 0, (size_t)n * 2 * half)) goto lost;
         if (half && c->lfm3 && !cc_copy(ch->csd, (size_t)ch->rows * c->rotary_dim, ch->cs, (size_t)ch->rows * c->rotary_dim,
                                         (size_t)n * 2 * half)) goto lost;   /* the sliding layers' table */
-        if (dm && q36cc_dm_tab(ch, 0, n, &(int){0}) == ch->dm_tabb && !q36cc_stage_from(ch, m, 0)) goto lost;   /* the first staged layer's copy */
+        ch->dm_routed = q36cc_routes_only(n, ch->dm_fmt);   /* every chunk, before a layer reads it: a short one's layers copy after their routers */
+        if (dm && !ch->dm_routed && q36cc_dm_tab(ch, 0, n, &(int){0}) == ch->dm_tabb)   /* the first staged layers' copies, one for each bank */
+            for (int s = 1; s <= q36cc_banks(ch); s++) if (!q36cc_stage_from(ch, m, 0, s)) goto lost;
         int ok = 1, pending = 0, pend_i = -1, dm_ids_defer = 0;   /* pend_i: the hybrid layer the host serves after recording the next */
         unsigned pend_v = 0;
         CcBuf *routed = ch->routed;              /* where the layer before left its routed sum */
@@ -2174,6 +2271,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
     if (S == 1) { ch->dec_n++; ch->dec_wait_ms += ch->wait_ms - w0; ch->dec_host_ms += ch->host_ms - h0; }
     return L;
 lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */
+    fprintf(stderr, "[chain] qwen36: a frame of a %d-row step at position %d failed; the CPU runs from here on\n", S, pos_base);
     if (!cc_lost()) cc_finish();
     q36cc_dm_end(ch);
     if (!ch->mx_rows) q36cc_recover(m, pos_base);   /* the held conversation (none in a multiplexed step) */
@@ -2265,8 +2363,9 @@ static void q36cc_report(Model *m) {
                         "the table read whole %llu times, %llu entries patched; %.1f ms choosing and staging, %.1f ms patching\n",
                 ch->dm_promoted, ch->dm_landed, ch->pr_braked, ch->dm_rebuilds, ch->dm_patches, ch->promo_ms, ch->patch_ms);
     if (ch->dm_staged)
-        fprintf(stderr, "[chain] qwen36: %llu prompt layer steps staged the host pool's experts (%.2f GB copied over the bus)\n",
-                ch->dm_staged, ch->dm_stage_bytes / 1073741824.0);
+        fprintf(stderr, "[chain] qwen36: %llu prompt layer steps staged the host pool's experts, %llu of them only those their rows "
+                        "route to (%.2f GB copied over the bus)\n",
+                ch->dm_staged, ch->dm_routed_steps, ch->dm_stage_bytes / 1073741824.0);
     if (ch->hp_follows)
         fprintf(stderr, "[chain] qwen36: the host pool followed the residents before %llu prompt chunks: %llu experts joined it, "
                         "%llu left it, %.1f ms\n", ch->hp_follows, ch->hp_joined, ch->hp_left, ch->hp_ms);

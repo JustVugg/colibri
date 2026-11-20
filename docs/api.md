@@ -698,7 +698,7 @@ server's `context_length`.
 A chat request may opt into context compaction with the extension field
 `"context_compaction": "auto"` (`"off"` is the default, the standard behavior;
 `COLI_COMPACT=1` on the server makes `auto` the default for every client). The
-dashboard and `coli chat` send it, so a conversation there never ends in
+chat UI and `coli chat` send it, so a conversation there never ends in
 `context_length_exceeded`:
 
 1. When the conversation does not fit the context, or leaves the answer less
@@ -771,46 +771,32 @@ prompt lookup follow one conversation), and their Vulkan dense chain, DeltaNet o
 the GPU and Metal paths stay off; the Vulkan expert tier serves every
 conversation's experts.
 
-## Web dashboard
+## The chat in the browser
 
-One command serves the OpenAI-compatible API **and** the web console on the
-same port, then opens your browser when the engine is ready:
+One command serves the OpenAI-compatible API and starts the chat UI in front of
+it, then opens your browser on the chat when the engine is ready:
 
 ```bash
-cd web && npm install && npm run build   # once
-./coli web --model <model-dir>
+./coli web --model <model-dir>     # the API on :8000, the chat on :8790
 ```
 
-`coli web` differs from `coli serve` only in opening a browser — both serve the
-dashboard on the same port. On a headless host (no display, often no GPU at all)
-use `coli serve`, or `coli web --no-browser`, and point a browser at it from
-another machine. Nothing in the dashboard needs a desktop session on the host.
+`coli web` is `coli serve` plus the chat UI (`ui/server.py`, Python's standard
+library, no build step) on the API's port + 790 (`--ui-port` picks another); the
+UI stops with it. The API's own address (`http://HOST:8000/`, where the dashboard
+was before the chat) sends a browser on to the chat at the same host;
+`coli web --no-ui` serves the API alone, as the desktop app runs it.
+`coli serve` serves the API alone too, and `coli ui` starts the
+chat next to a `coli serve` that already runs, on this machine or another
+(`--backend http://HOST:PORT`). On a headless host use `coli serve` or
+`coli web --no-browser` and point a browser at it from another machine.
 
-What you get is one workspace with a dock to switch page:
-
-- **Chat**: streaming answers, a reasoning toggle, image input where the engine
-  supports it, the KV slot to answer in, and the conversation exported as a file;
-  with `COLI_FILE_TOOLS=1`, a **Files** toggle that lets the model work on files
-  ([below](#file-tools));
-- **System One**: closed-set answers. A document, a question and the only answers
-  allowed; the engine reads the probability of each answer, generates nothing,
-  and reports an entropy that says when it is not sure. Same thing as
-  `POST /v1/systemone` (see [systemone.md](systemone.md));
-- **Brain**, two views. *Explore* draws the
-  [measured expert atlas](https://github.com/JustVugg/colibri/issues/175) of GLM-5.2 as a cortex with ten regions to
-  enter (publish `experts.json` from `tools/expert_atlas/analyze.py --web`).
-  *Live routing* shows the model actually running: one cell per expert,
-  colour = tier, brightness = routing heat, and the experts routed in each
-  turn flash white and decay;
-- **Profiling**: where the engine spends each turn, by phase (I/O wait, expert
-  matmul, attention, LM head, other), the disk service overlapped with compute,
-  and the last 30 turns as a trend;
-- a light and a dark theme.
-
-The dashboard talks to the engine over a small line protocol and plain JSON
-endpoints — nothing heavier than the engine itself. `web/` is a pure OpenAI-API
-client (React + TypeScript) and also works against any other compatible
-endpoint; the terminal `coli chat` remains the first-class interface.
+The chat proxies `/v1/`, `/health`, `/profile` and `/experts` to the gateway, so
+the page and the API share one origin: streaming answers with the reasoning in
+its own block, pictures where the engine loaded a vision tower, documents (PDF,
+Word, OpenDocument, PowerPoint, web pages, text) read into the message, web
+search, the expert map, the monitor with each turn's profile, System One
+(`POST /v1/systemone`, see [systemone.md](systemone.md)), the Models page and
+coding agents. What it does and how: [ui/README.md](../ui/README.md).
 
 ### File tools
 
@@ -818,33 +804,28 @@ With `./start-here.sh --files 1` (or `coli setup --files 1`, `coli start --files
 which sets `COLI_FILE_TOOLS=1` for the server that run starts (`--files 0`, the
 default, sets it to 0, so the switch is not kept for the next start), or with
 `COLI_FILE_TOOLS=1` in the environment of `coli serve` or `coli web`,
-`/health` reports `"file_tools": true` and
-the chat shows a **Files** toggle beside **Reasoning**, with a **Working folder**
-in Settings → Model (empty: the home folder). With it on, each request offers the
-model six OpenAI tools: `read_file`, `write_file`, `edit_file`, `list_dir`,
-`change_dir` and `run_command`. `change_dir` moves the working folder, like `cd`,
-for every later call (it is checked to exist, and Settings shows it). `edit_file` replaces one exact block (`old_text`, which must occur
-once in the file) with `new_text`, so a change to a large file costs only the block.
-The gateway renders them in the model's own format and returns its calls as
-`tool_calls` ([tool-calling support](#tool-calling-support)), so the same page
-works on every engine that takes tools; Inkling and OLMoE answer HTTP 400.
+`/health` reports `"file_tools": true` and the chat's **+** menu shows a **File**
+switch, on until it is turned off (a chip under the box says it is on). With it on,
+each request offers the model six OpenAI tools: `read_file`, `write_file`,
+`edit_file`, `list_dir`, `change_dir` and `run_command`. `change_dir` moves the
+working folder (at first the home folder), like `cd`, for every later call; it is
+checked to exist and the page keeps it. `edit_file` replaces one exact block
+(`old_text`, which must occur once in the file) with `new_text`, so a change to a
+large file costs only the block. The gateway renders them in the model's own format
+and returns its calls as `tool_calls` ([tool-calling support](#tool-calling-support)),
+so the same page works on every engine that takes tools; Inkling and OLMoE answer
+HTTP 400.
 
 The page runs each call on `POST /fs/<read|write|edit|list|cd|run>`, asks before every
-write, edit and command, shows each call's output folded under its line,, sends the result back as a `tool` message and streams
-the next round, up to 25 rounds a turn. The calls run as the user who started the
-gateway: a relative path resolves against the working folder, a command runs there
-for at most 120 s with no input, and nothing confines a command to the folder.
+write, edit and command, shows each call's output folded under its line, sends the
+result back as a `tool` message and streams the next round, up to 25 rounds a turn.
+The calls run as the user who started the gateway: a relative path resolves against
+the working folder, a command runs there for at most 120 s with no input, and nothing
+confines a command to the folder.
 
 `/fs/*` is answered only with the variable set, only from this machine (a loopback
 peer, whatever `--host` binds), only with a JSON body, and only to the gateway's own
 page as `Origin`, whatever `--cors-origin` allows for the API; the Host guard and
-`COLI_API_KEY` apply as on every route.
-
-The layout is responsive down to phone widths; the per-turn time breakdown and
-the tok/s trend live on the Profiling page:
-
-<p align="center">
-  <img src="media/colibri-mobile.png" width="270" alt="the dashboard on a phone-sized viewport" />
-  &nbsp;&nbsp;
-  <img src="media/colibri-profiling.png" width="560" alt="the Profiling page: where the engine spends each turn" />
-</p>
+`COLI_API_KEY` apply as on every route. The chat's server (`ui/server.py`) passes
+`/fs/` on only from its own page: its own Host and Origin and the `X-Colibri-UI`
+header a page elsewhere cannot send.

@@ -1,10 +1,11 @@
-"""qwen36 holds a GGUF's dense IQ3_S matrices as 4-bit codes for the CPU (Q36_IQ3S_CODES, #2704).
+"""qwen36 holds a GGUF's dense grid-type matrices in their larger forms for the CPU (Q36_IQ3S_CODES,
+#2704 for IQ3_S): IQ3_S and IQ3_XXS as 4-bit codes, IQ2_XXS, IQ2_XS, IQ2_S and IQ1_S as planes.
 
-A small qwen35 dense GGUF whose DeltaNet projections are IQ3_S in three layers (both of layer 0,
-layer 1's qkv, layer 2's gate) runs on the CPU with the codes and with the file's rows: the engine
-says it holds them as codes only in the first run, both runs give the same tokens, and every
-layer's residual of the last token (DUMP_LAYERS) stays within 1e-4 of the other run's. The
-kernels' bits against their reference are tests/test_gq_r16.c's.
+A small qwen35 dense GGUF whose DeltaNet projections are those six types in three layers runs on
+the CPU with the larger forms and with the file's rows: the engine names every type it holds so
+only in the first run, both runs give the same tokens, and every layer's residual of the last
+token (DUMP_LAYERS) stays within 1e-4 of the other run's. The kernels' bits against their
+reference are tests/test_gq_r16.c's.
 """
 import os
 import re
@@ -26,7 +27,8 @@ try:
 except ImportError:  # pragma: no cover
     write_model = None
 
-HELD = "IQ3_S matrices the CPU computes held as codes"
+HELD = re.compile(r"\[qwen36\] dense ([A-Z0-9_ ]+) matrices held as codes and planes")
+TYPES = {"IQ3_S", "IQ2_XXS", "IQ2_S", "IQ3_XXS", "IQ1_S", "IQ2_XS"}
 
 
 @unittest.skipUnless(ENGINE.exists(), "qwen36 is not built")
@@ -37,7 +39,7 @@ class Qwen36Iq3sCodesTest(unittest.TestCase):
         cls.tmp = Path(tempfile.mkdtemp(prefix="q36_iq3s_"))
         gg = cls.tmp / "m.gguf"
         write_model(gg, np.random.default_rng(23), dense=True,
-                    dn_types={0: ("IQ3_S", "IQ3_S"), 1: ("IQ3_S", "Q8_0"), 2: ("Q8_0", "IQ3_S")})
+                    dn_types={0: ("IQ3_S", "IQ2_XXS"), 1: ("IQ2_S", "IQ3_XXS"), 2: ("IQ1_S", "IQ2_XS")})
         cls.model = cls.tmp / "m"
         r = subprocess.run([sys.executable, str(HERE / "tools" / "gguf_import.py"), str(gg), str(cls.model)],
                            capture_output=True, text=True)
@@ -62,13 +64,15 @@ class Qwen36Iq3sCodesTest(unittest.TestCase):
         self.assertTrue(tokens, "no token line:\n" + log[-2000:])
         return tokens[-1].split(), np.fromfile(dump, dtype=np.float32), log
 
-    def test_codes_give_the_file_rows_answer(self):
+    def test_larger_forms_give_the_file_rows_answer(self):
         with_codes, layers1, log1 = self.run_engine("1")
         rows, layers0, log0 = self.run_engine("0")
-        if HELD not in log1 and "kept in the file's rows" not in log1:
+        held = HELD.search(log1)
+        if not held and "kept in the file's rows" not in log1:
             self.skipTest("this build has no interleaved kernels (no AVX2): the codes are never made")
-        self.assertIn(HELD, log1, log1[-2000:])
-        self.assertNotIn(HELD, log0, log0[-2000:])
+        self.assertTrue(held, log1[-2000:])
+        self.assertEqual(set(held.group(1).split()), TYPES, log1[-2000:])
+        self.assertIsNone(HELD.search(log0), log0[-2000:])
         self.assertEqual(with_codes, rows, "the codes changed the tokens")
         # the layers' residuals: the same integers, other float roundings (test_gq_r16's gap)
         self.assertEqual(layers1.size, layers0.size)

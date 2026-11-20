@@ -615,7 +615,7 @@ before. `prefix_store.h` keeps it (qwen36 does the same, [qwen36.md](qwen36.md#t
 - **Not kept or taken** for a picture's prompt (its placeholders are the same for every
   picture) or a read-out (`logprobs`: every position's frame).
 
-A prompt's top-k lists and candidate masks are not in a checkpoint: the rows read past
+A prompt's top-k lists and candidate blocks are not in a checkpoint: the rows read past
 it publish their own before any layer reads them (a decoded position would read the last
 forward's, and nothing here resumes one). Leaving out any of the window rings, the
 filling group, the rows or the engram history makes `tests/test_dsv41_prefix_store.py`

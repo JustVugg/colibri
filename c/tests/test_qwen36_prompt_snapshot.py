@@ -133,5 +133,63 @@ class Qwen36PromptCancelTest(PromptCancelContract, unittest.TestCase):
         self.assertIn(f"cancelled while reading the prompt: 0 of {len(self.CANCEL_OPENING + self.CANCEL_MORE)}", log, log)
 
 
+@unittest.skipUnless(ENGINE.exists(), "qwen36 is not built")
+@unittest.skipUnless((FIXTURE / "model-globals.safetensors").exists(),
+                     "tiny qwen36 container is absent (tools/convert_qwen36.py)")
+class Qwen36PromptCancelSlotsTest(PromptCancelContract, unittest.TestCase):
+    """KV_SLOTS=2 (serve_mux): the prompt's checks read the stream as with one slot, and hold the
+    other conversations' frames for the loop, which reads them after the prompt. Before, a
+    client gone while its prompt was read held its slot until the whole prompt was read
+    (79 s on Qwen3.8-27B on the CPU)."""
+    CANCEL_AFTER = 2
+    # several conversations keep no prompt-end snapshot (q36_pes_on): a read stopped in the first
+    # (DeltaNet) layer starts over, one stopped before the forward keeps the first turn
+    PROMPT_CANCEL_KEEPS_PREFIX = False
+
+    @classmethod
+    def setUpClass(cls):
+        ensure_byte_tokenizer(FIXTURE)
+
+    def spawn(self, log_prefix=True):
+        return spawn(log_prefix=log_prefix, KV_SLOTS="2")
+
+    def cold(self, prompt):
+        with mock.patch.dict(os.environ, self.CANCEL_ENV):
+            eng = spawn(log_prefix=False)
+        try:
+            return eng.ask("1", prompt, max_tok=8)
+        finally:
+            eng.close()
+
+    def test_the_other_slots_frames_wait_for_the_read(self):
+        """While slot 0's prompt is read, a SUBMIT for slot 1 and slot 0's CANCEL arrive: the read
+        stops in the middle, and slot 1's request then answers what it answers alone."""
+        other = b"And the capital of Italy is"
+        with mock.patch.dict(os.environ, dict(self.CANCEL_ENV, COLI_PROMPT_BREAK_AFTER=str(self.CANCEL_AFTER))):
+            eng = self.spawn()
+        prompt = self.CANCEL_OPENING + self.CANCEL_MORE
+        frames = f"SUBMIT 2 0 {len(prompt)} 8 0 1\n".encode() + prompt + b"\n"
+        frames += f"SUBMIT 5 1 {len(other)} 8 0 1\n".encode() + other + b"\n"
+        frames += b"CANCEL 2\n"
+        eng.p.stdin.write(frames)
+        eng.p.stdin.flush()
+        got, ended = {"2": b"", "5": b""}, {}
+        while len(ended) < 2:
+            line = eng.p.stdout.readline()
+            self.assertTrue(line, "the engine closed its output")
+            parts = line.decode("latin-1").rstrip("\n").split()
+            if parts[0] == "DATA":
+                got[parts[1]] += eng.p.stdout.read(int(parts[2]))
+                eng.p.stdout.readline()
+            elif parts[0] in ("DONE", "ERROR") and parts[1] in got:
+                ended[parts[1]] = " ".join(parts[:3])
+        log = eng.close()
+        self.assertEqual(ended["2"], "ERROR 2 CANCELLED", log)
+        self.assertEqual(got["2"], b"", "the cancelled turn wrote tokens")
+        self.assertIn(f"cancelled while reading the prompt: 0 of {len(prompt)}", log, log)
+        self.assertEqual(ended["5"], "DONE 5 STAT", log)
+        self.assertEqual(got["5"], self.cold(other), "the request held during the read answered otherwise")
+
+
 if __name__ == "__main__":
     unittest.main()

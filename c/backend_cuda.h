@@ -235,6 +235,13 @@ COLI_CUDA_DLLEXPORT int coli_cuda_matmul(ColiCudaTensor **tensor,
                      const void *weights, const float *scales,
                      int fmt, int S, int I, int O, int device, int gs);
 
+/* A vision tower's attention (the Qwen family's, qwen38_vision.h): every row of qkv [n][3][heads][D]
+ * (q, k and v side by side, rotated already) attends to all n, softmax(q.k * scale) over v, into
+ * out [n][heads][D], float32. D 64, 72, 80, 96 or 128. 1 on success; 0 (out untouched) leaves it
+ * to the CPU. Optional in the DLL loader. */
+COLI_CUDA_DLLEXPORT int coli_cuda_vision_attention(int device, float *out, const float *qkv,
+                                                   int n, int heads, int D, float scale);
+
 /* Fused expert pipeline: y = down(silu(gate(x)) * up(x)).  All three tensors
  * must already be resident on one device.  Activations cross PCIe once in
  * each direction instead of once per matrix. */

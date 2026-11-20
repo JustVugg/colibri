@@ -1,8 +1,6 @@
 # The Docker build only needs c/ (engine sources + launcher). Everything else
 # is either huge, host-specific, or irrelevant to the image.
 .git
-web/node_modules
-web/dist
 site
 docs
 **/*.o

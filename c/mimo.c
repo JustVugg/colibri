@@ -33,6 +33,7 @@
  * files pinned by SHA-256) on the tiny fixture of tools/make_mimo_tiny.py.
  */
 #define _GNU_SOURCE
+#define TOK_NFC   /* tok.h applies tokenizer.json's NFC normalizer, as HF does */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1514,7 +1515,8 @@ static void moe(Model *m, int li, const float *xn, int n, float *out) {
                 float v = score[e] + l->bias[e];
                 if (v > bv) { bv = v; best = e; }
             }
-            s[j] = best; w[j] = score[best];
+            /* every score NaN leaves best at -1: route_trace.h's pick, as the other engines */
+            s[j] = rt_router_pick(best, j, E, li); w[j] = score[s[j]];
         }
         float sum = 0;
         for (int j = 0; j < K; j++) sum += w[j];

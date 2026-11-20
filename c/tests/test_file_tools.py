@@ -1,4 +1,4 @@
-"""The dashboard's file tools on the gateway (file_tools.py, POST /fs/*).
+"""The chat's file tools on the gateway (file_tools.py, POST /fs/*).
 
 - Absent unless COLI_FILE_TOOLS=1: a 404, and /health says file_tools false.
 - With it: write, read, list and run in the working folder the page names.

@@ -85,7 +85,7 @@ cd colibri
    它就會為 GPU 重新建置；
 4. **下載模型**，顯示進度並支援續傳：你隨時可以中斷，
    再執行一次就會從中斷的地方繼續；
-5. **啟動 colibri，並在你的瀏覽器中開啟儀表板**，
+5. **啟動 colibri，並在你的瀏覽器中開啟聊天介面**，
    同時印出其他應用程式可以使用的位址：
 
 ```
@@ -163,7 +163,7 @@ Starting colibri
 不會改變產生答案的是哪些權重，也不會改變路由器的決策。
 
 為什麼：為了在人們已經擁有的硬體上執行這種規模的模型，為了觀察它們如何運作
-（儀表板會在每個專家被觸發時把它顯示出來），也為了讓引擎維持得夠小，
+（聊天介面的專家地圖會在每個專家被觸發時把它顯示出來），也為了讓引擎維持得夠小，
 讓任何人都能測量它、讓它變得更快。colibri 同時也是一個開放的研究平台：
 一項最佳化必須以可重現的端到端測量來證明自己的價值，
 而預設策略絕不會在不告知的情況下改變模型精度或路由語意。
@@ -407,17 +407,13 @@ curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -
 都已針對 `coli serve` 測試過。
 
 同樣的模式也可以在終端機中使用（`coli chat` 中的 `/decide merge | request changes | close`），
-以及儀表板的 System One 頁面。完整的請求與回覆格式、評分規則，以及它幫不上忙的情況：
+以及聊天介面的 System One 頁面。完整的請求與回覆格式、評分規則，以及它幫不上忙的情況：
 [docs/systemone.md](docs/systemone.md)。
 
-## 儀表板
+## 瀏覽器中的聊天
 
-`coli web` 會開啟它，一步安裝也會：包含聊天、System One 頁面、
-大腦（Brain）與效能剖析（Profiling）頁面，提供淺色與深色主題。
-
-### 新的聊天介面
-
-`coli ui` 會在執行中的 `coli serve` 旁開啟新的聊天介面：推理有自己的區塊，具備視覺塔的模型可以看圖片，還有網頁搜尋、專家地圖、即時監視器，以及已指向 colibri 的程式設計代理。支援七種語言。請見 [ui/README.md](ui/README.md)。
+`coli web` 會啟動模型並在它前面啟動聊天介面，然後在瀏覽器中開啟聊天；一步安裝也會這樣做。
+`coli ui` 會在已經執行中的 `coli serve` 旁開啟同一個聊天介面，可以在本機，也可以在另一台機器上：推理有自己的區塊，具備視覺塔的模型可以看圖片，文件（PDF、Word、OpenDocument、PowerPoint、網頁、文字）會讀入訊息，還有網頁搜尋、專家地圖、即時監視器、System One、模型頁面，以及已指向 colibri 的程式設計代理。支援七種語言，提供淺色與深色主題。請見 [ui/README.md](ui/README.md)。
 
 <p align="center">
   <img src="docs/media/ui/ui-chat.png" width="900" alt="新的聊天介面：一個問題、收合的推理、回答及其速度">
@@ -440,8 +436,7 @@ curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -
 <p align="center"><em><strong>System One</strong>：給模型一份文件，以及它唯一可以選擇的幾個答案。圖中 RTX PRO 4000 上的 Qwen3.6-35B 讀取一個破壞快取大小上限的拉取請求：
 <strong>request changes 為 81%</strong>，熵 0.56（不確定），讀取 98 個 token，生成 0 個。</em></p>
 
-**效能剖析**（Profiling）頁面顯示每一輪的時間花在哪裡，逐階段劃分，
-並以最近 30 輪呈現趨勢。若在 gateway 旁安裝 [joules](https://pypi.org/project/landauer-gap/)（`pip install landauer-gap`），它還會顯示機器的瓦數，以及最近一輪每個 token 的 joules。
+監視器中的**效能剖析**逐階段（等待專家、專家的矩陣乘法、注意力、LM head）逐輪顯示每一輪的時間花在哪裡。
 
 ### 終端介面
 
@@ -634,13 +629,13 @@ GLM-5.2 請使用帶 int8 MTP head 的 group-scaled（gs64）容器
 
 ```bash
 ./coli chat  --model /nvme/qwen36          # chat in the terminal
-./coli web   --model /nvme/qwen36          # API + dashboard, opens a browser
-./coli serve --model /nvme/qwen36          # API + dashboard, no browser
+./coli web   --model /nvme/qwen36          # API + the chat UI, opens a browser
+./coli serve --model /nvme/qwen36          # the API alone
 ./coli plan  --model /nvme/qwen36          # where the model will live: VRAM, RAM, disk
 ./coli doctor --model /nvme/qwen36         # read-only check: is everything ready?
 ./coli tune  --model /nvme/qwen36          # measure and save this machine's fastest safe settings
 ./coli import /nvme/Flint-UD-Q4_K_XL.gguf  # a GGUF: writes Flint-UD-Q4_K_XL.colibri next to it
-./coli ui                                  # the chat UI, next to a running coli serve
+./coli ui                                  # the chat UI alone, next to a running coli serve
 ./coli tui                                 # the chat in the terminal, on a running coli serve (or --model)
 ```
 
@@ -679,7 +674,7 @@ colibri 希望讓前沿模型減少對稀缺硬體的依賴，並降低執行成
 |---|---|
 | 一步安裝與手動安裝，涵蓋所有平台 | [quickstart.md](docs/quickstart.md) |
 | 透過 AI 助手安裝，以及 MCP 伺服器 | [AI_SETUP.md](docs/AI_SETUP.md)、[MCP_SERVER.md](docs/MCP_SERVER.md) |
-| API：OpenAI、Anthropic、工具、KV slots、儀表板 | [api.md](docs/api.md) |
+| API：OpenAI、Anthropic、工具、KV slots | [api.md](docs/api.md) |
 | System One 與決策模型 | [systemone.md](docs/systemone.md)、[laya.md](docs/laya.md)、[gliner_decide.md](docs/gliner_decide.md)、[clef.md](docs/clef.md) |
 | GGUF 檔案：支援的架構、兩種模式、各引擎如何處理這些區塊 | [gguf.md](docs/gguf.md) |
 | Qwen3.6 引擎上的模型（Flint、Muse Spark Open、LFM3-VL）與 Mistral-Large-4 | [qwen36.md](docs/qwen36.md)、[mistral-large4.md](docs/mistral-large4.md) |
@@ -735,9 +730,8 @@ c/
 ├── resource_plan.py      RAM/VRAM planner behind coli plan and coli doctor
 ├── tools/                conversion, fixtures and benchmarks
 └── tests/                dependency-free C and Python tests
-ui/                       the chat UI (coli ui)
-web/                      the dashboard (a pure API client)
-desktop/                  Tauri desktop shell around the dashboard
+ui/                       the chat UI (coli web, coli ui)
+desktop/                  Tauri desktop shell around the chat UI
 docker/                   container images
 docs/                     reference docs, experiments, media
 site/                     the website

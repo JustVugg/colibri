@@ -99,7 +99,7 @@ la instalación:
    motor se recompila para la GPU;
 4. **descarga el modelo** mostrando el progreso y con reanudación: detenla cuando
    quieras, vuelve a ejecutarla y continúa donde se había parado;
-5. **arranca colibri y abre el panel** en el navegador, e imprime las direcciones
+5. **arranca colibri y abre el chat** en el navegador, e imprime las direcciones
    que pueden usar otras apps:
 
 ```
@@ -181,7 +181,7 @@ velocidad a la que llega la respuesta, no qué pesos ni qué decisiones del rout
 producen.
 
 Por qué: para ejecutar modelos de este tamaño en el hardware que la gente ya posee,
-para verlos trabajar (el panel muestra cada experto en el momento en que se activa),
+para verlos trabajar (el mapa de expertos del chat muestra cada experto en el momento en que se activa),
 y para mantener el motor lo bastante pequeño como para que cualquiera pueda medirlo
 y hacerlo más rápido. colibri es también una plataforma de investigación abierta: una
 optimización se gana su sitio con una medición reproducible de extremo a extremo, y
@@ -473,21 +473,19 @@ arrancado sin `COLI_API_KEY`). Los dos SDK oficiales, sin modificar, están prob
 contra `coli serve`.
 
 El mismo modo está en la terminal (`/decide merge | request changes | close` en
-`coli chat`) y en la página System One del panel. La petición y la respuesta completas,
+`coli chat`) y en la página System One del chat. La petición y la respuesta completas,
 las reglas de puntuación y los casos en que no ayuda:
 [docs/systemone.md](docs/systemone.md).
 
-## El panel
+## El chat en el navegador
 
-`coli web` lo abre, y también lo abre la instalación en un paso: el chat, la página
-System One, el Brain y la página Profiling, en tema claro o oscuro.
-
-### La interfaz de chat
-
-`coli ui` abre el nuevo chat junto a un `coli serve` en ejecución: el razonamiento en
-su propio bloque, las imágenes para los modelos con torre visual, la búsqueda web, el
-mapa de expertos, un monitor en vivo y los agentes de programación ya apuntados a
-colibri. Siete idiomas. Consulta [ui/README.md](ui/README.md).
+`coli web` arranca el modelo y el chat delante de él, y abre el chat en el navegador; también lo
+hace la instalación en un paso. `coli ui` abre el mismo chat junto a un `coli serve` que ya está
+en ejecución, en esta máquina o en otra. El razonamiento en su propio bloque, las imágenes para
+los modelos con torre visual, los documentos (PDF, Word, OpenDocument, PowerPoint, páginas web,
+texto) leídos en el mensaje, la búsqueda web, el mapa de expertos, un monitor en vivo, System
+One, la página Modelos y los agentes de programación ya apuntados a colibri. Siete idiomas, tema
+claro y oscuro. Consulta [ui/README.md](ui/README.md).
 
 <p align="center">
   <img src="docs/media/ui/ui-chat.png" width="900" alt="la interfaz de chat: una pregunta, el razonamiento plegado, la respuesta y su velocidad">
@@ -511,10 +509,8 @@ colibri. Siete idiomas. Consulta [ui/README.md](ui/README.md).
 <p align="center"><em><strong>System One</strong>: dale al modelo un documento y las únicas respuestas que puede elegir. Aquí Qwen3.6-35B en una RTX PRO 4000
 lee una pull request que rompe el límite de tamaño de una caché: <strong>request changes al 81%</strong>, entropía 0,56 (incierto), 98 tokens leídos, 0 generados.</em></p>
 
-La página **Profiling** muestra dónde gasta cada turno su tiempo, fase por fase, con
-los últimos 30 turnos como tendencia. Con [julios](https://pypi.org/project/landauer-gap/)
-instalados junto al gateway (`pip install landauer-gap`) también muestra los vatios de
-la máquina y los julios por token del último turno.
+El **profiling** del monitor muestra dónde gastó cada turno su tiempo, fase por fase (la
+espera de los expertos, sus matmuls, la atención, la LM head), turno tras turno.
 
 ### La interfaz de terminal
 
@@ -744,13 +740,13 @@ de chat, así que los comandos son los mismos para cada modelo:
 
 ```bash
 ./coli chat  --model /nvme/qwen36          # chat in the terminal
-./coli web   --model /nvme/qwen36          # API + dashboard, opens a browser
-./coli serve --model /nvme/qwen36          # API + dashboard, no browser
+./coli web   --model /nvme/qwen36          # API + the chat UI, opens a browser
+./coli serve --model /nvme/qwen36          # the API alone
 ./coli plan  --model /nvme/qwen36          # where the model will live: VRAM, RAM, disk
 ./coli doctor --model /nvme/qwen36         # read-only check: is everything ready?
 ./coli tune  --model /nvme/qwen36          # measure and save this machine's fastest safe settings
 ./coli import /nvme/Flint-UD-Q4_K_XL.gguf  # a GGUF: writes Flint-UD-Q4_K_XL.colibri next to it
-./coli ui                                  # the chat UI, next to a running coli serve
+./coli ui                                  # the chat UI alone, next to a running coli serve
 ./coli tui                                 # the chat in the terminal, on a running coli serve (or --model)
 ```
 
@@ -792,7 +788,7 @@ Un fallo bien controlado vale más aquí que un número rápido sin explicar.
 |---|---|
 | La instalación en un paso y la instalación manual, en cada plataforma | [quickstart.md](docs/quickstart.md) |
 | La instalación a través de un asistente de IA, y el servidor MCP | [AI_SETUP.md](docs/AI_SETUP.md), [MCP_SERVER.md](docs/MCP_SERVER.md) |
-| La API: OpenAI, Anthropic, herramientas, slots KV, panel | [api.md](docs/api.md) |
+| La API: OpenAI, Anthropic, herramientas, slots KV | [api.md](docs/api.md) |
 | System One y los modelos de decisión | [systemone.md](docs/systemone.md), [laya.md](docs/laya.md), [gliner_decide.md](docs/gliner_decide.md), [clef.md](docs/clef.md) |
 | Archivos GGUF: las arquitecturas, los dos modos, qué hace cada motor con los bloques | [gguf.md](docs/gguf.md) |
 | Los modelos del motor de Qwen3.6 (Flint, Muse Spark Open, LFM3-VL) y Mistral-Large-4 | [qwen36.md](docs/qwen36.md), [mistral-large4.md](docs/mistral-large4.md) |
@@ -848,9 +844,8 @@ c/
 ├── resource_plan.py      RAM/VRAM planner behind coli plan and coli doctor
 ├── tools/                conversion, fixtures and benchmarks
 └── tests/                dependency-free C and Python tests
-ui/                       the chat UI (coli ui)
-web/                      the dashboard (a pure API client)
-desktop/                  Tauri desktop shell around the dashboard
+ui/                       the chat UI (coli web, coli ui)
+desktop/                  Tauri desktop shell around the chat UI
 docker/                   container images
 docs/                     reference docs, experiments, media
 site/                     the website

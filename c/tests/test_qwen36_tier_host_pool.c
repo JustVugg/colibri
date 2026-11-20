@@ -11,7 +11,10 @@
  * whose matrices lie apart does not; why the pool is off is named. Fake CUDA backend (its
  * page-locks counted), no GPU, no toolkit. The tier gives the chain's KV mirrors memory back
  * (qt_chain_give_back): its coldest residents, or with their addresses the residents of its
- * coldest pages, whole. */
+ * coldest pages, whole. Then a warm start that pools every expert, the residents too
+ * (qt_chain_host_all): an expert that leaves the card, by a promotion or a give-back, is in the
+ * pool already and the follow keeps them all; the page-locks running out leave the residents
+ * out, not the non-residents, and the follow keeps working; a start after it follows again. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -61,11 +64,146 @@ static void step(int layer, int a, int b) {   /* a row's routes, the misses offe
             qt_note(layer, e, pw[layer][e], pw[layer][e] + MB, pw[layer][e] + 2 * MB, sc[layer][e], sc[layer][e] + IH, sc[layer][e] + 2 * IH);
     }
 }
-/* a warm start as the engine's (tier_warmstart): every expert in RAM, eight on the card, the rest page-locked */
-static void warm(void) {
+/* a warm start as the engine's (tier_warmstart): every expert in RAM, eight on the card, the rest page-locked;
+ * all: and then the residents too, once the non-residents have theirs (its pool_all) */
+static void warm(int all) {
     for (int e = 0; e < NE; e++) for (int l = 0; l < NL; l++) note(l, e, 0);
     qt_fill_wait();
     for (int l = 0; l < NL; l++) for (int e = 0; e < NE; e++) if (!resident(l, e)) note(l, e, 1);
+    if (all) qt_chain_host_all();
+}
+static int promote_layer0(QtPromo *pr) {   /* layer 0 routes 4 and 5 three times; the promotions, done */
+    for (int t = 0; t < 3; t++) step(0, 4, 5);
+    int np = qt_chain_promote(8, pr);
+    for (int k = 0; k < np; k++) qt_chain_promote_done(pr[k].ci, pr[k].vi, 1);
+    return np;
+}
+static int all_pooled(void) {
+    for (int l = 0; l < NL; l++) for (int e = 0; e < NE; e++) if (!pooled(l, e)) return 0;
+    return 1;
+}
+
+/* Every expert pooled by the warm start: a promotion's victim, and an expert the KV mirrors' give-back
+ * takes, is in the pool already, the follow releases nothing, and the chain still sees the residents
+ * move (the epoch and the change list, which stale its staged table). The page-locks running out
+ * leave the residents out, not the non-residents, and then the pool is not whole: the follow stays
+ * on, as without the residents' copies. The start after it (the flag cleared at the exit) follows
+ * again. */
+static void every_expert_pooled(void) {
+    QtPromo pr[8];
+    int j, l, np, unregs, chg[16], over;
+    const unsigned long long eb = 3 * MB + NSC * sizeof(float);
+    qt_source_planar(1);
+    check(qt_init(NL, NE, D, IH, NE, TOPK, 64, 1), "tier starts again, every expert to be pooled");
+    warm(1);
+    check(qt_chain_host_count() == NL * NE && all_pooled() && fake_host_regs - fake_host_unregs == 2 * NL * NE &&
+          G_host_bytes == NL * NE * eb && G_host_all, "every expert pooled: all sixteen page-locked, the eight residents too, their bytes counted");
+    qt_chain_changes(chg, 16, &over);   /* the recording starts */
+    unsigned ep = qt_chain_epoch();
+    np = promote_layer0(pr);
+    check(np >= 1 && !resident(pr[0].vi / NE, pr[0].vi % NE) && pooled(pr[0].vi / NE, pr[0].vi % NE),
+          "every expert pooled: a victim off the card is in the pool already");
+    check(qt_chain_epoch() != ep && qt_chain_changes(chg, 16, &over) == 2 * np && !over,
+          "the chain still sees the promotion: the epoch moved, the change list names the victim and the newcomer");
+    unregs = fake_host_unregs;
+    check(qt_chain_host_follow(&j, &l) == 0 && j == 0 && l == 0 && qt_chain_host_count() == NL * NE &&
+          fake_host_unregs == unregs, "every expert pooled: the follow releases nothing, the newcomers stay in the pool");
+
+    /* the KV mirrors' give-back: the coldest residents leave the card, and are in the pool already */
+    int got = 0, el[8], ee[8];
+    qt_evicted_take(el, ee, 8);   /* the promotion's victims, taken */
+    ep = qt_chain_epoch();
+    size_t freed = qt_chain_give_back(2 * G.exp_bytes - 1, NULL);
+    got = qt_evicted_take(el, ee, 8);
+    check(freed == 2 * G.exp_bytes && got == 2 && !resident(el[0], ee[0]) && !resident(el[1], ee[1]) &&
+          pooled(el[0], ee[0]) && pooled(el[1], ee[1]), "the give-back: two residents leave the card, both in the pool already");
+    check(qt_chain_epoch() != ep && qt_chain_changes(chg, 16, &over) == 2 && !over,
+          "the give-back: the epoch moved and the change list has the two (the chain's staged table is rebuilt from them)");
+    unregs = fake_host_unregs;
+    check(qt_chain_host_follow(&j, &l) == 0 && qt_chain_host_count() == NL * NE && fake_host_unregs == unregs,
+          "the give-back: nothing for the follow to do");
+    qt_shutdown();
+    check(fake_host_unregs == fake_host_regs, "every expert pooled: the exit releases every page-lock");
+
+    /* the page-locks run out (the driver's limit): the non-residents have theirs, the residents get what is left */
+    qt_source_planar(1);
+    check(qt_init(NL, NE, D, IH, NE, TOPK, 64, 1), "tier starts again, the page-locks limited");
+    fake_host_reg_max = fake_host_regs - fake_host_unregs + 2 * (NE + 2);   /* the eight non-residents and two residents */
+    warm(1);
+    int nres = 0;
+    for (int a = 0; a < NL; a++) for (int e = 0; e < NE; e++) nres += resident(a, e) && pooled(a, e);
+    check(qt_chain_host_count() == NE + 2 && nres == 2, "limited: the eight non-residents and two residents page-locked");
+    int rest_in = 1;
+    for (int a = 0; a < NL; a++) for (int e = 0; e < NE; e++) if (!resident(a, e) && !pooled(a, e)) rest_in = 0;
+    check(rest_in, "limited: no non-resident was left out for a resident");
+    check(!G_host_all, "limited: the pool is not whole, the follow stays on");
+    fake_host_reg_max = 0;
+    np = promote_layer0(pr);
+    check(np >= 1 && qt_chain_host_follow(&j, &l) == 1 && pool_is_rest(),
+          "limited: the follow works as without the residents' copies: the victims join, the residents leave, the pool is the non-residents");
+    qt_shutdown();
+    check(fake_host_unregs == fake_host_regs, "limited: the exit releases every page-lock");
+
+    /* the next start, the experts off the card pooled only, follows again: the flag did not outlive the tier */
+    qt_source_planar(1);
+    check(qt_init(NL, NE, D, IH, NE, TOPK, 64, 1), "tier starts again, the experts off the card pooled");
+    warm(0);
+    np = promote_layer0(pr);
+    check(np >= 1 && qt_chain_host_follow(&j, &l) == 1 && j == np && l == np && pool_is_rest(),
+          "the next start follows again: the victims join, the newcomers leave");
+    qt_source_planar(0);
+    qt_shutdown();
+}
+
+/* A GGUF's experts (qt_init_gguf, exact slots as qwen36 asks for them): the pool takes each expert's rows
+ * as the file has them, gate, up and down back to back at their own layer's sizes, no scales. Every expert
+ * pooled: the residents' rows too, whole, and one that leaves the card is in the pool already. */
+enum { GL = 3, GE = 4, GD = 256, GI = 256 };
+static const int g_tg[GL] = {16, 16, 16}, g_td[GL] = {22, 22, 21};
+static const size_t g_gb[GL] = {(size_t)GI * 66, (size_t)GI * 66, (size_t)GI * 66}, g_db[GL] = {(size_t)GD * 82, (size_t)GD * 82, (size_t)GD * 110};
+static void gguf_every_expert_pooled(void) {
+    static unsigned char rows[GL][GE][2 * (size_t)GI * 66 + (size_t)GD * 110];
+    int j, l;
+    for (int a = 0; a < GL; a++) for (int e = 0; e < GE; e++) memset(rows[a][e], 0x30 + a * GE + e, sizeof rows[a][e]);
+    fake_block_elems = 256;
+    qt_gguf_exact_slots(1);
+    /* room on the card for six of the twelve experts (two sizes of slot: the biggest's, to be sure) */
+    size_t one = 2 * qt_pad256((g_gb[2] + 3 * (size_t)GI) / 4 * 4) + qt_pad256((g_db[2] + 3 * (size_t)GD) / 4 * 4);
+    char gb[64]; snprintf(gb, sizeof gb, "%.15f", (double)(6 * one + one / 2) / 1073741824.0);
+    setenv("CUDA_EXPERT_GB", gb, 1);
+    int ok = qt_init_gguf(GL, GE, GD, GI, GE, TOPK, g_tg, g_td, g_gb, g_db, 0);
+    check(ok && G.wfmt == QT_GGUF && G_exact, "GGUF: the tier starts with exact slots");
+    if (!ok) { qt_gguf_exact_slots(0); return; }
+    int layers[GL * GE], eids[GL * GE];
+    int planned = qt_plan_fill(layers, eids, GL * GE);
+    check(planned > 0 && planned < GL * GE, "GGUF: the card holds some of the experts, not all");
+    for (int i = 0; i < planned; i++) {
+        unsigned char *b = rows[layers[i]][eids[i]];
+        qt_note_planned(layers[i], eids[i], b, b + g_gb[layers[i]], b + 2 * g_gb[layers[i]], NULL, NULL, NULL);
+    }
+    qt_fill_wait();
+    int regs = fake_host_regs;
+    for (int a = 0; a < GL; a++) for (int e = 0; e < GE; e++) if (!qt_is_resident(a, e)) {
+        unsigned char *b = rows[a][e];
+        qt_note_host(a, e, b, b + g_gb[a], b + 2 * g_gb[a], NULL, NULL, NULL);
+    }
+    check(qt_chain_host_count() == GL * GE - planned && fake_host_regs == regs + GL * GE - planned,
+          "GGUF: the experts off the card page-locked, one range each (no scales)");
+    qt_chain_host_all();
+    int whole = 1;
+    for (int a = 0; a < GL; a++) for (int e = 0; e < GE; e++) {
+        const void *w; const float *sc; size_t wb, sb;
+        whole = whole && qt_chain_host(a, e, &w, &wb, &sc, &sb) && w == rows[a][e] && wb == 2 * g_gb[a] + g_db[a] && sb == 0;
+    }
+    check(qt_chain_host_count() == GL * GE && whole, "GGUF, every expert pooled: each one's rows whole, at its own layer's size");
+    int out = layers[0], oe = eids[0];
+    pthread_mutex_lock(&G.mx); res_set(qs(out, oe), 0); pthread_mutex_unlock(&G.mx);   /* an expert leaves the card */
+    const void *w; const float *sc; size_t wb, sb;
+    check(qt_chain_host(out, oe, &w, &wb, &sc, &sb) && qt_chain_host_follow(&j, &l) == 0 && qt_chain_host_count() == GL * GE,
+          "GGUF, every expert pooled: an expert that left the card is in the pool, and the follow keeps them");
+    qt_shutdown();
+    qt_gguf_exact_slots(0);
+    fake_block_elems = 0;
 }
 
 int main(void) {
@@ -84,7 +222,7 @@ int main(void) {
 
     qt_source_planar(1);
     check(qt_init(NL, NE, D, IH, NE, TOPK, 64, 1), "tier starts (int4 gs=64, planar source)");
-    warm();
+    warm(0);
     int chg[16], over, j, l;
     check(qt_chain_host_count() == 8 && fake_host_regs == 16 && G_host_bytes == 8 * eb,
           "warm start: the eight experts off the card page-locked (weights and scales), 16 registrations");
@@ -153,7 +291,7 @@ int main(void) {
     qt_source_planar(1);
     check(qt_init(NL, NE, D, IH, NE, TOPK, 64, 1), "tier starts again, the pool off");
     regs = fake_host_regs;
-    warm();
+    warm(1);   /* asked to pool every expert too: nothing, the pool being off */
     for (int t = 0; t < 3; t++) step(0, 4, 5);
     np = qt_chain_promote(8, pr);
     for (int k = 0; k < np; k++) qt_chain_promote_done(pr[k].ci, pr[k].vi, 1);
@@ -180,6 +318,13 @@ int main(void) {
         check(lo >= 0 && qt_chain_host(lo, eo, &w, &a, &s, &b) && w == pw[lo][eo] && a == 3 * MB && s == sc[lo][eo] &&
               b == (2 * IH + D) * sizeof(float), "per row: an expert's block and its row scales (2 IH + D), as the slot holds them");
         check(!qt_chain_host_planar() && !qt_chain_host_off(), "per row: the pool is on, its int4 in pairs");
+        /* every expert pooled: a resident's copy goes in as the slot holds it, pairs and row scales */
+        qt_chain_host_all();
+        int ro = -1, rr = -1;
+        for (int l = 0; l < NL && ro < 0; l++) for (int e = 0; e < NE; e++) if (resident(l, e)) { ro = l; rr = e; break; }
+        check(qt_chain_host_count() == NL * NE && all_pooled() && ro >= 0 && qt_chain_host(ro, rr, &w, &a, &s, &b) &&
+              w == pw[ro][rr] && a == 3 * MB && s == sc[ro][rr] && b == (2 * IH + D) * sizeof(float),
+              "per row, every expert pooled: a resident's block and its row scales, as the slot holds them");
     }
     qt_shutdown();
     check(fake_host_unregs == fake_host_regs, "per row: the exit releases every page-lock");
@@ -200,7 +345,7 @@ int main(void) {
      * them, the chain sees the move, and the next follow takes them into the pool */
     qt_source_planar(1);
     check(qt_init(NL, NE, D, IH, NE, TOPK, 64, 1), "tier starts (planar), for the give-back");
-    warm();
+    warm(0);
     {
         int hot[2], nh = 0;
         for (int e = 0; e < NE && nh < 2; e++) if (resident(0, e)) hot[nh++] = e;
@@ -229,7 +374,7 @@ int main(void) {
      * page and releases a page only when it is empty, so the residents go by page: every resident
      * with a matrix in the picked page, and no other; the conversation's experts stay */
     check(qt_init(NL, NE, D, IH, NE, TOPK, 64, 1), "tier starts (planar), for the give-back by page");
-    warm();
+    warm(0);
     {
         int hot[2], nh = 0;
         for (int e = 0; e < NE && nh < 2; e++) if (resident(1, e)) hot[nh++] = e;
@@ -265,7 +410,7 @@ int main(void) {
     /* a planar container's pool says so; the RAM short of every expert turns it off, by name */
     qt_source_planar(1);
     check(qt_init(NL, NE, D, IH, NE, TOPK, 64, 1), "tier starts (planar)");
-    warm();
+    warm(0);
     check(qt_chain_host_count() == 8 && qt_chain_host_planar() && !qt_chain_host_off(), "planar: the pool is on, its int4 planar");
     qt_shutdown();
     check(qt_init(NL, NE, D, IH, NE / 2, TOPK, 64, 1), "tier starts with the RAM holding half of a layer's experts");
@@ -273,7 +418,10 @@ int main(void) {
     qt_source_planar(0);
     qt_shutdown();
 
+    every_expert_pooled();
+    gguf_every_expert_pooled();
+
     if (fails) { printf("test_qwen36_tier_host_pool: %d failure(s)\n", fails); return 1; }
-    printf("OK test_qwen36_tier_host_pool: after promotions the host pool is the non-residents again, every page-lock released at the exit; a per-row container's pairs join it; memory back from the coldest residents, or by page\n");
+    printf("OK test_qwen36_tier_host_pool: after promotions the host pool is the non-residents again, every page-lock released at the exit; a per-row container's pairs join it; memory back from the coldest residents, or by page; every expert pooled, the residents too, when the warm start says so\n");
     return 0;
 }

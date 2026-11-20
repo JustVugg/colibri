@@ -189,7 +189,8 @@ static int qpack_check_token(const char *text, size_t index, const char *field,
 
 static void qpack_free_layout(ColiQpackLayout *layout) {
     if (!layout) return;
-    for (size_t i = 0; i < layout->section_count; i++) {
+    /* sections is NULL when its own calloc is what failed */
+    for (size_t i = 0; layout->sections && i < layout->section_count; i++) {
         free(layout->sections[i].name);
         free(layout->sections[i].dtype);
         free(layout->sections[i].shape);

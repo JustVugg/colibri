@@ -43,6 +43,7 @@
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <termios.h>
 #include <unistd.h>
 #endif
@@ -659,7 +660,7 @@ static void probe_terminal(void) {
 /* ---------------------------------------------------------------- keys */
 
 enum { K_NONE, K_CHAR, K_ENTER, K_NEWLINE, K_BACK, K_DEL, K_LEFT, K_RIGHT, K_UP, K_DOWN, K_HOME, K_END,
-       K_PGUP, K_PGDN, K_TAB, K_BTAB, K_ESC, K_CTRL, K_FN, K_WHEELUP, K_WHEELDOWN, K_CLICK, K_DRAG, K_RELEASE };
+       K_PGUP, K_PGDN, K_TAB, K_BTAB, K_ESC, K_CTRL, K_FN, K_WHEELUP, K_WHEELDOWN, K_CLICK, K_DRAG, K_RELEASE, K_PBEGIN, K_PEND };
 enum { KM_SHIFT = 1, KM_ALT = 2, KM_CTRL = 4 };
 typedef struct {
     int k, mod, x, y;
@@ -804,7 +805,7 @@ static int parse_key(Key *k, int force) {
                 else if (b[j] == ';' && np < 3) np++;
             }
             if (in_paste) {
-                if (fin == '~' && p[0] == 201) in_paste = 0;
+                if (fin == '~' && p[0] == 201) { in_paste = 0; k->k = K_PEND; }
                 return i + 1;
             }
             if (lt) { /* SGR mouse: wheel, left press and release, motion with the left button held */
@@ -830,7 +831,7 @@ static int parse_key(Key *k, int force) {
                 case 3: k->k = K_DEL; break;
                 case 5: k->k = K_PGUP; break;
                 case 6: k->k = K_PGDN; break;
-                case 200: in_paste = 1; break;
+                case 200: in_paste = 1; k->k = K_PBEGIN; break;
                 default: break;
                 }
                 break;
@@ -986,6 +987,107 @@ static int textr(int xr, int y, int maxw, const char *s, uint32_t fg, uint32_t b
 }
 static void hline(int x, int y, int w, uint32_t cp, uint32_t fg, uint32_t bg) {
     for (int i = 0; i < w; i++) put(x + i, y, cp, fg, bg, 0);
+}
+
+/* ---------------------------------------------------------------- copying: a drag over the text */
+
+/* A program that reads the mouse keeps the terminal's own selection from it (the console's quick
+   edit is off too): a drag here selects the cells it covers, row after row as a terminal does, and
+   the release copies their text. */
+static struct { int down, on, x0, y0, x1, y1; } sel;
+
+static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static char *b64(const unsigned char *d, size_t n) {
+    char *o = xrealloc(NULL, n / 3 * 4 + 5), *q = o;
+    size_t i = 0;
+    for (; i + 2 < n; i += 3) {
+        unsigned v = (unsigned)d[i] << 16 | (unsigned)d[i + 1] << 8 | d[i + 2];
+        *q++ = B64[v >> 18]; *q++ = B64[v >> 12 & 63]; *q++ = B64[v >> 6 & 63]; *q++ = B64[v & 63];
+    }
+    if (i < n) {
+        unsigned v = (unsigned)d[i] << 16 | (i + 1 < n ? (unsigned)d[i + 1] << 8 : 0u);
+        *q++ = B64[v >> 18];
+        *q++ = B64[v >> 12 & 63];
+        *q++ = i + 1 < n ? B64[v >> 6 & 63] : '=';
+        *q++ = '=';
+    }
+    *q = 0;
+    return o;
+}
+/* the selection as cell indices, first to last */
+static void sel_range(int *a, int *b) {
+    int s0 = sel.y0 * W + sel.x0, s1 = sel.y1 * W + sel.x1;
+    if (s0 > s1) { int x = s0; s0 = s1; s1 = x; }
+    *a = s0 < 0 ? 0 : s0;
+    *b = s1 >= W * H ? W * H - 1 : s1;
+}
+/* the selection over the frame: its cells' colours swapped */
+static void sel_paint(void) {
+    if (!sel.on || !scr) return;
+    int a, b;
+    sel_range(&a, &b);
+    for (int i = a; i <= b; i++) { uint32_t f = scr[i].fg; scr[i].fg = scr[i].bg; scr[i].bg = f; }
+}
+/* the selected cells' text: each row without its trailing blanks, the rows on lines of their own */
+static char *sel_text(void) {
+    int a, b;
+    sel_range(&a, &b);
+    char *o = xrealloc(NULL, (size_t)(b - a + 1) * 5 + 1);
+    size_t n = 0, keep = 0;   /* keep: the bytes up to the row's last character that is not blank */
+    for (int i = a; i <= b; i++) {
+        if (i > a && i % W == 0) { n = keep; o[n++] = '\n'; keep = n; }
+        uint32_t cp = scr[i].cp;
+        if (cp == CONT) continue;
+        n += (size_t)u8enc(cp ? cp : ' ', o + n);
+        if (cp && cp != ' ') keep = n;
+    }
+    o[keep] = 0;
+    return o;
+}
+/* text to the clipboard: 1 when it went somewhere */
+static int clip_copy(const char *t) {
+#ifdef _WIN32
+    int wn = MultiByteToWideChar(CP_UTF8, 0, t, -1, NULL, 0), ok = 0;
+    if (wn <= 0 || !OpenClipboard(NULL)) return 0;
+    EmptyClipboard();
+    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, (size_t)wn * sizeof(wchar_t));
+    wchar_t *w = h ? (wchar_t *)GlobalLock(h) : NULL;
+    if (w) {
+        MultiByteToWideChar(CP_UTF8, 0, t, -1, w, wn);
+        GlobalUnlock(h);
+        ok = SetClipboardData(CF_UNICODETEXT, h) != NULL;
+    }
+    if (h && !ok) GlobalFree(h);
+    CloseClipboard();
+    return ok;
+#else
+    /* the terminal's clipboard (OSC 52, which most terminals and tmux take), and the desktop's
+       through the first tool for it that runs: GNOME's terminal (VTE) ignores OSC 52 */
+    char *e = b64((const unsigned char *)t, strlen(t));
+    ob_s("\x1b]52;c;");
+    ob_s(e);
+    ob_s("\x07");
+    free(e);
+    const char *tools[5];
+    int nt = 0;
+#ifdef __APPLE__
+    tools[nt++] = "pbcopy";
+#endif
+    const char *wl = getenv("WAYLAND_DISPLAY"), *x11 = getenv("DISPLAY");
+    if (wl && *wl) tools[nt++] = "wl-copy";
+    if (x11 && *x11) { tools[nt++] = "xclip -selection clipboard"; tools[nt++] = "xsel -ib"; }
+    void (*was)(int) = signal(SIGPIPE, SIG_IGN);   /* a tool that is not there closes the pipe */
+    for (int i = 0; i < nt; i++) {
+        char cmd[96];
+        snprintf(cmd, sizeof cmd, "%s >/dev/null 2>&1", tools[i]);
+        FILE *f = popen(cmd, "w");
+        if (!f) continue;
+        fputs(t, f);
+        if (pclose(f) == 0) break;
+    }
+    signal(SIGPIPE, was);
+    return 1;
+#endif
 }
 
 /* ---------------------------------------------------------------- the bird as a picture */
@@ -1517,6 +1619,9 @@ enum { M_USER, M_ASSIST };
 typedef struct {
     int kind, model, streaming, toks, err;
     char *text, *reason;
+    char *docs, *files; /* the documents' text sent ahead of the message, the files' names */
+    char **img;         /* its pictures, data: URLs */
+    int nimg;
     double reason_s, tps, secs;
     time_t when;
 } Msg;
@@ -2354,12 +2459,24 @@ static void live_send(Conv *c, double t) {
     buf_add(&b, &n, &cap, "\",\"stream\":true,\"messages\":[");
     for (int i = 0, first = 1; i < c->n - 1; i++) {
         const Msg *x = &c->m[i];
-        if ((x->kind != M_USER && x->kind != M_ASSIST) || !x->text || !*x->text || x->err) continue;
+        if ((x->kind != M_USER && x->kind != M_ASSIST) || !x->text || (!*x->text && !x->docs && !x->nimg) || x->err) continue;
         buf_add(&b, &n, &cap, first ? "{\"role\":\"" : ",{\"role\":\"");
         first = 0;
-        buf_add(&b, &n, &cap, x->kind == M_USER ? "user\",\"content\":\"" : "assistant\",\"content\":\"");
+        buf_add(&b, &n, &cap, x->kind == M_USER ? "user\",\"content\":" : "assistant\",\"content\":");
+        buf_add(&b, &n, &cap, x->nimg ? "[{\"type\":\"text\",\"text\":\"" : "\"");
+        if (x->docs) json_esc(&b, &n, &cap, x->docs);
         json_esc(&b, &n, &cap, x->text);
-        buf_add(&b, &n, &cap, "\"}");
+        buf_add(&b, &n, &cap, "\"");
+        if (x->nimg) {   /* the pictures as the chat page sends them */
+            buf_add(&b, &n, &cap, "}");
+            for (int j = 0; j < x->nimg; j++) {
+                buf_add(&b, &n, &cap, ",{\"type\":\"image_url\",\"image_url\":{\"url\":\"");
+                buf_add(&b, &n, &cap, x->img[j]);
+                buf_add(&b, &n, &cap, "\"}}");
+            }
+            buf_add(&b, &n, &cap, "]");
+        }
+        buf_add(&b, &n, &cap, "}");
     }
     buf_add(&b, &n, &cap, "]}");
     gen.on = 1;
@@ -2793,11 +2910,15 @@ static int msg_draw(const Conv *c, int mi, int x, int y, int w, int draw, double
     switch (m->kind) {
     case M_USER: {
         md_layout(m->text, w - 4, ST_N);
-        int h = vln + 2;
+        int fl = m->files ? 1 : 0, h = vln + 2 + fl;
         if (draw) {
             fill(x, y, w, h, S2);
             for (int r = 0; r < h; r++) put(x, y + r, 0x258e, ACC, S2, 0);
-            for (int i = 0; i < vln; i++) draw_vl(&vl[i], x + 2, y + 1 + i, INK, S2, w - 4);
+            if (fl) {
+                int col = text(x + 2, y + 1, w - 4, T("Allegati: ", "Attached: "), MUTED, S2, 0);
+                text(x + 2 + col, y + 1, w - 4 - col, m->files, ACCT, S2, 0);
+            }
+            for (int i = 0; i < vln; i++) draw_vl(&vl[i], x + 2, y + 1 + fl + i, INK, S2, w - 4);
             struct tm *tm = localtime(&m->when);
             if (tm) textr(x + w - 2, y + h - 1, 8, fmt("%02d:%02d", tm->tm_hour, tm->tm_min), MUTED, S2, 0);
         }
@@ -3050,6 +3171,298 @@ static void in_cut(int a, int b) {
     inlen -= b - a;
     inb[inlen] = 0;
     incur = a;
+}
+
+/* ---------------------------------------------------------------- files: dropped on the terminal */
+
+/* A terminal drops a file as its path, pasted or typed: quoted where it holds a space, with a
+   backslash before each space, or as a file:// URI. An absolute path of a file that exists becomes
+   an attachment of the next message, as on the chat page: a picture goes to the model as one; a
+   document as its text, read by the page's reader (ui/docs.py, which `coli tui` names in COLI_DOCS
+   with its Python in COLI_PYTHON: PDF, Word, OpenDocument, PowerPoint, HTML), or directly when it
+   is plain text and the reader is not there. */
+typedef struct {
+    char name[96];
+    char *text;   /* a document's */
+    char **img;   /* data: URLs: the picture, or a document's scanned pages */
+    int nimg, pages, doc;
+} Att;
+#define ATT_MAX 8
+static Att att[ATT_MAX];
+static int natt, paste_at = -1;
+static char att_err[160];
+
+#define ATT_IMG ".png .jpg .jpeg .webp .gif .bmp"
+#define ATT_TXT ".txt .md .markdown .csv .tsv .json .jsonl .xml .log .yaml .yml .toml .ini .cfg .py .js .ts .tsx " \
+                ".jsx .c .h .cc .cpp .hpp .java .go .rs .sh .bat .ps1 .sql .tex .rst .srt .vtt .css .html .htm"
+
+/* s into d of n bytes, cut at a character's boundary where it does not fit */
+static void str_fit(char *d, size_t n, const char *s) {
+    size_t l = strlen(s);
+    if (l >= n) {
+        l = n - 1;
+        while (l && ((unsigned char)s[l] & 0xc0) == 0x80) l--;
+    }
+    memcpy(d, s, l);
+    d[l] = 0;
+}
+static const char *base_name(const char *p) {
+    const char *b = p;
+    for (; *p; p++)
+        if (*p == '/' || *p == '\\') b = p + 1;
+    return b;
+}
+/* whether the file's extension is one of list's (".a .b"), whatever its case */
+static int ext_in(const char *path, const char *list) {
+    const char *d = strrchr(base_name(path), '.');
+    char e[16];
+    size_t n = d ? strlen(d) : 0;
+    if (!n || n >= sizeof e) return 0;
+    for (size_t i = 0; i <= n; i++) e[i] = (char)tolower((unsigned char)d[i]);
+    for (const char *l = list; (l = strstr(l, e)); l += n)
+        if (l[n] == ' ' || l[n] == 0) return 1;
+    return 0;
+}
+static int is_abs(const char *p) {
+#ifdef _WIN32
+    return (isalpha((unsigned char)p[0]) && p[1] == ':' && (p[2] == '\\' || p[2] == '/')) || (p[0] == '\\' && p[1] == '\\');
+#else
+    return p[0] == '/';
+#endif
+}
+#ifdef _WIN32
+static wchar_t *wide(const char *s) {
+    int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
+    wchar_t *w = xrealloc(NULL, (size_t)(n > 0 ? n : 1) * sizeof(wchar_t));
+    if (n <= 0 || !MultiByteToWideChar(CP_UTF8, 0, s, -1, w, n)) w[0] = 0;
+    return w;
+}
+#endif
+static int is_file(const char *p) {
+#ifdef _WIN32
+    wchar_t *w = wide(p);
+    DWORD a = GetFileAttributesW(w);
+    free(w);
+    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+#else
+    struct stat st;
+    return stat(p, &st) == 0 && S_ISREG(st.st_mode);
+#endif
+}
+/* the file's bytes and a NUL after them, at most max of them: NULL when it cannot be read or is larger */
+static unsigned char *slurp(const char *path, size_t max, size_t *n) {
+#ifdef _WIN32
+    wchar_t *w = wide(path);
+    FILE *f = _wfopen(w, L"rb");
+    free(w);
+#else
+    FILE *f = fopen(path, "rb");
+#endif
+    if (!f) return NULL;
+    size_t cap = 1 << 16, len = 0;
+    unsigned char *d = xrealloc(NULL, cap + 1);
+    for (;;) {
+        if (len == cap) {
+            if (cap > max) break;
+            cap *= 2;
+            d = xrealloc(d, cap + 1);
+        }
+        size_t r = fread(d + len, 1, cap - len, f);
+        if (!r) break;
+        len += r;
+    }
+    fclose(f);
+    if (len > max) { free(d); return NULL; }
+    d[len] = 0;
+    *n = len;
+    return d;
+}
+/* the next word of s[*i, e): its bytes [*t0, *t1) and the path it names, unquoted, in out */
+static int next_tok(const char *s, int *i, int e, int *t0, int *t1, char *out, int cap) {
+    while (*i < e && (s[*i] == ' ' || s[*i] == '\n' || s[*i] == '\t')) (*i)++;
+    if (*i >= e) return 0;
+    *t0 = *i;
+    int o = 0;
+    char q = s[*i] == '"' || s[*i] == '\'' ? s[(*i)++] : 0;
+    while (*i < e && (q ? s[*i] != q : !(s[*i] == ' ' || s[*i] == '\n' || s[*i] == '\t'))) {
+#ifndef _WIN32
+        if (!q && s[*i] == '\\' && *i + 1 < e) (*i)++;   /* my\ file.pdf */
+#endif
+        if (o < cap - 1) out[o++] = s[*i];
+        (*i)++;
+    }
+    if (q && *i < e) (*i)++;
+    *t1 = *i;
+    out[o] = 0;
+    if (!strncmp(out, "file://", 7)) {   /* file://host/path, its %XX decoded */
+        const char *u = out + 7;
+        if (*u != '/') u = strchr(u, '/');
+        char d[1024];
+        int n = 0;
+        for (; u && *u && n < (int)sizeof d - 1; u++) {
+            if (*u == '%' && isxdigit((unsigned char)u[1]) && isxdigit((unsigned char)u[2])) {
+                char h[3] = {u[1], u[2], 0};
+                d[n++] = (char)strtol(h, NULL, 16);
+                u += 2;
+            } else d[n++] = *u;
+        }
+        d[n] = 0;
+        const char *dd = d;
+#ifdef _WIN32
+        if (d[0] == '/' && isalpha((unsigned char)d[1]) && d[2] == ':') dd = d + 1;   /* file:///C:/x */
+#endif
+        snprintf(out, (size_t)cap, "%s", dd);
+    }
+#ifndef _WIN32
+    const char *home = getenv("HOME");
+    if (out[0] == '~' && out[1] == '/' && home) {
+        char d[1024];
+        snprintf(d, sizeof d, "%s%s", home, out + 1);
+        snprintf(out, (size_t)cap, "%s", d);
+    }
+#endif
+    return 1;
+}
+static void att_free(Att *a) {
+    free(a->text);
+    for (int i = 0; i < a->nimg; i++) free(a->img[i]);
+    free(a->img);
+    memset(a, 0, sizeof *a);
+}
+static void att_clear(void) {
+    for (int i = 0; i < natt; i++) att_free(&att[i]);
+    natt = 0;
+}
+static void att_img_add(Att *a, char *url) {
+    a->img = xrealloc(a->img, sizeof(char *) * (size_t)(a->nimg + 1));
+    a->img[a->nimg++] = url;
+}
+/* a document through the chat page's reader: 1 when it ran (*err set where it refused), 0 when it is not there */
+static int att_reader(const char *path, Att *a) {
+    const char *py = getenv("COLI_PYTHON");
+    const char *rd = getenv("COLI_DOCS");
+    if (!py || !*py || !rd || !*rd) return 0;
+    size_t cl = strlen(py) + strlen(rd) + strlen(path) * 4 + 64;
+    char *cmd = xrealloc(NULL, cl);
+#ifdef _WIN32
+    snprintf(cmd, cl, "\"\"%s\" \"%s\" \"%s\" 2>NUL\"", py, rd, path);
+    wchar_t *wc = wide(cmd);
+    FILE *f = _wpopen(wc, L"rb");
+    free(wc);
+#else
+    /* single quotes, a quote in a name closed, escaped and reopened */
+    size_t o = 0;
+    const char *parts[3] = {py, rd, path};
+    for (int k = 0; k < 3; k++) {
+        cmd[o++] = '\'';
+        for (const char *c = parts[k]; *c; c++) {
+            if (*c == '\'') { memcpy(cmd + o, "'\\''", 4); o += 4; }
+            else cmd[o++] = *c;
+        }
+        cmd[o++] = '\'';
+        cmd[o++] = ' ';
+    }
+    snprintf(cmd + o, cl - o, "2>/dev/null");
+    FILE *f = popen(cmd, "r");
+#endif
+    free(cmd);
+    if (!f) return 0;
+    size_t cap = 1 << 16, len = 0, r;
+    char *out = xrealloc(NULL, cap);
+    while ((r = fread(out + len, 1, cap - len, f)) > 0) {
+        len += r;
+        if (len == cap) out = xrealloc(out, cap *= 2);
+    }
+#ifdef _WIN32
+    _pclose(f);
+#else
+    pclose(f);
+#endif
+    int ok = len && json_parse(out, (int)len) > 0 && jt[0].type == 'o';
+    int ke = ok ? jget(0, "error") : -1, kt = ok ? jget(0, "text") : -1;
+    if (!ok || ke >= 0 || kt < 0) {
+        if (ke >= 0) jstr(ke, att_err, sizeof att_err);
+        else snprintf(att_err, sizeof att_err, "%s", T("il lettore dei documenti non ha risposto", "the document reader did not answer"));
+        free(out);
+        return 1;
+    }
+    int tl = jt[kt].end - jt[kt].start + 8;
+    a->text = xrealloc(NULL, (size_t)tl);
+    jstr(kt, a->text, tl);
+    a->pages = (int)jnum(jget(0, "pages"), 0);
+    a->doc = 1;
+    int ki = jget(0, "images");
+    for (int i = 0, n = jlen(ki); i < n; i++) {
+        int k = jat(ki, i), ul = k >= 0 ? jt[k].end - jt[k].start + 8 : 0;
+        if (ul <= 8) continue;
+        char *u = xrealloc(NULL, (size_t)ul);
+        jstr(k, u, ul);
+        att_img_add(a, u);
+    }
+    free(out);
+    att_err[0] = 0;
+    return 1;
+}
+/* path as the next message's attachment: 1, or 0 with att_err saying why */
+static int att_add(const char *path) {
+    Att a;
+    memset(&a, 0, sizeof a);
+    str_fit(a.name, sizeof a.name, base_name(path));
+    att_err[0] = 0;
+    size_t n = 0;
+    if (natt == ATT_MAX) {
+        snprintf(att_err, sizeof att_err, T("al massimo %d file per messaggio", "%d files a message at most"), ATT_MAX);
+    } else if (ext_in(path, ATT_IMG)) {
+        unsigned char *d = slurp(path, (size_t)20 << 20, &n);
+        if (!d) snprintf(att_err, sizeof att_err, "%s", T("illeggibile o oltre 20 MB", "unreadable, or over 20 MB"));
+        else {
+            const char *dot = strrchr(a.name, '.'), *mime = "image/png";
+            if (ext_in(path, ".jpg .jpeg")) mime = "image/jpeg";
+            else if (ext_in(path, ".webp")) mime = "image/webp";
+            else if (ext_in(path, ".gif")) mime = "image/gif";
+            else if (ext_in(path, ".bmp")) mime = "image/bmp";
+            (void)dot;
+            char *e = b64(d, n);
+            size_t ul = strlen(e) + 40;
+            char *u = xrealloc(NULL, ul);
+            snprintf(u, ul, "data:%s;base64,%s", mime, e);
+            free(e);
+            free(d);
+            att_img_add(&a, u);
+        }
+    } else if (!att_reader(path, &a)) {
+        unsigned char *d = ext_in(path, ATT_TXT) ? slurp(path, (size_t)8 << 20, &n) : NULL;
+        if (d && !memchr(d, 0, n < 65536 ? n : 65536)) { a.text = (char *)d; a.doc = 1; }
+        else {
+            free(d);
+            snprintf(att_err, sizeof att_err, "%s", ext_in(path, ATT_TXT) ? T("illeggibile o oltre 8 MB", "unreadable, or over 8 MB")
+                                                                     : T("per i documenti serve il lettore della chat: avvia con coli tui",
+                                                                         "documents need the chat's reader: start it with coli tui"));
+        }
+    }
+    if (att_err[0]) { att_free(&a); return 0; }
+    att[natt++] = a;
+    return 1;
+}
+/* the files among inb[a, b), each taken off the input as it becomes an attachment; with all, only
+   when every word there names one (a paste of paths). The number attached. */
+static int att_scan(int a, int b, int all) {
+    int i = a, t0, t1, n = 0, c0[ATT_MAX], c1[ATT_MAX];
+    static char paths[ATT_MAX][1024];
+    char w[1024];
+    while (next_tok(inb, &i, b, &t0, &t1, w, sizeof w)) {
+        if (is_abs(w) && is_file(w)) {
+            if (n < ATT_MAX) { c0[n] = t0; c1[n] = t1; snprintf(paths[n], sizeof paths[n], "%s", w); n++; }
+        } else if (all) return 0;
+    }
+    int got = 0, ok[ATT_MAX];
+    for (int k = 0; k < n; k++) got += ok[k] = att_add(paths[k]);
+    if (all && got == n) in_cut(a, b);   /* a paste of paths only: none of it stays, its blanks neither */
+    else
+        for (int k = n - 1; k >= 0; k--)   /* from the last: the earlier spans stay where they are */
+            if (ok[k]) in_cut(c0[k], c1[k]);
+    if (got < n) toast(att_err);
+    return got;
 }
 
 /* the input's visual lines (their first bytes) and the cursor's line and column */
@@ -3352,6 +3765,13 @@ static void draw_main(int x0, double t) {
             s = fmt("%s tok/s \xc2\xb7 %d token", dec(el > 0.2 ? gen.toks / el : gen.tps, 1), gen.toks);
         }
         text(ax + 2, act_y, alim - 2, s, SOFT, BG, 0);
+    } else if (natt) {   /* the files the next message takes */
+        char s[600];
+        int o = snprintf(s, sizeof s, "%s", T("Allegati: ", "Attached: "));
+        for (int i = 0; i < natt && o < (int)sizeof s - 1; i++)
+            o += snprintf(s + o, sizeof s - (size_t)o, "%s%s", i ? " \xc2\xb7 " : "", att[i].name);
+        int col = text(ax, act_y, alim, s, ACCT, BG, 0);
+        text(ax + col, act_y, alim - col, T("  ctrl+x li toglie", "  ctrl+x drops them"), FAINT, BG, 0);
     } else {
         for (int i = c->n - 1; i >= 0; i--) {
             const Msg *m = &c->m[i];
@@ -3417,13 +3837,22 @@ static void render(double t) {
         if ((unsigned char)*p < 0x20) *p = ' ';
     int changed = strcmp(title, last_title) != 0;
     if (changed) snprintf(last_title, sizeof last_title, "%s", title);
+    sel_paint();
     present(changed ? title : NULL);
 }
 
 /* ---------------------------------------------------------------- keys to actions */
 
 static void send_input(double t) {
-    if (!inlen) return;
+    att_scan(0, inlen, 0);   /* a path typed, or dropped on a console, which types it */
+    if (natt) {   /* the blanks the paths left at either end */
+        int i = 0;
+        while (i < inlen && (inb[i] == ' ' || inb[i] == '\n')) i++;
+        in_cut(0, i);
+        while (inlen && (inb[inlen - 1] == ' ' || inb[inlen - 1] == '\n')) inb[--inlen] = 0;
+        incur = inlen;
+    }
+    if (!inlen && !natt) return;
     if (gen.on) {
         toast(T("Aspetta la fine della risposta (esc la ferma)", "Wait for the answer to end (esc stops it)"));
         return;
@@ -3438,9 +3867,39 @@ static void send_input(double t) {
         }
         c->title[o] = 0;
         if (inb[i]) snprintf(c->title + o, sizeof c->title - (size_t)o, "\xe2\x80\xa6");
+        if (!o && natt) snprintf(c->title, sizeof c->title, "%s", att[0].name);
     }
     Msg *u = msg_add(c, M_USER);
     u->text = xstrdup(inb);
+    if (natt) {
+        /* as the chat page sends them: each document's text ahead of the message, the pictures after it */
+        char *d = NULL, *f = NULL;
+        size_t dn = 0, dc = 0, fn = 0, fc = 0;
+        for (int i = 0; i < natt; i++) {
+            Att *a = &att[i];
+            buf_add(&f, &fn, &fc, i ? ", " : "");
+            buf_add(&f, &fn, &fc, a->name);
+            if (a->doc) {
+                buf_add(&d, &dn, &dc, dn ? "\n\n---\n\n" : "");
+                buf_add(&d, &dn, &dc, fmt("%s \"%s\"", T("Documento allegato", "Attached document"), a->name));
+                if (a->pages) buf_add(&d, &dn, &dc, fmt(" (%d %s)", a->pages, a->pages == 1 ? T("pagina", "page") : T("pagine", "pages")));
+                buf_add(&d, &dn, &dc, ":\n\n");
+                buf_add(&d, &dn, &dc, a->text && *a->text ? a->text
+                                                         : T("(nessun testo: le pagine sono allegate come immagini)",
+                                                             "(no text: the pages are attached as pictures)"));
+            }
+            for (int j = 0; j < a->nimg; j++) {
+                u->img = xrealloc(u->img, sizeof(char *) * (size_t)(u->nimg + 1));
+                u->img[u->nimg++] = a->img[j];
+            }
+            a->nimg = 0;   /* the message has them now */
+        }
+        if (d) buf_add(&d, &dn, &dc, "\n\n---\n\n");
+        u->docs = d;
+        u->files = f;
+        c->used += (long)(dn / 4) + 256L * u->nimg;
+        att_clear();
+    }
     c->used += inlen / 4 + 1;
     c->upd = time(NULL);
     inlen = incur = 0;
@@ -3461,6 +3920,10 @@ static void conv_delete(int id, double t) {
         Msg *m = &c->m[k];
         free(m->text);
         free(m->reason);
+        free(m->docs);
+        free(m->files);
+        for (int j = 0; j < m->nimg; j++) free(m->img[j]);
+        free(m->img);
     }
     free(c->m);
     memmove(conv + i, conv + i + 1, sizeof(Conv) * (size_t)(nconv - i - 1));
@@ -3478,6 +3941,13 @@ static void switch_conv(int to) {
 
 static void on_key(const Key *k, double t) {
     m_wake(t);
+    if (k->k != K_CLICK && k->k != K_DRAG && k->k != K_RELEASE) sel.on = 0;
+    if (k->k == K_PBEGIN) { paste_at = focus == F_INPUT && !pal.open && !show_mon ? incur : -1; return; }
+    if (k->k == K_PEND) {   /* a paste that is only paths of files: dropped files, attached */
+        if (paste_at >= 0 && paste_at <= incur) att_scan(paste_at, incur, 1);
+        paste_at = -1;
+        return;
+    }
     if (del_pending) {
         int id = del_pending;
         del_pending = 0;
@@ -3497,9 +3967,22 @@ static void on_key(const Key *k, double t) {
         M.oy = M.dpy - M.drag_y;
         return;
     }
+    if (k->k == K_CLICK) {   /* where a selection would start: a drag from here selects */
+        sel.down = 1;
+        sel.on = 0;
+        sel.x0 = sel.x1 = k->x;
+        sel.y0 = sel.y1 = k->y;
+    }
     if (k->k == K_DRAG) {
         double px = k->x * g_cw + g_cw / 2.0, py = k->y * g_ch + g_ch / 2.0;
-        if (!M.down) return;
+        if (!M.down) {
+            if (sel.down) {
+                sel.x1 = k->x < 0 ? 0 : k->x >= W ? W - 1 : k->x;
+                sel.y1 = k->y < 0 ? 0 : k->y >= H ? H - 1 : k->y;
+                sel.on = sel.on || sel.x1 != sel.x0 || sel.y1 != sel.y0;
+            }
+            return;
+        }
         if (!M.dragging && hypot(px - M.dpx, py - M.dpy) > 6) {
             static const int fly[] = {P_FLY1, P_FLY2};
             M.dragging = 1;
@@ -3514,7 +3997,19 @@ static void on_key(const Key *k, double t) {
         }
         return;
     }
+    if (k->k == K_RELEASE && !M.down && sel.down) {   /* the selection's text to the clipboard */
+        sel.down = 0;
+        if (sel.on) {
+            char *s = sel_text();
+            size_t n = 0;
+            for (const char *q = s; *q; q++) n += ((unsigned char)*q & 0xc0) != 0x80;
+            if (n && clip_copy(s)) toast(fmt(T("Copiati %zu caratteri", "%zu characters copied"), n));
+            free(s);
+        }
+        return;
+    }
     if (k->k == K_RELEASE) {
+        sel.down = 0;
         if (M.dragging) { /* it flies back to its place */
             double sx = M.drag_x - M.comp_l, sy = M.drag_y - (M.comp_t - BOX + 1);
             M.dragging = 0;
@@ -3571,6 +4066,9 @@ static void on_key(const Key *k, double t) {
         case 'l': full_redraw = 1; break;
         case 'j': if (focus == F_INPUT) in_insert('\n'); break;
         case 'u': inlen = incur = 0; inb[0] = 0; break;
+        case 'x':
+            if (natt) { att_clear(); toast(T("Allegati tolti", "Attachments dropped")); }
+            break;
         case 'w': {
             int i = incur;
             while (i > 0 && inb[i - 1] == ' ') i--;

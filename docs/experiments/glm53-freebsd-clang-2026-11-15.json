@@ -1,0 +1,79 @@
+{
+  "version": 1,
+  "hypothesis": "On FreeBSD x86-64, building the GLM engine with clang (the base system's compiler, LLVM libomp, with KMP_BLOCKTIME=0 so idle threads sleep at once) decodes GLM-5.3 faster than building it with gcc (libgomp), with identical output.",
+  "commit": "581298ed231a7c115f0391542be32b2bcf0a48de",
+  "model": "GLM-5.3 (744B MoE, 419 GB on disk), colibri int8 container, experts and dense at 8 bit",
+  "command": "gmake -C c colibri CC=gcc (baseline) or gmake -C c colibri (trial: clang); cp <history> <model>/.coli_usage; env DIRECT=1 PIPE=1 python3 coli run --model <model> --ngen 64 --temp 0 \"Explain what a hash table is.\". Three rounds, gcc then clang in each, one script. The commit is risner-main in github.com/risner/colibri: v2.1.0 plus the FreeBSD fixes now in dev, plus this PR's two commits.",
+  "prompt_hash": "e008d3f01aed06e0444798474b4489a9ad5cd866d4cb50c484862952fb4358a5",
+  "hardware": {
+    "cpu": "2x Intel Xeon Gold 6230 (40 cores, hyper-threading off, AVX-512 VNNI), Cisco UCS C240 M5, no GPU",
+    "ram": "848 GB, two NUMA domains",
+    "storage": "two NVMe drives on PCIe x2 links, striped with gstripe, UFS, about 2.6 GB/s sequential; the engine reads with O_DIRECT",
+    "os": "FreeBSD 15.1 amd64; FreeBSD clang 19.1.7 and its libomp from the base system; gcc 14.2.0 (FreeBSD Ports Collection) and its libgomp from packages"
+  },
+  "warmup_runs": 0,
+  "changed_variables": [
+    "CC"
+  ],
+  "baseline": {
+    "config": {
+      "model": "GLM-5.3 int8",
+      "engine": "colibri (glm_moe_dsa), CPU only",
+      "threads": 40,
+      "DIRECT": "1",
+      "PIPE": "1",
+      "hot_thread_tuning": "on (engine default); KMP_BLOCKTIME=0 set by the engine on FreeBSD, read by libomp, ignored by libgomp",
+      "expert_usage_history": "the same .coli_usage file copied back before every run, so every run pins the same experts (about 365 GB)",
+      "scenario": "new process per run; decode of 64 tokens with every expert already in RAM (hit rate 100%)",
+      "tok_s": "64 / the engine's decode seconds",
+      "CC": "gcc"
+    },
+    "samples": {
+      "tok_s": [
+        0.7085,
+        0.7226,
+        0.6756
+      ]
+    },
+    "median_tok_s": 0.7085,
+    "quality": {
+      "method": "all six runs print the same 64 tokens (md5 of the generated text 8cb06830df75); gmake -C c check on FreeBSD 15.1 built with clang: 3112 tests OK, run at 890a7e3a, one commit before the KMP_BLOCKTIME line",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/glm53-freebsd-clang-2026-11-15-raw.txt",
+      "sha256": "6aca20080afc9cc3bea3faafbcdcfbd2800c0a10828d4915fe8c5b2e70624020"
+    }
+  },
+  "trial": {
+    "config": {
+      "model": "GLM-5.3 int8",
+      "engine": "colibri (glm_moe_dsa), CPU only",
+      "threads": 40,
+      "DIRECT": "1",
+      "PIPE": "1",
+      "hot_thread_tuning": "on (engine default); KMP_BLOCKTIME=0 set by the engine on FreeBSD, read by libomp, ignored by libgomp",
+      "expert_usage_history": "the same .coli_usage file copied back before every run, so every run pins the same experts (about 365 GB)",
+      "scenario": "new process per run; decode of 64 tokens with every expert already in RAM (hit rate 100%)",
+      "tok_s": "64 / the engine's decode seconds",
+      "CC": "clang"
+    },
+    "samples": {
+      "tok_s": [
+        0.8988,
+        0.946,
+        1.0002
+      ]
+    },
+    "median_tok_s": 0.946,
+    "quality": {
+      "method": "all six runs print the same 64 tokens (md5 of the generated text 8cb06830df75); gmake -C c check on FreeBSD 15.1 built with clang: 3112 tests OK, run at 890a7e3a, one commit before the KMP_BLOCKTIME line",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/glm53-freebsd-clang-2026-11-15-raw.txt",
+      "sha256": "6aca20080afc9cc3bea3faafbcdcfbd2800c0a10828d4915fe8c5b2e70624020"
+    }
+  },
+  "outcome": "improvement"
+}
