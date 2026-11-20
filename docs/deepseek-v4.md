@@ -764,9 +764,11 @@ expert, already in the slab's layout, so a miss is one read straight into the sl
 moved afterwards. `COLI_WEX_ROOT=<root>` (printed by `tools/wex4_verify`) refuses any other file
 and checks each record's SHA-256 at its first read. A file that does not fit the checkpoint is
 not used and a record that fails its check is read from the safetensors, so the checkpoint stays
-the source. A container of WNR3 records (smaller, lossless) is decoded into the slab on the CPU,
-on the thread that missed, at about 25 MB/s a thread with the reference decoder: a trade of disk
-bytes for CPU time that pays only on a slow drive. Details, the messages and the order of the
+the source. A container of WNR3 records (smaller, lossless) is decoded into the slab on the thread
+that missed: by default with the fast CPU decoder (about 7x the reference's 25 MB/s a thread on an
+i7-7700K, [wex.md](wex.md#the-fast-cpu-decoder)), on the GPU when `COLI_WEX_CUDA_LIB` names the
+CUDA helper, and with the reference under `COLI_WEX_FAST_DECODE=0`: a trade of disk bytes for
+decode time. Details, the messages and the order of the
 checks: [wex.md](wex.md).
 
 ## Prefill: segments, chunks, checkpoints

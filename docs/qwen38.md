@@ -452,8 +452,10 @@ own process.
 computed by the code above. `COLI_WEX_ROOT=<root>` (printed by
 `tools/wex4_verify`) refuses any other file and checks each record's SHA-256 the
 first time it is used. A container of WNR3 records (the same records, coded losslessly) is
-decoded on the CPU by the thread that reads each record, about 105 ms for a 2.6 MB record
-at the reference decoder's 25 MB/s: smaller on disk, slower to load. Details and the checks
+decoded by the thread that reads each record: by default with the fast CPU decoder (about 7x
+the reference on an i7-7700K, [wex.md](wex.md#the-fast-cpu-decoder)), on the GPU when
+`COLI_WEX_CUDA_LIB` names the CUDA helper, and with the reference under `COLI_WEX_FAST_DECODE=0`
+(about 105 ms for a 2.6 MB record at 25 MB/s): smaller on disk, more work to load. Details and the checks
 at attach: [wex.md](wex.md#qwen38-qwen38).
 
 ## Speculative decoding with the MTP head

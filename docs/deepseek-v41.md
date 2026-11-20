@@ -307,10 +307,12 @@ into the same windows by the same readers. `COLI_WEX_ROOT=<root>` (printed by
 record that fails is read from the shards instead. The DSpark stages and the rest of the
 checkpoint stay on the shards. A container of WNR3 records (the published REAP-192 one: 7,680
 records, 123.3 GB against 144.4 GB as RAW) is read a record at a time and decoded on the CPU by
-the reader threads. It gives the same tokens, but on a CPU the decode is the bottleneck: on an
-i7-7700K (4 cores) with both files on one SATA SSD, 8 prompt and 8 generated tokens took
-232.8 s and 293.6 s from the container against 102.4 s and 74.6 s from the shards (engram off,
-cap 8). Details: [wex.md](wex.md#deepseek-v41-deepseek_v41).
+the reader threads. It gives the same tokens. On an i7-7700K (4 cores), the container on NVMe and
+the trunk on a SATA SSD, 8 greedy tokens decoded in 71.1 s with the default fast CPU decoder
+against 62.5-91.6 s from the shards, and in 35.2 s with the CUDA helper (`COLI_WEX_CUDA_LIB`, an
+RTX 3070); with the reference decoder (`COLI_WEX_FAST_DECODE=0`) the decode is the bottleneck,
+293.2 s (engram off, cap 8). Details: [wex.md](wex.md#deepseek-v41-deepseek_v41) and
+[the fast CPU decoder](wex.md#the-fast-cpu-decoder).
 
 ### The cheapest resident tier there is
 

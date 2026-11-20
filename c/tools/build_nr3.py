@@ -11,8 +11,8 @@ encodes WNR3 records with tools/wex_nr3_tools.dll (CPU) and CPU-verifies every r
   --train-lab80: 80 seeded picks spread over every layer of the source (V4.1: the same 80 as before).
   --cz: canonical zero (-0 -> +0); off by default, and useless on Quark MXFP4 (it emits no -0).
 
-bins: the test_decode_batch.cu layout (u32 model_bytes, model, u32 count, per record: 72-B entry with
-file_offset 0 / total_bytes / codec 5, u32 raw_bytes, expected slab, record). The expected slab is the WEX1
+bins: the RECORDS.bin layout tests/test_wex_nr3_gpu.cu reads (u32 model_bytes, model, u32 count, per
+record: 72-B entry with file_offset 0 / total_bytes / codec 5, u32 raw_bytes, expected slab, record). The expected slab is the WEX1
 slab, or Z(WEX1) (-0 stored as +0) for --cz. Records not smaller than raw are left out of a bin.
 container: WEX3 v3, flags 33 (97 with --cz), WNMD descriptor at 64, model at 4096, table, records; only the
 listed layers are present (other entries all zero -> safetensors). Refuses to start without ~0.9 x the

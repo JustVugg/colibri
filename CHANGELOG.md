@@ -33,7 +33,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   (`make -C c tools/wex_decode_bench`) is its C part ([docs/wex-bench.md](docs/wex-bench.md)).
 - **`COLI_WEX_STATS=1`**: one stderr line at exit, `[wex] stats: helper=... fast=...
   reference=... failed=...`, with what decoded the WNR3 records of a WEX4 container
-  (deepseek_v4, qwen38, deepseek_v41; [docs/wex.md](docs/wex.md#counting-the-decodes)).
+  (deepseek_v4, qwen38, deepseek_v41, glm53; [docs/wex.md](docs/wex.md#counting-the-decodes)).
 - **WNR3 records decode on the CPU with the fast decoder** (`COLI_WEX_FAST_DECODE`, default
   on): `coli_wex_decode_record` uses `wex_fast_decode.h` where the CPU has its kernel (AVX2 by
   CPUID, NEON), one thread a record; `0`, or another CPU: the reference, as before. Same bytes,
@@ -42,7 +42,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 - **A fast CPU decoder for WNR3 records** (`c/wex_fast_decode.h`): Wex-WRN2's research decoder
   (AVX2 and NEON kernels, a scalar fallback), the reference's bytes and verdicts at several times its
   speed; on x86-64 the AVX2 kernel is chosen at run time by CPUID, so a build without `-mavx2`
-  carries it too. No engine uses it yet. `tests/test_wex_fast_decode.c` (three builds) in
+  carries it too. `tests/test_wex_fast_decode.c` (three builds) in
   `make test-c` checks it against the reference of `wex_decode.c` on synthetic records and
   mutated mini-records; given a container, on real records too ([docs/wex.md](docs/wex.md)).
 - **DeepSeek V4.1: a batch's first-read SHA-256 on the OpenMP team** (`COLI_WEX_VERIFY`, on
@@ -63,7 +63,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   on an NVIDIA GPU, to host slabs or into device buffers, one record or a batch; ABI 1 and six
   feature bits. A record it refuses leaves every destination untouched, the host batch included.
   Its GPU workspaces come from a pool, one per call in flight, so threads that exit leave none
-  behind. No engine opens it yet. `make wex-cuda-test` checks it against the CPU decoder (needs a GPU;
+  behind. `make wex-cuda-test` checks it against the CPU decoder (needs a GPU;
   not in `make test-c`) ([docs/wex.md](docs/wex.md)).
 - **The WNR3 encoder** (`c/tools/wex_nr3_tools.c`, `c/tools/build_nr3.py`, `make wex-nr3-tools`):
   trains a WNM2 model on chosen experts of a WEX1 container, encodes every record as WNR3
@@ -74,8 +74,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   REAP-192 container (7,680 WNR3 records) runs end to end, the trunk from the shards; each
   record read whole by one reader thread and decoded on the CPU into the expert's six windows,
   after its owner (and its SHA-256 at the first read, when asked); one that fails is read from
-  the shards for the run. Same tokens as the shards; on a 4-core CPU about 3x slower (the
-  decode is the bottleneck). RAW containers and an unset `COLI_WEX_PATH` behave as before.
+  the shards for the run. Same tokens as the shards; on a 4-core i7-7700K, 71 s for 8 tokens
+  with the fast CPU decoder against 62.5-91.6 s from the shards (293 s with
+  `COLI_WEX_FAST_DECODE=0`). RAW containers and an unset `COLI_WEX_PATH` behave as before.
   `tests/test_dsv41_wex4.c`.
 - **Qwen3.8 reads WNR3 records from a WEX4 container** (`COLI_WEX_PATH`): the WNM2 model blob
   checked and registered at attach; each WNR3 record decoded on the CPU by the thread that reads
@@ -89,7 +90,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   run. RAW containers and an unset `COLI_WEX_PATH` behave as before. `tests/test_v4_wex4.c`.
 - **WNR3 records on the CPU** (`c/wex_decode.c`, `c/wex_decode.h`): the WNM2 model registry, a
   WEX4 container's model blob checked against its index hash, and the in-place decode of a WNR3
-  (codec 5) record with the reference decoder. No engine reads WNR3 records yet.
+  (codec 5) record with the reference decoder.
   `tests/test_wex_decode.c` in `make test-c` ([docs/wex.md](docs/wex.md)).
 - **DeepSeek V4.1's routed experts from a WEX4 container** (`COLI_WEX_PATH`, `COLI_WEX_ROOT`,
   `COLI_WEX_VERIFY`): a backbone expert's six tensors read from its one record, by the same
@@ -108,7 +109,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   `tests/test_v4_wex4.c` in `make test-c` ([docs/wex.md](docs/wex.md)).
 - **WEX container format headers** (`c/wex_format.h`, `c/wex_palette.h`, `c/wex_neural_rans.h`):
   the WEX1-WEX3 record entry, its validators and the lossless record codecs, header only, with
-  `tests/test_wex_format.c` in `make test-c`. No engine uses them yet ([docs/wex.md](docs/wex.md)).
+  `tests/test_wex_format.c` in `make test-c` ([docs/wex.md](docs/wex.md)).
 - **WEX4 reader and `tools/wex4_verify`** (`c/wex4.h`): the header page, the index and the records
   of a WEX4 container, validated in place; `wex4_verify FILE` checks every record against the
   index's SHA-256 and prints the root to pin (`COLI_WEX_ROOT=...`). `tests/test_wex4_verify.c` in

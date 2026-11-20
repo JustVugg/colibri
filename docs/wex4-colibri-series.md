@@ -1,13 +1,13 @@
-# WEX4 expert containers in colibri: the whole series on one branch
+# WEX4 expert containers in colibri: the whole series in one pull request
 
-Branch `kaira/wex4-colibri` of this fork: WEX4 expert containers in colibri, with the reader, the
-WNR3 codec (CPU, fast CPU, CUDA), the I/O switches, the bench and GLM-5.3. It holds, as 24 commits
-on `dev` @ 7f6a8ab2 (plus one build fix and this page), the 20 stacked pull requests that were opened against JustVugg/colibri
-(#2861-#2897) and tracked in JustVugg/colibri#2860. Every commit is kept as it was, so the series
-can still be reviewed commit by commit. The PR numbers below are those of JustVugg/colibri.
+WEX4 expert containers in colibri, with the reader, the WNR3 codec (CPU, fast CPU, CUDA), the I/O
+switches, the bench and GLM-5.3. The series brings together the 20 stacked pull requests that were
+opened against JustVugg/colibri (#2861-#2897) and tracked in JustVugg/colibri#2860, plus a build
+fix and this page; `dev` was merged into it later. The commits of the parts are kept as they were,
+so the series can still be reviewed commit by commit. The PR numbers below are those of
+JustVugg/colibri.
 
-Those 20 drafts were closed on 2026-11-17, and their discussion stays there for reference. The
-consolidated series lives only on this fork: nothing of it is proposed to JustVugg/colibri.
+Those 20 drafts were closed on 2026-11-17, and their discussion stays there for reference.
 
 Tracking issue: JustVugg/colibri#2860. Its "Tests wanted" section is the list of tests still
 missing.
@@ -38,7 +38,8 @@ What they give, as measured so far (each with its conditions):
     WNR3 was slower (2.15 tok/s).
   - A byte copy on a second drive, with reads split by a hash of (layer, expert): +49% decode (2.02
     to 2.99 tok/s, one pair, RTX 5090, 7 prompts x 64 tokens), bit-identical logits.
-- On this branch, DeepSeek V4.1 with the published WNR3 container on an i7-7700K with an RTX 3070:
+- On the former PR branches of the series, DeepSeek V4.1 with the published WNR3 container on an
+  i7-7700K with an RTX 3070:
   the same tokens as the shards, at the shards' speed with the fast CPU decoder, and about twice it
   with the CUDA helper (see [End-to-end results](#end-to-end-results)).
 - Per record (16 records of the published V4.1 container, 18,800,640 decoded bytes each):
@@ -50,7 +51,8 @@ What they give, as measured so far (each with its conditions):
 
 ## The parts, in commit order
 
-Short SHAs are those on this branch (`git log --reverse dev..kaira/wex4-colibri`).
+Short SHAs are those of the series' commits; the former PR numbers in the last column stay valid
+whatever form the merge takes.
 
 | # | Part | What it adds | Variables (default) | Commits | Former PR |
 |---|---|---|---|---|---|
@@ -96,12 +98,11 @@ The series order of JustVugg/colibri#2860 is followed: series 1 (rows 1-5), 2 (6
     decodes for `COLI_WEX_STATS` as `coli_wex_decode_record` does (fast, reference, failed).
 - The whole linear stack was then rebased from `dev` @ c7752bf5 onto `dev` @ 7f6a8ab2 without a
   conflict.
-- The two #2897 commits were committed under the series author (they had carried another author
-  name on the fork branch). Their content is the PR's, apart from the conflict resolution above.
+- The two #2897 commits were committed under the series author. Their content is the PR's, apart
+  from the conflict resolution above.
 - One build fix was added (part 21). #2897's `make check` fix predates #2896 being under it, so
   `tests.test_makefile_deps` flagged the headers that #2896's `tests/test_glm53_wex4` rule lists by
   hand.
-- The former branches on this fork are unchanged.
 
 ## How to review
 
@@ -183,8 +184,9 @@ Per record:
 - `COLI_WEX_VERIFY` is on when `COLI_WEX_ROOT` pins the container, and off otherwise.
 - A bad or refused record:
   - DeepSeek V4 and V4.1 read that expert from the shards, and it stays on them for the run.
-  - Qwen3.8 (and GLM-5.3) stop with the reason, because their store has no second copy of the
-    MXFP4 experts.
+  - Qwen3.8 stops with the reason, because its store has no second copy of the MXFP4 experts.
+  - GLM-5.3 stops too. Its MXFP4 shards do hold the same experts, but it does not fall back to
+    them.
 - A container whose WNR3 records are partly value-exact (canonical zero) and partly not is refused
   as a bad file.
 - Under `DSV4_CUDA_MOE_MASKED=1`, DeepSeek V4 refuses a canonical-zero (value-exact) container
@@ -250,8 +252,6 @@ Not run on any machine:
 - A native ARM Linux machine, macOS end to end, and another NVIDIA GPU.
 - MSVC builds of the decoder files.
 - The engram tables.
-
-colibri's CI is not waited on: its maintainer cancels it, so every result here is a local run.
 
 ## Tests wanted
 

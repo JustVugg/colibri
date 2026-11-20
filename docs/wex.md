@@ -40,8 +40,10 @@ The files are kept byte for byte in step with Wex-WRN2's `c/` folder (only the l
 that repository's licence header, and the include guards and two comments, reworded here, differ); a change to the format goes there first, with its
 specification and its conformance vectors. Comments in them that name a `docs/` or `wex4/` path
 mean a path of that repository. `wex_decode.c` and `wex_decode.h` are the exception: Wex-WRN2's
-copy also loads an optional CUDA helper that decodes on the GPU, which is not here (the GPU decode
-comes later), and colibri's adds `coli_wex4_register_model` and the `COLI_WEX_DECODE_API` macro.
+copy also looks for the CUDA helper beside the executable, while colibri's opens it only when
+`COLI_WEX_CUDA_LIB` names it ([below](#how-an-engine-finds-it)); colibri's adds
+`coli_wex4_register_model`, the `COLI_WEX_DECODE_API` macro, the `COLI_WEX_STATS` counters and the
+measured stream count.
 `wex_fast_decode.h` is the other exception: it comes from that repository's research folder,
 without its gather kernel, with the AVX2 kernel chosen at run time, and with
 `wex_fast_decode_record` added ([below](#the-fast-cpu-decoder)).
@@ -140,7 +142,7 @@ c/tests/test_wex_fast_decode --bench experts.nr3.wex 16        # ms per record, 
 
 the neural records decoded by the CUDA helper into host memory (`helper`) and into device
 buffers (`device`), by the fast CPU decoder, by the reference decoder, the ones refused or not
-decoded (`failed`), and the CPU decoder at exit. It is the same for the three engines (the line
+decoded (`failed`), and the CPU decoder at exit. It is the same for the four engines (the line
 comes from the one call they make); a RAW container prints no line. Unset or `0`: nothing.
 
 ### Measuring
@@ -313,8 +315,9 @@ an expert from (the CPU's MoE, the Vulkan and CUDA expert tiers and their warm s
 worker), then reads the record whole into the slot (`g53_wex_read`), hashes it at its first read
 when asked, decodes a WNR3 record in place through `coli_wex_decode_record` (the helper first when
 `COLI_WEX_CUDA_LIB` names it, the CPU otherwise) and points the six pieces into it. A record that
-fails its hash, names another expert or does not decode stops the engine: glm53 has no second
-copy of the experts to fall back to. The run's last line counts the records:
+fails its hash, names another expert or does not decode stops the engine, as on qwen38 (the
+checkpoint's MXFP4 shards hold the same experts, but glm53 does not fall back to them). The run's
+last line counts the records:
 `[glm53] WEX4 records: N read, M WNR3 decoded (CUDA helper H, CPU C)`. `COLI_MODEL_MIRROR`
 copies are for the shards; the container is read from its one path. `tests/test_glm53_wex4.c`
 covers the shards' MXFP4 experts, RAW and WNR3 containers and the refusals.
@@ -405,7 +408,7 @@ make -C c wex-cuda-test        # the helper and tests/test_wex_nr3_gpu, run on s
 | File | What it is |
 |---|---|
 | `c/tools/wex_cuda_bridge.cu` | the helper: the exported functions below, the workspace pools, the model registry, the batch lanes |
-| `c/wex_cuda.cuh` | its kernels (WNR1, WNR2 and WNR3 records; the commit kernel) |
+| `c/wex_cuda.cuh` | its kernels, as in Wex-WRN2 (WNR1, WNR2, WNR3 and palette3 records; the commit kernel). The engines send it WNR3 records only, and those are what `make wex-cuda-test` checks |
 | `c/tests/test_wex_nr3_gpu.cu` | every entry point against the CPU decoder of `wex_neural_rans.h`, on synthetic, crafted and (given a records file) real and mutated records |
 
 The ABI (`wex_cuda_helper_abi()` returns 1) is `wex_cuda_decode_to_host`; everything else is
@@ -454,7 +457,8 @@ COLI_WEX_CUDA_LIB=$PWD/c/kaira_wex_cuda.so COLI_WEX_PATH=experts.wex4 ./c/deepse
 `wex_cuda_decode_to_host`, and decodes it on the CPU when the helper does not (status 1: no
 GPU, no memory; the helper wrote nothing). The bytes are the same either way, so tokens do not
 depend on the helper. On 16 records of the published DeepSeek V4.1 container, an RTX 3070
-decoded a record in 6-9 ms where the CPU reference decoder took about a second. The helper's
+decoded a record in 6-9 ms where one thread of its i7-7700K took about 100 ms with the fast
+decoder and 740-760 ms with the reference. The helper's
 other calls are `coli_wex_cuda_decode_to_device`, `_decode_batch_to_device`,
 `_decode_batch_to_host` and `_host_register` (`wex_decode.h`). Windows and Linux only.
 
