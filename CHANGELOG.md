@@ -574,6 +574,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **The plan and `coli tune` inside a container's CPU quota** (#2932, after #2914): the plan's
+  thread team, the tuning sweep's thread candidates and so a saved profile's fingerprint follow
+  the quota and the affinity mask as the launcher and the engines do; a host with no limit keeps
+  the plan it had. Under `CPUQuota=400%` on an 8-core host: 4 threads instead of 8.
+- **A FIFO in a qpack container no longer hangs the open** (#2931): `manifest.json`,
+  `layout.json` and the layer files open without blocking, and the regular-file checks refuse
+  what is not one.
 - **Qwen3.6's CUDA decode back to 2.1.0's**: the int8 GEMV's four outputs a warp (`gemv_i8_w4`,
   2026-11-03, for Qwen3.8's verify) took every matrix of 2048 inputs or more, and Qwen3.6's
   2048- and 4096-input matrices decode faster an output a warp: Qwen3.6-35B-A3B int4 on an RTX
