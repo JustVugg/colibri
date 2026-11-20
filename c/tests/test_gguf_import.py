@@ -949,18 +949,23 @@ class InklingConfig(unittest.TestCase):
 INK2 = dict(D=128, L=4, E=8, K=2, I=64, H=4, HD=32, KVL=2, KVG=1, DR=8, WIN=8, EXT=16, CK=4, V=300, UV=290)
 INK2_LOCAL = [True, True, False, True]   # layer 2 global
 INK2_SCALED = (0, 1)                     # the NVFP4 layers: experts without their global scale
+# Inkling-2-Mini's shape: six layers in blocks of two, the loop over layers 2-3 (one block, global
+# layer 3 inside it) for three passes with gates of rank 8, layer 5 global after it
+INK2M = dict(INK2, L=6)
+INK2M_LOCAL = [True, True, True, False, True, False]
+INK2M_LOOP = dict(start=2, end=4, passes=3, rank=8)
 
 
-def ink2_weights(rng):
+def ink2_weights(rng, g=INK2, local_layers=INK2_LOCAL, loop=None):
     """A small Inkling-2 under the checkpoint's own names (model.llm.*), f32, every parameter
-    drawn at random: the snapshot's tensors."""
-    g = INK2
+    drawn at random: the snapshot's tensors. loop (INK2M_LOOP): Inkling-2-Mini's, its gates on
+    the loop's layers and the message queries."""
     D, E, I, H, HD, DR, CK = g["D"], g["E"], g["I"], g["H"], g["HD"], g["DR"], g["CK"]
     r = lambda *s, std=0.08, base=0.0: (base + rng.standard_normal(s) * std).astype(np.float32)
     t = {"model.llm.embed.weight": r(g["V"], D, std=0.5), "model.llm.embed_norm.weight": r(D, std=0.1, base=1.0),
          "model.llm.norm.weight": r(D, std=0.1, base=1.0), "model.llm.unembed.weight": r(g["V"], D, std=0.1),
          "model.llm.attn_res.output_query": r(D, std=0.3)}
-    for i, local in enumerate(INK2_LOCAL):
+    for i, local in enumerate(local_layers):
         p = f"model.llm.layers.{i}."
         kv = (g["KVL"] if local else g["KVG"]) * HD
         if local:
@@ -986,6 +991,15 @@ def ink2_weights(rng):
         if i > 0:
             t[f"model.llm.attn_res.attn_queries.{i - 1}"] = r(D, std=0.3) if local else r(3, D, std=0.3)
         t[f"model.llm.attn_res.mlp_queries.{i}"] = r(D, std=0.3)
+        if loop and loop["start"] <= i < loop["end"]:
+            for c in ("attn", "k", "v", "mlp"):
+                t[p + f"controllers.{c}.down_weight"] = r(loop["rank"], 2 * D, std=0.1)
+                t[p + f"controllers.{c}.forget_weight"] = r(D, loop["rank"], std=0.3)
+                t[p + f"controllers.{c}.gain_weight"] = r(D, loop["rank"], std=0.3)
+    if loop:
+        n = loop["end"] - loop["start"]
+        t["model.llm.middle_cycle_cross_pass_queries"] = r(2 * n, D, std=0.3)      # [q, mlp] a loop layer
+        t["model.llm.middle_cycle_cross_pass_kv_queries"] = r(2 * n, D, std=0.3)   # [k, v]
     return t
 
 
@@ -1081,6 +1095,98 @@ def write_inkling2(path, t, experts="F32", dense="F32"):
     return held
 
 
+def write_inkling2_mini(path, t, experts="F32"):
+    """The model of ink2_weights(INK2M, loop=INK2M_LOOP) as unsloth's Inkling-2-Mini GGUFs lay it
+    out (llama.cpp's later inkling2 names): block_count and the per-layer arrays in application
+    order (the loop's passes one after the other), the short convolutions as the checkpoint has
+    them but a global layer's static taps in convolution order, the relative bias transposed, an
+    expert's gate and up rows in one tensor, the loop's gates under blk.N.loop_* and the message
+    queries global. The INK2_SCALED layers' experts divided by their global scale (.scale), as
+    the NVFP4 layers'. Returns the model the file holds (t with the experts as read back)."""
+    g, local_layers, lp = INK2M, INK2M_LOCAL, INK2M_LOOP
+    D, E, I, CK, L = g["D"], g["E"], g["I"], g["CK"], g["L"]
+    ls, le, P = lp["start"], lp["end"], lp["passes"]
+    app = list(range(le)) + [i for _ in range(P - 1) for i in range(ls, le)] + list(range(le, L))
+    held = dict(t)
+    w = gguf.GGUFWriter(str(path), "inkling2")
+    p = "inkling2."
+    for key, v in (("block_count", len(app)), ("context_length", 4096), ("embedding_length", D),
+                   ("attention.key_length", g["HD"]), ("attention.key_length_swa", g["HD"]), ("vocab_size", g["V"]),
+                   ("vocab_size_unpadded", g["UV"]), ("expert_count", E), ("expert_used_count", g["K"]),
+                   ("expert_feed_forward_length", I), ("attention.sliding_window", g["WIN"]),
+                   ("attention.relative_length", g["DR"]), ("attention.relative_extent", g["EXT"]),
+                   ("shortconv.l_cache", CK), ("attn_res.block_size", 2), ("attention.log_scale_floor", 4),
+                   ("num_loops", P), ("loop.core_start", ls), ("loop.core_end", le), ("loop.gate_rank", lp["rank"])):
+        w.add_uint32(p + key, v)
+    w.add_array(p + "attention.head_count", [g["H"]] * len(app))
+    w.add_array(p + "attention.head_count_kv", [g["KVL"] if local_layers[a] else g["KVG"] for a in app])
+    w.add_array(p + "attention.sliding_window_pattern", [local_layers[a] for a in app])
+    for key, v in (("expert_weights_scale", 2.0), ("attention.log_scale_alpha", 0.1), ("attention.qk_clip", 3.0),
+                   ("attention.relative_clip", 2.0), ("activation.situ_beta", 4.0), ("activation.situ_linear_beta", 25.0),
+                   ("final_logit_softcapping", 30.0), ("attention.layer_norm_rms_epsilon", 1e-6)):
+        w.add_float32(p + key, v)
+    toks = [f"<0x{b:02X}>" if b < 256 else f"t{b}" for b in range(g["V"] - 3)] + ["<|bos|>", "<|eos|>", "<|pad|>"]
+    w.add_tokenizer_model("gpt2"); w.add_tokenizer_pre("inkling"); w.add_token_list(toks)
+    w.add_token_types([1] * (g["V"] - 3) + [3, 3, 3]); w.add_token_merges([])
+    w.add_bos_token_id(g["V"] - 3); w.add_eos_token_id(g["V"] - 2)
+    add = lambda name, a: w.add_tensor(name, np.ascontiguousarray(a, dtype=np.float32))
+    def exps(name, a):
+        a = np.ascontiguousarray(a, dtype=np.float32)
+        if experts == "F32":
+            add(name, a)
+            return a
+        q = gguf.quants.quantize(a, QT[experts])
+        w.add_tensor(name, q, raw_dtype=QT[experts])
+        return gguf.quants.dequantize(q, QT[experts]).reshape(a.shape).astype(np.float32)
+    m = "model.llm."
+    add("token_embd.weight", t[m + "embed.weight"]); add("token_embd_norm.weight", t[m + "embed_norm.weight"])
+    add("output_norm.weight", t[m + "norm.weight"]); add("output.weight", t[m + "unembed.weight"])
+    add("output_res_query.weight", t[m + "attn_res.output_query"])
+    add("loop_res_query.weight", t[m + "middle_cycle_cross_pass_queries"])
+    add("loop_kv_res_query.weight", t[m + "middle_cycle_cross_pass_kv_queries"])
+    for i, local in enumerate(local_layers):
+        s, b = f"{m}layers.{i}.", f"blk.{i}."
+        if local:
+            add(b + "attn_norm.weight", t[s + "attn_norm.weight"])
+            for n in "kv":
+                add(b + f"attn_{n}_conv.weight", t[s + f"attn.{n}_sconv.weight"])
+        else:
+            for n in "qkv":
+                add(b + f"attn_{n}_inp_norm.weight", t[s + f"{n}_input_norm.weight"])
+            for n in "kv":
+                add(b + f"attn_{n}_conv.weight", t[s + f"attn.{n}_sconv.static_w"][::-1].T)
+                add(b + f"attn_{n}_conv_proj.weight", t[s + f"attn.{n}_sconv.weight_proj"])
+        add(b + "ffn_norm.weight", t[s + "mlp_norm.weight"])
+        for gg, hf in (("attn_q", "attn.wq_du.weight"), ("attn_k", "attn.wk_dv.weight"), ("attn_v", "attn.wv_dv.weight"),
+                       ("attn_rel", "attn.wr_du.weight"), ("attn_output", "attn.wo_ud.weight"),
+                       ("attn_gate", "attn.gate_attn.weight"), ("attn_sink_proj", "attn.attn_sink_proj.weight"),
+                       ("attn_q_clip", "attn.q_l2_clip.scale"), ("attn_rel_clip", "attn.rel_l2_clip.scale"),
+                       ("ffn_gate_inp", "mlp.gate.weight"), ("attn_post_conv", "attn_sconv.weight"),
+                       ("ffn_post_conv", "mlp_sconv.weight")):
+            add(b + gg + ".weight", t[s + hf])
+        add(b + "attn_rel_bias.weight", t[s + "attn.rel_logits_proj.proj"].T)
+        add(b + "exp_probs_b.bias", t[s + "mlp.gate.bias"])
+        if i > 0:
+            add(b + "attn_res_query.weight", t[f"{m}attn_res.attn_queries.{i - 1}"])
+        add(b + "ffn_res_query.weight", t[f"{m}attn_res.mlp_queries.{i}"])
+        if ls <= i < le:
+            for c in ("attn", "k", "v", "mlp"):
+                for kind in ("down", "forget", "gain"):
+                    add(b + f"loop_{c}_{kind}.weight", t[s + f"controllers.{c}.{kind}_weight"])
+        gu, dn = t[s + "mlp.experts.gate_up_proj"], t[s + "mlp.experts.down_proj"]
+        if i in INK2_SCALED:
+            sg = (np.abs(gu).max(axis=(1, 2)) / 2688.0).astype(np.float32)
+            sd = (np.abs(dn).max(axis=(1, 2)) / 2688.0).astype(np.float32)
+            gu, dn = gu / sg[:, None, None], dn / sd[:, None, None]
+            add(b + "ffn_gate_up_exps.scale", sg); add(b + "ffn_down_exps.scale", sd)
+        else:
+            sg = sd = np.ones(E, np.float32)
+        held[s + "mlp.experts.gate_up_proj"] = exps(b + "ffn_gate_up_exps.weight", gu) * sg[:, None, None]
+        held[s + "mlp.experts.down_proj"] = exps(b + "ffn_down_exps.weight", dn) * sd[:, None, None]
+    w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
+    return held
+
+
 INK2V = dict(D=32, L=2, H=2, I=64, P=4, M=2, G=4, PROJ=64, IMG=292)   # IMG: the picture's token, past the unpadded vocabulary
 
 
@@ -1161,6 +1267,26 @@ def write_inkling2_pair(root, experts="F32", seed=11, dense="F32", vision=False)
     return root / "gg", snap
 
 
+def write_inkling2_mini_pair(root, experts="F32", seed=13):
+    """write_inkling2_pair's for Inkling-2-Mini: root/mini.gguf imported into root/gg, and
+    root/snap the model the file holds under the official names, with the import's config."""
+    sys.path.insert(0, str(HERE / "tools"))
+    import convert_inkling2_int4 as cv
+    root = Path(root)
+    t = write_inkling2_mini(root / "mini.gguf", ink2_weights(np.random.default_rng(seed), INK2M, INK2M_LOCAL, INK2M_LOOP),
+                            experts)
+    p = subprocess.run([sys.executable, str(HERE / "tools" / "gguf_import.py"), str(root / "mini.gguf"), str(root / "gg")],
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if p.returncode:
+        raise AssertionError(p.stdout.decode())
+    cfg = json.loads((root / "gg" / "config.json").read_text())
+    snap = root / "snap"
+    snap.mkdir()
+    cv.write_safetensors(str(snap / "model.safetensors"), {k: ("F32", v.shape, v.tobytes()) for k, v in t.items()})
+    (snap / "config.json").write_text(json.dumps(cfg))
+    return root / "gg", snap
+
+
 class Inkling2Config(unittest.TestCase):
     """llama.cpp's inkling2 as the inkling engine's flat inkling2_text config.json."""
     @unittest.skipIf(gguf is None, "gguf-py (pip install gguf) is not installed")
@@ -1174,6 +1300,23 @@ class Inkling2Config(unittest.TestCase):
             self.assertEqual((cfg["d_rel"], cfg["rel_extent"], cfg["sliding_window_size"], cfg["conv_kernel_size"]), (8, 16, 8, 4))
             self.assertEqual((cfg["n_routed_experts"], cfg["num_experts_per_tok"], cfg["route_scale"]), (8, 2, 2.0))
             self.assertEqual((cfg["mlp_gate_softcap"], cfg["mlp_up_softcap"], cfg["n_layers_per_attn_res_block"]), (4.0, 25.0, 2))
+            self.assertEqual((cfg["vocab_size"], cfg["unpadded_vocab_size"]), (300, 290))
+
+    @unittest.skipIf(gguf is None, "gguf-py (pip install gguf) is not installed")
+    def test_the_mini_config(self):
+        """Inkling-2-Mini's later metadata names and its loop: block_count counts the passes, the
+        checkpoint's layers are fewer, and their types come from the arrays' application order."""
+        with tempfile.TemporaryDirectory() as tmp:
+            gg, _ = write_inkling2_mini_pair(tmp)
+            cfg = json.loads((gg / "config.json").read_text())
+            self.assertEqual(cfg["model_type"], "inkling2_loop_text")
+            self.assertEqual(cfg["num_hidden_layers"], 6)
+            self.assertEqual(cfg["layer_types"], ["hybrid_sliding" if l else "hybrid" for l in INK2M_LOCAL])
+            self.assertEqual((cfg["loop_layer_index_start"], cfg["loop_layer_index_end"], cfg["loop_num_passes"],
+                              cfg["loop_gate_rank"]), (2, 4, 3, 8))
+            self.assertEqual((cfg["d_rel"], cfg["rel_extent"], cfg["conv_kernel_size"], cfg["log_scaling_n_floor"]), (8, 16, 4, 4))
+            self.assertEqual((cfg["qk_l2_clip_threshold"], cfg["rel_l2_clip_threshold"]), (3.0, 2.0))
+            self.assertEqual((cfg["mlp_gate_softcap"], cfg["mlp_up_softcap"]), (4.0, 25.0))
             self.assertEqual((cfg["vocab_size"], cfg["unpadded_vocab_size"]), (300, 290))
 
 
@@ -1215,6 +1358,27 @@ class Inkling2Gguf(unittest.TestCase):
             ts, ls = inkling_run(snap)
             self.assertEqual(tg, ts)
             self.assertLess(float(np.abs(lg - ls).max()), 1e-3 * max(1.0, float(np.abs(ls).max())))
+
+    def test_the_mini_gguf_is_the_checkpoint(self):
+        """Inkling-2-Mini as unsloth's files lay it out (the later names, the loop's gates and
+        queries, gate and up in one tensor): tokens and logits against the safetensors."""
+        with tempfile.TemporaryDirectory() as tmp:
+            gg, snap = write_inkling2_mini_pair(tmp)
+            tg, lg = inkling_run(gg)
+            ts, ls = inkling_run(snap)
+            self.assertEqual(tg, ts)
+            self.assertLess(float(np.abs(lg - ls).max()), 1e-3 * max(1.0, float(np.abs(ls).max())))
+
+    def test_the_mini_loop_runs(self):
+        """The loop is read and run: the same file with one pass answers otherwise."""
+        with tempfile.TemporaryDirectory() as tmp:
+            gg, _ = write_inkling2_mini_pair(tmp)
+            _, lg = inkling_run(gg)
+            cfg = json.loads((gg / "config.json").read_text())
+            cfg["loop_num_passes"] = 1
+            (gg / "config.json").write_text(json.dumps(cfg))
+            _, l1 = inkling_run(gg)
+            self.assertGreater(float(np.abs(lg - l1).max()), 1e-3)
 
     def test_q8_0_experts(self):
         """Q8_0 blocks, the NVFP4 layers' holding W / scale: the float kernels (GQ_EXACT=1) on the

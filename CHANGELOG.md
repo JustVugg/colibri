@@ -7,6 +7,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### New
 
+- **Inkling-2-Mini** (`thinkingmachines/Inkling-2-Mini`, 26.4B, 3.4B active, Apache 2.0) on the
+  inkling engine: Inkling-2 whose layers 6-17 run three passes with their weights shared, each
+  pass with K/V and convolution states of its own, and from the second pass every loop layer
+  mixes four messages of the previous pass (its block states and its output) into its inputs
+  through low-rank gates. From unsloth's GGUFs (llama.cpp's later `inkling2` names: the
+  convolutions as the checkpoint has them, gate and up in one tensor, the loop's gates and
+  queries, `block_count` counting the passes) with the vision tower from their mmproj
+  (projector `inkling2v`), or from the NVFP4 release through `tools/convert_inkling2_int4.py`
+  (the loop's tensors pass as they are). The CPU, the CUDA and Vulkan expert tiers, and Vulkan's
+  dense chain with the passes on the device (a pass's own K/V mirrors and convolution states,
+  the messages and the gates, `VKC_EW_LOOPGATE`); the CUDA chain, off by default for Inkling-2,
+  leaves a loop to the per-matrix path. The drafter (`INK2_MTP=1`) counts its target layers
+  over the passes. `tools/make_tiny_inkling2_loop.py` and the `inkling2-loop-oracle` job: a tiny
+  random Inkling2LoopForCausalLM token for token (transformers' pull request 51050), plain and
+  through the converter; `tests/test_gguf_import.py` the GGUF's layout.
+- **The CPU's NVFP4 blocks unpacked with AVX2**, their E4M3 scales from their bits instead of
+  `ldexpf` (the same values): Inkling-2's NVFP4 experts from a GGUF.
+
 - **`coli web` opens the chat UI**: it serves the API and starts the chat (`ui/server.py`, the
   page `coli ui` serves) in front of it, on the API's port + 790 (8790 for 8000, `--ui-port`
   picks another), opened in the browser when the engine answers; `coli start` and the one-step
@@ -574,6 +592,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **Inkling's expert cache from the RAM plan in `coli serve`**: without `--cap` the engine got
+  the legacy eight slots a layer, and on Inkling-2 (eight routed experts a token) nearly every
+  expert of a step came again from the page cache. Inkling-2-Mini UD-Q4_K_XL on the CPU: 4.3 ->
+  6.4 tok/s of decode, 6.0 -> 10.9 of prompt. The plan counts a fused `ffn_gate_up_exps` as
+  experts (it took them for 10.5 GB of dense weights) and a loop's passes in the state.
+- **`--gpu none` keeps the inkling engine off a CUDA card** (`COLI_CUDA=0`): a build with both
+  backends ran the experts and the dense matrices on CUDA anyway.
 - **The plan and `coli tune` inside a container's CPU quota** (#2932, after #2914): the plan's
   thread team, the tuning sweep's thread candidates and so a saved profile's fingerprint follow
   the quota and the affinity mask as the launcher and the engines do; a host with no limit keeps

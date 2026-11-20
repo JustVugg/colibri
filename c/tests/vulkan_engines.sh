@@ -636,6 +636,21 @@ PY
     SNAP=ink2_ggufd/gg -- 8 0 ink2_ggufd/ref.json
   CHAINNAME=inkling2 chain_gate inkling "chain inkling2 GGUF Q8_0 dense, tiled GEMM" 0 COLI_VK_DENSE=1 GQ_EXACT=1 COLI_VK_IDOT=0 \
     SNAP=ink2_ggufd/gg -- 8 0 ink2_ggufd/ref.json
+  # Inkling-2-Mini's loop (tools/make_tiny_inkling2_loop.py, transformers' Inkling2LoopForCausalLM:
+  # tools/oracle-inkling2-loop-requirements.txt): the tier with the layers on the CPU, then the
+  # chain with the passes on the device (their own K/V mirrors and convolution states, the
+  # messages and their gates), and prompts only
+  if $PY -c "import transformers; transformers.Inkling2LoopForCausalLM" 2>/dev/null; then
+    $PY tools/make_tiny_inkling2_loop.py tiny_loop
+    local RL=tiny_loop/ref_inkling2.json
+    for cap in 1 8; do
+      tier_gate inkling "inkling2 loop tier f32 cap=$cap" SNAP=tiny_loop -- $cap 0 $RL
+      CHAINNAME=inkling2 chain_gate inkling "chain inkling2 loop f32 cap=$cap" 1 COLI_VK_DENSE=1 SNAP=tiny_loop -- $cap 0 $RL
+    done
+    CHAINMODE=2 CHAINNAME=inkling2 chain_gate inkling "chain inkling2 loop prompts only" 1 COLI_VK_DENSE=1 SNAP=tiny_loop -- 8 0 $RL
+  else
+    echo "  skip: the Inkling-2-Mini loop gates need transformers with Inkling2LoopForCausalLM (tools/oracle-inkling2-loop-requirements.txt)"
+  fi
 }
 
 family_inkling_olmoe() {

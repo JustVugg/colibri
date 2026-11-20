@@ -210,6 +210,7 @@ int  vkc_dnrec(int KD, VkcBuf *cv, VkcBuf *ab, VkcBuf *z, VkcBuf *st, VkcBuf *pr
 #define VKC_EW_HEADGATE 12   /* y = a * sigmoid(b[b_off + i / D]): a gate per head of D values (LFM3) */
 #define VKC_EW_SSMAX    13   /* y = a * (e[e_off + h] * c[c_off + r] + e[e_off + C + h]), h = (i / D) % C, r = i / (D * C):
                               * Mistral-Large-4's SSMax (c the rows' log(pos + 1), e the heads' s, then b) */
+#define VKC_EW_LOOPGATE 14   /* y = (1 - tanh(a)) * c + tanh(b) * e: Inkling-2-Mini's loop gate (inkling2_chain.h) */
 typedef struct { int op, n, D, C, flags, e_row, y_off, a_off, b_off, c_off, e_off; float fc; } VkcEw;
 int  vkc_ew(VkcBuf *y, VkcBuf *a, VkcBuf *b, VkcBuf *c, VkcBuf *e, const VkcEw *p);
 /* chain_qsa.comp (mode 0: nb block keys from b0; mode 1: the selection of S rows, run as two dispatches that write the

@@ -1686,7 +1686,7 @@ def _gguf_sources(model_dir):
 
 # The routed experts _gguf_tensor_sizes names, one entry per expert whatever the family
 # (analyze_model counts them as experts without the family's checkpoint names).
-_GGUF_EXPERT = re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(?:(?:gate|up|down)_proj\.weight|gguf)$")
+_GGUF_EXPERT = re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(?:(?:gate_up|gate|up|down)_proj\.weight|gguf)$")
 
 
 def _gguf_tensor_sizes(parts, layers=None):
@@ -1700,7 +1700,8 @@ def _gguf_tensor_sizes(parts, layers=None):
     import importlib.util
     spec = importlib.util.spec_from_file_location("gguf_reader", Path(__file__).resolve().parent / "tools" / "gguf_reader.py")
     gr = importlib.util.module_from_spec(spec); spec.loader.exec_module(gr)
-    fused = re.compile(r"^blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$")
+    # gate_up: one tensor of both, an expert's gate rows then its up rows (Inkling-2-Mini's files)
+    fused = re.compile(r"^blk\.(\d+)\.ffn_(gate_up|gate|up|down)_exps\.weight$")
     packed = re.compile(r"^blk\.(\d+)\.ffn_exps_colibri$")
     last = None
     for part in parts:
