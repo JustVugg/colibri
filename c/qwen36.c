@@ -10296,11 +10296,21 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     /* Also honor a control arriving during the final projection before DATA.
      * In that case the fully completed prefix is still safe to reuse. */
     if(!prefill_control) prefill_control = serve_control_pending(q->id);
+#ifdef QWEN36_METAL_GRAPH
+    /* The forward ran whole (lo): its copy of the state where the turn opens counts, whether the
+     * request goes on or a STOP or CANCEL ends it below. The graph takes a control only here,
+     * once the prompt is read, and a client that sends the conversation again starts from the copy. */
+    if (snap_armed && lo) qg_snapshot_taken(m, ids);
+#endif
     if(prefill_control){
         /* a STOP or CANCEL seen once the prompt was read whole: the state is its end, the
          * snapshot a client that sends the same prompt again resumes from */
         if(lo && !q->pin && q->logprobs == 0){ q36_pes_take(m, ids, np, lo); q36_pes_commit(m); }
         free(lo);
+#ifdef QWEN36_METAL_GRAPH
+        /* no decode step follows and q36_spec_end is not reached: a GGUF's dense matrices go back here */
+        if (m->graph) qg_gguf_lock(m, m->graph, 0, 1);
+#endif
         g_echo_k = 0; g_echo_id = NULL;
         if(getenv("COLI_PREFIX_LOG")){   /* what the next request finds (prompt_break.h's line) */
             fprintf(stderr,"[PREFIX] %s while reading the prompt: %d of %d prompt tokens held\n",
@@ -10315,7 +10325,6 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     }
     qt_stats_mark();
 #ifdef QWEN36_METAL_GRAPH
-    if (snap_armed) qg_snapshot_taken(m, ids);
     if (!m->graph)   /* both copy the CPU engine's state */
 #endif
     {
