@@ -141,14 +141,14 @@ static const gq_type_info GQ_TYPES[GQ_TYPE_MAX] = {
  * a little more for the K-quants, whose scales it keeps decoded). */
 enum { GQ_Q2_0_R16 = 64, GQ_Q4_K_R16, GQ_Q5_K_R16, GQ_Q6_K_R16, GQ_Q3_K_R16, GQ_IQ4_XS_R16,
        GQ_Q8_0_R16, GQ_Q4_0_R16, GQ_IQ4_NL_R16, GQ_IQ3_S_R16, GQ_IQ2_XXS_R16, GQ_IQ2_XS_R16, GQ_IQ2_S_R16, GQ_IQ3_XXS_R16,
-       GQ_IQ1_S_R16, GQ_IQ1_M_R16, GQ_Q2_K_R16, GQ_MXFP4_R16, GQ_R16_END };
+       GQ_IQ1_S_R16, GQ_IQ1_M_R16, GQ_Q2_K_R16, GQ_MXFP4_R16, GQ_NVFP4_R16, GQ_R16_END };
 static inline int gq_r16_base(int t) {
     static const int8_t base[] = { GQ_Q2_0, GQ_Q4_K, GQ_Q5_K, GQ_Q6_K, GQ_Q3_K, GQ_IQ4_XS, GQ_Q8_0, GQ_Q4_0, GQ_IQ4_NL, GQ_IQ3_S,
-                                   GQ_IQ2_XXS, GQ_IQ2_XS, GQ_IQ2_S, GQ_IQ3_XXS, GQ_IQ1_S, GQ_IQ1_M, GQ_Q2_K, GQ_MXFP4 };
+                                   GQ_IQ2_XXS, GQ_IQ2_XS, GQ_IQ2_S, GQ_IQ3_XXS, GQ_IQ1_S, GQ_IQ1_M, GQ_Q2_K, GQ_MXFP4, GQ_NVFP4 };
     return t >= GQ_Q2_0_R16 && t < GQ_R16_END ? base[t - GQ_Q2_0_R16] : -1;
 }
 static inline int gq_r16_group_bytes(int t) {
-    static const int16_t gb[] = { 288, 2368, 2880, 3360, 1824, 2208, 544, 288, 288, 2208, 1696, 1824, 1824, 2208, 1200, 1376, 1344, 272 };
+    static const int16_t gb[] = { 288, 2368, 2880, 3360, 1824, 2208, 544, 288, 288, 2208, 1696, 1824, 1824, 2208, 1200, 1376, 1344, 272, 576 };
     return t >= GQ_Q2_0_R16 && t < GQ_R16_END ? gb[t - GQ_Q2_0_R16] : -1;
 }
 /* the interleaved form of block type t, or -1 */
@@ -170,7 +170,7 @@ static inline int gq_r16_of_grown(int t) {
 static inline int gq_type_ok(int t) { return t >= 0 && t < GQ_TYPE_MAX && GQ_TYPES[t].blck > 0 && GQ_TYPES[t].supported; }
 static inline const char *gq_type_name(int t) {
     static const char *r16[] = { "Q2_0r16", "Q4_Kr16", "Q5_Kr16", "Q6_Kr16", "Q3_Kr16", "IQ4_XSr16", "Q8_0r16", "Q4_0r16", "IQ4_NLr16", "IQ3_Sr16",
-                                 "IQ2_XXSr16", "IQ2_XSr16", "IQ2_Sr16", "IQ3_XXSr16", "IQ1_Sr16", "IQ1_Mr16", "Q2_Kr16", "MXFP4r16" };
+                                 "IQ2_XXSr16", "IQ2_XSr16", "IQ2_Sr16", "IQ3_XXSr16", "IQ1_Sr16", "IQ1_Mr16", "Q2_Kr16", "MXFP4r16", "NVFP4r16" };
     if (gq_r16_base(t) >= 0) return r16[t - GQ_Q2_0_R16];
     return (t >= 0 && t < GQ_TYPE_MAX && GQ_TYPES[t].name) ? GQ_TYPES[t].name : "?";
 }
@@ -2336,7 +2336,10 @@ static inline const int16_t *gq_iq1_rev(void) {
 /* Q2_K_R16, the file's bytes: d (16 f16), dmin (16 f16), the 16 scale bytes (low nibble the scale,
  * high the min, as the file has them: byte 64 + 16 k + r = row r's group k of 16 elements), then the
  * 2-bit codes in Q2_0_R16's layout (16 words of 64 bytes). MXFP4_R16: the 16 rows' e8m0 bytes, then
- * IQ4_NL_R16's four quads of nibbles: 272 bytes, 16 blocks of 17. */
+ * IQ4_NL_R16's four quads of nibbles: 272 bytes, 16 blocks of 17. NVFP4_R16, a block of 64: the 16
+ * rows' E4M3 scales by group (byte 16 g + r: row r's group g of 16), then each half of 32 as
+ * IQ4_NL_R16's quads (64 + 256 G + 64 q + 4 r), its nibbles reordered so that byte k holds the
+ * half's weights k (low) and 16 + k (high): 576 bytes, 16 blocks of 36. */
 /* The larger forms' packing a row at a time, vectorized (a model's dense matrices are packed at
  * their first product, so this is time to first token): a row's 2-bit levels into Q2_0_R16's
  * transposed words (four levels a byte from four 32-bit words), its sign bits a quad's nibble at
@@ -2533,6 +2536,18 @@ static void gq_r16_pack_blk(int t, uint8_t *o, const uint8_t *const *b) {
             o[r] = s[0];
             for (int q = 0; q < 4; q++) memcpy(o + 16 + 64 * q + 4 * r, s + 1 + 4 * q, 4);
             break;
+        case GQ_NVFP4_R16:   /* the file's group g: byte j its weights j (low) and 8 + j (high) */
+            for (int g = 0; g < 4; g++) o[16 * g + r] = s[g];
+            for (int G = 0; G < 2; G++) {
+                const uint8_t *qa = s + 4 + 16 * G, *qb = qa + 8;   /* groups 2G and 2G + 1 */
+                uint8_t nb[16];
+                for (int k = 0; k < 16; k++) {
+                    const int lo = k < 8 ? qa[k] & 15 : qa[k - 8] >> 4, hi = k < 8 ? qb[k] & 15 : qb[k - 8] >> 4;
+                    nb[k] = (uint8_t)(lo | hi << 4);
+                }
+                for (int q = 0; q < 4; q++) memcpy(o + 64 + 256 * G + 64 * q + 4 * r, nb + 4 * q, 4);
+            }
+            break;
         }
     }
 }
@@ -2669,6 +2684,19 @@ static void gq_r16_unpack_blk(int t, const uint8_t *o, int r, uint8_t *s) {
     case GQ_MXFP4_R16:
         s[0] = o[r];
         for (int q = 0; q < 4; q++) memcpy(s + 1 + 4 * q, o + 16 + 64 * q + 4 * r, 4);
+        break;
+    case GQ_NVFP4_R16:
+        for (int g = 0; g < 4; g++) s[g] = o[16 * g + r];
+        for (int G = 0; G < 2; G++) {
+            uint8_t nb[16], *qa = s + 4 + 16 * G, *qb = qa + 8;
+            for (int q = 0; q < 4; q++) memcpy(nb + 4 * q, o + 64 + 256 * G + 64 * q + 4 * r, 4);
+            memset(qa, 0, 16);
+            for (int k = 0; k < 16; k++) {
+                const int lo = nb[k] & 15, hi = nb[k] >> 4;
+                if (k < 8) { qa[k] |= (uint8_t)lo; qb[k] |= (uint8_t)hi; }
+                else { qa[k - 8] |= (uint8_t)(lo << 4); qb[k - 8] |= (uint8_t)(hi << 4); }
+            }
+        }
         break;
     case GQ_IQ3_S_R16: {   /* the grid index back from each four levels (gq_iq3s_rev) */
         const int16_t *rev = gq_iq3s_rev();
@@ -3025,6 +3053,35 @@ static inline __m512 gq_r16_e8m0_16(const uint8_t *p) {
     const __m512i big = _mm512_slli_epi32(_mm512_sub_epi32(e, _mm512_set1_epi32(1)), 23), sub = _mm512_sllv_epi32(_mm512_set1_epi32(0x00200000), e);
     return _mm512_castsi512_ps(_mm512_mask_blend_epi32(_mm512_cmplt_epu32_mask(e, _mm512_set1_epi32(2)), big, sub));
 }
+/* NVFP4: per half of a block the two groups' E4M3 scales (gq_ue4m3_half's values, 16 rows a
+ * vector) and IQ4_NL's kernel over kvalues_mxfp4, a scale per 16 (GQ_R16_ACC16) */
+static inline __m512 gq_r16_ue4m3_16(const uint8_t *p) {
+    const __m512i x = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)p));
+    const __m512i e = _mm512_and_si512(_mm512_srli_epi32(x, 3), _mm512_set1_epi32(15)), m = _mm512_and_si512(x, _mm512_set1_epi32(7));
+    const __m512 nrm = _mm512_castsi512_ps(_mm512_or_si512(_mm512_slli_epi32(_mm512_add_epi32(e, _mm512_set1_epi32(119)), 23), _mm512_slli_epi32(m, 20)));
+    const __m512 sub = _mm512_mul_ps(_mm512_cvtepi32_ps(m), _mm512_set1_ps(1.f / 1024.f));
+    const __m512 v = _mm512_mask_blend_ps(_mm512_cmpeq_epi32_mask(e, _mm512_setzero_si512()), nrm, sub);
+    return _mm512_maskz_mov_ps(_mm512_cmpneq_epi32_mask(x, _mm512_set1_epi32(0x7F)), v);
+}
+GQ_R16_FN gq_r16_nvfp4(GQ_R16_ARGS) {
+    const __m512i m4 = _mm512_set1_epi8(0x0F);
+    const __m512i tab = _mm512_broadcast_i32x4(_mm_xor_si128(_mm_loadu_si128((const __m128i *)GGML_KVALUES_MXFP4), _mm_set1_epi8((char)0x80)));
+    GQ_R16_ZERO
+    for (int b = 0; b < I / 64; b++) {
+        const uint8_t *o = grp + (int64_t)b * 576;
+        for (int G = 0; G < 2; G++) {
+            const int g32 = 2 * b + G;
+            const __m512 sv0 = gq_r16_ue4m3_16(o + 32 * G), sv1 = gq_r16_ue4m3_16(o + 32 * G + 16);
+            __m512i c[8];
+            for (int q = 0; q < 4; q++) {
+                const __m512i v = _mm512_loadu_si512(o + 64 + 256 * G + 64 * q);
+                c[q] = _mm512_shuffle_epi8(tab, _mm512_and_si512(v, m4)); c[4 + q] = _mm512_shuffle_epi8(tab, _mm512_and_si512(_mm512_srli_epi16(v, 4), m4));
+            }
+            GQ_R16_ACC16(c, sv0, sv1, 128)
+        }
+    }
+    GQ_R16_STORE
+}
 GQ_R16_FN gq_r16_mxfp4(GQ_R16_ARGS) {
     const __m512i m4 = _mm512_set1_epi8(0x0F);
     const __m512i tab = _mm512_broadcast_i32x4(_mm_xor_si128(_mm_loadu_si128((const __m128i *)GGML_KVALUES_MXFP4), _mm_set1_epi8((char)0x80)));
@@ -3094,6 +3151,7 @@ GQ_R16_ROWS_FN(gq_r16_iq3_xxs)
 GQ_R16_ROWS_FN(gq_r16_iq4_nl)
 GQ_R16_ROWS_FN(gq_r16_iq4_xs)
 GQ_R16_ROWS_FN(gq_r16_mxfp4)
+GQ_R16_ROWS_FN(gq_r16_nvfp4)
 GQ_R16_ROWS_FN(gq_r16_q2_0)
 GQ_R16_ROWS_FN(gq_r16_q2_k)
 GQ_R16_ROWS_FN(gq_r16_q3_k)
@@ -3126,6 +3184,7 @@ static void gq_r16_rows(int t, float *y, int ystride, const uint8_t *grp, const 
         case GQ_IQ1_M_R16: gq_r16_iq1_m_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
         case GQ_Q2_K_R16: gq_r16_q2_k_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
         case GQ_MXFP4_R16: gq_r16_mxfp4_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
+        case GQ_NVFP4_R16: gq_r16_nvfp4_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
         }
     }
 }
@@ -3543,6 +3602,33 @@ static inline __m256 gq_r16h_e8m0_8(const uint8_t *p) {
     const __m256i big = _mm256_slli_epi32(_mm256_sub_epi32(e, _mm256_set1_epi32(1)), 23), sub = _mm256_sllv_epi32(_mm256_set1_epi32(0x00200000), e);
     return _mm256_castsi256_ps(_mm256_blendv_epi8(big, sub, _mm256_cmpgt_epi32(_mm256_set1_epi32(2), e)));
 }
+/* NVFP4 (AVX2): eight rows' E4M3 scales a vector, IQ4_NL's codes over kvalues_mxfp4, a scale per 16 */
+static inline __m256 gq_r16h_ue4m3_8(const uint8_t *p) {
+    const __m256i x = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)p));
+    const __m256i e = _mm256_and_si256(_mm256_srli_epi32(x, 3), _mm256_set1_epi32(15)), m = _mm256_and_si256(x, _mm256_set1_epi32(7));
+    const __m256 nrm = _mm256_castsi256_ps(_mm256_or_si256(_mm256_slli_epi32(_mm256_add_epi32(e, _mm256_set1_epi32(119)), 23), _mm256_slli_epi32(m, 20)));
+    const __m256 sub = _mm256_mul_ps(_mm256_cvtepi32_ps(m), _mm256_set1_ps(1.f / 1024.f));
+    const __m256 v = _mm256_blendv_ps(nrm, sub, _mm256_castsi256_ps(_mm256_cmpeq_epi32(e, _mm256_setzero_si256())));
+    return _mm256_andnot_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(x, _mm256_set1_epi32(0x7F))), v);
+}
+GQ_R16H_FN gq_r16h_nvfp4(GQ_R16H_ARGS) {
+    const __m256i m4 = _mm256_set1_epi8(0x0F), tab = gq_r16h_values_tab(GGML_KVALUES_MXFP4);
+    GQ_R16H_ZERO2
+    for (int b = 0; b < I / 64; b++) {
+        const uint8_t *o = grp + (int64_t)b * 576;
+        for (int G = 0; G < 2; G++) { const int g32 = 2 * b + G;
+        for (int h = 0; h < 2; h++) { __m256 *acc = accs[h];   /* both halves of the rows, one after the other */
+            const __m256 sv0 = gq_r16h_ue4m3_8(o + 32 * G + 8 * h), sv1 = gq_r16h_ue4m3_8(o + 32 * G + 16 + 8 * h);
+            __m256i c[8];
+            for (int q = 0; q < 4; q++) {
+                const __m256i v = GQ_R16H_LD(o + 64 + 256 * G + 64 * q + 32 * h);
+                c[q] = _mm256_shuffle_epi8(tab, _mm256_and_si256(v, m4)); c[4 + q] = _mm256_shuffle_epi8(tab, _mm256_and_si256(_mm256_srli_epi16(v, 4), m4));
+            }
+            GQ_R16H_ACC16B(c, sv0, sv1, GQ_R16_BIGBIAS)
+        } }
+    }
+    GQ_R16H_STORE2
+}
 GQ_R16H_FN gq_r16h_mxfp4(GQ_R16H_ARGS) {
     const __m256i m4 = _mm256_set1_epi8(0x0F), tab = gq_r16h_values_tab(GGML_KVALUES_MXFP4);
     GQ_R16H_ZERO2
@@ -3575,6 +3661,7 @@ GQ_R16H_ROWS_FN(gq_r16h_iq3_xxs)
 GQ_R16H_ROWS_FN(gq_r16h_iq4_nl)
 GQ_R16H_ROWS_FN(gq_r16h_iq4_xs)
 GQ_R16H_ROWS_FN(gq_r16h_mxfp4)
+GQ_R16H_ROWS_FN(gq_r16h_nvfp4)
 GQ_R16H_ROWS_FN(gq_r16h_q2_0)
 GQ_R16H_ROWS_FN(gq_r16h_q2_k)
 GQ_R16H_ROWS_FN(gq_r16h_q3_k)
@@ -3606,6 +3693,7 @@ static void gq_r16_rows(int t, float *y, int ystride, const uint8_t *grp, const 
         case GQ_IQ1_M_R16: gq_r16h_iq1_m_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
         case GQ_Q2_K_R16: gq_r16h_q2_k_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
         case GQ_MXFP4_R16: gq_r16h_mxfp4_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
+        case GQ_NVFP4_R16: gq_r16h_nvfp4_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
         }
     }
 }

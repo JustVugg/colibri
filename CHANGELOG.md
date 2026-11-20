@@ -24,6 +24,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   through the converter; `tests/test_gguf_import.py` the GGUF's layout.
 - **The CPU's NVFP4 blocks unpacked with AVX2**, their E4M3 scales from their bits instead of
   `ldexpf` (the same values): Inkling-2's NVFP4 experts from a GGUF.
+- **NVFP4 in the CPU's 16-row interleaved forms** (`GQ_NVFP4_R16`, AVX2 and AVX-512 VNNI kernels:
+  each half of a 64 block as IQ4_NL's quads over kvalues_mxfp4, a scale per 16), which the
+  engines make for a GGUF's NVFP4 experts as they read them; `tests/test_gq_r16.c` holds it to its
+  reference to the bit. Inkling-2-Mini UD-Q4_K_XL on an i5-13500 (6 threads), after a 570-token
+  prompt: decode 6.4 -> 8.0-8.1 tok/s, the prompt 10.9 -> 18.2-18.8.
 - **Inkling-2's Vulkan chain decodes in one frame**: the routed experts in the frame
   (`vk_dmoe.h`: Inkling-2's router and SiTU-GLU experts, the K/V rows of those layers held for the
   frame's end), a GGUF's NVFP4 experts with their global scales (the expert table's words 19 and
