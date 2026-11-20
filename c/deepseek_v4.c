@@ -9534,6 +9534,7 @@ typedef struct {
                         * (#1852): coli_v4_expert_store_add_wait */
     uint8_t *ehit;     /* layers*experts_per_layer: experts routed in the current turn */
     uint8_t *eheat;    /* layers*experts_per_layer: cumulative routing selections, capped 63 */
+    int prompt_cold;   /* V4_RAM_PROMPT_COLD: a prompt is being read through the bank */
 } V4ExpertStoreState;
 
 static int set_error(char *error, size_t size, const char *format, ...) {
@@ -9726,6 +9727,45 @@ static void touch_lru_slot(V4ExpertStoreState *state, V4ExpertSlot *slot) {
     else
         state->lru_head[partition] = index;
     state->lru_tail[partition] = index;
+}
+
+/* V4_RAM_PROMPT_COLD (opt-in, 0 = off): a prompt's expert bank reads every
+ * expert of every layer once, in the same order each prompt, and that sweep
+ * (about 256 experts per layer) is larger than a layer's RAM partition. Kept
+ * by recency, each read evicts an expert the same sweep needs further on (with
+ * 133 of 256 slots per layer, measured: one prompt read in six hit RAM), and
+ * the sweep also pushed out the experts decode had just used. With the switch,
+ * a slot the bank reads into during a prompt (an uncounted miss while
+ * coli_v4_expert_store_prompt_sweep is on) is linked at the OLDEST end of its
+ * partition's list, with the oldest timestamp, so the next such miss reuses it
+ * and the rest of the cache stays as it was: the prompt hits whatever RAM
+ * holds, and decode keeps its experts. Hits keep their recency touch; decode,
+ * the read-ahead lanes and the CPU union's counted lookups are unchanged.
+ * The bank holds each view's lease until its upload, so a cold slot is never
+ * reused before the bank has its copy. */
+static int v4_ram_prompt_cold_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("V4_RAM_PROMPT_COLD");
+        on = e && *e && atoi(e) == 1;
+    }
+    return on;
+}
+
+/* state->mutex held: as touch_lru_slot, but to the oldest end of the list. */
+static void cold_lru_slot(V4ExpertStoreState *state, V4ExpertSlot *slot) {
+    touch_lru_slot(state, slot);
+    int index = (int)(slot - state->slots);
+    int partition = slot_partition(state, slot);
+    int head = state->lru_head[partition];
+    if (head == index) return;
+    state->lru_tail[partition] = slot->lru_previous;
+    state->slots[slot->lru_previous].lru_next = -1;
+    slot->lru_previous = -1;
+    slot->lru_next = head;
+    state->slots[head].lru_previous = index;
+    state->lru_head[partition] = index;
+    slot->used = state->slots[head].used ? state->slots[head].used - 1 : 0;
 }
 
 static V4ExpertSlot *next_empty_slot(V4ExpertStoreState *state, int layer) {
@@ -11178,7 +11218,9 @@ retry_lookup:
     slot->references = 1;
     state->active_leases++;
     slot->used = ++state->clock;
-    touch_lru_slot(state, slot);
+    const int cold = !counted && state->prompt_cold;
+    if (cold) cold_lru_slot(state, slot);
+    else touch_lru_slot(state, slot);
     pthread_mutex_unlock(&state->mutex);
     int rep = coli_st_expert_route(key.layer, key.expert);
     struct timespec disk_t0;
@@ -11216,7 +11258,8 @@ retry_lookup:
     }
     slot->expert = key.expert; slot->loading_expert = -1;
     slot->used = ++state->clock;
-    touch_lru_slot(state, slot);
+    if (cold) cold_lru_slot(state, slot);
+    else touch_lru_slot(state, slot);
     state->stats.misses++; state->stats.bytes_read += record->record_bytes;
     hot_pack_slot_commit(policy, state, record, slot, v4_pack_buf);
     v4_pack_buf = NULL;
@@ -11413,6 +11456,17 @@ void coli_v4_expert_store_touch_union(ColiExpertStore *store, int layer,
 void coli_v4_expert_store_note_union(ColiExpertStore *store, int layer,
                                      const int *ids, int count) {
     hot_union(store, layer, ids, count, 1);
+}
+
+/* V4_RAM_PROMPT_COLD: on while a prompt is read (session_generate_impl, from
+ * the request's start until the bank is released for decode), off otherwise.
+ * A no-op without the switch or on another ExpertStore backend. */
+void coli_v4_expert_store_prompt_sweep(ColiExpertStore *store, int on) {
+    if (!store || !store->state || !hot_find(store)) return;
+    V4ExpertStoreState *state = store->state;
+    pthread_mutex_lock(&state->mutex);
+    state->prompt_cold = on && v4_ram_prompt_cold_on();
+    pthread_mutex_unlock(&state->mutex);
 }
 
 int (*coli_v4_expert_store_ram_first)(int layer, int expert);   /* exclusive RAM/VRAM: NULL unless a Vulkan tier sets it */
@@ -19107,6 +19161,7 @@ static int session_generate_impl(ColiV4Session *session,
         return -1;
     }
     if (stats_out) memset(stats_out, 0, sizeof(*stats_out));
+    coli_v4_expert_store_prompt_sweep(session->engine->experts, 1);
     free(session->text);
     session->text = NULL;
     session->text_length = 0;
@@ -19356,6 +19411,7 @@ static int session_generate_impl(ColiV4Session *session,
      * large prefill). */
     coli_v4_gpu_moe_batch_release();
 #endif
+    coli_v4_expert_store_prompt_sweep(session->engine->experts, 0);
     session->state = state;
     session->next = next;
     /* The batch holds only the final segment, so its last row is at
@@ -20558,6 +20614,7 @@ static void v4_serve_finish(ColiV4Engine *engine, ColiV4Session *session,
                             int max_tokens, int prompt_tokens, double decode_sec) {
     double elapsed = spec_now() - marks->started;
     ColiExpertStoreStats after = {0};
+    coli_v4_expert_store_prompt_sweep(engine->experts, 0);
     if (engine->experts && engine->experts->ops && engine->experts->ops->stats)
         engine->experts->ops->stats(engine->experts, &after);
     uint64_t hits = after.hits - marks->experts.hits;
