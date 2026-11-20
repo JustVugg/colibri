@@ -234,6 +234,21 @@ int main(void) {
     expect("nonzero padding after record 3: never served (verify off)", 1, HELD - 1 - PRIVATE, 1 + PRIVATE, 0);
     w4[offset[3] + RAW + 7] = 0u;
 
+    {   /* the last record (layer 1 expert 3) made a record of no expert, its owner its index, resealed */
+        unsigned char *dense = malloc(bytes);
+        char dense_root[65];
+        const size_t last = (size_t)index_offset + 2u * WEX4_BLOB_BYTES + (CELLS - 2u) * WEX4_RECORD_BYTES;
+        const uint16_t flags = 0;
+        const uint32_t owner = CELLS - 2u;
+        assert(dense);
+        memcpy(dense, w4, bytes);
+        memcpy(dense + last + 18, &flags, 2); memcpy(dense + last + 24, &owner, 4);
+        wex4_fixture_reseal(dense, dense_root);
+        write_file(wex_path, dense, bytes);
+        expect("a record of no expert in the container: skipped, that expert from the safetensors", 1, HELD - 1, 0, 0);
+        free(dense);
+    }
+
     write_file(wex_path, w4, bytes);
     setenv("COLI_WEX_ROOT", "00", 1);
     expect("COLI_WEX_ROOT not 64 hex digits: no container", 0, 0, 0, 0);
