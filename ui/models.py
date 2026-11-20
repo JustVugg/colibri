@@ -712,7 +712,7 @@ def tiers_for(g, disk_bytes, ram_min_gb=0, have=False, family="", mtp=None, acce
             mcache = ram - resident
             mfits = mcache > 0 and ram_min_gb * GB <= (MACHINE.get("ram_total_gb") or 0) * GB
             t.update(fits=mfits, label="GPU Metal + SSD", est=None,
-                     est_note="su questa GPU la velocità si misura al primo uso",
+                     est_note="velocità non stimata per la GPU Apple: guarda il Monitor durante l'uso",
                      why=("la GPU calcola, parte densa %.0f GB in RAM, cache esperti %.0f GB, il resto dall'SSD"
                           % (resident / GB, mcache / GB) if mfits
                           else "la parte densa (%.0f GB) non entra nella RAM utile" % (resident / GB)))

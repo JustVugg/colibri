@@ -3418,7 +3418,7 @@ static void q38_mux_finish(Model *m,Q38MuxReq *r){
     if(r->cancel){
         coli_serve_write_error(stdout,r->q.id,"CANCELLED");
 #ifdef QWEN38_METAL
-        q38m_frame();   /* one a finished request, as the one-conversation loop's */
+        q38m_frame();   /* one per finished request, as the one-conversation loop's */
 #endif
         return;
     }

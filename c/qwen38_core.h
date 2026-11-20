@@ -5646,7 +5646,12 @@ static float *q38_forward(Model *m,const int *ids,int S,int pos_base,int nlogits
     /* Lettura del prefill: la posizione p predice il token p+1. Il primo token
      * fresco lo predice la fotografia del prefisso, quando c'e. Pagata solo da
      * chi ha chiesto il canale. */
-    if(g_echo_k>0&&g_echo_id&&S>0){
+#ifdef QWEN38_METAL
+    const int q38_lost_now=g_q38m_lost;   /* the chain failed in this forward: mixed holds no rows */
+#else
+    const int q38_lost_now=0;
+#endif
+    if(g_echo_k>0&&g_echo_id&&S>0&&!q38_lost_now){
         if(g_echo_pin_logit)
             q38_echo(g_echo_id,pos_base,ids[0],g_echo_pin_logit,c->vocab,g_echo_k);
         float *elog=logit;
