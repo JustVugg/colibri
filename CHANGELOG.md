@@ -84,6 +84,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **DeepSeek V4.1's prompt on the CPU reads each expert once a block** (#2924, `V41_MOE_BLOCK`,
+  1024 rows by default): the CPU path routed a prompt 32 rows at a time and read an expert once
+  for every chunk that asked for it. A 650-token prompt on V4.1-Flash UD-Q2_K_XL read 885 GB in
+  250 s, now 164 GB in 81 s (i7-13700KF, 32 GB, the PR's numbers); the logits are the same and
+  the CUDA and Vulkan tiers are unchanged.
+
 - **Windows: DeepSeek V4 built with clang and LLVM's libomp** (#2286). MinGW's libgomp, which the
   gcc build links, has no spin-wait: its barriers sleep on a semaphore whatever
   `OMP_WAIT_POLICY` and `GOMP_SPINCOUNT` say, and every one of a token's small parallel regions
@@ -567,6 +573,33 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md)).
 
 ### Fixed
+
+- **DeepSeek V4 Flash from a GGUF did not start on CUDA** (`cannot preload resident CUDA
+  experts`): the resident experts' auto mode refused the engine when a GGUF's shared experts had
+  no device mirror, which they never have (a GGUF's dense matrices stay on the CPU), and a GGUF's
+  routed experts are ggml blocks the FP4 mirrors cannot take. The preload now steps aside for a
+  GGUF and the cache serves its experts, as in 2.1.0: UD-IQ1_S on an RTX PRO 4000 reads a prompt
+  at 18.3-18.6 tok/s (2.1.0: 16.3-16.4) and decodes at 6.1, the same.
+- **Qwen3.8's RAM plan for a checkpoint whose experts are only in a sidecar**: with no routed
+  expert in its shards (only `experts-vq2g32/`, `Q38_EXPERT_LOWBIT=vq2g32`) a cache slot was
+  priced at 0 bytes. The plan gave 0 slots with `Q38_MTP=0` (the gateway then started at 10, 3.5
+  tok/s on 8 cores) and, with the MTP head on, a slot of the head's record alone (512 slots, 32
+  GiB of experts on a 25 GiB budget). The layers now come from the sidecar's index: 398 and 367
+  slots with 41 GB available, 8.8 tok/s with the head off.
+- **`tool_choice` naming a function** (#2911): Qwen3.6, Qwen3.8 and MiMo declared every tool and
+  never asked for the call, GLM-5.3 narrowed the tools without naming the function, and
+  Mistral-Large-4 declared every tool, `"none"` included, where a call came back as raw
+  `[TOOL_CALLS]` text. The forced function is now the only tool declared and is named, as GLM-5.2
+  and DeepSeek V4 already did; `auto` and `required` render as before.
+- **aarch64: the grouped int4 kernels rounded two ways** (#2872): with GCC 16 the fused gate+up
+  and two single calls differed in the last bit (`test_i4_grouped` failed on an M2 Pro under
+  Asahi Linux); the scalar step is now pinned in the source.
+- **Qwen3.8 from a GGUF checks its PLE head ranges at load** (#2927), as from a safetensors
+  checkpoint, instead of meeting a range it cannot use at the first token.
+- **Qwen3.6 on Metal, a STOP or CANCEL at a prompt's end** (#2926): the turn's copy is kept for
+  a client that sends the conversation again, and a GGUF's dense matrices are given back.
+- **The CUDA build without warnings**: `make CUDA=1 VK=1` of colibri, qwen36, qwen38 and olmoe
+  printed eleven (unused names, the DeltaNet chain's `snap_n` left implicit); it prints none.
 
 - **The chat's web search answered nothing from some addresses**: DuckDuckGo's HTML page answers
   202 with its bot check there, which read as no results; the search now asks its lite page
