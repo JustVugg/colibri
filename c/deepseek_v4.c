@@ -12719,6 +12719,11 @@ static void v4_gpu_route_scratch_clear(void) {
  * 10 GiB the dense/attention mirrors (6.2 GiB) are worth less on the card
  * than the same VRAM as expert mirrors, so they stay in RAM. */
 static long long g_v4_vram_hold_mb;
+/* The dense mirrors stay in RAM, the shared experts with them, so the
+ * prompt's VRAM bank (COLI_CUDA_MOE_BATCH=1) has nothing to run on: it is
+ * not asked for (coli_v4_gpu_moe_batch_wanted), so no VRAM is kept free for
+ * it and the prompt's CPU union keeps the prefill pool. */
+static int g_v4_dense_ram;
 int g_v4_gpu_mirror_on;   /* defined in the GPU unit, read by the expert store */
 
 static void v4_gpu_place(ColiV4Engine *engine, int device) {
@@ -12731,6 +12736,11 @@ static void v4_gpu_place(ColiV4Engine *engine, int device) {
     engine->gpu.dense_ram = budget_mb < (10LL << 10);
     fprintf(stderr, "v4_gpu place device=%d budget=%lldMiB dense=%s\n", device,
             budget_mb, engine->gpu.dense_ram ? "ram" : "card");
+    g_v4_dense_ram = 0;   /* the switch as set, for the note below */
+    if (engine->gpu.dense_ram && coli_v4_gpu_moe_batch_wanted())
+        fprintf(stderr, "v4_gpu moe-batch=off (no shared-expert mirrors: "
+                        "dense in RAM below 10 GiB)\n");
+    g_v4_dense_ram = engine->gpu.dense_ram;
 }
 #endif
 
@@ -14830,6 +14840,9 @@ int coli_v4_gpu_dspark_mirrors_ensure(ColiV4Engine *engine) {
  * generation. */
 int coli_v4_gpu_moe_batch_wanted(void) {
     static int wanted = -1;
+#ifdef COLI_V4_HIP
+    if (g_v4_dense_ram) return 0;   /* v4_gpu_place */
+#endif
     if (wanted < 0) {
         const char *setting = getenv("COLI_CUDA_MOE_BATCH");
         wanted = setting && atoi(setting) != 0;
