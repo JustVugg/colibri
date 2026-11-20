@@ -1,0 +1,26 @@
+Upstream dev bb70e197 + this commit, one binary; V4_ROUTE_FORCED_ONLY unset (=0) and =1, alternated.
+deepseek_v4 <model> --prompt-file prompt3k.txt (3,278 tokens) --max-tokens 36 --memory-gb 16; the engine
+timing line (time to the first token, the 35 tokens after it), prompt_tok_s = 3278 / time_to_first_token,
+text = md5 of stdout without the 'TUNE decode' line (it carries a timing).
+The alternated and profiled runs used the first form of the commit (0dd259ed: the verify line every 65,536
+checks; =0 and =1 run the same code as the final commit), the verify run the final one.
+
+ab1_f0  V4_ROUTE_FORCED_ONLY=0  time_to_first_token=42.246 s  after_first=9.559 s  prompt_tok_s=77.59  text=9b6266c1f1ef
+ab2_f1  V4_ROUTE_FORCED_ONLY=1  time_to_first_token=41.952 s  after_first=9.566 s  prompt_tok_s=78.14  text=9b6266c1f1ef
+ab3_f1  V4_ROUTE_FORCED_ONLY=1  time_to_first_token=41.904 s  after_first=9.619 s  prompt_tok_s=78.23  text=9b6266c1f1ef
+ab4_f0  V4_ROUTE_FORCED_ONLY=0  time_to_first_token=42.386 s  after_first=9.605 s  prompt_tok_s=77.34  text=9b6266c1f1ef
+ab5_f0  V4_ROUTE_FORCED_ONLY=0  time_to_first_token=42.277 s  after_first=9.626 s  prompt_tok_s=77.54  text=9b6266c1f1ef
+ab6_f1  V4_ROUTE_FORCED_ONLY=1  time_to_first_token=41.787 s  after_first=9.588 s  prompt_tok_s=78.45  text=9b6266c1f1ef
+ab7_f1  V4_ROUTE_FORCED_ONLY=1  time_to_first_token=41.928 s  after_first=9.572 s  prompt_tok_s=78.18  text=9b6266c1f1ef
+ab8_f0  V4_ROUTE_FORCED_ONLY=0  time_to_first_token=42.604 s  after_first=9.588 s  prompt_tok_s=76.94  text=9b6266c1f1ef
+
+Verify (V4_ROUTE_FORCED_ONLY=2: the forced-only result and the full computation, compared bit for bit
+for every routing of a hash layer, prompt and decode; a line every 4,096 checks and at every mismatch):
+verify  time_to_first_token=42.550 s  after_first=9.579 s  text=9b6266c1f1ef
+routeforced verify checked=4096 mismatches=0
+routeforced verify checked=8192 mismatches=0
+
+Router time per prompt (V4_MOE_BATCH_PROF=1, sum of the moebprof route= field over the chunk-layers;
+hash = layers 0-2, other = the GPU-routed layers 3-42):
+prof_f0  route hash=802 ms  other=507 ms  time_to_first_token=42.401 s  text=9b6266c1f1ef
+prof_f1  route hash=33 ms  other=507 ms  time_to_first_token=41.941 s  text=9b6266c1f1ef

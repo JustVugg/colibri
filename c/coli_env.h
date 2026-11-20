@@ -958,6 +958,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"V4_PREFIX_CKPT_SLOTS",             CE_STR   , CE_DSV4                                         , 0             , NULL},
     {"V4_PREFIX_LOG",                    CE_STR   , CE_DSV4                                         , 0             , NULL},
     {"V4_REPLAY_TRACE", CE_PATH, CE_DSV4, 0, NULL},
+    {"V4_ROUTE_FORCED_ONLY", CE_INT, CE_DSV4, 0, NULL},
     {"V4_SERVE_STATS_LOG", CE_BOOL, CE_DSV4, 0, NULL},
     {"V4_SLAB_SHIFT", CE_BOOL, CE_DSV4, 0, NULL},
     {"V4_UPLOAD_FENCE", CE_BOOL, CE_DSV4, 0, NULL},

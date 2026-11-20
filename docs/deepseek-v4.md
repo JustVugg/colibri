@@ -757,6 +757,37 @@ The prompt gains too, a tenth of its time, because the bank refills read
 experts through the same path. Not measured: a CPU-only run, Linux, a contiguous (FLOCK-packed)
 checkpoint. The record is in `docs/experiments/v4-slab-shift-2026-11-13/`.
 
+### A hash layer's router computes only its experts' gate scores (`V4_ROUTE_FORCED_ONLY`, opt-in)
+
+The first three layers route by hash: a token's six experts come from the
+token table (`ffn.gate.tid2eid`), and the router needs only those six experts'
+gate scores for the weights. It computed all 256 gate dot products per token
+anyway, on the CPU (the prompt's GPU router serves only the score-routed
+layers): about 10 ms per 128-token prompt chunk on a hash layer, against about
+0.5 ms on the others. With `V4_ROUTE_FORCED_ONLY=1` the router computes the
+forced experts' dot products only. Each is the same serial loop as before, so
+the weights are the same bits. `V4_ROUTE_FORCED_ONLY=2` also computes the full
+set and compares the two bit for bit (`routeforced verify` lines, at every
+mismatch and every 4,096 checks). Device logits (Vulkan) and precomputed logits
+are unchanged; so is every score-routed layer.
+
+Measured on the RTX 5080 server (3,278-token prompt, 36 tokens, `--memory-gb
+16`, dev's merged switches, one binary, the arms alternated four times; the
+text is the same in all eleven runs):
+
+| | unset | `V4_ROUTE_FORCED_ONLY=1` |
+|---|---|---|
+| time to first token (s), median | 42.33 | 41.92 |
+| prompt tokens per second, median | 77.44 | 78.21 |
+| hash layers' routing per prompt (ms, `V4_MOE_BATCH_PROF=1`) | 802 | 33 |
+| 35 tokens after the first (s), median | 9.60 | 9.58 |
+
+Not all of the router's 0.77 s comes off the prompt: the expert bank's
+prefetch of the next layer runs under it. The verify run checked every
+hash-layer routing of one run: 0 mismatches. Not measured: Windows, HIP,
+Vulkan, a CPU-only build (the CPU union routes through the same function). The
+record is in `docs/experiments/v4-route-forced-only-2026-11-18/`.
+
 ## Prefill: segments, chunks, checkpoints
 
 - **Chunks/segments.** Prefill runs layer-major over 128-token chunks
@@ -1048,6 +1079,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_LOADER_LANES` (9, max 16) | persistent expert-loader threads for decode. The default suits the CPU path (1.41× decode, #1097); **with the GPU tier set `3`**: mirrors/RAM absorb most decode misses (9 lanes ≈ +4 % decode) while the extra readers contend with the MoE bank refill for the NVMe queues (~10 % slower prefill; measured on the reference box, v1.7.0) |
 | `V4_EXPERT_UNION` (1) | per-chunk expert union batching on the CPU path |
 | `COLI_V4_DIRECT` (1) | O_DIRECT streaming reads |
+| `V4_ROUTE_FORCED_ONLY` (0) | `1` = a hash layer's router computes only the forced experts' gate dot products (same bits); `2` = also the full set, compared (`routeforced verify` lines) (see [A hash layer's router computes only its experts' gate scores](#a-hash-layers-router-computes-only-its-experts-gate-scores-v4_route_forced_only-opt-in)) |
 | `V4_SLAB_SHIFT` (1) | an expert record stays where its direct read landed and the views point there; `0` = moved to the slab's first byte after every read, as before (see [An expert record stays where its read landed](#an-expert-record-stays-where-its-read-landed-v4_slab_shift-on)) |
 | `COLI_V4_AUTOPIN`, `COLI_V4_SAVE_USAGE` | hot-expert pinning from `.coli_usage` history |
 | `COLI_V4_PREWARM` (unset) | the expert cache filled before the first request: unset, a serve (chat, web) reads every expert its RAM plan holds, or with a smaller cache each layer's most used ones in `.coli_usage`, before it says ready, in parallel with a progress line, and stops short of the RAM the plan keeps for the system; a one-shot run fills it as experts are used. `0` skips it, `1` fills it in every run (#2109) |
