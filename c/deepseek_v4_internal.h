@@ -594,6 +594,18 @@ int coli_v4_compressor_advance(ColiDeepSeekV4CompressorState *state,
                                float *output, int *produced,
                                const float *kv_proj, const float *gate_proj,
                                int position, char *error, size_t error_size);
+/* V4_COMP_BATCH: a chunk's advances at once from the batched projections
+ * (ratio 4): the emits in order, the state as the walk leaves it; the count
+ * of emits, -1 (state untouched) when not handled. */
+int coli_v4_compressor_advance_batch(ColiDeepSeekV4CompressorState *state,
+                                     float *emitted, int emit_capacity,
+                                     const float *kv_proj,
+                                     const float *gate_proj, int proj_stride,
+                                     int start_position, int batch);
+ColiDeepSeekV4CompressorState *coli_v4_compressor_clone(
+    const ColiDeepSeekV4CompressorState *state);
+int coli_v4_compressor_state_equal(const ColiDeepSeekV4CompressorState *a,
+                                   const ColiDeepSeekV4CompressorState *b);
 
 #ifdef __cplusplus
 }
@@ -657,6 +669,14 @@ int coli_v4_indexer_advance(ColiDeepSeekV4Indexer *state, const float *input,
                             int position, const float *kv_proj,
                             const float *gate_proj, char *error,
                             size_t error_size);
+/* V4_COMP_BATCH: the indexer's compressor advanced over a chunk at once;
+ * counts[item] the candidates visible to each token. 0, or -1 (state
+ * untouched) when not handled. */
+int coli_v4_indexer_advance_batch(ColiDeepSeekV4Indexer *state,
+                                  const float *kv_proj, const float *gate_proj,
+                                  int proj_stride, int start_position,
+                                  int batch, int *counts, char *error,
+                                  size_t error_size);
 int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
                                  int index_capacity, const float *query_ranks,
                                  const float *inputs, int start_position,

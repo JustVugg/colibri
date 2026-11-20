@@ -784,6 +784,28 @@ checkpoint. The record is in `docs/experiments/v4-slab-shift-2026-11-13/`.
   loaded lazily on the first request after a restart — a fresh serve no
   longer re-prefills the system prompt.
 
+### A prompt chunk's compressor advances in one pass (`V4_COMP_BATCH`, opt-in)
+
+The batched attention advanced its two ratio-4 compressors (the attention's and
+the indexer's) token by token: per token the state rows, per fourth token the
+pooling of eight rows and the emit's norm, RoPE and quantization, serially.
+Every emit's rows are known before the chunk starts (the chunk's batched
+projections and the rows carried in the state), so with `V4_COMP_BATCH=1` the
+chunk's emits pool in one parallel pass over (emit, column), in the serial
+emit's expression order per column, their tails run in parallel, and the state
+rows are set as the walk leaves them; the indexer's keys are appended the same
+way. A chunk that starts in the middle of a group of four (a prefix-checkpoint
+resume, a `V4_PREFILL_CHUNK` that is not a multiple of 4) reads the open group's
+carried rows where the walk left them. Ratio-128 layers keep the walk.
+`V4_COMP_BATCH=2` runs the batch on a copy of the attention compressor and
+compares every emit and the final state with the walk (`compbatch` lines).
+
+Measured on the RTX 5080 box (`--memory-gb 16`, the 3,278-token prompt): with
+`V4_PREFILL_CHAIN=1 V4_BANK_READ_LANES=2` the time to the first token goes
+32.0 → 31.4 s, the same text; without them the prompt waits for its expert bank
+and the gain disappears into that wait. The verify found no difference over
+16,380 emits. The record is in `docs/experiments/v4-comp-batch-2026-11-17/`.
+
 ## Performance (RTX 5080 16 GB, 2× NVMe mirror, 32 GB RAM, i9-class CPU)
 
 | scenario | before this tier | now |
@@ -1031,6 +1053,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 **Prefill / checkpoints**
 | var | meaning |
 |---|---|
+| `V4_COMP_BATCH` (0) | `1` = a prompt chunk's compressor advances in one parallel pass (see above); `2` = verify against the per-token walk (`compbatch`) |
 | `V4_PREFILL_CHUNK` (128) | chunk width, clamp [1,128] |
 | `V4_PREFILL_SEGMENT` (4096) | atomic segment length (cancel/resume granularity, expert re-sweeps) |
 | `V4_PREFIX_CKPT` (1) / `V4_PREFIX_CKPT_MIN` (512) / `V4_PREFIX_CKPT_SLOTS` (4) / `V4_PREFIX_CKPT_DISK` (1) | prefix checkpoints, see above |
