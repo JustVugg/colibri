@@ -60,7 +60,7 @@ __host__ __device__ constexpr int bd_grid_base(int t) {
     return t == 22 ? BDT_IQ2S : t == 21 ? BDT_IQ3S : t == 17 ? BDT_IQ2XS : t == 18 ? BDT_IQ3XXS : BDT_IQ2XXS;
 }
 __host__ __device__ constexpr int bd_ks_words(int t) { return t == 16 || t == 17 || t == 18 ? 128 : 0; }
-__host__ __device__ constexpr int bd_kv_words(int t) { return 0; }   /* IQ4's values in registers (bdi_kv4) */
+__host__ __device__ constexpr int bd_kv_words(int) { return 0; }   /* IQ4's values in registers (bdi_kv4) */
 __host__ __device__ constexpr int bd_tab_words(int t) { return (bd_grid_words(t) + bd_ks_words(t) + bd_kv_words(t) + 3) & ~3; }
 
 /* ksm (bd_mmg_k's): ksigns' sign masks, entry i's bdi_smask of its low and high 4 bits at 2i, 2i + 1 */
@@ -1708,7 +1708,7 @@ static thread_local int g_bd_x_same = 0;
 /* the stream's records forgotten on whatever device: a stream is one device's, and a record forgotten
  * costs no more than its x quantized again. So a matmul does not ask for the device (cudaGetDevice
  * every matmul: an R9700's runtime went from 2898 calls to 37989 in a 64-token request, #2757) */
-static void bd_xq_forget(cudaStream_t st) {
+static inline void bd_xq_forget(cudaStream_t st) {
     std::lock_guard<std::mutex> lk(g_bd_xq_mu);
     for (int i = 0; i < g_bd_xq_n; i++) if (g_bd_xq[i].st == st) g_bd_xq[i].h = {nullptr, 0, 0};
 }
@@ -1864,8 +1864,8 @@ static inline int bd_fmt_ok(int fmt) {
 }
 /* the rows ids[0..n) of a block-format matrix against one row of x (bd_gemv_rows_i8_k): the types
  * with the integer form; 0 for the others */
-static int bd_gemv_rows_launch(float *y, const float *x, const bd_u32 *W, const bd_u32 *tab, const int *ids, int fmt, int I, int O,
-                               int rowWords, int n, size_t smem_max, cudaStream_t st) {
+static inline int bd_gemv_rows_launch(float *y, const float *x, const bd_u32 *W, const bd_u32 *tab, const int *ids, int fmt, int I, int O,
+                                      int rowWords, int n, size_t smem_max, cudaStream_t st) {
     if (!bd_fmt_ok(fmt) || I % 32 || I % BD_BLK[fmt - 100]) return 0;
     switch (fmt - 100) {
 #define BD_R8_CASE(t) case t: return bd_gemv_rows_i8_launch<t>(y, x, W, tab, ids, I, O, rowWords, n, smem_max, st);
@@ -1877,8 +1877,8 @@ static int bd_gemv_rows_launch(float *y, const float *x, const bd_u32 *W, const 
 }
 /* y = silu(x Wg^T) * (x Wu^T) for up to BD_GEMV_MAX_S rows, Wg and Wu of one type and shape (bd_gemv_i8_k's
  * GLU): the types with the integer form; 0 for the others (the caller's two GEMVs and its SwiGLU then) */
-static int bd_glu_launch(float *y, const float *x, const bd_u32 *Wg, const bd_u32 *Wu, const bd_u32 *tab, int fmt, int I, int O,
-                         int rowWords, int S, size_t smem_max, cudaStream_t st) {
+static inline int bd_glu_launch(float *y, const float *x, const bd_u32 *Wg, const bd_u32 *Wu, const bd_u32 *tab, int fmt, int I, int O,
+                                int rowWords, int S, size_t smem_max, cudaStream_t st) {
     if (!bd_fmt_ok(fmt) || I % 32 || I % BD_BLK[fmt - 100] || !Wu) return 0;
     switch (fmt - 100) {
 #define BD_G8_CASE(t) case t: return bd_gemv_i8_launch<t>(y, x, Wg, tab, I, O, rowWords, S, smem_max, st, Wu);
