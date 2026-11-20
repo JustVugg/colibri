@@ -14,6 +14,10 @@ a fixed seed (HF datasets-server, cached in /tmp, nothing committed).
 Prints per-question lines and a final accuracy; diff two runs for the delta.
 """
 import argparse, json, os, random, re, subprocess, sys, urllib.request
+try:
+    from tools.engine_environment import engine_environment
+except ImportError:
+    from engine_environment import engine_environment
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--model", required=True)
@@ -56,8 +60,8 @@ def make_prompt(q):
             "<|assistant|><think></think>Answer:")
 
 def run_one(prompt):
-    env = dict(os.environ, SNAP=os.path.expanduser(args.model), PROMPT=prompt,
-               NGEN="2", TEMP="0", DRAFT="0")
+    env = engine_environment(SNAP=os.path.expanduser(args.model), PROMPT=prompt,
+                             NGEN="2", COLI_TEMP="0", TEMP="0", DRAFT="0")
     env.pop("ADAPTER", None)
     if args.adapter: env["ADAPTER"] = args.adapter
     out = subprocess.run([args.binary, "64"], env=env, capture_output=True,
