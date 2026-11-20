@@ -43,7 +43,7 @@ def scan_sources():
     for root, dirs, files in os.walk(C_DIR):
         dirs[:] = [d for d in dirs if d not in ("tests", "__pycache__", "shaders")]
         for f in files:
-            if not f.endswith((".c", ".h", ".cu", ".mm")):
+            if not f.endswith((".c", ".h", ".cu", ".m", ".mm")):
                 continue
             # coli_env.h is scanned like any other source: its own getenv() calls
             # (COLI_ENV_STRICT) are real reads. The table rows are `{"NAME",` and
