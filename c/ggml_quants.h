@@ -503,8 +503,12 @@ GQ_EXACT_FN static void gq_blk_tq2_0(const uint8_t *b, float *y) {
  * because the value table holds e2m1 values doubled; 0 and 0x7F decode to 0. */
 static inline float gq_ue4m3_half(uint8_t x) {
     if (x == 0 || x == 0x7F) return 0.f;
-    int e = (x >> 3) & 0xF, m = x & 7;
-    return e == 0 ? ldexpf((float)m, -10) : ldexpf((float)(8 + m), e - 11);
+    const int e = (x >> 3) & 0xF, m = x & 7;
+    if (e == 0) return (float)m * (1.f / 1024.f);   /* m * 2^-10, exact */
+    /* (8 + m) * 2^(e - 11) = (1 + m/8) * 2^(e - 8): the float's bits, no ldexpf (the CPU's
+     * NVFP4 experts read four of these a block of 64) */
+    union { uint32_t u; float f; } v = { ((uint32_t)(e - 8 + 127) << 23) | ((uint32_t)m << 20) };
+    return v.f;
 }
 GQ_EXACT_FN static void gq_blk_nvfp4(const uint8_t *b, float *y) {
     GQ_EXACT_BEGIN
@@ -937,6 +941,16 @@ GQ_EXACT_FN static void gq_ublk(int t, const uint8_t *b, int8_t *w, float *sw, f
         const __m128i tab = _mm_loadu_si128((const __m128i *)(nl ? GGML_KVALUES_IQ4NL : GGML_KVALUES_MXFP4));
         _mm256_storeu_si256((__m256i *)w, gq_nib16_lut(b + (nl ? 2 : 1), tab));
         gq_set_g(sw, mw, 0, 2, d, 0.f); return; }
+    case GQ_NVFP4: {   /* four groups of 16: byte j of group g holds elements 16g + j (low) and 16g + 8 + j */
+        const __m128i tab = _mm_loadu_si128((const __m128i *)GGML_KVALUES_MXFP4), m = _mm_set1_epi8(0x0F);
+        for (int h = 0; h < 2; h++) {
+            const __m128i v = _mm_loadu_si128((const __m128i *)(b + 4 + 16 * h));
+            const __m128i lo = _mm_and_si128(v, m), hi = _mm_and_si128(_mm_srli_epi16(v, 4), m);
+            _mm_storeu_si128((__m128i *)(w + 32 * h), _mm_shuffle_epi8(tab, _mm_unpacklo_epi64(lo, hi)));
+            _mm_storeu_si128((__m128i *)(w + 32 * h + 16), _mm_shuffle_epi8(tab, _mm_unpackhi_epi64(lo, hi)));
+        }
+        for (int g = 0; g < 4; g++) { sw[g] = gq_ue4m3_half(b[g]); mw[g] = 0.f; }
+        return; }
     case GQ_IQ4_XS: GQ_UNPACK_SB(gq_bd_iq4_xs, gq_sb_iq4_xs)
     case GQ_IQ2_XXS: GQ_UNPACK_SB(gq_bd_f16, gq_sb_iq2_xxs)
     case GQ_IQ2_XS: GQ_UNPACK_SB(gq_bd_f16, gq_sb_iq2_xs)
