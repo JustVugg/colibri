@@ -218,7 +218,6 @@ static int copy_file(const char *from, const char *to) {
 }
 
 int main(int argc, char **argv) {
-    char fake[4200], beside[4200];
     setbuf(stdout, NULL);
     if (argc == 3 && !strcmp(argv[1], "child")) return child(argv[2]);
 #ifndef COLI_WEX_CUDA_LOADER
@@ -226,6 +225,7 @@ int main(int argc, char **argv) {
     printf("test_wex_cuda_loader: skipped (the helper is loaded on Windows and Linux only)\n");
     return 0;
 #else
+    char fake[4200], beside[4200];
     unsetenv("FAKE_WEX_ABI"); unsetenv("FAKE_WEX_FEATURES"); unsetenv("FAKE_WEX_HOST_FAIL"); unsetenv("FAKE_WEX_BATCH_FAIL");
     unsetenv("DSV4_CUDA_MOE_MASKED");
     /* absolute paths: this executable, the stand-in beside it in tests/ */

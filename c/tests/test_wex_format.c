@@ -948,7 +948,7 @@ static void test_nr3_codec(void) {
                          2048u, 512u, flags | WEX_NR3_FLAG_CZ, owner, record, capacity, &written));   /* -0 under CZ */
     for (c = 0; c < 2; c++) {
         unsigned char anchor[3];
-        uint32_t b, cflags = flags;
+        uint32_t b = 0, cflags = flags;
         if (c == 0) cflags |= WEX_NR3_FLAG_CZ;   /* CZ record carrying symbol 8 */
         else {                                    /* ceil record with a max-5 block at coded scale 0 */
             for (b = 0; b < layout.scale_count[0] && wex_nr3_block_max(weights[0] + (size_t)b * 16u, NULL) != 5u; b++) {}
