@@ -421,6 +421,22 @@ static void test_preload(void) {
     store.gpu = v4_gpu_expert_mirrors_create_devices(engine->gpu.devices, 2, 6);
     void *original = store.gpu;
     char error[256];
+    {   /* a GGUF: ggml experts and its dense matrices on the CPU, so no shared mirror either. Auto
+         * keeps the cache (it refused the engine), an explicit request is still refused. */
+        st_tensor ggml = {0}; ggml.dtype = ST_GGML_BASE + 2;
+        shards gguf = {0}; gguf.t = &ggml; gguf.n = 1;
+        engine->target_index = &gguf;
+        shared_missing = 1;
+        const int gguf_calls = lookups;
+        unsetenv("DSV4_CUDA_RESIDENT_EXPERTS");
+        assert(coli_v4_gpu_experts_preload(engine, error, sizeof(error)) == 1);
+        assert(coli_v4_gpu_experts_init(engine, error, sizeof(error)) == 0);
+        assert(lookups == gguf_calls && store.gpu == original && !live_tensors && !error[0]);
+        setenv("DSV4_CUDA_RESIDENT_EXPERTS", "1", 1);
+        assert(coli_v4_gpu_experts_init(engine, error, sizeof(error)) == -1 && error[0]);
+        unsetenv("DSV4_CUDA_RESIDENT_EXPERTS");
+        engine->target_index = NULL;
+    }
     shared_missing = 1;
     unsetenv("DSV4_CUDA_RESIDENT_EXPERTS");
     assert(coli_v4_gpu_experts_init(engine, error, sizeof(error)) == -1);
