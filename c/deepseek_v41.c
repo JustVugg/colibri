@@ -2276,9 +2276,10 @@ static void expert_fetch(Model *m, const char *kind, int layer,
     int total = 0;
     ExpertRead *list = xmalloc((size_t)n * V41_EXPERT_TENSORS * sizeof(ExpertRead),
                                "expert read list");
-    int *first = xmalloc((size_t)n * sizeof(int), "expert read list");   /* each expert's first read */
+    /* each expert's first read, for the container's checks below (none without a container) */
+    int *first = m->wex ? xmalloc((size_t)n * sizeof(int), "expert read list") : NULL;
     for (int i = 0; i < n; i++) {
-        first[i] = total;
+        if (first) first[i] = total;
         total += expert_read_list(m, kind, layer, eid[i], slot[i],
                                   expert_route(layer, eid[i]), list + total);
     }
@@ -2368,11 +2369,12 @@ static void expert_fetch(Model *m, const char *kind, int layer,
      * extensions the portable SHA-256 runs at a few hundred MB/s, so a batch of first reads
      * hashed one after another on this thread took longer than reading it. Each iteration
      * touches its own expert only. */
+    if (m->wex) {
 #if defined(_OPENMP)
-    const int hashing = m->wex && m->wex->sha && n > 1;
+    const int hashing = m->wex->sha && n > 1;
     #pragma omp parallel for schedule(dynamic, 1) if (hashing)
 #endif
-    for (int i = 0; i < (m->wex ? n : 0); i++) {
+    for (int i = 0; i < n; i++) {
         ExpertRead *r = list + first[i];
         if (r->S != &m->wex->S) continue;
         const int coded = v41_wex_nr3(m, r, layer) != NULL;
@@ -2387,6 +2389,7 @@ static void expert_fetch(Model *m, const char *kind, int layer,
             st_read_range_rep(&m->S, r[k].t->fd, r[k].rep, r[k].t->off, r[k].t->nbytes,
                               r[k].slot->base[r[k].part] + r[k].t->off % ST_DIRECT_ALIGN, r[k].t->nbytes, 1,
                               expert_direct(), "pread expert");
+    }
     }
     free(first);
     /* Publish the payload pointers only now. A slot that advertises an expert has
