@@ -231,10 +231,40 @@ static void json_free(jval *v) {
     free(v);
 }
 
+/* A checked JSON document is UTF-8, including strings a caller may ignore.
+ * Validate raw bytes before parsing; escaped Unicode is checked separately in
+ * j_parse_str_raw. Consume continuation bytes one at a time so a truncated
+ * sequence never reads past the caller's NUL terminator. */
+static int j_valid_utf8(const char *text) {
+    const unsigned char *s = (const unsigned char *)text;
+    while (*s) {
+        unsigned c = *s++;
+        int rest;
+        unsigned lo = 0x80, hi = 0xBF;
+        if (c < 0x80) continue;
+        if (c >= 0xC2 && c <= 0xDF) rest = 1;
+        else if (c >= 0xE0 && c <= 0xEF) {
+            rest = 2;
+            if (c == 0xE0) lo = 0xA0; /* no overlong encodings */
+            if (c == 0xED) hi = 0x9F; /* no surrogate code points */
+        } else if (c >= 0xF0 && c <= 0xF4) {
+            rest = 3;
+            if (c == 0xF0) lo = 0x90;
+            if (c == 0xF4) hi = 0x8F; /* at most U+10FFFF */
+        } else return 0;
+        for (int i = 0; i < rest; i++) {
+            if (*s < lo || *s > hi) return 0;
+            s++;
+            lo = 0x80; hi = 0xBF;
+        }
+    }
+    return 1;
+}
+
 /* An oracle must not accept a partial tree from a truncated/malformed file.
  * Keep the existing API's permissive behavior for other engine consumers. */
 static jval *json_parse_checked(const char *text) {
-    if (!text) return NULL;
+    if (!text || !j_valid_utf8(text)) return NULL;
     jparser p = { text, NULL, 0, 0, 0, 0 };
     jval *v = j_parse_val(&p);
     j_ws(&p);
