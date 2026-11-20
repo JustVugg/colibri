@@ -589,6 +589,8 @@ TEST_EXCLUDE += test_qwen36_tier_stream_engine
 TEST_EXCLUDE += test_v4_wex4
 # nvcc and an NVIDIA GPU: run by `make wex-cuda-test`, not by test-c
 TEST_EXCLUDE += test_wex_nr3_gpu
+# the -march=x86-64 build of test_wex_fast_decode: elsewhere it would be the default build again (below)
+TEST_EXCLUDE += test_wex_fast_decode_x86_64
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
@@ -601,7 +603,8 @@ TEST_BINS += tests/test_gsgemv_sse41$(EXE) tests/test_qgemv_sse41$(EXE) \
 	tests/test_olmoe_dot_i8_16_sse41$(EXE) tests/test_st_f16_bf16_simd_sse41$(EXE) \
 	tests/test_i4_grouped_sse41$(EXE) \
 	tests/test_i4_grouped_sse41_o1$(EXE) tests/test_i4_grouped_sse41_no_contract$(EXE) \
-	tests/test_idot_ssse3$(EXE) tests/test_int_kernel_exact_ssse3$(EXE)
+	tests/test_idot_ssse3$(EXE) tests/test_int_kernel_exact_ssse3$(EXE) \
+	tests/test_wex_fast_decode_x86_64$(EXE)
 endif
 ifeq ($(COLI_V4_SUPPORTED),1)
 TEST_BINS += tests/test_v4_gpu_devices$(EXE)
