@@ -2177,7 +2177,12 @@ static void q38_x4_read_nr3(Model *m,int layer,int expert,const WexEntry *e,void
     uint8_t *record=NULL;
     if(posix_memalign((void**)&record,WEX4_PAGE,stored?stored:1)){fprintf(stderr,"OOM WNR3 expert record\n");exit(1);}
     if(!why){
-        st_read_range_rep(&x->S,x->fd[layer],0,(int64_t)e->file_offset,(int64_t)stored,record,(int64_t)stored,1,0,tag);
+        const int rep=q38_x4_replica(m,layer,expert);   /* the drive its route names, as a RAW record */
+        st_read_range_rep(&x->S,x->fd[layer],rep,(int64_t)e->file_offset,(int64_t)stored,record,(int64_t)stored,1,0,tag);
+        if(x->mir_n>1){
+            __atomic_fetch_add(&x->mir_reads[rep],1,__ATOMIC_RELAXED);
+            __atomic_fetch_add(&x->mir_bytes[rep],(uint64_t)stored,__ATOMIC_RELAXED);
+        }
         q38_wex_check(m,layer,expert,record,(int64_t)stored);
         if(!wex_nr3_owner_ok(e,record,(uint32_t)layer,(uint32_t)expert,x->wex_nr3_flags))
             why="names another expert, or another canonical-zero form";
@@ -2222,8 +2227,10 @@ static void q38_prefetch_experts(Model *m,int layer,const int *experts,int count
         for(int index=0;index<count;index++){
             int expert=experts[index];
             if(expert<0||expert>=m->c.experts||cache->by_expert[expert]>=0)continue;
+            const WexEntry *nr3=q38_wex_nr3(m,layer,expert);   /* a WNR3 record: its stored bytes */
             posix_fadvise(st_fd_rep(&m->x4->S,m->x4->fd[layer],q38_x4_replica(m,layer,expert)),
-                          m->x4->off[(int64_t)layer*m->c.experts+expert],m->x4->record_bytes,POSIX_FADV_WILLNEED);
+                          m->x4->off[(int64_t)layer*m->c.experts+expert],
+                          nr3?(int64_t)nr3->total_bytes:m->x4->record_bytes,POSIX_FADV_WILLNEED);
             m->expert_prefetch_ranges++;
         }
         return;

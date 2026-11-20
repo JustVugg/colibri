@@ -312,6 +312,21 @@ int main(int argc, char **argv) {
     ck(m.x4 && m.x4->wex_nr3 && m.x4->record_bytes == (int64_t)RAW && load_all(&m) && m.x4->wex_decoded == CELLS,
        "the WNR3 container attaches; every expert loaded holds its record, decoded");
     drop(&m);
+#ifdef _WIN32
+    mkdir(mirror);
+#else
+    mkdir(mirror, 0700);
+#endif
+    {   FILE *f = fopen(mirror_path, "wb");
+        assert(f && fwrite(nr3, 1, nr3_bytes, f) == nr3_bytes && fclose(f) == 0); }
+    setenv("COLI_MODEL_MIRROR", mirror, 1); setenv("COLI_DISK_WEIGHTS", "1,1000", 1);
+    grid(&m); q38_expert_int4_attach(&m, directory);
+    ck(m.x4 && m.x4->mir_n == 2 && load_all(&m) && m.x4->wex_decoded == CELLS &&
+       m.x4->mir_reads[1] == (uint64_t)routed && m.x4->mir_reads[0] == (uint64_t)(CELLS - routed),
+       "the WNR3 container with a copy on a mirror: each record read from the replica its route names, decoded");
+    drop(&m);
+    unsetenv("COLI_MODEL_MIRROR"); unsetenv("COLI_DISK_WEIGHTS");
+    remove(mirror_path); rmdir(mirror);
     setenv("COLI_WEX_ROOT", nroot, 1);
     ck(attach_and_load() == 0, "pinned: every WNR3 record passes its hash at its first read and decodes");
     setenv("COLI_MAP_EXPERTS", "1", 1);
