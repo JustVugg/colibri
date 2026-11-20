@@ -2429,7 +2429,7 @@ def _read_cgroup_mounts(proc_mountinfo_path):
     return mounts
 
 
-def _resolve_cgroup_hierarchy(mounts, member, *, v1=False):
+def _resolve_cgroup_hierarchy(mounts, member, *, v1=False, controller="memory"):
     """Return the mounts exposing ``member``, shallowest root first.
 
     A mount's root is the cgroup its mount point shows; ``member`` maps into
@@ -2441,7 +2441,7 @@ def _resolve_cgroup_hierarchy(mounts, member, *, v1=False):
     """
     if v1:
         applicable = [mount for mount in mounts
-                      if mount.fs_type == "cgroup" and "memory" in mount.options]
+                      if mount.fs_type == "cgroup" and controller in mount.options]
     else:
         applicable = [mount for mount in mounts if mount.fs_type == "cgroup2"]
     views = [mount for mount in applicable if member[:len(mount.root)] == mount.root]
@@ -3280,10 +3280,155 @@ def _windows_performance_cores(raw):
     return classes.count(max(classes))
 
 
+def _cgroup_cpu_memberships(proc_cgroup_path):
+    """``(v2 path, v1 cpu path)`` from ``/proc/self/cgroup``, ``None`` for an absent file.
+
+    Only the two records the CPU probe reads: the v2 one and the v1 hierarchy whose
+    controllers include ``cpu`` (``cpu,cpuacct`` on most systems)."""
+    present, raw = _read_bounded_bytes(
+        proc_cgroup_path, _CGROUP_MEMBERSHIP_MAX_BYTES, "cgroup membership file")
+    if not present:
+        return None
+    v2_path = v1_path = None
+    for line in _proc_lines(raw, "cgroup membership file"):
+        fields = line.split(b":", 2)
+        if len(fields) != 3:
+            raise CgroupFormatError(f"malformed cgroup membership record: {line!r}")
+        hierarchy, controllers, member_path = fields
+        if hierarchy == b"0" and not controllers:
+            v2_path = _decode_cgroup_membership_path(member_path, "cgroup membership path")
+        elif b"cpu" in controllers.split(b","):
+            v1_path = _decode_cgroup_membership_path(member_path, "cgroup membership path")
+    return (v2_path, v1_path)
+
+
+def _cgroup_cpu_limit_of(directory, v1=False):
+    """``(controls_present, cpus_or_none)`` for one cgroup: v2 ``cpu.max`` is
+    ``"<quota> <period>"`` or ``"max <period>"`` (no quota); v1 is ``cpu.cfs_quota_us``
+    (-1: no quota) over ``cpu.cfs_period_us``. A present but malformed file raises."""
+    directory = Path(directory)
+    if not v1:
+        path = directory / "cpu.max"
+        present, text = _read_bounded_ascii(path, _CGROUP_VALUE_MAX_BYTES, "cgroup cpu limit")
+        if not present:
+            return (False, None)
+        match = re.fullmatch(r"(max|\d{1,20}) (\d{1,20})\n?", text)
+        if match is None or int(match.group(2)) == 0 or match.group(1) == "0":
+            raise CgroupFormatError(f"malformed cgroup cpu limit: {path}")
+        if match.group(1) == "max":
+            return (True, None)
+        return (True, int(match.group(1)) / int(match.group(2)))
+    quota_path = directory / "cpu.cfs_quota_us"
+    period_path = directory / "cpu.cfs_period_us"
+    present, text = _read_bounded_ascii(quota_path, _CGROUP_VALUE_MAX_BYTES, "cgroup cpu quota")
+    if not present:
+        return (False, None)
+    match = re.fullmatch(r"(-1|\d{1,20})\n?", text)
+    if match is None or match.group(1) == "0":
+        raise CgroupFormatError(f"malformed cgroup cpu quota: {quota_path}")
+    if match.group(1) == "-1":
+        return (True, None)
+    present, text = _read_bounded_ascii(period_path, _CGROUP_VALUE_MAX_BYTES, "cgroup cpu period")
+    period = re.fullmatch(r"(\d{1,20})\n?", text) if present else None
+    if period is None or int(period.group(1)) == 0:
+        raise CgroupFormatError(f"malformed or missing cgroup cpu period: {period_path}")
+    return (True, int(match.group(1)) / int(period.group(1)))
+
+
+def _cgroup_cpu_walk(views, member, v1=False):
+    """``(controls_seen, tightest quota in CPUs)``, each view walked from the member's
+    directory up to its mount point, as the memory probe walks it."""
+    seen = False
+    cpus = None
+    for mount in views:
+        suffix = member[len(mount.root):]
+        for depth in range(len(suffix), -1, -1):
+            present, value = _cgroup_cpu_limit_of(
+                mount.mount_point.joinpath(*suffix[:depth]), v1=v1)
+            seen = seen or present
+            if value is not None:
+                cpus = value if cpus is None else min(cpus, value)
+    return (seen, cpus)
+
+
+def cgroup_cpu_quota(cgroup_root=Path("/sys/fs/cgroup"),
+                     proc_cgroup_path=Path("/proc/self/cgroup"),
+                     proc_mountinfo_path=Path("/proc/self/mountinfo")):
+    """The tightest CPU quota on this process's cgroup and its ancestors, in CPUs
+    (7.65 for a ``cpu.max`` of ``765000 100000``), or ``None``: no quota, not Linux,
+    or nothing that could be read.
+
+    A container's quota throttles a team larger than it as soon as the team has spent
+    the period's share, whatever the host's core count: 48 threads under a quota of
+    7.65 CPUs decoded Qwen3.6 at 18-21 tok/s against 134 with 7 (#2914). The engines
+    read the same files (compat.h, compat_cgroup_cpu_limit). Unlike the memory probe
+    this one fails open: an input it cannot read leaves the team as it was."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        memberships = _cgroup_cpu_memberships(proc_cgroup_path)
+        if memberships is None:
+            return None
+        v2_member, v1_member = memberships
+        mounts = _read_cgroup_mounts(proc_mountinfo_path)
+        if mounts is None:
+            root = Path(cgroup_root)
+            probes = ((root, v2_member, False), (root / "cpu", v1_member, True),
+                      (root / "cpu,cpuacct", v1_member, True), (root, v1_member, True))
+            for base, member, v1 in probes:
+                if member is None:
+                    continue
+                seen, cpus = _cgroup_cpu_walk([_fixed_root_view(base, v1=v1)], member, v1=v1)
+                if seen:
+                    return cpus
+            return None
+        for member, v1 in ((v2_member, False), (v1_member, True)):
+            if member is None:
+                continue
+            views = _resolve_cgroup_hierarchy(mounts, member, v1=v1, controller="cpu")
+            seen, cpus = _cgroup_cpu_walk(views, member, v1=v1)
+            if seen:
+                return cpus
+        return None
+    except (CgroupError, OSError, ValueError):
+        return None
+
+
+def allowed_cpu_count():
+    """The CPUs this process may run on when that is fewer than the machine's online
+    CPUs (a container's cpuset, a ``taskset``), else ``None``. lscpu and sysfs count
+    the host's cores whatever the affinity mask says."""
+    getter = getattr(os, "sched_getaffinity", None)
+    if getter is None:
+        return None
+    try:
+        allowed = len(getter(0))
+    except OSError:
+        return None
+    online = os.cpu_count() or 0
+    return allowed if 0 < allowed < online else None
+
+
+def bound_team(cores, quota_cpus=None, allowed_cpus=None):
+    """``cores`` no larger than the CPUs the process may run on and no larger than its
+    CPU quota, floored (7.65 CPUs: 7 threads) and at least one."""
+    team = cores
+    if allowed_cpus and allowed_cpus < team:
+        team = allowed_cpus
+    if quota_cpus is not None and quota_cpus > 0:
+        team = min(team, max(1, int(quota_cpus)))
+    return team
+
+
 def team_cpu_count():
     """The OpenMP team a launch defaults to: the performance cores of a hybrid CPU
-    (performance_core_count), else the physical cores (physical_cpu_count)."""
-    return performance_core_count() or physical_cpu_count()
+    (performance_core_count), else the physical cores (physical_cpu_count), no more
+    than the CPUs the process may run on (allowed_cpu_count) or its container's CPU
+    quota lets run at once (cgroup_cpu_quota, #2914). The launcher sets
+    OMP_NUM_THREADS from this, and an engine given OMP_NUM_THREADS sizes nothing
+    itself, so this is where a container's limits must be seen."""
+    return bound_team(performance_core_count() or physical_cpu_count(),
+                      cgroup_cpu_quota(), allowed_cpu_count())
 
 
 def _resolve_physical_cores(physical_cpus):

@@ -704,6 +704,21 @@ static inline int compat_cg_u64(const char *s, uint64_t *v){
     *v = x;
     return 1;
 }
+/* parses an unsigned 64-bit integer, advancing *sp past digits and leading/trailing spaces */
+static inline int compat_cg_u64_field(const char **sp, uint64_t *v){
+    const char *s = *sp;
+    while(*s == ' ' || *s == '\t') s++;
+    uint64_t x = 0; int d = 0;
+    for(; *s >= '0' && *s <= '9'; s++, d++){
+        if(x > (UINT64_MAX - (uint64_t)(*s - '0')) / 10) return 0;
+        x = x * 10 + (uint64_t)(*s - '0');
+    }
+    if(!d) return 0;
+    while(*s == ' ' || *s == '\t') s++;
+    *v = x;
+    *sp = s;
+    return 1;
+}
 /* 1 when dir has both controls; *lim and *room (UINT64_MAX: none yet) keep the
  * tighter of theirs and this cgroup's, and an unlimited one changes neither */
 static inline int compat_cg_pair(const char *dir, int v1, uint64_t *lim, uint64_t *room){
@@ -789,6 +804,124 @@ static inline int compat_cgroup_room(const char *root, const char *proc_cgroup, 
     if(lim == UINT64_MAX) return 0;
     *limit = lim; *room = rm;
     return 1;
+}
+
+/* --- the cgroup's CPU quota: bounds OpenMP team sizing in a container (#2914) ---
+ * In cgroup v2, cpu.max holds "<quota> <period>" or "max <period>".
+ * In cgroup v1, cpu.cfs_quota_us and cpu.cfs_period_us hold quota and period.
+ * When a quota is set, effective allowed cores = quota / period.
+ * Ancestor cgroups are walked from the member directory up to root, keeping the
+ * tightest (smallest) finite quota in cores. */
+static inline int compat_cg_cpu_pair(const char *dir, int v1, double *quota){
+    if(!v1){
+        /* v2: cpu.max contains "<quota> <period>" or "max <period>" */
+        char p[1400], buf[128];
+        snprintf(p, sizeof p, "%s/cpu.max", dir);
+        if(compat_cg_read(p, buf, sizeof buf) <= 0) return 0;
+        const char *s = buf;
+        while(*s == ' ' || *s == '\t') s++;
+        if(!strncmp(s, "max", 3)) return 1; /* explicitly unlimited */
+        uint64_t q = 0, per = 0;
+        if(!compat_cg_u64_field(&s, &q)) return 0;
+        if(!compat_cg_u64_field(&s, &per) || per == 0) return 0;
+        double cores = (double)q / (double)per;
+        if(cores > 0.0 && (*quota <= 0.0 || cores < *quota)) *quota = cores;
+        return 1;
+    } else {
+        /* v1: cpu.cfs_quota_us and cpu.cfs_period_us */
+        char p[1400], buf[64];
+        snprintf(p, sizeof p, "%s/cpu.cfs_quota_us", dir);
+        if(compat_cg_read(p, buf, sizeof buf) <= 0) return 0;
+        const char *s = buf;
+        while(*s == ' ' || *s == '\t') s++;
+        if(*s == '-' || !strncmp(s, "-1", 2)) return 1; /* -1: unlimited */
+        uint64_t q = 0, per = 0;
+        if(!compat_cg_u64(s, &q) || q == 0) return 0;
+        snprintf(p, sizeof p, "%s/cpu.cfs_period_us", dir);
+        if(compat_cg_read(p, buf, sizeof buf) <= 0) return 0;
+        s = buf;
+        while(*s == ' ' || *s == '\t') s++;
+        if(!compat_cg_u64(s, &per) || per == 0) return 0;
+        double cores = (double)q / (double)per;
+        if(cores > 0.0 && (*quota <= 0.0 || cores < *quota)) *quota = cores;
+        return 1;
+    }
+}
+
+static inline int compat_cg_cpu_walk(const char *root, const char *member, int v1, double *quota){
+    char dir[1300]; int seen = 0;
+    if(snprintf(dir, sizeof dir, "%s%s", root, member) >= (int)sizeof dir) return 0;
+    size_t base = strlen(root);
+    for(int i = 0; i < 64; i++){
+        seen |= compat_cg_cpu_pair(dir, v1, quota);
+        char *s = strrchr(dir + base, '/');
+        if(!s) break;
+        *s = 0;
+    }
+    return seen;
+}
+
+static inline int compat_cgroup_cpu_quota(const char *root, const char *proc_cgroup, double *quota){
+    char buf[8192], v2[1024] = "", v1[1024] = "";
+    int has2 = 0, has1 = 0;
+    double q = 0.0;
+    if(quota) *quota = 0.0;
+    if(compat_cg_read(proc_cgroup, buf, sizeof buf) <= 0) return 0;
+    for(char *ln = buf; ln && *ln; ){
+        char *nl = strchr(ln, '\n'); if(nl) *nl = 0;
+        char *c1 = strchr(ln, ':'), *c2 = c1 ? strchr(c1 + 1, ':') : NULL;
+        if(c2 && c2[1] == '/' && strlen(c2 + 1) < sizeof v2){
+            *c1 = *c2 = 0;
+            if(!strcmp(ln, "0") && !c1[1]){ strcpy(v2, c2 + 1); has2 = 1; }
+            for(const char *t = c1 + 1; *t; ){
+                size_t k = strcspn(t, ",");
+                if(k == 3 && !strncmp(t, "cpu", 3)){ strcpy(v1, c2 + 1); has1 = 1; }
+                t += k + (t[k] == ',');
+            }
+        }
+        ln = nl ? nl + 1 : NULL;
+    }
+    if((has2 && compat_cg_outside(v2)) || (has1 && compat_cg_outside(v1))) return 0;
+    if(!strcmp(v2, "/")) v2[0] = 0;
+    if(!strcmp(v1, "/")) v1[0] = 0;
+    char r1[256];
+    int ok = 0;
+    if(has2) ok = compat_cg_cpu_walk(root, v2, 0, &q);
+    if(!ok && has1){
+        if(snprintf(r1, sizeof r1, "%s/cpu", root) < (int)sizeof r1)
+            ok = compat_cg_cpu_walk(r1, v1, 1, &q);
+        if(!ok && snprintf(r1, sizeof r1, "%s/cpu,cpuacct", root) < (int)sizeof r1)
+            ok = compat_cg_cpu_walk(r1, v1, 1, &q);
+        if(!ok)
+            ok = compat_cg_cpu_walk(root, v1, 1, &q);
+    }
+    if(q <= 0.0) return 0;
+    if(quota) *quota = q;
+    return 1;
+}
+
+/* Returns the maximum safe OpenMP thread count under container cgroup CPU quota,
+ * or 0 if unconstrained / not measurable. Uses the floor of fractional quota
+ * (e.g. 7.65 -> 7) to avoid CFS quota throttling (#2914). COLIBRI_CGROUP_ROOT and
+ * COLIBRI_PROC_CGROUP point it at a fixture tree (tests/test_omp_tune.c); nothing
+ * else sets them. */
+static inline int compat_cgroup_cpu_limit(double *quota_out){
+    const char *root = getenv("COLIBRI_CGROUP_ROOT");
+    const char *proc = getenv("COLIBRI_PROC_CGROUP");
+#ifdef __linux__
+    if(!root) root = "/sys/fs/cgroup";
+    if(!proc) proc = "/proc/self/cgroup";
+#endif
+    if(root && proc){
+        double q = 0.0;
+        if(compat_cgroup_cpu_quota(root, proc, &q) && q > 0.0){
+            if(quota_out) *quota_out = q;
+            int t = (int)q;
+            return t >= 1 ? t : 1;
+        }
+    }
+    if(quota_out) *quota_out = 0.0;
+    return 0;
 }
 
 /* the machine's numbers (GB, 0 = not measured) bounded by a cgroup's limit and room (bytes) */
