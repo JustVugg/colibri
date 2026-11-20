@@ -111,6 +111,7 @@ static size_t g_g53_cud;    /* the room the dense matrices take there (cud_open)
 #include "serve_poll.h"          /* CANCEL a meta' turno (#1332) */
 #include "route_trace.h"
 #include "decode_batch.h"   /* coli_submit_ext, coli_logprob_tail: canale logprobs */
+#include "serve_codec.h"    /* the request frames, as the sibling engines read them */
 #include "pin_pool.h"       /* piu scatti annidati dello stato */
 #include <time.h>
 #ifndef _WIN32
@@ -4965,86 +4966,67 @@ static void serve_data_lp(unsigned long long id, const char *text, int n,
 }
 
 /* Una richiesta intera, o 0 su EOF. Il payload si legge a byte contati, non a
- * righe: puo' contenerne. */
-static int serve_read_req(ServeReq *q, char *verb, size_t verb_size) {
-    char header[512];
-    if (!fgets(header, sizeof(header), stdin)) return 0;
+ * righe: puo' contenerne.
+ *
+ * The frames go through serve_codec.h, as for the sibling engines, with this engine's
+ * numeric request ids and its limits (an image up to 256 MiB, a prompt up to 16 MiB, the
+ * second checked once the payload is consumed). A frame the stream cannot be trusted after
+ * -- a payload that does not end on its newline, a short read, a refused SUBMIT or IMAGE
+ * header -- comes back as BAD_FRAME, which the callers answer, and the session then ends:
+ * every later read is end of input, as on Kimi K3 and OLMoE, instead of reading the rest of
+ * the stream as commands. A DECIDE (no decision head here) is consumed and skipped. */
+#define GLM53_MAX_PROMPT_BYTES (1u << 24)
+static const ColiServeWireProfile g53_wire = {
+    .max_header_bytes = 511,
+    .max_payload_bytes = 1u << 28,
+    .require_exact_lf = 1,
+};
+static int g53_input_lost;   /* the session ends: nothing after this frame is read */
+
+static int serve_read_req(FILE *in, ServeReq *q, char *verb, size_t verb_size) {
     memset(q, 0, sizeof(*q));
-    if (sscanf(header, "%15s", verb) != 1) { verb[0] = 0; return 1; }
-    if (!strcmp(verb, "STOP") || !strcmp(verb, "CANCEL")) {
-        sscanf(header, "%*s %llu", &q->id);
+    if (g53_input_lost) return 0;
+    ColiServeCommand c; memset(&c, 0, sizeof c);
+    const ColiServeReadResult r = coli_serve_read_command(in, &g53_wire, &c);
+    if (r == COLI_SERVE_READ_EOF) return 0;
+    uint64_t id = 0;
+    const int numeric = coli_serve_parse_u64(c.id, &id);
+    q->id = numeric ? (unsigned long long)id : 0;
+    const int framed = c.kind == COLI_SERVE_COMMAND_SUBMIT || c.kind == COLI_SERVE_COMMAND_IMAGE;
+    if (r == COLI_SERVE_READ_BAD_FRAME || r == COLI_SERVE_READ_NOMEM ||
+        (r == COLI_SERVE_READ_BAD_REQUEST && (framed || c.kind == COLI_SERVE_COMMAND_DECIDE)) ||
+        (r == COLI_SERVE_READ_OK && framed && !numeric) ||
+        (r == COLI_SERVE_READ_OK && c.kind == COLI_SERVE_COMMAND_SUBMIT && c.payload_bytes > GLM53_MAX_PROMPT_BYTES)) {
+        coli_serve_command_dispose(&c);
+        g53_input_lost = 1;
+        snprintf(verb, verb_size, "BAD_FRAME");
         return 1;
     }
-    if (!strcmp(verb, "IMAGE")) {
-        unsigned long long id; int bytes, grid_h, grid_w;
-        if (sscanf(header, "IMAGE %llu %d %d %d", &id, &bytes, &grid_h, &grid_w) != 4 ||
-            bytes < 0 || bytes > (1 << 28) || grid_h < 1 || grid_w < 1) {
-            strcpy(verb, "BAD_FRAME");
-            return 1;
-        }
+    if (r != COLI_SERVE_READ_OK || !numeric) { coli_serve_command_dispose(&c); snprintf(verb, verb_size, "?"); return 1; }
+    switch (c.kind) {
+    case COLI_SERVE_COMMAND_STOP: snprintf(verb, verb_size, "STOP"); return 1;
+    case COLI_SERVE_COMMAND_CANCEL: snprintf(verb, verb_size, "CANCEL"); return 1;
+    case COLI_SERVE_COMMAND_IMAGE:
         pending_clear();
-        float *patches = malloc((size_t)bytes);
-        if (!patches || fread(patches, 1, (size_t)bytes, stdin) != (size_t)bytes) {
-            free(patches);
-            strcpy(verb, "BAD_FRAME");
-            return 1;
-        }
-        (void)fgetc(stdin);                       /* il '\n' di chiusura */
-        g_pending.id = id;
-        g_pending.patches = patches;
-        g_pending.bytes = (size_t)bytes;
-        g_pending.grid_h = grid_h;
-        g_pending.grid_w = grid_w;
-        q->id = id;
+        g_pending.id = q->id;
+        g_pending.bytes = (size_t)c.payload_bytes;
+        g_pending.grid_h = c.grid_h;
+        g_pending.grid_w = c.grid_w;
+        g_pending.patches = (float *)coli_serve_command_take_payload(&c);
+        snprintf(verb, verb_size, "IMAGE");
+        return 1;
+    case COLI_SERVE_COMMAND_SUBMIT:
+        q->slot = c.slot; q->max_tokens = c.max_tokens; q->temp = c.temperature; q->top_p = c.top_p;
+        q->logprobs = c.logprobs; q->pin = c.pin;
+        q->plen = (int)c.payload_bytes;
+        q->payload = (char *)coli_serve_command_take_payload(&c);
+        snprintf(verb, verb_size, "SUBMIT");
+        return 1;
+    default:
+        coli_serve_command_dispose(&c);
+        snprintf(verb, verb_size, "?");
         return 1;
     }
-    if (strcmp(verb, "SUBMIT")) return 1;
-    int header_used = 0;
-    if (sscanf(header, "SUBMIT %llu %d %d %d %f %f%n", &q->id, &q->slot, &q->plen,
-               &q->max_tokens, &q->temp, &q->top_p, &header_used) != 6) {
-        strcpy(verb, "BAD_FRAME");
-        return 1;
-    }
-    /* Chiavi facoltative dopo i sei campi posizionali (logprobs=k, pin=1): le
-     * legge lo stesso parser degli altri motori, cosi la modalita jev si
-     * chiede allo stesso modo ovunque. Una richiesta che non ne porta resta
-     * identica a prima, byte per byte. */
-    q->logprobs = 0; q->pin = 0;
-    {
-        const char *rest = header + header_used;
-        while (*rest == ' ') rest++;
-        if (*rest && *rest != '\n') {
-            char tailbuf[256];
-            snprintf(tailbuf, sizeof tailbuf, "%s", rest);
-            for (char *w = tailbuf; *w; w++) if (*w == '\n' || *w == '\r') { *w = 0; break; }
-            ColiSubmit ext; memset(&ext, 0, sizeof ext);
-            if (coli_submit_ext(tailbuf, &ext)) { q->logprobs = ext.logprobs; q->pin = ext.pin; }
-        }
-    }
-    if (q->plen < 0 || q->plen > (1 << 24)) { strcpy(verb, "BAD_FRAME"); return 1; }
-    q->payload = malloc((size_t)q->plen + 1);
-    if (!q->payload) { strcpy(verb, "BAD_FRAME"); return 1; }
-    if (q->plen && fread(q->payload, 1, (size_t)q->plen, stdin) != (size_t)q->plen) {
-        free(q->payload); q->payload = NULL;
-        strcpy(verb, "BAD_FRAME");
-        return 1;
-    }
-    q->payload[q->plen] = 0;
-    int trailing = fgetc(stdin);
-    (void)trailing;                        /* il '\n' di chiusura del frame */
-    /* max_tokens=0 vale solo in modalita jev ("leggi e fermati"), e lo si sa
-     * solo dopo aver letto le chiavi. Il rifiuto sta DOPO che payload e '\n'
-     * sono stati consumati: rifiutare prima lascerebbe i byte del prompt nello
-     * stream e disallineerebbe ogni frame successivo, che e' esattamente il
-     * guaio che il commento di serve_cancel_pending descrive. Questo motore non
-     * passa dal parser condiviso, quindi la regola va ripetuta qui o resta
-     * l'unico ad accettare uno zero che per tutti gli altri e' malformato. */
-    if (q->max_tokens < 1 && !(q->max_tokens == 0 && q->logprobs > 0)) {
-        free(q->payload); q->payload = NULL; q->plen = 0;
-        strcpy(verb, "BAD_FRAME");
-        return 1;
-    }
-    return 1;
 }
 
 /* Cosa ha chiesto il gateway mentre il turno girava: niente, un abort del
@@ -5096,26 +5078,29 @@ enum { SERVE_CTL_NONE = 0, SERVE_CTL_CANCEL = 1, SERVE_CTL_STOP = 2 };
  * Non legge MAI se stdin non e' pronto: una fgets bloccante qui fermerebbe la
  * generazione in attesa di un comando che potrebbe non arrivare mai -- un
  * guasto peggiore di quello che questa funzione cura. */
-static int serve_cancel_pending(unsigned long long id, int *input_eof) {
+static int serve_cancel_read(FILE *in, FILE *out, int (*ready)(void), unsigned long long id, int *input_eof) {
     int cancelled = 0, stopped = 0;
-    while (coli_serve_stdin_ready()) {
+    while (ready()) {
         ServeReq n; char verb[16];
-        if (!serve_read_req(&n, verb, sizeof(verb))) { *input_eof = 1; break; }
+        if (!serve_read_req(in, &n, verb, sizeof(verb))) { *input_eof = 1; break; }
         if (!strcmp(verb, "CANCEL")) {
             if (n.id == id) cancelled = 1;
-            else serve_line("ERROR %llu NOT_FOUND\n", n.id);
+            else { fprintf(out, "ERROR %llu NOT_FOUND\n", n.id); fflush(out); }
         } else if (!strcmp(verb, "STOP")) {
             if (n.id == id) stopped = 1;
         } else if (!strcmp(verb, "SUBMIT")) {
-            serve_line("ERROR %llu SLOT_BUSY\n", n.id);
+            fprintf(out, "ERROR %llu SLOT_BUSY\n", n.id); fflush(out);
             free(n.payload);
         } else if (!strcmp(verb, "BAD_FRAME")) {
-            serve_line("ERROR %llu BAD_FRAME\n", n.id);
+            fprintf(out, "ERROR %llu BAD_FRAME\n", n.id); fflush(out);
         }
         /* IMAGE non risponde niente, come nel ciclo principale. */
     }
     if (cancelled) return SERVE_CTL_CANCEL;
     return stopped ? SERVE_CTL_STOP : SERVE_CTL_NONE;
+}
+static int serve_cancel_pending(unsigned long long id, int *input_eof) {
+    return serve_cancel_read(stdin, stdout, coli_serve_stdin_ready, id, input_eof);
 }
 
 /* La stessa guardata, fra un pezzo di prefill e l'altro.
@@ -5978,7 +5963,7 @@ static void serve_loop(GModel *m, Tok *tokenizer) {
     emap_emit(m);
     for (;;) {
         ServeReq q; char verb[16];
-        if (!serve_read_req(&q, verb, sizeof(verb))) break;   /* EOF: si esce */
+        if (!serve_read_req(stdin, &q, verb, sizeof(verb))) break;   /* EOF: si esce */
         if (!strcmp(verb, "SUBMIT")) {
             /* < 0: stdin e' finito mentre il turno girava. Il turno e' stato
              * servito per intero (e' la regola: "in-flight requests finish
