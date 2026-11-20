@@ -496,6 +496,9 @@ tests/test_dsv4_compressor_state_cuda: tests/test_dsv4_compressor_state_cuda.c \
 	$(CC) $(CFLAGS) $< COLI_V4_UNIT_NATIVE_QUANT.o COLI_V4_UNIT_MATH.o \
 		backend_cuda_dsv4.o -o $@ $(LDFLAGS)
 
+tests/test_dsv4_prefill_chain_cuda: tests/test_dsv4_prefill_chain_cuda.c 		backend_cuda_dsv4.h backend_cuda_dsv4.o
+	$(CC) $(CFLAGS) $< backend_cuda_dsv4.o -o $@ $(LDFLAGS)
+
 tests/test_dsv4_multigpu_cuda: tests/test_dsv4_multigpu_cuda.c \
 		backend_cuda_dsv4.h deepseek_v4_gpu_devices.h backend_cuda_dsv4.o
 	$(CC) $(CFLAGS) $< backend_cuda_dsv4.o -o $@ $(LDFLAGS)
@@ -517,9 +520,9 @@ DSV4_TEST_DEVICES ?= 0,1
 DSV4_CUDA_TESTS := tests/test_dsv4_head_cuda tests/test_dsv4_wo_decode_cuda \
 	tests/test_dsv4_compressor_cuda tests/test_dsv4_compressor_state_cuda \
 	tests/test_dsv4_indexer_prepare_cuda tests/test_dsv4_multigpu_cuda \
-	tests/test_dsv4_quant_cuda tests/test_dsv4_resident_route tests/test_dsv4_resident_indexer
+	tests/test_dsv4_quant_cuda tests/test_dsv4_resident_route tests/test_dsv4_resident_indexer 	tests/test_dsv4_prefill_chain_cuda
 
-# All nine CUDA unit tests on two devices. A GPU is required (CI has none);
+# All ten CUDA unit tests on two devices. A GPU is required (CI has none);
 # set DSV4_TEST_DEVICES="a,b" to pick the ordinals, e.g. 2,3.
 dsv4-cuda-tests: $(DSV4_CUDA_TESTS)
 	@set -e; for t in $(DSV4_CUDA_TESTS); do \
@@ -540,7 +543,7 @@ deepseek-v4-clean:
 		tests/test_dsv4_compressor_cuda tests/test_dsv4_compressor_state_cuda \
 		tests/test_dsv4_indexer_prepare_cuda tests/test_dsv4_wo_decode_cuda tests/test_dsv4_head_cuda \
 		tests/test_dsv4_quant_cuda tests/test_dsv4_resident_route tests/test_dsv4_resident_indexer \
-		test_expert_store_registry $(V4_FLAGS_STAMP) \
+		tests/test_dsv4_prefill_chain_cuda test_expert_store_registry $(V4_FLAGS_STAMP) \
 		$(V4_CUDA_FLAGS_STAMP) backend_cuda_dsv4.o backend_cuda_dsv4.d backend_vulkan_v4.o vk_tier_v4.o vk_chain_v4.o
 
 # Bootstrap old objects and recover dependency files removed independently.

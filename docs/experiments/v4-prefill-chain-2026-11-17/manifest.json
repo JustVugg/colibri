@@ -1,0 +1,95 @@
+{
+  "version": 1,
+  "hypothesis": "The batched prompt attention moves the query across the PCIe link four times per chunk and layer (down after wq_b for its norm and RoPE on the host, up for the attention, the attended down for its inverse RoPE, up again for wo). Running wq_b, the norm, the RoPE, the cached sparse attention, the inverse RoPE and wo as one device chain, with the normalized query ranks going up once and the outputs coming down once, removes those crossings and the host's per-head work and shortens the time to the first token.",
+  "commit": "0513ba7cf7fa9512b7a80b07301af78da4b1265c",
+  "model": "DeepSeek-V4-Flash-0731 architecture, abliterated weights (same shapes), safetensors, native FP8/FP4",
+  "command": "make -C c -f Makefile.deepseek-v4 deepseek-v4 CUDA=1 DEEPGEMM=1 CUDA_HOME=/usr/local/cuda-13.3 ARCH=native; deepseek_v4 <model> --prompt-file prompt3k.txt --max-tokens 36 --memory-gb 16 with the environment in config; the arms alternate (baseline, trial) three times on one binary; tok_s = 3278 prompt tokens / time_to_first_token from the engine's `timing` line (prompt throughput)",
+  "prompt_hash": "3def6f25ca23ac992efe343ea4eec2c4a71ffe48dc66a95c93de91014b6923da",
+  "hardware": {
+    "cpu": "AMD Ryzen 9 3900X, 12 cores / 24 threads",
+    "ram": "94 GiB (--memory-gb 16)",
+    "storage": "Samsung 990 PRO 4TB + 980 PRO 2TB NVMe in one LVM volume, ext4, direct aligned reads",
+    "os": "Ubuntu 26.04.1, Linux 7.0.0-43, gcc 15.2.0, CUDA 13.3, driver 595.91.07, RTX 5080 16 GB"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "V4_PREFILL_CHAIN"
+  ],
+  "baseline": {
+    "config": {
+      "binary": "deepseek_v4 CUDA=1 DEEPGEMM=1 ARCH=native (one binary, the DeepGEMM sm_120a flavour linked in)",
+      "args": "--prompt-file prompt3k.txt --max-tokens 36 --memory-gb 16",
+      "COLI_CUDA": "1",
+      "CUDA_DENSE": "1",
+      "COLI_CUDA_PIPE": "2",
+      "COLI_CUDA_ATTN_BATCH": "1",
+      "COLI_CUDA_MOE_BATCH": "1",
+      "COLI_CUDA_MOE_DOUBLE": "1",
+      "V4_MOE_REFILL_GROUP": "12",
+      "V4_LOADER_LANES": "3",
+      "V4_PREFIX_CKPT": "0",
+      "COLI_V4_SAVE_USAGE": "0",
+      "V4_LAYER_FUSED": "1",
+      "V4_BANK_MAKE_ROOM": "1",
+      "V4_UPLOAD_THREAD": "1",
+      "V4_MIRROR_BLOCK": "1",
+      "DSV4_CUDA_MOE_FUSED6": "1",
+      "V4_PREFILL_CHAIN": "unset"
+    },
+    "samples": {
+      "tok_s": [
+        73.3908,
+        74.9548,
+        74.7123
+      ]
+    },
+    "median_tok_s": 74.7123,
+    "quality": {
+      "method": "greedy text identical across the arm's runs and identical to the trial's (md5 of stdout)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/v4-prefill-chain-2026-11-17/baseline_runs.txt",
+      "sha256": "6989085725fc413e8ba6465d2daa637a7f25aa4b75dff1cee6a113cd56b3fd0c"
+    }
+  },
+  "trial": {
+    "config": {
+      "binary": "deepseek_v4 CUDA=1 DEEPGEMM=1 ARCH=native (one binary, the DeepGEMM sm_120a flavour linked in)",
+      "args": "--prompt-file prompt3k.txt --max-tokens 36 --memory-gb 16",
+      "COLI_CUDA": "1",
+      "CUDA_DENSE": "1",
+      "COLI_CUDA_PIPE": "2",
+      "COLI_CUDA_ATTN_BATCH": "1",
+      "COLI_CUDA_MOE_BATCH": "1",
+      "COLI_CUDA_MOE_DOUBLE": "1",
+      "V4_MOE_REFILL_GROUP": "12",
+      "V4_LOADER_LANES": "3",
+      "V4_PREFIX_CKPT": "0",
+      "COLI_V4_SAVE_USAGE": "0",
+      "V4_LAYER_FUSED": "1",
+      "V4_BANK_MAKE_ROOM": "1",
+      "V4_UPLOAD_THREAD": "1",
+      "V4_MIRROR_BLOCK": "1",
+      "DSV4_CUDA_MOE_FUSED6": "1",
+      "V4_PREFILL_CHAIN": "1"
+    },
+    "samples": {
+      "tok_s": [
+        93.4249,
+        93.2336,
+        93.5689
+      ]
+    },
+    "median_tok_s": 93.4249,
+    "quality": {
+      "method": "greedy text identical across the arm's runs and identical to the baseline's (md5 of stdout); V4_PREFILL_CHAIN=2 ran the chain beside the host's path on every chunk and layer of the prompt and compared each output bit for bit: 0 of 510,533,632 outputs differed over 989 calls; tests/test_dsv4_prefill_chain_cuda.c compares the chain with the separate calls, plain and indexed, and reports 0 differing outputs on this card (docs/experiments/v4-prefill-chain-2026-11-17/verify_run.txt, sha256 bd14848dd9e208b5251204a7f11542f878bf04fe210b5af728cf054d566642b1)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/v4-prefill-chain-2026-11-17/trial_runs.txt",
+      "sha256": "8858bf1a8a197e435528e00432650cbe6dd335ea6755ce48c4d488026a134d24"
+    }
+  },
+  "outcome": "improvement"
+}

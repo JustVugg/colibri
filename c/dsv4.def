@@ -54,6 +54,7 @@ EXPORTS
     dsv4_cuda_indexer_resident
     dsv4_cuda_indexer_keys_sync
     dsv4_cuda_attn_decode_chain
+    dsv4_cuda_attn_prefill_chain
     dsv4_cuda_proj_batch
     dsv4_cuda_proj_batch_release
     dsv4_cuda_wo_decode
