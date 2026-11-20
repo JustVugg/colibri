@@ -7108,10 +7108,17 @@ def cap_for_arch(arch, cap, env=None, model=None):
         settings = env if env is not None else os.environ
         ram = settings.get("RAM_GB", "0")
         limits = family_by_id(arch).limits
+        # the conversations' state the engine will hold: KV_SLOTS of its environment (the server sets it for every
+        # engine), so a server of eight slots does not size the cache for one; one slot plans as before
+        try:
+            kv_slots = max(1, int(settings.get("KV_SLOTS") or 1))
+        except (TypeError, ValueError):
+            kv_slots = 1
+        slot_kw = {"kv_slots": kv_slots} if kv_slots > 1 else {}
         try:
             plan = build_plan(model, ram_gb=0 if ram == "auto" else float(ram),
                               context=int(settings.get(limits.context_env, limits.default_context)),
-                              gpu_indices=[])
+                              gpu_indices=[], **slot_kw)
             slots = plan["tiers"]["ram"]["cache_slots_per_layer"]
         except (OSError, ValueError, KeyError, TypeError) as error:
             if arch in ("deepseek_v41", "mimo"):

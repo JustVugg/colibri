@@ -566,6 +566,7 @@ def env_for_engine(a, arch, plan=None):
         sys.exit(f"{C.yel}--ctx does not apply to {family.display_name}:{C.r} a decision model reads "
                  f"{reads} ({knob} overrides it)")
     if getattr(a,"ram",0): explicit_env.add("RAM_GB")
+    platform_engine_env(a, env)
     # OMP_NUM_THREADS for the sister engines that do not size their own team.
     #
     # #805 set this from physical cores "on every platform" -- but only inside
@@ -729,7 +730,7 @@ def env_for_engine(a, arch, plan=None):
                 # --gpu on a Vulkan build names Vulkan devices: no CUDA tier, and the
                 # plan sizes the device the engine opens
                 plan=build_plan(a.model,ram,ctx,[] if vulkan else devices,vram,policy=a.policy,
-                                kv_slots=requested_kv_slots(a,env),env=vulkan_plan_env(a,vulkan))
+                                kv_slots=requested_kv_slots(a,env),env=plan_env(a,env,vulkan_plan_env(a,vulkan)))
             plan_must_not_choose_omp=("OMP_NUM_THREADS" not in env
                                       and (arch == "deepseek_v4"
                                            or env.get("COLI_NO_OMP_TUNE")))
@@ -834,8 +835,10 @@ def cuda_binary(engine=None):
     if sys.platform == "linux":
         try:
             linked=subprocess.run(["ldd",engine],capture_output=True,text=True,timeout=3)
-            # Detect both CUDA (libcudart) and HIP (libamdhip64) builds.
-            return any(("libcudart" in line or "libamdhip64" in line) and "not found" not in line
+            # Detect CUDA (libcudart), HIP (libamdhip64) and SYCL (libsycl: the
+            # SYCL=1 build of the same coli_cuda_* ABI for Intel GPUs) builds.
+            return any(("libcudart" in line or "libamdhip64" in line or "libsycl" in line)
+                       and "not found" not in line
                        for line in linked.stdout.splitlines())
         except (OSError,subprocess.SubprocessError): return False
     if sys.platform == "win32":
@@ -910,6 +913,39 @@ def vulkan_plan_env(a, vulkan):
     elif vulkan: vulkan_gpu_env(env,a.gpu)
     return env
 
+def q38_sycl_hybrid_expected(a, env):
+    """Will qwen38's SYCL defaults apply (qwen38.c: the qualified hybrid where the FP8 tier streams to Data Center GPU
+    Max cards)? What the gateway can see of the engine's own conditions: qwen38 on the card (--gpu other than none, or
+    COLI_CUDA=1; --gpu none is the CPU whatever COLI_CUDA says), a SYCL engine, every Intel GPU a Max, the native FP8
+    checkpoint (no gguf.json, no int4 or low-bit sidecar the engine would attach, Q38_NATIVE_FP8 on), no explicit
+    COLI_CUDA_CHAIN=1 or Q38_DN_GPU=1, COLI_PLATFORM_DEFAULTS not 0."""
+    model=getattr(a,"model",None)
+    if not model or (env.get("COLI_PLATFORM_DEFAULTS") or "").strip()=="0": return False
+    try:
+        if resolve_model(model).descriptor.id!="qwen38": return False
+    except Exception: return False
+    gpu=getattr(a,"gpu",None)
+    if gpu=="none" or not (gpu is not None or env.get("COLI_CUDA")=="1"): return False
+    if env.get("COLI_CUDA_CHAIN")=="1" or env.get("Q38_DN_GPU")=="1" or (env.get("Q38_NATIVE_FP8") or "").strip()=="0": return False
+    if os.path.exists(os.path.join(model,"gguf.json")): return False
+    if os.path.isdir(os.path.join(model,"experts-int4g64")) and (env.get("Q38_EXPERT_INT4") or "").strip()!="0": return False
+    # a low-bit expert sidecar (qwen38_core.h's q38_expert_lowbit_wanted: Q38_EXPERT_LOWBIT named, or Q38_EXPERT_INT2
+    # other than 0): the engine computes from it, its FP8 tier does not start and the table does not apply
+    if (env.get("Q38_EXPERT_LOWBIT") or "").strip() or (env.get("Q38_EXPERT_INT2") or "").strip() not in ("","0"): return False
+    try: engine=engine_for(model)
+    except Exception: return False
+    return sycl_binary(engine) and intel_max_cards_only()
+
+def plan_env(a, env, base=None):
+    """The environment build_plan prices with: base as it is (None: the process's own, as before; a caller that
+    already gives build_plan an environment of its own passes it here) unless qwen38's SYCL defaults will leave the
+    MTP head off (q38_sycl_hybrid_expected) and nobody set Q38_MTP -- then base with Q38_MTP=0, so the plan does not
+    price a head the engine does not load. Nothing else changes, and nothing is written into this process's
+    environment or the engine's (the engine takes 0 from its own table)."""
+    priced = os.environ if base is None else base
+    if (env.get("Q38_MTP") or "").strip() or (priced.get("Q38_MTP") or "").strip(): return base
+    return dict(priced, Q38_MTP="0") if q38_sycl_hybrid_expected(a, env) else base
+
 def resource_request(a, env):
     from family_registry import default_context
     resolved=resolve_model(a.model) if getattr(a,"model",None) else None
@@ -933,10 +969,94 @@ def resource_request(a, env):
     return ram,ctx,devices,vram
 
 
+# Data Center GPU Max (Ponte Vecchio): the PCI ids of Intel's i915 driver (1.25 DKMS: 0x0b69, 0x0b6e, 0x0bd0, 0x0bd4-0x0bdb)
+# and the rest of the 0x0bd0-0x0bdb range
+PVC_DEVICE_IDS=frozenset({"0x0b69","0x0b6e"} | {f"0x0bd{d}" for d in "0123456789ab"})
+
+def intel_max_cards_only(sysfs="/sys/class/drm"):
+    """True when this host has Intel GPUs and every one is a Data Center GPU Max card: read from sysfs
+    (card*/device/vendor and device), no device opened. False where sysfs is missing (not Linux)."""
+    found=False
+    try: names=sorted(os.listdir(sysfs))
+    except OSError: return False
+    for name in names:
+        if not name.startswith("card") or not name[4:].isdigit(): continue
+        dev=os.path.join(sysfs,name,"device")
+        try:
+            with open(os.path.join(dev,"vendor")) as f: vendor=f.read().strip().lower()
+            with open(os.path.join(dev,"device")) as f: device=f.read().strip().lower()
+        except OSError: continue
+        if vendor!="0x8086": continue
+        if device not in PVC_DEVICE_IDS: return False
+        found=True
+    return found
+
+def sycl_binary(engine):
+    """Was `engine` built with the SYCL backend (links libsycl)? Linux only, from ldd, as cuda_binary."""
+    if not engine or not os.path.exists(engine) or sys.platform!="linux": return False
+    try:
+        linked=subprocess.run(["ldd",engine],capture_output=True,text=True,timeout=3)
+        return any("libsycl" in line and "not found" not in line for line in linked.stdout.splitlines())
+    except (OSError,subprocess.SubprocessError): return False
+
+def qwen36_35b_a3b_shape(model):
+    """Is `model` (a directory) the Qwen3.6 MoE the slot measurement was made on: model_type qwen3_5_moe(_text),
+    hidden 2048, 256 experts? Other models of the qwen36 family keep the generic default."""
+    try:
+        with open(os.path.join(model,"config.json"),encoding="utf-8") as f: c=json.load(f)
+    except (OSError,ValueError,TypeError): return False
+    t=c.get("text_config") if isinstance(c.get("text_config"),dict) else c
+    return (t.get("model_type") or c.get("model_type")) in ("qwen3_5_moe_text","qwen3_5_moe") and \
+           t.get("hidden_size")==2048 and t.get("num_experts")==256
+
+def qwen36_on_max(a, env):
+    """The measured case of the platform's serving defaults: the Qwen3.6 MoE measured (qwen36_35b_a3b_shape) on the
+    card (--gpu other than none, or COLI_CUDA=1; --gpu none is the CPU whatever COLI_CUDA says) with a SYCL engine on
+    a host whose Intel GPUs are all Data Center GPU Max cards; never under COLI_PLATFORM_DEFAULTS=0, as the engine's
+    measured defaults."""
+    if (env.get("COLI_PLATFORM_DEFAULTS") or "").strip()=="0": return False
+    model=getattr(a,"model",None)
+    if not model: return False
+    try:
+        if resolve_model(model).descriptor.id!="qwen36": return False
+    except Exception: return False
+    gpu=getattr(a,"gpu",None)
+    if gpu=="none" or not (gpu is not None or env.get("COLI_CUDA")=="1"): return False
+    if not qwen36_35b_a3b_shape(model): return False
+    try: engine=engine_for(model)
+    except Exception: return False
+    return sycl_binary(engine) and intel_max_cards_only()
+
+def platform_kv_slots(a, env):
+    """The measured default the platform gives --kv-slots, or None: 8 in the measured case (qwen36_on_max) -- one
+    engine a card serving several users: 207 tok/s at eight requests against 79 for one, every text the request's
+    alone (campaign records M4, H10, M5). With more than one slot the engine drafts nothing and keeps no prompt-end
+    snapshot, parks nothing and reuses no attention-only prefix: one request alone lost 0-4 % on the prompts tried."""
+    return 8 if qwen36_on_max(a, env) else None
+
+# the Level Zero runtime's memory pool every Qwen3.6 measurement on Max cards ran with (an expert's device allocations
+# pooled: warm start 11.5 -> 3.9 s with nothing else changed, campaign record h4-load); read by the runtime when it
+# starts, so the gateway sets it (the engine cannot know the card before the runtime reads it)
+L0_POOL = "1;32M;device:4M,4,256M"
+
+def platform_engine_env(a, env):
+    """The platform's defaults for the environment of every engine the gateway starts in the measured case
+    (qwen36_on_max): the runtime's memory pool, unless either of its two names is set already (the runtime reads
+    UR_L0_USM_ALLOCATOR first, so filling it in would override a value set under the older name)."""
+    if qwen36_on_max(a, env):
+        names=("UR_L0_USM_ALLOCATOR","SYCL_PI_LEVEL_ZERO_USM_ALLOCATOR")
+        if not any((env.get(k) or "").strip() for k in names):
+            for k in names: env[k]=L0_POOL
+
 def requested_kv_slots(a, env):
+    """--kv-slots: as given; else COLI_KV_SLOTS; else the platform's measured default (platform_kv_slots); else 1.
+    serve, plan, doctor, tune and the engine's environment all take it from here. A command without the option
+    (chat, run, tui) starts an engine of one conversation and plans for one."""
+    if not hasattr(a,"kv_slots"): return 1
     value=getattr(a,"kv_slots",None)
-    if value is None: value=int(env.get("COLI_KV_SLOTS","1"))
-    return value
+    if value is not None: return value
+    if (env.get("COLI_KV_SLOTS") or "").strip(): return int(env["COLI_KV_SLOTS"])
+    return platform_kv_slots(a,env) or 1
 
 def plan_cuda_enabled(a, arch, env):
     """Should --auto-tier apply the VRAM tier that `coli plan` printed?
@@ -1106,7 +1226,7 @@ def env_for(a):
         try:
             ram,ctx,devices,vram=resource_request(a,e)
             plan=build_plan(a.model,ram,ctx,[] if vulkan else devices,vram,policy=a.policy,
-                            kv_slots=requested_kv_slots(a,e),env=vulkan_plan_env(a,vulkan))
+                            kv_slots=requested_kv_slots(a,e),env=plan_env(a,e,vulkan_plan_env(a,vulkan)))
         except (OSError,ValueError,json.JSONDecodeError) as error:
             sys.exit(f"{C.yel}invalid resource plan:{C.r} {error}")
         has_cuda=cuda_binary()
@@ -1173,7 +1293,7 @@ def env_for(a):
                     ram,ctx,devices,vram_req = resource_request(a, e)
                     try:
                         plan=build_plan(a.model,ram,ctx,devices,vram_req,policy=a.policy,
-                                        kv_slots=requested_kv_slots(a,e))
+                                        kv_slots=requested_kv_slots(a,e),env=plan_env(a,e))
                         e.update(environment_for_plan(plan,e,cuda_enabled=True))
                         vt=plan["tiers"]["vram"]
                         # #1409: the dense trunk is read on every token; leaving
@@ -1643,7 +1763,7 @@ def cmd_plan(a):
         if ctx<1: raise ValueError("--ctx must be positive")
         if a.vram<0: raise ValueError("--vram cannot be negative")
         plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy,
-                        kv_slots=requested_kv_slots(a,os.environ))
+                        kv_slots=requested_kv_slots(a,os.environ),env=plan_env(a,os.environ))
     except (OSError, ValueError, json.JSONDecodeError) as error:
         sys.exit(f"{C.yel}cannot create resource plan:{C.r} {error}")
     if a.json:
@@ -1669,6 +1789,8 @@ def cmd_doctor(a):
         if ctx<1: raise ValueError("--ctx must be positive")
         if ram<0: raise ValueError("--ram cannot be negative")
         if vram<0: raise ValueError("--vram cannot be negative")
+        # doctor.py plans from this process's environment and starts no engine: plan_env's one value goes there
+        if plan_env(a,os.environ) is not None: os.environ.setdefault("Q38_MTP","0")
     except ValueError as error:
         report={"schema_version":1,"status":"error","model":os.path.abspath(a.model) if a.model else None,
                 "mode":"deep" if a.deep else "standard",
@@ -1722,7 +1844,7 @@ def cmd_tune(a):
         # sizes the device env_for_engine/env_for open
         vulkan=vulkan_gpu(a,resolve_model(a.model).descriptor.id)
         plan=build_plan(a.model,ram,ctx,[] if vulkan else devices,vram,policy=a.policy,
-                        kv_slots=requested_kv_slots(a,os.environ),env=vulkan_plan_env(a,vulkan))
+                        kv_slots=requested_kv_slots(a,os.environ),env=plan_env(a,os.environ,vulkan_plan_env(a,vulkan)))
     except (OSError,ValueError,json.JSONDecodeError) as error:
         sys.exit(f"{C.yel}cannot create tuning plan:{C.r} {error}")
     a.auto_tier=True
@@ -3616,6 +3738,11 @@ def cmd_serve(a):
         sys.exit(f"{family.display_name}: gateway adapter is not wired")
     engine=engine_for(a.model)
     need_model(a.model,engine)
+    if getattr(a,"kv_slots",None) is None:
+        a.kv_slots=requested_kv_slots(a,os.environ)
+        if a.kv_slots>1 and not (os.environ.get("COLI_KV_SLOTS") or "").strip():
+            print(f"coli serve: --kv-slots {a.kv_slots}, the measured default for this model on Data Center GPU Max "
+                  "cards (--kv-slots N, COLI_KV_SLOTS=N or COLI_PLATFORM_DEFAULTS=0 to choose)",file=sys.stderr)
     if a.kv_slots>family.limits.max_kv_slots:
         sys.exit(f"{arch} currently supports at most {family.limits.max_kv_slots} KV slot(s)")
     # pidfile: cosi' `coli stop` spegne tutto con un comando, senza pkill a mano.
@@ -4364,7 +4491,8 @@ def main():
                     help="allowed browser origin, repeatable; plain values replace the default list, +ORIGIN adds to it")
     ps.add_argument("--max-queue",type=int,default=int(os.environ.get("COLI_MAX_QUEUE","8")))
     ps.add_argument("--queue-timeout",type=float,default=float(os.environ.get("COLI_QUEUE_TIMEOUT","300")))
-    ps.add_argument("--kv-slots",type=int,default=int(os.environ.get("COLI_KV_SLOTS","1")))
+    ps.add_argument("--kv-slots",type=int,default=None,
+                    help="KV slots (conversations at once); default COLI_KV_SLOTS, else 8 for qwen36 on Data Center GPU Max cards with a SYCL engine, else 1")
     ps.add_argument("--allowed-host",action="append",
         default=[h.strip() for h in os.environ.get("COLI_ALLOWED_HOSTS","").split(",") if h.strip()],
         help="additional Host header accepted by the DNS-rebinding guard; repeat as needed")
@@ -4396,7 +4524,7 @@ def main():
                                          help="allowed browser origin, repeatable; plain values replace the default list, +ORIGIN adds to it")),
                    ("--max-queue",dict(type=int,default=int(os.environ.get("COLI_MAX_QUEUE","8")))),
                    ("--queue-timeout",dict(type=float,default=float(os.environ.get("COLI_QUEUE_TIMEOUT","300")))),
-                   ("--kv-slots",dict(type=int,default=int(os.environ.get("COLI_KV_SLOTS","1")))),
+                   ("--kv-slots",dict(type=int,default=None)),
                    ("--allowed-host",dict(action="append",
                        default=[h.strip() for h in os.environ.get("COLI_ALLOWED_HOSTS","").split(",") if h.strip()],
                        help="additional Host header accepted by the DNS-rebinding guard; repeat as needed"))):

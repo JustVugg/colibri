@@ -723,6 +723,89 @@ endif
 endif
 endif
 
+# SYCL=1 builds the SAME backend for Intel GPUs (Data Center GPU Max, the Arc B-series and
+# the Xe2 / Xe3 integrated parts) with oneAPI's icpx: the units in sycl/ are the dpct
+# migration of backend_cuda.cu, cuda_chain.cu and cu_xb.cu (sycl/MIGRATION.md) plus the
+# profile, device and matrix-engine layer of sycl/coli_sycl.h, exporting the coli_cuda_*
+# ABI, so the engines build with -DCOLI_CUDA exactly as the CUDA=1 / HIP=1 arms. Every
+# device decision is made at run time from the device (sycl/README.md); the AOT list only
+# decides which GPUs carry native code in the binary (any other JITs from the SPIR-V).
+#   make -C c qwen36 colibri SYCL=1 ARCH=x86-64-v4    (intel/oneapi-basekit, setvars sourced)
+#   SYCL_DEVICES=pvc,bmg   ocloc's -device list (SYCL_DEVICES=pvc for one card)
+#   SYCL_TARGETS=spir64    JIT only, no ocloc (the default spir64_gen is AOT for SYCL_DEVICES)
+# The C engine stays gcc's: icpx compiles only the SYCL units (fat objects: host code plus
+# the device IR), and one -fsycl-link step turns their device parts into a plain object
+# holding the AOT images and the runtime's registration (sycl/coli_sycl_dev.o), so the
+# existing gcc link lines take the SYCL objects like any other (checked: the gcc-linked
+# binary carries the pvc and bmg images and their registration; -fPIE on that step keeps
+# the PIE link free of text relocations). No icpx-driven final link is needed.
+SYCL         ?= 0
+ICPX         ?= icpx
+SYCL_DEVICES ?= pvc,bmg
+SYCL_TARGETS ?= spir64_gen
+# AOT precision experiment: both division and sqrt correctly rounded by IGC.
+# Default preserves the qualified OpenCL-precision kernels. Explicitly reject JIT
+# mode here: that needs runtime build-option plumbing, not an ignored setting.
+SYCL_IEEE_DIV_SQRT ?= 0
+ifneq ($(SYCL_IEEE_DIV_SQRT),0)
+ifneq ($(SYCL_IEEE_DIV_SQRT),1)
+$(error SYCL_IEEE_DIV_SQRT must be 0 or 1)
+endif
+endif
+ifeq ($(SYCL_IEEE_DIV_SQRT),1)
+ifneq ($(SYCL_TARGETS),spir64_gen)
+$(error SYCL_IEEE_DIV_SQRT=1 requires SYCL_TARGETS=spir64_gen)
+endif
+SYCL_AOT_MATH = -options -cl-fp32-correctly-rounded-divide-sqrt
+endif
+ifeq ($(SYCL_TARGETS),spir64_gen)
+SYCL_TARGET_FLAGS = -fsycl -fsycl-targets=spir64_gen -Xsycl-target-backend=spir64_gen "-device $(SYCL_DEVICES) $(SYCL_AOT_MATH)"
+else
+SYCL_TARGET_FLAGS = -fsycl -fsycl-targets=$(SYCL_TARGETS)
+endif
+# -fp-model=precise: icpx defaults to fast math, which the migrated backend refuses by design
+# (its fmt=8 guard, sycl/MIGRATION.md). COLI_GPU_PORTABLE_ONLY keeps the NVIDIA-only arms
+# out, as the migration's input had them. The migrated units' own copies of
+# backend_gpu_compat.h and cuda_bd.dp.hpp sit beside them in sycl/, found first by their
+# quoted includes; the ABI headers come from -I. and dpct's helpers from -Isycl/include.
+ICPXFLAGS ?= -O3 -std=c++17 $(SYCL_TARGET_FLAGS) -fp-model=precise -fPIE -Wall -Wextra \
+             -Wno-unused-parameter -Wno-unused-function -I. -Isycl -Isycl/include -DCOLI_GPU_PORTABLE_ONLY=1
+# SYCL_DNNL=1: a prompt chunk's attention may go through oneDNN's fused attention
+# (sycl/coli_sycl_dnnl.cpp; COLI_SYCL_DNNL_ATTN=1 or 2, or unset on Max cards: sycl/README.md). Compiles that unit
+# with COLI_SYCL_DNNL and links the toolkit's libdnnl (setvars' DNNLROOT; the runtime image's
+# redist carries libdnnl.so.3). Without it the unit is empty and the stubs decline. Changing it
+# rebuilds the objects (it is in .build-config, below).
+SYCL_DNNL ?= 0
+ifeq ($(SYCL_DNNL),1)
+ICPXFLAGS     += -DCOLI_SYCL_DNNL=1 $(if $(DNNLROOT),-I$(DNNLROOT)/include)
+SYCL_DNNL_LIB  = $(if $(DNNLROOT),-L$(DNNLROOT)/lib) -ldnnl
+endif
+# every unit in sycl/: the migrated .dp.cpp and the hand-written .cpp (the profile, its
+# rules, the stubs, the XMX family when it lands), so a new unit needs no Makefile line
+SYCL_SRC     = $(sort $(wildcard sycl/*.dp.cpp) $(wildcard sycl/*.cpp))
+SYCL_FAT_OBJ = $(SYCL_SRC:.cpp=.o)
+SYCL_DEV_OBJ = sycl/coli_sycl_dev.o
+SYCL_OBJ     = $(SYCL_FAT_OBJ) $(SYCL_DEV_OBJ)
+ifeq ($(SYCL),1)
+ifeq (,$(LINUX))
+$(error SYCL=1 is supported only on Linux)
+endif
+ifneq (,$(filter 1,$(CUDA) $(HIP) $(CUDA_DLL) $(HIP_DLL)))
+$(error choose SYCL=1 or CUDA=1 / HIP=1, not both: each builds the one backend_cuda.h ABI)
+endif
+# VK=1 stays independent, as it is of CUDA=1 (a build for a box with both kinds of card).
+# The gcc link also needs icpx's own runtime behind the fat objects' host code: libintlc
+# (the optimizer emits _intel_fast_memcpy / _intel_fast_memset at -O3) and the math
+# libraries an icpx-driven link would add (libimf, libsvml, libirng); all four are in the
+# basekit's LIBRARY_PATH (setvars) and in the runtime image's /opt/intel/oneapi/redist/lib.
+CFLAGS     += -DCOLI_CUDA -DCOLI_SYCL
+LDFLAGS    += -lsycl -lstdc++ -lintlc -limf -lsvml -lirng $(SYCL_DNNL_LIB)
+CUDA_OBJ    = $(SYCL_OBJ) cu_tier.o
+GPUCC       = $(ICPX)
+GPUFLAGS    = $(ICPXFLAGS)
+GPUCC_NAME  = icpx (source /opt/intel/oneapi/setvars.sh or set ICPX)
+endif
+
 # METAL=1 adds an opt-in Apple-GPU backend (macOS only). The shader is compiled at
 # runtime, so no Xcode / offline metal compiler is required. Default build unchanged.
 METAL     ?= 0
@@ -975,7 +1058,7 @@ glm: colibri$(EXE)
 # rewrite it ONLY when they change (evaluated here at parse time, so the file's
 # timestamp moves exactly when the config moves). The binary and CUDA/loader objects depend
 # on it, so they relink on a config change and stay put otherwise. (#306)
-BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|CUDA_GLIBC_MATH_COMPAT=$(CUDA_GLIBC_MATH_COMPAT)|METAL=$(METAL)|HIP=$(HIP)|HIP_DLL=$(HIP_DLL)|HIP_ARCH=$(HIP_ARCH)|VK=$(VK)|XDNA=$(XDNA)
+BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|CUDA_GLIBC_MATH_COMPAT=$(CUDA_GLIBC_MATH_COMPAT)|METAL=$(METAL)|HIP=$(HIP)|HIP_DLL=$(HIP_DLL)|HIP_ARCH=$(HIP_ARCH)|VK=$(VK)|XDNA=$(XDNA)|SYCL=$(SYCL)|SYCL_TARGETS=$(SYCL_TARGETS)|SYCL_DEVICES=$(SYCL_DEVICES)|SYCL_IEEE_DIV_SQRT=$(SYCL_IEEE_DIV_SQRT)|SYCL_DNNL=$(SYCL_DNNL)
 BUILD_CONFIG_OLD := $(shell cat .build-config 2>/dev/null)
 ifneq "$(BUILD_CONFIG)" "$(BUILD_CONFIG_OLD)"
 # $(file ...) writes via make's own primitive (GNU Make >= 4.0, 2013), NOT by
@@ -1179,6 +1262,24 @@ cu_xb.o: cu_xb.cu cu_tier_ops.h cuda_bd.cuh vk_alloc.h backend_cuda.h backend_gp
 	"$(GPUCC)" $(GPUFLAGS) -c cu_xb.cu -o $@
 cu_tier.o: cu_tier.c vk_tier.c vk_tier.h cu_tier.h cu_tier_ops.h .build-config
 	$(CC) $(CFLAGS) -c cu_tier.c -o $@
+
+# The SYCL units (SYCL=1): each a fat object (host code and device IR), then the one device
+# link that AOT-compiles every kernel for SYCL_DEVICES and wraps the images, with their
+# registration, into a plain object the gcc link takes. Pattern rule: a new unit in sycl/
+# builds with no line here.
+# The headers a unit may include, named so a reader can check them; the compile also writes
+# sycl/<unit>.d (-MMD -MP: the host compile's includes, dpct's helpers and this directory's
+# among them), read back below, so an edit to any header a unit really includes rebuilds it.
+SYCL_HDR = sycl/coli_sycl.h sycl/coli_sycl_profile.h sycl/backend_sycl.h sycl/backend_gpu_compat.h sycl/cuda_bd.dp.hpp \
+           backend_cuda.h cuda_chain.h cu_tier_ops.h fp8_format.h vk_alloc.h
+sycl/%.o: sycl/%.cpp $(SYCL_HDR) .build-config
+	@command -v "$(ICPX)" >/dev/null 2>&1 || { echo "icpx not found: source /opt/intel/oneapi/setvars.sh or set ICPX (SYCL=1)" >&2; exit 1; }
+	"$(ICPX)" $(ICPXFLAGS) -MMD -MP -c $< -o $@
+ifeq ($(SYCL),1)
+-include $(SYCL_FAT_OBJ:.o=.d)
+endif
+$(SYCL_DEV_OBJ): $(SYCL_FAT_OBJ)
+	"$(ICPX)" $(SYCL_TARGET_FLAGS) -fPIE -fsycl-link $(SYCL_FAT_OBJ) -o $@
 
 
 backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h backend_cuda_dsv4_quant.cuh .build-config $(DSV4_DEEPGEMM_DEP)
@@ -1591,6 +1692,49 @@ gpu-compile: backend_cuda.o cuda_chain.o
 	"$(GPUCC)" $(GPUFLAGS) tests/test_weights_owned_cuda.cu -o weights_owned_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) tests/test_cuda_fmt_trap_cuda.cu -o cuda_fmt_trap_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 
+# SYCL=1 (sycl/README.md). sycl-compile: every SYCL object, no link (CI without a GPU, or
+# a check of one unit: make sycl/coli_sycl_profile.o SYCL=1). sycl-profile-test: the
+# host-only test of the profile's decisions (plain C++, no SYCL runtime: it runs anywhere).
+# sycl-test: that, plus the GPU tests built, not run (they need a card; sycl-chain-check
+# runs the chain's): the two migrated ones under their cuda-test names, and every other
+# sycl/tests/*.cpp as sycl/tests/<name> (the dispatch test, the XMX test, the next one
+# with no line here). The tests link the fat objects through icpx, which does their
+# device link itself.
+sycl-compile: $(SYCL_OBJ)
+sycl/tests/test_sycl_profile$(EXE): sycl/tests/test_sycl_profile.cpp sycl/coli_sycl_profile_rules.cpp sycl/coli_sycl_profile.h
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Isycl sycl/tests/test_sycl_profile.cpp sycl/coli_sycl_profile_rules.cpp -o $@
+sycl-profile-test: sycl/tests/test_sycl_profile$(EXE)
+	./sycl/tests/test_sycl_profile$(EXE)
+sycl/tests/test_host_sync$(EXE): sycl/tests/test_host_sync.cpp sycl/coli_sycl_host_sync.h
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -pthread $< -o $@
+sycl-host-sync-test: sycl/tests/test_host_sync$(EXE)
+	./sycl/tests/test_host_sync$(EXE)
+sycl/tests/test_matmul_plan$(EXE): sycl/tests/test_matmul_plan.cpp sycl/coli_sycl_matmul_plan.h
+	$(CXX) -std=c++17 -O2 -Wall -Wextra $< -o $@
+sycl-matmul-plan-test: sycl/tests/test_matmul_plan$(EXE)
+	./sycl/tests/test_matmul_plan$(EXE)
+SYCL_GPU_TEST_SRC = $(filter-out %.dp.cpp sycl/tests/test_sycl_profile.cpp sycl/tests/test_host_sync.cpp sycl/tests/test_matmul_plan.cpp,$(sort $(wildcard sycl/tests/*.cpp)))
+SYCL_GPU_TEST_BIN = $(SYCL_GPU_TEST_SRC:.cpp=$(EXE))
+sycl/tests/test_qwen38_fp8_stages$(EXE): tests/qwen38_fp8_fixture.h
+ifeq ($(SYCL),1)
+# The Qwen engine's GCC final link resolves host expf through glibc, whereas an
+# icpx final link may embed Intel libm. Use this runner for bit-exact host SiLU
+# comparisons; the GPU test source and device registration are unchanged.
+sycl/tests/test_qwen38_fp8_stages_hostlink.o: sycl/tests/test_qwen38_fp8_stages.cpp tests/qwen38_fp8_fixture.h $(SYCL_HDR) sycl/tests/sycl_test_args.h
+	"$(ICPX)" $(ICPXFLAGS) -c $< -o $@
+sycl/tests/test_qwen38_fp8_stages_hostlink$(EXE): sycl/tests/test_qwen38_fp8_stages_hostlink.o $(SYCL_OBJ)
+	$(CC) $(CFLAGS) $< $(SYCL_OBJ) -o $@ $(LDFLAGS)
+endif
+sycl/tests/%$(EXE): sycl/tests/%.cpp $(SYCL_FAT_OBJ) $(SYCL_HDR) sycl/tests/sycl_test_args.h
+	"$(ICPX)" $(ICPXFLAGS) $< $(SYCL_FAT_OBJ) -o $@ $(SYCL_DNNL_LIB)
+cuda_chain_test$(EXE): sycl/tests/test_cuda_chain.dp.cpp $(SYCL_FAT_OBJ) $(SYCL_HDR) sycl/tests/sycl_test_args.h
+	"$(ICPX)" $(ICPXFLAGS) $< $(SYCL_FAT_OBJ) -o $@ $(SYCL_DNNL_LIB)
+backend_cuda_test$(EXE): sycl/tests/test_backend_cuda.dp.cpp $(SYCL_FAT_OBJ) $(SYCL_HDR) sycl/tests/sycl_test_args.h
+	"$(ICPX)" $(ICPXFLAGS) $< $(SYCL_FAT_OBJ) -o $@ $(SYCL_DNNL_LIB)
+sycl-test: sycl-profile-test sycl-host-sync-test sycl-matmul-plan-test cuda_chain_test$(EXE) backend_cuda_test$(EXE) $(SYCL_GPU_TEST_BIN)
+sycl-chain-check: sycl-test
+	./cuda_chain_test$(EXE)
+
 cuda-bench: backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h tests/bench_tensor_core.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/bench_tensor_core.cu -o backend_cuda_bench$(EXE) $(ANS_NVCC_LIBS)
@@ -1634,7 +1778,7 @@ olmoe$(EXE): olmoe.c $(CHAIN_CUDA_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
 # the tier compiles in through the runtime loader exactly as it does through
 # the direct link, or `make qwen36.exe CUDA_DLL=1` silently produced a CPU-only
 # engine (#1533).
-ifneq (,$(filter 1,$(CUDA) $(CUDA_DLL) $(HIP) $(HIP_DLL)))
+ifneq (,$(filter 1,$(CUDA) $(CUDA_DLL) $(HIP) $(HIP_DLL) $(SYCL)))
 QWEN36_TIER_OBJ = qwen36_tier.o
 QWEN36_CFLAGS   = $(CFLAGS)
 QWEN36_LDFLAGS  = $(LDFLAGS)
@@ -2213,7 +2357,7 @@ inkling$(EXE): inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build
 # flags for these targets and say so once, loudly.
 comma := ,
 NOCUDA_CFLAGS  = $(filter-out -DCOLI_CUDA -DCOLI_ANS,$(CFLAGS))
-NOCUDA_LDFLAGS = $(filter-out -lcudart -lcublasLt -lcublas -lstdc++ -lcuda -L$(CUDA_HOME)/lib64 \
+NOCUDA_LDFLAGS = $(filter-out -lcudart -lcublasLt -lcublas -lstdc++ -lcuda -lsycl -lintlc -limf -lsvml -lirng $(SYCL_DNNL_LIB) -L$(CUDA_HOME)/lib64 \
                    -Wl$(comma)-rpath$(comma)$(CUDA_HOME)/lib64,$(LDFLAGS))
 
 # GLM-5.3-Flash: routed experts stream from the int4-gs64 container.
@@ -2399,6 +2543,13 @@ tests/test_dsv41_engram_stage$(EXE): tests/test_dsv41_engram_stage.c deepseek_v4
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_qwen38_idot$(EXE): tests/test_qwen38_idot.c qwen38.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+# Model-free stage fixtures from the actual GCC/AVX CPU functions. No GPU init.
+tests/export_qwen38_fp8_stages$(EXE): tests/export_qwen38_fp8_stages.c qwen38.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+tests/export_qwen38_fp8_native$(EXE): tests/export_qwen38_fp8_native.c tests/export_qwen38_fp8_stages.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 # The token list of qwen38's MTP head (draft_vocab.h), with no model.
@@ -3406,11 +3557,25 @@ tests/test_qwen36_tier_invariants$(EXE): tests/test_qwen36_tier_invariants.c qwe
 tests/test_qwen36_tier_take_error$(EXE): tests/test_qwen36_tier_take_error.c qwen36_tier.c
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
+# Raw ranked collection preserves caller ownership and rejects partial rows.
+tests/test_qwen36_tier_take_rows$(EXE): tests/test_qwen36_tier_take_rows.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
 # Same fake backend, with uploads that take time: qt_fill_wait must not return
 # until the last enqueued expert is RESIDENT, not merely dequeued -- the engine
 # frees the RAM int8 copies right after it (#1360 saw the gap one run in
 # fifteen; here the slow upload hook makes it every run without the fix).
 tests/test_qwen36_tier_fill_wait$(EXE): tests/test_qwen36_tier_fill_wait.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Same fake backend: the native int4 format's arena (COLI_CUDA_EXPERT_ARENA=1) -- an expert one copy
+# of its matrices and one of its scales into a slot, where an upload a matrix allocated twice each.
+tests/test_qwen36_tier_int4_arena$(EXE): tests/test_qwen36_tier_int4_arena.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Same fake backend: the fp8 experts' arena (COLI_CUDA_EXPERT_ARENA=1|2 in the tier's copy mode, Qwen3.8) --
+# an expert ONE copy of its slot (gate | up | down | scales) and three views, a swap into the victim's slot.
+tests/test_qwen36_tier_fp8_arena$(EXE): tests/test_qwen36_tier_fp8_arena.c qwen36_tier.c
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
 # Same fake backend: the automatic placement (COLI_PLACE unset/"auto") puts
@@ -3470,6 +3635,14 @@ tests/test_qwen36_tier_replan$(EXE): tests/test_qwen36_tier_replan.c qwen36_tier
 # qt_chain_promote: the resident set follows the conversation while the chain runs the experts in its frame (fake backend).
 tests/test_qwen36_tier_promote$(EXE): tests/test_qwen36_tier_promote.c qwen36_tier.c
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# the int4 arena's slots under the chain's promotions, a failed qt_init, a staging buffer out at shutdown (fake backend).
+tests/test_qwen36_tier_arena_promote$(EXE): tests/test_qwen36_tier_arena_promote.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# platform_defaults.h: an engine's measured configuration for the variables left unset (qwen38's SYCL table).
+tests/test_platform_defaults$(EXE): tests/test_platform_defaults.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 # qt_chain_host_follow: after the promotions the host pool is the non-residents again, or every expert when the warm start pooled them all (qt_chain_host_all; fake backend).
 tests/test_qwen36_tier_host_pool$(EXE): tests/test_qwen36_tier_host_pool.c qwen36_tier.c
@@ -3899,6 +4072,7 @@ bench: iobench$(EXE)
 	deepseek-v4-tiny-generate deepseek-v4-tiny-check \
 	qwen38-tiny-generate qwen38-tiny-check \
 	iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench fp8-bench cuda-dll hip-dll portable \
+	sycl-compile sycl-test sycl-profile-test sycl-host-sync-test sycl-chain-check \
 	test-c test-python test check clean install uninstall bench
 
 # Own line: see the TEST_RULES note above on shared .PHONY lines.

@@ -1,0 +1,87 @@
+# colibri — the Intel GPU (SYCL) engine image: built in the oneAPI basekit, run in the
+# oneAPI runtime (multi-stage, the shape of docker/Dockerfile.slim). The model is mounted,
+# never baked in. Everything about the GPU is decided at run time from the device
+# (sycl/README.md); the build only chooses which GPUs carry native code (SYCL_DEVICES).
+#
+#   docker build -t colibri-sycl -f c/sycl/Dockerfile.sycl .          (from the repo root)
+#   docker build -t colibri-sycl -f c/sycl/Dockerfile.sycl --build-arg ARCH=x86-64-v3 .
+#
+#   # first contact: what the runtime sees, no kernel runs (the README's procedure; any entry
+#   # point of the backend answers it, and qwen36 enters the backend only with COLI_CUDA=1 and
+#   # after the model loads: the engine's form is
+#   # -e COLI_CUDA=1 -e COLI_SYCL_LIST=1 -e SNAP=/model ... --entrypoint /app/qwen36 colibri-sycl 256 4 p.txt)
+#   docker run --rm --device /dev/dri --group-add $(getent group render | cut -d: -f3) \
+#       -e COLI_SYCL_LIST=1 --entrypoint /app/tests/backend_cuda_test colibri-sycl
+#   docker run --rm --device /dev/dri --group-add <render gid> -v /nvme/qwen36_i4:/model colibri-sycl info
+#   docker run --rm -p 5000:5000 --device /dev/dri --group-add <render gid> -v /nvme/qwen36_i4:/model \
+#       colibri-sycl serve --host 0.0.0.0
+#
+# --------------------------------------------------------------------------
+# Stage 1: build. icpx compiles the SYCL units (AOT for SYCL_DEVICES, pvc and bmg by
+# default), gcc the C engine; the gcc link takes the SYCL objects (c/Makefile, SYCL=1).
+# ARCH is the C engine's -march: x86-64-v4 (AVX-512) suits the Xeon hosts of the Data
+# Center GPU Max and the Arc Pro B60; pass x86-64-v3 for a host without AVX-512. The
+# host-only profile test runs here; the GPU tests are only built (no card at build time).
+FROM intel/oneapi-basekit:2025.3.2-0-devel-ubuntu24.04 AS build
+ARG ARCH=x86-64-v4
+ARG SYCL_DEVICES=pvc,bmg
+# JOBS: make's -j (the seven icpx units and the engine's C files compile in parallel; the AOT
+# device links are serial within themselves)
+ARG JOBS=8
+WORKDIR /src
+COPY c/ ./c/
+# setvars.sh is a safety net here (the image's ENV already ran it, SETVARS_COMPLETED=1, and
+# then it returns 3 without doing anything), so its status is not chained into make's.
+RUN bash -lc 'source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1; \
+    make -C c -j${JOBS} qwen36 colibri sycl-test SYCL=1 ARCH=${ARCH} SYCL_DEVICES=${SYCL_DEVICES}'
+
+# --------------------------------------------------------------------------
+# Stage 2: runtime. The oneAPI runtime image carries libsycl.so.8 and the Level Zero /
+# OpenCL adapters under /opt/intel/oneapi/redist/lib (compute runtime 25.18, the GPU driver
+# stack), and already has what the engine and the launcher need besides: libgomp1 (gcc's
+# OpenMP, linked by the C side) and python3 (3.12). The launcher and its support files are
+# the ones docker/Dockerfile.slim ships; the GPU tests ride along under /app/tests for
+# first contact. The container's user is colibri, uid 1000 (the bind-mounted model's usual
+# owner): the image ships a stock uid-1000 user (ubuntu), renamed rather than duplicated.
+FROM intel/oneapi-runtime:2025.3.1-0-devel-ubuntu24.04
+RUN if getent passwd 1000 >/dev/null; then \
+        usermod -l colibri -d /home/colibri -m "$(getent passwd 1000 | cut -d: -f1)" && \
+        groupmod -n colibri "$(getent group 1000 | cut -d: -f1)"; \
+    else useradd -m -u 1000 colibri; fi
+WORKDIR /app
+
+# The runtime image's UR adapters (libur_adapter_level_zero.so.0, libur_adapter_opencl.so.0,
+# the libraries libsycl loads to reach a GPU) need libumf.so.1, which the 2025.3.1 runtime
+# image does not ship (ldd: "libumf.so.1 => not found": no adapter would load, and the engine
+# would see no GPU on any card). The basekit has it (umf 1.0, and the libhwloc it needs), so
+# both go next to libsycl.
+COPY --from=build /opt/intel/oneapi/umf/1.0/lib/libumf.so.1 /opt/intel/oneapi/tcm/1.4/lib/libhwloc.so.15 \
+     /opt/intel/oneapi/redist/lib/
+
+COPY --from=build /src/c/colibri /src/c/qwen36 ./
+COPY --from=build /src/c/cuda_chain_test /src/c/backend_cuda_test /src/c/sycl/tests/test_coli_sycl_launch \
+     /src/c/sycl/tests/test_sycl_xmx /src/c/sycl/tests/test_sycl_profile ./tests/
+COPY c/coli c/version.py c/openai_server.py c/v4_dsml.py c/v41_dsml.py c/family_registry.py c/resource_plan.py c/doctor.py c/autotune.py c/image_engine.py c/term_image.py c/power.py ./
+COPY c/tools/ ./tools/
+
+# Leave COLI_ENGINE unset: it overrides family selection, even for a Qwen model.
+# The launcher finds colibri and qwen36 beside itself via family_registry.py.
+# LD_LIBRARY_PATH: libsycl and the adapters.
+# ZES_ENABLE_SYSMAN=1: Level Zero's sysman, which the device's free-memory query needs (the
+# engine budgets on it: the tier's allowance, the chain's prompt chunk); the backend sets it
+# before its first runtime call as well, this covers a test or tool that touches the runtime
+# first.
+ENV COLI_MODEL=/model \
+    LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:/opt/intel/oneapi/redist/opt/compiler/lib \
+    ZES_ENABLE_SYSMAN=1 \
+    PYTHONUNBUFFERED=1
+# A bind-mounted model lands here; declaring the volume documents the contract.
+VOLUME ["/model"]
+# `coli serve` default port.
+EXPOSE 5000
+
+# The GPU: --device /dev/dri plus the host's render group (--group-add <gid>), since the
+# container's user is not root.
+USER colibri
+ENTRYPOINT ["python3", "/app/coli"]
+CMD ["info"]
