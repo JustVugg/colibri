@@ -36,6 +36,8 @@ int dsv4_cuda_peer_probe(int device, int peer, char *why, int why_size) {
 int dsv4_cuda_lost(void) { return 0; }
 int coli_v4_hybrid_enabled(void) { return 0; }
 int coli_v4_hot_split_on(void) { return 0; }
+/* v4_gpu_place (the HIP build) hands the block unit its pick */
+void coli_v4_hot_split_auto(int on) { (void)on; }
 int coli_v4_gpu_resident_first(void) { return 0; }
 void (*coli_v4_expert_store_vram_held)(ColiExpertStore *store, int layer,
                                        unsigned char *held, int experts);
