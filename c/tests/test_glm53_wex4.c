@@ -354,8 +354,12 @@ int main(int argc, char **argv) {
 #else
     const char *helper = argc > 1 ? argv[1] : "tests/fake_wex_cuda.so";
 #endif
+#ifdef COLI_WEX_CUDA_LOADER
     FILE *probe = fopen(helper, "rb");
     if (probe) fclose(probe);
+#else
+    FILE *probe = NULL;   /* wex_decode.c loads the helper on Windows and Linux only */
+#endif
     if (probe) {   /* the fake CUDA helper (tests/fake_wex_cuda): every WNR3 record decoded by it */
         setenv("COLI_WEX_CUDA_LIB", helper, 1);
         child_case(argv[0], 0, "COLI_WEX_CUDA_LIB (the fake helper): every WNR3 record decoded by the helper, the same bytes");
@@ -363,7 +367,12 @@ int main(int argc, char **argv) {
         child_case(argv[0], 9, "the helper refuses every record (status 1): each decoded on the CPU, the same bytes");
         unsetenv("FAKE_WEX_HOST_FAIL");
         unsetenv("COLI_WEX_CUDA_LIB");
-    } else printf("  skip COLI_WEX_CUDA_LIB: no %s (make tests/fake_wex_cuda first)\n", helper);
+    } else
+#ifdef COLI_WEX_CUDA_LOADER
+        printf("  skip COLI_WEX_CUDA_LIB: no %s (make tests/fake_wex_cuda first)\n", helper);
+#else
+        printf("  skip COLI_WEX_CUDA_LIB: the helper is loaded on Windows and Linux only (%s)\n", helper);
+#endif
     put(cz, cz_bytes);
     ck(attach_and_load() == 0, "the canonical-zero WNR3 container: the same records");
     nr3[at[4] + 5000] ^= 0x10u; put(nr3, nr3_bytes);
