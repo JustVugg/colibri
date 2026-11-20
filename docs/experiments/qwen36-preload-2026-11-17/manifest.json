@@ -1,0 +1,163 @@
+{
+  "version": 1,
+  "hypothesis": "With a cache slot for every expert and the model in the page cache, a fresh qwen36 server's first replies are slow because each expert's first use reads and repacks it on the engine's thread; filling the free slots from background threads at startup (Q36_PRELOAD=1) should bring the first replies to the warm speed and shorten the first token, with the same text and no cost once warm.",
+  "commit": "bae0e3c14d2215a891a32e52199f4dd02e62fdd9",
+  "model": "Qwen3.6-35B-A3B, Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64 (int4 gs=64 safetensors container from the one-step setup)",
+  "command": "make -C c qwen36 ARCH=native; python3 docs/experiments/qwen36-preload-2026-11-17/bench.py MODEL OUT off:WT/c on:WT/c:Q36_PRELOAD=1, three times (each run: coli serve --model MODEL --auto-tier --port 8011, with the preload wait for its 'experts loaded' line, one warm-up request, three timed requests, five others, the same three again; tok_s holds the FIRST round, which is what the preload changes); racing.txt: race:WT/c:Q36_PRELOAD=1,NOWAIT=1 twice",
+  "prompt_hash": "sha256:a66be27c334df7f45cbfb7a831a8df906fb138200e3eeff1ced6d91a3ba85014",
+  "hardware": {
+    "cpu": "2x Intel Xeon E5-2670 (Sandy Bridge-EP: AVX, SSSE3, no AVX2, no FMA, no F16C), 16 cores / 32 threads, 2 NUMA nodes",
+    "ram": "94 GiB DDR3, 64 GB on node 0 and 32 GB on node 1",
+    "storage": "7200 rpm HDD, ext4 (rw,relatime); the model was in the page cache for every run",
+    "os": "Fedora 42, Linux 6.17.7, glibc 2.41, GCC 15.2.1"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "Q36_PRELOAD"
+  ],
+  "baseline": {
+    "config": {
+      "OMP_NUM_THREADS": "unset (16, the engine's choice)",
+      "COLI_TIMERS": "1",
+      "Q36_PRELOAD_THREADS": "unset (4)",
+      "expert cache": "256 a layer (--auto-tier), page cache warm",
+      "BUILD": "make qwen36 ARCH=native, GCC 15.2.1, binary sha256 605560d91ba116e3c89457c94a4c1c978c7b7c4b921d611c86560a91b18a1da1",
+      "max_tokens": "96",
+      "temperature": "0",
+      "Q36_PRELOAD": "unset"
+    },
+    "samples": {
+      "tok_s": [
+        2.832,
+        4.867,
+        7.068,
+        2.869,
+        4.959,
+        7.125,
+        2.87,
+        4.921,
+        7.171
+      ],
+      "first_token_s": [
+        13.64,
+        6.1,
+        2.88,
+        13.39,
+        5.83,
+        2.91,
+        13.52,
+        5.88,
+        2.93
+      ],
+      "tok_s_second_round": [
+        9.435,
+        10.059,
+        10.271,
+        9.998,
+        9.822,
+        10.135,
+        9.906,
+        9.74,
+        10.216
+      ],
+      "first_token_s_second_round": [
+        2.05,
+        1.75,
+        1.77,
+        1.95,
+        1.85,
+        1.71,
+        1.85,
+        1.74,
+        1.63
+      ],
+      "moe_ms_per_token_second_round_by_run": [
+        52.4,
+        51.4,
+        52.0
+      ]
+    },
+    "median_tok_s": 4.921,
+    "quality": {
+      "method": "tests/test_qwen36_preload.py passes (the replies of the tiny fixtures are the ones without the preload, racing the loaders and after them, caps 8 and 2, 1/4/16 loaders); the text of the six timed replies is byte-identical in all eight runs, the two racing ones included (sha256 9ec0f3c7a6ffae4888f65424209f872fb43178efcb3d64132ef3cb1d007d58eb)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-preload-2026-11-17/baseline.txt",
+      "sha256": "211fab0a95a83acf9e43ce7f76600d14b6437133e2f3995c5e3fa8b3d2bad405"
+    }
+  },
+  "trial": {
+    "config": {
+      "OMP_NUM_THREADS": "unset (16, the engine's choice)",
+      "COLI_TIMERS": "1",
+      "Q36_PRELOAD_THREADS": "unset (4)",
+      "expert cache": "256 a layer (--auto-tier), page cache warm",
+      "BUILD": "make qwen36 ARCH=native, GCC 15.2.1, binary sha256 605560d91ba116e3c89457c94a4c1c978c7b7c4b921d611c86560a91b18a1da1",
+      "max_tokens": "96",
+      "temperature": "0",
+      "Q36_PRELOAD": "1"
+    },
+    "samples": {
+      "tok_s": [
+        9.139,
+        9.602,
+        9.92,
+        9.229,
+        9.909,
+        9.945,
+        9.194,
+        9.876,
+        9.823
+      ],
+      "first_token_s": [
+        1.85,
+        1.76,
+        1.69,
+        1.81,
+        1.75,
+        1.77,
+        1.84,
+        1.74,
+        1.65
+      ],
+      "tok_s_second_round": [
+        9.842,
+        9.863,
+        10.08,
+        10.289,
+        10.048,
+        10.111,
+        10.248,
+        10.024,
+        10.218
+      ],
+      "first_token_s_second_round": [
+        1.8,
+        1.74,
+        1.66,
+        1.99,
+        1.83,
+        1.7,
+        1.77,
+        1.75,
+        1.77
+      ],
+      "moe_ms_per_token_second_round_by_run": [
+        50.6,
+        49.9,
+        49.6
+      ]
+    },
+    "median_tok_s": 9.823,
+    "quality": {
+      "method": "tests/test_qwen36_preload.py passes (the replies of the tiny fixtures are the ones without the preload, racing the loaders and after them, caps 8 and 2, 1/4/16 loaders); the text of the six timed replies is byte-identical in all eight runs, the two racing ones included (sha256 9ec0f3c7a6ffae4888f65424209f872fb43178efcb3d64132ef3cb1d007d58eb)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-preload-2026-11-17/trial.txt",
+      "sha256": "d324b15aff777b59d42f6fa852d66e50d032227402dd9b539a14916b9ba5085e"
+    }
+  },
+  "outcome": "improvement"
+}
