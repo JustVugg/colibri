@@ -24,6 +24,8 @@ ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--cache", default="/tmp/mmlu_subset_cache.json")
 ap.add_argument("--out", default=None)
 args = ap.parse_args()
+if args.n < 1:
+    ap.error("--n must be positive")
 
 # ---- fetch + cache a pool of questions (deterministic subset from it) ----
 if not os.path.exists(args.cache):
@@ -35,6 +37,8 @@ if not os.path.exists(args.cache):
             rows += [x["row"] for x in json.load(r)["rows"]]
     json.dump(rows, open(args.cache, "w"))
 pool = json.load(open(args.cache))
+if args.n > len(pool):
+    ap.error(f"--n requests {args.n} questions but the cached pool contains only {len(pool)}")
 
 rng = random.Random(args.seed)
 by_subj = {}
