@@ -2106,6 +2106,15 @@ static void q38_report_request_split(const Model *m,const Q38ReqClock *clk,const
  * the CPU's loop sees the stop before its first layer, and the copy goes back here too. An
  * echo (logprobs) and a prompt with an image are read in one call, as before.
  * COLI_PROMPT_SEGMENT sets the rows (2048 on the CPU, 8192 for a chain). */
+/* A serve's Metal chain failed with the recurrent state on the GPU only (q38m_forward): the turn
+ * ends with an error and nothing more of it runs (q38_chain_lost_end). 0 in other builds. */
+static int q38_chain_lost(void){
+#ifdef QWEN38_METAL
+    return g_q38m_lost;
+#else
+    return 0;
+#endif
+}
 static int q38_prompt_poll(ColiPromptBreak *b){   /* control: 1 STOP, 3 CANCEL (serve_read_req) */
     while(!b->control&&!b->eof&&coli_stdin_readable()){
         int r=serve_read_req(stdin,stdout,NULL,b->id);
@@ -2135,6 +2144,7 @@ static float *q38_serve_prefill(Model *m,const int *ids,int from,int np,ColiProm
         for(int at=from;at<np;){
             int n=np-at<seg?np-at:seg;
             float *next=step(m,ids+at,n,at);
+            if(next&&q38_chain_lost()){free(next);next=NULL;}   /* the rest of the prompt not read */
             free(lo);lo=next;
             if(!next)break;
             at+=n;
@@ -2160,6 +2170,7 @@ static float *q38_serve_prefill(Model *m,const int *ids,int from,int np,ColiProm
         if(!one&&(empty||q38_pin_state_copy(m,&st,1)))g_coli_prompt_break=ctl;
         float *next=step(m,ids+at,n,at);
         g_coli_prompt_break=NULL;
+        if(next&&q38_chain_lost()){free(next);next=NULL;}   /* the rest of the prompt not read */
         if(!next){
             if(empty)reset_recurrent(m);
             else q38_pin_state_copy(m,&st,0);
@@ -2993,6 +3004,30 @@ static void q38_prefix_miss_log(Model *m,const int *ids,int np){
     q38_log_ids_text("[PREFIX]   held:  ",held,at,at+16<len?at+16:len);
 }
 
+/* The turn after a serve's Metal chain failed with the recurrent state on the GPU only: the chain
+ * is off (q38m_forward freed it and put the CPU's expert cache back), and every state that came
+ * from the GPU goes, so the next request reads its whole prompt on the CPU: the recurrent state
+ * and the K/V rows (reset_recurrent, kv_len), the prompt-end snapshot, a parked conversation and
+ * the prefix store's prompts in RAM (the pins go with the live state's record, which no longer
+ * holds their tokens). Then the request's ERROR. 0 when the chain did not fail. */
+static int q38_chain_lost_end(Model *m,const char *id){
+    if(!q38_chain_lost())return 0;
+#ifdef QWEN38_METAL
+    g_q38m_lost=0;
+#endif
+    reset_recurrent(m);m->kv_len=0;
+    q38_prefix_cache_invalidate();
+    if(g_q38_park.on){
+        q38_prefix_cache_dispose(&g_q38_park.snap);memset(&g_q38_park.snap,0,sizeof g_q38_park.snap);
+        q38_park_free_rows();
+    }
+    q38_psd_join();   /* a disk write in flight holds copies, not the store's entries */
+    coli_ps_clear(&g_q38_ps);
+    coli_serve_write_error(stdout,id,"GPU_FAILED the GPU path failed; the conversation will be re-read on the CPU");
+    fflush(stdout);
+    return 1;
+}
+
 /* lone: one conversation, whose prompt reads its STOP or CANCEL while it is read
  * (q38_serve_prefill); the multiplexed loop owns its command stream and passes 0. */
 static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, float **lo_out,
@@ -3127,6 +3162,7 @@ static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
         lo=q38_serve_prefill_at(m,ids,0,np,pc,snap_ok,&snapped);
     }
     g_echo_k=0; g_echo_id=NULL; g_echo_pin_logit=NULL;   /* la lettura e finita col prefill */
+    if(q38_chain_lost_end(m,q->id)){q38_vision_detach(m);free(lo);free(ids);return 0;}
     if(ctl.control){
         /* stopped while reading: what was read stays the live state; a STOP ends the turn
          * with no token, a CANCEL with the error the gateway waits for */
@@ -3233,6 +3269,7 @@ static int serve_one_turn(Model *m, ServeReq *q){
         if(m->draft_vocab)draft_vocab_count_token(m->draft_vocab,tk);
         lo = q38_spec_step(m, &spec, tk, np+s, q->max_tok-1-s);
         picked = lo ? spec.next_tok : -1;
+        if(q38_chain_lost())break;   /* the GPU's state is gone: the turn ends with an error below */
     }
     q38_spec_end(m, &spec);
     /* I vettori dell'immagine valgono per QUESTO turno soltanto: lasciarli
@@ -3241,6 +3278,7 @@ static int serve_one_turn(Model *m, ServeReq *q){
      * silenziosamente invece di dare errore. */
     q38_vision_detach(m);
     free(lo); free(ids);
+    if(q38_chain_lost_end(m,q->id)){q38_spec_free(&spec);return input_eof?-1:0;}
     if(cancelled){coli_serve_write_error(stdout,q->id,"CANCELLED");return input_eof?-1:0;}
     if(stopped)limited=0;
     unsigned char tail[3];int tail_n=0;
@@ -3518,6 +3556,9 @@ static void serve_mux(Model *m){
 
 static void serve_loop(Model *m){
     g_serve_model=m;
+#ifdef QWEN38_METAL
+    g_q38m_serve=1;   /* a chain failure ends a turn, not the engine (q38m_forward) */
+#endif
     coli_serve_binary_mode();
     setvbuf(stdin,NULL,_IONBF,0);
     int max_ctx=qwen38_max_ctx();

@@ -29,7 +29,8 @@ and the steps and the GPU experts go on. Measured on the real model (24 GB M4 Pr
 unless `COLI_LOOKUP=1`: the chain hands a verify to the CPU, the recurrent state down and up
 again. Debug-only switches: `Q38M_CHECK_WEIGHTS`, `Q38M_LAYER_CHECK`, `Q38M_DECLINE_EVERY`,
 `Q38M_FORCE_ROUTES`, `Q38M_FAIL_SLOT_ALLOC`, `Q38M_REFUSE_AT` (refuses the k-th step's device
-memory: the off path's test), `Q38M_AHEAD_EARLY`, `Q38M_AHEAD_FAIL` (read-ahead's degrade
+memory: the off path's test), `Q38M_FAIL_AT_STEP` (the k-th step fails as a kernel would: the
+failure path's test), `Q38M_AHEAD_EARLY`, `Q38M_AHEAD_FAIL` (read-ahead's degrade
 path) ([ENVIRONMENT.md](ENVIRONMENT.md)). Each is read once and has no effect unset.
 
 The device's K/V/IK caches grow in steps (256, 512, 1024, then 1024 more at a time). A
@@ -78,14 +79,20 @@ unforced, long12k agrees 12 of 14 scored steps, the misses after router near-tie
   not know the chain is on); prefill also re-reads the routed experts for every 256-row
   chunk, since the cache (6.8 GiB here) is far smaller than one chunk's experts. Streaming
   prefill is planned (M4).
-- A few failures stop the engine (exit), since the recurrent state then lives only on the
-  GPU and cannot be handed to the CPU: a GPU command batch that fails, or a kernel that
-  declines, once the state has moved on the GPU (any step after the first, or a later chunk
-  of the first: `the Metal chain failed: ...; stopping`, exit 1),
-  and an SSD read of an expert that fails (`GPU experts: reading ... failed: <error>`, then
-  `... stopping`, exit 3). They are rare; the server reports `engine exited` and must be
-  restarted (`COLI_METAL=0` runs the CPU engine). A step whose device memory is refused,
-  or a step the chain declines at its start, is not fatal: the CPU runs it.
+- A GPU command batch that fails, or a kernel that declines, once the recurrent state has
+  moved on the GPU (any step after the first, or a later chunk of the first) leaves no state
+  the CPU could take over. In serve mode the turn ends with `ERROR <id> GPU_FAILED ...` (the
+  gateway answers 503 `gpu_failed`): the chain turns off with its line and frees its device
+  memory, the CPU's expert cache gets its slots back, and every state that came from the GPU
+  goes (the live state, the prompt-end snapshot, a parked conversation, the prefix store's
+  prompts in RAM). The engine keeps serving: the next request reads its whole prompt on the
+  CPU, which runs the model until the server is restarted; the `METAL` frame says `chain=0`
+  and why. Outside a serve the run stops as before (`the Metal chain failed: ...; stopping`,
+  exit 1). An SSD read of an expert that fails stays fatal everywhere
+  (`GPU experts: reading ... failed: <error>`, then `... stopping`, exit 3): the server
+  reports `engine exited` and must be restarted (`COLI_METAL=0` runs the CPU engine). A step
+  whose device memory is refused, or a step the chain declines at its start, is not fatal:
+  the CPU runs it.
 - GPU residency was not measured (see above).
 - macOS only (Metal).
 

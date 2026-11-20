@@ -150,6 +150,13 @@ def _engine_error(fields, message):
         head = reason.split(":", 1)[0] if ":" in reason else ""
         param = head if head and " " not in head else "questions"
         return APIError(422, reason, param, "invalid_question")
+    if fields and fields[0] == "GPU_FAILED":
+        # qwen38 on the Metal chain (serve mode): the GPU path failed with the conversation's
+        # state on the GPU only. The engine keeps running with the chain off and reads the next
+        # request's whole prompt on the CPU; this turn is over.
+        return APIError(503, "The GPU path failed and this reply was stopped. Send the message again: "
+                             "the conversation is read again on the CPU (slower) until the server is "
+                             "restarted.", None, "gpu_failed", "server_error")
     if fields and fields[0] == "CONTEXT_EXCEEDED":
         # Two spellings of the same frame. colibri and deepseek_v4 write the
         # original `CONTEXT_EXCEEDED <used> <limit>`; qwen36 and qwen38 write

@@ -5599,6 +5599,11 @@ static float *q38_forward(Model *m,const int *ids,int S,int pos_base,int nlogits
         int took=q38m_forward(m,ids,S,pos_base,nlogits,hyper,streams!=NULL,echo?mixed:NULL,chain_logit);
         if(took){
             free(m->ple_pref); m->ple_pref=NULL; m->ple_pref_rows=0;   /* consumed, as q38_layer_forward does */
+        } else if(g_q38m_lost){
+            /* a serve's chain failed with the recurrent state on the GPU only: the turn ends with
+             * an error (qwen38.c, q38_chain_lost_end), so no CPU step runs on a state that is gone */
+            memset(chain_logit,0,(size_t)nlogits*c->vocab*sizeof(float));
+            free(m->ple_pref); m->ple_pref=NULL; m->ple_pref_rows=0;
         } else {
             free(chain_logit); chain_logit=NULL;
             q38m_cpu_step(m,pos_base);   /* the CPU runs the step from the host state */

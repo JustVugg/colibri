@@ -16,7 +16,7 @@
  * the exact kernels; QWEN38_METAL_EXPERTS=0 the routed experts on the CPU (M2);
  * QWEN38_EXPERT_CACHE_BYTES the GPU expert cache. Debug only (read once, no effect unset):
  * Q38M_CHECK_WEIGHTS, Q38M_LAYER_CHECK (1, 2), Q38M_FORCE_ROUTES, Q38M_DECLINE_EVERY,
- * Q38M_FAIL_SLOT_ALLOC, Q38M_REFUSE_AT, Q38M_AHEAD_EARLY, Q38M_AHEAD_FAIL. */
+ * Q38M_FAIL_SLOT_ALLOC, Q38M_REFUSE_AT, Q38M_FAIL_AT_STEP, Q38M_AHEAD_EARLY, Q38M_AHEAD_FAIL. */
 #ifndef QWEN38_METAL_CHAIN_H
 #define QWEN38_METAL_CHAIN_H
 #include "qwen36_gpu.h"
@@ -27,6 +27,10 @@ static int g_mtl_chain;                        /* 1 when the chain runs steps */
 static unsigned long long g_q38m_forwards, g_q38m_declined;
 
 static char g_q38m_off_why[192];               /* the off line's reason, for the METAL frame */
+/* serve mode (qwen38.c's serve_loop sets it): a failure with the recurrent state on the GPU only
+ * turns the chain off and sets g_q38m_lost instead of exiting; the turn then ends with an ERROR
+ * and the conversation starts over on the CPU (qwen38.c, q38_chain_lost_end). Elsewhere it exits. */
+static int g_q38m_serve, g_q38m_lost;
 static void q38m_off(const char *why) {
     snprintf(g_q38m_off_why, sizeof g_q38m_off_why, "%s", why);
     fprintf(stderr, "[qwen38-metal] the Metal chain is off: %s; the CPU engine runs the model\n", why);
@@ -411,6 +415,8 @@ static struct {
                            * 2: also the CPU against itself from inputs one ulp away */
     long refuse_at;       /* Q38M_REFUSE_AT (debug): the k-th step offered has its device memory
                            * refused, so the chain turns off mid-run (the off path's test) */
+    long fail_at;         /* Q38M_FAIL_AT_STEP (debug): the k-th step offered fails before the first
+                           * layer of its last chunk, as a declining kernel does (the failure path's test) */
     int force_routes;     /* Q38M_FORCE_ROUTES (debug, with the layer check): 1 the reference run's
                            * routes, 2 also its QSA selections past the budget */
 } g_q38f;
@@ -745,6 +751,8 @@ static int q38m_setup(Model *m, char *why, size_t nwhy) {
     g_q38f.decline_every = d && *d ? atol(d) : 0;
     const char *ra = getenv("Q38M_REFUSE_AT");
     g_q38f.refuse_at = ra && *ra ? atol(ra) : 0;
+    const char *fa = getenv("Q38M_FAIL_AT_STEP");
+    g_q38f.fail_at = fa && *fa ? atol(fa) : 0;
     g_q38f.layer_check = lc && (!strcmp(lc, "1") || !strcmp(lc, "2")) ? atoi(lc) : 0;
     const char *fr = getenv("Q38M_FORCE_ROUTES");
     g_q38f.force_routes = fr && (!strcmp(fr, "1") || !strcmp(fr, "2")) ? atoi(fr) : 0;
@@ -1192,6 +1200,9 @@ static int q38m_forward(Model *m, const int *ids, int S, int pos_base, int nlogi
     int failed_layer = -1, lo_first = S - nlogits, c0;
     for (c0 = 0; c0 < S; c0 += Q38M_CHUNK) {
         if (coli_prompt_break()) { g_q38m_declined++; return 0; }   /* a served prompt's stop, between two chunks */
+        if (c0 + Q38M_CHUNK >= S && g_q38f.fail_at > 0 && offered == (unsigned long long)g_q38f.fail_at) {   /* its last chunk */
+            what = "a step forced to fail (Q38M_FAIL_AT_STEP)"; failed_layer = 0; goto fail;
+        }
         const int n = S - c0 < Q38M_CHUNK ? S - c0 : Q38M_CHUNK, pb = pos_base + c0;
         memcpy(q36_tensor_data(g_q38f.hyper), hyper_h + (size_t)c0 * W, (size_t)n * W * sizeof(float));
         q38m_push(m, pb);
@@ -1314,13 +1325,22 @@ fail:
      * held the whole state at the step's start (its first chunk). */
     q36_gpu_sync();
     q38x_settle(1);
+    int lost = 0;
     {
         char why[192];
         snprintf(why, sizeof why, "%s of layer %d at position %d did not run on the GPU", what ? what : "a step", failed_layer, pos_base);
         if (was_dev || c0 > 0) {   /* the recurrent state moved on the GPU only: nothing to hand the CPU */
-            fprintf(stderr, "[qwen38-metal] the Metal chain failed: %s; the recurrent state is on the GPU only, "
-                            "stopping\n", why);
-            exit(1);
+            if (!g_q38m_serve) {
+                fprintf(stderr, "[qwen38-metal] the Metal chain failed: %s; the recurrent state is on the GPU only, "
+                                "stopping\n", why);
+                exit(1);
+            }
+            /* a serve keeps serving: the chain off and its memory freed below, the turn ended
+             * with an ERROR and the conversation read again on the CPU (q38_chain_lost_end) */
+            lost = 1;
+            g_q38m_lost = 1;
+            fprintf(stderr, "[qwen38-metal] the Metal chain failed with the recurrent state on the GPU only: this turn "
+                            "ends with an error and the next request is read again on the CPU\n");
         }
         q38m_off(why);
     }
@@ -1331,6 +1351,7 @@ fail:
     q38x_chain_off();
     g_mtl_chain = 0;
     g_q38m_declined++;
+    if (lost) q38m_free(m);   /* the state it held is gone: the device memory goes too */
     return 0;
 }
 

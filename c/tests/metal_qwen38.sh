@@ -59,6 +59,10 @@
 #   tests/test_qwen38_prefix_serve.py and test_qwen38_prefix_store.py with the chain on.
 # serve metal frame: tests/metal_qwen38_serve.py --metal-frame on the tiny GGUF (the gateway's
 #   METAL frame: one a turn, per-turn deltas, GPU-resident experts as EMAP tier 2; COLI_METAL=0).
+# serve gpu error: tests/metal_qwen38_serve.py --gpu-error on the tiny GGUF (Q38M_FAIL_AT_STEP=3,
+#   debug: a chain failure with the state on the GPU only ends the turn with ERROR GPU_FAILED, the
+#   engine keeps serving and reads the next turn on the CPU as a CPU-only engine does); not a
+#   serve, the same failure still exits 1.
 set -u
 cd "$(dirname "$0")/.." || exit 1
 fail=0
@@ -618,6 +622,15 @@ echo "== serve"
 "${PYTHON:-python3}" tests/metal_qwen38_serve.py || fail=1
 echo "== serve metal frame"
 "${PYTHON:-python3}" tests/metal_qwen38_serve.py --metal-frame ./qwen38_tiny_256_gguf || fail=1
+echo "== serve gpu error"
+"${PYTHON:-python3}" tests/metal_qwen38_serve.py --gpu-error ./qwen38_tiny_256_gguf || fail=1
+# not a serve: the same failure stops the run loudly, as before (Q38M_FAIL_AT_STEP, debug)
+out=$(env Q38M_FAIL_AT_STEP=3 OMP_NUM_THREADS=2 SNAP=./qwen38_tiny_256_gguf ./qwen38 1 8 ./qwen38_tiny_256_gguf/ref.json 2>&1); rc=$?
+if [ $rc -eq 1 ] && printf '%s\n' "$out" | grep -qF "the recurrent state is on the GPU only, stopping"; then
+    echo "ok   [gpu error not a serve] exit 1 with the stopping line"
+else
+    echo "FAIL [gpu error not a serve] exit $rc"; printf '%s\n' "$out" | grep -F '[qwen38-metal]'; fail=1
+fi
 # the engine's own prefix suites (the live state, the snapshot, the pins, the parked
 # conversation, the cancels; the store's checkpoints and rows) with the chain on: they reach
 # every state hook (q38m_sync_host, q38m_host_wrote, q38m_rollback)

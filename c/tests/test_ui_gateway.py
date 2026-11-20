@@ -309,6 +309,33 @@ class MetalFrameTest(unittest.TestCase):
         self.assertEqual((e.metal["chain"], e.metal["loads"], e.metal["hits"]), (1, 3, 1))
         self.assertEqual(e.metal_total["loads"], 3)
 
+    def test_gpu_failed_error_then_chain_off(self):
+        """a serve's Metal failure: ERROR GPU_FAILED ends that request as a 503 the client can
+        read, and the METAL frame after it says chain=0 with the reason"""
+        import io
+        e = gw.Engine.__new__(gw.Engine)
+        pending = gw._Pending()
+        e.__dict__.update(closed=False, dispatcher_error=None, pending={"7": pending}, pending_lock=threading.Lock(),
+                          live={}, live_lock=threading.Lock(), tiers=None, hwinfo=None, emap=None, hits=None,
+                          hits_seq=0, hits_live=collections.deque(maxlen=256), hits_live_seq=0,
+                          profile=collections.deque(maxlen=8), profile_seq=0, metal=None, metal_total=None)
+        frames = ["ERROR 7 GPU_FAILED the GPU path failed; the conversation will be re-read on the CPU",
+                  "METAL chain=0 reason=the%20attention%20of%20layer%203%20at%20position%2040%20did%20not%20run"
+                  "%20on%20the%20GPU forwards=9 declined=1 experts_gpu=0 cache_gb=0.000 slots=0 loads=0 hits=0 "
+                  "wait_s=0.0000 ahead=0 guesses=0 right=0 kv_regrow=0"]
+        e.process = mock.Mock(stdout=io.BytesIO(b"".join(f.encode() + b"\n" for f in frames)),
+                              **{"wait.return_value": None, "poll.return_value": None})
+        e._fail_pending = lambda error: None
+        with mock.patch("sys.stderr"):
+            e._dispatch_stdout()
+        kind, error = pending.events.get_nowait()
+        self.assertEqual(kind, "error")
+        self.assertIsInstance(error, gw.APIError)
+        self.assertEqual((error.status, error.code), (503, "gpu_failed"))
+        self.assertIn("read again on the CPU", error.message)
+        self.assertEqual((e.metal["chain"], e.metal["experts_gpu"]), (0, 0))
+        self.assertEqual(e.metal["reason"], "the attention of layer 3 at position 40 did not run on the GPU")
+
     def test_no_metal_frame(self):
         e = dispatched("TIERS 0 4 4 0.0 1.5")
         self.assertIsNone(e.metal)

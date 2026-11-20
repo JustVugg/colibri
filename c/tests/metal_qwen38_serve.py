@@ -22,6 +22,15 @@ kv slots: KV_SLOTS=2 in serve mode turns the chain off with its one line.
   cells with tier 2 (in the GPU expert cache) after turn 1; then COLI_METAL=0, whose frame says
   chain=0 reason=COLI_METAL%3D0.
 
+--gpu-error <fixture> (the tiny GGUF) runs only this case: serve gpu error. Q38M_FAIL_AT_STEP=3
+  (debug) fails the chain in turn 1's second decode step, with the recurrent state on the GPU
+  only: turn 1 ends with an ERROR GPU_FAILED frame, the engine keeps serving (the same
+  process), its METAL frame says chain=0 with the reason, one off line and one GPU experts
+  released line are in the log; turn 2 (the conversation plus a new message) is read again
+  on the CPU and its reply and every step's logits are a CPU-only engine's (COLI_METAL=0).
+  serve gpu error in a prompt: Q38M_FAIL_AT_STEP=1 fails the second 256-row chunk of a
+  300-token prompt: ERROR GPU_FAILED before any token, and the next turn as a CPU-only engine's.
+
 --segments <dir> (a fixture with a tokenizer and 2048 positions; metal_qwen38.sh gives it
   qwen38_decay's weights) runs only this case: a 1,020-token prompt read in segments of 300
   rows (COLI_PROMPT_SEGMENT=300, the serve's own prompt segments), then 8 tokens decoded
@@ -33,6 +42,7 @@ kv slots: KV_SLOTS=2 in serve mode turns the chain off with its one line.
 
 Prints `ok   [...]` / `FAIL [...]` lines like the shell test; exit 1 on a failure.
 """
+import json
 import os
 import re
 import subprocess
@@ -246,11 +256,127 @@ def metal_frame(fixture):
     return failed
 
 
+def turn_frames(e, rid, prompt, max_tok=8, temp="0.0001"):
+    """One SUBMIT, then every frame up to and including the turn's METAL line: (the bytes
+    written, the ERROR line or None, the METAL frame's fields)."""
+    p = e.p
+    p.stdin.write(f"SUBMIT {rid} 0 {len(prompt)} {max_tok} {temp} 1\n".encode() + prompt + b"\n")
+    p.stdin.flush()
+    chunks, error = [], None
+    while True:
+        line = p.stdout.readline()
+        if not line:
+            raise RuntimeError("engine closed mid-request:\n" + "".join(e._err)[-2000:])
+        text = line.decode("latin-1").rstrip("\n")
+        kind = text.split(" ", 1)[0]
+        if kind == "DATA":
+            chunks.append(p.stdout.read(int(text.split()[2])))
+            p.stdout.readline()
+        elif kind == "ERROR":
+            error = text
+        elif kind == "METAL":
+            return b"".join(chunks), error, dict(kv.split("=", 1) for kv in text.split()[1:] if "=" in kv)
+
+
+def settled_steps(e, before):
+    """the [LOGITS] lines after the first `before`, once stderr stops growing"""
+    n, still = -1, 0
+    while still < 5:
+        time.sleep(0.05)
+        m = len(LOGITS.findall("".join(e._err)))
+        still = still + 1 if m == n else 0
+        n = m
+    return LOGITS.findall("".join(e._err))[before:]
+
+
+def gpu_error(fixture):
+    """serve gpu error: a chain failure with the state on the GPU only ends the turn with an
+    ERROR, not the engine; the next turn is read again on the CPU, as a CPU-only engine reads it."""
+    env = {"SNAP": str(fixture), "SERVE": "1", "OMP_NUM_THREADS": "2", "COLI_NO_OMP_TUNE": "1", "COLI_CUDA": "0",
+           "Q38_MAXT": "128", "COLI_LOGIT_DUMP": "1"}
+    second = OPENING + QUESTION
+    e = ServeEngine(ENGINE, ["1", "8"], dict(env, Q38M_FAIL_AT_STEP="3"))
+    pid = e.p.pid
+    try:
+        _, err1, frame1 = turn_frames(e, "1", OPENING)
+        before = len(LOGITS.findall("".join(e._err)))
+        got, err2, frame2 = turn_frames(e, "2", second)
+        steps = settled_steps(e, before)
+        alive = e.p.poll() is None and e.p.pid == pid
+    finally:
+        log = e.close()
+    cpu = ServeEngine(ENGINE, ["1", "8"], dict(env, COLI_METAL="0"))
+    try:
+        want, cerr, _ = turn_frames(cpu, "1", second)
+        want_steps = settled_steps(cpu, 0)
+    finally:
+        cpu.close()
+    off = [line for line in log.splitlines() if OFF in line]
+    released = log.count("[qwen38-metal] GPU experts released (the chain is off)")
+    ok1 = err1 is not None and err1.startswith("ERROR 1 GPU_FAILED ") and "re-read on the CPU" in err1
+    ok_frame = frame1.get("chain") == "0" and "did%20not%20run%20on%20the%20GPU" in frame1.get("reason", "") \
+        and frame2.get("chain") == "0" and frame2.get("reason") == frame1.get("reason")
+    ok2 = err2 is None and cerr is None and got == want and steps == want_steps and len(steps) == 8
+    say(ok1 and alive and len(off) == 1 and released == 1 and "stopping" not in log,
+        "serve gpu error turn 1", "%s; engine %s; off lines %d, released lines %d"
+        % (err1, "alive, same pid" if alive else "gone", len(off), released))
+    say(ok_frame, "serve gpu error METAL frame", "turn 1 chain=%s reason=%s; turn 2 chain=%s"
+        % (frame1.get("chain"), frame1.get("reason"), frame2.get("chain")))
+    say(ok2, "serve gpu error turn 2 on the CPU", "reply %r vs the CPU's %r, %d steps vs %d, %s"
+        % (got, want, len(steps), len(want_steps), "identical" if steps == want_steps else "steps differ"))
+    if not (ok1 and ok2):
+        print("\n".join(line for line in log.splitlines() if "metal" in line or "PREFIX" in line or "stopping" in line))
+
+    # in a prompt: the step's second chunk fails (c0 > 0), before any token
+    x, long_prompt = 4711, bytearray()
+    for _ in range(300):   # bytes 33..63: one token each in the fixture's byte vocabulary
+        x = (x * 1103515245 + 12345) % 2**31
+        long_prompt.append(33 + x % 31)
+    long_prompt = bytes(long_prompt)
+    # the fixture with 512 positions (its own 128 hold no 300-token prompt)
+    tmp = tempfile.TemporaryDirectory()
+    wide = Path(tmp.name)
+    for f in Path(fixture).iterdir():
+        if f.name not in ("config.json", ".coli_usage"):
+            (wide / f.name).symlink_to(f.resolve())
+    cfg = json.loads((Path(fixture) / "config.json").read_text())
+    (cfg.get("text_config") or cfg)["max_position_embeddings"] = 512
+    (wide / "config.json").write_text(json.dumps(cfg))
+    env = dict(env, SNAP=str(wide), Q38_MAXT="512")
+    e = ServeEngine(ENGINE, ["1", "8"], dict(env, Q38M_FAIL_AT_STEP="1"))
+    try:
+        data1, err1, frame1 = turn_frames(e, "1", long_prompt)
+        before = len(LOGITS.findall("".join(e._err)))
+        got, err2, _ = turn_frames(e, "2", long_prompt + QUESTION)
+        steps = settled_steps(e, before)
+        alive = e.p.poll() is None
+    finally:
+        log = e.close()
+    cpu = ServeEngine(ENGINE, ["1", "8"], dict(env, COLI_METAL="0"))
+    try:
+        want, _, _ = turn_frames(cpu, "1", long_prompt + QUESTION)
+        want_steps = settled_steps(cpu, 0)
+    finally:
+        cpu.close()
+    ok = err1 is not None and "GPU_FAILED" in err1 and data1 == b"" and frame1.get("chain") == "0" \
+        and "at%20position%200%20" in frame1.get("reason", "") and alive and err2 is None \
+        and got == want and steps == want_steps and len(steps) == 8 and log.count(OFF) == 1
+    say(ok, "serve gpu error in a prompt", "%s, %d bytes before it, reason %s; turn 2 %s, %d steps %s"
+        % (err1, len(data1), frame1.get("reason"), "the CPU's" if got == want else "%r vs %r" % (got, want),
+           len(steps), "identical" if steps == want_steps else "differ"))
+    if not ok:
+        print("\n".join(line for line in log.splitlines() if "metal" in line or "PREFIX" in line or "stopping" in line))
+    tmp.cleanup()
+    return failed
+
+
 def main():
     if len(sys.argv) == 3 and sys.argv[1] == "--segments":
         return segments(sys.argv[2])
     if len(sys.argv) == 3 and sys.argv[1] == "--metal-frame":
         return metal_frame(sys.argv[2])
+    if len(sys.argv) == 3 and sys.argv[1] == "--gpu-error":
+        return gpu_error(sys.argv[2])
     with tempfile.TemporaryDirectory() as d:
         subprocess.run([sys.executable, str(HERE / "tools" / "make_edge_tiny_tokenizer.py"), "--vocab-size", "64", d],
                        check=True, stdout=subprocess.DEVNULL)

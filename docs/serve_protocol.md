@@ -156,7 +156,10 @@ only resembles an XTML marker cannot be promoted into a client tool call.
 Errors replace the stream: `ERROR <id> <CODE>` with codes `BAD_FRAME`, `BAD_REQUEST`,
 `SLOT_BUSY`, `DUPLICATE_ID`, `EMPTY_PROMPT`, `NOT_FOUND` (CANCEL of unknown id),
 `CANCELLED`, and for decision engines `DECIDE_INVALID`, `DECIDE_FAILED` and
-`NOT_SUPPORTED` (a `SUBMIT` to an engine that does not generate). A `CANCEL` is acknowledged by `ERROR <id> CANCELLED` after the slot's KV
+`NOT_SUPPORTED` (a `SUBMIT` to an engine that does not generate), and for qwen38 on the Metal
+chain `GPU_FAILED <text>` (the GPU path failed with the conversation's state on the GPU only:
+the turn ends, possibly after some `DATA`; the engine keeps serving with the chain off, its next
+`METAL` frame says `chain=0` and why, and the next request's prompt is read on the CPU). A `CANCEL` is acknowledged by `ERROR <id> CANCELLED` after the slot's KV
 is persisted.
 
 Immediately before each `DONE` the engine emits a telemetry block for the finished
