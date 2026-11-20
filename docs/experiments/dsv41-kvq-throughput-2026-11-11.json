@@ -1,0 +1,125 @@
+{
+ "version": 1,
+ "hypothesis": "The packed default (COLI_VK_KV_FP32=0) does not change short-context decode throughput: the host KV is 6.4 MiB at ctx 4096 instead of 36.2 MiB, but at this context the host rows are not the bottleneck, so tok_s should stay inside the run-to-run spread of the fp32 arm.",
+ "commit": "382dfb456ef7563f4cb0665ff0db11ad16d5090f",
+ "model": "DeepSeek-V4.1-Flash-1017 (colibri dsv41 container, 48 shards, 510,296,708,312 B, 40 layers, 384 experts/layer 6 routed, DSpark 3 stages), /root/Models/DeepSeek-V4.1-Flash-1017",
+ "command": "c/coli serve at 382dfb45 (c/deepseek_v41 built at this commit, VK=1): env -u COLI_VK_KV_QUANT COLI_VK_KV_FP32=<arm> VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_LEDGER=1 V41_STATS=1 OMP_NUM_THREADS=2 COLI_NO_OMP_TUNE=1 COLI_USAGE=<reset copy> ./c/coli serve --model /root/Models/DeepSeek-V4.1-Flash-1017 --ram 24 --ctx 4096 --gpu 0 --port 8061; then per arm 1 warmup turn (discarded) and 3 measured turns of POST /v1/chat/completions {temperature 0, max_tokens 64} with the prompt below, wall timed client-side around the request; tok_s = usage.completion_tokens / wall",
+ "prompt_hash": "sha256:08f7c93c1d426662b9cb8008fdd91f6b4b49f150e21f91e88a1535af459bc46c",
+ "hardware": {
+  "cpu": "12th Gen Intel(R) Core(TM) i9-12900K, 16 physical cores / 24 logical CPUs, 1 socket; the engine ran with OMP_NUM_THREADS=2 and COLI_NO_OMP_TUNE=1 (a host-side expert tier, the device does the dense chain)",
+  "ram": "38.9 GiB total (MemTotal 40,811,404 kB), 25.0 GB MemAvailable at plan time, 15 GiB swap configured and not the run's bottleneck; --ram 24 because MemAvailable was under 26 GB",
+  "storage": "/dev/nvme0n1p2, f2fs, 1.9 TB, mounted /; the 476 GiB checkpoint (48 shards) sits there, read through the page cache (warm after the load)",
+  "os": "Arch Linux, kernel 7.1.11-arch1-1, Mesa 26.2.1-arch1.1 (RADV NAVI21), Vulkan 1.4.354, AMD Radeon RX 6900 XT 16 GB (card2, the tier's device)"
+ },
+ "warmup_runs": 1,
+ "changed_variables": [
+  "COLI_VK_KV_FP32"
+ ],
+ "baseline": {
+  "config": {
+   "COLI_VULKAN": "1",
+   "COLI_VK_CHAIN": "1",
+   "COLI_VK_LEDGER": "1",
+   "COLI_VK_KV_QUANT": "unset",
+   "V41_STATS": "1",
+   "OMP_NUM_THREADS": "2",
+   "COLI_NO_OMP_TUNE": "1",
+   "COLI_USAGE": "/root/Projects/colibri-pr2712-testrun/scratch/usage-tput.txt, reset byte-identical from usage-tput-base.txt (sha256 91b8314f4d0a319f52caa1e39f9bab13cabaad68b8272c71c3ee524497439367) before each arm",
+   "SERVE": "./c/coli serve --model /root/Models/DeepSeek-V4.1-Flash-1017 --ram 24 --ctx 4096 --gpu 0 --port 8061",
+   "ENDPOINT": "/v1/chat/completions, one user message",
+   "TEMPERATURE": "0",
+   "MAX_TOKENS": "64",
+   "PROMPT": "the 239-token prose prompt, sha256 08f7c93c1d426662b9cb8008fdd91f6b4b49f150e21f91e88a1535af459bc46c",
+   "ORDER": "baseline arm fully, then trial arm fully (not interleaved)",
+   "COLI_VK_KV_FP32": "1"
+  },
+  "samples": {
+   "tok_s": [
+    0.3513,
+    0.3534,
+    0.3515
+   ],
+   "wall_s": [
+    182.159,
+    181.092,
+    182.085
+   ],
+   "completion_tokens": [
+    64,
+    64,
+    64
+   ],
+   "prompt_tokens": [
+    239,
+    239,
+    239
+   ]
+  },
+  "median_tok_s": 0.3515,
+  "quality": {
+   "method": "test_vk_kv_quant: the codec is bit-exact on the device (PASS at this commit)",
+   "passed": true
+  },
+  "evidence": {
+   "uri": "docs/experiments/dsv41-kvq-throughput-2026-11-11-raw.json",
+   "sha256": "4c957ecfdd5d674f6e72692745a7e3360f892f3e0d09e8fa6c70d462444b612a"
+  }
+ },
+ "trial": {
+  "config": {
+   "COLI_VULKAN": "1",
+   "COLI_VK_CHAIN": "1",
+   "COLI_VK_LEDGER": "1",
+   "COLI_VK_KV_QUANT": "unset",
+   "V41_STATS": "1",
+   "OMP_NUM_THREADS": "2",
+   "COLI_NO_OMP_TUNE": "1",
+   "COLI_USAGE": "/root/Projects/colibri-pr2712-testrun/scratch/usage-tput.txt, reset byte-identical from usage-tput-base.txt (sha256 91b8314f4d0a319f52caa1e39f9bab13cabaad68b8272c71c3ee524497439367) before each arm",
+   "SERVE": "./c/coli serve --model /root/Models/DeepSeek-V4.1-Flash-1017 --ram 24 --ctx 4096 --gpu 0 --port 8061",
+   "ENDPOINT": "/v1/chat/completions, one user message",
+   "TEMPERATURE": "0",
+   "MAX_TOKENS": "64",
+   "PROMPT": "the 239-token prose prompt, sha256 08f7c93c1d426662b9cb8008fdd91f6b4b49f150e21f91e88a1535af459bc46c",
+   "ORDER": "baseline arm fully, then trial arm fully (not interleaved)",
+   "COLI_VK_KV_FP32": "0"
+  },
+  "samples": {
+   "tok_s": [
+    0.3508,
+    0.3538,
+    0.3523
+   ],
+   "wall_s": [
+    182.419,
+    180.872,
+    181.649
+   ],
+   "completion_tokens": [
+    64,
+    64,
+    64
+   ],
+   "prompt_tokens": [
+    239,
+    239,
+    239
+   ]
+  },
+  "median_tok_s": 0.3523,
+  "quality": {
+   "method": "test_vk_kv_quant: the codec is bit-exact on the device (PASS at this commit)",
+   "passed": true
+  },
+  "evidence": {
+   "uri": "docs/experiments/dsv41-kvq-throughput-2026-11-11-raw.json",
+   "sha256": "4c957ecfdd5d674f6e72692745a7e3360f892f3e0d09e8fa6c70d462444b612a"
+  }
+ },
+ "outcome": "no-change",
+ "notes": [
+  "Endpoint: the brief named /v1/completions. On this checkpoint that path answers HTTP 200 with choices[0].text=\"\", finish_reason \"stop\" and usage.completion_tokens 0 (4 turns, 71.2 s each) because it passes the prompt as a text continuation rather than through the chat template, so tok_s could not be formed from it. The supervisor approved /v1/chat/completions (one user message) for this experiment on 2026-11-11: same engine, same server, same decode loop, and the path the 12-prompt A/B in docs/experiments/dsv41-kvq-2026-11-11/ used. No sample is fabricated and no zero sample is carried.",
+  "Both arms produced non-empty text and used the whole 64-token budget (finish_reason \"length\"), 347 chars baseline and 326 chars trial. The texts are not byte-identical: this record claims nothing about output parity; the 12-prompt A/B (10 of 12 identical) is that evidence, in docs/experiments/dsv41-kvq-2026-11-11/.",
+  "The arms ran one after the other, not interleaved. The between-arm difference of the medians is 0.0008 tok/s (0.23%), smaller than the within-arm spread (baseline 0.3513-0.3534, trial 0.3508-0.3538), so the record says no-change; a 3-sample, single-ordering design cannot resolve an effect this small.",
+  "tok_s here includes the prefill of the 239 prompt tokens, because it is completion_tokens over the whole HTTP request, as briefed. At ctx 4096 the packed arm's host KV is 6.4 MiB against 36.2 MiB, and neither is the bottleneck at this context, which is what the hypothesis says."
+ ]
+}

@@ -406,6 +406,9 @@ def build(out: Path, cfg: dict, ref_path: Path | None, max_new: int, prompt_len:
     # rollback buffers from a stage count that is zero until the checkpoint is
     # probed for it.
     text = {k: v for k, v in cfg.items() if k not in ("max_seq_len", "n_mtp_layers")}
+    # ... but the stage count under the key the released checkpoint carries it as:
+    # dropping it entirely would leave the planner's stage term unexercised.
+    text["num_nextn_predict_layers"] = cfg["n_mtp_layers"]
     config = {
         "architectures": ["DeepseekV41ForCausalLM"],
         "model_type": "deepseek_v41",
@@ -534,8 +537,15 @@ def main() -> int:
     ap.add_argument("--emit-ref", type=Path, default=None)
     ap.add_argument("--max-new", type=int, default=8)
     ap.add_argument("--prompt-len", type=int, default=12)
+    ap.add_argument("--kv-quant-dims", action="store_true",
+                    help="the released KV geometry (head_dim 512, index_head_dim 128): "
+                         "the packed cache's mirror formats (528/288/68 B a row, COLI_VK_KV_FP32) are "
+                         "defined at those widths, so the kv-quant tests' fixture uses them")
     args = ap.parse_args()
     cfg = tiny_config()
+    if args.kv_quant_dims:
+        cfg["head_dim"] = 512
+        cfg["index_head_dim"] = 128
     build(args.out, cfg, args.emit_ref, args.max_new, args.prompt_len)
     total = sum(p.stat().st_size for p in args.out.iterdir() if p.is_file())
     print(f"container -> {args.out}  ({total/1e6:.2f} MB)")

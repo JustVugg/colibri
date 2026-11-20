@@ -132,10 +132,12 @@ static const CuTierOps *cut_ops(void) {
 #define vkt_score cut_score
 #define vkt_settle cut_settle
 #define vkt_shutdown cut_shutdown
+#define vkt_slot_reserve cut_slot_reserve
 #define vkt_stage_room cut_stage_room
 #define vkt_step_rows cut_step_rows
 #define vkt_stream_prefetch cut_stream_prefetch
 #define vkt_take_back cut_take_back
+#define vkt_vram cut_vram
 #define vkt_wanted cut_wanted
 #define vkt_wants cut_wants
 #define vkt_warm_report cut_warm_report

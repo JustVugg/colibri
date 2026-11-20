@@ -1,0 +1,3 @@
+needle-B start 2026-11-11T07:15:53Z tokens=4000 (fp32 control at 4K; 16K default arm passed)
+NEEDLE status=200 target=4000 prompt_tokens=4046
+NEEDLE pass=yes prompt_tokens=4046 wall=381.3

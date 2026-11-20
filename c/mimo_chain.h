@@ -358,7 +358,7 @@ static int mc_push_state(MimoChain *ch, Model *m, int pos_base, int n_rows) {
         Layer *l = &m->L[i];
         if (ch->kv_valid[i] > pos_base) ch->kv_valid[i] = pos_base;
         if (!g.swa && ch->ks.on) {     /* the split: its window placed, the rows below pos_base uploaded */
-            VkcKvPart pt[2] = {{1, g.kd, l->K, 0, ch->kc[i], 0, 0}, {1, g.vdd, l->V, 0, ch->vc[i], 0, 0}};
+            VkcKvPart pt[2] = {{1, g.kd, l->K, 0, ch->kc[i], 0, 0, 0}, {1, g.vdd, l->V, 0, ch->vc[i], 0, 0, 0}};
             vkc_kv_lower(&ch->ks, ch->kvi[i], pos_base);
             vkc_kv_place(&ch->ks, ch->kvi[i], pos_base, n_rows);
             ok = vkc_kv_push(&ch->ks, ch->kvi[i], pt, 2, pos_base);
@@ -421,7 +421,7 @@ static int mc_attention(MimoChain *ch, Model *m, int i, int n, int pb) {
     a.sink = l->sink != NULL; a.sink_off = (int)ch->o_sink[i];
     VkcBuf *kc = ch->kc[i], *vc = ch->vc[i];
     if (!g.swa && ch->ks.on) {         /* the split: the rows into their window slots, the attention in two parts */
-        VkcKvPart pk = {1, g.kd, l->K, 0, kc, 0, 0}, pv = {1, g.vdd, l->V, 0, vc, 0, 0};
+        VkcKvPart pk = {1, g.kd, l->K, 0, kc, 0, 0, 0}, pv = {1, g.vdd, l->V, 0, vc, 0, 0, 0};
         VkcKvGqa ga = {&ch->ks, ch->kvi[i], ch->qkv, kc, vc, NULL, NULL, l->sink ? ch->prm : NULL, ch->ctx,
                        n, g.nh, g.kvh, g.hd, g.vd, pb, 0, 1, l->sink != NULL, (int)ch->o_sink[i],
                        g.rw, g.hd, 0, 0, 0, 0, g.nh * g.vd, 0, 0, 1.0f / sqrtf((float)g.hd),

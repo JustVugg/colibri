@@ -175,7 +175,7 @@ class Qwen38PrefixStoreTest(unittest.TestCase):
         p2 = chat(Q1, a, Q3)
         a2 = e.ask("a2", p2, max_tok=6)
         log = e.close()
-        self.assertGreaterEqual(self.hits(log)[-1][0], ntok(p1) + len(a) - 1, log[-3000:])   # the first turn as it ended
+        self.assertGreaterEqual(self.hits(log)[-1][0], ntok(p1) + ntok(a) - 1, log[-3000:])   # the first turn as it ended
         self.same(log, 2, p2, a2)
 
     def test_two_slots_the_other_slot(self):
@@ -186,7 +186,7 @@ class Qwen38PrefixStoreTest(unittest.TestCase):
         p2 = chat(Q1, a, Q3)
         a2 = e.ask("a2", p2, max_tok=6, slot=1)   # the first conversation, on the slot the other held
         log = e.close()
-        self.assertGreaterEqual(self.hits(log)[-1][0], ntok(p1) + len(a) - 1, log[-3000:])   # its turn's end
+        self.assertGreaterEqual(self.hits(log)[-1][0], ntok(p1) + ntok(a) - 1, log[-3000:])   # its turn's end
         self.same(log, 2, p2, a2, slots=2)
 
     def test_mtp_head_on(self):
@@ -249,6 +249,7 @@ class Qwen38PrefixStoreTest(unittest.TestCase):
                 e.p.stdout.read(int(line.split()[2]))
                 e.p.stdout.readline()
             elif kind in (b"DONE", b"ERROR"):
+                self.assertEqual(kind, b"DONE", f"engine error: {line!r}")   # an ERROR frame ends no read-out well
                 break
         log = e.close()
         self.assertEqual(log.count("prompt tokens from the store"), 0, "a read-out took a stored prefix")

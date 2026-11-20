@@ -5164,9 +5164,9 @@ static int glm53_ps_parts(const GModel *m, const GSession *s, ColiPsPart *parts)
         if (!c->is_full[i]) continue;
         const GLayerState *st = s ? &s->layer[i] : NULL;
         const int cap = s ? s->cap : g_slot_context;
-        parts[n++] = (ColiPsPart){st ? st->latent : NULL, (size_t)c->kv_lora * sizeof(float), cap, 1, 0, 1};
-        parts[n++] = (ColiPsPart){st ? st->ikeys : NULL, (size_t)c->index_hd * sizeof(float), cap, 1, 0, 1};
-        parts[n++] = (ColiPsPart){st ? st->igates : NULL, (size_t)c->index_hd * sizeof(float), cap, 1, 0, 1};
+        parts[n++] = (ColiPsPart){st ? st->latent : NULL, (size_t)c->kv_lora * sizeof(float), cap, 1, 0, 1, 0};
+        parts[n++] = (ColiPsPart){st ? st->ikeys : NULL, (size_t)c->index_hd * sizeof(float), cap, 1, 0, 1, 0};
+        parts[n++] = (ColiPsPart){st ? st->igates : NULL, (size_t)c->index_hd * sizeof(float), cap, 1, 0, 1, 0};
     }
     return n;
 }

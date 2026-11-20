@@ -119,7 +119,9 @@ static int vk_integrated(VkPhysicalDevice phys) {
  * run wrote, written back (pc_save) after a pipeline that took PC_SLOW_MS or more to make
  * (the process may not reach its teardown: a killed server, an exit()) and at the device's
  * teardown (pc_close) when anything was added. A file goes to <path>.<pid>.tmp first and
- * then takes the name, so a reader never sees half of one. */
+ * then takes the name, so a reader never sees half of one. That name also ends in a
+ * cache-scheme tag (PC_TAG): bumped when what a run may write changes in a way a later
+ * read must not reuse, the new name never matches and the old file is left unread. */
 #define PC_MAXDEV 4
 #define PC_SLOW_MS 1000.0
 #define PC_MAX_BYTES ((size_t)1 << 30)
@@ -181,6 +183,14 @@ static void pc_save(int i) {
     free(data);
     pthread_mutex_unlock(&g_pc_mx);
 }
+/* the name's cache-scheme tag. Bumped with the main-shader guard at coli_vk_init's top:
+ * before that guard, an init handed a chain/sibling module built the 4-binding main
+ * pipeline from it (RADV ran it; MoltenVK refused every dispatch), and that bad pipeline
+ * sat in this device-keyed file for every later run to read -- measured on M4/MoltenVK at
+ * 9185d64d reading a 9e43e6c7-primed file: 29 failed kv-quant checks, 87 chain checks.
+ * The bump orphans every such file: the new name never matches, the stale one is simply
+ * never read again (left for the user's rm or the OS). */
+#define PC_TAG "-c2"
 /* the device's cache, from its file when that file is this device's and driver's */
 static void pc_open(VkPhysicalDevice phys, VkDevice dev) {
     if (!dev || pc_find(dev) >= 0) return;
@@ -193,8 +203,8 @@ static void pc_open(VkPhysicalDevice phys, VkDevice dev) {
         int k = snprintf(path, sizeof path, "%s/vk-%04x-%04x-%08x-", dir, pp.vendorID, pp.deviceID, pp.driverVersion);
         for (int b = 0; b < (int)VK_UUID_SIZE && k > 0 && k + 3 < (int)sizeof path; b++)
             k += snprintf(path + k, sizeof path - (size_t)k, "%02x", pp.pipelineCacheUUID[b]);
-        if (k <= 0 || k + 5 >= (int)sizeof path) path[0] = 0;
-        else strcat(path, ".bin");
+        if (k <= 0 || k + (int)sizeof PC_TAG + 4 >= (int)sizeof path) path[0] = 0;   /* tag + ".bin" + NUL */
+        else strcat(strcat(path, PC_TAG), ".bin");
     }
     void *data = NULL;
     size_t n = 0;
@@ -1563,7 +1573,48 @@ static int coop_slot(int S) {
 static void vk_prof_paths(void);
 static int g_vk_prof;
 
+/* The main-shader check, before any loader or instance work: coli_vk_init's argument is
+ * the MAIN qmatmul shader (COLI_VK_SHADERS is documented as the qmatmul.spv file or its
+ * directory) -- the 4-binding pipeline is built from it and the siblings derived beside
+ * it (_gemm/_coop/_gate_up/_bd, rmsnorm, attention_absorb), while the chain modules are
+ * the chain's own loads and the expert ones the tier's. A module of one of those
+ * families under the 4-binding pipeline declares more bindings than it binds: MoltenVK
+ * refuses every dispatch, a lenient driver (RADV) runs it -- and its bad pipeline lands
+ * in the on-disk pipeline cache, keyed by the device only, for later runs to read. The
+ * KNOWN non-main modules (the families c/shaders holds: chain_*, attention_absorb*,
+ * rmsnorm*, expert_* and the sibling suffixes derive_sibling builds) are refused by name
+ * before a file is opened or any state touched; a name no family covers is a custom main
+ * shader, which is not this check's business. */
+static int vk_main_spv_ok(const char *spv_path) {
+    if (!spv_path) return 0;   /* no name to check -- a caller bug, refused like a wrong one */
+    const char *base = spv_path, *sl = strrchr(spv_path, '/');
+#ifdef _WIN32
+    const char *bs = strrchr(spv_path, '\\');
+    if (bs && (!sl || bs > sl)) sl = bs;
+#endif
+    if (sl) base = sl + 1;
+    if (!strncmp(base, "qmatmul", 7)) return 1;   /* the main family: the documented argument */
+    static const char *pre[] = { "chain_", "attention_absorb", "rmsnorm", "expert_" };
+    static const char *suf[] = { "_gemm", "_coop", "_gate_up", "_bd" };   /* before .spv / .comp */
+    size_t n = strlen(base);
+    int known = 0;
+    for (size_t i = 0; !known && i < sizeof pre / sizeof *pre; i++)
+        known = !strncmp(base, pre[i], strlen(pre[i]));
+    for (size_t i = 0; !known && i < sizeof suf / sizeof *suf; i++) {
+        size_t l = strlen(suf[i]);
+        known = n > l + 4 && !strncmp(base + n - 4 - l, suf[i], l) &&
+                (!strcmp(base + n - 4, ".spv") || !strcmp(base + n - 4, ".comp"));
+    }
+    if (!known) return 1;
+    fprintf(stderr, "[VK] %s is a sibling or chain module, not the main qmatmul shader: this argument "
+                    "builds the 4-binding pipeline, with the siblings and chain modules loaded beside "
+                    "it, and a module like this still runs under that pipeline on lenient drivers -- "
+                    "its bad pipeline kept in the shared on-disk pipeline cache\n", base);
+    return 0;
+}
+
 int coli_vk_init(const char *spv_path) {
+    if (!vk_main_spv_ok(spv_path)) return 0;
     if (G.ready) return 1;
     if (!coli_vk_load()) return 0;
     up_fault_init();
