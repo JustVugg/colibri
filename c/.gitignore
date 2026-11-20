@@ -30,6 +30,8 @@ tools/iq3.dll
 tools/librans_c.so
 tools/librans_c.dylib
 tools/rans_c.dll
+tools/libwex_nr3_tools.so
+tools/libwex_nr3_tools.dylib
 tests/fuzz_rans
 tests/fuzz_glm53_worker
 tests/bench_omp_grain
