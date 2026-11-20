@@ -6,11 +6,13 @@
 #include "../../backend_cuda.h"
 #include "sycl_test_args.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 static void require(bool ok, const char *what) {
@@ -65,6 +67,54 @@ static void compare(const char *name,const float *got,const float *want,size_t n
     std::printf("FP8 %s relative RMS %.9g max_abs %.9g (limit 1e-4)\n",name,rms,maximum);
     require(rms<=1e-4,name);
 }
+/* the group's second half on the card's finish thread (COLI_SYCL_F8_ASYNC_FINISH): the switch, the host SiLU, a
+ * CPU-order kernel and whole 128-blocks, as f8_group_launch decides it */
+static bool split_expected(int D,int I) {
+    auto is=[](const char *k,const char *v){ const char *e=std::getenv(k); return e && !std::strcmp(e,v); };
+    const char *o=std::getenv("COLI_SYCL_F8_CPU_ORDER");
+    return is("COLI_SYCL_F8_ASYNC_FINISH","1") && is("COLI_SYCL_F8_HOST_SILU","1") &&
+           o && o[0]>='1' && o[0]<='4' && !o[1] && !(D&127) && !(I&127);
+}
+static void busy_us(int us) {
+    const auto end=std::chrono::steady_clock::now()+std::chrono::microseconds(us);
+    while(std::chrono::steady_clock::now()<end) {}
+}
+/* issue/take against the synchronous group in the orders a decode step gives them: the take at once; after the
+ * CPU's share (the second half done before the take); after an idle longer than the hand-over's spin (the finish
+ * thread asleep when the next group comes) and the next group at once. With the second half on the finish thread,
+ * a synchronous group sent while it is out declines (its submissions would land inside the half), and works again
+ * after the take; one that comes after the half is done runs, on the same input, and the take still holds the
+ * group's bytes. */
+static void issue_take_orders(int dev,ColiCudaTensor **dg,ColiCudaTensor **du,ColiCudaTensor **dd,int *rows,
+                              const std::vector<float> &x,const std::vector<float> &got,int D,int I) {
+    auto one=[&](int before_us,const char *what){
+        require(coli_cuda_expert_group_issue(dg,du,dd,rows,2,x.data()),"issue");
+        if(before_us>0) busy_us(before_us);
+        const float *r=coli_cuda_expert_group_take(dev);
+        require(r && !std::memcmp(r,got.data(),got.size()*sizeof(float)),what);
+    };
+    one(0,"async != sync (the take at once)");
+    one(3000,"async != sync (the take after 3 ms on the host)");
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    one(0,"async != sync (after an idle of 20 ms)");
+    one(0,"async != sync (the next group at once)");
+    if(!split_expected(D,I)) return;
+    std::vector<float> other(got.size());
+    int declined=0;
+    for(int k=0;k<20;k++) {
+        require(coli_cuda_expert_group_issue(dg,du,dd,rows,2,x.data()),"issue");
+        const int took=coli_cuda_expert_group(dg,du,dd,rows,2,other.data(),x.data());
+        const float *r=coli_cuda_expert_group_take(dev);
+        require(r && !std::memcmp(r,got.data(),got.size()*sizeof(float)),"async != sync (a synchronous group between)");
+        if(took) require(!std::memcmp(other.data(),got.data(),got.size()*sizeof(float)),"the group between, after the half");
+        declined+=!took;
+    }
+    require(declined>0,"a synchronous group while the second half is out declines");
+    require(coli_cuda_expert_group(dg,du,dd,rows,2,other.data(),x.data()) &&
+            !std::memcmp(other.data(),got.data(),got.size()*sizeof(float)),"the synchronous group after the take");
+    std::printf("FP8 split D=%d I=%d: issue/take in four orders, a synchronous group between declined %d of 20; bitwise\n",
+                D,I,declined);
+}
 static void shape(int dev,int D,int I) {
     std::printf("FP8 shape START D=%d I=%d\n",D,I);std::fflush(stdout);
     Weight g0(D,I),u0(D,I),d0(I,D),g1(D,I),u1(D,I),d1(I,D);
@@ -88,6 +138,7 @@ static void shape(int dev,int D,int I) {
     require(coli_cuda_expert_group_issue(dg,du,dd,rows,2,x.data()),"issue");
     const float *async=coli_cuda_expert_group_take(dev);
     require(async && !std::memcmp(async,got.data(),got.size()*sizeof(float)),"async != sync");
+    issue_take_orders(dev,dg,du,dd,rows,x,got,D,I);
     std::vector<float> one(D);int r1=1;off=0;
     for(int e=0;e<2;e++)for(int row=0;row<rows[e];row++,off++) {
         require(coli_cuda_expert_group(dg+e,du+e,dd+e,&r1,1,one.data(),x.data()+(size_t)off*D),"single row");

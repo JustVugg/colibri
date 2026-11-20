@@ -7,6 +7,7 @@
 #define COLIBRI_BACKEND_SYCL_H
 
 #include <sycl/sycl.hpp>
+#include <atomic>
 #include <cstdio>
 #include "coli_sycl.h"
 
@@ -18,7 +19,7 @@
  * flag, and so does an asynchronous error the runtime delivers to a queue's handler instead of
  * throwing (coli_sycl_lost, read by fault_injected): the backend's fault_injected then refuses
  * every compute entry, as it does under COLI_GPU_FAIL_AFTER, and the engine keeps its CPU paths. */
-static int g_sycl_lost;   /* this unit saw a SYCL exception */
+static std::atomic<int> g_sycl_lost{0};   /* this unit saw a SYCL exception (atomic: the FP8 finish threads catch too) */
 static inline int sycl_caught(const sycl::exception &e, const char *where) {
     std::fprintf(stderr, "[CUDA] %s: SYCL exception: %s\n", where, e.what());
     g_sycl_lost = 1;

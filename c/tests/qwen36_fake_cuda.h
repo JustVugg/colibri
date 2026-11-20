@@ -115,11 +115,49 @@ int coli_cuda_planar_rows(int device, int D, int I) { (void)device; (void)D; (vo
 /* a GGUF's block formats: fake_block_elems for every fmt >= 100 (0: the backend takes none) */
 static int fake_block_elems;
 int coli_cuda_block_elems(int fmt) { return fmt >= 100 ? fake_block_elems : 0; }
+/* every block the fake hands out as a card's memory (coli_cuda_pipe_alloc: the arena) or a card's page-locked
+ * memory (coli_cuda_host_alloc: the staging), with the card it was asked for: coli_cuda_pipe_upload then checks
+ * that a copy to a card reads that card's staging and writes that card's arena (a test that only compared the
+ * tier's own bookkeeping would pass with every copy staged through card 0's pool). Blocks come and go at the
+ * tier's start and shutdown, copies on its uploader: one lock. */
+#include <pthread.h>
+#define FAKE_BLOCKS 64
+static struct { const char *p; size_t n; int device, pinned; } fake_blocks[FAKE_BLOCKS];
+static pthread_mutex_t fake_blocks_mx = PTHREAD_MUTEX_INITIALIZER;
+static unsigned fake_host_alloc_mask;   /* the cards page-locked memory was asked for (bit a card) */
+static void fake_block_add(const void *p, size_t n, int device, int pinned) {
+    if (!p) return;
+    pthread_mutex_lock(&fake_blocks_mx);
+    for (int i = 0; i < FAKE_BLOCKS; i++)
+        if (!fake_blocks[i].p) { fake_blocks[i].p = (const char *)p; fake_blocks[i].n = n; fake_blocks[i].device = device; fake_blocks[i].pinned = pinned; break; }
+    pthread_mutex_unlock(&fake_blocks_mx);
+}
+static void fake_block_drop(const void *p) {
+    pthread_mutex_lock(&fake_blocks_mx);
+    for (int i = 0; i < FAKE_BLOCKS; i++) if (p && fake_blocks[i].p == p) fake_blocks[i].p = NULL;
+    pthread_mutex_unlock(&fake_blocks_mx);
+}
+/* the card of the block of that kind holding q; -1 for none */
+static int fake_block_device(const void *q, int pinned) {
+    int d = -1;
+    pthread_mutex_lock(&fake_blocks_mx);
+    for (int i = 0; i < FAKE_BLOCKS; i++)
+        if (fake_blocks[i].p && fake_blocks[i].pinned == pinned && (const char *)q >= fake_blocks[i].p &&
+            (const char *)q < fake_blocks[i].p + fake_blocks[i].n) { d = fake_blocks[i].device; break; }
+    pthread_mutex_unlock(&fake_blocks_mx);
+    return d;
+}
 /* device memory (the tier's arena): host memory here; fake_alloc_fail refuses it */
 static int fake_alloc_fail;
 static int fake_pipe_allocs, fake_pipe_frees;
-void *coli_cuda_pipe_alloc(int device, size_t bytes) { (void)device; if (fake_alloc_fail) return NULL; fake_pipe_allocs++; return calloc(1, bytes ? bytes : 1); }
-void coli_cuda_pipe_free(int device, void *p) { (void)device; if (p) fake_pipe_frees++; free(p); }
+void *coli_cuda_pipe_alloc(int device, size_t bytes) {
+    if (fake_alloc_fail) return NULL;
+    fake_pipe_allocs++;
+    void *p = calloc(1, bytes ? bytes : 1);
+    fake_block_add(p, bytes ? bytes : 1, device, 0);
+    return p;
+}
+void coli_cuda_pipe_free(int device, void *p) { (void)device; if (p) fake_pipe_frees++; fake_block_drop(p); free(p); }
 /* an arena's slot: the fake keeps the host bytes as an upload would */
 static int fake_upload_at;
 int coli_cuda_tensor_upload_at(ColiCudaTensor **t, void *dev, size_t cap, const void *w, int fmt, int I, int O, int device) {
@@ -130,12 +168,14 @@ int coli_cuda_tensor_upload_at(ColiCudaTensor **t, void *dev, size_t cap, const 
  * fake_host_frees count the blocks */
 static int fake_host_alloc_fail, fake_host_allocs, fake_host_frees;
 void *coli_cuda_host_alloc(int device, size_t bytes) {
-    (void)device;
     if (fake_host_alloc_fail || !bytes) return NULL;
     fake_host_allocs++;
-    return calloc(1, bytes);
+    if (device >= 0 && device < 32) fake_host_alloc_mask |= 1u << device;
+    void *p = calloc(1, bytes);
+    fake_block_add(p, bytes, device, 1);
+    return p;
 }
-void coli_cuda_host_free(int device, void *p) { (void)device; fake_host_frees += p != NULL; free(p); }
+void coli_cuda_host_free(int device, void *p) { (void)device; fake_host_frees += p != NULL; fake_block_drop(p); free(p); }
 /* a native int4 expert in an arena's slot: the fake's arena is host memory, so the copies are real and
  * the tensors point into the slot; fake_slot_fills counts the experts filled that way */
 static int fake_slot_fills;
@@ -156,10 +196,15 @@ int coli_cuda_tensor_at_g(ColiCudaTensor **t, void *dev_w, float *dev_s, int I, 
  * real), then a view a matrix that owns nothing. fake_f8_view_fail: a backend without the view */
 static int fake_pipe_uploads, fake_f8_views, fake_f8_view_fail;
 static size_t fake_pipe_upload_bytes;
+/* fake_pipe_upload_foreign: copies to a card from another card's staging or into another card's arena;
+ * fake_pipe_upload_staged[c]: copies to card c from its own page-locked staging */
+static int fake_pipe_upload_foreign, fake_pipe_upload_staged[8];
 int coli_cuda_pipe_upload(int device, void *dst, const void *src, size_t bytes) {
-    (void)device;
     if (!dst || !src || !bytes) return 0;
     if (fake_upload_hook) fake_upload_hook(8);
+    const int sd = fake_block_device(src, 1), dd = fake_block_device(dst, 0);
+    if ((sd >= 0 && sd != device) || (dd >= 0 && dd != device)) fake_pipe_upload_foreign++;
+    if (sd >= 0 && sd == device && device < 8) fake_pipe_upload_staged[device]++;
     memcpy(dst, src, bytes);
     fake_pipe_uploads++; fake_pipe_upload_bytes += bytes;
     return 1;
@@ -208,18 +253,35 @@ int coli_cuda_expert_group_issue(ColiCudaTensor *const *g, ColiCudaTensor *const
 }
 const float *coli_cuda_expert_group_take(int device) { (void)device; return NULL; }
 /* the synchronous group (qt_prefill_group): recorded; y[row][d] = 1000*(expert index in the call) + row + d/1e4, so a
- * test can see which rows came from which expert; fake_group_fail refuses */
+ * test can see which rows came from which expert; fake_group_fail refuses. fake_group_sleep_ms: each call takes that
+ * long (a card's group takes time), and fake_group_max_inflight records how many calls ever ran at once (two threads,
+ * a card each: Q38_PREFILL_GPU_PERCARD's workers) */
+#include <pthread.h>
 static int fake_group_calls, fake_group_experts, fake_group_rows, fake_group_fail;
+static int fake_group_sleep_ms, fake_group_inflight, fake_group_max_inflight;
+static pthread_mutex_t fake_group_mx = PTHREAD_MUTEX_INITIALIZER;
 int coli_cuda_expert_group(ColiCudaTensor *const *g, ColiCudaTensor *const *u, ColiCudaTensor *const *d,
                            const int *rows, int count, float *y, const float *x) {
     (void)u; (void)d; (void)x;
     if (fake_group_fail || count < 1) return 0;
+    pthread_mutex_lock(&fake_group_mx);
+    if (++fake_group_inflight > fake_group_max_inflight) fake_group_max_inflight = fake_group_inflight;
+    const int sleep_ms = fake_group_sleep_ms;   /* read with the count raised, under the lock: a test that sees this
+                                                   group in flight and then changes the setting does not change it */
+    pthread_mutex_unlock(&fake_group_mx);
+    if (sleep_ms > 0) {
+        struct timespec ts = {sleep_ms / 1000, (long)(sleep_ms % 1000) * 1000000L};
+        nanosleep(&ts, NULL);
+    }
+    pthread_mutex_lock(&fake_group_mx);
     fake_group_calls++; fake_group_experts += count;
     int r = 0;
     for (int c = 0; c < count; c++)
         for (int j = 0; j < rows[c]; j++, r++)
             for (int k = 0; k < g[c]->I; k++) y[(size_t)r * g[c]->I + k] = 1000.f * c + j + k / 1e4f;
     fake_group_rows += r;
+    fake_group_inflight--;
+    pthread_mutex_unlock(&fake_group_mx);
     return 1;
 }
 void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64_t *rows,

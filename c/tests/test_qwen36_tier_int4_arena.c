@@ -134,7 +134,7 @@ int main(void) {
     /* ---- off: as before -------------------------------------------------------------- */
     unsetenv("COLI_CUDA_EXPERT_ARENA");
     if (!up("switch off")) return 1;
-    check(!G_nat_arena && !G_arena_on && !G_stg, "no arena and no pool without the switch");
+    check(!G_nat_arena && !G_arena_on && !G_stg[0], "no arena and no pool without the switch");
     stage_all(0);
     check(residents() == NL * NE, "switch off: every expert resident");
     check(fake_slot_fills == 0, "switch off: no slot is filled");
@@ -145,7 +145,7 @@ int main(void) {
     setenv("COLI_CUDA_EXPERT_ARENA", "1", 1);
     if (!up("switch 1")) return 1;
     check(G_nat_arena && G_arena_on && G_arena[0], "1: the arena is up");
-    check(!G_stg && fake_host_allocs == 0, "1: no page-locked pool");
+    check(!G_stg[0] && fake_host_allocs == 0, "1: no page-locked pool");
     check(G_aslots[0] == NL * NE, "1: a slot for every expert");
     check(G_aoff_s == 3 * MB && G_aslot == 3 * MB + (2 * SGU + SD) * sizeof(float), "1: the slot is three matrices, then the scales");
     check(G.exp_bytes == G_aslot, "1: an expert is budgeted at its slot");
@@ -170,25 +170,25 @@ int main(void) {
     /* ---- 2: page-locked staging, repacked outside the lock; one loader thread ---------------- */
     setenv("COLI_CUDA_EXPERT_ARENA", "2", 1);
     if (!up("switch 2")) return 1;
-    check(G_nat_arena && G_arena_on && G_stg, "2: the arena and the staging pool are up");
+    check(G_nat_arena && G_arena_on && G_stg[0], "2: the arena and the staging pool are up");
     check(fake_host_allocs == 1, "2: one page-locked block");
-    check(G_stg_nfree == QT_STG_N, "2: the pool starts full");
+    check(G_stg_nfree[0] == QT_STG_N, "2: the pool starts full");
     stage_all(0);
     check(residents() == NL * NE, "2: every expert resident when the wait returns, none queued");
     check(fake_slot_fills == NL * NE, "2: one fill an expert");
     check(G_stg_used == NL * NE, "2: every expert staged through the pool");
-    check(G_stg_nfree == QT_STG_N, "2: every buffer back in the pool after the warm start");
+    check(G_stg_nfree[0] == QT_STG_N, "2: every buffer back in the pool after the warm start");
     check(G.inflight == 0 && G.qn == 0, "2: nothing in flight, the queue empty");
     check_slots("2");
     qt_shutdown();
-    check(!G_stg && !G_arena_on, "2: shutdown releases the pool and the arena");
+    check(!G_stg[0] && !G_arena_on, "2: shutdown releases the pool and the arena");
 
     /* ---- 2, many loader threads, more experts than the queue holds --------------------------- */
     if (!up("switch 2, threads")) return 1;
     stage_all(1);
     check(residents() == NL * NE, "2 threads: every expert resident when the wait returns, none queued");
     check(fake_slot_fills == NL * NE, "2 threads: one fill an expert, none twice");
-    check(G_stg_nfree == QT_STG_N, "2 threads: every buffer back in the pool");
+    check(G_stg_nfree[0] == QT_STG_N, "2 threads: every buffer back in the pool");
     check(G.inflight == 0 && G.qn == 0, "2 threads: nothing in flight, the queue empty");
     check_slots("2 threads");
     qt_shutdown();
@@ -198,7 +198,7 @@ int main(void) {
     stage_planned();
     check(residents() == NL * NE, "2 planned: every expert resident when the wait returns, none queued");
     check(fake_slot_fills == NL * NE, "2 planned: one fill an expert");
-    check(G_stg_nfree == QT_STG_N, "2 planned: every buffer back in the pool");
+    check(G_stg_nfree[0] == QT_STG_N, "2 planned: every buffer back in the pool");
     {
         size_t used = 0;
         pthread_mutex_lock(&G.mx); used = G.used[0]; pthread_mutex_unlock(&G.mx);
@@ -211,7 +211,7 @@ int main(void) {
     fake_host_alloc_fail = 1;
     if (!up("pool refused")) return 1;
     fake_host_alloc_fail = 0;
-    check(G_nat_arena && G_arena_on && !G_stg, "pool refused: the arena stays, without the pool");
+    check(G_nat_arena && G_arena_on && !G_stg[0], "pool refused: the arena stays, without the pool");
     stage_all(1);
     check(residents() == NL * NE, "pool refused: every expert resident");
     check(fake_slot_fills == NL * NE && G_stg_used == 0, "pool refused: one fill an expert, none through the pool");

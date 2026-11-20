@@ -253,29 +253,29 @@ int main(void) {
     check(!qt_init(NL, NE, D, IH, NE, TOPK, GS, 1), "qt_init refuses (the test's late failure)");
     check(fake_pipe_allocs > pa && fake_host_allocs > ha, "it had made the arena and the staging pool");
     check(!G_arena_on && G_arena[0] == NULL && fake_pipe_allocs == fake_pipe_frees, "the arena is returned and its flag cleared");
-    check(G_stg == NULL && !G_stg_closing, "the staging pool is returned");
+    check(G_stg[0] == NULL && !G_stg_closing[0], "the staging pool is returned");
     unsetenv("QT_FAIL_INIT_LATE");
 
     printf("a staging buffer still out when the tier shuts down\n");
-    check(qt_init(NL, NE, D, IH, NE, TOPK, GS, 1) && G_stg != NULL, "the tier starts with the arena and the pool");
-    uint8_t *out = qt_stg_take();   /* as an engine thread staging an expert outside the tier's lock holds one */
+    check(qt_init(NL, NE, D, IH, NE, TOPK, GS, 1) && G_stg[0] != NULL, "the tier starts with the arena and the pool");
+    uint8_t *out = qt_stg_take(0);   /* as an engine thread staging an expert outside the tier's lock holds one */
     check(out != NULL && qt_stg_owns(out), "a buffer taken from the pool");
     qt_shutdown();
-    check(G_stg != NULL && G_stg_closing, "the shutdown keeps the pool while the buffer is out");
-    check(qt_stg_take() == NULL, "and hands out no buffer from it");
-    uint8_t *const kept = G_stg;
+    check(G_stg[0] != NULL && G_stg_closing[0], "the shutdown keeps the pool while the buffer is out");
+    check(qt_stg_take(0) == NULL, "and hands out no buffer from it");
+    uint8_t *const kept = G_stg[0];
     check(qt_init(NL, NE, D, IH, NE, TOPK, GS, 1), "a new tier starts while the buffer is still out");
-    check(G_stg == kept && G_stg_closing, "without a pool of its own while the old one is kept");
+    check(G_stg[0] == kept && G_stg_closing[0], "without a pool of its own while the old one is kept");
     qt_shutdown();
     memset(out, 0x5a, 64);          /* the staging thread may still write it: the memory is not freed */
     qt_stg_release(out, (float *)(out + G_aoff_s));
-    check(G_stg_nfree == QT_STG_N, "the late release lands in the pool");
+    check(G_stg_nfree[0] == QT_STG_N, "the late release lands in the pool");
     const int hf = fake_host_frees;
     check(qt_init(NL, NE, D, IH, NE, TOPK, GS, 1), "the next tier starts");
-    check(fake_host_frees == hf + 1 && G_stg != NULL && !G_stg_closing && G_stg_nfree == QT_STG_N,
+    check(fake_host_frees == hf + 1 && G_stg[0] != NULL && !G_stg_closing[0] && G_stg_nfree[0] == QT_STG_N,
           "it returns the kept pool (every buffer back) and makes its own");
     qt_shutdown();
-    check(G_stg == NULL && !G_stg_closing, "and its shutdown returns that one");
+    check(G_stg[0] == NULL && !G_stg_closing[0], "and its shutdown returns that one");
 
     printf("%s: %d failures\n", fails ? "FAILED" : "PASSED", fails);
     return fails != 0;

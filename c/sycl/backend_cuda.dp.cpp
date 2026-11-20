@@ -30,13 +30,19 @@ static_assert(FP8_BLOCK == 128, "fmt=8 on-disk containers carry ceil(dim/128)-ed
 #include <cerrno>
 #include <chrono>
 #include <atomic>
+#include <condition_variable>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <fcntl.h>
 #include <unistd.h>
 #include <cmath>
+#ifdef __linux__
+#include <pthread.h>   /* pthread_setaffinity_np: the FP8 finish threads' CPU mask */
+#include <sched.h>
+#endif
 
 
 
@@ -145,6 +151,8 @@ static double g_device_group_h2d_ms[COLI_CUDA_MAX_DEVICES];
 static double g_device_group_kernel_ms[COLI_CUDA_MAX_DEVICES];
 static double g_device_group_d2h_ms[COLI_CUDA_MAX_DEVICES];
 static std::mutex g_group_stats_mu;
+static bool finish_join(DeviceContext *ctx);   /* COLI_SYCL_F8_ASYNC_FINISH (with f8_group_launch) */
+static bool split_busy(DeviceContext *ctx, const char *who);
 
 /* ---- the host-side protocol, where the CUDA runtime's was ----------------------------------
  *   - errors: a SYCL call that fails throws. COLI_SYCL_TRY(expr) runs one in a try block and gives
@@ -873,6 +881,14 @@ static void silu_cpu_mul(float *gate,const float *up,size_t n) {
     size_t i=item.get_global_id(2);
     if(i<n)gate[i]=cpu_form_silu_mul(gate[i],up[i]);
 }
+/* COLI_SYCL_SILU_CPU=2: the host's SiLU to the bit on the card (glibc_form_silu_mul, glibc_expf_dev: glibc's expf
+ * as x86-64 runs it, exhaustively equal to the system expf; see the header) */
+#include "coli_silu_exact.hpp"
+static void silu_glibc_mul(float *gate,const float *up,size_t n) {
+    auto item=sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    size_t i=item.get_global_id(2);
+    if(i<n)gate[i]=glibc_form_silu_mul(gate[i],up[i]);
+}
 
 static void silu_mul(float *gate, const float *up, size_t n) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
@@ -1254,7 +1270,7 @@ static void grouped_down_f8(float *y, const float *x, const GroupDesc *desc,
  * kernels; grid (ceil(O/8), count): 8 warps per 256-thread block, rows looped
  * in-kernel. The old kernels stay compiled and selectable (=0) as the field
  * escape hatch. */
-template <int HW, int SG, bool CPU_ORDER=false, bool CPU_SILU=false, bool RAW=false>
+template <int HW, int SG, bool CPU_ORDER=false, int CPU_SILU=0, bool RAW=false>   /* CPU_SILU: 1 cpu_form, 2 glibc_form */
 static void grouped_hidden_f8w_dual(float *gate, float *up, const float *x,
                                     const GroupDesc *desc, int I, int D,
                                     float const *c_e4m3) {
@@ -1295,7 +1311,9 @@ auto &slut = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[256]>(
             if constexpr(RAW) {
                 gate[(size_t)(d.offset+s0+s)*I+o]=g;
                 up[(size_t)(d.offset+s0+s)*I+o]=u;
-            } else if constexpr(CPU_SILU)
+            } else if constexpr(CPU_SILU==2)
+                gate[(size_t)(d.offset+s0+s)*I+o]=glibc_form_silu_mul(g,u);
+            else if constexpr(CPU_SILU)
                 gate[(size_t)(d.offset+s0+s)*I+o]=cpu_form_silu_mul(g,u);
             else
                 gate[(size_t)(d.offset + s0 + s) * I + o] =
@@ -1425,7 +1443,7 @@ __dpct_inline__ void f8c3_row(const float *lut, const uint8_t *gr, const uint8_t
         }
     }
 }
-template <int SG, bool CPU_SILU=false, bool RAW=false>
+template <int SG, int CPU_SILU=0, bool RAW=false>   /* CPU_SILU: 1 cpu_form, 2 glibc_form */
 static void grouped_hidden_f8c3_dual(float *gate, float *up, const float *x, const GroupDesc *desc,
                                      int I, int D, float const *c_e4m3) {
     static_assert(SG == 16 || SG == 32, "supported subgroup width");
@@ -1451,6 +1469,7 @@ static void grouped_hidden_f8c3_dual(float *gate, float *up, const float *x, con
                 const float g = (float)ga[s], u = (float)ua[s];
                 const size_t at = (size_t)(d.offset + s0 + s) * I + o;
                 if constexpr (RAW) { gate[at] = g; up[at] = u; }
+                else if constexpr (CPU_SILU == 2) gate[at] = glibc_form_silu_mul(g, u);
                 else if constexpr (CPU_SILU) gate[at] = cpu_form_silu_mul(g, u);
                 else gate[at] = (g / (1.f + sycl::native::exp(-g))) * u;
             }
@@ -1482,7 +1501,7 @@ static void grouped_down_f8c3(float *y, const float *x, const GroupDesc *desc, i
             for (int s = 0; s < ns; s++) y[(size_t)(d.offset + s0 + s) * D + o] = (float)a[s];
     }
 }
-template <int SG, bool CPU_SILU=false, bool RAW=false>
+template <int SG, int CPU_SILU=0, bool RAW=false>   /* CPU_SILU: 1 cpu_form, 2 glibc_form */
 static void grouped_hidden_f8c2_dual(float *gate, float *up, const float *x, const GroupDesc *desc,
                                      int I, int D, float const *c_e4m3) {
     static_assert(SG == 16 || SG == 32, "supported subgroup width");
@@ -1517,6 +1536,7 @@ static void grouped_hidden_f8c2_dual(float *gate, float *up, const float *x, con
                 const float g = (float)ga[s], u = (float)ua[s];
                 const size_t at = (size_t)(d.offset + s0 + s) * I + o;
                 if constexpr (RAW) { gate[at] = g; up[at] = u; }
+                else if constexpr (CPU_SILU == 2) gate[at] = glibc_form_silu_mul(g, u);
                 else if constexpr (CPU_SILU) gate[at] = cpu_form_silu_mul(g, u);
                 else gate[at] = (g / (1.f + sycl::native::exp(-g))) * u;
             }
@@ -1884,6 +1904,7 @@ extern "C" int coli_cuda_available_device_count(void) {
 extern "C" void coli_cuda_shutdown(void) {
     for (int i = 0; i < g_nctx; i++) {
         DeviceContext *ctx = &g_ctx[i];
+        (void)finish_join(ctx);   /* a group's second half still on the card's finish thread (COLI_SYCL_F8_ASYNC_FINISH) */
         if (!select_ctx(ctx)) continue;
         /* cudaFree synchronised the device before releasing; sycl::free releases at once, and
          * the engine reaches here with a group possibly in flight (qwen36_tier's shutdown with a
@@ -2459,17 +2480,21 @@ static int f8_cpu_order_mode(void) {
     return !e || !e[0] || e[1] ? 0 : e[0]=='1' ? 1 : e[0]=='2' ? 2 : e[0]=='3' ? 3 : e[0]=='4' ? 4 : 0;
 }
 static bool f8_cpu_order_on(void) { return f8_cpu_order_mode()>0; }
-static bool cpu_silu_on(void) {
+/* COLI_SYCL_SILU_CPU: 1 the CPU-form SiLU (double exp rounded to float), 2 the host's SiLU to the bit (glibc's expf,
+ * glibc_form_silu_mul); anything else 0 */
+static int cpu_silu_mode(void) {
     const char *e=std::getenv("COLI_SYCL_SILU_CPU");
-    return e && !std::strcmp(e,"1");
+    return !e ? 0 : !std::strcmp(e,"1") ? 1 : !std::strcmp(e,"2") ? 2 : 0;
 }
+static bool cpu_silu_on(void) { return cpu_silu_mode()>0; }
 static void cpu_silu_note(int site) {
     // Host logging only; these atomics are not passed to the device.
     static std::atomic_flag mlp=ATOMIC_FLAG_INIT,group=ATOMIC_FLAG_INIT,pipe=ATOMIC_FLAG_INIT;
     auto &seen=site==0?mlp:(site==1?group:pipe);
     if(!seen.test_and_set(std::memory_order_relaxed))
-        std::fprintf(stderr,"[SYCL] CPU-form SiLU: %s, double exp rounded to float, stable sigmoid, rounded division\n",
-                     site==0?"fp8 mlp":(site==1?"fp8 group":"pipe"));
+        std::fprintf(stderr,"[SYCL] CPU-form SiLU: %s, %s, stable sigmoid, rounded division\n",
+                     site==0?"fp8 mlp":(site==1?"fp8 group":"pipe"),
+                     cpu_silu_mode()==2?"glibc's expf to the bit (COLI_SYCL_SILU_CPU=2)":"double exp rounded to float");
 }
 static void f8_cpu_order_note(bool grouped,int I,int O,int sg) {
     // Host-side logging only; these atomics are never visible to a kernel.
@@ -3000,7 +3025,7 @@ extern "C" int coli_cuda_matmul_mxfp4(float *y, const float *x,
     if (fault_injected()) return 0;
     if (S < 1 || I < 1 || O < 1 || !y || !x || !q4 || !e8s) return 0;
     DeviceContext *ctx = find_ctx(0);
-    if (!select_ctx(ctx)) return 0;
+    if (!ctx || split_busy(ctx, "coli_cuda_matmul_mxfp4") || !select_ctx(ctx)) return 0;
 
     size_t rb = (size_t)(I + 1) / 2, ng = (size_t)(I + 31) / 32;
     size_t wb = (size_t)O * rb, sb = (size_t)O * ng;
@@ -3102,7 +3127,7 @@ coli_cuda_expert_mxfp4(float *y, const float *x, const unsigned char *gate_w,
         !down_w || !down_s || S < 1 || S > 65535 || D < 1 || I < 1 ||
         !(b1 > 0.f) || !(b2 > 0.f) || !std::isfinite(b1) || !std::isfinite(b2)) return 0;
     DeviceContext *ctx = find_ctx(0);
-    if (!select_ctx(ctx)) return 0;
+    if (!ctx || split_busy(ctx, "coli_cuda_expert_mxfp4") || !select_ctx(ctx)) return 0;
     size_t xb = (size_t)S * D * sizeof(float), ib = (size_t)S * I * sizeof(float);
     if (!reserve(&ctx->x, &ctx->x_cap, xb) || !reserve(&ctx->y, &ctx->y_cap, xb) ||
         !reserve(&ctx->gate, &ctx->gate_cap, ib) || !reserve(&ctx->up, &ctx->up_cap, ib)) return 0;
@@ -3162,7 +3187,7 @@ extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
         gate->I != up->I || gate->O != up->O ||
         down->I != gate->O || down->O != gate->I) return 0;
     DeviceContext *ctx = find_ctx(gate->device);
-    if (!select_ctx(ctx)) return 0;
+    if (!ctx || split_busy(ctx, "coli_cuda_expert_mlp") || !select_ctx(ctx)) return 0;
     int D = gate->I, I = gate->O;
     size_t xb=(size_t)S*D*sizeof(float), ib=(size_t)S*I*sizeof(float);
     size_t yb=(size_t)S*D*sizeof(float);
@@ -3181,9 +3206,14 @@ extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
     if(cpu_silu) {
         cpu_silu_note(0);
         float *g=ctx->gate;const float *u=ctx->up;
-        dq().parallel_for(sycl::nd_range<3>(sycl::range<3>(1,1,((n+255)/256)*256),
-                                          sycl::range<3>(1,1,256)),
-                         [=](sycl::nd_item<3>){silu_cpu_mul(g,u,n);});
+        if(cpu_silu_mode()==2)
+            dq().parallel_for(sycl::nd_range<3>(sycl::range<3>(1,1,((n+255)/256)*256),
+                                              sycl::range<3>(1,1,256)),
+                             [=](sycl::nd_item<3>){silu_glibc_mul(g,u,n);});
+        else
+            dq().parallel_for(sycl::nd_range<3>(sycl::range<3>(1,1,((n+255)/256)*256),
+                                              sycl::range<3>(1,1,256)),
+                             [=](sycl::nd_item<3>){silu_cpu_mul(g,u,n);});
     } else dq().submit([&](sycl::handler &cgh) {
         auto ctx_gate_ct0 = ctx->gate;
         const float *ctx_up_ct1 = ctx->up;
@@ -3225,7 +3255,7 @@ extern "C" int coli_cuda_shared_mlp_w4a16(ColiCudaTensor *gate,
     if(!gate||!up||!down||!x||!y||S<1||gate->fmt!=2||up->fmt!=2||down->fmt!=2||
        gate->device!=up->device||gate->device!=down->device||gate->I!=up->I||
        gate->O!=up->O||down->I!=gate->O||down->O!=gate->I)return 0;
-    DeviceContext *ctx=find_ctx(gate->device);if(!select_ctx(ctx))return 0;
+    DeviceContext *ctx=find_ctx(gate->device);if(!ctx||split_busy(ctx,"coli_cuda_shared_mlp_w4a16")||!select_ctx(ctx))return 0;
     int D=gate->I,I=gate->O;size_t xb=(size_t)S*D*sizeof(float),ib=(size_t)S*I*sizeof(float);
     if(!xmx_dense_ok(ctx,2,0,D,I)||!xmx_dense_ok(ctx,2,0,I,D)){ xmx_note("shared expert (prompt rows)", 0); return 0; }
     xmx_note("shared expert (prompt rows)", 1);
@@ -3277,14 +3307,234 @@ static bool f8_async_waits_on(void) {
     if(v<0){const char *e=std::getenv("COLI_SYCL_F8_ASYNC_WAITS");v=e&&e[0]=='1'&&!e[1];}
     return v!=0;
 }
+
+/* COLI_SYCL_F8_ASYNC_FINISH=1 (default 0): an FP8 group with the host SiLU (the qualified Qwen3.8 path) in two
+ * halves. The issue launches gate/up and queues both downloads without a wait, and hands the rest -- the wait for
+ * them, the same host SiLU loop, the hidden upload, the down kernel, the result's download -- to a thread of the
+ * card's own; the take joins it before its wait on the queue, as before. The engine's thread is free from the
+ * gate/up launch on: it issues the next card's group (two cards' groups run side by side, where each waited for
+ * the one before it: campaign pair1/pair2) and computes the CPU's experts meanwhile. The kernels and the host
+ * loop are the same, so the bits are. The issue's own checks keep one group a card in flight (group_pending);
+ * the matmuls the engine's thread sends between issue and take use dx/dy, not the group's buffers, and the entry
+ * points that do use them decline while a second half is out (split_busy). A finish thread the system refuses
+ * turns the switch off for the process (that group's second half then runs on the issue, and so do the next).
+ *
+ * The hand-over: each side spins on an atomic for up to COLI_SYCL_F8_FINISH_SPIN_US microseconds (default 2000; a
+ * decode layer's period on a Max 1100 is 1-2 ms, so the finish thread stays awake from one layer's group to the
+ * next) before it sleeps on the condition variable. 0 sleeps at once, the first form: a thread woken from a sleep
+ * starts tens of microseconds later, twice a group (campaign PAIR3, one card: warm decode 19.5 -> 18.4 tok/s). */
+struct F8Finish {
+    DeviceContext *ctx; GroupDesc *dev;
+    int I, D, count, total; size_t hidden_bytes, xb;
+    bool cpu3, down2, cpu_order;
+    sycl::event up_done;   /* the up download's (in order: after the gate's) */
+};
+struct FinishWorker {
+    std::mutex mx; std::condition_variable cv;
+    std::atomic<uint64_t> started{0};   /* second halves handed over: raised by the engine's thread (the issue) */
+    std::atomic<uint64_t> done{0};      /* and finished: raised by the finish thread */
+    std::atomic<bool> ok{true};         /* false once one failed, until the take reads it */
+    std::atomic<int> sleepers{0};       /* threads asleep on cv, either side */
+    F8Finish job{};                     /* written before started is raised; read and cleared before done is */
+};
+static std::atomic<FinishWorker *> g_finish[COLI_CUDA_MAX_DEVICES];   /* never freed: its detached thread waits on it until the exit */
+static std::mutex g_finish_mu;   /* a worker's creation */
+static std::atomic<int> g_finish_off{0};
+static long f8_finish_spin_us(void) {
+    static const long v=[]{
+        const char *e=std::getenv("COLI_SYCL_F8_FINISH_SPIN_US");
+        if(!e||!*e) return 2000L;
+        char *end=nullptr; const long n=std::strtol(e,&end,10);
+        if(*end||n<0){ std::fprintf(stderr,"[SYCL] COLI_SYCL_F8_FINISH_SPIN_US=%s is not a count of microseconds: 2000\n",e); return 2000L; }
+        return n>1000000 ? 1000000L : n;
+    }();
+    return v;
+}
+static inline void finish_relax(void) {
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#else
+    std::this_thread::yield();
+#endif
+}
+/* true once ready() holds, after spinning for at most COLI_SYCL_F8_FINISH_SPIN_US; false: the caller sleeps */
+template <class Ready> static bool finish_spin(Ready ready) {
+    if(ready()) return true;
+    const long us=f8_finish_spin_us();
+    if(us<=0) return false;
+    const auto end=std::chrono::steady_clock::now()+std::chrono::microseconds(us);
+    for(unsigned n=1;;n++){
+        finish_relax();
+        if(ready()) return true;
+        if(!(n&63) && std::chrono::steady_clock::now()>=end) return false;
+    }
+}
+/* until ready() holds: the spin, then a sleep on the worker's condition variable. The side that makes it hold
+ * notifies when it sees a sleeper counted; the count and the condition are sequentially consistent, so a sleeper
+ * either sees the condition before it sleeps or is seen. */
+template <class Ready> static void finish_await(FinishWorker *w, Ready ready) {
+    if(finish_spin(ready)) return;
+    std::unique_lock<std::mutex> lk(w->mx);
+    w->sleepers.fetch_add(1);
+    w->cv.wait(lk,ready);
+    w->sleepers.fetch_sub(1);
+}
+static void finish_wake(FinishWorker *w) {
+    if(w->sleepers.load()){ std::lock_guard<std::mutex> lk(w->mx); w->cv.notify_all(); }
+}
+static bool f8_async_finish_on(void) {
+    static int v=-1;
+    if(v<0){const char *e=std::getenv("COLI_SYCL_F8_ASYNC_FINISH");v=e&&e[0]=='1'&&!e[1];}
+    return v!=0 && !g_finish_off.load();
+}
+/* the FP8 group's down kernel, as f8_group_launch picks it from its flags (both halves' paths use it) */
+static void f8_down_launch(DeviceContext *ctx, GroupDesc *dev, int I, int D, int count, bool cpu3, bool down2, bool cpu_order) {
+    const int wpb=ctx->wpb;   /* output rows a block: a sub-group each */
+    dpct::dim3 og((unsigned)((D + wpb - 1) / wpb), (unsigned)count),
+        og2((unsigned)((D + 31) / 32), (unsigned)count);
+    const float *c_e4m3_ptr_ct1 = ctx->e4m3;
+    auto ctx_y_ct0 = ctx->y;
+    const float *ctx_gate_ct1 = ctx->gate;
+    if(cpu3 && !down2) {
+        COLI_SG_LAUNCH(*ctx->stream, ctx->sg, og, 256, 0,
+            grouped_down_f8c3<SG>(ctx_y_ct0,ctx_gate_ct1,dev,D,I,c_e4m3_ptr_ct1));
+    } else if(down2) {
+        COLI_SG_LAUNCH(*ctx->stream, ctx->sg, og2, 256, 0,
+            grouped_down_f8c2<SG>(ctx_y_ct0,ctx_gate_ct1,dev,D,I,c_e4m3_ptr_ct1));
+    } else if(cpu_order) {
+        COLI_SG_LAUNCH(*ctx->stream, ctx->sg, og, 256, 0,
+            grouped_down_f8w<0,SG,true>(ctx_y_ct0,ctx_gate_ct1,dev,D,I,c_e4m3_ptr_ct1));
+    } else {
+        COLI_SG_LAUNCH(*ctx->stream, ctx->sg, og, 256, 0,
+                       grouped_down_f8w<0, SG>(ctx_y_ct0, ctx_gate_ct1, dev, D, I, c_e4m3_ptr_ct1));
+    }
+}
+/* a group's second half, on the card's finish thread; a failure drains the queue before the host buffers are
+ * reused and is reported by the take */
+static bool f8_group_finish(const F8Finish &j) {
+    DeviceContext *ctx=j.ctx;
+    try {
+        if(!select_ctx(ctx)) return false;   /* this thread's current device (thread-local) */
+        sycl::event up=j.up_done;
+        up.wait();
+        for(size_t k=0;k<(size_t)j.total*j.I;k++)ctx->host_gate[k]=coli_fp8_host_silu_mul(ctx->host_gate[k],ctx->host_up[k]);
+        if(!cuda_ok(COLI_SYCL_TRY(ctx->stream->memcpy(ctx->gate,ctx->host_gate,j.hidden_bytes)),"fp8 host SiLU hidden upload")){
+            f8_async_drain(ctx); return false;
+        }
+        f8_down_launch(ctx,j.dev,j.I,j.D,j.count,j.cpu3,j.down2,j.cpu_order);
+        if(!cuda_ok(COLI_SYCL_TRY(ctx->stream->memcpy(ctx->host_y,ctx->y,j.xb)),"expert group issue download")){
+            f8_async_drain(ctx); return false;
+        }
+        return true;
+    } catch (sycl::exception const &exc) {
+        sycl_caught(exc,"fp8 group finish"); f8_async_drain(ctx); return false;
+    } catch (const std::exception &exc) {
+        std::fprintf(stderr,"[CUDA] fp8 group finish: %s\n",exc.what()); f8_async_drain(ctx); return false;
+    }
+}
+/* every online CPU for the finish thread: a thread inherits its creator's mask, and with OMP_PROC_BIND the engine's
+ * thread (the OpenMP master) is bound to one core, which the finish thread would share during the very overlap it
+ * is for (qwen36_tier.c's qt_aff_widen and qwen38_core.h's prefill worker do the same) */
+static void finish_widen_self(void) {
+#if defined(__linux__) && defined(CPU_SETSIZE)
+    cpu_set_t all; CPU_ZERO(&all);
+    long n=sysconf(_SC_NPROCESSORS_ONLN); if(n>CPU_SETSIZE) n=CPU_SETSIZE;
+    for(long i=0;i<n;i++) CPU_SET((int)i,&all);
+    (void)pthread_setaffinity_np(pthread_self(),sizeof all,&all);
+#endif
+}
+static void finish_loop(FinishWorker *w) {
+    finish_widen_self();
+    for(uint64_t seen=0;;){
+        const uint64_t want=seen+1;
+        finish_await(w,[&]{ return w->started.load()>=want; });
+        seen=want;
+        const F8Finish j=w->job;
+        w->job=F8Finish{};   /* the group's event, and through it its context, not kept past the group */
+        if(!f8_group_finish(j)) w->ok.store(false);
+        w->done.store(want);
+        finish_wake(w);
+    }
+}
+static FinishWorker *finish_of(DeviceContext *ctx) {
+    const long i=ctx-g_ctx;
+    return i<0||i>=COLI_CUDA_MAX_DEVICES ? nullptr : g_finish[i].load(std::memory_order_acquire);
+}
+/* the card's finish thread, made on its first second half; NULL (and the switch off) where the system refuses one */
+static FinishWorker *finish_worker(DeviceContext *ctx) {
+    const long i=ctx-g_ctx;
+    if(i<0||i>=COLI_CUDA_MAX_DEVICES) return nullptr;
+    if(FinishWorker *w=g_finish[i].load(std::memory_order_acquire)) return w;
+    std::lock_guard<std::mutex> lk(g_finish_mu);
+    if(FinishWorker *w=g_finish[i].load(std::memory_order_acquire)) return w;
+    FinishWorker *w=nullptr;
+    try {
+        w=new FinishWorker;
+        std::thread(finish_loop,w).detach();
+    } catch (const std::exception &e) {
+        delete w;
+        if(!g_finish_off.exchange(1))
+            std::fprintf(stderr,"[SYCL] fp8 group: no finish thread (%s): every group finishes on its issue\n",e.what());
+        return nullptr;
+    }
+    g_finish[i].store(w,std::memory_order_release);
+    static std::atomic_flag noted=ATOMIC_FLAG_INIT; /* host logging only */
+    if(!noted.test_and_set(std::memory_order_relaxed))
+        std::fprintf(stderr,"[SYCL] fp8 group in two halves (COLI_SYCL_F8_ASYNC_FINISH=1): the host SiLU, the down kernel "
+                            "and the download on a thread of each card (hand-over: spin %ld us, then sleep)\n",f8_finish_spin_us());
+    return w;
+}
+static void finish_start(FinishWorker *w, const F8Finish &j) {
+    w->job=j;
+    w->started.fetch_add(1);
+    finish_wake(w);
+}
+/* a second half still on the card's finish thread */
+static bool split_out(DeviceContext *ctx) {
+    FinishWorker *w=finish_of(ctx);
+    return w && w->done.load()<w->started.load();
+}
+/* the card's finish thread's last second half, waited for; true with none out or when every one since the last
+ * join succeeded (only the engine's thread hands them over, so the count it reads is its own) */
+static bool finish_join(DeviceContext *ctx) {
+    FinishWorker *w=finish_of(ctx);
+    if(!w) return true;
+    const uint64_t want=w->started.load();
+    finish_await(w,[&]{ return w->done.load()>=want; });
+    return w->ok.exchange(true);
+}
+/* An entry point that uses the group's buffers (x, y, gate, up, the descriptors and their host copies) while a
+ * second half is out on that card: declined, and the engine computes it on the CPU, where its submissions would
+ * land between that half's upload, kernel and download. No engine does this today (the tier refuses its prompt
+ * groups while a group is open; colibri.c issues only with the group path on), so it is noted once: it would be
+ * an engine's bug. Never true with the switch off. */
+static bool split_busy(DeviceContext *ctx, const char *who) {
+    if(!split_out(ctx)) return false;
+    static std::atomic_flag noted=ATOMIC_FLAG_INIT; /* host logging only */
+    if(!noted.test_and_set(std::memory_order_relaxed))
+        std::fprintf(stderr,"[SYCL] %s declined: an FP8 group's second half is still out on that card "
+                            "(COLI_SYCL_F8_ASYNC_FINISH; its take comes first)\n",who);
+    return true;
+}
+/* split (COLI_SYCL_F8_ASYNC_FINISH, the issue's async path): with the host SiLU, only the first half here --
+ * gate/up launched, both downloads queued -- and *split filled for the card's finish thread (split->ctx set);
+ * without the host SiLU split->ctx stays NULL and the group is whole, as with split NULL */
 static bool f8_group_launch(DeviceContext *ctx,GroupDesc *dev,int I,int D,
-                            int max_rows,int count,int total){
+                            int max_rows,int count,int total,F8Finish *split=nullptr){
     int mode=f8_warp_mode();
     if(mode&&ctx->has_fp64){   /* the warp kernels sum their blocks in double */
         const bool cpu_order=!(I&127) && !(D&127) && f8_cpu_order_on();
-        const bool cpu_silu=!(I&127) && !(D&127) && cpu_silu_on();
+        const int smode=!(I&127) && !(D&127) ? cpu_silu_mode() : 0;   /* 2: glibc_form_silu_mul */
+        const bool cpu_silu=smode>0;
         const char *host_env=std::getenv("COLI_SYCL_F8_HOST_SILU");
         const bool host_silu=cpu_order&&host_env&&!std::strcmp(host_env,"1");
+        /* COLI_SYCL_SILU_CPU=2 with the CPU-order kernels and the host SiLU off: the host path's own gate/up kernel (the
+         * RAW instantiation, so g and u are the bytes the host path downloads), then the SiLU in a kernel of its own
+         * (silu_glibc_mul, the form test_sycl_silu_exact checks for every input), then down. Fused into the gate/up
+         * kernel's epilogue the same function gave 1 ulp on 0.14 % of the outputs (p9-bits): the fused instantiation is
+         * not the checked one, so it is not used where the bits must be the CPU's. */
+        const bool dev_silu2=cpu_order && smode==2 && !host_silu;
+        const bool raw=host_silu || dev_silu2;
         size_t hidden_bytes=0;
         if(host_silu){
             if(total<1||I<1||(size_t)total>SIZE_MAX/(size_t)I/sizeof(float))return false;
@@ -3313,24 +3563,34 @@ static bool f8_group_launch(DeviceContext *ctx,GroupDesc *dev,int I,int D,
                 std::fprintf(stderr,"[SYCL] fp8 CPU order 2: the same FMA chains, tree and double sums, a group of 8 lanes an output row\n");
         }
         const int wpb=ctx->wpb;   /* output rows a block: a sub-group each */
-        dpct::dim3 hg((unsigned)((I + wpb - 1) / wpb), (unsigned)count),
-            og((unsigned)((D + wpb - 1) / wpb), (unsigned)count);
-        dpct::dim3 hg2((unsigned)((I + 31) / 32), (unsigned)count),
-            og2((unsigned)((D + 31) / 32), (unsigned)count);
+        dpct::dim3 hg((unsigned)((I + wpb - 1) / wpb), (unsigned)count);   /* the down kernel's grids: f8_down_launch */
+        dpct::dim3 hg2((unsigned)((I + 31) / 32), (unsigned)count);
         const float *c_e4m3_ptr_ct1 = ctx->e4m3;
         {
             auto ctx_gate_ct0 = ctx->gate;
             auto ctx_up_ct1 = ctx->up;
             const float *ctx_x_ct2 = ctx->x;
-            if(host_silu && cpu3) {
+            if(raw && cpu3) {
                 COLI_SG_LAUNCH(*ctx->stream, ctx->sg, hg, 256, 0,
                     grouped_hidden_f8c3_dual<SG,false,true>(ctx_gate_ct0,ctx_up_ct1,ctx_x_ct2,dev,I,D,c_e4m3_ptr_ct1));
-            } else if(host_silu && cpu2) {
+            } else if(raw && cpu2) {
                 COLI_SG_LAUNCH(*ctx->stream, ctx->sg, hg2, 256, 0,
                     grouped_hidden_f8c2_dual<SG,false,true>(ctx_gate_ct0,ctx_up_ct1,ctx_x_ct2,dev,I,D,c_e4m3_ptr_ct1));
-            } else if(host_silu) {
+            } else if(raw) {
                 COLI_SG_LAUNCH(*ctx->stream, ctx->sg, hg, 256, 0,
                     grouped_hidden_f8w_dual<0,SG,true,false,true>(ctx_gate_ct0,ctx_up_ct1,ctx_x_ct2,dev,I,D,c_e4m3_ptr_ct1));
+            } else if(smode==2 && cpu3) {
+                COLI_SG_LAUNCH(*ctx->stream, ctx->sg, hg, 256, 0,
+                    grouped_hidden_f8c3_dual<SG,2>(ctx_gate_ct0,ctx_up_ct1,ctx_x_ct2,dev,I,D,c_e4m3_ptr_ct1));
+            } else if(smode==2 && cpu2) {
+                COLI_SG_LAUNCH(*ctx->stream, ctx->sg, hg2, 256, 0,
+                    grouped_hidden_f8c2_dual<SG,2>(ctx_gate_ct0,ctx_up_ct1,ctx_x_ct2,dev,I,D,c_e4m3_ptr_ct1));
+            } else if(smode==2 && cpu_order) {
+                COLI_SG_LAUNCH(*ctx->stream, ctx->sg, hg, 256, 0,
+                    grouped_hidden_f8w_dual<0,SG,true,2>(ctx_gate_ct0,ctx_up_ct1,ctx_x_ct2,dev,I,D,c_e4m3_ptr_ct1));
+            } else if(smode==2) {
+                COLI_SG_LAUNCH(*ctx->stream, ctx->sg, hg, 256, 0,
+                    grouped_hidden_f8w_dual<0,SG,false,2>(ctx_gate_ct0,ctx_up_ct1,ctx_x_ct2,dev,I,D,c_e4m3_ptr_ct1));
             } else if(cpu_silu && cpu3) {
                 COLI_SG_LAUNCH(*ctx->stream, ctx->sg, hg, 256, 0,
                     grouped_hidden_f8c3_dual<SG,true>(ctx_gate_ct0,ctx_up_ct1,ctx_x_ct2,dev,I,D,c_e4m3_ptr_ct1));
@@ -3357,6 +3617,22 @@ static bool f8_group_launch(DeviceContext *ctx,GroupDesc *dev,int I,int D,
                                grouped_hidden_f8w_dual<0, SG>(ctx_gate_ct0, ctx_up_ct1, ctx_x_ct2, dev, I, D, c_e4m3_ptr_ct1));
             }
         }
+        if(host_silu && split){
+            /* COLI_SYCL_F8_ASYNC_FINISH: both downloads queued, neither waited; the card's finish thread waits for
+             * them (the up download's event: in order, after the gate's), runs the host loop, the upload and the
+             * down kernel below (f8_down_launch) */
+            if(!cuda_ok(COLI_SYCL_TRY(ctx->stream->memcpy(ctx->host_gate,ctx->gate,hidden_bytes)),"fp8 host SiLU gate download")){
+                f8_async_drain(ctx); return false;
+            }
+            sycl::event up;
+            if(!cuda_ok(COLI_SYCL_TRY(up=ctx->stream->memcpy(ctx->host_up,ctx->up,hidden_bytes)),"fp8 host SiLU up download")){
+                f8_async_drain(ctx); return false;   /* the gate download may still be writing host_gate */
+            }
+            split->ctx=ctx; split->dev=dev; split->I=I; split->D=D; split->count=count; split->total=total;
+            split->hidden_bytes=hidden_bytes; split->cpu3=cpu3; split->down2=down2; split->cpu_order=cpu_order;
+            split->up_done=up;
+            return true;
+        }
         if(host_silu){
             /* Explicit copies and waits keep the GPU from accessing host data
              * while the CPU transforms it; no device atomics on host memory. */
@@ -3375,23 +3651,17 @@ static bool f8_group_launch(DeviceContext *ctx,GroupDesc *dev,int I,int D,
                 }
             } else if(!cuda_ok(COLI_SYCL_TRY(ctx->stream->memcpy(ctx->gate,ctx->host_gate,hidden_bytes).wait()),"fp8 host SiLU hidden upload"))return false;
         }
-        {
-            auto ctx_y_ct0 = ctx->y;
-            const float *ctx_gate_ct1 = ctx->gate;
-            if(cpu3 && !down2) {
-                COLI_SG_LAUNCH(*ctx->stream, ctx->sg, og, 256, 0,
-                    grouped_down_f8c3<SG>(ctx_y_ct0,ctx_gate_ct1,dev,D,I,c_e4m3_ptr_ct1));
-            } else if(down2) {
-                COLI_SG_LAUNCH(*ctx->stream, ctx->sg, og2, 256, 0,
-                    grouped_down_f8c2<SG>(ctx_y_ct0,ctx_gate_ct1,dev,D,I,c_e4m3_ptr_ct1));
-            } else if(cpu_order) {
-                COLI_SG_LAUNCH(*ctx->stream, ctx->sg, og, 256, 0,
-                    grouped_down_f8w<0,SG,true>(ctx_y_ct0,ctx_gate_ct1,dev,D,I,c_e4m3_ptr_ct1));
-            } else {
-                COLI_SG_LAUNCH(*ctx->stream, ctx->sg, og, 256, 0,
-                               grouped_down_f8w<0, SG>(ctx_y_ct0, ctx_gate_ct1, dev, D, I, c_e4m3_ptr_ct1));
-            }
+        if(dev_silu2){   /* the SiLU on the card, a kernel of its own, in the group's queue between gate/up and down */
+            static std::atomic_flag noted_s2=ATOMIC_FLAG_INIT; /* host logging only */
+            if(!noted_s2.test_and_set(std::memory_order_relaxed))
+                std::fprintf(stderr,"[SYCL] fp8 group: the SiLU on the card with glibc's expf, a kernel between gate/up and down "
+                                    "(COLI_SYCL_SILU_CPU=2): no host round trip\n");
+            float *g=ctx->gate; const float *u=ctx->up; const size_t n=(size_t)total*I;
+            if(!cuda_ok(COLI_SYCL_TRY(ctx->stream->parallel_for(
+                    sycl::nd_range<3>(sycl::range<3>(1,1,((n+255)/256)*256),sycl::range<3>(1,1,256)),
+                    [=](sycl::nd_item<3>){silu_glibc_mul(g,u,n);})),"fp8 card SiLU"))return false;
         }
+        f8_down_launch(ctx,dev,I,D,count,cpu3,down2,cpu_order);
         return true;
     }
     dpct::dim3 hg((unsigned)I, (unsigned)max_rows, (unsigned)count),
@@ -3535,7 +3805,7 @@ static int expert_group_impl(ColiCudaTensor *const *gates,
           g_group_calls++; g_group_experts+=(uint64_t)count; g_group_rows+=(uint64_t)total; }
         return 1;
     }
-    DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
+    DeviceContext *ctx=find_ctx(device); if(!ctx||split_busy(ctx,"coli_cuda_expert_group")||!select_ctx(ctx)) return 0;
     if(!prepare_group_weights(ctx,gates,ups,downs,count,host)) return 0;
     size_t xb=(size_t)total*D*sizeof(float), ib=(size_t)total*I*sizeof(float);
     if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->y,&ctx->y_cap,xb)||
@@ -4036,6 +4306,7 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
     std::memcpy(ctx->host_x,x,xb);
     const size_t descb=(size_t)count*sizeof(GroupDesc);
     bool unwaited=false;   /* a failure past this copy drains the queue first (f8_async_drain) */
+    bool y_queued=false;   /* the result's download already queued by the group's second half (COLI_SYCL_F8_ASYNC_FINISH) */
     if (aw && reserve_pinned(&ctx->host_desc,&ctx->host_desc_cap,descb)) {
         /* from a page-locked copy, not waited (the take waits before the next issue reuses it) */
         std::memcpy(ctx->host_desc, host, descb);
@@ -4088,8 +4359,16 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
         }
     }else if(all_f8){
         /* fp8-e4m3 groups on the async decode path: same launch helper as the
-         * sync dispatch, silu fused in the dual epilogue. */
-        if(!f8_group_launch(ctx,(GroupDesc*)ctx->group_desc,I,D,max_rows,count,total)){ if(unwaited) f8_async_drain(ctx); return 0; }
+         * sync dispatch, silu fused in the dual epilogue. COLI_SYCL_F8_ASYNC_FINISH: with the host SiLU only
+         * the first half here, the rest (the download of the result too) on the card's finish thread. */
+        F8Finish fin{};
+        if(!f8_group_launch(ctx,(GroupDesc*)ctx->group_desc,I,D,max_rows,count,total,f8_async_finish_on()?&fin:nullptr)){ if(unwaited) f8_async_drain(ctx); return 0; }
+        if(fin.ctx){   /* the first half is out: the second on the card's finish thread, or here without one */
+            fin.xb=xb;
+            if(FinishWorker *fw=finish_worker(ctx)) finish_start(fw,fin);
+            else if(!f8_group_finish(fin)) return 0;   /* it drained the queue */
+            y_queued=true;
+        }
     }else if(group_moe_ok(host,count,total,D,I)){
         /* pin 1: the warp kernels at any row count, so 9..32 rows give the bits of the
          * same experts issued 8 rows at a time (the tensor-core family past
@@ -4300,9 +4579,9 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
                 });
             }
     }}
-    if (!cuda_ok(0, "expert group issue launch") ||
+    if (!y_queued && (!cuda_ok(0, "expert group issue launch") ||
         !cuda_ok(COLI_SYCL_TRY(ctx->stream->memcpy(ctx->host_y, ctx->y, xb)),
-                 "expert group issue download")) { if(unwaited) f8_async_drain(ctx); return 0; }
+                 "expert group issue download"))) { if(unwaited) f8_async_drain(ctx); return 0; }
     ctx->group_pending=1; ctx->group_pending_bytes=xb;
     { std::lock_guard<std::mutex> lock(g_group_stats_mu);
       int index=(int)(ctx-g_ctx);
@@ -4317,7 +4596,10 @@ extern "C" const float *coli_cuda_expert_group_take(int device) try {
     DeviceContext *ctx=find_ctx(device);
     if(!ctx||!ctx->group_pending) return nullptr;
     ctx->group_pending=0;
-    if(!select_ctx(ctx)) return nullptr;
+    /* COLI_SYCL_F8_ASYNC_FINISH: the group's second half first (it queued the result's download); a failure
+     * there drained the queue */
+    const bool finished=finish_join(ctx);
+    if(!select_ctx(ctx)||!finished) return nullptr;
     if (!cuda_ok(COLI_SYCL_TRY(ctx->stream->wait()),
                  "expert group take")) return nullptr;
     return ctx->host_y;
@@ -6912,9 +7194,14 @@ extern "C" int coli_cuda_pipe_silu_mul(int device,float *gate_dev,const float *u
     DeviceContext *ctx=find_ctx(device); if(!n||!select_ctx(ctx)) return 0;
     if(ctx->has_fp64 && f8_warp_mode() && cpu_silu_on()) {
         cpu_silu_note(2);
-        dq().parallel_for(sycl::nd_range<3>(sycl::range<3>(1,1,((n+255)/256)*256),
-                                          sycl::range<3>(1,1,256)),
-                         [=](sycl::nd_item<3>){silu_cpu_mul(gate_dev,up_dev,n);});
+        if(cpu_silu_mode()==2)
+            dq().parallel_for(sycl::nd_range<3>(sycl::range<3>(1,1,((n+255)/256)*256),
+                                              sycl::range<3>(1,1,256)),
+                             [=](sycl::nd_item<3>){silu_glibc_mul(gate_dev,up_dev,n);});
+        else
+            dq().parallel_for(sycl::nd_range<3>(sycl::range<3>(1,1,((n+255)/256)*256),
+                                              sycl::range<3>(1,1,256)),
+                             [=](sycl::nd_item<3>){silu_cpu_mul(gate_dev,up_dev,n);});
     } else dq().parallel_for(
         sycl::nd_range<3>(sycl::range<3>(1, 1, (unsigned)((n + 255) / 256)) *
                               sycl::range<3>(1, 1, 256),

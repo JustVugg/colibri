@@ -1261,6 +1261,7 @@ cu_tier.o: cu_tier.c vk_tier.c vk_tier.h cu_tier.h cu_tier_ops.h .build-config
 # sycl/<unit>.d (-MMD -MP: the host compile's includes, dpct's helpers and this directory's
 # among them), read back below, so an edit to any header a unit really includes rebuilds it.
 SYCL_HDR = sycl/coli_sycl.h sycl/coli_sycl_profile.h sycl/backend_sycl.h sycl/backend_gpu_compat.h sycl/cuda_bd.dp.hpp \
+           sycl/coli_silu_exact.hpp sycl/fp8_host_silu.h \
            backend_cuda.h cuda_chain.h cu_tier_ops.h fp8_format.h vk_alloc.h
 sycl/%.o: sycl/%.cpp $(SYCL_HDR) .build-config
 	@command -v "$(ICPX)" >/dev/null 2>&1 || { echo "icpx not found: source /opt/intel/oneapi/setvars.sh or set ICPX (SYCL=1)" >&2; exit 1; }
@@ -1714,6 +1715,15 @@ sycl/tests/test_qwen38_fp8_stages_hostlink.o: sycl/tests/test_qwen38_fp8_stages.
 	"$(ICPX)" $(ICPXFLAGS) -c $< -o $@
 sycl/tests/test_qwen38_fp8_stages_hostlink$(EXE): sycl/tests/test_qwen38_fp8_stages_hostlink.o $(SYCL_OBJ)
 	$(CC) $(CFLAGS) $< $(SYCL_OBJ) -o $@ $(LDFLAGS)
+# COLI_SYCL_SILU_CPU=2's exhaustive check (sycl/coli_silu_exact.hpp against the host's glibc expf and SiLU), linked
+# by GCC for the same reason; it needs no backend object, but its own kernels' device images: a -fsycl-link step of its
+# fat object, as $(SYCL_DEV_OBJ) is for the backend's (without it the first parallel_for finds no kernel)
+sycl/tests/test_sycl_silu_exact.o: sycl/tests/test_sycl_silu_exact.cpp sycl/coli_silu_exact.hpp sycl/fp8_host_silu.h
+	"$(ICPX)" $(ICPXFLAGS) -c $< -o $@
+sycl/tests/test_sycl_silu_exact_dev.o: sycl/tests/test_sycl_silu_exact.o
+	"$(ICPX)" $(SYCL_TARGET_FLAGS) -fPIE -fsycl-link $< -o $@
+sycl/tests/test_sycl_silu_exact$(EXE): sycl/tests/test_sycl_silu_exact.o sycl/tests/test_sycl_silu_exact_dev.o
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 endif
 sycl/tests/%$(EXE): sycl/tests/%.cpp $(SYCL_FAT_OBJ) $(SYCL_HDR) sycl/tests/sycl_test_args.h
 	"$(ICPX)" $(ICPXFLAGS) $< $(SYCL_FAT_OBJ) -o $@
@@ -3567,6 +3577,11 @@ tests/test_qwen36_tier_int4_arena$(EXE): tests/test_qwen36_tier_int4_arena.c qwe
 # an expert ONE copy of its slot (gate | up | down | scales) and three views, a swap into the victim's slot.
 tests/test_qwen36_tier_fp8_arena$(EXE): tests/test_qwen36_tier_fp8_arena.c qwen36_tier.c
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Qwen3.8's Q38_PREFILL_GPU_PERCARD placement (qwen38_pg.h): an equal part of the cards' share a card, the workers'
+# ranges of the grouped list.
+tests/test_qwen38_pg_percard$(EXE): tests/test_qwen38_pg_percard.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 # Same fake backend: the automatic placement (COLI_PLACE unset/"auto") puts
 # the offered dense trunk into VRAM by bytes-saved-per-byte, prices displaced

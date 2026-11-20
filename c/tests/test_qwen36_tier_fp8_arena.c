@@ -23,6 +23,14 @@ static void check(int ok, const char *what) {
     if (!ok) { printf("  FAIL: %s\n", what); fails++; }
 }
 
+/* a prompt group on another thread (qt_prefill_group: one expert of layer 0, one row) */
+typedef struct { int eid, ok; float *x, *y; } PgJob;
+static void *pg_job(void *arg) {
+    PgJob *j = (PgJob *)arg; const int rows[1] = {1};
+    j->ok = qt_prefill_group(0, &j->eid, rows, 1, j->x, j->y);
+    return NULL;
+}
+
 enum { NL = 2, NE = 16, D = 256, IH = 128, CAP = 4, TOPK = 2, R = 3,
        MB = D * IH,                                      /* a matrix, a byte an element: 32768 */
        NSC = ((IH + 127) / 128) * ((D + 127) / 128) };   /* block scales a matrix: 2 */
@@ -106,6 +114,7 @@ static void set_budget(size_t per) {   /* an allowance for exactly R experts of 
 static void reset_counts(void) {
     fake_uploads = fake_overwrites = fake_pipe_uploads = fake_f8_views = fake_tensor_frees = 0;
     fake_pipe_allocs = fake_pipe_frees = fake_host_allocs = 0; fake_pipe_upload_bytes = 0;
+    fake_pipe_upload_foreign = 0; memset(fake_pipe_upload_staged, 0, sizeof fake_pipe_upload_staged); fake_host_alloc_mask = 0;
 }
 
 #define CHECK(c, what) do { snprintf(m, sizeof m, "%s: %s", mode, what); check((c), m); } while (0)
@@ -120,7 +129,7 @@ static void run(const char *mode, int arena, int pool, uint64_t dig[4]) {
     if (!qt_init_fp8(NL, NE, D, IH, CAP, TOPK, lut)) { CHECK(0, "the tier starts"); return; }
     CHECK(G.wfmt == 8 && qt_streaming(), "format 8, copy mode");
     if (!arena) {
-        CHECK(!G_nat_arena && !G_arena_on && !G_arena[0] && !G_stg, "no arena and no pool without the switch");
+        CHECK(!G_nat_arena && !G_arena_on && !G_arena[0] && !G_stg[0], "no arena and no pool without the switch");
         CHECK(G.exp_bytes == off_bytes(), "an expert budgeted at its six device allocations, as before");
         CHECK(fake_pipe_allocs == 0 && fake_f8_views == 0 && fake_host_allocs == 0, "nothing allocated, no view asked for");
     } else {
@@ -130,8 +139,8 @@ static void run(const char *mode, int arena, int pool, uint64_t dig[4]) {
         CHECK(G_aslots[0] == R && G_anfree[0] == R, "as many slots as the budget holds, all free");
         CHECK(fake_pipe_allocs == 1, "one device allocation: the arena");
         CHECK(fake_f8_views == 1 && fake_tensor_frees == 1, "the backend's view asked for once, and released");
-        if (pool) CHECK(G_stg && fake_host_allocs == 1 && G_stg_nfree == QT_STG_N, "the page-locked pool is up, full");
-        else CHECK(!G_stg && fake_host_allocs == 0, "no page-locked pool at 1");
+        if (pool) CHECK(G_stg[0] && fake_host_allocs == 1 && G_stg_nfree[0] == QT_STG_N, "the page-locked pool is up, full");
+        else CHECK(!G_stg[0] && fake_host_allocs == 0, "no page-locked pool at 1");
     }
     const int v0 = fake_f8_views, f0 = fake_tensor_frees;
 
@@ -146,7 +155,7 @@ static void run(const char *mode, int arena, int pool, uint64_t dig[4]) {
         CHECK(a >= 0 && b >= 0 && c >= 0 && a != b && a != c && b != c, "every expert in a slot of its own");
         CHECK(G_anfree[0] == 0 && fake_pipe_allocs == 1, "no free slot left, still one device allocation");
         CHECK(slot_ok(0, 5) && slot_ok(0, 6) && slot_ok(1, 7), "a slot holds the engine's bytes, the views point into it, its padding is zero");
-        if (pool) CHECK(G_stg_used == (unsigned long long)R && G_stg_nfree == QT_STG_N, "every expert staged through the pool, every buffer back");
+        if (pool) CHECK(G_stg_used == (unsigned long long)R && G_stg_nfree[0] == QT_STG_N, "every expert staged through the pool, every buffer back");
         else CHECK(G_stg_used == 0, "none through a pool at 1");
     }
     CHECK(shapes_ok(0, 5) && shapes_ok(1, 7), "the tensors carry format 8 and the shapes");
@@ -217,7 +226,7 @@ static void run(const char *mode, int arena, int pool, uint64_t dig[4]) {
         CHECK(fake_pipe_uploads == R + 1 && fake_pipe_upload_bytes == (size_t)(R + 1) * G_aslot, "the swap is ONE copy of the slot");
         CHECK(fake_f8_views == v0 + 3 * (R + 1) && fake_tensor_frees == f0 + 3, "the victim's three views released once, three made");
         CHECK(slot_ok(0, 9) && slot_ok(0, 6) && slot_ok(1, 7), "the slot holds the newcomer; the others' slots are as they were");
-        if (pool) CHECK(G_stg_used == (unsigned long long)(R + 1) && G_stg_nfree == QT_STG_N, "the swap staged through the pool too, every buffer back");
+        if (pool) CHECK(G_stg_used == (unsigned long long)(R + 1) && G_stg_nfree[0] == QT_STG_N, "the swap staged through the pool too, every buffer back");
     }
     dig[3] = dev_digest(0, 9);
     CHECK(dig[3] == src_digest(0, 9), "the device holds the newcomer's bytes");
@@ -225,7 +234,7 @@ static void run(const char *mode, int arena, int pool, uint64_t dig[4]) {
 
     qt_shutdown();
     if (arena) {
-        CHECK(!G_arena_on && !G_arena[0] && !G_stg, "shutdown releases the arena and the pool");
+        CHECK(!G_arena_on && !G_arena[0] && !G_stg[0], "shutdown releases the arena and the pool");
         CHECK(fake_pipe_allocs == 1 && fake_pipe_frees == 1, "the arena freed once");
         CHECK(fake_tensor_frees == fake_f8_views, "every view released exactly once");
     } else CHECK(fake_tensor_frees == fake_uploads, "every tensor released exactly once");
@@ -260,7 +269,7 @@ int main(void) {
     fake_alloc_fail = 0;
     CHECK(up, "the tier starts all the same");
     if (up) {
-        CHECK(!G_nat_arena && !G_arena_on && !G_stg && fake_host_allocs == 0, "no arena, no pool");
+        CHECK(!G_nat_arena && !G_arena_on && !G_stg[0] && fake_host_allocs == 0, "no arena, no pool");
         CHECK(G.exp_bytes == off_bytes(), "an expert budgeted at its device allocations again");
         note(0, 1);
         CHECK(qt_is_resident(0, 1) && fake_uploads == 3 && fake_pipe_uploads == 0 && fake_f8_views == 0, "three uploads an expert, no slot");
@@ -275,7 +284,7 @@ int main(void) {
     up = qt_init_fp8(NL, NE, D, IH, CAP, TOPK, lut);
     CHECK(up, "the tier starts all the same");
     if (up) {
-        CHECK(!G_nat_arena && !G_arena_on && !G_arena[0] && !G_stg, "the arena is given back, no pool");
+        CHECK(!G_nat_arena && !G_arena_on && !G_arena[0] && !G_stg[0], "the arena is given back, no pool");
         CHECK(fake_pipe_allocs == 1 && fake_pipe_frees == 1 && fake_host_allocs == 0, "allocated once, freed once, no page-locked block");
         CHECK(G.exp_bytes == off_bytes(), "an expert budgeted at its device allocations again");
         note(0, 2);
@@ -293,13 +302,107 @@ int main(void) {
     fake_host_alloc_fail = 0;
     CHECK(up, "the tier starts");
     if (up) {
-        CHECK(G_nat_arena && G_arena_on && !G_stg, "the arena stays, without the pool");
+        CHECK(G_nat_arena && G_arena_on && !G_stg[0], "the arena stays, without the pool");
         note(0, 3);
         CHECK(qt_is_resident(0, 3) && fake_uploads == 0 && fake_pipe_uploads == 1 && fake_pipe_upload_bytes == G_aslot, "still one copy of the slot, from one malloc'd block");
         CHECK(slot_ok(0, 3) && G_stg_used == 0, "the slot holds the engine's bytes");
         qt_shutdown();
         CHECK(fake_tensor_frees == fake_f8_views && fake_pipe_frees == 1, "every view and the arena released once");
     }
+
+    printf(" two cards\n"); mode = "two cards";
+    /* the page-locked staging a card (until 2026-11-19 two cards had no pool: every upload staged in pageable memory
+     * under the lock): each card's pool from its own context, an expert staged in its home card's pool, every
+     * buffer back in the pool it came from, both pools returned at the shutdown */
+    setenv("COLI_CUDA_EXPERT_ARENA", "2", 1); setenv("COLI_GPUS", "0,1", 1); fake_ndev = 2;
+    set_budget(slot_bytes()); reset_counts();
+    up = qt_init_fp8(NL, NE, D, IH, CAP, TOPK, lut);
+    CHECK(up && G.ndev == 2, "the tier starts on two cards");
+    if (up) {
+        CHECK(G_nat_arena && G_arena_on && G_arena[0] && G_arena[1], "an arena a card");
+        CHECK(G_stg[0] && G_stg[1] && G_stg[0] != G_stg[1] && fake_host_allocs == 2, "two page-locked pools, one a card");
+        CHECK(G_stg_dev[0] == G.dev[0] && G_stg_dev[1] == G.dev[1], "each pool recorded with its card");
+        CHECK(fake_host_alloc_mask == ((1u << G.dev[0]) | (1u << G.dev[1])) &&
+              fake_block_device(G_stg[0], 1) == G.dev[0] && fake_block_device(G_stg[1], 1) == G.dev[1],
+              "each pool page-locked for its own card (as the backend was asked)");
+        CHECK(G_stg_nfree[0] == QT_STG_N && G_stg_nfree[1] == QT_STG_N, "both full");
+        uint8_t *a = qt_stg_take(0), *b = qt_stg_take(1);
+        CHECK(a && b && qt_stg_owner(a) == 0 && qt_stg_owner(b) == 1, "a buffer from each card's pool, its pool known");
+        CHECK(G_stg_nfree[0] == QT_STG_N - 1 && G_stg_nfree[1] == QT_STG_N - 1, "one out of each");
+        qt_stg_release(b, (float *)(b + G_aoff_s)); qt_stg_release(a, (float *)(a + G_aoff_s));
+        CHECK(G_stg_nfree[0] == QT_STG_N && G_stg_nfree[1] == QT_STG_N, "each back in its own pool");
+        CHECK(qt_stg_take(2) == NULL && qt_stg_take(-1) == NULL && qt_stg_take(QT_MAX_DEV) == NULL, "no pool past the cards");
+        int e0 = -1, e1 = -1;
+        pthread_mutex_lock(&G.mx);
+        for (int e = 0; e < NE && (e0 < 0 || e1 < 0); e++) {
+            const int h = home2(0, e);
+            if (h == 0 && e0 < 0) e0 = e;
+            if (h == 1 && e1 < 0) e1 = e;
+        }
+        pthread_mutex_unlock(&G.mx);
+        CHECK(e0 >= 0 && e1 >= 0, "experts homed on each card");
+        if (e0 >= 0 && e1 >= 0) {
+            const unsigned long long u0 = G_stg_used;
+            const int s0 = fake_pipe_upload_staged[G.dev[0]], s1 = fake_pipe_upload_staged[G.dev[1]];
+            note(0, e0); note(0, e1);
+            CHECK(qt_is_resident(0, e0) && qt_is_resident(0, e1), "both resident");
+            CHECK(qt_resident_home(0, e0) == 0 && qt_resident_home(0, e1) == 1, "each on its home card");
+            CHECK(G_stg_used == u0 + 2, "both staged through a pool");
+            CHECK(fake_pipe_upload_staged[G.dev[0]] == s0 + 1 && fake_pipe_upload_staged[G.dev[1]] == s1 + 1 &&
+                  fake_pipe_upload_foreign == 0, "each card's copy from its own staging into its own arena");
+            CHECK(G_stg_nfree[0] == QT_STG_N && G_stg_nfree[1] == QT_STG_N, "every buffer back in its own pool");
+            CHECK(dev_digest(0, e0) == src_digest(0, e0) && dev_digest(0, e1) == src_digest(0, e1), "each card holds its expert's bytes");
+            /* qt_split_report (qwen38's Q38_TIER_REPORT): a card's resident experts, and in each layer */
+            FILE *tf = tmpfile();
+            CHECK(tf != NULL, "a temporary file for the report");
+            if (tf) {
+                qt_split_report_to(tf, "test");
+                rewind(tf); char buf[4096]; size_t n = fread(buf, 1, sizeof buf - 1, tf); buf[n] = 0; fclose(tf);
+                char want[160];
+                snprintf(want, sizeof want, "[qtier] split test: 2 of %d experts on the cards", NL * NE);
+                CHECK(strstr(buf, want) != NULL, "the report counts the two residents");
+                snprintf(want, sizeof want, "dev %d: 1 experts resident", G.dev[0]);
+                CHECK(strstr(buf, want) != NULL, "one on the first card");
+                snprintf(want, sizeof want, "dev %d: 1 experts resident", G.dev[1]);
+                CHECK(strstr(buf, want) != NULL, "one on the second card");
+                snprintf(want, sizeof want, "dev %d per layer: 1 0\n", G.dev[0]);
+                CHECK(strstr(buf, want) != NULL, "the first card's in layer 0, none in layer 1");
+                snprintf(want, sizeof want, "dev %d per layer: 1 0\n", G.dev[1]);
+                CHECK(strstr(buf, want) != NULL, "the second card's in layer 0, none in layer 1");
+            }
+            /* qt_prefill_group from two threads, a card each (Q38_PREFILL_GPU_PERCARD's workers): both admitted and
+             * running at once; a second group on a busy card refused, the other card's admitted meanwhile */
+            static float px0[D], py0[D], px1[D], py1[D];
+            PgJob a = {e0, -1, px0, py0}, b = {e1, -1, px1, py1};
+            pthread_t ta, tb;
+            fake_group_sleep_ms = 40; fake_group_max_inflight = 0;
+            pthread_create(&ta, NULL, pg_job, &a); pthread_create(&tb, NULL, pg_job, &b);
+            pthread_join(ta, NULL); pthread_join(tb, NULL);
+            CHECK(a.ok == 1 && b.ok == 1, "a group a card from two threads: both admitted");
+            CHECK(fake_group_max_inflight == 2, "the two cards' groups ran at once");
+            CHECK(G.pg_open == 0 && !G.pg_dev_open[0] && !G.pg_dev_open[1], "no group left open");
+            fake_group_sleep_ms = 200; fake_group_max_inflight = 0;
+            PgJob c = {e0, -1, px0, py0};
+            pthread_create(&ta, NULL, pg_job, &c);
+            for (int i = 0; i < 400; i++) {   /* until card 0's group is in flight */
+                pthread_mutex_lock(&fake_group_mx); const int fl = fake_group_inflight; pthread_mutex_unlock(&fake_group_mx);
+                if (fl) break;
+                struct timespec ts = {0, 1000000}; nanosleep(&ts, NULL);
+            }
+            const int rows1[1] = {1};
+            pthread_mutex_lock(&fake_group_mx);
+            fake_group_sleep_ms = 0;   /* the calls below return at once (the one in flight read its 200 ms) */
+            pthread_mutex_unlock(&fake_group_mx);
+            CHECK(qt_prefill_group(0, &e0, rows1, 1, px1, py1) == 0, "a second group on a busy card: refused");
+            CHECK(qt_prefill_group(0, &e1, rows1, 1, px1, py1) == 1, "the other card's group meanwhile: admitted");
+            pthread_join(ta, NULL);
+            CHECK(c.ok == 1 && G.pg_open == 0, "the busy card's group ended, nothing left open");
+        }
+        const int hf = fake_host_frees;
+        qt_shutdown();
+        CHECK(!G_stg[0] && !G_stg[1] && fake_host_frees == hf + 2, "the shutdown returns both pools");
+    }
+    setenv("COLI_GPUS", "0", 1); fake_ndev = 1;
 
     unsetenv("COLI_CUDA_EXPERT_ARENA");
     if (fails) { printf("test_qwen36_tier_fp8_arena: %d failure(s)\n", fails); return 1; }

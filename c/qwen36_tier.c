@@ -76,6 +76,8 @@ static struct {
     int *fill_order; int fill_cur;        /* warmstart order (heat desc) */
     uint8_t *off;                         /* layers without experts (qt_layer_off): never planned */
     int issue_open;                       /* guard: no tensor_free while a group is in flight */
+    int pg_open;                          /* prompt groups in flight (qt_prefill_group): no tensor_free either */
+    uint8_t pg_dev_open[QT_MAX_DEV];      /* ... at most one a card, several cards at once */
     pthread_cond_t cv_take;               /* signals qt_take done + queue space */
     uint64_t tick, swaps, inplace, pf_hits, pf_notes;
     uint32_t *heat0;                      /* heat table loaded from HEAT_FILE */
@@ -168,48 +170,63 @@ static size_t G_aoff_s;
  * at 2 (swaps too: copy mode stages every expert in enqueue_locked) or one malloc. */
 static int qt_f8_slotted(void){ return G_nat_arena && G.wfmt==8; }
 /* COLI_CUDA_EXPERT_ARENA=2: the warm start's staging in page-locked host memory as well, and outside the lock.
- * A pool of QT_STG_N buffers of a slot's layout (coli_cuda_host_alloc: host USM), so the copy to the card is
- * the device's own: from pageable memory it passed through a copy on the uploader's thread, about 7 GB/s
- * whatever the size of a call. And enqueue_staged repacks an expert with G.mx released, where enqueue_locked
- * stages one expert at a time under it (more loader threads then only added contention: 3.9 s with 16,
- * 7.6 s with 32, 12.0 s with 64 on a Max 1100). One device only; a buffer the pool cannot give, and every
- * swap, stage as before. */
+ * A pool of QT_STG_N buffers of a slot's layout a device (coli_cuda_host_alloc: host USM in that device's context),
+ * so the copy to the card is the device's own: from pageable memory it passed through a copy on the uploader's
+ * thread, about 7 GB/s whatever the size of a call. An expert stages in the pool of its home device (home2): each
+ * card has a context of its own, and a pool is page-locked for its own card. And enqueue_staged repacks an expert
+ * with G.mx released, where enqueue_locked stages one expert at a time under it (more loader threads then only
+ * added contention: 3.9 s with 16, 7.6 s with 32, 12.0 s with 64 on a Max 1100). A buffer its pool cannot give,
+ * and every swap without one, stage as before. (Until 2026-11-19 one pool for one device only: with two cards
+ * every upload staged in pageable memory under the lock, campaign pair1.) */
 #define QT_STG_N (QT_QCAP + 1 + 64)
-static uint8_t *G_stg;
-static size_t G_stg_sz;                 /* the pool's buffer size (G_aslot when it was made: a later tier may differ) */
-static int G_stg_free[QT_STG_N], G_stg_nfree, G_stg_dev = -1, G_stg_want;
-static int G_stg_closing;               /* qt_stg_down found buffers out: the pool is kept, none handed out */
-static unsigned long long G_stg_used;   /* experts staged through the pool (tests, the summary) */
+static uint8_t *G_stg[QT_MAX_DEV];
+static size_t G_stg_sz[QT_MAX_DEV];     /* a pool's buffer size (G_aslot when it was made: a later tier may differ) */
+static int G_stg_free[QT_MAX_DEV][QT_STG_N], G_stg_nfree[QT_MAX_DEV], G_stg_dev[QT_MAX_DEV], G_stg_want;
+static int G_stg_closing[QT_MAX_DEV];   /* qt_stg_down found buffers out: the pool is kept, none handed out */
+static unsigned long long G_stg_used;   /* experts staged through the pools (tests, the summary) */
 static pthread_mutex_t G_stg_mx = PTHREAD_MUTEX_INITIALIZER;
-static int qt_stg_owns(const void *w){
-    return G_stg && (const uint8_t *)w >= G_stg && (const uint8_t *)w < G_stg + (size_t)QT_STG_N*G_stg_sz;
+static int qt_stg_any(void){ for(int i=0;i<QT_MAX_DEV;i++) if(G_stg[i]) return 1; return 0; }
+/* the pool a buffer is from, -1 none (G_stg_mx held where the pools may change) */
+static int qt_stg_owner(const void *w){
+    for(int i=0;i<QT_MAX_DEV;i++)
+        if(G_stg[i] && (const uint8_t *)w >= G_stg[i] && (const uint8_t *)w < G_stg[i] + (size_t)QT_STG_N*G_stg_sz[i]) return i;
+    return -1;
 }
-static uint8_t *qt_stg_take(void){
+static int qt_stg_owns(const void *w){ return qt_stg_owner(w) >= 0; }
+/* a buffer from home device hd's pool; NULL when it has none, is closing or has every buffer out */
+static uint8_t *qt_stg_take(int hd){
     uint8_t *b=NULL;
+    if(hd<0||hd>=QT_MAX_DEV) return NULL;
     pthread_mutex_lock(&G_stg_mx);
-    if(G_stg && !G_stg_closing && G_stg_nfree>0){ b=G_stg + (size_t)G_stg_free[--G_stg_nfree]*G_stg_sz; G_stg_used++; }
+    if(G_stg[hd] && !G_stg_closing[hd] && G_stg_nfree[hd]>0){
+        b=G_stg[hd] + (size_t)G_stg_free[hd][--G_stg_nfree[hd]]*G_stg_sz[hd]; G_stg_used++;
+    }
     pthread_mutex_unlock(&G_stg_mx);
     return b;
 }
-/* an expert's staging back: the pool's buffer to the pool (its scales are inside it), malloc's to free */
+/* an expert's staging back: a pool's buffer to its pool (its scales are inside it), malloc's to free */
 static void qt_stg_release(uint8_t *w, float *sc){
-    if(qt_stg_owns(w)){
-        pthread_mutex_lock(&G_stg_mx);
-        G_stg_free[G_stg_nfree++]=(int)((size_t)(w - G_stg)/G_stg_sz);
-        pthread_mutex_unlock(&G_stg_mx);
-    } else if(qt_f8_slotted()) free(w);   /* one block of a slot's layout: the scales are inside it */
+    pthread_mutex_lock(&G_stg_mx);
+    const int o=qt_stg_owner(w);
+    if(o>=0) G_stg_free[o][G_stg_nfree[o]++]=(int)((size_t)(w - G_stg[o])/G_stg_sz[o]);
+    pthread_mutex_unlock(&G_stg_mx);
+    if(o>=0) return;
+    if(qt_f8_slotted()) free(w);   /* one block of a slot's layout: the scales are inside it */
     else { free(w); free(sc); }
 }
-/* the pool back to the device -- unless a buffer is still out. qt_shutdown first waits for the threads staging
- * an expert outside the tier's lock (enqueue_staged counts them in G.waiters), so a buffer still out then is one
- * nobody is writing; it is kept all the same: no buffer is handed out from now on, a release still lands in it,
- * the device stays open for it (qt_shutdown), and the next qt_init or the process's exit returns it. */
+/* the pools back to their devices -- each unless a buffer of it is still out. qt_shutdown first waits for the
+ * threads staging an expert outside the tier's lock (enqueue_staged counts them in G.waiters), so a buffer still
+ * out then is one nobody is writing; its pool is kept all the same: no buffer is handed out from it from now on,
+ * a release still lands in it, the devices stay open for it (qt_shutdown), and the next qt_init or the process's
+ * exit returns it. */
 static void qt_stg_down(void){
     pthread_mutex_lock(&G_stg_mx);
-    if(G_stg && G_stg_nfree<QT_STG_N) G_stg_closing=1;
-    else {
-        if(G_stg) coli_cuda_host_free(G_stg_dev, G_stg);
-        G_stg=NULL; G_stg_nfree=0; G_stg_dev=-1; G_stg_closing=0;
+    for(int i=0;i<QT_MAX_DEV;i++){
+        if(G_stg[i] && G_stg_nfree[i]<QT_STG_N) G_stg_closing[i]=1;
+        else {
+            if(G_stg[i]) coli_cuda_host_free(G_stg_dev[i], G_stg[i]);
+            G_stg[i]=NULL; G_stg_nfree[i]=0; G_stg_dev[i]=-1; G_stg_closing[i]=0;
+        }
     }
     pthread_mutex_unlock(&G_stg_mx);
 }
@@ -422,9 +439,9 @@ static void *uploader(void *arg){
         }
         if(ve>=0){
             /* LFRU swap: touch the victim only when no group and no chain forward is in flight */
-            while((G.issue_open||G.chain_hold) && !G.th_stop) wait_take_locked();
+            while((G.issue_open||G.pg_open||G.chain_hold) && !G.th_stop) wait_take_locked();
             QSlot *v=qs(vl,ve);
-            if(G.th_stop && (G.issue_open||G.chain_hold)){
+            if(G.th_stop && (G.issue_open||G.pg_open||G.chain_hold)){
                 /* Shutting down with a group still open: qt_take() -- the only
                  * thing that clears issue_open -- will never come. Abandon
                  * this swap instead of freeing a victim tensor the in-flight
@@ -1370,18 +1387,23 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
         }
         if(pv) coli_cuda_tensor_free(pv);
     }
-    if(G_nat_arena && G_arena_on && G_stg_want){   /* the page-locked staging pool, one device */
-        if(G_stg) qt_stg_down();   /* an earlier tier's kept pool: returned now if every buffer came back */
-        if(G_stg) fprintf(stderr,"[qtier] no page-locked staging: an earlier tier's pool still has buffers out\n");
-        else if(G.ndev==1 && (G_stg=coli_cuda_host_alloc(G.dev[0], (size_t)QT_STG_N*G_aslot))){
-            for(int k=0;k<QT_STG_N;k++) G_stg_free[k]=QT_STG_N-1-k;
-            G_stg_nfree=QT_STG_N; G_stg_dev=G.dev[0]; G_stg_sz=G_aslot;
-            fprintf(stderr,"[qtier] dev %d: page-locked staging for the experts' uploads, %d buffers (%.0f MiB); %s\n",
-                    G.dev[0], QT_STG_N, (double)QT_STG_N*G_aslot/1048576.0,
-                    G.wfmt==8 ? "an fp8 expert is copied into one as it passes and goes to the card in one copy"
-                              : "an expert is repacked outside the lock");
-        } else fprintf(stderr,"[qtier] no page-locked staging (%s): the experts' uploads stage in pageable memory, under the lock\n",
-                       G.ndev==1 ? "the device refused it" : "more than one device");
+    if(G_nat_arena && G_arena_on && G_stg_want){   /* the page-locked staging pools, one a device */
+        qt_stg_down();   /* an earlier tier's kept pools: returned now where every buffer came back */
+        for(int i=0;i<G.ndev;i++){
+            if(G_stg[i]){
+                fprintf(stderr,"[qtier] dev %d: no page-locked staging: an earlier tier's pool still has buffers out\n",G.dev[i]);
+                continue;
+            }
+            if((G_stg[i]=coli_cuda_host_alloc(G.dev[i], (size_t)QT_STG_N*G_aslot))){
+                for(int k=0;k<QT_STG_N;k++) G_stg_free[i][k]=QT_STG_N-1-k;
+                G_stg_nfree[i]=QT_STG_N; G_stg_dev[i]=G.dev[i]; G_stg_sz[i]=G_aslot;
+                fprintf(stderr,"[qtier] dev %d: page-locked staging for the experts' uploads, %d buffers (%.0f MiB); %s\n",
+                        G.dev[i], QT_STG_N, (double)QT_STG_N*G_aslot/1048576.0,
+                        G.wfmt==8 ? "an fp8 expert is copied into one as it passes and goes to the card in one copy"
+                                  : "an expert is repacked outside the lock");
+            } else fprintf(stderr,"[qtier] dev %d: no page-locked staging (the device refused it): its experts' uploads stage in pageable memory, under the lock\n",
+                           G.dev[i]);
+        }
     }
     if(G.wfmt==QT_GGUF && G.exp_bytes==G_aslot && !G_trunk_only && !qt_arena_up()){
         /* no arena: an expert costs what three cudaMallocs take */
@@ -2190,8 +2212,10 @@ int qt_resident_home(int layer,int eid){
 /* A prompt chunk's resident experts computed on the card (Qwen3.8's Q38_PREFILL_GPU): n experts of `layer` (up to 64,
  * the backend's group), rows[i] rows each, their inputs in x expert by expert, the outputs into y the same way.
  * Synchronous, from any thread. Every expert must be resident on one device now, else 0 and nothing is computed (the
- * caller runs them on the CPU). No heat, hit or tick: a prompt pass does not move the tier. Holds issue_open as a
- * decode group does, so no swap frees a tensor meanwhile; refused while a decode group is open. */
+ * caller runs them on the CPU). No heat, hit or tick: a prompt pass does not move the tier. Counted in pg_open while
+ * it runs, so no swap frees a tensor meanwhile; one group a card at a time, the cards at once (Q38_PREFILL_GPU_PERCARD's
+ * workers: until 2026-11-20 a single issue_open refused the second card's group outright); refused while a decode
+ * group is open, or while another prompt group runs on the same card (the backend's buffers are the card's). */
 int qt_prefill_group(int layer,const int *eids,const int *rows,int n,const float *x,float *y){
     if(!G.on || G_chain_own || G_trunk_only || n<1 || n>64 || layer<0 || layer>=G.nl || !eids || !rows || !x || !y) return 0;
     ColiCudaTensor *tg[64],*tu[64],*td[64]; int dev=-1;
@@ -2203,12 +2227,13 @@ int qt_prefill_group(int layer,const int *eids,const int *rows,int n,const float
         if(!s->resident || !s->tg || !s->tu || !s->td || (dev>=0 && di!=dev)){ pthread_mutex_unlock(&G.mx); return 0; }
         dev=di; tg[i]=s->tg; tu[i]=s->tu; td[i]=s->td;
     }
-    G.issue_open=1;
+    if(dev<0 || dev>=QT_MAX_DEV || G.pg_dev_open[dev]){ pthread_mutex_unlock(&G.mx); return 0; }   /* that card is busy */
+    G.pg_open++; G.pg_dev_open[dev]=1;
     pthread_mutex_unlock(&G.mx);
     const int ok=coli_cuda_expert_group(tg,tu,td,rows,n,y,x);
     pthread_mutex_lock(&G.mx);
-    G.issue_open=0;
-    pthread_cond_broadcast(&G.cv_take);   /* a swap parked on issue_open */
+    G.pg_open--; G.pg_dev_open[dev]=0;
+    pthread_cond_broadcast(&G.cv_take);   /* a swap or a decode group parked on pg_open */
     pthread_mutex_unlock(&G.mx);
     return ok;
 }
@@ -2232,7 +2257,7 @@ static int enqueue_locked(int layer,int eid,int v_layer,int v_eid,int reserved){
         /* ONE block of a slot's layout (gate | up | down, the scales from G_aoff_s), which the uploader
          * hands to the device in one copy: from the page-locked pool at 2, a swap's too; else malloc's */
         const size_t nsb=(2*G.sc_gu+G.sc_d)*sizeof(float);
-        w=qt_stg_take();
+        w=qt_stg_take(hd);
         if(!w) w=malloc(G_aslot);
         if(!w) return 0;
         sc=(float *)(w+G_aoff_s);
@@ -2261,7 +2286,7 @@ static int enqueue_staged(int layer,int eid,int reserved){
     if(s->resident||s->queued||!s->g4) return 0;
     int hd=home2(layer,eid);
     if(!reserved && G.used[hd]+qt_ebytes(layer)>G.budget[hd]) return 0;
-    uint8_t *w=qt_stg_take();
+    uint8_t *w=qt_stg_take(hd);
     if(!w) return enqueue_locked(layer,eid,-1,-1,reserved);   /* every buffer is out: the old way for this one */
     float *sc=(float *)(w+G_aoff_s);
     if(!reserved) G.used[hd]+=qt_ebytes(layer);
@@ -2396,7 +2421,7 @@ void qt_note_block(int layer,int eid,
     if(G_stream) stream_point(s,g4,u4,d4,gs,us,ds);
     else if(!s->g4){ s->g4=g4; s->u4=u4; s->d4=d4; s->gs=gs; s->us=us; s->ds=ds; }
     while(G.qn>=QT_QCAP && !G.th_stop) wait_take_locked();
-    if(G_stg && !G_stream) enqueue_staged(layer,eid,0);
+    if(qt_stg_any() && !G_stream) enqueue_staged(layer,eid,0);
     else enqueue_locked(layer,eid,-1,-1,0);
     if(G_stream) stream_forget(s);
     pthread_mutex_unlock(&G.mx);
@@ -2505,7 +2530,7 @@ void qt_note_planned(int layer,int eid,
     if(G_stream) stream_point(s,g4,u4,d4,gs,us,ds);
     else if(!s->g4){ s->g4=g4; s->u4=u4; s->d4=d4; s->gs=gs; s->us=us; s->ds=ds; }
     while(G.qn>=QT_QCAP && !G.th_stop) wait_take_locked();
-    if(!(G_stg && !G_stream ? enqueue_staged(layer,eid,1) : enqueue_locked(layer,eid,-1,-1,1))){
+    if(!(qt_stg_any() && !G_stream ? enqueue_staged(layer,eid,1) : enqueue_locked(layer,eid,-1,-1,1))){
         /* not enqueueable (e.g. already resident): return the reservation */
         if(s->planned) G.used[home2(layer,eid)]-=qt_ebytes(layer);
     }
@@ -2708,6 +2733,8 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
      * six entries still queued). No group is open here, so the wait cannot
      * meet a swap parked on issue_open. */
     if(G_upload_sync) while(G.inflight>0 && !G.th_stop) wait_take_locked();
+    /* a decode group never overlaps a prompt group (the engine joins its prompt workers first; this keeps it so) */
+    while(G.pg_open>0 && !G.th_stop) wait_take_locked();
     if(G.th_stop){ pthread_mutex_unlock(&G.mx); return 0; }
     if(layer==0) qt_lfru_tick_locked();
     G.issue_open=1;
@@ -2845,6 +2872,44 @@ void qt_stats(void){
               (unsigned long long)calls,(unsigned long long)ex,h2d,kms,d2h); }
 }
 
+/* Where the experts are (qwen38's serve mode calls it after each request and at the end with Q38_TIER_REPORT=1): a
+ * line for the tier, a line a card (its resident experts, its arena's slots and how many are free, the expert runs it
+ * served), and a line a card with its resident experts in each layer. The counts are taken under the tier's lock, so
+ * the residency is one moment's. It only reads. (qt_split_report_to: the same into a given file, for the tests.) */
+static void qt_split_report_to(FILE *f, const char *scope){
+    if(!G.on||!f) return;
+    enum { QT_REP_NL = 128 };
+    size_t res[QT_MAX_DEV]={0}; uint16_t per[QT_MAX_DEV][QT_REP_NL];
+    uint64_t hits[QT_MAX_DEV]={0}, miss, uploads, swaps; int nfree[QT_MAX_DEV]={0}, nslot[QT_MAX_DEV]={0};
+    const int nl=G.nl<QT_REP_NL?G.nl:QT_REP_NL;
+    memset(per,0,sizeof per);
+    pthread_mutex_lock(&G.mx);
+    for(int l=0;l<G.nl;l++) for(int e=0;e<G.ne;e++){
+        if(!qs(l,e)->resident) continue;
+        const int di=home2(l,e);
+        if(di<0||di>=G.ndev) continue;
+        res[di]++; if(l<nl) per[di][l]++;
+    }
+    for(int i=0;i<G.ndev;i++){ hits[i]=G.hits[i]; nfree[i]=G_anfree[i]; nslot[i]=G_aslots[i]; }
+    miss=G.miss; uploads=G.uploads; swaps=G.swaps;
+    pthread_mutex_unlock(&G.mx);
+    size_t all=0; uint64_t hall=0;
+    for(int i=0;i<G.ndev;i++){ all+=res[i]; hall+=hits[i]; }
+    const double eb=(double)(G_arena_on&&G_aslot?G_aslot:G.exp_bytes);
+    fprintf(f,"[qtier] split %s: %zu of %d experts on the cards | expert runs: %llu on the cards, %llu on the CPU "
+              "| uploads %llu | swaps %llu\n", scope?scope:"", all, G.nl*G.ne, (unsigned long long)hall,
+            (unsigned long long)miss, (unsigned long long)uploads, (unsigned long long)swaps);
+    for(int i=0;i<G.ndev;i++){
+        fprintf(f,"[qtier]   dev %d: %zu experts resident (%.2f GB), arena %d slots (%d free), %llu expert runs\n",
+                G.dev[i], res[i], (double)res[i]*eb/1073741824.0, nslot[i], nfree[i], (unsigned long long)hits[i]);
+        char line[1024]; int o=snprintf(line,sizeof line,"[qtier]   dev %d per layer:",G.dev[i]);
+        for(int l=0;l<nl&&o>0&&o<(int)sizeof line-8;l++) o+=snprintf(line+o,sizeof line-(size_t)o," %u",(unsigned)per[i][l]);
+        fprintf(f,"%s\n",line);
+    }
+    fflush(f);
+}
+void qt_split_report(const char *scope){ qt_split_report_to(stderr,scope); }
+
 static void dense_free_all(void){
     dn_gpu_free_all();
     for(int h = 0; h < G_dense_n; h++){ if(G_dense[h].t) coli_cuda_tensor_free(G_dense[h].t); G_dense[h].t = NULL; G_dense[h].on = 0; }
@@ -2878,6 +2943,9 @@ void qt_shutdown(void){
     pthread_mutex_lock(&G.mx); G.th_stop=1; pthread_cond_signal(&G.cv); pthread_cond_broadcast(&G.cv_take); pthread_mutex_unlock(&G.mx);
     pthread_join(G.th,NULL);
     pthread_mutex_lock(&G.mx);
+    /* prompt groups still on a card (Q38_PREFILL_GPU's workers, if the process exits during a prompt pass's CPU share):
+     * their tensors stay until they end; none is admitted after th_stop, so this cannot wait forever */
+    while(G.pg_open>0) pthread_cond_wait(&G.cv_take,&G.mx);
     while(G.waiters) pthread_cond_wait(&G.cv_take,&G.mx);
     pthread_mutex_unlock(&G.mx);
     /* The uploader is stopped, but a decode group may still own the tensors. */
@@ -2911,17 +2979,17 @@ void qt_shutdown(void){
     pthread_cond_destroy(&G.cv_take);
     pthread_cond_destroy(&G.cv);
     pthread_mutex_destroy(&G.mx);
-    G.issue_open=0;
+    G.issue_open=0; G.pg_open=0; memset(G.pg_dev_open,0,sizeof G.pg_dev_open);
     memset(G.is_cnt,0,sizeof G.is_cnt);
     G.on=0;
     G_fp8_stream=0; G_stream=0; G_trunk_only=0; G_src_planar=0;
     G_host_on=-1; G_host_all=0; G_host_n=G_host_bytes=0;
     if(G_slots_lost) fprintf(stderr,"[qtier] %d arena slot(s) left out of use after refused promotion copies\n",G_slots_lost);
-    /* a staging buffer still out keeps the pool (qt_stg_down), and the pool's page-locked memory lives as long as the
-     * device context it came from: the device stays open for it. A qt_init on the same devices reuses the open
+    /* a staging buffer still out keeps its pool (qt_stg_down), and a pool's page-locked memory lives as long as the
+     * device context it came from: the devices stay open for it. A qt_init on the same devices reuses the open
      * context (coli_cuda_init accepts the same set) and returns the pool once every buffer is back; another device
      * set is refused until a shutdown; the process's exit closes it otherwise */
-    if(G_stg) fprintf(stderr,"[qtier] a staging buffer is still out: the device stays open for the kept pool\n");
+    if(qt_stg_any()) fprintf(stderr,"[qtier] a staging buffer is still out: the devices stay open for the kept pool\n");
     else coli_cuda_shutdown();
 }
 

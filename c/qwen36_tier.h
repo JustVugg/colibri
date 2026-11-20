@@ -260,6 +260,9 @@ int  qt_counters(QtCounters *out);
 
 /* One telemetry block on stderr: residency, hits/misses, uploads per device. */
 void qt_stats(void);
+/* Where the experts are, on stderr: a card's resident experts, its arena's free slots, the expert runs it served,
+ * and its resident experts in each layer (qwen38's serve mode with Q38_TIER_REPORT=1). Only reads. */
+void qt_split_report(const char *scope);
 
 /* The dense chain's routed experts (the engines' *_cuda_chain.h: cc_route, cc_moe): the
  * chain computes the residents on its device by address and the host the rest.
@@ -451,6 +454,7 @@ static inline int  qt_evicted_take(int*a,int*b,int c){(void)a;(void)b;(void)c;re
 static inline void qt_stats_mark(void){}
 static inline int  qt_counters(QtCounters *out){QtCounters z={0,0,0,0,0};*out=z;return 0;}
 static inline void qt_stats(void){}
+static inline void qt_split_report(const char *s){(void)s;}
 
 #endif /* COLI_CUDA */
 #endif /* QWEN36_TIER_H */
