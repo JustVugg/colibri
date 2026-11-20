@@ -133,7 +133,8 @@ CFLAGS = -D_GNU_SOURCE -O3 -march=$(ARCH) -fopenmp -pthread -include pthread.h \
 	-DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 \
 	-DCOLI_V4_PIN_RAMP_REQUESTS=24 \
 	-DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
-LDFLAGS = -lm -fopenmp -pthread
+# -ldl: wex_decode.c opens the optional WEX CUDA helper with dlopen (glibc before 2.34)
+LDFLAGS = -lm -fopenmp -pthread -ldl
 V4_BINARY := deepseek_v4
 V4_WIN_EXTRA_OBJS =
 endif
