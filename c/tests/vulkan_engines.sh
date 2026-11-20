@@ -2320,7 +2320,7 @@ spec_fixtures() {
   $PY tools/make_qwen38_tiny.py --out qwen38_tiny_mtp --mtp
   $PY tools/make_edge_tiny_tokenizer.py --vocab-size 64 ./qwen38_tiny_mtp   # serve speaks text
   $PY tools/make_qwen38_tiny.py --out qwen38_tiny_int4_mtp --fp8-experts --int4-experts --expert-gain 3 --mtp
-  make qwen36-tiny-v128-generate
+  make -j1 qwen36-tiny-v128-generate
 }
 family_qwen_spec() {
   make qwen36 qwen38 tests/test_spec_draft VK=1
@@ -2339,7 +2339,7 @@ family_qwen_spec() {
   # device (one frame a draft), every depth's tokens and last logits those of plain decoding
   # in the same chain, serve with prefix reuse and pins. Its draft logits against the
   # reference within the device's roundings (make qwen36-tiny-mtp-check holds the CPU's to 1e-6).
-  make qwen36-tiny-mtp-generate
+  make -j1 qwen36-tiny-mtp-generate
   $PY tests/qwen36_mtp_harness.py --engine ./qwen36 --source ./qwen36_tiny_mtp --model ./qwen36_tiny_mtp_i8 \
     --model ./qwen36_tiny_mtp_i4 --quick --device --head-tol 2e-2 $chain
   # A six-row verify crosses several one-row KV chunks. Rollback must lower both
@@ -4955,7 +4955,7 @@ family_decide() {
   make laya gliner_decide qwen36 tests/test_qwen36_weight_alloc VK=1 EXTRA_CFLAGS="$SANF"
   COLI_VULKAN=0 ./tests/test_qwen36_weight_alloc
   COLI_VULKAN=1 ./tests/test_qwen36_weight_alloc
-  make laya-tiny-generate gliner-decide-tiny-generate clef-tiny-generate
+  make -j1 laya-tiny-generate gliner-decide-tiny-generate clef-tiny-generate   # one generator at a time
   export OMP_NUM_THREADS=2
   local c e
   local -a cmp=(
@@ -4991,7 +4991,7 @@ family_decide() {
   decide_vk_lines serve.log "decide serve"
   echo "OK decide: the serve tests (tests.test_decision_serve) through the device: $(tail -1 serve.log)"
   if [ -z "${SAN:-}" ] && $PY -c "import typesafe_sdk" 2>/dev/null && [ -d "${JEV_TS_SDK_DIR:-tools/jev-sdk}/node_modules" ]; then
-    make mimo VK=1 mimo-tiny-generate
+    make -j1 mimo VK=1 mimo-tiny-generate   # the generator after the engine
     rm -f sdk-serve.log
     COLI_VULKAN=1 COLI_VK_CHAIN=1 JEV_SDK_REQUIRED=1 JEV_SDK_SERVE_LOG=sdk-serve.log \
       $PY -m unittest tests.test_jev_sdk > sdk.log 2>&1 || { tail -80 sdk.log; fail "decide: TypeSafe's SDKs through the device"; }
