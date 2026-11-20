@@ -5287,10 +5287,14 @@ extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, cons
         size_t prow = (size_t)(gx4(t->I / 4) + 1) * 16;   /* a padded row's bytes */
         /* a verify's rows share each weight load where the matrix has the blocks to fill the
          * device without its rows and shared memory holds them padded */
-        if (gemv_i8_w4_on() && t->I >= 2048 && (size_t)t->O * t->I >= ((size_t)1 << 21)) {   /* long rows: four outputs a warp
-                                                                               * (gemv_i8_w4), the inputs split where the outputs are
-                                                                               * few; a smaller matrix's blocks are too few for it
-                                                                               * (512 x 2560: 3.1 -> 4.0 us) */
+        if (gemv_i8_w4_on() && t->I > 4096 && (size_t)t->O * t->I >= ((size_t)1 << 21)) {   /* long rows: four outputs a warp
+                                                                              * (gemv_i8_w4), the inputs split where the outputs are
+                                                                              * few; a smaller matrix's blocks are too few for it
+                                                                              * (512 x 2560: 3.1 -> 4.0 us), and up to 4096 inputs an
+                                                                              * output a warp decodes faster (Qwen3.6-35B-A3B int4 on
+                                                                              * an RTX PRO 4000, its 2048- and 4096-input matrices:
+                                                                              * 107.6-107.9 -> 110.0-110.1 tok/s; Qwen3.8's 10240-input
+                                                                              * read keeps it, Qwen3.8 IQ2_XS decodes as before) */
             const unsigned bw = (unsigned)((t->O + GEMV_I8_ROWS * GEMV_I8_OPW - 1) / (GEMV_I8_ROWS * GEMV_I8_OPW));
             const int ks = gemv_i8_sk_splits(ctx, t->I, bw);
             int kc = ks > 1 ? ((t->I + ks - 1) / ks + 511) / 512 * 512 : t->I, kz = (t->I + kc - 1) / kc;

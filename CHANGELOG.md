@@ -574,6 +574,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **Qwen3.6's CUDA decode back to 2.1.0's**: the int8 GEMV's four outputs a warp (`gemv_i8_w4`,
+  2026-11-03, for Qwen3.8's verify) took every matrix of 2048 inputs or more, and Qwen3.6's
+  2048- and 4096-input matrices decode faster an output a warp: Qwen3.6-35B-A3B int4 on an RTX
+  PRO 4000 decoded at 107.6-107.9 tok/s against 2.1.0's 111.4. It now starts above 4096 inputs:
+  110.0-110.1, and Qwen3.8 IQ2_XS decodes as before (its 10240-input read keeps it). Each
+  output's sums run in the same lanes and order either way, so the bits do not change.
 - **DeepSeek V4 Flash from a GGUF did not start on CUDA** (`cannot preload resident CUDA
   experts`): the resident experts' auto mode refused the engine when a GGUF's shared experts had
   no device mirror, which they never have (a GGUF's dense matrices stay on the CPU), and a GGUF's
