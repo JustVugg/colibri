@@ -84,6 +84,10 @@ c/tests/i4r16_*
 # make mistral-vision-check's binary (not test_*: test-c would run it without its arguments)
 c/tests/mistral_vision_check
 c/tests/mistral_vision_check.exe
+c/tests/export_qwen38_fp8_stages
+c/tests/export_qwen38_fp8_stages.exe
+c/tests/export_qwen38_fp8_native
+c/tests/export_qwen38_fp8_native.exe
 c/tests/fuzz_*
 !c/tests/fuzz_*.c
 !c/tests/fuzz_*.cu

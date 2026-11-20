@@ -480,7 +480,29 @@ typedef struct ColiCudaChainOps {
     int  (*fetch_at)(CcBuf *dst, const CcFetch *r, int n, int bank);
     int  (*fetch_wait_at)(int bank);
     int  (*fetch_done_at)(int bank);
+    /* the SYCL campaign's (2026-11-18/19), after upstream's so that their offsets stay */
+    /* dnconv_mx, dnrec_mx: the decode row of each of n conversations (2..CC_MX_N) in one launch. p is
+     * conversation 0's: S 1, no snapshot; conversation j's input and output are j rows on (in_off + j
+     * in_row, ..., y_off + j y_row), its ring or state its own buffer ring[j], st[j] (all different).
+     * The arithmetic is dnconv's and dnrec's for one row, so n calls' bits. 1 done, -1 not taken (the
+     * caller's n calls), 0 a failure */
+    int  (*dnconv_mx)(CcBuf *in, CcBuf *w, CcBuf *const *ring, int n, CcBuf *out, const CcDnConv *p);
+    int  (*dnrec_mx)(int KD, CcBuf *cv, CcBuf *ab, CcBuf *z, CcBuf *const *st, int n, CcBuf *prm, CcBuf *y, const CcDnRec *p);
+    /* attn_h_mx: attn_h's decode row of each of n conversations (2..CC_MX_ATTN_N) in one call, where attn_h
+     * splits a row over its positions (its default: two launches, the blocks and the join). p is
+     * conversation 0's: S 1, no selection list, pos_base and cap not read; conversation j's query, gate
+     * and output rows are j rows on (q_off + j q_row, g_off + j g_row, o_off + j o_row), its float16
+     * caches its own kc[j] and vc[j] of cap[j] rows a KV head, its row at position pos[j] (it attends to
+     * 0..pos[j], in the caches already). A row's arithmetic is attn_h's for that row alone, so n calls'
+     * bits. copy_regions_h_mx: copy_regions_h's regions r[j per .. j per + per) into dst[j], for each of
+     * n float16 caches (2..CC_MX_N, all different) in one launch, where a conversation's regions are one
+     * grid (a decode row: a region a KV head) of the same shape for all. 1 done, -1 not taken (the
+     * caller's n calls), 0 a failure */
+    int  (*attn_h_mx)(CcBuf *q, CcBuf *const *kc, CcBuf *const *vc, const int *pos, const int *cap, int n, CcBuf *o, CcBuf *gate, const CcAttn *p);
+    int  (*copy_regions_h_mx)(CcBuf *const *dst, int n, CcBuf *src, const CcRegion *r, int per);
 } ColiCudaChainOps;
+#define CC_MX_N 16   /* conversations a dnconv_mx / dnrec_mx launch takes (KV_SLOTS' limit) */
+#define CC_MX_ATTN_N 8   /* conversations an attn_h_mx call takes: a decode step's rows in the backend's attention */
 /* the table's size without the optional ops: a backend at least this big has the chain */
 #define CC_OPS_BASE_SIZE (offsetof(ColiCudaChainOps, route))
 
@@ -680,6 +702,26 @@ static inline int cc_dftap(CcBuf *x, CcBuf *y, const CcDfTap *p) { return cc_dfl
 static inline int cc_dftopk(CcBuf *x, CcBuf *sc, CcBuf *out, const CcDfTopk *p) { return cc_dflash_ready() ? cc_ops()->dftopk(x, sc, out, p) : 0; }
 static inline int cc_dfconv(CcBuf *x, CcBuf *kp, CcBuf *prm, CcBuf *y, const CcDfConv *p) {
     return cc_dflash_ready() ? cc_ops()->dfconv(x, kp, prm, y, p) : 0;
+}
+static inline int cc_dnconv_mx(CcBuf *in, CcBuf *w, CcBuf *const *ring, int n, CcBuf *out, const CcDnConv *p) {
+    const ColiCudaChainOps *o = cc_ops();
+    return o && o->size >= offsetof(ColiCudaChainOps, dnconv_mx) + sizeof o->dnconv_mx && o->dnconv_mx
+           ? o->dnconv_mx(in, w, ring, n, out, p) : -1;
+}
+static inline int cc_dnrec_mx(int KD, CcBuf *cv, CcBuf *ab, CcBuf *z, CcBuf *const *st, int n, CcBuf *prm, CcBuf *y, const CcDnRec *p) {
+    const ColiCudaChainOps *o = cc_ops();
+    return o && o->size >= offsetof(ColiCudaChainOps, dnrec_mx) + sizeof o->dnrec_mx && o->dnrec_mx
+           ? o->dnrec_mx(KD, cv, ab, z, st, n, prm, y, p) : -1;
+}
+static inline int cc_attn_h_mx(CcBuf *q, CcBuf *const *kc, CcBuf *const *vc, const int *pos, const int *cap, int n, CcBuf *o, CcBuf *gate, const CcAttn *p) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, attn_h_mx) + sizeof t->attn_h_mx && t->attn_h_mx
+           ? t->attn_h_mx(q, kc, vc, pos, cap, n, o, gate, p) : -1;
+}
+static inline int cc_copy_regions_h_mx(CcBuf *const *dst, int n, CcBuf *src, const CcRegion *r, int per) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, copy_regions_h_mx) + sizeof t->copy_regions_h_mx && t->copy_regions_h_mx
+           ? t->copy_regions_h_mx(dst, n, src, r, per) : -1;
 }
 /* the chain's and the backend's kernels loaded now where the backend can (an older one loads them
  * at their first launch) */
