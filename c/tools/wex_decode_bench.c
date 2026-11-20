@@ -1,6 +1,6 @@
 /* wex_decode_bench -- WNR3 decode and record read speed on records of a real WEX4 container.
  *
- *   tools/wex_decode_bench decode FILE [--records N] [--seed S] [--passes P] [--lanes 2,4,6,8] [--threads T]
+ *   tools/wex_decode_bench decode FILE [--records N] [--seed S] [--passes P] [--lanes 3,4,6,8] [--threads T]
  *   tools/wex_decode_bench io FILE [--records N] [--seed S] [--passes P] [--threads T]
  *
  * decode: N WNR3 expert records picked by the seed (default 16, seed 1) are read into memory, then decoded
@@ -366,7 +366,7 @@ static int run_decode(Container *c, int n, int passes, const int *lanes, int n_l
     for (int l = 0; l < (simd ? n_lanes : 1) && n_arms < MAX_ARMS - 6; l++) {
         Arm *a = &arms[n_arms++];
         WexFastOptions o = {1, 1, simd ? lanes[l] : WEX_FAST_LANES, 1};
-        if (simd) snprintf(a->name, sizeof a->name, "fast %s, %d streams%s", wex_fast_kernels(), lanes[l], lanes[l] == WEX_FAST_LANES ? " (default)" : "");
+        if (simd) snprintf(a->name, sizeof a->name, "fast %s, %d streams%s", wex_fast_kernels(), lanes[l], lanes[l] == WEX_FAST_LANES ? " (build default)" : "");
         else snprintf(a->name, sizeof a->name, "fast, no SIMD kernel here (scalar)");
         a->threads = 1;
         for (int p = 0; p < passes; p++) per_pass[p] = pass_serial(recs, n, slab, cap, raw, DEC_FAST, &o, 0, &a->mismatches, NULL);
@@ -381,7 +381,7 @@ static int run_decode(Container *c, int n, int passes, const int *lanes, int n_l
         for (int dec = DEC_REF; dec <= DEC_FAST; dec++) {
             Arm *a = &arms[n_arms++];
             const int pp = dec == DEC_REF ? 1 : passes;
-            snprintf(a->name, sizeof a->name, "%s, %d records at once", dec == DEC_REF ? "reference" : "fast (default streams)", threads);
+            snprintf(a->name, sizeof a->name, "%s, %d records at once", dec == DEC_REF ? "reference" : "fast (build default streams)", threads);
             a->threads = threads;
             for (int p = 0; p < pp; p++) per_pass[p] = pass_parallel(recs, n, slabs, cap, raw, dec, &one, threads, &a->mismatches);
             a->t = timing_of(per_pass, pp);
@@ -543,11 +543,11 @@ static int run_io(const char *path, Container *c, int n, int passes, int threads
 }
 
 static void usage(const char *argv0) {
-    fprintf(stderr, "usage: %s decode|io FILE [--records N] [--seed S] [--passes P] [--lanes 2,4,6,8] [--threads T]\n", argv0);
+    fprintf(stderr, "usage: %s decode|io FILE [--records N] [--seed S] [--passes P] [--lanes 3,4,6,8] [--threads T]\n", argv0);
 }
 
 int main(int argc, char **argv) {
-    int n = 16, passes = -1, threads = 0, lanes[8] = {2, 4, 6, 8}, n_lanes = 4;
+    int n = 16, passes = -1, threads = 0, lanes[8] = {3, 4, 6, 8}, n_lanes = 4;
     Container c;
     setbuf(stdout, NULL);
     if (argc < 3 || (strcmp(argv[1], "decode") && strcmp(argv[1], "io"))) { usage(argv[0]); return 2; }

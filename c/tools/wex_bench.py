@@ -16,8 +16,9 @@ Stages (each runs alone; results accumulate in OUT/wex-bench-results.json):
     all      env verify decode io (engine too with --snap), then report
 
 Standard library only; it builds the C tools with `make -C c` when they are missing.
-Nothing it prints or writes holds the host name, the user name or a path: paths are replaced by
-placeholders, and the container is named by its file name. See docs/wex-bench.md.
+What it prints and writes has the host name, the user name and the paths it recognises replaced
+by placeholders, and names the container by its file name; read the report before pasting it.
+See docs/wex-bench.md.
 """
 import argparse
 import ctypes
@@ -137,12 +138,13 @@ PATH_VARS = ("COLI_WEX_PATH", "SNAP", "COLI_WEX_CUDA_LIB", "COLI_MODEL_MIRROR", 
 
 
 def env_vars(extra=None):
-    """The variables that change what the tools and engines do, as set now; values that are paths: <set>."""
+    """The variables that change what the tools and engines do, as set now; values that are or hold a path: <set>."""
     env = dict(os.environ)
     env.update(extra or {})
     picked = {k: v for k, v in sorted(env.items())
               if k.startswith(("COLI_", "WEX_", "OMP_", "GOMP_", "KMP_", "CUDA_VISIBLE", "V41_", "Q38_", "DSV4_")) or k in ("SNAP", "CC")}
-    return {k: ("<set>" if k in PATH_VARS and v not in ("", "0") else v) for k, v in picked.items()}
+    return {k: ("<set>" if (k in PATH_VARS or "/" in v or "\\" in v) and v not in ("", "0") else v)
+            for k, v in picked.items()}
 
 
 def save_stage(out, stage, data, extra_env=None):
@@ -497,7 +499,7 @@ def parse_engine(engine, out, err):
                         "reference": int(m.group(4)), "failed": int(m.group(5)), "cpu_decoder": m.group(6)}
     m = re.search(r"\[wex\] WNR3 records decode on the CPU with the (.+)", err)
     r["cpu_decoder_line"] = m.group(1).strip() if m else None
-    m = re.search(r"\[wex\] CUDA helper [^:]*: (.+)", err)
+    m = re.search(r"\[wex\] CUDA helper .*: (ABI \d+, features \d+)", err)   # the path may hold a drive colon
     r["helper_line"] = m.group(1).strip() if m else None
     return r
 
@@ -714,7 +716,7 @@ def main():
     ap.add_argument("--records", type=int, default=16, help="records for decode and io (default 16)")
     ap.add_argument("--seed", type=int, default=1, help="which records (default 1)")
     ap.add_argument("--passes", type=int, default=0, help="passes per arm (default: decode 3, the reference 1; io 1)")
-    ap.add_argument("--lanes", default="2,4,6,8", help="fast decoder stream counts (any of 1,2,3,4,6,8)")
+    ap.add_argument("--lanes", default="3,4,6,8", help="fast decoder stream counts (any of 1,2,3,4,6,8)")
     ap.add_argument("--threads", type=int, default=0, help="records at once / read threads (default: the OpenMP team, at most 8)")
     ap.add_argument("--verify-threads", type=int, default=8)
     ap.add_argument("--helper", help="the CUDA helper (kaira_wex_cuda.dll / .so); default: COLI_WEX_CUDA_LIB")

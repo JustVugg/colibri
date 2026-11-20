@@ -36,8 +36,9 @@ with the same `--out`.
 | `all` | `env verify decode io` (and `engine` with `--snap`), then `report` | |
 
 Options that matter: `--records N` (16), `--seed S` (1: the same records on every machine),
-`--lanes 2,4,6,8`, `--threads T` (records at once and read threads; default the OpenMP team, at
-most 8), `--passes P`, `--helper PATH`, `--out DIR`.
+`--lanes 3,4,6,8` (the counts an engine measures on its first records unless
+`COLI_WEX_FAST_LANES` sets one), `--threads T` (records at once and read threads; default the
+OpenMP team, at most 8), `--passes P`, `--helper PATH`, `--out DIR`.
 
 ### The engine stage
 
@@ -63,18 +64,20 @@ checkpoint): each arm is one run, in the order given; the page cache is not drop
 
 ## What the report holds, and what it does not
 
-The report and the results file hold no host name, user name or path: paths are replaced by
-`<container dir>`, `<checkpoint>`, `<repo>`, `<path>`, the container is named by its file name,
-and variables that hold paths are shown as `<set>`. Read the report before pasting it.
+In the report and the results file the host name and the user name are replaced by placeholders,
+and so are the paths the tool recognises: `<container dir>`, `<checkpoint>`, `<repo>`, and
+`<path>` for other absolute paths. The container is named by its file name, and a variable whose
+value holds a path is shown as `<set>`. A path it does not recognise (a directory with spaces
+outside those, say) can stay: read the report before pasting it.
 
 ## Example (Windows 10, i7-7700K, RTX 3070, the V4.1 container on NVMe)
 
 ```
-| arm                                  | threads | ms/record, best |
-| reference (wex_decode_nr2_record)    |       1 |          857.72 |
-| fast AVX2, 4 streams (default)       |       1 |          117.00 |
-| fast (default streams), 8 at once    |       8 |           29.25 |
-| CUDA helper, coli_wex_decode_record  |       1 |            6.35 |
+| arm                                     | threads | ms/record, best |
+| reference (wex_decode_nr2_record)       |       1 |          857.72 |
+| fast AVX2, 4 streams (build default)    |       1 |          117.00 |
+| fast (build default streams), 8 at once |       8 |           29.25 |
+| CUDA helper, coli_wex_decode_record     |       1 |            6.35 |
 ```
 
 The sample reports of the PR that added the bench have the whole tables.
