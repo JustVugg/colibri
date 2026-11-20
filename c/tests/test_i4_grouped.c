@@ -155,12 +155,12 @@ static int check(const char *name, int S, int I, int O, int gs, int fill_edges){
  *
  *  - Correctness, always: both outputs must match the double reference within
  *    the same magnitude-relative epsilon as the unfused kernel.
- *  - Bit-exactness: forced-SSE builds require every shape to match two scalar
- *    calls. Other builds retain the aligned-shape invariant used by AVX2.
- *
- * On AVX2, a PARTIAL last group falls to scalar code and the fused body can
- * round differently from the single-matrix one. The forced-SSE rows4 path has
- * no horizontal reduction or group tail and is exact for those shapes too. */
+ *  - Bit-exactness: every shape on every build must match two single calls.
+ *    Both kernels' scalar steps are quant.h's i4g_step, pinned in the source,
+ *    so the scalar code (all of it on aarch64, a partial last group's tail on
+ *    AVX2) rounds the same in the fused body as in the single-matrix one; left
+ *    to -ffp-contract, GCC fused the two differently on aarch64. The forced-SSE
+ *    rows4 path has no horizontal reduction or group tail and is exact too. */
 #ifdef COLI_HAVE_GROUPED_PAIR
 static int check_pair(const char *name, int S, int I, int O, int gs){
     int rb=(I+1)/2, ng=(I+gs-1)/gs;
@@ -196,13 +196,11 @@ static int check_pair(const char *name, int S, int I, int O, int gs){
         }
         if(yg[i]!=rg[i]||yu[i]!=ru[i]) exact=0;
     }
-    int require_exact=I%gs==0;
 #ifdef COLI_I4_GROUPED_SCALAR_EXACT
-    require_exact=1;
     exact=memcmp(yg,rg,(size_t)S*O*sizeof(float))==0
        && memcmp(yu,ru,(size_t)S*O*sizeof(float))==0;
 #endif
-    if(require_exact && !exact){
+    if(!exact){
         fprintf(stderr,"%s: FAIL fused != unfused bitwise "
                        "(the operation order must match)\n",name);
         bad++;
@@ -210,8 +208,7 @@ static int check_pair(const char *name, int S, int I, int O, int gs){
     free(qg);free(qu);free(sg);free(su);free(x);free(yg);free(yu);free(rg);free(ru);
     free(dg);free(du);free(mg);free(mu);
     if(bad){ fprintf(stderr,"%s: FAIL (%d mismatched)\n",name,bad); return 1; }
-    printf("  %-42s ok (S=%d I=%d O=%d gs=%d, worst rel %.2g%s)\n",name,S,I,O,gs,worst,
-           require_exact?", bit-exact vs unfused":"");
+    printf("  %-42s ok (S=%d I=%d O=%d gs=%d, worst rel %.2g, bit-exact vs unfused)\n",name,S,I,O,gs,worst);
     return 0;
 }
 #endif

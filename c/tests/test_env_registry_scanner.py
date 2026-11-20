@@ -48,3 +48,7 @@ class RegistryScannerTest(unittest.TestCase):
         (self.root / "tests").mkdir()
         (self.root / "tests" / "fixture.c").write_text('getenv("FIXTURE_ONLY");')
         self.assertEqual(registry.scan_sources(), {})
+
+    def test_objective_c_sources_are_scanned(self):
+        (self.root / "glue.m").write_text('getenv("COLI_OBJC");\n')
+        self.assertEqual(registry.scan_sources(), {"COLI_OBJC": ["glue.m:1"]})

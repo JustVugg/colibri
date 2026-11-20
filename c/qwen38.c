@@ -4236,7 +4236,6 @@ static size_t q38_vk_dense_bytes(Model *m){
  * ranges with the layer's scale bank. buf holds the bytes; 0 when this layout has
  * no direct read (the caller loads it through a temporary slot instead). */
 static int q38_vk_read_direct(Model *m,int layer,int e,uint8_t *buf,int64_t cap,VktExpertSrc *src){
-    Cfg *c=&m->c;
     if(q38_layer_int4(m,layer)){
         Q38Int4Experts *x=m->x4;
         if(x->record_bytes>cap)return 0;

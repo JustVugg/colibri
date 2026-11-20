@@ -34,6 +34,17 @@
  * the two name buffers below hold COLI_QPACK_MAX_NAME bytes plus the NUL. */
 #define COLI_QPACK_MAX_NAME 255u
 
+/* A container usually comes from a download, so a FIFO may sit under any of
+ * its names, and opening one to read waits for a writer. O_NONBLOCK lets the
+ * open return, so the check that follows it refuses whatever is not a regular
+ * file; the flag is cleared on the descriptors the reader keeps. No
+ * O_NOFOLLOW: a container's files may be symlinks. */
+#ifdef _WIN32
+#define QPACK_O_RDONLY COMPAT_O_RDONLY
+#else
+#define QPACK_O_RDONLY (COMPAT_O_RDONLY | O_NONBLOCK)
+#endif
+
 static int qpack_fail(char *error, size_t capacity, const char *format, ...) {
     if (error && capacity) {
         va_list args;
@@ -69,7 +80,7 @@ static char *qpack_join_path(const char *left, const char *right) {
 
 static char *qpack_read_text(const char *path, size_t *size_out,
                              char *error, size_t error_capacity) {
-    int fd = open(path, COMPAT_O_RDONLY);
+    int fd = open(path, QPACK_O_RDONLY);
     if (fd < 0)
         return qpack_fail(error, error_capacity, "open %s: %s",
                           path, strerror(errno)), NULL;
@@ -629,7 +640,7 @@ int coli_qpack_open(ColiQpackReader *reader, const char *container_dir,
             coli_qpack_close(reader);
             return -1;
         }
-        int fd = open(path, COMPAT_O_RDONLY);
+        int fd = open(path, QPACK_O_RDONLY);
         if (fd < 0) {
             int saved = errno;
             free(path);
@@ -656,6 +667,11 @@ int coli_qpack_open(ColiQpackReader *reader, const char *container_dir,
             return qpack_fail(error, error_capacity,
                               "%s has unexpected size", relative);
         }
+#ifndef _WIN32
+        /* A regular file: the descriptor the reader keeps blocks again. */
+        int flags = fcntl(fd, F_GETFL);
+        if (flags != -1) (void)fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+#endif
         free(path);
     }
 

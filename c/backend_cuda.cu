@@ -2747,7 +2747,7 @@ static void mx4_group_launch(DeviceContext *ctx,GroupDesc *dev,int I,int D,int c
  * so their bits stay one path's. COLI_CUDA_GROUP_MOE=0 keeps the grouped kernels. */
 extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float *x, const int *ids, const float *w,
                                    float *hid, float *y, const float *hy, const CcMoe *p, void *stream);
-static int group_moe_ok(const GroupDesc *host, int count, int total, int D, int I) {
+static int group_moe_ok(const GroupDesc *host, int count, int D, int I) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("COLI_CUDA_GROUP_MOE"); on = !(e && *e == '0'); }
     if (!on || count < 1 || D < 32 || I < 32 || D % 32 || I % 32 || D > CC_MOE_DIM_MAX || I > CC_MOE_DIM_MAX) return 0;
@@ -2932,7 +2932,7 @@ static int expert_group_impl(ColiCudaTensor *const *gates,
             }
             off16+=r;
         }
-    }else if(group_moe_ok(host,count,total,D,I)){
+    }else if(group_moe_ok(host,count,D,I)){
         if(!group_moe_launch(ctx,device,host,count,rows,total,D,I,pin_small_batch))return 0;
     }else if(all_s4&&(!getenv("COLI_CUDA_W4_PACKED")||atoi(getenv("COLI_CUDA_W4_PACKED")))){
         dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
@@ -3081,7 +3081,7 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
         f8_group_launch(ctx,(GroupDesc*)ctx->group_desc,I,D,max_rows,count);
     }else if(all_mx4){
         mx4_group_launch(ctx,(GroupDesc*)ctx->group_desc,I,D,count);
-    }else if(group_moe_ok(host,count,total,D,I)){
+    }else if(group_moe_ok(host,count,D,I)){
         /* pin 1: the warp kernels at any row count, so 9..32 rows give the bits of the
          * same experts issued 8 rows at a time (the tensor-core family past
          * CC_MOE_FRAME_ROWS is for prompt chunks, not a decode step). */
@@ -5287,10 +5287,14 @@ extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, cons
         size_t prow = (size_t)(gx4(t->I / 4) + 1) * 16;   /* a padded row's bytes */
         /* a verify's rows share each weight load where the matrix has the blocks to fill the
          * device without its rows and shared memory holds them padded */
-        if (gemv_i8_w4_on() && t->I >= 2048 && (size_t)t->O * t->I >= ((size_t)1 << 21)) {   /* long rows: four outputs a warp
-                                                                               * (gemv_i8_w4), the inputs split where the outputs are
-                                                                               * few; a smaller matrix's blocks are too few for it
-                                                                               * (512 x 2560: 3.1 -> 4.0 us) */
+        if (gemv_i8_w4_on() && t->I > 4096 && (size_t)t->O * t->I >= ((size_t)1 << 21)) {   /* long rows: four outputs a warp
+                                                                              * (gemv_i8_w4), the inputs split where the outputs are
+                                                                              * few; a smaller matrix's blocks are too few for it
+                                                                              * (512 x 2560: 3.1 -> 4.0 us), and up to 4096 inputs an
+                                                                              * output a warp decodes faster (Qwen3.6-35B-A3B int4 on
+                                                                              * an RTX PRO 4000, its 2048- and 4096-input matrices:
+                                                                              * 107.6-107.9 -> 110.0-110.1 tok/s; Qwen3.8's 10240-input
+                                                                              * read keeps it, Qwen3.8 IQ2_XS decodes as before) */
             const unsigned bw = (unsigned)((t->O + GEMV_I8_ROWS * GEMV_I8_OPW - 1) / (GEMV_I8_ROWS * GEMV_I8_OPW));
             const int ks = gemv_i8_sk_splits(ctx, t->I, bw);
             int kc = ks > 1 ? ((t->I + ks - 1) / ks + 511) / 512 * 512 : t->I, kz = (t->I + kc - 1) / kc;
