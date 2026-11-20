@@ -14090,6 +14090,9 @@ static int v4_view_block_runs(const ColiExpertView *view, V4MirrorRuns *runs) {
 static int v4_mirror_block_fill(V4GpuExpertMirrorCache *cache, V4GpuExpertMirror *entry,
                                 const ColiExpertView *view, const V4MirrorRuns *runs,
                                 int sync) {
+    /* the verifier reads the mirror back: a copy the uploader only enqueued
+     * (sync 3) is drained on its stream instead (sync 2) */
+    if (sync == 3 && v4_mirror_block_verify_on()) sync = 2;
     if (!dsv4_cuda_mirror_refill(entry->gate, entry->up, entry->down,
                                  runs->scales, runs->scale_bytes, runs->scale_offset,
                                  runs->weights, runs->weight_bytes, runs->weight_offset,
