@@ -9891,14 +9891,17 @@ static void v4_wex_report(const V4Wex *w) {
 
 #ifdef COLI_V4_TEST_HOOKS
 /* tests/test_v4_wex4: whether the store reads a container, and its counters
- * (reads, bytes, fallbacks, refused, WNR3 records decoded). */
-int coli_v4_test_wex(ColiExpertStore *store, uint64_t counters[5]) {
+ * (reads, bytes, fallbacks, refused, WNR3 records decoded, records read per matrix). */
+int coli_v4_test_wex(ColiExpertStore *store, uint64_t counters[6]) {
     const V4ExpertStoreState *state = store ? store->state : NULL;
     const V4Wex *w = state ? state->wex : NULL;
     if (counters) {
         counters[0] = w ? w->reads : 0; counters[1] = w ? w->bytes : 0;
         counters[2] = w ? w->fallbacks : 0; counters[3] = w ? w->refused : 0;
         counters[4] = w ? w->decoded : 0;
+        counters[5] = 0;
+        for (size_t i = 0; state && i < (size_t)state->layers * state->experts_per_layer; i++)
+            counters[5] += state->records[i].per_matrix != 0;
     }
     return w != NULL;
 }
@@ -10617,7 +10620,13 @@ int coli_deepseek_v4_expert_store_open(
         if (ilv) fprintf(stderr, "v4_gguf experts interleaved by 16 rows on %d of %d layers "
                                  "(COLI_V4_ROWS16=0: the file's rows)\n", ilv, state->layers);
     }
-    v4_wex_bind(state);   /* drops the container when a record is not the checkpoint's expert */
+    /* v4_wex_bind drops the container when a record is not the checkpoint's expert; the
+     * records are then built again, without the per-matrix layout the container forced */
+    if (v4_wex_bind(state))
+        for (size_t i = 0; i < record_count; i++)
+            if (build_record(state, (int)(i / state->experts_per_layer), (int)(i % state->experts_per_layer),
+                             &state->records[i], error, error_size) != 0)
+                goto fail;
     state->slots_per_layer = (int)(options->cache_bytes /
         ((uint64_t)state->layers * state->record_bytes));
     int minimum_slots = state->experts_per_layer < 6

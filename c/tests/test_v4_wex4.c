@@ -29,7 +29,7 @@
 #include "wex4_fixture.h"
 #include "wnr3_fixture.h"
 
-int coli_v4_test_wex(ColiExpertStore *store, uint64_t counters[5]);
+int coli_v4_test_wex(ColiExpertStore *store, uint64_t counters[6]);
 
 enum { LAYERS = 2, EXPERTS = 4, ROWS = 40, SCALE_COLS = 64, WEIGHT_COLS = 1024 };
 #define CELLS (LAYERS * EXPERTS)
@@ -118,9 +118,9 @@ static int same_matrix(const ColiTensorView *v, size_t cell, int m) {
 }
 
 /* Open the store, look every expert up, compare with the checkpoint; counters: reads,
- * bytes, fallbacks, refused of the container (all 0 without one). Returns whether the
- * store had a container. */
-static int run(uint64_t counters[5]) {
+ * bytes, fallbacks, refused of the container (all 0 without one), WNR3 records decoded,
+ * records read per matrix. Returns whether the store had a container. */
+static int run(uint64_t counters[6]) {
     char error[256] = {0};
     ColiDeepSeekV4ExpertStoreOptions options = {directory, LAYERS, EXPERTS, (uint64_t)CELLS * 2 * RAW, -1, 0, 1, 0};
     ColiExpertStore *store = NULL;
@@ -162,8 +162,14 @@ static int run(uint64_t counters[5]) {
 /* decoded: how many of the reads were WNR3 records decoded (0 for a RAW container) */
 static void expect5(const char *what, int active, uint64_t reads, uint64_t fallbacks, uint64_t refused,
                     uint64_t decoded) {
-    uint64_t c[5];
+    uint64_t c[6] = {0};
     int got = run(c);
+    /* a container makes every record per-matrix; without one this checkpoint's are contiguous */
+    if (c[5] != (uint64_t)(active ? CELLS : 0)) {
+        fprintf(stderr, "FAIL %s: %llu records read per matrix (want %d)\n", what, (unsigned long long)c[5],
+                active ? CELLS : 0);
+        failures++;
+    }
     if (got != active || c[0] != reads || c[2] != fallbacks || c[3] != refused || c[4] != decoded) {
         fprintf(stderr, "FAIL %s: container %d (want %d), reads %llu (want %llu), fallbacks %llu (want %llu), "
                         "refused %llu (want %llu), decoded %llu (want %llu)\n", what, got, active,
