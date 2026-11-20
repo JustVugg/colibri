@@ -3,7 +3,7 @@
   "hypothesis": "In decode the Metal chain's GPU experts wait on SSD reads for about half of a step; running the next layer's router on the current MLP row and announcing its six likeliest uncached experts to the OS (F_RDADVISE on their GGUF ranges) once the next trunk is submitted lets the SSD read them while the GPU computes, so decode after the 61-token short.txt prompt gets faster with the same tokens.",
   "commit": "cecdd7236216a284396b5ad5553a2e7f12b4871d",
   "model": "Qwen3.8-Flash-Next heretic-2, llama.cpp IQ4_XS GGUF (routed experts IQ4_XS gate/up, IQ4_NL down, 2.54 MiB each; trunk mostly Q8_0), imported in link mode (colibri-dev)",
-  "command": "BUILD='cecdd723 METAL=1' METAL=1 WARMUP=1 BENCH_RAW=results/raw-m3 ARM_ENV='USAGE_SAVE=0 QWEN38_METAL_AHEAD=<0|1>' bench/q38_bench.sh bench/bin/qwen38-metal-m3 /Users/otabek/colibri-models/qwen38-heretic2/colibri-dev metal-m3-<noahead|ahead> 3",
+  "command": "BUILD='cecdd723 METAL=1' METAL=1 WARMUP=1 BENCH_RAW=results/raw-m3 ARM_ENV='USAGE_SAVE=0 QWEN38_METAL_AHEAD=<0|1>' bench/q38_bench.sh bench/bin/qwen38-metal-m3 ~/models/qwen38-heretic2/colibri-dev metal-m3-<noahead|ahead> 3",
   "prompt_hash": "1d86e7a6a60915badaf1a1321d9fd24d3fa99dc1da139372b26437f7912ed8f8",
   "hardware": {
     "cpu": "Apple M4 Pro, 8 performance + 4 efficiency cores (Mac16,8)",
@@ -45,7 +45,7 @@
     },
     "evidence": {
       "uri": "docs/experiments/qwen38-metal-ahead-2026-11-19/baseline.json",
-      "sha256": "bd430b464a1d0aa9729ac0040659ee7285f9814c90a737335d75764fe4daf54e"
+      "sha256": "d80651edb060d8a1d2d794404841a9ee6179448c72bfc55d53ab6703b3a0e4b5"
     }
   },
   "trial": {
@@ -78,7 +78,7 @@
     },
     "evidence": {
       "uri": "docs/experiments/qwen38-metal-ahead-2026-11-19/trial.json",
-      "sha256": "d140bc6e64dc9307044227bd255f5363a26bf18d0e9a83619bac226e09a7522a"
+      "sha256": "f56c6fd14cd5083b30a9a6a077b4d4b9388579069f1be3315e0a39065ae03606"
     }
   },
   "outcome": "improvement"

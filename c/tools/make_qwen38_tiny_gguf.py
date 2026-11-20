@@ -47,7 +47,7 @@ try:
     from gguf import GGMLQuantizationType as QT, GGUFValueType as VT
     from safetensors import safe_open
 except ImportError as exc:
-    sys.exit(f"Missing dependency: {exc}. Needs gguf, torch and safetensors (local-llm/.venv-fixtures).")
+    sys.exit(f"Missing dependency: {exc}. Needs gguf, torch and safetensors (pip install them in a virtualenv).")
 
 Q8, BF16, F32 = QT.Q8_0, QT.BF16, QT.F32
 

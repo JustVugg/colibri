@@ -1290,7 +1290,7 @@ test-qwen38-metal-kernels: tests/test_qwen38_metal_kernels
 # norms), imported in link mode: qwen38_tiny_256_gguf/ holds model.gguf, the importer's
 # config.json and tokenizer, and a ref.json rebased onto the CPU engine's tokens and logits
 # on that GGUF (--rebase-ref; the safetensors source's own ref.json is left alone). PYTHON needs
-# gguf, torch, transformers 5.16.1 and safetensors (local-llm/.venv-fixtures).
+# gguf, torch, transformers 5.16.1 and safetensors (a virtualenv with these packages).
 .PHONY: qwen38-tiny-gguf-generate
 qwen38-tiny-gguf-generate: qwen38$(EXE)
 	@test -f qwen38_tiny_256/model.safetensors || $(PYTHON) tools/make_qwen38_tiny.py --out ./qwen38_tiny_256 --geometry gguf-256
