@@ -1,0 +1,70 @@
+{
+  "schema": "atlas.evidence.demo.v1",
+  "mode": "deterministic-fixture",
+  "model_requests": 0,
+  "checks": {
+    "valid_span_passed": true,
+    "fabricated_quote_rejected": true,
+    "source_drift_rejected": true,
+    "changed_policy_rejected": true,
+    "tamper_detected": true,
+    "replay_original_accepted": true,
+    "replay_policy_blocks_report": true,
+    "replay_source_blocks_report": true,
+    "replay_policy_reuses_generation": true,
+    "replay_source_reuses_generation": true,
+    "replay_keeps_work_identity": true,
+    "replay_makes_zero_model_requests": true
+  },
+  "semantic_status": "unreviewed",
+  "replay": {
+    "original": {
+      "status": "accepted",
+      "model_requests": 0,
+      "stats": {
+        "works": 3,
+        "judgements": 3,
+        "attempts_total": 3,
+        "attempts_running": 0,
+        "attempts_interrupted": 0,
+        "attempts_failed": 0,
+        "producer_calls": 3,
+        "verifier_calls": 3,
+        "work_hits": 0,
+        "judgement_hits": 9
+      }
+    },
+    "policy_changed": {
+      "status": "blocked",
+      "model_requests": 0,
+      "stats": {
+        "works": 3,
+        "judgements": 4,
+        "attempts_total": 3,
+        "attempts_running": 0,
+        "attempts_interrupted": 0,
+        "attempts_failed": 0,
+        "producer_calls": 0,
+        "verifier_calls": 1,
+        "work_hits": 3,
+        "judgement_hits": 4
+      }
+    },
+    "source_changed": {
+      "status": "blocked",
+      "model_requests": 0,
+      "stats": {
+        "works": 3,
+        "judgements": 5,
+        "attempts_total": 3,
+        "attempts_running": 0,
+        "attempts_interrupted": 0,
+        "attempts_failed": 0,
+        "producer_calls": 0,
+        "verifier_calls": 1,
+        "work_hits": 3,
+        "judgement_hits": 4
+      }
+    }
+  }
+}

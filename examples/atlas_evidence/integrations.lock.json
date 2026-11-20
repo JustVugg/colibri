@@ -1,0 +1,20 @@
+{
+  "schema": "atlas.evidence.integrations.v1",
+  "colibri_base": {
+    "repository": "https://github.com/JustVugg/colibri",
+    "revision": "615037250e6ea95a046da8553be86573a6b6a1eb",
+    "licence": "Apache-2.0"
+  },
+  "reweave": {
+    "repository": "https://github.com/Albertito-AI/atlas-reweave",
+    "revision": "7242490af31dc0d805c48b79209414d711b40d7b",
+    "licence": "MIT",
+    "use": "Optional installed dependency for durable review and accepted dependency export"
+  },
+  "regnav": {
+    "repository": "https://github.com/Albertito-AI/regnav-source-watch",
+    "revision": "d758e4e53b73eac1a2d627a534709042b4288a45",
+    "licence": "Apache-2.0",
+    "use": "Manifest interoperability and source-change comparison; no vendored code"
+  }
+}
