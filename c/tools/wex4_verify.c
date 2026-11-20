@@ -93,8 +93,12 @@ static int wex4_verify_file(const char *path, int threads, char root[65], FILE *
     if (rc) { fprintf(log, "%s: not a valid WEX4 header page (wex4.h error %d)\n", path, rc); goto done; }
     for (int i = 0; i < 32; i++) snprintf(root + i * 2, 3, "%02x", h.root[i]);
     index = (unsigned char *)w4v_alloc((size_t)wex4_align(h.index_bytes) + WEX4_PAGE);
-    if (!index || (h.index_bytes && w4v_read(f, index, (uint32_t)wex4_align(h.index_bytes), h.index_offset)) ||
-        (rc = wex4_open(&h, index, (size_t)wex4_align(h.index_bytes), &v))) {
+    if (!index || (h.index_bytes && w4v_read(f, index, (uint32_t)wex4_align(h.index_bytes), h.index_offset))) {
+        fprintf(log, "%s: the index cannot be read (%s)\n", path, index ? "read failed" : "out of memory");
+        root[0] = 0;
+        goto done;
+    }
+    if ((rc = wex4_open(&h, index, (size_t)wex4_align(h.index_bytes), &v))) {
         fprintf(log, "%s: the index does not open (wex4.h error %d)\n", path, rc);
         root[0] = 0;
         goto done;
