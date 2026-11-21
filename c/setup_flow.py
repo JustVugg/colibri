@@ -1795,15 +1795,22 @@ def choose_model(ui, rows, wanted=None, show_all=False):
         raise SetupError("no model in the catalog fits this machine:\n" +
                          "\n".join(f"    {r['entry'].name}: {r['reason']}" for r in rows))
     ui.say("Models that fit this machine")
-    ui.say(f"  ({setup_catalog.FITS_EXPLAINED})")
+    measured = any(r.get("est") for r in fitting)
+    if measured:
+        ui.say("  (the speed is an estimate of decode here: the bytes a token reads over the "
+               "bandwidth that serves them, as measured on this machine)")
+    else:
+        ui.say(f"  ({setup_catalog.FITS_EXPLAINED})")
     for number, row in enumerate(fitting, 1):
-        entry = row["entry"]
+        entry, est = row["entry"], row.get("est")
         runs = "runs from RAM" if entry.size_class == "small" else "streams from the SSD"
+        if est:
+            runs = f"~{est['tok_s']:g} tok/s, {BACKEND_NAME[est['backend']]}"
         if entry.modality == "image":
             runs = "makes images"
         tag = "  [recommended]" if row["recommended"] else ""
-        ui.say(f"  {number:>2}) {entry.name:<28} {entry.disk_gb:>7.0f} GB   {runs:<20}{tag}".rstrip())
-        ui.say(f"      {entry.summary}; {row['reason']}"
+        ui.say(f"  {number:>2}) {entry.name:<32} {entry.disk_gb:>7.0f} GB   {runs:<22}{tag}".rstrip())
+        ui.say(f"      {entry.summary}; {est['where'] if est else row['reason']}"
                + (f"; {entry.license_note}" if entry.license_note else ""))
     hidden = [r for r in rows if not r["fits"]]
     if more:
@@ -2149,15 +2156,18 @@ def cmd_setup(a, ui=None):
     requested_ctx = getattr(a, "ctx", None)
 
     if a.list:
-        hw = setup_hw.detect(models_root_for(None, a.dir), probe_gpu=False)
-        rows = _recommend_for(hw, a.dir)
+        hw = setup_hw.detect(models_root_for(None, a.dir))
+        rows = _recommend_for(hw, a.dir, "cpu" if a.no_gpu else (a.backend or "auto"))
         if a.json:
             print(json.dumps([setup_catalog.as_dict(r) for r in rows], indent=2))
         else:
             for row in rows:
                 entry = row["entry"]
                 mark = "*" if row["recommended"] else " "
-                ui.say(f" {mark} {entry.id:<24} {entry.disk_gb:>7.0f} GB  {row['status']:<10} {row['reason']}")
+                est = row.get("est")
+                speed = f"~{est['tok_s']:g} tok/s {BACKEND_NAME[est['backend']]}" if est else row["status"]
+                ui.say(f" {mark} {entry.id:<26} {entry.disk_gb:>7.0f} GB  {speed:<20} "
+                       f"{est['where'] if est else row['reason']}")
         return 0
 
     write_state("starting")
@@ -2229,7 +2239,10 @@ def cmd_setup(a, ui=None):
                                  "the catalog any more: run `coli setup --reconfigure`")
             ui.say(f"Resuming the setup of {entry.name}.")
         else:
-            rows = _recommend_for(hw, a.dir)
+            import model_fit
+            fit = machine_fit(hw, models_root_for(None, a.dir))
+            ui.say(f"Measured: {model_fit.describe(fit)}\n")
+            rows = _recommend_for(hw, a.dir, "cpu" if a.no_gpu else (a.backend or "auto"), fit=fit)
             entry = choose_model(ui, rows, wanted=a.pick, show_all=a.all)
         family = family_by_id(entry.family)
         root = models_root_for(entry, a.dir) if not resume else os.path.dirname(resume["model_dir"])
@@ -2328,7 +2341,19 @@ def cmd_setup(a, ui=None):
     return _finish(ui, cfg, a)
 
 
-def _recommend_for(hw, explicit_dir):
+def machine_fit(hw, root):
+    """The machine as model_fit's estimates read it: setup_hw's report, the RAM's bandwidth
+    measured now (about two seconds), the cards' from the CUDA driver, the disk under `root`."""
+    import model_fit
+    probe = setup_hw._probe_cuda_child() if (hw.get("gpu") or {}).get("nvidia") else None
+    return model_fit.machine_from_hw(
+        hw, model_fit.measure_ram_bandwidth(avail_bytes=(hw.get("memory") or {}).get("available")),
+        model_fit.disk_kind(root), (probe or {}).get("devices"))
+
+
+def _recommend_for(hw, explicit_dir, requested="auto", tc=None, fit=None):
+    """The catalog for this machine: each model with its estimated speed on the backend the
+    setup would give its engine here (choose_backend), the best one marked."""
     root = models_root_for(None, explicit_dir)
     free = setup_hw.disk_free(root)
     downloaded = {}
@@ -2338,8 +2363,18 @@ def _recommend_for(hw, explicit_dir):
             downloaded[entry.id] = setup_download.bytes_present(os.path.join(root, entry.id),
                                                                 manifest.get("files", []),
                                                                 extra_shard_dirs(entry.family))
+    if fit is None:
+        fit = machine_fit(hw, root)
+    tc = tc if tc is not None else toolchain()
+    backends = {}
+    for family_id in {e.family for e in setup_catalog.catalog()}:
+        try:
+            backends[family_id] = choose_backend(hw, family_by_id(family_id), tc, requested)["backend"]
+        except Exception:   # a family the registry does not know: the CPU's estimate
+            backends[family_id] = "cpu"
     return setup_catalog.recommend(hw["memory"].get("total"), free, os_name=host_os(),
-                                   machine=hw["os"].get("machine"), downloaded=downloaded)
+                                   machine=hw["os"].get("machine"), downloaded=downloaded,
+                                   fit=fit, backends=backends)
 
 
 def _finish(ui, cfg, a):

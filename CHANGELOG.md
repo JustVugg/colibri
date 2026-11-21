@@ -9,6 +9,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### New
 
+- **`coli setup` (START-HERE) picks the model that runs best on the machine**, not the most
+  capable one that fits in RAM. It measures the RAM's read bandwidth (two seconds, standard
+  library only: a process a core scanning its own buffer, within 3% of numpy on three machines),
+  reads each card's memory and its bandwidth (the CUDA driver's memory clock and bus width, else
+  the card's name) and the disk's kind (NVMe, SSD, HDD), and `c/model_fit.py` estimates every
+  catalog model's decode speed on the backend `choose_backend` would give it: every weight on the
+  card, the dense part and some experts on it with the rest in RAM, in RAM, or streaming experts
+  from the disk. The estimates are the bytes a token reads (each entry's geometry, from its files'
+  headers) over the bandwidth that serves them plus a cost a layer, fitted to 19 measured runs on
+  two machines: within a fifth on the card and in RAM, a quarter half on the card. The default is
+  the most capable model that decodes at 20 tok/s or more, a slower one discounted by the square of
+  how far it falls short, one that streams from the disk at half its estimate; the menu and
+  `--list` show each model's estimate, backend and where it runs. On 8 GB a 2-bit Inkling-2-Mini,
+  on a 24 GB card Qwen3.8-Flash-Next UD-IQ3_XXS, on a 1 TB server with eight H100 MiMo-V2.6 Pro;
+  before, every machine from 12 GB to 512 GB got Qwen3.6-35B.
+- **The setup's catalog takes GGUFs**: Inkling-2-Mini UD-Q4_K_XL and UD-IQ2_XXS (with the
+  mmproj) and Qwen3.8-Flash-Next UD-IQ2_XS and UD-IQ3_XXS (with the MTP head), imported in place
+  after the download (`tools/gguf_link.py`).
 - **Inkling-2-Mini from mainline llama.cpp's layout** (`inkling2_loop`: unsloth's
   `Mainline_Support/*.gguf_file`, the same tensors as their root files byte for byte): `coli import`
   reads its metadata (`inkling2_loop.*`, `block_count` the checkpoint's 24 layers, the loop as

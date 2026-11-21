@@ -223,6 +223,9 @@ jobs:
           # person with argparse arguments -- so pack_python's import walk cannot reach
           # it, exactly like k3_tokenizer.py. Copied explicitly for the same reason.
           cp c/tools/check_ablate_evidence.py dist/tools/
+          # gguf_link.py is the setup catalog's post-download step for its GGUF entries, named
+          # there without its .py as k3_tokenizer is: copied explicitly for the same reason.
+          cp c/tools/gguf_link.py dist/tools/
           cp c/coli dist/
           # Windows has nothing to click otherwise: `coli` is an extensionless
           # Python script, and the .exe files are engines that exit at once
@@ -292,6 +295,7 @@ jobs:
           # Same position as k3_tokenizer.py: reachable only by a person, so only an
           # explicit gate can prove it shipped.
           test -f tools/check_ablate_evidence.py || { echo "FAIL: check_ablate_evidence.py missing from archive"; exit 1; }
+          test -f tools/gguf_link.py || { echo "FAIL: gguf_link.py (the setup's GGUF step) missing from archive"; exit 1; }
           # E tutto cio' che coli raggiunge, import e sottoprocessi. Il controllo
           # qui sopra guarda l'unico file che il passo di copia aveva appena
           # scritto: conferma se stesso, ed e' il motivo per cui la v1.10.0 e'

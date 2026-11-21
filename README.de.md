@@ -84,9 +84,13 @@ Du beantwortest eine einzige Frage, welches Modell, und Enter übernimmt die
 Empfehlung. Dann die Einrichtung:
 
 1. **prüft deinen Rechner**: RAM, freien Speicher, CPU und GPUs;
-2. **empfiehlt ein Modell, das passt**: der Teil des Modells, der immer im RAM bleibt,
-   plus ein minimaler Expert-Cache, muss in dein RAM passen, und der Download auf
-   deine Festplatte;
+2. **empfiehlt das Modell, das dort am besten läuft**: es misst die Bandbreite
+   deines RAM (zwei Sekunden), liest Speicher und Bandbreite jeder Grafikkarte und
+   die Art der Festplatte und schätzt für jedes Modell die Decode-Geschwindigkeit
+   auf dem Backend, das es bekäme (ganz auf der Karte, halb auf der Karte und halb
+   im RAM, im RAM oder von der Festplatte gestreamt). Vorgeschlagen wird das
+   leistungsfähigste, das flüssig dekodiert, und das Menü zeigt für jedes die
+   Schätzung;
 3. **besorgt die Engine**: Ist ein Compiler vorhanden, baut sie die Engine für deinen
    Rechner, sonst lädt sie die fertig gebaute herunter, die auf der CPU läuft und
    unter Linux und Windows auch auf einer Vulkan-GPU. Sie baut für deine GPU, wenn
@@ -193,12 +197,16 @@ Modell nicht heimlich neu definieren. [Wie es funktioniert](#how-it-works) enth�
 
 ## Welches Modell für meinen Rechner
 
-Die Einrichtung empfiehlt das leistungsfähigste Modell, das auf deinem Rechner aus dem
-RAM läuft, und listet direkt darunter die größeren auf, die von der Festplatte
-gestreamt werden. `./start-here.sh --list` zeigt sie alle im Vergleich zu deinem
-Rechner. Die Tabellen folgen dem eigenen Katalog der Einrichtung
-([`c/setup_catalog.py`](c/setup_catalog.py)); die Downloadgrößen sind die, die
-Hugging Face für jedes Repository angibt.
+Die Einrichtung schätzt, wie schnell jedes Modell auf deinem Rechner dekodiert
+([`c/model_fit.py`](c/model_fit.py): die Bytes, die ein Token liest, durch die
+Bandbreite, die sie liefert, plus ein Aufwand pro Schicht, an die unten gemessenen
+Geschwindigkeiten angepasst), und empfiehlt das leistungsfähigste, das flüssig
+dekodiert, mit 20 tok/s oder mehr; die langsameren zählen umso weniger, je weiter
+sie darunter liegen, und eines, das Experten von der Festplatte streamt, zählt mit
+der Hälfte seiner Schätzung. `./start-here.sh --list` zeigt sie alle mit ihren
+Schätzungen für deinen Rechner. Die Tabellen folgen dem eigenen Katalog der
+Einrichtung ([`c/setup_catalog.py`](c/setup_catalog.py)); die Downloadgrößen sind
+die, die Hugging Face für jedes Repository angibt.
 
 - **RAM** sind zwei Zahlen: Unterhalb der ersten startet das Modell nicht, ab der
   zweiten läuft es wie gemessen.
@@ -215,6 +223,8 @@ Hugging Face für jedes Repository angibt.
 |---|---|---|---|---|---|
 | **Qwen3.6-35B-A3B**: Chat mit Thinking und Tools | `qwen36-35b` | 23 GB | 10 / 20 GB | CUDA, Vulkan (auch integriert) | 6.0 tok/s auf der CPU, 9.9 mit Vulkan auf der integrierten GPU (A); 30.0 mit CUDA (C) |
 | Qwen3-Coder-30B-A3B: Code und Tool-Aufrufe, ohne Thinking | `qwen3-coder-30b` | 19 GB | 8 / 18 GB | CUDA, Vulkan (auch integriert) | 8.5-9.6 tok/s mit allen Experts im RAM, 5.1 mit 32 pro Layer (A, CPU) |
+| **Inkling-2-Mini** UD-Q4_K_XL: Chat, Bilder und Tools, Apache 2.0 (GGUF von unsloth) | `inkling2-mini` | 18 GB | 6 / 21 GB | CUDA, Vulkan | 40.9-41.1 tok/s mit CUDA, 39.2-39.4 mit Vulkan, 8.0-8.1 auf der CPU (D) |
+| Inkling-2-Mini UD-IQ2_XXS: dasselbe mit 2-Bit-Experten, für 8 bis 16 GB | `inkling2-mini-iq2` | 9 GB | 4 / 12 GB | CUDA, Vulkan | 46.3-46.5 tok/s mit CUDA, 46.0-46.2 mit Vulkan, 8.4 auf der CPU (D) |
 | **Qwen-Image-2.1**: Text zu Bild, nicht kommerzielle Lizenz; mit weniger RAM [seine GGUFs](docs/qwen-image.md#gguf-unsloth): 10 GB auf der Platte, 5.9 GB Spitze | `qwen-image-2.1` | 33 GB | 12 / 18 GB | Vulkan | ein Bild 768x512 in 2 min 40 s (8 Zen-4-Kerne, CPU) |
 
 **Große Modelle, deren Experts von der Festplatte gestreamt werden** (die Festplatte
@@ -226,6 +236,8 @@ bestimmt die Geschwindigkeit: eine schnelle NVMe hilft am meisten)
 | **DeepSeek V4 Flash** (284B): Tools | `deepseek-v4-flash` | 167 GB | 16 / 32 GB | CUDA, Vulkan | 0.93 tok/s mit 32 GB (Ryzen 7 5800X), 1.24 mit 63 GB (Ryzen 9 5950X), nur CPU; 1.5-1.6 mit CUDA (RTX 5080, 32 GB, zwei NVMe) |
 | **MiMo-V2.6 Flash** (309B): Vision und Tools | `mimo-v2.6-flash` | 172 GB | 32 / 52 GB | Vulkan | 2.34-3.37 tok/s (A, CPU) |
 | **Qwen3.8-Flash-Next** (125B + 51B n-gram): Vision und Tools | `qwen38-flash-next` | 186 GB | 24 / 32 GB | CUDA, Vulkan (auch integriert) | 1.91-2.56 tok/s mit 32-96 Experts pro Layer; 3.99 mit den optionalen int4-Experts (A, CPU) |
+| **Qwen3.8-Flash-Next** UD-IQ2_XS: 2-Bit-Experten und sein MTP-Kopf (GGUF von unsloth) | `qwen38-flash-next-iq2xs` | 80 GB | 16 / 54 GB | CUDA, Vulkan (auch integriert) | 55.8-56.6 tok/s mit CUDA, 36.3-36.7 mit Vulkan, halb auf der Karte; 7.5-8.2 auf der CPU (D) |
+| Qwen3.8-Flash-Next UD-IQ3_XXS: 3-Bit-Experten und sein MTP-Kopf (GGUF von unsloth) | `qwen38-flash-next-iq3` | 88 GB | 16 / 62 GB | CUDA, Vulkan (auch integriert) | 41.5-41.6 tok/s mit CUDA, 33.0-33.4 mit Vulkan, halb auf der Karte (D) |
 | **GLM-5.2** (744B): das Referenzmodell, mit dem MTP-Head | `glm-5.2` | 429 GB | 16 / 24 GB | CUDA, Vulkan | 0.05-0.1 tok/s kalt auf einem Laptop mit 25 GB; 1.83 auf einem Ryzen AI Max+ 395 mit 128 GB; 9.0-9.2 auf 6x RTX 5090 |
 | GLM-5.3 (744B): dieselbe Engine, ohne MTP-Head | `glm-5.3` | 419 GB | 16 / 24 GB | CUDA, Vulkan | |
 | **Inkling** (975B): int4-Experts, dichte bf16-Gewichte | `inkling` | 514 GB | 120 / 128 GB wie heruntergeladen; 25 GB nach einer [Konvertierung des dichten Teils](docs/inkling.md) | CUDA, Vulkan | 0.25 tok/s (Ryzen 9 7900, 187 GB, RTX A6000) |

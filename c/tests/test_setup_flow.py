@@ -136,6 +136,13 @@ def no_cuda_path(family_id):
             mock.patch.object(setup_flow, "WINDOWS_CUDA_ENGINES", windows):
         yield
 
+
+def cpu_fit(hw, root):
+    """setup_flow.machine_fit for the tests: the machine's RAM read at 40 GB/s, no card counted,
+    nothing measured (the real probe takes seconds and answers per machine)"""
+    return {"ram": (hw.get("memory") or {}).get("total") or 0, "ram_avail": None, "ram_gbs": 40.0,
+            "cards": [], "integrated": None, "disk": "nvme", "disk_gbs": 2.0}
+
 class HomeTestCase(unittest.TestCase):
     """Each test gets its own setup folder."""
 
@@ -1407,6 +1414,7 @@ class WholeSetup(HomeTestCase):
                 mock.patch.dict(os.environ, {"HF_ENDPOINT": self.hub.base,
                                              "COLI_SETUP_CATALOG": catalog}),
                 mock.patch.object(setup_flow, "HERE", self.engines),
+                mock.patch.object(setup_flow, "machine_fit", cpu_fit),
                 mock.patch.object(setup_hw, "detect",
                                   return_value=hw_report(vulkan=IGPU, icd="/home/u/dzn.json")),
                 mock.patch.object(setup_hw, "is_wsl", return_value=False),
@@ -1920,7 +1928,8 @@ class WholeSetup(HomeTestCase):
         self.assertEqual(second.id, [r for r in rows if r["fits"]][1]["entry"].id)
         menu = out.getvalue()
         self.assertIn("[recommended]", menu)
-        self.assertIn(setup_catalog.FITS_EXPLAINED, menu)
+        self.assertIn("the speed is an estimate of decode here", menu)
+        self.assertIn("tok/s, CPU", menu)
         self.assertIn("type a number from 1", menu)
 
     def test_json_mode_prints_the_configuration(self):

@@ -65,7 +65,7 @@ cd colibri
 你只需要回答一个问题：用哪个模型，直接按回车就采用推荐。然后安装程序会：
 
 1. **检查你的机器**：内存、磁盘可用空间、CPU 和 GPU；
-2. **推荐一个装得下的模型**：模型中始终留在内存里的部分，加上最小的专家缓存，必须放得进你的内存，下载的文件必须放得进你的磁盘；
+2. **推荐在这台机器上跑得最好的模型**：测量你的内存带宽（两秒），读取每张显卡的显存和带宽以及磁盘类型，并估计每个模型在它会用到的后端上的解码速度（全部在显卡上、一半在显卡一半在内存、在内存中，或从磁盘流式读取）。默认推荐解码流畅的模型中最强的一个，菜单会显示每个模型的估计速度；
 3. **获取引擎**：如果机器上有编译器，就为你的机器编译引擎，否则下载预编译版本，该版本在 CPU 上运行，在 Linux 和 Windows 上也能在 Vulkan GPU 上运行。在值得的时候，它会为你的 GPU 编译：Linux 上的 NVIDIA 显卡在装有 CUDA toolkit 时用 CUDA，否则用 Vulkan。在独立显卡上总是这样做；集成显卡与 CPU 共用内存，只有实测在集成显卡上更快的模型（Qwen3.6、Qwen3-Coder 和 Qwen3.8-Flash-Next）才会这样做。如果缺少某个软件包，它会打印出安装该软件包的确切命令，并继续使用 CPU；之后再运行一次安装程序，它就会为 GPU 重新编译；
 4. **下载模型**，显示进度并支持断点续传：随时可以中断，再次运行就会从中断的地方继续；
 5. **启动 colibri，并在浏览器中打开聊天界面**，同时打印出其他应用可以使用的地址：
@@ -134,7 +134,7 @@ Starting colibri
 
 ## 我的机器适合哪个模型
 
-安装程序会推荐能在你的机器上完全从内存运行的最强模型，并在它下面列出从磁盘流式读取的更大模型。`./start-here.sh --list` 会把所有模型与你的机器逐一对照。下面的表格与安装程序自己的目录（[`c/setup_catalog.py`](c/setup_catalog.py)）一致；下载大小是 Hugging Face 为每个仓库列出的大小。
+安装程序会估计每个模型在你的机器上的解码速度（[`c/model_fit.py`](c/model_fit.py)：一个 token 读取的字节数除以供给这些字节的带宽，再加上每层的固定开销，按下面实测的速度拟合），并推荐解码流畅（20 tok/s 及以上）的模型中最强的一个；更慢的模型差得越多，分数越低，从磁盘流式读取专家的模型按其估计速度的一半计算。`./start-here.sh --list` 会列出所有模型以及它们在你的机器上的估计速度。下面的表格与安装程序自己的目录（[`c/setup_catalog.py`](c/setup_catalog.py)）一致；下载大小是 Hugging Face 为每个仓库列出的大小。
 
 - **内存**一栏是两个数字：低于第一个数字时模型无法启动，达到第二个数字时，它的运行速度与实测一致。
 - **GPU** 一栏是安装程序能为该引擎编译的 GPU 版本（[GPU](#gpus)）。*含集成显卡*表示它也会使用集成显卡，这些引擎在集成显卡上实测更快；其他引擎只使用独立显卡。
@@ -146,6 +146,8 @@ Starting colibri
 |---|---|---|---|---|---|
 | **Qwen3.6-35B-A3B**：聊天，支持思考和工具调用 | `qwen36-35b` | 23 GB | 10 / 20 GB | CUDA、Vulkan（含集成显卡） | CPU 上 6.0 tok/s，在集成显卡上用 Vulkan 9.9（A）；用 CUDA 30.0（C） |
 | Qwen3-Coder-30B-A3B：写代码和工具调用，不带思考 | `qwen3-coder-30b` | 19 GB | 8 / 18 GB | CUDA、Vulkan（含集成显卡） | 全部专家都在内存中时 8.5-9.6 tok/s，每层 32 个时 5.1（A，CPU） |
+| **Inkling-2-Mini** UD-Q4_K_XL：聊天、图片和工具调用，Apache 2.0（unsloth 的 GGUF） | `inkling2-mini` | 18 GB | 6 / 21 GB | CUDA、Vulkan | CUDA 40.9-41.1 tok/s，Vulkan 39.2-39.4，CPU 8.0-8.1（D） |
+| Inkling-2-Mini UD-IQ2_XXS：同一模型，专家为 2 位，适合 8 到 16 GB | `inkling2-mini-iq2` | 9 GB | 4 / 12 GB | CUDA、Vulkan | CUDA 46.3-46.5 tok/s，Vulkan 46.0-46.2，CPU 8.4（D） |
 | **Qwen-Image-2.1**：文生图，非商业许可；内存较少时用[它的 GGUF](docs/qwen-image.md#gguf-unsloth)：磁盘 10 GB，峰值 5.9 GB | `qwen-image-2.1` | 33 GB | 12 / 18 GB | Vulkan | 一张 768x512 的图片用时 2 分 40 秒（8 个 Zen 4 核心，CPU） |
 
 **大模型，专家从磁盘流式读取**（速度由磁盘决定：快速的 NVMe 硬盘帮助最大）
@@ -156,6 +158,8 @@ Starting colibri
 | **DeepSeek V4 Flash**（284B）：工具调用 | `deepseek-v4-flash` | 167 GB | 16 / 32 GB | CUDA、Vulkan | 32 GB 时 0.93 tok/s（Ryzen 7 5800X），63 GB 时 1.24（Ryzen 9 5950X），仅用 CPU；用 CUDA 1.5-1.6（RTX 5080，32 GB，两块 NVMe） |
 | **MiMo-V2.6 Flash**（309B）：视觉和工具调用 | `mimo-v2.6-flash` | 172 GB | 32 / 52 GB | Vulkan | 2.34-3.37 tok/s（A，CPU） |
 | **Qwen3.8-Flash-Next**（125B + 51B n-gram）：视觉和工具调用 | `qwen38-flash-next` | 186 GB | 24 / 32 GB | CUDA、Vulkan（含集成显卡） | 每层 32-96 个专家时 1.91-2.56 tok/s；使用可选的 int4 专家时 3.99（A，CPU） |
+| **Qwen3.8-Flash-Next** UD-IQ2_XS：2 位专家，带 MTP 头（unsloth 的 GGUF） | `qwen38-flash-next-iq2xs` | 80 GB | 16 / 54 GB | CUDA、Vulkan（含集成显卡） | 一半在显卡上：CUDA 55.8-56.6 tok/s，Vulkan 36.3-36.7；CPU 7.5-8.2（D） |
+| Qwen3.8-Flash-Next UD-IQ3_XXS：3 位专家，带 MTP 头（unsloth 的 GGUF） | `qwen38-flash-next-iq3` | 88 GB | 16 / 62 GB | CUDA、Vulkan（含集成显卡） | 一半在显卡上：CUDA 41.5-41.6 tok/s，Vulkan 33.0-33.4（D） |
 | **GLM-5.2**（744B）：参考模型，带 MTP head | `glm-5.2` | 429 GB | 16 / 24 GB | CUDA、Vulkan | 25 GB 笔记本上冷启动 0.05-0.1 tok/s；128 GB 的 Ryzen AI Max+ 395 上 1.83；6x RTX 5090 上 9.0-9.2 |
 | GLM-5.3（744B）：同一个引擎，没有 MTP head | `glm-5.3` | 419 GB | 16 / 24 GB | CUDA、Vulkan | |
 | **Inkling**（975B）：int4 专家，bf16 稠密权重 | `inkling` | 514 GB | 按下载格式为 120 / 128 GB；经过[稠密部分转换](docs/inkling.md)后为 25 GB | CUDA、Vulkan | 0.25 tok/s（Ryzen 9 7900，187 GB，RTX A6000） |

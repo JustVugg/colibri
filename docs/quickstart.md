@@ -31,10 +31,18 @@ Both run `coli setup`, which does the rest:
 
 1. **Finds your hardware**: RAM, free disk where the model goes, CPU features,
    and GPUs (any Vulkan GPU with its memory, NVIDIA cards through nvidia-smi).
-2. **Recommends a model that fits**, in a short numbered menu with download
-   sizes; Enter takes the recommendation. "Fits" means the part of the model
-   that always stays in RAM (the dense part) plus a minimum expert cache fit
-   in your RAM, and the download fits on your disk.
+2. **Recommends the model that runs best there**, in a short numbered menu
+   with download sizes and each model's estimated decode speed; Enter takes the
+   recommendation. It measures the RAM's bandwidth (two seconds), reads each
+   card's memory and bandwidth (from the CUDA driver, else from its name) and
+   the disk's kind (NVMe, SSD, HDD), and estimates each model on the backend
+   it would get: all on the card, half on the card and half in RAM, in RAM, or
+   streaming experts from the disk ([`c/model_fit.py`](../c/model_fit.py),
+   fitted to measured runs). The default is the most capable model that
+   decodes at 20 tok/s or more, a slower one discounted by how far it falls
+   short; one that streams from the disk counts at half its estimate. A model
+   fits at all when its dense part and a minimum expert cache fit in RAM and
+   the download on the disk.
 3. **Gets the engine**: it builds it for your machine when a compiler is
    there, with Vulkan or CUDA when your GPU can use it, or downloads the
    prebuilt one when there is no compiler (CPU, and on x86-64 Linux and
@@ -65,13 +73,16 @@ Your machine
   GPU     Intel(R) Iris(R) Xe Graphics via Vulkan 1.3 (integrated, shares RAM)
   System  Ubuntu 24.04 LTS
 
+Measured: RAM 27 GB at 44 GB/s, integrated GPU Intel(R) Iris(R) Xe Graphics, disk NVMe
+
 Models that fit this machine
-  (fits = the dense part, which always stays in RAM, plus a minimum expert cache fit in RAM, and the download fits on the disk)
-   1) Qwen3.6-35B-A3B                   23 GB   runs from RAM         [recommended]
-      general chat with thinking and tools; int4-gs64 container; the whole model fits in RAM (20 GB)
-   2) Qwen3-Coder-30B-A3B               19 GB   runs from RAM
-      coding model with tool calls, no thinking; int4-gs64 container; the whole model fits in RAM (18 GB)
-   3) DeepSeek V4 Flash REAP 150B       85 GB   streams from the SSD
+  (the speed is an estimate of decode here: the bytes a token reads over the bandwidth that serves them, as measured on this machine)
+   1) Qwen3.6-35B-A3B                    23 GB   ~13.8 tok/s, Vulkan    [recommended]
+      general chat with thinking and tools; int4-gs64 container; every weight in RAM, the integrated GPU (Intel(R) Iris(R) Xe Graphics)
+   2) Qwen3-Coder-30B-A3B                19 GB   ~15.4 tok/s, Vulkan
+      coding model with tool calls, no thinking; int4-gs64 container; every weight in RAM, the integrated GPU (Intel(R) Iris(R) Xe Graphics)
+   3) Inkling-2-Mini UD-IQ2_XXS           9 GB   ~11.2 tok/s, CPU
+      Inkling-2-Mini with 2-bit experts, for 8 to 16 GB of RAM; unsloth's GGUF; every weight in RAM (9 of 23 GB), the CPU
    ...
   (2 more fit too: `--all` lists them, `--model ID` picks one)
   (4 more need more RAM or disk: `coli setup --list` shows why)
