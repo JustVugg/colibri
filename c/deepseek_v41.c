@@ -6807,6 +6807,35 @@ int main(int argc, char **argv) {
         }
     }
 #endif
+#if defined(_OPENMP) && defined(__linux__)
+    /* Bind the team, one thread to a core packed from the first (OMP_PROC_BIND=close,
+     * OMP_PLACES=cores), as colibri and inkling do. Unbound, the scheduler moves the team's
+     * threads onto a hybrid CPU's efficiency cores, and the team waits at every barrier for the
+     * slowest of them. libgomp reads these when it loads, so the process runs itself again
+     * once with them set. An OMP_PROC_BIND or OMP_PLACES the user set wins (setenv's 0);
+     * COLI_NO_OMP_TUNE=1 leaves the team unbound. Not OMP_WAIT_POLICY=active: a spinning team
+     * measured slower here, beside the GPU's threads. */
+    if (!getenv("COLI_OMP_TUNED") && !getenv("COLI_NO_OMP_TUNE") && argv && argv[0]) {
+        setenv("OMP_PROC_BIND", "close", 0);
+        setenv("OMP_PLACES", "cores", 0);
+        setenv("COLI_OMP_TUNED", "1", 1);
+#ifdef CPU_SETSIZE
+        {   /* #471: a user's OMP_PROC_BIND already bound this thread to one place; the new image
+             * would inherit that mask and put its whole team there */
+            cpu_set_t all; CPU_ZERO(&all);
+            long n = sysconf(_SC_NPROCESSORS_ONLN);
+            if (n > CPU_SETSIZE) n = CPU_SETSIZE;
+            for (long i = 0; i < n; i++) CPU_SET((int)i, &all);
+            if (sched_setaffinity(0, sizeof all, &all) != 0) perror("[OMP] deepseek_v41: sched_setaffinity before the re-exec (continuing)");
+        }
+#endif
+        char self[4096];   /* the binary's own path, so the process keeps its name */
+        ssize_t k = readlink("/proc/self/exe", self, sizeof self - 1);
+        if (k > 0) { self[k] = 0; execv(self, argv); }
+        execv("/proc/self/exe", argv);
+        perror("[OMP] deepseek_v41: execv self-reexec failed, the team runs unbound");
+    }
+#endif
     coli_env_check(CE_DSV41, "deepseek-v41");
     coli_env_dump(CE_DSV41, "deepseek-v41");
     /* Size the team to PHYSICAL cores before anything else touches the model.
