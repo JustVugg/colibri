@@ -2038,6 +2038,15 @@ qwen36-tiny-mtp-check: qwen36-tiny-mtp-generate qwen36$(EXE)
 	$(PYTHON) tests/qwen36_mtp_harness.py --engine ./qwen36$(EXE) --source ./qwen36_tiny_mtp \
 		--model ./qwen36_tiny_mtp_i8 --model ./qwen36_tiny_mtp_i4
 
+# A Basalt .basalt qwen35 pack -> GGUF (tools/convert_basalt_to_gguf.py): the converter
+# on a tiny pack in Basalt's form (tests/basalt_fixture.py), then the converted file on
+# qwen36 (CPU): GGUF_CHECK, MTP drafts, residuals equal to the pack's values. Here the
+# engine part may not skip; test-python runs the same file and skips it when qwen36 is
+# not built.
+.PHONY: basalt-convert-check
+basalt-convert-check: qwen36$(EXE)
+	BASALT_CONVERT_REQUIRED=1 $(PYTHON) -m unittest -v tests.test_convert_basalt_to_gguf
+
 # Speculative decoding with deeper verifies (docs/speculative.md): the MTP head's
 # drafts up to 3 per verify (Q38_MTP_DRAFTS) and prompt-lookup drafts up to 5
 # (COLI_LOOKUP=1, spec_draft.h), on qwen38 and qwen36. tests/test_spec_draft
