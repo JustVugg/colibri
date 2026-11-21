@@ -434,6 +434,45 @@ static void head_logits_on_the_card(Weights *w, const Model *shared, const int *
     g_cuda_chain = 0;
 }
 
+static void placement_probe(Weights *w) {
+    QW *cw[2] = { &w->L[0].dn_qkv, &w->L[0].dn_qkv };
+    float x[D], y[CD];
+    for (int i = 0; i < D; i++) x[i] = sinf(0.37f * i);
+    double gpu = 0, cpu = 0;
+#ifdef COLI_SYCL
+    unsetenv("COLI_TRUNK_PROBE_PIPE");   /* exercise the SYCL default */
+#else
+    setenv("COLI_TRUNK_PROBE_PIPE", "1", 1);
+#endif
+    int frames0 = fake_chain_frames, ops0 = fake_chain_ops, dense0 = qt_dense_count();
+    size_t bytes0 = fake_chain_dev_bytes;
+    ck(trunk_probe_chain(cw, 2, 0, x, y, &gpu, &cpu) == 1 && gpu >= 0 && cpu >= 0,
+       "resident probe measures the GPU and CPU with the tiny matrices");
+    ck(fake_chain_frames - frames0 == 7 && fake_chain_ops - ops0 == 39,
+       "resident probe waits per batch, not per matrix");
+    ck(fake_chain_dev_bytes == bytes0 && qt_dense_count() == dense0 && fcc_ready(),
+       "probe frees temporary buffers, consumes no dense handles and leaves the context usable");
+    frames0 = fake_chain_frames;
+    setenv("COLI_TRUNK_PROBE_PIPE", "0", 1);
+    ck(trunk_probe_chain(cw, 2, 0, x, y, &gpu, &cpu) == 0 && fake_chain_frames == frames0,
+       "the probe knob restores the legacy path without submitting work");
+    setenv("COLI_TRUNK_PROBE_PIPE", "1", 1); setenv("COLI_CUDA_CHAIN", "0", 1);
+    ck(trunk_probe_chain(cw, 2, 0, x, y, &gpu, &cpu) == 0,
+       "a disabled chain keeps the synchronous probe");
+    setenv("COLI_CUDA_CHAIN", "1", 1); fake_chain_absent = 1;
+    ck(trunk_probe_chain(cw, 2, 0, x, y, &gpu, &cpu) == 0,
+       "an older backend without a chain keeps the synchronous probe");
+    fake_chain_absent = 0;
+    fake_chain_fail_at = fake_chain_frames + 1;
+    ck(trunk_probe_chain(cw, 2, 0, x, y, &gpu, &cpu) == -1 && fcc_lost(),
+       "a failed probe stops startup without retrying or claiming a timing result");
+    ck(fake_chain_dev_bytes == bytes0 && qt_dense_count() == dense0,
+       "failed probe releases its temporary buffers too");
+    fake_chain_fail_at = 0; fcc_shutdown();   /* fake device only: reset for independent tests */
+    unsetenv("COLI_TRUNK_PROBE_PIPE");
+}
+
+
 /* a short prompt chunk's copies for one layer (q36cc_routed_fetches): the experts its rows route
  * to that have regions in the staged table, two regions each, in the table's order. Only the
  * list is tested here: the copy itself runs on a card (the T4 bench of the experiment record). */
@@ -480,6 +519,7 @@ int main(int argc, char **argv) {
     setenv("COLI_CUDA_CHAIN", "1", 1);
     fake_ndev = 1; fake_dense_compute = 1;
     Weights w; make_weights(&w);
+    placement_probe(&w);
     const int ids[12] = {3, 17, 42, 9, 21, 60, 5, 33, 12, 48, 7, 29};   /* the verify reads three from index 6 */
 
     ck(qt_init(NL, E, D, INTER, E, TOPK, 0, 0), "the tier is up");

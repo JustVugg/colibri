@@ -83,6 +83,9 @@ static int qwen36_max_ctx(void) {
 #include "qwen38_nfc.h"         /* NFC, the tokenizer.json normalizer (Clef) */
 #include "coli_env.h"
 #include "qwen36_tier.h"   /* optional CUDA VRAM expert tier */
+#ifdef COLI_CUDA
+#include "cuda_chain.h"    /* resident-chain placement probe, before the engine chain */
+#endif
 #include "vk_tier.h"       /* optional Vulkan routed-expert tier (COLI_VULKAN=1; stubs without VK=1) */
 #include "route_trace.h"   /* the tier's expert history (.coli_usage), kept only while the tier is on */
 #include "draft_vocab.h"   /* the tokens the MTP head scores for a draft (Q36_MTP_VOCAB) */
@@ -3298,20 +3301,47 @@ static uint64_t qwen_dense_fingerprint(shards *S, const QdfSpec *s, int n) {
  * 8, no COLI_KEEP_F32, and a run on the CPU (not COLI_CUDA=1 or COLI_VULKAN=1, which
  * place or upload the matrices their own way), outside the adapters. A file beside
  * the model that does not match it is set aside with the reason, and the matrices
- * are converted as without it; one named by QWEN_DENSE_CACHE stops the start. */
+ * are converted as without it; one named by QWEN_DENSE_CACHE stops the start.
+ *
+ * COLI_CUDA_DENSE_CACHE=1 lets a COLI_CUDA=1 run use the file too. The placer
+ * uploads the INT8 rows and scales load_tq leaves in the QW (dense_keep_i8 keeps
+ * them under COLI_CUDA=1), and those are the file's bytes or the conversion's:
+ * the same either way. Default off: a COLI_CUDA=1 start converts as before.
+ * QWEN_DENSE_CACHE_VERIFY=1 converts every matrix as without the file and
+ * compares the result with the file's rows and scales (a start that proves the
+ * file for this build and this model; it saves no time). */
+static int qwen_dense_verify_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("QWEN_DENSE_CACHE_VERIFY"); v = e && *e == '1'; }
+    return v;
+}
+static int g_dense_release = 0;   /* COLI_CUDA_DENSE_CACHE=1 in effect: qwen_dense_read gives the file's pages back as it copies */
+static void qwen_dense_file_open_(Model *m, const char *snap, int full);
 static void qwen_dense_file_open(Model *m, const char *snap, int full) {
+    qwen_dense_file_open_(m, snap, full);
+    /* A verify start that compares nothing must not look like one that passed. */
+    if (full && qwen_dense_verify_on() && !m->dense_file.base) {
+        fprintf(stderr, "[qwen-dense] QWEN_DENSE_CACHE_VERIFY=1, but this start uses no canonical.qc (none found, set aside above, or not allowed: COLI_CUDA=1 needs COLI_CUDA_DENSE_CACHE=1): nothing to compare\n");
+        exit(1);
+    }
+}
+static void qwen_dense_file_open_(Model *m, const char *snap, int full) {
     const char *path = getenv("QWEN_DENSE_CACHE");
     if (path && !*path) path = NULL;   /* empty: unset */
     char beside[1100]; struct stat st;
     int usable = full && dense_i8_on() && dense_bits() == 8 && !getenv("COLI_KEEP_F32") && !q36_waligned();
 #ifdef COLI_CUDA
-    { const char *cu = getenv("COLI_CUDA"); if (cu && *cu == '1') usable = 0; }
+    { const char *cu = getenv("COLI_CUDA"), *dc = getenv("COLI_CUDA_DENSE_CACHE");
+      /* unset: the platform's measured default (the file used on Data Center GPU Max cards, where there is one) */
+      if (cu && *cu == '1' && !(dc && *dc) && coli_cuda_tuned_default("COLI_CUDA_DENSE_CACHE", 0) == 1) dc = "1";
+      if (cu && *cu == '1' && !(dc && *dc == '1')) usable = 0;
+      else if (cu && *cu == '1') g_dense_release = 1; }
 #endif
 #if defined(COLI_SEGMENT_ADAPTER) || defined(COLI_EDGE_ADAPTER)
     usable = 0;
 #endif
     if (!usable) {
-        if (path) { fprintf(stderr, "[qwen-dense] QWEN_DENSE_CACHE needs the whole model in INT8 (COLI_DENSE_BITS=8, not COLI_DENSE_I8=0), without COLI_KEEP_F32, COLI_CUDA=1, COLI_VULKAN=1 or an adapter\n"); exit(1); }
+        if (path) { fprintf(stderr, "[qwen-dense] QWEN_DENSE_CACHE needs the whole model in INT8 (COLI_DENSE_BITS=8, not COLI_DENSE_I8=0), without COLI_KEEP_F32, COLI_CUDA=1 (unless COLI_CUDA_DENSE_CACHE=1), COLI_VULKAN=1 or an adapter\n"); exit(1); }
         return;
     }
     int named = path != NULL;
@@ -3330,8 +3360,9 @@ static void qwen_dense_file_open(Model *m, const char *snap, int full) {
         fprintf(stderr, "[qwen-dense] %s; converting the matrices at start instead\n", error);
         return;
     }
-    fprintf(stderr, "[qwen-dense] %s: %d INT8 matrices (%zu bytes) checked in %.3f s, read instead of converted\n",
-            path, l.count, m->dense_file.bytes, now_s() - started);
+    fprintf(stderr, "[qwen-dense] %s: %d INT8 matrices (%zu bytes) checked in %.3f s, %s\n",
+            path, l.count, m->dense_file.bytes, now_s() - started,
+            qwen_dense_verify_on() ? "to be compared with this start's conversion (QWEN_DENSE_CACHE_VERIFY=1)" : "read instead of converted");
     qwen_dense_list_free(&l);
 }
 /* A matrix canonical.qc holds: its rows and scales copied out of the file.
@@ -3341,6 +3372,28 @@ static void qwen_dense_file_open(Model *m, const char *snap, int full) {
  * 01f32c06, a 64-token prompt and 8 generated tokens: with the matrices used
  * in place, prompt -5% and generation -29%, and 1.3 to 4.8 times the page
  * faults of one read of the file). */
+/* COLI_CUDA_DENSE_CACHE=1: the rows copied `blk` bytes a block (64 MB), the blocks over the threads, and a
+ * block's whole pages of the mapping given back once it is copied (they stay in the page
+ * cache). Without the release every page of the file counts in the process's peak resident
+ * size beside its copy -- on the 35B, 3.74 GB at the end of the load against 2.95 GB for a
+ * conversion (ru_maxrss, which the auto cap subtracts from RAM_GB). The bytes copied are the
+ * same; the other callers keep the one memcpy. */
+static void qwen_dense_copy_release(int8_t *dst, const int8_t *src, size_t n, size_t blk) {
+    const int64_t nb = (int64_t)((n + blk - 1) / blk);
+#ifndef _WIN32
+    long pgl = sysconf(_SC_PAGESIZE);
+    const uintptr_t pg = pgl > 0 ? (uintptr_t)pgl : 4096;
+#endif
+    #pragma omp parallel for schedule(static)
+    for (int64_t b = 0; b < nb; b++) {
+        size_t at = (size_t)b * blk, k = n - at < blk ? n - at : blk;
+        memcpy(dst + at, src + at, k);
+#ifndef _WIN32
+        uintptr_t lo = ((uintptr_t)(src + at) + pg - 1) / pg * pg, hi = (uintptr_t)(src + at + k) / pg * pg;
+        if (hi > lo) madvise((void *)lo, hi - lo, MADV_DONTNEED);
+#endif
+    }
+}
 static int qwen_dense_read(Model *m, const char *name, int I, int O, QW *out) {
     if (!m->dense_file.base) return 0;
     const int8_t *q; const float *sc;
@@ -3350,10 +3403,22 @@ static int qwen_dense_read(Model *m, const char *name, int I, int O, QW *out) {
     memset(out, 0, sizeof(*out));
     out->q = q36_walloc((size_t)O * I); out->sc = malloc((size_t)O * sizeof(float));
     if (!out->q || !out->sc) { fprintf(stderr, "OOM reading %s from canonical.qc\n", name); exit(1); }
-    memcpy(out->q, q, (size_t)O * I); memcpy(out->sc, sc, (size_t)O * sizeof(float));
+    if (g_dense_release) qwen_dense_copy_release(out->q, q, (size_t)O * I, (size_t)64 << 20);
+    else memcpy(out->q, q, (size_t)O * I);
+    memcpy(out->sc, sc, (size_t)O * sizeof(float));
     out->I = I; out->O = O;
     return 1;
 }
+/* QWEN_DENSE_CACHE_VERIFY=1: w is the matrix `name` as this start converted it. 1 when
+ * canonical.qc holds the same rows and the same scales, byte for byte; 0 when it does
+ * not, or does not hold the matrix. */
+static int qwen_dense_same(const Model *m, const char *name, int I, int O, const QW *w) {
+    const int8_t *q; const float *sc;
+    if (!m->dense_file.base || !w->q || !w->sc) return 0;
+    if (!qdf_find(&m->dense_file, name, I, O, &q, &sc)) return 0;
+    return !memcmp(w->q, q, (size_t)O * I) && !memcmp(w->sc, sc, (size_t)O * sizeof(float));
+}
+static int g_dense_verified = 0;   /* matrices QWEN_DENSE_CACHE_VERIFY=1 compared (all equal: a difference stops the start) */
 
 /* The Metal graph uses canonical.qc's rows and scales in place: the GPU reads
  * them from the mapping (qwen36_graph.h), which it keeps for the run. */
@@ -3448,7 +3513,7 @@ static void load_tq(Model *m, const char *name, int I, int O, int quantize, cons
         }
         return;
     }
-    if (quantize && dense_i8_on() &&
+    if (quantize && dense_i8_on() && !qwen_dense_verify_on() &&
         (QWEN_GRAPH(m) ? qwen_dense_mapped(m, name, I, O, out) : qwen_dense_read(m, name, I, O, out))) return;
     float *p = load_t_n(m, name, (int64_t)I * O);
     out->w = p; out->q = NULL; out->sc = NULL; out->I = I; out->O = O;
@@ -3465,6 +3530,13 @@ static void load_tq(Model *m, const char *name, int I, int O, int quantize, cons
         return;
     }
     qw_quantize(p, I, O, tag, out);
+    if (m->dense_file.base && qwen_dense_verify_on()) {
+        if (!qwen_dense_same(m, name, I, O, out)) {
+            fprintf(stderr, "[qwen-dense] QWEN_DENSE_CACHE_VERIFY: %s differs from this start's conversion (or is not in canonical.qc)\n", name);
+            exit(1);
+        }
+        g_dense_verified++;
+    }
     if (getenv("COLI_KEEP_F32")) out->w = p; else { free(p); out->w = NULL; }
 }
 /* load_tq, and under COLI_VULKAN a note of what it read (name, tag, whether it was
@@ -4720,7 +4792,14 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         }
     }
     #undef QCOUNT
-    if (quantize_dense && m->dense_file.base)
+    if (quantize_dense && m->dense_file.base && qwen_dense_verify_on() && g_dense_verified != qcount) {
+        fprintf(stderr, "[qwen-dense] QWEN_DENSE_CACHE_VERIFY: %d matrices quantized, %d compared with canonical.qc\n", qcount, g_dense_verified);
+        exit(1);
+    }
+    if (quantize_dense && m->dense_file.base && qwen_dense_verify_on())
+        fprintf(stderr, "[dense-i8] %d matrices quantized during load, %.1f GB f32 freed; QWEN_DENSE_CACHE_VERIFY: %d of them compared with canonical.qc, rows and scales identical\n",
+                qcount, qfreed/1073741824.0, g_dense_verified);
+    else if (quantize_dense && m->dense_file.base)
         fprintf(stderr, "[dense-i8] %d matrices read from canonical.qc, no f32 copies\n", qcount);
     else if (quantize_dense)
         fprintf(stderr, "[dense-i8] %d matrices %s during load, %.1f GB f32 freed\n", qcount,
@@ -5114,6 +5193,26 @@ static void unpack_int4_to_int8(int8_t *out, const uint8_t *raw, int64_t n)
     }
 }
 
+/* Whether an expert's bytes are dropped from the page cache once read (st_read_raw's drop). 1, the default:
+ * the cache does not hold a second copy of what the slot keeps, and every start reads the experts from the
+ * drive again (qwen36-35b-a3b on a Max 1100 host: 16 GB at 4.4 GB/s, 3.65 s of a 3.8 s warm start, start
+ * after start). COLI_EXPERT_PAGECACHE=1 leaves them in the cache: a restart takes them from memory, for
+ * that much reclaimable page cache. */
+static int q36_expert_drop(void) {
+    static int drop = -1;
+    if (drop < 0) {
+        const char *e = getenv("COLI_EXPERT_PAGECACHE");
+        int keep = e && *e == '1';
+#ifdef COLI_CUDA
+        /* unset, on the card: the platform's measured default (kept on Data Center GPU Max cards); a CPU run never
+         * asks the backend (it would start the device runtime for nothing) */
+        { const char *cu = getenv("COLI_CUDA");
+          if (!(e && *e) && cu && cu[0] == '1' && !cu[1] && coli_cuda_tuned_default("COLI_EXPERT_PAGECACHE", 0) == 1) keep = 1; }
+#endif
+        drop = !keep;
+    }
+    return drop;
+}
 #ifdef QWEN36_METAL_GRAPH
 /* One experts.qc record straight into a Metal slot, which holds the weights
  * and then the scales in the same order. */
@@ -5223,7 +5322,7 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
         if (!noted_m) { fprintf(stderr, "[qwen36] mixed expert layout detected (int4 gate/up, int8 down) — unpacking gate/up to int8 in slot\n"); noted_m = 1; }
         uint8_t *raw = (uint8_t *)malloc((size_t)want_mixed);
         if (!raw) { fprintf(stderr, "OOM reading mixed expert %s\n", nm); exit(1); }
-        st_read_raw(&m->S, nm, raw, 1);
+        st_read_raw(&m->S, nm, raw, q36_expert_drop());
         unpack_int4_to_int8(s->g, raw, ng + ng);          /* 2*ng elements from ng bytes */
         memcpy(s->d, raw + ng, (size_t)nd);
         free(raw);
@@ -5250,7 +5349,7 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
             free(raw); raw = (uint8_t *)malloc((size_t)(want_w / 2)); raw_cap = raw ? (size_t)(want_w / 2) : 0;
         }
         if (!raw) { fprintf(stderr, "OOM reading int4 expert %s\n", nm); exit(1); }
-        st_read_raw(&m->S, nm, raw, 1);
+        st_read_raw(&m->S, nm, raw, q36_expert_drop());
         if (s->pw && xf_r16(m)) {
             /* shared kernel, rows interleaved by 16: pairs -> planar beside, then the slot's
              * groups with the scales, on the threads unless the caller already runs on them */
@@ -5315,7 +5414,7 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
     } else {
         s->is_int4 = 0;
         slot_free_i4(s);
-        st_read_raw(&m->S, nm, s->g, 1);
+        st_read_raw(&m->S, nm, s->g, q36_expert_drop());
     }
     st_read_f32(&m->S, qsnm, s->gs, 0);
 }
@@ -7594,6 +7693,63 @@ static int trunk_place_dense(Model *m, double *vram_bytes, int kinds[3]){
     return placed;
 }
 
+#ifdef COLI_CUDA
+/* Time the path the resident chain actually runs: device inputs/outputs, ten
+ * distinct weights and one completion per batch. No tensor or buffer survives
+ * the probe. Keep the context: shutting it down also ends frame profiling.
+ * 0: legacy probe requested/unavailable; 1: measured; -1: GPU operation failed.
+ * A failure must not start another probe or silently continue on the device. */
+static int trunk_probe_chain(QW **cw, int nc, int dev, const float *x, float *y,
+                             double *gpu, double *cpu) {
+    const char *e = getenv("COLI_TRUNK_PROBE_PIPE"), *chain = getenv("COLI_CUDA_CHAIN");
+#ifdef COLI_SYCL
+    int enabled = !(e && *e == '0');
+#else
+    int enabled = e && *e == '1';   /* other backends keep their measured policy */
+#endif
+    if (!enabled || (chain && *chain == '0')) return 0;
+    const ColiCudaChainOps *op = coli_cuda_chain_ops();
+    if (!op || op->size < CC_OPS_BASE_SIZE) return 0;
+    int I = cw[0]->I, O = cw[0]->O, ok = 0;
+    ColiCudaTensor *t[10] = {0};
+    CcBuf *xb = NULL, *yb = NULL;
+    if (!op->init(dev)) goto done;
+    for (int k = 0; k < nc; k++)
+        if (!coli_cuda_tensor_upload(&t[k], cw[k]->q, cw[k]->sc, 1, I, O, dev)) goto done;
+    xb = op->buf((size_t)I * sizeof(float), CC_DEV);
+    if (!xb) goto done;
+    yb = op->buf((size_t)O * sizeof(float), CC_DEV);
+    if (!yb || !op->begin() || !op->write(xb, 0, x, (size_t)I * sizeof(float)) || !op->submit(1)) goto done;
+    *gpu = *cpu = 1e30;
+    for (int r = 0; r < 3; r++) {
+        if (!op->begin()) goto done;
+        for (int k = 0; k < 3; k++)
+            if (!op->matmul(t[(7 + k) % nc], xb, 0, yb, 0, 1)) goto done;
+        if (!op->submit(1)) goto done;
+        double t0 = now_s();
+        if (!op->begin()) goto done;
+        for (int k = 0; k < 10; k++)
+            if (!op->matmul(t[k % nc], xb, 0, yb, 0, 1)) goto done;
+        if (!op->submit(1)) goto done;
+        double tg = (now_s() - t0) / 10;
+        for (int k = 0; k < 3; k++) matmul_q(y, x, cw[(7 + k) % nc]->q, cw[(7 + k) % nc]->sc, I, O);
+        t0 = now_s();
+        for (int k = 0; k < 10; k++) matmul_q(y, x, cw[k % nc]->q, cw[k % nc]->sc, I, O);
+        double tc = (now_s() - t0) / 10;
+        if (tg < *gpu) *gpu = tg;
+        if (tc < *cpu) *cpu = tc;
+    }
+    ok = 1;
+done:
+    /* free waits for readers even if recording failed before submit. */
+    if (xb) op->free(xb);
+    if (yb) op->free(yb);
+    for (int k = 0; k < nc; k++) if (t[k]) coli_cuda_tensor_free(t[k]);
+    if (!ok) fprintf(stderr, "[place] resident-chain probe failed; stopping startup\n");
+    return ok ? 1 : -1;
+}
+#endif
+
 /* Measured, not assumed. The placer prices a trunk component by the bytes it
  * saves on the CPU's memory bus, which presumes the GPU answers a GEMV faster
  * than the CPU does. Four Tesla M10 (sm_50) said otherwise: every placed
@@ -7610,10 +7766,18 @@ static int trunk_place_dense(Model *m, double *vram_bytes, int kinds[3]){
  * the experts went to the CPU: decode 21.5 tok/s, 113 on the card.
  * Only the automatic placement is questioned: a hand-written COLI_PLACE
  * stands. COLI_TRUNK_PROBE=0 skips the probe and trusts the placer. The
- * probe's copy stays resident (one projection, 16 MiB on the 35B). */
+ * legacy probe's copy stays resident (one projection, 16 MiB on the 35B).
+ * SYCL with the chain enabled uses the resident probe above by default;
+ * COLI_TRUNK_PROBE_PIPE=0 restores the synchronous probe below. Unset, the
+ * platform's measured default: no probe on a Data Center GPU Max
+ * (coli_cuda_tuned_default), where a start beside a busy card otherwise fell
+ * back to the CPU with another text in 4 of 8 pairs of starts. */
 static int trunk_probe_gpu_wins(Model *m){
     const char *e = getenv("COLI_TRUNK_PROBE");
     if (e && *e == '0') return 1;
+#ifdef COLI_CUDA
+    if (!(e && *e) && coli_cuda_tuned_default("COLI_TRUNK_PROBE", 1) == 0) return 1;
+#endif
     if (!qt_place_is_auto()) return 1;
     Cfg *c = &m->c;
     QW *w = NULL, *cw[10]; int dev = QT_PLACE_CPU, nc = 0;
@@ -7626,12 +7790,23 @@ static int trunk_probe_gpu_wins(Model *m){
     if (dev == QT_PLACE_CPU) dev = qt_place_of("lmhead", 0);
     if (dev == QT_PLACE_CPU) return 1;               /* nothing placed: nothing to measure */
     int I = w->I, O = w->O;
-    int h = qt_dense_init(w->q, w->sc, I, O, dev);
-    if (h < 0) return 1;                             /* cannot measure: the placer's word stands */
     float *x = malloc((size_t)I * sizeof(float)), *y = malloc((size_t)O * sizeof(float));
     if (!x || !y) { free(x); free(y); return 1; }
     for (int i = 0; i < I; i++) x[i] = sinf(0.37f * (float)i);
     double gpu = 1e30, cpu = 1e30;
+#ifdef COLI_CUDA
+    int piped = trunk_probe_chain(cw, nc, dev, x, y, &gpu, &cpu);
+    if (piped) {
+        free(x); free(y);
+        if (piped < 0) return -1;
+        int wins = gpu < cpu;
+        fprintf(stderr, "[place] probe: resident chain [%d x %d] int8 GEMV, %d distinct weights, %.3f ms on GPU dev %d, %.3f ms on the CPU -> trunk %s\n",
+                O, I, nc, gpu * 1e3, dev, cpu * 1e3, wins ? "to VRAM" : "stays on the CPU");
+        return wins;
+    }
+#endif
+    int h = qt_dense_init(w->q, w->sc, I, O, dev);
+    if (h < 0) { free(x); free(y); return 1; }        /* cannot measure: the placer's word stands */
     for (int r = 0; r < 3; r++) {
         for (int k = 0; k < 3; k++) if (!qt_dense_matmul(h, y, x, I, O)) { free(x); free(y); return 1; }
         double t0 = now_s();
@@ -11942,7 +12117,9 @@ int main(int argc, char **argv) {
         atexit(qt_shutdown);
         for (int i = 0; i < m.c.n_layers; i++) if (q36_dense_l(&m.c, i)) qt_layer_off(i);   /* Flint's dense layers */
         /* The placer predicted; measure before uploading a byte of trunk. */
-        if (!trunk_probe_gpu_wins(&m)) {
+        int probe = trunk_probe_gpu_wins(&m);
+        if (probe < 0) return 1;
+        if (!probe) {
             qt_trunk_withdraw("measured slower than the CPU");
             qt_experts_withdraw("the device's GEMV measured slower than the CPU's");
         }

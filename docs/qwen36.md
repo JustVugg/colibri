@@ -499,7 +499,10 @@ named by `QWEN_DENSE_CACHE` that does not match stops the start with the reason.
 It is used only where every dense matrix is the int8 copy the engine would make:
 the whole model, `COLI_DENSE_BITS=8` (the default), no `COLI_KEEP_F32`, and a run
 on the CPU, not with `COLI_CUDA=1` or `COLI_VULKAN=1`, and not in the Segment and
-Edge adapters. A `VK=1` build that runs on the CPU, as the Linux and Windows
+Edge adapters. `COLI_CUDA_DENSE_CACHE=1` lets a `COLI_CUDA=1` run use it too (the
+placer uploads the int8 rows and scales, which are the file's or the conversion's);
+`QWEN_DENSE_CACHE_VERIFY=1` is a start that converts every matrix anyway and
+compares it with the file, byte for byte. A `VK=1` build that runs on the CPU, as the Linux and Windows
 release binaries do without `COLI_VULKAN=1`, uses it. The tool converts BF16, F16
 and F32 dense matrices, with or without the `language_model.` prefix (the
 containers of `convert_qwen36.py`); it does not convert a qpack container's

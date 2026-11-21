@@ -82,6 +82,22 @@ tests/xdna_fail_fixtures/
 tests/xdna_physical_probe
 tests/xdna_fake_helper*.so
 libcoli_xdna.so
+# SYCL=1 (sycl/README.md): the host-only profile test, the device tests sycl-test builds
+# under sycl/tests/, the migrated GPU tests under their cuda-test names, icpx's .d files
+sycl/tests/test_sycl_profile
+sycl/tests/test_coli_sycl_launch
+sycl/tests/test_sycl_xmx
+sycl/tests/test_sycl_attn
+sycl/*.d
+cuda_chain_test
+backend_cuda_test
+sycl/tests/test_host_sync
+sycl/tests/test_sycl_host_cancel
+
+sycl/tests/test_sycl_fp8_experts
+sycl/tests/test_qwen38_fp8_stages
+sycl/tests/test_matmul_plan
+sycl/tests/test_sycl_matmul_rows
 shaders/chain_dnconv_rows.spv
 shaders/qmatmul_bd.spv
 shaders/qmatmul_gate_up_bd.spv

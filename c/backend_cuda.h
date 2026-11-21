@@ -195,6 +195,29 @@ COLI_CUDA_DLLEXPORT int coli_cuda_block_elems(int fmt);
  * (a 576 KiB matrix took 1 MiB) and none of its synchronisation. Optional in the DLL loader. */
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload_at(ColiCudaTensor **tensor, void *dev, size_t cap, const void *weights,
                                                    int fmt, int I, int O, int device);
+/* Page-locked host memory on the device's context (host USM), for staging what is copied to the device:
+ * the copy from it is the device's own, where one from pageable memory passes through a copy on the
+ * calling thread. NULL when refused. Optional: NULL from a backend without it (the CUDA backend). */
+COLI_CUDA_DLLEXPORT void *coli_cuda_host_alloc(int device, size_t bytes);
+COLI_CUDA_DLLEXPORT void coli_cuda_host_free(int device, void *p);
+/* An expert of the tier's native int4 format (packed nibbles, grouped scales) in device memory the
+ * caller owns (an arena's slot): its nw bytes of weights, the matrices back to back, in one copy to
+ * dev_w; its ns scale floats in one copy to dev_s; the nibbles made signed; one wait. Then a tensor
+ * a matrix over the filled ranges (coli_cuda_tensor_at_g: no allocation, no copy), which
+ * coli_cuda_tensor_free leaves in place. Both optional: 0 from a backend without them, and the tier
+ * keeps a device allocation a matrix (coli_cuda_tensor_upload_g). */
+COLI_CUDA_DLLEXPORT int coli_cuda_slot_fill_s4(int device, void *dev_w, const void *w, size_t nw,
+                                               float *dev_s, const float *s, size_t ns);
+COLI_CUDA_DLLEXPORT int coli_cuda_tensor_at_g(ColiCudaTensor **tensor, void *dev_w, float *dev_s,
+                                              int I, int O, int device, int gs);
+/* A matrix of the fp8-e4m3 format (fmt 8: a byte an element, a float a 128 x 128 block, [ceil(O/128),
+ * ceil(I/128)]) over device memory the caller owns and has filled: an arena's slot, which the tier fills
+ * with ONE coli_cuda_pipe_upload of gate | up | down | the three scale tables. No allocation and no copy
+ * here; coli_cuda_tensor_free leaves both ranges. 0 before the decode table is published, for a pointer
+ * that is not 4-byte aligned, or from a backend without it (the CUDA backend, an older DLL): the tier asks
+ * once at qt_init and then keeps a device allocation a matrix. Optional in the DLL loader. */
+COLI_CUDA_DLLEXPORT int coli_cuda_tensor_at_f8(ColiCudaTensor **tensor, void *dev_w, float *dev_s,
+                                               int I, int O, int device);
 #ifdef COLI_ANS
 /* Experimental Linux-only GPU-resident entropy tier. The archive remains in
  * VRAM and is decoded into per-device scratch immediately before a grouped
@@ -234,6 +257,17 @@ COLI_CUDA_DLLEXPORT int coli_cuda_matmul(ColiCudaTensor **tensor,
                      float *y, const float *x,
                      const void *weights, const float *scales,
                      int fmt, int S, int I, int O, int device, int gs);
+/* A resident fmt=1 tensor (int8 rows, one float scale a row) times activations the caller quantized to int8 with one
+ * scale a row (xq: S x I, sx: S): each dot exact in int32, then y[s][o] = ((float)dot * scale[o]) * sx[s] -- the
+ * CPU's matmul_q_idot, so the CPU's bits. 0: not done (another format, a size mismatch, a lost device). */
+COLI_CUDA_DLLEXPORT int coli_cuda_matmul_i8act(ColiCudaTensor *tensor, float *y, const signed char *xq,
+                     const float *sx, int S, int I, int O);
+/* The default a platform's measurements give a switch the environment leaves unset. The SYCL backend answers from
+ * its device profiles (coli_sycl_tuned_default: e.g. COLI_CUDA_MUX_BATCH 15 and COLI_TRUNK_PROBE 0 on a Data Center
+ * GPU Max) when every opened device gives the same value, and says so once a switch; before coli_cuda_init, with
+ * devices that disagree, under COLI_PLATFORM_DEFAULTS=0, and in the CUDA and HIP backends: `generic`. The caller
+ * reads the switch's own variable first: an explicit value always wins. */
+COLI_CUDA_DLLEXPORT int coli_cuda_tuned_default(const char *knob, int generic);
 
 /* A vision tower's attention (the Qwen family's, qwen38_vision.h): every row of qkv [n][3][heads][D]
  * (q, k and v side by side, rotated already) attends to all n, softmax(q.k * scale) over v, into

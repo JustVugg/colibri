@@ -148,6 +148,8 @@ int  qt_dnproj_z_init_fmt(int layer, const void *w, int fmt, int I, int O, int d
 int  qt_dense_matmul(int handle, float *y, const float *x, int I, int O);
 /* Row-major x[S,I] -> y[S,O], using the same resident int8 tensor. */
 int  qt_dense_matmul_batch(int handle, float *y, const float *x, int S, int I, int O);
+/* Qwen3.8's Q38_TRUNK_GPU_I8: a resident int8 matrix times activations quantized as the CPU path does -- its bits */
+int  qt_dense_matmul_i8act(int handle, float *y, const signed char *xq, const float *sx, int S, int I, int O);
 int  qt_dense_count(void);
 /* The resident tensors behind the handles, for the dense chain (qwen36_cuda_chain.h):
  * the backend's object and the CUDA ordinal it lives on; NULL when nothing is placed. */
@@ -211,6 +213,13 @@ int qt_take(uint32_t mask, const float *val, int K, float *out);
 /* qt_take with Muse Spark's norm on every expert's row first: out += w * row*s / rms(row*s),
  * eps inside the root (the CPU path's products, in its order) */
 int qt_take_scaled(uint32_t mask, const float *val, int K, float *out, const float *s, float eps);
+/* Collect raw expert outputs into caller-owned rows[k*stride + 0..hidden).
+ * Copy only GPU ranks; CPU rows/padding remain untouched. Drain every issued
+ * device and validate the complete rank mask before publishing any row. Return
+ * 0 on failure with rows unchanged. Always release the issue, including mask0.
+ * The caller supplies K rows, stride in floats >= hidden, disjoint from the
+ * backend's borrowed result buffers. No borrowed pointer escapes this call. */
+int qt_take_rows(uint32_t mask, int K, float *rows, size_t stride);
 
 /* Warmstart: plan the full fill set (heat order, budget reserved), then any
  * number of loader threads may call qt_note_planned per planned expert. */
@@ -251,6 +260,9 @@ int  qt_counters(QtCounters *out);
 
 /* One telemetry block on stderr: residency, hits/misses, uploads per device. */
 void qt_stats(void);
+/* Where the experts are, on stderr: a card's resident experts, its arena's free slots, the expert runs it served,
+ * and its resident experts in each layer (qwen38's serve mode with Q38_TIER_REPORT=1). Only reads. */
+void qt_split_report(const char *scope);
 
 /* The dense chain's routed experts (the engines' *_cuda_chain.h: cc_route, cc_moe): the
  * chain computes the residents on its device by address and the host the rest.
@@ -292,13 +304,23 @@ void qt_chain_own(void);
 /* the warm start's order from an engine's expert history (counts[l][e], nl x ne) */
 void qt_heat_order(uint32_t *const *counts, int nl, int ne);
 int  qt_note_wanted(int layer, int eid);
+/* copy mode: recompute the coldest resident a device (qt_note_wanted's bar) without a tick, for an engine
+ * that notes experts where no tick runs (a prompt pass) */
+void qt_cold_refresh(void);
 void qt_note_heat(int layer, int eid);
+void qt_note_heat_pass(int layer, int eid);   /* a prompt pass's: none with a trunk-only tier or the chain's */
+/* a prompt chunk's resident experts on the card (Q38_PREFILL_GPU): the device an expert is resident on now (-1: none,
+ * a hint), and a synchronous group of up to 64 resident experts of one device, rows[i] rows each, x and y expert by
+ * expert; 0: not computed (an expert not resident, a decode group open, the backend refused) */
+int  qt_resident_home(int layer, int eid);
+int  qt_prefill_group(int layer, const int *eids, const int *rows, int n, const float *x, float *y);
 int  qt_chain_devices(void);
 int  qt_chain_history(void);
 /* The chain's promotions (qwen36_tier.c's comment): after a decode-sized step, up to max of its
  * misses into the buffers of the coldest residents by this conversation's routes -- the pairs,
  * the newcomer's RAM bytes and the victim's tensors, for the chain to copy; qt_chain_promote_done
- * once a pair's copy landed (ok) or failed; the changes of residency since the chain last asked
+ * once a pair's copy landed (ok 1) or failed (0: nothing in flight, the slot is free again; -1: a late
+ * copy may still land, the slot stays out of use); the changes of residency since the chain last asked
  * (slot indices; *overflow: read every entry again); how many promotions landed so far */
 typedef struct {
     int ci, vi;                                   /* newcomer and victim: layer * ne + eid */
@@ -366,6 +388,7 @@ static inline int  qt_dnproj_init_fmt(int a,const void*b,const float*c,int d,int
 static inline int  qt_dnproj_z_init_fmt(int a,const void*b,int c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
 static inline int  qt_dense_matmul(int a,float*b,const float*c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
 static inline int  qt_dense_matmul_batch(int a,float*b,const float*c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
+static inline int  qt_dense_matmul_i8act(int a,float*b,const signed char*c,const float*d,int e,int f,int g){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
 static inline int  qt_dense_count(void){return 0;}
 static inline void *qt_dense_tensor(int a,int*b){(void)a;(void)b;return NULL;}
 static inline void *qt_dnproj_tensor(int a,int*b){(void)a;(void)b;return NULL;}
@@ -389,7 +412,11 @@ static inline int  qt_chain_slot(int a,int b){(void)a;(void)b;return -1;}
 static inline void qt_chain_own(void){}
 static inline void qt_heat_order(uint32_t*const*a,int b,int c){(void)a;(void)b;(void)c;}
 static inline int  qt_note_wanted(int a,int b){(void)a;(void)b;return 0;}
+static inline void qt_cold_refresh(void){}
 static inline void qt_note_heat(int a,int b){(void)a;(void)b;}
+static inline void qt_note_heat_pass(int a,int b){(void)a;(void)b;}
+static inline int  qt_resident_home(int a,int b){(void)a;(void)b;return -1;}
+static inline int  qt_prefill_group(int a,const int *b,const int *c,int d,const float *e,float *f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
 static inline int  qt_chain_devices(void){return 0;}
 static inline int  qt_chain_history(void){return 0;}
 typedef struct { int ci, vi; const uint8_t *g, *u, *d; const float *gs, *us, *ds; struct ColiCudaTensor *tg, *tu, *td; size_t mb, sb_gu, sb_d; } QtPromo;
@@ -415,6 +442,7 @@ static inline void qt_note(int a,int b,const uint8_t*c,const uint8_t*d,const uin
 static inline uint32_t qt_issue(int a,const int*b,int c,const float*d){(void)a;(void)b;(void)c;(void)d;return 0;}
 static inline int qt_take(uint32_t a,const float*b,int c,float*d){(void)b;(void)c;(void)d;return a==0;}
 static inline int qt_take_scaled(uint32_t a,const float*b,int c,float*d,const float*s,float e){(void)b;(void)c;(void)d;(void)s;(void)e;return a==0;}
+static inline int qt_take_rows(uint32_t a,int b,float*c,size_t d){(void)b;(void)c;(void)d;return a==0;}
 static inline int  qt_plan_fill(int*a,int*b,int c){(void)a;(void)b;(void)c;return 0;}
 static inline void qt_layer_off(int a){(void)a;}
 static inline void qt_note_planned(int a,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;}
@@ -426,6 +454,7 @@ static inline int  qt_evicted_take(int*a,int*b,int c){(void)a;(void)b;(void)c;re
 static inline void qt_stats_mark(void){}
 static inline int  qt_counters(QtCounters *out){QtCounters z={0,0,0,0,0};*out=z;return 0;}
 static inline void qt_stats(void){}
+static inline void qt_split_report(const char *s){(void)s;}
 
 #endif /* COLI_CUDA */
 #endif /* QWEN36_TIER_H */

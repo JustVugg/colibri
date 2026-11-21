@@ -5479,6 +5479,20 @@ static void attention_rows_ml4(Model *m, Layer *l, int layer, float *x, int S, i
     free(Q); free(ctx); free(comp);
     m->t_attn += now_s()-ta0;
 }
+#ifdef COLI_CUDA
+/* Optional host-side proof that the selected MLA path completed on the device.
+ * One message per path and row class; no device atomics or change to dispatch/math. */
+static void cuda_mla_trace(int ragged, int S, int H, int K, int T){
+    const char *e=getenv("COLI_CUDA_ATTN_TRACE");
+    if(!e || strcmp(e,"1")) return;
+    static _Atomic int seen[4];
+    int slot=(ragged!=0)*2+(S==1);
+    if(!atomic_exchange_explicit(&seen[slot],1,memory_order_relaxed))
+        fprintf(stderr,"[CUDA] MLA attention trace: %s GPU project completed S=%d H=%d K=%d T=%d\n",
+                ragged ? "ragged" : "contiguous",S,H,K,T);
+}
+#endif
+
 static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int pos_base,
                            KVState *const *kvs, const int *positions, float *out){
     Cfg *c=&m->c; int H=c->n_heads, D=c->hidden, qh=c->qk_head, vh=c->v_head;
@@ -5840,6 +5854,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 }
                 cuda_core=cuda_projected=coli_cuda_attention_project_ragged(l->kv_b.cuda,l->o.cuda,
                     out,Q,rk,rl,rr,rn,S,H,c->qk_nope,c->qk_rope,vh,kvl,mt,c->attn_scale);
+                if(cuda_projected) cuda_mla_trace(1,S,H,kvl,mt);
             }
             free(rk);free(rl);free(rr);free(rn);
         } else if(cuda_absorb&&l->n_kv_b_shard>1){
@@ -5864,6 +5879,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
             cuda_core=cuda_projected=coli_cuda_attention_project_batch(l->kv_b.cuda,l->o.cuda,out,Q,
                 coli_kv_row(m->Lc[layer],st0,kvl),coli_kv_row(m->Rc[layer],st0,c->qk_rope),
                 S,H,c->qk_nope,c->qk_rope,vh,kvl,nt,c->attn_scale);
+            if(cuda_projected) cuda_mla_trace(0,S,H,kvl,nt);
         } else if(S<=4&&g_cuda_enabled&&!kv_coded()&&getenv("COLI_CUDA_ATTN")&&atoi(getenv("COLI_CUDA_ATTN"))&&
            l->kv_b.cuda_eligible&&qt_cuda_upload(&l->kv_b)){   /* quant guard: absorb/kvdev read f32 Lc/Rc rows */
             cuda_core=1;
@@ -9640,6 +9656,18 @@ static void run_score(Model *m, const char *snap, const char *path){
     }
     if(ferror(f)){ perror(path); exit(1); }
     free(ln); free(ids); free(x); free(lo); free(row); fclose(f);
+#ifdef COLI_CUDA
+    /* SCORE stdout is a machine-readable protocol. Optional execution proof
+     * belongs on stderr, like generation's existing resident/group report. */
+    if(g_prof && g_cuda_enabled){
+        cuda_stats_print();
+        /* Large SCORE batches can use individual MLPs instead of expert groups.
+         * t_egpu includes that path only after the GPU call succeeds. */
+        fprintf(stderr,"[SCORE] expert execution: VRAM requests %llu | GPU critical %.6f s | CPU rows %llu\n",
+            (unsigned long long)m->gpu_expert_calls,m->t_egpu,
+            (unsigned long long)m->cpu_expert_rows);
+    }
+#endif
 }
 
 /* ===========================================================================
