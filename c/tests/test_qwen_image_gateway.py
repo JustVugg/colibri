@@ -8,9 +8,11 @@ determinism, the size actually drawn and the PNG framing.
 """
 import base64
 import http.client
+import importlib.util
 import json
 import os
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -29,15 +31,20 @@ from openai_server import APIServer  # noqa: E402
 
 MODEL_ID = "qwen-image-2.1-colibri"
 KEY = "secret"
+C_DIR = Path(__file__).resolve().parent.parent
+EDIT_TINY = os.environ.get("QWENIMAGE_EDIT_TINY")
+EDIT_ENGINE = C_DIR / ("qwenimage.exe" if sys.platform == "win32" else "qwenimage")
 
 
 class GatewayHarness:
     """One stub engine behind one API server, torn down in reverse order."""
 
-    def __init__(self, delay=0.0, max_queue=8, api_key=KEY, **stub):
+    def __init__(self, delay=0.0, max_queue=8, api_key=KEY, *, engine_path=STUB,
+                 model=None, env=None, **stub):
         self.tmp = tempfile.TemporaryDirectory()
-        self.model = make_fake_pipeline(Path(self.tmp.name) / "qwen-image")
-        self.engine = image_engine.ImageEngine(STUB, self.model, env=stub_env(delay, **stub),
+        self.model = model or make_fake_pipeline(Path(self.tmp.name) / "qwen-image")
+        self.engine = image_engine.ImageEngine(engine_path, self.model,
+                                               env=env if env is not None else stub_env(delay, **stub),
                                                on_log=lambda _m: None)
         self.server = APIServer(("127.0.0.1", 0), self.engine, MODEL_ID, api_key, 16,
                                 max_queue=max_queue, queue_timeout=30)
@@ -249,6 +256,12 @@ class ImagesEndpointTest(unittest.TestCase):
         status, _h, raw = self.gw.request(f"/v1/models/{MODEL_ID}")
         self.assertEqual(json.loads(raw)["capabilities"], ["image_generation"])
 
+    def test_generation_only_engine_refuses_edits(self):
+        status, _h, raw = self.gw.request("/v1/images/edits",
+                                          {"model": MODEL_ID, "prompt": "x", "image": "abcd"})
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(raw)["error"]["code"], "unsupported_endpoint")
+
     def test_auth_is_required(self):
         for key in (None, "wrong"):
             with self.subTest(key=key):
@@ -358,6 +371,70 @@ class ImagesFailureTest(unittest.TestCase):
             gw.close()
 
 
+class EditsEndpointTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.gw = GatewayHarness(QWENIMAGE_STUB_EDITS="1")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.gw.close()
+
+    def edit(self, image, **options):
+        return self.gw.request("/v1/images/edits", {"model": MODEL_ID, "prompt": "blue fox",
+                                                   "size": "256x256", "steps": 2, "seed": 7,
+                                                   "image": image, **options})
+
+    def test_models_advertise_editing_from_ready(self):
+        status, _h, raw = self.gw.request("/v1/models")
+        self.assertEqual(status, 200)
+        entry = json.loads(raw)["data"][0]
+        self.assertEqual(entry["capabilities"], ["image_generation", "image_editing"])
+        self.assertEqual(entry["input_modalities"], ["text", "image"])
+        self.assertIs(entry["image"]["supports_image_edits"], True)
+
+    def test_rejects_paths_urls_multiple_images_and_img2img_options(self):
+        cases = (("file:///etc/passwd", {}, "image"),
+                 (self.gw.model, {}, "image"),
+                 ("https://example.com/fox.png", {}, "image"),
+                 (["abcd", "abcd"], {}, "image"),
+                 ("data:text/plain;base64,YWJjZA==", {}, "image"),
+                 ("abcd", {"mask": "abcd"}, "mask"),
+                 ("abcd", {"strength": 0.5}, "strength"),
+                 ("abcd", {"n": 2}, "n"))
+        for value, extras, param in cases:
+            with self.subTest(value=value, extras=extras):
+                status, _h, raw = self.edit(value, **extras)
+                self.assertEqual(status, 400)
+                self.assertEqual(json.loads(raw)["error"]["param"], param)
+
+    @unittest.skipUnless(importlib.util.find_spec("PIL"), "image editing requires Pillow")
+    def test_inline_bytes_reach_protocol_in_both_response_modes(self):
+        def sample(color):
+            pixels = bytes([color, 0, 255, 255]) * 8
+            return base64.b64encode(image_engine.encode_png(4, 2, pixels, 4)).decode("ascii")
+        status, _h, raw = self.edit(sample(1))
+        self.assertEqual(status, 200, raw)
+        image = json.loads(raw)["data"][0]["b64_json"]
+        status, _h, raw = self.edit("data:image/png;base64," + sample(1), stream=True)
+        self.assertEqual(status, 200, raw)
+        events = parse_sse(raw.decode())
+        self.assertEqual(events[0][0], "image_edit.progress")
+        self.assertEqual(events[-2][0], "image_edit.completed")
+        self.assertEqual(events[-2][1]["data"][0]["b64_json"], image)
+        self.assertEqual(events[-1], (None, "[DONE]"))
+        status, _h, raw = self.edit(sample(2))
+        self.assertEqual(status, 200, raw)
+        self.assertNotEqual(json.loads(raw)["data"][0]["b64_json"], image)
+        self.assertIsNone(self.gw.engine._reference_dir)
+
+    @unittest.skipUnless(importlib.util.find_spec("PIL"), "image editing requires Pillow")
+    def test_valid_base64_but_invalid_image_is_a_client_error(self):
+        status, _h, raw = self.edit("YWJjZA==")
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(raw)["error"]["param"], "image")
+
+
 class TextModelImagesTest(unittest.TestCase):
     def test_a_chat_model_refuses_image_generation(self):
         class Chat:
@@ -386,6 +463,44 @@ class TextModelImagesTest(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
+
+
+@unittest.skipUnless(EDIT_TINY, "needs QWENIMAGE_EDIT_TINY")
+class RealEngineEditsTest(unittest.TestCase):
+    def test_cli_and_http_edit_the_same_reference(self):
+        self.assertTrue(EDIT_ENGINE.is_file(), "build qwenimage before setting QWENIMAGE_EDIT_TINY")
+        env = dict(os.environ, COLI_ENGINE=str(EDIT_ENGINE), COLI_IMG_BITS="8",
+                   COLI_IMG_ACT8="0", COLI_VULKAN="0", OMP_NUM_THREADS="2")
+        gw = GatewayHarness(engine_path=EDIT_ENGINE, model=EDIT_TINY, env=env)
+        self.addCleanup(gw.close)
+        self.assertIs(gw.engine.info.get("supports_image_edits"), True)
+        root = Path(gw.tmp.name)
+        reference, output = root / "reference.png", root / "edit.png"
+        first = image_engine.encode_png(32, 32, bytes((240, 20, 30, 255)) * 1024, 4)
+        second = image_engine.encode_png(32, 32, bytes((30, 20, 240, 255)) * 1024, 4)
+        reference.write_bytes(first)
+        prompt = "replace the background with a beach"
+        cli = subprocess.run(
+            [sys.executable, str(C_DIR / "coli"), "run", "--model", EDIT_TINY,
+             "--image", str(reference), "--size", "256x256", "--seed", "13",
+             "--steps", "2", "--out", str(output), prompt],
+            env=env, capture_output=True, text=True, timeout=180,
+        )
+        self.assertEqual(cli.returncode, 0, cli.stderr)
+        cli_image = image_engine.decode_png(output.read_bytes())
+        self.assertEqual(cli_image[:3], (256, 256, 4))
+
+        def edit(png):
+            status, _headers, raw = gw.request("/v1/images/edits", {
+                "model": MODEL_ID, "prompt": prompt, "size": "256x256",
+                "steps": 2, "seed": 13, "image": base64.b64encode(png).decode("ascii"),
+            })
+            self.assertEqual(status, 200, raw)
+            return png_pixels(json.loads(raw)["data"][0]["b64_json"])
+
+        self.assertEqual(edit(first), cli_image)
+        self.assertNotEqual(edit(second)[3], cli_image[3],
+                            "changing only the reference left the real engine output unchanged")
 
 
 if __name__ == "__main__":

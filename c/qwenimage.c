@@ -1582,9 +1582,81 @@ static void send_error(const char *id, const char *m){
     fflush(stdout);
 }
 
+static int engine_edit_supported(Engine *e){
+#ifdef QI_HAVE_VAE
+    if (!te_image_supported(&e->te, e->model)) return 0;
+    char dir[2100]; qi_part(e->model, "vae", dir, sizeof dir);
+    struct stat sb;
+    if (stat(dir, &sb) || !S_ISDIR(sb.st_mode)) return 0;
+    /* Inspect the checkpoint index to distinguish an encoder/decoder from
+     * a decoder-only export. Do not load the encoder before it is needed. */
+    shards s; st_init(&s, dir);
+    int supported = st_has(&s, "encoder.conv_in.weight") && st_has(&s, "quant_conv.weight");
+    st_destroy(&s);
+    return supported;
+#else
+    (void)e;
+    return 0;
+#endif
+}
+
+static int serve_reference(jval *j, int supported, QiReference *ref, char *msg, size_t msgn){
+    jval *path = json_get(j, "reference_path");
+    jval *w = json_get(j, "reference_width"), *h = json_get(j, "reference_height");
+    if (!path && !w && !h) return 0;
+    if (!supported) {
+        snprintf(msg, msgn, "the image engine does not support reference-image edits");
+        return -1;
+    }
+#ifdef QI_HAVE_VAE
+    if (!path || path->t != J_STR || !*path->str || !w || w->t != J_NUM || !h || h->t != J_NUM ||
+        !(w->num >= 32 && w->num <= 2048 && h->num >= 32 && h->num <= 2048) ||
+        w->num != floor(w->num) || h->num != floor(h->num) ||
+        !reference_size((int)w->num, (int)h->num)) {
+        snprintf(msg, msgn, "the reference requires a private file and valid RGBA8 dimensions");
+        return -1;
+    }
+    /* Only the local protocol names a file. The HTTP gateway passes a private
+     * file of decoded pixels and never passes a path supplied by a client. */
+    size_t bytes = (size_t)w->num * (size_t)h->num * 4;
+    int flags = COMPAT_O_RDONLY;
+#ifdef O_NONBLOCK
+    flags |= O_NONBLOCK;
+#endif
+    int fd = open(path->str, flags);
+    struct stat sb;
+    if (fd < 0 || fstat(fd, &sb) || !S_ISREG(sb.st_mode) || (uint64_t)sb.st_size != bytes) {
+        if (fd >= 0) close(fd);
+        snprintf(msg, msgn, "the reference file must contain exactly %zu RGBA8 bytes", bytes);
+        return -1;
+    }
+    uint8_t *pixels = xmalloc(bytes);
+    size_t done = 0;
+    while (done < bytes) {
+        ssize_t n = read(fd, pixels + done, bytes - done);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        done += (size_t)n;
+    }
+    close(fd);
+    if (done != bytes) {
+        free(pixels);
+        snprintf(msg, msgn, "could not read all reference pixels");
+        return -1;
+    }
+    *ref = (QiReference){ pixels, (int)w->num, (int)h->num };
+    return 0;
+#else
+    (void)ref;
+    return -1;
+#endif
+}
+
 static int serve_loop(Engine *e, int dw, int dh, int dsteps){
+    int edit_supported = engine_edit_supported(e);
     printf("READY {\"model\":\"qwen-image-2.1\",\"default_width\":%d,\"default_height\":%d,\"default_steps\":%d,"
-           "\"min_side\":256,\"max_side\":2048,\"multiple\":32}\n", dw, dh, dsteps);
+           "\"min_side\":256,\"max_side\":2048,\"multiple\":32%s}\n", dw, dh, dsteps,
+           edit_supported ? ",\"supports_image_edits\":true" : "");
     fflush(stdout);
     char *line;
     for (;;) {
@@ -1602,15 +1674,18 @@ static int serve_loop(Engine *e, int dw, int dh, int dsteps){
         const char *prompt = j && (v = json_get(j, "prompt")) && v->t == J_STR ? v->str : NULL;
         int w = (int)jnum(j, "width", dw), h = (int)jnum(j, "height", dh), steps = (int)jnum(j, "steps", dsteps);
         uint64_t seed = (uint64_t)jnum(j, "seed", (double)(time(NULL) & 0x7fffffff));
+        QiReference ref = {0};
         if (!j) send_error(id, "bad GEN line (not JSON)");
         else if (!prompt || !*prompt) send_error(id, "empty prompt");
         else if (check_size(w, h, steps, msg, sizeof msg)) send_error(id, msg);
+        else if (serve_reference(j, edit_supported, &ref, msg, sizeof msg)) send_error(id, msg);
         else {
             g_cancel_pending = 0;
             uint8_t *rgba = xmalloc((size_t)w * h * 4);
             double tm[3];
             Progress pg = { id, serve_cancelled, (int)jnum(j, "preview", 0) };
-            if (engine_generate(e, prompt, w, h, steps, seed, rgba, tm, &pg, msg, sizeof msg, NULL)) send_error(id, msg);
+            if (engine_generate(e, prompt, w, h, steps, seed, rgba, tm, &pg, msg, sizeof msg,
+                                ref.pixels ? &ref : NULL)) send_error(id, msg);
             else {
                 printf("IMAGE {\"id\":\""); json_escape_out(id);
                 printf("\",\"width\":%d,\"height\":%d,\"channels\":4,\"bytes\":%lld,\"seed\":%llu,\"steps\":%d,"
@@ -1622,6 +1697,7 @@ static int serve_loop(Engine *e, int dw, int dh, int dsteps){
             }
             free(rgba);
         }
+        free((void *)ref.pixels);
         if (j) json_free(j);
         free(arena); free(line);
     }

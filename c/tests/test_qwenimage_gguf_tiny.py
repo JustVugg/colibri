@@ -111,6 +111,31 @@ class QwenImageGgufTiny(unittest.TestCase):
         self.assertIn("qwen3vl, 1 part(s)", err)
         self.assertGreater(psnr(ref, gg), 80.0)
 
+    def test_cli_uses_the_imported_processor(self):
+        model = self.d / "gg_te"
+        index_path = model / "model_index.json"
+        original = index_path.read_text()
+        index = json.loads(original)
+        self.assertFalse((model / "processor").exists())
+        absolute = index["colibri_parts"]["processor"]
+        try:
+            for kind, path in (("absolute", absolute), ("relative", os.path.relpath(absolute, model.resolve()))):
+                with self.subTest(kind=kind):
+                    index["colibri_parts"]["processor"] = path
+                    index_path.write_text(json.dumps(index))
+                    out = self.d / f"cli-{kind}.png"
+                    run = subprocess.run(
+                        [sys.executable, str(HERE / "coli"), "run", "--model", model.name,
+                         "--size", "256x256", "--steps", "2", "--seed", "7",
+                         "--out", str(out), "a red fox"],
+                        cwd=self.d, env=dict(os.environ, COLI_ENGINE=str(ENGINE), COLI_VULKAN="0"),
+                        capture_output=True, text=True, timeout=60,
+                    )
+                    self.assertEqual(run.returncode, 0, run.stderr)
+                    self.assertEqual(image_engine.decode_png(out.read_bytes())[:3], (256, 256, 4))
+        finally:
+            index_path.write_text(original)
+
     def test_blocks_are_the_decoded_matrices(self):
         f32, _ = self.image("gg", "gg32b", COLI_IMG_BITS="32")
         native, err = self.image("gg", "native", COLI_IMG_ACT8="0")

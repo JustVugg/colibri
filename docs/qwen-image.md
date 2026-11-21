@@ -335,6 +335,40 @@ since the engine draws one image at a time. `GET /v1/models` marks the model
 with `"capabilities": ["image_generation"]` and its size rules;
 `/v1/chat/completions` answers 400 and points to the images endpoint.
 
+## Edit one reference image
+
+An edit-capable engine advertises `image_editing` in `GET /v1/models`.
+Install Pillow in the Python environment running `coli` to read a
+PNG, JPEG, or WebP reference. The same resized image conditions the text
+encoder and the DiT. The output size, steps, and seed use the generation
+options above.
+
+```sh
+coli run --model ~/Models/Qwen-Image-2.1 --image fox.png --size 1024x576 \
+  --seed 42 --out edited.png "Give the fox a blue scarf"
+```
+
+Send `POST /v1/images/edits` with a JSON body and the same generation
+fields plus one `image` string. The JSON body has a 4 MiB limit. Send the
+file contents as base64 or as an image data URL such as
+`data:image/png;base64,...`. The gateway never reads
+image paths or fetches URLs from edit requests. Reference edits take a prompt
+and one image. The route rejects `mask` and `strength`.
+
+```sh
+python3 -c 'import base64, json; print(json.dumps({
+    "model": "qwen-image-2.1-colibri",
+    "prompt": "Give the fox a blue scarf",
+    "image": base64.b64encode(open("fox.png", "rb").read()).decode("ascii"),
+    "size": "1024x576",
+    "seed": 42,
+}))' | curl -fsS http://127.0.0.1:8000/v1/images/edits \
+  -H 'Content-Type: application/json' --data-binary @-
+```
+
+The response contains the PNG and generation metadata. With `"stream": true`,
+the event names use `image_edit` as their prefix.
+
 ## Timings
 
 Measured on a server with 8 Zen 4 cores (AVX-512, 8 OpenMP threads), 768x512,

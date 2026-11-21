@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """The image engine from Python: its serve protocol, PNG, sizes, and the plan.
 
-Shared by the gateway (openai_server.py, POST /v1/images/generations) and the
-TUI (coli chat / coli run), so the two cannot disagree about what a valid
-request is or how a picture is framed on the wire. Stdlib only.
+Shared by the gateway (openai_server.py, POST /v1/images/generations or
+/v1/images/edits) and the TUI (coli chat / coli run), so they agree on
+request validation and wire framing. Reference decoding uses optional Pillow.
 
 The engine (c/qwenimage, `--model DIR --serve`) speaks one line per control
 message, a keyword, one space and a JSON object, and two of those messages are
@@ -17,7 +17,10 @@ followed by raw pixels:
     ERROR {...}                      the engine stays alive for the next GEN
     CANCEL {...}                     client; answered with ERROR "cancelled"
 """
+import base64
+import io
 import json
+import math
 import os
 import queue
 import random
@@ -26,6 +29,7 @@ import signal
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import zlib
@@ -52,6 +56,9 @@ MAX_SEED = 2**32 - 1
 # a picture: 2048 x 2048 x 4 is 16 MiB, so anything past 64 MiB is refused
 # before a single byte of it is allocated.
 MAX_FRAME_BYTES = 64 << 20
+REFERENCE_MAX_SIDE = 2048
+REFERENCE_MAX_AREA = 1024 * 1088
+REFERENCE_MAX_PIXELS = 16 << 20
 # The prompt, in UTF-8 bytes. The engine caps the tokens too (1024 with the
 # template); this refuses early, before a multi-megabyte GEN line is written.
 MAX_PROMPT_BYTES = 8192
@@ -110,6 +117,58 @@ def _prompt_byte_length(prompt):
         raise ImageRequestError("`prompt` must contain valid Unicode text.", "prompt") from error
 
 
+def supports_image_edits(info):
+    return info.get("supports_image_edits") is True
+
+
+def edit_image_bytes(body):
+    """Read one inline image. This route never resolves paths or URLs."""
+    for param in ("mask", "strength"):
+        if param in body:
+            raise ImageRequestError(f"`{param}` is not supported for reference-image edits.", param)
+    value = body.get("image")
+    if not isinstance(value, str) or not value:
+        raise ImageRequestError("Provide one `image` as base64 or an image data URL.", "image")
+    if value.startswith("data:"):
+        header, _, value = value.partition(",")
+        if header not in ("data:image/png;base64", "data:image/jpeg;base64", "data:image/webp;base64"):
+            raise ImageRequestError("`image` must use a PNG, JPEG, or WebP base64 data URL.", "image")
+    try:
+        data = base64.b64decode(value, validate=True)
+    except ValueError as error:
+        raise ImageRequestError("`image` must contain valid base64 image data.", "image") from error
+    if not data:
+        raise ImageRequestError("`image` must contain valid base64 image data.", "image")
+    return data
+
+
+def prepare_edit_reference(data):
+    """Return (width, height, RGBA bytes) for both Qwen-Image-2.1 encoders."""
+    try:
+        from PIL import Image
+    except ImportError as error:
+        raise ImageRequestError("Image editing requires Pillow (pip install pillow).", "image") from error
+    try:
+        with Image.open(io.BytesIO(data), formats=("PNG", "JPEG", "WEBP")) as image:
+            width, height = image.size
+            if width * height > REFERENCE_MAX_PIXELS:
+                raise ImageRequestError("The reference image has more than 16,777,216 pixels.", "image")
+            if getattr(image, "n_frames", 1) != 1:
+                raise ImageRequestError("The reference image must have one frame.", "image")
+            # Diffusers QwenImage21Pipeline.calculate_dimensions: target area
+            # 1024², aspect ratio preserved before rounding to the 32-pixel grid.
+            ratio = width / height
+            target_width = math.sqrt(1024 * 1024 * ratio)
+            width = round(target_width / 32) * 32
+            height = round(target_width / ratio / 32) * 32
+            if not (32 <= width <= REFERENCE_MAX_SIDE and 32 <= height <= REFERENCE_MAX_SIDE):
+                raise ImageRequestError("The reference aspect ratio is outside the supported range.", "image")
+            rgba = image.convert("RGBA").resize((width, height), Image.Resampling.LANCZOS).tobytes()
+    except (OSError, Image.DecompressionBombError) as error:
+        raise ImageRequestError("`image` must contain a readable PNG, JPEG, or WebP image.", "image") from error
+    return width, height, rgba
+
+
 class ImageEngine:
     """One engine process and the one request it can work on at a time.
 
@@ -163,6 +222,7 @@ class ImageEngine:
         self.dead = None                      # why the engine is gone, once it is
         self._seq = 0
         self._abandoned = None                # id of a request left without its final frame
+        self._reference_dir = None            # kept alive until that request ends
         try:
             self.info = self._await_ready(load_timeout)
         except BaseException:
@@ -286,9 +346,29 @@ class ImageEngine:
     def alive(self):
         return self.dead is None and self.process.poll() is None
 
+    def _write_reference(self, request, reference):
+        width, height, pixels = reference
+        if (not (32 <= width <= REFERENCE_MAX_SIDE and 32 <= height <= REFERENCE_MAX_SIDE)
+                or width % 32 or height % 32 or width * height > REFERENCE_MAX_AREA
+                or len(pixels) != width * height * 4):
+            raise ImageRequestError("Invalid prepared RGBA reference image.", "image")
+        try:
+            self._reference_dir = tempfile.TemporaryDirectory(prefix="coli-image-")
+            path = Path(self._reference_dir.name) / "reference.rgba"
+            path.write_bytes(pixels)
+        except OSError as error:
+            self._clear_reference()
+            raise ImageEngineError("cannot stage the reference image") from error
+        request.update(reference_path=str(path), reference_width=width, reference_height=height)
+
+    def _clear_reference(self):
+        folder, self._reference_dir = self._reference_dir, None
+        if folder is not None:
+            folder.cleanup()
+
     def generate(self, prompt, width, height, steps, seed, preview=False, on_progress=None,
                  on_preview=None, cancelled=None, on_idle=None, interruptible=False,
-                 on_interrupt=None):
+                 on_interrupt=None, *, reference=None):
         """Run one GEN to its final frame and return the image.
 
         Returns {"width","height","channels","seed","steps","timings","rgba"}.
@@ -296,17 +376,27 @@ class ImageEngine:
         for anything the engine refuses or a process that dies. `cancelled` is
         polled between frames and on every idle tick; with `interruptible` the
         first Ctrl-C sends CANCEL and keeps waiting (the engine is still busy
-        until it answers), the second one propagates."""
+        until it answers), the second one propagates. A reference is the
+        (width, height, RGBA bytes) tuple from prepare_edit_reference()."""
         if _prompt_byte_length(prompt) > MAX_PROMPT_BYTES:
             raise ImageRequestError(f"`prompt` is longer than {MAX_PROMPT_BYTES} bytes.", "prompt")
         with self.lock:
             if self.dead:
                 raise ImageEngineError(self.dead)
+            if reference is not None and not supports_image_edits(self.info):
+                raise ImageEngineError("the image engine does not support reference-image edits")
             self._finish_abandoned()
             self._seq += 1
             rid = f"r{self._seq}"
-            self._send("GEN", {"id": rid, "prompt": prompt, "width": width, "height": height,
-                               "steps": steps, "seed": seed, "preview": 1 if preview else 0})
+            request = {"id": rid, "prompt": prompt, "width": width, "height": height,
+                       "steps": steps, "seed": seed, "preview": 1 if preview else 0}
+            if reference is not None:
+                self._write_reference(request, reference)
+            try:
+                self._send("GEN", request)
+            except BaseException:
+                self._clear_reference()
+                raise
             cancel_sent = False
 
             def cancel():
@@ -387,10 +477,12 @@ class ImageEngine:
                     except ImageEngineError:
                         pass
                     self._abandoned = rid
+                else:
+                    self._clear_reference()
 
     def _finish_abandoned(self):
         """Drain the frames of an abandoned request up to its final one."""
-        rid, self._abandoned = self._abandoned, None
+        rid = self._abandoned
         if rid is None:
             return
         deadline = time.monotonic() + ABANDONED_TIMEOUT
@@ -399,6 +491,7 @@ class ImageEngine:
             if left <= 0:
                 self.dead = "the image engine did not finish an abandoned request"
                 self._kill_quietly()
+                self._clear_reference()
                 raise ImageEngineError(self.dead)
             try:
                 kind, body, _payload = self.events.get(timeout=min(left, 1.0))
@@ -406,9 +499,11 @@ class ImageEngine:
                 continue
             if kind in ("_error", "_eof"):
                 self.events.put((kind, body, None))   # the request that follows sees it
-                return
+                break
             if kind in ("IMAGE", "ERROR") and body.get("id") == rid:
-                return
+                break
+        self._abandoned = None
+        self._clear_reference()
 
     def close(self, timeout=10):
         """stdin EOF is the engine's clean exit; escalate only if it ignores it."""
@@ -434,6 +529,7 @@ class ImageEngine:
         if dispatcher is not None and dispatcher is not threading.current_thread():
             dispatcher.join(timeout=5)
         if self.process.poll() is not None:
+            self._clear_reference()
             for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
                 try:
                     if stream is not None:
@@ -828,6 +924,11 @@ def _part_dir(root, index, name):
     return root / name
 
 
+def image_tokenizer_path(model_dir, index):
+    """The tokenizer that the image pipeline's processor loads."""
+    return _part_dir(Path(model_dir), index, "processor") / "tokenizer.json"
+
+
 def _gguf_reader():
     import importlib.util
     spec = importlib.util.spec_from_file_location("gguf_reader", Path(__file__).resolve().parent / "tools" / "gguf_reader.py")
@@ -927,7 +1028,7 @@ def inspect_image_model(model_dir):
         elif name == "vae":
             entry["precision"] = "f32" if dtypes else None
         components[name] = entry
-    tokenizer = _part_dir(root, index, "processor") / "tokenizer.json"
+    tokenizer = image_tokenizer_path(root, index)
     license_text = ""
     try:
         license_text = (root / "LICENSE").read_text(encoding="utf-8", errors="replace")[:400]

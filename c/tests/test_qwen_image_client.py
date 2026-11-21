@@ -268,6 +268,24 @@ class ImageEngineTest(unittest.TestCase):
         self.assertTrue(engine.alive)
         self.assertEqual(engine.generate("y", 256, 256, 2, 2)["seed"], 2)
 
+    def test_reference_file_is_cleaned_after_an_abandoned_request_is_drained(self):
+        engine = self.engine(QWENIMAGE_STUB_EDITS="1")
+        pixels = bytes((10, 20, 30, 255)) * (32 * 64)
+        paths = []
+
+        def abandon(_progress):
+            path = Path(engine._reference_dir.name) / "reference.rgba"
+            self.assertEqual(path.read_bytes(), pixels)
+            paths.append(path)
+            raise RuntimeError("stop listening")
+
+        with self.assertRaisesRegex(RuntimeError, "stop listening"):
+            engine.generate("edit", 256, 256, 2, 1, reference=(32, 64, pixels),
+                            on_progress=abandon)
+        self.assertTrue(paths[0].exists())
+        self.assertEqual(engine.generate("new image", 256, 256, 2, 2)["seed"], 2)
+        self.assertFalse(paths[0].exists())
+
     def test_a_crash_is_reported_and_the_engine_marked_dead(self):
         engine = self.engine()
         with self.assertRaisesRegex(ie.ImageEngineError, "exited"):
