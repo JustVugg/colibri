@@ -1962,10 +1962,15 @@ qwen38-tiny-mxfp4-generate:
 #      of the same fixture reproduce it too, so both runs give the same tokens;
 #  (c) the two runs' last logits within cosine 0.99999, the refusals (another geometry, an
 #      incomplete conversion, a record not of the layout, no sidecar, an unknown
-#      Q38_EXPERT_LOWBIT) and the CUDA tier declining MXFP4 (tests/qwen38_mxfp4_engine_check.py);
-#  (d) the sidecar read from COLI_MODEL_MIRROR copies, as the int4 one (tests/qwen38_mirror_check.py).
+#      Q38_EXPERT_LOWBIT) and ref.json under COLI_CUDA=1, the experts on the CUDA tier where the
+#      build has a card, else on the CPU (tests/qwen38_mxfp4_engine_check.py);
+#  (d) the sidecar read from COLI_MODEL_MIRROR copies, as the int4 one (tests/qwen38_mirror_check.py);
+#  (e) the CUDA tier's fmt 7 copy mode on the fake backend: every group refused, the last logits
+#      the CPU run's to the bit; the fake computing the residents, the oracle's tokens and the
+#      logits within 1e-6, the same bits run to run (tests/test_qwen38_tier_engine).
 .PHONY: qwen38-tiny-mxfp4-check
-qwen38-tiny-mxfp4-check: qwen38-tiny-mxfp4-generate qwen38$(EXE) tests/test_qwen38_mxfp4_experts$(EXE)
+qwen38-tiny-mxfp4-check: qwen38-tiny-mxfp4-generate qwen38-tiny-fp8-generate qwen38$(EXE) \
+		tests/test_qwen38_mxfp4_experts$(EXE) tests/test_qwen38_tier_engine$(EXE)
 	OMP_NUM_THREADS=2 ./tests/test_qwen38_mxfp4_experts$(EXE) ./qwen38_tiny_mxfp4
 	@d=./qwen38_tiny_mxfp4/logits; rm -rf $$d; mkdir -p $$d; n=0; \
 	for trunk in 1024 0; do for cap in 1 2 4; do for mode in single batched prefill prefill-serial mapped; do \
@@ -1991,6 +1996,7 @@ qwen38-tiny-mxfp4-check: qwen38-tiny-mxfp4-generate qwen38$(EXE) tests/test_qwen
 	$(PYTHON) tests/qwen38_mxfp4_engine_check.py --model ./qwen38_tiny_mxfp4 --engine ./qwen38$(EXE) \
 		--mxfp4 ./qwen38_tiny_mxfp4/logits/t1024-c2-batched.f32 --fp8 ./qwen38_tiny_mxfp4/logits/fp8.f32
 	$(PYTHON) tests/qwen38_mirror_check.py --model ./qwen38_tiny_mxfp4 --engine ./qwen38$(EXE) --lowbit mxfp4 --ref ref.json
+	./tests/test_qwen38_tier_engine$(EXE) ./qwen38_tiny_mxfp4
 
 # The int4 fixture's sidecar read from COLI_MODEL_MIRROR copies in temporary directories: the
 # tokens and last logits of the run without a mirror, every replica serving records, a differing
