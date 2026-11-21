@@ -220,7 +220,7 @@ dépôt.
 |---|---|---|---|---|---|
 | **Qwen3.6-35B-A3B** : chat avec réflexion et outils | `qwen36-35b` | 23 GB | 10 / 20 GB | CUDA, Vulkan (intégré aussi) | 6.0 tok/s sur le CPU, 9.9 avec Vulkan sur le GPU intégré (A) ; 30.0 avec CUDA (C) |
 | Qwen3-Coder-30B-A3B : code et appels d'outils, sans réflexion | `qwen3-coder-30b` | 19 GB | 8 / 18 GB | CUDA, Vulkan (intégré aussi) | 8.5-9.6 tok/s avec tous les experts en RAM, 5.1 avec 32 par couche (A, CPU) |
-| **Qwen-Image-2.1** : texte vers image, licence non commerciale | `qwen-image-2.1` | 33 GB | 12 / 18 GB | Vulkan | une image 768x512 en 2 min 40 s (8 cœurs Zen 4, CPU) |
+| **Qwen-Image-2.1** : texte vers image, licence non commerciale ; avec moins de RAM, [ses GGUF](docs/qwen-image.md#gguf-unsloth) : 10 GB sur le disque, 5.9 GB au pic | `qwen-image-2.1` | 33 GB | 12 / 18 GB | Vulkan | une image 768x512 en 2 min 40 s (8 cœurs Zen 4, CPU) |
 
 **Grands modèles, dont les experts sont lus depuis le disque** (le disque fixe la
 vitesse : un SSD NVMe rapide aide le plus)
@@ -265,6 +265,8 @@ modèles sont publiés sous forme de GGUF :
 |---|---|---|---|
 | **Mistral-Large-4** (1T, 52B actifs) : texte, images, raisonnement et outils | unsloth, UD-IQ1_S 233 GB | CUDA, Vulkan | 1.34-1.36 tok/s avec CUDA, 1.16-1.17 avec Vulkan (D) |
 | **Muse Spark Open** (816B, 42B actifs) : texte et outils, sous l'accord de licence de Meta | unsloth, de UD-IQ1_S 176 GB à UD-Q4_K_XL 505 GB | CUDA, Vulkan | 1.55-1.58 tok/s avec Vulkan, 1.34-1.40 avec CUDA, 0.83-0.89 sur le CPU (D) |
+| **Inkling-2-Small** (594B, 17B actifs) : texte, images et outils, Apache 2.0 ([inkling.md](docs/inkling.md#inkling-2-small)) | unsloth, de UD-IQ1_S 171.7 GB à UD-Q4_K_XL 354 GB, les images par son mmproj ; ou notre int4 g64 depuis la version NVFP4 | CUDA, Vulkan | UD-IQ1_S : 2.80-2.87 tok/s avec CUDA, 2.75-2.82 avec Vulkan (D) |
+| **Inkling-2-Mini** (26.4B, 3.4B actifs, les couches du milieu trois fois) : texte, images et outils, Apache 2.0 ([inkling.md](docs/inkling.md#inkling-2-mini)) | unsloth, de UD-IQ2_XXS 8.5 GB à UD-Q4_K_XL 17.6 GB, les images par son mmproj ; ou notre int4 g64 depuis la version NVFP4 | CUDA, Vulkan | UD-Q4_K_XL : 39.2-39.4 tok/s avec Vulkan, 40.9-41.1 avec CUDA, 8.0-8.1 sur le CPU (D) |
 | **Flint** (40B, 2.5B actifs) : texte et outils, Apache 2.0 | unsloth, de UD-IQ1_M 11.4 GB à BF16 79.6 GB | CUDA, Vulkan | UD-Q4_K_XL : 77.4 tok/s avec CUDA, 77.7 avec Vulkan, 15.8 sur le CPU (D) |
 | **LFM3-VL-2B** : texte, images et outils, LFM Open License | LiquidAI, de QAD-Q4_0 à BF16 (ou le checkpoint, converti) | CUDA, Vulkan | Q4_K_M : 235.1 tok/s avec CUDA, 214.1 avec Vulkan, 34.5 sur le CPU (D) |
 | **Qwen-Image-2.1** et sa version **Turbo** : texte vers image, licence non commerciale ([qwen-image.md](docs/qwen-image.md#gguf-unsloth)) | unsloth, de Q2_K 2.5 GB à F16 14.2 GB, avec un GGUF Qwen3-VL-8B-Instruct comme encodeur de texte | Vulkan | Turbo Q4_K_M, 1024x1024 en 8 étapes : 37 s de débruitage avec Vulkan (D) ; à 512x512, 8.4-9.3 s par étape sur le CPU (A) |
@@ -392,7 +394,7 @@ moteurs de décision se compilent avec `make <engine> CUDA=1`. Sous Windows, le 
 CUDA est une DLL séparée ([windows.md](docs/windows.md)), et chaque version publiée
 l'embarque déjà compilée : `colibri-<version>-windows-x86_64-cuda.zip` contient
 `coli_cuda.dll` (cartes de capacité de calcul 8.0 et plus récentes) et les moteurs
-colibri, glm53, qwen36 et kimi_k3 qui le chargent, avec les DLL CUDA propres à
+colibri, glm53, qwen36, qwen38 et kimi_k3 qui le chargent, avec les DLL CUDA propres à
 DeepSeek V4. Décompressez-la par-dessus l'archive principale et l'installation
 choisit CUDA.
 
@@ -682,14 +684,21 @@ depuis la page de chaque modèle :
 | GGUF | taille | backend | prompt | décodage |
 |---|---:|---|---:|---:|
 | Inkling-Small UD-IQ2_XXS | 77 GB | Vulkan | 15.1-33.1 | 10.92-11.53 ([vulkan.md](docs/vulkan.md)) |
+| Qwen3.8-Flash-Next UD-IQ3_XXS | 84 GB | CUDA | 478-492 | 41.5 † |
+| Qwen3.8-Flash-Next UD-IQ3_XXS | 84 GB | Vulkan | 276 | 33.0-33.4 † |
 | MiMo-V2.6-Flash Q2_K_S | 106 GB | Vulkan | 8.2 | 7.8 ([gguf.md](docs/gguf.md)) |
 | DeepSeek V4 Flash 0731 UD-IQ2_XXS | 85 GB | Vulkan | 19.7-20.4 | 6.18-6.25 ([vulkan.md](docs/vulkan.md)) |
+| DeepSeek V4 Flash UD-IQ1_S | 83 GB | CUDA | 18.3-18.6 | 6.1 † |
+| DeepSeek V4 Flash UD-IQ1_S | 83 GB | Vulkan | 21.5-22.0 | 6.4-6.5 † |
 | DeepSeek V4.1 Flash UD-IQ1_S | | Vulkan | 31.8 sur 3,403 tokens | 5.01-5.29 ([deepseek-v41.md](docs/deepseek-v41.md)) |
-| GLM-5.3-Flash UD-IQ2_XXS | 95 GB | Vulkan | 9.3 | 2.92-3.40 ([vulkan.md](docs/vulkan.md)) |
+| GLM-5.3-Flash UD-IQ2_XXS | 95 GB | CUDA | 17.1-17.5 | 5.2 † |
+| GLM-5.3-Flash UD-IQ2_XXS | 95 GB | Vulkan | 17.5-17.7 | 5.5-5.6 † |
 | Muse Spark Open UD-IQ1_S | 176 GB | Vulkan | 5.0-5.3 | 1.55-1.58 ([qwen36.md](docs/qwen36.md#muse-spark-open)) |
 | Mistral-Large-4 UD-IQ1_S | 233 GB | CUDA | 240 tokens en 66-82 s | 1.34-1.36 ([mistral-large4.md](docs/mistral-large4.md)) |
 | GLM-5.2 UD-IQ1_S | 202 GB | Vulkan | | 0.633-0.658 ([gguf.md](docs/gguf.md)) |
 | Kimi K3 UD-IQ1_S | 594 GB | Vulkan | 31 tokens en 46.5 s | 0.349 ([gguf.md](docs/gguf.md)) |
+
+† Mesuré pour cette version sur la machine D : un prompt de 1000 tokens, puis 300 tokens de décodage.
 
 ### Contextes longs et agents
 
@@ -719,12 +728,15 @@ chiffres.
 <a id="1-get-colibri"></a>
 
 **1. Le programme.** Prenez l'archive de votre plateforme sur
-[Releases](https://github.com/JustVugg/colibri/releases) (Linux x86_64, macOS,
+[Releases](https://github.com/JustVugg/colibri/releases) (Linux x86_64 et aarch64, macOS,
 Windows ; aucun compilateur requis, seulement [Python 3](https://www.python.org/downloads/)
 pour le lanceur et l'API) et décompressez-la, puis `python3 coli info`. Les moteurs
 Linux et Windows ont Vulkan intégré, avec leurs `shaders/` à côté, et ceux de macOS
-ont Metal ; pour une carte NVIDIA sous Windows, ajoutez l'archive CUDA. Ou compilez
-depuis les sources avec `gcc` (ou clang) et OpenMP :
+ont Metal ; pour une carte NVIDIA sous Windows, ajoutez l'archive CUDA. L'archive
+aarch64 (un Raspberry Pi 4 ou 5, Graviton, Ampere) est en armv8-a simple et tourne sur le
+CPU : un cœur doté des instructions dot-product va plus vite avec un moteur compilé dessus
+([quickstart](docs/quickstart.md)). Ou compilez depuis les sources avec `gcc` (ou clang) et
+OpenMP ; sous FreeBSD x86-64, `gmake` compile avec le clang du système de base et son OpenMP :
 
 ```bash
 git clone https://github.com/JustVugg/colibri && cd colibri/c

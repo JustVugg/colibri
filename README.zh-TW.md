@@ -194,7 +194,7 @@ Starting colibri
 |---|---|---|---|---|---|
 | **Qwen3.6-35B-A3B**：支援思考與工具的聊天 | `qwen36-35b` | 23 GB | 10 / 20 GB | CUDA、Vulkan（含內建顯示晶片） | CPU 上 6.0 tok/s，在內建顯示晶片上用 Vulkan 為 9.9（A）；用 CUDA 為 30.0（C） |
 | Qwen3-Coder-30B-A3B：程式碼與工具呼叫，不含思考 | `qwen3-coder-30b` | 19 GB | 8 / 18 GB | CUDA、Vulkan（含內建顯示晶片） | 所有專家都在 RAM 中時 8.5-9.6 tok/s，每層 32 個時 5.1（A，CPU） |
-| **Qwen-Image-2.1**：文字生成圖片，非商業授權 | `qwen-image-2.1` | 33 GB | 12 / 18 GB | Vulkan | 一張 768x512 的圖片 2 分 40 秒（8 個 Zen 4 核心，CPU） |
+| **Qwen-Image-2.1**：文字生成圖片，非商業授權；記憶體較少時用[它的 GGUF](docs/qwen-image.md#gguf-unsloth)：磁碟 10 GB，峰值 5.9 GB | `qwen-image-2.1` | 33 GB | 12 / 18 GB | Vulkan | 一張 768x512 的圖片 2 分 40 秒（8 個 Zen 4 核心，CPU） |
 
 **大型模型，專家從硬碟串流讀取**（速度由硬碟決定：
 快速的 NVMe 硬碟幫助最大）
@@ -233,6 +233,8 @@ Starting colibri
 |---|---|---|---|
 | **Mistral-Large-4**（1T，啟用 52B）：文字、圖片、推理與工具呼叫 | unsloth，UD-IQ1_S 233 GB | CUDA、Vulkan | CUDA 1.34-1.36 tok/s，Vulkan 1.16-1.17（D） |
 | **Muse Spark Open**（816B，啟用 42B）：文字與工具呼叫，遵循 Meta 的授權協議 | unsloth，從 UD-IQ1_S 176 GB 到 UD-Q4_K_XL 505 GB | CUDA、Vulkan | Vulkan 1.55-1.58 tok/s，CUDA 1.34-1.40，CPU 0.83-0.89（D） |
+| **Inkling-2-Small**（594B，啟用 17B）：文字、圖片與工具呼叫，Apache 2.0（[inkling.md](docs/inkling.md#inkling-2-small)） | unsloth，從 UD-IQ1_S 171.7 GB 到 UD-Q4_K_XL 354 GB，圖片透過其 mmproj；或我們從 NVFP4 版本轉換的 int4 g64 | CUDA、Vulkan | UD-IQ1_S：CUDA 2.80-2.87 tok/s，Vulkan 2.75-2.82（D） |
+| **Inkling-2-Mini**（26.4B，啟用 3.4B，中間層執行三遍）：文字、圖片與工具呼叫，Apache 2.0（[inkling.md](docs/inkling.md#inkling-2-mini)） | unsloth，從 UD-IQ2_XXS 8.5 GB 到 UD-Q4_K_XL 17.6 GB，圖片透過其 mmproj；或我們從 NVFP4 版本轉換的 int4 g64 | CUDA、Vulkan | UD-Q4_K_XL：Vulkan 39.2-39.4 tok/s，CUDA 40.9-41.1，CPU 8.0-8.1（D） |
 | **Flint**（40B，啟用 2.5B）：文字與工具呼叫，Apache 2.0 | unsloth，從 UD-IQ1_M 11.4 GB 到 BF16 79.6 GB | CUDA、Vulkan | UD-Q4_K_XL：CUDA 77.4 tok/s，Vulkan 77.7，CPU 15.8（D） |
 | **LFM3-VL-2B**：文字、圖片與工具呼叫，LFM Open License | LiquidAI，從 QAD-Q4_0 到 BF16（或轉換後的 checkpoint） | CUDA、Vulkan | Q4_K_M：CUDA 235.1 tok/s，Vulkan 214.1，CPU 34.5（D） |
 | **Qwen-Image-2.1** 與其 **Turbo**：文字生成圖片，非商業授權（[qwen-image.md](docs/qwen-image.md#gguf-unsloth)） | unsloth，從 Q2_K 2.5 GB 到 F16 14.2 GB，另需一個 Qwen3-VL-8B-Instruct GGUF 作為文字編碼器 | Vulkan | Turbo Q4_K_M，1024x1024 在 8 步內：Vulkan 去噪 37 秒（D）；512x512 時 CPU 上每步 8.4-9.3 秒（A） |
@@ -331,7 +333,7 @@ GPU 加總數字的順序不同，而且會把某些中間結果（activation）
 
 ### CUDA：NVIDIA 顯示卡
 
-安裝了 CUDA 工具包時，安裝程式會在 Linux 上為有 CUDA 路徑的引擎建置 CUDA：GLM-5.2/5.3 與 Mistral-Large-4、GLM-5.3-Flash、Inkling、Kimi K3、DeepSeek V4 Flash、DeepSeek V4.1 Flash、MiMo-V2.6、Qwen3.8-Flash-Next，以及 Qwen3.6 與它執行的模型；OLMoE 與決策引擎用 `make <引擎> CUDA=1` 建置。在 Windows 上，CUDA 引擎是一個獨立的 DLL（[windows.md](docs/windows.md)），每個版本都附帶編譯好的版本：`colibri-<version>-windows-x86_64-cuda.zip` 包含 `coli_cuda.dll`（compute capability 8.0 以上的顯示卡）以及載入它的 colibri、glm53、qwen36 與 kimi_k3 引擎，還有 DeepSeek V4 的 CUDA DLL。把它解壓到主壓縮檔之上，安裝程式就會選擇 CUDA。
+安裝了 CUDA 工具包時，安裝程式會在 Linux 上為有 CUDA 路徑的引擎建置 CUDA：GLM-5.2/5.3 與 Mistral-Large-4、GLM-5.3-Flash、Inkling、Kimi K3、DeepSeek V4 Flash、DeepSeek V4.1 Flash、MiMo-V2.6、Qwen3.8-Flash-Next，以及 Qwen3.6 與它執行的模型；OLMoE 與決策引擎用 `make <引擎> CUDA=1` 建置。在 Windows 上，CUDA 引擎是一個獨立的 DLL（[windows.md](docs/windows.md)），每個版本都附帶編譯好的版本：`colibri-<version>-windows-x86_64-cuda.zip` 包含 `coli_cuda.dll`（compute capability 8.0 以上的顯示卡）以及載入它的 colibri、glm53、qwen36、qwen38 與 kimi_k3 引擎，還有 DeepSeek V4 的 CUDA DLL。把它解壓到主壓縮檔之上，安裝程式就會選擇 CUDA。
 
 - **所有層都在顯示卡上**（Qwen3.6、Qwen3.8 與 OLMoE）：稠密層、注意力以及顯示卡持有的路由專家作為一條鏈執行，顯示卡不持有的專家在 CPU 上執行。在 RTX PRO 4000 上，Qwen3.6-35B-A3B UD-Q4_K_M 的解碼速度為 104.8 tok/s，讀取提示詞為 3,491，OLMoE 為 354.6 與 10,418（[表格](#three-backends-on-one-machine)）。
 - **每個引擎都有顯示卡上的路由專家層級**（`cu_tier.h`），DeepSeek V4、V4.1、Kimi K3、GLM-5.3 與 MiMo 的稠密矩陣也放在顯示卡上（`cu_dense.h`）。
@@ -570,14 +572,21 @@ GLM-5.2 的解碼速度，取自[完整表格](docs/benchmarks.md)：
 | GGUF | 大小 | 後端 | 提示詞 | 解碼 |
 |---|---:|---|---:|---:|
 | Inkling-Small UD-IQ2_XXS | 77 GB | Vulkan | 15.1-33.1 | 10.92-11.53 ([vulkan.md](docs/vulkan.md)) |
+| Qwen3.8-Flash-Next UD-IQ3_XXS | 84 GB | CUDA | 478-492 | 41.5 † |
+| Qwen3.8-Flash-Next UD-IQ3_XXS | 84 GB | Vulkan | 276 | 33.0-33.4 † |
 | MiMo-V2.6-Flash Q2_K_S | 106 GB | Vulkan | 8.2 | 7.8 ([gguf.md](docs/gguf.md)) |
 | DeepSeek V4 Flash 0731 UD-IQ2_XXS | 85 GB | Vulkan | 19.7-20.4 | 6.18-6.25 ([vulkan.md](docs/vulkan.md)) |
+| DeepSeek V4 Flash UD-IQ1_S | 83 GB | CUDA | 18.3-18.6 | 6.1 † |
+| DeepSeek V4 Flash UD-IQ1_S | 83 GB | Vulkan | 21.5-22.0 | 6.4-6.5 † |
 | DeepSeek V4.1 Flash UD-IQ1_S |  | Vulkan | 3,403 個 token 時 31.8 | 5.01-5.29 ([deepseek-v41.md](docs/deepseek-v41.md)) |
-| GLM-5.3-Flash UD-IQ2_XXS | 95 GB | Vulkan | 9.3 | 2.92-3.40 ([vulkan.md](docs/vulkan.md)) |
+| GLM-5.3-Flash UD-IQ2_XXS | 95 GB | CUDA | 17.1-17.5 | 5.2 † |
+| GLM-5.3-Flash UD-IQ2_XXS | 95 GB | Vulkan | 17.5-17.7 | 5.5-5.6 † |
 | Muse Spark Open UD-IQ1_S | 176 GB | Vulkan | 5.0-5.3 | 1.55-1.58 ([qwen36.md](docs/qwen36.md#muse-spark-open)) |
 | Mistral-Large-4 UD-IQ1_S | 233 GB | CUDA | 240 個 token 耗時 66-82 秒 | 1.34-1.36 ([mistral-large4.md](docs/mistral-large4.md)) |
 | GLM-5.2 UD-IQ1_S | 202 GB | Vulkan |  | 0.633-0.658 ([gguf.md](docs/gguf.md)) |
 | Kimi K3 UD-IQ1_S | 594 GB | Vulkan | 31 個 token 耗時 46.5 秒 | 0.349 ([gguf.md](docs/gguf.md)) |
+
+† 為本版本在機器 D 上測得：1000 個 token 的提示詞，然後解碼 300 個 token。
 
 ### 長上下文與智慧代理
 
@@ -596,10 +605,10 @@ GLM-5.2 的解碼速度，取自[完整表格](docs/benchmarks.md)：
 <a id="1-get-colibri"></a>
 
 **1. 程式**。從 [Releases](https://github.com/JustVugg/colibri/releases)
-下載適用你平台的壓縮檔（Linux x86_64、macOS、Windows；不需要編譯器，
+下載適用你平台的壓縮檔（Linux x86_64 與 aarch64、macOS、Windows；不需要編譯器，
 只需要供啟動器與 API 使用的 [Python 3](https://www.python.org/downloads/)），
 解壓縮後執行 `python3 coli info`。Linux 與 Windows 的引擎內建 Vulkan（`shaders/` 就在旁邊），
-macOS 的引擎內建 Metal；在 Windows 上使用 NVIDIA 顯示卡時，再加上 CUDA 壓縮檔。或者使用 `gcc`（或 clang）與 OpenMP 從原始碼建置：
+macOS 的引擎內建 Metal；在 Windows 上使用 NVIDIA 顯示卡時，再加上 CUDA 壓縮檔。aarch64 壓縮檔（Raspberry Pi 4 或 5、Graviton、Ampere）是一般的 armv8-a，在 CPU 上執行；具備點積指令的核心用在其上建置的引擎會更快（[quickstart](docs/quickstart.md)）。或者使用 `gcc`（或 clang）與 OpenMP 從原始碼建置；在 FreeBSD x86-64 上，`gmake` 以基本系統內建的 clang 與其 OpenMP 建置：
 
 ```bash
 git clone https://github.com/JustVugg/colibri && cd colibri/c

@@ -147,7 +147,7 @@ Starting colibri
 |---|---|---|---|---|---|
 | **Qwen3.6-35B-A3B**: чат с рассуждениями и инструментами | `qwen36-35b` | 23 GB | 10 / 20 GB | CUDA, Vulkan (включая встроенную) | 6.0 tok/s на CPU, 9.9 с Vulkan на встроенной GPU (A); 30.0 с CUDA (C) |
 | Qwen3-Coder-30B-A3B: код и вызовы инструментов, без рассуждений | `qwen3-coder-30b` | 19 GB | 8 / 18 GB | CUDA, Vulkan (включая встроенную) | 8.5-9.6 tok/s со всеми экспертами в RAM, 5.1 с 32 на слой (A, CPU) |
-| **Qwen-Image-2.1**: из текста в изображение, некоммерческая лицензия | `qwen-image-2.1` | 33 GB | 12 / 18 GB | Vulkan | одно изображение 768x512 за 2 min 40 s (8 ядер Zen 4, CPU) |
+| **Qwen-Image-2.1**: из текста в изображение, некоммерческая лицензия; при меньшем объёме RAM [его GGUF](docs/qwen-image.md#gguf-unsloth): 10 GB на диске, пик 5.9 GB | `qwen-image-2.1` | 33 GB | 12 / 18 GB | Vulkan | одно изображение 768x512 за 2 min 40 s (8 ядер Zen 4, CPU) |
 
 **Крупные модели, чьи эксперты читаются с диска потоком** (скорость задаёт диск: больше всего помогает быстрый NVMe)
 
@@ -185,6 +185,8 @@ Starting colibri
 |---|---|---|---|
 | **Mistral-Large-4** (1T, 52B активных): текст, изображения, рассуждения и инструменты | unsloth, UD-IQ1_S 233 GB | CUDA, Vulkan | 1.34-1.36 tok/s с CUDA, 1.16-1.17 с Vulkan (D) |
 | **Muse Spark Open** (816B, 42B активных): текст и инструменты, по лицензионному соглашению Meta | unsloth, от UD-IQ1_S 176 GB до UD-Q4_K_XL 505 GB | CUDA, Vulkan | 1.55-1.58 tok/s с Vulkan, 1.34-1.40 с CUDA, 0.83-0.89 на CPU (D) |
+| **Inkling-2-Small** (594B, 17B активных): текст, изображения и инструменты, Apache 2.0 ([inkling.md](docs/inkling.md#inkling-2-small)) | unsloth, от UD-IQ1_S 171.7 GB до UD-Q4_K_XL 354 GB, изображения через его mmproj; или наш int4 g64 из релиза NVFP4 | CUDA, Vulkan | UD-IQ1_S: 2.80-2.87 tok/s с CUDA, 2.75-2.82 с Vulkan (D) |
+| **Inkling-2-Mini** (26.4B, 3.4B активных, средние слои три раза): текст, изображения и инструменты, Apache 2.0 ([inkling.md](docs/inkling.md#inkling-2-mini)) | unsloth, от UD-IQ2_XXS 8.5 GB до UD-Q4_K_XL 17.6 GB, изображения через его mmproj; или наш int4 g64 из релиза NVFP4 | CUDA, Vulkan | UD-Q4_K_XL: 39.2-39.4 tok/s с Vulkan, 40.9-41.1 с CUDA, 8.0-8.1 на CPU (D) |
 | **Flint** (40B, 2.5B активных): текст и инструменты, Apache 2.0 | unsloth, от UD-IQ1_M 11.4 GB до BF16 79.6 GB | CUDA, Vulkan | UD-Q4_K_XL: 77.4 tok/s с CUDA, 77.7 с Vulkan, 15.8 на CPU (D) |
 | **LFM3-VL-2B**: текст, изображения и инструменты, LFM Open License | LiquidAI, от QAD-Q4_0 до BF16 (или чекпоинт, сконвертированный) | CUDA, Vulkan | Q4_K_M: 235.1 tok/s с CUDA, 214.1 с Vulkan, 34.5 на CPU (D) |
 | **Qwen-Image-2.1** и его **Turbo**: из текста в изображение, некоммерческая лицензия ([qwen-image.md](docs/qwen-image.md#gguf-unsloth)) | unsloth, от Q2_K 2.5 GB до F16 14.2 GB, с Qwen3-VL-8B-Instruct GGUF в качестве текстового энкодера | Vulkan | Turbo Q4_K_M, 1024x1024 за 8 шагов: 37 s денойзинга с Vulkan (D); при 512x512 8.4-9.3 s на шаг на CPU (A) |
@@ -247,7 +249,7 @@ CI проверяет путь Vulkan каждого движка против �
 
 ### CUDA: карты NVIDIA
 
-Установка собирает CUDA в Linux, если установлен CUDA toolkit, для движков, у которых есть путь CUDA: GLM-5.2/5.3 и Mistral-Large-4, GLM-5.3-Flash, Inkling, Kimi K3, DeepSeek V4 Flash, DeepSeek V4.1 Flash, MiMo-V2.6, Qwen3.8-Flash-Next, а также Qwen3.6 с моделями, которые он запускает; OLMoE и движки решений собираются командой `make <engine> CUDA=1`. В Windows движок CUDA — это отдельная DLL ([windows.md](docs/windows.md)), и каждый релиз поставляется уже собранным: `colibri-<version>-windows-x86_64-cuda.zip` содержит `coli_cuda.dll` (карты с compute capability 8.0 и новее) и движки colibri, glm53, qwen36 и kimi_k3, которые её загружают, вместе с собственными CUDA DLL для DeepSeek V4. Распакуйте его поверх основного архива, и установка выберет CUDA.
+Установка собирает CUDA в Linux, если установлен CUDA toolkit, для движков, у которых есть путь CUDA: GLM-5.2/5.3 и Mistral-Large-4, GLM-5.3-Flash, Inkling, Kimi K3, DeepSeek V4 Flash, DeepSeek V4.1 Flash, MiMo-V2.6, Qwen3.8-Flash-Next, а также Qwen3.6 с моделями, которые он запускает; OLMoE и движки решений собираются командой `make <engine> CUDA=1`. В Windows движок CUDA — это отдельная DLL ([windows.md](docs/windows.md)), и каждый релиз поставляется уже собранным: `colibri-<version>-windows-x86_64-cuda.zip` содержит `coli_cuda.dll` (карты с compute capability 8.0 и новее) и движки colibri, glm53, qwen36, qwen38 и kimi_k3, которые её загружают, вместе с собственными CUDA DLL для DeepSeek V4. Распакуйте его поверх основного архива, и установка выберет CUDA.
 
 - **Каждый слой на карте** для Qwen3.6, Qwen3.8 и OLMoE: плотные слои, attention и маршрутизируемые эксперты, которые есть на карте, работают как одна цепочка, а те, которых на карте нет, выполняются на CPU. На RTX PRO 4000 Qwen3.6-35B-A3B UD-Q4_K_M декодирует со скоростью 104.8 tok/s и читает промпт из 3,491 токена, OLMoE — 354.6 и 10,418 ([таблица](#three-backends-on-one-machine)).
 - **Уровень маршрутизируемых экспертов на карте для каждого движка** (`cu_tier.h`), а плотные матрицы на ней — для DeepSeek V4, V4.1, Kimi K3, GLM-5.3 и MiMo (`cu_dense.h`).
@@ -401,14 +403,21 @@ curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -
 | GGUF | размер | бэкенд | промпт | декодирование |
 |---|---:|---|---:|---:|
 | Inkling-Small UD-IQ2_XXS | 77 GB | Vulkan | 15.1-33.1 | 10.92-11.53 ([vulkan.md](docs/vulkan.md)) |
+| Qwen3.8-Flash-Next UD-IQ3_XXS | 84 GB | CUDA | 478-492 | 41.5 † |
+| Qwen3.8-Flash-Next UD-IQ3_XXS | 84 GB | Vulkan | 276 | 33.0-33.4 † |
 | MiMo-V2.6-Flash Q2_K_S | 106 GB | Vulkan | 8.2 | 7.8 ([gguf.md](docs/gguf.md)) |
 | DeepSeek V4 Flash 0731 UD-IQ2_XXS | 85 GB | Vulkan | 19.7-20.4 | 6.18-6.25 ([vulkan.md](docs/vulkan.md)) |
+| DeepSeek V4 Flash UD-IQ1_S | 83 GB | CUDA | 18.3-18.6 | 6.1 † |
+| DeepSeek V4 Flash UD-IQ1_S | 83 GB | Vulkan | 21.5-22.0 | 6.4-6.5 † |
 | DeepSeek V4.1 Flash UD-IQ1_S |  | Vulkan | 31.8 за 3,403 токена | 5.01-5.29 ([deepseek-v41.md](docs/deepseek-v41.md)) |
-| GLM-5.3-Flash UD-IQ2_XXS | 95 GB | Vulkan | 9.3 | 2.92-3.40 ([vulkan.md](docs/vulkan.md)) |
+| GLM-5.3-Flash UD-IQ2_XXS | 95 GB | CUDA | 17.1-17.5 | 5.2 † |
+| GLM-5.3-Flash UD-IQ2_XXS | 95 GB | Vulkan | 17.5-17.7 | 5.5-5.6 † |
 | Muse Spark Open UD-IQ1_S | 176 GB | Vulkan | 5.0-5.3 | 1.55-1.58 ([qwen36.md](docs/qwen36.md#muse-spark-open)) |
 | Mistral-Large-4 UD-IQ1_S | 233 GB | CUDA | 240 токенов за 66-82 s | 1.34-1.36 ([mistral-large4.md](docs/mistral-large4.md)) |
 | GLM-5.2 UD-IQ1_S | 202 GB | Vulkan |  | 0.633-0.658 ([gguf.md](docs/gguf.md)) |
 | Kimi K3 UD-IQ1_S | 594 GB | Vulkan | 31 токен за 46.5 s | 0.349 ([gguf.md](docs/gguf.md)) |
+
+† Измерено для этого релиза на машине D: промпт из 1000 токенов, затем 300 токенов декодирования.
 
 ### Длинные контексты и агенты
 
@@ -424,7 +433,7 @@ curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -
 
 <a id="1-get-colibri"></a>
 
-**1. Программа.** Возьмите архив для своей платформы из [Releases](https://github.com/JustVugg/colibri/releases) (Linux x86_64, macOS, Windows; компилятор не нужен, нужен только [Python 3](https://www.python.org/downloads/) для лаунчера и API), распакуйте его и выполните `python3 coli info`. Движки Linux и Windows имеют Vulkan внутри, с их `shaders/` рядом, а движки macOS — Metal; для карты NVIDIA в Windows добавьте архив CUDA. Или соберите из исходников с `gcc` (или clang) и OpenMP:
+**1. Программа.** Возьмите архив для своей платформы из [Releases](https://github.com/JustVugg/colibri/releases) (Linux x86_64 и aarch64, macOS, Windows; компилятор не нужен, нужен только [Python 3](https://www.python.org/downloads/) для лаунчера и API), распакуйте его и выполните `python3 coli info`. Движки Linux и Windows имеют Vulkan внутри, с их `shaders/` рядом, а движки macOS — Metal; для карты NVIDIA в Windows добавьте архив CUDA. Архив aarch64 (Raspberry Pi 4 или 5, Graviton, Ampere) собран для простого armv8-a и работает на CPU: ядро с инструкциями скалярного произведения быстрее с движком, собранным на нём ([quickstart](docs/quickstart.md)). Или соберите из исходников с `gcc` (или clang) и OpenMP; во FreeBSD x86-64 `gmake` собирает с clang базовой системы и его OpenMP:
 
 ```bash
 git clone https://github.com/JustVugg/colibri && cd colibri/c

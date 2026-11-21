@@ -146,7 +146,7 @@ Mixture-of-Experts モデルは、ディスク上では巨大でも、1 トー�
 |---|---|---|---|---|---|
 | **Qwen3.6-35B-A3B**：思考モードとツールに対応したチャット | `qwen36-35b` | 23 GB | 10 / 20 GB | CUDA、Vulkan（内蔵 GPU も） | CPU で 6.0 tok/s、内蔵 GPU の Vulkan で 9.9（A）。CUDA で 30.0（C） |
 | Qwen3-Coder-30B-A3B：コードとツール呼び出し、思考モードなし | `qwen3-coder-30b` | 19 GB | 8 / 18 GB | CUDA、Vulkan（内蔵 GPU も） | 全エキスパートを RAM に置いて 8.5-9.6 tok/s、レイヤーあたり 32 個で 5.1（A、CPU） |
-| **Qwen-Image-2.1**：テキストから画像、非商用ライセンス | `qwen-image-2.1` | 33 GB | 12 / 18 GB | Vulkan | 768x512 の画像 1 枚に 2 分 40 秒（Zen 4 の 8 コア、CPU） |
+| **Qwen-Image-2.1**：テキストから画像、非商用ライセンス。RAM が少ないときは [GGUF](docs/qwen-image.md#gguf-unsloth)：ディスク 10 GB、ピーク 5.9 GB | `qwen-image-2.1` | 33 GB | 12 / 18 GB | Vulkan | 768x512 の画像 1 枚に 2 分 40 秒（Zen 4 の 8 コア、CPU） |
 
 **大きなモデル：エキスパートをディスクからストリーミングします**（速度を決めるのはディスクで、高速な NVMe ドライブが最も効果的です）
 
@@ -184,6 +184,8 @@ Mixture-of-Experts モデルは、ディスク上では巨大でも、1 トー�
 |---|---|---|---|
 | **Mistral-Large-4**（1T、アクティブ 52B）：テキスト、画像、推論、ツール | unsloth、UD-IQ1_S 233 GB | CUDA、Vulkan | CUDA で 1.34-1.36 tok/s、Vulkan で 1.16-1.17（D） |
 | **Muse Spark Open**（816B、アクティブ 42B）：テキストとツール、Meta のライセンス契約のもとで | unsloth、UD-IQ1_S 176 GB から UD-Q4_K_XL 505 GB | CUDA、Vulkan | Vulkan で 1.55-1.58 tok/s、CUDA で 1.34-1.40、CPU で 0.83-0.89（D） |
+| **Inkling-2-Small**（594B、アクティブ 17B）：テキスト、画像、ツール、Apache 2.0（[inkling.md](docs/inkling.md#inkling-2-small)） | unsloth、UD-IQ1_S 171.7 GB から UD-Q4_K_XL 354 GB、画像は mmproj で。または NVFP4 版から変換した私たちの int4 g64 | CUDA、Vulkan | UD-IQ1_S：CUDA で 2.80-2.87 tok/s、Vulkan で 2.75-2.82（D） |
+| **Inkling-2-Mini**（26.4B、アクティブ 3.4B、中間の層を 3 回通す）：テキスト、画像、ツール、Apache 2.0（[inkling.md](docs/inkling.md#inkling-2-mini)） | unsloth、UD-IQ2_XXS 8.5 GB から UD-Q4_K_XL 17.6 GB、画像は mmproj で。または NVFP4 版から変換した私たちの int4 g64 | CUDA、Vulkan | UD-Q4_K_XL：Vulkan で 39.2-39.4 tok/s、CUDA で 40.9-41.1、CPU で 8.0-8.1（D） |
 | **Flint**（40B、アクティブ 2.5B）：テキストとツール、Apache 2.0 | unsloth、UD-IQ1_M 11.4 GB から BF16 79.6 GB | CUDA、Vulkan | UD-Q4_K_XL：CUDA で 77.4 tok/s、Vulkan で 77.7、CPU で 15.8（D） |
 | **LFM3-VL-2B**：テキスト、画像、ツール、LFM Open License | LiquidAI、QAD-Q4_0 から BF16（または変換したチェックポイント） | CUDA、Vulkan | Q4_K_M：CUDA で 235.1 tok/s、Vulkan で 214.1、CPU で 34.5（D） |
 | **Qwen-Image-2.1** および **Turbo**：テキストから画像、非商用ライセンス（[qwen-image.md](docs/qwen-image.md#gguf-unsloth)） | unsloth、Q2_K 2.5 GB から F16 14.2 GB まで。テキストエンコーダーとして Qwen3-VL-8B-Instruct の GGUF を使用 | Vulkan | Turbo Q4_K_M、1024x1024 を 8 ステップで：Vulkan で 37 秒のデノイズ（D）。512x512 では CPU で 1 ステップあたり 8.4-9.3 秒（A） |
@@ -244,7 +246,7 @@ CI は、ソフトウェアドライバ上で、すべてのエンジンの Vulk
 
 ### CUDA：NVIDIA カード
 
-CUDA ツールキットがインストールされていれば、セットアップは Linux で CUDA の経路を持つエンジンを CUDA 付きでビルドします：GLM-5.2/5.3 と Mistral-Large-4、GLM-5.3-Flash、Inkling、Kimi K3、DeepSeek V4 Flash、DeepSeek V4.1 Flash、MiMo-V2.6、Qwen3.8-Flash-Next、そして Qwen3.6 とそれが動かすモデル。OLMoE と判定エンジンは `make <エンジン> CUDA=1` でビルドします。Windows では CUDA エンジンは別の DLL です（[windows.md](docs/windows.md)）。各リリースにはビルド済みのものが含まれます：`colibri-<version>-windows-x86_64-cuda.zip` には `coli_cuda.dll`（compute capability 8.0 以上のカード）と、それを読み込む colibri、glm53、qwen36、kimi_k3 の各エンジン、DeepSeek V4 用の CUDA DLL が入っています。メインのアーカイブの上に展開すると、セットアップが CUDA を選びます。
+CUDA ツールキットがインストールされていれば、セットアップは Linux で CUDA の経路を持つエンジンを CUDA 付きでビルドします：GLM-5.2/5.3 と Mistral-Large-4、GLM-5.3-Flash、Inkling、Kimi K3、DeepSeek V4 Flash、DeepSeek V4.1 Flash、MiMo-V2.6、Qwen3.8-Flash-Next、そして Qwen3.6 とそれが動かすモデル。OLMoE と判定エンジンは `make <エンジン> CUDA=1` でビルドします。Windows では CUDA エンジンは別の DLL です（[windows.md](docs/windows.md)）。各リリースにはビルド済みのものが含まれます：`colibri-<version>-windows-x86_64-cuda.zip` には `coli_cuda.dll`（compute capability 8.0 以上のカード）と、それを読み込む colibri、glm53、qwen36、qwen38、kimi_k3 の各エンジン、DeepSeek V4 用の CUDA DLL が入っています。メインのアーカイブの上に展開すると、セットアップが CUDA を選びます。
 
 - **すべてのレイヤーをカード上で**（Qwen3.6、Qwen3.8、OLMoE）：密レイヤー、アテンション、カードが持つルーティングエキスパートを 1 本のチェーンとして実行し、カードにないエキスパートは CPU で実行します。RTX PRO 4000 では Qwen3.6-35B-A3B UD-Q4_K_M のデコードが 104.8 tok/s、プロンプト読み込みが 3,491、OLMoE は 354.6 と 10,418 です（[表](#three-backends-on-one-machine)）。
 - **すべてのエンジンでカード上のエキスパートティア**（`cu_tier.h`）。DeepSeek V4、V4.1、Kimi K3、GLM-5.3、MiMo では密行列もカード上に置きます（`cu_dense.h`）。
@@ -399,14 +401,21 @@ RAM 62 GB の i5-13500 と RTX PRO 4000 Blackwell SFF（24 GB、70 W）。各モ
 | GGUF | サイズ | バックエンド | プロンプト | デコード |
 |---|---:|---|---:|---:|
 | Inkling-Small UD-IQ2_XXS | 77 GB | Vulkan | 15.1-33.1 | 10.92-11.53 ([vulkan.md](docs/vulkan.md)) |
+| Qwen3.8-Flash-Next UD-IQ3_XXS | 84 GB | CUDA | 478-492 | 41.5 † |
+| Qwen3.8-Flash-Next UD-IQ3_XXS | 84 GB | Vulkan | 276 | 33.0-33.4 † |
 | MiMo-V2.6-Flash Q2_K_S | 106 GB | Vulkan | 8.2 | 7.8 ([gguf.md](docs/gguf.md)) |
 | DeepSeek V4 Flash 0731 UD-IQ2_XXS | 85 GB | Vulkan | 19.7-20.4 | 6.18-6.25 ([vulkan.md](docs/vulkan.md)) |
+| DeepSeek V4 Flash UD-IQ1_S | 83 GB | CUDA | 18.3-18.6 | 6.1 † |
+| DeepSeek V4 Flash UD-IQ1_S | 83 GB | Vulkan | 21.5-22.0 | 6.4-6.5 † |
 | DeepSeek V4.1 Flash UD-IQ1_S |  | Vulkan | 3,403 トークンで 31.8 | 5.01-5.29 ([deepseek-v41.md](docs/deepseek-v41.md)) |
-| GLM-5.3-Flash UD-IQ2_XXS | 95 GB | Vulkan | 9.3 | 2.92-3.40 ([vulkan.md](docs/vulkan.md)) |
+| GLM-5.3-Flash UD-IQ2_XXS | 95 GB | CUDA | 17.1-17.5 | 5.2 † |
+| GLM-5.3-Flash UD-IQ2_XXS | 95 GB | Vulkan | 17.5-17.7 | 5.5-5.6 † |
 | Muse Spark Open UD-IQ1_S | 176 GB | Vulkan | 5.0-5.3 | 1.55-1.58 ([qwen36.md](docs/qwen36.md#muse-spark-open)) |
 | Mistral-Large-4 UD-IQ1_S | 233 GB | CUDA | 240 トークンを 66-82 s | 1.34-1.36 ([mistral-large4.md](docs/mistral-large4.md)) |
 | GLM-5.2 UD-IQ1_S | 202 GB | Vulkan |  | 0.633-0.658 ([gguf.md](docs/gguf.md)) |
 | Kimi K3 UD-IQ1_S | 594 GB | Vulkan | 31 トークンを 46.5 s | 0.349 ([gguf.md](docs/gguf.md)) |
+
+† このリリースのためにマシン D で測定：1000 トークンのプロンプトのあと 300 トークンのデコード。
 
 ### 長いコンテキストとエージェント
 
@@ -422,7 +431,7 @@ RAM 62 GB の i5-13500 と RTX PRO 4000 Blackwell SFF（24 GB、70 W）。各モ
 
 <a id="1-get-colibri"></a>
 
-**1. プログラム。** [Releases](https://github.com/JustVugg/colibri/releases) から自分のプラットフォーム用のアーカイブ（Linux x86_64、macOS、Windows。コンパイラは不要で、必要なのはランチャーと API のための [Python 3](https://www.python.org/downloads/) だけ）を取得して展開し、`python3 coli info` を実行します。Linux と Windows のエンジンには Vulkan が組み込まれ（`shaders/` が隣にあります）、macOS のエンジンには Metal が組み込まれています。Windows で NVIDIA のカードを使うなら、CUDA のアーカイブも追加してください。または、`gcc`（または clang）と OpenMP を使ってソースからビルドします：
+**1. プログラム。** [Releases](https://github.com/JustVugg/colibri/releases) から自分のプラットフォーム用のアーカイブ（Linux x86_64 と aarch64、macOS、Windows。コンパイラは不要で、必要なのはランチャーと API のための [Python 3](https://www.python.org/downloads/) だけ）を取得して展開し、`python3 coli info` を実行します。Linux と Windows のエンジンには Vulkan が組み込まれ（`shaders/` が隣にあります）、macOS のエンジンには Metal が組み込まれています。Windows で NVIDIA のカードを使うなら、CUDA のアーカイブも追加してください。aarch64 のアーカイブ（Raspberry Pi 4 や 5、Graviton、Ampere）は素の armv8-a で、CPU で動きます。ドット積命令を持つコアでは、その上でビルドしたエンジンのほうが速くなります（[quickstart](docs/quickstart.md)）。または、`gcc`（または clang）と OpenMP を使ってソースからビルドします。FreeBSD x86-64 では、`gmake` がベースシステムの clang とその OpenMP でビルドします：
 
 ```bash
 git clone https://github.com/JustVugg/colibri && cd colibri/c

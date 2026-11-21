@@ -226,7 +226,7 @@ ukuran yang dicantumkan Hugging Face untuk setiap repository.
 |---|---|---|---|---|---|
 | **Qwen3.6-35B-A3B**: chat dengan thinking dan tools | `qwen36-35b` | 23 GB | 10 / 20 GB | CUDA, Vulkan (termasuk terintegrasi) | 6.0 tok/s pada CPU, 9.9 dengan Vulkan pada GPU terintegrasi (A); 30.0 dengan CUDA (C) |
 | Qwen3-Coder-30B-A3B: kode dan tool calls, tanpa thinking | `qwen3-coder-30b` | 19 GB | 8 / 18 GB | CUDA, Vulkan (termasuk terintegrasi) | 8.5-9.6 tok/s dengan semua pakar di RAM, 5.1 dengan 32 per layer (A, CPU) |
-| **Qwen-Image-2.1**: teks ke gambar, lisensi nonkomersial | `qwen-image-2.1` | 33 GB | 12 / 18 GB | Vulkan | satu gambar 768x512 dalam 2 min 40 s (8 core Zen 4, CPU) |
+| **Qwen-Image-2.1**: teks ke gambar, lisensi nonkomersial; dengan RAM lebih kecil, [GGUF-nya](docs/qwen-image.md#gguf-unsloth): 10 GB di disk, puncak 5.9 GB | `qwen-image-2.1` | 33 GB | 12 / 18 GB | Vulkan | satu gambar 768x512 dalam 2 min 40 s (8 core Zen 4, CPU) |
 
 **Model besar, yang pakarnya melakukan streaming dari disk** (disk menentukan
 kecepatan: drive NVMe yang cepat paling membantu)
@@ -270,6 +270,8 @@ ini datang sebagai GGUF:
 |---|---|---|---|
 | **Mistral-Large-4** (1T, 52B aktif): teks, gambar, penalaran, dan tool | unsloth, UD-IQ1_S 233 GB | CUDA, Vulkan | 1.34-1.36 tok/s dengan CUDA, 1.16-1.17 dengan Vulkan (D) |
 | **Muse Spark Open** (816B, 42B aktif): teks dan tool, di bawah perjanjian lisensi Meta | unsloth, dari UD-IQ1_S 176 GB sampai UD-Q4_K_XL 505 GB | CUDA, Vulkan | 1.55-1.58 tok/s dengan Vulkan, 1.34-1.40 dengan CUDA, 0.83-0.89 di CPU (D) |
+| **Inkling-2-Small** (594B, 17B aktif): teks, gambar dan tool, Apache 2.0 ([inkling.md](docs/inkling.md#inkling-2-small)) | unsloth, dari UD-IQ1_S 171.7 GB sampai UD-Q4_K_XL 354 GB, gambar lewat mmproj-nya; atau int4 g64 kami dari rilis NVFP4 | CUDA, Vulkan | UD-IQ1_S: 2.80-2.87 tok/s dengan CUDA, 2.75-2.82 dengan Vulkan (D) |
+| **Inkling-2-Mini** (26.4B, 3.4B aktif, lapisan tengahnya tiga kali): teks, gambar dan tool, Apache 2.0 ([inkling.md](docs/inkling.md#inkling-2-mini)) | unsloth, dari UD-IQ2_XXS 8.5 GB sampai UD-Q4_K_XL 17.6 GB, gambar lewat mmproj-nya; atau int4 g64 kami dari rilis NVFP4 | CUDA, Vulkan | UD-Q4_K_XL: 39.2-39.4 tok/s dengan Vulkan, 40.9-41.1 dengan CUDA, 8.0-8.1 di CPU (D) |
 | **Flint** (40B, 2.5B aktif): teks dan tool, Apache 2.0 | unsloth, dari UD-IQ1_M 11.4 GB sampai BF16 79.6 GB | CUDA, Vulkan | UD-Q4_K_XL: 77.4 tok/s dengan CUDA, 77.7 dengan Vulkan, 15.8 di CPU (D) |
 | **LFM3-VL-2B**: teks, gambar, dan tool, LFM Open License | LiquidAI, dari QAD-Q4_0 sampai BF16 (atau checkpoint yang dikonversi) | CUDA, Vulkan | Q4_K_M: 235.1 tok/s dengan CUDA, 214.1 dengan Vulkan, 34.5 di CPU (D) |
 | **Qwen-Image-2.1** dan **Turbo**-nya: teks ke gambar, lisensi nonkomersial ([qwen-image.md](docs/qwen-image.md#gguf-unsloth)) | unsloth, Q2_K 2.5 GB sampai F16 14.2 GB, dengan GGUF Qwen3-VL-8B-Instruct sebagai text encoder | Vulkan | Turbo Q4_K_M, 1024x1024 dalam 8 langkah: 37 s denoising dengan Vulkan (D); pada 512x512 8.4-9.3 s per langkah di CPU (A) |
@@ -396,7 +398,7 @@ dan Qwen3.6 dengan model yang dijalankannya; OLMoE dan engine keputusan dibangun
 dengan `make <engine> CUDA=1`. Di Windows, engine CUDA adalah DLL terpisah
 ([windows.md](docs/windows.md)), dan setiap rilis menyertakannya dalam bentuk
 siap pakai: `colibri-<versi>-windows-x86_64-cuda.zip` berisi `coli_cuda.dll`
-(kartu dengan compute capability 8.0 ke atas) dan engine colibri, glm53, qwen36,
+(kartu dengan compute capability 8.0 ke atas) dan engine colibri, glm53, qwen36, qwen38,
 dan kimi_k3 yang memuatnya, beserta DLL CUDA milik DeepSeek V4. Ekstrak di atas
 arsip utama, dan setup akan memilih CUDA.
 
@@ -692,14 +694,21 @@ halaman setiap model:
 | GGUF | ukuran | backend | prompt | decode |
 |---|---:|---|---:|---:|
 | Inkling-Small UD-IQ2_XXS | 77 GB | Vulkan | 15.1-33.1 | 10.92-11.53 ([vulkan.md](docs/vulkan.md)) |
+| Qwen3.8-Flash-Next UD-IQ3_XXS | 84 GB | CUDA | 478-492 | 41.5 † |
+| Qwen3.8-Flash-Next UD-IQ3_XXS | 84 GB | Vulkan | 276 | 33.0-33.4 † |
 | MiMo-V2.6-Flash Q2_K_S | 106 GB | Vulkan | 8.2 | 7.8 ([gguf.md](docs/gguf.md)) |
 | DeepSeek V4 Flash 0731 UD-IQ2_XXS | 85 GB | Vulkan | 19.7-20.4 | 6.18-6.25 ([vulkan.md](docs/vulkan.md)) |
+| DeepSeek V4 Flash UD-IQ1_S | 83 GB | CUDA | 18.3-18.6 | 6.1 † |
+| DeepSeek V4 Flash UD-IQ1_S | 83 GB | Vulkan | 21.5-22.0 | 6.4-6.5 † |
 | DeepSeek V4.1 Flash UD-IQ1_S |  | Vulkan | 31.8 atas 3403 token | 5.01-5.29 ([deepseek-v41.md](docs/deepseek-v41.md)) |
-| GLM-5.3-Flash UD-IQ2_XXS | 95 GB | Vulkan | 9.3 | 2.92-3.40 ([vulkan.md](docs/vulkan.md)) |
+| GLM-5.3-Flash UD-IQ2_XXS | 95 GB | CUDA | 17.1-17.5 | 5.2 † |
+| GLM-5.3-Flash UD-IQ2_XXS | 95 GB | Vulkan | 17.5-17.7 | 5.5-5.6 † |
 | Muse Spark Open UD-IQ1_S | 176 GB | Vulkan | 5.0-5.3 | 1.55-1.58 ([qwen36.md](docs/qwen36.md#muse-spark-open)) |
 | Mistral-Large-4 UD-IQ1_S | 233 GB | CUDA | 240 token dalam 66-82 s | 1.34-1.36 ([mistral-large4.md](docs/mistral-large4.md)) |
 | GLM-5.2 UD-IQ1_S | 202 GB | Vulkan |  | 0.633-0.658 ([gguf.md](docs/gguf.md)) |
 | Kimi K3 UD-IQ1_S | 594 GB | Vulkan | 31 token dalam 46.5 s | 0.349 ([gguf.md](docs/gguf.md)) |
+
+† Diukur untuk rilis ini di mesin D: prompt 1000 token, lalu 300 token decode.
 
 ### Konteks panjang dan agen
 
@@ -728,12 +737,15 @@ hasil pengukurannya.
 <a id="1-get-colibri"></a>
 
 **1. Programnya.** Ambil archive untuk platform Anda dari
-[Releases](https://github.com/JustVugg/colibri/releases) (Linux x86_64, macOS,
+[Releases](https://github.com/JustVugg/colibri/releases) (Linux x86_64 dan aarch64, macOS,
 Windows; tidak memerlukan compiler, hanya [Python 3](https://www.python.org/downloads/)
 untuk launcher dan API), ekstrak, lalu jalankan `python3 coli info`. Engine
 Linux dan Windows sudah berisi Vulkan, dengan `shaders/` di sampingnya, dan engine
-macOS berisi Metal; untuk kartu NVIDIA di Windows tambahkan archive CUDA. Atau build
-dari source menggunakan `gcc` (atau clang) dan OpenMP:
+macOS berisi Metal; untuk kartu NVIDIA di Windows tambahkan archive CUDA. Archive
+aarch64 (Raspberry Pi 4 atau 5, Graviton, Ampere) adalah armv8-a polos dan berjalan di CPU:
+core dengan instruksi dot-product lebih cepat dengan engine yang di-build di atasnya
+([quickstart](docs/quickstart.md)). Atau build dari source menggunakan `gcc` (atau clang) dan
+OpenMP; di FreeBSD x86-64, `gmake` build dengan clang bawaan sistem dasar dan OpenMP-nya:
 
 ```bash
 git clone https://github.com/JustVugg/colibri && cd colibri/c
