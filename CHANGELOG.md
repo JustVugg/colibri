@@ -634,6 +634,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **Bounds on what requests and files hand the chat**:
+  - `ui/docs.py` unpacks an Office part up to 64 MB and a file's parts up to 256 MB together, and
+    refuses an XML part with a document type (Office XML has none; `xml.parsers.expat` checks
+    before ElementTree reads it, in any encoding).
+  - The gateway refuses a request's picture past 8192 x 8192 pixels, from its header, before an
+    image preprocessor decodes it whole (`MAX_IMAGE_PIXELS`).
+  - The chat page's `esc` turns quotes into entities too, so a page title or a link in an answer
+    stays inside its attribute; a source's link is http or https, or none, and `ui/web.py` keeps
+    only http and https results from SearXNG, as it did from DuckDuckGo.
+  - The desktop window hands the system's opener only http and https links.
+  - qwen36's Metal graph reads the MTP head's routed experts only in the packed int4 form, with
+    their byte and scale counts checked against the slot, as the CPU's reader does.
 - **Inkling's expert cache from the RAM plan in `coli serve`**: without `--cap` the engine got
   the legacy eight slots a layer, and on Inkling-2 (eight routed experts a token) nearly every
   expert of a step came again from the page cache. Inkling-2-Mini UD-Q4_K_XL on the CPU: 4.3 ->

@@ -51,6 +51,10 @@ def default_engine(family=None):
 END = b"\x01\x01END\x01\x01\n"
 READY = b"\x01\x01READY\x01\x01\n"
 MAX_BODY = 4 << 20
+#: The most pixels a request's picture may have (8192 x 8192): every image preprocessor decodes a
+#: picture whole before it scales it down, and a few MB of PNG can describe far more pixels than
+#: that, gigabytes once decoded. Read from the file's header, before anything decodes it.
+MAX_IMAGE_PIXELS = 8192 * 8192
 PROFILE_TURNS = 120           # rolling window of per-turn PROF snapshots kept for /profile
 DEFAULT_CORS_ORIGINS = (
     "http://127.0.0.1:8000",
@@ -4125,6 +4129,24 @@ def _image_part_url(part, kind):
 
 
 def _image_bytes_from_url(url):
+    """_image_source_bytes's picture, refused past MAX_IMAGE_PIXELS (its header's size, read
+    by Pillow without decoding it). A file Pillow does not read passes: the preprocessor that
+    needs it says so."""
+    data = _image_source_bytes(url)
+    try:
+        import io
+        from PIL import Image
+        with Image.open(io.BytesIO(data)) as img:
+            width, height = img.size
+    except Exception:   # noqa: BLE001 - no Pillow, or not a picture it reads
+        return data
+    if width * height > MAX_IMAGE_PIXELS:
+        raise APIError(400, f"the image is {width}x{height} pixels; at most {MAX_IMAGE_PIXELS} "
+                            "pixels (8192 x 8192) are accepted.", "messages")
+    return data
+
+
+def _image_source_bytes(url):
     """data: URI, file:// o percorso sul disco -> i byte dell'immagine.
 
     A local path is read with the server process's own permissions, and an
