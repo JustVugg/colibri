@@ -1437,55 +1437,64 @@ static const float mx4_lut[16] = {0.f,.5f,1.f,1.5f,2.f,3.f,4.f,6.f,
 static inline float mx4_scale(uint8_t s){
     union { uint32_t u; float f; } b; b.u = (uint32_t)s << 23; return b.f;
 }
+/* one weight row (rb packed bytes, ng scales) times one activation row: matmul_mxfp4's and
+ * matmul_mxfp4_rows' element, so the two give the same bits for a row */
+static inline float mx4_dot_row(const uint8_t *w, const uint8_t *scl, const float *xs, int I){
+    int ng=(I+31)/32; float a=0;
+#ifdef __AVX2__
+    if(I%32==0){
+        /* doubled e2m1 values are exact int8 -> one pshufb decodes a
+         * nibble vector; the 0.5f un-doubling rides the group scale */
+        const __m128i lut2=_mm_setr_epi8(0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12);
+        const __m128i m4=_mm_set1_epi8(0x0F);
+        __m256 acc=_mm256_setzero_ps();
+        for(int g=0;g<ng;g++){
+            __m128i by=_mm_loadu_si128((const __m128i*)(w+g*16));
+            __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+            __m128i n0=_mm_shuffle_epi8(lut2,_mm_unpacklo_epi8(lo,hi));  /* cols g*32+0..15  */
+            __m128i n1=_mm_shuffle_epi8(lut2,_mm_unpackhi_epi8(lo,hi));  /* cols g*32+16..31 */
+            const float *xg=xs+g*32;
+            __m256 ga=_mm256_mul_ps(_mm256_loadu_ps(xg),
+                                    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(n0)));
+            ga=_mm256_fmadd_ps(_mm256_loadu_ps(xg+8),
+                               _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(n0,8))),ga);
+            ga=_mm256_fmadd_ps(_mm256_loadu_ps(xg+16),
+                               _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(n1)),ga);
+            ga=_mm256_fmadd_ps(_mm256_loadu_ps(xg+24),
+                               _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(n1,8))),ga);
+            acc=_mm256_fmadd_ps(ga,_mm256_set1_ps(mx4_scale(scl[g])*0.5f),acc);
+        }
+        return hsum256(acc);
+    }
+#endif
+    for(int g=0;g<ng;g++){
+        int base=g*32, glen=32; if(base+glen>I) glen=I-base;
+        float sc=mx4_scale(scl[g]), ga=0;
+        for(int i=base;i<base+glen;i+=2){
+            uint8_t byte=w[i>>1];
+            ga+=xs[i]*mx4_lut[byte&0xF];
+            if(i+1<base+glen) ga+=xs[i+1]*mx4_lut[byte>>4];
+        }
+        a+=ga*sc;
+    }
+    return a;
+}
 static void matmul_mxfp4(float *y, const float *x, const uint8_t *q4, const uint8_t *e8s,
                          int S, int I, int O){
     int rb=(I+1)/2, ng=(I+31)/32;
     #pragma omp parallel for schedule(static)
-    for(int o=0;o<O;o++){
-        const uint8_t *w=q4+(int64_t)o*rb;
-        const uint8_t *scl=e8s+(int64_t)o*ng;
-        for(int s=0;s<S;s++){
-            const float *xs=x+(int64_t)s*I; float a=0;
-#ifdef __AVX2__
-            if(I%32==0){
-                /* doubled e2m1 values are exact int8 -> one pshufb decodes a
-                 * nibble vector; the 0.5f un-doubling rides the group scale */
-                const __m128i lut2=_mm_setr_epi8(0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12);
-                const __m128i m4=_mm_set1_epi8(0x0F);
-                __m256 acc=_mm256_setzero_ps();
-                for(int g=0;g<ng;g++){
-                    __m128i by=_mm_loadu_si128((const __m128i*)(w+g*16));
-                    __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
-                    __m128i n0=_mm_shuffle_epi8(lut2,_mm_unpacklo_epi8(lo,hi));  /* cols g*32+0..15  */
-                    __m128i n1=_mm_shuffle_epi8(lut2,_mm_unpackhi_epi8(lo,hi));  /* cols g*32+16..31 */
-                    const float *xg=xs+g*32;
-                    __m256 ga=_mm256_mul_ps(_mm256_loadu_ps(xg),
-                                            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(n0)));
-                    ga=_mm256_fmadd_ps(_mm256_loadu_ps(xg+8),
-                                       _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(n0,8))),ga);
-                    ga=_mm256_fmadd_ps(_mm256_loadu_ps(xg+16),
-                                       _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(n1)),ga);
-                    ga=_mm256_fmadd_ps(_mm256_loadu_ps(xg+24),
-                                       _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(n1,8))),ga);
-                    acc=_mm256_fmadd_ps(ga,_mm256_set1_ps(mx4_scale(scl[g])*0.5f),acc);
-                }
-                y[(int64_t)s*O+o]=hsum256(acc);
-                continue;
-            }
-#endif
-            for(int g=0;g<ng;g++){
-                int base=g*32, glen=32; if(base+glen>I) glen=I-base;
-                float sc=mx4_scale(scl[g]), ga=0;
-                for(int i=base;i<base+glen;i+=2){
-                    uint8_t byte=w[i>>1];
-                    ga+=xs[i]*mx4_lut[byte&0xF];
-                    if(i+1<base+glen) ga+=xs[i+1]*mx4_lut[byte>>4];
-                }
-                a+=ga*sc;
-            }
-            y[(int64_t)s*O+o]=a;
-        }
-    }
+    for(int o=0;o<O;o++)
+        for(int s=0;s<S;s++)
+            y[(int64_t)s*O+o]=mx4_dot_row(q4+(int64_t)o*rb,e8s+(int64_t)o*ng,x+(int64_t)s*I,I);
+}
+/* weight rows [r0,r1) for n activation rows xr[a]: y[a*ys + o], on the calling thread (a
+ * parallel region's item); each element is matmul_mxfp4's for that row */
+static void matmul_mxfp4_rows(float *y, int ys, const uint8_t *q4, const uint8_t *e8s, int I,
+                              int r0, int r1, const float *const *xr, int n){
+    int rb=(I+1)/2, ng=(I+31)/32;
+    for(int o=r0;o<r1;o++)
+        for(int a=0;a<n;a++)
+            y[(int64_t)a*ys+o]=mx4_dot_row(q4+(int64_t)o*rb,e8s+(int64_t)o*ng,xr[a],I);
 }
 
 /* IDOT variant of matmul_mxfp4: per-32-group int8 activation quantization +

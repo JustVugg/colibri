@@ -4617,7 +4617,7 @@ static void q38_expert_row(Model *m,int layer,int eid,const float *xs,float *eg,
  * experts loaded as one batch, and one parallel region runs gate+up over (expert, row
  * block) items for all the rows each expert received, the hidden rows, then down.
  * Every output row comes from the per-row kernel q38_weight_matmul calls for that
- * matrix (q38_matmul_int4g64, x2_matmul, xl_matmul, matmul_fp8 without FMA: a row's bits do not depend on how
+ * matrix (q38_matmul_int4g64, x2_matmul, xl_matmul, matmul_fp8 without FMA, matmul_mxfp4: a row's bits do not depend on how
  * many activation rows share the call), and each row's sum is added in rank order as
  * the decode loop adds it, so the output is the decode loop's to the bit.
  * Q38_MOE_GROUPED=0 keeps the decode loop. */
@@ -4627,13 +4627,14 @@ enum { Q38_ROWS_NONE = 0, Q38_ROWS_F32 = 1, Q38_ROWS_X2 = 2, Q38_ROWS_GQ = 3 };
  * expert, a few rows each: a 32-row chunk of ISTA's Qwen3.8 spent a third of its threads'
  * time waiting at their barriers. Here a layer is two regions for all its experts. */
 #define Q38_GROUPED_ROWS 256
-/* how a routed expert's matrix takes its input here: f32 (int4-g64), int8 per 32
+/* how a routed expert's matrix takes its input here: f32 (int4-g64, MXFP4), int8 per 32
  * (int2-g32, int2-g16, int3-g16), a GGUF block type's integer form (gq_act), or not
  * at all (GQ_EXACT=1's float path among them) */
 static int q38_rows_kind(const Q38Weight *w) {
     if(!w->data||w->q4||w->q8||w->gpu||w->act2)return Q38_ROWS_NONE;
     if(w->kind==Q38_WEIGHT_INT4G64&&w->r16)return Q38_ROWS_GQ;   /* xf16 rows take gq_act */
     if(w->kind==Q38_WEIGHT_INT4G64&&w->scales)return Q38_ROWS_F32;
+    if(w->kind==Q38_WEIGHT_MXFP4&&w->x2q)return Q38_ROWS_F32;   /* quant.h matmul_mxfp4_rows */
 #ifdef COLI_FP8_NOFMA_LANES
     if(w->kind==Q38_WEIGHT_FP8&&w->scales)return Q38_ROWS_F32;   /* quant.h matmul_fp8_nofma_part */
 #endif
@@ -4661,6 +4662,7 @@ static int q38_layer_fp8_rows(Model *m,int layer) {
  * xq/dx the int8-per-32 ones ([n][I], [n][I/32]), ga the GGUF types' (n rows) */
 static void q38_rows(float *y,int ys,const Q38Weight *w,int I,int r0,int r1,
                      const float *const *xr,const int8_t *xq,const float *dx,const gq_act *ga,int n) {
+    if(w->kind==Q38_WEIGHT_MXFP4){matmul_mxfp4_rows(y,ys,(const uint8_t*)w->data,w->x2q,I,r0,r1,xr,n);return;}
 #ifdef COLI_FP8_NOFMA_LANES
     if(w->kind==Q38_WEIGHT_FP8){matmul_fp8_nofma_part(y,ys,(const uint8_t*)w->data,w->scales,I,r0,r1,xr,n);return;}
 #endif

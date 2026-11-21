@@ -7,7 +7,9 @@
  *    rounding, on the release's two expert shapes, the tiny fixture's and
  *    widths with a short last group of 32, for one row and for a batch;
  *  - every row of a batch is the bits of that row alone, so decode and the
- *    prefill batch cannot drift apart;
+ *    prefill batch cannot drift apart, and the grouped MoE's row kernel
+ *    (q38_rows over a block of weight rows, gathered activation rows) gives
+ *    the same bits;
  *  - the record of the release (H 2560, I 640) is 2,611,200 bytes, 2,613,248
  *    on its 4096-byte stride, with the scales of gate, down and up first.
  * With a converted snapshot on argv (make qwen38-tiny-mxfp4-check):
@@ -83,6 +85,18 @@ static void kernel_case(int O,int I,int S){
     if(S>1)ck(same,what);
     snprintf(what,sizeof what,"[%d x %d]: q38_weight_bytes counts codes and scales",O,I);
     ck(q38_weight_bytes(&w)==(uint64_t)(O*rb+O*ng),what);
+    /* the grouped MoE's form (q38_moe_decode_grouped): the rows in blocks, the activation
+     * rows gathered in another order and written at a stride, each element the bits of the
+     * whole-matrix call */
+    const float **xr=malloc((size_t)S*sizeof(float*));float *yg=malloc((size_t)S*(O+3)*sizeof(float));
+    for(int a=0;a<S;a++)xr[a]=x+(int64_t)(S-1-a)*I;
+    const int block=O>16?16:3;
+    for(int r0=0;r0<O;r0+=block)q38_rows(yg,O+3,&w,I,r0,r0+block<O?r0+block:O,xr,NULL,NULL,NULL,S);
+    same=q38_rows_kind(&w)==Q38_ROWS_F32;
+    for(int a=0;a<S&&same;a++)same=!memcmp(yg+(int64_t)a*(O+3),y+(int64_t)(S-1-a)*O,(size_t)O*sizeof(float));
+    snprintf(what,sizeof what,"[%d x %d], %d row(s): the grouped path's row kernel gives the same bits",O,I,S);
+    ck(same,what);
+    free(xr);free(yg);
     free(codes);free(scales);free(x);free(y);free(one);free(ref);free(mag);
 }
 
