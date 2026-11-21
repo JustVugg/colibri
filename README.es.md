@@ -33,7 +33,7 @@ GPU mediante Vulkan y en las tarjetas NVIDIA mediante CUDA. [Cuál elegir para m
 
 ```
 $ ./coli chat
-  colibri v2.1.0 · GLM-5.2 · 744B MoE · int4 · streaming CPU
+  colibri v2.2.0 · GLM-5.2 · 744B MoE · int4 · streaming CPU
   ✓ ready in 32s · resident 9.9 GB
   › ciao!
   ◆ Ciao! Come posso aiutarti oggi?

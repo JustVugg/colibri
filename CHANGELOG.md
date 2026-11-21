@@ -5,6 +5,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-11-21
+
 ### New
 
 - **Inkling-2-Mini from mainline llama.cpp's layout** (`inkling2_loop`: unsloth's

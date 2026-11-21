@@ -267,7 +267,7 @@ class BackendChoice(unittest.TestCase):
                                    here=here, requested="cuda")
             self.assertEqual(decision["backend"], "cuda")
             # an engine without a CUDA path in that archive: Vulkan
-            decision = self.choose(hw_report(vulkan=rtx_vk, nvidia=[card]), family="mimo", tc=tc,
+            decision = self.choose(hw_report(vulkan=rtx_vk, nvidia=[card]), family="olmoe", tc=tc,
                                    platform="win32", here=here)
             self.assertNotEqual(decision["backend"], "cuda")
         with tempfile.TemporaryDirectory() as here:   # the engines without the DLL
@@ -302,7 +302,7 @@ class BackendChoice(unittest.TestCase):
         self.assertEqual(decision["backend"], "vulkan")
         self.assertIn("the release's coli_cuda.dll runs on compute 8.0", decision["reason"])
         # an engine the release carries no CUDA build of, or a compiler here: as before
-        decision = self.choose(hw_report(vulkan=DGPU, nvidia=[card]), family="mimo", tc=tc, platform="win32")
+        decision = self.choose(hw_report(vulkan=DGPU, nvidia=[card]), family="olmoe", tc=tc, platform="win32")
         self.assertEqual(decision["backend"], "vulkan")
         decision = self.choose(hw_report(vulkan=DGPU, nvidia=[card]), family="kimi", platform="win32")
         self.assertEqual(decision["backend"], "vulkan")
