@@ -48,6 +48,12 @@
 #define Q38CC_DEV  1
 #define Q38CC_BOTH 2
 #define Q38CC_PROMO_WIN 64   /* frames the brake looks back on (q38cc_braked) */
+/* Q38_CC_GRAPH's segments of a layer's decode frames (q38cc_seg): 0 frame A1 up to an attention
+ * layer's position-dependent ops (a DeltaNet layer: all of A1), 1 the rest of an attention layer's
+ * A1, 2 frame A2 (the shared expert); Q38G_WAYS graphs a layer and segment */
+#define Q38G_SEGS 3
+#define Q38G_WAYS 8
+typedef struct Q38CcGraph { unsigned long long key, fp, tick; void *exec; } Q38CcGraph;
 
 /* A prompt chunk in two lanes (q38cc_chunk_lanes): every buffer that holds a lane's rows between
  * the ops of one step and the next, the other lane's kept here while one lane's ops are recorded
@@ -118,6 +124,10 @@ typedef struct {
     CcBuf *dv_ids, *dv_y, *dv_x, *dv_pick; unsigned long long dv_drafts;   /* the draft list scored on the card */
     unsigned long long mtp_rows, drafts;
     float *host_routed, *host_emb;
+    /* Q38_CC_GRAPH (q38cc_seg): per layer and segment, Q38G_WAYS graphs by shape and fingerprint */
+    int g_on;
+    Q38CcGraph *gr;
+    unsigned long long g_fp0, g_tick, g_launch, g_capture, g_eager;
     unsigned long long forwards, frames, fault_at, dec_n;
     double host_ms, wait_ms, dec_wait_ms, dec_host_ms;
     /* the routed experts in the frame (q38cc_dm_*) */
@@ -641,6 +651,13 @@ static Q38CChain *q38cc_setup(Model *m, int mux_slots) {
     ch->nl = L; ch->head = 1;
     ch->dn_where = Q38CC_HOST;
     { const char *e = getenv("COLI_CUDA_CHAIN_FAULT"); ch->fault_at = e && *e ? strtoull(e, NULL, 10) : 0; }
+    if (q38_env_bool("Q38_CC_GRAPH", 0)) {
+        if (g_q38_gguf)   /* a GGUF's block matrices quantize their input into a scratch the backend may move */
+            fprintf(stderr, "[chain] qwen38: Q38_CC_GRAPH: not with a GGUF's matrices; the ops run one by one\n");
+        else if (!cc_graph_ready() || !cc_dev_addr_ready() || !cc_moe_ready())
+            fprintf(stderr, "[chain] qwen38: Q38_CC_GRAPH: the CUDA backend has no graphs (an older DLL, or HIP); the ops run one by one\n");
+        else if ((ch->gr = (Q38CcGraph *)calloc((size_t)L * Q38G_SEGS * Q38G_WAYS, sizeof *ch->gr))) ch->g_on = 1;
+    }
     ch->ok = 1;
     ch->dm_on = q38cc_dm_able(ch, m);
     if (ch->dm_on) q38cc_head_card(ch, m);   /* the MTP head's experts in Q2_0 on the card */
@@ -888,7 +905,15 @@ static void q38cc_rollback(Model *m, int slot, int len) {
         if (ch->pk_valid[i] > len / R) ch->pk_valid[i] = len / R;
     }
     if (slot < 0 || slot >= ch->snap_valid || ch->dn_where != Q38CC_DEV) { ch->snap_valid = 0; return; }
-    for (int i = 0; i < m->c.layers; i++) {
+    /* Q38_CC_GRAPH: the copy's bits copied into the live buffers on the device, which keep their
+     * addresses (the graphs hold them); a failed frame swaps as below (rec gets the copy's bits either way) */
+    int copied = ch->g_on && cc_begin();
+    size_t nr = (size_t)m->c.dn_vheads * m->c.dn_kdim * m->c.dn_vdim, nc = (size_t)m->c.dn_conv_dim * (m->c.dn_convk - 1);
+    for (int i = 0; i < m->c.layers && copied; i++)
+        if (!m->c.is_attn[i])
+            copied = cc_copy(ch->rec[i], 0, ch->rec_snap[slot][i], 0, nr) && cc_copy(ch->ring[i], 0, ch->ring_snap[slot][i], 0, nc);
+    if (copied) copied = cc_submit(0);
+    for (int i = 0; i < m->c.layers && !copied; i++) {
         if (m->c.is_attn[i]) continue;
         CcBuf *t = ch->rec[i]; ch->rec[i] = ch->rec_snap[slot][i]; ch->rec_snap[slot][i] = t;
         t = ch->ring[i]; ch->ring[i] = ch->ring_snap[slot][i]; ch->ring_snap[slot][i] = t;
@@ -982,10 +1007,13 @@ static int q38cc_gr_apply(Q38CChain *ch, Model *m, CcBuf *inj, int n) {
     CcEw ap = {CC_EW_HC_APPLY, n * c->hc_width, c->hidden, c->hc_count, 0, 1, q38cc_ho(ch, c->hc_width), 0, 0, 0, 0, 1.f};
     return cc_ew(q38cc_hb(ch), inj, ch->blk, NULL, NULL, &ap);
 }
-static int q38cc_attention(Q38CChain *ch, Model *m, Layer *l, int i, int n, int pb) {
+/* an attention layer in three parts: the projections, norms, RoPE and float16 rounding (a function
+ * of the layer and the rows: Q38_CC_GRAPH's segment 0), the position's ops (the cache rows, the
+ * pooled keys, the selection, the attention), the output projection (segment 1 starts with it) */
+static int q38cc_attn_pre(Q38CChain *ch, Model *m, Layer *l, int i, int n) {
     Cfg *c = &m->c;
     int QH = c->q_heads, KVH = c->kv_heads, D = c->head_dim, kvo = KVH * D, qo = QH * 2 * D, half = c->rotary_dim / 2;
-    int IQ = c->idx_qheads, ID = c->idx_dim, R = c->idx_ratio, ipw = (IQ + 1) * ID;
+    int IQ = c->idx_qheads, ID = c->idx_dim, ipw = (IQ + 1) * ID;
     int ok = cc_matmul(q38cc_t(ch, &l->q), ch->mixed, 0, ch->q, 0, n) && cc_matmul(q38cc_t(ch, &l->k), ch->mixed, 0, ch->k, 0, n) &&
              cc_matmul(q38cc_t(ch, &l->v), ch->mixed, 0, ch->v, 0, n) && cc_matmul(q38cc_t(ch, &l->idx_qk), ch->mixed, 0, ch->ip, 0, n);
     CcNorm kn = {n * KVH, D, KVH, 0, kvo, D, 0, kvo, D, (int)ch->o_kn[i], 0, CC_NORM_ADD1, c->eps, 1.f};
@@ -1001,7 +1029,12 @@ static int q38cc_attention(Q38CChain *ch, Model *m, Layer *l, int i, int n, int 
         CcEw r = {CC_EW_F16, n * kvo, kvo, 0, 0, 0, 0, 0, 0, 0, 0, 1.f};
         ok = cc_ew(ch->k, ch->k, NULL, NULL, NULL, &r) && cc_ew(ch->v, ch->v, NULL, NULL, NULL, &r);
     }
-    if (!ok) return 0;
+    return ok;
+}
+static int q38cc_attn_mid(Q38CChain *ch, Model *m, int i, int n, int pb) {
+    Cfg *c = &m->c; int ok = 1;
+    int QH = c->q_heads, KVH = c->kv_heads, D = c->head_dim, kvo = KVH * D, qo = QH * 2 * D, half = c->rotary_dim / 2;
+    int IQ = c->idx_qheads, ID = c->idx_dim, R = c->idx_ratio, ipw = (IQ + 1) * ID;
     /* the rows into the device caches and the host's */
     CcRegion *rg = malloc(sizeof *rg * (size_t)n * (KVH > 1 ? KVH : 1));
     CcRegion *ri = malloc(sizeof *ri * (size_t)n);
@@ -1041,8 +1074,10 @@ static int q38cc_attention(Q38CChain *ch, Model *m, Layer *l, int i, int n, int 
                  1.f / sqrtf((float)D), 0, 0};
     return ok && cc_qsa(ch->ip, NULL, ch->pk[i], NULL, ch->qsc, ch->sel, &ps) &&
            (ch->kvh ? cc_attn_h(ch->q, ch->kc[i], ch->vc[i], ch->ctx, ch->q, ch->sel, &at)
-                    : cc_attn(ch->q, ch->kc[i], ch->vc[i], ch->ctx, ch->q, ch->sel, &at)) &&
-           cc_matmul(q38cc_t(ch, &l->o), ch->ctx, 0, ch->blk, 0, n);
+                    : cc_attn(ch->q, ch->kc[i], ch->vc[i], ch->ctx, ch->q, ch->sel, &at));
+}
+static int q38cc_attention(Q38CChain *ch, Model *m, Layer *l, int i, int n, int pb) {
+    return q38cc_attn_pre(ch, m, l, i, n) && q38cc_attn_mid(ch, m, i, n, pb) && cc_matmul(q38cc_t(ch, &l->o), ch->ctx, 0, ch->blk, 0, n);
 }
 /* ns: the chunk's rows whose state a verify copies (rows 0..ns-1, into slots c0..): the
  * convolution and the recurrence split into one dispatch per copy, each ending on its
@@ -3517,6 +3552,105 @@ static void q38cc_pd_end(Q38CChain *ch, int S, int pd, double sec) {
         fprintf(stderr, "[chain] qwen38: a decode step's pooled experts %s: %.2f ms a step%s%.0d with the CPU's, %.2f over the bus\n",
                 ch->pd_bus ? "read by the device over the bus" : "on the CPU", cpu * 1e3, r ? " of " : "", r, bus * 1e3);
 }
+/* ---- Q38_CC_GRAPH=1 (default off): a decode step's segments as CUDA graphs ------------
+ * A decode step or a verify (S <= Q38_SPEC_ROWS rows) on the host's routed experts (the routed
+ * experts not in the frame) launches about forty ops a layer one by one, each a few microseconds
+ * of the host's (more on Windows' WDDM) while the device runs them faster than that: the device
+ * waits for the host. Here the ops of a layer whose arguments are a function of the layer and the
+ * rows alone run as captured graphs, one launch each: segment 0 (the previous layer's MoE sum and
+ * its injection, the attention read, then a DeltaNet layer's whole block, its MLP read, the router
+ * and the copies down; an attention layer's projections, norms, RoPE and float16 rounding only),
+ * segment 1 (an attention layer's output projection to the copies down), segment 2 (the shared
+ * expert, frame A2). What depends on the position runs op by op as before: the K/V and index-key
+ * rows into the caches, the pooled keys, the selection and the attention; the PLE layer's rows and
+ * convolution (host rows, ring slots); the streams' write, the state push, the read-out.
+ * A segment runs op by op the first time its key (rows, verify copies, whether it starts with the
+ * MoE sum) is seen with a fingerprint (the device addresses of every buffer and weight it can
+ * touch: q38g_fp0, q38g_fp), is captured the second time and replayed after that; a new
+ * fingerprint (a buffer grown, a weight placed again, a verify's copies swapped) is a new entry, the
+ * least recently used of the layer's Q38G_WAYS going. A replay runs the kernels the capture
+ * recorded with the arguments it recorded, in the same order on the same stream: the bits of the
+ * ops one by one. The host's mapped buffers (the RoPE table, the routed sum up, the router logits
+ * and the mixed rows down, a verify's table of copies) are read and written when the replay runs,
+ * as by the ops. With the switch a verify's rollback copies the DeltaNet copies' bits into the
+ * live buffers instead of swapping them (the graphs hold their addresses). A capture an op broke
+ * or the stream refused turns the switch off and frees every graph: the ops run one by one. Not
+ * with the routed experts in the frame (a GGUF's), DFlash2's drafter or a prompt's rows. The
+ * [chain] line's ops and matmuls count a graph's ops once, when it was captured. */
+static unsigned long long q38g_mix(unsigned long long h, const void *p) {   /* FNV-1a over the address */
+    uintptr_t v = (uintptr_t)p;
+    for (size_t k = 0; k < sizeof v; k++) { h ^= (unsigned char)(v >> (8 * k)); h *= 0x100000001b3ULL; }
+    return h;
+}
+static unsigned long long q38g_buf(unsigned long long h, const CcBuf *b) { return q38g_mix(h, b ? cc_dev_addr(b) : NULL); }
+static unsigned long long q38g_fp0(Q38CChain *ch) {
+    CcBuf *all[] = {ch->prm, ch->hyper, ch->hn, ch->low, ch->mix, ch->mixed, ch->inj_a, ch->inj_m, ch->blk, ch->q, ch->k, ch->v,
+                    ch->ip, ch->ctx, ch->qkv, ch->z, ch->ab, ch->cv, ch->dny, ch->lg, ch->gs, ch->us, ch->hs, ch->ds, ch->sgd,
+                    ch->mixd, ch->lgd, ch->routed, ch->cs, ch->snap_tab};
+    unsigned long long h = q38g_mix(0xcbf29ce484222325ULL, (const void *)(uintptr_t)ch->rows);
+    for (size_t k = 0; k < sizeof all / sizeof *all; k++) h = q38g_buf(h, all[k]);
+    return h;
+}
+static unsigned long long q38g_fp(Q38CChain *ch, Model *m, int i) {
+    Q38Weight *w[Q38CC_MATS]; const char *nm[Q38CC_MATS]; int nw = q38cc_mats(m, i, w, nm);
+    unsigned long long h = q38g_buf(q38g_buf(q38g_mix(ch->g_fp0, (const void *)(uintptr_t)i), ch->rec[i]), ch->ring[i]);
+    for (int s = 0; s < ch->snap_slots; s++)
+        h = q38g_buf(q38g_buf(h, ch->rec_snap[s] ? ch->rec_snap[s][i] : NULL), ch->ring_snap[s] ? ch->ring_snap[s][i] : NULL);
+    for (int k = 0; k < nw; k++) {
+        ColiCudaTensor *t = q38cc_t(ch, w[k]); const void *p = NULL; const float *sc = NULL; int gs = 0;
+        if (t) cc_tensor_dev(t, &p, &sc, &gs);
+        h = q38g_mix(q38g_mix(q38g_mix(h, t), p), sc);
+    }
+    return q38g_mix(h, ch->t_sg[i]);
+}
+/* a segment's ops, as the forward issues them (segment 0 of the PLE layer: its MoE sum and PLE before it, apply 0) */
+static int q38cc_seg_ops(Q38CChain *ch, Model *m, int i, int seg, int n, int c0, int ns, int apply) {
+    Cfg *c = &m->c; Layer *l = &m->L[i];
+    if (seg == 2) return q38cc_shared(ch, m, l, i, n);
+    int ok = 1;
+    if (seg == 0) {
+        if (apply) ok = q38cc_moe_apply(ch, m, n, ch->routed);
+        ok = ok && q38cc_gr_read(ch, m, &l->attn_gr, ch->o_an[i], n, ch->inj_a);
+        if (c->is_attn[i]) return ok && q38cc_attn_pre(ch, m, l, i, n);
+        ok = ok && q38cc_deltanet(ch, m, l, i, n, c0, ns);
+    } else ok = cc_matmul(q38cc_t(ch, &l->o), ch->ctx, 0, ch->blk, 0, n);
+    return ok && q38cc_gr_apply(ch, m, ch->inj_a, n) && q38cc_gr_read(ch, m, &l->mlp_gr, ch->o_mn[i], n, ch->inj_m) &&
+           cc_matmul(q38cc_t(ch, &l->router), ch->mixed, 0, ch->lg, 0, n) &&
+           cc_copy(ch->lgd, 0, ch->lg, 0, (size_t)n * c->experts) && cc_copy(ch->mixd, 0, ch->mixed, 0, (size_t)n * c->hidden);
+}
+/* a segment: replayed, captured, or op by op (see above); 0 = a frame failed (the caller's lost path) */
+static int q38cc_seg(Q38CChain *ch, Model *m, int i, int seg, int n, int c0, int ns, int apply, unsigned long long fp) {
+    if (!ch->g_on) return q38cc_seg_ops(ch, m, i, seg, n, c0, ns, apply);
+    unsigned long long key = 1 + (unsigned long long)n + ((unsigned long long)ns << 8) + ((unsigned long long)apply << 16) +
+                             ((unsigned long long)c0 << 20);
+    Q38CcGraph *w = ch->gr + ((size_t)i * Q38G_SEGS + seg) * Q38G_WAYS, *e = NULL, *old = w;
+    for (int k = 0; k < Q38G_WAYS && !e; k++) {
+        if (w[k].key == key && w[k].fp == fp) e = &w[k];
+        else if (w[k].tick < old->tick) old = &w[k];
+    }
+    ch->g_tick++;
+    if (!e) {   /* first sight: op by op, remembered (the least recent entry goes) */
+        cc_graph_free(old->exec);
+        *old = (Q38CcGraph){key, fp, ch->g_tick, NULL};
+        ch->g_eager++;
+        return q38cc_seg_ops(ch, m, i, seg, n, c0, ns, apply);
+    }
+    e->tick = ch->g_tick;
+    if (e->exec) { ch->g_launch++; return cc_graph_launch(e->exec); }
+    void *x = NULL; int ok = 0, broke = 1;
+    if (cc_graph_begin()) {
+        ok = q38cc_seg_ops(ch, m, i, seg, n, c0, ns, apply);
+        x = cc_graph_end(&broke);
+        if (x && ok) { e->exec = x; ch->g_capture++; return cc_graph_launch(x); }
+        cc_graph_free(x);
+        if (!x && !broke) return 0;
+    } else if (cc_lost()) return 0;   /* a capture the stream refused (the device fine): as one an op broke */
+    fprintf(stderr, "[chain] qwen38: Q38_CC_GRAPH: layer %d's segment %d did not capture; the ops run one by one from here on\n", i, seg);
+    ch->g_on = 0;
+    for (size_t k = 0; k < (size_t)m->c.layers * Q38G_SEGS * Q38G_WAYS; k++) { cc_graph_free(ch->gr[k].exec); ch->gr[k].exec = NULL; }
+    return q38cc_seg_ops(ch, m, i, seg, n, c0, ns, apply);
+}
+
 /* Every layer for S rows. hyper_h: the rows' streams in, the final ones out when
  * want_streams; mixed_h (or NULL): every row's final mixed row, for the prefill
  * read-out; logit: the last nlogits rows' logits (a greedy caller's picks instead, in
@@ -3618,39 +3752,51 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
         int ok = 1, pending = 0, pend_i = -1;   /* pend_i: the hybrid layer the host serves after recording the next */
         unsigned pend_v = 0;
         CcBuf *routed = ch->routed;              /* where the layer before left its routed sum */
+        /* Q38_CC_GRAPH: a decode step's or a verify's segments as graphs (q38cc_seg) */
+        const int gr = ch->g_on && S <= Q38_SPEC_ROWS && !dm && !ch->hyp && !q38cc_df(m);
+        if (gr) ch->g_fp0 = q38g_fp0(ch);
         for (int i = 0; i < L && ok; i++) {
             Layer *l = &m->L[i];
-            if (pending) ok = q38cc_moe_apply(ch, m, n, routed);
-            if (ok && pending) q38cc_df_tap(m, ch, i - 1, n, 0);   /* DFlash2's drafter: layer i - 1's rows */
-            if (ok && i == c->ple_layer) ok = q38cc_ple(ch, m, n, c0, ns);
-            ok = ok && q38cc_gr_read(ch, m, &l->attn_gr, ch->o_an[i], n, ch->inj_a);
-            ok = ok && (c->is_attn[i] ? q38cc_attention(ch, m, l, i, n, pb) : q38cc_deltanet(ch, m, l, i, n, c0, ns));
-            ok = ok && q38cc_gr_apply(ch, m, ch->inj_a, n);
-            ok = ok && q38cc_gr_read(ch, m, &l->mlp_gr, ch->o_mn[i], n, ch->inj_m);
-            if (ok && dm && (n <= Q38CC_DM_ROWS || !ch->dm_part[i])) {   /* routed in the frame; a hybrid layer's host share once the next is recorded */
-                unsigned v = 0;
-                ch->dm_ran[i] = 1;
-                ok = q38cc_dm_layer(ch, m, l, i, n, &v);
-                int fg, fd;
-                if (ok && v && sv && qt_chain_layer_format(i, &fg, &fd) && fg >= 100 && fd >= 100) {   /* the server's from here */
-                    const size_t io = (size_t)i * ch->rows * c->topk;
-                    q38cc_srv_post(sv, i, n, v, fg - 100, fd - 100, (const int *)cc_ptr(ch->dm_idsd) + io, (const float *)cc_ptr(ch->dm_wd) + io,
-                                   ch->dm_res + (size_t)i * E, q38cc_dm_skips(ch, n, 0));
-                    v = 0;
+            const unsigned long long fp = gr ? q38g_fp(ch, m, i) : 0;
+            if (gr) {   /* q38cc_seg's segments, in the order of the ops below (the router and its copies in them) */
+                int apply = pending;
+                if (i == c->ple_layer) { ok = (!pending || q38cc_moe_apply(ch, m, n, routed)) && q38cc_ple(ch, m, n, c0, ns); apply = 0; }
+                ok = ok && q38cc_seg(ch, m, i, 0, n, c0, ns, apply, fp);
+                if (c->is_attn[i]) ok = ok && q38cc_attn_mid(ch, m, i, n, pb) && q38cc_seg(ch, m, i, 1, n, c0, ns, 0, fp);
+            } else {
+                if (pending) ok = q38cc_moe_apply(ch, m, n, routed);
+                if (ok && pending) q38cc_df_tap(m, ch, i - 1, n, 0);   /* DFlash2's drafter: layer i - 1's rows */
+                if (ok && i == c->ple_layer) ok = q38cc_ple(ch, m, n, c0, ns);
+                ok = ok && q38cc_gr_read(ch, m, &l->attn_gr, ch->o_an[i], n, ch->inj_a);
+                ok = ok && (c->is_attn[i] ? q38cc_attention(ch, m, l, i, n, pb) : q38cc_deltanet(ch, m, l, i, n, c0, ns));
+                ok = ok && q38cc_gr_apply(ch, m, ch->inj_a, n);
+                ok = ok && q38cc_gr_read(ch, m, &l->mlp_gr, ch->o_mn[i], n, ch->inj_m);
+                if (ok && dm && (n <= Q38CC_DM_ROWS || !ch->dm_part[i])) {   /* routed in the frame; a hybrid layer's host share once the next is recorded */
+                    unsigned v = 0;
+                    ch->dm_ran[i] = 1;
+                    ok = q38cc_dm_layer(ch, m, l, i, n, &v);
+                    int fg, fd;
+                    if (ok && v && sv && qt_chain_layer_format(i, &fg, &fd) && fg >= 100 && fd >= 100) {   /* the server's from here */
+                        const size_t io = (size_t)i * ch->rows * c->topk;
+                        q38cc_srv_post(sv, i, n, v, fg - 100, fd - 100, (const int *)cc_ptr(ch->dm_idsd) + io, (const float *)cc_ptr(ch->dm_wd) + io,
+                                       ch->dm_res + (size_t)i * E, q38cc_dm_skips(ch, n, 0));
+                        v = 0;
+                    }
+                    if (ok && pend_v) ok = q38cc_dm_serve(ch, m, pend_i, n, pend_v);
+                    pend_i = i; pend_v = v; routed = ch->dm_y; pending = 1;
+                    continue;
                 }
-                if (ok && pend_v) ok = q38cc_dm_serve(ch, m, pend_i, n, pend_v);
-                pend_i = i; pend_v = v; routed = ch->dm_y; pending = 1;
-                continue;
+                ok = ok && cc_matmul(q38cc_t(ch, &l->router), ch->mixed, 0, ch->lg, 0, n) &&
+                     cc_copy(ch->lgd, 0, ch->lg, 0, (size_t)n * E) && cc_copy(ch->mixd, 0, ch->mixed, 0, (size_t)n * H);
             }
-            ok = ok && cc_matmul(q38cc_t(ch, &l->router), ch->mixed, 0, ch->lg, 0, n) &&
-                 cc_copy(ch->lgd, 0, ch->lg, 0, (size_t)n * E) && cc_copy(ch->mixd, 0, ch->mixed, 0, (size_t)n * H);
             if (ok && pend_v) { ok = q38cc_dm_serve(ch, m, pend_i, n, pend_v); pend_v = 0; }   /* before a wait for the frame */
             double t0 = now_s();
             ok = ok && cc_submit(1);   /* A1 */
             m->timers.seconds[Q38_TM_DENSE_MATMUL] += now_s() - t0; ch->wait_ms += (now_s() - t0) * 1e3;
             if (!ok) break;
             q38cc_kv_down(ch, m, i, n, pb);
-            ok = q38cc_frame_begin(ch) && q38cc_shared(ch, m, l, i, n) && cc_submit(0);   /* A2 */
+            ok = q38cc_frame_begin(ch) && (gr ? q38cc_seg(ch, m, i, 2, n, c0, ns, 0, fp) : q38cc_shared(ch, m, l, i, n)) &&
+                 cc_submit(0);   /* A2 */
             double t1 = now_s();
             q38_moe_ex(m, l, i, (const float *)cc_ptr(ch->mixd), n, ch->host_routed, (const float *)cc_ptr(ch->lgd), 1);
             memcpy(cc_ptr(ch->routed), ch->host_routed, (size_t)n * H * sizeof(float));
@@ -3862,6 +4008,9 @@ static void q38cc_report(Model *m) {
                     "%.1f ms of routed experts on the host, %.1f MiB on the device; per decode step %.2f ms waiting, %.2f ms of experts (%llu steps)\n",
             ch->forwards, st.frames, st.ops, st.matmuls, ch->wait_ms, ch->host_ms, st.dev_bytes / 1048576.0,
             ch->dec_n ? ch->dec_wait_ms / ch->dec_n : 0.0, ch->dec_n ? ch->dec_host_ms / ch->dec_n : 0.0, ch->dec_n);
+    if (ch->g_launch || ch->g_capture || ch->g_eager)
+        fprintf(stderr, "[chain] qwen38: Q38_CC_GRAPH: %llu segment graphs replayed, %llu captured, %llu segments op by op%s\n",
+                ch->g_launch, ch->g_capture, ch->g_eager, ch->g_on ? "" : " (switched off)");
     if (ch->dm_steps)
         fprintf(stderr, "[chain] qwen38: %llu layer steps with the routed experts in the frame, %llu of them hybrid "
                         "(%llu slots on the host in %.1f ms, %.1f ms waiting for the device's routes), %llu slots from the host pool\n",

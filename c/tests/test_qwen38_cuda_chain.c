@@ -10,7 +10,10 @@
  * (ref.json), the chain runs must have set up and run every layer on the device.
  * Then a refusal of the card's memory on a chain written by hand (q38cc_forward gives
  * the K/V mirrors back), and the promotions' brake (q38cc_braked) on frames written by
- * hand: the fixture has no GGUF, so no host pool and no promotion runs above. */
+ * hand: the fixture has no GGUF, so no host pool and no promotion runs above.
+ * Q38_CC_GRAPH=1 on a fake card whose graphs record the ops and replay them (fg_*): the
+ * tokens and the last logits of the switch-off run bit for bit, with captures that break,
+ * a stream that refuses to capture, and a verify's rejected rows rolled back. */
 #define main qwen38_main_unused
 #include "../qwen38.c"
 #undef main
@@ -39,6 +42,168 @@ static void t_fill(int t, uint8_t *w, int rows, int cols) {
 struct SrvCtx { uint8_t *pool; size_t st; int ne; };
 static const uint8_t *t_srv_where(void *ctx, int k) { const struct SrvCtx *c = ctx; return c->pool + (size_t)(k % c->ne) * c->st; }
 static int brake_frame(Q38CChain *b, unsigned routes, unsigned miss) { b->routes += routes; b->pool_reads += miss; return q38cc_braked(b); }
+
+/* ---- Q38_CC_GRAPH on the fake card: graphs that record the ops and replay them ----
+ * fg_install gives the fake's table the graph entries: between graph_begin and graph_end the
+ * ops a segment may hold (copy, matmul, norm, rope, dnconv, dnrec, ew) are recorded, not run,
+ * as a CUDA capture does; graph_launch runs them in their order with their arguments. Any
+ * other op inside a capture breaks it (graph_end then says broke: nothing ran), as an op the
+ * capture refuses would; fg_break_at = n breaks the n-th recorded op instead; fg_refuse makes
+ * the stream refuse to capture. */
+typedef struct { int op; ColiCudaTensor *t; CcBuf *b[8]; size_t z[2]; int iv;
+                 union { CcNorm n; CcRope r; CcDnConv dc; CcDnRec dr; CcEw e; } p; } FgOp;
+typedef struct { int n, cap; FgOp *ops; } FgGraph;
+static FgGraph *fg_cur;
+static int fg_broke, fg_break_at, fg_recorded, fg_refuse;
+static unsigned long long fg_replays, fg_captures, fg_frees, fg_breaks, fg_refused, fg_pushed;
+static FgOp *fg_push(int op) {
+    fg_pushed++;
+    if (fg_break_at && ++fg_recorded == fg_break_at) { fg_broke = 1; return NULL; }
+    if (fg_cur->n == fg_cur->cap) {
+        fg_cur->cap = fg_cur->cap ? 2 * fg_cur->cap : 64;
+        fg_cur->ops = (FgOp *)realloc(fg_cur->ops, (size_t)fg_cur->cap * sizeof(FgOp));
+    }
+    FgOp *o = &fg_cur->ops[fg_cur->n++];
+    memset(o, 0, sizeof *o); o->op = op;
+    return o;
+}
+static int fg_copy(CcBuf *dst, size_t doff, CcBuf *src, size_t soff, size_t n) {
+    if (!fg_cur) return fcc_copy(dst, doff, src, soff, n);
+    FgOp *o = fg_push(1); if (!o) return 0;
+    o->b[0] = dst; o->z[0] = doff; o->b[1] = src; o->z[1] = soff; o->iv = (int)n; return 1;
+}
+static int fg_matmul(ColiCudaTensor *t, CcBuf *x, size_t xo, CcBuf *y, size_t yo, int S) {
+    if (!fg_cur) return fcc_matmul(t, x, xo, y, yo, S);
+    FgOp *o = fg_push(2); if (!o) return 0;
+    o->t = t; o->b[0] = x; o->z[0] = xo; o->b[1] = y; o->z[1] = yo; o->iv = S; return 1;
+}
+static int fg_norm(CcBuf *x, CcBuf *w, CcBuf *y, const CcNorm *p) {
+    if (!fg_cur) return fcc_norm(x, w, y, p);
+    FgOp *o = fg_push(3); if (!o) return 0;
+    o->b[0] = x; o->b[1] = w; o->b[2] = y; o->p.n = *p; return 1;
+}
+static int fg_rope(CcBuf *x, CcBuf *cs, const CcRope *p) {
+    if (!fg_cur) return fcc_rope(x, cs, p);
+    FgOp *o = fg_push(4); if (!o) return 0;
+    o->b[0] = x; o->b[1] = cs; o->p.r = *p; return 1;
+}
+static int fg_dnconv(CcBuf *in, CcBuf *w, CcBuf *ring, CcBuf *out, CcBuf *snap, const CcDnConv *p) {
+    if (!fg_cur) return fcc_dnconv(in, w, ring, out, snap, p);
+    FgOp *o = fg_push(5); if (!o) return 0;
+    o->b[0] = in; o->b[1] = w; o->b[2] = ring; o->b[3] = out; o->b[4] = snap; o->p.dc = *p; return 1;
+}
+static int fg_dnrec(int KD, CcBuf *cv, CcBuf *ab, CcBuf *z, CcBuf *st, CcBuf *prm, CcBuf *y, CcBuf *snap, const CcDnRec *p) {
+    if (!fg_cur) return fcc_dnrec(KD, cv, ab, z, st, prm, y, snap, p);
+    FgOp *o = fg_push(6); if (!o) return 0;
+    o->iv = KD; o->b[0] = cv; o->b[1] = ab; o->b[2] = z; o->b[3] = st; o->b[4] = prm; o->b[5] = y; o->b[6] = snap; o->p.dr = *p; return 1;
+}
+static int fg_ew(CcBuf *y, CcBuf *a, CcBuf *b, CcBuf *c, CcBuf *e, const CcEw *p) {
+    if (!fg_cur) return fcc_ew(y, a, b, c, e, p);
+    FgOp *o = fg_push(7); if (!o) return 0;
+    o->b[0] = y; o->b[1] = a; o->b[2] = b; o->b[3] = c; o->b[4] = e; o->p.e = *p; return 1;
+}
+/* the ops no segment holds: inside a capture they break it */
+static int fg_copy_regions(CcBuf *dst, CcBuf *src, const CcRegion *r, int n) { if (fg_cur) { fg_broke = 1; return 0; } return fcc_copy_regions(dst, src, r, n); }
+static int fg_zero(CcBuf *dst, size_t off, size_t n) { if (fg_cur) { fg_broke = 1; return 0; } return fcc_zero(dst, off, n); }
+static int fg_write(CcBuf *dst, size_t off, const void *src, size_t bytes) { if (fg_cur) { fg_broke = 1; return 0; } return fcc_write(dst, off, src, bytes); }
+static int fg_attn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *sel, const CcAttn *p) {
+    if (fg_cur) { fg_broke = 1; return 0; } return fcc_attn(q, kc, vc, o, gate, sel, p);
+}
+static int fg_qsa(CcBuf *src, CcBuf *w, CcBuf *pk, CcBuf *cs, CcBuf *sc, CcBuf *sel, const CcQsa *p) {
+    if (fg_cur) { fg_broke = 1; return 0; } return fcc_qsa(src, w, pk, cs, sc, sel, p);
+}
+static int fg_ple(CcBuf *keys, CcBuf *hyp, CcBuf *val, CcBuf *prm, CcBuf *gated, CcBuf *normv, CcBuf *conv, CcBuf *ring, const CcPle *p) {
+    if (fg_cur) { fg_broke = 1; return 0; } return fcc_ple(keys, hyp, val, prm, gated, normv, conv, ring, p);
+}
+static int fg_begin(void) {
+    if (fg_cur || !fcc_ready()) return 0;
+    if (fg_refuse) { fg_refused++; return 0; }   /* a stream that will not capture, the device fine */
+    fg_cur = (FgGraph *)calloc(1, sizeof *fg_cur); fg_broke = 0;
+    return 1;
+}
+static void fg_free(void *g) { FgGraph *x = (FgGraph *)g; if (x) { free(x->ops); free(x); fg_frees++; } }
+static void *fg_end(int *broke) {
+    FgGraph *g = fg_cur; fg_cur = NULL;
+    *broke = fg_broke;
+    if (fg_broke) fg_breaks++;
+    if (!g || fg_broke) { if (g) { free(g->ops); free(g); } return NULL; }
+    fg_captures++;
+    return g;
+}
+static int fg_launch(void *gv) {
+    FgGraph *g = (FgGraph *)gv; int ok = fcc_ready() && g && !fg_cur;
+    for (int k = 0; ok && k < g->n; k++) {
+        FgOp *o = &g->ops[k];
+        switch (o->op) {
+        case 1: ok = fcc_copy(o->b[0], o->z[0], o->b[1], o->z[1], (size_t)o->iv); break;
+        case 2: ok = fcc_matmul(o->t, o->b[0], o->z[0], o->b[1], o->z[1], o->iv); break;
+        case 3: ok = fcc_norm(o->b[0], o->b[1], o->b[2], &o->p.n); break;
+        case 4: ok = fcc_rope(o->b[0], o->b[1], &o->p.r); break;
+        case 5: ok = fcc_dnconv(o->b[0], o->b[1], o->b[2], o->b[3], o->b[4], &o->p.dc); break;
+        case 6: ok = fcc_dnrec(o->iv, o->b[0], o->b[1], o->b[2], o->b[3], o->b[4], o->b[5], o->b[6], &o->p.dr); break;
+        default: ok = fcc_ew(o->b[0], o->b[1], o->b[2], o->b[3], o->b[4], &o->p.e); break;
+        }
+    }
+    if (ok) fg_replays++;
+    return ok;
+}
+static ColiCudaChainOps fg_saved;
+static void fg_install(void) {
+    fg_saved = fake_chain_table;
+    ColiCudaChainOps *t = &fake_chain_table;
+    t->size = sizeof *t;   /* the optional ops qwen38 asks for: these, tensor_dev and dev_addr (the fake's), pick_rows */
+    t->copy = fg_copy; t->matmul = fg_matmul; t->norm = fg_norm; t->rope = fg_rope; t->dnconv = fg_dnconv; t->dnrec = fg_dnrec; t->ew = fg_ew;
+    t->copy_regions = fg_copy_regions; t->zero = fg_zero; t->write = fg_write; t->attn = fg_attn; t->qsa = fg_qsa; t->ple = fg_ple;
+    t->graph_begin = fg_begin; t->graph_end = fg_end; t->graph_launch = fg_launch; t->graph_free = fg_free;
+}
+static void fg_uninstall(void) { fake_chain_table = fg_saved; }
+static char *fg_slurp(const char *path, size_t *n) {
+    FILE *f = fopen(path, "rb"); char *b = NULL; long len = 0;
+    if (f && !fseek(f, 0, SEEK_END) && (len = ftell(f)) >= 0 && !fseek(f, 0, SEEK_SET) && (b = (char *)malloc((size_t)len + 1)))
+        len = (long)fread(b, 1, (size_t)len, f);
+    if (f) fclose(f);
+    if (b) b[len] = 0;
+    *n = b ? (size_t)len : 0;
+    return b;
+}
+/* the engine with its stdout and stderr in files, the last logits in DUMP */
+static int fg_run(char **argv, const char *tag) {
+    char out[64], err[64], dump[64];
+    snprintf(out, sizeof out, "q38g_%s.out", tag); snprintf(err, sizeof err, "q38g_%s.err", tag); snprintf(dump, sizeof dump, "q38g_%s.f32", tag);
+    setenv("DUMP", dump, 1);
+    fflush(stdout); fflush(stderr);
+    int so = dup(1), se = dup(2), rc = -1;
+    if (freopen(out, "wb", stdout) && freopen(err, "wb", stderr)) rc = qwen38_main_unused(4, argv);
+    fflush(stdout); fflush(stderr); dup2(so, 1); dup2(se, 2); close(so); close(se);
+    unsetenv("DUMP");
+    qt_shutdown();
+    return rc;
+}
+/* Q38_CC_GRAPH off, then on: the same tokens (the engine's printout) and the same last logits bit
+ * for bit; *took (a counter of the graphs' work) moved with the switch on and only then */
+static void t_graph_switch(char **argv, const char *title, const unsigned long long *took) {
+    printf(" %s\n", title);
+    setenv("COLI_CUDA_CHAIN", "1", 1);
+    fake_chain_frames = 0; fake_chain_fail_at = 0;
+    unsetenv("Q38_CC_GRAPH");
+    unsigned long long t0 = *took;
+    int rc0 = fg_run(argv, "off");
+    unsigned long long t1 = *took;
+    setenv("Q38_CC_GRAPH", "1", 1);
+    int rc1 = fg_run(argv, "on");
+    unsigned long long t2 = *took;
+    unsetenv("Q38_CC_GRAPH");
+    size_t n0, n1, l0, l1;
+    char *o0 = fg_slurp("q38g_off.out", &n0), *o1 = fg_slurp("q38g_on.out", &n1);
+    char *d0 = fg_slurp("q38g_off.f32", &l0), *d1 = fg_slurp("q38g_on.f32", &l1);
+    tk(rc0 == 0 && rc1 == 0 && fake_chain_frames > 8, "both runs on the chain within the oracle's limits");
+    tk(t1 == t0 && t2 > t1, "the graphs' work ran with the switch on and only then");
+    tk(o0 && o1 && n0 == n1 && n0 > 0 && !memcmp(o0, o1, n0), "the switch on prints the switch-off run's tokens and cosine");
+    tk(d0 && d1 && l0 == l1 && l0 > 0 && !memcmp(d0, d1, l0), "the last logits are the switch-off run's bit for bit");
+    free(o0); free(o1); free(d0); free(d1);
+    static const char *const tmp[] = {"q38g_off.out", "q38g_on.out", "q38g_off.err", "q38g_on.err", "q38g_off.f32", "q38g_on.f32"};
+    for (size_t i = 0; i < sizeof tmp / sizeof *tmp; i++) remove(tmp[i]);
+}
 
 int main(void) {
     setenv("SNAP", "./qwen38_tiny_fp8", 1);
@@ -85,6 +250,32 @@ int main(void) {
     fake_chain_fail_at = 0;
     qt_shutdown();
 
+    {   /* Q38_CC_GRAPH=1: the decode steps' segments captured on their second sight, replayed after */
+        fg_install();
+        t_graph_switch(argv, "Q38_CC_GRAPH=1 on the chain (a decode step's segments replayed as graphs)", &fg_replays);
+        printf("       %llu segment graphs captured, %llu replays\n", fg_captures, fg_replays);
+        tk(fg_captures > 0 && fg_breaks == 0 && fg_refused == 0, "segments captured, no capture broke");
+        unsigned long long r0 = fg_replays;
+        fg_break_at = 3; fg_recorded = 0;
+        t_graph_switch(argv, "Q38_CC_GRAPH=1, a capture an op breaks: the ops one by one from there", &fg_breaks);
+        tk(fg_replays == r0, "nothing replayed once the switch went off");
+        fg_break_at = 0;
+        fg_refuse = 1;
+        t_graph_switch(argv, "Q38_CC_GRAPH=1, a capture the stream refuses: the ops one by one, the chain stays on", &fg_refused);
+        tk(fg_replays == r0, "nothing replayed once the switch went off");
+        fg_refuse = 0;
+        {   /* a capture that breaks after others were made: the switch off frees every graph it holds */
+            unsigned long long p0 = fg_pushed;
+            t_graph_switch(argv, "Q38_CC_GRAPH=1 (counting the ops a run records)", &fg_replays);
+            fg_break_at = (int)((fg_pushed - p0) / 2); fg_recorded = 0;
+            unsigned long long c0 = fg_captures, f0 = fg_frees, b0 = fg_breaks;
+            t_graph_switch(argv, "Q38_CC_GRAPH=1, a capture breaks halfway through the run", &fg_breaks);
+            tk(fg_breaks == b0 + 1 && fg_captures > c0 && fg_frees - f0 == fg_captures - c0, "the graphs made before the break all freed");
+            fg_break_at = 0;
+        }
+        fg_uninstall();
+    }
+
     printf(" the same without the chain\n");
     setenv("COLI_CUDA_CHAIN", "0", 1);
     fake_chain_frames = 0;
@@ -106,6 +297,20 @@ int main(void) {
     tk(fake_dn_snapshots > 0, "MTP verification wrote DeltaNet chain snapshots");
     tk(g_q38cc_mtp_rows > 0, "the MTP head's layer ran on the card");
     qt_shutdown();
+    {   /* verify rows (n > 1, the DeltaNet copies) replayed; a rejected draft's rollback copies into the live state */
+        static const char *const force[] = {"reject", "mixed", "cycle"};
+        fg_install();
+        for (int k = 0; k < 3; k++) {
+            char title[96];
+            snprintf(title, sizeof title, "Q38_CC_GRAPH=1 with MTP verify rows, Q38_MTP_FORCE=%s", force[k]);
+            setenv("Q38_MTP_FORCE", force[k], 1);
+            fake_dn_snapshots = 0;
+            t_graph_switch(argv, title, &fg_replays);
+            tk(fake_dn_snapshots > 0, "the verifies wrote DeltaNet copies");
+        }
+        setenv("Q38_MTP_FORCE", "reject", 1);
+        fg_uninstall();
+    }
     printf(" the MTP head on the CPU beside the chain (Q38_MTP_CHAIN=0)\n");
     setenv("Q38_MTP_CHAIN", "0", 1);
     fake_chain_frames = 0; g_q38cc_mtp_rows = 0;
@@ -422,12 +627,12 @@ int main(void) {
          * to miss (dm_part: a chunk takes the host's route there, which waits for no copy and starts
          * none): their pooled experts get no places and no copies, so the copies go from one framed
          * layer to the next (#2764) */
-        enum { L = 4, E = 4, H = 64, IN = 64 };
+        enum { L = 4, E = 4, H = 64, IN_ = 64 };   /* IN_: windows.h defines IN */
         const size_t sz0 = fake_chain_table.size;
         fake_chain_table.size = sizeof fake_chain_table;   /* the staging's device addresses */
         fcc_init(0);
         Model mm; memset(&mm, 0, sizeof mm);
-        mm.c.layers = L; mm.c.experts = E; mm.c.hidden = H; mm.c.inter = IN;
+        mm.c.layers = L; mm.c.experts = E; mm.c.hidden = H; mm.c.inter = IN_;
         int gtg[L], gtd[L];
         for (int i = 0; i < L; i++) gtg[i] = gtd[i] = GQ_Q8_0;
         const int on0 = G.on, nl0 = G.nl, wf0 = G.wfmt; int *gtg0 = G_gtg, *gtd0 = G_gtd;
