@@ -6036,6 +6036,46 @@ class ImageUrlPathGuard(unittest.TestCase):
         self.assertNotIn("secret-name", str(caught.exception))
 
 
+def _png_header(width, height):
+    """a PNG's signature, IHDR and a few bytes of IDAT: Pillow reads its size from the header
+    and decodes nothing until asked"""
+    import zlib
+
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(b"\x00" * 16)) + chunk(b"IEND", b"")
+
+
+class ImagePixelCeiling(unittest.TestCase):
+    """A request's picture past MAX_IMAGE_PIXELS is refused from its header, before a
+    preprocessor decodes it whole: a few KB of PNG can name 10000 x 10000 pixels."""
+
+    def setUp(self):
+        try:
+            import PIL  # noqa: F401
+        except ImportError:
+            self.skipTest("Pillow is not installed")
+
+    def uri(self, data):
+        import base64
+        return "data:image/png;base64," + base64.b64encode(data).decode()
+
+    def test_a_picture_past_the_ceiling_is_refused(self):
+        big = _png_header(10000, 10000)
+        self.assertLess(len(big), 200)
+        with self.assertRaises(APIError) as caught:
+            _image_bytes_from_url(self.uri(big))
+        self.assertEqual(caught.exception.status, 400)
+        self.assertIn("10000x10000", str(caught.exception))
+
+    def test_a_picture_at_the_ceiling_passes(self):
+        side = _png_header(8192, 8192)
+        self.assertEqual(_image_bytes_from_url(self.uri(side)), side)
+        small = _png_header(640, 480)
+        self.assertEqual(_image_bytes_from_url(self.uri(small)), small)
+
+
 class ContextExceededMessageTest(unittest.TestCase):
     """#1376: the engine writes `CONTEXT_EXCEEDED prompt_tokens=N requested=M
     capacity=C`. The message took fields[2] ("requested=M", the completion

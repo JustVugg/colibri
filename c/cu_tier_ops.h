@@ -14,8 +14,9 @@
  * 12 FP8 per group, 10 f32, 11 bf16, 100 + t a ggml block type), so the tier's
  * conversions and sizes are the same. What the CUDA backend does not do it declines the
  * way the Vulkan one declines on a device without it, and the tier then does without:
- * no dense chain entries (xb_expert_entry 0), no second device (dev2_open_env 0), no
- * streaming (gemm_rows 0 in xb_stats), no grouped step (xb_step_begin NULL). */
+ * no second device (dev2_open_env 0), no streaming (gemm_rows 0 in xb_stats), no grouped
+ * step (xb_step_begin NULL). The dense chain's entries (xb_expert_entry) are CUDA's CcExpert
+ * (cuda_chain.h), not Vulkan's words. */
 #ifndef COLI_CU_TIER_OPS_H
 #define COLI_CU_TIER_OPS_H
 #include <stddef.h>

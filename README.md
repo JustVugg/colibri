@@ -32,7 +32,7 @@ and on NVIDIA cards through CUDA. [Which one for my machine](#which-model-for-my
 
 ```
 $ ./coli chat
-  colibri v2.1.0 · GLM-5.2 · 744B MoE · int4 · streaming CPU
+  colibri v2.2.0 · GLM-5.2 · 744B MoE · int4 · streaming CPU
   ✓ ready in 32s · resident 9.9 GB
   › ciao!
   ◆ Ciao! Come posso aiutarti oggi?
@@ -83,9 +83,12 @@ You answer one question, which model, and Enter takes the recommendation. Then
 the setup:
 
 1. **looks at your machine**: RAM, free disk, CPU and GPUs;
-2. **recommends a model that fits**: the part of the model that always stays in
-   RAM, plus a minimum cache of experts, must fit in your RAM, and the download
-   on your disk;
+2. **recommends the model that runs best there**: it measures your RAM's
+   bandwidth (two seconds), reads each card's memory and bandwidth and the
+   disk's kind, and estimates every model's decode speed on the backend it
+   would use (all on the card, half on the card and half in RAM, in RAM, or
+   streaming from the disk). The default is the most capable one that decodes
+   smoothly, and the menu shows each one's estimate;
 3. **gets the engine**: it builds it for your machine when a compiler is there,
    otherwise it downloads the prebuilt one, which runs on the CPU and, on x86-64
    Linux and Windows, on a Vulkan GPU too. It builds
@@ -186,9 +189,13 @@ quietly redefine the model. [How it works](#how-it-works) has the details.
 
 ## Which model for my machine
 
-The setup recommends the most capable model that runs from RAM on your
-machine, and lists the larger ones that stream from the disk right below it.
-`./start-here.sh --list` shows them all against your machine. The tables follow
+The setup estimates how fast each model decodes on your machine
+([`c/model_fit.py`](c/model_fit.py): the bytes a token reads over the bandwidth
+that serves them, plus a cost a layer, fitted to the speeds measured below) and
+recommends the most capable one that decodes smoothly, 20 tok/s or more, the
+slower ones discounted by how far they fall short; one that streams experts
+from the disk counts at half its estimate. `./start-here.sh --list` shows them
+all with their estimates against your machine. The tables follow
 the setup's own catalog ([`c/setup_catalog.py`](c/setup_catalog.py)); the
 downloads are the sizes Hugging Face lists for each repository.
 
@@ -207,7 +214,9 @@ downloads are the sizes Hugging Face lists for each repository.
 |---|---|---|---|---|---|
 | **Qwen3.6-35B-A3B**: chat with thinking and tools | `qwen36-35b` | 23 GB | 10 / 20 GB | CUDA, Vulkan (integrated too) | 6.0 tok/s on the CPU, 9.9 with Vulkan on the integrated GPU (A); 30.0 with CUDA (C) |
 | Qwen3-Coder-30B-A3B: code and tool calls, no thinking | `qwen3-coder-30b` | 19 GB | 8 / 18 GB | CUDA, Vulkan (integrated too) | 8.5-9.6 tok/s with every expert in RAM, 5.1 with 32 per layer (A, CPU) |
-| **Qwen-Image-2.1**: text to picture, non-commercial licence | `qwen-image-2.1` | 33 GB | 12 / 18 GB | Vulkan | one 768x512 picture in 2 min 40 s (8 Zen 4 cores, CPU) |
+| **Inkling-2-Mini** UD-Q4_K_XL: chat, pictures and tools, Apache 2.0 (unsloth's GGUF) | `inkling2-mini` | 18 GB | 6 / 21 GB | CUDA, Vulkan | 40.9-41.1 tok/s with CUDA, 39.2-39.4 with Vulkan, 8.0-8.1 on the CPU (D) |
+| Inkling-2-Mini UD-IQ2_XXS: the same with 2-bit experts, for 8 to 16 GB | `inkling2-mini-iq2` | 9 GB | 4 / 12 GB | CUDA, Vulkan | 46.3-46.5 tok/s with CUDA, 46.0-46.2 with Vulkan, 8.4 on the CPU (D) |
+| **Qwen-Image-2.1**: text to picture, non-commercial licence; with less RAM, [its GGUFs](docs/qwen-image.md#gguf-unsloth): 10 GB on disk, a 5.9 GB peak | `qwen-image-2.1` | 33 GB | 12 / 18 GB | Vulkan | one 768x512 picture in 2 min 40 s (8 Zen 4 cores, CPU) |
 
 **Large models, whose experts stream from the disk** (the disk sets the speed:
 a fast NVMe drive helps most)
@@ -218,6 +227,8 @@ a fast NVMe drive helps most)
 | **DeepSeek V4 Flash** (284B): tools | `deepseek-v4-flash` | 167 GB | 16 / 32 GB | CUDA, Vulkan | 0.93 tok/s with 32 GB (Ryzen 7 5800X), 1.24 with 63 GB (Ryzen 9 5950X), CPU only; 1.5-1.6 with CUDA (RTX 5080, 32 GB, two NVMe) |
 | **MiMo-V2.6 Flash** (309B): vision and tools | `mimo-v2.6-flash` | 172 GB | 32 / 52 GB | Vulkan | 2.34-3.37 tok/s (A, CPU) |
 | **Qwen3.8-Flash-Next** (125B + 51B n-gram): vision and tools | `qwen38-flash-next` | 186 GB | 24 / 32 GB | CUDA, Vulkan (integrated too) | 1.91-2.56 tok/s with 32-96 experts per layer; 3.99 with the optional int4 experts (A, CPU) |
+| **Qwen3.8-Flash-Next** UD-IQ2_XS: 2-bit experts and its MTP head (unsloth's GGUF) | `qwen38-flash-next-iq2xs` | 80 GB | 16 / 54 GB | CUDA, Vulkan (integrated too) | 55.8-56.6 tok/s with CUDA, 36.3-36.7 with Vulkan, half on the card; 7.5-8.2 on the CPU (D) |
+| Qwen3.8-Flash-Next UD-IQ3_XXS: 3-bit experts and its MTP head (unsloth's GGUF) | `qwen38-flash-next-iq3` | 88 GB | 16 / 62 GB | CUDA, Vulkan (integrated too) | 41.5-41.6 tok/s with CUDA, 33.0-33.4 with Vulkan, half on the card (D) |
 | **GLM-5.2** (744B): the reference model, with the MTP head | `glm-5.2` | 429 GB | 16 / 24 GB | CUDA, Vulkan | 0.05-0.1 tok/s cold on a 25 GB laptop; 1.83 on a 128 GB Ryzen AI Max+ 395; 9.0-9.2 on 6x RTX 5090 |
 | GLM-5.3 (744B): the same engine, no MTP head | `glm-5.3` | 419 GB | 16 / 24 GB | CUDA, Vulkan | |
 | **Inkling** (975B): int4 experts, bf16 dense weights | `inkling` | 514 GB | 120 / 128 GB as downloaded; 25 GB after a [dense conversion](docs/inkling.md) | CUDA, Vulkan | 0.25 tok/s (Ryzen 9 7900, 187 GB, RTX A6000) |
@@ -250,6 +261,8 @@ and MXFP4. The engines of every chat model above read GGUFs too
 |---|---|---|---|
 | **Mistral-Large-4** (1T, 52B active): text, pictures, reasoning and tools | unsloth, UD-IQ1_S 233 GB | CUDA, Vulkan | 1.34-1.36 tok/s with CUDA, 1.16-1.17 with Vulkan (D) |
 | **Muse Spark Open** (816B, 42B active): text and tools, under Meta's licence agreement | unsloth, UD-IQ1_S 176 GB to UD-Q4_K_XL 505 GB | CUDA, Vulkan | 1.55-1.58 tok/s with Vulkan, 1.34-1.40 with CUDA, 0.83-0.89 on the CPU (D) |
+| **Inkling-2-Small** (594B, 17B active): text, pictures and tools, Apache 2.0 ([inkling.md](docs/inkling.md#inkling-2-small)) | unsloth, UD-IQ1_S 171.7 GB to UD-Q4_K_XL 354 GB, pictures through its mmproj; or our int4 g64 from the NVFP4 release | CUDA, Vulkan | UD-IQ1_S: 2.80-2.87 tok/s with CUDA, 2.75-2.82 with Vulkan (D) |
+| **Inkling-2-Mini** (26.4B, 3.4B active, its middle layers three times): text, pictures and tools, Apache 2.0 ([inkling.md](docs/inkling.md#inkling-2-mini)) | unsloth, UD-IQ2_XXS 8.5 GB to UD-Q4_K_XL 17.6 GB, pictures through its mmproj; or our int4 g64 from the NVFP4 release | CUDA, Vulkan | UD-Q4_K_XL: 39.2-39.4 tok/s with Vulkan, 40.9-41.1 with CUDA, 8.0-8.1 on the CPU (D) |
 | **Flint** (40B, 2.5B active): text and tools, Apache 2.0 | unsloth, UD-IQ1_M 11.4 GB to BF16 79.6 GB | CUDA, Vulkan | UD-Q4_K_XL: 77.4 tok/s with CUDA, 77.7 with Vulkan, 15.8 on the CPU (D) |
 | **LFM3-VL-2B**: text, pictures and tools, LFM Open License | LiquidAI, QAD-Q4_0 to BF16 (or the checkpoint, converted) | CUDA, Vulkan | Q4_K_M: 235.1 tok/s with CUDA, 214.1 with Vulkan, 34.5 on the CPU (D) |
 | **Qwen-Image-2.1** and its **Turbo**: text to picture, non-commercial licence ([qwen-image.md](docs/qwen-image.md#gguf-unsloth)) | unsloth, Q2_K 2.5 GB to F16 14.2 GB, with a Qwen3-VL-8B-Instruct GGUF as the text encoder | Vulkan | Turbo Q4_K_M, 1024x1024 in 8 steps: 37 s of denoising with Vulkan (D); at 512x512 8.4-9.3 s a step on the CPU (A) |
@@ -364,12 +377,14 @@ a word ([vulkan.md](docs/vulkan.md#the-other-engines)).
 The setup builds CUDA on Linux when the CUDA toolkit is installed, for the
 engines that have a CUDA path: GLM-5.2/5.3 and Mistral-Large-4, GLM-5.3-Flash,
 Inkling, Kimi K3, DeepSeek V4 Flash, DeepSeek V4.1 Flash, MiMo-V2.6,
-Qwen3.8-Flash-Next, and Qwen3.6 with the models it runs; OLMoE and the decision
-engines build with `make <engine> CUDA=1`. On
+Qwen3.8-Flash-Next, Qwen3.6 with the models it runs, OLMoE and the decision
+engines (Laya, GLiNER2.5-Decide). On
 Windows the CUDA engine is a separate DLL ([windows.md](docs/windows.md)), and
 every release ships it built: `colibri-<version>-windows-x86_64-cuda.zip` has
 `coli_cuda.dll` (cards of compute capability 8.0 and newer) and the colibri,
-glm53, qwen36 and kimi_k3 engines that load it, with DeepSeek V4's own CUDA DLLs.
+glm53, qwen36, qwen38, kimi_k3, deepseek_v41, mimo, inkling, olmoe, laya and
+gliner_decide engines that load it,
+with DeepSeek V4's own CUDA DLLs.
 Unpack it over the main archive and the setup picks CUDA.
 
 - **Every layer on the card** for Qwen3.6, Qwen3.8 and OLMoE: the dense layers,
@@ -641,14 +656,21 @@ second, from each model's page:
 | GGUF | size | backend | prompt | decode |
 |---|---:|---|---:|---:|
 | Inkling-Small UD-IQ2_XXS | 77 GB | Vulkan | 15.1-33.1 | 10.92-11.53 ([vulkan.md](docs/vulkan.md)) |
+| Qwen3.8-Flash-Next UD-IQ3_XXS | 84 GB | CUDA | 478-492 | 41.5 † |
+| Qwen3.8-Flash-Next UD-IQ3_XXS | 84 GB | Vulkan | 276 | 33.0-33.4 † |
 | MiMo-V2.6-Flash Q2_K_S | 106 GB | Vulkan | 8.2 | 7.8 ([gguf.md](docs/gguf.md)) |
 | DeepSeek V4 Flash 0731 UD-IQ2_XXS | 85 GB | Vulkan | 19.7-20.4 | 6.18-6.25 ([vulkan.md](docs/vulkan.md)) |
+| DeepSeek V4 Flash UD-IQ1_S | 83 GB | CUDA | 18.3-18.6 | 6.1 † |
+| DeepSeek V4 Flash UD-IQ1_S | 83 GB | Vulkan | 21.5-22.0 | 6.4-6.5 † |
 | DeepSeek V4.1 Flash UD-IQ1_S | | Vulkan | 31.8 over 3,403 tokens | 5.01-5.29 ([deepseek-v41.md](docs/deepseek-v41.md)) |
-| GLM-5.3-Flash UD-IQ2_XXS | 95 GB | Vulkan | 9.3 | 2.92-3.40 ([vulkan.md](docs/vulkan.md)) |
+| GLM-5.3-Flash UD-IQ2_XXS | 95 GB | CUDA | 17.1-17.5 | 5.2 † |
+| GLM-5.3-Flash UD-IQ2_XXS | 95 GB | Vulkan | 17.5-17.7 | 5.5-5.6 † |
 | Muse Spark Open UD-IQ1_S | 176 GB | Vulkan | 5.0-5.3 | 1.55-1.58 ([qwen36.md](docs/qwen36.md#muse-spark-open)) |
 | Mistral-Large-4 UD-IQ1_S | 233 GB | CUDA | 240 tokens in 66-82 s | 1.34-1.36 ([mistral-large4.md](docs/mistral-large4.md)) |
 | GLM-5.2 UD-IQ1_S | 202 GB | Vulkan | | 0.633-0.658 ([gguf.md](docs/gguf.md)) |
 | Kimi K3 UD-IQ1_S | 594 GB | Vulkan | 31 tokens in 46.5 s | 0.349 ([gguf.md](docs/gguf.md)) |
+
+† Measured for this release on machine D: a 1000-token prompt, then 300 tokens of decode.
 
 ### Long contexts and agents
 
@@ -676,12 +698,15 @@ the numbers.
 <a id="1-get-colibri"></a>
 
 **1. The program.** Take the archive for your platform from
-[Releases](https://github.com/JustVugg/colibri/releases) (Linux x86_64, macOS,
-Windows; no compiler needed, only [Python 3](https://www.python.org/downloads/)
+[Releases](https://github.com/JustVugg/colibri/releases) (Linux x86_64 and aarch64,
+macOS, Windows; no compiler needed, only [Python 3](https://www.python.org/downloads/)
 for the launcher and the API) and unpack it, then `python3 coli info`. The Linux
 and Windows engines have Vulkan built in, with their `shaders/` beside them, and
-the macOS ones Metal; for an NVIDIA card on Windows add the CUDA archive. Or build
-from source with `gcc` (or clang) and OpenMP:
+the macOS ones Metal; for an NVIDIA card on Windows add the CUDA archive. The
+aarch64 archive (a Raspberry Pi 4 or 5, Graviton, Ampere) is plain armv8-a and runs on
+the CPU: a core with the dot-product instructions is faster with an engine built on it
+([quickstart](docs/quickstart.md)). Or build from source with `gcc` (or clang) and
+OpenMP; on FreeBSD x86-64, `gmake` builds with the base system's clang and its OpenMP:
 
 ```bash
 git clone https://github.com/JustVugg/colibri && cd colibri/c

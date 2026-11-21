@@ -44,9 +44,53 @@ __global__ static void ccg_sconv_k(float *x, const float *w, float *ring, CcScon
     for (int k = 0; k < 8; k++) if (k < nh) ring[p.ring_off + c * nh + k] = hist[k];
 }
 
-/* one block of 128 per (head, row): chain_relattn.comp's online softmax over tiles of 128 positions */
+/* tile b0 (128 positions from b0) of a (head, row)'s attention into its running max m, sum l and
+ * weighted V (acc0: dims tid, acc1: tid + 128): chain_relattn.comp's online softmax step */
+__device__ __forceinline__ void ccg_relattn_tile(const float *__restrict__ kc, const float *__restrict__ vc, const float *__restrict__ kvs,
+        const float *__restrict__ relp, const CcRelAttn &p, const float *qs, const float *rs, float *pe, float *red, int *pt,
+        int kvh, int qpos, int t0, int n, float ts, int b0, int tid, float &m, float &l, float &acc0, float &acc1) {
+    const int i = b0 + tid;
+    float sv = -3.0e38f;
+    if (i < n) {
+        const int t = t0 + i;
+        pt[tid] = t;
+        float a = 0.f;
+        if (t < p.pos_base) { const float *kr = kc + p.k_off + ((long)kvh * p.cap + t % p.cap) * p.hd; for (int d = 0; d < p.hd; d++) a += qs[d] * kr[d]; }
+        else { const float *kr = kvs + p.ks_off + (long)(t - p.pos_base) * p.kv_row + kvh * p.hd; for (int d = 0; d < p.hd; d++) a += qs[d] * kr[d]; }
+        const int dist = qpos - t;
+        float bias = 0.f;
+        if (dist < p.ext) for (int j = 0; j < p.d_rel; j++) bias += rs[j] * relp[p.relp_off + j * p.ext + dist];
+        sv = ts * (a * p.scale + bias);
+    }
+    red[tid] = sv;
+    __syncthreads();
+    for (int off = 64; off > 0; off >>= 1) { if (tid < off) red[tid] = fmaxf(red[tid], red[tid + off]); __syncthreads(); }
+    const float mn = fmaxf(m, red[0]);
+    __syncthreads();
+    const float e = i < n ? expf(sv - mn) : 0.f;
+    pe[tid] = e; red[tid] = e;
+    __syncthreads();
+    for (int off = 64; off > 0; off >>= 1) { if (tid < off) red[tid] += red[tid + off]; __syncthreads(); }
+    const float corr = expf(m - mn);
+    l = l * corr + red[0];
+    acc0 *= corr; acc1 *= corr;
+    const int cnt = min(128, n - b0), d0 = tid, d1 = tid + 128;
+    for (int j = 0; j < cnt; j++) {
+        const int t = pt[j];
+        const float w = pe[j];
+        const float *vr = t < p.pos_base ? vc + p.v_off + ((long)kvh * p.cap + t % p.cap) * p.hd
+                                         : kvs + p.vs_off + (long)(t - p.pos_base) * p.kv_row + kvh * p.hd;
+        if (d0 < p.hd) acc0 += w * vr[d0];
+        if (d1 < p.hd) acc1 += w * vr[d1];
+    }
+    m = mn;
+    __syncthreads();
+}
+/* one block of 128 per (head, row): chain_relattn.comp's online softmax over tiles of 128 positions.
+ * part (the split, a decode step's rows): block z takes tile z alone, its max, sum and weighted V into
+ * part (hd + 2 floats a (row, head, tile)), and ccg_relattn_join_k joins the tiles */
 __global__ static void ccg_relattn_k(const float *q, const float *kc, const float *vc, float *o, const float *kvs,
-                                     const float *r, const float *relp, const float *tau, CcRelAttn p) {
+                                     const float *r, const float *relp, const float *tau, CcRelAttn p, float *part) {
     const int h = (int)blockIdx.x, s = (int)blockIdx.y, tid = (int)threadIdx.x;
     const int kvh = h / (p.H / p.KVH);
     __shared__ float qs[256], rs[64], pe[128], red[128];
@@ -60,49 +104,38 @@ __global__ static void ccg_relattn_k(const float *q, const float *kc, const floa
     const float ts = tau[p.tau_off + s];
     __syncthreads();
     float m = -3.0e38f, l = 0.f, acc0 = 0.f, acc1 = 0.f;
-    if (p.has_sink) { m = tau[p.sink_off + s * p.H + h]; l = 1.f; }
-    for (int b0 = 0; b0 < n; b0 += 128) {
-        const int i = b0 + tid;
-        float sv = -3.0e38f;
-        if (i < n) {
-            const int t = t0 + i;
-            pt[tid] = t;
-            float a = 0.f;
-            if (t < p.pos_base) { const float *kr = kc + p.k_off + ((long)kvh * p.cap + t % p.cap) * p.hd; for (int d = 0; d < p.hd; d++) a += qs[d] * kr[d]; }
-            else { const float *kr = kvs + p.ks_off + (long)(t - p.pos_base) * p.kv_row + kvh * p.hd; for (int d = 0; d < p.hd; d++) a += qs[d] * kr[d]; }
-            const int dist = qpos - t;
-            float bias = 0.f;
-            if (dist < p.ext) for (int j = 0; j < p.d_rel; j++) bias += rs[j] * relp[p.relp_off + j * p.ext + dist];
-            sv = ts * (a * p.scale + bias);
-        }
-        red[tid] = sv;
-        __syncthreads();
-        for (int off = 64; off > 0; off >>= 1) { if (tid < off) red[tid] = fmaxf(red[tid], red[tid + off]); __syncthreads(); }
-        const float mn = fmaxf(m, red[0]);
-        __syncthreads();
-        const float e = i < n ? expf(sv - mn) : 0.f;
-        pe[tid] = e; red[tid] = e;
-        __syncthreads();
-        for (int off = 64; off > 0; off >>= 1) { if (tid < off) red[tid] += red[tid + off]; __syncthreads(); }
-        const float corr = expf(m - mn);
-        l = l * corr + red[0];
-        acc0 *= corr; acc1 *= corr;
-        const int cnt = min(128, n - b0), d0 = tid, d1 = tid + 128;
-        for (int j = 0; j < cnt; j++) {
-            const int t = pt[j];
-            const float w = pe[j];
-            const float *vr = t < p.pos_base ? vc + p.v_off + ((long)kvh * p.cap + t % p.cap) * p.hd
-                                             : kvs + p.vs_off + (long)(t - p.pos_base) * p.kv_row + kvh * p.hd;
-            if (d0 < p.hd) acc0 += w * vr[d0];
-            if (d1 < p.hd) acc1 += w * vr[d1];
-        }
-        m = mn;
-        __syncthreads();
+    if (part) {
+        const int z = (int)blockIdx.z, b0 = z * 128;
+        if (b0 < n) ccg_relattn_tile(kc, vc, kvs, relp, p, qs, rs, pe, red, pt, kvh, qpos, t0, n, ts, b0, tid, m, l, acc0, acc1);
+        float *pp = part + (((long)s * p.H + h) * gridDim.z + z) * (p.hd + 2);
+        if (tid == 0) { pp[0] = m; pp[1] = l; }
+        if (tid < p.hd) pp[2 + tid] = acc0;
+        if (tid + 128 < p.hd) pp[2 + tid + 128] = acc1;
+        return;
     }
+    if (p.has_sink) { m = tau[p.sink_off + s * p.H + h]; l = 1.f; }
+    for (int b0 = 0; b0 < n; b0 += 128)
+        ccg_relattn_tile(kc, vc, kvs, relp, p, qs, rs, pe, red, pt, kvh, qpos, t0, n, ts, b0, tid, m, l, acc0, acc1);
     const float inv = l > 0.f ? 1.f / l : 0.f;
     const int ob = p.o_off + s * p.o_row + h * p.hd;
     if (tid < p.hd) o[ob + tid] = acc0 * inv;
     if (tid + 128 < p.hd) o[ob + tid + 128] = acc1 * inv;
+}
+/* the split's join: a (head, row)'s nc tiles (and its sink) in tile order into its output */
+__global__ static void ccg_relattn_join_k(const float *part, const float *tau, float *o, CcRelAttn p, int nc) {
+    const int h = (int)blockIdx.x, s = (int)blockIdx.y, tid = (int)threadIdx.x;
+    const float *pp = part + ((long)s * p.H + h) * nc * (p.hd + 2);
+    float M = p.has_sink ? tau[p.sink_off + s * p.H + h] : -3.0e38f;
+    for (int z = 0; z < nc; z++) if (pp[(long)z * (p.hd + 2) + 1] > 0.f) M = fmaxf(M, pp[(long)z * (p.hd + 2)]);
+    float L = p.has_sink ? expf(tau[p.sink_off + s * p.H + h] - M) : 0.f, acc = 0.f;
+    for (int z = 0; z < nc; z++) {
+        const float *pz = pp + (long)z * (p.hd + 2);
+        if (!(pz[1] > 0.f)) continue;
+        const float w = expf(pz[0] - M);
+        L += pz[1] * w;
+        if (tid < p.hd) acc += pz[2 + tid] * w;
+    }
+    if (tid < p.hd) o[p.o_off + s * p.o_row + h * p.hd + tid] = L > 0.f ? acc / L : 0.f;
 }
 
 /* one block of 256 per row: every vector's sums in one pass, the warps' joined in order */
@@ -210,8 +243,25 @@ static int cc_relattn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *kvs, CcBu
     CcCtx *c = live();
     if (!c || !p || p->hd > 256 || p->hd < 1 || p->d_rel > 64 || p->d_rel < 0 || p->KVH < 1 || p->H % p->KVH || p->cap < 1) return 0;
     if (p->S <= 0) return 1;
+    /* a decode step's rows (up to 8): each (head, row)'s positions split over blocks of a tile each, then joined
+     * (COLI_CUDA_RELATTN_SPLIT=0: a block a (head, row) over every tile). Inkling-2-Mini Q4_K_XL at about 650
+     * positions on an RTX PRO 4000: a block a head ran its tiles one after another */
+    const int split = cc_relattn_split();
+    const int nmax = p->window > 0 ? p->window : p->pos_base + p->S, nc = (nmax + 127) / 128;
+    if (split && p->S <= 8 && nc >= 2) {
+        float *part = NULL;
+        const size_t pb = (size_t)p->S * p->H * nc * (p->hd + 2) * sizeof(float);
+        if (cudaMallocAsync((void **)&part, pb, c->stream) == cudaSuccess) {
+            coli_launch(ccg_relattn_k, dim3((unsigned)p->H, (unsigned)p->S, (unsigned)nc), 128, 0, c->stream, fp(q), fp(kc), fp(vc), fpw(o),
+                        fp(kvs), fp(r), fp(relp), fp(tau), *p, part);
+            coli_launch(ccg_relattn_join_k, dim3((unsigned)p->H, (unsigned)p->S), 256, 0, c->stream, (const float *)part, fp(tau), fpw(o), *p, nc);
+            (void)cudaFreeAsync(part, c->stream);
+            return launched(c, "relattn split");
+        }
+        (void)cudaGetLastError();
+    }
     coli_launch(ccg_relattn_k, dim3((unsigned)p->H, (unsigned)p->S), 128, 0, c->stream, fp(q), fp(kc), fp(vc), fpw(o), fp(kvs),
-                fp(r), fp(relp), fp(tau), *p);
+                fp(r), fp(relp), fp(tau), *p, (float *)nullptr);
     return launched(c, "relattn");
 }
 static int cc_ink2_mix(CcBuf *x, CcBuf *blk, CcBuf *prm, CcBuf *y, const CcInk2Mix *p) {

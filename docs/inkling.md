@@ -167,8 +167,9 @@ On a GPU, the CUDA build (`CUDA=1`) or the Vulkan one (`VK=1`, `COLI_VULKAN=1`):
   a discrete GPU, [vulkan.md](vulkan.md#inkling-2-on-the-chain)): the attention, the residual
   mixes and the convolutions on the device, one frame a layer, the routed experts on the host;
   with CUDA, or `COLI_VK_CHAIN=0`, the matrices go a call at a time and the rest runs on the CPU
-  (a CUDA build has the same chain with `COLI_CUDA_CHAIN=1`, off by default: it measured no
-  faster there, [cuda.md](cuda.md#inkling-2-on-cuda-inkling2_cuchainh)).
+  (a CUDA build has the same chain, on by default for Inkling-2-Mini with its experts in the
+  frame, and with `COLI_CUDA_CHAIN=1` for the Small, where it measured no faster:
+  [cuda.md](cuda.md#inkling-2-on-cuda-inkling2_cuchainh)).
 - the RAM cache's pinned experts that the tier holds go back to its LRU after the warm start,
   so that RAM and VRAM hold different experts. The tier's host pool is off for Inkling-2
   (`COLI_VK_TIER_HOST=1` turns it on): the RAM it takes from the expert cache cost more than
@@ -337,6 +338,14 @@ Two ways to run it, as for the Small:
   ./coli import ~/models/Inkling-2-Mini-UD-Q4_K_XL.gguf      # mmproj-F16.gguf next to it
   ```
 
+  The repo's `Mainline_Support/*.gguf_file` hold the same tensors byte for byte in mainline
+  llama.cpp's `inkling2_loop` layout, and import the same way (renamed to `.gguf`, or as they
+  are): the metadata under `inkling2_loop.*` with a `block_count` of 24 and the loop as
+  `loop.count/start/end`, the gates as `blk.N.loop_{q,k,v,ffn}_ctrl_*` (the checkpoint's attn, k,
+  v and mlp) and a loop layer's four message queries in `blk.N.loop_msg_query`. Either file of a
+  quant gives the same `config.json` and the same answers: UD-IQ3_XXS decoded 100 tokens at
+  43.9-44.0 tok/s on CUDA from both (machine D, below), 42.3 on Vulkan.
+
 - **The official checkpoint as int4 g64**: `c/tools/convert_inkling2_int4.py` as for the Small
   (19 GB of NVFP4 and MXFP8 experts in, 18 GB out, 9.6-10.0% relative error on every layer; the
   loop's tensors and the drafter pass as they are).
@@ -347,9 +356,9 @@ expert of the model fits on the card:
 
 | Model | CUDA | Vulkan | CPU (6 threads) |
 |---|---|---|---|
-| UD-IQ2_XXS (8.5 GB) | 109.5-114.0, 20.2-20.5 | 275.3-284.0, 46.0-46.2 | 16.3-16.4, 8.4 |
-| UD-Q4_K_XL (17.6 GB) | 107.7-108.2, 18.3-18.6 | 270.1-276.5, 39.2-39.4 | 18.2-18.8, 8.0-8.1 |
-| int4 g64 (18 GB) | 64.4-65.4, 16.0-16.3 | 314.6-327.6, 36.3-36.4 | 14.6-14.7, 6.1-6.2 |
+| UD-IQ2_XXS (8.5 GB) | 310.6-316.9, 46.3-46.5 | 275.3-284.0, 46.0-46.2 | 16.3-16.4, 8.4 |
+| UD-Q4_K_XL (17.6 GB) | 285.4-289.3, 40.9-41.1 | 270.1-276.5, 39.2-39.4 | 18.2-18.8, 8.0-8.1 |
+| int4 g64 (18 GB) | 130.9-132.1, 36.0-36.1 | 314.6-327.6, 36.3-36.4 | 14.6-14.7, 6.1-6.2 |
 
 Vulkan runs the dense chain with the loop (`c/inkling2_chain.h`: the passes' own K/V mirrors and
 convolution states on the device, the messages through `chain_ink2`'s mix and the gates through
@@ -360,9 +369,10 @@ those three the same decode was 19.7-20.3, 14.8-15.2 and 18.1-18.5 tok/s. A prom
 the tier's, through its grouped GEMMs (SiTU-GLU on the block formats' too, NVFP4 among their
 types): the GGUFs' prompts read at 51.5-54.2 and 32.2-32.9 tok/s before. On the CPU a GGUF's NVFP4
 experts are held in the 16-row interleaved form (`GQ_NVFP4_R16`): UD-Q4_K_XL went from 10.9 and 6.4
-to the line above. CUDA runs the dense matrices a call at a time with the attention on the
-CPU: its chain (`COLI_CUDA_CHAIN`, off by default for Inkling-2) leaves a loop to that path; the
-release's CUDA package carries no inkling engine, so Inkling on an NVIDIA card is Vulkan there. Every answer above was the same: "The train arrives at 17:25.", then a palindrome
+to the line above. CUDA runs the same chain (`c/inkling2_cuchain.h`, on by default for the Mini):
+the loop, the experts in the frame from the CUDA tier's table (SiTU-GLU, NVFP4 through an integer
+step of its own) and the split attention; the per-matrix path it replaced measured 109.5-114.0 and
+20.2-20.5, 107.7-108.2 and 18.3-18.6, 64.4-65.4 and 16.0-16.3 ([cuda.md](cuda.md#inkling-2-on-cuda-inkling2_cuchainh)). Every answer above was the same: "The train arrives at 17:25.", then a palindrome
 check in Python. A picture (64 x 48, red on the left, blue on the right) with each of the three:
 "The picture has red and blue. Red is on the left." (UD-Q4_K_XL), "The picture has two colors:
 red and blue. The red color is on the left." (UD-IQ2_XXS and int4 g64).
@@ -383,7 +393,8 @@ oracle; the engine reproduces it token for token on the CPU, on CUDA and on Vulk
 chain, plain and through the converter (`inkling2-loop-oracle` in CI,
 `tests/vulkan_engines.sh inkling2`). `tests/test_gguf_import.py` writes a tiny Mini as unsloth's
 files lay it out and reads it back as the checkpoint it came from, tokens and logits, and checks
-that one pass instead of three answers otherwise.
+that one pass instead of three answers otherwise; the same model in the `inkling2_loop` layout
+gives the same config and, bit for bit, the same logits.
 
 ## Modes
 

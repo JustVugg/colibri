@@ -15,6 +15,12 @@ with `--backend http://HOST:PORT`. The server proxies
 one origin (the gateway sends no CORS headers); a chat stream passes through chunk by chunk,
 and when the page stops a request the upstream connection closes, which stops the engine.
 
+While the UI listens on this machine only (the default), those paths answer only a request whose
+`Host` names this machine (`127.0.0.1`, `localhost`, `[::1]`), as the gateway itself does, so a web
+page on another site cannot reach the gateway through a name it re-points here. If the UI is
+reached through a reverse proxy or a tunnel name, add that name with `--allowed-host NAME`
+(repeatable, or `COLI_ALLOWED_HOSTS=a,b`). A UI bound to `0.0.0.0` or a LAN address is unchanged.
+
 ## What it does
 
 - **Chat**: streaming, the reasoning in its own block (open or closed while it streams, the

@@ -37,6 +37,8 @@ it is not a measured speedup. Check the startup log for skipped mirrors and
 probe failures before trusting the split. See the
 [environment reference](ENVIRONMENT.md#dual-ssd-streaming) for the variables.
 
+A GGUF model (DeepSeek V4.1) works the same way: copy the `.gguf` parts to the other drive and point `COLI_MODEL_MIRROR` at that directory. Because every layer's experts live in one part, splitting the parts across drives does not help, but a mirror does, since each expert is read from whichever copy its hash picks. A GGUF copy is accepted when its size, the header up to the first tensor and 16 sampled blocks of data match the primary, so it does not read everything: check a fresh copy with `cmp` or a checksum.
+
 Missing or divergent mirror shards fall back to the primary. For a smaller
 drive, use the [partial-mirror planner](#partial-mirrors-coli-mirror)
 to stage a usage-ranked subset. `COLI_MODEL_DIRS` is a different layout: it

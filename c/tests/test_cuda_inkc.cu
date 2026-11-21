@@ -6,6 +6,8 @@
  *   mix     nb 0, 8 and 15 block states, Inkling-2-Small's width
  *   clip    with and without the learned scale, a threshold that binds and one that does not
  *   dconv   two steps, the state carried, 1 to 9 taps
+ *   relattn a decode step's split over its positions (a block a tile of 128, then joined), up to 1500
+ *   loopgate Inkling-2-Mini's loop gate (CC_EW_LOOPGATE), in place too, and the backend's CC_INK2_* bits
  * make CUDA=1 cuda-inkc-check */
 #include <cstdio>
 #include <cstdlib>
@@ -187,6 +189,20 @@ static void test_dconv(int KV, int hd, int K, int S1, int S2) {
     T->free(bx); T->free(bd); T->free(bw); T->free(br);
 }
 
+/* y = (1 - tanh(a)) c + tanh(b) e, ink2_loop_gate's last line; y the same buffer as c when inplace */
+static void test_loopgate(int rows, int D, int inplace) {
+    const int n = rows * D;
+    std::vector<float> a = fvec(n, 3.f), b = fvec(n, 3.f), c = fvec(n, 2.f), e = fvec(n, 2.f), ref(n);
+    for (int i = 0; i < n; i++) ref[i] = (1.f - tanhf(a[i])) * c[i] + tanhf(b[i]) * e[i];
+    CcBuf *ba = upf(a), *bb = upf(b), *bc = upf(c), *be = upf(e), *by = inplace ? bc : T->buf((size_t)n * 4, CC_DEV);
+    CcEw p = {CC_EW_LOOPGATE, n, D, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
+    int ok = T->begin() && T->ew(by, ba, bb, bc, be, &p) && T->submit(1);
+    std::vector<float> y = down(by, 0, (size_t)n);
+    char what[96]; snprintf(what, sizeof what, "loop gate %d x %d%s", rows, D, inplace ? ", in place" : "");
+    check(ok ? rel_to_max(y.data(), ref.data(), ref.size()) : 1e30, 1e-6, what);
+    T->free(ba); T->free(bb); T->free(bc); T->free(be); if (!inplace) T->free(by);
+}
+
 int main(void) {
     T = coli_cuda_chain_ops();
     if (!T || !T->init(0) || !T->ready()) { printf("cuda-inkc-check: no CUDA chain on this machine\n"); return 1; }
@@ -203,6 +219,15 @@ int main(void) {
     test_relattn(130, 3, 0, 200, 24, 4, 200, 1);
     test_relattn(3, 513, 512, 512, 128, 16, 512, 1);
     test_relattn(2, 9, 0, 64, 256, 64, 8, 1);
+    test_relattn(1, 1500, 0, 1501, 128, 16, 512, 1);   /* a decode step at 1500 positions: twelve tiles split and joined */
+    test_relattn(8, 700, 0, 708, 64, 8, 64, 0);
+    printf("loop gate\n");
+    {
+        const int caps = T->size >= offsetof(ColiCudaChainOps, ink2_caps) + sizeof T->ink2_caps && T->ink2_caps ? T->ink2_caps() : 0;
+        printf("  %s the backend's Inkling-2-Mini bits: %d\n", (caps & 3) == 3 ? "ok  " : "FAIL", caps);
+        if ((caps & 3) != 3) fails++;
+    }
+    test_loopgate(1, 2048, 0); test_loopgate(3, 300, 1);
     printf("ink2 mix, clip, dconv\n");
     test_mix(1, 64, 0); test_mix(3, 4608, 8); test_mix(2, 300, 15);
     test_clip(3, 4, 128, 1, 2.f); test_clip(2, 2, 16, 0, 0.5f); test_clip(1, 48, 300, 1, 22.6f);

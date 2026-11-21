@@ -950,6 +950,8 @@ jobs:
           done
       - name: Qwen3.6 checkpoint MTP (reference logits, exact verifies, multi-turn serve)
         run: make -C c qwen36-tiny-mtp-check
+      - name: Qwen3.6 SEED seeds the sampler (same seed same draws, another seed other draws, greedy unchanged)
+        run: make -C c qwen36-seed-check
       - name: Qwen3.8-2.4T geometry, fused experts + mtp head (converter contract + token-exact)
         run: |
           cd c
@@ -2342,10 +2344,11 @@ jobs:
           make qwen36.exe CUDA_DLL=1
           test -f qwen36.exe || { echo "qwen36 CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
           echo "qwen36.exe built against the DLL loader"
-          # kimi_k3, glm53 and qwen38 link the same loader: five engines share
-          # coli_cuda.dll. deepseek_v4 has its own DLL (coli_cuda_dsv4.dll,
-          # Makefile.deepseek-v4) and joins in a later step; inkling's CUDA object
-          # has no Windows loader.
+          # kimi_k3, glm53, qwen38, deepseek_v41, mimo, inkling, olmoe, laya and
+          # gliner_decide link the same loader: eleven engines share coli_cuda.dll
+          # (inkling's bf16 matrices through its ink_ops table, the last three the
+          # dense chain alone). deepseek_v4 has its own DLL
+          # (coli_cuda_dsv4.dll, Makefile.deepseek-v4) and joins in a later step.
           make kimi_k3.exe CUDA_DLL=1
           test -f kimi_k3.exe || { echo "kimi_k3 CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
           echo "kimi_k3.exe built against the DLL loader"
@@ -2355,6 +2358,26 @@ jobs:
           make qwen38.exe CUDA_DLL=1
           test -f qwen38.exe || { echo "qwen38 CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
           echo "qwen38.exe built against the DLL loader"
+          make deepseek_v41.exe CUDA_DLL=1
+          test -f deepseek_v41.exe || { echo "deepseek_v41 CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
+          echo "deepseek_v41.exe built against the DLL loader"
+          make mimo.exe CUDA_DLL=1
+          test -f mimo.exe || { echo "mimo CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
+          echo "mimo.exe built against the DLL loader"
+          make inkling.exe CUDA_DLL=1
+          test -f inkling.exe || { echo "inkling CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
+          echo "inkling.exe built against the DLL loader"
+          make olmoe.exe CUDA_DLL=1
+          test -f olmoe.exe || { echo "olmoe CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
+          echo "olmoe.exe built against the DLL loader"
+          make laya.exe CUDA_DLL=1
+          test -f laya.exe || { echo "laya CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
+          echo "laya.exe built against the DLL loader"
+          make gliner_decide.exe CUDA_DLL=1
+          test -f gliner_decide.exe || { echo "gliner_decide CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
+          echo "gliner_decide.exe built against the DLL loader"
+          # the table inkling.exe's ink_cuda_* forward through (backend_cuda_ink.h)
+          objdump -p coli_cuda.dll | grep -q "coli_cuda_ink_ops" || { echo "coli_cuda.dll does not export coli_cuda_ink_ops" >&2; exit 1; }
       - name: make cuda-dsv4-dll and cuda-dsv4-dg-dll (DeepSeek V4, as the release ships them)
         shell: msys2 {0}
         run: |
@@ -2401,6 +2424,12 @@ jobs:
             c/kimi_k3.exe
             c/glm53.exe
             c/qwen38.exe
+            c/deepseek_v41.exe
+            c/mimo.exe
+            c/inkling.exe
+            c/olmoe.exe
+            c/laya.exe
+            c/gliner_decide.exe
 
   python:
     name: Python tests

@@ -1082,7 +1082,11 @@ const url=p=>ST.base.replace(/\/+$/,'')+p;
 const H=()=>({'Content-Type':'application/json',...(ST.key?{Authorization:'Bearer '+ST.key}:{})});
 async function errText(r){try{const b=await r.json();return b.error?.message||(typeof b.error==='string'&&b.error)||`${r.status} ${r.statusText}`}catch(e){return `${r.status} ${r.statusText}`}}
 async function jget(p){const r=await fetch(url(p),{headers:H()});if(!r.ok)throw new Error(await errText(r));return r.json()}
-const esc=s=>String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+/* text for HTML, in an element or inside a quoted attribute alike: quotes too, since a page's title
+   or a link's address (a search's results, the model's answer) lands in title="..." and href="..." */
+/* a source's address as a link: http and https only (a javascript: one would run on a click) */
+const webUrl=u=>/^https?:\/\//i.test(String(u||''))?String(u):'#';
+const esc=s=>String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 const fmt=(v,d=1)=>(+v).toFixed(d).replace('.',DEC);
 const nf=n=>(+n).toLocaleString(LOC);
 const sleepMs=ms=>new Promise(r=>setTimeout(r,ms));
@@ -1236,11 +1240,11 @@ async function runWebTool(c,a,signal){let args={};try{args=JSON.parse(c.args||'{
 function stepsHTML(a){if(!a.steps||!a.steps.length)return '';
   return `<div class="wsteps">${a.steps.map(s=>`<div class="wstep is-${s.state}"><svg class="ic ic--sm"><use href="#${s.kind==='open'?'i-link':'i-search'}"/></svg><span>${s.kind==='open'?'Legge':'Cerca'} <b>${esc(s.kind==='open'?(s.title||host(s.url)||s.url):s.q)}</b></span><small>${s.state==='run'?'<span class="dots"><i></i><i></i><i></i></span>':s.state==='err'?esc(s.err):s.kind==='search'?`${s.results.length} risultati`:`[${s.results[0]}]`}</small></div>`).join('')}</div>`}
 function sourcesHTML(a){if(!a.sources||!a.sources.length)return '';
-  return `<details class="wsrc"><summary><svg class="ic ic--sm"><use href="#i-link"/></svg>Fonti · ${a.sources.length}<svg class="ic ic--sm chev"><use href="#i-chev"/></svg></summary><ol>${a.sources.map(x=>`<li><a href="${esc(x.url)}" target="_blank" rel="noopener">${esc(x.title||x.url)}</a><small>${esc(host(x.url))}</small></li>`).join('')}</ol></details>`}
+  return `<details class="wsrc"><summary><svg class="ic ic--sm"><use href="#i-link"/></svg>Fonti · ${a.sources.length}<svg class="ic ic--sm chev"><use href="#i-chev"/></svg></summary><ol>${a.sources.map(x=>`<li><a href="${esc(webUrl(x.url))}" target="_blank" rel="noopener">${esc(x.title||x.url)}</a><small>${esc(host(x.url))}</small></li>`).join('')}</ol></details>`}
 /* [1] or [1, 3] in the answer: a link to that source, when the turn has sources */
 function citeify(html){if(!CITE||!CITE.length)return html;
   return html.replace(/\[(\d{1,2}(?:\s*,\s*\d{1,2})*)\]/g,(m,list)=>{const ns=list.split(/\s*,\s*/).map(Number);if(!ns.every(n=>n>=1&&n<=CITE.length))return m;
-    return ns.map(n=>`<a class="cite" href="${esc(CITE[n-1].url)}" target="_blank" rel="noopener" title="${esc(CITE[n-1].title||CITE[n-1].url)}">${n}</a>`).join('')})}
+    return ns.map(n=>`<a class="cite" href="${esc(webUrl(CITE[n-1].url))}" target="_blank" rel="noopener" title="${esc(CITE[n-1].title||CITE[n-1].url)}">${n}</a>`).join('')})}
 
 /* ================================================= thread */
 function statsHTML(s){if(!s)return '';const p=[],ap=s.approx?'~':'',pps=s.pps!==undefined?s.pps:(s.prompt!=null&&s.ttft>0?s.prompt/s.ttft:null);if(pps)p.push(`<span><b>${fmt(pps)}</b> pp/s</span>`);if(s.tps)p.push(`<span><b>${ap}${fmt(s.tps)}</b> tg/s</span>`);if(s.out!=null)p.push(`<span><b>${ap}${nf(s.out)}</b> token scritti</span>`);if(s.prompt!=null)p.push(`<span><b>${nf(s.prompt)}</b> token di prompt</span>`);if(s.ttft!=null)p.push(`<span>primo token dopo <b>${fmt(s.ttft)} s</b></span>`);return `<div class="msg-stats">${p.join('')}</div>`}

@@ -1695,7 +1695,25 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         m->final_norm = load_t(m, "model.llm.norm.weight");
         m->lm_head    = load_w(m, "model.llm.unembed.weight", 1);
         m->x2_out_query = load_t(m, "model.llm.attn_res.output_query");
-        if (m->c.loop_p > 1) {   /* the checkpoint's two [2 x loop layers, D]: [q, mlp] and [k, v] of each loop layer */
+        char mq[96] = "";
+        if (m->c.loop_p > 1) snprintf(mq, sizeof mq, "model.llm.layers.%d.loop_msg_query", m->c.loop_s);
+        if (m->c.loop_p > 1 && st_has(&m->S, mq)) {
+            /* mainline llama.cpp's inkling2_loop files: a loop layer's four queries in a tensor of its own,
+             * [q, k, v, mlp] (st_gguf.h) */
+            const int nl = m->c.loop_e - m->c.loop_s; const int64_t D = m->c.hidden;
+            m->x2_loopq = falloc((int64_t)nl * 4 * D);
+            for (int j = 0; j < nl; j++) {
+                snprintf(mq, sizeof mq, "model.llm.layers.%d.loop_msg_query", m->c.loop_s + j);
+                if (st_numel(&m->S, mq) != 4 * D) {
+                    fprintf(stderr, "inkling2: %s has %lld values, not 4 x %lld\n", mq,
+                            (long long)st_numel(&m->S, mq), (long long)D);
+                    exit(1);
+                }
+                float *t = load_t(m, mq);
+                memcpy(m->x2_loopq + (int64_t)j * 4 * D, t, 4 * D * sizeof(float));
+                free(t);
+            }
+        } else if (m->c.loop_p > 1) {   /* the checkpoint's two [2 x loop layers, D]: [q, mlp] and [k, v] of each loop layer */
             const int nl = m->c.loop_e - m->c.loop_s; const int64_t D = m->c.hidden;
             const char *qn = "model.llm.middle_cycle_cross_pass_queries", *kvn = "model.llm.middle_cycle_cross_pass_kv_queries";
             if (st_numel(&m->S, qn) != 2 * nl * D || st_numel(&m->S, kvn) != 2 * nl * D) {
@@ -2954,6 +2972,7 @@ static void ink_vk_tier_start(Model *m) {
  * holds there (load_w), whose memory the budget it reads leaves them. Inkling keeps the
  * backend alone, as before: its experts on the CPU. */
 static size_t ink2cc_plan_bytes(const Model *m);   /* inkling2_cuchain.h */
+static int ink2cc_wanted(const Cfg *c);             /* inkling2_cuchain.h */
 static ColiCudaTensor *ink2cc_mat(Wt *w, int I, int O);   /* inkling2_cuchain.h */
 /* Inkling-2 from a GGUF on the CUDA build: the attention's block-format matrices and the head on
  * the device as the file has them (cuda_bd.cuh; matmul_w reads W.cut), before the tier measures
@@ -2990,11 +3009,11 @@ static void ink2_cuda_gguf_dense(Model *m) {
 static void ink_cu_tier_start(Model *m) {
     Cfg *c = &m->c;
     if (c->v2 && g_cuda && !XT(ready)()) ink2_cuda_gguf_dense(m);
-    /* Inkling-2's CUDA chain (COLI_CUDA_CHAIN=1 or 2, inkling2_cuchain.h; off by default: it measured
-     * no faster than the matrices a call at a time) planned here, before the tier sizes itself: the
-     * tier leaves its buffers and K/V mirrors */
-    { const char *e = getenv("COLI_CUDA_CHAIN");
-      g_ink2cc_want = c->v2 && c->loop_p <= 1 && g_cuda && !XT(ready)() && e && (*e == '1' || *e == '2') && g_ink_mux_slots <= 1; }
+    /* Inkling-2's CUDA chain (COLI_CUDA_CHAIN=1 or 2, inkling2_cuchain.h; unset, on for Inkling-2-Mini,
+     * whose experts it runs in the frame, and off for the others: there it measured no faster than the
+     * matrices a call at a time) planned here, before the tier sizes itself: the tier leaves its
+     * buffers and K/V mirrors */
+    g_ink2cc_want = c->v2 && g_cuda && !XT(ready)() && g_ink_mux_slots <= 1 && ink2cc_wanted(c);
     if (!c->v2 || !g_cuda || XT(ready)() || !cut_wanted()) return;   /* cut_wanted: COLI_VK_TIER=0 keeps it off */
     int dev = getenv("GPU_DEV") ? atoi(getenv("GPU_DEV")) : 0;
     if (!coli_cuda_init(&dev, 1)) { fprintf(stderr, "[CUDA] tier inkling: device %d unavailable; the experts stay on the CPU\n", dev); return; }

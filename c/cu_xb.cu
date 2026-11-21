@@ -10,14 +10,16 @@
  * decodes as vk_tier.c's float reference (dev_dequant) does. The activations are
  * expert_act.comp's and expert_act_v4.comp's.
  *
- * Not here yet, declined as a Vulkan device without them declines: the dense chain's
- * expert table (xb_expert_entry 0), a second device, streaming's sub-batches and the
- * grouped step (gemm_rows 0), the low-bit formats 200-203 (no device form). */
+ * The dense chain's expert table (xb_expert_entry): the CUDA chain's CcExpert entries (cc_moe).
+ * Not here yet, declined as a Vulkan device without them declines: a second device, streaming's
+ * sub-batches and the grouped step (gemm_rows 0), the low-bit formats 200-203 (no device form). */
 #include "backend_cuda.h"
 #include "backend_gpu_compat.h"
 #include "cuda_bd.cuh"
 #include "cu_tier_ops.h"
 #include "vk_alloc.h"
+#define COLI_CUDA_CHAIN_NO_WRAPPERS
+#include "cuda_chain.h"   /* CcExpert: the dense chain's table entry (cu_xb_expert_entry) */
 
 #include <cstdio>
 #include <cstdlib>
@@ -660,7 +662,32 @@ static void cu_xb_expert_free(ColiVkExpert *e) {
 static void cu_xb_expert_tensors(const ColiVkExpert *e, ColiVkTensor **g, ColiVkTensor **u, ColiVkTensor **d) {
     *g = e ? e->g : NULL; *u = e ? e->u : NULL; *d = e ? e->d : NULL;
 }
-static int cu_xb_expert_entry(const ColiVkExpert *e, uint32_t *entry) { (void)e; (void)entry; return 0; }
+/* Its entry in the CUDA dense chain's table (cuda_chain.h's cc_moe): a CcExpert in words 0..13, its
+ * tensors by device address in the tier's own layouts (the host pool's by the device pointers of
+ * their mapping, host 1; int4 rows planar 2: each nibble v + 8, as cu_word reads them), then words
+ * 14..17 gate's and up's format and group size, down's, and 18 = 1, as backend_vulkan.h's
+ * COLI_VK_XB_ENTRY words are laid out for Vulkan's. 0 for the formats the chain's kernels do not
+ * take from here (fp8, int3, the low-bit forms). */
+static_assert(sizeof(CcExpert) <= 14 * sizeof(uint32_t), "a CcExpert in an entry's first 14 words");
+static int cu_xb_expert_entry(const ColiVkExpert *e, uint32_t *entry) {
+    if (!e || !e->g || !e->u || !e->d || !entry) return 0;
+    const ColiVkTensor *g = e->g, *u = e->u, *d = e->d;
+    const int bd = cu_bd_fmt(g->fmt) && cu_bd_fmt(d->fmt);
+    const int ints = (g->fmt == 1 || g->fmt == 2 || g->fmt == 4) && d->fmt == g->fmt && (g->fmt != 4 || g->gs == d->gs);
+    if (g->fmt != u->fmt || g->gs != u->gs || !(bd || ints) || !g->w || !u->w || !d->w) return 0;
+    if ((g->fmt == 1 || g->fmt == 2 || g->fmt == 4) && (!g->s || !u->s || !d->s)) return 0;
+    const int host = C.pool[g->pool].host;
+    if (C.pool[u->pool].host != host || C.pool[d->pool].host != host) return 0;
+    CcExpert x;
+    memset(&x, 0, sizeof x);
+    x.g = g->w; x.u = u->w; x.d = d->w;
+    if (!bd) { x.gs = g->s; x.us = u->s; x.ds = d->s; x.planar = g->fmt == 1 ? 0 : 2; }
+    x.host = host;
+    memset(entry, 0, 32 * sizeof *entry);
+    memcpy(entry, &x, sizeof x);
+    entry[14] = (uint32_t)g->fmt; entry[15] = (uint32_t)g->gs; entry[16] = (uint32_t)d->fmt; entry[17] = (uint32_t)d->gs; entry[18] = 1;
+    return 1;
+}
 
 /* the scratch for `rows` rows: x, gate (then the activation), up, y and the route weights on
  * the device, x, y and the weights in page-locked RAM. Not while a batch is in flight. */

@@ -7,43 +7,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### New
 
-- **Inkling-2-Mini** (`thinkingmachines/Inkling-2-Mini`, 26.4B, 3.4B active, Apache 2.0) on the
-  inkling engine: Inkling-2 whose layers 6-17 run three passes with their weights shared, each
-  pass with K/V and convolution states of its own, and from the second pass every loop layer
-  mixes four messages of the previous pass (its block states and its output) into its inputs
-  through low-rank gates. From unsloth's GGUFs (llama.cpp's later `inkling2` names: the
-  convolutions as the checkpoint has them, gate and up in one tensor, the loop's gates and
-  queries, `block_count` counting the passes) with the vision tower from their mmproj
-  (projector `inkling2v`), or from the NVFP4 release through `tools/convert_inkling2_int4.py`
-  (the loop's tensors pass as they are). The CPU, the CUDA and Vulkan expert tiers, and Vulkan's
-  dense chain with the passes on the device (a pass's own K/V mirrors and convolution states,
-  the messages and the gates, `VKC_EW_LOOPGATE`); the CUDA chain, off by default for Inkling-2,
-  leaves a loop to the per-matrix path. The drafter (`INK2_MTP=1`) counts its target layers
-  over the passes. `tools/make_tiny_inkling2_loop.py` and the `inkling2-loop-oracle` job: a tiny
-  random Inkling2LoopForCausalLM token for token (transformers' pull request 51050), plain and
-  through the converter; `tests/test_gguf_import.py` the GGUF's layout.
-- **The CPU's NVFP4 blocks unpacked with AVX2**, their E4M3 scales from their bits instead of
-  `ldexpf` (the same values): Inkling-2's NVFP4 experts from a GGUF.
-- **NVFP4 in the CPU's 16-row interleaved forms** (`GQ_NVFP4_R16`, AVX2 and AVX-512 VNNI kernels:
-  each half of a 64 block as IQ4_NL's quads over kvalues_mxfp4, a scale per 16), which the
-  engines make for a GGUF's NVFP4 experts as they read them; `tests/test_gq_r16.c` holds it to its
-  reference to the bit. Inkling-2-Mini UD-Q4_K_XL on an i5-13500 (6 threads), after a 570-token
-  prompt: decode 6.4 -> 8.0-8.1 tok/s, the prompt 10.9 -> 18.2-18.8.
-- **Inkling-2's Vulkan chain decodes in one frame**: the routed experts in the frame
-  (`vk_dmoe.h`: Inkling-2's router and SiTU-GLU experts, the K/V rows of those layers held for the
-  frame's end), a GGUF's NVFP4 experts with their global scales (the expert table's words 19 and
-  20, `chain_moe.comp` applies them; 0 is a scale of 1, so every other engine's entries read as
-  before) and NVFP4 in the block step decoder (`bdstep.glsl`), and a decode step's attention split
-  over its positions (`chain_relattn.comp` modes 1 and 2, `vkc_relattn_part`; at 648 positions
-  24 -> 7.6 ms of a token, `COLI_VK_RELATTN_SPLIT=0` keeps it whole). Inkling-2-Mini on an RTX PRO
-  4000 after a 570-token prompt: UD-Q4_K_XL 14.8-15.2 -> 39.2-39.3 tok/s, UD-IQ2_XXS 19.7-20.3 ->
-  45.5-45.7, the int4 g64 container 18.1-18.5 -> 36.3.
-- **The Vulkan tier's grouped GEMMs on a GGUF's experts compute SiTU-GLU** (Kimi K3's and
-  Inkling-2's activation; `qmatmul_grp_bd*.comp` read the act, a and b the tier pushed them
-  already) and take NVFP4 (bdstep.glsl's): those prompts took the experts one at a time. Inkling-2-Mini
-  on an RTX PRO 4000, a 570-token prompt: UD-Q4_K_XL 32.2-32.9 -> 270.1-276.5 tok/s, UD-IQ2_XXS
-  51.5-54.2 -> 275.3-284.0.
-
 - **WNR3 records decoded straight into the expert's buffers, and the fast decoder's stream count
   measured** (`coli_wex_decode_record_to`, `COLI_WEX_FAST_LANES`): DeepSeek V4.1 and Qwen3.8 read a
   WNR3 record into a buffer of its stored size and decode it into the six windows / the expert
@@ -151,6 +114,92 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   of a WEX4 container, validated in place; `wex4_verify FILE` checks every record against the
   index's SHA-256 and prints the root to pin (`COLI_WEX_ROOT=...`). `tests/test_wex4_verify.c` in
   `make test-c`.
+
+## [2.2.0] - 2026-11-21
+
+### New
+
+- **`coli setup` (START-HERE) picks the model that runs best on the machine**, not the most
+  capable one that fits in RAM. It measures the RAM's read bandwidth (two seconds, standard
+  library only: a process a core scanning its own buffer, within 3% of numpy on three machines),
+  reads each card's memory and its bandwidth (the CUDA driver's memory clock and bus width, else
+  the card's name) and the disk's kind (NVMe, SSD, HDD), and `c/model_fit.py` estimates every
+  catalog model's decode speed on the backend `choose_backend` would give it: every weight on the
+  card, the dense part and some experts on it with the rest in RAM, in RAM, or streaming experts
+  from the disk. The estimates are the bytes a token reads (each entry's geometry, from its files'
+  headers) over the bandwidth that serves them plus a cost a layer, fitted to 19 measured runs on
+  two machines: within a fifth on the card and in RAM, a quarter half on the card. The default is
+  the most capable model that decodes at 20 tok/s or more, a slower one discounted by the square of
+  how far it falls short, one that streams from the disk at half its estimate; the menu and
+  `--list` show each model's estimate, backend and where it runs. On 8 GB a 2-bit Inkling-2-Mini,
+  on a 24 GB card Qwen3.8-Flash-Next UD-IQ3_XXS, on a 1 TB server with eight H100 MiMo-V2.6 Pro;
+  before, every machine from 12 GB to 512 GB got Qwen3.6-35B.
+- **The setup's catalog takes GGUFs**: Inkling-2-Mini UD-Q4_K_XL and UD-IQ2_XXS (with the
+  mmproj) and Qwen3.8-Flash-Next UD-IQ2_XS and UD-IQ3_XXS (with the MTP head), imported in place
+  after the download (`tools/gguf_link.py`).
+- **Inkling-2-Mini from mainline llama.cpp's layout** (`inkling2_loop`: unsloth's
+  `Mainline_Support/*.gguf_file`, the same tensors as their root files byte for byte): `coli import`
+  reads its metadata (`inkling2_loop.*`, `block_count` the checkpoint's 24 layers, the loop as
+  `loop.count/start/end`) into the same `config.json`, and the engine its tensors (`st_gguf.h`:
+  the gates as `loop_{q,k,v,ffn}_ctrl_*`, a loop layer's four message queries in
+  `blk.N.loop_msg_query`). Before, the import refused the architecture and the engine, given such a
+  file, stopped at "no tensor map in st_gguf.h". UD-IQ3_XXS in either layout: the same answers, 44
+  tok/s on CUDA.
+- **The Windows CUDA package carries every engine coli setup runs on CUDA**: `deepseek_v41.exe`,
+  `mimo.exe`, `inkling.exe`, `olmoe.exe`, `laya.exe` and `gliner_decide.exe` join colibri, glm53,
+  qwen36, qwen38 and kimi_k3. `coli setup` builds OLMoE, Laya and GLiNER2.5-Decide with CUDA on an
+  NVIDIA card on Linux too: their CUDA paths (OLMoE's chain, `decide_cuda.h`) were left out of its
+  list, which called them CPU-only. Only qwenimage has none. inkling's bf16
+  matrices come through `coli_cuda.dll` (`backend_cuda_ink.cu` built in, one optional export,
+  `coli_cuda_ink_ops`; an older DLL leaves inkling on Vulkan or the CPU), and `coli setup` fetches
+  the package for those engines from the release after v2.1.0.
+- **Inkling-2-Mini** (`thinkingmachines/Inkling-2-Mini`, 26.4B, 3.4B active, Apache 2.0) on the
+  inkling engine: Inkling-2 whose layers 6-17 run three passes with their weights shared, each
+  pass with K/V and convolution states of its own, and from the second pass every loop layer
+  mixes four messages of the previous pass (its block states and its output) into its inputs
+  through low-rank gates. From unsloth's GGUFs (llama.cpp's later `inkling2` names: the
+  convolutions as the checkpoint has them, gate and up in one tensor, the loop's gates and
+  queries, `block_count` counting the passes) with the vision tower from their mmproj
+  (projector `inkling2v`), or from the NVFP4 release through `tools/convert_inkling2_int4.py`
+  (the loop's tensors pass as they are). The CPU, the CUDA and Vulkan expert tiers, and Vulkan's
+  dense chain with the passes on the device (a pass's own K/V mirrors and convolution states,
+  the messages and the gates, `VKC_EW_LOOPGATE`); the CUDA chain the same (below). The drafter (`INK2_MTP=1`) counts its target layers
+  over the passes. `tools/make_tiny_inkling2_loop.py` and the `inkling2-loop-oracle` job: a tiny
+  random Inkling2LoopForCausalLM token for token (transformers' pull request 51050), plain and
+  through the converter; `tests/test_gguf_import.py` the GGUF's layout.
+- **Inkling-2-Mini on the CUDA chain**, on by default for the Mini (`COLI_CUDA_CHAIN` unset):
+  the loop's passes (`CC_EW_LOOPGATE`), the routed experts of a decode step in the frame
+  (`cc_route`, then `cc_moe` with SiTU-GLU, `CcMoe.act` 1, from the CUDA tier's table: `cu_xb.cu`
+  now gives each resident's `CcExpert`, the int4 rows as the tier keeps them, `planar` 2), a GGUF's
+  NVFP4 experts with their global scales beside the table (`CcMoe.esc_off`) and an NVFP4 integer
+  step for the experts' GEMVs (`cuda_bd.cuh`, the CPU's integer form), and a decode step's
+  attention split over its positions (`COLI_CUDA_RELATTN_SPLIT`). A backend without them
+  (`cc_ink2_caps`) keeps the per-matrix path. On an RTX PRO 4000, 100 tokens after a 570-token
+  prompt: UD-Q4_K_XL 17.8-18.1 to 40.9-41.1 tok/s of decode (prompt 106-107 to 285-289),
+  UD-IQ2_XXS 20.2-20.5 to 46.3-46.5, int4 g64 16.0-16.3 to 36.0-36.1; `tests/test_cuda_bd.cu`,
+  `tests/test_cuda_chain.cu` and `tests/test_cuda_inkc.cu` hold the new ops to the CPU's.
+- **The CPU's NVFP4 blocks unpacked with AVX2**, their E4M3 scales from their bits instead of
+  `ldexpf` (the same values): Inkling-2's NVFP4 experts from a GGUF.
+- **NVFP4 in the CPU's 16-row interleaved forms** (`GQ_NVFP4_R16`, AVX2 and AVX-512 VNNI kernels:
+  each half of a 64 block as IQ4_NL's quads over kvalues_mxfp4, a scale per 16), which the
+  engines make for a GGUF's NVFP4 experts as they read them; `tests/test_gq_r16.c` holds it to its
+  reference to the bit. Inkling-2-Mini UD-Q4_K_XL on an i5-13500 (6 threads), after a 570-token
+  prompt: decode 6.4 -> 8.0-8.1 tok/s, the prompt 10.9 -> 18.2-18.8.
+- **Inkling-2's Vulkan chain decodes in one frame**: the routed experts in the frame
+  (`vk_dmoe.h`: Inkling-2's router and SiTU-GLU experts, the K/V rows of those layers held for the
+  frame's end), a GGUF's NVFP4 experts with their global scales (the expert table's words 19 and
+  20, `chain_moe.comp` applies them; 0 is a scale of 1, so every other engine's entries read as
+  before) and NVFP4 in the block step decoder (`bdstep.glsl`), and a decode step's attention split
+  over its positions (`chain_relattn.comp` modes 1 and 2, `vkc_relattn_part`; at 648 positions
+  24 -> 7.6 ms of a token, `COLI_VK_RELATTN_SPLIT=0` keeps it whole). Inkling-2-Mini on an RTX PRO
+  4000 after a 570-token prompt: UD-Q4_K_XL 14.8-15.2 -> 39.2-39.3 tok/s, UD-IQ2_XXS 19.7-20.3 ->
+  45.5-45.7, the int4 g64 container 18.1-18.5 -> 36.3.
+- **The Vulkan tier's grouped GEMMs on a GGUF's experts compute SiTU-GLU** (Kimi K3's and
+  Inkling-2's activation; `qmatmul_grp_bd*.comp` read the act, a and b the tier pushed them
+  already) and take NVFP4 (bdstep.glsl's): those prompts took the experts one at a time. Inkling-2-Mini
+  on an RTX PRO 4000, a 570-token prompt: UD-Q4_K_XL 32.2-32.9 -> 270.1-276.5 tok/s, UD-IQ2_XXS
+  51.5-54.2 -> 275.3-284.0.
+
 - **`coli web` opens the chat UI**: it serves the API and starts the chat (`ui/server.py`, the
   page `coli ui` serves) in front of it, on the API's port + 790 (8790 for 8000, `--ui-port`
   picks another), opened in the browser when the engine answers; `coli start` and the one-step
@@ -717,6 +766,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md)).
 
 ### Fixed
+
+- **Bounds on what requests and files hand the chat**:
+  - `ui/docs.py` unpacks an Office part up to 64 MB and a file's parts up to 256 MB together, and
+    refuses an XML part with a document type (Office XML has none; `xml.parsers.expat` checks
+    before ElementTree reads it, in any encoding).
+  - The gateway refuses a request's picture past 8192 x 8192 pixels, from its header, before an
+    image preprocessor decodes it whole (`MAX_IMAGE_PIXELS`).
+  - The chat page's `esc` turns quotes into entities too, so a page title or a link in an answer
+    stays inside its attribute; a source's link is http or https, or none, and `ui/web.py` keeps
+    only http and https results from SearXNG, as it did from DuckDuckGo.
+  - The desktop window hands the system's opener only http and https links.
+  - qwen36's Metal graph reads the MTP head's routed experts only in the packed int4 form, with
+    their byte and scale counts checked against the slot, as the CPU's reader does.
+- **qwen36, qwen38: `SEED` seeds the sampler.** Both engines drew their temperature samples from an
+  unseeded libc `rand()`: every run took the same sequence, and `SEED`, which the other engines
+  read, did nothing here. Set, a run repeats to the token; unset, the clock and the pid seed it,
+  as on mimo and inkling. `coli_env.h` lists the variable for both.
 
 - **Inkling's expert cache from the RAM plan in `coli serve`**: without `--cap` the engine got
   the legacy eight slots a layer, and on Inkling-2 (eight routed experts a token) nearly every

@@ -3563,6 +3563,10 @@ int main(int argc, char **argv) {
      * the hot team (omp_tune.h), which re-runs the engine once with libgomp's settings. */
     coli_omp_hot_team(argv, "qwen38", coli_omp_env_on("COLI_CUDA") || coli_omp_env_on("COLI_METAL"));
     coli_omp_tune_threads("qwen38");
+    /* The sampler draws from libc's rand() (glibc seeds it with 1: the same sequence every run);
+     * SEED seeds it as on qwen36, mimo, inkling and deepseek_v41 (coli_env.h). */
+    { const char *seed = getenv("SEED");
+      srand(seed && *seed ? (unsigned)strtoul(seed, NULL, 10) : (unsigned)(time(NULL) ^ (unsigned)getpid())); }
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
     {   /* a model directory made by tools/gguf_import.py: gguf.json names llama.cpp's

@@ -354,8 +354,10 @@ class NvidiaParsing(unittest.TestCase):
 
     def test_the_cuda_driver_probe(self):
         """_cuda_probe_inprocess against a stand-in for libcuda/nvcuda.dll: the
-        attribute numbers are the compute capability's (75, 76 in cuda.h)."""
-        cards = [("Tesla V100-SXM2-16GB", "0000:1A:00.0", 7, 0), ("NVIDIA GeForce RTX 3090", "0000:68:00.0", 8, 6)]
+        attribute numbers are the compute capability's (75, 76 in cuda.h), and the memory's clock
+        in kHz and bus in bits (36, 37), which model_fit turns into the card's bandwidth."""
+        cards = [("Tesla V100-SXM2-16GB", "0000:1A:00.0", 7, 0, 877000, 4096),
+                 ("NVIDIA GeForce RTX 3090", "0000:68:00.0", 8, 6, 9751000, 384)]
 
         class Driver:
             def cuInit(self, flags):
@@ -370,7 +372,8 @@ class NvidiaParsing(unittest.TestCase):
                 return 0
 
             def cuDeviceGetAttribute(self, value, attribute, device):
-                value._obj.value = {75: cards[device.value][2], 76: cards[device.value][3]}[attribute]
+                value._obj.value = {75: cards[device.value][2], 76: cards[device.value][3],
+                                    36: cards[device.value][4], 37: cards[device.value][5]}[attribute]
                 return 0
 
             def cuDeviceGetPCIBusId(self, buffer, size, device):
@@ -384,8 +387,10 @@ class NvidiaParsing(unittest.TestCase):
         with mock.patch.object(setup_hw, "_cuda_driver_library", return_value=Driver()):
             probe = setup_hw._cuda_probe_inprocess()
         self.assertEqual(probe["devices"], [
-            {"name": "Tesla V100-SXM2-16GB", "pci_bus_id": "0000:1A:00.0", "compute_cap": "7.0"},
-            {"name": "NVIDIA GeForce RTX 3090", "pci_bus_id": "0000:68:00.0", "compute_cap": "8.6"}])
+            {"name": "Tesla V100-SXM2-16GB", "pci_bus_id": "0000:1A:00.0", "compute_cap": "7.0",
+             "memory_clock_khz": 877000, "memory_bus_bits": 4096},
+            {"name": "NVIDIA GeForce RTX 3090", "pci_bus_id": "0000:68:00.0", "compute_cap": "8.6",
+             "memory_clock_khz": 9751000, "memory_bus_bits": 384}])
         with mock.patch.object(setup_hw, "_cuda_driver_library", return_value=None):
             self.assertEqual(setup_hw._cuda_probe_inprocess(), {"driver": False, "devices": []})
 

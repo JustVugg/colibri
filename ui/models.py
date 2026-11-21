@@ -51,6 +51,7 @@ import setup_catalog  # noqa: E402
 import setup_download  # noqa: E402
 import setup_flow  # noqa: E402
 import setup_hw  # noqa: E402
+import model_fit  # noqa: E402
 
 GB = 1_000_000_000
 LINUX = sys.platform.startswith("linux")
@@ -73,8 +74,8 @@ IGPU_RATIO = {"qwen36": {"model": "Qwen3.6", "gpu": 9.94, "cpu": 6.01},
 # with one draft (#1940 on an i5-13500). A family measured here uses its own tokens per forward.
 MTP_GAIN = {"qwen36": 14.8 / 13.8}
 # How capable a family is, for the best model each way it can run (higher first).
-FAMILY_RANK = {"olmoe": 1, "qwen36": 3, "glm53": 4, "qwen38": 5, "deepseek_v4": 5, "mimo": 6,
-               "deepseek_v41": 6, "glm": 8, "inkling": 9, "kimi": 10}
+FAMILY_RANK = {"olmoe": 10, "qwen36": 30, "glm53": 40, "qwen38": 50, "deepseek_v4": 50, "mimo": 60,
+               "deepseek_v41": 60, "glm": 80, "inkling": 90, "kimi": 100}   # setup_catalog's ranks
 # A GGUF's general.architecture -> the engine family that reads it (tools/gguf_import.py ARCHES)
 GGUF_FAMILY = {"qwen35moe": "qwen36", "qwen35": "qwen36", "qwen3moe": "qwen36", "qwen3": "qwen36",
                "flint": "qwen36", "muse-spark": "qwen36", "lfm3": "qwen36", "qwen4exp": "qwen38",
@@ -352,8 +353,11 @@ def measure_ram_bw(seconds=1.5):
     numpy's sum runs outside the GIL; in plain Python the threads would take turns."""
     try:
         import numpy as np
-    except ImportError:
-        raise RuntimeError("serve numpy per misurare la banda della RAM") from None
+    except ImportError:   # the setup's own probe: a process a core, memchr over its buffer
+        v = model_fit.measure_ram_bandwidth(avail_bytes=(setup_hw.detect_memory() or {}).get("available"))
+        if not v:
+            raise RuntimeError("la banda della RAM non si misura qui") from None
+        return v
     n = os.cpu_count() or 4
     per = 64 << 20
     arrs = [np.ones(per // 8, dtype=np.float64) for _ in range(n)]
@@ -647,6 +651,29 @@ def usable_ram():
     return max(0.0, (MACHINE.get("ram_total_gb") or 0) * GB * 0.9 - 2 * GB)
 
 
+def gpu_estimate(g, family, cards, bench):
+    """Decode on the dedicated cards, as `coli setup` estimates it (model_fit.estimate): the
+    card's bandwidth from its name, the RAM's measured here, CUDA for an NVIDIA card where the
+    engine has it, else Vulkan. None without the figures."""
+    k, e = g.get("k"), g.get("E")
+    if not (k and e and g.get("experts") is not None):
+        return None
+    resident, dense = held(g, family)
+    arch = g.get("arch") or ""
+    entry = type("Geometry", (), {"family": family, "modality": "text", "tpf": 0,
+                                  "cost": "inkling2" if arch.startswith("inkling2") or (family == "inkling" and e in (128, 384)) else "",
+                                  "resident_gb": resident / GB, "experts_gb": g["experts"] / GB, "dense_read_gb": dense / GB,
+                                  "active_gb": (dense + g["experts"] * k / e) / GB, "layers": g.get("layers") or 48})()
+    nvidia = all("nvidia" in ((c.get("vendor") or "") + (c.get("name") or "")).lower() for c in cards)
+    backend = "cuda" if nvidia and family in setup_flow.CUDA_ENGINES else "vulkan"
+    fit = {"ram": (MACHINE.get("ram_total_gb") or 0) * GB, "ram_gbs": bench.get("ram_bw_gbs"), "integrated": None,
+           "disk": None, "disk_gbs": bench.get("disk_gbs"),
+           "cards": [{"name": c.get("name"), "vram": (c.get("vram_gb") or 0) * GB,
+                      "gbs": model_fit.card_gbs(c.get("name"), (c.get("vram_gb") or 0) * GB)} for c in cards]}
+    est = model_fit.estimate(entry, fit, backend)
+    return est["tok_s"] if est.get("tier") in ("gpu", "hybrid", "ssd") else None
+
+
 def tiers_for(g, disk_bytes, ram_min_gb=0, have=False, family="", mtp=None, accel=True):
     """The three ways a model can run here, each with fits / why / speed estimate. `have`:
     already on this disk, so the download size does not matter. `accel`: its engine has a GPU
@@ -676,8 +703,9 @@ def tiers_for(g, disk_bytes, ram_min_gb=0, have=False, family="", mtp=None, acce
         vram = sum(x.get("vram_gb") or 0 for x in disc) * GB
         cap = ram + vram
         fits = total <= cap
-        t = {"fits": fits, "need_gb": round(total / GB, 1), "gpu": name, "est": None,
-             "est_note": "su GPU dedicata la velocità si misura al primo uso" if disc else None,
+        est_gpu = gpu_estimate(g, family, disc, bench) if (disc and fits and accel) else None
+        t = {"fits": fits, "need_gb": round(total / GB, 1), "gpu": name, "est": est_gpu,
+             "est_note": (None if est_gpu else "su GPU dedicata la velocità si misura al primo uso") if disc else None,
              "why": (("%s: GPU integrata, usa la stessa RAM (%.0f GB utili)" % (name, ram / GB) if not disc
                       else "%.0f GB di VRAM + %.0f GB di RAM" % (vram / GB, ram / GB)) if fits
                      else "servono %.0f GB, VRAM + RAM fanno %.0f GB" % (total / GB, cap / GB))}
