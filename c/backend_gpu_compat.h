@@ -17,7 +17,17 @@
  * __half and nvcuda::wmma names are mapped to their rocWMMA equivalents.
  * Note: grouped_s4_wmma uses wmma::experimental::precision::s4 (4-bit)
  * which has no rocWMMA equivalent — that kernel stays a no-op under HIP
- * and falls back to quant_matmul. */
+ * and falls back to quant_matmul.
+ *
+ * COLI_GPU_PORTABLE_ONLY: the input of the SYCL migration (c/sycl/, dpct over
+ * these sources). Every NVIDIA-only construct the migration tool cannot carry
+ * is compiled out behind it -- the WMMA and mma.sync tensor-core kernels and
+ * their host gates, the inline PTX (cp.async, ldmatrix, griddepcontrol), the
+ * stream-ordered allocator's pool, cuda_fp8.h's conversions, batched copies --
+ * so what the tool sees is the plain CUDA C the HIP arm already runs on. The
+ * host dispatch then takes the same fallbacks as COLI_HIP_NO_WMMA (the block
+ * kernels, the warp kernels, hcg_ok/tcg_ok 0). Undefined for nvcc and hipcc
+ * builds: nothing in them changes. */
 #ifndef COLIBRI_BACKEND_GPU_COMPAT_H
 #define COLIBRI_BACKEND_GPU_COMPAT_H
 
@@ -186,12 +196,20 @@ static inline hipError_t cudaGraphInstantiate(hipGraphExec_t *exec,
 #define __trap                   abort
 #else
 #include <cuda_runtime.h>
+#if !defined(COLI_GPU_PORTABLE_ONLY)
 #include <mma.h>
 #define COLI_GPU_HAS_WMMA        1
 /* nvcuda::wmma::experimental::precision::s4 exists here; the kernel body still
  * needs sm_75+, which the host checks at run time from the device's compute
  * capability (see the grouped_s4_wmma dispatch in backend_cuda.cu). */
 #define COLI_GPU_HAS_S4_WMMA     1
+#else
+/* the migration's input: no tensor-core kernels (their bodies are compiled out
+ * with the same guard), so the host gates fall back as under COLI_HIP_NO_WMMA */
+#include <cuda_fp16.h>   /* __half (the f16 KV mirrors): mma.h brought it in above */
+#define COLI_GPU_HAS_WMMA        0
+#define COLI_GPU_HAS_S4_WMMA     0
+#endif
 #endif
 
 /* Programmatic dependent launch (sm_90 and later). A kernel coli_launch starts may be set up
@@ -202,12 +220,12 @@ static inline hipError_t cudaGraphInstantiate(hipGraphExec_t *exec,
  * Elsewhere (HIP, older archs, COLI_CUDA_PDL=0, a fatbin whose code for this device was built
  * below sm_90, the legacy default stream) coli_launch is a plain launch and the wait returns at
  * once. */
-#if !defined(__HIP_PLATFORM_AMD__) && !defined(__HIP__) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if !defined(__HIP_PLATFORM_AMD__) && !defined(__HIP__) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900 && !defined(COLI_GPU_PORTABLE_ONLY)
 #define COLI_PDL_WAIT()          asm volatile("griddepcontrol.wait;" ::: "memory")
 #else
 #define COLI_PDL_WAIT()          ((void)0)
 #endif
-#if !defined(__HIP_PLATFORM_AMD__) && !defined(__HIP__)
+#if !defined(__HIP_PLATFORM_AMD__) && !defined(__HIP__) && !defined(COLI_GPU_PORTABLE_ONLY)
 #include <cstdlib>
 __global__ static void coli_pdl_probe_k(void) {}
 /* per translation unit (each .cu's fatbin is probed): on where the device is sm_90 or later
@@ -244,6 +262,13 @@ static inline void coli_launch(void (*k)(P...), dim3 g, dim3 b, size_t sm, cudaS
     }
     k<<<g, b, sm, st>>>(a...);
 }
+#elif defined(COLI_GPU_PORTABLE_ONLY)
+/* The migration's input: a plain launch as a macro. The migration tool migrates a launch it sees
+ * the kernel of; one through a kernel pointer (the template above) or inside a macro it does not,
+ * so c/sycl/tools/dpct-prep.py expands this macro at every call site before the tool runs (a
+ * kernel with template arguments carries commas a macro cannot pass: the script splits on the
+ * brackets, which is why the sites are not parenthesised here). */
+#define coli_launch(k, g, b, sm, st, ...) k<<<g, b, sm, st>>>(__VA_ARGS__)
 #else
 template <typename... P, typename... A>
 static inline void coli_launch(void (*k)(P...), dim3 g, dim3 b, size_t sm, cudaStream_t st, A... a) { k<<<g, b, sm, st>>>(a...); }

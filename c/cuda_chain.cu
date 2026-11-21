@@ -532,7 +532,7 @@ __global__ static void __launch_bounds__(128) cc_attn_gk(const float *__restrict
  * valid for row r iff t <= pos_base + token(r). Not bit-identical to cc_attn_k (f16 operands).
  * Grid: x = ceil(S / TPW) token groups, y = kv heads. */
 #define CC_FA_BC 64
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__) && !defined(COLI_GPU_PORTABLE_ONLY)
 #define CC_FA_BODY 1
 #else
 #define CC_FA_BODY 0
@@ -721,7 +721,7 @@ __global__ static void __launch_bounds__(128) cc_attn_fk(const float *__restrict
  * rows, twice. Not bit-identical to cc_attn_fk (one pass, the sums in another order).
  * Grid: x = ceil(S / (16 * NW / GQ)) token groups, y = kv heads; dynamic shared memory
  * cc_f2_smem_bytes. */
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750 && !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750 && !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__) && !defined(COLI_GPU_PORTABLE_ONLY)
 #define CC_F2_BODY 1
 __device__ __forceinline__ void cc_f2_mma(float *c, const uint32_t *a, uint32_t b0, uint32_t b1) {
 #if __CUDA_ARCH__ >= 800
@@ -935,7 +935,7 @@ __global__ static void __launch_bounds__(32 * NW) cc_attn_f2(const float *__rest
     }
 #endif
 }
-#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)   /* the opt-in limit's attribute is CUDA's */
+#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__) && !defined(COLI_GPU_PORTABLE_ONLY)   /* the opt-in limit's attribute is CUDA's */
 /* cc_attn_f2 at head dim 256 with blocks of BC keys (1: launched); ok says whether the card gives
  * its shared memory, asked once: 1 allowed, -1 refused, 0 not asked */
 template <int BC, typename KT, int NW = 4>
@@ -977,7 +977,7 @@ static int cc_attn_f2_fits(const CcCtx *c, const CcAttn *p, int G) {
 template <typename KT>
 static int cc_attn_f2_go(CcCtx *c, CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, const CcAttn *p, int G,
                          int win, const float *sk, int so, int ring, const int *sel = nullptr) {
-#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__) && !defined(COLI_GPU_PORTABLE_ONLY)
     static int on = -1;
     if (on < 0) { const char *e = getenv("COLI_CUDA_CHAIN_FLASH2"); on = !(e && *e == '0'); }
     if (!on || c->major * 10 + c->minor < 75 || (p->hd != 64 && p->hd != 128 && p->hd != 256) ||
@@ -2013,7 +2013,7 @@ static int cc_init(int device) {
     if (!cc_ok(nullptr, cudaStreamCreateWithFlags(&c->stream, cudaStreamNonBlocking), "stream")) return 0;
     if (!cc_ok(nullptr, cudaEventCreateWithFlags(&c->ev, cudaEventDisableTiming), "event")) { cudaStreamDestroy(c->stream); return 0; }
     c->ev_ok = 1; c->up = 1; c->lost = 0; c->in_frame = 0; c->ev_pending = 0;
-#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)   /* the flash attention's tensor cores (CUDA only) */
+#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__) && !defined(COLI_GPU_PORTABLE_ONLY)   /* the flash attention's tensor cores (CUDA only) */
     if (cudaDeviceGetAttribute(&c->major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
         cudaDeviceGetAttribute(&c->minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess) {
         c->major = c->minor = 0; (void)cudaGetLastError();
@@ -2723,7 +2723,7 @@ static int cc_attn_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBu
     static int fl = -1;
     if (fl < 0) { const char *e = getenv("COLI_CUDA_CHAIN_FLASH"); fl = e && *e ? atoi(e) : 16; if (fl < 0) fl = 0; }
     int G = p->H / p->KVH;
-#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__) && !defined(COLI_GPU_PORTABLE_ONLY)
     if (fl > 0 && p->S >= fl && p->sel_row <= 0 && cc_attn_f2_go<KT>(c, q, kc, vc, o, gate, p, G, 0, nullptr, 0, 0))
         return launched(c, "attn (tensor cores, one pass)");
     if (fl > 0 && p->S >= fl && c->major >= 7 && p->sel_row <= 0 && 16 % G == 0 && (p->hd == 64 || p->hd == 128 || p->hd == 256)) {
@@ -2745,7 +2745,7 @@ static int cc_attn_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBu
      * bits do not depend on how a forward is cut into steps, and a prefix resumed answers as
      * the prompt recomputed does */
     int fk = 0;
-#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__) && !defined(COLI_GPU_PORTABLE_ONLY)
     /* or cc_attn_f2 (Qwen3.8-27B's six query heads a kv head: its decode read every position a
      * block a head, cc_attn_k) */
     fk = fl > 0 && ((c->major >= 7 && 16 % G == 0 && (p->hd == 64 || p->hd == 128 || p->hd == 256)) || cc_attn_f2_fits(c, p, G));
@@ -2809,7 +2809,7 @@ static int cc_attn_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBu
      * COLI_CUDA_ATTN_SEL_TC=0 keeps cc_attn_gk below. Not bit-identical to it (f16 operands, one pass) */
     int stc = 1;   /* read each call, as COLI_CUDA_ATTN_DEC_SEL */
     { const char *e = getenv("COLI_CUDA_ATTN_SEL_TC"); stc = !(e && *e == '0'); }
-#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__) && !defined(COLI_GPU_PORTABLE_ONLY)
     if (stc && fl > 0 && p->S >= fl && p->sel_row > 0 && p->hd == 256 && cc_attn_f2_go<KT>(c, q, kc, vc, o, gate, p, G, 0, nullptr, 0, 0, sp))
         return launched(c, "attn (tensor cores, a selection list)");
 #endif
@@ -3186,7 +3186,7 @@ static int cc_host_up_n(void *const *dst, const void *const *src, const size_t *
     if (!cc_ok(c, cudaEventRecord(c->up_after, c->stream), "host up after") ||
         !cc_ok(c, cudaStreamWaitEvent(c->cs, c->up_after, 0), "host up wait")) return 0;
     int sent = 0;
-#if !(defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)) && defined(CUDART_VERSION) && CUDART_VERSION >= 12080
+#if !(defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)) && defined(CUDART_VERSION) && CUDART_VERSION >= 12080 && !defined(COLI_GPU_PORTABLE_ONLY)
     if (n > 1 && cc_up_batch_on()) {
         cudaMemcpyAttributes at;
         memset(&at, 0, sizeof at);
@@ -3237,7 +3237,7 @@ static int cc_attn_w2_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, C
     if (fl < 0) { const char *e = getenv("COLI_CUDA_CHAIN_FLASH"); fl = e && *e ? atoi(e) : 16; if (fl < 0) fl = 0; }
     if (dec < 0) { const char *e = getenv("COLI_CUDA_ATTN_DEC"); dec = !(e && *e == '0'); }
     int G = p->H / p->KVH, fk = 0;
-#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__) && !defined(COLI_GPU_PORTABLE_ONLY)
     fk = fl > 0 && c->major >= 7 && 16 % G == 0 && (p->hd == 64 || p->hd == 128 || p->hd == 256);
     if (fl > 0 && p->S >= fl && cc_attn_f2_go<KT>(c, q, kc, vc, o, gate, p, G, win, sk, so, ring))
         return launched(c, "attn (tensor cores, one pass, window, sinks)");
@@ -3675,7 +3675,7 @@ static int cc_enc_rel(CcBuf *x, CcBuf *pt, CcBuf *y, const CcEncRel *p) {
  * 4000), the backend's at the first tile (17 ms) */
 static int cc_preload(void) {
     if (!live()) return 0;
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__) || defined(COLI_GPU_PORTABLE_ONLY)
     return 1;
 #else
     cudaFuncAttributes fa;

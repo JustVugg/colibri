@@ -64,6 +64,7 @@ static int qwen38_max_ctx(void) {
 #include "cli_args.h"
 #include "st.h"
 #include "omp_tune.h"
+#include "platform_defaults.h"   /* the SYCL build's measured configuration for unset switches (main) */
 #include "qwen38_vision.h"
 #include "json.h"   /* tokenizer.json parsing (reuse minimal parser) */
 #include "tok_unicode.h"
@@ -3133,6 +3134,13 @@ static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     return 1;
 }
 
+/* Q38_TIER_REPORT=1 (default 0): after each request and when serving ends, where the experts are on the cards
+ * (qt_split_report: a card's resident experts, in each layer, and the expert runs it served). Only reads. */
+static int q38_tier_report_on(void){
+    static int v=-1;
+    if(v<0){const char *e=getenv("Q38_TIER_REPORT");v=e&&e[0]=='1'&&!e[1];}
+    return v;
+}
 static int serve_one_turn(Model *m, ServeReq *q);
 /* one request; a conversation parked for it (q38_park) waits for the next request (q38_park_decide) */
 static int serve_one(Model *m, ServeReq *q){
@@ -3238,6 +3246,7 @@ static int serve_one_turn(Model *m, ServeReq *q){
     serve_hits(m);
     q38_tm_report_bank(&timers,"request");
     q38_report_request_split(m,&clk,q->id);
+    if(q38_tier_report_on())qt_split_report("request");
     {char scope[96];snprintf(scope,sizeof scope,"turn %s",q->id);q38_spec_report(m,&spec,scope);q38_vocab_report(m,scope);}
     q38_spec_free(&spec);
     return input_eof?-1:0;
@@ -3341,6 +3350,7 @@ static void q38_mux_finish(Model *m,Q38MuxReq *r){
     serve_hits(m);
     q38_tm_report_bank(&timers,"request");
     q38_report_request_split(m,&r->clk,r->q.id);
+    if(q38_tier_report_on())qt_split_report("request");
     /* the slot's conversation as the turn left it, for its next turn on another slot (one as long
      * as a parked one at least: COLI_PARK_MIN) */
     q38_psd_flush(m);
@@ -3726,6 +3736,91 @@ int main(int argc, char **argv) {
 
     Model m; model_init(&m, snap, cap, bits);
     q38_expert_int4_attach(&m, snap);   /* <snap>/experts-int4g64/ when present (Q38_EXPERT_INT4) */
+#ifdef COLI_SYCL
+    /* The SYCL build's default where the expert tier will stream the native FP8 checkpoint's experts to Data Center
+     * GPU Max cards: the hybrid the fork qualified (the trunk on the CPU, the CPU's FP8 order and SiLU on the card, the
+     * rank-order sum: greedy NLL 0.3030 and human 2.6323 against the CPU reference), no drafting (COLI_LOOKUP=0,
+     * Q38_MTP=0: a draft's verify is a step of several rows, which that configuration never ran), the kernels and the
+     * prompt path accepted on a Max 1100 (CPU order 4: warm decode 16.8 -> 19.1 tok/s; a prompt chunk's resident
+     * experts on the card at the measured split: first token -9 %, the same bits) and the tier settings they were
+     * measured with. Since 2026-11-20 the SiLU between gate/up and down runs on the card with the host's bits
+     * (COLI_SYCL_SILU_CPU=2: glibc's expf ported, exhaustively equal on every float; COLI_SYCL_F8_HOST_SILU=0, no host
+     * round trip; COLI_SYCL_F8_ASYNC_WAITS=1, fewer waits around a group) -- the FP8 group's outputs byte-identical to
+     * the host SiLU's, the same NLL, decode +3.6 % (one card) to +8.7 % -- and a step of several conversations gives each
+     * card a worker of its own (Q38_PREFILL_GPU_PERCARD=1: two cards, four at once 29.35 -> 33.07 tok/s; one card the
+     * same). The hybrid before: COLI_SYCL_F8_HOST_SILU=1 COLI_SYCL_SILU_CPU=1 COLI_SYCL_F8_ASYNC_WAITS=0
+     * Q38_PREFILL_GPU_PERCARD=0. And the hyper-connections' own work -- q38_gr_read's norms, SiLU and sigmoid mixing,
+     * about a million expf a token at one row -- on the OpenMP threads (Q38_HC_PAR=1: every element's operations
+     * unchanged; 4.45 billion elements compared with the one-thread loops, 0 differ; one card 19.27 / 24.87 / 30.96 ->
+     * 20.62 / 28.02 / 37.06 tok/s at 1 / 2 / 4 at once, two cards 20.98 / 24.56 / 33.42 -> 23.02 / 29.03 / 41.28).
+     * And the lm-head -- 248 320 rows, one product a token after the last layer, while the cards wait -- on the first
+     * card this process opens, with the CPU's bits: Q38_TRUNK_GPU=1 offers the trunk to the tier's placer,
+     * COLI_PLACE=lmhead=<that card>,experts=all places the lm-head alone there and keeps the experts on every card
+     * (the card from COLI_GPUS, else COLI_GPU, as the tier reads them, else 0: a card the placement names is opened
+     * too, so it must be one of the selected), and Q38_TRUNK_GPU_I8=1 -- a default of its own, for any trunk matrix
+     * on a card, the lm-head's or one placed by hand -- answers through qt_dense_matmul_i8act (the activation
+     * quantized as the CPU does, exact int32 dots, the CPU's final expression; byte-identical to the CPU's formula at
+     * the lm-head's shape). lm-head 2.59 -> 0.99 ms a token; two cards 23.12 / 28.51 / 40.92 -> 23.82 / 28.95 / 41.76
+     * tok/s, the same texts and NLL. Q38_TRUNK_GPU and COLI_PLACE are a group: both or neither, neither when one is
+     * set by hand (Q38_TRUNK_GPU=0 alone: the lm-head on the CPU), and neither where the placed lm-head would not
+     * give the CPU's bits or would override a choice: a BF16 trunk asked for (Q38_TRUNK_CPU_INT8=0: the placement
+     * quantizes what it places), Q38_TRUNK_GPU_I8 set to other than 1, a COLI_CUDA_CHAIN the chain reads as on (any
+     * value starting with 1: the placed lm-head would give the chain a card, and the chain computes in float), or
+     * layer homes (QT_HOME: read only by the automatic placement, which a hand-written COLI_PLACE turns off).
+     * Only (1) where q38_tier_start will start the FP8 tier (q38_tier_takes_fp8), (2) where the backend
+     * says every card this process will open is one it was measured on (coli_cuda_tuned_default "Q38_SYCL_HYBRID",
+     * read from the listed devices before any is opened: on any other card the CPU-order kernels may not run -- they
+     * need FP64 -- while the prompt path would still take the card's word for its bits), and (3) not under an explicit
+     * COLI_CUDA_CHAIN=1 or Q38_DN_GPU=1 (the trunk on the card, asked for). Only variables the environment leaves unset
+     * are filled; COLI_PLATFORM_DEFAULTS=0 keeps every code default (the trunk on the card, which failed that gate:
+     * 0.3288). Here, after the checkpoint and its sidecar are known and before anything reads these: the MTP head,
+     * the KV type, the drafts, the tier, the trunk placer and the backend read them later. */
+    if (q38_tier_takes_fp8(&m)) {
+        const char *chain = getenv("COLI_CUDA_CHAIN"), *dng = getenv("Q38_DN_GPU");
+        if ((chain && !strcmp(chain, "1")) || (dng && !strcmp(dng, "1")))
+            fprintf(stderr, "[qwen38] SYCL defaults not applied: COLI_CUDA_CHAIN=1 or Q38_DN_GPU=1 asks for the trunk on the card\n");
+        else if (coli_cuda_tuned_default("Q38_SYCL_HYBRID", 0) == 1) {
+            static const ColiDefaultKV q38_sycl[] = {
+                {"COLI_SYCL_F8_CPU_ORDER", "4"},       {"COLI_SYCL_F8_HOST_SILU", "0"}, {"COLI_SYCL_SILU_CPU", "2"},
+                {"COLI_SYCL_F8_ASYNC_WAITS", "1"},
+                {"Q38_TIER_RANK_ORDER", "1"},          {"Q38_TRUNK_GPU", "0"},          {"Q38_KV", "f16"},
+                {"Q38_MTP", "0"},                      {"COLI_LOOKUP", "0"},            {"COLI_CUDA_EXPERT_ARENA", "2"},
+                {"Q38_PREFILL_BATCH_ROWS", "128"},     {"Q38_PREFILL_WORKSPACE_MIB", "2048"},
+                {"Q38_PREFILL_GPU", "1"},              {"Q38_PREFILL_GPU_BALANCE", "1"},
+                {"Q38_PREFILL_GPU_PERCARD", "1"},      {"Q38_HC_PAR", "1"},
+            };
+            /* Q38_TRUNK_GPU_I8=1 first, on its own; then the lm-head on the first selected card, a group placed only
+             * where Q38_TRUNK_GPU_I8 is then exactly 1 (and not under the comment's other conditions above), before the
+             * table (whose Q38_TRUNK_GPU=0 fills in only where the group did not apply) */
+            static const ColiDefaultKV q38_i8[] = { {"Q38_TRUNK_GPU_I8", "1"} };
+            char got[768], rest[640], i8got[64];
+            int nset = coli_platform_defaults_apply(q38_i8, 1, i8got, sizeof i8got);
+            const char *ci8 = getenv("Q38_TRUNK_CPU_INT8"), *ti8 = getenv("Q38_TRUNK_GPU_I8"), *home = getenv("QT_HOME");
+            int lm_ok = !(ci8 && !strcmp(ci8, "0")) && ti8 && !strcmp(ti8, "1") && !(chain && *chain == '1') &&
+                        !(home && *home);
+            const char *gl = getenv("COLI_GPUS");
+            if (!gl || !*gl) gl = getenv("COLI_GPU");
+            int lm_dev = 0;
+            if (gl && *gl) {   /* the tier's first strtok(",") token, through atoi */
+                while (*gl == ',') gl++;
+                if (*gl) lm_dev = atoi(gl); else lm_ok = 0;
+            }
+            char lm_place[48];
+            snprintf(lm_place, sizeof lm_place, "lmhead=%d,experts=all", lm_dev);
+            const ColiDefaultKV q38_lmhead[] = { {"Q38_TRUNK_GPU", "1"}, {"COLI_PLACE", lm_place} };
+            got[0] = 0;
+            if (lm_ok)
+                nset += coli_platform_defaults_apply_group(q38_lmhead, (int)(sizeof q38_lmhead / sizeof q38_lmhead[0]),
+                                                           got, sizeof got);
+            nset += coli_platform_defaults_apply(q38_sycl, (int)(sizeof q38_sycl / sizeof q38_sycl[0]), rest, sizeof rest);
+            if (i8got[0]) { size_t l = strlen(got); snprintf(got + l, sizeof got - l, "%s%s", l ? " " : "", i8got); }
+            if (rest[0]) { size_t l = strlen(got); snprintf(got + l, sizeof got - l, "%s%s", l ? " " : "", rest); }
+            if (nset)
+                fprintf(stderr, "[qwen38] SYCL defaults for the switches left unset (the qualified hybrid with the accepted "
+                                "kernels, measured on these cards; COLI_PLATFORM_DEFAULTS=0 keeps the code's own): %s\n", got);
+        }
+    }
+#endif
     if (serve_mode) {   /* KV_SLOTS: how many conversations the serve decodes at once */
         const char *ks=getenv("KV_SLOTS");
         if (ks && *ks) {
@@ -3824,6 +3919,12 @@ int main(int argc, char **argv) {
 #endif
     {   /* the trunk's int8 rows interleaved for the CPU, when no device reads them as rows */
         int dev=qt_ready();
+        /* Q38_ILV16_TIER=1: the CUDA tier holding only routed experts (Q38_TRUNK_GPU=0, no chain)
+         * reads no trunk row, so the CPU's trunk takes the 16-row layout as a CPU-only run does
+         * (the same int32 sums and the same final scaling: the CPU reference was made this way) */
+#ifdef COLI_CUDA
+        if(dev&&q38_ilv16_tier_on()&&!g_cuda_chain&&!q38_trunk_any_on_device())dev=0;
+#endif
 #ifdef COLI_VULKAN
         dev=dev||g_vk_ready;
 #endif
@@ -3839,6 +3940,7 @@ int main(int argc, char **argv) {
             q38_model_free(&m); rt_destroy(); return 1; }
         coli_rt_term_arm();   /* SIGTERM must reach the save below (#1629) */
         serve_loop(&m);
+        if(q38_tier_report_on()){qt_stats();qt_split_report("end");}
         rt_save(g_q38_usage, 0);
         q38_vocab_save(&m);
         q38_prefix_cache_release(&m);

@@ -108,6 +108,11 @@ typedef void           (*fn_host_unregister)(void *p);
 typedef int            (*fn_planar_rows)(int device, int D, int I);
 typedef int            (*fn_block_elems)(int fmt);
 typedef int            (*fn_tensor_upload_at)(ColiCudaTensor **tensor, void *dev, size_t cap, const void *weights, int fmt, int I, int O, int device);
+typedef void *         (*fn_host_alloc)(int device, size_t bytes);
+typedef void           (*fn_host_free)(int device, void *p);
+typedef int            (*fn_slot_fill_s4)(int device, void *dev_w, const void *w, size_t nw, float *dev_s, const float *s, size_t ns);
+typedef int            (*fn_tensor_at_g)(ColiCudaTensor **tensor, void *dev_w, float *dev_s, int I, int O, int device, int gs);
+typedef int            (*fn_tensor_at_f8)(ColiCudaTensor **tensor, void *dev_w, float *dev_s, int I, int O, int device);
 typedef const ColiCudaChainOps *(*fn_chain_ops)(void);
 typedef const CuTierOps *(*fn_tier_ops)(void);
 typedef int            (*fn_e8_set_grid)(const void *grid);
@@ -116,6 +121,9 @@ typedef int            (*fn_vision_attention)(int device, float *out, const floa
 typedef int            (*fn_matmul)(ColiCudaTensor **tensor, float *y, const float *x,
                                     const void *weights, const float *scales,
                                     int fmt, int S, int I, int O, int device, int gs);
+typedef int            (*fn_matmul_i8act)(ColiCudaTensor *tensor, float *y, const signed char *xq,
+                                         const float *sx, int S, int I, int O);
+typedef int            (*fn_tuned_default)(const char *knob, int generic);
 typedef int            (*fn_matmul_mxfp4)(float *y, const float *x, const unsigned char *q4,
                                           const unsigned char *e8s, int S, int I, int O);
 typedef int (*fn_expert_mxfp4)(float *y, const float *x,
@@ -201,6 +209,9 @@ static struct {
     fn_host_register host_register; fn_host_unregister host_unregister; fn_planar_rows planar_rows;   /* optional: the tier's RAM staged for a prompt chunk */
     fn_block_elems block_elems;   /* optional: a GGUF's block formats on the device */
     fn_tensor_upload_at tensor_upload_at;   /* optional: a block-format tensor in an arena's slot */
+    fn_slot_fill_s4 slot_fill_s4; fn_tensor_at_g tensor_at_g;   /* optional: a native int4 expert in an arena's slot */
+    fn_tensor_at_f8 tensor_at_f8;   /* optional: an fp8 expert's matrix over an arena's slot */
+    fn_host_alloc host_alloc; fn_host_free host_free;           /* optional: page-locked staging for the tier's uploads */
     fn_chain_ops chain_ops;                 /* optional: the dense chain (cuda_chain.h); NULL = none */
     fn_tier_ops tier_ops;                   /* optional: the routed-expert tier (cu_tier_ops.h); NULL = none */
     fn_e8_set_grid     e8_set_grid;
@@ -208,6 +219,8 @@ static struct {
     fn_matmul          matmul;
     fn_matmul_mxfp4    matmul_mxfp4;
     fn_vision_attention vision_attention;
+    fn_matmul_i8act    matmul_i8act;
+    fn_tuned_default   tuned_default;
     fn_expert_mxfp4    expert_mxfp4;
     fn_tensor_free     tensor_free;
     fn_tensor_bytes    tensor_bytes;
@@ -1466,6 +1479,11 @@ static int coli_cuda_load(void){
     RESOLVE_OPT(planar_rows, fn_planar_rows)
     RESOLVE_OPT(block_elems, fn_block_elems)
     RESOLVE_OPT(tensor_upload_at, fn_tensor_upload_at)
+    RESOLVE_OPT(slot_fill_s4, fn_slot_fill_s4)
+    RESOLVE_OPT(host_alloc, fn_host_alloc)
+    RESOLVE_OPT(host_free, fn_host_free)
+    RESOLVE_OPT(tensor_at_g, fn_tensor_at_g)
+    RESOLVE_OPT(tensor_at_f8, fn_tensor_at_f8)
     RESOLVE_OPT(chain_ops, fn_chain_ops)
     RESOLVE_OPT(tier_ops, fn_tier_ops)
     RESOLVE_OPT(e8_set_grid, fn_e8_set_grid)
@@ -1476,6 +1494,10 @@ static int coli_cuda_load(void){
      * to CPU" result, so an older DLL still serves GLM and Qwen3.6 (#1405). */
     RESOLVE_OPT(matmul_mxfp4,   fn_matmul_mxfp4)
     RESOLVE_OPT(vision_attention, fn_vision_attention)
+    /* Qwen3.8's exact int8 trunk product. Optional: an older DLL lacks it and the engine keeps the CPU path. */
+    RESOLVE_OPT(matmul_i8act,   fn_matmul_i8act)
+    /* A platform's measured defaults. Optional: an older DLL lacks it and every switch keeps the code's default. */
+    RESOLVE_OPT(tuned_default,  fn_tuned_default)
     RESOLVE_OPT(expert_mxfp4,   fn_expert_mxfp4)
     RESOLVE_OPT(available_device_count, fn_available_device_count)   /* older DLLs still support explicit device selection */
     RESOLVE(tensor_free,    fn_tensor_free)
@@ -1713,6 +1735,21 @@ int coli_cuda_planar_rows(int device, int D, int I){
 int coli_cuda_tensor_upload_at(ColiCudaTensor **tensor, void *dev, size_t cap, const void *weights, int fmt, int I, int O, int device){
     return g_cuda.available && g_cuda.tensor_upload_at ? g_cuda.tensor_upload_at(tensor, dev, cap, weights, fmt, I, O, device) : 0;
 }
+void *coli_cuda_host_alloc(int device, size_t bytes){
+    return g_cuda.available && g_cuda.host_alloc ? g_cuda.host_alloc(device, bytes) : NULL;
+}
+void coli_cuda_host_free(int device, void *p){
+    if(g_cuda.available && g_cuda.host_free) g_cuda.host_free(device, p);
+}
+int coli_cuda_slot_fill_s4(int device, void *dev_w, const void *w, size_t nw, float *dev_s, const float *s, size_t ns){
+    return g_cuda.available && g_cuda.slot_fill_s4 ? g_cuda.slot_fill_s4(device, dev_w, w, nw, dev_s, s, ns) : 0;
+}
+int coli_cuda_tensor_at_g(ColiCudaTensor **tensor, void *dev_w, float *dev_s, int I, int O, int device, int gs){
+    return g_cuda.available && g_cuda.tensor_at_g ? g_cuda.tensor_at_g(tensor, dev_w, dev_s, I, O, device, gs) : 0;
+}
+int coli_cuda_tensor_at_f8(ColiCudaTensor **tensor, void *dev_w, float *dev_s, int I, int O, int device){
+    return g_cuda.available && g_cuda.tensor_at_f8 ? g_cuda.tensor_at_f8(tensor, dev_w, dev_s, I, O, device) : 0;
+}
 int coli_cuda_block_elems(int fmt){
     if(!coli_cuda_load()) return 0;   /* asked before any device: the engine decides where a GGUF runs */
     return g_cuda.block_elems ? g_cuda.block_elems(fmt) : 0;   /* older DLL: no block formats */
@@ -1742,6 +1779,17 @@ int coli_cuda_matmul(ColiCudaTensor **tensor, float *y, const float *x,
                      int fmt, int S, int I, int O, int device, int gs){
     if(!g_cuda.available) return 0;
     return g_cuda.matmul(tensor, y, x, weights, scales, fmt, S, I, O, device, gs);
+}
+
+int coli_cuda_matmul_i8act(ColiCudaTensor *tensor, float *y, const signed char *xq, const float *sx,
+                           int S, int I, int O){
+    if(!g_cuda.available || !g_cuda.matmul_i8act) return 0;   /* 0 = the CPU path */
+    return g_cuda.matmul_i8act(tensor, y, xq, sx, S, I, O);
+}
+
+int coli_cuda_tuned_default(const char *knob, int generic){
+    if(!g_cuda.available || !g_cuda.tuned_default) return generic;   /* no table: the code's own default */
+    return g_cuda.tuned_default(knob, generic);
 }
 
 int coli_cuda_vision_attention(int device, float *out, const float *qkv, int n, int heads, int D, float scale){

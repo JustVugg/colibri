@@ -142,6 +142,31 @@ int main(void) {
         CHECK(qdf_find(&m.dense_file, specs[i].name, I, O, &wq, &wsc) &&
               ((const unsigned char *)wq - m.dense_file.base) % 16384 == 0 && ((uintptr_t)wsc % 4) == 0,
               "matrix %d misaligned", i);
+        /* QWEN_DENSE_CACHE_VERIFY's comparison: equal for the conversion, and one changed
+         * row byte, one changed scale, another shape or an unknown name are all seen */
+        CHECK(qwen_dense_same(&m, specs[i].name, I, O, &want), "matrix %d: the conversion is not the file's", i);
+        want.q[(size_t)I * O - 1] ^= 1;
+        CHECK(!qwen_dense_same(&m, specs[i].name, I, O, &want), "matrix %d: a changed row byte is not seen", i);
+        want.q[(size_t)I * O - 1] ^= 1;
+        want.sc[O - 1] *= 1.0000002f;
+        CHECK(!qwen_dense_same(&m, specs[i].name, I, O, &want), "matrix %d: a changed scale is not seen", i);
+        want.sc[O - 1] = got.sc[O - 1];
+        CHECK(qwen_dense_same(&m, specs[i].name, I, O, &want), "matrix %d: not equal again after the scale is put back", i);
+        CHECK(!qwen_dense_same(&m, specs[i].name, I + 1, O, &want), "matrix %d: another shape compares equal", i);
+        CHECK(!qwen_dense_same(&m, "model.layers.9.mlp.gate.weight", I, O, &got), "matrix %d: an unknown name compares equal", i);
+        /* COLI_CUDA_DENSE_CACHE's copy: the same bytes as the one memcpy, and the file's pages
+         * readable again after they were given back */
+        g_dense_release = 1;
+        QW rel; memset(&rel, 0, sizeof rel);
+        CHECK(qwen_dense_read(&m, specs[i].name, I, O, &rel) && !memcmp(rel.q, got.q, (size_t)I * O) &&
+              !memcmp(rel.sc, got.sc, (size_t)O * 4), "matrix %d: the copy with release differs", i);
+        CHECK(qwen_dense_same(&m, specs[i].name, I, O, &rel), "matrix %d: the file differs after its pages were given back", i);
+        g_dense_release = 0;
+        /* several blocks, none a whole number of pages: every byte copied once */
+        memset(rel.q, 0x55, (size_t)I * O);
+        qwen_dense_copy_release(rel.q, wq, (size_t)I * O, 1000);
+        CHECK(!memcmp(rel.q, got.q, (size_t)I * O), "matrix %d: the copy in blocks of 1000 bytes differs", i);
+        qw_free(&rel);
         qw_free(&got); qw_free(&want);
     }
     const int8_t *wq; const float *wsc;

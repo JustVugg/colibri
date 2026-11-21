@@ -76,6 +76,8 @@ static struct {
     int *fill_order; int fill_cur;        /* warmstart order (heat desc) */
     uint8_t *off;                         /* layers without experts (qt_layer_off): never planned */
     int issue_open;                       /* guard: no tensor_free while a group is in flight */
+    int pg_open;                          /* prompt groups in flight (qt_prefill_group): no tensor_free either */
+    uint8_t pg_dev_open[QT_MAX_DEV];      /* ... at most one a card, several cards at once */
     pthread_cond_t cv_take;               /* signals qt_take done + queue space */
     uint64_t tick, swaps, inplace, pf_hits, pf_notes;
     uint32_t *heat0;                      /* heat table loaded from HEAT_FILE */
@@ -152,7 +154,82 @@ static size_t *G_gmb, *G_gmbd;          /* a gate (or up) matrix's bytes and a d
  * neither. Off when the backend lacks coli_cuda_tensor_upload_at or the arena is refused. */
 static void *G_arena[QT_MAX_DEV];
 static int *G_afree[QT_MAX_DEV], G_anfree[QT_MAX_DEV], G_aslots[QT_MAX_DEV], G_arena_on;
+static int G_slots_lost;   /* slots a refused promotion batch left out of use (qt_chain_promote_done, ok -1) */
 static size_t G_aslot, G_aoff_u, G_aoff_d;
+/* The native int4 format with grouped scales in the same arena (COLI_CUDA_EXPERT_ARENA=1; off by default):
+ * a slot holds an expert's three matrices back to back, as the staging has them, and their scales from
+ * G_aoff_s. One copy for the weights and one for the scales where an upload a matrix made two device
+ * allocations and two waited copies each (coli_cuda_slot_fill_s4, coli_cuda_tensor_at_g). */
+static int G_nat_arena;
+static size_t G_aoff_s;
+/* The fp8-e4m3 experts (Qwen3.8; always copy mode) in the same arena, under the same switch. A slot is the
+ * staging's own layout: gate | up | down, a byte an element, then the three block-scale tables (gate, up,
+ * down) from G_aoff_s. An expert goes up as ONE copy of its slot (coli_cuda_pipe_upload) and three views
+ * over it (coli_cuda_tensor_at_f8), where three uploads made six device allocations and six waited copies;
+ * a swap refills the victim's slot. The staging is one block of a slot's layout, from the page-locked pool
+ * at 2 (swaps too: copy mode stages every expert in enqueue_locked) or one malloc. */
+static int qt_f8_slotted(void){ return G_nat_arena && G.wfmt==8; }
+/* COLI_CUDA_EXPERT_ARENA=2: the warm start's staging in page-locked host memory as well, and outside the lock.
+ * A pool of QT_STG_N buffers of a slot's layout a device (coli_cuda_host_alloc: host USM in that device's context),
+ * so the copy to the card is the device's own: from pageable memory it passed through a copy on the uploader's
+ * thread, about 7 GB/s whatever the size of a call. An expert stages in the pool of its home device (home2): each
+ * card has a context of its own, and a pool is page-locked for its own card. And enqueue_staged repacks an expert
+ * with G.mx released, where enqueue_locked stages one expert at a time under it (more loader threads then only
+ * added contention: 3.9 s with 16, 7.6 s with 32, 12.0 s with 64 on a Max 1100). A buffer its pool cannot give,
+ * and every swap without one, stage as before. (Until 2026-11-19 one pool for one device only: with two cards
+ * every upload staged in pageable memory under the lock, campaign pair1.) */
+#define QT_STG_N (QT_QCAP + 1 + 64)
+static uint8_t *G_stg[QT_MAX_DEV];
+static size_t G_stg_sz[QT_MAX_DEV];     /* a pool's buffer size (G_aslot when it was made: a later tier may differ) */
+static int G_stg_free[QT_MAX_DEV][QT_STG_N], G_stg_nfree[QT_MAX_DEV], G_stg_dev[QT_MAX_DEV], G_stg_want;
+static int G_stg_closing[QT_MAX_DEV];   /* qt_stg_down found buffers out: the pool is kept, none handed out */
+static unsigned long long G_stg_used;   /* experts staged through the pools (tests, the summary) */
+static pthread_mutex_t G_stg_mx = PTHREAD_MUTEX_INITIALIZER;
+static int qt_stg_any(void){ for(int i=0;i<QT_MAX_DEV;i++) if(G_stg[i]) return 1; return 0; }
+/* the pool a buffer is from, -1 none (G_stg_mx held where the pools may change) */
+static int qt_stg_owner(const void *w){
+    for(int i=0;i<QT_MAX_DEV;i++)
+        if(G_stg[i] && (const uint8_t *)w >= G_stg[i] && (const uint8_t *)w < G_stg[i] + (size_t)QT_STG_N*G_stg_sz[i]) return i;
+    return -1;
+}
+static int qt_stg_owns(const void *w){ return qt_stg_owner(w) >= 0; }
+/* a buffer from home device hd's pool; NULL when it has none, is closing or has every buffer out */
+static uint8_t *qt_stg_take(int hd){
+    uint8_t *b=NULL;
+    if(hd<0||hd>=QT_MAX_DEV) return NULL;
+    pthread_mutex_lock(&G_stg_mx);
+    if(G_stg[hd] && !G_stg_closing[hd] && G_stg_nfree[hd]>0){
+        b=G_stg[hd] + (size_t)G_stg_free[hd][--G_stg_nfree[hd]]*G_stg_sz[hd]; G_stg_used++;
+    }
+    pthread_mutex_unlock(&G_stg_mx);
+    return b;
+}
+/* an expert's staging back: a pool's buffer to its pool (its scales are inside it), malloc's to free */
+static void qt_stg_release(uint8_t *w, float *sc){
+    pthread_mutex_lock(&G_stg_mx);
+    const int o=qt_stg_owner(w);
+    if(o>=0) G_stg_free[o][G_stg_nfree[o]++]=(int)((size_t)(w - G_stg[o])/G_stg_sz[o]);
+    pthread_mutex_unlock(&G_stg_mx);
+    if(o>=0) return;
+    if(qt_f8_slotted()) free(w);   /* one block of a slot's layout: the scales are inside it */
+    else { free(w); free(sc); }
+}
+/* the pools back to their devices -- each unless a buffer of it is still out. qt_shutdown first waits for the
+ * threads staging an expert outside the tier's lock (enqueue_staged counts them in G.waiters), so a buffer still
+ * out then is one nobody is writing; its pool is kept all the same: no buffer is handed out from it from now on,
+ * a release still lands in it, the devices stay open for it (qt_shutdown), and the next qt_init or the process's
+ * exit returns it. */
+static void qt_stg_down(void){
+    pthread_mutex_lock(&G_stg_mx);
+    for(int i=0;i<QT_MAX_DEV;i++){
+        if(G_stg[i] && G_stg_nfree[i]<QT_STG_N) G_stg_closing[i]=1;
+        else {
+            if(G_stg[i]) coli_cuda_host_free(G_stg_dev[i], G_stg[i]);
+            G_stg[i]=NULL; G_stg_nfree[i]=0; G_stg_dev[i]=-1; G_stg_closing[i]=0;
+        }
+    }
+    pthread_mutex_unlock(&G_stg_mx);
+}
 static size_t qt_pad256(size_t b){ return (b + 255) / 256 * 256; }
 /* Exact slots (qt_gguf_exact_slots, one device): each expert in the room of its own layer's
  * matrices (G_lsl bytes, up and down at G_lou and G_lod), carved from one allocation of the
@@ -362,9 +439,9 @@ static void *uploader(void *arg){
         }
         if(ve>=0){
             /* LFRU swap: touch the victim only when no group and no chain forward is in flight */
-            while((G.issue_open||G.chain_hold) && !G.th_stop) wait_take_locked();
+            while((G.issue_open||G.pg_open||G.chain_hold) && !G.th_stop) wait_take_locked();
             QSlot *v=qs(vl,ve);
-            if(G.th_stop && (G.issue_open||G.chain_hold)){
+            if(G.th_stop && (G.issue_open||G.pg_open||G.chain_hold)){
                 /* Shutting down with a group still open: qt_take() -- the only
                  * thing that clears issue_open -- will never come. Abandon
                  * this swap instead of freeing a victim tensor the in-flight
@@ -375,7 +452,7 @@ static void *uploader(void *arg){
                 res_set(v,1); qs(layer,eid)->queued=0; G.inflight--;
                 if(aslot>=0) v->aslot=aslot+1;   /* the victim keeps its slot */
                 pthread_cond_broadcast(&G.cv_take);
-                pthread_mutex_unlock(&G.mx); free(w); free(sc); continue;
+                pthread_mutex_unlock(&G.mx); qt_stg_release(w,sc); continue;
             }
             ColiCudaTensor *a=v->tg,*b=v->tu,*ct=v->td;
             v->tg=v->tu=v->td=NULL;
@@ -388,6 +465,9 @@ static void *uploader(void *arg){
              * backend without the entry point, or a failure half-way, falls
              * back to the old free-then-upload. */
             int same=G.wfmt!=QT_GGUF || (G_gtg[vl]==G_gtg[layer] && G_gtd[vl]==G_gtd[layer]);   /* a GGUF's layers differ: the arena re-uploads */
+            /* the fp8 arena: the victim's tensors are views that own no device memory, so there is nothing
+             * to overwrite through them; they are dropped and its slot (aslot, taken above) refilled below */
+            if(qt_f8_slotted() && G_arena_on) same=0;
             if(a&&b&&ct && same && coli_cuda_tensor_overwrite(a,w,sg) && coli_cuda_tensor_overwrite(b,w+mb,su)
                         && coli_cuda_tensor_overwrite(ct,w+2*mb,sd)){
                 tg=a; tu=b; td=ct; ok=1; inplace=1;
@@ -419,6 +499,16 @@ static void *uploader(void *arg){
                 ok = coli_cuda_tensor_upload(&tg, w,      NULL, 100+G_gtg[layer], G.D,  G.Ih, dv)
                   && coli_cuda_tensor_upload(&tu, w+mb,   NULL, 100+G_gtg[layer], G.D,  G.Ih, dv)
                   && coli_cuda_tensor_upload(&td, w+2*mb, NULL, 100+G_gtd[layer], G.Ih, G.D,  dv);
+            } else if(G.wfmt==8 && G_nat_arena && G_arena_on){
+                /* the fp8 expert into its slot in ONE copy: the staging is the slot's layout (enqueue_locked),
+                 * page-locked at COLI_CUDA_EXPERT_ARENA=2; then a view a matrix, no device allocation */
+                char *b=(char *)G_arena[home2(layer,eid)] + (size_t)(aslot<0?0:aslot)*G_aslot;
+                float *bs=(float *)(b + G_aoff_s);
+                ok = aslot>=0 && (const uint8_t *)sc==w+G_aoff_s
+                  && coli_cuda_pipe_upload(dv, b, w, G_aslot)
+                  && coli_cuda_tensor_at_f8(&tg, b,      bs,             G.D,  G.Ih, dv)
+                  && coli_cuda_tensor_at_f8(&tu, b+mb,   bs+G.sc_gu,     G.D,  G.Ih, dv)
+                  && coli_cuda_tensor_at_f8(&td, b+2*mb, bs+2*G.sc_gu,   G.Ih, G.D,  dv);
             } else if(G.wfmt==8){
                 /* e4m3 bytes as they came from the checkpoint, block scales
                  * [ceil(O/128), ceil(I/128)] per matrix -- the layout #817's
@@ -432,6 +522,15 @@ static void *uploader(void *arg){
                 ok = coli_cuda_tensor_upload(&tg, w,      sg, 1, G.D,  G.Ih, dv)
                   && coli_cuda_tensor_upload(&tu, w+mb,   su, 1, G.D,  G.Ih, dv)
                   && coli_cuda_tensor_upload(&td, w+2*mb, sd, 1, G.Ih, G.D,  dv);
+            } else if(G.egs && G_nat_arena && G_arena_on){
+                /* the expert into its slot: the three matrices in one copy, the scales in one more, one wait */
+                char *b=(char *)G_arena[home2(layer,eid)] + (size_t)(aslot<0?0:aslot)*G_aslot;
+                float *bs=(float *)(b + G_aoff_s);
+                ok = aslot>=0
+                  && coli_cuda_slot_fill_s4(dv, b, w, 3*mb, bs, sc, 2*G.sc_gu + G.sc_d)
+                  && coli_cuda_tensor_at_g(&tg, b,      bs,             G.D,  G.Ih, dv, G.egs)
+                  && coli_cuda_tensor_at_g(&tu, b+mb,   bs+G.sc_gu,     G.D,  G.Ih, dv, G.egs)
+                  && coli_cuda_tensor_at_g(&td, b+2*mb, bs+2*G.sc_gu,   G.Ih, G.D,  dv, G.egs);
             } else if(G.egs){
                 ok = coli_cuda_tensor_upload_g(&tg, w,      sg, 4, G.D,  G.Ih, dv, G.egs)
                   && coli_cuda_tensor_upload_g(&tu, w+mb,   su, 4, G.D,  G.Ih, dv, G.egs)
@@ -442,7 +541,7 @@ static void *uploader(void *arg){
                   && coli_cuda_tensor_upload(&td, w+2*mb, sd, 2, G.Ih, G.D,  dv);
             }
         }
-        free(w); free(sc);
+        qt_stg_release(w,sc);
         if(!ok){
             if(tg) coli_cuda_tensor_free(tg);
             if(tu) coli_cuda_tensor_free(tu);
@@ -722,6 +821,7 @@ void qt_experts_withdraw(const char *why){
         G_arena[i] = NULL; free(G_afree[i]); G_afree[i] = NULL; G_aslots[i] = G_anfree[i] = 0;
     }
     G_arena_on = 0;
+    qt_stg_down();
     fprintf(stderr,"[qtier] the experts stay on the CPU too (%s; CUDA_EXPERT_GB=<GB> keeps them on the device)\n",
             why ? why : "withdrawn");
 }
@@ -831,11 +931,19 @@ static int qt_arena_up(void){
         }
         for(size_t k=0;k<n;k++) G_afree[i][k]=(int)(n-1-k);
         G_anfree[i]=(int)n;
-        fprintf(stderr,"[qtier] dev %d: the GGUF experts' arena, %zu slots of %.2f MB (%.2f GB)\n",
-                G.dev[i], n, G_aslot/1048576.0, n*G_aslot/1073741824.0);
+        fprintf(stderr,"[qtier] dev %d: the %s experts' arena, %zu slots of %.2f MB (%.2f GB)\n",
+                G.dev[i], G_nat_arena ? (G.wfmt==8 ? "fp8" : "int4") : "GGUF", n, G_aslot/1048576.0, n*G_aslot/1073741824.0);
     }
     G_arena_on=1;
     return 1;
+}
+/* the arenas back to their devices, when nothing resident points into them (qt_init's refusals) */
+static void qt_arena_down(void){
+    for(int i=0;i<QT_MAX_DEV;i++){
+        if(G_arena[i]) coli_cuda_pipe_free(G.dev[i],G_arena[i]);
+        G_arena[i]=NULL; free(G_afree[i]); G_afree[i]=NULL; G_aslots[i]=G_anfree[i]=0;
+    }
+    G_arena_on=0;
 }
 int qt_init_gguf(int nl, int ne, int D, int Ih, int cap, int topk, const int *tg, const int *td,
                  const size_t *gu_bytes, const size_t *d_bytes, int copy){
@@ -977,6 +1085,42 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
     G.exp_bytes = 3*dev_alloc_footprint(mat_bytes)
                 + 2*dev_alloc_footprint(G.sc_gu*sizeof(float))
                 + dev_alloc_footprint(G.sc_d*sizeof(float));
+    G_nat_arena = 0;
+    {   /* the native int4 format's arena: matrices of whole 256 bytes and scale blocks of whole 64 lie in a
+         * slot at the offsets the device allocator gave them one by one */
+        const int int4_ok = G.wfmt==4 && G.egs>0 && !G_trunk_only && mat_bytes%256==0 && (G.sc_gu*sizeof(float))%64==0;
+        const char *ae = getenv("COLI_CUDA_EXPERT_ARENA");
+        char ae_t[2] = {0, 0};
+        if(int4_ok && !(ae && *ae)){   /* unset: the platform's measured default (2 on Data Center GPU Max cards), for
+                                        * the native int4 experts only: qwen38's FP8 tier takes it from qwen38's table */
+            const int t = coli_cuda_tuned_default("COLI_CUDA_EXPERT_ARENA", 0);
+            if(t == 1 || t == 2){ ae_t[0] = (char)('0' + t); ae = ae_t; }
+        }
+        G_stg_want = 0; G_stg_used = 0; G_slots_lost = 0;
+        if(int4_ok && ae && (*ae=='1' || *ae=='2')){
+            G_stg_want = *ae=='2';
+            G_aoff_s = qt_pad256(3*mat_bytes);
+            G_aslot = G_aoff_s + qt_pad256((2*G.sc_gu + G.sc_d)*sizeof(float));
+            G_arena_on = 0; G_exact = 0;
+            G_nat_arena = 1;
+            G.exp_bytes = G_aslot;
+        }
+    }
+    if(G.wfmt==8 && !G_trunk_only){
+        /* the fp8 experts' arena (qt_f8_slotted): matrices of whole 256 bytes, so each starts in its slot
+         * aligned as an allocation of its own would be for the kernels' loads; the scales are read a float
+         * at a time. 2560 x 640: 3 x 1 638 400 + 1 200 bytes of scales, padded to 4 916 480. */
+        const char *ae = getenv("COLI_CUDA_EXPERT_ARENA");
+        const size_t nsb = (2*G.sc_gu + G.sc_d)*sizeof(float);
+        if(ae && (*ae=='1' || *ae=='2') && mat_bytes && mat_bytes%256==0 && nsb){
+            G_stg_want = *ae=='2';
+            G_aoff_s = qt_pad256(3*mat_bytes);
+            G_aslot = G_aoff_s + qt_pad256(nsb);
+            G_arena_on = 0; G_exact = 0;
+            G_nat_arena = 1;
+            G.exp_bytes = G_aslot;
+        }
+    }
     if(G.wfmt==QT_GGUF){   /* the biggest layer's (a slot takes any layer's expert); padded rows, no scales */
         G.exp_bytes = 0; size_t mg=0, md=0;
         for(int l=0;l<nl;l++){
@@ -1219,6 +1363,48 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
                 G.dev[i], G.budget[i]/1073741824.0, G.budget[i]/per,
                 trunk ? " after trunk" : "");
     }
+    if(G_nat_arena && (G_trunk_only || !qt_arena_up())){
+        /* no arena: an expert costs what its six device allocations take, as before */
+        G_nat_arena = 0;
+        G.exp_bytes = 3*dev_alloc_footprint(mat_bytes) + 2*dev_alloc_footprint(G.sc_gu*sizeof(float))
+                    + dev_alloc_footprint(G.sc_d*sizeof(float));
+        if(!G_trunk_only) fprintf(stderr,"[qtier] the experts' arena was refused: a device allocation an expert matrix (%.2f MB an expert)\n",
+                                  G.exp_bytes/1048576.0);
+    }
+    if(G_nat_arena && G_arena_on && G.wfmt==8){
+        /* the fp8 slot needs the backend's view of a matrix in memory it does not own: asked once, over the
+         * first slot, before anything is staged for it. 0 from a backend without the entry point, or for an
+         * arena that is not word-aligned: no arena then, and an expert is three uploads as without the switch */
+        int di=-1; for(int i=0;i<G.ndev;i++) if(G_arena[i]){ di=i; break; }
+        ColiCudaTensor *pv=NULL;
+        if(di>=0 && !coli_cuda_tensor_at_f8(&pv, G_arena[di], (float *)((char *)G_arena[di]+G_aoff_s), G.D, G.Ih, G.dev[di])){
+            qt_arena_down();
+            G_nat_arena = 0;
+            G.exp_bytes = 3*dev_alloc_footprint(mat_bytes) + 2*dev_alloc_footprint(G.sc_gu*sizeof(float))
+                        + dev_alloc_footprint(G.sc_d*sizeof(float));
+            fprintf(stderr,"[qtier] the backend has no fp8 view of an arena's slot: a device allocation an expert matrix (%.2f MB an expert)\n",
+                    G.exp_bytes/1048576.0);
+        }
+        if(pv) coli_cuda_tensor_free(pv);
+    }
+    if(G_nat_arena && G_arena_on && G_stg_want){   /* the page-locked staging pools, one a device */
+        qt_stg_down();   /* an earlier tier's kept pools: returned now where every buffer came back */
+        for(int i=0;i<G.ndev;i++){
+            if(G_stg[i]){
+                fprintf(stderr,"[qtier] dev %d: no page-locked staging: an earlier tier's pool still has buffers out\n",G.dev[i]);
+                continue;
+            }
+            if((G_stg[i]=coli_cuda_host_alloc(G.dev[i], (size_t)QT_STG_N*G_aslot))){
+                for(int k=0;k<QT_STG_N;k++) G_stg_free[i][k]=QT_STG_N-1-k;
+                G_stg_nfree[i]=QT_STG_N; G_stg_dev[i]=G.dev[i]; G_stg_sz[i]=G_aslot;
+                fprintf(stderr,"[qtier] dev %d: page-locked staging for the experts' uploads, %d buffers (%.0f MiB); %s\n",
+                        G.dev[i], QT_STG_N, (double)QT_STG_N*G_aslot/1048576.0,
+                        G.wfmt==8 ? "an fp8 expert is copied into one as it passes and goes to the card in one copy"
+                                  : "an expert is repacked outside the lock");
+            } else fprintf(stderr,"[qtier] dev %d: no page-locked staging (the device refused it): its experts' uploads stage in pageable memory, under the lock\n",
+                           G.dev[i]);
+        }
+    }
     if(G.wfmt==QT_GGUF && G.exp_bytes==G_aslot && !G_trunk_only && !qt_arena_up()){
         /* no arena: an expert costs what three cudaMallocs take */
         G.exp_bytes=0;
@@ -1233,6 +1419,7 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
      * row count), not 8*D: a device other than 0 with a full 32-row issue
      * used to run past its own slice and off the end of this allocation
      * (#1339). The stride and G.is_k's row capacity are the same constant. */
+    { const char *fl=getenv("QT_FAIL_INIT_LATE"); if(fl && *fl=='1') goto fail_storage; }   /* tests: a refusal after the arena and the pool */
     G.is_x_floats=(size_t)G.ndev*QT_MAX_ROWS*D;
     G.is_x=malloc(G.is_x_floats*sizeof(float));
     if(!G.is_x) goto fail_storage;
@@ -1267,6 +1454,10 @@ fail_storage:
     free(G.heat0); G.heat0=NULL;
     free(G.slot); G.slot=NULL;
     G_lmh.dev_ok=0;
+    /* the arenas and the staging pool this call made: nothing resident points into them yet; without this
+     * they stayed allocated and G_arena_on stayed set for whatever ran next */
+    qt_arena_down(); G_nat_arena=0;
+    qt_stg_down();
     /* CUDA contexts may also serve standalone dense projections. */
     return 0;
 }
@@ -1362,6 +1553,12 @@ int qt_dense_matmul_batch(int h, float *y, const float *x, int S, int I, int O){
     fprintf(stderr,"[dense] handle %d GPU matmul failed; CPU from here on\n", h);
     G_dense[h].on = 0;
     return 0;
+}
+/* Qwen3.8's Q38_TRUNK_GPU_I8: a resident int8 matrix (fmt 1) times activations the engine quantized as its CPU path
+ * does (coli_cuda_matmul_i8act): the CPU's bits. 0: not done (not int8, not resident, the backend refused). */
+int qt_dense_matmul_i8act(int h, float *y, const signed char *xq, const float *sx, int S, int I, int O){
+    if(h < 0 || h >= G_dense_n || !G_dense[h].on || G_dense[h].fmt != 1 || S <= 0) return 0;
+    return coli_cuda_matmul_i8act(G_dense[h].t, y, xq, sx, S, I, O);
 }
 int qt_dense_matmul(int h, float *y, const float *x, int I, int O){
     return qt_dense_matmul_batch(h, y, x, 1, I, O);
@@ -1722,6 +1919,11 @@ int qt_chain_promote(int max,QtPromo *out){
             int ci=G.pm[a]; QSlot *cs=&G.slot[ci];
             if(cs->conv<(uint32_t)G_promo_min) continue;       /* a one-off is not worth a swap */
             if(cs->resident||cs->queued||!cs->g4) continue;   /* taken by an earlier entry (a verify routes a slot twice), or landed */
+            /* the victim of a tier swap still in the upload queue: only the newcomer is marked queued, and the victim
+             * keeps its tensors and its slot until the uploader takes them. Promoted now, it would take another
+             * victim's tensors over its own, and the uploader would then write the swap's newcomer into the slot
+             * this expert computes from (the chain's table still pointing there) */
+            if(cs->tg||cs->tu||cs->td||cs->aslot) continue;
             int cl=ci/G.ne, di=home2(cl,ci%G.ne);
             int v=-1, found=0; uint64_t vsc=0;
             for(int t=0;t<1024 && found<64;t++){
@@ -1771,13 +1973,38 @@ void qt_chain_promote_stage(void *dst,const QtPromo *p){
 }
 /* the copy of a pair qt_chain_promote gave landed (ok) or failed: the newcomer takes the
  * victim's tensors and is resident; on a failure the victim's buffers hold neither expert
- * and are left to the tier's exit (nobody's from now on) */
+ * and are left to the tier's exit (nobody's from now on). With the arena the tensors are
+ * views of the victim's slot, so the slot's number goes with them (aslot): the newcomer
+ * owns it from now on, and a later eviction of the newcomer hands that slot on. Before,
+ * the victim kept its number while not resident and the newcomer had none: an eviction of
+ * the newcomer stranded the slot, and a victim promoted again later carried the stale
+ * number into its next eviction, which then wrote a newcomer into a slot another resident
+ * still computes from.
+ * ok: 1 the copy landed; 0 it failed with nothing in flight (refused before a byte went, or settled after the
+ * chain's finish): the victim's slot goes back to the free slots with its budget, so a plain upload refills it;
+ * -1 a refused batch whose earlier copies may still land in the slot: the slot stays out of use with its budget
+ * still counted (G_slots_lost), since nothing may be uploaded where a late copy could overwrite it. */
 void qt_chain_promote_done(int ci,int vi,int ok){
     if(!G.on || ci<0 || vi<0 || (size_t)ci>=(size_t)G.nl*G.ne || (size_t)vi>=(size_t)G.nl*G.ne) return;
     pthread_mutex_lock(&G.mx);
     QSlot *cs=&G.slot[ci], *vs=&G.slot[vi];
-    if(ok){ cs->tg=vs->tg; cs->tu=vs->tu; cs->td=vs->td; vs->tg=vs->tu=vs->td=NULL; res_set(cs,1); G.uploads++; G.inplace++; G.promo_done++; }
-    else  { vs->tg=vs->tu=vs->td=NULL; }
+    if(ok>0){
+        cs->tg=vs->tg; cs->tu=vs->tu; cs->td=vs->td; vs->tg=vs->tu=vs->td=NULL;
+        cs->aslot=vs->aslot; vs->aslot=0;
+        res_set(cs,1); G.uploads++; G.inplace++; G.promo_done++;
+    } else {
+        vs->tg=vs->tu=vs->td=NULL;
+        if(G_arena_on && vs->aslot>0){
+            const int a=vs->aslot-1, vl=vi/G.ne, ve=vi%G.ne, hi=home2(vl,ve);
+            if(ok==0){
+                if(G_exact) qt_slot_give(vl,(size_t)a*256u);
+                else if(G_afree[hi] && G_anfree[hi]<G_aslots[hi]) G_afree[hi][G_anfree[hi]++]=a;
+                const size_t eb=qt_ebytes(vl);
+                G.used[hi] = G.used[hi]>=eb ? G.used[hi]-eb : 0;
+            } else G_slots_lost++;
+        }
+        vs->aslot=0;
+    }
     cs->queued=0; vs->queued=0;
     pthread_cond_broadcast(&G.cv_take);
     pthread_mutex_unlock(&G.mx);
@@ -1973,6 +2200,43 @@ int qt_is_resident(int layer,int eid){
     pthread_mutex_unlock(&G.mx);
     return r;
 }
+/* the device index (0..ndev-1) an expert is resident on now, else -1; a hint (qt_prefill_group checks again) */
+int qt_resident_home(int layer,int eid){
+    if(!G.on || G_chain_own || G_trunk_only || layer<0 || layer>=G.nl || eid<0 || eid>=G.ne) return -1;
+    pthread_mutex_lock(&G.mx);
+    const QSlot *s=qs(layer,eid);
+    int d = s->resident && s->tg ? home2(layer,eid) : -1;
+    pthread_mutex_unlock(&G.mx);
+    return d;
+}
+/* A prompt chunk's resident experts computed on the card (Qwen3.8's Q38_PREFILL_GPU): n experts of `layer` (up to 64,
+ * the backend's group), rows[i] rows each, their inputs in x expert by expert, the outputs into y the same way.
+ * Synchronous, from any thread. Every expert must be resident on one device now, else 0 and nothing is computed (the
+ * caller runs them on the CPU). No heat, hit or tick: a prompt pass does not move the tier. Counted in pg_open while
+ * it runs, so no swap frees a tensor meanwhile; one group a card at a time, the cards at once (Q38_PREFILL_GPU_PERCARD's
+ * workers: until 2026-11-20 a single issue_open refused the second card's group outright); refused while a decode
+ * group is open, or while another prompt group runs on the same card (the backend's buffers are the card's). */
+int qt_prefill_group(int layer,const int *eids,const int *rows,int n,const float *x,float *y){
+    if(!G.on || G_chain_own || G_trunk_only || n<1 || n>64 || layer<0 || layer>=G.nl || !eids || !rows || !x || !y) return 0;
+    ColiCudaTensor *tg[64],*tu[64],*td[64]; int dev=-1;
+    pthread_mutex_lock(&G.mx);
+    if(G.th_stop || G.issue_open || G.chain_hold){ pthread_mutex_unlock(&G.mx); return 0; }   /* nor during a chain frame */
+    for(int i=0;i<n;i++){
+        if(eids[i]<0 || eids[i]>=G.ne || rows[i]<1){ pthread_mutex_unlock(&G.mx); return 0; }
+        const QSlot *s=qs(layer,eids[i]); const int di=home2(layer,eids[i]);
+        if(!s->resident || !s->tg || !s->tu || !s->td || (dev>=0 && di!=dev)){ pthread_mutex_unlock(&G.mx); return 0; }
+        dev=di; tg[i]=s->tg; tu[i]=s->tu; td[i]=s->td;
+    }
+    if(dev<0 || dev>=QT_MAX_DEV || G.pg_dev_open[dev]){ pthread_mutex_unlock(&G.mx); return 0; }   /* that card is busy */
+    G.pg_open++; G.pg_dev_open[dev]=1;
+    pthread_mutex_unlock(&G.mx);
+    const int ok=coli_cuda_expert_group(tg,tu,td,rows,n,y,x);
+    pthread_mutex_lock(&G.mx);
+    G.pg_open--; G.pg_dev_open[dev]=0;
+    pthread_cond_broadcast(&G.cv_take);   /* a swap or a decode group parked on pg_open */
+    pthread_mutex_unlock(&G.mx);
+    return ok;
+}
 
 /* internal, G.mx held: enqueue one upload. victim=-1: plain upload (budget is
  * reserved here); victim>=0: LFRU swap (budget neutral). */
@@ -1988,14 +2252,64 @@ static int enqueue_locked(int layer,int eid,int v_layer,int v_eid,int reserved){
     int hd=home2(layer,eid);
     if(!reserved && v_eid<0 && G.used[hd]+qt_ebytes(layer)>G.budget[hd]) return 0;
     /* staging: three matrices (int8/fp8 a byte an element, a GGUF's the file's rows), their scales */
-    uint8_t *w=malloc(2*qt_mb_gu(layer)+qt_mb_d(layer)); float *sc=malloc((2*G.sc_gu+G.sc_d+1)*sizeof(float));
-    if(!w||!sc){ free(w); free(sc); return 0; }
+    uint8_t *w; float *sc;
+    if(qt_f8_slotted()){
+        /* ONE block of a slot's layout (gate | up | down, the scales from G_aoff_s), which the uploader
+         * hands to the device in one copy: from the page-locked pool at 2, a swap's too; else malloc's */
+        const size_t nsb=(2*G.sc_gu+G.sc_d)*sizeof(float);
+        w=qt_stg_take(hd);
+        if(!w) w=malloc(G_aslot);
+        if(!w) return 0;
+        sc=(float *)(w+G_aoff_s);
+        memset(w+G_aoff_s+nsb,0,G_aslot-G_aoff_s-nsb);   /* the slot's padding goes to the device too */
+    } else {
+        w=malloc(2*qt_mb_gu(layer)+qt_mb_d(layer)); sc=malloc((2*G.sc_gu+G.sc_d+1)*sizeof(float));
+        if(!w||!sc){ free(w); free(sc); return 0; }
+    }
     if(!reserved && v_eid<0) G.used[hd]+=qt_ebytes(layer);
     s->queued=1;
     stage(w,sc,layer,s->g4,s->u4,s->d4,s->gs,s->us,s->ds);
     G.q[G.qt_].layer=layer; G.q[G.qt_].eid=eid; G.q[G.qt_].w=w; G.q[G.qt_].s=sc;
     G.q[G.qt_].v_layer=v_layer; G.q[G.qt_].v_eid=v_eid;
     G.qt_=(G.qt_+1)%QT_QCAP; G.qn++; G.inflight++;
+    pthread_cond_signal(&G.cv);
+    return 1;
+}
+/* enqueue_locked for the warm start's plain uploads with the pool up (COLI_CUDA_EXPERT_ARENA=2): the expert is
+ * admitted and marked under G.mx as there, repacked into a page-locked buffer with G.mx RELEASED, and put in
+ * the queue under it again. G.mx is held on entry and on return. The expert counts as in flight from its
+ * admission, so qt_fill_wait covers the repacking; a shutdown that arrives during it finds nothing enqueued
+ * and the admission undone. 0 as enqueue_locked: not enqueued (the caller returns a reservation it made). */
+static int enqueue_staged(int layer,int eid,int reserved){
+    QSlot *s=qs(layer,eid);
+    if(G.th_stop) return 0;
+    if(s->resident||s->queued||!s->g4) return 0;
+    int hd=home2(layer,eid);
+    if(!reserved && G.used[hd]+qt_ebytes(layer)>G.budget[hd]) return 0;
+    uint8_t *w=qt_stg_take(hd);
+    if(!w) return enqueue_locked(layer,eid,-1,-1,reserved);   /* every buffer is out: the old way for this one */
+    float *sc=(float *)(w+G_aoff_s);
+    if(!reserved) G.used[hd]+=qt_ebytes(layer);
+    s->queued=1; G.inflight++;
+    const uint8_t *g4=s->g4,*u4=s->u4,*d4=s->d4; const float *gs=s->gs,*us=s->us,*ds=s->ds;
+    /* counted with the waiters while the lock is released: qt_shutdown waits for them before it frees G.slot, the
+     * lock and the pool (an exit() from another loader thread runs it while this one repacks) */
+    G.waiters++;
+    pthread_mutex_unlock(&G.mx);
+    stage(w,sc,layer,g4,u4,d4,gs,us,ds);
+    pthread_mutex_lock(&G.mx);
+    if(--G.waiters==0 && G.th_stop) pthread_cond_broadcast(&G.cv_take);
+    while(G.qn>=QT_QCAP && !G.th_stop) wait_take_locked();
+    if(G.th_stop){
+        s->queued=0; G.inflight--;
+        if(!reserved) G.used[hd]-=qt_ebytes(layer);
+        qt_stg_release(w,sc);
+        pthread_cond_broadcast(&G.cv_take);
+        return 0;
+    }
+    G.q[G.qt_].layer=layer; G.q[G.qt_].eid=eid; G.q[G.qt_].w=w; G.q[G.qt_].s=sc;
+    G.q[G.qt_].v_layer=-1; G.q[G.qt_].v_eid=-1;
+    G.qt_=(G.qt_+1)%QT_QCAP; G.qn++;
     pthread_cond_signal(&G.cv);
     return 1;
 }
@@ -2074,10 +2388,27 @@ int qt_note_wanted(int layer,int eid){
     if(G.used[hd]+qt_ebytes(layer)<=G.budget[hd]) return 1;
     return G_cold_heat[hd]!=0xFFFFFFFFu && tier_should_promote(s->heat+1,G_cold_heat[hd]);
 }
+void qt_cold_refresh(void){
+    if(!G.on || !G_stream || G_chain_own) return;
+    pthread_mutex_lock(&G.mx);
+    size_t n=(size_t)G.nl*G.ne;
+    for(int di=0;di<G.ndev;di++) G_cold_heat[di]=0xFFFFFFFFu;
+    for(size_t i=0;i<n;i++){
+        QSlot *s=&G.slot[i]; int di=home2((int)(i/G.ne),(int)(i%G.ne));
+        if(s->resident && !s->queued && s->heat<G_cold_heat[di]) G_cold_heat[di]=s->heat;
+    }
+    pthread_mutex_unlock(&G.mx);
+}
 void qt_note_heat(int layer,int eid){
     if(!G.on || layer<0 || layer>=G.nl || eid<0 || eid>=G.ne) return;
     QSlot *s=qs(layer,eid);
     if(s->heat<0xFFFFFFFFu) __atomic_add_fetch(&s->heat,1u,__ATOMIC_RELAXED);
+}
+/* qt_note_heat for a prompt pass (Qwen3.8's Q38_PREFILL_TIER_NOTE): nothing where the tier holds no experts or the
+ * CUDA chain owns them (the chain keeps its own heat), as qt_note_wanted */
+void qt_note_heat_pass(int layer,int eid){
+    if(!G.on || G_trunk_only || G_chain_own) return;
+    qt_note_heat(layer,eid);
 }
 
 /* blocking variant for the warmstart (waits for queue space). */
@@ -2090,7 +2421,8 @@ void qt_note_block(int layer,int eid,
     if(G_stream) stream_point(s,g4,u4,d4,gs,us,ds);
     else if(!s->g4){ s->g4=g4; s->u4=u4; s->d4=d4; s->gs=gs; s->us=us; s->ds=ds; }
     while(G.qn>=QT_QCAP && !G.th_stop) wait_take_locked();
-    enqueue_locked(layer,eid,-1,-1,0);
+    if(qt_stg_any() && !G_stream) enqueue_staged(layer,eid,0);
+    else enqueue_locked(layer,eid,-1,-1,0);
     if(G_stream) stream_forget(s);
     pthread_mutex_unlock(&G.mx);
 }
@@ -2198,7 +2530,7 @@ void qt_note_planned(int layer,int eid,
     if(G_stream) stream_point(s,g4,u4,d4,gs,us,ds);
     else if(!s->g4){ s->g4=g4; s->u4=u4; s->d4=d4; s->gs=gs; s->us=us; s->ds=ds; }
     while(G.qn>=QT_QCAP && !G.th_stop) wait_take_locked();
-    if(!enqueue_locked(layer,eid,-1,-1,1)){
+    if(!(qt_stg_any() && !G_stream ? enqueue_staged(layer,eid,1) : enqueue_locked(layer,eid,-1,-1,1))){
         /* not enqueueable (e.g. already resident): return the reservation */
         if(s->planned) G.used[home2(layer,eid)]-=qt_ebytes(layer);
     }
@@ -2401,6 +2733,8 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
      * six entries still queued). No group is open here, so the wait cannot
      * meet a swap parked on issue_open. */
     if(G_upload_sync) while(G.inflight>0 && !G.th_stop) wait_take_locked();
+    /* a decode group never overlaps a prompt group (the engine joins its prompt workers first; this keeps it so) */
+    while(G.pg_open>0 && !G.th_stop) wait_take_locked();
     if(G.th_stop){ pthread_mutex_unlock(&G.mx); return 0; }
     if(layer==0) qt_lfru_tick_locked();
     G.issue_open=1;
@@ -2470,6 +2804,41 @@ int qt_take_scaled(uint32_t mask,const float *val,int K,float *out,const float *
     return ok;
 }
 
+int qt_take_rows(uint32_t mask,int K,float *rows,size_t stride){
+    if(!G.on) return mask==0;
+    const float *result[QT_MAX_DEV]={0};
+    uint32_t seen=0;
+    int ok=K>=0&&K<=QT_MAX_ROWS;
+    if(mask && (!rows||K<1||G.D<1||stride<(size_t)G.D||
+                (K>1&&stride>(SIZE_MAX/sizeof(float)-(size_t)G.D)/(size_t)(K-1)))) ok=0;
+    /* Even invalid arguments or mask0 must drain an outstanding group. The
+     * uploader cannot recycle its tensors until every borrowed row is copied. */
+    for(int di=0;di<G.ndev;di++){
+        int n=G.is_cnt[di];
+        if(!n) continue;
+        result[di]=coli_cuda_expert_group_take(G.dev[di]);
+        if(!result[di]) ok=0;
+        if(n<0||n>QT_MAX_ROWS){ok=0;continue;}
+        for(int j=0;j<n;j++){
+            int k=G.is_k[di][j];
+            if(k<0||k>=K||k>=QT_MAX_ROWS){ok=0;continue;}
+            uint32_t bit=1u<<k;
+            if(seen&bit) ok=0;
+            seen|=bit;
+        }
+    }
+    if(seen!=mask) ok=0;
+    if(ok) for(int di=0;di<G.ndev;di++) for(int j=0;j<G.is_cnt[di];j++)
+        memcpy(rows+(size_t)G.is_k[di][j]*stride,result[di]+(size_t)j*G.D,(size_t)G.D*sizeof(float));
+    if(!ok) fprintf(stderr,"[qtier] raw expert collection failed (mask=%08x ranks=%08x K=%d)\n",mask,seen,K);
+    for(int di=0;di<G.ndev;di++) G.is_cnt[di]=0;
+    pthread_mutex_lock(&G.mx);
+    G.issue_open=0;
+    pthread_cond_broadcast(&G.cv_take);
+    pthread_mutex_unlock(&G.mx);
+    return ok;
+}
+
 void qt_stats(void){
     if(!G.on) return;
     uint64_t hits=0; size_t res=0;
@@ -2502,6 +2871,44 @@ void qt_stats(void){
       if(calls) fprintf(stderr,"[qtier] group_stats: %llu calls, %llu experts | h2d %.0f ms, kernel %.0f ms, d2h %.0f ms\n",
               (unsigned long long)calls,(unsigned long long)ex,h2d,kms,d2h); }
 }
+
+/* Where the experts are (qwen38's serve mode calls it after each request and at the end with Q38_TIER_REPORT=1): a
+ * line for the tier, a line a card (its resident experts, its arena's slots and how many are free, the expert runs it
+ * served), and a line a card with its resident experts in each layer. The counts are taken under the tier's lock, so
+ * the residency is one moment's. It only reads. (qt_split_report_to: the same into a given file, for the tests.) */
+static void qt_split_report_to(FILE *f, const char *scope){
+    if(!G.on||!f) return;
+    enum { QT_REP_NL = 128 };
+    size_t res[QT_MAX_DEV]={0}; uint16_t per[QT_MAX_DEV][QT_REP_NL];
+    uint64_t hits[QT_MAX_DEV]={0}, miss, uploads, swaps; int nfree[QT_MAX_DEV]={0}, nslot[QT_MAX_DEV]={0};
+    const int nl=G.nl<QT_REP_NL?G.nl:QT_REP_NL;
+    memset(per,0,sizeof per);
+    pthread_mutex_lock(&G.mx);
+    for(int l=0;l<G.nl;l++) for(int e=0;e<G.ne;e++){
+        if(!qs(l,e)->resident) continue;
+        const int di=home2(l,e);
+        if(di<0||di>=G.ndev) continue;
+        res[di]++; if(l<nl) per[di][l]++;
+    }
+    for(int i=0;i<G.ndev;i++){ hits[i]=G.hits[i]; nfree[i]=G_anfree[i]; nslot[i]=G_aslots[i]; }
+    miss=G.miss; uploads=G.uploads; swaps=G.swaps;
+    pthread_mutex_unlock(&G.mx);
+    size_t all=0; uint64_t hall=0;
+    for(int i=0;i<G.ndev;i++){ all+=res[i]; hall+=hits[i]; }
+    const double eb=(double)(G_arena_on&&G_aslot?G_aslot:G.exp_bytes);
+    fprintf(f,"[qtier] split %s: %zu of %d experts on the cards | expert runs: %llu on the cards, %llu on the CPU "
+              "| uploads %llu | swaps %llu\n", scope?scope:"", all, G.nl*G.ne, (unsigned long long)hall,
+            (unsigned long long)miss, (unsigned long long)uploads, (unsigned long long)swaps);
+    for(int i=0;i<G.ndev;i++){
+        fprintf(f,"[qtier]   dev %d: %zu experts resident (%.2f GB), arena %d slots (%d free), %llu expert runs\n",
+                G.dev[i], res[i], (double)res[i]*eb/1073741824.0, nslot[i], nfree[i], (unsigned long long)hits[i]);
+        char line[1024]; int o=snprintf(line,sizeof line,"[qtier]   dev %d per layer:",G.dev[i]);
+        for(int l=0;l<nl&&o>0&&o<(int)sizeof line-8;l++) o+=snprintf(line+o,sizeof line-(size_t)o," %u",(unsigned)per[i][l]);
+        fprintf(f,"%s\n",line);
+    }
+    fflush(f);
+}
+void qt_split_report(const char *scope){ qt_split_report_to(stderr,scope); }
 
 static void dense_free_all(void){
     dn_gpu_free_all();
@@ -2536,6 +2943,9 @@ void qt_shutdown(void){
     pthread_mutex_lock(&G.mx); G.th_stop=1; pthread_cond_signal(&G.cv); pthread_cond_broadcast(&G.cv_take); pthread_mutex_unlock(&G.mx);
     pthread_join(G.th,NULL);
     pthread_mutex_lock(&G.mx);
+    /* prompt groups still on a card (Q38_PREFILL_GPU's workers, if the process exits during a prompt pass's CPU share):
+     * their tensors stay until they end; none is admitted after th_stop, so this cannot wait forever */
+    while(G.pg_open>0) pthread_cond_wait(&G.cv_take,&G.mx);
     while(G.waiters) pthread_cond_wait(&G.cv_take,&G.mx);
     pthread_mutex_unlock(&G.mx);
     /* The uploader is stopped, but a decode group may still own the tensors. */
@@ -2556,6 +2966,7 @@ void qt_shutdown(void){
         G_arena[i]=NULL; free(G_afree[i]); G_afree[i]=NULL; G_aslots[i]=G_anfree[i]=0;
     }
     G_arena_on=0; G_chain_own=0;
+    qt_stg_down();
     if(G_cfree) for(int c=0;c<G_ncls;c++) free(G_cfree[c]);
     free(G_cfree); G_cfree=NULL; free(G_cnfree); G_cnfree=NULL; free(G_ccap); G_ccap=NULL;
     free(G_lsl); G_lsl=NULL; free(G_lou); G_lou=NULL; free(G_lod); G_lod=NULL; free(G_lcls); G_lcls=NULL;
@@ -2568,12 +2979,18 @@ void qt_shutdown(void){
     pthread_cond_destroy(&G.cv_take);
     pthread_cond_destroy(&G.cv);
     pthread_mutex_destroy(&G.mx);
-    G.issue_open=0;
+    G.issue_open=0; G.pg_open=0; memset(G.pg_dev_open,0,sizeof G.pg_dev_open);
     memset(G.is_cnt,0,sizeof G.is_cnt);
     G.on=0;
     G_fp8_stream=0; G_stream=0; G_trunk_only=0; G_src_planar=0;
     G_host_on=-1; G_host_all=0; G_host_n=G_host_bytes=0;
-    coli_cuda_shutdown();
+    if(G_slots_lost) fprintf(stderr,"[qtier] %d arena slot(s) left out of use after refused promotion copies\n",G_slots_lost);
+    /* a staging buffer still out keeps its pool (qt_stg_down), and a pool's page-locked memory lives as long as the
+     * device context it came from: the devices stay open for it. A qt_init on the same devices reuses the open
+     * context (coli_cuda_init accepts the same set) and returns the pool once every buffer is back; another device
+     * set is refused until a shutdown; the process's exit closes it otherwise */
+    if(qt_stg_any()) fprintf(stderr,"[qtier] a staging buffer is still out: the devices stay open for the kept pool\n");
+    else coli_cuda_shutdown();
 }
 
 #endif /* COLI_CUDA */
