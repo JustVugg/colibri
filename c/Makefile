@@ -1696,8 +1696,11 @@ ifneq ($(EXE),)
 .PHONY: qwenimage
 qwenimage: qwenimage$(EXE)
 endif
-qwenimage$(EXE): qwenimage.c $(VK_OBJ) $(VK_SPV) .build-config
-	$(CC) $(CFLAGS) qwenimage.c $(VK_OBJ) -o qwenimage$(EXE) $(LDFLAGS)
+qwenimage$(EXE): qwenimage.c $(QWEN36_METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) qwenimage.c $(QWEN36_METAL_OBJ) $(VK_OBJ) -o qwenimage$(EXE) $(LDFLAGS) $(QWEN36_GRAPH_LDFLAGS)
+
+tests/bench_qwenimage_metal$(EXE): tests/bench_qwenimage_metal.c $(QWEN36_METAL_OBJ) $(VK_OBJ) .build-config
+	$(CC) $(CFLAGS) $< $(QWEN36_METAL_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS) $(QWEN36_GRAPH_LDFLAGS)
 
 # colibri-tui: the terminal interface (docs/tui.md), a client of coli serve. One C file and the
 # chat page's mascot (tui_mascot.h, from tools/make_tui_mascot.py); no OpenMP, no GPU, no

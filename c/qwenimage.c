@@ -53,6 +53,12 @@
 #include "tok.h"
 #include "qwen38_nfc.h"
 #include "qi_gemm.h"
+#ifdef COLI_METAL
+#include "qwen36_gpu.h"  /* shared row-INT8 Metal matrix kernel */
+static int g_metal_ready;
+static unsigned long long g_metal_calls;
+static q36_tensor *g_metal_input, *g_metal_output;
+#endif
 #include "serve_poll.h"
 #if defined(__has_include)
 #if __has_include("qwenimage_vae.h")
@@ -154,8 +160,34 @@ typedef struct {
     int gpu;        /* may run on the GPU (COLI_VULKAN): the DiT's matrices */
     void *vk;       /* its device copy, made on first use */
     int vk_off;     /* the upload failed: this one stays on the CPU */
+#ifdef COLI_METAL
+    q36_tensor *metal_weight, *metal_scale;
+#endif
     QiGG gg;        /* QI_GG: the file's rows (m.w points here) */
 } Lin;
+
+static void lin_alloc_i8(Lin *l, int N, int K, int device){
+    size_t bytes = (size_t)N * K;
+    l->m.fmt = QI_I8;
+#ifdef COLI_METAL
+    if (device && g_metal_ready && N % 32 == 0 && K % 32 == 0) {
+        l->metal_weight = q36_tensor_new(bytes);
+        l->metal_scale = q36_tensor_new((size_t)N * sizeof(float));
+        if (l->metal_weight && l->metal_scale) {
+            /* Quantize directly into shared storage. CPU fallback reads these same bytes. */
+            l->m.w = q36_tensor_data(l->metal_weight);
+            l->m.sc = q36_tensor_data(l->metal_scale);
+            return;
+        }
+        q36_tensor_free(l->metal_weight); l->metal_weight = NULL;
+        q36_tensor_free(l->metal_scale); l->metal_scale = NULL;
+    }
+#else
+    (void)device;
+#endif
+    l->m.w = l->own = xmalloc(bytes);
+    l->m.sc = l->own_sc = fmalloc(N);
+}
 
 static st_tensor *need_tensor(shards *S, const char *name, int64_t n0, int64_t n1){
     st_tensor *t = st_find(S, name);
@@ -187,7 +219,7 @@ static int qi_load_threads(void){
 
 /* An f32 matrix into the storage bits asks for (8 = int8 rows, 16 = bf16, 32 = f32);
  * tmp becomes the matrix's or is freed. */
-static void lin_from_f32(Lin *out, float *tmp, int N, int K, int bits){
+static void lin_from_f32(Lin *out, float *tmp, int N, int K, int bits, int device){
     memset(out, 0, sizeof *out);
     out->m.N = N; out->m.K = K;
     if (bits == 32) {
@@ -202,11 +234,9 @@ static void lin_from_f32(Lin *out, float *tmp, int N, int K, int bits){
         free(tmp);
         out->m.fmt = QI_BF16; out->m.w = out->own = b;
     } else {
-        int8_t *q = xmalloc((size_t)N * K);
-        float *sc = fmalloc(N);
-        qi_quantize_i8(tmp, N, K, q, sc);
+        lin_alloc_i8(out, N, K, device);
+        qi_quantize_i8(tmp, N, K, (int8_t *)out->m.w, (float *)out->m.sc);
         free(tmp);
-        out->m.fmt = QI_I8; out->m.w = out->own = q; out->m.sc = out->own_sc = sc;
     }
 }
 
@@ -260,7 +290,7 @@ static int qi_gg_keep(int gt, int K){
 static int g_lin_gg, g_lin_conv;   /* matrices kept in the file's blocks, and converted (the load's line) */
 
 /* bits: 8 = int8 rows, 16 = bf16, 32 = f32. Small matrices ask for 32. */
-static void lin_load(shards *S, const char *name, int N, int K, int bits, Lin *out){
+static void lin_load_storage(shards *S, const char *name, int N, int K, int bits, Lin *out, int device){
     st_tensor *t = need_tensor(S, name, N, K);
     if (st_is_ggml(t->dtype)) {
         const int gt = st_ggml_type(t->dtype);
@@ -293,7 +323,7 @@ static void lin_load(shards *S, const char *name, int N, int K, int bits, Lin *o
         float *tmp = fmalloc((size_t)N * K);
         for (int n = 0; n < N; n++) qi_gg_decode(gt, raw + (int64_t)n * rb, tmp + (int64_t)n * K, K);
         free(raw);
-        lin_from_f32(out, tmp, N, K, bits);
+        lin_from_f32(out, tmp, N, K, bits, device);
         #pragma omp atomic
         g_lin_conv++;
         return;
@@ -304,16 +334,18 @@ static void lin_load(shards *S, const char *name, int N, int K, int bits, Lin *o
         st_read_raw_cap(S, name, raw, (int64_t)N * K * 2, 1);
         memset(out, 0, sizeof *out);
         out->m.N = N; out->m.K = K;
-        int8_t *q = xmalloc((size_t)N * K);
-        float *sc = fmalloc(N);
-        qi_quantize_i8_bf16(raw, N, K, q, sc);
+        lin_alloc_i8(out, N, K, device);
+        qi_quantize_i8_bf16(raw, N, K, (int8_t *)out->m.w, (float *)out->m.sc);
         free(raw);
-        out->m.fmt = QI_I8; out->m.w = out->own = q; out->m.sc = out->own_sc = sc;
         return;
     }
     float *tmp = fmalloc((size_t)N * K);
     st_read_f32_cap(S, name, tmp, (int64_t)N * K, 1);
-    lin_from_f32(out, tmp, N, K, bits);
+    lin_from_f32(out, tmp, N, K, bits, device);
+}
+
+static void lin_load(shards *S, const char *name, int N, int K, int bits, Lin *out){
+    lin_load_storage(S, name, N, K, bits, out, 0);
 }
 /* The load's line: the storage of the matrices just loaded (and the counters reset). */
 static const char *qi_storage(int bits){
@@ -327,6 +359,10 @@ static const char *qi_storage(int bits){
 }
 
 static void lin_free(Lin *l){
+#ifdef COLI_METAL
+    q36_tensor_free(l->metal_weight);
+    q36_tensor_free(l->metal_scale);
+#endif
 #ifdef COLI_VULKAN
     if (l->vk) coli_vk_tensor_free((ColiVkTensor *)l->vk);
 #endif
@@ -335,7 +371,7 @@ static void lin_free(Lin *l){
 static size_t lin_bytes(const Lin *l){
     size_t e = l->m.fmt == QI_F32 ? 4 : l->m.fmt == QI_BF16 ? 2 : 1;
     size_t w = l->m.fmt == QI_GG ? (size_t)l->m.N * (size_t)l->gg.rb : (size_t)l->m.N * l->m.K * e;
-    return w + (l->own_sc ? (size_t)l->m.N * 4 : 0);
+    return w + (l->m.sc ? (size_t)l->m.N * 4 : 0);
 }
 static float *vec_load(shards *S, const char *name, int n){
     need_tensor(S, name, n, 1);
@@ -375,9 +411,49 @@ static int qi_vk_linear(float *y, const float *x, int M, const Lin *l){
 
 /* QWENIMAGE_PROF=1: where a step's time goes (linears, attention, the rest) */
 static int g_prof; static double g_t_lin, g_t_att;
+
+#ifdef COLI_METAL
+static int qi_metal_reserve(q36_tensor **tensor, size_t bytes){
+    if (q36_tensor_bytes(*tensor) >= bytes) return 1;
+    q36_tensor_free(*tensor);
+    *tensor = q36_tensor_new(bytes);
+    return *tensor != NULL;
+}
+
+static int qi_metal_linear(float *y, const float *x, int M, const Lin *l){
+    if (!g_metal_ready || !l->metal_weight || M <= 8) return 0;
+#ifdef _OPENMP
+    if (omp_in_parallel()) return 0;
+#endif
+    size_t xbytes = (size_t)M * l->m.K * sizeof(float);
+    size_t ybytes = (size_t)M * l->m.N * sizeof(float);
+    if (!qi_metal_reserve(&g_metal_input, xbytes) || !qi_metal_reserve(&g_metal_output, ybytes)) return 0;
+    memcpy(q36_tensor_data(g_metal_input), x, xbytes);
+    if (!q36_dot_i8(g_metal_output, g_metal_input, l->metal_weight, l->metal_scale, M, l->m.K, l->m.N) ||
+        !q36_gpu_sync()) {
+        fprintf(stderr, "[Metal] qwenimage: projection dispatch failed; using CPU for later projections\n");
+        g_metal_ready = 0;
+        return 0;
+    }
+    memcpy(y, q36_tensor_data(g_metal_output), ybytes);
+    g_metal_calls++;
+    return 1;
+}
+
+static void qi_metal_cleanup(void){
+    q36_tensor_free(g_metal_input);
+    q36_tensor_free(g_metal_output);
+    q36_gpu_cleanup();
+}
+#endif
+
 static inline void linear(float *y, const float *x, int M, const Lin *l){
     double t0 = g_prof ? now_s() : 0;
-    if (!qi_vk_linear(y, x, M, l)) {
+    if (!qi_vk_linear(y, x, M, l)
+#ifdef COLI_METAL
+        && !qi_metal_linear(y, x, M, l)
+#endif
+    ) {
         if (g_act8 && l->act8 && (l->m.fmt == QI_I8 || l->m.fmt == QI_GG)) qi_gemm_act8(y, l->m.N, x, l->m.K, M, &l->m, NULL);
         else qi_gemm(y, x, M, &l->m, NULL);
     }
@@ -772,13 +848,13 @@ static void dit_load(Dit *d, const char *model){
         DitBlock *B = &d->B[l];
         char n[256];
 #define BN(s) (snprintf(n, sizeof n, "transformer_blocks.%d.%s", l, s), n)
-        lin_load(&S, BN("attn.to_q.weight"), D, D, g_bits, &B->q);
-        lin_load(&S, BN("attn.to_k.weight"), D, D, g_bits, &B->k);
-        lin_load(&S, BN("attn.to_v.weight"), D, D, g_bits, &B->v);
-        lin_load(&S, BN("attn.to_out.0.weight"), D, D, g_bits, &B->o);
-        lin_load(&S, BN("img_mlp.gate_layer.weight"), d->mlp, D, g_bits, &B->gate);
-        lin_load(&S, BN("img_mlp.proj.weight"), d->mlp, D, g_bits, &B->proj);
-        lin_load(&S, BN("img_mlp.out.weight"), D, d->mlp, g_bits, &B->out);
+        lin_load_storage(&S, BN("attn.to_q.weight"), D, D, g_bits, &B->q, 1);
+        lin_load_storage(&S, BN("attn.to_k.weight"), D, D, g_bits, &B->k, 1);
+        lin_load_storage(&S, BN("attn.to_v.weight"), D, D, g_bits, &B->v, 1);
+        lin_load_storage(&S, BN("attn.to_out.0.weight"), D, D, g_bits, &B->o, 1);
+        lin_load_storage(&S, BN("img_mlp.gate_layer.weight"), d->mlp, D, g_bits, &B->gate, 1);
+        lin_load_storage(&S, BN("img_mlp.proj.weight"), d->mlp, D, g_bits, &B->proj, 1);
+        lin_load_storage(&S, BN("img_mlp.out.weight"), D, d->mlp, g_bits, &B->out, 1);
         B->q.act8 = B->k.act8 = B->v.act8 = B->o.act8 = B->gate.act8 = B->proj.act8 = B->out.act8 = 1;
         B->q.gpu = B->k.gpu = B->v.gpu = B->o.gpu = B->gate.gpu = B->proj.gpu = B->out.gpu = 1;
         B->nq = vec_load(&S, BN("attn.norm_q.weight"), d->hd);
@@ -1911,7 +1987,11 @@ static int run_oracle(Engine *e, const char *refdir){
 
 /* Once, at the end: how many products the GPU actually took, so a run that
  * asked for Vulkan and quietly stayed on the CPU says so. */
-static void qi_vk_report(void){
+static void qi_gpu_report(void){
+#ifdef COLI_METAL
+    if (g_metal_ready || g_metal_calls)
+        fprintf(stderr, "[Metal] qwenimage: %llu DiT projections on the GPU\n", g_metal_calls);
+#endif
 #ifdef COLI_VULKAN
     if (g_vk_ready) fprintf(stderr, "[VK] qwenimage: %llu matmuls on the GPU\n", coli_vk_matmul_calls());
     qic_report();
@@ -1931,6 +2011,7 @@ static void usage(void){
         "       COLI_IMG_NATIVE=0  a GGUF's block types (Q2_K..Q6_K, IQ*) as int8 rows too (default: the file's blocks)\n"
         "       COLI_IMG_TE=resident|stage  keep the text encoder loaded between prompts (serve default: resident)\n"
         "       COLI_IMG_LOAD_THREADS=n  layers loaded at once (default 4)\n"
+        "       COLI_IMG_METAL=1 (a METAL=1 build): DiT projections with int8 rows and f32 activations on Apple GPUs\n"
         "       COLI_VK_QI_RESIDENT=n  transformer blocks kept on the GPU (default: what its free memory holds)\n"
         "       COLI_VULKAN=1 (a VK=1 build): the transformer on the GPU; COLI_VK_CHAIN=0 keeps each step's blocks\n"
         "                    off the device chain (the matrices one by one)\n");
@@ -1979,10 +2060,25 @@ int main(int argc, char **argv){
     if (g_act8 && a8 && *a8 == '1') fprintf(stderr, "[qwenimage] COLI_IMG_ACT8 needs VNNI; this build has none, staying on f32 activations\n");
     g_act8 = 0;
 #endif
+    const char *metal = getenv("COLI_IMG_METAL");
+    if (metal && !strcmp(metal, "1")) {
+#ifdef COLI_METAL
+        if (g_bits == 8 && !g_act8 && q36_gpu_init()) {
+            q36_gpu_set_exact(0); /* the batched matrix kernel, with f32 accumulation */
+            g_metal_ready = 1;
+            atexit(qi_metal_cleanup);
+            fprintf(stderr, "[Metal] qwenimage: DiT projections on %s\n", q36_gpu_device_name());
+        } else {
+            fprintf(stderr, "[Metal] qwenimage: Metal projections need int8 row weights, f32 activations and a usable GPU\n");
+        }
+#else
+        fprintf(stderr, "[qwenimage] COLI_IMG_METAL needs a METAL=1 build\n");
+#endif
+    }
     if (!seed_set && !serve && !ref) seed = (uint64_t)time(NULL);
     static Engine e;
     engine_init(&e, model);
-    if (ref) { int rc = run_oracle(&e, ref); qi_vk_report(); return rc; }
+    if (ref) { int rc = run_oracle(&e, ref); qi_gpu_report(); return rc; }
     if (getenv("QWENIMAGE_PRINT_TOKENS")) {          /* tokenizer check against the processor */
         int n, drop; int *ids = te_encode_prompt(&e.te, prompt ? prompt : "", &n, &drop);
         printf("drop %d ids", drop);
@@ -1995,7 +2091,7 @@ int main(int argc, char **argv){
         te_load(&e.te, model);
         dit_load(&e.dit, model);
         int rc = serve_loop(&e, width, height, steps);
-        qi_vk_report();
+        qi_gpu_report();
         return rc;
     }
     char msg[512];
@@ -2008,6 +2104,6 @@ int main(int argc, char **argv){
     if (write_png(out, rgba, width, height)) { fprintf(stderr, "[qwenimage] cannot write %s\n", out); return 1; }
     fprintf(stderr, "[qwenimage] %s  %dx%d  %d steps  seed %llu  encode %.1f s  denoise %.1f s  decode %.1f s\n",
             out, width, height, steps, (unsigned long long)seed, tm[0], tm[1], tm[2]);
-    qi_vk_report();
+    qi_gpu_report();
     return 0;
 }

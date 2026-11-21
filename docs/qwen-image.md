@@ -96,6 +96,27 @@ and BF16 matrices become int8 rows, as the checkpoint's bf16 ones do (smaller
 than Q8_0's 8.5 bits a weight, and nothing to decode). `COLI_IMG_NATIVE=0`
 makes every type int8 rows.
 
+### Metal projections (experimental)
+
+On Apple Silicon, `make -C c METAL=1 qwenimage` builds the Metal projection
+path. Set `COLI_IMG_METAL=1` to use it for the transformer's dense INT8 rows:
+
+```sh
+COLI_IMG_METAL=1 c/qwenimage --model ~/Models/Qwen-Image-2.1-Turbo \
+  --prompt "a red fox in the snow, photograph" --width 512 --height 512 \
+  --steps 8 --seed 42 --out fox.png
+```
+
+The path uses the Qwen3.6 Metal matrix kernel with the image engine's existing
+signed INT8 rows and float32 scales and activations. The summation order can
+change the last bits. CPU code still runs attention, the text encoder and the
+VAE. Projections use Metal when the input and output widths are divisible by
+32 and the batch has more than eight rows. Other shapes and weight formats
+stay on the CPU. A GGUF whose transformer remains in block format keeps that
+format. Use `COLI_IMG_NATIVE=0` only when you want to convert those matrices to
+INT8 rows, as in the CPU path. The engine reports how many projections ran on
+Metal.
+
 ### What the files give
 
 Measured on the 8 Zen 4 cores of the timings below, 512x512, 8 steps, seed 42,
