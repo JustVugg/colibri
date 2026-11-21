@@ -105,6 +105,7 @@ typedef struct { int S, VH, KH, VD, Ktot, cv_off, cv_row, b_off, b_row, a_off, a
 #define CC_EW_RESGATE  10   /* y = e[col] * a + c[col] * b (cc_muse_ready) */
 #define CC_EW_F16      11   /* y = a clamped to +-65504, rounded to the nearest float16, as kv16.h (cc_kv16_ready) */
 #define CC_EW_HEADGATE 12   /* y = a * sigmoid(b[b_off + i / D]): a gate per head of D values, LFM3's (cc_lfm3_ready) */
+#define CC_EW_LOOPGATE 13   /* y = (1 - tanh(a)) * c + tanh(b) * e: Inkling-2-Mini's loop gate (cc_ink2_caps' CC_INK2_LOOPGATE) */
 typedef struct { int op, n, D, C, flags, e_row, y_off, a_off, b_off, c_off, e_off; float fc; } CcEw;
 /* chain_qsa.comp (mode 0: nb block keys from b0; mode 1: S rows' selections) */
 typedef struct { int mode, ID, R, b0, half_, S, pos_base, budget, IQ, q_off, q_row, nbmax, sel_row; float eps;
@@ -146,7 +147,8 @@ typedef struct { const void *g, *u, *d; const float *gs, *us, *ds; int planar, h
  * rows, 2 int4 rows, 4 int4 with a scale per gs inputs, 8 fp8-e4m3 with a scale per
  * 128 x 128 block: the tier's formats; 100 + t a GGUF's ggml type t, fmt_d down's, the types
  * with cuda_bd.cuh's integer step), D and I multiples of 32 up to CC_MOE_DIM_MAX. hid holds S*K rows of
- * I floats (silu(gate) * up, act 0, the only one) and then S*K rows of D (down's
+ * I floats (act 0 silu(gate) * up; act 1 SiTU-GLU, act_a * tanh(g / act_a) * sigmoid(g) *
+ * act_b * tanh(u / act_b), Inkling-2's, a decode step's rows only) and then S*K rows of D (down's
  * output). parts 1: the experts the table holds; parts 2: y (y_off + s*y_row) = the
  * host's row (hy at h_off + s*D, h_off >= 0; else 0) plus each slot the table holds,
  * w * down's output, in rank order (the CPU tier's order: its misses, then the device's
@@ -162,6 +164,15 @@ typedef struct {
                      0 = fmt's; a matrix's rows as the file has them, padded to words */
     int lay_S, lay_s0;   /* parts 2 only: hid as a parts 1 of lay_S rows left it (0: S), this call's
                             S rows its rows lay_s0.. (a prompt chunk's lanes sum their own rows) */
+    /* cc_ink2_caps' CC_INK2_MOE, a decode step's rows (S up to CC_MOE_FRAME_ROWS) only:
+     * esc_off > 0, each expert's scales outside its matrices, float pairs (gate's and up's one
+     * number, then down's) at byte esc_off of the table's buffer, entry t_off + e's pair at
+     * t_off + e (Inkling-2's NVFP4 layers from a GGUF: the gate's and up's outputs times the
+     * first before the activation, down's times the second in the sum); act_a, act_b act 1's
+     * caps. The table's entries may then be the CUDA tier's (cu_xb.cu): CcExpert.planar 2, int4
+     * rows as the tier keeps them (each nibble v + 8, weight 2j the low one). */
+    int esc_off;
+    float act_a, act_b;
 } CcMoe;
 /* the ggml types cc_moe takes for a GGUF's experts (CcMoe.fmt >= 100: cuda_bd.cuh's integer step) */
 static inline int cc_moe_block_type(int t) {
@@ -480,7 +491,11 @@ typedef struct ColiCudaChainOps {
     int  (*fetch_at)(CcBuf *dst, const CcFetch *r, int n, int bank);
     int  (*fetch_wait_at)(int bank);
     int  (*fetch_done_at)(int bank);
+    /* ink2_caps: what the backend takes of Inkling-2-Mini's chain (CC_INK2_*) */
+    int  (*ink2_caps)(void);
 } ColiCudaChainOps;
+#define CC_INK2_MOE      1   /* cc_moe's act 1, esc_off, planar 2 entries and NVFP4 (fmt 140) in a decode step's rows */
+#define CC_INK2_LOOPGATE 2   /* cc_ew's CC_EW_LOOPGATE */
 /* the table's size without the optional ops: a backend at least this big has the chain */
 #define CC_OPS_BASE_SIZE (offsetof(ColiCudaChainOps, route))
 
@@ -796,6 +811,11 @@ static inline int cc_fetch_at_ready(void) {
     return t && t->size >= offsetof(ColiCudaChainOps, fetch_done_at) + sizeof t->fetch_done_at && t->fetch_at && t->fetch_wait_at && t->fetch_done_at;
 }
 static inline int cc_fetch_at(CcBuf *dst, const CcFetch *r, int n, int bank) { return cc_fetch_at_ready() ? cc_ops()->fetch_at(dst, r, n, bank) : 0; }
+/* the backend's CC_INK2_* bits; 0 from one before them */
+static inline int cc_ink2_caps(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, ink2_caps) + sizeof t->ink2_caps && t->ink2_caps ? t->ink2_caps() : 0;
+}
 static inline int cc_fetch_wait_at(int bank) { return cc_fetch_at_ready() ? cc_ops()->fetch_wait_at(bank) : 0; }
 static inline int cc_fetch_done_at(int bank) { return cc_fetch_at_ready() ? cc_ops()->fetch_done_at(bank) : 0; }
 #endif

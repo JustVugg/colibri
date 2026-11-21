@@ -1743,6 +1743,9 @@ __global__ static void cc_ew_k(float *__restrict__ y, const float *__restrict__ 
         y[p.y_off + i] = cc_f16_round(a[p.a_off + i]);
     } else if (p.op == 12) {   /* LFM3's head gate: one logit a head of D values */
         y[p.y_off + i] = a[p.a_off + i] * cc_sig(b[p.b_off + i / p.D]);
+    } else if (p.op == 13) {   /* Inkling-2-Mini's loop gate, ink2_loop_gate's last line: y may be c */
+        float h = c[p.c_off + i];
+        y[p.y_off + i] = (1.f - tanhf(a[p.a_off + i])) * h + tanhf(b[p.b_off + i]) * e[p.e_off + i];
     }
 }
 
@@ -2933,6 +2936,7 @@ static int cc_ew(CcBuf *y, CcBuf *a, CcBuf *b, CcBuf *cb, CcBuf *e, const CcEw *
     case CC_EW_SIGMUL: if (!a || !b) return 0; break;
     case CC_EW_RESGATE: if (!a || !b || !cb || !e || p->D < 1) return 0; break;
     case CC_EW_HEADGATE: if (!a || !b || p->D < 1) return 0; break;   /* LFM3's gate a head (cc_lfm3) */
+    case CC_EW_LOOPGATE: if (!a || !b || !cb || !e) return 0; break;  /* Inkling-2-Mini's loop gate */
     default: return 0;
     }
     coli_launch(cc_ew_k, grid1((size_t)p->n, 256), 256, 0, c->stream, fpw(y), fp(a), fp(b), fp(cb), fp(e), *p);
@@ -2989,6 +2993,10 @@ static int cc_moe(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf 
     const int LS = p->lay_S > 0 ? p->lay_S : p->S;
     if (p->lay_S < 0 || p->lay_s0 < 0 || p->lay_s0 > LS - p->S || ((p->parts & 1) && (LS != p->S || p->lay_s0))) return 0;
     if (cc_moe_hid_floats(LS, p->K, p->D, p->I, p->E) * 4 > hid->bytes || (LS > CC_MOE_FRAME_ROWS && p->E < 1)) return 0;
+    /* CC_INK2_MOE's (a decode step's rows; the scales' pairs inside the table's buffer): refused here, not a lost device */
+    if (p->act < 0 || p->act > 1 || p->esc_off < 0 || ((p->act || p->esc_off) && LS > CC_MOE_FRAME_ROWS) ||
+        (p->act == 1 && !(p->act_a > 0.f && p->act_b > 0.f)) ||
+        (p->esc_off && (p->esc_off % 8 || p->E < 1 || (size_t)p->esc_off + (size_t)(p->t_off + p->E) * 8 > tab->bytes))) return 0;
     g_st.ops++;
     if (!coli_cuda_moe_async(c->device, (const CcExpert *)tab->d, fp(x), (const int *)ids->d, fp(w), fpw(hid), fpw(y), fp(hy), p,
                              (void *)c->stream)) { c->lost = 1; return 0; }
@@ -3687,8 +3695,15 @@ static int cc_preload(void) {
 #include "cuda_dsv4c.cuh"   /* DeepSeek V4.1's layer ops */
 #include "cuda_glm53c.cuh"  /* GLM-5.3's layer ops */
 #include "cuda_k3c.cuh"     /* Kimi K3's residual mix and activation */
+/* COLI_CUDA_RELATTN_SPLIT=0: a decode step's Inkling-2 attention a block a (head, row) (cuda_inkc.cuh) */
+static int cc_relattn_split(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_CUDA_RELATTN_SPLIT"); on = !(e && *e == '0'); }
+    return on;
+}
 #include "cuda_inkc.cuh"    /* Inkling's and Inkling-2's ops */
 #include "cuda_dflash.cuh"  /* DFlash2's drafter's convolution */
+static int cc_ink2_caps_(void) { return CC_INK2_MOE | CC_INK2_LOOPGATE; }
 static const ColiCudaChainOps g_cc_ops = {
     sizeof(ColiCudaChainOps),
     cc_init, cc_ready, cc_lost_, cc_shutdown, cc_device, cc_device_now,
@@ -3729,5 +3744,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_wait_host_if,
     cc_sconv, cc_relattn, cc_ink2_mix, cc_ink2_clip, cc_ink2_dconv,
     cc_fetch_at, cc_fetch_wait_at, cc_fetch_done_at,
+    cc_ink2_caps_,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }

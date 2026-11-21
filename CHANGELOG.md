@@ -17,11 +17,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   (projector `inkling2v`), or from the NVFP4 release through `tools/convert_inkling2_int4.py`
   (the loop's tensors pass as they are). The CPU, the CUDA and Vulkan expert tiers, and Vulkan's
   dense chain with the passes on the device (a pass's own K/V mirrors and convolution states,
-  the messages and the gates, `VKC_EW_LOOPGATE`); the CUDA chain, off by default for Inkling-2,
-  leaves a loop to the per-matrix path. The drafter (`INK2_MTP=1`) counts its target layers
+  the messages and the gates, `VKC_EW_LOOPGATE`); the CUDA chain the same (below). The drafter (`INK2_MTP=1`) counts its target layers
   over the passes. `tools/make_tiny_inkling2_loop.py` and the `inkling2-loop-oracle` job: a tiny
   random Inkling2LoopForCausalLM token for token (transformers' pull request 51050), plain and
   through the converter; `tests/test_gguf_import.py` the GGUF's layout.
+- **Inkling-2-Mini on the CUDA chain**, on by default for the Mini (`COLI_CUDA_CHAIN` unset):
+  the loop's passes (`CC_EW_LOOPGATE`), the routed experts of a decode step in the frame
+  (`cc_route`, then `cc_moe` with SiTU-GLU, `CcMoe.act` 1, from the CUDA tier's table: `cu_xb.cu`
+  now gives each resident's `CcExpert`, the int4 rows as the tier keeps them, `planar` 2), a GGUF's
+  NVFP4 experts with their global scales beside the table (`CcMoe.esc_off`) and an NVFP4 integer
+  step for the experts' GEMVs (`cuda_bd.cuh`, the CPU's integer form), and a decode step's
+  attention split over its positions (`COLI_CUDA_RELATTN_SPLIT`). A backend without them
+  (`cc_ink2_caps`) keeps the per-matrix path. On an RTX PRO 4000, 100 tokens after a 570-token
+  prompt: UD-Q4_K_XL 17.8-18.1 to 40.9-41.1 tok/s of decode (prompt 106-107 to 285-289),
+  UD-IQ2_XXS 20.2-20.5 to 46.3-46.5, int4 g64 16.0-16.3 to 36.0-36.1; `tests/test_cuda_bd.cu`,
+  `tests/test_cuda_chain.cu` and `tests/test_cuda_inkc.cu` hold the new ops to the CPU's.
 - **The CPU's NVFP4 blocks unpacked with AVX2**, their E4M3 scales from their bits instead of
   `ldexpf` (the same values): Inkling-2's NVFP4 experts from a GGUF.
 - **NVFP4 in the CPU's 16-row interleaved forms** (`GQ_NVFP4_R16`, AVX2 and AVX-512 VNNI kernels:
