@@ -1082,7 +1082,7 @@ const url=p=>ST.base.replace(/\/+$/,'')+p;
 const H=()=>({'Content-Type':'application/json',...(ST.key?{Authorization:'Bearer '+ST.key}:{})});
 async function errText(r){try{const b=await r.json();return b.error?.message||(typeof b.error==='string'&&b.error)||`${r.status} ${r.statusText}`}catch(e){return `${r.status} ${r.statusText}`}}
 async function jget(p){const r=await fetch(url(p),{headers:H()});if(!r.ok)throw new Error(await errText(r));return r.json()}
-const esc=s=>String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+const esc=s=>String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 const fmt=(v,d=1)=>(+v).toFixed(d).replace('.',DEC);
 const nf=n=>(+n).toLocaleString(LOC);
 const sleepMs=ms=>new Promise(r=>setTimeout(r,ms));
