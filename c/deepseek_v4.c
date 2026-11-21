@@ -5502,6 +5502,10 @@ static int v4_hc_decode_team(const ColiExpertStore *experts) {
         if (setting < -1) setting = -1;
     }
     if (setting >= 0) return setting;
+#ifdef COLI_V4_GPU_TIER
+    /* V4_HOT_SPLIT: the CPU works through every layer, its team never sleeps */
+    if (coli_v4_hot_split_on()) return 0;
+#endif
     return experts && experts->gpu ? COLI_V4_HC_GPU_TEAM : 0;
 }
 
@@ -6166,6 +6170,48 @@ int coli_v4_hybrid_enabled(void) {
     }
     return on;
 }
+/* V4_HOT_SPLIT (for a card that holds few experts): VRAM keeps the
+ * experts decode uses most and the CPU computes the others at the same time.
+ * A token's mirrored experts start on the GPU as soon as the layer has routed
+ * and are not read from the store; the CPU meanwhile computes the shared
+ * expert and the rest. Uploading an expert costs more than computing it on
+ * the CPU on a PCIe x8 card, so a miss is never uploaded to be used now: after
+ * the layer, at most one expert joins the cache, the most used of those the
+ * CPU computed, if it has earned the place (coli_v4_gpu_expert_admit_hot).
+ * Needs the shared experts in RAM: the backend runs one job at a time. */
+static int g_v4_hot_split_auto;
+/* V4_HOT_SPLIT unset: what the GPU unit picks at engine open (v4_gpu_place:
+ * on for one HIP card whose dense mirrors, the shared experts with them,
+ * stay in RAM); 0 or 1 decides. */
+void coli_v4_hot_split_auto(int on) { g_v4_hot_split_auto = on; }
+int coli_v4_hot_split_on(void) {
+    static int setting = -2;
+    if (setting == -2) {
+        const char *text = getenv("V4_HOT_SPLIT");
+        setting = text && *text ? atoi(text) != 0 : -1;
+    }
+    return setting >= 0 ? setting : g_v4_hot_split_auto;
+}
+#define V4_HOT_MAX_EXPERTS 16
+typedef struct {
+    void *gates[V4_HOT_MAX_EXPERTS], *ups[V4_HOT_MAX_EXPERTS], *downs[V4_HOT_MAX_EXPERTS];
+    float weights[V4_HOT_MAX_EXPERTS];
+    const float *input;
+    float *sum;
+    float limit;
+    int count, ok;
+} V4HotGroup;
+static void *v4_hot_group_run(void *argument) {
+    extern int dsv4_cuda_expert_group(
+        void *const *gate, void *const *up, void *const *down,
+        const float *weights, int count, float limit,
+        float *y, const float *x);
+    V4HotGroup *group = (V4HotGroup *)argument;
+    group->ok = dsv4_cuda_expert_group(group->gates, group->ups, group->downs,
+                                       group->weights, group->count, group->limit,
+                                       group->sum, group->input);
+    return NULL;
+}
 /* Non-static on purpose: the serve unit prints these counters, and under the
  * per-unit amalgam build that is a different object file. */
 double g_v4_hyb_fill_bw;   /* experts/s uploaded, EMA */
@@ -6576,14 +6622,26 @@ static int moe_token_pipeline(float *output,
     unsigned char *leased = calloc((size_t)alloc_n, 1);
     int *fetch = malloc((size_t)alloc_n * sizeof(*fetch));
     int nfetch = 0;
+#ifdef COLI_V4_GPU_TIER
+    int hot_split = 0, hot_started = 0;
+    unsigned char hot_on_gpu[V4_HOT_MAX_EXPERTS] = {0};
+    V4HotGroup hot_group;
+    pthread_t hot_thread;
+    hot_group.count = 0;
+    hot_group.ok = 0;
+    hot_group.sum = NULL;
+#endif
     if (!result && (!views || !leased || !fetch))
         result = moe_fail("layer %d: out of memory for %d expert views",
                           weights->plan.layer, selected);
     if (!result) {
         memset(views, 0, (size_t)alloc_n * sizeof(*views));
 #ifdef COLI_V4_GPU_TIER
-        int first = store->gpu && coli_v4_gpu_resident_first() &&
-                    !coli_v4_hybrid_enabled();
+        hot_split = store->gpu && coli_v4_hot_split_on() &&
+                    selected <= V4_HOT_MAX_EXPERTS &&
+                    !coli_v4_layer_gpu(weights, "ffn.shared_experts.w1");
+        int first = store->gpu && (hot_split ||
+                    (coli_v4_gpu_resident_first() && !coli_v4_hybrid_enabled()));
 #endif
         for (int i = 0; i < selected; i++) {
             views[i].key = (ColiExpertKey){weights->plan.layer, expert_ids[i]};
@@ -6594,6 +6652,32 @@ static int moe_token_pipeline(float *output,
 #endif
             fetch[nfetch++] = i;
         }
+#ifdef COLI_V4_GPU_TIER
+        if (hot_split) {
+            coli_v4_gpu_hot_touch(weights->plan.layer, expert_ids, selected);
+            for (int i = 0; i < selected; i++) {
+                if (!views[i].gate.gpu) continue;
+                int k = hot_group.count++;
+                hot_on_gpu[i] = 1;
+                hot_group.gates[k] = views[i].gate.gpu;
+                hot_group.ups[k] = views[i].up.gpu;
+                hot_group.downs[k] = views[i].down.gpu;
+                hot_group.weights[k] = expert_weights[i];
+            }
+            if (hot_group.count) {
+                hot_group.input = input;
+                hot_group.limit = config->swiglu_limit;
+                hot_group.sum = malloc((size_t)d * sizeof(*hot_group.sum));
+                if (!hot_group.sum)
+                    result = moe_fail("layer %d: out of memory for the GPU's sum",
+                                      weights->plan.layer);
+                else
+                    hot_started = pthread_create(&hot_thread, NULL, v4_hot_group_run,
+                                                 &hot_group) == 0;
+                if (!result && !hot_started) v4_hot_group_run(&hot_group);
+            }
+        }
+#endif
         if (dec) g_v4_dec_store_fetches += (unsigned long long)nfetch;
 #ifdef COLI_V4_EXPERIMENTAL_PREFETCH
         /* only what the store will be asked for: a mirrored expert is not */
@@ -6669,7 +6753,7 @@ static int moe_token_pipeline(float *output,
             leased[current] = 1;
 #ifdef COLI_V4_GPU_TIER
             int handed = 0;
-            if (store->gpu) {
+            if (store->gpu && !hot_split) {
                 if (coli_v4_hybrid_enabled())
                     /* peek only: uploads are decided once the token's full
                      * miss count is known, by the q* pass below */
@@ -6732,7 +6816,7 @@ static int moe_token_pipeline(float *output,
     }
     /* If the token cannot take the fused GPU path after all (an attach
      * failed), its mirror-only views need their host data now. */
-    if (!result && !gpu_compute)
+    if (!result && !gpu_compute && !hot_split)
         result = v4_views_fetch_host(store, views, leased, selected,
                                      weights->plan.layer, fetch, jobs,
                                      loaders, loader_active, dec);
@@ -6740,7 +6824,8 @@ static int moe_token_pipeline(float *output,
     int hybrid_pending_drain = 0;   /* async DMA enqueued, not yet drained */
     int hybrid_uploads = 0;
     struct timespec hybrid_fill_t0 = {0, 0};
-    if (!result && coli_v4_hybrid_enabled() && store->gpu && !gpu_compute) {
+    if (!result && coli_v4_hybrid_enabled() && store->gpu && !gpu_compute &&
+        !hot_split) {
         /* q* pass: the peeks above established which of the token's experts
          * are already resident. Upload only fill = q*(m) of the m misses;
          * the rest stay host-side on purpose. Uploads are timed to feed the
@@ -6794,7 +6879,43 @@ static int moe_token_pipeline(float *output,
         if (selected > 0 && hybrid_gpu_count == selected)
             gpu_compute = 1;    /* every expert made it: use the fused path */
     }
-    if (!result && gpu_compute && store->gpu) {
+    if (hot_group.count) {
+        /* V4_HOT_SPLIT: the CPU's experts beside the group started above */
+        for (int current = 0; !result && current < selected; current++) {
+            if (hot_on_gpu[current]) continue;
+            result = coli_v4_expert_forward_ref(
+                expert_output, &views[current], input,
+                expert_weights[current], config->swiglu_limit);
+            if (!result)
+                for (int i = 0; i < d; i++) output[i] += expert_output[i];
+        }
+        if (hot_started) pthread_join(hot_thread, NULL);
+        if (!result && !hot_group.ok) {
+            /* The device failed: its experts from host data, on the CPU. */
+            for (int i = 0; i < selected; i++)
+                if (hot_on_gpu[i])
+                    views[i].gate.gpu = views[i].up.gpu = views[i].down.gpu = NULL;
+            result = v4_views_fetch_host(store, views, leased, selected,
+                                         weights->plan.layer, fetch, jobs,
+                                         loaders, loader_active, dec);
+            for (int current = 0; !result && current < selected; current++) {
+                if (!hot_on_gpu[current]) continue;
+                result = coli_v4_expert_forward_ref(
+                    expert_output, &views[current], input,
+                    expert_weights[current], config->swiglu_limit);
+                if (!result)
+                    for (int i = 0; i < d; i++) output[i] += expert_output[i];
+            }
+        }
+        if (!result) {
+            for (int i = 0; i < d; i++)
+                output[i] = coli_bf16_round(
+                    output[i] + (hot_group.ok ? hot_group.sum[i] : 0.0f) +
+                    shared_output[i]);
+            g_v4_hyb_gpu_n += (unsigned long long)hot_group.count;
+            g_v4_hyb_cpu_n += (unsigned long long)(selected - hot_group.count);
+        }
+    } else if (!result && gpu_compute && store->gpu) {
         double gpu_t0 = v4_wait_clock();
         void *sg = coli_v4_layer_gpu(weights, "ffn.shared_experts.w1");
         void *su = coli_v4_layer_gpu(weights, "ffn.shared_experts.w3");
@@ -7020,6 +7141,17 @@ static int moe_token_pipeline(float *output,
         if (nvram)
             coli_v4_expert_store_note_vram(store, weights->plan.layer, fetch, nvram);
         if (dec) g_v4_gpu_first_hits += (unsigned long long)nvram;
+    }
+    free(hot_group.sum);
+    if (!result && hot_split) {
+        /* the views the CPU computed still hold their host data */
+        int missing[V4_HOT_MAX_EXPERTS], nmissing = 0;
+        for (int i = 0; i < selected; i++)
+            if (leased[i] && !hot_on_gpu[i]) missing[nmissing++] = i;
+        int best = coli_v4_gpu_hot_pick(weights->plan.layer, expert_ids,
+                                        missing, nmissing);
+        if (best >= 0 && coli_v4_gpu_expert_admit_hot(store, &views[best]) == 0)
+            g_v4_hyb_upload_n++;
     }
 #endif
     if (views)
@@ -12672,6 +12804,9 @@ static int v4_gpu_wanted(void) {
 }
 
 typedef struct V4GpuExpertMirrorCache V4GpuExpertMirrorCache;
+#define V4_HOT_OTHER_MB 256   /* the HIP runtime and the working buffers: 193 measured */
+static int v4_hot_mirrors(ColiExpertStore *store);
+static void v4_hot_mirrors_cap(ColiExpertStore *store, long long mirrors);
 /* Peer mirror pool (DSV4_CUDA_PEER_DEVICE): a second cache on another GPU.
  * The fused MoE runs its experts on that GPU (peer compute) or reads them in
  * place over P2P/NVLink (dsv4_cuda_peer_compute says which). */
@@ -12719,6 +12854,7 @@ static void v4_gpu_route_scratch_clear(void) {
  * 10 GiB the dense/attention mirrors (6.2 GiB) are worth less on the card
  * than the same VRAM as expert mirrors, so they stay in RAM. */
 static long long g_v4_vram_hold_mb;
+static long long g_v4_vram_budget_mb;
 int g_v4_gpu_mirror_on;   /* defined in the GPU unit, read by the expert store */
 
 static void v4_gpu_place(ColiV4Engine *engine, int device) {
@@ -12728,9 +12864,19 @@ static void v4_gpu_place(ColiV4Engine *engine, int device) {
                                                : free_mb;
     if (budget_mb > free_mb) budget_mb = free_mb;
     g_v4_vram_hold_mb = free_mb - budget_mb;
+    g_v4_vram_budget_mb = budget_mb;
     engine->gpu.dense_ram = budget_mb < (10LL << 10);
     fprintf(stderr, "v4_gpu place device=%d budget=%lldMiB dense=%s\n", device,
             budget_mb, engine->gpu.dense_ram ? "ram" : "card");
+    /* The shared experts stay in RAM with the dense mirrors, so the card can
+     * take the hot experts while the CPU computes the rest (V4_HOT_SPLIT).
+     * A GGUF's experts are not mirrored. */
+    coli_v4_hot_split_auto(engine->gpu.dense_ram &&
+                           !coli_v4_index_gguf(engine->target_index));
+    const char *hot = getenv("V4_HOT_SPLIT");
+    if (coli_v4_hot_split_on() && !(hot && *hot))
+        fprintf(stderr, "v4_gpu hot-split=on (dense in RAM; V4_HOT_SPLIT=0 "
+                        "turns it off)\n");
 }
 #endif
 
@@ -12877,11 +13023,25 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     }
 #ifdef COLI_V4_HIP
     g_v4_gpu_mirror_on = engine->experts && engine->experts->gpu;
+    /* V4_HOT_SPLIT: as many mirrors as --vram pays for beside the exact head
+     * and the runtime's own buffers, a number that does not move with the free
+     * VRAM of the moment: which experts run where decides the low bits of the
+     * sums, so the same prompt then gives the same text, within --vram. */
+    if (coli_v4_hot_split_on() && engine->experts && engine->experts->gpu) {
+        long long hidden = engine->config.hidden_size;
+        long long head_mb = (engine->config.vocab_size * hidden * 2) >> 20;
+        long long mirror = 3 * (engine->config.moe_intermediate_size * hidden / 2 +
+                                engine->config.moe_intermediate_size * hidden / 32);
+        long long room_mb = g_v4_vram_budget_mb - head_mb - V4_HOT_OTHER_MB;
+        long long mirrors = room_mb > 0 && mirror > 0 ? (room_mb << 20) / mirror : 0;
+        v4_hot_mirrors_cap(engine->experts, mirrors);
+    }
 #endif
     /* VRAM-first decode never asks the store for a mirrored expert: its RAM
      * pin ranking leaves them out (the peer pool's too, once there is one). */
     if (engine->experts && engine->experts->gpu &&
-        coli_v4_gpu_resident_first() && !coli_v4_hybrid_enabled())
+        (coli_v4_hot_split_on() ||
+         (coli_v4_gpu_resident_first() && !coli_v4_hybrid_enabled())))
         coli_v4_expert_store_vram_held = v4_gpu_expert_vram_held;
     if (ndevices == 2 && engine->experts && engine->experts->gpu && !g_v4_peer_mirrors) {
         if (dsv4_cuda_peer_access(device, peer)) {
@@ -12909,6 +13069,10 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
 
 static void v4_upload_report(void);
 void coli_v4_gpu_engine_close(ColiV4Engine *engine) {
+    if (engine && engine->gpu.enabled && coli_v4_hot_split_on())
+        fprintf(stderr, "v4_gpu hot-split experts gpu=%llu cpu=%llu uploads=%llu mirrors=%d\n",
+                g_v4_hyb_gpu_n, g_v4_hyb_cpu_n, g_v4_hyb_upload_n,
+                v4_hot_mirrors(engine->experts));
     v4_upload_report();
     if (!engine || !engine->gpu.enabled) return;
     /* First, while the store, the shared-expert mirrors and the backend are
@@ -14492,6 +14656,74 @@ int coli_v4_gpu_expert_attach_async(ColiExpertStore *store,
     if (!store || !view) return -1;
     return v4_gpu_expert_attach_cached_ex(
         v4_gpu_expert_cache(store, view->key.layer), view, 0);
+}
+
+static int v4_hot_mirrors(ColiExpertStore *store) {
+    V4GpuExpertMirrorCache *cache = store ? v4_gpu_expert_cache(store, 0) : NULL;
+    return cache ? cache->count : 0;
+}
+static void v4_hot_mirrors_cap(ColiExpertStore *store, long long mirrors) {
+    V4GpuExpertMirrorCache *cache = v4_gpu_expert_cache(store, 0);
+    if (cache && mirrors < cache->capacity) cache->capacity = (int)mirrors;
+    fprintf(stderr, "v4_gpu hot-split mirrors=%d\n", cache ? cache->capacity : 0);
+}
+/* V4_HOT_SPLIT: how often decode picked each expert, halved about every 64
+ * tokens so that a change of subject can replace what VRAM holds. */
+#define V4_HOT_LAYERS 128
+#define V4_HOT_EXPERTS 256
+#define V4_HOT_MIN_USES 2
+#define V4_HOT_HALVE_LAYERS (64u * 43u)
+static uint32_t g_v4_hot_uses[V4_HOT_LAYERS][V4_HOT_EXPERTS];
+static unsigned g_v4_hot_layers_seen;
+static uint32_t v4_hot_uses(int layer, int expert) {
+    return layer >= 0 && layer < V4_HOT_LAYERS && expert >= 0 &&
+           expert < V4_HOT_EXPERTS ? g_v4_hot_uses[layer][expert] : 0;
+}
+void coli_v4_gpu_hot_touch(int layer, const int *ids, int count) {
+    if (layer < 0 || layer >= V4_HOT_LAYERS) return;
+    for (int i = 0; i < count; i++)
+        if (ids[i] >= 0 && ids[i] < V4_HOT_EXPERTS) g_v4_hot_uses[layer][ids[i]]++;
+    if (++g_v4_hot_layers_seen >= V4_HOT_HALVE_LAYERS) {
+        g_v4_hot_layers_seen = 0;
+        for (int l = 0; l < V4_HOT_LAYERS; l++)
+            for (int e = 0; e < V4_HOT_EXPERTS; e++) g_v4_hot_uses[l][e] /= 2;
+    }
+}
+/* The most used of `count` views (indices into ids), or -1. */
+int coli_v4_gpu_hot_pick(int layer, const int *ids, const int *candidates, int count) {
+    int best = -1;
+    uint32_t most = 0;
+    for (int i = 0; i < count; i++) {
+        uint32_t uses = v4_hot_uses(layer, ids[candidates[i]]);
+        if (uses > most) { most = uses; best = candidates[i]; }
+    }
+    return best;
+}
+/* Upload `view` if it has been used enough: into free room, else over the
+ * least used mirror of another layer when it was used at least twice as often
+ * (the expert keeps its place otherwise: no churn over the bus). 0 = uploaded. */
+int coli_v4_gpu_expert_admit_hot(ColiExpertStore *store, ColiExpertView *view) {
+    if (!store || !view) return -1;
+    V4GpuExpertMirrorCache *cache = v4_gpu_expert_cache(store, view->key.layer);
+    if (!cache) return -1;
+    uint32_t uses = v4_hot_uses(view->key.layer, view->key.expert);
+    if (uses < V4_HOT_MIN_USES) return -1;
+    int r = v4_gpu_expert_attach_cached_mode(cache, view, 1, 1);
+    if (r != -2) return r;
+    pthread_mutex_lock(&cache->mutex);
+    int victim = -1;
+    uint32_t least = 0;
+    if (cache->count >= V4_MIRROR_RECYCLE_MIN && !cache->experts_per_layer)
+        for (int i = 0; i < cache->count; i++) {
+            if (cache->entries[i].layer == view->key.layer) continue;
+            uint32_t held = v4_hot_uses(cache->entries[i].layer,
+                                        cache->entries[i].expert);
+            if (victim < 0 || held < least) { victim = i; least = held; }
+        }
+    int replace = victim >= 0 && uses >= 2 * least;
+    if (replace) cache->entries[victim].clock = 0;   /* the recycle's choice */
+    pthread_mutex_unlock(&cache->mutex);
+    return replace ? v4_gpu_expert_attach_cached_mode(cache, view, 1, 0) : -1;
 }
 
 extern int dsv4_cuda_stream_drain(int device);

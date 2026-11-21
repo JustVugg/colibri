@@ -35,6 +35,9 @@ int dsv4_cuda_peer_probe(int device, int peer, char *why, int why_size) {
 }
 int dsv4_cuda_lost(void) { return 0; }
 int coli_v4_hybrid_enabled(void) { return 0; }
+int coli_v4_hot_split_on(void) { return 0; }
+/* v4_gpu_place (the HIP build) hands the block unit its pick */
+void coli_v4_hot_split_auto(int on) { (void)on; }
 int coli_v4_gpu_resident_first(void) { return 0; }
 void (*coli_v4_expert_store_vram_held)(ColiExpertStore *store, int layer,
                                        unsigned char *held, int experts);
@@ -645,6 +648,70 @@ static void upload_counts_reset(void) {
     memset(fence_drains, 0, sizeof(fence_drains));
     refill_calls = refill_off_main = 0;
 }
+/* V4_HOT_SPLIT: an expert enters VRAM once it has been used twice, takes free
+ * room first, and then only replaces a mirror of another layer that was used
+ * at most half as often. */
+static ColiExpertView hot_view(int layer, int expert) {
+    ColiExpertView view = upload_view(expert);
+    view.key.layer = layer;
+    return view;
+}
+static void hot_use(int layer, int expert, int times) {
+    for (int i = 0; i < times; i++) coli_v4_gpu_hot_touch(layer, &expert, 1);
+}
+static void test_hot_admission(void) {
+    memset(g_v4_hot_uses, 0, sizeof(g_v4_hot_uses));
+    g_v4_hot_layers_seen = 0;
+    V4GpuExpertMirrorCache *cache = v4_gpu_expert_mirrors_create_capacity(0, 8);
+    cache->first_layer = 0; cache->end_layer = 4;
+    ColiExpertStore store = {0};
+    store.gpu = cache;
+    int tensors = live_tensors;
+    /* used once: stays on the CPU */
+    ColiExpertView view = hot_view(1, 0);
+    hot_use(1, 0, 1);
+    assert(coli_v4_gpu_expert_admit_hot(&store, &view) == -1 && cache->count == 0);
+    /* used twice: free room */
+    hot_use(1, 0, 1);
+    assert(coli_v4_gpu_expert_admit_hot(&store, &view) == 0 && view.gate.gpu);
+    assert(cache->count == 1 && live_tensors == tensors + 3);
+    /* the pick is the most used of the candidates; none used: none */
+    int ids[3] = {5, 6, 7}, candidates[3] = {0, 1, 2};
+    assert(coli_v4_gpu_hot_pick(2, ids, candidates, 3) == -1);
+    hot_use(2, 6, 3); hot_use(2, 7, 1);
+    assert(coli_v4_gpu_hot_pick(2, ids, candidates, 3) == 1);
+    /* a full cache of layer 1: nothing of that layer may be replaced */
+    for (int expert = 1; expert < 8; expert++) {
+        ColiExpertView fill = hot_view(1, expert);
+        hot_use(1, expert, 2);
+        assert(coli_v4_gpu_expert_admit_hot(&store, &fill) == 0);
+    }
+    assert(cache->count == 8);
+    ColiExpertView same = hot_view(1, 20);
+    hot_use(1, 20, 100);
+    assert(coli_v4_gpu_expert_admit_hot(&store, &same) == -1 && !same.gate.gpu);
+    /* from layer 2 the coldest mirror (2 uses) needs 4 uses to go */
+    ColiExpertView other = hot_view(2, 9);
+    hot_use(2, 9, 3);
+    assert(coli_v4_gpu_expert_admit_hot(&store, &other) == -1 && !other.gate.gpu);
+    hot_use(2, 9, 1);
+    hot_use(1, 0, 1);   /* expert 0 is no longer the coldest */
+    assert(coli_v4_gpu_expert_admit_hot(&store, &other) == 0 && other.gate.gpu);
+    assert(cache->count == 8 && live_tensors == tensors + 24);
+    assert(v4_gpu_expert_find(cache, 2, 9) && v4_gpu_expert_find(cache, 1, 0));
+    assert(!v4_gpu_expert_find(cache, 1, 1));
+    /* the counts decay, so that a new subject can take over */
+    uint32_t before = g_v4_hot_uses[2][9];
+    int unused = 200;
+    for (unsigned i = g_v4_hot_layers_seen; i < V4_HOT_HALVE_LAYERS; i++)
+        coli_v4_gpu_hot_touch(3, &unused, 1);
+    assert(g_v4_hot_uses[2][9] == before / 2);
+    /* a capacity below the count of mirrors --vram pays for is the limit */
+    v4_hot_mirrors_cap(&store, 8);
+    assert(cache->capacity == 8 && v4_hot_mirrors(&store) == 8);
+    v4_gpu_expert_mirrors_free(cache);
+    assert(live_tensors == tensors);
+}
 static void test_upload_thread(void) {
     V4GpuExpertMirrorCache *cache = v4_gpu_expert_mirrors_create_capacity(2, 8);
     cache->first_layer = 0; cache->end_layer = 4;
@@ -906,6 +973,7 @@ int main(void) {
     test_preload();
     test_mirror_block();
     test_upload_thread();
+    test_hot_admission();
     test_resident_route();
     test_bank_make_room();
     test_wo_decode();

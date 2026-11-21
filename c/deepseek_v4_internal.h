@@ -1249,6 +1249,11 @@ int coli_v4_gpu_resident_first(void);
 /* DSV4_HYBRID=1 gate plus its cross-unit counters/EMAs: defined in the block
  * unit, read by the serve unit's per-turn stderr line. */
 int coli_v4_hybrid_enabled(void);
+int coli_v4_hot_split_on(void);
+void coli_v4_hot_split_auto(int on);
+void coli_v4_gpu_hot_touch(int layer, const int *ids, int count);
+int coli_v4_gpu_hot_pick(int layer, const int *ids, const int *candidates, int count);
+int coli_v4_gpu_expert_admit_hot(ColiExpertStore *store, ColiExpertView *view);
 /* async attach (enqueue only; drain closes the pipeline before compute) */
 int coli_v4_gpu_expert_attach_async(ColiExpertStore *store,
                                     ColiExpertView *view);

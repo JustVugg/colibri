@@ -726,6 +726,77 @@ token-layers (`calls`), their wall time from routing on, the wait for store
 fetches, the VRAM attach time and the mirror `uploads` it caused, and the
 fused GPU compute.
 
+### Hot experts on the card, the rest on the CPU (`V4_HOT_SPLIT`, on below 10 GiB on HIP)
+
+On a card that holds few experts the GPU tier can decode slower than the CPU
+alone. With `--vram 5` on an 8 GB RX 7600M XT (PCIe 4.0 x8) about four in five
+routed experts miss VRAM, and uploading one (1.0 ms for its 12.75 MiB) costs
+more than computing it on a 16-core CPU (about 0.8 ms): the card mostly waits
+for the bus. `V4_HOT_SPLIT` uses the card for the experts decode picks most
+and the CPU for the rest, at the same time:
+
+- as soon as a layer has routed, the token's experts mirrored in VRAM start on
+  the GPU on a helper thread and are not read from the store; the CPU computes
+  the shared expert and the other experts meanwhile, then the sums are added;
+- a miss is never uploaded to be used now. After the layer at most one of the
+  experts the CPU computed joins the cache: the most used one, into free room,
+  or over the least used mirror of another layer when it was used at least
+  twice as often. Use counts are halved about every 64 tokens, so a change of
+  subject can change what VRAM holds;
+- on HIP the mirror count is fixed from `--vram` (minus the exact head and 256
+  MiB for the runtime) rather than from the free VRAM of the moment: which
+  experts run where decides the low bits of the sums, and the same prompt then
+  gives the same text from run to run, within `--vram`;
+- the hyper-connection team stays whole (`V4_HC_TEAM` unset acts as `0`): the
+  CPU works through every layer.
+
+It needs the shared experts in RAM, as the GPU tier keeps them below 10 GiB of
+`--vram`; with them on the card the switch does nothing. On a HIP build with
+one card the placement turns it on there by itself (`v4_gpu hot-split=on` on
+stderr), not for a GGUF, whose experts are not mirrored; `V4_HOT_SPLIT=0`
+keeps the plain GPU tier, and `1` asks for the split on a CUDA build, where it
+was not measured. Like
+`V4_GPU_RESIDENT_FIRST` it acts on the one-token decode MoE. The GPU and CPU
+expert arithmetic are not bit-identical (see above), so a text can differ from
+a CPU run's in its later tokens.
+
+Measured on a Ryzen 9 7945HX (16 cores) with 62 GB RAM and an RX 7600M XT
+8 GB (gfx1102, PCIe 4.0 x8), DeepSeek V4 Flash REAP 150B, `--vram 5`, 200
+greedy tokens of a counting prompt, one binary (hipcc's default 32-lane
+waves), three alternating runs per row
+(`docs/experiments/v4-hot-split-2026-11-19/`):
+
+| configuration | decode tok/s |
+|---|---|
+| GPU tier, `V4_HOT_SPLIT=0` | 1.66 |
+| CPU only, `COLI_CUDA=0` | 3.14 |
+| GPU tier, `V4_HOT_SPLIT=1` (302 mirrors) | **3.41** |
+
+The counting answer was the same text in all nine runs; about half the
+expert computations ran on the card. Built with 64-lane waves (`-mwavefrontsize64`)
+the split reached 3.65 tok/s. VRAM held at 5045 MiB under `--vram 5` (4013
+MiB at 4, 6065 at 6, 7043 at 7). On an essay prompt the split was 9-10 %
+faster than the CPU (64-lane waves), and its text, the same from run to run,
+differed from the CPU's in later tokens.
+
+With the switch unset (on by itself), the same machine and prompt, one binary,
+three alternating runs per arm (`docs/experiments/v4-hot-split-auto-2026-11-20/`;
+about 3 GiB less RAM free than the day before, so every row is a little
+lower):
+
+| `--vram` | `V4_HOT_SPLIT=0` | unset (split) | mirrors | VRAM peak, MiB |
+|---|---|---|---|---|
+| 4 | 1.51 | **3.35** | 221 | 4013 |
+| 5 | | 3.26 (one run) | 302 | 5045 |
+| 6 | 1.64 | **3.29** | 382 | 6065 |
+| 7 | does not fit | 3.25 | 462 | 7064 |
+| CPU only, `COLI_CUDA=0` | 3.09 | | | |
+
+At `--vram 7` the plain tier peaks about 180 MiB above `--vram`, more than the
+card had free beside the desktop (about 900 MiB). More mirrors move more of
+the experts to the card (43 % at 4, 62 % at 7) without a faster decode. The
+text was the same in all 22 runs.
+
 ### An expert record stays where its read landed (`V4_SLAB_SHIFT`, on)
 
 A direct read of an expert lands a 4 KiB-aligned window of the file in the
@@ -1021,6 +1092,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_UPLOAD_THREAD` (0) | `1` = a decode step hands each mirror upload to an uploader thread and starts its lane's next read at once; the copies go on the device's second stream and the expert group is ordered after them by an event (see [The decode mirror uploads on an uploader thread](#the-decode-mirror-uploads-on-an-uploader-thread-v4_upload_thread-opt-in)) |
 | `V4_UPLOAD_FENCE` (1) | with `V4_UPLOAD_THREAD=1`: `0` = the uploader drains the second stream after each mirror instead of the event |
 | `V4_GPU_RESIDENT_FIRST` (0) | `1` = decode computes VRAM-mirrored experts without an expert-store lookup, and the RAM pins skip them (VRAM adds to the RAM tier); off under `DSV4_HYBRID=1` |
+| `V4_HOT_SPLIT` (on for one HIP card below 10 GiB of `--vram`, else 0) | `1` = decode computes the experts mirrored in VRAM on the GPU while the CPU computes the others, and at most one expert per layer is uploaded, after it, by use count (see [Hot experts on the card, the rest on the CPU](#hot-experts-on-the-card-the-rest-on-the-cpu-v4_hot_split-on-below-10-gib-on-hip)); needs the shared experts in RAM |
 | `DSV4_CUDA_PEER_DEVICE` (unset) | second GPU for a decode mirror pool (peer access required; unused under `DSV4_HYBRID=1`) |
 | `DSV4_CUDA_PEER_COMPUTE` (1, `.cu`) | run the peer pool's experts on the peer GPU (both GPUs at the same SM version; `mode=` in the `peer-mirrors` line); `0` = read them in place over P2P; no effect with `DSV4_CUDA_BATCHED=0`, which reads them in place |
 | `DSV4_CUDA_PEER_FAULT` (unset, `.cu`) | tests: `n` = the n-th peer-compute pass fails at its join with an error the devices survive, and the peer is latched off (that call recomputes on the primary); `n:lost` = the peer also counts as lost (the call fails, decode takes host copies); `n:sticky` = the error is a kernel fault's, which latches CUDA off for the whole process (every later call refused, host paths), as a real fault does |
