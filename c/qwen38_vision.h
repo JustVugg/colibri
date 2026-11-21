@@ -56,6 +56,17 @@ typedef struct {
 } Q38VBlock;
 
 typedef struct {
+    Q38Norm norm;
+    Q38Linear fc1, fc2;
+} Q38VMerger;
+
+typedef struct {
+    int layer;
+    Q38VMerger merger;
+    float *out;
+} Q38VisionTap;
+
+typedef struct {
     int depth, hidden, heads, head_dim, inter, patch, merge, temporal, in_ch;
     int out_hidden, num_pos, side;      /* side = sqrt(num_pos) */
     float eps;
@@ -157,10 +168,25 @@ static void q38v_taps(int index, int size, int side, int *tap, float *weight)
 
 /* ---- il forward --------------------------------------------------------- */
 
+static void q38v_merge(float *out, const float *x, float *tmp, float *hidden,
+                       const Q38VMerger *merger, int n, int width, int unit,
+                       float eps, int postshuffle)
+{
+    const int tokens = n / unit, wide = width * unit;
+    q38v_layernorm(tmp, x, &merger->norm, postshuffle ? tokens : n,
+                   postshuffle ? wide : width, eps);
+    q38v_linear(hidden, tmp, &merger->fc1, tokens);
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < (size_t)tokens * wide; i++)
+        hidden[i] = q38v_gelu_exact(hidden[i]);
+    q38v_linear(out, hidden, &merger->fc2, tokens);
+}
+
 /* patches: [n, in_ch*temporal*patch*patch].  out: [n/merge^2, out_hidden].
  * Ritorna il numero di token prodotti, o -1 se la griglia non e' coerente. */
-static int q38_vision_forward_dbg(const Q38Vision *v, const float *patches,
-                              int grid_h, int grid_w, float *out, float *last_hidden)
+static int q38_vision_forward_tapped(const Q38Vision *v, const float *patches,
+                                    int grid_h, int grid_w, float *out, float *last_hidden,
+                                    const Q38VisionTap *taps, int tap_count)
 {
     if (grid_h <= 0 || grid_w <= 0) return -1;
     if (grid_h % v->merge || grid_w % v->merge) return -1;    /* il merger 2x2 non chiuderebbe */
@@ -174,10 +200,10 @@ static int q38_vision_forward_dbg(const Q38Vision *v, const float *patches,
     float *mlp = (float *)calloc((size_t)n * v->inter, sizeof(float));
     float *cos_t = (float *)calloc((size_t)n * D, sizeof(float));
     float *sin_t = (float *)calloc((size_t)n * D, sizeof(float));
-    float *scores = (float *)calloc((size_t)n, sizeof(float));
-    if (!x || !tmp || !qkv || !att || !mlp || !cos_t || !sin_t || !scores) {
+    float *merge_hidden = (float *)malloc((size_t)n * H * sizeof(float));
+    if (!x || !tmp || !qkv || !att || !mlp || !cos_t || !sin_t || !merge_hidden) {
         free(x); free(tmp); free(qkv); free(att); free(mlp);
-        free(cos_t); free(sin_t); free(scores); return -1;
+        free(cos_t); free(sin_t); free(merge_hidden); return -1;
     }
 
     /* 1. patch embedding, e le posizioni apprese sommate subito dopo. */
@@ -277,32 +303,25 @@ static int q38_vision_forward_dbg(const Q38Vision *v, const float *patches,
         q38v_linear(tmp, mlp, &blk->fc2, n);
         #pragma omp parallel for schedule(static)
         for (size_t i = 0; i < (size_t)n * H; i++) x[i] += tmp[i];
+        for (int j = 0; j < tap_count; j++)
+            if (taps[j].layer == layer)
+                q38v_merge(taps[j].out, x, tmp, merge_hidden, &taps[j].merger,
+                           n, H, unit, v->eps, 1);
     }
 
     if (last_hidden) memcpy(last_hidden, x, (size_t)n * H * sizeof(float));
 
     /* 4. merger: normalizza ogni token, poi ne unisce merge^2 adiacenti. */
-    q38v_layernorm(tmp, x, &v->merger_norm, n, H, v->eps);
-    {
-        const int tokens = n / unit, wide = H * unit;
-        float *grouped = (float *)calloc((size_t)tokens * wide, sizeof(float));
-        float *hidden = (float *)calloc((size_t)tokens * wide, sizeof(float));
-        if (!grouped || !hidden) {
-            free(grouped); free(hidden);
-            free(x); free(tmp); free(qkv); free(att); free(mlp);
-            free(cos_t); free(sin_t); free(scores); return -1;
-        }
-        memcpy(grouped, tmp, (size_t)tokens * wide * sizeof(float));
-        q38v_linear(hidden, grouped, &v->merger_fc1, tokens);
-        #pragma omp parallel for schedule(static)
-        for (size_t i = 0; i < (size_t)tokens * wide; i++) hidden[i] = q38v_gelu_exact(hidden[i]);
-        q38v_linear(out, hidden, &v->merger_fc2, tokens);
-        free(grouped); free(hidden);
-        free(x); free(tmp); free(qkv); free(att); free(mlp);
-        free(cos_t); free(sin_t); free(scores);
-        return tokens;
-    }
+    const Q38VMerger merger = {v->merger_norm, v->merger_fc1, v->merger_fc2};
+    q38v_merge(out, x, tmp, merge_hidden, &merger, n, H, unit, v->eps, 0);
+    free(x); free(tmp); free(qkv); free(att); free(mlp);
+    free(cos_t); free(sin_t); free(merge_hidden);
+    return n / unit;
 }
+
+static int q38_vision_forward_dbg(const Q38Vision *v, const float *patches,
+                                  int grid_h, int grid_w, float *out, float *last_hidden)
+{ return q38_vision_forward_tapped(v, patches, grid_h, grid_w, out, last_hidden, NULL, 0); }
 
 static int q38_vision_forward(const Q38Vision *v, const float *patches,
                               int grid_h, int grid_w, float *out)
