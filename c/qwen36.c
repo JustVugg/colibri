@@ -1416,6 +1416,15 @@ static struct { int l, e; } pilot_q[4096];
 static volatile unsigned pilot_r = 0, pilot_w = 0;
 static Model *pilot_m = NULL;
 static int g_pilot = 0;
+static _Thread_local int tl_loader_thread = 0;   /* set on PILOT pool threads: their loads stay single-threaded */
+
+/* PAR_LOAD=0 turns off the parallel expert loads added for small-RAM streaming (default on):
+ * a token's / a prefill chunk's missed experts are read from disk concurrently instead of
+ * one pread at a time, so the drive sees a queue depth of up to PF_CHUNK (default 8). The
+ * maths and the token ids are unchanged: only the order in which misses are served differs. */
+static int par_load_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("PAR_LOAD"); on = !(e && *e == '0'); } return on; }
+static int pf_chunk(void) { static int n = -1; if (n < 0) { const char *e = getenv("PF_CHUNK"); n = e ? atoi(e) : 8; if (n < 1) n = 1; if (n > 64) n = 64; } return n; }
+static int pilot_threads(void) { static int n = -1; if (n < 0) { const char *e = getenv("PILOT_THREADS"); n = e ? atoi(e) : 1; if (n < 1) n = 1; if (n > 16) n = 16; } return n; }
 static int g_wide  = 1;
 /* CACHE_ROUTE family, same names and defaults as the GLM engine (docs/CACHE_ROUTE.md). */
 static int   g_cache_route = 0;
@@ -1426,6 +1435,8 @@ static float g_route_alpha = 1.f;
 static int   g_route_agree = 0;
 
 static void pilot_prefetch(Model *m, int lnext, const float *x, int S);
+static int pilot_enqueue(Model *m, int layer, int eid);
+static int pf_ahead_on(void);
 static void *pilot_worker(void *arg);
 static void ensure_pilot_worker_started(Model *m);
 static void slot_ensure_allocated(Model *m, Slot *s);
@@ -1524,12 +1535,15 @@ static int slot_victim(const LCache *lc, int layer, int allow_pinned) {
 static void ensure_pilot_worker_started(Model *m) {
     if (!pilot_m) {
         pilot_m = m;
-        pthread_t t;
-        if (pthread_create(&t, NULL, pilot_worker, NULL) != 0) {
-            fprintf(stderr, "Error: Failed to create pilot prefetch worker thread\n");
-            exit(1);
+        const int nw = pilot_threads();
+        for (int i = 0; i < nw; i++) {
+            pthread_t t;
+            if (pthread_create(&t, NULL, pilot_worker, NULL) != 0) {
+                fprintf(stderr, "Error: Failed to create pilot prefetch worker thread\n");
+                exit(1);
+            }
+            pthread_detach(t);
         }
-        pthread_detach(t);
     }
 }
 
@@ -5171,7 +5185,7 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
                 ng[k] = ht[k] != ft[k] ? rows[k] / 16 : 0;
                 if (!ng[k]) memcpy(dst + ho[k], b + fo[k], (size_t)fb[k]);
             }
-            #pragma omp parallel for schedule(static) if (!omp_in_parallel())
+            #pragma omp parallel for schedule(static) if (!omp_in_parallel() && !tl_loader_thread)
             for (int j = 0; j < ng[0] + ng[1] + ng[2]; j++) {
                 const int k = j < ng[0] ? 0 : j < ng[0] + ng[1] ? 1 : 2, g = j - (k > 0 ? ng[0] : 0) - (k > 1 ? ng[1] : 0);
                 const int64_t fr = gq_row_bytes(ft[k], cols[k]), hr = gq_row_bytes(ht[k], cols[k]);
@@ -6697,6 +6711,7 @@ static inline void gq_rows_u(float *y, int u, const gq_act *a, const uint8_t *W,
 static int moe_gq_unit(const GqExp *gx, int D, int I) {
     return gguf_expert_ilv(gx) ? 16 : I % 8 == 0 && D % 8 == 0 && gq_f8_ok(gx->hg, D) && gq_f8_ok(gx->hu, D) && gq_f8_ok(gx->hd, I) ? 8 : 1;
 }
+static void slots_release(Slot **sl, int n) { for (int k = 0; k < n; k++) slot_release(sl[k]); }
 static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const int *idx, const float *val) {
     Cfg *c = &m->c; const int D = q36_eh(c), K = c->topk, I = c->inter;
     const GqExp *gx = &m->gqx[layer];
@@ -6705,12 +6720,12 @@ static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const 
     if (u == 16 && (I % 16 || D % 16)) return -1;
     Slot *sl[64]; int ids[64]; float w[64]; int n = 0;
     for (int k = 0; k < K; k++) if (idx[k] >= 0) { ids[n] = idx[k]; w[n] = val[k]; n++; }
-    for (int k = 0; k < n; k++) expert_get(m, layer, ids[k], &sl[k]);
-    for (int k = 0; k < n; k++) if (sl[k]->eid != ids[k]) {   /* evicted while fetching the others */
-        for (int j = 0; j < n; j++) expert_get(m, layer, ids[j], &sl[j]);
-        for (int j = 0; j < n; j++) if (sl[j]->eid != ids[j]) return -1;
-        break;
-    }
+    /* the token's misses read concurrently (expert_fetch loads outside its lock, as the PILOT worker
+     * does), each held until the step is done: a PILOT load (the lookahead's or the next layer's)
+     * picks its victim among the slots nobody computes from, so it cannot take one of these */
+    #pragma omp parallel for schedule(dynamic, 1) if (par_load_on() && n > 1)
+    for (int k = 0; k < n; k++) sl[k] = expert_hold(m, layer, ids[k]);
+    for (int k = 0; k < n; k++) if (sl[k]->eid != ids[k]) { slots_release(sl, n); return -1; }   /* held: cannot happen */
     /* moe() runs on the engine's thread; the worker threads get these through
      * the local pointers below (thread-local storage here would hand each
      * worker its own empty copy) */
@@ -6721,7 +6736,7 @@ static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const 
         GU_s = falloc((int64_t)cap); H_s = falloc((int64_t)cap); Y_s = falloc((int64_t)cap);
     }
     float *GU = GU_s, *H = H_s, *Y = Y_s;
-    if (gq_act_set(pax, x, 1, D)) return -1;
+    if (gq_act_set(pax, x, 1, D)) { slots_release(sl, n); return -1; }
     const int64_t rbg = gq_row_bytes(gx->hg, D), rbu = gq_row_bytes(gx->hu, D), rbd = gq_row_bytes(gx->hd, I);
     const int gI = I / u, gD = D / u;
     #pragma omp parallel for schedule(static)
@@ -6737,7 +6752,7 @@ static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const 
         if (gx->su) for (int i = 0; i < I; i++) u[i] *= gx->su[ids[k]];
         for (int i = 0; i < I; i++) { float gv = g[i]; h[i] = (gv / (1.f + expf(-gv))) * u[i]; }
     }
-    if (gq_act_set(pah, H, n, I)) return -1;   /* row k of ah is expert k's hidden */
+    if (gq_act_set(pah, H, n, I)) { slots_release(sl, n); return -1; }   /* row k of ah is expert k's hidden */
     #pragma omp parallel for schedule(static)
     for (int r = 0; r < n * gD; r++) {
         int k = r / gD, o = (r % gD) * u;
@@ -6754,6 +6769,7 @@ static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const 
         if (m->L[layer].post_en) rmsnorm_scaled(ys, ys, m->L[layer].post_en, D, c->post_eps);   /* Muse Spark */
         for (int d = 0; d < D; d++) out[d] += w[k] * ys[d];
     }
+    slots_release(sl, n);
     return 0;
 }
 
@@ -6774,10 +6790,26 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
     /* a speculative verify's rows (S <= GQ_EXACT_ROWS) read the experts as a decode step does, the
      * file's rows by eight where moe_gq_decode does: a row's bits are then a plain step's (#2874) */
     const int f8 = S <= GQ_EXACT_ROWS && moe_gq_unit(gx, D, I) == 8;
-    for (int e = 0; e < E; e++) {
+    /* the experts this chunk needs, in order; misses of the next PF_CHUNK of them are read
+     * concurrently before their compute (bounded well below cap so nothing prefetched is
+     * evicted before it is used: prefetched slots carry the newest LRU clocks) */
+    int *need = malloc(sizeof(int) * (size_t)E), nn = 0;
+    for (int e = 0; e < E; e++) if (cnt[e + 1] - cnt[e]) need[nn++] = e;
+    int pf = pf_chunk(); { int capl = m->cache[layer].cap; if (pf > capl / 2) pf = capl / 2 > 0 ? capl / 2 : 1; }
+    const int ahead = pf_ahead_on() && m->is_queued != NULL;
+    if (ahead) ensure_pilot_worker_started(m);
+    for (int i0 = 0; i0 < nn; i0 += pf) {
+        const int i1 = i0 + pf < nn ? i0 + pf : nn;
+        if (par_load_on() && i1 - i0 > 1) {
+            #pragma omp parallel for schedule(dynamic, 1)
+            for (int i = i0; i < i1; i++) { Slot *t; expert_get(m, layer, need[i], &t); }
+        }
+        if (ahead) { const int j1 = i1 + pf < nn ? i1 + pf : nn; for (int j = i1; j < j1; j++) pilot_enqueue(m, layer, need[j]); }
+    for (int ii = i0; ii < i1; ii++) {
+        const int e = need[ii];
         int n = cnt[e + 1] - cnt[e]; if (!n) continue;
         const int *tl = tok + cnt[e]; const float *wl = wt + cnt[e];
-        Slot *sl; expert_get(m, layer, e, &sl);
+        Slot *sl = expert_hold(m, layer, e);   /* the lookahead's PILOT loads may not evict it mid-matmul */
         for (int r = 0; r < n; r++) memcpy(X + (int64_t)r * D, x + (int64_t)tl[r] * D, sizeof(float) * (size_t)D);
         const int ex = f8 && !gq_act_set(&act, X, n, D);
         if (ex) {
@@ -6803,6 +6835,7 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
             for (int r = 0; r < D / 8; r++) gq_rows_f8(Y + 8 * r, D, &ah, wd + (int64_t)8 * r * rbd, rbd, gx->hd, I, 8);
         } else
         gq_matmul(Y, G, sl->gqe + gx->hb_g + gx->hb_u, gx->hd, n, I, D);
+        slot_release(sl);
         if (gx->sd) for (int64_t q = 0; q < (int64_t)n * D; q++) Y[q] *= gx->sd[e];
         if (m->L[layer].post_en)   /* Muse Spark: every expert's output scaled, then normalised */
             for (int r = 0; r < n; r++) rmsnorm_scaled(Y + (int64_t)r * D, Y + (int64_t)r * D, m->L[layer].post_en, D, c->post_eps);
@@ -6811,6 +6844,8 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
             for (int d = 0; d < D; d++) os[d] += w * ys[d];
         }
     }
+    }
+    free(need);
     gq_act_free(&act); gq_act_free(&ah);
     free(cnt); free(tok); free(wt); free(fill); free(X); free(G); free(U); free(Y);
 }
@@ -8277,6 +8312,22 @@ static float *q36_step_rows(Model *m, const Q36Row *rows, const int *ids, int S,
     return logit;
 }
 
+/* queue (layer, eid) for the prefetch pool unless resident or already queued; returns 1 if queued */
+static int pilot_enqueue(Model *m, int layer, int eid) {
+    Cfg *c = &m->c; const int gidx = layer * c->n_experts + eid;
+    pthread_mutex_lock(&g_pilot_mx);
+    if (slot_indexed(m, layer, eid) || m->is_queued[gidx]) { pthread_mutex_unlock(&g_pilot_mx); return 0; }
+    m->is_queued[gidx] = 1;
+    pthread_mutex_unlock(&g_pilot_mx);
+    unsigned w2 = __atomic_load_n(&pilot_w, __ATOMIC_RELAXED);
+    unsigned r2 = __atomic_load_n(&pilot_r, __ATOMIC_ACQUIRE);
+    if (w2 - r2 < 4096) { pilot_q[w2 & 4095].l = layer; pilot_q[w2 & 4095].e = eid; __atomic_store_n(&pilot_w, w2 + 1, __ATOMIC_RELEASE); return 1; }
+    pthread_mutex_lock(&g_pilot_mx); m->is_queued[gidx] = 0; pthread_mutex_unlock(&g_pilot_mx);
+    return 0;
+}
+/* PF_AHEAD=0 turns off the prefill lookahead: while a chunk of experts computes, the pool reads the next chunk */
+static int pf_ahead_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("PF_AHEAD"); on = !(e && *e == '0'); } return on; }
+
 static void pilot_realload(Model *m, int layer, int eid) {
     LCache *lc = &m->cache[layer]; Cfg *c = &m->c;
     pthread_mutex_lock(&g_pilot_mx);
@@ -8303,13 +8354,15 @@ static void pilot_realload(Model *m, int layer, int eid) {
 
 static void *pilot_worker(void *arg) {
     (void)arg;
+    tl_loader_thread = 1;
     while (1) {
         unsigned r = __atomic_load_n(&pilot_r, __ATOMIC_ACQUIRE);
         unsigned w = __atomic_load_n(&pilot_w, __ATOMIC_ACQUIRE);
         if (r == w) { sleep_ms(1); continue; }
+        /* several workers (PILOT_THREADS) share the ring: claim the entry before reading it */
+        if (!__atomic_compare_exchange_n(&pilot_r, &r, r + 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) continue;
         int layer = pilot_q[r & 4095].l, eid = pilot_q[r & 4095].e;
         pilot_realload(pilot_m, layer, eid);
-        __atomic_store_n(&pilot_r, r + 1, __ATOMIC_RELEASE);
     }
     return NULL;
 }
