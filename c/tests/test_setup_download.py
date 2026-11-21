@@ -441,8 +441,10 @@ class DownloadTest(unittest.TestCase):
         .cmd around the same script on Windows."""
         script = Path(self.tmp.name, "curl_stand_in.py")
         script.write_text(
-            "import sys, urllib.request\n"
+            "import os, sys, urllib.request\n"
             "args = sys.argv[1:]\n"
+            "if os.environ.get('CURL_ARGV_LOG'):\n"
+            "    open(os.environ['CURL_ARGV_LOG'], 'w').write('\\n'.join(args))\n"
             "out = args[args.index('-o') + 1]\n"
             "data = urllib.request.urlopen(args[-1]).read()\n"
             "open(out, 'wb').write(data)\n")
@@ -477,6 +479,31 @@ class DownloadTest(unittest.TestCase):
             setup_download.download_file_windows(self.url(other), os.path.join(self.dst, other),
                                                  bad, fake_curl)
         self.assertFalse(os.path.exists(os.path.join(self.dst, other)))
+
+    def test_windows_curl_transport_bounds_a_stalled_transfer(self):
+        """The Python transport gives up on a connection that sends nothing for
+        60 s; curl.exe has no read timeout of its own, and the loop waiting on it
+        has no deadline. Without a speed floor a transfer that stalls keeps
+        coli setup waiting forever instead of failing with "rerun to continue"."""
+        fake_curl = self.stand_in_curl()
+        argv_log = Path(self.tmp.name, "curl_argv.txt")
+        name = "README.md"
+        with mock.patch.object(setup_download, "wsl_windows_path", side_effect=lambda p: p), \
+                mock.patch.dict(os.environ, {"CURL_ARGV_LOG": str(argv_log)}):
+            setup_download.download_file_windows(
+                self.url(name), os.path.join(self.dst, name), self.spec(name), fake_curl)
+        argv = argv_log.read_text().split("\n")
+
+        def value(flag):
+            self.assertIn(flag, argv)
+            return int(argv[argv.index(flag) + 1])
+
+        self.assertGreater(value("--connect-timeout"), 0)
+        self.assertGreater(value("--speed-limit"), 0)
+        # A floor measured over a full minute, as long as the Python transport's
+        # read timeout, so a slow but moving link is not cut off.
+        self.assertGreaterEqual(value("--speed-time"), 60)
+        self.assertEqual(argv[argv.index("-C") + 1], "-")       # still resumes the .part
 
     def test_token_from_file(self):
         with tempfile.TemporaryDirectory() as hf_home:

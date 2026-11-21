@@ -388,7 +388,13 @@ def download_file_windows(url, dest, spec, curl, *, token=None, progress=None, v
         target = wsl_windows_path(part)
         if not target:
             raise DownloadError("wslpath could not translate the target folder for curl.exe")
+        # curl has no read timeout: without a speed floor a transfer that stalls
+        # keeps the loop below waiting forever. Under 1 KiB/s for a minute (the
+        # Python transport's own read timeout) counts as stalled: --retry tries
+        # again, and after the last retry setup says to rerun, which resumes the
+        # .part (-C -).
         cmd = [curl, "-L", "--fail", "--retry", "5", "--retry-delay", "3", "-s", "-S",
+               "--connect-timeout", "30", "--speed-limit", "1024", "--speed-time", "60",
                "-C", "-", "-o", target, url]
         if token:
             cmd[1:1] = ["-H", f"Authorization: Bearer {token}"]
