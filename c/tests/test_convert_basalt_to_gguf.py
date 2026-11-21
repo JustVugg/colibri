@@ -22,7 +22,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError as exc:
+    # make basalt-convert-check sets BASALT_CONVERT_REQUIRED=1: there a missing numpy is a failure, not a skip
+    if os.environ.get("BASALT_CONVERT_REQUIRED") == "1":
+        raise
+    raise unittest.SkipTest("numpy not installed: %s" % exc)
 
 HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HERE / "tests"))
