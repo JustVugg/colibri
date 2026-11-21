@@ -1997,6 +1997,36 @@ qwen38-tiny-mxfp4-check: qwen38-tiny-mxfp4-generate qwen38$(EXE) tests/test_qwen
 qwen38-tiny-mirror-check: qwen38-tiny-int4-generate qwen38$(EXE)
 	$(PYTHON) tests/qwen38_mirror_check.py --model ./qwen38_tiny_int4 --engine ./qwen38$(EXE)
 
+# The grouped MoE (q38_moe_decode_grouped) on MXFP4 experts. The tiny fixture's experts are
+# narrower than one 32-wide scale group and the grouped path declines them; this fixture has
+# the GGUF oracle's geometry (gguf-256: hidden and expert widths 256, 8 experts, top-2). Gates,
+# at caps 2, 4 and 8: ref.json reproduced; the rows grouped by expert in one parallel region
+# (its startup line); the last logits identical to the bit to the decode loop's
+# (Q38_MOE_GROUPED=0) grouped, through the prompt batch, and with Q38_ROUTE_PAR=1
+# (Q38_ROUTE_PAR_MIN=1: every block routed in a parallel region) and Q38_GROUP_KEEP=1.
+.PHONY: qwen38-tiny-mxfp4-grouped-check
+qwen38-tiny-mxfp4-grouped-check: qwen38$(EXE)
+	$(PYTHON) tools/make_qwen38_tiny.py --out ./qwen38_tiny_mxfp4_256 --mxfp4-experts --expert-gain 3 --geometry gguf-256
+	@d=./qwen38_tiny_mxfp4_256/logits; rm -rf $$d; mkdir -p $$d; n=0; \
+	for cap in 2 4 8; do for mode in loop grouped prefill par; do \
+		case $$mode in \
+			loop) e="Q38_MOE_GROUPED=0 Q38_PREFILL_BATCH=0";; \
+			grouped) e="Q38_PREFILL_BATCH=0";; \
+			prefill) e="Q38_MOE_GROUPED=0 Q38_PREFILL_BATCH=1 Q38_ROUTE_PAR=1 Q38_ROUTE_PAR_MIN=1";; \
+			par) e="Q38_ROUTE_PAR=1 Q38_ROUTE_PAR_MIN=1 Q38_GROUP_KEEP=1";; \
+		esac; \
+		env $$e Q38_EXPERT_LOWBIT=mxfp4 DUMP=$$d/c$$cap-$$mode.f32 OMP_NUM_THREADS=4 \
+			SNAP=./qwen38_tiny_mxfp4_256 ./qwen38$(EXE) $$cap 8 ./qwen38_tiny_mxfp4_256/ref.json > $$d/run.log 2>&1 \
+			|| { cat $$d/run.log; echo "FAIL mxfp4 grouped, cap=$$cap $$mode"; exit 1; }; \
+		grep -q 'routed experts: experts-mxfp4' $$d/run.log || { cat $$d/run.log; echo "FAIL the sidecar was not used"; exit 1; }; \
+		case $$mode in grouped|par) grep -q 'grouped by expert, one parallel region' $$d/run.log \
+			|| { cat $$d/run.log; echo "FAIL cap=$$cap $$mode: the MXFP4 rows were not grouped"; exit 1; };; esac; \
+		cmp -s $$d/c$$cap-$$mode.f32 $$d/c2-loop.f32 \
+			|| { echo "FAIL cap=$$cap $$mode: last logits differ from the decode loop's"; exit 1; }; \
+		n=$$((n+1)); \
+	done; done; \
+	echo "qwen38 mxfp4 grouped: ref.json reproduced in $$n configurations, last logits identical to the decode loop's"
+
 # Speculative decoding with the checkpoint's MTP head (Q38_MTP=1; qwen38_core.h,
 # "the MTP head"). The fixtures are the three above plus an MTP head (--mtp:
 # random head weights from their own seed under the release's mtp.* names; the
@@ -2424,6 +2454,10 @@ tests/test_qwen38_int4_experts$(EXE): tests/test_qwen38_int4_experts.c qwen38.c 
 # The MXFP4 expert matmul with no model (part of test-c); given a converted snapshot on
 # argv it checks the experts-mxfp4/ sidecar's loaders too (qwen38-tiny-mxfp4-check).
 tests/test_qwen38_mxfp4_experts$(EXE): tests/test_qwen38_mxfp4_experts.c qwen38.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+# Q38_ROUTE_PAR's one-pass top-k against the K-pass pick on random router rows (part of test-c).
+tests/test_qwen38_route_par$(EXE): tests/test_qwen38_route_par.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_qwen38_igpu_defaults$(EXE): tests/test_qwen38_igpu_defaults.c qwen38.c $(VK_OBJ)

@@ -5,6 +5,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### New
+
+- **qwen38: the grouped MoE takes MXFP4 experts** (`experts-mxfp4/`, `Q38_EXPERT_LOWBIT=mxfp4`):
+  decode rows, MTP verifies and prompt chunks are grouped by expert in two parallel regions a
+  layer, as for int4-g64 and the GGUF types, through `quant.h`'s new `matmul_mxfp4_rows` (the same
+  per-row arithmetic as `matmul_mxfp4`, now one shared inline). Before, each MXFP4 assignment ran
+  alone, three parallel regions per expert and row. Bit-identical to the decode loop:
+  `make -C c qwen38-tiny-mxfp4-grouped-check` on a 256-wide MXFP4 fixture.
+- **qwen38: `Q38_ROUTE_PAR=1`** (default off): the router's top-k in one pass over the experts,
+  and a grouped or prompt-batch block of `Q38_ROUTE_PAR_MIN` (16) rows or more routed in one
+  parallel region; the three copies of the routing code are now one (`q38_route_probs`). Exact:
+  `tests/test_qwen38_route_par.c` checks 50,000 random rows (ties, NaN, fallback ranks).
+- **qwen38: `Q38_GROUP_KEEP=1`** (default off): the grouped MoE keeps its per-assignment buffers
+  (46 MB at 256 rows of Qwen3.8) between calls instead of allocating them at every layer.
+
 ## [2.2.0] - 2026-11-21
 
 ### New
