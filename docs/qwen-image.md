@@ -98,8 +98,8 @@ makes every type int8 rows.
 
 ### Metal projections (experimental)
 
-On Apple Silicon, `make -C c METAL=1 qwenimage` builds the Metal projection
-path. Set `COLI_IMG_METAL=1` to use it for the transformer's dense INT8 rows:
+On Apple Silicon, build with `make -C c METAL=1 qwenimage` and set
+`COLI_IMG_METAL=1` to run the transformer's dense INT8 projections on Metal.
 
 ```sh
 COLI_IMG_METAL=1 c/qwenimage --model ~/Models/Qwen-Image-2.1-Turbo \
@@ -107,15 +107,14 @@ COLI_IMG_METAL=1 c/qwenimage --model ~/Models/Qwen-Image-2.1-Turbo \
   --steps 8 --seed 42 --out fox.png
 ```
 
-The path uses the Qwen3.6 Metal matrix kernel with the image engine's existing
-signed INT8 rows and float32 scales and activations. The summation order can
-change the last bits. CPU code still runs attention, the text encoder and the
-VAE. Projections use Metal when the input and output widths are divisible by
-32 and the batch has more than eight rows. Other shapes and weight formats
-stay on the CPU. A GGUF whose transformer remains in block format keeps that
-format. Use `COLI_IMG_NATIVE=0` only when you want to convert those matrices to
-INT8 rows, as in the CPU path. The engine reports how many projections ran on
-Metal.
+Colibri uses the Qwen3.6 Metal matrix kernel for signed INT8 rows with float32
+scales and activations. It uses Metal for batches over eight rows when both
+widths are multiples of 32. The CPU runs other projections, attention, the text
+encoder and the VAE. Metal sums in a different order, which can change the last
+bits.
+
+Set `COLI_IMG_NATIVE=0` to convert a GGUF's block weights to INT8 rows for this
+path. The engine prints the number of projections it ran on Metal.
 
 ### What the files give
 
