@@ -1174,7 +1174,7 @@ cuda_chain.o: cuda_chain.cu cuda_chain.h cuda_dsv4c.cuh cuda_glm53c.cuh cuda_k3c
 
 # The routed-expert tier on a CUDA device: vk_tier.c's logic (cu_tier.c compiles it again,
 # cu_tier.h) over the device side in cu_xb.cu (cu_tier_ops.h).
-cu_xb.o: cu_xb.cu cu_tier_ops.h cuda_bd.cuh vk_alloc.h backend_cuda.h backend_gpu_compat.h .build-config
+cu_xb.o: cu_xb.cu cu_tier_ops.h cuda_bd.cuh cuda_chain.h vk_alloc.h backend_cuda.h backend_gpu_compat.h .build-config
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) -c cu_xb.cu -o $@
 cu_tier.o: cu_tier.c vk_tier.c vk_tier.h cu_tier.h cu_tier_ops.h .build-config
@@ -1569,7 +1569,7 @@ hip-test:
 # host code. An ARM host with a card (DGX Spark, GH200, Jetson) builds it without the x86
 # SIMD kernels, so a name those alone define breaks only there; CI runs this at
 # ARCH=x86-64 (no AVX2) to see it on an x86 runner.
-CUDA_HOST_SRC = qwen38.c qwen36.c olmoe.c qwen36_tier.c backend_loader.c glm53.c deepseek_v41.c colibri.c kimi_k3.c
+CUDA_HOST_SRC = qwen38.c qwen36.c olmoe.c qwen36_tier.c backend_loader.c glm53.c deepseek_v41.c colibri.c kimi_k3.c inkling.c
 cuda-host-syntax:
 	for f in $(CUDA_HOST_SRC); do $(CC) $(filter-out -MMD -MP,$(CFLAGS)) -fsyntax-only -DCOLI_CUDA $$f || exit 1; done
 
