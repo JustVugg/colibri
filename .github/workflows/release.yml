@@ -223,6 +223,9 @@ jobs:
           # person with argparse arguments -- so pack_python's import walk cannot reach
           # it, exactly like k3_tokenizer.py. Copied explicitly for the same reason.
           cp c/tools/check_ablate_evidence.py dist/tools/
+          # gguf_link.py is the setup catalog's post-download step for its GGUF entries, named
+          # there without its .py as k3_tokenizer is: copied explicitly for the same reason.
+          cp c/tools/gguf_link.py dist/tools/
           cp c/coli dist/
           # Windows has nothing to click otherwise: `coli` is an extensionless
           # Python script, and the .exe files are engines that exit at once
@@ -292,6 +295,7 @@ jobs:
           # Same position as k3_tokenizer.py: reachable only by a person, so only an
           # explicit gate can prove it shipped.
           test -f tools/check_ablate_evidence.py || { echo "FAIL: check_ablate_evidence.py missing from archive"; exit 1; }
+          test -f tools/gguf_link.py || { echo "FAIL: gguf_link.py (the setup's GGUF step) missing from archive"; exit 1; }
           # E tutto cio' che coli raggiunge, import e sottoprocessi. Il controllo
           # qui sopra guarda l'unico file che il passo di copia aveva appena
           # scritto: conferma se stesso, ed e' il motivo per cui la v1.10.0 e'
@@ -492,13 +496,14 @@ jobs:
 
   # The Windows CUDA package, an archive of its own: coli_cuda.dll (CUDA_ARCH=portable:
   # SASS for sm_80/86/89/90/120 plus compute_120 PTX, so RTX 30, 40 and 50 cards and
-  # their datacenter peers), the CUDA runtime it links, and the five engines that load
-  # it (colibri, glm53, qwen36, qwen38, kimi_k3; CUDA_DLL=1 and Vulkan as in the main archive,
-  # colibri also with its NPU lane); and DeepSeek V4's own two, coli_cuda_dsv4_dg.dll
+  # their datacenter peers), the CUDA runtime it links, and the eleven engines that load
+  # it (colibri, glm53, qwen36, qwen38, kimi_k3, deepseek_v41, mimo, inkling, olmoe, laya,
+  # gliner_decide: every engine coli setup runs on CUDA; CUDA_DLL=1 and Vulkan as in the main
+  # archive, colibri also with its NPU lane); and DeepSeek V4's own two, coli_cuda_dsv4_dg.dll
   # (DeepGEMM, RTX 50) and coli_cuda_dsv4.dll (portable), which the main archive's
   # deepseek_v4.exe loads at run time (#2047; DSV4_TC=0: no cuBLASLt, so
   # cudart64_12.dll is all they need). Unpacked next to windows-x86_64.zip's engines
-  # it replaces those five, and coli setup / coli chat turn CUDA on for an NVIDIA card
+  # it replaces those eleven, and coli setup / coli chat turn CUDA on for an NVIDIA card
   # it runs on. A separate archive because the DLL is large and only an NVIDIA card
   # can use it.
   # windows-2022 and CUDA 12.8.1: the pins of ci.yml's windows-cuda-build, which builds
@@ -532,23 +537,24 @@ jobs:
           cd c
           make cuda-dll CUDA_ARCH=portable
           # the real <engine>.exe targets of c/Makefile (as ci.yml's windows-cuda-build)
-          for t in colibri.exe glm53.exe qwen36.exe qwen38.exe kimi_k3.exe; do make $t CUDA_DLL=1 VK=1 XDNA=1; done
+          for t in colibri.exe glm53.exe qwen36.exe qwen38.exe kimi_k3.exe deepseek_v41.exe mimo.exe inkling.exe olmoe.exe laya.exe gliner_decide.exe; do make $t CUDA_DLL=1 VK=1 XDNA=1; done
           make cuda-dsv4-dll CUDA_ARCH=portable DSV4_TC=0
           make cuda-dsv4-dg-dll DSV4_TC=0
-          ls -l coli_cuda.dll coli_cuda_dsv4.dll coli_cuda_dsv4_dg.dll colibri.exe glm53.exe qwen36.exe qwen38.exe kimi_k3.exe
+          ls -l coli_cuda.dll coli_cuda_dsv4.dll coli_cuda_dsv4_dg.dll colibri.exe glm53.exe qwen36.exe qwen38.exe kimi_k3.exe deepseek_v41.exe mimo.exe inkling.exe olmoe.exe laya.exe gliner_decide.exe
       - name: Package
         shell: bash
         run: |
           mkdir -p dist/pkg
-          cp c/coli_cuda.dll c/coli_cuda_dsv4.dll c/coli_cuda_dsv4_dg.dll c/colibri.exe c/glm53.exe c/qwen36.exe c/qwen38.exe c/kimi_k3.exe dist/pkg/
+          cp c/coli_cuda.dll c/coli_cuda_dsv4.dll c/coli_cuda_dsv4_dg.dll c/colibri.exe c/glm53.exe c/qwen36.exe c/qwen38.exe c/kimi_k3.exe c/deepseek_v41.exe c/mimo.exe c/inkling.exe c/olmoe.exe c/laya.exe c/gliner_decide.exe dist/pkg/
           cp "$CUDA_PATH"/bin/cudart64_*.dll dist/pkg/
           printf '%s\r\n' \
             "colibri ${TAG}: the CUDA backend for Windows" \
             "" \
             "Unpack these files into the folder of colibri-${TAG}-windows-x86_64.zip, next to" \
-            "coli.cmd, replacing colibri.exe, glm53.exe, qwen36.exe, qwen38.exe and" \
-            "kimi_k3.exe. They are the same engines with CUDA added; coli setup then picks" \
-            "CUDA for an NVIDIA card." \
+            "coli.cmd, replacing colibri.exe, glm53.exe, qwen36.exe, qwen38.exe," \
+            "kimi_k3.exe, deepseek_v41.exe, mimo.exe, inkling.exe, olmoe.exe, laya.exe and" \
+            "gliner_decide.exe. They are the same engines with CUDA added; coli setup then" \
+            "picks CUDA for an NVIDIA card." \
             "" \
             "coli_cuda.dll runs on compute capability 8.0 and newer (RTX 30, 40, 50 series," \
             "A100, H100 and later) with an NVIDIA driver for CUDA 12. Older cards keep" \
@@ -566,7 +572,7 @@ jobs:
           mkdir -p verify && cd verify
           7z x ../dist/colibri-${TAG}-windows-x86_64-cuda.zip > /dev/null
           ls -l
-          for f in coli_cuda.dll coli_cuda_dsv4.dll coli_cuda_dsv4_dg.dll colibri.exe glm53.exe qwen36.exe qwen38.exe kimi_k3.exe README-CUDA.txt; do
+          for f in coli_cuda.dll coli_cuda_dsv4.dll coli_cuda_dsv4_dg.dll colibri.exe glm53.exe qwen36.exe qwen38.exe kimi_k3.exe deepseek_v41.exe mimo.exe inkling.exe olmoe.exe laya.exe gliner_decide.exe README-CUDA.txt; do
             test -f $f || { echo "FAIL: $f missing from the CUDA package"; exit 1; }
           done
           # the DLL links the runtime that is beside it, and the engines neither CUDA
@@ -580,7 +586,9 @@ jobs:
           if objdump -p coli_cuda_dsv4.dll coli_cuda_dsv4_dg.dll | grep -qi 'DLL Name: cublas'; then
             echo "FAIL: a DeepSeek V4 DLL links cuBLAS, which the package does not carry"; exit 1
           fi
-          for e in colibri glm53 qwen36 qwen38 kimi_k3; do
+          # inkling.exe's bf16 matrices go through the DLL's ink_ops table (backend_cuda_ink.h)
+          objdump -p coli_cuda.dll | grep -q coli_cuda_ink_ops || { echo "FAIL: coli_cuda.dll does not export coli_cuda_ink_ops"; exit 1; }
+          for e in colibri glm53 qwen36 qwen38 kimi_k3 deepseek_v41 mimo inkling olmoe laya gliner_decide; do
             deps=$(objdump -p $e.exe | grep 'DLL Name')
             if echo "$deps" | grep -qiE 'cudart|vulkan|coli_cuda'; then echo "FAIL: $e.exe links $deps"; exit 1; fi
           done
@@ -589,11 +597,11 @@ jobs:
           sys.path.insert(0, "../c")
           from doctor import windows_backend_dll
           from setup_flow import binary_backends
-          for e in ("colibri", "glm53", "qwen36", "qwen38", "kimi_k3"):
+          for e in ("colibri", "glm53", "qwen36", "qwen38", "kimi_k3", "deepseek_v41", "mimo", "inkling", "olmoe", "laya", "gliner_decide"):
               image = open(e + ".exe", "rb").read()
               if windows_backend_dll(image) != "coli_cuda.dll" or binary_backends(e + ".exe") != {"cuda", "vulkan"}:
                   sys.exit(f"FAIL: {e}.exe is not a CUDA_DLL + Vulkan build")
-          print("OK: colibri, glm53, qwen36, qwen38 and kimi_k3 load coli_cuda.dll and carry Vulkan")
+          print("OK: colibri, glm53, qwen36, qwen38, kimi_k3, deepseek_v41, mimo, inkling, olmoe, laya and gliner_decide load coli_cuda.dll and carry Vulkan")
           PYCHK
       - uses: actions/upload-artifact@v4
         with:

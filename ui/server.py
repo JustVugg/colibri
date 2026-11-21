@@ -27,6 +27,17 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PROXIED = ("/v1/", "/health", "/profile", "/experts", "/power")
 MODELS = "/models/"   # the Models page: what fits this machine, search, download and switch models
 HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authorization", "proxy-authenticate", "host", "content-length"}
+LOOPBACK = ("127.0.0.1", "localhost", "::1")
+
+
+def host_name(value):
+    """the name in a Host header, lower case: `name`, `name:port`, `ipv4:port` or `[ipv6]:port`"""
+    value = (value or "").strip().lower()
+    if value.startswith("["):
+        return value[1:].split("]", 1)[0]
+    if value.count(":") == 1:
+        return value.rsplit(":", 1)[0]
+    return value
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -35,6 +46,8 @@ class Handler(BaseHTTPRequestHandler):
     models_backend = None   # a models service elsewhere (--models-backend)
     models = None           # ui/models.py in this process (the gateway is on this machine)
     port = 8790
+    bind_host = "127.0.0.1"  # what this server listens on (--host)
+    allowed_hosts = ()       # more Host names the API paths accept (--allowed-host)
 
     def _json(self, code, obj):
         b = json.dumps(obj).encode()
@@ -58,6 +71,25 @@ class Handler(BaseHTTPRequestHandler):
         if post and (self.headers.get("X-Colibri-UI") != "1" or not (self.headers.get("Content-Type") or "").startswith("application/json")):
             return False
         return True
+
+    def _api_host_ok(self):
+        """DNS-rebinding guard for the paths this server passes on to the gateway. The gateway
+        refuses a Host that is not loopback, but it sees only the Host this proxy writes (the
+        client's is dropped, see HOP), so without this a page on another site that re-points its
+        name at 127.0.0.1 reaches the gateway through the UI port. Applies only to a server bound
+        to this machine: once it listens on 0.0.0.0 or a LAN address the exposure is already
+        chosen, as in the gateway's own guard."""
+        if (self.bind_host or "").strip("[]").lower() not in LOOPBACK:
+            return True
+        name = host_name(self.headers.get("Host"))
+        return name in LOOPBACK or name in self.allowed_hosts or "*" in self.allowed_hosts
+
+    def _host_refused(self):
+        name = host_name(self.headers.get("Host"))
+        self.close_connection = True   # a body may be unread
+        self._json(403, {"error": "Host header %r not allowed. Add it with --allowed-host %s (or COLI_ALLOWED_HOSTS), "
+                                  "or --allowed-host '*' to accept any host when the UI is reached by a name it "
+                                  "cannot predict." % (name, name)})
 
     def _agents(self, path):
         post = self.command == "POST"
@@ -205,6 +237,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _route(self):
         path = urllib.parse.urlparse(self.path).path
+        if (path.startswith(PROXIED) or path == "/v1/responses") and not self._api_host_ok():
+            return self._host_refused()
         if path == "/doc/extract" and self.command == "POST":
             self._doc()
         elif path.startswith("/web/") and self.command == "GET":
@@ -256,6 +290,10 @@ def main():
                     help="where models are, for the Models page (default: colibri's own folder)")
     ap.add_argument("--searx", default=os.environ.get("COLIBRI_SEARX", ""),
                     help="a SearXNG instance for web search (default: DuckDuckGo's HTML results)")
+    ap.add_argument("--allowed-host", action="append",
+                    default=[h.strip() for h in os.environ.get("COLI_ALLOWED_HOSTS", "").split(",") if h.strip()],
+                    help="a Host name the gateway's API paths accept besides loopback, for a UI reached through a "
+                         "reverse proxy or a tunnel name (repeatable; or COLI_ALLOWED_HOSTS; '*' accepts any)")
     ap.add_argument("--exit-with-stdin", action="store_true",
                     help="exit when stdin closes: `coli web` holds it open, so the UI ends with the launcher "
                          "however that ends (coli stop, Ctrl-C, a crash)")
@@ -282,6 +320,10 @@ def main():
     Handler.backend = urllib.parse.urlparse(a.backend)
     Handler.models_backend = urllib.parse.urlparse(a.models_backend) if a.models_backend else None
     Handler.port = a.port
+    Handler.bind_host = a.host
+    Handler.allowed_hosts = tuple(h.strip().lower() for h in a.allowed_host if h and h.strip())
+    if "*" in Handler.allowed_hosts:
+        print("WARNING: --allowed-host '*' accepts ANY Host header (DNS-rebinding guard disabled)", file=sys.stderr)
     if not a.models_backend and Handler.backend.hostname in ("127.0.0.1", "localhost", "::1"):
         try:   # the gateway is on this machine: the Models page is served from here
             import models

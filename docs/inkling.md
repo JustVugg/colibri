@@ -338,6 +338,14 @@ Two ways to run it, as for the Small:
   ./coli import ~/models/Inkling-2-Mini-UD-Q4_K_XL.gguf      # mmproj-F16.gguf next to it
   ```
 
+  The repo's `Mainline_Support/*.gguf_file` hold the same tensors byte for byte in mainline
+  llama.cpp's `inkling2_loop` layout, and import the same way (renamed to `.gguf`, or as they
+  are): the metadata under `inkling2_loop.*` with a `block_count` of 24 and the loop as
+  `loop.count/start/end`, the gates as `blk.N.loop_{q,k,v,ffn}_ctrl_*` (the checkpoint's attn, k,
+  v and mlp) and a loop layer's four message queries in `blk.N.loop_msg_query`. Either file of a
+  quant gives the same `config.json` and the same answers: UD-IQ3_XXS decoded 100 tokens at
+  43.9-44.0 tok/s on CUDA from both (machine D, below), 42.3 on Vulkan.
+
 - **The official checkpoint as int4 g64**: `c/tools/convert_inkling2_int4.py` as for the Small
   (19 GB of NVFP4 and MXFP8 experts in, 18 GB out, 9.6-10.0% relative error on every layer; the
   loop's tensors and the drafter pass as they are).
@@ -385,7 +393,8 @@ oracle; the engine reproduces it token for token on the CPU, on CUDA and on Vulk
 chain, plain and through the converter (`inkling2-loop-oracle` in CI,
 `tests/vulkan_engines.sh inkling2`). `tests/test_gguf_import.py` writes a tiny Mini as unsloth's
 files lay it out and reads it back as the checkpoint it came from, tokens and logits, and checks
-that one pass instead of three answers otherwise.
+that one pass instead of three answers otherwise; the same model in the `inkling2_loop` layout
+gives the same config and, bit for bit, the same logits.
 
 ## Modes
 

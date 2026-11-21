@@ -33,7 +33,7 @@ GPU mediante Vulkan y en las tarjetas NVIDIA mediante CUDA. [Cuál elegir para m
 
 ```
 $ ./coli chat
-  colibri v2.1.0 · GLM-5.2 · 744B MoE · int4 · streaming CPU
+  colibri v2.2.0 · GLM-5.2 · 744B MoE · int4 · streaming CPU
   ✓ ready in 32s · resident 9.9 GB
   › ciao!
   ◆ Ciao! Come posso aiutarti oggi?
@@ -85,9 +85,12 @@ Respondes a una sola pregunta, qué modelo, y Intro acepta la recomendación. Lu
 la instalación:
 
 1. **revisa tu máquina**: RAM, disco libre, CPU y GPU;
-2. **recomienda un modelo que cabe**: la parte del modelo que siempre se queda en
-   RAM, más una caché mínima de expertos, debe caber en tu RAM, y la descarga en
-   tu disco;
+2. **recomienda el modelo que mejor funciona ahí**: mide el ancho de banda de tu RAM
+   (dos segundos), lee la memoria y el ancho de banda de cada tarjeta y el tipo de
+   disco, y estima la velocidad de decodificación de cada modelo en el backend que
+   usaría (todo en la tarjeta, mitad en la tarjeta y mitad en RAM, en RAM, o leyendo
+   del disco en streaming). La opción por defecto es el más capaz que decodifica con
+   fluidez, y el menú muestra la estimación de cada uno;
 3. **prepara el motor**: lo compila para tu máquina si hay un compilador; si no,
    descarga el ya compilado, que funciona en la CPU y, en Linux y Windows, también
    en una GPU Vulkan. Lo compila para tu GPU cuando compensa: CUDA para una tarjeta
@@ -193,12 +196,15 @@ el modelo en secreto. [Cómo funciona](#how-it-works) tiene los detalles.
 
 ## Qué modelo para mi máquina
 
-La instalación recomienda el modelo más capaz que funciona desde la RAM de tu
-máquina, y justo debajo enumera los más grandes, que se leen del disco en
-streaming. `./start-here.sh --list` los muestra todos comparados con tu máquina.
-Las tablas siguen el catálogo propio de la instalación
-([`c/setup_catalog.py`](c/setup_catalog.py)); las descargas son los tamaños que
-Hugging Face indica para cada repositorio.
+La instalación estima a qué velocidad decodifica cada modelo en tu máquina
+([`c/model_fit.py`](c/model_fit.py): los bytes que lee un token entre el ancho de
+banda que los sirve, más un coste por capa, ajustado a las velocidades medidas
+abajo) y recomienda el más capaz que decodifica con fluidez, a 20 tok/s o más; los
+más lentos cuentan menos cuanto más se alejan, y uno que lee expertos del disco en
+streaming cuenta con la mitad de su estimación. `./start-here.sh --list` los muestra
+todos con sus estimaciones para tu máquina. Las tablas siguen el catálogo propio de
+la instalación ([`c/setup_catalog.py`](c/setup_catalog.py)); las descargas son los
+tamaños que Hugging Face indica para cada repositorio.
 
 - **RAM** son dos números: por debajo del primero el modelo no arranca; desde el
   segundo en adelante funciona como en las mediciones.
@@ -216,6 +222,8 @@ Hugging Face indica para cada repositorio.
 |---|---|---|---|---|---|
 | **Qwen3.6-35B-A3B**: chat con razonamiento y herramientas | `qwen36-35b` | 23 GB | 10 / 20 GB | CUDA, Vulkan (también integrada) | 6.0 tok/s en la CPU, 9.9 con Vulkan en la GPU integrada (A); 30.0 con CUDA (C) |
 | Qwen3-Coder-30B-A3B: código y llamadas a herramientas, sin razonamiento | `qwen3-coder-30b` | 19 GB | 8 / 18 GB | CUDA, Vulkan (también integrada) | 8.5-9.6 tok/s con todos los expertos en RAM, 5.1 con 32 por capa (A, CPU) |
+| **Inkling-2-Mini** UD-Q4_K_XL: chat, imágenes y herramientas, Apache 2.0 (GGUF de unsloth) | `inkling2-mini` | 18 GB | 6 / 21 GB | CUDA, Vulkan | 40.9-41.1 tok/s con CUDA, 39.2-39.4 con Vulkan, 8.0-8.1 en la CPU (D) |
+| Inkling-2-Mini UD-IQ2_XXS: lo mismo con expertos de 2 bits, para 8 a 16 GB | `inkling2-mini-iq2` | 9 GB | 4 / 12 GB | CUDA, Vulkan | 46.3-46.5 tok/s con CUDA, 46.0-46.2 con Vulkan, 8.4 en la CPU (D) |
 | **Qwen-Image-2.1**: de texto a imagen, licencia no comercial; con menos RAM, [sus GGUF](docs/qwen-image.md#gguf-unsloth): 10 GB en disco, 5.9 GB de pico | `qwen-image-2.1` | 33 GB | 12 / 18 GB | Vulkan | una imagen de 768x512 en 2 min 40 s (8 núcleos Zen 4, CPU) |
 
 **Modelos grandes, cuyos expertos se leen del disco en streaming** (la velocidad
@@ -227,6 +235,8 @@ la decide el disco: un NVMe rápido es lo que más ayuda)
 | **DeepSeek V4 Flash** (284B): herramientas | `deepseek-v4-flash` | 167 GB | 16 / 32 GB | CUDA, Vulkan | 0.93 tok/s con 32 GB (Ryzen 7 5800X), 1.24 con 63 GB (Ryzen 9 5950X), solo CPU; 1.5-1.6 con CUDA (RTX 5080, 32 GB, dos NVMe) |
 | **MiMo-V2.6 Flash** (309B): visión y herramientas | `mimo-v2.6-flash` | 172 GB | 32 / 52 GB | Vulkan | 2.34-3.37 tok/s (A, CPU) |
 | **Qwen3.8-Flash-Next** (125B + 51B n-gram): visión y herramientas | `qwen38-flash-next` | 186 GB | 24 / 32 GB | CUDA, Vulkan (también integrada) | 1.91-2.56 tok/s con 32-96 expertos por capa; 3.99 con los expertos int4 opcionales (A, CPU) |
+| **Qwen3.8-Flash-Next** UD-IQ2_XS: expertos de 2 bits y su cabeza MTP (GGUF de unsloth) | `qwen38-flash-next-iq2xs` | 80 GB | 16 / 54 GB | CUDA, Vulkan (también integrada) | 55.8-56.6 tok/s con CUDA, 36.3-36.7 con Vulkan, mitad en la tarjeta; 7.5-8.2 en la CPU (D) |
+| Qwen3.8-Flash-Next UD-IQ3_XXS: expertos de 3 bits y su cabeza MTP (GGUF de unsloth) | `qwen38-flash-next-iq3` | 88 GB | 16 / 62 GB | CUDA, Vulkan (también integrada) | 41.5-41.6 tok/s con CUDA, 33.0-33.4 con Vulkan, mitad en la tarjeta (D) |
 | **GLM-5.2** (744B): el modelo de referencia, con la cabeza MTP | `glm-5.2` | 429 GB | 16 / 24 GB | CUDA, Vulkan | 0.05-0.1 tok/s en frío en un portátil de 25 GB; 1.83 en un Ryzen AI Max+ 395 de 128 GB; 9.0-9.2 en 6x RTX 5090 |
 | GLM-5.3 (744B): el mismo motor, sin cabeza MTP | `glm-5.3` | 419 GB | 16 / 24 GB | CUDA, Vulkan | |
 | **Inkling** (975B): expertos int4, pesos densos bf16 | `inkling` | 514 GB | 120 / 128 GB tal como se descarga; 25 GB tras una [conversión de la parte densa](docs/inkling.md) | CUDA, Vulkan | 0.25 tok/s (Ryzen 9 7900, 187 GB, RTX A6000) |
@@ -383,11 +393,11 @@ desviarse de la de la CPU en una palabra
 La instalación compila CUDA en Linux cuando está instalado el CUDA toolkit, para los
 motores que tienen una ruta CUDA: GLM-5.2/5.3 y Mistral-Large-4, GLM-5.3-Flash,
 Inkling, Kimi K3, DeepSeek V4 Flash, DeepSeek V4.1 Flash, MiMo-V2.6,
-Qwen3.8-Flash-Next, y Qwen3.6 con los modelos que ejecuta; OLMoE y los motores de
-decisión se compilan con `make <engine> CUDA=1`. En Windows el motor CUDA es una DLL
+Qwen3.8-Flash-Next, Qwen3.6 con los modelos que ejecuta, OLMoE y los motores de
+decisión (Laya, GLiNER2.5-Decide). En Windows el motor CUDA es una DLL
 aparte ([windows.md](docs/windows.md)), y cada versión lo distribuye ya compilado:
 `colibri-<version>-windows-x86_64-cuda.zip` contiene `coli_cuda.dll` (tarjetas con
-compute capability 8.0 o superior) y los motores colibri, glm53, qwen36, qwen38 y kimi_k3 que
+compute capability 8.0 o superior) y los motores colibri, glm53, qwen36, qwen38, kimi_k3, deepseek_v41, mimo, inkling, olmoe, laya y gliner_decide que
 lo cargan, con las DLL CUDA propias de DeepSeek V4. Descomprímelo sobre el archivo
 principal y la instalación elige CUDA.
 

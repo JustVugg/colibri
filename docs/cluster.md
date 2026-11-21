@@ -64,6 +64,24 @@ without closing is noticed by TCP keepalive in about two deadlines. Raise the
 deadline for a worker whose disk needs more than two minutes per prefill
 chunk.
 
+## Registration token
+
+Registration is open by default, and `--host 0.0.0.0` (above) lets any host that can reach the
+port register as an expert worker: the coordinator then hands its address to `coli serve`, which
+sends it each layer's rows and adds its replies to the output. On a network you do not fully
+control, set a shared secret on the coordinator and on every worker:
+
+```bash
+export COLI_CLUSTER_TOKEN=$(openssl rand -hex 24)   # the same value on each machine
+```
+
+With it set, `register` and `heartbeat` need `Authorization: Bearer <token>`; the workers' calls
+send it from the same variable, so no flag changes. The coordinator warns at start when it listens
+beyond this machine with no token. Reading the topology (`/health`, `/v1/cluster/topology`) stays
+open. The token covers registration only: it travels over plain HTTP, and it does not protect the
+workers' own data port. It stops an unauthenticated host from joining, not an eavesdropper on the
+network, so keep the cluster on a private network or a VPN.
+
 ## Protocol v2
 
 The wire protocol (`COLIEX01` in `c/colibri.c`) has two versions. v1, the

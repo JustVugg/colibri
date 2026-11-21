@@ -29,7 +29,8 @@ colibri runs the GGUF files people already have on disk. The ggml blocks are com
 | `deepseek4` | DeepSeek V4 Flash | deepseek_v4 |
 | `deepseek41` | DeepSeek V4.1 Flash (files with e4m3 engram rows, and the published K-quant and IQ files; `dflash`, its DSpark head, with `--mtp`) | deepseek_v41 |
 | `inkling` | Inkling | inkling |
-| `inkling2` | Inkling-2-Small, text, and pictures with the `mmproj-*.gguf` next to it ([inkling.md](inkling.md#inkling-2-small)) | inkling |
+| `inkling2` | Inkling-2-Small and unsloth's Inkling-2-Mini files, text, and pictures with the `mmproj-*.gguf` next to it ([inkling.md](inkling.md#inkling-2-small)) | inkling |
+| `inkling2_loop` | Inkling-2-Mini in mainline llama.cpp's layout (unsloth's `Mainline_Support` files, [inkling.md](inkling.md#inkling-2-mini)) | inkling |
 | `glm5-next` | GLM-5.3-Flash | glm53 |
 | `glm-dsa` | GLM-5.2, GLM-5.3 | colibri |
 | `mistral-large4` | Mistral-Large-4 ([mistral-large4.md](mistral-large4.md)) | colibri |

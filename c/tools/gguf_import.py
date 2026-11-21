@@ -23,7 +23,9 @@ Supported architectures: qwen35moe (Qwen3.5 / Qwen3.6 MoE -> qwen36 engine), qwe
 dense models -> qwen36 engine), qwen3moe (Qwen3 MoE, Qwen3-Coder -> qwen36 engine), qwen3 (the dense
 Qwen3 -> qwen36 engine), flint (Flint -> qwen36 engine), muse-spark (Muse Spark Open -> qwen36
 engine), lfm3 (LFM3-VL's text model -> qwen36 engine), qwen4exp (Qwen3.8-Flash-Next -> qwen38 engine), deepseek4 (DeepSeek V4
-Flash -> deepseek_v4 engine), inkling (Inkling -> inkling engine), glm5-next (GLM-5.3-Flash ->
+Flash -> deepseek_v4 engine), inkling (Inkling -> inkling engine), inkling2 (Inkling-2-Small and
+unsloth's Inkling-2-Mini files -> inkling engine), inkling2_loop (Inkling-2-Mini as mainline llama.cpp
+lays it out, unsloth's Mainline_Support files -> inkling engine), glm5-next (GLM-5.3-Flash ->
 glm53 engine), glm-dsa (GLM-5.2 / GLM-5.3 -> colibri engine), mimo2 (MiMo-V2.6 -> mimo engine),
 deepseek41 (DeepSeek V4.1 Flash, files with the config whole and the published K-quant and IQ ones ->
 deepseek_v41 engine), olmoe (OLMoE -> olmoe engine). Qwen-Image-2.1's denoiser (unsloth's GGUFs, no
@@ -576,6 +578,35 @@ def inkling2_config(meta, tensors, overrides=None):
         cfg.update({"loop_layer_index_start": ls, "loop_layer_index_end": le, "loop_num_passes": passes,
                     "loop_gate_rank": int(get("loop.gate_rank"))})
     return cfg, layers
+
+
+#: inkling2_loop's metadata names that differ from inkling2's (the rest are inkling2's under the
+#: inkling2_loop prefix)
+INK2_LOOP_KEYS = {"loop.count": "num_loops", "loop.start": "loop.core_start", "loop.end": "loop.core_end"}
+
+
+def inkling2_loop_config(meta, tensors, overrides=None):
+    """Inkling-2-Mini as mainline llama.cpp lays it out (inkling2_loop: unsloth's Mainline_Support
+    files, the same tensors as their inkling2 ones byte for byte). Its metadata is inkling2's under
+    inkling2_loop.*, with the loop as loop.count/start/end and block_count and the per-layer arrays
+    counting the checkpoint's layers, not the passes; st_gguf.h reads its tensors' names (the loop's
+    gates loop_{q,k,v,ffn}_ctrl_*, a loop layer's four message queries in blk.N.loop_msg_query)."""
+    p = "inkling2_loop."
+    if meta.get(p + "loop.varying"):
+        sys.exit("GGUF metadata: inkling2_loop.loop.varying is set (weights that change between the loop's passes), "
+                 "which Inkling-2-Mini does not have: not supported")
+    view = {k: v for k, v in meta.items() if not k.startswith(p)}
+    for k, v in meta.items():
+        if k.startswith(p):
+            view["inkling2." + INK2_LOOP_KEYS.get(k[len(p):], k[len(p):])] = v
+    passes = int(view.get("inkling2.num_loops", 1))
+    ls, le = int(view.get("inkling2.loop.core_start", 0)), int(view.get("inkling2.loop.core_end", 0))
+    if passes > 1 and 0 < ls < le:   # inkling2_config's block_count counts the layers as they run
+        view["inkling2.block_count"] = int(view["inkling2.block_count"]) + (passes - 1) * (le - ls)
+        missing = [i for i in range(ls, le) if f"blk.{i}.loop_msg_query.weight" not in tensors]
+        if missing:
+            sys.exit(f"GGUF: the loop's layer {missing[0]} has no loop_msg_query.weight")
+    return inkling2_config(view, tensors, overrides)
 
 
 def glm5next_config(meta, tensors, overrides=None):
@@ -1141,7 +1172,7 @@ def qwen4exp_config(meta, tensors, overrides=None):
 
 
 COPY_UNREAD = {"qwen4exp"}   # their engine does not read the colibri container (copy mode)
-ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen3moe": qwen3moe_config, "qwen3": qwen3_config, "flint": flint_config, "muse-spark": muse_config, "lfm3": lfm3_config, "deepseek4": deepseek4_config, "inkling": inkling_config, "inkling2": inkling2_config, "glm5-next": glm5next_config, "glm-dsa": glmdsa_config, "mistral-large4": mistral_large4_config, "mimo2": mimo2_config, "deepseek41": deepseek41_config, "kimi-k3": kimik3_config, "olmoe": olmoe_config, "qwen4exp": qwen4exp_config}
+ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen3moe": qwen3moe_config, "qwen3": qwen3_config, "flint": flint_config, "muse-spark": muse_config, "lfm3": lfm3_config, "deepseek4": deepseek4_config, "inkling": inkling_config, "inkling2": inkling2_config, "inkling2_loop": inkling2_loop_config, "glm5-next": glm5next_config, "glm-dsa": glmdsa_config, "mistral-large4": mistral_large4_config, "mimo2": mimo2_config, "deepseek41": deepseek41_config, "kimi-k3": kimik3_config, "olmoe": olmoe_config, "qwen4exp": qwen4exp_config}
 
 # unsloth ships Qwen3.8-Flash-Next's MTP head apart, in an MTP/ folder of the repository:
 # shared-* borrow token_embd and output from the model (the engine always does), the
@@ -1198,7 +1229,8 @@ DSPARK_PREFERENCE = ("Q8_0", "BF16")
 # (projector inkling2): st_gguf.h reads it under the checkpoint's model.visual.* names for
 # inkling2_vision.h, and its geometry goes in config.json's vision_config.
 # Inkling-2-Mini's mmproj names its projector inkling2v (llama.cpp's later name, the same tower).
-MMPROJ_PROJECTORS = {"lfm3": "lfm3vl", "mistral-large4": "pixtral", "inkling2": ("inkling2", "inkling2v")}
+MMPROJ_PROJECTORS = {"lfm3": "lfm3vl", "mistral-large4": "pixtral", "inkling2": ("inkling2", "inkling2v"),
+                     "inkling2_loop": ("inkling2", "inkling2v")}
 
 
 def write_inkling2_vision_config(out_dir, mmproj):
@@ -1935,7 +1967,7 @@ def main():
         print(f"  vision tower: {link.get('mmproj', 'none found next to the model (--mmproj names one): text only')}")
         if link.get("mmproj") and MMPROJ_PROJECTORS[arch] == "pixtral":
             write_pixtral_preprocessor(args.out, link["mmproj"])
-        if link.get("mmproj") and arch == "inkling2":
+        if link.get("mmproj") and arch in ("inkling2", "inkling2_loop"):
             write_inkling2_vision_config(args.out, link["mmproj"])
     (args.out / "gguf.json").write_text(json.dumps(link, indent=1), encoding="utf-8")
     for r in readers:

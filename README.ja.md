@@ -19,7 +19,7 @@
 
 ```
 $ ./coli chat
-  colibri v2.1.0 · GLM-5.2 · 744B MoE · int4 · streaming CPU
+  colibri v2.2.0 · GLM-5.2 · 744B MoE · int4 · streaming CPU
   ✓ ready in 32s · resident 9.9 GB
   › ciao!
   ◆ Ciao! Come posso aiutarti oggi?
@@ -65,7 +65,7 @@ cd colibri
 聞かれる質問は「どのモデルにするか」の 1 つだけで、Enter を押せば推奨のモデルが選ばれます。そのあとセットアップは次のことを行います：
 
 1. **マシンを調べます**：RAM、ディスクの空き容量、CPU、GPU。
-2. **収まるモデルを推奨します**：モデルのうち常に RAM に置かれる部分と、最小限のエキスパートキャッシュが RAM に収まり、ダウンロードしたファイルがディスクに収まる必要があります。
+2. **そのマシンで一番よく動くモデルを推奨します**：RAM の帯域幅を測り（2 秒）、各カードのメモリと帯域幅、ディスクの種類を読み取り、各モデルが使うバックエンドでのデコード速度を見積もります（すべてカード上、半分カード上で半分 RAM、RAM、またはディスクからのストリーミング）。既定はなめらかにデコードできるもののうち最も高性能なモデルで、メニューには各モデルの見積もりが表示されます。
 3. **エンジンを用意します**：コンパイラがあればこのマシン向けにビルドし、なければビルド済みのものをダウンロードします（CPU で動き、Linux と Windows では Vulkan GPU でも動きます）。GPU 向けのビルドは、それで速くなる場合に行います：Linux の NVIDIA カードで CUDA ツールキットがインストールされていれば CUDA、それ以外は Vulkan です。ディスクリート GPU では常に GPU 向けにビルドします。CPU と RAM を共有する内蔵 GPU では、そこで速くなることが計測されたモデル（Qwen3.6、Qwen3-Coder、Qwen3.8-Flash-Next）の場合だけです。足りないパッケージがある場合は、それをインストールするための正確なコマンドを表示して、CPU で続行します。あとでセットアップをもう一度実行すれば、GPU 向けにビルドし直します。
 4. **モデルをダウンロードします**。進捗を表示し、途中から再開できます：いつ止めてもかまいません。もう一度実行すれば、止まったところから続きます。
 5. **colibri を起動し、ブラウザでチャットを開きます**。また、ほかのアプリが使えるアドレスを表示します：
@@ -134,7 +134,7 @@ Mixture-of-Experts モデルは、ディスク上では巨大でも、1 トー�
 
 ## 自分のマシンに合うモデル
 
-セットアップは、あなたのマシンで RAM から動かせるモデルのうち最も高性能なものを推奨し、そのすぐ下に、ディスクからストリーミングする、より大きなモデルを並べます。`./start-here.sh --list` を実行すると、すべてのモデルをこのマシンと照らし合わせて表示します。以下の表はセットアップ自身のカタログ（[`c/setup_catalog.py`](c/setup_catalog.py)）に沿っています。ダウンロードのサイズは、Hugging Face が各リポジトリについて表示しているサイズです。
+セットアップは、あなたのマシンで各モデルがどれだけの速さでデコードできるかを見積もり（[`c/model_fit.py`](c/model_fit.py)：1 トークンが読むバイト数をそれを供給する帯域幅で割り、レイヤーごとのコストを加えたもので、以下で計測した速度に合わせてあります）、20 tok/s 以上でなめらかにデコードできるもののうち最も高性能なモデルを推奨します。遅いモデルは足りない分だけ評価が下がり、エキスパートをディスクからストリーミングするモデルは見積もりの半分として扱います。`./start-here.sh --list` を実行すると、すべてのモデルをこのマシンでの見積もりとともに表示します。以下の表はセットアップ自身のカタログ（[`c/setup_catalog.py`](c/setup_catalog.py)）に沿っています。ダウンロードのサイズは、Hugging Face が各リポジトリについて表示しているサイズです。
 
 - **RAM** は 2 つの数値です：1 つ目を下回るとモデルは起動せず、2 つ目以上あれば計測値どおりに動きます。
 - **GPU** は、セットアップがそのエンジン向けにビルドできるものです（[GPU](#gpus)）。*内蔵 GPU も* とあるものは内蔵 GPU も使います。これらのエンジンは内蔵 GPU で速くなることが計測されています。それ以外のエンジンはディスクリート GPU だけを使います。
@@ -146,6 +146,8 @@ Mixture-of-Experts モデルは、ディスク上では巨大でも、1 トー�
 |---|---|---|---|---|---|
 | **Qwen3.6-35B-A3B**：思考モードとツールに対応したチャット | `qwen36-35b` | 23 GB | 10 / 20 GB | CUDA、Vulkan（内蔵 GPU も） | CPU で 6.0 tok/s、内蔵 GPU の Vulkan で 9.9（A）。CUDA で 30.0（C） |
 | Qwen3-Coder-30B-A3B：コードとツール呼び出し、思考モードなし | `qwen3-coder-30b` | 19 GB | 8 / 18 GB | CUDA、Vulkan（内蔵 GPU も） | 全エキスパートを RAM に置いて 8.5-9.6 tok/s、レイヤーあたり 32 個で 5.1（A、CPU） |
+| **Inkling-2-Mini** UD-Q4_K_XL：チャット、画像、ツール、Apache 2.0（unsloth の GGUF） | `inkling2-mini` | 18 GB | 6 / 21 GB | CUDA、Vulkan | CUDA で 40.9-41.1 tok/s、Vulkan で 39.2-39.4、CPU で 8.0-8.1（D） |
+| Inkling-2-Mini UD-IQ2_XXS：同じモデルを 2 ビットのエキスパートで、8-16 GB 向け | `inkling2-mini-iq2` | 9 GB | 4 / 12 GB | CUDA、Vulkan | CUDA で 46.3-46.5 tok/s、Vulkan で 46.0-46.2、CPU で 8.4（D） |
 | **Qwen-Image-2.1**：テキストから画像、非商用ライセンス。RAM が少ないときは [GGUF](docs/qwen-image.md#gguf-unsloth)：ディスク 10 GB、ピーク 5.9 GB | `qwen-image-2.1` | 33 GB | 12 / 18 GB | Vulkan | 768x512 の画像 1 枚に 2 分 40 秒（Zen 4 の 8 コア、CPU） |
 
 **大きなモデル：エキスパートをディスクからストリーミングします**（速度を決めるのはディスクで、高速な NVMe ドライブが最も効果的です）
@@ -156,6 +158,8 @@ Mixture-of-Experts モデルは、ディスク上では巨大でも、1 トー�
 | **DeepSeek V4 Flash**（284B）：ツール対応 | `deepseek-v4-flash` | 167 GB | 16 / 32 GB | CUDA、Vulkan | CPU のみで、32 GB（Ryzen 7 5800X）なら 0.93 tok/s、63 GB（Ryzen 9 5950X）なら 1.24。CUDA で 1.5-1.6（RTX 5080、32 GB、NVMe 2 台） |
 | **MiMo-V2.6 Flash**（309B）：ビジョンとツール | `mimo-v2.6-flash` | 172 GB | 32 / 52 GB | Vulkan | 2.34-3.37 tok/s（A、CPU） |
 | **Qwen3.8-Flash-Next**（125B + 51B n-gram）：ビジョンとツール | `qwen38-flash-next` | 186 GB | 24 / 32 GB | CUDA、Vulkan（内蔵 GPU も） | レイヤーあたり 32-96 エキスパートで 1.91-2.56 tok/s。オプションの int4 エキスパートで 3.99（A、CPU） |
+| **Qwen3.8-Flash-Next** UD-IQ2_XS：2 ビットのエキスパートと MTP ヘッド（unsloth の GGUF） | `qwen38-flash-next-iq2xs` | 80 GB | 16 / 54 GB | CUDA、Vulkan（内蔵 GPU も） | 半分をカードに載せて CUDA で 55.8-56.6 tok/s、Vulkan で 36.3-36.7、CPU で 7.5-8.2（D） |
+| Qwen3.8-Flash-Next UD-IQ3_XXS：3 ビットのエキスパートと MTP ヘッド（unsloth の GGUF） | `qwen38-flash-next-iq3` | 88 GB | 16 / 62 GB | CUDA、Vulkan（内蔵 GPU も） | 半分をカードに載せて CUDA で 41.5-41.6 tok/s、Vulkan で 33.0-33.4（D） |
 | **GLM-5.2**（744B）：リファレンスモデル、MTP ヘッド付き | `glm-5.2` | 429 GB | 16 / 24 GB | CUDA、Vulkan | 25 GB のラップトップでコールド時 0.05-0.1 tok/s。128 GB の Ryzen AI Max+ 395 で 1.83。6x RTX 5090 で 9.0-9.2 |
 | GLM-5.3（744B）：同じエンジン、MTP ヘッドなし | `glm-5.3` | 419 GB | 16 / 24 GB | CUDA、Vulkan | |
 | **Inkling**（975B）：int4 エキスパート、bf16 の密な重み | `inkling` | 514 GB | ダウンロードしたままなら 120 / 128 GB。[密な重みの変換](docs/inkling.md)後は 25 GB | CUDA、Vulkan | 0.25 tok/s（Ryzen 9 7900、187 GB、RTX A6000） |
@@ -246,7 +250,7 @@ CI は、ソフトウェアドライバ上で、すべてのエンジンの Vulk
 
 ### CUDA：NVIDIA カード
 
-CUDA ツールキットがインストールされていれば、セットアップは Linux で CUDA の経路を持つエンジンを CUDA 付きでビルドします：GLM-5.2/5.3 と Mistral-Large-4、GLM-5.3-Flash、Inkling、Kimi K3、DeepSeek V4 Flash、DeepSeek V4.1 Flash、MiMo-V2.6、Qwen3.8-Flash-Next、そして Qwen3.6 とそれが動かすモデル。OLMoE と判定エンジンは `make <エンジン> CUDA=1` でビルドします。Windows では CUDA エンジンは別の DLL です（[windows.md](docs/windows.md)）。各リリースにはビルド済みのものが含まれます：`colibri-<version>-windows-x86_64-cuda.zip` には `coli_cuda.dll`（compute capability 8.0 以上のカード）と、それを読み込む colibri、glm53、qwen36、qwen38、kimi_k3 の各エンジン、DeepSeek V4 用の CUDA DLL が入っています。メインのアーカイブの上に展開すると、セットアップが CUDA を選びます。
+CUDA ツールキットがインストールされていれば、セットアップは Linux で CUDA の経路を持つエンジンを CUDA 付きでビルドします：GLM-5.2/5.3 と Mistral-Large-4、GLM-5.3-Flash、Inkling、Kimi K3、DeepSeek V4 Flash、DeepSeek V4.1 Flash、MiMo-V2.6、Qwen3.8-Flash-Next、Qwen3.6 とそれが動かすモデル、そして OLMoE と判定エンジン（Laya、GLiNER2.5-Decide）。Windows では CUDA エンジンは別の DLL です（[windows.md](docs/windows.md)）。各リリースにはビルド済みのものが含まれます：`colibri-<version>-windows-x86_64-cuda.zip` には `coli_cuda.dll`（compute capability 8.0 以上のカード）と、それを読み込む colibri、glm53、qwen36、qwen38、kimi_k3、deepseek_v41、mimo、inkling、olmoe、laya、gliner_decide の各エンジン、DeepSeek V4 用の CUDA DLL が入っています。メインのアーカイブの上に展開すると、セットアップが CUDA を選びます。
 
 - **すべてのレイヤーをカード上で**（Qwen3.6、Qwen3.8、OLMoE）：密レイヤー、アテンション、カードが持つルーティングエキスパートを 1 本のチェーンとして実行し、カードにないエキスパートは CPU で実行します。RTX PRO 4000 では Qwen3.6-35B-A3B UD-Q4_K_M のデコードが 104.8 tok/s、プロンプト読み込みが 3,491、OLMoE は 354.6 と 10,418 です（[表](#three-backends-on-one-machine)）。
 - **すべてのエンジンでカード上のエキスパートティア**（`cu_tier.h`）。DeepSeek V4、V4.1、Kimi K3、GLM-5.3、MiMo では密行列もカード上に置きます（`cu_dense.h`）。

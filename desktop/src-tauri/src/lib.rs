@@ -560,8 +560,13 @@ fn retry(app: AppHandle, state: tauri::State<'_, State>) {
     thread::spawn(move || start(app, state));
 }
 
-/// A link that leaves colibri opens in the system's browser, not in this window.
+/// A link that leaves colibri opens in the system's browser, not in this window: http and https
+/// only. The system's opener runs what it is given (a file: link to a program starts it, other
+/// schemes start their own handlers), and a link in an answer is the model's to write.
 fn open_outside(url: &Url) {
+    if !matches!(url.scheme(), "http" | "https") {
+        return;
+    }
     let u = url.as_str();
     let _ = if cfg!(windows) {
         hidden(Command::new("rundll32").args(["url.dll,FileProtocolHandler", u])).spawn()

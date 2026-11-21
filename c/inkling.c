@@ -1695,7 +1695,25 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         m->final_norm = load_t(m, "model.llm.norm.weight");
         m->lm_head    = load_w(m, "model.llm.unembed.weight", 1);
         m->x2_out_query = load_t(m, "model.llm.attn_res.output_query");
-        if (m->c.loop_p > 1) {   /* the checkpoint's two [2 x loop layers, D]: [q, mlp] and [k, v] of each loop layer */
+        char mq[96] = "";
+        if (m->c.loop_p > 1) snprintf(mq, sizeof mq, "model.llm.layers.%d.loop_msg_query", m->c.loop_s);
+        if (m->c.loop_p > 1 && st_has(&m->S, mq)) {
+            /* mainline llama.cpp's inkling2_loop files: a loop layer's four queries in a tensor of its own,
+             * [q, k, v, mlp] (st_gguf.h) */
+            const int nl = m->c.loop_e - m->c.loop_s; const int64_t D = m->c.hidden;
+            m->x2_loopq = falloc((int64_t)nl * 4 * D);
+            for (int j = 0; j < nl; j++) {
+                snprintf(mq, sizeof mq, "model.llm.layers.%d.loop_msg_query", m->c.loop_s + j);
+                if (st_numel(&m->S, mq) != 4 * D) {
+                    fprintf(stderr, "inkling2: %s has %lld values, not 4 x %lld\n", mq,
+                            (long long)st_numel(&m->S, mq), (long long)D);
+                    exit(1);
+                }
+                float *t = load_t(m, mq);
+                memcpy(m->x2_loopq + (int64_t)j * 4 * D, t, 4 * D * sizeof(float));
+                free(t);
+            }
+        } else if (m->c.loop_p > 1) {   /* the checkpoint's two [2 x loop layers, D]: [q, mlp] and [k, v] of each loop layer */
             const int nl = m->c.loop_e - m->c.loop_s; const int64_t D = m->c.hidden;
             const char *qn = "model.llm.middle_cycle_cross_pass_queries", *kvn = "model.llm.middle_cycle_cross_pass_kv_queries";
             if (st_numel(&m->S, qn) != 2 * nl * D || st_numel(&m->S, kvn) != 2 * nl * D) {

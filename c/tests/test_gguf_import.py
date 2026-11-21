@@ -1124,7 +1124,7 @@ def nvfp4_rows(a):
     return out.reshape(rows, cols // 64 * 36), held
 
 
-def write_inkling2_mini(path, t, experts="F32"):
+def write_inkling2_mini(path, t, experts="F32", mainline=False, varying=False):
     """The model of ink2_weights(INK2M, loop=INK2M_LOOP) as unsloth's Inkling-2-Mini GGUFs lay it
     out (llama.cpp's later inkling2 names): block_count and the per-layer arrays in application
     order (the loop's passes one after the other), the short convolutions as the checkpoint has
@@ -1132,21 +1132,31 @@ def write_inkling2_mini(path, t, experts="F32"):
     expert's gate and up rows in one tensor, the loop's gates under blk.N.loop_* and the message
     queries global. The INK2_SCALED layers' experts divided by their global scale (.scale), as
     the NVFP4 layers'; experts "NVFP4" holds those layers' in NVFP4 blocks and the others' as Q8_0,
-    as unsloth's UD-Q4_K_XL does. Returns the model the file holds (t with the experts as read back)."""
+    as unsloth's UD-Q4_K_XL does. Returns the model the file holds (t with the experts as read back).
+    mainline: as mainline llama.cpp lays it out (inkling2_loop, unsloth's Mainline_Support files):
+    the metadata under inkling2_loop.* with the loop as loop.count/start/end, block_count and the
+    arrays counting the checkpoint's layers, the gates as loop_{q,k,v,ffn}_ctrl_* and a loop
+    layer's queries in blk.N.loop_msg_query, [q, k, v, mlp] (as measured on unsloth's two files);
+    varying sets its loop.varying (weights that change between the passes)."""
     g, local_layers, lp = INK2M, INK2M_LOCAL, INK2M_LOOP
     D, E, I, CK, L = g["D"], g["E"], g["I"], g["CK"], g["L"]
     ls, le, P = lp["start"], lp["end"], lp["passes"]
     app = list(range(le)) + [i for _ in range(P - 1) for i in range(ls, le)] + list(range(le, L))
+    loop_keys = (("num_loops", P), ("loop.core_start", ls), ("loop.core_end", le), ("loop.gate_rank", lp["rank"]))
+    if mainline:
+        app = list(range(L))
+        loop_keys = (("loop.count", P), ("loop.start", ls), ("loop.end", le), ("loop.gate_rank", lp["rank"]))
     held = dict(t)
-    w = gguf.GGUFWriter(str(path), "inkling2")
-    p = "inkling2."
+    w = gguf.GGUFWriter(str(path), "inkling2_loop" if mainline else "inkling2")
+    p = "inkling2_loop." if mainline else "inkling2."
+    if mainline:
+        w.add_bool(p + "loop.varying", varying)
     for key, v in (("block_count", len(app)), ("context_length", 4096), ("embedding_length", D),
                    ("attention.key_length", g["HD"]), ("attention.key_length_swa", g["HD"]), ("vocab_size", g["V"]),
                    ("vocab_size_unpadded", g["UV"]), ("expert_count", E), ("expert_used_count", g["K"]),
                    ("expert_feed_forward_length", I), ("attention.sliding_window", g["WIN"]),
                    ("attention.relative_length", g["DR"]), ("attention.relative_extent", g["EXT"]),
-                   ("shortconv.l_cache", CK), ("attn_res.block_size", 2), ("attention.log_scale_floor", 4),
-                   ("num_loops", P), ("loop.core_start", ls), ("loop.core_end", le), ("loop.gate_rank", lp["rank"])):
+                   ("shortconv.l_cache", CK), ("attn_res.block_size", 2), ("attention.log_scale_floor", 4)) + loop_keys:
         w.add_uint32(p + key, v)
     w.add_array(p + "attention.head_count", [g["H"]] * len(app))
     w.add_array(p + "attention.head_count_kv", [g["KVL"] if local_layers[a] else g["KVG"] for a in app])
@@ -1177,8 +1187,9 @@ def write_inkling2_mini(path, t, experts="F32"):
     add("token_embd.weight", t[m + "embed.weight"]); add("token_embd_norm.weight", t[m + "embed_norm.weight"])
     add("output_norm.weight", t[m + "norm.weight"]); add("output.weight", t[m + "unembed.weight"])
     add("output_res_query.weight", t[m + "attn_res.output_query"])
-    add("loop_res_query.weight", t[m + "middle_cycle_cross_pass_queries"])
-    add("loop_kv_res_query.weight", t[m + "middle_cycle_cross_pass_kv_queries"])
+    if not mainline:
+        add("loop_res_query.weight", t[m + "middle_cycle_cross_pass_queries"])
+        add("loop_kv_res_query.weight", t[m + "middle_cycle_cross_pass_kv_queries"])
     for i, local in enumerate(local_layers):
         s, b = f"{m}layers.{i}.", f"blk.{i}."
         if local:
@@ -1205,9 +1216,13 @@ def write_inkling2_mini(path, t, experts="F32"):
             add(b + "attn_res_query.weight", t[f"{m}attn_res.attn_queries.{i - 1}"])
         add(b + "ffn_res_query.weight", t[f"{m}attn_res.mlp_queries.{i}"])
         if ls <= i < le:
-            for c in ("attn", "k", "v", "mlp"):
+            for c, mc in (("attn", "q"), ("k", "k"), ("v", "v"), ("mlp", "ffn")):
                 for kind in ("down", "forget", "gain"):
-                    add(b + f"loop_{c}_{kind}.weight", t[s + f"controllers.{c}.{kind}_weight"])
+                    add(b + (f"loop_{mc}_ctrl_{kind}.weight" if mainline else f"loop_{c}_{kind}.weight"),
+                        t[s + f"controllers.{c}.{kind}_weight"])
+            if mainline:
+                j, q, kv = i - ls, t[m + "middle_cycle_cross_pass_queries"], t[m + "middle_cycle_cross_pass_kv_queries"]
+                add(b + "loop_msg_query.weight", np.stack([q[2 * j], kv[2 * j], kv[2 * j + 1], q[2 * j + 1]]))
         gu, dn = t[s + "mlp.experts.gate_up_proj"], t[s + "mlp.experts.down_proj"]
         if i in INK2_SCALED:
             sg = (np.abs(gu).max(axis=(1, 2)) / 2688.0).astype(np.float32)
@@ -1303,14 +1318,15 @@ def write_inkling2_pair(root, experts="F32", seed=11, dense="F32", vision=False)
     return root / "gg", snap
 
 
-def write_inkling2_mini_pair(root, experts="F32", seed=13):
+def write_inkling2_mini_pair(root, experts="F32", seed=13, mainline=False):
     """write_inkling2_pair's for Inkling-2-Mini: root/mini.gguf imported into root/gg, and
-    root/snap the model the file holds under the official names, with the import's config."""
+    root/snap the model the file holds under the official names, with the import's config.
+    mainline: the file in mainline llama.cpp's layout (write_inkling2_mini)."""
     sys.path.insert(0, str(HERE / "tools"))
     import convert_inkling2_int4 as cv
     root = Path(root)
     t = write_inkling2_mini(root / "mini.gguf", ink2_weights(np.random.default_rng(seed), INK2M, INK2M_LOCAL, INK2M_LOOP),
-                            experts)
+                            experts, mainline)
     p = subprocess.run([sys.executable, str(HERE / "tools" / "gguf_import.py"), str(root / "mini.gguf"), str(root / "gg")],
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     if p.returncode:
@@ -1354,6 +1370,30 @@ class Inkling2Config(unittest.TestCase):
             self.assertEqual((cfg["qk_l2_clip_threshold"], cfg["rel_l2_clip_threshold"]), (3.0, 2.0))
             self.assertEqual((cfg["mlp_gate_softcap"], cfg["mlp_up_softcap"]), (4.0, 25.0))
             self.assertEqual((cfg["vocab_size"], cfg["unpadded_vocab_size"]), (300, 290))
+
+    @unittest.skipIf(gguf is None, "gguf-py (pip install gguf) is not installed")
+    def test_the_mainline_mini_config(self):
+        """Mainline llama.cpp's inkling2_loop (block_count the checkpoint's layers, the loop as
+        loop.count/start/end): the same config.json as unsloth's inkling2 file of the same model."""
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "u").mkdir(); (Path(tmp) / "m").mkdir()
+            a, _ = write_inkling2_mini_pair(Path(tmp) / "u")
+            b, _ = write_inkling2_mini_pair(Path(tmp) / "m", mainline=True)
+            ca, cb = json.loads((a / "config.json").read_text()), json.loads((b / "config.json").read_text())
+            self.assertEqual((ca.pop("colibri_gguf")["arch"], cb.pop("colibri_gguf")["arch"]), ("inkling2", "inkling2_loop"))
+            self.assertEqual(cb, ca)
+
+    @unittest.skipIf(gguf is None, "gguf-py (pip install gguf) is not installed")
+    def test_the_mainline_loop_varying_is_refused(self):
+        """loop.varying (weights that change between the passes, which the Mini does not have) is refused."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mini.gguf"
+            write_inkling2_mini(path, ink2_weights(np.random.default_rng(13), INK2M, INK2M_LOCAL, INK2M_LOOP),
+                                mainline=True, varying=True)
+            p = subprocess.run([sys.executable, str(HERE / "tools" / "gguf_import.py"), str(path), str(Path(tmp) / "gg")],
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn("loop.varying", p.stdout.decode())
 
 
 INKLING = HERE / ("inkling.exe" if sys.platform == "win32" else "inkling")
@@ -1404,6 +1444,22 @@ class Inkling2Gguf(unittest.TestCase):
             ts, ls = inkling_run(snap)
             self.assertEqual(tg, ts)
             self.assertLess(float(np.abs(lg - ls).max()), 1e-3 * max(1.0, float(np.abs(ls).max())))
+
+    def test_the_mainline_mini_gguf_is_the_checkpoint(self):
+        """Inkling-2-Mini in mainline llama.cpp's layout (inkling2_loop: the gates under other names,
+        a loop layer's queries in its own tensor): tokens and logits against the safetensors, and
+        bit for bit the logits of unsloth's inkling2 file of the same model."""
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "m").mkdir(); (Path(tmp) / "u").mkdir()
+            gg, snap = write_inkling2_mini_pair(Path(tmp) / "m", mainline=True)
+            gu, _ = write_inkling2_mini_pair(Path(tmp) / "u")
+            tg, lg = inkling_run(gg)
+            ts, ls = inkling_run(snap)
+            tu, lu = inkling_run(gu)
+            self.assertEqual(tg, ts)
+            self.assertLess(float(np.abs(lg - ls).max()), 1e-3 * max(1.0, float(np.abs(ls).max())))
+            self.assertEqual(tg, tu)
+            self.assertEqual(lg.tobytes(), lu.tobytes())
 
     def test_the_mini_nvfp4_experts(self):
         """The scaled layers' experts as NVFP4 blocks, the others Q8_0 (UD-Q4_K_XL's layout): the

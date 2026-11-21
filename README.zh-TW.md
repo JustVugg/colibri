@@ -22,7 +22,7 @@
 
 ```
 $ ./coli chat
-  colibri v2.1.0 · GLM-5.2 · 744B MoE · int4 · streaming CPU
+  colibri v2.2.0 · GLM-5.2 · 744B MoE · int4 · streaming CPU
   ✓ ready in 32s · resident 9.9 GB
   › ciao!
   ◆ Ciao! Come posso aiutarti oggi?
@@ -72,8 +72,7 @@ cd colibri
 接著安裝程式會：
 
 1. **檢查你的機器**：RAM、硬碟可用空間、CPU 與 GPU；
-2. **推薦一個放得下的模型**：模型中永遠留在 RAM 的部分，加上最少量的專家快取，
-   必須放得進你的 RAM，下載的檔案也必須放得進你的硬碟；
+2. **推薦在這台機器上跑得最好的模型**：測量你的 RAM 頻寬（兩秒），讀取每張顯示卡的記憶體與頻寬以及硬碟類型，並估計每個模型在它會用到的後端上的解碼速度（全部在顯示卡上、一半在顯示卡一半在 RAM、在 RAM 中，或從硬碟串流讀取）。預設推薦解碼流暢的模型中能力最強的一個，選單會顯示每個模型的估計速度；
 3. **取得引擎**：有編譯器時，它會針對你的機器建置引擎；沒有的話，
    就下載預先建置好的版本，在 CPU 上執行，在 Linux 與 Windows 上也能在 Vulkan GPU 上執行。
    在值得的情況下，它會為你的 GPU 建置：
@@ -174,9 +173,7 @@ Starting colibri
 
 ## 我的機器適合哪個模型
 
-安裝程式會推薦能在你的機器上從 RAM 執行、能力最強的模型，
-並在它正下方列出從硬碟串流讀取的更大模型。
-`./start-here.sh --list` 會把所有模型與你的機器逐一對照列出。下面的表格依據安裝程式本身的目錄
+安裝程式會估計每個模型在你的機器上的解碼速度（[`c/model_fit.py`](c/model_fit.py)：一個 token 讀取的位元組數除以供給這些位元組的頻寬，再加上每層的固定開銷，依下面實測的速度擬合），並推薦解碼流暢（20 tok/s 以上）的模型中能力最強的一個；越慢的模型差得越多，分數越低，從硬碟串流讀取專家的模型按其估計速度的一半計算。`./start-here.sh --list` 會列出所有模型以及它們在你的機器上的估計速度。下面的表格依據安裝程式本身的目錄
 （[`c/setup_catalog.py`](c/setup_catalog.py)）；
 下載大小是 Hugging Face 為每個儲存庫列出的大小。
 
@@ -194,6 +191,8 @@ Starting colibri
 |---|---|---|---|---|---|
 | **Qwen3.6-35B-A3B**：支援思考與工具的聊天 | `qwen36-35b` | 23 GB | 10 / 20 GB | CUDA、Vulkan（含內建顯示晶片） | CPU 上 6.0 tok/s，在內建顯示晶片上用 Vulkan 為 9.9（A）；用 CUDA 為 30.0（C） |
 | Qwen3-Coder-30B-A3B：程式碼與工具呼叫，不含思考 | `qwen3-coder-30b` | 19 GB | 8 / 18 GB | CUDA、Vulkan（含內建顯示晶片） | 所有專家都在 RAM 中時 8.5-9.6 tok/s，每層 32 個時 5.1（A，CPU） |
+| **Inkling-2-Mini** UD-Q4_K_XL：聊天、圖片與工具呼叫，Apache 2.0（unsloth 的 GGUF） | `inkling2-mini` | 18 GB | 6 / 21 GB | CUDA、Vulkan | CUDA 40.9-41.1 tok/s，Vulkan 39.2-39.4，CPU 8.0-8.1（D） |
+| Inkling-2-Mini UD-IQ2_XXS：同一模型，專家為 2 位元，適合 8 到 16 GB | `inkling2-mini-iq2` | 9 GB | 4 / 12 GB | CUDA、Vulkan | CUDA 46.3-46.5 tok/s，Vulkan 46.0-46.2，CPU 8.4（D） |
 | **Qwen-Image-2.1**：文字生成圖片，非商業授權；記憶體較少時用[它的 GGUF](docs/qwen-image.md#gguf-unsloth)：磁碟 10 GB，峰值 5.9 GB | `qwen-image-2.1` | 33 GB | 12 / 18 GB | Vulkan | 一張 768x512 的圖片 2 分 40 秒（8 個 Zen 4 核心，CPU） |
 
 **大型模型，專家從硬碟串流讀取**（速度由硬碟決定：
@@ -205,6 +204,8 @@ Starting colibri
 | **DeepSeek V4 Flash**（284B）：支援工具 | `deepseek-v4-flash` | 167 GB | 16 / 32 GB | CUDA、Vulkan | 32 GB 時 0.93 tok/s（Ryzen 7 5800X），63 GB 時 1.24（Ryzen 9 5950X），僅用 CPU；用 CUDA 為 1.5-1.6（RTX 5080，32 GB，兩顆 NVMe） |
 | **MiMo-V2.6 Flash**（309B）：視覺與工具 | `mimo-v2.6-flash` | 172 GB | 32 / 52 GB | Vulkan | 2.34-3.37 tok/s（A，CPU） |
 | **Qwen3.8-Flash-Next**（125B + 51B n-gram）：視覺與工具 | `qwen38-flash-next` | 186 GB | 24 / 32 GB | CUDA、Vulkan（含內建顯示晶片） | 每層 32-96 個專家時 1.91-2.56 tok/s；使用選用的 int4 專家時 3.99（A，CPU） |
+| **Qwen3.8-Flash-Next** UD-IQ2_XS：2 位元專家，附 MTP 頭（unsloth 的 GGUF） | `qwen38-flash-next-iq2xs` | 80 GB | 16 / 54 GB | CUDA、Vulkan（含內建顯示晶片） | 一半在顯示卡上：CUDA 55.8-56.6 tok/s，Vulkan 36.3-36.7；CPU 7.5-8.2（D） |
+| Qwen3.8-Flash-Next UD-IQ3_XXS：3 位元專家，附 MTP 頭（unsloth 的 GGUF） | `qwen38-flash-next-iq3` | 88 GB | 16 / 62 GB | CUDA、Vulkan（含內建顯示晶片） | 一半在顯示卡上：CUDA 41.5-41.6 tok/s，Vulkan 33.0-33.4（D） |
 | **GLM-5.2**（744B）：參考模型，含 MTP head | `glm-5.2` | 429 GB | 16 / 24 GB | CUDA、Vulkan | 25 GB 筆電上冷啟動 0.05-0.1 tok/s；128 GB 的 Ryzen AI Max+ 395 上 1.83；6x RTX 5090 上 9.0-9.2 |
 | GLM-5.3（744B）：同一引擎，不含 MTP head | `glm-5.3` | 419 GB | 16 / 24 GB | CUDA、Vulkan | |
 | **Inkling**（975B）：int4 專家，bf16 稠密權重 | `inkling` | 514 GB | 按下載格式為 120 / 128 GB；經過[稠密部分轉換](docs/inkling.md)後為 25 GB | CUDA、Vulkan | 0.25 tok/s（Ryzen 9 7900，187 GB，RTX A6000） |
@@ -333,7 +334,7 @@ GPU 加總數字的順序不同，而且會把某些中間結果（activation）
 
 ### CUDA：NVIDIA 顯示卡
 
-安裝了 CUDA 工具包時，安裝程式會在 Linux 上為有 CUDA 路徑的引擎建置 CUDA：GLM-5.2/5.3 與 Mistral-Large-4、GLM-5.3-Flash、Inkling、Kimi K3、DeepSeek V4 Flash、DeepSeek V4.1 Flash、MiMo-V2.6、Qwen3.8-Flash-Next，以及 Qwen3.6 與它執行的模型；OLMoE 與決策引擎用 `make <引擎> CUDA=1` 建置。在 Windows 上，CUDA 引擎是一個獨立的 DLL（[windows.md](docs/windows.md)），每個版本都附帶編譯好的版本：`colibri-<version>-windows-x86_64-cuda.zip` 包含 `coli_cuda.dll`（compute capability 8.0 以上的顯示卡）以及載入它的 colibri、glm53、qwen36、qwen38 與 kimi_k3 引擎，還有 DeepSeek V4 的 CUDA DLL。把它解壓到主壓縮檔之上，安裝程式就會選擇 CUDA。
+安裝了 CUDA 工具包時，安裝程式會在 Linux 上為有 CUDA 路徑的引擎建置 CUDA：GLM-5.2/5.3 與 Mistral-Large-4、GLM-5.3-Flash、Inkling、Kimi K3、DeepSeek V4 Flash、DeepSeek V4.1 Flash、MiMo-V2.6、Qwen3.8-Flash-Next、Qwen3.6 與它執行的模型，以及 OLMoE 與決策引擎（Laya、GLiNER2.5-Decide）。在 Windows 上，CUDA 引擎是一個獨立的 DLL（[windows.md](docs/windows.md)），每個版本都附帶編譯好的版本：`colibri-<version>-windows-x86_64-cuda.zip` 包含 `coli_cuda.dll`（compute capability 8.0 以上的顯示卡）以及載入它的 colibri、glm53、qwen36、qwen38、kimi_k3、deepseek_v41、mimo、inkling、olmoe、laya 與 gliner_decide 引擎，還有 DeepSeek V4 的 CUDA DLL。把它解壓到主壓縮檔之上，安裝程式就會選擇 CUDA。
 
 - **所有層都在顯示卡上**（Qwen3.6、Qwen3.8 與 OLMoE）：稠密層、注意力以及顯示卡持有的路由專家作為一條鏈執行，顯示卡不持有的專家在 CPU 上執行。在 RTX PRO 4000 上，Qwen3.6-35B-A3B UD-Q4_K_M 的解碼速度為 104.8 tok/s，讀取提示詞為 3,491，OLMoE 為 354.6 與 10,418（[表格](#three-backends-on-one-machine)）。
 - **每個引擎都有顯示卡上的路由專家層級**（`cu_tier.h`），DeepSeek V4、V4.1、Kimi K3、GLM-5.3 與 MiMo 的稠密矩陣也放在顯示卡上（`cu_dense.h`）。

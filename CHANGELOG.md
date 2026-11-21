@@ -5,8 +5,44 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-11-21
+
 ### New
 
+- **`coli setup` (START-HERE) picks the model that runs best on the machine**, not the most
+  capable one that fits in RAM. It measures the RAM's read bandwidth (two seconds, standard
+  library only: a process a core scanning its own buffer, within 3% of numpy on three machines),
+  reads each card's memory and its bandwidth (the CUDA driver's memory clock and bus width, else
+  the card's name) and the disk's kind (NVMe, SSD, HDD), and `c/model_fit.py` estimates every
+  catalog model's decode speed on the backend `choose_backend` would give it: every weight on the
+  card, the dense part and some experts on it with the rest in RAM, in RAM, or streaming experts
+  from the disk. The estimates are the bytes a token reads (each entry's geometry, from its files'
+  headers) over the bandwidth that serves them plus a cost a layer, fitted to 19 measured runs on
+  two machines: within a fifth on the card and in RAM, a quarter half on the card. The default is
+  the most capable model that decodes at 20 tok/s or more, a slower one discounted by the square of
+  how far it falls short, one that streams from the disk at half its estimate; the menu and
+  `--list` show each model's estimate, backend and where it runs. On 8 GB a 2-bit Inkling-2-Mini,
+  on a 24 GB card Qwen3.8-Flash-Next UD-IQ3_XXS, on a 1 TB server with eight H100 MiMo-V2.6 Pro;
+  before, every machine from 12 GB to 512 GB got Qwen3.6-35B.
+- **The setup's catalog takes GGUFs**: Inkling-2-Mini UD-Q4_K_XL and UD-IQ2_XXS (with the
+  mmproj) and Qwen3.8-Flash-Next UD-IQ2_XS and UD-IQ3_XXS (with the MTP head), imported in place
+  after the download (`tools/gguf_link.py`).
+- **Inkling-2-Mini from mainline llama.cpp's layout** (`inkling2_loop`: unsloth's
+  `Mainline_Support/*.gguf_file`, the same tensors as their root files byte for byte): `coli import`
+  reads its metadata (`inkling2_loop.*`, `block_count` the checkpoint's 24 layers, the loop as
+  `loop.count/start/end`) into the same `config.json`, and the engine its tensors (`st_gguf.h`:
+  the gates as `loop_{q,k,v,ffn}_ctrl_*`, a loop layer's four message queries in
+  `blk.N.loop_msg_query`). Before, the import refused the architecture and the engine, given such a
+  file, stopped at "no tensor map in st_gguf.h". UD-IQ3_XXS in either layout: the same answers, 44
+  tok/s on CUDA.
+- **The Windows CUDA package carries every engine coli setup runs on CUDA**: `deepseek_v41.exe`,
+  `mimo.exe`, `inkling.exe`, `olmoe.exe`, `laya.exe` and `gliner_decide.exe` join colibri, glm53,
+  qwen36, qwen38 and kimi_k3. `coli setup` builds OLMoE, Laya and GLiNER2.5-Decide with CUDA on an
+  NVIDIA card on Linux too: their CUDA paths (OLMoE's chain, `decide_cuda.h`) were left out of its
+  list, which called them CPU-only. Only qwenimage has none. inkling's bf16
+  matrices come through `coli_cuda.dll` (`backend_cuda_ink.cu` built in, one optional export,
+  `coli_cuda_ink_ops`; an older DLL leaves inkling on Vulkan or the CPU), and `coli setup` fetches
+  the package for those engines from the release after v2.1.0.
 - **Inkling-2-Mini** (`thinkingmachines/Inkling-2-Mini`, 26.4B, 3.4B active, Apache 2.0) on the
   inkling engine: Inkling-2 whose layers 6-17 run three passes with their weights shared, each
   pass with K/V and convolution states of its own, and from the second pass every loop layer
@@ -620,6 +656,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md)).
 
 ### Fixed
+
+- **Bounds on what requests and files hand the chat**:
+  - `ui/docs.py` unpacks an Office part up to 64 MB and a file's parts up to 256 MB together, and
+    refuses an XML part with a document type (Office XML has none; `xml.parsers.expat` checks
+    before ElementTree reads it, in any encoding).
+  - The gateway refuses a request's picture past 8192 x 8192 pixels, from its header, before an
+    image preprocessor decodes it whole (`MAX_IMAGE_PIXELS`).
+  - The chat page's `esc` turns quotes into entities too, so a page title or a link in an answer
+    stays inside its attribute; a source's link is http or https, or none, and `ui/web.py` keeps
+    only http and https results from SearXNG, as it did from DuckDuckGo.
+  - The desktop window hands the system's opener only http and https links.
+  - qwen36's Metal graph reads the MTP head's routed experts only in the packed int4 form, with
+    their byte and scale counts checked against the slot, as the CPU's reader does.
+- **qwen36, qwen38: `SEED` seeds the sampler.** Both engines drew their temperature samples from an
+  unseeded libc `rand()`: every run took the same sequence, and `SEED`, which the other engines
+  read, did nothing here. Set, a run repeats to the token; unset, the clock and the pid seed it,
+  as on mimo and inkling. `coli_env.h` lists the variable for both.
 
 - **Inkling's expert cache from the RAM plan in `coli serve`**: without `--cap` the engine got
   the legacy eight slots a layer, and on Inkling-2 (eight routed experts a token) nearly every

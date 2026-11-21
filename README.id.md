@@ -33,7 +33,7 @@ apa pun lewat Vulkan, dan di kartu NVIDIA lewat CUDA. [Mana yang cocok untuk mes
 
 ```
 $ ./coli chat
-  colibri v2.1.0 · GLM-5.2 · 744B MoE · int4 · streaming CPU
+  colibri v2.2.0 · GLM-5.2 · 744B MoE · int4 · streaming CPU
   ✓ ready in 32s · resident 9.9 GB
   › ciao!
   ◆ Ciao! Come posso aiutarti oggi?
@@ -84,9 +84,12 @@ Anda menjawab satu pertanyaan, yaitu model mana yang ingin digunakan, dan
 menekan Enter akan menerima rekomendasi. Kemudian proses penyiapan:
 
 1. **memeriksa mesin Anda**: RAM, ruang kosong di disk, CPU, dan GPU;
-2. **merekomendasikan model yang muat**: bagian model yang selalu berada di
-   RAM, ditambah cache minimum pakar, harus muat di RAM Anda, dan unduhannya
-   harus muat di disk;
+2. **merekomendasikan model yang berjalan paling baik di sana**: mengukur bandwidth
+   RAM Anda (dua detik), membaca memori dan bandwidth setiap kartu serta jenis disk,
+   lalu memperkirakan kecepatan decode setiap model pada backend yang akan
+   dipakainya (seluruhnya di kartu, separuh di kartu dan separuh di RAM, di RAM,
+   atau streaming dari disk). Pilihan default adalah model paling kapabel yang
+   melakukan decode dengan lancar, dan menu menampilkan perkiraan masing-masing;
 3. **menyiapkan engine**: engine akan di-build untuk mesin Anda jika compiler
    tersedia; jika tidak, versi prebuilt akan diunduh, yang berjalan di CPU dan,
    di Linux dan Windows, juga di GPU Vulkan.
@@ -201,12 +204,16 @@ model. [Cara kerjanya](#how-it-works) menjelaskan detailnya.
 
 ## Model mana yang cocok untuk mesin saya
 
-Proses penyiapan merekomendasikan model paling kapabel yang dapat berjalan dari
-RAM pada mesin Anda, lalu mencantumkan tepat di bawahnya model yang lebih besar
-yang melakukan streaming dari disk. `./start-here.sh --list` menampilkan
-semuanya untuk mesin Anda. Tabel berikut mengikuti katalog milik proses
-penyiapan ([`c/setup_catalog.py`](c/setup_catalog.py)); ukuran unduhan adalah
-ukuran yang dicantumkan Hugging Face untuk setiap repository.
+Proses penyiapan memperkirakan seberapa cepat setiap model melakukan decode di mesin
+Anda ([`c/model_fit.py`](c/model_fit.py): byte yang dibaca satu token dibagi
+bandwidth yang melayaninya, ditambah biaya per layer, disesuaikan dengan kecepatan
+yang diukur di bawah) lalu merekomendasikan model paling kapabel yang melakukan
+decode dengan lancar, 20 tok/s atau lebih; model yang lebih lambat dihitung makin
+rendah makin jauh selisihnya, dan model yang melakukan streaming pakar dari disk
+dihitung separuh dari perkiraannya. `./start-here.sh --list` menampilkan semuanya
+beserta perkiraannya untuk mesin Anda. Tabel berikut mengikuti katalog milik proses
+penyiapan ([`c/setup_catalog.py`](c/setup_catalog.py)); ukuran unduhan adalah ukuran
+yang dicantumkan Hugging Face untuk setiap repository.
 
 - **RAM** terdiri dari dua angka: di bawah angka pertama model tidak dapat
   dijalankan, sedangkan mulai dari angka kedua model berjalan seperti yang
@@ -226,6 +233,8 @@ ukuran yang dicantumkan Hugging Face untuk setiap repository.
 |---|---|---|---|---|---|
 | **Qwen3.6-35B-A3B**: chat dengan thinking dan tools | `qwen36-35b` | 23 GB | 10 / 20 GB | CUDA, Vulkan (termasuk terintegrasi) | 6.0 tok/s pada CPU, 9.9 dengan Vulkan pada GPU terintegrasi (A); 30.0 dengan CUDA (C) |
 | Qwen3-Coder-30B-A3B: kode dan tool calls, tanpa thinking | `qwen3-coder-30b` | 19 GB | 8 / 18 GB | CUDA, Vulkan (termasuk terintegrasi) | 8.5-9.6 tok/s dengan semua pakar di RAM, 5.1 dengan 32 per layer (A, CPU) |
+| **Inkling-2-Mini** UD-Q4_K_XL: chat, gambar dan tool, Apache 2.0 (GGUF dari unsloth) | `inkling2-mini` | 18 GB | 6 / 21 GB | CUDA, Vulkan | 40.9-41.1 tok/s dengan CUDA, 39.2-39.4 dengan Vulkan, 8.0-8.1 di CPU (D) |
+| Inkling-2-Mini UD-IQ2_XXS: sama dengan pakar 2-bit, untuk 8 hingga 16 GB | `inkling2-mini-iq2` | 9 GB | 4 / 12 GB | CUDA, Vulkan | 46.3-46.5 tok/s dengan CUDA, 46.0-46.2 dengan Vulkan, 8.4 di CPU (D) |
 | **Qwen-Image-2.1**: teks ke gambar, lisensi nonkomersial; dengan RAM lebih kecil, [GGUF-nya](docs/qwen-image.md#gguf-unsloth): 10 GB di disk, puncak 5.9 GB | `qwen-image-2.1` | 33 GB | 12 / 18 GB | Vulkan | satu gambar 768x512 dalam 2 min 40 s (8 core Zen 4, CPU) |
 
 **Model besar, yang pakarnya melakukan streaming dari disk** (disk menentukan
@@ -237,6 +246,8 @@ kecepatan: drive NVMe yang cepat paling membantu)
 | **DeepSeek V4 Flash** (284B): tools | `deepseek-v4-flash` | 167 GB | 16 / 32 GB | CUDA, Vulkan | 0.93 tok/s dengan 32 GB (Ryzen 7 5800X), 1.24 dengan 63 GB (Ryzen 9 5950X), hanya CPU; 1.5-1.6 dengan CUDA (RTX 5080, 32 GB, dua NVMe) |
 | **MiMo-V2.6 Flash** (309B): vision dan tools | `mimo-v2.6-flash` | 172 GB | 32 / 52 GB | Vulkan | 2.34-3.37 tok/s (A, CPU) |
 | **Qwen3.8-Flash-Next** (125B + 51B n-gram): vision dan tools | `qwen38-flash-next` | 186 GB | 24 / 32 GB | CUDA, Vulkan (termasuk terintegrasi) | 1.91-2.56 tok/s dengan 32-96 pakar per layer; 3.99 dengan pakar int4 opsional (A, CPU) |
+| **Qwen3.8-Flash-Next** UD-IQ2_XS: pakar 2-bit dan kepala MTP-nya (GGUF dari unsloth) | `qwen38-flash-next-iq2xs` | 80 GB | 16 / 54 GB | CUDA, Vulkan (termasuk terintegrasi) | 55.8-56.6 tok/s dengan CUDA, 36.3-36.7 dengan Vulkan, separuh di kartu; 7.5-8.2 di CPU (D) |
+| Qwen3.8-Flash-Next UD-IQ3_XXS: pakar 3-bit dan kepala MTP-nya (GGUF dari unsloth) | `qwen38-flash-next-iq3` | 88 GB | 16 / 62 GB | CUDA, Vulkan (termasuk terintegrasi) | 41.5-41.6 tok/s dengan CUDA, 33.0-33.4 dengan Vulkan, separuh di kartu (D) |
 | **GLM-5.2** (744B): model referensi, dengan MTP head | `glm-5.2` | 429 GB | 16 / 24 GB | CUDA, Vulkan | 0.05-0.1 tok/s cold pada laptop 25 GB; 1.83 pada Ryzen AI Max+ 395 dengan 128 GB; 9.0-9.2 pada 6x RTX 5090 |
 | GLM-5.3 (744B): engine yang sama, tanpa MTP head | `glm-5.3` | 419 GB | 16 / 24 GB | CUDA, Vulkan | |
 | **Inkling** (975B): pakar int4, bobot dense bf16 | `inkling` | 514 GB | 120 / 128 GB sebagaimana diunduh; 25 GB setelah [konversi dense](docs/inkling.md) | CUDA, Vulkan | 0.25 tok/s (Ryzen 9 7900, 187 GB, RTX A6000) |
@@ -394,12 +405,12 @@ menyimpang satu kata dari hasil CPU
 Setup membangun CUDA di Linux saat CUDA toolkit terpasang, untuk engine yang
 memiliki jalur CUDA: GLM-5.2/5.3 dan Mistral-Large-4, GLM-5.3-Flash, Inkling,
 Kimi K3, DeepSeek V4 Flash, DeepSeek V4.1 Flash, MiMo-V2.6, Qwen3.8-Flash-Next,
-dan Qwen3.6 dengan model yang dijalankannya; OLMoE dan engine keputusan dibangun
-dengan `make <engine> CUDA=1`. Di Windows, engine CUDA adalah DLL terpisah
+dan Qwen3.6 dengan model yang dijalankannya; juga OLMoE dan engine keputusan
+(Laya, GLiNER2.5-Decide). Di Windows, engine CUDA adalah DLL terpisah
 ([windows.md](docs/windows.md)), dan setiap rilis menyertakannya dalam bentuk
 siap pakai: `colibri-<versi>-windows-x86_64-cuda.zip` berisi `coli_cuda.dll`
 (kartu dengan compute capability 8.0 ke atas) dan engine colibri, glm53, qwen36, qwen38,
-dan kimi_k3 yang memuatnya, beserta DLL CUDA milik DeepSeek V4. Ekstrak di atas
+kimi_k3, deepseek_v41, mimo, inkling, olmoe, laya, dan gliner_decide yang memuatnya, beserta DLL CUDA milik DeepSeek V4. Ekstrak di atas
 arsip utama, dan setup akan memilih CUDA.
 
 - **Setiap layer di kartu** untuk Qwen3.6, Qwen3.8, dan OLMoE: layer dense,

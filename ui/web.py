@@ -46,7 +46,7 @@ def _searx(q, n):
     out, seen = [], set()
     for x in data.get("results") or []:
         u = x.get("url")
-        if not u or u in seen:
+        if not isinstance(u, str) or not u.startswith(("http://", "https://")) or u in seen:   # as _duckduckgo's
             continue
         seen.add(u)
         out.append({"title": _clean(x.get("title"), 160), "url": u, "snippet": _clean(x.get("content"), 320),

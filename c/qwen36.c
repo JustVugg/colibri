@@ -4941,14 +4941,23 @@ static void qwen36_graph_mtp_expert(Model *m, int eid, Slot *s) {
     snprintf(nm, sizeof nm, "mtp.layers.0.mlp.experts.%d.merged_weight", eid);
     snprintf(qs, sizeof qs, "mtp.layers.0.mlp.experts.%d.qs", eid);
     int64_t ng = (int64_t)c->inter * c->hidden, gp = ng / 2, bytes = 3 * ng / 2;
+    const int64_t nsc = 2 * scale_count_gu(c) + scale_count_d(c);   /* the slot's scales (slot_alloc) */
+    /* the packed int4 form only, as qwen36_mtp.h checks the CPU's: the slot holds that many bytes
+     * and scales, and the file says what it holds */
+    st_tensor *t = st_find(&m->S, nm);
+    if (!t || t->nbytes != bytes || st_numel(&m->S, qs) != nsc || q36_eh(c) != c->hidden || !s->gs) {
+        fprintf(stderr, "[qwen36-mtp] %s: not a packed int4 expert of %lld bytes with %lld scales\n",
+                nm, (long long)bytes, (long long)nsc);
+        exit(1);
+    }
     uint8_t *raw = malloc((size_t)bytes);
     if (!raw || !s->pw) { fprintf(stderr, "OOM reading %s\n", nm); exit(1); }
-    st_read_raw(&m->S, nm, raw, 1);
+    st_read_raw_cap(&m->S, nm, raw, bytes, 1);
     xf_repack_pairs_signed(s->pw, raw, c->inter, c->hidden);
     xf_repack_pairs_signed(s->pw + gp, raw + gp, c->inter, c->hidden);
     xf_repack_pairs_signed(s->pw + 2 * gp, raw + 2 * gp, c->hidden, c->inter);
     free(raw);
-    st_read_f32(&m->S, qs, s->gs, 0);
+    st_read_f32_cap(&m->S, qs, s->gs, nsc, 0);
     s->is_int4 = 1;
 }
 #endif
@@ -11503,6 +11512,12 @@ int main(int argc, char **argv) {
      * the hot team (omp_tune.h), which re-runs the engine once with libgomp's settings. */
     coli_omp_hot_team(argv, "qwen36", coli_omp_env_on("COLI_CUDA") || coli_omp_env_on("COLI_METAL"));
     coli_omp_tune_threads("qwen36");
+    /* The sampler (qwen36_sample.h) draws from libc's rand(), which glibc seeds with 1: every
+     * run drew the same sequence, and nothing could repeat a run on purpose or vary it. SEED
+     * seeds it as the other engines do (mimo, inkling, deepseek_v41; coli_env.h): set, a run
+     * repeats to the token at a temperature above 0; unset, the clock and the pid seed it. */
+    { const char *seed = getenv("SEED");
+      srand(seed && *seed ? (unsigned)strtoul(seed, NULL, 10) : (unsigned)(time(NULL) ^ (unsigned)getpid())); }
     const char *snap = getenv("SNAP");
     if (!snap) { coli_print_launcher_help("Qwen3.6", "SNAP=<model directory> ./qwen36 ..."); return 1; }
     static char gguf_path[4096], mmproj_path[4096], mtp_path[4096]; int gguf_dir = 0;

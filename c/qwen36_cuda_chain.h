@@ -1869,7 +1869,7 @@ static int q36cc_dm_layer(Q36CChain *ch, Model *m, Layer *l, int i, int n, unsig
     int part;
     CcBuf *tab = q36cc_dm_tab(ch, i, n, &part);
     CcMoe mp = {n, K, D, I, ch->dm_fmt, ch->dm_gs, 0, 1, i * E, 0, D, io, K, io, K, 0, D, -1, E,
-                tab == ch->dm_tabb && ch->dm_fmt < 100 && qt_chain_host_planar(), 0, 0, 0};
+                tab == ch->dm_tabb && ch->dm_fmt < 100 && qt_chain_host_planar(), 0, 0, 0, 0, 0.f, 0.f};
     if (ch->dm_fmt >= 100) qt_chain_layer_format(i, &mp.fmt, &mp.fmt_d);   /* a GGUF's types change from layer to layer */
     int stg = q36cc_stages(ch, tab, i);
     int ok = cc_matmul(ch->t_gate[i], ch->h2, 0, ch->lg, 0, n) && cc_route(ch->lg, NULL, ch->dm_ids, ch->dm_w, &rp);

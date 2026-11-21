@@ -156,9 +156,12 @@ class Protocol(unittest.TestCase):
 
     def test_recommend_models(self):
         fake_hw = {"os": {"machine": "x86_64"}, "memory": {"total": 27 * 10**9}}
+        fit = {"ram": 27 * 10**9, "ram_avail": None, "ram_gbs": 40.0, "cards": [], "integrated": None,
+               "disk": "nvme", "disk_gbs": 2.0}   # setup_flow.machine_fit's, without the probe
         with mock.patch.object(mcp_server.setup_hw, "detect", return_value=fake_hw), \
              mock.patch.object(mcp_server.setup_hw, "disk_free", return_value=800 * 10**9), \
-             mock.patch.object(setup_flow.setup_hw, "disk_free", return_value=800 * 10**9):
+             mock.patch.object(setup_flow.setup_hw, "disk_free", return_value=800 * 10**9), \
+             mock.patch.object(setup_flow, "machine_fit", return_value=fit):
             self.x.send(request(1, "tools/call", {"name": "recommend_models", "arguments": {}}))
             data = self.x.reply(1)["result"]["structuredContent"]
         self.assertEqual(data["recommended"], "qwen36-35b")
