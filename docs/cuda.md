@@ -247,7 +247,8 @@ The card holds the 12.5 GiB of dense matrices and the chain's 3.1 GiB, and the t
 ## OLMoE on the card (`olmoe_cuda_chain.h`)
 
 OLMoE-1B-7B is small enough to hold whole on a card (Q4_K_M: 3.9 GiB of experts and 0.6 GiB of
-the rest), so a CUDA build (`make olmoe CUDA=1`) with `COLI_CUDA=1` (`coli serve --gpu`) puts
+the rest), so a CUDA build (`make olmoe CUDA=1`, which `coli setup` makes on an NVIDIA card, and
+`olmoe.exe` of the Windows CUDA package) with `COLI_CUDA=1` (`coli serve --gpu`) puts
 every layer, every routed expert and lm_head on the device and runs a step of any rows as one
 frame: the norms, q/k/v (one matrix where their forms agree), OLMoE's q and k norms over the
 whole projection, RoPE, the new K/V rows into a float16 mirror, the attention, o_proj, the router,
@@ -343,7 +344,8 @@ as much back (the chain and the expert tier share the card), and the first promp
 
 Laya (`laya.c`) and GLiNER2.5-Decide (`gliner_decide.c`) answer a decision with one forward
 over the request's rows and generate no text ([systemone.md](systemone.md#decision-engines)).
-In a CUDA build (`make laya gliner_decide CUDA=1`) with `COLI_CUDA=1` (`coli serve --gpu`),
+In a CUDA build (`make laya gliner_decide CUDA=1`, which `coli setup` makes on an NVIDIA card, and
+the Windows CUDA package's `laya.exe` and `gliner_decide.exe`) with `COLI_CUDA=1` (`coli serve --gpu`),
 `decide_cuda.h` opens the device once the weights are loaded, uploads every matrix of the
 encoder and of Laya's head as f32 (the checkpoint's values), and runs each forward as frames
 of the CUDA chain, one submission a forward: the embedding rows go up, the activations stay on

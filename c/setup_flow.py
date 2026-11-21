@@ -409,7 +409,7 @@ TEXT_HINTS = {
     "cuda-win32": "the Windows CUDA build needs the CUDA Toolkit and MSVC: see docs/windows.md",
     "cuda-win32-release": ("unpack the release's windows-x86_64-cuda.zip next to the engines "
                            "(coli_cuda.dll and the CUDA builds of colibri, glm53, qwen36, qwen38, "
-                           "kimi_k3, deepseek_v41, mimo and inkling)"),
+                           "kimi_k3, deepseek_v41, mimo, inkling, olmoe, laya and gliner_decide)"),
     "build-other": "install gcc (with OpenMP) and make from your distribution",
     "vulkan-other": ("install the Vulkan loader development files, glslc (shaderc) and the "
                      "Mesa Vulkan drivers from your distribution"),
@@ -479,8 +479,14 @@ VULKAN_IGPU_MEASURED = frozenset({"qwen36", "qwen38"})
 #:     device (cu_tier.h). A build with Vulkan too runs on Vulkan unless
 #:     COLI_VULKAN=0 (CUDA_WITH_VULKAN), whose dense chain puts the trunk on the card.
 #:
-#: The remaining engines are CPU-only: none of them is here, so none of them is
-#: built with CUDA.
+#:   backend_cuda.o through the dense chain alone (olmoe, laya, gliner_decide:
+#:     CHAIN_CUDA_OBJ): OLMoE's every layer and expert on the card as one frame
+#:     (olmoe_cuda_chain.h), the decision engines' encoder forward (decide_cuda.h);
+#:     docs/cuda.md measures them (OLMoE 316 tok/s of decode against 32.5 on the CPU,
+#:     Laya 0.69 s a request against 11.4-13.0).
+#:
+#: The remaining engine, qwenimage, has no CUDA path (Vulkan and the CPU): it is not
+#: here, so it is not built with CUDA.
 CUDA_ENGINES = {
     "qwen36": {"object": "backend_cuda.o"},
     "qwen38": {"object": "backend_cuda.o"},
@@ -490,6 +496,9 @@ CUDA_ENGINES = {
     "deepseek_v41": {"object": "backend_cuda.o"},
     "mimo": {"object": "backend_cuda.o"},
     "inkling": {"object": "backend_cuda_ink.o"},
+    "olmoe": {"object": "backend_cuda.o"},
+    "laya": {"object": "backend_cuda.o"},
+    "gliner_decide": {"object": "backend_cuda.o"},
     "deepseek_v4": {"object": "backend_cuda_dsv4.o", "min_compute": 60,
                     "min_toolkit": (12, 0), "no_tc_below": (12, 8)},
 }
@@ -761,14 +770,16 @@ RELEASE_VULKAN = ("linux-x86_64.tar.gz", "windows-x86_64.zip")
 #: deepseek_v4, whose DLLs are their own (inkling's bf16 matrices come through the DLL's
 #: ink_ops table), and the oldest card its DLL runs on: CUDA_ARCH=portable is SASS for sm_80
 #: and newer plus compute_120 PTX.
-WINDOWS_CUDA_ENGINES = ("glm", "glm53", "qwen36", "qwen38", "kimi", "deepseek_v41", "mimo", "inkling")
+WINDOWS_CUDA_ENGINES = ("glm", "glm53", "qwen36", "qwen38", "kimi", "deepseek_v41", "mimo", "inkling",
+                        "olmoe", "laya", "gliner_decide")
 WINDOWS_CUDA_FLOOR = 80
 RELEASE_CUDA_WIN32 = "windows-x86_64-cuda.zip"
 #: The engines the package got later, each with the last release whose package lacks it:
-#: v2.1.0's has no glm53.exe (#2541), no qwen38.exe (#2846) and no deepseek_v41.exe,
-#: mimo.exe or inkling.exe. With such a release the engine stays on Vulkan.
+#: v2.1.0's has no glm53.exe (#2541), no qwen38.exe (#2846) and none of deepseek_v41.exe,
+#: mimo.exe, inkling.exe, olmoe.exe, laya.exe and gliner_decide.exe. With such a release the
+#: engine stays on Vulkan.
 WINDOWS_CUDA_LATER = {"glm53": "2.1.0", "qwen38": "2.1.0", "deepseek_v41": "2.1.0", "mimo": "2.1.0",
-                      "inkling": "2.1.0"}
+                      "inkling": "2.1.0", "olmoe": "2.1.0", "laya": "2.1.0", "gliner_decide": "2.1.0"}
 
 
 def prebuilt_vulkan(family, tc):

@@ -380,12 +380,12 @@ palavra ([vulkan.md](docs/vulkan.md#the-other-engines)).
 O setup compila CUDA no Linux quando o CUDA toolkit está instalado, para os
 motores que têm um caminho CUDA: GLM-5.2/5.3 e Mistral-Large-4, GLM-5.3-Flash,
 Inkling, Kimi K3, DeepSeek V4 Flash, DeepSeek V4.1 Flash, MiMo-V2.6,
-Qwen3.8-Flash-Next, e Qwen3.6 com os modelos que ele roda; o OLMoE e os motores
-de decisão compilam com `make <motor> CUDA=1`. No Windows o motor CUDA é uma DLL
+Qwen3.8-Flash-Next, Qwen3.6 com os modelos que ele roda, o OLMoE e os motores
+de decisão (Laya, GLiNER2.5-Decide). No Windows o motor CUDA é uma DLL
 separada ([windows.md](docs/windows.md)), e toda release a traz compilada:
 `colibri-<versão>-windows-x86_64-cuda.zip` tem a `coli_cuda.dll` (placas de
 compute capability 8.0 ou mais nova) e os motores colibri, glm53, qwen36, qwen38,
-kimi_k3, deepseek_v41, mimo e inkling que a carregam, com as DLLs CUDA do DeepSeek V4. Descompacte por cima
+kimi_k3, deepseek_v41, mimo, inkling, olmoe, laya e gliner_decide que a carregam, com as DLLs CUDA do DeepSeek V4. Descompacte por cima
 do arquivo principal e o setup escolhe CUDA.
 
 - **Todas as camadas na placa** para Qwen3.6, Qwen3.8 e OLMoE: as camadas

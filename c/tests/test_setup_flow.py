@@ -125,6 +125,17 @@ def setup_args(**overrides):
     return argparse.Namespace(**values)
 
 
+
+@contextlib.contextmanager
+def no_cuda_path(family_id):
+    """family_id as an engine with no CUDA path, on Linux and in the Windows package: every
+    engine with an accelerator has one now, and the setup's answer for one without is kept"""
+    engines = {k: v for k, v in setup_flow.CUDA_ENGINES.items() if k != family_id}
+    windows = tuple(f for f in setup_flow.WINDOWS_CUDA_ENGINES if f != family_id)
+    with mock.patch.object(setup_flow, "CUDA_ENGINES", engines), \
+            mock.patch.object(setup_flow, "WINDOWS_CUDA_ENGINES", windows):
+        yield
+
 class HomeTestCase(unittest.TestCase):
     """Each test gets its own setup folder."""
 
@@ -171,7 +182,8 @@ class BackendChoice(unittest.TestCase):
     def test_engine_without_cuda_path_uses_vulkan(self):
         rtx_vk = {"name": RTX["name"], "type": "discrete", "api_version": "1.3.289",
                   "api_version_raw": (1 << 22) | (3 << 12) | 289}
-        decision = self.choose(hw_report(vulkan=rtx_vk, nvidia=[RTX]), family="olmoe")
+        with no_cuda_path("olmoe"):
+            decision = self.choose(hw_report(vulkan=rtx_vk, nvidia=[RTX]), family="olmoe")
         self.assertEqual(decision["backend"], "vulkan")
 
     def test_integrated_gpu_only_for_engines_measured_faster_there(self):
@@ -267,8 +279,9 @@ class BackendChoice(unittest.TestCase):
                                    here=here, requested="cuda")
             self.assertEqual(decision["backend"], "cuda")
             # an engine without a CUDA path in that archive: Vulkan
-            decision = self.choose(hw_report(vulkan=rtx_vk, nvidia=[card]), family="olmoe", tc=tc,
-                                   platform="win32", here=here)
+            with no_cuda_path("olmoe"):
+                decision = self.choose(hw_report(vulkan=rtx_vk, nvidia=[card]), family="olmoe", tc=tc,
+                                       platform="win32", here=here)
             self.assertNotEqual(decision["backend"], "cuda")
         with tempfile.TemporaryDirectory() as here:   # the engines without the DLL
             self.windows_cuda_here(here, dll=False)
@@ -302,7 +315,8 @@ class BackendChoice(unittest.TestCase):
         self.assertEqual(decision["backend"], "vulkan")
         self.assertIn("the release's coli_cuda.dll runs on compute 8.0", decision["reason"])
         # an engine the release carries no CUDA build of, or a compiler here: as before
-        decision = self.choose(hw_report(vulkan=DGPU, nvidia=[card]), family="olmoe", tc=tc, platform="win32")
+        with no_cuda_path("olmoe"):
+            decision = self.choose(hw_report(vulkan=DGPU, nvidia=[card]), family="olmoe", tc=tc, platform="win32")
         self.assertEqual(decision["backend"], "vulkan")
         decision = self.choose(hw_report(vulkan=DGPU, nvidia=[card]), family="kimi", platform="win32")
         self.assertEqual(decision["backend"], "vulkan")
@@ -352,7 +366,8 @@ class BackendChoice(unittest.TestCase):
             self.assertEqual(decision["backend"], "cuda")
             self.assertIn("the release's CUDA backend (windows-x86_64-cuda.zip)", decision["reason"])
             self.assertNotIn("gpu_unused", decision)
-            decision = self.choose(hw, family="olmoe", tc=tc, platform="win32")
+            with no_cuda_path("olmoe"):
+                decision = self.choose(hw, family="olmoe", tc=tc, platform="win32")
             self.assertEqual(decision["backend"], "cpu")
             self.assertEqual(decision["gpu_unused"], a100["name"])
             self.assertEqual(decision["reason"],
@@ -365,10 +380,12 @@ class BackendChoice(unittest.TestCase):
         self.assertEqual(decision["missing"], [])
         self.assertIn("the windows-x86_64-cuda.zip of release 2.1.0 has no qwen38.exe", decision["reason"])
         # a driver model that was not read, or Linux: no word on TCC
-        decision = self.choose(hw_report(nvidia=[dict(a100, driver_model=None)]), family="olmoe", tc=tc,
-                               platform="win32")
+        with no_cuda_path("olmoe"):
+            decision = self.choose(hw_report(nvidia=[dict(a100, driver_model=None)]), family="olmoe", tc=tc,
+                                   platform="win32")
         self.assertIn("and no Vulkan device answered: the engine runs on the CPU", decision["reason"])
-        decision = self.choose(hw_report(nvidia=[a100]), family="olmoe")
+        with no_cuda_path("olmoe"):
+            decision = self.choose(hw_report(nvidia=[a100]), family="olmoe")
         self.assertEqual(decision["reason"],
                          "NVIDIA A100-PCIE-40GB found, but OLMoE has no CUDA path and no Vulkan "
                          "device answered: the engine runs on the CPU")
@@ -670,7 +687,8 @@ class CudaEngineTable(unittest.TestCase):
     """CUDA_ENGINES says what each engine's CUDA build is and needs; this reads
     the same facts from the Makefiles and the sources."""
 
-    OBJECTS = {"CUDA_OBJ": "backend_cuda.o", "INK_CUDA_OBJ": "backend_cuda_ink.o"}
+    OBJECTS = {"CUDA_OBJ": "backend_cuda.o", "INK_CUDA_OBJ": "backend_cuda_ink.o",
+               "CHAIN_CUDA_OBJ": "backend_cuda.o"}   # the dense chain's objects of CUDA_OBJ
 
     def rule(self, artifact):
         makefile = (C_DIR / "Makefile").read_text(encoding="utf-8")

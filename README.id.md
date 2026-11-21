@@ -394,12 +394,12 @@ menyimpang satu kata dari hasil CPU
 Setup membangun CUDA di Linux saat CUDA toolkit terpasang, untuk engine yang
 memiliki jalur CUDA: GLM-5.2/5.3 dan Mistral-Large-4, GLM-5.3-Flash, Inkling,
 Kimi K3, DeepSeek V4 Flash, DeepSeek V4.1 Flash, MiMo-V2.6, Qwen3.8-Flash-Next,
-dan Qwen3.6 dengan model yang dijalankannya; OLMoE dan engine keputusan dibangun
-dengan `make <engine> CUDA=1`. Di Windows, engine CUDA adalah DLL terpisah
+dan Qwen3.6 dengan model yang dijalankannya; juga OLMoE dan engine keputusan
+(Laya, GLiNER2.5-Decide). Di Windows, engine CUDA adalah DLL terpisah
 ([windows.md](docs/windows.md)), dan setiap rilis menyertakannya dalam bentuk
 siap pakai: `colibri-<versi>-windows-x86_64-cuda.zip` berisi `coli_cuda.dll`
 (kartu dengan compute capability 8.0 ke atas) dan engine colibri, glm53, qwen36, qwen38,
-kimi_k3, deepseek_v41, mimo, dan inkling yang memuatnya, beserta DLL CUDA milik DeepSeek V4. Ekstrak di atas
+kimi_k3, deepseek_v41, mimo, inkling, olmoe, laya, dan gliner_decide yang memuatnya, beserta DLL CUDA milik DeepSeek V4. Ekstrak di atas
 arsip utama, dan setup akan memilih CUDA.
 
 - **Setiap layer di kartu** untuk Qwen3.6, Qwen3.8, dan OLMoE: layer dense,

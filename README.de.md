@@ -382,12 +382,12 @@ von der der CPU abweichen ([vulkan.md](docs/vulkan.md#the-other-engines)).
 Die Einrichtung baut CUDA unter Linux, wenn das CUDA-Toolkit installiert ist, für die
 Engines, die einen CUDA-Pfad haben: GLM-5.2/5.3 und Mistral-Large-4, GLM-5.3-Flash,
 Inkling, Kimi K3, DeepSeek V4 Flash, DeepSeek V4.1 Flash, MiMo-V2.6,
-Qwen3.8-Flash-Next und Qwen3.6 mit den Modellen, die es ausführt; OLMoE und die
-Entscheidungs-Engines werden mit `make <engine> CUDA=1` gebaut. Unter Windows ist die
+Qwen3.8-Flash-Next, Qwen3.6 mit den Modellen, die es ausführt, OLMoE und die
+Entscheidungs-Engines (Laya, GLiNER2.5-Decide). Unter Windows ist die
 CUDA-Engine eine eigene DLL ([windows.md](docs/windows.md)), und jedes Release liefert
 sie bereits gebaut mit: `colibri-<version>-windows-x86_64-cuda.zip` enthält
 `coli_cuda.dll` (Karten mit Compute Capability 8.0 oder neuer) und die Engines colibri,
-glm53, qwen36, qwen38, kimi_k3, deepseek_v41, mimo und inkling, die sie laden, mit den CUDA-DLLs von DeepSeek V4. Entpacke
+glm53, qwen36, qwen38, kimi_k3, deepseek_v41, mimo, inkling, olmoe, laya und gliner_decide, die sie laden, mit den CUDA-DLLs von DeepSeek V4. Entpacke
 es über das Hauptarchiv, dann wählt die Einrichtung CUDA.
 
 - **Jeder Layer auf der Karte** für Qwen3.6, Qwen3.8 und OLMoE: die dichten Layer, die

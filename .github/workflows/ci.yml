@@ -2334,9 +2334,10 @@ jobs:
           make qwen36.exe CUDA_DLL=1
           test -f qwen36.exe || { echo "qwen36 CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
           echo "qwen36.exe built against the DLL loader"
-          # kimi_k3, glm53, qwen38, deepseek_v41, mimo and inkling link the same
-          # loader: eight engines share coli_cuda.dll (inkling's bf16 matrices
-          # through its ink_ops table). deepseek_v4 has its own DLL
+          # kimi_k3, glm53, qwen38, deepseek_v41, mimo, inkling, olmoe, laya and
+          # gliner_decide link the same loader: eleven engines share coli_cuda.dll
+          # (inkling's bf16 matrices through its ink_ops table, the last three the
+          # dense chain alone). deepseek_v4 has its own DLL
           # (coli_cuda_dsv4.dll, Makefile.deepseek-v4) and joins in a later step.
           make kimi_k3.exe CUDA_DLL=1
           test -f kimi_k3.exe || { echo "kimi_k3 CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
@@ -2356,6 +2357,15 @@ jobs:
           make inkling.exe CUDA_DLL=1
           test -f inkling.exe || { echo "inkling CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
           echo "inkling.exe built against the DLL loader"
+          make olmoe.exe CUDA_DLL=1
+          test -f olmoe.exe || { echo "olmoe CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
+          echo "olmoe.exe built against the DLL loader"
+          make laya.exe CUDA_DLL=1
+          test -f laya.exe || { echo "laya CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
+          echo "laya.exe built against the DLL loader"
+          make gliner_decide.exe CUDA_DLL=1
+          test -f gliner_decide.exe || { echo "gliner_decide CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
+          echo "gliner_decide.exe built against the DLL loader"
           # the table inkling.exe's ink_cuda_* forward through (backend_cuda_ink.h)
           objdump -p coli_cuda.dll | grep -q "coli_cuda_ink_ops" || { echo "coli_cuda.dll does not export coli_cuda_ink_ops" >&2; exit 1; }
       - name: make cuda-dsv4-dll and cuda-dsv4-dg-dll (DeepSeek V4, as the release ships them)
@@ -2407,6 +2417,9 @@ jobs:
             c/deepseek_v41.exe
             c/mimo.exe
             c/inkling.exe
+            c/olmoe.exe
+            c/laya.exe
+            c/gliner_decide.exe
 
   python:
     name: Python tests

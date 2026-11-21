@@ -366,12 +366,13 @@ a word ([vulkan.md](docs/vulkan.md#the-other-engines)).
 The setup builds CUDA on Linux when the CUDA toolkit is installed, for the
 engines that have a CUDA path: GLM-5.2/5.3 and Mistral-Large-4, GLM-5.3-Flash,
 Inkling, Kimi K3, DeepSeek V4 Flash, DeepSeek V4.1 Flash, MiMo-V2.6,
-Qwen3.8-Flash-Next, and Qwen3.6 with the models it runs; OLMoE and the decision
-engines build with `make <engine> CUDA=1`. On
+Qwen3.8-Flash-Next, Qwen3.6 with the models it runs, OLMoE and the decision
+engines (Laya, GLiNER2.5-Decide). On
 Windows the CUDA engine is a separate DLL ([windows.md](docs/windows.md)), and
 every release ships it built: `colibri-<version>-windows-x86_64-cuda.zip` has
 `coli_cuda.dll` (cards of compute capability 8.0 and newer) and the colibri,
-glm53, qwen36, qwen38, kimi_k3, deepseek_v41, mimo and inkling engines that load it,
+glm53, qwen36, qwen38, kimi_k3, deepseek_v41, mimo, inkling, olmoe, laya and
+gliner_decide engines that load it,
 with DeepSeek V4's own CUDA DLLs.
 Unpack it over the main archive and the setup picks CUDA.
 

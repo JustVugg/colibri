@@ -2107,7 +2107,7 @@ static int q38cc_dm_card(Q38CChain *ch, Model *m, int i, int n) {
     Cfg *c = &m->c; int H = c->hidden, E = c->experts, K = c->topk, io = i * ch->rows * K;
     CcBuf *tab = q38cc_dm_tab(ch, n);
     int stg = tab == ch->dm_tabb && ch->dm_frn[i] > 0;   /* this layer's copy to wait for */
-    CcMoe mp = {n, K, H, c->inter, ch->dm_fmt, ch->dm_gs, 0, 1, i * E, 0, H, io, K, io, K, 0, H, -1, E, 0, 0, 0, 0};
+    CcMoe mp = {n, K, H, c->inter, ch->dm_fmt, ch->dm_gs, 0, 1, i * E, 0, H, io, K, io, K, 0, H, -1, E, 0, 0, 0, 0, 0, 0.f, 0.f};
     if (ch->dm_fmt >= 100) qt_chain_layer_format(i, &mp.fmt, &mp.fmt_d);   /* a GGUF's types change from layer to layer */
     int ok = (!stg || cc_fetch_wait()) && cc_moe(tab, ch->mixed, ch->dm_ids, ch->dm_w, ch->dm_hid, ch->dm_y, NULL, &mp);
     if (ok && stg) ok = cc_fetch_done() && q38cc_stage_from(ch, m, i + 1);   /* the sum below reads no weights */
@@ -2122,7 +2122,7 @@ static int q38cc_dm_layer_a(Q38CChain *ch, Model *m, Layer *l, int i, int n, uns
 static int q38cc_dm_sum(Q38CChain *ch, Model *m, int i, int n, unsigned v, CcBuf *hid, int lay_S, int lay_s0) {
     Cfg *c = &m->c; int H = c->hidden, E = c->experts, K = c->topk, io = i * ch->rows * K;
     CcBuf *tab = q38cc_dm_tab(ch, n);
-    CcMoe ms = {n, K, H, c->inter, ch->dm_fmt, ch->dm_gs, 0, 2, i * E, 0, H, io, K, io, K, 0, H, v ? 0 : -1, E, 0, 0, lay_S, lay_s0};
+    CcMoe ms = {n, K, H, c->inter, ch->dm_fmt, ch->dm_gs, 0, 2, i * E, 0, H, io, K, io, K, 0, H, v ? 0 : -1, E, 0, 0, lay_S, lay_s0, 0, 0.f, 0.f};
     if (ch->dm_fmt >= 100) qt_chain_layer_format(i, &ms.fmt, &ms.fmt_d);
     int ok = !v || (q38cc_dm_skips(ch, n, lay_S) ? cc_wait_host_if(ch->dm_hfl, 0, v, tab, (size_t)i * E, ch->dm_ids, (size_t)io, n * K, E,
                                                                     ch->dm_hy, (size_t)n * H)
@@ -2982,7 +2982,7 @@ static int q38cc_dm_layer_lm(Q38CChain *ch, Model *m, Layer *l, int i, int n, in
     CcBuf *tab = ch->dm_tabb;
     int stg = ch->dm_frn[i] > 0;
     CcRoute rp = {n, E, K, 0, 0, E, 0, 0, io, K, io, K, 1, 1, c->norm_topk ? 1 : 0, 1.f, 1.f, 0.f};
-    CcMoe mp = {n, K, H, c->inter, ch->dm_fmt, ch->dm_gs, 0, 1, i * E, 0, H, io, K, io, K, 0, H, -1, E, 0, 0, 0, 0};
+    CcMoe mp = {n, K, H, c->inter, ch->dm_fmt, ch->dm_gs, 0, 1, i * E, 0, H, io, K, io, K, 0, H, -1, E, 0, 0, 0, 0, 0, 0.f, 0.f};
     if (ch->dm_fmt >= 100) qt_chain_layer_format(i, &mp.fmt, &mp.fmt_d);
     int ok = cc_matmul(q38cc_t(ch, &l->router), ch->mixed, 0, ch->lg, 0, n) && cc_route(ch->lg, NULL, ch->dm_ids, ch->dm_w, &rp) &&
              cc_copy(ch->dm_idsd, io, ch->dm_ids, io, (size_t)n * K) && cc_copy(ch->dm_wd, io, ch->dm_w, io, (size_t)n * K);
@@ -3047,7 +3047,7 @@ static int q38cc_moe_group(Q38CChain *ch, Model *m, Layer *l, int i, int c0, int
                  cc_matmul(q38cc_t(ch, &l->router), ch->mixed, 0, ch->lg, 0, n) && cc_route(ch->lg, NULL, ch->mg_ids, ch->mg_w, &rp);
         if (!ok || !cc_submit(0)) return 0;
     }
-    CcMoe mp = {G, K, H, c->inter, ch->dm_fmt, ch->dm_gs, 0, 3, i * E, 0, H, 0, K, 0, K, 0, H, -1, E, 0, 0, 0, 0};
+    CcMoe mp = {G, K, H, c->inter, ch->dm_fmt, ch->dm_gs, 0, 3, i * E, 0, H, 0, K, 0, K, 0, H, -1, E, 0, 0, 0, 0, 0, 0.f, 0.f};
     if (ch->dm_fmt >= 100) qt_chain_layer_format(i, &mp.fmt, &mp.fmt_d);
     const int stg = ch->dm_frn[i] > 0;
     if (!q38cc_frame_begin(ch) || (stg && first && !cc_fetch_wait())) return 0;
@@ -3792,7 +3792,7 @@ static int q38cc_mtp_rows(Model *m, const float *streams, const int *next, int S
         const int hyb = !card && ch->hd_base && ch->srv && ch->dm_dfl && n <= Q38CC_DM_ROWS;   /* on the pool's server */
         if (card) {   /* routed, computed and summed on the card, in Q2_0 (q38cc_head_card) */
             CcRoute rp = {n, E, c->topk, 0, 0, E, 0, 0, 0, c->topk, 0, c->topk, 1, 1, c->norm_topk ? 1 : 0, 1.f, 1.f, 0.f};
-            CcMoe mp = {n, c->topk, H, c->inter, 100 + GQ_Q2_0, 0, 0, 3, 0, 0, H, 0, c->topk, 0, c->topk, 0, H, -1, E, 0, 100 + GQ_Q2_0, 0, 0};
+            CcMoe mp = {n, c->topk, H, c->inter, 100 + GQ_Q2_0, 0, 0, 3, 0, 0, H, 0, c->topk, 0, c->topk, 0, H, -1, E, 0, 100 + GQ_Q2_0, 0, 0, 0, 0.f, 0.f};
             ok = ok && cc_matmul(q38cc_t(ch, &l->router), ch->mixed, 0, ch->lg, 0, n) && cc_route(ch->lg, NULL, ch->hd_ids, ch->hd_w, &rp) &&
                  q38cc_shared(ch, m, l, L, n) && cc_moe(ch->hd_tab, ch->mixed, ch->hd_ids, ch->hd_w, ch->dm_hid, ch->dm_y, NULL, &mp) &&
                  q38cc_moe_apply(ch, m, n, ch->dm_y);

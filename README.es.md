@@ -383,11 +383,11 @@ desviarse de la de la CPU en una palabra
 La instalación compila CUDA en Linux cuando está instalado el CUDA toolkit, para los
 motores que tienen una ruta CUDA: GLM-5.2/5.3 y Mistral-Large-4, GLM-5.3-Flash,
 Inkling, Kimi K3, DeepSeek V4 Flash, DeepSeek V4.1 Flash, MiMo-V2.6,
-Qwen3.8-Flash-Next, y Qwen3.6 con los modelos que ejecuta; OLMoE y los motores de
-decisión se compilan con `make <engine> CUDA=1`. En Windows el motor CUDA es una DLL
+Qwen3.8-Flash-Next, Qwen3.6 con los modelos que ejecuta, OLMoE y los motores de
+decisión (Laya, GLiNER2.5-Decide). En Windows el motor CUDA es una DLL
 aparte ([windows.md](docs/windows.md)), y cada versión lo distribuye ya compilado:
 `colibri-<version>-windows-x86_64-cuda.zip` contiene `coli_cuda.dll` (tarjetas con
-compute capability 8.0 o superior) y los motores colibri, glm53, qwen36, qwen38, kimi_k3, deepseek_v41, mimo e inkling que
+compute capability 8.0 o superior) y los motores colibri, glm53, qwen36, qwen38, kimi_k3, deepseek_v41, mimo, inkling, olmoe, laya y gliner_decide que
 lo cargan, con las DLL CUDA propias de DeepSeek V4. Descomprímelo sobre el archivo
 principal y la instalación elige CUDA.
 
