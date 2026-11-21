@@ -1758,6 +1758,8 @@ jobs:
         run: |
           make -C c qwenimage-encoder-check
           python3 c/tools/check_qwenimage_encoder.py --sanitizers
+      - name: Single-reference Qwen3-VL conditioning against diffusers
+        run: make -C c qwenimage-vision-check
       - name: The shipping defaults (int8 weights) end to end, and the serve protocol
         run: |
           cd c

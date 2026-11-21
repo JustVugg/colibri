@@ -5,7 +5,7 @@
  *
  *   text_encoder  Qwen3-VL's language model (36 layers, 8B). Only a prefill: the
  *                 last layer's hidden states, before the final norm, are the
- *                 prompt's embedding. lm_head and the vision tower are not read.
+ *                 prompt's embedding. Text-to-image skips the vision tower.
  *   transformer   the DiT: 32 single-stream blocks over [prompt ; image tokens].
  *                 Prompt tokens are modulated as if t = 0 and attend causally, so
  *                 their keys and values do not depend on the step: they are
@@ -461,6 +461,7 @@ static void attention(float *out, int ldo, const float *Q, int ldq, int Tq,
 typedef struct { Lin q, k, v, o, gate, up, down; float *ln1, *ln2, *qn, *kn; } TeLayer;
 typedef struct {
     int hidden, layers, heads, kv, hd, inter, vocab;
+    int mrope[3];
     float eps, theta;
     shards S; int open;
     st_tensor *embed;
@@ -483,9 +484,19 @@ static void te_config(Te *te, const char *model){
     te->vocab = (int)jnum(c, "vocab_size", 0);
     te->eps = (float)jnum(c, "rms_norm_eps", 1e-6);
     te->theta = (float)jnum(c, "rope_theta", 0);
-    if (te->theta == 0) {
-        jval *rp = json_get(c, "rope_parameters");
-        te->theta = (float)jnum(rp, "rope_theta", 5000000.0);
+    jval *rp = json_get(c, "rope_parameters");
+    if (te->theta == 0) te->theta = (float)jnum(rp, "rope_theta", 5000000.0);
+    jval *sections = json_get(rp, "mrope_section");
+    if (!sections) sections = json_get(json_get(c, "rope_scaling"), "mrope_section");
+    if (sections && sections->t == J_ARR && sections->len == 3) {
+        int sizes[3], i = 0;
+        for (; i < 3; i++) {
+            jval *section = sections->kids[i];
+            if (section->t != J_NUM || !(section->num >= 0 && section->num <= 512) ||
+                section->num != floor(section->num)) break;
+            sizes[i] = (int)section->num;
+        }
+        if (i == 3) memcpy(te->mrope, sizes, sizeof sizes);
     }
     json_free(root); free(arena);
     /* Model files come from mirrors nobody vouches for: every dimension that
@@ -580,16 +591,18 @@ static void te_tokenizer(Te *te, const char *model){
 
 /* The pipeline's template, tokenized as one string (not through
  * apply_chat_template: the checkpoint was trained on this one). */
+#define QI_MAX_PROMPT_TOKENS 1024
+
 static const char *QI_SYS = "Comprehend and analyze the provided prompt.";
 
-static int *te_encode_prompt(Te *te, const char *prompt, int *n_out, int *drop_out){
+static int *te_encode_prompt_impl(Te *te, const char *prompt, int image, int *n_out, int *drop_out){
     char *norm = NULL; size_t norm_len = 0;
     const char *p = prompt && *prompt ? prompt : " ";   /* the pipeline's rule: no empty prompt */
     if (q38_nfc_normalize(p, strlen(p), &norm, &norm_len) != 0) { norm = strdup(p); norm_len = strlen(p); }
     size_t cap = norm_len + 512;
     char *text = xmalloc(cap);
-    snprintf(text, cap, "<|im_start|>system\n%s<|im_end|>\n<|im_start|>user\n%.*s<|im_end|>\n<|im_start|>assistant\n",
-             QI_SYS, (int)norm_len, norm);
+    snprintf(text, cap, "<|im_start|>system\n%s<|im_end|>\n<|im_start|>user\n%s%.*s<|im_end|>\n<|im_start|>assistant\n",
+             QI_SYS, image ? "<image1><|vision_start|><|image_pad|><|vision_end|>" : "", (int)norm_len, norm);
     int max = (int)strlen(text) + 16;
     int *ids = xmalloc(sizeof(int) * max);
     int n = tok_encode(&te->tok, text, (int)strlen(text), ids, max);
@@ -602,9 +615,18 @@ static int *te_encode_prompt(Te *te, const char *prompt, int *n_out, int *drop_o
     return ids;
 }
 
+static int *te_encode_prompt(Te *te, const char *prompt, int *n_out, int *drop_out){
+    return te_encode_prompt_impl(te, prompt, 0, n_out, drop_out);
+}
+
+typedef struct {
+    int start, count;
+    const float *merged, *deepstack[3], *cosines, *sines;
+} TeVisual;
+
 /* rotate-half RoPE over the full head (text only: Qwen3-VL's M-RoPE with three
  * equal position components is the plain 1D rotary). */
-static void te_rope(float *x, int T, int nh, int hd, int ld, float theta){
+static void te_rope(float *x, int T, int nh, int hd, int ld, float theta, const TeVisual *visual){
     int half = hd / 2;
     float *inv = fmalloc(half);
     for (int i = 0; i < half; i++) inv[i] = 1.f / powf(theta, (float)(2 * i) / (float)hd);
@@ -613,7 +635,10 @@ static void te_rope(float *x, int T, int nh, int hd, int ld, float theta){
         for (int h = 0; h < nh; h++) {
             float *r = x + (int64_t)t * ld + (int64_t)h * hd;
             for (int i = 0; i < half; i++) {
-                float a = (float)t * inv[i], c = cosf(a), s = sinf(a);
+                float a = (float)t * inv[i];
+                size_t lane = (size_t)t * half + i;
+                float c = visual ? visual->cosines[lane] : cosf(a);
+                float s = visual ? visual->sines[lane] : sinf(a);
                 float x0 = r[i], x1 = r[i + half];
                 r[i] = x0 * c - x1 * s;
                 r[i + half] = x1 * c + x0 * s;
@@ -623,7 +648,7 @@ static void te_rope(float *x, int T, int nh, int hd, int ld, float theta){
 }
 
 /* ids[T] -> hidden[T][hidden]: the last layer's output before the final norm. */
-static float *te_forward(Te *te, const int *ids, int T){
+static float *te_forward_impl(Te *te, const int *ids, int T, const TeVisual *visual){
     int H = te->hidden, qd = te->heads * te->hd, kd = te->kv * te->hd, I = te->inter;
     float *x = fmalloc((size_t)T * H), *h = fmalloc((size_t)T * H);
     float *q = fmalloc((size_t)T * qd), *k = fmalloc((size_t)T * kd), *v = fmalloc((size_t)T * kd);
@@ -632,6 +657,11 @@ static float *te_forward(Te *te, const int *ids, int T){
     const int64_t rb = gq_row_bytes(et, H);
     uint8_t *row = xmalloc((size_t)rb);
     for (int t = 0; t < T; t++) {
+        if (visual && t >= visual->start && t - visual->start < visual->count) {
+            memcpy(x + (size_t)t * H, visual->merged + (size_t)(t - visual->start) * H,
+                   (size_t)H * sizeof(float));
+            continue;
+        }
         if (ids[t] < 0 || ids[t] >= te->vocab) { fprintf(stderr, "[qwenimage] token id %d out of range\n", ids[t]); exit(1); }
         st_pread_full(te->embed->fd, row, rb, te->embed->off + (int64_t)ids[t] * rb, "embed row");
         gq_dequant_row(et, row, x + (int64_t)t * H, H);
@@ -643,8 +673,8 @@ static float *te_forward(Te *te, const int *ids, int T){
         linear(q, h, T, &L->q); linear(k, h, T, &L->k); linear(v, h, T, &L->v);
         rmsnorm_rows(q, q, L->qn, T * te->heads, te->hd, te->eps, 0);
         rmsnorm_rows(k, k, L->kn, T * te->kv, te->hd, te->eps, 0);
-        te_rope(q, T, te->heads, te->hd, qd, te->theta);
-        te_rope(k, T, te->kv, te->hd, kd, te->theta);
+        te_rope(q, T, te->heads, te->hd, qd, te->theta, visual);
+        te_rope(k, T, te->kv, te->hd, kd, te->theta, visual);
         attention(a, qd, q, qd, T, k, v, kd, T, te->heads, te->kv, te->hd, 0);
         linear(h, a, T, &L->o);
         for (int64_t i = 0; i < (int64_t)T * H; i++) x[i] += h[i];
@@ -654,10 +684,21 @@ static float *te_forward(Te *te, const int *ids, int T){
         for (int64_t i = 0; i < (int64_t)T * I; i++) g[i] = silu(g[i]) * u[i];
         linear(h, g, T, &L->down);
         for (int64_t i = 0; i < (int64_t)T * H; i++) x[i] += h[i];
+        if (visual && l < 3) {
+            float *image = x + (size_t)visual->start * H;
+            for (size_t i = 0; i < (size_t)visual->count * H; i++)
+                image[i] += visual->deepstack[l][i];
+        }
     }
     free(h); free(q); free(k); free(v); free(a); free(g); free(u);
     return x;
 }
+
+static float *te_forward(Te *te, const int *ids, int T){
+    return te_forward_impl(te, ids, T, NULL);
+}
+
+#include "qwenimage_vision.h"
 
 /* ---- DiT ------------------------------------------------------------------- */
 
@@ -1223,7 +1264,6 @@ static QiVae *engine_vae(Engine *e, char *msg, size_t msgn){
  * score matrix, so an unbounded prompt is an unbounded allocation (40000 digits,
  * one token each, took 6.4 GB on the tiny model); the pipeline's own prompts
  * are a few dozen tokens. */
-#define QI_MAX_PROMPT_TOKENS 1024
 
 static int engine_prefix(Engine *e, const char *prompt, float **emb_out, int *L_out, char *msg, size_t msgn){
     if (e->last_prompt && !strcmp(e->last_prompt, prompt) && e->prefix.K && !emb_out) {
