@@ -669,6 +669,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   - The desktop window hands the system's opener only http and https links.
   - qwen36's Metal graph reads the MTP head's routed experts only in the packed int4 form, with
     their byte and scale counts checked against the slot, as the CPU's reader does.
+- **qwen36, qwen38: `SEED` seeds the sampler.** Both engines drew their temperature samples from an
+  unseeded libc `rand()`: every run took the same sequence, and `SEED`, which the other engines
+  read, did nothing here. Set, a run repeats to the token; unset, the clock and the pid seed it,
+  as on mimo and inkling. `coli_env.h` lists the variable for both.
+
 - **Inkling's expert cache from the RAM plan in `coli serve`**: without `--cap` the engine got
   the legacy eight slots a layer, and on Inkling-2 (eight routed experts a token) nearly every
   expert of a step came again from the page cache. Inkling-2-Mini UD-Q4_K_XL on the CPU: 4.3 ->

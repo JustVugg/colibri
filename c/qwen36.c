@@ -11512,6 +11512,12 @@ int main(int argc, char **argv) {
      * the hot team (omp_tune.h), which re-runs the engine once with libgomp's settings. */
     coli_omp_hot_team(argv, "qwen36", coli_omp_env_on("COLI_CUDA") || coli_omp_env_on("COLI_METAL"));
     coli_omp_tune_threads("qwen36");
+    /* The sampler (qwen36_sample.h) draws from libc's rand(), which glibc seeds with 1: every
+     * run drew the same sequence, and nothing could repeat a run on purpose or vary it. SEED
+     * seeds it as the other engines do (mimo, inkling, deepseek_v41; coli_env.h): set, a run
+     * repeats to the token at a temperature above 0; unset, the clock and the pid seed it. */
+    { const char *seed = getenv("SEED");
+      srand(seed && *seed ? (unsigned)strtoul(seed, NULL, 10) : (unsigned)(time(NULL) ^ (unsigned)getpid())); }
     const char *snap = getenv("SNAP");
     if (!snap) { coli_print_launcher_help("Qwen3.6", "SNAP=<model directory> ./qwen36 ..."); return 1; }
     static char gguf_path[4096], mmproj_path[4096], mtp_path[4096]; int gguf_dir = 0;
