@@ -550,8 +550,9 @@ int coli_qpack_open(ColiQpackReader *reader, const char *container_dir,
     size_t layout_size;
     char *manifest_text = qpack_read_text(
         manifest_path, NULL, error, error_capacity);
-    char *layout_text = qpack_read_text(
-        layout_path, &layout_size, error, error_capacity);
+    /* the first failure is the one reported: a second read would overwrite it */
+    char *layout_text = manifest_text ? qpack_read_text(
+        layout_path, &layout_size, error, error_capacity) : NULL;
     free(manifest_path);
     if (!manifest_text || !layout_text) {
         free(manifest_text);
