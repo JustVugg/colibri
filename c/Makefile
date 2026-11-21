@@ -583,6 +583,8 @@ TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_frami
 TEST_EXCLUDE += test_vk_chain test_vk_memtype test_glm53_vk_f32 test_vk_dev2_window test_vk_pcache
 # needs a CUDA device and the CUDA objects: make tests/test_cu_tier CUDA=1
 TEST_EXCLUDE += test_cu_tier
+# the same: make tests/test_qwen36_tier_mxfp4_gpu CUDA=1 (Windows: CUDA_DLL=1)
+TEST_EXCLUDE += test_qwen36_tier_mxfp4_gpu
 # takes a fixture and the CPU build's logits on its command line (ci.yml, the int4 gs64 A/B step)
 TEST_EXCLUDE += test_qwen36_tier_stream_engine
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
@@ -3441,6 +3443,17 @@ tests/test_qwen36_tier_init_failure$(EXE): tests/test_qwen36_tier_init_failure.c
 # engine's recycled slot, promotion decided when the bytes pass by.
 tests/test_qwen36_tier_fp8$(EXE): tests/test_qwen36_tier_fp8.c qwen36_tier.c
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Same fake backend: the MXFP4 copy mode (Qwen3.8's experts-mxfp4/ sidecar) -- fmt 7
+# uploads, half a byte a weight, the ue8m0 scale BYTES staged in order, no chain format.
+tests/test_qwen36_tier_mxfp4$(EXE): tests/test_qwen36_tier_mxfp4.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# The same mode on a real device (the grouped MXFP4 kernels behind qt_issue/qt_take, a swap
+# in place) against quant.h's matmul_mxfp4. Needs the CUDA objects, like test_cu_tier.
+tests/test_qwen36_tier_mxfp4_gpu$(EXE): tests/test_qwen36_tier_mxfp4_gpu.c qwen36_tier.c $(CUDA_OBJ)
+	@case "$(CUDA_OBJ)" in *backend_*) ;; *) echo "tests/test_qwen36_tier_mxfp4_gpu needs CUDA=1, CUDA_DLL=1 or HIP=1" >&2; exit 1 ;; esac
+	$(CC) $(CFLAGS) $< $(CUDA_OBJ) -o $@ $(LDFLAGS)
 
 # Same fake backend, qwen36 below full residency (#2090): cap < n_experts in copy
 # mode, the engine's planar int4 staged as the container's pairs, hits keeping

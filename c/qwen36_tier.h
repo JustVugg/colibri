@@ -166,6 +166,12 @@ struct ColiCudaTensor *qt_lmhead_tensor(int *dev);
  * callers must serialize init/shutdown with new work. */
 int  qt_init_fp8(int n_layers, int n_experts, int hidden, int inter,
                  int cap_experts_per_layer, int topk, const float *e4m3_lut);
+/* MXFP4 copy mode (Qwen3.8's experts-mxfp4/ sidecar), fp8's contract: experts go up as fmt 7
+ * (e2m1 nibbles [O,I/2], the low nibble the even column, and a ue8m0 byte per row and 32 inputs
+ * [O,ceil(I/32)]). qt_note's gs/us/ds carry those scale BYTES through the float* parameters, as
+ * coli_cuda_tensor_upload takes them. hidden and inter must be even (else 0: the CPU's). */
+int  qt_init_mxfp4(int n_layers, int n_experts, int hidden, int inter,
+                   int cap_experts_per_layer, int topk);
 int  qt_init(int n_layers, int n_experts, int hidden, int inter,
              int cap_experts_per_layer, int topk, int expert_gs,
              int expert_is_int4);
@@ -335,6 +341,7 @@ int  qt_chain_host_all(void);
 
 static inline int  qt_init(int a,int b,int c,int d,int e,int f,int g,int h){(void)h;(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
 static inline int  qt_init_fp8(int a,int b,int c,int d,int e,int f,const float*g){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
+static inline int  qt_init_mxfp4(int a,int b,int c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
 static inline int  qt_init_gguf(int a,int b,int c,int d,int e,int f,const int*g,const int*h,const size_t*i,const size_t*j,int k){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i;(void)j;(void)k;return 0;}
 static inline int  qt_lmhead_init(const int8_t*a,const float*b,int c,int d){(void)a;(void)b;(void)c;(void)d;return 0;}
 static inline int  qt_lmhead_matmul(float*a,const float*b,int c,int d){(void)a;(void)b;(void)c;(void)d;return 0;}
