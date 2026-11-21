@@ -2,18 +2,25 @@
 """Registration and discovery control plane for local expert workers."""
 
 import argparse
+import hmac
 import json
 import os
 import sys
 import threading
 import time
 from http.server import ThreadingHTTPServer
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import openai_server
 
 
 PROTOCOL_VERSION = 1
+# A shared secret for the coordinator. Set on the coordinator and on every worker (the workers'
+# register and heartbeat calls read it from here), and registration then needs it. Read from the
+# environment, not a flag: a command-line secret shows in the process list.
+TOKEN_ENV = "COLI_CLUSTER_TOKEN"
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 
 
 class ClusterRegistry:
@@ -93,9 +100,22 @@ class _Handler(openai_server.APIHandler):
             return
         self.send_json(404, {"error": "not found"})
 
+    def _check_token(self):
+        """registration and heartbeat need the shared secret when the coordinator has one. The
+        Host guard is not authentication: it stops a web page from re-pointing a name here, but
+        any host that can reach the port can send `Host: 127.0.0.1`."""
+        token = getattr(self.server, "token", None)
+        if not token:
+            return
+        sent = self.headers.get("Authorization", "")
+        if not hmac.compare_digest(sent.encode("utf-8"), f"Bearer {token}".encode("utf-8")):
+            raise openai_server.APIError(
+                401, f"registration needs the cluster token: send 'Authorization: Bearer <${TOKEN_ENV}>'")
+
     def do_POST(self):  # noqa: N802 - stdlib handler API
         try:
             self._check_host()
+            self._check_token()
             body = self.read_json()
             if self.path == "/v1/cluster/register":
                 self.send_json(200, self.server.registry.register(body))
@@ -110,9 +130,10 @@ class _Handler(openai_server.APIHandler):
 
 
 class ClusterServer(openai_server.APIServer):
-    def __init__(self, address, registry, allowed_hosts=()):
+    def __init__(self, address, registry, allowed_hosts=(), token=None):
         ThreadingHTTPServer.__init__(self, address, _Handler)
         self.registry = registry
+        self.token = token or None   # None or "": registration is open, as before
         # Shared APIHandler plumbing reads these off the server. The registry has
         # no API key or CORS surface, and its Host guard stays loopback + bind
         # address (the same default openai_server enforces). A cross-host worker
@@ -135,11 +156,40 @@ def _endpoint(coordinator, path):
     return coordinator.rstrip("/") + "/v1/cluster/" + path
 
 
-def serve(host="127.0.0.1", port=8765, stale_after=30.0, allowed_hosts=()):
+def _auth_headers():
+    token = os.environ.get(TOKEN_ENV)
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def _post(request):
+    try:
+        with urlopen(request, timeout=5) as response:
+            return json.load(response)
+    except HTTPError as error:
+        if error.code == 401:
+            raise OSError(f"the coordinator refused this node: set {TOKEN_ENV} to the coordinator's "
+                          f"cluster token") from error
+        raise
+
+
+def exposure_warning(host, token):
+    """what to tell the operator when the coordinator listens beyond this machine with an open
+    registration, or None"""
+    if token or str(host).strip("[]").lower() in LOOPBACK_HOSTS:
+        return None
+    return (f"WARNING: the coordinator listens on {host} and {TOKEN_ENV} is not set, so any host that "
+            f"can reach it can register as an expert worker; set {TOKEN_ENV} here and on every worker")
+
+
+def serve(host="127.0.0.1", port=8765, stale_after=30.0, allowed_hosts=(), token=None):
     if allowed_hosts and "*" in allowed_hosts:
         print("WARNING: --allowed-host '*' accepts ANY Host header "
               "(DNS-rebinding guard disabled)", file=sys.stderr)
-    server = ClusterServer((host, port), ClusterRegistry(stale_after), allowed_hosts)
+    token = token if token is not None else os.environ.get(TOKEN_ENV)
+    warning = exposure_warning(host, token)
+    if warning:
+        print(warning, file=sys.stderr)
+    server = ClusterServer((host, port), ClusterRegistry(stale_after), allowed_hosts, token)
     print(f"colibri cluster coordinator listening on http://{host}:{port}", flush=True)
     try:
         server.serve_forever()
@@ -150,17 +200,15 @@ def serve(host="127.0.0.1", port=8765, stale_after=30.0, allowed_hosts=()):
 def register(coordinator, node):
     request = Request(_endpoint(coordinator, "register"),
                       data=json.dumps(node).encode(),
-                      headers={"Content-Type": "application/json"}, method="POST")
-    with urlopen(request, timeout=5) as response:
-        return json.load(response)
+                      headers={"Content-Type": "application/json", **_auth_headers()}, method="POST")
+    return _post(request)
 
 
 def heartbeat(coordinator, node_id):
     request = Request(_endpoint(coordinator, "heartbeat"),
                       data=json.dumps({"node_id": node_id}).encode(),
-                      headers={"Content-Type": "application/json"}, method="POST")
-    with urlopen(request, timeout=5) as response:
-        return json.load(response)
+                      headers={"Content-Type": "application/json", **_auth_headers()}, method="POST")
+    return _post(request)
 
 
 def discover_workers(coordinator):
