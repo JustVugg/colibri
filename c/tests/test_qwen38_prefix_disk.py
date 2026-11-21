@@ -193,6 +193,22 @@ class Qwen38PrefixDiskTest(unittest.TestCase):
                     self.assertEqual(hashlib.sha256(again[:-32]).digest(), again[-32:])
                     self.same(log, 0, chat(Q2), b, fixture=fixture, Q38_MTP=mtp, logit_check=mtp == "0")
 
+    def test_mtp_head_file_holds_nothing_the_engine_did_not_write(self):
+        """With the MTP head a file carries the head's pending rows and the head's own rows whatever
+        the head holds of them: with one row pending and the head a position behind, the other rows
+        and a position of the head's K, V and index rows are memory the engine never wrote. Two runs of
+        one prompt, the allocator filling fresh memory with a different byte in each (glibc's
+        MALLOC_PERTURB_; elsewhere the two runs are simply two runs), write the same file."""
+        if "mtp" not in self.dirs:
+            self.skipTest("tiny qwen38 MTP fixture is absent (tools/make_qwen38_tiny.py --mtp)")
+        sys_end, wrote = ntok(SYSTEM), []
+        for fill in ("90", "195"):
+            d = self.tmp()
+            answer, _ = self.run1(d, chat(Q1), "mtp", Q38_MTP="1", MALLOC_PERTURB_=fill)
+            self.run1(d, chat(Q1, answer, Q3), "mtp", Q38_MTP="1", MALLOC_PERTURB_=fill)
+            wrote.append(files(d)[sys_end].read_bytes())
+        self.assertEqual(wrote[0], wrote[1])
+
     def test_cap_evicts_the_least_recently_used(self):
         """A cap that holds where the system prompt ends and one deeper file, not two deeper ones. A
         conversation's third turn, an hour after its second and two after its first, takes its second
