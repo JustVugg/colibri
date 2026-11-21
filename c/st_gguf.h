@@ -263,6 +263,19 @@ static const st_gg_name st_gg_ink2_layer[] = {
     {"loop_v_gain.weight", "controllers.v.gain_weight"},
     {"loop_mlp_down.weight", "controllers.mlp.down_weight"}, {"loop_mlp_forget.weight", "controllers.mlp.forget_weight"},
     {"loop_mlp_gain.weight", "controllers.mlp.gain_weight"},
+    /* mainline llama.cpp's inkling2_loop (unsloth's Mainline_Support files): the same gates as
+     * loop_{q,k,v,ffn}_ctrl_* (the checkpoint's attn, k, v and mlp, matched byte for byte), and a
+     * loop layer's four message queries in one [4, D] tensor, [q, k, v, mlp] as inkling.c lays the
+     * checkpoint's middle_cycle_cross_pass_(kv_)queries out */
+    {"loop_q_ctrl_down.weight", "controllers.attn.down_weight"}, {"loop_q_ctrl_forget.weight", "controllers.attn.forget_weight"},
+    {"loop_q_ctrl_gain.weight", "controllers.attn.gain_weight"},
+    {"loop_k_ctrl_down.weight", "controllers.k.down_weight"}, {"loop_k_ctrl_forget.weight", "controllers.k.forget_weight"},
+    {"loop_k_ctrl_gain.weight", "controllers.k.gain_weight"},
+    {"loop_v_ctrl_down.weight", "controllers.v.down_weight"}, {"loop_v_ctrl_forget.weight", "controllers.v.forget_weight"},
+    {"loop_v_ctrl_gain.weight", "controllers.v.gain_weight"},
+    {"loop_ffn_ctrl_down.weight", "controllers.mlp.down_weight"}, {"loop_ffn_ctrl_forget.weight", "controllers.mlp.forget_weight"},
+    {"loop_ffn_ctrl_gain.weight", "controllers.mlp.gain_weight"},
+    {"loop_msg_query.weight", "loop_msg_query"},
     {NULL, NULL}};
 /* Inkling-2's vision tower from its own GGUF (unsloth's mmproj-*.gguf: architecture clip,
  * projector inkling2, gguf.json "mmproj"), under the checkpoint's model.visual.* names. The same
@@ -457,6 +470,7 @@ static const st_gg_map st_gguf_maps[] = {
     {"kimi-k3", "model.layers.%d.", st_gg_k3_glob, st_gg_k3_layer, NULL, NULL},
     {"inkling", "model.layers.%d.", st_gg_ink_glob, st_gg_ink_layer, NULL, NULL},
     {"inkling2", "model.llm.layers.%d.", st_gg_ink2_glob, st_gg_ink2_layer, NULL, NULL},
+    {"inkling2_loop", "model.llm.layers.%d.", st_gg_ink2_glob, st_gg_ink2_layer, NULL, NULL},
     {"inkling2_clip", "model.visual.backbone.layers.%d.", st_gg_ink2v_glob, st_gg_ink2v_layer, NULL, "v.blk.%d.%n"},
     {"qwen_image", "transformer_blocks.%d.", st_gg_qimg_glob, st_gg_qimg_layer,
      "model.diffusion_model.", "transformer_blocks.%d.%n"},
@@ -689,7 +703,7 @@ static int st_init_gguf(shards *S, const char *snap_dir) {
         head = S->n - was;
     }
     int vis = 0;
-    if (mpath[0] && arch && !strcmp(arch, "inkling2")) {   /* the vision tower's own file (the other engines read theirs) */
+    if (mpath[0] && arch && (!strcmp(arch, "inkling2") || !strcmp(arch, "inkling2_loop"))) {   /* the vision tower's own file (the other engines read theirs) */
         gguf_ctx *V = &st_gguf_vis;
         if (gguf_open(V, mpath)) coli_load_fail(COLI_LOAD_FAIL_FORMAT, "GGUF %s: %s", mpath, V->err);
         /* Inkling-2-Mini's names it clip.vision.projector_type inkling2v (llama.cpp's later names) */

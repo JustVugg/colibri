@@ -7,6 +7,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### New
 
+- **Inkling-2-Mini from mainline llama.cpp's layout** (`inkling2_loop`: unsloth's
+  `Mainline_Support/*.gguf_file`, the same tensors as their root files byte for byte): `coli import`
+  reads its metadata (`inkling2_loop.*`, `block_count` the checkpoint's 24 layers, the loop as
+  `loop.count/start/end`) into the same `config.json`, and the engine its tensors (`st_gguf.h`:
+  the gates as `loop_{q,k,v,ffn}_ctrl_*`, a loop layer's four message queries in
+  `blk.N.loop_msg_query`). Before, the import refused the architecture and the engine, given such a
+  file, stopped at "no tensor map in st_gguf.h". UD-IQ3_XXS in either layout: the same answers, 44
+  tok/s on CUDA.
 - **Inkling-2-Mini** (`thinkingmachines/Inkling-2-Mini`, 26.4B, 3.4B active, Apache 2.0) on the
   inkling engine: Inkling-2 whose layers 6-17 run three passes with their weights shared, each
   pass with K/V and convolution states of its own, and from the second pass every loop layer
