@@ -37,6 +37,9 @@ typedef struct Ink2Layer {
     float *k_wp, *v_wp;              /* global: attn.k/v_sconv.weight_proj [KV*K, D] */
     float *aq; int naq;              /* attention_input queries [naq, D]; layer 0 has none */
     float *mq;                       /* mlp_input query [D] */
+    /* Inkling-2-Mini's loop layers: the message gates of the query (the checkpoint's controllers.attn),
+     * key, value and MLP inputs, down [rank, 2D], forget and gain [D, rank] (NULL off the loop) */
+    float *lg_down[4], *lg_fgt[4], *lg_gain[4];
 } Ink2Layer;
 
 /* ink_glu (the experts' softcapped SwiGLU) and ink2_head_post (the logits' softcap) are in
@@ -96,8 +99,18 @@ static void ink2_load_layer(Model *m, int i, char *nm, size_t nmz) {
     x->sink = load_t(m, P2("attn.attn_sink_proj.weight"));
     x->q_clip = load_t(m, P2("attn.q_l2_clip.scale"));
     x->r_clip = load_t(m, P2("attn.rel_l2_clip.scale"));
-    l->relp = load_t(m, P2("attn.rel_logits_proj.proj"));
     const int K = c->conv_k, gg = st_has(&m->S, P2("attn_sconv.gguf"));   /* a GGUF's folded convolutions */
+    /* llama.cpp's later names (Inkling-2-Mini's GGUFs): the convolutions as the checkpoint has them but
+     * a global layer's static taps in convolution order, the relative bias transposed */
+    const int ggn = st_has(&m->S, P2("attn.k_sconv.ggufn")), ggq = st_has(&m->S, P2("attn_res.mlp_query"));
+    if (st_has(&m->S, P2("attn.rel_logits_proj.gguf_t"))) {
+        const int ext = L_EXT(c, i), dr = c->d_rel;
+        float *t = load_t(m, P2("attn.rel_logits_proj.gguf_t"));   /* [ext, d_rel] */
+        if (st_numel(&m->S, nm) != (int64_t)ext * dr) { fprintf(stderr, "layer %d: %s is not %d x %d\n", i, nm, ext, dr); exit(1); }
+        l->relp = falloc((int64_t)ext * dr);
+        for (int a = 0; a < ext; a++) for (int b = 0; b < dr; b++) l->relp[(int64_t)b * ext + a] = t[(int64_t)a * dr + b];
+        free(t);
+    } else l->relp = load_t(m, P2("attn.rel_logits_proj.proj"));
     const int64_t kvdim = (int64_t)L_KV(c, i) * L_HD(c, i);
     if (gg) {
         const float sq = (float)sqrt((double)(2 * K + 1));
@@ -113,12 +126,20 @@ static void ink2_load_layer(Model *m, int i, char *nm, size_t nmz) {
         }
         ink2_unfold_sconv(l->a_cw = load_t(m, P2("attn_sconv.gguf")), c->hidden, K);
         ink2_unfold_sconv(l->m_cw = load_t(m, P2("mlp_sconv.gguf")), c->hidden, K);
-        /* the NVFP4 layers' experts come without their global scale */
-        if (st_has(&m->S, P2("mlp.experts.gate_scale"))) {
-            l->xgsc = load_t(m, P2("mlp.experts.gate_scale"));
-            l->xusc = load_t(m, P2("mlp.experts.up_scale"));
-            l->xdsc = load_t(m, P2("mlp.experts.down_scale"));
+    } else if (ggn && c->local[i]) {   /* [C, K] as the checkpoint's [C, 1, K] */
+        l->k_cw = load_t(m, P2("attn.k_sconv.ggufn"));
+        l->v_cw = load_t(m, P2("attn.v_sconv.ggufn"));
+    } else if (ggn) {   /* the static taps [C, K] in convolution order: the checkpoint's static_w [K, C] reversed */
+        float **dst[2] = { &x->k_st, &x->v_st }; const char *src[2] = { "attn.k_sconv.ggufn", "attn.v_sconv.ggufn" };
+        for (int j = 0; j < 2; j++) {
+            snprintf(nm, nmz, "model.llm.layers.%d.%s", i, src[j]);
+            if (st_numel(&m->S, nm) != kvdim * K) { fprintf(stderr, "layer %d: %s is not %lld x %d\n", i, nm, (long long)kvdim, K); exit(1); }
+            float *g = load_t(m, nm), *o = falloc(kvdim * K);
+            for (int64_t ch = 0; ch < kvdim; ch++) for (int k = 0; k < K; k++) o[(int64_t)k * kvdim + ch] = g[ch * K + (K - 1 - k)];
+            free(g); *dst[j] = o;
         }
+        x->k_wp = load_t(m, P2("attn.k_sconv.weight_proj"));
+        x->v_wp = load_t(m, P2("attn.v_sconv.weight_proj"));
     } else if (c->local[i]) {
         l->k_cw = load_t(m, P2("attn.k_sconv.weight"));
         l->v_cw = load_t(m, P2("attn.v_sconv.weight"));
@@ -132,6 +153,12 @@ static void ink2_load_layer(Model *m, int i, char *nm, size_t nmz) {
         l->a_cw = load_t(m, P2("attn_sconv.weight"));
         l->m_cw = load_t(m, P2("mlp_sconv.weight"));
     }
+    /* a GGUF's NVFP4 layers: the experts come without their global scale (one F32 an expert) */
+    if (st_has(&m->S, P2("mlp.experts.gate_scale"))) {
+        l->xgsc = load_t(m, P2("mlp.experts.gate_scale"));
+        l->xusc = load_t(m, P2("mlp.experts.up_scale"));
+        l->xdsc = load_t(m, P2("mlp.experts.down_scale"));
+    }
     l->router = load_t(m, P2("mlp.gate.weight"));
     l->rbias  = load_t(m, P2("mlp.gate.bias"));
     l->rgs = 1.f;
@@ -139,7 +166,7 @@ static void ink2_load_layer(Model *m, int i, char *nm, size_t nmz) {
     /* the attention residuals' queries: layer i reads attn_queries.(i-1) ([D], or [3, D] on a
      * global layer: q, k and v) and mlp_queries.i */
     if (i > 0) {
-        if (gg) snprintf(nm, nmz, "model.llm.layers.%d.attn_res.attn_query", i);   /* the GGUF's, by layer */
+        if (gg || ggq) snprintf(nm, nmz, "model.llm.layers.%d.attn_res.attn_query", i);   /* the GGUF's, by layer */
         else snprintf(nm, nmz, "model.llm.attn_res.attn_queries.%d", i - 1);
         int64_t n = st_numel(&m->S, nm);
         x->naq = n == (int64_t)c->hidden ? 1 : n == 3LL * c->hidden ? 3 : 0;
@@ -150,9 +177,26 @@ static void ink2_load_layer(Model *m, int i, char *nm, size_t nmz) {
         }
         x->aq = load_t(m, nm);
     }
-    if (gg) snprintf(nm, nmz, "model.llm.layers.%d.attn_res.mlp_query", i);
+    if (gg || ggq) snprintf(nm, nmz, "model.llm.layers.%d.attn_res.mlp_query", i);
     else snprintf(nm, nmz, "model.llm.attn_res.mlp_queries.%d", i);
     x->mq = load_t(m, nm);
+    if (c->loop_p > 1 && i >= c->loop_s && i < c->loop_e) {   /* Inkling-2-Mini: a loop layer's message gates */
+        static const char *const g[4] = { "attn", "k", "v", "mlp" };
+        const int64_t D = c->hidden, r = c->loop_r;
+        for (int j = 0; j < 4; j++) {
+            static const char *const part[3] = { "down_weight", "forget_weight", "gain_weight" };
+            float **dst[3] = { &x->lg_down[j], &x->lg_fgt[j], &x->lg_gain[j] };
+            const int64_t want[3] = { r * 2 * D, D * r, D * r };
+            for (int k = 0; k < 3; k++) {
+                snprintf(nm, nmz, "model.llm.layers.%d.controllers.%s.%s", i, g[j], part[k]);
+                if (st_numel(&m->S, nm) != want[k]) {
+                    fprintf(stderr, "layer %d: %s has %lld values, not %lld\n", i, nm, (long long)st_numel(&m->S, nm), (long long)want[k]);
+                    exit(1);
+                }
+                *dst[k] = load_t(m, nm);
+            }
+        }
+    }
 }
 
 /* ---- the short convolutions ---- */
@@ -340,72 +384,158 @@ static void ink2_attn_res(const Cfg *c, const float *qs, int nq, float *const *b
 
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out);
 
-/* ---- the layers: x [S, D] in, the stream the final norm reads out (the output mix applied) ---- */
+/* ---- Inkling-2-Mini's loop ----
+ * A message gate: out = (1 - tanh(F z)) * h + tanh(G z) * m, z = W [unorm(h); unorm(m)] (W [rank, 2D],
+ * F and G [D, rank]), row by row in f32. out may be h. */
+static void ink2_loop_gate(const Cfg *c, const float *W, const float *F, const float *G, float *out,
+                           const float *h, const float *msg, int S) {
+    const int D = c->hidden, r = c->loop_r;
+    #pragma omp parallel
+    {
+        float *hn = malloc((size_t)2 * D * sizeof(float)), *z = malloc((size_t)r * sizeof(float));
+        if (!hn || !z) { fprintf(stderr, "OOM\n"); exit(1); }
+        #pragma omp for schedule(static)
+        for (int s = 0; s < S; s++) {
+            const float *hs = h + (int64_t)s * D, *ms = msg + (int64_t)s * D;
+            float *os = out + (int64_t)s * D;
+            ink2_unorm(hn, hs, D, c->eps);
+            ink2_unorm(hn + D, ms, D, c->eps);
+            for (int k = 0; k < r; k++) z[k] = dot_f32_lanes(W + (int64_t)k * 2 * D, hn, 2 * D);
+            for (int d = 0; d < D; d++) {
+                const float *fr = F + (int64_t)d * r, *gr = G + (int64_t)d * r;
+                float f = 0.f, g = 0.f;
+                for (int k = 0; k < r; k++) { f += fr[k] * z[k]; g += gr[k] * z[k]; }
+                os[d] = (1.f - tanhf(f)) * hs[d] + tanhf(g) * ms[d];
+            }
+        }
+        free(hn); free(z);
+    }
+}
+
+static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out);
+
+/* the scratch one layer needs, [S, D] each */
+typedef struct { float *hq, *hk, *hv, *nq, *nk, *nv, *a, *res; } Ink2Scratch;
+
+/* One layer: weight layer i, its state (key/value rows, convolutions) in state layer v (i outside a
+ * loop's later passes). msg: the four messages of a loop pass after the first (q, k, v, mlp), NULL
+ * otherwise. x [S, D] in and out; a block boundary appends this layer's input to blocks. */
+static void ink2_layer(Model *m, int i, int v, float *x, int S, int pos0, float **blocks, int *Bp, int maxb,
+                       float *const *msg, Ink2Scratch *w) {
+    Cfg *c = &m->c;
+    const int D = c->hidden, blk = c->res_block > 0 ? c->res_block : 1;
+    const int64_t SD = (int64_t)S * D;
+    Layer *l = &m->L[i];
+    Ink2Layer *x2 = l->x2;
+    const int local = c->local[i];
+    float *hq = w->hq, *hk = w->hk, *hv = w->hv, *nq = w->nq, *nk = w->nk, *nv = w->nv, *a = w->a, *res = w->res;
+    int B = *Bp;
+    /* the attention's input: the mix of the blocks so far and this stream (layer 0: the stream) */
+    const float *iq = x, *ik = x, *iv = x;
+    if (x2->aq) {
+        float *outs[3] = { hq, hk, hv };
+        ink2_attn_res(c, x2->aq, x2->naq, blocks, B, x, S, outs);
+        iq = hq; ik = local ? hq : hk; iv = local ? hq : hv;
+    }
+    if (msg) {   /* a later loop pass: each input mixed with its message (a sliding layer's one mix three ways) */
+        ink2_loop_gate(c, x2->lg_down[1], x2->lg_fgt[1], x2->lg_gain[1], hk, ik, msg[1], S);
+        ink2_loop_gate(c, x2->lg_down[2], x2->lg_fgt[2], x2->lg_gain[2], hv, iv, msg[2], S);
+        ink2_loop_gate(c, x2->lg_down[0], x2->lg_fgt[0], x2->lg_gain[0], hq, iq, msg[0], S);
+        iq = hq; ik = hk; iv = hv;
+    }
+    double ta = now_s();
+    if (local && !msg) {
+        for (int s = 0; s < S; s++) rmsnorm_row(nq + (int64_t)s * D, iq + (int64_t)s * D, x2->in_ln, D, c->eps);
+        ink2_attention(m, l, v, nq, nq, nq, S, pos0, a);
+    } else {
+        const float *gq = local ? x2->in_ln : x2->qin_ln, *gk = local ? x2->in_ln : x2->kin_ln, *gv = local ? x2->in_ln : x2->vin_ln;
+        for (int s = 0; s < S; s++) {
+            rmsnorm_row(nq + (int64_t)s * D, iq + (int64_t)s * D, gq, D, c->eps);
+            rmsnorm_row(nk + (int64_t)s * D, ik + (int64_t)s * D, gk, D, c->eps);
+            rmsnorm_row(nv + (int64_t)s * D, iv + (int64_t)s * D, gv, D, c->eps);
+        }
+        ink2_attention(m, l, v, nq, nk, nv, S, pos0, a);
+    }
+    m->t_attn += now_s() - ta;
+    ink2_sconv(m, a, S, D, l->a_cw, 2, v);
+    /* a block boundary keeps this layer's input stream as a block, and the stream starts over
+     * from the attention's output; elsewhere the output adds to it */
+    if (i % blk == 0) {
+        if (B == maxb) { fprintf(stderr, "inkling2: more than %d blocks\n", maxb); exit(1); }
+        blocks[B] = falloc(SD);
+        memcpy(blocks[B++], x, (size_t)SD * sizeof(float));
+        memcpy(res, a, (size_t)SD * sizeof(float));
+    } else for (int64_t j = 0; j < SD; j++) res[j] = x[j] + a[j];
+    float *mo = hq;   /* the MLP's input mix, then its normed input, then its output */
+    float *outs[1] = { mo };
+    ink2_attn_res(c, x2->mq, 1, blocks, B, res, S, outs);
+    if (msg) ink2_loop_gate(c, x2->lg_down[3], x2->lg_fgt[3], x2->lg_gain[3], mo, mo, msg[3], S);
+    for (int s = 0; s < S; s++) rmsnorm_row(nq + (int64_t)s * D, mo + (int64_t)s * D, x2->post_ln, D, c->eps);
+    moe(m, l, i, nq, S, mo);
+    ink2_sconv(m, mo, S, D, l->m_cw, 3, v);
+    for (int64_t j = 0; j < SD; j++) x[j] = res[j] + mo[j];
+    *Bp = B;
+}
+
+/* ---- the layers: x [S, D] in, the stream the final norm reads out (the output mix applied) ----
+ * Inkling-2-Mini: layers [loop_s, loop_e) run loop_p passes. Every pass starts from the stream and
+ * the blocks the layers before the loop left, with key/value and convolution states of its own
+ * (state layers ink_sl), and from the second pass on each loop layer takes four messages: the mix
+ * its queries take of the previous pass's blocks (but the first, its own input) and that pass's
+ * output stream. The layers after the loop read the last pass's. The drafter's capture points
+ * count the layers as they run (n_state of them). */
 static void ink2_layers_forward(Model *m, float *x, int S, int pos0) {
     Cfg *c = &m->c;
     const int D = c->hidden, L = c->n_layers, blk = c->res_block > 0 ? c->res_block : 1;
     const int64_t SD = (int64_t)S * D;
     const int maxb = (L + blk - 1) / blk;
-    float **blocks = calloc((size_t)maxb, sizeof(float *));
-    float *hq = falloc(SD), *hk = falloc(SD), *hv = falloc(SD);
-    float *nq = falloc(SD), *nk = falloc(SD), *nv = falloc(SD);
-    float *a = falloc(SD), *res = falloc(SD);
-    if (!blocks) { fprintf(stderr, "OOM\n"); exit(1); }
-    int B = 0;
+    const int loop = c->loop_p > 1, ls = loop ? c->loop_s : L, le = loop ? c->loop_e : L;
+    float **blocks = calloc((size_t)maxb, sizeof(float *)), **prevb = calloc((size_t)maxb, sizeof(float *));
+    Ink2Scratch w = { falloc(SD), falloc(SD), falloc(SD), falloc(SD), falloc(SD), falloc(SD), falloc(SD), falloc(SD) };
+    if (!blocks || !prevb) { fprintf(stderr, "OOM\n"); exit(1); }
+    int B = 0, app = 0;
     ink2m_begin(m, S);   /* INK2_MTP: the drafter's fused streams of this forward */
     ink2m_capture(m, 0, x, S);
-    for (int i = 0; i < L; i++) {
-        if (coli_prompt_break()) break;
-        Layer *l = &m->L[i];
-        Ink2Layer *x2 = l->x2;
-        const int local = c->local[i];
-        /* the attention's input: the mix of the blocks so far and this stream (layer 0: the stream) */
-        const float *iq = x, *ik = x, *iv = x;
-        if (x2->aq) {
-            float *outs[3] = { hq, hk, hv };
-            ink2_attn_res(c, x2->aq, x2->naq, blocks, B, x, S, outs);
-            iq = hq; ik = local ? hq : hk; iv = local ? hq : hv;
-        }
-        double ta = now_s();
-        if (local) {
-            for (int s = 0; s < S; s++) rmsnorm_row(nq + (int64_t)s * D, iq + (int64_t)s * D, x2->in_ln, D, c->eps);
-            ink2_attention(m, l, i, nq, nq, nq, S, pos0, a);
-        } else {
-            for (int s = 0; s < S; s++) {
-                rmsnorm_row(nq + (int64_t)s * D, iq + (int64_t)s * D, x2->qin_ln, D, c->eps);
-                rmsnorm_row(nk + (int64_t)s * D, ik + (int64_t)s * D, x2->kin_ln, D, c->eps);
-                rmsnorm_row(nv + (int64_t)s * D, iv + (int64_t)s * D, x2->vin_ln, D, c->eps);
+    for (int i = 0; i < ls && !coli_prompt_break(); i++) {
+        ink2_layer(m, i, i, x, S, pos0, blocks, &B, maxb, NULL, &w);
+        ink2m_capture(m, ++app, x, S);
+    }
+    if (loop && !coli_prompt_broken()) {
+        float *pre = falloc(SD), *xprev = falloc(SD), *mbuf[4] = { falloc(SD), falloc(SD), falloc(SD), falloc(SD) };
+        memcpy(pre, x, (size_t)SD * sizeof(float));
+        const int preB = B; int nprev = 0;
+        for (int p = 0; p < c->loop_p && !coli_prompt_broken(); p++) {
+            if (p > 0) {   /* the previous pass's blocks but its first, and its output, for the messages */
+                for (int b = 0; b < nprev; b++) free(prevb[b]);
+                nprev = 0;
+                for (int b = preB; b < B; b++) { if (b == preB) free(blocks[b]); else prevb[nprev++] = blocks[b]; blocks[b] = NULL; }
+                B = preB;
+                memcpy(xprev, x, (size_t)SD * sizeof(float));
+                memcpy(x, pre, (size_t)SD * sizeof(float));
             }
-            ink2_attention(m, l, i, nq, nk, nv, S, pos0, a);
+            for (int i = ls; i < le && !coli_prompt_break(); i++) {
+                if (p > 0) ink2_attn_res(c, m->x2_loopq + (int64_t)(i - ls) * 4 * D, 4, prevb, nprev, xprev, S, mbuf);
+                ink2_layer(m, i, ink_sl(c, p, i), x, S, pos0, blocks, &B, maxb, p > 0 ? mbuf : NULL, &w);
+                ink2m_capture(m, ++app, x, S);
+            }
         }
-        m->t_attn += now_s() - ta;
-        ink2_sconv(m, a, S, D, l->a_cw, 2, i);
-        /* a block boundary keeps this layer's input stream as a block, and the stream starts over
-         * from the attention's output; elsewhere the output adds to it */
-        if (i % blk == 0) {
-            if (B == maxb) { fprintf(stderr, "inkling2: more than %d blocks\n", maxb); exit(1); }
-            blocks[B] = falloc(SD);
-            memcpy(blocks[B++], x, (size_t)SD * sizeof(float));
-            memcpy(res, a, (size_t)SD * sizeof(float));
-        } else for (int64_t j = 0; j < SD; j++) res[j] = x[j] + a[j];
-        float *mo = hq;   /* the MLP's input mix, then its normed input, then its output */
-        float *outs[1] = { mo };
-        ink2_attn_res(c, x2->mq, 1, blocks, B, res, S, outs);
-        for (int s = 0; s < S; s++) rmsnorm_row(nq + (int64_t)s * D, mo + (int64_t)s * D, x2->post_ln, D, c->eps);
-        moe(m, l, i, nq, S, mo);
-        ink2_sconv(m, mo, S, D, l->m_cw, 3, i);
-        for (int64_t j = 0; j < SD; j++) x[j] = res[j] + mo[j];
-        ink2m_capture(m, i + 1, x, S);
+        for (int b = 0; b < nprev; b++) free(prevb[b]);
+        free(pre); free(xprev); for (int j = 0; j < 4; j++) free(mbuf[j]);
+    }
+    for (int i = le; i < L && !coli_prompt_break(); i++) {
+        ink2_layer(m, i, i, x, S, pos0, blocks, &B, maxb, NULL, &w);
+        ink2m_capture(m, ++app, x, S);
     }
     if (!coli_prompt_broken()) {   /* the output's mix of the blocks and the last stream */
-        float *outs[1] = { hq };
+        float *outs[1] = { w.hq };
         ink2_attn_res(c, m->x2_out_query, 1, blocks, B, x, S, outs);
-        memcpy(x, hq, (size_t)SD * sizeof(float));
-        ink2m_capture(m, L + 1, x, S);
+        memcpy(x, w.hq, (size_t)SD * sizeof(float));
+        ink2m_capture(m, c->n_state + 1, x, S);
         ink2m_end(m, pos0, S);
     }
     for (int b = 0; b < B; b++) free(blocks[b]);
-    free(blocks); free(hq); free(hk); free(hv); free(nq); free(nk); free(nv); free(a); free(res);
+    free(blocks); free(prevb);
+    free(w.hq); free(w.hk); free(w.hv); free(w.nq); free(w.nk); free(w.nv); free(w.a); free(w.res);
 }
 
 #endif /* INKLING2_H */

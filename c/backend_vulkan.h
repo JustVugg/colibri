@@ -304,7 +304,8 @@ void coli_vk_xb_expert_free(ColiVkExpert *e);
 /* Its entry in the expert table the dense chain reads (vk_chain.h, vkc_moe), the
  * COLI_VK_XB_ENTRY words of chain_moe.comp: [0..1] gate's rows by device address, [2..3]
  * its scales, [4..7] up's, [8..11] down's, [12..14] gate and up's fmt, row words and gs,
- * [15..17] down's, [18] 1, the rest 0. 0 (nothing written) when the device cannot read
+ * [15..17] down's, [18] 1, the rest 0 ([19] and [20]: an engine's scales outside the matrices,
+ * which vk_dmoe.h writes in its copy of the table, chain_moe.comp's). 0 (nothing written) when the device cannot read
  * them by address: bufferDeviceAddress off, the second device, a tensor outside a pool. */
 #define COLI_VK_XB_ENTRY 32
 int coli_vk_xb_expert_entry(const ColiVkExpert *e, uint32_t *entry);

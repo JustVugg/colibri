@@ -4400,7 +4400,9 @@ __device__ __forceinline__ void hcm_body(const HcmArgs &A) {
     #undef HCM_LDX
     #undef HCM_STW
     #undef HCM_FETCH
-    if (GLU) {
+    /* if constexpr: each instantiation keeps only its own store (a GLU or MIX one had the plain
+     * store after its return, which nvcc warned unreachable, #128-D, once a GLU instantiation) */
+    if constexpr (GLU) {
         #pragma unroll
         for (int i = 0; i < 4; i++)
             #pragma unroll
@@ -4415,9 +4417,7 @@ __device__ __forceinline__ void hcm_body(const HcmArgs &A) {
                     if (c + 1 < O && !(O & 1)) *reinterpret_cast<float2 *>(yr) = make_float2(v0, v1);
                     else { if (c < O) yr[0] = v0; if (c + 1 < O) yr[1] = v1; }
                 }
-        return;
-    }
-    if (MIX) {   /* the products' sigmoids through shared memory, 128 rows at a time, then each output's four streams in order */
+    } else if constexpr (MIX) {   /* the products' sigmoids through shared memory, 128 rows at a time, then each output's four streams in order */
         asm volatile("cp.async.wait_all;\n");
         float (*sg)[129] = reinterpret_cast<float (*)[129]>(hcm_sm);
         #pragma unroll
@@ -4447,20 +4447,20 @@ __device__ __forceinline__ void hcm_body(const HcmArgs &A) {
                 A.y[row * A.ldy + n0 + dd] = v / A.fc;
             }
         }
-        return;
-    }
-    #pragma unroll
-    for (int i = 0; i < 4; i++)
+    } else {
         #pragma unroll
-        for (int j = 0; j < NJ; j++)
+        for (int i = 0; i < 4; i++)
             #pragma unroll
-            for (int e = 0; e < 4; e += 2) {
-                int r = wr * 64 + i * 16 + g + (e < 2 ? 0 : 8), c = n0 + wc * WN + j * 8 + tig * 2;
-                if (r >= M) continue;
-                float *yr = A.y + (size_t)(A.yrows ? A.yrows[r] : m0 + r) * A.ldy + c;
-                if (c + 1 < O && !(O & 1)) *reinterpret_cast<float2 *>(yr) = make_float2(acc[i][j][e], acc[i][j][e + 1]);
-                else { if (c < O) yr[0] = acc[i][j][e]; if (c + 1 < O) yr[1] = acc[i][j][e + 1]; }
-            }
+            for (int j = 0; j < NJ; j++)
+                #pragma unroll
+                for (int e = 0; e < 4; e += 2) {
+                    int r = wr * 64 + i * 16 + g + (e < 2 ? 0 : 8), c = n0 + wc * WN + j * 8 + tig * 2;
+                    if (r >= M) continue;
+                    float *yr = A.y + (size_t)(A.yrows ? A.yrows[r] : m0 + r) * A.ldy + c;
+                    if (c + 1 < O && !(O & 1)) *reinterpret_cast<float2 *>(yr) = make_float2(acc[i][j][e], acc[i][j][e + 1]);
+                    else { if (c < O) yr[0] = acc[i][j][e]; if (c + 1 < O) yr[1] = acc[i][j][e + 1]; }
+                }
+    }
 #else
     (void)A;
 #endif

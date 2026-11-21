@@ -38,6 +38,7 @@ static void fill(int t, uint8_t *w, int rows, int I) {
         case GQ_Q3_K: memcpy(b + 108, &d, 2); break;
         case GQ_Q2_K: memcpy(b + 80, &d, 2); memcpy(b + 82, &m, 2); break;
         case GQ_MXFP4: b[0] = (uint8_t)(118 + rnd() % 8); break;
+        case GQ_NVFP4: for (int g = 0; g < 4; g++) b[g] = (uint8_t)(0x28 + rnd() % 16); break;   /* E4M3 scales near 0.05 */
         case GQ_IQ1_M:   /* d is the top nibbles of the four scale words */
             for (int i = 0; i < 4; i++) b[49 + 2 * i] = (uint8_t)((b[49 + 2 * i] & 0x0F) | (((d >> (4 * i)) & 15) << 4));
             break;
@@ -47,7 +48,7 @@ static void fill(int t, uint8_t *w, int rows, int I) {
 }
 /* the kernels' numerics in plain C, from gq_ublk's integers and per-16 scales and mins */
 static void ref(int t, float *y, int ys, const uint8_t *w, const gq_act *a, int rows, int I) {
-    const int bl = GQ_TYPES[t].blck, bb = GQ_TYPES[t].bytes, nb = I / bl, per16 = t == GQ_Q6_K || t == GQ_Q3_K || t == GQ_IQ2_XS || t == GQ_IQ2_S || t == GQ_IQ1_M;
+    const int bl = GQ_TYPES[t].blck, bb = GQ_TYPES[t].bytes, nb = I / bl, per16 = t == GQ_Q6_K || t == GQ_Q3_K || t == GQ_IQ2_XS || t == GQ_IQ2_S || t == GQ_IQ1_M || t == GQ_NVFP4;
     int8_t w8[256]; float sw[16], mw[16];
     for (int r = 0; r < rows; r++) for (int s = 0; s < a->S; s++) {
         float acc = 0.f;

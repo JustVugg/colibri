@@ -2,7 +2,7 @@
 // with x, one decoder per type, for the GEMVs that take a row over several lanes
 // (chain_gemv_bd.comp, a pipeline per type; chain_moe.comp, a GGUF's routed experts). The
 // types: 8 Q8_0, 10 Q2_K, 11 Q3_K, 12 Q4_K, 13 Q5_K, 14 Q6_K, 16 IQ2_XXS, 17 IQ2_XS,
-// 18 IQ3_XXS, 19 IQ1_S, 20 IQ4_NL, 21 IQ3_S, 22 IQ2_S, 23 IQ4_XS, 29 IQ1_M, 42 Q2_0, and the
+// 18 IQ3_XXS, 19 IQ1_S, 20 IQ4_NL, 21 IQ3_S, 22 IQ2_S, 23 IQ4_XS, 29 IQ1_M, 40 NVFP4, 42 Q2_0, and the
 // 16-bit floats 1 F16 and 30 BF16 (a step is 64 bytes of the row, read 16 at a time) (bs_has).
 // IQ1_S and IQ1_M read their grid (2048 rows of 8, 16 KiB) from the table, not shared memory. Q4_K and Q5_K read 16-byte steps (their blocks, 144 and 176
 // bytes, keep a row's 16-byte alignment); the others words, two for one where a block of 34,
@@ -14,7 +14,7 @@
 //   BS_W1(i)  uint word i of the matrix          BS_W4(i)  its uvec4 i (16-byte aligned)
 //   BS_ACC(w, i)  w (vec4, the decoded weights) against x elements 4i..4i+3
 //   BS_G(i)   word i of blockdec_table.h's table
-// and keeps `shared float bs_kvt[16]` (kvalues_iq4nl), `shared uint bs_grid[2048]` (the type's
+// and keeps `shared float bs_kvt[16]` (kvalues_iq4nl, NVFP4's kvalues_mxfp4), `shared uint bs_grid[2048]` (the type's
 // grid: IQ2_S's 1024 rows of 8 bytes, IQ2_XS's 512 of 8, IQ3_S's 512 of 4, IQ2_XXS's 256 of
 // 8, IQ3_XXS's 256 of 4) and `shared uint
 // bs_ks[128]` (ksigns_iq2xs), filled by bs_tables_fill before a barrier: a grid row comes
@@ -24,10 +24,11 @@
 #include "blockdec_table.h"
 
 bool bs_has(int t) { return t == 8 || t == 10 || t == 11 || t == 12 || t == 13 || t == 14 || t == 16 || t == 17 || t == 18 || t == 19 || t == 20 ||
-                            t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 1 || t == 30; }
+                            t == 21 || t == 22 || t == 23 || t == 29 || t == 40 || t == 42 || t == 1 || t == 30; }
 // type t's tables into shared memory (a workgroup of 256)
 void bs_tables_fill(int t, int tid) {
     if ((t == 20 || t == 23) && tid < 16) bs_kvt[tid] = float(int(BS_G(BDT_IQ4NL + uint(tid))));
+    if (t == 40 && tid < 16) bs_kvt[tid] = float(int(BS_G(BDT_MXFP4 + uint(tid))));
     uint base = t == 22 ? uint(BDT_IQ2S) : t == 21 ? uint(BDT_IQ3S) : t == 17 ? uint(BDT_IQ2XS) : t == 18 ? uint(BDT_IQ3XXS) : uint(BDT_IQ2XXS);
     uint n = t == 22 ? 2048u : t == 17 ? 1024u : t == 21 || t == 16 ? 512u : t == 18 ? 256u : 0u;
     for (uint i = uint(tid); i < n; i += 256u) bs_grid[i] = BS_G(base + i);
@@ -57,6 +58,13 @@ vec4 bs_nib4(uint w, int sh) {   // the nibbles at bit sh of each of w's bytes
 vec4 bs_sb4(uint w) { return bs_u8x4(w ^ 0x80808080u) - 128.0; }   // the four signed bytes
 // (these are 2^23 + b less 2^23: a compiler may fold the constants added after them into one,
 // at 2^23's ulp of 1, so a fraction is added only after a product: IQ1's delta lost so)
+// NVFP4's block scale: unsigned E4M3 (bias 7), halved as kvalues_mxfp4 are doubled; 0 and 0x7F
+// are 0 (ggml_quants.h's gq_ue4m3_half, blockdec.glsl's bd_ue4m3_half)
+float bs_ue4m3_half(uint x) {
+    if (x == 0u || x == 0x7Fu) return 0.0;
+    uint e = (x >> 3) & 15u, m = x & 7u;
+    return e == 0u ? float(m) * (1.0 / 1024.0) : uintBitsToFloat(((e + 119u) << 23) | (m << 20));
+}
 vec4 bs_kv4(uint w, int sh) {    // kvalues of the nibbles at bit sh of each byte
     return vec4(bs_kvt[bitfieldExtract(w, sh, 4)], bs_kvt[bitfieldExtract(w, sh + 8, 4)], bs_kvt[bitfieldExtract(w, sh + 16, 4)], bs_kvt[bitfieldExtract(w, sh + 24, 4)]);
 }
@@ -138,6 +146,20 @@ void bs_step(int t, uint rb, uint q) {
         uint base = rb + q * 34u;
         float d = bs_f16at(base);
         [[unroll]] for (int k = 0; k < 8; k++) BS_ACC(bs_sb4(bs_ldu(base + 2u + 4u * uint(k))) * d, q * 8u + uint(k));
+        return;
+    }
+    if (t == 40) {   // NVFP4: a step is half a block of 64 (36 bytes: four E4M3 scales, then 8 bytes a
+                     // group of 16, byte j its weights j (low nibble) and 8 + j (high)), two groups
+        uint base = rb + (q >> 1) * 36u, sw = BS_W1(base >> 2);
+        [[unroll]] for (int h = 0; h < 2; h++) {
+            uint g = (q & 1u) * 2u + uint(h), qa = (base + 4u + 8u * g) >> 2;
+            float d = bs_ue4m3_half((sw >> (8u * g)) & 255u);
+            uint w0 = BS_W1(qa), w1 = BS_W1(qa + 1u);
+            BS_ACC(bs_kv4(w0, 0) * d, q * 8u + uint(4 * h));
+            BS_ACC(bs_kv4(w1, 0) * d, q * 8u + uint(4 * h) + 1u);
+            BS_ACC(bs_kv4(w0, 4) * d, q * 8u + uint(4 * h) + 2u);
+            BS_ACC(bs_kv4(w1, 4) * d, q * 8u + uint(4 * h) + 3u);
+        }
         return;
     }
     if (t == 20) {   // IQ4_NL: the step is the block, low nibbles weights 0..15, high 16..31

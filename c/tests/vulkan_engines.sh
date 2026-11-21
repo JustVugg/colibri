@@ -636,6 +636,37 @@ PY
     SNAP=ink2_ggufd/gg -- 8 0 ink2_ggufd/ref.json
   CHAINNAME=inkling2 chain_gate inkling "chain inkling2 GGUF Q8_0 dense, tiled GEMM" 0 COLI_VK_DENSE=1 GQ_EXACT=1 COLI_VK_IDOT=0 \
     SNAP=ink2_ggufd/gg -- 8 0 ink2_ggufd/ref.json
+  # Inkling-2-Mini's loop (tools/make_tiny_inkling2_loop.py, transformers' Inkling2LoopForCausalLM:
+  # tools/oracle-inkling2-loop-requirements.txt): the tier with the layers on the CPU, then the
+  # chain with the passes on the device (their own K/V mirrors and convolution states, the
+  # messages and their gates), and prompts only
+  if $PY -c "import transformers; transformers.Inkling2LoopForCausalLM" 2>/dev/null; then
+    $PY tools/make_tiny_inkling2_loop.py tiny_loop
+    local RL=tiny_loop/ref_inkling2.json
+    for cap in 1 8; do
+      tier_gate inkling "inkling2 loop tier f32 cap=$cap" SNAP=tiny_loop -- $cap 0 $RL
+      CHAINNAME=inkling2 chain_gate inkling "chain inkling2 loop f32 cap=$cap" 1 COLI_VK_DENSE=1 SNAP=tiny_loop -- $cap 0 $RL
+    done
+    CHAINMODE=2 CHAINNAME=inkling2 chain_gate inkling "chain inkling2 loop prompts only" 1 COLI_VK_DENSE=1 SNAP=tiny_loop -- 8 0 $RL
+  else
+    echo "  skip: the Inkling-2-Mini loop gates need transformers with Inkling2LoopForCausalLM (tools/oracle-inkling2-loop-requirements.txt)"
+  fi
+  # a tiny Inkling-2-Mini GGUF as UD-Q4_K_XL lays it out (tests/test_gguf_import.py: NVFP4 experts
+  # with their global scales outside the blocks, Q8_0 ones elsewhere): the chain's experts in the
+  # frame (the scales in the table's entries, NVFP4 through the block step) against the CPU's
+  if [ ! -d ink2m_nv/gg ]; then
+    rm -rf ink2m_nv && mkdir ink2m_nv
+    $PY - <<'PY' || fail "gguf-py (pip install gguf) is needed for the Inkling-2-Mini GGUF gate"
+import json, sys
+sys.path.insert(0, "tests")
+from test_gguf_import import write_inkling2_mini_pair
+write_inkling2_mini_pair("ink2m_nv", experts="NVFP4")
+p = [5, 77, 13, 201, 42, 9, 150, 33, 61, 18, 240, 7]
+json.dump({"prompt_ids": p, "full_ids": p + [0] * 16}, open("ink2m_nv/ref.json", "w"))
+PY
+  fi
+  CHAINNAME=inkling2 chain_gate inkling "chain inkling2 loop GGUF NVFP4 experts in the frame" 1 COLI_VK_DENSE=1 GQ_EXACT=1 COLI_VK_IDOT=0 \
+    COLI_VK_CHAIN_GEMM=0 SNAP=ink2m_nv/gg -- 8 0 ink2m_nv/ref.json
 }
 
 family_inkling_olmoe() {

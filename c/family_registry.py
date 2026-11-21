@@ -810,10 +810,20 @@ def _inkling_geometry(config, context, _model_dir):
     if len(local) != layers:
         raise ValueError("inkling: layer_types length must match num_hidden_layers")
 
+    # Inkling-2-Mini's loop: its layers' later passes keep their own K/V and convolution state
+    # (inkling.c's n_state), each as its weight layer's kind
+    lc = config.get("loop_config") if isinstance(config.get("loop_config"), dict) else {}
+    passes = _optional_int(lc, "num_passes", _optional_int(config, "loop_num_passes", 1, 1), 1)
+    ls = _optional_int(lc, "core_start", _optional_int(config, "loop_layer_index_start", 0, 0), 0)
+    le = _optional_int(lc, "core_end", _optional_int(config, "loop_layer_index_end", 0, 0), 0)
+    state_layers = list(range(layers))
+    if passes > 1 and 0 < ls < le <= layers:
+        state_layers += [ls + v % (le - ls) for v in range((passes - 1) * (le - ls))]
+
     state = 0
     fixed = 0
     workspace = 0
-    for i in range(layers):
+    for i in state_layers:
         kv = swa_kv if local[i] else n_kv
         hd = swa_hd if local[i] else head_dim
         h = swa_heads if local[i] else heads
@@ -1429,8 +1439,10 @@ FAMILIES = (
         id="inkling",
         # inkling2 / inkling2_text: Inkling-2 (inkling.c's v2: attention residuals, gated
         # attention with a sink, dynamic convolutions), the root model_type of the checkpoint
-        # and the one of a flat text snapshot or a GGUF import
-        model_types=("inkling_mm_model", "inkling", "inkling2", "inkling2_text"),
+        # and the one of a flat text snapshot or a GGUF import; inkling2_loop / inkling2_loop_text:
+        # Inkling-2-Mini (Inkling-2 whose middle layers run three passes)
+        model_types=("inkling_mm_model", "inkling", "inkling2", "inkling2_text",
+                     "inkling2_loop", "inkling2_loop_text"),
         display_name="Inkling",
         display_scale="975B",
         display_variants=(
@@ -1438,6 +1450,10 @@ FAMILIES = (
                            model_id="inkling-2-small-colibri"),
             DisplayVariant((("model_type", "inkling2_text"),), "Inkling-2-Small", "594B",
                            model_id="inkling-2-small-colibri"),
+            DisplayVariant((("model_type", "inkling2_loop"),), "Inkling-2-Mini", "26B",
+                           model_id="inkling-2-mini-colibri"),
+            DisplayVariant((("model_type", "inkling2_loop_text"),), "Inkling-2-Mini", "26B",
+                           model_id="inkling-2-mini-colibri"),
             DisplayVariant((("model_type", "inkling_mm_model"),), "Inkling", "975B"),
             DisplayVariant((("model_type", "inkling"),), "Inkling", "975B"),
         ),

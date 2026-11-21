@@ -49,6 +49,10 @@ static int ink2cc_maxb(const Cfg *c) {
 }
 static int ink2cc_geometry_ok(const Model *m, int say) {
     const Cfg *c = &m->c; int dr = c->d_rel, CK = c->conv_k;
+    if (c->loop_p > 1) {   /* Inkling-2-Mini: its middle layers' passes and messages are not in the chain */
+        if (say) fprintf(stderr, "[CUDA] inkling2 chain: the loop's passes (Inkling-2-Mini) run on the per-matrix path\n");
+        return 0;
+    }
     for (int i = 0; i < c->n_layers; i++) {
         const Layer *l = &m->L[i];
         int H = L_HEADS(c, i), KV = L_KV(c, i), hd = L_HD(c, i);
