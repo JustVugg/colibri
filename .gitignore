@@ -52,6 +52,17 @@ c/coli_hip.dll
 c/coli_hip.lib
 c/coli_hip.exp
 c/coli_hip.pdb
+# the WEX CUDA helper (make wex-cuda-helper)
+c/kaira_wex_cuda.dll
+c/kaira_wex_cuda.lib
+c/kaira_wex_cuda.exp
+c/kaira_wex_cuda.so
+# its CPU stand-in for tests/test_wex_cuda_loader
+c/tests/fake_wex_cuda.dll
+c/tests/fake_wex_cuda.so
+# the copy of it under the helper's name that the test makes beside itself
+c/tests/kaira_wex_cuda.dll
+c/tests/kaira_wex_cuda.so
 # DeepSeek V4 CUDA tier build artifacts (coli_cuda_dsv4.dll is the MSVC/nvcc
 # backend loaded at runtime by the MinGW-built deepseek-v4.exe)
 c/coli_cuda_dsv4.dll

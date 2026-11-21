@@ -445,6 +445,19 @@ bit across paths, the same fixture's FP8 experts give the same tokens and
 last logits within cosine 0.99999, and every refusal above is checked in its
 own process.
 
+### The same records from a WEX4 container (`COLI_WEX_PATH`)
+
+`COLI_WEX_PATH=<file>` reads the MXFP4 records from one WEX4 container instead of
+`experts-mxfp4/`: the same bytes, one 4096-aligned record per expert, bound and
+computed by the code above. `COLI_WEX_ROOT=<root>` (printed by
+`tools/wex4_verify`) refuses any other file and checks each record's SHA-256 the
+first time it is used. A container of WNR3 records (the same records, coded losslessly) is
+decoded by the thread that reads each record: by default with the fast CPU decoder (about 7x
+the reference on an i7-7700K, [wex.md](wex.md#the-fast-cpu-decoder)), on the GPU when
+`COLI_WEX_CUDA_LIB` names the CUDA helper, and with the reference under `COLI_WEX_FAST_DECODE=0`
+(about 105 ms for a 2.6 MB record at 25 MB/s): smaller on disk, more work to load. Details and the checks
+at attach: [wex.md](wex.md#qwen38-qwen38).
+
 ## Speculative decoding with the MTP head
 
 On by default from 1.13.0 when the checkpoint has it (`Q38_MTP=0` turns it off, and

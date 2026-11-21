@@ -2485,9 +2485,10 @@ static int q38_psd_on(Model *m){
         for(int k=0;g_q38_gguf&&k<g_q38gg_mtp.n_files;k++)h=q38_psd_stamp(h,g_q38gg_mtp.paths[k]);
         /* the routed experts attached (the int4 sidecar is taken unasked when it is complete): which, and their files */
         char path[1200];
-        const int ex=m->x4?(m->x4->lb?2:1):0;
+        const int ex=m->x4?(m->x4->wex?3:m->x4->lb?2:1):0;   /* 3: a WEX4 container (COLI_WEX_PATH) */
         h=q38_psd_fnv(h,&ex,sizeof ex);
-        if(ex&&snap){
+        if(ex==3)h=q38_psd_stamp(h,m->x4->wex);
+        else if(ex&&snap){
             snprintf(path,sizeof path,"%s/%s",snap,m->x4->lb?m->x4->lb->dir:Q38_INT4_DIR);
             h=q38_psd_dir_stamp(h,path,"");
         }

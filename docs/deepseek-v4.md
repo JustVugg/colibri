@@ -757,6 +757,20 @@ The prompt gains too, a tenth of its time, because the bank refills read
 experts through the same path. Not measured: a CPU-only run, Linux, a contiguous (FLOCK-packed)
 checkpoint. The record is in `docs/experiments/v4-slab-shift-2026-11-13/`.
 
+### Routed experts from a WEX4 container (`COLI_WEX_PATH`, opt-in)
+
+`COLI_WEX_PATH=<file>` names a WEX4 container of the routed experts: one 4096-aligned record per
+expert, already in the slab's layout, so a miss is one read straight into the slab with nothing
+moved afterwards. `COLI_WEX_ROOT=<root>` (printed by `tools/wex4_verify`) refuses any other file
+and checks each record's SHA-256 at its first read. A file that does not fit the checkpoint is
+not used and a record that fails its check is read from the safetensors, so the checkpoint stays
+the source. A container of WNR3 records (smaller, lossless) is decoded into the slab on the thread
+that missed: by default with the fast CPU decoder (about 7x the reference's 25 MB/s a thread on an
+i7-7700K, [wex.md](wex.md#the-fast-cpu-decoder)), on the GPU when `COLI_WEX_CUDA_LIB` names the
+CUDA helper, and with the reference under `COLI_WEX_FAST_DECODE=0`: a trade of disk bytes for
+decode time. Details, the messages and the order of the
+checks: [wex.md](wex.md).
+
 ## Prefill: segments, chunks, checkpoints
 
 - **Chunks/segments.** Prefill runs layer-major over 128-token chunks

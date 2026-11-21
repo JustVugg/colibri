@@ -39,6 +39,21 @@ the 92 tensor kinds is classified explicitly and an unrecognised name stops the
 conversion, because a converter that skips what it does not know produces a
 checkpoint that loads and is quietly missing a tensor.
 
+### AMD's MXFP4 checkpoint, and a WEX4 container of it
+
+`amd/GLM-5.3-Flash-Quark-MXFP4` (185 GB, 62 shards) runs as it is published, no conversion:
+`./glm53 --model <its folder> ...`. Its routed experts are MXFP4 (`name.weight` U8 e2m1 codes and
+`name.weight_scale` U8 ue8m0, one exponent per 32 columns); the engine sees the `weight_scale` next
+to the first expert, streams them like the int4 container's (13.4 MB an expert instead of 14.2)
+and computes them with quant.h's `matmul_mxfp4`, the bytes as the file has them. The Vulkan and
+CUDA expert tiers take them as MXFP4 (`VKT_SRC_MXFP4_E8M0`). The shared experts, MXFP4 too, are
+decoded at load and held at `GLM53_BITS`; the attention, the dense layers 0-2, the routers and the
+head are BF16 there, as in the original release. The MTP layer (45) is not loaded, as before.
+
+A WEX4 container of the same checkpoint (Wex-WRN2's `pack --experts raw|nr3 --names qwen38`) can
+serve the routed experts instead of the shards: `COLI_WEX_PATH=<file>`, with `COLI_WEX_ROOT` to pin
+it and `COLI_WEX_CUDA_LIB` for the CUDA helper ([wex.md](wex.md#glm-53-flash-glm53)).
+
 ## Architecture notes
 
 Four pieces differ from everything else in this repository:

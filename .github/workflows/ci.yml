@@ -875,6 +875,14 @@ jobs:
           nvcc -O2 -std=c++17 -arch=sm_80 -c backend_cuda_ink.cu -o /dev/null \
             -Xcompiler=-Wall,-Wextra
           echo "inkling CUDA syntax check passed"
+      - name: Compile the WEX CUDA helper (syntax only, no GPU)
+        run: |
+          cd c
+          # tools/wex_cuda_bridge.cu over wex_cuda.cuh (make wex-cuda-helper), which wex_decode.c
+          # opens at run time by its exports' names; nothing else compiles it
+          nvcc -O2 -std=c++17 -arch=sm_80 -c tools/wex_cuda_bridge.cu -o /dev/null \
+            -Xcompiler=-Wall,-Wextra
+          echo "WEX CUDA helper syntax check passed"
       - name: "Compile backend_cuda_dsv4.cu without cuBLASLt (the Windows package's form)"
         run: |
           cd c
