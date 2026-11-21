@@ -1619,6 +1619,79 @@ kernel void q36_router_select_row(device const float *prob [[buffer(0)]],
     }
 }
 
+// q36_router_select for wide routers without groups (G == 1, E <= 512, K <= 16;
+// Qwen3.8: 512 experts, top-k 10), one threadgroup of 256 threads per row, any
+// number of rows. K passes of "the largest expert not taken yet", as the CPU's
+// router: each thread the largest of its experts (strict >, in increasing id),
+// then the SIMD groups' and the threadgroup's (the larger value, of equal ones
+// the lower id), so ties go to the lowest id. A taken expert's value becomes
+// -inf; ineligible ones (NaN, <= -1e30) never qualify. The sum and the weights
+// on one thread, in the order taken; fewer eligible experts than K leave id -1
+// and weight -1e30, unnormalized, as q36_router_select.
+#define Q36_WIDE_E 512
+#define Q36_WIDE_K 16
+#if Q38_COUNTER_TEST == 4   /* test-only: equal experts go to the higher id (a build with the macro unset is untouched) */
+#define Q36_WIDE_TIE(o, i) ((o) > (i))
+#else
+#define Q36_WIDE_TIE(o, i) ((o) < (i))
+#endif
+kernel void q36_router_select_wide(device const float *prob [[buffer(0)]],
+                                   device int *ids [[buffer(1)]],
+                                   device float *weights [[buffer(2)]],
+                                   constant q36_router_args &p [[buffer(3)]],
+                                   uint row [[threadgroup_position_in_grid]],
+                                   ushort tid [[thread_index_in_threadgroup]],
+                                   ushort nt [[threads_per_threadgroup]],
+                                   ushort sg [[simdgroup_index_in_threadgroup]],
+                                   ushort lane [[thread_index_in_simdgroup]]) {
+    threadgroup float vals[Q36_WIDE_E];
+    threadgroup float bestv[32];
+    threadgroup uint besti[32];
+    threadgroup int chosen[Q36_WIDE_K];
+    threadgroup float val[Q36_WIDE_K];
+    if (row >= p.rows) return;
+    ulong off = ulong(row) * p.E, route = ulong(row) * p.K;
+    for (uint e = tid; e < p.E; e += nt) vals[e] = prob[off + e];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint groups = (nt + 31u) / 32u;
+    for (uint k = 0; k < p.K; k++) {
+        float bv = -1e30f;
+        uint bi = 0xffffffffu;                  // none
+        for (uint e = tid; e < p.E; e += nt) {
+            float v = vals[e];
+            if (v > bv) { bv = v; bi = e; }
+        }
+        for (ushort d = 16; d > 0; d >>= 1) {
+            float ov = simd_shuffle_down(bv, d);
+            uint oi = simd_shuffle_down(bi, d);
+            if (lane + d < 32 && (ov > bv || (ov == bv && Q36_WIDE_TIE(oi, bi)))) { bv = ov; bi = oi; }
+        }
+        if (lane == 0) { bestv[sg] = bv; besti[sg] = bi; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            for (uint g = 1; g < groups; g++)
+                if (bestv[g] > bv || (bestv[g] == bv && Q36_WIDE_TIE(besti[g], bi))) { bv = bestv[g]; bi = besti[g]; }
+            if (bi == 0xffffffffu) {            /* fewer eligible experts than K */
+                chosen[k] = -1;
+                val[k] = -1e30f;
+            } else {
+                chosen[k] = int(bi);
+                val[k] = bv;
+                vals[bi] = -INFINITY;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        float sum = 0;
+        for (uint k = 0; k < p.K; k++) sum += val[k];
+        for (uint k = 0; k < p.K; k++) {
+            ids[route + k] = chosen[k];
+            weights[route + k] = sum > 0 ? val[k] / sum : val[k];
+        }
+    }
+}
+
 // q36_shared_gate, one threadgroup per row (H <= Q36_ROW_MAX): the products
 // in parallel, rounded as in the serial loop, the ordered sum on one thread.
 kernel void q36_shared_gate_row(device const float *x [[buffer(0)]],

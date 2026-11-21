@@ -730,6 +730,9 @@ METAL_OBJ  =
 QWEN36_METAL_OBJ =
 QWEN36_GRAPH_CFLAGS =
 QWEN36_GRAPH_LDFLAGS =
+QWEN38_METAL_OBJ =
+QWEN38_GRAPH_CFLAGS =
+QWEN38_GRAPH_LDFLAGS =
 METALXX    = clang++ -x objective-c++ -std=gnu++17 -fobjc-arc -O3
 ifeq ($(METAL),1)
 ifeq (,$(DARWIN))
@@ -741,6 +744,10 @@ METAL_OBJ = backend_metal.o
 QWEN36_METAL_OBJ = qwen36_metal.o
 QWEN36_GRAPH_CFLAGS = -DQWEN36_METAL
 QWEN36_GRAPH_LDFLAGS = -framework Accelerate
+# qwen38's dense chain on the GPU (qwen38_metal_chain.h): its kernels and qwen36's
+QWEN38_METAL_OBJ = qwen38_metal.o qwen36_metal.o
+QWEN38_GRAPH_CFLAGS = -DQWEN38_METAL
+QWEN38_GRAPH_LDFLAGS = -framework Metal -framework Foundation -framework Accelerate
 endif
 
 # VK=1 adds an opt-in Vulkan compute backend (any Vulkan 1.2 driver, e.g. Mesa/RADV)
@@ -1261,8 +1268,71 @@ metal-test: tests/test_backend_metal.mm backend_metal.mm backend_metal.h affine_
 # Qwen3.6 Metal layer: the kernels live in metal/qwen36.metal and are built
 # into qwen36_metal.o (#embed), so the executable needs no files at run time.
 QWEN36_METALC = clang -x objective-c -std=gnu2x -fobjc-arc -O2 -Wall -Wextra -Wno-unused-parameter
-qwen36_metal.o: qwen36_metal.m qwen36_gpu.h metal/qwen36.metal ggml_grids.h shaders/blockdec_table.h
+qwen36_metal.o: qwen36_metal.m qwen36_gpu.h qwen36_metal_internal.h metal/qwen36.metal ggml_grids.h \
+               shaders/blockdec_table.h
 	$(QWEN36_METALC) -c qwen36_metal.m -o $@
+
+# Qwen3.8's own kernels (metal/qwen38.metal, #embed), on qwen36's device and
+# command batch. Linked into qwen38 by METAL=1 (QWEN38_METAL_OBJ).
+qwen38_metal.o: qwen38_metal.m qwen38_gpu.h qwen36_gpu.h qwen36_metal_internal.h metal/qwen38.metal
+	$(QWEN36_METALC) -c qwen38_metal.m -o $@
+
+# Every Qwen3.8 kernel against a double-precision reference. No model needed.
+tests/test_qwen38_metal_kernels: tests/test_qwen38_metal_kernels.c qwen38_gpu.h qwen36_gpu.h ggml_quants.h ggml_grids.h \
+                                 qwen38_metal.o qwen36_metal.o
+	$(CC) -O2 -Wall -Wextra -Wno-unused-function -std=c11 $< qwen38_metal.o qwen36_metal.o -framework Metal -framework Foundation -lm -o $@
+
+.PHONY: test-qwen38-metal-kernels
+test-qwen38-metal-kernels: tests/test_qwen38_metal_kernels
+	./tests/test_qwen38_metal_kernels
+
+# The 256-wide tiny fixture as a GGUF (qwen4exp, Q8_0 experts and trunk, BF16 indexer, F32
+# norms), imported in link mode: qwen38_tiny_256_gguf/ holds model.gguf, the importer's
+# config.json and tokenizer, and a ref.json rebased onto the CPU engine's tokens and logits
+# on that GGUF (--rebase-ref; the safetensors source's own ref.json is left alone). PYTHON needs
+# gguf, torch, transformers 5.16.1 and safetensors (a virtualenv with these packages).
+.PHONY: qwen38-tiny-gguf-generate
+qwen38-tiny-gguf-generate: qwen38$(EXE)
+	@test -f qwen38_tiny_256/model.safetensors || $(PYTHON) tools/make_qwen38_tiny.py --out ./qwen38_tiny_256 --geometry gguf-256
+	rm -rf qwen38_tiny_256_gguf && mkdir qwen38_tiny_256_gguf
+	$(PYTHON) tools/make_qwen38_tiny_gguf.py ./qwen38_tiny_256 ./qwen38_tiny_256_gguf/model.gguf
+	$(PYTHON) tools/gguf_import.py ./qwen38_tiny_256_gguf/model.gguf ./qwen38_tiny_256_gguf --mode link
+	cp qwen38_tiny_256/ref.json qwen38_tiny_256_gguf/ref.json
+	$(PYTHON) tools/make_qwen38_tiny_gguf.py --rebase-ref ./qwen38$(EXE) ./qwen38_tiny_256_gguf
+
+# The qwen38 engine's Metal chain on the tiny fixtures (tests/metal_qwen38.sh):
+# its startup decision and the CPU engine it leaves unchanged.
+.PHONY: test-qwen38-metal-engine
+test-qwen38-metal-engine: qwen38$(EXE)
+	$(if $(filter 1,$(METAL)),,$(error test-qwen38-metal-engine needs METAL=1))
+	PYTHON="$(PYTHON)" sh tests/metal_qwen38.sh
+
+# Counter-tests: for n = 1..5 build the test and both Metal objects with
+# -DQ38_COUNTER_TEST=n (1 hc_mix fc, 2 ple ring shift, 3 qsa tie order, 4 router
+# tie, 5 bf16 rounding; the macro reaches the Metal sources through
+# preprocessorMacros, only in these builds) and require the test to FAIL. Exit 0
+# only if all five failed. The objects stay in tests/ct<n>_*, never linked into
+# anything else.
+.PHONY: test-qwen38-metal-counter
+test-qwen38-metal-counter: qwen38_gpu.h qwen36_gpu.h qwen36_metal_internal.h metal/qwen38.metal metal/qwen36.metal \
+                           tests/test_qwen38_metal_kernels.c qwen38_metal.m qwen36_metal.m
+	@missed=0; \
+	for n in 1 2 3 4 5; do \
+	  echo "== counter-test $$n"; \
+	  { $(QWEN36_METALC) -DQ38_COUNTER_TEST=$$n -c qwen36_metal.m -o tests/ct$${n}_qwen36_metal.o && \
+	    $(QWEN36_METALC) -DQ38_COUNTER_TEST=$$n -c qwen38_metal.m -o tests/ct$${n}_qwen38_metal.o && \
+	    $(CC) -O2 -Wall -Wextra -Wno-unused-function -std=c11 -DQ38_COUNTER_TEST=$$n tests/test_qwen38_metal_kernels.c \
+	        tests/ct$${n}_qwen38_metal.o tests/ct$${n}_qwen36_metal.o -framework Metal -framework Foundation -lm \
+	        -o tests/test_ct$${n}_qwen38_kernels; } || { echo "counter n=$$n: build failed"; exit 1; }; \
+	  ./tests/test_ct$${n}_qwen38_kernels > tests/ct$${n}.log 2>&1; \
+	  if grep -q 'SKIPPED' tests/ct$${n}.log; then echo "counter n=$$n: skipped: no Metal device"; exit 1; fi; \
+	  if grep -q ' FAIL' tests/ct$${n}.log; then \
+	    echo "counter-test $$n: caught ($$(grep -c ' FAIL' tests/ct$${n}.log) FAIL lines)"; \
+	  else \
+	    echo "counter-test $$n: NOT caught (no FAIL line in log)"; missed=1; \
+	  fi; \
+	done; \
+	if [ $$missed = 0 ]; then echo "counter-tests: all 5 caught"; else echo "counter-tests: NOT ALL CAUGHT"; exit 1; fi
 
 # Every Qwen3.6 kernel against a double-precision reference. No model needed.
 tests/test_qwen36_kernels: tests/test_qwen36_kernels.c qwen36_gpu.h qwen36_cpu_mm.h ggml_quants.h ggml_grids.h \
@@ -1821,8 +1891,10 @@ ifneq ($(EXE),)
 .PHONY: qwen38
 qwen38: qwen38$(EXE)
 endif
-qwen38$(EXE): qwen38.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
-	$(CC) $(QWEN36_CFLAGS) qwen38.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o qwen38$(EXE) $(QWEN36_LDFLAGS)
+# METAL=1 adds the dense chain on the Apple GPU (QWEN38_GRAPH_CFLAGS, qwen38_metal.o and
+# qwen36_metal.o); COLI_METAL=0 runs the CPU engine.
+qwen38$(EXE): qwen38.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) $(QWEN38_METAL_OBJ) .build-config
+	$(CC) $(QWEN36_CFLAGS) $(QWEN38_GRAPH_CFLAGS) qwen38.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) $(QWEN38_METAL_OBJ) -o qwen38$(EXE) $(QWEN36_LDFLAGS) $(QWEN38_GRAPH_LDFLAGS)
 
 .PHONY: qwen38-tiny-generate qwen38-tiny-check
 qwen38-tiny-generate:

@@ -156,7 +156,12 @@ only resembles an XTML marker cannot be promoted into a client tool call.
 Errors replace the stream: `ERROR <id> <CODE>` with codes `BAD_FRAME`, `BAD_REQUEST`,
 `SLOT_BUSY`, `DUPLICATE_ID`, `EMPTY_PROMPT`, `NOT_FOUND` (CANCEL of unknown id),
 `CANCELLED`, and for decision engines `DECIDE_INVALID`, `DECIDE_FAILED` and
-`NOT_SUPPORTED` (a `SUBMIT` to an engine that does not generate). A `CANCEL` is acknowledged by `ERROR <id> CANCELLED` after the slot's KV
+`NOT_SUPPORTED` (a `SUBMIT` to an engine that does not generate), and for qwen38 on the Metal
+chain `GPU_FAILED <text>` (the GPU path failed with the conversation's state on the GPU only:
+the turn ends, possibly after some `DATA`; the gateway ends a committed OpenAI stream with a
+`data:` chunk carrying the error object and no `[DONE]`, as it does for any engine error after its
+200; the engine keeps serving with the chain off, its next
+`METAL` frame says `chain=0` and why, and the next request's prompt is read on the CPU). A `CANCEL` is acknowledged by `ERROR <id> CANCELLED` after the slot's KV
 is persisted.
 
 Immediately before each `DONE` the engine emits a telemetry block for the finished
@@ -171,7 +176,8 @@ turn: `HWINFO`, `PERF`, `ENTROPY`, `GPUS`, `TIERS`, `EMAP`, `HITS` (formats belo
 | `HWINFO` | `HWINFO <cores> <ram_total> <ram_avail> <ngpu> <vram_total> <cpu>\|<gpu>` | host snapshot (GBs are floats) |
 | `CAPS` | `CAPS key=value ...` | handshake only, between `READY` and `STAT`: what the engine loaded (`vision=0\|1`) |
 | `LOAD_FAIL` | `LOAD_FAIL kind=<kind> <detail>` | handshake only, instead of `READY`: why the model did not load (`nomem`, `io`, `format`, `unsupported`); the engine exits after it |
-| `EMAP` | `EMAP <rows> <cols> <hex>` | one byte per expert, row-major over `rows×cols` (sparse layers +MTP × experts): `byte = (tier<<6) \| heat` — 2-bit tier (0 disk / 1 RAM / 2 VRAM), 6-bit log₂-bucketed usage heat |
+| `EMAP` | `EMAP <rows> <cols> <hex>` | one byte per expert, row-major over `rows×cols` (sparse layers +MTP × experts): `byte = (tier<<6) \| heat` — 2-bit tier (0 disk / 1 RAM / 2 VRAM; qwen38 METAL=1: 2 also for an expert in the Metal chain's GPU expert cache), 6-bit log₂-bucketed usage heat |
+| `METAL` | `METAL chain=<0\|1> reason=<urlencoded\|-> forwards=<n> declined=<n> experts_gpu=<0\|1> cache_gb=<f> slots=<n> loads=<n> hits=<n> wait_s=<f> ahead=<0\|1> guesses=<n> right=<n> kv_regrow=<n>` | qwen38 METAL=1 builds only, one line after every finished request (also in a `KV_SLOTS>1` serve, where the chain is off): the Metal chain's state. `reason` is why the chain is off (`COLI_METAL%3D0`), `-` while it runs. `loads`, `hits`, `wait_s`, `guesses`, `right` are the turn's (since the previous `METAL`); `forwards`, `declined`, `kv_regrow` the run's. `key=value` with lowercase keys; readers ignore keys they do not know, so fields can be added. The gateway keeps the last frame and the sums of the turn fields: `/health` (authenticated) carries `"metal": {…last, "totals": {…}}` once a frame was seen, nothing otherwise |
 | `HITS` | `HITS <rows> <cols> <hex>` | 1 bit per expert, experts routed since the previous `HITS` |
 | `PERF` | `PERF <id> <dt> <t_edisk> <t_ewait> <t_emm> <t_attn> <t_kvb> <t_head>` | this turn's PROFILO deltas, seconds |
 | `ENTROPY` | `ENTROPY <h0> <h1> …` | per-sparse-layer routing entropy of the turn, bits |

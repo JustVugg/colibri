@@ -135,6 +135,12 @@ def _with_engine_reason(fault, message):
                     fault.param, fault.code, fault.error_type)
 
 
+class EngineReportedError(RuntimeError):
+    """An engine ERROR frame with no more specific meaning: the engine's own account of why the
+    turn ended. A committed OpenAI stream ends with an error chunk for it (APIHandler._fail),
+    unlike the gateway's own faults after the 200 (a pipe that broke), which still just close."""
+
+
 def _engine_error(fields, message):
     """Turn an engine ERROR frame into the right exception type.
 
@@ -150,6 +156,13 @@ def _engine_error(fields, message):
         head = reason.split(":", 1)[0] if ":" in reason else ""
         param = head if head and " " not in head else "questions"
         return APIError(422, reason, param, "invalid_question")
+    if fields and fields[0] == "GPU_FAILED":
+        # qwen38 on the Metal chain (serve mode): the GPU path failed with the conversation's
+        # state on the GPU only. The engine keeps running with the chain off and reads the next
+        # request's whole prompt on the CPU; this turn is over.
+        return APIError(503, "The GPU path failed and this reply was stopped. Send the message again: "
+                             "the conversation is read again on the CPU (slower) until the server is "
+                             "restarted.", None, "gpu_failed", "server_error")
     if fields and fields[0] == "CONTEXT_EXCEEDED":
         # Two spellings of the same frame. colibri and deepseek_v4 write the
         # original `CONTEXT_EXCEEDED <used> <limit>`; qwen36 and qwen38 write
@@ -176,7 +189,7 @@ def _engine_error(fields, message):
         except ValueError:
             error.context = None
         return error
-    return RuntimeError(message)
+    return EngineReportedError(message)
 
 
 class GenerationScheduler:
@@ -5194,6 +5207,116 @@ _CPU_LAST = {}
 _GPU_LAST = {"t": 0.0, "v": None}
 
 
+def _run_quick(cmd):
+    """stdout of a local command (macOS stats), or None on any failure; never raises, 0.5 s cap."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=0.5)
+        return r.stdout if r.returncode == 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+_GPU_DARWIN = {"t": 0.0, "v": None}
+
+
+def _gpu_stats_darwin():
+    """The Apple GPU from ioreg's IOAccelerator statistics (use %, system memory in use), at most
+    once a second. None when ioreg gives nothing usable."""
+    now = time.monotonic()
+    if now - _GPU_DARWIN["t"] < 1.0:
+        return _GPU_DARWIN["v"]
+    _GPU_DARWIN["t"] = now
+    _GPU_DARWIN["v"] = None
+    txt = _run_quick(["ioreg", "-r", "-d", "1", "-c", "IOAccelerator"])
+    if txt:
+        g = {}
+        m = re.search(r'"model"\s*=\s*"([^"]+)"', txt)
+        g["name"] = m.group(1) if m else "Apple GPU"
+        m = re.search(r'"Device Utilization %"\s*=\s*(\d+)', txt)
+        if m:
+            g["util_pct"] = int(m.group(1))
+        m = re.search(r'"In use system memory"\s*=\s*(\d+)', txt)
+        if m:
+            g["mem_used_gb"] = round(int(m.group(1)) / 1073741824, 2)
+        if len(g) > 1:
+            _GPU_DARWIN["v"] = [g]
+    return _GPU_DARWIN["v"]
+
+
+def _system_stats_darwin(engine):
+    out = {}
+    try:
+        mem = _run_quick(["sysctl", "-n", "hw.memsize", "hw.ncpu"])
+        if mem:
+            a = mem.split()
+            out["ram_total_gb"] = round(int(a[0]) / 1073741824, 2)
+            out["cores"] = int(a[1])
+    except (ValueError, IndexError):
+        pass
+    try:
+        vm = _run_quick(["vm_stat"])
+        if vm:
+            ps = int(re.search(r"page size of (\d+) bytes", vm).group(1))
+            pages = sum(int(re.search(rf"^Pages {k}:\s+(\d+)", vm, re.M).group(1))
+                        for k in ("free", "inactive", "speculative"))
+            out["ram_avail_gb"] = round(pages * ps / 1073741824, 2)
+    except (AttributeError, ValueError):
+        pass
+    try:
+        out["load1"] = round(os.getloadavg()[0], 2)
+    except OSError:
+        pass
+    gpus = _gpu_stats_darwin()
+    if gpus:
+        out["gpus"] = gpus
+    pid = getattr(getattr(engine, "process", None), "pid", None)
+    if pid:
+        try:
+            f = (_run_quick(["ps", "-o", "%cpu=,rss=,time=", "-p", str(int(pid))]) or "").split()
+            out["engine_cpu_pct"] = _darwin_cpu_pct(int(pid), float(f[0]), _ps_time_s(f[2] if len(f) > 2 else ""))
+            out["engine_rss_gb"] = round(int(f[1]) / 1048576, 2)
+        except (ValueError, IndexError):
+            out.pop("engine_cpu_pct", None)
+    return out
+
+
+_CPU_DARWIN = {}   # pid -> (monotonic s, cumulative CPU s, last pct)
+
+
+def _ps_time_s(txt):
+    """ps's cumulative CPU time ([dd-][hh:]mm:ss[.ss]) in seconds, None when unreadable."""
+    try:
+        days, _, rest = txt.rpartition("-")
+        parts = [float(x) for x in rest.split(":")]
+        if not 2 <= len(parts) <= 3:
+            return None
+        s = 0.0
+        for p in parts:
+            s = s * 60 + p
+        return round(s + (int(days) * 86400 if days else 0), 3)
+    except ValueError:
+        return None
+
+
+def _darwin_cpu_pct(pid, ps_pct, cpu_s):
+    """The engine's CPU now (100 = one core), from its CPU time over the wall time since the
+    previous sample at least 0.5 s old: macOS ps's %cpu is a decayed lifetime average, which
+    lags a turn by many seconds. ps's %cpu on the first sample or without a time column."""
+    now = time.monotonic()
+    last = _CPU_DARWIN.get(pid)
+    if cpu_s is None:
+        return round(ps_pct, 1)
+    if last is None:
+        _CPU_DARWIN.clear()   # one engine at a time: a restarted engine drops the old pid
+        _CPU_DARWIN[pid] = (now, cpu_s, round(ps_pct, 1))
+        return round(ps_pct, 1)
+    if now - last[0] < 0.5:
+        return last[2]
+    pct = round(max(0.0, 100.0 * (cpu_s - last[1]) / (now - last[0])), 1)
+    _CPU_DARWIN[pid] = (now, cpu_s, pct)
+    return pct
+
+
 def _gpu_stats():
     """The NVIDIA cards as nvidia-smi sees them (use, memory, temperature, power), at most once a
     second: the monitors (the TUI's, the chat page's) poll /health every second or two. None when
@@ -5227,7 +5350,10 @@ def _gpu_stats():
 
 def _system_stats(engine):
     """RAM of the box and of the engine process, and the engine's CPU since the last call
-    (100 = one core busy). Read from /proc, so empty fields off Linux."""
+    (100 = one core busy). Read from /proc on Linux, from local commands on macOS, so empty
+    fields elsewhere."""
+    if sys.platform == "darwin":
+        return _system_stats_darwin(engine)
     out = {}
     try:
         mi = {}
@@ -6951,6 +7077,33 @@ def engine_illegal_instruction(status):
     return status == -4 or status == 0xC000001D
 
 
+# The METAL frame (docs/serve_protocol.md): the qwen38 Metal chain's state after each turn.
+# Integers, floats, and the URL-encoded reason ("-": none); keys not listed are ignored, so
+# the engine can add fields. METAL_DELTAS are the turn's own, summed into `totals`.
+METAL_INTS = ("chain", "forwards", "declined", "experts_gpu", "slots", "loads", "hits", "ahead",
+              "guesses", "right", "kv_regrow")
+METAL_FLOATS = ("cache_gb", "wait_s")
+METAL_DELTAS = ("loads", "hits", "wait_s", "guesses", "right")
+
+
+def _parse_metal(tokens):
+    out = {}
+    for token in tokens:
+        key, sep, value = token.partition("=")
+        if not sep:
+            continue
+        try:
+            if key in METAL_INTS:
+                out[key] = int(value)
+            elif key in METAL_FLOATS:
+                out[key] = float(value)
+            elif key == "reason":
+                out[key] = None if value == "-" else unquote(value)
+        except ValueError:
+            continue
+    return out
+
+
 class EngineLoadError(RuntimeError):
     """The engine said why it could not load, and exited before READY.
 
@@ -7623,6 +7776,8 @@ class Engine:
         self.kv_slots = kv_slots
         self.tiers = None
         self.hwinfo = None
+        self.metal = None         # the last METAL frame (qwen38 METAL=1 builds), None until one
+        self.metal_total = None   # its per-turn fields summed over the run
         self.emap = None
         self.hits = None
         self.hits_seq = 0                      # latest "TIERS" snapshot from the engine
@@ -8005,6 +8160,14 @@ class Engine:
                     self.tiers = {"vram": int(fields[1]), "ram": int(fields[2]),
                                   "disk": int(fields[3]), "vram_gb": float(fields[4]),
                                   "ram_gb": float(fields[5])}
+                elif kind == "METAL":
+                    # the qwen38 Metal chain after a turn: key=value, unknown keys ignored
+                    metal = _parse_metal(fields[1:])
+                    total = self.metal_total or {}
+                    for key in METAL_DELTAS:
+                        if key in metal:
+                            total[key] = round(total.get(key, 0) + metal[key], 6)
+                    self.metal, self.metal_total = metal, total
                 elif kind == "ERROR" and len(fields) >= 2:
                     request_id = fields[1]
                     message = " ".join(fields[2:]) or "engine request failed"
@@ -8455,6 +8618,8 @@ def engine_alive(engine):
 TEXT_ENDPOINTS = ("/v1/chat/completions", "/v1/completions", "/v1/messages",
                   "/v1/messages/count_tokens", "/v1/systemone")
 ANTHROPIC_ENDPOINTS = ("/v1/messages", "/v1/messages/count_tokens")
+# streamed OpenAI responses whose failure after the 200 ends with an error chunk (_fail)
+OPENAI_STREAM_ENDPOINTS = ("/v1/chat/completions", "/v1/completions")
 # Anthropic's error `type` follows the HTTP status; any other 5xx is api_error.
 ANTHROPIC_ERROR_TYPES = {400: "invalid_request_error", 401: "authentication_error",
                          403: "permission_error", 404: "not_found_error",
@@ -8830,6 +8995,7 @@ class APIHandler(BaseHTTPRequestHandler):
         Draining once at the request boundary covers every such path, present and future,
         instead of asking each early return to remember."""
         self._committed = False
+        self._event_stream = False
         self._body_read = False
         # Fresh budget per request: a keep-alive connection may serve many, and
         # each is entitled to its own read window -- but none may drip forever.
@@ -8867,6 +9033,12 @@ class APIHandler(BaseHTTPRequestHandler):
             # writes in the streaming path, which is where Ctrl-C lands.
             self.close_connection = True
             return
+
+    def send_header(self, keyword, value):
+        """Notes an SSE response, so _fail knows the body it would end is an event stream."""
+        if keyword.lower() == "content-type" and str(value).startswith("text/event-stream"):
+            self._event_stream = True
+        super().send_header(keyword, value)
 
     def send_response(self, code, message=None):
         """Single choke point for "the status line is out". Overriding here rather than
@@ -9086,6 +9258,9 @@ class APIHandler(BaseHTTPRequestHandler):
                     if tiers: payload["tiers"] = tiers
                     hwinfo = getattr(self.server.engine, "hwinfo", None) if self.server.engine else None
                     if hwinfo: payload["hwinfo"] = hwinfo
+                    metal = getattr(self.server.engine, "metal", None) if self.server.engine else None
+                    if metal:   # an engine that sent no METAL frame: /health as before
+                        payload["metal"] = {**metal, "totals": dict(self.server.engine.metal_total or {})}
                     payload["capabilities"] = self.server.capabilities()
                     eng = self.server.engine
                     payload["live"] = eng.live_snapshot() if hasattr(eng, "live_snapshot") else []
@@ -9222,7 +9397,8 @@ class APIHandler(BaseHTTPRequestHandler):
             self.log_error("request failed: %s", error)
             try:
                 self._fail(APIError(500, "The colibri engine failed to process the request.",
-                                    None, "engine_error", "server_error"), request_id)
+                                    None, "engine_error", "server_error"), request_id,
+                           tell_stream=isinstance(error, EngineReportedError))
             except OSError:
                 pass
 
@@ -9864,19 +10040,31 @@ class APIHandler(BaseHTTPRequestHandler):
         event("image_generation.completed", self._image_payload(result, created))
         write(b"data: [DONE]\n\n")
 
-    def _fail(self, error, request_id):
+    def _fail(self, error, request_id, tell_stream=True):
         """Report an error, unless the response is already on the wire. Once a streaming 200
         is committed, a second status line would be framed as SSE body -- clients saw a whole
         `HTTP/1.1 500` spliced into the event stream. All we can still do is stop talking; the
-        stream ends at the close, which the 200 already announced (#597 item 3)."""
+        stream ends at the close, which the 200 already announced (#597 item 3).
+
+        Except for saying why: Anthropic's stream has an `error` event, and an OpenAI stream
+        (chat/completions, completions) ends with a `data:` chunk carrying the error object,
+        which the OpenAI SDKs raise and the chat page shows. No `[DONE]` follows, so the
+        reply is never taken as complete: an APIError (a GPU failure mid-reply, an engine ERROR
+        frame) or another ERROR frame of the engine's (tell_stream). A fault of the gateway's own
+        after the 200 (an engine pipe that broke while the stream ran) still only closes, as the
+        #597 tests require."""
         if self._committed:
             self.close_connection = True
-            if urlsplit(self.path).path in ANTHROPIC_ENDPOINTS:
-                # Anthropic's stream has an `error` event for this: say why before the
-                # close, instead of a silent truncation.
+            path = urlsplit(self.path).path
+            frame = None
+            if path in ANTHROPIC_ENDPOINTS:
+                frame = "event: error\ndata: %s\n\n"
+            elif tell_stream and path in OPENAI_STREAM_ENDPOINTS and getattr(self, "_event_stream", False):
+                frame = "data: %s\n\n"
+            if frame:
                 data = json.dumps(self.error_body(error), ensure_ascii=False)
                 try:
-                    self.wfile.write(f"event: error\ndata: {data}\n\n".encode())
+                    self.wfile.write((frame % data).encode())
                     self.wfile.flush()
                 except OSError:
                     pass

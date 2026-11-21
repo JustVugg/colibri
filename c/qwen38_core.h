@@ -336,6 +336,9 @@ typedef struct {
 #ifdef COLI_CUDA
     void *cchain;                  /* the CUDA dense chain's device state (qwen38_cuda_chain.h), NULL until it runs */
 #endif
+#ifdef QWEN38_METAL
+    void *mtlchain;                /* the Metal dense chain's device state (qwen38_metal_chain.h), NULL until it runs */
+#endif
 } Model;
 
 /* Layer rows of storage: the c.layers decoder layers, plus the MTP head's at
@@ -1314,6 +1317,19 @@ static int q38_gg_held_type(int type,int rows,int cols) {
 #endif
     return type;
 }
+/* The heap copy of a GGUF matrix's blocks (the file is read, not mapped). METAL=1: page
+ * aligned and page rounded, so the Metal chain maps these very bytes in place
+ * (qwen38_metal_chain.h, q38m_weight); free() releases it either way. */
+static void *q38_gg_alloc(size_t bytes) {
+#ifdef QWEN38_METAL
+    long page=sysconf(_SC_PAGESIZE); void *p=NULL;
+    if(page<=0)return malloc(bytes);
+    size_t rounded=(bytes+(size_t)page-1)&~((size_t)page-1);
+    return posix_memalign(&p,(size_t)page,rounded?rounded:(size_t)page)?NULL:p;
+#else
+    return malloc(bytes);
+#endif
+}
 /* A matrix [rows][cols] from the GGUF: f32/f16 as f32, bf16 as bf16, any other ggml
  * type as its blocks (Q38_WEIGHT_GGML; with `held`, in q38_gg_held_type's form). `parts`
  * tensors of the same type are stacked by rows (the indexer's q and k projections). */
@@ -1341,12 +1357,12 @@ static Q38Weight q38_gg_weight_parts(Model *m,const gguf_tensor *const *parts,in
         for(int i=0;i<n;i++){q38_gg_read(parts[i],p,0,parts[i]->nbytes);p+=parts[i]->nbytes;}
     } else if(gq_blk_decoder(type)){
         int64_t rb=gq_row_bytes(type,cols);
-        w.data=malloc((size_t)(rb*rows)); if(!w.data){fprintf(stderr,"OOM GGUF weight\n");exit(1);}
+        w.data=q38_gg_alloc((size_t)(rb*rows)); if(!w.data){fprintf(stderr,"OOM GGUF weight\n");exit(1);}
         uint8_t *p=(uint8_t*)w.data;
         for(int i=0;i<n;i++){q38_gg_read(parts[i],p,0,parts[i]->nbytes);p+=parts[i]->nbytes;}
         const int ht=held?q38_gg_held_type(type,rows,cols):type;
         if(ht!=type){   /* interleaved by 16 for the CPU's kernels */
-            const int64_t hb=gq_row_bytes(ht,cols); uint8_t *h=(uint8_t*)malloc((size_t)(hb*rows));
+            const int64_t hb=gq_row_bytes(ht,cols); uint8_t *h=(uint8_t*)q38_gg_alloc((size_t)(hb*rows));
             if(!h){fprintf(stderr,"OOM GGUF weight\n");exit(1);}
             #pragma omp parallel for schedule(static)
             for(int g=0;g<rows/16;g++)gq_r16_pack(ht,h+(int64_t)g*16*hb,(const uint8_t*)w.data+(int64_t)g*16*rb,16,cols);
@@ -3460,6 +3476,9 @@ static inline int q38_kv16(void){
     return g_q38_kv16;
 }
 
+/* Debug (the Metal chain's Q38M_FORCE_ROUTES=2): every row's QSA selection, when set; NULL
+ * otherwise (a step of several conversations never calls it) */
+static void (*g_q38_sel_hook)(int layer,int pos_base,int S,const int *sel,const int *nsel,int maxsel);
 static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int pos_base,float *out) {
     Cfg *c=&m->c;int H=c->hidden,QH=c->q_heads,KVH=c->kv_heads,D=c->head_dim;
     float theta=layer<c->layers?c->theta:c->mtp_theta;   /* the MTP head has its own RoPE base */
@@ -3540,6 +3559,7 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
             nsel[s]=n;
         }
     }
+    if(g_q38_sel_hook&&!mr)g_q38_sel_hook(layer,pos_base,S,selected,nsel,maxsel);
     double index_dt=now_s()-qsa_started;qsa_started=now_s();
     /* C by (row, KV head): the query heads that share a KV head read its selected K and V rows
      * once between them, not once each (Qwen3.8: 24 heads over 2 KV heads, so every row was
@@ -5393,6 +5413,9 @@ static void q38_embed_row(Model *m,int id,int abs_pos,float *out);   /* below; t
 static DfDrafter g_q38_df;
 #include "qwen38_cuda_chain.h"  /* COLI_CUDA_CHAIN: every layer's dense chain on the CUDA device */
 #endif
+#ifdef QWEN38_METAL
+#include "qwen38_metal_chain.h" /* METAL=1: every layer's dense chain on the Apple GPU */
+#endif
 
 static void reset_recurrent(Model *m) {
     kv_prefix_clear(&m->kvp);
@@ -5409,6 +5432,9 @@ static void reset_recurrent(Model *m) {
 #endif
 #ifdef COLI_CUDA
     q38cc_host_wrote(m,1);
+#endif
+#ifdef QWEN38_METAL
+    q38m_host_wrote(m,1);
 #endif
 }
 
@@ -5571,6 +5597,30 @@ static float *q38_forward(Model *m,const int *ids,int S,int pos_base,int nlogits
         }
     }
 #endif
+#ifdef QWEN38_METAL
+    /* METAL=1: the same on the Apple GPU (qwen38_metal_chain.h), every layer */
+    if(g_mtl_chain&&!chain_logit){
+        int echo=g_echo_k>0&&g_echo_id&&S>1;
+        chain_logit=falloc((int64_t)nlogits*c->vocab);
+        int took=q38m_forward(m,ids,S,pos_base,nlogits,hyper,streams!=NULL,echo?mixed:NULL,chain_logit);
+        if(took){
+            free(m->ple_pref); m->ple_pref=NULL; m->ple_pref_rows=0;   /* consumed, as q38_layer_forward does */
+        } else if(g_q38m_lost){
+            /* a serve's chain failed with the recurrent state on the GPU only: the turn ends with
+             * an error (qwen38.c, q38_chain_lost_end), so no CPU step runs on a state that is gone */
+            memset(chain_logit,0,(size_t)nlogits*c->vocab*sizeof(float));
+            free(m->ple_pref); m->ple_pref=NULL; m->ple_pref_rows=0;
+        } else {
+            free(chain_logit); chain_logit=NULL;
+            q38m_cpu_step(m,pos_base);   /* the CPU runs the step from the host state */
+            for(int s=0;s<S;s++){
+                float *e=hyper+(int64_t)s*W;
+                q38_embed_row(m,ids[s],pos_base+s,e);
+                for(int b=1;b<C;b++)memcpy(e+(int64_t)b*H,e,(size_t)H*sizeof(float));
+            }
+        }
+    }
+#endif
     if(!chain_logit){
     for(int i=first;i<c->layers;i++){
         /* stopped before layer i: kv_len and the kv_prefix record are left as they were,
@@ -5602,7 +5652,12 @@ static float *q38_forward(Model *m,const int *ids,int S,int pos_base,int nlogits
     /* Lettura del prefill: la posizione p predice il token p+1. Il primo token
      * fresco lo predice la fotografia del prefisso, quando c'e. Pagata solo da
      * chi ha chiesto il canale. */
-    if(g_echo_k>0&&g_echo_id&&S>0){
+#ifdef QWEN38_METAL
+    const int q38_lost_now=g_q38m_lost;   /* the chain failed in this forward: mixed holds no rows */
+#else
+    const int q38_lost_now=0;
+#endif
+    if(g_echo_k>0&&g_echo_id&&S>0&&!q38_lost_now){
         if(g_echo_pin_logit)
             q38_echo(g_echo_id,pos_base,ids[0],g_echo_pin_logit,c->vocab,g_echo_k);
         float *elog=logit;
@@ -6128,6 +6183,9 @@ static void q38_spec_rollback(Model *m,int len,int keep) {
 #ifdef COLI_CUDA
     q38cc_rollback(m,slot,len);
 #endif
+#ifdef QWEN38_METAL
+    q38m_rollback(m,slot,len);   /* the verify ran on the CPU (the chain declines one): the host's state */
+#endif
     for(int i=0;i<c->layers;i++)if(!c->is_attn[i]){
         float *t=m->DN_rec[i];m->DN_rec[i]=m->snap_rec[slot][i];m->snap_rec[slot][i]=t;
         t=m->DN_conv[i];m->DN_conv[i]=m->snap_conv[slot][i];m->snap_conv[slot][i]=t;
@@ -6614,6 +6672,9 @@ static void q38_layer_free(Layer *l) {
 
 static void q38_model_free(Model *m) {
     if(!m) return;
+#ifdef QWEN38_METAL
+    q38m_free(m);   /* first: its in-place maps read the GGUF blocks freed below */
+#endif
     q38_tstats_write();g_q38_tstats_path[0]=0;   /* Q38_TRUNK_STATS: while the sums still exist */
     kv_prefix_free(&m->kvp);
     int rows=q38_layer_rows(m);
