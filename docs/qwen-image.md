@@ -337,23 +337,21 @@ with `"capabilities": ["image_generation"]` and its size rules;
 
 ## Edit one reference image
 
-An edit-capable engine advertises `image_editing` in `GET /v1/models`.
-Install Pillow in the Python environment running `coli` to read a
-PNG, JPEG, or WebP reference. The same resized image conditions the text
-encoder and the DiT. The output size, steps, and seed use the generation
-options above.
+Install Pillow in the Python environment that runs `coli`. Pass a PNG,
+JPEG, or WebP reference with `--image`. Colibri resizes it once for the
+text encoder and the DiT. Use the generation options above for output
+size, steps, and seed.
 
 ```sh
 coli run --model ~/Models/Qwen-Image-2.1 --image fox.png --size 1024x576 \
   --seed 42 --out edited.png "Give the fox a blue scarf"
 ```
 
-Send `POST /v1/images/edits` with a JSON body and the same generation
-fields plus one `image` string. The JSON body has a 4 MiB limit. Send the
-file contents as base64 or as an image data URL such as
-`data:image/png;base64,...`. The gateway never reads
-image paths or fetches URLs from edit requests. Reference edits take a prompt
-and one image. The route rejects `mask` and `strength`.
+Check `GET /v1/models` for the `image_editing` capability. Send the
+generation fields to `POST /v1/images/edits` as JSON, plus one `image`
+string containing the file bytes as base64 or an image data URL such as
+`data:image/png;base64,...`. The body limit is 4 MiB. Leave `mask` and
+`strength` out of the request.
 
 ```sh
 python3 -c 'import base64, json; print(json.dumps({
@@ -366,8 +364,8 @@ python3 -c 'import base64, json; print(json.dumps({
   -H 'Content-Type: application/json' --data-binary @-
 ```
 
-The response contains the PNG and generation metadata. With `"stream": true`,
-the event names use `image_edit` as their prefix.
+Read the PNG from `data[0].b64_json` and the generation metadata from
+`colibri`. Set `"stream": true` for `image_edit.*` events.
 
 ## Timings
 
