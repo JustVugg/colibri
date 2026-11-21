@@ -147,9 +147,14 @@ against 41.7 on the CPU, the 30 DeltaNet projections 106 against 66) and
 decode fell from 3.56 to 2.68 tok/s. So the engine measures before it uploads
 a byte of trunk: one DeltaNet input projection is timed both ways on the
 device that would host it (ten GEMVs, best of three rounds, after a warm-up),
-one `[place] probe:` line reports both times, and if the GPU loses the whole
-automatic placement is withdrawn (`[place] trunk stays on the CPU`) and its
-bytes go back to the expert budget before the warmstart. On the CPU the ten
+one `[place] probe:` line reports both times, and if the CPU is clearly faster
+(the card's time more than 1.3 times the CPU's) the whole automatic placement
+is withdrawn (`[place] trunk stays on the CPU`) and its bytes go back to the
+expert budget before the warmstart. A near tie goes to the card: a burst of ten
+GEMVs flatters the CPU, most of all in a container under a CPU quota, where a
+team larger than the quota runs at full speed for the probe and is throttled
+for the decode (#2914). Where the CPU won, it won by far: 0.860 ms against
+2.303 on the M10, 0.306 against 0.900 on a GTX 1650 Max-Q. On the CPU the ten
 GEMVs read the projections of ten layers, as decode reads each once a step:
 one 16 MiB projection read ten times stays in a big L3, and beside an RTX PRO
 6000 an EPYC 9B45 (three 32 MiB L3s) came within about 10% of the card that way

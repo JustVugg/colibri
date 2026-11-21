@@ -1494,6 +1494,14 @@ static void q38_load_gr(Model *m,GatedResidual *g,int layer,const char *kind,int
     q38_load_gr_at(m,g,base,inject);
 }
 
+/* A head's rows are [offset, offset+vocab): q38_hash_row takes a remainder by the
+ * vocab size and adds the offset, so both are checked before either is used. */
+static void q38_need_ple_heads(const Model *m) {
+    for(int h=0;h<m->c.ngram_heads;h++)
+        Q38_NEED(m->ple_head_vocab[h]>0&&m->ple_head_offset[h]>=0&&
+                 m->ple_head_vocab[h]<=INT64_MAX-m->ple_head_offset[h],
+                 "invalid PLE head range %d",h);
+}
 static void q38_load_ple(Model *m,Layer *l) {
     Cfg *c=&m->c; int i=c->ple_layer; char nm[320];
     q38_name(m,nm,sizeof nm,i,"ple.key_proj.weight");l->ple_key=q38_load_weight(m,nm,c->hc_width,c->ple_dim);
@@ -1513,6 +1521,7 @@ static void q38_load_ple(Model *m,Layer *l) {
                      (kv->atype==GGUF_T_I64||kv->atype==GGUF_T_U64),"GGUF: %s missing or not %d 64-bit integers",keys[b],counts[b]);
             memcpy(dsts[b],kv->arr,(size_t)counts[b]*8);
         }
+        q38_need_ple_heads(m);
         Q38_NEED(!gguf_find(&g_q38gg,"per_layer_token_embd.scale"),
                  "GGUF carries per_layer_token_embd.scale; the PLE reader applies no weight scale");
         const gguf_tensor *t=gguf_mark(&g_q38gg,"per_layer_token_embd.weight");
@@ -1528,10 +1537,7 @@ static void q38_load_ple(Model *m,Layer *l) {
         st_tensor *t=st_find(&m->S,nm); if(!t||t->dtype!=6||t->numel!=counts[b]){fprintf(stderr,"invalid %s\n",nm);exit(1);}
         st_read_raw_cap(&m->S,nm,dsts[b],(int64_t)counts[b]*8,1);
     }
-    for(int h=0;h<c->ngram_heads;h++)
-        Q38_NEED(m->ple_head_vocab[h]>0&&m->ple_head_offset[h]>=0&&
-                 m->ple_head_vocab[h]<=INT64_MAX-m->ple_head_offset[h],
-                 "invalid PLE head range %d",h);
+    q38_need_ple_heads(m);
     m->ple_part_count=0; m->ple_part_start[0]=0;
     q38_name(m,nm,sizeof nm,i,"ple.ple_embedding.ngram_embedding.weight");
     if(st_has(&m->S,nm)){

@@ -14323,6 +14323,15 @@ int coli_v4_gpu_experts_preload(ColiV4Engine *engine, char *error, size_t size) 
                                   "below 10 GiB (use --vram 10 or more)");
         return 1;
     }
+    if (coli_v4_index_gguf(engine->target_index)) {
+        /* a GGUF's routed experts are ggml blocks, not the FP4 records the mirrors take, and its
+         * dense matrices (the shared experts with them) stay on the CPU: nothing to preload, and
+         * under auto the cache serves them as before (the missing shared mirror refused the engine) */
+        if (error && size)
+            snprintf(error, size, "a GGUF's routed experts are ggml blocks, not the FP4 records "
+                                  "the resident mirrors take");
+        return 1;
+    }
     if (layers < 1 || layers > COLI_V4_RESIDENT_MAX_LAYERS ||
         engine->gpu.device_count < 1 || engine->gpu.device_count > layers ||
         experts < 1 || hidden < 1 || intermediate < 1) return -1;
@@ -21311,6 +21320,17 @@ static int v4_omp_reserve_loader_cpus(void) {
     int team = logical - COLI_V4_EXPERT_LOADER_COUNT;
     if (team < 2) return 0; /* tiny machine: leave the OpenMP default alone */
     int phys = coli_physical_cores();   /* 0: not known, and then no guess */
+    /* A container's CPU quota (#2914): the compute team no larger than the CPUs it lets
+     * run at once (the loader lanes block in pread and need no whole CPU, see above). */
+    double cg_quota = 0.0;
+    const int cg = compat_cgroup_cpu_limit(&cg_quota);
+    if (cg > 0 && cg < (phys > 0 && phys < logical && phys < team ? phys : team)) {
+        omp_set_num_threads(cg);
+        fprintf(stderr, "[OMP] deepseek-v4: %d compute threads, bounded by the container's CPU quota "
+                        "(%.2f CPUs, %d logical); OMP_NUM_THREADS=<n> overrides, COLI_NO_OMP_TUNE=1 disables\n",
+                cg, cg_quota, logical);
+        return 1;
+    }
     if (phys > 0 && phys < logical && phys < team) {
         omp_set_num_threads(phys);
         fprintf(stderr, "[OMP] deepseek-v4: %d compute threads (the physical cores of %d logical "

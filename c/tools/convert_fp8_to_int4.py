@@ -154,6 +154,10 @@ OTHER_FAMILY_PATHS = {
                        "(coli import), see docs/inkling.md",
     "inkling2_text":   "Inkling-2: use tools/convert_inkling2_int4.py, or run one of its GGUFs "
                        "(coli import), see docs/inkling.md",
+    "inkling2_loop":   "Inkling-2-Mini: use tools/convert_inkling2_int4.py, or run one of its GGUFs "
+                       "(coli import), see docs/inkling.md",
+    "inkling2_loop_text": "Inkling-2-Mini: use tools/convert_inkling2_int4.py, or run one of its "
+                       "GGUFs (coli import), see docs/inkling.md",
     "olmoe":           "OLMoE: use tools/convert_olmoe.py",
     "kimi_k3":         "Kimi K3: see docs/kimi_k3.md for its container pipeline",
     "kimi_linear":     "Kimi K3: see docs/kimi_k3.md for its container pipeline",

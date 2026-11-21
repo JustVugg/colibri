@@ -1142,7 +1142,7 @@ static int q36cc_shortconv(Q36CChain *ch, Model *m, int i, int n, int c0, int ns
     for (int r = 0; r < segs && ok; r++) {
         int s0 = ns > 1 ? r : 0, len = ns > 1 && r < ns - 1 ? 1 : n - s0, snap_row = ns ? 0 : -1;
         CcBuf *cs = ns ? ch->ring_snap[c0 + r][i] : NULL;
-        CcDnConv cp = {len, D, c->dn_convk, s0 * 3 * D, 3 * D, s0 * D, D, snap_row, 2, (int)ch->o_conv[i], 0, 0};
+        CcDnConv cp = {len, D, c->dn_convk, s0 * 3 * D, 3 * D, s0 * D, D, snap_row, 2, (int)ch->o_conv[i], 0, 0, 0};
         ok = cc_dnconv(ch->qkvz, ch->prm, ch->ring[i], ch->cv, cs, &cp);
     }
     return ok && cc_matmul(ch->t_sco[i], ch->cv, 0, ch->tmp, 0, n);
@@ -1152,7 +1152,7 @@ static int q36cc_shortconv_mx(Q36CChain *ch, Model *m, int i, int n, int c0) {
     int ok = cc_matmul(ch->t_sci[i], ch->nrm, 0, ch->qkvz, 0, n);
     for (int s = 0; s < n && ok; s++) {
         const int sl = ch->mx_snap ? ch->mx_snap[c0 + s] : -1;
-        CcDnConv cp = {1, D, c->dn_convk, s * 3 * D, 3 * D, s * D, D, sl >= 0 ? 0 : -1, 2, (int)ch->o_conv[i], 0, 0};
+        CcDnConv cp = {1, D, c->dn_convk, s * 3 * D, 3 * D, s * D, D, sl >= 0 ? 0 : -1, 2, (int)ch->o_conv[i], 0, 0, 0};
         ok = cc_dnconv(ch->qkvz, ch->prm, ch->mx_conv[c0 + s]->ring[i], ch->cv, sl >= 0 ? ch->ring_snap[sl][i] : NULL, &cp);
     }
     return ok && cc_matmul(ch->t_sco[i], ch->cv, 0, ch->tmp, 0, n);
@@ -1242,11 +1242,11 @@ static int q36cc_deltanet_mx(Q36CChain *ch, Model *m, Layer *l, int i, int n, in
         Q36ccConv *v = ch->mx_conv[c0 + s];
         /* a verify's row: the state after it copied to its snapshot slot (q36cc_mux_rollback) */
         const int sl = ch->mx_snap ? ch->mx_snap[c0 + s] : -1, snap_row = sl >= 0 ? 0 : -1;
-        CcDnConv cp = {1, CD, c->dn_convk, s * qr, qr, s * CD, CD, snap_row, 0, (int)ch->o_conv[i], 0, 0};
+        CcDnConv cp = {1, CD, c->dn_convk, s * qr, qr, s * CD, CD, snap_row, 0, (int)ch->o_conv[i], 0, 0, 0};
         CcDnRec rp = {1, vh, c->dn_kheads, c->dn_vdim, c->dn_kheads * c->dn_kdim, s * CD, CD, s * 2 * vh, 2 * vh,
                       vh + s * 2 * vh, 2 * vh, (int)z0 + s * zr, zr, s * vd, vd, snap_row,
                       (g_ssm_a_direct ? 2 : 0) | (g_dn_tiled ? 4 : 0), c->eps,
-                      1.f / sqrtf((float)c->dn_kdim), 0, 0, (int)ch->o_dn[i]};
+                      1.f / sqrtf((float)c->dn_kdim), 0, 0, (int)ch->o_dn[i], 0};
         ok = cc_dnconv(ch->qkvz, ch->prm, v->ring[i], ch->cv, sl >= 0 ? ch->ring_snap[sl][i] : NULL, &cp) &&
              cc_dnrec(c->dn_kdim, ch->cv, ch->ab, ch->qkvz, v->rec[i], ch->prm, ch->dny, sl >= 0 ? ch->rec_snap[sl][i] : NULL, &rp);
     }

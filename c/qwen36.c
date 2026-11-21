@@ -7646,7 +7646,15 @@ static int trunk_probe_gpu_wins(Model *m){
         if (tc < cpu) cpu = tc;
     }
     free(x); free(y);
-    int wins = gpu < cpu;
+    /* The trunk stays on the CPU only when the CPU is clearly faster, by QT_PROBE_CPU_MARGIN_PCT.
+     * A burst this short flatters the CPU: in a container under a CPU quota (#2914, 7.65 CPUs
+     * of a 48-core host) a team of 48 timed 0.114-0.169 ms against the card's 0.131-0.136,
+     * before the quota throttled it, and three starts of four kept the trunk on the CPU at
+     * 2-4 tok/s against 134 on the card; the EPYC above tied the card under nsys and decoded
+     * at 21.5 tok/s, 113 on the card. Where the CPU did win it won by far: 0.860 ms against
+     * 2.303 on the M10 (#1652), 0.306 against 0.900 on a GTX 1650 Max-Q (#2211). */
+    enum { QT_PROBE_CPU_MARGIN_PCT = 130 };
+    int wins = gpu * 100.0 <= cpu * QT_PROBE_CPU_MARGIN_PCT;
     fprintf(stderr, "[place] probe: one [%d x %d] int8 GEMV takes %.3f ms on CUDA dev %d, %.3f ms on the CPU -> trunk %s\n",
             O, I, gpu * 1e3, dev, cpu * 1e3, wins ? "to VRAM" : "stays on the CPU");
     return wins;
@@ -10288,11 +10296,21 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     /* Also honor a control arriving during the final projection before DATA.
      * In that case the fully completed prefix is still safe to reuse. */
     if(!prefill_control) prefill_control = serve_control_pending(q->id);
+#ifdef QWEN36_METAL_GRAPH
+    /* The forward ran whole (lo): its copy of the state where the turn opens counts, whether the
+     * request goes on or a STOP or CANCEL ends it below. The graph takes a control only here,
+     * once the prompt is read, and a client that sends the conversation again starts from the copy. */
+    if (snap_armed && lo) qg_snapshot_taken(m, ids);
+#endif
     if(prefill_control){
         /* a STOP or CANCEL seen once the prompt was read whole: the state is its end, the
          * snapshot a client that sends the same prompt again resumes from */
         if(lo && !q->pin && q->logprobs == 0){ q36_pes_take(m, ids, np, lo); q36_pes_commit(m); }
         free(lo);
+#ifdef QWEN36_METAL_GRAPH
+        /* no decode step follows and q36_spec_end is not reached: a GGUF's dense matrices go back here */
+        if (m->graph) qg_gguf_lock(m, m->graph, 0, 1);
+#endif
         g_echo_k = 0; g_echo_id = NULL;
         if(getenv("COLI_PREFIX_LOG")){   /* what the next request finds (prompt_break.h's line) */
             fprintf(stderr,"[PREFIX] %s while reading the prompt: %d of %d prompt tokens held\n",
@@ -10307,7 +10325,6 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     }
     qt_stats_mark();
 #ifdef QWEN36_METAL_GRAPH
-    if (snap_armed) qg_snapshot_taken(m, ids);
     if (!m->graph)   /* both copy the CPU engine's state */
 #endif
     {

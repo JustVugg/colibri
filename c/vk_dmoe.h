@@ -150,7 +150,18 @@ typedef struct VkcDmoe_ {
      * they name, wr the entries to write, nwr of them; reads whole, patches, entries patched */
     int *chg, *wr; int nwr;
     unsigned long long reads, patches, patched;
+    /* the engine's scales an expert outside its matrices, [L][E][2] (gate and up's one number,
+     * down's), NULL none: written into each entry's words 19 and 20 as it is read (Inkling-2's
+     * NVFP4 layers from a GGUF: each expert's global scale; chain_moe.comp applies them) */
+    const float *escale;
 } VkcDmoe;
+/* entry j (layer i of the table, expert e)'s scale words from d->escale (0 = none: scale 1) */
+static void vkc_dmoe_scale_entry(const VkcDmoe *d, int i, int e, uint32_t *ent) {
+    if (!d->escale || !ent[18]) return;
+    const float *sc = d->escale + ((size_t)i * d->E + e) * 2;
+    memcpy(&ent[19], &sc[0], sizeof(float));
+    memcpy(&ent[20], &sc[1], sizeof(float));
+}
 
 static int vkc_dmoe_wanted(void) {
     static int on = -1;
@@ -344,6 +355,7 @@ static int vkc_dmoe_patch(VkcDmoe *d) {
         uint8_t host = 0;
         int r = vkt_dev_entry(l, e, d->tabh + j * ent, d->hybrid ? d->tabhh + j * ent : NULL, d->hybrid ? d->hx + j : NULL, &host);
         if (r <= 0) return 0;
+        vkc_dmoe_scale_entry(d, i, e, d->tabh + j * ent);
         if (d->hybrid && d->hx_n) d->hx_n[i] += (d->hx[j].g != NULL) - had;
         if (d->hostm) d->hostm[j] = host;
         if (d->keep_valid) vkc_keep_entry(d, j);
@@ -366,6 +378,7 @@ static int vkc_dmoe_read(VkcDmoe *d) {
         int n = vkt_dev_table(d->lo + i, d->tabh + (size_t)i * E * COLI_VK_XB_ENTRY);
         if (n < 0) { d->off = 1; return 0; }
         d->on[i] = n == E;
+        for (int e = 0; d->escale && e < E; e++) vkc_dmoe_scale_entry(d, i, e, d->tabh + ((size_t)i * E + e) * COLI_VK_XB_ENTRY);
     }
     if (d->hybrid) {
         if (!d->tabhh) d->tabhh = malloc((size_t)L * E * COLI_VK_XB_ENTRY * sizeof(uint32_t));
@@ -696,7 +709,7 @@ static void vkc_dmoe_pc_probe(VkcDmoe *d) {
     for (size_t k = 0; k < (size_t)R * D; k++) x[k] = (float)((k * 2654435761u >> 16) & 1023) / 512.f - 1.f;
     int teams[2] = {vkc_hyb_threads(), 0}, nt = 1;
 #ifdef _OPENMP
-    if (omp_get_num_procs() > teams[0]) teams[nt++] = omp_get_num_procs();
+    if (coli_cpu_budget() > teams[0]) teams[nt++] = coli_cpu_budget();   /* never past a container's CPU quota (#2914) */
 #endif
     double kept = 0;
     for (int ti = 0; ti < nt; ti++) {

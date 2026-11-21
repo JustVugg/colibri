@@ -5139,7 +5139,7 @@ static void xb_grp_bd_init(XbCtx *X) {
 /* its pipeline for v (0 down, 1 gate+up) and ggml type t, made on first use */
 static VkPipeline xb_grp_bd_pipe(XbCtx *X, int v, int t) {
     if (!X->grp_bd || t < 0 || t >= 64 || !(t == 8 || t == 10 || t == 11 || t == 12 || t == 13 || t == 14 || t == 16 || t == 17 || t == 18 ||
-        t == 19 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42)) return VK_NULL_HANDLE;
+        t == 19 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 40 || t == 42)) return VK_NULL_HANDLE;   /* 40 NVFP4: bdstep.glsl's */
     if (!X->grp_bd_tried[v][t]) {
         X->grp_bd_tried[v][t] = 1;
         int32_t sv = t;
@@ -5640,8 +5640,10 @@ static int xb_grp_ok(const XbCtx *X, ColiVkExpert *const *ex, const int *rows, i
     int total = 0;
     for (int c = 0; c < count; c++) total += rows[c];
     if (total_out) *total_out = total;
-    /* mode 3: a GGUF's experts, every one in the batch's block types (one layer's) */
-    if (X->grp_bd && X->act == COLI_VK_ACT_SWIGLU && dr % X->align == 0 && ir % X->align == 0 && D % 64 == 0 &&
+    /* mode 3: a GGUF's experts, every one in the batch's block types (one layer's); SwiGLU or
+     * SiTU-GLU (Inkling-2's: the grouped GEMMs read act, a and b; a prompt of Inkling-2-Mini's
+     * UD-Q4_K_XL took the experts one at a time before, 20 s for 648 rows) */
+    if (X->grp_bd && (X->act == COLI_VK_ACT_SWIGLU || X->act == COLI_VK_ACT_SITU) && dr % X->align == 0 && ir % X->align == 0 && D % 64 == 0 &&
         I % 64 == 0 && count > 0 && bd_fmt(ex[0]->g->fmt) && bd_fmt(ex[0]->d->fmt) && g_bdtab[0]) {
         int tg = ex[0]->g->fmt, td = ex[0]->d->fmt, ok = 1;
         for (int c = 0; c < count && ok; c++) {

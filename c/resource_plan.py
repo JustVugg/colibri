@@ -1686,7 +1686,7 @@ def _gguf_sources(model_dir):
 
 # The routed experts _gguf_tensor_sizes names, one entry per expert whatever the family
 # (analyze_model counts them as experts without the family's checkpoint names).
-_GGUF_EXPERT = re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(?:(?:gate|up|down)_proj\.weight|gguf)$")
+_GGUF_EXPERT = re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(?:(?:gate_up|gate|up|down)_proj\.weight|gguf)$")
 
 
 def _gguf_tensor_sizes(parts, layers=None):
@@ -1700,7 +1700,8 @@ def _gguf_tensor_sizes(parts, layers=None):
     import importlib.util
     spec = importlib.util.spec_from_file_location("gguf_reader", Path(__file__).resolve().parent / "tools" / "gguf_reader.py")
     gr = importlib.util.module_from_spec(spec); spec.loader.exec_module(gr)
-    fused = re.compile(r"^blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$")
+    # gate_up: one tensor of both, an expert's gate rows then its up rows (Inkling-2-Mini's files)
+    fused = re.compile(r"^blk\.(\d+)\.ffn_(gate_up|gate|up|down)_exps\.weight$")
     packed = re.compile(r"^blk\.(\d+)\.ffn_exps_colibri$")
     last = None
     for part in parts:
@@ -1989,6 +1990,10 @@ def qwen38_int4_sidecar(info):
     2.01 MB at 3, 1.32 MB vq2, 0.82 MB vq1 on the release), priced the same way: by the
     record its index states, whatever the name, so a format this list does not know yet is
     never priced with the FP8 bytes (a 188-expert cap where RAM held 512, 2026-10-14).
+    A checkpoint whose shards carry no routed experts, the sidecar being their only copy,
+    takes its sparse layers from the index (which states the config's): priced by the
+    shards' layers it had none, a cap of 0 slots, or with the MTP head on one made of the
+    head's record alone (512 slots of 30 GiB on a 25 GiB budget, Qwen3.8 Flash Next on vq2g32).
     """
     resolved = info["resolved_family"]
     lowbit = (os.environ.get("Q38_EXPERT_LOWBIT") or "").strip()
@@ -2012,7 +2017,8 @@ def qwen38_int4_sidecar(info):
     if (any(index.get(key) != value for key, value in want.items()) or
             isinstance(record, bool) or not isinstance(record, int) or record < 1):
         return info
-    per_layer = {layer: record for layer in info["expert_bytes_by_layer"]}
+    layers = info["expert_bytes_by_layer"] or (range(want["layers"]) if isinstance(want["layers"], int) else ())
+    per_layer = {layer: record for layer in layers}
     return dict(info,
                 expert_bytes=record * want["experts"] * len(per_layer),
                 typical_expert_bytes=record, max_expert_bytes=record,
@@ -2429,7 +2435,7 @@ def _read_cgroup_mounts(proc_mountinfo_path):
     return mounts
 
 
-def _resolve_cgroup_hierarchy(mounts, member, *, v1=False):
+def _resolve_cgroup_hierarchy(mounts, member, *, v1=False, controller="memory"):
     """Return the mounts exposing ``member``, shallowest root first.
 
     A mount's root is the cgroup its mount point shows; ``member`` maps into
@@ -2441,7 +2447,7 @@ def _resolve_cgroup_hierarchy(mounts, member, *, v1=False):
     """
     if v1:
         applicable = [mount for mount in mounts
-                      if mount.fs_type == "cgroup" and "memory" in mount.options]
+                      if mount.fs_type == "cgroup" and controller in mount.options]
     else:
         applicable = [mount for mount in mounts if mount.fs_type == "cgroup2"]
     views = [mount for mount in applicable if member[:len(mount.root)] == mount.root]
@@ -3280,10 +3286,155 @@ def _windows_performance_cores(raw):
     return classes.count(max(classes))
 
 
+def _cgroup_cpu_memberships(proc_cgroup_path):
+    """``(v2 path, v1 cpu path)`` from ``/proc/self/cgroup``, ``None`` for an absent file.
+
+    Only the two records the CPU probe reads: the v2 one and the v1 hierarchy whose
+    controllers include ``cpu`` (``cpu,cpuacct`` on most systems)."""
+    present, raw = _read_bounded_bytes(
+        proc_cgroup_path, _CGROUP_MEMBERSHIP_MAX_BYTES, "cgroup membership file")
+    if not present:
+        return None
+    v2_path = v1_path = None
+    for line in _proc_lines(raw, "cgroup membership file"):
+        fields = line.split(b":", 2)
+        if len(fields) != 3:
+            raise CgroupFormatError(f"malformed cgroup membership record: {line!r}")
+        hierarchy, controllers, member_path = fields
+        if hierarchy == b"0" and not controllers:
+            v2_path = _decode_cgroup_membership_path(member_path, "cgroup membership path")
+        elif b"cpu" in controllers.split(b","):
+            v1_path = _decode_cgroup_membership_path(member_path, "cgroup membership path")
+    return (v2_path, v1_path)
+
+
+def _cgroup_cpu_limit_of(directory, v1=False):
+    """``(controls_present, cpus_or_none)`` for one cgroup: v2 ``cpu.max`` is
+    ``"<quota> <period>"`` or ``"max <period>"`` (no quota); v1 is ``cpu.cfs_quota_us``
+    (-1: no quota) over ``cpu.cfs_period_us``. A present but malformed file raises."""
+    directory = Path(directory)
+    if not v1:
+        path = directory / "cpu.max"
+        present, text = _read_bounded_ascii(path, _CGROUP_VALUE_MAX_BYTES, "cgroup cpu limit")
+        if not present:
+            return (False, None)
+        match = re.fullmatch(r"(max|\d{1,20}) (\d{1,20})\n?", text)
+        if match is None or int(match.group(2)) == 0 or match.group(1) == "0":
+            raise CgroupFormatError(f"malformed cgroup cpu limit: {path}")
+        if match.group(1) == "max":
+            return (True, None)
+        return (True, int(match.group(1)) / int(match.group(2)))
+    quota_path = directory / "cpu.cfs_quota_us"
+    period_path = directory / "cpu.cfs_period_us"
+    present, text = _read_bounded_ascii(quota_path, _CGROUP_VALUE_MAX_BYTES, "cgroup cpu quota")
+    if not present:
+        return (False, None)
+    match = re.fullmatch(r"(-1|\d{1,20})\n?", text)
+    if match is None or match.group(1) == "0":
+        raise CgroupFormatError(f"malformed cgroup cpu quota: {quota_path}")
+    if match.group(1) == "-1":
+        return (True, None)
+    present, text = _read_bounded_ascii(period_path, _CGROUP_VALUE_MAX_BYTES, "cgroup cpu period")
+    period = re.fullmatch(r"(\d{1,20})\n?", text) if present else None
+    if period is None or int(period.group(1)) == 0:
+        raise CgroupFormatError(f"malformed or missing cgroup cpu period: {period_path}")
+    return (True, int(match.group(1)) / int(period.group(1)))
+
+
+def _cgroup_cpu_walk(views, member, v1=False):
+    """``(controls_seen, tightest quota in CPUs)``, each view walked from the member's
+    directory up to its mount point, as the memory probe walks it."""
+    seen = False
+    cpus = None
+    for mount in views:
+        suffix = member[len(mount.root):]
+        for depth in range(len(suffix), -1, -1):
+            present, value = _cgroup_cpu_limit_of(
+                mount.mount_point.joinpath(*suffix[:depth]), v1=v1)
+            seen = seen or present
+            if value is not None:
+                cpus = value if cpus is None else min(cpus, value)
+    return (seen, cpus)
+
+
+def cgroup_cpu_quota(cgroup_root=Path("/sys/fs/cgroup"),
+                     proc_cgroup_path=Path("/proc/self/cgroup"),
+                     proc_mountinfo_path=Path("/proc/self/mountinfo")):
+    """The tightest CPU quota on this process's cgroup and its ancestors, in CPUs
+    (7.65 for a ``cpu.max`` of ``765000 100000``), or ``None``: no quota, not Linux,
+    or nothing that could be read.
+
+    A container's quota throttles a team larger than it as soon as the team has spent
+    the period's share, whatever the host's core count: 48 threads under a quota of
+    7.65 CPUs decoded Qwen3.6 at 18-21 tok/s against 134 with 7 (#2914). The engines
+    read the same files (compat.h, compat_cgroup_cpu_limit). Unlike the memory probe
+    this one fails open: an input it cannot read leaves the team as it was."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        memberships = _cgroup_cpu_memberships(proc_cgroup_path)
+        if memberships is None:
+            return None
+        v2_member, v1_member = memberships
+        mounts = _read_cgroup_mounts(proc_mountinfo_path)
+        if mounts is None:
+            root = Path(cgroup_root)
+            probes = ((root, v2_member, False), (root / "cpu", v1_member, True),
+                      (root / "cpu,cpuacct", v1_member, True), (root, v1_member, True))
+            for base, member, v1 in probes:
+                if member is None:
+                    continue
+                seen, cpus = _cgroup_cpu_walk([_fixed_root_view(base, v1=v1)], member, v1=v1)
+                if seen:
+                    return cpus
+            return None
+        for member, v1 in ((v2_member, False), (v1_member, True)):
+            if member is None:
+                continue
+            views = _resolve_cgroup_hierarchy(mounts, member, v1=v1, controller="cpu")
+            seen, cpus = _cgroup_cpu_walk(views, member, v1=v1)
+            if seen:
+                return cpus
+        return None
+    except (CgroupError, OSError, ValueError):
+        return None
+
+
+def allowed_cpu_count():
+    """The CPUs this process may run on when that is fewer than the machine's online
+    CPUs (a container's cpuset, a ``taskset``), else ``None``. lscpu and sysfs count
+    the host's cores whatever the affinity mask says."""
+    getter = getattr(os, "sched_getaffinity", None)
+    if getter is None:
+        return None
+    try:
+        allowed = len(getter(0))
+    except OSError:
+        return None
+    online = os.cpu_count() or 0
+    return allowed if 0 < allowed < online else None
+
+
+def bound_team(cores, quota_cpus=None, allowed_cpus=None):
+    """``cores`` no larger than the CPUs the process may run on and no larger than its
+    CPU quota, floored (7.65 CPUs: 7 threads) and at least one."""
+    team = cores
+    if allowed_cpus and allowed_cpus < team:
+        team = allowed_cpus
+    if quota_cpus is not None and quota_cpus > 0:
+        team = min(team, max(1, int(quota_cpus)))
+    return team
+
+
 def team_cpu_count():
     """The OpenMP team a launch defaults to: the performance cores of a hybrid CPU
-    (performance_core_count), else the physical cores (physical_cpu_count)."""
-    return performance_core_count() or physical_cpu_count()
+    (performance_core_count), else the physical cores (physical_cpu_count), no more
+    than the CPUs the process may run on (allowed_cpu_count) or its container's CPU
+    quota lets run at once (cgroup_cpu_quota, #2914). The launcher sets
+    OMP_NUM_THREADS from this, and an engine given OMP_NUM_THREADS sizes nothing
+    itself, so this is where a container's limits must be seen."""
+    return bound_team(performance_core_count() or physical_cpu_count(),
+                      cgroup_cpu_quota(), allowed_cpu_count())
 
 
 def _resolve_physical_cores(physical_cpus):
@@ -3585,8 +3736,11 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                           if (vulkan or {}).get("type") in ("integrated", "cpu")
                           and _vk_dense_active(family_id, env_now, vulkan) else 0)
     # the team a launch defaults to (environment_for_plan): a hybrid CPU's performance
-    # cores, probed only when the caller did not name a count
+    # cores, and no more than a container's CPU quota or the affinity mask lets run at
+    # once (#2914, as team_cpu_count); probed only when the caller did not name a count
     team_cpus = (performance_core_count() if physical_cpus is None else None)
+    cpu_limits = ((cgroup_cpu_quota(), allowed_cpu_count()) if physical_cpus is None
+                  else (None, None))
     physical_cpus = physical_cpu_count() if physical_cpus is None else physical_cpus
     cpu_sockets = cpu_socket_count() if cpu_sockets is None else cpu_sockets
     resolved = info["resolved_family"]
@@ -3823,6 +3977,17 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     probe_state, probe_gbs = ssd_probe_state(info["path"])
     actions = _next_actions(bottleneck_class, projected_hit, probe_state,
                             probe_gbs, planning_gpus)
+    cpu = {"physical_cores": _resolve_physical_cores(physical_cpus),
+           "sockets": max(1, int(cpu_sockets)),
+           "team_threads": bound_team(_resolve_physical_cores(team_cpus or physical_cpus),
+                                      *cpu_limits),
+           "thread_policy": "performance-cores" if team_cpus else "physical-cores"}
+    # The most threads those limits let run at once, for a tuning sweep to stay within.
+    # Named only when that is fewer than the cores: a machine without limits keeps the
+    # block it had, and with it the fingerprint of its tuning profiles, which hashes it.
+    limit_threads = bound_team(cpu["physical_cores"], *cpu_limits)
+    if limit_threads < cpu["physical_cores"]:
+        cpu["limit_threads"] = limit_threads
 
     return {
         "version": 2,
@@ -3833,10 +3998,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                   "family_id": resolved.descriptor.id,
                   "model_type": resolved.model_type,
                   "configured_experts": configured_experts},
-        "cpu": {"physical_cores": _resolve_physical_cores(physical_cpus),
-                 "sockets": max(1, int(cpu_sockets)),
-                 "team_threads": _resolve_physical_cores(team_cpus or physical_cpus),
-                 "thread_policy": "performance-cores" if team_cpus else "physical-cores"},
+        "cpu": cpu,
         "memory": {"unified": unified, "available_bytes": available_memory},
         # the Vulkan device a COLI_VULKAN=1 run opens (its expert tier and dense chain
         # size themselves from its free memory at start)
