@@ -352,11 +352,11 @@ class BackendChoice(unittest.TestCase):
             self.assertEqual(decision["backend"], "cuda")
             self.assertIn("the release's CUDA backend (windows-x86_64-cuda.zip)", decision["reason"])
             self.assertNotIn("gpu_unused", decision)
-            decision = self.choose(hw, family="mimo", tc=tc, platform="win32")
+            decision = self.choose(hw, family="olmoe", tc=tc, platform="win32")
             self.assertEqual(decision["backend"], "cpu")
             self.assertEqual(decision["gpu_unused"], a100["name"])
             self.assertEqual(decision["reason"],
-                             "NVIDIA A100-PCIE-40GB found, but MiMo-V2.6 Flash has no CUDA build for "
+                             "NVIDIA A100-PCIE-40GB found, but OLMoE has no CUDA build for "
                              "Windows and no Vulkan device answered (the NVIDIA card runs in TCC mode, "
                              "where Windows offers no Vulkan device): the engine runs on the CPU")
         with mock.patch.object(setup_flow, "current_version", return_value="2.1.0"):
@@ -365,7 +365,7 @@ class BackendChoice(unittest.TestCase):
         self.assertEqual(decision["missing"], [])
         self.assertIn("the windows-x86_64-cuda.zip of release 2.1.0 has no qwen38.exe", decision["reason"])
         # a driver model that was not read, or Linux: no word on TCC
-        decision = self.choose(hw_report(nvidia=[dict(a100, driver_model=None)]), family="mimo", tc=tc,
+        decision = self.choose(hw_report(nvidia=[dict(a100, driver_model=None)]), family="olmoe", tc=tc,
                                platform="win32")
         self.assertIn("and no Vulkan device answered: the engine runs on the CPU", decision["reason"])
         decision = self.choose(hw_report(nvidia=[a100]), family="olmoe")
@@ -732,8 +732,13 @@ class WindowsCudaPackage(unittest.TestCase):
         expected = {family_by_id(fid).engine_artifact for fid in setup_flow.WINDOWS_CUDA_ENGINES}
         self.assertIn("glm53", expected)
         self.assertIn("qwen38", expected)       # #2846
-        for fid in setup_flow.WINDOWS_CUDA_ENGINES:      # the tier coli_cuda.dll's loader serves
-            self.assertEqual(setup_flow.CUDA_ENGINES[fid]["object"], "backend_cuda.o", fid)
+        self.assertIn("inkling", expected)
+        # what coli_cuda.dll's loader serves: the tier (backend_cuda.o) and inkling's bf16
+        # matrices (backend_cuda_ink.o, its ink_ops table); every engine of CUDA_ENGINES but
+        # deepseek_v4, whose DLLs are their own
+        for fid in setup_flow.WINDOWS_CUDA_ENGINES:
+            self.assertIn(setup_flow.CUDA_ENGINES[fid]["object"], ("backend_cuda.o", "backend_cuda_ink.o"), fid)
+        self.assertEqual(set(setup_flow.WINDOWS_CUDA_ENGINES), set(setup_flow.CUDA_ENGINES) - {"deepseek_v4"})
         def exes(text):
             return {name[:-len(".exe")] for name in re.findall(r"[a-z0-9_]+\.exe", text)}
 

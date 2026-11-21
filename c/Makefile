@@ -614,6 +614,8 @@ ifneq ($(IS_WIN),)
 ifeq ($(CUDA_DLL),1)
 CFLAGS  += -DCOLI_CUDA
 CUDA_OBJ = backend_loader.o cu_tier.o
+# inkling's bf16 matrices (backend_cuda_ink.cu) are in coli_cuda.dll too: the loader's ink_cuda_*
+INK_CUDA_OBJ = $(CUDA_OBJ)
 endif
 ifeq ($(HIP_DLL),1)
 # -DCOLI_CUDA keeps the existing shared GPU ABI (Linux HIP already reuses the
@@ -622,6 +624,8 @@ ifeq ($(HIP_DLL),1)
 # amdhip64 into the MinGW host is exactly what the DLL split exists to avoid.
 CFLAGS  += -DCOLI_CUDA -DCOLI_HIP_DLL
 CUDA_OBJ = backend_loader.o cu_tier.o
+# coli_hip.dll has no ink_ops: inkling's ink_cuda_* say no, and it runs on Vulkan or the CPU
+INK_CUDA_OBJ = $(CUDA_OBJ)
 endif
 endif
 
@@ -1113,14 +1117,14 @@ libcoli_xdna.so: backend_xdna_helper.cpp
 # shell that has the MSVC environment set (e.g. after vcvars64.bat, or from a
 # "x64 Native Tools Command Prompt"). COLI_CUDA_BUILDING_DLL enables
 # __declspec(dllexport) so the 15 API symbols are exported.
-cuda-dll: backend_cuda.cu cuda_chain.cu cu_xb.cu backend_cuda.h cuda_chain.h cu_tier_ops.h fp8_format.h
+cuda-dll: backend_cuda.cu cuda_chain.cu cu_xb.cu backend_cuda_ink.cu backend_cuda.h cuda_chain.h cu_tier_ops.h fp8_format.h backend_cuda_ink.h
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
 	# The banner is localized ("for x64" / "per x64" / "pour x64"): match the arch token only (#1531).
 	@cl 2>&1 | grep -qE "x64|AMD64" || { echo "cl.exe is the 32-bit (x86) compiler: nvcc then fails inside cuda_fp16.hpp with 'asm operand type size(8)'. Open 'x64 Native Tools Command Prompt for VS 2022' (or run vcvars64.bat), not the generic Developer Command Prompt (#1405)" >&2; exit 1; }
 	"$(NVCC)" $(NVCCFLAGS) -shared -DCOLI_CUDA_BUILDING_DLL \
 		-L"$(CUDA_HOME)/lib/x64" -lcudart \
-		backend_cuda.cu cuda_chain.cu cu_xb.cu -o coli_cuda.dll
+		backend_cuda.cu cuda_chain.cu cu_xb.cu backend_cuda_ink.cu -o coli_cuda.dll
 
 # Windows HIP DLL: the AMD sibling of cuda-dll above. hipcc compiles the SAME
 # backend_cuda.cu (through backend_gpu_compat.h) into coli_hip.dll, exporting

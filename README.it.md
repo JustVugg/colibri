@@ -390,7 +390,7 @@ decisione si compilano con `make <motore> CUDA=1`. Su Windows il motore CUDA è
 una DLL separata ([windows.md](docs/windows.md)), e ogni release la porta già
 compilata: `colibri-<versione>-windows-x86_64-cuda.zip` contiene `coli_cuda.dll`
 (schede con compute capability 8.0 o superiore) e i motori colibri, glm53, qwen36,
-qwen38 e kimi_k3 che la caricano, con le DLL CUDA di DeepSeek V4. Estrailo sopra
+qwen38, kimi_k3, deepseek_v41, mimo e inkling che la caricano, con le DLL CUDA di DeepSeek V4. Estrailo sopra
 l'archivio principale e l'installazione sceglie CUDA.
 
 - **Ogni layer sulla scheda** per Qwen3.6, Qwen3.8 e OLMoE: i layer densi,

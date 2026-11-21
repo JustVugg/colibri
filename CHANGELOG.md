@@ -15,6 +15,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   `blk.N.loop_msg_query`). Before, the import refused the architecture and the engine, given such a
   file, stopped at "no tensor map in st_gguf.h". UD-IQ3_XXS in either layout: the same answers, 44
   tok/s on CUDA.
+- **The Windows CUDA package carries every engine coli setup runs on CUDA**: `deepseek_v41.exe`,
+  `mimo.exe` and `inkling.exe` join colibri, glm53, qwen36, qwen38 and kimi_k3. inkling's bf16
+  matrices come through `coli_cuda.dll` (`backend_cuda_ink.cu` built in, one optional export,
+  `coli_cuda_ink_ops`; an older DLL leaves inkling on Vulkan or the CPU), and `coli setup` fetches
+  the package for those engines from the release after v2.1.0.
 - **Inkling-2-Mini** (`thinkingmachines/Inkling-2-Mini`, 26.4B, 3.4B active, Apache 2.0) on the
   inkling engine: Inkling-2 whose layers 6-17 run three passes with their weights shared, each
   pass with K/V and convolution states of its own, and from the second pass every loop layer

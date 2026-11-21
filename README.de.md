@@ -387,7 +387,7 @@ Entscheidungs-Engines werden mit `make <engine> CUDA=1` gebaut. Unter Windows is
 CUDA-Engine eine eigene DLL ([windows.md](docs/windows.md)), und jedes Release liefert
 sie bereits gebaut mit: `colibri-<version>-windows-x86_64-cuda.zip` enthält
 `coli_cuda.dll` (Karten mit Compute Capability 8.0 oder neuer) und die Engines colibri,
-glm53, qwen36, qwen38 und kimi_k3, die sie laden, mit den CUDA-DLLs von DeepSeek V4. Entpacke
+glm53, qwen36, qwen38, kimi_k3, deepseek_v41, mimo und inkling, die sie laden, mit den CUDA-DLLs von DeepSeek V4. Entpacke
 es über das Hauptarchiv, dann wählt die Einrichtung CUDA.
 
 - **Jeder Layer auf der Karte** für Qwen3.6, Qwen3.8 und OLMoE: die dichten Layer, die

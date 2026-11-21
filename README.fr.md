@@ -394,7 +394,7 @@ moteurs de décision se compilent avec `make <engine> CUDA=1`. Sous Windows, le 
 CUDA est une DLL séparée ([windows.md](docs/windows.md)), et chaque version publiée
 l'embarque déjà compilée : `colibri-<version>-windows-x86_64-cuda.zip` contient
 `coli_cuda.dll` (cartes de capacité de calcul 8.0 et plus récentes) et les moteurs
-colibri, glm53, qwen36, qwen38 et kimi_k3 qui le chargent, avec les DLL CUDA propres à
+colibri, glm53, qwen36, qwen38, kimi_k3, deepseek_v41, mimo et inkling qui le chargent, avec les DLL CUDA propres à
 DeepSeek V4. Décompressez-la par-dessus l'archive principale et l'installation
 choisit CUDA.
 

@@ -408,8 +408,8 @@ TEXT_HINTS = {
     "cuda": "install the CUDA Toolkit from https://developer.nvidia.com/cuda-downloads",
     "cuda-win32": "the Windows CUDA build needs the CUDA Toolkit and MSVC: see docs/windows.md",
     "cuda-win32-release": ("unpack the release's windows-x86_64-cuda.zip next to the engines "
-                           "(coli_cuda.dll and the CUDA builds of colibri, glm53, qwen36, qwen38 "
-                           "and kimi_k3)"),
+                           "(coli_cuda.dll and the CUDA builds of colibri, glm53, qwen36, qwen38, "
+                           "kimi_k3, deepseek_v41, mimo and inkling)"),
     "build-other": "install gcc (with OpenMP) and make from your distribution",
     "vulkan-other": ("install the Vulkan loader development files, glslc (shaderc) and the "
                      "Mesa Vulkan drivers from your distribution"),
@@ -757,15 +757,18 @@ def prebuilt_runs(family, backend, directory=None):
 #: The release archives whose engines are built with Vulkan (release.yml, VK=1).
 RELEASE_VULKAN = ("linux-x86_64.tar.gz", "windows-x86_64.zip")
 #: The engines the release's windows-x86_64-cuda.zip (RELEASE_CUDA_WIN32) carries, built against
-#: coli_cuda.dll (release.yml, the cuda-windows job), and the oldest card its DLL
-#: runs on: CUDA_ARCH=portable is SASS for sm_80 and newer plus compute_120 PTX.
-WINDOWS_CUDA_ENGINES = ("glm", "glm53", "qwen36", "qwen38", "kimi")
+#: coli_cuda.dll (release.yml, the cuda-windows job): every engine of CUDA_ENGINES but
+#: deepseek_v4, whose DLLs are their own (inkling's bf16 matrices come through the DLL's
+#: ink_ops table), and the oldest card its DLL runs on: CUDA_ARCH=portable is SASS for sm_80
+#: and newer plus compute_120 PTX.
+WINDOWS_CUDA_ENGINES = ("glm", "glm53", "qwen36", "qwen38", "kimi", "deepseek_v41", "mimo", "inkling")
 WINDOWS_CUDA_FLOOR = 80
 RELEASE_CUDA_WIN32 = "windows-x86_64-cuda.zip"
 #: The engines the package got later, each with the last release whose package lacks it:
-#: v2.1.0's has no glm53.exe (#2541) and no qwen38.exe (#2846). With such a release the
-#: engine stays on Vulkan.
-WINDOWS_CUDA_LATER = {"glm53": "2.1.0", "qwen38": "2.1.0"}
+#: v2.1.0's has no glm53.exe (#2541), no qwen38.exe (#2846) and no deepseek_v41.exe,
+#: mimo.exe or inkling.exe. With such a release the engine stays on Vulkan.
+WINDOWS_CUDA_LATER = {"glm53": "2.1.0", "qwen38": "2.1.0", "deepseek_v41": "2.1.0", "mimo": "2.1.0",
+                      "inkling": "2.1.0"}
 
 
 def prebuilt_vulkan(family, tc):
