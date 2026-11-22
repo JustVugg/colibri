@@ -3081,6 +3081,20 @@ def _physical_cores_warn(message):
     print(f"[plan] warning: {message}", file=sys.stderr)
 
 
+def apple_team(tiers):
+    """Apple Silicon's team out of its perflevel tiers, fastest first, as
+    (logical CPUs, name or None): every tier but the efficiency ones (omp_tune.h
+    coli_apple_team, the same rule). The names decide when every tier has one: an
+    M5 Pro's two tiers are Super and Performance, neither of them efficiency
+    (#2938). Without them the last tier is taken for the efficiency one, as on an
+    M1-M4 (P + E) and an M6 (Super + Performance + Efficiency, #2194). One tier,
+    or only efficiency tiers: every core."""
+    named = all(name is not None for _, name in tiers)
+    kept = sum(cpus for i, (cpus, name) in enumerate(tiers)
+               if cpus > 0 and (name != "Efficiency" if named else (len(tiers) == 1 or i < len(tiers) - 1)))
+    return kept or sum(cpus for cpus, _ in tiers if cpus > 0)
+
+
 def physical_cpu_count():
     """Number of physical CPU cores (not SMT siblings).
 
@@ -3122,17 +3136,25 @@ def physical_cpu_count():
     if sys.platform == "darwin":
         # Apple Silicon: every core but the efficiency tier's paces barriered expert
         # matmuls (omp_tune.h coli_physical_cores, the same rule). The tiers are
-        # hw.perflevel0 .. hw.perflevel(N-1), fastest first, the last the efficiency
-        # cores: two on an M1-M4 (perflevel0 alone), three on an M6 (2 Super + 4
-        # Performance, #2194); one tier is every core.
-        def sysctl_int(name):
+        # hw.perflevel0 .. hw.perflevel(N-1), fastest first, each with its name;
+        # apple_team picks them.
+        def sysctl_text(name):
             result = subprocess.run(["sysctl", "-n", name], text=True, capture_output=True,
                                     check=True, timeout=5)
-            return int(result.stdout.strip())
+            return result.stdout.strip()
+
+        def sysctl_int(name):
+            return int(sysctl_text(name))
+
+        def tier_name(i):
+            try:
+                return sysctl_text(f"hw.perflevel{i}.name") or None
+            except (OSError, subprocess.SubprocessError):
+                return None
         try:
-            levels = sysctl_int("hw.nperflevels")
-            cores = sum(sysctl_int(f"hw.perflevel{i}.logicalcpu")
-                        for i in range(min(max(levels - 1, 1), 16))) if levels >= 1 else 0
+            levels = min(sysctl_int("hw.nperflevels"), 16)
+            cores = apple_team([(sysctl_int(f"hw.perflevel{i}.logicalcpu"), tier_name(i))
+                                for i in range(levels)]) if levels >= 1 else 0
             if cores > 0:
                 return cores
         except (OSError, ValueError, subprocess.SubprocessError):
