@@ -145,6 +145,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_CUDA_ATTN_DEC_TPP", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_ATTN_F2_WARPS", CE_INT, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_ATTN_GROUPED", CE_INT, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
+    {"COLI_CUDA_ATTN_LONG_PLAIN", CE_STR, CE_QWEN, 0, NULL}, /* When set, bypass the one-pass long-prefix specialization. */
     {"COLI_CUDA_ATTN_PREFIX",            CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_CUDA_ATTN_SEL_TC", CE_BOOL, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_ATTN_SHARD",             CE_INT   , CE_COLIBRI                                      , 0             , NULL},
