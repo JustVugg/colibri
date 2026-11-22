@@ -136,6 +136,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_CUDA", CE_INT, CE_COLIBRI | CE_QWEN | CE_QWEN38 | CE_OLMOE | CE_DSV4 | CE_GLM53 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, CE_LAUNCHER, NULL},
     {"COLI_CUDA_ADDNORM", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_ASYNC", CE_INT, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
+    {"COLI_CUDA_ASYNC_DOWN", CE_BOOL, CE_QWEN, 0, NULL}, /* Large device-to-host copies on the copy stream. Default on. */
     {"COLI_CUDA_ATTN",                   CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_CUDA_ATTN_BATCH",             CE_STR   , CE_DSV4                                         , 0             , NULL},
     {"COLI_CUDA_ATTN_DEC", CE_INT, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},

@@ -6829,6 +6829,9 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
  * so `out` gets the routed experts' rank-order sum alone (the Vulkan dense chain runs
  * the router and the shared expert on the device and adds them there). moe() is
  * moe_ex(..., NULL, 0): the same operations in the same order as before. */
+#ifdef COLI_CUDA
+static int q36cc_skip_tier_scan(Model *m);
+#endif
 static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
                    const float *logits_in, int routed_only) {
     /* D: the experts' width, the rows of x and out (Muse Spark's latent, hidden otherwise) */
@@ -7063,7 +7066,11 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
              * read into RAM for it: below full residency the RAM cache and the
              * VRAM tier then add up instead of holding the same experts. */
             double _q0 = tm_now();
-            uint32_t qmask = qt_issue(layer, idx, K, xs);
+            int skip_full_scan = 0;
+#ifdef COLI_CUDA
+            skip_full_scan = q36cc_skip_tier_scan(m);
+#endif
+            uint32_t qmask = qt_issue_mode(layer, idx, K, xs, skip_full_scan);
             double _q1 = tm_now();
             qt_cpu_misses(m, layer, xs, idx, val, qmask, out + (int64_t)s*D, g, u, hh);
             /* Compute the shared expert NOW so it overlaps with the GPU
@@ -7884,6 +7891,10 @@ static int qwen_embedding_row(Model *m, int id, float *row) {
 #include "dflash_cuda.h"        /* COLI_DFLASH: DFlash2's drafter on the CUDA chain's device */
 static DfDrafter g_q36_df;
 #include "qwen36_cuda_chain.h"  /* COLI_CUDA_CHAIN: every layer's dense chain on the CUDA device */
+static int q36cc_skip_tier_scan(Model *m) {
+    Q36CChain *ch = q36cc_of(m);
+    return g_cuda_chain && q36cc_permits(ch, Q36_ASYNC_COPIES);
+}
 /* The CUDA chain's prompt staging (q36cc_gguf_stage_bytes), out of the tier's expert budget when
  * the card holds fewer than every routed expert of a GGUF (qt_reserve_short): taken from the
  * mirrors' room instead, a 16K prompt on Flint (RTX PRO 4000) found no memory for the routed
@@ -9050,6 +9061,13 @@ static void ensure_kv(Model *m){
     }
 #ifdef COLI_CUDA
     Q36CChain *ch = q36cc_of(m);
+    if (ch && ch->pend_books) {
+        /* The completed chunk still belongs to the old buffers and their head stride. */
+        int want = m->max_t;
+        m->max_t = m->kv_cap;
+        q36cc_dm_flush_books(ch, m);
+        m->max_t = want;
+    }
 #endif
     /* Growth COPIES the rows instead of discarding them. A chat resends a
      * longer transcript every turn, so this reallocation lands on exactly the
@@ -9096,6 +9114,11 @@ static void ensure_kv(Model *m){
     if (!ring) { free(m->ring_pos); m->ring_pos = NULL; }
     m->K = calloc((size_t)c->n_layers, sizeof(void *)); m->V = calloc((size_t)c->n_layers, sizeof(void *));
     const size_t es = q36_kv_es();
+#ifdef COLI_CUDA
+    const int parallel_copy = g_cuda_chain && q36cc_prompt_cache_enabled(ch);
+#else
+    const int parallel_copy = 0;
+#endif
     for (int i = 0; i < c->n_layers; i++){
         if (c->is_attn[i]){
             int64_t kvd = c->k_head_dim;
@@ -9104,18 +9127,36 @@ static void ensure_kv(Model *m){
                 m->K[i] = oldK[i]; m->V[i] = oldV[i]; oldK[i] = oldV[i] = NULL;
                 continue;
             }
-            int rows = win ? ring : m->max_t, ostride = old_ring && c->win_layer && c->win_layer[i] ? old_ring : old_stride;
+            int rows = win ? ring : m->max_t;
             m->K[i] = malloc((size_t)c->kv_heads * rows * kvd * es);
             m->V[i] = malloc((size_t)c->kv_heads * rows * kvd * es);
             if (!m->K[i] || !m->V[i]) { fprintf(stderr, "OOM KV cache, layer %d\n", i); exit(1); }
-            if (keep > 0 && oldK && oldK[i] && oldV[i])
-                for (int h = 0; h < c->kv_heads; h++){
+            if (!parallel_copy && keep > 0 && oldK && oldK[i] && oldV[i]) {
+                int ostride = old_ring && c->win_layer && c->win_layer[i] ? old_ring : old_stride;
+                for (int h = 0; h < c->kv_heads; h++) {
                     memcpy(q36_kv_ptr(m->K[i], (int64_t)h*rows*kvd),
                            q36_kv_ptr(oldK[i], (int64_t)h*ostride*kvd), (size_t)keep*kvd*es);
                     memcpy(q36_kv_ptr(m->V[i], (int64_t)h*rows*kvd),
                            q36_kv_ptr(oldV[i], (int64_t)h*ostride*kvd), (size_t)keep*kvd*es);
                 }
+            }
         } else { m->K[i] = NULL; m->V[i] = NULL; }
+    }
+    if (parallel_copy && keep > 0 && oldK && oldV) {
+        #pragma omp parallel for collapse(2)
+        for (int i = 0; i < c->n_layers; i++) {
+            for (int h = 0; h < c->kv_heads; h++) {
+                if (!c->is_attn[i] || !oldK[i] || !oldV[i]) continue;
+                int64_t kvd = c->k_head_dim;
+                int win = ring && c->win_layer && c->win_layer[i];
+                int rows = win ? ring : m->max_t;
+                int ostride = old_ring && c->win_layer && c->win_layer[i] ? old_ring : old_stride;
+                memcpy(q36_kv_ptr(m->K[i], (int64_t)h*rows*kvd),
+                       q36_kv_ptr(oldK[i], (int64_t)h*ostride*kvd), (size_t)keep*kvd*es);
+                memcpy(q36_kv_ptr(m->V[i], (int64_t)h*rows*kvd),
+                       q36_kv_ptr(oldV[i], (int64_t)h*ostride*kvd), (size_t)keep*kvd*es);
+            }
+        }
     }
     if (ring && ring != old_ring) {
         int nw = 0;
@@ -10208,6 +10249,9 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
         q->max_tok = budget;
     }
     printf("ACCEPT %s %d\n",q->id,np); fflush(stdout);
+#ifdef COLI_CUDA
+    q36cc_dm_flush_books(q36cc_of(m), m);   /* park, rewind and prefix restores may read or overwrite the host KV */
+#endif
     q36_park_decide(m, ids, np, q->max_tok);   /* a conversation parked by the last request: back, kept or dropped */
     int need = np + q->max_tok;
     m->max_t = need;
