@@ -7391,6 +7391,7 @@ class Engine:
 
     def transcribe(self, audio, filename, opts, cancelled=None, cache_slot=0):
         """One TRANSCRIBE round trip: audio bytes in, transcript JSON back."""
+        import base64
         if not self.transcribes:
             raise APIError(400, "This engine does not support audio transcription.",
                            "model", "unsupported_endpoint")
@@ -7918,14 +7919,19 @@ class APIServer(ThreadingHTTPServer):
         return seen
 
     def capabilities(self):
-        """What the served model does, for /v1/models and /health: an image model
-        draws (image_generation); every text engine answers POST /v1/systemone
-        (systemone), and a decision engine does only that (decision)."""
+        """What the served model does, for /v1/models and /health."""
         if is_image_engine(self.engine):
             return ["image_generation"]
-        if engine_decides(self.engine) and not engine_chats(self.engine):
-            return ["systemone", "decision"]
-        return ["chat", "systemone"]
+        caps = []
+        if engine_chats(self.engine):
+            caps.extend(["chat", "systemone"])
+        elif engine_decides(self.engine):
+            caps.extend(["systemone", "decision"])
+        if engine_transcribes(self.engine):
+            caps.append("transcribe")
+        if not caps:
+            caps.append("chat")
+        return caps
 
     def jev_model_card(self):
         """The served model as Jev's GET /v1/models lists it. colibri does not know a
@@ -7939,16 +7945,12 @@ class APIServer(ThreadingHTTPServer):
                 "release_date": time.strftime("%Y-%m-%d", time.gmtime(self.created))}
 
     def input_modalities(self):
-        """What a request to this server may carry: text, plus image when BOTH the
-        family has a placeholder expansion and the engine said it loaded its tower.
-        The family alone is not the truth (a glm53 export can declare vision_config
-        and ship no model.visual.* tensors, and the engine then serves text), and
-        the engine alone is not either (a tower the gateway cannot feed is no
-        modality). An engine that announced nothing is text: the card under-claims
-        rather than promising a picture nobody checked."""
+        """What a request to this server may carry."""
         modalities = ["text"]
         if family_by_id(ARCH).capabilities.image and getattr(self.engine, "vision", None) is True:
             modalities.append("image")
+        if engine_transcribes(self.engine):
+            modalities.append("audio")
         return modalities
 
     def generate(self, prompt, max_tokens, temperature, top_p, on_text, *args, **kwargs):

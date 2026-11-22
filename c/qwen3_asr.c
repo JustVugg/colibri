@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "json.h"
 #include "st.h"
@@ -34,6 +35,7 @@ typedef struct { float *w; float *b; int n; } LayerNorm;
 typedef struct {
     LayerNorm attn_ln, ffn_ln;
     Linear q, k, v, o;
+    Linear qkv; /* fused q+k+v when available */
     Linear fc1, fc2;
     int n_heads, head_dim, d_model, ffn_dim;
 } AsrEncLayer;
@@ -136,7 +138,7 @@ static void emit_transcript(FILE *out, const char *id, const char *text) {
     char hdr[128];
     int hn = snprintf(hdr, sizeof(hdr), "TRANSCRIPT %s %zu\n", id, o);
     if (hn > 0) { write_all(out, hdr, (size_t)hn); write_all(out, payload, o); write_all(out, "\n", 1); }
-    hn = snprintf(hdr, sizeof(hdr), "DONE %s 0 0.0 0.0 0.0 0 0\n", id);
+    hn = snprintf(hdr, sizeof(hdr), "DONE %s STAT 0 0.0 0.0 0.0 0 0\n", id);
     if (hn > 0) write_all(out, hdr, (size_t)hn);
     fflush(out);
     free(payload);
@@ -239,6 +241,36 @@ static int load_linear_gguf(gguf_ctx *g, const char *name, Linear *L, int want_b
             L->b = (float *)xcalloc((size_t)L->out, sizeof(float));
             if (gguf_read_f32(g, bt, L->b) != 0) { free(L->b); L->b = NULL; }
         }
+    }
+    return 0;
+}
+
+
+static int fuse_linear_qkv(Linear *dst, const Linear *q, const Linear *k, const Linear *v) {
+    if (q->in!=k->in || q->in!=v->in || q->out!=k->out || q->out!=v->out) return -1;
+    int in=q->in, out=q->out;
+    memset(dst, 0, sizeof(*dst));
+    dst->in=in; dst->out=out*3;
+    if (q->ggml && k->ggml && v->ggml && q->ggml_type==k->ggml_type && q->ggml_type==v->ggml_type) {
+        size_t rb = (size_t)gq_row_bytes(q->ggml_type, in);
+        size_t total = rb * (size_t)out * 3;
+        dst->ggml_type=q->ggml_type; dst->w=NULL;
+        dst->ggml = xmalloc(total);
+        memcpy((uint8_t*)dst->ggml, q->ggml, rb*out);
+        memcpy((uint8_t*)dst->ggml + rb*out, k->ggml, rb*out);
+        memcpy((uint8_t*)dst->ggml + rb*out*2, v->ggml, rb*out);
+    } else if (q->w && k->w && v->w) {
+        size_t row = (size_t)in;
+        dst->w = (uint16_t*)xmalloc(row*(size_t)out*3*sizeof(uint16_t));
+        memcpy(dst->w, q->w, row*out*sizeof(uint16_t));
+        memcpy(dst->w + row*out, k->w, row*out*sizeof(uint16_t));
+        memcpy(dst->w + row*out*2, v->w, row*out*sizeof(uint16_t));
+    } else return -1;
+    if (q->b || k->b || v->b) {
+        dst->b = (float*)xcalloc((size_t)out*3, sizeof(float));
+        if (q->b) memcpy(dst->b, q->b, (size_t)out*sizeof(float));
+        if (k->b) memcpy(dst->b + out, k->b, (size_t)out*sizeof(float));
+        if (v->b) memcpy(dst->b + out*2, v->b, (size_t)out*sizeof(float));
     }
     return 0;
 }
@@ -371,6 +403,7 @@ static int load_audio_tower(Qwen3Asr *m) {
         snprintf(n,sizeof(n),"%s.self_attn.q_proj",pfx); if (load_linear(&m->S,n,&L->q,a->d_model,a->d_model,1)<0) return -1;
         snprintf(n,sizeof(n),"%s.self_attn.k_proj",pfx); if (load_linear(&m->S,n,&L->k,a->d_model,a->d_model,1)<0) return -1;
         snprintf(n,sizeof(n),"%s.self_attn.v_proj",pfx); if (load_linear(&m->S,n,&L->v,a->d_model,a->d_model,1)<0) return -1;
+        fuse_linear_qkv(&L->qkv, &L->q, &L->k, &L->v);
         snprintf(n,sizeof(n),"%s.self_attn.out_proj",pfx); if (load_linear(&m->S,n,&L->o,a->d_model,a->d_model,1)<0) return -1;
         snprintf(n,sizeof(n),"%s.fc1",pfx); if (load_linear(&m->S,n,&L->fc1,a->ffn_dim,a->d_model,1)<0) return -1;
         snprintf(n,sizeof(n),"%s.fc2",pfx); if (load_linear(&m->S,n,&L->fc2,a->d_model,a->ffn_dim,1)<0) return -1;
@@ -445,6 +478,7 @@ static int load_audio_tower_gguf(Qwen3Asr *m) {
         snprintf(nm,sizeof(nm),"%s.attn_q",pfx); if(load_linear_gguf(g,nm,&L->q,1)<0) return -1;
         snprintf(nm,sizeof(nm),"%s.attn_k",pfx); if(load_linear_gguf(g,nm,&L->k,1)<0) return -1;
         snprintf(nm,sizeof(nm),"%s.attn_v",pfx); if(load_linear_gguf(g,nm,&L->v,1)<0) return -1;
+        if (fuse_linear_qkv(&L->qkv, &L->q, &L->k, &L->v) == 0) { /* fused */ }
         snprintf(nm,sizeof(nm),"%s.attn_out",pfx); if(load_linear_gguf(g,nm,&L->o,1)<0) return -1;
         snprintf(nm,sizeof(nm),"%s.ffn_up",pfx); if(load_linear_gguf(g,nm,&L->fc1,1)<0) return -1;
         snprintf(nm,sizeof(nm),"%s.ffn_down",pfx); if(load_linear_gguf(g,nm,&L->fc2,1)<0) return -1;
@@ -824,15 +858,25 @@ static int audio_encoder_forward(Qwen3Asr *m, const float *mel, int n_mels, int 
     float *q=(float*)xcalloc((size_t)T*D,sizeof(float));
     float *k=(float*)xcalloc((size_t)T*D,sizeof(float));
     float *v=(float*)xcalloc((size_t)T*D,sizeof(float));
+    float *qkv_out=(float*)xcalloc((size_t)T*3*D,sizeof(float));
     float *att=(float*)xcalloc((size_t)Hh*T*T,sizeof(float));
     float *tmp=(float*)xcalloc((size_t)T*D,sizeof(float));
     for (int li=0; li<a->n_layers; li++) {
         AsrEncLayer *L = &a->layers[li];
         /* self attn */
         for (int t=0;t<T;t++) layernorm(buf + (size_t)t*D, hidden + (size_t)t*D, L->attn_ln.w, L->attn_ln.b, D);
-        matmul_linear(q, buf, &L->q, T);
-        matmul_linear(k, buf, &L->k, T);
-        matmul_linear(v, buf, &L->v, T);
+        if (L->qkv.ggml || L->qkv.w) {
+            matmul_linear(qkv_out, buf, &L->qkv, T);
+            for (int ti=0;ti<T;ti++) {
+                memcpy(q + (size_t)ti*D, qkv_out + (size_t)ti*3*D, (size_t)D*sizeof(float));
+                memcpy(k + (size_t)ti*D, qkv_out + (size_t)ti*3*D + D, (size_t)D*sizeof(float));
+                memcpy(v + (size_t)ti*D, qkv_out + (size_t)ti*3*D + 2*D, (size_t)D*sizeof(float));
+            }
+        } else {
+            matmul_linear(q, buf, &L->q, T);
+            matmul_linear(k, buf, &L->k, T);
+            matmul_linear(v, buf, &L->v, T);
+        }
         /* attention - full attention (correct for short audio; TODO: n_window_infer windowing) */
         for (int h=0;h<Hh;h++) {
             for (int i=0;i<T;i++) {
@@ -874,7 +918,7 @@ static int audio_encoder_forward(Qwen3Asr *m, const float *mel, int n_mels, int 
     for (size_t i=0;i<(size_t)T*a->d_model;i++) p1[i]=gelu(p1[i]);
     float *p2=(float*)xcalloc((size_t)T*a->output_dim,sizeof(float));
     matmul_linear(p2, p1, &a->proj2, T);
-    free(p1); free(buf); free(q); free(k); free(v); free(att); free(tmp); free(hidden);
+    free(p1); free(buf); free(q); free(k); free(v); free(qkv_out); free(att); free(tmp); free(hidden);
     *out_emb = p2; *out_n = T;
     return 0;
 }
@@ -1054,6 +1098,8 @@ static unsigned char *b64_decode(const char *s, size_t *out_n){
     *out_n=o; return out;
 }
 
+static double now_ms(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return ts.tv_sec*1000.0+ts.tv_nsec/1e6; }
+
 static int greedy_decode(Qwen3Asr *m, const int *prompt, int n_prompt, const float *audio_emb, int audio_n, char *out, size_t out_cap, int max_new) {
     TextModel *t = &m->text;
     int max_seq = n_prompt + max_new + 8;
@@ -1064,30 +1110,34 @@ static int greedy_decode(Qwen3Asr *m, const int *prompt, int n_prompt, const flo
     int n = n_prompt;
     int eos = tok_id_of(&m->tok, "<|im_end|>");
     if (eos < 0) eos = 151645;
-    /* prefill */
+    double t0=now_ms();
     text_forward(m, seq, audio_emb, audio_n, n, 0, cache, logits);
+    double t_prefill=now_ms();
     int out_len = 0; out[0]=0;
+    int steps=0;
     for (int step=0; step<max_new; step++) {
         int best=0; float bestv=logits[0];
         for(int i=1;i<t->vocab;i++) if(logits[i]>bestv){bestv=logits[i]; best=i;}
         if (best == eos) break;
         if (n < max_seq) seq[n++] = best;
-        /* decode token to text */
         char piece[256];
         int pn = tok_decode(&m->tok, &best, 1, piece, (int)sizeof(piece)-1);
         if (pn > 0) piece[pn]=0; else piece[0]=0;
         if (pn > 0) {
             if (out_len + (size_t)pn + 1 < out_cap) { memcpy(out+out_len, piece, (size_t)pn); out_len += pn; out[out_len]=0; }
         }
-        /* next step with single token */
         text_forward(m, &best, NULL, 0, 1, n-1, cache, logits);
+        steps++;
     }
+    double t_decode=now_ms();
+    fprintf(stderr, "[qwen3_asr] prefill=%.1fms decode=%.1fms steps=%d prompt=%d audio=%d\n", t_prefill-t0, t_decode-t_prefill, steps, n_prompt, audio_n); fflush(stderr);
     free(seq); free(logits); kv_free(cache, t->n_layers);
     return (int)out_len;
 }
 
 static int transcribe_audio(Qwen3Asr *m, const unsigned char *wav, size_t wav_n, char *text_out, size_t cap) {
     if (!m->loaded) return -1;
+    double t0=now_ms();
     Q3AsrWav w={0}, r={0};
     int rc = q3asr_read_wav_bytes(wav, wav_n, &w);
     if (rc != 0) { if (cap) text_out[0]=0; return -2; }
@@ -1098,10 +1148,13 @@ static int transcribe_audio(Qwen3Asr *m, const unsigned char *wav, size_t wav_n,
     rc = q3asr_log_mel(r.samples, r.n, 16000, 400, 160, m->audio.n_mels, &mel);
     q3asr_wav_free(&r);
     if (rc != 0) { if (cap) text_out[0]=0; return -4; }
+    double t1=now_ms();
     float *audio_emb=NULL; int audio_n=0;
     rc = audio_encoder_forward(m, mel.mel, mel.n_mels, mel.n_frames, &audio_emb, &audio_n);
     q3asr_mel_free(&mel);
     if (rc != 0) { if (cap) text_out[0]=0; return -5; }
+    double t2=now_ms();
+    fprintf(stderr, "[qwen3_asr] mel=%.1fms audio_enc=%.1fms audio_tokens=%d\n", t1-t0, t2-t1, audio_n); fflush(stderr);
     /* build prompt - Qwen3-ASR chat template */
     int prompt[4096]; int n=0;
     int t_im_start = tok_id_of(&m->tok, "<|im_start|>");
@@ -1204,18 +1257,23 @@ static void usage(const char *argv0) {
 int main(int argc, char **argv) {
     Qwen3Asr m; memset(&m, 0, sizeof(m));
     int serve = 0;
+    const char *snap = getenv("SNAP");
+    const char *serve_env = getenv("SERVE");
+    if (snap && !m.model_dir[0]) strncpy(m.model_dir, snap, sizeof(m.model_dir)-1);
+    if (serve_env && !strcmp(serve_env, "1")) serve = 1;
     for (int i=1;i<argc;i++) {
         if (!strcmp(argv[i],"--model") && i+1<argc) { strncpy(m.model_dir, argv[++i], sizeof(m.model_dir)-1); }
         else if (!strcmp(argv[i],"--gguf") && i+1<argc) { strncpy(m.gguf_path, argv[++i], sizeof(m.gguf_path)-1); }
         else if (!strcmp(argv[i],"--mmproj") && i+1<argc) { strncpy(m.mmproj_path, argv[++i], sizeof(m.mmproj_path)-1); }
         else if (!strcmp(argv[i],"--serve")) serve=1;
         else if (!strcmp(argv[i],"--help")||!strcmp(argv[i],"-h")) { usage(argv[0]); return 0; }
+        else if (argv[i][0] != '-') { /* positional cap or model */ serve = 1; }
     }
     if (!serve) { usage(argv[0]); return 2; }
     if (m.model_dir[0] || m.gguf_path[0]) {
         if (load_model(&m) != 0) { fprintf(stderr, "qwen3_asr: failed to load model\n"); return 1; }
     }
-    write_all(stdout, "\x01\x01READY\x01\x01\n", 11);
+    write_all(stdout, "\x01\x01READY\x01\x01\n", 10);
     write_all(stdout, "CAPS transcribe=1 chat=0\n", 25);
     char stat[128]; snprintf(stat,sizeof(stat),"STAT 0 0.0 0.0 0.0 0 0\n");
     write_all(stdout, stat, strlen(stat));
