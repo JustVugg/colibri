@@ -681,6 +681,12 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
 
     detected_gpus = discover_gpus() if gpus is None else list(gpus)
     linkage = cuda_linkage(engine) if linkage is None else linkage
+    if linkage.get("vulkan") and linkage.get("linked") and gpu_indices:
+        # --gpu on a Vulkan build names Vulkan devices, numbered as the engine enumerates
+        # them (COLI_VK_DEV, COLI_VK_DEV2), not the CUDA/ROCm inventory (#2127)
+        from setup_hw import detect_vulkan
+        detected_gpus = [dict(device, index=index) for index, device
+                         in enumerate(detect_vulkan().get("devices", [])[:8])]
     selected_gpus = detected_gpus
     if gpu_indices is not None:
         wanted = set(gpu_indices)
@@ -688,6 +694,12 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
 
     if gpu_indices == []:
         checks.append(_check("accelerator.gpu", "skip", "GPU use was explicitly disabled"))
+    elif (linkage.get("vulkan") and linkage.get("linked") and gpu_indices
+          and (len(gpu_indices) > 2 or len(set(gpu_indices)) != len(gpu_indices))):
+        # what coli refuses for a Vulkan build: COLI_VK_DEV and one different COLI_VK_DEV2
+        checks.append(_check("accelerator.gpu", "fail",
+                             "a Vulkan build takes one device index, or two different ones",
+                             requested=gpu_indices))
     elif gpu_indices is not None and len(selected_gpus) != len(set(gpu_indices)):
         checks.append(_check("accelerator.gpu", "fail", "one or more requested GPUs were not detected",
                              requested=gpu_indices, detected=[gpu["index"] for gpu in detected_gpus]))
@@ -732,6 +744,9 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
         # an explicit CPU selection disables this path even in a VK build.
         vulkan_active = linkage.get("vulkan") and linkage.get("linked") and gpu_indices != []
         plan_env = dict(os.environ, COLI_VULKAN="1" if vulkan_active else "0")
+        if vulkan_active and gpu_indices:
+            # --gpu N: the device the launcher opens with COLI_VK_DEV=N (#2127)
+            plan_env["COLI_VK_DEV"] = str(gpu_indices[0])
         plan = build_plan(model, ram_gb, context, plan_gpu_indices, plan_vram_gb,
                           available_memory=available_memory, available_disk=available_disk,
                           gpus=plan_gpus, kv_slots=kv_slots, env=plan_env)
@@ -884,9 +899,9 @@ def run_image_doctor(model, engine_path, available_memory=None):
     checks.append(_check("engine.binary", "pass" if engine_ok else "fail",
                          "engine executable is ready" if engine_ok else "engine is not built",
                          path=str(engine)))
-    available_memory = memory_available() if available_memory is None else available_memory
     plan = None
     try:
+        available_memory = memory_available() if available_memory is None else available_memory
         plan = plan_image_model(model, available_memory or None)
         on_demand = plan["modes"]["text_encoder_on_demand"]
         resident = plan["modes"]["resident"]
@@ -903,6 +918,8 @@ def run_image_doctor(model, engine_path, available_memory=None):
                              on_demand_peak_bytes=on_demand["peak_bytes"]))
         for warning in plan["warnings"]:
             checks.append(_check("model.weights", "warn", warning))
+    except CgroupError as error:
+        checks.append(_check("memory.ram", "fail", str(error)))
     except (OSError, ValueError, KeyError) as error:
         checks.append(_check("model.weights", "fail", str(error)))
     statuses = {item["status"] for item in checks}
@@ -967,6 +984,8 @@ def run_decision_doctor(model, engine_path, available_memory=None):
             status, summary = "fail", f"{needed / 1e9:.1f} GB of f32 weights do not fit in RAM"
         checks.append(_check("memory.ram", status, summary, available_bytes=available_memory,
                              weight_bytes=needed, params=params))
+    except CgroupError as error:
+        checks.append(_check("memory.ram", "fail", str(error)))
     except (OSError, ValueError, struct.error) as error:
         checks.append(_check("model.weights", "fail", f"model.safetensors: {error}"))
     statuses = {item["status"] for item in checks}

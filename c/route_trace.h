@@ -305,8 +305,24 @@ static int rt_acc_cb(int l, int e, uint32_t c, void *ud){
     row[e] += c;
     return 1;
 }
+/* A history file that does not exist yet starts from the model's start profile, where it ships
+ * one: COLI_USAGE_START, else <path>.start (tools/usage_start_profile.py writes
+ * <model>/.coli_usage.start from ordinary prompts). Its counts seed the counters; the history
+ * the run writes still goes to path. A history that exists but cannot be read is left alone. */
 static int64_t rt_load(const char *path){
     int64_t t = rt_read(path, rt_acc_cb, NULL);
+    FILE *f = NULL;
+    if(t < 0 && path && !(f = fopen(path, "rb"))){
+        const char *s = getenv("COLI_USAGE_START");
+        char buf[4200];
+        if(!s || !*s){ snprintf(buf, sizeof buf, "%s.start", path); s = buf; }
+        int64_t u = rt_read(s, rt_acc_cb, NULL);
+        if(u > 0){
+            fprintf(stderr, "[USAGE] no expert history yet: the start profile's %lld selections (%s); the history "
+                            "goes to %s\n", (long long)u, s, path);
+            t = u;
+        }
+    } else if(t < 0 && path) fclose(f);
     return t < 0 ? 0 : t;                       /* callers already treat 0 as "no history" */
 }
 

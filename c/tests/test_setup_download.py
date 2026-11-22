@@ -114,6 +114,7 @@ class DownloadTest(unittest.TestCase):
             self.assertEqual(Path(self.dst, *name.split("/")).read_bytes(), data)
         self.assertTrue(setup_download.is_complete(self.dst))
         self.assertEqual(events[-1]["done"], events[-1]["total"])
+        self.assertTrue(all(event["fresh"] == event["done"] for event in events))
         self.assertEqual(events[0]["file"], "README.md")        # small files first
         # A rerun fetches nothing.
         before = len(self.hub.requests)
@@ -206,8 +207,12 @@ class DownloadTest(unittest.TestCase):
         os.makedirs(self.dst, exist_ok=True)
         Path(dest + ".part").write_bytes(self.files[name][:70_000])
         self.hub.ignore_range = True
-        setup_download.download_file(self.url(name), dest, self.spec(name), retries=0)
+        seen = []
+        setup_download.download_file(self.url(name), dest, self.spec(name), retries=0,
+                                     progress=lambda have, size, fresh: seen.append(fresh))
         self.assertEqual(Path(dest).read_bytes(), self.files[name])
+        # The prefix was discarded, so the whole file counts as received this call.
+        self.assertEqual(seen[-1], len(self.files[name]))
 
     def test_corrupt_partial_is_removed_not_kept(self):
         name = "model-00000.safetensors"
@@ -239,6 +244,35 @@ class DownloadTest(unittest.TestCase):
         cdn_side = [r for r in self.hub.requests if "/cdn/" in r["path"]]
         self.assertEqual(hub_side[-1]["headers"].get("Authorization"), "Bearer hf_secret")
         self.assertIsNone(cdn_side[-1]["headers"].get("Authorization"))
+
+    def test_resume_progress_counts_only_bytes_fetched_this_run(self):
+        # The partial shard sorts before the larger one that is already whole.
+        # fresh must follow the partial, not jump when that later shard is checked.
+        readme, partial, whole = "README.md", "model-00001.safetensors", "model-00000.safetensors"
+        prefix = 50_000
+        os.makedirs(self.dst)
+        Path(self.dst, readme).write_bytes(self.files[readme])
+        Path(self.dst, whole).write_bytes(self.files[whole])
+        Path(self.dst, partial + ".part").write_bytes(self.files[partial][:prefix])
+        files = self.listing(include=(readme, partial, whole))
+        events = []
+        setup_download.download_repo(REPO, "main", self.dst, files, base=self.hub.base,
+                                     progress=events.append)
+        new_bytes = len(self.files[partial]) - prefix
+        for event in events:
+            if event["file"] == readme:
+                self.assertEqual((event["fresh"], event["done"]), (0, len(self.files[readme])))
+            elif event["file"] == partial:
+                self.assertEqual(event["fresh"], event["file_done"] - prefix)
+                self.assertEqual(event["done"], len(self.files[readme]) + event["file_done"])
+            else:
+                self.assertEqual(event["file"], whole)
+                self.assertEqual(event["fresh"], new_bytes)
+                self.assertEqual(event["done"], len(self.files[readme]) + len(self.files[partial])
+                                 + event["file_done"])
+        self.assertEqual(events[-1]["done"], events[-1]["total"])
+        self.assertEqual(events[-1]["fresh"], new_bytes)
+        self.assertEqual(Path(self.dst, partial).read_bytes(), self.files[partial])
 
     def test_bytes_present_counts_partials(self):
         files = self.listing()
@@ -407,8 +441,10 @@ class DownloadTest(unittest.TestCase):
         .cmd around the same script on Windows."""
         script = Path(self.tmp.name, "curl_stand_in.py")
         script.write_text(
-            "import sys, urllib.request\n"
+            "import os, sys, urllib.request\n"
             "args = sys.argv[1:]\n"
+            "if os.environ.get('CURL_ARGV_LOG'):\n"
+            "    open(os.environ['CURL_ARGV_LOG'], 'w').write('\\n'.join(args))\n"
             "out = args[args.index('-o') + 1]\n"
             "data = urllib.request.urlopen(args[-1]).read()\n"
             "open(out, 'wb').write(data)\n")
@@ -431,7 +467,7 @@ class DownloadTest(unittest.TestCase):
         with mock.patch.object(setup_download, "wsl_windows_path", side_effect=lambda p: p):
             result = setup_download.download_file_windows(
                 self.url(name), dest, self.spec(name), fake_curl,
-                progress=lambda done, total: seen.append((done, total)))
+                progress=lambda done, total, fresh=0: seen.append((done, total)))
         self.assertEqual(result, "downloaded")
         self.assertEqual(Path(dest).read_bytes(), self.files[name])
         self.assertEqual(seen[-1], (300_000, 300_000))
@@ -444,6 +480,31 @@ class DownloadTest(unittest.TestCase):
                                                  bad, fake_curl)
         self.assertFalse(os.path.exists(os.path.join(self.dst, other)))
 
+    def test_windows_curl_transport_bounds_a_stalled_transfer(self):
+        """The Python transport gives up on a connection that sends nothing for
+        60 s; curl.exe has no read timeout of its own, and the loop waiting on it
+        has no deadline. Without a speed floor a transfer that stalls keeps
+        coli setup waiting forever instead of failing with "rerun to continue"."""
+        fake_curl = self.stand_in_curl()
+        argv_log = Path(self.tmp.name, "curl_argv.txt")
+        name = "README.md"
+        with mock.patch.object(setup_download, "wsl_windows_path", side_effect=lambda p: p), \
+                mock.patch.dict(os.environ, {"CURL_ARGV_LOG": str(argv_log)}):
+            setup_download.download_file_windows(
+                self.url(name), os.path.join(self.dst, name), self.spec(name), fake_curl)
+        argv = argv_log.read_text().split("\n")
+
+        def value(flag):
+            self.assertIn(flag, argv)
+            return int(argv[argv.index(flag) + 1])
+
+        self.assertGreater(value("--connect-timeout"), 0)
+        self.assertGreater(value("--speed-limit"), 0)
+        # A floor measured over a full minute, as long as the Python transport's
+        # read timeout, so a slow but moving link is not cut off.
+        self.assertGreaterEqual(value("--speed-time"), 60)
+        self.assertEqual(argv[argv.index("-C") + 1], "-")       # still resumes the .part
+
     def test_token_from_file(self):
         with tempfile.TemporaryDirectory() as hf_home:
             Path(hf_home, "token").write_text("hf_from_file\n")
@@ -452,6 +513,96 @@ class DownloadTest(unittest.TestCase):
             env["HF_HOME"] = hf_home
             with mock.patch.dict(os.environ, env, clear=True):
                 self.assertEqual(setup_download.hf_token(), "hf_from_file")
+
+    def test_resumed_206_requires_a_matching_content_range(self):
+        import io
+        class Response(io.BytesIO):
+            status = 206
+            def __init__(self, content_range):
+                super().__init__(b"def")
+                self.headers = ({"Content-Range": content_range}
+                                if content_range is not None else {})
+        dest = os.path.join(self.dst, "range.bin")
+        os.makedirs(self.dst)
+        for header in (None, "invalid", "bytes 3-5/7", "bytes 3-2/6",
+                       "bytes 3-6/6", "bytes 2-4/6"):
+            with self.subTest(header=header):
+                Path(dest + ".part").write_bytes(b"abc")
+                with self.assertRaises(setup_download.DownloadError):
+                    setup_download.download_file(
+                        "https://example.test/file", dest, {"size": 6},
+                        opener=lambda *a, **k: Response(header), retries=0)
+                self.assertFalse(Path(dest).exists())
+                self.assertEqual(Path(dest + ".part").read_bytes(), b"abc")
+        Path(dest + ".part").write_bytes(b"abc")
+        setup_download.download_file(
+            "https://example.test/file", dest, {"size": 6},
+            opener=lambda *a, **k: Response("bytes 3-5/6"), retries=0)
+        self.assertEqual(Path(dest).read_bytes(), b"abcdef")
+
+
+    def test_listing_pagination_resolves_relative_links(self):
+        import io
+        import json
+        class Response(io.BytesIO):
+            def __init__(self, entries, link=None):
+                super().__init__(json.dumps(entries).encode())
+                self.headers = {"Link": link} if link else {}
+        seen = []
+        def opener(request, **kwargs):
+            seen.append(request.full_url)
+            if len(seen) == 1:
+                return Response([], '<?cursor=next>; rel="next"')
+            self.assertEqual(request.full_url,
+                             "https://example.test/api/models/test/repo/tree/main?cursor=next")
+            return Response([{"type": "file", "path": "config.json", "size": 2}])
+        files = setup_download.list_repo_files("test/repo", base="https://example.test",
+                                               opener=opener)
+        self.assertEqual([f["path"] for f in files], ["config.json"])
+
+    def test_listing_pagination_accepts_equivalent_origin_spellings(self):
+        import io
+        for base, target in (("https://example.test", "https://EXAMPLE.test:443/page"),
+                             ("http://example.test", "http://EXAMPLE.test:80/page")):
+            with self.subTest(target=target):
+                first = io.BytesIO(b"[]")
+                first.headers = {"Link": f'<{target}>; rel="next"'}
+                last = io.BytesIO(b"[]")
+                last.headers = {}
+                opener = mock.Mock(side_effect=[first, last])
+                self.assertEqual(setup_download.list_repo_files(
+                    "test/repo", base=base, opener=opener), [])
+                self.assertEqual(opener.call_count, 2)
+
+    def test_listing_pagination_rejects_changed_ports_and_userinfo(self):
+        import io
+        for target in ("https://example.test:444/page", "https://user@example.test/page",
+                       "http://example.test/page", "https://example.test:invalid/page",
+                       "https://example.test:0/page", "https://[invalid/page"):
+            with self.subTest(target=target):
+                first = io.BytesIO(b"[]")
+                first.headers = {"Link": f'<{target}>; rel="next"'}
+                opener = mock.Mock(return_value=first)
+                with self.assertRaisesRegex(setup_download.DownloadError, "origin"):
+                    setup_download.list_repo_files("test/repo", base="https://example.test",
+                                                   opener=opener, token="test-token")
+                self.assertEqual(opener.call_count, 1)
+
+    def test_listing_rejects_cross_origin_pagination_before_sending_token(self):
+        import io
+        class Response(io.BytesIO):
+            headers = {"Link": '<https://other.test/page>; rel="next"'}
+            def __init__(self):
+                super().__init__(b"[]")
+        def response(request, **kwargs):
+            self.assertEqual(request.host, "example.test",
+                             "pagination must not send credentials to another origin")
+            return Response()
+        opener = mock.Mock(side_effect=response)
+        with self.assertRaisesRegex(setup_download.DownloadError, "origin"):
+            setup_download.list_repo_files("test/repo", base="https://example.test",
+                                           token="test-token", opener=opener)
+        self.assertEqual(opener.call_count, 1)
 
 
 if __name__ == "__main__":

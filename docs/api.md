@@ -89,6 +89,27 @@ sequences. The extension
 `enable_thinking: true` enables GLM-5.2's reasoning block; the standard
 `reasoning_effort` field also enables it unless set to `none`.
 
+The full GLM-5.3 also runs on the `colibri` engine and shares GLM-5.2's model
+architecture identifier. When its official `chat_template.jinja` (or that template
+inside `tokenizer_config.json`) is present, the gateway selects GLM-5.3's always-open
+reasoning contract: maximum effort by default; `enable_thinking: false` or
+`reasoning_effort: "none"` requests its minimum supported effort, Low, rather than
+closing a thinking block the model cannot disable. Reasoning remains separate
+from answer content. GLM-5.2's existing opt-in behavior is unchanged.
+
+The FP8 converter preserves `chat_template.jinja` alongside the tokenizer metadata.
+For an older converted GLM-5.3 folder missing that metadata, copy the template from
+the original checkpoint into the converted folder before restarting the gateway.
+The folder name alone does not select this contract; a folder without the template
+keeps the existing GLM behavior. This is separate from the GLM-5.3-Flash engine.
+
+The optional template check needs Jinja2 and the original checkpoint's template,
+not its weights:
+
+```sh
+python3 c/tests/glm53_chat_template_harness.py --full-model --template /path/to/GLM-5.3/chat_template.jinja
+```
+
 On Qwen3.6 the extension `preserve_thinking` is the official template's kwarg of
 the same name: past assistant turns keep their `<think>` block, with the
 `reasoning_content` the client sends back, empty when it sends none. It
@@ -269,6 +290,17 @@ Protocol support does not guarantee that every quantized model emits valid
 tool syntax; `COLI_TOOL_SALVAGE=1` is an opt-in recovery path for malformed GLM
 int4 tool calls. DeepSeek V4 uses its strict native DSML parser instead.
 
+A parameter the schema declares as an `array` or an `object` is sometimes written
+the way Python prints it rather than as JSON: `[7, 'x,y', None]`, a trailing comma.
+Every call form reads such text as a Python literal, with JSON's `null`, `true` and
+`false` accepted too, and passes it on as that list or dict when every part of it is a
+JSON value (Kimi K3 goes by the type its argument tag names; DeepSeek V4 and V4.1 read a
+call's whole arguments this way when they are not JSON). The text is parsed, never run.
+Anything else keeps the form's previous answer: tuples, sets, non-string keys,
+non-finite numbers and cut-off text are not read, and `strict_tool_calls` accepts
+JSON only. The gateway logs `[api] tool call: an array argument written as a Python
+literal, read as one` for each such value.
+
 `tool_choice: "required"` is a prompt-level instruction, not a sampling
 constraint. Every renderer that offers a tool block appends the same one line to
 it, and no renderer filters tokens or forces the sampler, so a model that
@@ -444,9 +476,18 @@ Tool use follows the per-engine matrix above. Unsupported engines reject active
 tool declarations and choices explicitly instead of feeding another
 architecture's markers to an incompatible tokenizer.
 
-Not supported, and refused explicitly rather than ignored: `stop_sequences`,
-`top_k`, and non-text content blocks (images, documents). Errors use Anthropic's own
-`{"type":"error","error":{...}}` envelope on this path. Architecture-local
+`stop_sequences` end the turn with `stop_reason: "stop_sequence"` and name the
+sequence in `stop_sequence`; the model family's own role markers still end it as
+`end_turn`. `POST /v1/messages/count_tokens` answers `{"input_tokens": N}`, an
+estimate from the rendered prompt and the tokens per character measured on the
+prompts served so far (nothing reaches the engine).
+
+Not supported, and refused explicitly rather than ignored: `top_k`, and non-text
+content blocks (images, documents). Errors use Anthropic's own
+`{"type":"error","error":{...}}` envelope on this path, with the `type` its HTTP
+status has in Anthropic's API (`authentication_error`, `not_found_error`,
+`rate_limit_error`, `overloaded_error`, `api_error`, ...); an error after a stream
+has started is sent as an `error` event before the close. Architecture-local
 features that have not been wired to this protocol are likewise rejected with
 an explicit error.
 
@@ -657,7 +698,7 @@ server's `context_length`.
 A chat request may opt into context compaction with the extension field
 `"context_compaction": "auto"` (`"off"` is the default, the standard behavior;
 `COLI_COMPACT=1` on the server makes `auto` the default for every client). The
-dashboard and `coli chat` send it, so a conversation there never ends in
+chat UI and `coli chat` send it, so a conversation there never ends in
 `context_length_exceeded`:
 
 1. When the conversation does not fit the context, or leaves the answer less
@@ -730,50 +771,29 @@ prompt lookup follow one conversation), and their Vulkan dense chain, DeltaNet o
 the GPU and Metal paths stay off; the Vulkan expert tier serves every
 conversation's experts.
 
-## Web dashboard
+## The chat in the browser
 
-One command serves the OpenAI-compatible API **and** the web console on the
-same port, then opens your browser when the engine is ready:
+One command serves the OpenAI-compatible API and starts the chat UI in front of
+it, then opens your browser on the chat when the engine is ready:
 
 ```bash
-cd web && npm install && npm run build   # once
-./coli web --model <model-dir>
+./coli web --model <model-dir>     # the API on :8000, the chat on :8790
 ```
 
-`coli web` differs from `coli serve` only in opening a browser — both serve the
-dashboard on the same port. On a headless host (no display, often no GPU at all)
-use `coli serve`, or `coli web --no-browser`, and point a browser at it from
-another machine. Nothing in the dashboard needs a desktop session on the host.
+`coli web` is `coli serve` plus the chat UI (`ui/server.py`, Python's standard
+library, no build step) on the API's port + 790 (`--ui-port` picks another); the
+UI stops with it. The API's own address (`http://HOST:8000/`, where the dashboard
+was before the chat) sends a browser on to the chat at the same host;
+`coli web --no-ui` serves the API alone, as the desktop app runs it.
+`coli serve` serves the API alone too, and `coli ui` starts the
+chat next to a `coli serve` that already runs, on this machine or another
+(`--backend http://HOST:PORT`). On a headless host use `coli serve` or
+`coli web --no-browser` and point a browser at it from another machine.
 
-What you get is one workspace with a dock to switch page:
-
-- **Chat**: streaming answers, a reasoning toggle, image input where the engine
-  supports it, the KV slot to answer in, and the conversation exported as a file;
-- **System One**: closed-set answers. A document, a question and the only answers
-  allowed; the engine reads the probability of each answer, generates nothing,
-  and reports an entropy that says when it is not sure. Same thing as
-  `POST /v1/systemone` (see [systemone.md](systemone.md));
-- **Brain**, two views. *Explore* draws the
-  [measured expert atlas](https://github.com/JustVugg/colibri/issues/175) of GLM-5.2 as a cortex with ten regions to
-  enter (publish `experts.json` from `tools/expert_atlas/analyze.py --web`).
-  *Live routing* shows the model actually running: one cell per expert,
-  colour = tier, brightness = routing heat, and the experts routed in each
-  turn flash white and decay;
-- **Profiling**: where the engine spends each turn, by phase (I/O wait, expert
-  matmul, attention, LM head, other), the disk service overlapped with compute,
-  and the last 30 turns as a trend;
-- a light and a dark theme.
-
-The dashboard talks to the engine over a small line protocol and plain JSON
-endpoints — nothing heavier than the engine itself. `web/` is a pure OpenAI-API
-client (React + TypeScript) and also works against any other compatible
-endpoint; the terminal `coli chat` remains the first-class interface.
-
-The layout is responsive down to phone widths; the per-turn time breakdown and
-the tok/s trend live on the Profiling page:
-
-<p align="center">
-  <img src="media/colibri-mobile.png" width="270" alt="the dashboard on a phone-sized viewport" />
-  &nbsp;&nbsp;
-  <img src="media/colibri-profiling.png" width="560" alt="the Profiling page: where the engine spends each turn" />
-</p>
+The chat proxies `/v1/`, `/health`, `/profile` and `/experts` to the gateway, so
+the page and the API share one origin: streaming answers with the reasoning in
+its own block, pictures where the engine loaded a vision tower, documents (PDF,
+Word, OpenDocument, PowerPoint, web pages, text) read into the message, web
+search, the expert map, the monitor with each turn's profile, System One
+(`POST /v1/systemone`, see [systemone.md](systemone.md)), the Models page and
+coding agents. What it does and how: [ui/README.md](../ui/README.md).

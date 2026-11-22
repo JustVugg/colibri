@@ -132,8 +132,9 @@ def _vk_device(env, vulkan):
     if vulkan is not None or not _vk_flag(env, "COLI_VULKAN"):
         return vulkan
     try:
-        from setup_hw import best_vulkan_device, detect_vulkan
-        return best_vulkan_device(detect_vulkan().get("devices", []))
+        # COLI_VK_DEV's device when it names one, as the engine opens it (#2127)
+        from setup_hw import detect_vulkan, engine_vulkan_device
+        return engine_vulkan_device(detect_vulkan().get("devices", []), env)
     except Exception:
         return None
 
@@ -284,6 +285,73 @@ def _glm53_dense_tensors(info, env):
         if _EMBED_TABLE.search(name):
             embedding += resident
     return dict(info, dense_bytes=total, embed_bytes=embedding, dense_tensors=adjusted)
+
+
+# The matrices qwen36.c loads through load_tq, by their name in the layer: the attention's
+# projections and gate, the router, the shared expert or a dense layer's MLP, the DeltaNet's
+# input and output projections, LFM3's short conv and Muse Spark's latent projections (and
+# the lm_head). The vectors and the small matrices beside them (norms, conv taps, in_proj_a
+# and in_proj_b, dt_bias, A_log, the shared expert's gate) go through load_t_n: float32.
+_Q36_LOAD_TQ = (_ATTENTION_PROJECTIONS | _MLP_PROJECTIONS |
+                frozenset(p.replace("shared_experts", "shared_expert") for p in _SHARED_PROJECTIONS) |
+                {"mlp.gate", "self_attn.gate_proj", "linear_attn.in_proj_qkv", "linear_attn.in_proj_z",
+                 "linear_attn.out_proj", "conv.in_proj", "conv.out_proj",
+                 "mlp.pre_expert_proj", "mlp.post_expert_proj"})
+_Q36_FLOAT32 = re.compile(r"(norm\.weight|layernorm\.weight|conv1d\.weight|conv\.conv\.weight|"
+                          r"in_proj_a\.weight|in_proj_b\.weight|shared_expert_gate\.weight|"
+                          r"dt_bias|A_log|e_score_correction_bias|softmax_offset)$")
+
+
+def _q36_dense_tensors(info, env):
+    """Price qwen36's dense weights as qwen36.c holds them, not as the checkpoint stores them.
+
+    With the int8 trunk (COLI_DENSE_I8 on, COLI_DENSE_BITS 8, no COLI_KEEP_F32: the
+    default) load_tq turns each matrix of _Q36_LOAD_TQ into int8 rows with a float32
+    scale a row while it loads, and the embedding's rows are read in place from the
+    checkpoint (qwen36_embedding.h) unless a Vulkan run or COLI_EMBED_MMAP=0 keeps the
+    float32 table. The vectors are read into float32. A GGUF's tensors, the other
+    trunks, macOS's Metal graph and the tensors not named here keep the checkpoint's
+    bytes, as before. Priced as the checkpoint stores them (4.56 GiB in BF16 on the 35B
+    int4 gs64 container), the plan kept 244 of its 256 experts a layer in the 30.5 GiB
+    a 32 GB box had free, and the CUDA tier pools the experts for a prompt chunk's copy
+    only when the RAM holds every one: a 5.6K-token prompt on an 8 GB card took 119 s,
+    7.9 with every expert in RAM (#2900). Held so, it is 2.34 GiB of RSS beside the experts.
+    """
+    if info["resolved_family"].descriptor.id != "qwen36" or sys.platform == "darwin":
+        return info
+    setting = re.match(r"\s*([+-]?\d+)", env.get("COLI_DENSE_BITS") or "8")
+    bits = int(setting[1]) if setting else 8   # dense_bits(): 4 and 16 are those, any other is 8
+    if (env.get("COLI_DENSE_I8") or "").startswith("0") or bits in (4, 16) or env.get("COLI_KEEP_F32") is not None:
+        return info
+    in_place = not (env.get("COLI_EMBED_MMAP") or "").startswith("0") and not _vk_flag(env, "COLI_VULKAN")
+    adjusted, total, embedding = [], 0, 0
+    for tensor in info.get("dense_tensors", []):
+        name, size, resident = _text_weight_name(tensor["name"]), tensor["size"], tensor["resident"]
+        element = {"BF16": 2, "F16": 2, "F32": 4}.get(tensor["dtype"])
+        shape = _matrix_shape(tensor)
+        if element and size % element == 0:
+            if _EMBED_TABLE.search(name):
+                resident = 0 if in_place and shape else size // element * 4
+            elif shape and (name == "lm_head.weight" or _layer_component(name) in _Q36_LOAD_TQ):
+                rows, columns = shape
+                resident = rows * columns + rows * 4
+            elif (name.startswith("model.layers.") or name == "model.norm.weight") and _Q36_FLOAT32.search(name):
+                resident = size // element * 4
+        adjusted.append(dict(tensor, resident=resident))
+        total += resident
+        if _EMBED_TABLE.search(name):
+            embedding += resident
+    return dict(info, dense_bytes=total, embed_bytes=embedding, dense_tensors=adjusted)
+
+
+def _engine_state_bytes(family_id, state_bytes, env):
+    """The KV the engine allocates for the planner's float32 state of a context: qwen36.c keeps
+    K and V as float16 (kv16.h) unless Q36_KV=f32. Only the cache's sizing takes it; chat_context
+    keeps the float32 steps, so the default context stays what it was: a wider one would grow
+    the CUDA chain's mirrors on the card further at a request without max_tokens (#2900)."""
+    if family_id == "qwen36" and (env.get("Q36_KV") or "").strip() != "f32":
+        return state_bytes // 2
+    return state_bytes
 
 
 def _q38_state_file(env, setting, default, model_dir):
@@ -1618,7 +1686,7 @@ def _gguf_sources(model_dir):
 
 # The routed experts _gguf_tensor_sizes names, one entry per expert whatever the family
 # (analyze_model counts them as experts without the family's checkpoint names).
-_GGUF_EXPERT = re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(?:(?:gate|up|down)_proj\.weight|gguf)$")
+_GGUF_EXPERT = re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(?:(?:gate_up|gate|up|down)_proj\.weight|gguf)$")
 
 
 def _gguf_tensor_sizes(parts, layers=None):
@@ -1632,7 +1700,8 @@ def _gguf_tensor_sizes(parts, layers=None):
     import importlib.util
     spec = importlib.util.spec_from_file_location("gguf_reader", Path(__file__).resolve().parent / "tools" / "gguf_reader.py")
     gr = importlib.util.module_from_spec(spec); spec.loader.exec_module(gr)
-    fused = re.compile(r"^blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$")
+    # gate_up: one tensor of both, an expert's gate rows then its up rows (Inkling-2-Mini's files)
+    fused = re.compile(r"^blk\.(\d+)\.ffn_(gate_up|gate|up|down)_exps\.weight$")
     packed = re.compile(r"^blk\.(\d+)\.ffn_exps_colibri$")
     last = None
     for part in parts:
@@ -1921,6 +1990,10 @@ def qwen38_int4_sidecar(info):
     2.01 MB at 3, 1.32 MB vq2, 0.82 MB vq1 on the release), priced the same way: by the
     record its index states, whatever the name, so a format this list does not know yet is
     never priced with the FP8 bytes (a 188-expert cap where RAM held 512, 2026-10-14).
+    A checkpoint whose shards carry no routed experts, the sidecar being their only copy,
+    takes its sparse layers from the index (which states the config's): priced by the
+    shards' layers it had none, a cap of 0 slots, or with the MTP head on one made of the
+    head's record alone (512 slots of 30 GiB on a 25 GiB budget, Qwen3.8 Flash Next on vq2g32).
     """
     resolved = info["resolved_family"]
     lowbit = (os.environ.get("Q38_EXPERT_LOWBIT") or "").strip()
@@ -1944,7 +2017,8 @@ def qwen38_int4_sidecar(info):
     if (any(index.get(key) != value for key, value in want.items()) or
             isinstance(record, bool) or not isinstance(record, int) or record < 1):
         return info
-    per_layer = {layer: record for layer in info["expert_bytes_by_layer"]}
+    layers = info["expert_bytes_by_layer"] or (range(want["layers"]) if isinstance(want["layers"], int) else ())
+    per_layer = {layer: record for layer in layers}
     return dict(info,
                 expert_bytes=record * want["experts"] * len(per_layer),
                 typical_expert_bytes=record, max_expert_bytes=record,
@@ -2033,9 +2107,39 @@ def windows_available_bytes(avail_phys, avail_pagefile):
     handed the resulting cap to the engine; the engine filled it slot by slot
     until Windows refused the next 14 MB. Physical memory was there. Commit
     was not, and nothing had looked at it."""
-    if avail_pagefile and 0 < avail_pagefile < avail_phys:
+    if avail_pagefile is not None and 0 <= avail_pagefile < avail_phys:
         return avail_pagefile
     return avail_phys
+
+
+def darwin_available_bytes(vm_stat_text):
+    """What macOS can take back without compressing or swapping, from vm_stat:
+    Pages free + File-backed pages + Pages purgeable. That is physical memory
+    less Activity Monitor's "Memory Used" (App + Wired + Compressed), and the
+    same figure compat_meminfo_gb computes from host_statistics64. None when
+    vm_stat printed none of the three.
+
+    vm_stat prints free_count - speculative_count as "Pages free" and
+    external_page_count as "File-backed pages". Whether the external count holds
+    the speculative (read-ahead) pages depends on the macOS version (on 15.6 it
+    does not), so they are counted once or not at all, never twice.
+
+    Not "Pages inactive": that queue holds file pages, which macOS can drop,
+    and anonymous pages, which it can only compress or swap. It leaves out file
+    pages still in the active queue, so it moves as they age (one possible
+    reason for #2785's drift), and it counts other apps' inactive anonymous
+    memory (#1614). Can, not will: the compressor is not modeled, and macOS
+    may compress before it drops."""
+    text = vm_stat_text or ""
+    pages = 0
+    for key in ("Pages free", "File-backed pages", "Pages purgeable"):
+        match = re.search(rf"{key}:\s+(\d+)\.", text)
+        if match:
+            pages += int(match.group(1))
+    if not pages:
+        return None
+    page = re.search(r"page size of (\d+) bytes", text)
+    return pages * (int(page.group(1)) if page else os.sysconf("SC_PAGE_SIZE"))
 
 
 def _read_bounded_bytes(path, max_bytes, description):
@@ -2331,7 +2435,7 @@ def _read_cgroup_mounts(proc_mountinfo_path):
     return mounts
 
 
-def _resolve_cgroup_hierarchy(mounts, member, *, v1=False):
+def _resolve_cgroup_hierarchy(mounts, member, *, v1=False, controller="memory"):
     """Return the mounts exposing ``member``, shallowest root first.
 
     A mount's root is the cgroup its mount point shows; ``member`` maps into
@@ -2343,7 +2447,7 @@ def _resolve_cgroup_hierarchy(mounts, member, *, v1=False):
     """
     if v1:
         applicable = [mount for mount in mounts
-                      if mount.fs_type == "cgroup" and "memory" in mount.options]
+                      if mount.fs_type == "cgroup" and controller in mount.options]
     else:
         applicable = [mount for mount in mounts if mount.fs_type == "cgroup2"]
     views = [mount for mount in applicable if member[:len(mount.root)] == mount.root]
@@ -2473,6 +2577,18 @@ def _host_memory_available(meminfo_path):
     return kib * 1024
 
 
+def freebsd_available_bytes(sysctl_text):
+    """Available memory on FreeBSD from ``sysctl -n vm.stats.vm.v_free_count
+    vm.stats.vm.v_inactive_count vm.stats.vm.v_page_size`` (one number per line):
+    free + inactive pages, the definition the C engine's compat_meminfo_gb uses
+    there. ``None`` when the output is not those three numbers."""
+    try:
+        free, inactive, page = (int(value) for value in (sysctl_text or "").split())
+    except ValueError:
+        return None
+    return (free + inactive) * page
+
+
 def memory_available(*, meminfo_path=Path("/proc/meminfo"),
                      cgroup_root=Path("/sys/fs/cgroup"),
                      proc_cgroup_path=Path("/proc/self/cgroup"),
@@ -2539,21 +2655,15 @@ def memory_available(*, meminfo_path=Path("/proc/meminfo"),
                 return total_kb.value * 1024
         except OSError:
             pass
-    # macOS: no /proc and not win32. Sum the reclaimable pages reported by vm_stat
-    # (free + inactive + speculative + purgeable) — the same "reclaimable without swapping"
-    # definition the C engine's compat_meminfo uses. Fall back to total RAM (never 0 on a Mac).
+    # macOS: no /proc and not win32. vm_stat's free + file-backed + purgeable pages
+    # (darwin_available_bytes), the definition the C engines' compat_meminfo_gb uses.
+    # Fall back to total RAM (never 0 on a Mac).
     if sys.platform == "darwin":
         try:
             out = subprocess.run(["vm_stat"], text=True, capture_output=True, timeout=5).stdout
-            page_match = re.search(r"page size of (\d+) bytes", out)
-            page = int(page_match.group(1)) if page_match else os.sysconf("SC_PAGE_SIZE")
-            pages = 0
-            for key in ("Pages free", "Pages inactive", "Pages speculative", "Pages purgeable"):
-                match = re.search(rf"{key}:\s+(\d+)\.", out)
-                if match:
-                    pages += int(match.group(1))
-            if pages:
-                return pages * page
+            available = darwin_available_bytes(out)
+            if available:
+                return available
         except (OSError, subprocess.SubprocessError, ValueError):
             pass
         try:
@@ -2562,6 +2672,18 @@ def memory_available(*, meminfo_path=Path("/proc/meminfo"),
             if total:
                 return int(total)
         except (OSError, subprocess.SubprocessError, ValueError):
+            pass
+    # FreeBSD: no /proc/meminfo unless linprocfs is mounted there, which a default
+    # install does not do. The kernel's page counters instead (freebsd_available_bytes).
+    if sys.platform.startswith("freebsd"):
+        try:
+            out = subprocess.run(["sysctl", "-n", "vm.stats.vm.v_free_count",
+                                  "vm.stats.vm.v_inactive_count", "vm.stats.vm.v_page_size"],
+                                 text=True, capture_output=True, timeout=5).stdout
+            available = freebsd_available_bytes(out)
+            if available:
+                return available
+        except (OSError, subprocess.SubprocessError):
             pass
     return None
 
@@ -2927,7 +3049,7 @@ def _discover_amd_gpus():
 #: The oldest compute capability an engine's CUDA tier is built for by default, and
 #: what reaches older cards (docs/deepseek-v4.md).
 CUDA_TIER_FLOOR = {
-    "deepseek_v4": ((8, 0), "a build with CUDA_ARCH=portable-pre-ampere NO_TC=1 runs on Pascal and Turing"),
+    "deepseek_v4": ((8, 0), "a build with CUDA_ARCH=portable-pre-ampere NO_TC=1 (CUDA <= 12.9) runs on Pascal and Turing"),
 }
 
 
@@ -3027,6 +3149,18 @@ def physical_cpu_count():
             cores = int(result.stdout.strip())
             if cores > 0:
                 return cores
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            _physical_cores_warn(f"sysctl core probe failed: {error}")
+    if sys.platform.startswith("freebsd"):
+        # kern.smp.cores counts a core once, whatever kern.smp.threads_per_core is
+        # (omp_tune.h coli_physical_cores, the same sysctl). There is no lscpu here.
+        try:
+            result = subprocess.run(["sysctl", "-n", "kern.smp.cores"], text=True,
+                                    capture_output=True, check=True, timeout=5)
+            cores = int(result.stdout.strip())
+            if cores > 0:
+                return cores
+            _physical_cores_warn("kern.smp.cores reported no cores")
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             _physical_cores_warn(f"sysctl core probe failed: {error}")
     try:
@@ -3152,10 +3286,155 @@ def _windows_performance_cores(raw):
     return classes.count(max(classes))
 
 
+def _cgroup_cpu_memberships(proc_cgroup_path):
+    """``(v2 path, v1 cpu path)`` from ``/proc/self/cgroup``, ``None`` for an absent file.
+
+    Only the two records the CPU probe reads: the v2 one and the v1 hierarchy whose
+    controllers include ``cpu`` (``cpu,cpuacct`` on most systems)."""
+    present, raw = _read_bounded_bytes(
+        proc_cgroup_path, _CGROUP_MEMBERSHIP_MAX_BYTES, "cgroup membership file")
+    if not present:
+        return None
+    v2_path = v1_path = None
+    for line in _proc_lines(raw, "cgroup membership file"):
+        fields = line.split(b":", 2)
+        if len(fields) != 3:
+            raise CgroupFormatError(f"malformed cgroup membership record: {line!r}")
+        hierarchy, controllers, member_path = fields
+        if hierarchy == b"0" and not controllers:
+            v2_path = _decode_cgroup_membership_path(member_path, "cgroup membership path")
+        elif b"cpu" in controllers.split(b","):
+            v1_path = _decode_cgroup_membership_path(member_path, "cgroup membership path")
+    return (v2_path, v1_path)
+
+
+def _cgroup_cpu_limit_of(directory, v1=False):
+    """``(controls_present, cpus_or_none)`` for one cgroup: v2 ``cpu.max`` is
+    ``"<quota> <period>"`` or ``"max <period>"`` (no quota); v1 is ``cpu.cfs_quota_us``
+    (-1: no quota) over ``cpu.cfs_period_us``. A present but malformed file raises."""
+    directory = Path(directory)
+    if not v1:
+        path = directory / "cpu.max"
+        present, text = _read_bounded_ascii(path, _CGROUP_VALUE_MAX_BYTES, "cgroup cpu limit")
+        if not present:
+            return (False, None)
+        match = re.fullmatch(r"(max|\d{1,20}) (\d{1,20})\n?", text)
+        if match is None or int(match.group(2)) == 0 or match.group(1) == "0":
+            raise CgroupFormatError(f"malformed cgroup cpu limit: {path}")
+        if match.group(1) == "max":
+            return (True, None)
+        return (True, int(match.group(1)) / int(match.group(2)))
+    quota_path = directory / "cpu.cfs_quota_us"
+    period_path = directory / "cpu.cfs_period_us"
+    present, text = _read_bounded_ascii(quota_path, _CGROUP_VALUE_MAX_BYTES, "cgroup cpu quota")
+    if not present:
+        return (False, None)
+    match = re.fullmatch(r"(-1|\d{1,20})\n?", text)
+    if match is None or match.group(1) == "0":
+        raise CgroupFormatError(f"malformed cgroup cpu quota: {quota_path}")
+    if match.group(1) == "-1":
+        return (True, None)
+    present, text = _read_bounded_ascii(period_path, _CGROUP_VALUE_MAX_BYTES, "cgroup cpu period")
+    period = re.fullmatch(r"(\d{1,20})\n?", text) if present else None
+    if period is None or int(period.group(1)) == 0:
+        raise CgroupFormatError(f"malformed or missing cgroup cpu period: {period_path}")
+    return (True, int(match.group(1)) / int(period.group(1)))
+
+
+def _cgroup_cpu_walk(views, member, v1=False):
+    """``(controls_seen, tightest quota in CPUs)``, each view walked from the member's
+    directory up to its mount point, as the memory probe walks it."""
+    seen = False
+    cpus = None
+    for mount in views:
+        suffix = member[len(mount.root):]
+        for depth in range(len(suffix), -1, -1):
+            present, value = _cgroup_cpu_limit_of(
+                mount.mount_point.joinpath(*suffix[:depth]), v1=v1)
+            seen = seen or present
+            if value is not None:
+                cpus = value if cpus is None else min(cpus, value)
+    return (seen, cpus)
+
+
+def cgroup_cpu_quota(cgroup_root=Path("/sys/fs/cgroup"),
+                     proc_cgroup_path=Path("/proc/self/cgroup"),
+                     proc_mountinfo_path=Path("/proc/self/mountinfo")):
+    """The tightest CPU quota on this process's cgroup and its ancestors, in CPUs
+    (7.65 for a ``cpu.max`` of ``765000 100000``), or ``None``: no quota, not Linux,
+    or nothing that could be read.
+
+    A container's quota throttles a team larger than it as soon as the team has spent
+    the period's share, whatever the host's core count: 48 threads under a quota of
+    7.65 CPUs decoded Qwen3.6 at 18-21 tok/s against 134 with 7 (#2914). The engines
+    read the same files (compat.h, compat_cgroup_cpu_limit). Unlike the memory probe
+    this one fails open: an input it cannot read leaves the team as it was."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        memberships = _cgroup_cpu_memberships(proc_cgroup_path)
+        if memberships is None:
+            return None
+        v2_member, v1_member = memberships
+        mounts = _read_cgroup_mounts(proc_mountinfo_path)
+        if mounts is None:
+            root = Path(cgroup_root)
+            probes = ((root, v2_member, False), (root / "cpu", v1_member, True),
+                      (root / "cpu,cpuacct", v1_member, True), (root, v1_member, True))
+            for base, member, v1 in probes:
+                if member is None:
+                    continue
+                seen, cpus = _cgroup_cpu_walk([_fixed_root_view(base, v1=v1)], member, v1=v1)
+                if seen:
+                    return cpus
+            return None
+        for member, v1 in ((v2_member, False), (v1_member, True)):
+            if member is None:
+                continue
+            views = _resolve_cgroup_hierarchy(mounts, member, v1=v1, controller="cpu")
+            seen, cpus = _cgroup_cpu_walk(views, member, v1=v1)
+            if seen:
+                return cpus
+        return None
+    except (CgroupError, OSError, ValueError):
+        return None
+
+
+def allowed_cpu_count():
+    """The CPUs this process may run on when that is fewer than the machine's online
+    CPUs (a container's cpuset, a ``taskset``), else ``None``. lscpu and sysfs count
+    the host's cores whatever the affinity mask says."""
+    getter = getattr(os, "sched_getaffinity", None)
+    if getter is None:
+        return None
+    try:
+        allowed = len(getter(0))
+    except OSError:
+        return None
+    online = os.cpu_count() or 0
+    return allowed if 0 < allowed < online else None
+
+
+def bound_team(cores, quota_cpus=None, allowed_cpus=None):
+    """``cores`` no larger than the CPUs the process may run on and no larger than its
+    CPU quota, floored (7.65 CPUs: 7 threads) and at least one."""
+    team = cores
+    if allowed_cpus and allowed_cpus < team:
+        team = allowed_cpus
+    if quota_cpus is not None and quota_cpus > 0:
+        team = min(team, max(1, int(quota_cpus)))
+    return team
+
+
 def team_cpu_count():
     """The OpenMP team a launch defaults to: the performance cores of a hybrid CPU
-    (performance_core_count), else the physical cores (physical_cpu_count)."""
-    return performance_core_count() or physical_cpu_count()
+    (performance_core_count), else the physical cores (physical_cpu_count), no more
+    than the CPUs the process may run on (allowed_cpu_count) or its container's CPU
+    quota lets run at once (cgroup_cpu_quota, #2914). The launcher sets
+    OMP_NUM_THREADS from this, and an engine given OMP_NUM_THREADS sizes nothing
+    itself, so this is where a container's limits must be seen."""
+    return bound_team(performance_core_count() or physical_cpu_count(),
+                      cgroup_cpu_quota(), allowed_cpu_count())
 
 
 def _resolve_physical_cores(physical_cpus):
@@ -3273,8 +3552,10 @@ def _next_actions(bottleneck_class, projected_hit, probe_state, probe_gbs,
             actions.append({
                 "id": "measure-storage",
                 "priority": "required",
-                "reason": "cold experts remain on disk and no trusted storage probe is available",
-                "command": "make -C c iobench && ./c/iobench",
+                "reason": ("cold experts remain on disk and no trusted storage probe is available; "
+                           "from a source checkout, replace <model-shard> with an existing "
+                           "model weight file of at least 38 MiB on the model drive"),
+                "command": 'make -C c iobench && ./c/iobench "<model-shard>" 19 64 8 1',
             })
         actions.append({
             "id": "measure-residency",
@@ -3415,6 +3696,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     info = _q38_cpu_dense_tensors(info, env_now)
     info = _q38_mtp_head(info, env_now, vulkan)
     info = _glm53_dense_tensors(info, env_now)
+    info = _q36_dense_tensors(info, env_now)
     # Only the matrices a family's dho pass can release earn RAM credit. The
     # embedding, norms, CPU-only components and unrecognized formats stay reserved.
     family_id = info["resolved_family"].descriptor.id
@@ -3454,8 +3736,11 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                           if (vulkan or {}).get("type") in ("integrated", "cpu")
                           and _vk_dense_active(family_id, env_now, vulkan) else 0)
     # the team a launch defaults to (environment_for_plan): a hybrid CPU's performance
-    # cores, probed only when the caller did not name a count
+    # cores, and no more than a container's CPU quota or the affinity mask lets run at
+    # once (#2914, as team_cpu_count); probed only when the caller did not name a count
     team_cpus = (performance_core_count() if physical_cpus is None else None)
+    cpu_limits = ((cgroup_cpu_quota(), allowed_cpu_count()) if physical_cpus is None
+                  else (None, None))
     physical_cpus = physical_cpu_count() if physical_cpus is None else physical_cpus
     cpu_sockets = cpu_socket_count() if cpu_sockets is None else cpu_sockets
     resolved = info["resolved_family"]
@@ -3524,13 +3809,18 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     unified = placement_unified or _host_unified_memory() or bool(shared_dense_bytes)
     typical = info["typical_expert_bytes"]
     max_expert = info["max_expert_bytes"] or typical
-    kv_bytes = (geometry.context_state_bytes + geometry.fixed_state_bytes) * kv_slots
+    state_bytes = _engine_state_bytes(family_id, geometry.context_state_bytes, env_now)
+    kv_bytes = (state_bytes + geometry.fixed_state_bytes) * kv_slots
     kv_buffer = geometry.workspace_bytes
     # expert_fixed_bytes is retained once per model (currently Qwen3.8's
     # normalized FP8 scale bank), unlike per_cap_bytes which is paid for
     # every cache slot. Include it in the resident runtime reservation so the
     # selected capacity cannot overrun the model's actual allocation.
-    runtime_bytes = int(1.2 * GB + 2.5 * GB + 64 * max_expert +
+    # The base is colibri.c's slack (expert_avail: 1.2 + 2.5 GB and 64 experts in
+    # flight). olmoe.c sets aside 0.5 GB of activations beside its resident dense
+    # (model_init_range, #2785).
+    base_reserve = 0.5 * GB if family_id == "olmoe" else 1.2 * GB + 2.5 * GB + 64 * max_expert
+    runtime_bytes = int(base_reserve +
                         info["expert_fixed_bytes"] + kv_bytes + kv_buffer + shared_dense_bytes)
     per_cap = info["per_cap_bytes"]
     configured_experts = geometry.configured_experts
@@ -3687,6 +3977,17 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     probe_state, probe_gbs = ssd_probe_state(info["path"])
     actions = _next_actions(bottleneck_class, projected_hit, probe_state,
                             probe_gbs, planning_gpus)
+    cpu = {"physical_cores": _resolve_physical_cores(physical_cpus),
+           "sockets": max(1, int(cpu_sockets)),
+           "team_threads": bound_team(_resolve_physical_cores(team_cpus or physical_cpus),
+                                      *cpu_limits),
+           "thread_policy": "performance-cores" if team_cpus else "physical-cores"}
+    # The most threads those limits let run at once, for a tuning sweep to stay within.
+    # Named only when that is fewer than the cores: a machine without limits keeps the
+    # block it had, and with it the fingerprint of its tuning profiles, which hashes it.
+    limit_threads = bound_team(cpu["physical_cores"], *cpu_limits)
+    if limit_threads < cpu["physical_cores"]:
+        cpu["limit_threads"] = limit_threads
 
     return {
         "version": 2,
@@ -3697,10 +3998,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                   "family_id": resolved.descriptor.id,
                   "model_type": resolved.model_type,
                   "configured_experts": configured_experts},
-        "cpu": {"physical_cores": _resolve_physical_cores(physical_cpus),
-                 "sockets": max(1, int(cpu_sockets)),
-                 "team_threads": _resolve_physical_cores(team_cpus or physical_cpus),
-                 "thread_policy": "performance-cores" if team_cpus else "physical-cores"},
+        "cpu": cpu,
         "memory": {"unified": unified, "available_bytes": available_memory},
         # the Vulkan device a COLI_VULKAN=1 run opens (its expert tier and dense chain
         # size themselves from its free memory at start)
@@ -3719,7 +4017,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                     "shared_device_dense_bytes": shared_dense_bytes,
                     "runtime_bytes": runtime_bytes,
                     "expert_fixed_bytes": info["expert_fixed_bytes"],
-                    "sequence_state_bytes": geometry.context_state_bytes,
+                    "sequence_state_bytes": state_bytes,
                     "fixed_state_bytes": geometry.fixed_state_bytes,
                     "workspace_bytes": geometry.workspace_bytes,
                     "expert_cache_bytes": cache_bytes,

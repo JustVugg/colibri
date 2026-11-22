@@ -34,6 +34,10 @@
  *            with a budget of four (the smaller form's experts take the rooms the bigger
  *            form's give up, no upload refused), and streamed through slots that change
  *            format between the layers' steps;
+ *   rooms    three layers in three forms of three sizes: every expert sits in a room of
+ *            its own form's size (a budget of the experts' own bytes holds them all), a
+ *            smaller form's experts take the rooms the two bigger forms' give up and a
+ *            bigger form's never a smaller one's, no upload refused;
  *   timeout  a batch's wait gives up (COLI_VK_WAIT_FAULT): the tier stops and the experts
  *            that batch names keep their device memory until the device is idle;
  *   promote  a host pool that holds every expert (COLI_VK_TIER_HOST=1), the device four:
@@ -67,6 +71,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <math.h>
 #include <unistd.h>
 #include "../backend_vulkan.h"
@@ -76,7 +81,7 @@
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fails++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
-enum { L = 2, E = 10, K = 3, HF_MAX = 512 };
+enum { L = 2, LX = 3, E = 10, K = 3, HF_MAX = 512 };   /* LX: rooms() adds a layer */
 static int H = 192, F = 128;   /* hidden and expert width; grouped() widens H */
 static unsigned rng = 7;
 static unsigned rnd(void) { rng = rng * 1103515245u + 12345u; return rng >> 8; }
@@ -166,7 +171,8 @@ static void mat_free(Mat *m) { free(m->codes); free(m->scales); free(m->w); }
 
 /* ---- the synthetic model ---------------------------------------------------------- */
 typedef struct { Mat g, u, d; } Ex;
-static Ex ex[L][E];
+static Ex ex[LX][E];
+static int g_layers = L;
 static int g_act; static float g_limit;
 static void expert_ref(const Ex *e, const float *x, float *y) {
     float h[HF_MAX];
@@ -244,7 +250,7 @@ static void route(int S, int lo, int span, int *idx, float *w) {
 }
 
 static VktConfig cfg_of(VktFmt gu, VktFmt dn, int act, float limit) {
-    return (VktConfig){.engine = "test", .layers = L, .experts = E, .hidden = H, .inter = F, .topk = K,
+    return (VktConfig){.engine = "test", .layers = g_layers, .experts = E, .hidden = H, .inter = F, .topk = K,
                        .gate_up = gu, .down = dn, .act = act, .act_limit = limit, .act_a = 4.f, .act_b = 25.f,
                        .max_rows = 1 << 20};
 }
@@ -615,6 +621,45 @@ static void sync_evict(void) {
     vkt_shutdown(); model_free();
 }
 
+/* #2705: vkt_give_back waits for the uploader's queue first. An upload the pool refused for
+ * room waited (a minute an entry) for a free that only the engine thread makes at a quiescent
+ * point, and the engine thread was the one waiting in vkt_give_back: a turn stalled in it. A
+ * budget of six experts and the pool's limit cut to three before any upload: a step routes six,
+ * three go up and three meet the full pool; the give-back that follows returns at once, the
+ * three given up and back on the CPU, none counted failed, the budget standing. */
+static double mono_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+static void give_back_wait(void) {
+    VktFmt f = {VKT_SRC_I8_ROW, 0};
+    model_make(f, f); g_act = VKT_ACT_SWIGLU; g_limit = 0;
+    set_budget(6, f, f);
+    setenv("COLI_VK_TIER_RATE", "64", 1);
+    VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+    int on = vkt_init(&vc, NULL);
+    CHECK(on, "give back: the tier did not start");
+    if (!on) { model_free(); return; }
+    const size_t eb = vkt_expert_bytes(H, F, f, f);
+    coli_vk_tier_pool_limit(3 * eb);
+    Books bk = {0, 0};
+    int idx[2 * K] = {0, 1, 2, 3, 4, 5}; float w[2 * K] = {0.5f, 0.3f, 0.2f, 0.5f, 0.3f, 0.2f};
+    vkt_begin_forward(); step(0, 2, idx, w, &bk);
+    for (int k = 0; k < 50; k++) {   /* the uploader at work: three in, a refused one waiting for room */
+        int res = 0; for (int e = 0; e < 6; e++) res += vkt_resident(0, e);
+        if (res >= 3) break;
+        struct timespec ts = {0, 20 * 1000000L}; nanosleep(&ts, NULL);
+        vkt_begin_forward();
+    }
+    const double t0 = mono_s();
+    vkt_give_back(eb);
+    const double dt = mono_s() - t0;
+    unsigned long long ev, failed;
+    report_counts(&ev, &failed);
+    int res = 0; for (int l = 0; l < L; l++) for (int e = 0; e < E; e++) res += vkt_resident(l, e);
+    printf("  give back: %.2f s with refused uploads queued, resident %d, failed %llu\n", dt, res, failed);
+    CHECK(dt < 10.0, "give back: %.1f s with refused uploads queued (the uploader waited for room only this thread makes)", dt);
+    CHECK(failed == 0, "give back: %llu uploads counted failed (a give-back's are given up, the budget stands)", failed);
+    vkt_shutdown(); model_free();
+}
+
 /* An extra layer: layer 0 is the model's (int4 v+8 gs64), layer 1 an MTP head's held
  * as f32 (VktConfig.extra_layers), eight times the bytes. Its experts sit in a pool of
  * their own with the extra layer's share of the budget; uploads awaited throughout. */
@@ -942,6 +987,42 @@ static void stream(void) {
     }
 }
 
+/* An empty prefetch must not allocate the reserved streaming slots. The
+ * resident count/budget stays unchanged; stream() above covers real cold work. */
+static void empty_prefetch(void) {
+    VktFmt f = {VKT_SRC_MXFP4_E8M0, 32};
+    model_make(f, f); g_act = VKT_ACT_SWIGLU; g_limit = 0;
+    set_budget(L * E + 4, f, f);
+    setenv("COLI_VK_TIER_STREAM", "1", 1);
+    setenv("COLI_VK_TIER_STREAM_SLOTS", "4", 1);
+    VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+    vc.load = load_cb; vc.release = release_cb;
+    int on = vkt_init(&vc, NULL);
+    CHECK(on, "empty prefetch: the tier did not start");
+    if (on) {
+        for (int l = 0; l < L; l++) for (int e = 0; e < E; e++) {
+            VktExpertSrc src = src_of(&ex[l][e]); vkt_put(l, e, &src);
+        }
+        vkt_put_done();
+        int resident = 0;
+        for (int l = 0; l < L; l++) for (int e = 0; e < E; e++) resident += vkt_resident(l, e) != 0;
+        CHECK(resident == L * E, "empty prefetch: only %d of %d experts resident", resident, L * E);
+        ColiVkXbStats xs; coli_vk_xb_stats(&xs);
+        CHECK(xs.gemm_rows > 0 && xs.gemm_rows <= 64, "empty prefetch: streaming guard would skip the call (%d rows)", xs.gemm_rows);
+        ColiVkPoolStats before, after; coli_vk_pool_stats(1, &before);
+        for (int l = 0; l < L; l++) CHECK(vkt_stream_prefetch(l, 64) == 0, "empty prefetch: unexpected cold expert");
+        coli_vk_pool_stats(1, &after);
+        CHECK(before.used == after.used && before.allocs == after.allocs && before.live == after.live,
+              "empty prefetch allocated slots: used %zu -> %zu, allocations %llu -> %llu, live %d -> %d",
+              before.used, after.used, (unsigned long long)before.allocs, (unsigned long long)after.allocs, before.live, after.live);
+        printf("  all %d experts resident: empty prefetch %zu -> %zu bytes, %llu extra tier allocations\n",
+               resident, before.used, after.used, (unsigned long long)(after.allocs - before.allocs));
+        vkt_shutdown();
+    }
+    model_free();
+    unsetenv("COLI_VK_TIER_STREAM"); unsetenv("COLI_VK_TIER_STREAM_SLOTS");
+}
+
 /* formats by layer: layer 0 Q4_K gate/up and Q5_K down (the main form), layer 1 the
  * bigger Q5_K and Q6_K, as a published GGUF gives a few layers */
 static void layers(void) {
@@ -1013,6 +1094,84 @@ static void layers(void) {
         unsetenv("COLI_VK_TIER_STREAM_SLOTS"); unsetenv("COLI_VK_TIER_STREAM_ROWS");
     }
     H = H0; F = F0;
+}
+
+/* three layers in three forms of three sizes (Q4_K/Q5_K, Q5_K/Q6_K, Q6_K/Q6_K): a room
+ * for each size, not one of the biggest form's for every form but the most common */
+static void rooms(void) {
+    const int H0 = H, F0 = F;
+    H = 512; F = 256; g_layers = LX;
+    const VktFmt q4 = {(VktSrc)(VKT_SRC_GGML + GQ_Q4_K), 0}, q5 = {(VktSrc)(VKT_SRC_GGML + GQ_Q5_K), 0},
+                 q6 = {(VktSrc)(VKT_SRC_GGML + GQ_Q6_K), 0};
+    VktFmt lgu[LX] = {q4, q5, q6}, ldn[LX] = {q5, q6, q6};
+    size_t own[LX];
+    for (int l = 0; l < LX; l++) own[l] = vkt_expert_bytes(H, F, lgu[l], ldn[l]);
+    for (int mode = 0; mode < 2; mode++) {   /* resident, evicting */
+        for (int l = 0; l < LX; l++) for (int e = 0; e < E; e++) {
+            mat_make_block(&ex[l][e].g, lgu[l], H, F); mat_make_block(&ex[l][e].u, lgu[l], H, F);
+            mat_make_block(&ex[l][e].d, ldn[l], F, H);
+        }
+        g_act = VKT_ACT_SWIGLU; g_limit = 0;
+        /* every expert's own bytes; or two of each bigger form's, four experts on average */
+        const double bytes = (mode == 0 ? (double)E * (own[0] + own[1] + own[2]) : 2.0 * (own[1] + own[2])) + 0.5 * own[0];
+        char b[64]; snprintf(b, sizeof b, "%.12f", bytes / 1073741824.0);
+        setenv("COLI_VK_TIER_GB", b, 1);
+        setenv("COLI_VK_TIER_RATE", "64", 1);
+        setenv("COLI_VK_TIER_SYNC", "1", 1);
+        VktConfig vc = cfg_of(lgu[0], ldn[0], VKT_ACT_SWIGLU, 0);
+        vc.layer_gate_up = lgu; vc.layer_down = ldn;
+        int on = vkt_init(&vc, NULL);
+        unsetenv("COLI_VK_TIER_SYNC");
+        CHECK(on, "rooms: the tier did not start");
+        if (on) {
+            Books bk = {0, 0}; double worst = 0;
+            int res[LX] = {0, 0, 0}, mid[LX] = {0, 0, 0};
+            if (mode == 0)
+                for (int t = 0; t < 6; t++)
+                    for (int l = 0; l < LX; l++) {
+                        int idx[24 * K]; float w[24 * K];
+                        route(24, 0, E, idx, w);
+                        vkt_begin_forward();
+                        double r = step(l, 24, idx, w, &bk);
+                        if (!(r <= worst)) worst = r;
+                    }
+            else   /* two experts of layers 1 and 2 settle; layer 0's take their rooms (LFRU: a few hundred
+                    * steps); then layer 2's, the biggest, are routed again and take none of layer 0's */
+                for (int t = 0; t < 480; t++) {
+                    int lay = t < 60 ? 1 + t % 2 : t < 360 ? 0 : 2, idx[4 * K]; float w[4 * K];
+                    route(4, 0, t < 60 ? K : 5, idx, w);
+                    vkt_begin_forward();
+                    double r = step(lay, 4, idx, w, &bk);
+                    if (!(r <= worst)) worst = r;
+                    if (t == 59 || t == 359) for (int l = 0; l < LX; l++) { mid[l] = res[l]; res[l] = 0; for (int e = 0; e < E; e++) res[l] += vkt_resident(l, e); }
+                    if (t == 59) CHECK(res[0] == 0 && res[1] > 0 && res[2] > 0, "rooms: layers 1 and 2 did not settle (%d, %d, %d resident)", res[0], res[1], res[2]);
+                }
+            int end[LX] = {0, 0, 0};
+            for (int l = 0; l < LX; l++) for (int e = 0; e < E; e++) end[l] += vkt_resident(l, e);
+            printf("  Q4_K/Q5_K, Q5_K/Q6_K and Q6_K/Q6_K layers, %-10s device %4llu of %4llu, resident %d %d %d",
+                   mode ? "evicting" : "resident", bk.dev, bk.routed, end[0], end[1], end[2]);
+            if (mode) printf(" (%d %d %d, then %d %d %d)", mid[0], mid[1], mid[2], res[0], res[1], res[2]);
+            printf(", worst %.2e\n", worst);
+            unsigned long long ev, failed;
+            report_counts(&ev, &failed);
+            int counted = failed != ~0ull;
+            CHECK(bk.dev > 0, "rooms: nothing ran on the device");
+            CHECK(!counted || failed == 0, "rooms: %llu uploads refused", failed);
+            CHECK(worst < 2e-3, "rooms: device rows off the reference (%.3g)", worst);
+            if (mode == 0) CHECK(end[0] + end[1] + end[2] == LX * E, "rooms: %d of %d experts resident in a budget of their own bytes",
+                                 end[0] + end[1] + end[2], LX * E);
+            else {
+                CHECK(res[0] > 0 && res[1] + res[2] < mid[1] + mid[2] && (!counted || ev > 0),
+                      "rooms: the smallest form's experts did not take the bigger forms' rooms (%d %d %d resident)", res[0], res[1], res[2]);
+                CHECK(end[0] == res[0] && end[2] <= res[2], "rooms: a bigger form's expert took a smaller one's room (%d %d %d resident)",
+                      end[0], end[1], end[2]);
+            }
+            vkt_shutdown();
+        }
+        for (int l = 0; l < LX; l++) for (int e = 0; e < E; e++) { mat_free(&ex[l][e].g); mat_free(&ex[l][e].u); mat_free(&ex[l][e].d); }
+        memset(ex, 0, sizeof ex);
+    }
+    H = H0; F = F0; g_layers = L;
 }
 
 /* A large requested step under a deliberately tiny scratch budget: reserve a
@@ -1333,12 +1492,14 @@ static unsigned long long hy_pairs(const char *line) {
     p = strstr(p, "steps, ");
     return p ? strtoull(p + 7, NULL, 10) : ~0ull;
 }
-/* vkt_host_pairs alone: 12 pairs of three experts over five rows, all at once (an expert's
- * pairs grouped, its rows read once) and one by one; the same bits, and the float reference
- * within tol (the float form's or the integer form's error, whichever vk_tier.c computes) */
+/* vkt_host_pairs alone: 12 pairs of three experts over eight rows, all at once (an expert's
+ * pairs grouped, its rows read once: 7, 3 and 2 rows, so a kernel's paths for one to four rows
+ * and past four run) and one by one; the same bits, and the float reference within tol (the
+ * float form's or the integer form's error, whichever vk_tier.c computes; FP8 has only the float
+ * form, so 1e-5 for it) */
 static void host_pairs_case(double tol) {
-    enum { HP = 512, FP = 256, NE = 3, NR = 5, NP = 12 };
-    static const int pe[NP] = {0, 1, 2, 0, 1, 0, 2, 1, 0, 2, 2, 1}, pr[NP] = {0, 0, 0, 1, 1, 2, 2, 3, 3, 3, 4, 4};
+    enum { HP = 512, FP = 256, NE = 3, NR = 8, NP = 12 };
+    static const int pe[NP] = {0, 1, 2, 0, 1, 0, 2, 0, 0, 1, 0, 0}, pr[NP] = {0, 0, 1, 1, 2, 2, 3, 3, 4, 5, 6, 7};
     /* a GGUF's block types, and colibri's int4-g64 pairs (fmt 4) and int8 a row (fmt 1), the
      * host pool's layouts of VKT_SRC_I4U_PAIRS_GS and VKT_SRC_I8_ROW */
     static const int ty[7][2] = {{GQ_Q4_K, GQ_Q6_K}, {GQ_IQ2_XXS, GQ_IQ3_XXS}, {-4, -4}, {-1, -1}, {-5, -5}, {-7, -7}, {-12, -12}};
@@ -1388,7 +1549,7 @@ static void host_pairs_case(double tol) {
         printf("  %-16s %d pairs of %d experts: grouped %s one by one, worst relative error %.2e against the float reference\n",
                nm[c], NP, NE, diff ? "DIFFERS from" : "the same bits as", worst);
         CHECK(!diff, "host pairs %s: the grouped pairs are not the bits of each on its own", nm[c]);
-        CHECK(worst < tol, "host pairs %s: relative error %.3g", nm[c], worst);
+        CHECK(worst < (ty[c][0] == -12 && tol > 1e-5 ? 1e-5 : tol), "host pairs %s: relative error %.3g", nm[c], worst);
         free(x); free(gs); free(hs); free(all); free(one); free(hr);
         for (int e = 0; e < NE; e++) { mat_free(&xe[e].g); mat_free(&xe[e].u); mat_free(&xe[e].d); }
     }
@@ -1665,11 +1826,14 @@ int main(int argc, char **argv) {
     printf("adapt:\n"); adapt();
     printf("partial:\n"); partial();
     printf("sync:\n"); sync_evict();
+    printf("give back:\n"); give_back_wait();
     printf("extra:\n"); extra();
     printf("fill:\n"); fill();   /* after extra: its exact pool capacities assume no tier came before with more experts */
     printf("DeepSeek V4:\n"); v4_act();
     printf("stream:\n"); stream();
+    printf("empty prefetch:\n"); empty_prefetch();
     printf("layers:\n"); layers();
+    printf("rooms:\n"); rooms();
     printf("promote:\n"); promote_case();
     printf("hybrid:\n");
     hybrid_case((VktFmt){(VktSrc)(VKT_SRC_GGML + GQ_Q4_K), 0}, (VktFmt){(VktSrc)(VKT_SRC_GGML + GQ_Q6_K), 0}, "Q4_K/Q6_K");

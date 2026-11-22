@@ -129,8 +129,8 @@ class FamilyRegistryTest(unittest.TestCase):
         # `logprobs_echo` is the numeric logprobs/echo channel: the engine emits one ECHO
         # frame per prompt position it read out, position 0 included. `submit_gbytes` is
         # the header SHAPE -- the seventh numeric field coli_submit_parse reads, which a
-        # sibling engine's six-field parser would take for a malformed key and answer with
-        # "bad submit extension". Neither is published metadata: they describe the engine
+        # sibling engine's six-field parser would take for a malformed key and refuse
+        # ("bad submit header"). Neither is published metadata: they describe the engine
         # link, not the user surface.
         by_id, _ = _build_registry(FAMILIES)
         for family_id, echo, gbytes in (("glm", True, True), ("mimo", True, True),
@@ -153,8 +153,8 @@ class FamilyRegistryTest(unittest.TestCase):
         for family_id, expected in (("glm53", True), ("qwen38", True), ("qwen36", True),
                                     ("deepseek_v41", True), ("mimo", True),
                                     ("glm", True),   # Mistral-Large-4's pictures (expand_ml4_images); GLM-5.2's engine says vision=0
-                                    ("kimi", False),
-                                    ("inkling", False), ("olmoe", False),
+                                    ("inkling", True),   # Inkling-2's pictures (expand_inkling2_images); Inkling's renderer refuses them
+                                    ("kimi", False), ("olmoe", False),
                                     ("deepseek_v4", False), ("qwen_image", False)):
             with self.subTest(family=family_id):
                 self.assertIs(by_id[family_id].capabilities.image, expected)
@@ -1100,7 +1100,8 @@ class FamilyRegistryTest(unittest.TestCase):
         source = cli_path.read_text(encoding="utf-8")
         self.assertNotRegex(source, r"family\.(?:cli|gateway)_adapter\s+not in")
         self.assertNotIn("K3CHAT1", source)
-        self.assertEqual(source.count("if not family.has_gateway_adapter:"), 3)
+        # tune, chat, serve and tui start the gateway: each checks the adapter first
+        self.assertEqual(source.count("if not family.has_gateway_adapter:"), 4)
         self.assertEqual(source.count("if not family.has_cli_adapter:"), 1)
         self.assertEqual(set(openai_server.family_ids()),
                          {family.id for family in FAMILIES})
@@ -1144,11 +1145,9 @@ class FamilyRegistryTest(unittest.TestCase):
             "inkling": "<|user|>hello {world}<|assistant|>",
             "kimi": "K3CHAT1\nM user 13\nhello {world}G 0\n\n",
             "olmoe": "<|user|>\nhello {world}\n<|assistant|>\n",
-            # Qwen3.6's generation prompt MUST open <think>: the model was
-            # never trained on the bare "assistant\\n" state and greedy argmax
-            # there lands on an EOS special (measured gen=0).
-            "qwen36": "<|im_start|>user\nhello {world}<|im_end|>\n"
-                      "<|im_start|>assistant\n<think>\n",
+            # qwen36's checkpoints ship different templates: `coli tune` renders
+            # through the gateway (tune_renders_chat, tests/test_tune_chat_prompt.py)
+            "qwen36": "hello {world}",
             "qwen38": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully "
                       "through the task, validate key assumptions, consider plausible alternatives, "
                       "and prioritize correctness, consistency, and clarity in the final answer."

@@ -31,13 +31,23 @@
 #include <immintrin.h>
 #endif
 
-enum { QI_F32 = 0, QI_BF16 = 1, QI_I8 = 2 };
+enum { QI_F32 = 0, QI_BF16 = 1, QI_I8 = 2, QI_GG = 3 };
+
+/* QI_GG: the rows of a GGUF tensor as the file has them (a ggml type's blocks), decoded
+ * while a panel is packed by the caller's decoder (gq_dequant_row: this header does not
+ * know the types). w points at a QiGG. A row is rb bytes; a panel's KC columns start at a
+ * block boundary, so K is a multiple of QI_KC (qi_gg_ok). sc holds the int8 scale of each
+ * decoded row, the one qi_quantize_i8 gives: the int8 x int8 product packs exactly the int8
+ * rows that quantizing the decoded matrix at load would have kept, with the file's bytes in
+ * memory. */
+typedef int (*qi_rowdec_fn)(int type, const uint8_t *src, float *dst, int64_t n);
+typedef struct { const uint8_t *data; int64_t rb; int gt; qi_rowdec_fn dec; } QiGG;
 
 typedef struct {
-    int fmt;            /* QI_F32 | QI_BF16 | QI_I8 */
+    int fmt;            /* QI_F32 | QI_BF16 | QI_I8 | QI_GG */
     int N, K;           /* rows (outputs) x columns (inputs) */
-    const void *w;      /* [N][K] in fmt */
-    const float *sc;    /* QI_I8: one scale per row; NULL otherwise */
+    const void *w;      /* [N][K] in fmt; QI_GG: a QiGG */
+    const float *sc;    /* QI_I8, QI_GG: one scale per row; NULL otherwise */
     int ld;             /* row stride in elements, 0 = K. Lets attention read one head's
                          * columns of K straight out of the [T][heads*hd] projection. */
 } QiMat;
@@ -52,11 +62,18 @@ static inline float qi_bf16(uint16_t h){ union { uint32_t u; float f; } v; v.u =
 /* Pack W rows [n0, n0+nr) x columns [k0, k0+kc) as f32, k-major: panel[k*QI_NR + j].
  * Rows past nr are zero so the kernel never branches on the edge. The int8 scale
  * is applied here, so the kernel is the same for every format. */
+static inline int qi_gg_ok(int K){ return K > 0 && K % QI_KC == 0; }
+
 static void qi_pack_w(float *panel, const QiMat *W, int n0, int nr, int k0, int kc){
     for (int j = 0; j < QI_NR; j++) {
         if (j >= nr) { for (int k = 0; k < kc; k++) panel[k*QI_NR + j] = 0.f; continue; }
         int64_t row = (int64_t)(n0 + j) * (W->ld ? W->ld : W->K) + k0;
-        if (W->fmt == QI_F32) {
+        if (W->fmt == QI_GG) {
+            const QiGG *g = (const QiGG *)W->w;
+            float v[QI_KC];
+            g->dec(g->gt, g->data + (int64_t)(n0 + j) * g->rb + (int64_t)k0 * g->rb / W->K, v, kc);
+            for (int k = 0; k < kc; k++) panel[k*QI_NR + j] = v[k];
+        } else if (W->fmt == QI_F32) {
             const float *s = (const float *)W->w + row;
             for (int k = 0; k < kc; k++) panel[k*QI_NR + j] = s[k];
         } else if (W->fmt == QI_BF16) {
@@ -179,13 +196,49 @@ static inline void qi_gemm(float *Y, const float *X, int M, const QiMat *W, cons
 #define QI_DPBUSD(acc, a, b) _mm256_dpbusd_avx_epi32(acc, a, b)
 #endif
 
+/* A QI_GG row decoded and quantized to int8 with its scale: qi_quantize_i8's rounding, so
+ * the bytes are those of the decoded matrix quantized at load. f and q hold K each. */
+static void qi_gg_row_i8(const QiMat *W, int n, float *f, int8_t *q){
+    const int K = W->K;
+    const QiGG *g = (const QiGG *)W->w;
+    g->dec(g->gt, g->data + (int64_t)n * g->rb, f, K);
+    const float inv = 1.f / W->sc[n];
+    int k = 0;
+    /* eight at a time, the scalar loop's operations (the product, +-0.5 as v < 0 picks it,
+     * truncation, the clamp): the same bytes, several times faster (this loop was most of
+     * the pack's time, and the pack is a step's extra time over int8 rows) */
+    const __m256 vinv = _mm256_set1_ps(inv), half = _mm256_set1_ps(0.5f), mhalf = _mm256_set1_ps(-0.5f);
+    const __m256i hi = _mm256_set1_epi32(127), lo = _mm256_set1_epi32(-127);
+    for (; k + 32 <= K; k += 32) {
+        __m256i r[4];
+        for (int j = 0; j < 4; j++) {
+            __m256 v = _mm256_mul_ps(_mm256_loadu_ps(f + k + 8 * j), vinv);
+            __m256 neg = _mm256_cmp_ps(v, _mm256_setzero_ps(), _CMP_LT_OQ);
+            __m256i iv = _mm256_cvttps_epi32(_mm256_add_ps(v, _mm256_blendv_ps(half, mhalf, neg)));
+            r[j] = _mm256_max_epi32(_mm256_min_epi32(iv, hi), lo);
+        }
+        __m256i p8 = _mm256_packs_epi16(_mm256_packs_epi32(r[0], r[1]), _mm256_packs_epi32(r[2], r[3]));
+        p8 = _mm256_permutevar8x32_epi32(p8, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));   /* the packs interleave lanes */
+        _mm256_storeu_si256((__m256i *)(q + k), p8);
+    }
+    for (; k < K; k++) {
+        float v = f[k] * inv;
+        int iv = (int)(v < 0 ? v - 0.5f : v + 0.5f);
+        if (iv > 127) iv = 127;
+        if (iv < -127) iv = -127;
+        q[k] = (int8_t)iv;
+    }
+}
+
 /* W rows [n0, n0+nr), all K (padded to Kp, a multiple of 4), as [Kp/4][16][4]
- * bytes, plus the sum of each row for the +128 correction. */
-static void qi_pack_w8(int8_t *panel, int32_t *wsum, const QiMat *W, int n0, int nr, int Kp){
+ * bytes, plus the sum of each row for the +128 correction. gf, gq: QI_GG's row buffers. */
+static void qi_pack_w8(int8_t *panel, int32_t *wsum, const QiMat *W, int n0, int nr, int Kp, float *gf, int8_t *gq){
     const int K = W->K, ld = W->ld ? W->ld : K;
     for (int j = 0; j < QI_NR; j++) {
         int32_t s = 0;
-        const int8_t *r = j < nr ? (const int8_t *)W->w + (int64_t)(n0 + j) * ld : NULL;
+        const int8_t *r = NULL;
+        if (j < nr && W->fmt == QI_GG) { qi_gg_row_i8(W, n0 + j, gf, gq); r = gq; }
+        else if (j < nr) r = (const int8_t *)W->w + (int64_t)(n0 + j) * ld;
         for (int k = 0; k < Kp; k++) {
             int8_t v = r && k < K ? r[k] : 0;
             panel[(k >> 2) * (QI_NR * 4) + j * 4 + (k & 3)] = v;
@@ -233,11 +286,11 @@ static void qi_kernel8(float *Y, int ldy, const uint8_t *X, int Kp, const int8_t
 }
 #endif
 
-/* Y = X . W^T with X quantized to int8 per row. W must be QI_I8. */
+/* Y = X . W^T with X quantized to int8 per row. W must be QI_I8 or QI_GG. */
 static void qi_gemm_act8(float *Y, int ldy, const float *X, int ldx, int M, const QiMat *W, const float *bias){
 #ifdef QI_HAVE_VNNI
     const int N = W->N, K = W->K, Kp = (K + 3) & ~3;
-    if (W->fmt != QI_I8 || M <= 0 || N <= 0) { qi_gemm_ld(Y, ldy, X, ldx, M, W, bias); return; }
+    if ((W->fmt != QI_I8 && W->fmt != QI_GG) || M <= 0 || N <= 0) { qi_gemm_ld(Y, ldy, X, ldx, M, W, bias); return; }
     uint8_t *xq = (uint8_t *)malloc((size_t)M * Kp);
     float *sx = (float *)malloc(sizeof(float) * (size_t)M);
     if (!xq || !sx) { fprintf(stderr, "OOM qi_gemm_act8\n"); exit(1); }
@@ -253,24 +306,49 @@ static void qi_gemm_act8(float *Y, int ldy, const float *X, int ldx, int M, cons
         for (int k = K; k < Kp; k++) d[k] = 128;
     }
     const int nblocks = (N + QI_NR - 1) / QI_NR, mblocks = (M + QI_MC - 1) / QI_MC;
+    /* The packed panel depends on the weights only, so hoist it out of the
+     * m-loop when there are enough n-panels to keep every thread busy. A narrow
+     * N keeps the (n-panel, m-block) tiles, whose redundancy buys parallelism. */
+    int want = 1;
+#ifdef _OPENMP
+    want = omp_get_max_threads();
+#endif
     #pragma omp parallel
     {
         int8_t *panel = (int8_t *)malloc((size_t)Kp * QI_NR);
         int32_t wsum[QI_NR];
-        if (!panel) { fprintf(stderr, "OOM qi_gemm_act8 panel\n"); exit(1); }
-        #pragma omp for schedule(dynamic, 1) collapse(2)
-        for (int nb = 0; nb < nblocks; nb++)
-            for (int mb = 0; mb < mblocks; mb++) {
+        float *gf = W->fmt == QI_GG ? (float *)malloc((size_t)K * sizeof(float)) : NULL;
+        int8_t *gq = W->fmt == QI_GG ? (int8_t *)malloc((size_t)K) : NULL;
+        if (!panel || (W->fmt == QI_GG && (!gf || !gq))) { fprintf(stderr, "OOM qi_gemm_act8 panel\n"); exit(1); }
+        if (nblocks >= 2 * want) {
+            #pragma omp for schedule(dynamic, 1)
+            for (int nb = 0; nb < nblocks; nb++) {
                 int n0 = nb * QI_NR, nr = N - n0 < QI_NR ? N - n0 : QI_NR;
-                int m0 = mb * QI_MC, mc = M - m0 < QI_MC ? M - m0 : QI_MC;
-                qi_pack_w8(panel, wsum, W, n0, nr, Kp);
-                for (int i = 0; i < mc; i += QI_MR) {
-                    int mr = mc - i < QI_MR ? mc - i : QI_MR;
-                    qi_kernel8(Y + (int64_t)(m0 + i) * ldy + n0, ldy, xq + (int64_t)(m0 + i) * Kp, Kp,
-                               panel, wsum, sx + m0 + i, W->sc + n0, mr, nr, bias ? bias + n0 : NULL);
+                qi_pack_w8(panel, wsum, W, n0, nr, Kp, gf, gq);
+                for (int mb = 0; mb < mblocks; mb++) {
+                    int m0 = mb * QI_MC, mc = M - m0 < QI_MC ? M - m0 : QI_MC;
+                    for (int i = 0; i < mc; i += QI_MR) {
+                        int mr = mc - i < QI_MR ? mc - i : QI_MR;
+                        qi_kernel8(Y + (int64_t)(m0 + i) * ldy + n0, ldy, xq + (int64_t)(m0 + i) * Kp, Kp,
+                                   panel, wsum, sx + m0 + i, W->sc + n0, mr, nr, bias ? bias + n0 : NULL);
+                    }
                 }
             }
-        free(panel);
+        } else {
+            #pragma omp for schedule(dynamic, 1) collapse(2)
+            for (int nb = 0; nb < nblocks; nb++)
+                for (int mb = 0; mb < mblocks; mb++) {
+                    int n0 = nb * QI_NR, nr = N - n0 < QI_NR ? N - n0 : QI_NR;
+                    int m0 = mb * QI_MC, mc = M - m0 < QI_MC ? M - m0 : QI_MC;
+                    qi_pack_w8(panel, wsum, W, n0, nr, Kp, gf, gq);
+                    for (int i = 0; i < mc; i += QI_MR) {
+                        int mr = mc - i < QI_MR ? mc - i : QI_MR;
+                        qi_kernel8(Y + (int64_t)(m0 + i) * ldy + n0, ldy, xq + (int64_t)(m0 + i) * Kp, Kp,
+                                   panel, wsum, sx + m0 + i, W->sc + n0, mr, nr, bias ? bias + n0 : NULL);
+                    }
+                }
+        }
+        free(panel); free(gf); free(gq);
     }
     free(xq); free(sx);
 #else

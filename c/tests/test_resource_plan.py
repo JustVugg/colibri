@@ -14,7 +14,9 @@ from resource_plan import (
     CgroupFormatError,
     analyze_model,
     build_plan,
+    chat_context,
     cpu_socket_count,
+    darwin_available_bytes,
     discover_gpus,
     environment_for_plan,
     format_plan,
@@ -25,6 +27,7 @@ from resource_plan import (
     physical_cpu_count,
     read_ssd_probe,
     ssd_probe_state,
+    team_cpu_count,
 )
 
 
@@ -73,6 +76,26 @@ def write_shard(path, tensors, f32_fill=None):
                     stream.seek(base + start)
                     stream.write(f32_fill * ((end - start) // 4))
         stream.truncate(base + offset)
+
+
+def write_gguf(path, tensors, arch, blocks):
+    """A GGUF v3 file as tools/gguf_reader.py reads it: (name, ggml type, dims in ggml
+    order) tensors of type 0 (F32) or 8 (Q8_0), the payload extended as write_shard's."""
+    def text(value):
+        return struct.pack("<Q", len(value.encode())) + value.encode()
+    out = b"GGUF" + struct.pack("<IQQ", 3, len(tensors), 2)
+    out += text("general.architecture") + struct.pack("<I", 8) + text(arch)
+    out += text(f"{arch}.block_count") + struct.pack("<II", 4, blocks)
+    offset = 0
+    for name, kind, dims in tensors:
+        count = 1
+        for dim in dims:
+            count *= dim
+        out += text(name) + struct.pack(f"<I{len(dims)}QIQ", len(dims), *dims, kind, offset)
+        offset += -(-(count * 4 if kind == 0 else count // 32 * 34) // 32) * 32
+    with path.open("wb") as stream:
+        stream.write(out)
+        stream.truncate(-(-len(out) // 32) * 32 + offset)
 
 
 class ShardFixtureTest(unittest.TestCase):
@@ -663,6 +686,60 @@ class ResourcePlanTest(unittest.TestCase):
             self.assertEqual(ram["sequence_state_bytes"], 2 * 32 * 4 * 8 * 2 * 4)
             self.assertEqual(ram["fixed_state_bytes"], 0)
 
+    def test_olmoe_plans_the_cache_olmoe_sizes_itself(self):
+        # #2785: the plan reserves what olmoe.c reserves (model_init_range): 0.5 GB of
+        # activations beside the resident dense, not colibri.c's 1.2 + 2.5 GB and 64
+        # experts. The KV of the planned context stays on top: the engine's own cache
+        # gives that back as the KV grows (kv_room_fit). OLMoE-1B-7B's geometry, as
+        # convert_olmoe_merged.py writes it (int8, one expert per layer, the BF16
+        # embedding for the dense) and as `coli import` links a Q8_0 GGUF (two experts
+        # per layer, every dense tensor).
+        hidden, inter, layers, experts, vocab = 2048, 1024, 16, 64, 50304
+        config = json.dumps({
+            "model_type": "olmoe", "num_hidden_layers": layers, "hidden_size": hidden,
+            "num_attention_heads": 16, "num_key_value_heads": 16, "num_experts": experts,
+            "num_experts_per_tok": 8, "intermediate_size": inter, "vocab_size": vocab})
+        merged, gguf = self.model / "merged", self.model / "gguf"
+        for folder in (merged, gguf):
+            folder.mkdir()
+            (folder / "config.json").write_text(config)
+        tensors = [("model.embed_tokens.weight", vocab * hidden * 2, "BF16", [vocab, hidden])]
+        for i in range(layers):
+            p = f"model.layers.{i}.mlp.experts.0."
+            tensors += [(p + "merged_weight", 3 * inter * hidden, "I8", [3 * inter * hidden]),
+                        (p + "qs", (2 * inter + hidden) * 4, "F32", [2 * inter + hidden])]
+        write_shard(merged / "model.safetensors", tensors)
+        q8, f32 = 8, 0
+        tensors = [("token_embd.weight", q8, [hidden, vocab]), ("output.weight", q8, [hidden, vocab]),
+                   ("output_norm.weight", f32, [hidden])]
+        for i in range(layers):
+            tensors += [(f"blk.{i}.{name}.weight", q8, [hidden, hidden])
+                        for name in ("attn_q", "attn_k", "attn_v", "attn_output")]
+            tensors += [(f"blk.{i}.{name}.weight", f32, [hidden])
+                        for name in ("attn_norm", "attn_q_norm", "attn_k_norm", "ffn_norm")]
+            tensors += [(f"blk.{i}.ffn_gate_inp.weight", f32, [hidden, experts]),
+                        (f"blk.{i}.ffn_gate_exps.weight", q8, [hidden, inter, 2]),
+                        (f"blk.{i}.ffn_up_exps.weight", q8, [hidden, inter, 2]),
+                        (f"blk.{i}.ffn_down_exps.weight", q8, [inter, hidden, 2])]
+        write_gguf(gguf / "olmoe.gguf", tensors, arch="olmoe", blocks=layers)
+        (gguf / "gguf.json").write_text(json.dumps({"gguf": "olmoe.gguf"}))
+        slot = {merged: hidden * inter * 3 + (inter * 2 + hidden) * 4,   # olmoe.c slot_bytes()
+                gguf: 3 * hidden * inter // 32 * 34}                      # Q8_0 blocks
+        # what _discover_metal_gpus reports for an M1 Pro: no placement budget
+        metal = [{"index": 0, "name": "Apple M1 Pro", "total_bytes": 0, "free_bytes": None,
+                  "unified_memory": True, "backend": "metal"}]
+        for model, ram_gb, available, planned in ((merged, 0, 8 * GB, 52), (merged, 0, 11 * GB, 64),
+                                                  (gguf, 8, 8 * GB, 55), (gguf, 0, 8 * GB, 46)):
+            with self.subTest(model=model.name, ram_gb=ram_gb, available=available):
+                plan = build_plan(model, ram_gb=ram_gb, context=4096, available_memory=available,
+                                  available_disk=1, gpus=metal, physical_cpus=8,
+                                  cpu_sockets=1, env={})
+                ram = plan["tiers"]["ram"]
+                room = ram["budget_bytes"] - ram["dense_bytes"] - GB // 2 - ram["sequence_state_bytes"]
+                self.assertEqual(ram["cache_slots_per_layer"],
+                                 min(experts, room // (slot[model] * layers)))
+                self.assertEqual(ram["cache_slots_per_layer"], planned)
+
     def test_glm_dsa_state_is_charged_only_when_every_indexer_weight_exists(self):
         config = json.loads((self.model / "config.json").read_text())
         config.update({"index_head_dim": 16,
@@ -1018,6 +1095,8 @@ memInfo.free:                     23.50 GB (97%)
             with mock.patch("resource_plan.subprocess.run",
                             return_value=lscpu(blob)), \
                  mock.patch("resource_plan.performance_core_count", return_value=None), \
+                 mock.patch("resource_plan.cgroup_cpu_quota", return_value=None), \
+                 mock.patch("resource_plan.allowed_cpu_count", return_value=None), \
                  mock.patch.object(sys, "platform", "linux"):
                 plan = build_plan(self.model, available_memory=16 * GB,
                                   available_disk=1, gpus=[])
@@ -1027,12 +1106,42 @@ memInfo.free:                     23.50 GB (97%)
         # a hybrid CPU: the team is its performance cores, the physical count stays
         with mock.patch("resource_plan.subprocess.run", return_value=lscpu(layouts["2-col (-p=core,socket)"])), \
              mock.patch("resource_plan.performance_core_count", return_value=4), \
+             mock.patch("resource_plan.cgroup_cpu_quota", return_value=None), \
+             mock.patch("resource_plan.allowed_cpu_count", return_value=None), \
              mock.patch.object(sys, "platform", "linux"):
             plan = build_plan(self.model, available_memory=16 * GB, available_disk=1, gpus=[])
             env = environment_for_plan(plan)
         self.assertEqual((plan["cpu"]["physical_cores"], plan["cpu"]["team_threads"]), (12, 4))
         self.assertEqual(plan["cpu"]["thread_policy"], "performance-cores")
         self.assertEqual(env["OMP_NUM_THREADS"], "4")
+
+    def test_auto_tier_thread_count_stays_within_a_cpu_quota_and_the_affinity_mask(self):
+        # #2914: the launcher's default team sees a container's CPU quota and its
+        # cpuset (team_cpu_count). The plan's team is that default too: 48 cores
+        # under a cpu.max of 7.65 CPUs plan 7 threads, and the count of cores stays
+        # the hardware's.
+        def planned(quota, allowed, **named):
+            with mock.patch("resource_plan.physical_cpu_count", return_value=48), \
+                 mock.patch("resource_plan.performance_core_count", return_value=None), \
+                 mock.patch("resource_plan.cgroup_cpu_quota", return_value=quota), \
+                 mock.patch("resource_plan.allowed_cpu_count", return_value=allowed):
+                plan = build_plan(self.model, available_memory=16 * GB, available_disk=1,
+                                  gpus=[], cpu_sockets=1, **named)
+                return plan["cpu"], environment_for_plan(plan)["OMP_NUM_THREADS"], team_cpu_count()
+        cpu, threads, launcher_default = planned(7.65, None)
+        self.assertEqual((cpu["physical_cores"], cpu["team_threads"], cpu.get("limit_threads")), (48, 7, 7))
+        self.assertEqual((threads, launcher_default), ("7", 7))
+        cpu, threads, launcher_default = planned(None, 8)
+        self.assertEqual((cpu["team_threads"], cpu.get("limit_threads")), (8, 8))
+        self.assertEqual((threads, launcher_default), ("8", 8))
+        # no limit, or one looser than the cores: the block is the one it was, so the
+        # fingerprint of a tuning profile saved on such a machine does not move
+        unlimited = {"physical_cores": 48, "sockets": 1, "team_threads": 48,
+                     "thread_policy": "physical-cores"}
+        for quota, allowed in ((None, None), (64.0, None), (None, 96)):
+            self.assertEqual(planned(quota, allowed)[0], unlimited, (quota, allowed))
+        # a caller that names the cores is not probed, as for the performance cores
+        self.assertEqual(planned(7.65, 8, physical_cpus=48)[0], unlimited)
 
     def test_plan_does_not_set_omp_affinity_vars(self):
         # The real #325 regression: --auto-tier set OMP_PROC_BIND=spread +
@@ -1399,9 +1508,11 @@ memInfo.free:                     23.50 GB (97%)
         kwargs = dict(context=32, available_memory=16 * GB, available_disk=16 * GB, gpus=[],
                       vulkan={"type": "discrete", "budget_bytes": 16 * GB})
         on = {"COLI_VULKAN": "1", "COLI_VK_DENSE_HOST": "0"}
-        host = build_plan(model, env=dict(on, COLI_VK_DENSE_HOST="1"), **kwargs)["tiers"]["ram"]
         for bits, credit in (("8", 4096), ("4", 2048), ("16", 0)):
             with self.subTest(bits=bits):
+                # the host copy at the same width (_q36_dense_tensors prices the int8 trunk's)
+                host = build_plan(model, env=dict(on, COLI_VK_DENSE_HOST="1", COLI_DENSE_BITS=bits),
+                                  **kwargs)["tiers"]["ram"]
                 ram = build_plan(model, env=dict(on, COLI_DENSE_BITS=bits), **kwargs)["tiers"]["ram"]
                 self.assertEqual(ram["dense_on_device_bytes"], credit)
                 self.assertEqual(ram["dense_bytes"], host["dense_bytes"] - credit)
@@ -1455,6 +1566,27 @@ memInfo.free:                     23.50 GB (97%)
                     self.assertEqual(ram["dense_on_device_bytes"], 0)
                     self.assertEqual(ram["dense_bytes"], cpu["dense_bytes"])
                     self.assertEqual(ram["expert_cache_bytes"], cpu["expert_cache_bytes"])
+
+    def test_vulkan_plan_sizes_the_device_coli_vk_dev_names(self):
+        """#2127: two discrete GPUs, the small one enumerated first. The engine opens
+        COLI_VK_DEV's device; the plan sized the ranking's first discrete one."""
+        self.write_qwen38()
+        MiB = 1 << 20
+        kwargs = dict(context=64, ram_gb=4, available_memory=16 * GB,
+                      available_disk=16 * GB, gpus=[])
+        small = {"name": "RTX 3050", "type": "discrete", "budget_bytes": GB + MiB}
+        large = {"name": "RTX 5060 Ti", "type": "discrete", "budget_bytes": 16 * GB}
+        with mock.patch("setup_hw.detect_vulkan", return_value={"devices": [small, large]}):
+            ranked = build_plan(self.model, env={"COLI_VULKAN": "1"}, **kwargs)
+            chosen = build_plan(self.model, env={"COLI_VULKAN": "1", "COLI_VK_DEV": "1"}, **kwargs)
+            ignored = build_plan(self.model, env={"COLI_VULKAN": "1", "COLI_VK_DEV": "2"}, **kwargs)
+        self.assertEqual(ranked["vulkan"]["name"], "RTX 3050")
+        self.assertEqual(ranked["tiers"]["ram"]["dense_on_device_bytes"], 0)
+        self.assertEqual(chosen["vulkan"]["name"], "RTX 5060 Ti")
+        self.assertGreater(chosen["tiers"]["ram"]["dense_on_device_bytes"], 0)
+        self.assertIn("Vulkan · RTX 5060 Ti", format_plan(chosen))
+        # out of range: the engine ignores it and ranks, and so does the plan
+        self.assertEqual(ignored["vulkan"]["name"], "RTX 3050")
 
     def test_vulkan_device_only_decision_follows_the_engine_rule(self):
         from resource_plan import vk_dense_device_only
@@ -1614,6 +1746,28 @@ memInfo.free:                     23.50 GB (97%)
                 json.dumps(dict(geometry, format="colibri.qwen38.experts-int2g32", record_bytes=60, complete=False)))
             plan = build_plan(self.model, context=64, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
             self.assertEqual(plan["model"]["per_cap_bytes"], 384)
+
+    def test_qwen38_sidecar_only_checkpoint_prices_every_layer(self):
+        # A checkpoint whose shards carry no routed experts, the sidecar being their only copy:
+        # its layers come from the index. Priced by the shards' layers (none) the cap came out
+        # 0 with the MTP head off, and with the head on it was the head's record alone.
+        self.write_qwen38()
+        write_shard(self.model / "model.safetensors",
+                    [("model.embed_tokens.weight", 256, "BF16", [16, 8]),
+                     ("model.layers.0.mlp.gate.weight", 1024, "BF16", [2, 256])])
+        geometry = {"version": 1, "complete": True, "layers": 2, "experts": 2,
+                    "hidden_size": 8, "moe_intermediate_size": 4, "record_bytes": 53}
+        (self.model / "experts-vq2g32").mkdir()
+        (self.model / "experts-vq2g32" / "index.json").write_text(
+            json.dumps(dict(geometry, format="colibri.qwen38.experts-vq2g32")))
+        with mock.patch.dict(os.environ, {"Q38_EXPERT_LOWBIT": "vq2g32", "Q38_MTP": "0"}):
+            os.environ.pop("Q38_EXPERT_INT4", None)
+            plan = build_plan(self.model, context=64, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+        model = plan["model"]
+        self.assertTrue(model["qwen38_int4_experts"])
+        self.assertEqual((model["per_cap_bytes"], model["expert_bytes"]), (106, 212))
+        self.assertEqual(plan["tiers"]["ram"]["cache_slots_per_layer"], 2)
+        self.assertNotIn("RAM budget cannot hold one expert slot per sparse layer", plan["warnings"])
 
     def test_cli_emits_versioned_json(self):
         cli = Path(__file__).parents[1] / "coli"
@@ -1798,6 +1952,10 @@ memInfo.free:                     23.50 GB (97%)
         text = format_plan(plan)
         self.assertIn("next actions:", text)
         self.assertIn("coli tune --model <model>", text)
+        action = plan["next_actions"][0]
+        self.assertIn('iobench "<model-shard>" 19 64 8 1', action["command"])
+        self.assertIn(action["command"], text)
+        self.assertIn("existing model weight file of at least 38 MiB", text)
 
     def test_trusted_storage_probe_removes_probe_action(self):
         info = analyze_model(self.model)
@@ -2125,6 +2283,51 @@ class VulkanPartialChainQwenOlmoeTest(unittest.TestCase):
                 tensors.append((p + f"mlp.experts.{e}.qs", (2 * 32 + 64) * 4, "F32", [2 * 32 + 64]))
         write_shard(self.model / "model.safetensors", tensors, f32_fill=f32_fill)
         return analyze_model(self.model)
+
+    def test_qwen36_dense_weights_priced_as_the_engine_holds_them(self):
+        # qwen36.c's int8 trunk: load_tq's matrices as int8 rows and a float32 scale a row,
+        # the vectors and the small matrices (in_proj_a/b, conv taps, the shared expert's
+        # gate) in float32, the embedding read in place; the fixture is F16
+        import resource_plan
+        on_linux = mock.patch.object(resource_plan.sys, "platform", "linux")   # macOS keeps the old pricing (below)
+        on_linux.start()
+        self.addCleanup(on_linux.stop)
+        info = self.write_qwen36()
+        attention = (8192 + 512) + 2 * (2048 + 128) + (4096 + 256) + 2 * 16 * 4   # q, k, v, o, q/k norms
+        deltanet = (2 * 8 + 512 + 2 * 512 + 8) * 4 + (8192 + 512) + 2 * (4096 + 256)   # vectors, taps, a/b; qkv, z, out
+        mlp = (512 + 32) + 2 * (2048 + 128) + (2048 + 256) + 64 * 4   # router, shared gate/up/down, its gate
+        held = (20480 + 1280) + 64 * 4 + 8 * 2 * 64 * 4 + 2 * attention + 6 * deltanet + 8 * mlp
+        kwargs = dict(context=64, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+        cpu = build_plan(self.model, env={}, **kwargs)
+        self.assertEqual(cpu["model"]["dense_bytes"], held)
+        self.assertEqual(cpu["model"]["embed_bytes"], 0)
+        self.assertLess(held, info["dense_disk_bytes"])
+        # a Vulkan run keeps the float32 table; another trunk keeps the checkpoint's bytes
+        vk = build_plan(self.model, env={"COLI_VULKAN": "1", "COLI_VK_DENSE_HOST": "1"}, **kwargs)
+        self.assertEqual(vk["model"]["embed_bytes"], 320 * 64 * 4)
+        for env in ({"COLI_DENSE_I8": "0"}, {"COLI_DENSE_BITS": "16"}, {"COLI_KEEP_F32": "1"}):
+            with self.subTest(env=env):
+                self.assertEqual(build_plan(self.model, env=env, **kwargs)["model"]["dense_bytes"],
+                                 info["dense_bytes"])
+        # the Metal graph reads the checkpoint's dense weights in place: macOS keeps the checkpoint's bytes
+        with mock.patch.object(resource_plan.sys, "platform", "darwin"):
+            self.assertEqual(build_plan(self.model, env={}, **kwargs)["model"]["dense_bytes"], info["dense_bytes"])
+        # what the held bytes give back goes to the experts' cache
+        f32 = build_plan(self.model, env={"COLI_DENSE_I8": "0"}, **kwargs)
+        self.assertEqual(cpu["tiers"]["ram"]["expert_cache_bytes"] - f32["tiers"]["ram"]["expert_cache_bytes"],
+                         info["dense_bytes"] - held)
+
+    def test_qwen36_kv_priced_as_float16_unless_q36_kv_f32(self):
+        # kv16.h: K and V as float16 by default; the default context keeps its float32 steps
+        self.write_qwen36()
+        kwargs = dict(context=4096, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+        half = build_plan(self.model, env={}, **kwargs)["tiers"]["ram"]
+        full = build_plan(self.model, env={"Q36_KV": "f32"}, **kwargs)["tiers"]["ram"]
+        self.assertEqual(2 * half["sequence_state_bytes"], full["sequence_state_bytes"])
+        self.assertEqual(full["runtime_bytes"] - half["runtime_bytes"], half["sequence_state_bytes"])
+        for avail in (8 * GB, 32 * GB):
+            self.assertEqual(chat_context(self.model, env={}, available=avail),
+                             chat_context(self.model, env={"Q36_KV": "f32"}, available=avail))
 
     def test_cuda_plan_leaves_qwen36_tier_to_size_each_card(self):
         # qwen36_tier.c reads CUDA_EXPERT_GB as GiB for each card: the plan's GB
@@ -3056,10 +3259,14 @@ class PerformanceCoreCountTest(unittest.TestCase):
     def test_team_falls_back_to_the_physical_cores(self):
         import resource_plan
         with mock.patch("resource_plan.performance_core_count", return_value=None), \
-             mock.patch("resource_plan.physical_cpu_count", return_value=8):
+             mock.patch("resource_plan.physical_cpu_count", return_value=8), \
+             mock.patch("resource_plan.cgroup_cpu_quota", return_value=None), \
+             mock.patch("resource_plan.allowed_cpu_count", return_value=None):
             self.assertEqual(resource_plan.team_cpu_count(), 8)
         with mock.patch("resource_plan.performance_core_count", return_value=6), \
-             mock.patch("resource_plan.physical_cpu_count", return_value=14):
+             mock.patch("resource_plan.physical_cpu_count", return_value=14), \
+             mock.patch("resource_plan.cgroup_cpu_quota", return_value=None), \
+             mock.patch("resource_plan.allowed_cpu_count", return_value=None):
             self.assertEqual(resource_plan.team_cpu_count(), 6)
 
 
@@ -3088,6 +3295,15 @@ class PhysicalCpuCountTest(unittest.TestCase):
                     rows.append(f"{cpu},{core},{sock}")
                     cpu += 1
         return "# CPU,Core,Socket\n" + "\n".join(rows)
+
+    def test_freebsd_reads_kern_smp_cores(self):
+        # FreeBSD has no lscpu: the cores come from the kern.smp.cores sysctl, which
+        # counts a core once with SMT on (40 here, not the 80 logical CPUs)
+        with mock.patch("resource_plan.subprocess.run", return_value=self._lscpu("40\n")) as run, \
+             mock.patch.object(sys, "platform", "freebsd15"), \
+             mock.patch("resource_plan.os.cpu_count", return_value=80):
+            self.assertEqual(physical_cpu_count(), 40)
+        self.assertEqual(run.call_args.args[0], ["sysctl", "-n", "kern.smp.cores"])
 
     def test_counts_physical_cores_not_smt_threads(self):
         blob = self._lscpu_topology(sockets=2, cores_per_socket=16, threads_per_core=2)
@@ -3178,7 +3394,11 @@ class WindowsCommitLimitTest(unittest.TestCase):
 
     def test_physical_is_used_when_commit_is_larger_or_unknown(self):
         self.assertEqual(windows_available_bytes(110 << 30, 200 << 30), 110 << 30)
-        self.assertEqual(windows_available_bytes(110 << 30, 0), 110 << 30)
+        self.assertEqual(windows_available_bytes(110 << 30, None), 110 << 30)
+
+    def test_zero_commit_headroom_is_not_an_unknown_measurement(self):
+        self.assertEqual(windows_available_bytes(110 << 30, 0), 0)
+        self.assertEqual(windows_available_bytes(0, 40 << 30), 0)
 
     def test_memorystatusex_layout_is_the_documented_one(self):
         # Order matters for ctypes: a skipped field shifts every later one.
@@ -3186,3 +3406,109 @@ class WindowsCommitLimitTest(unittest.TestCase):
             "dwLength", "dwMemoryLoad", "ullTotalPhys", "ullAvailPhys",
             "ullTotalPageFile", "ullAvailPageFile", "ullTotalVirtual",
             "ullAvailVirtual", "ullAvailExtendedVirtual"])
+
+
+def vm_stat_output(free, active, inactive, speculative, wired, purgeable, file_backed,
+                   compressor, anonymous=0, page=16384):
+    """vm_stat's output, in its order and its format (printf "%-30s %16llu.").
+    Pages free is free_count - speculative_count, File-backed pages is
+    external_page_count; no identity ties them to the queues (whether the
+    external count holds the speculative pages depends on the macOS version)."""
+    rows = (("Pages free", free), ("Pages active", active), ("Pages inactive", inactive),
+            ("Pages speculative", speculative), ("Pages throttled", 0),
+            ("Pages wired down", wired), ("Pages purgeable", purgeable),
+            ('"Translation faults"', 412345678), ("Pages copy-on-write", 15071823),
+            ("Pages zero filled", 165834917), ("Pages reactivated", 4196520),
+            ("Pages purged", 2289932), ("File-backed pages", file_backed),
+            ("Anonymous pages", anonymous), ("Pages stored in compressor", 3 * compressor),
+            ("Pages occupied by compressor", compressor), ("Decompressions", 2973697),
+            ("Compressions", 4876563), ("Pageins", 5524149), ("Pageouts", 98286),
+            ("Swapins", 0), ("Swapouts", 0))
+    return (f"Mach Virtual Memory Statistics: (page size of {page} bytes)\n" +
+            "".join(f"{name + ':':<30} {count:>16}.\n" for name, count in rows))
+
+
+# Synthetic fixtures: neither report posted vm_stat. From #2785: a 16 GB M1 Pro
+# (2^20 pages of 16 KiB), and a dev figure (5.5 GB, a 4.84 GB budget) inside the
+# 4.6-6.3 GB budget its `coli plan` saw. The rest is ours, chosen to show the
+# mechanism: right after a run, 7 GB of the model's file pages are still in the
+# active queue.
+MAC16_AFTER_RUN = vm_stat_output(free=40000, active=577576, inactive=276000, speculative=15000,
+                                 wired=110000, purgeable=5000, file_backed=626387,
+                                 compressor=30000, anonymous=242189)
+# The same synthetic Mac minutes later: 400000 of those pages have aged into the
+# inactive queue.
+MAC16_AGED = vm_stat_output(free=40000, active=177576, inactive=676000, speculative=15000,
+                            wired=110000, purgeable=5000, file_backed=626387, compressor=30000,
+                            anonymous=242189)
+# From #1614 run 1: 48 GB, browsers open, 8.3 GiB in the compressor, free +
+# inactive 32.5 GiB. The free/file-backed split is ours (the report has none):
+# here most of the inactive queue is anonymous. Were it file-backed, the new
+# figure would stay near 32 GiB.
+MAC48_DIRTY = vm_stat_output(free=300000, active=271728, inactive=1830000, speculative=20000,
+                             wired=180000, purgeable=10000, file_backed=450000,
+                             compressor=544000, anonymous=1671728)
+# Measured by a reviewer on a Mac mini M4, macOS 15.6. Pages free (36277 against
+# free_count - speculative_count 36233), File-backed pages (225055 against
+# external_page_count 224891: not external + speculative, 248700), Anonymous
+# pages and the active + inactive + speculative total (325300) are vm_stat's;
+# speculative 23809, inactive, active and purgeable 2 are derived from the
+# reported host_statistics64 figures; wired and the compressor are ours, unread.
+# The C rule on the raw counters gave 4278288384 bytes, 0.08% below this text.
+MAC_M4_15_6 = vm_stat_output(free=36277, active=36487, inactive=265004, speculative=23809,
+                             wired=150000, purgeable=2, file_backed=225055,
+                             compressor=200000, anonymous=353884)
+
+
+class DarwinAvailableMemoryTest(unittest.TestCase):
+    """#2785, #1614: on macOS what can be planned is Pages free + File-backed
+    pages + Pages purgeable. The inactive queue mixes file pages, which macOS
+    can drop, with anonymous pages, which it can only compress or swap."""
+
+    def available(self, vm_stat):
+        """memory_available() on a Mac: no /proc/meminfo, vm_stat's output."""
+        result = subprocess.CompletedProcess(args=["vm_stat"], returncode=0,
+                                             stdout=vm_stat, stderr="")
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(sys, "platform", "darwin"), \
+             mock.patch("resource_plan.subprocess.run", return_value=result) as run:
+            available = memory_available(meminfo_path=Path(tmp) / "meminfo")
+        self.assertEqual(run.call_args.args[0], ["vm_stat"])
+        return available
+
+    def test_free_file_backed_and_purgeable_pages(self):
+        self.assertEqual(darwin_available_bytes(MAC16_AFTER_RUN), (40000 + 626387 + 5000) * 16384)
+        self.assertEqual(darwin_available_bytes(MAC48_DIRTY), (300000 + 450000 + 10000) * 16384)
+        # an Intel Mac's 4 KiB pages; no vm_stat output is no measurement
+        self.assertEqual(darwin_available_bytes(vm_stat_output(1, 0, 0, 0, 0, 0, 0, 0, page=4096)),
+                         4096)
+        self.assertIsNone(darwin_available_bytes(""))
+
+    def test_a_model_cache_still_active_is_available(self):
+        # dev's free + inactive + speculative + purgeable reads 5.5 GB here, a
+        # budget in the range #2785's `coli plan` saw. Its 0 slots came mostly
+        # from the planner's runtime reserve; this fixture shows the active file
+        # pages the old sum leaves out (our assumption, not measured on that Mac)
+        self.assertEqual(self.available(MAC16_AFTER_RUN), 671387 * 16384)   # 11.0 GB
+
+    def test_pages_aging_into_inactive_do_not_move_it(self):
+        # the old sum goes from 5.5 to 12.1 GB as the pages age: our hypothesis
+        # for #2785's automatic OLMoE cache of 42, 60 and 64 slots within minutes
+        self.assertEqual(self.available(MAC16_AGED), self.available(MAC16_AFTER_RUN))
+
+    def test_anonymous_inactive_pages_are_not_available(self):
+        # #1614 run 1 accepted RAM_GB=32 at 32.5 GiB of free + inactive, then
+        # compressed and swapped 3 GiB. Below 32 GiB here only because this
+        # fixture's inactive queue is mostly anonymous; the report does not say
+        self.assertEqual(self.available(MAC48_DIRTY), 760000 * 16384)   # 11.6 GiB
+        self.assertLess(self.available(MAC48_DIRTY), 32 << 30)
+
+    def test_speculative_pages_counted_at_most_once(self):
+        # macOS 15.6: File-backed pages is external_page_count without the
+        # speculative pages, and Pages free leaves them out too. The figure is
+        # the reviewer's vm_stat rule to the byte, and Pages speculative is
+        # never read, so no macOS version can count it twice
+        self.assertEqual(self.available(MAC_M4_15_6), 4281696256)   # (36277 + 225055 + 2) pages
+        moved = MAC_M4_15_6.replace(f"{23809:>16}.", f"{123809:>16}.")
+        self.assertNotEqual(moved, MAC_M4_15_6)
+        self.assertEqual(darwin_available_bytes(moved), 4281696256)

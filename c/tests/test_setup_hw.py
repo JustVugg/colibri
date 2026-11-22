@@ -138,14 +138,36 @@ class MemoryParsing(unittest.TestCase):
         mem = setup_hw.memory_from_windows_status(32 * 2**30, 20 * 2**30, 40 * 2**30)
         self.assertEqual(mem["available"], 20 * 2**30)
 
+    def test_windows_status_preserves_zero_measured_headroom(self):
+        self.assertEqual(setup_hw.memory_from_windows_status(32 << 30, 20 << 30, 0)["available"], 0)
+        self.assertEqual(setup_hw.memory_from_windows_status(32 << 30, 0, 20 << 30)["available"], 0)
+        self.assertEqual(setup_hw.memory_from_windows_status(32 << 30, 20 << 30)["available"], 20 << 30)
+
     def test_darwin(self):
+        # free + file-backed + purgeable (resource_plan.darwin_available_bytes): not the
+        # inactive queue, and not Pages speculative (out of Pages free; in File-backed or
+        # not, depending on the macOS version)
         vm_stat = ("Mach Virtual Memory Statistics: (page size of 16384 bytes)\n"
                    "Pages free:                               10000.\n"
                    "Pages inactive:                           5000.\n"
-                   "Pages speculative:                        1000.\n")
+                   "Pages speculative:                        1000.\n"
+                   "Pages purgeable:                            500.\n"
+                   "File-backed pages:                         4000.\n")
         mem = setup_hw.memory_from_darwin("17179869184\n", vm_stat)
         self.assertEqual(mem["total"], 17179869184)
-        self.assertEqual(mem["available"], 16000 * 16384)
+        self.assertEqual(mem["available"], 14500 * 16384)
+
+    def test_freebsd(self):
+        # sysctl -n hw.physmem v_free_count v_inactive_count v_page_size: one per line
+        mem = setup_hw.memory_from_freebsd("910533877760\n39321600\n157286400\n4096\n")
+        self.assertEqual(mem["total"], 910533877760)
+        self.assertEqual(mem["available"], (39321600 + 157286400) * 4096)
+
+    def test_freebsd_unreadable_counters_are_unknown_not_zero(self):
+        mem = setup_hw.memory_from_freebsd("910533877760\n")
+        self.assertEqual(mem["total"], 910533877760)
+        self.assertIsNone(mem["available"])
+        self.assertEqual(setup_hw.memory_from_freebsd(""), {"total": None, "available": None})
 
 
 class CpuParsing(unittest.TestCase):
@@ -279,9 +301,30 @@ class NvidiaParsing(unittest.TestCase):
             with self.subTest(exe=exe):
                 gpus, seen, child = self.run_detect({query: NVIDIA_SMI_CC.splitlines()[0] + "\n"}, exe)
                 self.assertEqual(seen[0][:2], [exe, query])
-                self.assertEqual(len(seen), 1)
+                # one query for the cards (on Windows a second one reads the driver model)
+                self.assertEqual(len([cmd for cmd in seen if "driver_model" not in cmd[1]]), 1)
                 self.assertEqual(gpus[0]["compute_cap"], "7.0")
                 child.assert_not_called()                         # nvidia-smi answered
+
+    def test_the_driver_model_on_windows(self):
+        """#2846: on Windows a separate query reads each card's driver model, so the
+        setup can say that a card in TCC mode has no Vulkan device. Elsewhere, and when
+        the answer does not parse, nothing is asked or the model stays None."""
+        query = setup_hw.nvidia_smi_query()[0]
+        rows = ("0, NVIDIA A100-PCIE-40GB, 40960, 40000, 595.97, 8.0, 00000000:01:00.0\n"
+                "1, NVIDIA RTX A4000, 16376, 16000, 595.97, 8.6, 00000000:02:00.0\n")
+        answers = {query: rows, "--query-gpu=index,driver_model.current": "0, TCC\n1, WDDM\n"}
+        with mock.patch.object(setup_hw.sys, "platform", "win32"):
+            gpus, seen, _child = self.run_detect(answers, r"C:\Windows\System32\nvidia-smi.exe")
+        self.assertEqual([g["driver_model"] for g in gpus], ["TCC", "WDDM"])
+        self.assertEqual(seen[1][1:], ["--query-gpu=index,driver_model.current", "--format=csv,noheader"])
+        with mock.patch.object(setup_hw.sys, "platform", "linux"):
+            gpus, seen, _child = self.run_detect(answers, "/usr/bin/nvidia-smi")
+        self.assertEqual(len(seen), 1)
+        self.assertNotIn("driver_model", gpus[0])
+        self.assertEqual([g["driver_model"] for g in setup_hw.fill_driver_models(
+            [{"index": 0}, {"index": 1}, {"index": 2}], "0, [N/A]\nnot a row\n2, mcdm\n")],
+            [None, None, "MCDM"])
 
     def test_an_old_driver_is_asked_again_and_the_cuda_driver_fills_in(self):
         query = setup_hw.nvidia_smi_query()[0]
@@ -295,7 +338,8 @@ class NvidiaParsing(unittest.TestCase):
             {"name": "Tesla P40", "pci_bus_id": "0000:3B:00.0", "compute_cap": "6.1"},
             {"name": "Tesla V100-SXM2-16GB", "pci_bus_id": "0000:1a:00.0", "compute_cap": "7.0"}]}
         gpus, seen, child = self.run_detect(answers, "/usr/bin/nvidia-smi", probe)
-        self.assertEqual([cmd[1] for cmd in seen], [query, old_query])
+        # (on Windows a third query reads the driver model)
+        self.assertEqual([cmd[1] for cmd in seen if "driver_model" not in cmd[1]], [query, old_query])
         child.assert_called_once()
         self.assertEqual([(g["name"], g["compute_cap"]) for g in gpus],
                          [("Tesla V100-SXM2-16GB", "7.0"), ("Tesla P40", "6.1")])   # matched by slot
@@ -310,8 +354,10 @@ class NvidiaParsing(unittest.TestCase):
 
     def test_the_cuda_driver_probe(self):
         """_cuda_probe_inprocess against a stand-in for libcuda/nvcuda.dll: the
-        attribute numbers are the compute capability's (75, 76 in cuda.h)."""
-        cards = [("Tesla V100-SXM2-16GB", "0000:1A:00.0", 7, 0), ("NVIDIA GeForce RTX 3090", "0000:68:00.0", 8, 6)]
+        attribute numbers are the compute capability's (75, 76 in cuda.h), and the memory's clock
+        in kHz and bus in bits (36, 37), which model_fit turns into the card's bandwidth."""
+        cards = [("Tesla V100-SXM2-16GB", "0000:1A:00.0", 7, 0, 877000, 4096),
+                 ("NVIDIA GeForce RTX 3090", "0000:68:00.0", 8, 6, 9751000, 384)]
 
         class Driver:
             def cuInit(self, flags):
@@ -326,7 +372,8 @@ class NvidiaParsing(unittest.TestCase):
                 return 0
 
             def cuDeviceGetAttribute(self, value, attribute, device):
-                value._obj.value = {75: cards[device.value][2], 76: cards[device.value][3]}[attribute]
+                value._obj.value = {75: cards[device.value][2], 76: cards[device.value][3],
+                                    36: cards[device.value][4], 37: cards[device.value][5]}[attribute]
                 return 0
 
             def cuDeviceGetPCIBusId(self, buffer, size, device):
@@ -340,8 +387,10 @@ class NvidiaParsing(unittest.TestCase):
         with mock.patch.object(setup_hw, "_cuda_driver_library", return_value=Driver()):
             probe = setup_hw._cuda_probe_inprocess()
         self.assertEqual(probe["devices"], [
-            {"name": "Tesla V100-SXM2-16GB", "pci_bus_id": "0000:1A:00.0", "compute_cap": "7.0"},
-            {"name": "NVIDIA GeForce RTX 3090", "pci_bus_id": "0000:68:00.0", "compute_cap": "8.6"}])
+            {"name": "Tesla V100-SXM2-16GB", "pci_bus_id": "0000:1A:00.0", "compute_cap": "7.0",
+             "memory_clock_khz": 877000, "memory_bus_bits": 4096},
+            {"name": "NVIDIA GeForce RTX 3090", "pci_bus_id": "0000:68:00.0", "compute_cap": "8.6",
+             "memory_clock_khz": 9751000, "memory_bus_bits": 384}])
         with mock.patch.object(setup_hw, "_cuda_driver_library", return_value=None):
             self.assertEqual(setup_hw._cuda_probe_inprocess(), {"driver": False, "devices": []})
 
@@ -428,6 +477,26 @@ class VulkanParsing(unittest.TestCase):
         summary = setup_hw.gpu_summary({"devices": [cpu], "icd": None}, [])
         self.assertIsNone(summary["vulkan"])
         self.assertFalse(summary["has_gpu"])
+
+    def test_engine_device_follows_coli_vk_dev(self):
+        """#2127: backend_vulkan.c takes COLI_VK_DEV's entry of the enumeration (strtol,
+        base 10, the whole string) and ranks otherwise; the plan sized the ranking's."""
+        first = device("RTX 3050", "discrete")
+        second = device("RTX 5060 Ti", "discrete")
+        devices = [first, second]
+        pick = setup_hw.engine_vulkan_device
+        self.assertIs(pick(devices, {}), first)                         # unset: the ranking
+        self.assertIs(pick(devices, {"COLI_VK_DEV": "1"}), second)
+        self.assertIs(pick(devices, {"COLI_VK_DEV": " +1"}), second)    # strtol's own forms
+        self.assertIs(pick(devices, {"COLI_VK_DEV": "0"}), first)
+        for ignored in ("2", "-1", "1 ", "1,0", "x", ""):               # the engine's "ignored" line
+            with self.subTest(value=ignored):
+                self.assertIs(pick(devices, {"COLI_VK_DEV": ignored}), first)
+        cpu = device("llvmpipe", "cpu")
+        self.assertIs(pick([cpu, first], {"COLI_VK_DEV": "0"}), cpu)    # forced, even a CPU device
+        self.assertIs(pick([cpu] * 8 + [first], {"COLI_VK_DEV": "8"}), cpu)   # it reads eight
+        with mock.patch.dict(os.environ, {"COLI_VK_DEV": "1"}):
+            self.assertIs(pick(devices), second)                        # default: the process's
 
     def test_user_driver_manifests(self):
         with tempfile.TemporaryDirectory() as home:
@@ -523,6 +592,24 @@ class Report(unittest.TestCase):
         self.assertIn("no AVX2: the prebuilt engines need it", setup_hw.format_report(report))
         report["cpu"]["features"] = ["avx2"]
         self.assertNotIn("no AVX2", setup_hw.format_report(report))
+
+    def test_features_that_were_not_read_are_not_reported_missing(self):
+        # FreeBSD lacks /proc/cpuinfo: detect_cpu finds no features there, and the
+        # report said "no AVX2" on a Xeon Gold 6230, which has it the feature
+        with mock.patch.object(setup_hw.sys, "platform", "freebsd15"), \
+             mock.patch("builtins.open", side_effect=FileNotFoundError("/proc/cpuinfo")), \
+             mock.patch.object(setup_hw.platform, "machine", return_value="amd64"):
+            cpu = setup_hw.detect_cpu()
+        self.assertEqual(cpu["features"], [])
+        self.assertIs(cpu["features_known"], False)
+        report = {"os": {"platform": "freebsd15", "pretty_name": "FreeBSD 15.1"}, "cpu": cpu,
+                  "memory": {"total": 910e9, "available": 512e9}, "disk": None,
+                  "vulkan": {"devices": []}, "nvidia": [], "windows_video": [],
+                  "gpu": setup_hw.gpu_summary({"devices": []}, [])}
+        self.assertNotIn("no AVX2", setup_hw.format_report(report))
+        # the processor of a host whose features were read still gets the note
+        cpu = dict(cpu, features_known=True)
+        self.assertIn("no AVX2", setup_hw.format_report(dict(report, cpu=cpu)))
 
     def test_detect_without_gpu_probe_is_plain_data(self):
         import json

@@ -1,0 +1,123 @@
+{
+  "version": 1,
+  "hypothesis": "When the first request after an engine start is a long prompt, q36c_mirror's first-forward reservation keeps almost all free memory for the prompt scratch, so the KV mirror past 8192 positions is taken from the expert tier (one 256 MiB block, about 78 experts out of the card for the rest of the process) and later decode slows. Sizing the first chunk before that mirror and keeping free only that chunk's scratch, the tier's staging room and a margin keeps every expert on the card, so decode after a long first prompt keeps its normal speed.",
+  "commit": "e24cd51afd44b480c1e41ba82e20a28bac76c34f",
+  "model": "Qwen/Qwen3.6-35B-A3B in colibri's int4-gs64 container (expert_gs=64, ~22 GB; base_model Qwen/Qwen3.6-35B-A3B in its README), at /models/qwen36-35b-a3b (config.json sha256 7606939241b64e82308369b308af8abe85d24e70846704c41ed4e0b59687a674)",
+  "command": "Build, both trees: docker run --rm -v <tree>:/src -w /src colibri-builder:xe2 nice -n 19 make -C c colibri qwen36 VK=1 ARCH=x86-64-v3 -j8 (0 warnings); c/colibri, c/qwen36 and c/shaders/ copied over colibri-vulkan:ubuntu26-qwen (Mesa 26.0.8, main 0a5504a1's Python gateway). Engine: docker compose up -d with the measuring host's compose.yaml (coli serve --model /models/qwen36-35b-a3b --ram 32; COLI_VK_TIER_GB=18, COLI_VK_DEV2= (GPU 0 only), OMP_NUM_THREADS=16) and an override with the arm's image and variables. Measured with colibench: python3 experiments/pr_manifests.py firstlong (streamed OpenAI API requests to the engine, temperature 0); this folder made by experiments/make_manifests.py from its records.",
+  "prompt_hash": "aeb5b994d4eae4bd80a0f021d91af048483815cd27c2296b984dc383bec2a0de",
+  "hardware": {
+    "cpu": "Proxmox VE 9.2 VM on an HP Z6 G4: 32 vCPUs of an Intel Xeon Gold 6254 @ 3.10GHz (1 socket, 1 thread per core in the guest); GPU 0 = an Intel Arc Pro B60 (Xe2, BMG G21, 24 GB) as an SR-IOV VF (0000:01:00.0), factory clocks, nothing else running on it",
+    "ram": "247 GiB in the guest",
+    "storage": "the model on a CIFS share (//172.25.0.253/public/models), bind-mounted read-only; the expert tier warm-starts every expert into GPU 0's memory (18 GiB) at each engine start",
+    "os": "Ubuntu 26.04.1 LTS guest, kernel 7.0.0-42-generic, xe kernel driver (SR-IOV VF: a GPU job is killed after 5 s); engine image Ubuntu 26.04 with Mesa ANV 26.0.8 (mesa-vulkan-drivers 26.0.8-1ubuntu0.3); engine compiled with gcc 15.2.0 (Ubuntu 15.2.0-16ubuntu1) in the colibri-builder:xe2 container (ubuntu:26.04): -O3 -march=x86-64-v3, VK=1"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "engine_build"
+  ],
+  "baseline": {
+    "config": {
+      "model": "Qwen3.6-35B-A3B int4-gs64 (/models/qwen36-35b-a3b)",
+      "gpu": "Arc Pro B60 VF, GPU 0 only, 18 GiB tier",
+      "mesa": "26.0.8-1ubuntu0.3",
+      "OMP_NUM_THREADS": "16",
+      "COLI_VK_TIER_GB": "18",
+      "COLI_VK_DEV2": "unset",
+      "COLI_VK_SUBGROUP": "16",
+      "anv_enable_buffer_comp": "true",
+      "COLI_VK_ATTN_SLICE": "unset",
+      "COLI_VK_ATTN_DEC": "unset",
+      "INTEL_MEASURE": "unset",
+      "engine_build": "dev e24cd51a (qwen36 sha256 1d8f712d518d7fec)"
+    },
+    "samples": {
+      "tok_s": [
+        27.13,
+        26.16,
+        26.73
+      ],
+      "second_answer_tok_s": [
+        32.52,
+        32.35,
+        32.25
+      ],
+      "experts_given_back": [
+        76,
+        77,
+        77
+      ],
+      "prompt_chunk_rows": [
+        4864,
+        4864,
+        4864
+      ],
+      "ttft_16k_first_s": [
+        132.44,
+        132.42,
+        132.56
+      ]
+    },
+    "median_tok_s": 26.73,
+    "quality": {
+      "method": "dev e24cd51a itself: the build of the 'dev-base' reference (greedy answers to 3 fixed prompts, 160 tokens, taken from it on 2026-11-06)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-vulkan-mirror-first-keep-2026-11-07/runs.txt",
+      "sha256": "b6e4c00b9d752df5653e9cc76bdd8ba33dd7cb9fb851680bc3d317de6d06652d"
+    }
+  },
+  "trial": {
+    "config": {
+      "model": "Qwen3.6-35B-A3B int4-gs64 (/models/qwen36-35b-a3b)",
+      "gpu": "Arc Pro B60 VF, GPU 0 only, 18 GiB tier",
+      "mesa": "26.0.8-1ubuntu0.3",
+      "OMP_NUM_THREADS": "16",
+      "COLI_VK_TIER_GB": "18",
+      "COLI_VK_DEV2": "unset",
+      "COLI_VK_SUBGROUP": "16",
+      "anv_enable_buffer_comp": "true",
+      "COLI_VK_ATTN_SLICE": "unset",
+      "COLI_VK_ATTN_DEC": "unset",
+      "INTEL_MEASURE": "unset",
+      "engine_build": "dev e24cd51a + this change (qwen36 sha256 8cfb74b13f84eb47)"
+    },
+    "samples": {
+      "tok_s": [
+        37.83,
+        37.88,
+        37.85
+      ],
+      "second_answer_tok_s": [
+        38.0,
+        38.0,
+        38.06
+      ],
+      "experts_given_back": [
+        0,
+        0,
+        0
+      ],
+      "prompt_chunk_rows": [
+        4864,
+        4864,
+        4864
+      ],
+      "ttft_16k_first_s": [
+        118.43,
+        118.57,
+        118.4
+      ]
+    },
+    "median_tok_s": 37.85,
+    "quality": {
+      "method": "greedy answers to 3 fixed prompts (160 tokens), every character, against dev e24cd51a with the chain on (driver option, subgroup 16), 2026-11-06: 3/3 identical",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-vulkan-mirror-first-keep-2026-11-07/runs.txt",
+      "sha256": "b6e4c00b9d752df5653e9cc76bdd8ba33dd7cb9fb851680bc3d317de6d06652d"
+    }
+  },
+  "outcome": "improvement"
+}

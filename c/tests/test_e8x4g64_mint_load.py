@@ -67,8 +67,10 @@ def _cc_flags():
               "-Wno-misleading-indentation", "-Wno-unused-function"]
     ldflags = ["-lm"]
     if sys.platform not in ("darwin", "win32"):
-        cflags += ["-fopenmp"]
-        ldflags += ["-fopenmp"]
+        # -pthread as the Makefile builds the engines: FreeBSD keeps the threads
+        # in libthr, which nothing links without it (glibc has them in libc).
+        cflags += ["-fopenmp", "-pthread"]
+        ldflags += ["-fopenmp", "-pthread"]
     if sys.platform == "darwin":
         # The Makefile builds this harness with OpenMP on macOS via Homebrew's
         # libomp. Locating it must not fail quietly: a swallowed error here

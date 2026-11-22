@@ -3,7 +3,8 @@
 Use extra drives when model reads limit inference. `COLI_MODEL_MIRROR` points
 to read-only copies of the primary model's shards; no RAID setup is required.
 These examples target the GLM-5.2 engine. Other engines have their own I/O
-paths, so check their model guides before applying the same settings.
+paths, so check their model guides before applying the same settings (qwen38
+mirrors its expert sidecar only: [qwen38.md](qwen38.md#the-sidecar-on-several-drives)).
 
 ## Run with two or more copies
 
@@ -35,6 +36,8 @@ For example, `9,3,3` requests shares of 60%, 20%, and 20% across three drives;
 it is not a measured speedup. Check the startup log for skipped mirrors and
 probe failures before trusting the split. See the
 [environment reference](ENVIRONMENT.md#dual-ssd-streaming) for the variables.
+
+A GGUF model (DeepSeek V4.1) works the same way: copy the `.gguf` parts to the other drive and point `COLI_MODEL_MIRROR` at that directory. Because every layer's experts live in one part, splitting the parts across drives does not help, but a mirror does, since each expert is read from whichever copy its hash picks. A GGUF copy is accepted when its size, the header up to the first tensor and 16 sampled blocks of data match the primary, so it does not read everything: check a fresh copy with `cmp` or a checksum.
 
 Missing or divergent mirror shards fall back to the primary. For a smaller
 drive, use the [partial-mirror planner](#partial-mirrors-coli-mirror)

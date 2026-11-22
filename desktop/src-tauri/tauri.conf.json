@@ -4,26 +4,12 @@
   "version": "0.1.0",
   "identifier": "org.colibri.desktop",
   "build": {
-    "beforeDevCommand": "npm --prefix ../web run dev",
-    "devUrl": "http://localhost:5173",
-    "beforeBuildCommand": "npm --prefix ../web run build",
-    "frontendDist": "../../web/dist"
+    "frontendDist": "../dist"
   },
   "app": {
-    "windows": [
-      {
-        "label": "main",
-        "title": "colibrì",
-        "width": 1280,
-        "height": 820,
-        "minWidth": 860,
-        "minHeight": 600,
-        "center": true,
-        "resizable": true
-      }
-    ],
+    "windows": [],
     "security": {
-      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost data: blob:; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:* http://localhost:*"
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost"
     }
   },
   "bundle": {

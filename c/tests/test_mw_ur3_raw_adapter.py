@@ -9,6 +9,7 @@ from collections import Counter
 from unittest.mock import patch
 from pathlib import Path
 import sys
+import shutil
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -16,6 +17,9 @@ C_ROOT = ROOT / "c"
 TOOLS = C_ROOT / "tools"
 sys.path.insert(0, str(TOOLS))
 import mw_ur3_raw_adapter as adapter  # noqa: E402
+
+# GNU make: the BSDs' own make cannot read this Makefile, and they install GNU make as gmake.
+MAKE = shutil.which("gmake" if sys.platform.startswith(("freebsd", "openbsd", "netbsd", "dragonfly")) else "make")
 
 INVALID_REQUEST_IDS = (
     "0", "+1", "01", "-1", str(adapter.REQUEST_ID_MAX + 1),
@@ -889,7 +893,7 @@ class RawAdapterTest(unittest.TestCase):
         paths = [directory / name for name in (
             "group.requests", "group.frames",
             "sequential.requests", "sequential.frames")]
-        subprocess.run(["make", "tests/test_group_score"], cwd=C_ROOT,
+        subprocess.run([MAKE or "make", "tests/test_group_score"], cwd=C_ROOT,
                        check=True, stdout=subprocess.PIPE,
                        stderr=subprocess.PIPE, text=True)
         subprocess.run([

@@ -1,0 +1,166 @@
+#version 450
+// Inkling-2's ops on the dense chain (vk_chain.c, vkc_ink2_*; inkling2_chain.h), three modes.
+//
+// mode 0, the attention residuals' mix (inkling2.h's ink2_attn_res), for S rows. Row s mixes
+// nb + 1 vectors of D floats, each RMS-normalised without a weight: the block states at
+// b_off + s*b_row + e*D (e < nb) and the partial stream at x_off + s*x_row:
+//   r_e = 1 / sqrt(mean(v_e^2) + eps),   n_e = v_e * r_e
+//   score_e = ((q . v_e) * r_e) * scale                     (q at w_off)
+//   y[y_off + s*y_row + d] = sum_e softmax(score)_e n_e[d]   (the sum in e order)
+// One workgroup per row, every sum in one pass over the vectors (a lane's share, then the
+// subgroup's, then the subgroups' in order). The CPU sums the squares in double and q . n_e in
+// its lanes; here in floats, so the two agree to rounding. The softmax is the CPU's: the maximum,
+// exp(x - max) in order with their sum, then a division. nb <= 15.
+//
+// mode 1, the L2 clip (ink2_l2clip) of nseg segments of n floats, in place: segment g at
+// x_off + (g / per_row)*x_row + (g % per_row)*n. With has_w each element first times
+// w[w_off + (g % per_row)*n + i] (a learned scale per head); then the segment times
+// thr / (|v| + 1e-6) when that is below 1. One workgroup per segment.
+//
+// mode 2, a global layer's dynamic short convolution (ink2_dsconv_rows) over S rows, in
+// place: channel c of C (head h = c / hd), tap lag of K (0: the row itself):
+//   tap  = st[w_off + lag*C + c] + dyn[b_off + s*b_row + h*K + lag]
+//   y    = (sum_lag u_lag * tap + u_0) / fc,   fc = sqrt(2K + 1)
+// where u_0 is the row's input and u_lag the input lag rows before it (the state's K-1
+// inputs, ring[y_off + c*(K-1) + j] oldest first, then the step's rows); the state keeps the
+// last K-1 inputs. One thread per channel. K <= 9.
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer XB { float xv[]; };            // 0: the stream; 1, 2: in place
+layout(std430, binding = 1) readonly buffer BB { float bv[]; };   // 0: the block states; 2: dyn
+layout(std430, binding = 2) readonly buffer WB { float wv[]; };   // the parameters
+layout(std430, binding = 3) buffer YB { float yv[]; };            // 0: the mix; 2: the state
+
+layout(push_constant) uniform P { int v[32]; } p;
+#define MODE    p.v[0]
+#define S_      p.v[1]
+#define D_      p.v[2]
+#define NB      p.v[3]
+#define X_OFF   p.v[4]
+#define X_ROW   p.v[5]
+#define B_OFF   p.v[6]
+#define B_ROW   p.v[7]
+#define W_OFF   p.v[8]
+#define Y_OFF   p.v[9]
+#define Y_ROW   p.v[10]
+#define EPS     intBitsToFloat(p.v[11])
+#define SCALE   intBitsToFloat(p.v[12])
+// mode 1
+#define NSEG    p.v[1]
+#define SEG_N   p.v[2]
+#define PER_ROW p.v[3]
+#define HAS_W   p.v[6]
+#define THR     intBitsToFloat(p.v[11])
+// mode 2
+#define C_      p.v[2]
+#define K_      p.v[3]
+#define HD_     p.v[10]
+#define FC      intBitsToFloat(p.v[11])
+
+shared float rms[256];
+shared float pms[64 * 16];   // mode 0: per subgroup and vector, the sums of squares and of q . v
+shared float pdt[64 * 16];
+shared float sc[16];
+shared float rr[16];
+
+void mixrow() {
+    int s = int(gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x);
+    if (s >= S_) return;                           // uniform across the workgroup
+    int tid = int(gl_LocalInvocationID.x), sg = int(gl_SubgroupID), ns = int(gl_NumSubgroups);
+    int xb = X_OFF + s * X_ROW, bb = B_OFF + s * B_ROW, yb = Y_OFF + s * Y_ROW;
+    // one pass over the vectors for every sum, each a lane's share summed over the subgroup
+    float ms[16], dt[16];
+    [[unroll]] for (int e = 0; e < 16; e++) { ms[e] = 0.0; dt[e] = 0.0; }
+    for (int d = tid; d < D_; d += 256) {
+        float q = wv[W_OFF + d];
+        [[unroll]] for (int e = 0; e < 16; e++) {
+            if (e > NB) break;
+            float x = e < NB ? bv[bb + e * D_ + d] : xv[xb + d];
+            ms[e] += x * x;
+            dt[e] += x * q;
+        }
+    }
+    [[unroll]] for (int e = 0; e < 16; e++) {
+        if (e > NB) break;
+        float a = subgroupAdd(ms[e]), b = subgroupAdd(dt[e]);
+        if (subgroupElect()) { pms[sg * 16 + e] = a; pdt[sg * 16 + e] = b; }
+    }
+    barrier();
+    if (tid <= NB) {
+        float a = 0.0, b = 0.0;
+        for (int g = 0; g < ns; g++) { a += pms[g * 16 + tid]; b += pdt[g * 16 + tid]; }
+        float r = 1.0 / sqrt(a / float(D_) + EPS);
+        rr[tid] = r;
+        sc[tid] = (b * r) * SCALE;
+    }
+    barrier();
+    if (tid == 0) {                                // the CPU's softmax, in order
+        float m = sc[0];
+        for (int e = 1; e <= NB; e++) if (sc[e] > m) m = sc[e];
+        float sum = 0.0;
+        for (int e = 0; e <= NB; e++) { sc[e] = exp(sc[e] - m); sum += sc[e]; }
+        for (int e = 0; e <= NB; e++) sc[e] /= sum;
+    }
+    barrier();
+    for (int d = tid; d < D_; d += 256) {
+        float a = 0.0;
+        for (int e = 0; e < NB; e++) a += sc[e] * (bv[bb + e * D_ + d] * rr[e]);
+        a += sc[NB] * (xv[xb + d] * rr[NB]);
+        yv[yb + d] = a;
+    }
+}
+
+void l2clip() {
+    int g = int(gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x);
+    if (g >= NSEG) return;
+    int tid = int(gl_LocalInvocationID.x);
+    int j = g % PER_ROW;
+    int base = X_OFF + (g / PER_ROW) * X_ROW + j * SEG_N;
+    float ss = 0.0;
+    for (int i = tid; i < SEG_N; i += 256) {
+        float v = xv[base + i];
+        if (HAS_W != 0) v *= wv[W_OFF + j * SEG_N + i];
+        ss += v * v;
+    }
+    rms[tid] = ss;
+    barrier();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off) rms[tid] += rms[tid + off];
+        barrier();
+    }
+    float f = THR / (sqrt(rms[0]) + 1e-6);
+    for (int i = tid; i < SEG_N; i += 256) {
+        float v = xv[base + i];
+        if (HAS_W != 0) v *= wv[W_OFF + j * SEG_N + i];
+        xv[base + i] = f < 1.0 ? v * f : v;
+    }
+}
+
+void dconv() {
+    int c = int(gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 256u);
+    if (c >= C_) return;
+    int K = K_, nh = K - 1, h = c / HD_;
+    float hist[8];
+    [[unroll]] for (int k = 0; k < 8; k++) hist[k] = k < nh ? yv[Y_OFF + c * nh + k] : 0.0;
+    for (int s = 0; s < S_; s++) {
+        int xi = X_OFF + s * X_ROW + c;
+        float cur = xv[xi];
+        int db = B_OFF + s * B_ROW + h * K;
+        float acc = cur * (wv[W_OFF + c] + bv[db]);                       // lag 0
+        [[unroll]] for (int lag = 1; lag < 9; lag++)
+            if (lag < K) acc += hist[nh - lag] * (wv[W_OFF + lag * C_ + c] + bv[db + lag]);
+        xv[xi] = (acc + cur) / FC;
+        [[unroll]] for (int k = 0; k < 7; k++) if (k + 1 < nh) hist[k] = hist[k + 1];
+        [[unroll]] for (int k = 0; k < 8; k++) if (k == nh - 1) hist[k] = cur;
+    }
+    [[unroll]] for (int k = 0; k < 8; k++) if (k < nh) yv[Y_OFF + c * nh + k] = hist[k];
+}
+
+void main() {
+    if (MODE == 0) mixrow();
+    else if (MODE == 1) l2clip();
+    else dconv();
+}

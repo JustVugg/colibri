@@ -60,31 +60,10 @@ static void q36_mtp_expert_qw(QW *w, const int8_t *q, const float *sc,
         w->w = f;
     }
 }
-static int q36_mtp_load(Model *m) {
+/* A MoE head's router, its shared expert's gate and its routed experts, as the container keeps them */
+static void q36_mtp_load_experts(Model *m) {
     Cfg *c = &m->c; Q36Mtp *p = &g_q36_mtp;
-    int D = c->hidden, E = c->n_experts, I = c->inter, Ish = c->shared_inter;
-    if (!st_find(&m->S, "mtp.fc.weight")) return 0;
-    if (E <= 0 || E > 1024 || c->topk > 16 || Ish <= 0) {
-        fprintf(stderr, "[mtp] head requires a MoE model with shared expert\n"); return 0;
-    }
-    p->E = E; p->K = c->topk; p->I = I; p->ish = Ish;
-#define MN(field, name, n) p->field = load_norm_n(m, "mtp." name ".weight", n)
-    MN(enorm, "pre_fc_norm_embedding", D); MN(hnorm, "pre_fc_norm_hidden", D);
-    MN(head_norm, "norm", D); MN(L.in_ln, "layers.0.input_layernorm", D);
-    MN(L.post_ln, "layers.0.post_attention_layernorm", D);
-    MN(L.qn, "layers.0.self_attn.q_norm", c->head_dim);
-    MN(L.kn, "layers.0.self_attn.k_norm", c->k_head_dim);
-#undef MN
-#define MW(field, name, ni, no) load_tq(m, "mtp." name ".weight", ni, no, 1, "mtp", &p->field)
-    MW(eh, "fc", 2 * D, D);
-    MW(L.q, "layers.0.self_attn.q_proj", D, c->q_heads * c->q_head_dim);
-    MW(L.k, "layers.0.self_attn.k_proj", D, c->kv_heads * c->k_head_dim);
-    MW(L.v, "layers.0.self_attn.v_proj", D, c->kv_heads * c->v_head_dim);
-    MW(L.o, "layers.0.self_attn.o_proj", c->q_heads * c->head_dim, D);
-    MW(sh_g, "layers.0.mlp.shared_expert.gate_proj", D, Ish);
-    MW(sh_u, "layers.0.mlp.shared_expert.up_proj", D, Ish);
-    MW(sh_d, "layers.0.mlp.shared_expert.down_proj", Ish, D);
-#undef MW
+    int D = c->hidden, E = p->E, I = p->I;
     p->router = load_t_n(m, "mtp.layers.0.mlp.gate.weight", (int64_t)E * D);
     p->sh_gate = load_t_n(m, "mtp.layers.0.mlp.shared_expert_gate.weight", D);
     p->eg = calloc(E, sizeof(QW)); p->eu = calloc(E, sizeof(QW)); p->ed = calloc(E, sizeof(QW));
@@ -112,7 +91,45 @@ static int q36_mtp_load(Model *m) {
         q36_mtp_expert_qw(&p->ed[e], q+2*n, sc+2*ns, I, D, mixed ? g_expert_down_gs : g_expert_gs, packed);
         free(q); free(raw); free(sc);
     }
+}
+static int q36_mtp_load(Model *m) {
+    Cfg *c = &m->c; Q36Mtp *p = &g_q36_mtp;
+    int D = c->hidden, E = c->n_experts, I = c->inter, Ish = c->shared_inter;
+    if (!mt_has(m, "mtp.fc.weight")) return 0;
+    /* a dense model's head (Qwen3.8-27B): its layer's MLP, no router and no gate (the engine
+     * holds the model's own MLP the same way, a shared expert shared_inter wide) */
+    const int dense = E <= 0 && Ish > 0 && mt_has(m, "mtp.layers.0.mlp.gate_proj.weight");
+    if (!dense && (E <= 0 || E > 1024 || c->topk > 16 || Ish <= 0)) {
+        fprintf(stderr, "[mtp] head requires a MoE model with shared expert, or a dense model's MLP\n"); return 0;
+    }
+    if (dense) E = I = 0;
+    p->E = E; p->K = dense ? 0 : c->topk; p->I = I; p->ish = Ish;
+#define MN(field, name, n) p->field = load_norm_n(m, "mtp." name ".weight", n)
+    MN(enorm, "pre_fc_norm_embedding", D); MN(hnorm, "pre_fc_norm_hidden", D);
+    MN(head_norm, "norm", D); MN(L.in_ln, "layers.0.input_layernorm", D);
+    MN(L.post_ln, "layers.0.post_attention_layernorm", D);
+    MN(L.qn, "layers.0.self_attn.q_norm", c->head_dim);
+    MN(L.kn, "layers.0.self_attn.k_norm", c->k_head_dim);
+#undef MN
+#define MW(field, name, ni, no) load_tq(m, "mtp." name ".weight", ni, no, 1, "mtp", &p->field)
+    MW(eh, "fc", 2 * D, D);
+    MW(L.q, "layers.0.self_attn.q_proj", D, c->q_heads * c->q_head_dim);
+    MW(L.k, "layers.0.self_attn.k_proj", D, c->kv_heads * c->k_head_dim);
+    MW(L.v, "layers.0.self_attn.v_proj", D, c->kv_heads * c->v_head_dim);
+    MW(L.o, "layers.0.self_attn.o_proj", c->q_heads * c->head_dim, D);
+    if (dense) {
+        MW(sh_g, "layers.0.mlp.gate_proj", D, Ish);
+        MW(sh_u, "layers.0.mlp.up_proj", D, Ish);
+        MW(sh_d, "layers.0.mlp.down_proj", Ish, D);
+    } else {
+        MW(sh_g, "layers.0.mlp.shared_expert.gate_proj", D, Ish);
+        MW(sh_u, "layers.0.mlp.shared_expert.up_proj", D, Ish);
+        MW(sh_d, "layers.0.mlp.shared_expert.down_proj", Ish, D);
+    }
+#undef MW
+    if (!dense) q36_mtp_load_experts(m);
     const char *file = getenv("Q36_MTP_VOCAB_IDS");
+    if (file && *file && g_gguf) { fprintf(stderr, "Q36_MTP_VOCAB_IDS reads a safetensors lm_head, which a GGUF does not have\n"); exit(1); }
     if (file && *file) {
         FILE *f = fopen(file, "r");
         if (!f) { fprintf(stderr, "cannot read Q36_MTP_VOCAB_IDS %s\n", file); exit(1); }
@@ -201,7 +218,8 @@ static int q36_mtp_load(Model *m) {
         }
     }
     p->pend = falloc(D); p->on = 1;
-    fprintf(stderr, "[mtp] Qwen3.6 checkpoint head: %d experts\n", E);
+    if (dense) fprintf(stderr, "[mtp] the checkpoint's head: a dense MLP %d wide\n", Ish);
+    else fprintf(stderr, "[mtp] Qwen3.6 checkpoint head: %d experts\n", E);
     return 1;
 }
 
@@ -229,7 +247,9 @@ static int q36_mtp_kv(Model *m) {
         p->Vp = malloc(sizeof(void *) * (size_t)(c->n_layers + 1));
         if (!p->Kp || !p->Vp) { p->on = 0; return 0; }
     }
-    for (int i = 0; i < c->n_layers; i++) { p->Kp[i] = m->K[i]; p->Vp[i] = m->V[i]; }
+    /* the trunk's pointers, the CPU head's (a multiplexed step runs the device head with every
+     * conversation parked, the Model's own K and V unset) */
+    for (int i = 0; i < c->n_layers; i++) { p->Kp[i] = m->K ? m->K[i] : NULL; p->Vp[i] = m->V ? m->V[i] : NULL; }
     p->Kp[c->n_layers] = p->Kc; p->Vp[c->n_layers] = p->Vc;
     return 1;
 }
@@ -253,6 +273,14 @@ static void q36_mtp_route(float *l, int E, int K, int *idx, float *val) {
  * a prompt's rows grouped per expert, so its catch-up is a few batched matmuls */
 static void q36_mtp_moe(const float *x, int R, int D, float *out) {
     Q36Mtp *p = &g_q36_mtp; int E = p->E, K = p->K, I = p->I, Ish = p->ish;
+    if (!E) {   /* a dense model's head: its MLP, no router and no gate */
+        float *g = falloc((int64_t)R * Ish), *u = falloc((int64_t)R * Ish);
+        matmul_d(g, x, &p->sh_g, R, D, Ish); matmul_d(u, x, &p->sh_u, R, D, Ish);
+        for (int64_t i = 0; i < (int64_t)R * Ish; i++) g[i] = g[i] / (1.f + expf(-g[i])) * u[i];
+        matmul_d(out, g, &p->sh_d, R, Ish, D);
+        free(g); free(u);
+        return;
+    }
     int *idx = malloc(sizeof(int) * (size_t)R * K); float *val = falloc((int64_t)R * K), *lg = falloc((int64_t)R * E);
     /* the router's logits: every (row, expert) dot apart */
     #pragma omp parallel for schedule(static)
@@ -373,7 +401,8 @@ static int q36_mg_init(Model *m) {
     if (g->on) return 1;
     if (g->failed) return 0;
     const char *e = getenv("Q36_MTP_GPU");
-    if ((e && *e == '0') || !g_vk_chain || !vkc_ready() || m->mpos || m->rope_delta) { g->failed = 1; return 0; }
+    /* a dense model's head (no experts) runs on the CPU beside the Vulkan chain */
+    if ((e && *e == '0') || !g_vk_chain || !vkc_ready() || m->mpos || m->rope_delta || !p->E) { g->failed = 1; return 0; }
     int D = c->hidden, E = p->E, K = p->K, I = p->I, Ish = p->ish, hd = c->head_dim, kvd = c->k_head_dim;
     /* the norms' weights, one arena */
     size_t n = 0;
@@ -674,18 +703,22 @@ static void q36_mtp_rows(Model *m, const int *tok, const float *hid, int R, int 
 /* After a forward fed ids[0..S) at pos_base with its residual rows res[S] (normalized here):
  * the head reads the rows it completes and keeps the last one pending. A forward that
  * starts behind the head (a verify's rejected rows undone) continues from the forward
- * before's row there; one that leaves a gap stops the head until the next prompt. */
-static void q36_mtp_feed_rows(Model *m, const int *ids, int S, int pos_base, const float *hid);
+ * before's row there; one that leaves a gap stops the head until the next prompt.
+ * A prompt's rows go to the head Q36_MTP_FEED_ROWS at a time and the forward keeps its last
+ * Q36_MTP_FEED_ROWS rows: the head's buffers (the host's, and q36_mc_bufs' on the card) held the
+ * whole prompt, 220 KiB a row on Qwen3.8-27B's card (93K tokens: 21 GB; every later verify's
+ * copies refused). A later forward that starts further back than that waits as after a gap. */
+#define Q36_MTP_FEED_ROWS 4096
+static void q36_mtp_feed_in(Model *m, const int *ids, int S, int pos_base, const float *rows, int normed);
 static void q36_mtp_feed(Model *m, const int *ids, int S, int pos_base, const float *res) {
-    Q36Mtp *p = &g_q36_mtp; int D = m->c.hidden;
-    if (!p->on || S < 1 || !q36_mtp_kv(m)) return;
-    float *hid = falloc((int64_t)S * D);   /* h_p: the model's output, after its final norm */
-    #pragma omp parallel for schedule(static) if(S > 8)
-    for (int s = 0; s < S; s++) rmsnorm_row(hid + (int64_t)s * D, res + (int64_t)s * D, m->final_norm, D, m->c.eps);
-    q36_mtp_feed_rows(m, ids, S, pos_base, hid);
-    free(hid);
+    if (!g_q36_mtp.on || S < 1 || !q36_mtp_kv(m)) return;
+    q36_mtp_feed_in(m, ids, S, pos_base, res, 0);
 }
 static void q36_mtp_feed_rows(Model *m, const int *ids, int S, int pos_base, const float *hid) {
+    q36_mtp_feed_in(m, ids, S, pos_base, hid, 1);
+}
+/* rows: the forward's residuals (normed 0: the final norm here, a chunk at a time) or h_p (1) */
+static void q36_mtp_feed_in(Model *m, const int *ids, int S, int pos_base, const float *rows, int normed) {
     Q36Mtp *p = &g_q36_mtp; int D = m->c.hidden;
     if (pos_base == 0) { p->len = 0; p->has_pend = 0; p->done_pos = -1; }
     else {
@@ -703,14 +736,28 @@ static void q36_mtp_feed_rows(Model *m, const int *ids, int S, int pos_base, con
         }
     }
     p->done_pos = -1;
-    if (pos_base == 0 || p->has_pend) {
-        if (S > 1) q36_mtp_rows(m, ids + 1, hid, S - 1, pos_base + 1, NULL, NULL);
-        memcpy(p->pend, hid + (int64_t)(S - 1) * D, sizeof(float) * D);
+    const int feed = pos_base == 0 || p->has_pend, C = S < Q36_MTP_FEED_ROWS ? S : Q36_MTP_FEED_ROWS;
+    if (C > p->last_cap) { free(p->last); p->last = falloc((int64_t)C * D); p->last_cap = C; }
+    float *buf = normed ? NULL : falloc((int64_t)C * D);   /* h_p: the model's output, after its final norm */
+    for (int s0 = 0; s0 < S; s0 += C) {
+        const int n = S - s0 < C ? S - s0 : C;
+        const float *h = rows + (int64_t)s0 * D;
+        if (!normed) {
+            #pragma omp parallel for schedule(static) if(n > 8)
+            for (int s = 0; s < n; s++) rmsnorm_row(buf + (int64_t)s * D, h + (int64_t)s * D, m->final_norm, D, m->c.eps);
+            h = buf;
+        }
+        const int pairs = s0 + n < S ? n : n - 1;   /* each row with the token after it; the last waits (pend) */
+        if (feed && pairs > 0 && p->on) q36_mtp_rows(m, ids + 1 + s0, h, pairs, pos_base + 1 + s0, NULL, NULL);
+        const int k0 = S - C > s0 ? S - C - s0 : 0;   /* this chunk's rows among the forward's last C */
+        if (k0 < n) memcpy(p->last + (int64_t)(s0 + k0 - (S - C)) * D, h + (int64_t)k0 * D, sizeof(float) * (size_t)(n - k0) * D);
+    }
+    free(buf);
+    if (feed) {
+        memcpy(p->pend, p->last + (int64_t)(C - 1) * D, sizeof(float) * D);
         p->len = pos_base + S - 1; p->has_pend = 1;
     }
-    if (S > p->last_cap) { free(p->last); p->last = falloc((int64_t)S * D); p->last_cap = S; }
-    memcpy(p->last, hid, sizeof(float) * (size_t)S * D);
-    p->last_base = pos_base; p->last_n = S;
+    p->last_base = pos_base + S - C; p->last_n = C;
 }
 
 /* Whether the head can draft for a token about to be fed at pos */
@@ -803,6 +850,11 @@ static void q36_mtp_attach(Model *m) {
     if (g_cache_route || qq_active()) {
         fprintf(stderr, "[mtp] Q36_MTP=1: the head stays off under %s, where there are no speculative steps\n",
                 g_cache_route ? "CACHE_ROUTE" : "a qpack container");
+        return;
+    }
+    if (QWEN_GRAPH(m)) {   /* the graph drafts with its own head (qwen36_graph_mtp_load in qwen36.c) */
+        fprintf(stderr, "[mtp] Q36_MTP=1: the Metal graph drafts with its own MTP head, on when the container has "
+                        "one (QWEN36_MTP=0 turns it off)\n");
         return;
     }
     if (!q36_mtp_load(m)) { fprintf(stderr, "[mtp] Q36_MTP=%s: the head stays off\n", path); return; }

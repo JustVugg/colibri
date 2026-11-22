@@ -1,0 +1,286 @@
+# Kernel-only checks of chain_attnb, stock (dev e24cd51a's shader) against this change, on the B60's second GPU (GPU 1 of the VM), Mesa ANV 26.0.8, 2026-11-06 19:07-20:00. attnbench is a replay harness written for this work (not part of the PR): it records the engine's own chain_attnb dispatches for Qwen3.6's attention (16 heads over 2 KV heads, head dim 256) and compares every output float. GPU 1 was shared with other jobs, so times are indicative; the subgroup-16 times are the best of 3 repetitions (timing.sh). Files, as written by the runs:
+
+===== timing.sh
+#!/bin/sh
+# speed, new against stock (best of 3 after the bits run), Qwen3.6's attention
+B=./attnbench
+for kv in 1 0; do
+  $B port.spv stock.spv S=255 last=16384 kv16=$kv budget=0 reps=3 stats=0 | grep -E "^(BITS|TIME)" | sed "s/^/S 255 last 16384 kv16 $kv one dispatch: /"
+  for last in 16384 32768; do
+    $B port.spv stock.spv S=4096 last=$last cap=32768 kv16=$kv budget=68719476736 reps=3 stats=0 | grep -E "^(CASE|BITS|TIME)" | sed "s/^/  /"
+  done
+done
+
+===== timing_sg16.txt
+S 255 last 16384 kv16 1 one dispatch: BITS 0 of 1044480 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+S 255 last 16384 kv16 1 one dispatch: TIME new 25.667 ms stock 185.109 ms (x7.21), longest slice new 42.4 ms stock 185.1 ms, 2.646 TFLOPS new
+  CASE H 16 KVH 2 hd 256 vd 256 S 4096 last 16384 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 1024 rows (4 slices) fixed 1 vec 1 sg 16
+  BITS 0 of 16777216 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  TIME new 324.850 ms stock 2317.593 ms (x7.13), longest slice new 90.1 ms stock 642.4 ms, 2.962 TFLOPS new
+  CASE H 16 KVH 2 hd 256 vd 256 S 4096 last 32768 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 512 rows (8 slices) fixed 1 vec 1 sg 16
+  BITS 0 of 16777216 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  TIME new 776.345 ms stock 5664.692 ms (x7.30), longest slice new 109.2 ms stock 749.5 ms, 2.656 TFLOPS new
+S 255 last 16384 kv16 0 one dispatch: BITS 0 of 1044480 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+S 255 last 16384 kv16 0 one dispatch: TIME new 59.485 ms stock 183.027 ms (x3.08), longest slice new 75.0 ms stock 183.1 ms, 1.142 TFLOPS new
+  CASE H 16 KVH 2 hd 256 vd 256 S 4096 last 16384 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 1024 rows (4 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 16777216 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  TIME new 750.345 ms stock 2299.452 ms (x3.06), longest slice new 207.7 ms stock 638.0 ms, 1.282 TFLOPS new
+  CASE H 16 KVH 2 hd 256 vd 256 S 4096 last 32768 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 512 rows (8 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 16777216 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  TIME new 1822.300 ms stock 5609.201 ms (x3.08), longest slice new 241.9 ms stock 742.2 ms, 1.131 TFLOPS new
+
+===== matrix_sg16_b32.txt
+CASE H 16 KVH 2 hd 256 vd 256 S 255 last 16384 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 64 rows (4 slices) fixed 1 vec 0 sg 16
+BITS 0 of 1044480 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+TIME new 126.915 ms stock 353.155 ms (x2.78), longest slice new 43.0 ms stock 88.8 ms, 0.535 TFLOPS new
+CASE H 16 KVH 2 hd 256 vd 256 S 1024 last 16384 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 64 rows (16 slices) fixed 1 vec 0 sg 16
+BITS 0 of 4194304 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+TIME new 450.136 ms stock 1379.226 ms (x3.06), longest slice new 40.3 ms stock 88.8 ms, 0.592 TFLOPS new
+CASE H 16 KVH 2 hd 256 vd 256 S 4096 last 16384 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 64 rows (64 slices) fixed 1 vec 0 sg 16
+BITS 0 of 16777216 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+TIME new 1592.543 ms stock 4986.037 ms (x3.13), longest slice new 36.0 ms stock 88.9 ms, 0.604 TFLOPS new
+CASE H 16 KVH 2 hd 256 vd 256 S 255 last 32768 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 32 rows (8 slices) fixed 1 vec 0 sg 16
+BITS 0 of 1044480 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+TIME new 461.862 ms stock 1414.235 ms (x3.06), longest slice new 71.1 ms stock 177.4 ms, 0.295 TFLOPS new
+CASE H 16 KVH 2 hd 256 vd 256 S 1024 last 32768 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 32 rows (32 slices) fixed 1 vec 0 sg 16
+BITS 0 of 4194304 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+TIME new 1777.815 ms stock 5590.493 ms (x3.14), longest slice new 68.1 ms stock 177.4 ms, 0.304 TFLOPS new
+CASE H 16 KVH 2 hd 256 vd 256 S 4096 last 32768 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 32 rows (128 slices) fixed 1 vec 0 sg 16
+BITS 0 of 16777216 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+TIME new 6721.597 ms stock 21284.856 ms (x3.17), longest slice new 65.3 ms stock 177.3 ms, 0.307 TFLOPS new
+CASE H 16 KVH 2 hd 256 vd 256 S 255 last 16384 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 64 rows (4 slices) fixed 1 vec 1 sg 16
+BITS 0 of 1044480 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+TIME new 59.370 ms stock 357.701 ms (x6.02), longest slice new 20.4 ms stock 89.9 ms, 1.144 TFLOPS new
+CASE H 16 KVH 2 hd 256 vd 256 S 1024 last 16384 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 64 rows (16 slices) fixed 1 vec 1 sg 16
+BITS 0 of 4194304 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+TIME new 182.055 ms stock 1396.104 ms (x7.67), longest slice new 19.1 ms stock 89.9 ms, 1.463 TFLOPS new
+CASE H 16 KVH 2 hd 256 vd 256 S 4096 last 16384 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 64 rows (64 slices) fixed 1 vec 1 sg 16
+BITS 0 of 16777216 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+TIME new 622.218 ms stock 5044.836 ms (x8.11), longest slice new 15.9 ms stock 89.9 ms, 1.546 TFLOPS new
+CASE H 16 KVH 2 hd 256 vd 256 S 255 last 32768 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 32 rows (8 slices) fixed 1 vec 1 sg 16
+BITS 0 of 1044480 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+TIME new 187.983 ms stock 1434.653 ms (x7.63), longest slice new 38.1 ms stock 179.9 ms, 0.725 TFLOPS new
+CASE H 16 KVH 2 hd 256 vd 256 S 1024 last 32768 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 32 rows (32 slices) fixed 1 vec 1 sg 16
+BITS 0 of 4194304 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+TIME new 692.307 ms stock 5667.260 ms (x8.19), longest slice new 35.1 ms stock 179.9 ms, 0.782 TFLOPS new
+CASE H 16 KVH 2 hd 256 vd 256 S 4096 last 32768 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 32 rows (128 slices) fixed 1 vec 1 sg 16
+BITS 0 of 16777216 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+TIME new 2596.568 ms stock 21582.909 ms (x8.31), longest slice new 34.1 ms stock 179.6 ms, 0.794 TFLOPS new
+
+===== matrix_sg32_b32.txt
+CASE H 16 KVH 2 hd 256 vd 256 S 255 last 16384 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 64 rows (4 slices) fixed 1 vec 0 sg 32
+BITS 0 of 1044480 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+TIME new 202.247 ms stock 477.030 ms (x2.36), longest slice new 62.2 ms stock 119.9 ms, 0.336 TFLOPS new
+CASE H 16 KVH 2 hd 256 vd 256 S 1024 last 16384 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 64 rows (16 slices) fixed 1 vec 0 sg 32
+BITS 0 of 4194304 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+TIME new 742.226 ms stock 1922.524 ms (x2.59), longest slice new 58.5 ms stock 125.3 ms, 0.359 TFLOPS new
+CASE H 16 KVH 2 hd 256 vd 256 S 4096 last 16384 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 64 rows (64 slices) fixed 1 vec 0 sg 32
+BITS 0 of 16777216 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+TIME new 2646.920 ms stock 6928.341 ms (x2.62), longest slice new 52.3 ms stock 125.1 ms, 0.363 TFLOPS new
+CASE H 16 KVH 2 hd 256 vd 256 S 255 last 32768 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 32 rows (8 slices) fixed 1 vec 0 sg 32
+BITS 0 of 1044480 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+TIME new 759.458 ms stock 1773.560 ms (x2.34), longest slice new 108.2 ms stock 222.6 ms, 0.180 TFLOPS new
+CASE H 16 KVH 2 hd 256 vd 256 S 1024 last 32768 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 32 rows (32 slices) fixed 1 vec 0 sg 32
+BITS 0 of 4194304 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+TIME new 2954.623 ms stock 7013.945 ms (x2.37), longest slice new 104.7 ms stock 222.6 ms, 0.183 TFLOPS new
+CASE H 16 KVH 2 hd 256 vd 256 S 4096 last 32768 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 32 rows (128 slices) fixed 1 vec 0 sg 32
+BITS 0 of 16777216 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+TIME new 11206.325 ms stock 26699.647 ms (x2.38), longest slice new 98.6 ms stock 222.6 ms, 0.184 TFLOPS new
+CASE H 16 KVH 2 hd 256 vd 256 S 255 last 16384 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 64 rows (4 slices) fixed 1 vec 1 sg 32
+BITS 0 of 1044480 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+TIME new 129.969 ms stock 485.353 ms (x3.73), longest slice new 44.9 ms stock 122.1 ms, 0.523 TFLOPS new
+CASE H 16 KVH 2 hd 256 vd 256 S 1024 last 16384 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 64 rows (16 slices) fixed 1 vec 1 sg 32
+BITS 0 of 4194304 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+TIME new 456.919 ms stock 1940.088 ms (x4.25), longest slice new 41.7 ms stock 124.9 ms, 0.583 TFLOPS new
+CASE H 16 KVH 2 hd 256 vd 256 S 4096 last 16384 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 64 rows (64 slices) fixed 1 vec 1 sg 32
+BITS 0 of 16777216 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+TIME new 1615.606 ms stock 6852.381 ms (x4.24), longest slice new 39.4 ms stock 122.1 ms, 0.596 TFLOPS new
+CASE H 16 KVH 2 hd 256 vd 256 S 255 last 32768 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 32 rows (8 slices) fixed 1 vec 1 sg 32
+BITS 0 of 1044480 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+TIME new 470.507 ms stock 1776.980 ms (x3.78), longest slice new 73.3 ms stock 222.9 ms, 0.290 TFLOPS new
+CASE H 16 KVH 2 hd 256 vd 256 S 1024 last 32768 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 32 rows (32 slices) fixed 1 vec 1 sg 32
+BITS 0 of 4194304 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+TIME new 1801.735 ms stock 7024.222 ms (x3.90), longest slice new 63.9 ms stock 223.0 ms, 0.300 TFLOPS new
+CASE H 16 KVH 2 hd 256 vd 256 S 4096 last 32768 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 32 rows (128 slices) fixed 1 vec 1 sg 32
+BITS 0 of 16777216 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+TIME new 6848.765 ms stock 26763.167 ms (x3.91), longest slice new 67.6 ms stock 222.9 ms, 0.301 TFLOPS new
+
+===== features_gpu1_sg16.txt
+  CASE H 16 KVH 2 hd 256 vd 256 S 40 last 47 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 40 rows (1 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 163840 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 16 KVH 2 hd 256 vd 256 S 40 last 47 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 40 rows (1 slices) fixed 1 vec 1 sg 16
+  BITS 0 of 163840 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 24 KVH 2 hd 64 vd 64 S 33 last 33 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 2 slice 33 rows (1 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 50688 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 24 KVH 2 hd 64 vd 64 S 33 last 33 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 2 slice 33 rows (1 slices) fixed 1 vec 1 sg 16
+  BITS 0 of 50688 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 4 KVH 4 hd 32 vd 32 S 64 last 164 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 32 slice 64 rows (1 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 8192 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 4 KVH 4 hd 32 vd 32 S 64 last 164 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 32 slice 64 rows (1 slices) fixed 1 vec 1 sg 16
+  BITS 0 of 8192 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 16 KVH 2 hd 128 vd 128 S 37 last 42 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 1 koff 0 voff 0 part 0 | bc 8 br 1 slice 37 rows (1 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 75776 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 16 KVH 2 hd 128 vd 128 S 37 last 42 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 1 koff 0 voff 0 part 0 | bc 8 br 1 slice 37 rows (1 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 75776 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 24 KVH 2 hd 24 vd 24 S 16 last 216 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 1 koff 0 voff 0 part 0 | bc 8 br 1 slice 16 rows (1 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 9216 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 24 KVH 2 hd 24 vd 24 S 16 last 216 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 1 koff 0 voff 0 part 0 | bc 8 br 1 slice 16 rows (1 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 9216 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 4 KVH 2 hd 48 vd 32 S 40 last 40 kv16 0 gate 1 win 8 ring 0 sink 1 pm 1 list 0 koff 0 voff 0 part 0 | bc 8 br 16 slice 40 rows (1 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 5120 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 4 KVH 2 hd 48 vd 32 S 40 last 40 kv16 1 gate 1 win 8 ring 0 sink 1 pm 1 list 0 koff 0 voff 0 part 0 | bc 8 br 16 slice 40 rows (1 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 5120 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 8 KVH 2 hd 64 vd 48 S 33 last 53 kv16 0 gate 1 win 0 ring 0 sink 1 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 8 slice 33 rows (1 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 12672 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 8 KVH 2 hd 64 vd 48 S 33 last 53 kv16 1 gate 1 win 0 ring 0 sink 1 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 8 slice 33 rows (1 slices) fixed 1 vec 1 sg 16
+  BITS 0 of 12672 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 4 KVH 4 hd 48 vd 32 S 50 last 150 kv16 0 gate 1 win 16 ring 40 sink 0 pm 1 list 0 koff 0 voff 0 part 0 | bc 8 br 32 slice 50 rows (1 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 6400 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 4 KVH 4 hd 48 vd 32 S 50 last 150 kv16 1 gate 1 win 16 ring 40 sink 0 pm 1 list 0 koff 0 voff 0 part 0 | bc 8 br 32 slice 50 rows (1 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 6400 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 8 KVH 4 hd 192 vd 128 S 20 last 23 kv16 0 gate 1 win 128 ring 0 sink 1 pm 1 list 0 koff 0 voff 0 part 0 | bc 8 br 16 slice 20 rows (1 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 20480 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 8 KVH 4 hd 192 vd 128 S 20 last 23 kv16 1 gate 1 win 128 ring 0 sink 1 pm 1 list 0 koff 0 voff 0 part 0 | bc 8 br 16 slice 20 rows (1 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 20480 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 32 KVH 4 hd 128 vd 128 S 90 last 990 kv16 0 gate 1 win 129 ring 230 sink 1 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 90 rows (1 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 368640 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 32 KVH 4 hd 128 vd 128 S 90 last 990 kv16 1 gate 1 win 129 ring 230 sink 1 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 90 rows (1 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 368640 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 32 KVH 4 hd 128 vd 128 S 33 last 53 kv16 0 gate 1 win 16 ring 0 sink 1 pm 0 list 0 koff 32 voff 16 part 0 | bc 8 br 4 slice 33 rows (1 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 135168 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 32 KVH 4 hd 128 vd 128 S 33 last 53 kv16 1 gate 1 win 16 ring 0 sink 1 pm 0 list 0 koff 32 voff 16 part 0 | bc 8 br 4 slice 33 rows (1 slices) fixed 1 vec 1 sg 16
+  BITS 0 of 135168 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 16 KVH 2 hd 256 vd 256 S 40 last 340 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 32 voff 16 part 0 | bc 8 br 4 slice 40 rows (1 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 163840 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 16 KVH 2 hd 256 vd 256 S 40 last 340 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 32 voff 16 part 0 | bc 8 br 4 slice 40 rows (1 slices) fixed 1 vec 1 sg 16
+  BITS 0 of 163840 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 4 KVH 2 hd 36 vd 20 S 40 last 100 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 16 slice 40 rows (1 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 3200 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 4 KVH 2 hd 36 vd 20 S 40 last 100 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 16 slice 40 rows (1 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 3200 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 4 KVH 2 hd 100 vd 72 S 37 last 300 kv16 0 gate 1 win 50 ring 0 sink 1 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 16 slice 37 rows (1 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 10656 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 4 KVH 2 hd 100 vd 72 S 37 last 300 kv16 1 gate 1 win 50 ring 0 sink 1 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 16 slice 37 rows (1 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 10656 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 8 KVH 2 hd 12 vd 4 S 20 last 60 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 8 slice 20 rows (1 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 640 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 8 KVH 2 hd 12 vd 4 S 20 last 60 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 8 slice 20 rows (1 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 640 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 8 KVH 8 hd 4 vd 8 S 24 last 40 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 1 koff 0 voff 0 part 0 | bc 8 br 1 slice 24 rows (1 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 1536 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 8 KVH 8 hd 4 vd 8 S 24 last 40 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 1 koff 0 voff 0 part 0 | bc 8 br 1 slice 24 rows (1 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 1536 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 16 KVH 2 hd 256 vd 256 S 40 last 340 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 4 voff 12 part 0 | bc 8 br 4 slice 40 rows (1 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 163840 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 16 KVH 2 hd 256 vd 256 S 40 last 340 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 4 voff 12 part 0 | bc 8 br 4 slice 40 rows (1 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 163840 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 16 KVH 2 hd 256 vd 256 S 64 last 700 kv16 0 gate 0 win 0 ring 0 sink 1 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 64 rows (1 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 262144 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 16 KVH 2 hd 256 vd 256 S 64 last 700 kv16 1 gate 0 win 0 ring 0 sink 1 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 64 rows (1 slices) fixed 1 vec 1 sg 16
+  BITS 0 of 262144 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 16 KVH 2 hd 256 vd 256 S 17 last 17 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 17 rows (1 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 69632 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 16 KVH 2 hd 256 vd 256 S 17 last 17 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 17 rows (1 slices) fixed 1 vec 1 sg 16
+  BITS 0 of 69632 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 16 KVH 2 hd 256 vd 256 S 64 last 1000 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 1 (chunks) | bc 8 br 4 slice 64 rows (1 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 528384 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 16 KVH 2 hd 256 vd 256 S 64 last 1000 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 1 (chunks) | bc 8 br 4 slice 64 rows (1 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 528384 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 16 KVH 2 hd 128 vd 64 S 50 last 1500 kv16 0 gate 1 win 300 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 1 (chunks) | bc 8 br 4 slice 50 rows (1 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 158400 floats differ (max rel 0.000e+00); stock output: 0 NaN, 104000 zeros, -0: new 0 stock 0
+  CASE H 16 KVH 2 hd 128 vd 64 S 50 last 1500 kv16 1 gate 1 win 300 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 1 (chunks) | bc 8 br 4 slice 50 rows (1 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 158400 floats differ (max rel 0.000e+00); stock output: 0 NaN, 104000 zeros, -0: new 0 stock 0
+  CASE H 32 KVH 4 hd 128 vd 128 S 8 last 2000 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 1 (chunks) | bc 8 br 4 slice 8 rows (1 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 133120 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 32 KVH 4 hd 128 vd 128 S 8 last 2000 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 1 (chunks) | bc 8 br 4 slice 8 rows (1 slices) fixed 1 vec 0 sg 16
+  BITS 0 of 133120 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+
+===== features_gpu1_sg32.txt
+  CASE H 16 KVH 2 hd 256 vd 256 S 40 last 47 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 40 rows (1 slices) fixed 1 vec 0 sg 32
+  BITS 0 of 163840 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 16 KVH 2 hd 256 vd 256 S 40 last 47 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 40 rows (1 slices) fixed 1 vec 1 sg 32
+  BITS 0 of 163840 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 24 KVH 2 hd 64 vd 64 S 33 last 33 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 2 slice 33 rows (1 slices) fixed 1 vec 0 sg 32
+  BITS 0 of 50688 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 24 KVH 2 hd 64 vd 64 S 33 last 33 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 2 slice 33 rows (1 slices) fixed 1 vec 1 sg 32
+  BITS 0 of 50688 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 4 KVH 4 hd 32 vd 32 S 64 last 164 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 32 slice 64 rows (1 slices) fixed 1 vec 0 sg 32
+  BITS 0 of 8192 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 4 KVH 4 hd 32 vd 32 S 64 last 164 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 32 slice 64 rows (1 slices) fixed 1 vec 1 sg 32
+  BITS 0 of 8192 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 16 KVH 2 hd 128 vd 128 S 37 last 42 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 1 koff 0 voff 0 part 0 | bc 8 br 1 slice 37 rows (1 slices) fixed 1 vec 0 sg 32
+  BITS 0 of 75776 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 16 KVH 2 hd 128 vd 128 S 37 last 42 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 1 koff 0 voff 0 part 0 | bc 8 br 1 slice 37 rows (1 slices) fixed 1 vec 0 sg 32
+  BITS 0 of 75776 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 24 KVH 2 hd 24 vd 24 S 16 last 216 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 1 koff 0 voff 0 part 0 | bc 8 br 1 slice 16 rows (1 slices) fixed 1 vec 0 sg 32
+  BITS 0 of 9216 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 24 KVH 2 hd 24 vd 24 S 16 last 216 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 1 koff 0 voff 0 part 0 | bc 8 br 1 slice 16 rows (1 slices) fixed 1 vec 0 sg 32
+  BITS 0 of 9216 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 4 KVH 2 hd 48 vd 32 S 40 last 40 kv16 0 gate 1 win 8 ring 0 sink 1 pm 1 list 0 koff 0 voff 0 part 0 | bc 8 br 16 slice 40 rows (1 slices) fixed 1 vec 0 sg 32
+  BITS 0 of 5120 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 4 KVH 2 hd 48 vd 32 S 40 last 40 kv16 1 gate 1 win 8 ring 0 sink 1 pm 1 list 0 koff 0 voff 0 part 0 | bc 8 br 16 slice 40 rows (1 slices) fixed 1 vec 0 sg 32
+  BITS 0 of 5120 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 8 KVH 2 hd 64 vd 48 S 33 last 53 kv16 0 gate 1 win 0 ring 0 sink 1 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 8 slice 33 rows (1 slices) fixed 1 vec 0 sg 32
+  BITS 0 of 12672 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 8 KVH 2 hd 64 vd 48 S 33 last 53 kv16 1 gate 1 win 0 ring 0 sink 1 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 8 slice 33 rows (1 slices) fixed 1 vec 1 sg 32
+  BITS 0 of 12672 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 4 KVH 4 hd 48 vd 32 S 50 last 150 kv16 0 gate 1 win 16 ring 40 sink 0 pm 1 list 0 koff 0 voff 0 part 0 | bc 8 br 32 slice 50 rows (1 slices) fixed 1 vec 0 sg 32
+  BITS 0 of 6400 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 4 KVH 4 hd 48 vd 32 S 50 last 150 kv16 1 gate 1 win 16 ring 40 sink 0 pm 1 list 0 koff 0 voff 0 part 0 | bc 8 br 32 slice 50 rows (1 slices) fixed 1 vec 0 sg 32
+  BITS 0 of 6400 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 8 KVH 4 hd 192 vd 128 S 20 last 23 kv16 0 gate 1 win 128 ring 0 sink 1 pm 1 list 0 koff 0 voff 0 part 0 | bc 8 br 16 slice 20 rows (1 slices) fixed 1 vec 0 sg 32
+  BITS 0 of 20480 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 8 KVH 4 hd 192 vd 128 S 20 last 23 kv16 1 gate 1 win 128 ring 0 sink 1 pm 1 list 0 koff 0 voff 0 part 0 | bc 8 br 16 slice 20 rows (1 slices) fixed 1 vec 0 sg 32
+  BITS 0 of 20480 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 32 KVH 4 hd 128 vd 128 S 90 last 990 kv16 0 gate 1 win 129 ring 230 sink 1 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 90 rows (1 slices) fixed 1 vec 0 sg 32
+  BITS 0 of 368640 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 32 KVH 4 hd 128 vd 128 S 90 last 990 kv16 1 gate 1 win 129 ring 230 sink 1 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 90 rows (1 slices) fixed 1 vec 0 sg 32
+  BITS 0 of 368640 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 32 KVH 4 hd 128 vd 128 S 33 last 53 kv16 0 gate 1 win 16 ring 0 sink 1 pm 0 list 0 koff 32 voff 16 part 0 | bc 8 br 4 slice 33 rows (1 slices) fixed 1 vec 0 sg 32
+  BITS 0 of 135168 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 32 KVH 4 hd 128 vd 128 S 33 last 53 kv16 1 gate 1 win 16 ring 0 sink 1 pm 0 list 0 koff 32 voff 16 part 0 | bc 8 br 4 slice 33 rows (1 slices) fixed 1 vec 1 sg 32
+  BITS 0 of 135168 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 16 KVH 2 hd 256 vd 256 S 40 last 340 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 32 voff 16 part 0 | bc 8 br 4 slice 40 rows (1 slices) fixed 1 vec 0 sg 32
+  BITS 0 of 163840 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 16 KVH 2 hd 256 vd 256 S 40 last 340 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 32 voff 16 part 0 | bc 8 br 4 slice 40 rows (1 slices) fixed 1 vec 1 sg 32
+  BITS 0 of 163840 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 4 KVH 2 hd 36 vd 20 S 40 last 100 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 16 slice 40 rows (1 slices) fixed 1 vec 0 sg 32
+  BITS 0 of 3200 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 4 KVH 2 hd 36 vd 20 S 40 last 100 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 16 slice 40 rows (1 slices) fixed 1 vec 0 sg 32
+  BITS 0 of 3200 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 4 KVH 2 hd 100 vd 72 S 37 last 300 kv16 0 gate 1 win 50 ring 0 sink 1 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 16 slice 37 rows (1 slices) fixed 1 vec 0 sg 32
+  BITS 0 of 10656 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 4 KVH 2 hd 100 vd 72 S 37 last 300 kv16 1 gate 1 win 50 ring 0 sink 1 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 16 slice 37 rows (1 slices) fixed 1 vec 0 sg 32
+  BITS 0 of 10656 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 8 KVH 2 hd 12 vd 4 S 20 last 60 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 8 slice 20 rows (1 slices) fixed 1 vec 0 sg 32
+  BITS 0 of 640 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 8 KVH 2 hd 12 vd 4 S 20 last 60 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 8 slice 20 rows (1 slices) fixed 1 vec 0 sg 32
+  BITS 0 of 640 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 8 KVH 8 hd 4 vd 8 S 24 last 40 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 1 koff 0 voff 0 part 0 | bc 8 br 1 slice 24 rows (1 slices) fixed 1 vec 0 sg 32
+  BITS 0 of 1536 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 8 KVH 8 hd 4 vd 8 S 24 last 40 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 1 koff 0 voff 0 part 0 | bc 8 br 1 slice 24 rows (1 slices) fixed 1 vec 0 sg 32
+  BITS 0 of 1536 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 16 KVH 2 hd 256 vd 256 S 40 last 340 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 4 voff 12 part 0 | bc 8 br 4 slice 40 rows (1 slices) fixed 1 vec 0 sg 32
+  BITS 0 of 163840 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 16 KVH 2 hd 256 vd 256 S 40 last 340 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 4 voff 12 part 0 | bc 8 br 4 slice 40 rows (1 slices) fixed 1 vec 0 sg 32
+  BITS 0 of 163840 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 16 KVH 2 hd 256 vd 256 S 64 last 700 kv16 0 gate 0 win 0 ring 0 sink 1 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 64 rows (1 slices) fixed 1 vec 0 sg 32
+  BITS 0 of 262144 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 16 KVH 2 hd 256 vd 256 S 64 last 700 kv16 1 gate 0 win 0 ring 0 sink 1 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 64 rows (1 slices) fixed 1 vec 1 sg 32
+  BITS 0 of 262144 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 16 KVH 2 hd 256 vd 256 S 17 last 17 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 17 rows (1 slices) fixed 1 vec 0 sg 32
+  BITS 0 of 69632 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 16 KVH 2 hd 256 vd 256 S 17 last 17 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 0 | bc 8 br 4 slice 17 rows (1 slices) fixed 1 vec 1 sg 32
+  BITS 0 of 69632 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 16 KVH 2 hd 256 vd 256 S 64 last 1000 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 1 (chunks) | bc 8 br 4 slice 64 rows (1 slices) fixed 1 vec 0 sg 32
+  BITS 0 of 528384 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 16 KVH 2 hd 256 vd 256 S 64 last 1000 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 1 (chunks) | bc 8 br 4 slice 64 rows (1 slices) fixed 1 vec 0 sg 32
+  BITS 0 of 528384 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 16 KVH 2 hd 128 vd 64 S 50 last 1500 kv16 0 gate 1 win 300 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 1 (chunks) | bc 8 br 4 slice 50 rows (1 slices) fixed 1 vec 0 sg 32
+  BITS 0 of 158400 floats differ (max rel 0.000e+00); stock output: 0 NaN, 104000 zeros, -0: new 0 stock 0
+  CASE H 16 KVH 2 hd 128 vd 64 S 50 last 1500 kv16 1 gate 1 win 300 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 1 (chunks) | bc 8 br 4 slice 50 rows (1 slices) fixed 1 vec 0 sg 32
+  BITS 0 of 158400 floats differ (max rel 0.000e+00); stock output: 0 NaN, 104000 zeros, -0: new 0 stock 0
+  CASE H 32 KVH 4 hd 128 vd 128 S 8 last 2000 kv16 0 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 1 (chunks) | bc 8 br 4 slice 8 rows (1 slices) fixed 1 vec 0 sg 32
+  BITS 0 of 133120 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0
+  CASE H 32 KVH 4 hd 128 vd 128 S 8 last 2000 kv16 1 gate 1 win 0 ring 0 sink 0 pm 0 list 0 koff 0 voff 0 part 1 (chunks) | bc 8 br 4 slice 8 rows (1 slices) fixed 1 vec 0 sg 32
+  BITS 0 of 133120 floats differ (max rel 0.000e+00); stock output: 0 NaN, 0 zeros, -0: new 0 stock 0

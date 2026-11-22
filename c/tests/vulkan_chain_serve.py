@@ -18,7 +18,9 @@ COLI_VK_CHAIN in the caller's environment picks the chain's mode (default 1; 2 r
 prompts on the device and decode on the CPU, the state moving between them).
 CHAIN_SERVE_PAIRS=1 with CHAIN_SERVE_SLOTS=n sends the turns n at a time, one a slot,
 together: their decode rows run in the same steps (several conversations in one forward).
-CHAIN_SERVE_LONG=n (with CHAIN_SERVE_PAIRS) puts n bytes before each group's first prompt.
+CHAIN_SERVE_LONG=n (with CHAIN_SERVE_PAIRS) puts n bytes before each group's first prompt;
+CHAIN_SERVE_LONG_ONCE=1, before the first group's only (the later conversations in that slot
+are shorter: a place's mirrors cut to them). Without CHAIN_SERVE_PAIRS, before the first turn.
 CHAIN_SERVE_TEXT=1 compares each frame's kind, id and text only (a device lost mid-session:
 the state rebuilt on the CPU sums in another order, the numbers move in their last digits).
 CHAIN_SERVE_BACKEND=cuda runs the chain session on the CUDA chain instead (COLI_CUDA=1).
@@ -82,6 +84,8 @@ def session(engine, snap, extra, chain):
     nslots = int(os.environ.get("CHAIN_SERVE_SLOTS", "1"))
     if os.environ.get("CHAIN_SERVE_PAIRS") == "1" and nslots > 1:
         return pairs(p, err, turns, nslots)
+    if LONG and turns:   # one session: its first turn a long conversation, the later ones shorter
+        turns[0] = (bytes(97 + (t * 7) % 26 for t in range(LONG)) + turns[0][0],) + tuple(turns[0][1:])
     interleave = os.environ.get("CHAIN_SERVE_INTERLEAVE") == "1" and nslots > 1
     sched = []   # (turn index, slot); -1: a foreign turn on another slot between two of slot 0's
     for i in range(len(turns)):
@@ -138,7 +142,7 @@ def pairs(p, err, turns, nslots):
         group = turns[k:k + nslots]
         wire = b""
         for j, (prompt, max_tok, ext) in enumerate(group):
-            if j == 0 and LONG:   # a conversation past the places' first mirrors (they grow)
+            if j == 0 and LONG and (k == 0 or not LONG_ONCE):   # a conversation past the places' first mirrors (they grow)
                 prompt = bytes(97 + (t * 7) % 26 for t in range(LONG)) + prompt
             hdr = f"SUBMIT r{k + j} {j} {len(prompt)} {max_tok + 8 * j} 0 1" + (f" {ext}" if ext else "") + "\n"
             wire += hdr.encode() + prompt + b"\n"
@@ -171,6 +175,7 @@ WORST = [0.0]
 
 TEXT = os.environ.get("CHAIN_SERVE_TEXT") == "1"
 LONG = int(os.environ.get("CHAIN_SERVE_LONG", "0"))
+LONG_ONCE = os.environ.get("CHAIN_SERVE_LONG_ONCE") == "1"
 
 
 def close(a, b):

@@ -41,7 +41,9 @@ sys.path.insert(0, str(HERE / "tools"))
 FAILS = []
 # Q38_MTP_DRAFTS=1: this harness gates the one-draft verify (S=2) and counts its loop;
 # deeper verifies and prompt lookup are tests/spec_drafts_harness.py's
-BASE_ENV = {"OMP_NUM_THREADS": "2", "COLI_NO_OMP_TUNE": "1", "COLI_CUDA": "0",
+# SEED: both arms of a comparison sample the same draws (#2949: an unset SEED seeds the sampler
+# from the clock and the pid)
+BASE_ENV = {"SEED": os.environ.get("SEED", "1"), "OMP_NUM_THREADS": "2", "COLI_NO_OMP_TUNE": "1", "COLI_CUDA": "0",
             "Q38_TRUNK_GPU": "0", "NOSTREAM": "1", "USAGE_SAVE": "0", "Q38_MTP_DRAFTS": "1",
             # the comparisons are against plain decoding, and the MTP head and prompt lookup
             # are on by default since 1.13.0: a run is plain unless it sets Q38_MTP=1 itself
@@ -273,8 +275,8 @@ def serve_session(engine, model, extra, turns=SERVE_TURNS):
                 p.stdin.flush()
                 while True:
                     fields, line = frame()
-                    if not fields or fields[0] in (b"STAT", b"PROF", b"EMAP", b"HITS", b"CAPS"):
-                        continue    # timings, and the expert residency the draft rows change
+                    if not fields or fields[0] in (b"STAT", b"PROF", b"EMAP", b"HITS", b"HITL", b"CAPS"):
+                        continue    # timings, and the expert residency and routes (HITL) the draft rows change
                     if fields[0] == b"DONE":    # tokens/s and RSS vary: keep the count and the reason
                         line = b" ".join(fields[:4] + fields[-2:])
                     frames.append(line)

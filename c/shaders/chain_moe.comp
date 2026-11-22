@@ -79,7 +79,10 @@ layout(push_constant) uniform P {
 
 // an entry: 32 words (coli_vk_xb_expert_entry): [0..1] gate rows, [2..3] its scales,
 // [4..5] up, [6..7], [8..9] down, [10..11]; [12] gate/up fmt, [13] their row words,
-// [14] their gs, [15] down's fmt, [16] row words, [17] gs; [18] 1 = resident
+// [14] their gs, [15] down's fmt, [16] row words, [17] gs; [18] 1 = resident; [19] and [20]
+// a scale of gate and up's and of down's outside the matrices, as float bits, 0 = none (1):
+// gate's and up's products times [19] before the activation, w times [20] in the sum
+// (Inkling-2's NVFP4 experts from a GGUF, their global scales; vk_dmoe.h's escale)
 #define ENT 32u
 #define RPS 4u
 
@@ -349,7 +352,10 @@ float rowdot(WRef W, SRef Sc, int fmt, int rowWords, int gs, int o, int lane, in
 
 uvec2 addr(uint at) { return uvec2(tab[at], tab[at + 1u]); }
 float situ_tanh(float v) { return abs(v) < 0.000244140625 ? v : tanh(v); }
+float g_s13 = 1.0;   // the pair's gate and up scale (entry word 19), mode 0
+float esc(uint eb, uint w) { uint v = tab[eb + w]; return v == 0u ? 1.0 : uintBitsToFloat(v); }
 float act(float g, float u) {
+    g *= g_s13; u *= g_s13;
     if (p.act == 1) return p.a * situ_tanh(g / p.a) * (1.0 / (1.0 + exp(-g))) * (p.b * situ_tanh(u / p.b));
     if (p.limit > 0.0) { g = min(g, p.limit); u = clamp(u, -p.limit, p.limit); }
     return (g / (1.0 + exp(-g))) * u;
@@ -386,7 +392,7 @@ void main() {
         for (int k = 0; k < p.K; k++) {
             int e = ids[p.i_off + s * p.i_row + k];
             if (e < 0 || tab[uint(p.t_off + max(e, 0)) * ENT + 18u] == 0u) continue;
-            acc += rw[p.w_off + s * p.w_row + k] * hid[yko + (s * p.K + k) * p.D + oc];
+            acc += rw[p.w_off + s * p.w_row + k] * esc(uint(p.t_off + e) * ENT, 20u) * hid[yko + (s * p.K + k) * p.D + oc];
         }
         if (o < p.D) y[p.y_off + s * p.y_row + o] = acc;
         return;
@@ -398,6 +404,7 @@ void main() {
     int e = ids[p.i_off + s * p.i_row + k];
     uint eb = uint(p.t_off + max(e, 0)) * ENT;
     if (e < 0 || tab[eb + 18u] == 0u) return;
+    if (p.mode == 0) g_s13 = esc(eb, 19u);
     uint fo = p.mode == 0 ? 12u : 15u;                  // the matrices' format words
     int fmt = int(tab[eb + fo]), rws = int(tab[eb + fo + 1u]), gs = int(tab[eb + fo + 2u]);
     if (BD != 0 && BTG > 0 && BTD > 0) fmt = p.mode == 0 ? 99 + BTG : 99 + BTD;

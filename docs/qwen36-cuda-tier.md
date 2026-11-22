@@ -147,9 +147,14 @@ against 41.7 on the CPU, the 30 DeltaNet projections 106 against 66) and
 decode fell from 3.56 to 2.68 tok/s. So the engine measures before it uploads
 a byte of trunk: one DeltaNet input projection is timed both ways on the
 device that would host it (ten GEMVs, best of three rounds, after a warm-up),
-one `[place] probe:` line reports both times, and if the GPU loses the whole
-automatic placement is withdrawn (`[place] trunk stays on the CPU`) and its
-bytes go back to the expert budget before the warmstart. On the CPU the ten
+one `[place] probe:` line reports both times, and if the CPU is clearly faster
+(the card's time more than 1.3 times the CPU's) the whole automatic placement
+is withdrawn (`[place] trunk stays on the CPU`) and its bytes go back to the
+expert budget before the warmstart. A near tie goes to the card: a burst of ten
+GEMVs flatters the CPU, most of all in a container under a CPU quota, where a
+team larger than the quota runs at full speed for the probe and is throttled
+for the decode (#2914). Where the CPU won, it won by far: 0.860 ms against
+2.303 on the M10, 0.306 against 0.900 on a GTX 1650 Max-Q. On the CPU the ten
 GEMVs read the projections of ten layers, as decode reads each once a step:
 one 16 MiB projection read ten times stays in a big L3, and beside an RTX PRO
 6000 an EPYC 9B45 (three 32 MiB L3s) came within about 10% of the card that way
@@ -524,6 +529,14 @@ it replaces gave each (head, row) a block that read every K and V row again. On 
 35B, a 1024-token prompt: 226 ms of attention -> 23 ms; a 467-token prompt 819-837 ->
 890-903 tok/s; the loss above 3.2223 -> 3.2271.
 
+Where `cc_attn_fk` takes a prompt chunk (sm_70, or `COLI_CUDA_CHAIN_FLASH2=0`), at head
+dim 256 and with K and V 16-byte aligned (the chain's mirrors are), a thread stages them
+16 bytes a load, eight loads before it stores any (`cc_fa_stage16`): eight halves of a
+float16 cache copied as they are, or four floats rounded as the one-element loop rounds
+them, so the same bits. Groups of 16 loads spilled on sm_70, where the kernel already
+holds 230 registers; groups of 8 take 242 and no stack. Qwen3.6-35B on a V100 (every
+expert on the card): a 2048-token prompt 2442 -> 2595 tok/s, 8192 tokens 2218 -> 3015.
+
 From sm_75 (a T4) `cc_attn_f2` takes it instead (one pass, FlashAttention-2's running max
 and sum): a block of four warps takes 64 query rows (the query heads of a kv head dividing
 64), so a block of keys is staged once for four times the rows, and its scores never leave
@@ -699,7 +712,12 @@ a layer's non-resident experts into VRAM and runs them with the residents:
   f16 GEMMs read directly (`CcExpert.planar`: in each 64 weights' 32 bytes, byte k holds
   weight k low and k + 32 high, both v + 8). No second copy in RAM, no conversion. On when
   the RAM holds every expert (no slot is ever recycled), one card, int4-g64 and the f16
-  GEMMs (`coli_cuda_planar_rows`).
+  GEMMs (`coli_cuda_planar_rows`). A per-row int4 container (or int4 per group with
+  `QWEN_EXPERT_KERNEL=0`) keeps the packed pairs beside its int8 copy: the very bytes the
+  residents' tensors hold (`CcExpert.planar` 0), gate, up and down in one block with the
+  row scales, so the pool takes them as they are and every GEMM reads them as it reads a
+  resident's. Where the pool stays off and not every expert is on the card, the warm start
+  says why (`[qtier] no host pool (...)`).
 - The pool follows the residents (`qt_chain_host_follow`). The chain's promotions and the
   tier's LFRU swaps move experts between the card and the RAM after the warm start; before a
   prompt chunk of 128 rows or more (`Q36CC_FOLLOW_ROWS`), the experts that left the card are
@@ -710,11 +728,56 @@ a layer's non-resident experts into VRAM and runs them with the residents:
   back to a chunk of a few dozen rows: a smaller chunk leaves the pool behind for the next
   large one, its layers holding an expert that left on the host's step as before. An expert
   whose page-lock is refused stays out until the next follow.
-- The staging (`cc_fetch`, `cc_fetch_wait`, `cc_fetch_done`): one layer's worth of VRAM,
-  the most non-resident experts any layer has, filled on a copy stream of its own. The copy
-  of the next such layer starts once the layer before has run its experts' GEMMs, so it
-  overlaps that layer's sum and the next layer's attention; one buffer, because the copy
-  is the longer of the two and a second one would buy little.
+- The residents' copies go to the pool too when the card holds fewer than every expert and
+  the chain runs (`tier_warmstart`, which calls `qt_chain_host_all` once the loop that
+  pools the experts off the card has ended): an expert the promotions, the swaps or the KV
+  mirrors' give-back move off the card is in the pool already, for any prompt chunk that
+  stages, and the follow has nothing to do (once every expert is in, it returns at once; the chain's staged table
+  still follows the residents, by the tier's epoch). The copies are the slots' own, in
+  whichever layout the pool takes (planar blocks, int4 pairs, a GGUF's rows). It costs the
+  RAM page-locked, every expert's instead of those off the card, and a pass over the
+  residents at the warm start: on a Colab T4, 16.88 GB of the RAM cache page-locked
+  instead of 6.00, the model ready in 21.96 s instead of 19.73. A short chunk gains from
+  it because it copies only its routed experts (above): with a whole layer's copy for
+  each of those layers, a 64-token prompt after a long one was slower than with the
+  host's step (89.94 against 103.58 tok/s on that T4, on the code before the routed
+  copy). They come last: where the driver refuses page-locks, the
+  experts off the card, which the pool is for, have theirs and the residents get what is
+  left. If the driver refused any page-lock, the pool is not whole and the follow stays on
+  as without this: the pooled residents leave it, the experts that leave the card join it,
+  and the startup line says the page-locks did not reach every expert. A card that holds
+  every expert pools nothing, as before. The startup line `host pool` says how many of its
+  experts are the residents'.
+- The staging (`cc_fetch`, `cc_fetch_wait`, `cc_fetch_done`): VRAM for the most
+  non-resident experts any layer has, filled on a copy stream of its own. The copy of the
+  next such layer starts once the layer before has run its experts' GEMMs, so it overlaps
+  that layer's sum and the next layer's attention. With whole layers off the card (the
+  warm start in index order, before the spread residents) a staged layer has 256 experts
+  to copy, the copy is the longer of the two and one bank is all there is. With the
+  residents spread over the layers (a Colab T4: 91 experts a layer) the buffer has two
+  banks, the staged
+  layers taking them in turn (`cc_fetch_at`, `cc_fetch_wait_at`, `cc_fetch_done_at`, a pair
+  of events each): a layer's copy runs beside the layer before's experts. Two banks only
+  where both fit in the `n_experts` experts that `q36cc_rows_max` and `q36cc_mirror_room`
+  already set aside for the staging (`2 * hmax <= n_experts`), so the residents and the
+  chunk size are what they were. Where the card has no room for the second bank the
+  staging has one, and where the mirrors later need the memory `q36cc_stage_drop` gives
+  both back. The line `stages the host pool's experts in` says how many banks and how
+  many experts each. The layout is the same for the planar pool and for a per-row
+  container's pairs (only `CcExpert.planar` differs). A staged table that sets no banks
+  (a GGUF's, `q36cc_stage_table_gguf`, which writes none) has one (`q36cc_banks`).
+- On an int4 container (per row or per group, planar blocks or pairs: an expert's two
+  regions in the pool, its matrices and its scales), a chunk of up to 256 rows
+  (`Q36CC_ROUTED_ROWS`) routes to only a part of a layer's experts: each staged layer
+  copies just those, right after its router (the host reads the routes down, then queues
+  the copies). That copy no longer overlaps the layer before, so a longer chunk, which
+  routes to nearly every expert, keeps the whole copy. The chain says the rule at its
+  first staging; its report counts the layer steps that copied only their routes. With two banks
+  the routed copy goes into the layer's own bank, with that bank's events (`cc_fetch_at`, the layer's
+  `cc_fetch_wait_at` and `cc_fetch_done_at`), and the next layer's copy is not started ahead: a routed
+  chunk uses the banks for their addresses, not to overlap. A GGUF's chunk copies whole layers: its staged experts take one or three regions,
+  which the routed copy's list of an expert's two regions cannot describe
+  (`q36cc_routes_only`).
 - The prompt chunk's table points each staged expert at its place in the staging; a
   decode step keeps the table of the residents and the CPU's share (a row at a time,
   the CPU's kernel is faster than a copy).
@@ -804,6 +867,57 @@ engine on the same card in the last column):
 
 Decode is the same: 111.5 against 111.3 tok/s on the whole card, and 50.9 against 53.3
 with 7 GiB free.
+
+**A per-row int4 container** (#2734) had no host pool: its 12.7K-token prompt ran the experts
+outside VRAM on the CPU, 134 s on an RTX 3070 against 10.4 s with the gs64 container. On an
+RTX PRO 4000 at `CUDA_EXPERT_GB=6` (4.2 GB of experts, an 8 GB card's `auto` budget), an
+11,852-token prompt, three runs each:
+
+| Qwen3.6-35B-A3B | prompt | decode after |
+|---|---|---|
+| per-row int4, before | 235 / 160 / 130 s | 37-50 tok/s |
+| per-row int4, the host pool | 4.2 / 4.4 / 4.4 s | 37-49 tok/s |
+| int4-g64 (unchanged) | 4.8 / 4.9 / 4.8 s | 54-66 tok/s |
+
+The first token's top-20 logprobs with 7585 experts staged from RAM are the bits it has with
+every expert on the card.
+
+### The KV mirrors' room under `CUDA_EXPERT_GB=auto`
+
+`auto` fills the card with experts, and the chain's KV mirrors grow with the conversation
+into what is left. The chunk's rows take half the free memory at the first prompt and leave
+the other half to the mirrors (`q36cc_rows_max`); on an 8 GB card at `--ctx 65536` a long
+conversation outgrew it: the mirrors first took the host pool's staging for the rest of the
+process, then the memory a frame needed, and every later step went to the CPU (#2734). Before
+the mirrors grow, the chain now makes room for them, a chunk's scratch and staging where not
+yet allocated, and 256 MiB for the driver (a kernel's first launch loads its code into device
+memory), out of the expert tier where the card lacks it (`q36cc_mirror_room`,
+`qt_chain_give_back`): residents leave the card, the tier's budget comes down by as much, the
+CPU computes them from their RAM copy and the host pool takes them at its next follow (they
+are in it already where the warm start pooled the residents' copies too).
+
+The driver packs allocations under 2 MiB into 2 MiB pages and releases a page only when
+nothing in it is left. The 35B's expert matrices are 512 KiB each, so the coldest residents,
+spread over the card, freed no memory at all (142 MB of experts, the free memory where it
+was). The tier takes them by page instead, with their device addresses from the chain: pages
+its matrices fill before any other, each pick the page whose release costs the fewest
+residents still on the card (one each plus its routes and heat), and the chain measures the
+free memory again after each give-back (`q36cc_room_from_tier`). One conversation's place
+under `KV_SLOTS` > 1 grows the same way once the other places' mirrors are gone.
+
+Measured on an RTX PRO 4000 with 16 GB held by another process (the 7.2 GB left an 8 GB
+card's), `CUDA_EXPERT_GB=auto` (4.16 GB of experts, 1024 rows a chunk), `--ctx 65536`, the
+gs64 container, prompts of growing length in one server (tok/s):
+
+| prompt | before | after | decode after, before / after |
+|---|---|---|---|
+| 3,750 tokens | 740 | 740 | 58.3 / 57.4 |
+| 11,850 | 766 | 770 | 69.6 / 69.2 |
+| 19,387 | 796 | 786 | 68.0 / 66.6 |
+| 29,962 | 147 (the staging dropped) | 754 | 66.4 / 60.8 |
+| 43,913 | out of memory, the CPU (more than 900 s) | 725 | - / 55.3 |
+
+603 experts given back in all, one give-back a growth past 19K tokens.
 
 ### A GGUF's experts at their own size (`COLI_CUDA_EXACT_SLOTS`, on by default)
 

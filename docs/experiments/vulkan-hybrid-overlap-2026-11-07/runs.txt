@@ -1,0 +1,46 @@
+# A hybrid step's frame B overlaps the CPU pairs: before against after (2026-11-07)
+# Hardware: Proxmox VE 9.2 VM on an HP Z6 G4: 32 vCPUs of an Intel Xeon Gold 6254 @ 3.10GHz (1 socket, 1 thread per core in the guest), the engine container on CPUs 16-31 with 16 OpenMP threads; GPU 1 = an Intel Arc Pro B60 (Xe2, BMG G21, 24 GB) as an SR-IOV VF (0000:02:00.0, PCIe Gen3 x8 to the host), the engine's only device; another engine idle on GPU 0 and CPUs 0-15
+# Model: Qwen/Qwen3.8-Flash-Next-FP8 (the release's FP8 e4m3 experts, 128x128 block scales; 185.5 GB), at /models/qwen38-flash-next (config.json sha256 99c11efba4012d0f760f4e4831a8d6cafd845044e21d0aa9e6d9e70a15a90a8d)
+#   base    dev e24cd51a + the Xe2 fixes of #2685-#2689 + the FP8 host pairs kernel (the companion pull request): image colibri-vulkan:q38-fp8host2, qwen38 sha256 fbd70cc4996c372756524231d681a76d1807bb1ff2d0321eeb15afeb9caa059c
+#   change  the same + this change: image colibri-vulkan:q38-fp8host3, qwen38 sha256 101327ea94d0071d047d106b77708f808d2c0f52b0e3277e3a417f64789bca18
+# Engine settings, both arms: {"COLI_VK_HYBRID_BIG_ROWS": "32", "COLI_VK_CHAIN_ROWS": "3072", "Q38_MAXT": "65536", "experts": "FP8 (Q38_EXPERT_INT4=0)", "cap": "64", "OMP_NUM_THREADS": "16"}
+# Command: Build, both trees: docker run --rm -v <tree>:/src -w /src colibri-builder:xe2 nice -n 19 make -C c colibri qwen36 qwen38 VK=1 ARCH=x86-64-v3 (0 warnings); the binaries, c/*.py, c/tools and c/shaders over the same runtime image (Ubuntu 26.04, Mesa 26.2.6). Engine: docker compose up -d of a compose file with coli serve --model /models/qwen38-flash-next --cap 64, COLI_ENGINE=/app/qwen38, COLI_VULKAN=1, only GPU 1's render node mapped, cpuset 16-31, OMP_NUM_THREADS=16, COLI_USAGE= the shipped c/profiles/qwen38-flash-next.coli_usage with USAGE_SAVE=0, and an override with the arm's image and variables. Measured with colibench, a local benchmark harness (not part of this repository): python3 colibench.py run --profile light --micro off --repetitions 3 --warmups 1 --workloads decode_short,prefill_short,prefill_long --timeout 1800, COLIBENCH_REASONING_EFFORT=none (streamed OpenAI API requests, temperature 0); answers: experiments/outputs_check.py.
+# Prompt set sha256 (sha256 of the sorted sha256s of the measured prompts, one per line): d8763306dccc29100d666f6bdcfa3cff852a0a0eaa2336e2eb46a74ed8eeb2d1.
+# Read: tok/s = colibench's decode proxy of decode_short (128 tokens of 'Write a long numbered list of computer performance tips. Continue until the output limit. Do not conclude.'); ttft = first streamed token of prefill_short ('Reply OK.') and prefill_long (3,000 words, 3,059 rows in the engine). One warm-up request first.
+
+# Samples
+base  decode_short 1: 6.616 tok/s
+base  decode_short 2: 7.821 tok/s
+base  decode_short 3: 7.698 tok/s
+change  decode_short 1: 8.912 tok/s
+change  decode_short 2: 11.509 tok/s
+change  decode_short 3: 10.811 tok/s
+
+# First token (s)
+base  short [1.6617, 1.6035, 1.4287]  ~3,000 tokens [52.8703, 43.9559, 43.7992]
+change  short [1.5874, 1.4246, 1.3339]  ~3,000 tokens [52.6347, 44.0778, 44.235]
+
+# Answers (greedy, 3 prompts, 160 tokens, against q38-base)
+base:   greedy answers to 3 fixed prompts (160 tokens, thinking off) against q38-base: 3/3 identical
+change: 3/3 identical
+
+===== base: colibench run 20261107-204105 (1794084065.6459572)
+  prefill_long   rep 1  ttft 52.870 s  decode None tok/s  tokens 1  ok
+  prefill_short  rep 1  ttft 1.662 s  decode None tok/s  tokens 1  ok
+  decode_short   rep 1  ttft 1.736 s  decode 6.616 tok/s  tokens 128  ok
+  decode_short   rep 2  ttft 1.680 s  decode 7.821 tok/s  tokens 128  ok
+  prefill_long   rep 2  ttft 43.956 s  decode None tok/s  tokens 1  ok
+  prefill_short  rep 2  ttft 1.604 s  decode None tok/s  tokens 1  ok
+  prefill_long   rep 3  ttft 43.799 s  decode None tok/s  tokens 1  ok
+  decode_short   rep 3  ttft 1.998 s  decode 7.698 tok/s  tokens 128  ok
+  prefill_short  rep 3  ttft 1.429 s  decode None tok/s  tokens 1  ok
+===== change: colibench run 20261107-204713 (1794084433.6460738)
+  prefill_long   rep 1  ttft 52.635 s  decode None tok/s  tokens 1  ok
+  prefill_short  rep 1  ttft 1.587 s  decode None tok/s  tokens 1  ok
+  decode_short   rep 1  ttft 1.668 s  decode 8.912 tok/s  tokens 128  ok
+  decode_short   rep 2  ttft 1.667 s  decode 11.509 tok/s  tokens 128  ok
+  prefill_long   rep 2  ttft 44.078 s  decode None tok/s  tokens 1  ok
+  prefill_short  rep 2  ttft 1.425 s  decode None tok/s  tokens 1  ok
+  prefill_long   rep 3  ttft 44.235 s  decode None tok/s  tokens 1  ok
+  decode_short   rep 3  ttft 1.817 s  decode 10.811 tok/s  tokens 128  ok
+  prefill_short  rep 3  ttft 1.334 s  decode None tok/s  tokens 1  ok

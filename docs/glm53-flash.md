@@ -116,6 +116,39 @@ they stay on the CPU while the tier is on). Each run ends with
 [vulkan.md](vulkan.md#glm-52-and-glm-53-flash-on-the-tier). Measured on Lavapipe for
 correctness only: no GPU has run the real weights on it yet.
 
+**CUDA.** In a `make glm53 CUDA=1` build (Linux), or `make glm53.exe CUDA_DLL=1` next to
+`coli_cuda.dll` on Windows ([windows.md](windows.md)), `COLI_CUDA=1` puts the routed
+experts on the CUDA expert tier (`cu_tier.h`) and the resident matrices on the card as
+far as their budget goes (`cu_dense.h`); `coli chat --gpu 0` sets it (`--gpu` takes
+`auto`, `none` or a device list). The Windows release's `windows-x86_64-cuda.zip`
+carries this build from the release after v2.1.0. A build with Vulkan too, as that one
+is, runs on Vulkan on the same card unless `COLI_VULKAN=0`. The disk floor above holds
+either way.
+
+## Every prompt kept: the prefix store
+
+The KDA layers carry a recurrence that cannot be wound back, so a slot resumes only from the end of
+what it holds (or a pin of its own, whose rows must still be in the slot). An agent's new
+conversation on the same system prompt and tools read its whole prompt again; so did a conversation
+back after another took its slot, or one on another slot. `prefix_store.h` keeps every prompt read,
+as qwen36 does ([qwen36.md](qwen36.md#the-prefix-store)): the full-attention layers' MLA latents and
+indexer keys and gates in blocks of 256 tokens named by their tokens, shared by every prompt that
+starts with them, and checkpoints of the KDA layers' states and convolution windows where a prompt's
+messages start (`<|system|>`, `<|user|>`, `<|assistant|>`, `<|observation|>`) and where a turn ends.
+A request takes the deepest checkpoint its prompt starts with when it reaches further than its slot,
+in a fresh session the chains take from the host. A checkpoint's KDA state is about 149 MiB on the
+released checkpoint; the store's budget (`COLI_PREFIX_STORE_MB`, a quarter of the free RAM up to
+4 GiB) and its floor of free RAM decide how many stay. `COLI_PREFIX_STORE=0` turns it off.
+
+MEASURED
+
+`tests/test_glm53_prefix_store.py` holds every request that took the store to a fresh engine reading
+the same prompt with the store off, each step's top five logits to the last digit: a new
+conversation on the same system prompt, the first conversation back after another system prompt
+took the slot, a new conversation on the other slot, a budget of nothing, the store off, a read-out
+reading everything; `GLM53_PS_BACKEND=vulkan` runs both engines on the dense chain (Lavapipe in
+`tests/vulkan_engines.sh`). Leaving out the rows or the KDA state makes it fail.
+
 ## Vision
 
 Reachable from every surface: a path pasted in `coli chat` (read by the client,

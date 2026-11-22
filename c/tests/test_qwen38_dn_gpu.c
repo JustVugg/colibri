@@ -13,7 +13,6 @@
 #undef main
 
 #ifdef _WIN32
-#undef setenv
 #undef unsetenv
 #define unsetenv(name) _putenv_s(name, "")
 #endif

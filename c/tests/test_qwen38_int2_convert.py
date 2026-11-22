@@ -114,6 +114,7 @@ class Int2Convert(unittest.TestCase):
             h = np.sqrt(imp)[:, None] * c * np.sqrt(imp)[None, :]
             np.testing.assert_allclose(u.T @ u @ h, np.eye(256), atol=1e-6)
             np.testing.assert_allclose(cov.upper_inv(1, imp), u)   # the scale of a layer's matrix does not matter
+            del cov   # its memmap holds cov.bin open, and Windows cannot delete an open file
 
     def test_gptq_lowers_output_error(self):
         a = self.rng.standard_normal((256, 16))
@@ -128,6 +129,7 @@ class Int2Convert(unittest.TestCase):
             plain = cv.dequantize_int2(*cv.quantize_int2_g32(w, imp))
             gptq = cv.dequantize_int2(*cv.quantize_int2_g32_gptq(w, imp, u))
             self.assertLess(out_err(w.astype(np.float64), gptq, h), 0.8 * out_err(w.astype(np.float64), plain, h))
+            del cov
 
     def test_dump_rows_and_exact_quantizer(self):
         h, k, n, experts = 256, 4, 600, 6
@@ -145,7 +147,11 @@ class Int2Convert(unittest.TestCase):
             want = (ids == 2).any(axis=1)
             np.testing.assert_array_equal(xe, x[want].astype(np.float64))
             np.testing.assert_allclose(ge, (gates * (ids == 2)).sum(axis=1)[want])
-            np.testing.assert_allclose(dump.layer_moment(0), x.astype(np.float64).T @ x / n, rtol=1e-12)
+            # atol for the entries that nearly cancel: layer_moment's x.T @ x is one array
+            # against itself (BLAS syrk), this one is two arrays (gemm), and the two round
+            # a sum near zero differently on some BLAS builds (3.8e-16 apart on FreeBSD's).
+            np.testing.assert_allclose(dump.layer_moment(0), x.astype(np.float64).T @ x / n,
+                                       rtol=1e-12, atol=1e-12)
             w3 = [(self.rng.standard_normal(shape) * 0.05).astype(np.float32) for shape in ((128, h), (128, h), (h, 128))]
 
             def out(ws, rows):

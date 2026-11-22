@@ -25,6 +25,7 @@
 #include <string.h>
 #include <math.h>
 #include "ggml_grids.h"
+#include "fma_compat.h"   /* coli_fmaf_exact: gq_dot_i8's min correction without libm (#2882) */
 
 #if defined(__AVX2__) || defined(__F16C__)
 #include <immintrin.h>
@@ -90,7 +91,7 @@ enum {
     GQ_IQ3_XXS = 18, GQ_IQ1_S = 19, GQ_IQ4_NL = 20, GQ_IQ3_S = 21, GQ_IQ2_S = 22,
     GQ_IQ4_XS = 23, GQ_I8 = 24, GQ_I16 = 25, GQ_I32 = 26, GQ_I64 = 27,
     GQ_F64 = 28, GQ_IQ1_M = 29, GQ_BF16 = 30, GQ_TQ1_0 = 34, GQ_TQ2_0 = 35,
-    GQ_MXFP4 = 39, GQ_NVFP4 = 40, GQ_Q1_0 = 41, GQ_Q2_0 = 42, GQ_TYPE_MAX = 43
+    GQ_MXFP4 = 39, GQ_NVFP4 = 40, GQ_Q1_0 = 41, GQ_Q2_0 = 42, GQ_MXFP8 = 43, GQ_TYPE_MAX = 44
 };
 
 typedef struct { const char *name; int blck; int bytes; int supported; } gq_type_info;
@@ -131,6 +132,7 @@ static const gq_type_info GQ_TYPES[GQ_TYPE_MAX] = {
     [GQ_NVFP4]   = { "NVFP4",   64,  36, 1 },
     [GQ_Q1_0]    = { "Q1_0",    128, 18, 1 },
     [GQ_Q2_0]    = { "Q2_0",    64,  18, 1 },
+    [GQ_MXFP8]   = { "MXFP8",   32,  33, 1 },   /* unsloth's DeepSeek V4.1 Engram tables (UD-IQ3_S, UD-Q3_K_XL and up) */
 };
 
 /* Not GGUF types: a block type's rows interleaved in groups of 16 (gq_r16_*, below), made by
@@ -138,23 +140,37 @@ static const gq_type_info GQ_TYPES[GQ_TYPE_MAX] = {
  * after block, its 16 rows' blocks as one group block (gq_r16_group_bytes: 16 blocks' bytes,
  * a little more for the K-quants, whose scales it keeps decoded). */
 enum { GQ_Q2_0_R16 = 64, GQ_Q4_K_R16, GQ_Q5_K_R16, GQ_Q6_K_R16, GQ_Q3_K_R16, GQ_IQ4_XS_R16,
-       GQ_Q8_0_R16, GQ_Q4_0_R16, GQ_IQ4_NL_R16, GQ_R16_END };
+       GQ_Q8_0_R16, GQ_Q4_0_R16, GQ_IQ4_NL_R16, GQ_IQ3_S_R16, GQ_IQ2_XXS_R16, GQ_IQ2_XS_R16, GQ_IQ2_S_R16, GQ_IQ3_XXS_R16,
+       GQ_IQ1_S_R16, GQ_IQ1_M_R16, GQ_Q2_K_R16, GQ_MXFP4_R16, GQ_NVFP4_R16, GQ_R16_END };
 static inline int gq_r16_base(int t) {
-    static const int8_t base[] = { GQ_Q2_0, GQ_Q4_K, GQ_Q5_K, GQ_Q6_K, GQ_Q3_K, GQ_IQ4_XS, GQ_Q8_0, GQ_Q4_0, GQ_IQ4_NL };
+    static const int8_t base[] = { GQ_Q2_0, GQ_Q4_K, GQ_Q5_K, GQ_Q6_K, GQ_Q3_K, GQ_IQ4_XS, GQ_Q8_0, GQ_Q4_0, GQ_IQ4_NL, GQ_IQ3_S,
+                                   GQ_IQ2_XXS, GQ_IQ2_XS, GQ_IQ2_S, GQ_IQ3_XXS, GQ_IQ1_S, GQ_IQ1_M, GQ_Q2_K, GQ_MXFP4, GQ_NVFP4 };
     return t >= GQ_Q2_0_R16 && t < GQ_R16_END ? base[t - GQ_Q2_0_R16] : -1;
 }
 static inline int gq_r16_group_bytes(int t) {
-    static const int16_t gb[] = { 288, 2368, 2880, 3360, 1824, 2208, 544, 288, 288 };
+    static const int16_t gb[] = { 288, 2368, 2880, 3360, 1824, 2208, 544, 288, 288, 2208, 1696, 1824, 1824, 2208, 1200, 1376, 1344, 272, 576 };
     return t >= GQ_Q2_0_R16 && t < GQ_R16_END ? gb[t - GQ_Q2_0_R16] : -1;
 }
 /* the interleaved form of block type t, or -1 */
+/* the forms that take more bytes than the rows they come from: IQ3_S's, its 9-bit grid indices
+ * and sign bits as one 4-bit code a value (sign and level, the grid's byte (2 level + 1)), IQ4_XS's
+ * layout, a quarter more bytes. gq_r16_of never names them, so no engine holds its experts
+ * larger without asking: gq_r16_of_grown does, for matrices an engine keeps resident. */
+static inline int gq_r16_grown(int r) { return r == GQ_IQ3_S_R16 || (r >= GQ_IQ2_XXS_R16 && r <= GQ_IQ1_M_R16); }
 static inline int gq_r16_of(int t) {
-    for (int r = GQ_Q2_0_R16; r < GQ_R16_END; r++) if (gq_r16_base(r) == t) return r;
+    for (int r = GQ_Q2_0_R16; r < GQ_R16_END; r++) if (gq_r16_base(r) == t && !gq_r16_grown(r)) return r;
     return -1;
+}
+/* the interleaved form of t that takes more bytes, or -1 (gq_r16_grown) */
+static inline int gq_r16_of_grown(int t) {
+    switch (t) { case GQ_IQ3_S: return GQ_IQ3_S_R16; case GQ_IQ2_XXS: return GQ_IQ2_XXS_R16; case GQ_IQ2_XS: return GQ_IQ2_XS_R16;
+                 case GQ_IQ2_S: return GQ_IQ2_S_R16; case GQ_IQ3_XXS: return GQ_IQ3_XXS_R16;
+                 case GQ_IQ1_S: return GQ_IQ1_S_R16; case GQ_IQ1_M: return GQ_IQ1_M_R16; default: return -1; }
 }
 static inline int gq_type_ok(int t) { return t >= 0 && t < GQ_TYPE_MAX && GQ_TYPES[t].blck > 0 && GQ_TYPES[t].supported; }
 static inline const char *gq_type_name(int t) {
-    static const char *r16[] = { "Q2_0r16", "Q4_Kr16", "Q5_Kr16", "Q6_Kr16", "Q3_Kr16", "IQ4_XSr16", "Q8_0r16", "Q4_0r16", "IQ4_NLr16" };
+    static const char *r16[] = { "Q2_0r16", "Q4_Kr16", "Q5_Kr16", "Q6_Kr16", "Q3_Kr16", "IQ4_XSr16", "Q8_0r16", "Q4_0r16", "IQ4_NLr16", "IQ3_Sr16",
+                                 "IQ2_XXSr16", "IQ2_XSr16", "IQ2_Sr16", "IQ3_XXSr16", "IQ1_Sr16", "IQ1_Mr16", "Q2_Kr16", "MXFP4r16", "NVFP4r16" };
     if (gq_r16_base(t) >= 0) return r16[t - GQ_Q2_0_R16];
     return (t >= 0 && t < GQ_TYPE_MAX && GQ_TYPES[t].name) ? GQ_TYPES[t].name : "?";
 }
@@ -487,8 +503,12 @@ GQ_EXACT_FN static void gq_blk_tq2_0(const uint8_t *b, float *y) {
  * because the value table holds e2m1 values doubled; 0 and 0x7F decode to 0. */
 static inline float gq_ue4m3_half(uint8_t x) {
     if (x == 0 || x == 0x7F) return 0.f;
-    int e = (x >> 3) & 0xF, m = x & 7;
-    return e == 0 ? ldexpf((float)m, -10) : ldexpf((float)(8 + m), e - 11);
+    const int e = (x >> 3) & 0xF, m = x & 7;
+    if (e == 0) return (float)m * (1.f / 1024.f);   /* m * 2^-10, exact */
+    /* (8 + m) * 2^(e - 11) = (1 + m/8) * 2^(e - 8): the float's bits, no ldexpf (the CPU's
+     * NVFP4 experts read four of these a block of 64) */
+    union { uint32_t u; float f; } v = { ((uint32_t)(e - 8 + 127) << 23) | ((uint32_t)m << 20) };
+    return v.f;
 }
 GQ_EXACT_FN static void gq_blk_nvfp4(const uint8_t *b, float *y) {
     GQ_EXACT_BEGIN
@@ -500,6 +520,24 @@ GQ_EXACT_FN static void gq_blk_nvfp4(const uint8_t *b, float *y) {
             y[16 * sb + 8 + j] = d * (float)GGML_KVALUES_MXFP4[qs[8 * sb + j] >> 4];
         }
     }
+}
+/* MXFP8 (ggml type 43): blocks of 32, an E8M0 exponent byte, then 32 E4M3 values; each value is
+ * e4m3 * 2^(e - 127), the encoding of DeepSeek V4.1's own Engram table (fp8 with a ue8m0 scale per
+ * 32), so a GGUF's rows are the checkpoint's bits. E4M3: bias 7, 0x7F and 0xFF NaN; E8M0 0xFF NaN. */
+static inline float gq_e4m3(uint8_t x) {
+    const int e = (x >> 3) & 0xF, m = x & 7;
+    if (e == 15 && m == 7) return NAN;
+    const float v = e == 0 ? ldexpf((float)m, -9) : ldexpf((float)(8 + m), e - 10);
+    return (x & 0x80) ? -v : v;
+}
+static inline float gq_e8m0(uint8_t x) {
+    const uint32_t bits = x == 0 ? 0x00400000u : x == 255 ? 0x7FC00000u : (uint32_t)x << 23;
+    float r; memcpy(&r, &bits, 4); return r;
+}
+GQ_EXACT_FN static void gq_blk_mxfp8(const uint8_t *b, float *y) {
+    GQ_EXACT_BEGIN
+    const float d = gq_e8m0(b[0]);
+    for (int j = 0; j < 32; j++) y[j] = gq_e4m3(b[1 + j]) * d;
 }
 GQ_EXACT_FN static void gq_blk_q1_0(const uint8_t *b, float *y) {
     GQ_EXACT_BEGIN
@@ -527,7 +565,7 @@ static inline gq_blk_fn gq_blk_decoder(int t) {
     case GQ_IQ4_XS: return gq_blk_iq4_xs; case GQ_MXFP4: return gq_blk_mxfp4;
     case GQ_TQ1_0: return gq_blk_tq1_0;   case GQ_TQ2_0: return gq_blk_tq2_0;
     case GQ_NVFP4: return gq_blk_nvfp4;   case GQ_Q1_0: return gq_blk_q1_0;
-    case GQ_Q2_0: return gq_blk_q2_0;
+    case GQ_Q2_0: return gq_blk_q2_0;     case GQ_MXFP8: return gq_blk_mxfp8;
     default: return NULL;
     }
 }
@@ -749,18 +787,79 @@ GQ_SB_FN __m256i gq_sb_iq1_s(const uint8_t *b, float d, int ib, float *s) {
 }
 GQ_SB_FN __m256i gq_sb_iq1_m(const uint8_t *b, float d, int ib, float *s) {
     const uint8_t *qs = b, *qh = b + 32, *scp = b + 48;
-    uint16_t sc[4]; for (int i = 0; i < 4; i++) sc[i] = gq_rd16(scp + 2 * i);
-    for (int h = 0; h < 2; h++) { int s16 = 2 * ib + h; int v = (sc[s16 >> 2] >> (3 * (s16 & 3))) & 7; s[h] = d * (float)(2 * v + 1) * 0.125f; }
-    uint64_t g[4]; int8_t ds[4];
-    for (int l = 0; l < 4; l++) {
-        int k = 4 * ib + l, hh = (qh[k >> 1] >> (4 * (k & 1))) & 0x0F;
-        memcpy(&g[l], GGML_IQ1S_GRID + 8 * (qs[k] | ((hh & 7) << 8)), 8); ds[l] = (hh & 8) ? -1 : 1;
-    }
+    /* the sub-block's 3-bit scales are in one 16-bit word of the four (ib / 2), its four index
+     * nibbles in qh's bytes 2 ib and 2 ib + 1, its four low index bytes at qs + 4 ib: one load
+     * each (a load a field cost IQ1_M 48 ns a block on one Zen 4 core) */
+    const uint32_t sw = gq_rd16(scp + 2 * (ib >> 1)), h16 = gq_rd16(qh + 2 * ib), q4 = gq_rd32(qs + 4 * ib);
+    for (int h = 0; h < 2; h++) { int v = (sw >> (3 * ((2 * ib + h) & 3))) & 7; s[h] = d * (float)(2 * v + 1) * 0.125f; }
+    uint64_t g[4];
+    for (int l = 0; l < 4; l++) memcpy(&g[l], GGML_IQ1S_GRID + 8 * (((q4 >> (8 * l)) & 0xFF) | (((h16 >> (4 * l)) & 7) << 8)), 8);
     __m256i v = _mm256_set_epi64x((long long)g[3], (long long)g[2], (long long)g[1], (long long)g[0]);
     v = _mm256_add_epi8(v, v); v = _mm256_add_epi8(v, v); v = _mm256_add_epi8(v, v);   /* 8 * grid, byte-wise (a 16-bit shift would carry 0xFF into the neighbour) */
-    __m256i dl = _mm256_set_epi64x((long long)(0x0101010101010101ull * (uint8_t)ds[3]), (long long)(0x0101010101010101ull * (uint8_t)ds[2]),
-                                   (long long)(0x0101010101010101ull * (uint8_t)ds[1]), (long long)(0x0101010101010101ull * (uint8_t)ds[0]));
+    /* group l's delta, -1 where bit 4 l + 3 of h16 is set, else +1, in every byte of its quarter:
+     * (0 - bit) | 0x01 bytes */
+    const __m256i bit = _mm256_and_si256(_mm256_srlv_epi64(_mm256_set1_epi64x((long long)h16), _mm256_setr_epi64x(3, 7, 11, 15)), _mm256_set1_epi64x(1));
+    const __m256i dl = _mm256_or_si256(_mm256_sub_epi64(_mm256_setzero_si256(), bit), _mm256_set1_epi8(1));
     return _mm256_add_epi8(v, dl);
+}
+/* The grid types' sub-blocks for the dot product alone: the grid rows as they are (every
+ * grid byte is positive and below 64) and the signs apart, *sg one +1 / -1 byte an element.
+ * The dot product took the decoder's signed bytes w and multiplied |w| by sign(x, w): |w| is
+ * the grid row and sign(x, w) is sign(x, *sg), so the products get the same two operands, byte
+ * for byte, without the signs applied to the weights and taken off again. One Zen 4 core,
+ * x86-64-v3, IQ2_XXS at Qwen3.8-27B's gate shape: 3.58 -> 4.37 GB/s. The unpack keeps gq_sb_*. */
+static inline __m256i gq_ld4x8(const void *a, const void *b, const void *c, const void *d) {
+    uint64_t x0, x1, x2, x3; memcpy(&x0, a, 8); memcpy(&x1, b, 8); memcpy(&x2, c, 8); memcpy(&x3, d, 8);
+    return _mm256_set_epi64x((long long)x3, (long long)x2, (long long)x1, (long long)x0);
+}
+/* the four sign bytes as gq_signs4 reads them, as +1 / -1 */
+static inline __m256i gq_pm1_4(uint32_t bits) {
+    const __m256i pick = _mm256_set_epi64x(0x0303030303030303LL, 0x0202020202020202LL, 0x0101010101010101LL, 0);
+    const __m256i bit = _mm256_set1_epi64x((long long)0x8040201008040201ULL);
+    const __m256i m = _mm256_cmpeq_epi8(_mm256_and_si256(_mm256_shuffle_epi8(_mm256_set1_epi32((int)bits), pick), bit), bit);
+    return _mm256_or_si256(m, _mm256_set1_epi8(1));
+}
+#define GQ_PM1(i) (GGML_KSIGNS_PM1 + 8 * (i))
+GQ_SB_FN __m256i gq_sbu_iq2_xxs(const uint8_t *b, float d, int ib, float *s, __m256i *sg) {
+    const uint8_t *q = b + 2 + 8 * ib; const uint32_t a0 = gq_rd32(q), a1 = gq_rd32(q + 4);
+    s[0] = s[1] = d * (0.5f + (float)(a1 >> 28)) * 0.25f;
+    *sg = gq_ld4x8(GQ_PM1(a1 & 127), GQ_PM1((a1 >> 7) & 127), GQ_PM1((a1 >> 14) & 127), GQ_PM1((a1 >> 21) & 127));
+    const uint8_t *G = GGML_IQ2XXS_GRID;
+    return gq_ld4x8(G + 8 * (a0 & 0xFF), G + 8 * ((a0 >> 8) & 0xFF), G + 8 * ((a0 >> 16) & 0xFF), G + 8 * (a0 >> 24));
+}
+GQ_SB_FN __m256i gq_sbu_iq2_xs(const uint8_t *b, float d, int ib, float *s, __m256i *sg) {
+    const uint8_t *qs = b + 2, *sc = b + 66;
+    for (int h = 0; h < 2; h++) { int si = 2 * ib + h; int v = (sc[si >> 1] >> (4 * (si & 1))) & 0x0F; s[h] = d * (0.5f + (float)v) * 0.25f; }
+    uint64_t u; memcpy(&u, qs + 8 * ib, 8);   /* the four 16-bit fields from one load */
+    const uint32_t q0 = (uint32_t)(u & 0xFFFF), q1 = (uint32_t)((u >> 16) & 0xFFFF), q2 = (uint32_t)((u >> 32) & 0xFFFF), q3 = (uint32_t)(u >> 48);
+    *sg = gq_ld4x8(GQ_PM1(q0 >> 9), GQ_PM1(q1 >> 9), GQ_PM1(q2 >> 9), GQ_PM1(q3 >> 9));
+    const uint8_t *G = GGML_IQ2XS_GRID;
+    return gq_ld4x8(G + 8 * (q0 & 511), G + 8 * (q1 & 511), G + 8 * (q2 & 511), G + 8 * (q3 & 511));
+}
+GQ_SB_FN __m256i gq_sbu_iq2_s(const uint8_t *b, float d, int ib, float *s, __m256i *sg) {
+    const uint8_t *qs = b + 2, *sgn = b + 34, *qh = b + 66, *sc = b + 74;
+    for (int h = 0; h < 2; h++) { int si = 2 * ib + h; int v = (sc[si >> 1] >> (4 * (si & 1))) & 0x0F; s[h] = d * (0.5f + (float)v) * 0.25f; }
+    const __m128i lo = _mm_cvtepu8_epi32(_mm_cvtsi32_si128((int)gq_rd32(qs + 4 * ib)));
+    const __m128i hi = _mm_and_si128(_mm_srlv_epi32(_mm_set1_epi32(qh[ib]), _mm_setr_epi32(0, 2, 4, 6)), _mm_set1_epi32(3));
+    *sg = gq_pm1_4(gq_rd32(sgn + 4 * ib));
+    return gq_gather8x4(GGML_IQ2S_GRID, _mm_or_si128(lo, _mm_slli_epi32(hi, 8)));
+}
+GQ_SB_FN __m256i gq_sbu_iq3_xxs(const uint8_t *b, float d, int ib, float *s, __m256i *sg) {
+    const uint8_t *q = b + 2 + 8 * ib; const uint32_t a = gq_rd32(b + 66 + 4 * ib);
+    s[0] = s[1] = d * (0.5f + (float)(a >> 28)) * 0.5f;
+    *sg = gq_ld4x8(GQ_PM1(a & 127), GQ_PM1((a >> 7) & 127), GQ_PM1((a >> 14) & 127), GQ_PM1((a >> 21) & 127));
+    const uint8_t *G = GGML_IQ3XXS_GRID;
+    uint64_t u; memcpy(&u, q, 8);   /* the eight indices from one load: shifts cost less than eight byte loads */
+    uint32_t g[8]; for (int j = 0; j < 8; j++) memcpy(&g[j], G + 4 * ((u >> (8 * j)) & 0xFF), 4);
+    return _mm256_setr_epi32((int)g[0], (int)g[1], (int)g[2], (int)g[3], (int)g[4], (int)g[5], (int)g[6], (int)g[7]);
+}
+GQ_SB_FN __m256i gq_sbu_iq3_s(const uint8_t *b, float d, int ib, float *s, __m256i *sg) {
+    const uint8_t *qs = b + 2, *qh = b + 66, *sgn = b + 74, *sc = b + 106;
+    int v = (sc[ib >> 1] >> (4 * (ib & 1))) & 0x0F; s[0] = s[1] = d * (float)(1 + 2 * v);
+    const __m256i lo = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(qs + 8 * ib)));
+    const __m256i hi = _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32(qh[ib]), _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7)), _mm256_set1_epi32(1));
+    *sg = gq_pm1_4(gq_rd32(sgn + 4 * ib));
+    return gq_gather4x8(GGML_IQ3S_GRID, _mm256_or_si256(lo, _mm256_slli_epi32(hi, 8)));
 }
 /* The K-quants' sub-blocks: 32 elements, their two group scales s[] and mins m[]
  * (sw and mw of the unpack: dequantized value = s * w - m). */
@@ -804,6 +903,13 @@ GQ_SB_FN __m256i gq_sbk_q3_k(const uint8_t *b, int ib, float *s, float *m) {
     const __m256i sub = _mm256_andnot_si256(_mm256_cmpeq_epi8(_mm256_and_si256(hv, bit), bit), _mm256_set1_epi8(4));
     return _mm256_sub_epi8(_mm256_and_si256(_mm256_srli_epi16(q, 2 * sh), _mm256_set1_epi8(3)), sub);
 }
+GQ_SB_FN __m256i gq_sbk_q2_k(const uint8_t *b, int ib, float *s, float *m) {
+    const uint8_t *sc = b, *qs = b + 16; const float d = gq_f16(gq_rd16(b + 80)), dmin = gq_f16(gq_rd16(b + 82));
+    for (int h = 0; h < 2; h++) { s[h] = d * (float)(sc[2 * ib + h] & 0xF); m[h] = dmin * (float)(sc[2 * ib + h] >> 4); }
+    const int c = ib >> 2, sh = ib & 3;   /* element 32*ib + j: bits 2*sh of qs[32c + j] */
+    const __m256i q = _mm256_loadu_si256((const __m256i *)(qs + 32 * c));
+    return _mm256_and_si256(_mm256_srli_epi16(q, 2 * sh), _mm256_set1_epi8(3));
+}
 #define GQ_UNPACK_SBK(SB) { \
         for (int ib = 0; ib < 8; ib++) { float s2[2], m2[2]; _mm256_storeu_si256((__m256i *)(w + 32 * ib), SB(b, ib, s2, m2)); \
             sw[2 * ib] = s2[0]; sw[2 * ib + 1] = s2[1]; mw[2 * ib] = m2[0]; mw[2 * ib + 1] = m2[1]; } \
@@ -835,6 +941,16 @@ GQ_EXACT_FN static void gq_ublk(int t, const uint8_t *b, int8_t *w, float *sw, f
         const __m128i tab = _mm_loadu_si128((const __m128i *)(nl ? GGML_KVALUES_IQ4NL : GGML_KVALUES_MXFP4));
         _mm256_storeu_si256((__m256i *)w, gq_nib16_lut(b + (nl ? 2 : 1), tab));
         gq_set_g(sw, mw, 0, 2, d, 0.f); return; }
+    case GQ_NVFP4: {   /* four groups of 16: byte j of group g holds elements 16g + j (low) and 16g + 8 + j */
+        const __m128i tab = _mm_loadu_si128((const __m128i *)GGML_KVALUES_MXFP4), m = _mm_set1_epi8(0x0F);
+        for (int h = 0; h < 2; h++) {
+            const __m128i v = _mm_loadu_si128((const __m128i *)(b + 4 + 16 * h));
+            const __m128i lo = _mm_and_si128(v, m), hi = _mm_and_si128(_mm_srli_epi16(v, 4), m);
+            _mm_storeu_si128((__m128i *)(w + 32 * h), _mm_shuffle_epi8(tab, _mm_unpacklo_epi64(lo, hi)));
+            _mm_storeu_si128((__m128i *)(w + 32 * h + 16), _mm_shuffle_epi8(tab, _mm_unpackhi_epi64(lo, hi)));
+        }
+        for (int g = 0; g < 4; g++) { sw[g] = gq_ue4m3_half(b[g]); mw[g] = 0.f; }
+        return; }
     case GQ_IQ4_XS: GQ_UNPACK_SB(gq_bd_iq4_xs, gq_sb_iq4_xs)
     case GQ_IQ2_XXS: GQ_UNPACK_SB(gq_bd_f16, gq_sb_iq2_xxs)
     case GQ_IQ2_XS: GQ_UNPACK_SB(gq_bd_f16, gq_sb_iq2_xs)
@@ -1163,7 +1279,9 @@ GQ_EXACT_FN static void gq_ublk(int t, const uint8_t *b, int8_t *w, float *sw, f
     }
 }
 /* 1 if type t has an integer form (every block type does; F32/F16/BF16 do not). */
-static inline int gq_has_int(int t) { return gq_blk_decoder(t) != NULL; }
+/* MXFP8's values carry their own exponents: no int8 form with a scale per 16 (its rows are read as floats,
+ * the Engram table's lookups) */
+static inline int gq_has_int(int t) { return gq_blk_decoder(t) != NULL && t != GQ_MXFP8; }
 /* Unpack n elements (whole blocks) of row src. 0, or -1 for a float/unknown type. */
 static int gq_unpack_row(int t, const uint8_t *src, int64_t n, int8_t *w8, float *sw, float *mw) {
     if (!gq_has_int(t) || n % GQ_TYPES[t].blck) return -1;
@@ -1277,9 +1395,11 @@ static float gq_dot_i8(const int8_t *w8, const float *sw, const float *mw, int h
         acc += dx[b] * (sw[2 * b] * (float)s0 + sw[2 * b + 1] * (float)s1);
     }
 #endif
-    if (has_min) {   /* explicit fmaf: the same bits in gq_dot_b32, whatever the compiler contracts */
+    if (has_min) {   /* explicit fmaf: the same bits in gq_dot_b32, whatever the compiler contracts; without
+                      * FMA its bits inline (coli_fmaf_exact), not two libm calls a block of 32 (#2882) */
         float m = 0.f;
-        for (int64_t b = 0; b < n / 32; b++) m = fmaf(dx[b], fmaf(mw[2 * b], (float)xs[2 * b], mw[2 * b + 1] * (float)xs[2 * b + 1]), m);
+        for (int64_t b = 0; b < n / 32; b++)
+            m = coli_fmaf_exact(dx[b], coli_fmaf_exact(mw[2 * b], (float)xs[2 * b], mw[2 * b + 1] * (float)xs[2 * b + 1]), m);
         acc -= m;
     }
     return acc;
@@ -1389,6 +1509,17 @@ static inline int gq_tbuf(int I) {
     }
     return gq_tcap >= I;
 }
+/* activation rows a fused kernel takes at once; from there one unpack shared by all is cheaper.
+ * Every build has it: the paths without the fused kernels give a row the bits of its row alone
+ * as well, and the CUDA chains group a verify's rows by it (an ARM host with a card) */
+#define GQ_FUSED_ROWS 4
+/* Up to this many activation rows (a speculative verify: the token and up to seven drafts) a matrix
+ * gives each row the bits that row gets alone: the fused kernels, GQ_FUSED_ROWS rows at a time. The
+ * prompt's kernels (gq_rows_f8, the tiles of 16) sum in another order and start above it: a verify of
+ * five or six rows took them, and a token's bits then depended on how many drafts came with it, so a
+ * greedy answer with drafts differed from plain decoding, and from run to run as the gate drafts by
+ * the time a step takes (#2874; Qwen3.6-35B UD-IQ2_XXS on the CPU, 3 different texts of 64 tokens). */
+#define GQ_EXACT_ROWS 8
 /* one output row of W against every activation row */
 #if defined(__AVX2__) && defined(__FMA__)
 /* The 32-element block types without the unpack (Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL,
@@ -1405,7 +1536,6 @@ static inline __m256i gq_bits32(uint32_t bits) {   /* byte i: 0xFF when bit i is
 }
 #define GQ_HSUM8(v) ({ __m128 h_ = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1)); \
     h_ = _mm_add_ps(h_, _mm_movehl_ps(h_, h_)); h_ = _mm_add_ss(h_, _mm_movehdup_ps(h_)); _mm_cvtss_f32(h_); })
-#define GQ_FUSED_ROWS 4   /* activation rows a fused kernel takes at once; from there one unpack shared by all is cheaper */
 /* S (1..GQ_FUSED_ROWS) activation rows of one weight row: y[s * ystride]. A block is
  * decoded once and multiplied into every row, each row with its own accumulator and
  * the operations it has alone, so a row's bits do not depend on S. */
@@ -1569,6 +1699,58 @@ static void gq_dot_q8_0_rows(float *y, int ystride, const uint8_t *row, const in
     default: gq_dot_q8_0_body(y, ystride, row, xq, dx, I, 4); break;
     }
 }
+/* A 256-element block's scales as vectors, lane by lane the operations its sub-block decoder does
+ * for them in the same order (so the same floats): for the types with one scale a sub-block the
+ * eight of them (gq_bs8_*), for those with one per 16 elements the sixteen as lo (sub-blocks 0-3,
+ * elements 16 g .. 16 g + 15 in lane g) and hi (4-7). A row kernel takes them once a block and
+ * times dx once a block, and a sub-block its two with one permute: the decoders' scalar scales
+ * cost a nibble's extraction, a convert and three multiplies a half, and are left dead. */
+GQ_SB_FN __m256 gq_bs8_iq2_xxs(const uint8_t *b, float d) {   /* a1 >> 28: the odd words of the eight sub-blocks */
+    const __m256i i = _mm256_setr_epi32(1, 3, 5, 7, 1, 3, 5, 7);
+    const __m256i a = _mm256_blend_epi32(_mm256_permutevar8x32_epi32(_mm256_loadu_si256((const __m256i *)(b + 2)), i),
+                                         _mm256_permutevar8x32_epi32(_mm256_loadu_si256((const __m256i *)(b + 34)), i), 0xF0);
+    return _mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(d), _mm256_add_ps(_mm256_set1_ps(0.5f), _mm256_cvtepi32_ps(_mm256_srli_epi32(a, 28)))), _mm256_set1_ps(0.25f));
+}
+GQ_SB_FN __m256 gq_bs8_iq3_xxs(const uint8_t *b, float d) {
+    const __m256i a = _mm256_loadu_si256((const __m256i *)(b + 66));
+    return _mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(d), _mm256_add_ps(_mm256_set1_ps(0.5f), _mm256_cvtepi32_ps(_mm256_srli_epi32(a, 28)))), _mm256_set1_ps(0.5f));
+}
+/* nibble k of the n bytes at p (low nibble first), k < 8, as eight int32 */
+static inline __m256i gq_nib8_32(const uint8_t *p) {
+    const __m128i v = _mm_cvtsi32_si128((int)gq_rd32(p)), m = _mm_set1_epi8(0x0F);
+    return _mm256_cvtepu8_epi32(_mm_unpacklo_epi8(_mm_and_si128(v, m), _mm_and_si128(_mm_srli_epi16(v, 4), m)));
+}
+GQ_SB_FN __m256 gq_bs8_iq3_s(const uint8_t *b, float d) {   /* d (1 + 2 v) */
+    const __m256i v = gq_nib8_32(b + 106);
+    return _mm256_mul_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_set1_epi32(1), _mm256_add_epi32(v, v))));
+}
+GQ_SB_FN __m256 gq_bs8_iq4_xs(const uint8_t *b, float d) {   /* d (ls - 32), ls: a nibble and two bits of sh */
+    const __m256i lo = gq_nib8_32(b + 4);
+    const __m256i hi = _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32(gq_rd16(b + 2)), _mm256_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14)), _mm256_set1_epi32(3));
+    return _mm256_mul_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_or_si256(lo, _mm256_slli_epi32(hi, 4)), _mm256_set1_epi32(32))));
+}
+GQ_SB_FN __m256 gq_bs8_iq1_s(const uint8_t *b, float d) {   /* d (2 ((qh >> 12) & 7) + 1) / 8 */
+    const __m256i q = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)(b + 34)));
+    const __m256i l = _mm256_and_si256(_mm256_srli_epi32(q, 12), _mm256_set1_epi32(7));
+    return _mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_add_epi32(l, l), _mm256_set1_epi32(1)))), _mm256_set1_ps(0.125f));
+}
+/* the sixteen 4-bit scales of IQ2_XS (at 66) and IQ2_S (at 74): d (0.5 + v) / 4 */
+GQ_SB_FN void gq_bs16_iq2(const uint8_t *sc, float d, __m256 *lo, __m256 *hi) {
+    const __m256 dv = _mm256_set1_ps(d), h = _mm256_set1_ps(0.5f), q = _mm256_set1_ps(0.25f);
+    *lo = _mm256_mul_ps(_mm256_mul_ps(dv, _mm256_add_ps(h, _mm256_cvtepi32_ps(gq_nib8_32(sc)))), q);
+    *hi = _mm256_mul_ps(_mm256_mul_ps(dv, _mm256_add_ps(h, _mm256_cvtepi32_ps(gq_nib8_32(sc + 4)))), q);
+}
+GQ_SB_FN void gq_bs16_iq1_m(const uint8_t *b, float d, __m256 *lo, __m256 *hi) {   /* d (2 v + 1) / 8, v = 3 bits of word g / 4 */
+    const __m256i w = _mm256_cvtepu16_epi32(_mm_loadl_epi64((const __m128i *)(b + 48)));
+    const __m256i sh = _mm256_setr_epi32(0, 3, 6, 9, 0, 3, 6, 9), m7 = _mm256_set1_epi32(7), one = _mm256_set1_epi32(1);
+    const __m256 dv = _mm256_set1_ps(d), e = _mm256_set1_ps(0.125f);
+    for (int k = 0; k < 2; k++) {
+        const __m256i ww = _mm256_permutevar8x32_epi32(w, k ? _mm256_setr_epi32(2, 2, 2, 2, 3, 3, 3, 3) : _mm256_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1));
+        const __m256i v = _mm256_and_si256(_mm256_srlv_epi32(ww, sh), m7);
+        const __m256 f = _mm256_mul_ps(_mm256_mul_ps(dv, _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_add_epi32(v, v), one))), e);
+        if (k) *hi = f; else *lo = f;
+    }
+}
 /* The 256-element grid types without the unpack: each sub-block from its decoder
  * (gq_sb_*, the unpack's own), multiplied at once as gq_dot_i8 does it (the same
  * lanes, group scales times dx, fma and reduction), so the result is the unpack
@@ -1598,14 +1780,87 @@ GQ_EXACT_FN static void NAME(float *y, int ystride, const uint8_t *row, const in
     default: NAME##_body(y, ystride, row, xq, dx, I, 4); break; \
     } \
 }
-GQ_DOT_SB256(gq_dot_iq4_xs, 136, gq_bd_iq4_xs, gq_sb_iq4_xs)
-GQ_DOT_SB256(gq_dot_iq2_xxs, 66, gq_bd_f16, gq_sb_iq2_xxs)
-GQ_DOT_SB256(gq_dot_iq2_xs, 74, gq_bd_f16, gq_sb_iq2_xs)
-GQ_DOT_SB256(gq_dot_iq2_s, 82, gq_bd_f16, gq_sb_iq2_s)
-GQ_DOT_SB256(gq_dot_iq3_xxs, 98, gq_bd_f16, gq_sb_iq3_xxs)
-GQ_DOT_SB256(gq_dot_iq3_s, 110, gq_bd_f16, gq_sb_iq3_s)
-GQ_DOT_SB256(gq_dot_iq1_s, 50, gq_bd_f16, gq_sb_iq1_s)
-GQ_DOT_SB256(gq_dot_iq1_m, 56, gq_bd_iq1_m, gq_sb_iq1_m)
+/* GQ_DOT_SB256 for the grid types, from their gq_sbu_* decoders: the grid rows times x with
+ * the signs (the same operands) */
+#define GQ_DOT_SBU256(NAME, BYTES, BD, SBU, UNI) \
+GQ_SB_FN void NAME##_body(float *y, int ystride, const uint8_t *row, const int8_t *xq, const float *dx, int I, const int S) { \
+    __m256 vacc[GQ_FUSED_ROWS]; for (int s = 0; s < S; s++) vacc[s] = _mm256_setzero_ps(); \
+    for (int64_t blk = 0; blk < I / 256; blk++) { \
+        const uint8_t *b = row + blk * (BYTES); const float d = BD(b); \
+        for (int ib = 0; ib < 8; ib++) { \
+            float s2[2]; __m256i sg; const __m256i w = SBU(b, d, ib, s2, &sg); const int64_t xb = blk * 8 + ib; \
+            for (int s = 0; s < S; s++) { \
+                const __m256i x = _mm256_loadu_si256((const __m256i *)(xq + (int64_t)s * I + xb * 32)); \
+                const __m256i p = GQ_DP32(w, _mm256_sign_epi8(x, sg)); \
+                const float dd = dx[(int64_t)s * (I / 32) + xb]; \
+                const __m256 sv = (UNI) ? _mm256_set1_ps(s2[0] * dd) : _mm256_set_m128(_mm_set1_ps(s2[1] * dd), _mm_set1_ps(s2[0] * dd)); \
+                vacc[s] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), sv, vacc[s]); \
+            } \
+        } \
+    } \
+    for (int s = 0; s < S; s++) y[(int64_t)s * ystride] = GQ_HSUM8(vacc[s]); \
+} \
+GQ_EXACT_FN static void NAME(float *y, int ystride, const uint8_t *row, const int8_t *xq, const float *dx, int I, int S) { \
+    switch (S) { \
+    case 1: NAME##_body(y, ystride, row, xq, dx, I, 1); break; \
+    case 2: NAME##_body(y, ystride, row, xq, dx, I, 2); break; \
+    case 3: NAME##_body(y, ystride, row, xq, dx, I, 3); break; \
+    default: NAME##_body(y, ystride, row, xq, dx, I, 4); break; \
+    } \
+}
+/* The grid types and IQ4_XS with their scales a block at a time (gq_bs8_*, gq_bs16_*): per block the
+ * scales times dx as vectors, per sub-block its two lanes picked with one permute. The same lanes,
+ * products and fma as GQ_DOT_SB256 / GQ_DOT_SBU256, so the same bits. DEC: the sub-block's |w| into
+ * w and its signs into sg (GQ_DEC_U for the gq_sbu_* decoders, GQ_DEC_S for the signed gq_sb_*);
+ * PER16: a scale per 16 elements (BS16 sets lo and hi), else one per sub-block (BS8). */
+#define GQ_DEC_U(F) w = F(b, d, ib, s2, &sg);
+#define GQ_DEC_S(F) { const __m256i ws_ = F(b, d, ib, s2); sg = ws_; w = _mm256_sign_epi8(ws_, ws_); }
+#define GQ_DOT_SBV(NAME, BYTES, BD, DEC, PER16, BS16, BS8) \
+GQ_SB_FN void NAME##_body(float *y, int ystride, const uint8_t *row, const int8_t *xq, const float *dx, int I, const int S) { \
+    __m256 vacc[GQ_FUSED_ROWS]; for (int s = 0; s < S; s++) vacc[s] = _mm256_setzero_ps(); \
+    const __m256i plo = _mm256_setr_epi32(0, 0, 1, 1, 2, 2, 3, 3), phi = _mm256_setr_epi32(4, 4, 5, 5, 6, 6, 7, 7); \
+    for (int64_t blk = 0; blk < I / 256; blk++) { \
+        const uint8_t *b = row + blk * (BYTES); const float d = BD(b); \
+        __m256 sd[2][GQ_FUSED_ROWS]; \
+        if (PER16) { \
+            __m256 lo, hi; BS16; \
+            for (int s = 0; s < S; s++) { \
+                const __m256 xv = _mm256_loadu_ps(dx + (int64_t)s * (I / 32) + blk * 8); \
+                sd[0][s] = _mm256_mul_ps(lo, _mm256_permutevar8x32_ps(xv, plo)); sd[1][s] = _mm256_mul_ps(hi, _mm256_permutevar8x32_ps(xv, phi)); \
+            } \
+        } else { \
+            const __m256 s8 = BS8; \
+            for (int s = 0; s < S; s++) sd[0][s] = _mm256_mul_ps(s8, _mm256_loadu_ps(dx + (int64_t)s * (I / 32) + blk * 8)); \
+        } \
+        for (int ib = 0; ib < 8; ib++) { \
+            float s2[2]; __m256i w, sg; DEC \
+            (void)s2; const int64_t xb = blk * 8 + ib; \
+            const __m256i pick = (PER16) ? _mm256_add_epi32(_mm256_set1_epi32(2 * (ib & 3)), _mm256_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1)) : _mm256_set1_epi32(ib); \
+            for (int s = 0; s < S; s++) { \
+                const __m256i x = _mm256_loadu_si256((const __m256i *)(xq + (int64_t)s * I + xb * 32)); \
+                const __m256i p = GQ_DP32(w, _mm256_sign_epi8(x, sg)); \
+                vacc[s] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_permutevar8x32_ps(sd[(PER16) ? ib >> 2 : 0][s], pick), vacc[s]); \
+            } \
+        } \
+    } \
+    for (int s = 0; s < S; s++) y[(int64_t)s * ystride] = GQ_HSUM8(vacc[s]); \
+} \
+GQ_EXACT_FN static void NAME(float *y, int ystride, const uint8_t *row, const int8_t *xq, const float *dx, int I, int S) { \
+    switch (S) { \
+    case 1: NAME##_body(y, ystride, row, xq, dx, I, 1); break; \
+    case 2: NAME##_body(y, ystride, row, xq, dx, I, 2); break; \
+    case 3: NAME##_body(y, ystride, row, xq, dx, I, 3); break; \
+    default: NAME##_body(y, ystride, row, xq, dx, I, 4); break; \
+    } \
+}
+GQ_DOT_SBV(gq_dot_iq4_xs, 136, gq_bd_iq4_xs, GQ_DEC_S(gq_sb_iq4_xs), 0, (void)0, gq_bs8_iq4_xs(b, d))
+GQ_DOT_SBV(gq_dot_iq2_xxs, 66, gq_bd_f16, GQ_DEC_U(gq_sbu_iq2_xxs), 0, (void)0, gq_bs8_iq2_xxs(b, d))
+GQ_DOT_SBV(gq_dot_iq2_xs, 74, gq_bd_f16, GQ_DEC_U(gq_sbu_iq2_xs), 1, gq_bs16_iq2(b + 66, d, &lo, &hi), _mm256_setzero_ps())
+GQ_DOT_SBV(gq_dot_iq2_s, 82, gq_bd_f16, GQ_DEC_U(gq_sbu_iq2_s), 1, gq_bs16_iq2(b + 74, d, &lo, &hi), _mm256_setzero_ps())
+GQ_DOT_SBV(gq_dot_iq3_xxs, 98, gq_bd_f16, GQ_DEC_U(gq_sbu_iq3_xxs), 0, (void)0, gq_bs8_iq3_xxs(b, d))
+GQ_DOT_SBV(gq_dot_iq3_s, 110, gq_bd_f16, GQ_DEC_U(gq_sbu_iq3_s), 0, (void)0, gq_bs8_iq3_s(b, d))
+GQ_DOT_SBV(gq_dot_iq1_s, 50, gq_bd_f16, GQ_DEC_S(gq_sb_iq1_s), 0, (void)0, gq_bs8_iq1_s(b, d))
+GQ_DOT_SBV(gq_dot_iq1_m, 56, gq_bd_iq1_m, GQ_DEC_S(gq_sb_iq1_m), 1, gq_bs16_iq1_m(b, d, &lo, &hi), _mm256_setzero_ps())
 /* The K-quants the same way, with gq_dot_i8's min term accumulated per row in its
  * order (explicit fmaf) beside the vector part. */
 #define GQ_DOT_SBK(NAME, BYTES, SB, HASMIN) \
@@ -1640,6 +1895,7 @@ GQ_DOT_SBK(gq_dot_q4_k, 144, gq_sbk_q4_k, 1)
 GQ_DOT_SBK(gq_dot_q5_k, 176, gq_sbk_q5_k, 1)
 GQ_DOT_SBK(gq_dot_q6_k, 210, gq_sbk_q6_k, 0)
 GQ_DOT_SBK(gq_dot_q3_k, 110, gq_sbk_q3_k, 0)
+GQ_DOT_SBK(gq_dot_q2_k, 84, gq_sbk_q2_k, 1)
 typedef void (*gq_fdot_fn)(float *, int, const uint8_t *, const int8_t *, const float *, int, int);
 static inline gq_fdot_fn gq_fdot_sb256(int t) {
     switch (t) {
@@ -1695,14 +1951,70 @@ GQ_SB_FN void NAME##_512(float *y, int ystride, const uint8_t *row, const int8_t
     } \
     for (int s = 0; s < S; s++) y[(int64_t)s * ystride] = GQ_HSUM8(vacc[s]); \
 }
-GQ_DOT_SB256_512(gq_dot_iq4_xs, 136, gq_bd_iq4_xs, gq_sb_iq4_xs)
-GQ_DOT_SB256_512(gq_dot_iq2_xxs, 66, gq_bd_f16, gq_sb_iq2_xxs)
-GQ_DOT_SB256_512(gq_dot_iq2_xs, 74, gq_bd_f16, gq_sb_iq2_xs)
-GQ_DOT_SB256_512(gq_dot_iq2_s, 82, gq_bd_f16, gq_sb_iq2_s)
-GQ_DOT_SB256_512(gq_dot_iq3_xxs, 98, gq_bd_f16, gq_sb_iq3_xxs)
-GQ_DOT_SB256_512(gq_dot_iq3_s, 110, gq_bd_f16, gq_sb_iq3_s)
-GQ_DOT_SB256_512(gq_dot_iq1_s, 50, gq_bd_f16, gq_sb_iq1_s)
-GQ_DOT_SB256_512(gq_dot_iq1_m, 56, gq_bd_iq1_m, gq_sb_iq1_m)
+/* GQ_DOT_SB256_512 for the grid types, from their gq_sbu_* decoders, as the AVX2 kernels take
+ * them: the grid rows are |w| as they are (every grid byte is positive), and the sign bytes
+ * give the lanes to negate (-1 where w < 0), so vpdpbusd gets the same two operands as from the
+ * signed decoder, byte for byte, without the signs applied to the weights and taken off again.
+ * The same lanes and float steps: the AVX2 kernels' bits. */
+#define GQ_DOT_SBU256_512(NAME, BYTES, BD, SBU) \
+GQ_SB_FN void NAME##_512(float *y, int ystride, const uint8_t *row, const int8_t *xq, const float *dx, const int32_t *xs, int I, const int S) { \
+    (void)xs; __m256 vacc[GQ_FUSED_ROWS]; for (int s = 0; s < S; s++) vacc[s] = _mm256_setzero_ps(); \
+    for (int64_t blk = 0; blk < I / 256; blk++) { \
+        const uint8_t *b = row + blk * (BYTES); const float d = BD(b); \
+        for (int ib = 0; ib < 8; ib += 2) { \
+            float sa[2], sb[2]; __m256i ga, gb; const __m256i w0 = SBU(b, d, ib, sa, &ga), w1 = SBU(b, d, ib + 1, sb, &gb); \
+            const __m512i aw = gq_pair(w0, w1); const __mmask64 neg = _mm512_movepi8_mask(gq_pair(ga, gb)); \
+            const __m512 ws = gq_w16(sa[0], sa[1], sb[0], sb[1]); const int64_t xb = blk * 8 + ib; \
+            for (int s = 0; s < S; s++) { \
+                const __m512 pf = _mm512_cvtepi32_ps(gq_dp64(aw, neg, _mm512_loadu_si512((const void *)(xq + (int64_t)s * I + xb * 32)))); \
+                const __m512 sc = _mm512_mul_ps(ws, gq_x16(dx + (int64_t)s * (I / 32) + xb)); \
+                GQ_FMA2V(vacc[s], pf, sc) \
+            } \
+        } \
+    } \
+    for (int s = 0; s < S; s++) y[(int64_t)s * ystride] = GQ_HSUM8(vacc[s]); \
+}
+/* GQ_DOT_SBV on AVX-512: a block's sixteen scales (one a 16 elements) times its dx as one vector,
+ * a pair of sub-blocks' four picked with one permute: the lanes gq_w16 times gq_x16 gave, the same
+ * products, so the same bits. DEC2: sub-blocks ib and ib + 1 into aw (|w|) and neg (the lanes whose
+ * product is negated): GQ_DEC2_U for the gq_sbu_* decoders, GQ_DEC2_S for the signed gq_sb_*. */
+#define GQ_DEC2_U(F) { float sa_[2], sb_[2]; __m256i ga_, gb_; const __m256i w0_ = F(b, d, ib, sa_, &ga_), w1_ = F(b, d, ib + 1, sb_, &gb_); \
+    aw = gq_pair(w0_, w1_); neg = _mm512_movepi8_mask(gq_pair(ga_, gb_)); }
+#define GQ_DEC2_S(F) { float sa_[2], sb_[2]; const __m256i w0_ = F(b, d, ib, sa_), w1_ = F(b, d, ib + 1, sb_); \
+    const __m512i w_ = gq_pair(w0_, w1_); aw = _mm512_abs_epi8(w_); neg = _mm512_movepi8_mask(w_); }
+#define GQ_DOT_SBV_512(NAME, BYTES, BD, DEC2, PER16, BS16, BS8) \
+GQ_SB_FN void NAME##_512(float *y, int ystride, const uint8_t *row, const int8_t *xq, const float *dx, const int32_t *xs, int I, const int S) { \
+    (void)xs; __m256 vacc[GQ_FUSED_ROWS]; for (int s = 0; s < S; s++) vacc[s] = _mm256_setzero_ps(); \
+    const __m512i dup = _mm512_setr_epi32(0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7); \
+    const __m512i quad = _mm512_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3); \
+    for (int64_t blk = 0; blk < I / 256; blk++) { \
+        const uint8_t *b = row + blk * (BYTES); const float d = BD(b); \
+        __m512 s16; \
+        if (PER16) { __m256 lo, hi; BS16; s16 = _mm512_insertf32x8(_mm512_castps256_ps512(lo), hi, 1); } \
+        else s16 = _mm512_permutexvar_ps(dup, _mm512_castps256_ps512(BS8)); \
+        __m512 sd[GQ_FUSED_ROWS]; \
+        for (int s = 0; s < S; s++) \
+            sd[s] = _mm512_mul_ps(s16, _mm512_permutexvar_ps(dup, _mm512_castps256_ps512(_mm256_loadu_ps(dx + (int64_t)s * (I / 32) + blk * 8)))); \
+        for (int ib = 0; ib < 8; ib += 2) { \
+            __m512i aw; __mmask64 neg; DEC2 \
+            const int64_t xb = blk * 8 + ib; const __m512i pick = _mm512_add_epi32(_mm512_set1_epi32(2 * ib), quad); \
+            for (int s = 0; s < S; s++) { \
+                const __m512 pf = _mm512_cvtepi32_ps(gq_dp64(aw, neg, _mm512_loadu_si512((const void *)(xq + (int64_t)s * I + xb * 32)))); \
+                const __m512 sc = _mm512_permutexvar_ps(pick, sd[s]); \
+                GQ_FMA2V(vacc[s], pf, sc) \
+            } \
+        } \
+    } \
+    for (int s = 0; s < S; s++) y[(int64_t)s * ystride] = GQ_HSUM8(vacc[s]); \
+}
+GQ_DOT_SBV_512(gq_dot_iq4_xs, 136, gq_bd_iq4_xs, GQ_DEC2_S(gq_sb_iq4_xs), 0, (void)0, gq_bs8_iq4_xs(b, d))
+GQ_DOT_SBV_512(gq_dot_iq2_xxs, 66, gq_bd_f16, GQ_DEC2_U(gq_sbu_iq2_xxs), 0, (void)0, gq_bs8_iq2_xxs(b, d))
+GQ_DOT_SBV_512(gq_dot_iq2_xs, 74, gq_bd_f16, GQ_DEC2_U(gq_sbu_iq2_xs), 1, gq_bs16_iq2(b + 66, d, &lo, &hi), _mm256_setzero_ps())
+GQ_DOT_SBV_512(gq_dot_iq2_s, 82, gq_bd_f16, GQ_DEC2_U(gq_sbu_iq2_s), 1, gq_bs16_iq2(b + 74, d, &lo, &hi), _mm256_setzero_ps())
+GQ_DOT_SBV_512(gq_dot_iq3_xxs, 98, gq_bd_f16, GQ_DEC2_U(gq_sbu_iq3_xxs), 0, (void)0, gq_bs8_iq3_xxs(b, d))
+GQ_DOT_SBV_512(gq_dot_iq3_s, 110, gq_bd_f16, GQ_DEC2_U(gq_sbu_iq3_s), 0, (void)0, gq_bs8_iq3_s(b, d))
+GQ_DOT_SBV_512(gq_dot_iq1_s, 50, gq_bd_f16, GQ_DEC2_S(gq_sb_iq1_s), 0, (void)0, gq_bs8_iq1_s(b, d))
+GQ_DOT_SBV_512(gq_dot_iq1_m, 56, gq_bd_iq1_m, GQ_DEC2_S(gq_sb_iq1_m), 1, gq_bs16_iq1_m(b, d, &lo, &hi), _mm256_setzero_ps())
 #define GQ_DOT_SBK_512(NAME, BYTES, SB, HASMIN) \
 GQ_SB_FN void NAME##_512(float *y, int ystride, const uint8_t *row, const int8_t *xq, const float *dx, const int32_t *xs, int I, const int S) { \
     __m256 vacc[GQ_FUSED_ROWS]; float mm[GQ_FUSED_ROWS]; \
@@ -1730,6 +2042,7 @@ GQ_DOT_SBK_512(gq_dot_q4_k, 144, gq_sbk_q4_k, 1)
 GQ_DOT_SBK_512(gq_dot_q5_k, 176, gq_sbk_q5_k, 1)
 GQ_DOT_SBK_512(gq_dot_q6_k, 210, gq_sbk_q6_k, 0)
 GQ_DOT_SBK_512(gq_dot_q3_k, 110, gq_sbk_q3_k, 0)
+GQ_DOT_SBK_512(gq_dot_q2_k, 84, gq_sbk_q2_k, 1)
 /* Q8_0: two blocks a register, each with its own scale */
 static inline __attribute__((always_inline)) void gq_dot_q8_0_512(float *y, int ystride, const uint8_t *row, const int8_t *xq,
                                                                  const float *dx, const int32_t *xs, int I, const int S) {
@@ -1804,6 +2117,7 @@ GQ_EXACT_FN static int gq_row_512(float *y, int ystride, const gq_act *a, const 
     case GQ_Q5_K: GQ_ROWS512(gq_dot_q5_k_512, y, ystride, row, a, I); return 1;
     case GQ_Q6_K: GQ_ROWS512(gq_dot_q6_k_512, y, ystride, row, a, I); return 1;
     case GQ_Q3_K: GQ_ROWS512(gq_dot_q3_k_512, y, ystride, row, a, I); return 1;
+    case GQ_Q2_K: GQ_ROWS512(gq_dot_q2_k_512, y, ystride, row, a, I); return 1;
     case GQ_IQ4_XS: GQ_ROWS512(gq_dot_iq4_xs_512, y, ystride, row, a, I); return 1;
     case GQ_IQ2_XXS: GQ_ROWS512(gq_dot_iq2_xxs_512, y, ystride, row, a, I); return 1;
     case GQ_IQ2_XS: GQ_ROWS512(gq_dot_iq2_xs_512, y, ystride, row, a, I); return 1;
@@ -1829,17 +2143,25 @@ static inline void gq_row_all(float *y, int ystride, const gq_act *a, const uint
         }
         return;
     }
-    if (a->S <= GQ_FUSED_ROWS) {
-        if (t == GQ_Q4_0 || t == GQ_Q4_1 || t == GQ_Q5_0 || t == GQ_Q5_1 || t == GQ_IQ4_NL || t == GQ_MXFP4) {
-            gq_dot_b32(t, y, ystride, row, a->q, a->d, a->s, I, a->S); return;
-        }
+    if (a->S <= GQ_EXACT_ROWS) {   /* a verify's rows too: the fused kernels GQ_FUSED_ROWS at a time, each row's bits its own */
+        const int b32 = t == GQ_Q4_0 || t == GQ_Q4_1 || t == GQ_Q5_0 || t == GQ_Q5_1 || t == GQ_IQ4_NL || t == GQ_MXFP4;
         const gq_fdot_fn f = gq_fdot_sb256(t);
-        if (f) { f(y, ystride, row, a->q, a->d, I, a->S); return; }
-        if (t == GQ_Q4_K) { gq_dot_q4_k(y, ystride, row, a->q, a->d, a->s, I, a->S); return; }
-        if (t == GQ_Q2_0) { gq_dot_q2_0(y, ystride, row, a->q, a->d, I, a->S); return; }
-        if (t == GQ_Q5_K) { gq_dot_q5_k(y, ystride, row, a->q, a->d, a->s, I, a->S); return; }
-        if (t == GQ_Q6_K) { gq_dot_q6_k(y, ystride, row, a->q, a->d, a->s, I, a->S); return; }
-        if (t == GQ_Q3_K) { gq_dot_q3_k(y, ystride, row, a->q, a->d, a->s, I, a->S); return; }
+        if (b32 || f || t == GQ_Q4_K || t == GQ_Q2_0 || t == GQ_Q5_K || t == GQ_Q6_K || t == GQ_Q3_K || t == GQ_Q2_K) {
+            for (int s0 = 0; s0 < a->S; s0 += GQ_FUSED_ROWS) {
+                const int n = a->S - s0 < GQ_FUSED_ROWS ? a->S - s0 : GQ_FUSED_ROWS;
+                float *ys = y + (int64_t)s0 * ystride; const int8_t *xq = a->q + (int64_t)s0 * I;
+                const float *dx = a->d + (int64_t)s0 * (I / 32); const int32_t *xs = a->s + (int64_t)s0 * (I / 16);
+                if (b32) gq_dot_b32(t, ys, ystride, row, xq, dx, xs, I, n);
+                else if (f) f(ys, ystride, row, xq, dx, I, n);
+                else if (t == GQ_Q4_K) gq_dot_q4_k(ys, ystride, row, xq, dx, xs, I, n);
+                else if (t == GQ_Q2_0) gq_dot_q2_0(ys, ystride, row, xq, dx, I, n);
+                else if (t == GQ_Q5_K) gq_dot_q5_k(ys, ystride, row, xq, dx, xs, I, n);
+                else if (t == GQ_Q6_K) gq_dot_q6_k(ys, ystride, row, xq, dx, xs, I, n);
+                else if (t == GQ_Q3_K) gq_dot_q3_k(ys, ystride, row, xq, dx, xs, I, n);
+                else gq_dot_q2_k(ys, ystride, row, xq, dx, xs, I, n);
+            }
+            return;
+        }
     }
 #else
     if (t == GQ_Q8_0) {
@@ -1878,7 +2200,196 @@ static inline void gq_r16_t2(uint8_t *out, const uint8_t *in) {
     memcpy(out, &v, 4);
 }
 /* one group block from the 16 rows' blocks b[r] */
+/* IQ3_S's grid as its levels: the index of four levels ((byte - 1) / 2, three bits each, the
+ * first lowest), -1 where no grid row has them; built once, by the first caller */
+static inline const int16_t *gq_iq3s_rev(void) {
+    static int16_t rev[4096];
+    static int state;   /* 0 unbuilt, 1 building, 2 built */
+    if (__atomic_load_n(&state, __ATOMIC_ACQUIRE) == 2) return rev;
+    int zero = 0;
+    if (__atomic_compare_exchange_n(&state, &zero, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        for (int i = 0; i < 4096; i++) rev[i] = -1;
+        for (int i = 0; i < 512; i++) {
+            int key = 0;
+            for (int j = 0; j < 4; j++) key |= ((GGML_IQ3S_GRID[4 * i + j] - 1) >> 1) << (3 * j);
+            rev[key] = (int16_t)i;
+        }
+        __atomic_store_n(&state, 2, __ATOMIC_RELEASE);
+    } else
+        while (__atomic_load_n(&state, __ATOMIC_ACQUIRE) != 2) { }
+    return rev;
+}
+/* Q6_K_R16 and Q3_K_R16 keep their high bits beside the low bits that the same sub-blocks read
+ * (Q3_K: quad j of part c, low bits then high bits), so a kernel reads its group in ascending
+ * order: with the high bits after all the low ones, every block jumped ahead and back, and one
+ * Zen 4 core streamed a 27B-sized Q6_K matrix from RAM at 13 GB/s instead of 25 or more. Q6_K's
+ * high bits are a 2-bit plane a sub-block (Q2_0_R16's layout: a 64-byte word per 16 elements, byte
+ * 4 r + k bits 2 i = element 16 G + 4 i + k), after the nibbles of the quads that read them, so each
+ * of a half's four sub-blocks reads 10, 10, 2 and 2 new lines instead of 16, 8, 0 and 0. Half c:
+ * sub-block 0's word 0, part 2c's quads 0-3, its word 1, quads 4-7; sub-block 1 and part 2c+1 the
+ * same; sub-block 2's words; sub-block 3's. */
+/* GQ_UNROLL_IB: some K kernels' sub-block loops are unrolled (the nibbles' shifts immediates either
+ * way), where that was faster on a Zen 4 core both in cache and streaming from RAM on one thread,
+ * which it was not everywhere: the compiler's load order then changes how the core's prefetchers
+ * follow the group. Each type's rows are a function of their own (GQ_R16_ROWS_FN) for that reason:
+ * inlined into one dispatcher, a change to one kernel moved the others by as much as 2x. */
+#define GQ_Q6R_QL(p, j) (288 + 1536 * ((p) >> 1) + 640 * ((p) & 1) + 64 + 64 * (j) + ((j) >= 4 ? 64 : 0))   /* nibbles, part p */
+#define GQ_Q6R_HP(c, k, G) (288 + 1536 * (c) + ((k) < 2 ? 640 * (k) + 320 * (G) : 1280 + 128 * ((k) - 2) + 64 * (G)))   /* high bits, sub-block 4c + k */
+#define GQ_Q3R_QS(c, j) ((c) ? 1312 + 64 * (j) : 288 + 128 * (j))                           /* two-bit codes, part c */
+#define GQ_Q3R_HM(j) (288 + 128 * (j) + 64)                                                  /* hmask */
+/* IQ3_S_R16's codes as values: (sign << 3) | level, level -> 2 level + 1 */
+static const int8_t GQ_IQ3S_CODES[16] __attribute__((aligned(16))) = { 1, 3, 5, 7, 9, 11, 13, 15, -1, -3, -5, -7, -9, -11, -13, -15 };
+/* IQ2_XXS, IQ2_XS and IQ2_S held as planes (gq_r16_of_grown). Their values are the grid's bytes 8,
+ * 25 and 43 with a sign: two bits of level, in Q2_0_R16's layout (a 64-byte word per 16 elements of
+ * the 16 rows: byte 4 r + k, bits 2 i = element 4 i + k of row r), and a sign bit, a 64-bit word per
+ * quad (bit 4 r + k = element k of row r); the kernels look (sign << 2 | level) up as the value. A
+ * group block: d, the scales 2 s + 1 (a byte a row, per 32 elements for IQ2_XXS, per 16 for the
+ * others), the levels, the signs: 106 bytes a row and block for IQ2_XXS (66 in the file), 114 for
+ * IQ2_XS (74) and IQ2_S (82). The scale's factor 1/8 comes back in the kernels, exactly. */
+static const int8_t GQ_IQ2_CODES[16] __attribute__((aligned(16))) = { 8, 25, 43, 0, -8, -25, -43, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+static inline int gq_p2_per16(int t) { return t != GQ_IQ2_XXS_R16; }
+static inline int gq_p2_lv(int t) { return gq_p2_per16(t) ? 288 : 160; }   /* the levels; the signs 1024 after */
+static inline int gq_p2_level(int v) { return v == 8 ? 0 : v == 25 ? 1 : 2; }
+static inline int gq_p2_get(const uint8_t *o, int lv, int r, int e, int *neg) {   /* element e of row r */
+    const int bit = 4 * r + (e & 3);
+    *neg = (o[lv + 1024 + 8 * (e >> 2) + (bit >> 3)] >> (bit & 7)) & 1;
+    return (o[lv + 64 * (e >> 4) + 4 * r + (e & 3)] >> (2 * ((e >> 2) & 3))) & 3;
+}
+/* an IQ2 grid as levels: the index of eight levels (base 3, the first lowest), -1 where no grid row
+ * has them; built once a grid, by the first caller */
+static inline const int16_t *gq_iq2_rev(int base) {
+    static int16_t rev[3][6561];
+    static int state[3];   /* 0 unbuilt, 1 building, 2 built */
+    const int k = base == GQ_IQ2_XXS ? 0 : base == GQ_IQ2_XS ? 1 : 2;
+    const uint8_t *grid = k == 0 ? GGML_IQ2XXS_GRID : k == 1 ? GGML_IQ2XS_GRID : GGML_IQ2S_GRID;
+    const int n = k == 0 ? 256 : k == 1 ? 512 : 1024;
+    if (__atomic_load_n(&state[k], __ATOMIC_ACQUIRE) == 2) return rev[k];
+    int zero = 0;
+    if (__atomic_compare_exchange_n(&state[k], &zero, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        for (int i = 0; i < 6561; i++) rev[k][i] = -1;
+        for (int i = 0; i < n; i++) {
+            int key = 0;
+            for (int j = 7; j >= 0; j--) key = 3 * key + gq_p2_level(grid[8 * i + j]);
+            rev[k][key] = (int16_t)i;
+        }
+        __atomic_store_n(&state[k], 2, __ATOMIC_RELEASE);
+    } else
+        while (__atomic_load_n(&state[k], __ATOMIC_ACQUIRE) != 2) { }
+    return rev[k];
+}
+/* IQ3_XXS held as codes (gq_r16_of_grown), IQ3_S_R16's way: IQ4_XS_R16's layout, a 4-bit code a
+ * value (sign << 3 | level, the grid's bytes 4, 12, .. 52, 62 as levels 0 .. 7) and the scales
+ * 2 s + 1, whose factor 1/4 comes back in the kernels: 138 bytes a row and block (98 in the file) */
+static const int8_t GQ_IQ3XXS_CODES[16] __attribute__((aligned(16))) = { 4, 12, 20, 28, 36, 44, 52, 62, -4, -12, -20, -28, -36, -44, -52, -62 };
+static inline int gq_i3x_level(int v) { return v == 62 ? 7 : (v - 4) >> 3; }
+/* IQ3_XXS's grid as levels: the index of four levels (three bits each, the first lowest) */
+static inline const int16_t *gq_iq3xxs_rev(void) {
+    static int16_t rev[4096];
+    static int state;
+    if (__atomic_load_n(&state, __ATOMIC_ACQUIRE) == 2) return rev;
+    int zero = 0;
+    if (__atomic_compare_exchange_n(&state, &zero, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        for (int i = 0; i < 4096; i++) rev[i] = -1;
+        for (int i = 0; i < 256; i++) {
+            int key = 0;
+            for (int j = 0; j < 4; j++) key |= gq_i3x_level(GGML_IQ3XXS_GRID[4 * i + j]) << (3 * j);
+            rev[key] = (int16_t)i;
+        }
+        __atomic_store_n(&state, 2, __ATOMIC_RELEASE);
+    } else
+        while (__atomic_load_n(&state, __ATOMIC_ACQUIRE) != 2) { }
+    return rev;
+}
+/* IQ1_S and IQ1_M held as planes (gq_r16_of_grown): a value is 8 g + delta, g of the grid in -1 .. 1
+ * (two bits of level g + 1, the IQ2 planes' layout) and delta -1 or +1 for a sub-block (IQ1_S) or
+ * eight elements (IQ1_M), kept as one 16-bit word a group (bit r = row r's delta is -1); the
+ * kernels look (delta < 0) << 2 | level up as the value. d, the scales 2 s + 1 (per 32 for IQ1_S,
+ * per 16 for IQ1_M), the levels, the delta words: 75 bytes a row and block for IQ1_S (50 in the
+ * file) and 86 for IQ1_M (56). The scale's 1/8 comes back in the kernels, exactly. */
+static const int8_t GQ_IQ1_CODES[16] __attribute__((aligned(16))) = { -7, 1, 9, 0, -9, -1, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+static inline int gq_p1_m(int t) { return t == GQ_IQ1_M_R16; }
+static inline int gq_p1_lv(int t) { return gq_p1_m(t) ? 288 : 160; }   /* the levels; the delta words 1024 after */
+/* bit i of the byte m set: nibble i of the result all ones (a row's four lanes of a quad) */
+static inline uint32_t gq_nib4(uint32_t m) {
+    m &= 255; m = (m | m << 12) & 0x000F000Fu; m = (m | m << 6) & 0x03030303u; m = (m | m << 3) & 0x11111111u;
+    return m * 15u;
+}
+static inline uint64_t gq_nib4x2(uint32_t m16) { return (uint64_t)gq_nib4(m16) | (uint64_t)gq_nib4(m16 >> 8) << 32; }
+/* IQ1_S's grid as levels: the index of eight levels g + 1 (base 3, the first lowest) */
+static inline const int16_t *gq_iq1_rev(void) {
+    static int16_t rev[6561];
+    static int state;
+    if (__atomic_load_n(&state, __ATOMIC_ACQUIRE) == 2) return rev;
+    int zero = 0;
+    if (__atomic_compare_exchange_n(&state, &zero, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        for (int i = 0; i < 6561; i++) rev[i] = -1;
+        for (int i = 0; i < 2048; i++) {
+            int key = 0;
+            for (int j = 7; j >= 0; j--) key = 3 * key + (GGML_IQ1S_GRID[8 * i + j] + 1);
+            rev[key] = (int16_t)i;
+        }
+        __atomic_store_n(&state, 2, __ATOMIC_RELEASE);
+    } else
+        while (__atomic_load_n(&state, __ATOMIC_ACQUIRE) != 2) { }
+    return rev;
+}
+/* Q2_K_R16, the file's bytes: d (16 f16), dmin (16 f16), the 16 scale bytes (low nibble the scale,
+ * high the min, as the file has them: byte 64 + 16 k + r = row r's group k of 16 elements), then the
+ * 2-bit codes in Q2_0_R16's layout (16 words of 64 bytes). MXFP4_R16: the 16 rows' e8m0 bytes, then
+ * IQ4_NL_R16's four quads of nibbles: 272 bytes, 16 blocks of 17. NVFP4_R16, a block of 64: the 16
+ * rows' E4M3 scales by group (byte 16 g + r: row r's group g of 16), then each half of 32 as
+ * IQ4_NL_R16's quads (64 + 256 G + 64 q + 4 r), its nibbles reordered so that byte k holds the
+ * half's weights k (low) and 16 + k (high): 576 bytes, 16 blocks of 36. */
+/* The larger forms' packing a row at a time, vectorized (a model's dense matrices are packed at
+ * their first product, so this is time to first token): a row's 2-bit levels into Q2_0_R16's
+ * transposed words (four levels a byte from four 32-bit words), its sign bits a quad's nibble at
+ * a time, and the levels from gq_ublk's values with compares. */
+static inline void gq_r16_put_lv(uint8_t *o, int r, const uint8_t *l) {   /* l[256], each 0 .. 3 */
+    for (int G = 0; G < 16; G++) {
+        uint32_t w[4]; memcpy(w, l + 16 * G, 16);
+        const uint32_t v = w[0] | w[1] << 2 | w[2] << 4 | w[3] << 6;   /* byte k: bits 2 i = element 16 G + 4 i + k */
+        memcpy(o + 64 * G + 4 * r, &v, 4);
+    }
+}
+static inline uint32_t gq_neg32(const int8_t *w) {   /* bit e: w[e] < 0 */
+#if defined(__AVX2__)
+    return (uint32_t)_mm256_movemask_epi8(_mm256_loadu_si256((const __m256i *)w));
+#else
+    uint32_t m = 0; for (int e = 0; e < 32; e++) m |= (uint32_t)(w[e] < 0) << e; return m;
+#endif
+}
+static inline void gq_r16_put_sg(uint8_t *sg, int r, const int8_t *w8) {   /* quad Q's word at sg + 8 Q: bits 4 r + k */
+    for (int c = 0; c < 8; c++) {
+        const uint32_t m = gq_neg32(w8 + 32 * c);
+        for (int q = 0; q < 8; q++) sg[8 * (8 * c + q) + (r >> 1)] |= (uint8_t)(((m >> (4 * q)) & 15) << (4 * (r & 1)));
+    }
+}
+/* the levels of IQ2's values 8, 25, 43 (sign apart) and of IQ1's 8 g + delta (g + 1) */
+static inline void gq_levels_iq2(const int8_t *w8, uint8_t *l) {
+#if defined(__AVX2__)
+    for (int c = 0; c < 8; c++) {
+        const __m256i a = _mm256_abs_epi8(_mm256_loadu_si256((const __m256i *)(w8 + 32 * c)));
+        const __m256i v = _mm256_add_epi8(_mm256_cmpgt_epi8(a, _mm256_set1_epi8(8)), _mm256_cmpgt_epi8(a, _mm256_set1_epi8(25)));
+        _mm256_storeu_si256((__m256i *)(l + 32 * c), _mm256_sub_epi8(_mm256_setzero_si256(), v));
+    }
+#else
+    for (int e = 0; e < 256; e++) l[e] = (uint8_t)gq_p2_level(w8[e] < 0 ? -w8[e] : w8[e]);
+#endif
+}
+static inline void gq_levels_iq1(const int8_t *w8, uint8_t *l) {
+#if defined(__AVX2__)
+    for (int c = 0; c < 8; c++) {
+        const __m256i w = _mm256_loadu_si256((const __m256i *)(w8 + 32 * c));
+        const __m256i v = _mm256_add_epi8(_mm256_cmpgt_epi8(w, _mm256_set1_epi8(-2)), _mm256_cmpgt_epi8(w, _mm256_set1_epi8(2)));
+        _mm256_storeu_si256((__m256i *)(l + 32 * c), _mm256_sub_epi8(_mm256_setzero_si256(), v));
+    }
+#else
+    for (int e = 0; e < 256; e++) l[e] = (uint8_t)((w8[e] + 9) >> 3);
+#endif
+}
 static void gq_r16_pack_blk(int t, uint8_t *o, const uint8_t *const *b) {
+    if (t >= GQ_IQ2_XXS_R16 && t <= GQ_IQ2_S_R16) memset(o + gq_p2_lv(t) + 1024, 0, 512);   /* the sign words are or-ed in */
+    if (t == GQ_IQ1_S_R16 || t == GQ_IQ1_M_R16) memset(o + gq_p1_lv(t) + 1024, 0, gq_p1_m(t) ? 64 : 16);   /* the delta words are or-ed in */
     for (int r = 0; r < 16; r++) {
         const uint8_t *s = b[r];
         switch (t) {
@@ -1897,8 +2408,12 @@ static void gq_r16_pack_blk(int t, uint8_t *o, const uint8_t *const *b) {
             memcpy(o + 2 * r, s + 208, 2);
             for (int k = 0; k < 16; k++) o[32 + 16 * k + r] = s[192 + k];
             for (int c = 0; c < 2; c++) for (int a = 0; a < 2; a++) for (int j = 0; j < 8; j++)
-                memcpy(o + 288 + ((2 * c + a) * 8 + j) * 64 + 4 * r, s + 64 * c + 32 * a + 4 * j, 4);
-            for (int c = 0; c < 2; c++) for (int j = 0; j < 8; j++) memcpy(o + 2336 + (8 * c + j) * 64 + 4 * r, s + 128 + 32 * c + 4 * j, 4);
+                memcpy(o + GQ_Q6R_QL(2 * c + a, j) + 4 * r, s + 64 * c + 32 * a + 4 * j, 4);
+            for (int c = 0; c < 2; c++) for (int k = 0; k < 4; k++) for (int G = 0; G < 2; G++) for (int kk = 0; kk < 4; kk++) {
+                uint8_t v = 0;   /* element 16 G + 4 i + kk of sub-block 4c + k: bits 2k of qh[32c + 16 G + 4 i + kk] */
+                for (int i = 0; i < 4; i++) v |= (uint8_t)(((s[128 + 32 * c + 16 * G + 4 * i + kk] >> (2 * k)) & 3) << (2 * i));
+                o[GQ_Q6R_HP(c, k, G) + 4 * r + kk] = v;
+            }
             break;
         case GQ_Q3_K_R16: {
             const uint8_t *sc = s + 96;
@@ -1907,8 +2422,8 @@ static void gq_r16_pack_blk(int t, uint8_t *o, const uint8_t *const *b) {
                 const int l = k < 8 ? sc[k] & 15 : sc[k - 8] >> 4, hh = (sc[8 + (k & 3)] >> (2 * (k >> 2))) & 3;
                 o[32 + 16 * k + r] = (uint8_t)(int8_t)((l | hh << 4) - 32);
             }
-            for (int c = 0; c < 2; c++) for (int j = 0; j < 8; j++) memcpy(o + 288 + (8 * c + j) * 64 + 4 * r, s + 32 + 32 * c + 4 * j, 4);
-            for (int j = 0; j < 8; j++) memcpy(o + 1312 + 64 * j + 4 * r, s + 4 * j, 4);
+            for (int c = 0; c < 2; c++) for (int j = 0; j < 8; j++) memcpy(o + GQ_Q3R_QS(c, j) + 4 * r, s + 32 + 32 * c + 4 * j, 4);
+            for (int j = 0; j < 8; j++) memcpy(o + GQ_Q3R_HM(j) + 4 * r, s + 4 * j, 4);
             break; }
         case GQ_IQ4_XS_R16: {
             const uint16_t sh = gq_rd16(s + 2); const uint8_t *sl = s + 4;
@@ -1923,9 +2438,115 @@ static void gq_r16_pack_blk(int t, uint8_t *o, const uint8_t *const *b) {
             memcpy(o + 2 * r, s, 2);
             for (int j = 0; j < 8; j++) for (int e = 0; e < 4; e++) o[32 + 64 * j + 4 * r + e] = s[2 + 4 * j + e] ^ 0x80;
             break;
+        case GQ_IQ2_XXS_R16: case GQ_IQ2_XS_R16: case GQ_IQ2_S_R16: {   /* the values as gq_ublk decodes them */
+            const int lv = gq_p2_lv(t); int8_t w8[256]; float sw[16], mw[16];
+            gq_ublk(gq_r16_base(t), s, w8, sw, mw);
+            memcpy(o + 2 * r, s, 2);
+            if (t == GQ_IQ2_XXS_R16) for (int ib = 0; ib < 8; ib++) o[32 + 16 * ib + r] = (uint8_t)(2 * (gq_rd32(s + 6 + 8 * ib) >> 28) + 1);
+            else {
+                const uint8_t *sc = s + (t == GQ_IQ2_XS_R16 ? 66 : 74);
+                for (int k = 0; k < 16; k++) o[32 + 16 * k + r] = (uint8_t)(2 * ((sc[k >> 1] >> (4 * (k & 1))) & 15) + 1);
+            }
+            uint8_t l[256]; gq_levels_iq2(w8, l);
+            gq_r16_put_lv(o + lv, r, l); gq_r16_put_sg(o + lv + 1024, r, w8);
+            break; }
         case GQ_Q4_0_R16: case GQ_IQ4_NL_R16:
             memcpy(o + 2 * r, s, 2);
             for (int q = 0; q < 4; q++) memcpy(o + 32 + 64 * q + 4 * r, s + 2 + 4 * q, 4);
+            break;
+        case GQ_IQ3_S_R16: {   /* IQ4_XS_R16's layout: d, the scales 1 + 2 v, the codes (sign << 3 | level) */
+            const uint8_t *qs = s + 2, *qh = s + 66, *sg = s + 74, *sc = s + 106;
+            memcpy(o + 2 * r, s, 2);
+            for (int ib = 0; ib < 8; ib++) {
+                o[32 + 16 * ib + r] = (uint8_t)(1 + 2 * ((sc[ib >> 1] >> (4 * (ib & 1))) & 15));
+                uint8_t nb[16] = {0};   /* element k at byte k % 16, the low nibble for k < 16 */
+                for (int g4 = 0; g4 < 8; g4++) {   /* a grid row: four elements */
+                    const uint8_t *g = GGML_IQ3S_GRID + 4 * (qs[8 * ib + g4] | (((qh[ib] >> g4) & 1) << 8));
+                    const int sb = sg[4 * ib + g4 / 2] >> (4 * (g4 & 1));
+                    for (int j = 0; j < 4; j++) {
+                        const int k = 4 * g4 + j;
+                        nb[k & 15] |= (uint8_t)((((sb >> j) & 1) << 3 | (g[j] - 1) >> 1) << (k < 16 ? 0 : 4));
+                    }
+                }
+                for (int q = 0; q < 4; q++) memcpy(o + 160 + (4 * ib + q) * 64 + 4 * r, nb + 4 * q, 4);
+            }
+            break; }
+        case GQ_IQ3_XXS_R16: {   /* IQ3_S_R16's layout, the values as gq_ublk decodes them */
+            int8_t w8[256]; float sw[16], mw[16];
+            gq_ublk(GQ_IQ3_XXS, s, w8, sw, mw);
+            memcpy(o + 2 * r, s, 2);
+            for (int ib = 0; ib < 8; ib++) {
+                o[32 + 16 * ib + r] = (uint8_t)(2 * (gq_rd32(s + 66 + 4 * ib) >> 28) + 1);
+                uint8_t nb[16];
+#if defined(__AVX2__)
+                {   /* code (w < 0) << 3 | (|w| - 4) >> 3 (the bytes 4, 12, .. 52, 62 as 0 .. 7); element k at byte k % 16 */
+                    const __m256i w = _mm256_loadu_si256((const __m256i *)(w8 + 32 * ib)), a = _mm256_abs_epi8(w);
+                    const __m256i lvl = _mm256_and_si256(_mm256_srli_epi16(_mm256_sub_epi8(a, _mm256_set1_epi8(4)), 3), _mm256_set1_epi8(7));
+                    const __m256i c = _mm256_or_si256(lvl, _mm256_and_si256(_mm256_cmpgt_epi8(_mm256_setzero_si256(), w), _mm256_set1_epi8(8)));
+                    _mm_storeu_si128((__m128i *)nb, _mm_or_si128(_mm256_castsi256_si128(c), _mm_slli_epi16(_mm256_extracti128_si256(c, 1), 4)));
+                }
+#else
+                memset(nb, 0, 16);
+                for (int k = 0; k < 32; k++) {
+                    const int v = w8[32 * ib + k], neg = v < 0;
+                    nb[k & 15] |= (uint8_t)((neg << 3 | gq_i3x_level(neg ? -v : v)) << (k < 16 ? 0 : 4));
+                }
+#endif
+                for (int q = 0; q < 4; q++) memcpy(o + 160 + (4 * ib + q) * 64 + 4 * r, nb + 4 * q, 4);
+            }
+            break; }
+        case GQ_IQ1_S_R16: case GQ_IQ1_M_R16: {   /* the levels as gq_ublk decodes them (8 g + delta), the deltas and scales from the block */
+            const int m16 = gq_p1_m(t), lv = gq_p1_lv(t); int8_t w8[256]; float sw[16], mw[16];
+            gq_ublk(gq_r16_base(t), s, w8, sw, mw);
+            uint16_t *dm = (uint16_t *)(void *)(o + lv + 1024);
+            if (!m16) {
+                memcpy(o + 2 * r, s, 2);
+                for (int ib = 0; ib < 8; ib++) {
+                    const uint16_t qh = gq_rd16(s + 34 + 2 * ib);
+                    o[32 + 16 * ib + r] = (uint8_t)(2 * ((qh >> 12) & 7) + 1);
+                    if (qh & 0x8000) { uint16_t w; memcpy(&w, dm + ib, 2); w |= (uint16_t)(1 << r); memcpy(dm + ib, &w, 2); }
+                }
+            } else {
+                uint16_t sc[4]; for (int i = 0; i < 4; i++) sc[i] = gq_rd16(s + 48 + 2 * i);
+                const uint16_t dh = (uint16_t)((sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0) | ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000));
+                memcpy(o + 2 * r, &dh, 2);
+                for (int k = 0; k < 16; k++) o[32 + 16 * k + r] = (uint8_t)(2 * ((sc[k >> 2] >> (3 * (k & 3))) & 7) + 1);
+                for (int g = 0; g < 32; g++)
+                    if ((s[32 + (g >> 1)] >> (4 * (g & 1))) & 8) { uint16_t w; memcpy(&w, dm + g, 2); w |= (uint16_t)(1 << r); memcpy(dm + g, &w, 2); }
+            }
+            uint8_t l[256]; gq_levels_iq1(w8, l);
+            gq_r16_put_lv(o + lv, r, l);
+            break; }
+        case GQ_Q2_K_R16:
+            memcpy(o + 2 * r, s + 80, 2); memcpy(o + 32 + 2 * r, s + 82, 2);
+            for (int k = 0; k < 16; k++) o[64 + 16 * k + r] = s[k];
+            {   /* element e = 128 c + 32 sh + j: bits 2 sh of qs[32 c + j] */
+                uint8_t l[256];
+                for (int c = 0; c < 2; c++) for (int sh = 0; sh < 4; sh++) {
+#if defined(__AVX2__)
+                    _mm256_storeu_si256((__m256i *)(l + 128 * c + 32 * sh), _mm256_and_si256(_mm256_srl_epi16(_mm256_loadu_si256((const __m256i *)(s + 16 + 32 * c)), _mm_cvtsi32_si128(2 * sh)), _mm256_set1_epi8(3)));
+#else
+                    for (int j = 0; j < 32; j++) l[128 * c + 32 * sh + j] = (uint8_t)((s[16 + 32 * c + j] >> (2 * sh)) & 3);
+#endif
+                }
+                gq_r16_put_lv(o + 320, r, l);
+            }
+            break;
+        case GQ_MXFP4_R16:
+            o[r] = s[0];
+            for (int q = 0; q < 4; q++) memcpy(o + 16 + 64 * q + 4 * r, s + 1 + 4 * q, 4);
+            break;
+        case GQ_NVFP4_R16:   /* the file's group g: byte j its weights j (low) and 8 + j (high) */
+            for (int g = 0; g < 4; g++) o[16 * g + r] = s[g];
+            for (int G = 0; G < 2; G++) {
+                const uint8_t *qa = s + 4 + 16 * G, *qb = qa + 8;   /* groups 2G and 2G + 1 */
+                uint8_t nb[16];
+                for (int k = 0; k < 16; k++) {
+                    const int lo = k < 8 ? qa[k] & 15 : qa[k - 8] >> 4, hi = k < 8 ? qb[k] & 15 : qb[k - 8] >> 4;
+                    nb[k] = (uint8_t)(lo | hi << 4);
+                }
+                for (int q = 0; q < 4; q++) memcpy(o + 64 + 256 * G + 64 * q + 4 * r, nb + 4 * q, 4);
+            }
             break;
         }
     }
@@ -1953,8 +2574,10 @@ static void gq_r16_unpack_blk(int t, const uint8_t *o, int r, uint8_t *s) {
         memcpy(s + 208, o + 2 * r, 2);
         for (int k = 0; k < 16; k++) s[192 + k] = o[32 + 16 * k + r];
         for (int c = 0; c < 2; c++) for (int a = 0; a < 2; a++) for (int j = 0; j < 8; j++)
-            memcpy(s + 64 * c + 32 * a + 4 * j, o + 288 + ((2 * c + a) * 8 + j) * 64 + 4 * r, 4);
-        for (int c = 0; c < 2; c++) for (int j = 0; j < 8; j++) memcpy(s + 128 + 32 * c + 4 * j, o + 2336 + (8 * c + j) * 64 + 4 * r, 4);
+            memcpy(s + 64 * c + 32 * a + 4 * j, o + GQ_Q6R_QL(2 * c + a, j) + 4 * r, 4);
+        memset(s + 128, 0, 64);
+        for (int c = 0; c < 2; c++) for (int k = 0; k < 4; k++) for (int G = 0; G < 2; G++) for (int kk = 0; kk < 4; kk++)
+            for (int i = 0; i < 4; i++) s[128 + 32 * c + 16 * G + 4 * i + kk] |= (uint8_t)(((o[GQ_Q6R_HP(c, k, G) + 4 * r + kk] >> (2 * i)) & 3) << (2 * k));
         break;
     case GQ_Q3_K_R16: {
         uint8_t *sc = s + 96; memset(sc, 0, 12);
@@ -1964,8 +2587,8 @@ static void gq_r16_unpack_blk(int t, const uint8_t *o, int r, uint8_t *s) {
             if (k < 8) sc[k] |= (uint8_t)(u & 15); else sc[k - 8] |= (uint8_t)((u & 15) << 4);
             sc[8 + (k & 3)] |= (uint8_t)(((u >> 4) & 3) << (2 * (k >> 2)));
         }
-        for (int c = 0; c < 2; c++) for (int j = 0; j < 8; j++) memcpy(s + 32 + 32 * c + 4 * j, o + 288 + (8 * c + j) * 64 + 4 * r, 4);
-        for (int j = 0; j < 8; j++) memcpy(s + 4 * j, o + 1312 + 64 * j + 4 * r, 4);
+        for (int c = 0; c < 2; c++) for (int j = 0; j < 8; j++) memcpy(s + 32 + 32 * c + 4 * j, o + GQ_Q3R_QS(c, j) + 4 * r, 4);
+        for (int j = 0; j < 8; j++) memcpy(s + 4 * j, o + GQ_Q3R_HM(j) + 4 * r, 4);
         break; }
     case GQ_IQ4_XS_R16: {
         uint16_t sh = 0; uint8_t *sl = s + 4; memset(sl, 0, 4);
@@ -1981,6 +2604,121 @@ static void gq_r16_unpack_blk(int t, const uint8_t *o, int r, uint8_t *s) {
         memcpy(s, o + 2 * r, 2);
         for (int j = 0; j < 8; j++) for (int e = 0; e < 4; e++) s[2 + 4 * j + e] = o[32 + 64 * j + 4 * r + e] ^ 0x80;
         break;
+    case GQ_IQ2_XXS_R16: case GQ_IQ2_XS_R16: case GQ_IQ2_S_R16: {   /* each eight levels back to their grid index (gq_iq2_rev) */
+        const int base = gq_r16_base(t), lv = gq_p2_lv(t); const int16_t *rev = gq_iq2_rev(base);
+        memset(s, 0, (size_t)GQ_TYPES[base].bytes); memcpy(s, o + 2 * r, 2);
+        for (int g = 0; g < 32; g++) {
+            int key = 0, sb = 0;
+            for (int j = 7; j >= 0; j--) { int neg; key = 3 * key + gq_p2_get(o, lv, r, 8 * g + j, &neg); sb = sb << 1 | neg; }
+            const int idx = rev[key] < 0 ? 0 : rev[key];
+            if (t == GQ_IQ2_XXS_R16) {
+                s[2 + 8 * (g >> 2) + (g & 3)] = (uint8_t)idx;
+                const uint32_t a1 = gq_rd32(s + 6 + 8 * (g >> 2)) | (uint32_t)(sb & 127) << (7 * (g & 3)); memcpy(s + 6 + 8 * (g >> 2), &a1, 4);
+            } else if (t == GQ_IQ2_XS_R16) {
+                const uint16_t q = (uint16_t)(idx | (sb & 127) << 9); memcpy(s + 2 + 2 * g, &q, 2);
+            } else { s[2 + g] = (uint8_t)idx; s[34 + g] = (uint8_t)sb; s[66 + (g >> 2)] |= (uint8_t)(((idx >> 8) & 3) << (2 * (g & 3))); }
+        }
+        if (t == GQ_IQ2_XXS_R16)
+            for (int ib = 0; ib < 8; ib++) { const uint32_t a1 = gq_rd32(s + 6 + 8 * ib) | (uint32_t)((o[32 + 16 * ib + r] - 1) >> 1) << 28; memcpy(s + 6 + 8 * ib, &a1, 4); }
+        else {
+            uint8_t *sc = s + (t == GQ_IQ2_XS_R16 ? 66 : 74);
+            for (int k = 0; k < 16; k++) sc[k >> 1] |= (uint8_t)(((o[32 + 16 * k + r] - 1) >> 1) << (4 * (k & 1)));
+        }
+        break; }
+    case GQ_IQ3_XXS_R16: {   /* each four levels back to their grid index (gq_iq3xxs_rev), each eight signs to their 7-bit field */
+        const int16_t *rev = gq_iq3xxs_rev();
+        memset(s, 0, 98); memcpy(s, o + 2 * r, 2);
+        for (int ib = 0; ib < 8; ib++) {
+            uint8_t nb[16]; int c[32];
+            for (int q = 0; q < 4; q++) memcpy(nb + 4 * q, o + 160 + (4 * ib + q) * 64 + 4 * r, 4);
+            for (int k = 0; k < 32; k++) c[k] = (nb[k & 15] >> (k < 16 ? 0 : 4)) & 15;
+            for (int g4 = 0; g4 < 8; g4++) {
+                int key = 0;
+                for (int j = 0; j < 4; j++) key |= (c[4 * g4 + j] & 7) << (3 * j);
+                s[2 + 8 * ib + g4] = (uint8_t)(rev[key] < 0 ? 0 : rev[key]);
+            }
+            uint32_t a = (uint32_t)((o[32 + 16 * ib + r] - 1) >> 1) << 28;
+            for (int l = 0; l < 4; l++) {
+                int sb = 0;
+                for (int j = 0; j < 7; j++) sb |= (c[8 * l + j] >> 3) << j;   /* the eighth sign is the others' parity */
+                a |= (uint32_t)sb << (7 * l);
+            }
+            memcpy(s + 66 + 4 * ib, &a, 4);
+        }
+        break; }
+    case GQ_IQ1_S_R16: case GQ_IQ1_M_R16: {   /* each eight levels back to their grid index (gq_iq1_rev) */
+        const int m16 = gq_p1_m(t), lv = gq_p1_lv(t); const int16_t *rev = gq_iq1_rev();
+        memset(s, 0, m16 ? 56 : 50);
+        int idx[32];
+        for (int g = 0; g < 32; g++) {
+            int key = 0;
+            for (int j = 7; j >= 0; j--) { const int e = 8 * g + j; key = 3 * key + ((o[lv + 64 * (e >> 4) + 4 * r + (e & 3)] >> (2 * ((e >> 2) & 3))) & 3); }
+            idx[g] = rev[key] < 0 ? 0 : rev[key];
+        }
+        if (!m16) {
+            memcpy(s, o + 2 * r, 2);
+            for (int g = 0; g < 32; g++) s[2 + g] = (uint8_t)idx[g];
+            for (int ib = 0; ib < 8; ib++) {
+                uint16_t qh = (uint16_t)(((o[32 + 16 * ib + r] - 1) >> 1) << 12);
+                for (int l = 0; l < 4; l++) qh |= (uint16_t)(((idx[4 * ib + l] >> 8) & 7) << (3 * l));
+                if ((gq_rd16(o + lv + 1024 + 2 * ib) >> r) & 1) qh |= 0x8000;
+                memcpy(s + 34 + 2 * ib, &qh, 2);
+            }
+        } else {
+            const uint16_t dh = gq_rd16(o + 2 * r); uint16_t sc[4] = {0, 0, 0, 0};
+            for (int g = 0; g < 32; g++) {
+                s[g] = (uint8_t)idx[g];
+                const int h = ((idx[g] >> 8) & 7) | (((gq_rd16(o + lv + 1024 + 2 * g) >> r) & 1) << 3);
+                s[32 + (g >> 1)] |= (uint8_t)(h << (4 * (g & 1)));
+            }
+            for (int k = 0; k < 16; k++) sc[k >> 2] |= (uint16_t)(((o[32 + 16 * k + r] - 1) >> 1) << (3 * (k & 3)));
+            for (int i = 0; i < 4; i++) { sc[i] |= (uint16_t)(((dh >> (4 * i)) & 15) << 12); memcpy(s + 48 + 2 * i, &sc[i], 2); }
+        }
+        break; }
+    case GQ_Q2_K_R16:
+        memset(s, 0, 84); memcpy(s + 80, o + 2 * r, 2); memcpy(s + 82, o + 32 + 2 * r, 2);
+        for (int k = 0; k < 16; k++) s[k] = o[64 + 16 * k + r];
+        for (int e = 0; e < 256; e++)
+            s[16 + 32 * (e >> 7) + (e & 31)] |= (uint8_t)(((o[320 + 64 * (e >> 4) + 4 * r + (e & 3)] >> (2 * ((e >> 2) & 3))) & 3) << (2 * ((e >> 5) & 3)));
+        break;
+    case GQ_MXFP4_R16:
+        s[0] = o[r];
+        for (int q = 0; q < 4; q++) memcpy(s + 1 + 4 * q, o + 16 + 64 * q + 4 * r, 4);
+        break;
+    case GQ_NVFP4_R16:
+        for (int g = 0; g < 4; g++) s[g] = o[16 * g + r];
+        for (int G = 0; G < 2; G++) {
+            uint8_t nb[16], *qa = s + 4 + 16 * G, *qb = qa + 8;
+            for (int q = 0; q < 4; q++) memcpy(nb + 4 * q, o + 64 + 256 * G + 64 * q + 4 * r, 4);
+            memset(qa, 0, 16);
+            for (int k = 0; k < 16; k++) {
+                const int lo = nb[k] & 15, hi = nb[k] >> 4;
+                if (k < 8) { qa[k] |= (uint8_t)lo; qb[k] |= (uint8_t)hi; }
+                else { qa[k - 8] |= (uint8_t)(lo << 4); qb[k - 8] |= (uint8_t)(hi << 4); }
+            }
+        }
+        break;
+    case GQ_IQ3_S_R16: {   /* the grid index back from each four levels (gq_iq3s_rev) */
+        const int16_t *rev = gq_iq3s_rev();
+        uint8_t *qs = s + 2, *qh = s + 66, *sg = s + 74, *sc = s + 106;
+        memset(s, 0, 110); memcpy(s, o + 2 * r, 2);
+        for (int ib = 0; ib < 8; ib++) {
+            sc[ib >> 1] |= (uint8_t)((((int)o[32 + 16 * ib + r] - 1) >> 1) << (4 * (ib & 1)));
+            uint8_t nb[16];
+            for (int q = 0; q < 4; q++) memcpy(nb + 4 * q, o + 160 + (4 * ib + q) * 64 + 4 * r, 4);
+            for (int g4 = 0; g4 < 8; g4++) {
+                int key = 0;
+                for (int j = 0; j < 4; j++) {
+                    const int k = 4 * g4 + j, c = (nb[k & 15] >> (k < 16 ? 0 : 4)) & 15;
+                    key |= (c & 7) << (3 * j);
+                    if (c & 8) sg[4 * ib + k / 8] |= (uint8_t)(1 << (k & 7));
+                }
+                const int idx = rev[key] < 0 ? 0 : rev[key];
+                qs[8 * ib + g4] = (uint8_t)(idx & 255);
+                qh[ib] |= (uint8_t)((idx >> 8) << g4);
+            }
+        }
+        break; }
     case GQ_Q4_0_R16: case GQ_IQ4_NL_R16:
         memcpy(s, o + 2 * r, 2);
         for (int q = 0; q < 4; q++) memcpy(s + 2 + 4 * q, o + 32 + 64 * q + 4 * r, 4);
@@ -2100,15 +2838,29 @@ GQ_R16_FN gq_r16_q45_k(GQ_R16_ARGS, const int five) {
     for (int b = 0; b < I / 256; b++) {
         const uint8_t *o = grp + (int64_t)b * gb;
         const __m512 dv = GQ_R16_D(o), mv = GQ_R16_D(o + 32);
+        if (five) {
+        _Pragma("GCC unroll 8")   /* GQ_UNROLL_IB */
         for (int ib = 0; ib < 8; ib++) {
-            const int g32 = 8 * b + ib; const __m128i sh = _mm_cvtsi32_si128(4 * (ib & 1));
+            const int g32 = 8 * b + ib;
             __m512i c[8];
             for (int j = 0; j < 8; j++) {
-                c[j] = _mm512_and_si512(_mm512_srl_epi16(_mm512_loadu_si512(o + qo + (8 * (ib >> 1) + j) * 64), sh), m4);
+                { const __m512i v = _mm512_loadu_si512(o + qo + (8 * (ib >> 1) + j) * 64); c[j] = _mm512_and_si512(ib & 1 ? _mm512_srli_epi16(v, 4) : v, m4); }
                 if (five) c[j] = _mm512_mask_add_epi8(c[j], _mm512_test_epi8_mask(_mm512_loadu_si512(o + 320 + 64 * j), _mm512_set1_epi8((char)(1 << ib))), c[j], sixteen);
             }
             const __m512 sv = _mm512_mul_ps(dv, GQ_R16_SCU8(o + 64 + 16 * ib)), nv = _mm512_mul_ps(mv, GQ_R16_SCU8(o + 192 + 16 * ib));
             GQ_R16_ACC32(c, sv, 1, nv, 0)
+        }
+        } else {
+        for (int ib = 0; ib < 8; ib++) {
+            const int g32 = 8 * b + ib;
+            __m512i c[8];
+            for (int j = 0; j < 8; j++) {
+                { const __m512i v = _mm512_loadu_si512(o + qo + (8 * (ib >> 1) + j) * 64); c[j] = _mm512_and_si512(ib & 1 ? _mm512_srli_epi16(v, 4) : v, m4); }
+                if (five) c[j] = _mm512_mask_add_epi8(c[j], _mm512_test_epi8_mask(_mm512_loadu_si512(o + 320 + 64 * j), _mm512_set1_epi8((char)(1 << ib))), c[j], sixteen);
+            }
+            const __m512 sv = _mm512_mul_ps(dv, GQ_R16_SCU8(o + 64 + 16 * ib)), nv = _mm512_mul_ps(mv, GQ_R16_SCU8(o + 192 + 16 * ib));
+            GQ_R16_ACC32(c, sv, 1, nv, 0)
+        }
         }
     }
     GQ_R16_STORE
@@ -2116,22 +2868,26 @@ GQ_R16_FN gq_r16_q45_k(GQ_R16_ARGS, const int five) {
 GQ_R16_FN gq_r16_q4_k(GQ_R16_ARGS) { gq_r16_q45_k(y, ystride, grp, xq, dx, xs, I, S, 0); }
 GQ_R16_FN gq_r16_q5_k(GQ_R16_ARGS) { gq_r16_q45_k(y, ystride, grp, xq, dx, xs, I, S, 1); }
 /* Q6_K: d, the 16 int8 scales, ql (sub-block 4c+k: nibble k>>1 of half k&1 of 64-byte part c),
- * qh (bits 2k of part c's 32 bytes); codes = w + 32 */
+ * the high bits a 2-bit plane a sub-block (GQ_Q6R_HP); codes = w + 32 */
 GQ_R16_FN gq_r16_q6_k(GQ_R16_ARGS) {
     const __m512i m4 = _mm512_set1_epi8(0x0F), m30 = _mm512_set1_epi8(0x30);
     GQ_R16_ZERO
     for (int b = 0; b < I / 256; b++) {
         const uint8_t *o = grp + (int64_t)b * 3360;
         const __m512 dv = GQ_R16_D(o);
+        _Pragma("GCC unroll 8")   /* GQ_UNROLL_IB */
         for (int ib = 0; ib < 8; ib++) {
             const int g32 = 8 * b + ib, cc = ib >> 2, k = ib & 3;
-            const __m128i sl = _mm_cvtsi32_si128(4 * (k >> 1));
             __m512i c[8];
-            for (int j = 0; j < 8; j++) {
-                const __m512i lo = _mm512_and_si512(_mm512_srl_epi16(_mm512_loadu_si512(o + 288 + ((2 * cc + (k & 1)) * 8 + j) * 64), sl), m4);
-                const __m512i hv = _mm512_loadu_si512(o + 2336 + (8 * cc + j) * 64);
-                const __m512i h = k == 0 ? _mm512_slli_epi16(hv, 4) : k == 1 ? _mm512_slli_epi16(hv, 2) : k == 2 ? hv : _mm512_srli_epi16(hv, 2);
-                c[j] = _mm512_or_si512(lo, _mm512_and_si512(h, m30));
+            for (int G = 0; G < 2; G++) {
+                const __m512i hv = _mm512_loadu_si512(o + GQ_Q6R_HP(cc, k, G));   /* quad 4 G + i's high bits: bits 2 i */
+                for (int i = 0; i < 4; i++) {
+                    const int j = 4 * G + i;
+                    const __m512i ql = _mm512_loadu_si512(o + GQ_Q6R_QL(2 * cc + (k & 1), j));
+                    const __m512i lo = _mm512_and_si512(k & 2 ? _mm512_srli_epi16(ql, 4) : ql, m4);
+                    const __m512i h = i == 0 ? _mm512_slli_epi16(hv, 4) : i == 1 ? _mm512_slli_epi16(hv, 2) : i == 2 ? hv : _mm512_srli_epi16(hv, 2);
+                    c[j] = _mm512_ternarylogic_epi32(lo, h, m30, 0xF8);   /* lo | (h & m30): lo's bits 4-7 are clear */
+                }
             }
             const __m512 sv0 = _mm512_mul_ps(dv, GQ_R16_SC8(o + 32 + 32 * ib)), sv1 = _mm512_mul_ps(dv, GQ_R16_SC8(o + 48 + 32 * ib));
             GQ_R16_ACC16(c, sv0, sv1, 32)
@@ -2147,12 +2903,14 @@ GQ_R16_FN gq_r16_q3_k(GQ_R16_ARGS) {
     for (int b = 0; b < I / 256; b++) {
         const uint8_t *o = grp + (int64_t)b * 1824;
         const __m512 dv = GQ_R16_D(o);
+        _Pragma("GCC unroll 8")   /* GQ_UNROLL_IB */
         for (int ib = 0; ib < 8; ib++) {
-            const int g32 = 8 * b + ib; const __m128i sh = _mm_cvtsi32_si128(2 * (ib & 3));
+            const int g32 = 8 * b + ib;
             __m512i c[8];
             for (int j = 0; j < 8; j++) {
-                const __m512i q2 = _mm512_and_si512(_mm512_srl_epi16(_mm512_loadu_si512(o + 288 + (8 * (ib >> 2) + j) * 64), sh), m3);
-                c[j] = _mm512_mask_add_epi8(q2, _mm512_test_epi8_mask(_mm512_loadu_si512(o + 1312 + 64 * j), _mm512_set1_epi8((char)(1 << ib))), q2, four);
+                const __m512i v = _mm512_loadu_si512(o + GQ_Q3R_QS(ib >> 2, j));
+                const __m512i q2 = _mm512_and_si512((ib & 3) == 0 ? v : (ib & 3) == 1 ? _mm512_srli_epi16(v, 2) : (ib & 3) == 2 ? _mm512_srli_epi16(v, 4) : _mm512_srli_epi16(v, 6), m3);
+                c[j] = _mm512_mask_add_epi8(q2, _mm512_test_epi8_mask(_mm512_loadu_si512(o + GQ_Q3R_HM(j)), _mm512_set1_epi8((char)(1 << ib))), q2, four);
             }
             const __m512 sv0 = _mm512_mul_ps(dv, GQ_R16_SC8(o + 32 + 32 * ib)), sv1 = _mm512_mul_ps(dv, GQ_R16_SC8(o + 48 + 32 * ib));
             GQ_R16_ACC16(c, sv0, sv1, 4)
@@ -2162,9 +2920,9 @@ GQ_R16_FN gq_r16_q3_k(GQ_R16_ARGS) {
 }
 /* IQ4_XS: d, the eight sub-block scales (int8, -32 applied), then per sub-block four quads of
  * bytes: low nibbles quads 0-3, high nibbles 4-7, looked up as value + 128 */
-GQ_R16_FN gq_r16_iq4_xs(GQ_R16_ARGS) {
+GQ_R16_FN gq_r16_iq4_xs_tab(GQ_R16_ARGS, const void *values, const float dmul) {
     const __m512i m4 = _mm512_set1_epi8(0x0F);
-    const __m512i tab = _mm512_broadcast_i32x4(_mm_xor_si128(_mm_loadu_si128((const __m128i *)GGML_KVALUES_IQ4NL), _mm_set1_epi8((char)0x80)));
+    const __m512i tab = _mm512_broadcast_i32x4(_mm_xor_si128(_mm_loadu_si128((const __m128i *)values), _mm_set1_epi8((char)0x80)));
     GQ_R16_ZERO
     for (int b = 0; b < I / 256; b++) {
         const uint8_t *o = grp + (int64_t)b * 2208;
@@ -2177,12 +2935,173 @@ GQ_R16_FN gq_r16_iq4_xs(GQ_R16_ARGS) {
                 c[q] = _mm512_shuffle_epi8(tab, _mm512_and_si512(v, m4));
                 c[4 + q] = _mm512_shuffle_epi8(tab, _mm512_and_si512(_mm512_srli_epi16(v, 4), m4));
             }
-            const __m512 sv = _mm512_mul_ps(dv, GQ_R16_SC8(o + 32 + 16 * ib));
+            __m512 sv = _mm512_mul_ps(dv, GQ_R16_SC8(o + 32 + 16 * ib));
+            if (dmul != 1.f) sv = _mm512_mul_ps(sv, _mm512_set1_ps(dmul));   /* IQ3_XXS: the scale's 1/4 */
             GQ_R16_ACC32(c, sv, 0, sv, 128)
         }
     }
     GQ_R16_STORE
 }
+GQ_R16_FN gq_r16_iq4_xs(GQ_R16_ARGS) { gq_r16_iq4_xs_tab(y, ystride, grp, xq, dx, xs, I, S, GGML_KVALUES_IQ4NL, 1.f); }
+/* IQ3_S held as codes: IQ4_XS's kernel, the codes' values for the IQ4 table */
+GQ_R16_FN gq_r16_iq3_s(GQ_R16_ARGS) { gq_r16_iq4_xs_tab(y, ystride, grp, xq, dx, xs, I, S, GQ_IQ3S_CODES, 1.f); }
+GQ_R16_FN gq_r16_iq3_xxs(GQ_R16_ARGS) { gq_r16_iq4_xs_tab(y, ystride, grp, xq, dx, xs, I, S, GQ_IQ3XXS_CODES, 0.25f); }
+/* the IQ2 planes: per 32 elements two level words (quad 4 G + i: bits 2 i) and the eight quads' sign
+ * words as masks; (sign << 2 | level) looked up as value + 128; the scale is (d (2 s + 1)) / 8 */
+GQ_R16_FN gq_r16_iq2p(GQ_R16_ARGS, const int per16) {
+    const int lv = per16 ? 288 : 160, gb = lv + 1536;
+    const __m512i m3 = _mm512_set1_epi8(3), four = _mm512_set1_epi8(4);
+    const __m512i tab = _mm512_broadcast_i32x4(_mm_xor_si128(_mm_load_si128((const __m128i *)GQ_IQ2_CODES), _mm_set1_epi8((char)0x80)));
+    const __m512 eighth = _mm512_set1_ps(0.125f);
+    GQ_R16_ZERO
+    for (int b = 0; b < I / 256; b++) {
+        const uint8_t *o = grp + (int64_t)b * gb;
+        const __m512 dv = GQ_R16_D(o);
+        for (int ib = 0; ib < 8; ib++) {
+            const int g32 = 8 * b + ib; __m512i c[8];
+            for (int G = 0; G < 2; G++) {
+                const __m512i v = _mm512_loadu_si512(o + lv + 64 * (2 * ib + G));
+                for (int i = 0; i < 4; i++) {
+                    const int j = 4 * G + i; uint64_t sb; memcpy(&sb, o + lv + 1024 + 8 * (8 * ib + j), 8);
+                    const __m512i l = _mm512_and_si512(_mm512_srl_epi16(v, _mm_cvtsi32_si128(2 * i)), m3);
+                    c[j] = _mm512_shuffle_epi8(tab, _mm512_mask_add_epi8(l, _cvtu64_mask64(sb), l, four));
+                }
+            }
+            if (per16) {
+                const __m512 sv0 = _mm512_mul_ps(_mm512_mul_ps(dv, GQ_R16_SCU8(o + 32 + 32 * ib)), eighth);
+                const __m512 sv1 = _mm512_mul_ps(_mm512_mul_ps(dv, GQ_R16_SCU8(o + 48 + 32 * ib)), eighth);
+                GQ_R16_ACC16(c, sv0, sv1, 128)
+            } else {
+                const __m512 sv = _mm512_mul_ps(_mm512_mul_ps(dv, GQ_R16_SCU8(o + 32 + 16 * ib)), eighth);
+                GQ_R16_ACC32(c, sv, 0, sv, 128)
+            }
+        }
+    }
+    GQ_R16_STORE
+}
+/* the IQ1 planes: the levels as IQ2's, the delta of a quad's rows from its group's 16-bit word */
+GQ_R16_FN gq_r16_iq1p(GQ_R16_ARGS, const int m16) {
+    const int lv = m16 ? 288 : 160, gb = lv + 1024 + (m16 ? 64 : 16);
+    const __m512i m3 = _mm512_set1_epi8(3), four = _mm512_set1_epi8(4);
+    const __m512i tab = _mm512_broadcast_i32x4(_mm_xor_si128(_mm_load_si128((const __m128i *)GQ_IQ1_CODES), _mm_set1_epi8((char)0x80)));
+    const __m512 eighth = _mm512_set1_ps(0.125f);
+    GQ_R16_ZERO
+    for (int b = 0; b < I / 256; b++) {
+        const uint8_t *o = grp + (int64_t)b * gb;
+        const __m512 dv = GQ_R16_D(o);
+        for (int ib = 0; ib < 8; ib++) {
+            const int g32 = 8 * b + ib; __m512i c[8];
+            __mmask64 dm = m16 ? 0 : _cvtu64_mask64(gq_nib4x2(gq_rd16(o + lv + 1024 + 2 * ib)));
+            for (int G = 0; G < 2; G++) {
+                const __m512i v = _mm512_loadu_si512(o + lv + 64 * (2 * ib + G));
+                for (int i = 0; i < 4; i++) {
+                    const int j = 4 * G + i;
+                    if (m16 && !(j & 1)) dm = _cvtu64_mask64(gq_nib4x2(gq_rd16(o + lv + 1024 + 2 * (4 * ib + j / 2))));
+                    const __m512i l = _mm512_and_si512(_mm512_srl_epi16(v, _mm_cvtsi32_si128(2 * i)), m3);
+                    c[j] = _mm512_shuffle_epi8(tab, _mm512_mask_add_epi8(l, dm, l, four));
+                }
+            }
+            if (m16) {
+                const __m512 sv0 = _mm512_mul_ps(_mm512_mul_ps(dv, GQ_R16_SCU8(o + 32 + 32 * ib)), eighth);
+                const __m512 sv1 = _mm512_mul_ps(_mm512_mul_ps(dv, GQ_R16_SCU8(o + 48 + 32 * ib)), eighth);
+                GQ_R16_ACC16(c, sv0, sv1, 128)
+            } else {
+                const __m512 sv = _mm512_mul_ps(_mm512_mul_ps(dv, GQ_R16_SCU8(o + 32 + 16 * ib)), eighth);
+                GQ_R16_ACC32(c, sv, 0, sv, 128)
+            }
+        }
+    }
+    GQ_R16_STORE
+}
+/* Q2_K: per 16 elements the exact dot of the codes, its scale d s and its min term dmin m times the
+ * activation's sum: (p1 sv1 + p0 sv0) dx, then minus (m1 x1 + m0 x0) dx */
+GQ_R16_FN gq_r16_q2_k(GQ_R16_ARGS) {
+    const __m512i m3 = _mm512_set1_epi8(3); const __m128i m4 = _mm_set1_epi8(0x0F);
+    GQ_R16_ZERO
+    for (int b = 0; b < I / 256; b++) {
+        const uint8_t *o = grp + (int64_t)b * 1344;
+        const __m512 dv = GQ_R16_D(o), mv = GQ_R16_D(o + 32);
+        for (int ib = 0; ib < 8; ib++) {
+            const int g32 = 8 * b + ib; __m512i c[8];
+            for (int G = 0; G < 2; G++) {
+                const __m512i v = _mm512_loadu_si512(o + 320 + 64 * (2 * ib + G));
+                for (int i = 0; i < 4; i++) c[4 * G + i] = _mm512_and_si512(_mm512_srl_epi16(v, _mm_cvtsi32_si128(2 * i)), m3);
+            }
+            const __m128i sm0 = _mm_loadu_si128((const __m128i *)(o + 64 + 32 * ib)), sm1 = _mm_loadu_si128((const __m128i *)(o + 80 + 32 * ib));
+            const __m512 sv0 = _mm512_mul_ps(dv, _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_and_si128(sm0, m4))));
+            const __m512 sv1 = _mm512_mul_ps(dv, _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_and_si128(sm1, m4))));
+            const __m512 nv0 = _mm512_mul_ps(mv, _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_and_si128(_mm_srli_epi16(sm0, 4), m4))));
+            const __m512 nv1 = _mm512_mul_ps(mv, _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_and_si128(_mm_srli_epi16(sm1, 4), m4))));
+            for (int s = 0; s < S; s++) {
+                const int8_t *xb = xq + (int64_t)s * I + 32 * (int64_t)g32;
+                __m512i p0 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), c[0], GQ_R16_X4(xb, 0));
+                __m512i p1 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), c[4], GQ_R16_X4(xb, 4));
+                for (int j = 1; j < 4; j++) { p0 = _mm512_dpbusd_epi32(p0, c[j], GQ_R16_X4(xb, j)); p1 = _mm512_dpbusd_epi32(p1, c[4 + j], GQ_R16_X4(xb, 4 + j)); }
+                const int32_t *x16 = xs + (int64_t)s * (I / 16) + 2 * (int64_t)g32;
+                const __m512 t = _mm512_fmadd_ps(_mm512_cvtepi32_ps(p1), sv1, _mm512_mul_ps(_mm512_cvtepi32_ps(p0), sv0));
+                const __m512 u = _mm512_fmadd_ps(nv1, _mm512_set1_ps((float)x16[1]), _mm512_mul_ps(nv0, _mm512_set1_ps((float)x16[0])));
+                const __m512 dd = _mm512_set1_ps(dx[(int64_t)s * (I / 32) + g32]);
+                acc[s] = _mm512_fnmadd_ps(u, dd, _mm512_fmadd_ps(t, dd, acc[s]));
+            }
+        }
+    }
+    GQ_R16_STORE
+}
+/* MXFP4: the rows' e8m0 bytes as floats the way gq_e8m0_half makes them, then IQ4_NL's kernel */
+static inline __m512 gq_r16_e8m0_16(const uint8_t *p) {
+    const __m512i e = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)p));
+    const __m512i big = _mm512_slli_epi32(_mm512_sub_epi32(e, _mm512_set1_epi32(1)), 23), sub = _mm512_sllv_epi32(_mm512_set1_epi32(0x00200000), e);
+    return _mm512_castsi512_ps(_mm512_mask_blend_epi32(_mm512_cmplt_epu32_mask(e, _mm512_set1_epi32(2)), big, sub));
+}
+/* NVFP4: per half of a block the two groups' E4M3 scales (gq_ue4m3_half's values, 16 rows a
+ * vector) and IQ4_NL's kernel over kvalues_mxfp4, a scale per 16 (GQ_R16_ACC16) */
+static inline __m512 gq_r16_ue4m3_16(const uint8_t *p) {
+    const __m512i x = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)p));
+    const __m512i e = _mm512_and_si512(_mm512_srli_epi32(x, 3), _mm512_set1_epi32(15)), m = _mm512_and_si512(x, _mm512_set1_epi32(7));
+    const __m512 nrm = _mm512_castsi512_ps(_mm512_or_si512(_mm512_slli_epi32(_mm512_add_epi32(e, _mm512_set1_epi32(119)), 23), _mm512_slli_epi32(m, 20)));
+    const __m512 sub = _mm512_mul_ps(_mm512_cvtepi32_ps(m), _mm512_set1_ps(1.f / 1024.f));
+    const __m512 v = _mm512_mask_blend_ps(_mm512_cmpeq_epi32_mask(e, _mm512_setzero_si512()), nrm, sub);
+    return _mm512_maskz_mov_ps(_mm512_cmpneq_epi32_mask(x, _mm512_set1_epi32(0x7F)), v);
+}
+GQ_R16_FN gq_r16_nvfp4(GQ_R16_ARGS) {
+    const __m512i m4 = _mm512_set1_epi8(0x0F);
+    const __m512i tab = _mm512_broadcast_i32x4(_mm_xor_si128(_mm_loadu_si128((const __m128i *)GGML_KVALUES_MXFP4), _mm_set1_epi8((char)0x80)));
+    GQ_R16_ZERO
+    for (int b = 0; b < I / 64; b++) {
+        const uint8_t *o = grp + (int64_t)b * 576;
+        for (int G = 0; G < 2; G++) {
+            const int g32 = 2 * b + G;
+            const __m512 sv0 = gq_r16_ue4m3_16(o + 32 * G), sv1 = gq_r16_ue4m3_16(o + 32 * G + 16);
+            __m512i c[8];
+            for (int q = 0; q < 4; q++) {
+                const __m512i v = _mm512_loadu_si512(o + 64 + 256 * G + 64 * q);
+                c[q] = _mm512_shuffle_epi8(tab, _mm512_and_si512(v, m4)); c[4 + q] = _mm512_shuffle_epi8(tab, _mm512_and_si512(_mm512_srli_epi16(v, 4), m4));
+            }
+            GQ_R16_ACC16(c, sv0, sv1, 128)
+        }
+    }
+    GQ_R16_STORE
+}
+GQ_R16_FN gq_r16_mxfp4(GQ_R16_ARGS) {
+    const __m512i m4 = _mm512_set1_epi8(0x0F);
+    const __m512i tab = _mm512_broadcast_i32x4(_mm_xor_si128(_mm_loadu_si128((const __m128i *)GGML_KVALUES_MXFP4), _mm_set1_epi8((char)0x80)));
+    GQ_R16_ZERO
+    for (int b = 0; b < I / 32; b++) {
+        const uint8_t *o = grp + (int64_t)b * 272; const int g32 = b;
+        const __m512 dv = gq_r16_e8m0_16(o);
+        __m512i c[8];
+        for (int q = 0; q < 4; q++) {
+            const __m512i v = _mm512_loadu_si512(o + 16 + 64 * q);
+            c[q] = _mm512_shuffle_epi8(tab, _mm512_and_si512(v, m4)); c[4 + q] = _mm512_shuffle_epi8(tab, _mm512_and_si512(_mm512_srli_epi16(v, 4), m4));
+        }
+        GQ_R16_ACC32(c, dv, 0, dv, 128)
+    }
+    GQ_R16_STORE
+}
+GQ_R16_FN gq_r16_iq1_s(GQ_R16_ARGS) { gq_r16_iq1p(y, ystride, grp, xq, dx, xs, I, S, 0); }
+GQ_R16_FN gq_r16_iq1_m(GQ_R16_ARGS) { gq_r16_iq1p(y, ystride, grp, xq, dx, xs, I, S, 1); }
+GQ_R16_FN gq_r16_iq2_xxs(GQ_R16_ARGS) { gq_r16_iq2p(y, ystride, grp, xq, dx, xs, I, S, 0); }
+GQ_R16_FN gq_r16_iq2_xs(GQ_R16_ARGS) { gq_r16_iq2p(y, ystride, grp, xq, dx, xs, I, S, 1); }
 /* Q8_0: d, then the 32 bytes ^ 0x80 (w + 128) as 8 quads */
 GQ_R16_FN gq_r16_q8_0(GQ_R16_ARGS) {
     GQ_R16_ZERO
@@ -2220,6 +3139,27 @@ GQ_R16_FN gq_r16_iq4_nl(GQ_R16_ARGS) { gq_r16_q4_0_nl(y, ystride, grp, xq, dx, x
         case 1: FN(ys, ystride, grp, xq, dx, xs, I, 1); break; case 2: FN(ys, ystride, grp, xq, dx, xs, I, 2); break; \
         case 3: FN(ys, ystride, grp, xq, dx, xs, I, 3); break; case 4: FN(ys, ystride, grp, xq, dx, xs, I, 4); break; \
         default: FN(ys, ystride, grp, xq, dx, xs, I, n); break; } } while (0)
+/* every type's rows in a function of its own: a kernel's code then does not change with the others' */
+#define GQ_R16_ROWS_FN(FN) static __attribute__((noinline)) void FN##_rows(float *ys, int ystride, const uint8_t *grp, const int8_t *xq, \
+        const float *dx, const int32_t *xs, int I, int n) { GQ_R16_N(FN); }
+GQ_R16_ROWS_FN(gq_r16_iq1_m)
+GQ_R16_ROWS_FN(gq_r16_iq1_s)
+GQ_R16_ROWS_FN(gq_r16_iq2_xs)
+GQ_R16_ROWS_FN(gq_r16_iq2_xxs)
+GQ_R16_ROWS_FN(gq_r16_iq3_s)
+GQ_R16_ROWS_FN(gq_r16_iq3_xxs)
+GQ_R16_ROWS_FN(gq_r16_iq4_nl)
+GQ_R16_ROWS_FN(gq_r16_iq4_xs)
+GQ_R16_ROWS_FN(gq_r16_mxfp4)
+GQ_R16_ROWS_FN(gq_r16_nvfp4)
+GQ_R16_ROWS_FN(gq_r16_q2_0)
+GQ_R16_ROWS_FN(gq_r16_q2_k)
+GQ_R16_ROWS_FN(gq_r16_q3_k)
+GQ_R16_ROWS_FN(gq_r16_q4_0)
+GQ_R16_ROWS_FN(gq_r16_q4_k)
+GQ_R16_ROWS_FN(gq_r16_q5_k)
+GQ_R16_ROWS_FN(gq_r16_q6_k)
+GQ_R16_ROWS_FN(gq_r16_q8_0)
 /* group grp's 16 rows (output rows at y .. y + 15) against every activation row of a */
 static void gq_r16_rows(int t, float *y, int ystride, const uint8_t *grp, const gq_act *a, int I) {
     for (int s0 = 0; s0 < a->S; s0 += 8) {
@@ -2227,15 +3167,24 @@ static void gq_r16_rows(int t, float *y, int ystride, const uint8_t *grp, const 
         float *ys = y + (int64_t)s0 * ystride; const int8_t *xq = a->q + (int64_t)s0 * I;
         const float *dx = a->d + (int64_t)s0 * (I / 32); const int32_t *xs = a->s + (int64_t)s0 * (I / 16);
         switch (t) {
-        case GQ_Q2_0_R16: GQ_R16_N(gq_r16_q2_0); break;
-        case GQ_Q4_K_R16: GQ_R16_N(gq_r16_q4_k); break;
-        case GQ_Q5_K_R16: GQ_R16_N(gq_r16_q5_k); break;
-        case GQ_Q6_K_R16: GQ_R16_N(gq_r16_q6_k); break;
-        case GQ_Q3_K_R16: GQ_R16_N(gq_r16_q3_k); break;
-        case GQ_IQ4_XS_R16: GQ_R16_N(gq_r16_iq4_xs); break;
-        case GQ_Q8_0_R16: GQ_R16_N(gq_r16_q8_0); break;
-        case GQ_Q4_0_R16: GQ_R16_N(gq_r16_q4_0); break;
-        case GQ_IQ4_NL_R16: GQ_R16_N(gq_r16_iq4_nl); break;
+        case GQ_Q2_0_R16: gq_r16_q2_0_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
+        case GQ_Q4_K_R16: gq_r16_q4_k_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
+        case GQ_Q5_K_R16: gq_r16_q5_k_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
+        case GQ_Q6_K_R16: gq_r16_q6_k_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
+        case GQ_Q3_K_R16: gq_r16_q3_k_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
+        case GQ_IQ4_XS_R16: gq_r16_iq4_xs_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
+        case GQ_Q8_0_R16: gq_r16_q8_0_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
+        case GQ_Q4_0_R16: gq_r16_q4_0_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
+        case GQ_IQ4_NL_R16: gq_r16_iq4_nl_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
+        case GQ_IQ3_S_R16: gq_r16_iq3_s_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
+        case GQ_IQ2_XXS_R16: gq_r16_iq2_xxs_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
+        case GQ_IQ2_XS_R16: case GQ_IQ2_S_R16: gq_r16_iq2_xs_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
+        case GQ_IQ3_XXS_R16: gq_r16_iq3_xxs_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
+        case GQ_IQ1_S_R16: gq_r16_iq1_s_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
+        case GQ_IQ1_M_R16: gq_r16_iq1_m_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
+        case GQ_Q2_K_R16: gq_r16_q2_k_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
+        case GQ_MXFP4_R16: gq_r16_mxfp4_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
+        case GQ_NVFP4_R16: gq_r16_nvfp4_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
         }
     }
 }
@@ -2289,7 +3238,7 @@ static void gq_tile16_rows(float *y, int ystride, const uint8_t *grp, const gq_a
 #define GQ_R16_BIG(acc, c, x) GQ_R16_DPS(acc, c, x)   /* the signed values */
 #define GQ_R16_BIGBIAS 0
 #endif
-#define GQ_R16H_ARGS float *y, int ystride, const uint8_t *grp, const int8_t *xq, const float *dx, const int32_t *xs, int I, const int S, const int h
+#define GQ_R16H_ARGS float *y, int ystride, const uint8_t *grp, const int8_t *xq, const float *dx, const int32_t *xs, int I, const int S
 #define GQ_R16H_FN static inline __attribute__((always_inline)) void
 #define GQ_R16H_X4(xb, j) _mm256_set1_epi32(gq_ld32((xb) + 4 * (j)))
 /* the int32 sums of quads j0 .. j0 + n - 1 (n even): with VNNI a vpdpbusd each; without, two
@@ -2325,8 +3274,11 @@ static void gq_tile16_rows(float *y, int ystride, const uint8_t *grp, const gq_a
         const __m256 t_ = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p1_), (sv1), _mm256_mul_ps(_mm256_cvtepi32_ps(p0_), (sv0))); \
         acc[s] = _mm256_fmadd_ps(t_, _mm256_set1_ps(dx[(int64_t)s * (I / 32) + g32]), acc[s]); \
     }
-#define GQ_R16H_ZERO __m256 acc[4]; for (int s = 0; s < S; s++) acc[s] = _mm256_setzero_ps();
-#define GQ_R16H_STORE for (int s = 0; s < S; s++) _mm256_storeu_ps(y + (int64_t)s * ystride + 8 * h, acc[s]);
+/* the accumulators of both halves (rows 0-7 and 8-15): a kernel takes a block's two halves one after the
+ * other, so the block's bytes come from RAM once and are in the L1 for the second half (a half at a time
+ * over the whole row streamed the matrix twice, the first time with half the work to hide it behind) */
+#define GQ_R16H_ZERO2 __m256 accs[2][4]; for (int h_ = 0; h_ < 2; h_++) for (int s = 0; s < S; s++) accs[h_][s] = _mm256_setzero_ps();
+#define GQ_R16H_STORE2 for (int h_ = 0; h_ < 2; h_++) for (int s = 0; s < S; s++) _mm256_storeu_ps(y + (int64_t)s * ystride + 8 * h_, accs[h_][s]);
 #define GQ_R16H_LD(p) _mm256_loadu_si256((const __m256i *)(p))
 #define GQ_R16H_D(p) _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(p)))   /* eight f16 */
 #define GQ_R16H_SC8(p) _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i *)(p))))
@@ -2335,9 +3287,10 @@ static void gq_tile16_rows(float *y, int ystride, const uint8_t *grp, const gq_a
 #define GQ_R16H_BIT(v, b) _mm256_cmpeq_epi8(_mm256_and_si256((v), _mm256_set1_epi8((char)(b))), _mm256_set1_epi8((char)(b)))
 GQ_R16H_FN gq_r16h_q2_0(GQ_R16H_ARGS) {
     const __m256i m3 = _mm256_set1_epi8(3);
-    GQ_R16H_ZERO
+    GQ_R16H_ZERO2
     for (int b = 0; b < I / 64; b++) {
         const uint8_t *o = grp + (int64_t)b * 288;
+        for (int h = 0; h < 2; h++) { __m256 *acc = accs[h];   /* both halves of the block, one after the other */
         const __m256 dv = GQ_R16H_D(o + 16 * h);
         for (int hf = 0; hf < 2; hf++) {
             const int g32 = 2 * b + hf; __m256i c[8];
@@ -2350,82 +3303,105 @@ GQ_R16H_FN gq_r16h_q2_0(GQ_R16H_ARGS) {
             }
             GQ_R16H_ACC32(c, dv, 0, dv, 1, GQ_R16H_DOTU)
         }
-    }
-    GQ_R16H_STORE
+    } }
+    GQ_R16H_STORE2
 }
 GQ_R16H_FN gq_r16h_q45_k(GQ_R16H_ARGS, const int five) {
     const int gb = five ? 2880 : 2368, qo = five ? 832 : 320;
     const __m256i m4 = _mm256_set1_epi8(0x0F), sixteen = _mm256_set1_epi8(16);
-    GQ_R16H_ZERO
+    GQ_R16H_ZERO2
     for (int b = 0; b < I / 256; b++) {
         const uint8_t *o = grp + (int64_t)b * gb;
+        for (int h = 0; h < 2; h++) { __m256 *acc = accs[h];   /* both halves of the block, one after the other */
         const __m256 dv = GQ_R16H_D(o + 16 * h), mv = GQ_R16H_D(o + 32 + 16 * h);
+        if (five) {
         for (int ib = 0; ib < 8; ib++) {
-            const int g32 = 8 * b + ib; const __m128i sh = _mm_cvtsi32_si128(4 * (ib & 1));
+            const int g32 = 8 * b + ib;
             __m256i c[8];
             for (int j = 0; j < 8; j++) {
-                c[j] = _mm256_and_si256(_mm256_srl_epi16(GQ_R16H_LD(o + qo + (8 * (ib >> 1) + j) * 64 + 32 * h), sh), m4);
+                { const __m256i v = GQ_R16H_LD(o + qo + (8 * (ib >> 1) + j) * 64 + 32 * h); c[j] = _mm256_and_si256(ib & 1 ? _mm256_srli_epi16(v, 4) : v, m4); }
                 if (five) c[j] = _mm256_add_epi8(c[j], _mm256_and_si256(GQ_R16H_BIT(GQ_R16H_LD(o + 320 + 64 * j + 32 * h), 1 << ib), sixteen));
             }
             const __m256 sv = _mm256_mul_ps(dv, GQ_R16H_SCU8(o + 64 + 16 * ib + 8 * h)), nv = _mm256_mul_ps(mv, GQ_R16H_SCU8(o + 192 + 16 * ib + 8 * h));
             GQ_R16H_ACC32(c, sv, 1, nv, 0, GQ_R16H_DOTU)
         }
-    }
-    GQ_R16H_STORE
+        } else {
+        _Pragma("GCC unroll 8")   /* GQ_UNROLL_IB */
+        for (int ib = 0; ib < 8; ib++) {
+            const int g32 = 8 * b + ib;
+            __m256i c[8];
+            for (int j = 0; j < 8; j++) {
+                { const __m256i v = GQ_R16H_LD(o + qo + (8 * (ib >> 1) + j) * 64 + 32 * h); c[j] = _mm256_and_si256(ib & 1 ? _mm256_srli_epi16(v, 4) : v, m4); }
+                if (five) c[j] = _mm256_add_epi8(c[j], _mm256_and_si256(GQ_R16H_BIT(GQ_R16H_LD(o + 320 + 64 * j + 32 * h), 1 << ib), sixteen));
+            }
+            const __m256 sv = _mm256_mul_ps(dv, GQ_R16H_SCU8(o + 64 + 16 * ib + 8 * h)), nv = _mm256_mul_ps(mv, GQ_R16H_SCU8(o + 192 + 16 * ib + 8 * h));
+            GQ_R16H_ACC32(c, sv, 1, nv, 0, GQ_R16H_DOTU)
+        }
+        }
+    } }
+    GQ_R16H_STORE2
 }
-GQ_R16H_FN gq_r16h_q4_k(GQ_R16H_ARGS) { gq_r16h_q45_k(y, ystride, grp, xq, dx, xs, I, S, h, 0); }
-GQ_R16H_FN gq_r16h_q5_k(GQ_R16H_ARGS) { gq_r16h_q45_k(y, ystride, grp, xq, dx, xs, I, S, h, 1); }
+GQ_R16H_FN gq_r16h_q4_k(GQ_R16H_ARGS) { gq_r16h_q45_k(y, ystride, grp, xq, dx, xs, I, S, 0); }
+GQ_R16H_FN gq_r16h_q5_k(GQ_R16H_ARGS) { gq_r16h_q45_k(y, ystride, grp, xq, dx, xs, I, S, 1); }
 GQ_R16H_FN gq_r16h_q6_k(GQ_R16H_ARGS) {
     const __m256i m4 = _mm256_set1_epi8(0x0F), m30 = _mm256_set1_epi8(0x30);
-    GQ_R16H_ZERO
+    GQ_R16H_ZERO2
     for (int b = 0; b < I / 256; b++) {
         const uint8_t *o = grp + (int64_t)b * 3360;
+        for (int h = 0; h < 2; h++) { __m256 *acc = accs[h];   /* both halves of the block, one after the other */
         const __m256 dv = GQ_R16H_D(o + 16 * h);
         for (int ib = 0; ib < 8; ib++) {
             const int g32 = 8 * b + ib, cc = ib >> 2, k = ib & 3;
-            const __m128i sl = _mm_cvtsi32_si128(4 * (k >> 1));
             __m256i c[8];
-            for (int j = 0; j < 8; j++) {
-                const __m256i lo = _mm256_and_si256(_mm256_srl_epi16(GQ_R16H_LD(o + 288 + ((2 * cc + (k & 1)) * 8 + j) * 64 + 32 * h), sl), m4);
-                const __m256i hv = GQ_R16H_LD(o + 2336 + (8 * cc + j) * 64 + 32 * h);
-                const __m256i hh = k == 0 ? _mm256_slli_epi16(hv, 4) : k == 1 ? _mm256_slli_epi16(hv, 2) : k == 2 ? hv : _mm256_srli_epi16(hv, 2);
-                c[j] = _mm256_or_si256(lo, _mm256_and_si256(hh, m30));
+            for (int G = 0; G < 2; G++) {
+                const __m256i hv = GQ_R16H_LD(o + GQ_Q6R_HP(cc, k, G) + 32 * h);
+                for (int i = 0; i < 4; i++) {
+                    const int j = 4 * G + i;
+                    const __m256i ql = GQ_R16H_LD(o + GQ_Q6R_QL(2 * cc + (k & 1), j) + 32 * h);
+                    const __m256i lo = _mm256_and_si256(k & 2 ? _mm256_srli_epi16(ql, 4) : ql, m4);
+                    const __m256i hh = i == 0 ? _mm256_slli_epi16(hv, 4) : i == 1 ? _mm256_slli_epi16(hv, 2) : i == 2 ? hv : _mm256_srli_epi16(hv, 2);
+                    c[j] = _mm256_or_si256(lo, _mm256_and_si256(hh, m30));
+                }
             }
             const __m256 sv0 = _mm256_mul_ps(dv, GQ_R16H_SC8(o + 32 + 32 * ib + 8 * h)), sv1 = _mm256_mul_ps(dv, GQ_R16H_SC8(o + 48 + 32 * ib + 8 * h));
             GQ_R16H_ACC16(c, sv0, sv1, 32)
         }
-    }
-    GQ_R16H_STORE
+    } }
+    GQ_R16H_STORE2
 }
 GQ_R16H_FN gq_r16h_q3_k(GQ_R16H_ARGS) {
     const __m256i m3 = _mm256_set1_epi8(3), four = _mm256_set1_epi8(4);
-    GQ_R16H_ZERO
+    GQ_R16H_ZERO2
     for (int b = 0; b < I / 256; b++) {
         const uint8_t *o = grp + (int64_t)b * 1824;
+        for (int h = 0; h < 2; h++) { __m256 *acc = accs[h];   /* both halves of the block, one after the other */
         const __m256 dv = GQ_R16H_D(o + 16 * h);
         for (int ib = 0; ib < 8; ib++) {
-            const int g32 = 8 * b + ib; const __m128i sh = _mm_cvtsi32_si128(2 * (ib & 3));
+            const int g32 = 8 * b + ib;
             __m256i c[8];
             for (int j = 0; j < 8; j++) {
-                const __m256i q2 = _mm256_and_si256(_mm256_srl_epi16(GQ_R16H_LD(o + 288 + (8 * (ib >> 2) + j) * 64 + 32 * h), sh), m3);
-                c[j] = _mm256_add_epi8(q2, _mm256_and_si256(GQ_R16H_BIT(GQ_R16H_LD(o + 1312 + 64 * j + 32 * h), 1 << ib), four));
+                const __m256i v = GQ_R16H_LD(o + GQ_Q3R_QS(ib >> 2, j) + 32 * h);
+                const __m256i q2 = _mm256_and_si256((ib & 3) == 0 ? v : (ib & 3) == 1 ? _mm256_srli_epi16(v, 2) : (ib & 3) == 2 ? _mm256_srli_epi16(v, 4) : _mm256_srli_epi16(v, 6), m3);
+                c[j] = _mm256_add_epi8(q2, _mm256_and_si256(GQ_R16H_BIT(GQ_R16H_LD(o + GQ_Q3R_HM(j) + 32 * h), 1 << ib), four));
             }
             const __m256 sv0 = _mm256_mul_ps(dv, GQ_R16H_SC8(o + 32 + 32 * ib + 8 * h)), sv1 = _mm256_mul_ps(dv, GQ_R16H_SC8(o + 48 + 32 * ib + 8 * h));
             GQ_R16H_ACC16(c, sv0, sv1, 4)
         }
-    }
-    GQ_R16H_STORE
+    } }
+    GQ_R16H_STORE2
 }
 /* the IQ4 values as the codes the products take: + 128 with VNNI, signed without */
-static inline __m256i gq_r16h_iq4_tab(void) {
-    const __m128i t = _mm_loadu_si128((const __m128i *)GGML_KVALUES_IQ4NL);
+static inline __m256i gq_r16h_values_tab(const void *values) {
+    const __m128i t = _mm_loadu_si128((const __m128i *)values);
     return _mm256_broadcastsi128_si256(GQ_R16_BIGBIAS ? _mm_xor_si128(t, _mm_set1_epi8((char)0x80)) : t);
 }
-GQ_R16H_FN gq_r16h_iq4_xs(GQ_R16H_ARGS) {
-    const __m256i m4 = _mm256_set1_epi8(0x0F), tab = gq_r16h_iq4_tab();
-    GQ_R16H_ZERO
+static inline __m256i gq_r16h_iq4_tab(void) { return gq_r16h_values_tab(GGML_KVALUES_IQ4NL); }
+GQ_R16H_FN gq_r16h_iq4_xs_tab(GQ_R16H_ARGS, const void *values, const float dmul) {
+    const __m256i m4 = _mm256_set1_epi8(0x0F), tab = gq_r16h_values_tab(values);
+    GQ_R16H_ZERO2
     for (int b = 0; b < I / 256; b++) {
         const uint8_t *o = grp + (int64_t)b * 2208;
+        for (int h = 0; h < 2; h++) { __m256 *acc = accs[h];   /* both halves of the block, one after the other */
         const __m256 dv = GQ_R16H_D(o + 16 * h);
         for (int ib = 0; ib < 8; ib++) {
             const int g32 = 8 * b + ib;
@@ -2435,29 +3411,35 @@ GQ_R16H_FN gq_r16h_iq4_xs(GQ_R16H_ARGS) {
                 c[q] = _mm256_shuffle_epi8(tab, _mm256_and_si256(v, m4));
                 c[4 + q] = _mm256_shuffle_epi8(tab, _mm256_and_si256(_mm256_srli_epi16(v, 4), m4));
             }
-            const __m256 sv = _mm256_mul_ps(dv, GQ_R16H_SC8(o + 32 + 16 * ib + 8 * h));
+            __m256 sv = _mm256_mul_ps(dv, GQ_R16H_SC8(o + 32 + 16 * ib + 8 * h));
+            if (dmul != 1.f) sv = _mm256_mul_ps(sv, _mm256_set1_ps(dmul));
             GQ_R16H_ACC32(c, sv, 0, sv, GQ_R16_BIGBIAS, GQ_R16H_DOTB)
         }
-    }
-    GQ_R16H_STORE
+    } }
+    GQ_R16H_STORE2
 }
+GQ_R16H_FN gq_r16h_iq4_xs(GQ_R16H_ARGS) { gq_r16h_iq4_xs_tab(y, ystride, grp, xq, dx, xs, I, S, GGML_KVALUES_IQ4NL, 1.f); }
+GQ_R16H_FN gq_r16h_iq3_s(GQ_R16H_ARGS) { gq_r16h_iq4_xs_tab(y, ystride, grp, xq, dx, xs, I, S, GQ_IQ3S_CODES, 1.f); }
+GQ_R16H_FN gq_r16h_iq3_xxs(GQ_R16H_ARGS) { gq_r16h_iq4_xs_tab(y, ystride, grp, xq, dx, xs, I, S, GQ_IQ3XXS_CODES, 0.25f); }
 GQ_R16H_FN gq_r16h_q8_0(GQ_R16H_ARGS) {
     const __m256i flip = _mm256_set1_epi8(GQ_R16_BIGBIAS ? 0 : (char)0x80);   /* without VNNI: the bytes back to w */
-    GQ_R16H_ZERO
+    GQ_R16H_ZERO2
     for (int b = 0; b < I / 32; b++) {
         const uint8_t *o = grp + (int64_t)b * 544; const int g32 = b;
+        for (int h = 0; h < 2; h++) { __m256 *acc = accs[h];   /* both halves of the block, one after the other */
         const __m256 dv = GQ_R16H_D(o + 16 * h);
         __m256i c[8];
         for (int j = 0; j < 8; j++) c[j] = _mm256_xor_si256(GQ_R16H_LD(o + 32 + 64 * j + 32 * h), flip);
         GQ_R16H_ACC32(c, dv, 0, dv, GQ_R16_BIGBIAS, GQ_R16H_DOTB)
-    }
-    GQ_R16H_STORE
+    } }
+    GQ_R16H_STORE2
 }
 GQ_R16H_FN gq_r16h_q4_0(GQ_R16H_ARGS) {
     const __m256i m4 = _mm256_set1_epi8(0x0F);
-    GQ_R16H_ZERO
+    GQ_R16H_ZERO2
     for (int b = 0; b < I / 32; b++) {
         const uint8_t *o = grp + (int64_t)b * 288; const int g32 = b;
+        for (int h = 0; h < 2; h++) { __m256 *acc = accs[h];   /* both halves of the block, one after the other */
         const __m256 dv = GQ_R16H_D(o + 16 * h);
         __m256i c[8];
         for (int q = 0; q < 4; q++) {
@@ -2465,14 +3447,15 @@ GQ_R16H_FN gq_r16h_q4_0(GQ_R16H_ARGS) {
             c[q] = _mm256_and_si256(v, m4); c[4 + q] = _mm256_and_si256(_mm256_srli_epi16(v, 4), m4);
         }
         GQ_R16H_ACC32(c, dv, 0, dv, 8, GQ_R16H_DOTU)
-    }
-    GQ_R16H_STORE
+    } }
+    GQ_R16H_STORE2
 }
 GQ_R16H_FN gq_r16h_iq4_nl(GQ_R16H_ARGS) {
     const __m256i m4 = _mm256_set1_epi8(0x0F), tab = gq_r16h_iq4_tab();
-    GQ_R16H_ZERO
+    GQ_R16H_ZERO2
     for (int b = 0; b < I / 32; b++) {
         const uint8_t *o = grp + (int64_t)b * 288; const int g32 = b;
+        for (int h = 0; h < 2; h++) { __m256 *acc = accs[h];   /* both halves of the block, one after the other */
         const __m256 dv = GQ_R16H_D(o + 16 * h);
         __m256i c[8];
         for (int q = 0; q < 4; q++) {
@@ -2480,12 +3463,12 @@ GQ_R16H_FN gq_r16h_iq4_nl(GQ_R16H_ARGS) {
             c[q] = _mm256_shuffle_epi8(tab, _mm256_and_si256(v, m4)); c[4 + q] = _mm256_shuffle_epi8(tab, _mm256_and_si256(_mm256_srli_epi16(v, 4), m4));
         }
         GQ_R16H_ACC32(c, dv, 0, dv, GQ_R16_BIGBIAS, GQ_R16H_DOTB)
-    }
-    GQ_R16H_STORE
+    } }
+    GQ_R16H_STORE2
 }
 #define GQ_R16H_N(FN) do { switch (n) { \
-        case 1: FN(ys, ystride, grp, xq, dx, xs, I, 1, h); break; case 2: FN(ys, ystride, grp, xq, dx, xs, I, 2, h); break; \
-        case 3: FN(ys, ystride, grp, xq, dx, xs, I, 3, h); break; default: FN(ys, ystride, grp, xq, dx, xs, I, 4, h); break; } } while (0)
+        case 1: FN(ys, ystride, grp, xq, dx, xs, I, 1); break; case 2: FN(ys, ystride, grp, xq, dx, xs, I, 2); break; \
+        case 3: FN(ys, ystride, grp, xq, dx, xs, I, 3); break; default: FN(ys, ystride, grp, xq, dx, xs, I, 4); break; } } while (0)
 /* GQ_R16H_ACC16 for codes past 63 (a tile's): the dot of Q8_0 and the IQ4 lookups */
 #define GQ_R16H_ACC16B(c, sv0, sv1, BIAS) \
     for (int s = 0; s < S; s++) { \
@@ -2498,42 +3481,220 @@ GQ_R16H_FN gq_r16h_iq4_nl(GQ_R16H_ARGS) {
     }
 /* a tile (gq_tile16_pack), half h: its codes are w + GQ_R16_BIGBIAS (w itself without VNNI) */
 GQ_R16H_FN gq_r16h_tile(GQ_R16H_ARGS) {
-    GQ_R16H_ZERO
+    GQ_R16H_ZERO2
     for (int b = 0; b < I / 32; b++) {
         const uint8_t *o = grp + (int64_t)b * 640; const int g32 = b;
+        for (int h = 0; h < 2; h++) { __m256 *acc = accs[h];   /* both halves of the block, one after the other */
         __m256i c[8];
         for (int j = 0; j < 8; j++) c[j] = GQ_R16H_LD(o + 64 * j + 32 * h);
         const __m256 sv0 = _mm256_loadu_ps((const float *)(o + 512) + 8 * h), sv1 = _mm256_loadu_ps((const float *)(o + 576) + 8 * h);
         GQ_R16H_ACC16B(c, sv0, sv1, GQ_R16_BIGBIAS)
-    }
-    GQ_R16H_STORE
+    } }
+    GQ_R16H_STORE2
 }
 static void gq_tile16_rows(float *y, int ystride, const uint8_t *grp, const gq_act *a, int I) {
     for (int s0 = 0; s0 < a->S; s0 += 4) {
         const int n = a->S - s0 < 4 ? a->S - s0 : 4;
         float *ys = y + (int64_t)s0 * ystride; const int8_t *xq = a->q + (int64_t)s0 * I;
         const float *dx = a->d + (int64_t)s0 * (I / 32); const int32_t *xs = a->s + (int64_t)s0 * (I / 16);
-        for (int h = 0; h < 2; h++) GQ_R16H_N(gq_r16h_tile);
+        GQ_R16H_N(gq_r16h_tile);
     }
 }
 #define GQ_TILE16_BIAS GQ_R16_BIGBIAS
+/* the IQ2 planes, half h: the signs' 32 bits of the half as bytes (gq_bits32) */
+GQ_R16H_FN gq_r16h_iq2p(GQ_R16H_ARGS, const int per16) {
+    const int lv = per16 ? 288 : 160, gb = lv + 1536;
+    const __m256i m3 = _mm256_set1_epi8(3), four = _mm256_set1_epi8(4), tab = gq_r16h_values_tab(GQ_IQ2_CODES);
+    const __m256 eighth = _mm256_set1_ps(0.125f);
+    GQ_R16H_ZERO2
+    for (int b = 0; b < I / 256; b++) {
+        const uint8_t *o = grp + (int64_t)b * gb;
+        for (int h = 0; h < 2; h++) { __m256 *acc = accs[h];   /* both halves of the block, one after the other */
+        const __m256 dv = GQ_R16H_D(o + 16 * h);
+        for (int ib = 0; ib < 8; ib++) {
+            const int g32 = 8 * b + ib; __m256i c[8];
+            for (int G = 0; G < 2; G++) {
+                const __m256i v = GQ_R16H_LD(o + lv + 64 * (2 * ib + G) + 32 * h);
+                for (int i = 0; i < 4; i++) {
+                    const int j = 4 * G + i; const uint32_t sb = (uint32_t)gq_ld32(o + lv + 1024 + 8 * (8 * ib + j) + 4 * h);
+                    const __m256i l = _mm256_and_si256(_mm256_srl_epi16(v, _mm_cvtsi32_si128(2 * i)), m3);
+                    c[j] = _mm256_shuffle_epi8(tab, _mm256_add_epi8(l, _mm256_and_si256(gq_bits32(sb), four)));
+                }
+            }
+            if (per16) {
+                const __m256 sv0 = _mm256_mul_ps(_mm256_mul_ps(dv, GQ_R16H_SCU8(o + 32 + 32 * ib + 8 * h)), eighth);
+                const __m256 sv1 = _mm256_mul_ps(_mm256_mul_ps(dv, GQ_R16H_SCU8(o + 48 + 32 * ib + 8 * h)), eighth);
+                GQ_R16H_ACC16B(c, sv0, sv1, GQ_R16_BIGBIAS)
+            } else {
+                const __m256 sv = _mm256_mul_ps(_mm256_mul_ps(dv, GQ_R16H_SCU8(o + 32 + 16 * ib + 8 * h)), eighth);
+                GQ_R16H_ACC32(c, sv, 0, sv, GQ_R16_BIGBIAS, GQ_R16H_DOTB)
+            }
+        }
+    } }
+    GQ_R16H_STORE2
+}
+GQ_R16H_FN gq_r16h_iq1p(GQ_R16H_ARGS, const int m16) {
+    const int lv = m16 ? 288 : 160, gb = lv + 1024 + (m16 ? 64 : 16);
+    const __m256i m3 = _mm256_set1_epi8(3), four = _mm256_set1_epi8(4), tab = gq_r16h_values_tab(GQ_IQ1_CODES);
+    const __m256 eighth = _mm256_set1_ps(0.125f);
+    GQ_R16H_ZERO2
+    for (int b = 0; b < I / 256; b++) {
+        const uint8_t *o = grp + (int64_t)b * gb;
+        for (int h = 0; h < 2; h++) { __m256 *acc = accs[h];   /* both halves of the block, one after the other */
+        const __m256 dv = GQ_R16H_D(o + 16 * h);
+        for (int ib = 0; ib < 8; ib++) {
+            const int g32 = 8 * b + ib; __m256i c[8];
+            __m256i dm = m16 ? _mm256_setzero_si256() : _mm256_and_si256(gq_bits32(gq_nib4(o[lv + 1024 + 2 * ib + h])), four);
+            for (int G = 0; G < 2; G++) {
+                const __m256i v = GQ_R16H_LD(o + lv + 64 * (2 * ib + G) + 32 * h);
+                for (int i = 0; i < 4; i++) {
+                    const int j = 4 * G + i;
+                    if (m16 && !(j & 1)) dm = _mm256_and_si256(gq_bits32(gq_nib4(o[lv + 1024 + 2 * (4 * ib + j / 2) + h])), four);
+                    const __m256i l = _mm256_and_si256(_mm256_srl_epi16(v, _mm_cvtsi32_si128(2 * i)), m3);
+                    c[j] = _mm256_shuffle_epi8(tab, _mm256_add_epi8(l, dm));
+                }
+            }
+            if (m16) {
+                const __m256 sv0 = _mm256_mul_ps(_mm256_mul_ps(dv, GQ_R16H_SCU8(o + 32 + 32 * ib + 8 * h)), eighth);
+                const __m256 sv1 = _mm256_mul_ps(_mm256_mul_ps(dv, GQ_R16H_SCU8(o + 48 + 32 * ib + 8 * h)), eighth);
+                GQ_R16H_ACC16B(c, sv0, sv1, GQ_R16_BIGBIAS)
+            } else {
+                const __m256 sv = _mm256_mul_ps(_mm256_mul_ps(dv, GQ_R16H_SCU8(o + 32 + 16 * ib + 8 * h)), eighth);
+                GQ_R16H_ACC32(c, sv, 0, sv, GQ_R16_BIGBIAS, GQ_R16H_DOTB)
+            }
+        }
+    } }
+    GQ_R16H_STORE2
+}
+GQ_R16H_FN gq_r16h_q2_k(GQ_R16H_ARGS) {
+    const __m256i m3 = _mm256_set1_epi8(3); const __m128i m4 = _mm_set1_epi8(0x0F);
+    GQ_R16H_ZERO2
+    for (int b = 0; b < I / 256; b++) {
+        const uint8_t *o = grp + (int64_t)b * 1344;
+        for (int h = 0; h < 2; h++) { __m256 *acc = accs[h];   /* both halves of the block, one after the other */
+        const __m256 dv = GQ_R16H_D(o + 16 * h), mv = GQ_R16H_D(o + 32 + 16 * h);
+        for (int ib = 0; ib < 8; ib++) {
+            const int g32 = 8 * b + ib; __m256i c[8];
+            for (int G = 0; G < 2; G++) {
+                const __m256i v = GQ_R16H_LD(o + 320 + 64 * (2 * ib + G) + 32 * h);
+                for (int i = 0; i < 4; i++) c[4 * G + i] = _mm256_and_si256(_mm256_srl_epi16(v, _mm_cvtsi32_si128(2 * i)), m3);
+            }
+            const __m128i sm0 = _mm_loadl_epi64((const __m128i *)(o + 64 + 32 * ib + 8 * h)), sm1 = _mm_loadl_epi64((const __m128i *)(o + 80 + 32 * ib + 8 * h));
+            const __m256 sv0 = _mm256_mul_ps(dv, _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_and_si128(sm0, m4))));
+            const __m256 sv1 = _mm256_mul_ps(dv, _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_and_si128(sm1, m4))));
+            const __m256 nv0 = _mm256_mul_ps(mv, _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_and_si128(_mm_srli_epi16(sm0, 4), m4))));
+            const __m256 nv1 = _mm256_mul_ps(mv, _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_and_si128(_mm_srli_epi16(sm1, 4), m4))));
+            for (int s = 0; s < S; s++) {
+                const int8_t *xb_ = xq + (int64_t)s * I + 32 * (int64_t)g32;
+                __m256i p0_, p1_; GQ_R16H_DOTU(p0_, c, xb_, 0, 4) GQ_R16H_DOTU(p1_, c, xb_, 4, 4)
+                const int32_t *x16 = xs + (int64_t)s * (I / 16) + 2 * (int64_t)g32;
+                const __m256 t = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p1_), sv1, _mm256_mul_ps(_mm256_cvtepi32_ps(p0_), sv0));
+                const __m256 u = _mm256_fmadd_ps(nv1, _mm256_set1_ps((float)x16[1]), _mm256_mul_ps(nv0, _mm256_set1_ps((float)x16[0])));
+                const __m256 dd = _mm256_set1_ps(dx[(int64_t)s * (I / 32) + g32]);
+                acc[s] = _mm256_fnmadd_ps(u, dd, _mm256_fmadd_ps(t, dd, acc[s]));
+            }
+        }
+    } }
+    GQ_R16H_STORE2
+}
+static inline __m256 gq_r16h_e8m0_8(const uint8_t *p) {
+    const __m256i e = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)p));
+    const __m256i big = _mm256_slli_epi32(_mm256_sub_epi32(e, _mm256_set1_epi32(1)), 23), sub = _mm256_sllv_epi32(_mm256_set1_epi32(0x00200000), e);
+    return _mm256_castsi256_ps(_mm256_blendv_epi8(big, sub, _mm256_cmpgt_epi32(_mm256_set1_epi32(2), e)));
+}
+/* NVFP4 (AVX2): eight rows' E4M3 scales a vector, IQ4_NL's codes over kvalues_mxfp4, a scale per 16 */
+static inline __m256 gq_r16h_ue4m3_8(const uint8_t *p) {
+    const __m256i x = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)p));
+    const __m256i e = _mm256_and_si256(_mm256_srli_epi32(x, 3), _mm256_set1_epi32(15)), m = _mm256_and_si256(x, _mm256_set1_epi32(7));
+    const __m256 nrm = _mm256_castsi256_ps(_mm256_or_si256(_mm256_slli_epi32(_mm256_add_epi32(e, _mm256_set1_epi32(119)), 23), _mm256_slli_epi32(m, 20)));
+    const __m256 sub = _mm256_mul_ps(_mm256_cvtepi32_ps(m), _mm256_set1_ps(1.f / 1024.f));
+    const __m256 v = _mm256_blendv_ps(nrm, sub, _mm256_castsi256_ps(_mm256_cmpeq_epi32(e, _mm256_setzero_si256())));
+    return _mm256_andnot_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(x, _mm256_set1_epi32(0x7F))), v);
+}
+GQ_R16H_FN gq_r16h_nvfp4(GQ_R16H_ARGS) {
+    const __m256i m4 = _mm256_set1_epi8(0x0F), tab = gq_r16h_values_tab(GGML_KVALUES_MXFP4);
+    GQ_R16H_ZERO2
+    for (int b = 0; b < I / 64; b++) {
+        const uint8_t *o = grp + (int64_t)b * 576;
+        for (int G = 0; G < 2; G++) { const int g32 = 2 * b + G;
+        for (int h = 0; h < 2; h++) { __m256 *acc = accs[h];   /* both halves of the rows, one after the other */
+            const __m256 sv0 = gq_r16h_ue4m3_8(o + 32 * G + 8 * h), sv1 = gq_r16h_ue4m3_8(o + 32 * G + 16 + 8 * h);
+            __m256i c[8];
+            for (int q = 0; q < 4; q++) {
+                const __m256i v = GQ_R16H_LD(o + 64 + 256 * G + 64 * q + 32 * h);
+                c[q] = _mm256_shuffle_epi8(tab, _mm256_and_si256(v, m4)); c[4 + q] = _mm256_shuffle_epi8(tab, _mm256_and_si256(_mm256_srli_epi16(v, 4), m4));
+            }
+            GQ_R16H_ACC16B(c, sv0, sv1, GQ_R16_BIGBIAS)
+        } }
+    }
+    GQ_R16H_STORE2
+}
+GQ_R16H_FN gq_r16h_mxfp4(GQ_R16H_ARGS) {
+    const __m256i m4 = _mm256_set1_epi8(0x0F), tab = gq_r16h_values_tab(GGML_KVALUES_MXFP4);
+    GQ_R16H_ZERO2
+    for (int b = 0; b < I / 32; b++) {
+        const uint8_t *o = grp + (int64_t)b * 272; const int g32 = b;
+        for (int h = 0; h < 2; h++) { __m256 *acc = accs[h];   /* both halves of the block, one after the other */
+        const __m256 dv = gq_r16h_e8m0_8(o + 8 * h);
+        __m256i c[8];
+        for (int q = 0; q < 4; q++) {
+            const __m256i v = GQ_R16H_LD(o + 16 + 64 * q + 32 * h);
+            c[q] = _mm256_shuffle_epi8(tab, _mm256_and_si256(v, m4)); c[4 + q] = _mm256_shuffle_epi8(tab, _mm256_and_si256(_mm256_srli_epi16(v, 4), m4));
+        }
+        GQ_R16H_ACC32(c, dv, 0, dv, GQ_R16_BIGBIAS, GQ_R16H_DOTB)
+    } }
+    GQ_R16H_STORE2
+}
+GQ_R16H_FN gq_r16h_iq1_s(GQ_R16H_ARGS) { gq_r16h_iq1p(y, ystride, grp, xq, dx, xs, I, S, 0); }
+GQ_R16H_FN gq_r16h_iq1_m(GQ_R16H_ARGS) { gq_r16h_iq1p(y, ystride, grp, xq, dx, xs, I, S, 1); }
+GQ_R16H_FN gq_r16h_iq2_xxs(GQ_R16H_ARGS) { gq_r16h_iq2p(y, ystride, grp, xq, dx, xs, I, S, 0); }
+GQ_R16H_FN gq_r16h_iq2_xs(GQ_R16H_ARGS) { gq_r16h_iq2p(y, ystride, grp, xq, dx, xs, I, S, 1); }
+/* every type's rows in a function of its own: a kernel's code then does not change with the others' */
+#define GQ_R16H_ROWS_FN(FN) static __attribute__((noinline)) void FN##_rows(float *ys, int ystride, const uint8_t *grp, const int8_t *xq, \
+        const float *dx, const int32_t *xs, int I, int n) { GQ_R16H_N(FN); }
+GQ_R16H_ROWS_FN(gq_r16h_iq1_m)
+GQ_R16H_ROWS_FN(gq_r16h_iq1_s)
+GQ_R16H_ROWS_FN(gq_r16h_iq2_xs)
+GQ_R16H_ROWS_FN(gq_r16h_iq2_xxs)
+GQ_R16H_ROWS_FN(gq_r16h_iq3_s)
+GQ_R16H_ROWS_FN(gq_r16h_iq3_xxs)
+GQ_R16H_ROWS_FN(gq_r16h_iq4_nl)
+GQ_R16H_ROWS_FN(gq_r16h_iq4_xs)
+GQ_R16H_ROWS_FN(gq_r16h_mxfp4)
+GQ_R16H_ROWS_FN(gq_r16h_nvfp4)
+GQ_R16H_ROWS_FN(gq_r16h_q2_0)
+GQ_R16H_ROWS_FN(gq_r16h_q2_k)
+GQ_R16H_ROWS_FN(gq_r16h_q3_k)
+GQ_R16H_ROWS_FN(gq_r16h_q4_0)
+GQ_R16H_ROWS_FN(gq_r16h_q4_k)
+GQ_R16H_ROWS_FN(gq_r16h_q5_k)
+GQ_R16H_ROWS_FN(gq_r16h_q6_k)
+GQ_R16H_ROWS_FN(gq_r16h_q8_0)
 static void gq_r16_rows(int t, float *y, int ystride, const uint8_t *grp, const gq_act *a, int I) {
     for (int s0 = 0; s0 < a->S; s0 += 4) {
         const int n = a->S - s0 < 4 ? a->S - s0 : 4;
         float *ys = y + (int64_t)s0 * ystride; const int8_t *xq = a->q + (int64_t)s0 * I;
         const float *dx = a->d + (int64_t)s0 * (I / 32); const int32_t *xs = a->s + (int64_t)s0 * (I / 16);
-        for (int h = 0; h < 2; h++)
-            switch (t) {
-            case GQ_Q2_0_R16: GQ_R16H_N(gq_r16h_q2_0); break;
-            case GQ_Q4_K_R16: GQ_R16H_N(gq_r16h_q4_k); break;
-            case GQ_Q5_K_R16: GQ_R16H_N(gq_r16h_q5_k); break;
-            case GQ_Q6_K_R16: GQ_R16H_N(gq_r16h_q6_k); break;
-            case GQ_Q3_K_R16: GQ_R16H_N(gq_r16h_q3_k); break;
-            case GQ_IQ4_XS_R16: GQ_R16H_N(gq_r16h_iq4_xs); break;
-            case GQ_Q8_0_R16: GQ_R16H_N(gq_r16h_q8_0); break;
-            case GQ_Q4_0_R16: GQ_R16H_N(gq_r16h_q4_0); break;
-            case GQ_IQ4_NL_R16: GQ_R16H_N(gq_r16h_iq4_nl); break;
-            }
+        switch (t) {
+        case GQ_Q2_0_R16: gq_r16h_q2_0_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
+        case GQ_Q4_K_R16: gq_r16h_q4_k_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
+        case GQ_Q5_K_R16: gq_r16h_q5_k_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
+        case GQ_Q6_K_R16: gq_r16h_q6_k_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
+        case GQ_Q3_K_R16: gq_r16h_q3_k_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
+        case GQ_IQ4_XS_R16: gq_r16h_iq4_xs_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
+        case GQ_Q8_0_R16: gq_r16h_q8_0_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
+        case GQ_Q4_0_R16: gq_r16h_q4_0_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
+        case GQ_IQ4_NL_R16: gq_r16h_iq4_nl_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
+        case GQ_IQ3_S_R16: gq_r16h_iq3_s_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
+        case GQ_IQ2_XXS_R16: gq_r16h_iq2_xxs_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
+        case GQ_IQ2_XS_R16: case GQ_IQ2_S_R16: gq_r16h_iq2_xs_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
+        case GQ_IQ3_XXS_R16: gq_r16h_iq3_xxs_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
+        case GQ_IQ1_S_R16: gq_r16h_iq1_s_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
+        case GQ_IQ1_M_R16: gq_r16h_iq1_m_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
+        case GQ_Q2_K_R16: gq_r16h_q2_k_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
+        case GQ_MXFP4_R16: gq_r16h_mxfp4_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
+        case GQ_NVFP4_R16: gq_r16h_nvfp4_rows(ys, ystride, grp, xq, dx, xs, I, n); break;
+        }
     }
 }
 #endif
@@ -2796,6 +3957,86 @@ GQ_SB_FN void gq_f8_q8_0(GQ_F8_ARGS) {
     }
     GQ_F8_STORE
 }
+/* IQ4_NL: d, then 16 bytes of nibbles (the low ones the block's first 16 elements, the high ones
+ * the last 16), looked up as IQ4_XS's */
+GQ_SB_FN void gq_f8_iq4_nl(GQ_F8_ARGS) {
+    const __m256i m4 = _mm256_set1_epi8(0x0F);
+    const __m128i t0 = _mm_loadu_si128((const __m128i *)GGML_KVALUES_IQ4NL);
+    const __m256i tab = _mm256_broadcastsi128_si256(GQ_F8_BB ? _mm_xor_si128(t0, _mm_set1_epi8((char)0x80)) : t0);
+    GQ_F8_ZERO
+    for (int64_t g32 = 0; g32 < I / 32; g32++) {
+        __m256i w[8], T[8], c[8];
+        const uint8_t *b[8];
+        for (int r = 0; r < 8; r++) {
+            b[r] = row + r * rb + g32 * 18;
+            w[r] = _mm256_inserti128_si256(_mm256_setzero_si256(), _mm_loadu_si128((const __m128i *)(b[r] + 2)), 0);
+        }
+        gq_f8_t8(T, w);   /* T[0..3]: the 16 bytes */
+        const __m256 sv = gq_f8_h16(b, 0);
+        for (int q = 0; q < 4; q++) {
+            c[q] = _mm256_shuffle_epi8(tab, _mm256_and_si256(T[q], m4));
+            c[4 + q] = _mm256_shuffle_epi8(tab, _mm256_and_si256(_mm256_srli_epi16(T[q], 4), m4));
+        }
+        GQ_F8_ACC32(c, sv, 0, sv, GQ_F8_BB, GQ_F8_DOTB)
+    }
+    GQ_F8_STORE
+}
+/* Q5_0 and Q5_1: d (and m), the 32 high bits, then 16 bytes of nibbles (the low ones the first 16
+ * elements, the high ones the last 16): each byte's nibble with its high bit at bit 4, unsigned codes,
+ * Q5_0's less 16 by the bias, Q5_1's min as Q4_K's */
+GQ_SB_FN void gq_f8_q5(GQ_F8_ARGS, const int one) {
+    const __m256i m4 = _mm256_set1_epi8(0x0F), x10 = _mm256_set1_epi8(0x10);
+    /* a lane's byte k of qh into its four bytes (k = 0 .. 3), and the four bits of a nibble's half of it */
+    __m256i rep[4], bit[2];
+    for (int k = 0; k < 4; k++) rep[k] = _mm256_setr_epi8(k, k, k, k, 4 + k, 4 + k, 4 + k, 4 + k, 8 + k, 8 + k, 8 + k, 8 + k, 12 + k, 12 + k, 12 + k, 12 + k,
+                                                          k, k, k, k, 4 + k, 4 + k, 4 + k, 4 + k, 8 + k, 8 + k, 8 + k, 8 + k, 12 + k, 12 + k, 12 + k, 12 + k);
+    bit[0] = _mm256_set1_epi32(0x08040201); bit[1] = _mm256_set1_epi32((int)0x80402010u);
+    const int BYTES = one ? 24 : 22, oh = one ? 4 : 2;
+    GQ_F8_ZERO
+    for (int64_t g32 = 0; g32 < I / 32; g32++) {
+        __m256i w[8], T[8], c[8];
+        const uint8_t *b[8];
+        for (int r = 0; r < 8; r++) {
+            b[r] = row + r * rb + g32 * BYTES;
+            w[r] = _mm256_inserti128_si256(_mm256_setzero_si256(), _mm_loadu_si128((const __m128i *)(b[r] + oh + 4)), 0);
+        }
+        gq_f8_t8(T, w);   /* T[0..3]: the 16 bytes */
+        const __m256 sv = gq_f8_h16(b, 0);
+        const __m256 nv = one ? _mm256_sub_ps(_mm256_setzero_ps(), gq_f8_h16(b, 2)) : sv;
+        const __m256i QH = gq_f8_w32(b, oh);
+        for (int q = 0; q < 8; q++) {   /* elements 4q .. 4q + 3: their high bits are bits 4q .. 4q + 3 of qh */
+            const __m256i hs = _mm256_and_si256(_mm256_shuffle_epi8(QH, rep[q >> 1]), bit[q & 1]);
+            const __m256i hb = _mm256_and_si256(_mm256_cmpeq_epi8(hs, bit[q & 1]), x10);
+            const __m256i nib = q < 4 ? _mm256_and_si256(T[q], m4) : _mm256_and_si256(_mm256_srli_epi16(T[q - 4], 4), m4);
+            c[q] = _mm256_or_si256(nib, hb);
+        }
+        if (one) { GQ_F8_ACC32(c, sv, 1, nv, 0, GQ_F8_DOTU) }
+        else { GQ_F8_ACC32(c, sv, 0, nv, 16, GQ_F8_DOTU) }
+    }
+    GQ_F8_STORE
+}
+/* Q2_0: d, then a block of 64's 2-bit codes, four a byte from its low bits (the value code - 1):
+ * a group of 32's eight bytes a row, each byte's four codes into the four bytes of its quad,
+ * the codes unsigned with a bias of 1 */
+GQ_SB_FN void gq_f8_q2_0(GQ_F8_ARGS) {
+    const __m256i m3 = _mm256_set1_epi32(0x03030303);
+    GQ_F8_ZERO
+    for (int64_t g32 = 0; g32 < I / 32; g32++) {
+        const uint8_t *b[8];
+        for (int r = 0; r < 8; r++) b[r] = row + r * rb + (g32 >> 1) * 18;
+        const __m256 sv = gq_f8_h16(b, 0);
+        const int off = 2 + 8 * (int)(g32 & 1);
+        const __m256i lo = gq_f8_w32(b, off), hi = gq_f8_w32(b, off + 4);
+        __m256i c[8];
+        for (int j = 0; j < 8; j++) {
+            const __m256i x = GQ_F8_B32(j < 4 ? lo : hi, j & 3);
+            c[j] = _mm256_and_si256(_mm256_or_si256(_mm256_or_si256(x, _mm256_slli_epi32(x, 6)),
+                                                    _mm256_or_si256(_mm256_slli_epi32(x, 12), _mm256_slli_epi32(x, 18))), m3);
+        }
+        GQ_F8_ACC32(c, sv, 0, sv, 1, GQ_F8_DOTU)
+    }
+    GQ_F8_STORE
+}
 /* The grid types row by row: |w| the grid's bytes, the signs on x as +1 / -1 rows. */
 #if GQ_F8_VNNI
 #define GQ_F8_DPR(u, x) GQ_F8_DPU(_mm256_setzero_si256(), (u), (x))
@@ -2911,7 +4152,8 @@ static inline int gq_f8_ok(int t, int I) {
     switch (t) {
     case GQ_IQ4_XS: case GQ_IQ2_XXS: case GQ_IQ2_XS: case GQ_IQ2_S: case GQ_IQ3_XXS: case GQ_IQ3_S:
     case GQ_Q4_K: case GQ_Q5_K: case GQ_Q6_K: case GQ_Q3_K: return I % 256 == 0;
-    case GQ_Q8_0: return I % 32 == 0;
+    case GQ_Q8_0: case GQ_IQ4_NL: case GQ_Q5_0: case GQ_Q5_1: return I % 32 == 0;
+    case GQ_Q2_0: return I % 64 == 0;
     default: return 0;
     }
 #else
@@ -2939,6 +4181,10 @@ static void gq_rows_f8(float *y, int ystride, const gq_act *a, const uint8_t *ro
             case GQ_Q6_K: GQ_F8_N(gq_f8_q6_k(ys, ystride, rw, rb, xq, dx, xs, I, S)); break;
             case GQ_Q3_K: GQ_F8_N(gq_f8_q3_k(ys, ystride, rw, rb, xq, dx, xs, I, S)); break;
             case GQ_Q8_0: GQ_F8_N(gq_f8_q8_0(ys, ystride, rw, rb, xq, dx, xs, I, S)); break;
+            case GQ_IQ4_NL: GQ_F8_N(gq_f8_iq4_nl(ys, ystride, rw, rb, xq, dx, xs, I, S)); break;
+            case GQ_Q2_0: GQ_F8_N(gq_f8_q2_0(ys, ystride, rw, rb, xq, dx, xs, I, S)); break;
+            case GQ_Q5_0: GQ_F8_N(gq_f8_q5(ys, ystride, rw, rb, xq, dx, xs, I, S, 0)); break;
+            case GQ_Q5_1: GQ_F8_N(gq_f8_q5(ys, ystride, rw, rb, xq, dx, xs, I, S, 1)); break;
             }
         }
 #else
@@ -2959,7 +4205,9 @@ static inline int gq_int_ok(int t, int I) {
  * for these types), lays them out as the R16 kernels read, and every activation row goes
  * through gq_r16_tile: per row and per 16 elements the exact integer dot, then its scale,
  * the R16 kernels' float steps (a TF-NLL check, not their bits). */
-#define GQ_TILE16_MIN_S 8   /* activation rows from which one unpack for all pays */
+/* activation rows from which one unpack for all pays; below it, a verify's rows (GQ_EXACT_ROWS) keep
+ * the row kernels' bits */
+#define GQ_TILE16_MIN_S (GQ_EXACT_ROWS + 1)
 static inline int gq_tile16_ok(int t, int I) {
     return !gq_exact_mode() && gq_r16_of(t) < 0 && gq_has_int(t) && !gq_has_min(t) && I % 32 == 0 && I % GQ_TYPES[t].blck == 0;
 }
@@ -3028,12 +4276,12 @@ static void gq_matmul_act(float *y, const gq_act *a, const uint8_t *W, int t, in
     }
 #endif
 #ifdef GQ_F8_ON
-    /* a prompt's rows (more than a fused kernel takes): the file's rows by eight, gq_rows_f8,
+    /* a prompt's rows (more than a verify takes, GQ_EXACT_ROWS): the file's rows by eight, gq_rows_f8,
      * where the type has that kernel. gq_row_all unpacks a row once and then pays a convert
      * and an fma per 32 elements for every row and activation row: on a prompt of Flint
      * (UD-Q3_K_XL, IQ2_S experts) that was 29% of the CPU's time. Decode keeps the fused row
      * kernels. */
-    if (a->S > GQ_FUSED_ROWS && gq_f8_ok(t, I)) {
+    if (a->S > GQ_EXACT_ROWS && gq_f8_ok(t, I)) {
         const int G8 = O / 8;
         #pragma omp parallel for schedule(dynamic, 1)
         for (int g = 0; g < G8; g++) gq_rows_f8(y + 8 * g, O, a, W + (int64_t)8 * g * rb, rb, t, I, 8);
@@ -3051,7 +4299,7 @@ static void gq_matmul2_act(float *y1, const uint8_t *W1, int t1, float *y2, cons
     if (gq_r16_base(t1) >= 0 || gq_r16_base(t2) >= 0) { gq_matmul_act(y1, a, W1, t1, O); gq_matmul_act(y2, a, W2, t2, O); return; }
 #endif
 #ifdef GQ_F8_ON
-    if (a->S > GQ_FUSED_ROWS && (gq_f8_ok(t1, I) || gq_f8_ok(t2, I))) { gq_matmul_act(y1, a, W1, t1, O); gq_matmul_act(y2, a, W2, t2, O); return; }
+    if (a->S > GQ_EXACT_ROWS && (gq_f8_ok(t1, I) || gq_f8_ok(t2, I))) { gq_matmul_act(y1, a, W1, t1, O); gq_matmul_act(y2, a, W2, t2, O); return; }
 #endif
     #pragma omp parallel for schedule(static)
     for (int r = 0; r < 2 * O; r++) {

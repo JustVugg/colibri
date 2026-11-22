@@ -1,0 +1,81 @@
+{
+  "version": 1,
+  "hypothesis": "In decode the Metal graph announces to the kernel the guessed experts of the next layer that are not in the cache, so the SSD reads them while the GPU works; announcing only the six likeliest instead of all eight leaves out the reads a step most often does not use, so decode steps 2 to 32 after a 512-token prompt of chat.txt get faster on an 8 GB M1, with the same logits.",
+  "commit": "b16c23cafa00c517a4b27f1d25d572ba088df425",
+  "model": "Qwen3.6-35B-A3B (Qwen3_5MoeForConditionalGeneration) converted to Colibri's qwen36 container: INT4 routed experts with gs=64 group scales, f16 dense weights (quantized to INT8 at load) and f16 embedding; 23 GB of safetensors; canonical.qc beside it (1.94 GB, written by qwen36-canonical) and experts.qc (17.1 GB, scales as 16-bit codes, the bytes qwen36-canonical --experts writes: its records written on 2026-10-05, its 8-byte stamp on 2026-10-07); the checkpoint's shards were written on 2026-09-16",
+  "command": "for each version, git archive <its commit> c | tar -x -C <dir>, make -C <dir>/c qwen36_metal.o backend_metal.o METAL=1, then from the repository root, with the compiler flags make -C c qwen36 METAL=1 gives qwen36.c except its qpack path (-DQWEN36_QPACK and its objects, which the harness does not use): clang -O3 -Xclang -fopenmp -I<libomp>/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_METAL -DQWEN36_METAL -I<dir>/c docs/experiments/qwen36-ahead-six-2026-10-06/bench.c <dir>/c/qwen36_metal.o <dir>/c/backend_metal.o -o <dir>/qwen36-bench -lm -L<libomp>/lib -lomp -framework Metal -framework Foundation -framework Accelerate -lc++; every run: /usr/bin/time -l env -i PATH=/usr/bin:/bin HOME=$HOME SNAP=<model> <dir>/qwen36-bench chat.txt 64,512 32; baseline = a367db0c (the parent), trial = b16c23ca",
+  "prompt_hash": "d77e4d25d43fa554459d85996f69e8573038376cbe2b2fe2725bb12a98fe1960",
+  "hardware": {
+    "cpu": "Apple M1, 4 performance + 4 efficiency cores (MacBook Air, MacBookAir10,1, no fan)",
+    "ram": "8 GB unified memory",
+    "storage": "internal APPLE SSD AP0256Q, APFS",
+    "os": "macOS 26.6.2 (25G83), Apple clang 21.0.0 (clang-2100.3.34.2), Homebrew libomp"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "ANNOUNCED_GUESSES"
+  ],
+  "baseline": {
+    "config": {
+      "SNAP": "Qwen3.6-35B-A3B, Colibri qwen36 container, INT4 experts gs=64, internal SSD",
+      "BUILD": "the compiler flags of make -C c qwen36 METAL=1 on macOS without its qpack path: clang -O3 -Xclang -fopenmp -DCOLI_METAL -DQWEN36_METAL, qwen36_metal.o and backend_metal.o",
+      "EXPERT_CACHE": "the Metal graph's default: a sixteenth of the RAM (512 MiB, 303 slots of 1.77 MB in both versions)",
+      "PROMPT": "the first 64 and the first 512 tokens of chat.txt (in this record: an English conversation written for these measurements, plain User:/Assistant: text without the chat template, 6,900 bytes read whole; prompt_hash is its SHA-256), each from an empty state; after each, 32 greedy tokens",
+      "ORDER": "1 warm-up run (baseline, discarded), then baseline trial trial baseline baseline trial trial baseline, one process each",
+      "REST": "thermal state nominal, then 60 s, before every run",
+      "EXPERT_SOURCE": "experts.qc beside the model",
+      "ENGINE": "the Metal graph, default (fast) kernels",
+      "ANNOUNCED_GUESSES": "the next layer's eight guessed experts (its top-k), those not in the cache (a367db0c)",
+      "MEASURED": "tokens per second of the 32 tokens generated after the 512-token prompt (the first token excluded)"
+    },
+    "samples": {
+      "tok_s": [
+        7.622,
+        7.626,
+        7.597,
+        7.613
+      ]
+    },
+    "median_tok_s": 7.6175,
+    "quality": {
+      "method": "FNV-1a fingerprint of every logit of the run, and the hash of the generated tokens, per prompt length: 64 tokens 250dc21c15a34ae4/5b90de6c0b996836, 512 tokens f0941d8725f04c2a/79ddc72edd15f604, the same in all nine runs (the warm-up and the 4 runs of each version)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-ahead-six-2026-10-06/baseline-chat.txt",
+      "sha256": "8af29e0c399914e8f3dbc471d7111a83931f601b2bbc0c59628c0db4e65aea0c"
+    }
+  },
+  "trial": {
+    "config": {
+      "SNAP": "Qwen3.6-35B-A3B, Colibri qwen36 container, INT4 experts gs=64, internal SSD",
+      "BUILD": "the compiler flags of make -C c qwen36 METAL=1 on macOS without its qpack path: clang -O3 -Xclang -fopenmp -DCOLI_METAL -DQWEN36_METAL, qwen36_metal.o and backend_metal.o",
+      "EXPERT_CACHE": "the Metal graph's default: a sixteenth of the RAM (512 MiB, 303 slots of 1.77 MB in both versions)",
+      "PROMPT": "the first 64 and the first 512 tokens of chat.txt (in this record: an English conversation written for these measurements, plain User:/Assistant: text without the chat template, 6,900 bytes read whole; prompt_hash is its SHA-256), each from an empty state; after each, 32 greedy tokens",
+      "ORDER": "1 warm-up run (baseline, discarded), then baseline trial trial baseline baseline trial trial baseline, one process each",
+      "REST": "thermal state nominal, then 60 s, before every run",
+      "EXPERT_SOURCE": "experts.qc beside the model",
+      "ENGINE": "the Metal graph, default (fast) kernels",
+      "ANNOUNCED_GUESSES": "the six likeliest of them, those not in the cache (b16c23ca)",
+      "MEASURED": "tokens per second of the 32 tokens generated after the 512-token prompt (the first token excluded)"
+    },
+    "samples": {
+      "tok_s": [
+        7.906,
+        7.897,
+        7.897,
+        7.744
+      ]
+    },
+    "median_tok_s": 7.897,
+    "quality": {
+      "method": "FNV-1a fingerprint of every logit of the run, and the hash of the generated tokens, per prompt length: 64 tokens 250dc21c15a34ae4/5b90de6c0b996836, 512 tokens f0941d8725f04c2a/79ddc72edd15f604, the same in all nine runs (the warm-up and the 4 runs of each version)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-ahead-six-2026-10-06/trial-chat.txt",
+      "sha256": "e0f24e22e271cd4f4313c4f92fea167a2a87fd31ec0d6948277dbbdcfd59b0fa"
+    }
+  },
+  "outcome": "improvement"
+}

@@ -69,13 +69,15 @@ for example `7.0`, or null when nothing reported it).
 | `status` | `good`, `tight`, `needs-ram`, `needs-disk` or `unsupported` |
 | `fits`, `reason` | whether it can be installed here, and why |
 | `recommended` | exactly one model is the default |
+| `estimate` | for a text model that fits: `backend` (cuda, vulkan, cpu), `tier` (`gpu` every weight on the card, `hybrid` half on the card and half in RAM, `ram`, `ssd` experts streamed from the disk), `tok_s` the estimated decode speed, `where` in words |
 
 "Fits" means: the dense part, which always stays in RAM, plus a minimum
 expert cache fit in RAM, and the download fits on the disk.
 
 Tell the user the recommendation and the alternatives that fit, with their
-sizes. Large models stream from the SSD and are much slower than the small
-ones that run from RAM.
+sizes and estimated speeds. The recommendation is the most capable model whose
+estimate reaches 20 tok/s here, a slower one discounted by how far it falls
+short; a model that streams from the SSD counts at half its estimate.
 
 ## 2. Install
 
@@ -232,7 +234,7 @@ seconds to minutes depending on the model). Then give the user:
 
 | Field in `status --json` | Use |
 |---|---|
-| `server.urls.browser` | the dashboard, for the user |
+| `server.urls.browser` | the chat, for the user |
 | `server.urls.openai_base_url` | `.../v1`, for OpenAI-compatible clients |
 | `server.urls.anthropic_base_url` | for Anthropic-compatible clients (they append `/v1/messages`) |
 | `server.model_id` | the `model` value API requests must send |

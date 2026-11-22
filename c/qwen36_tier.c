@@ -160,7 +160,7 @@ static size_t qt_pad256(size_t b){ return (b + 255) / 256 * 256; }
  * of the largest layer's left Flint UD-Q3_K_XL's average expert 18 % of it unused, UD-Q4_K_XL's
  * 28 % (2.45 MB slots for 1.91 MB): on an RTX PRO 4000 the card held 8140 of its 12032 experts.
  * The budget counts each expert at its slot (qt_ebytes); a swap pairs slots of one size. The
- * qwen38 chain reads the arena as slots of one size (qt_chain_arena): it does not ask for it. */
+ * qwen38 chain takes the arena over by qt_chain_arena_exact and pairs its promotions by size class. */
 static int G_exact_want, G_exact;
 static size_t *G_lsl, *G_lou, *G_lod, G_lsl_min, G_abump;
 static int *G_lcls, G_ncls;                 /* a layer's size class, of G_ncls */
@@ -540,7 +540,8 @@ static int qt_place_named(const char *component){
 /* One fused qkv++z tensor per DeltaNet layer. Indexed by model layer index,
  * so the array is n_layers wide and the attention slots stay empty. */
 #define QT_DN_MAX_LAYERS 128
-static struct { ColiCudaTensor *t; int dev, on, fmt; } G_dnp[QT_DN_MAX_LAYERS];
+static struct { ColiCudaTensor *t; int dev, on, fmt, O; } G_dnp[QT_DN_MAX_LAYERS],
+    G_dnz[QT_DN_MAX_LAYERS];   /* z's rows when a GGUF gives them another type than qkv's (qt_dnproj_z_init_fmt) */
 static int G_home_layer;                          /* QT_HOME=layer */
 static uint8_t G_layer_dev[QT_DN_MAX_LAYERS];     /* device INDEX per layer in that mode */
 static int home(int eid){ return eid % G.ndev; }   /* the expert-index mapping (tests read it too) */
@@ -702,6 +703,15 @@ void qt_reserve(size_t bytes){ G_reserve = bytes; }
  * the card would hold memory for nothing) */
 static size_t G_reserve_short, G_short_experts;
 void qt_reserve_short(size_t bytes, size_t experts){ G_reserve_short = bytes; G_short_experts = experts; }
+/* qt_reserve_stage: the qwen38 chain's prompt staging past the `base` bytes its own reserve holds,
+ * toward `full` (every expert of its largest layer): what the layer's experts off the card would
+ * take, a fifth more for a layer the card holds fewer of than the average, at most a sixteenth of
+ * the expert budget (one device). Unsloth's UD-IQ2_XS on an RTX PRO 4000 (13.95 GB of experts): a
+ * 4220-token prompt 318-371 tok/s with 512 MiB, 719-729 with 800 and 726-728 with 1100, its decode
+ * the same with 800 and 2-4 tok/s down with 1100 (the card's 8647 experts 8471 and 8313) */
+static size_t G_stage_base, G_stage_full, G_stage_extra;
+void qt_reserve_stage(size_t base, size_t full){ G_stage_base = base; G_stage_full = full; G_stage_extra = 0; }
+size_t qt_stage_extra(void){ return G_stage_extra; }
 void qt_experts_withdraw(const char *why){
     const char *bg = getenv("CUDA_EXPERT_GB");
     if(!G.on || G_trunk_only || (bg && strcmp(bg,"auto") && atof(bg) > 0)) return;
@@ -1191,6 +1201,20 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
             fprintf(stderr,"[qtier] dev %d: %.2f GB kept for a prompt chunk's experts from the host pool (fewer than all %zu fit)\n",
                     G.dev[i], G_reserve_short/1073741824.0, G_short_experts);
         }
+        G_stage_extra = 0;
+        if(G_stage_full > G_stage_base && G.ndev == 1 && G.budget[i] && per && G.nl > 0 && G.ne > 0){
+            double all = (double)per * G.nl * G.ne, on = (double)G.budget[i] / all;
+            if(on > 1) on = 1;
+            size_t want = (size_t)((double)G_stage_full * (1.0 - on) * 1.2), cap = G.budget[i] / 16;
+            if(want > G_stage_full) want = G_stage_full;
+            if(want > cap) want = cap;
+            if(want > G_stage_base){
+                G_stage_extra = (want - G_stage_base + 255) / 256 * 256;
+                G.budget[i] -= G_stage_extra;
+                fprintf(stderr,"[qtier] dev %d: %.0f MiB more for a prompt's staging of the experts off the card (%.0f MiB in all; a layer's every expert %.0f MiB)\n",
+                        G.dev[i], G_stage_extra/1048576.0, (G_stage_base+G_stage_extra)/1048576.0, G_stage_full/1048576.0);
+            }
+        }
         fprintf(stderr,"[qtier] dev %d: budget %.2f GB for experts (~%zu experts)%s\n",
                 G.dev[i], G.budget[i]/1073741824.0, G.budget[i]/per,
                 trunk ? " after trunk" : "");
@@ -1248,6 +1272,16 @@ fail_storage:
 }
 
 int qt_ready(void){ return G.on; }
+int qt_vision_matmul(float *y, const float *x, const float *w, int rows, int in, int out){
+    if(!G.on || G.ndev < 1) return 0;
+    ColiCudaTensor *t = NULL;
+    int ok = coli_cuda_matmul(&t, y, x, w, NULL, 0, rows, in, out, G.dev[0], 0);
+    if(t) coli_cuda_tensor_free(t);
+    return ok;
+}
+int qt_vision_attention(float *out, const float *qkv, int n, int heads, int D, float scale){
+    return G.on && G.ndev > 0 && coli_cuda_vision_attention(G.dev[0], out, qkv, n, heads, D, scale);
+}
 int qt_streaming(void){ return G.on && G_stream; }
 int qt_experts_on(void){
     if(!G.on || G_trunk_only) return 0;
@@ -1279,8 +1313,23 @@ int qt_dnproj_init_fmt(int layer, const void *w, const float *sc, int fmt,
         fprintf(stderr,"[dnp] layer %d upload failed -> stays on CPU\n", layer);
         return 0;
     }
-    G_dnp[layer].dev = device; G_dnp[layer].on = 1; G_dnp[layer].fmt = fmt;
+    G_dnp[layer].dev = device; G_dnp[layer].on = 1; G_dnp[layer].fmt = fmt; G_dnp[layer].O = O;
     return 1;
+}
+int qt_dnproj_z_init_fmt(int layer, const void *w, int fmt, int I, int O, int device){
+    if(layer < 0 || layer >= QT_DN_MAX_LAYERS || !G_dnp[layer].on || G_dnp[layer].dev != device || !w || fmt < 100) return 0;
+    if(!coli_cuda_tensor_upload(&G_dnz[layer].t, w, NULL, fmt, I, O, device)){
+        fprintf(stderr,"[dnp] layer %d: z's upload failed -> the in_proj stays on CPU\n", layer);
+        coli_cuda_tensor_free(G_dnp[layer].t); G_dnp[layer].t = NULL; G_dnp[layer].on = 0;
+        return 0;
+    }
+    G_dnz[layer].dev = device; G_dnz[layer].on = 1; G_dnz[layer].fmt = fmt; G_dnz[layer].O = O;
+    return 1;
+}
+ColiCudaTensor *qt_dnproj_z_tensor(int layer, int *dev){
+    if(layer < 0 || layer >= QT_DN_MAX_LAYERS || !G_dnp[layer].on || !G_dnz[layer].on || !G_dnz[layer].t) return NULL;
+    if(dev) *dev = G_dnz[layer].dev;
+    return G_dnz[layer].t;
 }
 int qt_dnproj_init(int layer, const int8_t *q, const float *sc,
                    int I, int O, int device){ return qt_dnproj_init_fmt(layer, q, sc, 1, I, O, device); }
@@ -1339,6 +1388,25 @@ int qt_dnproj_ready(int layer){
 }
 int qt_dnproj_matmul_batch(int layer, float *y, const float *x, int S, int I, int O){
     if(!qt_dnproj_ready(layer) || S <= 0) return 0;
+    if(G_dnz[layer].on){   /* two tensors: qkv's rows then z's, each row of y qkv ++ z as one tensor gives it */
+        const int Oq = G_dnp[layer].O, Oz = G_dnz[layer].O;
+        if(Oq + Oz != O) return 0;
+        float *yq = S == 1 ? y : malloc((size_t)S * Oq * sizeof(float)), *yz = S == 1 ? y + Oq : malloc((size_t)S * Oz * sizeof(float));
+        int ok = yq && yz &&
+                 coli_cuda_matmul(&G_dnp[layer].t,yq,x,NULL,NULL,G_dnp[layer].fmt,S,I,Oq,G_dnp[layer].dev,0) &&
+                 coli_cuda_matmul(&G_dnz[layer].t,yz,x,NULL,NULL,G_dnz[layer].fmt,S,I,Oz,G_dnz[layer].dev,0);
+        if(ok && S > 1)
+            for(int s = 0; s < S; s++){
+                memcpy(y + (size_t)s * O, yq + (size_t)s * Oq, (size_t)Oq * sizeof(float));
+                memcpy(y + (size_t)s * O + Oq, yz + (size_t)s * Oz, (size_t)Oz * sizeof(float));
+            }
+        if(S > 1){ free(yq); free(yz); }
+        if(ok) return 1;
+        if(!yq || !yz) return 0;   /* no host memory: this call on the CPU, the tensors stay */
+        fprintf(stderr,"[dnp] layer %d GPU matmul failed; CPU from here on\n", layer);
+        G_dnp[layer].on = 0; G_dnz[layer].on = 0;
+        return 0;
+    }
     if(coli_cuda_matmul(&G_dnp[layer].t,y,x,NULL,NULL,G_dnp[layer].fmt,S,I,O,G_dnp[layer].dev,0))
         return 1;
     fprintf(stderr,"[dnp] layer %d GPU matmul failed; CPU from here on\n", layer);
@@ -1359,7 +1427,7 @@ int qt_dn_gpu_init(int layer, int vh, int vk, int kdim, int vdim, int conv_dim, 
     ColiCudaDn *d = coli_cuda_dn_create(G_dnp[layer].dev, vh, vk, kdim, vdim, conv_dim, convk, hidden, conv_w, norm_w, eps, 0);
     if(!d) return 0;                                                    /* older backend or no memory: CPU path stands */
     G_dn[layer].d = d; G_dn[layer].dev = G_dnp[layer].dev; G_dn[layer].on = 1;
-    G_dn[layer].proj = G_dnp[layer].t; G_dn[layer].projz = NULL; G_dn[layer].outp = G_dense[h].t;
+    G_dn[layer].proj = G_dnp[layer].t; G_dn[layer].projz = G_dnz[layer].on ? G_dnz[layer].t : NULL; G_dn[layer].outp = G_dense[h].t;
     return 1;
 }
 /* The same layer from three dense handles (qwen38: dnqkv, dnz, dnout as the
@@ -1427,18 +1495,38 @@ static void qt_lfru_tick_locked(void);
  * the copies as it is, page-locked here (a copy at the bus's full rate, no second copy in RAM).
  * A decode step's slots stay the CPU's. On when the RAM holds every expert (no slot is ever
  * recycled), one device, and the RAM copy is a layout the device's GEMMs read: expert_ffn.h's
- * planar int4 per 64 (coli_cuda_planar_rows), or a GGUF's rows as the file has them (gate, up
- * and down back to back, no scales; the engine holds them so when this tier takes a GGUF's
- * experts). COLI_CUDA_HOST_POOL=0 off. */
-static int G_host_on = -1;
+ * planar int4 per 64 (coli_cuda_planar_rows), int4 in pairs (a per-row container, or per group
+ * off the shared kernel: the bytes the residents' tensors hold, gate, up and down in one block),
+ * or a GGUF's rows as the file has them (gate, up and down back to back, no scales; the engine
+ * holds them so when this tier takes a GGUF's experts). A per-row container had none: its
+ * 12.7K-token prompt ran the experts outside VRAM on the CPU (#2734). COLI_CUDA_HOST_POOL=0 off. */
+/* The warm start pools the experts off the card, and the residents' copies too when the card holds
+ * fewer than every expert and the chain runs; G_host_all: it did, every one (qt_chain_host_all). */
+static int G_host_on = -1, G_host_all;
 static unsigned long long G_host_n, G_host_bytes;
 static int host_pool_on(void){
     if(G_host_on >= 0) return G_host_on;
     const char *e = getenv("COLI_CUDA_HOST_POOL");
     G_host_on = !(e && *e == '0') && G.on && !G_stream && !G_trunk_only && G.ndev == 1 &&
-                ((G_src_planar && G.wfmt == 4 && G.egs == 64 && coli_cuda_planar_rows(G.dev[0], G.D, G.Ih)) || G.wfmt == QT_GGUF);
+                ((G_src_planar && G.wfmt == 4 && G.egs == 64 && coli_cuda_planar_rows(G.dev[0], G.D, G.Ih)) ||
+                 (!G_src_planar && G.wfmt == 4) || G.wfmt == QT_GGUF);
     return G_host_on;
 }
+/* Why the host pool is off, NULL when it is on (or the tier is): the startup says it, since a
+ * prompt chunk's experts outside VRAM then take the host's step, a long prompt ten times slower. */
+const char *qt_chain_host_off(void){
+    if(!G.on || G_trunk_only || host_pool_on()) return NULL;
+    const char *e = getenv("COLI_CUDA_HOST_POOL");
+    if(e && *e == '0') return "COLI_CUDA_HOST_POOL=0";
+    if(G_stream) return "the RAM holds fewer than every expert";
+    if(G.ndev != 1) return "more than one device";
+    if(G.wfmt == 1) return "int8 experts";
+    if(G.wfmt == 8) return "fp8 experts";
+    if(G.wfmt == 4 && G_src_planar) return "planar int4 the device's GEMMs do not read at these widths";
+    return "the experts' format";
+}
+/* the host pool's int4 in expert_ffn.h's planar blocks (else in pairs, as the residents hold it) */
+int qt_chain_host_planar(void){ return G.on && G_host_on > 0 && G.wfmt == 4 && G_src_planar; }
 /* a host pool expert's bytes: its matrices (three of mb, a GGUF's gate, up and down) and scales */
 static size_t host_w_bytes(int layer){ return G.wfmt == QT_GGUF ? 2*G_gmb[layer] + G_gmbd[layer] : 3*((size_t)G.D*G.Ih/2); }
 static size_t host_s_bytes(void){ return G.wfmt == QT_GGUF ? 0 : (2*G.sc_gu + G.sc_d)*sizeof(float); }
@@ -1476,17 +1564,40 @@ int qt_chain_host(int layer,int eid,const void **w,size_t *wb,const float **sc,s
     return r;
 }
 int qt_chain_host_count(void){ return G.on && G_host_on > 0 ? (int)G_host_n : 0; }
+/* Every expert in the pool: the residents' copies too, the slots' own (qt_note_planned kept
+ * them), page-locked once the warm start's loop has done the non-residents. An expert the card
+ * lets go (a promotion, a swap, the KV mirrors' give-back) is then in the pool already, for a
+ * prompt chunk of any size, and the follow below has nothing to do. The residents come last: if
+ * the page-locks run out, those of the experts the pool is for are taken. The follow is turned
+ * off (G_host_all) only if every expert with a RAM copy ended up in the pool: with one left out
+ * (a page-lock refused) it stays on, as before this existed, so that an expert leaving the card
+ * still joins. 1 when the pool holds them all. Cleared at the exit. */
+int qt_chain_host_all(void){
+    if(!G.on || !host_pool_on()) return 0;
+    for(int i=0; i<G.nl*G.ne; i++){
+        pthread_mutex_lock(&G.mx);
+        const QSlot c = G.slot[i];
+        pthread_mutex_unlock(&G.mx);
+        if(!c.hreg && c.g4) qt_note_host(i/G.ne, i%G.ne, c.g4, c.u4, c.d4, c.gs, c.us, c.ds);
+    }
+    int out = 0;
+    pthread_mutex_lock(&G.mx);
+    for(int i=0; i<G.nl*G.ne; i++) out += G.slot[i].g4 && !G.slot[i].hreg;
+    G_host_all = out == 0;
+    pthread_mutex_unlock(&G.mx);
+    return G_host_all;
+}
 /* The pool follows the residents. The warm start page-locks the experts it leaves in RAM; the
  * chain's promotions and the tier's LFRU swaps then trade experts between the card and the RAM, and
  * the pool kept its first set: an expert that left the card was not in it, so a prompt chunk's
  * layer holding one went to the host's step whole (q36cc_stage_table), and one that came in kept
  * its RAM page-locked for nothing. Before a large prompt chunk (Q36CC_FOLLOW_ROWS) the chain calls
  * this: the non-residents join the pool, the residents leave it; the CUDA calls outside the lock,
- * as in qt_note_host.
+ * as in qt_note_host. Nothing when the pool holds every expert (qt_chain_host_all).
  * 1 when the pool changed; *joined and *left say how many. */
 int qt_chain_host_follow(int *joined,int *left){
     *joined=*left=0;
-    if(!G.on || G_host_on <= 0) return 0;
+    if(!G.on || G_host_on <= 0 || G_host_all) return 0;
     size_t n = (size_t)G.nl*G.ne, mb = (size_t)G.D*G.Ih/2, sb = (2*G.sc_gu + G.sc_d)*sizeof(float);
     int *mv = malloc(n*sizeof(int)), nj = 0, nl = 0;   /* the joins from the front, the leaves from the back */
     if(!mv) return 0;
@@ -1685,6 +1796,129 @@ int qt_chain_changes(int *idx,int max,int *overflow){
     return n;
 }
 uint64_t qt_chain_promoted(void){ return G.on ? G.promo_done : 0; }
+/* Device memory back from the tier for the chain's KV mirrors (#2734): residents leave the card,
+ * their buffers freed, and the budget comes down by as much, so neither the swaps nor the
+ * promotions fill it again. Under CUDA_EXPERT_GB=auto the tier fills the card, and a long
+ * prompt's mirrors then took what the chain's scratch and the driver needed: on an 8 GB card
+ * a 44K-token prompt ran out of memory mid-step and every later step went to the CPU. The
+ * experts given back compute on the CPU from their RAM copy (qt_evicted_take: an int4
+ * container's int8 again), and join the host pool before the next large prompt chunk
+ * (qt_chain_host_follow), or are in it already (qt_chain_host_all).
+ *
+ * The driver packs allocations under 2 MiB into 2 MiB pages and releases a page only when
+ * nothing in it is left: an expert's matrices are 512 KiB each on Qwen3.6, so the coldest
+ * residents, spread over the card, freed 142 MB of them and not a byte of free memory. With
+ * addr (a tensor's device address, from the chain) the residents are taken by page, as the
+ * Vulkan tier gives back whole blocks: pages its matrices fill (four of 512 KiB) before any
+ * other, each pick the page whose release costs the fewest residents still on the card (one
+ * each plus its routes and heat), every resident with a matrix in it out, until the picked
+ * pages hold `bytes`. Picking the coldest pages took the pages with one resident in, whose
+ * other allocations kept them: 261 MB of experts gave the chain 6 MB. Without addr, the
+ * coldest residents.
+ * Between the chain's forwards (no group, no forward, no upload in flight); the chain reads the
+ * moves at its next step (qt_chain_epoch). A GGUF's arena keeps its one allocation: nothing
+ * back. Returns the bytes the experts given back held. */
+#define QT_GB_PAGE_SHIFT 21
+typedef struct { uintptr_t page; int ci; size_t bytes; } QtGbRef;   /* a matrix's bytes in a page */
+static int cmp_gb_ref(const void *a, const void *b){
+    const QtGbRef *x = a, *y = b;
+    return x->page < y->page ? -1 : x->page > y->page ? 1 : x->ci - y->ci;
+}
+typedef struct { size_t at, n, cover; } QtGbPage;   /* a page's refs (ref[at], n of them) and the bytes they cover */
+
+size_t qt_chain_give_back(size_t bytes, int (*addr)(const struct ColiCudaTensor *t, uintptr_t *at)){
+    if(!G.on || G_trunk_only || G_arena_on || G.ndev != 1 || !bytes) return 0;
+    size_t n = (size_t)G.nl*G.ne;
+    int *cand = malloc(n*sizeof(int));
+    ColiCudaTensor **ft = malloc(3*n*sizeof *ft);
+    uint8_t *out_of = calloc(n, 1);
+    QtGbRef *ref = addr ? malloc(6*n*sizeof *ref) : NULL;   /* a matrix in two pages at most (none passes 2 MiB) */
+    QtGbPage *pg = addr ? malloc(6*n*sizeof *pg) : NULL;
+    if(!cand || !ft || !out_of || (addr && (!ref || !pg))){ free(cand); free(ft); free(out_of); free(ref); free(pg); return 0; }
+    pthread_mutex_lock(&G.mx);
+    while((G.issue_open || G.chain_hold || G.uploading) && !G.th_stop) wait_take_locked();
+    int nc = 0, nf = 0, out = 0, pages = 0;
+    size_t freed = 0;
+    if(!G.th_stop){
+        for(size_t i = 0; i < n; i++){
+            const QSlot *x = &G.slot[i];
+            if(x->resident && !x->queued && x->tg && x->tu && x->td) cand[nc++] = (int)i;
+        }
+        size_t nr = 0;
+        const size_t page = (size_t)1 << QT_GB_PAGE_SHIFT;
+        for(int k = 0; addr && k < nc; k++){
+            const QSlot *x = &G.slot[cand[k]];
+            const int l = cand[k] / G.ne;
+            ColiCudaTensor *t3[3] = {x->tg, x->tu, x->td};
+            const size_t mb3[3] = {qt_mb_gu(l), qt_mb_gu(l), qt_mb_d(l)};
+            for(int j = 0; j < 3; j++){
+                uintptr_t at;
+                if(!addr(t3[j], &at) || mb3[j] > page) continue;
+                const uintptr_t p0 = at >> QT_GB_PAGE_SHIFT, p1 = (at + mb3[j] - 1) >> QT_GB_PAGE_SHIFT;
+                const size_t in0 = p0 == p1 ? mb3[j] : (size_t)(((p0 + 1) << QT_GB_PAGE_SHIFT) - at);
+                ref[nr++] = (QtGbRef){p0, cand[k], in0};
+                if(p1 != p0) ref[nr++] = (QtGbRef){p1, cand[k], mb3[j] - in0};
+            }
+        }
+        if(nr){   /* by page: the coldest pages' residents */
+            qsort(ref, nr, sizeof *ref, cmp_gb_ref);
+            size_t np = 0;
+            for(size_t a = 0; a < nr; ){
+                size_t b = a, cov = 0;
+                for(; b < nr && ref[b].page == ref[a].page; b++) cov += ref[b].bytes;
+                pg[np++] = (QtGbPage){a, b - a, cov};
+                a = b;
+            }
+            /* greedy: the page whose release costs the fewest residents still on the card (their
+             * routes and heat), a page the tier's matrices fill before any other; the residents a
+             * pick takes out leave their other matrices' pages cheaper, so an expert's three go
+             * together where they lie side by side */
+            uint8_t *took = calloc(np, 1);
+            while(took && (size_t)pages * page < bytes){
+                size_t best = np; double bc = 0; int bf = 0; size_t bcov = 0;
+                for(size_t q = 0; q < np; q++){
+                    if(took[q]) continue;
+                    double c = 0;
+                    for(size_t r = pg[q].at; r < pg[q].at + pg[q].n; r++)
+                        if(!out_of[ref[r].ci] && (r == pg[q].at || ref[r].ci != ref[r-1].ci)) c += 1.0 + (double)pm_score(&G.slot[ref[r].ci]);
+                    const int f = pg[q].cover >= page;
+                    if(best == np || f > bf || (f == bf && (f ? c < bc : (pg[q].cover > bcov || (pg[q].cover == bcov && c < bc))))){
+                        best = q; bc = c; bf = f; bcov = pg[q].cover;
+                    }
+                }
+                if(best == np) break;
+                took[best] = 1; pages++;
+                for(size_t r = pg[best].at; r < pg[best].at + pg[best].n; r++) out_of[ref[r].ci] = 1;
+            }
+            free(took);
+        } else {   /* the coldest residents */
+            qsort(cand, (size_t)nc, sizeof(int), cmp_pm);   /* the hottest first: taken from the end */
+            size_t want = 0;
+            for(int k = nc - 1; k >= 0 && want < bytes; k--){ out_of[cand[k]] = 1; want += qt_ebytes(cand[k] / G.ne); }
+        }
+        for(int k = 0; k < nc; k++){
+            if(!out_of[cand[k]]) continue;
+            QSlot *x = &G.slot[cand[k]];
+            ft[nf++] = x->tg; ft[nf++] = x->tu; ft[nf++] = x->td; x->tg = x->tu = x->td = NULL;
+            res_set(x, 0); evict_note_locked(cand[k]);
+            size_t eb = qt_ebytes(cand[k] / G.ne);
+            G.used[0] = G.used[0] > eb ? G.used[0] - eb : 0;
+            freed += eb; out++;
+        }
+        G.budget[0] = G.budget[0] > freed ? G.budget[0] - freed : 0;
+        if(G.budget[0] < G.used[0]) G.budget[0] = G.used[0];
+    }
+    pthread_mutex_unlock(&G.mx);
+    for(int k = 0; k < nf; k++) coli_cuda_tensor_free(ft[k]);
+    free(cand); free(ft); free(out_of); free(ref); free(pg);
+    if(out){
+        char by[64] = "";
+        if(pages) snprintf(by, sizeof by, ", the residents of %d pages of 2 MiB", pages);
+        fprintf(stderr, "[qtier] dev %d: %.2f GiB of experts back for the chain's KV mirrors (%d experts to the CPU%s; "
+                        "the tier's budget now %.2f GB)\n", G.dev[0], freed/1073741824.0, out, by, G.budget[0]/1073741824.0);
+    }
+    return freed;
+}
 /* The arena of a GGUF's experts on the tier's one device, for a chain that takes it over
  * (qt_chain_own): its base, a slot's bytes, the up and down rows' offsets in a slot (gate at
  * 0), its slots; 0 without an arena. qt_chain_slot: the slot expert eid of layer holds, -1
@@ -1694,6 +1928,13 @@ uint64_t qt_chain_promoted(void){ return G.on ? G.promo_done : 0; }
 int qt_chain_arena(void **base,size_t *slot,size_t *off_u,size_t *off_d,int *nslots){
     if(!G.on || G.ndev!=1 || G.wfmt!=QT_GGUF || !G_arena_on || !G_arena[0] || G_exact) return 0;   /* slots of one size only */
     *base=G_arena[0]; *slot=G_aslot; *off_u=G_aoff_u; *off_d=G_aoff_d; *nslots=G_aslots[0];
+    return 1;
+}
+int qt_chain_arena_exact(QtChainArena *a){
+    if(!G.on || G.ndev!=1 || G.wfmt!=QT_GGUF || !G_arena_on || !G_arena[0] || !G_exact || !a) return 0;
+    a->base=G_arena[0]; a->bytes=(size_t)G_aslots[0]*256u; a->bump=G_abump; a->nl=G.nl; a->ncls=G_ncls;
+    a->lsl=G_lsl; a->lou=G_lou; a->lod=G_lod; a->lcls=G_lcls;
+    a->cfree=(const size_t *const *)G_cfree; a->cnfree=G_cnfree;
     return 1;
 }
 int qt_chain_slot(int layer,int eid){
@@ -2092,6 +2333,16 @@ void qt_stats_mark(void){
     pthread_mutex_unlock(&G.mx);
 }
 
+int qt_counters(QtCounters *out){
+    memset(out,0,sizeof *out);
+    if(!G.on) return 0;
+    pthread_mutex_lock(&G.mx);
+    for(int i=0;i<G.ndev;i++) out->hits+=G.hits[i];
+    out->miss=G.miss; out->uploads=G.uploads; out->swaps=G.swaps; out->q_full_skips=G.q_full_skips;
+    pthread_mutex_unlock(&G.mx);
+    return 1;
+}
+
 static void qt_lfru_tick_locked(void){
     if(G_chain_own) return;   /* the chain's to move */
     size_t n=(size_t)G.nl*G.ne;
@@ -2321,7 +2572,7 @@ void qt_shutdown(void){
     memset(G.is_cnt,0,sizeof G.is_cnt);
     G.on=0;
     G_fp8_stream=0; G_stream=0; G_trunk_only=0; G_src_planar=0;
-    G_host_on=-1; G_host_n=G_host_bytes=0;
+    G_host_on=-1; G_host_all=0; G_host_n=G_host_bytes=0;
     coli_cuda_shutdown();
 }
 

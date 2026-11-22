@@ -1,0 +1,13 @@
+# Deps for the Inkling-2-Mini tiny-model oracle (tools/make_tiny_inkling2_loop.py): the ci.yml
+# `inkling2-loop-oracle` job and the vulkan-engines job's inkling2 family install exactly this
+# file (its Inkling2ForCausalLM gives the Inkling-2 fixtures the engine was checked against too).
+# transformers has Inkling2LoopForCausalLM (models/inkling2_loop) only in its pull request 51050,
+# open when this was written, so it is pinned to that pull request's head, the commit the oracle
+# was built against; move to main once it is merged, and to the first release that carries it.
+--index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://pypi.org/simple
+torch
+transformers @ git+https://github.com/huggingface/transformers@6173a2f679ff4ed393afc499aefc569da7e68bc1
+safetensors
+numpy
+gguf>=0.19   # tests/vulkan_engines.sh inkling2's GGUF fixtures

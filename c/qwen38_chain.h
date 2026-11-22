@@ -99,6 +99,7 @@ typedef struct {
     VkcBuf *ones;                     /* rows x C ones: the head's fc_embedding row added to each stream */
     VkcDmoe dm_mtp;                   /* the head's routed experts in the frame (its layer whole in the tier) */
     unsigned long long mtp_rows;      /* the head's rows run here */
+    unsigned long long pc_took, pc_staged;   /* prompts whose host pool experts the CPU computed, and those staged (q38c_pc_take) */
 } Q38Chain;
 /* the MTP head's layer on the device beside the full chain (q38c_mtp_rows); Q38_MTP_CHAIN=0:
  * on the CPU, as before */
@@ -228,19 +229,31 @@ static int q38c_mirror(Q38Chain *ch, Model *m) {
     int nbmax = m->kv_cap / (c->idx_ratio > 0 ? c->idx_ratio : 1) + 1;
     if (ch->cap != m->kv_cap) {   /* the host cache is new: mirror it again (K/V whole, or split past the budget) */
         size_t row = (size_t)kvo * 2 * 4;
+        /* The index keys and the pooled keys are sized by the cache's capacity and take no
+         * part in the split, so they go up before the plan: vkc_kv_plan budgets K/V from the
+         * device memory that is left, and its margin (a fifth) stays free for the prompt
+         * chunk's scratch. Planned first, K/V took four fifths of the memory these buffers
+         * were about to need too: at 60000 positions they are 439 MiB, the whole margin, and
+         * vkc_chunk_rows then found nothing and cut the prompt into chunks of one row. */
+        for (int i = ch->lo; i < ch->lo + ch->nl + (ch->mtp_on ? 1 : 0); i++) {
+            if (!q38c_attn_at(c, i)) continue;
+            vkc_free(ch->ik[i]); vkc_free(ch->pk[i]);
+            ch->kv_valid[i] = ch->pk_valid[i] = 0;
+            ch->ik[i] = vkc_buf((size_t)c->idx_dim * m->kv_cap * 4, VKC_DEV);
+            ch->pk[i] = vkc_buf((size_t)c->idx_dim * nbmax * 4, VKC_DEV);
+            if (!ch->ik[i] || !ch->pk[i]) { ch->cap = 0; return 0; }
+        }
         int plan = ch->n_attn ? vkc_kv_plan(&ch->ks, q38c_name(ch), ch->n_attn, row, m->kv_cap, 1, 1,
                                             (size_t)ch->n_attn * ch->dev_rows * row) : 1;
         if (!plan) { ch->cap = 0; return 0; }
         ch->dev_rows = ch->ks.on ? ch->ks.rows : m->kv_cap;
         for (int i = ch->lo; i < ch->lo + ch->nl + (ch->mtp_on ? 1 : 0); i++) {
             if (!q38c_attn_at(c, i)) continue;
-            vkc_free(ch->kc[i]); vkc_free(ch->vc[i]); vkc_free(ch->ik[i]); vkc_free(ch->pk[i]);
-            ch->kv_valid[i] = ch->pk_valid[i] = 0;
+            vkc_free(ch->kc[i]); vkc_free(ch->vc[i]);
+            ch->kv_valid[i] = 0;
             ch->kc[i] = vkc_buf((size_t)kvo * ch->dev_rows * 4, VKC_DEV);
             ch->vc[i] = vkc_buf((size_t)kvo * ch->dev_rows * 4, VKC_DEV);
-            ch->ik[i] = vkc_buf((size_t)c->idx_dim * m->kv_cap * 4, VKC_DEV);
-            ch->pk[i] = vkc_buf((size_t)c->idx_dim * nbmax * 4, VKC_DEV);
-            if (!ch->kc[i] || !ch->vc[i] || !ch->ik[i] || !ch->pk[i]) { ch->cap = 0; return 0; }
+            if (!ch->kc[i] || !ch->vc[i]) { ch->cap = 0; return 0; }
         }
         ch->cap = m->kv_cap;
     }
@@ -646,6 +659,9 @@ static void q38c_prewarm(Model *m, const Q38Chain *ch) {
     }
     pw.moe_d = c->hidden; pw.moe_i = c->inter;
     pw.ex_ours = c->experts > 0 && !g_q38_gguf;   /* our formats' experts: their grouped GEMMs */
+    /* and the formats q38_vk_tier_start gives them on the device: experts-int4g64/'s 4; the
+     * low-bit, FP8, BF16 and f32 ones and the MTP head's none of their own (bit 0) */
+    if (pw.ex_ours) pw.moe_fmts = (m->x4 && !m->x4->lb ? 1u << 4 : 1u) | (m->mtp ? 1u : 0u);
     /* a GGUF's experts, as the file has them: a prompt chunk's grouped GEMMs (vk_dmoe.h) */
     for (int i = 0; g_q38_gguf && i < c->layers; i++) {
         const char *kn[2] = {"ffn_gate_exps", "ffn_down_exps"};
@@ -1183,11 +1199,55 @@ static void q38c_kv_down(Q38Chain *ch, Model *m, int i, int n, int pb) {
  * alone (a verify's rows keep a decode step's bits). The books follow at the frame's end
  * from the ids: the history (rt_count), HITS and the tier's heat. Off with ROUTE_TRACE,
  * the CUDA tier, and on the second device. */
-static int q38c_dmoe(Q38Chain *ch, Model *m, int rows) {
+/* COLI_VK_CHAIN_POOL_CPU_ROWS: a prompt of up to this many rows may have the CPU compute its host
+ * pool experts beside the device's (vk_dmoe.h's hybrid steps, pc_prompt) instead of staging them
+ * (q38c_pc_take decides); 0 stages them as before */
+#define Q38C_PC_ROWS 2048
+static int q38c_pc_rows(void) {
+    static int r = -1;
+    if (r < 0) { const char *e = getenv("COLI_VK_CHAIN_POOL_CPU_ROWS"); r = e && *e ? atoi(e) : Q38C_PC_ROWS; if (r < 0) r = 0; }
+    return r;
+}
+/* the CPU where its estimate is at most this many times the staging's copy (qwen38_cuda_chain.h's
+ * Q38CC_PC_BUS, the same reason) */
+#define Q38C_PC_BUS 1.5
+/* A prompt of S rows: the CPU's pairs where its estimate (the rows' pairs by the host pool's share
+ * of the routes, the books' once there are enough, else the history's, at the measured time a
+ * pair, the prompts' own once there are some) is at most Q38C_PC_BUS times the copy of what a
+ * chunk stages at the measured rate (vkc_dmoe_pc_probe); with nothing staging, the GEMMs would
+ * read the host pool over the bus: the CPU */
+static int q38c_pc_take(Q38Chain *ch, Model *m, int S, int rows) {
+    VkcDmoe *d = &ch->dm;
+    if (S <= VKC_DMOE_ROWS || S > q38c_pc_rows() || !vkt_host_pool_on() || !d->hybrid || !d->ev || !d->hx) return 0;
+    vkc_dmoe_pc_probe(d);
+    if (!vkc_dmoe_pc_ready(d, rows)) return 0;
+    if (!d->stg_on || d->pc_bus_gbs <= 0 || d->pc_pair_us <= 0) return 1;
+    const Cfg *c = &m->c; int E = d->E;
+    double frac = 0;
+    if (d->pc_routes >= 100000) frac = (double)d->pc_pool / (double)d->pc_routes;
+    else {   /* the history's routes to the host pool's experts */
+        uint32_t **hist = rt_counts_all(); double hp = 0, ha = 0;
+        for (int i = 0; hist && i < d->L; i++) for (int e = 0; hist[d->lo + i] && e < E; e++) {
+            double n = hist[d->lo + i][e]; ha += n; if (d->hx[(size_t)i * E + e].g) hp += n;
+        }
+        frac = ha > 0 ? hp / ha : 0;
+    }
+    const VkcHyb *w = &g_vkc_hyb;
+    const double us = w->big_pairs >= 2000 ? w->big_ms * 1e3 / (double)w->big_pairs : d->pc_pair_us;
+    const double cpu_ms = (double)S * c->topk * d->L * frac * us / 1e3, bus_ms = d->pc_stage_bytes / d->pc_bus_gbs / 1e6;
+    return cpu_ms <= Q38C_PC_BUS * bus_ms;
+}
+static int q38c_dmoe(Q38Chain *ch, Model *m, int rows, int S) {
     Cfg *c = &m->c;
     if (ch->d || c->experts <= 0 || rt_fp || qt_ready()) return 0;
     ch->dm.big = 1;   /* a prompt chunk too: a GGUF's experts and ours through the grouped GEMMs */
-    return vkc_dmoe_prepare(&ch->dm, ch->lo, ch->nl, c->experts, c->topk, c->hidden, c->inter, rows);
+    ch->dm.pc_prompt = 0;
+    int ok = vkc_dmoe_prepare(&ch->dm, ch->lo, ch->nl, c->experts, c->topk, c->hidden, c->inter, rows);
+    if (ok && rows > VKC_DMOE_ROWS) {   /* the tables read: the choice for this prompt */
+        ch->dm.pc_prompt = q38c_pc_take(ch, m, S, rows);
+        if (ch->dm.pc_prompt) ch->pc_took++; else ch->pc_staged++;
+    }
+    return ok;
 }
 static void q38c_dmoe_done(Q38Chain *ch, Model *m, int from, int to, int n, int pb) {
     Cfg *c = &m->c; int K = c->topk;
@@ -1198,6 +1258,10 @@ static void q38c_dmoe_done(Q38Chain *ch, Model *m, int from, int to, int n, int 
         for (int s = 0; s < n; s++) rt_count(i, ids + s * K, K);
         for (int j = 0; j < n * K; j++) if (ids[j] >= 0) q38_ehit_mark(m, i, ids[j]);
         vkt_dev_count(i, n, K, ids);
+        if (ch->dm.hybrid && ch->dm.hx) {   /* the routes the host pool served (q38c_pc_take's share) */
+            const VktHostExpert *hx = ch->dm.hx + (size_t)(i - ch->dm.lo) * c->experts;
+            for (int j = 0; j < n * K; j++) if (ids[j] >= 0 && ids[j] < c->experts) { ch->dm.pc_routes++; ch->dm.pc_pool += hx[ids[j]].g != NULL; }
+        }
     }
 }
 
@@ -1211,16 +1275,17 @@ static void q38c_dmoe_done(Q38Chain *ch, Model *m, int from, int to, int n, int 
  * chunk is a frame of its own, waited for: the host's tables it writes (RoPE's angles, the
  * PLE rows, the pooled keys' angles) and its K/V rows down are a chunk's as before, and each
  * chunk gets the bits it gets chunk by chunk (the same ops on the same rows, the MoE's sum
- * added at the layer's end rather than the next one's start). Not taken with a verify's
- * copies, a split KV mirror, a partial chain or the streams wanted back.
+ * added at the layer's end rather than the next one's start). The rows' final streams, where
+ * the caller wants them (an MTP head's prefill), come back as chunk by chunk, each chunk's after
+ * the last layer. Not taken with a verify's copies, a split KV mirror or a partial chain.
  * Taken where the host pool's experts stage (a GGUF's block types: vk_dmoe.h); without
  * staging a chunk reads them over the bus either way. COLI_VK_CHAIN_LAYERWISE=0 keeps
  * the chunks, =1 takes it without staging too (tests). */
 static int q38c_lm_layers(Model *m, Q38Chain *ch, const int *ids, int S, int pos_base, int nlogits,
-                          const float *hyper_h, int rows, const float *cs_all);
+                          float *hyper_h, int want_streams, int rows, const float *cs_all);
 /* 1 done, 0 declined before any layer ran (the chunks then, in the frame begun here), -1 lost */
 static int q38c_forward_lm(Model *m, Q38Chain *ch, const int *ids, int S, int pos_base, int nlogits,
-                           const float *hyper_h, float *logit, int rows) {
+                           float *hyper_h, int want_streams, float *logit, int rows) {
     Cfg *c = &m->c; int W = c->hc_width, lo = ch->lo, hi = lo + ch->nl, V = c->vocab;
     int half = c->rotary_dim / 2;
     if (!vkc_begin() || !vkc_dmoe_upload(&ch->dm)) return -1;
@@ -1234,7 +1299,7 @@ static int q38c_forward_lm(Model *m, Q38Chain *ch, const int *ids, int S, int po
         float ang = (float)(pos_base + r) / powf(c->theta, (float)(2 * j) / c->rotary_dim);
         cs_all[((size_t)r * half + j) * 2] = cosf(ang); cs_all[((size_t)r * half + j) * 2 + 1] = sinf(ang);
     }
-    int r = q38c_lm_layers(m, ch, ids, S, pos_base, nlogits, hyper_h, rows, cs_all);
+    int r = q38c_lm_layers(m, ch, ids, S, pos_base, nlogits, hyper_h, want_streams, rows, cs_all);
     free(cs_all);
     if (r <= 0 || r == 2) return r;
     memcpy(logit, vkc_ptr(ch->outd), (size_t)nlogits * V * sizeof(float));
@@ -1243,7 +1308,7 @@ static int q38c_forward_lm(Model *m, Q38Chain *ch, const int *ids, int S, int po
 }
 /* q38c_forward_lm's layers: 1 done, -1 lost */
 static int q38c_lm_layers(Model *m, Q38Chain *ch, const int *ids, int S, int pos_base, int nlogits,
-                          const float *hyper_h, int rows, const float *cs_all) {
+                          float *hyper_h, int want_streams, int rows, const float *cs_all) {
     Cfg *c = &m->c; int H = c->hidden, W = c->hc_width, lo = ch->lo, hi = lo + ch->nl, V = c->vocab, E = c->experts;
     int half = c->rotary_dim / 2;
     const int SEG = (q38c_lm_rows() / rows > 0 ? q38c_lm_rows() / rows : 1) * rows;
@@ -1283,6 +1348,7 @@ static int q38c_lm_layers(Model *m, Q38Chain *ch, const int *ids, int S, int pos
                     ok = vkc_begin() && vkc_dmoe_upload(&ch->dm) && q38c_moe_apply(ch, m, n, ch->routed);
                 }
                 ok = ok && vkc_copy(ch->hyper_all, (size_t)(c0 - g0) * W, ch->hyper, 0, (size_t)n * W);
+                if (ok && want_streams && i == hi - 1) ok = vkc_copy(ch->hypd, 0, ch->hyper, 0, (size_t)n * W);   /* q38c_forward reserved it */
                 /* after the last layer, the head on this chunk's share of the last nlogits rows */
                 int lo0 = S - nlogits > c0 ? S - nlogits - c0 : 0, lo_n = n - lo0;
                 if (ok && i == hi - 1 && lo0 < n && c0 + n > S - nlogits) {
@@ -1294,6 +1360,7 @@ static int q38c_lm_layers(Model *m, Q38Chain *ch, const int *ids, int S, int pos
                 ok = ok && vkc_submit(1);
                 m->timers.seconds[Q38_TM_DENSE_MATMUL] += now_s() - t0;
                 if (!ok) return -1;
+                if (want_streams && i == hi - 1) memcpy(hyper_h + (size_t)c0 * W, vkc_ptr(ch->hypd), (size_t)n * W * 4);   /* the frame is done */
                 if (dl) q38c_dmoe_done(ch, m, i, i + 1, n, pb);
                 if (c->is_attn[i]) { ch->kv_valid[i] = pb + n; vkc_kv_done(&ch->ks, ch->attn_ord[i], pb + n); }
                 ch->dn_where = Q38C_DEV; ch->host_zero = 0;
@@ -1335,10 +1402,10 @@ static int q38c_forward_seg(Model *m, Q38Chain *ch, const int *ids, int S, int p
     }
     int half = c->rotary_dim / 2;
     vkc_gemm_rows(g_q38_rowwise ? 0 : -1);   /* a verify's rows get a decode step's bits */
-    int snapped = 0, dmoe = q38c_dmoe(ch, m, rows);
-    if (dmoe && S > rows && q38c_layer_major() && ch->head && !want_streams && !mixed_h && !ch->ks.on &&
-        m->snap_rows <= 0 && vkt_host_pool_on()) {
-        int r = q38c_forward_lm(m, ch, ids, S, pos_base, nlogits, hyper_h, logit, rows);
+    int snapped = 0, dmoe = q38c_dmoe(ch, m, rows, S);
+    if (dmoe && S > rows && q38c_layer_major() && ch->head && !mixed_h && !ch->ks.on &&
+        m->snap_rows <= 0 && vkt_host_pool_on() && !ch->dm.pc_prompt) {
+        int r = q38c_forward_lm(m, ch, ids, S, pos_base, nlogits, hyper_h, want_streams, logit, rows);
         if (r < 0) goto lost;
         if (r == 2) { vkc_gemm_rows(-1); return 0; }   /* stopped: not taken */
         if (r > 0) { ch->snap_valid = 0; vkc_gemm_rows(-1); ch->forwards++; return 1; }
@@ -1635,6 +1702,10 @@ static void q38c_report(Model *m) {
                             "(COLI_VK_CHAIN_LAYERWISE=0: chunk by chunk)\n", q38c_name(ch), ch->lm_forwards);
         vkc_kv_report(&ch->ks);
         vkc_dmoe_hyb_report(q38c_name(ch), &ch->dm);
+        if (ch->pc_took || ch->pc_staged)
+            fprintf(stderr, "[VK] %s chain: %llu prompts' host pool experts on the CPU, %llu staged (the measures: the staging %.1f GB/s, "
+                            "%.2f GB a chunk, %.1f us a pair on the CPU; COLI_VK_CHAIN_POOL_CPU_ROWS=0 stages every prompt)\n",
+                    q38c_name(ch), ch->pc_took, ch->pc_staged, ch->dm.pc_bus_gbs, ch->dm.pc_stage_bytes / 1e9, ch->dm.pc_pair_us);
         vkc_prof_print();
         vkc_device(was);
     }

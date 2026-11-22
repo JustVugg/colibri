@@ -141,6 +141,25 @@ class Qwen3CoderTemplateTest(unittest.TestCase):
                                                     add_generation_prompt=False)
         self.assertEqual(got, full[:-len("<|im_end|>\n")])
 
+    def test_a_call_after_one_newline_renders_as_generated(self):
+        # Qwen3-Coder often writes its text, ONE newline, then <tool_call>; the reply's
+        # content keeps that newline. Sent back untrimmed, the turn must render as it was
+        # generated, or the next request differs from the engine's state by a token and
+        # prefix reuse misses (the whole conversation is read again).
+        call = {"id": "c1", "type": "function",
+                "function": {"name": "search", "arguments": '{"query": "x"}'}}
+        user = {"role": "user", "content": "find x"}
+        generated = openai_server.render_chat_qwen3_coder(
+            [user, {"role": "assistant", "content": "Let me look.\n", "tool_calls": [call]}],
+            tools=[SEARCH], add_generation_prompt=False)
+        self.assertIn("<|im_start|>assistant\nLet me look.\n<tool_call>\n", generated)
+        # Trimmed, or with the template's own blank line, it is still the template.
+        for content in ("Let me look.", "Let me look.\n\n"):
+            got = openai_server.render_chat_qwen3_coder(
+                [user, {"role": "assistant", "content": content, "tool_calls": [call]}],
+                tools=[SEARCH], add_generation_prompt=False)
+            self.assertIn("<|im_start|>assistant\nLet me look.\n\n<tool_call>\n", got)
+
     def test_tool_choice_none_offers_no_tools(self):
         got = openai_server.render_chat_qwen3_coder([{"role": "user", "content": "x"}],
                                                     tools=[WEATHER], tool_choice="none")

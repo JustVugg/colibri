@@ -132,6 +132,26 @@ CONFIG = {
     "eos_token_id": EOS_ID,
 }
 
+# --k31: Kimi K3.1, the same model with DeepSeek Sparse Attention on its gated MLA layers
+# (text_config.dsa_config in the real checkpoint; this flat config carries it at the top).
+# index_topk is 4, so a prompt past 4 tokens already attends to a selection: the test
+# exercises the indexer on short sequences. The indexer's weights come from their own
+# generator (K31_SEED), after every K3 weight, so the K3 tensors stay byte-identical.
+K31_SEED = 20261108
+IDX_HEADS = 4
+IDX_HD = 16
+IDX_TOPK = 4
+K31_DSA = {
+    "index_head_dim": IDX_HD,
+    "index_num_heads": IDX_HEADS,
+    "index_topk": IDX_TOPK,
+    "index_rope_dim": 0,
+    "index_k_norm_type": "layernorm",
+    "index_skip_topk_offset": 1,
+    "index_topk_freq": 1,
+    "dsa_layers": [x for x in range(1, LAYERS + 1) if x not in KDA_LAYERS],
+}
+
 ST_DTYPE = {np.dtype("float32"): "F32", np.dtype("uint8"): "U8"}
 
 
@@ -250,6 +270,18 @@ def build_tensors(rng):
     return tensors
 
 
+def add_k31_indexer(tensors, rng):
+    """K3.1's indexer on every dsa_layers layer (1-indexed): wq_b reads the q_lora
+    latent, wk and weights_proj the attention input, k_norm is a LayerNorm with bias."""
+    for x in K31_DSA["dsa_layers"]:
+        a = f"model.layers.{x - 1}.self_attn.indexer."
+        tensors[a + "wq_b.weight"] = (rng.standard_normal((IDX_HEADS * IDX_HD, Q_RANK)) * 0.3).astype(np.float32)
+        tensors[a + "wk.weight"] = (rng.standard_normal((IDX_HD, HIDDEN)) * 0.3).astype(np.float32)
+        tensors[a + "k_norm.weight"] = (1.0 + rng.standard_normal(IDX_HD) * 0.1).astype(np.float32)
+        tensors[a + "k_norm.bias"] = (rng.standard_normal(IDX_HD) * 0.1).astype(np.float32)
+        tensors[a + "weights_proj.weight"] = (rng.standard_normal((IDX_HEADS, HIDDEN)) * 0.3).astype(np.float32)
+
+
 def write_safetensors(path, tensors):
     """Hand-rolled writer: preserves dict insertion order, which the expert
     contiguity contract depends on (the safetensors library reorders)."""
@@ -275,6 +307,8 @@ def main():
     parser.add_argument("--output", default="./kimi_k3_tiny")
     parser.add_argument("--force", action="store_true",
                         help="overwrite an existing model.safetensors")
+    parser.add_argument("--k31", action="store_true",
+                        help="Kimi K3.1: the same weights plus the DSA indexer (dsa_config)")
     args = parser.parse_args()
 
     out = Path(args.output)
@@ -287,8 +321,13 @@ def main():
 
     rng = np.random.default_rng(SEED)
     tensors = build_tensors(rng)
+    config = CONFIG
+    if args.k31:
+        add_k31_indexer(tensors, np.random.default_rng(K31_SEED))
+        config = dict(CONFIG, model_type="kimi_k31",
+                      architectures=["KimiK31ForConditionalGeneration"], dsa_config=K31_DSA)
     write_safetensors(model_path, tensors)
-    (out / "config.json").write_text(json.dumps(CONFIG, indent=2) + "\n")
+    (out / "config.json").write_text(json.dumps(config, indent=2) + "\n")
 
     total = sum(a.nbytes for a in tensors.values())
     print(f"{out}: {len(tensors)} tensors, {total / 1e6:.1f} MB, "

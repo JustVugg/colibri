@@ -249,6 +249,10 @@ SCHEDULER_CONFIG = dict(base_image_seq_len=256, base_shift=0.5, invert_sigmas=Fa
                         max_shift=0.9, num_train_timesteps=1000, shift=1.0, shift_terminal=0.02,
                         stochastic_sampling=False, time_shift_type="exponential", use_beta_sigmas=False,
                         use_dynamic_shifting=True, use_exponential_sigmas=False, use_karras_sigmas=False)
+# --turbo: Qwen-Image-2.1-Turbo's scheduler (a static shift of 1, no terminal stretch) and the
+# eight sigmas its model_index.json names, the schedule at 8 steps
+SCHEDULER_CONFIG_TURBO = dict(SCHEDULER_CONFIG, shift_terminal=None, use_dynamic_shifting=False)
+TURBO_SIGMAS = [1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568]
 MODEL_INDEX = {
     "_class_name": "QwenImage21Pipeline",
     "processor": ["transformers", "Qwen3VLProcessor"],
@@ -285,7 +289,7 @@ def randomize(model: torch.nn.Module, gen: torch.Generator, conv_out_gain: dict 
             p.copy_(v.to(p.dtype))
 
 
-def build_models(out: Path, gen: torch.Generator):
+def build_models(out: Path, gen: torch.Generator, turbo: bool = False):
     from diffusers import AutoencoderKLQwenImage21, FlowMatchEulerDiscreteScheduler, QwenImage21Transformer2DModel
     from transformers import AutoConfig, Qwen3VLForConditionalGeneration
 
@@ -312,10 +316,13 @@ def build_models(out: Path, gen: torch.Generator):
     vae.save_pretrained(str(out / "vae"))
     del vae
 
-    FlowMatchEulerDiscreteScheduler(**SCHEDULER_CONFIG).save_pretrained(str(out / "scheduler"))
+    FlowMatchEulerDiscreteScheduler(**(SCHEDULER_CONFIG_TURBO if turbo else SCHEDULER_CONFIG)).save_pretrained(
+        str(out / "scheduler"))
     import diffusers
-    (out / "model_index.json").write_text(json.dumps({**MODEL_INDEX, "_diffusers_version": diffusers.__version__},
-                                                     indent=2))
+    index = {**MODEL_INDEX, "_diffusers_version": diffusers.__version__}
+    if turbo:
+        index["sample_sigmas"] = TURBO_SIGMAS
+    (out / "model_index.json").write_text(json.dumps(index, indent=2))
 
 
 # ---------------------------------------------------------------- checks
@@ -364,7 +371,8 @@ def crosscheck_pipeline(out: Path, prompt: str, latents_init: torch.Tensor, widt
 
     with torch.no_grad():
         image = pipe(prompt=prompt, latents=latents_init[None], width=width, height=height,
-                     num_inference_steps=steps, true_cfg_scale=1.0, callback_on_step_end=cb).images[0]
+                     num_inference_steps=steps, true_cfg_scale=1.0, sigmas=qref.sample_sigmas(out, steps),
+                     callback_on_step_end=cb).images[0]
     return np.array(image), final["latents"][0].float()
 
 
@@ -379,6 +387,8 @@ def main() -> int:
     ap.add_argument("--prompt", default=PROMPT)
     ap.add_argument("--seed", type=int, default=SEED)
     ap.add_argument("--threads", type=int, default=4)
+    ap.add_argument("--turbo", action="store_true",
+                    help="Qwen-Image-2.1-Turbo's scheduler and sample_sigmas (give --steps 8 for its own schedule)")
     args = ap.parse_args()
     if args.width % 32 or args.height % 32:
         raise SystemExit("width and height must be multiples of 32")
@@ -389,7 +399,7 @@ def main() -> int:
     gen = torch.Generator(device="cpu").manual_seed(args.seed)
 
     write_processor(out / "processor")
-    build_models(out, gen)
+    build_models(out, gen, args.turbo)
     check_storage_dtypes(out)
 
     # reference, from the files just written, in f32

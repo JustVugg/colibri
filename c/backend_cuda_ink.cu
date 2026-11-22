@@ -43,6 +43,11 @@ extern "C" void *ink_cuda_upload(const void *h, size_t n) {
     return d;
 }
 
+extern "C" int ink_cuda_download(void *h, const void *d, size_t n) {
+    return cudaMemcpy(h, d, n, cudaMemcpyDeviceToHost) == cudaSuccess ? 0 : -1;
+}
+extern "C" void ink_cuda_free(void *d) { if (d) cudaFree(d); }
+
 /* 4 warps per block, one output row per warp; lanes stride the contraction
  * dim two bf16 at a time (4-byte coalesced loads of the weight row). */
 __global__ void mm_bf16_kernel(const __nv_bfloat16 * __restrict__ W,
@@ -89,3 +94,8 @@ extern "C" int ink_cuda_matmul_bf16(float *y, const float *x, const void *W, int
     memcpy(y, g_hy, yn);
     return 0;
 }
+
+static const ColiInkCudaOps g_ink_ops = {
+    ink_cuda_init, ink_cuda_free_bytes, ink_cuda_upload, ink_cuda_download, ink_cuda_free, ink_cuda_matmul_bf16,
+};
+extern "C" const ColiInkCudaOps *coli_cuda_ink_ops(void) { return &g_ink_ops; }

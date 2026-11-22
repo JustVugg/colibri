@@ -1,0 +1,81 @@
+{
+  "version": 1,
+  "hypothesis": "Copying the next layer's guessed experts beside the expert cache while a layer computes, from the system's file cache, makes the 32 decode steps after a 512-token prompt of code.txt, the first included, faster on an 8 GB M1, with fast experts, guessed experts and the MTP head's drafts, with the same tokens and logits.",
+  "commit": "aeb219a4061d8fba1107aea104d3d5ee6e978ac8",
+  "model": "Qwen3.6-35B-A3B (Qwen3_5MoeForConditionalGeneration) converted to Colibri's qwen36 container: INT4 routed experts with gs=64 group scales, f16 dense weights (quantized to INT8 at load) and f16 embedding; 23 GB of safetensors; canonical.qc beside it (1.94 GB, written by qwen36-canonical) and experts.qc (17.1 GB, scales as 16-bit codes, the bytes qwen36-canonical --experts writes: its records written on 2026-10-05, its 8-byte stamp on 2026-10-07); the checkpoint's shards were written on 2026-09-16; and model-mtp.safetensors (the checkpoint's MTP head: the 529 tensors tools/convert_qwen36.py --mtp-only writes, byte for byte, read from a file of 531,710,984 bytes written on 2026-10-06, SHA-256 c8a3779f7e95016f923d3686663061621ac0ab1d221dc677e0f8869357a1a4ac; docs/experiments/qwen36-mtp-speculative-2026-10-06/head.txt)",
+  "command": "git archive aeb219a4 c | tar -x -C <dir>, make -C <dir>/c qwen36_metal.o backend_metal.o METAL=1, then from the repository root, with the compiler flags make -C c qwen36 METAL=1 gives qwen36.c except its qpack path (-DQWEN36_QPACK and its objects, which the harness does not use): clang -O3 -Xclang -fopenmp -I<libomp>/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_METAL -DQWEN36_METAL -I<dir>/c docs/experiments/qwen36-prefetch-2026-10-18/bench.c <dir>/c/qwen36_metal.o <dir>/c/backend_metal.o -o <dir>/qwen36-bench -lm -L<libomp>/lib -lomp -framework Metal -framework Foundation -framework Accelerate -lc++; every run: /usr/bin/time -l env -i PATH=/usr/bin:/bin HOME=$HOME SNAP=<model+head> TEACHER=1 launchers/<variant>/qwen36-bench code.txt 64,512 32; <variant> is pr14-guessed4 for the baseline (launchers/pr14-guessed4/qwen36-bench, a script with the one line QWEN36_FAST_EXPERTS=5 QWEN36_FAST_GUESSED=4 exec bin-pr14/qwen36-bench \"$@\") and pr14-prefetch for the trial (QWEN36_FAST_EXPERTS=5 QWEN36_FAST_GUESSED=4 QWEN36_PREFETCH=1 exec bin-pr14/qwen36-bench \"$@\"); the runs used 2a2c5bc6, a local commit not in the repository whose c/ tree is aeb219a4's (the branch moved onto a later record of the commits below, with the same c/ tree)",
+  "prompt_hash": "ff641dc87569e6e3b56c3e7996fce21627a4b8cea5489d90864d6102232a2e72",
+  "hardware": {
+    "cpu": "Apple M1, 4 performance + 4 efficiency cores (MacBook Air, MacBookAir10,1, no fan)",
+    "ram": "8 GB unified memory",
+    "storage": "internal APPLE SSD AP0256Q, APFS",
+    "os": "macOS 26.6.2 (25G83), Apple clang 21.0.0 (clang-2100.3.34.2), Homebrew libomp"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "QWEN36_PREFETCH"
+  ],
+  "baseline": {
+    "config": {
+      "SNAP": "Qwen3.6-35B-A3B, Colibri qwen36 container, INT4 experts gs=64, internal SSD, with the checkpoint's MTP head in model-mtp.safetensors",
+      "BUILD": "the compiler flags of make -C c qwen36 METAL=1 on macOS without its qpack path: clang -O3 -Xclang -fopenmp -DCOLI_METAL -DQWEN36_METAL, qwen36_metal.o and backend_metal.o",
+      "EXPERT_CACHE": "the Metal graph's default: a sixteenth of the RAM (512 MiB, 303 slots of 1.77 MB, the head's experts among them)",
+      "PROMPT": "the first 64 and the first 512 tokens of code.txt (in this record: an earlier version of c/qwen36_graph.h, 69,605 bytes, of which the harness reads the first 20,480; prompt_hash is its SHA-256), each from an empty state; after each, 32 tokens, each fed the text's own next token (teacher forcing: both versions read the same tokens)",
+      "ORDER": "1 warm-up run (baseline, discarded), then baseline trial trial baseline baseline trial trial baseline, one process each",
+      "REST": "thermal state nominal, then 60 s, before every run",
+      "EXPERT_SOURCE": "experts.qc beside the model; the head's experts from model-mtp.safetensors",
+      "ENGINE": "the Metal graph, default (fast) kernels with QWEN36_FAST_EXPERTS=5 QWEN36_FAST_GUESSED=4 and the MTP head's drafts",
+      "QWEN36_PREFETCH": "unset: a layer reads its misses into the cache's slots itself, their reads announced while the layer before computed",
+      "MEASURED": "tokens per second of all 32 decode steps after the 512-token prompt, the first included: 32 / (gen_first_ms / 1000 + 31 / gen_steady_tps), from the harness's columns; each step fed the text's next token (teacher forcing), with the MTP head's drafts"
+    },
+    "samples": {
+      "tok_s": [
+        11.513,
+        11.451,
+        11.794,
+        11.671
+      ]
+    },
+    "median_tok_s": 11.592,
+    "quality": {
+      "method": "FNV-1a fingerprint of every logit of the run, and the hash of the generated tokens, per prompt length: 64 tokens a10bddf1eda31730/24b5cd77c9db23fb, 512 tokens 7a6e8ecab7029d58/561100505ac9d4ca, the same in all nine runs (the warm-up and the 4 runs of each version)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-prefetch-2026-10-18/baseline-code.txt",
+      "sha256": "8d3b70e95f873c3976a9452d8fd2696689104c89b73c7c1b094f4a3eb10c92ff"
+    }
+  },
+  "trial": {
+    "config": {
+      "SNAP": "Qwen3.6-35B-A3B, Colibri qwen36 container, INT4 experts gs=64, internal SSD, with the checkpoint's MTP head in model-mtp.safetensors",
+      "BUILD": "the compiler flags of make -C c qwen36 METAL=1 on macOS without its qpack path: clang -O3 -Xclang -fopenmp -DCOLI_METAL -DQWEN36_METAL, qwen36_metal.o and backend_metal.o",
+      "EXPERT_CACHE": "the Metal graph's default: a sixteenth of the RAM (512 MiB, 303 slots of 1.77 MB, the head's experts among them)",
+      "PROMPT": "the first 64 and the first 512 tokens of code.txt (in this record: an earlier version of c/qwen36_graph.h, 69,605 bytes, of which the harness reads the first 20,480; prompt_hash is its SHA-256), each from an empty state; after each, 32 tokens, each fed the text's own next token (teacher forcing: both versions read the same tokens)",
+      "ORDER": "1 warm-up run (baseline, discarded), then baseline trial trial baseline baseline trial trial baseline, one process each",
+      "REST": "thermal state nominal, then 60 s, before every run",
+      "EXPERT_SOURCE": "experts.qc beside the model; the head's experts from model-mtp.safetensors",
+      "ENGINE": "the Metal graph, default (fast) kernels with QWEN36_FAST_EXPERTS=5 QWEN36_FAST_GUESSED=4 and the MTP head's drafts",
+      "QWEN36_PREFETCH": "1: the next layer's guesses whose records the system's file cache holds are copied, while this layer computes, into eight slots beside the expert cache (14.2 MB on top of its budget); a layer that misses one takes the copy",
+      "MEASURED": "tokens per second of all 32 decode steps after the 512-token prompt, the first included: 32 / (gen_first_ms / 1000 + 31 / gen_steady_tps), from the harness's columns; each step fed the text's next token (teacher forcing), with the MTP head's drafts"
+    },
+    "samples": {
+      "tok_s": [
+        11.709,
+        11.837,
+        11.505,
+        11.481
+      ]
+    },
+    "median_tok_s": 11.607,
+    "quality": {
+      "method": "FNV-1a fingerprint of every logit of the run, and the hash of the generated tokens, per prompt length: 64 tokens a10bddf1eda31730/24b5cd77c9db23fb, 512 tokens 7a6e8ecab7029d58/561100505ac9d4ca, the same in all nine runs (the warm-up and the 4 runs of each version)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-prefetch-2026-10-18/trial-code.txt",
+      "sha256": "02bca12dcb10fc95e4cb5d807d024f7dde50dfd02111af88de05b003584ddab2"
+    }
+  },
+  "outcome": "no-change"
+}

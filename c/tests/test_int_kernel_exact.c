@@ -165,6 +165,28 @@ int main(void){
             free(qp);free(ql);free(sc);free(xq);free(sx);free(xsg);free(ya);free(yb);
         }
     }
+    /* K1b's step without FMA (i4p_fmaf: TwoSum, then round to odd in double) against libm's
+     * fmaf. Random K1b-shaped steps, then ones built on a float halfway: a = 1 + 2^-24 (the
+     * midpoint above 1) less a product far below its ulp, where rounding the double sum to
+     * float a second time picks the wrong side unless the double was rounded to odd. */
+    {
+        for(int i=0;i<1000000;i++){
+            float d=(float)((int32_t)(rnd()%130049)-65024), s=0.0005f+(rnd()%911)*1e-6f;
+            float a=((float)(int32_t)(rnd()%2000001)-1000000.f)*1e-3f;
+            float r=i4p_fmaf(d,s,a), w=fmaf(d,s,a); checks++;
+            if(memcmp(&r,&w,4)){ fails++; if(fails<8) fprintf(stderr,"FAIL i4p_fmaf(%a,%a,%a)=%a, fmaf %a\n",(double)d,(double)s,(double)a,(double)r,(double)w); }
+        }
+        /* x*y = 2^-24 - a^2 2^-70 beside z = 1 + 2^-23: the exact sum sits just below the float
+         * midpoint 1 + 3*2^-24 (fmaf: 1 + 2^-23); rounded to double first it is that midpoint,
+         * and a second rounding to float goes to even, 1 + 2^-22, unless the double was rounded
+         * to odd. Both signs, and the same shape at other exponents. */
+        for(int a=1;a<256;a++) for(int sg=-1;sg<=1;sg+=2) for(int ex=-20;ex<=20;ex+=5){
+            float x=sg*(1.0f+(float)a*ldexpf(1.0f,-23)), y=ldexpf(1.0f-(float)a*ldexpf(1.0f,-23),-24+ex);
+            float z=sg*ldexpf(1.0f+ldexpf(1.0f,-23),ex);
+            float r=i4p_fmaf(x,y,z), w=fmaf(x,y,z); checks++;
+            if(memcmp(&r,&w,4)){ fails++; if(fails<8) fprintf(stderr,"FAIL i4p_fmaf double rounding a=%d ex=%d: %a, fmaf %a\n",a,ex,(double)r,(double)w); }
+        }
+    }
     printf("int-kernel exactness: %d checks, %d failures (%s / " IDOT_KERNEL ")\n",
            checks,fails,fails?"FAIL":"PASS");
     return fails?1:0;

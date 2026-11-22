@@ -53,7 +53,7 @@ class FamilyCapabilities:
     # of the key=value extension keys -- the shape decode_batch.h's coli_submit_parse
     # reads. The siblings speak a 6-field header (c/qwen36.c takes its keys straight
     # after top_p), so handing them the extra field puts a bare `0` where their
-    # parser wants `key=value` and the engine answers "bad submit extension".
+    # parser wants `key=value` and the engine refuses the header ("bad submit header").
     submit_gbytes: bool = False
 
 
@@ -133,6 +133,9 @@ class FamilyDescriptor:
     has_gateway_adapter: bool = False
     has_cli_adapter: bool = False
     tune_prompt_template: str = "{prompt}"
+    # `coli tune` renders its prompts through the gateway (openai_server.tune_chat_prompt)
+    # instead of tune_prompt_template: the family's checkpoints ship different templates
+    tune_renders_chat: bool = False
     # The environment variable the engine reads for extra shard folders, a model
     # split across drives (st_init_multi: the shards of every listed folder, by
     # file name). The launcher looks there too before it calls a model incomplete
@@ -630,6 +633,19 @@ def _kimi_geometry(config, context, _model_dir):
     qh = qk_nope + qk_rope
     ws_mla = context * (q_lora + heads * qh + kv_lora + qk_rope +
                         2 * heads * v_head) * 4
+    # Kimi K3.1 (dsa_config): every DSA layer keeps an indexer key a position
+    # (index_head_dim floats, kimi_k3.c's Ic), and a chunk's selection reads its
+    # queries and weights (C x index_num_heads x (index_head_dim + 1)) and two
+    # score rows of the context
+    dsa = config.get("dsa_config")
+    if isinstance(dsa, dict):
+        idx_hd = _required_int(dsa, "index_head_dim", "kimi_k3")
+        idx_nh = _required_int(dsa, "index_num_heads", "kimi_k3")
+        dsa_list = dsa.get("dsa_layers")
+        n_dsa = (sum(1 for v in dsa_list if isinstance(v, int) and 1 <= v <= layers)
+                 if isinstance(dsa_list, list) else n_mla)
+        state += n_dsa * context * idx_hd * 4
+        ws_mla += context * (idx_nh * (idx_hd + 1) + 2) * 4
     workspace = max(ws_kda, ws_mla)
     return PlannerGeometry(state, fixed, workspace, experts)
 
@@ -794,10 +810,20 @@ def _inkling_geometry(config, context, _model_dir):
     if len(local) != layers:
         raise ValueError("inkling: layer_types length must match num_hidden_layers")
 
+    # Inkling-2-Mini's loop: its layers' later passes keep their own K/V and convolution state
+    # (inkling.c's n_state), each as its weight layer's kind
+    lc = config.get("loop_config") if isinstance(config.get("loop_config"), dict) else {}
+    passes = _optional_int(lc, "num_passes", _optional_int(config, "loop_num_passes", 1, 1), 1)
+    ls = _optional_int(lc, "core_start", _optional_int(config, "loop_layer_index_start", 0, 0), 0)
+    le = _optional_int(lc, "core_end", _optional_int(config, "loop_layer_index_end", 0, 0), 0)
+    state_layers = list(range(layers))
+    if passes > 1 and 0 < ls < le <= layers:
+        state_layers += [ls + v % (le - ls) for v in range((passes - 1) * (le - ls))]
+
     state = 0
     fixed = 0
     workspace = 0
-    for i in range(layers):
+    for i in state_layers:
         kv = swa_kv if local[i] else n_kv
         hd = swa_hd if local[i] else head_dim
         h = swa_heads if local[i] else heads
@@ -1013,9 +1039,11 @@ _V4_EXPERT = re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.")
 _GLM53_EXPERT = re.compile(
     r"^model\.(?:language_model\.)?layers\.(\d+)\.mlp\.experts\.(\d+)\."
 )
+# Inkling's fused experts; Inkling-2's under model.llm, in a container (gate_up_proj/down_proj,
+# tools/convert_inkling2_int4.py) or as the checkpoint names them (w13_weight/w2_weight)
 _INKLING_EXPERT = re.compile(
-    r"^model\.layers\.(\d+)\.mlp\.experts\."
-    r"(?:gate_up_proj|down_proj)(?:\.|$)"
+    r"^model\.(?:llm\.)?layers\.(\d+)\.mlp\.experts\."
+    r"(?:gate_up_proj|down_proj|w13_weight|w2_weight)(?:\.|$)"
 )
 _QWEN38_EXPERT = re.compile(
     r"^(?:model\.)?(?:language_model\.)?layers\.(\d+)\.mlp\.experts\."
@@ -1409,9 +1437,26 @@ FAMILIES = (
     ),
     FamilyDescriptor(
         id="inkling",
-        model_types=("inkling_mm_model", "inkling"),
+        # inkling2 / inkling2_text: Inkling-2 (inkling.c's v2: attention residuals, gated
+        # attention with a sink, dynamic convolutions), the root model_type of the checkpoint
+        # and the one of a flat text snapshot or a GGUF import; inkling2_loop / inkling2_loop_text:
+        # Inkling-2-Mini (Inkling-2 whose middle layers run three passes)
+        model_types=("inkling_mm_model", "inkling", "inkling2", "inkling2_text",
+                     "inkling2_loop", "inkling2_loop_text"),
         display_name="Inkling",
         display_scale="975B",
+        display_variants=(
+            DisplayVariant((("model_type", "inkling2"),), "Inkling-2-Small", "594B",
+                           model_id="inkling-2-small-colibri"),
+            DisplayVariant((("model_type", "inkling2_text"),), "Inkling-2-Small", "594B",
+                           model_id="inkling-2-small-colibri"),
+            DisplayVariant((("model_type", "inkling2_loop"),), "Inkling-2-Mini", "26B",
+                           model_id="inkling-2-mini-colibri"),
+            DisplayVariant((("model_type", "inkling2_loop_text"),), "Inkling-2-Mini", "26B",
+                           model_id="inkling-2-mini-colibri"),
+            DisplayVariant((("model_type", "inkling_mm_model"),), "Inkling", "975B"),
+            DisplayVariant((("model_type", "inkling"),), "Inkling", "975B"),
+        ),
         engine_artifact="inkling",
         engine_aliases=(),
         engine_group="inkling",
@@ -1433,7 +1478,9 @@ FAMILIES = (
         # turno senza risposta (#1278). 16384 e' il valore che hanno gia' tutte
         # le famiglie con lo stesso contesto massimo di 1048576.
         limits=FamilyLimits(8192, 1048576, 1024, 16384, 16, 8, "CTX_MAX"),
-        capabilities=FamilyCapabilities(False, False, True, True),
+        # image: Inkling-2's pictures (expand_inkling2_images); the engine says CAPS vision=1
+        # only when it loaded the tower, and Inkling's handshake says nothing (text)
+        capabilities=FamilyCapabilities(False, False, True, True, image=True),
         has_gateway_adapter=True,
         tune_prompt_template="<|user|>{prompt}<|assistant|>",
     ),
@@ -1443,7 +1490,9 @@ FAMILIES = (
         # (the real checkpoint's text_config carries it; the root "kimi_k3"
         # belongs to the vision wrapper). A text-only export -- the tiny
         # fixture included -- is therefore kimi_linear at top level.
-        model_types=("kimi_k3", "kimi_linear"),
+        # "kimi_k31" is Kimi K3.1 Pro's root: K3 with DeepSeek Sparse Attention on
+        # its gated MLA layers (text_config.dsa_config), the same engine.
+        model_types=("kimi_k3", "kimi_linear", "kimi_k31"),
         display_name="Kimi K3",
         display_scale="2.8T",
         engine_artifact="kimi_k3",
@@ -1454,6 +1503,13 @@ FAMILIES = (
         build_target="kimi_k3",
         process_names=("kimi_k3",),
         default_model_id="kimi-k3-colibri",
+        # K3 and K3.1 have the same geometry and text_config model_type: the root's
+        # model_type names them (_variant_matches)
+        display_variants=(
+            DisplayVariant((("model_type", "kimi_k31"),), "Kimi K3.1 Pro", "2.8T", model_id="kimi-k3.1-colibri"),
+            DisplayVariant((("model_type", "kimi_k3"),), "Kimi K3", "2.8T"),
+            DisplayVariant((("model_type", "kimi_linear"),), "Kimi K3", "2.8T"),
+        ),
         cli_adapter="kimi",
         gateway_adapter="kimi",
         planner_id="kimi_hybrid",
@@ -1589,8 +1645,10 @@ FAMILIES = (
         # the answer. False gives the user "use coli chat or coli serve", which
         # is true and actionable; chat/serve/web all work through the gateway.
         has_cli_adapter=False,
-        tune_prompt_template=(
-            "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n"),
+        # Qwen3.6, Qwen3-Coder, Flint, Muse Spark, LFM3 and the dense Qwen3 each ship their
+        # own template (detect_chat_flavor): one fixed form put Qwen3-Coder, which has no
+        # thinking mode, after an open <think>, and it answered nothing (#2590)
+        tune_renders_chat=True,
     ),
     FamilyDescriptor(
         id="qwen38",
@@ -2151,7 +2209,7 @@ def default_model_id(resolved):
         return head.model_id
     matched = False
     for variant in family.display_variants:
-        if all(config.get(key) == value for key, value in variant.geometry):
+        if _variant_matches(variant, resolved):
             if variant.model_id:
                 return variant.model_id
             matched = True
@@ -2161,6 +2219,15 @@ def default_model_id(resolved):
     if slug and family.display_variants and not matched:   # one-model families keep their id
         return slug + "-colibri"
     return family.default_model_id
+
+
+def _variant_matches(variant, resolved):
+    """A display variant's geometry against the family config; a model_type it names,
+    against the checkpoint's own as well. Kimi reads text_config, whose model_type is
+    kimi_linear for K3 and K3.1 alike; the root's says which of the two it is."""
+    config = resolved.family_config
+    return all(config.get(key) == value or (key == "model_type" and resolved.model_type == value)
+               for key, value in variant.geometry)
 
 
 def display_for(resolved):
@@ -2184,7 +2251,7 @@ def display_for(resolved):
     if not family.display_variants:   # an imported GGUF says which model it is (Inkling-Small)
         return (name, size) if name else (family.display_name, family.display_scale)
     for variant in family.display_variants:
-        if all(config.get(key) == value for key, value in variant.geometry):
+        if _variant_matches(variant, resolved):
             return variant.display_name, variant.display_scale
     if name:   # an imported GGUF: the name its file gives
         return name, size

@@ -1,0 +1,29 @@
+_tensor *router_logits;
+    q36_tensor *shared_w1, *shared_w2, *shared_w3;
+    q36_tensor *shared_out;
+    q36_tensor *router_logits_norm;
+    q36_tensor *router_logits_normed;
+    q36_cpu_mm *cpu_mm;
+    q36_layer_loader *loader;
+    q36_advice_schedule *schedule;
+    int layer;
+    int head_dim;
+    int num_heads;
+    int num_kv_heads;
+    int num_experts;
+    int num_experts_per_tok;
+    int num_experts_per_tok;
+    int num_experts_per_tok;
+    header_t header;
+} QgLayer;
+
+typedef struct {
+    q36_tensor *input_embed;
+    q36_tensor *token_embed;
+    q36 embeddings;
+    q36_tensor *ln_f;
+    q36_tensor *lm_head;
+    q36_tensor *logits;
+    q36_tensor *logits_norm;
+    q36_tensor *logits_normed;
+    q36_tensor *logits_normed

@@ -42,6 +42,9 @@ static int memory_read(void *user_data, void *data, size_t size) {
 }
 
 static int register_all(void) {
+#ifdef COLI_SEGMENT_TEST_REGISTER
+    return COLI_SEGMENT_TEST_REGISTER();
+#else
     return coli_glm_segment_adapter_register() ||
            coli_glm53_segment_adapter_register() ||
            coli_inkling_segment_adapter_register() ||
@@ -50,6 +53,7 @@ static int register_all(void) {
            coli_qwen36_segment_adapter_register() ||
            coli_qwen38_segment_adapter_register() ||
            coli_deepseek_v4_segment_adapter_register();
+#endif
 }
 
 static int close_enough(const float *left, const float *right, size_t count,
@@ -320,6 +324,22 @@ int main(int argc, char **argv) {
                               error, sizeof(error))) {
         free(checkpoint.data);
         goto free_buffers;
+    }
+    /* A broken transport must not commit either a partial header or payload. */
+    const size_t complete_size = checkpoint.size;
+    const size_t cuts[] = {sizeof(ColiSegmentSnapshotHeader)-1, complete_size-1};
+    for (size_t cut=0; cut<sizeof(cuts)/sizeof(*cuts); cut++) {
+        checkpoint.size=cuts[cut]; checkpoint.offset=0;
+        int rejected=coli_segment_restore(restored,memory_read,&checkpoint,error,sizeof(error));
+        checkpoint.size=complete_size; checkpoint.offset=0;
+        if (!rejected || coli_segment_snapshot(restored,memory_write,&after_bad,error,sizeof(error)) ||
+            before_bad.size!=after_bad.size ||
+            memcmp(before_bad.data,after_bad.data,before_bad.size)) {
+            snprintf(error,sizeof(error),"truncated snapshot accepted or mutated live state");
+            free(after_bad.data); free(before_bad.data); free(checkpoint.data);
+            goto free_buffers;
+        }
+        free(after_bad.data); memset(&after_bad,0,sizeof(after_bad));
     }
     /* Header metadata is untrusted too.  In particular, a forged context
      * must be rejected before an adapter derives any state spans from it. */

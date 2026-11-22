@@ -1,0 +1,269 @@
+{
+  "sessions": [
+    "deepseek-v4-flash-reap-baseline-20261108-133525",
+    "deepseek-v4-flash-reap-variant-20261108-135632"
+  ],
+  "run_ids": [
+    "20261108-134038",
+    "20261108-140146"
+  ],
+  "images": [
+    "colibri-vulkan:xe2-models-mesa26.2.6",
+    "colibri-vulkan:xe2-models-lazy-mesa26.2.6"
+  ],
+  "configuration_equal_except_image": true,
+  "reference_answers_exact": true,
+  "reference_characters": [
+    452,
+    632,
+    771
+  ],
+  "common_requests": [
+    {
+      "workload": "warmup",
+      "repetition": 1,
+      "inputs_exact": true,
+      "outputs_exact": true,
+      "prompt_sha256": "785466992b3d873d20e0a2040b1e53b03c67b1a0629ee0f9fb9619942e362736"
+    },
+    {
+      "workload": "prefill_long",
+      "repetition": 1,
+      "inputs_exact": true,
+      "outputs_exact": true,
+      "prompt_sha256": "76bcdd3918b5e1a5ad5a14c353d6e6d6b36398468bd2d72ed78fe5ab1bcd8091"
+    },
+    {
+      "workload": "prefill_short",
+      "repetition": 1,
+      "inputs_exact": true,
+      "outputs_exact": true,
+      "prompt_sha256": "aed75a5fc21e5b0af2d8ccdbd17e837db8c89ee26c2463318f53139508dafbc4"
+    },
+    {
+      "workload": "decode_short",
+      "repetition": 1,
+      "inputs_exact": true,
+      "outputs_exact": true,
+      "prompt_sha256": "dfca9a8f4fb7117bef8de9c4c809d6406f2a48deadbdc04b69ec8acd3210cb2f"
+    },
+    {
+      "workload": "decode_short",
+      "repetition": 2,
+      "inputs_exact": true,
+      "outputs_exact": true,
+      "prompt_sha256": "17393b60a68e7c3ae81c28405ce93a19f9ab58cc36d8c2a0c3202373630c1ab6"
+    }
+  ],
+  "all_common_outputs_exact": true,
+  "serving_adopted": false,
+  "arms": [
+    {
+      "session": "deepseek-v4-flash-reap-baseline-20261108-133525",
+      "run": "20261108-134038",
+      "exit_code": 1,
+      "error": "RuntimeError: Engine device failure; benchmark/profile aborted",
+      "engine_fatal": [
+        "2026-11-08T13:54:18.453075855Z intel: the execbuf ioctl keeps returning ENOMEM"
+      ],
+      "peak_gpu_mib": 24308.13671875,
+      "samples": [
+        {
+          "workload": "warmup",
+          "repetition": 1,
+          "warmup": true,
+          "ttft_s": 12.045927895000204,
+          "decode_proxy_tps": null,
+          "prompt_tokens": 22,
+          "completion_tokens": 1,
+          "peak_gpu_mib": 23013.21484375
+        },
+        {
+          "workload": "prefill_long",
+          "repetition": 1,
+          "warmup": false,
+          "ttft_s": 585.7461246409803,
+          "decode_proxy_tps": null,
+          "prompt_tokens": 3047,
+          "completion_tokens": 1,
+          "peak_gpu_mib": 24251.3046875
+        },
+        {
+          "workload": "prefill_short",
+          "repetition": 1,
+          "warmup": false,
+          "ttft_s": 12.90574702899903,
+          "decode_proxy_tps": null,
+          "prompt_tokens": 24,
+          "completion_tokens": 1,
+          "peak_gpu_mib": 24257.3046875
+        },
+        {
+          "workload": "decode_short",
+          "repetition": 1,
+          "warmup": false,
+          "ttft_s": 20.77657560899388,
+          "decode_proxy_tps": 1.5177080105332017,
+          "prompt_tokens": 40,
+          "completion_tokens": 128,
+          "peak_gpu_mib": 24257.3046875
+        },
+        {
+          "workload": "decode_short",
+          "repetition": 2,
+          "warmup": false,
+          "ttft_s": 21.252173321990995,
+          "decode_proxy_tps": 1.6695179947996541,
+          "prompt_tokens": 40,
+          "completion_tokens": 128,
+          "peak_gpu_mib": 24255.3046875
+        }
+      ],
+      "tier_states": [
+        [
+          "913",
+          "913",
+          "14.31",
+          "14.37",
+          "58"
+        ]
+      ],
+      "chunk_rows": [
+        1280
+      ],
+      "completed_long_prompts": 1,
+      "raw_results_sha256": "c427b43563433dd77607e13779355f11de2cb7ec9aceb3dcde7e92769f4a49bd"
+    },
+    {
+      "session": "deepseek-v4-flash-reap-variant-20261108-135632",
+      "run": "20261108-140146",
+      "exit_code": 0,
+      "error": null,
+      "engine_fatal": [],
+      "peak_gpu_mib": 24297.16015625,
+      "samples": [
+        {
+          "workload": "warmup",
+          "repetition": 1,
+          "warmup": true,
+          "ttft_s": 11.873395756003447,
+          "decode_proxy_tps": null,
+          "prompt_tokens": 22,
+          "completion_tokens": 1,
+          "peak_gpu_mib": 22120.7421875
+        },
+        {
+          "workload": "prefill_long",
+          "repetition": 1,
+          "warmup": false,
+          "ttft_s": 593.1024272310024,
+          "decode_proxy_tps": null,
+          "prompt_tokens": 3047,
+          "completion_tokens": 1,
+          "peak_gpu_mib": 23837.546875
+        },
+        {
+          "workload": "prefill_short",
+          "repetition": 1,
+          "warmup": false,
+          "ttft_s": 12.877480258001015,
+          "decode_proxy_tps": null,
+          "prompt_tokens": 24,
+          "completion_tokens": 1,
+          "peak_gpu_mib": 23841.546875
+        },
+        {
+          "workload": "decode_short",
+          "repetition": 1,
+          "warmup": false,
+          "ttft_s": 20.738702811999246,
+          "decode_proxy_tps": 1.587909623240262,
+          "prompt_tokens": 40,
+          "completion_tokens": 128,
+          "peak_gpu_mib": 23841.546875
+        },
+        {
+          "workload": "decode_short",
+          "repetition": 2,
+          "warmup": false,
+          "ttft_s": 21.185652724001557,
+          "decode_proxy_tps": 1.8464388689800602,
+          "prompt_tokens": 40,
+          "completion_tokens": 128,
+          "peak_gpu_mib": 23839.546875
+        },
+        {
+          "workload": "prefill_long",
+          "repetition": 2,
+          "warmup": false,
+          "ttft_s": 525.9665138839919,
+          "decode_proxy_tps": null,
+          "prompt_tokens": 3047,
+          "completion_tokens": 1,
+          "peak_gpu_mib": 24157.5703125
+        },
+        {
+          "workload": "prefill_short",
+          "repetition": 2,
+          "warmup": false,
+          "ttft_s": 12.50237858298351,
+          "decode_proxy_tps": null,
+          "prompt_tokens": 24,
+          "completion_tokens": 1,
+          "peak_gpu_mib": 24161.5703125
+        },
+        {
+          "workload": "prefill_long",
+          "repetition": 3,
+          "warmup": false,
+          "ttft_s": 528.0002710880071,
+          "decode_proxy_tps": null,
+          "prompt_tokens": 3047,
+          "completion_tokens": 1,
+          "peak_gpu_mib": 24293.16015625
+        },
+        {
+          "workload": "decode_short",
+          "repetition": 3,
+          "warmup": false,
+          "ttft_s": 20.885072887991555,
+          "decode_proxy_tps": 1.6639051999420145,
+          "prompt_tokens": 40,
+          "completion_tokens": 128,
+          "peak_gpu_mib": 24297.16015625
+        },
+        {
+          "workload": "prefill_short",
+          "repetition": 3,
+          "warmup": false,
+          "ttft_s": 12.676768945995718,
+          "decode_proxy_tps": null,
+          "prompt_tokens": 24,
+          "completion_tokens": 1,
+          "peak_gpu_mib": 24295.16015625
+        }
+      ],
+      "tier_states": [
+        [
+          "913",
+          "913",
+          "13.37",
+          "14.37",
+          "54"
+        ]
+      ],
+      "chunk_rows": [
+        1280
+      ],
+      "completed_long_prompts": 3,
+      "raw_results_sha256": "04dd8ec69f29ae386708ec72b2e2ae9019eff35024bb3baae9da9810accbd2bf"
+    }
+  ],
+  "limitations": [
+    "Original arm aborted on its second long prompt; no complete three-sample speed comparison.",
+    "memory.used is sampled GPU1 VRAM usage, not a tier payload or allocation counter.",
+    "Deterministic placement controls differ from the initial adaptive reference; not adopted for serving.",
+    "This repeated 3047-token prompt workload does not validate the full configured 64K context."
+  ],
+  "candidate_full_workload_passed": true
+}
