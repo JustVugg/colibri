@@ -5,6 +5,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A GGUF's reads no longer queue one behind the other on Windows.** `gguf_read` read through the
+  descriptor `open()` gives, a synchronous file object, and Windows runs one I/O at a time on one:
+  the OpenMP team that reads a prompt's PLE rows ahead (`q38_ple_prefetch`) read them in turn. Each
+  part is now also opened overlapped, and a read waits on an event of its own. 71,664 random 90-byte
+  rows of Qwen3.8-Flash-Next's 28.8 GB table (a 4.5K-token prompt's), 16 threads: 7.4 s to 1.2 s
+  cold, 0.55 s to 0.27 s from the page cache. Served on an RTX 5090 (Qwen3.8-Flash-Next IQ1_M,
+  every expert on the card, greedy, two sessions each way): a 4,479-token prompt's first token
+  5.37-5.75 s to 2.04-2.10 s, the engine ready 21.1-21.4 s to 12.7 s, decode unchanged
+  (47.4-52.4 tok/s to 48.8-54.5), the same text in every request. Same bytes; Linux and macOS
+  unchanged.
+
 ## [2.2.0] - 2026-11-21
 
 ### New
