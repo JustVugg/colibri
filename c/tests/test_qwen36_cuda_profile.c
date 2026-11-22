@@ -60,6 +60,20 @@ int main(void) {
     check_mask(Q36_GPU_A100, 1, 64, 1, 0, 0, a100 & ~Q36_DNREC);
     check_mask(Q36_GPU_A100, 0, 63, 1, 0, 0, a100 & ~Q36_DNREC);
     check_mask(Q36_GPU_A100, 0, 64, 1, 1, 0, a100 & ~(Q36_FLASH_ATTN | Q36_ASYNC_COPIES));
+    check_device(8, 6, "NVIDIA GeForce RTX 3090", GIB(24), Q36_GPU_3090);
+    check_device(8, 6, "NVIDIA GeForce RTX 3090 Ti", GIB(24), Q36_GPU_NONE);
+    unsigned rtx3090 = Q36_ALL_FEATURES & ~4482u;
+    check_value(q36_device_features(Q36_GPU_3090), rtx3090, "RTX 3090 available features");
+    const int live[][2] = {{5785, 1298}, {7137, 904}, {8065, 348}};
+    for (size_t i = 0; i < sizeof live / sizeof *live; i++) {
+        int reused = live[i][0], fresh = live[i][1];
+        for (int generation = 0; generation <= 1; generation++) {
+            check_mask(Q36_GPU_3090, reused, fresh, 0, generation, 1, rtx3090 & ~Q36_PROMPT_CACHE);
+            check_mask(Q36_GPU_3090, reused, fresh, 0, generation, 0, rtx3090);
+            check_mask(Q36_GPU_3090, reused, fresh + 1, 0, generation, 1, rtx3090);
+            check_mask(Q36_GPU_3090, reused - 1, fresh + 1, 0, generation, 1, rtx3090);
+        }
+    }
     printf("Qwen3.6 CUDA profiles: %u checks, %u failures\n", checks, failures);
     return failures ? 1 : 0;
 }

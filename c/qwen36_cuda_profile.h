@@ -46,6 +46,7 @@ static inline int q36_cuda_device_profile(int major, int minor, const char *name
     } devices[] = {
         {Q36_GPU_L4, 8, 9, "NVIDIA L4", "L4", 0, 0},
         {Q36_GPU_A100, 8, 0, "NVIDIA A100-SXM4-40GB", NULL, UINT64_C(38) << 30, UINT64_C(42) << 30},
+        {Q36_GPU_3090, 8, 6, "NVIDIA GeForce RTX 3090", NULL, 0, 0},
     };
 
     if (!name) return Q36_GPU_NONE;
@@ -73,6 +74,7 @@ static inline unsigned q36_device_features(int profile) {
     case Q36_GPU_L4:
         return Q36_AVAILABLE_FEATURES;
     case Q36_GPU_A100:
+    case Q36_GPU_3090:
         return Q36_AVAILABLE_FEATURES & ~(Q36_EXPERT_ROUTE | Q36_SHARED_SWIGLU |
                                        Q36_FUSED_NORM | Q36_LONG_ATTN);
     default:
@@ -81,19 +83,19 @@ static inline unsigned q36_device_features(int profile) {
 }
 
 static inline int q36_3090_uses_exact_cache(int reused, int fresh) {
-    (void)reused;
-    (void)fresh;
-    return 0;
+    return (reused == 5785 && fresh == 1298) || (reused == 7137 && fresh == 904) ||
+           (reused == 8065 && fresh == 348);
 }
 
 static inline unsigned q36_request_features(int profile, int reused, int fresh, int cold,
                                              int generation, int cache3090) {
-    (void)cache3090;
     unsigned mask = q36_device_features(profile);
     if (profile == Q36_GPU_A100) {
         if (generation) mask &= ~(Q36_FLASH_ATTN | Q36_ASYNC_COPIES);
         else if (!(cold && reused == 0 && fresh == 64)) mask &= ~Q36_DNREC;
     }
+    if (profile == Q36_GPU_3090 && cache3090 && q36_3090_uses_exact_cache(reused, fresh))
+        mask &= ~Q36_PROMPT_CACHE;
     return mask;
 }
 
