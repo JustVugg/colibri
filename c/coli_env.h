@@ -192,6 +192,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_CUDA_DENSE_BM", CE_INT, CE_QWEN, 0, NULL}, /* Dense tensor-core tile or kernel mode. Default automatic. */
     {"COLI_CUDA_DENSE_GB", CE_INT, CE_COLIBRI | CE_KIMI | CE_DSV4 | CE_GLM53 | CE_DSV41 | CE_MIMO, 0, NULL},
     {"COLI_CUDA_DENSE_I8", CE_BOOL, CE_QWEN, 0, NULL}, /* INT8 dense tensor-core dispatch. Default on except in a test without a benchmark. */
+    {"COLI_CUDA_DNCONV_FAST", CE_INT, CE_QWEN, 0, NULL}, /* DeltaNet convolution mode. Default 1 enables the tiled long-prompt path. */
     {"COLI_CUDA_DNREC_CFG", CE_INT, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_DNREC_ROWS", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_DNREC_SPLIT", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
