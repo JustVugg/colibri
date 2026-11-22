@@ -501,13 +501,20 @@ def vulkan_loader_present():
 # at run time, and macOS has no ldd: without these a working Metal build read as
 # "GPU detected but the engine is CPU-only" (#2921).
 _METAL_MARKERS = (b"[metal] pipeline failed", b"[metal] shader compile failed")
-# Metal is switched on at run time, and not the same way in every engine: qwen36's
-# Metal graph (qwen36_metal.m, whose messages are these) is on unless COLI_METAL=0;
-# colibri, glm53 and inkling need COLI_METAL=1, Kimi K3 K3_METAL=1 (kimi_k3.c's own
-# "[K3-METAL]" messages; the name K3_METAL itself is in every engine, through
-# coli_env.h's table).
+# Metal is switched on at run time, and not the same way in every engine, so the
+# engine is told by its own messages:
+#   qwen36 ([qwen36-metal], qwen36_metal.m): on unless COLI_METAL=0 (atoi), not with
+#     KV_SLOTS > 1 (qwen36.c q36 graph eligibility);
+#   Kimi K3 ([K3-METAL], kimi_k3.c): K3_METAL non-zero (atoi), not with KV_SLOTS > 1.
+#     The name K3_METAL itself is in every engine, through coli_env.h's table;
+#   Inkling ([inkling2], inkling.c and its headers): COLI_METAL starting with '1' and no
+#     NOGPU; an Inkling-2 model also needs INK2_METAL starting with '1', and a build with
+#     neither CUDA nor Vulkan ("runs on the CPU in this build") keeps Inkling-2 on the CPU;
+#   colibri and glm53: COLI_METAL non-zero (atoi).
 _METAL_ON_BY_DEFAULT = b"[qwen36-metal]"
-_METAL_K3_SWITCH = b"[K3-METAL]"
+_METAL_K3 = b"[K3-METAL]"
+_METAL_INKLING = b"[inkling2]"
+_METAL_INKLING2_CPU = b"Inkling-2 runs on the CPU in this build"
 
 
 def _atoi(value):
@@ -516,15 +523,57 @@ def _atoi(value):
     return int(match.group(1)) if match else 0
 
 
-def metal_active(linkage, env=None):
-    """Whether a Metal engine (cuda_linkage's "metal") runs on the GPU with this
-    environment, and the variable that decides it."""
+def _metal_engine(image):
+    if _METAL_ON_BY_DEFAULT in image:
+        return {"metal_engine": "qwen36", "metal_switch": "COLI_METAL", "metal_default": True}
+    if _METAL_K3 in image:
+        return {"metal_engine": "kimi_k3", "metal_switch": "K3_METAL", "metal_default": False}
+    if _METAL_INKLING in image:
+        return {"metal_engine": "inkling", "metal_switch": "COLI_METAL", "metal_default": False,
+                "inkling2_cpu_build": _METAL_INKLING2_CPU in image}
+    return {"metal_engine": "other", "metal_switch": "COLI_METAL", "metal_default": False}
+
+
+def _inkling2_model(model):
+    """config.json's model_type (or text_config's) starts with inkling2, as inkling.c
+    ink_snap_v2 reads it."""
+    try:
+        config = json.loads(Path(model, "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return False
+    if not isinstance(config, dict):
+        return False
+    text = config.get("text_config") if isinstance(config.get("text_config"), dict) else {}
+    return any(str(c.get("model_type") or "").startswith("inkling2") for c in (config, text))
+
+
+def metal_active(linkage, env=None, kv_slots=1, model=None):
+    """(on, switch, why): whether a Metal engine (cuda_linkage's "metal") runs on the GPU
+    with this environment, the variable that turns it on, and when it is off why, in the
+    words of the check."""
     env = os.environ if env is None else env
     switch = linkage.get("metal_switch") or "COLI_METAL"
     value = env.get(switch)
+    engine = linkage.get("metal_engine")
+    slots = max(int(kv_slots or 1), _atoi(env.get("KV_SLOTS")))
     if linkage.get("metal_default"):
-        return (value is None or _atoi(value) != 0), switch
-    return _atoi(value) != 0, switch
+        if value is not None and _atoi(value) == 0:
+            return False, switch, f"{switch}={value} keeps it on the CPU"
+    elif engine == "inkling":
+        if not (value or "").startswith("1"):
+            return False, switch, f"{switch}=1 runs it on the Apple GPU"
+        if env.get("NOGPU") is not None:
+            return False, switch, "NOGPU keeps it on the CPU"
+        if model is not None and _inkling2_model(model):
+            if linkage.get("inkling2_cpu_build"):
+                return False, switch, "Inkling-2 runs on the CPU in a build without CUDA or Vulkan"
+            if not (env.get("INK2_METAL") or "").startswith("1"):
+                return False, "INK2_METAL", "an Inkling-2 model also needs INK2_METAL=1"
+    elif _atoi(value) == 0:
+        return False, switch, f"{switch}=1 runs it on the Apple GPU"
+    if engine in ("qwen36", "kimi_k3") and slots > 1:
+        return False, switch, f"KV_SLOTS={slots} keeps it on the CPU (one conversation's state on the GPU)"
+    return True, switch, None
 
 
 def cuda_linkage(engine_path):
@@ -546,9 +595,7 @@ def cuda_linkage(engine_path):
         present = vulkan_loader_present()
         return {"linked": present, "missing": not present, "vulkan": True}
     if any(marker in image for marker in _METAL_MARKERS):
-        return {"linked": True, "missing": False, "metal": True,
-                "metal_default": _METAL_ON_BY_DEFAULT in image,
-                "metal_switch": "K3_METAL" if _METAL_K3_SWITCH in image else "COLI_METAL"}
+        return {"linked": True, "missing": False, "metal": True, **_metal_engine(image)}
     return state
 
 
@@ -751,7 +798,7 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
                              devices=[gpu["index"] for gpu in selected_gpus]))
     elif linkage.get("metal") and linkage.get("linked"):
         metal = [gpu for gpu in selected_gpus if gpu.get("backend") == "metal"]
-        on, switch = metal_active(linkage)
+        on, switch, why = metal_active(linkage, kv_slots=kv_slots, model=model)
         if not metal:
             checks.append(_check("accelerator.gpu", "warn",
                                  "the engine is a Metal build but no Metal GPU was detected; "
@@ -763,10 +810,8 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
                                  switch=switch))
         else:
             # a Metal build that this environment leaves on the CPU, as the engine will
-            how = (f"{switch}=0 keeps it on the CPU" if linkage.get("metal_default")
-                   else f"{switch}=1 runs it on the Apple GPU")
             checks.append(_check("accelerator.gpu", "warn",
-                                 f"Metal engine, but it runs on the CPU here: {how}",
+                                 f"Metal engine, but it runs on the CPU here: {why}",
                                  devices=[gpu["index"] for gpu in metal], switch=switch))
     elif selected_gpus and linkage.get("missing"):
         checks.append(_check("accelerator.gpu", "fail", "GPU runtime library is missing"))
@@ -794,7 +839,7 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
         plan_gpu_indices = gpu_indices if cuda else []
         plan_vram_gb = vram_gb if cuda else 0
         if (linkage.get("metal") and linkage.get("linked") and gpu_indices != []
-                and metal_active(linkage)[0]):
+                and metal_active(linkage, kv_slots=kv_slots, model=model)[0]):
             # a Metal engine that runs on the GPU here: the Apple GPU as the planner knows
             # it (identity only, unified memory, no VRAM budget to spend:
             # resource_plan._discover_metal_gpus), so the plan's device line reads
