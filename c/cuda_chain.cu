@@ -1031,7 +1031,8 @@ __device__ __forceinline__ void cc_f2_put(__half *d, float4 v, float s) {
 #endif
 template<int HD, int NW, int BC, bool QREG>
 static constexpr size_t cc_f2_smem_bytes() { return ((size_t)2 * BC * (HD + 8) + (QREG ? 0 : (size_t)16 * NW * (HD + 8))) * 2; }
-template<int HD, int NW, int BC, bool QREG, typename KT = float>
+enum CcF2Pass { CC_F2_DIRECT, CC_F2_WRITE_QK, CC_F2_READ_QK };
+template<int HD, int NW, int BC, bool QREG, typename KT = float, CcF2Pass pass = CC_F2_DIRECT>
 __global__ static void __launch_bounds__(32 * NW) cc_attn_f2(const float *__restrict__ q, const KT *__restrict__ kc,
         const KT *__restrict__ vc, float *__restrict__ o, const float *__restrict__ gt, CcAttn p, int GQ,
         int win, const float *__restrict__ snk, int sink_off, int ring, const int *__restrict__ sel_) {
@@ -1040,11 +1041,12 @@ __global__ static void __launch_bounds__(32 * NW) cc_attn_f2(const float *__rest
     constexpr int LD = HD + 8, BR = 16 * NW, NT = 32 * NW, NKT = BC / 8, NDT = HD / 8, KS = HD / 16;
     static_assert(!QREG || BR <= 2 * BC, "Q is staged where K and V go");
     extern __shared__ __align__(16) unsigned char cc_f2_sm[];
-    __half *sK = reinterpret_cast<__half *>(cc_f2_sm), *sV = sK + BC * LD, *sQ = QREG ? sK : sV + BC * LD;
+    __half *sK = reinterpret_cast<__half *>(cc_f2_sm), *sV = pass == CC_F2_READ_QK ? sK : sK + BC * LD;
+    __half *sQ = QREG || pass == CC_F2_READ_QK ? sK : sV + BC * LD;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gid = lane >> 2, tig = lane & 3;
     const int TPB = BR / GQ, g = blockIdx.y, t0 = blockIdx.x * TPB, S = p.S, pb = p.pos_base, nt = pb + S;
     const int tlast = min(t0 + TPB, S) - 1;
-    for (int e = tid; e < BR * HD / 4; e += NT) {   /* Q, scaled, row r = (token t0 + r / GQ, head g * GQ + r % GQ) */
+    if constexpr (pass != CC_F2_READ_QK) for (int e = tid; e < BR * HD / 4; e += NT) {   /* Q, scaled, row r = (token t0 + r / GQ, head g * GQ + r % GQ) */
         int r = e / (HD / 4), d = (e - r * (HD / 4)) * 4, tk = t0 + r / GQ, h = g * GQ + r % GQ;
         float4 v = tk < S ? *reinterpret_cast<const float4 *>(q + p.q_off + (size_t)tk * p.q_row + (size_t)h * p.q_seg + d)
                           : make_float4(0.f, 0.f, 0.f, 0.f);
@@ -1075,7 +1077,7 @@ __global__ static void __launch_bounds__(32 * NW) cc_attn_f2(const float *__rest
      * count, -1 none, then the positions); a key block's mask a token (smk, bit i: key k0 + i) from
      * the part of the list the block covers (scur, the list's next entry); a block no token of the
      * block selects from is skipped */
-    const int *sel = BC <= 32 ? sel_ : nullptr;   /* a token's mask of a key block is a word: blocks of 32 keys or fewer */
+    const int *sel = pass == CC_F2_DIRECT && BC <= 32 ? sel_ : nullptr;   /* a token's mask of a key block is a word: blocks of 32 keys or fewer */
     __shared__ unsigned smk[64];
     __shared__ int scur[64], slen[64];
     const int wt0 = (warp * 16) / GQ, wt1 = (warp * 16 + 15) / GQ;   /* the warp's rows' tokens, of the block's */
@@ -1087,7 +1089,9 @@ __global__ static void __launch_bounds__(32 * NW) cc_attn_f2(const float *__rest
         __syncthreads();
     }
     const int kb_lo = win > 0 && pb + t0 - win + 1 > 0 ? (pb + t0 - win + 1) / BC : 0, kb_hi = (pb + tlast) / BC;
-    for (int kb = kb_lo; kb <= kb_hi; kb++) {
+    int first_tile = pass == CC_F2_WRITE_QK ? (int)blockIdx.z : kb_lo;
+    int last_tile = pass == CC_F2_WRITE_QK ? min(first_tile, kb_hi) : kb_hi;
+    for (int kb = first_tile; kb <= last_tile; kb++) {
         const int k0 = kb * BC;
         if (sel) {
             for (int j = warp; j < TPB; j += NW) {
@@ -1118,11 +1122,11 @@ __global__ static void __launch_bounds__(32 * NW) cc_attn_f2(const float *__rest
             float4 kv = make_float4(0.f, 0.f, 0.f, 0.f), vv = kv;
             if (key < nt) {
                 size_t at = (size_t)(g * p.cap + (ring ? key % ring : key)) * HD + d;
-                kv = cc_kv4(kc, p.k_off + at);
-                vv = cc_kv4(vc, p.v_off + at);
+                if constexpr (pass != CC_F2_READ_QK) kv = cc_kv4(kc, p.k_off + at);
+                if constexpr (pass != CC_F2_WRITE_QK) vv = cc_kv4(vc, p.v_off + at);
             }
-            cc_f2_put(sK + kl * LD + d, kv, 1.f);
-            cc_f2_put(sV + kl * LD + d, vv, 1.f);
+            if constexpr (pass != CC_F2_READ_QK) cc_f2_put(sK + kl * LD + d, kv, 1.f);
+            if constexpr (pass != CC_F2_WRITE_QK) cc_f2_put(sV + kl * LD + d, vv, 1.f);
         }
         __syncthreads();
         /* none of this warp's rows sees a key of the block: past its last row, or before its
@@ -1130,21 +1134,35 @@ __global__ static void __launch_bounds__(32 * NW) cc_attn_f2(const float *__rest
         unsigned wsel = sel ? 0u : 1u;
         if (sel) for (int j = wt0; j <= wt1 && j < TPB; j++) wsel |= smk[j];
         if (k0 <= whi && (win <= 0 || k0 + BC - 1 + win > wlo) && wsel) {
-            float sc[NKT][4];
-            #pragma unroll
-            for (int j = 0; j < NKT; j++) sc[j][0] = sc[j][1] = sc[j][2] = sc[j][3] = 0.f;
-            #pragma unroll
-            for (int ks = 0; ks < KS; ks++) {
-                uint32_t a[4];
-                if (QREG) { a[0] = qa[ks][0]; a[1] = qa[ks][1]; a[2] = qa[ks][2]; a[3] = qa[ks][3]; }
-                else cc_f2_ldm(a, sQ + (warp * 16 + ar) * LD + ks * 16 + ac);
+            __align__(16) float sc[NKT][4];
+            // Each lane's four MMA results are stored together, in the same warp and key order.
+            size_t slot = ((((size_t)g * gridDim.x + blockIdx.x) * (1 + (nt - 1) / BC) + kb) * NW + warp) * NKT * 32 + lane;
+            if constexpr (pass == CC_F2_READ_QK) {
                 #pragma unroll
-                for (int j = 0; j < NKT; j += 2) {
-                    uint32_t b[4];
-                    cc_f2_ldm(b, sK + (j * 8 + br) * LD + ks * 16 + bc);
-                    cc_f2_mma(sc[j], a, b[0], b[1]);
-                    cc_f2_mma(sc[j + 1], a, b[2], b[3]);
+                for (int j = 0; j < NKT; j++)
+                    *reinterpret_cast<float4 *>(sc[j]) = reinterpret_cast<const float4 *>(q)[slot + j * 32];
+            } else {
+                #pragma unroll
+                for (int j = 0; j < NKT; j++) sc[j][0] = sc[j][1] = sc[j][2] = sc[j][3] = 0.f;
+                #pragma unroll
+                for (int ks = 0; ks < KS; ks++) {
+                    uint32_t a[4];
+                    if (QREG) { a[0] = qa[ks][0]; a[1] = qa[ks][1]; a[2] = qa[ks][2]; a[3] = qa[ks][3]; }
+                    else cc_f2_ldm(a, sQ + (warp * 16 + ar) * LD + ks * 16 + ac);
+                    #pragma unroll
+                    for (int j = 0; j < NKT; j += 2) {
+                        uint32_t b[4];
+                        cc_f2_ldm(b, sK + (j * 8 + br) * LD + ks * 16 + bc);
+                        cc_f2_mma(sc[j], a, b[0], b[1]);
+                        cc_f2_mma(sc[j + 1], a, b[2], b[3]);
+                    }
                 }
+            }
+            if constexpr (pass == CC_F2_WRITE_QK) {
+                #pragma unroll
+                for (int j = 0; j < NKT; j++)
+                    reinterpret_cast<float4 *>(o)[slot + j * 32] = *reinterpret_cast<const float4 *>(sc[j]);
+                break;
             }
             /* the masks only where a row's position or window cuts the block */
             const bool edge = !(k0 + BC - 1 <= wlo && (win <= 0 || k0 + win > whi));
@@ -1165,7 +1183,13 @@ __global__ static void __launch_bounds__(32 * NW) cc_attn_f2(const float *__rest
             x0 = fmaxf(x0, __shfl_xor_sync(0xffffffffu, x0, 1)); x0 = fmaxf(x0, __shfl_xor_sync(0xffffffffu, x0, 2));
             x1 = fmaxf(x1, __shfl_xor_sync(0xffffffffu, x1, 1)); x1 = fmaxf(x1, __shfl_xor_sync(0xffffffffu, x1, 2));
             const float n0 = fmaxf(m0, x0), n1 = fmaxf(m1, x1), c0 = __expf(m0 - n0), c1 = __expf(m1 - n1);
-            m0 = n0; m1 = n1; l0 *= c0; l1 *= c1;
+            m0 = n0; m1 = n1;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
+            if constexpr (pass == CC_F2_READ_QK) {
+                l0 = __fmul_rn(l0, c0); l1 = __fmul_rn(l1, c1);
+            } else
+#endif
+            { l0 *= c0; l1 *= c1; }
             #pragma unroll
             for (int dt = 0; dt < NDT; dt++) { oa[dt][0] *= c0; oa[dt][1] *= c0; oa[dt][2] *= c1; oa[dt][3] *= c1; }
             uint32_t pa[BC / 16][4];
@@ -1187,8 +1211,9 @@ __global__ static void __launch_bounds__(32 * NW) cc_attn_f2(const float *__rest
                     cc_f2_mma(oa[dt + 1], pa[kk], b[2], b[3]);
                 }
         }
-        __syncthreads();   /* sK and sV are rewritten next block */
+        if constexpr (pass != CC_F2_WRITE_QK) __syncthreads();   /* sK and sV are rewritten next block */
     }
+    if constexpr (pass == CC_F2_WRITE_QK) return;
     l0 += __shfl_xor_sync(0xffffffffu, l0, 1); l0 += __shfl_xor_sync(0xffffffffu, l0, 2);
     l1 += __shfl_xor_sync(0xffffffffu, l1, 1); l1 += __shfl_xor_sync(0xffffffffu, l1, 2);
     const float i0 = l0 > 0.f ? 1.f / l0 : 0.f, i1 = l1 > 0.f ? 1.f / l1 : 0.f;
@@ -1228,6 +1253,49 @@ static int cc_f2_256(CcCtx *c, int &ok, dim3 fg, CcBuf *q, CcBuf *kc, CcBuf *vc,
     coli_launch(cc_attn_f2<256, NW, BC, false, KT>, fg, 32 * NW, sm, c->stream, fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G, win, sk, so,
                 ring, sel);
     return 1;
+}
+
+/* A short continuation at a long prefix: only the independent QK tiles are split across CTAs.
+ * P, its f16 conversion, PV and all accumulated output visit the original 32-key tiles in sequence.
+ * Return 0 if the direct Flash fallback also declined, -1 after a CUDA error. */
+template<typename KT>
+static int cc_attn_long_f2(CcCtx *c, CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate,
+                           const CcAttn *p, int G) {
+    constexpr int nw = 4, bc = 32, ld = 256 + 8;
+    const unsigned nt = (unsigned)p->pos_base + (unsigned)p->S, tiles = 1 + (nt - 1) / bc;
+    const dim3 fg((unsigned)((p->S + 64 / G - 1) / (64 / G)), (unsigned)p->KVH);
+    const char *direct = getenv("COLI_CUDA_PR13_FLASH_DEV");
+    if (!(direct && *direct == '1') && tiles <= 65535 && nt <= 0x7fffffffu) {
+        const size_t bytes = (size_t)fg.x * fg.y * tiles * (16 * nw) * bc * sizeof(float);
+        float *scores = nullptr;
+        const cudaError_t alloc = cudaMallocAsync((void **)&scores, bytes, c->stream);
+        if (alloc == cudaSuccess) {
+            const dim3 kg(fg.x, fg.y, tiles);
+            coli_launch(cc_attn_f2<256, nw, bc, true, KT, CC_F2_WRITE_QK>, kg, 32 * nw,
+                        cc_f2_smem_bytes<256, nw, bc, true>(), c->stream, fp(q), kvp<KT>(kc), kvp<KT>(vc),
+                        scores, fp(gate), *p, G, 0, (const float *)nullptr, 0, 0, (const int *)nullptr);
+            int ok = launched(c, "attn long QK tiles");
+            if (ok) {
+                coli_launch(cc_attn_f2<256, nw, bc, false, KT, CC_F2_READ_QK>, fg, 32 * nw,
+                            (size_t)bc * ld * sizeof(__half), c->stream, (const float *)scores, kvp<KT>(kc),
+                            kvp<KT>(vc), fpw(o), fp(gate), *p, G, 0, (const float *)nullptr, 0, 0, (const int *)nullptr);
+                ok = launched(c, "attn long ordered Flash");
+            }
+            const bool freed = cc_ok(c, cudaFreeAsync(scores, c->stream), "attn long QK free");
+            return ok && freed ? 1 : -1;
+        }
+        if (alloc != cudaErrorMemoryAllocation && alloc != cudaErrorNotSupported) {
+            cc_ok(c, alloc, "attn long QK allocation");
+            return -1;
+        }
+        (void)cudaGetLastError();
+    }
+    int &big = sizeof(KT) == 2 ? c->f2_big_h : c->f2_big;
+    int &mid = sizeof(KT) == 2 ? c->f2_mid_h : c->f2_mid;
+    if (cc_f2_256<32, KT>(c, big, fg, q, kc, vc, o, gate, p, G, 0, nullptr, 0, 0, nullptr) ||
+        cc_f2_256<16, KT>(c, mid, fg, q, kc, vc, o, gate, p, G, 0, nullptr, 0, 0, nullptr))
+        return launched(c, "attn long direct Flash") ? 1 : -1;
+    return 0;
 }
 #endif
 /* whether cc_attn_f2_go takes a prompt chunk of this attention (no selection list): its gate
@@ -4118,11 +4186,32 @@ static int cc_attn_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBu
      * the query heads of a kv head dividing 16, no selection list */
     static int fl = -1;
     if (fl < 0) { const char *e = getenv("COLI_CUDA_CHAIN_FLASH"); fl = e && *e ? atoi(e) : 16; if (fl < 0) fl = 0; }
+    const auto read_decode_setting = [] {
+        const char *e = getenv("COLI_CUDA_ATTN_DEC");
+        return !(e && *e == '0');
+    };
+    static int plain_dec = -1, profiled_dec = -1;
+    int &dec = c->device_profile ? profiled_dec : plain_dec;
+    if (c->device_profile && (dec < 0 || (cc_uses_feature(c, Q36_LONG_ATTN) &&
+        (getenv("COLI_CUDA_CHAIN_TEST") || getenv("COLI_CUDA_CHAIN_BENCH")))))
+        dec = read_decode_setting();
+    const bool long_turn = cc_uses_feature(c, Q36_LONG_ATTN) && p->sel_row <= 0 && p->pos_base >= 2048;
     int G = p->H / p->KVH;
+    bool ordered_long = false;
 #if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
-    if (fl > 0 && p->S >= fl && p->sel_row <= 0 && cc_attn_f2_go<KT>(c, q, kc, vc, o, gate, p, G, 0, nullptr, 0, 0))
+    ordered_long = dec && long_turn && p->S > CC_ATTN_DEC_ROWS && p->S <= 64 && p->H == 16 &&
+                   p->KVH == 2 && p->hd == 256 && c->major >= 8 && !getenv("COLI_CUDA_F2_MODE");
+    if (ordered_long && fl > 0 && p->S >= fl && cc_attn_f2_fits(c, p, G)) {
+        const int rc = cc_attn_long_f2<KT>(c, q, kc, vc, o, gate, p, G);
+        if (rc) return rc > 0;
+    }
+#endif
+    const int max_dec_rows = long_turn && !ordered_long ? 64 : CC_ATTN_DEC_ROWS;
+    const bool dec_long = dec && long_turn && !ordered_long && p->S <= max_dec_rows;
+#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+    if (fl > 0 && p->S >= fl && !dec_long && p->sel_row <= 0 && cc_attn_f2_go<KT>(c, q, kc, vc, o, gate, p, G, 0, nullptr, 0, 0))
         return launched(c, "attn (tensor cores, one pass)");
-    if (fl > 0 && p->S >= fl && c->major >= 7 && p->sel_row <= 0 && 16 % G == 0 && (p->hd == 64 || p->hd == 128 || p->hd == 256)) {
+    if (fl > 0 && p->S >= fl && !dec_long && c->major >= 7 && p->sel_row <= 0 && 16 % G == 0 && (p->hd == 64 || p->hd == 128 || p->hd == 256)) {
         dim3 fg((unsigned)((p->S + 16 / G - 1) / (16 / G)), (unsigned)p->KVH);
         if (p->hd == 64) coli_launch(cc_attn_fk<64, KT>, fg, 128, 0, c->stream, fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G, 0, nullptr, 0, 0);
         else if (p->hd == 128) coli_launch(cc_attn_fk<128, KT>, fg, 128, 0, c->stream, fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G, 0, nullptr, 0, 0);
@@ -4134,8 +4223,7 @@ static int cc_attn_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBu
 #endif
     (void)fl;
     /* a decode's or a verify's rows over many positions: split over them */
-    static int dec = -1;
-    if (dec < 0) { const char *e = getenv("COLI_CUDA_ATTN_DEC"); dec = !(e && *e == '0'); }
+    if (dec < 0) dec = read_decode_setting();
     int last = p->pos_base + p->S;
     /* only where a prompt chunk takes cc_attn_fk (f16 on the tensor cores): elsewhere a row's
      * bits do not depend on how a forward is cut into steps, and a prefix resumed answers as
@@ -4153,7 +4241,7 @@ static int cc_attn_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBu
     const int *sp = (const int *)fp(sel);
     int lists = 0;
     if (p->sel_row > 0) { const char *e = getenv("COLI_CUDA_ATTN_DEC_SEL"); lists = !(e && *e == '0') && sp; }
-    if (dec && (p->sel_row <= 0 ? fk : lists) && p->S <= CC_ATTN_DEC_ROWS && last >= CC_ATTN_DEC_MIN) {
+    if (dec && (p->sel_row <= 0 ? fk : lists) && p->S <= max_dec_rows && last >= CC_ATTN_DEC_MIN) {
         /* each row as a decode step of it alone: its own blocks of positions (cc_attn_dec_len),
          * and the rows whose positions are fewer than CC_ATTN_DEC_MIN through cc_attn_k */
         int k = CC_ATTN_DEC_MIN - (p->pos_base + 1);
@@ -4192,9 +4280,9 @@ static int cc_attn_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBu
         }
         if (c->adec) {
             if (gq) cc_decg_launch(c, gq, fp(q), kvp<KT>(kc), kvp<KT>(vc), c->adec, *p, nb, 0, 0, hc);
-            else coli_launch(cc_attn_dec_k<KT>, dim3((unsigned)p->H, (unsigned)nb, (unsigned)p->S), 256, 0, c->stream, 
+            else coli_launch(cc_attn_dec_k<KT>, dim3((unsigned)p->H, (unsigned)nb, (unsigned)p->S), 256, 0, c->stream,
                 fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), c->adec, *p, 0, nb, 0, nullptr, 0, 0, 0, lists ? sp : nullptr);
-            coli_launch(cc_attn_dec_k<KT>, dim3((unsigned)p->H, (unsigned)p->S), 256, 0, c->stream, 
+            coli_launch(cc_attn_dec_k<KT>, dim3((unsigned)p->H, (unsigned)p->S), 256, 0, c->stream,
                 fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), c->adec, *p, 1, nb, 0, nullptr, 0, 0, hc, lists ? sp : nullptr);
             return launched(c, "attn (positions in blocks)");
         }
@@ -4787,9 +4875,9 @@ static int cc_attn_w2_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, C
         }
         if (c->adec) {
             if (gq) cc_decg_launch(c, gq, fp(q), kvp<KT>(kc), kvp<KT>(vc), c->adec, *p, nb, win, ring, hc);
-            else coli_launch(cc_attn_dec_k<KT>, dim3((unsigned)p->H, (unsigned)nb, (unsigned)p->S), 256, 0, c->stream, 
+            else coli_launch(cc_attn_dec_k<KT>, dim3((unsigned)p->H, (unsigned)nb, (unsigned)p->S), 256, 0, c->stream,
                 fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), c->adec, *p, 0, nb, win, sk, so, ring, 0, nullptr);
-            coli_launch(cc_attn_dec_k<KT>, dim3((unsigned)p->H, (unsigned)p->S), 256, 0, c->stream, 
+            coli_launch(cc_attn_dec_k<KT>, dim3((unsigned)p->H, (unsigned)p->S), 256, 0, c->stream,
                 fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), c->adec, *p, 1, nb, win, sk, so, ring, hc, nullptr);
             return launched(c, "attn (positions in blocks, window, sinks)");
         }

@@ -242,6 +242,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_CUDA_PIPE",                   CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_CUDA_PIPE_SHARD",             CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_CUDA_PIPE_S_MIN",             CE_INT   , CE_COLIBRI                                      , 0             , NULL},
+    {"COLI_CUDA_PR13_FLASH_DEV", CE_STR, CE_QWEN, 0, NULL}, /* Use direct Flash attention for a long prefix when set to 1. */
     {"COLI_CUDA_PROFILE", CE_INT, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_QSA_TILES", CE_BOOL, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_QX_CACHE", CE_BOOL, CE_QWEN, 0, NULL}, /* Reuse quantized activations across eligible projections. Defaults to the active profile. */
