@@ -49,6 +49,7 @@ static inline int q36_cuda_device_profile(int major, int minor, const char *name
         {Q36_GPU_3090, 8, 6, "NVIDIA GeForce RTX 3090", NULL, 0, 0},
         {Q36_GPU_PRO4000, 12, 0, "NVIDIA RTX PRO 4000 Blackwell", NULL, 0, 0},
         {Q36_GPU_4090, 8, 9, "NVIDIA GeForce RTX 4090", NULL, 0, 0},
+        {Q36_GPU_5090, 12, 0, "NVIDIA GeForce RTX 5090", NULL, 0, 0},
     };
 
     if (!name) return Q36_GPU_NONE;
@@ -68,6 +69,7 @@ static inline int q36_cuda_device_profile(int major, int minor, const char *name
 static inline int q36_has_request_rules(int profile) {
     switch (profile) {
     case Q36_GPU_4090:
+    case Q36_GPU_5090:
         return 1;
     default:
         return 0;
@@ -135,11 +137,31 @@ static inline unsigned q36_row_features(int profile, uint32_t rows, int generati
         { Q36_ANY_ROW, Q36_ANY_ROW }, /* expert matmul */
         { Q36_ROW(16), 0 }, /* long attn */
     };
+    static const struct PhaseRules rtx5090[13] = {
+        { Q36_ANY_ROW & ~Q36_ROWS(13, 16),
+          Q36_ANY_ROW & ~Q36_ROW(16) }, /* prompt cache */
+        { 0, 0 }, /* expert route */
+        { Q36_ANY_ROW, Q36_ROWS(9, 16) }, /* flash attn */
+        { Q36_ANY_ROW,
+          Q36_ANY_ROW & ~(Q36_ROW(10) | Q36_ROW(12) | Q36_ROW(14)) }, /* async copies */
+        { 0, 0 }, /* short matmul */
+        { Q36_ROWS(5, 14), Q36_ROWS(5, 14) & ~Q36_ROW(12) }, /* tiled matmul */
+        { Q36_ANY_ROW, 0 }, /* activation cache */
+        { Q36_ANY_ROW, Q36_ANY_ROW }, /* shared swiglu */
+        { 0, 0 }, /* fused norm */
+        { 0, 0 }, /* dnconv */
+        { Q36_ROW(1), Q36_ANY_ROW }, /* dnrec */
+        { Q36_ANY_ROW, 0 }, /* expert matmul */
+        { Q36_ROW(16), 0 }, /* long attn */
+    };
 
     const struct PhaseRules *rules;
     switch (profile) {
     case Q36_GPU_4090:
         rules = rtx4090;
+        break;
+    case Q36_GPU_5090:
+        rules = rtx5090;
         break;
     default:
         return 0;
@@ -165,6 +187,7 @@ static inline unsigned q36_device_features(int profile) {
         return Q36_AVAILABLE_FEATURES & ~(Q36_ACTIVATION_CACHE | Q36_DNCONV |
                                        Q36_DNREC | Q36_LONG_ATTN);
     case Q36_GPU_4090:
+    case Q36_GPU_5090:
         return q36_row_features(profile, Q36_ANY_ROW, 0) |
                q36_row_features(profile, Q36_ANY_ROW, 1);
     default:
