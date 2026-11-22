@@ -523,7 +523,7 @@ running `coli serve`, or starts one with `--model`. See [docs/tui.md](docs/tui.m
 <p align="center">
   <img src="docs/media/tui/tui-chat.png" width="900" alt="the terminal UI: the conversations, a question, the reasoning folded, the answer, its speed, and the hummingbird on the input box">
 </p>
-<p align="center"><em>Qwen3.8-Flash-Next on an RTX PRO 4000 through <code>coli serve</code>, at a 256K context.</em></p>
+<p align="center"><em>Qwen3.8-Flash-Next on an RTX PRO 4000 through <code>coli serve</code>, at a 64K context.</em></p>
 
 ## Use it from other apps
 

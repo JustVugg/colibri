@@ -537,7 +537,7 @@ donde la terminal dibuja sixel (Terminal de Windows, foot, WezTerm). Se conecta 
 <p align="center">
   <img src="docs/media/tui/tui-chat.png" width="900" alt="la interfaz de terminal: las conversaciones, una pregunta, el razonamiento plegado, la respuesta, su velocidad y el colibrí en la caja de entrada">
 </p>
-<p align="center"><em>Qwen3.8-Flash-Next en una RTX PRO 4000 mediante <code>coli serve</code>, con un contexto de 256K.</em></p>
+<p align="center"><em>Qwen3.8-Flash-Next en una RTX PRO 4000 mediante <code>coli serve</code>, con un contexto de 64K.</em></p>
 
 ## Usarlo desde otras apps
 

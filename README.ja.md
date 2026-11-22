@@ -327,7 +327,7 @@ curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -
 <p align="center">
   <img src="docs/media/tui/tui-chat.png" width="900" alt="ターミナル UI：会話の一覧、質問、折りたたまれた推論、回答とその速度、入力欄にとまるハチドリ">
 </p>
-<p align="center"><em>RTX PRO 4000 上の Qwen3.8-Flash-Next、<code>coli serve</code> 経由、コンテキスト 256K。</em></p>
+<p align="center"><em>RTX PRO 4000 上の Qwen3.8-Flash-Next、<code>coli serve</code> 経由、コンテキスト 64K。</em></p>
 
 ## ほかのアプリから使う
 

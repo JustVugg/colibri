@@ -1953,6 +1953,16 @@ static int q38_emap_on_card(Model *m,int i,int e){
     (void)m;return 0;
 #endif
 }
+/* EMAP's tier 1 also for the CUDA chain's host pool: page-locked RAM the card reads over the bus
+ * (q38cc_pool_init), where the experts the card leaves live when the RAM cache holds none of them */
+static int q38_emap_in_pool(Model *m,int i,int e){
+#ifdef COLI_CUDA
+    Q38CChain *ch=q38cc_of(m);
+    return ch&&ch->ok&&ch->pool_of&&ch->pool_of[(size_t)i*m->c.experts+e]>=0;
+#else
+    (void)m;(void)i;(void)e;return 0;
+#endif
+}
 static void serve_emap(Model *m){
     const Cfg *c=&m->c; int E=c->experts, rows=c->layers;
     char *hex=(char*)malloc((size_t)rows*E*2+1); int w=0;
@@ -1960,7 +1970,7 @@ static void serve_emap(Model *m){
         LCache *lc=&m->cache[i];
         for(int e=0;e<E;e++){
             int si=lc->by_expert?lc->by_expert[e]:-1;
-            int b=(q38_emap_on_card(m,i,e)?2:si>=0&&si<lc->n&&lc->slots[si].eid==e?1:0)<<6;   /* 2 = on the GPU */
+            int b=(q38_emap_on_card(m,i,e)?2:(si>=0&&si<lc->n&&lc->slots[si].eid==e)||q38_emap_in_pool(m,i,e)?1:0)<<6;   /* 2 on the GPU, 1 in RAM */
             hex[w++]="0123456789abcdef"[b>>4]; hex[w++]="0123456789abcdef"[b&15];
         }
     }

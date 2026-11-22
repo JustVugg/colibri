@@ -559,7 +559,7 @@ berjalan, atau menjalankan satu dengan `--model`. Lihat [docs/tui.md](docs/tui.m
 <p align="center">
   <img src="docs/media/tui/tui-chat.png" width="900" alt="antarmuka terminal: daftar percakapan, sebuah pertanyaan, penalaran terlipat, jawaban dan kecepatannya, serta kolibri di atas kotak input">
 </p>
-<p align="center"><em>Qwen3.8-Flash-Next pada RTX PRO 4000 melalui <code>coli serve</code>, dengan konteks 256K.</em></p>
+<p align="center"><em>Qwen3.8-Flash-Next pada RTX PRO 4000 melalui <code>coli serve</code>, dengan konteks 64K.</em></p>
 
 ## Gunakan dari aplikasi lain
 

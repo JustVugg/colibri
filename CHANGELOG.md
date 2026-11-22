@@ -659,7 +659,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 - **The expert map shows Qwen3.8's experts on a CUDA card.** Qwen3.8's map for the chat page and `coli tui`
   read the Vulkan tier only, so on CUDA every expert the card held showed as in RAM or on the disk ("VRAM 0%").
-  It now reads the CUDA tier too, and the CUDA chain's own slots where it holds the arena.
+  It now reads the CUDA tier too and the CUDA chain's own slots where it holds the arena, and counts the
+  chain's host pool (page-locked RAM the card reads over the bus) as RAM, where it showed as the disk.
 
 - **A GGUF's reads no longer queue one behind the other on Windows.** `gguf_read` read through the
   descriptor `open()` gives, a synchronous file object, and Windows runs one I/O at a time on one:

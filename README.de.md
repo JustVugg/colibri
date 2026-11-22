@@ -536,7 +536,7 @@ laufenden `coli serve` oder startet eines mit `--model`. Siehe [docs/tui.md](doc
 <p align="center">
   <img src="docs/media/tui/tui-chat.png" width="900" alt="die Terminal-Oberfläche: die Unterhaltungen, eine Frage, das eingeklappte Reasoning, die Antwort, ihre Geschwindigkeit und der Kolibri auf dem Eingabefeld">
 </p>
-<p align="center"><em>Qwen3.8-Flash-Next auf einer RTX PRO 4000 über <code>coli serve</code>, mit einem Kontext von 256K.</em></p>
+<p align="center"><em>Qwen3.8-Flash-Next auf einer RTX PRO 4000 über <code>coli serve</code>, mit einem Kontext von 64K.</em></p>
 
 ## Aus anderen Apps nutzen
 

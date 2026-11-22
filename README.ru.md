@@ -329,7 +329,7 @@ curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -
 <p align="center">
   <img src="docs/media/tui/tui-chat.png" width="900" alt="терминальный интерфейс: разговоры, вопрос, свёрнутые рассуждения, ответ, его скорость и колибри на поле ввода">
 </p>
-<p align="center"><em>Qwen3.8-Flash-Next на RTX PRO 4000 через <code>coli serve</code>, с контекстом 256K.</em></p>
+<p align="center"><em>Qwen3.8-Flash-Next на RTX PRO 4000 через <code>coli serve</code>, с контекстом 64K.</em></p>
 
 ## Использование из других приложений
 

@@ -550,7 +550,7 @@ rattache à un `coli serve` en cours d'exécution, ou en démarre un avec `--mod
 <p align="center">
   <img src="docs/media/tui/tui-chat.png" width="900" alt="l'interface du terminal : les conversations, une question, le raisonnement replié, la réponse, sa vitesse, et le colibri sur la zone de saisie">
 </p>
-<p align="center"><em>Qwen3.8-Flash-Next sur une RTX PRO 4000 via <code>coli serve</code>, avec un contexte de 256K.</em></p>
+<p align="center"><em>Qwen3.8-Flash-Next sur une RTX PRO 4000 via <code>coli serve</code>, avec un contexte de 64K.</em></p>
 
 ## Utiliser depuis d'autres applications
 

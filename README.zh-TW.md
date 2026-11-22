@@ -449,7 +449,7 @@ curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -
 <p align="center">
   <img src="docs/media/tui/tui-chat.png" width="900" alt="終端介面：對話列表、一個問題、摺疊的推理、回答及其速度，以及停在輸入框上的蜂鳥">
 </p>
-<p align="center"><em>Qwen3.8-Flash-Next 在 RTX PRO 4000 上透過 <code>coli serve</code> 執行，上下文 256K。</em></p>
+<p align="center"><em>Qwen3.8-Flash-Next 在 RTX PRO 4000 上透過 <code>coli serve</code> 執行，上下文 64K。</em></p>
 
 ## 從其他應用程式使用
 

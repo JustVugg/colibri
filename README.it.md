@@ -544,7 +544,7 @@ il terminale disegna sixel (Terminale di Windows, foot, WezTerm). Si collega a u
 <p align="center">
   <img src="docs/media/tui/tui-chat.png" width="900" alt="l'interfaccia nel terminale: le conversazioni, una domanda, il ragionamento chiuso, la risposta, la sua velocità e il colibrì sulla casella di testo">
 </p>
-<p align="center"><em>Qwen3.8-Flash-Next su una RTX PRO 4000 attraverso <code>coli serve</code>, con un contesto da 256K.</em></p>
+<p align="center"><em>Qwen3.8-Flash-Next su una RTX PRO 4000 attraverso <code>coli serve</code>, con un contesto da 64K.</em></p>
 
 ## Usarlo da altre app
 
