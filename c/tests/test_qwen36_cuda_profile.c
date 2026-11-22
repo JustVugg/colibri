@@ -50,6 +50,16 @@ int main(void) {
         check_mask(Q36_GPU_L4, 0, 64, 1, generation, 0, available);
         check_mask(Q36_GPU_L4, 5785, 1298, 0, generation, 1, available);
     }
+    check_device(8, 0, "NVIDIA A100-SXM4-40GB", GIB(39), Q36_GPU_A100);
+    check_value(q36_cuda_device_profile(8, 0, "NVIDIA A100-SXM4-40GB", GIB(80)),
+                Q36_GPU_NONE, "40GB profile rejects an oversized device");
+    unsigned a100 = Q36_ALL_FEATURES & ~4482u;
+    check_value(q36_device_features(Q36_GPU_A100), a100, "A100 available features");
+    check_mask(Q36_GPU_A100, 0, 64, 1, 0, 0, a100);
+    check_mask(Q36_GPU_A100, 0, 64, 0, 0, 0, a100 & ~Q36_DNREC);
+    check_mask(Q36_GPU_A100, 1, 64, 1, 0, 0, a100 & ~Q36_DNREC);
+    check_mask(Q36_GPU_A100, 0, 63, 1, 0, 0, a100 & ~Q36_DNREC);
+    check_mask(Q36_GPU_A100, 0, 64, 1, 1, 0, a100 & ~(Q36_FLASH_ATTN | Q36_ASYNC_COPIES));
     printf("Qwen3.6 CUDA profiles: %u checks, %u failures\n", checks, failures);
     return failures ? 1 : 0;
 }

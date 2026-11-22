@@ -94,6 +94,11 @@ static inline bool cc_uses_feature(const CcCtx *c, unsigned feature) {
     return c->device_profile && (c->kernel_mask & feature);
 }
 
+/* The L4 and RTX 4090 activation cache packs the ordered float norm. */
+static inline bool cc_pack_float_norm(const CcCtx *c) {
+    return (c->device_profile == Q36_GPU_L4 || c->device_profile == Q36_GPU_4090) && cc_uses_feature(c, Q36_ACTIVATION_CACHE);
+}
+
 CcCtx g_cc[COLI_CUDA_MAX_DEVICES];
 /* the retired attention scratches, after the stream was seen to pass the frames that read them */
 static void cc_adec_reap(CcCtx *c) {
@@ -3780,9 +3785,7 @@ static int cc_norm(CcBuf *x, CcBuf *w, CcBuf *y, const CcNorm *p) {
     float *yy = fpw(y);
     const bool skip_y = req_skip_y && skip_y_on && getenv("COLI_CUDA_DENSE_BM") == nullptr;
     int8_t *xq = nullptr; float *xs = nullptr;
-    /* The activation cache packs the float result. Fused INT8 output also
-     * changes the order of the sum of squares, even when it stores float rows. */
-    if (!cc_uses_feature(c, Q36_ACTIVATION_CACHE) && pn.D == 2048 && pn.per_row == 1 && !(pn.flags & 8) &&
+    if (!cc_pack_float_norm(c) && pn.D == 2048 && pn.per_row == 1 && !(pn.flags & 8) &&
         ((pn.x_off | pn.x_row | pn.w_off) & 3) == 0 &&
         pn.y_off == 0 && pn.y_row == pn.D && pn.y_seg == pn.D)
         coli_cuda_qx_prepare(c->device, yy, pn.nseg, pn.D, &xq, &xs, 0, (int)skip_y);
@@ -4198,7 +4201,8 @@ static int cc_attn_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBu
     int G = p->H / p->KVH;
     bool ordered_long = false;
 #if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
-    ordered_long = dec && long_turn && p->S > CC_ATTN_DEC_ROWS && p->S <= 64 && p->H == 16 &&
+    const bool ordered_profile = c->device_profile == Q36_GPU_L4;
+    ordered_long = ordered_profile && dec && long_turn && p->S > CC_ATTN_DEC_ROWS && p->S <= 64 && p->H == 16 &&
                    p->KVH == 2 && p->hd == 256 && c->major >= 8 && !getenv("COLI_CUDA_F2_MODE");
     if (ordered_long && fl > 0 && p->S >= fl && cc_attn_f2_fits(c, p, G)) {
         const int rc = cc_attn_long_f2<KT>(c, q, kc, vc, o, gate, p, G);
@@ -4490,7 +4494,7 @@ static int cc_ew_norm(CcBuf *y, CcBuf *a, CcBuf *b, CcBuf *cb, CcBuf *e, const C
     float *yy = fpw(y), *yyn = fpw(yn), *ee = (pe->op == CC_EW_ADD && (pe->flags & 4)) ? fpw(e) : (float *)fp(e);
     const bool skip_yn = req_skip_yn && skip_yn_on && getenv("COLI_CUDA_DENSE_BM") == nullptr;
     int8_t *xq = nullptr; float *xs = nullptr;
-    if (!cc_uses_feature(c, Q36_ACTIVATION_CACHE) && pn.D == 2048 && pn.per_row == 1 && !(pn.flags & 8) &&
+    if (!cc_pack_float_norm(c) && pn.D == 2048 && pn.per_row == 1 && !(pn.flags & 8) &&
         ((pe->a_off | pe->b_off | pe->c_off | pe->y_off | pn.w_off) & 3) == 0 &&
         pn.y_off == 0 && pn.y_row == pn.D && pn.y_seg == pn.D)
         coli_cuda_qx_prepare(c->device, yyn, pn.nseg, pn.D, &xq, &xs, 0, (int)skip_yn);
