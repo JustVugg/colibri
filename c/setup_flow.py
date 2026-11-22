@@ -1850,6 +1850,9 @@ def download_model(ui, entry, model_dir, *, via_windows="auto", verify=True, ext
     whole in extra_dirs (a model split across drives) are neither counted as missing
     nor fetched again."""
     token = setup_download.hf_token()
+    # Say where it is going before the first request: a network that does not answer
+    # otherwise leaves the screen at the "Download:" line for minutes (#2970).
+    ui.say(f"  connecting to {setup_download.endpoint()} for the file list")
     files = setup_download.list_repo_files(entry.repo, entry.revision, include=entry.include,
                                            exclude=entry.exclude, token=token)
     if not files:
@@ -1903,8 +1906,12 @@ def download_model(ui, entry, model_dir, *, via_windows="auto", verify=True, ext
                               total=event["total"], rate=rate, eta_seconds=eta, model_dir=model_dir)
 
     write_state("download", model=entry.id, done=have, total=total, model_dir=model_dir)
+    # the bar from the start, before the first byte arrives, and every retry on its own
+    # line with its cause: "trying again" instead of a screen that does not move (#2970)
+    progress({"file": "", "done": have, "total": total, "fresh": 0})
     setup_download.download_repo(entry.repo, entry.revision, model_dir, files, token=token,
-                                 progress=progress, curl=curl, verify=verify, extra_dirs=extra_dirs)
+                                 progress=progress, curl=curl, verify=verify, extra_dirs=extra_dirs,
+                                 notice=lambda text: ui.say(f"  {text}"))
     ui.progress(f"  [{'#' * 24}] 100.0%  {human_size(total)}  done", force=True)
     ui.say("")
     return total

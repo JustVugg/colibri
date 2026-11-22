@@ -5,6 +5,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`coli setup` says what the download waits for.** After `Download: ...; safe to interrupt`, the
+  screen stayed as it was until the first byte arrived: a network that did not answer cost up to
+  six attempts of a minute each with nothing printed. The setup now names the host it connects to,
+  draws the progress bar at once, and prints every retry with its cause and its number
+  (`model-00001.safetensors: Temporary failure in name resolution; trying again in 2 s (retry 2
+  of 5)`); the final error names the cause instead of urllib's `<urlopen error ...>`. (#2970)
+
 ## [2.2.0] - 2026-11-21
 
 ### New

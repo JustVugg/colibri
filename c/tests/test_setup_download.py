@@ -201,6 +201,48 @@ class DownloadTest(unittest.TestCase):
         self.assertEqual(Path(dest).read_bytes(), self.files[name])
         self.assertEqual(self.ranges(name), [None, "bytes=50000-"])
 
+    def test_every_retry_is_told_with_its_cause(self):
+        # #2970: retries were silent, so a network that did not answer left setup at
+        # its "Download:" line for minutes with nothing on the screen
+        name = "model-00001.safetensors"
+        self.hub.cut_after[name] = 50_000
+        dest = os.path.join(self.dst, name)
+        told = []
+        setup_download.download_file(self.url(name), dest, self.spec(name), retries=2,
+                                     notice=told.append)
+        self.assertEqual(Path(dest).read_bytes(), self.files[name])
+        self.assertEqual(len(told), 1)
+        self.assertIn(name, told[0])
+        self.assertIn("trying again in 1 s (retry 1 of 2)", told[0])
+
+    def test_a_network_that_does_not_answer_names_its_cause(self):
+        name = "README.md"
+        dest = os.path.join(self.dst, name)
+        cause = OSError(-3, "Temporary failure in name resolution")
+
+        def offline(*args, **kwargs):
+            raise setup_download.urllib.error.URLError(cause)
+        told = []
+        with self.assertRaises(setup_download.DownloadError) as caught:
+            setup_download.download_file(self.url(name), dest, self.spec(name), retries=2,
+                                         opener=offline, notice=told.append)
+        self.assertEqual(len(told), 2)
+        self.assertTrue(all("Temporary failure in name resolution" in text for text in told))
+        self.assertIn("retry 2 of 2", told[-1])
+        self.assertIn("Temporary failure in name resolution", str(caught.exception))
+        self.assertNotIn("<urlopen error", str(caught.exception))
+        self.assertIn("rerun to continue", str(caught.exception))
+
+    def test_repository_download_passes_the_notice_on(self):
+        name = "model-00000.safetensors"
+        self.hub.cut_after[name] = 100_000
+        told = []
+        setup_download.download_repo(REPO, "main", self.dst, self.listing(include=(name,)),
+                                     base=self.hub.base, notice=told.append)
+        self.assertEqual(Path(self.dst, name).read_bytes(), self.files[name])
+        self.assertEqual(len(told), 1)
+        self.assertIn(name, told[0])
+
     def test_server_ignoring_range_restarts_instead_of_appending(self):
         name = "model-00001.safetensors"
         dest = os.path.join(self.dst, name)

@@ -2813,6 +2813,40 @@ class DownloadProgressTest(HomeTestCase):
         self.assertIn("1.0 MB/s", moving)
         self.assertIn("2 min left", moving)
 
+    def test_the_screen_says_what_it_waits_for_before_the_first_byte(self):
+        # #2970: nothing after "Download: ...; safe to interrupt" while the network did
+        # not answer; the setup now names the host, draws the bar at once, and prints
+        # each retry with its cause
+        entry = mock.Mock(repo="tester/m", revision="main", include=None, exclude=None, id="m")
+        model_dir = os.path.join(self.tmp.name, "model")
+        os.makedirs(model_dir)
+        stream = io.StringIO()
+        stream.isatty = lambda: True
+        ui = setup_flow.UI(False, stream=stream)
+        seen = {}
+
+        def pull(*args, progress, notice, **kwargs):
+            seen["before"] = stream.getvalue()
+            notice("model.safetensors: Temporary failure in name resolution; trying again in "
+                   "1 s (retry 1 of 5)")
+            progress({"file": "model.safetensors", "done": 10, "total": 10, "fresh": 10})
+
+        with mock.patch.dict(os.environ, {"HF_ENDPOINT": "https://hub.example.test"}), \
+             mock.patch.object(setup_download, "hf_token", return_value=None), \
+             mock.patch.object(setup_download, "list_repo_files",
+                               return_value=[{"path": "model.safetensors", "size": 10}]), \
+             mock.patch.object(setup_download, "bytes_present", return_value=0), \
+             mock.patch.object(setup_hw, "disk_free", return_value=None), \
+             mock.patch.object(setup_hw, "is_wsl", return_value=False), \
+             mock.patch.object(setup_flow, "write_state"), \
+             mock.patch.object(setup_flow, "write_state_throttled"), \
+             mock.patch.object(setup_download, "download_repo", side_effect=pull):
+            setup_flow.download_model(ui, entry, model_dir)
+        self.assertIn("connecting to https://hub.example.test", seen["before"])
+        self.assertIn("0.0%", seen["before"])              # the bar before any byte
+        text = stream.getvalue()
+        self.assertIn("\n  model.safetensors: Temporary failure in name resolution; trying again", text)
+
 
 class PortFreeTest(unittest.TestCase):
     """A port is free when nothing answers on it AND a server could bind it now."""
