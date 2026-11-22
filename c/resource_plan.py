@@ -2385,7 +2385,10 @@ def _read_cgroup_mounts(proc_mountinfo_path):
     ``None`` means the file is absent. Every record is held to mountinfo(5)'s
     grammar so a truncated or synthetic file is a refusal rather than a quiet
     "no cgroup mounts here"; paths are decoded only for cgroup records, so an
-    unrelated mount with an unusual name cannot block discovery.
+    unrelated mount with an unusual name cannot block discovery. The super options
+    end the record and are the one field the kernel does not escape: a filesystem
+    prints them itself, and WSL's 9p mounts carry a Windows path with its spaces
+    (``path=C:\\Program Files\\...``), so they are the rest of the line.
     """
     present, raw = _read_bounded_bytes(
         proc_mountinfo_path, _CGROUP_MOUNTINFO_MAX_BYTES, "cgroup mountinfo file")
@@ -2401,8 +2404,9 @@ def _read_cgroup_mounts(proc_mountinfo_path):
             separator = fields.index(b"-", 6)
         except ValueError as error:
             raise CgroupFormatError(f"mountinfo record lacks separator: {line!r}") from error
-        if len(fields) != separator + 4:
+        if len(fields) < separator + 4:
             raise CgroupFormatError(f"malformed mountinfo record: {line!r}")
+        super_options = b" ".join(fields[separator + 3:])
         mount_id = _parse_bounded_id(fields[0], "mountinfo mount id", allow_zero=False)
         parent_id = _parse_bounded_id(fields[1], "mountinfo parent id")
         device = fields[2].split(b":")
@@ -2428,7 +2432,7 @@ def _read_cgroup_mounts(proc_mountinfo_path):
         mount_point = Path("/").joinpath(
             *_decode_proc_path(fields[4], "cgroup mount point"))
         options = (_parse_mount_options(fields[5], "cgroup mount options")
-                   | _parse_mount_options(fields[separator + 3], "cgroup super options"))
+                   | _parse_mount_options(super_options, "cgroup super options"))
         mounts.append(_CgroupMount(mount_id=mount_id, parent_id=parent_id, root=root,
                                    mount_point=mount_point,
                                    fs_type=fs_type.decode("ascii"), options=options))
