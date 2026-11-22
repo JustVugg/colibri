@@ -3081,6 +3081,26 @@ def _physical_cores_warn(message):
     print(f"[plan] warning: {message}", file=sys.stderr)
 
 
+def apple_team_cores(cpus, names):
+    """The team of an Apple Silicon machine from its performance levels, fastest first
+    (omp_tune.h coli_apple_team_cores, the same rule): ``cpus[i]`` is
+    hw.perflevel<i>.logicalcpu (0 when it could not be read), ``names[i]`` its
+    hw.perflevel<i>.name, None when it could not be read.
+
+    A level is left out by its name, not by its place: an M5 Pro has two levels and
+    neither is the efficiency cores' (6 Super, 12 Performance), and leaving the last
+    one out gave it 6 threads for 18 cores (#2938). When a name is missing, or the
+    names leave no core, the rule is the one from before the names were read: every
+    level but the last, one level being every core.
+    """
+    if cpus and len(names) == len(cpus) and all(names):
+        cores = sum(count for count, name in zip(cpus, names)
+                    if name.strip().lower() != "efficiency" and count > 0)
+        if cores > 0:
+            return cores
+    return sum(count for count in cpus[:max(len(cpus) - 1, 1)] if count > 0)
+
+
 def physical_cpu_count():
     """Number of physical CPU cores (not SMT siblings).
 
@@ -3122,17 +3142,29 @@ def physical_cpu_count():
     if sys.platform == "darwin":
         # Apple Silicon: every core but the efficiency tier's paces barriered expert
         # matmuls (omp_tune.h coli_physical_cores, the same rule). The tiers are
-        # hw.perflevel0 .. hw.perflevel(N-1), fastest first, the last the efficiency
-        # cores: two on an M1-M4 (perflevel0 alone), three on an M6 (2 Super + 4
-        # Performance, #2194); one tier is every core.
-        def sysctl_int(name):
+        # hw.perflevel0 .. hw.perflevel(N-1), fastest first, and the one named
+        # Efficiency is left out (apple_team_cores): two on an M1-M4 (perflevel0
+        # alone), three on an M6 (2 Super + 4 Performance, #2194), two with no
+        # efficiency cores on an M5 Pro (6 Super + 12 Performance, #2938); one tier
+        # is every core.
+        def sysctl_text(name):
             result = subprocess.run(["sysctl", "-n", name], text=True, capture_output=True,
                                     check=True, timeout=5)
-            return int(result.stdout.strip())
+            return result.stdout.strip()
+
+        def sysctl_int(name):
+            return int(sysctl_text(name))
+
+        def sysctl_or(read, name, missing):
+            try:
+                return read(name)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                return missing
         try:
-            levels = sysctl_int("hw.nperflevels")
-            cores = sum(sysctl_int(f"hw.perflevel{i}.logicalcpu")
-                        for i in range(min(max(levels - 1, 1), 16))) if levels >= 1 else 0
+            levels = min(sysctl_int("hw.nperflevels"), 16)
+            cores = apple_team_cores(
+                [sysctl_or(sysctl_int, f"hw.perflevel{i}.logicalcpu", 0) for i in range(levels)],
+                [sysctl_or(sysctl_text, f"hw.perflevel{i}.name", None) for i in range(levels)])
             if cores > 0:
                 return cores
         except (OSError, ValueError, subprocess.SubprocessError):

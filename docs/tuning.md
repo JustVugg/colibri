@@ -50,7 +50,9 @@ Auto-tier plans size OpenMP from physical cores and bind workers across cores.
 Memory-bound quantized kernels can regress sharply when SMT siblings compete for
 limited memory channels. On a hybrid CPU the team is the performance cores only:
 an OpenMP team meets at a barrier after every matmul, so its slowest thread sets the
-pace. That is Apple Silicon's P-cores (`hw.perflevel0`), and on x86 the cores of the
+pace. On Apple Silicon that is every performance level but the one named `Efficiency`
+(`hw.perflevel<i>.name`: an M1-M4's P-cores, an M6's Super and Performance cores, every
+core of an M5 Pro, whose two levels are Super and Performance), and on x86 the cores of the
 highest `EfficiencyClass` on Windows or the `cpu_core` PMU's on Linux (Intel's P-cores;
 an i5-13500, 6 P + 8 E cores, decoded Qwen3.8 IQ2_XS on the CPU at 9.40 tok/s on its 6
 P-cores against 9.00 on all 14). The GLM, Kimi K3, and OLMoE engines also apply that

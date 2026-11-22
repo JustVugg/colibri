@@ -13,6 +13,7 @@ from resource_plan import (
     MANY_COMPUTE_UNITS,
     CgroupFormatError,
     analyze_model,
+    apple_team_cores,
     build_plan,
     chat_context,
     cpu_socket_count,
@@ -3370,6 +3371,39 @@ class PhysicalCpuCountTest(unittest.TestCase):
         with mock.patch("resource_plan.subprocess.run", side_effect=self._darwin(values)), \
              mock.patch.object(sys, "platform", "darwin"):
             self.assertEqual(physical_cpu_count(), 6)
+
+    def test_apple_silicon_tier_is_left_out_by_its_name_not_its_place(self):
+        # #2938, an M5 Pro: 6 Super and 12 Performance cores and no efficiency tier;
+        # the last tier left out by its place gave 6 threads for 18 cores
+        values = {"hw.nperflevels": 2, "hw.perflevel0.logicalcpu": 6, "hw.perflevel0.name": "Super",
+                  "hw.perflevel1.logicalcpu": 12, "hw.perflevel1.name": "Performance",
+                  "hw.physicalcpu": 18}
+        with mock.patch("resource_plan.subprocess.run", side_effect=self._darwin(values)), \
+             mock.patch.object(sys, "platform", "darwin"):
+            self.assertEqual(physical_cpu_count(), 18)
+
+    def test_apple_silicon_named_tiers_keep_the_counts_of_the_place_rule(self):
+        m1_max = {"hw.nperflevels": 2, "hw.perflevel0.logicalcpu": 8, "hw.perflevel0.name": "Performance",
+                  "hw.perflevel1.logicalcpu": 2, "hw.perflevel1.name": "Efficiency", "hw.physicalcpu": 10}
+        m6 = {"hw.nperflevels": 3, "hw.perflevel0.logicalcpu": 2, "hw.perflevel0.name": "Super",
+              "hw.perflevel1.logicalcpu": 4, "hw.perflevel1.name": "Performance",
+              "hw.perflevel2.logicalcpu": 6, "hw.perflevel2.name": "Efficiency", "hw.physicalcpu": 12}
+        for values, want in ((m1_max, 8), (m6, 6)):
+            with mock.patch("resource_plan.subprocess.run", side_effect=self._darwin(values)), \
+                 mock.patch.object(sys, "platform", "darwin"):
+                self.assertEqual(physical_cpu_count(), want)
+
+    def test_apple_team_cores_is_the_place_rule_without_every_name(self):
+        # the same table as tests/test_omp_tune.c's test_apple_tiers
+        self.assertEqual(apple_team_cores([6, 12], ["Super", "Performance"]), 18)
+        self.assertEqual(apple_team_cores([8, 2], ["performance", "EFFICIENCY"]), 8)
+        self.assertEqual(apple_team_cores([6, 12], ["Super", None]), 6)
+        self.assertEqual(apple_team_cores([6, 12], ["Super", ""]), 6)
+        self.assertEqual(apple_team_cores([2, 4, 6], [None, None, None]), 6)
+        self.assertEqual(apple_team_cores([4], ["Efficiency"]), 4)      # the names leave no core
+        self.assertEqual(apple_team_cores([0, 12], ["Super", "Performance"]), 12)   # a count not read
+        self.assertEqual(apple_team_cores([8, 2], ["Performance", "Efficiency2"]), 10)
+        self.assertEqual(apple_team_cores([], []), 0)
 
     def test_apple_one_tier_is_every_core_and_older_macos_reads_perflevel0(self):
         one = {"hw.nperflevels": 1, "hw.perflevel0.logicalcpu": 8, "hw.physicalcpu": 8}

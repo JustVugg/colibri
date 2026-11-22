@@ -70,6 +70,43 @@ static int test_windows_hybrid_records(void)
 }
 #endif
 
+/* #2938: an Apple performance level is left out by its name, not by its place. An M5
+ * Pro's two levels are 6 Super and 12 Performance, and the last one left out gave it 6
+ * threads for 18 cores. The rule is plain C, so every host checks it. */
+static int test_apple_tiers(void)
+{
+    static const struct {
+        const char *what; int n; int cpus[3]; const char *names[3]; int want;
+    } t[] = {
+        { "an M1 Max",              2, { 8, 2 },    { "Performance", "Efficiency" },          8 },
+        { "an M6 (#2194)",          3, { 2, 4, 6 }, { "Super", "Performance", "Efficiency" }, 6 },
+        { "an M5 Pro (#2938)",      2, { 6, 12 },   { "Super", "Performance" },               18 },
+        { "one level",              1, { 8 },       { "Performance" },                        8 },
+        { "the name's case",        2, { 8, 2 },    { "performance", "EFFICIENCY" },          8 },
+        { "a name not read",        2, { 6, 12 },   { "Super", NULL },                        6 },
+        { "an empty name",          2, { 6, 12 },   { "Super", "" },                          6 },
+        { "no name read",           3, { 2, 4, 6 }, { NULL, NULL, NULL },                     6 },
+        { "efficiency cores only",  1, { 4 },       { "Efficiency" },                         4 },
+        { "a count not read",       2, { 0, 12 },   { "Super", "Performance" },               12 },
+        { "a longer name",          2, { 8, 2 },    { "Performance", "Efficiency2" },         10 },
+    };
+    int fail = 0;
+    for (size_t i = 0; i < sizeof t / sizeof t[0]; i++) {
+        int got = coli_apple_team_cores(t[i].n, t[i].cpus, t[i].names);
+        if (got != t[i].want) {
+            fprintf(stderr, "Apple performance levels, %s: a team of %d, want %d\n",
+                    t[i].what, got, t[i].want);
+            fail = 1;
+        }
+    }
+    const int two[2] = { 8, 2 };
+    if (coli_apple_team_cores(2, two, NULL) != 8 || coli_apple_team_cores(0, two, NULL) != 0) {
+        fprintf(stderr, "Apple performance levels: no name table, or no level, was not the place rule\n");
+        fail = 1;
+    }
+    return fail;
+}
+
 #ifdef _OPENMP
 static int test_cgroup_cpu_quota_bound(void)
 {
@@ -119,10 +156,14 @@ static int test_cgroup_cpu_quota_bound(void) { return 0; }
 int main(void)
 {
 #ifndef _OPENMP
+    if (test_apple_tiers()) {
+        puts("test_omp_tune: FAIL");
+        return 1;
+    }
     puts("test_omp_tune: ok (OpenMP unavailable; helper is a no-op)");
     return 0;
 #else
-    int fail = 0;
+    int fail = test_apple_tiers();
     int logical = omp_get_num_procs();
     int physical = coli_physical_cores();
 

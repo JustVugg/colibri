@@ -5,6 +5,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **An Apple M5 Pro's OpenMP team is its 18 cores, not 6.** The launcher (`resource_plan.py`
+  `physical_cpu_count`) and the engines (`omp_tune.h` `coli_physical_cores`) left the last
+  performance level out, taking it for the efficiency cores; an M5 Pro's two levels are 6 Super and
+  12 Performance, so the team was 6 threads. A level is now left out by its name
+  (`hw.perflevel<i>.name` is `Efficiency`), with the old rule when a name cannot be read. M1-M4 and
+  M6 keep the same team. The reporter measured MiMo-V2.6 Flash at 0.60 tok/s with 6 threads and
+  1.18 with 18 (cold cache), 0.75 against 1.28 warm. (#2938)
+
 ## [2.2.0] - 2026-11-21
 
 ### New

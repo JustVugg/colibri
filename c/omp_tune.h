@@ -106,6 +106,44 @@ static int coli_count_windows_physical_cores(const void *buf, DWORD bytes)
 }
 #endif
 
+/* 1 when an Apple performance level's name (hw.perflevel<i>.name) is the efficiency
+ * cores', whatever its case. */
+static inline int coli_apple_tier_is_efficiency(const char *name)
+{
+    static const char want[] = "efficiency";
+    size_t i = 0;
+    if (!name) return 0;
+    for (; want[i]; i++) {
+        char c = name[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        if (c != want[i]) return 0;
+    }
+    return name[i] == 0;
+}
+
+/* The team of an Apple Silicon machine from its performance levels, fastest first:
+ * cpus[i] is hw.perflevel<i>.logicalcpu (0 when it could not be read), names[i] its
+ * hw.perflevel<i>.name, NULL when it could not be read. A level is left out by its
+ * name, not by its place: an M5 Pro has two levels and neither is the efficiency
+ * cores' (6 Super, 12 Performance), and leaving the last one out gave it 6 threads
+ * for 18 cores (#2938). When a name is missing, or the names leave no core, the rule
+ * is the one from before the names were read: every level but the last, one level
+ * being every core. Here rather than under __APPLE__ so that tests/test_omp_tune.c
+ * checks it on every host. */
+static inline int coli_apple_team_cores(int n, const int *cpus, const char *const *names)
+{
+    int named = n > 0, tot = 0;
+    for (int i = 0; i < n; i++) if (!names || !names[i] || !names[i][0]) named = 0;
+    if (named) {
+        for (int i = 0; i < n; i++)
+            if (!coli_apple_tier_is_efficiency(names[i]) && cpus[i] > 0) tot += cpus[i];
+        if (tot > 0) return tot;
+    }
+    const int last = n > 1 ? n - 1 : n;
+    for (int i = 0; i < last; i++) if (cpus[i] > 0) tot += cpus[i];
+    return tot;
+}
+
 static int coli_physical_cores(void)
 {
 #if defined(_WIN32)
@@ -124,18 +162,26 @@ static int coli_physical_cores(void)
     /* Apple Silicon: every core but the efficiency tier's. hw.physicalcpu counts
      * the E-cores too (10 on an M1 Max), and with a barrier per matmul the slowest
      * thread sets the pace: the E-cores slowed the team (#707, -4.2% decode). The
-     * tiers are hw.perflevel0 .. hw.perflevel(N-1), fastest first, the last the
-     * efficiency cores: an M1-M4 has two (perflevel0, its P-cores), an M6 three
-     * (2 Super, 4 Performance, 6 Efficiency: 6, not perflevel0's 2, #2194); one
-     * tier is every core. An Intel Mac has no perflevel*: hw.physicalcpu. */
+     * tiers are hw.perflevel0 .. hw.perflevel(N-1), fastest first, and the one
+     * named Efficiency is left out (coli_apple_team_cores): an M1-M4 has two
+     * (perflevel0, its P-cores), an M6 three (2 Super, 4 Performance, 6 Efficiency:
+     * 6, not perflevel0's 2, #2194), an M5 Pro two with no efficiency cores (6 Super,
+     * 12 Performance: 18, #2938); one tier is every core. An Intel Mac has no
+     * perflevel*: hw.physicalcpu. */
     int n = 0; size_t sz = sizeof(n);
     if (sysctlbyname("hw.nperflevels", &n, &sz, NULL, 0) == 0 && n >= 1) {
-        int tot = 0, last = n > 1 ? n - 1 : 1;
-        for (int i = 0; i < last && i < 16; i++) {
+        int cpus[16]; char names[16][32]; const char *name[16];
+        if (n > 16) n = 16;
+        for (int i = 0; i < n; i++) {
             char nm[48]; snprintf(nm, sizeof nm, "hw.perflevel%d.logicalcpu", i);
             int c = 0; sz = sizeof(c);
-            if (sysctlbyname(nm, &c, &sz, NULL, 0) == 0 && c > 0) tot += c;
+            cpus[i] = sysctlbyname(nm, &c, &sz, NULL, 0) == 0 && c > 0 ? c : 0;
+            /* a name longer than the buffer fails (ENOMEM) and reads as missing */
+            snprintf(nm, sizeof nm, "hw.perflevel%d.name", i);
+            memset(names[i], 0, sizeof names[i]); sz = sizeof(names[i]) - 1;
+            name[i] = sysctlbyname(nm, names[i], &sz, NULL, 0) == 0 && names[i][0] ? names[i] : NULL;
         }
+        int tot = coli_apple_team_cores(n, cpus, name);
         if (tot > 0) return tot;
     }
     int v = 0; sz = sizeof(v);
