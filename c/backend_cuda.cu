@@ -181,6 +181,7 @@ static bool use_plain_swiglu_schedule(const DeviceContext *ctx) {
     switch (ctx->device_profile) {
     case Q36_GPU_A100:
     case Q36_GPU_3090:
+    case Q36_GPU_L40S:
         return true;
     default:
         return false;
