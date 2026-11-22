@@ -1344,8 +1344,8 @@ static int q36cc_snap_tab(Q36CChain *ch, Model *m, int i, int c0, int ns, int *r
     *rec_off = i * 2 * Q36_SPEC_SNAPS * 2; *ring_off = *rec_off + Q36_SPEC_SNAPS * 2;
     return 1;
 }
-static int q36cc_deltanet(Q36CChain *ch, Model *m, Layer *l, int i, int n, int c0, int ns) {
-    Cfg *c = &m->c; (void)l;
+static int q36cc_deltanet(Q36CChain *ch, Model *m, int i, int n, int c0, int ns) {
+    Cfg *c = &m->c;
     int vh = c->dn_vheads, CD = c->dn_conv_dim, vd = vh * c->dn_vdim, PD = CD + vd;
     /* one in_proj: rows of qkv ++ z, PD wide; two (q36cc_dnp): n rows of qkv, then n of z */
     const int two = ch->t_dnz[i] != NULL, qr = two ? CD : PD, zr = two ? vd : PD;
@@ -1360,10 +1360,11 @@ static int q36cc_deltanet(Q36CChain *ch, Model *m, Layer *l, int i, int n, int c
         int s0 = ns > 1 ? r : 0, len = ns > 1 && r < ns - 1 ? 1 : n - s0, snap_row = ns && !one ? 0 : -1;
         if (one) { s0 = 0; len = n; }
         CcBuf *rs = one ? ch->snap_tab : ns ? ch->rec_snap[c0 + r][i] : NULL, *cs = one ? ch->snap_tab : ns ? ch->ring_snap[c0 + r][i] : NULL;
-        CcDnConv cp = {len, CD, c->dn_convk, s0 * qr, qr, s0 * CD, CD, snap_row, 0, (int)ch->o_conv[i], 0, one ? ring_off : 0, one ? ns : 0};
+        CcDnConv cp = {len, CD, c->dn_convk, s0 * qr, qr, s0 * CD, CD, snap_row, 0,
+                       (int)ch->o_conv[i], 0, one ? ring_off : 0, one ? ns : 0};
         CcDnRec rp = {len, vh, c->dn_kheads, c->dn_vdim, c->dn_kheads * c->dn_kdim, s0 * CD, CD, s0 * 2 * vh, 2 * vh,
                       vh + s0 * 2 * vh, 2 * vh, (int)z0 + s0 * zr, zr, s0 * vd, vd, snap_row,
-                      (g_ssm_a_direct ? 2 : 0) | (g_dn_tiled ? 4 : 0), c->eps,   /* a GGUF's layout (qwen36.c) */
+                      (g_ssm_a_direct ? 2 : 0) | (g_dn_tiled ? 4 : 0), c->eps,
                       1.f / sqrtf((float)c->dn_kdim), 0, one ? rec_off : 0, (int)ch->o_dn[i], one ? ns : 0};
         ok = cc_dnconv(ch->qkvz, ch->prm, ch->ring[i], ch->cv, cs, &cp) &&
              cc_dnrec(c->dn_kdim, ch->cv, ch->ab, ch->qkvz, ch->rec[i], ch->prm, ch->dny, rs, &rp);
@@ -2452,7 +2453,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
             if (ch->mx_rows) ok = ok && (c->is_attn[i] ? q36cc_attention_mx(ch, m, l, i, n, c0) :
                                          c->lfm3 ? q36cc_shortconv_mx(ch, m, i, n, c0) : q36cc_deltanet_mx(ch, m, l, i, n, c0));
             else ok = ok && (c->is_attn[i] ? q36cc_attention(ch, m, l, i, n, pb, ordered_books) :
-                             c->lfm3 ? q36cc_shortconv(ch, m, i, n, c0, ns) : q36cc_deltanet(ch, m, l, i, n, c0, ns));
+                             c->lfm3 ? q36cc_shortconv(ch, m, i, n, c0, ns) : q36cc_deltanet(ch, m, i, n, c0, ns));
             if (ok && lf) ok = cc_copy(ch->lfd, (size_t)i * 3 * D, ch->tmp, (size_t)(n - 1) * D, D);
             CcEw add = {CC_EW_ADD, n * D, D, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
             int fused = -1;   /* the branch into x and x's norm in one pass (cc_addnorm): -1 not taken */

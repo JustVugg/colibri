@@ -2180,6 +2180,188 @@ __global__ static void __launch_bounds__(128) cc_dnconv_f4_k(const float *__rest
         ring[rb0 + 9] = h0.w; ring[rb0 + 10] = h1.w; ring[rb0 + 11] = h2.w;
     }
 }
+__device__ __forceinline__ float4 cc_lds128(const float *p) {
+#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__) && defined(__CUDA_ARCH__)
+    float4 v;
+    unsigned s = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ld.shared.v4.f32 {%0, %1, %2, %3}, [%4];" : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w) : "r"(s));
+    return v;
+#else
+    return *reinterpret_cast<const float4 *>(p);
+#endif
+}
+/* one block of 128 per value head, thread v's column of the state in registers */
+template <int KD, int FAST = 1, bool SNAP = true>
+__global__ static void __launch_bounds__(128) cc_dnrec_prepared_k(const float *__restrict__ cv, const float *__restrict__ ab,
+        const float *__restrict__ z, float *__restrict__ st, const float *__restrict__ prm, float *__restrict__ y,
+        float *__restrict__ snap, CcDnRec p) {
+    __shared__ float qn[KD];
+    __shared__ float kn[KD];
+    __shared__ float red[128];
+    __shared__ float red2[128];
+    int h = blockIdx.x, v = threadIdx.x;
+    bool own = (FAST && KD == 128) ? true : (v < p.VD);
+    int vd = (FAST && KD == 128) ? 128 : p.VD;
+    int kh = (p.flags & 4) ? h % p.KH : h / (p.VH / p.KH);   /* flags 4: a GGUF's value heads, tiled */
+    float col[KD];
+    int sb = p.st_off + h * KD * vd + v, nb = p.snap_off + h * KD * vd + v;
+    #pragma unroll
+    for (int k = 0; k < KD; k++) col[k] = own ? st[sb + k * vd] : 0.f;
+    float alog = prm[p.prm_off + h], dtb = prm[p.prm_off + p.VH + h];
+    float nw = own ? prm[p.prm_off + 2 * p.VH + v] : 0.f;
+    for (int s = 0; s < p.S; s++) {
+        int cb = p.cv_off + s * p.cv_row;
+        float qa = 0.f, ka = 0.f;
+        for (int k = v; k < KD; k += 128) {
+            float qv = cv[cb + kh * KD + k], kv = cv[cb + p.Ktot + kh * KD + k];
+            qn[k] = qv; kn[k] = kv;
+            qa += qv * qv; ka += kv * kv;
+        }
+        red[v] = qa; red2[v] = ka;
+        __syncthreads();
+        if (v < 64) { red[v] += red[v + 64]; red2[v] += red2[v + 64]; }
+        __syncthreads();
+        if (v < 32) {
+            float qv = red[v] + red[v + 32], kv = red2[v] + red2[v + 32];
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) { qv += cc_shfl_xor(qv, off); kv += cc_shfl_xor(kv, off); }
+            if (v == 0) {
+                red[0] = 1.f / sqrtf(qv + 1e-6f) * p.qscale;
+                red2[0] = 1.f / sqrtf(kv + 1e-6f);
+            }
+        }
+        __syncthreads();
+        float qsc = red[0], ksc = red2[0];
+        for (int k = v; k < KD; k += 128) { qn[k] *= qsc; kn[k] *= ksc; }
+        __syncthreads();
+        float bv = ab[p.b_off + s * p.b_row + h], av = ab[p.a_off + s * p.a_row + h];
+        float beta = 1.f / (1.f + expf(-bv));
+        float decay = expf(((p.flags & 2) ? alog : -expf(alog)) * cc_softplus(av + dtb));   /* flags 2: a GGUF's A itself */
+        float o = 0.f;
+        if (own) {
+            float vin = cv[cb + 2 * p.Ktot + h * vd + v];
+            float kvs = 0.f;
+            #pragma unroll
+            for (int k = 0; k < KD; k++) { col[k] *= decay; kvs += kn[k] * col[k]; }
+            float delta = (vin - kvs) * beta;
+            #pragma unroll
+            for (int k = 0; k < KD; k++) col[k] += kn[k] * delta;
+            #pragma unroll
+            for (int k = 0; k < KD; k++) o += qn[k] * col[k];
+        }
+        red[v] = o * o;
+        __syncthreads();
+        if (v < 64) red[v] += red[v + 64];
+        __syncthreads();
+        if (v < 32) {
+            float ov = red[v] + red[v + 32];
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) ov += cc_shfl_xor(ov, off);
+            if (v == 0) red[0] = 1.f / sqrtf(ov / (float)p.VD + p.eps);
+        }
+        __syncthreads();
+        float r = red[0];
+        if (own) {
+            float zv = z[p.z_off + s * p.z_row + h * vd + v];
+            float g = (p.flags & 1) ? 1.f / (1.f + expf(-zv)) : zv / (1.f + expf(-zv));
+            y[p.y_off + s * p.y_row + h * vd + v] = o * r * nw * g;
+            if (SNAP && s == p.snap_row) {
+                #pragma unroll
+                for (int k = 0; k < KD; k++) snap[nb + k * vd] = col[k];
+            }
+        }
+        __syncthreads();
+    }
+    if (own) {
+        #pragma unroll
+        for (int k = 0; k < KD; k++) st[sb + k * vd] = col[k];
+    }
+}
+/* Prepare normalized queries and keys, beta and decay for the ordered split recurrence. */
+__global__ static void __launch_bounds__(256) cc_dnrec_prep_k(const float *__restrict__ cv, const float *__restrict__ ab,
+        const float *__restrict__ prm, float *__restrict__ prep, CcDnRec p) {
+    int seg = (int)blockIdx.x * 8 + (int)(threadIdx.x >> 5), lane = threadIdx.x & 31;
+    int tot_qk = p.S * 2 * p.KH;
+    if (seg >= tot_qk) return;
+    int kh = seg % p.KH, rem = seg / p.KH, isk = rem & 1, r = rem >> 1;
+    int cb = p.cv_off + r * p.cv_row + isk * p.Ktot + kh * 128;
+    float x[4], a = 0.f;
+    #pragma unroll
+    for (int j = 0; j < 4; j++) { float xv = cv[cb + lane + j * 32]; x[j] = xv; a += xv * xv; }
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) a += cc_shfl_xor(a, m);
+    float sc = 1.f / sqrtf(a + 1e-6f) * (isk ? 1.f : p.qscale);
+    float *out_qk = prep + (size_t)seg * 128;
+    #pragma unroll
+    for (int j = 0; j < 4; j++) out_qk[lane + j * 32] = x[j] * sc;
+    if (isk == 0 && kh == 0) {
+        float *bd = prep + (size_t)tot_qk * 128 + (size_t)r * p.VH * 2;
+        for (int h = lane; h < p.VH; h += 32) {
+            float alog = prm[p.prm_off + h], dtb = prm[p.prm_off + p.VH + h];
+            float bv = ab[p.b_off + r * p.b_row + h], av = ab[p.a_off + r * p.a_row + h];
+            float bval = 1.f / (1.f + expf(-bv));
+            float dval = expf(((p.flags & 2) ? alog : -expf(alog)) * cc_softplus(av + dtb));
+            *reinterpret_cast<float2 *>(bd + h * 2) = make_float2(bval, dval);
+        }
+    }
+}
+template <int FAST = 1>
+__global__ static void __launch_bounds__(256) cc_dnrec_norm_k(const float *__restrict__ z, const float *__restrict__ prm,
+        float *__restrict__ y, CcDnRec p, int8_t *__restrict__ xq = nullptr, float *__restrict__ xs = nullptr) {
+    int wp = (blockIdx.x * 8) + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (wp >= p.S * p.VH) return;
+    int s = wp / p.VH, h = wp - s * p.VH;
+    int yb = p.y_off + s * p.y_row + h * 128, zb = p.z_off + s * p.z_row + h * 128;
+    if (FAST) {
+        float o[4], oo = 0.f;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) { float v = y[yb + lane + j * 32]; o[j] = v; oo += v * v; }
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) oo += cc_shfl_xor(oo, m);
+        float rr = 1.f / sqrtf(oo / (float)p.VD + p.eps);
+        const float *pw = prm + p.prm_off + 2 * p.VH;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            int c = lane + j * 32;
+            float zv = __ldg(&z[zb + c]);
+            float g = (p.flags & 1) ? 1.f / (1.f + expf(-zv)) : zv / (1.f + expf(-zv));
+            float val = o[j] * rr * __ldg(&pw[c]) * g;
+            if (FAST < 2) y[yb + c] = val;
+            o[j] = val;
+        }
+        if (xq) {
+            float amax0 = fmaxf(fabsf(o[0]), fabsf(o[1]));
+            float amax1 = fmaxf(fabsf(o[2]), fabsf(o[3]));
+            #pragma unroll
+            for (int m = 16; m > 0; m >>= 1) {
+                amax0 = fmaxf(amax0, cc_shfl_xor(amax0, m));
+                amax1 = fmaxf(amax1, cc_shfl_xor(amax1, m));
+            }
+            size_t g0 = (size_t)yb >> 6;
+            if (lane == 0) {
+                xs[g0] = amax0 * (1.f / 127.f);
+                xs[g0 + 1] = amax1 * (1.f / 127.f);
+            }
+            float inv0 = amax0 > 0.f ? __fdividef(127.f, amax0) : 0.f;
+            float inv1 = amax1 > 0.f ? __fdividef(127.f, amax1) : 0.f;
+            xq[yb + lane] = cc_f_s8(o[0] * inv0);
+            xq[yb + lane + 32] = cc_f_s8(o[1] * inv0);
+            xq[yb + lane + 64] = cc_f_s8(o[2] * inv1);
+            xq[yb + lane + 96] = cc_f_s8(o[3] * inv1);
+        }
+        return;
+    }
+    float oo = 0.f;
+    for (int c = lane; c < 128; c += 32) { float o = y[yb + c]; oo += o * o; }
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) oo += cc_shfl_xor(oo, m);
+    float rr = 1.f / sqrtf(oo / (float)p.VD + p.eps);
+    for (int c = lane; c < 128; c += 32) {
+        float zv = z[zb + c];
+        float g = (p.flags & 1) ? 1.f / (1.f + expf(-zv)) : zv / (1.f + expf(-zv));
+        y[yb + c] = y[yb + c] * rr * prm[p.prm_off + 2 * p.VH + c] * g;
+    }
+}
 /* cc_dnrec_split_k's rows: each (row, head)'s gated RMSNorm in place, a warp each, cc_dnrec_rows_k's sums */
 __global__ static void __launch_bounds__(128) cc_dnnorm_k(const float *__restrict__ z, const float *__restrict__ prm,
                                                            float *__restrict__ y, CcDnRec p) {
@@ -4062,6 +4244,21 @@ static int cc_dnconv_tiled(CcBuf *in, CcBuf *w, CcBuf *ring, CcBuf *out, CcBuf *
     }
     return launched(c, "dnconv");
 }
+static int cc_dnrec_prepared(CcBuf *cv, CcBuf *ab, CcBuf *z, CcBuf *st, CcBuf *prm, CcBuf *y, CcBuf *snap, const CcDnRec *p) {
+    CcCtx *c = live(CC_OVERLAP_DOWN);
+    if (!c || !cv || !ab || !z || !st || !prm || !y || !p || p->S < 1 || p->VH < 1 || p->KH < 1 || p->VH % p->KH ||
+        p->VD < 1 || p->VD > 128) return 0;
+    if (p->snap_row >= 0 && !snap) return 0;
+    const float *a = fp(cv), *b = fp(ab), *zz = fp(z), *pr = fp(prm);
+    if (p->y_off != 0) cc_down_access(y);
+    float *s = fpw(st), *yy = p->y_off == 0 ? fpw(y) : (float *)fp(y), *sn = fpw(snap);
+    if (p->y_off != 0) (void)fpw(y);
+    if (p->snap_row < 0)
+        cc_dnrec_prepared_k<128, 1, false><<<(unsigned)p->VH, 128, 0, c->stream>>>(a, b, zz, s, pr, yy, sn, *p);
+    else
+        cc_dnrec_prepared_k<128, 1, true><<<(unsigned)p->VH, 128, 0, c->stream>>>(a, b, zz, s, pr, yy, sn, *p);
+    return launched(c, "dnrec");
+}
 static int cc_dnconv(CcBuf *in, CcBuf *w, CcBuf *ring, CcBuf *out, CcBuf *snap, const CcDnConv *p) {
     CcCtx *c = live(CC_OVERLAP_DOWN);
     if (!c || !in || !w || !ring || !out || !p || p->S < 1 || p->CD < 1 || p->CK < 2 || p->CK > 9) return 0;
@@ -4087,6 +4284,9 @@ static int cc_dnrec(int KD, CcBuf *cv, CcBuf *ab, CcBuf *z, CcBuf *st, CcBuf *pr
     if ((p->snap_row >= 0 || p->snap_n > 0) && !snap) return 0;
     if (p->snap_n > 0 && (p->snap_row >= 0 || p->snap_n > p->S || p->snap_off % 2 || ((size_t)p->snap_off + 2 * (size_t)p->snap_n) * 4 > snap->bytes)) return 0;
     if (p->snap_n > 0 && c->down_seq != c->down_joined && !cc_join_down(c)) return 0;
+    const bool prepare_recurrence = cc_uses_feature(c, Q36_DNREC) && p->snap_n == 0 && KD == 128 && p->VD == 128;
+    if (prepare_recurrence && p->S < CC_DNREC_ROWS)
+        return cc_dnrec_prepared(cv, ab, z, st, prm, y, snap, p);
     const float *a = fp(cv), *b = fp(ab), *zz = fp(z), *pr = fp(prm);
     float *s = fpw(st), *yy = fpw(y), *sn = fpw(snap);
     if (p->snap_n > 0) goto one;   /* a verify's rows with their copies: one block a head, the rows in order */
@@ -4106,7 +4306,10 @@ static int cc_dnrec(int KD, CcBuf *cv, CcBuf *ab, CcBuf *z, CcBuf *st, CcBuf *pr
         if (cudaMallocAsync((void **)&qk, (nq + nbd) * sizeof(float), c->stream) != cudaSuccess) { (void)cudaGetLastError(); goto rows; }
         {
             const int nvb = (p->S * 2 * p->KH + 3) / 4, nbb = (p->S * p->VH + 127) / 128;
-            coli_launch(cc_dnprep_k, (unsigned)(nvb + nbb), 128, 0, c->stream, a, b, pr, qk, qk + nq, KD, nvb, *p);
+            /* The tiled recurrence prepares the same q/k and beta/decay arrays in a different grid.
+             * Keep the standard split-column dot products and sequential state updates. */
+            if (prepare_recurrence) cc_dnrec_prep_k<<<grid1((size_t)p->S * 2 * p->KH, 8), 256, 0, c->stream>>>(a, b, pr, qk, *p);
+            else coli_launch(cc_dnprep_k, (unsigned)(nvb + nbb), 128, 0, c->stream, a, b, pr, qk, qk + nq, KD, nvb, *p);
             dim3 g((unsigned)p->VH, (unsigned)((p->VD + cb - 1) / cb));
             #define CC_DS(P_, C_) do { if (KD == 64) coli_launch(cc_dnrec_split_k<64, 16, P_, C_>, g, 128, 0, c->stream, a, qk, qk + nq, s, yy, sn, *p); \
                                         else coli_launch(cc_dnrec_split_k<128, 16, P_, C_>, g, 128, 0, c->stream, a, qk, qk + nq, s, yy, sn, *p); } while (0)
@@ -4119,7 +4322,8 @@ static int cc_dnrec(int KD, CcBuf *cv, CcBuf *ab, CcBuf *z, CcBuf *st, CcBuf *pr
             (void)cudaFreeAsync(qk, c->stream);
         }
         if (!launched(c, "dnrec split")) return 0;
-        coli_launch(cc_dnnorm_k, (unsigned)((p->S * p->VH + 3) / 4), 128, 0, c->stream, zz, pr, yy, *p);
+        if (prepare_recurrence) cc_dnrec_norm_k<1><<<grid1((size_t)p->S * p->VH, 8), 256, 0, c->stream>>>(zz, pr, yy, *p);
+        else coli_launch(cc_dnnorm_k, (unsigned)((p->S * p->VH + 3) / 4), 128, 0, c->stream, zz, pr, yy, *p);
         return launched(c, "dnrec norm");
     }
 rows:
