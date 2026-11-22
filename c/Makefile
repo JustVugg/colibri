@@ -585,6 +585,8 @@ TEST_EXCLUDE += test_vk_chain test_vk_memtype test_glm53_vk_f32 test_vk_dev2_win
 TEST_EXCLUDE += test_cu_tier
 # takes a fixture and the CPU build's logits on its command line (ci.yml, the int4 gs64 A/B step)
 TEST_EXCLUDE += test_qwen36_tier_stream_engine
+# runs qwen36.c's main on a GGUF named on its command line: tests/test_qwen36_gguf_hostdrop.py drives it
+TEST_EXCLUDE += test_qwen36_gguf_hostdrop
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
@@ -3505,6 +3507,11 @@ tests/test_qwen36_cuda_chain$(EXE): tests/test_qwen36_cuda_chain.c qwen36.c qwen
 tests/test_qwen36_trunk_dense$(EXE): tests/test_qwen36_trunk_dense.c qwen36.c qwen36_tier.c $(VK_OBJ)
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
+# A GGUF's placed matrices give their host rows back and the CPU reads them back exactly
+# (the whole engine on the fake backend; tests/test_qwen36_gguf_hostdrop.py drives it).
+tests/test_qwen36_gguf_hostdrop$(EXE): tests/test_qwen36_gguf_hostdrop.c qwen36.c qwen36_tier.c $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
 # #1391: il decode path deve offrire gli esperti int8 al tier, non solo il warmstart
 tests/test_qwen36_tier_int8_decode$(EXE): tests/test_qwen36_tier_int8_decode.c qwen36.c qwen36_tier.c $(VK_OBJ)
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
@@ -3775,7 +3782,7 @@ test-c: $(TEST_BINS)
 # itself (the test ALSO skips loudly if the library is somehow still absent,
 # e.g. when invoked via unittest directly — but a green `make test` must mean
 # the pin was actually checked).
-test-python: $(RANSLIB) tests/test_ggml_quants$(EXE) tests/test_gguf_c$(EXE) tests/test_gq_dot$(EXE)
+test-python: $(RANSLIB) tests/test_ggml_quants$(EXE) tests/test_gguf_c$(EXE) tests/test_gq_dot$(EXE) tests/test_qwen36_gguf_hostdrop$(EXE)
 	$(PYTHON) -m unittest discover -s tests -p 'test_*.py'
 
 # One after the other, also under -j: the C binaries build in parallel, then run, and only

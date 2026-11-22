@@ -165,7 +165,9 @@ int coli_cuda_vision_attention(int device, float *out, const float *qkv, int n, 
  * went; the arithmetic has its own oracle in the CUDA build. Parameters are
  * unused on purpose (CFLAGS carry -Wno-unused-parameter). */
 static int fake_matmuls, fake_matmul_fail, fake_matmul_rows, fake_matmul_fail_at;
+static void (*fake_matmul_hook)(void);   /* called at every coli_cuda_matmul, before anything else */
 int coli_cuda_matmul(ColiCudaTensor **tensor, float *y, const float *x, const void *weights, const float *scales, int fmt, int S, int I, int O, int device, int gs) {
+    if (fake_matmul_hook) fake_matmul_hook();
     fake_matmuls++;
     fake_matmul_rows = S;
     if (fake_matmul_fail || fake_matmuls == fake_matmul_fail_at) {
