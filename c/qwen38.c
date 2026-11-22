@@ -2127,15 +2127,21 @@ static float *q38_serve_prefill(Model *m,const int *ids,int from,int np,ColiProm
     /* a chain's segment is the one its own layer-by-layer prompt takes (q38cc_lm_rows), so it
      * does the same work as when it took the prompt in one call */
     const int seg=coli_prompt_segment_rows(chain?8192:2048);
+    /* Q38_PLE_AHEAD: the PLE rows read on a thread while the forwards run (q38_pla_start), a quarter
+     * segment at a time and one segment ahead; the first forward is a piece, so it waits for one
+     * piece's reads and not the segment's */
+    const int piece=(seg+3)/4, ahead=np-from>piece&&q38_pla_start(m,ids+from,np-from,piece,seg+piece,chain);
     if(!ctl){
         float *lo=NULL;
         for(int at=from;at<np;){
             int n=np-at<seg?np-at:seg;
+            if(ahead&&at==from&&n>piece)n=piece;
             float *next=step(m,ids+at,n,at);
             free(lo);lo=next;
             if(!next)break;
             at+=n;
         }
+        q38_pla_end();
         return lo;
     }
     Q38PinState *st=NULL;
@@ -2143,6 +2149,7 @@ static float *q38_serve_prefill(Model *m,const int *ids,int from,int np,ColiProm
     for(int at=from;at<np;){
         if(coli_prompt_poll(ctl)){free(lo);lo=NULL;break;}
         int n=np-at<seg?np-at:seg;
+        if(ahead&&at==from&&n>piece)n=piece;
         /* the state at the segment's start (from the device too, for a chain), so a stop inside
          * the segment can put it back; none where the CUDA chain takes it in one chunk, which a
          * stop finds before it starts or not at all (a 470-token prompt's copy of the DeltaNet
@@ -2164,6 +2171,7 @@ static float *q38_serve_prefill(Model *m,const int *ids,int from,int np,ColiProm
         }
         free(lo);lo=next;at+=n;
     }
+    q38_pla_end();
     q38_pin_state_free(st);
     return lo;
 }

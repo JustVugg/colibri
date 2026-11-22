@@ -96,6 +96,21 @@ class Qwen38PrefixServeTest(PromptCancelContract, unittest.TestCase):
             engine.close()
         self.assertEqual(got, self.cold(prompt))
 
+    def test_ple_rows_read_ahead_answer_as_in_line(self):
+        """Q38_PLE_AHEAD=1: the PLE rows of a prompt read in segments come from a thread
+        that reads them ahead of the forwards (a first forward of one row, then pieces of
+        one row, at most a segment ahead), hashed with the same history: the same answer."""
+        prompt = self.OPENING + self.CANCEL_MORE
+        with mock.patch.dict(os.environ, {"COLI_PROMPT_SEGMENT": "3", "Q38_PLE_AHEAD": "1"}):
+            engine = self.spawn(log_prefix=False)
+        try:
+            got = engine.ask("1", prompt, max_tok=8)
+        finally:
+            engine.close()
+        with mock.patch.dict(os.environ, {"Q38_PLE_AHEAD": "0"}):
+            want = self.cold(prompt)
+        self.assertEqual(got, want)
+
     def test_three_turns_keep_reusing(self):
         warm = self.spawn()
         transcript = self.OPENING
