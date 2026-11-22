@@ -820,7 +820,8 @@ them (a reset as zeros, a restored snapshot as an upload). An MTP or prompt-look
 runs row-wise (the warp GEMV computes each row on its own: a decode step's bits) and
 copies the DeltaNet state, the conv rings and the PLE ring after each of its rows into a
 device slot; a rejected draft swaps slot r in (`q38cc_rollback`) as the CPU swaps its
-own. A lost device zeroes the state, rebuilds it on the CPU from the prefix record (the
+own (with `Q38_CC_GRAPH=1` it copies slot r's bits into the live buffers, which the graphs
+hold by address). A lost device zeroes the state, rebuilds it on the CPU from the prefix record (the
 PLE history replayed) and runs there from then on. `Q38_DN_GPU`'s per-layer step is not
 set up beside the chain; `KV_SLOTS` > 1 keeps the chain off.
 
@@ -882,11 +883,31 @@ The index keys of an attention layer now come down in one copy over the rows: a 
 filled the driver's queue on a 1912-row prompt while a hybrid layer held the stream, and the
 host blocked there before serving it; the staged 2612-token prompt gains 3 % from it.
 
+**A decode step's segments as CUDA graphs** (`Q38_CC_GRAPH=1`, default off). With the routed
+experts on the host's step (FP8 or MXFP4 experts; not a GGUF's, which run in the frame), a
+decode step or a verify issues about forty ops a layer one by one. The ops whose arguments
+depend only on the layer and the rows run as three captured graphs a layer (`q38cc_seg`):
+the MoE sum, the attention read and a DeltaNet layer's block or an attention layer's
+projections, norms and RoPE, then the MLP read and the router; an attention layer's output
+projection onward; the shared expert. The K/V rows, the pooled keys, QSA, the attention and
+the PLE layer still run one by one. A segment runs op by op on the first sight of its key
+(rows, verify copies) and of a fingerprint of every device address it touches, is captured on
+the second and replayed after; a capture that breaks turns the switch off for the run. A replay
+runs the same kernels with the same arguments in the same order: the bits of the ops. Measured
+on an RTX 5090 (Windows, Qwen3.8-Flash-Next FP8, RAM cache 4/layer, uploads synchronous so the
+residency is a function of the routes), 64 greedy tokens, off/on/on/off: the decode step's time
+outside the routed experts 43.9 / 26.4 / 27.3 / 40.8 ms, the last logits byte-identical in all
+four runs. On this machine the FP8 decode is bound by the expert reads (about 350 ms a step), so
+the served decode moved 1-5 % (2.35-4.48 -> 2.36-4.67 tok/s, the same text and the same expert
+hits); with the experts mostly in VRAM the dense part is a larger share of the step.
+
 `tests/test_qwen38_cuda_chain.c` (`make qwen38-cuda-chain-check`, in CI beside
 `qwen38-dn-gpu-check`) runs the tiny FP8 fixture's oracle on the fake tier with the
 chain's ops from the fake's host-side table: the chain on (8/8 tokens, cosine 0.99998), a
 frame that fails mid-run (the state rebuilt on the CPU, the run finishing there within
-the limits), and the per-matrix path. `tests/test_cuda_chain.cu` checks the QSA and PLE
+the limits), and the per-matrix path; with `Q38_CC_GRAPH=1` on a fake card whose graphs record
+and replay the ops, the switch-off run's tokens and last logits bit for bit (captures that break
+or are refused, MTP verifies rolled back). `tests/test_cuda_chain.cu` checks the QSA and PLE
 kernels on a real card against their references.
 
 ### The trunk on the CPU: int8 rows
