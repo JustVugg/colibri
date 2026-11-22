@@ -834,6 +834,13 @@ static inline int cc_ink2_caps(void) {
 }
 static inline int cc_fetch_wait_at(int bank) { return cc_fetch_at_ready() ? cc_ops()->fetch_wait_at(bank) : 0; }
 static inline int cc_fetch_done_at(int bank) { return cc_fetch_at_ready() ? cc_ops()->fetch_done_at(bank) : 0; }
+static inline int cc_ew_norm_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, ew_norm) + sizeof t->ew_norm && t->ew_norm;
+}
+static inline int cc_ew_norm(CcBuf *y, CcBuf *a, CcBuf *b, CcBuf *c, CcBuf *e, const CcEw *pe, CcBuf *w, CcBuf *yn, const CcNorm *pn) {
+    return cc_ew_norm_ready() ? cc_ops()->ew_norm(y, a, b, c, e, pe, w, yn, pn) : 0;
+}
 static inline int cc_matmul_swiglu_ready(void) {
     const ColiCudaChainOps *t = cc_ops();
     return t && t->size >= offsetof(ColiCudaChainOps, matmul_swiglu) + sizeof t->matmul_swiglu && t->matmul_swiglu;
