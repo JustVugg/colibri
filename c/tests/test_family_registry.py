@@ -143,6 +143,12 @@ class FamilyRegistryTest(unittest.TestCase):
         caps = FamilyCapabilities(True, False, False, True)
         self.assertFalse(caps.logprobs_echo)
         self.assertFalse(caps.submit_gbytes)
+        # `seed` is the engine's word that it seeds each request from the SUBMIT key;
+        # no engine does yet, so the gateway sends the key to none of them.
+        self.assertFalse(caps.seed)
+        for family in FAMILIES:
+            with self.subTest(seeds=family.id):
+                self.assertFalse(family.capabilities.seed)
 
     def test_capabilities_carry_the_image_bit_for_families_with_an_image_path(self):
         # The bit says the gateway has a placeholder expansion for the family. Whether

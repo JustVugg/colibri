@@ -128,10 +128,11 @@ copies. Tool calling depends on the active engine; see the support matrix below.
 Images and token penalties return an explicit error rather than being silently
 ignored. The OpenAI-compatible endpoints request log probabilities only from a
 glm engine (see below); on every other engine such a request is refused with a
-named error, never silently ignored. `seed` is accepted and ignored (see
-below). Audio is accepted only by Inkling checkpoints with audio support. The
-default bind address is localhost; set `COLI_API_KEY` before exposing the
-server beyond the machine.
+named error, never silently ignored. `seed` is honoured only by engines that
+seed their requests, and accepted and ignored on the others (see below). Audio
+is accepted only by Inkling checkpoints with audio support. The default bind
+address is localhost; set `COLI_API_KEY` before exposing the server beyond the
+machine.
 
 Request bodies must fit within 4 MiB and the running Python JSON parser's
 limits. An integer or nesting depth the runtime cannot parse receives HTTP
@@ -149,9 +150,17 @@ modalities receive a named 400 rather than silently returning text.
 
 ### `seed`
 
-`seed` is accepted (not rejected) for OpenAI-API request-shape compatibility;
-the value is not validated. This server sends no per-request seed on the
-wire, so the value has no effect at any temperature.
+On an engine that seeds its requests, `seed` (any signed 64-bit integer) starts
+that request's sampler from a state of its own: the same seed, the same request
+and the same batch shape draw the same tokens at any temperature. A different
+batch shape (other requests decoding alongside it) is not covered, since the
+rows of a batch are not computed bit for bit as they are alone. A value that is
+not such an integer is a named 400 (`invalid_value`).
+
+No engine seeds its requests yet; their support is being added one engine at a
+time. On the others `seed` is accepted (not rejected) for OpenAI-API
+request-shape compatibility, the value is not validated, and the server puts
+nothing on the wire for it, so it has no effect at any temperature.
 
 ### Log probabilities and prompt echo
 

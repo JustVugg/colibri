@@ -76,7 +76,7 @@ static void test_submit_extension_fields(void)
     /* rejects: over-cap, out-of-range, unknown key, malformed token */
     assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 logprobs=33", &sub));
     assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 ids=2", &sub));
-    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 seed=7", &sub));
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 n=7", &sub));
     assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 logprobs=", &sub));
     assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 =5", &sub));
     assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 logprobs=5x", &sub));
@@ -102,6 +102,38 @@ static void test_submit_extension_fields(void)
     assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 logprobs=1000", &sub));
     /* an extended header still validates the base fields */
     assert(!coli_submit_parse("SUBMIT 0 3 17 64 0.7 0.95 0 logprobs=5", &sub));
+
+    /* seed=: a signed 64-bit value, read into its two's complement bits; no
+     * seed is has_seed 0, so seed=0 stays a seed like any other */
+    assert(coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0", &sub));
+    assert(!sub.has_seed && sub.seed == 0);
+    assert(coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 seed=0", &sub));
+    assert(sub.has_seed && sub.seed == 0);
+    assert(coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 logprobs=5 seed=1234567 pin=1", &sub));
+    assert(sub.has_seed && sub.seed == 1234567 && sub.logprobs == 5 && sub.pin == 1);
+    assert(coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 seed=-1", &sub));
+    assert(sub.has_seed && sub.seed == 0xFFFFFFFFFFFFFFFFULL);
+    assert(coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 seed=9223372036854775807", &sub));
+    assert(sub.seed == 0x7FFFFFFFFFFFFFFFULL);
+    assert(coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 seed=-9223372036854775808", &sub));
+    assert(sub.seed == 0x8000000000000000ULL);
+    /* the next request without a seed does not inherit this one's */
+    assert(coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 logprobs=5", &sub));
+    assert(!sub.has_seed && sub.seed == 0);
+    /* one past either end of int64, and far past it, is out of range */
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 seed=9223372036854775808", &sub));
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 seed=-9223372036854775809", &sub));
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 seed=18446744073709551616", &sub));
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 seed=99999999999999999999999", &sub));
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 seed=", &sub));
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 seed=-", &sub));
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 seed=+5", &sub));
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 seed=--5", &sub));
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 seed=5x", &sub));
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 seed=1.5", &sub));
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 seed=1 seed=1", &sub));
+    /* the other keys keep their int range: a seed-sized value is still refused */
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 logprobs=-1", &sub));
 
     /* max_tokens=0 = "leggi il prompt e fermati", e vale SOLO con logprobs>0.
      * Chi punteggia un insieme chiuso non vuole generare niente: dover chiedere

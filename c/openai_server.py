@@ -6208,8 +6208,7 @@ def generation_options(body, limit):
     stop_sequences = parse_stop_sequences(body)
     if body.get("frequency_penalty", 0) or body.get("presence_penalty", 0):
         raise APIError(400, "Token penalties are not supported yet.", None, "unsupported_parameter")
-    # `seed` is accepted for request-shape compatibility and silently discarded:
-    # this server puts no per-request seed on the wire, at any temperature.
+    # `seed` is read by seed_option(), against the engine that serves the request.
     # response_format -> optional per-request grammar for the engine's grammar-forced
     # draft source (#70/#148). NEVER a sampling constraint: drafts are verified, so a
     # schema the engine cannot compile degrades to "no speedup", not to an error and
@@ -6768,7 +6767,26 @@ def _completion_choice_fields(stats, *, raw_text, text, chat, engine_k, echo, di
     return text, logprobs_obj, finish_reason
 
 
-def _engine_extension_args(engine_k):
+SEED_MIN, SEED_MAX = -2 ** 63, 2 ** 63 - 1
+
+
+def seed_option(body, honoured):
+    """The `seed` to send the engine, or None.
+
+    An engine that does not seed its requests (`FamilyCapabilities.seed`) is sent
+    nothing and the field stays accepted and ignored, as before (#1720). One that
+    does gets any signed 64-bit integer; anything else is a named 400, since a
+    seed the engine cannot take would otherwise be dropped in silence."""
+    seed = body.get("seed")
+    if seed is None or not honoured:
+        return None
+    if isinstance(seed, bool) or not isinstance(seed, int) or not SEED_MIN <= seed <= SEED_MAX:
+        raise APIError(400, "`seed` must be an integer between -2^63 and 2^63-1.",
+                       "seed", "invalid_value")
+    return seed
+
+
+def _engine_extension_args(engine_k, seed=None):
     """The `Engine.generate()` keyword arguments that carry this request's SUBMIT
     extension, built once from the parsed options and spread at each call site.
 
@@ -6783,10 +6801,13 @@ def _engine_extension_args(engine_k):
     /v1/systemone's scoring sends its keys through the same rule (`_engine_gbytes_args`):
     without the field, colibri.c refused its header and the request waited for an answer
     that never came."""
-    if not engine_k:
-        return {}
-    args = {"logprobs": engine_k}
-    args.update(_engine_gbytes_args())
+    args = {}
+    if engine_k:
+        args["logprobs"] = engine_k
+    if seed is not None:
+        args["seed"] = seed
+    if args:
+        args.update(_engine_gbytes_args())
     return args
 
 
@@ -7455,6 +7476,7 @@ class Engine:
         self.supports_logprobs_echo = (family.capabilities.logprobs_echo
                                        and CHAT_FLAVOR in (None, arch))
         self.supports_tok_ids = (arch == "glm")
+        self.supports_seed = family.capabilities.seed
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
         # All three are off unless set (0 = off). When one fires the engine is killed and
@@ -8071,7 +8093,7 @@ class Engine:
     def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0,
                  cancelled=None, grammar=None, stopped=None, on_accept=None, audio=None,
                  on_tool=None, image=None, logprobs=0, pin=False, on_echo=None,
-                 gbytes_before_ext=False):
+                 gbytes_before_ext=False, seed=None):
         if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.kv_slots:
             raise APIError(400, "Invalid cache slot.", "cache_slot")
         # GLM's ids=1 intake consumes decimal token IDs directly, without a
@@ -8148,6 +8170,8 @@ class Engine:
             ext += " pin=1"
         if token_ids:
             ext += " ids=1"
+        if seed is not None:
+            ext += f" seed={int(seed)}"
         # `gbytes_before_ext` asks for the 7th numeric field ahead of the extension keys
         # even with no grammar or audio payload to describe. It defaults to False, so
         # every caller that does not ask keeps the wire it had.
@@ -9934,6 +9958,7 @@ class APIHandler(BaseHTTPRequestHandler):
                                 "engine yet.", "response_format", "unsupported_parameter")
         engine_k, echo, display_k = logprobs_options(
             body, chat, getattr(self.server.engine, "supports_logprobs_echo", False))
+        seed = seed_option(body, getattr(self.server.engine, "supports_seed", False))
         stop_sequences, ignore_leading_stop = stop_policy(body, chat)
         cache_slot = body.get("cache_slot")
         if (cache_slot is not None and
@@ -9958,7 +9983,7 @@ class APIHandler(BaseHTTPRequestHandler):
             # bool("false") is True: a string, number or object would have turned the usage frame on
             raise APIError(400, "`stream_options.include_usage` must be a boolean.", "stream_options.include_usage")
         include_usage = bool(include_usage)
-        return (maximum, temperature, top_p, grammar, engine_k, echo, display_k,
+        return (maximum, temperature, top_p, grammar, engine_k, echo, display_k, seed,
                 stop_sequences, ignore_leading_stop, cache_slot, stream, include_usage)
 
     def generation(self, body, prompt, request_id, chat, tools=None, tool_choice=None,
@@ -9974,7 +9999,7 @@ class APIHandler(BaseHTTPRequestHandler):
         if dbg >= 2:
             sys.stderr.write(f"\n===== PROMPT [{request_id}] =====\n{prompt}\n===== OUTPUT [{request_id}] =====\n")
             sys.stderr.flush()
-        (maximum, temperature, top_p, grammar, engine_k, echo, display_k,
+        (maximum, temperature, top_p, grammar, engine_k, echo, display_k, seed,
          stop_sequences, ignore_leading_stop, cache_slot, stream, include_usage) = (
             self._generation_request_options(body, chat))
         # tools and tool_choice come from chat_completion() already processed/filtered
@@ -10026,7 +10051,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     **({"audio": audio} if audio else {}),
                     **({"image": image} if image is not None else {}),
                     **({"on_echo": prompt_echoes.append} if engine_k and echo else {}),
-                    **_engine_extension_args(engine_k))
+                    **_engine_extension_args(engine_k, seed))
                 if channels:
                     channels.finish()
                 stop_filter.finish()
@@ -10264,7 +10289,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     **({"on_tool": sideband.feed} if sideband.enabled else {}),
                     on_accept=start_stream, **({"audio": audio} if audio else {}),
                     **({"image": image} if image is not None else {}),
-                    **_engine_extension_args(engine_k))
+                    **_engine_extension_args(engine_k, seed))
                 if channels:
                     channels.finish()
                 stop_filter.finish()
@@ -10305,7 +10330,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     self.client_disconnected, grammar=grammar, stopped=stop_filter.stopped,
                     on_accept=start_stream, **({"audio": audio} if audio else {}),
                     **({"image": image} if image is not None else {}),
-                    **_engine_extension_args(engine_k))
+                    **_engine_extension_args(engine_k, seed))
                 if channels:
                     channels.finish()
                 stop_filter.finish()

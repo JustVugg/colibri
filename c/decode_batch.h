@@ -35,12 +35,14 @@ typedef struct {
     float temperature, top_p;
     int logprobs;   /* requested per-token top-k count; 0 = channel off (opt-in) */
     int tok_ids;    /* 1 = payload is ASCII token ids, not raw prompt text */
+    int has_seed;   /* SUBMIT seed=<n>: this request's sampler starts from `seed` */
+    unsigned long long seed;   /* a signed 64-bit value's two's complement bits */
 } ColiSubmit;
 
 /* Extension fields, 8th whitespace field onward: "key=value" tokens after the
  * full 7-field header, e.g. "SUBMIT 1 0 12 16 0 1 0 logprobs=5 ids=1".
  * A namespace instead of more positional fields: the next per-request knob
- * (a future seed, say) claims a key here rather than forcing another
+ * claims a key here (as seed= did) rather than forcing another
  * field-count migration of this scarce wire budget. Unknown keys, duplicate
  * keys, glued tokens and out-of-range values all reject the whole frame --
  * framing stays as unambiguous as the legacy arms' trailing-field guard.
@@ -54,10 +56,30 @@ typedef struct {
  * The value is accumulated by hand into a bounded int (digit loop stops once
  * the running value exceeds the largest legal value of any key, then a
  * pending-digit check rejects): sscanf %llu on an overflowing field is
- * undefined behavior (C11 7.21.6.2), so no sscanf ever touches the value. */
+ * undefined behavior (C11 7.21.6.2), so no sscanf ever touches the value.
+ * seed= is the one key whose value does not fit an int: coli_submit_seed reads
+ * it, with an optional '-', under the same discipline. */
+static inline const char *coli_submit_seed(const char *p, unsigned long long *out)
+{
+    const int neg = *p == '-';
+    const unsigned long long lim = 9223372036854775807ULL + (unsigned long long)neg;
+    unsigned long long v = 0;
+    const char *d;
+    p += neg;
+    d = p;
+    while (*p >= '0' && *p <= '9') {
+        const unsigned dig = (unsigned)(*p++ - '0');
+        if (v > (lim - dig) / 10) return NULL;   /* outside int64: out of range */
+        v = v * 10 + dig;
+    }
+    if (p == d) return NULL;
+    *out = neg ? 0 - v : v;
+    return p;
+}
+
 static inline int coli_submit_ext(const char *p, ColiSubmit *s)
 {
-    int seen = 0, seen_logprobs = 0, seen_ids = 0, seen_pin = 0;
+    int seen = 0, seen_logprobs = 0, seen_ids = 0, seen_pin = 0, seen_seed = 0;
     while (*p == ' ' || *p == '\t') p++;
     while (*p) {
         char key[16];
@@ -68,6 +90,14 @@ static inline int coli_submit_ext(const char *p, ColiSubmit *s)
         key[kn] = 0;
         if (kn == 0 || *p != '=') return 0;
         p++;
+        if (!strcmp(key, "seed")) {              /* this request's sampler seed */
+            if (seen_seed || !(p = coli_submit_seed(p, &s->seed))) return 0;
+            if (*p && *p != ' ' && *p != '\t') return 0;   /* glued garbage */
+            seen_seed = s->has_seed = 1;
+            seen = 1;
+            while (*p == ' ' || *p == '\t') p++;
+            continue;
+        }
         d = p;
         while (*p >= '0' && *p <= '9' && val <= COLI_SUBMIT_TOPK_MAX)
             val = val * 10 + (*p++ - '0');
@@ -111,6 +141,8 @@ static inline int coli_submit_parse(const char *line, ColiSubmit *s)
     s->logprobs = 0;
     s->tok_ids = 0;
     s->pin = 0;
+    s->has_seed = 0;
+    s->seed = 0;
     if (sscanf(line, "SUBMIT %llu %d %llu %d %f %f %llu %c", &s->id, &s->slot,
                &s->bytes, &s->max_tokens, &s->temperature, &s->top_p,
                &s->gbytes, &tail) == 7) ok = 1;

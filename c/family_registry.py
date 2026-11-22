@@ -55,6 +55,11 @@ class FamilyCapabilities:
     # after top_p), so handing them the extra field puts a bare `0` where their
     # parser wants `key=value` and the engine refuses the header ("bad submit header").
     submit_gbytes: bool = False
+    # The engine seeds a request's sampler from the SUBMIT `seed=` key, in a state of
+    # that request's own, so two requests with the same seed and the same batch shape
+    # draw the same tokens. A family without it keeps `seed` accepted and ignored
+    # (#1720), and the gateway never puts the key on its wire.
+    seed: bool = False
 
 
 @dataclass(frozen=True, slots=True)

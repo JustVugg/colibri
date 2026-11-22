@@ -74,6 +74,8 @@ typedef struct {
      * stesso namespace di decode_batch.h, non un secondo dialetto. */
     int logprobs;
     int pin;        /* SUBMIT pin=1, vedi decode_batch.h */
+    int has_seed;   /* SUBMIT seed=<n>, vedi decode_batch.h */
+    unsigned long long seed;
     unsigned char *payload;
 } ColiServeCommand;
 
@@ -333,6 +335,8 @@ static inline ColiServeReadResult coli_serve_read_command_alloc(
         if (strchr(fields[f], '=')) { positional = f; break; }
     command->logprobs = 0;
     command->pin = 0;
+    command->has_seed = 0;
+    command->seed = 0;
     int token_ids = 0;
     if (positional < nfields) {
         char ext[128]; size_t used = 0; ext[0] = 0;
@@ -349,6 +353,8 @@ static inline ColiServeReadResult coli_serve_read_command_alloc(
             if (!coli_submit_ext(ext, &tmp)) { free(line); return COLI_SERVE_READ_BAD_REQUEST; }
             command->logprobs = tmp.logprobs;
             command->pin = tmp.pin;
+            command->has_seed = tmp.has_seed;
+            command->seed = tmp.seed;
             token_ids = tmp.tok_ids;
         }
     }
