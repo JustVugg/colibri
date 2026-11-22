@@ -123,7 +123,7 @@ typedef struct {
     size_t smem_optin;      /* shared bytes a block may ask for (the block GEMVs past 48 KiB) */
     int sms;                /* multiprocessors (f32_gemm_launch's tile) */
     char *moe_stage; size_t moe_stage_slot; int moe_stage_n;   /* coli_cuda_moe_stage: a decode step's host experts' copies */
-    struct { cudaStream_t st; void *p; size_t cap; } skp[8];   /* HIP: gemv_i8_w4's split partials, a buffer a stream (gemv_sk_part) */
+    struct { cudaStream_t st; void *p; size_t cap; } skp[8];   /* gemv_i8_w4's split partials, a buffer a stream (gemv_sk_part; CUDA: COLI_CUDA_SK_PART=1) */
 #ifdef COLI_ANS
     void *ans_raw; size_t ans_raw_cap;
     void *ans_host; size_t ans_host_cap;
@@ -5270,6 +5270,29 @@ static void *gemv_sk_part(DeviceContext *ctx, cudaStream_t st, size_t bytes) {
     ctx->skp[k].st = st; ctx->skp[k].p = p; ctx->skp[k].cap = cap;
     return p;
 }
+#else
+/* CUDA, COLI_CUDA_SK_PART=1: the same buffer a stream, but never regrown, so a captured graph keeps
+ * its address; a call that needs more than the first allocation takes the stream-ordered allocator
+ * as before (NULL). Qwen3.8's chain makes 96 cudaMallocAsync + 96 cudaFreeAsync a decode step
+ * without it (nsys, UD-IQ1_M on an RTX 5090). */
+static int gemv_sk_part_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_CUDA_SK_PART"); on = e && *e == '1'; }
+    return on;
+}
+static void *gemv_sk_part(DeviceContext *ctx, cudaStream_t st, size_t bytes) {
+    if (!gemv_sk_part_on()) return NULL;
+    int k = -1;
+    for (int i = 0; i < 8 && k < 0; i++) if (ctx->skp[i].p && ctx->skp[i].st == st) k = i;
+    if (k >= 0) return ctx->skp[k].cap >= bytes ? ctx->skp[k].p : NULL;
+    for (int i = 0; i < 8 && k < 0; i++) if (!ctx->skp[i].p) k = i;
+    if (k < 0) return NULL;
+    size_t cap = bytes < ((size_t)8 << 20) ? ((size_t)8 << 20) : bytes;   /* 8 MiB: 8 splits x 8 rows x 32768 outputs */
+    void *p = NULL;
+    if (cudaMalloc(&p, cap) != cudaSuccess) { (void)cudaGetLastError(); return NULL; }
+    ctx->skp[k].st = st; ctx->skp[k].p = p; ctx->skp[k].cap = cap;
+    return p;
+}
 #endif
 
 extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, const float *x_dev, int S, void *stream) {
@@ -5301,11 +5324,9 @@ extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, cons
             int sr = S < GEMV_I8_NR ? S : GEMV_I8_NR;
             size_t xrow = (size_t)(gx4(kc / 4) + 1) * 16;
             while (sr > 1 && sr * xrow > 48 * 1024) sr--;
-            void *part = NULL; int own = 0;   /* own: the stream's buffer (HIP, gemv_sk_part), kept */
+            void *part = NULL; int own = 0;   /* own: the stream's buffer (gemv_sk_part), kept */
             const size_t pb = (size_t)kz * S * t->O * sizeof(float);
-#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
             if (sr * xrow <= 48 * 1024 && kz > 1) own = (part = gemv_sk_part(ctx, st, pb)) != NULL;
-#endif
             if (sr * xrow <= 48 * 1024 && (kz == 1 || own || cudaMallocAsync(&part, pb, st) == cudaSuccess)) {
                 dim3 g(bw, (unsigned)kz, (unsigned)((S + sr - 1) / sr));
                 if (sr == 1) coli_launch(gemv_i8_w4<1>, g, 256, xrow, st, y_dev, (float *)part, x_dev, w, t->scales, t->I, t->O, S, 1, kc);
