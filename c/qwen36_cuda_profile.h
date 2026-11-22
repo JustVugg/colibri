@@ -34,7 +34,7 @@ enum {
     Q36_LONG_ATTN = 1u << 12,
 };
 #define Q36_ALL_FEATURES ((1u << 13) - 1u)
-#define Q36_AVAILABLE_FEATURES ((1u << 10) - 1u)
+#define Q36_AVAILABLE_FEATURES ((1u << 11) - 1u)
 
 /* Match the complete device name and compute capability for each profile. */
 static inline int q36_cuda_device_profile(int major, int minor, const char *name,
@@ -96,7 +96,5 @@ static inline unsigned q36_request_features(int profile, int reused, int fresh, 
 static inline unsigned q36_default_features(int profile) {
     return q36_request_features(profile, 0, 0, 0, 0, 0);
 }
-
-static inline int q36_dnrec_has_override(void) { return 0; }
 
 #endif
