@@ -187,6 +187,16 @@ static bool use_plain_swiglu_schedule(const DeviceContext *ctx) {
     }
 }
 
+static bool use_dense_i8_schedule(const DeviceContext *ctx) {
+    if (!ctx->qwen36_active) return false;
+    switch (ctx->device_profile) {
+    case Q36_GPU_PRO4000:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static DeviceContext g_ctx[COLI_CUDA_MAX_DEVICES];
 static std::mutex g_qx_half_mutex[COLI_CUDA_MAX_DEVICES];
 static std::mutex &hcg_half_mutex(const DeviceContext *ctx) { return g_qx_half_mutex[ctx - g_ctx]; }
@@ -8010,7 +8020,7 @@ static bool hcg_dense_launch(DeviceContext *ctx, float *y, const float *x, const
     /* An INT8-only cache entry has no FP32 input available to pack. */
     const bool only_i8 = ctx->qx_only_i8[slot] && ctx->qx_slot_epoch[slot] == ctx->qx_epoch &&
         ctx->qx_src[slot] == x && ctx->qx_S[slot] == S && ctx->qx_I[slot] == I;
-    if (dense_auto_i8 && (ctx->kernel_mask & Q36_ACTIVATION_CACHE) && !only_i8) {
+    if (dense_auto_i8 && (ctx->kernel_mask & Q36_ACTIVATION_CACHE) && !only_i8 && !use_dense_i8_schedule(ctx)) {
         dim3 grid((unsigned)((O + TCG_BN - 1) / TCG_BN), (unsigned)((S + TCG_BM - 1) / TCG_BM));
         HcgPart h = hcg_part(ctx, y, (long long)grid.x * grid.y, 2, S, I, O, 1, st);
         grid.z = (unsigned)h.ns;
@@ -8239,7 +8249,7 @@ static int hcg_dense_swiglu_launch(DeviceContext *ctx, float *y, const float *x,
     const bool only_i8 = ctx->qx_only_i8[slot] && ctx->qx_slot_epoch[slot] == ctx->qx_epoch &&
         ctx->qx_src[slot] == x && ctx->qx_S[slot] == S && ctx->qx_I[slot] == I;
     const bool prefer_fp16_swiglu = (ctx->kernel_mask & Q36_ACTIVATION_CACHE) && !only_i8 &&
-        !use_plain_swiglu_schedule(ctx);
+        !use_plain_swiglu_schedule(ctx) && !use_dense_i8_schedule(ctx);
     dim3 g((unsigned)((O + TCG_BN - 1) / TCG_BN), (unsigned)((S + bm - 1) / bm));
     if (mode == 500) {
         if (bm == 16) hcg_dense_swiglu_k<WNP, 16, 0, 1, 2><<<g, 256, 0, st>>>(y, x, wg, scg, wu, scu, gs, S, I, O);

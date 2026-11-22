@@ -35,6 +35,7 @@ capabilities match the device reported by CUDA.
 | NVIDIA L4 (also reported as `L4`) | 8.9 |
 | NVIDIA A100-SXM4-40GB | 8.0 |
 | NVIDIA GeForce RTX 3090 | 8.6 |
+| NVIDIA RTX PRO 4000 Blackwell | 12.0 |
 
 The A100 profile also checks for at least 38 GiB and less than 42 GiB of device memory.
 The active kernels can depend on prefill or decode, cached prefix length, new token count and cold state.
