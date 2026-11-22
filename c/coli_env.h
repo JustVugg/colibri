@@ -189,6 +189,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_CUDA_CHAIN_TEST", CE_BOOL, CE_QWEN, 0, NULL}, /* Presence enables test-mode kernel settings, including when set to 0. Default unset. */
     {"COLI_CUDA_COPY_K", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_DENSE", CE_INT, CE_COLIBRI | CE_KIMI | CE_DSV4 | CE_GLM53 | CE_DSV41 | CE_MIMO, 0, NULL},
+    {"COLI_CUDA_DENSE_BM", CE_INT, CE_QWEN, 0, NULL}, /* Dense tensor-core tile or kernel mode. Default automatic. */
     {"COLI_CUDA_DENSE_GB", CE_INT, CE_COLIBRI | CE_KIMI | CE_DSV4 | CE_GLM53 | CE_DSV41 | CE_MIMO, 0, NULL},
     {"COLI_CUDA_DNREC_CFG", CE_INT, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_DNREC_ROWS", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
