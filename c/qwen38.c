@@ -3844,6 +3844,7 @@ int main(int argc, char **argv) {
     int64_t hist = q38_telemetry_init(snap, &m);
     if (g_q38_gguf_tier) q38_tier_warm(&m, hist > 0);   /* the CUDA tier's warm start, the history's most used experts first */
 #ifdef COLI_CUDA
+    if (g_cuda_chain) q38cc_dm_recheck(&m);   /* every expert on the card: the frame takes them, whatever the RAM cache's size */
     if (g_cuda_chain) q38cc_pool_init(&m);    /* the experts the card leaves, in RAM it reads over the bus */
 #endif
     q38_vocab_init(snap, &m);
