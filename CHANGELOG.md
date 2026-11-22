@@ -5,6 +5,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The gateway refuses POSTs from browser origins it does not know.** A page on any site could
+  send a no-cors `text/plain` POST to a local server with no API key, and the engine ran it
+  (`read_json` does not look at Content-Type). A POST whose `Origin` is neither in `--cors-origin`
+  nor the server's own origin now gets 403; requests without `Origin` are unchanged.
+
 ## [2.2.0] - 2026-11-21
 
 ### New

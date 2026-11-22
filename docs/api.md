@@ -344,6 +344,12 @@ enabled by default. Repeat `--cors-origin https://your-ui.example` to allow
 another exact origin, or use `--cors-origin '*'` only on a trusted local
 network.
 
+The same list guards POSTs: a request carrying an `Origin` header that is
+neither listed nor the server's own origin gets 403 `origin_not_allowed`, so a
+page on another site cannot drive a local server that has no API key with a
+no-cors form or `fetch`. Clients that send no `Origin` (SDKs, curl) are not
+affected; `--cors-origin '*'` turns the check off.
+
 The engine owns its KV contexts, so HTTP generation uses a bounded FIFO
 admission queue instead of pretending to run unsafe parallel sequences.
 Configure it with `--max-queue N` (default 8) and `--queue-timeout SECONDS`

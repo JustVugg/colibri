@@ -8974,6 +8974,23 @@ class APIHandler(BaseHTTPRequestHandler):
             return True
         return hmac.compare_digest(self.headers.get("x-api-key", ""), self.server.api_key)
 
+    def _check_origin(self):
+        """CSRF guard: a page on a foreign site can still send a no-cors "simple" POST
+        (text/plain, which read_json parses anyway) that the engine would run when no API
+        key is set. Browsers send Origin on every cross-origin POST, so refuse one that is
+        neither configured (--cors-origin) nor this server's own origin. Clients that send
+        no Origin (SDKs, curl, the ui/ proxy, which drops it) are unaffected."""
+        origin = self.headers.get("Origin")
+        if origin is None or "*" in self.server.cors_origins or origin in self.server.cors_origins:
+            return
+        # same origin (a page served by this server): Chromium sends Origin on those POSTs
+        # too, and Host has already passed _check_host, so matching it is enough
+        parts = urlsplit(origin)
+        if parts.scheme in ("http", "https") and parts.netloc.lower() == self.headers.get("Host", "").strip().lower():
+            return
+        raise APIError(403, "Origin %r not allowed. Add it with --cors-origin." % origin[:200],
+                       None, "origin_not_allowed", "permission_error")
+
     def require_auth(self):
         if not self._is_authed():
             raise APIError(401, "Invalid or missing API key.", None, "invalid_api_key",
@@ -9197,6 +9214,7 @@ class APIHandler(BaseHTTPRequestHandler):
         request_id = "req_" + uuid.uuid4().hex
         try:
             self._check_host()
+            self._check_origin()
             self.require_auth()
             try:
                 body = self.read_json()
