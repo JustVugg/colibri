@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """Reproducible ASR benchmark: Colibri qwen3_asr vs llama.cpp.
 
-Reports WER, CER, RTF, wall time, audio duration, and peak RSS (when /usr/bin/time -v available).
+Reports WER, CER, RTF, wall time, audio duration, load time, and peak RSS.
 Uses deterministic flite-generated WAV samples by default.
 
 Example:
-  python3 c/tools/benchmark_asr.py \
-    --colibri ./c/qwen3_asr \
-    --model ~/.cache/huggingface/hub/models--Qwen--Qwen3-ASR-1.7B/snapshots/<rev> \
-    --llama-cli .../llama-cli --gguf ...Q8_0.gguf --mmproj ...mmproj-Q8_0.gguf
+  OMP_NUM_THREADS=16 python3 c/tools/benchmark_asr.py \
+    --colibri ./c/qwen3_asr --model <hf-snapshot> \
+    --gguf <text.gguf> --mmproj <mmproj.gguf> \
+    --llama-cli <llama-cli> --json --repeats 1
 """
 from __future__ import annotations
-import argparse, base64, json, os, platform, resource, subprocess, sys, time, wave
+import argparse, base64, json, os, platform, re, resource, subprocess, sys, time, wave
 
 DEFAULT_SAMPLES = [
     ("hello", "Hello world, this is a test of speech recognition."),
@@ -20,7 +20,7 @@ DEFAULT_SAMPLES = [
 ]
 
 def norm(t: str):
-    return t.lower().replace(",", "").replace(".", "").replace("!", "").replace("?", "").replace("'", "").split()
+    return re.sub(r"[^a-z0-9 ]+", " ", t.lower()).split()
 
 def wer(ref: str, hyp: str):
     r, h = norm(ref), norm(hyp)
@@ -57,58 +57,77 @@ def ensure_samples(workdir):
         out.append((name, text, path))
     return out
 
-def bench_colibri(args, samples):
+def proc_rss_kb(pid):
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("VmHWM:"):
+                    return int(line.split()[1])
+    except Exception:
+        return None
+    return None
+
+def bench_colibri(args, samples, env):
     cmd=[args.colibri, "--model", args.model]
     if args.gguf: cmd += ["--gguf", args.gguf]
     if args.mmproj: cmd += ["--mmproj", args.mmproj]
     cmd += ["--serve"]
-    p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
     ready = False
     t0 = time.time()
-    for _ in range(800):
+    for _ in range(1200):
         line = p.stdout.readline()
+        if not line: break
         if b"READY" in line: ready = True; break
     load_s = time.time() - t0
-    if not ready: raise RuntimeError("colibri engine did not become READY")
+    if not ready:
+        p.kill(); p.wait(timeout=5)
+        raise RuntimeError("colibri engine did not become READY")
     rows = []
-    for name, ref, wav in samples:
-        audio_b64 = base64.b64encode(open(wav, "rb").read()).decode()
-        payload = json.dumps({"audio_b64": audio_b64}).encode()
-        cmd = f"TRANSCRIBE t1 0 {len(payload)}\n".encode() + payload + b"\n"
-        t0 = time.time(); p.stdin.write(cmd); p.stdin.flush()
-        text = ""; err = None
-        while True:
-            line = p.stdout.readline()
-            if not line: err = "eof"; break
-            if line.startswith(b"TRANSCRIPT t1 "):
-                n = int(line.split()[-1]); pl = p.stdout.read(n); p.stdout.readline()
-                try: text = json.loads(pl.decode()).get("text", "")
-                except Exception as e: err = str(e)
-            if line.startswith(b"DONE t1"): break
-            if line.startswith(b"ERROR t1"): err = line.decode(errors="ignore").strip(); break
-        dt = time.time() - t0; dur = wav_dur(wav)
-        we, wn = wer(ref, text); ce, cn = cer(ref, text)
-        rows.append({"engine":"colibri","sample":name,"wer":f"{we}/{wn}","cer":f"{ce}/{cn}","rtf":round(dt/dur,3),"wall_s":round(dt,3),"audio_s":round(dur,3),"load_s":round(load_s,3),"text":text,"error":err})
+    for rep in range(args.repeats):
+        for si, (name, ref, wav) in enumerate(samples):
+            audio_b64 = base64.b64encode(open(wav, "rb").read()).decode()
+            payload = json.dumps({"audio_b64": audio_b64}).encode()
+            req = f"TRANSCRIBE r{rep}_{si} 0 {len(payload)}\n".encode() + payload + b"\n"
+            t0 = time.time(); p.stdin.write(req); p.stdin.flush()
+            text = ""; err = None
+            while True:
+                line = p.stdout.readline()
+                if not line: err = "eof"; break
+                if line.startswith(f"TRANSCRIPT r{rep}_{si} ".encode()):
+                    n = int(line.split()[-1]); pl = p.stdout.read(n); p.stdout.readline()
+                    try: text = json.loads(pl.decode()).get("text", "")
+                    except Exception as e: err = str(e)
+                if line.startswith(f"DONE r{rep}_{si} ".encode()): break
+                if line.startswith(f"ERROR r{rep}_{si} ".encode()): err = line.decode(errors="ignore").strip(); break
+            dt = time.time() - t0; dur = wav_dur(wav)
+            we, wn = wer(ref, text); ce, cn = cer(ref, text)
+            rows.append({"engine":"colibri","sample":name,"rep":rep,"cold":rep==0 and si==0,"wer":f"{we}/{wn}","cer":f"{ce}/{cn}","rtf":round(dt/dur,4),"wall_s":round(dt,4),"audio_s":round(dur,4),"load_s":round(load_s,4),"rss_peak_kb":proc_rss_kb(p.pid),"text":text,"error":err})
     p.terminate()
     try: p.wait(timeout=5)
     except Exception: p.kill()
-    return rows
+    return rows, cmd
 
-def bench_llama(args, samples):
-    if not args.llama_cli: return []
+def bench_llama(args, samples, env):
+    if not args.llama_cli: return [], []
     rows = []
-    for name, ref, wav in samples:
-        t0 = time.time()
-        r = subprocess.run([args.llama_cli, "-m", args.gguf, "--mmproj", args.mmproj, "--audio", wav, "-p", "Transcribe this audio.", "-n", "128", "--no-display-prompt", "-st"], capture_output=True, text=True, timeout=args.timeout)
-        dt = time.time() - t0
-        text = r.stdout
-        if "<asr_text>" in text: text = text.split("<asr_text>")[-1]
-        for cut in ["[ Prompt:", "\n>", "Exiting"]:
-            if cut in text: text = text.split(cut)[0]
-        text = text.strip(); dur = wav_dur(wav)
-        we, wn = wer(ref, text); ce, cn = cer(ref, text)
-        rows.append({"engine":"llama.cpp","sample":name,"wer":f"{we}/{wn}","cer":f"{ce}/{cn}","rtf":round(dt/dur,3),"wall_s":round(dt,3),"audio_s":round(dur,3),"load_s":None,"text":text,"error":None if r.returncode==0 else f"rc={r.returncode}"})
-    return rows
+    cmd_base=[args.llama_cli, "-m", args.gguf, "--mmproj", args.mmproj]
+    for rep in range(args.repeats):
+        for si, (name, ref, wav) in enumerate(samples):
+            cmd = cmd_base + ["--audio", wav, "-p", "Transcribe this audio.", "-n", "128", "--no-display-prompt", "-st"]
+            t0 = time.time()
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout, env=env)
+            dt = time.time() - t0
+            text = r.stdout
+            if "<asr_text>" in text: text = text.split("<asr_text>")[-1]
+            for cut in ["[ Prompt:", "\n>", "Exiting"]:
+                if cut in text: text = text.split(cut)[0]
+            text = text.strip(); dur = wav_dur(wav)
+            we, wn = wer(ref, text); ce, cn = cer(ref, text)
+            # llama.cpp runs per process; ru_maxrss is children peak in KB on Linux
+            rss = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+            rows.append({"engine":"llama.cpp","sample":name,"rep":rep,"cold":True,"wer":f"{we}/{wn}","cer":f"{ce}/{cn}","rtf":round(dt/dur,4),"wall_s":round(dt,4),"audio_s":round(dur,4),"load_s":None,"rss_peak_kb":rss,"text":text,"error":None if r.returncode==0 else f"rc={r.returncode}"})
+    return rows, cmd_base
 
 def main():
     ap = argparse.ArgumentParser()
@@ -119,18 +138,33 @@ def main():
     ap.add_argument("--mmproj")
     ap.add_argument("--workdir", default="/tmp/opencode/bench_wavs")
     ap.add_argument("--timeout", type=int, default=300)
+    ap.add_argument("--repeats", type=int, default=1)
+    ap.add_argument("--omp-threads", type=int, default=int(os.environ.get("OMP_NUM_THREADS", "0")) or None)
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--out")
     args = ap.parse_args()
+    env = os.environ.copy()
+    if args.omp_threads: env["OMP_NUM_THREADS"] = str(args.omp_threads)
     samples = ensure_samples(args.workdir)
-    meta = {"platform": platform.platform(), "python": sys.version.split()[0], "machine": platform.machine(), "processor": platform.processor()}
-    rows = bench_colibri(args, samples) + bench_llama(args, samples)
+    meta = {"platform": platform.platform(), "python": sys.version.split()[0], "machine": platform.machine(), "processor": platform.processor(),
+            "omp_num_threads": env.get("OMP_NUM_THREADS"), "cpu_count": os.cpu_count(), "repeats": args.repeats,
+            "model": args.model, "gguf": args.gguf, "mmproj": args.mmproj}
+    colibri_rows, colibri_cmd = bench_colibri(args, samples, env)
+    llama_rows, llama_cmd = bench_llama(args, samples, env)
+    meta["colibri_cmd"] = colibri_cmd
+    meta["llama_cmd"] = llama_cmd
+    rows = colibri_rows + llama_rows
+    report = {"meta": meta, "rows": rows}
+    text = json.dumps(report, indent=2)
+    if args.out:
+        with open(args.out, "w") as f: f.write(text + "\n")
     if args.json:
-        print(json.dumps({"meta": meta, "rows": rows}, indent=2))
+        print(text)
     else:
-        print(f"# ASR benchmark\nplatform={meta['platform']} machine={meta['machine']}")
-        print("engine,sample,wer,cer,rtf,wall_s,audio_s,load_s,text")
+        print(f"# ASR benchmark\nplatform={meta['platform']} machine={meta['machine']} omp={meta['omp_num_threads']}")
+        print("engine,sample,rep,cold,wer,cer,rtf,wall_s,audio_s,load_s,rss_peak_kb,text")
         for r in rows:
-            print(f"{r['engine']},{r['sample']},{r['wer']},{r['cer']},{r['rtf']},{r['wall_s']},{r['audio_s']},{r['load_s']},{json.dumps(r['text'])}")
+            print(f"{r['engine']},{r['sample']},{r['rep']},{r['cold']},{r['wer']},{r['cer']},{r['rtf']},{r['wall_s']},{r['audio_s']},{r['load_s']},{r['rss_peak_kb']},{json.dumps(r['text'])}")
 
 if __name__ == "__main__":
     main()
