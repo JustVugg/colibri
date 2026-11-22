@@ -762,28 +762,31 @@ static void test_routed_fetches(void) {
        "no staged chunk has a layer the host serves inside the frame: the wait for the routes cannot block");
 }
 
-/* The shared expert takes one fused operation per layer on prompt and decode rows. */
-static void shared_swiglu_steps(Weights *w, Model *ref, const int *ids) {
+/* a backend with ew_norm: every layer's residual sum and the norm after it, and the layer
+ * before's sums with this one's input norm, in one op each; the logits the CPU path's, over a
+ * prompt and decode rows with the routed experts in the frame */
+static void ew_norm_steps(Weights *w, Model *ref, const int *ids) {
     Model r4, m4; build_model(&r4, w); build_model(&m4, w);
     share_trunk(&r4, ref); share_trunk(&m4, ref);
     fake_chain_table.size = sizeof(ColiCudaChainOps);
     Q36CChain *c4 = q36cc_setup(&m4, 1, NULL);
-    ck(c4 != NULL && c4->ok && cc_matmul_swiglu_ready(), "a backend with matmul_swiglu: the chain set up");
+    ck(c4 != NULL && c4->ok && cc_ew_norm_ready() && cc_matmul_swiglu_ready(), "a backend with ew_norm and matmul_swiglu: the chain set up");
     ck(c4 && !c4->device_profile && !fake_active_profile, "the tiny int8 fixture uses normal dispatch after setup");
     c4->device_profile = cc_select_qwen36_profile(1);   /* exercise the device profile on the small host reference */
     ck(c4->device_profile && fake_active_profile, "the extended table selects the device profile for the fusion checks");
     g_cuda_chain = 1;
-    int sw0 = fake_matmul_swiglus;
+    int ops0 = fake_ew_norms, sw0 = fake_matmul_swiglus;
     float *lr = step_ex(&r4, ids, 3, 0, 1); r4.kv_len = 3;
     float *lc = step_ex(&m4, ids, 3, 0, 1); m4.kv_len = 3;
-    same_logits(lc, lr, V, "matmul_swiglu: three prompt rows");
+    same_logits(lc, lr, V, "ew_norm + matmul_swiglu: three prompt rows");
     free(lr); free(lc);
+    ck(fake_ew_norms - ops0 == 2 * NL - 1, "ew_norm: a step's 2 * layers - 1 (the last layer's sums go to the final norm apart)");
     ck(fake_matmul_swiglus - sw0 == NL, "matmul_swiglu: a step's shared expert gate, up and SwiGLU in one op per layer");
     for (int t = 3; t < 6; t++) {
         int sw1 = fake_matmul_swiglus;
         lr = step_ex(&r4, ids + t, 1, t, 1); r4.kv_len = t + 1;
         lc = step_ex(&m4, ids + t, 1, t, 1); m4.kv_len = t + 1;
-        same_logits(lc, lr, V, "matmul_swiglu: a decode row");
+        same_logits(lc, lr, V, "ew_norm + matmul_swiglu: a decode row");
         ck(fake_matmul_swiglus - sw1 == NL, "matmul_swiglu: one fused op per layer on decode");
         free(lr); free(lc);
     }
@@ -1164,8 +1167,8 @@ int main(int argc, char **argv) {
     }
     fake_chain_table.size = CC_OPS_BASE_SIZE;
 
-    printf(" G2. the shared expert in one op (matmul_swiglu)\n");
-    shared_swiglu_steps(&w, &ref, ids);
+    printf(" G2. the residual sums and their norms in one op (ew_norm)\n");
+    ew_norm_steps(&w, &ref, ids);
 
     printf(" H. the MTP head on the CUDA chain: its drafts picked on the device\n");
     /* the whole vocabulary or the adaptive list: picked on the device; a listed vocabulary, or a

@@ -493,9 +493,9 @@ typedef struct ColiCudaChainOps {
     int  (*fetch_done_at)(int bank);
     /* ink2_caps: what the backend takes of Inkling-2-Mini's chain (CC_INK2_*) */
     int  (*ink2_caps)(void);
-    /* ew_norm: an ADD or a COMBINE ew (pe) into y, then y's rows normalised into yn (pn: a
-     * segment a row, x = y): a step's residual sum and the norm after it in one launch, the
-     * bits of ew and norm (qwen36_cuda_chain.h); absent: those two */
+    /* Add or combine the residual into y and normalize each row in one launch.
+     * The float path writes yn in the ordinary reduction order. A packed INT8
+     * result can use a different reduction and omit yn when the caller allows it. */
     int  (*ew_norm)(CcBuf *y, CcBuf *a, CcBuf *b, CcBuf *c, CcBuf *e, const CcEw *pe, CcBuf *w, CcBuf *yn, const CcNorm *pn);
     /* matmul_swiglu: gate (tg) and up (tu) on S rows of x at xo, then silu(g) * u into y at yo
      * with the kernel selected for the weight format and activation precision. Returns 1 on
@@ -834,6 +834,13 @@ static inline int cc_ink2_caps(void) {
 }
 static inline int cc_fetch_wait_at(int bank) { return cc_fetch_at_ready() ? cc_ops()->fetch_wait_at(bank) : 0; }
 static inline int cc_fetch_done_at(int bank) { return cc_fetch_at_ready() ? cc_ops()->fetch_done_at(bank) : 0; }
+static inline int cc_ew_norm_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, ew_norm) + sizeof t->ew_norm && t->ew_norm;
+}
+static inline int cc_ew_norm(CcBuf *y, CcBuf *a, CcBuf *b, CcBuf *c, CcBuf *e, const CcEw *pe, CcBuf *w, CcBuf *yn, const CcNorm *pn) {
+    return cc_ew_norm_ready() ? cc_ops()->ew_norm(y, a, b, c, e, pe, w, yn, pn) : 0;
+}
 static inline int cc_matmul_swiglu_ready(void) {
     const ColiCudaChainOps *t = cc_ops();
     return t && t->size >= offsetof(ColiCudaChainOps, matmul_swiglu) + sizeof t->matmul_swiglu && t->matmul_swiglu;
