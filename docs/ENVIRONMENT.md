@@ -539,6 +539,7 @@ These backend settings are for kernel testing and tuning. A profile default foll
 | `COLI_CUDA_CHAIN_TEST` | unset | Its presence, including a value of zero, enables test-mode kernel selection. |
 | `COLI_CUDA_DENSE_BM` | automatic | Override the tile size or kernel mode of eligible dense Tensor Core projections. |
 | `COLI_CUDA_DENSE_I8` | profile | Allow INT8 dense Tensor Core projection. A chain test without a benchmark defaults to off. |
+| `COLI_CUDA_DNCONV_FAST` | 1 | Select the DeltaNet convolution kernel mode. Mode 1 enables tiling on eligible long prompts. |
 | `COLI_CUDA_F2_MODE` | 0 | Select the prompt Flash attention variant for a head dimension of 256. |
 | `COLI_CUDA_F32G_FAST` | 1 | Select the narrow-output FP32 projection kernel. |
 | `COLI_CUDA_FUSED_SWIGLU` | profile | Allow supported shared-expert gate and up projections to fuse with SwiGLU. Zero selects separate projections for the profile. |
