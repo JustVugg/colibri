@@ -884,7 +884,7 @@ filled the driver's queue on a 1912-row prompt while a hybrid layer held the str
 host blocked there before serving it; the staged 2612-token prompt gains 3 % from it.
 
 **A decode step's segments as CUDA graphs** (`Q38_CC_GRAPH=1`, default off). With the routed
-experts on the host's step (FP8 or MXFP4 experts; not a GGUF's, which run in the frame), a
+experts on the host's step (FP8 or MXFP4 experts; a GGUF's, in the frame, below), a
 decode step or a verify issues about forty ops a layer one by one. The ops whose arguments
 depend only on the layer and the rows run as three captured graphs a layer (`q38cc_seg`):
 the MoE sum, the attention read and a DeltaNet layer's block or an attention layer's
@@ -900,6 +900,18 @@ outside the routed experts 43.9 / 26.4 / 27.3 / 40.8 ms, the last logits byte-id
 four runs. On this machine the FP8 decode is bound by the expert reads (about 350 ms a step), so
 the served decode moved 1-5 % (2.35-4.48 -> 2.36-4.67 tok/s, the same text and the same expert
 hits); with the experts mostly in VRAM the dense part is a larger share of the step.
+
+With the routed experts in the frame (a GGUF's), a layer whose slots are all the card's (no
+slot the host computes, no staged copy) ends its last segment with its router, routes, shared
+expert and experts instead of the router's copies down; a layer with a hosted slot or a staged
+copy runs op by op. A GGUF's block matrices quantize their input into a scratch of the backend's
+that grows, and moves, for a prompt's rows: its address (the optional `graph_scratch` op) is in a
+segment's fingerprint, so a graph that holds the old one is never replayed; with a DLL without
+the op a GGUF keeps the switch off. Measured on an RTX 5090 (Windows, Qwen3.8-Flash-Next
+GSQ-RCO IQ1_M, every routed expert on the card, `--ram 16 --cap 80`, served greedy, four requests
+from 32 to 4,634 prompt tokens, two sessions each): decode 49.4-52.5 tok/s off, 82.6-92.7 on
+(about +73 %), the step's wait for the device 0.55-0.60 ms off and 8.7-8.8 ms on (the step is
+now the card's), the same text in every request of every session.
 
 `tests/test_qwen38_cuda_chain.c` (`make qwen38-cuda-chain-check`, in CI beside
 `qwen38-dn-gpu-check`) runs the tiny FP8 fixture's oracle on the fake tier with the

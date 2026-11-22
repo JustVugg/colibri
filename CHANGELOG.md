@@ -7,6 +7,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### New
 
+- **qwen38: `Q38_CC_GRAPH=1` with a GGUF's routed experts in the frame.** The switch turned
+  itself off whenever the routed experts ran in the frame, so a GGUF with its experts on the card
+  issued about 2,000 ops a decode step one by one, bound by the host's launches. A layer whose
+  slots are all the card's now ends its last segment with its router, routes, shared expert and
+  experts; a layer with a hosted slot or a staged copy runs op by op as before. A new optional op,
+  `graph_scratch` (`cuda_chain.h`), gives the address of the scratch the GGUF block matrices
+  quantize into: it is in a segment's fingerprint, so a graph captured before the scratch moved
+  (a prompt's rows grow it) is never replayed; an older DLL keeps a GGUF's switch off. RTX 5090,
+  Qwen3.8-Flash-Next IQ1_M, every expert on the card, served greedy: decode 49.4-52.5 tok/s to
+  82.6-92.7, the same text in every request.
+
 - **qwen38: `Q38_CC_GRAPH=1` replays a decode step's chain segments as CUDA graphs** (default
   off). With the CUDA chain on and the routed experts on the host's step (FP8 or MXFP4 experts),
   a decode step or a verify launched about forty ops a layer one by one; the ops whose arguments
