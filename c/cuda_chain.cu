@@ -37,6 +37,7 @@ extern "C" int coli_cuda_tensor_glu_async(ColiCudaTensor *tg, ColiCudaTensor *tu
 /* the caller's word for this thread's next matmul: x as it was at the stream's last one (its
  * quantization kept) */
 extern "C" void coli_cuda_bd_x_same(int on);
+extern "C" const void *coli_cuda_bd_scratch_of(void *stream);
 extern "C" int coli_cuda_tensor_gemv_rows_async(ColiCudaTensor *t, const int *ids_dev, float *y_dev, const float *x_dev, int n, void *stream);
 /* and the routed experts' kernels (cc_moe), on the same terms, and a resident tensor's device copy */
 extern "C" int coli_cuda_tensor_dev(const ColiCudaTensor *t, const void **w, const float **sc, int *gs);
@@ -2197,9 +2198,13 @@ static void cc_graph_free(void *g) {
     }
     (void)cudaGetLastError();
 }
-#define CC_GRAPH_OPS cc_graph_begin, cc_graph_end, cc_graph_launch, cc_graph_free
+static const void *cc_graph_scratch(void) {   /* g_cc directly: cur() would move t_cc_seq */
+    const CcCtx *c = g_cur >= 0 ? &g_cc[g_cur] : nullptr;
+    return c && c->up ? coli_cuda_bd_scratch_of((void *)c->stream) : nullptr;
+}
+#define CC_GRAPH_OPS cc_graph_begin, cc_graph_end, cc_graph_launch, cc_graph_free, cc_graph_scratch
 #else
-#define CC_GRAPH_OPS nullptr, nullptr, nullptr, nullptr
+#define CC_GRAPH_OPS nullptr, nullptr, nullptr, nullptr, nullptr
 #endif
 static int cc_finish(void) {
     CcCtx *c = live();
@@ -3061,7 +3066,7 @@ static int cc_moe(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf 
         (p->esc_off && (p->esc_off % 8 || p->E < 1 || (size_t)p->esc_off + (size_t)(p->t_off + p->E) * 8 > tab->bytes))) return 0;
     g_st.ops++;
     if (!coli_cuda_moe_async(c->device, (const CcExpert *)tab->d, fp(x), (const int *)ids->d, fp(w), fpw(hid), fpw(y), fp(hy), p,
-                             (void *)c->stream)) { c->lost = 1; return 0; }
+                             (void *)c->stream)) { if (c->capturing) c->cap_broke = 1; else c->lost = 1; return 0; }
     return 1;
 }
 /* a hyper-connection read's up projection and mix (coli_cuda_tensor_gemm_hcmix_async): -1 not taken */

@@ -1915,6 +1915,12 @@ static inline int bd_mmq_takes(const DeviceContext *ctx, const ColiCudaTensor *t
 }
 /* cuda_chain.cu's: x unchanged since this thread's last matmul on the stream (bd_xq_quant keeps its quantization) */
 extern "C" void coli_cuda_bd_x_same(int on) { g_bd_x_same = on; }
+/* the stream's scratch (bd_xq_scratch), NULL before its first GEMV: cuda_chain.cu's graph_scratch */
+extern "C" const void *coli_cuda_bd_scratch_of(void *stream) {
+    std::lock_guard<std::mutex> lk(g_bd_xq_mu);
+    for (int i = 0; i < g_bd_xq_n; i++) if (g_bd_xq[i].st == (cudaStream_t)stream) return g_bd_xq[i].p;
+    return nullptr;
+}
 static int bd_tensor_gemm(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float *x, int S, cudaStream_t st);
 static int bd_tensor_gemv(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float *x, int S, cudaStream_t st) {
     const bd_u32 *tab = bd_table(ctx);

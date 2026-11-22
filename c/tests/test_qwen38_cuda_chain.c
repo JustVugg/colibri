@@ -121,6 +121,9 @@ static int fg_begin(void) {
     fg_cur = (FgGraph *)calloc(1, sizeof *fg_cur); fg_broke = 0;
     return 1;
 }
+/* where a GGUF's block matrices quantize (graph_scratch): fixed, or (fg_scratch_moves) moved before every segment */
+static int fg_scratch_moves; static uintptr_t fg_scratch_at = 0x1000;
+static const void *fg_scratch_of(void) { return (const void *)(fg_scratch_moves ? (fg_scratch_at += 64) : fg_scratch_at); }
 static void fg_free(void *g) { FgGraph *x = (FgGraph *)g; if (x) { free(x->ops); free(x); fg_frees++; } }
 static void *fg_end(int *broke) {
     FgGraph *g = fg_cur; fg_cur = NULL;
@@ -155,6 +158,7 @@ static void fg_install(void) {
     t->copy = fg_copy; t->matmul = fg_matmul; t->norm = fg_norm; t->rope = fg_rope; t->dnconv = fg_dnconv; t->dnrec = fg_dnrec; t->ew = fg_ew;
     t->copy_regions = fg_copy_regions; t->zero = fg_zero; t->write = fg_write; t->attn = fg_attn; t->qsa = fg_qsa; t->ple = fg_ple;
     t->graph_begin = fg_begin; t->graph_end = fg_end; t->graph_launch = fg_launch; t->graph_free = fg_free;
+    t->graph_scratch = fg_scratch_of;
 }
 static void fg_uninstall(void) { fake_chain_table = fg_saved; }
 static char *fg_slurp(const char *path, size_t *n) {
@@ -180,18 +184,18 @@ static int fg_run(char **argv, const char *tag) {
     return rc;
 }
 /* Q38_CC_GRAPH off, then on: the same tokens (the engine's printout) and the same last logits bit
- * for bit; *took (a counter of the graphs' work) moved with the switch on and only then */
+ * for bit; *took (a counter of the graphs' work, NULL: none) moved with the switch on and only then */
 static void t_graph_switch(char **argv, const char *title, const unsigned long long *took) {
     printf(" %s\n", title);
     setenv("COLI_CUDA_CHAIN", "1", 1);
     fake_chain_frames = 0; fake_chain_fail_at = 0;
     unsetenv("Q38_CC_GRAPH");
-    unsigned long long t0 = *took;
+    unsigned long long t0 = took ? *took : 0;
     int rc0 = fg_run(argv, "off");
-    unsigned long long t1 = *took;
+    unsigned long long t1 = took ? *took : 0;
     setenv("Q38_CC_GRAPH", "1", 1);
     int rc1 = fg_run(argv, "on");
-    unsigned long long t2 = *took;
+    unsigned long long t2 = took ? *took : 1;
     unsetenv("Q38_CC_GRAPH");
     size_t n0, n1, l0, l1;
     char *o0 = fg_slurp("q38g_off.out", &n0), *o1 = fg_slurp("q38g_on.out", &n1);
@@ -272,6 +276,14 @@ int main(void) {
             t_graph_switch(argv, "Q38_CC_GRAPH=1, a capture breaks halfway through the run", &fg_breaks);
             tk(fg_breaks == b0 + 1 && fg_captures > c0 && fg_frees - f0 == fg_captures - c0, "the graphs made before the break all freed");
             fg_break_at = 0;
+        }
+        {   /* the scratch a GGUF's block matrices quantize into moved (a prompt's rows grow it): a graph that
+             * holds the old address is never replayed; here it moves before every segment */
+            unsigned long long c0 = fg_captures, r0 = fg_replays;
+            fg_scratch_moves = 1;
+            t_graph_switch(argv, "Q38_CC_GRAPH=1, the block matrices' scratch moved before every segment", NULL);
+            tk(fg_captures == c0 && fg_replays == r0, "every segment op by op: no graph captured or replayed");
+            fg_scratch_moves = 0;
         }
         fg_uninstall();
     }

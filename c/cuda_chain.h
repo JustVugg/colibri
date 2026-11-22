@@ -505,6 +505,10 @@ typedef struct ColiCudaChainOps {
     void *(*graph_end)(int *broke);
     int  (*graph_launch)(void *g);
     void (*graph_free)(void *g);
+    /* graph_scratch: the device address of the scratch the backend's GGUF block matmuls quantize
+     * their input into on the chain's stream (NULL before the first): a graph captured with one
+     * address is stale once the scratch moved (it grows for a prompt's rows). NULL entry on HIP. */
+    const void *(*graph_scratch)(void);
 } ColiCudaChainOps;
 #define CC_INK2_MOE      1   /* cc_moe's act 1, esc_off, planar 2 entries and NVFP4 (fmt 140) in a decode step's rows */
 #define CC_INK2_LOOPGATE 2   /* cc_ew's CC_EW_LOOPGATE */
@@ -838,6 +842,11 @@ static inline int cc_graph_begin(void) { return cc_graph_ready() ? cc_ops()->gra
 static inline void *cc_graph_end(int *broke) { *broke = 0; return cc_graph_ready() ? cc_ops()->graph_end(broke) : NULL; }
 static inline int cc_graph_launch(void *g) { return cc_graph_ready() && g ? cc_ops()->graph_launch(g) : 0; }
 static inline void cc_graph_free(void *g) { if (g && cc_graph_ready()) cc_ops()->graph_free(g); }
+static inline int cc_graph_scratch_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, graph_scratch) + sizeof t->graph_scratch && t->graph_scratch;
+}
+static inline const void *cc_graph_scratch(void) { return cc_graph_scratch_ready() ? cc_ops()->graph_scratch() : NULL; }
 static inline int cc_fetch_wait_at(int bank) { return cc_fetch_at_ready() ? cc_ops()->fetch_wait_at(bank) : 0; }
 static inline int cc_fetch_done_at(int bank) { return cc_fetch_at_ready() ? cc_ops()->fetch_done_at(bank) : 0; }
 #endif
