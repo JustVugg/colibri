@@ -42,12 +42,15 @@ checkable.
 
 ### `OMP_NUM_THREADS` — 18 (all logical cores)
 
-Swept 6→18. **18 gave the best decode throughput (0.28 tok/s).** The built-in
-auto-sizer (`omp_tune.h`) caps the OpenMP team at `perflevel0` cores (6 on this
-chip), which is correct for P+E layouts but wrong here: the M5 Max's second tier
-runs ~0.70× per core — well above the `N_fast/(N_fast+N_slow)=0.33` break-even
-for equal-split scheduling — so including all 18 helps rather than drags.
-`OMP_NUM_THREADS` overrides the auto-sizer (it yields if the env var is set).
+Swept 6→18. **18 gave the best decode throughput (0.28 tok/s).** When this was
+measured, the built-in auto-sizer (`omp_tune.h`) left the last performance level
+out (6 threads on this chip), which is correct for P+E layouts but wrong here: the
+M5 Max's second tier runs ~0.70× per core — well above the
+`N_fast/(N_fast+N_slow)=0.33` break-even for equal-split scheduling — so including
+all 18 helps rather than drags. The auto-sizer now leaves out only a level named
+`Efficiency` (#2938), so a chip whose levels are Super and Performance, as on the
+M5 Pro, gets every core without the override. `OMP_NUM_THREADS` overrides the
+auto-sizer (it yields if the env var is set).
 
 ### `K3_EXPERT_GB` — ~40–44
 
