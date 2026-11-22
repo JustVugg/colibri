@@ -537,6 +537,7 @@ These backend settings are for kernel testing and tuning. A profile default foll
 | `COLI_CUDA_ASYNC_DOWN` | on when eligible | Allow large device-to-host copies on the copy stream. Zero disables this path. |
 | `COLI_CUDA_CHAIN_BENCH` | unset | Select a CUDA chain benchmark. Its presence also makes several kernel settings refresh between calls. |
 | `COLI_CUDA_CHAIN_TEST` | unset | Its presence, including a value of zero, enables test-mode kernel selection. |
+| `COLI_CUDA_DENSE_BM` | automatic | Override the tile size or kernel mode of eligible dense Tensor Core projections. |
 | `COLI_CUDA_F2_MODE` | 0 | Select the prompt Flash attention variant for a head dimension of 256. |
 | `COLI_CUDA_F32G_FAST` | 1 | Select the narrow-output FP32 projection kernel. |
 | `COLI_CUDA_GEMV_I2F` | 1 | Select the integer-to-float kernel mode for short matrix-vector projections. |

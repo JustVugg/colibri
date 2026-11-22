@@ -2873,7 +2873,7 @@ static int cc_matmul(ColiCudaTensor *t, CcBuf *x, size_t xo, CcBuf *y, size_t yo
     (void)fp(x);
     if (c->lost) return 0;
     g_st.matmuls++; g_st.ops++;
-    if (c->device_profile && (fmt == 0 || (fmt == 1 && S <= 8))) {
+    if (c->device_profile && fmt < 100) {
         if (!coli_cuda_qwen36_gemm_async(t, y->d + yo, x->d + xo, S, (void *)c->stream)) { c->lost = 1; return 0; }
         return 1;
     }
