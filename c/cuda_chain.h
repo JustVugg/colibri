@@ -530,7 +530,7 @@ typedef struct ColiCudaChainOps {
      * Chain initialization and shutdown clear the selection. Returns the active profile ID, or zero. */
     int  (*select_qwen36_profile)(int enable);
     void (*set_kernel_mask)(unsigned mask);
-    /* Reserved for the packed native INT8 operation in the extended table. */
+    /* As matmul_swiglu at offset zero, with packed decoding of the native INT8 weights. */
     int (*swiglu_pair_codes)(ColiCudaTensor *g, ColiCudaTensor *u, CcBuf *x, CcBuf *y, int S);
     /* Report the current device's profile without enabling it. */
     int (*probe_qwen36_profile)(void);
@@ -872,6 +872,12 @@ static inline int cc_matmul_swiglu_ready(void) {
 }
 static inline int cc_matmul_swiglu(ColiCudaTensor *tg, ColiCudaTensor *tu, CcBuf *x, size_t xo, CcBuf *y, size_t yo, int S) {
     return cc_matmul_swiglu_ready() ? cc_ops()->matmul_swiglu(tg, tu, x, xo, y, yo, S) : 0;
+}
+static inline int cc_swiglu_pair_codes(ColiCudaTensor *g, ColiCudaTensor *u, CcBuf *x, CcBuf *y, int S) {
+    const ColiCudaChainOps *t = cc_ops();
+    if (t && t->size >= offsetof(ColiCudaChainOps, swiglu_pair_codes) + sizeof t->swiglu_pair_codes && t->swiglu_pair_codes)
+        return t->swiglu_pair_codes(g, u, x, y, S);
+    return cc_matmul_swiglu(g, u, x, 0, y, 0, S);
 }
 static inline int cc_select_qwen36_profile(int enable) {
     const ColiCudaChainOps *t = cc_ops();

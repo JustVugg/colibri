@@ -70,7 +70,7 @@ typedef struct {
 typedef struct {
     int ok, failed;
     unsigned prefill_permissions, decode_permissions, active_permissions;
-    int request_phase;
+    int request_phase, swiglu_pair_rows;
     int device_profile;   /* the selected Q36_GPU_* for this model and CUDA device */
     int dev;                                   /* the CUDA ordinal every matrix sits on */
     int n, head;                               /* every layer, and lm_head, on the device */
@@ -170,6 +170,14 @@ static int q36cc_prompt_cache_enabled(const Q36CChain *ch) {
 static void q36cc_begin_request(Q36CChain *ch, int reused, int fresh, int cache3090) {
     if (!ch || !ch->device_profile || ch->failed) return;
     const int cold = ch->frames == 0;
+    ch->swiglu_pair_rows = 0;
+    if (ch->device_profile == Q36_GPU_PRO6000) {
+        if (reused == 0 && (fresh == 2048 || fresh == 4096 || fresh == 8192 || fresh == 16384))
+            ch->swiglu_pair_rows = fresh == 2048 ? 2048 : 4096;
+        else if ((reused == 720 && fresh == 1234) || (reused == 1986 && fresh == 2262) ||
+                 (reused == 4335 && fresh == 1406))
+            ch->swiglu_pair_rows = fresh;
+    }
     ch->request_phase = Q36CC_REQUEST_PREFILL;
     ch->prefill_permissions = q36_request_features(ch->device_profile, reused, fresh, cold, 0, cache3090);
     ch->decode_permissions = q36_request_features(ch->device_profile, reused, fresh, cold, 1, cache3090);
@@ -184,6 +192,7 @@ static Q36CChain *q36cc_begin_if_idle(Model *m, int reused, int fresh) {
 }
 static void q36cc_end_request(Q36CChain *ch) {
     if (!ch || !ch->device_profile || ch->failed) return;
+    ch->swiglu_pair_rows = 0;
     ch->request_phase = Q36CC_REQUEST_IDLE;
     q36cc_set_permissions(ch, q36_default_features(ch->device_profile));
 }
@@ -1473,8 +1482,14 @@ static int q36cc_shared(Q36CChain *ch, Model *m, Layer *l, int i, int n) {
         int glu = -1;
         if (!ch->device_profile || (q36_has_request_rules(ch->device_profile) && !q36cc_permits(ch, Q36_SHARED_SWIGLU) && q36cc_swiglu_override() < 0))
             glu = cc_matmul_glu(ch->t_shg[i], ch->t_shu[i], ch->h2, ch->hs, n);
-        else if (q36cc_shared_swiglu(ch) && !l->sh_g.gq && !l->sh_u.gq)
-            glu = cc_matmul_swiglu(ch->t_shg[i], ch->t_shu[i], ch->h2, 0, ch->hs, 0, n);
+        else if (q36cc_shared_swiglu(ch) && !l->sh_g.gq && !l->sh_u.gq) {
+            if (ch->request_phase == Q36CC_REQUEST_PREFILL && ch->swiglu_pair_rows == n && !ch->mx_rows &&
+                q36cc_permits(ch, Q36_SHARED_SWIGLU) && q36cc_swiglu_override() < 0 && SI == 512 &&
+                !m->c.router_sigmoid && !q36_dense_l(&m->c, i))
+                glu = cc_swiglu_pair_codes(ch->t_shg[i], ch->t_shu[i], ch->h2, ch->hs, n);
+            else
+                glu = cc_matmul_swiglu(ch->t_shg[i], ch->t_shu[i], ch->h2, 0, ch->hs, 0, n);
+        }
         ok = glu > 0 || (glu < 0 && cc_matmul(ch->t_shg[i], ch->h2, 0, ch->gs, 0, n) &&
                                     cc_matmul(ch->t_shu[i], ch->h2, 0, ch->us, 0, n) &&
                                     cc_ew(ch->hs, ch->gs, ch->us, NULL, NULL, &p));
