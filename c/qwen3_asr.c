@@ -1198,6 +1198,9 @@ static int transcribe_audio(Qwen3Asr *m, const unsigned char *wav, size_t wav_n,
     prompt[n++]=t_im_end;
     prompt[n++]=198;
     prompt[n++]=t_im_start; prompt[n++]=77091; prompt[n++]=198;
+    /* Default prefill: force English transcription, matching HF apply_transcription_request(language='English'). */
+    { int prefill[] = {11528, 6364, 151704}; /* "language English<asr_text>" */
+      for (int pi=0; pi<3 && n<4096; pi++) prompt[n++]=prefill[pi]; }
     int gen = greedy_decode(m, prompt, n, audio_emb, audio_n, text_out, cap, 256);
     /* Strip Qwen3-ASR control prefix: "language ...<asr_text>" */
     char *asr = strstr(text_out, "<asr_text>");
