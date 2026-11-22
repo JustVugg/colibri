@@ -950,6 +950,37 @@ static void test_step_kernel_mask(Model *m, Model *ref, Q36CChain *ch, const int
     fake_chain_table.size = saved_size;
 }
 
+static void test_request_kernel_mask(void) {
+    const size_t saved_size = fake_chain_table.size;
+    const int saved_profile = fake_device_profile;
+    const int saved_up = fake_chain_up;
+    fake_chain_up = 1;
+    fake_chain_table.size = sizeof fake_chain_table;
+    fake_device_profile = Q36_GPU_A100;
+    Q36CChain a100 = {0};
+    a100.device_profile = cc_select_qwen36_profile(1);
+    q36cc_end_request(&a100);
+    const unsigned a100_hot = fake_kernel_mask;
+    q36cc_begin_request(&a100, 0, 64, 0);
+    ck(a100.request_phase && (fake_kernel_mask & Q36_DNREC) &&
+       !(a100.decode_permissions & (Q36_FLASH_ATTN | Q36_ASYNC_COPIES)),
+       "A100 cold 64-token prompt and decode use different permitted operations");
+    q36cc_end_request(&a100);
+    ck(!a100.request_phase && fake_kernel_mask == a100_hot,
+       "A100 request completion restores the ordinary profile mask");
+    a100.frames = 1;
+    q36cc_begin_request(&a100, 0, 64, 0);
+    ck(a100.request_phase && fake_kernel_mask == a100_hot &&
+       !(fake_kernel_mask & Q36_DNREC),
+       "A100 subsequent 64-token prompt leaves cold DeltaNet scheduling disabled");
+    q36cc_end_request(&a100);
+    ck(cc_select_qwen36_profile(0) == Q36_GPU_NONE && !fake_kernel_mask,
+       "disabling the device profile clears backend request permissions");
+    fake_device_profile = saved_profile;
+    fake_chain_up = saved_up;
+    fake_chain_table.size = saved_size;
+}
+
 int main(int argc, char **argv) {
 #ifdef _WIN32
     if (argc == 3 && !strcmp(argv[1], "--probe")) return probe(atoi(argv[2]), 0);
@@ -981,6 +1012,8 @@ int main(int argc, char **argv) {
     Model m; build_model(&m, &w);
     for (int i = 0; i < NL; i++) { m.L[i].qth_dnout = ref.L[i].qth_dnout; m.L[i].qth_q = ref.L[i].qth_q; m.L[i].qth_k = ref.L[i].qth_k; m.L[i].qth_v = ref.L[i].qth_v;
                                    m.L[i].qth_o = ref.L[i].qth_o; m.L[i].qth_shg = ref.L[i].qth_shg; m.L[i].qth_shu = ref.L[i].qth_shu; m.L[i].qth_shd = ref.L[i].qth_shd; }
+
+    test_request_kernel_mask();
 
     test_cuda_model_filter(&ref);
 

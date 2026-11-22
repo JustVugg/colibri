@@ -144,7 +144,7 @@ typedef struct {
     const float *qx_src[2]; int qx_S[2], qx_I[2];
     const void *qx_last_w[2]; uint64_t qx_slot_epoch[2], qx_epoch; int qx_only_i8[2];
     HcgHalfCache qx_half;
-    int qwen36_active, l2_fetch_changed;
+    int qwen36_active, l2_fetch_changed, device_profile;
     size_t saved_l2_fetch_limit;
     unsigned kernel_mask;
     float *host_x,*host_y,*host_kv; size_t host_x_cap,host_y_cap,host_kv_cap;
@@ -175,6 +175,16 @@ typedef struct {
     int gf,uf,df,rows,offset;
     int ggs,ugs,dgs;      /* per-tensor quant group size; 0 = per-row scales (#334 fmt=4) */
 } GroupDesc;
+
+static bool use_plain_swiglu_schedule(const DeviceContext *ctx) {
+    if (!ctx->qwen36_active) return false;
+    switch (ctx->device_profile) {
+    case Q36_GPU_A100:
+        return true;
+    default:
+        return false;
+    }
+}
 
 static DeviceContext g_ctx[COLI_CUDA_MAX_DEVICES];
 static std::mutex g_qx_half_mutex[COLI_CUDA_MAX_DEVICES];
@@ -1792,6 +1802,7 @@ extern "C" int coli_cuda_init(const int *devices, int count) {
         cudaDeviceProp prop{};
         if (!cuda_ok(cudaGetDeviceProperties(&prop, device), "device properties")) { coli_cuda_shutdown(); return 0; }
         ctx->compute_major=prop.major;ctx->compute_minor=prop.minor;
+        ctx->device_profile = q36_cuda_device_profile(prop.major, prop.minor, prop.name, prop.totalGlobalMem);
         ctx->sms=prop.multiProcessorCount>0?prop.multiProcessorCount:1;
 #if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
         ctx->smem_optin=48*1024;
@@ -8226,7 +8237,8 @@ static int hcg_dense_swiglu_launch(DeviceContext *ctx, float *y, const float *x,
     const int slot = I == 2048 ? 0 : 1;
     const bool only_i8 = ctx->qx_only_i8[slot] && ctx->qx_slot_epoch[slot] == ctx->qx_epoch &&
         ctx->qx_src[slot] == x && ctx->qx_S[slot] == S && ctx->qx_I[slot] == I;
-    const bool prefer_fp16_swiglu = (ctx->kernel_mask & Q36_ACTIVATION_CACHE) && !only_i8;
+    const bool prefer_fp16_swiglu = (ctx->kernel_mask & Q36_ACTIVATION_CACHE) && !only_i8 &&
+        !use_plain_swiglu_schedule(ctx);
     dim3 g((unsigned)((O + TCG_BN - 1) / TCG_BN), (unsigned)((S + bm - 1) / bm));
     if (mode == 500) {
         if (bm == 16) hcg_dense_swiglu_k<WNP, 16, 0, 1, 2><<<g, 256, 0, st>>>(y, x, wg, scg, wu, scu, gs, S, I, O);
@@ -8269,7 +8281,7 @@ static int hcg_dense_swiglu_launch(DeviceContext *ctx, float *y, const float *x,
         if (bm == 16) hcg_dense_swiglu_k<WNP, 16, 1, 2, 2><<<g, 256, 0, st>>>(y, x, wg, scg, wu, scu, gs, S, I, O);
         else if (bm == 32) hcg_dense_swiglu_k<WNP, 32, 1, 2, 2><<<g, 256, 0, st>>>(y, x, wg, scg, wu, scu, gs, S, I, O);
         else hcg_dense_swiglu_k<WNP, 64, 1, 2, 2><<<g, 256, 0, st>>>(y, x, wg, scg, wu, scu, gs, S, I, O);
-    } else if (mode == 0) {
+    } else if (mode == 0 && !use_plain_swiglu_schedule(ctx)) {
         return hcg_swiglu_dev_launch<WF>(ctx, y, x, wg, scg, wu, scu, gs, S, I, O, st);
     } else if (bm == 16) hcg_dense_swiglu_k<WNP, 16, 0, 1, 2><<<g, 256, 0, st>>>(y, x, wg, scg, wu, scu, gs, S, I, O);
     else if (bm == 32) hcg_dense_swiglu_k<WNP, 32, 0, 1, 2><<<g, 256, 0, st>>>(y, x, wg, scg, wu, scu, gs, S, I, O);
