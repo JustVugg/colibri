@@ -2624,6 +2624,22 @@ static void *q38_psd_write(void *arg){
     return NULL;
 }
 static void q38_psd_join(void){ if(g_q38_psd_busy){pthread_join(g_q38_psd_th,NULL);g_q38_psd_busy=0;} }
+/* A tail's rows (`n` positions from `t0`, part by part and head by head, as coli_ps_rows lays them):
+ * the MTP head's, for the positions it does not hold yet (`held` on), are zeros in the file and not
+ * what its arrays last had there. A whole block always has them (q38_ps_save). 0: out of memory. */
+static int q38_psd_head_tail(const Model *m,char *rows,int t0,int n,int held){
+    ColiPsPart *parts=(ColiPsPart*)malloc((size_t)3*q38_layer_rows(m)*sizeof *parts+1);
+    if(!parts)return 0;
+    const int np=q38_ps_parts(m,parts),L=m->c.layers,has=held<=t0?0:held-t0>=n?n:held-t0;
+    for(int p=0;p<np;p++){
+        const ColiPsPart *q=&parts[p];
+        const int per=coli_ps_per(q),head=q->base==m->K[L]||q->base==m->V[L]||q->base==m->IK[L];
+        const size_t len=(size_t)(n/per)*q->row,live=(size_t)(has/per)*q->row;
+        for(int h=0;h<q->heads;h++,rows+=len)if(head&&live<len)memset(rows+live,0,len-live);
+    }
+    free(parts);
+    return 1;
+}
 /* The image of the store's checkpoint at exactly ids[0, P) (its size in *bytes); NULL when the store
  * does not hold it, it is over the cap, or its copy would leave less than the store's RAM floor free. */
 static char *q38_psd_image(Model *m,const int *ids,int P,size_t *bytes){
@@ -2649,15 +2665,25 @@ static char *q38_psd_image(Model *m,const int *ids,int P,size_t *bytes){
             if(!m->c.is_attn[i]){Q38_PSD_PUT(st->rec[i],rec*sizeof(float));Q38_PSD_PUT(st->conv[i],conv*sizeof(float));}
         if(ple)Q38_PSD_PUT(st->ple,ple*sizeof(float));
         Q38_PSD_PUT(st->ple_hist,sizeof st->ple_hist); Q38_PSD_PUT(&st->ple_len,sizeof(int));
+        int whole=1;
         if(m->mtp){
-            Q38_PSD_PUT(st->mtp_pend,(size_t)Q38_SPEC_ROWS*m->c.hc_width*sizeof(float));
+            /* the rows past mtp_pend_n are not pending ones: zeros, not what the buffer last had */
+            const size_t row=(size_t)m->c.hc_width*sizeof(float);
+            const int n=st->mtp_pend_n<0?0:st->mtp_pend_n>Q38_SPEC_ROWS?Q38_SPEC_ROWS:st->mtp_pend_n;
+            Q38_PSD_PUT(st->mtp_pend,(size_t)n*row);
+            memset(w,0,(size_t)(Q38_SPEC_ROWS-n)*row); w+=(size_t)(Q38_SPEC_ROWS-n)*row;
             Q38_PSD_PUT(&st->mtp_len,sizeof(int)); Q38_PSD_PUT(&st->mtp_pend_n,sizeof(int));
             Q38_PSD_PUT(st->mtp_pend_tok,sizeof st->mtp_pend_tok);
         }
         for(int k=0;k<h.depth;k++)Q38_PSD_PUT(g_q38_ps.blk[h.path[k]].rows,g_q38_ps.blk_bytes);
-        if(ck->tail)Q38_PSD_PUT(ck->trows,(size_t)ck->tail*(g_q38_ps.blk_bytes/g_q38_ps.B));
+        if(ck->tail){
+            char *tail=w;
+            Q38_PSD_PUT(ck->trows,(size_t)ck->tail*(g_q38_ps.blk_bytes/g_q38_ps.B));
+            if(m->mtp)whole=q38_psd_head_tail(m,tail,P-ck->tail,ck->tail,st->mtp_len);
+        }
 #undef Q38_PSD_PUT
-        if(w-img!=size){free(img);img=NULL;}   /* the geometry and the size disagree: nothing written */
+        /* the geometry and the size disagree, or no memory to lay the tail out: nothing written */
+        if(w-img!=size||!whole){free(img);img=NULL;}
         else *bytes=(size_t)size;
     }
     coli_ps_hit_free(&h);
@@ -3818,6 +3844,7 @@ int main(int argc, char **argv) {
     int64_t hist = q38_telemetry_init(snap, &m);
     if (g_q38_gguf_tier) q38_tier_warm(&m, hist > 0);   /* the CUDA tier's warm start, the history's most used experts first */
 #ifdef COLI_CUDA
+    if (g_cuda_chain) q38cc_dm_recheck(&m);   /* every expert on the card: the frame takes them, whatever the RAM cache's size */
     if (g_cuda_chain) q38cc_pool_init(&m);    /* the experts the card leaves, in RAM it reads over the bus */
 #endif
     q38_vocab_init(snap, &m);

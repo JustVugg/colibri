@@ -1723,10 +1723,14 @@ int coli_cuda_block_elems(int fmt){
 }
 
 const ColiCudaChainOps *coli_cuda_chain_ops(void){
+    /* asked before any device (qwen38's chain reserve on an FP8 snapshot): the DLL loads here, or the
+     * caller would keep "no chain" (cuda_chain.h's cc_ops) for the whole run */
+    if(!coli_cuda_load()) return NULL;
     if(!g_cuda.available || !g_cuda.chain_ops) return NULL;   /* older DLL: no chain, the per-matrix path */
     return g_cuda.chain_ops();
 }
 const CuTierOps *coli_cuda_tier_ops(void){
+    if(!coli_cuda_load()) return NULL;   /* the same: the tier's table asked before any device */
     if(!g_cuda.available || !g_cuda.tier_ops) return NULL;   /* older DLL: no CUDA tier, the experts on the CPU */
     return g_cuda.tier_ops();
 }
