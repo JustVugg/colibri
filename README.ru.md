@@ -324,11 +324,12 @@ curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -
 ### Терминальный интерфейс
 
 `coli tui` — это тот же чат в терминале, один файл на C без библиотек: разговоры, ответ в потоке со свёрнутыми рассуждениями, монитор (`F2`) с CPU и RAM движка, GPU и её VRAM и профилем каждого хода, карта экспертов (`ctrl+e`), а также колибри со страницы чата, который рисуется картинкой там, где терминал умеет sixel (Windows Terminal, foot, WezTerm). Он подключается к работающему `coli serve` или запускает его с `--model`. См. [docs/tui.md](docs/tui.md).
+`coli chat` остаётся классическим чатом построчно, которым может управлять и скрипт или конвейер.
 
 <p align="center">
   <img src="docs/media/tui/tui-chat.png" width="900" alt="терминальный интерфейс: разговоры, вопрос, свёрнутые рассуждения, ответ, его скорость и колибри на поле ввода">
 </p>
-<p align="center"><em>Qwen3.8-Flash-Next на RTX PRO 4000 через <code>coli serve</code>, с контекстом 256K.</em></p>
+<p align="center"><em>Qwen3.8-Flash-Next на RTX PRO 4000 через <code>coli serve</code>, с контекстом 64K.</em></p>
 
 ## Использование из других приложений
 
@@ -455,7 +456,7 @@ make qwen36 VK=1                          # one engine, here with Vulkan (CUDA=1
 **3. Запуск.** Из `c/` в копии исходников или из распакованного релиза. Лаунчер читает `config.json` модели и выбирает движок и его шаблон чата, поэтому команды одинаковы для каждой модели:
 
 ```bash
-./coli chat  --model /nvme/qwen36          # chat in the terminal
+./coli chat  --model /nvme/qwen36          # the classic chat in the terminal, a line at a time (scripts and pipes too)
 ./coli web   --model /nvme/qwen36          # API + the chat UI, opens a browser
 ./coli serve --model /nvme/qwen36          # the API alone
 ./coli plan  --model /nvme/qwen36          # where the model will live: VRAM, RAM, disk
@@ -463,7 +464,7 @@ make qwen36 VK=1                          # one engine, here with Vulkan (CUDA=1
 ./coli tune  --model /nvme/qwen36          # measure and save this machine's fastest safe settings
 ./coli import /nvme/Flint-UD-Q4_K_XL.gguf  # a GGUF: writes Flint-UD-Q4_K_XL.colibri next to it
 ./coli ui                                  # the chat UI alone, next to a running coli serve
-./coli tui                                 # the chat in the terminal, on a running coli serve (or --model)
+./coli tui                                 # the full-screen chat in the terminal, with the monitor and the expert map (on a running coli serve, or --model)
 ```
 
 В Windows архив релиза содержит `coli.cmd` (`coli.cmd chat --model

@@ -532,11 +532,12 @@ conversaciones, la respuesta en streaming con el razonamiento plegado, el monito
 mapa de expertos (`ctrl+e`) y el colibrí de la página de chat, dibujado como imagen
 donde la terminal dibuja sixel (Terminal de Windows, foot, WezTerm). Se conecta a un
 `coli serve` encendido, o arranca uno con `--model`. Consulta [docs/tui.md](docs/tui.md).
+`coli chat` sigue siendo el chat clásico, línea a línea, que también puede usar un script o una tubería.
 
 <p align="center">
   <img src="docs/media/tui/tui-chat.png" width="900" alt="la interfaz de terminal: las conversaciones, una pregunta, el razonamiento plegado, la respuesta, su velocidad y el colibrí en la caja de entrada">
 </p>
-<p align="center"><em>Qwen3.8-Flash-Next en una RTX PRO 4000 mediante <code>coli serve</code>, con un contexto de 256K.</em></p>
+<p align="center"><em>Qwen3.8-Flash-Next en una RTX PRO 4000 mediante <code>coli serve</code>, con un contexto de 64K.</em></p>
 
 ## Usarlo desde otras apps
 
@@ -761,7 +762,7 @@ descomprimida. El lanzador lee el `config.json` del modelo y elige el motor y su
 de chat, así que los comandos son los mismos para cada modelo:
 
 ```bash
-./coli chat  --model /nvme/qwen36          # chat in the terminal
+./coli chat  --model /nvme/qwen36          # the classic chat in the terminal, a line at a time (scripts and pipes too)
 ./coli web   --model /nvme/qwen36          # API + the chat UI, opens a browser
 ./coli serve --model /nvme/qwen36          # the API alone
 ./coli plan  --model /nvme/qwen36          # where the model will live: VRAM, RAM, disk
@@ -769,7 +770,7 @@ de chat, así que los comandos son los mismos para cada modelo:
 ./coli tune  --model /nvme/qwen36          # measure and save this machine's fastest safe settings
 ./coli import /nvme/Flint-UD-Q4_K_XL.gguf  # a GGUF: writes Flint-UD-Q4_K_XL.colibri next to it
 ./coli ui                                  # the chat UI alone, next to a running coli serve
-./coli tui                                 # the chat in the terminal, on a running coli serve (or --model)
+./coli tui                                 # the full-screen chat in the terminal, with the monitor and the expert map (on a running coli serve, or --model)
 ```
 
 En Windows, un archivo de la versión trae `coli.cmd` (`coli.cmd chat --model

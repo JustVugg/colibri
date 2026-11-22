@@ -316,11 +316,12 @@ curl -s http://127.0.0.1:8000/v1/systemone -H 'Content-Type: application/json' -
 ### 终端界面
 
 `coli tui` 是在终端里的同一个聊天，只有一个 C 文件，不依赖任何库：对话列表、流式输出的回答（推理折叠起来）、监视器（`F2`，包括引擎的 CPU 和内存、GPU 及其显存、每一轮的剖析）、专家地图（`ctrl+e`），以及聊天页面上的那只蜂鸟，在支持 sixel 的终端里（Windows Terminal、foot、WezTerm）画成图片。它会连接正在运行的 `coli serve`，或者用 `--model` 自己启动一个。参见 [docs/tui.md](docs/tui.md)。
+`coli chat` 仍是经典的逐行聊天，脚本或管道也能驱动它。
 
 <p align="center">
   <img src="docs/media/tui/tui-chat.png" width="900" alt="终端界面：对话列表、一个问题、折叠的推理、回答及其速度，以及停在输入框上的蜂鸟">
 </p>
-<p align="center"><em>Qwen3.8-Flash-Next 在 RTX PRO 4000 上通过 <code>coli serve</code> 运行，上下文 256K。</em></p>
+<p align="center"><em>Qwen3.8-Flash-Next 在 RTX PRO 4000 上通过 <code>coli serve</code> 运行，上下文 64K。</em></p>
 
 ## 在其他应用中使用
 
@@ -446,7 +447,7 @@ make qwen36 VK=1                          # one engine, here with Vulkan (CUDA=1
 **3. 运行。** 在源码 checkout 的 `c/` 目录中，或在解压后的发布包中运行。启动器会读取模型的 `config.json`，选出对应的引擎及其聊天模板，因此所有模型的命令都相同：
 
 ```bash
-./coli chat  --model /nvme/qwen36          # chat in the terminal
+./coli chat  --model /nvme/qwen36          # the classic chat in the terminal, a line at a time (scripts and pipes too)
 ./coli web   --model /nvme/qwen36          # API + the chat UI, opens a browser
 ./coli serve --model /nvme/qwen36          # the API alone
 ./coli plan  --model /nvme/qwen36          # where the model will live: VRAM, RAM, disk
@@ -454,7 +455,7 @@ make qwen36 VK=1                          # one engine, here with Vulkan (CUDA=1
 ./coli tune  --model /nvme/qwen36          # measure and save this machine's fastest safe settings
 ./coli import /nvme/Flint-UD-Q4_K_XL.gguf  # a GGUF: writes Flint-UD-Q4_K_XL.colibri next to it
 ./coli ui                                  # the chat UI alone, next to a running coli serve
-./coli tui                                 # the chat in the terminal, on a running coli serve (or --model)
+./coli tui                                 # the full-screen chat in the terminal, with the monitor and the expert map (on a running coli serve, or --model)
 ```
 
 在 Windows 上，发布包附带 `coli.cmd`（`coli.cmd chat --model D:\qwen36`）；在源码 checkout 中请使用 `py -3 c\coli`。`.exe` 文件是引擎，而不是启动器。所有选项和变量：[SETTINGS.md](docs/SETTINGS.md)、[ENVIRONMENT.md](docs/ENVIRONMENT.md)。
