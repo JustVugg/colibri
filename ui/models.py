@@ -1150,9 +1150,11 @@ def run_download(job, repo, revision, files, dest, after=None):
         job.update(state="done", msg=job.get("msg") or "pronto")
         _inst["at"] = 0
     except Cancelled:
-        job.update(state="cancelled", msg="annullato: i file parziali restano e il download riprende da lì")
+        job.update(state="cancelled", note="",
+                   msg="annullato: i file parziali restano e il download riprende da lì")
     except Exception as e:   # noqa: BLE001 - said on the page
-        job.update(state="error", msg=str(e)[:400])
+        # the error names the cause; a retry line left under it would promise one more
+        job.update(state="error", note="", msg=str(e)[:400])
 
 
 def start_catalog_download(model_id):

@@ -125,6 +125,27 @@ class ModelJobIdentityTests(unittest.TestCase):
         self.assertEqual(seen['moving'], '')
         self.assertEqual(job['note'], '')
 
+    def test_a_download_that_stops_while_retrying_drops_the_retry_line(self):
+        def failing(*args, notice, **kwargs):
+            notice('model.safetensors: Temporary failure; trying again in 15 s (retry 5 of 5)')
+            raise models.setup_download.DownloadError('model.safetensors: Temporary failure '
+                                                      '(rerun to continue from 0 of 10 bytes)')
+
+        def cancelled(*args, progress, notice, **kwargs):
+            notice('model.safetensors: no bytes from curl.exe for 60 s')
+            job['cancel'] = True
+            progress({'file': 'model.safetensors', 'done': 0, 'total': 10, 'fresh': 0})
+
+        for pull, state in ((failing, 'error'), (cancelled, 'cancelled')):
+            job = models.new_job('download', 'fixture')
+            with tempfile.TemporaryDirectory() as tmp, \
+                    patch.object(models.setup_download, 'hf_token', return_value=None), \
+                    patch.object(models.setup_download, 'bytes_present', return_value=0), \
+                    patch.object(models.setup_download, 'download_repo', side_effect=pull):
+                models.run_download(job, 'fixture/m', 'main', [{'path': 'model.safetensors', 'size': 10}], tmp)
+            self.assertEqual(job['state'], state)
+            self.assertEqual(job['note'], '', state)
+
 
 if __name__ == '__main__':
     unittest.main()
