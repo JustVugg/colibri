@@ -784,8 +784,11 @@ static int audio_encoder_forward(Qwen3Asr *m, const float *mel, int n_mels, int 
     int chunk_len = a->n_window * 2; /* 100 */
     int pad_frames = ((n_frames + chunk_len - 1) / chunk_len) * chunk_len;
     if (pad_frames <= 0) pad_frames = chunk_len;
-    /* Build padded mel [1, n_mels, pad_frames] */
-    float *padded = (float *)xcalloc((size_t)n_mels * pad_frames, sizeof(float));
+    /* Build padded mel [1, n_mels, pad_frames]. Pad with mel floor (not 0). */
+    float mel_floor = mel[0];
+    for (int i=1; i<n_frames*n_mels; i++) if (mel[i] < mel_floor) mel_floor = mel[i];
+    float *padded = (float *)malloc((size_t)n_mels * pad_frames * sizeof(float));
+    for (size_t i=0, nn=(size_t)n_mels*pad_frames; i<nn; i++) padded[i] = mel_floor;
     for (int f=0; f<n_frames; f++) for (int mi=0; mi<n_mels; mi++) padded[(size_t)mi*pad_frames + f] = mel[(size_t)f*n_mels + mi];
     int num_chunks = pad_frames / chunk_len;
     int ds = a->conv1.out;
@@ -1172,6 +1175,16 @@ static int transcribe_audio(Qwen3Asr *m, const unsigned char *wav, size_t wav_n,
     double t1=now_ms();
     float *audio_emb=NULL; int audio_n=0;
     rc = audio_encoder_forward(m, mel.mel, mel.n_mels, mel.n_frames, &audio_emb, &audio_n);
+    const char *dump_dir = getenv("QWEN3_ASR_DUMP");
+    if (dump_dir && dump_dir[0]) {
+        char dp[4096]; FILE *df;
+        snprintf(dp,sizeof(dp),"%s/mel.f32",dump_dir); df=fopen(dp,"wb"); if(df){fwrite(mel.mel,sizeof(float),(size_t)mel.n_mels*mel.n_frames,df); fclose(df);}
+        snprintf(dp,sizeof(dp),"%s/mel_meta.json",dump_dir); df=fopen(dp,"w"); if(df){fprintf(df,"{\"n_mels\":%d,\"n_frames\":%d}\n",mel.n_mels,mel.n_frames); fclose(df);}
+        if (rc==0 && audio_emb) {
+            snprintf(dp,sizeof(dp),"%s/audio_emb.f32",dump_dir); df=fopen(dp,"wb"); if(df){fwrite(audio_emb,sizeof(float),(size_t)audio_n*m->audio.output_dim,df); fclose(df);}
+            snprintf(dp,sizeof(dp),"%s/audio_emb_meta.json",dump_dir); df=fopen(dp,"w"); if(df){fprintf(df,"{\"n_tokens\":%d,\"dim\":%d}\n",audio_n,m->audio.output_dim); fclose(df);}
+        }
+    }
     q3asr_mel_free(&mel);
     if (rc != 0) { if (cap) text_out[0]=0; return -5; }
     double t2=now_ms();
