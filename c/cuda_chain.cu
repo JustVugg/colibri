@@ -50,6 +50,8 @@ extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float 
                                    float *hid, float *y, const float *hy, const CcMoe *p, void *stream);
 
 extern "C" int coli_cuda_qwen36_gemm_async(ColiCudaTensor *t, float *y_dev, const float *x_dev, int S, void *stream);
+extern "C" int coli_cuda_swiglu_formats_supported(const ColiCudaTensor *g, const ColiCudaTensor *u);
+extern "C" int coli_cuda_tensor_swiglu_async(ColiCudaTensor *tg, ColiCudaTensor *tu, float *y_dev, const float *x_dev, int S, void *stream);
 extern "C" void coli_cuda_qx_invalidate(int device, const float *y_dev, size_t n_floats);
 extern "C" int coli_cuda_qx_prepare(int device, const float *y_dev, int S, int I, int8_t **xq_out, float **xs_out, int s0 = 0, int only_i8 = 0);
 #include "qwen36_cuda_profile.h"
@@ -2936,6 +2938,30 @@ static int cc_matmul_glu(ColiCudaTensor *wg, ColiCudaTensor *wu, CcBuf *x, CcBuf
     g_st.matmuls += 2; g_st.ops++;
     return 1;
 }
+static int cc_matmul_swiglu(ColiCudaTensor *tg, ColiCudaTensor *tu, CcBuf *x, size_t xo, CcBuf *y, size_t yo, int S) {
+    CcCtx *c = live(CC_OVERLAP_DOWN);
+    if (!c || !tg || !tu || !x || !y || S < 1) return 0;
+    int fmtg, Ig, Og, fmtu, Iu, Ou;
+    if (!coli_cuda_tensor_shape(tg, &fmtg, &Ig, &Og) || !coli_cuda_tensor_shape(tu, &fmtu, &Iu, &Ou) ||
+        coli_cuda_tensor_device(tg) != c->device || coli_cuda_tensor_device(tu) != c->device ||
+        fmtg != fmtu || Ig != Iu || Og != Ou) return 0;
+    const size_t x_floats = x->bytes / sizeof(float), y_floats = y->bytes / sizeof(float);
+    if (xo > x_floats || (size_t)S * Ig > x_floats - xo ||
+        yo > y_floats || (size_t)S * Og > y_floats - yo) return 0;
+    if (c->device_profile) {
+        const char *mode = getenv("COLI_CUDA_FUSED_SWIGLU");
+        if ((q36_has_request_rules(c->device_profile) && !(mode ? *mode != '0' : cc_uses_feature(c, Q36_SHARED_SWIGLU))) ||
+            !coli_cuda_swiglu_formats_supported(tg, tu)) return -1;
+    }
+    cc_down_access(y);
+    (void)fp(x);
+    if (c->lost) return 0;
+    const int rc = coli_cuda_tensor_swiglu_async(tg, tu, y->d + yo, x->d + xo, S, (void *)c->stream);
+    if (rc < 0) return -1;   /* No fused output was enqueued. */
+    g_st.matmuls += 2; g_st.ops++;
+    if (!rc) { c->lost = 1; return 0; }
+    return 1;
+}
 static int cc_norm(CcBuf *x, CcBuf *w, CcBuf *y, const CcNorm *p) {
     CcCtx *c = live(CC_OVERLAP_DOWN);
     if (!c || !x || !y || !p || p->nseg < 1 || p->D < 1 || p->per_row < 1) return 0;
@@ -4329,7 +4355,7 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_sconv, cc_relattn, cc_ink2_mix, cc_ink2_clip, cc_ink2_dconv,
     cc_fetch_at, cc_fetch_wait_at, cc_fetch_done_at,
     cc_ink2_caps_,
-    nullptr, nullptr, cc_select_qwen36_profile, cc_set_kernel_mask_,
+    nullptr, cc_matmul_swiglu, cc_select_qwen36_profile, cc_set_kernel_mask_,
     nullptr, /* packed native INT8 operation */
     cc_probe_qwen36_profile_,
 };

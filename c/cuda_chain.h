@@ -498,7 +498,8 @@ typedef struct ColiCudaChainOps {
      * bits of ew and norm (qwen36_cuda_chain.h); absent: those two */
     int  (*ew_norm)(CcBuf *y, CcBuf *a, CcBuf *b, CcBuf *c, CcBuf *e, const CcEw *pe, CcBuf *w, CcBuf *yn, const CcNorm *pn);
     /* matmul_swiglu: gate (tg) and up (tu) on S rows of x at xo, then silu(g) * u into y at yo
-     * in one launch, the bits of two matmuls and CC_EW_SWIGLU (qwen36_cuda_chain.h); absent: those three */
+     * in one launch, the bits of two matmuls and CC_EW_SWIGLU (qwen36_cuda_chain.h). Returns 1 on
+     * success, -1 when the format needs those three operations, 0 on invalid input or failure. */
     int  (*matmul_swiglu)(ColiCudaTensor *tg, ColiCudaTensor *tu, CcBuf *x, size_t xo, CcBuf *y, size_t yo, int S);
     /* Select the certified Qwen3.6 path if the current model and device qualify.
      * Chain initialization and shutdown clear the selection. Returns the active profile ID, or zero. */
@@ -833,6 +834,13 @@ static inline int cc_ink2_caps(void) {
 }
 static inline int cc_fetch_wait_at(int bank) { return cc_fetch_at_ready() ? cc_ops()->fetch_wait_at(bank) : 0; }
 static inline int cc_fetch_done_at(int bank) { return cc_fetch_at_ready() ? cc_ops()->fetch_done_at(bank) : 0; }
+static inline int cc_matmul_swiglu_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, matmul_swiglu) + sizeof t->matmul_swiglu && t->matmul_swiglu;
+}
+static inline int cc_matmul_swiglu(ColiCudaTensor *tg, ColiCudaTensor *tu, CcBuf *x, size_t xo, CcBuf *y, size_t yo, int S) {
+    return cc_matmul_swiglu_ready() ? cc_ops()->matmul_swiglu(tg, tu, x, xo, y, yo, S) : 0;
+}
 static inline int cc_select_qwen36_profile(int enable) {
     const ColiCudaChainOps *t = cc_ops();
     if (!t || t->size < offsetof(ColiCudaChainOps, set_kernel_mask) + sizeof t->set_kernel_mask ||
