@@ -50,10 +50,13 @@ extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float 
                                    float *hid, float *y, const float *hy, const CcMoe *p, void *stream);
 
 extern "C" int coli_cuda_qwen36_gemm_async(ColiCudaTensor *t, float *y_dev, const float *x_dev, int S, void *stream);
+extern "C" void coli_cuda_qx_invalidate(int device, const float *y_dev, size_t n_floats);
+extern "C" int coli_cuda_qx_prepare(int device, const float *y_dev, int S, int I, int8_t **xq_out, float **xs_out, int s0 = 0, int only_i8 = 0);
 #include "qwen36_cuda_profile.h"
 extern "C" int coli_cuda_enable_qwen36(int device, int enabled);
 extern "C" void coli_cuda_set_qwen36_mask(int device, unsigned mask);
 extern "C" void coli_cuda_set_l2_fetch(int device, int enabled);
+extern "C" int coli_cuda_qwen36_gemm_seq_async(ColiCudaTensor *, float *, const float *, int, void *, uint64_t);
 
 struct CcBuf { int kind, dev; size_t bytes; float *d; void *h; unsigned long long down_seq; };
 
@@ -61,7 +64,7 @@ namespace {
 #define CC_UP_MARKS 1024   /* host_up's marks in flight (three a promoted expert) */
 struct CcCtx {
     unsigned kernel_mask;
-    int device, up, lost, in_frame, device_profile;
+    int device, up, lost, in_frame, device_profile, qx_warmed;
     int major, minor;   /* the device's compute capability: cc_attn_fk's tensor cores from 7.0, cc_attn_f2's from 7.5 */
     int f2_big;  /* cc_attn_f2's head dim 256 (66 KiB of shared memory): 1 allowed, -1 refused, 0 not asked */
     int f2_big_h;   /* the same for its float16 cache's kernel */
@@ -143,6 +146,7 @@ const float *fp(const CcBuf *b) {
 float *fpw(CcBuf *b) {
     if (b && g_cur >= 0 && g_cc[g_cur].device_profile) {
         cc_down_access(b);
+        coli_cuda_qx_invalidate(b->dev, b->d, b->bytes / sizeof(float));
     }
     return b ? b->d : nullptr;
 }
@@ -2501,6 +2505,7 @@ static int cc_select_qwen36_profile(int enable) {
             (void)coli_cuda_enable_qwen36(c->device, 0);
             c->device_profile = Q36_GPU_NONE;
             c->kernel_mask = 0;
+            c->qx_warmed = 0;
         }
         return Q36_GPU_NONE;
     }
@@ -2552,7 +2557,7 @@ static void cc_shutdown(void) {
             cc_adec_reap(c);
         }
         if (c->device_profile) (void)coli_cuda_enable_qwen36(c->device, 0);
-        c->device_profile = 0;
+        c->device_profile = c->qx_warmed = 0;
         c->adec = nullptr; c->adec_bytes = 0;
         (void)cudaGetLastError();
         c->ev_down = c->ev_down_done = nullptr;
@@ -2587,6 +2592,14 @@ static CcBuf *cc_buf(size_t bytes, int kind) {
             return nullptr;
         }
         g_st.dev_bytes += bytes;
+        if (cc_uses_feature(c, Q36_ACTIVATION_CACHE) && !c->qx_warmed && bytes >= (32u << 20)) {
+            c->qx_warmed = 1;
+            int8_t *xq = nullptr;
+            float *xs = nullptr;
+            (void)coli_cuda_qx_prepare(c->device, (const float *)b->d, 4096, 2048, &xq, &xs);
+            (void)coli_cuda_qx_prepare(c->device, (const float *)b->d, 4096, 4096, &xq, &xs);
+            coli_cuda_qx_invalidate(c->device, nullptr, 0);
+        }
     } else {
         unsigned flags = cudaHostAllocMapped | (kind == CC_UP ? cudaHostAllocWriteCombined : 0u);
         void *dp = nullptr;
@@ -2605,6 +2618,9 @@ static void cc_free(CcBuf *b) {
     if (!b) return;
     CcCtx *c = ctx_of(b->dev);
     if (c && c->up && cudaSetDevice(c->device) == cudaSuccess) {
+        if (c->device_profile) {
+            coli_cuda_qx_invalidate(b->dev, nullptr, 0);
+        }
         if (!c->lost) cudaStreamSynchronize(c->stream);   /* the frames that may read it */
         if (!c->lost && c->cs_ok) cudaStreamSynchronize(c->cs);   /* and the copies that may write it */
         if (b->kind == CC_DEV) { cudaFree(b->d); g_st.dev_bytes -= b->bytes; }
@@ -2628,6 +2644,7 @@ static size_t cc_bytes(const CcBuf *b) { return b ? b->bytes : 0; }
 static int cc_begin(void) {
     CcCtx *c = live();
     if (!c) return 0;
+    if (c->device_profile) coli_cuda_qx_invalidate(c->device, nullptr, 0);
     c->in_frame = 1;
     g_st.frames++;
     return 1;
@@ -2718,6 +2735,7 @@ static int cc_copy(CcBuf *dst, size_t doff, CcBuf *src, size_t soff, size_t n) {
     if (src->kind != CC_DEV) g_st.bytes_up += n * 4;
     const bool ordered_copies = cc_uses_feature(c, Q36_ASYNC_COPIES);
     if (c->device_profile) {
+        coli_cuda_qx_invalidate(c->device, dst->d + doff, n);
         if (ordered_copies && dst->kind == CC_DOWN && src->kind == CC_DEV && n >= 262144 && cc_async_down_on()) {
             if (!cc_copy_stream(c) || !cc_readback_events(c) ||
                 !cc_ok(c, cudaEventRecord(c->ev_down, c->stream), "copy down event") ||
@@ -2746,6 +2764,7 @@ static int cc_zero(CcBuf *dst, size_t off, size_t n) {
     if (!n) return 1;
     if ((off + n) * 4 > dst->bytes) return 0;
     g_st.ops++;
+    if (c->device_profile) coli_cuda_qx_invalidate(c->device, dst->d + off, n);
     return cc_ok(c, cudaMemsetAsync(dst->d + off, 0, n * 4, c->stream), "zero");
 }
 /* Regions on a grid (vk_chain.c's cp2_grid): region i = (q, h) = (i / per, i % per) copies len
@@ -2806,6 +2825,7 @@ static int cc_copy_regions(CcBuf *dst, CcBuf *src, const CcRegion *r, int n) {
     if (!c || !dst || !src || (n > 0 && !r)) return 0;
     for (int i = 0; i < n; i++)
         if ((r[i].dst + r[i].n) * 4 > dst->bytes || (r[i].src + r[i].n) * 4 > src->bytes) return 0;
+    if (c->device_profile && n > 0) coli_cuda_qx_invalidate(c->device, dst->d, dst->bytes / sizeof(float));
     int small = !cc_uses_feature(c, Q36_ASYNC_COPIES) && n > 0 && cc_copy_k_on();
     for (int i = 0; i < n && small; i++) small = r[i].n * 4 <= CC_COPY_K_MAX && r[i].dst + r[i].n < (1ull << 32) && r[i].src + r[i].n < (1ull << 32);
     if (small && !(n >= 2 && dst != src && cc_grid_run(r, n) == n)) {   /* scattered regions: a block each, by kernel */
@@ -2845,6 +2865,7 @@ static int cc_write(CcBuf *dst, size_t off, const void *src, size_t bytes) {
     if (!c || !dst || !src) return 0;
     if (!bytes) return 1;
     if (off * 4 + bytes > dst->bytes) return 0;
+    if (c->device_profile) coli_cuda_qx_invalidate(c->device, dst->d + off, (bytes + 3) / 4);
     g_st.bytes_up += bytes; g_st.ops++;
     if (dst->kind != CC_DEV) { std::memcpy((char *)dst->h + off * 4, src, bytes); return 1; }
     return cc_ok(c, cudaMemcpyAsync(dst->d + off, src, bytes, cudaMemcpyHostToDevice, c->stream), "write");
@@ -2874,7 +2895,8 @@ static int cc_matmul(ColiCudaTensor *t, CcBuf *x, size_t xo, CcBuf *y, size_t yo
     if (c->lost) return 0;
     g_st.matmuls++; g_st.ops++;
     if (c->device_profile && fmt < 100) {
-        if (!coli_cuda_qwen36_gemm_async(t, y->d + yo, x->d + xo, S, (void *)c->stream)) { c->lost = 1; return 0; }
+        const uint64_t seq = c->in_frame && x->kind == CC_DEV && x != y ? t_cc_seq : 0;
+        if (!coli_cuda_qwen36_gemm_seq_async(t, y->d + yo, x->d + xo, S, (void *)c->stream, seq)) { c->lost = 1; return 0; }
         return 1;
     }
     /* the input of the last matmul, with no call to the chain between (q, k and v; gate and up): its
@@ -3680,6 +3702,7 @@ static int cc_fetch_at(CcBuf *dst, const CcFetch *r, int n, int bank) {
     CcCtx *c = live();
     if (!c || !dst || dst->kind != CC_DEV || n < 0 || (n && !r) || (unsigned)bank > 1) return 0;
     for (int i = 0; i < n; i++) if (!r[i].src || r[i].dst > dst->bytes || r[i].bytes > dst->bytes - r[i].dst) return 0;
+    if (c->device_profile && n > 0) coli_cuda_qx_invalidate(c->device, dst->d, dst->bytes / sizeof(float));
     if (!cc_copy_stream(c)) return 0;
     /* an event never recorded is no wait: the first fetch starts at once */
     if (!cc_ok(c, cudaStreamWaitEvent(c->cs, c->ev_free[bank], 0), "fetch's reader")) return 0;
