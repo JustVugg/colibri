@@ -541,6 +541,7 @@ These backend settings are for kernel testing and tuning. A profile default foll
 | `COLI_CUDA_DENSE_I8` | profile | Allow INT8 dense Tensor Core projection. A chain test without a benchmark defaults to off. |
 | `COLI_CUDA_F2_MODE` | 0 | Select the prompt Flash attention variant for a head dimension of 256. |
 | `COLI_CUDA_F32G_FAST` | 1 | Select the narrow-output FP32 projection kernel. |
+| `COLI_CUDA_FUSED_SWIGLU` | profile | Allow supported shared-expert gate and up projections to fuse with SwiGLU. Zero selects separate projections for the profile. |
 | `COLI_CUDA_GEMV_I2F` | 1 | Select the integer-to-float kernel mode for short matrix-vector projections. |
 | `COLI_CUDA_L2_GRAN` | 128 bytes on the prompt-cache path | Set the CUDA L2 fetch granularity. Zero leaves the device limit alone. |
 | `COLI_CUDA_QX_CACHE` | profile | Reuse packed INT8 activations across eligible projections. Zero disables reuse. |

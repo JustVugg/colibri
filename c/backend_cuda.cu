@@ -3648,6 +3648,11 @@ extern "C" size_t coli_cuda_tensor_vram(const ColiCudaTensor *tensor) {
 extern "C" int coli_cuda_tensor_device(const ColiCudaTensor *tensor) {
     return tensor ? tensor->device : -1;
 }
+/* A valid pair outside these fused formats can use two independent projections. */
+extern "C" int coli_cuda_swiglu_formats_supported(const ColiCudaTensor *g, const ColiCudaTensor *u) {
+    return g->fmt == u->fmt && g->gs == u->gs &&
+           (g->fmt == 0 || g->fmt == 1 || (g->fmt == 4 && g->gs == 64));
+}
 extern "C" int coli_cuda_tensor_shape(const ColiCudaTensor *t, int *fmt, int *I, int *O) {
     if (!t) return 0;
     if (fmt) *fmt = t->fmt;
@@ -4003,10 +4008,10 @@ static inline int hcg_bt_wf(int fmt) {
     case 221: K<221><<<grid, 256, 0, st>>>(__VA_ARGS__); break; case 222: K<222><<<grid, 256, 0, st>>>(__VA_ARGS__); break; \
     case 223: K<223><<<grid, 256, 0, st>>>(__VA_ARGS__); break; default: K<100><<<grid, 256, 0, st>>>(__VA_ARGS__); break; \
     } } while (0)
-template<int WF, int NW, bool PACKED = false>
+template<int WF, int NW, bool PACKED = false, bool PARTIAL_GLU = false>
 __device__ __forceinline__ void hcg_tile(float *__restrict__ Y, int yld, const int *yr, const void *__restrict__ X, int xld, const int *xr,
                                          int M, const uint8_t *const *W, const float *const *sc, int gs, int N, int K, int n0,
-                                         int planar = 0, int kb = 0, int ke = -1) {   /* [kb, ke): a split K's part (-1: K) */
+                                         int planar = 0, int kb = 0, int ke = -1, float *__restrict__ Yu = nullptr) {
 #if HCG_BODY
     using namespace nvcuda;
     constexpr int STG = (1 + NW) * TCG_BM * HCG_LDH * 2, EPI = NW * TCG_BM * (TCG_BN + 4) * 4;   /* bytes */
@@ -4071,13 +4076,14 @@ __device__ __forceinline__ void hcg_tile(float *__restrict__ Y, int yld, const i
         if (NW == 2) {
             float u = Cs[TCG_BM * CL + r * CL + c];
             if (WF != 4 && WF < 100) u *= sc[NW - 1][nn];
-            g = (g / (1.f + expf(-g))) * u;
+            if (PARTIAL_GLU) Yu[(size_t)yr[r] * yld + nn] = u;
+            else g = (g / (1.f + expf(-g))) * u;
         }
         Y[(size_t)yr[r] * yld + nn] = g;
     }
 #else
     (void)Y; (void)yld; (void)yr; (void)X; (void)xld; (void)xr; (void)M; (void)W; (void)sc; (void)gs; (void)N; (void)K; (void)n0; (void)planar;
-    (void)kb; (void)ke;
+    (void)kb; (void)ke; (void)Yu;
 #endif
 }
 template<int WF, bool PACKED = false>
@@ -4676,10 +4682,11 @@ __global__ static void hcm_sum_k(float *__restrict__ y, const float *__restrict_
  * in scratch, then hcm_sum_k. A narrow output over long rows was a few blocks down every
  * input: Qwen3.8's hyper-connection read (10240 x 320, int8) at 235 rows, 20 blocks, 172 us
  * on an RTX PRO 4000. COLI_CUDA_HCG_SPLIT=n: n splits always (1 none). */
-struct HcgPart { float *yp; void *scr; int ns, kc; };
-static HcgPart hcg_part(const DeviceContext *ctx, float *y, long long blocks, int per_sm, int S, int I, int O, int can, cudaStream_t st) {
+struct HcgPart { float *yp; void *scr; int ns, kc; cudaError_t scratch_error = cudaSuccess; };
+static HcgPart hcg_part(const DeviceContext *ctx, float *y, long long blocks, int per_sm, int S, int I, int O, int can, cudaStream_t st,
+                        int projections = 1) {
 #if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)   /* the f16 tiles are off there (hcg_ok) */
-    (void)ctx; (void)blocks; (void)per_sm; (void)S; (void)O; (void)can; (void)st;
+    (void)ctx; (void)blocks; (void)per_sm; (void)S; (void)O; (void)can; (void)st; (void)projections;
     HcgPart h = {y, nullptr, 1, I};
     return h;
 #else
@@ -4695,7 +4702,10 @@ static HcgPart hcg_part(const DeviceContext *ctx, float *y, long long blocks, in
     int kc = ((I + ns - 1) / ns + 255) / 256 * 256;
     if (kc >= I) return h;
     ns = (I + kc - 1) / kc;
-    if (cudaMallocAsync(&h.scr, (size_t)ns * S * O * sizeof(float), st) != cudaSuccess) { (void)cudaGetLastError(); h.scr = nullptr; return h; }
+    h.scratch_error = cudaMallocAsync(&h.scr, (size_t)ns * S * O * projections * sizeof(float), st);
+    if (h.scratch_error != cudaSuccess) {
+        (void)cudaGetLastError(); h.scr = nullptr; return h;
+    }
     h.yp = (float *)h.scr; h.ns = ns; h.kc = kc;
     return h;
 #endif
@@ -8126,6 +8136,148 @@ static bool hcg_dense_launch(DeviceContext *ctx, float *y, const float *x, const
     }
     return true;
 }
+/* The gate and up projections share an input tile and accumulate K in the order
+ * of the separate projections. */
+template<int WF, bool PARTIAL_GLU>
+__global__ static void __launch_bounds__(256) hcg_swiglu_ordered_k(float *__restrict__ gate, float *__restrict__ up,
+        const float *__restrict__ x, const uint8_t *__restrict__ wg, const float *__restrict__ scg,
+        const uint8_t *__restrict__ wu, const float *__restrict__ scu, int gs, int S, int I, int O, int kc) {
+    COLI_PDL_WAIT();
+    __shared__ int rows[TCG_BM];
+    const int m0 = blockIdx.y * TCG_BM, M = min(S - m0, TCG_BM);
+    if (threadIdx.x < TCG_BM) rows[threadIdx.x] = m0 + (threadIdx.x < M ? threadIdx.x : 0);
+    __syncthreads();
+    const uint8_t *W[2] = {wg, wu};
+    const float *Sc[2] = {scg, scu};
+    const int kb = (int)blockIdx.z * kc, ke = min(I, kb + kc);
+    const size_t off = (size_t)blockIdx.z * S * O;
+    ::hcg_tile<WF, 2, false, PARTIAL_GLU>(gate + off, O, rows, x, I, rows, M, W, Sc, gs, O, I, blockIdx.x * TCG_BN,
+                                   0, kb, ke, PARTIAL_GLU ? up + off : nullptr);
+}
+__global__ static void hcg_swiglu_sum_k(float *__restrict__ y, const float *__restrict__ gate, const float *__restrict__ up,
+                                       long long n, int ns) {
+    COLI_PDL_WAIT();
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float g = gate[i], u = up[i];
+    for (int z = 1; z < ns; z++) {
+        const size_t offset = (size_t)z * n + i;
+        g += gate[offset];
+        u += up[offset];
+    }
+    y[i] = (g / (1.f + expf(-g))) * u;
+}
+template<int WF>
+static int hcg_swiglu_dev_launch(DeviceContext *ctx, float *y, const float *x, const uint8_t *wg, const float *scg,
+                                  const uint8_t *wu, const float *scu, int gs, int S, int I, int O, cudaStream_t st) {
+    dim3 grid((unsigned)((O + TCG_BN - 1) / TCG_BN), (unsigned)((S + TCG_BM - 1) / TCG_BM));
+    HcgPart h = hcg_part(ctx, y, (long long)grid.x * grid.y, 2, S, I, O, WF != 4 || 256 % gs == 0, st, 2);
+    /* Separate projections need only one scratch buffer at a time. */
+    if (h.scratch_error == cudaErrorMemoryAllocation || h.scratch_error == cudaErrorNotSupported) return -1;
+    if (h.scratch_error != cudaSuccess) return cuda_ok(h.scratch_error, "chain swiglu scratch");
+    grid.z = (unsigned)h.ns;
+    if (h.ns == 1) {
+        hcg_swiglu_ordered_k<WF, false><<<grid, 256, 0, st>>>(y, nullptr, x, wg, scg, wu, scu, gs, S, I, O, h.kc);
+        const cudaError_t err = cudaGetLastError();
+        return err == cudaErrorLaunchOutOfResources ? -1 : cuda_ok(err, "chain swiglu launch");
+    }
+    const long long n = (long long)S * O;
+    float *up = h.yp + (size_t)h.ns * n;
+    hcg_swiglu_ordered_k<WF, true><<<grid, 256, 0, st>>>(h.yp, up, x, wg, scg, wu, scu, gs, S, I, O, h.kc);
+    const cudaError_t project_err = cudaGetLastError();
+    if (project_err != cudaSuccess) {
+        const cudaError_t free_err = cudaFreeAsync(h.scr, st);
+        if (!cuda_ok(free_err, "chain swiglu free scratch")) return 0;
+        return project_err == cudaErrorLaunchOutOfResources ? -1 : cuda_ok(project_err, "chain swiglu projections");
+    }
+    hcg_swiglu_sum_k<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(y, h.yp, up, n, h.ns);
+    const cudaError_t sum_err = cudaGetLastError();
+    const cudaError_t free_err = cudaFreeAsync(h.scr, st);
+    return cuda_ok(sum_err, "chain swiglu sum") && cuda_ok(free_err, "chain swiglu free scratch");
+}
+/* gate, up and SwiGLU in one tile (NW 2): x staged once, silu(g) * u in the epilogue */
+template<int WF, int BM = TCG_BM, int STG_X = (WF < 100 ? 1 : 0), int MMA_1 = 1, int LB = (WF >= 100 ? 2 : 3)>
+__global__ static void __launch_bounds__(256, LB) hcg_dense_swiglu_k(float *__restrict__ y, const float *__restrict__ x, const uint8_t *__restrict__ wg,
+                                                                     const float *__restrict__ scg, const uint8_t *__restrict__ wu, const float *__restrict__ scu,
+                                                                     int gs, int S, int I, int O, const float *__restrict__ xs = nullptr) {
+    int m0 = blockIdx.y * BM, M = S - m0 < BM ? S - m0 : BM;
+    const uint8_t *W[2] = {wg, wu}; const float *Sc[2] = {scg, scu};
+    const float *xp = MMA_1 == 6 ? reinterpret_cast<const float *>(reinterpret_cast<const int8_t *>(x) + (size_t)m0 * I) : (x + (size_t)m0 * I);
+    const float *xsp = MMA_1 == 6 ? (xs + (size_t)m0 * (I >> 6)) : nullptr;
+    hcg_tile<WF, 2, BM, 0, 0, STG_X, MMA_1>(y + (size_t)m0 * O, O, nullptr, xp, I, nullptr, M, W, Sc, gs, O, I, blockIdx.x * TCG_BN, 0, nullptr, xsp);
+}
+template<int WF>
+static int hcg_dense_swiglu_launch(DeviceContext *ctx, float *y, const float *x, const uint8_t *wg, const float *scg,
+                                    const uint8_t *wu, const float *scu, int gs, int S, int I, int O, cudaStream_t st) {
+    (void)ctx;
+    constexpr int WNP = WF == 4 ? 40 : WF;
+    int bm = S <= 16 ? 16 : (S <= 64 ? (O <= 512 ? 16 : 32) : 64);
+    const char *ev = getenv("COLI_CUDA_DENSE_BM");
+    int mode = ev && *ev ? atoi(ev) : 0;
+    const int slot = I == 2048 ? 0 : 1;
+    const bool only_i8 = ctx->qx_only_i8[slot] && ctx->qx_slot_epoch[slot] == ctx->qx_epoch &&
+        ctx->qx_src[slot] == x && ctx->qx_S[slot] == S && ctx->qx_I[slot] == I;
+    const bool prefer_fp16_swiglu = (ctx->kernel_mask & Q36_ACTIVATION_CACHE) && !only_i8;
+    dim3 g((unsigned)((O + TCG_BN - 1) / TCG_BN), (unsigned)((S + bm - 1) / bm));
+    if (mode == 500) {
+        if (bm == 16) hcg_dense_swiglu_k<WNP, 16, 0, 1, 2><<<g, 256, 0, st>>>(y, x, wg, scg, wu, scu, gs, S, I, O);
+        else if (bm == 32) hcg_dense_swiglu_k<WNP, 32, 0, 1, 2><<<g, 256, 0, st>>>(y, x, wg, scg, wu, scu, gs, S, I, O);
+        else hcg_dense_swiglu_k<WNP, 64, 0, 1, 2><<<g, 256, 0, st>>>(y, x, wg, scg, wu, scu, gs, S, I, O);
+    } else if (mode == 501) {
+        if (bm == 16) hcg_dense_swiglu_k<WNP, 16, 0, 1, 2><<<g, 256, 0, st>>>(y, x, wg, scg, wu, scu, gs, S, I, O);
+        else if (bm == 32) hcg_dense_swiglu_k<WNP, 32, 0, 1, 2><<<g, 256, 0, st>>>(y, x, wg, scg, wu, scu, gs, S, I, O);
+        else hcg_dense_swiglu_k<WNP, 64, 0, 1, 3><<<g, 256, 0, st>>>(y, x, wg, scg, wu, scu, gs, S, I, O);
+    } else if (mode == 502) {
+        if (bm == 16) hcg_dense_swiglu_k<WNP, 16, 0, 1, 2><<<g, 256, 0, st>>>(y, x, wg, scg, wu, scu, gs, S, I, O);
+        else if (bm == 32) hcg_dense_swiglu_k<WNP, 32, 1, 1, 3><<<g, 256, 0, st>>>(y, x, wg, scg, wu, scu, gs, S, I, O);
+        else hcg_dense_swiglu_k<WNP, 64, 1, 1, 3><<<g, 256, 0, st>>>(y, x, wg, scg, wu, scu, gs, S, I, O);
+    } else if (mode == 600) {
+        if (bm == 16) hcg_dense_swiglu_k<WNP, 16, 0, 4, 3><<<g, 256, 0, st>>>(y, x, wg, scg, wu, scu, gs, S, I, O);
+        else if (bm == 32) hcg_dense_swiglu_k<WNP, 32, 0, 4, 3><<<g, 256, 0, st>>>(y, x, wg, scg, wu, scu, gs, S, I, O);
+        else hcg_dense_swiglu_k<WNP, 64, 0, 4, 3><<<g, 256, 0, st>>>(y, x, wg, scg, wu, scu, gs, S, I, O);
+    } else if (mode == 602) {
+        if (bm == 16) hcg_dense_swiglu_k<WNP, 16, 1, 4, 3><<<g, 256, 0, st>>>(y, x, wg, scg, wu, scu, gs, S, I, O);
+        else if (bm == 32) hcg_dense_swiglu_k<WNP, 32, 1, 4, 3><<<g, 256, 0, st>>>(y, x, wg, scg, wu, scu, gs, S, I, O);
+        else hcg_dense_swiglu_k<WNP, 64, 1, 4, 3><<<g, 256, 0, st>>>(y, x, wg, scg, wu, scu, gs, S, I, O);
+    } else if ((mode == 605 ||
+                (mode == 0 &&
+                 (S >= 64 || getenv("COLI_CUDA_CHAIN_BENCH") != nullptr ||
+                             getenv("COLI_CUDA_CHAIN_TEST") != nullptr) &&
+                 !prefer_fp16_swiglu && dense_i8_on(ctx) && I >= 512 && O >= 512)) &&
+               WNP == 1 && hcg_quant_x_i8(ctx, x, S, I, st, I == 2048 ? 0 : 1, wg)) {
+        int slot = I == 2048 ? 0 : 1;
+        const float *xq = reinterpret_cast<const float *>(ctx->qx_slot[slot]), *xs = ctx->qscale_slot[slot];
+        if (bm == 16) hcg_dense_swiglu_k<WNP, 16, 0, 6, 3><<<g, 256, 0, st>>>(y, xq, wg, scg, wu, scu, gs, S, I, O, xs);
+        else if (bm == 32) hcg_dense_swiglu_k<WNP, 32, 0, 6, 3><<<g, 256, 0, st>>>(y, xq, wg, scg, wu, scu, gs, S, I, O, xs);
+        else hcg_dense_swiglu_k<WNP, 64, 0, 6, 3><<<g, 256, 0, st>>>(y, xq, wg, scg, wu, scu, gs, S, I, O, xs);
+    } else if (mode == 606 && WNP == 1 && hcg_quant_x_i8(ctx, x, S, I, st, I == 2048 ? 0 : 1, wg)) {
+        int slot = I == 2048 ? 0 : 1;
+        const float *xq = reinterpret_cast<const float *>(ctx->qx_slot[slot]), *xs = ctx->qscale_slot[slot];
+        if (bm == 16) hcg_dense_swiglu_k<WNP, 16, 1, 6, 3><<<g, 256, 0, st>>>(y, xq, wg, scg, wu, scu, gs, S, I, O, xs);
+        else if (bm == 32) hcg_dense_swiglu_k<WNP, 32, 1, 6, 3><<<g, 256, 0, st>>>(y, xq, wg, scg, wu, scu, gs, S, I, O, xs);
+        else hcg_dense_swiglu_k<WNP, 64, 1, 6, 2><<<g, 256, 0, st>>>(y, xq, wg, scg, wu, scu, gs, S, I, O, xs);
+    } else if (mode == 302) {
+        if (bm == 16) hcg_dense_swiglu_k<WNP, 16, 1, 2, 2><<<g, 256, 0, st>>>(y, x, wg, scg, wu, scu, gs, S, I, O);
+        else if (bm == 32) hcg_dense_swiglu_k<WNP, 32, 1, 2, 2><<<g, 256, 0, st>>>(y, x, wg, scg, wu, scu, gs, S, I, O);
+        else hcg_dense_swiglu_k<WNP, 64, 1, 2, 2><<<g, 256, 0, st>>>(y, x, wg, scg, wu, scu, gs, S, I, O);
+    } else if (mode == 0) {
+        return hcg_swiglu_dev_launch<WF>(ctx, y, x, wg, scg, wu, scu, gs, S, I, O, st);
+    } else if (bm == 16) hcg_dense_swiglu_k<WNP, 16, 0, 1, 2><<<g, 256, 0, st>>>(y, x, wg, scg, wu, scu, gs, S, I, O);
+    else if (bm == 32) hcg_dense_swiglu_k<WNP, 32, 0, 1, 2><<<g, 256, 0, st>>>(y, x, wg, scg, wu, scu, gs, S, I, O);
+    else hcg_dense_swiglu_k<WNP, 64><<<g, 256, 0, st>>>(y, x, wg, scg, wu, scu, gs, S, I, O);
+    return cuda_ok(cudaGetLastError(), "chain swiglu tensor-core gemm launch");
+}
+template<int WF>
+__global__ static void __launch_bounds__(128) tcg_dense_swiglu_k(float *__restrict__ y, const float *__restrict__ x, const uint8_t *__restrict__ wg,
+                                                                 const float *__restrict__ scg, const uint8_t *__restrict__ wu, const float *__restrict__ scu,
+                                                                 int gs, int S, int I, int O) {
+    __shared__ int rows[TCG_BM];
+    int m0 = blockIdx.y * TCG_BM, M = S - m0 < TCG_BM ? S - m0 : TCG_BM;
+    if (threadIdx.x < TCG_BM) rows[threadIdx.x] = m0 + (threadIdx.x < M ? threadIdx.x : 0);
+    __syncthreads();
+    const uint8_t *W[2] = {wg, wu}; const float *Sc[2] = {scg, scu};
+    tcg_tile<WF, 2>(y, O, rows, x, I, rows, M, W, Sc, gs, O, I, blockIdx.x * TCG_BN);
+}
 template <int FAST = 1>
 __device__ __forceinline__ void gemv_i8_f16(float (&wf)[16], uint4 v) {
 #if Q36_MMA
@@ -8192,6 +8344,61 @@ __global__ static void __launch_bounds__(256) gemv_i8_rows(float *__restrict__ y
         float a = acc[r];
         for (int off = 16; off > 0; off >>= 1) a += f8_shfl_down(a, off);
         if (lane == 0) y[(size_t)r * O + o] = a * sc[o];
+    }
+}
+/* gate, up and SwiGLU for up to GEMV_I8_MAX_S rows of int8 weights: x staged once in xs4,
+ * each row's gate and up accumulated in gemv_i8_rows's order, then silu(g) * u */
+template <int NR, int PAD, int FAST = 1>
+__global__ static void __launch_bounds__(256) gemv_i8_swiglu_rows(float *__restrict__ y, const float *__restrict__ x,
+        const int8_t *__restrict__ wg, const float *__restrict__ scg,
+        const int8_t *__restrict__ wu, const float *__restrict__ scu, int I, int O, int S, int nr) {
+    extern __shared__ float4 xs4[];
+    int s0 = NR == 1 ? (int)blockIdx.y : (int)blockIdx.y * nr, nrow = NR == 1 ? 1 : min(nr, S - s0);
+    int I4 = I / 4, XR = PAD ? gx4(I4) + 1 : I4;
+    x += (size_t)s0 * I; y += (size_t)s0 * O;
+    const float4 *x4 = reinterpret_cast<const float4 *>(x);
+    for (int k = threadIdx.x; k < nrow * I4; k += 256) {
+        int r = NR == 1 ? 0 : k / I4, kk = NR == 1 ? k : k - r * I4;
+        xs4[r * XR + (PAD ? gx4(kk) : kk)] = x4[(size_t)r * I4 + kk];
+    }
+    __syncthreads();
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    int o = blockIdx.x * GEMV_I8_ROWS + warp;
+    if (o >= O) return;
+    const int8_t *rowg = wg + (size_t)o * I, *rowu = wu + (size_t)o * I;
+    float accg[NR], accu[NR];
+    #pragma unroll
+    for (int r = 0; r < NR; r++) { accg[r] = 0.f; accu[r] = 0.f; }
+    for (int i0 = lane * 16; i0 < I; i0 += 32 * 16) {
+        float wfg[16], wfu[16];
+        gemv_i8_f16<FAST>(wfg, *reinterpret_cast<const uint4 *>(rowg + i0));
+        gemv_i8_f16<FAST>(wfu, *reinterpret_cast<const uint4 *>(rowu + i0));
+        int k4 = i0 / 4;
+        #pragma unroll
+        for (int r = 0; r < NR; r++) if (r < nrow) {
+            const float4 *xr = xs4 + r * XR;
+            float4 q[4];
+            #pragma unroll
+            for (int j = 0; j < 4; j++) q[j] = xr[PAD ? gx4(k4 + j) : k4 + j];
+            const float *xv = reinterpret_cast<const float *>(q);
+            #pragma unroll
+            for (int k = 0; k < 16; k++) {
+                accg[r] += xv[k] * wfg[k];
+                accu[r] += xv[k] * wfu[k];
+            }
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < NR; r++) if (r < nrow) {
+        float ag = accg[r], au = accu[r];
+        for (int off = 16; off > 0; off >>= 1) {
+            ag += f8_shfl_down(ag, off);
+            au += f8_shfl_down(au, off);
+        }
+        if (lane == 0) {
+            float g = ag * scg[o], u = au * scu[o];
+            y[(size_t)r * O + o] = (g / (1.f + expf(-g))) * u;
+        }
     }
 }
 __device__ __forceinline__ void f32g_cp16(void *dst, const void *src, bool valid) {
@@ -8483,11 +8690,103 @@ static int tensor_gemm_seq(ColiCudaTensor *t, float *y_dev, const float *x_dev, 
                                             row_bytes(t->fmt, t->I), t->gs, t->ng);
     return cuda_ok(cudaGetLastError(), "chain gemm launch");
 }
+__global__ static void quant_matmul_swiglu(float *y, const float *x, const void *wg, const float *scg,
+                                           const void *wu, const float *scu, int fmt, int S, int I, int O,
+                                           size_t rb, int gs, int ng) {
+    __shared__ float pg[256], pu[256];
+    int o = blockIdx.x, s = blockIdx.y;
+    float sumg = 0.0f, sumu = 0.0f;
+    size_t row = (size_t)o * rb;
+    const float *xs = x + (size_t)s * I;
+    if (fmt == 4) {
+        const float *sg = scg + (size_t)o * ng, *su = scu + (size_t)o * ng;
+        for (int i = threadIdx.x; i < I; i += blockDim.x) {
+            int g = i / gs;
+            if (g >= ng) g = ng - 1;
+            float xv = xs[i];
+            sumg += xv * weight_at(wg, fmt, row, i) * sg[g];
+            sumu += xv * weight_at(wu, fmt, row, i) * su[g];
+        }
+    } else {
+        for (int i = threadIdx.x; i < I; i += blockDim.x) {
+            float xv = xs[i];
+            sumg += xv * weight_at(wg, fmt, row, i);
+            sumu += xv * weight_at(wu, fmt, row, i);
+        }
+    }
+    pg[threadIdx.x] = sumg; pu[threadIdx.x] = sumu;
+    __syncthreads();
+    for (int n = blockDim.x / 2; n > 0; n >>= 1) {
+        if (threadIdx.x < n) {
+            pg[threadIdx.x] += pg[threadIdx.x + n];
+            pu[threadIdx.x] += pu[threadIdx.x + n];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        float g = (fmt && fmt != 4) ? pg[0] * scg[o] : pg[0];
+        float u = (fmt && fmt != 4) ? pu[0] * scu[o] : pu[0];
+        y[(size_t)s * O + o] = (g / (1.0f + expf(-g))) * u;
+    }
+    (void)S;
+}
+extern "C" int coli_cuda_tensor_swiglu_async(ColiCudaTensor *tg, ColiCudaTensor *tu, float *y_dev, const float *x_dev, int S, void *stream) {
+    if (fault_injected()) return 0;
+    if (!tg || !tu || !y_dev || !x_dev || S < 1) return 0;
+    if (tg->device != tu->device || tg->I != tu->I || tg->O != tu->O || !coli_cuda_swiglu_formats_supported(tg, tu)) return 0;
+    DeviceContext *ctx = find_ctx(tg->device);
+    if (!ctx || !ctx->qwen36_active || !select_ctx(ctx)) return 0;
+    qx_invalidate(ctx, y_dev, (size_t)S * tg->O);
+    cudaStream_t st = (cudaStream_t)stream;
+    if (tg->fmt == 1 && S <= GEMV_I8_MAX_S && tg->I % 16 == 0 && tg->I <= 12288 && ((uintptr_t)x_dev & 15) == 0) {
+        unsigned bx = (unsigned)((tg->O + GEMV_I8_ROWS - 1) / GEMV_I8_ROWS);
+        const int8_t *wg = (const int8_t *)tg->weights, *wu = (const int8_t *)tu->weights;
+        size_t prow = (size_t)(gx4(tg->I / 4) + 1) * 16;
+        int nr = S > 1 && bx >= 64 && gemv_i8_nr_on() ? (S < GEMV_I8_NR ? S : GEMV_I8_NR) : 1, fast = gemv_i2f_fast_on() >= 1;
+        while (nr > 1 && nr * prow > 48 * 1024) nr--;
+        if (nr > 1) {
+            if (fast) gemv_i8_swiglu_rows<GEMV_I8_NR, 1, 1><<<dim3(bx, (unsigned)((S + nr - 1) / nr)), 256, nr * prow, st>>>(
+                y_dev, x_dev, wg, tg->scales, wu, tu->scales, tg->I, tg->O, S, nr);
+            else      gemv_i8_swiglu_rows<GEMV_I8_NR, 1, 0><<<dim3(bx, (unsigned)((S + nr - 1) / nr)), 256, nr * prow, st>>>(
+                y_dev, x_dev, wg, tg->scales, wu, tu->scales, tg->I, tg->O, S, nr);
+        } else if (prow <= 48 * 1024) {
+            if (fast) gemv_i8_swiglu_rows<1, 1, 1><<<dim3(bx, (unsigned)S), 256, prow, st>>>(
+                y_dev, x_dev, wg, tg->scales, wu, tu->scales, tg->I, tg->O, S, 1);
+            else      gemv_i8_swiglu_rows<1, 1, 0><<<dim3(bx, (unsigned)S), 256, prow, st>>>(
+                y_dev, x_dev, wg, tg->scales, wu, tu->scales, tg->I, tg->O, S, 1);
+        } else {
+            if (fast) gemv_i8_swiglu_rows<1, 0, 1><<<dim3(bx, (unsigned)S), 256, (size_t)tg->I * sizeof(float), st>>>(
+                y_dev, x_dev, wg, tg->scales, wu, tu->scales, tg->I, tg->O, S, 1);
+            else      gemv_i8_swiglu_rows<1, 0, 0><<<dim3(bx, (unsigned)S), 256, (size_t)tg->I * sizeof(float), st>>>(
+                y_dev, x_dev, wg, tg->scales, wu, tu->scales, tg->I, tg->O, S, 1);
+        }
+        return cuda_ok(cudaGetLastError(), "chain swiglu gemv launch");
+    }
+    if (S > GEMV_I8_MAX_S && tg->I % HCG_BK == 0 && ((uintptr_t)x_dev & 15) == 0 && hcg_ok(ctx) &&
+        (tg->fmt == 1 || tg->fmt == 4)) {
+        const uint8_t *wg = (const uint8_t *)tg->weights, *wu = (const uint8_t *)tu->weights;
+        if (tg->fmt == 1) return hcg_dense_swiglu_launch<1>(ctx, y_dev, x_dev, wg, tg->scales, wu, tu->scales, 0, S, tg->I, tg->O, st);
+        return hcg_dense_swiglu_launch<4>(ctx, y_dev, x_dev, wg, tg->scales, wu, tu->scales, tg->gs, S, tg->I, tg->O, st);
+    }
+    if (S > GEMV_I8_MAX_S && tg->I % TCG_BK == 0 && ((uintptr_t)x_dev & 15) == 0 && tcg_ok(ctx) &&
+        (tg->fmt == 1 || tg->fmt == 4)) {
+        dim3 g((unsigned)((tg->O + TCG_BN - 1) / TCG_BN), (unsigned)((S + TCG_BM - 1) / TCG_BM));
+        const uint8_t *wg = (const uint8_t *)tg->weights, *wu = (const uint8_t *)tu->weights;
+        if (tg->fmt == 1) tcg_dense_swiglu_k<1><<<g, 128, 0, st>>>(y_dev, x_dev, wg, tg->scales, wu, tu->scales, 0, S, tg->I, tg->O);
+        else tcg_dense_swiglu_k<4><<<g, 128, 0, st>>>(y_dev, x_dev, wg, tg->scales, wu, tu->scales, tg->gs, S, tg->I, tg->O);
+        return cuda_ok(cudaGetLastError(), "chain swiglu tensor-core gemm launch");
+    }
+    dim3 grid((unsigned)tg->O, (unsigned)S);
+    quant_matmul_swiglu<<<grid, 256, 0, st>>>(y_dev, x_dev, tg->weights, tg->scales, tu->weights, tu->scales, tg->fmt, S, tg->I, tg->O,
+                                              row_bytes(tg->fmt, tg->I), tg->gs, tg->ng);
+    return cuda_ok(cudaGetLastError(), "chain swiglu gemm launch");
+}
 #undef Q36_MMA
 }  // namespace qwen36_cuda
 #else
 extern "C" void coli_cuda_qx_invalidate(int, const float *, size_t) {}
 extern "C" int coli_cuda_qx_prepare(int, const float *, int, int, int8_t **, float **, int, int) { return 0; }
+extern "C" int coli_cuda_tensor_swiglu_async(ColiCudaTensor *, ColiCudaTensor *, float *, const float *, int, void *) { return 0; }
 extern "C" int coli_cuda_qwen36_gemm_async(ColiCudaTensor *t, float *y, const float *x, int S, void *stream) {
     return coli_cuda_tensor_gemm_async(t, y, x, S, stream);
 }
