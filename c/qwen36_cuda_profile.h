@@ -51,6 +51,7 @@ static inline int q36_cuda_device_profile(int major, int minor, const char *name
         {Q36_GPU_4090, 8, 9, "NVIDIA GeForce RTX 4090", NULL, 0, 0},
         {Q36_GPU_5090, 12, 0, "NVIDIA GeForce RTX 5090", NULL, 0, 0},
         {Q36_GPU_PRO6000, 12, 0, "NVIDIA RTX PRO 6000 Blackwell Server Edition", NULL, 0, 0},
+        {Q36_GPU_L40S, 8, 9, "NVIDIA L40S", NULL, 0, 0},
     };
 
     if (!name) return Q36_GPU_NONE;
@@ -72,6 +73,7 @@ static inline int q36_has_request_rules(int profile) {
     case Q36_GPU_4090:
     case Q36_GPU_5090:
     case Q36_GPU_PRO6000:
+    case Q36_GPU_L40S:
         return 1;
     default:
         return 0;
@@ -172,6 +174,21 @@ static inline unsigned q36_row_features(int profile, uint32_t rows, int generati
         { Q36_ANY_ROW, 0 }, /* expert matmul */
         { Q36_ROW(16), Q36_ROW(16) }, /* long attn */
     };
+    static const struct PhaseRules l40s[13] = {
+        { Q36_ANY_ROW & ~Q36_ROWS(13, 15), Q36_ANY_ROW }, /* prompt cache */
+        { Q36_ANY_ROW, Q36_ANY_ROW & ~Q36_ROW(12) }, /* expert route */
+        { Q36_ROW(8) | Q36_ROW(13) | Q36_ROW(16), 0 }, /* flash attn */
+        { Q36_ANY_ROW, Q36_ANY_ROW & ~Q36_ROW(10) }, /* async copies */
+        { Q36_ROW(9), Q36_ANY_ROW }, /* short matmul */
+        { Q36_ROWS(5, 8) | Q36_ROW(10) | Q36_ROWS(12, 14), 0 }, /* tiled matmul */
+        { Q36_ROW(2) | Q36_ROWS(4, 15), 0 }, /* activation cache */
+        { 0, Q36_ROW(4) | Q36_ROW(8) | Q36_ROW(13) | Q36_ROW(15) }, /* shared swiglu */
+        { 0, 0 }, /* fused norm */
+        { Q36_ROW(9), 0 }, /* dnconv */
+        { Q36_ROW(1), 0 }, /* dnrec */
+        { Q36_ANY_ROW, Q36_ANY_ROW }, /* expert matmul */
+        { 0, 0 }, /* long attn */
+    };
 
     const struct PhaseRules *rules;
     switch (profile) {
@@ -183,6 +200,9 @@ static inline unsigned q36_row_features(int profile, uint32_t rows, int generati
         break;
     case Q36_GPU_PRO6000:
         rules = pro6000;
+        break;
+    case Q36_GPU_L40S:
+        rules = l40s;
         break;
     default:
         return 0;
@@ -210,6 +230,7 @@ static inline unsigned q36_device_features(int profile) {
     case Q36_GPU_4090:
     case Q36_GPU_5090:
     case Q36_GPU_PRO6000:
+    case Q36_GPU_L40S:
         return q36_row_features(profile, Q36_ANY_ROW, 0) |
                q36_row_features(profile, Q36_ANY_ROW, 1);
     default:
