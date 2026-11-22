@@ -1855,6 +1855,37 @@ static int q38cc_dm_able(Q38CChain *ch, Model *m) {
     }
     return 1;
 }
+/* After the tier's warm start (q38_tier_warm): q38cc_setup turned a decode step's routed experts in the frame off
+ * when a layer's RAM cache had fewer slots than a step's distinct experts (q38cc_dm_able), before anything was on
+ * the card. With every routed expert on the card the host computes none, so the cache needs those slots but none
+ * of their memory: empty caches are given them and the frame takes the experts. An A/B on an RTX 5090 (a
+ * 256-expert GGUF, every expert in VRAM) with `--ram 16`: 54 slots a layer, every expert on the host, 30-32 tok/s
+ * and 8.5-10.3 GB read a request; with 80 slots 47-48 tok/s and nothing read. */
+static void q38cc_dm_recheck(Model *m) {
+    Q38CChain *ch = q38cc_of(m);
+    if (!ch || !ch->ok || ch->dm_on) return;
+    Cfg *c = &m->c; int L = c->layers, E = c->experts, K = c->topk;
+    const int need = Q38CC_DM_ROWS * K < E ? Q38CC_DM_ROWS * K : E;
+    int short_slots = 0;
+    for (int i = 0; i < L; i++) {
+        if (m->cache[i].cap >= need) continue;
+        if (m->cache[i].n) return;   /* experts already in it: its table stays */
+        short_slots = 1;
+    }
+    if (!short_slots) return;   /* q38cc_dm_able said no for another reason */
+    for (int i = 0; i < L; i++)
+        for (int e = 0; e < E; e++) {
+            ColiCudaTensor *g, *u, *d;
+            if (!qt_chain_resident(i, e, ch->dev, &g, &u, &d)) return;   /* the host would compute some */
+        }
+    for (int i = 0; i < L; i++)
+        if (m->cache[i].cap < need && q38_cache_slots_set(&m->cache[i], need)) return;
+    ch->dm_on = q38cc_dm_able(ch, m);
+    if (!ch->dm_on) return;
+    q38cc_head_card(ch, m);
+    fprintf(stderr, "[chain] qwen38: every routed expert on the card: the layers' RAM caches take %d slots (none of them "
+                    "filled) and a decode step's routed experts run in the frame\n", need);
+}
 static int q38cc_stage_table(Q38CChain *ch, Model *m);
 /* the step's buffers, and the table when the tier's residents moved (the tier held) */
 /* the routed experts' scratch for ch->rows rows: their routes up and down, their hidden rows and
