@@ -1940,6 +1940,19 @@ static int q38_format_prof(char *out,size_t capacity,double wall_s,int prompt_to
  * resident in the layer cache; heat 0, no usage counter here). Printed after
  * READY and STAT, and again after every turn. HITS: one bit per expert routed
  * in the turn, packed 8 per hex pair, printed after DONE next to PROF. */
+/* EMAP's tier 2, an expert on the GPU: the Vulkan tier's, or the CUDA tier's, or the CUDA chain's own
+ * slots where it holds the arena (q38cc_promote_init). It read the Vulkan tier only, so the maps of the
+ * chat page and coli tui showed a CUDA card's experts as in RAM or on the disk ("VRAM 0%"). */
+static int q38_emap_on_card(Model *m,int i,int e){
+    if(vkt_resident(i,e))return 1;
+#ifdef COLI_CUDA
+    Q38CChain *ch=q38cc_of(m);
+    if(ch&&ch->ok&&ch->own&&ch->vslot)return ch->vslot[(size_t)i*m->c.experts+e]>=0;
+    return qt_is_resident(i,e);
+#else
+    (void)m;return 0;
+#endif
+}
 static void serve_emap(Model *m){
     const Cfg *c=&m->c; int E=c->experts, rows=c->layers;
     char *hex=(char*)malloc((size_t)rows*E*2+1); int w=0;
@@ -1947,7 +1960,7 @@ static void serve_emap(Model *m){
         LCache *lc=&m->cache[i];
         for(int e=0;e<E;e++){
             int si=lc->by_expert?lc->by_expert[e]:-1;
-            int b=(vkt_resident(i,e)?2:si>=0&&si<lc->n&&lc->slots[si].eid==e?1:0)<<6;   /* 2 = on the Vulkan device */
+            int b=(q38_emap_on_card(m,i,e)?2:si>=0&&si<lc->n&&lc->slots[si].eid==e?1:0)<<6;   /* 2 = on the GPU */
             hex[w++]="0123456789abcdef"[b>>4]; hex[w++]="0123456789abcdef"[b&15];
         }
     }
