@@ -20,6 +20,7 @@ int main(void) {
     assert(coli_env_find("Q38_TRUNK_GPU")->engines == CE_QWEN38);
     assert(coli_env_find("COLI_PLACE")->engines == (CE_QWEN | CE_QWEN38));
     assert(coli_env_find("CACHE_ROUTE")->engines & CE_QWEN);
+    assert(coli_env_find("COLI_PROMPT_BREAK_AFTER")->engines & CE_QWEN);   /* qwen36.c's own reader */
     assert(coli_env_find("SNAP")->engines & CE_DSV41);
     assert(coli_env_find("MIMO_CAP")->engines == CE_MIMO);   /* read through mimo.c's env_int() */
     assert(coli_env_find("SNAP")->engines & CE_MIMO);

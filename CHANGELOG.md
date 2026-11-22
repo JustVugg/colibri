@@ -672,6 +672,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **Qwen3.8's CUDA chain runs the routed experts on the card when every one of them is there, whatever the
+  RAM cache's size.** A decode step's experts in the frame needed a layer's RAM cache of 8 x top-k slots, and
+  the gateway's plan at `--ram 16` gave 54: on an RTX 5090 with a 256-expert GGUF all in VRAM every expert ran
+  on the CPU, 30 against 48 tok/s, and a request read 8.5 to 10 GB from disk. After the tier's warm start, with
+  every routed expert resident, the empty caches take the slots (none of them filled) and the frame takes the
+  experts.
+- **Windows CUDA package: the DLL loads before its chain and tier tables are read.** On an FP8 snapshot the
+  qwen38 chain's reserve asked for the chain before anything had loaded `coli_cuda.dll`, and the chain then
+  stayed "absent" for the whole run.
+
 - **Bounds on what requests and files hand the chat**:
   - `ui/docs.py` unpacks an Office part up to 64 MB and a file's parts up to 256 MB together, and
     refuses an XML part with a document type (Office XML has none; `xml.parsers.expat` checks

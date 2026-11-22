@@ -466,6 +466,21 @@ static void test_eager_layer_validation_cleanup(void) {
     cleanup(root);
 }
 
+/* A directory that is not a container has neither JSON file. The message names
+ * the first one missing, manifest.json, which is what says a directory is a
+ * container: not layout.json, read second into the same buffer. */
+static void test_missing_manifest_is_the_error_reported(void) {
+    char root[] = "test_qpack_empty_XXXXXX";
+    CHECK(mkdtemp(root) != NULL);
+    ColiQpackReader reader;
+    char error[512] = {0};
+    CHECK(coli_qpack_open(&reader, root, error, sizeof(error)) != 0);
+    CHECK(strstr(error, "manifest.json") != NULL);
+    CHECK(strstr(error, "layout.json") == NULL);
+    CHECK(reader.layer_fds == NULL && reader.layout.sections == NULL);
+    remove_dir(root);
+}
+
 #ifndef _WIN32
 /* A model directory usually comes from a download, so a FIFO may sit under any
  * of the container's names. Opening one to read waits for a writer (the alarm
@@ -798,6 +813,7 @@ int main(void) {
     test_two_modules_open();
     test_affine_shape_refusal();
     test_eager_layer_validation_cleanup();
+    test_missing_manifest_is_the_error_reported();
 #ifndef _WIN32
     expect_fifo_refusal("manifest.json", "is not a bounded regular JSON file");
     expect_fifo_refusal("packed_experts/layout.json",
