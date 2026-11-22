@@ -201,6 +201,7 @@ static bool use_short_projection_kernels(const DeviceContext *ctx) {
     if (!ctx->qwen36_active) return false;
     switch (ctx->device_profile) {
     case Q36_GPU_4090:
+    case Q36_GPU_5090:
         return true;
     default:
         return false;

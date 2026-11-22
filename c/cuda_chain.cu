@@ -4208,16 +4208,19 @@ static int cc_attn_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBu
     bool ordered_long = false;
 #if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
     const bool ordered_profile = c->device_profile == Q36_GPU_L4 ||
-                                 c->device_profile == Q36_GPU_4090;
+                                 c->device_profile == Q36_GPU_4090 ||
+                                 c->device_profile == Q36_GPU_5090;
     ordered_long = ordered_profile && dec && long_turn && p->S > CC_ATTN_DEC_ROWS && p->S <= 64 && p->H == 16 &&
                    p->KVH == 2 && p->hd == 256 && c->major >= 8 && !getenv("COLI_CUDA_F2_MODE");
     /* This FP16 continuation uses the profile's one-pass Flash path with default settings. */
-    const bool flash_profile = c->device_profile == Q36_GPU_4090;
+    const bool flash_profile = c->device_profile == Q36_GPU_5090 ||
+                               c->device_profile == Q36_GPU_4090;
     const bool use_one_pass = flash_profile && sizeof(KT) == 2 && ordered_long && p->pos_base == 8880 && p->S == 35 &&
         !getenv("COLI_CUDA_PR13_FLASH_DEV") && !getenv("COLI_CUDA_ATTN_LONG_PLAIN") &&
         !getenv("COLI_CUDA_ATTN_DEC") && !getenv("COLI_CUDA_ATTN_DEC_GQA") && !getenv("COLI_CUDA_ATTN_DEC_TPP") &&
         !getenv("COLI_CUDA_CHAIN_FLASH") && !getenv("COLI_CUDA_CHAIN_FLASH2");
-    if (ordered_long && fl > 0 && p->S >= fl && cc_attn_f2_fits(c, p, G)) {
+    const bool skip_ordered = use_one_pass && (c->device_profile == Q36_GPU_5090);
+    if (ordered_long && !skip_ordered && fl > 0 && p->S >= fl && cc_attn_f2_fits(c, p, G)) {
         if (c->device_profile == Q36_GPU_4090 && use_one_pass && cc_uses_feature(c, Q36_FLASH_ATTN) &&
             p->has_gate && q == gate && cc_attn_f2_go<KT>(c, q, kc, vc, o, gate, p, G, 0, nullptr, 0, 0))
             return launched(c, "attn (tensor cores, one pass)");
