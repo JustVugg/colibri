@@ -847,6 +847,8 @@ static int audio_encoder_forward(Qwen3Asr *m, const float *mel, int n_mels, int 
         out_pos += feat;
         free(in); free(o1); free(o2); free(o3);
     }
+    int max_chunk_aftercnn = 0;
+    for (int c=0;c<num_chunks;c++) if (tok_per_chunk[c] > max_chunk_aftercnn) max_chunk_aftercnn = tok_per_chunk[c];
     free(padded); free(tok_per_chunk);
 
     /* Transformer encoder layers */
@@ -854,6 +856,19 @@ static int audio_encoder_forward(Qwen3Asr *m, const float *mel, int n_mels, int 
     int D = a->d_model;
     int Hh = a->n_heads;
     int Hd = a->head_dim;
+    /* cu_seqlens for n_window_infer windowed attention (matches HF get_audio_cu_seqlens). */
+    int n_window_ratio = (a->n_window * 2 > 0) ? (a->n_window_infer / (a->n_window * 2)) : 1;
+    if (n_window_ratio < 1) n_window_ratio = 1;
+    int window_aftercnn = max_chunk_aftercnn * n_window_ratio;
+    if (window_aftercnn <= 0) window_aftercnn = T;
+    int nwin = (T + window_aftercnn - 1) / window_aftercnn;
+    int *cu = (int*)xmalloc(((size_t)nwin + 1) * sizeof(int));
+    cu[0] = 0;
+    int cu_n = 0;
+    for (int pos=0; pos<T; pos += window_aftercnn) {
+        int end = pos + window_aftercnn; if (end > T) end = T;
+        cu[++cu_n] = end;
+    }
     float *buf = (float*)xcalloc((size_t)T*D,sizeof(float));
     float *q=(float*)xcalloc((size_t)T*D,sizeof(float));
     float *k=(float*)xcalloc((size_t)T*D,sizeof(float));
@@ -877,26 +892,32 @@ static int audio_encoder_forward(Qwen3Asr *m, const float *mel, int n_mels, int 
             matmul_linear(k, buf, &L->k, T);
             matmul_linear(v, buf, &L->v, T);
         }
-        /* attention - full attention (correct for short audio; TODO: n_window_infer windowing) */
+        /* windowed attention per cu_seqlens */
         for (int h=0;h<Hh;h++) {
-            for (int i=0;i<T;i++) {
-                float maxv = -1e30f;
-                for (int j=0;j<T;j++) {
-                    float dot=0.0f;
-                    for (int d=0;d<Hd;d++) dot += q[(size_t)i*D+h*Hd+d]*k[(size_t)j*D+h*Hd+d];
-                    dot /= sqrtf((float)Hd);
-                    att[((size_t)h*T+i)*T+j]=dot;
-                    if (dot>maxv) maxv=dot;
+            for (int wi=0; wi<cu_n; wi++) {
+                int ws = cu[wi], we = cu[wi+1];
+                for (int i=ws;i<we;i++) {
+                    float maxv = -1e30f;
+                    for (int j=ws;j<we;j++) {
+                        float dot=0.0f;
+                        for (int d=0;d<Hd;d++) dot += q[(size_t)i*D+h*Hd+d]*k[(size_t)j*D+h*Hd+d];
+                        dot /= sqrtf((float)Hd);
+                        att[((size_t)h*T+i)*T+j]=dot;
+                        if (dot>maxv) maxv=dot;
+                    }
+                    float sum=0.0f;
+                    for (int j=ws;j<we;j++) { att[((size_t)h*T+i)*T+j]=expf(att[((size_t)h*T+i)*T+j]-maxv); sum+=att[((size_t)h*T+i)*T+j]; }
+                    if (sum > 0) for (int j=ws;j<we;j++) att[((size_t)h*T+i)*T+j]/=sum;
                 }
-                float sum=0.0f;
-                for (int j=0;j<T;j++) { att[((size_t)h*T+i)*T+j]=expf(att[((size_t)h*T+i)*T+j]-maxv); sum+=att[((size_t)h*T+i)*T+j]; }
-                if (sum > 0) for (int j=0;j<T;j++) att[((size_t)h*T+i)*T+j]/=sum;
             }
         }
         memset(tmp,0,(size_t)T*D*sizeof(float));
-        for (int h=0;h<Hh;h++) for (int i=0;i<T;i++) for (int j=0;j<T;j++) {
-            float wgt = att[((size_t)h*T+i)*T+j];
-            for (int d=0;d<Hd;d++) tmp[(size_t)i*D+h*Hd+d] += wgt * v[(size_t)j*D+h*Hd+d];
+        for (int h=0;h<Hh;h++) for (int wi=0; wi<cu_n; wi++) {
+            int ws = cu[wi], we = cu[wi+1];
+            for (int i=ws;i<we;i++) for (int j=ws;j<we;j++) {
+                float wgt = att[((size_t)h*T+i)*T+j];
+                for (int d=0;d<Hd;d++) tmp[(size_t)i*D+h*Hd+d] += wgt * v[(size_t)j*D+h*Hd+d];
+            }
         }
         matmul_linear(buf, tmp, &L->o, T);
         for (size_t i=0;i<(size_t)T*D;i++) hidden[i]+=buf[i];
@@ -918,7 +939,7 @@ static int audio_encoder_forward(Qwen3Asr *m, const float *mel, int n_mels, int 
     for (size_t i=0;i<(size_t)T*a->d_model;i++) p1[i]=gelu(p1[i]);
     float *p2=(float*)xcalloc((size_t)T*a->output_dim,sizeof(float));
     matmul_linear(p2, p1, &a->proj2, T);
-    free(p1); free(buf); free(q); free(k); free(v); free(qkv_out); free(att); free(tmp); free(hidden);
+    free(p1); free(buf); free(q); free(k); free(v); free(qkv_out); free(att); free(tmp); free(hidden); free(cu);
     *out_emb = p2; *out_n = T;
     return 0;
 }
