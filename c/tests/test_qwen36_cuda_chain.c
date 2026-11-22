@@ -382,7 +382,7 @@ static int probe(int S, int cpu) {
     Weights w; make_weights(&w);
     if (!qt_init(NL, E, D, INTER, E, TOPK, 0, 0)) return 1;
     Model m; build_model(&m, &w); place_trunk(&m, &w);
-    if (!q36cc_setup(&m, 1)) return 1;
+    if (!q36cc_setup(&m, 1, NULL)) return 1;
     g_cuda_chain = !cpu;
     mtp_head();
     int *tk = malloc((size_t)S * sizeof(int));
@@ -401,6 +401,173 @@ static int probe(int S, int cpu) {
 }
 #endif
 
+/* Shape selection only: handles refer to already resident projections. Setup reads
+ * the norms and uploads its arena, but no 35B projection is evaluated. */
+static int selector_request, selector_calls;
+static int record_selector(int on) {
+    if (!selector_calls++) selector_request = on;
+    return fcc_select_qwen36_profile(on);
+}
+static int selector_init_failure(int dev) { (void)dev; return 0; }
+
+static int write_fixture_file(const char *path, const char *contents) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return 0;
+    int ok = fputs(contents, f) >= 0;
+    return fclose(f) == 0 && ok;
+}
+
+static void test_cuda_model_filter(const Model *trunk) {
+    enum Shape { native, gguf, int8_experts, group32, muse, lfm3, width, depth, experts, picks,
+                 middle, q_heads, kv_heads, q_width, k_width, mux2, draft, mtp, allowed_env,
+                 no_init, no_memory, other_gpu, different_weights, missing_checkpoint };
+
+    char fixture_dir[] = "qwen36-checkpoint-XXXXXX";
+    if (!mkdtemp(fixture_dir)) { ck(0, "make checkpoint selector fixture"); return; }
+    char weight_path[256], config_path[256], cache_path[256];
+    snprintf(weight_path, sizeof weight_path, "%s/model-00000.safetensors", fixture_dir);
+    snprintf(config_path, sizeof config_path, "%s/config.json", fixture_dir);
+    snprintf(cache_path, sizeof cache_path, "%s/%s", fixture_dir, Q36_CHECKPOINT_CACHE);
+    if (!write_fixture_file(weight_path, "abc") || !write_fixture_file(config_path, "{}")) {
+        ck(0, "write checkpoint selector fixture");
+        return;
+    }
+    int fd = open(weight_path, COMPAT_O_RDONLY);
+    if (fd < 0) { ck(0, "open checkpoint selector fixture"); return; }
+#if defined(__linux__) || defined(__APPLE__)
+    if (q36_checkpoint_cache_fs(fd)) sleep(2);  /* allow the fixture to qualify for the cache */
+#endif
+    const Q36CheckpointFile fixture_files[] = {
+        {"model-00000.safetensors", 3, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"},
+        {"config.json", 2, "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"},
+    };
+    const Q36Checkpoint fixture_checkpoint = {fixture_dir, fixture_files, 1, 2};
+    shards fixture_shards = {.nfd = 1, .fds = {fd}, .paths = {weight_path}, .sizes = {3}};
+    const ColiCudaChainOps saved = fake_chain_table;
+    const int prev_gguf = g_gguf, prev_int4 = g_expert_is_int4;
+    const size_t prev_cap = fake_chain_dev_cap;
+    const char *val = getenv("COLI_DFLASH"); char *draft_env = val ? strdup(val) : NULL;
+    val = getenv("Q36_MTP"); char *mtp_env = val ? strdup(val) : NULL;
+    float norm[2048] = {0};
+    Layer layers[40] = {0};
+    uint8_t attention[40]; memset(attention, 1, sizeof attention);
+    for (int i = 0; i < 40; i++) {
+        Layer *l = &layers[i];
+        l->qth_q = l->qth_ag = l->qth_ld = l->qth_lu = trunk->L[1].qth_q;
+        l->qth_k = trunk->L[1].qth_k; l->qth_v = trunk->L[1].qth_v; l->qth_o = trunk->L[1].qth_o;
+        l->in_ln = l->post_ln = l->ra_a = l->ra_b = l->rf_a = l->rf_b = norm;
+        l->pre_en = l->post_fn = l->post_op = l->post_ffn = norm;
+        l->gate = trunk->L[1].gate;
+    }
+    fake_chain_table.size = sizeof fake_chain_table;
+    fake_chain_table.select_qwen36_profile = record_selector;
+    fake_chain_table.muse = fake_chain_table.lfm3 = fcc_ready;
+    for (int trial = native; trial <= missing_checkpoint; trial++) {
+        Model m = {0}; Cfg *c = &m.c;
+        c->hidden = trial == width ? 2016 : 2048; c->n_layers = trial == depth ? 39 : 40;
+        c->n_experts = trial == experts ? 255 : 256; c->topk = trial == picks ? 7 : 8;
+        c->inter = trial == middle ? 256 : 512; c->expert_gs = trial == group32 ? 32 : 64;
+        c->q_heads = trial == q_heads ? 8 : 16; c->kv_heads = trial == kv_heads ? 1 : 2;
+        c->head_dim = trial == q_width ? 128 : 256; c->k_head_dim = trial == k_width ? 128 : 256;
+        c->q_head_dim = 512; c->is_attn = attention; c->muse = trial == muse; c->lfm3 = trial == lfm3;
+        m.S = fixture_shards;
+        m.L = layers; m.final_norm = norm; g_gguf = trial == gguf; g_expert_is_int4 = trial != int8_experts;
+        if (trial == draft) setenv("COLI_DFLASH", "draft", 1);
+        else if (trial == allowed_env) setenv("COLI_DFLASH", "", 1);
+        else unsetenv("COLI_DFLASH");
+        if (trial == mtp || trial == allowed_env) setenv("Q36_MTP", trial == mtp ? "1" : "2", 1);
+        else unsetenv("Q36_MTP");
+        fake_chain_table.init = trial == no_init ? selector_init_failure : saved.init;
+        fake_chain_dev_cap = trial == no_memory ? fake_chain_dev_bytes + 1 : prev_cap;
+        selector_request = -1; selector_calls = 0;
+        const int old_device = fake_device_profile;
+        if (trial == other_gpu) {
+            unlink(cache_path);
+            fake_device_profile = Q36_GPU_NONE;
+        }
+        if (trial == different_weights) ck(write_fixture_file(weight_path, "xyz"), "replace the weights with the same number of bytes");
+        Q36CChain *ch = q36cc_setup(&m, trial == mux2 ? 2 : 1,
+                                  trial == missing_checkpoint ? NULL : &fixture_checkpoint);
+        if (trial == other_gpu) ck(access(cache_path, F_OK) != 0, "another GPU does not verify checkpoint files");
+        if (trial == different_weights) ck(write_fixture_file(weight_path, "abc"), "restore checkpoint fixture");
+        fake_device_profile = old_device;
+        const int early = trial == q_width || trial == k_width || trial == no_init;
+        const int enabled = trial == native || trial == allowed_env;
+        int ok = early ? (!ch && !selector_calls && !fake_active_profile) :
+                 trial == no_memory ? (!ch && selector_request == 1 && selector_calls == 2 && !fake_active_profile) :
+                 (ch && (ch->device_profile != 0) == enabled && selector_request == enabled && (fake_active_profile != 0) == enabled);
+        char what[136];
+        snprintf(what, sizeof what, "Qwen selector trial %d: request, active dispatch and setup result", trial);
+        ck(ok, what);
+        if (ch) { q36cc_free_own(ch, &m); cc_select_qwen36_profile(0); }
+        Q36CChain *a = q36cc_of(&m);
+        if (a) {
+            void *owned[] = {a->o_in, a->o_post, a->o_qn, a->o_kn, a->o_conv, a->o_dn, a->o_snk, a->o_ra, a->o_rf,
+                a->o_pre, a->o_pf, a->t_ag, a->t_ld, a->t_lu, a->t_sci, a->t_sco, a->o_po, a->o_pff, a->t_ab,
+                a->t_sg, a->t_gate, a->rgf, a->t_q, a->t_k, a->t_v, a->t_o, a->t_dnp, a->t_dno, a->t_dnz,
+                a->t_shg, a->t_shu, a->t_shd, a->rec, a->ring, a->kc, a->vc, a->kv_valid, a->attn_ord, a->kv_rows};
+            for (size_t j = 0; j < sizeof owned / sizeof *owned; j++) free(owned[j]);
+            free(a);
+        }
+    }
+    struct stat cache_before, cache_after;
+#if defined(__linux__) || defined(__APPLE__)
+    if (q36_checkpoint_cache_fs(fd)) sleep(2);  /* allow the restored fixture's timestamps to settle */
+#endif
+    ck(q36_checkpoint_matches(&fixture_shards, &fixture_checkpoint), "verify exact fixture files");
+    if (q36_checkpoint_cache_fs(fd)) {
+        ck(stat(cache_path, &cache_before) == 0 && q36_checkpoint_matches(&fixture_shards, &fixture_checkpoint) &&
+           stat(cache_path, &cache_after) == 0 && cache_before.st_ino == cache_after.st_ino,
+           "unchanged verified files reuse the cache without replacing it");
+    }
+    ck(write_fixture_file(weight_path, "xyz") && !q36_checkpoint_matches(&fixture_shards, &fixture_checkpoint),
+       "a same-size weight change invalidates existing cache entries");
+#ifndef _WIN32
+    ck(unlink(weight_path) == 0 && write_fixture_file(weight_path, "abc"),
+       "replace the path with a byte-identical new file");
+    ck(!q36_checkpoint_matches(&fixture_shards, &fixture_checkpoint),
+       "a replaced path cannot attest to the shard descriptor previously opened");
+    close(fd);
+    fd = open(weight_path, COMPAT_O_RDONLY);
+    fixture_shards.fds[0] = fd;
+    ck(q36_checkpoint_matches(&fixture_shards, &fixture_checkpoint),
+       "a byte-identical replacement requalifies through a new descriptor");
+#endif
+    ck(write_fixture_file(config_path, "[]") && !q36_checkpoint_matches(&fixture_shards, &fixture_checkpoint),
+       "a same-size configuration change invalidates the checkpoint");
+    close(fd);
+    unlink(weight_path);
+    unlink(config_path);
+    unlink(cache_path);
+    rmdir(fixture_dir);
+
+    const int old_profile = fake_device_profile;
+    const unsigned old_mask = fake_kernel_mask;
+    fake_device_profile = Q36_GPU_L4;
+    ck(cc_probe_qwen36_profile() == Q36_GPU_L4 && !fake_active_profile && fake_kernel_mask == old_mask,
+       "querying an eligible CUDA device leaves the engine on standard dispatch");
+    fake_device_profile = Q36_GPU_NONE;
+    ck(cc_probe_qwen36_profile() == Q36_GPU_NONE && !fake_active_profile && fake_kernel_mask == old_mask,
+       "querying another CUDA device leaves the engine on standard dispatch");
+    fake_device_profile = old_profile;
+    fake_chain_table.size = offsetof(ColiCudaChainOps, probe_qwen36_profile);
+    selector_calls = 0;
+    ck(!cc_probe_qwen36_profile() && !selector_calls && !fake_active_profile,
+       "a table without a device probe cannot enable a profile");
+    fake_chain_table.size = offsetof(ColiCudaChainOps, set_kernel_mask);
+    selector_calls = 0;
+    ck(!cc_select_qwen36_profile(1) && !selector_calls,
+       "table with the selector but without request permissions declines the device profile");
+    fake_chain_table.size = sizeof fake_chain_table;
+    fake_chain_table.set_kernel_mask = NULL;
+    ck(!cc_select_qwen36_profile(1) && !selector_calls,
+       "table with a null request permissions callback declines the device profile");
+
+    fake_chain_table = saved; fake_chain_dev_cap = prev_cap; g_gguf = prev_gguf; g_expert_is_int4 = prev_int4;
+    if (draft_env) { setenv("COLI_DFLASH", draft_env, 1); free(draft_env); } else unsetenv("COLI_DFLASH");
+    if (mtp_env) { setenv("Q36_MTP", mtp_env, 1); free(mtp_env); } else unsetenv("Q36_MTP");
+}
+
 /* The lm_head computes on the card and one copy takes its logits to the host's buffer: no matmul of
  * the chain's steps stores through the bus, and the logits equal the CPU path's after a prompt read
  * in chunks, a decode token and a verify whose three logits rows lie in two chunks. */
@@ -408,7 +575,7 @@ static void head_logits_on_the_card(Weights *w, const Model *shared, const int *
     g_q36_mtp.on = 0; memset(&g_q36_mc, 0, sizeof g_q36_mc);   /* section H's MTP head is not part of these steps */
     Model r, m; build_model(&r, w); build_model(&m, w);
     share_trunk(&r, shared); share_trunk(&m, shared);
-    Q36CChain *ch = q36cc_setup(&m, 1);
+    Q36CChain *ch = q36cc_setup(&m, 1, NULL);
     ck(ch != NULL && ch->ok, "chain model ready for the head's logits");
     g_cuda_chain = 1;
     int stores0 = fake_chain_host_stores;
@@ -466,6 +633,159 @@ static void test_routed_fetches(void) {
        "no staged chunk has a layer the host serves inside the frame: the wait for the routes cannot block");
 }
 
+/* Make new mirror storage distinguishable from an explicitly zeroed attention ring. */
+static CcBuf *mirror_marked_buf(size_t bytes, int kind) {
+    CcBuf *b = fcc_buf(bytes, kind);
+    if (b) memset(b->d, 0x3c, b->bytes);
+    return b;
+}
+static int mirror_halves(void) { return 1; }
+
+/* Send a one-token request with a varying generation budget. The empty mux input
+ * queue isolates serve_start's control poll from the process's standard input. */
+static void host_growth_requests(Weights *w, const Model *shared, int grow_cache, int ring) {
+    Model m; build_model(&m, w); share_trunk(&m, shared);
+    for (int i = 0; i < NL; i++) { free(m.K[i]); free(m.V[i]); }
+    free(m.K); free(m.V); m.K = m.V = NULL; m.max_t = m.kv_cap = 0;
+    Q36CChain policy = {0}; policy.device_profile = grow_cache ? Q36_GPU_L4 : Q36_GPU_NONE; m.cchain = &policy;
+    uint8_t window[NL] = {0, 1};
+    if (ring) { m.c.window = 4; m.c.win_layer = window; }
+    const int old_slots = g_q36_mux_slots, old_eof = g_q36_held_eof;
+    g_q36_mux_slots = 2; g_q36_held_eof = 1;
+    const int needs[] = {5, 1024, 2048, 2049, 4090, 4200};
+    /* The prompt cache rounds 4090 to its next 1024-slot block. Both policies cap 4200 at 4097. */
+    const int expected[2][6] = {{1024, 1024, 2048, 3072, 4097, 4097}, {2048, 2048, 2048, 3072, 4096, 4097}};
+    int ok = 1;
+    for (int k = 0; k < 6 && ok; k++) {
+        void *old_k = k ? m.K[1] : NULL, *old_v = k ? m.V[1] : NULL;
+        int old_cap = m.kv_cap, old_rows = q36_kv_rows(&m, 1);
+        if (k) {
+            m.kvp.len = 7;
+            for (int v = 0; v < 2; v++) for (int h = 0; h < KV; h++) for (int j = 0; j < HD; j++) {
+                float *buf = v ? old_v : old_k;
+                buf[((size_t)h * old_rows + 6) * HD + j] = (float)(100 * v + 31 * h + j + 7 * k);
+            }
+        }
+        ServeReq req = {0}; strcpy(req.id, "cache-growth"); req.payload = "A"; req.plen = 1; req.max_tok = needs[k] - 1;
+        Q36ReqClock clk = {0}; int *tokens = NULL, count = 0; float *logits = NULL;
+        ok = q36_serve_start(&m, &req, &tokens, &count, &logits, &clk) && count == 1 && logits &&
+             m.kv_cap == expected[grow_cache][k] && m.max_t == m.kv_cap;
+        for (int j = 0; ok && j < V; j++) ok = isfinite(logits[j]);
+        free(tokens); free(logits);
+        int rows = q36_kv_rows(&m, 1);
+        if (ok && ring) ok = rows == m.kv_ring && m.kv_ring > 6 && m.kv_ring < m.max_t;
+        if (k && ok) {
+            if (ring || old_cap == m.kv_cap) ok &= m.K[1] == old_k && m.V[1] == old_v;
+            for (int v = 0; v < 2; v++) for (int h = 0; h < KV; h++) for (int j = 0; j < HD; j++) {
+                const float *buf = v ? m.V[1] : m.K[1];
+                float x = buf[((size_t)h * rows + 6) * HD + j];
+                ok &= isfinite(x) && x == (float)(100 * v + 31 * h + j + 7 * k);
+            }
+        }
+    }
+    g_q36_mux_slots = old_slots; g_q36_held_eof = old_eof;
+    for (int i = 0; i < NL; i++) { free(m.K[i]); free(m.V[i]); }
+    free(m.K); free(m.V); free(m.ring_pos); free(m.attn_sc); kv_prefix_free(&m.kvp);
+    ck(ok, "served budgets grow or reuse host KV at the expected capacity and preserve per-head K/V, including rings");
+}
+
+static void mirror_growth_cases(int half) {
+    enum { layers = 3, heads = 2, width = 4, keep = 3, ceiling = 4097 };
+    Model m = {0};
+    Q36CChain ch = {0};
+    uint8_t attn[layers] = {1, 1, 1}, window[layers] = {0, 0, 1};
+    CcBuf *keys[layers] = {0}, *values[layers] = {0};
+    int rows[layers] = {0}, valid[layers] = {0};
+    m.c.n_layers = layers; m.c.kv_heads = heads; m.c.k_head_dim = width;
+    m.c.is_attn = attn; m.c.win_layer = window; m.max_t = m.kv_cap = 512;
+    ch.kc = keys; ch.vc = values; ch.kv_rows = rows; ch.kv_valid = valid; ch.device_profile = Q36_GPU_L4;
+    ColiCudaChainOps saved = fake_chain_table;
+    int saved_kv = g_q36_kv16;
+    size_t baseline = fake_chain_dev_bytes, es = half ? 2 : 4;
+    fake_chain_table.size = sizeof fake_chain_table; fake_chain_table.kvh = mirror_halves;
+    fake_chain_table.buf = mirror_marked_buf; g_q36_kv16 = half;
+    int ok = q36cc_kves() == es && q36cc_mirror(&ch, &m) && ch.cap == 3072;
+    if (!ok) goto done;
+    {
+        CcBuf *first = keys[0], *last = values[layers - 1];
+        int frames = fake_chain_frames;
+        size_t held = fake_chain_dev_bytes;
+        ok = q36cc_mirror(&ch, &m);
+        m.max_t = m.kv_cap = 2000;
+        ok &= q36cc_mirror(&ch, &m) && ch.host_cap == 2000 && ch.cap == 3072 &&
+              keys[0] == first && values[layers - 1] == last && fake_chain_frames == frames && fake_chain_dev_bytes == held;
+        for (int i = 0; i < layers; i++) {
+            valid[i] = keep;
+            for (int v = 0; v < 2; v++) for (int h = 0; h < heads; h++) for (int j = 0; j < keep * width; j++) {
+                CcBuf *buf = v ? values[i] : keys[i];
+                int at = h * rows[i] * width + j;
+                float x = (float)(1 + i * 400 + v * 100 + h * 20 + j);
+                if (half) ((uint16_t *)buf->d)[at] = kv16_from(x); else buf->d[at] = x;
+            }
+        }
+        m.kv_ring = 17; m.max_t = m.kv_cap = 3500;
+        size_t old_pair = 2 * heads * 3072 * width * es, new_pair = 2 * heads * ceiling * width * es;
+        /* The second layer fits only after the first copy is submitted and its old pair is freed. */
+        fake_chain_dev_cap = held + 2 * new_pair - old_pair;
+        ok &= q36cc_mirror(&ch, &m) && ch.cap == ceiling && fake_chain_frames == frames + 2;
+        fake_chain_dev_cap = 0;
+        if (!ok) goto done;
+        for (int i = 0; i < layers; i++) {
+            int ring = window[i], n = ring ? m.kv_ring * width : keep * width;
+            ok &= valid[i] == (ring ? 0 : keep) && rows[i] == (ring ? m.kv_ring : ceiling);
+            for (int v = 0; v < 2; v++) for (int h = 0; h < heads; h++) for (int j = 0; j < n; j++) {
+                CcBuf *buf = v ? values[i] : keys[i];
+                int at = h * rows[i] * width + j;
+                float x = half ? kv16_to(((uint16_t *)buf->d)[at]) : buf->d[at];
+                ok &= isfinite(x) && x == (ring ? 0.f : (float)(1 + i * 400 + v * 100 + h * 20 + j));
+            }
+        }
+        ch.device_profile = 0;
+        ok &= q36cc_mirror(&ch, &m) && ch.cap == 3500 && rows[0] == 3500 && rows[1] == 3500 &&
+              rows[2] == m.kv_ring && !valid[0] && !valid[1] && !valid[2];
+    }
+done:
+    fake_chain_dev_cap = 0;
+    for (int i = 0; i < layers; i++) { cc_free(keys[i]); cc_free(values[i]); }
+    fake_chain_table = saved; g_q36_kv16 = saved_kv;
+    ck(ok && fake_chain_dev_bytes == baseline,
+       "mirror slack, clamped growth under pressure, per-head K/V, cleared ring and exact size");
+}
+
+static void test_step_kernel_mask(Model *m, Model *ref, Q36CChain *ch, const int *ids) {
+    const size_t saved_size = fake_chain_table.size;
+    fake_chain_table.size = sizeof fake_chain_table;
+    ch->device_profile = cc_select_qwen36_profile(1);
+    q36cc_end_request(ch);
+    const unsigned defaults = fake_kernel_mask;
+    for (int rows = 1; rows <= 2; rows++) {
+        const int pos = m->kv_len;
+        float *logits = step(m, ids + pos, rows, pos);
+        float *expected = step_ex(ref, ids + pos, rows, pos, 1);
+        m->kv_len = ref->kv_len = pos + rows;
+        ck(logits && !ch->request_phase && fake_kernel_mask == defaults,
+           "a standalone step releases its request and restores the default kernel mask");
+        same_logits(logits, expected, V, "standalone CUDA step agrees with CPU");
+        free(logits); free(expected);
+    }
+    q36cc_begin_request(ch, 0, m->kv_len + 1, 0);
+    const unsigned restricted = defaults & ~Q36_PROMPT_CACHE;
+    q36cc_set_permissions(ch, restricted);
+    const int pos = m->kv_len;
+    float *logits = step(m, ids + pos, 1, pos);
+    float *expected = step_ex(ref, ids + pos, 1, pos, 1);
+    m->kv_len = ref->kv_len = pos + 1;
+    ck(logits && ch->request_phase && fake_kernel_mask == restricted,
+       "a nested step retains the caller's request and backend permissions");
+    same_logits(logits, expected, V, "nested CUDA step agrees with CPU");
+    free(logits); free(expected);
+    q36cc_end_request(ch);
+    ck(!ch->request_phase && fake_kernel_mask == defaults,
+       "the caller releases the request kernel mask after the nested step");
+    ch->device_profile = cc_select_qwen36_profile(0);
+    fake_chain_table.size = saved_size;
+}
+
 int main(int argc, char **argv) {
 #ifdef _WIN32
     if (argc == 3 && !strcmp(argv[1], "--probe")) return probe(atoi(argv[2]), 0);
@@ -498,8 +818,10 @@ int main(int argc, char **argv) {
     for (int i = 0; i < NL; i++) { m.L[i].qth_dnout = ref.L[i].qth_dnout; m.L[i].qth_q = ref.L[i].qth_q; m.L[i].qth_k = ref.L[i].qth_k; m.L[i].qth_v = ref.L[i].qth_v;
                                    m.L[i].qth_o = ref.L[i].qth_o; m.L[i].qth_shg = ref.L[i].qth_shg; m.L[i].qth_shu = ref.L[i].qth_shu; m.L[i].qth_shd = ref.L[i].qth_shd; }
 
+    test_cuda_model_filter(&ref);
+
     printf(" A. the chain against the CPU path\n");
-    Q36CChain *ch = q36cc_setup(&m, 1);
+    Q36CChain *ch = q36cc_setup(&m, 1, NULL);
     ck(ch != NULL && ch->ok && ch->n == NL && ch->head, "the chain set itself up on the fake device, every layer and the head");
     g_cuda_chain = 1;
     float *lr = step_ex(&ref, ids, 4, 0, 1);
@@ -527,6 +849,8 @@ int main(int argc, char **argv) {
         same_logits(lc, lr, V, what);
         free(lr); free(lc);
     }
+    test_step_kernel_mask(&m, &ref, ch, ids);
+
     q36cc_sync_host(&m);
     ck(maxdiff(m.DN_rec[0], ref.DN_rec[0], (size_t)VH * KD * VD) < 1e-3 && maxdiff(m.DN_conv[0], ref.DN_conv[0], (size_t)CD * (CONVK - 1)) < 1e-4,
        "the state read back from the device equals the CPU path's");
@@ -589,7 +913,7 @@ int main(int argc, char **argv) {
       fake_chain_absent = 0;
       /* KV_SLOTS > 1: the chain stays on, each conversation's state in a place of its own
        * (q36cc_conv_*, serve_mux) */
-      Q36CChain *c2 = q36cc_setup(&m2, 2);
+      Q36CChain *c2 = q36cc_setup(&m2, 2, NULL);
       ck(c2 != NULL && c2->ok, "KV_SLOTS > 1 keeps the chain on");
       (void)m2; }
 
@@ -620,7 +944,7 @@ int main(int argc, char **argv) {
         r3.freq = calloc((size_t)NL * E, sizeof(uint64_t)); m3.freq = calloc((size_t)NL * E, sizeof(uint64_t));
         r3.resident_collecting = m3.resident_collecting = 1;
         if (hyb) setenv("COLI_CUDA_CHAIN_PROMOTE", "0", 1);   /* the chain promotes nothing */
-        Q36CChain *c3 = q36cc_setup(&m3, 1);
+        Q36CChain *c3 = q36cc_setup(&m3, 1, NULL);
         ck(c3 != NULL && c3->ok && c3->dm_on, "routed experts in the frame enabled");
         if (hyb) {   /* expert 3 of layer 1 on the host, and kept there: with the residents made hot,
                       * the tier's swap (a quarter hotter than the coldest, tier_should_promote)
@@ -705,7 +1029,7 @@ int main(int argc, char **argv) {
             r3.L[i].qth_shg = m3.L[i].qth_shg = ref.L[i].qth_shg; r3.L[i].qth_shu = m3.L[i].qth_shu = ref.L[i].qth_shu;
             r3.L[i].qth_shd = m3.L[i].qth_shd = ref.L[i].qth_shd;
         }
-        Q36CChain *c3 = q36cc_setup(&m3, 1);
+        Q36CChain *c3 = q36cc_setup(&m3, 1, NULL);
         ck(c3 != NULL && c3->ok, "chain model ready for the MTP head");
 
         float *hid_in = fvec(3 * D, &ms, 0.3f, 0.f), h_cpu[D], h_gpu[D];
@@ -919,7 +1243,7 @@ int main(int argc, char **argv) {
         g_cap = S + 16;
         ck(qt_init(NL, E, D, INTER, E, TOPK, 0, 0), "the tier is up for a long context");
         Model mm; build_model(&mm, &w); place_trunk(&mm, &w);
-        Q36CChain *cm = q36cc_setup(&mm, 1);
+        Q36CChain *cm = q36cc_setup(&mm, 1, NULL);
         ck(cm != NULL && cm->ok, "a chain for the long context");
         g_cuda_chain = 1;
         mtp_head();
@@ -992,6 +1316,56 @@ int main(int argc, char **argv) {
     stage_table_case(3, 1, -1, 0, 1, 1, "planar, five of eight in the pool (two would not fit in a layer's)");
     stage_table_case(4, 1, -1, 40000, 1, 1, "planar, room for one bank only");
     stage_table_case(4, 1, -1, 0, 0, 1, "planar, a backend whose table ends before the banks' ops");
+
+    printf(" Q. warmstart pre-allocates scratch and mirror growth preserves valid KV rows in VRAM\n");
+    {
+        unsetenv("CUDA_EXPERT_GB"); unsetenv("COLI_PLACE"); fake_planar_rows = 0;
+        fake_chain_table.size = CC_OPS_BASE_SIZE;   /* this fixture keeps its routed experts on the host */
+        ck(qt_init(NL, E, D, INTER, E, TOPK, 0, 0), "tier up for warmstart and mirror growth");
+        Model mw, mr; build_model(&mw, &w); build_model(&mr, &w);
+        place_trunk(&mr, &w); share_trunk(&mw, &mr);
+        Q36CChain *cw = q36cc_setup(&mw, 1, NULL);
+        ck(cw != NULL && cw->ok, "chain setup for warmstart");
+        g_cuda_chain = 1;
+        cw->device_profile = fcc_select_qwen36_profile(1);   /* exercise the cache growth policy on the tiny model */
+        q36cc_warmstart(&mw);
+        ck(cw->cap >= Q36CC_CONV_ROWS && cw->rows > 0, "q36cc_warmstart pre-allocates KV mirrors and prompt scratch");
+        float *lr = step_ex(&mr, ids, 4, 0, 1), *lw = step_ex(&mw, ids, 4, 0, 1);
+        mr.kv_len = mw.kv_len = 4; mw.kvp.len = mr.kvp.len = 4;
+        same_logits(lw, lr, V, "warmstarted chain prompt logits match CPU");
+        free(lr); free(lw);
+        /* Grow host kv_cap past cw->cap (3072): q36cc_mirror must copy the 4 valid rows in VRAM in 1 frame and keep kv_valid[1] == 4 */
+        mr.max_t = mw.max_t = 4096;
+        ensure_kv(&mr); ensure_kv(&mw);
+        int f0 = fake_chain_frames;
+        ck(q36cc_mirror(cw, &mw) && cw->cap >= 4096 && cw->kv_valid[1] == 4 && fake_chain_frames - f0 == 1,
+           "q36cc_mirror grows in VRAM in a single batched frame and preserves kv_valid[1] == 4 without host re-upload");
+        lr = step_ex(&mr, ids + 4, 2, 4, 1); lw = step_ex(&mw, ids + 4, 2, 4, 1);
+        same_logits(lw, lr, V, "continuation after VRAM mirror growth matches CPU");
+        free(lr); free(lw);
+        {
+            const char *limit = getenv("Q36_MAXT");
+            char *saved = limit ? strdup(limit) : NULL;
+            setenv("Q36_MAXT", "4097", 1);
+            for (int mode = 0; mode < 2; mode++)
+                for (int ring = 0; ring < 2; ring++) host_growth_requests(&w, &mr, mode, ring);
+            mirror_growth_cases(0);
+            mirror_growth_cases(1);
+            if (saved) { setenv("Q36_MAXT", saved, 1); free(saved); } else unsetenv("Q36_MAXT");
+        }
+
+        /* Corrupt one preserved device KV entry and check that the continuation still reads it. */
+        float saved = cw->kc[1]->d[0];
+        cw->kc[1]->d[0] += 100.0f;
+        lw = step_ex(&mw, ids + 4, 2, 4, 1);
+        lr = step_ex(&mr, ids + 4, 2, 4, 1);
+        ck(maxdiff(lw, lr, V) > 1e-3, "corrupting preserved device KV row 0 changes continuation logits without a host re-upload");
+        cw->kc[1]->d[0] = saved;
+        free(lr); free(lw);
+        g_cuda_chain = 0;
+        qt_shutdown();
+        fake_chain_table.size = CC_OPS_BASE_SIZE;
+    }
     if (fails) { printf("test_qwen36_cuda_chain: %d failure(s)\n", fails); return 1; }
     printf("OK test_qwen36_cuda_chain: the CUDA chain gives the CPU path's logits; host and device state agree; a lost device rebuilds; the host pool follows before a large prompt chunk only; the promotions' brake only with a history; the MTP head and the CPU's layers read a long prompt a chunk at a time\n");
     return 0;

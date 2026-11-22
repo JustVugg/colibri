@@ -271,15 +271,31 @@ int coli_cuda_dn_step(ColiCudaDn *d, ColiCudaTensor *proj, ColiCudaTensor *projz
  * f32 rows of a fmt 0 tensor. fake_chain_fail_at: the n-th cc_submit fails (a lost
  * device); fake_chain_frames counts the submits. */
 #include "../cuda_chain.h"
+#include "../qwen36_cuda_profile.h"
 struct CcBuf { int kind; size_t bytes; float *d; };
 static int fake_chain_up, fake_chain_lost, fake_chain_dev = -1, fake_chain_frames, fake_chain_fail_at, fake_chain_ops, fake_chain_down_copies;
+static CcBuf *fake_last_sgd;
+static int fake_active_profile;
+static int fake_device_profile = Q36_GPU_L4;
+static unsigned fake_kernel_mask;
+static void fcc_set_kernel_mask(unsigned mask) { fake_kernel_mask = mask; }
 static int fake_chain_host_stores;   /* matmuls whose output is host memory: stored over the bus on a real card */
 static size_t fake_chain_dev_bytes;
 static size_t fake_chain_dev_cap;   /* 0: no limit; else the most CC_DEV bytes the card holds: cc_buf fails past it */
-static int fcc_init(int device) { fake_chain_up = 1; fake_chain_lost = 0; fake_chain_dev = device; return 1; }
+static int fcc_init(int device) { fake_chain_up = 1; fake_chain_lost = 0; fake_chain_dev = device; fake_active_profile = 0; fake_kernel_mask = 0; fake_last_sgd = NULL; return 1; }
 static int fcc_ready(void) { return fake_chain_up && !fake_chain_lost; }
 static int fcc_lost(void) { return !fake_chain_up || fake_chain_lost; }
-static void fcc_shutdown(void) { fake_chain_up = 0; }
+static void fcc_shutdown(void) { fake_chain_up = 0; fake_active_profile = 0; fake_kernel_mask = 0; fake_last_sgd = NULL; }
+static int fcc_probe_qwen36_profile(void) {
+    return fcc_ready() ? fake_device_profile : Q36_GPU_NONE;
+}
+static int fcc_select_qwen36_profile(int enable) {
+
+    fake_active_profile = enable && fcc_ready() ? fake_device_profile : Q36_GPU_NONE;
+    fake_kernel_mask = fake_active_profile ? q36_default_features(fake_active_profile) : 0;
+    if (!fake_active_profile) fake_last_sgd = NULL;
+    return fake_active_profile;
+}
 static int fcc_device(int d) { int was = fake_chain_dev; fake_chain_dev = d; return was; }
 static int fcc_device_now(void) { return fake_chain_dev; }
 static CcBuf *fcc_buf(size_t bytes, int kind) {
@@ -749,6 +765,9 @@ static ColiCudaChainOps fake_chain_table = {
     NULL, NULL, NULL, NULL, NULL, NULL, NULL,        /* the encoders' */
     NULL, NULL, NULL,                                /* lfm3, matmul_glu, addnorm */
     fcc_pick_rows,
+    .select_qwen36_profile = fcc_select_qwen36_profile,
+    .set_kernel_mask = fcc_set_kernel_mask,
+    .probe_qwen36_profile = fcc_probe_qwen36_profile,
 };
 static int fake_chain_absent;   /* 1: a backend without the chain (an older DLL) */
 const ColiCudaChainOps *coli_cuda_chain_ops(void) { return fake_chain_absent ? NULL : &fake_chain_table; }

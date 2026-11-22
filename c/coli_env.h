@@ -212,6 +212,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_CUDA_HOST_WAIT_S", CE_FLOAT, CE_QWEN | CE_QWEN38, 0, NULL},
     {"COLI_CUDA_K3_ROWS", CE_INT, CE_KIMI, 0, NULL},
     {"COLI_CUDA_KV16", CE_STR, CE_QWEN, 0, NULL},
+    {"COLI_CUDA_L2_GRAN", CE_INT, CE_QWEN, 0, NULL}, /* L2 fetch granularity in bytes. Default 128. Zero leaves the device limit alone. */
     {"COLI_CUDA_MOE_BATCH",              CE_STR   , CE_DSV4                                         , 0             , NULL},
     {"COLI_CUDA_MOE_BATCH_MIN",          CE_STR   , CE_DSV4                                         , 0             , NULL},
     {"COLI_CUDA_MOE_DOUBLE",             CE_STR   , CE_DSV4                                         , 0             , NULL},

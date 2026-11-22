@@ -8146,7 +8146,14 @@ static float *step_ex(Model *m, const int *ids, int S, int pos_base, int nlogits
 }
 
 static float *step(Model *m, const int *ids, int S, int pos_base) {
-    return step_ex(m, ids, S, pos_base, 1);
+#ifdef COLI_CUDA
+    Q36CChain *owned = q36cc_begin_if_idle(m, pos_base, S);
+#endif
+    float *logit = step_ex(m, ids, S, pos_base, 1);
+#ifdef COLI_CUDA
+    if (owned) q36cc_end_request(owned);
+#endif
+    return logit;
 }
 
 /* ---- several conversations at once (KV_SLOTS>1, serve_mux) --------------------
@@ -9041,6 +9048,9 @@ static void ensure_kv(Model *m){
         m->max_t = m->kv_cap;
         return;
     }
+#ifdef COLI_CUDA
+    Q36CChain *ch = q36cc_of(m);
+#endif
     /* Growth COPIES the rows instead of discarding them. A chat resends a
      * longer transcript every turn, so this reallocation lands on exactly the
      * turn that wants to reuse the previous one's state: freeing the rows here
@@ -9055,6 +9065,9 @@ static void ensure_kv(Model *m){
      * new length paid the reallocation, the rows' copy and (a GPU chain) its KV mirrors' again
      * on every turn (LFM3-VL-2B on CUDA: a prompt of a new length 48 ms instead of 35). The
      * RAM plan reserves the whole context's cache already. */
+#ifdef COLI_CUDA
+    if (!(g_cuda_chain && q36cc_prompt_cache_enabled(ch)))
+#endif
     {
         const int top = qwen36_max_ctx();
         int want = m->max_t;
@@ -9438,6 +9451,13 @@ static int q36_mtp_depth(Q36Spec *sp, int room, double *value) {
  * them; `more` is how many tokens the caller may still want after `tok`. The
  * returned buffer is the caller's (it may hold more rows past the first vocab). */
 static float *q36_spec_step(Model *m, Q36Spec *sp, int tok, int pos, int more) {
+#ifdef COLI_CUDA
+    Q36CChain *request_chain = g_cuda_chain ? q36cc_of(m) : NULL;
+    if (request_chain && request_chain->device_profile && !request_chain->failed && request_chain->request_phase == Q36CC_REQUEST_PREFILL) {
+        request_chain->request_phase = Q36CC_REQUEST_DECODE;
+        q36cc_set_permissions(request_chain, request_chain->decode_permissions);
+    }
+#endif
     Cfg *c = &m->c; int V = c->vocab;
     sp->tokens++;
     q36_spec_hist_push(sp, tok, pos);
@@ -9649,6 +9669,9 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     ensure_kv(m);
     m->kv_len = 0;
     for (int i = 0; i < np; i++) out[i] = prompt[i];
+#ifdef COLI_CUDA
+    Q36CChain *owned = q36cc_begin_if_idle(m, 0, np);
+#endif
     float *logit = step(m, prompt, np, 0);
     qt_stats_mark();   /* [qtier] stats also report the hit rate from here on */
     int len = np;
@@ -9672,6 +9695,9 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
           if (tm_on()) g_tm_step += tm_now()-_s0; }
     }
     q36_spec_end(m, sp);
+#ifdef COLI_CUDA
+    if (owned) q36cc_end_request(owned);
+#endif
 }
 
 static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out) {
@@ -9686,6 +9712,9 @@ static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out)
     ensure_kv(m);
     m->kv_len = 0;
     double nll = 0; int scored = 0;
+#ifdef COLI_CUDA
+    Q36CChain *owned = q36cc_begin_if_idle(m, 0, np);
+#endif
     float *logit = step(m, full, np, 0);
     for (int i = np; i < nfull; i++) {
         float mx = logit[0]; for (int v = 1; v < c->vocab; v++) if (logit[v] > mx) mx = logit[v];
@@ -9697,6 +9726,9 @@ static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out)
         logit = step(m, &full[i], 1, i);
     }
     if (logit) free(logit);
+#ifdef COLI_CUDA
+    if (owned) q36cc_end_request(owned);
+#endif
     *nll_out = nll / scored;
     return scored;
 }
@@ -10095,6 +10127,35 @@ static void q36_rewind(Model *m, int len) {
     if (m->kvp.len > len) m->kvp.len = len;
 }
 
+#ifdef COLI_CUDA
+static void q36cc_reserve_prompt_cache(Model *m, int need, int max_ctx) {
+    Q36CChain *ch = g_cuda_chain ? q36cc_of(m) : NULL;
+    m->max_t = need;
+    if (q36cc_prompt_cache_enabled(ch) && need > m->kv_cap) {
+        int step = m->kv_cap / 8 > 1024 ? m->kv_cap / 8 : 1024;
+        int cap = m->kv_cap ? ((m->kv_cap + step + 1023) / 1024) * 1024 : 2048;
+        if (cap < need) cap = ((need + (need / 8 > 1024 ? need / 8 : 1024) + 1023) / 1024) * 1024;
+        m->max_t = cap > max_ctx ? max_ctx : cap;
+    }
+    ensure_kv(m);
+}
+
+static int q36cc_reuses_live_prefix(Model *m, const int *ids, int np) {
+    if (!q36_3090_uses_exact_cache(m->kv_len, np - m->kv_len)) return 0;
+    int held = kv_prefix_reuse(&m->kvp, ids, np);
+    if (held != m->kv_len || !q36_ring_holds(m->ring_pos, m->kv_ring, held - m->c.window + 1, held) ||
+        coli_pin_best(&g_pins, ids, np) >= 0) return 0;
+    if (q36_ps_on(m)) {
+        for (int i = 0; i < g_q36_ps.nck; i++) {
+            const ColiPsCkpt *ck = &g_q36_ps.ck[i];
+            int len = ck->depth * g_q36_ps.B + ck->tail;
+            if (ck->live && len > held + coli_ps_min_gain(&g_q36_ps) && len < np) return 0;
+        }
+    }
+    return 1;
+}
+#endif
+
 /* A request's prompt into the conversation the Model holds: its tokens and image,
  * the budget, ACCEPT, the prefix reuse and the pins, the prefill and its read-out.
  * 1 with the prompt's ids and the logits after it; 0 when the request ended here,
@@ -10148,10 +10209,22 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     }
     printf("ACCEPT %s %d\n",q->id,np); fflush(stdout);
     q36_park_decide(m, ids, np, q->max_tok);   /* a conversation parked by the last request: back, kept or dropped */
-    m->max_t = np + q->max_tok;
-    /* Grow the cache BEFORE deciding, so the decision sees the state that will
-     * actually be there: ensure_kv preserves both the rows and the record. */
+    int need = np + q->max_tok;
+    m->max_t = need;
+#ifdef COLI_CUDA
+    Q36CChain *request_chain = g_cuda_chain ? q36cc_of(m) : NULL;
+    const int select_live_cache = request_chain && request_chain->device_profile == Q36_GPU_3090 && !q->pin && !q->logprobs &&
+                             !m->vis_rows_n && !kv_prefix_off();
+    const int defer_cache_growth = request_chain && q36_has_request_rules(request_chain->device_profile) && !request_chain->failed && m->K != NULL;
+    if (defer_cache_growth) m->max_t = m->kv_cap;
+    else {
+        int direct = select_live_cache && q36cc_reuses_live_prefix(m, ids, np) ? m->kv_len : 0;
+        q36cc_begin_request(request_chain, direct, np - direct, direct != 0);
+        q36cc_reserve_prompt_cache(m, need, max_ctx);
+    }
+#else
     ensure_kv(m);
+#endif
     /* A chat client resends the whole transcript every turn. If this prompt
      * begins with the ids the current state was built from, that state already
      * IS the state at those positions: prefill only the tail. Either the reused
@@ -10245,6 +10318,17 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
      * The pin path above is untouched -- a photograph carries the logits for the position
      * that follows it, so it still resumes. */
     if (g_echo_k > 0 && !g_pin_use_logit) reuse = 0;
+#ifdef COLI_CUDA
+    int reused_tokens = !reuse && !g_pin_use_logit ? rewind : reuse;
+    q36cc_begin_request(request_chain, reused_tokens, np - reused_tokens, select_live_cache);
+    if (defer_cache_growth) {
+        q36cc_reserve_prompt_cache(m, need, max_ctx);
+        if (reused_tokens > m->kvp.len) {
+            reuse = rewind = g_pin_use_logit = 0; pes_logit = NULL;
+            q36cc_begin_request(request_chain, 0, np, 0);
+        }
+    }
+#endif
     if (!reuse) {
         q36_park(m, np, q->max_tok);   /* a short request keeps the conversation (q36_unpark) */
         if (rewind > 0 && !g_pin_use_logit) {
@@ -10329,6 +10413,9 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
         if(prefill_control == Q36_CONTROL_CANCEL) printf("ERROR %s CANCELLED\n",q->id);
         else printf("DONE %s STAT 0 0.000 0.0 %.2f %d 0\n",q->id,rss_gb(),np);
         fflush(stdout);
+#ifdef COLI_CUDA
+        q36cc_end_request(request_chain);
+#endif
         free(ids);
         return 0;
     }
@@ -10382,7 +10469,11 @@ static void serve_one_turn(Model *m, ServeReq *q){
         if(control == Q36_CONTROL_STOP){ limited=0; break; }
         if(control == Q36_CONTROL_CANCEL){
             free(lo); lo=NULL;
-            q36_spec_end(m, &spec); q36_spec_free(&spec);   /* the state of the tokens fed, drafts undone */
+            q36_spec_end(m, &spec);
+#ifdef COLI_CUDA
+            q36cc_end_request(q36cc_of(m));
+#endif
+            q36_spec_free(&spec);   /* the state of the tokens fed, drafts undone */
             if(sbn>0) serve_data(q->id,(char*)sbuf,sbn);
             printf("ERROR %s CANCELLED\n",q->id); fflush(stdout);
             free(ids);
@@ -10396,6 +10487,9 @@ static void serve_one_turn(Model *m, ServeReq *q){
     }
     q36_pes_commit(m);   /* a turn that ended on its first token (an EOS) */
     q36_spec_end(m, &spec);
+#ifdef COLI_CUDA
+    q36cc_end_request(q36cc_of(m));
+#endif
     forwards += (int)spec.forwards;
     if(sbn>0) serve_data(q->id,(char*)sbuf,sbn);   /* flush trailing partial UTF-8 */
     free(lo); free(ids);
@@ -12047,7 +12141,8 @@ int main(int argc, char **argv) {
          * per-layer step below is not set up beside it. */
         int chain_up = 0;
 #ifdef COLI_CUDA
-        if (q36cc_env_on() && q36cc_setup(&m, g_q36_mux_slots)) { g_cuda_chain = 1; chain_up = 1; atexit(cc_shutdown); }
+        const Q36Checkpoint profile_checkpoint = q36_qualified_checkpoint(snap);
+        if (q36cc_env_on() && q36cc_setup(&m, g_q36_mux_slots, &profile_checkpoint)) { g_cuda_chain = 1; chain_up = 1; atexit(cc_shutdown); }
 #endif
         if (!chain_up && dn_gpu_env_on()) {
             int n = 0; double vram = 0;
@@ -12072,6 +12167,9 @@ int main(int argc, char **argv) {
          * loading all RAM slots along the way. */
         const char *nws = getenv("QT_NO_WARMSTART");
         if (!(nws && *nws=='1') && qt_experts_on()) tier_warmstart(&m, expert_is_int4);
+#ifdef COLI_CUDA
+        if (chain_up) q36cc_warmstart(&m);
+#endif
     }
 
 #ifdef COLI_VULKAN

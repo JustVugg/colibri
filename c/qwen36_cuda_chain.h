@@ -47,6 +47,10 @@
  * (q36cc_recover, as q36c_recover). COLI_CUDA_CHAIN_FAULT=n fakes it at the n-th
  * frame, for the tests. */
 #include "cuda_chain.h"
+#include "qwen36_cuda_profile.h"
+#include "qwen36_cuda_checkpoint.h"
+
+enum { Q36CC_REQUEST_IDLE, Q36CC_REQUEST_PREFILL, Q36CC_REQUEST_DECODE };
 
 #define Q36CC_HOST 0
 #define Q36CC_DEV  1
@@ -65,10 +69,13 @@ typedef struct {
 #define Q36CC_PROMO_WIN 64     /* decode steps the brake looks back on (q36cc_promote) */
 typedef struct {
     int ok, failed;
+    unsigned prefill_permissions, decode_permissions, active_permissions;
+    int request_phase;
+    int device_profile;   /* the selected Q36_GPU_* for this model and CUDA device */
     int dev;                                   /* the CUDA ordinal every matrix sits on */
     int n, head;                               /* every layer, and lm_head, on the device */
     int rows;                                  /* scratch capacity in rows */
-    int cap;                                   /* the host's kv_cap the mirrors follow */
+    int cap, host_cap;                         /* the host's kv_cap the mirrors follow */
     CcBuf *prm;                                /* every norm / conv / DeltaNet parameter */
     size_t *o_in, *o_post, *o_qn, *o_kn, *o_conv, *o_dn, o_final;
     size_t *o_snk;                             /* Flint: a layer's sink logits in prm */
@@ -145,6 +152,40 @@ typedef struct {
 static int g_cuda_chain = 0;     /* COLI_CUDA_CHAIN asked for it and the chain is up */
 static Q36CChain *q36cc_of(Model *m) { return (Q36CChain *)m->cchain; }
 static int q36cc_dm_able(Q36CChain *ch, Model *m);
+static void q36cc_set_permissions(Q36CChain *ch, unsigned mask) {
+    if (ch->active_permissions == mask) return;
+    ch->active_permissions = mask;
+    cc_set_kernel_mask(mask);
+}
+static int q36cc_permits(const Q36CChain *ch, unsigned feature) {
+    if (!ch || !ch->device_profile) return 0;
+    const unsigned mask = ch->request_phase ? ch->active_permissions : q36_default_features(ch->device_profile);
+    return (mask & feature) != 0;
+}
+static int q36cc_prompt_cache_enabled(const Q36CChain *ch) {
+    return q36cc_permits(ch, Q36_PROMPT_CACHE);
+}
+static void q36cc_begin_request(Q36CChain *ch, int reused, int fresh, int cache3090) {
+    if (!ch || !ch->device_profile || ch->failed) return;
+    const int cold = ch->frames == 0;
+    ch->request_phase = Q36CC_REQUEST_PREFILL;
+    ch->prefill_permissions = q36_request_features(ch->device_profile, reused, fresh, cold, 0, cache3090);
+    ch->decode_permissions = q36_request_features(ch->device_profile, reused, fresh, cold, 1, cache3090);
+    q36cc_set_permissions(ch, ch->prefill_permissions);
+}
+/* Single forwards release only the request phase they opened. */
+static Q36CChain *q36cc_begin_if_idle(Model *m, int reused, int fresh) {
+    Q36CChain *ch = g_cuda_chain ? q36cc_of(m) : NULL;
+    if (!ch || !ch->device_profile || ch->failed || ch->request_phase) return NULL;
+    q36cc_begin_request(ch, reused, fresh, 0);
+    return ch;
+}
+static void q36cc_end_request(Q36CChain *ch) {
+    if (!ch || !ch->device_profile || ch->failed) return;
+    ch->request_phase = Q36CC_REQUEST_IDLE;
+    q36cc_set_permissions(ch, q36_default_features(ch->device_profile));
+}
+
 
 /* on unless COLI_CUDA_CHAIN=0: the chain took 34 -> 59 tok/s of decode on Qwen3.6-35B int4-g64, 85 with its
  * routed experts in the frame (an RTX PRO 4000); q36cc_setup declines where it cannot run */
@@ -165,7 +206,11 @@ static void q36cc_recover(Model *m, int upto) {
     Q36CChain *ch = q36cc_of(m);
     Cfg *c = &m->c; int D = c->hidden;
     g_cuda_chain = 0;
-    if (ch) { ch->failed = 1; ch->dn_where = Q36CC_HOST; ch->host_zero = 0; ch->snap_valid = 0; }
+    if (ch) {
+        if (ch->device_profile) cc_select_qwen36_profile(0);
+        ch->device_profile = Q36_GPU_NONE;
+        ch->failed = 1; ch->dn_where = Q36CC_HOST; ch->host_zero = 0; ch->snap_valid = 0;
+    }
     for (int i = 0; i < c->n_layers; i++) {
         if (c->is_attn[i]) continue;
         memset(m->DN_rec[i], 0, q36_rec_cells(c) * sizeof(float));
@@ -332,7 +377,7 @@ static void q36cc_free_own(Q36CChain *ch, Model *m) {
 /* The chain on the device, at startup after the tier placed the trunk: every layer's
  * matrices found on one device, the parameter arena, the chain's own small tensors and
  * the DeltaNet state. NULL = the chain cannot run (the message says why). */
-static Q36CChain *q36cc_setup(Model *m, int mux_slots) {
+static Q36CChain *q36cc_setup(Model *m, int mux_slots, const Q36Checkpoint *checkpoint) {
     Cfg *c = &m->c; int L = c->n_layers, D = c->hidden;
     if (m->cchain) return ((Q36CChain *)m->cchain)->ok ? (Q36CChain *)m->cchain : NULL;
     if (!cc_available()) { fprintf(stderr, "[chain] qwen36: the CUDA backend has no chain (an older DLL); the per-matrix path\n"); return NULL; }
@@ -432,6 +477,13 @@ static Q36CChain *q36cc_setup(Model *m, int mux_slots) {
 #undef Q36CC_TAKE
     ch->head = 1;
     if (!cc_init(ch->dev)) { fprintf(stderr, "[chain] qwen36: the chain's context on device %d did not come up\n", ch->dev); return NULL; }
+    const char *draft = getenv("COLI_DFLASH"), *mtp = getenv("Q36_MTP");
+    ch->device_profile = cc_select_qwen36_profile(!g_gguf && g_expert_is_int4 && c->expert_gs == 64 && !c->muse && !c->lfm3 &&
+                              D == 2048 && L == 40 && c->n_experts == 256 && c->topk == 8 && c->inter == 512 &&
+                              c->q_heads == 16 && c->kv_heads == 2 && c->head_dim == 256 && c->k_head_dim == 256 &&
+                              mux_slots <= 1 && !(draft && *draft) && !(mtp && !strcmp(mtp, "1")) &&
+                              cc_probe_qwen36_profile() && q36_checkpoint_matches(&m->S, checkpoint));
+    q36cc_end_request(ch);
     /* the parameter arena: offsets, then one upload */
     size_t np = 0;
     int vh = c->dn_vheads, conv_dim = c->dn_conv_dim, convk = c->dn_convk;
@@ -454,7 +506,7 @@ static Q36CChain *q36cc_setup(Model *m, int mux_slots) {
     }
     ch->o_final = np; np += D;
     float *arena = calloc(np, sizeof(float));
-    if (!arena) return NULL;
+    if (!arena) { if (ch->device_profile) cc_select_qwen36_profile(0); return NULL; }
     for (int i = 0; i < L; i++) {
         Layer *l = &m->L[i];
         memcpy(arena + ch->o_in[i], l->in_ln, D * sizeof(float));
@@ -529,6 +581,7 @@ static Q36CChain *q36cc_setup(Model *m, int mux_slots) {
     if (!ok) {
         fprintf(stderr, "[chain] qwen36: device memory for the chain's parameters refused; the per-matrix path\n");
         q36cc_free_own(ch, m);
+        if (ch->device_profile) cc_select_qwen36_profile(0);
         return NULL;
     }
     ch->n = L;
@@ -595,8 +648,9 @@ static int q36cc_kv_up(CcBuf *dst, size_t at, const void *base, int64_t idx, siz
  * reads one (cc_attn_wr; an older backend: a mirror of the cache's length, filled from the
  * host's ring): position t in row t % ring on both sides. 0 for a full layer. */
 static int q36cc_ring(Model *m, int i) { return cc_attn_wr_ready() && q36_kv_rows(m, i) != m->max_t ? m->kv_ring : 0; }
-/* the KV mirrors at the host's capacity (a cache that grew is mirrored again) */
-static int q36cc_mirror(Q36CChain *ch, Model *m) {
+#define Q36CC_CONV_ROWS 2048
+/* Reallocate at the host capacity. The caller reloads valid KV rows after a resize. */
+static int q36cc_mirror_exact(Q36CChain *ch, Model *m) {
     Cfg *c = &m->c; int KV = c->kv_heads;
     if (ch->cap != m->kv_cap) {
         for (int i = 0; i < c->n_layers; i++) {
@@ -615,6 +669,72 @@ static int q36cc_mirror(Q36CChain *ch, Model *m) {
         }
         ch->cap = m->kv_cap;
     }
+    return 1;
+}
+static int q36cc_mirror(Q36CChain *ch, Model *m) {
+    if (!q36cc_prompt_cache_enabled(ch)) return q36cc_mirror_exact(ch, m);
+    if (ch->cap > 0 && ch->host_cap == m->kv_cap && ch->cap >= m->kv_cap) return 1;
+    Cfg *c = &m->c; int KV = c->kv_heads, hd = c->k_head_dim;
+    const int top = qwen36_max_ctx() > m->kv_cap ? qwen36_max_ctx() : m->kv_cap;
+    int need = m->kv_cap > Q36CC_CONV_ROWS ? m->kv_cap : Q36CC_CONV_ROWS;
+    if (need > top) need = top;
+    int cap = ch->cap;
+    if (cap < need) {
+        cap = need + (need / 8 > 1024 ? need / 8 : 1024);
+        cap = (cap + 1023) / 1024 * 1024;
+        if (cap > top) cap = top;
+    }
+    CcBuf *old[256]; int n_old = 0, in_f = 0;
+    for (int i = 0; i < c->n_layers; i++) {
+        if (!c->is_attn[i]) continue;
+        int R = q36cc_ring(m, i), rows = R ? R : cap;
+        if (ch->kc[i] && ch->vc[i] && ch->kv_rows[i] == rows) continue;
+        size_t bytes = (size_t)KV * rows * hd * q36cc_kves();
+        CcBuf *kc = cc_buf(bytes, CC_DEV), *vc = cc_buf(bytes, CC_DEV);
+        if ((!kc || !vc) && n_old > 0) {
+            cc_free(kc); cc_free(vc);
+            if (in_f) { if (!cc_submit(1)) { while (n_old > 0) cc_free(old[--n_old]); ch->cap = 0; return 0; } in_f = 0; }
+            while (n_old > 0) cc_free(old[--n_old]);
+            kc = cc_buf(bytes, CC_DEV); vc = cc_buf(bytes, CC_DEV);
+        }
+        if (!kc || !vc) {
+            cc_free(kc); cc_free(vc);
+            if (in_f) cc_submit(1);
+            while (n_old > 0) cc_free(old[--n_old]);
+            ch->cap = 0; return 0;
+        }
+        int valid = !R && ch->kc[i] && ch->vc[i] ? ch->kv_valid[i] : 0, ostride = ch->kv_rows[i];
+        if (valid > ostride) valid = ostride;
+        if (valid > rows) valid = rows;
+        int ok = 1;
+        /* the tensor cores' attention reads whole blocks of keys and masks the window's
+         * outside: in a ring those rows are other positions', or never written */
+        if (R) ok = cc_zero(kc, 0, bytes / sizeof(float)) && cc_zero(vc, 0, bytes / sizeof(float));
+        else if (valid > 0) {
+            CcRegion rk[64], rv[64];
+            for (int h = 0; h < KV; h++)
+                rk[h] = rv[h] = (CcRegion){(size_t)h * rows * hd, (size_t)h * ostride * hd, (size_t)valid * hd};
+            if (!in_f) { ok = cc_begin(); in_f = ok; }
+            ok = ok && q36cc_kv_copy(kc, ch->kc[i], rk, KV) && q36cc_kv_copy(vc, ch->vc[i], rv, KV);
+        }
+        if (ch->kc[i]) old[n_old++] = ch->kc[i];
+        if (ch->vc[i]) old[n_old++] = ch->vc[i];
+        ch->kc[i] = kc; ch->vc[i] = vc;
+        ch->kv_valid[i] = ok ? valid : 0;
+        ch->kv_rows[i] = rows;
+        if (!ok) {
+            if (in_f) cc_submit(1);
+            while (n_old > 0) cc_free(old[--n_old]);
+            ch->cap = 0; return 0;
+        }
+    }
+    if (in_f && !cc_submit(1)) {
+        while (n_old > 0) cc_free(old[--n_old]);
+        for (int i = 0; i < c->n_layers; i++) ch->kv_valid[i] = 0;
+        ch->cap = 0; return 0;
+    }
+    while (n_old > 0) cc_free(old[--n_old]);
+    ch->cap = cap; ch->host_cap = m->kv_cap;
     return 1;
 }
 static int q36cc_scratch(Q36CChain *ch, Model *m, int rows) {
@@ -700,7 +820,6 @@ static void q36cc_conv_free(Model *m, Q36ccConv *v) {
     free(v->rec); free(v->ring); free(v->kc); free(v->vc); free(v->kv_valid); free(v->kv_rows);
     memset(v, 0, sizeof *v); v->slot = -1;
 }
-#define Q36CC_CONV_ROWS 2048
 static size_t q36cc_conv_kv_bytes(Model *m, int cap) {
     Cfg *c = &m->c; size_t b = 0;
     for (int i = 0; i < c->n_layers; i++)
@@ -1987,6 +2106,31 @@ static int q36cc_rows_max(Q36CChain *ch, Model *m) {
     return ch->rows_max = r;
 }
 
+/* Pre-allocate the prompt chunk scratch, routed expert table, and initial KV mirrors
+ * after expert-tier initialization to avoid allocating them in the first request. */
+static void q36cc_warm_buffers(Model *m) {
+    if (!g_cuda_chain || qq_active() || g_pilot) return;
+    Q36CChain *ch = q36cc_of(m);
+    if (!ch || !ch->ok || ch->failed || !ch->device_profile) return;
+    int CH = q36cc_rows_max(ch, m);
+    if (!q36cc_mirror(ch, m) || !q36cc_scratch(ch, m, CH)) return;
+    if (m->c.n_experts > 0 && ch->dm_on) {
+        q36cc_dm_begin(ch, m, 1);
+        q36cc_dm_end(ch);
+    }
+}
+static void q36cc_warmstart(Model *m) {
+    Q36CChain *ch = q36cc_of(m);
+    if (!g_cuda_chain || !ch || !ch->ok || ch->failed || !ch->device_profile) return;
+    const unsigned buffers = Q36_PROMPT_CACHE | Q36_ASYNC_COPIES | Q36_ACTIVATION_CACHE |
+                             Q36_DNREC | Q36_EXPERT_MATMUL;
+    ch->request_phase = Q36CC_REQUEST_PREFILL;
+    q36cc_set_permissions(ch, q36_device_features(ch->device_profile) & buffers);
+    q36cc_warm_buffers(m);
+    q36cc_end_request(ch);
+}
+
+
 /* Room for the KV mirrors at cap positions, and beside them for a prompt chunk: its scratch where
  * not yet allocated, the host pool's staging where not yet allocated, and Q36CC_KV_MARGIN for the
  * driver (a kernel's first launch loads its code into device memory). Where the device lacks it,
@@ -2033,9 +2177,20 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
         }
         if (!mirror_ok) { q36cc_pool_off(ch, m); mirror_ok = q36cc_mirror(ch, m); }
     } else if (!ch->mx_rows) {
-        if (ch->cap != m->kv_cap) q36cc_mirror_room(ch, m, m->kv_cap, q36cc_mirror_held(ch, m));
+        if (!q36cc_prompt_cache_enabled(ch) && ch->cap != m->kv_cap)
+            q36cc_mirror_room(ch, m, m->kv_cap, q36cc_mirror_held(ch, m));
         mirror_ok = q36cc_mirror(ch, m);
-        if (!mirror_ok && q36cc_stage_drop(ch)) mirror_ok = q36cc_mirror(ch, m);   /* the staging's memory to the mirrors */
+        if (!mirror_ok && q36cc_prompt_cache_enabled(ch) && !cc_lost()) {
+            /* Growth with slack keeps the valid rows on the card. Under memory pressure,
+             * the host's current rows allow the exact-size mirror to replace one layer at a time. */
+            q36cc_mirror_room(ch, m, m->kv_cap, q36cc_mirror_held(ch, m));
+            mirror_ok = q36cc_mirror_exact(ch, m);
+            if (mirror_ok) ch->host_cap = m->kv_cap;
+        }
+        if (!mirror_ok && !cc_lost() && q36cc_stage_drop(ch)) {
+            mirror_ok = q36cc_mirror_exact(ch, m);
+            if (mirror_ok) ch->host_cap = m->kv_cap;
+        }
     }
     /* the scratch for a power of two of rows (from 64, at most a chunk's): sized to the rows
      * exactly, every prompt longer than any before regrew some thirty device and page-locked
@@ -2049,6 +2204,8 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
                          !cc_reserve(&ch->outd, (size_t)nlogits * c->vocab * sizeof(float), CC_DOWN)))) {
         fprintf(stderr, "[chain] qwen36: device memory for %d rows refused; the per-matrix path\n", rows);
         ch->failed = 1;
+        if (ch->device_profile) cc_select_qwen36_profile(0);
+        ch->device_profile = Q36_GPU_NONE;
         if (ch->conv) q36cc_mux_drop(m);   /* the conversations' states the device holds, to the host */
         return 0;
     }

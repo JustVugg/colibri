@@ -493,6 +493,21 @@ typedef struct ColiCudaChainOps {
     int  (*fetch_done_at)(int bank);
     /* ink2_caps: what the backend takes of Inkling-2-Mini's chain (CC_INK2_*) */
     int  (*ink2_caps)(void);
+    /* ew_norm: an ADD or a COMBINE ew (pe) into y, then y's rows normalised into yn (pn: a
+     * segment a row, x = y): a step's residual sum and the norm after it in one launch, the
+     * bits of ew and norm (qwen36_cuda_chain.h); absent: those two */
+    int  (*ew_norm)(CcBuf *y, CcBuf *a, CcBuf *b, CcBuf *c, CcBuf *e, const CcEw *pe, CcBuf *w, CcBuf *yn, const CcNorm *pn);
+    /* matmul_swiglu: gate (tg) and up (tu) on S rows of x at xo, then silu(g) * u into y at yo
+     * in one launch, the bits of two matmuls and CC_EW_SWIGLU (qwen36_cuda_chain.h); absent: those three */
+    int  (*matmul_swiglu)(ColiCudaTensor *tg, ColiCudaTensor *tu, CcBuf *x, size_t xo, CcBuf *y, size_t yo, int S);
+    /* Select the certified Qwen3.6 path if the current model and device qualify.
+     * Chain initialization and shutdown clear the selection. Returns the active profile ID, or zero. */
+    int  (*select_qwen36_profile)(int enable);
+    void (*set_kernel_mask)(unsigned mask);
+    /* Reserved for the packed native INT8 operation in the extended table. */
+    int (*swiglu_pair_codes)(ColiCudaTensor *g, ColiCudaTensor *u, CcBuf *x, CcBuf *y, int S);
+    /* Report the current device's profile without enabling it. */
+    int (*probe_qwen36_profile)(void);
 } ColiCudaChainOps;
 #define CC_INK2_MOE      1   /* cc_moe's act 1, esc_off, planar 2 entries and NVFP4 (fmt 140) in a decode step's rows */
 #define CC_INK2_LOOPGATE 2   /* cc_ew's CC_EW_LOOPGATE */
@@ -818,6 +833,22 @@ static inline int cc_ink2_caps(void) {
 }
 static inline int cc_fetch_wait_at(int bank) { return cc_fetch_at_ready() ? cc_ops()->fetch_wait_at(bank) : 0; }
 static inline int cc_fetch_done_at(int bank) { return cc_fetch_at_ready() ? cc_ops()->fetch_done_at(bank) : 0; }
+static inline int cc_select_qwen36_profile(int enable) {
+    const ColiCudaChainOps *t = cc_ops();
+    if (!t || t->size < offsetof(ColiCudaChainOps, set_kernel_mask) + sizeof t->set_kernel_mask ||
+        !t->select_qwen36_profile || !t->set_kernel_mask) return 0;
+    return t->select_qwen36_profile(enable);
+}
+static inline int cc_probe_qwen36_profile(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, probe_qwen36_profile) + sizeof t->probe_qwen36_profile
+        && t->probe_qwen36_profile ? t->probe_qwen36_profile() : 0;
+}
+static inline void cc_set_kernel_mask(unsigned mask) {
+    const ColiCudaChainOps *t = cc_ops();
+    if (t && t->size >= offsetof(ColiCudaChainOps, set_kernel_mask) + sizeof t->set_kernel_mask &&
+        t->set_kernel_mask) t->set_kernel_mask(mask);
+}
 #endif
 
 #ifdef __cplusplus
