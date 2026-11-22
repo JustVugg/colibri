@@ -501,6 +501,30 @@ def vulkan_loader_present():
 # at run time, and macOS has no ldd: without these a working Metal build read as
 # "GPU detected but the engine is CPU-only" (#2921).
 _METAL_MARKERS = (b"[metal] pipeline failed", b"[metal] shader compile failed")
+# Metal is switched on at run time, and not the same way in every engine: qwen36's
+# Metal graph (qwen36_metal.m, whose messages are these) is on unless COLI_METAL=0;
+# colibri, glm53 and inkling need COLI_METAL=1, Kimi K3 K3_METAL=1 (kimi_k3.c's own
+# "[K3-METAL]" messages; the name K3_METAL itself is in every engine, through
+# coli_env.h's table).
+_METAL_ON_BY_DEFAULT = b"[qwen36-metal]"
+_METAL_K3_SWITCH = b"[K3-METAL]"
+
+
+def _atoi(value):
+    """C's atoi() of an environment value, as the engines read their switches."""
+    match = re.match(r"\s*([+-]?\d+)", value or "")
+    return int(match.group(1)) if match else 0
+
+
+def metal_active(linkage, env=None):
+    """Whether a Metal engine (cuda_linkage's "metal") runs on the GPU with this
+    environment, and the variable that decides it."""
+    env = os.environ if env is None else env
+    switch = linkage.get("metal_switch") or "COLI_METAL"
+    value = env.get(switch)
+    if linkage.get("metal_default"):
+        return (value is None or _atoi(value) != 0), switch
+    return _atoi(value) != 0, switch
 
 
 def cuda_linkage(engine_path):
@@ -522,7 +546,9 @@ def cuda_linkage(engine_path):
         present = vulkan_loader_present()
         return {"linked": present, "missing": not present, "vulkan": True}
     if any(marker in image for marker in _METAL_MARKERS):
-        return {"linked": True, "missing": False, "metal": True}
+        return {"linked": True, "missing": False, "metal": True,
+                "metal_default": _METAL_ON_BY_DEFAULT in image,
+                "metal_switch": "K3_METAL" if _METAL_K3_SWITCH in image else "COLI_METAL"}
     return state
 
 
@@ -725,14 +751,23 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
                              devices=[gpu["index"] for gpu in selected_gpus]))
     elif linkage.get("metal") and linkage.get("linked"):
         metal = [gpu for gpu in selected_gpus if gpu.get("backend") == "metal"]
-        if metal:
-            checks.append(_check("accelerator.gpu", "pass",
-                                 "Metal engine; the Apple GPU is available (unified memory)",
-                                 devices=[gpu["index"] for gpu in metal], unified=True))
-        else:
+        on, switch = metal_active(linkage)
+        if not metal:
             checks.append(_check("accelerator.gpu", "warn",
                                  "the engine is a Metal build but no Metal GPU was detected; "
                                  "it runs on the CPU"))
+        elif on:
+            checks.append(_check("accelerator.gpu", "pass",
+                                 "Metal engine on the Apple GPU (unified memory)",
+                                 devices=[gpu["index"] for gpu in metal], unified=True,
+                                 switch=switch))
+        else:
+            # a Metal build that this environment leaves on the CPU, as the engine will
+            how = (f"{switch}=0 keeps it on the CPU" if linkage.get("metal_default")
+                   else f"{switch}=1 runs it on the Apple GPU")
+            checks.append(_check("accelerator.gpu", "warn",
+                                 f"Metal engine, but it runs on the CPU here: {how}",
+                                 devices=[gpu["index"] for gpu in metal], switch=switch))
     elif selected_gpus and linkage.get("missing"):
         checks.append(_check("accelerator.gpu", "fail", "GPU runtime library is missing"))
     elif selected_gpus and linkage.get("linked"):
@@ -758,10 +793,12 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
         plan_gpus = detected_gpus if cuda else []
         plan_gpu_indices = gpu_indices if cuda else []
         plan_vram_gb = vram_gb if cuda else 0
-        if linkage.get("metal") and linkage.get("linked") and gpu_indices != []:
-            # a Metal engine: the Apple GPU as the planner knows it (identity only, unified
-            # memory, no VRAM budget to spend: resource_plan._discover_metal_gpus), so the
-            # plan reads "Metal ... unified memory" and takes the Metal tuning (#2921)
+        if (linkage.get("metal") and linkage.get("linked") and gpu_indices != []
+                and metal_active(linkage)[0]):
+            # a Metal engine that runs on the GPU here: the Apple GPU as the planner knows
+            # it (identity only, unified memory, no VRAM budget to spend:
+            # resource_plan._discover_metal_gpus), so the plan's device line reads
+            # "Metal ... unified memory" instead of a CPU-only plan (#2921)
             plan_gpus = [gpu for gpu in detected_gpus if gpu.get("backend") == "metal"]
             plan_gpu_indices = gpu_indices
         # a Vulkan engine: the plan of a COLI_VULKAN=1 run (the dense weights on the device,
