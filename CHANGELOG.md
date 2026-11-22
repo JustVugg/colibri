@@ -5,6 +5,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`coli doctor` recognises a Metal engine.** A `METAL=1` build links Metal.framework rather than
+  loading a GPU runtime, and macOS has no `ldd`, so doctor found no GPU runtime and reported "GPU
+  detected but the engine is CPU-only" for a qwen36 that ran its Metal graph (an M5 Air and an M2
+  mini). It now reads the messages `backend_metal.o` compiles into every Metal engine: the GPU check
+  passes ("Metal engine; the Apple GPU is available"), the plan shows the Apple GPU as unified
+  memory with no VRAM budget, and a Metal build on a Mac with no Metal GPU found says so. (#2921)
+
 ## [2.2.0] - 2026-11-21
 
 ### New

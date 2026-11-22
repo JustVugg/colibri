@@ -159,6 +159,45 @@ class DoctorTest(unittest.TestCase):
         report = self.report(gpu_indices=None, linkage={"linked": False, "missing": True, "vulkan": True})
         self.assertEqual(self.checks_by_id(report)["accelerator.gpu"]["status"], "fail")
 
+    def test_metal_engine_is_a_gpu_engine(self):
+        """#2921: a METAL=1 engine links Metal.framework and macOS has no ldd, so doctor
+        found no GPU runtime and called a working Metal build "GPU detected but the
+        engine is CPU-only". backend_metal.o's messages in the binary say what it is;
+        the plan shows the Apple GPU as unified memory, not CUDA's VRAM."""
+        self.engine.write_bytes(b"\xcf\xfa\xed\xfe ... [metal] pipeline failed\n ... [qwen36-metal]")
+        self.engine.chmod(0o755)
+        with mock.patch("doctor._runtime_linkage", return_value={"linked": False, "missing": False}):
+            self.assertEqual(cuda_linkage(self.engine), {"linked": True, "missing": False, "metal": True})
+            self.engine.write_bytes(b"\xcf\xfa\xed\xfe ... [metal] shader compile failed: %s\n")
+            self.assertEqual(cuda_linkage(self.engine), {"linked": True, "missing": False, "metal": True})
+            # neither marker nor a Vulkan loader: a CPU build, as before
+            self.engine.write_bytes(b"\xcf\xfa\xed\xfe ... [OMP] ...")
+            self.assertEqual(cuda_linkage(self.engine), {"linked": False, "missing": False})
+        apple = {"index": 0, "name": "Apple M5", "total_bytes": 0, "free_bytes": None,
+                 "unified_memory": True, "backend": "metal"}
+        metal = {"linked": True, "missing": False, "metal": True}
+        report = self.report(gpu_indices=None, gpus=[apple], linkage=metal)
+        check = self.checks_by_id(report)["accelerator.gpu"]
+        self.assertEqual(check["status"], "pass")
+        self.assertIn("Metal", check["summary"])
+        self.assertNotIn("CPU-only", check["summary"])
+        self.assertEqual(check["details"], {"devices": [0], "unified": True})
+        from resource_plan import format_plan
+        self.assertIn("Metal  0:Apple M5 · unified memory", format_plan(report["plan"]))
+        self.assertEqual(report["plan"]["tiers"]["vram"]["budget_bytes"], 0)
+        # --gpu none on a Metal build: no GPU, and a CPU plan
+        report = self.report(gpu_indices=[], gpus=[apple], linkage=metal)
+        self.assertEqual(self.checks_by_id(report)["accelerator.gpu"]["status"], "skip")
+        self.assertEqual(report["plan"]["tiers"]["vram"]["devices"], [])
+        # a Metal build where no Metal GPU was found says so rather than passing
+        report = self.report(gpu_indices=None, gpus=[], linkage=metal)
+        check = self.checks_by_id(report)["accelerator.gpu"]
+        self.assertEqual(check["status"], "warn")
+        self.assertIn("no Metal GPU", check["summary"])
+        # a CPU build on the same Mac keeps its warning
+        report = self.report(gpu_indices=None, gpus=[apple])
+        self.assertIn("CPU-only", self.checks_by_id(report)["accelerator.gpu"]["summary"])
+
     def test_vulkan_engine_gpu_index_is_the_vulkan_device(self):
         """#2127: on a Vulkan build --gpu 1 is Vulkan device 1, the one COLI_VK_DEV=1
         opens. doctor checked it against the CUDA inventory and sized the plan from the

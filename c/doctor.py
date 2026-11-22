@@ -496,10 +496,18 @@ def vulkan_loader_present():
                   "/usr/local/lib"))
 
 
+# What backend_metal.o compiles into every METAL=1 engine (backend_metal.mm's
+# coli_metal_init messages, outside any #if). Metal.framework is linked, not loaded
+# at run time, and macOS has no ldd: without these a working Metal build read as
+# "GPU detected but the engine is CPU-only" (#2921).
+_METAL_MARKERS = (b"[metal] pipeline failed", b"[metal] shader compile failed")
+
+
 def cuda_linkage(engine_path):
     """Return the engine's GPU linkage state without loading the executable or a GPU
     runtime: its CUDA/HIP runtime, else (a VK=1 build) the Vulkan loader it opens,
-    reported with "vulkan": True."""
+    reported with "vulkan": True, else (a METAL=1 build) "metal": True. Metal is part
+    of macOS, so a Metal build is never missing its runtime."""
     engine = Path(engine_path)
     if not engine.is_file():
         return {"linked": False, "missing": False}
@@ -513,6 +521,8 @@ def cuda_linkage(engine_path):
     if any(name in image for name in _VULKAN_LOADER_NAMES):
         present = vulkan_loader_present()
         return {"linked": present, "missing": not present, "vulkan": True}
+    if any(marker in image for marker in _METAL_MARKERS):
+        return {"linked": True, "missing": False, "metal": True}
     return state
 
 
@@ -713,6 +723,16 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
         checks.append(_check("accelerator.gpu", "pass", "Vulkan engine; the loader is installed "
                              "(COLI_VULKAN=1 runs the expert tier and the dense chain on the GPU)",
                              devices=[gpu["index"] for gpu in selected_gpus]))
+    elif linkage.get("metal") and linkage.get("linked"):
+        metal = [gpu for gpu in selected_gpus if gpu.get("backend") == "metal"]
+        if metal:
+            checks.append(_check("accelerator.gpu", "pass",
+                                 "Metal engine; the Apple GPU is available (unified memory)",
+                                 devices=[gpu["index"] for gpu in metal], unified=True))
+        else:
+            checks.append(_check("accelerator.gpu", "warn",
+                                 "the engine is a Metal build but no Metal GPU was detected; "
+                                 "it runs on the CPU"))
     elif selected_gpus and linkage.get("missing"):
         checks.append(_check("accelerator.gpu", "fail", "GPU runtime library is missing"))
     elif selected_gpus and linkage.get("linked"):
@@ -734,10 +754,16 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
         # passing discovered GPUs through here made doctor contradict its own
         # accelerator check and emit CUDA-only tuning advice. Keep inventory
         # details in accelerator.gpu above, but build an executable plan below.
-        cuda = linkage.get("linked") and not linkage.get("vulkan")
+        cuda = linkage.get("linked") and not linkage.get("vulkan") and not linkage.get("metal")
         plan_gpus = detected_gpus if cuda else []
         plan_gpu_indices = gpu_indices if cuda else []
         plan_vram_gb = vram_gb if cuda else 0
+        if linkage.get("metal") and linkage.get("linked") and gpu_indices != []:
+            # a Metal engine: the Apple GPU as the planner knows it (identity only, unified
+            # memory, no VRAM budget to spend: resource_plan._discover_metal_gpus), so the
+            # plan reads "Metal ... unified memory" and takes the Metal tuning (#2921)
+            plan_gpus = [gpu for gpu in detected_gpus if gpu.get("backend") == "metal"]
+            plan_gpu_indices = gpu_indices
         # a Vulkan engine: the plan of a COLI_VULKAN=1 run (the dense weights on the device,
         # the Vulkan line), not the CPU path's
         # Ambient COLI_VULKAN must not give a CPU binary a Vulkan plan, and
