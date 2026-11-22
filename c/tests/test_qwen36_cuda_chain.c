@@ -350,6 +350,86 @@ static void share_trunk(Model *to, const Model *from) {
     }
 }
 
+static Q36CChain *wide_router_chain;
+static int wide_router_downloads;
+static size_t wide_router_count;
+static int count_route_copy(CcBuf *dst, size_t dst_off, CcBuf *src, size_t src_off, size_t n) {
+    if (src == wide_router_chain->dm_ids && dst == wide_router_chain->dm_idsd) {
+        wide_router_downloads++;
+        wide_router_count += n;
+    }
+    return fcc_copy(dst, dst_off, src, src_off, n);
+}
+
+static void wide_router_model(Model *m, Weights *w, const QW *gate) {
+    build_model(m, w);
+    m->c.n_experts = 256;
+    m->c.topk = 8;
+    free(m->is_pinned); free(m->is_queued); free(m->seen);
+    m->is_pinned = calloc(NL * 256, 1); m->is_queued = calloc(NL * 256, 1); m->seen = calloc(NL * 256, 1);
+    m->freq = calloc(NL * 256, sizeof *m->freq); m->resident_collecting = 1;
+    for (int l = 0; l < NL; l++) {
+        m->L[l].gate = gate[l];
+        LCache *lc = &m->cache[l];
+        Slot *slots = calloc(256, sizeof *slots);
+        free(lc->slot_by_expert);
+        lc->slot_by_expert = malloc(256 * sizeof *lc->slot_by_expert);
+        for (int e = 0; e < 256; e++) {
+            slots[e] = lc->slots[e % E]; slots[e].eid = e;
+            lc->slot_by_expert[e] = e;
+        }
+        free(lc->slots); lc->slots = slots; lc->n = lc->cap = 256;
+    }
+}
+
+static void test_wide_caller(Weights *w, const int *tokens) {
+    const ColiCudaChainOps saved = fake_chain_table;
+    fake_chain_table.size = sizeof fake_chain_table;
+    const int tier = qt_init(NL, 256, D, INTER, 256, 8, 0, 0);
+    ck(tier, "start the fixture with 256 resident experts per layer");
+    if (tier) {
+        QW gate[NL]; uint32_t seed = 501;
+        for (int i = 0; i < NL; i++) mk_qw(&gate[i], D, 256, &seed);
+        Model ref, m; wide_router_model(&ref, w, gate); wide_router_model(&m, w, gate);
+        place_trunk(&ref, w); share_trunk(&m, &ref);
+        for (int l = 0; l < NL; l++) for (int e = 0; e < 256; e++) {
+            const Slot *s = &m.cache[l].slots[e];
+            qt_note_block(l, e, (const uint8_t *)s->g, (const uint8_t *)s->u, (const uint8_t *)s->d, s->gs, s->us, s->ds);
+        }
+        qt_fill_wait();
+        Q36CChain *ch = q36cc_setup(&m, 1, NULL);
+        int ok = ch && ch->ok && ch->dm_on;
+        if (ok) {
+            wide_router_chain = ch; fake_chain_table.copy = count_route_copy;
+            ch->device_profile = cc_select_qwen36_profile(1);
+            ok = ch->device_profile;
+            for (int step = 0; step < 2 && ok; step++) {
+                const int n = step ? 1 : 3, pos = step ? 3 : 0;
+                g_cuda_chain = 0;
+                float *cpu = step_ex(&ref, tokens + pos, n, pos, 1);
+                g_cuda_chain = 1;
+                wide_router_downloads = 0; wide_router_count = 0;
+                float *out = step_ex(&m, tokens + pos, n, pos, 1);
+                ref.kv_len = m.kv_len = pos + n;
+                ok = !ch->failed && ch->dm_steps == (unsigned long long)(step + 1) * NL &&
+                     wide_router_downloads == 1 && wide_router_count == (size_t)NL * n * 8 &&
+                     !memcmp(m.freq, ref.freq, NL * 256 * sizeof *m.freq) && !memcmp(m.seen, ref.seen, NL * 256);
+                unsigned long long count = 0;
+                for (int j = 0; j < NL * 256; j++) count += ref.freq[j];
+                ok &= count == (unsigned long long)NL * (pos + n) * 8;
+                for (int j = 0; j < V; j++) ok &= isfinite(cpu[j]) && isfinite(out[j]);
+                ok &= maxdiff(cpu, out, V) <= 1e-3 * fmax(1., maxabs(cpu, V));
+                free(cpu); free(out);
+            }
+            cc_select_qwen36_profile(0); g_cuda_chain = 0; wide_router_chain = NULL;
+        }
+        ck(ok, "E256/K8 prompt and decode agree with CPU logits and route books, one ID download per frame");
+        qt_shutdown();
+        for (int l = 0; l < NL; l++) { free(gate[l].q); free(gate[l].sc); }
+    }
+    fake_chain_table = saved;
+}
+
 /* the MTP head of section H (E routed experts, the whole vocabulary), on */
 static void mtp_head(void) {
     uint32_t ms = 99;
@@ -1309,6 +1389,8 @@ int main(int argc, char **argv) {
         fake_chain_table.size = CC_OPS_BASE_SIZE;
         qt_shutdown();
     }
+    test_wide_caller(&w, ids);
+
     printf(" P. the staged table: the host pool's experts in the staging's banks\n");
     stage_table_case(4, 1, -1, 0, 1, 2, "planar, half the experts in the pool (two layers' worth fit in a layer's)");
     stage_table_case(4, 0, -1, 0, 1, 2, "the residents' pairs, the same");
