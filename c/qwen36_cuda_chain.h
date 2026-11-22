@@ -101,6 +101,7 @@ typedef struct {
     int dn_where, host_zero;
     CcBuf *x, *nrm, *tmp, *q, *k, *v, *ctx, *qkvz, *ab, *cv, *dny, *h2, *lg, *gs, *us, *hs, *ds, *sgd, *fin, *out;
     CcBuf *h2d, *lgd, *kvd, *outd, *xd, *lfd, *routed, *cs;
+    int kv_slot, pend_books, pend_n, pend_pb, pend_slot;
     CcBuf *csd;   /* cs on the device: every RoPE of a step reads it there, not over the bus */
     CcBuf *kg, *vg;   /* a long step's window over a ring: its rows before the step and the step's (q36cc_attention) */
     CcBuf *agb, *lat, *latd;   /* Muse Spark: the attention gate's rows, the experts' input rows */
@@ -112,6 +113,7 @@ typedef struct {
     int dm_on, dm_fmt, dm_gs, dm_read, dm_held;
     unsigned dm_epoch, dm_seq;
     int *dm_nres;   /* a layer's experts the table lacks (dm_part = any) */
+    int dm_partial;    /* at least one expert is off the card, including staged host experts */
     int dm_stage_dirty;   /* the staged table is behind the residents */
     /* promotions (q36cc_promote): the rate a step, a ring of page-locked staging slots the
      * newcomers' bytes go up from, the pairs whose copies are in flight */
@@ -186,6 +188,7 @@ static void q36cc_end_request(Q36CChain *ch) {
     q36cc_set_permissions(ch, q36_default_features(ch->device_profile));
 }
 
+static void q36cc_dm_flush_books(Q36CChain *ch, Model *m);
 
 /* on unless COLI_CUDA_CHAIN=0: the chain took 34 -> 59 tok/s of decode on Qwen3.6-35B int4-g64, 85 with its
  * routed experts in the frame (an RTX PRO 4000); q36cc_setup declines where it cannot run */
@@ -207,6 +210,7 @@ static void q36cc_recover(Model *m, int upto) {
     Cfg *c = &m->c; int D = c->hidden;
     g_cuda_chain = 0;
     if (ch) {
+        q36cc_dm_flush_books(ch, m);
         if (ch->device_profile) cc_select_qwen36_profile(0);
         ch->device_profile = Q36_GPU_NONE;
         ch->failed = 1; ch->dn_where = Q36CC_HOST; ch->host_zero = 0; ch->snap_valid = 0;
@@ -739,6 +743,7 @@ static int q36cc_mirror(Q36CChain *ch, Model *m) {
 }
 static int q36cc_scratch(Q36CChain *ch, Model *m, int rows) {
     Cfg *c = &m->c; int D = q36_eh(c) > c->hidden ? q36_eh(c) : c->hidden;   /* the routed sum's width */
+    if (ch->pend_books && rows > ch->rows) q36cc_dm_flush_books(ch, m);
     if (!q36cc_bufs(ch, m, rows)) return 0;
     if (ch->rows < rows) {
         float *hr = realloc(ch->host_routed, (size_t)rows * D * sizeof(float));
@@ -750,6 +755,7 @@ static int q36cc_scratch(Q36CChain *ch, Model *m, int rows) {
 
 /* ---- state between the host and the device ----------------------------------- */
 static int q36cc_sync_one(Model *m, Q36CChain *ch) {
+    if (ch && ch->pend_books) q36cc_dm_flush_books(ch, m);
     if (!ch || !ch->ok || ch->dn_where != Q36CC_DEV) return 1;
     Cfg *c = &m->c;
     size_t nr = q36_rec_cells(c), nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
@@ -770,7 +776,9 @@ static void q36cc_sync_host(Model *m) {
 static void q36cc_host_wrote(Model *m, int zero) {
     Q36CChain *ch = q36cc_of(m);
     if (!ch || !ch->ok) return;
+    q36cc_dm_flush_books(ch, m);
     ch->dn_where = Q36CC_HOST; ch->host_zero = zero; ch->snap_valid = 0;
+    if (zero && ch->kv_valid) for (int i = 0; i < m->c.n_layers; i++) ch->kv_valid[i] = 0;
 }
 /* A CPU step from pos_base: the host state current before it, the device's stale after. */
 static void q36cc_cpu_step(Model *m, int pos_base) {
@@ -951,6 +959,7 @@ static int q36cc_conv_get(Q36CChain *ch, Model *m, int slot, int evict) {
 }
 static void q36cc_mux_init(Model *m) {
     Q36CChain *ch = q36cc_of(m);
+    q36cc_dm_flush_books(ch, m);
     if (!q36cc_pool_ok(ch) || ch->conv || !(ch->conv = calloc((size_t)g_q36_mux_slots, sizeof *ch->conv))) return;
     for (int k = 0; k < g_q36_mux_slots; k++) ch->conv[k].slot = -1;
     ch->nconv = 1; ch->conv_cur = 0;
@@ -1053,6 +1062,7 @@ static void q36cc_mux_host(Model *m, const Q36Row *rows, int S, int after) {
 static void q36cc_rollback(Model *m, int slot, int len) {
     Q36CChain *ch = q36cc_of(m);
     if (!ch || !ch->ok) return;
+    q36cc_dm_flush_books(ch, m);
     for (int i = 0; i < m->c.n_layers; i++) if (ch->kv_valid[i] > len) ch->kv_valid[i] = len;
     if (slot < 0 || slot >= ch->snap_valid || ch->dn_where != Q36CC_DEV) { ch->snap_valid = 0; return; }
     for (int i = 0; i < m->c.n_layers; i++) {
@@ -1188,7 +1198,7 @@ static int q36cc_attn_qkv(Q36CChain *ch, Model *m, Layer *l, int i, int n) {
     }
     return ok;
 }
-static int q36cc_attention(Q36CChain *ch, Model *m, Layer *l, int i, int n, int pb) {
+static int q36cc_attention(Q36CChain *ch, Model *m, Layer *l, int i, int n, int pb, int ordered_books) {
     Cfg *c = &m->c;
     int H = c->q_heads, KV = c->kv_heads, hd = c->head_dim, qdim = c->q_head_dim, kvd = c->k_head_dim;
     int qo = H * qdim, kvo = KV * kvd, gate_dim = qdim > hd ? qdim - hd : 0, ok = 1;
@@ -1236,8 +1246,18 @@ static int q36cc_attention(Q36CChain *ch, Model *m, Layer *l, int i, int n, int 
     }
     for (int s = 0; s < n; s++) for (int h = 0; h < KV; h++)
         rg[s * KV + h] = (CcRegion){((size_t)h * rows + (R ? (pb + s) % R : pb + s)) * kvd, (size_t)s * kvo + (size_t)h * kvd, (size_t)kvd};
-    ok = q36cc_kv_put(ch->kc[i], ch->k, rg, n * KV) && q36cc_kv_put(ch->vc[i], ch->v, rg, n * KV) &&
-         cc_copy(ch->kvd, ko, ch->k, 0, (size_t)n * kvo) && cc_copy(ch->kvd, ko + (size_t)ch->rows * kvo, ch->v, 0, (size_t)n * kvo);
+    ok = q36cc_kv_put(ch->kc[i], ch->k, rg, n * KV) && q36cc_kv_put(ch->vc[i], ch->v, rg, n * KV);
+    if (ok && ordered_books && ch->device_profile && q36cc_kvh() && !ch->mx_rows && R == 0 && (kvd & 1) == 0) {
+        size_t words = (size_t)n * (size_t)(kvd / 2), slot_off = ch->kv_slot ? ((size_t)ch->rows * kvo) / 2 : 0;
+        for (int h = 0; h < KV && ok; h++) {
+            size_t src_w = ((size_t)h * rows + pb) * (size_t)(kvd / 2);
+            ok = cc_copy(ch->kvd, ko + slot_off + (size_t)h * words, ch->kc[i], src_w, words) &&
+                 cc_copy(ch->kvd, ko + slot_off + (size_t)ch->rows * kvo + (size_t)h * words, ch->vc[i], src_w, words);
+        }
+    } else {
+        ok = ok && cc_copy(ch->kvd, ko, ch->k, 0, (size_t)n * kvo) &&
+             cc_copy(ch->kvd, ko + (size_t)ch->rows * kvo, ch->v, 0, (size_t)n * kvo);
+    }
     free(rg);
     CcAttn a = {n, H, KV, hd, pb, rows, 0, qo, qdim, hd, qo, qdim, gate_dim > 0, 0, H * hd, 0, 0,
                 1.f / sqrtf((float)hd), 0, 0};
@@ -1489,7 +1509,7 @@ static int q36cc_dm_able(Q36CChain *ch, Model *m) {
     }
     return 1;
 }
-static void q36cc_kv_down(Q36CChain *ch, Model *m, int i, int n, int pb) {
+static void q36cc_kv_down_slot(Q36CChain *ch, Model *m, int i, int n, int pb, int slot, int ordered_books) {
     Cfg *c = &m->c; int kvo = c->kv_heads * c->k_head_dim;
     if (!c->is_attn[i]) return;
     const float *kv = (const float *)cc_ptr(ch->kvd) + (size_t)ch->attn_ord[i] * 2 * ch->rows * kvo;
@@ -1507,6 +1527,23 @@ static void q36cc_kv_down(Q36CChain *ch, Model *m, int i, int n, int pb) {
         }
         return;
     }
+    if (ordered_books && ch->device_profile && q36cc_kvh() && R == 0 && (c->k_head_dim & 1) == 0) {
+        size_t words = (size_t)n * (size_t)(c->k_head_dim / 2);
+        const float *kvs = kv + (slot ? ((size_t)ch->rows * kvo) / 2 : 0);
+        #pragma omp parallel for collapse(2) schedule(static) if (n >= 64)
+        for (int h = 0; h < c->kv_heads; h++) {
+            for (int s0 = 0; s0 < n; s0 += 64) {
+                int ns = n - s0 < 64 ? n - s0 : 64;
+                size_t dst = q36_kv_at(m, i, h, pb + s0);
+                size_t off = (size_t)h * words + (size_t)s0 * (size_t)(c->k_head_dim / 2);
+                size_t bytes = (size_t)ns * (size_t)c->k_head_dim * sizeof(uint16_t);
+                memcpy(q36_kv_ptr(m->K[i], dst), kvs + off, bytes);
+                memcpy(q36_kv_ptr(m->V[i], dst), kvs + (size_t)ch->rows * kvo + off, bytes);
+            }
+        }
+        return;
+    }
+    #pragma omp parallel for schedule(static) if (ch->device_profile && ordered_books && R == 0 && n >= 64)
     for (int s = 0; s < n; s++) {
         for (int h = 0; h < c->kv_heads; h++) {
             size_t dst = q36_kv_at(m, i, h, pb + s), src = (size_t)s * kvo + (size_t)h * c->k_head_dim;
@@ -1514,6 +1551,33 @@ static void q36cc_kv_down(Q36CChain *ch, Model *m, int i, int n, int pb) {
             q36_kv_put(m->V[i], (int64_t)dst, kv + (size_t)ch->rows * kvo + src, c->k_head_dim);
         }
         if (R && m->ring_pos) m->ring_pos[(pb + s) % R] = pb + s;
+    }
+}
+static void q36cc_kv_down(Q36CChain *ch, Model *m, int i, int n, int pb, int ordered_books) {
+    q36cc_kv_down_slot(ch, m, i, n, pb, ch->kv_slot, ordered_books);
+}
+/* Fault in newly mmap'd host K/V cache pages across OpenMP threads while the GPU executes the chunk. */
+static void q36cc_kv_prefault(Model *m, int n, int pb) {
+    Cfg *c = &m->c;
+    if (!q36cc_kvh() || n < 64) return;
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int i = 0; i < c->n_layers; i++) {
+        for (int h = 0; h < c->kv_heads; h++) {
+            if (!c->is_attn[i]) continue;
+            if (q36_kv_rows(m, i) != m->max_t && m->kv_ring > 0) continue;
+            size_t dst = q36_kv_at(m, i, h, pb);
+            size_t bytes = (size_t)n * (size_t)c->k_head_dim * sizeof(uint16_t);
+            volatile uint8_t *pk = (volatile uint8_t *)q36_kv_ptr(m->K[i], dst);
+            volatile uint8_t *pv = (volatile uint8_t *)q36_kv_ptr(m->V[i], dst);
+            for (size_t off = 0; off < bytes; off += 4096) {
+                pk[off] = 0;
+                pv[off] = 0;
+            }
+            if (bytes > 0) {
+                pk[bytes - 1] = 0;
+                pv[bytes - 1] = 0;
+            }
+        }
     }
 }
 /* A prompt chunk routes nearly every expert of a layer, and the host's step costs per row
@@ -1617,17 +1681,21 @@ static void q36cc_promote(Q36CChain *ch, Model *m, int rows) {
         if (wr > 0 && (wr - wm) * 100 >= (unsigned long long)ch->promo_hits * wr) { max = 0; ch->pr_braked++; }
     }
     if (max <= 0) { qt_chain_promote(0, NULL); ch->promo_ms += tm_now() - t0; return; }   /* the step's misses dropped: the tier's list is a step's */
+    QtPromo pr[Q36CC_PROMO_SLOTS];
+    const int defer_staging = ch->device_profile && (ch->device_profile == Q36_GPU_A100 || q36cc_permits(ch, Q36_ASYNC_COPIES));
+    int n = defer_staging ? qt_chain_promote(max, pr) : 0;
+    if (defer_staging && n <= 0) { ch->promo_ms += tm_now() - t0; return; }
     if (!ch->pr_buf) {   /* the staging: three matrices and their scales an expert, 256-byte aligned */
         size_t mb = ch->dm_fmt == 2 || ch->dm_fmt == 4 ? (size_t)D * I / 2 : (size_t)D * I, sb = (size_t)(2 * I + D) * sizeof(float);
         if (ch->dm_fmt == 4) sb = (size_t)(2 * I * ((D + ch->dm_gs - 1) / ch->dm_gs) + D * ((I + ch->dm_gs - 1) / ch->dm_gs)) * sizeof(float);
         ch->pr_stride = (3 * mb + sb + 255) / 256 * 256;
         if (!cc_host_up_ready() || !cc_reserve(&ch->pr_buf, ch->pr_stride * Q36CC_PROMO_SLOTS, CC_UP)) {
+            for (int k = 0; k < n; k++) qt_chain_promote_done(pr[k].ci, pr[k].vi, 0);
             fprintf(stderr, "[chain] qwen36: no page-locked staging for promotions; the warm start's set stays\n");
             ch->promo_rate = 0; return;
         }
     }
-    QtPromo pr[Q36CC_PROMO_SLOTS];
-    int n = qt_chain_promote(max, pr);
+    if (!defer_staging) n = qt_chain_promote(max, pr);
     /* the step's copies in one call (cc_host_up_many), its pending pairs from p0 on one ticket */
     void *ud[6 * Q36CC_PROMO_SLOTS]; const void *us[6 * Q36CC_PROMO_SLOTS]; size_t ub[6 * Q36CC_PROMO_SLOTS];
     int nu = 0, p0 = ch->pr_npend;
@@ -1877,7 +1945,7 @@ static int q36cc_dm_begin(Q36CChain *ch, Model *m, int n) {
         } else ch->promo_rate = 0;
     }
     if (!cc_reserve(&ch->dm_ids, (size_t)L * r * K * 4, CC_DEV) || !cc_reserve(&ch->dm_w, (size_t)L * r * K * F, CC_DEV) ||
-        !cc_reserve(&ch->dm_idsd, (size_t)L * r * K * 4, CC_DOWN) || !cc_reserve(&ch->dm_wd, (size_t)L * r * K * F, CC_DOWN) ||
+        !cc_reserve(&ch->dm_idsd, (q36cc_permits(ch, Q36_ASYNC_COPIES) ? 2 : 1) * (size_t)L * r * K * 4, CC_DOWN) || !cc_reserve(&ch->dm_wd, (size_t)L * r * K * F, CC_DOWN) ||
         !cc_reserve(&ch->dm_hid, cc_moe_hid_floats((int)r, K, D, I, E) * F, CC_DEV) || !cc_reserve(&ch->dm_y, r * D * F, CC_DEV) ||
         !cc_reserve(&ch->dm_hy, r * D * F, CC_UP) || !cc_reserve(&ch->dm_dfl, 64, CC_DOWN) || !cc_reserve(&ch->dm_hfl, 64, CC_UP) ||
         !cc_reserve(&ch->dm_tab, ne * sizeof(CcExpert), CC_DEV)) return 0;
@@ -1913,6 +1981,10 @@ static int q36cc_dm_begin(Q36CChain *ch, Model *m, int n) {
         ch->dm_epoch = ep; ch->dm_read = 1; ch->dm_stage_dirty = 1;
         ch->patch_ms += tm_now() - tp;
     }
+    int any_part = qt_chain_host_count() > 0;
+    for (int i = 0; !any_part && i < L; i++) if (ch->dm_part[i]) any_part = 1;
+    if (any_part && ch->pend_books) q36cc_dm_flush_books(ch, m);
+    ch->dm_partial = any_part;
     /* the staged table (a prompt chunk's host-pool copies) follows the residents when a chunk needs it,
      * and on a large chunk the pool first (q36cc_follow) */
     int stage = n > Q36CC_STAGE_ROWS && qt_chain_host_count() > 0 && !ch->dm_stage_off && cc_fetch_ready();
@@ -2052,19 +2124,36 @@ static int q36cc_dm_serve(Q36CChain *ch, Model *m, int i, int n, unsigned v) {
     return 1;
 }
 /* after the frame: every layer's books from its ids, and the K/V rows */
-static void q36cc_dm_books(Q36CChain *ch, Model *m, int n, int pb) {
+static void q36cc_dm_books_slot(Q36CChain *ch, Model *m, int n, int pb, int slot, int force_all, int ordered_books) {
     Cfg *c = &m->c; int L = c->n_layers, E = c->n_experts, K = c->topk;
+    size_t ids_base = slot ? (size_t)L * ch->rows * K : 0;
     for (int i = 0; i < L; i++) {
-        if (!ch->dm_ran[i]) continue;   /* a layer that took the host's step kept its own books */
-        q36cc_kv_down(ch, m, i, n, pb);
-        const int *ids = (const int *)cc_ptr(ch->dm_idsd) + (size_t)i * n * K;
-        for (int s = 0; s < n; s++) {
-            const int *idx = ids + s * K;
-            if (m->resident_collecting) for (int k = 0; k < K; k++) if (idx[k] >= 0) m->seen[(int64_t)i * E + idx[k]] = 1;
-            if (!m->hot_pinned && m->freq) for (int k = 0; k < K; k++) if (idx[k] >= 0) m->freq[(int64_t)i * E + idx[k]]++;
-            qt_chain_count(i, idx, K);
+        if (!force_all && !ch->dm_ran[i]) continue;   /* a layer that took the host's step kept its own books */
+        q36cc_kv_down_slot(ch, m, i, n, pb, slot, ordered_books);
+        const int *ids = (const int *)cc_ptr(ch->dm_idsd) + ids_base + (size_t)i * n * K;
+        const int bulk = ordered_books && ch->device_profile && (force_all || !ch->dm_partial);
+        if (!bulk || m->resident_collecting || (!m->hot_pinned && m->freq)) {
+            for (int s = 0; s < n; s++) {
+                const int *idx = ids + s * K;
+                if (!bulk) {
+                    if (ch->device_profile && ordered_books) qt_chain_count_rows(i, idx, 1, K);
+                    else qt_chain_count(i, idx, K);
+                }
+                if (m->resident_collecting) for (int k = 0; k < K; k++) if (idx[k] >= 0) m->seen[(int64_t)i * E + idx[k]] = 1;
+                if (!m->hot_pinned && m->freq) for (int k = 0; k < K; k++) if (idx[k] >= 0) m->freq[(int64_t)i * E + idx[k]]++;
+            }
         }
+        if (bulk) qt_chain_count_rows(i, ids, n, K);
     }
+}
+static void q36cc_dm_books(Q36CChain *ch, Model *m, int n, int pb, int ordered_books) {
+    q36cc_dm_books_slot(ch, m, n, pb, ch->kv_slot, 0, ordered_books);
+}
+static void q36cc_dm_flush_books(Q36CChain *ch, Model *m) {
+    if (!ch || !ch->pend_books) return;
+    ch->pend_books = 0;
+    /* The pending chunk was written in packed form before the phase could change. */
+    q36cc_dm_books_slot(ch, m, ch->pend_n, ch->pend_pb, ch->pend_slot, 1, 1);
 }
 
 /* Rows per prompt chunk: COLI_CUDA_CHAIN_ROWS, else the most (a power of two from 256 to 4096)
@@ -2155,12 +2244,17 @@ static void q36cc_mirror_room(Q36CChain *ch, Model *m, int cap, size_t held) {
 static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int want_x, int nlogits, float *logit,
                          int *rows_only) {
     *rows_only = 0;
-    if (!g_cuda_chain || qq_active() || g_pilot || m->mux_rows) return 0;
     Q36CChain *ch = q36cc_of(m);
-    if (!ch || !ch->ok || ch->failed) return 0;
+    if (!g_cuda_chain || qq_active() || g_pilot || m->mux_rows || !ch || !ch->ok || ch->failed) {
+        q36cc_dm_flush_books(ch, m);
+        return 0;
+    }
+    const int ordered_books = !ch->device_profile || q36cc_permits(ch, Q36_ASYNC_COPIES);
     Cfg *c = &m->c; int D = c->hidden, L = c->n_layers, E = c->n_experts;
     int CH = q36cc_rows_max(ch, m), rows = S < CH ? S : CH;
     int half = c->rotary_dim / 2;
+    if (ch->pend_books && (!ordered_books || rows > ch->rows || ch->mx_rows || m->snap_rows > 0 || !q36cc_kvh() || m->kv_ring != 0 || (c->k_head_dim & 1) != 0))
+        q36cc_dm_flush_books(ch, m);
     if (m->snap_rows > 0 && !q36cc_spec_slots(ch, m, m->snap_rows)) {
         fprintf(stderr, "[chain] qwen36: device memory for a verify's %d copies refused; this verify on the CPU\n", m->snap_rows);
         return 0;
@@ -2183,6 +2277,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
         if (!mirror_ok && q36cc_prompt_cache_enabled(ch) && !cc_lost()) {
             /* Growth with slack keeps the valid rows on the card. Under memory pressure,
              * the host's current rows allow the exact-size mirror to replace one layer at a time. */
+            q36cc_dm_flush_books(ch, m);
             q36cc_mirror_room(ch, m, m->kv_cap, q36cc_mirror_held(ch, m));
             mirror_ok = q36cc_mirror_exact(ch, m);
             if (mirror_ok) ch->host_cap = m->kv_cap;
@@ -2202,6 +2297,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
         (nlogits > 1 && (!cc_reserve(&ch->fin, (size_t)nlogits * D * sizeof(float), CC_DEV) ||
                          !cc_reserve(&ch->out, (size_t)nlogits * c->vocab * sizeof(float), CC_DEV) ||
                          !cc_reserve(&ch->outd, (size_t)nlogits * c->vocab * sizeof(float), CC_DOWN)))) {
+        q36cc_dm_flush_books(ch, m);
         fprintf(stderr, "[chain] qwen36: device memory for %d rows refused; the per-matrix path\n", rows);
         ch->failed = 1;
         if (ch->device_profile) cc_select_qwen36_profile(0);
@@ -2215,16 +2311,21 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
         fprintf(stderr, "[dflash] device memory for the drafter's rows refused: drafts off\n");
         df->on = 0; df = NULL;
     }
-    int snapped = 0;
+    int snapped = 0, x_staged = 0;
     double w0 = ch->wait_ms, h0 = ch->host_ms;
     for (int c0 = 0; c0 < S; c0 += rows) {
         int n = S - c0 < rows ? S - c0 : rows, pb = pos_base + c0;
         if (c0 > 0 && q36_chunk_control()) {   /* a STOP or CANCEL between two prompt chunks */
+            q36cc_dm_flush_books(ch, m);
+            ch->kv_slot = 0;
             q36cc_dm_end(ch);
             for (int i = 0; i < L; i++) if (ch->kv_valid[i] > pos_base) ch->kv_valid[i] = pos_base;
             ch->snap_valid = 0;
             return 0;
         }
+        int can_2slot = ordered_books && ch->device_profile && !ch->dm_partial && q36cc_kvh() && !ch->mx_rows && m->kv_ring == 0 && (c->k_head_dim & 1) == 0;
+        if (ch->pend_books && !can_2slot) q36cc_dm_flush_books(ch, m);
+        ch->kv_slot = can_2slot ? (ch->pend_books ? (ch->pend_slot ^ 1) : ((c0 > 0 && n > Q36CC_ROUTED_ROWS) ? ((c0 / rows) & 1) : 0)) : 0;
         int ns = m->snap_rows - c0 < n ? m->snap_rows - c0 : n;   /* the rows of this chunk a verify copies */
         if (ns < 0) ns = 0;
         if (ns) snapped = c0 + ns;
@@ -2262,9 +2363,14 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
             fprintf(stderr, "[chain] qwen36: the routed experts' buffers or table refused; the host's step from here on\n");
             q36cc_dm_end(ch); ch->dm_on = dm = 0;
         }
+        if (ch->dm_partial) { can_2slot = 0; ch->kv_slot = 0; }
         if (dm) memset(ch->dm_ran, 0, (size_t)L);
         if (dm) cc_host_wait_arm(ch->dm_hfl);
-        if (!q36cc_frame_begin(ch) || !cc_write(ch->x, 0, xh + (size_t)c0 * D, (size_t)n * D * sizeof(float)) ||
+        int use_staged = x_staged && c0 > 0;
+        x_staged = 0;
+        if (!q36cc_frame_begin(ch) ||
+            !(use_staged ? cc_copy(ch->x, 0, ch->routed, 0, (size_t)n * D)
+                         : cc_write(ch->x, 0, xh + (size_t)c0 * D, (size_t)n * D * sizeof(float))) ||
             !(ch->mx_rows ? q36cc_mux_push(ch, m, c0, n) : q36cc_push_state(ch, m, pb))) goto lost;
         /* the angles to the device once a step: a RoPE that read them where the host wrote them
          * paid the bus on every element, 11-16 us a call (Flint: 70 calls a token) */
@@ -2299,7 +2405,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
             if (!normed) ok = ok && q36cc_norm(ch->x, 0, ch->prm, ch->o_in[i], ch->nrm, 0, n, D, c->eps);
             if (ch->mx_rows) ok = ok && (c->is_attn[i] ? q36cc_attention_mx(ch, m, l, i, n, c0) :
                                          c->lfm3 ? q36cc_shortconv_mx(ch, m, i, n, c0) : q36cc_deltanet_mx(ch, m, l, i, n, c0));
-            else ok = ok && (c->is_attn[i] ? q36cc_attention(ch, m, l, i, n, pb) :
+            else ok = ok && (c->is_attn[i] ? q36cc_attention(ch, m, l, i, n, pb, ordered_books) :
                              c->lfm3 ? q36cc_shortconv(ch, m, i, n, c0, ns) : q36cc_deltanet(ch, m, l, i, n, c0, ns));
             if (ok && lf) ok = cc_copy(ch->lfd, (size_t)i * 3 * D, ch->tmp, (size_t)(n - 1) * D, D);
             CcEw add = {CC_EW_ADD, n * D, D, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
@@ -2355,7 +2461,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
                 ok = ok && cc_submit(1);   /* A1 */
                 ch->wait_ms += tm_now() - t0;
                 if (!ok) break;
-                if (c->is_attn[i]) q36cc_kv_down(ch, m, i, n, pb);   /* the rows into the host's cache */
+                if (c->is_attn[i]) q36cc_kv_down(ch, m, i, n, pb, ordered_books);   /* the rows into the host's cache */
                 /* A2: the shared expert, while the host computes the routed experts */
                 ok = q36cc_frame_begin(ch) && q36cc_shared(ch, m, l, i, n) && cc_submit(0);
                 double t1 = tm_now();
@@ -2378,7 +2484,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
         if (ok) ok = q36cc_combine(ch, m, L - 1, n, routed);
         if (ok && df && df_tap_index(df, L - 1) >= 0 && !df_tap(df, ch->x, 0, D, 1, n, df_tap_index(df, L - 1), 0)) { df->on = 0; df = NULL; }
         if (ok && df && !df_ctx(df, n, pb)) { fprintf(stderr, "[dflash] the drafter's rows failed: drafts off\n"); df->on = 0; df = NULL; }
-        if (ok && dm_ids_defer) ok = cc_copy(ch->dm_idsd, 0, ch->dm_ids, 0, (size_t)L * n * c->topk);
+        if (ok && dm_ids_defer) ok = cc_copy(ch->dm_idsd, ch->kv_slot ? (size_t)L * ch->rows * c->topk : 0, ch->dm_ids, 0, (size_t)L * n * c->topk);
         if (ok && lf) ok = cc_copy(ch->lfd, ((size_t)(L - 1) * 3 + 2) * D, ch->x, (size_t)(n - 1) * D, D);
         if (ok && want_x) ok = cc_copy(ch->xd, 0, ch->x, 0, (size_t)n * D);
         int last = c0 + n == S;
@@ -2394,19 +2500,40 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
         }
         double t0 = tm_now();
         ok = ok && cc_submit(0);
+        if (ok && ch->pend_books) q36cc_dm_flush_books(ch, m);
         if (ok && pend_v) ok = q36cc_dm_serve(ch, m, pend_i, n, pend_v);   /* the last hybrid layer's, the tail recorded */
+        if (ok && ordered_books && ch->device_profile && dm && !pend_v && !ch->mx_rows && n >= 64) {
+            int all_dm_ran = 1;
+            for (int i = 0; all_dm_ran && i < L; i++) if (!ch->dm_ran[i]) all_dm_ran = 0;
+            if (all_dm_ran) q36cc_kv_prefault(m, n, pb);
+            if (all_dm_ran && !last) {
+                int n_next = S - (c0 + n) < rows ? S - (c0 + n) : rows;
+                float *dst_x = (float *)cc_ptr(ch->routed);
+                const float *src_x = xh + (size_t)(c0 + n) * D;
+                #pragma omp parallel for schedule(static)
+                for (int s0 = 0; s0 < n_next; s0 += 64) {
+                    int ns = n_next - s0 < 64 ? n_next - s0 : 64;
+                    memcpy(dst_x + (size_t)s0 * D, src_x + (size_t)s0 * D, (size_t)ns * D * sizeof(float));
+                }
+                x_staged = 1;
+            }
+        }
         ok = ok && cc_finish();
         ch->wait_ms += tm_now() - t0;
         if (!ok) goto lost;
         if (dm && cc_host_wait_gave_up(ch->dm_hfl, "qwen36")) goto lost;
-        if (dm) q36cc_dm_books(ch, m, n, pb);
+        int all_dm = dm && !pend_v && can_2slot &&
+                     (!last ? n > Q36CC_DM_ROWS : (n >= 512 && !ch->conv && !m->resident_collecting && (m->hot_pinned || !m->freq)));
+        for (int i = 0; all_dm && i < L; i++) if (!ch->dm_ran[i]) all_dm = 0;
+        if (all_dm) { ch->pend_books = 1; ch->pend_n = n; ch->pend_pb = pb; ch->pend_slot = ch->kv_slot; }
+        else if (dm) q36cc_dm_books(ch, m, n, pb, ordered_books);
         if (dm && n <= Q36CC_DM_ROWS) q36cc_promote(ch, m, n);
         else if (dm) { ch->pr_steps0 = ch->dm_steps; ch->pr_pairs0 = ch->dm_pairs; }   /* a prompt chunk's misses are not the brake's */
         /* a dense model reads its K/V rows back here, and so does a Flint dense layer (no
          * expert step ends its frame; q36c_forward_seg says what went wrong without it) */
         for (int i = 0; i < L; i++) {
             if (!c->is_attn[i] || (E > 0 && !q36_dense_l(c, i))) continue;
-            q36cc_kv_down(ch, m, i, n, pb);
+            q36cc_kv_down(ch, m, i, n, pb, ordered_books);
         }
         if (want_x) memcpy(xh + (size_t)c0 * D, cc_ptr(ch->xd), (size_t)n * D * sizeof(float));
         if (ch->mx_rows)   /* each row's place: its row on the device, its DeltaNet state there only */
@@ -2421,6 +2548,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
         }
         if (last) memcpy(logit, cc_ptr(ch->outd), (size_t)nlogits * c->vocab * sizeof(float));
     }
+    ch->kv_slot = 0;
     q36cc_dm_end(ch);
     if (lf) fwrite(cc_ptr(ch->lfd), sizeof(float), (size_t)L * 3 * D, lf);
     ch->snap_valid = snapped;
@@ -2428,6 +2556,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
     if (S == 1) { ch->dec_n++; ch->dec_wait_ms += ch->wait_ms - w0; ch->dec_host_ms += ch->host_ms - h0; }
     return L;
 lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */
+    ch->pend_books = 0; ch->kv_slot = 0;
     fprintf(stderr, "[chain] qwen36: a frame of a %d-row step at position %d failed; the CPU runs from here on\n", S, pos_base);
     if (!cc_lost()) cc_finish();
     q36cc_dm_end(ch);
@@ -2442,6 +2571,7 @@ lost:   /* a frame failed: the device is gone (or would not take a command); the
  * (q36cc_mux_rollback), -1 none; want_x: the rows' residuals back in xh (the MTP head's) */
 static int q36cc_mux_step(Model *m, const Q36Row *rows, int S, float *xh, float *logit, const int *snap, int want_x) {
     Q36CChain *ch = q36cc_of(m);
+    q36cc_dm_flush_books(ch, m);
     g_q36_df.len = 0;   /* DFlash2's drafter keeps one conversation's rows: several in a step leave it none */
     if (!g_cuda_chain || !ch || !ch->conv || !q36cc_pool_ok(ch) || S < 1 || S > q36cc_rows_max(ch, m)) return 0;
     if (snap) {
@@ -2497,6 +2627,7 @@ static int q36cc_mux_rollback(Model *m, int slot, int snap, int len) {
 
 static void q36cc_report(Model *m) {
     Q36CChain *ch = q36cc_of(m);
+    q36cc_dm_flush_books(ch, m);
     if (!ch || !ch->ok || !ch->forwards) return;
     CcStats st; cc_stats(&st);
     fprintf(stderr, "[chain] qwen36: %llu forwards, %llu frames (%llu ops, %llu matmuls), %.1f ms waiting for the device, "

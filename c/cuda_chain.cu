@@ -54,7 +54,7 @@ extern "C" int coli_cuda_enable_qwen36(int device, int enabled);
 extern "C" void coli_cuda_set_qwen36_mask(int device, unsigned mask);
 extern "C" void coli_cuda_set_l2_fetch(int device, int enabled);
 
-struct CcBuf { int kind, dev; size_t bytes; float *d; void *h; };
+struct CcBuf { int kind, dev; size_t bytes; float *d; void *h; unsigned long long down_seq; };
 
 namespace {
 #define CC_UP_MARKS 1024   /* host_up's marks in flight (three a promoted expert) */
@@ -72,6 +72,8 @@ struct CcCtx {
     /* staging (cc_fetch): the copy stream, and for each of its two banks the copies' event and the
      * buffer's last reader's */
     cudaStream_t cs; cudaEvent_t ev_fetched[2], ev_free[2]; int cs_ok;
+    cudaEvent_t ev_down, ev_down_done;
+    unsigned long long down_seq, down_joined;
     /* host_up: the copies' marks, a ring of CC_UP_MARKS events on the copy stream */
     cudaEvent_t up_ev[CC_UP_MARKS]; unsigned up_seq, up_made; cudaEvent_t up_after;
     float *adec; size_t adec_bytes;   /* cc_attn_dec_k's blocks */
@@ -103,10 +105,16 @@ static thread_local unsigned long long t_cc_seq = 0;   /* this thread's last cou
 CcCtx *cur(void) { t_cc_seq = ++g_cc_seq; return g_cur >= 0 ? &g_cc[g_cur] : nullptr; }
 CcCtx *ctx_of(int device) { t_cc_seq = ++g_cc_seq; for (int i = 0; i < g_ncc; i++) if (g_cc[i].device == device) return &g_cc[i]; return nullptr; }
 /* every call: the context's device current (the backend's other calls switch it) */
-CcCtx *live(void) {
+static int cc_join_down(CcCtx *c);
+enum CcOrdering { CC_ORDERED, CC_OVERLAP_DOWN };
+/* An operation taking CC_OVERLAP_DOWN orders writes to a pending readback's source and reads
+ * of its destination through fpw/fp. Other operations (including submit and signal) join all
+ * previous readbacks: a host that sees their completion can consume the downloaded data. */
+CcCtx *live(CcOrdering order = CC_ORDERED) {
     CcCtx *c = cur();
     if (!c || !c->up || c->lost) return nullptr;
     if (cudaSetDevice(c->device) != cudaSuccess) { c->lost = 1; (void)cudaGetLastError(); return nullptr; }
+    if (order == CC_ORDERED && c->down_seq != c->down_joined && !cc_join_down(c)) return nullptr;
     return c;
 }
 int cc_ok(CcCtx *c, cudaError_t e, const char *what) {
@@ -116,10 +124,27 @@ int cc_ok(CcCtx *c, cudaError_t e, const char *what) {
     if (c) c->lost = 1;
     return 0;
 }
-int launched(CcCtx *c, const char *what) { g_st.ops++; return cc_ok(c, cudaGetLastError(), what); }
+int launched(CcCtx *c, const char *what) { g_st.ops++; return !c->lost && cc_ok(c, cudaGetLastError(), what); }
+static int cc_join_down(CcCtx *c) {
+    if (!cc_ok(c, cudaStreamWaitEvent(c->stream, c->ev_down_done, 0), "copy down order")) return 0;
+    c->down_joined = c->down_seq;
+    return 1;
+}
+static void cc_down_access(const CcBuf *b) {
+    if (b && b->down_seq && g_cur >= 0 && b->down_seq > g_cc[g_cur].down_joined)
+        (void)cc_join_down(&g_cc[g_cur]);
+}
 unsigned grid1(size_t n, unsigned block) { size_t g = (n + block - 1) / block; return g > 0x7fffffffu ? 0x7fffffffu : (unsigned)g; }
-const float *fp(const CcBuf *b) { return b ? b->d : nullptr; }
-float *fpw(CcBuf *b) { return b ? b->d : nullptr; }
+const float *fp(const CcBuf *b) {
+    if (b && b->kind == CC_DOWN) cc_down_access(b);
+    return b ? b->d : nullptr;
+}
+float *fpw(CcBuf *b) {
+    if (b && g_cur >= 0 && g_cc[g_cur].device_profile) {
+        cc_down_access(b);
+    }
+    return b ? b->d : nullptr;
+}
 }
 
 /* ---- kernels: shaders/chain_*.comp, line for line --------------------------- */
@@ -302,7 +327,7 @@ __device__ __forceinline__ float4 cc_kv4(const __half *p, size_t i) {
     return make_float4(a.x, a.y, b.x, b.y);
 }
 #endif
-template <typename KT> static const KT *kvp(CcBuf *b) { return b ? reinterpret_cast<const KT *>(b->d) : nullptr; }
+template <typename KT> static const KT *kvp(CcBuf *b) { return reinterpret_cast<const KT *>(fp(b)); }
 /* one block of 128 per (head, row); K and V rows read once per tile of 128 positions;
  * hd <= 256: two dims per thread */
 /* win > 0: a sliding window, the row's last win positions; snk: a sink logit per head at
@@ -2500,6 +2525,7 @@ static void cc_set_kernel_mask_(unsigned mask) {
     if (change_l2 && !(gran && *gran))
         coli_cuda_set_l2_fetch(c->device, (mask & Q36_PROMPT_CACHE) != 0);
 }
+static int cc_copy_stream(CcCtx *c);
 static int cc_ready(void) { CcCtx *c = cur(); return c && c->up && !c->lost; }
 static int cc_lost_(void) { CcCtx *c = cur(); return !c || !c->up || c->lost; }
 static void cc_shutdown(void) {
@@ -2513,6 +2539,10 @@ static void cc_shutdown(void) {
             if (c->cs_ok) {
                 if (!c->lost) cudaStreamSynchronize(c->cs);
                 for (int s = 0; s < 2; s++) { cudaEventDestroy(c->ev_fetched[s]); cudaEventDestroy(c->ev_free[s]); }
+                if (c->ev_down) {
+                    cudaEventDestroy(c->ev_down);
+                    cudaEventDestroy(c->ev_down_done);
+                }
                 cudaStreamDestroy(c->cs);
             }
             if (c->up_made) { for (int i = 0; i < CC_UP_MARKS; i++) cudaEventDestroy(c->up_ev[i]); cudaEventDestroy(c->up_after); }
@@ -2524,6 +2554,8 @@ static void cc_shutdown(void) {
         c->device_profile = 0;
         c->adec = nullptr; c->adec_bytes = 0;
         (void)cudaGetLastError();
+        c->ev_down = c->ev_down_done = nullptr;
+        c->down_seq = c->down_joined = 0;
         c->up = 0; c->ev_ok = 0; c->cs_ok = 0;
     }
     g_ncc = 0; g_cur = -1;
@@ -2655,8 +2687,27 @@ static int cc_copy_k_on(void) {
     if (on < 0) { const char *e = getenv("COLI_CUDA_COPY_K"); on = !(e && *e == '0'); }
     return on;
 }
+static int cc_readback_events(CcCtx *c) {
+    if (c->ev_down) return 1;
+    cudaEvent_t start, done;
+    cudaError_t err = cudaEventCreateWithFlags(&start, cudaEventDisableTiming);
+    if (err != cudaSuccess) return cc_ok(c, err, "copy down start event");
+    err = cudaEventCreateWithFlags(&done, cudaEventDisableTiming);
+    if (err != cudaSuccess) {
+        (void)cudaEventDestroy(start);
+        return cc_ok(c, err, "copy down completion event");
+    }
+    c->ev_down = start;
+    c->ev_down_done = done;
+    return 1;
+}
+static int cc_async_down_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_CUDA_ASYNC_DOWN"); on = !(e && *e == '0'); }
+    return on;
+}
 static int cc_copy(CcBuf *dst, size_t doff, CcBuf *src, size_t soff, size_t n) {
-    CcCtx *c = live();
+    CcCtx *c = live(CC_OVERLAP_DOWN);
     if (!c || !dst || !src) return 0;
     if (!n) return 1;
     if ((doff + n) * 4 > dst->bytes || (soff + n) * 4 > src->bytes) return 0;
@@ -2664,7 +2715,22 @@ static int cc_copy(CcBuf *dst, size_t doff, CcBuf *src, size_t soff, size_t n) {
     g_st.ops++;
     if (dst->kind != CC_DEV) g_st.bytes_down += n * 4;
     if (src->kind != CC_DEV) g_st.bytes_up += n * 4;
-    if (n * 4 <= CC_COPY_K_MAX && cc_copy_k_on()) {
+    const bool ordered_copies = cc_uses_feature(c, Q36_ASYNC_COPIES);
+    if (c->device_profile) {
+        if (ordered_copies && dst->kind == CC_DOWN && src->kind == CC_DEV && n >= 262144 && cc_async_down_on()) {
+            if (!cc_copy_stream(c) || !cc_readback_events(c) ||
+                !cc_ok(c, cudaEventRecord(c->ev_down, c->stream), "copy down event") ||
+                !cc_ok(c, cudaStreamWaitEvent(c->cs, c->ev_down, 0), "copy down wait") ||
+                !cc_ok(c, cudaMemcpyAsync(dst->d + doff, src->d + soff, n * 4, cudaMemcpyDefault, c->cs), "copy down") ||
+                !cc_ok(c, cudaEventRecord(c->ev_down_done, c->cs), "copy down completion")) return 0;
+            src->down_seq = dst->down_seq = ++c->down_seq;
+            return 1;
+        }
+    }
+    cc_down_access(dst);
+    (void)fp(src);
+    if (c->lost) return 0;
+    if (!ordered_copies && n * 4 <= CC_COPY_K_MAX && cc_copy_k_on()) {
         size_t blocks = (n / 4 + 255) / 256;
         if (blocks < 1) blocks = 1;
         if (blocks > 256) blocks = 256;
@@ -2739,7 +2805,7 @@ static int cc_copy_regions(CcBuf *dst, CcBuf *src, const CcRegion *r, int n) {
     if (!c || !dst || !src || (n > 0 && !r)) return 0;
     for (int i = 0; i < n; i++)
         if ((r[i].dst + r[i].n) * 4 > dst->bytes || (r[i].src + r[i].n) * 4 > src->bytes) return 0;
-    int small = n > 0 && cc_copy_k_on();
+    int small = !cc_uses_feature(c, Q36_ASYNC_COPIES) && n > 0 && cc_copy_k_on();
     for (int i = 0; i < n && small; i++) small = r[i].n * 4 <= CC_COPY_K_MAX && r[i].dst + r[i].n < (1ull << 32) && r[i].src + r[i].n < (1ull << 32);
     if (small && !(n >= 2 && dst != src && cc_grid_run(r, n) == n)) {   /* scattered regions: a block each, by kernel */
         for (int i = 0; i < n; i += CC_REG_K) {
@@ -2795,11 +2861,14 @@ static int cc_read(CcBuf *src, size_t off, void *dst, size_t bytes) {
 
 /* ---- ops --------------------------------------------------------------------------- */
 static int cc_matmul(ColiCudaTensor *t, CcBuf *x, size_t xo, CcBuf *y, size_t yo, int S) {
-    CcCtx *c = live();
+    CcCtx *c = live(CC_OVERLAP_DOWN);
     if (!c || !t || !x || !y || S < 1) return 0;
     int fmt, I, O;
     if (!coli_cuda_tensor_shape(t, &fmt, &I, &O) || coli_cuda_tensor_device(t) != c->device) return 0;
     if ((xo + (size_t)S * I) * 4 > x->bytes || (yo + (size_t)S * O) * 4 > y->bytes) return 0;
+    cc_down_access(y);
+    (void)fp(x);
+    if (c->lost) return 0;
     g_st.matmuls++; g_st.ops++;
     /* the input of the last matmul, with no call to the chain between (q, k and v; gate and up): its
      * quantization stays */
@@ -2839,7 +2908,7 @@ static int cc_matmul_glu(ColiCudaTensor *wg, ColiCudaTensor *wu, CcBuf *x, CcBuf
     return 1;
 }
 static int cc_norm(CcBuf *x, CcBuf *w, CcBuf *y, const CcNorm *p) {
-    CcCtx *c = live();
+    CcCtx *c = live(CC_OVERLAP_DOWN);
     if (!c || !x || !y || !p || p->nseg < 1 || p->D < 1 || p->per_row < 1) return 0;
     if (!(p->flags & CC_NORM_NOW) && !w) return 0;
     coli_launch(cc_norm_k, grid1((size_t)p->nseg, 1), 256, 0, c->stream, fp(x), fp(w), fpw(y), *p);
@@ -3190,7 +3259,7 @@ static void cc_decg_launch(CcCtx *c, int G, const float *q, const KT *kc, const 
 }
 template <typename KT>
 static int cc_attn_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *sel, const CcAttn *p) {
-    CcCtx *c = live();
+    CcCtx *c = live(CC_OVERLAP_DOWN);
     if (!c || !q || !kc || !vc || !o || !p || p->S < 1 || p->H < 1 || p->KVH < 1 || p->H % p->KVH || p->hd < 1 || p->hd > 256) return 0;
     if (p->has_gate && !gate) return 0;
     if (p->sel_row > 0 && !sel) return 0;
@@ -3231,7 +3300,7 @@ static int cc_attn_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBu
      * a (head, row) walking up to its budget's positions, 104-144 us a layer on an RTX PRO 4000);
      * their bits then are not those the same rows get in a prompt chunk (cc_attn_gk, cc_attn_k's).
      * COLI_CUDA_ATTN_DEC_SEL=0 keeps cc_attn_k for them (read each call) */
-    const int *sp = sel ? (const int *)sel->d : nullptr;
+    const int *sp = (const int *)fp(sel);
     int lists = 0;
     if (p->sel_row > 0) { const char *e = getenv("COLI_CUDA_ATTN_DEC_SEL"); lists = !(e && *e == '0') && sp; }
     if (dec && (p->sel_row <= 0 ? fk : lists) && p->S <= CC_ATTN_DEC_ROWS && last >= CC_ATTN_DEC_MIN) {
@@ -3302,17 +3371,18 @@ static int cc_attn_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBu
 #undef CC_ATTN_G
     }
     dim3 grid((unsigned)p->H, (unsigned)p->S);
-    coli_launch(cc_attn_k<KT>, grid, 128, 0, c->stream, fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), sel ? (const int *)sel->d : nullptr, *p, 0, nullptr, 0, 0);
+    coli_launch(cc_attn_k<KT>, grid, 128, 0, c->stream, fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), sp, *p, 0, nullptr, 0, 0);
     return launched(c, "attn");
 }
 static int cc_attn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *sel, const CcAttn *p) {
     return cc_attn_t<float>(q, kc, vc, o, gate, sel, p);
 }
 static int cc_dnconv(CcBuf *in, CcBuf *w, CcBuf *ring, CcBuf *out, CcBuf *snap, const CcDnConv *p) {
-    CcCtx *c = live();
+    CcCtx *c = live(CC_OVERLAP_DOWN);
     if (!c || !in || !w || !ring || !out || !p || p->S < 1 || p->CD < 1 || p->CK < 2 || p->CK > 9) return 0;
     if ((p->snap_row >= 0 || p->snap_n > 0) && !snap) return 0;
     if (p->snap_n > 0 && (p->snap_row >= 0 || p->snap_n > p->S || p->snap_off % 2 || ((size_t)p->snap_off + 2 * (size_t)p->snap_n) * 4 > snap->bytes)) return 0;
+    if (p->snap_n > 0 && c->down_seq != c->down_joined && !cc_join_down(c)) return 0;
     if (p->S > 1 && p->S < 65536) {   /* a prompt's rows apart, then the ring past them */
         dim3 g((unsigned)((p->CD + 127) / 128), (unsigned)p->S);
         coli_launch(cc_dnconv_rows_k, g, 128, 0, c->stream, fp(in), fp(w), fp(ring), fpw(out), *p);
@@ -3324,11 +3394,12 @@ static int cc_dnconv(CcBuf *in, CcBuf *w, CcBuf *ring, CcBuf *out, CcBuf *snap, 
     return launched(c, "dnconv");
 }
 static int cc_dnrec(int KD, CcBuf *cv, CcBuf *ab, CcBuf *z, CcBuf *st, CcBuf *prm, CcBuf *y, CcBuf *snap, const CcDnRec *p) {
-    CcCtx *c = live();
+    CcCtx *c = live(CC_OVERLAP_DOWN);
     if (!c || !cv || !ab || !z || !st || !prm || !y || !p || p->S < 1 || p->VH < 1 || p->KH < 1 || p->VH % p->KH ||
         p->VD < 1 || p->VD > 128) return 0;
     if ((p->snap_row >= 0 || p->snap_n > 0) && !snap) return 0;
     if (p->snap_n > 0 && (p->snap_row >= 0 || p->snap_n > p->S || p->snap_off % 2 || ((size_t)p->snap_off + 2 * (size_t)p->snap_n) * 4 > snap->bytes)) return 0;
+    if (p->snap_n > 0 && c->down_seq != c->down_joined && !cc_join_down(c)) return 0;
     const float *a = fp(cv), *b = fp(ab), *zz = fp(z), *pr = fp(prm);
     float *s = fpw(st), *yy = fpw(y), *sn = fpw(snap);
     if (p->snap_n > 0) goto one;   /* a verify's rows with their copies: one block a head, the rows in order */
@@ -3395,7 +3466,7 @@ one:
     return launched(c, "dnrec");
 }
 static int cc_ew(CcBuf *y, CcBuf *a, CcBuf *b, CcBuf *cb, CcBuf *e, const CcEw *p) {
-    CcCtx *c = live();
+    CcCtx *c = live(CC_OVERLAP_DOWN);
     if (!c || !y || !p || p->n < 1) return 0;
     switch (p->op) {
     case CC_EW_ADD: case CC_EW_SWIGLU: if (!a || !b) return 0; break;
@@ -3450,7 +3521,7 @@ static int cc_ple(CcBuf *keys, CcBuf *hyp, CcBuf *val, CcBuf *prm, CcBuf *gated,
     return launched(c, "ple");
 }
 static int cc_route(CcBuf *l, CcBuf *bias, CcBuf *ids, CcBuf *w, const CcRoute *p) {
-    CcCtx *c = live();
+    CcCtx *c = live(CC_OVERLAP_DOWN);
     if (!c || !l || !ids || !w || !p || p->S < 1 || p->E < 1 || p->E > CC_ROUTE_EMAX || p->K < 1 || p->K > CC_ROUTE_KMAX ||
         p->K > p->E || p->kind < 0 || p->kind > 2 || p->has_bias < 0 || p->has_bias > 2 || (p->has_bias && !bias) || !(p->temp > 0.f) ||
         (p->n_group > 1 && (p->n_group > 64 || p->E % p->n_group || p->topk_group < 1 || p->topk_group > p->n_group))) return 0;
@@ -3468,7 +3539,7 @@ static int cc_route(CcBuf *l, CcBuf *bias, CcBuf *ids, CcBuf *w, const CcRoute *
     return launched(c, "route");
 }
 static int cc_moe(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf *y, CcBuf *hy, const CcMoe *p) {
-    CcCtx *c = live();
+    CcCtx *c = live(CC_OVERLAP_DOWN);
     if (!c || !tab || !ids || !hid || !p || p->parts < 1 || p->parts > 3 || p->S < 1 || p->K < 1) return 0;
     if ((p->parts & 1) && !x) return 0;
     if ((p->parts & 2) && (!w || !y || (p->h_off >= 0 && !hy))) return 0;
@@ -3480,7 +3551,7 @@ static int cc_moe(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf 
         (p->act == 1 && !(p->act_a > 0.f && p->act_b > 0.f)) ||
         (p->esc_off && (p->esc_off % 8 || p->E < 1 || (size_t)p->esc_off + (size_t)(p->t_off + p->E) * 8 > tab->bytes))) return 0;
     g_st.ops++;
-    if (!coli_cuda_moe_async(c->device, (const CcExpert *)tab->d, fp(x), (const int *)ids->d, fp(w), fpw(hid), fpw(y), fp(hy), p,
+    if (!coli_cuda_moe_async(c->device, (const CcExpert *)fp(tab), fp(x), (const int *)fp(ids), fp(w), fpw(hid), fpw(y), fp(hy), p,
                              (void *)c->stream)) { c->lost = 1; return 0; }
     return 1;
 }
@@ -3505,7 +3576,7 @@ static int cc_moe_cols(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, C
     if (cc_moe_hid_floats(p->S, p->K, cols < p->D ? cols : p->D, p->I, p->E) * 4 > hid->bytes ||
         (size_t)(p->x_off + (size_t)(p->S - 1) * p->x_row + p->D) * 4 > x->bytes ||
         (size_t)(p->y_off + (size_t)(p->S - 1) * p->y_row + p->D) * 4 > y->bytes) return -1;
-    const int r = coli_cuda_moe_cols_async(c->device, (const CcExpert *)tab->d, fp(x), (const int *)ids->d, fp(w), fpw(hid), fpw(y), p,
+    const int r = coli_cuda_moe_cols_async(c->device, (const CcExpert *)fp(tab), fp(x), (const int *)fp(ids), fp(w), fpw(hid), fpw(y), p,
                                            cols, (void *)c->stream);
     if (r > 0) { g_st.ops++; return 1; }
     if (r == 0) c->lost = 1;
@@ -3795,13 +3866,13 @@ static int cc_lfm3(void) { return 1; }   /* dnconv's order 2, ew's HEADGATE */
 static int cc_pick(CcBuf *logits, CcBuf *out, int n) {
     CcCtx *c = live();
     if (!c || !logits || !out || n < 1 || (size_t)n * 4 > logits->bytes || out->bytes < 8) return 0;
-    coli_launch(cc_pick_k, 1, 256, 0, c->stream, fp(logits), out->d, n);
+    coli_launch(cc_pick_k, 1, 256, 0, c->stream, fp(logits), fpw(out), n);
     return launched(c, "pick");
 }
 static int cc_pick_rows(CcBuf *logits, size_t off, CcBuf *out, int n, int rows) {
     CcCtx *c = live();
     if (!c || !logits || !out || n < 1 || rows < 1 || (off + (size_t)rows * n) * 4 > logits->bytes || out->bytes < (size_t)rows * 8) return 0;
-    coli_launch(cc_pick_k, (unsigned)rows, 256, 0, c->stream, fp(logits) + off, out->d, n);
+    coli_launch(cc_pick_k, (unsigned)rows, 256, 0, c->stream, fp(logits) + off, fpw(out), n);
     return launched(c, "pick rows");
 }
 static int cc_matmul_rows(ColiCudaTensor *t, CcBuf *ids, CcBuf *x, CcBuf *y, int n) {
@@ -3841,11 +3912,12 @@ __global__ static void cc_copy_grid_h_k(__half *__restrict__ d, const float *__r
     d[g.d0 + q * g.dq + h * g.dh + j] = __float2half_rn(s[g.s0 + q * g.sq + h * g.sh + j]);
 }
 static int cc_copy_regions_h(CcBuf *dst, CcBuf *src, const CcRegion *r, int n) {
-    CcCtx *c = live();
+    CcCtx *c = live(CC_OVERLAP_DOWN);
     if (!c || !dst || !src || !dst->d || !src->d || dst == src || (n > 0 && !r)) return 0;
     for (int i = 0; i < n; i++)
         if ((r[i].dst + r[i].n) * 2 > dst->bytes || (r[i].src + r[i].n) * 4 > src->bytes) return 0;
-    __half *d = reinterpret_cast<__half *>(dst->d);
+    __half *d = reinterpret_cast<__half *>(fpw(dst));
+    (void)fp(src);
     for (int i = 0; i < n; ) {
         int k = cc_grid_run(r + i, n - i);
         CcGrid g;

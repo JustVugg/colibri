@@ -96,6 +96,8 @@ static void every_expert_pooled(void) {
     qt_source_planar(1);
     check(qt_init(NL, NE, D, IH, NE, TOPK, 64, 1), "tier starts again, every expert to be pooled");
     warm(1);
+    check(qt_chain_host_count() == NL * NE && fake_host_regs - fake_host_unregs == 2 * NL * NE,
+          "every expert pooled: all sixteen page-locked, the eight residents too");
     check(qt_chain_host_count() == NL * NE && all_pooled() && fake_host_regs - fake_host_unregs == 2 * NL * NE &&
           G_host_bytes == NL * NE * eb && G_host_all, "every expert pooled: all sixteen page-locked, the eight residents too, their bytes counted");
     qt_chain_changes(chg, 16, &over);   /* the recording starts */
@@ -117,6 +119,7 @@ static void every_expert_pooled(void) {
     got = qt_evicted_take(el, ee, 8);
     check(freed == 2 * G.exp_bytes && got == 2 && !resident(el[0], ee[0]) && !resident(el[1], ee[1]) &&
           pooled(el[0], ee[0]) && pooled(el[1], ee[1]), "the give-back: two residents leave the card, both in the pool already");
+    check(G.nres == 6, "the resident count follows the two give-backs after promotion");
     check(qt_chain_epoch() != ep && qt_chain_changes(chg, 16, &over) == 2 && !over,
           "the give-back: the epoch moved and the change list has the two (the chain's staged table is rebuilt from them)");
     unregs = fake_host_unregs;
@@ -239,6 +242,7 @@ int main(void) {
     qt_chain_promote_done(pr[0].ci, pr[0].vi, 1);
     qt_chain_promote_done(pr[1].ci, pr[1].vi, 1);
     qt_chain_promote_done(pr[2].ci, pr[2].vi, 0);   /* a copy that failed: the victim's buffers hold neither */
+    check(G.nres == 7, "a failed promotion lowers the resident count by one");
     int vl[3], ve[3];
     for (int k = 0; k < 3; k++) vl[k] = pr[k].vi / NE, ve[k] = pr[k].vi % NE;
     check(!resident(vl[0], ve[0]) && !resident(vl[1], ve[1]) && !resident(vl[2], ve[2]) &&
