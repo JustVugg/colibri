@@ -1982,7 +1982,8 @@ static int q36cc_dm_begin(Q36CChain *ch, Model *m, int n) {
     }
     if (!cc_reserve(&ch->dm_ids, (size_t)L * r * K * 4, CC_DEV) || !cc_reserve(&ch->dm_w, (size_t)L * r * K * F, CC_DEV) ||
         !cc_reserve(&ch->dm_idsd, (q36cc_permits(ch, Q36_ASYNC_COPIES) ? 2 : 1) * (size_t)L * r * K * 4, CC_DOWN) || !cc_reserve(&ch->dm_wd, (size_t)L * r * K * F, CC_DOWN) ||
-        !cc_reserve(&ch->dm_hid, cc_moe_hid_floats((int)r, K, D, I, E) * F, CC_DEV) || !cc_reserve(&ch->dm_y, r * D * F, CC_DEV) ||
+        (!ch->device_profile && !cc_reserve(&ch->dm_hid, cc_moe_hid_floats((int)r, K, D, I, E) * F, CC_DEV)) ||
+        !cc_reserve(&ch->dm_y, r * D * F, CC_DEV) ||
         !cc_reserve(&ch->dm_hy, r * D * F, CC_UP) || !cc_reserve(&ch->dm_dfl, 64, CC_DOWN) || !cc_reserve(&ch->dm_hfl, 64, CC_UP) ||
         !cc_reserve(&ch->dm_tab, ne * sizeof(CcExpert), CC_DEV)) return 0;
     if (!ch->dm_held) { qt_chain_hold(1); ch->dm_held = 1; }
@@ -2021,6 +2022,11 @@ static int q36cc_dm_begin(Q36CChain *ch, Model *m, int n) {
     for (int i = 0; !any_part && i < L; i++) if (ch->dm_part[i]) any_part = 1;
     if (any_part && ch->pend_books) q36cc_dm_flush_books(ch, m);
     ch->dm_partial = any_part;
+    if (ch->device_profile) {
+        size_t hid_f = q36cc_permits(ch, Q36_EXPERT_MATMUL) ? cc_moe_tiled_hid_floats((int)r, K, D, I, E)
+                                             : cc_moe_hid_floats((int)r, K, D, I, E);
+        if (!cc_reserve(&ch->dm_hid, hid_f * F, CC_DEV)) return 0;
+    }
     /* the staged table (a prompt chunk's host-pool copies) follows the residents when a chunk needs it,
      * and on a large chunk the pool first (q36cc_follow) */
     int stage = n > Q36CC_STAGE_ROWS && qt_chain_host_count() > 0 && !ch->dm_stage_off && cc_fetch_ready();
@@ -2120,13 +2126,16 @@ static int q36cc_dm_layer(Q36CChain *ch, Model *m, Layer *l, int i, int n, unsig
              cc_copy(ch->dm_wd, io, ch->dm_w, io, (size_t)n * K) &&
              cc_copy(ch->h2d, 0, ch->h2, 0, (size_t)n * D) && cc_signal(ch->dm_dfl, 0, *v);
     }
+    if (q36cc_permits(ch, Q36_EXPERT_MATMUL) && !*v) mp.parts = 3;
     ok = ok && q36cc_shared(ch, m, l, i, n) && (!stg || q36cc_fetch_wait(ch, i)) &&
          cc_moe(tab, ch->h2, ch->dm_ids, ch->dm_w, ch->dm_hid, ch->dm_y, NULL, &mp);
-    if (ok && stg) ok = q36cc_fetch_done(ch, i) && (ch->dm_routed || q36cc_stage_from(ch, m, i + 1, q36cc_banks(ch)));   /* the sum below reads no weights;
-                                                                          * the next layer for this bank: q36cc_banks staged layers on */
-    if (ok && *v) ok = cc_wait_host(ch->dm_hfl, 0, *v);
-    CcMoe ms = mp; ms.parts = 2; ms.h_off = *v ? 0 : -1;
-    ok = ok && cc_moe(tab, NULL, ch->dm_ids, ch->dm_w, ch->dm_hid, ch->dm_y, ch->dm_hy, &ms);
+    /* The sum reads no weights, so this bank can stage its next layer. */
+    if (ok && stg) ok = q36cc_fetch_done(ch, i) && (ch->dm_routed || q36cc_stage_from(ch, m, i + 1, q36cc_banks(ch)));
+    if (mp.parts == 1) {
+        if (ok && *v) ok = cc_wait_host(ch->dm_hfl, 0, *v);
+        mp.parts = 2; mp.h_off = *v ? 0 : -1;
+        ok = ok && cc_moe(tab, NULL, ch->dm_ids, ch->dm_w, ch->dm_hid, ch->dm_y, ch->dm_hy, &mp);
+    }
     ch->dm_steps++;
     return ok;
 }
@@ -2240,6 +2249,10 @@ static void q36cc_warm_buffers(Model *m) {
     int CH = q36cc_rows_max(ch, m);
     if (!q36cc_mirror(ch, m) || !q36cc_scratch(ch, m, CH)) return;
     if (m->c.n_experts > 0 && ch->dm_on) {
+        const char *ef = getenv("COLI_CUDA_MOE_FUSED");
+        int fused = ef && !strcmp(ef, "1");
+        fprintf(stderr, "[chain] qwen36: moe down: %s (COLI_CUDA_MOE_FUSED=%d)\n",
+                fused ? "atomic accumulation enabled for eligible prompt kernels" : "rank-order sum", fused);
         q36cc_dm_begin(ch, m, 1);
         q36cc_dm_end(ch);
     }

@@ -346,7 +346,9 @@ static int fcc_read(CcBuf *src, size_t off, void *dst, size_t bytes) {
 }
 static int fcc_matmul(ColiCudaTensor *t, CcBuf *x, size_t xo, CcBuf *y, size_t yo, int S) {
     if (!fcc_ready() || !t || !x || !y || S < 1 || !t->w) return 0;
-    if ((xo + (size_t)S * t->I) * 4 > x->bytes || (yo + (size_t)S * t->O) * 4 > y->bytes) return 0;
+    size_t x_floats = x->bytes / sizeof(float), y_floats = y->bytes / sizeof(float);
+    if (xo > x_floats || (size_t)S * t->I > x_floats - xo ||
+        yo > y_floats || (size_t)S * t->O > y_floats - yo) return 0;
     fake_chain_ops++;
     if (y->kind != CC_DEV) fake_chain_host_stores++;
     for (int s = 0; s < S; s++) {
