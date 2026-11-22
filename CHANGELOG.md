@@ -12,7 +12,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   six attempts of a minute each with nothing printed. The setup now names the host it connects to,
   draws the progress bar at once, and prints every retry with its cause and its number
   (`model-00001.safetensors: Temporary failure in name resolution; trying again in 2 s (retry 2
-  of 5)`); the final error names the cause instead of urllib's `<urlopen error ...>`. (#2970)
+  of 5)`); the final error, the file list's included, names the cause instead of urllib's
+  `<urlopen error ...>`. On WSL's Windows path, where curl.exe retries by itself, it says when no
+  byte has arrived for a minute. The web UI's Models page shows the same retry line under the
+  download until bytes arrive again. (#2970)
 
 ## [2.2.0] - 2026-11-21
 

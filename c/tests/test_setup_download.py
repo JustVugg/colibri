@@ -487,6 +487,8 @@ class DownloadTest(unittest.TestCase):
             "args = sys.argv[1:]\n"
             "if os.environ.get('CURL_ARGV_LOG'):\n"
             "    open(os.environ['CURL_ARGV_LOG'], 'w').write('\\n'.join(args))\n"
+            "if os.environ.get('CURL_STALL'):\n"
+            "    import time; time.sleep(float(os.environ['CURL_STALL']))\n"
             "out = args[args.index('-o') + 1]\n"
             "data = urllib.request.urlopen(args[-1]).read()\n"
             "open(out, 'wb').write(data)\n")
@@ -546,6 +548,33 @@ class DownloadTest(unittest.TestCase):
         # read timeout, so a slow but moving link is not cut off.
         self.assertGreaterEqual(value("--speed-time"), 60)
         self.assertEqual(argv[argv.index("-C") + 1], "-")       # still resumes the .part
+
+    def test_windows_curl_transport_tells_when_no_bytes_arrive(self):
+        """#2970: curl.exe retries by itself and silently (-s), so a network that does
+        not answer looked like a hang on WSL's Windows path too."""
+        fake_curl = self.stand_in_curl()
+        name = "README.md"
+        told = []
+        with mock.patch.object(setup_download, "wsl_windows_path", side_effect=lambda p: p), \
+                mock.patch.dict(os.environ, {"CURL_STALL": "1.5"}):
+            result = setup_download.download_file_windows(
+                self.url(name), os.path.join(self.dst, name), self.spec(name), fake_curl,
+                notice=told.append, stall_after=0.4)
+        self.assertEqual(result, "downloaded")
+        self.assertGreaterEqual(len(told), 1)
+        self.assertIn("README.md: no bytes from curl.exe for", told[0])
+        self.assertIn("tries again by itself", told[0])
+        # the notices are spaced by stall_after, not one a poll
+        self.assertLessEqual(len(told), 4)
+
+    def test_listing_failure_names_its_cause(self):
+        def offline(*args, **kwargs):
+            raise setup_download.urllib.error.URLError(OSError(-3, "Temporary failure in name resolution"))
+        with self.assertRaises(setup_download.DownloadError) as caught:
+            setup_download.list_repo_files(REPO, base=self.hub.base, opener=offline)
+        self.assertIn("cannot list files ([Errno -3] Temporary failure in name resolution)",
+                      str(caught.exception))
+        self.assertNotIn("<urlopen error", str(caught.exception))
 
     def test_token_from_file(self):
         with tempfile.TemporaryDirectory() as hf_home:

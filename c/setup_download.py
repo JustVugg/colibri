@@ -117,7 +117,7 @@ def list_repo_files(repo, revision="main", *, include=(), exclude=(), token=None
                 raise DownloadError(f"{repo}@{revision}: not found on {base or endpoint()}")
             raise DownloadError(f"{repo}: listing failed (HTTP {error.code})")
         except (urllib.error.URLError, OSError, ValueError) as error:
-            raise DownloadError(f"{repo}: cannot list files ({error})")
+            raise DownloadError(f"{repo}: cannot list files ({_why(error)})")
         for entry in entries:
             if entry.get("type") != "file":
                 continue
@@ -381,9 +381,12 @@ def probe_throughput_windows(url, curl, *, token=None, max_bytes=4 << 20, max_se
     return speed if speed and speed > 0 else None
 
 
-def download_file_windows(url, dest, spec, curl, *, token=None, progress=None, verify=True):
+def download_file_windows(url, dest, spec, curl, *, token=None, progress=None, verify=True,
+                          notice=None, stall_after=60.0):
     """The same contract as download_file, with Windows' curl.exe doing the transfer
-    into the same `.part` file (curl's own `-C -` resumes it)."""
+    into the same `.part` file (curl's own `-C -` resumes it). curl retries by itself
+    and silently (-s), so `notice(text)` hears instead when no byte has arrived for
+    `stall_after` seconds, and again each time as long again passes (#2970)."""
     size = int(spec["size"])
     if (os.path.exists(dest) and os.path.getsize(dest) == size
             and (not verify or verify_file(dest, spec))):
@@ -418,10 +421,20 @@ def download_file_windows(url, dest, spec, curl, *, token=None, progress=None, v
             cmd[1:1] = ["-H", f"Authorization: Bearer {token}"]
         with tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace") as errors, \
                 subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=errors) as process:
+            seen, moved, told = prefix, time.monotonic(), 0
             while process.poll() is None:
                 time.sleep(1.0)
+                got = os.path.getsize(part) if os.path.exists(part) else 0
                 if os.path.exists(part):
-                    report(os.path.getsize(part))
+                    report(got)
+                now = time.monotonic()
+                if got != seen:
+                    seen, moved, told = got, now, 0
+                elif notice and now - moved >= stall_after * (told + 1):
+                    told += 1
+                    notice(f"{os.path.basename(dest)}: no bytes from curl.exe for "
+                           f"{now - moved:.0f} s; it tries again by itself (up to 5 times), "
+                           "or interrupt and rerun to continue")
             errors.seek(0)
             err = errors.read()
         if process.returncode != 0 and not (os.path.exists(part) and os.path.getsize(part) == size):
@@ -554,7 +567,8 @@ def download_repo(repo, revision, model_dir, files, *, token=None, progress=None
             continue
         url = file_url(repo, revision, spec["path"], base)
         if curl:
-            download_file_windows(url, dest, spec, curl, token=token, progress=on_bytes, verify=verify)
+            download_file_windows(url, dest, spec, curl, token=token, progress=on_bytes, verify=verify,
+                                  notice=notice)
         else:
             download_file(url, dest, spec, token=token, progress=on_bytes, opener=opener,
                           retries=retries, verify=verify, notice=notice)

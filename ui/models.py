@@ -1128,14 +1128,22 @@ def run_download(job, repo, revision, files, dest, after=None):
             # `done` includes bytes already on disk. `fresh` is this run only,
             # so a resume does not report the whole model as one second of speed.
             fresh = ev.get("fresh", ev["done"])
+            if fresh > mark[1] and job.get("note"):
+                job["note"] = ""            # bytes arrive again: the retry's line goes
             if now - mark[0] >= 1.0:
                 gained = max(0, fresh - mark[1])
                 rate = gained / (now - mark[0])
                 job["rate"] = rate if not job["rate"] else 0.7 * job["rate"] + 0.3 * rate
                 job["eta"] = (total - ev["done"]) / job["rate"] if job["rate"] > 0 else None
                 mark[0], mark[1] = now, fresh
-        setup_download.download_repo(repo, revision, dest, files, token=setup_download.hf_token(), progress=progress)
-        job["done"] = total
+
+        def notice(text):
+            # a retry and its cause, while it waits (#2970): the page showed nothing
+            job["note"] = "rete: " + text
+
+        setup_download.download_repo(repo, revision, dest, files, token=setup_download.hf_token(),
+                                     progress=progress, notice=notice)
+        job["done"], job["note"] = total, ""
         if after:
             job["state"] = "installing"
             after(job)

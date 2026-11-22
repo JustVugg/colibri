@@ -102,6 +102,29 @@ class ModelJobIdentityTests(unittest.TestCase):
                     self.assertFalse(thread.is_alive())
                 self.assertFalse(serve.is_alive())
 
+    def test_a_download_job_shows_each_retry_until_bytes_arrive(self):
+        """#2970: the page said nothing while a download retried, until its final error."""
+        job = models.new_job('download', 'fixture')
+        seen = {}
+
+        def pull(*args, progress, notice, **kwargs):
+            notice('model.safetensors: Temporary failure in name resolution; trying again in 1 s '
+                   '(retry 1 of 5)')
+            seen['waiting'] = job['note']
+            progress({'file': 'model.safetensors', 'done': 4, 'total': 10, 'fresh': 4})
+            seen['moving'] = job['note']
+            progress({'file': 'model.safetensors', 'done': 10, 'total': 10, 'fresh': 10})
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(models.setup_download, 'hf_token', return_value=None), \
+                patch.object(models.setup_download, 'bytes_present', return_value=0), \
+                patch.object(models.setup_download, 'download_repo', side_effect=pull):
+            models.run_download(job, 'fixture/m', 'main', [{'path': 'model.safetensors', 'size': 10}], tmp)
+        self.assertEqual(job['state'], 'done', job['msg'])
+        self.assertIn('Temporary failure in name resolution', seen['waiting'])
+        self.assertEqual(seen['moving'], '')
+        self.assertEqual(job['note'], '')
+
 
 if __name__ == '__main__':
     unittest.main()
