@@ -3676,8 +3676,14 @@ static int cc_matmul(ColiCudaTensor *t, CcBuf *x, size_t xo, CcBuf *y, size_t yo
     if (c->lost) return 0;
     g_st.matmuls++; g_st.ops++;
     if (c->device_profile && fmt < 100) {
-        const uint64_t seq = c->in_frame && x->kind == CC_DEV && x != y ? t_cc_seq : 0;
-        if (!coli_cuda_qwen36_gemm_seq_async(t, y->d + yo, x->d + xo, S, (void *)c->stream, seq)) { c->lost = 1; return 0; }
+        int ok;
+        if (c->device_profile == Q36_GPU_PRO4000) {
+            ok = coli_cuda_qwen36_gemm_async(t, y->d + yo, x->d + xo, S, (void *)c->stream);
+        } else {
+            const uint64_t seq = c->in_frame && x->kind == CC_DEV && x != y ? t_cc_seq : 0;
+            ok = coli_cuda_qwen36_gemm_seq_async(t, y->d + yo, x->d + xo, S, (void *)c->stream, seq);
+        }
+        if (!ok) { c->lost = 1; return 0; }
         return 1;
     }
     /* the input of the last matmul, with no call to the chain between (q, k and v; gate and up): its

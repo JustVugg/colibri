@@ -74,6 +74,11 @@ int main(void) {
             check_mask(Q36_GPU_3090, reused - 1, fresh + 1, 0, generation, 1, rtx3090);
         }
     }
+    check_device(12, 0, "NVIDIA RTX PRO 4000 Blackwell", GIB(24), Q36_GPU_PRO4000);
+    unsigned pro4000 = Q36_ALL_FEATURES & ~5696u;
+    check_value(q36_device_features(Q36_GPU_PRO4000), pro4000, "RTX PRO 4000 available features");
+    check_mask(Q36_GPU_PRO4000, 0, 64, 1, 0, 0, pro4000);
+    check_mask(Q36_GPU_PRO4000, 0, 64, 1, 1, 0, pro4000);
     printf("Qwen3.6 CUDA profiles: %u checks, %u failures\n", checks, failures);
     return failures ? 1 : 0;
 }
