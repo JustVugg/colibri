@@ -122,6 +122,7 @@ typedef struct {
     double host_ms, wait_ms, dec_wait_ms, dec_host_ms;
     /* the routed experts in the frame (q38cc_dm_*) */
     int dm_on, dm_fmt, dm_gs, dm_read, dm_held;
+    int *dm_cap0;   /* the layers' RAM cache slots before q38cc_dm_recheck gave them more (q38cc_dm_caps_back) */
     unsigned dm_epoch, dm_seq;
     CcExpert *dm_host; uint8_t *dm_res, *dm_ran, *dm_dev; int *dm_part;   /* dm_ran: the step's layers that ran so */
     CcBuf *dm_ids, *dm_w, *dm_idsd, *dm_wd, *dm_hid, *dm_y, *dm_hy, *dm_dfl, *dm_hfl, *dm_tab;
@@ -748,6 +749,15 @@ static int q38cc_scratch(Q38CChain *ch, Model *m, int rows) {
 static void q38_layer_forward(Model *m,int i,float *hyper,const int *ids,int S,int pos_base,
                               float *mixed,float *inject,float *block);
 static void q38_embed_row(Model *m,int id,int abs_pos,float *out);
+/* The slots q38cc_dm_recheck gave the layers' RAM caches, taken back where the host computes routed experts
+ * again (the frame's buffers refused, the device lost): the gateway's plan sized the caches for the RAM, and
+ * with every expert on the card nothing has filled them. A cache with experts in it keeps its slots. */
+static void q38cc_dm_caps_back(Q38CChain *ch, Model *m) {
+    if (!ch || !ch->dm_cap0) return;
+    for (int i = 0; i < m->c.layers; i++)
+        if (m->cache[i].cap != ch->dm_cap0[i] && !m->cache[i].n) (void)q38_cache_slots_set(&m->cache[i], ch->dm_cap0[i]);
+    free(ch->dm_cap0); ch->dm_cap0 = NULL;
+}
 /* The device was lost with the newest DeltaNet state, conv rings and PLE ring on it.
  * The host's K/V/index rows are canonical, those are not: rebuild them on the CPU by
  * running the `upto` positions the prefix record names (the PLE n-gram history replayed
@@ -757,7 +767,7 @@ static void q38cc_recover(Model *m, int upto) {
     Cfg *c = &m->c; int H = c->hidden, W = c->hc_width, C = c->hc_count, nl = c->layers;
     int ple = c->ple_layer >= 0 && c->ple_layer < nl;
     g_cuda_chain = 0;
-    if (ch) { ch->failed = 1; ch->dn_where = Q38CC_HOST; ch->host_zero = 0; ch->snap_valid = 0; }
+    if (ch) { ch->failed = 1; ch->dn_where = Q38CC_HOST; ch->host_zero = 0; ch->snap_valid = 0; q38cc_dm_caps_back(ch, m); }
     for (int i = 0; i < nl; i++) {
         if (c->is_attn[i]) continue;
         memset(m->DN_rec[i], 0, (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim * sizeof(float));
@@ -1878,10 +1888,12 @@ static void q38cc_dm_recheck(Model *m) {
             ColiCudaTensor *g, *u, *d;
             if (!qt_chain_resident(i, e, ch->dev, &g, &u, &d)) return;   /* the host would compute some */
         }
+    if (!(ch->dm_cap0 = malloc((size_t)L * sizeof(int)))) return;
+    for (int i = 0; i < L; i++) ch->dm_cap0[i] = m->cache[i].cap;
     for (int i = 0; i < L; i++)
-        if (m->cache[i].cap < need && q38_cache_slots_set(&m->cache[i], need)) return;
+        if (m->cache[i].cap < need && q38_cache_slots_set(&m->cache[i], need)) { q38cc_dm_caps_back(ch, m); return; }
     ch->dm_on = q38cc_dm_able(ch, m);
-    if (!ch->dm_on) return;
+    if (!ch->dm_on) { q38cc_dm_caps_back(ch, m); return; }
     q38cc_head_card(ch, m);
     fprintf(stderr, "[chain] qwen38: every routed expert on the card: the layers' RAM caches take %d slots (none of them "
                     "filled) and a decode step's routed experts run in the frame\n", need);
@@ -3621,6 +3633,7 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
             if (cc_lost()) goto lost;
             fprintf(stderr, "[chain] qwen38: the routed experts' buffers or table refused; the host's step from here on\n");
             q38cc_dm_end(ch); ch->dm_on = dm = 0;
+            q38cc_dm_caps_back(ch, m);
         }
         if (dm) memset(ch->dm_ran, 0, (size_t)L);
         /* a short prompt's chunk with the pool's slots on the CPU: two lanes (q38cc_chunk_lanes) */
