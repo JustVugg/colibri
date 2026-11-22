@@ -1469,6 +1469,16 @@ endif
 gliner_decide$(EXE): gliner_decide.c $(CHAIN_CUDA_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
 	$(CC) $(CFLAGS) gliner_decide.c $(CHAIN_CUDA_OBJ) $(VK_OBJ) -o gliner_decide$(EXE) $(LDFLAGS)
 
+# Qwen3-ASR speech-to-text (docs/plans/2026-11-22-qwen3-asr-port.md).
+# MVP scaffold: serve protocol + transcription endpoint wiring; model inference
+# (mel frontend, audio encoder, projector, Qwen3 decoder) is being implemented.
+ifneq ($(EXE),)
+.PHONY: qwen3_asr
+qwen3_asr: qwen3_asr$(EXE)
+endif
+qwen3_asr$(EXE): qwen3_asr.c $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) qwen3_asr.c $(VK_OBJ) -o qwen3_asr$(EXE) $(LDFLAGS)
+
 # Tiny Laya checkpoint + the laya package's own answers on it. The generator is
 # numpy and deterministic; laya_tiny/ref.json is committed and comes from the
 # `laya` package (tools/make_laya_ref.py, maintainer-run, fixture SHA-256

@@ -78,6 +78,12 @@ CATALOG = (
         summary="coding model with tool calls, no thinking; int4-gs64 container",
         prebuilt_since="2.0.0", doc="docs/qwen36.md#qwen3-coder-30b-a3b"),
     CatalogModel(
+        id="qwen3-asr-1.7b", family="qwen3_asr", name="Qwen3-ASR-1.7B",
+        repo="Qwen/Qwen3-ASR-1.7B", disk_gb=4.5,
+        ram_min_gb=6, ram_good_gb=8, dense_gb=4.0, rank=2, size_class="small",
+        summary="speech-to-text ASR (52 languages/dialects), BF16 safetensors; MVP in progress",
+        doc="docs/plans/2026-11-22-qwen3-asr-port.md"),
+    CatalogModel(
         id="deepseek-v4-flash-reap", family="deepseek_v4", name="DeepSeek V4 Flash REAP 150B",
         repo="puwaer/DeepSeek-V4-Flash-0731-reap-150b", disk_gb=84.7,
         ram_min_gb=16, ram_good_gb=32, dense_gb=7.9, rank=4, size_class="large",
