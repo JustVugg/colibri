@@ -904,7 +904,8 @@ hits); with the experts mostly in VRAM the dense part is a larger share of the s
 With the routed experts in the frame (a GGUF's), a layer whose slots are all the card's (no
 slot the host computes, no staged copy) ends its last segment with its router, routes, shared
 expert and experts instead of the router's copies down; a layer with a hosted slot or a staged
-copy runs op by op. A GGUF's block matrices quantize their input into a scratch of the backend's
+copy runs op by op, and so does the layer after a hosted one (freeing a graph waits for the
+stream, which waits for that layer's host share). A GGUF's block matrices quantize their input into a scratch of the backend's
 that grows, and moves, for a prompt's rows: its address (the optional `graph_scratch` op) is in a
 segment's fingerprint, so a graph that holds the old one is never replayed; with a DLL without
 the op a GGUF keeps the switch off. Measured on an RTX 5090 (Windows, Qwen3.8-Flash-Next

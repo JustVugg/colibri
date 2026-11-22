@@ -653,10 +653,10 @@ static Q38CChain *q38cc_setup(Model *m, int mux_slots) {
     ch->dn_where = Q38CC_HOST;
     { const char *e = getenv("COLI_CUDA_CHAIN_FAULT"); ch->fault_at = e && *e ? strtoull(e, NULL, 10) : 0; }
     if (q38_env_bool("Q38_CC_GRAPH", 0)) {
-        if (g_q38_gguf && !cc_graph_scratch_ready())   /* a GGUF's block matrices quantize into a scratch the backend may move */
-            fprintf(stderr, "[chain] qwen38: Q38_CC_GRAPH: the CUDA backend does not say where a GGUF's matrices quantize (an older DLL); the ops run one by one\n");
-        else if (!cc_graph_ready() || !cc_dev_addr_ready() || !cc_moe_ready())
+        if (!cc_graph_ready() || !cc_dev_addr_ready() || !cc_moe_ready())
             fprintf(stderr, "[chain] qwen38: Q38_CC_GRAPH: the CUDA backend has no graphs (an older DLL, or HIP); the ops run one by one\n");
+        else if (g_q38_gguf && !cc_graph_scratch_ready())   /* a GGUF's block matrices quantize into a scratch the backend may move */
+            fprintf(stderr, "[chain] qwen38: Q38_CC_GRAPH: the CUDA backend does not say where a GGUF's matrices quantize (an older DLL); the ops run one by one\n");
         else if ((ch->gr = (Q38CcGraph *)calloc((size_t)L * Q38G_SEGS * Q38G_WAYS, sizeof *ch->gr))) ch->g_on = 1;
     }
     ch->ok = 1;
@@ -3621,7 +3621,8 @@ static void q38cc_pd_end(Q38CChain *ch, int S, int pd, double sec) {
  * the routed experts in the frame (a GGUF's), a layer whose experts are all the card's (no slot the
  * host computes, nothing staged) has its router, routes, shared expert and experts at the end of
  * its last segment instead of the router's copies down, and no segment 2; a layer with a hosted
- * slot or a staged copy runs op by op, as before. A GGUF's block matrices quantize their input into
+ * slot or a staged copy runs op by op, as before, and so does the layer after a hosted one (freeing
+ * a graph waits for the stream, which waits for that layer's host share). A GGUF's block matrices quantize their input into
  * the backend's scratch: its address (graph_scratch) is in a segment's fingerprint, so a graph
  * captured before it moved (a prompt's rows grow it) is never replayed. Not with DFlash2's drafter
  * or a prompt's rows. The [chain] line's ops and matmuls count a graph's ops once, when it was
@@ -3817,9 +3818,11 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
         if (gr) { ch->g_fp0 = q38g_fp0(ch); if (dm) ch->g_fp0 = q38g_buf(ch->g_fp0, q38cc_dm_tab(ch, n)); }
         for (int i = 0; i < L && ok; i++) {
             Layer *l = &m->L[i];
-            /* with the routed experts in the frame: a layer whose slots are all the card's, on a table nothing is staged to */
+            /* with the routed experts in the frame: a layer whose slots are all the card's, on a table nothing is staged to,
+             * with no host share of the layer before still to serve (q38cc_seg may free a graph, which waits for the
+             * stream, and the stream waits for that share: the device's 30 s wait, then the chain lost) */
             const int gl = gr && (!dm || (n <= Q38CC_DM_ROWS && !q38cc_dm_hosted(ch, i, n) && q38cc_dm_tab(ch, n) != ch->dm_tabb &&
-                                          (!pending || routed == ch->dm_y)));
+                                          !pend_v && (!pending || routed == ch->dm_y)));
             const unsigned long long fp = gl ? q38g_fp(ch, m, i) : 0;
             if (gl) {   /* q38cc_seg's segments, in the order of the ops below (the router and its copies in them) */
                 int apply = pending;
@@ -3829,8 +3832,7 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
                 if (c->is_attn[i]) ok = ok && q38cc_attn_mid(ch, m, i, n, pb) && q38cc_seg(ch, m, i, 1, n, c0, ns, 0, dm, fp);
                 if (dm) {   /* the routed experts ran in the segment: on as the op-by-op branch below goes on */
                     ch->dm_ran[i] = 1; ch->dm_steps = steps + 1;
-                    if (ok && pend_v) ok = q38cc_dm_serve(ch, m, pend_i, n, pend_v);
-                    pend_i = i; pend_v = 0; routed = ch->dm_y; pending = 1;
+                    pend_i = i; routed = ch->dm_y; pending = 1;   /* pend_v: 0 (gl) */
                     continue;
                 }
             } else {
