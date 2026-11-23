@@ -1,0 +1,68 @@
+{
+  "meta": {
+    "platform": "Linux-6.8.0-111-generic-x86_64-with-glibc2.39",
+    "python": "3.12.3",
+    "machine": "x86_64",
+    "processor": "x86_64",
+    "omp_num_threads": "16",
+    "cpu_count": 24,
+    "repeats": 1,
+    "model": "/home/dorin/.cache/huggingface/hub/models--Qwen--Qwen3-ASR-1.7B/snapshots/7278e1e70fe206f11671096ffdd38061171dd6e5",
+    "gguf": null,
+    "mmproj": null,
+    "colibri_cmd": [
+      "./c/qwen3_asr",
+      "--model",
+      "/home/dorin/.cache/huggingface/hub/models--Qwen--Qwen3-ASR-1.7B/snapshots/7278e1e70fe206f11671096ffdd38061171dd6e5",
+      "--serve"
+    ],
+    "llama_cmd": []
+  },
+  "rows": [
+    {
+      "engine": "colibri",
+      "sample": "hello",
+      "rep": 0,
+      "cold": true,
+      "wer": "0/9",
+      "cer": "0/40",
+      "rtf": 4.7391,
+      "wall_s": 15.9235,
+      "audio_s": 3.36,
+      "load_s": 4.0491,
+      "rss_peak_kb": 4846240,
+      "text": "Hello, world. This is a test of speech recognition.",
+      "error": null
+    },
+    {
+      "engine": "colibri",
+      "sample": "weather",
+      "rep": 0,
+      "cold": false,
+      "wer": "0/10",
+      "cer": "0/39",
+      "rtf": 4.8173,
+      "wall_s": 12.1395,
+      "audio_s": 2.52,
+      "load_s": 4.0491,
+      "rss_peak_kb": 4846240,
+      "text": "The weather today is sunny with a chance of rain.",
+      "error": null
+    },
+    {
+      "engine": "colibri",
+      "sample": "numbers",
+      "rep": 0,
+      "cold": false,
+      "wer": "0/10",
+      "cer": "0/39",
+      "rtf": 5.2792,
+      "wall_s": 16.6558,
+      "audio_s": 3.155,
+      "load_s": 4.0491,
+      "rss_peak_kb": 4846240,
+      "text": "One, two, three, four, five, six, seven, eight, nine, ten.",
+      "error": null
+    }
+  ]
+}
