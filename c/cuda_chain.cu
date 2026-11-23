@@ -2041,6 +2041,145 @@ __global__ static void __launch_bounds__(128) cc_dnrec_split_k(const float *__re
         #pragma unroll
         for (int i = 0; i < KQ; i++) if (v0 + c < p.VD) st[sb + (P * i + qt) * p.VD + v0 + c] = col[c][i];
 }
+/* one thread per channel, the rows in order, the channel's ring in registers */
+__global__ static void cc_dnconv_tiled_k(const float *__restrict__ xin, const float *__restrict__ w, float *__restrict__ ring,
+                                   float *__restrict__ o, float *__restrict__ snap, CcDnConv p, int fast = 1) {
+    long long c = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= p.CD) return;
+    int nh = p.CK - 1;
+    int wb = p.w_off + (int)c * p.CK;
+    if (fast && p.CK == 4) {
+        size_t rb = (size_t)p.ring_off + (size_t)c * 3;
+        size_t inb = (size_t)p.in_off + (size_t)c, outb = (size_t)p.out_off + (size_t)c;
+        int s0 = (int)blockIdx.y * 64, s1 = gridDim.y > 1 ? min(s0 + 64, p.S) : p.S;
+        if (s0 >= p.S) return;
+        float h0, h1, h2;
+        if (s0 == 0) {
+            h0 = ring[rb]; h1 = ring[rb + 1]; h2 = ring[rb + 2];
+        } else {
+            h0 = __ldg(&xin[inb + (size_t)(s0 - 3) * p.in_row]);
+            h1 = __ldg(&xin[inb + (size_t)(s0 - 2) * p.in_row]);
+            h2 = __ldg(&xin[inb + (size_t)(s0 - 1) * p.in_row]);
+        }
+        float w0 = __ldg(&w[wb]), w1 = __ldg(&w[wb + 1]), w2 = __ldg(&w[wb + 2]), w3 = __ldg(&w[wb + 3]);
+        int s = s0;
+        if (p.order == 0 && p.snap_row < 0) {
+            for (; s + 3 < s1; s += 4) {
+                float c0 = __ldg(&xin[inb + (size_t)s * p.in_row]);
+                float c1 = __ldg(&xin[inb + (size_t)(s + 1) * p.in_row]);
+                float c2 = __ldg(&xin[inb + (size_t)(s + 2) * p.in_row]);
+                float c3 = __ldg(&xin[inb + (size_t)(s + 3) * p.in_row]);
+                // Dev accumulates the first tap into +0, including when the product is -0.
+                float a0 = __fmaf_rn(w0, h0, 0.f); a0 = fmaf(w1, h1, a0); a0 = fmaf(w2, h2, a0); a0 = fmaf(w3, c0, a0);
+                float a1 = __fmaf_rn(w0, h1, 0.f); a1 = fmaf(w1, h2, a1); a1 = fmaf(w2, c0, a1); a1 = fmaf(w3, c1, a1);
+                float a2 = __fmaf_rn(w0, h2, 0.f); a2 = fmaf(w1, c0, a2); a2 = fmaf(w2, c1, a2); a2 = fmaf(w3, c2, a2);
+                float a3 = __fmaf_rn(w0, c0, 0.f); a3 = fmaf(w1, c1, a3); a3 = fmaf(w2, c2, a3); a3 = fmaf(w3, c3, a3);
+                o[outb + (size_t)s * p.out_row]       = a0 / (1.f + expf(-a0));
+                o[outb + (size_t)(s + 1) * p.out_row] = a1 / (1.f + expf(-a1));
+                o[outb + (size_t)(s + 2) * p.out_row] = a2 / (1.f + expf(-a2));
+                o[outb + (size_t)(s + 3) * p.out_row] = a3 / (1.f + expf(-a3));
+                h0 = c1; h1 = c2; h2 = c3;
+            }
+        }
+        for (; s < s1; s++) {
+            float cur = __ldg(&xin[inb + (size_t)s * p.in_row]);
+            float acc;
+            if (p.order == 0) {
+                acc = __fmaf_rn(w0, h0, 0.f); acc = fmaf(w1, h1, acc); acc = fmaf(w2, h2, acc); acc = fmaf(w3, cur, acc);
+            } else {
+                acc = w3 * cur; acc = fmaf(w0, h0, acc); acc = fmaf(w1, h1, acc); acc = fmaf(w2, h2, acc);
+            }
+            o[outb + (size_t)s * p.out_row] = acc / (1.f + expf(-acc));
+            h0 = h1; h1 = h2; h2 = cur;
+            if (s == p.snap_row) {
+                size_t sb = (size_t)p.snap_off + (size_t)c * 3;
+                snap[sb] = h0; snap[sb + 1] = h1; snap[sb + 2] = h2;
+            }
+        }
+        if (blockIdx.y == 0) {
+            if (gridDim.y > 1 && p.S >= 3) {
+                ring[rb]     = __ldg(&xin[inb + (size_t)(p.S - 3) * p.in_row]);
+                ring[rb + 1] = __ldg(&xin[inb + (size_t)(p.S - 2) * p.in_row]);
+                ring[rb + 2] = __ldg(&xin[inb + (size_t)(p.S - 1) * p.in_row]);
+            } else {
+                ring[rb] = h0; ring[rb + 1] = h1; ring[rb + 2] = h2;
+            }
+        }
+        return;
+    }
+    float hist[8];
+    for (int k = 0; k < 8; k++) hist[k] = k < nh ? ring[p.ring_off + c * nh + k] : 0.f;
+    float wl = w[wb + p.CK - 1];
+    for (int s = 0; s < p.S; s++) {
+        float cur = xin[p.in_off + s * p.in_row + c];
+        float acc;
+        if (p.order == 0) {
+            acc = 0.f;
+            for (int k = 0; k < 8; k++) if (k < nh) acc += w[wb + k] * hist[k];
+            acc += wl * cur;
+        } else {
+            acc = wl * cur;
+            for (int k = 0; k < 8; k++) if (k < nh) acc += w[wb + k] * hist[k];
+        }
+        o[p.out_off + s * p.out_row + c] = acc / (1.f + expf(-acc));
+        for (int k = 0; k < 7; k++) if (k + 1 < nh) hist[k] = hist[k + 1];
+        for (int k = 0; k < 8; k++) if (k == nh - 1) hist[k] = cur;
+        if (s == p.snap_row)
+            for (int k = 0; k < 8; k++) if (k < nh) snap[p.snap_off + c * nh + k] = hist[k];
+    }
+    for (int k = 0; k < 8; k++) if (k < nh) ring[p.ring_off + c * nh + k] = hist[k];
+}
+/* 4 contiguous channels per thread (float4 loads/stores, BS rows/block) when CK == 4, order == 0, snap_row < 0 */
+template <int BS = 32>
+__global__ static void __launch_bounds__(128) cc_dnconv_f4_k(const float *__restrict__ xin, const float *__restrict__ w,
+                                                             float *__restrict__ ring, float *__restrict__ o, CcDnConv p) {
+    int c0 = ((int)blockIdx.x * 128 + (int)threadIdx.x) * 4;
+    if (c0 + 3 >= p.CD) return;
+    int s0 = (int)blockIdx.y * BS, s1 = gridDim.y > 1 ? min(s0 + BS, p.S) : p.S;
+    if (s0 >= p.S) return;
+    size_t rb0 = (size_t)p.ring_off + (size_t)c0 * 3;
+    size_t inb = (size_t)p.in_off + (size_t)c0, outb = (size_t)p.out_off + (size_t)c0;
+    float4 h0, h1, h2;
+    if (s0 == 0) {
+        h0 = make_float4(ring[rb0 + 0], ring[rb0 + 3], ring[rb0 + 6], ring[rb0 + 9]);
+        h1 = make_float4(ring[rb0 + 1], ring[rb0 + 4], ring[rb0 + 7], ring[rb0 + 10]);
+        h2 = make_float4(ring[rb0 + 2], ring[rb0 + 5], ring[rb0 + 8], ring[rb0 + 11]);
+    } else {
+        h0 = __ldg(reinterpret_cast<const float4 *>(&xin[inb + (size_t)(s0 - 3) * p.in_row]));
+        h1 = __ldg(reinterpret_cast<const float4 *>(&xin[inb + (size_t)(s0 - 2) * p.in_row]));
+        h2 = __ldg(reinterpret_cast<const float4 *>(&xin[inb + (size_t)(s0 - 1) * p.in_row]));
+    }
+    int wb = p.w_off + c0 * 4;
+    float4 wc0 = __ldg(reinterpret_cast<const float4 *>(&w[wb + 0]));
+    float4 wc1 = __ldg(reinterpret_cast<const float4 *>(&w[wb + 4]));
+    float4 wc2 = __ldg(reinterpret_cast<const float4 *>(&w[wb + 8]));
+    float4 wc3 = __ldg(reinterpret_cast<const float4 *>(&w[wb + 12]));
+    float4 w0 = make_float4(wc0.x, wc1.x, wc2.x, wc3.x);
+    float4 w1 = make_float4(wc0.y, wc1.y, wc2.y, wc3.y);
+    float4 w2 = make_float4(wc0.z, wc1.z, wc2.z, wc3.z);
+    float4 w3 = make_float4(wc0.w, wc1.w, wc2.w, wc3.w);
+    for (int s = s0; s < s1; s++) {
+        float4 cur = __ldg(reinterpret_cast<const float4 *>(&xin[inb + (size_t)s * p.in_row]));
+        float ax = __fmaf_rn(w0.x, h0.x, 0.f); ax = fmaf(w1.x, h1.x, ax); ax = fmaf(w2.x, h2.x, ax); ax = fmaf(w3.x, cur.x, ax);
+        float ay = __fmaf_rn(w0.y, h0.y, 0.f); ay = fmaf(w1.y, h1.y, ay); ay = fmaf(w2.y, h2.y, ay); ay = fmaf(w3.y, cur.y, ay);
+        float az = __fmaf_rn(w0.z, h0.z, 0.f); az = fmaf(w1.z, h1.z, az); az = fmaf(w2.z, h2.z, az); az = fmaf(w3.z, cur.z, az);
+        float aw = __fmaf_rn(w0.w, h0.w, 0.f); aw = fmaf(w1.w, h1.w, aw); aw = fmaf(w2.w, h2.w, aw); aw = fmaf(w3.w, cur.w, aw);
+        *reinterpret_cast<float4 *>(&o[outb + (size_t)s * p.out_row]) = make_float4(
+            ax / (1.f + expf(-ax)), ay / (1.f + expf(-ay)), az / (1.f + expf(-az)), aw / (1.f + expf(-aw)));
+        h0 = h1; h1 = h2; h2 = cur;
+    }
+    if (blockIdx.y == 0) {
+        if (gridDim.y > 1 && p.S >= 3) {
+            h0 = __ldg(reinterpret_cast<const float4 *>(&xin[inb + (size_t)(p.S - 3) * p.in_row]));
+            h1 = __ldg(reinterpret_cast<const float4 *>(&xin[inb + (size_t)(p.S - 2) * p.in_row]));
+            h2 = __ldg(reinterpret_cast<const float4 *>(&xin[inb + (size_t)(p.S - 1) * p.in_row]));
+        }
+        ring[rb0 + 0] = h0.x; ring[rb0 + 1] = h1.x; ring[rb0 + 2] = h2.x;
+        ring[rb0 + 3] = h0.y; ring[rb0 + 4] = h1.y; ring[rb0 + 5] = h2.y;
+        ring[rb0 + 6] = h0.z; ring[rb0 + 7] = h1.z; ring[rb0 + 8] = h2.z;
+        ring[rb0 + 9] = h0.w; ring[rb0 + 10] = h1.w; ring[rb0 + 11] = h2.w;
+    }
+}
 /* cc_dnrec_split_k's rows: each (row, head)'s gated RMSNorm in place, a warp each, cc_dnrec_rows_k's sums */
 __global__ static void __launch_bounds__(128) cc_dnnorm_k(const float *__restrict__ z, const float *__restrict__ prm,
                                                            float *__restrict__ y, CcDnRec p) {
@@ -3904,12 +4043,34 @@ static int cc_attn_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBu
 static int cc_attn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *sel, const CcAttn *p) {
     return cc_attn_t<float>(q, kc, vc, o, gate, sel, p);
 }
+static int cc_dnconv_tiled(CcBuf *in, CcBuf *w, CcBuf *ring, CcBuf *out, CcBuf *snap, const CcDnConv *p) {
+    CcCtx *c = live(CC_OVERLAP_DOWN);
+    if (!c || !in || !w || !ring || !out || !p || p->S < 1 || p->CD < 1 || p->CK < 2 || p->CK > 9) return 0;
+    if (p->snap_row >= 0 && !snap) return 0;
+    static int fast = -1, bench = -1;
+    if (bench < 0) bench = getenv("COLI_CUDA_CHAIN_BENCH") != nullptr || getenv("COLI_CUDA_CHAIN_TEST") != nullptr;
+    if (fast < 0 || bench) { const char *e = getenv("COLI_CUDA_DNCONV_FAST"); fast = e && *e ? atoi(e) : 1; }
+    if (fast == 1 && p->CK == 4 && p->order == 0 && p->snap_row < 0 && p->S > 64) {
+        if ((p->CD & 3) == 0 && ((p->in_off | p->in_row | p->out_off | p->out_row | p->w_off | p->ring_off) & 3) == 0) {
+            dim3 g(grid1((size_t)(p->CD / 4), 128), grid1((size_t)p->S, 32));
+            cc_dnconv_f4_k<32><<<g, 128, 0, c->stream>>>(fp(in), fp(w), fpw(ring), fpw(out), *p);
+        } else {
+            dim3 g(grid1((size_t)p->CD, 128), grid1((size_t)p->S, 64));
+            cc_dnconv_tiled_k<<<g, 128, 0, c->stream>>>(fp(in), fp(w), fpw(ring), fpw(out), fpw(snap), *p, 1);
+        }
+    } else {
+        cc_dnconv_tiled_k<<<grid1((size_t)p->CD, 64), 64, 0, c->stream>>>(fp(in), fp(w), fpw(ring), fpw(out), fpw(snap), *p, fast != 0);
+    }
+    return launched(c, "dnconv");
+}
 static int cc_dnconv(CcBuf *in, CcBuf *w, CcBuf *ring, CcBuf *out, CcBuf *snap, const CcDnConv *p) {
     CcCtx *c = live(CC_OVERLAP_DOWN);
     if (!c || !in || !w || !ring || !out || !p || p->S < 1 || p->CD < 1 || p->CK < 2 || p->CK > 9) return 0;
     if ((p->snap_row >= 0 || p->snap_n > 0) && !snap) return 0;
     if (p->snap_n > 0 && (p->snap_row >= 0 || p->snap_n > p->S || p->snap_off % 2 || ((size_t)p->snap_off + 2 * (size_t)p->snap_n) * 4 > snap->bytes)) return 0;
     if (p->snap_n > 0 && c->down_seq != c->down_joined && !cc_join_down(c)) return 0;
+    if (cc_uses_feature(c, Q36_DNCONV) && p->order != 2 && p->snap_n == 0)
+        return cc_dnconv_tiled(in, w, ring, out, snap, p);
     if (p->S > 1 && p->S < 65536) {   /* a prompt's rows apart, then the ring past them */
         dim3 g((unsigned)((p->CD + 127) / 128), (unsigned)p->S);
         coli_launch(cc_dnconv_rows_k, g, 128, 0, c->stream, fp(in), fp(w), fp(ring), fpw(out), *p);
