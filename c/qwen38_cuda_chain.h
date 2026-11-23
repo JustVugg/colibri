@@ -3626,7 +3626,6 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
                 cs[(s * half + j) * 2] = cosf(ang); cs[(s * half + j) * 2 + 1] = sinf(ang);
             }
         }
-        if (c->ple_layer >= 0 && c->ple_layer < L) q38cc_ple_rows(m, ids, c0, n, ch->host_emb);
         /* the routed experts in the frame (the table before the frame): a decode-sized step's every
          * layer, a prompt chunk's layers whose experts are all on the device or in the host pool (a
          * layer with some on the host keeps the host's step there) */
@@ -3654,6 +3653,10 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
             ch->dn_where = Q38CC_DEV; ch->host_zero = 0;
             continue;
         }
+        /* the chunk's PLE rows, here and not before the lanes: q38cc_chunk_lanes reads each lane's, and
+         * reading the chunk's too moved the two-token history twice (a row not prefetched then hashed
+         * from the chunk's end) */
+        if (c->ple_layer >= 0 && c->ple_layer < L) q38cc_ple_rows(m, ids, c0, n, ch->host_emb);
         if (dm && (sv = q38cc_srv_of(ch, m, n)))
             q38cc_srv_open(sv, (const volatile unsigned *)cc_ptr(ch->dm_dfl), (volatile unsigned *)cc_ptr(ch->dm_hfl),
                            (const float *)cc_ptr(ch->mixd), (float *)cc_ptr(ch->dm_hy));
