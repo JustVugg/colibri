@@ -5,6 +5,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **qwen36 with a GGUF on the CUDA tier no longer holds the placed dense matrices in RAM.** The
+  loader read every matrix into RAM before the tier placed a byte, and kept each placed one
+  beside its VRAM copy: Qwen3.8-27B Q4_K_M with its trunk on a 32 GB card passed 19 GB of RAM, and
+  a 32 GB PC with 22 GB free ran out of memory during the load (now about 8 GB). Now each matrix the tier takes goes from the file
+  to the device through one staging buffer (`Q36_GGUF_STAGE_KB`, 64 MiB), and is read back from
+  the file only if the CPU ever needs it. New optional backend export:
+  `coli_cuda_tensor_upload_rows`.
+
 ## [2.2.0] - 2026-11-21
 
 ### New

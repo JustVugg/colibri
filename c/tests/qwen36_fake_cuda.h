@@ -43,6 +43,9 @@ static int fake_ndev = 1;
 static size_t fake_free_bytes = 2ull << 30;    /* what coli_cuda_mem_info reports as free */
 static int (*fake_issue_hook)(int device, int count, const float *x) = NULL;
 static void (*fake_upload_hook)(int fmt) = NULL;
+/* every block-format matrix's rows as they arrive (fmt >= 100: n rows from row0, whole or a range
+ * of coli_cuda_tensor_upload_rows), for a test that checks the bytes the device would hold */
+static void (*fake_rows_hook)(int fmt, int I, int row0, int n, const void *rows) = NULL;
 
 /* fake_dense_compute=1: coli_cuda_matmul really computes fmt 1 (int8 per
  * row) from the uploaded bytes, so an engine test can put a trunk on the fake
@@ -64,6 +67,7 @@ static int upload_common(ColiCudaTensor **t, const void *w, const float *sc, int
         if (f) { memcpy(f, w, (size_t)I * O * sizeof(float)); n->w = f; n->sc = NULL; } else n->w = NULL;
     }
     *t = n;
+    if (fake_rows_hook && fmt >= 100 && w) fake_rows_hook(fmt, I, 0, O, w);
     fake_uploads++;
     last_fmt = fmt;
     last_bytes = (size_t)I * O / ((fmt == 1 || fmt == 8) ? 1 : 2);
@@ -114,6 +118,23 @@ static int fake_upload_at;
 int coli_cuda_tensor_upload_at(ColiCudaTensor **t, void *dev, size_t cap, const void *w, int fmt, int I, int O, int device) {
     (void)dev; (void)cap; fake_upload_at++;
     return upload_common(t, w, NULL, fmt, I, O, device, 0);
+}
+/* a block-format matrix a range of rows at a time: the first range makes the tensor (one upload),
+ * the rest go to it; nothing is kept (the fake computes no block format). _absent: an older
+ * backend (probe 0); fake_upload_ranges counts the ranges */
+static int fake_upload_rows_absent, fake_upload_ranges;
+int coli_cuda_tensor_upload_rows(ColiCudaTensor **t, const void *w, int fmt, int I, int O, int device, int row0, int n) {
+    if (!t) return !fake_upload_rows_absent;
+    if (fake_upload_rows_absent || !w || fmt < 100 || n < 1 || row0 < 0 || n > O - row0) return 0;
+    if (!*t) {
+        if (row0 || !(*t = (ColiCudaTensor *)calloc(1, sizeof **t))) return 0;
+        if (fake_upload_hook) fake_upload_hook(fmt);
+        (*t)->fmt = fmt; (*t)->I = I; (*t)->O = O; (*t)->device = device;
+        fake_uploads++; last_fmt = fmt;
+    } else if ((*t)->fmt != fmt || (*t)->I != I || (*t)->O != O || (*t)->device != device) return 0;
+    if (fake_rows_hook) fake_rows_hook(fmt, I, row0, n, w);
+    fake_upload_ranges++;
+    return 1;
 }
 size_t coli_cuda_tensor_bytes(const ColiCudaTensor *t) { return t ? (size_t)t->I * (size_t)t->O : 0; }
 int coli_cuda_tensor_overwrite(ColiCudaTensor *t, const void *w, const float *sc) {

@@ -1143,8 +1143,9 @@ static inline int q36_eh(const Cfg *c) { return c->ehid > 0 ? c->ehid : c->hidde
 /* vk_name, vk_tag, vk_quant: what load_tq read it with, to read it back from disk
  * (q36_dho_reload); vk_fmt, vk_gone: with the dense weights on the device only
  * (COLI_VK_DENSE_HOST), the device copy's format and 1 while no host copy is kept.
- * gq_gone: 1 while the CUDA tier holds this GGUF matrix alone (q36_gq_drop): no gq, its
- * gq_type kept; matmul_d reads the rows back from the file first (q36_gq_reload). */
+ * gq_gone: 1 while the CUDA tier holds this GGUF matrix alone (q36_gq_drop), 2 while the loader
+ * has read its header only (load_tq_noted under the CUDA tier, q36_gq_settle): no gq, gq_type
+ * what load_tq gives it; matmul_d reads the rows from the file first (q36_gq_reload). */
 typedef struct { const float *w; int8_t *q; float *sc; int I, O; uint8_t *q4; float *sg; int ng;
                  void *vk; int vk_off; uint16_t *h;
                  char *vk_name; const char *vk_tag; int vk_quant, vk_fmt, vk_gone, vk_imported;
@@ -2395,7 +2396,14 @@ static inline int qtd(int hp1, float *y, const float *x, int I, int O){
  * backend does not take the type or the tensor carries a scale the kernels lack. */
 #ifdef COLI_CUDA
 int coli_cuda_block_elems(int fmt);
+struct ColiCudaTensor;
+int coli_cuda_tensor_upload_rows(struct ColiCudaTensor **tensor, const void *weights, int fmt, int I, int O, int device, int row0, int n);
+int coli_cuda_host_register(void *p, size_t bytes);
+void coli_cuda_host_unregister(void *p);
 #endif
+/* a GGUF matrix the loader left in the file (gq_gone 2), read as the tier uploads it (q36_gq_stream) */
+typedef struct { QtRows r; const QW *w[2]; int O0; } Q36Rows;   /* rows [0, O0) of w[0], then w[1]'s */
+static const QtRows *q36_gq_stream(Q36Rows *s, const QW *a, const QW *b, int fmt);
 static int qdw_gq_fmt(const QW *w) {
 #ifdef COLI_CUDA
     if (g_gguf && !w->gq && w->wf16 && w->w) {   /* F16, BF16: blocks of 32 of their 16 bits (q36_wf16_rows) */
@@ -2432,9 +2440,10 @@ static int qdw_place(const QW *w, int dev){
     if (dev == QT_PLACE_CPU) return 0;
     if (!w->q) {
         const int fmt = qdw_gq_fmt(w);
-        uint8_t *rows; const void *src = fmt ? qdw_gq_rows(w, fmt, &rows) : NULL;
-        int h = src ? qt_dense_init_fmt(src, NULL, fmt, w->I, w->O, dev) : -1;
-        if (src) free(rows);
+        Q36Rows s; const QtRows *r = fmt ? q36_gq_stream(&s, w, NULL, fmt) : NULL;
+        uint8_t *rows = NULL; const void *src = fmt && !r ? qdw_gq_rows(w, fmt, &rows) : NULL;
+        int h = src || r ? qt_dense_init_fmt(src, r, NULL, fmt, w->I, w->O, dev) : -1;
+        free(rows);
         if (h >= 0) q36_gq_drop((QW *)w);   /* the device's copy is the one read from here on */
         return h >= 0 ? h + 1 : 0;
     }
@@ -3394,6 +3403,9 @@ static int qwen_dense_mapped(Model *m, const char *name, int I, int O, QW *out) 
  * load (rows are whole blocks: a byte copy), every kernel then rotates the halves as for every
  * other model. q36_gguf_rope_perm: 1 for such a file (muse-spark, Q36_GGUF_ROPE_PERM=0/1 sets it). */
 static int g_q36_rope_perm = 0;
+/* g_q36_gq_defer: main's GGUF run under the CUDA tier, whose loader reads a matrix's header only
+ * (load_tq_noted: g_q36_gq_defer_one, gq_gone 2) and the tier's upload its rows (q36_gq_settle) */
+static int g_q36_gq_defer, g_q36_gq_defer_one;
 static int q36_rope_heads(const Model *m, const char *name) {
     if (!g_q36_rope_perm || !name) return 0;
     size_t L = strlen(name);
@@ -3436,6 +3448,7 @@ static void load_tq(Model *m, const char *name, int I, int O, int quantize, cons
         if (!gq_blk_decoder(t->type)) { fprintf(stderr, "GGUF %s: type %s is not supported\n", t->name, gq_type_name(t->type)); exit(1); }
         if (!gg_scale(t, 1, &out->gs)) out->gs = 1.f;
         if (g_gguf_dry) { out->gq_type = t->type; return; }
+        if (g_q36_gq_defer_one) { out->gq_type = q36_gq_held(t->type, O, I); out->gq_gone = 2; return; }   /* q36_gq_settle */
 #ifdef QWEN36_METAL_GRAPH
         if (QWEN_GRAPH(m) && g_gg_map) {   /* the Metal graph reads the file's blocks in place (qg_dense) */
             out->gq = (uint8_t *)g_gg_map[t->file] + t->off; out->gq_type = t->type; out->mapped = 1;
@@ -3476,14 +3489,24 @@ static void load_tq(Model *m, const char *name, int I, int O, int quantize, cons
     if (getenv("COLI_KEEP_F32")) out->w = p; else { free(p); out->w = NULL; }
 }
 /* load_tq, and under COLI_VULKAN or COLI_CUDA a note of what it read (name, tag, whether it was
- * quantized) for q36_dho_reload and q36_gq_reload. Every resident dense matrix of the model loads here. */
+ * quantized) for q36_dho_reload and q36_gq_reload. Every resident dense matrix of the model loads here.
+ * With g_q36_gq_defer, a GGUF matrix's header only: g_q36_gq_left lists it for q36_gq_settle. */
+static QW **g_q36_gq_left;
+static int g_q36_gq_nleft;
 static void load_tq_noted(Model *m, const char *name, int I, int O, int quantize, const char *tag, QW *out) {
+    g_q36_gq_defer_one = g_q36_gq_defer;
     load_tq(m, name, I, O, quantize, tag, out);
+    g_q36_gq_defer_one = 0;
 #if defined(COLI_VULKAN) || defined(COLI_CUDA)
     out->vk_name = strdup(name); out->vk_tag = tag; out->vk_quant = quantize;
     out->vk_fmt = 0; out->vk_gone = 0;
     if (!out->vk_name) { fprintf(stderr, "OOM dense matrix name\n"); exit(1); }
 #endif
+    if (out->gq_gone == 2) {
+        QW **l = realloc(g_q36_gq_left, (size_t)(g_q36_gq_nleft + 1) * sizeof *l);
+        if (!l) { fprintf(stderr, "OOM dense matrix list\n"); exit(1); }
+        (g_q36_gq_left = l)[g_q36_gq_nleft++] = out;
+    }
 }
 /* ---- GGUF matrices the CUDA tier holds alone --------------------------------------
  * A GGUF matrix the CUDA tier took (qdw_place, the DeltaNet projections, lm_head) gives its
@@ -3491,30 +3514,110 @@ static void load_tq_noted(Model *m, const char *name, int I, int O, int quantize
  * CPU multiplies by it again only after a lost device or a handle the tier turned off, and
  * matmul_d first reads it back here, through load_tq with what it was loaded with (the same
  * bytes: the file's rows, un-permuted and interleaved as at load). Before, every placed matrix
- * kept its host rows: Qwen3.8-27B UD-Q4_K_XL, the trunk on a 32 GB card, held 15.4 GB of RAM
- * beside its VRAM copy for the whole run. g_q36_gq_model: set by main where the CUDA tier
- * places the trunk; NULL (every other path) keeps the host rows. */
+ * kept its host rows: Qwen3.8-27B Q4_K_M, the trunk on a 32 GB card, gave back 14.0 GB of RAM
+ * it held beside its VRAM copy for the whole run. g_q36_gq_model: set by main where the CUDA tier
+ * places the trunk; NULL (every other path) keeps the host rows.
+ * Nor does the loader read them first: under the CUDA tier it reads a GGUF matrix's header only
+ * (gq_gone 2), the tier's upload reads its rows from the file a range at a time through one
+ * staging buffer (q36_gq_stream: Q36_GGUF_STAGE_KB, 64 MiB, pinned where the backend gives it),
+ * and q36_gq_settle reads the matrices the tier did not take, as load_tq would have at load.
+ * Before, the loader read all of them into RAM first: that model passed 19 GB of RAM during the
+ * load and a 32 GB PC with 22 GB free ran out of memory; streamed, it runs in about 8 GB. */
 static Model *g_q36_gq_model;
 static pthread_mutex_t g_q36_gq_mx = PTHREAD_MUTEX_INITIALIZER;
 static size_t g_q36_gq_dropped;
 static int g_q36_gq_ndrop, g_q36_gq_nreload;
 static void q36_gq_drop(QW *w) {
-    if (!g_q36_gq_model || !w->gq || w->mapped || !w->vk_name) return;   /* not noted (an MTP head's): its rows stay */
+    if (!g_q36_gq_model || !(w->gq || w->gq_gone == 2) || w->mapped || !w->vk_name) return;   /* not noted (an MTP head's): its rows stay */
     g_q36_gq_dropped += (size_t)gq_row_bytes(w->gq_type, w->I) * w->O; g_q36_gq_ndrop++;
     free(w->gq); w->gq = NULL;
     __atomic_store_n(&w->gq_gone, 1, __ATOMIC_RELEASE);
 }
+/* load_tq with what w was noted with: the same bytes, the file's rows un-permuted and interleaved as at load */
+static void q36_gq_read(QW *w) {
+    QW t; memset(&t, 0, sizeof t);
+    load_tq(g_q36_gq_model, w->vk_name, w->I, w->O, w->vk_quant, w->vk_tag, &t);
+    w->gq_type = t.gq_type; w->gq = t.gq;
+    __atomic_store_n(&w->gq_gone, 0, __ATOMIC_RELEASE);
+}
 static void q36_gq_reload(QW *w) {
     pthread_mutex_lock(&g_q36_gq_mx);
     if (w->gq_gone) {
-        QW t; memset(&t, 0, sizeof t);
-        load_tq(g_q36_gq_model, w->vk_name, w->I, w->O, w->vk_quant, w->vk_tag, &t);
-        w->gq_type = t.gq_type; w->gq = t.gq;
-        __atomic_store_n(&w->gq_gone, 0, __ATOMIC_RELEASE);
-        if (!g_q36_gq_nreload++)
+        const int back = w->gq_gone == 1;   /* 2: the first read of a matrix the loader left in the file */
+        q36_gq_read(w);
+        if (back && !g_q36_gq_nreload++)
             fprintf(stderr, "[gguf] the CPU multiplies by a matrix the CUDA tier held alone (%s): its rows read back from the file\n", w->vk_name);
     }
     pthread_mutex_unlock(&g_q36_gq_mx);
+}
+static uint8_t *g_q36_stage;
+static size_t g_q36_stage_cap;
+static int g_q36_stage_pinned;
+/* QtRows.read: rows [row0, row0 + n) of s's matrices from the file, un-permuted as load_tq reads
+ * them before it interleaves them for the CPU: the rows qdw_gq_rows gives the device, byte for byte */
+static int q36_gq_file_rows(void *ctx, int row0, int n, void *buf) {
+    const Q36Rows *s = ctx; uint8_t *dst = buf;
+    while (n > 0) {
+        const int k = row0 >= s->O0, r = row0 - (k ? s->O0 : 0), c = k || row0 + n <= s->O0 ? n : s->O0 - row0;
+        const QW *w = s->w[k];
+        const gguf_tensor *t = gg_tensor(w->vk_name);
+        const size_t rb = (size_t)gq_row_bytes(t->type, w->I);
+        const int rh = q36_rope_heads(g_q36_gq_model, w->vk_name);
+        if (gguf_read(gg_ctx_of(t), t, dst, (int64_t)r * rb, (int64_t)c * rb)) { fprintf(stderr, "GGUF %s: read failed\n", t->name); exit(1); }
+        if (rh) q36_rope_unpermute(dst, rb, c / (w->O / rh), w->O / rh);   /* whole heads: QtRows.align */
+        dst += (size_t)c * rb; row0 += c; n -= c;
+    }
+    return 1;
+}
+/* What the tier's upload of a (then b: a DeltaNet's qkv ++ z) reads, when the loader left both
+ * in the file and the backend takes a range of rows; NULL: the caller hands the rows whole */
+static const QtRows *q36_gq_stream(Q36Rows *s, const QW *a, const QW *b, int fmt) {
+#ifdef COLI_CUDA
+    if (a->gq_gone != 2 || (b && b->gq_gone != 2) || !coli_cuda_tensor_upload_rows(NULL, NULL, 0, 0, 0, 0, 0, 0)) return NULL;
+    const gguf_tensor *ta = gg_tensor(a->vk_name), *tb = b ? gg_tensor(b->vk_name) : NULL;
+    if (!ta || ta->type != fmt - 100 || (b && (!tb || tb->type != fmt - 100 || b->I != a->I))) return NULL;
+    const int rh = b ? 0 : q36_rope_heads(g_q36_gq_model, a->vk_name), align = rh ? a->O / rh : 1;
+    const size_t rb = (size_t)gq_row_bytes(fmt - 100, a->I);
+    if (!g_q36_stage) {
+        const char *e = getenv("Q36_GGUF_STAGE_KB");
+        g_q36_stage_cap = (size_t)(e && atol(e) > 0 ? atol(e) : 65536) << 10;
+        if (!(g_q36_stage = malloc(g_q36_stage_cap))) return NULL;
+        g_q36_stage_pinned = coli_cuda_host_register(g_q36_stage, g_q36_stage_cap);   /* the copies DMA */
+    }
+    if (rb * (size_t)align > g_q36_stage_cap) return NULL;   /* not one range fits */
+    s->w[0] = a; s->w[1] = b; s->O0 = a->O;
+    s->r = (QtRows){ q36_gq_file_rows, s, g_q36_stage, g_q36_stage_cap, rb, align };
+    return &s->r;
+#else
+    (void)s; (void)a; (void)b; (void)fmt;
+    return NULL;
+#endif
+}
+/* After the tier's placement, or where none came: the matrices it did not take read now, as
+ * load_tq would have at load; the staging buffer goes */
+static void q36_gq_settle(void) {
+    if (!g_q36_gq_defer) return;
+    int n = 0; double bytes = 0;
+    pthread_mutex_lock(&g_q36_gq_mx);
+    for (int i = 0; i < g_q36_gq_nleft; i++) {
+        QW *w = g_q36_gq_left[i];
+        if (w->gq_gone != 2) continue;
+        q36_gq_read(w);
+        n++; bytes += (double)gq_row_bytes(w->gq_type, w->I) * w->O;
+    }
+    pthread_mutex_unlock(&g_q36_gq_mx);
+    if (g_q36_stage)
+        fprintf(stderr, "[gguf] the CUDA tier's matrices went from the file to the device through a %zu MiB staging buffer (%s); "
+                        "%d for the CPU read after them (%.2f GB)\n", g_q36_stage_cap >> 20, g_q36_stage_pinned ? "pinned" : "pageable",
+                n, bytes / 1073741824.0);
+    else if (n) fprintf(stderr, "[gguf] %d matrices for the CPU read after the placement (%.2f GB)\n", n, bytes / 1073741824.0);
+#ifdef COLI_CUDA
+    if (g_q36_stage_pinned) coli_cuda_host_unregister(g_q36_stage);
+#endif
+    free(g_q36_stage);
+    g_q36_stage = NULL; g_q36_stage_pinned = 0;
+    free(g_q36_gq_left); g_q36_gq_left = NULL; g_q36_gq_nleft = 0;
+    g_q36_gq_defer = 0;
 }
 #ifdef COLI_VULKAN
 /* ---- dense weights on the device only (COLI_VK_DENSE_HOST) ------------------------
@@ -4792,6 +4895,8 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
          * pre-existing, unrelated bug if this process ever builds two models
          * with different container formats (out of scope here). */
         double resident = rss_gb();
+        for (int i = 0; i < g_q36_gq_nleft; i++)   /* left in the file (q36_gq_settle): counted as read, as before */
+            resident += (double)gq_row_bytes(g_q36_gq_left[i]->gq_type, g_q36_gq_left[i]->I) * g_q36_gq_left[i]->O / 1073741824.0;
         double avail = mem_available_gb();
         const char *ram_env = getenv("RAM_GB");
         double ram_override = ram_env ? atof(ram_env) : 0.0;
@@ -11774,7 +11879,16 @@ int main(int argc, char **argv) {
      * it -- ASan: stack-use-after-return, READ of size 8, in a worker thread,
      * with the run's tokens already correct (#1262). Static storage outlives
      * every thread, so the pointer the worker holds stays valid. */
-    static Model m; model_init(&m, snap, cap, bits);
+    static Model m;
+#ifdef COLI_CUDA
+    /* a GGUF under the CUDA tier: the loader reads each matrix's header, the tier's upload its rows
+     * (Q36_GGUF_STAGE_KB=0: every matrix read at load, as before; the placed ones still give theirs back) */
+    const char *stage_kb = getenv("Q36_GGUF_STAGE_KB");
+    if (g_gguf && getenv("COLI_CUDA") && getenv("COLI_CUDA")[0] == '1' && !(stage_kb && !strcmp(stage_kb, "0"))) {
+        g_q36_gq_defer = 1; g_q36_gq_model = &m;
+    }
+#endif
+    model_init(&m, snap, cap, bits);
     if (g_tok_exact) q36_clef_load(&m, snap);
     g_expert_gs = m.c.expert_gs;
     if (g_expert_gs) fprintf(stderr, "[qwen36] group-scaled experts: gs=%d\n", g_expert_gs);
@@ -12008,8 +12122,9 @@ int main(int argc, char **argv) {
             qt_lmhead_init(m.lm_head.q, m.lm_head.sc, m.lm_head.I, m.lm_head.O);
         else if (qdw_gq_fmt(&m.lm_head)) {   /* a GGUF's blocks */
             const int fmt = qdw_gq_fmt(&m.lm_head);
-            uint8_t *rows; const void *src = qdw_gq_rows(&m.lm_head, fmt, &rows);
-            const int up = src && qt_lmhead_init_fmt(src, NULL, fmt, m.lm_head.I, m.lm_head.O);
+            Q36Rows s; const QtRows *r = q36_gq_stream(&s, &m.lm_head, NULL, fmt);
+            uint8_t *rows = NULL; const void *src = r ? NULL : qdw_gq_rows(&m.lm_head, fmt, &rows);
+            const int up = (src || r) && qt_lmhead_init_fmt(src, r, NULL, fmt, m.lm_head.I, m.lm_head.O);
             free(rows);
             if (up) q36_gq_drop(&m.lm_head);
         }
@@ -12031,12 +12146,13 @@ int main(int argc, char **argv) {
                 const int gf = qdw_gq_fmt(&m.L[i].dn_qkv), gz = qdw_gq_fmt(&m.L[i].dn_z);
                 if (!q1 && gf && gf == gz) {   /* a GGUF's blocks: qkv's rows, then z's */
                     const size_t rb = (size_t)gq_row_bytes(gf - 100, Hd);
-                    uint8_t *ra, *rz, *cat = malloc(rb * Of);
-                    const void *a = qdw_gq_rows(&m.L[i].dn_qkv, gf, &ra), *z = qdw_gq_rows(&m.L[i].dn_z, gf, &rz);
+                    Q36Rows s; const QtRows *r = q36_gq_stream(&s, &m.L[i].dn_qkv, &m.L[i].dn_z, gf);
+                    uint8_t *ra = NULL, *rz = NULL, *cat = r ? NULL : malloc(rb * Of);
+                    const void *a = r ? NULL : qdw_gq_rows(&m.L[i].dn_qkv, gf, &ra), *z = r ? NULL : qdw_gq_rows(&m.L[i].dn_z, gf, &rz);
                     int up = 0;
-                    if (cat && a && z) {
-                        memcpy(cat, a, rb * O_qkv); memcpy(cat + rb * O_qkv, z, rb * O_z);
-                        if ((up = qt_dnproj_init_fmt(i, cat, NULL, gf, Hd, Of, dev))) { placed++; vram += (double)rb * Of; }
+                    if (r || (cat && a && z)) {
+                        if (!r) { memcpy(cat, a, rb * O_qkv); memcpy(cat + rb * O_qkv, z, rb * O_z); }
+                        if ((up = qt_dnproj_init_fmt(i, cat, r, NULL, gf, Hd, Of, dev))) { placed++; vram += (double)rb * Of; }
                     }
                     free(ra); free(rz); free(cat);
                     if (up) { q36_gq_drop(&m.L[i].dn_qkv); q36_gq_drop(&m.L[i].dn_z); }
@@ -12044,10 +12160,12 @@ int main(int argc, char **argv) {
                 }
                 if (!q1 && gf && gz) {   /* two types (unsloth's mixes): two tensors, each the file's blocks */
                     const size_t rq = (size_t)gq_row_bytes(gf - 100, Hd), rzb = (size_t)gq_row_bytes(gz - 100, Hd);
-                    uint8_t *ra, *rz;
-                    const void *a = qdw_gq_rows(&m.L[i].dn_qkv, gf, &ra), *z = qdw_gq_rows(&m.L[i].dn_z, gz, &rz);
-                    const int up = a && z && qt_dnproj_init_fmt(i, a, NULL, gf, Hd, O_qkv, dev) &&
-                                   qt_dnproj_z_init_fmt(i, z, gz, Hd, O_z, dev);
+                    Q36Rows s, sz;
+                    const QtRows *r = q36_gq_stream(&s, &m.L[i].dn_qkv, NULL, gf), *rzs = q36_gq_stream(&sz, &m.L[i].dn_z, NULL, gz);
+                    uint8_t *ra = NULL, *rz = NULL;
+                    const void *a = r ? NULL : qdw_gq_rows(&m.L[i].dn_qkv, gf, &ra), *z = rzs ? NULL : qdw_gq_rows(&m.L[i].dn_z, gz, &rz);
+                    const int up = (a || r) && (z || rzs) && qt_dnproj_init_fmt(i, a, r, NULL, gf, Hd, O_qkv, dev) &&
+                                   qt_dnproj_z_init_fmt(i, z, rzs, gz, Hd, O_z, dev);
                     if (up) { placed++; split++; vram += (double)rq * O_qkv + (double)rzb * O_z; }
                     free(ra); free(rz);
                     if (up) { q36_gq_drop(&m.L[i].dn_qkv); q36_gq_drop(&m.L[i].dn_z); }
@@ -12085,6 +12203,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[gguf] %d matrices on the CUDA tier gave their host rows back: %.2f GB of RAM "
                             "(the CPU reads one back from the file only if it needs it)\n",
                     g_q36_gq_ndrop, g_q36_gq_dropped / 1073741824.0);
+        q36_gq_settle();   /* what the tier did not take, before the chain and the rest read it */
         /* Q36_DN_GPU=1: where the in_proj and the out_proj of a DeltaNet layer
          * both sit on one card, the conv ring, the recurrence and the gated
          * norm go there too, and a decode token runs the layer end to end on
@@ -12122,6 +12241,7 @@ int main(int argc, char **argv) {
         const char *nws = getenv("QT_NO_WARMSTART");
         if (!(nws && *nws=='1') && qt_experts_on()) tier_warmstart(&m, expert_is_int4);
     }
+    q36_gq_settle();   /* no tier: every matrix the loader left in the file */
 
 #ifdef COLI_VULKAN
     q36c_start(&m);      /* COLI_VK_CHAIN: how many layers the chain places (vkc_fit), before any upload */

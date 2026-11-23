@@ -4112,7 +4112,7 @@ static void q38_trunk_place_all(Model *m) {
                 if(!rows){fprintf(stderr,"OOM GGUF trunk matrix for the device\n");exit(1);}
                 gq_r16_unpack(w->gq_type,rows,(const uint8_t*)w->data,O,I);
             }
-            int h=qt_dense_init_fmt(rows?(const void*)rows:w->data,NULL,fmt,I,O,dev);
+            int h=qt_dense_init_fmt(rows?(const void*)rows:w->data,NULL,NULL,fmt,I,O,dev);
             free(rows);
             if(h>=0){ w->gpu=h+1; placed++; placed_bytes+=(size_t)O*gq_row_bytes(fmt-100,I); }
             continue;

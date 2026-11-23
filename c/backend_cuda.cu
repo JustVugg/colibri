@@ -1838,17 +1838,20 @@ static size_t bd_file_row_bytes(int fmt, int I) {
  * kernel after it) still on the legacy stream, which the chain's non-blocking stream does
  * not wait for. A kernel there read a just-uploaded f32 matrix's later rows unwritten. */
 static int upload_settled(const char *what) { return cuda_ok(cudaStreamSynchronize(0), what); }
-/* O rows of rb bytes from the host into rows of row_words words; zero_pad: the padding zeroed
- * first (a new tensor's; a refill keeps what the upload wrote there) */
-static int bd_rows_copy(ColiCudaTensor *t, const void *weights, int zero_pad) {
+/* n rows of rb bytes from the host into rows row0.. of row_words words; zero_pad: the whole
+ * tensor's padding zeroed first (a new tensor's; a refill keeps what the upload wrote there) */
+static int bd_rows_copy_at(ColiCudaTensor *t, const void *weights, int row0, int n, int zero_pad) {
     size_t rb = bd_file_row_bytes(t->fmt, t->I), pitch = (size_t)t->row_words * 4;
-    if (pitch == rb) return cuda_ok(cudaMemcpy(t->weights, weights, t->weight_bytes, cudaMemcpyHostToDevice), "block tensor upload") &&
+    char *dst = static_cast<char *>(t->weights) + (size_t)row0 * pitch;
+    if (pitch == rb) return cuda_ok(cudaMemcpy(dst, weights, rb * (size_t)n, cudaMemcpyHostToDevice), "block tensor upload") &&
                             upload_settled("block tensor upload");
     return (!zero_pad || cuda_ok(cudaMemset(t->weights, 0, t->weight_bytes), "block tensor padding")) &&
-           cuda_ok(cudaMemcpy2D(t->weights, pitch, weights, rb, rb, (size_t)t->O, cudaMemcpyHostToDevice), "block tensor upload") &&
+           cuda_ok(cudaMemcpy2D(dst, pitch, weights, rb, rb, (size_t)n, cudaMemcpyHostToDevice), "block tensor upload") &&
            upload_settled("block tensor upload");
 }
-static int bd_tensor_upload(ColiCudaTensor **tensor, const void *weights, int fmt, int I, int O, int device) {
+static int bd_rows_copy(ColiCudaTensor *t, const void *weights, int zero_pad) { return bd_rows_copy_at(t, weights, 0, t->O, zero_pad); }
+/* a block-format tensor of O rows, its first n from weights (n < O: coli_cuda_tensor_upload_rows brings the rest) */
+static int bd_tensor_upload(ColiCudaTensor **tensor, const void *weights, int fmt, int I, int O, int device, int n) {
     DeviceContext *ctx = find_ctx(device);
     size_t rb = bd_file_row_bytes(fmt, I);
     if (!weights || !rb || O < 1 || !select_ctx(ctx) || !bd_table(ctx)) return 0;
@@ -1859,12 +1862,21 @@ static int bd_tensor_upload(ColiCudaTensor **tensor, const void *weights, int fm
     t->weight_bytes = (size_t)t->row_words * 4 * (size_t)O;
     if (!cuda_ok(cudaMalloc(&t->weights, t->weight_bytes), "tensor allocation")) { coli_cuda_tensor_free(t); return 0; }
     t->weights_owned = 1;
-    if (!bd_rows_copy(t, weights, 1)) { coli_cuda_tensor_free(t); return 0; }
+    if (!bd_rows_copy_at(t, weights, 0, n, 1)) { coli_cuda_tensor_free(t); return 0; }
     t->tracked = 1;
     ctx->tensor_count++;
     ctx->tensor_bytes += t->weight_bytes;
     *tensor = t;
     return 1;
+}
+extern "C" int coli_cuda_tensor_upload_rows(ColiCudaTensor **tensor, const void *weights, int fmt, int I, int O, int device,
+                                            int row0, int n) {
+    if (!tensor) return 1;                   /* probe */
+    if (!weights || fmt < 100 || n < 1 || row0 < 0 || n > O - row0) return 0;
+    if (!*tensor) return !row0 && bd_tensor_upload(tensor, weights, fmt, I, O, device, n);
+    ColiCudaTensor *t = *tensor;
+    return t->fmt == fmt && t->I == I && t->O == O && t->device == device && t->weights && t->weights_owned &&
+           select_ctx(find_ctx(device)) && bd_rows_copy_at(t, weights, row0, n, 0);
 }
 /* y[S, O] = x[S, I] W^T for a block-format tensor, on stream st (device pointers): up to
  * BD_GEMV_MAX_S rows (a decode step, a verify's) on the GEMV, each row a decode step's bits;
@@ -1979,7 +1991,7 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
         int want_gs = (fmt==4 && g_upload_gs>0) ? g_upload_gs : 0;
         return t->fmt == fmt && t->I == I && t->O == O && t->device == device && t->gs == want_gs;
     }
-    if (fmt >= 100) return bd_tensor_upload(tensor, weights, fmt, I, O, device);
+    if (fmt >= 100) return bd_tensor_upload(tensor, weights, fmt, I, O, device, O);
     DeviceContext *ctx = find_ctx(device);
     if (!weights || I < 1 || O < 1 || !select_ctx(ctx)) return 0;
     size_t rb = row_bytes(fmt, I);
