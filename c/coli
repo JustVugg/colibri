@@ -1110,7 +1110,12 @@ def env_for(a):
         except (OSError,ValueError,json.JSONDecodeError) as error:
             sys.exit(f"{C.yel}invalid resource plan:{C.r} {error}")
         has_cuda=cuda_binary()
+        # COLI_NO_OMP_TUNE promises no automatic team: the launcher set none
+        # above, so the plan sets none either, as in env_for_engine.
+        plan_must_not_choose_omp=("OMP_NUM_THREADS" not in e
+                                  and e.get("COLI_NO_OMP_TUNE"))
         e=environment_for_plan(plan,e,has_cuda)
+        if plan_must_not_choose_omp: e.pop("OMP_NUM_THREADS",None)
         if not getattr(a, "no_tune_profile", False):
             from autotune import load_profile
             profile=load_profile(plan,a.model,GLM)
@@ -1174,7 +1179,11 @@ def env_for(a):
                     try:
                         plan=build_plan(a.model,ram,ctx,devices,vram_req,policy=a.policy,
                                         kv_slots=requested_kv_slots(a,e))
-                        e.update(environment_for_plan(plan,e,cuda_enabled=True))
+                        planned=environment_for_plan(plan,e,cuda_enabled=True)
+                        # no automatic team under COLI_NO_OMP_TUNE, as with --auto-tier
+                        if "OMP_NUM_THREADS" not in e and e.get("COLI_NO_OMP_TUNE"):
+                            planned.pop("OMP_NUM_THREADS",None)
+                        e.update(planned)
                         vt=plan["tiers"]["vram"]
                         # #1409: the dense trunk is read on every token; leaving
                         # it on the CPU next to a 30 GB expert tier is the
