@@ -52,6 +52,8 @@ extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float 
 extern "C" int coli_cuda_qwen36_gemm_async(ColiCudaTensor *t, float *y_dev, const float *x_dev, int S, void *stream);
 extern "C" int coli_cuda_swiglu_formats_supported(const ColiCudaTensor *g, const ColiCudaTensor *u);
 extern "C" int coli_cuda_tensor_swiglu_async(ColiCudaTensor *tg, ColiCudaTensor *tu, float *y_dev, const float *x_dev, int S, void *stream);
+extern "C" int coli_cuda_qwen36_moe_async(int device, const CcExpert *tab, const float *x, const int *ids, const float *w,
+                                   float *hid, float *y, const float *hy, const CcMoe *p, void *stream, size_t hid_floats);
 extern "C" void coli_cuda_qx_invalidate(int device, const float *y_dev, size_t n_floats);
 extern "C" int coli_cuda_qx_prepare(int device, const float *y_dev, int S, int I, int8_t **xq_out, float **xs_out, int s0 = 0, int only_i8 = 0);
 #include "qwen36_cuda_profile.h"
@@ -118,14 +120,14 @@ enum CcOrdering { CC_ORDERED, CC_OVERLAP_DOWN, CC_FUSE_ROPE };
 /* An operation taking CC_OVERLAP_DOWN orders writes to a pending readback's source and reads
  * of its destination through fpw/fp. Other operations (including submit and signal) join all
  * previous readbacks: a host that sees their completion can consume the downloaded data. */
-CcCtx *live(CcOrdering order = CC_ORDERED) {
-    CcCtx *c = cur();
+CcCtx *live(CcCtx *c, CcOrdering order) {
     if (!c || !c->up || c->lost) return nullptr;
     if (cudaSetDevice(c->device) != cudaSuccess) { c->lost = 1; (void)cudaGetLastError(); return nullptr; }
     if (order == CC_ORDERED && c->down_seq != c->down_joined && !cc_join_down(c)) return nullptr;
     if (c->pend_norm && order != CC_FUSE_ROPE && !cc_flush_norm(c)) return nullptr;
     return c;
 }
+CcCtx *live(CcOrdering order = CC_ORDERED) { return live(cur(), order); }
 int cc_ok(CcCtx *c, cudaError_t e, const char *what) {
     if (e == cudaSuccess) return 1;
     std::fprintf(stderr, "[CUDA] chain: %s: %s -- the device is lost to the chain\n", what, cudaGetErrorString(e));
@@ -4467,18 +4469,33 @@ static int cc_route(CcBuf *l, CcBuf *bias, CcBuf *ids, CcBuf *w, const CcRoute *
     return launched(c, "route");
 }
 static int cc_moe(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf *y, CcBuf *hy, const CcMoe *p) {
-    CcCtx *c = live(CC_OVERLAP_DOWN);
+    CcCtx *c = cur();
     if (!c || !tab || !ids || !hid || !p || p->parts < 1 || p->parts > 3 || p->S < 1 || p->K < 1) return 0;
     if ((p->parts & 1) && !x) return 0;
     if ((p->parts & 2) && (!w || !y || (p->h_off >= 0 && !hy))) return 0;
     const int LS = p->lay_S > 0 ? p->lay_S : p->S;
     if (p->lay_S < 0 || p->lay_s0 < 0 || p->lay_s0 > LS - p->S || ((p->parts & 1) && (LS != p->S || p->lay_s0))) return 0;
-    if (cc_moe_hid_floats(LS, p->K, p->D, p->I, p->E) * 4 > hid->bytes || (LS > CC_MOE_FRAME_ROWS && p->E < 1)) return 0;
     /* CC_INK2_MOE's (a decode step's rows; the scales' pairs inside the table's buffer): refused here, not a lost device */
     if (p->act < 0 || p->act > 1 || p->esc_off < 0 || ((p->act || p->esc_off) && LS > CC_MOE_FRAME_ROWS) ||
         (p->act == 1 && !(p->act_a > 0.f && p->act_b > 0.f)) ||
         (p->esc_off && (p->esc_off % 8 || p->E < 1 || (size_t)p->esc_off + (size_t)(p->t_off + p->E) * 8 > tab->bytes))) return 0;
+    if (LS > CC_MOE_FRAME_ROWS && p->E < 1) return 0;
+    const bool tiled_experts = cc_uses_feature(c, Q36_EXPERT_MATMUL) && p->fmt == 4 && p->gs == 64 && !p->act && !p->esc_off;
+    const size_t hid_floats = hid->bytes / sizeof(float);
+    if (tiled_experts) {
+        if (p->D % 32 || p->I % 32 || p->act || !cc_moe_tiled_hid_fits(LS, p, hid_floats)) return 0;
+        if (p->planar && (!cc_moe_tiled_layout(LS, p, x ? x->d : nullptr) ||
+                          !coli_cuda_planar_rows(c->device, p->D, p->I))) return 0;
+    } else if (hid_floats < cc_moe_hid_floats(LS, p->K, p->D, p->I, p->E)) return 0;
+    if (!live(c, CC_OVERLAP_DOWN)) return 0;   /* a pending norm can launch here */
     g_st.ops++;
+    if (tiled_experts) {
+        if (!coli_cuda_qwen36_moe_async(c->device, (const CcExpert *)fp(tab), fp(x), (const int *)fp(ids), fp(w), fpw(hid),
+                                       fpw(y), fp(hy), p, (void *)c->stream, hid_floats)) {
+            c->lost = 1; return 0;
+        }
+        return 1;
+    }
     if (!coli_cuda_moe_async(c->device, (const CcExpert *)fp(tab), fp(x), (const int *)fp(ids), fp(w), fpw(hid), fpw(y), fp(hy), p,
                              (void *)c->stream)) { c->lost = 1; return 0; }
     return 1;

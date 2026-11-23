@@ -546,6 +546,11 @@ These backend settings are for kernel testing and tuning. A profile default foll
 | `COLI_CUDA_FUSED_SWIGLU` | profile | Allow supported shared-expert gate and up projections to fuse with SwiGLU. Zero selects separate projections for the profile. |
 | `COLI_CUDA_GEMV_I2F` | 1 | Select the integer-to-float kernel mode for short matrix-vector projections. |
 | `COLI_CUDA_L2_GRAN` | 128 bytes on the prompt-cache path | Set the CUDA L2 fetch granularity. Zero leaves the device limit alone. |
+| `COLI_CUDA_MOE_BM` | 0 (automatic) | Select the routed-expert tile size or kernel mode. |
+| `COLI_CUDA_MOE_DN_I8` | inherits `COLI_CUDA_MOE_I8` | Select the INT8 mode for routed-expert down projections. |
+| `COLI_CUDA_MOE_FUSED` | off | A value of 1 enables experimental atomic down-projection sums. Their floating-point accumulation order can change. |
+| `COLI_CUDA_MOE_I8` | on when eligible | Allow INT8 gate and up projections for routed experts. A chain test without a benchmark defaults to off. |
+| `COLI_CUDA_MOE_STRIP` | 0 (off) | Set the down-projection strip width in columns to a multiple of 256 smaller than the output width. |
 | `COLI_CUDA_NORM256_FAST` | 1 | Select the 256-wide normalization kernel mode for eligible attention heads. |
 | `COLI_CUDA_NORM_PLAIN` | profile | A value of 1 selects ordinary normalization. |
 | `COLI_CUDA_NORM_SKIP_Y` | on when eligible | Allow normalization to omit its FP32 output when the caller requests packed INT8 output only. |

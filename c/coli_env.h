@@ -225,9 +225,14 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_CUDA_L2_GRAN", CE_INT, CE_QWEN, 0, NULL}, /* L2 fetch granularity in bytes. Default 128. Zero leaves the device limit alone. */
     {"COLI_CUDA_MOE_BATCH",              CE_STR   , CE_DSV4                                         , 0             , NULL},
     {"COLI_CUDA_MOE_BATCH_MIN",          CE_STR   , CE_DSV4                                         , 0             , NULL},
+    {"COLI_CUDA_MOE_BM", CE_INT, CE_QWEN, 0, NULL}, /* Routed-expert tensor-core tile or kernel mode. Default 0 selects automatically. */
+    {"COLI_CUDA_MOE_DN_I8", CE_INT, CE_QWEN, 0, NULL}, /* INT8 expert down-projection mode. Inherits MOE_I8 when unset. */
     {"COLI_CUDA_MOE_DOUBLE",             CE_STR   , CE_DSV4                                         , 0             , NULL},
+    {"COLI_CUDA_MOE_FUSED", CE_BOOL, CE_QWEN, 0, NULL}, /* Set to 1 to enable experimental fused routed-expert down sums. Default off. */
     {"COLI_CUDA_MOE_GV", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_MOE_HCM", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
+    {"COLI_CUDA_MOE_I8", CE_BOOL, CE_QWEN, 0, NULL}, /* INT8 routed-expert gate and up projections. Default on except in a test without a benchmark. */
+    {"COLI_CUDA_MOE_STRIP", CE_INT, CE_QWEN, 0, NULL}, /* Down-projection strip width in columns. Requires a multiple of 256 below D. Default 0 disables strips. */
     {"COLI_CUDA_MOE_TILE128", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_MTP",                    CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_CUDA_NORM256_FAST", CE_INT, CE_QWEN, 0, NULL}, /* In-place 256-wide normalization and RoPE fusion mode. Default 1. */

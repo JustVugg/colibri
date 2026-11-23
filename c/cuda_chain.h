@@ -42,7 +42,9 @@
  * tests. */
 #ifndef COLI_CUDA_CHAIN_H
 #define COLI_CUDA_CHAIN_H
+#include <limits.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -183,10 +185,33 @@ static inline int cc_moe_block_type(int t) {
  * through the tensor cores' GEMM where the device has it (gate and up, then down); hid
  * then also holds the sort's integers, cc_moe_hid_floats in all. */
 #define CC_MOE_FRAME_ROWS 8
+/* The original device layout sorts 64 routes per tile. An engine using an earlier
+ * operation table can pass a buffer of this size to moe or moe_cols. */
 static inline size_t cc_moe_hid_floats(int S, int K, int D, int I, int E) {
     size_t A = (size_t)S * K, n = A * (size_t)(I + D);
     if (S > CC_MOE_FRAME_ROWS) n += 3 * (size_t)E + 2 + 2 * ((A + 63) / 64 + (size_t)(E < (int)A ? E : (int)A)) + 2 * A;
     return n;
+}
+static inline size_t cc_moe_sort_floats(int S, int K, int E) {
+    if (S <= CC_MOE_FRAME_ROWS) return 0;
+    size_t A = (size_t)S * K;
+    size_t n = 3 * (size_t)E + 2 + 2 * ((A + 15) / 16 + (size_t)(E < (int)A ? E : (int)A)) + 2 * A;
+    return (n + 3) & ~(size_t)3;
+}
+static inline size_t cc_moe_tiled_hid_floats(int S, int K, int D, int I, int E) {
+    size_t A = (size_t)S * K;
+    return A * (size_t)(I + D) + cc_moe_sort_floats(S, K, E);
+}
+/* Tile selection uses the full layout even when this call only sums a slice of it. */
+static inline int cc_moe_tiled_layout(int rows, const CcMoe *p, const float *x) {
+    return rows > CC_MOE_FRAME_ROWS && p->E > 0 && p->E <= 4096 &&
+           (!x || ((uintptr_t)(x + p->x_off) & 15) == 0) && p->x_row % 4 == 0;
+}
+static inline int cc_moe_tiled_hid_fits(int rows, const CcMoe *p, size_t floats) {
+    /* The sort indexes route slots as ints. Bound the geometry before multiplying the full layout. */
+    return rows > 0 && p->K > 0 && rows <= INT_MAX / p->K &&
+           p->D >= 32 && p->D <= CC_MOE_DIM_MAX && p->I >= 32 && p->I <= CC_MOE_DIM_MAX &&
+           floats >= cc_moe_tiled_hid_floats(rows, p->K, p->D, p->I, p->E);
 }
 /* one copy over n regions (a KV row per head, say); offsets and counts in floats */
 typedef struct { size_t dst, src, n; } CcRegion;
