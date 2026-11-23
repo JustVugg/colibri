@@ -84,6 +84,26 @@ class Handler(BaseHTTPRequestHandler):
         name = host_name(self.headers.get("Host"))
         return name in LOOPBACK or name in self.allowed_hosts or "*" in self.allowed_hosts
 
+    def _origin_ok(self):
+        """A page on another site can POST to the API paths without a preflight, and this proxy drops
+        the Origin before the gateway could look at it. So a request that names an Origin runs only
+        for this machine's names, this request's own Host or one added with --allowed-host."""
+        origin = self.headers.get("Origin")
+        if origin is None:
+            return True
+        try:
+            name = (urllib.parse.urlparse(origin).hostname or "").lower()
+        except ValueError:
+            return False
+        return bool(name) and (name == host_name(self.headers.get("Host")) or name in LOOPBACK
+                               or name in self.allowed_hosts or "*" in self.allowed_hosts)
+
+    def _origin_refused(self):
+        origin = self.headers.get("Origin")
+        self.close_connection = True   # a body may be unread
+        self._json(403, {"error": "Origin %r not allowed. Add its host with --allowed-host (or COLI_ALLOWED_HOSTS) "
+                                  "if a page there should call this server." % origin})
+
     def _host_refused(self):
         name = host_name(self.headers.get("Host"))
         self.close_connection = True   # a body may be unread
@@ -239,6 +259,9 @@ class Handler(BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         if (path.startswith(PROXIED) or path == "/v1/responses") and not self._api_host_ok():
             return self._host_refused()
+        if ((path.startswith(PROXIED) or path == "/v1/responses") and self.command not in ("GET", "HEAD")
+                and not self._origin_ok()):
+            return self._origin_refused()
         if path == "/doc/extract" and self.command == "POST":
             self._doc()
         elif path.startswith("/web/") and self.command == "GET":
