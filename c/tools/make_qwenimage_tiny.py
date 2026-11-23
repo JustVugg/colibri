@@ -9,6 +9,9 @@ model and is held to those tensors.
 
   python3 tools/make_qwenimage_tiny.py OUTDIR [--width 64 --height 96 --steps 3]
 
+Pass --vision-conditioning to exercise all three DeepStack feature taps and
+write the single-reference Diffusers oracle under OUTDIR/ref-vision/.
+
 What is tiny and what is not:
   text_encoder  Qwen3VLForConditionalGeneration, text model hidden 64, 2 layers,
                 GQA 4/2, head_dim 16, MLP 128, interleaved M-RoPE [4, 2, 2],
@@ -152,7 +155,7 @@ def special_ids() -> dict[str, int]:
     return {tok: base + i for i, tok in enumerate(SPECIALS)}
 
 
-def write_processor(out: Path):
+def write_processor(out: Path, vision_conditioning: bool = False):
     out.mkdir(parents=True, exist_ok=True)
     vocab = {ch: i for i, (_, ch) in enumerate(bytes_to_unicode())}
     for a, b in MERGES:
@@ -192,7 +195,11 @@ def write_processor(out: Path):
         "pad_token": "<|endoftext|>", "processor_class": "Qwen3VLProcessor", "split_special_tokens": False,
         "tokenizer_class": "Qwen2Tokenizer", "unk_token": None}, indent=2), encoding="utf-8")
     (out / "chat_template.jinja").write_text(CHAT_TEMPLATE, encoding="utf-8")
-    (out / "preprocessor_config.json").write_text(json.dumps(PREPROCESSOR_CONFIG, indent=2), encoding="utf-8")
+    processor_config = PREPROCESSOR_CONFIG
+    if vision_conditioning:
+        # Keep the small already-aligned oracle image unchanged by the processor.
+        processor_config = {**PREPROCESSOR_CONFIG, "size": {**PREPROCESSOR_CONFIG["size"], "shortest_edge": 1024}}
+    (out / "preprocessor_config.json").write_text(json.dumps(processor_config, indent=2), encoding="utf-8")
     (out / "video_preprocessor_config.json").write_text(json.dumps(VIDEO_PREPROCESSOR_CONFIG, indent=2),
                                                          encoding="utf-8")
 
@@ -289,7 +296,7 @@ def randomize(model: torch.nn.Module, gen: torch.Generator, conv_out_gain: dict 
             p.copy_(v.to(p.dtype))
 
 
-def build_models(out: Path, gen: torch.Generator, turbo: bool = False):
+def build_models(out: Path, gen: torch.Generator, turbo: bool = False, vision_conditioning: bool = False):
     from diffusers import AutoencoderKLQwenImage21, FlowMatchEulerDiscreteScheduler, QwenImage21Transformer2DModel
     from transformers import AutoConfig, Qwen3VLForConditionalGeneration
 
@@ -298,6 +305,9 @@ def build_models(out: Path, gen: torch.Generator, turbo: bool = False):
     te_dir = out / "text_encoder"
     te_dir.mkdir(parents=True, exist_ok=True)
     te_cfg = text_encoder_config()
+    if vision_conditioning:
+        te_cfg["text_config"]["num_hidden_layers"] = 3
+        te_cfg["vision_config"].update(depth=3, deepstack_visual_indexes=[0, 1, 2])
     (te_dir / "config.json").write_text(json.dumps(te_cfg, indent=2))
     config = AutoConfig.from_pretrained(str(te_dir))
     te = Qwen3VLForConditionalGeneration(config).eval()
@@ -376,6 +386,49 @@ def crosscheck_pipeline(out: Path, prompt: str, latents_init: torch.Tensor, widt
     return np.array(image), final["latents"][0].float()
 
 
+@torch.no_grad()
+def write_vision_reference(out: Path):
+    """Deterministic non-square RGBA image with opaque, translucent, and transparent pixels."""
+    from PIL import Image
+    from safetensors.torch import save_file
+    from transformers import Qwen3VLForConditionalGeneration
+
+    width, height = 96, 64
+    x, y = np.meshgrid(np.arange(width), np.arange(height))
+    rgba = np.stack((17 * x + y, 11 * y + x, 3 * x + 5 * y, 13 * x + 7 * y), axis=-1).astype(np.uint8)
+    image = Image.fromarray(rgba)
+    rgb = Image.new("RGB", image.size, "white")
+    rgb.paste(image, mask=image.getchannel("A"))
+    te = Qwen3VLForConditionalGeneration.from_pretrained(out / "text_encoder", dtype=torch.float32).eval()
+    processor = qref.load_processor(out)
+    pipe = qref.make_pipeline(out, processor, text_encoder=te)
+    prompt = "Make the fox's fur blue."
+    inputs = processor(text=[pipe.prompt_template_ti2i.format(prompt)], images=[rgb],
+                       padding=True, padding_side="left", return_tensors="pt")
+    positions, _ = te.model.get_rope_index(inputs.input_ids, inputs.mm_token_type_ids,
+                                         image_grid_thw=inputs.image_grid_thw,
+                                         attention_mask=inputs.attention_mask)
+    half = te.config.text_config.head_dim // 2
+    cosines, sines = te.model.language_model.rotary_emb(inputs.pixel_values, positions)
+    vision = te.model.visual(inputs.pixel_values, grid_thw=inputs.image_grid_thw)
+    hidden, _, image_slots = pipe._get_qwen_prompt_embeds(prompt, [image], device=torch.device("cpu"))
+    slots = image_slots[0].nonzero().flatten()
+    assert slots.numel() > 1 and slots[-1] - slots[0] + 1 == slots.numel()
+    assert inputs.image_grid_thw[0].tolist() == [1, height // 16, width // 16]
+    ref = out / "ref-vision"
+    ref.mkdir(exist_ok=True)
+    (ref / "image.rgba").write_bytes(rgba.tobytes())
+    (ref / "ref.json").write_text(json.dumps({
+        "prompt": prompt, "width": width, "height": height, "drop": pipe._drop_idx,
+        "image_slot_start": slots[0].item(), "image_slot_count": slots.numel(),
+    }))
+    tensors = {"input_ids": inputs.input_ids[0], "pixel_values": inputs.pixel_values,
+               "cosines": cosines[0, :, :half], "sines": sines[0, :, :half],
+               "merged": vision.pooler_output, "hidden": hidden[0]}
+    tensors.update({f"deepstack_{i}": v for i, v in enumerate(vision.deepstack_features)})
+    save_file({k: v.contiguous() for k, v in tensors.items()}, ref / "ref.safetensors")
+
+
 # ---------------------------------------------------------------- main
 
 def main() -> int:
@@ -389,6 +442,8 @@ def main() -> int:
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--turbo", action="store_true",
                     help="Qwen-Image-2.1-Turbo's scheduler and sample_sigmas (give --steps 8 for its own schedule)")
+    ap.add_argument("--vision-conditioning", action="store_true",
+                    help="exercise all three DeepStack taps and write the single-reference vision oracle")
     args = ap.parse_args()
     if args.width % 32 or args.height % 32:
         raise SystemExit("width and height must be multiples of 32")
@@ -398,8 +453,8 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
     gen = torch.Generator(device="cpu").manual_seed(args.seed)
 
-    write_processor(out / "processor")
-    build_models(out, gen, args.turbo)
+    write_processor(out / "processor", args.vision_conditioning)
+    build_models(out, gen, args.turbo, args.vision_conditioning)
     check_storage_dtypes(out)
 
     # reference, from the files just written, in f32
@@ -450,6 +505,8 @@ def main() -> int:
           f"{latents_init.shape[0]} image tokens, {args.steps} steps, vae raw std {float(raw.std()):.3f}, "
           f"{100 * ref['vae_out_raw_stats']['frac_clamped']:.1f}% clamped, pipeline cross-check ok "
           f"(latents diff {lat_diff:.2e}), {time.time() - t_start:.1f} s")
+    if args.vision_conditioning:
+        write_vision_reference(out)
     return 0
 
 
