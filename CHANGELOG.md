@@ -5,6 +5,116 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### New
+
+- **WNR3 records decoded straight into the expert's buffers, and the fast decoder's stream count
+  measured** (`coli_wex_decode_record_to`, `COLI_WEX_FAST_LANES`): DeepSeek V4.1 and Qwen3.8 read a
+  WNR3 record into a buffer of its stored size and decode it into the six windows / the expert
+  buffer, with no page of the decoded size, no decoder scratch and no copy (V4.1 REAP-192, 8
+  readers: about 301 MB of reader buffers -> 129 MB). The streams the fast decoder interleaves (4
+  fixed before) are measured on the first 16 records, on each thread's CPU clock: 6 on a 4-vCPU
+  Xeon VM, where real V4.1 records decode 18-19% faster with both changes (8 readers: 31.3 -> 25.6
+  ms a record), 4 where 4 is best; `COLI_WEX_FAST_LANES=N` fixes it. Same bytes, same refusals.
+- **GLM-5.3-Flash: the routed experts from a WEX4 container** (`COLI_WEX_PATH`, `COLI_WEX_ROOT`,
+  `COLI_WEX_VERIFY`, `COLI_WEX_CUDA_LIB`): for AMD's MXFP4 checkpoint, a container written by
+  Wex-WRN2's `pack --names qwen38` serves each expert as one record, RAW or WNR3 (decoded in the
+  slot, by the CUDA helper when one is named, else the CPU), the same bytes as the shards. Every
+  path that takes an expert reads it there. The run ends with a count of the records read and
+  decoded, by the helper and by the CPU. Unset, nothing changes. `tests/test_glm53_wex4.c`
+  ([docs/wex.md](docs/wex.md#glm-53-flash-glm53)).
+- **GLM-5.3-Flash: AMD's MXFP4 checkpoint as published** (`amd/GLM-5.3-Flash-Quark-MXFP4`): routed
+  experts with a `weight_scale` beside them stream as MXFP4 (fmt 7, `matmul_mxfp4`, the file's bytes),
+  and go to the Vulkan and CUDA expert tiers as `VKT_SRC_MXFP4_E8M0`; MXFP4 shared experts are
+  decoded at load and held at `GLM53_BITS`. The int4 container and GGUF checkpoints load as before
+  ([docs/glm53-flash.md](docs/glm53-flash.md)).
+- **`c/tools/wex_bench.py`**: the WEX measurements in one command (machine, `wex4_verify`,
+  WNR3 decode per decoder and stream count with byte identity, record reads, an engine A/B of
+  shards against the container), and a report to paste into #2860; `c/tools/wex_decode_bench.c`
+  (`make -C c tools/wex_decode_bench`) is its C part ([docs/wex-bench.md](docs/wex-bench.md)).
+- **`COLI_WEX_STATS=1`**: one stderr line at exit, `[wex] stats: helper=... fast=...
+  reference=... failed=...`, with what decoded the WNR3 records of a WEX4 container
+  (deepseek_v4, qwen38, deepseek_v41, glm53; [docs/wex.md](docs/wex.md#counting-the-decodes)).
+- **WNR3 records decode on the CPU with the fast decoder** (`COLI_WEX_FAST_DECODE`, default
+  on): `coli_wex_decode_record` uses `wex_fast_decode.h` where the CPU has its kernel (AVX2 by
+  CPUID, NEON), one thread a record; `0`, or another CPU: the reference, as before. Same bytes,
+  same refusals. DeepSeek V4.1 on the published WNR3 container, CPU only, a 4-core i7-7700K:
+  8 tokens in 71 s against 293 s, the same tokens ([docs/wex.md](docs/wex.md#wnr3-on-the-cpu)).
+- **A fast CPU decoder for WNR3 records** (`c/wex_fast_decode.h`): Wex-WRN2's research decoder
+  (AVX2 and NEON kernels, a scalar fallback), the reference's bytes and verdicts at several times its
+  speed; on x86-64 the AVX2 kernel is chosen at run time by CPUID, so a build without `-mavx2`
+  carries it too. `tests/test_wex_fast_decode.c` (three builds) in
+  `make test-c` checks it against the reference of `wex_decode.c` on synthetic records and
+  mutated mini-records; given a container, on real records too ([docs/wex.md](docs/wex.md)).
+- **DeepSeek V4.1: a batch's first-read SHA-256 on the OpenMP team** (`COLI_WEX_VERIFY`, on
+  with `COLI_WEX_ROOT`): the records of one `expert_fetch` are hashed one expert a thread
+  instead of one after another on the calling thread. Same checks, same fallback; nothing
+  changes with the hash off.
+- **A WEX4 container on several drives** (`COLI_MODEL_MIRROR`, `COLI_DISK_WEIGHTS`, qwen38 and
+  deepseek_v41): a byte copy of the container in a mirror directory, same file name, size and
+  header page, becomes a read replica; each expert's record comes from the drive a hash of its
+  (layer, expert) picks. The copy needs no shards beside it. Unset, nothing changes.
+  `tests/test_dsv41_wex4.c` and `tests/test_qwen38_wex4.c` cover it ([docs/wex.md](docs/wex.md)).
+- **WNR3 records decoded on the GPU** (`COLI_WEX_CUDA_LIB`): `wex_decode.c` opens the CUDA helper
+  that `COLI_WEX_CUDA_LIB` names (and only then) the first time a WNR3 container is read, and `coli_wex_decode_record` hands it each record, decoding on the CPU when
+  it does not; the same bytes either way. Unset or `0`: the CPU. Windows and Linux.
+  `tests/test_wex_cuda_loader.c` in `make test-c` ([docs/wex.md](docs/wex.md)).
+- **The CUDA helper for WEX records** (`c/tools/wex_cuda_bridge.cu`, `c/wex_cuda.cuh`):
+  `make wex-cuda-helper` builds `kaira_wex_cuda.dll` / `.so`, which decodes WNR1-WNR3 records
+  on an NVIDIA GPU, to host slabs or into device buffers, one record or a batch; ABI 1 and six
+  feature bits. A record it refuses leaves every destination untouched, the host batch included.
+  Its GPU workspaces come from a pool, one per call in flight, so threads that exit leave none
+  behind. `make wex-cuda-test` checks it against the CPU decoder (needs a GPU;
+  not in `make test-c`) ([docs/wex.md](docs/wex.md)).
+- **The WNR3 encoder** (`c/tools/wex_nr3_tools.c`, `c/tools/build_nr3.py`, `make wex-nr3-tools`):
+  trains a WNM2 model on chosen experts of a WEX1 container, encodes every record as WNR3
+  (canonical zero with `--cz`), checks each one by decoding it again, and writes the WNR3
+  container (WEX3; Wex-WRN2's `wex4_convert.py upgrade` makes it WEX4). Wex-WRN2's copies.
+  `tests/test_wex_nr3_tools.py` ([docs/wex.md](docs/wex.md#making-a-wnr3-container)).
+- **DeepSeek V4.1 reads WNR3 records from a WEX4 container** (`COLI_WEX_PATH`): the published
+  REAP-192 container (7,680 WNR3 records) runs end to end, the trunk from the shards; each
+  record read whole by one reader thread and decoded on the CPU into the expert's six windows,
+  after its owner (and its SHA-256 at the first read, when asked); one that fails is read from
+  the shards for the run. Same tokens as the shards; on a 4-core i7-7700K, 71 s for 8 tokens
+  with the fast CPU decoder against 62.5-91.6 s from the shards (293 s with
+  `COLI_WEX_FAST_DECODE=0`). RAW containers and an unset `COLI_WEX_PATH` behave as before.
+  `tests/test_dsv41_wex4.c`.
+- **Qwen3.8 reads WNR3 records from a WEX4 container** (`COLI_WEX_PATH`): the WNM2 model blob
+  checked and registered at attach; each WNR3 record decoded on the CPU by the thread that reads
+  it, never mapped; one that names another expert or does not decode stops the engine, as a
+  damaged container does. RAW containers and an unset `COLI_WEX_PATH` behave as before.
+  `tests/test_qwen38_wex4.c`.
+- **DeepSeek V4 reads WNR3 records from a WEX4 container** (`COLI_WEX_PATH`): the container's
+  WNM2 model blob checked against its index hash and registered at open; each WNR3 record read
+  at the end of its page and decoded in the slot's slab on the CPU, after its owner (and its
+  SHA-256 at the first read, when asked); one that fails is served from the safetensors for the
+  run. RAW containers and an unset `COLI_WEX_PATH` behave as before. `tests/test_v4_wex4.c`.
+- **WNR3 records on the CPU** (`c/wex_decode.c`, `c/wex_decode.h`): the WNM2 model registry, a
+  WEX4 container's model blob checked against its index hash, and the in-place decode of a WNR3
+  (codec 5) record with the reference decoder.
+  `tests/test_wex_decode.c` in `make test-c` ([docs/wex.md](docs/wex.md)).
+- **DeepSeek V4.1's routed experts from a WEX4 container** (`COLI_WEX_PATH`, `COLI_WEX_ROOT`,
+  `COLI_WEX_VERIFY`): a backbone expert's six tensors read from its one record, by the same
+  readers into the same windows; the root pinned and each record's SHA-256 checked at its first
+  read when asked; a bad or foreign file, or a record that fails, falls back to the shards.
+  Unset, nothing changes. `tests/test_dsv41_wex4.c` in `make test-c` ([docs/wex.md](docs/wex.md)).
+- **Qwen3.8's MXFP4 experts from a WEX4 container** (`COLI_WEX_PATH`): the `experts-mxfp4/`
+  records from one WEX4 file, read and computed as the sidecar's; `COLI_WEX_ROOT` pins the file
+  and `COLI_WEX_VERIFY` checks each record's SHA-256 at its first use. Asked for, the container
+  is required: anything that does not fit stops the engine with the reason. Unset, nothing
+  changes. `tests/test_qwen38_wex4.c` in `make test-c` ([docs/wex.md](docs/wex.md)).
+- **DeepSeek V4's routed experts from a WEX4 container** (`COLI_WEX_PATH`, `COLI_WEX_ROOT`,
+  `COLI_WEX_VERIFY`): one read of one RAW record per miss instead of six ranges of the shards,
+  the root pinned and each record's SHA-256 checked at its first read when asked; a bad or
+  foreign file, or a record that fails, falls back to the safetensors. Unset, nothing changes.
+  `tests/test_v4_wex4.c` in `make test-c` ([docs/wex.md](docs/wex.md)).
+- **WEX container format headers** (`c/wex_format.h`, `c/wex_palette.h`, `c/wex_neural_rans.h`):
+  the WEX1-WEX3 record entry, its validators and the lossless record codecs, header only, with
+  `tests/test_wex_format.c` in `make test-c` ([docs/wex.md](docs/wex.md)).
+- **WEX4 reader and `tools/wex4_verify`** (`c/wex4.h`): the header page, the index and the records
+  of a WEX4 container, validated in place; `wex4_verify FILE` checks every record against the
+  index's SHA-256 and prints the root to pin (`COLI_WEX_ROOT=...`). `tests/test_wex4_verify.c` in
+  `make test-c`.
+
 ## [2.2.0] - 2026-11-21
 
 ### New

@@ -585,6 +585,12 @@ TEST_EXCLUDE += test_vk_chain test_vk_memtype test_glm53_vk_f32 test_vk_dev2_win
 TEST_EXCLUDE += test_cu_tier
 # takes a fixture and the CPU build's logits on its command line (ci.yml, the int4 gs64 A/B step)
 TEST_EXCLUDE += test_qwen36_tier_stream_engine
+# links the DeepSeek V4 objects: a gate only where the V4 engine builds (below)
+TEST_EXCLUDE += test_v4_wex4
+# nvcc and an NVIDIA GPU: run by `make wex-cuda-test`, not by test-c
+TEST_EXCLUDE += test_wex_nr3_gpu
+# the -march=x86-64 build of test_wex_fast_decode: elsewhere it would be the default build again (below)
+TEST_EXCLUDE += test_wex_fast_decode_x86_64
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
@@ -597,7 +603,8 @@ TEST_BINS += tests/test_gsgemv_sse41$(EXE) tests/test_qgemv_sse41$(EXE) \
 	tests/test_olmoe_dot_i8_16_sse41$(EXE) tests/test_st_f16_bf16_simd_sse41$(EXE) \
 	tests/test_i4_grouped_sse41$(EXE) \
 	tests/test_i4_grouped_sse41_o1$(EXE) tests/test_i4_grouped_sse41_no_contract$(EXE) \
-	tests/test_idot_ssse3$(EXE) tests/test_int_kernel_exact_ssse3$(EXE)
+	tests/test_idot_ssse3$(EXE) tests/test_int_kernel_exact_ssse3$(EXE) \
+	tests/test_wex_fast_decode_x86_64$(EXE)
 endif
 ifeq ($(COLI_V4_SUPPORTED),1)
 TEST_BINS += tests/test_v4_gpu_devices$(EXE)
@@ -606,6 +613,7 @@ TEST_BINS += tests/test_deepseek_v4$(EXE) tests/test_v4_ownership$(EXE) \
 	tests/test_v4_serve_framing$(EXE) \
 	tests/test_segment_adapters_registration$(EXE) \
 	tests/test_edge_adapters_registration$(EXE)
+TEST_BINS += tests/test_v4_wex4$(EXE)
 endif
 
 # Windows CUDA/HIP DLL path: host links the loader, NOT cudart or amdhip64.
@@ -836,6 +844,15 @@ VK_SPV   += shaders/chain_attn_flash.spv
 VK_SPV   += shaders/chain_attn_full.spv shaders/chain_attn_coop.spv
 # Qwen-Image's VAE decoder: a band's 3x3 taps and the DupUp3D shortcut (made on first use)
 VK_SPV   += shaders/chain_vae.spv
+endif
+
+# The engines that read WEX containers include wex_decode.c, which opens the optional
+# CUDA helper with dlopen on Linux (docs/wex.md): -ldl for glibc before 2.34, as VK=1
+# adds above. Nothing links the helper itself.
+ifneq ($(LINUX),)
+ifneq ($(VK),1)
+LDFLAGS  += -ldl
+endif
 endif
 
 # Optional AMD XDNA2 (Ryzen AI NPU) lane, Windows. Same opt-in shape as VK=1:
@@ -1248,6 +1265,35 @@ cuda-dsv4-dg-dll: backend_cuda_dsv4.cu backend_cuda_dsv4.h backend_cuda_dsv4_qua
 		-Xlinker /DEF:dsv4.def \
 		-L"$(CUDA_HOME)/lib/x64" $(DSV4_DLL_LIBS) \
 		backend_cuda_dsv4.cu -o coli_cuda_dsv4_dg.dll
+
+# The CUDA helper for WEX records (docs/wex.md): WNR3 (and WNR1/WNR2) records
+# decoded on an NVIDIA GPU, into a host slab or straight into device buffers.
+# Optional and never linked: an engine opens it at run time. One source file,
+# tools/wex_cuda_bridge.cu, over the kernels in wex_cuda.cuh; it needs only the
+# CUDA runtime. Windows: run from a vcvars64 shell, like cuda-dll (nvcc's host
+# compiler is cl.exe). CUDA_ARCH picks the target as for the other CUDA builds
+# (native by default; CUDA_ARCH=portable for a release build).
+#   make wex-cuda-helper     ->  kaira_wex_cuda.dll (Windows) / kaira_wex_cuda.so
+#   make wex-cuda-test       ->  the helper and tests/test_wex_nr3_gpu, run on synthetic records
+ifneq ($(IS_WIN),)
+WEX_CUDA_HELPER = kaira_wex_cuda.dll
+WEX_CUDA_SHARED = -shared
+else
+WEX_CUDA_HELPER = kaira_wex_cuda.so
+WEX_CUDA_SHARED = -shared -Xcompiler=-fPIC,-fvisibility=hidden
+endif
+WEX_CUDA_FLAGS = $(NVCCFLAGS)
+WEX_CUDA_DEPS = tools/wex_cuda_bridge.cu wex_cuda.cuh wex_format.h wex_neural_rans.h wex_palette.h
+.PHONY: wex-cuda-helper wex-cuda-test
+wex-cuda-helper: $(WEX_CUDA_HELPER)
+$(WEX_CUDA_HELPER): $(WEX_CUDA_DEPS)
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	"$(NVCC)" $(WEX_CUDA_FLAGS) $(WEX_CUDA_SHARED) tools/wex_cuda_bridge.cu -o $@
+tests/test_wex_nr3_gpu$(EXE): tests/test_wex_nr3_gpu.cu wex_format.h wex_neural_rans.h wex_palette.h
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	"$(NVCC)" $(WEX_CUDA_FLAGS) tests/test_wex_nr3_gpu.cu -o $@ $(if $(IS_WIN),,-ldl)
+wex-cuda-test: $(WEX_CUDA_HELPER) tests/test_wex_nr3_gpu$(EXE)
+	./tests/test_wex_nr3_gpu$(EXE) ./$(WEX_CUDA_HELPER) 0
 
 # Windows: the decode-path kernels validated through the runtime DLL loader.
 # deepseek-v4.exe is MinGW gcc; backend_loader_dsv4.c resolves the MSVC/nvcc
@@ -2405,6 +2451,11 @@ tests/test_dsv41_candidate_ids$(EXE): tests/test_dsv41_candidate_ids.c deepseek_
 tests/test_dsv41_engram_stage$(EXE): tests/test_dsv41_engram_stage.c deepseek_v41.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
+# The backbone's routed experts from a WEX4 container (COLI_WEX_PATH; docs/wex.md), no model:
+# a synthetic checkpoint and its container, every expert read and checked against the shards.
+tests/test_dsv41_wex4$(EXE): tests/test_dsv41_wex4.c deepseek_v41.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
 tests/test_qwen38_idot$(EXE): tests/test_qwen38_idot.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
@@ -2424,6 +2475,23 @@ tests/test_qwen38_int4_experts$(EXE): tests/test_qwen38_int4_experts.c qwen38.c 
 # The MXFP4 expert matmul with no model (part of test-c); given a converted snapshot on
 # argv it checks the experts-mxfp4/ sidecar's loaders too (qwen38-tiny-mxfp4-check).
 tests/test_qwen38_mxfp4_experts$(EXE): tests/test_qwen38_mxfp4_experts.c qwen38.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+# The MXFP4 experts from a WEX4 container (COLI_WEX_PATH; docs/wex.md), no model: a synthetic
+# grid and its container, every record loaded and checked, the refusals in child processes.
+tests/test_qwen38_wex4$(EXE): tests/test_qwen38_wex4.c qwen38.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+# GLM-5.3 on AMD's MXFP4 checkpoint (docs/glm53-flash.md), no model: a synthetic grid written as that
+# checkpoint writes its experts, every expert streamed as fmt 7 and its products checked, an MXFP4
+# shared expert through load_mat.
+tests/test_glm53_mxfp4$(EXE): tests/test_glm53_mxfp4.c glm53.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+# GLM-5.3's MXFP4 experts from the shards and from a WEX4 container (COLI_WEX_PATH; docs/wex.md), no
+# model: a synthetic grid, its shards and its containers (RAW, WNR3), every expert read and checked,
+# the refusals in child processes; the fake CUDA helper decodes the WNR3 records once.
+tests/test_glm53_wex4$(EXE): tests/test_glm53_wex4.c glm53.c wex_decode.c $(VK_OBJ) | tests/fake_wex_cuda$(XDNA_DLEXT)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_qwen38_igpu_defaults$(EXE): tests/test_qwen38_igpu_defaults.c qwen38.c $(VK_OBJ)
@@ -3313,6 +3381,14 @@ dsv4-route-scratch-test: tests/test_v4_route_scratch_cuda.c Makefile.deepseek-v4
 	./dsv4_route_scratch_cuda_test$(EXE) 1
 endif
 
+# The V4 expert store reading RAW and WNR3 records from a WEX4 container (COLI_WEX_PATH;
+# docs/wex.md), on a synthetic checkpoint and container. The objects are test_deepseek_v4's: built after it,
+# so the two sub-makes never write the same COLI_V4_UNIT_*.o at once under -j.
+tests/test_v4_wex4$(EXE): tests/test_v4_wex4.c tests/wex4_fixture.h tests/wnr3_fixture.h wex4.h wex_format.h \
+		wex_decode.c wex_decode.h wex_fast_decode.h deepseek_v4.c \
+		deepseek_v4_internal.h Makefile.deepseek-v4.units Makefile.deepseek-v4 | tests/test_deepseek_v4$(EXE)
+	$(CC) $(CFLAGS) -DCOLI_V4_TEST_HOOKS $< $(V4_TEST_LINK_OBJS) -o $@ -pthread $(LDFLAGS)
+
 V4_OWN_DIR = build/ownership
 V4_OWN_CFLAGS = $(CFLAGS) -DCOLI_V4_TEST_HOOKS
 V4_OWNERSHIP_OBJS = \
@@ -3933,6 +4009,64 @@ tests/cu_tier_fake.o: cu_tier.c
 tests/test_kimi_cuda_expert$(EXE): tests/test_kimi_cuda_expert.c kimi_k3.c tests/cu_tier_fake.o $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) -DCOLI_CUDA $< tests/cu_tier_fake.o $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
+# WEX expert containers (docs/wex.md): the record table, the lossless scale and palette codecs
+# and the WNR rANS decoder of wex_format.h, on synthetic records. No model, no GPU.
+tests/test_wex_format$(EXE): tests/test_wex_format.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# One read-only pass over a WEX4 container: the header page and the index as the engines check
+# them at open, then every blob and record against its SHA-256 in the index; prints the root to
+# pin as COLI_WEX_ROOT. make tools/wex4_verify; ./tools/wex4_verify FILE [THREADS].
+# The test builds the tool's code into itself and runs it on synthetic WEX4 files.
+tools/wex4_verify$(EXE): tools/wex4_verify.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_wex4_verify$(EXE): tests/test_wex4_verify.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# WNR3 decode and record read speed on N seeded records of a real container (docs/wex-bench.md):
+# the reference, the fast decoder per stream count, the CUDA helper when COLI_WEX_CUDA_LIB names it,
+# every arm checked against the reference's bytes. tools/wex_bench.py builds and runs it.
+tools/wex_decode_bench$(EXE): tools/wex_decode_bench.c wex_decode.c wex_decode.h wex_fast_decode.h wex_format.h \
+		wex_neural_rans.h wex4.h
+	$(CC) $(CFLAGS) $< -o $@ -pthread $(LDFLAGS) $(if $(IS_WIN),,-ldl)
+
+# WNR3 records on the CPU (wex_decode.c): the WNM2 model registry, a container's model blob,
+# the in-place decode, changed records, several threads. Records made by the reference encoder.
+tests/test_wex_decode$(EXE): tests/test_wex_decode.c
+	$(CC) $(CFLAGS) $< -o $@ -pthread $(LDFLAGS)
+
+# The fast CPU decoder of WNR3 records (wex_fast_decode.h) against the reference of wex_decode.c: the same
+# status and bytes on synthetic records and mini-records (a container path on the command line adds real
+# records). Three builds: the default flags; on x86-64 the baseline (-march=x86-64), where the AVX2 kernel is
+# compiled with a target attribute and chosen at run time by CPUID; and -DWEX_FAST_SCALAR (kernel 0 only).
+# Their headers come from -MMD, as every rule's here (tests/test_makefile_deps.py).
+tests/test_wex_fast_decode$(EXE): tests/test_wex_fast_decode.c
+	$(CC) $(CFLAGS) $< -o $@ -pthread $(LDFLAGS)
+tests/test_wex_fast_decode_x86_64$(EXE): tests/test_wex_fast_decode.c
+	$(CC) $(if $(X86_64),$(filter-out -march=% -mavx% -mfma%,$(CFLAGS)) -march=x86-64,$(CFLAGS)) $< -o $@ -pthread $(LDFLAGS)
+tests/test_wex_fast_decode_scalar$(EXE): tests/test_wex_fast_decode.c
+	$(CC) $(CFLAGS) -DWEX_FAST_SCALAR $< -o $@ -pthread $(LDFLAGS)
+
+# The CUDA helper's loader in wex_decode.c (COLI_WEX_CUDA_LIB), no GPU: a CPU stand-in with
+# the helper's exports, a .dll on Windows and a position-independent .so elsewhere.
+tests/fake_wex_cuda$(XDNA_DLEXT): tests/fake_wex_cuda.c
+	$(CC) $(CFLAGS) $(XDNA_SHARED) $< -o $@
+tests/test_wex_cuda_loader$(EXE): tests/test_wex_cuda_loader.c tests/fake_wex_cuda$(XDNA_DLEXT)
+	$(CC) $(CFLAGS) $< -o $@ -pthread $(LDFLAGS) $(if $(IS_WIN),,-ldl)
+
+# The WNR3 encoder (docs/wex.md, "Making a WNR3 container"): tools/build_nr3.py loads this
+# library with ctypes. make wex-nr3-tools; tests/test_wex_nr3_tools.py builds its own copy.
+ifneq (,$(DARWIN))
+NR3LIB = tools/libwex_nr3_tools.dylib
+else ifneq ($(IS_WIN),)
+NR3LIB = tools/wex_nr3_tools.dll
+else
+NR3LIB = tools/libwex_nr3_tools.so
+endif
+wex-nr3-tools: $(NR3LIB)
+$(NR3LIB): tools/wex_nr3_tools.c wex_format.h wex_neural_rans.h wex_palette.h
+	$(CC) $(CFLAGS) -fPIC -shared $< -o $@ $(LDFLAGS)
+
 # ---------------------------------------------------------------------------
 # Generated header prerequisites (#1741)
 #
@@ -3963,9 +4097,9 @@ tests/test_kimi_cuda_expert$(EXE): tests/test_kimi_cuda_expert.c kimi_k3.c tests
 # The same covers a .d deleted by hand.
 AUTODEP_ELSEWHERE = test_segment_adapters_registration test_segment_adapters_real \
 	test_edge_adapters_registration test_edge_adapters_real test_deepseek_v4 \
-	test_v4_serve_framing
+	test_v4_serve_framing test_v4_wex4
 AUTODEP_OWN_FLAGS = bench_cuda_resident_batch bench_load_tq_peak_rss \
-	bench_indexer_allocations
+	bench_indexer_allocations test_wex_nr3_gpu
 ENGINE_RULES := $(foreach n,$(RULE_NAMES),$(if $(findstring /,$(n)),,$(if $(wildcard $(n).c),$(n))))
 AUTODEP_TESTS := $(patsubst tests/%,%,$(filter tests/%,$(RULE_NAMES)))
 AUTODEP_OBJS      = backend_vulkan.o vk_tier.o vk_chain.o backend_loader.o backend_xdna.o qwen36_tier.o \

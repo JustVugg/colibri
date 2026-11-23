@@ -133,7 +133,8 @@ CFLAGS = -D_GNU_SOURCE -O3 -march=$(ARCH) -fopenmp -pthread -include pthread.h \
 	-DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 \
 	-DCOLI_V4_PIN_RAMP_REQUESTS=24 \
 	-DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
-LDFLAGS = -lm -fopenmp -pthread
+# -ldl: wex_decode.c opens the optional WEX CUDA helper with dlopen (glibc before 2.34)
+LDFLAGS = -lm -fopenmp -pthread -ldl
 V4_BINARY := deepseek_v4
 V4_WIN_EXTRA_OBJS =
 endif
@@ -412,12 +413,14 @@ $(TARGET_OBJS) $(TEST_UNIT_OBJS): %.o: deepseek_v4.c coli_env.h deepseek_v4.h \
 	deepseek_v4_internal.h deepseek_v4_gpu_devices.h deepseek_v4_dspark.inc st.h json.h compat.h tensor.h quant.h fp8_format.h sse41_kernels.h \
 	route_trace.h vk_tier.h deepseek_v4_chain.h vk_chain.h \
 	native_quant.h native_quant_batch.h native_quant_dual.h \
-	native_quant_fp4_rows16.h expert_store_registry.h v4_topk.h $(V4_FLAGS_STAMP)
+	native_quant_fp4_rows16.h expert_store_registry.h v4_topk.h \
+	wex4.h wex_format.h wex_palette.h wex_neural_rans.h wex_decode.c wex_decode.h $(V4_FLAGS_STAMP)
 	$(CC) $(CFLAGS) $(V4_DEPFLAGS) -D$* -c deepseek_v4.c -o $@
 
 $(V4_HOT_TEST_OBJ): deepseek_v4.c coli_env.h deepseek_v4.h deepseek_v4_internal.h \
 		st.h json.h compat.h tensor.h quant.h fp8_format.h route_trace.h sse41_kernels.h \
-		native_quant.h native_quant_fp4_rows16.h expert_store_registry.h $(V4_FLAGS_STAMP)
+		native_quant.h native_quant_fp4_rows16.h expert_store_registry.h \
+		wex4.h wex_format.h wex_palette.h wex_neural_rans.h wex_decode.c wex_decode.h $(V4_FLAGS_STAMP)
 	$(CC) $(CFLAGS) $(V4_DEPFLAGS) -DCOLI_V4_TEST_HOOKS \
 		-DCOLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16 -c deepseek_v4.c -o $@
 
