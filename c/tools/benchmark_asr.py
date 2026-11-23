@@ -17,6 +17,7 @@ DEFAULT_SAMPLES = [
     ("hello", "Hello world, this is a test of speech recognition."),
     ("weather", "The weather today is sunny with a chance of rain."),
     ("numbers", "One two three four five six seven eight nine ten."),
+    ("combined", "Hello world. This is a test of speech recognition. The weather today is sunny with a chance of rain. One two three four five six seven eight nine ten"),
 ]
 
 def norm(t: str):
@@ -53,7 +54,19 @@ def ensure_samples(workdir):
     for name, text in DEFAULT_SAMPLES:
         path = os.path.join(workdir, f"{name}.wav")
         if not os.path.exists(path):
-            subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", f"flite=text='{text}':voice=slt", "-ar", "16000", "-ac", "1", path], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if name == "combined":
+                # build from component samples for stable audio
+                parts = [os.path.join(workdir, f"{n}.wav") for n, _ in DEFAULT_SAMPLES if n in ("hello", "weather", "numbers")]
+                for p in parts:
+                    if not os.path.exists(p):
+                        ensure_samples(workdir)
+                        break
+                lst = os.path.join(workdir, "combined.txt")
+                with open(lst, "w") as f:
+                    for p in parts: f.write(f"file '{os.path.abspath(p)}'\n")
+                subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", lst, "-c", "copy", path], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", f"flite=text='{text}':voice=slt", "-ar", "16000", "-ac", "1", path], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         out.append((name, text, path))
     return out
 

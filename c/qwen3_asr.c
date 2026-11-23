@@ -1028,6 +1028,7 @@ static KVCache *kv_alloc(int n_layers, int cap, int kv_dim) {
 static void kv_free(KVCache *c, int n_layers) { if(!c) return; for(int i=0;i<n_layers;i++){free(c[i].k); free(c[i].v);} free(c); }
 
 static int text_forward(Qwen3Asr *m, const int *tokens, const float *audio_emb, int audio_n, int n_tokens, int start_pos, KVCache *cache, float *logits_out) {
+    double t_tf0 = now_ms();
     TextModel *t = &m->text;
     int D=t->hidden, H=t->n_heads, KVH=t->n_kv_heads, HD=t->head_dim, KVdim=KVH*HD;
     int S = n_tokens;
@@ -1147,6 +1148,7 @@ static int text_forward(Qwen3Asr *m, const int *tokens, const float *audio_emb, 
         }
     }
     free(x); free(xb); free(q); free(k); free(v); free(xb2); free(ff1); free(ff2); free(att);
+    if (getenv("QWEN3_ASR_DEBUG_TIMING")) fprintf(stderr,"[qwen3_asr] text_forward S=%d start=%d ms=%.1f\n", S, start_pos, now_ms()-t_tf0);
     return 0;
 }
 

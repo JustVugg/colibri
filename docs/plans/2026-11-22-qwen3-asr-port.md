@@ -92,9 +92,23 @@ Rules:
 - Warm and cold runs reported separately
 - No hidden preprocessing differences; document resampling/chunking
 
+## Status (MVP)
+
+- [x] `c/qwen3_asr.c` engine (BF16 safetensors + optional GGUF/mmproj), serve protocol, `/v1/audio/transcriptions`.
+- [x] Decoder parity: neox/half-split RoPE, English forced prefill, mel-floor padding, windowed audio encoder attention; rope_theta resolved to HF-effective value.
+- [x] Oracle smoke: `make -C c test-qwen3-asr` (skippable without model) — hello/weather/numbers/combined exact-or-normalized HF refs.
+- [x] Definitive benchmark (3-repeat, OMP=16, same machine): Colibri BF16 4.23/3.62/5.06s med, Colibri Q8_0 GGUF 3.06/2.60/3.35s, llama.cpp Q8_0 11.20/11.05/11.79s; WER 0.
+- [x] Plug-and-play benchmark: `c/tools/run_qwen3_asr_benchmark.sh`.
+
+## Perf posture
+
+- **Recommended fast path:** Q8_0 GGUF (`--gguf` + `--mmproj`) — lowest latency/RSS in definitive benchmark.
+- **Supported/reference:** BF16 safetensors — correct, slower decode/prefill (bandwidth-bound).
+- GPU encoder handoff deferred; no timestamps/streaming/ForcedAligner in MVP.
+
 ## Notes
 
 - Inkling DMel audio input in Colibri is not reusable for Whisper-mel ASR frontend.
 - Qwen3 dense support exists in qwen36-related paths; reuse only after exact config/mRoPE/template parity checks.
 - ForcedAligner (`Qwen/Qwen3-ForcedAligner-0.6B`) is out of MVP unless explicitly pulled in.
-- External project compatibility should prefer `/v1/audio/transcriptions`; confirm voicy-offline-llama expected endpoint before finalizing.
+- External project compatibility should prefer `/v1/audio/transcriptions`; confirm voicy-offline-llama expected endpoint before finalizing (deferred).
