@@ -229,6 +229,9 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_CUDA_MOE_HCM", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_MOE_TILE128", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_MTP",                    CE_INT   , CE_COLIBRI                                      , 0             , NULL},
+    {"COLI_CUDA_NORM256_FAST", CE_INT, CE_QWEN, 0, NULL}, /* In-place 256-wide normalization and RoPE fusion mode. Default 1. */
+    {"COLI_CUDA_NORM_PLAIN", CE_STR, CE_QWEN, 0, NULL}, /* Use the ordinary normalization kernel when set to 1. */
+    {"COLI_CUDA_NORM_SKIP_Y", CE_BOOL, CE_QWEN, 0, NULL}, /* Allows normalization to omit the float output when the caller requests quantized output only. Default on. */
     {"COLI_CUDA_PDL", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_PIPE",                   CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_CUDA_PIPE_SHARD",             CE_INT   , CE_COLIBRI                                      , 0             , NULL},

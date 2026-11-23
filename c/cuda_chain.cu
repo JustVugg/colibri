@@ -80,6 +80,7 @@ struct CcCtx {
     cudaStream_t cs; cudaEvent_t ev_fetched[2], ev_free[2]; int cs_ok;
     cudaEvent_t ev_down, ev_down_done;
     unsigned long long down_seq, down_joined;
+    int pend_norm; CcBuf *pend_nx, *pend_nw; CcNorm pend_np;
     /* host_up: the copies' marks, a ring of CC_UP_MARKS events on the copy stream */
     cudaEvent_t up_ev[CC_UP_MARKS]; unsigned up_seq, up_made; cudaEvent_t up_after;
     float *adec; size_t adec_bytes;   /* cc_attn_dec_k's blocks */
@@ -111,8 +112,9 @@ static thread_local unsigned long long t_cc_seq = 0;   /* this thread's last cou
 CcCtx *cur(void) { t_cc_seq = ++g_cc_seq; return g_cur >= 0 ? &g_cc[g_cur] : nullptr; }
 CcCtx *ctx_of(int device) { t_cc_seq = ++g_cc_seq; for (int i = 0; i < g_ncc; i++) if (g_cc[i].device == device) return &g_cc[i]; return nullptr; }
 /* every call: the context's device current (the backend's other calls switch it) */
+static int cc_flush_norm(CcCtx *c);
 static int cc_join_down(CcCtx *c);
-enum CcOrdering { CC_ORDERED, CC_OVERLAP_DOWN };
+enum CcOrdering { CC_ORDERED, CC_OVERLAP_DOWN, CC_FUSE_ROPE };
 /* An operation taking CC_OVERLAP_DOWN orders writes to a pending readback's source and reads
  * of its destination through fpw/fp. Other operations (including submit and signal) join all
  * previous readbacks: a host that sees their completion can consume the downloaded data. */
@@ -121,6 +123,7 @@ CcCtx *live(CcOrdering order = CC_ORDERED) {
     if (!c || !c->up || c->lost) return nullptr;
     if (cudaSetDevice(c->device) != cudaSuccess) { c->lost = 1; (void)cudaGetLastError(); return nullptr; }
     if (order == CC_ORDERED && c->down_seq != c->down_joined && !cc_join_down(c)) return nullptr;
+    if (c->pend_norm && order != CC_FUSE_ROPE && !cc_flush_norm(c)) return nullptr;
     return c;
 }
 int cc_ok(CcCtx *c, cudaError_t e, const char *what) {
@@ -155,6 +158,140 @@ float *fpw(CcBuf *b) {
 }
 
 /* ---- kernels: shaders/chain_*.comp, line for line --------------------------- */
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
+#define cc_shfl_xor(v, o) __shfl_xor((v), (o), 32)   /* 32-lane groups on a wave64 device too */
+#else
+#define cc_shfl_xor(v, o) __shfl_xor_sync(0xffffffffu, (v), (o), 32)
+#endif
+/* red[0..255]'s binary tree sum: three shared-memory halvings to warp 0, then five shuffles
+ * in the same pair order (off = 16, 8, 4, 2, 1), bit-identical to eight shared halvings */
+__device__ __forceinline__ float cc_norm_reduce(float *red, float acc, int tid) {
+    red[tid] = acc;
+    __syncthreads();
+    for (int off = 128; off >= 32; off >>= 1) {
+        if (tid < off) red[tid] += red[tid + off];
+        __syncthreads();
+    }
+    if (tid < 32) {
+        float v = red[tid];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) v += cc_shfl_xor(v, off);
+        if (tid == 0) red[0] = v;
+    }
+    __syncthreads();
+    return red[0];
+}
+__device__ __forceinline__ int8_t cc_f_s8(float x) {
+#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700)
+    unsigned b;
+    asm("cvt.rni.sat.s8.f32 %0, %1;" : "=r"(b) : "f"(x));
+    return (int8_t)b;
+#else
+    float r = rintf(x);
+    return (int8_t)(r < -128.f ? -128 : (r > 127.f ? 127 : (int)r));
+#endif
+}
+__device__ __forceinline__ uint32_t cc_f4_s8x4(float4 v, float sc) {
+#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700)
+    unsigned b0, b1, b2, b3;
+    float x0 = v.x * sc, x1 = v.y * sc, x2 = v.z * sc, x3 = v.w * sc;
+    asm("cvt.rni.sat.s8.f32 %0, %1;" : "=r"(b0) : "f"(x0));
+    asm("cvt.rni.sat.s8.f32 %0, %1;" : "=r"(b1) : "f"(x1));
+    asm("cvt.rni.sat.s8.f32 %0, %1;" : "=r"(b2) : "f"(x2));
+    asm("cvt.rni.sat.s8.f32 %0, %1;" : "=r"(b3) : "f"(x3));
+    unsigned p01 = __byte_perm(b0, b1, 0x1040u);
+    unsigned p23 = __byte_perm(b2, b3, 0x1040u);
+    return __byte_perm(p01, p23, 0x5410u);
+#else
+    uint32_t b0 = (uint8_t)cc_f_s8(v.x * sc);
+    uint32_t b1 = (uint8_t)cc_f_s8(v.y * sc);
+    uint32_t b2 = (uint8_t)cc_f_s8(v.z * sc);
+    uint32_t b3 = (uint8_t)cc_f_s8(v.w * sc);
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+#endif
+}
+template <int OUT_I8 = 0>
+__global__ static void cc_norm_pack_k(const float *__restrict__ x, const float *__restrict__ w, float *__restrict__ y, CcNorm p,
+                                 int8_t *__restrict__ xq = nullptr, float *__restrict__ xs = nullptr) {
+    __shared__ float red[OUT_I8 ? 8 : 256];
+    int g = blockIdx.x;
+    if (g >= p.nseg) return;
+    int row = g / p.per_row, j = g - row * p.per_row;
+    int xb = p.x_off + row * p.x_row + j * p.x_seg;
+    int yb = p.y_off + row * p.y_row + j * p.y_seg;
+    int wb = p.w_off + (p.w_mod > 0 ? (j % p.w_mod) * p.D : 0);
+    int tid = threadIdx.x;
+    float acc = 0.f, rv[8];
+    const bool pre = (p.flags & 8) != 0;
+    if (OUT_I8) {
+        /* D == 2048, per_row == 1, !pre, 16B-aligned: 2 float4s per thread, 1 barrier, half-warp Q8_1 group */
+        float4 xv[2];
+        #pragma unroll
+        for (int k = 0; k < 2; k++) {
+            int d0 = k * 1024 + tid * 4;
+            xv[k] = *reinterpret_cast<const float4 *>(x + xb + d0);
+            acc += xv[k].x * xv[k].x + xv[k].y * xv[k].y + xv[k].z * xv[k].z + xv[k].w * xv[k].w;
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) acc += cc_shfl_xor(acc, off);
+        if ((tid & 31) == 0) red[tid >> 5] = acc;
+        __syncthreads();
+        float sum = ((red[0] + red[1]) + (red[2] + red[3])) + ((red[4] + red[5]) + (red[6] + red[7]));
+        float r = ((p.flags & 4) ? 1.f / sqrtf(sum + p.eps) : 1.f / sqrtf(sum * (1.f / 2048.f) + p.eps)) * p.post;
+        float bias = (p.flags & 1) ? 1.f : 0.f;
+        #pragma unroll
+        for (int k = 0; k < 2; k++) {
+            int d0 = k * 1024 + tid * 4;
+            float4 wv = (p.flags & 2) ? make_float4(1.f, 1.f, 1.f, 1.f) : *reinterpret_cast<const float4 *>(w + wb + d0);
+            float4 yv = make_float4(xv[k].x * (wv.x + bias) * r, xv[k].y * (wv.y + bias) * r,
+                                    xv[k].z * (wv.z + bias) * r, xv[k].w * (wv.w + bias) * r);
+            if (OUT_I8 == 1) *reinterpret_cast<float4 *>(y + yb + d0) = yv;
+            float amax = fmaxf(fmaxf(fabsf(yv.x), fabsf(yv.y)), fmaxf(fabsf(yv.z), fabsf(yv.w)));
+            #pragma unroll
+            for (int off = 8; off >= 1; off >>= 1) amax = fmaxf(amax, cc_shfl_xor(amax, off));
+            float inv_sx = amax > 0.f ? __fdividef(127.f, amax) : 0.f;
+            *reinterpret_cast<uint32_t *>(xq + yb + d0) = cc_f4_s8x4(yv, inv_sx);
+            if ((tid & 15) == 0) xs[(size_t)(yb + d0) >> 6] = amax * (1.f / 127.f);
+        }
+        return;
+    }
+    if (p.D == 256) {
+        float xi = x[xb + tid], v = pre ? xi * w[wb + tid] : xi;
+        float sum = cc_norm_reduce(red, v * v, tid);
+        float r = (p.flags & 4) ? 1.f / sqrtf(sum + p.eps) : 1.f / sqrtf(sum * (1.f / 256.f) + p.eps);
+        float wv = (p.flags & 2) ? 1.f : ((p.flags & 1) ? 1.f + w[wb + tid] : w[wb + tid]);
+        y[yb + tid] = xi * (pre ? w[wb + tid] : wv) * r * p.post;
+        return;
+    }
+    if (p.D <= 2048) {
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            int i = tid + k * 256;
+            if (i < p.D) {
+                float xi = x[xb + i], v = pre ? xi * w[wb + i] : xi;
+                rv[k] = xi; acc += v * v;
+            }
+        }
+        float sum = cc_norm_reduce(red, acc, tid);
+        float r = (p.flags & 4) ? 1.f / sqrtf(sum + p.eps) : 1.f / sqrtf(sum / (float)p.D + p.eps);
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            int i = tid + k * 256;
+            if (i < p.D) {
+                float wv = (p.flags & 2) ? 1.f : ((p.flags & 1) ? 1.f + w[wb + i] : w[wb + i]);
+                y[yb + i] = rv[k] * (pre ? w[wb + i] : wv) * r * p.post;
+            }
+        }
+        return;
+    }
+    for (int i = tid; i < p.D; i += 256) { float v = pre ? x[xb + i] * w[wb + i] : x[xb + i]; acc += v * v; }
+    float sum = cc_norm_reduce(red, acc, tid);
+    float r = (p.flags & 4) ? 1.f / sqrtf(sum + p.eps) : 1.f / sqrtf(sum / (float)p.D + p.eps);
+    for (int i = tid; i < p.D; i += 256) {
+        float wv = (p.flags & 2) ? 1.f : ((p.flags & 1) ? 1.f + w[wb + i] : w[wb + i]);
+        y[yb + i] = x[xb + i] * (pre ? w[wb + i] : wv) * r * p.post;
+    }
+}
 __global__ static void cc_norm_k(const float *__restrict__ x, const float *__restrict__ w, float *__restrict__ y, CcNorm p) {
     COLI_PDL_WAIT();
     __shared__ float red[256];
@@ -290,6 +427,98 @@ __device__ static inline float cc_f16_round(float x) {
 __device__ static inline void cc_rope_pair(float a, float b, float c, float s, float *ra, float *rb) {
     *ra = __fmaf_rn(a, c, -__fmul_rn(b, s));
     *rb = __fmaf_rn(a, s, __fmul_rn(b, c));
+}
+/* 8 segments of D == 256 per 256-thread block (1 warp per segment, 0 shared memory, 0 barriers):
+ * tree reduction ((sq[0]+sq[4])+(sq[2]+sq[6]))+((sq[1]+sq[5])+(sq[3]+sq[7])) matches cc_norm_reduce
+ * bit-for-bit (0 ULP). ROPE == 1 fuses in-register half=32 RoPE; ROPE == 2 also rounds K and V to f16.
+ * M_SEG == 4 processes 4 segments per warp, caching w[0..255] (and RoPE cos/sin when per_row % 4 == 0) in registers. */
+template <int ROPE = 0, int M_SEG = 1>
+__global__ static void __launch_bounds__(256) cc_norm_256_k(const float *__restrict__ x, const float *__restrict__ w,
+                                                            float *__restrict__ y, CcNorm p,
+                                                            const float *__restrict__ cs = nullptr,
+                                                            int cs_off = 0, int cs_row = 0,
+                                                            float *__restrict__ v_f16 = nullptr) {
+    int g0 = ((int)blockIdx.x * 8 + (int)(threadIdx.x >> 5)) * M_SEG, lane = threadIdx.x & 31;
+    if (g0 >= p.nseg) return;
+    const bool pre = (p.flags & 8) != 0;
+    const bool needs_weights = pre || !(p.flags & CC_NORM_NOW);
+    float wk[8];
+    if (M_SEG > 1 && p.w_mod == 0) {
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            int d = lane + k * 32;
+            float wraw = needs_weights && w ? __ldg(&w[p.w_off + d]) : 1.f;
+            wk[k] = pre ? wraw : ((p.flags & 2) ? 1.f : ((p.flags & 1) ? 1.f + wraw : wraw));
+        }
+    }
+    float c_re = 0.f, c_im = 0.f;
+    if (ROPE == 1 && M_SEG == 4 && (p.per_row & 3) == 0) {
+        int row0 = g0 / p.per_row, cb0 = cs_off + row0 * cs_row + 2 * lane;
+        c_re = __ldg(&cs[cb0]);
+        c_im = __ldg(&cs[cb0 + 1]);
+    }
+    #pragma unroll
+    for (int m = 0; m < M_SEG; m++) {
+        int g = g0 + m;
+        if (M_SEG == 1 && g >= p.nseg) return;
+        int row = g / p.per_row, j = g - row * p.per_row;
+        int xb = p.x_off + row * p.x_row + j * p.x_seg;
+        int yb = p.y_off + row * p.y_row + j * p.y_seg;
+        int wb = p.w_off + (p.w_mod > 0 ? (j % p.w_mod) * 256 : 0);
+        float xi[8], sq[8];
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            int d = lane + k * 32;
+            float xk = x[xb + d];
+            float v = xk;
+            if (pre) v *= (M_SEG > 1 && p.w_mod == 0) ? wk[k] : w[wb + d];
+            xi[k] = xk;
+            sq[k] = __fmul_rn(v, v);
+        }
+        float sum = ((sq[0] + sq[4]) + (sq[2] + sq[6])) + ((sq[1] + sq[5]) + (sq[3] + sq[7]));
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) sum += cc_shfl_xor(sum, off);
+        float r = (p.flags & 4) ? 1.f / sqrtf(sum + p.eps) : 1.f / sqrtf(sum * (1.f / 256.f) + p.eps);
+        if (ROPE >= 1) {
+            int d0 = lane, d1 = lane + 32;
+            float w0 = (M_SEG > 1 && p.w_mod == 0) ? wk[0] : ((p.flags & 2) ? 1.f : ((p.flags & 1) ? 1.f + w[wb + d0] : w[wb + d0]));
+            float w1 = (M_SEG > 1 && p.w_mod == 0) ? wk[1] : ((p.flags & 2) ? 1.f : ((p.flags & 1) ? 1.f + w[wb + d1] : w[wb + d1]));
+            float y0 = xi[0] * (pre && !(M_SEG > 1 && p.w_mod == 0) ? w[wb + d0] : w0) * r * p.post;
+            float y1 = xi[1] * (pre && !(M_SEG > 1 && p.w_mod == 0) ? w[wb + d1] : w1) * r * p.post;
+            if (ROPE == 1 && M_SEG == 4 && (p.per_row & 3) == 0) {
+                cc_rope_pair(y0, y1, c_re, c_im, &y0, &y1);
+            } else {
+                int cb = cs_off + row * cs_row + 2 * lane;
+                cc_rope_pair(y0, y1, cs[cb], cs[cb + 1], &y0, &y1);
+            }
+            if (ROPE == 2) {
+                y0 = cc_f16_round(y0);
+                y1 = cc_f16_round(y1);
+                v_f16[yb + d0] = cc_f16_round(v_f16[yb + d0]);
+                v_f16[yb + d1] = cc_f16_round(v_f16[yb + d1]);
+            }
+            y[yb + d0] = y0;
+            y[yb + d1] = y1;
+            #pragma unroll
+            for (int k = 2; k < 8; k++) {
+                int d = lane + k * 32;
+                float wv = (M_SEG > 1 && p.w_mod == 0) ? wk[k] : ((p.flags & 2) ? 1.f : ((p.flags & 1) ? 1.f + w[wb + d] : w[wb + d]));
+                float yk = xi[k] * (pre && !(M_SEG > 1 && p.w_mod == 0) ? w[wb + d] : wv) * r * p.post;
+                if (ROPE == 2) {
+                    yk = cc_f16_round(yk);
+                    v_f16[yb + d] = cc_f16_round(v_f16[yb + d]);
+                }
+                y[yb + d] = yk;
+            }
+        } else {
+            #pragma unroll
+            for (int k = 0; k < 8; k++) {
+                int d = lane + k * 32;
+                float wv = (M_SEG > 1 && p.w_mod == 0) ? wk[k] : ((p.flags & 2) ? 1.f : ((p.flags & 1) ? 1.f + w[wb + d] : w[wb + d]));
+                y[yb + d] = xi[k] * (pre && !(M_SEG > 1 && p.w_mod == 0) ? w[wb + d] : wv) * r * p.post;
+            }
+        }
+    }
 }
 __global__ static void cc_rope_k(float *__restrict__ x, const float *__restrict__ cs, CcRope p) {
     COLI_PDL_WAIT();
@@ -1587,11 +1816,6 @@ __global__ static void __launch_bounds__(128) cc_dnrec_k(const float *__restrict
         for (int k = 0; k < KD; k++) st[sb + k * p.VD + v] = col[k];
     }
 }
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
-#define cc_shfl_xor(v, o) __shfl_xor((v), (o), 32)   /* 32-lane groups on a wave64 device too */
-#else
-#define cc_shfl_xor(v, o) __shfl_xor_sync(0xffffffffu, (v), (o), 32)
-#endif
 #define CC_DNREC_ROWS 8   /* rows from which cc_dnrec takes cc_dnrec_rows_k (COLI_CUDA_DNREC_ROWS=0 never) */
 /* A prompt chunk's rows (cc_dnrec from CC_DNREC_ROWS rows): cc_dnrec_k's arithmetic, R
  * rows at a time. cc_dnrec_k takes about eighteen barriers a row (the tree sums of the q, k
@@ -2151,6 +2375,156 @@ __global__ static void cc_ew_k(float *__restrict__ y, const float *__restrict__ 
     }
 }
 
+/* Update the residual y in place, then normalize it, one block per row.
+ * OUT_I8 == 0 uses cc_norm_k's sum-of-squares order. The packed paths
+ * reduce float4 lanes by warp and write INT8 groups with their scales.
+ * Mode 1 also writes the normalized floats to yn. Mode 2 skips that store.
+ * y may alias a. */
+template <int OUT_I8 = 0>
+__global__ static void cc_ew_norm_k(float *y, const float *a, const float *__restrict__ b, const float *__restrict__ c,
+                                    float *__restrict__ e, CcEw pe, const float *__restrict__ w,
+                                    float *__restrict__ yn, CcNorm p, int8_t *__restrict__ xq = nullptr, float *__restrict__ xs = nullptr) {
+    __shared__ float red[OUT_I8 ? 8 : 256];
+    int row = blockIdx.x, tid = threadIdx.x, D = p.D;
+    if (row >= p.nseg) return;
+    float acc = 0.f, rv[8];
+    int xb = p.x_off + row * p.x_row, yb = p.y_off + row * p.y_row;
+    if (OUT_I8) {
+        /* D == 2048, per_row == 1, !pre, 16B-aligned: 2 float4s per thread, 1 barrier, half-warp Q8_1 group */
+        float4 rv4[2];
+        long long base = (long long)row * 2048;
+        float g = ((pe.op != CC_EW_ADD) && (pe.flags & 2)) ? ((pe.flags & 4) ? cc_sig(e[pe.e_off + row * pe.e_row]) : 1.f) : 1.f;
+        #pragma unroll
+        for (int k = 0; k < 2; k++) {
+            int d0 = k * 1024 + tid * 4;
+            long long i0 = base + d0;
+            float4 v4;
+            if (pe.op == CC_EW_ADD) {
+                float4 a4 = *reinterpret_cast<const float4 *>(a + pe.a_off + i0);
+                float4 b4 = *reinterpret_cast<const float4 *>(b + pe.b_off + i0);
+                v4 = make_float4(a4.x + b4.x, a4.y + b4.y, a4.z + b4.z, a4.w + b4.w);
+            } else {
+                float4 t4 = (pe.flags & 1) ? *reinterpret_cast<const float4 *>(b + pe.b_off + i0) : make_float4(0.f, 0.f, 0.f, 0.f);
+                if (pe.flags & 2) {
+                    float4 c4 = *reinterpret_cast<const float4 *>(c + pe.c_off + i0);
+                    t4.x += g * c4.x; t4.y += g * c4.y; t4.z += g * c4.z; t4.w += g * c4.w;
+                }
+                if (pe.flags & 8) v4 = t4;
+                else {
+                    float4 a4 = *reinterpret_cast<const float4 *>(a + pe.a_off + i0);
+                    v4 = make_float4(a4.x + t4.x, a4.y + t4.y, a4.z + t4.z, a4.w + t4.w);
+                }
+            }
+            *reinterpret_cast<float4 *>(y + pe.y_off + i0) = v4;
+            rv4[k] = v4;
+            acc += v4.x * v4.x + v4.y * v4.y + v4.z * v4.z + v4.w * v4.w;
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) acc += cc_shfl_xor(acc, off);
+        if ((tid & 31) == 0) red[tid >> 5] = acc;
+        __syncthreads();
+        float sum = ((red[0] + red[1]) + (red[2] + red[3])) + ((red[4] + red[5]) + (red[6] + red[7]));
+        float r = ((p.flags & 4) ? 1.f / sqrtf(sum + p.eps) : 1.f / sqrtf(sum * (1.f / 2048.f) + p.eps)) * p.post;
+        float bias = (p.flags & 1) ? 1.f : 0.f, sg = 0.f;
+        const bool fuse_sg = pe.op == CC_EW_ADD && (pe.flags & 4);
+        #pragma unroll
+        for (int k = 0; k < 2; k++) {
+            int d0 = k * 1024 + tid * 4;
+            float4 w4 = (p.flags & 2) ? make_float4(1.f, 1.f, 1.f, 1.f) : *reinterpret_cast<const float4 *>(w + p.w_off + d0);
+            float4 o4 = make_float4(rv4[k].x * (w4.x + bias) * r, rv4[k].y * (w4.y + bias) * r,
+                                    rv4[k].z * (w4.z + bias) * r, rv4[k].w * (w4.w + bias) * r);
+            if (OUT_I8 == 1) *reinterpret_cast<float4 *>(yn + yb + d0) = o4;
+            if (fuse_sg) {
+                float4 gw = *reinterpret_cast<const float4 *>(w + p.w_off + 2048 + d0);
+                sg = fmaf(o4.x, gw.x, fmaf(o4.y, gw.y, fmaf(o4.z, gw.z, fmaf(o4.w, gw.w, sg))));
+            }
+            float amax = fmaxf(fmaxf(fabsf(o4.x), fabsf(o4.y)), fmaxf(fabsf(o4.z), fabsf(o4.w)));
+            #pragma unroll
+            for (int off = 8; off >= 1; off >>= 1) amax = fmaxf(amax, cc_shfl_xor(amax, off));
+            float inv_sx = amax > 0.f ? __fdividef(127.f, amax) : 0.f;
+            *reinterpret_cast<uint32_t *>(xq + yb + d0) = cc_f4_s8x4(o4, inv_sx);
+            if ((tid & 15) == 0) xs[(size_t)(yb + d0) >> 6] = amax * (1.f / 127.f);
+        }
+        if (fuse_sg) {
+            __shared__ float red_sg[8];
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) sg += cc_shfl_xor(sg, off);
+            if ((tid & 31) == 0) red_sg[tid >> 5] = sg;
+            __syncthreads();
+            if (!tid) e[pe.e_off + row * pe.e_row] = ((red_sg[0] + red_sg[1]) + (red_sg[2] + red_sg[3])) + ((red_sg[4] + red_sg[5]) + (red_sg[6] + red_sg[7]));
+        }
+        return;
+    }
+    if (D <= 2048) {
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            int d = tid + k * 256;
+            if (d < D) {
+                long long i = (long long)row * D + d;
+                float v;
+                if (pe.op == CC_EW_ADD) v = a[pe.a_off + i] + b[pe.b_off + i];
+                else {
+                    float t = (pe.flags & 1) ? b[pe.b_off + row * D + d] : 0.f;
+                    if (pe.flags & 2) {
+                        float g = (pe.flags & 4) ? cc_sig(e[pe.e_off + row * pe.e_row]) : 1.f;
+                        t = t + g * c[pe.c_off + row * D + d];
+                    }
+                    v = (pe.flags & 8) ? t : a[pe.a_off + i] + t;
+                }
+                y[pe.y_off + i] = v;
+                rv[k] = v;
+                acc += v * v;
+            }
+        }
+        float sum = cc_norm_reduce(red, acc, tid);
+        float r = (p.flags & 4) ? 1.f / sqrtf(sum + p.eps) : 1.f / sqrtf(sum / (float)p.D + p.eps);
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            int d = tid + k * 256;
+            if (d < D) {
+                float wv = (p.flags & 2) ? 1.f : ((p.flags & 1) ? 1.f + w[p.w_off + d] : w[p.w_off + d]);
+                yn[yb + d] = rv[k] * wv * r * p.post;
+            }
+        }
+        if (pe.op == CC_EW_ADD && (pe.flags & 4)) {
+            __syncthreads();
+            float sg = 0.f;
+            #pragma unroll
+            for (int k = 0; k < 8; k++) {
+                int d = tid + k * 256;
+                if (d < D) {
+                    float wv = (p.flags & 2) ? 1.f : ((p.flags & 1) ? 1.f + w[p.w_off + d] : w[p.w_off + d]);
+                    sg = fmaf(rv[k] * wv * r * p.post, w[p.w_off + D + d], sg);
+                }
+            }
+            sg = cc_norm_reduce(red, sg, tid);
+            if (!tid) e[pe.e_off + row * pe.e_row] = sg;
+        }
+        return;
+    }
+    for (int d = tid; d < D; d += 256) {
+        long long i = (long long)row * D + d;
+        float v;
+        if (pe.op == CC_EW_ADD) v = a[pe.a_off + i] + b[pe.b_off + i];
+        else {
+            float t = (pe.flags & 1) ? b[pe.b_off + row * D + d] : 0.f;
+            if (pe.flags & 2) {
+                float g = (pe.flags & 4) ? cc_sig(e[pe.e_off + row * pe.e_row]) : 1.f;
+                t = t + g * c[pe.c_off + row * D + d];
+            }
+            v = (pe.flags & 8) ? t : a[pe.a_off + i] + t;
+        }
+        y[pe.y_off + i] = v;
+        acc += v * v;
+    }
+    float sum = cc_norm_reduce(red, acc, tid);
+    float r = (p.flags & 4) ? 1.f / sqrtf(sum + p.eps) : 1.f / sqrtf(sum / (float)p.D + p.eps);
+    for (int d = tid; d < D; d += 256) {
+        float wv = (p.flags & 2) ? 1.f : ((p.flags & 1) ? 1.f + w[p.w_off + d] : w[p.w_off + d]);
+        yn[yb + d] = y[xb + d] * wv * r * p.post;
+    }
+}
+
 /* chain_route.comp: one block per row, its 8 warps the shader's subgroups (the row's max
  * and sum: each warp's, then theirs in warp order) */
 __device__ __forceinline__ float cc_wmax(float v) { for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, cc_shfl_xor(v, o)); return v; }
@@ -2541,7 +2915,11 @@ static void cc_shutdown(void) {
         CcCtx *c = &g_cc[i];
         if (!c->up) continue;
         if (cudaSetDevice(c->device) == cudaSuccess) {
-            if (!c->lost) cudaStreamSynchronize(c->stream);
+            if (!c->lost) {
+                g_cur = i;   /* a pending norm uses its device's readback dependencies */
+                cc_flush_norm(c);
+                cudaStreamSynchronize(c->stream);
+            }
             if (c->ev_ok) cudaEventDestroy(c->ev);
             cudaStreamDestroy(c->stream);
             if (c->cs_ok) {
@@ -2559,7 +2937,7 @@ static void cc_shutdown(void) {
             cc_adec_reap(c);
         }
         if (c->device_profile) (void)coli_cuda_enable_qwen36(c->device, 0);
-        c->device_profile = c->qx_warmed = 0;
+        c->pend_norm = 0; c->device_profile = c->qx_warmed = 0;
         c->adec = nullptr; c->adec_bytes = 0;
         (void)cudaGetLastError();
         c->ev_down = c->ev_down_done = nullptr;
@@ -2621,6 +2999,12 @@ static void cc_free(CcBuf *b) {
     CcCtx *c = ctx_of(b->dev);
     if (c && c->up && cudaSetDevice(c->device) == cudaSuccess) {
         if (c->device_profile) {
+            if (!c->lost && c->pend_norm) {
+                int saved = g_cur;
+                g_cur = (int)(c - g_cc);
+                cc_flush_norm(c);
+                g_cur = saved;
+            }
             coli_cuda_qx_invalidate(b->dev, nullptr, 0);
         }
         if (!c->lost) cudaStreamSynchronize(c->stream);   /* the frames that may read it */
@@ -2962,22 +3346,110 @@ static int cc_matmul_swiglu(ColiCudaTensor *tg, ColiCudaTensor *tu, CcBuf *x, si
     if (!rc) { c->lost = 1; return 0; }
     return 1;
 }
+namespace {
+static int cc_flush_norm(CcCtx *c) {
+    if (!c || !c->pend_norm) return 1;
+    int pm = c->pend_norm;
+    c->pend_norm = 0;
+    const CcNorm &np = c->pend_np;
+    if (np.w_mod == 0 && pm >= 2 && (np.nseg & 31) == 0)
+        cc_norm_256_k<0, 4><<<grid1((size_t)np.nseg, 32), 256, 0, c->stream>>>(
+            fp(c->pend_nx), fp(c->pend_nw), fpw(c->pend_nx), np);
+    else
+        cc_norm_256_k<0, 1><<<grid1((size_t)np.nseg, 8), 256, 0, c->stream>>>(
+            fp(c->pend_nx), fp(c->pend_nw), fpw(c->pend_nx), np);
+    return cc_ok(c, cudaGetLastError(), "norm");
+}
+}
 static int cc_norm(CcBuf *x, CcBuf *w, CcBuf *y, const CcNorm *p) {
     CcCtx *c = live(CC_OVERLAP_DOWN);
     if (!c || !x || !y || !p || p->nseg < 1 || p->D < 1 || p->per_row < 1) return 0;
     if (!(p->flags & CC_NORM_NOW) && !w) return 0;
-    coli_launch(cc_norm_k, grid1((size_t)p->nseg, 1), 256, 0, c->stream, fp(x), fp(w), fpw(y), *p);
+    const char *mode = c->device_profile ? getenv("COLI_CUDA_NORM_PLAIN") : nullptr;
+    if (!c->device_profile || (mode ? !strcmp(mode, "1") : !cc_uses_feature(c, Q36_FUSED_NORM))) {
+        CcNorm ordinary = *p;
+        if (c->device_profile && ordinary.eps < 0.f) ordinary.eps = -ordinary.eps;
+        coli_launch(cc_norm_k, grid1((size_t)p->nseg, 1), 256, 0, c->stream, fp(x), fp(w), fpw(y), ordinary);
+        return launched(c, "norm");
+    }
+    const bool req_skip_y = p->eps < 0.f;
+    CcNorm pn = *p;
+    if (req_skip_y) pn.eps = -pn.eps;
+    static int norm256_on = -1, skip_y_on = -1, bench = -1;
+    if (bench < 0) bench = getenv("COLI_CUDA_CHAIN_BENCH") != nullptr || getenv("COLI_CUDA_CHAIN_TEST") != nullptr;
+    if (norm256_on < 0 || bench) { const char *e = getenv("COLI_CUDA_NORM256_FAST"); norm256_on = e && *e ? atoi(e) : 1; }
+    if (skip_y_on < 0 || bench) { const char *e = getenv("COLI_CUDA_NORM_SKIP_Y"); skip_y_on = !(e && *e == '0'); }
+    if ((pn.flags & 16) && pn.D == 256 && norm256_on >= 1 && x == y &&
+        pn.x_off == pn.y_off && pn.x_row == pn.y_row && pn.x_seg == pn.y_seg) {
+        pn.flags &= ~16;
+        c->pend_norm = norm256_on; c->pend_nx = x; c->pend_nw = w; c->pend_np = pn;
+        g_st.ops++;
+        return 1;
+    }
+    pn.flags &= ~16;
+    float *yy = fpw(y);
+    const bool skip_y = req_skip_y && skip_y_on && getenv("COLI_CUDA_DENSE_BM") == nullptr;
+    int8_t *xq = nullptr; float *xs = nullptr;
+    /* The activation cache packs the float result. Fused INT8 output also
+     * changes the order of the sum of squares, even when it stores float rows. */
+    if (!cc_uses_feature(c, Q36_ACTIVATION_CACHE) && pn.D == 2048 && pn.per_row == 1 && !(pn.flags & 8) &&
+        ((pn.x_off | pn.x_row | pn.w_off) & 3) == 0 &&
+        pn.y_off == 0 && pn.y_row == pn.D && pn.y_seg == pn.D)
+        coli_cuda_qx_prepare(c->device, yy, pn.nseg, pn.D, &xq, &xs, 0, (int)skip_y);
+    if (xq) {
+        if (skip_y)
+            cc_norm_pack_k<2><<<grid1((size_t)pn.nseg, 1), 256, 0, c->stream>>>(fp(x), fp(w), yy, pn, xq, xs);
+        else
+            cc_norm_pack_k<1><<<grid1((size_t)pn.nseg, 1), 256, 0, c->stream>>>(fp(x), fp(w), yy, pn, xq, xs);
+    } else if (pn.D == 256 && norm256_on >= 1) {
+        if (pn.w_mod == 0 && (pn.nseg & 31) == 0 && norm256_on >= 2)
+            cc_norm_256_k<0, 4><<<grid1((size_t)pn.nseg, 32), 256, 0, c->stream>>>(fp(x), fp(w), yy, pn);
+        else
+            cc_norm_256_k<0, 1><<<grid1((size_t)pn.nseg, 8), 256, 0, c->stream>>>(fp(x), fp(w), yy, pn);
+    } else {
+        cc_norm_pack_k<0><<<grid1((size_t)pn.nseg, 1), 256, 0, c->stream>>>(fp(x), fp(w), yy, pn);
+    }
     return launched(c, "norm");
 }
 static int cc_rope(CcBuf *x, CcBuf *cs, const CcRope *p) {
-    CcCtx *c = live();
+    CcCtx *c = live(CC_FUSE_ROPE);
     if (!c || !x || !cs || !p || p->nseg < 1 || p->half_ < 1 || p->per_row < 1) return 0;
+    if (c->pend_norm && c->pend_nx == x && p->half_ == 32 &&
+        p->nseg == c->pend_np.nseg && p->per_row == c->pend_np.per_row &&
+        p->x_off == c->pend_np.y_off && p->x_row == c->pend_np.y_row && p->x_seg == c->pend_np.y_seg) {
+        int pm = c->pend_norm;
+        c->pend_norm = 0;
+        const CcNorm &np = c->pend_np;
+        if (np.w_mod == 0 && pm >= 2 && (np.nseg & 31) == 0 && (np.per_row & 3) == 0)
+            cc_norm_256_k<1, 4><<<grid1((size_t)np.nseg, 32), 256, 0, c->stream>>>(
+                fp(x), fp(c->pend_nw), fpw(x), np, fp(cs), p->cs_off, p->cs_row);
+        else
+            cc_norm_256_k<1, 1><<<grid1((size_t)np.nseg, 8), 256, 0, c->stream>>>(
+                fp(x), fp(c->pend_nw), fpw(x), np, fp(cs), p->cs_off, p->cs_row);
+        return launched(c, "rope");
+    }
+    if (!cc_flush_norm(c)) return 0;
     coli_launch(cc_rope_k, grid1((size_t)p->nseg * p->half_, 64), 64, 0, c->stream, fpw(x), fp(cs), *p);
     return launched(c, "rope");
 }
 static int cc_rope_f16(CcBuf *x, CcBuf *v, CcBuf *cs, const CcRope *p, int seg) {
-    CcCtx *c = live();
+    CcCtx *c = live(CC_FUSE_ROPE);
     if (!c || !x || !v || !cs || !p || p->nseg < 1 || p->half_ < 1 || p->per_row < 1 || seg < 2 * p->half_) return 0;
+    if (c->pend_norm && c->pend_nx == x && p->half_ == 32 && seg == 256 &&
+        p->nseg == c->pend_np.nseg && p->per_row == c->pend_np.per_row &&
+        p->x_off == c->pend_np.y_off && p->x_row == c->pend_np.y_row && p->x_seg == c->pend_np.y_seg) {
+        int pm = c->pend_norm;
+        c->pend_norm = 0;
+        const CcNorm &np = c->pend_np;
+        if (np.w_mod == 0 && pm >= 2 && (np.nseg & 31) == 0)
+            cc_norm_256_k<2, 4><<<grid1((size_t)np.nseg, 32), 256, 0, c->stream>>>(
+                fp(x), fp(c->pend_nw), fpw(x), np, fp(cs), p->cs_off, p->cs_row, fpw(v));
+        else
+            cc_norm_256_k<2, 1><<<grid1((size_t)np.nseg, 8), 256, 0, c->stream>>>(
+                fp(x), fp(c->pend_nw), fpw(x), np, fp(cs), p->cs_off, p->cs_row, fpw(v));
+        return launched(c, "rope_f16");
+    }
+    if (!cc_flush_norm(c)) return 0;
     coli_launch(cc_rope_f16_k, grid1((size_t)p->nseg * seg, 128), 128, 0, c->stream, fpw(x), fpw(v), fp(cs), *p, seg);
     return launched(c, "rope_f16");
 }
@@ -3541,6 +4013,42 @@ static int cc_ew(CcBuf *y, CcBuf *a, CcBuf *b, CcBuf *cb, CcBuf *e, const CcEw *
     }
     coli_launch(cc_ew_k, grid1((size_t)p->n, 256), 256, 0, c->stream, fpw(y), fp(a), fp(b), fp(cb), fp(e), *p);
     return launched(c, "ew");
+}
+static int cc_ew_norm(CcBuf *y, CcBuf *a, CcBuf *b, CcBuf *cb, CcBuf *e, const CcEw *pe, CcBuf *w, CcBuf *yn, const CcNorm *p) {
+    CcCtx *c = live(CC_OVERLAP_DOWN);
+    if (!c || !y || !a || !yn || !pe || !p || p->nseg < 1 || p->D < 1) return 0;
+    /* the norm reads y's rows as ew wrote them: a segment a row, no prescale */
+    if (p->per_row != 1 || p->x_off != pe->y_off || p->x_row != p->D || pe->D != p->D ||
+        pe->n != p->nseg * p->D || (p->flags & CC_NORM_PRESCALE)) return 0;
+    if (!(p->flags & CC_NORM_NOW) && !w) return 0;
+    switch (pe->op) {
+    case CC_EW_ADD: if (!b || ((pe->flags & 4) && (!e || !w || p->D > 2048))) return 0; break;
+    case CC_EW_COMBINE: if ((pe->flags & 1) && !b) return 0; if ((pe->flags & 2) && !cb) return 0;
+                        if ((pe->flags & 4) && !e) return 0; break;
+    default: return 0;
+    }
+    const bool req_skip_yn = p->eps < 0.f;
+    CcNorm pn = *p;
+    if (req_skip_yn) pn.eps = -pn.eps;
+    static int skip_yn_on = -1, bench = -1;
+    if (bench < 0) bench = getenv("COLI_CUDA_CHAIN_BENCH") != nullptr || getenv("COLI_CUDA_CHAIN_TEST") != nullptr;
+    if (skip_yn_on < 0 || bench) { const char *e = getenv("COLI_CUDA_NORM_SKIP_Y"); skip_yn_on = !(e && *e == '0'); }
+    float *yy = fpw(y), *yyn = fpw(yn), *ee = (pe->op == CC_EW_ADD && (pe->flags & 4)) ? fpw(e) : (float *)fp(e);
+    const bool skip_yn = req_skip_yn && skip_yn_on && getenv("COLI_CUDA_DENSE_BM") == nullptr;
+    int8_t *xq = nullptr; float *xs = nullptr;
+    if (!cc_uses_feature(c, Q36_ACTIVATION_CACHE) && pn.D == 2048 && pn.per_row == 1 && !(pn.flags & 8) &&
+        ((pe->a_off | pe->b_off | pe->c_off | pe->y_off | pn.w_off) & 3) == 0 &&
+        pn.y_off == 0 && pn.y_row == pn.D && pn.y_seg == pn.D)
+        coli_cuda_qx_prepare(c->device, yyn, pn.nseg, pn.D, &xq, &xs, 0, (int)skip_yn);
+    if (xq) {
+        if (skip_yn)
+            cc_ew_norm_k<2><<<grid1((size_t)pn.nseg, 1), 256, 0, c->stream>>>(yy, fp(a), fp(b), fp(cb), ee, *pe, fp(w), yyn, pn, xq, xs);
+        else
+            cc_ew_norm_k<1><<<grid1((size_t)pn.nseg, 1), 256, 0, c->stream>>>(yy, fp(a), fp(b), fp(cb), ee, *pe, fp(w), yyn, pn, xq, xs);
+    } else {
+        cc_ew_norm_k<0><<<grid1((size_t)pn.nseg, 1), 256, 0, c->stream>>>(yy, fp(a), fp(b), fp(cb), ee, *pe, fp(w), yyn, pn);
+    }
+    return launched(c, "ew_norm");
 }
 static int cc_qsa(CcBuf *src, CcBuf *w, CcBuf *pk, CcBuf *cs, CcBuf *sc, CcBuf *sel, const CcQsa *p) {
     CcCtx *c = live();
@@ -4355,7 +4863,7 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_sconv, cc_relattn, cc_ink2_mix, cc_ink2_clip, cc_ink2_dconv,
     cc_fetch_at, cc_fetch_wait_at, cc_fetch_done_at,
     cc_ink2_caps_,
-    nullptr, cc_matmul_swiglu, cc_select_qwen36_profile, cc_set_kernel_mask_,
+    cc_ew_norm, cc_matmul_swiglu, cc_select_qwen36_profile, cc_set_kernel_mask_,
     nullptr, /* packed native INT8 operation */
     cc_probe_qwen36_profile_,
 };
