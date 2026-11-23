@@ -1,0 +1,5 @@
+[
+  {"wav": "/tmp/opencode/bench_wavs/hello.wav", "ref": "Hello world. This is a test of speech recognition."},
+  {"wav": "/tmp/opencode/bench_wavs/weather.wav", "ref": "The weather today is sunny with a chance of rain."},
+  {"wav": "/tmp/opencode/bench_wavs/numbers.wav", "ref": "One, two, three, four, five, six, seven, eight, nine, ten."}
+]

@@ -1483,7 +1483,11 @@ QWEN3_ASR_MODEL ?= $(HOME)/.cache/huggingface/hub/models--Qwen--Qwen3-ASR-1.7B/s
 .PHONY: test-qwen3-asr
 test-qwen3-asr: qwen3_asr$(EXE)
 	@if [ ! -d "$(QWEN3_ASR_MODEL)" ]; then echo "skip: QWEN3_ASR_MODEL not found: $(QWEN3_ASR_MODEL)"; exit 0; fi
-	python3 tools/test_qwen3_asr_smoke.py --engine ./qwen3_asr$(EXE) --model "$(QWEN3_ASR_MODEL)"
+	@if [ -f testdata/qwen3_asr_hello3_refs.json ]; then \
+		python3 tools/test_qwen3_asr_smoke.py --engine ./qwen3_asr$(EXE) --model "$(QWEN3_ASR_MODEL)" --manifest testdata/qwen3_asr_hello3_refs.json; \
+	else \
+		python3 tools/test_qwen3_asr_smoke.py --engine ./qwen3_asr$(EXE) --model "$(QWEN3_ASR_MODEL)"; \
+	fi
 
 # Tiny Laya checkpoint + the laya package's own answers on it. The generator is
 # numpy and deterministic; laya_tiny/ref.json is committed and comes from the
