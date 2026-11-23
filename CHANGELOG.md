@@ -7,6 +7,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **Vulkan: a long prompt's steps stay on the GPU when the driver refuses their scratch.** On a
+  Windows desktop (an RTX PRO 4500 with Qwen3.8) the driver refused memory its budget showed free,
+  and every prompt step's experts went to the CPU: a long prompt three times slower. The step now
+  takes sub-batches of fewer rows on the GPU. Without Resizable BAR, Inkling-2's long prompts no
+  longer print `vkAllocateMemory failed: -2` at every step: one line says what happened.
 - **`coli doctor` recognises a Metal engine.** A `METAL=1` build links Metal.framework rather than
   loading a GPU runtime, and macOS has no `ldd`, so doctor found no GPU runtime and reported "GPU
   detected but the engine is CPU-only" for a qwen36 that ran its Metal graph (an M5 Air and an M2
