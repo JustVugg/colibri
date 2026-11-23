@@ -5,7 +5,7 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from openai_server import APIServer, QwenToolStream, parse_qwen_tool_calls
+from openai_server import APIServer, QwenToolStream, parse_mimo_tool_calls, parse_qwen_tool_calls
 from tests.test_openai_server import _ChunkEngine
 
 TOOLS = [{"type": "function", "function": {
@@ -70,6 +70,48 @@ class QwenToolValidationTest(unittest.TestCase):
             reply = f"<function=f><parameter=x>\n{raw}\n</parameter></function>"
             with self.subTest(kind=kind, raw=raw):
                 self.assertEqual(parse_qwen_tool_calls(reply, tools), (reply, []))
+
+    def test_types_declared_through_anyof_oneof_allof_and_ref(self):
+        # what pydantic / FastMCP write for
+        #   search(query: str, limit: int | None, filters: Filters | None, tags: list[str] | None,
+        #          exact: bool | None, opts: Filters, old: Filters = ..., note: str | None)
+        nullable = lambda spec: {"anyOf": [spec, {"type": "null"}], "default": None}
+        ref = {"$ref": "#/$defs/Filters"}
+        tools = [{"type": "function", "function": {"name": "search", "parameters": {
+            "type": "object",
+            "$defs": {"Filters": {"type": "object", "properties": {"lang": {"type": "string"}}}},
+            "properties": {
+                "query": {"type": "string"}, "limit": nullable({"type": "integer"}),
+                "filters": nullable(ref), "tags": nullable({"type": "array", "items": {"type": "string"}}),
+                "exact": {"oneOf": [{"type": "boolean"}, {"type": "null"}]}, "opts": ref,
+                "old": {"allOf": [ref], "default": {}}, "note": nullable({"type": "string"}),
+                "any": {"anyOf": [{"type": "integer"}, {}]}, "lost": {"$ref": "#/$defs/Missing"}},
+            "required": ["query"]}}}]
+        written = [("query", "colibri"), ("limit", "5"), ("filters", '{"lang": "en"}'),
+                   ("tags", "['a', 'b']"), ("exact", "True"), ("opts", '{"lang": "it"}'),
+                   ("old", "{}"), ("note", "null"), ("any", "7"), ("lost", "[1]")]
+        expected = {"query": "colibri", "limit": 5, "filters": {"lang": "en"}, "tags": ["a", "b"],
+                    "exact": True, "opts": {"lang": "it"}, "old": {}, "note": None,
+                    "any": "7", "lost": "[1]"}   # the last two declare no type: text, as before
+        qwen = "<function=search>\n" + "".join(
+            f"<parameter={k}>\n{v}\n</parameter>\n" for k, v in written) + "</function>"
+        mimo = "<tool_call><function=search>" + "".join(
+            f"<parameter={k}>{v}</parameter>" for k, v in written) + "</function></tool_call>"
+        for parse, reply in ((parse_qwen_tool_calls, qwen), (parse_mimo_tool_calls, mimo)):
+            with self.subTest(parse=parse.__name__):
+                _, calls = parse(reply, tools)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(json.loads(calls[0]["function"]["arguments"]), expected)
+            for key, raw in (("limit", "five"), ("filters", "[1]"), ("opts", "7")):
+                with self.subTest(parse=parse.__name__, key=key, raw=raw):   # a wrong type is no call
+                    bad = reply.replace(dict(written)[key], raw)
+                    self.assertEqual(parse(bad, tools)[1], [])
+
+    def test_a_ref_that_points_at_itself_is_untyped(self):
+        tools = [{"function": {"name": "f", "parameters": {
+            "$defs": {"A": {"$ref": "#/$defs/A"}}, "properties": {"x": {"$ref": "#/$defs/A"}}}}}]
+        _, calls = parse_qwen_tool_calls("<function=f><parameter=x>\n5\n</parameter></function>", tools)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"x": "5"})
 
     def test_unparsed_body_and_duplicate_parameters_are_not_recovered(self):
         for reply in (CALL.replace("</function>", "unparsed text</function>"),

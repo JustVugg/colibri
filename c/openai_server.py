@@ -3236,15 +3236,47 @@ QWEN_FUNCTION_RE = re.compile(r"<function=([^>\n]+)>\s*(.*?)</function>", re.S)
 QWEN_PARAM_RE = re.compile(r"<parameter=([^>\n]+)>\n(.*?)\n</parameter>", re.S)
 
 
-def _qwen_argument(raw, declared):
+def _qwen_kinds(declared, root, depth=8):
+    """The JSON types a parameter's schema declares, or None when it declares none.
+
+    Besides `type`, the spellings pydantic and FastMCP write: `anyOf`/`oneOf` (Optional[int]
+    is {"anyOf": [{"type": "integer"}, {"type": "null"}]}) as the union of their branches,
+    `allOf` as its first typed branch, and a `$ref` into the tool's own parameters
+    (a nested model is {"$ref": "#/$defs/Filters"})."""
+    if not isinstance(declared, dict) or depth <= 0:
+        return None
+    kind = declared.get("type")
+    if kind is not None:
+        return kind if isinstance(kind, list) else [kind]
+    ref = declared.get("$ref")
+    if isinstance(ref, str) and ref.startswith("#/"):
+        node = root
+        for part in ref[2:].split("/"):
+            node = node.get(part.replace("~1", "/").replace("~0", "~")) if isinstance(node, dict) else None
+        return _qwen_kinds(node, root, depth - 1)
+    for key in ("anyOf", "oneOf"):
+        branches = declared.get(key)
+        if isinstance(branches, list) and branches:
+            kinds = [_qwen_kinds(branch, root, depth - 1) for branch in branches]
+            # one branch that declares nothing takes any value: the parameter is untyped
+            return None if None in kinds else [k for found in kinds for k in found]
+    branches = declared.get("allOf")
+    for branch in branches if isinstance(branches, list) else ():
+        kinds = _qwen_kinds(branch, root, depth - 1)
+        if kinds:
+            return kinds
+    return None
+
+
+def _qwen_argument(raw, declared, root=None):
     """Restore declared JSON types, including the template's True/False/None.
 
     This checks the declared top-level type, not every JSON Schema constraint.
-    An untyped parameter stays text, as it did before tool-call recovery.
+    An untyped parameter stays text, as it did before tool-call recovery. `root` is the
+    tool's `parameters`, where a `$ref` is looked up.
     """
-    kind = declared.get("type") if isinstance(declared, dict) else None
-    kinds = kind if isinstance(kind, list) else [kind]
-    if kind is None:
+    kinds = _qwen_kinds(declared, root)
+    if kinds is None:
         return raw
     value = raw.strip()
     if "null" in kinds and value in ("null", "None"):
@@ -3282,6 +3314,7 @@ def parse_qwen_tool_calls(reply, tools=None, *, strip_text=True):
     re-read it as JSON, which restores numbers and booleans without guessing at
     anything the schema did not promise."""
     schema = {}
+    roots = {}
     required = {}
     closed = set()
     for tool in (tools or []):
@@ -3291,6 +3324,7 @@ def parse_qwen_tool_calls(reply, tools=None, *, strip_text=True):
         if isinstance(name, str) and name:
             if isinstance(params, dict):
                 schema[name] = params
+                roots[name] = fn.get("parameters")
                 required[name] = set((fn.get("parameters") or {}).get("required") or [])
                 if (fn.get("parameters") or {}).get("additionalProperties") is False:
                     closed.add(name)
@@ -3307,7 +3341,7 @@ def parse_qwen_tool_calls(reply, tools=None, *, strip_text=True):
                 return None
             declared = (schema.get(name) or {}).get(key) or {}
             try:
-                args[key] = _qwen_argument(raw, declared)
+                args[key] = _qwen_argument(raw, declared, roots.get(name))
             except (TypeError, ValueError):
                 return None
         if required.get(name, set()) - set(args):
@@ -3544,12 +3578,14 @@ def _parse_mimo_tool_calls(reply, tools, track_spans):
     body with no parameter tags but a JSON object in it is the template's other spelling
     (`arguments` as a string) and is taken as the arguments."""
     schema = {}
+    roots = {}
     for tool in (tools or []):
         fn = tool.get("function", tool) if isinstance(tool, dict) else {}
         name = fn.get("name")
         params = (fn.get("parameters") or {}).get("properties") or {}
         if isinstance(name, str) and name and isinstance(params, dict):
             schema[name] = params
+            roots[name] = fn.get("parameters")
 
     def make_call(name, body):
         args = {}
@@ -3566,7 +3602,7 @@ def _parse_mimo_tool_calls(reply, tools, track_spans):
                 if raw.endswith("\n"):
                     raw = raw[:-1]
                 declared = (schema.get(name) or {}).get(key) or {}
-                args[key] = _qwen_argument(raw, declared)
+                args[key] = _qwen_argument(raw, declared, roots.get(name))
             if not found and body.strip():
                 parsed = json.loads(body)
                 if not isinstance(parsed, dict):
