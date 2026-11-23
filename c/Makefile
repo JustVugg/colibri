@@ -1938,6 +1938,25 @@ qwen38-tiny-int4-check: qwen38-tiny-int4-generate qwen38-tiny-fp8-generate qwen3
 	echo "qwen38 int4-g64 experts: ref_int4.json reproduced in $$n configurations, last logits identical across paths; FP8 control ok"
 	./tests/test_qwen38_tier_engine$(EXE) ./qwen38_tiny_int4
 
+# The grouped decode (q38_moe_decode_grouped) with a RAM cache smaller than a step's distinct
+# experts: it takes them in waves of the cache's slots. The int4 fixture in the gguf-256 geometry
+# (the grouped path needs dims % 32; the default fixture's are 8) at caps 1, 2 and 8, the prompt
+# through the decode rows (Q38_PREFILL_BATCH=0: up to 8 distinct experts a step): the grouped path
+# runs at every cap and the last logits are identical to the bit (cap 8 is one wave). The run's
+# own oracle is not the gate: ref_int4.json is the small geometry's.
+.PHONY: qwen38-grouped-waves-check
+qwen38-grouped-waves-check: qwen38$(EXE)
+	$(PYTHON) tools/make_qwen38_tiny.py --out ./qwen38_tiny_g256_int4 --fp8-experts --int4-experts --expert-gain 3 --geometry gguf-256
+	@d=./qwen38_tiny_g256_int4/logits; rm -rf $$d; mkdir -p $$d; \
+	for cap in 1 2 8; do \
+		Q38_EXPERT_INT4=1 Q38_PREFILL_BATCH=0 DUMP=$$d/c$$cap.f32 OMP_NUM_THREADS=2 SNAP=./qwen38_tiny_g256_int4 \
+			./qwen38$(EXE) $$cap 8 ./qwen38_tiny_g256_int4/ref_int4.json > $$d/c$$cap.log 2>&1; \
+		grep -q '^C engine' $$d/c$$cap.log && [ -s $$d/c$$cap.f32 ] || { cat $$d/c$$cap.log; echo "FAIL cap=$$cap: no run"; exit 1; }; \
+		grep -q 'grouped by expert' $$d/c$$cap.log || { cat $$d/c$$cap.log; echo "FAIL cap=$$cap: the grouped decode did not run"; exit 1; }; \
+	done; \
+	for cap in 1 2; do cmp -s $$d/c$$cap.f32 $$d/c8.f32 || { echo "FAIL cap=$$cap: last logits differ from one wave (cap 8)"; exit 1; }; done; \
+	echo "qwen38 grouped decode in waves: caps 1, 2 and 8 give the same last logits"
+
 # The routed experts as AMD's Quark checkpoint ships them in MXFP4 (e2m1 nibbles, one E8M0
 # exponent per 32 inputs): --mxfp4-experts rounds the fixture's experts (scaled by 3, as the
 # int4 fixture's) to MXFP4, writes them under quark/ with Quark's tensor names and as FP8
