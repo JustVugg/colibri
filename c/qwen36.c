@@ -1534,12 +1534,8 @@ static void ensure_pilot_worker_started(Model *m) {
 }
 
 /* ---------- utility ---------- */
-static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec*1e-9; }
-#if defined(__APPLE__)
-static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0*1024.0); }
-#else
-static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0); }
-#endif
+static double now_s(void) { return compat_now_s(); }
+static double rss_gb(void) { return compat_rss_gb(); }
 /* same wrapper convention as colibri.c/olmoe.c/inkling.c/kimi_k3.c/deepseek_v4.c */
 static double mem_available_gb(void) { return compat_mem_available_gb(); }
 

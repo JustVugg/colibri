@@ -350,11 +350,7 @@ static int g_capture_last_logit;
  * get the bits a decode step gives them, see q38_weight_matmul and q38_moe. */
 static int g_q38_rowwise;
 
-static double now_s(void) {
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
-}
+static double now_s(void) { return compat_now_s(); }
 
 static inline void q38_tm_add(Model *m,Q38Timer timer,double started) {
     m->timers.seconds[timer] += now_s() - started;
@@ -368,11 +364,7 @@ static Q38Timers q38_tm_delta(const Q38Timers *after,const Q38Timers *before) {
     return delta;
 }
 
-#if defined(__APPLE__)
-static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF,&r); return r.ru_maxrss/1073741824.0; }
-#else
-static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF,&r); return r.ru_maxrss/1048576.0; }
-#endif
+static double rss_gb(void) { return compat_rss_gb(); }
 
 static float *falloc(int64_t n) {
     if (n < 0 || (uint64_t)n > SIZE_MAX / sizeof(float)) {

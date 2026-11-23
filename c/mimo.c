@@ -102,20 +102,9 @@ static int g_mimo_dho;
 
 /* ------------------------------------------------------------------ utils ---- */
 
-static double now_s(void) {
-    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
-    return t.tv_sec + t.tv_nsec * 1e-9;
-}
+static double now_s(void) { return compat_now_s(); }
 
-static double rss_gb(void) {
-    struct rusage usage;
-    getrusage(RUSAGE_SELF, &usage);
-#ifdef __APPLE__
-    return usage.ru_maxrss / 1e9;
-#else
-    return usage.ru_maxrss / 1e6;
-#endif
-}
+static double rss_gb(void) { return compat_rss_gb(); }
 
 static void *xmalloc(size_t bytes, const char *what) {
     void *p = malloc(bytes ? bytes : 1);
