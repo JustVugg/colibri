@@ -1124,6 +1124,23 @@ static float *load_t(Model *m, const char *name) {
     int64_t n = st_numel(&m->S, name);
     if (n < 0) { fprintf(stderr, "missing %s\n", name); exit(1); }
     float *p = falloc(n);
+    st_tensor *t = st_find(&m->S, name);
+    if (st_is_ggml(t->dtype)) {   /* a GGUF's small tensor in a block type (AtomicChat's Inkling-2-Mini
+                                   * files hold attn_sink_proj and the conv projections in Q8_0): its rows dequantized */
+        const int type = st_ggml_type(t->dtype);
+        const int64_t cols = t->shape[t->rank - 1], rows = n / cols, rb = gq_row_bytes(type, cols);
+        if (rb < 0 || t->nbytes != rb * rows) {
+            fprintf(stderr, "%s: not %lld rows of %lld in ggml type %s, refusing\n",
+                    name, (long long)rows, (long long)cols, gq_type_name(type)); exit(1); }
+        uint8_t *raw = malloc((size_t)t->nbytes);
+        if (!raw) { fprintf(stderr, "OOM reading %s\n", name); exit(1); }
+        st_pread_full(t->fd, raw, t->nbytes, t->off, name);
+        for (int64_t r = 0; r < rows; r++)
+            if (gq_dequant_row(type, raw + r * rb, p + r * cols, cols)) {
+                fprintf(stderr, "%s: cannot read %s rows\n", name, gq_type_name(type)); exit(1); }
+        free(raw);
+        return p;
+    }
     st_read_f32(&m->S, name, p, 0);
     return p;
 }
