@@ -535,6 +535,7 @@ These backend settings are for kernel testing and tuning. A profile default foll
 
 | Variable | Default | Effect |
 |---|---|---|
+| `COLI_CUDA_ASYNC_DOWN` | on when eligible | Allow large device-to-host copies on the copy stream. Zero disables this path. |
 | `COLI_CUDA_CHAIN_BENCH` | unset | Select a CUDA chain benchmark. Its presence also makes several kernel settings refresh between calls. |
 | `COLI_CUDA_CHAIN_TEST` | unset | Its presence, including a value of zero, enables test-mode kernel selection. |
 | `COLI_CUDA_F2_MODE` | 0 | Select the prompt Flash attention variant for a head dimension of 256. |

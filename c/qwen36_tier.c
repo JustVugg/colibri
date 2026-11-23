@@ -87,7 +87,7 @@ static struct {
     uint64_t mk_hits, mk_miss; int mk_on;
     /* the dense chain's routed experts (qt_chain_*): residency changes counted, and its
      * forwards in flight, which no swap may touch the tensors of */
-    unsigned epoch; int chain_hold;
+    unsigned epoch; int chain_hold, nres;
     /* the uploader is inside device calls (an allocation, a copy, a free): a chain that holds
      * the tier waits for them to end before its forward (qt_chain_hold) */
     int uploading;
@@ -110,7 +110,7 @@ static QSlot *qs(int layer, int eid){ return &G.slot[(size_t)layer*G.ne + eid]; 
 /* G.mx held: every change of residency goes through here (qt_chain_epoch) */
 static void res_set(QSlot *s, int r){
     if(s->resident==r) return;
-    s->resident=(uint8_t)r; G.epoch++;
+    s->resident=(uint8_t)r; G.epoch++; G.nres += r ? 1 : -1;
     if(G.chg_on){ if(G.chg_n<QT_CHG_CAP) G.chg[G.chg_n++]=(int)(s-G.slot); else G.chg_over=1; }
 }
 /* Expert homes. Default: expert eid lives on device index eid % ndev in every
@@ -1503,7 +1503,7 @@ int qt_lmhead_matmul(float *y, const float *x, int I, int O){
  * resident's buffers while one is in flight (an eviction only clears the flag at once,
  * which moves the epoch; its buffers wait for the hold to drop). The books qt_issue keeps
  * for the experts it serves, qt_chain_count keeps for the chain's. */
-static void qt_lfru_tick_locked(void);
+static void qt_lfru_tick_locked(int skip_full_scan);
 /* ---- the host pool: the RAM cache the device copies a prompt chunk's experts from -------------
  * A prompt chunk routes nearly every expert of a layer, and the CPU's step costs per row while a
  * copy over the bus costs per expert: from a few dozen rows up, copying a layer's non-resident
@@ -1676,23 +1676,33 @@ void qt_chain_hold(int on){
     else if(G.chain_hold>0 && --G.chain_hold==0) pthread_cond_broadcast(&G.cv_take);
     pthread_mutex_unlock(&G.mx);
 }
-void qt_chain_count(int layer,const int *eids,int K){
-    if(!G.on || layer<0 || layer>=G.nl) return;
+static void qt_chain_count_rows_mode(int layer,const int *eids,int rows,int K,int skip_full_scan){
+    if(!G.on || layer<0 || layer>=G.nl || rows<1) return;
     pthread_mutex_lock(&G.mx);
     if(G.th_stop){ pthread_mutex_unlock(&G.mx); return; }
-    if(layer==0) qt_lfru_tick_locked();
-    for(int k=0;k<K;k++){
-        if(eids[k]<0 || eids[k]>=G.ne) continue;
-        QSlot *s=qs(layer,eids[k]);
-        if(s->conv<0xFFFFFFFFu) s->conv++;
-        if(s->resident){ if(s->heat<0xFFFFFFFFu) s->heat++; G.hits[home2(layer,eids[k])]++; }
-        else {
-            G.miss++;
-            if(!G.pm){ G.pm=malloc(QT_PM_CAP*sizeof(int)); G.pm_cap=G.pm?QT_PM_CAP:0; }
-            if(G.pm_n<G.pm_cap && !s->queued && s->g4) G.pm[G.pm_n++]=(int)(s-G.slot);
+    for(int row=0;row<rows;row++){
+        /* Decay and pending moves precede this row's routes, as in a single-row call. */
+        if(layer==0) qt_lfru_tick_locked(skip_full_scan);
+        for(int k=0;k<K;k++){
+            int eid=eids[(size_t)row*K+k];
+            if(eid<0 || eid>=G.ne) continue;
+            QSlot *s=qs(layer,eid);
+            if(s->conv<0xFFFFFFFFu) s->conv++;
+            if(s->resident){ if(s->heat<0xFFFFFFFFu) s->heat++; G.hits[home2(layer,eid)]++; }
+            else {
+                G.miss++;
+                if(!G.pm){ G.pm=malloc(QT_PM_CAP*sizeof(int)); G.pm_cap=G.pm?QT_PM_CAP:0; }
+                if(G.pm_n<G.pm_cap && !s->queued && s->g4) G.pm[G.pm_n++]=(int)(s-G.slot);
+            }
         }
     }
     pthread_mutex_unlock(&G.mx);
+}
+void qt_chain_count_rows(int layer,const int *eids,int rows,int K){
+    qt_chain_count_rows_mode(layer,eids,rows,K,1);
+}
+void qt_chain_count(int layer,const int *eids,int K){
+    qt_chain_count_rows_mode(layer,eids,1,K,0);
 }
 /* The chain's promotions, after a decode-sized step: up to max of the step's misses, the most
  * worth the most first (pm_score: the heat, which carries the history and this conversation,
@@ -2360,7 +2370,7 @@ int qt_counters(QtCounters *out){
     return 1;
 }
 
-static void qt_lfru_tick_locked(void){
+static void qt_lfru_tick_locked(int skip_full_scan){
     if(G_chain_own) return;   /* the chain's to move */
     size_t n=(size_t)G.nl*G.ne;
     G.tick++;
@@ -2376,7 +2386,7 @@ static void qt_lfru_tick_locked(void){
     if(!(G.tick%QT_CONV_DECAY))
         for(size_t i=0;i<n;i++) G.slot[i].conv>>=1;
     replan_drain_locked(QT_REPLAN_PER_TICK);              /* pending re-plan pairs, a few per token */
-    if(G.tick%16) return;
+    if(G.tick%16 || (skip_full_scan && (size_t)G.nres >= n)) return;
     for(int di=0;di<G.ndev;di++){
         int cold=-1, hot=-1; uint32_t ch=0, hh=0;
         for(size_t i=0;i<n;i++){
@@ -2402,6 +2412,9 @@ static void qt_lfru_tick_locked(void){
 }
 
 uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
+    return qt_issue_mode(layer,eids,K,x,0);
+}
+uint32_t qt_issue_mode(int layer,const int *eids,int K,const float *x,int skip_full_scan){
     if(!G.on||K>QT_MAX_ROWS||G_chain_own) return 0;
     uint32_t mask=0;
     ColiCudaTensor *tg[QT_MAX_DEV][QT_MAX_ROWS],*tu[QT_MAX_DEV][QT_MAX_ROWS],*td[QT_MAX_DEV][QT_MAX_ROWS];
@@ -2419,7 +2432,7 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
      * meet a swap parked on issue_open. */
     if(G_upload_sync) while(G.inflight>0 && !G.th_stop) wait_take_locked();
     if(G.th_stop){ pthread_mutex_unlock(&G.mx); return 0; }
-    if(layer==0) qt_lfru_tick_locked();
+    if(layer==0) qt_lfru_tick_locked(skip_full_scan);
     G.issue_open=1;
     for(int k=0;k<K;k++){
         QSlot *s=qs(layer,eids[k]);

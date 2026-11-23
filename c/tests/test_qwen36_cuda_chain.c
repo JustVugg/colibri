@@ -648,6 +648,55 @@ static void test_cuda_model_filter(const Model *trunk) {
     if (mtp_env) { setenv("Q36_MTP", mtp_env, 1); free(mtp_env); } else unsetenv("Q36_MTP");
 }
 
+static int promo_staging_attempts;
+
+static int fail_promo_staging(CcBuf **buf, size_t bytes, int kind) {
+    if (kind != CC_UP) return fcc_reserve(buf, bytes, kind);
+    promo_staging_attempts++;
+    return 0;
+}
+
+static void test_tier_scan_permission(void) {
+    const int saved = g_cuda_chain;
+    Q36CChain chain = {0};
+    Model m = {0};
+    m.cchain = &chain;
+    chain.device_profile = Q36_GPU_L4;
+    chain.request_phase = Q36CC_REQUEST_PREFILL;
+    g_cuda_chain = 1;
+    chain.active_permissions = Q36_FLASH_ATTN;
+    ck(!q36cc_skip_tier_scan(&m), "Flash attention alone keeps the tier scan");
+    chain.active_permissions = Q36_ASYNC_COPIES;
+    ck(q36cc_skip_tier_scan(&m), "deferred copies may skip the tier scan");
+    g_cuda_chain = saved;
+}
+
+static void test_deferred_expert_staging(void) {
+    Model m = { .c = { .hidden = D, .inter = INTER, .topk = TOPK } };
+    Q36CChain plain = { .promo_rate = 1 };
+    Q36CChain tuned = {
+        .device_profile = Q36_GPU_L4,
+        .request_phase = Q36CC_REQUEST_PREFILL,
+        .active_permissions = Q36_ASYNC_COPIES,
+        .promo_rate = 1,
+    };
+    const size_t old_size = fake_chain_table.size;
+    int (*old_reserve)(CcBuf **, size_t, int) = fake_chain_table.reserve;
+    fake_chain_table.size = sizeof fake_chain_table;
+    fake_chain_table.reserve = fail_promo_staging;
+    promo_staging_attempts = 0;
+
+    q36cc_promote(&plain, &m, 1);
+    ck(promo_staging_attempts == 1 && !plain.pr_buf && plain.promo_rate == 0,
+       "Standard dispatch preserves the promotion staging failure before candidate selection");
+    q36cc_promote(&tuned, &m, 1);
+    ck(promo_staging_attempts == 1 && !tuned.pr_buf && tuned.promo_rate == 1,
+       "Deferred copies skip staging when there is no promotion candidate");
+
+    fake_chain_table.reserve = old_reserve;
+    fake_chain_table.size = old_size;
+}
+
 /* The lm_head computes on the card and one copy takes its logits to the host's buffer: no matmul of
  * the chain's steps stores through the bus, and the logits equal the CPU path's after a prompt read
  * in chunks, a decode token and a verify whose three logits rows lie in two chunks. */
@@ -900,6 +949,9 @@ int main(int argc, char **argv) {
 
     test_cuda_model_filter(&ref);
 
+    test_tier_scan_permission();
+    test_deferred_expert_staging();
+
     printf(" A. the chain against the CPU path\n");
     Q36CChain *ch = q36cc_setup(&m, 1, NULL);
     ck(ch != NULL && ch->ok && ch->n == NL && ch->head, "the chain set itself up on the fake device, every layer and the head");
@@ -1060,6 +1112,20 @@ int main(int argc, char **argv) {
         ck(one && c3->dm_steps == 6 * NL && (hyb ? c3->dm_hyb > 0 : c3->dm_hyb == 0),
            hyb ? "decode steps: the hybrid layer's three copies, then one ids copy, the logits" :
                  "decode steps: one route-ids download across all layers, the logits");
+        if (!hyb) {
+            ck(c3->pr_buf == NULL, "all experts resident: q36cc_promote allocates no pr_buf staging");
+            size_t k7 = q36_kv_at(&m3, 1, 0, 7);
+            float *k1 = (float *)m3.K[1], k7_ref = k1[k7];
+            k1[k7] = k7_ref + 50.0f;
+            c3->pend_books = 0;
+            q36cc_host_wrote(&m3, 0);
+            ck(fabsf(k1[k7] - (k7_ref + 50.0f)) < 1e-4f,
+               "controprova: without pend_books, q36cc_host_wrote leaves host K[1] untouched");
+            c3->pend_books = 1; c3->pend_n = 1; c3->pend_pb = 7; c3->pend_slot = 0;
+            q36cc_host_wrote(&m3, 0);
+            ck(!c3->pend_books && fabsf(k1[k7] - k7_ref) < 1e-4f,
+               "with pend_books=1, q36cc_host_wrote flushes deferred kvd slot into host K[1]");
+        }
         ck(books, "route books (seen and freq) equal the CPU path's after the prompt and every step");
         if (hyb) { fake_wait_hook = NULL; res_set(qs(1, 3), 1); unsetenv("COLI_CUDA_CHAIN_PROMOTE"); }
         g_cuda_chain = 0;

@@ -738,7 +738,7 @@ static inline int cc_attn_wr(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *ga
 /* a float16 KV cache's ops (kvh): 0 from an older backend or HIP */
 static inline int cc_kvh_ready(void) {
     const ColiCudaChainOps *t = cc_ops();
-    return t && t->size >= offsetof(ColiCudaChainOps, copy_regions_h) + sizeof t->copy_regions_h && t->kvh();
+    return t && t->size >= offsetof(ColiCudaChainOps, copy_regions_h) + sizeof t->copy_regions_h && t->kvh && t->kvh();
 }
 static inline int cc_attn_h(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *sel, const CcAttn *p) {
     return cc_kvh_ready() ? cc_ops()->attn_h(q, kc, vc, o, gate, sel, p) : 0;
