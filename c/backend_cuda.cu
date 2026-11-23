@@ -1,4 +1,5 @@
 #include "backend_cuda.h"
+#include "qwen36_cuda_profile.h"
 #define COLI_CUDA_CHAIN_NO_WRAPPERS
 #include "cuda_chain.h"   /* CcExpert, CcMoe: the chain's routed experts (coli_cuda_moe_async) */
 #include "fp8_format.h"   /* FP8_BLOCK: the shared fmt=8 scale-block edge (see that header) */
@@ -5014,6 +5015,12 @@ static int gemv_i8_w4_on(void) {
     if (on < 0) { const char *e = getenv("COLI_CUDA_GEMV_W4"); on = !(e && *e == '0'); }
     return on;
 }
+static bool gemv_i8_w4_shape(const ColiCudaTensor *t) {
+    return gemv_i8_w4_on() && t->I > 4096 && (size_t)t->O * t->I >= ((size_t)1 << 21);
+}
+static unsigned gemv_i8_w4_blocks(int O) {
+    return (unsigned)((O + GEMV_I8_ROWS * GEMV_I8_OPW - 1) / (GEMV_I8_ROWS * GEMV_I8_OPW));
+}
 /* COLI_CUDA_GEMV_NR=1: a verify's rows a block each, as before */
 static int gemv_i8_nr_on(void) {
     static int on = -1;
@@ -5378,8 +5385,7 @@ static void *gemv_sk_part(DeviceContext *ctx, cudaStream_t st, size_t bytes) {
 }
 #endif
 
-extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, const float *x_dev, int S, void *stream) {
-    if (fault_injected()) return 0;
+static int tensor_gemm_async(ColiCudaTensor *t, float *y_dev, const float *x_dev, int S, void *stream) {
     if (!t || !y_dev || !x_dev || S < 1) return 0;
     if (t->fmt == 4 && t->gs <= 0) return 0;
     DeviceContext *ctx = find_ctx(t->device);
@@ -5393,7 +5399,7 @@ extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, cons
         size_t prow = (size_t)(gx4(t->I / 4) + 1) * 16;   /* a padded row's bytes */
         /* a verify's rows share each weight load where the matrix has the blocks to fill the
          * device without its rows and shared memory holds them padded */
-        if (gemv_i8_w4_on() && t->I > 4096 && (size_t)t->O * t->I >= ((size_t)1 << 21)) {   /* long rows: four outputs a warp
+        if (gemv_i8_w4_shape(t)) {   /* long rows: four outputs a warp
                                                                               * (gemv_i8_w4), the inputs split where the outputs are
                                                                               * few; a smaller matrix's blocks are too few for it
                                                                               * (512 x 2560: 3.1 -> 4.0 us), and up to 4096 inputs an
@@ -5401,7 +5407,7 @@ extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, cons
                                                                               * an RTX PRO 4000, its 2048- and 4096-input matrices:
                                                                               * 107.6-107.9 -> 110.0-110.1 tok/s; Qwen3.8's 10240-input
                                                                               * read keeps it, Qwen3.8 IQ2_XS decodes as before) */
-            const unsigned bw = (unsigned)((t->O + GEMV_I8_ROWS * GEMV_I8_OPW - 1) / (GEMV_I8_ROWS * GEMV_I8_OPW));
+            const unsigned bw = gemv_i8_w4_blocks(t->O);
             const int ks = gemv_i8_sk_splits(ctx, t->I, bw);
             int kc = ks > 1 ? ((t->I + ks - 1) / ks + 511) / 512 * 512 : t->I, kz = (t->I + kc - 1) / kc;
             int sr = S < GEMV_I8_NR ? S : GEMV_I8_NR;
@@ -5475,6 +5481,10 @@ extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, cons
         coli_launch(quant_matmul, grid, 256, 0, st, y_dev, x_dev, t->weights, t->scales, t->fmt, S, t->I, t->O,
                                             row_bytes(t->fmt, t->I), t->gs, t->ng);
     return cuda_ok(cudaGetLastError(), "chain gemm launch");
+}
+
+extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, const float *x_dev, int S, void *stream) {
+    return !fault_injected() && tensor_gemm_async(t, y_dev, x_dev, S, stream);
 }
 
 /* A resident tensor's device copy for the dense chain's routed experts (cuda_chain.cu's
@@ -6439,6 +6449,361 @@ extern "C" int coli_cuda_moe_cols_async(int device, const CcExpert *tab, const f
     MoeSort m = moe_sort_of(hid, &q);
     return moe_rows_bd_launch(bc, tab, x, ids, hid, m, p, btab, (cudaStream_t)stream, cols, w, y) ? 1 : 0;
 }
+
+/* Native FP32 projections and short INT8 projections on the Qwen3.6 CUDA chain. */
+#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+namespace qwen36_cuda {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#define Q36_MMA 1
+#else
+#define Q36_MMA 0
+#endif
+#if Q36_MMA
+__device__ __forceinline__ bd_u32 hcg_lop3_6a(bd_u32 a, bd_u32 b, bd_u32 c) {
+    bd_u32 d;
+    asm("lop3.b32 %0, %1, %2, %3, 0x6a;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+    return d;
+}
+#endif
+template <int FAST = 1>
+__device__ __forceinline__ void gemv_i8_f16(float (&wf)[16], uint4 v) {
+#if Q36_MMA
+    if (FAST) {
+        const unsigned u[4] = {v.x, v.y, v.z, v.w};
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            unsigned w = u[j], h = w >> 16;
+            wf[4 * j + 0] = __fadd_rn(__uint_as_float(hcg_lop3_6a(w, 0x000000ffu, 0x4b000080u)), -8388736.f);
+            wf[4 * j + 1] = __fadd_rn(__uint_as_float(hcg_lop3_6a(w, 0x0000ff00u, 0x47008000u)), -32896.f);
+            wf[4 * j + 2] = __fadd_rn(__uint_as_float(hcg_lop3_6a(h, 0x000000ffu, 0x4b000080u)), -8388736.f);
+            wf[4 * j + 3] = __fadd_rn(__uint_as_float(hcg_lop3_6a(h, 0x0000ff00u, 0x47008000u)), -32896.f);
+        }
+        return;
+    }
+#endif
+    const int8_t *b = reinterpret_cast<const int8_t *>(&v);
+    #pragma unroll
+    for (int k = 0; k < 16; k++) wf[k] = (float)b[k];
+}
+static int gemv_i2f_fast_on(void) {
+    static int on = -1, bench = -1;
+    if (bench < 0) bench = getenv("COLI_CUDA_CHAIN_BENCH") != nullptr || getenv("COLI_CUDA_CHAIN_TEST") != nullptr;
+    if (on < 0 || bench) { const char *e = getenv("COLI_CUDA_GEMV_I2F"); on = e && *e ? atoi(e) : 1; }
+    return on;
+}
+template <int NR, int PAD, int FAST = 1>
+__global__ static void __launch_bounds__(256) gemv_i8_rows(float *__restrict__ y, const float *__restrict__ x,
+        const int8_t *__restrict__ w, const float *__restrict__ sc, int I, int O, int S, int nr) {
+    extern __shared__ float4 xs4[];
+    int s0 = NR == 1 ? (int)blockIdx.y : (int)blockIdx.y * nr, nrow = NR == 1 ? 1 : min(nr, S - s0);
+    int I4 = I / 4, XR = PAD ? gx4(I4) + 1 : I4;
+    x += (size_t)s0 * I; y += (size_t)s0 * O;
+    const float4 *x4 = reinterpret_cast<const float4 *>(x);
+    for (int k = threadIdx.x; k < nrow * I4; k += 256) {
+        int r = NR == 1 ? 0 : k / I4, kk = NR == 1 ? k : k - r * I4;
+        xs4[r * XR + (PAD ? gx4(kk) : kk)] = x4[(size_t)r * I4 + kk];
+    }
+    __syncthreads();
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    int o = blockIdx.x * GEMV_I8_ROWS + warp;
+    if (o >= O) return;
+    const int8_t *row = w + (size_t)o * I;
+    float acc[NR];
+    #pragma unroll
+    for (int r = 0; r < NR; r++) acc[r] = 0.f;
+    for (int i0 = lane * 16; i0 < I; i0 += 32 * 16) {
+        float wf[16];
+        gemv_i8_f16<FAST>(wf, *reinterpret_cast<const uint4 *>(row + i0));
+        int k4 = i0 / 4;
+        #pragma unroll
+        for (int r = 0; r < NR; r++) if (r < nrow) {
+            const float4 *xr = xs4 + r * XR;
+            float4 q[4];
+            #pragma unroll
+            for (int j = 0; j < 4; j++) q[j] = xr[PAD ? gx4(k4 + j) : k4 + j];
+            const float *xv = reinterpret_cast<const float *>(q);
+            #pragma unroll
+            for (int k = 0; k < 16; k++) acc[r] += xv[k] * wf[k];
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < NR; r++) if (r < nrow) {
+        float a = acc[r];
+        for (int off = 16; off > 0; off >>= 1) a += f8_shfl_down(a, off);
+        if (lane == 0) y[(size_t)r * O + o] = a * sc[o];
+    }
+}
+__device__ __forceinline__ void f32g_cp16(void *dst, const void *src, bool valid) {
+#if __CUDA_ARCH__ >= 800
+    unsigned smem = (unsigned)__cvta_generic_to_shared(dst);
+    int sz = valid ? 16 : 0;
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;" :: "r"(smem), "l"(src), "r"(sz));
+#else
+    *reinterpret_cast<float4 *>(dst) = valid ? *reinterpret_cast<const float4 *>(src) : make_float4(0.f, 0.f, 0.f, 0.f);
+#endif
+}
+template<int BM, int BN = F32G_N, int NTHR = 256>
+__global__ static void __launch_bounds__(NTHR) f32_gemm_k(float *__restrict__ y, const float *__restrict__ x,
+                                                          const float *__restrict__ w, int S, int I, int O) {
+    constexpr int TX_DIM = NTHR == 64 ? 8 : 16, TY_DIM = NTHR / TX_DIM;
+    constexpr int RT = BM / TY_DIM, CT = BN / TX_DIM, R_STEP = NTHR / 16;
+    constexpr int STAGES = (BM + BN <= 64) ? 2 : 1;
+    __shared__ alignas(16) float xs[STAGES][BM][F32G_K + 4], ws[STAGES][BN][F32G_K + 4];
+    int tx = threadIdx.x & (TX_DIM - 1), ty = threadIdx.x / TX_DIM, r0 = (int)blockIdx.y * BM, o0 = (int)blockIdx.x * BN;
+    int ld_r = threadIdx.x >> 4, ld_k = (threadIdx.x & 15) * 4;
+    bool align4 = ((I & 3) == 0) && (((uintptr_t)x & 15) == 0) && (((uintptr_t)w & 15) == 0);
+    float acc[RT][CT];
+    #pragma unroll
+    for (int i = 0; i < RT; i++) for (int j = 0; j < CT; j++) acc[i][j] = 0.f;
+    if (STAGES == 2 && align4 && (I & 63) == 0) {
+#if __CUDA_ARCH__ >= 800
+        #pragma unroll
+        for (int r = ld_r; r < BM; r += R_STEP) {
+            int sr = r0 + r < S ? r0 + r : 0;
+            f32g_cp16(&xs[0][r][ld_k], x + (size_t)sr * I + ld_k, r0 + r < S);
+        }
+        #pragma unroll
+        for (int r = ld_r; r < BN; r += R_STEP) {
+            int so = o0 + r < O ? o0 + r : 0;
+            f32g_cp16(&ws[0][r][ld_k], w + (size_t)so * I + ld_k, o0 + r < O);
+        }
+        asm volatile("cp.async.commit_group;");
+        int stg = 0;
+        for (int k0 = 0; k0 < I; k0 += F32G_K) {
+            int nxt = stg ^ 1, nk0 = k0 + F32G_K;
+            asm volatile("cp.async.wait_group 0;");
+            __syncthreads();
+            if (nk0 < I) {
+                #pragma unroll
+                for (int r = ld_r; r < BM; r += R_STEP) {
+                    int sr = r0 + r < S ? r0 + r : 0;
+                    f32g_cp16(&xs[nxt][r][ld_k], x + (size_t)sr * I + nk0 + ld_k, r0 + r < S);
+                }
+                #pragma unroll
+                for (int r = ld_r; r < BN; r += R_STEP) {
+                    int so = o0 + r < O ? o0 + r : 0;
+                    f32g_cp16(&ws[nxt][r][ld_k], w + (size_t)so * I + nk0 + ld_k, o0 + r < O);
+                }
+                asm volatile("cp.async.commit_group;");
+            }
+            #pragma unroll
+            for (int k4 = 0; k4 < F32G_K; k4 += 4) {
+                float4 a4[RT], b4[CT];
+                #pragma unroll
+                for (int i = 0; i < RT; i++) a4[i] = *reinterpret_cast<const float4 *>(&xs[stg][ty + i * TY_DIM][k4]);
+                #pragma unroll
+                for (int j = 0; j < CT; j++) b4[j] = *reinterpret_cast<const float4 *>(&ws[stg][tx + j * TX_DIM][k4]);
+                #pragma unroll
+                for (int i = 0; i < RT; i++) for (int j = 0; j < CT; j++) {
+                    acc[i][j] = fmaf(a4[i].x, b4[j].x, acc[i][j]);
+                    acc[i][j] = fmaf(a4[i].y, b4[j].y, acc[i][j]);
+                    acc[i][j] = fmaf(a4[i].z, b4[j].z, acc[i][j]);
+                    acc[i][j] = fmaf(a4[i].w, b4[j].w, acc[i][j]);
+                }
+            }
+            stg = nxt;
+        }
+#else
+        for (int k0 = 0; k0 < I; k0 += F32G_K) {
+            #pragma unroll
+            for (int r = ld_r; r < BM; r += R_STEP)
+                *reinterpret_cast<float4 *>(&xs[0][r][ld_k]) = r0 + r < S ? *reinterpret_cast<const float4 *>(x + (size_t)(r0 + r) * I + k0 + ld_k) : make_float4(0.f, 0.f, 0.f, 0.f);
+            #pragma unroll
+            for (int r = ld_r; r < BN; r += R_STEP)
+                *reinterpret_cast<float4 *>(&ws[0][r][ld_k]) = o0 + r < O ? *reinterpret_cast<const float4 *>(w + (size_t)(o0 + r) * I + k0 + ld_k) : make_float4(0.f, 0.f, 0.f, 0.f);
+            __syncthreads();
+            #pragma unroll
+            for (int k4 = 0; k4 < F32G_K; k4 += 4) {
+                float4 a4[RT], b4[CT];
+                #pragma unroll
+                for (int i = 0; i < RT; i++) a4[i] = *reinterpret_cast<const float4 *>(&xs[0][ty + i * TY_DIM][k4]);
+                #pragma unroll
+                for (int j = 0; j < CT; j++) b4[j] = *reinterpret_cast<const float4 *>(&ws[0][tx + j * TX_DIM][k4]);
+                #pragma unroll
+                for (int i = 0; i < RT; i++) for (int j = 0; j < CT; j++) {
+                    acc[i][j] = fmaf(a4[i].x, b4[j].x, acc[i][j]);
+                    acc[i][j] = fmaf(a4[i].y, b4[j].y, acc[i][j]);
+                    acc[i][j] = fmaf(a4[i].z, b4[j].z, acc[i][j]);
+                    acc[i][j] = fmaf(a4[i].w, b4[j].w, acc[i][j]);
+                }
+            }
+            __syncthreads();
+        }
+#endif
+    } else {
+        for (int k0 = 0; k0 < I; k0 += F32G_K) {
+            if (align4 && k0 + F32G_K <= I) {
+                #pragma unroll
+                for (int r = ld_r; r < BM; r += R_STEP)
+                    *reinterpret_cast<float4 *>(&xs[0][r][ld_k]) = r0 + r < S ? *reinterpret_cast<const float4 *>(x + (size_t)(r0 + r) * I + k0 + ld_k) : make_float4(0.f, 0.f, 0.f, 0.f);
+                #pragma unroll
+                for (int r = ld_r; r < BN; r += R_STEP)
+                    *reinterpret_cast<float4 *>(&ws[0][r][ld_k]) = o0 + r < O ? *reinterpret_cast<const float4 *>(w + (size_t)(o0 + r) * I + k0 + ld_k) : make_float4(0.f, 0.f, 0.f, 0.f);
+            } else {
+                for (int t = threadIdx.x; t < BM * F32G_K; t += NTHR) {   /* a row's 64 consecutive inputs, then the next row */
+                    int r = t / F32G_K, k = t % F32G_K, gk = k0 + k;
+                    xs[0][r][k] = r0 + r < S && gk < I ? x[(size_t)(r0 + r) * I + gk] : 0.f;
+                }
+                for (int t = threadIdx.x; t < BN * F32G_K; t += NTHR) {
+                    int r = t / F32G_K, k = t % F32G_K, gk = k0 + k;
+                    ws[0][r][k] = o0 + r < O && gk < I ? w[(size_t)(o0 + r) * I + gk] : 0.f;
+                }
+            }
+            __syncthreads();
+            #pragma unroll
+            for (int k4 = 0; k4 < F32G_K; k4 += 4) {
+                float4 a4[RT], b4[CT];
+                #pragma unroll
+                for (int i = 0; i < RT; i++) a4[i] = *reinterpret_cast<const float4 *>(&xs[0][ty + i * TY_DIM][k4]);
+                #pragma unroll
+                for (int j = 0; j < CT; j++) b4[j] = *reinterpret_cast<const float4 *>(&ws[0][tx + j * TX_DIM][k4]);
+                #pragma unroll
+                for (int i = 0; i < RT; i++) for (int j = 0; j < CT; j++) {
+                    acc[i][j] = fmaf(a4[i].x, b4[j].x, acc[i][j]);
+                    acc[i][j] = fmaf(a4[i].y, b4[j].y, acc[i][j]);
+                    acc[i][j] = fmaf(a4[i].z, b4[j].z, acc[i][j]);
+                    acc[i][j] = fmaf(a4[i].w, b4[j].w, acc[i][j]);
+                }
+            }
+            __syncthreads();
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < RT; i++) for (int j = 0; j < CT; j++) {
+        int r = r0 + ty + i * TY_DIM, o = o0 + tx + j * TX_DIM;
+        if (r < S && o < O) y[(size_t)r * O + o] = acc[i][j];
+    }
+}
+/* A decode step's rows (up to GEMV_I8_MAX_S) of an f32 matrix of few outputs and long rows
+ * (Qwen3.8's hyper-connection injection, 4 x 10240; DeltaNet's b and a rows, 48 x 2560):
+ * quant_matmul took the injection 18.8 us on an RTX PRO 4000, four blocks with one load at a
+ * time in flight a thread (its loop reads through weight_at's format switch). This is its
+ * arithmetic for fmt 0 in its order (each thread's fused multiply-adds at a stride of 256,
+ * then the same tree), the bits it gives, with eight loads in flight a thread. */
+template<int FAST = 1>
+__global__ static void __launch_bounds__(256) f32_gemv_k(float *__restrict__ y, const float *__restrict__ x,
+                                                          const float *__restrict__ w, int I, int O) {
+    __shared__ float partial[256];
+    int o = (int)blockIdx.x, s = (int)blockIdx.y, i = threadIdx.x;
+    const float *wr = w + (size_t)o * I, *xr = x + (size_t)s * I;
+    float sum = 0.f;
+    for (; i + 7 * 256 < I; i += 8 * 256) {
+        float a[8], b[8];
+        #pragma unroll
+        for (int k = 0; k < 8; k++) { a[k] = xr[i + k * 256]; b[k] = wr[i + k * 256]; }
+        #pragma unroll
+        for (int k = 0; k < 8; k++) sum = fmaf(a[k], b[k], sum);
+    }
+    for (; i < I; i += 256) sum = fmaf(xr[i], wr[i], sum);
+    if (FAST) {
+        int t = threadIdx.x;
+        if (t >= 32) partial[t] = sum;
+        __syncthreads();
+        if (t < 32) {
+            float s0 = (sum + partial[t + 128]) + (partial[t + 64] + partial[t + 192]);
+            float s1 = (partial[t + 32] + partial[t + 160]) + (partial[t + 96] + partial[t + 224]);
+            sum = s0 + s1;
+            #pragma unroll
+            for (int n = 16; n; n >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, n);
+            if (!t) y[(size_t)s * O + o] = sum;
+        }
+        return;
+    }
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (int n = 128; n; n >>= 1) {
+        if (threadIdx.x < n) partial[threadIdx.x] += partial[threadIdx.x + n];
+        __syncthreads();
+    }
+    if (!threadIdx.x) y[(size_t)s * O + o] = partial[0];
+}
+static int f32_gemm_fast_on(void) {
+    static int on = -1, bench = -1;
+    if (bench < 0) bench = getenv("COLI_CUDA_CHAIN_BENCH") != nullptr || getenv("COLI_CUDA_CHAIN_TEST") != nullptr;
+    if (on < 0 || bench) { const char *e = getenv("COLI_CUDA_F32G_FAST"); on = e && *e ? atoi(e) : 1; }
+    return on;
+}
+static int f32_gemm_launch(DeviceContext *ctx, float *y, const float *x, const float *w, int S, int I, int O, cudaStream_t st) {
+    if (::f32t_gemm(ctx, y, x, w, S, I, O, st)) return 1;
+    int fast = f32_gemm_fast_on();
+    unsigned gx = (unsigned)((O + F32G_N - 1) / F32G_N), big = (unsigned)((S + 63) / 64);
+    long min_b = fast ? 1L : 2L;
+    if (O <= 64 && S <= 64 && fast == 1)
+        f32_gemm_k<8, 8, 64><<<dim3((unsigned)((O + 7) / 8), (unsigned)((S + 7) / 8)), 64, 0, st>>>(y, x, w, S, I, O);
+    else if (O <= 64 && S <= 64 && fast == 2)
+        f32_gemm_k<8, 16, 64><<<dim3((unsigned)((O + 15) / 16), (unsigned)((S + 7) / 8)), 64, 0, st>>>(y, x, w, S, I, O);
+    else if (O <= 64 && S <= 64 && fast == 3)
+        f32_gemm_k<16, 16><<<dim3((unsigned)((O + 15) / 16), (unsigned)((S + 15) / 16)), 256, 0, st>>>(y, x, w, S, I, O);
+    else if (O <= 64 && ((fast == 1 && S >= 1024) || fast == 2))
+        f32_gemm_k<16, 32, 64><<<dim3((unsigned)((O + 31) / 32), (unsigned)((S + 15) / 16)), 64, 0, st>>>(y, x, w, S, I, O);
+    else if (O <= 64 && fast >= 1)
+        f32_gemm_k<16, 16, 64><<<dim3((unsigned)((O + 15) / 16), (unsigned)((S + 15) / 16)), 64, 0, st>>>(y, x, w, S, I, O);
+    else if ((long)gx * big >= min_b * (ctx->sms > 0 ? ctx->sms : 1))
+        f32_gemm_k<64, 64><<<dim3(gx, big), 256, 0, st>>>(y, x, w, S, I, O);
+    else
+        f32_gemm_k<16, 64><<<dim3(gx, (unsigned)((S + 15) / 16)), 256, 0, st>>>(y, x, w, S, I, O);
+    return cuda_ok(cudaGetLastError(), "chain f32 gemm launch");
+}
+extern "C" int coli_cuda_qwen36_gemm_async(ColiCudaTensor *t, float *y_dev, const float *x_dev, int S, void *stream) {
+    if (fault_injected()) return 0;
+    if (!t || !y_dev || !x_dev || S < 1) return 0;
+    DeviceContext *ctx = find_ctx(t->device);
+    if (!ctx || !ctx->qwen36_active)
+        return ::tensor_gemm_async(t, y_dev, x_dev, S, stream);
+    if (!(t->fmt == 0 || (t->fmt == 1 && S <= GEMV_I8_MAX_S)))
+        return ::tensor_gemm_async(t, y_dev, x_dev, S, stream);
+    const bool uses_short_projection_dispatch = t->fmt == 0 || (t->fmt == 1 && S <= GEMV_I8_MAX_S);
+    if (uses_short_projection_dispatch && !(ctx->kernel_mask & Q36_SHORT_MATMUL)) {
+        const char *mode = getenv(t->fmt == 0 ? "COLI_CUDA_F32G_FAST" : "COLI_CUDA_GEMV_I2F");
+        if (!mode || !*mode) return ::tensor_gemm_async(t, y_dev, x_dev, S, stream);
+    }
+    if (!select_ctx(ctx)) return 0;
+    cudaStream_t st = (cudaStream_t)stream;
+    if (t->fmt == 1 && S <= GEMV_I8_MAX_S && t->I % 16 == 0 && t->I <= 12288 && ((uintptr_t)x_dev & 15) == 0) {   /* x in float4 loads */
+        /* W1 and W4 take the same sums in each lane unless the standard dispatcher splits K.
+         * Use its partial sums, ordered merge and allocation fallback in that case. */
+        if (gemv_i8_w4_shape(t) && gemv_i8_sk_splits(ctx, t->I, gemv_i8_w4_blocks(t->O)) > 1)
+            return ::tensor_gemm_async(t, y_dev, x_dev, S, stream);
+        unsigned bx = (unsigned)((t->O + GEMV_I8_ROWS - 1) / GEMV_I8_ROWS);
+        const int8_t *w = (const int8_t *)t->weights;
+        size_t prow = (size_t)(gx4(t->I / 4) + 1) * 16;   /* a padded row's bytes */
+        /* a verify's rows share each weight load where the matrix has the blocks to fill the
+         * device without its rows and shared memory holds them padded */
+        int nr = S > 1 && bx >= 64 && gemv_i8_nr_on() ? (S < GEMV_I8_NR ? S : GEMV_I8_NR) : 1, fast = gemv_i2f_fast_on() >= 2;
+        while (nr > 1 && nr * prow > 48 * 1024) nr--;
+        if (nr > 1) {
+            if (fast) gemv_i8_rows<GEMV_I8_NR, 1, 1><<<dim3(bx, (unsigned)((S + nr - 1) / nr)), 256, nr * prow, st>>>(y_dev, x_dev, w, t->scales, t->I, t->O, S, nr);
+            else      gemv_i8_rows<GEMV_I8_NR, 1, 0><<<dim3(bx, (unsigned)((S + nr - 1) / nr)), 256, nr * prow, st>>>(y_dev, x_dev, w, t->scales, t->I, t->O, S, nr);
+        } else if (prow <= 48 * 1024) {
+            if (fast) gemv_i8_rows<1, 1, 1><<<dim3(bx, (unsigned)S), 256, prow, st>>>(y_dev, x_dev, w, t->scales, t->I, t->O, S, 1);
+            else      gemv_i8_rows<1, 1, 0><<<dim3(bx, (unsigned)S), 256, prow, st>>>(y_dev, x_dev, w, t->scales, t->I, t->O, S, 1);
+        } else {
+            if (fast) gemv_i8_rows<1, 0, 1><<<dim3(bx, (unsigned)S), 256, (size_t)t->I * sizeof(float), st>>>(y_dev, x_dev, w, t->scales, t->I, t->O, S, 1);
+            else      gemv_i8_rows<1, 0, 0><<<dim3(bx, (unsigned)S), 256, (size_t)t->I * sizeof(float), st>>>(y_dev, x_dev, w, t->scales, t->I, t->O, S, 1);
+        }
+        return cuda_ok(cudaGetLastError(), "chain gemv launch");
+    }
+    if (t->fmt == 0 && S > GEMV_I8_MAX_S && t->O >= 16)   /* a decode step's rows keep quant_matmul's bits, as a single gate row does */
+        return qwen36_cuda::f32_gemm_launch(ctx, y_dev, x_dev, (const float *)t->weights, S, t->I, t->O, st);
+    if (t->fmt == 0 && (S <= GEMV_I8_MAX_S ? t->O <= 512 : t->O < 16) && t->I >= 1024) {   /* few outputs, long rows: quant_matmul's bits */
+        if (f32_gemm_fast_on())
+            f32_gemv_k<1><<<dim3((unsigned)t->O, (unsigned)S), 256, 0, st>>>(y_dev, x_dev, (const float *)t->weights, t->I, t->O);
+        else
+            f32_gemv_k<0><<<dim3((unsigned)t->O, (unsigned)S), 256, 0, st>>>(y_dev, x_dev, (const float *)t->weights, t->I, t->O);
+        return cuda_ok(cudaGetLastError(), "chain f32 gemv launch");
+    }
+    dim3 grid((unsigned)t->O, (unsigned)S);
+    quant_matmul<<<grid, 256, 0, st>>>(y_dev, x_dev, t->weights, t->scales, t->fmt, S, t->I, t->O,
+                                            row_bytes(t->fmt, t->I), t->gs, t->ng);
+    return cuda_ok(cudaGetLastError(), "chain gemm launch");
+}
+#undef Q36_MMA
+}  // namespace qwen36_cuda
+#else
+extern "C" int coli_cuda_qwen36_gemm_async(ColiCudaTensor *t, float *y, const float *x, int S, void *stream) {
+    return coli_cuda_tensor_gemm_async(t, y, x, S, stream);
+}
+#endif
 
 /* ==== resident-pipeline primitives (Inc.0, 2026-07-13) ====
  * Device-side building blocks so the residual stream can stay on the layer's

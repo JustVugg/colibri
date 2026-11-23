@@ -49,6 +49,7 @@ extern "C" int coli_cuda_moe_stage(int device, void *stage, size_t slot_bytes, i
 extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float *x, const int *ids, const float *w,
                                    float *hid, float *y, const float *hy, const CcMoe *p, void *stream);
 
+extern "C" int coli_cuda_qwen36_gemm_async(ColiCudaTensor *t, float *y_dev, const float *x_dev, int S, void *stream);
 #include "qwen36_cuda_profile.h"
 extern "C" int coli_cuda_enable_qwen36(int device, int enabled);
 extern "C" void coli_cuda_set_qwen36_mask(int device, unsigned mask);
@@ -2865,11 +2866,17 @@ static int cc_matmul(ColiCudaTensor *t, CcBuf *x, size_t xo, CcBuf *y, size_t yo
     if (!c || !t || !x || !y || S < 1) return 0;
     int fmt, I, O;
     if (!coli_cuda_tensor_shape(t, &fmt, &I, &O) || coli_cuda_tensor_device(t) != c->device) return 0;
-    if ((xo + (size_t)S * I) * 4 > x->bytes || (yo + (size_t)S * O) * 4 > y->bytes) return 0;
+    const size_t x_floats = x->bytes / sizeof(float), y_floats = y->bytes / sizeof(float);
+    if (xo > x_floats || (size_t)S * I > x_floats - xo ||
+        yo > y_floats || (size_t)S * O > y_floats - yo) return 0;
     cc_down_access(y);
     (void)fp(x);
     if (c->lost) return 0;
     g_st.matmuls++; g_st.ops++;
+    if (c->device_profile && (fmt == 0 || (fmt == 1 && S <= 8))) {
+        if (!coli_cuda_qwen36_gemm_async(t, y->d + yo, x->d + xo, S, (void *)c->stream)) { c->lost = 1; return 0; }
+        return 1;
+    }
     /* the input of the last matmul, with no call to the chain between (q, k and v; gate and up): its
      * quantization stays */
     static thread_local struct { const float *x; int S, I; unsigned long long seq; cudaStream_t st; } last = {nullptr, 0, 0, 0, nullptr};
