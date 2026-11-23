@@ -3627,9 +3627,10 @@ static void q38cc_pd_end(Q38CChain *ch, int S, int pd, double sec) {
  * slot or a staged copy runs op by op, as before, and so does the layer after a hosted one (freeing
  * a graph waits for the stream, which waits for that layer's host share). A GGUF's block matrices quantize their input into
  * the backend's scratch: its address (graph_scratch) is in a segment's fingerprint, so a graph
- * captured before it moved (a prompt's rows grow it) is never replayed. Not with DFlash2's drafter
- * or a prompt's rows. The [chain] line's ops and matmuls count a graph's ops once, when it was
- * captured. */
+ * captured before it moved (a prompt's rows grow it) is never replayed. The int4 experts in the
+ * frame take the same path (the check does not look at the format); not measured. Not with
+ * DFlash2's drafter or a prompt of more than Q38_SPEC_ROWS rows. The [chain] line's ops and
+ * matmuls count a graph's ops once, when it was captured. */
 static unsigned long long q38g_mix(unsigned long long h, const void *p) {   /* FNV-1a over the address */
     uintptr_t v = (uintptr_t)p;
     for (size_t k = 0; k < sizeof v; k++) { h ^= (unsigned char)(v >> (8 * k)); h *= 0x100000001b3ULL; }

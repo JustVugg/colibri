@@ -896,10 +896,12 @@ the second and replayed after; a capture that breaks turns the switch off for th
 runs the same kernels with the same arguments in the same order: the bits of the ops. Measured
 on an RTX 5090 (Windows, Qwen3.8-Flash-Next FP8, RAM cache 4/layer, uploads synchronous so the
 residency is a function of the routes), 64 greedy tokens, off/on/on/off: the decode step's time
-outside the routed experts 43.9 / 26.4 / 27.3 / 40.8 ms, the last logits byte-identical in all
-four runs. On this machine the FP8 decode is bound by the expert reads (about 350 ms a step), so
-the served decode moved 1-5 % (2.35-4.48 -> 2.36-4.67 tok/s, the same text and the same expert
-hits); with the experts mostly in VRAM the dense part is a larger share of the step.
+outside the routed experts (a lab-only timer, not in the tree) 43.9 / 26.4 / 27.3 / 40.8 ms,
+the last logits byte-identical in all four runs. On this machine the FP8 decode is bound by
+the expert reads (about 350 ms a step), so the whole step is within noise (421.9 / 395.8 /
+391.6 / 392.4 ms), and the served decode, one session per arm and so indicative, moved 1-5 %
+(2.35-4.48 -> 2.36-4.67 tok/s, the same text and the same expert hits); with the experts mostly
+in VRAM the dense part is a larger share of the step.
 
 With the routed experts in the frame (a GGUF's), a layer whose slots are all the card's (no
 slot the host computes, no staged copy) ends its last segment with its router, routes, shared
@@ -908,7 +910,8 @@ copy runs op by op, and so does the layer after a hosted one (freeing a graph wa
 stream, which waits for that layer's host share). A GGUF's block matrices quantize their input into a scratch of the backend's
 that grows, and moves, for a prompt's rows: its address (the optional `graph_scratch` op) is in a
 segment's fingerprint, so a graph that holds the old one is never replayed; with a DLL without
-the op a GGUF keeps the switch off. Measured on an RTX 5090 (Windows, Qwen3.8-Flash-Next
+the op a GGUF keeps the switch off. The int4 experts in the frame take the same path (the check
+does not look at the format); not measured. Measured on an RTX 5090 (Windows, Qwen3.8-Flash-Next
 GSQ-RCO IQ1_M, every routed expert on the card, `--ram 16 --cap 80`, served greedy, four requests
 from 32 to 4,634 prompt tokens, two sessions each): decode 49.4-52.5 tok/s off, 82.6-92.7 on
 (about +73 %), the step's wait for the device 0.55-0.60 ms off and 8.7-8.8 ms on (the step is
