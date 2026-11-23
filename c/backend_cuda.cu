@@ -5,6 +5,10 @@
 
 #include "backend_gpu_compat.h"
 #include "cuda_bd.cuh"        /* a GGUF's block formats: fmt 100 + ggml type (blockdec_host.h's table) */
+#include "ledger_map.h"       /* LEDGER_OUT: the memory map and the window Ledger reads */
+#if !(defined(__HIP_PLATFORM_AMD__) || defined(__HIP__))
+#include <cuda_profiler_api.h>
+#endif
 
 static_assert(FP8_BLOCK == 128, "fmt=8 on-disk containers carry ceil(dim/128)-edged scale "
               "grids (mint tool, docs/FORMATS.md); FP8_BLOCK is container format, not a "
@@ -1478,13 +1482,15 @@ static int reserve(float **ptr, size_t *cap, size_t bytes) {
     *ptr = nullptr;
     *cap = 0;
     if (!cuda_ok(cudaMalloc(ptr, bytes), "scratch allocation")) return 0;
+    coli_ledger::add(*ptr, bytes, "buffer", coli_ledger::numbered("scratch"), {(long long)bytes}, "uint8");
     *cap = bytes;
     return 1;
 }
 
 static int reserve_bytes(void **ptr,size_t *cap,size_t bytes){
     if(*cap>=bytes) return 1; if(*ptr) cudaFree(*ptr); *ptr=nullptr; *cap=0;
-    if(!cuda_ok(cudaMalloc(ptr,bytes),"descriptor allocation")) return 0; *cap=bytes; return 1;
+    if(!cuda_ok(cudaMalloc(ptr,bytes),"descriptor allocation")) return 0; *cap=bytes;
+    coli_ledger::add(*ptr,bytes,"buffer",coli_ledger::numbered("descriptors"),{(long long)bytes},"uint8"); return 1;
 }
 
 static int reserve_pinned(float **ptr,size_t *cap,size_t bytes){
@@ -1838,6 +1844,24 @@ static size_t bd_file_row_bytes(int fmt, int I) {
  * kernel after it) still on the legacy stream, which the chain's non-blocking stream does
  * not wait for. A kernel there read a just-uploaded f32 matrix's later rows unwritten. */
 static int upload_settled(const char *what) { return cuda_ok(cudaStreamSynchronize(0), what); }
+static const char *ledger_dtype(int fmt) {
+    switch (fmt) {
+    case 0: return "float32";
+    case 1: return "int8";
+    case 2: case 4: return "int4";
+    case 6: return "e8";
+    case 7: return "mxfp4";
+    case 8: return "float8_e4m3fn";
+    default: return fmt >= 100 ? "gguf_block" : "uint8";
+    }
+}
+/* a tensor's weights and scales in the Ledger map, under the engine's label or tensor.<n> */
+static void ledger_tensor(const ColiCudaTensor *t) {
+    if (!coli_ledger::on()) return;
+    const std::string kind = coli_ledger::kind("weight"), name = coli_ledger::name("tensor");
+    coli_ledger::add(t->weights, t->weight_bytes, kind, name + ".weight", {t->O, t->I}, ledger_dtype(t->fmt));
+    if (t->scales) coli_ledger::add(t->scales, tensor_scale_bytes(t), kind, name + ".scale", {}, "float32");
+}
 /* O rows of rb bytes from the host into rows of row_words words; zero_pad: the padding zeroed
  * first (a new tensor's; a refill keeps what the upload wrote there) */
 static int bd_rows_copy(ColiCudaTensor *t, const void *weights, int zero_pad) {
@@ -1860,6 +1884,7 @@ static int bd_tensor_upload(ColiCudaTensor **tensor, const void *weights, int fm
     if (!cuda_ok(cudaMalloc(&t->weights, t->weight_bytes), "tensor allocation")) { coli_cuda_tensor_free(t); return 0; }
     t->weights_owned = 1;
     if (!bd_rows_copy(t, weights, 1)) { coli_cuda_tensor_free(t); return 0; }
+    ledger_tensor(t);
     t->tracked = 1;
     ctx->tensor_count++;
     ctx->tensor_bytes += t->weight_bytes;
@@ -1953,6 +1978,7 @@ extern "C" int coli_cuda_tensor_upload_at(ColiCudaTensor **tensor, void *dev, si
     t->row_words = (int)rw; t->weight_bytes = rw * 4 * (size_t)O;
     t->weights = dev; t->weights_owned = 0;
     if (!bd_rows_copy(t, weights, 1)) { std::free(t); return 0; }
+    ledger_tensor(t);
     *tensor = t;
     return 1;
 }
@@ -2027,6 +2053,7 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
     }
     if (!upload_settled("tensor upload")) { coli_cuda_tensor_free(t); return 0; }
     if (fmt == 6) t->scale_count = 0;      /* in-block scales: nothing separate to track */
+    ledger_tensor(t);
     t->tracked = 1;
     ctx->tensor_count++;
     ctx->tensor_bytes += t->weight_bytes + tensor_scale_bytes(t);
@@ -2488,6 +2515,13 @@ extern "C" ColiCudaDn *coli_cuda_dn_create(int device, int vh, int vk, int kdim,
              cuda_ok(cudaMemcpy(d->norm_w, norm_w, (size_t)vdim * sizeof(float), cudaMemcpyHostToDevice), "dn norm upload") &&
              cuda_ok(cudaMemset(d->ring, 0, ring_b), "dn ring zero") && cuda_ok(cudaMemset(d->rec, 0, rec_b), "dn state zero");
     if (!ok) { coli_cuda_dn_free(d); return NULL; }
+    if (coli_ledger::on()) {
+        const std::string n = coli_ledger::name("deltanet");
+        coli_ledger::add(d->ring, ring_b, "cache", n + ".conv_state", {conv_dim, convk - 1}, "float32");
+        coli_ledger::add(d->rec, rec_b, "cache", n + ".recurrent_state", {vh, kdim, vdim}, "float32");
+        coli_ledger::add(d->conv_w, (size_t)conv_dim * convk * sizeof(float), "weight", n + ".conv1d", {conv_dim, convk}, "float32");
+        coli_ledger::add(d->norm_w, (size_t)vdim * sizeof(float), "weight", n + ".norm", {vdim}, "float32");
+    }
     return d;
 }
 extern "C" void coli_cuda_dn_free(ColiCudaDn *d) {
@@ -3285,6 +3319,11 @@ extern "C" int coli_cuda_attention_project_ragged(ColiCudaTensor *w,ColiCudaTens
             }
             std::free(e->latent_pages);std::free(e->rope_pages);
             e->latent_pages=nl;e->rope_pages=nr;e->page_count=need;
+            for(int i=0;coli_ledger::on()&&i<need;i++){   /* the older pages are re-added unchanged */
+                const std::string n="kv.seq"+std::to_string((long long)(e-w->ragged))+".page."+std::to_string(i);
+                coli_ledger::add(nl[i],(size_t)COLI_KV_PAGE_TOKENS*K*sizeof(float),"cache",n+".latent",{COLI_KV_PAGE_TOKENS,K},"float32");
+                coli_ledger::add(nr[i],(size_t)COLI_KV_PAGE_TOKENS*R*sizeof(float),"cache",n+".rope",{COLI_KV_PAGE_TOKENS,R},"float32");
+            }
         }
         if(e->page_count>page_stride)page_stride=e->page_count;
         old[s]=e->length;add[s]=lengths[s]-e->length;
@@ -6394,10 +6433,24 @@ extern "C" float *coli_cuda_pipe_scratch(int device,int slot,size_t bytes){
     if(!reserve(&ctx->pipe_buf[slot],&ctx->pipe_cap[slot],bytes)) return NULL;
     return ctx->pipe_buf[slot];
 }
+/* Ledger (ledger_map.h): what the engine calls its next allocations on this thread
+ * (kind "weight", "cache" or "buffer"; a NULL name: the backend's own), and the end of
+ * a decode step, which writes the map and opens or closes COLI_LEDGER_WINDOW. */
+extern "C" void coli_cuda_ledger_label(const char *kind,const char *name){coli_ledger::set_label(kind,name);}
+extern "C" void coli_cuda_ledger_step(void){
+    const int edge=coli_ledger::step("cuda");
+    if(!edge) return;
+    for(int i=0;i<g_nctx;i++) if(select_ctx(&g_ctx[i])) (void)cudaDeviceSynchronize();
+#if !(defined(__HIP_PLATFORM_AMD__) || defined(__HIP__))   /* the map is off under HIP: no edge */
+    (void)(edge>0?cudaProfilerStart():cudaProfilerStop());
+#endif
+    std::fprintf(stderr,"[LEDGER] window %s after decode step %lld\n",edge>0?"opened":"closed",coli_ledger::map().steps);
+}
 extern "C" void *coli_cuda_pipe_alloc(int device,size_t bytes){
     DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return NULL;
     void *p=NULL;
     if(!cuda_ok(cudaMalloc(&p,bytes),"pipe alloc")) return NULL;
+    coli_ledger::add(p,bytes,coli_ledger::kind("buffer"),coli_ledger::name("pipe"),{(long long)bytes},"uint8");
     return p;
 }
 extern "C" void coli_cuda_pipe_free(int device,void *p){

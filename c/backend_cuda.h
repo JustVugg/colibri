@@ -321,6 +321,12 @@ COLI_CUDA_DLLEXPORT int coli_cuda_tensor_update(ColiCudaTensor *tensor,
 /* ---- resident-pipeline primitives (Inc.0): device-pointer entry points ---- */
 COLI_CUDA_DLLEXPORT float *coli_cuda_pipe_scratch(int device,int slot,size_t bytes);
 COLI_CUDA_DLLEXPORT void *coli_cuda_pipe_alloc(int device,size_t bytes);
+/* Ledger (ledger_map.h; no effect without LEDGER_OUT): what the engine calls its next
+ * allocations on this thread -- kind "weight", "cache" or "buffer", a NULL name for the
+ * backend's own -- and the end of a decode step (writes the map, opens and closes
+ * COLI_LEDGER_WINDOW=<skip>:<take>). */
+COLI_CUDA_DLLEXPORT void coli_cuda_ledger_label(const char *kind,const char *name);
+COLI_CUDA_DLLEXPORT void coli_cuda_ledger_step(void);
 COLI_CUDA_DLLEXPORT void coli_cuda_pipe_free(int device,void *p);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_upload(int device,void *dst,const void *src,size_t bytes);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_download(int device,const void *src,void *dst,size_t bytes);

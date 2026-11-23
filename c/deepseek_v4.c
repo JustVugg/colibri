@@ -12657,6 +12657,23 @@ fail:
 #include <stdlib.h>
 #include <math.h>
 
+/* Ledger (ledger_map.h): the device buffers of the next upload are layer `layer`'s `key`,
+ * or the model's `key` with layer < 0; a NULL key gives the backend back its own names. */
+static void v4_ledger_label(int layer, const char *key) {
+    char name[COLI_V4_MAX_TENSOR_NAME];
+    if (!key) { dsv4_cuda_ledger_label(NULL, NULL); return; }
+    if (layer < 0) snprintf(name, sizeof(name), "%s", key);
+    else snprintf(name, sizeof(name), "layers.%d.%s", layer, key);
+    dsv4_cuda_ledger_label("weight", name);
+}
+
+/* a mirror slot of device `device`'s expert cache: the expert in it changes */
+static void v4_ledger_slot(int device, int slot) {
+    char name[64];
+    snprintf(name, sizeof(name), "experts.dev%d.slot.%d", device, slot);
+    dsv4_cuda_ledger_label("weight", name);
+}
+
 /* the device the engine opened for this path (coli_v4_gpu_engine_open), -1 before: the
  * batched attention's helpers take it where a layer has no FP8 mirror to find it by (a GGUF) */
 static int g_v4_gpu_open_device = -1;
@@ -13011,11 +13028,13 @@ static void *v4_gpu_upload_fp8_fmt(ColiDeepSeekV4LayerWeights *weights,
         scale_bytes[b] = (uint8_t)(exponent + 127);
     }
     Dsv4CudaTensor *tensor = NULL;
+    v4_ledger_label(weights->plan.layer, prefix);
     int uploaded = bf16_rounded
         ? dsv4_cuda_upload_fp8_bf16(&tensor, source, scale_bytes, (int)rows,
                                     (int)columns, device)
         : dsv4_cuda_upload_fp8(&tensor, source, scale_bytes, (int)rows,
                                (int)columns, device);
+    v4_ledger_label(-1, NULL);
     if (!uploaded) {
         free(row_major);
         free(scale_bytes);
@@ -13052,8 +13071,11 @@ static void *v4_gpu_upload_indexer(ColiDeepSeekV4LayerWeights *weights,
     Dsv4CudaTensor *tensor = NULL;
     /* Preserve the resident rows8 layout and decoded float scales. Generic
      * FP8 mirrors change reduction order and can change indexer Top-k. */
-    if (!dsv4_cuda_upload_fp8_ref(&tensor, data, scales, (int)spec->shape[0],
-                                  (int)spec->shape[1], spec->packed_rows8, device)) return NULL;
+    v4_ledger_label(weights->plan.layer, "attn.indexer.wq_b");
+    int uploaded = dsv4_cuda_upload_fp8_ref(&tensor, data, scales, (int)spec->shape[0],
+                                            (int)spec->shape[1], spec->packed_rows8, device);
+    v4_ledger_label(-1, NULL);
+    if (!uploaded) return NULL;
     *bytes += dsv4_cuda_tensor_bytes(tensor);
     fprintf(stderr, "v4_gpu indexer-resident=on device=%d layer=%d bytes=%lld\n",
             device, weights->plan.layer, dsv4_cuda_tensor_bytes(tensor));
@@ -13074,9 +13096,10 @@ static void *v4_gpu_upload_f32_tensor(ColiDeepSeekV4LayerWeights *weights,
     for (int axis = 0; axis < spec->rank; axis++) elements *= spec->shape[axis];
     if (elements != (int64_t)rows * columns) return NULL;
     Dsv4CudaTensor *tensor = NULL;
-    if (!dsv4_cuda_upload_f32(&tensor, (const float *)data, rows, columns,
-                              device))
-        return NULL;
+    v4_ledger_label(weights->plan.layer, key);
+    int uploaded = dsv4_cuda_upload_f32(&tensor, (const float *)data, rows, columns, device);
+    v4_ledger_label(-1, NULL);
+    if (!uploaded) return NULL;
     if (bytes) *bytes += dsv4_cuda_tensor_bytes(tensor);
     return tensor;
 }
@@ -13101,7 +13124,9 @@ static void *v4_gpu_upload_norm_f32(ColiDeepSeekV4LayerWeights *weights,
         memcpy(&decoded[i], &bits, sizeof(bits));
     }
     Dsv4CudaTensor *tensor = NULL;
+    v4_ledger_label(weights->plan.layer, key);
     int uploaded = dsv4_cuda_upload_f32(&tensor, decoded, dimension, 1, device);
+    v4_ledger_label(-1, NULL);
     free(decoded);
     if (!uploaded) return NULL;
     if (bytes) *bytes += dsv4_cuda_tensor_bytes(tensor);
@@ -13140,12 +13165,13 @@ static void *v4_gpu_upload_bf16_matrix(ColiDeepSeekV4LayerWeights *weights,
         spec->shape[0] != expected_rows || spec->shape[1] != expected_columns)
         return NULL;
     Dsv4CudaTensor *tensor = NULL;
+    v4_ledger_label(weights->plan.layer, prefix);
     if (packed_decode)
         dsv4_cuda_upload_compressor(&tensor, data, expected_rows,
                                     expected_columns, device);
-    if (!tensor && !dsv4_cuda_upload_bf16(&tensor, data, expected_rows,
-                                         expected_columns, device))
-        return NULL;
+    if (!tensor) dsv4_cuda_upload_bf16(&tensor, data, expected_rows, expected_columns, device);
+    v4_ledger_label(-1, NULL);
+    if (!tensor) return NULL;
     if (bytes) *bytes += dsv4_cuda_tensor_bytes(tensor);
     return tensor;
 }
@@ -13170,8 +13196,10 @@ static void *v4_gpu_upload_gate(ColiDeepSeekV4LayerWeights *weights, int device,
         memcpy(&f32[i], &bits, sizeof(bits));
     }
     Dsv4CudaTensor *tensor = NULL;
-    if (!dsv4_cuda_upload_f32(&tensor, f32, (int)experts, (int)dimension,
-                              device)) {
+    v4_ledger_label(weights->plan.layer, "ffn.gate");
+    int uploaded = dsv4_cuda_upload_f32(&tensor, f32, (int)experts, (int)dimension, device);
+    v4_ledger_label(-1, NULL);
+    if (!uploaded) {
         free(f32);
         return NULL;
     }
@@ -13192,8 +13220,10 @@ static void *v4_gpu_upload_gate_bias(ColiDeepSeekV4LayerWeights *weights,
     int64_t experts = spec->shape[0];
     if (experts != 256) return NULL;
     Dsv4CudaTensor *tensor = NULL;
-    if (!dsv4_cuda_upload_f32(&tensor, data, (int)experts, 1, device))
-        return NULL;
+    v4_ledger_label(weights->plan.layer, "ffn.gate.bias");
+    int uploaded = dsv4_cuda_upload_f32(&tensor, data, (int)experts, 1, device);
+    v4_ledger_label(-1, NULL);
+    if (!uploaded) return NULL;
     if (bytes) *bytes += dsv4_cuda_tensor_bytes(tensor);
     return tensor;
 }
@@ -13407,8 +13437,11 @@ void coli_v4_gpu_head_upload(ColiV4Engine *engine) {
     for (int k = 0; k < n; k++) {
         int candidate = order[k];
         if (dsv4_cuda_mem_free_mb(candidate) < reserve + need) continue;
-        if (dsv4_cuda_upload_head_exact(&head, (const uint16_t *)engine->head_cache.data,
-                                        rows, cols, candidate)) {
+        v4_ledger_label(-1, "head");
+        int uploaded = dsv4_cuda_upload_head_exact(&head, (const uint16_t *)engine->head_cache.data,
+                                                   rows, cols, candidate);
+        v4_ledger_label(-1, NULL);
+        if (uploaded) {
             device = candidate;
             break;
         }
@@ -13873,6 +13906,7 @@ static int v4_gpu_experts_load(V4GpuExpertMirrorCache *cache,
             V4GpuExpertMirror *entry = &cache->entries[cache->count++];
             entry->layer = layer;
             entry->expert = expert;
+            v4_ledger_slot(cache->device, cache->count - 1);
             int ok = view.gate.rows == intermediate && view.gate.columns == hidden &&
                 view.up.rows == intermediate && view.up.columns == hidden &&
                 view.down.rows == hidden && view.down.columns == intermediate &&
@@ -13886,6 +13920,7 @@ static int v4_gpu_experts_load(V4GpuExpertMirrorCache *cache,
                     view.up.rows, view.up.columns, cache->device) &&
                 dsv4_cuda_upload_fp4(&entry->down, view.down.data, view.down.scales,
                     view.down.rows, view.down.columns, cache->device);
+            v4_ledger_label(-1, NULL);
             coli_expert_release(store, &view);
             if (!ok) return -1;
         }
@@ -14316,6 +14351,7 @@ static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
         cache->entries[found].block = 0;
         Dsv4CudaTensor *gate = NULL, *up = NULL, *down = NULL;
         int made_block = 0;
+        v4_ledger_slot(cache->device, found);
         if (block_wanted &&
             dsv4_cuda_mirror_alloc(&gate, &up, &down, runs.dims[0], runs.dims[1],
                                    runs.dims[2], runs.dims[3], cache->device)) {
@@ -14354,6 +14390,7 @@ static int v4_gpu_expert_attach_cached_mode(V4GpuExpertMirrorCache *cache,
                       (const uint8_t *)view->down.scales,
                       (int)view->down.rows, (int)view->down.columns,
                       cache->device));
+        v4_ledger_label(-1, NULL);
         if (!ok) {
             if (gate) dsv4_cuda_tensor_free(gate);
             if (up) dsv4_cuda_tensor_free(up);
@@ -18650,6 +18687,12 @@ static int session_emit_token(ColiV4Session *session,
                               ColiV4SessionTokenFn on_token, void *user_data,
                               int token, float logit, int position, int ordinal,
                               int stop_at_sentence) {
+#if defined(COLI_V4_GPU_TIER)
+    {   /* Ledger (ledger_map.h): a token is a decode step; inert without LEDGER_OUT */
+        extern void dsv4_cuda_ledger_step(void);
+        dsv4_cuda_ledger_step();
+    }
+#endif
     if (on_token) {
         if (on_token(user_data, token, logit, position, ordinal)) return 1;
     } else {

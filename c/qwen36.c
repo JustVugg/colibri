@@ -2389,6 +2389,11 @@ static inline int qtd(int hp1, float *y, const float *x, int I, int O){
  * backend does not take the type or the tensor carries a scale the kernels lack. */
 #ifdef COLI_CUDA
 int coli_cuda_block_elems(int fmt);
+void coli_cuda_ledger_step(void);
+/* Ledger (ledger_map.h): one generated token; inert without LEDGER_OUT */
+static void q36_ledger_token(void) { coli_cuda_ledger_step(); }
+#else
+static void q36_ledger_token(void) {}
 #endif
 static int qdw_gq_fmt(const QW *w) {
 #ifdef COLI_CUDA
@@ -10373,7 +10378,7 @@ static void serve_one_turn(Model *m, ServeReq *q){
             unsigned char chunk[256]; int cn=0; utf8_drain(sbuf,&sbn,tmp,tn,chunk,&cn);
             if(cn>0) serve_data(q->id,(char*)chunk,cn);
         }
-        gen++;
+        gen++; q36_ledger_token();
         if(s == 0) q36_pes_commit(m);   /* the first token is out; the state is still the prompt's end */
         /* #1332: una guardata a stdin per token. Il costo e' una select con
          * timeout zero; il guadagno e' che il gateway smette di aspettare un
@@ -10869,7 +10874,7 @@ static int q36_mux_pick(Model *m, Q36MuxReq *r, const int *eos_ids, int n_eos, i
         unsigned char chunk[256]; int cn = 0; utf8_drain(r->sbuf, &r->sbn, tmp, tn, chunk, &cn);
         if (cn > 0) serve_data(r->q.id, (char *)chunk, cn);
     }
-    r->gen++;
+    r->gen++; q36_ledger_token();
 #ifdef COLI_CUDA
     if (g_q36_mcv) q36_mtp_vocab_step(tk);   /* the draft vocabulary counts it, as a lone request's */
 #endif

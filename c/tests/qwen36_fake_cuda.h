@@ -107,6 +107,8 @@ static int fake_block_elems;
 int coli_cuda_block_elems(int fmt) { return fmt >= 100 ? fake_block_elems : 0; }
 /* device memory (the tier's arena): host memory here; fake_alloc_fail refuses it */
 static int fake_alloc_fail;
+void coli_cuda_ledger_label(const char *kind, const char *name) { (void)kind; (void)name; }
+void coli_cuda_ledger_step(void) {}
 void *coli_cuda_pipe_alloc(int device, size_t bytes) { (void)device; return fake_alloc_fail ? NULL : calloc(1, bytes ? bytes : 1); }
 void coli_cuda_pipe_free(int device, void *p) { (void)device; free(p); }
 /* an arena's slot: the fake keeps the host bytes as an upload would */

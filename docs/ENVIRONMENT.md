@@ -427,6 +427,8 @@ See [docs/vulkan.md](vulkan.md). On multi-core boxes also set `COLI_NO_OMP_TUNE=
 | `COLI_CUDA_ATTN_PREFIX` | off | Reuse one uploaded decode activation across `q_a` and `kv_a` while preserving the stock CPU RMSNorm path. |
 | `COLI_CUDA_ATTN_SHARD` | off | `=1` splits KV-b heads across devices during attention load (multi-GPU). |
 | `COLI_CUDA_PROFILE` | off | Emit CUDA timing. |
+| `LEDGER_OUT` | unset | A directory: the CUDA backends write their memory map there for [Ledger](cuda.md#per-launch-accounting-with-ledger-ledger_out). Unset: nothing is recorded. |
+| `COLI_LEDGER_WINDOW` | unset | `<skip>:<take>`: with `LEDGER_OUT`, bracket `take` generated tokens after the first `skip` (at least 1) with `cudaProfilerStart`/`Stop`. GLM, Qwen3.6 and DeepSeek V4. |
 | `COLI_MTP_GUARD_PCT` | `70` | With `COLI_SPEC_GATE=0` only (the gate of [speculative.md](speculative.md#the-gate) decides otherwise): pause MTP after the guard window when recent acceptance falls below this percentage. |
 | `COLI_MTP_GUARD_WINDOW` | `24` | With `COLI_SPEC_GATE=0` only: number of MTP proposals used by the soft acceptance guard. |
 | `COLI_CUDA_PIPE` | `0` (off) | `1` engages the multi-step attention pipeline; `2` enables the pipe2 path. |

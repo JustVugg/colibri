@@ -407,6 +407,10 @@ static void *uploader(void *arg){
         }
 
         if(!inplace){
+            char ln[64];   /* Ledger (ledger_map.h): an arena slot holds one expert, then another */
+            if(G.wfmt==QT_GGUF && G_arena_on) snprintf(ln,sizeof ln,"experts.dev%d.slot.%d",dv,aslot);
+            else snprintf(ln,sizeof ln,"layers.%d.experts.%d",layer,eid);
+            coli_cuda_ledger_label("weight",ln);
             if(G.wfmt==QT_GGUF && G_arena_on){
                 const size_t ou = G_exact ? G_lou[layer] : G_aoff_u, od = G_exact ? G_lod[layer] : G_aoff_d,
                              sl = G_exact ? G_lsl[layer] : G_aslot;
@@ -441,6 +445,7 @@ static void *uploader(void *arg){
                   && coli_cuda_tensor_upload(&tu, w+mb,   su, 2, G.D,  G.Ih, dv)
                   && coli_cuda_tensor_upload(&td, w+2*mb, sd, 2, G.Ih, G.D,  dv);
             }
+            coli_cuda_ledger_label(NULL,NULL);
         }
         free(w); free(sc);
         if(!ok){

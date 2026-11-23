@@ -56,6 +56,7 @@ long long dsv4_cuda_mem_free_mb(int device) {
 }
 int dsv4_cuda_stream_drain(int device) { drained[device]++; return device != 3; }
 void dsv4_cuda_tensor_free(Dsv4CudaTensor *t) { if (t) { live_tensors--; free(t); } }
+void dsv4_cuda_ledger_label(const char *kind, const char *name) { (void)kind; (void)name; }
 void dsv4_cuda_proj_batch_release(void) {}
 static int fp4_uploads, fp4_refills;
 int dsv4_cuda_upload_fp4(Dsv4CudaTensor **t, const uint8_t *w,

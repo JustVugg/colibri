@@ -147,6 +147,8 @@ typedef int (*fn_attention_project_batch_dev)(ColiCudaTensor *kv_b,ColiCudaTenso
 typedef int (*fn_attention_project_batch_dev_out)(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj, float *out_dev,const float *q_dev,const float *latent_dev,const float *rope_dev, int S,int H,int Q,int R,int V,int K,int T,float scale);
 typedef int (*fn_pipe_add)(int device,float *x_dev,const float *t_dev,size_t n);
 typedef void * (*fn_pipe_alloc)(int device,size_t bytes);
+typedef void (*fn_ledger_label)(const char *kind,const char *name);
+typedef void (*fn_ledger_step)(void);
 typedef int (*fn_pipe_copy2d)(int device,float *dst,int dpitch,const float *src, int spitch,int width,int height);
 typedef int (*fn_pipe_download)(int device,const void *src,void *dst,size_t bytes);
 typedef void (*fn_pipe_free)(int device,void *p);
@@ -227,6 +229,7 @@ static struct {
     fn_attention_project_batch_dev_out attention_project_batch_dev_out;
     fn_pipe_add pipe_add;
     fn_pipe_alloc pipe_alloc;
+    fn_ledger_label ledger_label; fn_ledger_step ledger_step;   /* optional: Ledger's map and window */
     fn_pipe_copy2d pipe_copy2d;
     fn_pipe_download pipe_download;
     fn_pipe_free pipe_free;
@@ -1447,6 +1450,8 @@ static int coli_cuda_load(void){
      * "not integrated" (0), so the RAM-budget correction simply doesn't apply
      * rather than taking the whole GPU backend down over one missing symbol. */
     RESOLVE_OPT(device_integrated, fn_device_integrated)
+    RESOLVE_OPT(ledger_label, fn_ledger_label)
+    RESOLVE_OPT(ledger_step, fn_ledger_step)
     RESOLVE(stats,          fn_stats)
     RESOLVE(group_stats,    fn_group_stats)
     RESOLVE(group_stats_device, fn_group_stats_device)
@@ -1870,6 +1875,14 @@ int coli_cuda_pipe_add(int device,float *x_dev,const float *t_dev,size_t n){
 void * coli_cuda_pipe_alloc(int device,size_t bytes){
     if(!g_cuda.available){ return NULL; }
     return g_cuda.pipe_alloc(device, bytes);
+}
+
+void coli_cuda_ledger_label(const char *kind,const char *name){
+    if(g_cuda.available && g_cuda.ledger_label) g_cuda.ledger_label(kind, name);
+}
+
+void coli_cuda_ledger_step(void){
+    if(g_cuda.available && g_cuda.ledger_step) g_cuda.ledger_step();
 }
 
 int coli_cuda_pipe_copy2d(int device,float *dst,int dpitch,const float *src, int spitch,int width,int height){

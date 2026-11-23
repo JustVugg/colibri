@@ -287,6 +287,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_LANG", CE_STR, 0, 0, NULL},
     {"COLI_LAYA_HEAD_MAX_LEN", CE_INT, CE_LAYA, 0, NULL},
     {"COLI_LAYA_MAX_LEN", CE_INT, CE_LAYA, 0, NULL},
+    {"COLI_LEDGER_WINDOW", CE_STR, CE_COLIBRI | CE_QWEN | CE_QWEN38 | CE_OLMOE | CE_KIMI | CE_INKLING | CE_GLM53 | CE_DSV4 | CE_DSV41, 0, NULL},   /* <skip>:<take> decode steps in Ledger's window (ledger_map.h) */
     {"COLI_LMHEAD_GPU", CE_INT, CE_QWEN | CE_QWEN38, 0, NULL},
     {"COLI_LOGIT_DUMP",                  CE_STR   , CE_ALL | CE_COLIBRI | CE_OLMOE | CE_QWEN | CE_QWEN38 | CE_DSV41 | CE_GLM53 | CE_MIMO, 0             , NULL},
     {"COLI_LOGIT_GAP",                   CE_BOOL  , CE_ALL | CE_COLIBRI | CE_OLMOE, 0             , NULL},
@@ -703,6 +704,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"KV_TQ_POLAR",                      CE_STR   , CE_COLIBRI                                      , 0             , NULL},
     {"LANG", CE_STR, 0, 0, NULL},
     {"LC_ALL", CE_STR, 0, 0, NULL},
+    {"LEDGER_OUT", CE_STR, CE_COLIBRI | CE_QWEN | CE_QWEN38 | CE_OLMOE | CE_KIMI | CE_INKLING | CE_GLM53 | CE_DSV4 | CE_DSV41, 0, NULL},   /* Ledger's capture directory: the CUDA backends write their memory map there (ledger_map.h) */
     {"LOCALAPPDATA", CE_STR, CE_COLIBRI | CE_KIMI | CE_INKLING | CE_OLMOE | CE_DSV4 | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_QWENIMAGE | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},   /* the system's: where the Vulkan pipeline cache goes (vk_pcache.h) */
     {"LOOKA",                            CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"LORA_UNSAFE", CE_STR, CE_COLIBRI, 0, NULL},

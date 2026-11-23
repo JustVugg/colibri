@@ -1117,7 +1117,7 @@ libcoli_xdna.so: backend_xdna_helper.cpp
 # shell that has the MSVC environment set (e.g. after vcvars64.bat, or from a
 # "x64 Native Tools Command Prompt"). COLI_CUDA_BUILDING_DLL enables
 # __declspec(dllexport) so the 15 API symbols are exported.
-cuda-dll: backend_cuda.cu cuda_chain.cu cu_xb.cu backend_cuda_ink.cu backend_cuda.h cuda_chain.h cu_tier_ops.h fp8_format.h backend_cuda_ink.h
+cuda-dll: backend_cuda.cu cuda_chain.cu cu_xb.cu backend_cuda_ink.cu backend_cuda.h cuda_chain.h cu_tier_ops.h fp8_format.h backend_cuda_ink.h ledger_map.h
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
 	# The banner is localized ("for x64" / "per x64" / "pour x64"): match the arch token only (#1531).
@@ -1166,7 +1166,7 @@ backend_cuda_ink.o: backend_cuda_ink.cu backend_cuda_ink.h .build-config
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	"$(NVCC)" $(NVCCFLAGS) -c backend_cuda_ink.cu -o $@
 
-backend_cuda.o: backend_cuda.cu backend_cuda.h cuda_bd.cuh cuda_chain.h fp8_format.h backend_gpu_compat.h .build-config
+backend_cuda.o: backend_cuda.cu backend_cuda.h cuda_bd.cuh cuda_chain.h fp8_format.h backend_gpu_compat.h ledger_map.h .build-config
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) -c backend_cuda.cu -o $@
 
@@ -1185,7 +1185,7 @@ cu_tier.o: cu_tier.c vk_tier.c vk_tier.h cu_tier.h cu_tier_ops.h .build-config
 	$(CC) $(CFLAGS) -c cu_tier.c -o $@
 
 
-backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h backend_cuda_dsv4_quant.cuh .build-config $(DSV4_DEEPGEMM_DEP)
+backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h backend_cuda_dsv4_quant.cuh ledger_map.h .build-config $(DSV4_DEEPGEMM_DEP)
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	"$(NVCC)" $(NVCCFLAGS) -c backend_cuda_dsv4.cu -o $@
 
@@ -1225,7 +1225,7 @@ else
 DSV4_DLL_TC =
 DSV4_DLL_LIBS = -lcublasLt -lcudart -lcuda
 endif
-cuda-dsv4-dll: backend_cuda_dsv4.cu backend_cuda_dsv4.h backend_cuda_dsv4_quant.cuh dsv4.def
+cuda-dsv4-dll: backend_cuda_dsv4.cu backend_cuda_dsv4.h backend_cuda_dsv4_quant.cuh ledger_map.h dsv4.def
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
 	@cl 2>&1 | grep -qE "x64|AMD64" || { echo "cl.exe is the 32-bit (x86) compiler: nvcc then fails inside cuda_fp16.hpp with 'asm operand type size(8)'. Open 'x64 Native Tools Command Prompt for VS 2022' (or run vcvars64.bat), not the generic Developer Command Prompt (#1405)" >&2; exit 1; }
@@ -3017,6 +3017,10 @@ tests/test_cuda_fmt_guard$(EXE): tests/test_cuda_fmt_guard.c
 # logic on a plain CPU build.
 tests/test_cuda_lut_gate$(EXE): tests/test_cuda_lut_gate.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# ledger_map.h is C++ (the CUDA backends include it): its test is too
+tests/test_ledger_map$(EXE): tests/test_ledger_map.cpp
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -MMD -MP $< -o $@
 
 tests/test_fp8_load$(EXE): tests/test_fp8_load.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
