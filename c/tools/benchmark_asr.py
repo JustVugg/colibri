@@ -67,10 +67,10 @@ def proc_rss_kb(pid):
         return None
     return None
 
-def bench_colibri(args, samples, env):
+def bench_colibri(args, samples, env, gguf=None, mmproj=None, engine_name=None):
     cmd=[args.colibri, "--model", args.model]
-    if args.gguf: cmd += ["--gguf", args.gguf]
-    if args.mmproj: cmd += ["--mmproj", args.mmproj]
+    if gguf: cmd += ["--gguf", gguf]
+    if mmproj: cmd += ["--mmproj", mmproj]
     cmd += ["--serve"]
     p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
     ready = False
@@ -81,9 +81,11 @@ def bench_colibri(args, samples, env):
         if b"READY" in line: ready = True; break
     load_s = time.time() - t0
     if not ready:
+        err = p.stderr.read().decode(errors="ignore")[-2000:]
         p.kill(); p.wait(timeout=5)
-        raise RuntimeError("colibri engine did not become READY")
+        raise RuntimeError(f"colibri engine not READY: {err}")
     rows = []
+    if engine_name is None: engine_name = "colibri-gguf" if gguf else "colibri"
     for rep in range(args.repeats):
         for si, (name, ref, wav) in enumerate(samples):
             audio_b64 = base64.b64encode(open(wav, "rb").read()).decode()
@@ -102,7 +104,6 @@ def bench_colibri(args, samples, env):
                 if line.startswith(f"ERROR r{rep}_{si} ".encode()): err = line.decode(errors="ignore").strip(); break
             dt = time.time() - t0; dur = wav_dur(wav)
             we, wn = wer(ref, text); ce, cn = cer(ref, text)
-            engine_name = "colibri-gguf" if args.gguf else "colibri"
             rows.append({"engine":engine_name,"sample":name,"rep":rep,"cold":rep==0 and si==0,"wer":f"{we}/{wn}","cer":f"{ce}/{cn}","rtf":round(dt/dur,4),"wall_s":round(dt,4),"audio_s":round(dur,4),"load_s":round(load_s,4),"rss_peak_kb":proc_rss_kb(p.pid),"text":text,"error":err})
     p.terminate()
     try: p.wait(timeout=5)
@@ -137,6 +138,8 @@ def main():
     ap.add_argument("--llama-cli")
     ap.add_argument("--gguf")
     ap.add_argument("--mmproj")
+    ap.add_argument("--colibri-gguf")
+    ap.add_argument("--colibri-mmproj")
     ap.add_argument("--workdir", default="/tmp/opencode/bench_wavs")
     ap.add_argument("--timeout", type=int, default=300)
     ap.add_argument("--repeats", type=int, default=1)
@@ -147,14 +150,20 @@ def main():
     env = os.environ.copy()
     if args.omp_threads: env["OMP_NUM_THREADS"] = str(args.omp_threads)
     samples = ensure_samples(args.workdir)
+    c_gguf = args.colibri_gguf or args.gguf
+    c_mmproj = args.colibri_mmproj or args.mmproj
     meta = {"platform": platform.platform(), "python": sys.version.split()[0], "machine": platform.machine(), "processor": platform.processor(),
             "omp_num_threads": env.get("OMP_NUM_THREADS"), "cpu_count": os.cpu_count(), "repeats": args.repeats,
-            "model": args.model, "gguf": args.gguf, "mmproj": args.mmproj}
-    colibri_rows, colibri_cmd = bench_colibri(args, samples, env)
+            "model": args.model, "gguf": args.gguf, "mmproj": args.mmproj, "colibri_gguf": c_gguf, "colibri_mmproj": c_mmproj}
+    colibri_rows, colibri_cmd = bench_colibri(args, samples, env, gguf=None, mmproj=None, engine_name="colibri-bf16")
+    colibri_gguf_rows, colibri_gguf_cmd = ([], None)
+    if c_gguf:
+        colibri_gguf_rows, colibri_gguf_cmd = bench_colibri(args, samples, env, gguf=c_gguf, mmproj=c_mmproj, engine_name="colibri-gguf")
     llama_rows, llama_cmd = bench_llama(args, samples, env)
     meta["colibri_cmd"] = colibri_cmd
+    meta["colibri_gguf_cmd"] = colibri_gguf_cmd
     meta["llama_cmd"] = llama_cmd
-    rows = colibri_rows + llama_rows
+    rows = colibri_rows + colibri_gguf_rows + llama_rows
     report = {"meta": meta, "rows": rows}
     text = json.dumps(report, indent=2)
     if args.out:
