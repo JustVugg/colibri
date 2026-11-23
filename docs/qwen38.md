@@ -445,6 +445,17 @@ bit across paths, the same fixture's FP8 experts give the same tokens and
 last logits within cosine 0.99999, and every refusal above is checked in its
 own process.
 
+The grouped MoE (decode rows, MTP verifies and prompt chunks of up to 256 rows
+grouped by expert, two parallel regions a layer, `Q38_MOE_GROUPED`) takes MXFP4
+experts too: `quant.h`'s `matmul_mxfp4_rows` computes a block of a matrix's rows
+for the rows each expert received, every element the bits `matmul_mxfp4` gives
+for that row. Before, MXFP4 had no row kernel there and every assignment ran
+alone, three parallel regions per expert and row. The tiny fixture's experts are
+narrower than one scale group, so `make -C c qwen38-tiny-mxfp4-grouped-check`
+builds one with 256-wide experts (`--geometry gguf-256`) and checks the grouped
+runs, the prompt batch and `Q38_ROUTE_PAR=1` / `Q38_GROUP_KEEP=1` against the
+decode loop's last logits, to the bit.
+
 ## Speculative decoding with the MTP head
 
 On by default from 1.13.0 when the checkpoint has it (`Q38_MTP=0` turns it off, and

@@ -1600,6 +1600,8 @@ jobs:
         run: make -C c qwen38-tiny-int4-check qwen38-tiny-mirror-check
       - name: Routed experts as AMD Quark's MXFP4 from the converter's sidecar
         run: make -C c qwen38-tiny-mxfp4-check
+      - name: MXFP4 experts on the grouped MoE path against the decode loop (bit identity)
+        run: make -C c qwen38-tiny-mxfp4-grouped-check
       - name: MTP speculative decoding against plain decoding (lossless gate)
         run: make -C c qwen38-tiny-mtp-check
       - name: Repeat the eviction path under ASan and UBSan

@@ -4610,6 +4610,58 @@ static void q38_expert_row(Model *m,int layer,int eid,const float *xs,float *eg,
     q38_tm_add(m,Q38_TM_ROUTED_EXPERT,started);
 }
 
+/* ---- the router's top-k -------------------------------------------------------
+ * Every MoE path routes a row the same way: the softmax terms of the router's row, the top-k
+ * by strict > (the lower id on a tie, no NaN picked: the -1 floor), rt_router_pick's fallback
+ * for ranks left without a candidate, and the gates over the top-k's sum (norm_topk) or all.
+ * Q38_ROUTE_PAR=1 (default off) picks the top-k in one pass over the experts instead of K
+ * passes with a "used" scan, and routes a block of Q38_ROUTE_PAR_MIN (16) rows or more in one
+ * parallel region. Both are exact: the same ranks, values and gates, and the route trace
+ * (rt_route) still sees the rows in order, after the block is routed. */
+static int g_q38_route_par=-1,g_q38_route_par_min=16;
+static int q38_route_par_on(void) {   /* read once, on the main thread (outside any region) */
+    if(g_q38_route_par<0){
+        g_q38_route_par=q38_env_bool("Q38_ROUTE_PAR",0);
+        const char *v=getenv("Q38_ROUTE_PAR_MIN");
+        if(v&&*v){
+            char *end=NULL;long n=strtol(v,&end,10);
+            if(!end||*end||n<1||n>65536){fprintf(stderr,"Q38_ROUTE_PAR_MIN must be 1 to 65536\n");exit(1);}
+            g_q38_route_par_min=(int)n;
+        }
+    }
+    return g_q38_route_par;
+}
+/* the K-pass's ranks and values: the candidates kept in (p descending, index ascending)
+ * order, the first K of them, then the fallback. An equal p never moves an earlier index
+ * down (strict >), and !(v > -1) skips NaN as the K-pass's floor does. */
+static void q38_topk_onepass(const float *p,int E,int K,int layer,int *idx,float *val) {
+    int n=0;
+    for(int e=0;e<E;e++){
+        float v=p[e];
+        if(!(v>-1.f)||(n==K&&!(v>val[K-1])))continue;
+        int z=n<K?n++:K-1;
+        for(;z>0&&v>val[z-1];z--){val[z]=val[z-1];idx[z]=idx[z-1];}
+        val[z]=v;idx[z]=e;
+    }
+    for(int z=n;z<K;z++){idx[z]=rt_router_pick(-1,z,E,layer);val[z]=p[idx[z]];}
+}
+/* lg: the router's raw row, turned into its softmax terms in place; idx, gates: K each.
+ * Reads nothing shared (rt_router_pick only sets a warn-once flag), so rows may run in
+ * parallel. */
+static void q38_route_probs(float *lg,int E,int K,int layer,int norm_topk,int onepass,int *idx,float *gates) {
+    float mx=lg[0];for(int e=1;e<E;e++)if(lg[e]>mx)mx=lg[e];
+    double all=0;for(int e=0;e<E;e++){lg[e]=expf(lg[e]-mx);all+=lg[e];}
+    float val[Q38_MAX_TOPK];
+    if(onepass)q38_topk_onepass(lg,E,K,layer,idx,val);
+    else for(int z=0;z<K;z++){
+        int best=-1;float bv=-1.f;
+        for(int e=0;e<E;e++){int used=0;for(int j=0;j<z;j++)if(idx[j]==e)used=1;if(!used&&lg[e]>bv){bv=lg[e];best=e;}}
+        idx[z]=rt_router_pick(best,z,E,layer);val[z]=lg[idx[z]];
+    }
+    double top=0;for(int z=0;z<K;z++)top+=val[z];double den=norm_topk?top:all;
+    for(int z=0;z<K;z++)gates[z]=(float)(val[z]/den);
+}
+
 /* ---- decode rows grouped by expert --------------------------------------------
  * The decode loop below runs every routed expert of every row on its own: three
  * parallel regions per expert and row, about 90 a layer for an MTP verify of 3 rows,
@@ -4617,7 +4669,7 @@ static void q38_expert_row(Model *m,int layer,int eid,const float *xs,float *eg,
  * experts loaded as one batch, and one parallel region runs gate+up over (expert, row
  * block) items for all the rows each expert received, the hidden rows, then down.
  * Every output row comes from the per-row kernel q38_weight_matmul calls for that
- * matrix (q38_matmul_int4g64, x2_matmul, xl_matmul, matmul_fp8 without FMA: a row's bits do not depend on how
+ * matrix (q38_matmul_int4g64, x2_matmul, xl_matmul, matmul_fp8 without FMA, matmul_mxfp4: a row's bits do not depend on how
  * many activation rows share the call), and each row's sum is added in rank order as
  * the decode loop adds it, so the output is the decode loop's to the bit.
  * Q38_MOE_GROUPED=0 keeps the decode loop. */
@@ -4627,13 +4679,14 @@ enum { Q38_ROWS_NONE = 0, Q38_ROWS_F32 = 1, Q38_ROWS_X2 = 2, Q38_ROWS_GQ = 3 };
  * expert, a few rows each: a 32-row chunk of ISTA's Qwen3.8 spent a third of its threads'
  * time waiting at their barriers. Here a layer is two regions for all its experts. */
 #define Q38_GROUPED_ROWS 256
-/* how a routed expert's matrix takes its input here: f32 (int4-g64), int8 per 32
+/* how a routed expert's matrix takes its input here: f32 (int4-g64, MXFP4), int8 per 32
  * (int2-g32, int2-g16, int3-g16), a GGUF block type's integer form (gq_act), or not
  * at all (GQ_EXACT=1's float path among them) */
 static int q38_rows_kind(const Q38Weight *w) {
     if(!w->data||w->q4||w->q8||w->gpu||w->act2)return Q38_ROWS_NONE;
     if(w->kind==Q38_WEIGHT_INT4G64&&w->r16)return Q38_ROWS_GQ;   /* xf16 rows take gq_act */
     if(w->kind==Q38_WEIGHT_INT4G64&&w->scales)return Q38_ROWS_F32;
+    if(w->kind==Q38_WEIGHT_MXFP4&&w->x2q)return Q38_ROWS_F32;   /* quant.h matmul_mxfp4_rows */
 #ifdef COLI_FP8_NOFMA_LANES
     if(w->kind==Q38_WEIGHT_FP8&&w->scales)return Q38_ROWS_F32;   /* quant.h matmul_fp8_nofma_part */
 #endif
@@ -4661,6 +4714,7 @@ static int q38_layer_fp8_rows(Model *m,int layer) {
  * xq/dx the int8-per-32 ones ([n][I], [n][I/32]), ga the GGUF types' (n rows) */
 static void q38_rows(float *y,int ys,const Q38Weight *w,int I,int r0,int r1,
                      const float *const *xr,const int8_t *xq,const float *dx,const gq_act *ga,int n) {
+    if(w->kind==Q38_WEIGHT_MXFP4){matmul_mxfp4_rows(y,ys,(const uint8_t*)w->data,w->x2q,I,r0,r1,xr,n);return;}
 #ifdef COLI_FP8_NOFMA_LANES
     if(w->kind==Q38_WEIGHT_FP8){matmul_fp8_nofma_part(y,ys,(const uint8_t*)w->data,w->scales,I,r0,r1,xr,n);return;}
 #endif
@@ -4780,7 +4834,19 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
     /* scratch: routes, then per assignment in grouped order its input and outputs */
     float *logits=falloc((int64_t)S*E),*gates=falloc(np),*sg=falloc((int64_t)S*SI),*su=falloc((int64_t)S*SI);
     float *sh=falloc((int64_t)S*SI),*shared=falloc((int64_t)S*H),*sgate=falloc(S);
-    float *eg=falloc((int64_t)np*I),*eu=falloc((int64_t)np*I),*ehf=falloc((int64_t)np*I),*eo=falloc((int64_t)np*H);
+    /* Q38_GROUP_KEEP=1 (default off): the four per-assignment buffers below, (3I + H) floats
+     * an assignment (46 MB for 256 rows of Qwen3.8's top-10), kept between calls and grown
+     * when a call needs more, instead of a fresh allocation that size (a fresh mapping, its
+     * pages faulted in again) at every layer. Every element a call reads it wrote first.
+     * One workspace: this runs on the engine's main thread only. */
+    static int keep=-1;static float *kept;static int64_t kept_n;
+    if(keep<0)keep=q38_env_bool("Q38_GROUP_KEEP",0);
+    float *eg,*eu,*ehf,*eo;
+    if(keep){
+        const int64_t need=(int64_t)np*(3*I+H);
+        if(need>kept_n){free(kept);kept=falloc(need);kept_n=need;}
+        eg=kept;eu=eg+(int64_t)np*I;ehf=eu+(int64_t)np*I;eo=ehf+(int64_t)np*I;
+    } else {eg=falloc((int64_t)np*I);eu=falloc((int64_t)np*I);ehf=falloc((int64_t)np*I);eo=falloc((int64_t)np*H);}
     float *dxt=falloc((int64_t)S*(H/32)),*dxg=falloc((int64_t)np*(H/32)),*ehdx=falloc((int64_t)np*(I/32));
     int8_t *xqt=(int8_t*)malloc((size_t)S*H),*xg=(int8_t*)malloc((size_t)np*H),*ehq=(int8_t*)malloc((size_t)np*I);
     gq_act gin,gh;memset(&gin,0,sizeof gin);memset(&gh,0,sizeof gh);   /* the GGUF kinds' inputs, grouped order */
@@ -4796,15 +4862,12 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
     if(idx_in){memcpy(idx,idx_in,(size_t)np*sizeof(int));memcpy(gates,gates_in,(size_t)np*sizeof(float));}
     else if(logits_in)memcpy(logits,logits_in,(size_t)S*E*sizeof(float));
     else q38_dense_matmul(m,logits,x,&l->router,S,H,E);
-    for(int s=0;s<S&&!idx_in;s++){
-        float *lg=logits+(int64_t)s*E;
-        float mx=lg[0];for(int e=1;e<E;e++)if(lg[e]>mx)mx=lg[e];
-        double all=0;for(int e=0;e<E;e++){lg[e]=expf(lg[e]-mx);all+=lg[e];}
-        int *ix=idx+(int64_t)s*K;float val[Q38_MAX_TOPK];
-        for(int z=0;z<K;z++){int best=-1;float bv=-1.f;for(int e=0;e<E;e++){int used=0;for(int j=0;j<z;j++)if(ix[j]==e)used=1;if(!used&&lg[e]>bv){bv=lg[e];best=e;}}ix[z]=rt_router_pick(best,z,E,layer);val[z]=lg[ix[z]];}
-        double top=0;for(int z=0;z<K;z++)top+=val[z];double den=c->norm_topk?top:all;
-        for(int z=0;z<K;z++)gates[s*K+z]=(float)(val[z]/den);
-        rt_route(layer,row0+s,ix,gates+(int64_t)s*K,K);
+    if(!idx_in){
+        const int onepass=q38_route_par_on(),par=onepass&&S>=g_q38_route_par_min;
+        #pragma omp parallel for schedule(static) if(par)
+        for(int s=0;s<S;s++)
+            q38_route_probs(logits+(int64_t)s*E,E,K,layer,c->norm_topk,onepass,idx+(int64_t)s*K,gates+(int64_t)s*K);
+        for(int s=0;s<S;s++)rt_route(layer,row0+s,idx+(int64_t)s*K,gates+(int64_t)s*K,K);
     }
     /* the CUDA tier's residents of the row run on the device from here on (qt_take adds them
      * after the CPU's, as the loop does); the rest are this function's */
@@ -4949,7 +5012,8 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
     }
     rt_trace_end();
     free(logits);free(gates);free(sg);free(su);free(sh);free(shared);free(sgate);
-    free(eg);free(eu);free(ehf);free(eo);free(dxt);free(dxg);free(ehdx);free(xqt);free(xg);free(ehq);
+    if(!keep){free(eg);free(eu);free(ehf);free(eo);}
+    free(dxt);free(dxg);free(ehdx);free(xqt);free(xg);free(ehq);
     free(idx);free(pos);free(uniq);free(cnt);free(start);free(who);free(pos_row);free(xr);free(hr);free(slot);free(ondev);
     gq_act_free(&gin);gq_act_free(&gh);
     return 1;
@@ -4972,13 +5036,8 @@ static void q38_moe_decode_ex(Model *m,Layer *l,int layer,const float *x,int S,f
         if(g_q38_cov)q38_cov_add(layer,xs,1);
         if(logits_in)memcpy(logits,logits_in+(int64_t)s*E,(size_t)E*sizeof(float));
         else q38_dense_matmul(m,logits,xs,&l->router,1,H,E);
-        float mx=logits[0];for(int e=1;e<E;e++)if(logits[e]>mx)mx=logits[e];
-        double all=0;for(int e=0;e<E;e++){logits[e]=expf(logits[e]-mx);all+=logits[e];}
-        int idx[Q38_MAX_TOPK];float val[Q38_MAX_TOPK];
-        for(int z=0;z<K;z++){int best=-1;float bv=-1.f;for(int e=0;e<E;e++){int used=0;for(int j=0;j<z;j++)if(idx[j]==e)used=1;if(!used&&logits[e]>bv){bv=logits[e];best=e;}}idx[z]=rt_router_pick(best,z,E,layer);val[z]=logits[idx[z]];}
-        double top=0;for(int z=0;z<K;z++)top+=val[z];double den=c->norm_topk?top:all;
-        float route_gates[Q38_MAX_TOPK];
-        for(int z=0;z<K;z++) route_gates[z]=(float)(val[z]/den);
+        int idx[Q38_MAX_TOPK];float route_gates[Q38_MAX_TOPK];
+        q38_route_probs(logits,E,K,layer,c->norm_topk,q38_route_par_on(),idx,route_gates);
         rt_route(layer,s,idx,route_gates,K); /* shared counts + post-normalization trace */
         if(g_q38_dump)q38_dump_add(layer,xs,idx,route_gates,K,H);
         /* Resident experts run on the GPU from here on (asynchronously); the
@@ -5151,38 +5210,17 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
          * deterministic fallback for invalid logits. */
         if(logits_in)memcpy(logits,logits_in+(int64_t)base*E,(size_t)rows*E*sizeof(float));
         else q38_dense_matmul(m,logits,x+(int64_t)base*H,&l->router,rows,H,E);
+        const int onepass=q38_route_par_on(),par=onepass&&rows>=g_q38_route_par_min;
+        #pragma omp parallel for schedule(static) if(par)
         for(int s=0;s<rows;s++) {
-            float *probabilities=logits+(int64_t)s*E;
-            float maximum=probabilities[0];
-            for(int e=1;e<E;e++)if(probabilities[e]>maximum)maximum=probabilities[e];
-            double total=0.0;
-            for(int e=0;e<E;e++) {
-                probabilities[e]=expf(probabilities[e]-maximum);
-                total+=probabilities[e];
-            }
-            int selected[Q38_MAX_TOPK];
-            float selected_probability[Q38_MAX_TOPK];
+            int selected[Q38_MAX_TOPK];float gates[Q38_MAX_TOPK];
+            q38_route_probs(logits+(int64_t)s*E,E,K,layer,c->norm_topk,onepass,selected,gates);
+            for(int rank=0;rank<K;rank++)routes[s*K+rank]=(Q38RouteAssignment){selected[rank],gates[rank]};
+        }
+        for(int s=0;s<rows;s++) {
+            int selected[Q38_MAX_TOPK];float gates[Q38_MAX_TOPK];
             for(int rank=0;rank<K;rank++) {
-                int best=-1;float best_value=-1.f;
-                for(int e=0;e<E;e++) {
-                    int used=0;
-                    for(int previous=0;previous<rank;previous++)
-                        if(selected[previous]==e){used=1;break;}
-                    if(!used&&probabilities[e]>best_value){
-                        best_value=probabilities[e];best=e;
-                    }
-                }
-                selected[rank]=rt_router_pick(best,rank,E,layer);
-                selected_probability[rank]=probabilities[selected[rank]];
-            }
-            double top=0.0;
-            for(int rank=0;rank<K;rank++)top+=selected_probability[rank];
-            double denominator=c->norm_topk?top:total;
-            float gates[Q38_MAX_TOPK];
-            for(int rank=0;rank<K;rank++) {
-                gates[rank]=(float)(selected_probability[rank]/denominator);
-                int assignment=s*K+rank;
-                routes[assignment]=(Q38RouteAssignment){selected[rank],gates[rank]};
+                selected[rank]=routes[s*K+rank].expert;gates[rank]=routes[s*K+rank].gate;
                 group_counts[selected[rank]]++;
             }
             rt_route(layer,base+s,selected,gates,K);
