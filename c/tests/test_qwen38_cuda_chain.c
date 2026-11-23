@@ -376,6 +376,25 @@ int main(void) {
         for (int i = 0; i < 4; i++) none = none && !kc[i] && !vc[i] && !ik[i] && !pk[i];
         tk(placed && r4 == 0 && rc.cap == 0 && none && fake_chain_dev_bytes == b0, "a refused growth leaves no mirror on the card");
         fake_chain_dev_cap = 0; rm.kv_cap = 32;
+        {   /* a verify's table of copies (q38cc_snap_tab) over chunks of 2 rows (COLI_CUDA_CHAIN_ROWS
+             * under the verify's 4): the second chunk's entries (slots 2, 3) beside the first's, not over
+             * them, so a replayed graph of either chunk, which does not rewrite the table, reads its own */
+            static Q38CChain tc; static CcBuf *rs[4][3], *gs[4][3];
+            const size_t sz = fake_chain_table.size; fake_chain_table.size = sizeof fake_chain_table;   /* dev_addr offered */
+            int ok = 1, own = 1, ro0 = 0, rg0 = 0, ro1 = 0, rg1 = 0;
+            for (int s = 0; s < 4; s++) {
+                tc.rec_snap[s] = rs[s]; tc.ring_snap[s] = gs[s];
+                for (int i = 0; i < 3; i++) ok = ok && (rs[s][i] = cc_buf(16, CC_DEV)) && (gs[s][i] = cc_buf(16, CC_DEV));
+            }
+            ok = ok && q38cc_snap_tab(&tc, &rm, 1, 0, 2, &ro0, &rg0) && q38cc_snap_tab(&tc, &rm, 1, 2, 2, &ro1, &rg1);
+            for (int r = 0; r < 2 && ok; r++)
+                own = own && fcc_snap_at(tc.snap_tab, ro0, r) == rs[r][1]->d && fcc_snap_at(tc.snap_tab, rg0, r) == gs[r][1]->d &&
+                      fcc_snap_at(tc.snap_tab, ro1, r) == rs[2 + r][1]->d && fcc_snap_at(tc.snap_tab, rg1, r) == gs[2 + r][1]->d;
+            tk(ok && own, "a verify in two chunks: each chunk's table entries its own copies");
+            for (int s = 0; s < 4; s++) for (int i = 0; i < 3; i++) { cc_free(rs[s][i]); cc_free(gs[s][i]); }
+            cc_free(tc.snap_tab);
+            fake_chain_table.size = sz;
+        }
         g_cuda_chain = chain0;
     }
 

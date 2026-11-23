@@ -1102,12 +1102,15 @@ static int q38cc_snap_tab(Q38CChain *ch, Model *m, int i, int c0, int ns, int *r
     if (!on || ns < 2 || c0 + ns > Q38_SPEC_SNAPS || !cc_dev_addr_ready() ||
         !cc_reserve(&ch->snap_tab, (size_t)L * 2 * Q38_SPEC_SNAPS * 2 * sizeof(float), CC_UP)) return 0;
     unsigned long long *t = (unsigned long long *)cc_ptr(ch->snap_tab) + (size_t)i * 2 * Q38_SPEC_SNAPS;
+    /* slot c0 + r, not r: a step of several chunks (COLI_CUDA_CHAIN_ROWS under the verify's rows) gives
+     * each chunk its own entries, so neither the next chunk's write nor a graph's replay (which does not
+     * rewrite them) leaves a chunk reading another one's copies */
     for (int r = 0; r < ns; r++) {
         const void *a = cc_dev_addr(ch->rec_snap[c0 + r][i]), *b = cc_dev_addr(ch->ring_snap[c0 + r][i]);
         if (!a || !b) return 0;
-        t[r] = (unsigned long long)(uintptr_t)a; t[Q38_SPEC_SNAPS + r] = (unsigned long long)(uintptr_t)b;
+        t[c0 + r] = (unsigned long long)(uintptr_t)a; t[Q38_SPEC_SNAPS + c0 + r] = (unsigned long long)(uintptr_t)b;
     }
-    *rec_off = i * 2 * Q38_SPEC_SNAPS * 2; *ring_off = *rec_off + Q38_SPEC_SNAPS * 2;
+    *rec_off = (i * 2 * Q38_SPEC_SNAPS + c0) * 2; *ring_off = *rec_off + Q38_SPEC_SNAPS * 2;
     return 1;
 }
 static int q38cc_deltanet(Q38CChain *ch, Model *m, Layer *l, int i, int n, int c0, int ns) {
