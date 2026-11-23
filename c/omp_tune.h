@@ -106,6 +106,21 @@ static int coli_count_windows_physical_cores(const void *buf, DWORD bytes)
 }
 #endif
 
+/* Apple Silicon's team out of its perflevel tiers (fastest first): every tier but the
+ * efficiency ones, eff[i] telling which (1), which not (0), or unknown (-1). The names
+ * decide when the system gives them all: an M5 Pro's two tiers are "Super" and
+ * "Performance" and neither is an efficiency tier (#2938). Without them the last tier
+ * is taken for the efficiency one, as on an M1-M4 (P + E) and an M6 (Super +
+ * Performance + Efficiency, #2194). One tier, or only efficiency tiers: every core. */
+static int coli_apple_team(int n, const int *cpus, const int *eff)
+{
+    int named = 1, tot = 0, all = 0;
+    for (int i = 0; i < n; i++) { named &= eff[i] >= 0; all += cpus[i] > 0 ? cpus[i] : 0; }
+    for (int i = 0; i < n; i++)
+        if (cpus[i] > 0 && (named ? !eff[i] : (n == 1 || i < n - 1))) tot += cpus[i];
+    return tot > 0 ? tot : all;
+}
+
 static int coli_physical_cores(void)
 {
 #if defined(_WIN32)
@@ -124,18 +139,24 @@ static int coli_physical_cores(void)
     /* Apple Silicon: every core but the efficiency tier's. hw.physicalcpu counts
      * the E-cores too (10 on an M1 Max), and with a barrier per matmul the slowest
      * thread sets the pace: the E-cores slowed the team (#707, -4.2% decode). The
-     * tiers are hw.perflevel0 .. hw.perflevel(N-1), fastest first, the last the
-     * efficiency cores: an M1-M4 has two (perflevel0, its P-cores), an M6 three
-     * (2 Super, 4 Performance, 6 Efficiency: 6, not perflevel0's 2, #2194); one
-     * tier is every core. An Intel Mac has no perflevel*: hw.physicalcpu. */
+     * tiers are hw.perflevel0 .. hw.perflevel(N-1), fastest first, each with its
+     * name (coli_apple_team picks them). An Intel Mac has no perflevel*:
+     * hw.physicalcpu. */
     int n = 0; size_t sz = sizeof(n);
     if (sysctlbyname("hw.nperflevels", &n, &sz, NULL, 0) == 0 && n >= 1) {
-        int tot = 0, last = n > 1 ? n - 1 : 1;
-        for (int i = 0; i < last && i < 16; i++) {
-            char nm[48]; snprintf(nm, sizeof nm, "hw.perflevel%d.logicalcpu", i);
-            int c = 0; sz = sizeof(c);
-            if (sysctlbyname(nm, &c, &sz, NULL, 0) == 0 && c > 0) tot += c;
+        int cpus[16] = {0}, eff[16];
+        if (n > 16) n = 16;
+        for (int i = 0; i < n; i++) {
+            char nm[48], name[32]; snprintf(nm, sizeof nm, "hw.perflevel%d.logicalcpu", i);
+            sz = sizeof(cpus[i]);
+            if (sysctlbyname(nm, &cpus[i], &sz, NULL, 0) != 0) cpus[i] = 0;
+            snprintf(nm, sizeof nm, "hw.perflevel%d.name", i);
+            sz = sizeof(name); eff[i] = -1;
+            if (sysctlbyname(nm, name, &sz, NULL, 0) == 0 && sz > 0 && sz <= sizeof(name)) {
+                name[sz - 1] = 0; eff[i] = !strcmp(name, "Efficiency");
+            }
         }
+        const int tot = coli_apple_team(n, cpus, eff);
         if (tot > 0) return tot;
     }
     int v = 0; sz = sizeof(v);

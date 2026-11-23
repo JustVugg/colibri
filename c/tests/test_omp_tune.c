@@ -116,8 +116,33 @@ static int test_cgroup_cpu_quota_bound(void)
 static int test_cgroup_cpu_quota_bound(void) { return 0; }
 #endif
 
+/* Apple Silicon's tiers (coli_apple_team): every tier but the efficiency ones by name, the
+ * last one taken for efficiency when a name is missing. A pure function, checked on any OS. */
+static int test_apple_tiers(void)
+{
+    static const struct { const char *chip; int n, cpus[3], eff[3], want; } cases[] = {
+        {"M1 Max: Performance + Efficiency", 2, {8, 2}, {0, 1}, 8},
+        {"M6: Super + Performance + Efficiency (#2194)", 3, {2, 4, 6}, {0, 0, 1}, 6},
+        {"M5 Pro: Super + Performance, no efficiency tier (#2938)", 2, {6, 12}, {0, 0}, 18},
+        {"no names: the last tier is the efficiency one", 2, {6, 12}, {-1, -1}, 6},
+        {"one name missing: the same", 3, {2, 4, 6}, {0, -1, 1}, 6},
+        {"one tier: every core", 1, {8}, {-1}, 8},
+        {"only efficiency tiers: every core", 1, {4}, {1}, 4},
+    };
+    int fail = 0;
+    for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
+        const int got = coli_apple_team(cases[i].n, cases[i].cpus, cases[i].eff);
+        if (got != cases[i].want) {
+            fprintf(stderr, "apple tiers, %s: got %d, want %d\n", cases[i].chip, got, cases[i].want);
+            fail = 1;
+        }
+    }
+    return fail;
+}
+
 int main(void)
 {
+    if (test_apple_tiers()) return 1;
 #ifndef _OPENMP
     puts("test_omp_tune: ok (OpenMP unavailable; helper is a no-op)");
     return 0;
