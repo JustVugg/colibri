@@ -5,6 +5,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### New
+
+- **qwen38: the MXFP4 experts (`experts-mxfp4/`, `Q38_EXPERT_LOWBIT=mxfp4`) stream to the CUDA
+  expert tier**, fmt 7 in the tier's copy mode (`qt_init_mxfp4`): an expert the CPU computed goes
+  to the card when it is hot, its nibbles and ue8m0 scale bytes as the record has them, and the
+  card computes it with the grouped MXFP4 kernels; the tier's warm start reads the most used
+  records at load. Before, `COLI_CUDA=1` kept these experts on the CPU, and the RAM held the whole
+  working set. An expert takes 3.2 MiB of VRAM against 6.0 MiB for FP8. The planner prices the card
+  with the records and no longer refuses a GPU for this sidecar (it still does for the int4 and
+  low-bit ones, and for MXFP4 under the Vulkan tier). `make -C c qwen38-tiny-mxfp4-check` checks
+  it on the fake backend: with every group refused the last logits are the CPU run's to the bit,
+  with the fake computing the residents the tokens are the oracle's;
+  `tests/test_qwen36_tier_mxfp4.c` pins the staging and the uploads.
+
 ## [2.2.0] - 2026-11-21
 
 ### New

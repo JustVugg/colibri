@@ -583,6 +583,8 @@ TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_frami
 TEST_EXCLUDE += test_vk_chain test_vk_memtype test_glm53_vk_f32 test_vk_dev2_window test_vk_pcache
 # needs a CUDA device and the CUDA objects: make tests/test_cu_tier CUDA=1
 TEST_EXCLUDE += test_cu_tier
+# the same: make tests/test_qwen36_tier_mxfp4_gpu CUDA=1 (Windows: CUDA_DLL=1)
+TEST_EXCLUDE += test_qwen36_tier_mxfp4_gpu
 # takes a fixture and the CPU build's logits on its command line (ci.yml, the int4 gs64 A/B step)
 TEST_EXCLUDE += test_qwen36_tier_stream_engine
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
@@ -1960,10 +1962,15 @@ qwen38-tiny-mxfp4-generate:
 #      of the same fixture reproduce it too, so both runs give the same tokens;
 #  (c) the two runs' last logits within cosine 0.99999, the refusals (another geometry, an
 #      incomplete conversion, a record not of the layout, no sidecar, an unknown
-#      Q38_EXPERT_LOWBIT) and the CUDA tier declining MXFP4 (tests/qwen38_mxfp4_engine_check.py);
-#  (d) the sidecar read from COLI_MODEL_MIRROR copies, as the int4 one (tests/qwen38_mirror_check.py).
+#      Q38_EXPERT_LOWBIT) and ref.json under COLI_CUDA=1, the experts on the CUDA tier where the
+#      build has a card, else on the CPU (tests/qwen38_mxfp4_engine_check.py);
+#  (d) the sidecar read from COLI_MODEL_MIRROR copies, as the int4 one (tests/qwen38_mirror_check.py);
+#  (e) the CUDA tier's fmt 7 copy mode on the fake backend: every group refused, the last logits
+#      the CPU run's to the bit; the fake computing the residents, the oracle's tokens and the
+#      logits within 1e-6, the same bits run to run (tests/test_qwen38_tier_engine).
 .PHONY: qwen38-tiny-mxfp4-check
-qwen38-tiny-mxfp4-check: qwen38-tiny-mxfp4-generate qwen38$(EXE) tests/test_qwen38_mxfp4_experts$(EXE)
+qwen38-tiny-mxfp4-check: qwen38-tiny-mxfp4-generate qwen38-tiny-fp8-generate qwen38$(EXE) \
+		tests/test_qwen38_mxfp4_experts$(EXE) tests/test_qwen38_tier_engine$(EXE)
 	OMP_NUM_THREADS=2 ./tests/test_qwen38_mxfp4_experts$(EXE) ./qwen38_tiny_mxfp4
 	@d=./qwen38_tiny_mxfp4/logits; rm -rf $$d; mkdir -p $$d; n=0; \
 	for trunk in 1024 0; do for cap in 1 2 4; do for mode in single batched prefill prefill-serial mapped; do \
@@ -1989,6 +1996,7 @@ qwen38-tiny-mxfp4-check: qwen38-tiny-mxfp4-generate qwen38$(EXE) tests/test_qwen
 	$(PYTHON) tests/qwen38_mxfp4_engine_check.py --model ./qwen38_tiny_mxfp4 --engine ./qwen38$(EXE) \
 		--mxfp4 ./qwen38_tiny_mxfp4/logits/t1024-c2-batched.f32 --fp8 ./qwen38_tiny_mxfp4/logits/fp8.f32
 	$(PYTHON) tests/qwen38_mirror_check.py --model ./qwen38_tiny_mxfp4 --engine ./qwen38$(EXE) --lowbit mxfp4 --ref ref.json
+	./tests/test_qwen38_tier_engine$(EXE) ./qwen38_tiny_mxfp4
 
 # The int4 fixture's sidecar read from COLI_MODEL_MIRROR copies in temporary directories: the
 # tokens and last logits of the run without a mirror, every replica serving records, a differing
@@ -3441,6 +3449,17 @@ tests/test_qwen36_tier_init_failure$(EXE): tests/test_qwen36_tier_init_failure.c
 # engine's recycled slot, promotion decided when the bytes pass by.
 tests/test_qwen36_tier_fp8$(EXE): tests/test_qwen36_tier_fp8.c qwen36_tier.c
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# Same fake backend: the MXFP4 copy mode (Qwen3.8's experts-mxfp4/ sidecar) -- fmt 7
+# uploads, half a byte a weight, the ue8m0 scale BYTES staged in order, no chain format.
+tests/test_qwen36_tier_mxfp4$(EXE): tests/test_qwen36_tier_mxfp4.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# The same mode on a real device (the grouped MXFP4 kernels behind qt_issue/qt_take, a swap
+# in place) against quant.h's matmul_mxfp4. Needs the CUDA objects, like test_cu_tier.
+tests/test_qwen36_tier_mxfp4_gpu$(EXE): tests/test_qwen36_tier_mxfp4_gpu.c qwen36_tier.c $(CUDA_OBJ)
+	@case "$(CUDA_OBJ)" in *backend_*) ;; *) echo "tests/test_qwen36_tier_mxfp4_gpu needs CUDA=1, CUDA_DLL=1 or HIP=1" >&2; exit 1 ;; esac
+	$(CC) $(CFLAGS) $< $(CUDA_OBJ) -o $@ $(LDFLAGS)
 
 # Same fake backend, qwen36 below full residency (#2090): cap < n_experts in copy
 # mode, the engine's planar int4 staged as the container's pairs, hits keeping

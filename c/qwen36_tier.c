@@ -195,9 +195,13 @@ static int swap_ok(int cand_layer, int victim_layer){
     if(G_exact) return G_lsl[cand_layer]==G_lsl[victim_layer];   /* the victim's slot holds the newcomer's matrices */
     return G.wfmt!=QT_GGUF || G_arena_on || (G_gtg[cand_layer]==G_gtg[victim_layer] && G_gtd[cand_layer]==G_gtd[victim_layer]);
 }
-/* bytes of one gate (or up) matrix and of one down matrix as the staging holds them */
-static size_t qt_mb_gu(int layer){ return G.wfmt==QT_GGUF ? G_gmb[layer] : (size_t)G.D*G.Ih/(G.wfmt==4?2:1); }
-static size_t qt_mb_d(int layer){ return G.wfmt==QT_GGUF ? G_gmbd[layer] : (size_t)G.D*G.Ih/(G.wfmt==4?2:1); }
+/* bytes of one gate (or up) matrix and of one down matrix as the staging holds them: int4 and
+ * MXFP4 (fmt 7) pack two weights a byte */
+static size_t qt_mb_gu(int layer){ return G.wfmt==QT_GGUF ? G_gmb[layer] : (size_t)G.D*G.Ih/(G.wfmt==4||G.wfmt==7?2:1); }
+static size_t qt_mb_d(int layer){ return G.wfmt==QT_GGUF ? G_gmbd[layer] : (size_t)G.D*G.Ih/(G.wfmt==4||G.wfmt==7?2:1); }
+/* bytes of n scales: MXFP4's are ue8m0 bytes (they travel through the float* parameters, as
+ * coli_cuda_tensor_upload takes them for fmt 7), every other format's f32 */
+static size_t qt_scb(size_t n){ return n*(G.wfmt==7?1:sizeof(float)); }
 void qt_source_planar(int on){ G_src_planar = on ? 1 : 0; }
 
 /* One planar block (64 elements in 32 bytes: byte k = element k low, k+32
@@ -260,7 +264,7 @@ static void planar_to_pairs_signed(uint8_t *dst, const uint8_t *src, size_t byte
 static void stage(uint8_t *dw, float *dsc, int layer,
                   const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,
                   const float *gs,const float *us,const float *ds){
-    size_t mb = (size_t)G.D*G.Ih/(G.wfmt==4?2:1);
+    size_t mb = qt_mb_gu(layer);
     if(G.wfmt==QT_GGUF){   /* the file's rows as they are: gate | up | down, no scales */
         size_t mg=qt_mb_gu(layer);
         memcpy(dw, g4, mg); memcpy(dw+mg, u4, mg); memcpy(dw+2*mg, d4, qt_mb_d(layer));
@@ -270,7 +274,7 @@ static void stage(uint8_t *dw, float *dsc, int layer,
         planar_to_pairs(dw,      g4, mb);
         planar_to_pairs(dw+mb,   u4, mb);
         planar_to_pairs(dw+2*mb, d4, mb);
-    } else if(G.wfmt==1 || G.wfmt==8){
+    } else if(G.wfmt==1 || G.wfmt==8 || G.wfmt==7){
         /* int8: il formato del backend e' gia' quello in RAM, si copia e basta.
          * Niente XOR: quello serve a portare i nibble int4 da complemento a due
          * a binario sfalsato, e su byte interi sarebbe corruzione. */
@@ -283,9 +287,10 @@ static void stage(uint8_t *dw, float *dsc, int layer,
     uint64_t *w0=(uint64_t*)dw,*w1=(uint64_t*)(dw+mb),*w2=(uint64_t*)(dw+2*mb);
     for(size_t i=0;i<mb/8;i++){ w0[i]=sg[i]^X; w1[i]=su[i]^X; w2[i]=sd[i]^X; }
     }
-    memcpy(dsc,                 gs, G.sc_gu*sizeof(float));
-    memcpy(dsc+G.sc_gu,         us, G.sc_gu*sizeof(float));
-    memcpy(dsc+2*G.sc_gu,       ds, G.sc_d *sizeof(float));
+    uint8_t *db=(uint8_t*)dsc;   /* MXFP4's scales are bytes (qt_scb) */
+    memcpy(db,                   gs, qt_scb(G.sc_gu));
+    memcpy(db+qt_scb(G.sc_gu),   us, qt_scb(G.sc_gu));
+    memcpy(db+2*qt_scb(G.sc_gu), ds, qt_scb(G.sc_d));
 }
 
 /* Thread affinity around the tier's own threads (Linux).
@@ -351,7 +356,8 @@ static void *uploader(void *arg){
          * byte per element, int8/fp8 = one. Scales follow the format. */
         size_t mb=qt_mb_gu(layer);
         const float *sg=sc, *su, *sd;
-        if(G.wfmt==8||G.egs){ su=sc+G.sc_gu; sd=sc+2*G.sc_gu; } else { su=sc+G.Ih; sd=sc+2*G.Ih; }
+        if(G.wfmt==7){ su=(const float*)((const uint8_t*)sc+G.sc_gu); sd=(const float*)((const uint8_t*)sc+2*G.sc_gu); }
+        else if(G.wfmt==8||G.egs){ su=sc+G.sc_gu; sd=sc+2*G.sc_gu; } else { su=sc+G.Ih; sd=sc+2*G.Ih; }
         int dv = G.dev[home2(layer,eid)];
         ColiCudaTensor *tg=NULL,*tu=NULL,*td=NULL;
         int ok=0, inplace=0, aslot=-1;   /* a GGUF's arena slot: the victim's, or a free one */
@@ -419,6 +425,12 @@ static void *uploader(void *arg){
                 ok = coli_cuda_tensor_upload(&tg, w,      NULL, 100+G_gtg[layer], G.D,  G.Ih, dv)
                   && coli_cuda_tensor_upload(&tu, w+mb,   NULL, 100+G_gtg[layer], G.D,  G.Ih, dv)
                   && coli_cuda_tensor_upload(&td, w+2*mb, NULL, 100+G_gtd[layer], G.Ih, G.D,  dv);
+            } else if(G.wfmt==7){
+                /* MXFP4 as the checkpoint has it: e2m1 nibbles [O,I/2] and a ue8m0 byte per 32 inputs
+                 * [O,ceil(I/32)] per matrix, the layout the fmt 7 kernels read (#2823) */
+                ok = coli_cuda_tensor_upload(&tg, w,      sg, 7, G.D,  G.Ih, dv)
+                  && coli_cuda_tensor_upload(&tu, w+mb,   su, 7, G.D,  G.Ih, dv)
+                  && coli_cuda_tensor_upload(&td, w+2*mb, sd, 7, G.Ih, G.D,  dv);
             } else if(G.wfmt==8){
                 /* e4m3 bytes as they came from the checkpoint, block scales
                  * [ceil(O/128), ceil(I/128)] per matrix -- the layout #817's
@@ -801,6 +813,18 @@ int qt_init_fp8(int nl, int ne, int D, int Ih, int cap, int topk, const float *e
     return ok;
 }
 
+/* MXFP4 copy mode (Qwen3.8's experts-mxfp4/ sidecar), fp8's contract: the bytes copied at
+ * qt_note, fmt 7 uploads, the ue8m0 scale BYTES handed over through the float* parameters */
+static int G_mx4_stream;
+int qt_init_mxfp4(int nl, int ne, int D, int Ih, int cap, int topk){
+    if(G.on) return 0;
+    if(D%2 || Ih%2){ fprintf(stderr,"[qtier] MXFP4 experts need an even hidden and inter size -> CPU path\n"); return 0; }   /* whole bytes a row */
+    G_mx4_stream = 1;
+    int ok = qt_init(nl, ne, D, Ih, cap, topk, 0, 0);
+    if(!ok) G_mx4_stream = 0;
+    return ok;
+}
+
 /* each device's arena: as many slots as its budget holds and its homed experts need */
 static int qt_arena_up(void){
     if(G_exact && G.ndev != 1) G_exact = 0;
@@ -883,9 +907,9 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
     if(topk>QT_MAX_ROWS){ fprintf(stderr,"[qtier] topk>%d unsupported\n",QT_MAX_ROWS); return 0; }
     /* cap > n_experts holds every expert too (a slot per expert, never recycled):
      * it used to be refused along with the smaller caps */
-    G_stream = G_fp8_stream || cap < ne || (G_gguf_init && G_gguf_copy);
+    G_stream = G_fp8_stream || G_mx4_stream || cap < ne || (G_gguf_init && G_gguf_copy);
     G_trunk_only = expert_is_int4 < 0;
-    if(G_stream && !G_fp8_stream && !G_trunk_only)
+    if(G_stream && !G_fp8_stream && !G_mx4_stream && !G_trunk_only)
         fprintf(stderr,"[qtier] RAM holds %d of %d experts a layer: the tier copies each expert it takes as it passes\n",cap,ne);
     memset(&G,0,sizeof G);
     { const char *e=getenv("QT_UPLOAD_SYNC"); G_upload_sync=e&&*e&&*e!='0'; }
@@ -944,7 +968,7 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
 
     /* Weight format and bytes per expert come first now: the automatic
      * placement below needs them to price the experts a trunk item displaces. */
-    G.wfmt = G_gguf_init ? QT_GGUF : G_fp8_stream ? 8 : (expert_is_int4 > 0 ? 4 : 1);
+    G.wfmt = G_gguf_init ? QT_GGUF : G_fp8_stream ? 8 : G_mx4_stream ? 7 : (expert_is_int4 > 0 ? 4 : 1);
     if(G.wfmt==1 && expert_gs>0 && !G_trunk_only){
         fprintf(stderr,"[qtier] int8 experts with grouped scales (gs=%d) cannot be "
                        "expressed on the GPU (fmt=1 is per-row only)\n", expert_gs);
@@ -958,6 +982,9 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
          * [D,Ih] -- the same count either way, kept as two fields for symmetry */
         size_t nbD=(size_t)(D+127)/128, nbI=(size_t)(Ih+127)/128;
         G.sc_gu = nbI*nbD; G.sc_d = nbD*nbI;
+    } else if(G.wfmt==7){
+        /* a ue8m0 byte per row and 32 inputs, a short last group rounded up: gate/up [Ih, D/32], down [D, Ih/32] */
+        G.sc_gu = (size_t)Ih*((D+31)/32); G.sc_d = (size_t)D*((Ih+31)/32);
     } else {
         G.sc_gu = expert_gs ? (size_t)Ih * ((D + expert_gs - 1)/expert_gs) : (size_t)Ih;
         G.sc_d  = expert_gs ? (size_t)D  * ((Ih + expert_gs - 1)/expert_gs) : (size_t)D;
@@ -973,10 +1000,10 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
      * before its stop-trying fallback shrank the budget. Now the planned count
      * is the resident count. The 22-28 % the granularity costs is real; only
      * pooling experts into one arena per device would win it back (open). */
-    size_t mat_bytes = G.wfmt==4 ? (size_t)D*Ih/2 : (size_t)D*Ih;
+    size_t mat_bytes = G.wfmt==4||G.wfmt==7 ? (size_t)D*Ih/2 : (size_t)D*Ih;
     G.exp_bytes = 3*dev_alloc_footprint(mat_bytes)
-                + 2*dev_alloc_footprint(G.sc_gu*sizeof(float))
-                + dev_alloc_footprint(G.sc_d*sizeof(float));
+                + 2*dev_alloc_footprint(qt_scb(G.sc_gu))
+                + dev_alloc_footprint(qt_scb(G.sc_d));
     if(G.wfmt==QT_GGUF){   /* the biggest layer's (a slot takes any layer's expert); padded rows, no scales */
         G.exp_bytes = 0; size_t mg=0, md=0;
         for(int l=0;l<nl;l++){
@@ -1953,14 +1980,14 @@ void qt_chain_own(void){
     pthread_mutex_unlock(&G.mx);
 }
 int qt_chain_format(int *fmt,int *gs){
-    if(!G.on) return 0;
+    if(!G.on || G.wfmt==7) return 0;   /* MXFP4: the chains' MoE kernels have no fmt 7; the tier's groups compute them */
     if(fmt) *fmt=G.wfmt==QT_GGUF?QT_GGUF:G.wfmt==8?8:G.wfmt==1?1:G.egs?4:2;
     if(gs) *gs=G.egs;
     return 1;
 }
 int qt_chain_layer_format(int layer,int *fmt,int *fmt_d){
     if(!G.on || layer<0 || layer>=G.nl) return 0;
-    int f; qt_chain_format(&f,NULL);
+    int f; if(!qt_chain_format(&f,NULL)) return 0;
     *fmt = G.wfmt==QT_GGUF ? 100+G_gtg[layer] : f;
     *fmt_d = G.wfmt==QT_GGUF ? 100+G_gtd[layer] : f;
     return 1;
@@ -1988,7 +2015,7 @@ static int enqueue_locked(int layer,int eid,int v_layer,int v_eid,int reserved){
     int hd=home2(layer,eid);
     if(!reserved && v_eid<0 && G.used[hd]+qt_ebytes(layer)>G.budget[hd]) return 0;
     /* staging: three matrices (int8/fp8 a byte an element, a GGUF's the file's rows), their scales */
-    uint8_t *w=malloc(2*qt_mb_gu(layer)+qt_mb_d(layer)); float *sc=malloc((2*G.sc_gu+G.sc_d+1)*sizeof(float));
+    uint8_t *w=malloc(2*qt_mb_gu(layer)+qt_mb_d(layer)); float *sc=malloc(qt_scb(2*G.sc_gu+G.sc_d+1));
     if(!w||!sc){ free(w); free(sc); return 0; }
     if(!reserved && v_eid<0) G.used[hd]+=qt_ebytes(layer);
     s->queued=1;
@@ -2571,7 +2598,7 @@ void qt_shutdown(void){
     G.issue_open=0;
     memset(G.is_cnt,0,sizeof G.is_cnt);
     G.on=0;
-    G_fp8_stream=0; G_stream=0; G_trunk_only=0; G_src_planar=0;
+    G_fp8_stream=0; G_mx4_stream=0; G_stream=0; G_trunk_only=0; G_src_planar=0;
     G_host_on=-1; G_host_all=0; G_host_n=G_host_bytes=0;
     coli_cuda_shutdown();
 }

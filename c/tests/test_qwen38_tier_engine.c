@@ -14,7 +14,13 @@
  * converted to int4-g64 experts on argv (make qwen38-tiny-int4-check passes
  * ./qwen38_tiny_int4), a third pass checks that the tier declines those
  * experts -- it streams e4m3 bytes only -- and that the engine then computes
- * them on the CPU and reproduces the int4 reference. Include order as in
+ * them on the CPU and reproduces the int4 reference. Given the experts-mxfp4/
+ * fixture instead (make qwen38-tiny-mxfp4-check passes ./qwen38_tiny_mxfp4),
+ * the third pass brings the tier up in its fmt 7 copy mode and checks the
+ * logits: with every group refused they are the CPU run's to the bit; with the
+ * fake computing the residents through the engine's own matmul_mxfp4 the tokens
+ * are the oracle's and the logits within 1e-6 of the CPU's (the device's rows
+ * join the sum after the CPU's), the same bits run to run. Include order as in
  * test_qwen36_tier_int8_engine.c: engine first, then the fake backend, then
  * the tier source, so the tier's statics (G, qs()) are readable here. */
 #define main qwen38_main_unused
@@ -35,6 +41,55 @@ static void tk(int ok, const char *what) {
     if (ok) { printf("  ok   %s\n", what); return; }
     printf("  FAIL %s\n", what);
     t_fails++;
+}
+
+/* A file's bytes (a DUMP's last logits); NULL when it cannot be read. */
+static float *slurp_f32(const char *path, size_t *n) {
+    FILE *f = fopen(path, "rb"); float *v = NULL; *n = 0;
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
+    if (len > 0 && (v = (float *)malloc((size_t)len)) && fread(v, 1, (size_t)len, f) == (size_t)len) *n = (size_t)len / sizeof(float);
+    else { free(v); v = NULL; }
+    fclose(f);
+    return v;
+}
+/* max |a - b| over max |b|, or -1 when either file is missing or the lengths differ;
+ * *same: the two files hold the same bytes */
+static double dump_rel(const char *a, const char *b, int *same) {
+    size_t na, nb; float *x = slurp_f32(a, &na), *y = slurp_f32(b, &nb);
+    double r = -1;
+    *same = 0;
+    if (x && y && na == nb && na) {
+        double mx = 0, mag = 0;
+        for (size_t i = 0; i < na; i++) {
+            double d = fabs((double)x[i] - y[i]);
+            if (!(d <= mx)) mx = d;   /* a NaN wins */
+            if (fabs(y[i]) > mag) mag = fabs(y[i]);
+        }
+        r = mag > 0 ? mx / mag : mx;
+        *same = !memcmp(x, y, na * sizeof(float));
+    }
+    free(x); free(y);
+    return r;
+}
+/* The fake card computing a group of MXFP4 residents as the engine computes an expert
+ * (matmul_mxfp4, silu(gate) * up, down), from the bytes the tier uploaded. */
+static float mx_out[QT_MAX_ROWS * 256];
+static int mx_groups;
+static int mx_compute(ColiCudaTensor *const *g, ColiCudaTensor *const *u, ColiCudaTensor *const *d,
+                      int count, const float *x) {
+    const int D = g[0]->I, I = g[0]->O;
+    float eg[256], eu[256];
+    if (D > 256 || I > 256) return 0;
+    for (int j = 0; j < count; j++) {
+        if (g[j]->fmt != 7 || !g[j]->owned || !u[j]->owned || !d[j]->owned) return 0;
+        matmul_mxfp4(eg, x + (size_t)j * D, (const uint8_t *)g[j]->w, (const uint8_t *)g[j]->sc, 1, D, I);
+        matmul_mxfp4(eu, x + (size_t)j * D, (const uint8_t *)u[j]->w, (const uint8_t *)u[j]->sc, 1, D, I);
+        for (int i = 0; i < I; i++) eg[i] = q38_silu(eg[i]) * eu[i];
+        matmul_mxfp4(mx_out + (size_t)j * D, eg, (const uint8_t *)d[j]->w, (const uint8_t *)d[j]->sc, 1, I, D);
+    }
+    fake_group_out = mx_out; mx_groups++;
+    return 1;
 }
 
 /* The load's own steps, model_init then q38_tier_start, with the trunk placed on the
@@ -163,7 +218,96 @@ int main(int argc, char **argv_in) {
     qt_shutdown();
     setenv("COLI_CUDA_CHAIN", "0", 1);
 
-    if (argc > 1) {
+    char mxi[2048]; FILE *mxf = NULL;
+    if (argc > 1) { snprintf(mxi, sizeof mxi, "%s/experts-mxfp4/index.json", argv_in[1]); mxf = fopen(mxi, "rb"); }
+    if (mxf) {
+        fclose(mxf);
+        /* Third pass: the experts-mxfp4/ sidecar on the tier (fmt 7 copy mode). The CPU's run
+         * first, then the tier with every group refused (the CPU computes every expert: the
+         * same bits), then the fake card computing the residents (twice: the same bits). */
+        const char *snap = argv_in[1];
+        printf(" mxfp4 experts on the tier (%s)\n", snap);
+        char ref[2048], cpu[2048], refused[2048], dev1[2048], dev2[2048];
+        snprintf(ref, sizeof ref, "%s/ref.json", snap);
+        snprintf(cpu, sizeof cpu, "%s/tier_cpu.f32", snap);
+        snprintf(refused, sizeof refused, "%s/tier_refused.f32", snap);
+        snprintf(dev1, sizeof dev1, "%s/tier_dev1.f32", snap);
+        snprintf(dev2, sizeof dev2, "%s/tier_dev2.f32", snap);
+        char *argvm[] = { (char *)"qwen38", (char *)"1", (char *)"8", ref };
+        setenv("SNAP", snap, 1);
+        setenv("Q38_EXPERT_LOWBIT", "mxfp4", 1);
+        setenv("Q38_TRUNK_GPU", "0", 1);         /* the trunk on the CPU: only the experts move */
+        setenv("COLI_PLACE", "off", 1);
+        G_offer_n = 0;                           /* the passes above left their offers */
+        fake_dense_compute = 0;
+        /* the fixture's expert: gate/up [8, 32] and down [32, 8], 128 nibble bytes each, and
+         * 8 + 8 + 32 scale bytes; room for six of the sixteen, so promotion has to swap */
+        size_t mx_bytes = 3 * dev_alloc_footprint(32 * 8 / 2) + 2 * dev_alloc_footprint(8) + dev_alloc_footprint(32);
+        snprintf(gb, sizeof gb, "%.15f", (double)(6 * mx_bytes + mx_bytes / 2) / 1073741824.0);
+        setenv("CUDA_EXPERT_GB", gb, 1);
+
+        setenv("COLI_CUDA", "0", 1); setenv("DUMP", cpu, 1);
+        rc = qwen38_main_unused(4, argvm);
+        tk(rc == 0, "the CPU on the mxfp4 sidecar reproduces the oracle (cap 1)");
+
+        setenv("COLI_CUDA", "1", 1); setenv("DUMP", refused, 1);
+        fake_uploads = 0;
+        rc = qwen38_main_unused(4, argvm);
+        qt_fill_wait();
+        tk(rc == 0, "the engine on the mxfp4 tier reproduces the oracle tokens and logits");
+        tk(G.on && G.wfmt == 7 && G_mx4_stream && qt_streaming(), "tier started from q38_tier_start in its fmt 7 copy mode");
+        tk(G.exp_bytes == mx_bytes, "exp_bytes: three nibble matrices and three scale BYTE tables");
+        tk(fake_uploads > 0 && fake_uploads % 3 == 0 && last_fmt == 7 && last_bytes == (size_t)G.D * G.Ih / 2,
+           "fmt 7 uploads in triples, half a byte per weight");
+        pthread_mutex_lock(&G.mx);
+        unsigned long long mhits = 0; for (int i = 0; i < G.ndev; i++) mhits += G.hits[i];
+        int mres = 0, mstale = 0;
+        for (int l = 0; l < G.nl; l++) for (int e = 0; e < G.ne; e++) {
+            mres += qs(l, e)->resident;
+            mstale += (qs(l, e)->g4 != NULL || qs(l, e)->gs != NULL);
+        }
+        size_t mused = G.used[0];
+        pthread_mutex_unlock(&G.mx);
+        tk(mhits > 0 && mres > 0 && mres <= 6 && mused == (size_t)mres * G.exp_bytes,
+           "residents routed (hits), within the six-expert budget, bytes accounted per resident");
+        tk(mstale == 0, "no slot keeps a pointer into the engine's records");
+        int same = 0; double rel = dump_rel(refused, cpu, &same);
+        tk(rel >= 0 && same, "every group refused: the last logits are the CPU run's to the bit");
+        qt_shutdown();
+        tk(!G_mx4_stream && !G.on, "shutdown leaves the mode");
+
+        fake_own_mx4 = 1; fake_group_hook = mx_compute; mx_groups = 0;
+        setenv("DUMP", dev1, 1);
+        rc = qwen38_main_unused(4, argvm);
+        tk(rc == 0, "the fake card computing the residents: the oracle tokens and logits");
+        int computed = mx_groups;
+        qt_shutdown();
+        setenv("DUMP", dev2, 1);
+        rc = qwen38_main_unused(4, argvm);
+        tk(rc == 0, "and again");
+        qt_shutdown();
+        /* the chain beside it: its MoE kernels have no fmt 7, so the routed experts take the
+         * host's step and the tier's groups compute the residents (the trunk on the fake card) */
+        setenv("COLI_CUDA_CHAIN", "1", 1); setenv("Q38_TRUNK_GPU", "1", 1); setenv("Q38_TRUNK_MIN_KB", "0", 1);
+        setenv("COLI_PLACE", "auto", 1); setenv("CUDA_EXPERT_GB", "0.5", 1); unsetenv("DUMP");
+        G_offer_n = 0; fake_dense_compute = 1; mx_groups = 0;
+        rc = qwen38_main_unused(4, argvm);
+        tk(rc == 0, "with COLI_CUDA_CHAIN=1 and the trunk on the fake card: within the oracle's limits");
+        int fmt7 = -1;
+        tk(G.on && G.wfmt == 7 && !qt_chain_format(&fmt7, NULL) && mx_groups > 0,
+           "the chain left the routed experts to the tier's groups (no chain format for fmt 7)");
+        qt_shutdown();
+        setenv("COLI_CUDA_CHAIN", "0", 1); setenv("Q38_TRUNK_GPU", "0", 1); setenv("COLI_PLACE", "off", 1);
+        fake_dense_compute = 0;
+        fake_own_mx4 = 0; fake_group_hook = NULL; fake_group_out = NULL;
+        tk(computed > 0, "the card computed resident experts");
+        rel = dump_rel(dev1, cpu, &same);
+        printf("  last logits, card vs CPU: max |d| / max |CPU| = %.3g%s\n", rel, same ? " (identical)" : "");
+        tk(rel >= 0 && rel <= 1e-6, "within 1e-6 of the CPU's (the device's rows join the sum after the CPU's)");
+        dump_rel(dev2, dev1, &same);
+        tk(same, "two runs with the same residency give the same bits");
+        unsetenv("Q38_EXPERT_LOWBIT"); unsetenv("DUMP");
+    } else if (argc > 1) {
         /* Third pass: the int4-g64 sidecar. The tier must stay off -- no
          * upload, no routed expert ever consulted -- and the CPU must answer
          * every expert from the sidecar, matching the int4 reference. */
