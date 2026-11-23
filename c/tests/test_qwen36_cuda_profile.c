@@ -4,7 +4,7 @@
 
 static unsigned checks, failures;
 
-enum { available = (1u << 6) - 1u };
+enum { available = (1u << 7) - 1u };
 #define GIB(n) ((size_t)(n) << 30)
 
 static void check_value(unsigned actual, unsigned expected, const char *what) {
