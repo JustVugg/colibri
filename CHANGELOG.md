@@ -5,6 +5,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`coli doctor` recognises a Metal engine.** A `METAL=1` build links Metal.framework rather than
+  loading a GPU runtime, and macOS has no `ldd`, so doctor found no GPU runtime and reported "GPU
+  detected but the engine is CPU-only" for a qwen36 that ran its Metal graph (an M5 Air and an M2
+  mini). It now reads the messages `backend_metal.o` compiles into every Metal engine, and the
+  switch that engine reads at run time: qwen36's Metal graph is on unless `COLI_METAL=0`; colibri,
+  GLM-5.3 and Inkling need `COLI_METAL=1` (an Inkling-2 model also `INK2_METAL=1` and a CUDA or
+  Vulkan build), Kimi K3 `K3_METAL=1`; qwen36 and Kimi K3 stay on the CPU with `KV_SLOTS` above 1.
+  When Metal is on the GPU check
+  passes ("Metal engine on the Apple GPU") and the plan shows the Apple GPU as unified memory with
+  no VRAM budget; when it is off it warns and names the variable; a Metal build on a Mac with no
+  Metal GPU found says so. (#2921)
+
 ## [2.2.0] - 2026-11-21
 
 ### New
