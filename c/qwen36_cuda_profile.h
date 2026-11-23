@@ -48,6 +48,7 @@ static inline int q36_cuda_device_profile(int major, int minor, const char *name
         {Q36_GPU_A100, 8, 0, "NVIDIA A100-SXM4-40GB", NULL, UINT64_C(38) << 30, UINT64_C(42) << 30},
         {Q36_GPU_3090, 8, 6, "NVIDIA GeForce RTX 3090", NULL, 0, 0},
         {Q36_GPU_PRO4000, 12, 0, "NVIDIA RTX PRO 4000 Blackwell", NULL, 0, 0},
+        {Q36_GPU_4090, 8, 9, "NVIDIA GeForce RTX 4090", NULL, 0, 0},
     };
 
     if (!name) return Q36_GPU_NONE;
@@ -65,8 +66,90 @@ static inline int q36_cuda_device_profile(int major, int minor, const char *name
 }
 
 static inline int q36_has_request_rules(int profile) {
-    (void)profile;
-    return 0;
+    switch (profile) {
+    case Q36_GPU_4090:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+#define Q36_ROW(n) (UINT32_C(1) << (n))
+#define Q36_ROWS(first, last) (Q36_ROW((last) + 1) - Q36_ROW(first))
+#define Q36_ANY_ROW Q36_ROWS(0, 16)
+
+/* Use the full logical request in both phases, before splitting into forwards.
+ * Cold means the chain has not run a forward when the request begins.
+ * Row 0 covers requests outside the measured matrix. */
+static inline uint32_t q36_request_row(int reused, int fresh, int cold) {
+    enum { ANY_TEMPERATURE = -1 };
+    static const struct {
+        int reused, fresh;
+        int cold;
+    } shapes[] = {
+        {   0,    64, 1 },
+        {   0,   512, 0 },
+        {   0,    64, 0 },
+        {   0,   512, 1 },
+        {   0,  2048, ANY_TEMPERATURE },
+        {   0,  4096, ANY_TEMPERATURE },
+        {   0,  8192, ANY_TEMPERATURE },
+        {   0, 16384, ANY_TEMPERATURE },
+        {   0,   663, ANY_TEMPERATURE },
+        { 720,  1234, ANY_TEMPERATURE },
+        {1986,  2262, ANY_TEMPERATURE },
+        {4335,  1406, ANY_TEMPERATURE },
+        {5785,  1298, ANY_TEMPERATURE },
+        {7137,   904, ANY_TEMPERATURE },
+        {8065,   348, ANY_TEMPERATURE },
+        {8880,    35, ANY_TEMPERATURE },
+    };
+
+    for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
+        if (shapes[i].reused == reused && shapes[i].fresh == fresh &&
+            (shapes[i].cold == ANY_TEMPERATURE || shapes[i].cold == (cold != 0)))
+            return Q36_ROW(i + 1);
+    }
+    return Q36_ROW(0);
+}
+
+static inline unsigned q36_row_features(int profile, uint32_t rows, int generation) {
+    struct PhaseRules { uint32_t read, generate; };
+    /* General permissions include row 0. Each allowlist applies to measured rows. */
+    enum {
+        RTX4090_TILED_MATMUL_ROWS = Q36_ANY_ROW &
+            ~(Q36_ROW(2) | Q36_ROW(4) | Q36_ROW(9) | Q36_ROWS(15, 16)),
+    };
+    static const struct PhaseRules rtx4090[13] = {
+        { Q36_ANY_ROW & ~Q36_ROWS(14, 15), Q36_ANY_ROW }, /* prompt cache */
+        { 0, Q36_ANY_ROW }, /* expert route */
+        { Q36_ANY_ROW, Q36_ANY_ROW }, /* flash attn */
+        { Q36_ANY_ROW, 0 }, /* async copies */
+        { 0, Q36_ANY_ROW }, /* short matmul */
+        { RTX4090_TILED_MATMUL_ROWS, RTX4090_TILED_MATMUL_ROWS }, /* tiled matmul */
+        { Q36_ANY_ROW, Q36_ANY_ROW }, /* activation cache */
+        { Q36_ANY_ROW, Q36_ANY_ROW }, /* shared swiglu */
+        { Q36_ANY_ROW, 0 }, /* fused norm */
+        { 0, 0 }, /* dnconv */
+        { Q36_ROW(1), Q36_ANY_ROW & ~Q36_ROW(14) }, /* dnrec */
+        { Q36_ANY_ROW, Q36_ANY_ROW }, /* expert matmul */
+        { Q36_ROW(16), 0 }, /* long attn */
+    };
+
+    const struct PhaseRules *rules;
+    switch (profile) {
+    case Q36_GPU_4090:
+        rules = rtx4090;
+        break;
+    default:
+        return 0;
+    }
+    unsigned permissions = 0;
+    for (unsigned i = 0; i < 13; i++) {
+        uint32_t allowed = generation ? rules[i].generate : rules[i].read;
+        if (allowed & rows) permissions |= 1u << i;
+    }
+    return permissions & Q36_AVAILABLE_FEATURES;
 }
 
 /* Capacity and initialization use the union of the permitted requests and phases. */
@@ -81,6 +164,9 @@ static inline unsigned q36_device_features(int profile) {
     case Q36_GPU_PRO4000:
         return Q36_AVAILABLE_FEATURES & ~(Q36_ACTIVATION_CACHE | Q36_DNCONV |
                                        Q36_DNREC | Q36_LONG_ATTN);
+    case Q36_GPU_4090:
+        return q36_row_features(profile, Q36_ANY_ROW, 0) |
+               q36_row_features(profile, Q36_ANY_ROW, 1);
     default:
         return 0;
     }
@@ -93,6 +179,8 @@ static inline int q36_3090_uses_exact_cache(int reused, int fresh) {
 
 static inline unsigned q36_request_features(int profile, int reused, int fresh, int cold,
                                              int generation, int cache3090) {
+    if (q36_has_request_rules(profile))
+        return q36_row_features(profile, q36_request_row(reused, fresh, cold), generation);
     unsigned mask = q36_device_features(profile);
     if (profile == Q36_GPU_A100) {
         if (generation) mask &= ~(Q36_FLASH_ATTN | Q36_ASYNC_COPIES);
@@ -106,5 +194,9 @@ static inline unsigned q36_request_features(int profile, int reused, int fresh, 
 static inline unsigned q36_default_features(int profile) {
     return q36_request_features(profile, 0, 0, 0, 0, 0);
 }
+
+#undef Q36_ANY_ROW
+#undef Q36_ROWS
+#undef Q36_ROW
 
 #endif

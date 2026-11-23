@@ -34,6 +34,87 @@ static void check_mask(int profile, int reused, int fresh, int cold, int generat
                 expected, context);
 }
 
+typedef struct { const char *read, *generate; } ExpectedPermissions;
+
+/* The leftmost character corresponds to feature bit 0. */
+static unsigned permission_bits(const char *flags) {
+    unsigned mask = 0;
+    for (int i = 0; flags[i]; i++)
+        if (flags[i] == '1') mask |= 1u << i;
+    return mask;
+}
+
+static void check_matrix(void) {
+    /* Full policy oracle in qualified request order. */
+    static const struct { int reused, fresh, cold; } measures[] = {
+        {   0,    64, 1 },
+        {   0,   512, 0 },
+        {   0,    64, 0 },
+        {   0,   512, 1 },
+        {   0,  2048, 1 },
+        {   0,  4096, 0 },
+        {   0,  8192, 0 },
+        {   0, 16384, 0 },
+        {   0,   663, 1 },
+        { 720,  1234, 0 },
+        {1986,  2262, 0 },
+        {4335,  1406, 0 },
+        {5785,  1298, 0 },
+        {7137,   904, 0 },
+        {8065,   348, 0 },
+        {8880,    35, 0 },
+    };
+    enum { MEASURE_COUNT = sizeof(measures) / sizeof(measures[0]) };
+
+    static const struct {
+        int profile;
+        ExpectedPermissions defaults;
+        ExpectedPermissions matrix[MEASURE_COUNT];
+    } cases[] = {
+        { Q36_GPU_4090, { "1011011110010", "1110111100110" }, {
+            { "1011011110110", "1110111100110" },
+            { "1011001110010", "1110101100110" },
+            { "1011011110010", "1110111100110" },
+            { "1011001110010", "1110101100110" },
+            { "1011011110010", "1110111100110" },
+            { "1011011110010", "1110111100110" },
+            { "1011011110010", "1110111100110" },
+            { "1011011110010", "1110111100110" },
+            { "1011001110010", "1110101100110" },
+            { "1011011110010", "1110111100110" },
+            { "1011011110010", "1110111100110" },
+            { "1011011110010", "1110111100110" },
+            { "1011011110010", "1110111100110" },
+            { "0011011110010", "1110111100010" },
+            { "0011001110010", "1110101100110" },
+            { "1011001110011", "1110101100110" },
+        } },
+    };
+
+    for (size_t gpu = 0; gpu < sizeof cases / sizeof *cases; gpu++) {
+        int profile = cases[gpu].profile;
+        ExpectedPermissions defaults = cases[gpu].defaults;
+        unsigned possible = permission_bits(defaults.read) | permission_bits(defaults.generate);
+        for (size_t row = 0; row < MEASURE_COUNT; row++) {
+            int reused = measures[row].reused, fresh = measures[row].fresh, cold = measures[row].cold;
+            ExpectedPermissions expected = cases[gpu].matrix[row];
+            possible |= permission_bits(expected.read) | permission_bits(expected.generate);
+            for (int generation = 0; generation <= 1; generation++) {
+                unsigned row_mask = permission_bits(generation ? expected.generate : expected.read);
+                unsigned fallback = permission_bits(generation ? defaults.generate : defaults.read);
+                check_mask(profile, reused, fresh, cold, generation, 0, row_mask);
+                if (fresh != 64 && fresh != 512)
+                    check_mask(profile, reused, fresh, !cold, generation, 0, row_mask);
+                check_mask(profile, reused, fresh - 1, cold, generation, 0, fallback);
+                check_mask(profile, reused, fresh + 1, cold, generation, 0, fallback);
+                check_mask(profile, reused + 1, fresh, cold, generation, 0, fallback);
+                if (reused)
+                    check_mask(profile, reused - 1, fresh + 1, cold, generation, 0, fallback);
+            }
+        }
+        check_value(q36_device_features(profile), possible, "union of matrix permissions");
+    }
+}
 
 int main(void) {
     check_device(8, 9, "NVIDIA L4", GIB(22), Q36_GPU_L4);
@@ -79,6 +160,8 @@ int main(void) {
     check_value(q36_device_features(Q36_GPU_PRO4000), pro4000, "RTX PRO 4000 available features");
     check_mask(Q36_GPU_PRO4000, 0, 64, 1, 0, 0, pro4000);
     check_mask(Q36_GPU_PRO4000, 0, 64, 1, 1, 0, pro4000);
+    check_device(8, 9, "NVIDIA GeForce RTX 4090", GIB(24), Q36_GPU_4090);
+    check_matrix();
     printf("Qwen3.6 CUDA profiles: %u checks, %u failures\n", checks, failures);
     return failures ? 1 : 0;
 }

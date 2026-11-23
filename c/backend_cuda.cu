@@ -197,6 +197,16 @@ static bool use_dense_i8_schedule(const DeviceContext *ctx) {
     }
 }
 
+static bool use_short_projection_kernels(const DeviceContext *ctx) {
+    if (!ctx->qwen36_active) return false;
+    switch (ctx->device_profile) {
+    case Q36_GPU_4090:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static DeviceContext g_ctx[COLI_CUDA_MAX_DEVICES];
 static std::mutex g_qx_half_mutex[COLI_CUDA_MAX_DEVICES];
 static std::mutex &hcg_half_mutex(const DeviceContext *ctx) { return g_qx_half_mutex[ctx - g_ctx]; }
@@ -8660,7 +8670,7 @@ static int f32_gemm_fast_on(void) {
     return on;
 }
 static int f32_gemm_launch(DeviceContext *ctx, float *y, const float *x, const float *w, int S, int I, int O, cudaStream_t st) {
-    if (::f32t_gemm(ctx, y, x, w, S, I, O, st)) return 1;
+    if (!use_short_projection_kernels(ctx) && ::f32t_gemm(ctx, y, x, w, S, I, O, st)) return 1;
     int fast = f32_gemm_fast_on();
     unsigned gx = (unsigned)((O + F32G_N - 1) / F32G_N), big = (unsigned)((S + 63) / 64);
     long min_b = fast ? 1L : 2L;
@@ -8703,7 +8713,8 @@ static int tensor_gemm_seq(ColiCudaTensor *t, float *y_dev, const float *x_dev, 
     if (t->fmt == 1 && S <= GEMV_I8_MAX_S && t->I % 16 == 0 && t->I <= 12288 && ((uintptr_t)x_dev & 15) == 0) {   /* x in float4 loads */
         /* W1 and W4 take the same sums in each lane unless the standard dispatcher splits K.
          * Use its partial sums, ordered merge and allocation fallback in that case. */
-        if (gemv_i8_w4_shape(t) && gemv_i8_sk_splits(ctx, t->I, gemv_i8_w4_blocks(t->O)) > 1)
+        if (!use_short_projection_kernels(ctx) && gemv_i8_w4_shape(t) &&
+            gemv_i8_sk_splits(ctx, t->I, gemv_i8_w4_blocks(t->O)) > 1)
             return ::tensor_gemm_async(t, y_dev, x_dev, S, stream);
         unsigned bx = (unsigned)((t->O + GEMV_I8_ROWS - 1) / GEMV_I8_ROWS);
         const int8_t *w = (const int8_t *)t->weights;
