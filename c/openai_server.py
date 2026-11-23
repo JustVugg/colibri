@@ -8979,6 +8979,23 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(401, "Invalid or missing API key.", None, "invalid_api_key",
                            "authentication_error")
 
+    def _check_origin(self):
+        """A web page on another site can POST here without a preflight (a text/plain body is a
+        "simple" request, and read_json does not look at the content type); CORS only decides whether
+        it may read the reply, not whether the request runs. So a request that names an Origin runs
+        only for this server's own, one it allows with --cors-origin, or loopback's own page."""
+        origin = self.headers.get("Origin")
+        if origin is None:
+            return                                  # a script or an SDK: no browser, no Origin
+        cors = self.server.cors_origins
+        if "*" in cors or origin in cors:
+            return
+        netloc = urlsplit(origin).netloc.lower()
+        if netloc and netloc == (self.headers.get("Host") or "").strip().lower():
+            return                                  # a page this server serves, calling itself
+        raise APIError(403, "Origin %r not allowed. Add it with --cors-origin %s if a page there should "
+                            "call this server." % (origin, origin), None, "forbidden")
+
     def _check_host(self):
         """DNS-rebinding guard: a web page can resolve a hostname to 127.0.0.1 and
         drive this local server unless we pin the Host header to loopback / the bind
@@ -9197,6 +9214,7 @@ class APIHandler(BaseHTTPRequestHandler):
         request_id = "req_" + uuid.uuid4().hex
         try:
             self._check_host()
+            self._check_origin()
             self.require_auth()
             try:
                 body = self.read_json()
