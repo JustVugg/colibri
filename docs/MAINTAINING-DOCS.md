@@ -2,6 +2,8 @@
 
 `ENVIRONMENT.md` and `SETTINGS.md` are **generated from source**. They carry a "Generated from `main @ <hash>`" line and *will* drift as the code adds knobs. This is the repeatable procedure to refresh them — by hand, or with an AI assistant (e.g. Claude) doing the tedious extraction and table editing.
 
+`make -C c check-env` holds the two ends together: every variable the engines read is in `c/coli_env.h`, and every variable in `c/coli_env.h` is described in a reference doc (`docs/*.md`, `docs/api-reference/*.md`, `README.md`, `GPU_BACKENDS.md`). A new variable fails the check until it has its line here or on its engine's page. `c/tools/env_undocumented.txt` lists the ones that had none when the check began; it only shrinks, and a name leaves it in the commit that documents the variable.
+
 ## Where the truth lives
 
 | Doc | Source of truth | What to scan for |
