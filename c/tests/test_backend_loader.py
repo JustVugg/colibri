@@ -918,7 +918,7 @@ class LoaderStubFixtureTest(unittest.TestCase):
             cls.fixture = None
 
     def test_abi_is_derived_from_the_loader_source(self):
-        """47 mandatory + 22 optional, parsed from backend_loader.c.
+        """47 mandatory + 24 optional, parsed from backend_loader.c.
 
         The counts are a deliberate tripwire: adding a RESOLVE to the loader
         widens the ABI every Windows DLL must satisfy, and that should be a
@@ -929,8 +929,8 @@ class LoaderStubFixtureTest(unittest.TestCase):
         """
         f = self.fixture
         self.assertEqual(len(f.mandatory), 47)
-        self.assertEqual(len(f.optional), 22)  # +expert_mxfp4: optional Kimi SiTU pipeline; +dn_create/free/set_state/get_state/step; +tensor_overwrite; +chain_ops (the dense chain's table); +host_register/host_unregister/planar_rows (the qwen36 tier's host pool); +block_elems/tensor_upload_at (a GGUF's block formats, the tier's arena); +tier_ops (the routed-expert tier's table, cu_tier_ops.h)
-        self.assertEqual(len(f.exports), 69)
+        self.assertEqual(len(f.optional), 24)  # +ink_ops (inkling's bf16 matrices, backend_cuda_ink.h); +expert_mxfp4: optional Kimi SiTU pipeline; +dn_create/free/set_state/get_state/step; +tensor_overwrite; +chain_ops (the dense chain's table); +host_register/host_unregister/planar_rows (the qwen36 tier's host pool); +block_elems/tensor_upload_at (a GGUF's block formats, the tier's arena); +tier_ops (the routed-expert tier's table, cu_tier_ops.h); +vision_attention (the Qwen vision tower's attention)
+        self.assertEqual(len(f.exports), 71)
         self.assertEqual(len(f.exports), len(f.mandatory) + len(f.optional))
         self.assertIn("coli_cuda_init", f.mandatory)
         self.assertIn("coli_cuda_e8_set_grid", f.optional)
@@ -941,7 +941,13 @@ class LoaderStubFixtureTest(unittest.TestCase):
         # tier_ops: the engines' routed-expert tier on the device (cu_tier.c); a DLL predating
         # it answers NULL and the tier stays off.
         self.assertIn("coli_cuda_tier_ops", f.optional)
+        # ink_ops: inkling's bf16 matrices on the card (backend_cuda_ink.h); a DLL predating it
+        # answers NULL and inkling.exe runs on Vulkan or the CPU.
+        self.assertIn("coli_cuda_ink_ops", f.optional)
         self.assertIn("coli_cuda_tensor_upload_at", f.optional)
+        # vision_attention: the Qwen vision tower's attention on the card (qwen38_vision.h); a DLL
+        # predating it answers 0 and the tower keeps the CPU's.
+        self.assertIn("coli_cuda_vision_attention", f.optional)
         # attention_project_ragged: paged ragged KV runtime (#795).
         self.assertIn("coli_cuda_attention_project_ragged", f.mandatory)
         # fp8_set_lut: fmt=8 e4m3 dense/expert kernels (#817).
@@ -2961,17 +2967,23 @@ class LoaderPreInitAvailabilityTest(unittest.TestCase):
         self.assertEqual(out.get("backend_loaded"), "0", detail)
         self.assertEqual(out.get("loader_init"), "0", detail)
 
-    def test_the_probe_falls_back_for_a_dll_without_the_export(self):
-        """An older DLL answers through device_count(), not through a crash."""
+    def test_the_probe_names_a_dll_without_the_export(self):
+        """An older DLL answers 0 and says why, not through a crash (#1542).
+
+        device_count() counts the contexts init made, so before init it was 0
+        on a real DLL whatever the fake here returns: the fallback chose the
+        CPU without a word. The message names the export and the two ways out.
+        """
         f = self.fixture
         proc, out = self._probe("probe_older_dll", vendor="cuda",
                                 backend_override=f.cuda_backend_old)
         detail = self._detail(proc)
         self.assertEqual(proc.returncode, 0, "harness failed" + detail)
         self.assertEqual(out.get("backend_loaded_after_probe"), "1", detail)
-        self.assertEqual(out.get("available_before_init"),
-                         str(_DEVICE_COUNT_PROBE),
-                         "the fallback did not reach device_count()" + detail)
+        self.assertEqual(out.get("available_before_init"), "0", detail)
+        err = proc.stderr or ""
+        self.assertIn("missing symbol coli_cuda_available_device_count", err, detail)
+        self.assertIn("COLI_GPUS", err, detail)
 
     def test_the_probe_keeps_the_hip_refusal_before_init(self):
         """A HIP host still refuses without a runtime directory, before init.

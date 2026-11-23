@@ -29,6 +29,21 @@
 
 #include <math.h>
 #include <stdlib.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+/* The `team` of coli_hc_pre_team as a thread count for the mix: 0 is the
+ * OpenMP default team, and no team is larger than that one. */
+static inline int coli_hc_team_size(int team) {
+#ifdef _OPENMP
+    int most = omp_get_max_threads();
+    return team > 0 && team < most ? team : most;
+#else
+    (void)team;
+    return 1;
+#endif
+}
 
 static inline float coli_hc_sigmoid(float value) {
     if (value >= 0.0f) {
@@ -113,12 +128,23 @@ static inline int coli_hc_split_sinkhorn(float *pre, float *post, float *comb,
 /* Entering a block: RMS-rescale the flattened streams, map them to the mix
  * logits through `hc_fn` [(2+hc)*hc, hc*dimension], split, and collapse the
  * streams into `output` [dimension] with the pre weights. `post` and `comb`
- * are handed back for the matching coli_hc_post(). */
-static inline int coli_hc_pre(float *output, float *post, float *comb,
-                              const float *input, const float *hc_fn,
-                              const float scale[3], const float *base,
-                              int hc, int dimension, int iterations,
-                              float norm_eps, float hc_eps) {
+ * are handed back for the matching coli_hc_post().
+ *
+ * `team` sizes the OpenMP teams and nothing else. 0: every loop on the
+ * default team, which is what a caller wants whose team is awake (a CPU run,
+ * one region after another). N >= 1: the mix on N threads and the collapse on
+ * the calling thread, for a caller whose team has gone to sleep between
+ * calls: a token of a GPU decode comes here ~90 times with milliseconds of
+ * device work in between, and waking and joining the whole team costs
+ * several times the ~400k MACs it shares out, let alone the collapse's few
+ * thousand. The loops are the same code whatever the team (the clauses
+ * below), each row and each column summed by one thread in its own order,
+ * so the results do not depend on `team` (tests/test_hc_team.py). */
+static inline int coli_hc_pre_team(float *output, float *post, float *comb,
+                                   const float *input, const float *hc_fn,
+                                   const float scale[3], const float *base,
+                                   int hc, int dimension, int iterations,
+                                   float norm_eps, float hc_eps, int team) {
     if (!output || !post || !comb || !input || !hc_fn || !scale || !base ||
         hc < 1 || dimension < 1 || norm_eps < 0.0f)
         return -1;
@@ -151,7 +177,7 @@ static inline int coli_hc_pre(float *output, float *post, float *comb,
      * this distributes whole rows across threads and is not a SIMD reduction
      * reorder. Nested parallelism was checked separately and is safe here. */
 #ifdef _OPENMP
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) if(team != 1) num_threads(coli_hc_team_size(team))
 #endif
     for (int row = 0; row < mix_count; row++) {
         float sum = 0.0f;
@@ -166,7 +192,7 @@ static inline int coli_hc_pre(float *output, float *post, float *comb,
         return -1;
     }
 #ifdef _OPENMP
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) if(team == 0)
 #endif
     for (int column = 0; column < dimension; column++) {
         float sum = 0.0f;
@@ -179,12 +205,23 @@ static inline int coli_hc_pre(float *output, float *post, float *comb,
     return 0;
 }
 
+static inline int coli_hc_pre(float *output, float *post, float *comb,
+                              const float *input, const float *hc_fn,
+                              const float scale[3], const float *base,
+                              int hc, int dimension, int iterations,
+                              float norm_eps, float hc_eps) {
+    return coli_hc_pre_team(output, post, comb, input, hc_fn, scale, base,
+                            hc, dimension, iterations, norm_eps, hc_eps, 0);
+}
+
 /* Leaving a block: mix the incoming streams through `comb` and add the block's
  * output where `post` says it goes. `output` and `residual` are [hc*dimension]
- * and may not overlap. */
-static inline int coli_hc_post(float *output, const float *branch,
-                               const float *residual, const float *post,
-                               const float *comb, int hc, int dimension) {
+ * and may not overlap. `team` as in coli_hc_pre_team: 0 the default OpenMP
+ * team, anything else the calling thread; the same loop either way. */
+static inline int coli_hc_post_team(float *output, const float *branch,
+                                    const float *residual, const float *post,
+                                    const float *comb, int hc, int dimension,
+                                    int team) {
     if (!output || !branch || !residual || !post || !comb ||
         hc < 1 || dimension < 1)
         return -1;
@@ -192,7 +229,7 @@ static inline int coli_hc_post(float *output, const float *branch,
      * collapse(2) gives full-width parallelism regardless of hc's small
      * size. The inner source-reduction (hc terms) keeps its own order. */
 #ifdef _OPENMP
-    #pragma omp parallel for collapse(2) schedule(static)
+    #pragma omp parallel for collapse(2) schedule(static) if(team == 0)
 #endif
     for (int destination = 0; destination < hc; destination++) {
         for (int column = 0; column < dimension; column++) {
@@ -205,6 +242,13 @@ static inline int coli_hc_post(float *output, const float *branch,
         }
     }
     return 0;
+}
+
+static inline int coli_hc_post(float *output, const float *branch,
+                               const float *residual, const float *post,
+                               const float *comb, int hc, int dimension) {
+    return coli_hc_post_team(output, branch, residual, post, comb, hc,
+                             dimension, 0);
 }
 
 #endif /* COLIBRI_HYPER_CONNECTIONS_H */

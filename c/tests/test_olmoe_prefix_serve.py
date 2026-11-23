@@ -27,6 +27,7 @@ FIXTURE = Path(os.environ.get("OLMOE_TINY", HERE / "olmoe_tiny_c"))
                      "tiny olmoe container is absent (tools/convert_olmoe_merged.py)")
 class OlmoePrefixServeTest(PrefixReuseContract, PromptCancelContract, unittest.TestCase):
     PARKS = True
+    PARK_DECIDES_NEXT = True
     RESUMES_MIDWAY = True
 
     def spawn(self, log_prefix=True, reuse=True):

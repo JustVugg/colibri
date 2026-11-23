@@ -61,27 +61,34 @@ def memory_from_windows_status(total_phys, avail_phys, avail_pagefile=None):
     """GlobalMemoryStatusEx figures. Available is the smaller of free physical
     memory and the commit Windows can still grant (resource_plan's rule, #1375)."""
     available = avail_phys
-    if avail_pagefile and 0 < avail_pagefile < avail_phys:
+    if avail_pagefile is not None and 0 <= avail_pagefile < avail_phys:
         available = avail_pagefile
     return {"total": int(total_phys) if total_phys else None,
-            "available": int(available) if available else None}
+            "available": int(available) if available is not None else None}
 
 
 def memory_from_darwin(memsize_text, vm_stat_text=""):
-    """hw.memsize plus the reclaimable pages of vm_stat (free, inactive,
-    speculative, purgeable), the engine's own definition of available."""
+    """hw.memsize plus what vm_stat says macOS can take back without compressing
+    or swapping (resource_plan.darwin_available_bytes, the planner's own rule)."""
+    from resource_plan import darwin_available_bytes
     try:
         total = int((memsize_text or "").strip())
     except ValueError:
         total = None
-    page_match = re.search(r"page size of (\d+) bytes", vm_stat_text or "")
-    page = int(page_match.group(1)) if page_match else 16384
-    pages = 0
-    for key in ("Pages free", "Pages inactive", "Pages speculative", "Pages purgeable"):
-        match = re.search(rf"{key}:\s+(\d+)\.", vm_stat_text or "")
-        if match:
-            pages += int(match.group(1))
-    return {"total": total, "available": pages * page if pages else None}
+    return {"total": total, "available": darwin_available_bytes(vm_stat_text)}
+
+
+def memory_from_freebsd(sysctl_text):
+    """``sysctl -n hw.physmem vm.stats.vm.v_free_count vm.stats.vm.v_inactive_count
+    vm.stats.vm.v_page_size``: the total, then free + inactive pages, the engine's
+    own definition of available on FreeBSD (resource_plan.freebsd_available_bytes)."""
+    from resource_plan import freebsd_available_bytes
+    values = (sysctl_text or "").split()
+    try:
+        total = int(values[0])
+    except (IndexError, ValueError):
+        total = None
+    return {"total": total, "available": freebsd_available_bytes(" ".join(values[1:]))}
 
 
 def _windows_memory():
@@ -109,6 +116,10 @@ def detect_memory():
         return _windows_memory()
     if sys.platform == "darwin":
         return memory_from_darwin(_run(["sysctl", "-n", "hw.memsize"]), _run(["vm_stat"]))
+    if sys.platform.startswith("freebsd"):
+        # No /proc/meminfo there (linprocfs is optional and rarely mounted).
+        return memory_from_freebsd(_run(["sysctl", "-n", "hw.physmem", "vm.stats.vm.v_free_count",
+                                         "vm.stats.vm.v_inactive_count", "vm.stats.vm.v_page_size"]))
     try:
         with open("/proc/meminfo", encoding="ascii", errors="replace") as handle:
             mem = memory_from_meminfo(handle.read(256 * 1024))
@@ -213,7 +224,9 @@ def detect_cpu():
             with open("/proc/cpuinfo", encoding="utf-8", errors="replace") as handle:
                 cpu = cpu_from_cpuinfo(handle.read(1 << 20))
         except OSError:
-            cpu = {"name": None, "features": []}
+            # Systems without /proc/cpuinfo (the BSDs): failure to read the features, is not
+            # the same as a processor that reports none of them.
+            cpu = {"name": None, "features": [], "features_known": False}
     cpu["arch"] = platform.machine().lower() or None
     cpu["logical_cores"] = os.cpu_count()
     try:
@@ -456,6 +469,25 @@ def detect_nvidia():
         probe = _probe_cuda_child()
         if probe:
             fill_compute_caps(gpus, probe.get("devices"))
+    if gpus and sys.platform == "win32":
+        fill_driver_models(gpus, _run([exe, "--query-gpu=index,driver_model.current",
+                                       "--format=csv,noheader"], timeout=10))
+    return gpus
+
+
+def fill_driver_models(gpus, text):
+    """Windows only: each card's driver model from `nvidia-smi --query-gpu=index,
+    driver_model.current --format=csv,noheader`. A data-center card runs in TCC (or MCDM)
+    mode, where Windows offers no Vulkan device, so the setup can say why Vulkan found
+    none. A separate query: a driver that refused the field would otherwise drop the
+    card's whole row. Unreadable rows leave driver_model None."""
+    models = {}
+    for line in (text or "").splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) == 2 and parts[0].isdigit() and parts[1] and not parts[1].startswith("["):
+            models[int(parts[0])] = parts[1].upper()
+    for gpu in gpus:
+        gpu["driver_model"] = models.get(gpu.get("index"))
     return gpus
 
 
@@ -490,13 +522,21 @@ def _cuda_probe_inprocess():
         # CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75, _MINOR = 76 (cuda.h)
         lib.cuDeviceGetAttribute(ctypes.byref(major), 75, device)
         lib.cuDeviceGetAttribute(ctypes.byref(minor), 76, device)
+        # CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE = 36 (kHz), _GLOBAL_MEMORY_BUS_WIDTH = 37 (bits):
+        # the card's peak memory bandwidth, for the model choice (model_fit.driver_gbs)
+        clock, bits = c_int(0), c_int(0)
+        if lib.cuDeviceGetAttribute(ctypes.byref(clock), 36, device) != 0:
+            clock.value = 0
+        if lib.cuDeviceGetAttribute(ctypes.byref(bits), 37, device) != 0:
+            bits.value = 0
         bus = ctypes.create_string_buffer(64)
         name = ctypes.create_string_buffer(256)
         lib.cuDeviceGetPCIBusId(bus, 64, device)
         lib.cuDeviceGetName(name, 256, device)
         devices.append({"name": name.value.decode("utf-8", "replace"),
                         "pci_bus_id": bus.value.decode("ascii", "replace"),
-                        "compute_cap": f"{major.value}.{minor.value}" if major.value else None})
+                        "compute_cap": f"{major.value}.{minor.value}" if major.value else None,
+                        "memory_clock_khz": clock.value or None, "memory_bus_bits": bits.value or None})
     return {"driver": True, "devices": devices}
 
 
@@ -755,6 +795,19 @@ def best_vulkan_device(devices):
     return best
 
 
+def engine_vulkan_device(devices, env=None):
+    """The device the engine opens (backend_vulkan.c coli_vk_init): COLI_VK_DEV=<index>
+    takes that entry of the enumeration, of the first eight it reads; unset, not a
+    number, or out of range, the ranking of best_vulkan_device."""
+    env = os.environ if env is None else env
+    devices = list(devices)[:8]
+    value = env.get("COLI_VK_DEV") or ""
+    # strtol(value, &end, 10) with nothing left after the number
+    if re.fullmatch(r"[ \t\n\v\f\r]*[+-]?[0-9]+", value) and 0 <= int(value) < len(devices):
+        return devices[int(value)]
+    return best_vulkan_device(devices)
+
+
 def find_user_icds(home=None):
     """Vulkan driver manifests installed under the home directory.
 
@@ -917,7 +970,9 @@ def format_report(report):
                          ("avx2", "avx_vnni", "avx512f", "avx512_vnni", "avx512_bf16", "asimddp", "sve"))
     lines.append(f"  CPU     {cpu.get('name') or cpu.get('arch') or '?'}, {core_text}"
                  + (f", {features}" if features else ""))
-    missing = missing_for_prebuilt(cpu)
+    # When features are unknown (features_known False), do not report the "no AVX2"
+    # message because the processor could have the feature.
+    missing = missing_for_prebuilt(cpu) if cpu.get("features_known", True) else []
     if missing:
         lines.append(f"          note: no {', '.join(f.upper() for f in missing)}: the prebuilt "
                      "engines need it, so the engine is built for this processor (a compiler "

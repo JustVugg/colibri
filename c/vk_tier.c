@@ -80,16 +80,20 @@ static struct {
      * layers', [1] the extra layers' (VktConfig.extra_layers, an MTP head's), from
      * main_layers on; [2..nform) the main layers' other forms when their formats differ
      * by layer (VktConfig.layer_gate_up/layer_down), lform[l] naming each layer's. Then
-     * the main layers fall in two classes of rooms (lcls[l]): 0 those of the form most
-     * layers have, their tensors at their own size, 1 the others, each tensor in the room
-     * of its role's biggest form among them (pad_w, pad_s [class][role]: [0] gate and up,
-     * [1] down). A newcomer displaces a resident of its own class (vcls_of), so a freed
-     * expert's ranges fit the one that takes its place. */
+     * the main layers fall in classes of rooms (lcls[l], ncls of them): one for each size
+     * their forms' tensors take, 0 that of the form most layers have, so every tensor sits
+     * in a room of its own size (pad_w, pad_s [class][role]: [0] gate and up, [1] down).
+     * A newcomer displaces a resident of its own class (vcls_of), so a freed expert's
+     * ranges fit the one that takes its place; failing that, one of a class whose rooms
+     * hold it (fall[class]: those classes, the tightest first, nfall of them). */
     int main_layers;
     struct { VktFmt gu, dn; int gu_fmt, gu_gs, dn_fmt, dn_gs; size_t gu_codes, gu_scales, d_codes, d_scales, stage_bytes; } form[VKT_FORMS];
     int nform, per_layer;
     uint8_t lform[VKT_MAX_LAYERS], lcls[VKT_MAX_LAYERS];
-    size_t pad_w[2][2], pad_s[2][2];
+    int ncls, major;                   /* the room classes; the form most layers have */
+    size_t mpad_w[2], mpad_s[2];       /* the other forms' biggest tensors by role (tier_stage_expert_bytes_at) */
+    size_t pad_w[VKT_FORMS][2], pad_s[VKT_FORMS][2];
+    uint8_t fall[VKT_FORMS][VKT_FORMS], nfall[VKT_FORMS];
     int h_exact; size_t h_bytes, h_max;   /* the host pool's experts at their own forms' sizes (host_init): the average, the largest */
     /* the extra layers' experts: on the primary device, in a pool of their own (another
      * size than the main ones', so neither leaves holes the other cannot use), at most
@@ -138,15 +142,21 @@ static struct {
     pthread_t th; int th_on, stop;
     pthread_mutex_t mx; pthread_cond_t cv, cv_room, cv_done;
     int busy;                          /* the uploader is between taking an entry and push_done */
+    int giving;                        /* vkt_give_back waits for the queue: an upload refused for room gives up
+                                        * at once (the room it waits for only the engine thread makes, and that
+                                        * thread is the one waiting, #2705) */
     int sync;                          /* COLI_VK_TIER_SYNC=1: quiescent points wait for the uploader */
     int evict_pending;                 /* victims chosen and not freed yet (a batch is in flight) */
+    /* what vkt_give_back took from the primary device and vkt_take_back has not returned: places
+     * (dmax[0]), bytes of the budget and of the pool's limit */
+    int gb_owed; size_t gb_owed_bytes;
     VQ q[VKT_QCAP]; int qh, qn;
     VDone *done; int ndone, cdone;
     unsigned long room_gen;
     /* evicted, freed at the next quiescent point */
     int *evict; int nevict, cevict;
     /* the coldest residents, refreshed once per forward */
-    int cand[3][VKT_CAND]; uint64_t cand_score[3][VKT_CAND]; int ncand[3];   /* per class (vcls_of): main, extra, the main layers' other forms */
+    int cand[VKT_FORMS + 1][VKT_CAND]; uint64_t cand_score[VKT_FORMS + 1][VKT_CAND]; int ncand[VKT_FORMS + 1];   /* per class (vcls_of): main, extra, the main layers' other rooms */
     /* the step in flight */
     int inflight, S, K;
     int *map; int cmap;
@@ -185,6 +195,7 @@ static struct {
     /* failed, by what: the pool refused the expert (no room as it is laid out), the copy
      * to the device failed, or the batch could not take the uploaded expert's sets */
     unsigned long long f_pool, f_copy, f_sets;
+    unsigned long long gave_up;          /* uploads given up for a give-back (#2705): back on the CPU, not failed */
     int plan_hist;                        /* the last plan's experts from the history (vkt_plan) */
     double dev_ms, cpu_ms, wait_ms;
     unsigned long long rep_routed, rep_served;
@@ -224,14 +235,15 @@ static int place_of(const VSlot *v) { return v->host ? 2 : v->dev; }
 static void set_place(VSlot *v, int pl) { v->dev = (uint8_t)(pl == 2 ? 0 : pl); v->host = (uint8_t)(pl == 2); }
 static int form_of(int layer) { return T.per_layer && layer < T.main_layers ? T.lform[layer] : kind_of(layer); }
 /* the class of the residents a newcomer of `layer` displaces: 0 the main layers of the most
- * common form, 2 those of the other forms, 1 the extra layers (each class's rooms alike) */
-static int vcls_of(int layer) { return kind_of(layer) ? 1 : T.per_layer && T.lcls[layer] ? 2 : 0; }
+ * common form, 1 the extra layers, 2 on those of the main layers' other rooms, room class
+ * c at c + 1 (each class's rooms alike) */
+static int vcls_of(int layer) { return kind_of(layer) ? 1 : T.per_layer && T.lcls[layer] ? T.lcls[layer] + 1 : 0; }
 /* a main tensor's room (forms_per_layer): its class's, 0 with one form (its own size) */
 static size_t pad_w_of(int layer, int down) { return T.per_layer && !kind_of(layer) ? T.pad_w[T.lcls[layer]][down] : 0; }
 static size_t pad_s_of(int layer, int down) { return T.per_layer && !kind_of(layer) ? T.pad_s[T.lcls[layer]][down] : 0; }
 /* the room of any main expert: a staging slot refilled with every form */
-static size_t pad_w_max(int down) { return T.pad_w[0][down] > T.pad_w[1][down] ? T.pad_w[0][down] : T.pad_w[1][down]; }
-static size_t pad_s_max(int down) { return T.pad_s[0][down] > T.pad_s[1][down] ? T.pad_s[0][down] : T.pad_s[1][down]; }
+static size_t pad_w_max(int down) { size_t m = 0; for (int c = 0; c < T.ncls; c++) if (T.pad_w[c][down] > m) m = T.pad_w[c][down]; return m; }
+static size_t pad_s_max(int down) { size_t m = 0; for (int c = 0; c < T.ncls; c++) if (T.pad_s[c][down] > m) m = T.pad_s[c][down]; return m; }
 
 /* ---- source formats ---------------------------------------------------------- */
 static int src_per_row(VktSrc k) {
@@ -430,14 +442,15 @@ static void promote_copy(const VQ *e) {
         if (!src[k] || frees >= 3 || waited >= 600 || T.sync) break;
         pthread_mutex_lock(&T.mx);
         unsigned long gen = T.room_gen;
-        while (T.room_gen == gen && !T.stop && waited < 600) {
+        while (T.room_gen == gen && !T.stop && !T.giving && waited < 600) {
             struct timespec until; clock_gettime(CLOCK_REALTIME, &until);
             until.tv_nsec += 100 * 1000000L; if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
             if (pthread_cond_timedwait(&T.cv_room, &T.mx, &until) == ETIMEDOUT) waited++;
         }
         if (T.room_gen != gen) frees++;
-        int stop = T.stop;
+        int stop = T.stop, gave = T.giving;
         pthread_mutex_unlock(&T.mx);
+        if (gave) { copy_failed = 2; break; }   /* given up for a give-back: no question of the budget */
         if (stop) break;
     }
     if (ok && !coli_vk_tensor_copy(t, src, 3)) {
@@ -484,7 +497,7 @@ static void *uploader(void *arg) {
         const uint8_t *g = b, *u = g + guc, *d = u + guc;
         const uint8_t *gs = d + dc, *us = gs + gus, *ds = us + gus;
         ColiVkTensor *t[3];
-        int ok = 0, r = 0;
+        int ok = 0, r = 0, gave = 0;
         /* Refused: the pool is at its budget until the engine thread frees the victim
          * this promotion displaced, at its next quiescent point (a join: every layer
          * in decode, after a chunk's CPU work in prefill). Wait for room to be made
@@ -499,19 +512,20 @@ static void *uploader(void *arg) {
             if (ok || r < 0 || frees >= 3 || waited >= 600 || T.sync) break;
             pthread_mutex_lock(&T.mx);
             unsigned long gen = T.room_gen;
-            while (T.room_gen == gen && !T.stop && waited < 600) {
+            while (T.room_gen == gen && !T.stop && !T.giving && waited < 600) {
                 struct timespec until; clock_gettime(CLOCK_REALTIME, &until);
                 until.tv_nsec += 100 * 1000000L; if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
                 if (pthread_cond_timedwait(&T.cv_room, &T.mx, &until) == ETIMEDOUT) waited++;
             }
             if (T.room_gen != gen) frees++;
             int stop = T.stop;
+            gave = T.giving;
             pthread_mutex_unlock(&T.mx);
-            if (stop) break;
+            if (stop || gave) break;
         }
         free(e.buf);
         if (!ok) t[0] = t[1] = t[2] = NULL;
-        push_done(e.layer, e.eid, ok, r < 0, t, NULL);
+        push_done(e.layer, e.eid, ok, gave && !ok ? 2 : r < 0, t, NULL);   /* 2: given up for a give-back */
     }
 }
 
@@ -606,6 +620,7 @@ static void quiesce(void) {
                 continue;
             }
             for (int k = 0; k < 3; k++) { ColiVkTensor *t = k == 0 ? d[i].g : k == 1 ? d[i].u : d[i].d; if (t) coli_vk_tensor_free(t); }
+            if (d[i].copy_failed == 2) { T.gave_up++; continue; }   /* for a give-back: it may come again, the budget stands */
             T.failed++;
             if (d[i].ok) T.f_sets++; else if (d[i].copy_failed) T.f_copy++; else T.f_pool++;
             if (!d[i].ok && !d[i].copy_failed && T.dmax[0] > T.dres[0] + T.dque[0]) {
@@ -630,6 +645,7 @@ static void quiesce(void) {
             for (int k = 0; k < 3; k++) { ColiVkTensor *t = k == 0 ? d[i].g : k == 1 ? d[i].u : d[i].d; if (t) coli_vk_tensor_free(t); }
             v->state = VS_NONE; set_place(v, 0);
             if (dv && !T.d2) continue;
+            if (d[i].copy_failed == 2) { T.gave_up++; continue; }   /* for a give-back: it may come again, the budget stands */
             T.failed++;
             if (d[i].ok) T.f_sets++; else if (d[i].copy_failed) T.f_copy++; else T.f_pool++;
             /* refused: the budget holds fewer than the count said (fragmentation, or the
@@ -706,7 +722,7 @@ static uint64_t score(const VSlot *v) { return tier_lfru_score(v->heat, v->last,
 /* The coldest residents of each kind, ascending, once per forward (T.full: on the device,
  * the host pool holding every expert anyway). */
 static void refresh_candidates(void) {
-    T.ncand[0] = T.ncand[1] = T.ncand[2] = 0;
+    memset(T.ncand, 0, sizeof T.ncand);
     size_t n = (size_t)T.c.layers * T.c.experts;
     for (size_t i = 0; i < n; i++) {
         VSlot *v = &T.s[i];
@@ -740,22 +756,25 @@ static int peek_victim(int k, uint64_t hs) {
 }
 
 /* The resident a newcomer of `layer` with score hs displaces, or -1, and *from its class:
- * one of its own class first; failing that, with forms by layer, one of the other main
+ * one of its own class first; failing that, with forms by layer, one of another main
  * class whose rooms hold its tensors (a smaller form's newcomer in a bigger form's room,
- * never the other way: the freed ranges would not hold it). */
+ * never the other way: the freed ranges would not hold it), the tightest rooms first. */
 static int rooms_hold(int a, int b) {   /* pad class a's rooms hold pad class b's tensors */
     for (int r = 0; r < 2; r++) if (T.pad_w[a][r] < T.pad_w[b][r] || T.pad_s[a][r] < T.pad_s[b][r]) return 0;
     return 1;
 }
+static size_t room_bytes(int c) { return 2 * (T.pad_w[c][0] + T.pad_s[c][0]) + T.pad_w[c][1] + T.pad_s[c][1]; }
 static int pick_victim(int layer, uint64_t hs, int *from) {
     const int k = vcls_of(layer);
     int v = peek_victim(k, hs);
     *from = k;
     if (v >= 0 || k == 1 || !T.per_layer) return v;
-    const int o = k == 0 ? 2 : 0;
-    if (!rooms_hold(o == 2, k == 2)) return -1;
-    *from = o;
-    return peek_victim(o, hs);
+    const int c = T.lcls[layer];
+    for (int i = 0; i < T.nfall[c]; i++) {
+        const int o = T.fall[c][i] ? T.fall[c][i] + 1 : 0;
+        if ((v = peek_victim(o, hs)) >= 0) { *from = o; return v; }
+    }
+    return -1;
 }
 
 /* A forward starts when the layer index goes back (a layer that issues several
@@ -1602,7 +1621,7 @@ static int join_big(const float **rows) {
 /* layer's likely streamed experts into the free slots, while the device runs its attention */
 int vkt_stream_prefetch(int layer, int S) {
     if (!T.on || !T.st_ok || T.inflight || layer < 0 || layer >= T.main_layers || S < T.gemm_rows) return 0;
-    if (!coli_vk_xb_ready() || !st_alloc()) return 0;
+    if (!coli_vk_xb_ready()) return 0;
     const int E = T.c.experts, K = T.c.topk;
     int R = stream_min_rows();
     /* the slots a step before left filled are free again */
@@ -1629,6 +1648,10 @@ int vkt_stream_prefetch(int layer, int S) {
             while (at > 0 && est[cand[at - 1]] < est[e]) { cand[at] = cand[at - 1]; at--; }
             cand[at] = e;
         }
+    /* With every expert resident (in VRAM or the host pool), nothing needs a
+     * streaming slot. Keep the budget/resident set, but allocate slots only
+     * after finding a candidate: an empty prefetch must not consume VRAM. */
+    if (nc && !st_alloc()) { free(est); free(cand); return 0; }
     int got = 0, used = 0;
     if (nc > T.st_n) nc = T.st_n;
     while (used < nc) {   /* groups of a sub-batch's worth, into the slots in order */
@@ -1746,12 +1769,219 @@ static void dev_codes3(uint8_t *u, const uint8_t *row, int I) {
 /* an MXFP4 row's values times 2, as int8 (e2m1: 0, 0.5, 1, 1.5, 2, 3, 4, 6 and the sign) */
 static void dev_codes_fp4(int8_t *w, const uint8_t *row, int I) {
     static const int8_t v2[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
-    for (int j = 0; j < I / 2; j++) { w[2 * j] = v2[row[j] & 15]; w[2 * j + 1] = v2[row[j] >> 4]; }
+    int j = 0;
+#if defined(__AVX2__)
+    /* The scalar table lookup, 16 packed bytes at a time. The two shuffles
+     * produce exactly the same signed int8 codes; arithmetic is unchanged. */
+    const __m128i lut = _mm_loadu_si128((const __m128i *)v2);
+    const __m128i mask = _mm_set1_epi8(15);
+    for (; j + 16 <= I / 2; j += 16) {
+        const __m128i b = _mm_loadu_si128((const __m128i *)(row + j));
+        const __m128i lo = _mm_shuffle_epi8(lut, _mm_and_si128(b, mask));
+        const __m128i hi = _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(b, 4), mask));
+        _mm_storeu_si128((__m128i *)(w + 2 * j), _mm_unpacklo_epi8(lo, hi));
+        _mm_storeu_si128((__m128i *)(w + 2 * j + 16), _mm_unpackhi_epi8(lo, hi));
+    }
+#endif
+    for (; j < I / 2; j++) { w[2 * j] = v2[row[j] & 15]; w[2 * j + 1] = v2[row[j] >> 4]; }
 }
 static float dev_fp8(uint8_t b) {   /* e4m3 as the backend decodes it */
     const int e = (b >> 3) & 15, m = b & 7;
     const float v = e == 0 ? m / 512.0f : ldexpf(1.0f + m / 8.0f, e - 7);
     return (b & 0x80) ? -v : v;
+}
+/* dev_fp8 of every code, written out (exact: three mantissa bits). The hybrid steps' FP8 rows read
+ * their weights from it instead of an ldexpf and a division for the scale per weight. As in
+ * dev_fp8, the two NaN codes of e4m3 (0x7f, 0xff) are finite here (+-480) where the shaders and
+ * quant.h give NaN; a well-formed checkpoint saturates at +-448 and never holds them. */
+static const float fp8_e4m3[256] __attribute__((aligned(64))) = {
+    0.0f, 0x1p-9f, 0x1p-8f, 0x1.8p-8f, 0x1p-7f, 0x1.4p-7f, 0x1.8p-7f, 0x1.cp-7f,
+    0x1p-6f, 0x1.2p-6f, 0x1.4p-6f, 0x1.6p-6f, 0x1.8p-6f, 0x1.ap-6f, 0x1.cp-6f, 0x1.ep-6f,
+    0x1p-5f, 0x1.2p-5f, 0x1.4p-5f, 0x1.6p-5f, 0x1.8p-5f, 0x1.ap-5f, 0x1.cp-5f, 0x1.ep-5f,
+    0x1p-4f, 0x1.2p-4f, 0x1.4p-4f, 0x1.6p-4f, 0x1.8p-4f, 0x1.ap-4f, 0x1.cp-4f, 0x1.ep-4f,
+    0x1p-3f, 0x1.2p-3f, 0x1.4p-3f, 0x1.6p-3f, 0x1.8p-3f, 0x1.ap-3f, 0x1.cp-3f, 0x1.ep-3f,
+    0x1p-2f, 0x1.2p-2f, 0x1.4p-2f, 0x1.6p-2f, 0x1.8p-2f, 0x1.ap-2f, 0x1.cp-2f, 0x1.ep-2f,
+    0x1p-1f, 0x1.2p-1f, 0x1.4p-1f, 0x1.6p-1f, 0x1.8p-1f, 0x1.ap-1f, 0x1.cp-1f, 0x1.ep-1f,
+    0x1p+0f, 0x1.2p+0f, 0x1.4p+0f, 0x1.6p+0f, 0x1.8p+0f, 0x1.ap+0f, 0x1.cp+0f, 0x1.ep+0f,
+    0x1p+1f, 0x1.2p+1f, 0x1.4p+1f, 0x1.6p+1f, 0x1.8p+1f, 0x1.ap+1f, 0x1.cp+1f, 0x1.ep+1f,
+    0x1p+2f, 0x1.2p+2f, 0x1.4p+2f, 0x1.6p+2f, 0x1.8p+2f, 0x1.ap+2f, 0x1.cp+2f, 0x1.ep+2f,
+    0x1p+3f, 0x1.2p+3f, 0x1.4p+3f, 0x1.6p+3f, 0x1.8p+3f, 0x1.ap+3f, 0x1.cp+3f, 0x1.ep+3f,
+    0x1p+4f, 0x1.2p+4f, 0x1.4p+4f, 0x1.6p+4f, 0x1.8p+4f, 0x1.ap+4f, 0x1.cp+4f, 0x1.ep+4f,
+    0x1p+5f, 0x1.2p+5f, 0x1.4p+5f, 0x1.6p+5f, 0x1.8p+5f, 0x1.ap+5f, 0x1.cp+5f, 0x1.ep+5f,
+    0x1p+6f, 0x1.2p+6f, 0x1.4p+6f, 0x1.6p+6f, 0x1.8p+6f, 0x1.ap+6f, 0x1.cp+6f, 0x1.ep+6f,
+    0x1p+7f, 0x1.2p+7f, 0x1.4p+7f, 0x1.6p+7f, 0x1.8p+7f, 0x1.ap+7f, 0x1.cp+7f, 0x1.ep+7f,
+    0x1p+8f, 0x1.2p+8f, 0x1.4p+8f, 0x1.6p+8f, 0x1.8p+8f, 0x1.ap+8f, 0x1.cp+8f, 0x1.ep+8f,
+    -0.0f, -0x1p-9f, -0x1p-8f, -0x1.8p-8f, -0x1p-7f, -0x1.4p-7f, -0x1.8p-7f, -0x1.cp-7f,
+    -0x1p-6f, -0x1.2p-6f, -0x1.4p-6f, -0x1.6p-6f, -0x1.8p-6f, -0x1.ap-6f, -0x1.cp-6f, -0x1.ep-6f,
+    -0x1p-5f, -0x1.2p-5f, -0x1.4p-5f, -0x1.6p-5f, -0x1.8p-5f, -0x1.ap-5f, -0x1.cp-5f, -0x1.ep-5f,
+    -0x1p-4f, -0x1.2p-4f, -0x1.4p-4f, -0x1.6p-4f, -0x1.8p-4f, -0x1.ap-4f, -0x1.cp-4f, -0x1.ep-4f,
+    -0x1p-3f, -0x1.2p-3f, -0x1.4p-3f, -0x1.6p-3f, -0x1.8p-3f, -0x1.ap-3f, -0x1.cp-3f, -0x1.ep-3f,
+    -0x1p-2f, -0x1.2p-2f, -0x1.4p-2f, -0x1.6p-2f, -0x1.8p-2f, -0x1.ap-2f, -0x1.cp-2f, -0x1.ep-2f,
+    -0x1p-1f, -0x1.2p-1f, -0x1.4p-1f, -0x1.6p-1f, -0x1.8p-1f, -0x1.ap-1f, -0x1.cp-1f, -0x1.ep-1f,
+    -0x1p+0f, -0x1.2p+0f, -0x1.4p+0f, -0x1.6p+0f, -0x1.8p+0f, -0x1.ap+0f, -0x1.cp+0f, -0x1.ep+0f,
+    -0x1p+1f, -0x1.2p+1f, -0x1.4p+1f, -0x1.6p+1f, -0x1.8p+1f, -0x1.ap+1f, -0x1.cp+1f, -0x1.ep+1f,
+    -0x1p+2f, -0x1.2p+2f, -0x1.4p+2f, -0x1.6p+2f, -0x1.8p+2f, -0x1.ap+2f, -0x1.cp+2f, -0x1.ep+2f,
+    -0x1p+3f, -0x1.2p+3f, -0x1.4p+3f, -0x1.6p+3f, -0x1.8p+3f, -0x1.ap+3f, -0x1.cp+3f, -0x1.ep+3f,
+    -0x1p+4f, -0x1.2p+4f, -0x1.4p+4f, -0x1.6p+4f, -0x1.8p+4f, -0x1.ap+4f, -0x1.cp+4f, -0x1.ep+4f,
+    -0x1p+5f, -0x1.2p+5f, -0x1.4p+5f, -0x1.6p+5f, -0x1.8p+5f, -0x1.ap+5f, -0x1.cp+5f, -0x1.ep+5f,
+    -0x1p+6f, -0x1.2p+6f, -0x1.4p+6f, -0x1.6p+6f, -0x1.8p+6f, -0x1.ap+6f, -0x1.cp+6f, -0x1.ep+6f,
+    -0x1p+7f, -0x1.2p+7f, -0x1.4p+7f, -0x1.6p+7f, -0x1.8p+7f, -0x1.ap+7f, -0x1.cp+7f, -0x1.ep+7f,
+    -0x1p+8f, -0x1.2p+8f, -0x1.4p+8f, -0x1.6p+8f, -0x1.8p+8f, -0x1.ap+8f, -0x1.cp+8f, -0x1.ep+8f,
+};
+#if defined(__AVX2__) && defined(__FMA__)
+static inline float fp8_hsum(__m256 v) {
+    __m128 s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    return _mm_cvtss_f32(_mm_add_ss(s, _mm_movehdup_ps(s)));
+}
+#endif
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+/* fp8_e4m3[] of eight codes without the table (vgatherdps bound the rows at 6-9 cycles per eight
+ * weights on a Xeon Gold 6254): each code in the high byte of a 16-bit lane, shifted right by one
+ * with its sign (bit 15 stays; bit 14 takes a copy that the mask 0xBF80 clears) is binary16 with
+ * exponent field e (0..15, never 31) and fraction m << 7, exactly 2^-8 of the code's value; F16C
+ * widens it exactly, and * 256 is exact. All 256 codes give fp8_e4m3[]'s bits, -0.0 and the two
+ * NaN codes' +-480 included, with or without FTZ/DAZ. */
+static inline __m256 fp8_half8(__m128i hb) {
+    const __m128i h = _mm_and_si128(_mm_srai_epi16(hb, 1), _mm_set1_epi16((short)0xBF80));
+    return _mm256_mul_ps(_mm256_cvtph_ps(h), _mm256_set1_ps(256.0f));
+}
+static inline __m256 fp8_lo8(__m128i b) { return fp8_half8(_mm_unpacklo_epi8(_mm_setzero_si128(), b)); }
+static inline __m256 fp8_hi8(__m128i b) { return fp8_half8(_mm_unpackhi_epi8(_mm_setzero_si128(), b)); }
+#define FP8_F16C 1
+#endif
+/* An FP8 e4m3 row (fmt 12, a scale per gs columns; gs 0: one for the row) against n float rows, n
+ * a constant where it is inlined: eight columns a step, the codes' values gathered from fp8_e4m3,
+ * a group's sums times its scale once. The float reference (dev_dequant, then a scalar sum per
+ * row) took an ldexpf and a division per weight: on a Xeon Gold 6254, 16 threads, Qwen3.8-Flash-
+ * Next's host pool pairs took 41 ms a layer step (6.4 pairs, 0.75 GB/s). Same weights; each
+ * group's sum times its scale instead of each weight times it, and the sums in another order
+ * (eight lanes): within 4.1e-7 of a double-precision reference (tests/test_vk_tier host-pairs). */
+static inline __attribute__((always_inline)) void fp8_rows_n(float *y, int ys, const float *const *xf, const uint8_t *row,
+                                                              int I, const float *rs, int gs, const int n) {
+    if (gs <= 0) gs = I;
+#if defined(__AVX2__) && defined(__FMA__)
+    __m256 tot[4], grp[4];
+    float tail[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int k = 0; k < n; k++) tot[k] = _mm256_setzero_ps();
+    for (int g0 = 0; g0 < I; g0 += gs) {
+        const int g1 = g0 + gs < I ? g0 + gs : I;
+        const float sc = rs[g0 / gs];
+        for (int k = 0; k < n; k++) grp[k] = _mm256_setzero_ps();
+        int i = g0;
+#ifdef FP8_F16C
+        for (; i + 16 <= g1; i += 16) {
+            const __m128i b = _mm_loadu_si128((const __m128i *)(row + i));
+            const __m256 w0 = fp8_lo8(b), w1 = fp8_hi8(b);
+            for (int k = 0; k < n; k++) grp[k] = _mm256_fmadd_ps(w0, _mm256_loadu_ps(xf[k] + i), grp[k]);
+            for (int k = 0; k < n; k++) grp[k] = _mm256_fmadd_ps(w1, _mm256_loadu_ps(xf[k] + i + 8), grp[k]);
+        }
+        for (; i + 8 <= g1; i += 8) {
+            const __m256 w = fp8_lo8(_mm_loadl_epi64((const __m128i *)(row + i)));
+            for (int k = 0; k < n; k++) grp[k] = _mm256_fmadd_ps(w, _mm256_loadu_ps(xf[k] + i), grp[k]);
+        }
+#else
+        for (; i + 8 <= g1; i += 8) {
+            const __m256 w = _mm256_i32gather_ps(fp8_e4m3, _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(row + i))), 4);
+            for (int k = 0; k < n; k++) grp[k] = _mm256_fmadd_ps(w, _mm256_loadu_ps(xf[k] + i), grp[k]);
+        }
+#endif
+        const __m256 scv = _mm256_set1_ps(sc);
+        for (int k = 0; k < n; k++) tot[k] = _mm256_fmadd_ps(grp[k], scv, tot[k]);
+        for (; i < g1; i++) {
+            const float w = fp8_e4m3[row[i]] * sc;
+            for (int k = 0; k < n; k++) tail[k] += w * xf[k][i];
+        }
+    }
+    for (int k = 0; k < n; k++) y[(size_t)k * ys] = fp8_hsum(tot[k]) + tail[k];
+#else
+    float tot[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int g0 = 0; g0 < I; g0 += gs) {
+        const int g1 = g0 + gs < I ? g0 + gs : I;
+        float grp[4] = {0.f, 0.f, 0.f, 0.f};
+        for (int i = g0; i < g1; i++) {
+            const float w = fp8_e4m3[row[i]];
+            for (int k = 0; k < n; k++) grp[k] += w * xf[k][i];
+        }
+        for (int k = 0; k < n; k++) tot[k] += grp[k] * rs[g0 / gs];
+    }
+    for (int k = 0; k < n; k++) y[(size_t)k * ys] = tot[k];
+#endif
+}
+/* fp8_rows_n for any count of rows, four at a time (a step of the hybrid has one to eight) */
+/* fp8_rows_n on a row already decoded to floats (w: fp8_e4m3 of its codes), the same FMA sequence
+ * for each activation row, so the same bits */
+static inline __attribute__((always_inline)) void fp8_rows_nf(float *y, int ys, const float *const *xf, const float *w,
+                                                               int I, const float *rs, int gs, const int n) {
+    if (gs <= 0) gs = I;
+#if defined(__AVX2__) && defined(__FMA__)
+    __m256 tot[4], grp[4];
+    float tail[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int k = 0; k < n; k++) tot[k] = _mm256_setzero_ps();
+    for (int g0 = 0; g0 < I; g0 += gs) {
+        const int g1 = g0 + gs < I ? g0 + gs : I;
+        const float sc = rs[g0 / gs];
+        for (int k = 0; k < n; k++) grp[k] = _mm256_setzero_ps();
+        int i = g0;
+        for (; i + 8 <= g1; i += 8) {
+            const __m256 wv = _mm256_loadu_ps(w + i);
+            for (int k = 0; k < n; k++) grp[k] = _mm256_fmadd_ps(wv, _mm256_loadu_ps(xf[k] + i), grp[k]);
+        }
+        const __m256 scv = _mm256_set1_ps(sc);
+        for (int k = 0; k < n; k++) tot[k] = _mm256_fmadd_ps(grp[k], scv, tot[k]);
+        for (; i < g1; i++) {
+            const float wi = w[i] * sc;
+            for (int k = 0; k < n; k++) tail[k] += wi * xf[k][i];
+        }
+    }
+    for (int k = 0; k < n; k++) y[(size_t)k * ys] = fp8_hsum(tot[k]) + tail[k];
+#else
+    float tot[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int g0 = 0; g0 < I; g0 += gs) {
+        const int g1 = g0 + gs < I ? g0 + gs : I;
+        float grp[4] = {0.f, 0.f, 0.f, 0.f};
+        for (int i = g0; i < g1; i++)
+            for (int k = 0; k < n; k++) grp[k] += w[i] * xf[k][i];
+        for (int k = 0; k < n; k++) tot[k] += grp[k] * rs[g0 / gs];
+    }
+    for (int k = 0; k < n; k++) y[(size_t)k * ys] = tot[k];
+#endif
+}
+/* fp8_rows_n for any count of rows, four at a time (a decode step has one to eight). Past four (a
+ * prompt step's expert of up to COLI_VK_HYBRID_BIG_ROWS rows) the row is decoded once into wtmp (I
+ * floats) and every pass of four reads it there. */
+static void fp8_rows(float *y, int ys, int S, const float *const *xf, const uint8_t *row, int I, const float *rs, int gs,
+                     float *wtmp) {
+    if (S > 4 && wtmp) {
+        int i = 0;
+#ifdef FP8_F16C
+        for (; i + 16 <= I; i += 16) {
+            const __m128i b = _mm_loadu_si128((const __m128i *)(row + i));
+            _mm256_storeu_ps(wtmp + i, fp8_lo8(b));
+            _mm256_storeu_ps(wtmp + i + 8, fp8_hi8(b));
+        }
+#endif
+        for (; i < I; i++) wtmp[i] = fp8_e4m3[row[i]];
+        for (int s = 0; s < S; s += 4) {
+            float *ys0 = y + (size_t)s * ys;
+            switch (S - s) {
+            case 1: fp8_rows_nf(ys0, ys, xf + s, wtmp, I, rs, gs, 1); break;
+            case 2: fp8_rows_nf(ys0, ys, xf + s, wtmp, I, rs, gs, 2); break;
+            case 3: fp8_rows_nf(ys0, ys, xf + s, wtmp, I, rs, gs, 3); break;
+            default: fp8_rows_nf(ys0, ys, xf + s, wtmp, I, rs, gs, 4); break;
+            }
+        }
+        return;
+    }
+    for (int s = 0; s < S; s += 4) {
+        float *ys0 = y + (size_t)s * ys;
+        switch (S - s) {
+        case 1: fp8_rows_n(ys0, ys, xf + s, row, I, rs, gs, 1); break;
+        case 2: fp8_rows_n(ys0, ys, xf + s, row, I, rs, gs, 2); break;
+        case 3: fp8_rows_n(ys0, ys, xf + s, row, I, rs, gs, 3); break;
+        default: fp8_rows_n(ys0, ys, xf + s, row, I, rs, gs, 4); break;
+        }
+    }
 }
 /* Activation row q (int8 per 32, dx its scales, xs its sums per 16) against a row's codes:
  * int8 w8, or int4 u4 (0..15, the value + 8: the bias comes back with the activation's
@@ -1932,7 +2162,11 @@ static float hy_dot8(const int8_t *w8, const float *rs, int gs, const gq_act *a,
  * bits whatever rows share the call. tmp: I floats, and for an int4 row I bytes after them. */
 static inline void host_rows(float *y, int ys, const gq_act *a, const HyAct *hp, const float *const *xf, const uint8_t *row, int t, int I,
                              float *tmp, const float *rs, int gs) {
-    if (t < 0 && (-t == 12 || (-t == 7 && I / gs > 2048)) && !gq_exact_mode()) {   /* FP8 has no integer form: its floats against x's */
+    if (t == -12 && !gq_exact_mode()) {   /* FP8 has no integer form: its codes' floats, a scale a group (fp8_rows) */
+        fp8_rows(y, ys, a->S, xf, row, I, rs, gs, tmp);
+        return;
+    }
+    if (t == -7 && I / gs > 2048 && !gq_exact_mode()) {   /* MXFP4 rows of more than 2048 groups: their floats against x's */
         dev_dequant(tmp, row, -t, rs, gs, I);
         for (int s = 0; s < a->S; s++) {
             const float *x = xf[s];
@@ -1979,8 +2213,50 @@ static inline void host_rows(float *y, int ys, const gq_act *a, const HyAct *hp,
  * at y + r * ystep: one check for the four. Four rows sharing one pass over the activation
  * (a sum in flight per row) was tried and lost to hy_dot4's four sums per row: 183 against
  * 129 us a pair on one core, 36 against 34 on twelve. */
+#ifdef FP8_F16C
+/* host_rows4's FP8 rows against one activation row (every decode step's pair): each row follows
+ * fp8_rows_n(n=1) step for step, so the same bits as one by one, with four FMA chains instead of
+ * one (a single chain is bound by the FMA's latency) and x loaded once for the four */
+#define FP8_R16(a, r) do { const __m128i b_ = _mm_loadu_si128((const __m128i *)((r) + i)); \
+        (a) = _mm256_fmadd_ps(fp8_lo8(b_), xl, (a)); (a) = _mm256_fmadd_ps(fp8_hi8(b_), xh, (a)); } while (0)
+#define FP8_R8(a, r) ((a) = _mm256_fmadd_ps(fp8_lo8(_mm_loadl_epi64((const __m128i *)((r) + i))), xl, (a)))
+static inline void fp8_rows4_s1(float *y, int ystep, const float *x, const uint8_t *row, size_t rb, int I,
+                                const float *rs, size_t nsc, int gs) {
+    if (gs <= 0) gs = I;
+    const uint8_t *r0 = row, *r1 = row + rb, *r2 = row + 2 * rb, *r3 = row + 3 * rb;
+    const float *s0 = rs, *s1 = rs + nsc, *s2 = rs + 2 * nsc, *s3 = rs + 3 * nsc;
+    __m256 t0 = _mm256_setzero_ps(), t1 = t0, t2 = t0, t3 = t0;
+    float l0 = 0.f, l1 = 0.f, l2 = 0.f, l3 = 0.f;
+    for (int g0 = 0; g0 < I; g0 += gs) {
+        const int g1 = g0 + gs < I ? g0 + gs : I, g = g0 / gs;
+        __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+        int i = g0;
+        for (; i + 16 <= g1; i += 16) {
+            const __m256 xl = _mm256_loadu_ps(x + i), xh = _mm256_loadu_ps(x + i + 8);
+            FP8_R16(a0, r0); FP8_R16(a1, r1); FP8_R16(a2, r2); FP8_R16(a3, r3);
+        }
+        for (; i + 8 <= g1; i += 8) {
+            const __m256 xl = _mm256_loadu_ps(x + i);
+            FP8_R8(a0, r0); FP8_R8(a1, r1); FP8_R8(a2, r2); FP8_R8(a3, r3);
+        }
+        t0 = _mm256_fmadd_ps(a0, _mm256_set1_ps(s0[g]), t0); t1 = _mm256_fmadd_ps(a1, _mm256_set1_ps(s1[g]), t1);
+        t2 = _mm256_fmadd_ps(a2, _mm256_set1_ps(s2[g]), t2); t3 = _mm256_fmadd_ps(a3, _mm256_set1_ps(s3[g]), t3);
+        for (; i < g1; i++) {   /* fp8_rows_n's tail: the weight times its scale, then times x */
+            const float w0 = fp8_e4m3[r0[i]] * s0[g], w1 = fp8_e4m3[r1[i]] * s1[g], w2 = fp8_e4m3[r2[i]] * s2[g], w3 = fp8_e4m3[r3[i]] * s3[g];
+            l0 += w0 * x[i]; l1 += w1 * x[i]; l2 += w2 * x[i]; l3 += w3 * x[i];
+        }
+    }
+    y[0] = fp8_hsum(t0) + l0; y[ystep] = fp8_hsum(t1) + l1;
+    y[(size_t)2 * ystep] = fp8_hsum(t2) + l2; y[(size_t)3 * ystep] = fp8_hsum(t3) + l3;
+}
+#undef FP8_R16
+#undef FP8_R8
+#endif
 static inline void host_rows4(float *y, int ys, int ystep, const gq_act *a, const HyAct *hp, const float *const *xf, const uint8_t *row,
                               size_t rb, int t, int I, float *tmp, const float *rs, size_t nsc, int gs) {
+#ifdef FP8_F16C
+    if (t == -12 && a->S == 1 && rs && !gq_exact_mode()) { fp8_rows4_s1(y, ystep, xf[0], row, rb, I, rs, nsc, gs); return; }
+#endif
     if (t < 0 && (-t == 2 || -t == 4) && hp && hp->S == a->S && !gq_exact_mode()) {
         for (int s = 0; s < a->S; s++) {
             for (int r = 0; r < 4; r++) y[(size_t)s * ys + (size_t)r * ystep] = hy_dot4(row + (size_t)r * rb, rs ? rs + (size_t)r * nsc : NULL, gs, hp, s);
@@ -2076,14 +2352,23 @@ static int host_pairs(const VktHostExpert *const *hx, const float *const *xr, in
         while (r < p && xr[r] != xr[p]) r++;
         xa[p] = r < p ? xa[r] : nx++;
     }
-    if (!(xb = malloc((size_t)nx * D * sizeof(float))) || (!ident && !(dq = malloc((size_t)np * D * sizeof(float))))) { err = 2; goto out; }
-    for (int p = 0; p < np; p++) memcpy(xb + (size_t)xa[p] * D, xr[p], (size_t)D * sizeof(float));
-    if (gq_act_set(&ax, xb, nx, D)) { err = 1; goto out; }
-    for (int g = 0; g < ng && !err; g++) {   /* each group's rows of ax */
-        for (int q = gs[g]; q < gs[g + 1]; q++) gx[q - gs[g]] = xa[ord[q]];
-        if (gq_act_gather(&ag[g], &ax, gx, gs[g + 1] - gs[g]) || hy_act_prep(&pg[g], &ag[g])) err = 2;
+    /* FP8 pairs (fp8_rows, fp8_rows4_s1) read only the float rows and each group's row count: no
+     * int8 forms of the activations for them, which were serial work before the team starts */
+    int f8 = !gq_exact_mode();
+    for (int p = 0; p < np && f8; p++) f8 = hx[p]->tg == -12 && hx[p]->td == -12;
+    if (!ident && !(dq = malloc((size_t)np * D * sizeof(float)))) { err = 2; goto out; }
+    if (f8) {
+        for (int g = 0; g < ng; g++) ag[g].S = ah[g].S = gs[g + 1] - gs[g];
+    } else {
+        if (!(xb = malloc((size_t)nx * D * sizeof(float)))) { err = 2; goto out; }
+        for (int p = 0; p < np; p++) memcpy(xb + (size_t)xa[p] * D, xr[p], (size_t)D * sizeof(float));
+        if (gq_act_set(&ax, xb, nx, D)) { err = 1; goto out; }
+        for (int g = 0; g < ng && !err; g++) {   /* each group's rows of ax */
+            for (int q = gs[g]; q < gs[g + 1]; q++) gx[q - gs[g]] = xa[ord[q]];
+            if (gq_act_gather(&ag[g], &ax, gx, gs[g + 1] - gs[g]) || hy_act_prep(&pg[g], &ag[g])) err = 2;
+        }
+        if (err) goto out;
     }
-    if (err) goto out;
     float *dy = dq ? dq : dn;
     /* gate and up of every group, the activation, then down: one parallel region, the
      * rows handed out in chunks (the cores of a hybrid CPU do not run at one speed) */
@@ -2137,12 +2422,14 @@ static int host_pairs(const VktHostExpert *const *hx, const float *const *xr, in
                 h[o] = gv / (1.f + expf(-gv)) * uv;
             }
         }
-        #pragma omp for schedule(static)
-        for (int g = 0; g < ng; g++)
-            if (gq_act_set(&ah[g], hh + (size_t)gs[g] * I, gs[g + 1] - gs[g], I) || hy_act_prep(&ph[g], &ah[g])) {
-                #pragma omp atomic write
-                err = 1;
-            }
+        if (!f8) {   /* f8 is the team's, so every thread takes the same branch */
+            #pragma omp for schedule(static)
+            for (int g = 0; g < ng; g++)
+                if (gq_act_set(&ah[g], hh + (size_t)gs[g] * I, gs[g + 1] - gs[g], I) || hy_act_prep(&ph[g], &ah[g])) {
+                    #pragma omp atomic write
+                    err = 1;
+                }
+        }
         #pragma omp for schedule(runtime)
         for (int64_t c = 0; c < (int64_t)ng * cd; c++) {
             if (!tmp) continue;
@@ -2510,11 +2797,12 @@ static int form_init(int k, VktFmt gu, VktFmt dn) {
 
 static int fmt_eq(VktFmt a, VktFmt b) { return a.kind == b.kind && a.gs == b.gs; }
 /* VktConfig.layer_gate_up/layer_down: each main layer's form, the ones past form 0 from 2
- * on, and the room every main tensor takes (the biggest form's of its role). 0 when a
- * layer's form has no device form, or there are more than VKT_FORMS. */
+ * on, and the room every main tensor takes (its own form's: forms whose tensors take the
+ * same bytes share a class). 0 when a layer's form has no device form, or there are more
+ * than VKT_FORMS. */
 static int forms_per_layer(void) {
     const int H = T.c.hidden, F = T.c.inter;
-    T.nform = 2;
+    T.nform = 2; T.ncls = 1;
     if (!T.c.layer_gate_up || !T.c.layer_down) return 1;
     if (T.main_layers > VKT_MAX_LAYERS) return 0;
     for (int l = 0; l < T.main_layers; l++) {
@@ -2529,20 +2817,40 @@ static int forms_per_layer(void) {
     }
     if (T.nform == 2) return 1;   /* every layer has form 0 */
     T.per_layer = 1;
-    /* the form most layers have: class 0, its rooms its own size; the others class 1 */
-    int count[VKT_FORMS] = {0}, major = 0;
+    /* the form most layers have: class 0; then a class for each other size the forms'
+     * tensors take, every room its own form's size */
+    int count[VKT_FORMS] = {0}, fcls[VKT_FORMS] = {0}, major = 0;
     for (int l = 0; l < T.main_layers; l++) count[T.lform[l]]++;
     for (int j = 0; j < T.nform; j++) if (j != 1 && count[j] > count[major]) major = j;
-    for (int l = 0; l < T.main_layers; l++) T.lcls[l] = (uint8_t)(T.lform[l] != major);
-    for (int j = 0; j < T.nform; j++) {
+    T.ncls = 0; T.major = major;
+    memset(T.mpad_w, 0, sizeof T.mpad_w); memset(T.mpad_s, 0, sizeof T.mpad_s);
+    for (int i = 0; i < T.nform; i++) {
+        const int j = i == 0 ? major : i == major ? 0 : i;   /* the most common form first */
         if (j == 1 || !count[j]) continue;
-        const int c = j != major;
         size_t sg, sd, wg = coli_vk_tensor_alloc_bytes(T.form[j].gu_fmt, H, F, T.form[j].gu_gs, &sg),
                wd = coli_vk_tensor_alloc_bytes(T.form[j].dn_fmt, F, H, T.form[j].dn_gs, &sd);
-        if (wg > T.pad_w[c][0]) T.pad_w[c][0] = wg;
-        if (sg > T.pad_s[c][0]) T.pad_s[c][0] = sg;
-        if (wd > T.pad_w[c][1]) T.pad_w[c][1] = wd;
-        if (sd > T.pad_s[c][1]) T.pad_s[c][1] = sd;
+        int c = 0;
+        while (c < T.ncls && (T.pad_w[c][0] != wg || T.pad_s[c][0] != sg || T.pad_w[c][1] != wd || T.pad_s[c][1] != sd)) c++;
+        if (c == T.ncls) { T.pad_w[c][0] = wg; T.pad_s[c][0] = sg; T.pad_w[c][1] = wd; T.pad_s[c][1] = sd; T.ncls++; }
+        fcls[j] = c;
+        if (j != major) {
+            if (wg > T.mpad_w[0]) T.mpad_w[0] = wg;
+            if (sg > T.mpad_s[0]) T.mpad_s[0] = sg;
+            if (wd > T.mpad_w[1]) T.mpad_w[1] = wd;
+            if (sd > T.mpad_s[1]) T.mpad_s[1] = sd;
+        }
+    }
+    for (int l = 0; l < T.main_layers; l++) T.lcls[l] = (uint8_t)fcls[T.lform[l]];
+    /* the classes whose rooms hold a class's tensors, the tightest first (pick_victim) */
+    for (int c = 0; c < T.ncls; c++) {
+        int n = 0;
+        for (int o = 0; o < T.ncls; o++) {
+            if (o == c || !rooms_hold(o, c)) continue;
+            int at = n++;
+            while (at > 0 && room_bytes(T.fall[c][at - 1]) > room_bytes(o)) { T.fall[c][at] = T.fall[c][at - 1]; at--; }
+            T.fall[c][at] = (uint8_t)o;
+        }
+        T.nfall[c] = (uint8_t)n;
     }
     return 1;
 }
@@ -2551,15 +2859,35 @@ static int forms_per_layer(void) {
  * that fills before it refuses the rest, and the count comes down to what it holds). */
 static size_t tier_expert_bytes_at(size_t a) {
     if (!T.per_layer) return expert_bytes_at(T.c.hidden, T.c.inter, T.c.gate_up, T.c.down, a);
-    size_t room[2] = {0, 0}; long long n[2] = {0, 0};
-    for (int c = 0; c < 2; c++)
+    size_t room[VKT_FORMS] = {0};
+    for (int c = 0; c < T.ncls; c++)
         for (int k = 0; k < 3; k++) {
             size_t w = T.pad_w[c][k == 2], sc = T.pad_s[c][k == 2];
             room[c] += (w + a - 1) / a * a + (sc + a - 1) / a * a;
         }
-    for (int l = 0; l < T.main_layers; l++) n[T.lcls[l]]++;
-    return n[0] + n[1] ? (size_t)((room[0] * (unsigned long long)n[0] + room[1] * (unsigned long long)n[1] + n[0] + n[1] - 1) /
-                                  (unsigned long long)(n[0] + n[1])) : room[0];
+    unsigned long long sum = 0;
+    for (int l = 0; l < T.main_layers; l++) sum += room[T.lcls[l]];
+    return T.main_layers ? (size_t)((sum + (unsigned long long)T.main_layers - 1) / (unsigned long long)T.main_layers) : room[0];
+}
+
+/* A prompt chunk's staging (VktConfig.stage, vk_dmoe.h) takes one layer's host pool experts at a time,
+ * each at its own form's size, so its share of them is sized per expert as the rooms were before
+ * every form had a room of its own size: a layer of another form than most layers' at those forms'
+ * biggest tensors. The rooms' average left it short where a layer's forms are bigger than the
+ * average: Qwen3.8-Flash-Next UD-IQ2_XS (5 sizes) with a 6 GiB tier on an RTX PRO 4000 staged in
+ * 840 MiB instead of 1019, and its 3036-token prompt went from 262.5 to 255.4 tok/s. With one or two
+ * sizes this is the rooms' average (tier_expert_bytes_at). */
+static size_t tier_stage_expert_bytes_at(size_t a) {
+    if (!T.per_layer) return expert_bytes_at(T.c.hidden, T.c.inter, T.c.gate_up, T.c.down, a);
+    size_t r0 = 0, r1 = 0;
+    for (int k = 0; k < 3; k++) {
+        size_t w0 = T.pad_w[0][k == 2], s0 = T.pad_s[0][k == 2], w1 = T.mpad_w[k == 2], s1 = T.mpad_s[k == 2];
+        r0 += (w0 + a - 1) / a * a + (s0 + a - 1) / a * a;
+        r1 += (w1 + a - 1) / a * a + (s1 + a - 1) / a * a;
+    }
+    unsigned long long sum = 0;
+    for (int l = 0; l < T.main_layers; l++) sum += T.lform[l] != T.major ? r1 : r0;
+    return T.main_layers ? (size_t)((sum + (unsigned long long)T.main_layers - 1) / (unsigned long long)T.main_layers) : r0;
 }
 
 /* One main expert's bytes at its own layer's form (no room of a bigger one), on average over
@@ -2649,10 +2977,24 @@ static void d2_init(long long fit0, long long all, int act) {
  * what RAM has free less 4 GiB (the engine's own growth, the page cache the loads go
  * through), at most what the devices leave; COLI_VK_TIER_HOST_GB sets it and
  * COLI_VK_TIER_HOST=0 turns it off. COLI_VK_TIER_HOST=1 turns it on where the device
- * shares the host's RAM too (tests: the same memory, the paths of a card). */
+ * shares the host's RAM too (tests: the same memory, the paths of a card), and on a
+ * trunk-first card (coli_vk_window_trunk_first_on) whose window holds the tier beside
+ * the trunk, where it is off by default: a mirror of the experts in GTT-imported RAM is
+ * a second copy of what the engine's cache keeps. */
 static void host_init(long long all) {
     const char *e = getenv("COLI_VK_TIER_HOST"), *g = getenv("COLI_VK_TIER_HOST_GB");
     if ((e && *e == '0') || (T.uma && !(e && !strcmp(e, "1"))) || !T.excl || !T.exp_bytes || !coli_vk_tier_host_pool()) return;
+    /* Trunk-first placement (deepseek_v41, coli_vk_window_trunk_first): the dense trunk went up before the
+     * window was asked and the ask kept the mapped path, so the tier runs inside what the heap leaves beside
+     * it. A host pool next to that holds a second copy of every expert the device's memory leaves, in system
+     * RAM the GTT imports, while the engine's own RAM cache already holds those experts once: on such a card
+     * the pool stays off unless it is asked for, and the tier's misses read the engine's cache and the disk. */
+    if (coli_vk_window_trunk_first_on() && !(e && !strcmp(e, "1")) && !(g && *g)) {
+        fprintf(stderr, VKT_TAG " tier %s: host pool off, the tier inside the mapped window beside the trunk; the experts "
+                        "it leaves come from the engine's RAM cache (COLI_VK_TIER_HOST=1 or COLI_VK_TIER_HOST_GB turns it on)\n",
+                T.engine);
+        return;
+    }
     long long left = all - T.dmax[0] - T.dmax[1];
     if (left <= 0) return;
     const double GiB = 1073741824.0;
@@ -2766,8 +3108,13 @@ size_t vkt_give_back(size_t bytes) {
     (void)bytes; return 0;
 #else
     if (!T.on || !bytes || T.inflight) return 0;
+    /* the uploader's queue drains first; an upload refused for room would wait (a minute an
+     * entry) for a free only this thread makes, at a quiescent point it cannot reach while it
+     * waits here (#2705): told so, it gives such an upload up at once, its expert back on the CPU */
     pthread_mutex_lock(&T.mx);
+    T.giving = 1; pthread_cond_broadcast(&T.cv_room);
     while ((T.qn || T.busy) && T.th_on && !T.stop) pthread_cond_wait(&T.cv_done, &T.mx);
+    T.giving = 0;
     pthread_mutex_unlock(&T.mx);
     quiesce();
     if (T.inflight || T.nevict || T.ndfree) return 0;
@@ -2818,7 +3165,7 @@ size_t vkt_give_back(size_t bytes) {
     }
     free(hp);
     const int drop = T.dmax[0] - (T.dres[0] + T.dque[0]);
-    if (drop > 0) { T.dmax[0] -= drop; T.max_resident -= drop; }
+    if (drop > 0) { T.dmax[0] -= drop; T.max_resident -= drop; T.gb_owed += drop; }
     pthread_mutex_lock(&T.mx); T.evict_pending = T.nevict + T.ndfree; pthread_mutex_unlock(&T.mx);
     quiesce();   /* nothing in flight: the device copies freed, the changes published */
     ColiVkPoolStats st; coli_vk_pool_stats(1, &st);
@@ -2828,12 +3175,43 @@ size_t vkt_give_back(size_t bytes) {
     if (now) { coli_vk_tier_pool_blocks(now, nb); for (int k = 0; k < nb; k++) if (pick[k] && !now[k]) gave += bb[k]; }
     free(now); free(pick); free(bb);
     T.budget = T.budget > gave ? T.budget - (size_t)gave : 0;
+    T.gb_owed_bytes += (size_t)gave;
     coli_vk_pool_stats(1, &st);
     char hb[32], hc[32];
     fprintf(stderr, VKT_TAG " tier %s: %s of device memory back for the dense chain (%d experts to the host pool, %d out of the tier; "
             "the tier's pool now %s in %d blocks)\n", T.engine, human((double)gave, hb, sizeof hb), moved, out,
             human((double)st.total, hc, sizeof hc), st.blocks);
     return (size_t)gave;
+#endif
+}
+
+/* vkt_take_back: device memory the dense chain freed for good back to the tier, up to what
+ * vkt_give_back took and has not had back: the places on the primary device (dmax), the budget
+ * and the pool's limit go up by it again, and the routes fill the room (promote, or an upload
+ * into a free place). Before, what a long conversation's KV mirror took stayed the chain's for
+ * the rest of the process: 2799 places came down to 967 after one 44K-token conversation on an
+ * 8 GB card, and every later short conversation decoded with them (#2733). */
+size_t vkt_take_back(size_t bytes) {
+#ifdef VKT_NO_GIVE_BACK
+    (void)bytes; return 0;
+#else
+    if (!T.on || !bytes || T.gb_owed <= 0 || !T.gb_owed_bytes) return 0;
+    const size_t per = T.gb_owed_bytes / (size_t)T.gb_owed;   /* the bytes a place given back held */
+    int ex = per ? (int)(bytes / per) : 0;
+    if (ex > T.gb_owed) ex = T.gb_owed;
+    if (ex < 1) return 0;
+    const size_t b = ex == T.gb_owed ? T.gb_owed_bytes : (size_t)ex * per;
+    pthread_mutex_lock(&T.mx);
+    T.dmax[0] += ex; T.max_resident += ex; T.budget += b;
+    T.gb_owed -= ex; T.gb_owed_bytes -= b;
+    pthread_mutex_unlock(&T.mx);
+    ColiVkPoolStats st; coli_vk_pool_stats(1, &st);
+    const uint64_t base = st.limit ? st.limit : st.total;
+    coli_vk_tier_pool_limit((size_t)(base + b));
+    char hb[32];
+    fprintf(stderr, VKT_TAG " tier %s: %s of device memory back from the dense chain (%d more places for experts, %d on the "
+            "device now)\n", T.engine, human((double)b, hb, sizeof hb), ex, T.dmax[0]);
+    return b;
 #endif
 }
 
@@ -2975,10 +3353,13 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
         long long per = (all - fit + T.main_layers - 1) / T.main_layers;
         per += per / 4;
         if (per > T.c.experts) per = T.c.experts;
-        if (T.c.stage && blocks && !(sg && *sg == '0') && pool && fit < all && per > 0 && fit - per >= 2) {
-            fit -= per; fit_raw -= per;
-            want -= (double)per * T.exp_bytes;
-            T.stage_room = (size_t)per * T.exp_bytes;
+        /* its bytes a layer's share at the staged experts' sizes, taken from the budget in main experts */
+        const size_t sexp = T.per_layer ? tier_stage_expert_bytes_at(coli_vk_buffer_alignment()) : T.exp_bytes;
+        const long long take = sexp > T.exp_bytes ? (long long)(((size_t)per * sexp + T.exp_bytes - 1) / T.exp_bytes) : per;
+        if (T.c.stage && blocks && !(sg && *sg == '0') && pool && fit < all && per > 0 && fit - take >= 2) {
+            fit -= take; fit_raw -= take;
+            want -= (double)take * T.exp_bytes;
+            T.stage_room = (size_t)per * sexp;
         }
     }
     /* Streaming (big prefill steps, see "streaming" above): COLI_VK_TIER_STREAM=0 turns
@@ -3072,14 +3453,14 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     if (T.form[0].dn_gs) fprintf(stderr, " gs %d", T.form[0].dn_gs);
     if (T.per_layer) {
         int other = 0, forms = 0;
-        for (int l = 0; l < T.main_layers; l++) other += T.lcls[l];
+        for (int l = 0; l < T.main_layers; l++) other += T.lform[l] != T.major;
         for (int j = 0; j < T.nform; j++) {
             int used = 0;
-            for (int l = 0; l < T.main_layers && !used; l++) used = j != 1 && T.lform[l] == j && T.lcls[l];
+            for (int l = 0; l < T.main_layers && !used; l++) used = j != T.major && T.lform[l] == j;
             forms += used;
         }
-        fprintf(stderr, "; %d layer%s in %d form%s other than most layers', their experts in the room of the biggest of those, the rest at their own size",
-                other, other == 1 ? "" : "s", forms, forms == 1 ? "" : "s");
+        fprintf(stderr, "; %d layer%s in %d form%s other than most layers', every expert in a room of its own form's size (%d size%s)",
+                other, other == 1 ? "" : "s", forms, forms == 1 ? "" : "s", T.ncls, T.ncls == 1 ? "" : "s");
     }
     if (T.c.chain_bytes) fprintf(stderr, "; %s left for the dense chain's KV mirror and a prompt chunk",
                                  human((double)T.c.chain_bytes, hb, sizeof hb));
@@ -3134,6 +3515,7 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
     if (T.failed)
         fprintf(stderr, " | failed: %llu refused by the pool, %llu copies to the device, %llu not taken by the batch",
                 T.f_pool, T.f_copy, T.f_sets);
+    if (T.gave_up) fprintf(stderr, " | %llu uploads given up for room the engine gave back", T.gave_up);
     if (T.balance) fprintf(stderr, " | balance: device share %.2f, %llu rows handed to the CPU", T.share, T.handed);
     if (T.chain_served) fprintf(stderr, " | in the dense chain: %llu routed experts with no host step", T.chain_served);
     if (T.hy_steps || T.hyb_steps) {

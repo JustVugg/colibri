@@ -138,8 +138,10 @@ The routed-expert tier the Vulkan engines share (`c/vk_tier.c`, [vulkan.md](vulk
 
 - **Formats:** colibri's (int8 a row or per group, int4 pairs, int3-g64, MXFP4, FP8, bf16, f32) and a GGUF's block types as the file has them, through the same block decoders as `cuda_bd.cuh`'s GEMVs, in the CPU's integer form (`GQ_EXACT=1`: the float form).
 - **The host pool:** the experts the card leaves sit in mapped page-locked RAM that the card reads over the bus; the CPU computes a small step's pairs from it in place (the hybrid, `COLI_VK_HYBRID=0` off).
-- **Not on CUDA yet:** the dense chain's expert table, a second device, streaming a prompt's cold experts, and the low-bit formats (fmt 200-203). Only Qwen3.8's sidecars use those, and Qwen3.8's own CUDA tier streams FP8 experts only: a build with Vulkan too hands the sidecars' experts to the Vulkan tier on the same card ([qwen38.md](qwen38.md#routed-experts-as-int4-g64)).
-- **GLM-5.3 Flash, DeepSeek V4.1 and MiMo** (`COLI_CUDA=1`, no Vulkan tier): the CUDA device opens for the routed experts, as their checkpoint or a GGUF holds them. Their dense matrices go to the same card where they fit (below, `cu_dense.h`): GLM-5.3's resident ones, a DeepSeek V4.1 GGUF's, and MiMo's in f32, int8 or a GGUF's blocks (its bf16 and FP8 stay on the CPU). A build with Vulkan too runs these engines on Vulkan unless `COLI_VULKAN=0`, since Vulkan's dense chain runs a layer's work on the card in one frame. `tests/cuda_tier_engines.sh` runs each of these engines and Kimi K3 on its tiny fixture against its CPU run on a CUDA card (the tokens, DeepSeek V4.1's oracle, Kimi K3's logits).
+- **Streaming a prompt's cold experts** (`COLI_CUDA_TIER_STREAM`): an expert a prompt step gives at least the rows its upload is worth goes to a streaming slot (a host pool expert copied there on the card) and runs on the dense matrices' f16 tiles (`coli_cuda_bd_gemm_raw`), in sub-batches on two halves with their own streams, each waiting for the other's slot copies. DeepSeek V4.1-Flash UD-IQ1_S on an RTX PRO 4000, a 4104-token prompt: 333 -> 21 GB of experts read from the disk, 5.75 -> 7.42-7.57 tok/s.
+- **A second device** (`COLI_VK_DEV2`, [vulkan.md](vulkan.md#a-second-device-coli_vk_dev2)): the experts after the primary card's on another CUDA card, as on Vulkan. `COLI_VK_DEV2=auto` takes the first CUDA device that is not the primary, `COLI_VK_DEV2=<index>` that CUDA device (the primary's own index: a second logical device on the same card, the test mode). It has its own memory (the tier's pool 3, `COLI_VK_RESERVE2_GB` left free), its own block decoder table, scratch, streams and events; every step sends it the batch of its own residents beside the primary's, on the GEMV route; its uploads go on its own copy stream, and a tensor freed while either card has a batch in flight waits for both. A batch that fails (`COLI_VK_DEV2_FAULT=n` fails the n-th, for tests) stops it: its experts go back to the CPU and the tier goes on with the primary card. `tests/cuda_tier_engines.sh` runs glm53 (decode, evict, fault) and DeepSeek V4.1 (decode, fault) with the same card twice against the CPU. Not measured: speed on two real cards (the machines here have one).
+- **Not on CUDA yet:** the dense chain's expert table and the low-bit formats (fmt 200-203). Only Qwen3.8's sidecars use those, and Qwen3.8's own CUDA tier streams FP8 experts only: a build with Vulkan too hands the sidecars' experts to the Vulkan tier on the same card ([qwen38.md](qwen38.md#routed-experts-as-int4-g64)).
+- **GLM-5.3 Flash, DeepSeek V4.1 and MiMo** (`COLI_CUDA=1`, no Vulkan tier): the CUDA device opens for the routed experts, as their checkpoint or a GGUF holds them. Their dense matrices go to the same card where they fit (below, `cu_dense.h`): GLM-5.3's resident ones, a DeepSeek V4.1 GGUF's, and MiMo's in f32, int8 or a GGUF's blocks (its bf16 and FP8 stay on the CPU); a DeepSeek V4.1 GGUF's prompt runs its layers on the CUDA chain (below). A build with Vulkan too runs these engines on Vulkan unless `COLI_VULKAN=0`, since Vulkan's dense chain runs a layer's work on the card in one frame. `tests/cuda_tier_engines.sh` runs each of these engines and Kimi K3 on its tiny fixture against its CPU run on a CUDA card (the tokens, DeepSeek V4.1's oracle, Kimi K3's logits).
 - **Kimi K3** (`COLI_CUDA=1`, `K3_CUDA=1`, no Vulkan tier): the routed experts, a checkpoint's MXFP4 or a GGUF's blocks, resident in the tier from the history, with SiTU on the card. The per-call path that uploaded every routed MXFP4 expert at every decode step stays off once the tier is on; the experts it has not taken run on the CPU. Its dense matrices go to the card where they fit (below), which UD-IQ1_S's 41.6 GiB does not on a 24 GB card. unsloth's UD-IQ1_S (594 GB) on an RTX PRO 4000 (24 GB) with 62 GB of RAM, a 181-token prompt and 128 tokens: 0.6 tok/s of prompt and 0.26 of decode, against 0.4-0.5 and 0.18-0.22 on the CPU and 1.0 and 0.28 on Vulkan, whose chain also puts 45 of the 93 layers on the card; most experts come from the disk, which sets the pace.
 - **DeepSeek V4** (`make deepseek-v4 CUDA=1`, `COLI_CUDA=1` with no Vulkan tier) uses it for a GGUF's experts, and puts the GGUF's dense matrices on the same card (below).
 
@@ -173,10 +175,80 @@ DeepSeek V4 Flash UD-IQ1_S (82.5 GB) on an RTX PRO 4000 (24 GB, PCIe 4.0 x8) wit
 
 The same models on the CPU, Vulkan and CUDA, one machine and one build: [gpu-parity.md](gpu-parity.md).
 
+### DeepSeek V4.1 with a GGUF on CUDA: a prompt on the CUDA chain (`deepseek_v41_cuchain.h`)
+
+On the CUDA tier the CPU ran a prompt's layers: the sparse attention, the hyper-connections and the router were three fifths of a 4104-token prompt of V4.1-Flash UD-IQ1_S (526 s on an RTX PRO 4000). A prompt of more than one chunk (`COLI_CUDA_V41_ROWS`, 256 rows) now runs on the card layer by layer, as the Vulkan chain's `v41c_prompt_lw`, with `cuda_chain.cu`'s ops and their DeepSeek twins (`cuda_dsv4c.cuh`):
+
+- **A layer:** its chunks in order through the mHC split and collapse, the attention (the window ring, the compressor and its latents, the indexer's selection, the sparse attention in three passes, `wo_a` as its output groups' GEMMs, `wo_b`), the write back, the FFN's split and the shared expert; then the layer's routed experts for all its rows in one step of the tier (its streaming), then each chunk's FFN sum. Every row's streams, its attention list (the selection its last index source made) and the candidate source's mask stay on the card from one layer to the next.
+- **The matrices:** `cu_dense.h`'s copies (`cud_tensor`, the decode's own), a GGUF's F32, F16 and BF16 tensors as f32 rows (the compressor's and the indexer's in unsloth's files), the mixers' matrices in f32.
+- **The state:** each layer's window ring, the compressed rows and index keys and the compressor's group go up as far as the card does not hold them, and come back as the CPU would leave them, so the decode, which stays on the CPU and the tier, and the next prompt read the same state.
+- **The memory:** at most `COLI_CUDA_V41_SEG` rows (4096) through the layers at once, a longer prompt in segments of whole chunks, so the chain's memory is bounded by the context (`--ctx`); the tier leaves it (`v41u_plan_bytes`, 0.96 GiB at 8192 positions).
+- **Not here:** a decode step, a speculative verify, DSpark's targets, a model whose matrices the card does not hold: the CPU runs those layers; `KV_SLOTS` above 1 (the chain keeps one conversation's state on the card), as on Vulkan. `COLI_CUDA_CHAIN=0`: never.
+
+unsloth's UD-IQ1_S, thinking off, an RTX PRO 4000 (PCIe 4.0 x8), an i5-13500 and 64 GB of RAM, two serves a side alternated:
+
+| | the CPU's layers | the CUDA chain | Vulkan |
+|---|---|---|---|
+| 4104-token prompt | 7.42-7.57 tok/s | 91.3-97.0 tok/s | 64.3-66.0 tok/s |
+| 523-token prompt | 23.2 tok/s | 58.3-59.8 tok/s | 20.6-21.1 tok/s |
+| decode | 5.97-6.03 tok/s | 5.65-5.98 tok/s | 5.92-5.96 tok/s |
+
+The chain's room leaves the tier 1930 experts instead of 2116 (15.11 against 16.52 GiB), which the decode, a CPU and tier step, may pay: its range starts lower. The decode reads most of the experts the card does not hold from the disk (the host pool takes the RAM the CPU's cache would have, six slots a layer), and its pace follows the disk.
+
+### GLM-5.3 on CUDA: every layer on the CUDA chain (`glm53_cuchain.h`)
+
+On the CUDA tier the CPU ran GLM-5.3's layers and `cu_dense.h` multiplied each dense matrix on the card a call at a time: about 530 synchronous calls a decoded token of GLM-5.3-Flash, the attention, the hyper-connections and the router on the CPU. With the routed experts on the CUDA tier, every layer now runs on the card, a prompt chunk and a decode step alike, the Vulkan chain's layout (`glm53_chain.h`) on `cuda_chain.cu`'s ops and GLM-5.3's (`cuda_glm53c.cuh`):
+
+- **A layer:** mHC's mix, split and collapse, the input norm, then the KDA layer (its projections, the short convolution with its window, the delta rule with its state, the output norm and gate) or the MLA layer (the query and kv latents with their norms into the latent cache, the k-pooled indexer's keys, pool gates, pooled keys and every row's pools, the absorbed query, the attention core over the selection, the values), the write back; the FFN site's split and norm, then the host's routed experts (the tier's batch and the CPU's share) while the card computes the shared expert, and the sum written back. The final streams come back for the head.
+- **The matrices:** `cu_dense.h`'s copies (`Mat.cu`, the CPU path's own), any format it holds (f32, int8 rows, int4 groups, a GGUF's blocks); the MLA's per-head `k_b` and `v_b` as floats; the mixers in f32.
+- **The state:** the KDA states and windows stay on the card while the chain runs and come back to the host before anything reads them there (a pin, a state capture, a CPU forward, another conversation); the host's MLA caches stay canonical and the card mirrors them. A device lost while it held the newest state: the state is rebuilt on the CPU from the input rows since the host's copy was current, and the CPU runs from there.
+- **The memory:** the tier leaves the chain its room (`g53u_plan_bytes`: the per-head floats, the mixers, the states, the MLA caches at `GLM53_MAXT` positions and a chunk's scratch at `COLI_CUDA_G53_ROWS` rows).
+- **Not here:** a layer range, a model the CUDA tier does not take (resident experts open no CUDA device), a matrix with no CUDA form: the CPU runs the layers. `COLI_CUDA_CHAIN=0`: never.
+
+A prompt chunk's matmuls run on the tensor cores (f16 or TF32 tiles): against the CPU a 4-bit trunk's logits move by 3e-4 of the largest, 6e-7 with `COLI_CUDA_TC_GEMM=0`. `tests/cuda_tier_engines.sh` holds the chain to the CPU's tokens and its logits.
+
+unsloth's GLM-5.3-Flash UD-IQ2_XXS (95 GB), an RTX PRO 4000 (24 GB, PCIe 4.0 x8), an i5-13500 and 62 GB of RAM, tokens a second with the thinking counted, two serves a side alternated:
+
+| | the CPU's layers | the CUDA chain | Vulkan (its chain) |
+|---|---|---|---|
+| a story, first turn (128 tokens) | 2.93-2.95 | 3.57-3.65 | 3.44 |
+| the same, second turn | 3.85-4.11 | 4.50-4.68 | 4.38 |
+| 523-token prompt | 5.92-6.57 | 10.92-15.16 | 10.30 |
+| its 16 tokens of decode | 2.57-2.75 | 3.83-3.98 | 3.64 |
+
+The chain's room leaves the tier 1987 experts instead of 2209 (15.08 against 16.71 GiB). The decode is the CPU's: the experts neither the card nor the host pool holds come from the disk, and the host pool's pairs run on the CPU.
+
+### GLM-5.2 and GLM-5.3 on CUDA: every layer on the CUDA chain (`colibri_cuchain.h`)
+
+A GGUF of GLM-5.2 or GLM-5.3 (the colibri engine, llama.cpp's glm-dsa) under `COLI_CUDA=1` put its routed experts on the CUDA tier and left the attention to the CPU, and its dense matrices too where cu_dense.h's rule (half of the card's free memory) did not hold them: GLM-5.3 UD-IQ1_S's 13.04 GiB stayed on the CPU, which read all of them every token. Every layer now runs on the card, a prompt chunk and a decode step alike, the Vulkan chain's layout (`glm_chain.h`) on `cuda_chain.cu`'s ops and the MLA ops GLM-5.3 Flash's chain added (`cuda_glm53c.cuh`):
+
+- **A layer:** the routed sum of the layer before and its shared expert into the residual, the input norm, the MLA attention (q's latent and its norm, q_b, RoPE on each head's rotated part; the kv latent and its norm into the latent cache, the rotated key into the rope cache; on a full indexer layer the index keys with their LayerNorm and RoPE into their cache and, past `index_topk` positions, every row's top-k, which the shared layers after it reuse; the absorbed query from `k_b`, the core over the cache or the selection, the values from `v_b`, `o_proj`), the residual and the post-attention norm; a dense layer's MLP, or the host's routed experts (the tier's batch and the CPU's share) while the card computes the shared expert. The final rows come back for the norm and the head.
+- **The selection:** `cc_dsa_select`, colibri.c's: each row's score of every visible key (per head the dot scaled by 1/sqrt(dim), its ReLU times the head's weight, summed, scaled by 1/sqrt(heads)), the k-th largest found bit by bit, the positions above it and then those equal to it, each in position order.
+- **The matrices:** `cu_dense.h`'s copies (the QT's handle, the per-matrix path's own), a GGUF's blocks as the file has them, its F32, F16 and BF16 tensors as f32 rows, colibri's int8 rows and int4 groups (a GGUF's F32 indexer head weights as the dense bits leave them); `k_b` and `v_b` as the file's Q8_0 rows (`cc_mla_hgemv_q8`, the float kernel's bits from a quarter of the bytes), floats in another type. The embedding, read a row at a time, is no part of the dense ask. Every dense matrix goes to the card when it fits beside the chain's own bytes (`cud_open_whole`), as the Vulkan chain's fit takes a discrete GPU's, and the routed experts keep the rest; else cu_dense.h's rule, and the chain stays off.
+- **The state:** the host's KV cache (latent, rope key, index keys) stays canonical, every step copies its new rows back, and the card mirrors the bound conversation's behind a watermark that every host write lowers (the CPU's attention, a new KV allocation, a slot adopting rows, a parked prefix restored, another conversation bound). MLA has no recurrent state: a device lost mid-forward leaves nothing to rebuild, and the CPU runs that forward again and from there.
+- **The memory:** the tier leaves the chain its room (`glmu_plan_bytes`: `k_b` and `v_b`, the KV mirror at `CTX` positions, a chunk's scratch at `COLI_CUDA_GLM_ROWS` rows). The chain sets itself up at startup, after the tier took its room.
+- **Not here:** a layer range, KV_SLOTS' batch of several conversations, a coded KV cache, PILOT and LOOKA, Mistral-Large-4, a matrix with no CUDA form: the CPU runs the attention. `COLI_CUDA_CHAIN=0`: never.
+
+A CUDA build also runs a GGUF's dense matrices through `cud_mm` where the chain does not (the head among them): before, only a build with Vulkan too did, and a CUDA build kept them on the CPU while the tier left their budget free.
+
+A prompt chunk's matmuls run on the tensor cores; `COLI_CUDA_TC_GEMM=0` keeps them exact. `tests/cuda_tier_engines.sh` holds the chain to the CPU's tokens and its logits on a tiny glm-dsa GGUF (decode, prompts in chunks, the DSA selection at top-4 and forced), and `make CUDA=1 cuda-glm53c-check` the selection to colibri.c's position for position.
+
+unsloth's GLM-5.3 UD-IQ1_S (217 GB), an RTX PRO 4000 (24 GB, PCIe 4.0 x8), an i5-13500 and 62 GB of RAM, `coli serve --ctx 8192`, tokens a second with the thinking counted, two serves a side alternated (the CUDA chain and Vulkan in one session, CUDA's CPU layers in the one before):
+
+| | the CPU's attention (dev) | the CUDA chain | Vulkan (its chain) |
+|---|---|---|---|
+| a story, first turn (128 tokens) | 0.677 / 0.661 | 0.786 / 0.773 | 0.765 / 0.782 |
+| the same, second turn | 0.757 / 0.759 | 0.984 / 0.877 | 0.902 / 0.845 |
+| 528-token prompt | 2.23 / 2.24 | 4.51 / 4.40 | 4.29 / 3.68 |
+| its 16 tokens of decode | 0.612 / 0.610 | 0.727 / 0.723 | 0.728 / 0.823 |
+
+The card holds the 12.5 GiB of dense matrices and the chain's 3.1 GiB, and the tier 581 experts instead of 2190 (Vulkan's chain leaves it 580). A decode profile (`PROF=1`, 64 tokens): the attention 29.2 s on the CPU, 3.3 s with the chain; the rest is the routed experts the card does not hold, from the disk and on the CPU.
+
 ## OLMoE on the card (`olmoe_cuda_chain.h`)
 
 OLMoE-1B-7B is small enough to hold whole on a card (Q4_K_M: 3.9 GiB of experts and 0.6 GiB of
-the rest), so a CUDA build (`make olmoe CUDA=1`) with `COLI_CUDA=1` (`coli serve --gpu`) puts
+the rest), so a CUDA build (`make olmoe CUDA=1`, which `coli setup` makes on an NVIDIA card, and
+`olmoe.exe` of the Windows CUDA package) with `COLI_CUDA=1` (`coli serve --gpu`) puts
 every layer, every routed expert and lm_head on the device and runs a step of any rows as one
 frame: the norms, q/k/v (one matrix where their forms agree), OLMoE's q and k norms over the
 whole projection, RoPE, the new K/V rows into a float16 mirror, the attention, o_proj, the router,
@@ -211,11 +283,69 @@ matrices apart.
 (`KV16=1`, `COLI_CUDA_CHAIN_ROWS=3`, `COLI_CUDA_CHAIN_QKV=0`, `COLI_CUDA_CHAIN_FAULT=n`): the
 reference's tokens and the last logits within 1e-5 of the CPU's.
 
+## Inkling-2 on CUDA (`inkling2_cuchain.h`)
+
+A CUDA build runs Inkling-2's dense matrices on the card a call at a time (its own small
+backend, `backend_cuda_ink.cu`) and the attention, the attention residuals and the short
+convolutions on the CPU. `COLI_CUDA_CHAIN=1` (`2`: prompts only) runs every layer on the card
+instead, the twin of the Vulkan chain ([vulkan.md](vulkan.md#inkling-2-on-the-chain)): one
+frame a layer on the chain's stream, the routed experts on the host (the CUDA tier's groups and
+the CPU's share), the K/V cache canonical on the host. Its ops are `cuda_inkc.cuh`'s: Inkling's
+short convolution, the attention with its relative-position bias, tau, window and sink, and
+Inkling-2's residual mix, L2 clips and dynamic convolution (`make CUDA=1 cuda-inkc-check` holds
+them to the CPU's arithmetic). The chain needs the backend's own tensors: at its first forward
+each bf16 matrix is read back once, freed and uploaded as a GGUF's BF16 rows (the same bytes);
+the per-matrix path then runs through those tensors where the chain declines a step.
+
+For Inkling-2-Mini it is on by default (`COLI_CUDA_CHAIN` unset; `0` turns it off), with three
+things the Small's runs did not have:
+
+- the loop: layers 6-17 run three passes, each with its own K/V mirror and convolution states,
+  the messages through the residual mix and the gates through `cc_ew`'s `CC_EW_LOOPGATE`, in the
+  CPU's order (`ink2_layers_forward`);
+- the routed experts in the frame: a decode step's rows (up to 8) route on the card (`cc_route`)
+  and run the CUDA tier's residents there (`cc_moe` with SiTU-GLU, `CcMoe.act` 1), by address
+  from the tier's table (`cut_dev_table`: `cu_xb.cu` writes each resident's `CcExpert`), so a
+  decode step whose layers all have every expert on the card is one frame. A GGUF's NVFP4 experts
+  keep each expert's global scale beside the table (`CcMoe.esc_off`) and go through an integer
+  step of their own (`cuda_bd.cuh`'s `bdi_moe_has`); the int4 g64 container's rows are the tier's
+  (`CcExpert.planar` 2, nibbles stored as v + 8). A layer with an expert elsewhere takes the
+  host's step, as do TOPP and `ROUTE_TRACE`; `COLI_CUDA_CHAIN_MOE=0` sends every layer there;
+- the attention of a decode step split over its positions (`COLI_CUDA_RELATTN_SPLIT`, on): a
+  block a tile of 128 positions for each (head, row), then a join in tile order. A block a head
+  walked every tile alone before, with only the heads' blocks on the card.
+
+A backend from before these ops (`cc_ink2_caps`) leaves the Mini on the per-matrix path. Measured
+on an RTX PRO 4000 Blackwell (24 GB, every expert of the model on the card), `coli serve`, about
+570 tokens of prompt then 100 of decode, tok/s:
+
+| Mini file | per-matrix | chain, experts on the host | chain, experts in the frame | + split attention |
+|---|---|---|---|---|
+| UD-Q4_K_XL | 106-107, 17.8-18.1 | 283-286, 20.0-20.6 | 283-286, 25.8-26.6 | 285-289, 40.9-41.1 |
+| UD-IQ2_XXS | 110-114, 20.2-20.5 | | 305-312, 27.8-28.8 | 311-317, 46.3-46.5 |
+| int4 g64 | 64-65, 16.0-16.3 | | 129-131, 23.7-24.4 | 131-132, 36.0-36.1 |
+
+The short answers were the same text on every arm; on a 300-token code answer the split moves a
+near tie 45 tokens in (the tiles' sums join in another order), as the per-matrix path and the
+chain without it part after about 240. The tiny Mini fixtures match the CPU token for token on the
+chain, the float ones' logits within 5e-5 and the int4 g64 container's within 2e-4; a GGUF's
+experts in the frame quantize the activations as the CPU's integer form does, and against it
+(`GQ_EXACT=0`) their logits stay within 2e-6 until a near tie parts the runs.
+
+For the Small it stays off by default because it measured no faster there. On an RTX PRO 4000
+with Inkling-2-Small int4 g64 (62 GB of RAM, the experts from RAM and disk), 64 tokens on three
+prompts in the same session: 1.24-1.27 tok/s with it against 1.26-1.29 without, the same text.
+The dense part of a run went from 4.7 to 3.4 s, but the routed experts and the reads took about
+as much back (the chain and the expert tier share the card), and the first prompt pays about
+4.5 s to move the matrices. The tiny oracles match token for token with it, their logits within
+1e-5 of the CPU's.
+
 ## The decision engines
 
 Laya (`laya.c`) and GLiNER2.5-Decide (`gliner_decide.c`) answer a decision with one forward
 over the request's rows and generate no text ([systemone.md](systemone.md#decision-engines)).
-In a CUDA build (`make laya gliner_decide CUDA=1`) with `COLI_CUDA=1` (`coli serve --gpu`),
+In a CUDA build (`make laya gliner_decide CUDA=1`, which `coli setup` makes on an NVIDIA card, and
+the Windows CUDA package's `laya.exe` and `gliner_decide.exe`) with `COLI_CUDA=1` (`coli serve --gpu`),
 `decide_cuda.h` opens the device once the weights are loaded, uploads every matrix of the
 encoder and of Laya's head as f32 (the checkpoint's values), and runs each forward as frames
 of the CUDA chain, one submission a forward: the embedding rows go up, the activations stay on
@@ -302,3 +432,13 @@ python tools/benchmark_cuda_fixture.py --model /nvme/colibri-bench-medium --gpu 
 The 313M-parameter fixture has random weights and is not a language model. It
 preserves the real MLA/MoE/streaming shapes to compare CPU streaming, dense-only
 CUDA, CPU hot-store, and CUDA hot-expert execution with identical replay tokens.
+
+### Direct DeepSeek V4 builds and older toolkits
+
+`make -C c -f Makefile.deepseek-v4 deepseek-v4 CUDA=1` checks the selected
+`NVCC` toolkit version before compiling the cuBLASLt block-scaling path.
+That path requires CUDA 12.8 or newer. An older or unrecognized version stops
+with a diagnostic; it does not silently change the requested configuration.
+Use a compatible toolkit, or explicitly pass `NO_TC=1` to compile the generic
+path without that check. GPU architecture support and the separate DeepGEMM
+requirements still apply. CPU-only builds do not probe CUDA.

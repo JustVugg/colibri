@@ -8,7 +8,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifdef _OPENMP
 #include <omp.h>
+#endif
 #include "../idot.h"
 
 #ifndef IDOT_R16

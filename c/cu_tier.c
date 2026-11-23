@@ -52,6 +52,9 @@ static const CuTierOps *cut_ops(void) {
 /* the CUDA tier's host pool is page-locked memory of its own (cudaHostAlloc), not a Vulkan
  * heap the driver sizes: no room reported, the pool sized from the RAM as before */
 #define coli_vk_tier_host_heap_room() ((size_t)0)
+/* the CUDA tier has no Vulkan mapped-weights window: the trunk-first ask never ran, the
+ * host pool keeps its own sizing */
+#define coli_vk_window_trunk_first_on() (0)
 #define VKT_NO_GIVE_BACK 1   /* vkt_give_back: the dense chain that asks is Vulkan's */
 #define coli_vk_block_elems(...) (cut_ops()->block_elems(__VA_ARGS__))
 #define coli_vk_tensor_row_bytes(...) (cut_ops()->tensor_row_bytes(__VA_ARGS__))
@@ -132,6 +135,7 @@ static const CuTierOps *cut_ops(void) {
 #define vkt_stage_room cut_stage_room
 #define vkt_step_rows cut_step_rows
 #define vkt_stream_prefetch cut_stream_prefetch
+#define vkt_take_back cut_take_back
 #define vkt_wanted cut_wanted
 #define vkt_wants cut_wants
 #define vkt_warm_report cut_warm_report

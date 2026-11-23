@@ -85,6 +85,32 @@ class CleanOwnershipTest(unittest.TestCase):
         self.assertIn("qwen36", mod.FILES)
         self.assertIn("qwen36.exe", mod.FILES)
 
+    def test_every_v4_build_stamp_is_cleaned_and_ignored(self):
+        """Makefile.deepseek-v4 writes a stamp per flag set into c/ on every build.
+
+        #2652 added the third, deepseek_v4.ldflags, without the clean.py and
+        .gitignore entries its two siblings have, so a standalone V4 build left
+        `?? c/deepseek_v4.ldflags` in `git status` and `make clean` kept it.
+        Read the stamp names from the Makefile so the next one cannot repeat it.
+        """
+        import importlib.util
+        import re
+        with open(os.path.join(C_DIR, "Makefile.deepseek-v4"), encoding="utf-8") as fh:
+            stamps = re.findall(r"^V4_\w*STAMP\s*=\s*(\S+)\s*$", fh.read(), re.M)
+        self.assertIn("deepseek_v4.ldflags", stamps)
+        spec = importlib.util.spec_from_file_location("coli_clean", CLEAN)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self.assertEqual([s for s in stamps if s not in mod.FILES], [],
+                         "V4 stamps clean.py does not remove")
+        gitignore = os.path.join(os.path.dirname(C_DIR), ".gitignore")
+        if not os.path.exists(gitignore):
+            self.skipTest("no .gitignore (not a git checkout)")
+        with open(gitignore, encoding="utf-8") as fh:
+            ignored = {line.strip() for line in fh}
+        self.assertEqual([s for s in stamps if "c/" + s not in ignored], [],
+                         "V4 stamps .gitignore does not list")
+
     def test_importing_the_module_is_inert(self):
         """Reading FILES must not delete anything.
 

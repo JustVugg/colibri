@@ -20,6 +20,10 @@ typedef struct {
     size_t length, offset;
 } MemoryStream;
 
+static int fake_multi_session = 1;
+static int fake_create_fails;
+static unsigned create_calls, destroy_calls;
+
 static void fake_capabilities(ColiSegmentCapabilities *capabilities) {
     capabilities->abi_version = COLI_SEGMENT_ABI_VERSION;
     capabilities->flags = COLI_SEGMENT_CAP_TOKEN_IDS |
@@ -27,6 +31,7 @@ static void fake_capabilities(ColiSegmentCapabilities *capabilities) {
                           COLI_SEGMENT_CAP_RANGE_NATIVE |
                           COLI_SEGMENT_CAP_MULTI_SESSION |
                           COLI_SEGMENT_CAP_CPU;
+    if (!fake_multi_session) capabilities->flags &= ~COLI_SEGMENT_CAP_MULTI_SESSION;
     snprintf(capabilities->engine_id, sizeof(capabilities->engine_id), "fake");
     snprintf(capabilities->state_schema, sizeof(capabilities->state_schema),
              "fake-state-v1");
@@ -59,6 +64,7 @@ static void fake_engine_destroy(void *engine_impl) { free(engine_impl); }
 static int fake_session_create(void *engine_impl, void **session_impl,
                                const ColiSegmentSessionOptions *options,
                                char *error, size_t error_size) {
+    create_calls++;
     FakeEngine *engine = (FakeEngine *)engine_impl;
     if (options->context_tokens > engine->context) {
         if (error && error_size) snprintf(error, error_size, "context too large");
@@ -68,10 +74,10 @@ static int fake_session_create(void *engine_impl, void **session_impl,
     if (!session) return -1;
     session->engine = engine;
     *session_impl = session;
-    return 0;
+    return fake_create_fails ? -1 : 0;
 }
 
-static void fake_session_destroy(void *session_impl) { free(session_impl); }
+static void fake_session_destroy(void *session_impl) { destroy_calls++; free(session_impl); }
 
 static int fake_session_run(void *session_impl,
                             const ColiSegmentRunRequest *request,
@@ -149,6 +155,46 @@ static const ColiSegmentAdapter incomplete_snapshot_adapter = {
     .session_run = fake_session_run,
     .session_snapshot = fake_snapshot,
 };
+
+static void test_single_session_capability(void) {
+    char error[160];
+    ColiSegmentEngineOptions options = {
+        .struct_size=sizeof(options), .model_dir="unused-fixture",
+        .layer_begin=1, .layer_end=4, .context_tokens=16,
+    };
+    ColiSegmentSessionOptions session_options = {
+        .struct_size=sizeof(session_options), .context_tokens=16,
+    };
+    ColiSegmentEngine *engine=NULL;
+    ColiSegmentSession *first=NULL, *second=NULL;
+    fake_multi_session=0;
+    assert(!coli_segment_engine_open("fake", &options, &engine, error, sizeof(error)));
+
+    /* Partial adapter failures release their resources without using the slot. */
+    unsigned destroyed=destroy_calls;
+    fake_create_fails=1;
+    assert(coli_segment_session_create(engine, &session_options, &first, error, sizeof(error)) != 0);
+    assert(first == NULL && destroy_calls == destroyed+1);
+    fake_create_fails=0;
+    assert(!coli_segment_session_create(engine, &session_options, &first, error, sizeof(error)));
+    unsigned calls=create_calls;
+    second=first; /* rejection must clear the output, not leave a stale handle */
+    assert(coli_segment_session_create(engine, &session_options, &second, error, sizeof(error)) != 0);
+    assert(second == NULL && create_calls == calls);
+    assert(strstr(error, "multiple live sessions"));
+    assert(coli_segment_engine_close(engine, error, sizeof(error)) != 0);
+
+    /* Rejection must not damage the first session. */
+    MemoryStream stream={0};
+    assert(!coli_segment_snapshot(first, memory_write, &stream, error, sizeof(error)));
+    assert(stream.length == sizeof(uint64_t));
+    coli_segment_session_destroy(first);
+    assert(!coli_segment_session_create(engine, &session_options, &second, error, sizeof(error)));
+    assert(create_calls == calls+1);
+    coli_segment_session_destroy(second);
+    assert(!coli_segment_engine_close(engine, error, sizeof(error)));
+    fake_multi_session=1;
+}
 
 static int never_cancel(void *unused) { (void)unused; return 0; }
 static int always_cancel(void *unused) { (void)unused; return 1; }
@@ -260,6 +306,7 @@ int main(void) {
     coli_segment_session_destroy(second);
     coli_segment_session_destroy(session);
     assert(coli_segment_engine_close(engine, error, sizeof(error)) == 0);
+    test_single_session_capability();
     puts("segment runtime tests: ok");
     return 0;
 }

@@ -14,7 +14,9 @@
 #include <string.h>
 #include <time.h>
 #include <math.h>
+#ifdef _OPENMP
 #include <omp.h>
+#endif
 #include "../expert_ffn.h"
 
 #ifndef XF16_ON

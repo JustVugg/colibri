@@ -59,6 +59,9 @@ typedef struct {
 typedef struct {
     int n_files;
     int *fds;
+#ifdef _WIN32
+    HANDLE *wh;               /* each part opened again overlapped: reads that do not queue (gguf_read) */
+#endif
     char **paths;
     int n_kv; gguf_kv *kv;
     int n_tensors; gguf_tensor *t;
@@ -152,12 +155,15 @@ static const gguf_kv *gguf_get(const gguf_ctx *g, const char *key) {
     for (int i = 0; i < g->n_kv; i++) if (!strcmp(g->kv[i].key, key)) return &g->kv[i];
     return NULL;
 }
-/* Integer/float/string getters: `def` when the key is absent or of the wrong kind. */
+/* Integer/float/string getters: `def` when the key is absent or of the wrong kind. gguf_get_int
+ * also returns `def` for a UINT64 above INT64_MAX, which int64_t cannot hold; gguf_get_float
+ * reads such a value as the positive number it is. */
 static int64_t gguf_get_int(const gguf_ctx *g, const char *key, int64_t def) {
     const gguf_kv *k = gguf_get(g, key);
     if (!k) return def;
     switch (k->type) {
-    case GGUF_T_U8: case GGUF_T_U16: case GGUF_T_U32: case GGUF_T_U64: case GGUF_T_BOOL: return (int64_t)k->v.u;
+    case GGUF_T_U8: case GGUF_T_U16: case GGUF_T_U32: case GGUF_T_U64: case GGUF_T_BOOL:
+        return k->v.u <= (uint64_t)INT64_MAX ? (int64_t)k->v.u : def;
     case GGUF_T_I8: case GGUF_T_I16: case GGUF_T_I32: case GGUF_T_I64: return k->v.i;
     default: return def;
     }
@@ -165,9 +171,12 @@ static int64_t gguf_get_int(const gguf_ctx *g, const char *key, int64_t def) {
 static double gguf_get_float(const gguf_ctx *g, const char *key, double def) {
     const gguf_kv *k = gguf_get(g, key);
     if (!k) return def;
-    if (k->type == GGUF_T_F32 || k->type == GGUF_T_F64) return k->v.f;
-    if (k->type == GGUF_T_ARRAY || k->type == GGUF_T_STRING) return def;
-    return (double)gguf_get_int(g, key, (int64_t)def);
+    switch (k->type) {
+    case GGUF_T_F32: case GGUF_T_F64: return k->v.f;
+    case GGUF_T_U8: case GGUF_T_U16: case GGUF_T_U32: case GGUF_T_U64: case GGUF_T_BOOL: return (double)k->v.u;
+    case GGUF_T_I8: case GGUF_T_I16: case GGUF_T_I32: case GGUF_T_I64: return (double)k->v.i;
+    default: return def;
+    }
 }
 static const char *gguf_get_str(const gguf_ctx *g, const char *key) {
     const gguf_kv *k = gguf_get(g, key); return (k && k->type == GGUF_T_STRING) ? k->s : NULL;
@@ -245,18 +254,35 @@ static int gguf_parse_one(gguf_ctx *g, int part, const char *path, int want_kv) 
         t->type = (int)gguf_rd_u32(&r);
         uint64_t rel = gguf_rd_u64(&r);
         if (r.bad) { free(t->name); break; }
-        int64_t rb = gq_row_bytes(t->type, t->ne[0]);
+        /* 64.. are the engine's own interleaved forms (GQ_*_R16), built at load for whole groups
+         * of 16 rows: never a file's type, or its rows are read as groups they do not fill */
+        int64_t rb = (t->type >= 0 && t->type < GQ_TYPE_MAX) ? gq_row_bytes(t->type, t->ne[0]) : -1;
         if (rb < 0) { r.bad = 1; snprintf(g->err, sizeof g->err, "%s: tensor %s: type %d (%s) cannot hold rows of %lld", path, t->name, t->type, gq_type_name(t->type), (long long)t->ne[0]); free(t->name); break; }
-        t->nbytes = rb * (numel / t->ne[0]);
+        int64_t rows = numel / t->ne[0];
+        if (rb > INT64_MAX / rows) {
+            r.bad = 1;
+            snprintf(g->err, sizeof g->err, "%s: tensor %s byte size overflows int64", path, t->name);
+            free(t->name); break;
+        }
+        t->nbytes = rb * rows;
         t->file = part; t->off = rel;          /* made absolute below */
         g->n_tensors++;
     }
     if (!r.bad) {
         uint64_t data = (r.pos + alignment - 1) / alignment * alignment;
+        /* A header read alone (GGUF_CHECK) holds no tensor bytes, so a tensor need not lie in the
+         * file; its end must still be an offset the readers hold in an int64_t (st_tensor.off,
+         * gguf_read), or an expert's slice past its start (st_gguf_index) overflows one. */
+        const uint64_t end = gguf_header_only ? (uint64_t)INT64_MAX : r.size;
         for (int i = t0; i < g->n_tensors; i++) {
             gguf_tensor *t = &g->t[i];
-            if (t->off % alignment || (!gguf_header_only && (t->off > r.size || data > r.size - t->off || (uint64_t)t->nbytes > r.size - data - t->off))) {
-                r.bad = 1; snprintf(g->err, sizeof g->err, "%s: tensor %s lies outside the file (offset %llu, %lld bytes)", path, t->name, (unsigned long long)t->off, (long long)t->nbytes); break;
+            if (t->off % alignment || t->off > end || data > end - t->off || (uint64_t)t->nbytes > end - data - t->off) {
+                r.bad = 1;
+                if (gguf_header_only)
+                    snprintf(g->err, sizeof g->err, "%s: tensor %s ends past the largest file offset (offset %llu, %lld bytes)", path, t->name, (unsigned long long)t->off, (long long)t->nbytes);
+                else
+                    snprintf(g->err, sizeof g->err, "%s: tensor %s lies outside the file (offset %llu, %lld bytes)", path, t->name, (unsigned long long)t->off, (long long)t->nbytes);
+                break;
             }
             t->off += data;
         }
@@ -269,6 +295,10 @@ static void gguf_close(gguf_ctx *g) {
     if (!g) return;
     for (int i = 0; i < g->n_files; i++) { if (g->fds && g->fds[i] >= 0) close(g->fds[i]); if (g->paths) free(g->paths[i]); }
     free(g->fds); free(g->paths);
+#ifdef _WIN32
+    for (int i = 0; g->wh && i < g->n_files; i++) if (g->wh[i] && g->wh[i] != INVALID_HANDLE_VALUE) CloseHandle(g->wh[i]);
+    free(g->wh);
+#endif
     for (int i = 0; i < g->n_kv; i++) {
         gguf_kv *k = &g->kv[i]; free(k->key); free(k->s); free(k->arr);
         if (k->strs) { for (uint64_t j = 0; j < k->n; j++) free(k->strs[j]); free(k->strs); }
@@ -291,10 +321,18 @@ static int gguf_is_file(const char *path) {
  * (NAME-00001-of-000NN.gguf), in which case every part is opened. */
 static int gguf_open(gguf_ctx *g, const char *path) {
     memset(g, 0, sizeof *g);
-    const char *of = strstr(path, "-of-");
+    const char *filename = strrchr(path, '/');
+    filename = filename ? filename + 1 : path;
+#ifdef _WIN32
+    const char *backslash = strrchr(filename, '\\');
+    if (backslash) filename = backslash + 1;
+#endif
+    size_t flen = strlen(filename);
+    const char *of = flen >= 20 ? filename + flen - 14 : NULL;
     int parts = 1;
     size_t plen = strlen(path);
-    if (of && of - path >= 6 && plen >= 5 && !strcmp(path + plen - 5, ".gguf")) {
+    if (of && !strncmp(of, "-of-", 4) && of - filename >= 6 &&
+        plen >= 5 && !strcmp(path + plen - 5, ".gguf")) {
         const char *num = of - 5;
         int a = atoi(num), b = atoi(of + 4);
         if (num[-1] == '-' && a == 1 && b >= 1 && b <= 9999) parts = b;
@@ -304,6 +342,9 @@ static int gguf_open(gguf_ctx *g, const char *path) {
     g->paths = (char **)calloc((size_t)parts, sizeof(char *));
     if (!g->fds || !g->paths) { snprintf(g->err, sizeof g->err, "out of memory"); gguf_close(g); return -1; }
     for (int p = 0; p < parts; p++) g->fds[p] = -1;
+#ifdef _WIN32
+    g->wh = (HANDLE *)calloc((size_t)parts, sizeof(HANDLE));   /* NULL entries: gguf_read keeps fds[] */
+#endif
     for (int p = 0; p < parts; p++) {
         char *pp = strdup(path);
         if (!pp) { snprintf(g->err, sizeof g->err, "out of memory"); gguf_close(g); return -1; }
@@ -316,6 +357,16 @@ static int gguf_open(gguf_ctx *g, const char *path) {
         g->fds[p] = open(pp, O_RDONLY);
 #endif
         if (g->fds[p] < 0) { snprintf(g->err, sizeof g->err, "%s: %s", pp, strerror(errno)); gguf_close(g); return -1; }
+#ifdef _WIN32
+        /* A handle from open() is synchronous, and Windows runs one I/O at a time on a synchronous
+         * file object: an OpenMP team reading a GGUF's rows through fds[] reads them one after
+         * the other. An overlapped handle does not queue them. No such handle: fds[] as before. */
+        if (g->wh) {
+            HANDLE h = CreateFileA(pp, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, NULL);
+            g->wh[p] = h == INVALID_HANDLE_VALUE ? NULL : h;
+        }
+#endif
     }
     g->idx_cap = g->n_tensors * 2 + 1;
     g->idx = (int *)malloc(sizeof(int) * (size_t)g->idx_cap);
@@ -335,12 +386,20 @@ static int gguf_read(const gguf_ctx *g, const gguf_tensor *t, void *dst, int64_t
     uint8_t *p = (uint8_t *)dst; uint64_t pos = t->off + (uint64_t)off; int64_t left = n;
     while (left > 0) {
 #ifdef _WIN32   /* positional, as compat_pread: _lseeki64 + _read share the seek and race between threads */
-        HANDLE h = (HANDLE)_get_osfhandle(g->fds[t->file]);
+        HANDLE wh = g->wh ? g->wh[t->file] : NULL;
+        HANDLE h = wh ? wh : (HANDLE)_get_osfhandle(g->fds[t->file]);
         if (h == INVALID_HANDLE_VALUE) return -1;
         DWORD want = left > (1 << 30) ? (DWORD)(1 << 30) : (DWORD)left, got = 0;
         OVERLAPPED ov; memset(&ov, 0, sizeof ov);
         ov.Offset = (DWORD)(pos & 0xFFFFFFFFu); ov.OffsetHigh = (DWORD)(pos >> 32);
-        if (!ReadFile(h, p, want, &got, &ov)) return -1;
+        if (wh) {   /* overlapped: an event of this read's own, waited on here */
+            ov.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
+            if (!ov.hEvent) return -1;
+            BOOL ok = ReadFile(h, p, want, NULL, &ov) || GetLastError() == ERROR_IO_PENDING;
+            ok = ok && GetOverlappedResult(h, &ov, &got, TRUE);
+            CloseHandle(ov.hEvent);
+            if (!ok) return -1;
+        } else if (!ReadFile(h, p, want, &got, &ov)) return -1;
         int64_t r = (int64_t)got;
 #else
         ssize_t r = pread(g->fds[t->file], p, (size_t)(left > (1 << 30) ? (1 << 30) : left), (off_t)pos);
@@ -349,6 +408,17 @@ static int gguf_read(const gguf_ctx *g, const gguf_tensor *t, void *dst, int64_t
         p += r; pos += (uint64_t)r; left -= r;
     }
     return 0;
+}
+
+/* Ask the OS to read n bytes at byte `off` inside tensor t ahead (POSIX_FADV_WILLNEED), so a
+ * gguf_read of them later finds them in the page cache; nothing where there is no fadvise. */
+static void gguf_advise(const gguf_ctx *g, const gguf_tensor *t, int64_t off, int64_t n) {
+#if defined(POSIX_FADV_WILLNEED) && !defined(_WIN32)
+    if (off < 0 || n <= 0 || off > t->nbytes || n > t->nbytes - off) return;
+    (void)posix_fadvise(g->fds[t->file], (off_t)(t->off + (uint64_t)off), (off_t)n, POSIX_FADV_WILLNEED);
+#else
+    (void)g; (void)t; (void)off; (void)n;
+#endif
 }
 
 /* Whole tensor to float32 (any supported type). dst holds numel floats. */

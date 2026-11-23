@@ -219,10 +219,15 @@ class InklingParkTest(unittest.TestCase):
     """A short request between two turns parks the conversation (park.h): the shared
     contract's scenario, on this engine's spawn."""
     PARKS = True
+    PARK_DECIDES_NEXT = True
     setUpClass = InklingPromptCancelTest.setUpClass
     spawn = InklingPromptCancelTest.spawn
     test_a_short_request_between_two_turns_keeps_the_conversation = \
         PrefixReuseContract.test_a_short_request_between_two_turns_keeps_the_conversation
+    test_a_new_shorter_conversation_keeps_its_own_state = \
+        PrefixReuseContract.test_a_new_shorter_conversation_keeps_its_own_state
+    test_two_short_requests_between_two_turns_keep_the_conversation = \
+        PrefixReuseContract.test_two_short_requests_between_two_turns_keep_the_conversation
 
 
 if __name__ == "__main__":

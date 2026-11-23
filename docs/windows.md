@@ -12,7 +12,7 @@ install it with winget), finds your hardware, recommends a model that fits,
 gets the engine (built with MSYS2 when it is installed, with Vulkan when your
 GPU can use it; otherwise the prebuilt one from the release, which runs on the
 CPU or with Vulkan), downloads
-the model with resume and opens the dashboard. Running it again starts colibri
+the model with resume and opens the chat. Running it again starts colibri
 directly. The same from a terminal: `py -3 c\coli setup`. See
 [quickstart.md](quickstart.md#the-one-step-way).
 
@@ -42,12 +42,41 @@ drivers all install one) and on the CPU everywhere else, with nothing to build.
 **NVIDIA, CUDA.** For an RTX 30, 40 or 50 series card (compute capability 8.0
 and newer: A100, H100 and later too) the release also has
 **`colibri-<version>-windows-x86_64-cuda.zip`**. Unpack it into the same folder:
-it replaces `colibri.exe`, `qwen36.exe` and `kimi_k3.exe` with the same engines
-plus CUDA, and adds `coli_cuda.dll` and NVIDIA's CUDA runtime
+it replaces `colibri.exe`, `glm53.exe`, `qwen36.exe`, `qwen38.exe`,
+`kimi_k3.exe`, `deepseek_v41.exe`, `mimo.exe`, `inkling.exe`, `olmoe.exe`,
+`laya.exe` and `gliner_decide.exe` with the same engines plus CUDA, and adds `coli_cuda.dll` and NVIDIA's CUDA runtime
 (`cudart64_12.dll`), so no CUDA toolkit is needed, only an NVIDIA driver for
-CUDA 12. `coli.cmd setup` then picks CUDA for the models those three engines
-run; an older card keeps Vulkan. To build the DLL yourself, for a card the
-package does not cover, see below.
+CUDA 12. `coli.cmd setup` then picks CUDA for the models those eleven engines
+run; an older card keeps Vulkan. `glm53.exe` (GLM-5.3-Flash) and `qwen38.exe`
+(Qwen3.8) are in the package from the release after v2.1.0, and so are
+`deepseek_v41.exe`, `mimo.exe`, `inkling.exe`, `olmoe.exe`, `laya.exe` and
+`gliner_decide.exe`; with v2.1.0, build them as
+below with `make <engine>.exe CUDA_DLL=1`. `inkling.exe` has both backends, as
+on Linux: Inkling-2 runs on Vulkan unless `COLI_VULKAN=0` asks for CUDA (the
+same card; Inkling-2-Mini measured within a few percent on either, [inkling.md](inkling.md#inkling-2-mini)). To build the DLL yourself, for a card the package
+does not cover, see below.
+
+| engine | family | CUDA on Windows |
+|---|---|---|
+| `colibri.exe` | GLM-5.2/5.3 | the CUDA package |
+| `glm53.exe` | GLM-5.3-Flash | the CUDA package, from the release after v2.1.0 |
+| `qwen36.exe` | Qwen3.6-35B-A3B | the CUDA package |
+| `qwen38.exe` | Qwen3.8-Flash-Next | the CUDA package, from the release after v2.1.0 |
+| `kimi_k3.exe` | Kimi K3 | the CUDA package |
+| `deepseek_v41.exe` | DeepSeek V4.1 Flash | the CUDA package, from the release after v2.1.0 |
+| `mimo.exe` | MiMo-V2.6 | the CUDA package, from the release after v2.1.0 |
+| `inkling.exe` | Inkling, Inkling-2 | the CUDA package, from the release after v2.1.0 (Vulkan unless `COLI_VULKAN=0`) |
+| `olmoe.exe` | OLMoE | the CUDA package, from the release after v2.1.0 |
+| `laya.exe`, `gliner_decide.exe` | Laya, GLiNER2.5-Decide | the CUDA package, from the release after v2.1.0 |
+| `deepseek_v4.exe` | DeepSeek V4 Flash | its own DLLs, in the CUDA package |
+| `qwenimage.exe` | Qwen-Image-2.1 | none: Vulkan or the CPU |
+
+**Data-center cards in TCC or MCDM mode.** Windows can run a data-center card
+such as the A100 in TCC or MCDM mode, compute-only driver models with no
+graphics API: the card then has no Vulkan device, `vulkaninfo` fails and setup
+finds none (#2846). `nvidia-smi --query-gpu=driver_model.current --format=csv`
+prints the mode. On such a card only the CUDA column above is a GPU path; setup
+says so before it downloads a model that would run on the CPU, and asks.
 
 The rest of this page is for building from source.
 
@@ -67,7 +96,8 @@ Its executables tools `sh`, `bash`, `make`, `sed` etc go in `c:\msys64\usr\bin`.
 From within `mingw64` we need to install compiler and make. \
 \
 `C:\msys64\mingw64.exe`\
-`pacman -S --needed mingw-w64-x86_64-gcc make`\
+`pacman -S --needed mingw-w64-x86_64-gcc mingw-w64-x86_64-libgomp make`\
+(in the UCRT64 shell, which the rest of this page and `coli setup` use, the packages are `mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-libgomp`; gcc 16 no longer brings libgomp along, so ask for it by name)\
 \
 To see which AI oriented instructions your processor has, run CPU-Z from `https://www.cpuid.com/softwares/cpu-z.html` \
 or use the following command from msys2: `cat /proc/cpuinfo | grep ^flags | head -n 1`\
@@ -186,6 +216,13 @@ make cuda-dll CUDA_ARCH=sm_120        # match your GPU: sm_120 Blackwell, sm_89 
 make colibri.exe CUDA_DLL=1 ARCH=native   # relink host with the runtime loader
 ```
 
+> **No CUDA Toolkit installer (for example, no admin rights)?** A conda-layout CUDA tree works as well. Put its `Library\bin` on PATH (that is where `nvcc.exe` and `cudart64_12.dll` are) and pass `CUDA_HOME` with forward slashes:
+> ```cmd
+> set PATH=C:\path\to\env\Library\bin;%PATH%
+> make cuda-dll CUDA_HOME=C:/path/to/env/Library CUDA_ARCH=sm_89
+> ```
+> `coli_cuda.dll` imports `cudart64_12.dll`, which lives in that same `Library\bin`: keep it on PATH at run time, or copy the DLL next to `coli_cuda.dll`. Built this way with nvcc 12.8.93 and the MSVC 14.44 Build Tools on an RTX 4090 Laptop (sm_89). If the Build Tools are installed outside the default folder, `vcvars64.bat` prints `'vswhere.exe' is not recognized`; that message is harmless.
+
 Two pitfalls, both fixed on current `dev` (#314) but worth knowing on older checkouts:
 
 - **Spaces in `CUDA_HOME`** (`C:\Program Files\...`) used to break the recipe → fixed; nvcc now comes from PATH and `"$(NVCC)"` is quoted.
@@ -222,7 +259,7 @@ Size `CUDA_EXPERT_GB` so dense (~10 GB) + experts + working set stays under your
 | `An Application Control policy has blocked this file` | Smart App Control | §2 — turn SAC off + **reboot** |
 | `cannot execute 'collect2.exe': CreateProcess: No such file or directory` | Smart App Control blocked the freshly installed compiler (#1900) | §2: SAC off and a reboot, or wait for SAC's verdict |
 | `storage size of 'r' isn't known` / `implicit declaration of function 'getrusage'`, or `make` stops with "builds for x86_64-pc-msys" (or cygwin) | the gcc that ran is MSYS2's own (the plain `gcc` package, or the "MSYS2 MSYS" shell): it targets the MSYS runtime, not Windows, and does not define `_WIN32` (#1979) | open "MSYS2 UCRT64", `pacman -S --needed mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-libgomp`, check that `gcc -dumpmachine` says `x86_64-w64-mingw32` |
-| `cannot find -lgomp` at the link | MSYS2's gcc 16 no longer pulls libgomp (#1900) | `pacman -S mingw-w64-ucrt-x86_64-libgomp` (`coli setup` lists it) |
+| `cannot find -lgomp` / "have you installed the static version of the gomp library?" at the link | MSYS2's gcc 16 no longer pulls libgomp (#1900): `-fopenmp -static` needs `libgomp.a`, which now ships in its own package (#2612). `gcc -print-file-name=libgomp.a` printing just `libgomp.a` confirms it | `pacman -S --needed mingw-w64-ucrt-x86_64-libgomp` (`make`, `setup.sh` and `coli setup` all point at it) |
 | `make qwen38` (or glm53, inkling, kimi_k3, olmoe, deepseek_v41) ends in `undefined reference to ...` | older tree: no bare target for that engine, make compiled the `.c` alone (#1945) | update, or name the binary: `make qwen38.exe ...` |
 | `coli setup` does not find MSYS2 installed by scoop, or uses another gcc on the PATH without Vulkan | older tree (#1900) | update, or set `MSYS2_ROOT` to the MSYS2 folder |
 | `cuda-dll ... Error 1` immediately | old tree: spaced CUDA_HOME / MSVC rejects `-Wextra` | update to current `dev` (#314) |

@@ -19,7 +19,7 @@ adapters and keep their existing initialization and inference paths.
 External consumers can build the complete CPU-baseline runtime with
 `make -C c segment-edge-library`. The resulting
 `c/build/segment/libcolibri_segment_edge.a` contains both public runtimes and
-all seven built-in adapters. Consumers link it after their own objects and call
+all eight built-in adapters. Consumers link it after their own objects and call
 the explicit registration functions below; ordinary Colibri executables do
 not link this archive.
 
@@ -55,6 +55,7 @@ Colibri model family:
 | Adapter | Boundary state | Edge residency |
 | --- | --- | --- |
 | GLM-5.2 | hidden state | tokenizer, embedding, final norm and head |
+| GLM-5.3-Flash | MLA latent, KDA and DSA streams | tokenizer, embedding, final norm and head |
 | Inkling | hidden state | tokenizer, optional embed norm, final norm and head |
 | Kimi K3 | hidden plus all AttnRes blocks | tokenizer, final transforms and head; embedding rows stream on demand |
 | OLMoE | hidden state | tokenizer, embedding, final norm and head |
@@ -78,7 +79,7 @@ returning one greedy token and an optional score per row. Edge ABI v2 also
 exposes `coli_edge_logits`, which returns the complete row-major vocabulary
 logits after that same model-specific transform. Colibri therefore remains the
 owner of model math, while a serving caller can apply temperature, top-p and
-its own reproducible RNG policy without duplicating any of the six heads.
+its own reproducible RNG policy without duplicating any model head.
 `argmax(logits)` is release-gated against `coli_edge_select` for every family.
 
 The runtime validates structure sizes, activation geometry, batch limits,
@@ -92,7 +93,7 @@ standalone engines, rather than a recoverable request error.
 
 ## All-family release gate
 
-`make -C c edge-adapters` verifies that all seven real adapters coexist in one
+`make -C c edge-adapters` verifies that all eight real adapters coexist in one
 runtime. `edge-adapters-real` is the stronger gate: for every family it loads
 the real Edge adapter and a full real Segment range, round-trips text, embeds
 an independent oracle prompt, performs prefill plus decode and compares three

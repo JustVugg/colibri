@@ -35,17 +35,23 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 _UP = os.path.dirname(HERE)
-# the release archive keeps coli next to ui/, a source checkout keeps it in c/
-COLI_DIR = _UP if os.path.isfile(os.path.join(_UP, "coli")) else os.path.join(_UP, "c")
+# Support modules sit next to ui/ in an archive or libexec installation,
+# and in c/ in a source checkout. An installed launcher lives in bin/.
+COLI_DIR = _UP if os.path.isfile(os.path.join(_UP, "setup_flow.py")) else os.path.join(_UP, "c")
+COLI = os.path.join(COLI_DIR, "coli")
+if not os.path.isfile(COLI):
+    COLI = os.path.join(os.path.dirname(os.path.dirname(COLI_DIR)), "bin", "coli")
 sys.path.insert(0, COLI_DIR)
 import setup_catalog  # noqa: E402
 import setup_download  # noqa: E402
 import setup_flow  # noqa: E402
 import setup_hw  # noqa: E402
+import model_fit  # noqa: E402
 
 GB = 1_000_000_000
 LINUX = sys.platform.startswith("linux")
@@ -68,8 +74,8 @@ IGPU_RATIO = {"qwen36": {"model": "Qwen3.6", "gpu": 9.94, "cpu": 6.01},
 # with one draft (#1940 on an i5-13500). A family measured here uses its own tokens per forward.
 MTP_GAIN = {"qwen36": 14.8 / 13.8}
 # How capable a family is, for the best model each way it can run (higher first).
-FAMILY_RANK = {"olmoe": 1, "qwen36": 3, "glm53": 4, "qwen38": 5, "deepseek_v4": 5, "mimo": 6,
-               "deepseek_v41": 6, "glm": 8, "inkling": 9, "kimi": 10}
+FAMILY_RANK = {"olmoe": 10, "qwen36": 30, "glm53": 40, "qwen38": 50, "deepseek_v4": 50, "mimo": 60,
+               "deepseek_v41": 60, "glm": 80, "inkling": 90, "kimi": 100}   # setup_catalog's ranks
 # A GGUF's general.architecture -> the engine family that reads it (tools/gguf_import.py ARCHES)
 GGUF_FAMILY = {"qwen35moe": "qwen36", "qwen35": "qwen36", "qwen3moe": "qwen36", "qwen3": "qwen36",
                "flint": "qwen36", "muse-spark": "qwen36", "lfm3": "qwen36", "qwen4exp": "qwen38",
@@ -189,6 +195,31 @@ def _argval(argv, flag):
     return None
 
 
+def coli_command(argv):
+    """`serve` or `web` when argv is coli's (`coli web` serves too, with this UI as its child), else None"""
+    for i, a in enumerate(argv[:3]):
+        if os.path.basename(a) == "coli" and i + 1 < len(argv) and argv[i + 1] in ("serve", "web"):
+            return argv[i + 1]
+    return None
+
+
+def serve_argv(argv):
+    """the command that starts a gateway like this one again: a `coli web` becomes `coli serve`
+    with its options, without the UI's own (this UI stays and follows the new process)"""
+    cmd = coli_command(argv)
+    if cmd != "web":
+        return list(argv)
+    at = next(i for i, a in enumerate(argv[:3]) if os.path.basename(a) == "coli") + 1
+    rest = [a for a in _without(argv[at + 1:], ("--ui-port",)) if a != "--no-browser"]
+    return argv[:at] + ["serve"] + rest
+
+
+# This UI as `coli web`'s child: it exits when that process does (server.py, --exit-with-stdin),
+# but a model switch stops it on purpose. While `switching`, the UI stays; after, it follows `pid`,
+# the gateway the switch started (or the previous one brought back).
+LIFE = {"switching": False, "pid": None}
+
+
 def _without(argv, flags):
     """argv without these options and their values"""
     out, skip = [], False
@@ -259,7 +290,7 @@ def gateway_proc():
             with open("/proc/%d/environ" % pid, "rb") as f:
                 env = dict(x.split("=", 1) for x in f.read().decode(errors="replace").split("\0") if "=" in x)
             info = {"pid": pid, "argv": argv, "cwd": os.readlink("/proc/%d/cwd" % pid), "env": env,
-                    "coli": any(os.path.basename(a) == "coli" for a in argv[:3]) and "serve" in argv}
+                    "coli": coli_command(argv) is not None}
             info["key"] = _argval(argv, "--api-key") or env.get("COLI_API_KEY")
         except OSError:
             info = None
@@ -322,8 +353,11 @@ def measure_ram_bw(seconds=1.5):
     numpy's sum runs outside the GIL; in plain Python the threads would take turns."""
     try:
         import numpy as np
-    except ImportError:
-        raise RuntimeError("serve numpy per misurare la banda della RAM") from None
+    except ImportError:   # the setup's own probe: a process a core, memchr over its buffer
+        v = model_fit.measure_ram_bandwidth(avail_bytes=(setup_hw.detect_memory() or {}).get("available"))
+        if not v:
+            raise RuntimeError("la banda della RAM non si misura qui") from None
+        return v
     n = os.cpu_count() or 4
     per = 64 << 20
     arrs = [np.ones(per // 8, dtype=np.float64) for _ in range(n)]
@@ -617,6 +651,29 @@ def usable_ram():
     return max(0.0, (MACHINE.get("ram_total_gb") or 0) * GB * 0.9 - 2 * GB)
 
 
+def gpu_estimate(g, family, cards, bench):
+    """Decode on the dedicated cards, as `coli setup` estimates it (model_fit.estimate): the
+    card's bandwidth from its name, the RAM's measured here, CUDA for an NVIDIA card where the
+    engine has it, else Vulkan. None without the figures."""
+    k, e = g.get("k"), g.get("E")
+    if not (k and e and g.get("experts") is not None):
+        return None
+    resident, dense = held(g, family)
+    arch = g.get("arch") or ""
+    entry = type("Geometry", (), {"family": family, "modality": "text", "tpf": 0,
+                                  "cost": "inkling2" if arch.startswith("inkling2") or (family == "inkling" and e in (128, 384)) else "",
+                                  "resident_gb": resident / GB, "experts_gb": g["experts"] / GB, "dense_read_gb": dense / GB,
+                                  "active_gb": (dense + g["experts"] * k / e) / GB, "layers": g.get("layers") or 48})()
+    nvidia = all("nvidia" in ((c.get("vendor") or "") + (c.get("name") or "")).lower() for c in cards)
+    backend = "cuda" if nvidia and family in setup_flow.CUDA_ENGINES else "vulkan"
+    fit = {"ram": (MACHINE.get("ram_total_gb") or 0) * GB, "ram_gbs": bench.get("ram_bw_gbs"), "integrated": None,
+           "disk": None, "disk_gbs": bench.get("disk_gbs"),
+           "cards": [{"name": c.get("name"), "vram": (c.get("vram_gb") or 0) * GB,
+                      "gbs": model_fit.card_gbs(c.get("name"), (c.get("vram_gb") or 0) * GB)} for c in cards]}
+    est = model_fit.estimate(entry, fit, backend)
+    return est["tok_s"] if est.get("tier") in ("gpu", "hybrid", "ssd") else None
+
+
 def tiers_for(g, disk_bytes, ram_min_gb=0, have=False, family="", mtp=None, accel=True):
     """The three ways a model can run here, each with fits / why / speed estimate. `have`:
     already on this disk, so the download size does not matter. `accel`: its engine has a GPU
@@ -646,8 +703,9 @@ def tiers_for(g, disk_bytes, ram_min_gb=0, have=False, family="", mtp=None, acce
         vram = sum(x.get("vram_gb") or 0 for x in disc) * GB
         cap = ram + vram
         fits = total <= cap
-        t = {"fits": fits, "need_gb": round(total / GB, 1), "gpu": name, "est": None,
-             "est_note": "su GPU dedicata la velocità si misura al primo uso" if disc else None,
+        est_gpu = gpu_estimate(g, family, disc, bench) if (disc and fits and accel) else None
+        t = {"fits": fits, "need_gb": round(total / GB, 1), "gpu": name, "est": est_gpu,
+             "est_note": (None if est_gpu else "su GPU dedicata la velocità si misura al primo uso") if disc else None,
              "why": (("%s: GPU integrata, usa la stessa RAM (%.0f GB utili)" % (name, ram / GB) if not disc
                       else "%.0f GB di VRAM + %.0f GB di RAM" % (vram / GB, ram / GB)) if fits
                      else "servono %.0f GB, VRAM + RAM fanno %.0f GB" % (total / GB, cap / GB))}
@@ -1035,7 +1093,7 @@ class Cancelled(BaseException):
 
 
 def new_job(kind, title, **kw):
-    jid = "%x" % int(time.time() * 1000)
+    jid = uuid.uuid4().hex
     job = {"id": jid, "kind": kind, "title": title, "state": "queued", "done": 0, "total": 0, "rate": 0, "eta": None,
            "msg": "", "started": time.time(), "cancel": False, **kw}
     with _jlock:
@@ -1067,11 +1125,15 @@ def run_download(job, repo, revision, files, dest, after=None):
                 raise Cancelled()
             now = time.time()
             job["done"], job["file"] = ev["done"], ev["file"]
+            # `done` includes bytes already on disk. `fresh` is this run only,
+            # so a resume does not report the whole model as one second of speed.
+            fresh = ev.get("fresh", ev["done"])
             if now - mark[0] >= 1.0:
-                rate = (ev["done"] - mark[1]) / (now - mark[0])
+                gained = max(0, fresh - mark[1])
+                rate = gained / (now - mark[0])
                 job["rate"] = rate if not job["rate"] else 0.7 * job["rate"] + 0.3 * rate
                 job["eta"] = (total - ev["done"]) / job["rate"] if job["rate"] > 0 else None
-                mark[0], mark[1] = now, ev["done"]
+                mark[0], mark[1] = now, fresh
         setup_download.download_repo(repo, revision, dest, files, token=setup_download.hf_token(), progress=progress)
         job["done"] = total
         if after:
@@ -1127,7 +1189,7 @@ def start_gguf_download(repo, stem):
     job = new_job("download", "%s %s" % (repo.split("/")[-1], v["quant"]), repo=repo, dest=out)
 
     def after(j):
-        r = subprocess.run([sys.executable, os.path.join(COLI_DIR, "coli"), "import", os.path.join(dest, v["files"][0]["path"]),
+        r = subprocess.run([sys.executable, COLI, "import", os.path.join(dest, v["files"][0]["path"]),
                             "--out", out, "--mode", "link"], capture_output=True, text=True, cwd=COLI_DIR)
         if r.returncode:
             raise RuntimeError("coli import: %s" % (r.stderr or r.stdout)[-400:])
@@ -1150,11 +1212,15 @@ def proc_children(pid):
 
 
 def stop_gateway(p, job):
-    kids = proc_children(p["pid"])
+    kids = [k for k in proc_children(p["pid"]) if k != os.getpid()]   # under `coli web` this UI is one
     job.update(state="stopping", msg="fermo il server attuale")
     os.kill(p["pid"], signal.SIGTERM)
     for _ in range(60):
-        if not os.path.exists("/proc/%d" % p["pid"]):
+        try:
+            reaped, _ = os.waitpid(p["pid"], os.WNOHANG)
+        except ChildProcessError:
+            reaped = 0
+        if reaped == p["pid"] or not os.path.exists("/proc/%d" % p["pid"]):
             break
         time.sleep(1)
     else:
@@ -1202,27 +1268,35 @@ def switch_model(path, force=False, tier=None):
     folder and environment) with --model changed; `tier` ram or gpu also turns the GPU off or
     on. A model that does not start brings the previous one back."""
     path = os.path.realpath(path)
-    if not os.path.isdir(path) or not under_roots(path):
+    if not os.path.isdir(path):
         raise ValueError("cartella del modello non valida")
-    old = gateway_proc()
-    answering = False
-    try:
-        gw_json("/health", timeout=3)
-        answering = True
-    except urllib.error.HTTPError:
-        answering = True
-    except (OSError, ValueError):
-        pass
-    if answering and old and not old["coli"]:
-        raise RuntimeError("la porta %d è di un altro processo (%d): non lo tocco" % (CFG.port, old["pid"]))
-    if answering and not old:
-        raise RuntimeError("non trovo il processo di coli serve sulla porta %d su questa macchina: fermalo e "
-                           "riavvialo con coli serve --model %s" % (CFG.port, path))
-    if answering and not force and not gw_idle():
-        raise RuntimeError("il motore sta rispondendo a una richiesta: riprova quando ha finito")
     if not _switching.acquire(blocking=False):
         raise RuntimeError("sto già cambiando modello: aspetta che finisca")
-    job = new_job("switch", os.path.basename(path), dest=path)
+    try:
+        # The current gateway and its health must belong to this admitted
+        # operation, not a snapshot from before another switch completed.
+        if not under_roots(path):
+            raise ValueError("cartella del modello non valida")
+        old = gateway_proc()
+        answering = False
+        try:
+            gw_json("/health", timeout=3)
+            answering = True
+        except urllib.error.HTTPError:
+            answering = True
+        except (OSError, ValueError):
+            pass
+        if answering and old and not old["coli"]:
+            raise RuntimeError("la porta %d è di un altro processo (%d): non lo tocco" % (CFG.port, old["pid"]))
+        if answering and not old:
+            raise RuntimeError("non trovo il processo di coli serve sulla porta %d su questa macchina: fermalo e "
+                               "riavvialo con coli serve --model %s" % (CFG.port, path))
+        if answering and not force and not gw_idle():
+            raise RuntimeError("il motore sta rispondendo a una richiesta: riprova quando ha finito")
+        job = new_job("switch", os.path.basename(path), dest=path)
+    except BaseException:
+        _switching.release()
+        raise
 
     def go():
         try:
@@ -1239,11 +1313,11 @@ def switch_model(path, force=False, tier=None):
                 if r.returncode or not os.path.exists(binary):
                     raise RuntimeError("make %s non riuscito: %s" % (d.build_target, (r.stderr or r.stdout)[-300:]))
             if old and old["coli"]:
-                argv, cwd, env = list(old["argv"]), old["cwd"], dict(old["env"])
+                argv, cwd, env = serve_argv(old["argv"]), old["cwd"], dict(old["env"])
                 at = argv.index("serve") + 1
                 argv = argv[:at] + ["--model", path] + _without(argv[at:], ("--model",))
             else:
-                argv = [sys.executable, os.path.join(COLI_DIR, "coli"), "serve", "--model", path,
+                argv = [sys.executable, COLI, "serve", "--model", path,
                         "--host", CFG.host, "--port", str(CFG.port)]
                 cwd, env = COLI_DIR, dict(os.environ)
             if tier == "ram":
@@ -1258,10 +1332,14 @@ def switch_model(path, force=False, tier=None):
                 if nvidia and env.get("COLI_CUDA") != "1" and not _argval(argv, "--gpu"):
                     argv += ["--gpu", "auto"]
             if old and old["coli"]:
+                if old["pid"] == os.getppid():
+                    LIFE["switching"] = True   # `coli web` started this UI: it stays while that stops
                 stop_gateway(old, job)
             log = spath("serve.log")
             job.update(state="starting", msg="avvio il nuovo modello")
             proc = launch(argv, cwd, env, log)
+            if LIFE["switching"]:
+                LIFE["pid"] = proc.pid
             try:
                 wait_up(proc, log, job)
             except RuntimeError as e:
@@ -1270,7 +1348,9 @@ def switch_model(path, force=False, tier=None):
                 if not (old and old["coli"]):
                     raise
                 job.update(state="starting", msg=str(e)[:400], note="non parte: riavvio il modello di prima")
-                back = launch(old["argv"], old["cwd"], old["env"], spath("serve-previous.log"))
+                back = launch(serve_argv(old["argv"]), old["cwd"], old["env"], spath("serve-previous.log"))
+                if LIFE["switching"]:
+                    LIFE["pid"] = back.pid
                 try:
                     wait_up(back, spath("serve-previous.log"), job)
                     job["note"] = "riavviato il modello di prima"
@@ -1283,8 +1363,14 @@ def switch_model(path, force=False, tier=None):
         except Exception as e:   # noqa: BLE001 - said on the page
             job.update(state="error", msg=str(e)[:400])
         finally:
+            LIFE["switching"] = False
             _switching.release()
-    threading.Thread(target=go, daemon=True).start()
+    try:
+        threading.Thread(target=go, daemon=True).start()
+    except BaseException as error:
+        job.update(state="error", msg=str(error)[:400])
+        _switching.release()
+        raise
     return job
 
 

@@ -1,0 +1,31 @@
+{
+  "base": "f5d65566de468c8e7ac285a5e8c7257bf4d06856",
+  "tier_source_sha256": "9ed76b733094df68643438532206499d0c8320899eda2825ca1c582509c1876a",
+  "measured_runtime_tier_source_matches": true,
+  "artifacts": {
+    "baseline-tier.log.gz": {
+      "original_sha256": "3151e146dbfafb63c8047e3270b00561f361797995a99bbe342cdb3054a0894f",
+      "archive_sha256": "7760280c9f77824001f2f821d8a5237b010591a83b0a9b51ccc3fdf2d437cb6f"
+    },
+    "candidate-tier.log.gz": {
+      "original_sha256": "6ea000e70f1266f09d5df5ba060c64049602b2177d8e8cddb4988187a66cbef5",
+      "archive_sha256": "6d552511b2caf77014772a687037abf4acf5b415df43e72fe776bea9a5788b6d"
+    },
+    "baseline-build.log.gz": {
+      "original_sha256": "bb433c639762f24ac77c66e3974a95cc0d1702b426da5534b591caa573d0981c",
+      "archive_sha256": "5c11b309c30120e8e279710ac4aa0e9d6a3025696196da0c10e3cd308ca3551b"
+    },
+    "candidate-build.log.gz": {
+      "original_sha256": "bb433c639762f24ac77c66e3974a95cc0d1702b426da5534b591caa573d0981c",
+      "archive_sha256": "5c11b309c30120e8e279710ac4aa0e9d6a3025696196da0c10e3cd308ca3551b"
+    },
+    "commands.jsonl": {
+      "original_sha256": "0d8c786c0754c6e1b9536dcad2e7f1364511707f576c05cbb75c4a088678df6d",
+      "archive_sha256": "0d8c786c0754c6e1b9536dcad2e7f1364511707f576c05cbb75c4a088678df6d"
+    },
+    "results.json": {
+      "original_sha256": "47885415faa91598cc190e8e2dfd10731f33ab200dfb357b30e39561c8b63fd2",
+      "archive_sha256": "47885415faa91598cc190e8e2dfd10731f33ab200dfb357b30e39561c8b63fd2"
+    }
+  }
+}

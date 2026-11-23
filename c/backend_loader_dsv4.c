@@ -36,12 +36,20 @@
 
 #include "backend_cuda_dsv4.h"
 
+/* Only for a clang build whose link leaves libomp.a's weak omp_get_num_devices
+ * unresolved (MSYS2's llvm-openmp 22.1.7 or binutils 2.46, #2286; Makefile.deepseek-v4
+ * probes for it). No offload runtime is linked, so 0 non-host devices: what libomp
+ * itself returns without one. */
+#ifdef COLI_OMP_NUM_DEVICES_STUB
+int omp_get_num_devices(void) { return 0; }
+#endif
+
 /* Two builds of the same source ship side by side: coli_cuda_dsv4_dg.dll
  * (DeepGEMM, sm_120a tensor-core paths) and coli_cuda_dsv4.dll (portable
  * generic kernels, sm_80+). The loader tries the DeepGEMM one first and asks
  * it whether the device fits (dsv4_cuda_backend_arch_ok); on refusal it
  * unloads and takes the generic one, so one install adapts to whatever GPU
- * is present. COLI_DSV4_DLL=<file name> forces a specific DLL. */
+ * is present. COLI_DSV4_DLL=<file name or path> forces a specific DLL. */
 #define DSV4_BACKEND_DLL "coli_cuda_dsv4.dll"
 #define DSV4_BACKEND_DLL_DG "coli_cuda_dsv4_dg.dll"
 #define DSV4_VENDOR_TAG  "[DSV4 CUDA]"
@@ -161,19 +169,58 @@ typedef int             (*fn_sparse_attn_batch_cached_idx)(int device, int layer
                                                             const int *sel, int selstride,
                                                             int abs_base, int comp_limit, int heads,
                                                             int dim, int tokens, float scale, float *out);
+typedef int             (*fn_proj_batch)(int n, Dsv4CudaTensor *const *t, const int *rows,
+                                         const float *x, float *stage);
+typedef void            (*fn_proj_batch_release)(void);
 typedef int             (*fn_indexer_score_batch)(int device, const float *queries, const float *keys,
                                                   const float *head_w, const int *counts, int tokens,
                                                   int heads, int dim, int count, float *scores);
 typedef int             (*fn_fp8_ref_matmul)(int device, const uint8_t *w, const float *bscale,
                                              int rows, int cols, int packed_rows8, const float *x,
                                              int tokens, float *y);
+typedef int             (*fn_indexer_resident)(int device, int layer, const uint8_t *w, const float *bscale,
+                                               int rows, int cols, int packed_rows8, const uint16_t *head_w,
+                                               int heads, int hidden);
+typedef int             (*fn_indexer_keys_sync)(int device, int layer, unsigned long long owner,
+                                                const float *keys, int count, int dim);
+typedef int             (*fn_matmul_bf16_multi)(Dsv4CudaTensor *const *ts, int n, const float *x,
+                                                int tokens, float *const *ys);
+typedef int             (*fn_decode_proj_multi)(Dsv4CudaTensor *const *ts, int n, const float *x,
+                                                float *const *ys);
+typedef int             (*fn_attn_decode_fused)(const Dsv4FusedArgs *a);
+typedef int             (*fn_attn_decode_chain)(int device, int layer, const float *q, const float *chunk,
+                                                int chunk_start, const float *sinks, const int *meta,
+                                                const int *sel, int selstride, int abs_base, int comp_limit,
+                                                int heads, int dim, float scale, const float *icos,
+                                                const float *isin, int rope_dim, int rope_fma,
+                                                Dsv4CudaTensor *wa, int groups, Dsv4CudaTensor *wb,
+                                                float *out, float *att_out, float *oa_out,
+                                                const float *qa, int q_rank, Dsv4CudaTensor *wqb,
+                                                float eps, int norm_fma, float *q_out);
 typedef int             (*fn_tensor_refill_fp4)(Dsv4CudaTensor *t, const uint8_t *w, const uint8_t *scale,
                                                 int O, int I, int sync);
+typedef int (*fn_head_scores_exact)(Dsv4CudaTensor*,const float*,float*);
+typedef int (*fn_head_exact_available)(void);
+typedef int (*fn_head_scores_batch_exact)(Dsv4CudaTensor*,const float*,int,float*);
+typedef int (*fn_head_argmax_batch_exact)(Dsv4CudaTensor*,const float*,int,int*,float*);
+typedef int (*fn_indexer_prepare)(Dsv4CudaTensor*,const float*,float*,float*,int);
+typedef int (*fn_upload_compressor)(Dsv4CudaTensor**,const uint16_t*,int,int,int);
+typedef int (*fn_compressor_project)(Dsv4CudaTensor*,Dsv4CudaTensor*,const float*,float*,float*);
+typedef int (*fn_upload_fp8_ref)(Dsv4CudaTensor**,const uint8_t*,const float*,int,int,int,int);
+typedef int (*fn_fp8_ref_matmul_resident)(Dsv4CudaTensor*,const float*,int,float*);
 typedef int             (*fn_backend_arch_ok)(int device);
 typedef const char     *(*fn_backend_name)(void);
 typedef long long       (*fn_mem_free_mb)(int device);
 typedef int             (*fn_device_unified)(int device);
 typedef int             (*fn_stream_drain)(int device);
+typedef int             (*fn_mirror_alloc)(Dsv4CudaTensor **gate, Dsv4CudaTensor **up, Dsv4CudaTensor **down,
+                                           int Og, int Ig, int Od, int Id, int device);
+typedef int             (*fn_mirror_refill)(Dsv4CudaTensor *gate, Dsv4CudaTensor *up, Dsv4CudaTensor *down,
+                                            const uint8_t *scales, long long S, const long long *soff,
+                                            const uint8_t *weights, long long Wb, const long long *woff,
+                                            int sync);
+typedef long long       (*fn_mirror_check)(Dsv4CudaTensor *gate, int run, const uint8_t *src, long long len);
+typedef int             (*fn_upload_fence)(int device, int drain);
 typedef int             (*fn_kv_ring_append)(int device, int layer, const float *rows,
                                              int start_pos, int count, int window, int dim);
 typedef int             (*fn_kv_comp_append)(int device, int layer, const float *rows,
@@ -208,6 +255,12 @@ typedef Dsv4CudaExpertSet *(*fn_expert_set_create)(Dsv4CudaTensor *const *gate, 
                                                    Dsv4CudaTensor *shared_down);
 typedef int             (*fn_expert_bank_slots)(int experts);
 typedef long long       (*fn_expert_bank_slot_bytes)(int hidden, int intermediate);
+typedef int             (*fn_peer_access)(int a, int b);
+typedef int             (*fn_peer_probe)(int device, int peer, char *why, int why_size);
+typedef int             (*fn_peer_compute)(int device, int peer);
+typedef void            (*fn_peer_best_effort)(int on);
+typedef int             (*fn_peer_healthy)(int device);
+typedef int             (*fn_lost)(void);
 typedef Dsv4CudaExpertSet *(*fn_expert_bank_create)(int count, int hidden, int intermediate, int device,
                                                     Dsv4CudaTensor *shared_gate, Dsv4CudaTensor *shared_up,
                                                     Dsv4CudaTensor *shared_down);
@@ -229,6 +282,8 @@ typedef int             (*fn_expert_bank_upload_tp2)(Dsv4CudaExpertSet *set, int
 typedef void            (*fn_expert_set_free)(Dsv4CudaExpertSet *set);
 typedef int             (*fn_expert_set_upload_hash)(Dsv4CudaExpertSet *set, const int64_t *map,
                                                     int vocab, int topk);
+typedef int (*fn_resident_route_moe)(Dsv4CudaExpertSet*,Dsv4CudaTensor*,Dsv4CudaTensor*,
+                                      const int*,float,float,float*,const float*);
 typedef int             (*fn_route_moe)(const Dsv4CudaActivation *input, Dsv4CudaTensor *gate, Dsv4CudaTensor *bias,
                                         int token, float routed_scale, Dsv4CudaExpertSet *experts,
                                         float limit, Dsv4CudaActivation *output);
@@ -309,7 +364,26 @@ static struct {
     fn_sparse_attn_batch_cached sparse_attn_batch_cached;
     fn_sparse_attn_batch_cached_idx sparse_attn_batch_cached_idx;
     fn_indexer_score_batch indexer_score_batch;
+    fn_proj_batch proj_batch;                       /* optional (V4_ATTN_BATCH_PROJ, older DLLs: 0) */
+    fn_proj_batch_release proj_batch_release;       /* optional */
     fn_fp8_ref_matmul fp8_ref_matmul;
+    /* optional, V4_LAYER_FUSED: a decode token's attention on the device */
+    fn_indexer_resident indexer_resident;
+    fn_indexer_keys_sync indexer_keys_sync;
+    fn_attn_decode_chain attn_decode_chain;
+    fn_attn_decode_fused attn_decode_fused;
+    fn_matmul_bf16_multi matmul_bf16_multi;
+    fn_decode_proj_multi decode_proj_multi;
+    fn_indexer_prepare indexer_prepare;
+    fn_upload_compressor upload_compressor;
+    fn_upload_compressor upload_head_exact;
+    fn_head_scores_exact head_scores_exact;
+    fn_head_exact_available head_exact_available;   /* optional (older DLLs: 0) */
+    fn_head_scores_batch_exact head_scores_batch_exact;
+    fn_head_argmax_batch_exact head_argmax_batch_exact;
+    fn_compressor_project compressor_project;
+    fn_upload_fp8_ref upload_fp8_ref;
+    fn_fp8_ref_matmul_resident fp8_ref_matmul_resident;
     fn_tensor_refill_fp4 tensor_refill_fp4;
     fn_backend_arch_ok backend_arch_ok;   /* optional */
     fn_backend_name backend_name;         /* optional */
@@ -317,6 +391,10 @@ static struct {
     fn_mem_free_mb mem_free_mb;
     fn_device_unified device_unified;     /* optional: older DLLs answer 0 (discrete) */
     fn_stream_drain stream_drain;                /* optional (older DLLs) */
+    fn_mirror_alloc mirror_alloc;                /* optional: block mirrors (V4_MIRROR_BLOCK) */
+    fn_mirror_refill mirror_refill;
+    fn_mirror_check mirror_check;
+    fn_upload_fence upload_fence;                /* optional: the decode uploader thread (V4_UPLOAD_THREAD) */
     fn_kv_ring_append kv_ring_append;
     fn_kv_comp_append kv_comp_append;
     fn_head_argmax     head_argmax;
@@ -330,12 +408,19 @@ static struct {
     fn_expert_bank_create expert_bank_create;
     fn_expert_bank_slots expert_bank_slots; /* optional (older DLLs: 256 only) */
     fn_expert_bank_slot_bytes expert_bank_slot_bytes; /* optional (older DLLs) */
+    fn_peer_access peer_access; /* optional (older DLLs: no peer mirror pool) */
+    fn_peer_probe peer_probe;   /* optional (older DLLs: no peer mirror pool) */
+    fn_peer_compute peer_compute; /* optional (older DLLs: reported as in-place reads) */
+    fn_peer_best_effort set_peer_best_effort; /* optional (older DLLs: strict) */
+    fn_peer_healthy peer_healthy; /* optional (older DLLs: never latch a peer off) */
+    fn_lost lost;                 /* optional (older DLLs: never latch CUDA off) */
     fn_expert_bank_upload expert_bank_upload;
     fn_expert_bank_set_shared expert_bank_set_shared;
     fn_expert_bank_upload_tp2 expert_bank_upload_tp2;
     fn_expert_bank_upload_aux expert_bank_upload_aux; /* optional (older DLLs) */
     fn_expert_set_free expert_set_free;
     fn_expert_set_upload_hash expert_set_upload_hash;
+    fn_resident_route_moe resident_route_moe;
     fn_route_moe       route_moe;
     fn_route_moe_batch route_moe_batch;
     fn_route_top6_batch route_top6_batch;
@@ -343,35 +428,55 @@ static struct {
     fn_route_moe_ep2   route_moe_ep2;
     fn_qkv             qkv;
     fn_wo              wo;
+    fn_wo              wo_decode;
     fn_tensor_free     tensor_free;
     fn_tensor_bytes    tensor_bytes;
     fn_tensor_device   tensor_device;
 } g_dsv4;
 
-/* One-shot loader: mirror of coli_cuda_load(). The DLL is loaded from the
- * engine's OWN directory by absolute path — never a bare name — so the
- * dependency search anchors to the trusted install directory and an attacker
- * cannot plant a same-named DLL in the CWD (classic DLL hijacking). */
-/* *present: whether the file is in the engine's folder at all, so a failure can
- * say "not in this folder" apart from "a DLL it needs is missing" -- Windows
- * reports both as error 126 (#2047). */
-static HMODULE dsv4_load_one(const char *name, int *present){
-    char dllpath[MAX_PATH];
+/* One-shot loader: mirror of coli_cuda_load(). A bare name is loaded from the
+ * engine's OWN directory by absolute path, never from the CWD (classic DLL
+ * hijacking); so is a relative path (sub\x.dll), as before. An absolute path
+ * (COLI_DSV4_DLL=C:\x\coli_cuda_dsv4_dg.dll, C:/x/..., \\server\share\...) is
+ * the user's explicit choice: that file is loaded, never glued onto the
+ * engine's folder. Either way its imports (the CUDA runtime) resolve
+ * from the DLL's own folder, System32 and PATH, never the CWD: dsv4_cuda_load
+ * takes the CWD out of the search order first (SetDllDirectoryA("")). */
+/* *present: whether the file exists at all, so a failure can say "not there"
+ * apart from "a DLL it needs is missing" -- Windows reports both as error 126
+ * (#2047). dllpath receives the path that was tried. */
+static HMODULE dsv4_load_one(const char *name, int *present, char *dllpath, DWORD size){
     HMODULE dll = NULL;
     *present = 0;
-    DWORD mn = GetModuleFileNameA(NULL, dllpath, (DWORD)sizeof(dllpath));
-    if(mn > 0 && mn < sizeof(dllpath)){
-        char *slash = strrchr(dllpath, '\\');
-        if(slash && (size_t)(slash + 1 - dllpath) + strlen(name) + 1 <= sizeof(dllpath)){
-            strcpy(slash + 1, name);
-            *present = GetFileAttributesA(dllpath) != INVALID_FILE_ATTRIBUTES;
-            dll = LoadLibraryExA(dllpath, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+    snprintf(dllpath, size, "%s", name);
+    /* absolute: a drive letter and a separator, or a UNC / \\?\ prefix; never CWD-relative */
+    int absolute = (name[0] && name[1] == ':' && (name[2] == '\\' || name[2] == '/'))
+                || ((name[0] == '\\' || name[0] == '/') && (name[1] == '\\' || name[1] == '/'));
+    if(absolute){
+        /* GetFullPathNameA also turns '/' into '\', which LOAD_WITH_ALTERED_SEARCH_PATH needs */
+        DWORD n = GetFullPathNameA(name, size, dllpath, NULL);
+        if(n == 0 || n >= size){
+            if(n >= size) SetLastError(ERROR_FILENAME_EXCED_RANGE);   /* GetFullPathNameA leaves it stale */
+            snprintf(dllpath, size, "%s", name);
+            return NULL;
         }
+        *present = GetFileAttributesA(dllpath) != INVALID_FILE_ATTRIBUTES;
+        return LoadLibraryExA(dllpath, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
     }
-    if(!dll)
+    DWORD mn = GetModuleFileNameA(NULL, dllpath, size);
+    char *slash = mn > 0 && mn < size ? strrchr(dllpath, '\\') : NULL;
+    if(slash && (size_t)(slash + 1 - dllpath) + strlen(name) + 1 <= size){
+        strcpy(slash + 1, name);
+        *present = GetFileAttributesA(dllpath) != INVALID_FILE_ATTRIBUTES;
+        dll = LoadLibraryExA(dllpath, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+    } else snprintf(dllpath, size, "%s", name);
+    if(!dll){
+        DWORD err = GetLastError();
         /* Fallback by name, restricted to the app dir and System32 — never CWD. */
         dll = LoadLibraryExA(name, NULL,
             LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if(!dll) SetLastError(err);   /* the cause of the engine-folder attempt, which the message names */
+    }
     return dll;
 }
 
@@ -386,16 +491,24 @@ static int dsv4_cuda_load(void){
     if(forced && *forced) candidates[n++] = forced;
     else { candidates[n++] = DSV4_BACKEND_DLL_DG; candidates[n++] = DSV4_BACKEND_DLL; }
     /* why each candidate was passed over, for the closing line (#1906: it named no cause) */
-    char why[512]; size_t wn = 0; why[0] = 0;
+    char why[2048]; size_t wn = 0; why[0] = 0;
+    char dllpath[MAX_PATH];
+    /* LOAD_WITH_ALTERED_SEARCH_PATH looks in the CWD before PATH, where the CUDA runtime
+     * often lives: a cudart64_*.dll planted in the CWD would run inside the engine. ""
+     * drops the CWD from this process's search orders and keeps PATH. */
+    SetDllDirectoryA("");
     for(int i = 0; i < n; i++){
         int present = 0;
-        g_dsv4.dll = dsv4_load_one(candidates[i], &present);
+        g_dsv4.dll = dsv4_load_one(candidates[i], &present, dllpath, (DWORD)sizeof(dllpath));
         if(!g_dsv4.dll){
             DWORD err = GetLastError();
-            int w = snprintf(why + wn, sizeof(why) - wn, "%s%s: %s (Windows error %lu)", wn ? "; " : "", candidates[i],
-                             !present ? "not in the engine's folder (the Windows CUDA package carries it)"
-                             : err == ERROR_MOD_NOT_FOUND ? "present, but a DLL it needs is missing (cudart64_12.dll beside it, or the NVIDIA driver's nvcuda.dll)"
-                             : err == ERROR_BAD_EXE_FORMAT ? "not a 64-bit DLL" : "not loadable", (unsigned long)err);
+            int w = snprintf(why + wn, sizeof(why) - wn, "%s%s: %s (tried %s, Windows error %lu)", wn ? "; " : "", candidates[i],
+                             err == ERROR_FILENAME_EXCED_RANGE || err == ERROR_INVALID_NAME ? "path too long or invalid"
+                             : !present ? "no such file (the Windows CUDA package carries it)"
+                             : err == ERROR_MOD_NOT_FOUND ? "present, but a DLL it needs is missing (the CUDA runtime "
+                               "cudart64_*.dll, and cublasLt64_*.dll for a DSV4_TC=1 build, beside it or on PATH, "
+                               "or the NVIDIA driver's nvcuda.dll)"
+                             : err == ERROR_BAD_EXE_FORMAT ? "not a 64-bit DLL" : "not loadable", dllpath, (unsigned long)err);
             if(w > 0 && (size_t)w < sizeof(why) - wn) wn += (size_t)w;
             continue;
         }
@@ -415,15 +528,19 @@ static int dsv4_cuda_load(void){
             memset(&g_dsv4, 0, sizeof(g_dsv4)); g_dsv4.loaded = 1;
             continue;
         }
-        snprintf(g_dsv4.loaded_name, sizeof(g_dsv4.loaded_name), "%s", candidates[i]);
-        fprintf(stderr, DSV4_VENDOR_TAG " backend=%s (%s)\n", candidates[i],
-                g_dsv4.backend_name ? g_dsv4.backend_name() : "unknown");
+        const char *base = candidates[i];   /* the file name; path= says where */
+        for(const char *p = base; *p; p++) if(*p == '\\' || *p == '/' || *p == ':') base = p + 1;
+        snprintf(g_dsv4.loaded_name, sizeof(g_dsv4.loaded_name), "%s", base);
+        DWORD pn = GetModuleFileNameA(g_dsv4.dll, dllpath, (DWORD)sizeof(dllpath));
+        fprintf(stderr, DSV4_VENDOR_TAG " backend=%s (%s) path=%s\n", base,
+                g_dsv4.backend_name ? g_dsv4.backend_name() : "unknown",
+                pn > 0 && pn < sizeof(dllpath) ? dllpath : "?");
         g_dsv4.available = 1;
         return 1;
     }
     fprintf(stderr, DSV4_VENDOR_TAG " no usable backend DLL (%s); GPU tier disabled (CPU path remains active). "
                     "The DLLs need an sm_80+ GPU (Ampere or newer); Pascal and Turing take a build with "
-                    "CUDA_ARCH=portable-pre-ampere NO_TC=1 (docs/deepseek-v4.md).\n",
+                    "CUDA_ARCH=portable-pre-ampere NO_TC=1 and CUDA <= 12.9 (docs/deepseek-v4.md).\n",
             wn ? why : DSV4_BACKEND_DLL_DG " / " DSV4_BACKEND_DLL);
     return 0;
 }
@@ -489,6 +606,24 @@ static int dsv4_cuda_resolve(const char *dllname){
     RESOLVE(sparse_attn_batch_cached_idx, fn_sparse_attn_batch_cached_idx);
     RESOLVE(indexer_score_batch, fn_indexer_score_batch);
     RESOLVE(fp8_ref_matmul, fn_fp8_ref_matmul);
+    /* optional (V4_LAYER_FUSED): a DLL without these exports keeps the tier
+     * alive, and the engine keeps the paths it had */
+    g_dsv4.indexer_resident = (fn_indexer_resident)GetProcAddress(g_dsv4.dll, "dsv4_cuda_indexer_resident");
+    g_dsv4.indexer_keys_sync = (fn_indexer_keys_sync)GetProcAddress(g_dsv4.dll, "dsv4_cuda_indexer_keys_sync");
+    g_dsv4.attn_decode_chain = (fn_attn_decode_chain)GetProcAddress(g_dsv4.dll, "dsv4_cuda_attn_decode_chain");
+    g_dsv4.attn_decode_fused = (fn_attn_decode_fused)GetProcAddress(g_dsv4.dll, "dsv4_cuda_attn_decode_fused");
+    g_dsv4.matmul_bf16_multi = (fn_matmul_bf16_multi)GetProcAddress(g_dsv4.dll, "dsv4_cuda_matmul_bf16_multi");
+    g_dsv4.decode_proj_multi = (fn_decode_proj_multi)GetProcAddress(g_dsv4.dll, "dsv4_cuda_decode_proj_multi");
+    g_dsv4.upload_head_exact = (fn_upload_compressor)GetProcAddress(g_dsv4.dll, "dsv4_cuda_upload_head_exact");
+    g_dsv4.head_scores_exact = (fn_head_scores_exact)GetProcAddress(g_dsv4.dll, "dsv4_cuda_head_scores_exact");
+    g_dsv4.head_exact_available = (fn_head_exact_available)GetProcAddress(g_dsv4.dll, "dsv4_cuda_head_exact_available");
+    g_dsv4.head_scores_batch_exact = (fn_head_scores_batch_exact)GetProcAddress(g_dsv4.dll, "dsv4_cuda_head_scores_batch_exact");
+    g_dsv4.head_argmax_batch_exact = (fn_head_argmax_batch_exact)GetProcAddress(g_dsv4.dll, "dsv4_cuda_head_argmax_batch_exact");
+    g_dsv4.indexer_prepare = (fn_indexer_prepare)GetProcAddress(g_dsv4.dll, "dsv4_cuda_indexer_prepare");
+    g_dsv4.upload_compressor = (fn_upload_compressor)GetProcAddress(g_dsv4.dll, "dsv4_cuda_upload_compressor");
+    g_dsv4.compressor_project = (fn_compressor_project)GetProcAddress(g_dsv4.dll, "dsv4_cuda_compressor_project");
+    g_dsv4.upload_fp8_ref = (fn_upload_fp8_ref)GetProcAddress(g_dsv4.dll, "dsv4_cuda_upload_fp8_ref");
+    g_dsv4.fp8_ref_matmul_resident = (fn_fp8_ref_matmul_resident)GetProcAddress(g_dsv4.dll, "dsv4_cuda_fp8_ref_matmul_resident");
     RESOLVE(tensor_refill_fp4, fn_tensor_refill_fp4);
     RESOLVE(mem_free_mb, fn_mem_free_mb);
     RESOLVE(kv_ring_append, fn_kv_ring_append);
@@ -507,6 +642,7 @@ static int dsv4_cuda_resolve(const char *dllname){
     RESOLVE(expert_bank_upload_tp2, fn_expert_bank_upload_tp2);
     RESOLVE(expert_set_free, fn_expert_set_free);
     RESOLVE(expert_set_upload_hash, fn_expert_set_upload_hash);
+    g_dsv4.resident_route_moe = (fn_resident_route_moe)GetProcAddress(g_dsv4.dll, "dsv4_cuda_resident_route_moe");
     RESOLVE(route_moe, fn_route_moe);
     RESOLVE(route_moe_batch, fn_route_moe_batch);
     RESOLVE(route_top6_batch, fn_route_top6_batch);
@@ -514,6 +650,7 @@ static int dsv4_cuda_resolve(const char *dllname){
     RESOLVE(route_moe_ep2, fn_route_moe_ep2);
     RESOLVE(qkv, fn_qkv);
     RESOLVE(wo, fn_wo);
+    g_dsv4.wo_decode = (fn_wo)GetProcAddress(g_dsv4.dll, "dsv4_cuda_wo_decode");
     RESOLVE(tensor_free, fn_tensor_free);
     RESOLVE(tensor_bytes, fn_tensor_bytes);
     RESOLVE(tensor_device, fn_tensor_device);
@@ -526,10 +663,26 @@ static int dsv4_cuda_resolve(const char *dllname){
     /* optional: an older DLL without the export keeps the whole tier alive;
      * the engine probes this and simply stays on synchronous attaches. */
     g_dsv4.stream_drain = (fn_stream_drain)GetProcAddress(g_dsv4.dll, "dsv4_cuda_stream_drain");
+    g_dsv4.mirror_alloc = (fn_mirror_alloc)GetProcAddress(g_dsv4.dll, "dsv4_cuda_mirror_alloc");
+    g_dsv4.mirror_refill = (fn_mirror_refill)GetProcAddress(g_dsv4.dll, "dsv4_cuda_mirror_refill");
+    g_dsv4.mirror_check = (fn_mirror_check)GetProcAddress(g_dsv4.dll, "dsv4_cuda_mirror_check");
+    g_dsv4.upload_fence = (fn_upload_fence)GetProcAddress(g_dsv4.dll, "dsv4_cuda_upload_fence");
     g_dsv4.expert_bank_upload_aux = (fn_expert_bank_upload_aux)GetProcAddress(g_dsv4.dll, "dsv4_cuda_expert_bank_upload_aux");
     g_dsv4.expert_bank_slots = (fn_expert_bank_slots)GetProcAddress(g_dsv4.dll, "dsv4_cuda_expert_bank_slots");
     g_dsv4.expert_bank_slot_bytes = (fn_expert_bank_slot_bytes)GetProcAddress(g_dsv4.dll, "dsv4_cuda_expert_bank_slot_bytes");
+    g_dsv4.peer_access = (fn_peer_access)GetProcAddress(g_dsv4.dll, "dsv4_cuda_peer_access");
+    g_dsv4.peer_probe = (fn_peer_probe)GetProcAddress(g_dsv4.dll, "dsv4_cuda_peer_probe");
+    g_dsv4.peer_compute = (fn_peer_compute)GetProcAddress(g_dsv4.dll, "dsv4_cuda_peer_compute");
+    g_dsv4.set_peer_best_effort = (fn_peer_best_effort)GetProcAddress(g_dsv4.dll, "dsv4_cuda_set_peer_best_effort");
+    g_dsv4.peer_healthy = (fn_peer_healthy)GetProcAddress(g_dsv4.dll, "dsv4_cuda_peer_healthy");
+    g_dsv4.lost = (fn_lost)GetProcAddress(g_dsv4.dll, "dsv4_cuda_lost");
     g_dsv4.backend_name = (fn_backend_name)GetProcAddress(g_dsv4.dll, "dsv4_cuda_backend_name");
+    g_dsv4.proj_batch = (fn_proj_batch)GetProcAddress(g_dsv4.dll, "dsv4_cuda_proj_batch");
+    g_dsv4.proj_batch_release = (fn_proj_batch_release)GetProcAddress(g_dsv4.dll, "dsv4_cuda_proj_batch_release");
+    if (!g_dsv4.proj_batch || !g_dsv4.proj_batch_release) {
+        g_dsv4.proj_batch = NULL;
+        g_dsv4.proj_batch_release = NULL;
+    }
     _Pragma("GCC diagnostic pop")
     return 1;
 }
@@ -849,6 +1002,16 @@ int dsv4_cuda_indexer_score_batch(int device, const float *queries, const float 
                                       heads, dim, count, scores);
 }
 
+int dsv4_cuda_proj_batch(int n, Dsv4CudaTensor *const *t, const int *rows,
+                         const float *x, float *stage){
+    if(!g_dsv4.available || !g_dsv4.proj_batch) return 0;
+    return g_dsv4.proj_batch(n, t, rows, x, stage);
+}
+
+void dsv4_cuda_proj_batch_release(void){
+    if(g_dsv4.available && g_dsv4.proj_batch_release) g_dsv4.proj_batch_release();
+}
+
 int dsv4_cuda_fp8_ref_matmul(int device, const uint8_t *w, const float *bscale,
                              int rows, int cols, int packed_rows8, const float *x,
                              int tokens, float *y){
@@ -856,9 +1019,111 @@ int dsv4_cuda_fp8_ref_matmul(int device, const uint8_t *w, const float *bscale,
     return g_dsv4.fp8_ref_matmul(device, w, bscale, rows, cols, packed_rows8, x, tokens, y);
 }
 
+int dsv4_cuda_indexer_resident(int device, int layer, const uint8_t *w, const float *bscale,
+                               int rows, int cols, int packed_rows8, const uint16_t *head_w,
+                               int heads, int hidden){
+    if(!g_dsv4.available||!g_dsv4.indexer_resident) return 0;
+    return g_dsv4.indexer_resident(device, layer, w, bscale, rows, cols, packed_rows8, head_w,
+                                   heads, hidden);
+}
+
+int dsv4_cuda_indexer_keys_sync(int device, int layer, unsigned long long owner,
+                                const float *keys, int count, int dim){
+    if(!g_dsv4.available||!g_dsv4.indexer_keys_sync) return 0;
+    return g_dsv4.indexer_keys_sync(device, layer, owner, keys, count, dim);
+}
+
+
+int dsv4_cuda_matmul_bf16_multi(Dsv4CudaTensor *const *ts, int n, const float *x, int tokens,
+                                float *const *ys){
+    if(!g_dsv4.available||!g_dsv4.matmul_bf16_multi) return 0;
+    return g_dsv4.matmul_bf16_multi(ts, n, x, tokens, ys);
+}
+int dsv4_cuda_decode_proj_multi(Dsv4CudaTensor *const *ts, int n, const float *x, float *const *ys){
+    if(!g_dsv4.available||!g_dsv4.decode_proj_multi) return 0;   /* a DLL without it: the separate calls */
+    return g_dsv4.decode_proj_multi(ts, n, x, ys);
+}
+
+int dsv4_cuda_attn_decode_fused(const Dsv4FusedArgs *a){
+    if(!g_dsv4.available||!g_dsv4.attn_decode_fused) return 0;   /* a DLL without it: the chained forms */
+    return g_dsv4.attn_decode_fused(a);
+}
+
+int dsv4_cuda_attn_decode_chain(int device, int layer, const float *q, const float *chunk,
+                                int chunk_start, const float *sinks, const int *meta,
+                                const int *sel, int selstride, int abs_base, int comp_limit,
+                                int heads, int dim, float scale, const float *icos,
+                                const float *isin, int rope_dim, int rope_fma,
+                                Dsv4CudaTensor *wa, int groups, Dsv4CudaTensor *wb,
+                                float *out, float *att_out, float *oa_out,
+                                const float *qa, int q_rank, Dsv4CudaTensor *wqb, float eps,
+                                int norm_fma, float *q_out){
+    if(!g_dsv4.available||!g_dsv4.attn_decode_chain) return 0;
+    return g_dsv4.attn_decode_chain(device, layer, q, chunk, chunk_start, sinks, meta, sel, selstride,
+                                    abs_base, comp_limit, heads, dim, scale, icos, isin, rope_dim,
+                                    rope_fma, wa, groups, wb, out, att_out, oa_out, qa, q_rank, wqb,
+                                    eps, norm_fma, q_out);
+}
+
+int dsv4_cuda_upload_head_exact(Dsv4CudaTensor **t,const uint16_t *w,int rows,int cols,int device){
+    return g_dsv4.available && g_dsv4.upload_head_exact && g_dsv4.head_scores_exact
+        ? g_dsv4.upload_head_exact(t,w,rows,cols,device) : 0;
+}
+int dsv4_cuda_head_exact_available(void){
+    return g_dsv4.available && g_dsv4.head_exact_available && g_dsv4.upload_head_exact &&
+           g_dsv4.head_scores_exact ? g_dsv4.head_exact_available() : 0;
+}
+int dsv4_cuda_head_scores_exact(Dsv4CudaTensor *t,const float *input,float *scores){
+    return g_dsv4.available && g_dsv4.head_scores_exact ? g_dsv4.head_scores_exact(t,input,scores) : 0;
+}
+int dsv4_cuda_head_scores_batch_exact(Dsv4CudaTensor *t,const float *input,int batch,float *scores){
+    return g_dsv4.available && g_dsv4.head_scores_batch_exact ? g_dsv4.head_scores_batch_exact(t,input,batch,scores) : 0;
+}
+int dsv4_cuda_head_argmax_batch_exact(Dsv4CudaTensor *t,const float *input,int batch,int *ids,float *values){
+    return g_dsv4.available && g_dsv4.head_argmax_batch_exact ? g_dsv4.head_argmax_batch_exact(t,input,batch,ids,values) : 0;
+}
+int dsv4_cuda_indexer_prepare(Dsv4CudaTensor *w,const float *x,float *q,float *h,int dim){
+    return g_dsv4.available && g_dsv4.indexer_prepare ? g_dsv4.indexer_prepare(w,x,q,h,dim) : 0;
+}
+int dsv4_cuda_upload_compressor(Dsv4CudaTensor **t,const uint16_t *w,int rows,int cols,int device){
+    return g_dsv4.available && g_dsv4.upload_compressor && g_dsv4.compressor_project
+        ? g_dsv4.upload_compressor(t,w,rows,cols,device) : 0;
+}
+int dsv4_cuda_compressor_project(Dsv4CudaTensor *kv,Dsv4CudaTensor *gate,const float *x,float *v,float *scores){
+    return g_dsv4.available && g_dsv4.compressor_project
+        ? g_dsv4.compressor_project(kv,gate,x,v,scores) : 0;
+}
+
+int dsv4_cuda_upload_fp8_ref(Dsv4CudaTensor **t,const uint8_t *w,const float *s,int rows,int cols,int packed,int device){
+    return g_dsv4.available && g_dsv4.upload_fp8_ref && g_dsv4.fp8_ref_matmul_resident
+        ? g_dsv4.upload_fp8_ref(t,w,s,rows,cols,packed,device) : 0;
+}
+
+int dsv4_cuda_fp8_ref_matmul_resident(Dsv4CudaTensor *t,const float *x,int tokens,float *y){
+    return g_dsv4.available && g_dsv4.fp8_ref_matmul_resident
+        ? g_dsv4.fp8_ref_matmul_resident(t,x,tokens,y) : 0;
+}
+
 int dsv4_cuda_tensor_refill_fp4(Dsv4CudaTensor *t, const uint8_t *w, const uint8_t *scale, int O, int I, int sync){
     if(!g_dsv4.available) return 0;
     return g_dsv4.tensor_refill_fp4(t, w, scale, O, I, sync);
+}
+
+/* V4_MIRROR_BLOCK: a DLL without these keeps the three-tensor mirrors */
+int dsv4_cuda_mirror_alloc(Dsv4CudaTensor **gate, Dsv4CudaTensor **up, Dsv4CudaTensor **down,
+                           int Og, int Ig, int Od, int Id, int device){
+    if(!g_dsv4.available||!g_dsv4.mirror_alloc||!g_dsv4.mirror_refill) return 0;
+    return g_dsv4.mirror_alloc(gate, up, down, Og, Ig, Od, Id, device);
+}
+int dsv4_cuda_mirror_refill(Dsv4CudaTensor *gate, Dsv4CudaTensor *up, Dsv4CudaTensor *down,
+                            const uint8_t *scales, long long S, const long long *soff,
+                            const uint8_t *weights, long long Wb, const long long *woff, int sync){
+    if(!g_dsv4.available||!g_dsv4.mirror_refill) return 0;
+    return g_dsv4.mirror_refill(gate, up, down, scales, S, soff, weights, Wb, woff, sync);
+}
+long long dsv4_cuda_mirror_check(Dsv4CudaTensor *gate, int run, const uint8_t *src, long long len){
+    if(!g_dsv4.available||!g_dsv4.mirror_check) return -2;
+    return g_dsv4.mirror_check(gate, run, src, len);
 }
 
 int dsv4_cuda_backend_arch_ok(int device){
@@ -889,6 +1154,14 @@ int dsv4_cuda_stream_drain(int device){
     if(!g_dsv4.available) return 1;
     if(!g_dsv4.stream_drain) return 0;
     return g_dsv4.stream_drain(device);
+}
+
+/* V4_UPLOAD_THREAD. A DLL without the export answers 0: the engine asks once
+ * and its uploader then copies on the compute stream and drains it, as the
+ * inline attach does (an older DLL reads any non-zero sync as "drain"). */
+int dsv4_cuda_upload_fence(int device, int drain){
+    if(!g_dsv4.available || !g_dsv4.upload_fence) return 0;
+    return g_dsv4.upload_fence(device, drain);
 }
 
 int dsv4_cuda_kv_ring_append(int device, int layer, const float *rows, int start_pos,
@@ -957,6 +1230,42 @@ Dsv4CudaExpertSet *dsv4_cuda_expert_set_create(Dsv4CudaTensor *const *gate, Dsv4
                                                Dsv4CudaTensor *shared_down){
     if(!g_dsv4.available) return NULL;
     return g_dsv4.expert_set_create(gate, up, down, count, shared_gate, shared_up, shared_down);
+}
+
+int dsv4_cuda_peer_access(int a, int b){
+    return g_dsv4.available && g_dsv4.peer_access ? g_dsv4.peer_access(a, b) : 0;
+}
+
+/* Asked before dsv4_cuda_init, so it loads the DLL itself (idempotent; init
+ * then reuses it). An older DLL without the export: no peer mirror pool. */
+int dsv4_cuda_peer_probe(int device, int peer, char *why, int why_size){
+    if(why && why_size > 0) why[0] = 0;
+    if(!dsv4_cuda_load()){
+        if(why && why_size > 0) snprintf(why, (size_t)why_size, "no usable CUDA backend DLL");
+        return 0;
+    }
+    if(!g_dsv4.peer_probe){
+        if(why && why_size > 0)
+            snprintf(why, (size_t)why_size, "%s predates the peer probe (an older build)", g_dsv4.loaded_name);
+        return 0;
+    }
+    return g_dsv4.peer_probe(device, peer, why, why_size);
+}
+
+int dsv4_cuda_peer_compute(int device, int peer){
+    return g_dsv4.available && g_dsv4.peer_compute ? g_dsv4.peer_compute(device, peer) : 0;
+}
+
+void dsv4_cuda_set_peer_best_effort(int on){
+    if(g_dsv4.available && g_dsv4.set_peer_best_effort) g_dsv4.set_peer_best_effort(on);
+}
+
+int dsv4_cuda_peer_healthy(int device){
+    return g_dsv4.available && g_dsv4.peer_healthy ? g_dsv4.peer_healthy(device) : 1;
+}
+
+int dsv4_cuda_lost(void){
+    return g_dsv4.available && g_dsv4.lost ? g_dsv4.lost() : 0;
 }
 
 int dsv4_cuda_expert_bank_slots(int experts){
@@ -1029,6 +1338,12 @@ int dsv4_cuda_expert_set_upload_hash(Dsv4CudaExpertSet *set, const int64_t *map,
     return g_dsv4.expert_set_upload_hash(set, map, vocab, topk);
 }
 
+int dsv4_cuda_resident_route_moe(Dsv4CudaExpertSet *set,Dsv4CudaTensor *gate,
+    Dsv4CudaTensor *bias,const int *fixed,float scale,float limit,float *out,const float *in){
+    return g_dsv4.available && g_dsv4.resident_route_moe
+        ? g_dsv4.resident_route_moe(set,gate,bias,fixed,scale,limit,out,in) : 0;
+}
+
 int dsv4_cuda_route_moe(const Dsv4CudaActivation *input, Dsv4CudaTensor *gate, Dsv4CudaTensor *bias,
                         int token, float routed_scale, Dsv4CudaExpertSet *experts, float limit,
                         Dsv4CudaActivation *output){
@@ -1072,6 +1387,9 @@ int dsv4_cuda_qkv(Dsv4CudaTensor *q_a, Dsv4CudaTensor *q_norm, Dsv4CudaTensor *q
     return g_dsv4.qkv(q_a, q_norm, q_b, kv, eps, q_out, kv_out, x);
 }
 
+int dsv4_cuda_wo_decode(Dsv4CudaTensor *a,Dsv4CudaTensor *b,int groups,float *out,const float *context){
+    return g_dsv4.available && g_dsv4.wo_decode ? g_dsv4.wo_decode(a,b,groups,out,context) : 0;
+}
 int dsv4_cuda_wo(Dsv4CudaTensor *wo_a, Dsv4CudaTensor *wo_b, int groups, float *out, const float *context){
     if(!g_dsv4.available) return 0;
     return g_dsv4.wo(wo_a, wo_b, groups, out, context);

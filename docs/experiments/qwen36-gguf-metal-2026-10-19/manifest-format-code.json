@@ -1,0 +1,77 @@
+{
+  "version": 1,
+  "hypothesis": "On an 8 GB M1, the Metal graph in its default (fast) mode runs the 32 decode steps after a 512-token prompt as fast on unsloth's UD-Q4_K_M GGUF of Qwen3.6-35B-A3B, read in place, as on the model's own format (canonical.qc, experts.qc).",
+  "commit": "082939226ee63b5f04adf52004b2555760cc0ced",
+  "model": "two files of the same model, Qwen3.6-35B-A3B: Qwen3.6-35B-A3B (Qwen3_5MoeForConditionalGeneration) in Colibri's qwen36 container: INT4 routed experts with gs=64 group scales and f16 dense weights, canonical.qc beside it (1.94 GB of INT8 dense matrices, written on 2026-10-01) and experts.qc (17.1 GB, last written on 2026-10-07); and unsloth's Qwen3.6-35B-A3B-UD-Q4_K_M.gguf (22,134,528,992 bytes, downloaded to this Mac's SSD on 2026-10-18, finished at 23:34), in the directory coli import --mode link makes for it (gguf.json, config.json, tokenizer.json): dense matrices in Q8_0, the head in Q6_K, the embedding in Q8_0, the routers and the DeltaNet's alpha and beta projections in F32, the routed experts' gate and up in Q4_K and their down in Q5_K (37 layers) or Q6_K (3). They are different quantizations of the checkpoint (their likelihoods of the texts are in quality.txt) and the GGUF is a newer file on the SSD (a freshly written file reads faster on this Mac's SSD for a while, which could only favour the GGUF: the runs were made more than a day after it was written)",
+  "command": "git archive <commit> c | tar -x -C <dir>, make -C <dir>/c qwen36_metal.o backend_metal.o METAL=1, then from the repository root, with the compiler flags make -C c qwen36 METAL=1 gives qwen36.c except its qpack path (-DQWEN36_QPACK and its objects, which the harness does not use): clang -O3 -Xclang -fopenmp -I<libomp>/include -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -DCOLI_METAL -DQWEN36_METAL -I<dir>/c docs/experiments/qwen36-gguf-metal-2026-10-19/bench.c <dir>/c/qwen36_metal.o <dir>/c/backend_metal.o -o bin-<commit>/qwen36-bench -lm -L<libomp>/lib -lomp -framework Metal -framework Foundation -framework Accelerate -lc++; every run: /usr/bin/time -l env -i PATH=/usr/bin:/bin HOME=$HOME TEACHER=1 launchers/<name>/qwen36-bench code.txt 64,512 32, where each launcher is a script of one line that sets SNAP and its variables and runs a harness; baseline = launchers/own/, trial = launchers/gguf/: the same harness (bin-08293922/) and defaults, the model's own format against the GGUF",
+  "prompt_hash": "ff641dc87569e6e3b56c3e7996fce21627a4b8cea5489d90864d6102232a2e72",
+  "hardware": {
+    "cpu": "Apple M1, 4 performance + 4 efficiency cores (MacBook Air, MacBookAir10,1, no fan)",
+    "ram": "8 GB unified memory",
+    "storage": "internal APPLE SSD AP0256Q, APFS",
+    "os": "macOS 26.6.2 (25G83), Apple clang 21.0.0 (clang-2100.3.34.2), Homebrew libomp"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "SNAP"
+  ],
+  "baseline": {
+    "config": {
+      "BUILD": "the compiler flags of make -C c qwen36 METAL=1 on macOS without its qpack path: clang -O3 -Xclang -fopenmp -DCOLI_METAL -DQWEN36_METAL, qwen36_metal.o and backend_metal.o",
+      "PROMPT": "the first 64 and the first 512 tokens of code.txt (an earlier version of c/qwen36_graph.h, of which the harness reads the first 21,504 bytes; prompt_hash is its SHA-256), each from an empty state; after each, 32 tokens, each fed the text's own next token (teacher forcing: both versions read the same tokens)",
+      "ORDER": "1 warm-up run of each version (discarded; the two versions read different files): the trial's, then the baseline's, so that the order is symmetric: each measured run of one version has one of the other version with the same pattern of files (its own or the other) in the two runs before it; then baseline trial trial baseline baseline trial trial baseline, one process each",
+      "REST": "thermal state nominal, then 60 s, before every run",
+      "ENGINE": "the Metal graph, default (fast) kernels",
+      "EXPERT_CACHE": "the Metal graph's default: a sixteenth of the RAM, 512 MiB: 303 slots of 1.77 MB for the model's own format (295 retained), 263 of 2.04 MB for the GGUF (255 retained, one short of the 256 a prompt layer by layer needs); at these defaults the two files do not read a fast prompt the same way: the model's own format reads it layer by layer and gives part of its products and experts to the CPU's matrix unit (QWEN36_CPU_MATMUL, on by default), the GGUF loads its experts eight at a time, on the GPU alone",
+      "SNAP": "the model's own format: canonical.qc (INT8 dense matrices) and experts.qc (INT4 experts, gs=64) beside the checkpoint, <model>",
+      "MEASURED": "tokens per second of decode steps 2 to 32 after the 512-token prompt, each step fed the text's next token (teacher forcing)"
+    },
+    "samples": {
+      "tok_s": [
+        7.801,
+        7.83,
+        8.025,
+        7.819
+      ]
+    },
+    "median_tok_s": 7.8245000000000005,
+    "quality": {
+      "method": "Correctness: both versions were fed the same tokens (teacher forcing: the hash of the tokens is the same in every run of both). The GGUF path: on this file the exact graph and the CPU engine (COLI_METAL=0 GQ_EXACT=1) choose the same 32 words after a 64-token prompt of each text, and over 256 teacher-forced words their per-token likelihoods are within 3.5e-5 of each other (correctness.txt). The two files quantize the model differently, so their logits differ: their likelihoods of 1024 teacher-forced tokens of each text are in quality.txt. Fingerprints of every logit and hashes of the tokens (baseline / trial), each the same in every run of its version: 64 tokens 2ca892c20f9dfdfa/24b5cd77c9db23fb / 993fc7a94a1c6db6/24b5cd77c9db23fb, 512 tokens 31fb860c5d30aac5/561100505ac9d4ca / 34a820a03a3e3055/561100505ac9d4ca; the 32 tokens' mean negative log-likelihood and top-1 rate (baseline / trial): after 64 tokens 2.85014 0.406 / 2.88531 0.406, after 512 tokens 2.59694 0.562 / 2.59825 0.562.",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-gguf-metal-2026-10-19/baseline-format-code.txt",
+      "sha256": "4c22ca57d38bcf7163982316aaea01af3e221a9f96859d381d6843cca476023d"
+    }
+  },
+  "trial": {
+    "config": {
+      "BUILD": "the compiler flags of make -C c qwen36 METAL=1 on macOS without its qpack path: clang -O3 -Xclang -fopenmp -DCOLI_METAL -DQWEN36_METAL, qwen36_metal.o and backend_metal.o",
+      "PROMPT": "the first 64 and the first 512 tokens of code.txt (an earlier version of c/qwen36_graph.h, of which the harness reads the first 21,504 bytes; prompt_hash is its SHA-256), each from an empty state; after each, 32 tokens, each fed the text's own next token (teacher forcing: both versions read the same tokens)",
+      "ORDER": "1 warm-up run of each version (discarded; the two versions read different files): the trial's, then the baseline's, so that the order is symmetric: each measured run of one version has one of the other version with the same pattern of files (its own or the other) in the two runs before it; then baseline trial trial baseline baseline trial trial baseline, one process each",
+      "REST": "thermal state nominal, then 60 s, before every run",
+      "ENGINE": "the Metal graph, default (fast) kernels",
+      "EXPERT_CACHE": "the Metal graph's default: a sixteenth of the RAM, 512 MiB: 303 slots of 1.77 MB for the model's own format (295 retained), 263 of 2.04 MB for the GGUF (255 retained, one short of the 256 a prompt layer by layer needs); at these defaults the two files do not read a fast prompt the same way: the model's own format reads it layer by layer and gives part of its products and experts to the CPU's matrix unit (QWEN36_CPU_MATMUL, on by default), the GGUF loads its experts eight at a time, on the GPU alone",
+      "SNAP": "the GGUF: UD-Q4_K_M, its ggml blocks read in place, <GGUF model>",
+      "MEASURED": "tokens per second of decode steps 2 to 32 after the 512-token prompt, each step fed the text's next token (teacher forcing)"
+    },
+    "samples": {
+      "tok_s": [
+        5.98,
+        6.203,
+        6.084,
+        6.233
+      ]
+    },
+    "median_tok_s": 6.1434999999999995,
+    "quality": {
+      "method": "Correctness: both versions were fed the same tokens (teacher forcing: the hash of the tokens is the same in every run of both). The GGUF path: on this file the exact graph and the CPU engine (COLI_METAL=0 GQ_EXACT=1) choose the same 32 words after a 64-token prompt of each text, and over 256 teacher-forced words their per-token likelihoods are within 3.5e-5 of each other (correctness.txt). The two files quantize the model differently, so their logits differ: their likelihoods of 1024 teacher-forced tokens of each text are in quality.txt. Fingerprints of every logit and hashes of the tokens (baseline / trial), each the same in every run of its version: 64 tokens 2ca892c20f9dfdfa/24b5cd77c9db23fb / 993fc7a94a1c6db6/24b5cd77c9db23fb, 512 tokens 31fb860c5d30aac5/561100505ac9d4ca / 34a820a03a3e3055/561100505ac9d4ca; the 32 tokens' mean negative log-likelihood and top-1 rate (baseline / trial): after 64 tokens 2.85014 0.406 / 2.88531 0.406, after 512 tokens 2.59694 0.562 / 2.59825 0.562.",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-gguf-metal-2026-10-19/trial-format-code.txt",
+      "sha256": "7c806febc203c12d168b62738381e9e835a1450e3a0e9b967e8b0d1360e01a4e"
+    }
+  },
+  "outcome": "regression"
+}

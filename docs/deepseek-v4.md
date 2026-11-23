@@ -113,6 +113,29 @@ The build uses link-time optimization by default. A gcc built without it (the
 portable w64devkit on Windows says `LTO support has not been enabled in this
 configuration`) builds with `make deepseek-v4 LTO=0`.
 
+On Windows, build it with clang (#2286). MSYS2's gcc links MinGW's libgomp,
+whose barriers always sleep on a semaphore: the `OMP_WAIT_POLICY=active` and
+`GOMP_SPINCOUNT` that `coli` sets for this engine change nothing there, and each
+of a token's many small parallel regions pays a thread wake-up. clang links LLVM's
+libomp, whose team spins between regions (on Windows `coli` also sets
+`KMP_BLOCKTIME=200` with the active policy, so the team sleeps 200 ms after the
+last region instead of spinning forever; `OMP_WAIT_POLICY=passive` makes it sleep
+at once). The release builds it this way. From source, in the MSYS2 UCRT64 shell:
+
+```bash
+pacman -S --needed mingw-w64-ucrt-x86_64-clang mingw-w64-ucrt-x86_64-llvm-openmp
+make deepseek-v4 CC=clang   # libomp.a is linked in: no extra DLL beside the .exe
+```
+
+(An MSYS2 whose package list predates the rename calls the second package
+`mingw-w64-ucrt-x86_64-openmp`.) On the tiny test model the tokens are the same
+as the gcc build's, and it decodes 3.1x faster on a 4-core i7-7700HQ (500 to
+1547 tok/s, a 72-token prompt in 20 ms instead of 67); on the full model the
+issue measured 1.5x with a clang build that had LTO. LTO is off for clang here
+(`LTO=1` needs LLVM's linker plugin), and the two compilers can round
+differently, so a real checkpoint may pick another token where two are nearly
+tied.
+
 ### Windows CUDA tier
 
 The engine is MinGW-built (MSYS2 **UCRT64** shell: `MSYSTEM=UCRT64`; the plain
@@ -125,6 +148,7 @@ picks at start-up by GPU:
 |---|---|---|---|
 | `coli_cuda_dsv4_dg.dll` | `make cuda-dsv4-dg-dll` (from a vcvars64 shell; fetches the pinned DeepGEMM headers on first use) | DeepGEMM tensor-core prefill paths + generic kernels | compute capability 12.x (RTX 50-series) |
 | `coli_cuda_dsv4.dll` | `make cuda-dsv4-dll CUDA_ARCH=portable` | generic CUDA kernels only (fp32 compute from fp8/fp4 decode) | any sm_80+ (RTX 30/40/50, A/H series) |
+| `coli_cuda_dsv4.dll` | `make cuda-dsv4-dll CUDA_ARCH=portable-pre-ampere NO_TC=1`, CUDA <= 12.9 | the same generic kernels, plus sm_61/sm_75 code (see [GPU coverage](#gpu-coverage)) | Pascal and Turing too (GTX 10/16, RTX 20) |
 
 The release's Windows CUDA package (`colibri-<tag>-windows-x86_64-cuda.zip`)
 carries both, built with `DSV4_TC=0`: that leaves out the opt-in cuBLASLt
@@ -146,9 +170,22 @@ them). `make cuda-dsv4-dg-dll` and `DEEPGEMM=1` run it on first build
 `DEEPGEMM_HOME=<dir>` points at an existing tree instead and `DEEPGEMM_PIN`
 bumps the commit. Attribution: `THIRD_PARTY_NOTICES.md`. Loader rules:
 try `_dg` first, ask it whether device 0 fits (`dsv4_cuda_backend_arch_ok`),
-otherwise load the generic DLL; `COLI_DSV4_DLL=<file name>` forces one. The
-start-up banner names the choice: `[DSV4 CUDA] backend=coli_cuda_dsv4_dg.dll
-(deepgemm-sm120)`. Deploy = `deepseek_v4.exe` + both DLLs next to it.
+otherwise load the generic DLL; `COLI_DSV4_DLL=<file name>` forces one from
+the engine's folder (a relative path too), `COLI_DSV4_DLL=<absolute path>`
+(`C:/x/coli_cuda_dsv4_dg.dll` or `C:\x\...`) loads that file, its CUDA runtime from beside it or PATH (never
+the current directory). The start-up banner names the choice and the file:
+`[DSV4 CUDA] backend=coli_cuda_dsv4_dg.dll (deepgemm-sm120) path=...`. Deploy = `deepseek_v4.exe` + both DLLs next to it.
+
+### Linux HIP tier
+
+```bash
+cd c
+make deepseek-v4 HIP=1 HIP_ARCH=gfx1102   # ROCM_HOME=/usr when ROCm is not in /opt/rocm
+```
+
+The same `backend_cuda_dsv4.cu`, compiled by `hipcc` (ROCm 6.3 or newer: the
+OCP fp8 type in `<hip/hip_fp8.h>`) and linked into the engine like `CUDA=1`.
+The cooperative fused-MoE kernel is CUDA-only and compiled out on HIP.
 
 ### Linux CUDA tier
 
@@ -203,6 +240,22 @@ the engine run by hand: give it with `--prompt-file <UTF-8 file>`. `--ngen` is a
 target (answers end at EOS; an oversized ceiling is clamped to the context
 with a stderr note). `CTX`/`--ctx` sets the context window.
 
+On the HIP build the engine reads the GPU variables `coli` already exports,
+the same names the other engines take on HIP too ([GPU_BACKENDS.md](../GPU_BACKENDS.md)):
+`COLI_CUDA=0` (`--gpu none`) turns the native tier off, `COLI_GPUS` (`--gpu N`)
+picks the device, and `CUDA_EXPERT_GB` (`--vram N`) is the VRAM the engine may
+use: the expert mirrors grow until the card has that much less free than it
+had at open, and never below the engine's own reserve (an explicit
+`DSV4_CUDA_VRAM_RESERVE_MB` is a floor too). The display server shares the
+card, so leave it room: `--vram` is a cap on this process, not on the card, and
+it caps the mirrors: the engine's working buffers (0.2 to 0.5 GiB measured) come
+on top. On an 8 GB card with a desktop that makes about 6 the practical
+maximum; 7 left the card with 0.5 GiB free in a run and was stopped.
+
+Below 10 GiB the dense/attention mirrors (6.2 GiB) are worth less on the card
+than the same VRAM as expert mirrors, so on an 8 GB card they stay in RAM.
+A long prompt is then prefilled on the CPU.
+
 What the knobs do (full table in [Environment reference](#environment-reference-v4-engine)):
 `COLI_CUDA_ATTN_BATCH=1` puts the batched prefill attention block on the GPU
 (compressor/indexer projections, sparse attention on a persistent device KV
@@ -228,14 +281,7 @@ and the rest as decode expert mirrors at **12.75 MiB each** (gate, up and
 down in fp4 with their scales).
 `DSV4_CUDA_EXPERT_MIRRORS` is only an upper bound (default 4096): the cache
 grows while at least `DSV4_CUDA_VRAM_RESERVE_MB` stays free, so free VRAM
-sizes it at run time — you normally do not need to set it. Free VRAM is
-re-read every 64 mirror misses; in between, an explicit reserve and the 600 MiB
-headroom also count the mirrors grown since the last reading, so the cache
-stops at the reserve instead of up to 64 mirrors (~800 MiB) past it, where the
-compressed-KV buffer and the prefill's attention buffers no longer fit and
-their layers' attention falls back to the CPU (`[DSV4 CUDA] kv comp
-allocation: out of memory`). The bank-sized default below already carries
-those 64 mirrors as margin, so its decisions do not change. Decode is
+sizes it at run time — you normally do not need to set it. Decode is
 disk-bound, so more mirrors help in proportion to the hit rate they add
 (~11 000 experts total; 600 mirrors ≈ 5 %); more RAM (`--ram`) buys more than
 more VRAM.
@@ -252,11 +298,54 @@ builds, 4873 on DeepGEMM and 3100 for a 132-expert checkpoint (7945, 8329 and
 Below 32 live mirrors the default keeps only 600 MiB free, so a card too small
 for the bank still decodes from a working mirror set (the bank then falls back
 to the CPU union). An explicit `DSV4_CUDA_VRAM_RESERVE_MB` is used as given.
+It and the 600 MiB default without the bank carry no probe margin, so from 8
+live mirrors on the cache counts the mirrors it has added since the last read
+of free VRAM against that read and stops at the reserve instead of
+overshooting it by up to 64 mirrors. The first 8 may still overshoot it by
+about 100 MiB, so a reserve just under the free VRAM leaves a mirror set the
+cache can recycle. The bank-sized default already counts those 64 mirrors in
+its reserve; below 32 live mirrors it may still grow up to 64 mirrors past its
+600 MiB between two reads. A failed mirror upload counts as a full card until
+the next read.
+
+`V4_BANK_MAKE_ROOM=1` (opt-in) turns that order around. The cache keeps only
+the 600 MiB headroom free and grows into the bank's room while a decode runs;
+where a prompt creates a bank, the least recently used mirrors of that
+device's caches are released until the bank and the headroom are free
+(`v4_gpu mirror-cache: released N decode mirrors for the prompt's expert bank`),
+and the cache grows again once decode starts. A prompt too short for the bank
+creates none and releases nothing, so a chat's short turns keep their mirrors.
+A resident table, a cache on another device (a layer placed elsewhere, the
+peer pool) and unified memory are not touched, and an explicit
+`DSV4_CUDA_VRAM_RESERVE_MB` still sets the reserve. It matters on a card where
+the bank-sized reserve leaves few mirrors. On the 16 GB RTX 5080 with
+`COLI_CUDA_MOE_DOUBLE=1` that reserve is 8329 MiB and the cache stays at its
+32-mirror minimum, so every routed expert of every token is an upload:
+
+| 3,278-token prompt, 36 tokens, `--memory-gb 16`, three runs, medians | 35 tokens after the first (s) | MoE per token (ms) | tok/s |
+|---|---|---|---|
+| unset | 22.83 | 530.4 | 1.533 |
+| `V4_BANK_MAKE_ROOM=1` | 21.39 | 488.5 | 1.636 (+6.7 %) |
+
+Three such prompts in a row on one serve engine (`DSV4_CUDA_HEAD=0`, one run
+per row): with the switch on, the second and third prompt each released 528
+mirrors (278 for the first bank, 250 for the second), both banks were created,
+no allocation failed, and each turn printed the text it prints with the switch
+unset.
+
+| turn | unset: first token (s), 35 tokens (s) | `V4_BANK_MAKE_ROOM=1` |
+|---|---|---|
+| 1 | 67.5, 24.6 | 66.8, 23.7 |
+| 2 | 63.4, 24.9 | 64.0, 24.1 |
+| 3 | 63.4, 24.0 | 64.3, 23.1 |
+
+The record is in `docs/experiments/v4-bank-make-room-2026-11-12/`.
 
 | VRAM | dense mirrors | prefill bank | recommended env | expected |
 |---|---|---|---|---|
 | 6 GB | no (6.3 GB does not fit) | yes (3.2 GiB) | `CUDA_DENSE=0 COLI_CUDA_MOE_BATCH=1 COLI_CUDA_ATTN_BATCH=0` | GPU MoE prefill (generic kernels on non-RTX50), CPU attention/decode; ~90 mirrors between prefills |
 | 8 GB | yes | no (~0.9 GiB left) | `CUDA_DENSE=1 COLI_CUDA_ATTN_BATCH=1 COLI_CUDA_MOE_BATCH=0` | GPU attention + GPU decode dense; MoE prefill on the CPU union; ~25 mirrors |
+| 8 GB (HIP build) | no (stays in RAM) | no | the HIP default (`--vram N` pins the budget) | decode dense in RAM, ~530–549 mirrors; prefill on the CPU |
 | 10–12 GB | yes | 12 GB: yes (tight); 10 GB: only a pruned checkpoint's smaller bank on generic builds | `CUDA_DENSE=1 COLI_CUDA_ATTN_BATCH=1 COLI_CUDA_MOE_BATCH=1` | full GPU prefill; 12 GB: the 32-mirror minimum beside a 256-expert bank's reserve (~350 mirrors with `COLI_CUDA_MOE_BATCH=0`), ~150 beside a 132-expert one; 10 GB: the 32-mirror minimum beside a 132-expert bank (256 experts: `COLI_CUDA_MOE_BATCH=0`, ~190 mirrors) |
 | 16 GB (this box) | yes | yes | the canonical line above (mirror cap can be left unset) | ~330 mirrors; the numbers in this document predate the bank-sized reserve (the fixed 2800 MiB default left more mirrors, but too little room for the bank once decode had filled the card) |
 | 24 GB | yes | yes | canonical | ~1 000 mirrors (~9 %) |
@@ -288,6 +377,86 @@ GPU fill branch and the CPU branch using bandwidths measured at runtime, and
 `COLI_CUDA_MOE_DOUBLE=1` (on top of `COLI_CUDA_MOE_BATCH=1`) prefetches the next
 layer's full expert set into a second VRAM bank while the current layer
 computes, falling back to the single bank when VRAM is short.
+
+### A decode mirror as two runs (`V4_MIRROR_BLOCK`, opt-in)
+
+A mirror in the per-device cache is three FP4 tensors (gate, up, down), each
+with a weight and a scale allocation: an upload, or a recycle in place, is six
+copies. The host record already keeps an expert's three scale tensors together
+and its three weight tensors together. `V4_MIRROR_BLOCK=1` gives a mirror one
+weight run and one scale run on the device, laid out as the record has them,
+and fills it with two copies. To everything that reads it (the expert group,
+the peer pool, the resident route) the entry is still three tensors; the cache,
+its growth guard, its LRU and its recycle in place are unchanged. An expert
+whose host tensors are not two contiguous runs, or whose weights would not
+start on a 16-byte offset inside the run, takes the three-tensor mirror in the
+same cache, and so does every expert under a DLL without the new exports. The
+exit line `v4_gpu mirror-block device= made= refills= three-tensor=` counts
+them. `V4_MIRROR_BLOCK_VERIFY=1` reads every fill back from the device and
+compares it with the host bytes (`verified= mismatches=` on the same line;
+slow, a diagnostic).
+
+Measured on the RTX 5080 (3,278-token prompt, 36 tokens, `--memory-gb 16`,
+`COLI_CUDA_MOE_BATCH=1 COLI_CUDA_MOE_DOUBLE=1`, three runs per row, medians;
+the text is the same in every run):
+
+| mirror reserve | mirrors | fills in the run | unset: 35 tokens (s), MoE (ms/token) | `V4_MIRROR_BLOCK=1` |
+|---|---|---|---|---|
+| the default (8329 MiB with two banks) | 32 | 8,998 | 22.84, 529.9 | 22.91, 532.2 |
+| `DSV4_CUDA_VRAM_RESERVE_MB=600` | 440 | 5,164 | 21.42, 489.2 | 21.05, 478.9 (+1.7 % tok/s) |
+
+With the default reserve the cache stays at its 32-mirror minimum on this card,
+every routed expert is an upload, and the two-copy mirror changes nothing that
+the timing can see. With room to grow it is 10 ms per token. The verifier read
+5,618 fills back with no difference. The record is in
+`docs/experiments/v4-mirror-block-2026-11-12/`.
+
+### The decode mirror uploads on an uploader thread (`V4_UPLOAD_THREAD`, opt-in)
+
+A decode step reads its routed experts on the loader lanes and attaches each
+one to the mirror cache before it starts that lane's next read. A recycled
+mirror is the three tensors' copies and a wait for them on the compute stream,
+on the thread that feeds the lanes, so every upload delays a read.
+
+`V4_UPLOAD_THREAD=1` hands the expert to one uploader thread and starts the
+next read at once. The thread runs the same attach as the step would (the same
+caches, growth guard, LRU and recycle in place, the peer pool included), one
+expert at a time. Its copies go on the device's second stream and are only
+enqueued. When the step's reads are in, it joins the thread, records an event
+behind the copies and makes the compute stream wait for it, so the expert group
+runs after the copies on the device and the host waits for no transfer. Before
+the step releases the experts' leases it waits for the second stream.
+
+- `V4_UPLOAD_FENCE=0` keeps the thread and has it drain the second stream after
+  each mirror, with no event.
+- A backend without `dsv4_cuda_upload_fence` (an older DLL) is asked once; the
+  uploader then copies on the compute stream and drains it, as the attach on the
+  generation thread does.
+- A new mirror, while the cache still grows, is a synchronous upload in every
+  mode. `DSV4_HYBRID=1` keeps its own uploads.
+- The step makes no backend call between its first hand-over and the join, so
+  the backend is still entered by one thread at a time.
+
+The exit line `v4_gpu uploader: jobs= attached= avg= ms copies= fences=
+fence-drains=` counts the experts handed over (hits included), the time per
+expert on the thread, where the copies went, and the events recorded
+(`fence-drains` are events that failed and were replaced by a wait).
+
+Measured on the RTX 5080 (3,278-token prompt, 36 tokens, `--memory-gb 16`,
+`COLI_CUDA_MOE_BATCH=1 COLI_CUDA_MOE_DOUBLE=1`, three interleaved runs per
+cell, medians: seconds for the 35 tokens after the first, routed-expert ms per
+token; the text is the same in all fifteen runs):
+
+| mirror reserve | unset | `V4_UPLOAD_THREAD=1` | with `V4_UPLOAD_FENCE=0` |
+|---|---|---|---|
+| the default (8329 MiB with two banks) | 22.98, 533.8 | 21.62, 494.9 (+6.3 % tok/s) | not run |
+| `DSV4_CUDA_VRAM_RESERVE_MB=600` | 21.49, 490.4 | 20.34, 458.0 (+5.6 % tok/s) | 20.56, 464.2 (+4.5 % tok/s) |
+
+The uploader spent 0.78 ms per expert at the default reserve, where every
+routed expert is an upload, and 0.53 ms at 600 MiB. With the event the three
+runs took 20.31 to 20.66 s and with the drain 20.19 to 20.61 s: these runs do
+not separate the two. Not measured: a second card, the peer pool, Linux. The
+record is in `docs/experiments/v4-upload-thread-2026-11-12/`.
 
 ### Expert-pruned checkpoints (REAP) and the generic kernels
 
@@ -380,6 +549,214 @@ decode has grown its mirror cache; the mirrors that room holds back cost some
 decode speed, and the reserve drops back to one bank once the prefetch has
 turned itself off (`moe-double=off`).
 
+### A decode token's attention on the device (`V4_LAYER_FUSED`)
+
+Opt-in (`V4_LAYER_FUSED=1`). A decode token's attention layer, as the
+engine runs it without the switch, is several device round trips with host
+arithmetic between them: the projections one by one, the compressor and
+indexer steps on the host, the selection's scores downloaded and ranked on
+the host, the cached sparse attention, then the output projection. Under
+WDDM each round trip costs more than the kernels it launches. With the
+switch on the layer is one round trip:
+
+- the token's six projections (`wq_a`, `wkv`, the two compressors' and
+  the indexer's pairs) from one upload of the hidden state;
+- the query's norm and RoPE, the key row's norm, RoPE and FP8
+  quantize-dequantize, and the row entered into the device KV ring;
+- on a token that emits a compressed row, the row pooled from a device
+  mirror of the compressor state (`V4_LAYER_FUSED_EMIT`);
+- the indexer's query, its scores over the resident keys and the top-k,
+  as a bitonic rank with the host's tie order;
+- the cached sparse attention over the selected rows, inverse RoPE and
+  the grouped output projection.
+
+The whole sequence is captured as a CUDA graph per layer
+(`DSV4_LF_GRAPH`), so a token replays 43 graphs. A token the fused layer
+does not take (a refusal, a layer without mirrors) falls back to the
+chained forms it is built from (`V4_WO_CHAIN`, `V4_DECODE_PROJ6`), and
+from those to the paths the engine had before.
+
+Every step keeps the CPU reference's order of operations, including which
+products are fused, so the results are the CPU's bit for bit.
+`V4_LAYER_FUSED_VERIFY=1` runs the fused layer into side buffers beside
+the usual path and counts differing words per call (`lfverify`);
+`DSV4_WO_VERIFY=1` does the same for the chained tail (`woverify`).
+
+With the switch unset nothing changes: the new entry points are not
+called, and the kernels the existing entry points would otherwise pick up
+(the warp matvecs `DSV4_MV_WARP`, the cached sparse attention's second
+form `DSV4_SATTN_V2`, the coalesced indexer reads `DSV4_IDX_COAL`,
+`DSV4_IDX_TILE`) default to off. Each sub-switch has its own variable,
+which wins when set; unset, it follows `V4_LAYER_FUSED`.
+
+VRAM: the fused layer reads the plain bf16 compressor mirrors and its own
+resident indexer weights, so with it on the packed compressor copies
+(`DSV4_CUDA_COMPRESSOR`) and the resident indexer mirrors
+(`DSV4_CUDA_RESIDENT_INDEXER`) default to off: 769 MiB on V4 Flash that
+would be held unread. On a 16 GB card that is also what the prompt was
+short of: its attention then stays on the device.
+
+Measured on an RTX 5080 16 GB (Ryzen 9 5950X, Windows 11, `--memory-gb
+16`, V4 Flash, a 3,278-token prompt, 36 tokens, greedy, the same text in
+every run, three runs per setting): `decprof` attention 81.6 -> 20.1 ms
+per token, the 35 tokens after the first 22.81 -> 20.52 s, and 85.0 ->
+63.2 s to the first token (the 556 allocation failures of the prompt
+gone). Both verifiers clean over 1,505 calls each. The record is in
+`docs/experiments/v4-decode-attention-fused-2026-11-12/`.
+
+### Decode on two GPUs (peer mirror pool) and VRAM-first lookups
+
+Decode mirrors routed experts in VRAM, but a mirror used to be an upload
+cache only: every routed expert was still fetched from the RAM expert store
+(and the SSD on a miss) before its mirror was found. Two opt-in levers turn
+VRAM into a real tier:
+
+- `V4_GPU_RESIDENT_FIRST=1`: an expert already mirrored in VRAM is computed
+  from the mirror without asking the store. The store still records the
+  routing (the `.coli_usage` history, the chat's expert map), and its
+  RAM pin ranking leaves mirrored experts out, so their RAM slots are no
+  longer pinned or refreshed, age out of the LRU, and the RAM tier holds
+  experts that are not in VRAM. A routing served from VRAM is not a store
+  request: the hit rate in `DONE`/`PROF` is then the RAM hit rate of the
+  experts the store was asked for. If a token cannot use the fused GPU path
+  after all (an attach failed: a failed upload, or a rows16-packed RAM slot),
+  its mirrored experts are read from the store through the loader lanes and
+  the token runs on the CPU, as without the switch.
+- `DSV4_CUDA_PEER_DEVICE=N`: a second mirror pool on GPU N (needs peer
+  access, e.g. NVLink). By default (`DSV4_CUDA_PEER_COMPUTE=1`) the fused
+  decode MoE runs the experts mirrored there ON that GPU: the token's input
+  is copied over P2P, the same kernels run on local weights, and each
+  expert's output row is written into the primary GPU's reduce buffer.
+  Results are bit-identical to computing every expert on one GPU; peer
+  compute needs both GPUs at the same SM version (the same machine code).
+  Mirrors are read in place over P2P from the other card only with
+  `DSV4_CUDA_PEER_COMPUTE=0`, with `DSV4_CUDA_BATCHED=0` (kernels launched
+  expert by expert on the primary GPU; `DSV4_CUDA_PEER_COMPUTE` has no effect
+  there), with GPUs of different SM versions, and when the fused MoE cannot
+  take the token (no GPU mirror of the shared expert, which is always the
+  case for a GGUF checkpoint, or a refused call) and the expert-group
+  fallback computes it. The `v4_gpu peer-mirrors ... mode=` line at startup
+  says which (`compute` or `p2p-read`); for a GGUF it says `compute`, but
+  decode reads the pool over P2P.
+
+GPU N is checked before anything is set up on it (a `DSV4_CUDA_PEER_MIRRORS`
+of 8 or more, a visible device other than the primary that no earlier peer
+failure in the process has latched off, peer access both ways, and on both
+GPUs, the primary's first, an architecture and kernel image the build runs);
+when a check fails, GPU N is left untouched, decode runs without it, and the
+`peer mirror pool off:` warning gives the reason and, for a missing kernel
+image, the build to use (a `CUDA_ARCH`, or the generic build for a DeepGEMM
+binary; a GPU that is full or taken by an exclusive-process job is reported
+as such). If the two-GPU init fails after the checks passed, GPU N's context
+is dropped again and decode retries on the primary alone. A miss grows the
+primary cache, then the pool, and once neither can grow recycles the older of
+the two LRU mirrors; a cache with fewer than 8 live mirrors (a nearly full
+card, `DSV4_CUDA_PEER_RESERVE_MB` above its free VRAM) is never recycled, so
+a starved pool only adds mirrors and never sends an expert to the CPU that
+the primary cache would have taken. A CUDA failure on the peer during decode
+latches it off for the rest of the run, with one
+`[DSV4 CUDA] peer device N failed in the decode MoE (...)` line. The token in
+flight is recomputed on the primary GPU, or on the CPU from host copies when
+the peer no longer answers, and the pool's mirrors count as misses from then
+on. That holds for an error the devices survive (an allocation or launch
+failure). A kernel fault (launch failure, illegal address, trap) is sticky,
+and with peer access between the GPUs it takes the primary's context with it
+too: measured on two RTX 3090s with NVLink, a `__trap()` on the peer left
+device 0's next calls failing, whether device 0's stream or the host waited
+for the peer. So a sticky error anywhere in the backend latches CUDA off for
+the whole process, with one `[DSV4 CUDA] ...: CUDA is lost for this process`
+line: every backend call is refused from then on without touching CUDA, the
+token in flight and every later one take host copies (the CPU paths, as
+without `CUDA=1`), and the server keeps answering, more slowly, until it is
+restarted. The latch covers peer compute (`mode=compute`); a peer that stops
+answering without reporting an error is not detected. The pool's VRAM on that
+GPU is released only when the engine closes.
+
+The peer card holds nothing but mirrors (no dense weights, no prefill bank),
+at the same 12.75 MiB each. After ~0.3 GiB of CUDA context and the 1024 MiB
+`DSV4_CUDA_PEER_RESERVE_MB`, a 24 GB card holds ~1 800 (~16 % of a
+256-expert model's ~11 000 experts, ~32 % of a 132-expert one's 5 676), a
+16 GB card ~1 200. `DSV4_CUDA_PEER_MIRRORS` (4096, i.e. 51 GiB) is only an
+upper bound, like `DSV4_CUDA_EXPERT_MIRRORS`: free VRAM sizes the pool.
+
+Both levers act where the MoE runs one token at a time, i.e. mainly the
+ordinary decode step. Decode batches of more than one token (the verification
+of speculative drafts, and the steps of a serve that decodes several
+conversations together, `KV_SLOTS`) go through the expert union and use
+neither (with the default `V4_EXPERT_UNION=1`; with `0` they run token by
+token and use both). The RAM pin ranking still leaves mirrored experts out
+on those paths and during prefill, as long as `V4_GPU_RESIDENT_FIRST=1` is
+set. `DSV4_HYBRID=1` turns `V4_GPU_RESIDENT_FIRST` off and
+uploads its split's experts into the primary cache only, so no peer pool is
+set up there: GPU N is left untouched, and a warning says so.
+
+Measured on the REAP 150B setup above (2× RTX 3090 with an NVLink bridge,
+`--ram 40`, six 300-token answers per run, greedy), with `COLI_CUDA_MOE_BATCH=1`
+set on every row, against upstream dev 736a0682: a fresh server per run, three
+runs per row interleaved, medians of each run's mean decode tok/s. Every run
+gave the same answers as dev's (compared in full).
+
+| configuration | decode tok/s |
+|---|---|
+| upstream dev | 3.01 |
+| this series, every switch off | 2.98 |
+| + `V4_GPU_RESIDENT_FIRST=1` | 3.07 |
+| + `DSV4_CUDA_PEER_DEVICE=1` (peer compute) | **4.29** |
+
+The second row is below dev because, with `COLI_CUDA_MOE_BATCH=1`, GPU0's
+mirror reserve keeps room for the prefill bank (3100 MiB for this model),
+which dev does not reserve for a 132-expert model, so fewer decode mirrors fit;
+a decode-only server can leave `COLI_CUDA_MOE_BATCH` unset or lower
+`DSV4_CUDA_VRAM_RESERVE_MB`. `DSV4_CUDA_PEER_COMPUTE=0` (the peer mirrors read
+in place over NVLink) was not measured on this base: in one earlier run per
+row it landed between the VRAM-first and peer-compute rows.
+
+Prefill is unchanged (it runs on the primary GPU's bank). On this box the
+host→GPU uploads run at ~12 GB/s (PCIe 4.0 x8 per card), so an expert read
+from the peer pool beats an upload from RAM by a wide margin.
+`V4_SERVE_STATS_LOG=1` prints two lines per turn on stderr. `v4_serve_turn`
+repeats the turn's `DONE`/`PROF` numbers: `decode_s` and `tok_s` are the
+decode's, the hit rate and the expert and attention seconds cover the whole
+turn, prefill included; `vram_first_hits_total` and `store_fetches_total` are
+process totals of the decode's routed experts computed from VRAM without a
+store lookup and fetched from the store. `v4_dec_moe` gives process totals of
+the single-token decode MoE (decode forwards only: prefill chunks, batched
+speculative verify and the `KV_SLOTS` multiplexed decode are not counted):
+token-layers (`calls`), their wall time from routing on, the wait for store
+fetches, the VRAM attach time and the mirror `uploads` it caused, and the
+fused GPU compute.
+
+### An expert record stays where its read landed (`V4_SLAB_SHIFT`, on)
+
+A direct read of an expert lands a 4 KiB-aligned window of the file in the
+expert's slab, and the record starts some bytes into that window. The reader
+used to move the record to the slab's first byte after every read: 12.6 MB for
+a V4 Flash expert, on the thread that read it. The slot now remembers where
+the record sits and the tensor views point there; nothing is moved. For a
+checkpoint that keeps an expert's scales and weights apart in the file, the
+weights' window lands on the first page boundary past the scale run and the
+scales are read to the slab's first byte, as before. Per-matrix and GGUF
+records, buffered reads and a direct read that fell back are unchanged. A slab
+holds 16 KiB past its record instead of 8. `V4_SLAB_SHIFT=0` restores the
+move; the bytes are the same either way.
+
+Measured on the RTX 5080 (3,278-token prompt, 36 tokens, `--memory-gb 16`,
+`COLI_CUDA_MOE_BATCH=1 COLI_CUDA_MOE_DOUBLE=1`, three interleaved runs per
+cell, medians; the text is the same in all twelve runs):
+
+| mirror reserve | | `V4_SLAB_SHIFT=0` | on |
+|---|---|---|---|
+| the default (8329 MiB with two banks) | 35 tokens after the first (s) | 22.15 | 20.34 (+8.9 % tok/s) |
+| | routed experts per token (ms) | 523.4 | 474.1 |
+| | time to first token (s) | 65.1 | 58.5 |
+| `DSV4_CUDA_VRAM_RESERVE_MB=600` | 35 tokens after the first (s) | 20.75 | 18.81 (+10.3 % tok/s) |
+| | routed experts per token (ms) | 482.1 | 428.9 |
+| | time to first token (s) | 64.9 | 58.7 |
+
+The prompt gains too, a tenth of its time, because the bank refills read
+experts through the same path. Not measured: a CPU-only run, Linux, a contiguous (FLOCK-packed)
+checkpoint. The record is in `docs/experiments/v4-slab-shift-2026-11-13/`.
+
 ## Prefill: segments, chunks, checkpoints
 
 - **Chunks/segments.** Prefill runs layer-major over 128-token chunks
@@ -423,7 +800,8 @@ Where the time goes now: prefill ≈ 35 % expert-bank refill (disk-bound,
 host↔device syncs), ≈ 5 % MoE GEMM, rest indexer/dense/mHC. Decode ≈ 75 %
 routed-expert reads (~230 × 12.6 MB per token from disk at 6 % VRAM hit
 rate), rest GPU stages. More RAM/VRAM (higher expert hit rate) is the only
-lever left below the disk limit; a multi-GPU design exists on paper only.
+lever left below the disk limit; the optional layer placement below spreads
+those caches across multiple GPUs.
 
 Profilers: `DSV4_ATTN_PROF=1` (per chunk-layer `attnprof`/`blockprof`/
 `idxprof`), `DSV4_DECODE_PROF=1` (per-token `decprof`), `DSV4_CUDA_MOE_PROF=1`,
@@ -441,8 +819,11 @@ build's two activation-quantise kernels (`fp8_sim64`, `fp8_sim64_dynamic`)
 do call `__nv_cvt_float_to_fp8`, but `cuda_fp8.h` resolves that to native
 `cvt` PTX only at `__CUDA_ARCH__ >= 890` and to its own software path
 below, so it builds and runs on older cards. All of it compiles unchanged
-for sm_61 and sm_75, so `CUDA_ARCH=portable-pre-ampere NO_TC=1` extends the
-generic tier to Pascal and Turing.
+for sm_61 and sm_75, so `CUDA_ARCH=portable-pre-ampere NO_TC=1`, built with
+CUDA <= 12.9, extends the generic tier to Pascal and Turing. CUDA 13 dropped
+`compute_61` (its `nvcc --list-gpu-arch` starts at `compute_75`), so nvcc
+stops at once with `Unsupported gpu architecture 'compute_61'`. With CUDA 13,
+a Turing card builds with `CUDA_ARCH=sm_75 NO_TC=1`.
 
 `NO_TC=1` is required because the opt-in `DSV4_CUDA_TC` path calls cuBLASLt
 block-scaling APIs (`CUBLASLT_MATMUL_DESC_A_SCALE_MODE` and friends) that need
@@ -462,15 +843,73 @@ is no software path to fall back to.
 |---|---|---|---|
 | CPU only (no DLL / `DSV4_CUDA=0` / Linux default) | — | CPU reference | CPU reference |
 | generic DLL / `CUDA=1` | any sm_80+ | GPU attention block, indexer, generic batched MoE on the VRAM bank | GPU attention, indexer, expert mirrors |
-| generic, pre-Ampere / `CUDA=1 CUDA_ARCH=portable-pre-ampere NO_TC=1` | sm_61 (Pascal), sm_75 (Turing) | as generic | as generic |
+| generic, pre-Ampere / `CUDA=1 CUDA_ARCH=portable-pre-ampere NO_TC=1`, CUDA <= 12.9 | sm_61 (Pascal), sm_75 (Turing) | as generic | as generic |
 | DeepGEMM DLL / `CUDA=1 DEEPGEMM=1` | compute 12.x | as generic + tensor-core dense/MoE GEMMs | same as generic |
-| multi-GPU | — | single device today (`DSV4_CUDA_DEVICE` selects); expert-parallel design drafted, not implemented | — |
+| multi-GPU layer placement | up to 16 visible CUDA devices | contiguous layer ranges, with dense mirrors and KV on the owning device | per-device expert caches; layers still execute sequentially |
 
 The runtime check `dsv4_cuda_backend_arch_ok` admits sm_60 and up for the
 generic build. It is deliberately independent of what the binary contains: a
 `CUDA_ARCH=portable` build has no sm_61/sm_75 cubin, and running it on such a
 card fails at launch with `"no kernel image is available"` rather than producing
 a wrong answer. Build with `portable-pre-ampere` for those cards.
+
+### Multiple GPUs: layer placement
+
+Set `DSV4_CUDA_DEVICES` to opt into contiguous layer placement:
+
+```bash
+DSV4_CUDA_DEVICES=0,1,2,3,4,5 COLI_CUDA_ATTN_BATCH=1 COLI_CUDA_MOE_BATCH=1 \
+  python c/coli run --model /path/to/DeepSeek-V4-Flash-0731 --ram 48 --ngen 64 \
+  "Explain why the sky is blue."
+```
+
+Build the CUDA engine first (`make -C c -f Makefile.deepseek-v4 deepseek-v4
+CUDA=1 CUDA_ARCH=sm_120` for RTX 5090). Ordinals refer to the devices visible
+through `CUDA_VISIBLE_DEVICES`, and list order determines layer order. For
+43 layers and six cards, the ranges are 0–6, 7–13, 14–20, 21–27, 28–34 and
+35–42. Startup prints each assignment. Invalid/duplicate lists and unavailable
+multi-device configurations fail startup instead of silently running one card.
+The single-device default is unchanged.
+
+Each layer's dense tensors, attention KV and routed-expert mirrors live on its
+assigned GPU. Cache limits and free-VRAM probes are per device. The transient
+prefill bank moves at device boundaries; double-bank lookahead stays within a
+device's layer range. MTP's separate expert cache stays on the first device.
+
+This increases usable cache capacity, not parallel compute within a layer.
+The engine still executes layers sequentially with CPU-canonical activations;
+there is no six-way TP, EP, or overlapped pipeline. CPU expert-store reads can
+still occur before a GPU cache hit, so RAM budget and disk traffic still matter.
+Do not interpret aggregate VRAM occupancy as a throughput or numerical-parity
+claim. Validate representative prompts against the single-device configuration.
+
+Peer access is best-effort: if the driver cannot enable it for a pair, startup
+logs the reason and continues, because contiguous layer placement does not
+require P2P. A build with `COLI_DSV4_NCCL` initializes NCCL only for six devices
+(the EP2 path); other counts do not need it. The exact head goes to the owning
+(last) device with room, then any other device, then the CPU. A GGUF keeps its
+dense matrices on device 0; `DSV4_CUDA_DEVICES` splits only the layer/expert
+tier for a GGUF.
+
+Each layer's KV ring and compressed-KV buffer are tied to their device; an
+append from a different device is refused, so restart the engine after changing
+the list.
+
+Linux backend lifecycle check (requires at least two GPUs; exercises all listed
+devices, duplicate-list refusal, active-context protection, and reopen with a
+different KV owner). Run the whole CUDA unit set with:
+
+```bash
+make -C c -f Makefile.deepseek-v4 dsv4-cuda-tests CUDA=1 CUDA_ARCH=sm_120 DSV4_TEST_DEVICES=0,1
+```
+
+or one test directly:
+
+```bash
+make -C c -f Makefile.deepseek-v4 tests/test_dsv4_multigpu_cuda CUDA=1 CUDA_ARCH=sm_120
+c/tests/test_dsv4_multigpu_cuda 0,1,2,3,4,5
+```
+
 ## Vulkan (`VK=1`, any GPU with a Vulkan 1.2 driver)
 
 `make deepseek-v4 VK=1` (the Vulkan headers and `glslc` at build time) links the shared
@@ -531,21 +970,63 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | var | meaning |
 |---|---|
 | `DSV4_CUDA` (1) | master switch for the V4 GPU tier; `0` = CPU only |
-| `DSV4_CUDA_DEVICE` (0) | CUDA device ordinal |
-| `COLI_DSV4_DLL` | Windows: force a backend DLL file name (loader) |
+| `DSV4_CUDA_DEVICE` (0) | single CUDA device ordinal, used when `DSV4_CUDA_DEVICES` is unset |
+| `DSV4_CUDA_DEVICES` (unset) | ordered comma-separated distinct CUDA ordinals; split contiguous layers across these devices |
+| `COLI_DSV4_DLL` | Windows: force a backend DLL, by file name or relative path (engine's folder) or absolute path (loader) |
 | `COLI_CUDA_ATTN_BATCH` (0; 1 for a GGUF on the CUDA expert tier) | `1` = GPU batched prefill attention block + GPU decode attention/indexer; unset, it is on for a GGUF whose dense matrices the CUDA expert tier's device holds (`COLI_CUDA=1`, `COLI_CUDA_DENSE`), `0` keeps it on the CPU |
 | `COLI_CUDA_MOE_BATCH` (0) | `1` = prefill MoE on the transient VRAM expert bank |
 | `COLI_CUDA_MOE_BATCH_MIN` (256) | min fresh tokens to engage the bank |
-| `DSV4_CUDA_EXPERT_MIRRORS` (4096) | upper bound on decode VRAM expert mirrors (12.75 MiB each); free VRAM sizes the cache at run time |
-| `DSV4_CUDA_VRAM_RESERVE_MB` (600; with the bank 600 + the bank, ×2 with `COLI_CUDA_MOE_DOUBLE=1`, + 64 mirrors, logged as `v4_gpu mirror-reserve=`) | VRAM kept free while mirrors grow (bank + attention buffers; the default only from 32 live mirrors on, see [VRAM budget](#vram-budget-and-per-card-settings)); an explicit value is used as given |
+| `DSV4_CUDA_EXPERT_MIRRORS` (4096) | per-device upper bound on decode VRAM expert mirrors (12.75 MiB each); each device's free VRAM sizes its cache at run time; minimum 8 (a smaller cache mirrors nothing) |
+| `DSV4_CUDA_VRAM_RESERVE_MB` (600; with the bank 600 + the bank, ×2 with `COLI_CUDA_MOE_DOUBLE=1`, + 64 mirrors, logged as `v4_gpu mirror-reserve=`) | VRAM kept free on each device while **decode mirrors grow** (bank + attention buffers; the default only from 32 live mirrors on, see [VRAM budget](#vram-budget-and-per-card-settings)); an explicit value is used as given and, from 8 live mirrors on, kept free between free-VRAM probes. Mirror growth only — the resident preload and head use `DSV4_CUDA_RESIDENT_RESERVE_MB` |
+| `DSV4_CUDA_RESIDENT_RESERVE_MB` (2800, min 256) | VRAM kept free while resident experts preload and the exact head uploads; separate from the mirror-growth reserve above |
+| `DSV4_CUDA_RESIDENT_EXPERTS` (auto) | `auto` loads every routed expert when the budget fits and keeps the LRU cache on a budget refusal; `1` requires residency (a budget refusal or hard failure rejects engine open); `0` keeps the cache |
+| `DSV4_CUDA_HEAD` (1) | exact vocabulary head on the GPU; `0` keeps it on the CPU |
+| `DSV4_CUDA_HEAD_LAZY` (1) | upload the exact head at the first head call, after the prompt, instead of at engine open, where its 1 GiB (2 while packing) is taken before the dense mirrors and the prefill bank are sized; `0` uploads at open |
+| `V4_HC_TEAM` (unset) | the OpenMP team of a decode token's hyper-connection steps: unset = the default team in a CPU run, and with the GPU tier on the mix on 6 threads and the column loops on the calling thread (the team sleeps through each layer's device work, and waking all of it four times a layer cost more than the loops); `0` = the default team everywhere, `N` = the mix on N threads. Same results whatever the team |
+| `V4_LAYER_FUSED` (0) | `1` = a decode token's attention layer in one device round trip, and under it the chained forms and shared kernels listed below; `0` = the engine as before |
+| `V4_LAYER_FUSED_VERIFY` (0), `DSV4_WO_VERIFY` (0) | `1` = run the fused layer (the chained tail) beside the usual path and count differing words per call (`lfverify`, `woverify`) |
+| `V4_LAYER_FUSED_EMIT`, `V4_WO_CHAIN`, `V4_DECODE_PROJ6`, `V4_DECODE_GPU_PROJ`, `V4_IDX_FUSED` (follow `V4_LAYER_FUSED`) | the parts of the device attention, each switchable on its own: the emitting tokens through the fused layer, the chained tail, the projections in one trip, the device projections, the fused layer's indexer on the device |
+| `DSV4_MV_WARP`, `DSV4_SATTN_V2`, `DSV4_IDX_COAL`, `DSV4_IDX_TILE` (follow `V4_LAYER_FUSED`) | backend kernels the existing entry points share with the device attention: a warp per row for the one-token matvecs, the cached sparse attention read once per selected row, the indexer's coalesced reads |
+| `DSV4_LF_GRAPH` (1), `DSV4_CHAIN_PACK` (1), `DSV4_PROJ_ONEDL` (1), `DSV4_SATTN_SPLIT` (1), `DSV4_SATTN_SPLIT_DS` (128), `DSV4_SATTN_HPB` (4), `DSV4_SATTN_HPB_PF` (16), `DSV4_IDX_HEADW` (2), `DSV4_IDX_SCORE_K` (8), `DSV4_IDX_PROJ_WARP` (0), `DSV4_MV_WARP_UNROLL` (1), `DSV4_MV_WARP_LUT` (1), `DSV4_CS_POOL_FMA` (1), `V4_COMP_EMIT_PAR` | shapes of those kernels, each measured at its default; all give the same results |
+| `DSV4_LF_KPROF`, `DSV4_LF_GPROF`, `DSV4_WO_KPROF`, `DSV4_PROJ_KPROF`, `DSV4_MV_WARP_VERIFY` (0) | per-kernel timers and checks of the device attention |
+| `DSV4_CUDA_HEAD_DEVICE` (unset) | exact-head device: unset tries the owning (last) device with room, then any other; set an ordinal to try that device first |
+| `DSV4_CUDA_HEAD_BATCH` (1) | batched exact head; `0` per-token |
+| `DSV4_HEAD_VERIFY` (0) | `1` checks the batched head against the per-token path (diagnostic) |
+| `DSV4_CUDA_RESIDENT_INDEXER` (1) | upload indexer query weights once per layer; `0` per call |
+| `DSV4_CUDA_INDEXER_HEADS` (1) | indexer score heads on the device; `0` the block kernel |
+| `DSV4_CUDA_INDEXER_PREP` (1) | indexer preparation on the device; `0` host path |
+| `DSV4_CUDA_WO_DECODE` (1) | output projection's decode intermediates on the device; `0` host |
+| `DSV4_CUDA_COMPRESSOR` (1) | compressor projection on the device; `0` host |
+| `DSV4_CUDA_RESIDENT_ROUTE` (1) | device-side routing/MoE for a complete 256-expert table; `0` host routing |
+| `DSV4_CUDA_BATCHED` (1) | batched BF16 routing path; `0` legacy |
+| `DSV4_CUDA_HEAD` (1) | exact vocabulary head on the GPU; `0` keeps it on the CPU |
+| `DSV4_CUDA_HEAD_BATCH` (1) | batched exact head; `0` per-token |
+| `DSV4_HEAD_VERIFY` (0) | `1` checks the batched head against the per-token path (diagnostic) |
+| `DSV4_CUDA_RESIDENT_INDEXER` (1) | upload indexer query weights once per layer; `0` per call |
+| `DSV4_CUDA_INDEXER_HEADS` (1) | indexer score heads on the device; `0` the block kernel |
+| `DSV4_CUDA_INDEXER_PREP` (1) | indexer preparation on the device; `0` host path |
+| `DSV4_CUDA_WO_DECODE` (1) | output projection's decode intermediates on the device; `0` host |
 | `V4_MTP_GPU_MIRRORS` (16) | separate mirror cache for the MTP drafter |
 | `DSV4_CUDA_PIN_HOST` (1, `.cu`) | page-lock expert-cache slabs for DMA uploads |
 | `DSV4_CUDA_MOE_GROUPED` (1, `.cu`) | expert-grouped MoE GEMM rows; `0` = legacy replicated |
+| `V4_BANK_MAKE_ROOM` (0) | `1` = the decode mirror cache keeps only the 600 MiB headroom free and uses the prompt bank's VRAM; a bank, when a prompt creates it, releases the least recently used mirrors it needs (see [VRAM budget](#vram-budget-and-per-card-settings)); an explicit `DSV4_CUDA_VRAM_RESERVE_MB` still sets the reserve |
 | `V4_MOE_BANK_FULL` (off) | `=N`: prefetch a whole layer's experts above N tokens (measured worse) |
 | `DSV4_MOE_EXPERT_MAJOR` (1, `.cu`) | generic batched MoE: expert-major fp4 kernel (weights read once per chunk); `0` = one matvec per route; `_VERIFY=1` compares both bit for bit (keeps the per-route results, also with `0`) |
 | `DSV4_MOE_EM_TB` (auto, `.cu`) | routes per pass of the expert-major kernel: unset = 2 below 4 routes per routed expert in the chunk, else 4; `2`, `3`, `4` or `6` forces one (anything else is ignored with a warning) |
 | `DSV4_MM_WARP` (auto, `.cu`) | generic dense batch matmul, fp8 shapes whose I is a multiple of 256: warp-per-row kernel for I ≤ 1024 (unset, empty or `auto`), `1` = all of them, `0` = off; `DSV4_MM_WARP_VERIFY=1` compares bit for bit (keeps the old kernel's results, also with `0`) |
+| `DSV4_CUDA_ACT_QUANT` (1, `.cu`) | the generic 128-block fp8 calls (`dsv4_cuda_matvec`, `_matvec_grouped`, `_wo_decode`, `_proj_batch`, the generic `_matmul_batch`) round their input to E4M3 per 128 on the device first, as `coli_fp8_matvec_ref` does on the CPU; `0` = the raw input (the behaviour before) |
 | `V4_MOE_BATCH_PROF` (0) | `1` = one `moebprof` line per chunk-layer: switch (layer change: prefetch-worker wait, bank swap) / route / refill / compute ms |
+| `V4_MIRROR_BLOCK` (0) | `1` = a decode mirror is one weight run and one scale run on the device, uploaded and recycled with two copies instead of six; experts whose host tensors are not two contiguous runs keep three tensors (see [A decode mirror as two runs](#a-decode-mirror-as-two-runs-v4_mirror_block-opt-in)) |
+| `V4_MIRROR_BLOCK_VERIFY` (0) | `1` = read every two-run fill back and compare it with the host bytes (`verified= mismatches=` in the `v4_gpu mirror-block` exit line); slow |
+| `V4_UPLOAD_THREAD` (0) | `1` = a decode step hands each mirror upload to an uploader thread and starts its lane's next read at once; the copies go on the device's second stream and the expert group is ordered after them by an event (see [The decode mirror uploads on an uploader thread](#the-decode-mirror-uploads-on-an-uploader-thread-v4_upload_thread-opt-in)) |
+| `V4_UPLOAD_FENCE` (1) | with `V4_UPLOAD_THREAD=1`: `0` = the uploader drains the second stream after each mirror instead of the event |
+| `V4_GPU_RESIDENT_FIRST` (0) | `1` = decode computes VRAM-mirrored experts without an expert-store lookup, and the RAM pins skip them (VRAM adds to the RAM tier); off under `DSV4_HYBRID=1` |
+| `DSV4_CUDA_PEER_DEVICE` (unset) | second GPU for a decode mirror pool (peer access required; unused under `DSV4_HYBRID=1`) |
+| `DSV4_CUDA_PEER_COMPUTE` (1, `.cu`) | run the peer pool's experts on the peer GPU (both GPUs at the same SM version; `mode=` in the `peer-mirrors` line); `0` = read them in place over P2P; no effect with `DSV4_CUDA_BATCHED=0`, which reads them in place |
+| `DSV4_CUDA_PEER_FAULT` (unset, `.cu`) | tests: `n` = the n-th peer-compute pass fails at its join with an error the devices survive, and the peer is latched off (that call recomputes on the primary); `n:lost` = the peer also counts as lost (the call fails, decode takes host copies); `n:sticky` = the error is a kernel fault's, which latches CUDA off for the whole process (every later call refused, host paths), as a real fault does |
+| `DSV4_CUDA_PEER_MIRRORS` (4096) / `DSV4_CUDA_PEER_RESERVE_MB` (1024) | upper bound on peer pool mirrors (12.75 MiB each; free VRAM sizes the pool), minimum 8 (a smaller or non-numeric value leaves the pool off) / VRAM kept free on the peer |
+| `DSV4_CUDA_PIN_CAP_GB` (20, `.cu`) | cap on page-locked expert-slab bytes for uploads, in GiB; negative = 0 (nothing pinned), empty or unparsable = 20, at most 1 PiB (no cap) |
+| `V4_SERVE_STATS_LOG` (0) | `1` = per-turn `v4_serve_turn` (the turn's DONE/PROF numbers, VRAM-first totals) and `v4_dec_moe` (decode MoE totals) lines on stderr |
 
 **Prefill / checkpoints**
 | var | meaning |
@@ -567,6 +1048,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_LOADER_LANES` (9, max 16) | persistent expert-loader threads for decode. The default suits the CPU path (1.41× decode, #1097); **with the GPU tier set `3`**: mirrors/RAM absorb most decode misses (9 lanes ≈ +4 % decode) while the extra readers contend with the MoE bank refill for the NVMe queues (~10 % slower prefill; measured on the reference box, v1.7.0) |
 | `V4_EXPERT_UNION` (1) | per-chunk expert union batching on the CPU path |
 | `COLI_V4_DIRECT` (1) | O_DIRECT streaming reads |
+| `V4_SLAB_SHIFT` (1) | an expert record stays where its direct read landed and the views point there; `0` = moved to the slab's first byte after every read, as before (see [An expert record stays where its read landed](#an-expert-record-stays-where-its-read-landed-v4_slab_shift-on)) |
 | `COLI_V4_AUTOPIN`, `COLI_V4_SAVE_USAGE` | hot-expert pinning from `.coli_usage` history |
 | `COLI_V4_PREWARM` (unset) | the expert cache filled before the first request: unset, a serve (chat, web) reads every expert its RAM plan holds, or with a smaller cache each layer's most used ones in `.coli_usage`, before it says ready, in parallel with a progress line, and stops short of the RAM the plan keeps for the system; a one-shot run fills it as experts are used. `0` skips it, `1` fills it in every run (#2109) |
 
@@ -680,5 +1162,115 @@ disabled.
 
 - Non-greedy sampling and more serving slots.
 - Linux CUDA tier: measure on a native Linux box (WSL2 verified), POSIX host pinning.
-- Multi-GPU expert-parallel tier (design draft, untracked until built).
+- Tensor/expert parallel execution within a layer (not provided by layer placement).
 - Shared replacements for the two temporary private quant paths (rows16 cache).
+
+### Resident decode experts
+
+The CUDA decode pipeline checks the owning device's expert cache before starting
+host expert loaders. If every routed expert and the shared expert are mirrored,
+it runs the fused MoE directly from those device weights. The cache mutex stays
+held until the synchronous backend returns, preventing refill/eviction of the
+selected buffers. Partial or incomplete residency and declined fusion use the
+existing loader/group fallback. Shared expert bindings use w1 (gate), w3 (up),
+and w2 (down).
+
+This adapts Naruto's resident expert-table execution approach
+(`core/model/deepseek_v4_moe.cc`, `DeviceRoutedExpertsInvocation`, revision
+6634772) to Colibri's existing CUDA mirrors. It does not import Naruto's TP2,
+EP2, SM121 kernels, or graph runtime. Cold loads and partial-hit tokens still
+use host expert storage; this is not full model preloading.
+
+Validation covers six-device cache ownership, full/partial/incomplete residency,
+locking through compute, backend-decline fallback, and CPU compilation. The subsequent
+[six-RTX-5090 test](experiments/dsv4-resident-2026-09-27.md) measured about 3.8%
+median decode improvement against an otherwise identical fused-path control.
+Its output matches that control, but differs from the original unfused baseline;
+this is not a claim of numerical equivalence or general model-quality validation.
+
+### Full routed-expert residency (automatic)
+
+With the CUDA build, the engine automatically loads every target routed expert
+onto its layer's owning device when the resident runtime tier and per-device
+VRAM budgets allow it. `DSV4_CUDA_RESIDENT_EXPERTS=auto` is the default; `0`
+keeps the LRU cache, and `1` requires full residency or rejects engine open.
+Insufficient VRAM or an unsupported tier in automatic mode retains the cache
+path and logs the reason. Other loading failures still reject engine open. The immutable table is indexed directly by layer
+and expert, following Naruto's prebuilt device expert-table approach. Target
+experts are never evicted; MTP experts retain their separate cache.
+
+The loader uploads dense mirrors first, checks every device's available VRAM
+against its complete expert footprint plus `DSV4_CUDA_RESIDENT_RESERVE_MB`
+(default 2800 MiB, minimum 256 MiB), then uploads experts. That reserve is
+separate from `DSV4_CUDA_VRAM_RESERVE_MB`, which sizes the decode mirror cache's
+bank-aware growth guard. The resident reserve overrides the LRU mirror capacity:
+the table has exactly one slot per assigned expert. A failed host lookup,
+unsupported tensor layout or upload aborts engine open and releases partial
+allocations; in `auto` those hard failures still reject the engine, while a
+budget refusal keeps the cache. Publication occurs only when all cards have
+completed loading. A resident execution failure is reported rather than
+silently loading experts on the CPU.
+
+Prefill currently uses the per-token GPU MoE pipeline with these same tables,
+not the CPU expert union or a duplicate streaming expert bank. This removes
+expert host reads after preload but does not implement batched resident MoE,
+TP/EP, device-only activations, or SM120 MMA kernels. Startup reads the complete
+expert set; cold-start latency and steady-state decode must be measured
+separately. Host expert-cache memory is still governed by the existing budget.
+
+On six RTX 5090 GPUs, a short 64-token test measured 6.155 token/s median
+(three runs) versus 2.149 with the option off (one run), with identical output.
+Preloading took about 73 seconds and increased total cold-process latency.
+See the [full report and raw results](experiments/dsv4-full-resident-2026-09-27.md)
+for the scope, startup cost, and remaining validation limits.
+
+On 24 GB cards the complete table can exceed the budget. Measured at the
+2026-11-03 head on two RTX 3090s (500/450 W), both the full 256-expert model and
+the 150B REAP checkpoint logged `resident-experts=cache-fallback` at
+`free≈16.6 GiB reserve=2800 MiB`; the gains there are kernel-side. REAP decoded
+1.22x one GPU and 1.54x two GPUs against dev one GPU; the full model 1.19x and
+~1.36x; long-prompt TTFT 0.89x. The exact head (`DSV4_CUDA_HEAD`) goes to the
+owning (last) device with room, then any other device, then the CPU.
+
+### Device-resident routing (default with full residency)
+
+For the supported 256-expert/top-6 profile, the resident table also owns a small
+borrowed-weight CUDA descriptor table per layer. Routing, ascending expert-ID
+ordering, descriptor selection and MoE now execute on one device stream: there
+is one activation upload and one result download, without copying top-k results
+back to the host. The existing BF16 rounding and expert accumulation order are
+preserved; no extra input quantization is introduced.
+
+`DSV4_CUDA_RESIDENT_ROUTE=0` selects the previous host-routed path. The default
+uses device routing when the complete table exists. An older Windows DLL can
+decline the optional new entry point and retain the original path. Explicit
+`DSV4_CUDA_BATCHED=0` and builds disabling BF16 routing retain their original
+execution paths. Attention, mHC, layer boundaries and the output head are not
+made device-only by this change.
+
+The [device-routing validation](experiments/dsv4-device-route-2026-09-27.md)
+covers exact kernel parity, six-device default selection, single-device budget
+fallback, and the remaining Attention bottleneck. Measured short-request decode
+remains around 6.1–6.2 token/s; the route-only comparison is too small to claim a
+stable throughput gain.
+
+### Native quantization and resident indexer projections
+
+The generic CUDA path uses native E4M3 conversion instead of searching 255
+codes per activation, and bit decoding for E2M1. Ties-to-even, positive zero
+from the old encoder, and the existing activation scaling remain unchanged.
+SM89+ uses hardware E4M3 decoding; older targets use the equivalent bit layout.
+Resident routing uses the existing warp Top-6 kernel, retaining the original
+expert-ID tie break and sequential normalization of the six selected weights.
+
+With batched CUDA attention enabled, indexer query weights now upload once
+during layer loading. These mirrors preserve the original rows8/row-major
+layout, float scales, and exact reference reduction order; they are not generic
+FP8 GEMM mirrors. They count toward dense residency before full expert budget
+checks and are released with their owning layer on the assigned device.
+`DSV4_CUDA_RESIDENT_INDEXER=0` retains per-call weight uploads. Missing optional
+DLL exports or unavailable mirrors retain that original fallback.
+
+These changes are default behavior for the applicable CUDA paths. They do not
+enable speculation, tensor parallelism, or a device-only Attention pipeline.
+See the [Naruto comparison and measurements](experiments/dsv4-naruto-gap-2026-09-28.md).

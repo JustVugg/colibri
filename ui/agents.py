@@ -3,8 +3,11 @@ pointed at colibri: the "Agenti" card in the UI's Settings. Standard library onl
 
 Windows agents are found on the user's own PATH, read from the registry through PowerShell
 (a process that WSL starts does not see a PATH the user changed later), and open in a cmd
-window; WSL agents open in a wsl.exe window. Each gets colibri through its own options and
-environment, never by rewriting the user's settings. The exception is pi, whose providers live
+window; WSL agents open in a wsl.exe window. The UI runs in WSL or on Windows itself (coli ui
+from a Windows prompt, the desktop window): there WSL's agents are found and opened through
+wsl.exe in its default distribution, whose home this process writes through the
+wsl.localhost share. Each gets colibri through its own options and environment, never by
+rewriting the user's settings. The exception is pi, whose providers live
 only in ~/.pi/agent/models.json: there the provider that points at colibri gets the server's
 model added (the file copied aside first, nothing else in it touched).
 
@@ -27,25 +30,36 @@ WIRED = {"pi", "codex", "claude", "opencode", "openclaw", "hermes"}   # the ones
 MODEL_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,128}$")
 KEY_RE = re.compile(r"^[A-Za-z0-9._-]{0,200}$")
 WINDIR_RE = re.compile(r"^[A-Za-z]:\\[^\"%&|<>^!\r\n]*$")   # nothing cmd would read as syntax
+ON_WIN = os.name == "nt"   # the UI on Windows itself: WSL only through wsl.exe
 _cache = {"t": 0.0, "v": None}
 _lock = threading.Lock()
 _last_launch = [0.0]
 
 
+def _cwd():
+    return None if ON_WIN else ("/mnt/c" if os.path.isdir("/mnt/c") else None)
+
+
 def _run(cmd, timeout=20):
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd="/mnt/c" if os.path.isdir("/mnt/c") else None)
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
+                           cwd=_cwd(), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         return r.stdout
     except (OSError, subprocess.SubprocessError):
         return ""
 
 
 def _wslpath(p, to_unix=True):
+    """a Windows path as this process opens it, or (to_unix=False) the other way; on Windows
+    itself both are the path"""
+    if ON_WIN:
+        return p or None
     out = _run(["wslpath", "-u" if to_unix else "-w", p], 10).strip()
     return out or None
 
 
 _PS = r"""
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
 $m = [Environment]::GetEnvironmentVariable('Path','Machine'); $u = [Environment]::GetEnvironmentVariable('Path','User')
 $env:Path = "$m;$u"
 $r = @{}
@@ -66,17 +80,49 @@ def _detect_windows():
         return None
 
 
+# an interactive login shell: the user's PATH as a terminal has it (nvm, ~/.local/bin), and an
+# alias where an installer left one (claude's ~/.claude/local)
+# (no double quotes: on Windows it is one argument of wsl.exe's command line)
+_WSL_FIND = ("for a in pi codex claude opencode openclaw hermes; do p=$(type -P $a) || "
+             "{ p=${BASH_ALIASES[$a]}; p=${p%% *}; p=${p/#\\~/$HOME}; test -x ${p:-/nonexistent} || p=; }; "
+             "test ${#p} -gt 0 && echo COLI_AGENT $a=$p; done; "
+             "echo COLI_HOME=$HOME; echo COLI_DISTRO=$WSL_DISTRO_NAME; echo COLI_SHARE=$(wslpath -w /)")
+
+
+def _wsl_host(wsl, p):
+    """WSL's path p as this process opens it: itself in WSL, under the distribution's share on Windows"""
+    if not ON_WIN:
+        return p
+    share = wsl.get("share")
+    return os.path.join(share, *p.strip("/").split("/")) if share and p.startswith("/") else None
+
+
 def _detect_wsl():
-    if not os.environ.get("WSL_DISTRO_NAME") and not os.path.exists("/proc/sys/fs/binfmt_misc/WSLInterop"):
-        return {}
-    # an interactive login shell: the user's PATH as a terminal has it (nvm, ~/.local/bin)
-    out = _run(["bash", "-lic", "for a in pi codex claude opencode openclaw hermes; do p=$(command -v $a) && echo \"COLI_AGENT $a=$p\"; done"], 30)
-    found = {}
+    """({agent: its path in WSL}, {distro, home, share}); ({}, {}) where there is no WSL"""
+    if ON_WIN:
+        if not shutil.which("wsl.exe"):
+            return {}, {}
+        out = _run(["wsl.exe", "-e", "bash", "-lic", _WSL_FIND], 30)
+    elif os.environ.get("WSL_DISTRO_NAME") or os.path.exists("/proc/sys/fs/binfmt_misc/WSLInterop"):
+        out = _run(["bash", "-lic", _WSL_FIND], 30)
+    else:
+        return {}, {}
+    meta, raw = {}, {}
     for line in out.splitlines():
-        m = re.match(r"^COLI_AGENT (\w+)=(/\S+)$", line.strip())
-        if m and os.path.isfile(m.group(2)):
-            found[m.group(1)] = m.group(2)
-    return found
+        line = line.strip()
+        m = re.match(r"^COLI_(HOME|DISTRO|SHARE)=(.*)$", line)
+        if m:
+            meta[m.group(1).lower()] = m.group(2).strip()
+            continue
+        m = re.match(r"^COLI_AGENT (\w+)=(.+)$", line)
+        if m:
+            raw[m.group(1)] = m.group(2)
+    if not ON_WIN:
+        meta["distro"] = os.environ.get("WSL_DISTRO_NAME") or meta.get("distro") or ""
+        meta["home"] = os.path.expanduser("~")
+    # bash found an executable (the share does not follow WSL's links: Windows trusts it)
+    found = {a: p for a, p in raw.items() if re.match(r"^/\S+$", p) and (ON_WIN or os.path.isfile(p))}
+    return found, meta
 
 
 def detect(force=False):
@@ -85,7 +131,7 @@ def detect(force=False):
         if not force and _cache["v"] and time.time() - _cache["t"] < 30:
             return _cache["v"]
         win = _detect_windows() or {}
-        wsl = _detect_wsl()
+        wsl, wmeta = _detect_wsl()
         res = []
         for a in AGENTS:
             wp = (win.get("found") or {}).get(a["id"])
@@ -93,7 +139,8 @@ def detect(force=False):
             where, path = ("windows", wp) if wp else ("wsl", lp) if lp else (None, None)
             res.append({**a, "installed": bool(path), "where": where, "path": path, "wired": a["id"] in WIRED,
                         "both": bool(wp and lp)})
-        _cache.update(t=time.time(), v={"agents": res, "win": {k: win.get(k) for k in ("path", "home", "temp")}})
+        _cache.update(t=time.time(), v={"agents": res, "win": {k: win.get(k) for k in ("path", "home", "temp")},
+                                        "wsl": {k: wmeta.get(k) for k in ("distro", "home", "share")}})
         return _cache["v"]
 
 
@@ -123,7 +170,10 @@ def _pi_provider(models_json, base_v1, model, ctx, key):
     name = next((n for n, p in provs.items() if isinstance(p, dict) and str(p.get("baseUrl", "")).rstrip("/") == base_v1), None)
     changed = False
     if name is None:
-        name = "colibri" if "colibri" not in provs else "colibri-ui"
+        name, suffix = "colibri", 0
+        while name in provs:
+            suffix += 1
+            name = "colibri-ui" if suffix == 1 else "colibri-ui-%d" % suffix
         provs[name] = {"baseUrl": base_v1, "api": "openai-completions", "apiKey": key or "colibri", "models": []}
         changed = True
     ms = provs[name].setdefault("models", [])
@@ -225,36 +275,50 @@ def launch(agent, model, folder, key, backend, ui):
     ctx = models[model]
     if not isinstance(folder, str) or not WINDIR_RE.match(folder):
         return False, "cartella non valida (un percorso Windows, es. C:\\Users\\nome\\progetto)"
-    ufolder = _wslpath(folder)
-    if not ufolder or not os.path.isdir(ufolder):
+    hfolder = _wslpath(folder)   # as this process opens it
+    if not hfolder or not os.path.isdir(hfolder):
         return False, "la cartella %s non esiste" % folder
+    wsl = info.get("wsl") or {}
+    ufolder = None
+    if a["where"] == "wsl":   # as WSL has it
+        ufolder = _wsl_path_of(wsl, folder) if ON_WIN else hfolder
+        if not ufolder:
+            return False, "WSL non trova la cartella %s" % folder
+        url = ui if agent == "codex" else backend   # the one the agent talks to (_plan)
+        if ON_WIN and not _wsl_reaches(wsl, url):
+            return False, ("%s è in WSL, ma da WSL %s non si raggiunge: colibri gira su Windows e WSL non vede "
+                           "il suo 127.0.0.1. Con networkingMode=mirrored in %%USERPROFILE%%\\.wslconfig "
+                           "(poi wsl --shutdown) WSL lo vede" % (a["name"], url))
     env, argv = _plan(agent, a["where"], model, ctx, key, backend, ui)
+    # the agent's home: as the agent has it, and as this process writes its files
+    if a["where"] == "windows":
+        home_a = info["win"].get("home")
+        home_h = _wslpath(home_a or "")
+    else:
+        home_a = wsl.get("home") or (None if ON_WIN else os.path.expanduser("~"))
+        home_h = _wsl_host(wsl, home_a) if home_a else None
+    if agent in ("pi", "openclaw", "hermes") and not (home_a and home_h):
+        return False, "non trovo la cartella home"
     if agent == "pi":
-        home = info["win"].get("home") if a["where"] == "windows" else os.path.expanduser("~")
-        mj = os.path.join(_wslpath(home) if a["where"] == "windows" else home, ".pi", "agent", "models.json")
+        mj = os.path.join(home_h, ".pi", "agent", "models.json")
         prov = _pi_provider(mj, backend.rstrip("/") + "/v1", model, ctx, key)
         argv = ["--provider", prov, "--model", model]
     elif agent in ("openclaw", "hermes"):
-        if a["where"] == "windows":
-            home_u = _wslpath(info["win"].get("home") or "")
-        else:
-            home_u = os.path.expanduser("~")
-        if not home_u:
-            return False, "non trovo la cartella home"
         base_v1 = backend.rstrip("/") + "/v1"
         if agent == "openclaw":
-            _openclaw_profile(home_u, base_v1, model, ctx, key)
+            _openclaw_profile(home_h, base_v1, model, ctx, key)
             env, argv = {"DO_NOT_TRACK": "1"}, ["--profile", "colibri", "chat"]
         else:
-            d = _hermes_home(home_u, base_v1, model, ctx, key)
-            env = {"HERMES_HOME": d if a["where"] == "wsl" else (_wslpath(d, to_unix=False) or d)}
+            d = _hermes_home(home_h, base_v1, model, ctx, key)
+            env = {"HERMES_HOME": home_a.rstrip("/") + "/.colibri/agents/hermes" if a["where"] == "wsl"
+                   else (_wslpath(d, to_unix=False) or d)}
             argv = []
     title = "colibri - " + a["name"]
     banner = "colibri: %s con %s su %s" % (a["name"], model, backend)
     if a["where"] == "windows":
         ok, msg = _open_windows(agent, a["path"], argv, env, folder, title, banner, info["win"])
     else:
-        ok, msg = _open_wsl(agent, a["path"], argv, env, ufolder, title, banner, info["win"])
+        ok, msg = _open_wsl(agent, a["path"], argv, env, ufolder, title, banner, info["win"], wsl)
     if ok:
         _last_launch[0] = time.time()
     return ok, msg
@@ -285,7 +349,7 @@ def _start(win, agent, title, command):
     if not re.match(r"^[A-Za-z]:\\[A-Za-z0-9\\._-]+$", w):
         return False, "la cartella temporanea di Windows ha caratteri che non so passare a cmd.exe"
     try:
-        subprocess.Popen(["cmd.exe", "/c", w], cwd="/mnt/c", stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        subprocess.Popen(["cmd.exe", "/c", w], cwd=_cwd(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, start_new_session=True)
     except OSError as e:
         return False, "non riesco ad aprire la finestra: %s" % e
@@ -314,21 +378,47 @@ def _sq(s):
     return "'" + s.replace("'", "'\\''") + "'"
 
 
-def _open_wsl(agent, path, argv, env, ufolder, title, banner, win):
-    d = os.path.join(os.path.expanduser("~"), ".cache", "colibri-agents")
-    os.makedirs(d, mode=0o700, exist_ok=True)
+def _wsl_cmd(wsl):
+    d = wsl.get("distro")
+    return ["wsl.exe"] + (["-d", d] if d else [])
+
+
+def _wsl_path_of(wsl, winpath):
+    """a Windows path as WSL has it (wslpath in the distribution), or None"""
+    out = _run(_wsl_cmd(wsl) + ["-e", "wslpath", "-u", winpath], 15).strip()
+    return out if out.startswith("/") else None
+
+
+def _wsl_reaches(wsl, url):
+    """WSL reaches url's port on 127.0.0.1 (from Windows only with WSL's mirrored network)"""
+    m = re.match(r"^https?://(?:127\.0\.0\.1|localhost)(?::(\d+))?(?:/|$)", url)
+    if not m:
+        return True
+    port = m.group(1) or ("443" if url.startswith("https") else "80")
+    return "ok" in _run(_wsl_cmd(wsl) + ["-e", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/%s && echo ok" % port], 15)
+
+
+def _open_wsl(agent, path, argv, env, ufolder, title, banner, win, wsl):
+    home = wsl.get("home") if ON_WIN else os.path.expanduser("~")
+    script = (home or "").rstrip("/") + "/.cache/colibri-agents/" + agent + ".sh"   # as WSL has it
+    hscript = _wsl_host(wsl, script) if home else None
+    if not hscript:
+        return False, "non trovo la cartella home di WSL"
+    os.makedirs(os.path.dirname(hscript), mode=0o700, exist_ok=True)
     lines = ["#!/bin/bash", "printf '\\033]0;%s\\007' " + _sq(title),
              "export PATH=%s:\"$PATH\"" % _sq(os.path.dirname(path))]
     for k, v in env.items():
         lines.append("export %s=%s" % (k, _sq(v)))
     lines += ["cd %s || exit 1" % _sq(ufolder), "echo " + _sq(banner),
               " ".join([_sq(path)] + [_sq(x) for x in argv]), "exec bash -l"]
-    script = os.path.join(d, agent + ".sh")
-    with open(script, "w", encoding="utf-8") as f:
+    with open(hscript, "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(lines) + "\n")
-    os.chmod(script, 0o700)
-    distro = os.environ.get("WSL_DISTRO_NAME") or "Ubuntu"
-    if not re.match(r"^[A-Za-z0-9._-]+$", distro) or not re.match(r"^[A-Za-z0-9/._-]+$", script):
+    if ON_WIN:   # written through the share: the mode as WSL has it
+        _run(_wsl_cmd(wsl) + ["-e", "chmod", "700", os.path.dirname(script), script], 15)
+    else:
+        os.chmod(script, 0o700)
+    distro = wsl.get("distro") or os.environ.get("WSL_DISTRO_NAME") or ("" if ON_WIN else "Ubuntu")
+    if not re.match(r"^[A-Za-z0-9._-]*$", distro) or not re.match(r"^[A-Za-z0-9/._-]+$", script):
         return False, "il nome della distribuzione WSL o la cartella home hanno caratteri che non so passare a cmd.exe"
-    ok, err = _start(win, agent, title, "wsl.exe -d %s -- bash -l %s" % (distro, script))
+    ok, err = _start(win, agent, title, "wsl.exe %s-- bash -l %s" % ("-d %s " % distro if distro else "", script))
     return (True, "aperto in una nuova finestra (WSL)") if ok else (False, err)

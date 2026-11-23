@@ -109,7 +109,7 @@ DECIDE <id> <slot> <bytes>\n<payload>\n
   saved pins; the next request recomputes from a clean state. A control
   received after the complete prefill retains that valid prefix. Response time
   depends on one full prompt-layer (or one chunk) of work, not a fixed
-  millisecond bound. Image turns, prompt logprobs, layer dumps, qpack and
+  millisecond bound. Image turns, prompt logprobs, layer dumps, qpack, the Metal graph and
   `KV_SLOTS>1` retain their existing whole-prefill handling. The gateway logs
   a client that leaves mid-turn (reading the prompt or generating) and the
   moment the engine frees the slot.
@@ -189,8 +189,6 @@ All telemetry is advisory: servers render what they know and skip the rest.
   `"colibri"` field.
 - `GET /experts` — the latest `EMAP`/`HITS` state: `{rows, cols, map, hits, seq,
   gpus, entropy, repin}`.
-- `GET /*` — static hosting of `web/dist` (SPA fallback, path-traversal-safe), plus
-  `experts.json` if published there (the measured expert atlas, #175/#218).
 
 ## Legacy protocol (`run_serve`, `coli chat`)
 

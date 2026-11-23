@@ -48,7 +48,9 @@ FAILS = []
 SANITIZE = False   # --sanitize: every run's stderr is checked for an ASan or UBSan report
 REQUIRE_KV_SPLIT = False
 SAN_RE = re.compile(rb"ERROR: AddressSanitizer|runtime error:")
-BASE_ENV = {"OMP_NUM_THREADS": "2", "COLI_NO_OMP_TUNE": "1", "COLI_CUDA": "0", "Q38_TRUNK_GPU": "0",
+# SEED: both arms of a comparison sample the same draws (#2949: an unset SEED seeds the sampler
+# from the clock and the pid)
+BASE_ENV = {"SEED": os.environ.get("SEED", "1"), "OMP_NUM_THREADS": "2", "COLI_NO_OMP_TUNE": "1", "COLI_CUDA": "0", "Q38_TRUNK_GPU": "0",
             "NOSTREAM": "1", "USAGE_SAVE": "0",
             # plain decoding is the reference, and both draft sources are on by default since
             # 1.13.0: every run starts from them off, and a case turns on what it checks
@@ -138,7 +140,8 @@ def expected(n_new, depth, mode, row=0, room_cap=MAX_ROWS - 1):
 
 
 def engine_tokens(stdout):
-    m = re.search(rb"^C engine :([^\n]*?)(?:Text|$)", stdout, re.M)
+    # ids only: with a tokenizer the decoded text is on its own "Text      :" line
+    m = re.search(rb"^C engine :([0-9 ]*)\r?$", stdout, re.M)
     return [int(t) for t in m.group(1).split()] if m else None
 
 

@@ -41,7 +41,7 @@ class GqDot(unittest.TestCase):
                 with self.subTest(type=name, O=O, I=I, S=S):
                     rng = np.random.default_rng(O * 1000 + S)
                     raw = make_blocks(name, O * I // blck, rng)
-                    if name == "MXFP4":   # block exponents of real magnitudes, not 2^127
+                    if name in ("MXFP4", "MXFP8"):   # block exponents of real magnitudes, not 2^127 (a float overflows)
                         raw[:, 0] = rng.integers(110, 140, raw.shape[0], dtype=np.uint8)
                     x = rng.standard_normal((S, I)).astype(np.float32)
                     x[:, :3] *= 20   # a few large activations, as real hidden states have

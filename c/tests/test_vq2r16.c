@@ -10,7 +10,9 @@
 #include <string.h>
 #include <time.h>
 #include <math.h>
+#ifdef _OPENMP
 #include <omp.h>
+#endif
 #include "../vq2_g32.h"
 
 #ifndef VQ2R16_ON

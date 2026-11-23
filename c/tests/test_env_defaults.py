@@ -59,7 +59,13 @@ class EnvDefaultsTest(unittest.TestCase):
         self.assertEqual(e["PIPE"], "1")
         self.assertEqual(e["PILOT_REAL"], "1")
         self.assertEqual(e["OMP_WAIT_POLICY"], "active")
+        self.assertEqual(e["KMP_BLOCKTIME"], "200")  # libomp (clang): no endless idle spin
         self.assertNotIn("OMP_PROC_BIND", e)  # MinGW libgomp: niente affinity
+
+    def test_passive_keeps_libomp_blocktime_zero(self):
+        # libomp gives passive its blocktime 0 only while KMP_BLOCKTIME is unset
+        e = self.env_for_with({"OMP_WAIT_POLICY": "passive"}, "win32")
+        self.assertNotIn("KMP_BLOCKTIME", e)
 
     def test_explicit_override_wins(self):
         e = self.env_for_with({"DIRECT": "0", "PIPE": "0"}, "win32")
@@ -70,13 +76,14 @@ class EnvDefaultsTest(unittest.TestCase):
     def test_kill_switch_scope_is_omp_only(self):
         e = self.env_for_with({"COLI_NO_OMP_TUNE": "1"}, "win32")
         self.assertNotIn("OMP_WAIT_POLICY", e)
+        self.assertNotIn("KMP_BLOCKTIME", e)
         self.assertNotIn("OMP_NUM_THREADS", e)
         self.assertEqual(e["DIRECT"], "1")   # i default I/O restano attivi
         self.assertEqual(e["PIPE"], "1")
 
     def test_non_windows_untouched(self):
         e = self.env_for_with({}, "linux")
-        for k in ("DIRECT", "PIPE", "PILOT_REAL", "OMP_WAIT_POLICY"):
+        for k in ("DIRECT", "PIPE", "PILOT_REAL", "OMP_WAIT_POLICY", "KMP_BLOCKTIME"):
             self.assertNotIn(k, e)
 
 
@@ -297,6 +304,31 @@ class CudaAutoEnableTest(unittest.TestCase):
         self.assertNotIn("CUDA_EXPERT_GB", e)
 
 
+class CudaDeviceOrderTest(unittest.TestCase):
+    """#2887: --gpu and the setup name nvidia-smi's indices (the PCI bus order); the CUDA runtime counts
+    the fastest device first unless CUDA_DEVICE_ORDER says otherwise, so on two V100s beside a Quadro
+    P2000 --gpu 1,2 opened a V100 and the P2000. Every engine's environment asks for the bus order."""
+
+    def test_the_bus_order_unless_the_user_set_one(self):
+        self.assertEqual(coli.cuda_device_order({})["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
+        self.assertEqual(coli.cuda_device_order({"CUDA_DEVICE_ORDER": "FASTEST_FIRST"})["CUDA_DEVICE_ORDER"],
+                         "FASTEST_FIRST")
+
+    def test_glm_engine_environment(self):
+        e = CudaAutoEnableTest()._env_for("win32", cuda=True, gpus=[
+            {"index": 1, "name": "Tesla V100-SXM2-16GB", "total_bytes": 16 << 30, "free_bytes": 15 << 30},
+            {"index": 2, "name": "Tesla V100-SXM2-16GB", "total_bytes": 16 << 30, "free_bytes": 15 << 30}])
+        self.assertEqual(e["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
+        self.assertEqual(e["COLI_GPUS"], "1,2")
+
+    def test_sibling_engine_environment(self):
+        a = args(cluster_workers=None, cluster_coordinator=None)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(coli.env_for_engine(a, "glm53")["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
+        with mock.patch.dict(os.environ, {"CUDA_DEVICE_ORDER": "FASTEST_FIRST"}, clear=True):
+            self.assertEqual(coli.env_for_engine(a, "glm53")["CUDA_DEVICE_ORDER"], "FASTEST_FIRST")
+
+
 class Dsv4CudaDetectTest(unittest.TestCase):
     """dsv4_cuda_available: the Windows check is a DLL next to the engine, but
     Linux links the tier straight into the binary (nvcc, -lcudart), so the DLL
@@ -322,9 +354,10 @@ class Dsv4CudaDetectTest(unittest.TestCase):
         out = "\tlibcudart.so.12 => /opt/cuda/lib64/libcudart.so.12 (0x00007f)\n"
         self.assertTrue(self._detect("linux", ldd_stdout=out))
 
-    def test_linux_hip_link_is_not_dsv4_cuda(self):
+    def test_linux_hip_link_is_dsv4_cuda(self):
+        # The native V4 tier is a HIP build too (libamdhip64).
         out = "\tlibamdhip64.so.6 => /opt/rocm/lib/libamdhip64.so.6 (0x00007f)\n"
-        self.assertFalse(self._detect("linux", ldd_stdout=out))
+        self.assertTrue(self._detect("linux", ldd_stdout=out))
 
     def test_linux_cpu_build_rejected(self):
         out = "\tlibc.so.6 => /usr/lib/libc.so.6 (0x00007f)\n"

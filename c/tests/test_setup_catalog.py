@@ -66,13 +66,21 @@ class Recommendation(unittest.TestCase):
         fits = [r["fits"] for r in rows]
         self.assertEqual(fits, sorted(fits, reverse=True))
 
-    def test_small_ram_takes_the_smaller_model(self):
+    def test_small_ram_takes_the_model_that_streams_the_least(self):
+        """9 GB: every model streams experts from the disk; the 2-bit Inkling-2-Mini's 7 GB of
+        experts miss the cache the least, so it decodes fastest"""
         rows = setup_catalog.recommend(9 * GB, 200 * GB)
-        self.assertEqual(recommended(rows), "qwen3-coder-30b")
+        self.assertEqual(recommended(rows), "inkling2-mini-iq2")
+        self.assertEqual(rows[0]["est"]["tier"], "ssd")
 
-    def test_tight_ram_prefers_the_most_capable_small_model_that_runs(self):
+    def test_a_model_from_ram_beats_a_more_capable_one_that_streams(self):
+        """16 GB: Qwen3.6 fits only with a small expert cache (tight), the rest from the disk;
+        the 2-bit Inkling-2-Mini runs from RAM at more than twice its speed"""
         rows = setup_catalog.recommend(16 * GB, 200 * GB)
-        self.assertEqual(recommended(rows), "qwen36-35b")
+        self.assertEqual(recommended(rows), "inkling2-mini-iq2")
+        est = {r["entry"].id: r.get("est") for r in rows}
+        self.assertEqual(est["inkling2-mini-iq2"]["tier"], "ram")
+        self.assertEqual(est["qwen36-35b"]["tier"], "ssd")
         self.assertEqual({r["entry"].id: r["status"] for r in rows}["qwen36-35b"], "tight")
 
     def test_nothing_fits(self):
@@ -87,17 +95,23 @@ class Recommendation(unittest.TestCase):
         status = {r["entry"].id: r["status"] for r in rows}
         self.assertEqual(status["qwen36-35b"], "needs-disk")
         self.assertEqual(status["glm-5.2"], "needs-disk")
-        self.assertEqual(recommended(rows), "qwen3-coder-30b")
+        # one the disk holds: the small ones, worth about the same on this CPU
+        self.assertIn(recommended(rows), ("qwen3-coder-30b", "inkling2-mini-iq2", "inkling2-mini"))
+        self.assertEqual(status[recommended(rows)], "good")
 
     def test_a_partial_download_counts_toward_the_disk(self):
         rows = setup_catalog.recommend(64 * GB, 10 * GB, downloaded={"qwen36-35b": 20 * GB})
         self.assertEqual({r["entry"].id: r["status"] for r in rows}["qwen36-35b"], "good")
 
-    def test_large_models_are_the_default_only_when_no_small_one_fits(self):
+    def test_where_nothing_is_usable_the_fastest_is_the_default(self):
+        """27 GB and only the models that stream from the disk: none reaches USABLE, so the
+        fastest (the one whose experts miss the cache least) is the default"""
         with mock.patch.object(setup_catalog, "CATALOG",
                                tuple(e for e in setup_catalog.CATALOG if e.size_class == "large")):
             rows = setup_catalog.recommend(27 * GB, 800 * GB)
-        self.assertEqual(recommended(rows), "deepseek-v4-flash-reap")   # smallest download
+        speeds = {r["entry"].id: r["est"]["tok_s"] for r in rows if r.get("est")}
+        self.assertEqual(recommended(rows), max(speeds, key=speeds.get))
+        self.assertEqual(recommended(rows), "qwen38-flash-next-iq2xs")
 
     def test_the_image_model_is_offered_never_the_default(self):
         with mock.patch.object(setup_catalog, "CATALOG",
@@ -124,6 +138,8 @@ class Recommendation(unittest.TestCase):
         json.dumps(data)
         self.assertEqual(sum(1 for d in data if d["recommended"]), 1)
         self.assertEqual(data[0]["runs"], "from RAM")
+        self.assertEqual(data[0]["estimate"]["backend"], "cpu")
+        self.assertGreater(data[0]["estimate"]["tok_s"], 0)
 
 
 class ExtraCatalog(unittest.TestCase):

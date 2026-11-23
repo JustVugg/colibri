@@ -15,9 +15,13 @@ This asserts the shape of the recipe rather than running a compiler, so it
 works on hosts without CUDA installed.
 """
 import shutil
+import sys
 import subprocess
 import unittest
 from pathlib import Path
+
+# GNU make: the BSDs' own make cannot read this Makefile, and they install GNU make as gmake.
+MAKE = shutil.which("gmake" if sys.platform.startswith(("freebsd", "openbsd", "netbsd", "dragonfly")) else "make")
 
 HERE = Path(__file__).resolve().parent.parent
 CUDA_MARKERS = ("-DCOLI_CUDA", "-lcudart")
@@ -30,7 +34,7 @@ def recipe(target, *variables):
     "is up to date" and no recipe at all, so the assertions below would pass
     vacuously on any tree where someone had run make first.
     """
-    result = subprocess.run(["make", "-Bn", target, *variables],
+    result = subprocess.run([MAKE, "-Bn", target, *variables],
                             cwd=HERE, text=True, capture_output=True,
                             check=False, timeout=120)
     return result.stdout + result.stderr
@@ -49,8 +53,8 @@ def cuda_flag_is_accepted():
     return "-DCOLI_CUDA" in recipe("colibri", "CUDA=1")
 
 
-@unittest.skipUnless(shutil.which("make"), "make is not installed")
-@unittest.skipUnless(shutil.which("make") and cuda_flag_is_accepted(),
+@unittest.skipUnless(MAKE, "make is not installed")
+@unittest.skipUnless(MAKE and cuda_flag_is_accepted(),
                      "this toolchain rejects CUDA=1 before any recipe is emitted")
 class MakefileCudaScopeTest(unittest.TestCase):
     def test_olmoe_now_gets_cuda(self):

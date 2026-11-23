@@ -7,8 +7,10 @@ purpose: every character is prompt the engine has to read.
 
 A page is opened only at a public address (no loopback, private, link-local or reserved one,
 redirects checked the same way), so a page the model asks for cannot reach this machine's own
-services or its network."""
+services or its network. The address checked is the one connected to: a name that answers a
+public address to the check and this machine to the connection (DNS rebinding) is refused."""
 import html
+import http.client
 import ipaddress
 import json
 import re
@@ -44,7 +46,7 @@ def _searx(q, n):
     out, seen = [], set()
     for x in data.get("results") or []:
         u = x.get("url")
-        if not u or u in seen:
+        if not isinstance(u, str) or not u.startswith(("http://", "https://")) or u in seen:   # as _duckduckgo's
             continue
         seen.add(u)
         out.append({"title": _clean(x.get("title"), 160), "url": u, "snippet": _clean(x.get("content"), 320),
@@ -56,7 +58,8 @@ def _searx(q, n):
 
 
 class _DDG(HTMLParser):
-    """result__a links (title, href) and result__snippet texts of DuckDuckGo's HTML page"""
+    """the result links (title, href) and snippets of DuckDuckGo's HTML page (result__a,
+    result__snippet) and of its lite page (result-link, result-snippet)"""
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.rows, self.cur, self.mode = [], None, None
@@ -64,11 +67,11 @@ class _DDG(HTMLParser):
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
         cls = a.get("class") or ""
-        if tag == "a" and "result__a" in cls.split():
+        if tag == "a" and ("result__a" in cls.split() or "result-link" in cls.split()):
             self.cur = {"title": "", "url": a.get("href") or "", "snippet": ""}
             self.rows.append(self.cur)
             self.mode = "title"
-        elif "result__snippet" in cls.split() and self.cur is not None:
+        elif ("result__snippet" in cls.split() or "result-snippet" in cls.split()) and self.cur is not None:
             self.mode = "snippet"
 
     def handle_endtag(self, tag):
@@ -90,16 +93,37 @@ def _ddg_url(u):
     return u
 
 
-def _duckduckgo(q, n):
+# DuckDuckGo's two plain pages, the second where the first answers with its bot check: from some
+# addresses html.duckduckgo.com returns 202 and a challenge page ("anomaly", "Unfortunately, bots
+# use DuckDuckGo too") instead of results, which read as no results at all while lite answered
+_DDG_PAGES = ("https://html.duckduckgo.com/html/", "https://lite.duckduckgo.com/lite/")
+
+
+def _ddg_page(url, q):
+    """the rows of one DuckDuckGo page, None when it answered with its bot check"""
     body = urllib.parse.urlencode({"q": q}).encode()
-    req = urllib.request.Request("https://html.duckduckgo.com/html/", data=body,
-                                 headers={"User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded"})
+    req = urllib.request.Request(url, data=body, headers={"User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded"})
     with urllib.request.urlopen(req, timeout=15) as r:
+        status = r.status
         page = r.read(2 << 20).decode("utf-8", errors="replace")
+    if status == 202 or "anomaly-modal" in page or "Unfortunately, bots use DuckDuckGo too" in page:
+        return None
     p = _DDG()
     p.feed(page)
+    return p.rows
+
+
+def _duckduckgo(q, n):
+    rows = None
+    for url in _DDG_PAGES:
+        rows = _ddg_page(url, q)
+        if rows:
+            break
+    if rows is None:
+        raise RuntimeError("DuckDuckGo answered with its bot check instead of results; give the chat a "
+                           "SearXNG instance (COLIBRI_SEARX=URL, or coli ui --searx URL)")
     out, seen = [], set()
-    for row in p.rows:
+    for row in rows:
         u = _ddg_url(row["url"])
         if not u.startswith(("http://", "https://")) or u in seen:
             continue
@@ -123,16 +147,58 @@ def search(q, n=6):
     return {"q": q, "results": results, "answers": answers}
 
 
+def _public_addresses(host, port):
+    """host's addresses, every one of them public"""
+    infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0].split("%")[0])
+        if not ip.is_global:
+            raise ValueError("not a public address: %s" % host)
+    return infos
+
+
 def _public_url(url):
     """http(s) to a public address only"""
     u = urllib.parse.urlsplit(url)
     if u.scheme not in ("http", "https") or not u.hostname:
         raise ValueError("http and https links only")
-    for info in socket.getaddrinfo(u.hostname, u.port or (443 if u.scheme == "https" else 80)):
-        ip = ipaddress.ip_address(info[4][0].split("%")[0])
-        if not ip.is_global:
-            raise ValueError("not a public address: %s" % u.hostname)
+    _public_addresses(u.hostname, u.port or (443 if u.scheme == "https" else 80))
     return url
+
+
+def _connect_public(address, *args, **kw):
+    """socket.create_connection to an address of the same lookup that checked it: resolving the
+    name again to connect would let it answer this machine the second time"""
+    host, port = address
+    error = OSError("no address for %s" % host)
+    for *_, addr in _public_addresses(host, port):
+        try:
+            return socket.create_connection((addr[0], addr[1]), *args, **kw)
+        except OSError as e:
+            error = e
+    raise error
+
+
+class _PublicHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, *args, **kw):
+        super().__init__(*args, **kw)
+        self._create_connection = _connect_public
+
+
+class _PublicHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, *args, **kw):   # the handshake still checks the certificate against the name
+        super().__init__(*args, **kw)
+        self._create_connection = _connect_public
+
+
+class _PublicHTTPHandler(urllib.request.HTTPHandler):
+    def do_open(self, http_class, req, **kw):   # through a proxy, the proxy resolves the name
+        return super().do_open(http_class if req.has_proxy() else _PublicHTTPConnection, req, **kw)
+
+
+class _PublicHTTPSHandler(urllib.request.HTTPSHandler):
+    def do_open(self, http_class, req, **kw):   # a CONNECT tunnel: the proxy resolves the name
+        return super().do_open(http_class if req._tunnel_host else _PublicHTTPSConnection, req, **kw)
 
 
 class _CheckedRedirect(urllib.request.HTTPRedirectHandler):
@@ -213,7 +279,7 @@ def page(url, max_chars=5000):
     whole body, scripts and navigation dropped, cut to max_chars."""
     _public_url(url)
     max_chars = max(200, min(int(max_chars), 20000))
-    opener = urllib.request.build_opener(_CheckedRedirect)
+    opener = urllib.request.build_opener(_CheckedRedirect, _PublicHTTPHandler, _PublicHTTPSHandler)
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "text/html,text/plain;q=0.9"})
     with opener.open(req, timeout=10) as r:
         ctype = r.headers.get("Content-Type", "")

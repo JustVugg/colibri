@@ -182,6 +182,7 @@ class GGMLTypeTableTest(unittest.TestCase):
             gguf_reader.GGML_TYPE_NVFP4: (64, 36),
             gguf_reader.GGML_TYPE_Q1_0: (128, 18),
             gguf_reader.GGML_TYPE_Q2_0: (64, 18),
+            gguf_reader.GGML_TYPE_MXFP8: (32, 33),
         }
 
     def test_block_table_matches_verified_values(self):

@@ -29,6 +29,9 @@ CUDA build, so this pins its side at source level:
   note_union and the Vulkan tier's note_routed; touch_union counts nothing, and
   neither leases, reads, inserts, evicts, repacks nor touches the hit/miss
   counters;
+- a routing VRAM-first decode serves from a mirror (note_vram) keeps only the
+  HITS and heat, through the code hot_count_locked uses (hot_heat_locked), and
+  the history: nothing that ranks or paces the RAM pins;
 - touch_union, note_union and lookup_uncounted exist in every build, not only
   Vulkan ones;
 - the CPU union still issues its lookups in ascending order, the order
@@ -165,6 +168,45 @@ class V4MoeBatchBooksSourceTest(unittest.TestCase):
             self.text, "void coli_v4_expert_store_note_routed(")
         find(routed, "hot_count_locked(policy, state, key);",
              where="coli_v4_expert_store_note_routed")
+
+    def test_vram_first_keeps_heat_and_history_only(self):
+        heat = function_body(self.text, "static void hot_heat_locked(")
+        for books in ("state->ehit[index] = 1;", "state->eheat[index]++;"):
+            find(heat, books, where="hot_heat_locked")
+        counter = function_body(self.text, "static void hot_count_locked(")
+        find(counter, "hot_heat_locked(state, index);", where="hot_count_locked")
+        where = "coli_v4_expert_store_note_vram"
+        note = function_body(self.text, "void coli_v4_expert_store_note_vram(")
+        find(note, "hot_heat_locked(state, ", where=where)
+        find(note, "rt_count(layer, experts, count);", where=where)
+        # One copy of the HITS and heat rule, and none of the books that rank
+        # or pace the RAM pins.
+        for books, body, name in (("ehit[", counter, "hot_count_locked"),
+                                  ("eheat[", counter, "hot_count_locked"),
+                                  ("ehit[", note, where),
+                                  ("eheat[", note, where)):
+            self.assertNotIn(books, body,
+                             f"{name} keeps the HITS and heat itself: {books}")
+        for forbidden in ("hot_count_locked(", "hot_repin_locked(", "usage[",
+                          "layer_requests", "stats."):
+            self.assertNotIn(forbidden, note,
+                             f"{where} keeps more than the HITS, heat and "
+                             f"history: {forbidden}")
+
+    def test_vram_first_note_counts_the_unleased_views_on_success(self):
+        where = "moe_token_pipeline"
+        body = function_body(self.text, "static int moe_token_pipeline(")
+        note = find(body, "coli_v4_expert_store_note_vram(store, weights->plan.layer, "
+                          "fetch, nvram);", where=where)
+        guard = body.rfind("if (!result) {", 0, note)
+        self.assertGreaterEqual(guard, 0,
+                                f"{where}: note_vram is not under if (!result)")
+        find(body[guard:note], "if (!leased[i]) fetch[nvram++] = expert_ids[i];",
+             where=where)
+        fetches = [m.start() for m in re.finditer(r"v4_views_fetch_host\(", body)]
+        self.assertTrue(fetches, f"{where}: no v4_views_fetch_host call")
+        self.assertTrue(all(f < guard for f in fetches),
+                        f"{where}: note_vram runs before a host fetch")
 
     def test_touch_and_note_keep_books_only(self):
         where = "hot_union"

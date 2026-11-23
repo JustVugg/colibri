@@ -31,10 +31,18 @@
  *     matmul_rows scores the whole vocabulary.
  *   - the host pool follows the residents before a prompt chunk of Q36CC_FOLLOW_ROWS rows or
  *     more, not before a smaller one, and a change stales the staged table (q36cc_follow);
+ *   - the staged table of a prompt chunk (q36cc_dm_begin) follows the tier's residents when the warm
+ *     start pooled every expert (qt_chain_host_all): after a promotion and a give-back every expert off
+ *     the card is staged, none of the layers goes to the host's step whole, and the follow has nothing
+ *     to do; without it a chunk of 36 rows leaves the layer holding a victim to the host;
  *   - the promotions' brake holds only where the warm start's set came from a history (this
  *     model's heat file); COLI_CUDA_CHAIN_PROMOTE_HITS, when set, wins;
  *   - the staging buffer for a prompt chunk's host-pool experts grows into the old one's place: a small card
  *     has no room for both (q36cc_stage_reserve).
+ *   - the staged table puts the host pool's experts in the staging's one or two banks (q36cc_stage_table):
+ *     two where two layers' worth fit in a layer's and the card has room, the staged layers taking them in
+ *     turn, each expert at its bank's offset in both layouts; the chain's calls (first copy of each bank, then
+ *     one after each layer) never write a bank before its layer is done with it.
  * Include order as in test_qwen36_tier_int8_engine.c. */
 #define main qwen36_main_unused
 #include "../qwen36.c"
@@ -56,6 +64,7 @@ static int vids_same(void) {
 enum { D = 64, H = 4, KV = 2, HD = 16, QDIM = 2 * HD, ROT = 8, VH = 4, VK = 2, KD = 16, VD = 16, CONVK = 4 };
 enum { CD = 2 * VK * KD + VH * VD, VDIM = VH * VD, PD = CD + VDIM, E = 4, TOPK = 2, INTER = 32, SI = 32, V = 64, NL = 2, CAP = 48 };
 
+static int g_cap = CAP;   /* the models' context (section M and --probe: a long prompt's) */
 static float frand(uint32_t *s) { *s = *s * 1664525u + 1013904223u; return ((*s >> 8) & 0xFFFF) / 65535.f * 2.f - 1.f; }
 static float *fvec(int n, uint32_t *s, float scale, float base) { float *v = falloc(n); for (int i = 0; i < n; i++) v[i] = base + scale * frand(s); return v; }
 static void mk_qw(QW *w, int I, int O, uint32_t *s) {
@@ -127,14 +136,14 @@ static void build_model(Model *m, Weights *w) {
     m->DN_rec = calloc(NL, sizeof(float *)); m->DN_conv = calloc(NL, sizeof(float *));
     m->DN_rec[0] = calloc((size_t)VH * KD * VD, sizeof(float)); m->DN_conv[0] = calloc((size_t)CD * (CONVK - 1), sizeof(float));
     m->dn_dev_fresh = calloc(NL, 1); m->dn_host_stale = calloc(NL, 1);
-    m->max_t = CAP; m->kv_cap = CAP;
+    m->max_t = g_cap; m->kv_cap = g_cap;
     ensure_kv(m);
     m->attn_sc_thr = 1;
 #ifdef _OPENMP
     m->attn_sc_thr = omp_get_max_threads();
 #endif
     m->attn_sc = falloc((int64_t)m->attn_sc_thr * m->max_t);
-    kv_prefix_alloc(&m->kvp, CAP);
+    kv_prefix_alloc(&m->kvp, g_cap);
     m->first_step = 1;
 }
 
@@ -190,6 +199,148 @@ static void hp_route(int l, int a, int b) {   /* a row's routes, the misses offe
     for (int k = 0; k < 2; k++) if (!qt_is_resident(l, ids[k])) hp_note(l, ids[k], 2);
 }
 
+/* P's tier: HL layers of the same experts, to see where q36cc_stage_table puts the host pool's in the staging */
+enum { HL = 5 };
+static unsigned char sq_w[HL][HE][3 * HMB];
+static float sq_sc[HL][HE][HSC];
+/* the staging's ops on the fake, a state machine for each bank: the layer a fetch put in it, which the layer's
+ * wait must find and its done must release before the next fetch lands there */
+static struct { int hold[2], bad, fetches, waits, expect, maxend, firstat[HL], routed; Q36CChain *ch; } sg;
+static int sg_layer(const CcFetch *r) {   /* the layer whose copies these are */
+    if (sg.routed) return sg.expect;   /* a short chunk's list is built apart (q36cc_routed_fetches) */
+    for (int i = 0; i < HL; i++) if (sg.ch->dm_frn[i] > 0 && r == sg.ch->dm_fr + sg.ch->dm_fro[i]) return i;
+    return -1;
+}
+static int sg_fetch_at(CcBuf *dst, const CcFetch *r, int n, int bank) {
+    int i = sg_layer(r);
+    if (bank < 0 || bank > 1 || i < 0 || sg.hold[bank] >= 0) sg.bad++;   /* a bank still unread, or copies of no layer */
+    else { sg.hold[bank] = i; sg.fetches++; sg.firstat[i] = n ? (int)r[0].dst : -1; }
+    for (int k = 0; k < n; k++) {
+        if (r[k].dst + r[k].bytes > cc_bytes(dst)) sg.bad++;   /* past the buffer */
+        if (r[k].dst + r[k].bytes > (size_t)sg.maxend) sg.maxend = (int)(r[k].dst + r[k].bytes);
+    }
+    return 1;
+}
+static int sg_wait_at(int bank) { sg.waits++; if (bank < 0 || bank > 1 || sg.hold[bank] != sg.expect) sg.bad++; return 1; }
+static int sg_done_at(int bank) { if (bank < 0 || bank > 1 || sg.hold[bank] != sg.expect) sg.bad++; else sg.hold[bank] = -1; return 1; }
+static int sg_fetch(CcBuf *dst, const CcFetch *r, int n) { return sg_fetch_at(dst, r, n, 0); }
+static int sg_wait(void) { return sg_wait_at(0); }
+static int sg_done(void) { return sg_done_at(0); }
+
+/* A tier of HL layers with `res` experts of the HE on the card (the first ones, in every layer) and the rest in the
+ * host pool, `cap` bytes of device memory for the staging (0: no limit), one layer (unstaged_l, -1: none) with an
+ * expert in neither, a backend whose table has the banks' ops (at_ops) or ends before them. Builds the staged table,
+ * then runs the staged layers as the chain does: the first copy of each bank, and after a layer's experts the copy
+ * of the layer that takes its bank. */
+static void stage_table_case(int res, int planar, int unstaged_l, size_t cap, int at_ops, int want_banks, const char *what) {
+    char gb[64], msg[240];
+    setenv("HEAT_FILE", "", 1); setenv("COLI_PLACE", "off", 1); setenv("QT_UPLOAD_SYNC", "", 1);
+    fake_host_reg_ok = 1; fake_planar_rows = planar;
+    for (int i = 0; i < HL; i++) for (int e = 0; e < HE; e++) {
+        for (size_t k = 0; k < sizeof sq_w[i][e]; k++) sq_w[i][e][k] = (unsigned char)((k * 31u + (unsigned)i * 11u + (unsigned)e * 5u) & 0xFFu);
+        for (int k = 0; k < HSC; k++) sq_sc[i][e][k] = 0.5f * (float)(k + e + i + 1);
+    }
+    size_t xb = 3 * dev_alloc_footprint(HMB) + 3 * dev_alloc_footprint((HSC / 3) * sizeof(float));
+    snprintf(gb, sizeof gb, "%.15f", (double)((size_t)HL * res * xb + xb / 2) / 1073741824.0);
+    setenv("CUDA_EXPERT_GB", gb, 1);
+    qt_source_planar(planar);
+    int up = qt_init(HL, HE, D, HI, HE, TOPK, 64, 1);
+    for (int e = 0; e < HE; e++) for (int i = 0; i < HL; i++) {
+        const unsigned char *g = sq_w[i][e]; const float *s = sq_sc[i][e];
+        qt_note_block(i, e, g, g + HMB, g + 2 * HMB, s, s + HI, s + 2 * HI);
+    }
+    qt_fill_wait();
+    int pool = 0, resident = 0;
+    for (int i = 0; i < HL; i++) for (int e = 0; e < HE; e++) {
+        if (qt_is_resident(i, e)) { resident++; continue; }
+        if (i == unstaged_l && e == HE - 1) continue;   /* in neither */
+        const unsigned char *g = sq_w[i][e]; const float *s = sq_sc[i][e];
+        qt_note_host(i, e, g, g + HMB, g + 2 * HMB, s, s + HI, s + 2 * HI);
+        pool++;
+    }
+    snprintf(msg, sizeof msg, "%s: %d experts a layer on the card, the rest in the pool", what, res);
+    ck(up && resident == HL * res && qt_chain_host_count() == pool, msg);
+
+    static Q36CChain ch; static Model sm;
+    memset(&ch, 0, sizeof ch); memset(&sm, 0, sizeof sm);
+    sm.c.n_layers = HL; sm.c.n_experts = HE; sm.c.hidden = D; sm.c.inter = HI;
+    ch.dm_fmt = 4; ch.dm_gs = 64;
+    ch.dm_host = calloc((size_t)HL * HE, sizeof(CcExpert)); ch.dm_res = calloc((size_t)HL * HE, 1);
+    for (int i = 0; i < HL; i++) for (int e = 0; e < HE; e++) ch.dm_res[i * HE + e] = (uint8_t)qt_is_resident(i, e);
+    memset(&sg, 0, sizeof sg); sg.hold[0] = sg.hold[1] = -1; sg.ch = &ch;
+    ColiCudaChainOps saved = fake_chain_table;
+    fake_chain_table.size = at_ops ? sizeof fake_chain_table : offsetof(ColiCudaChainOps, fetch_at);
+    fake_chain_table.fetch = sg_fetch; fake_chain_table.fetch_wait = sg_wait; fake_chain_table.fetch_done = sg_done;
+    fake_chain_table.fetch_at = at_ops ? sg_fetch_at : NULL; fake_chain_table.fetch_wait_at = at_ops ? sg_wait_at : NULL;
+    fake_chain_table.fetch_done_at = at_ops ? sg_done_at : NULL;
+    fake_chain_dev_cap = cap ? fake_chain_dev_bytes + cap : 0;
+
+    const int hmax = HE - res, staged = HL - (unstaged_l >= 0);
+    const size_t wb = 3 * HMB, wa = (wb + 255) / 256 * 256, stride = wa + (HSC * sizeof(float) + 255) / 256 * 256, bank = (size_t)hmax * stride;
+    ck(q36cc_stage_table(&ch, &sm), what);
+    snprintf(msg, sizeof msg, "%s: %d bank%s of %d experts", what, want_banks, want_banks == 1 ? "" : "s", hmax);
+    ck(ch.dm_banks == want_banks && cc_bytes(ch.dm_stage) >= want_banks * bank, msg);
+    int banks_ok = 1, seen = 0, at_ok = 1;
+    const char *base = (const char *)cc_dev_addr(ch.dm_stage);
+    for (int i = 0; i < HL; i++) {
+        const int st = q36cc_stages(&ch, ch.dm_tabb, i);
+        banks_ok = banks_ok && (st == (i != unstaged_l)) && ch.dm_bank[i] == (st ? seen % want_banks : -1);
+        for (int e = 0; e < HE && st; e++) {   /* the staged expert h of a layer at (bank * hmax + h) * stride, as the pool holds it */
+            const CcExpert *x = &ch.dm_hostb[(size_t)i * HE + e];
+            if (ch.dm_res[i * HE + e]) continue;
+            const size_t off = (size_t)((const char *)x->g - base), h = off / stride - (size_t)ch.dm_bank[i] * hmax;
+            at_ok = at_ok && off % stride == 0 && h < (size_t)hmax && x->u == (const char *)x->g + HMB && x->d == (const char *)x->g + 2 * HMB &&
+                    (const char *)x->gs == base + off + wa && x->us == x->gs + HI && x->ds == x->gs + 2 * HI && x->planar == planar;
+        }
+        seen += st;
+    }
+    snprintf(msg, sizeof msg, "%s: the staged layers take the banks in turn, an unstaged layer takes none", what);
+    ck(banks_ok && seen == staged, msg);
+    snprintf(msg, sizeof msg, "%s: each expert in its layer's bank, its matrices and scales after it (%s)", what, planar ? "planar" : "pairs");
+    ck(at_ok, msg);
+
+    const int banks = q36cc_banks(&ch);
+    int ok = 1, first_ok = 1;
+    for (int s = 1; s <= banks; s++) ok = ok && q36cc_stage_from(&ch, &sm, 0, s);
+    for (int i = 0; i < HL; i++) {
+        if (!q36cc_stages(&ch, ch.dm_tabb, i)) continue;
+        sg.expect = i;
+        ok = ok && q36cc_fetch_wait(&ch, i) && q36cc_fetch_done(&ch, i) && q36cc_stage_from(&ch, &sm, i + 1, banks);
+        first_ok = first_ok && sg.firstat[i] == ch.dm_bank[i] * (int)bank;   /* the layer's copy starts at its bank */
+    }
+    snprintf(msg, sizeof msg, "%s: each copy lands in a free bank at its layer's offset and is waited for by its layer", what);
+    ck(ok && sg.bad == 0 && sg.fetches == staged && sg.waits == staged && sg.hold[0] < 0 && sg.hold[1] < 0 &&
+       sg.maxend <= (int)(want_banks * bank) && first_ok, msg);
+
+    /* a short chunk's routed copy, layer by layer as q36cc_dm_layer runs it: after the router, the layer's bank, and
+     * the wait and done of that same bank (a copy with another bank's events leaves its bank's state unmatched) */
+    sm.c.topk = TOPK;
+    fake_chain_dev_cap = 0;
+    const int hot = HE - 1;   /* not on the card in any layer: the last of the pool's, the layer's last staged expert */
+    ok = cc_reserve(&ch.dm_idsd, (size_t)HL * TOPK * sizeof(int), CC_DEV);
+    for (int i = 0; ok && i < HL; i++) { ((int *)cc_ptr(ch.dm_idsd))[i * TOPK] = 0; ((int *)cc_ptr(ch.dm_idsd))[i * TOPK + 1] = hot; }
+    memset(&sg.hold, 0xff, sizeof sg.hold); sg.bad = sg.fetches = sg.waits = sg.maxend = 0; sg.routed = 1;
+    int routed_at_ok = 1, routed_n = 0;
+    for (int i = 0; ok && i < HL; i++) {
+        if (!q36cc_stages(&ch, ch.dm_tabb, i)) continue;
+        sg.expect = i; routed_n++;
+        ok = q36cc_stage_routed(&ch, &sm, i, 1) && q36cc_fetch_wait(&ch, i) && q36cc_fetch_done(&ch, i);
+        const size_t at = (size_t)sg.firstat[i], lo = (size_t)ch.dm_bank[i] * bank, h = (size_t)ch.dm_hostb[(size_t)i * HE + hot].g - (size_t)base;
+        routed_at_ok = routed_at_ok && at == h && at >= lo && at + stride <= lo + bank;   /* the routed expert, in its layer's bank */
+    }
+    sg.routed = 0;
+    snprintf(msg, sizeof msg, "%s: a short chunk's routed copy takes its layer's bank, with that bank's events", what);
+    ck(ok && routed_n == staged && sg.bad == 0 && sg.fetches == staged && sg.waits == staged && sg.hold[0] < 0 && sg.hold[1] < 0 && routed_at_ok, msg);
+
+    fake_chain_dev_cap = 0;
+    cc_free(ch.dm_idsd);
+    cc_free(ch.dm_stage); cc_free(ch.dm_tabb); free(ch.dm_hostb); free(ch.dm_partb); free(ch.dm_fro); free(ch.dm_frn);
+    free(ch.dm_bank); free(ch.dm_frx); free(ch.dm_used); free(ch.dm_rfr); free(ch.dm_fr); free(ch.dm_host); free(ch.dm_res);
+    fake_chain_table = saved;
+    qt_source_planar(0);
+    qt_shutdown();
+}
+
 /* the reference's resident copies, matrix by matrix (sections G and H write the same lines out) */
 static void share_trunk(Model *to, const Model *from) {
     for (int i = 0; i < NL; i++) {
@@ -198,6 +349,57 @@ static void share_trunk(Model *to, const Model *from) {
         to->L[i].qth_shu = from->L[i].qth_shu; to->L[i].qth_shd = from->L[i].qth_shd;
     }
 }
+
+/* the MTP head of section H (E routed experts, the whole vocabulary), on */
+static void mtp_head(void) {
+    uint32_t ms = 99;
+    Q36Mtp *p = &g_q36_mtp;
+    memset(p, 0, sizeof *p);
+    p->on = 1; p->E = E; p->K = TOPK; p->I = INTER; p->ish = SI;
+    p->enorm = fvec(D, &ms, 0.1f, 0.f); p->hnorm = fvec(D, &ms, 0.1f, 0.f); p->head_norm = fvec(D, &ms, 0.1f, 0.f);
+    p->L.in_ln = fvec(D, &ms, 0.1f, 0.f); p->L.post_ln = fvec(D, &ms, 0.1f, 0.f);
+    p->L.qn = fvec(HD, &ms, 0.1f, 0.f); p->L.kn = fvec(HD, &ms, 0.1f, 0.f);
+    mk_qw(&p->eh, 2 * D, D, &ms);
+    mk_qw(&p->L.q, D, H * QDIM, &ms); mk_qw(&p->L.k, D, KV * HD, &ms);
+    mk_qw(&p->L.v, D, KV * HD, &ms); mk_qw(&p->L.o, H * HD, D, &ms);
+    mk_qw(&p->sh_g, D, SI, &ms); mk_qw(&p->sh_u, D, SI, &ms); mk_qw(&p->sh_d, SI, D, &ms);
+    p->router = fvec(E * D, &ms, 0.2f, 0.f); p->sh_gate = fvec(D, &ms, 0.1f, 0.f);
+    p->eg = calloc(E, sizeof(QW)); p->eu = calloc(E, sizeof(QW)); p->ed = calloc(E, sizeof(QW));
+    for (int e = 0; e < E; e++) { mk_qw(&p->eg[e], D, INTER, &ms); mk_qw(&p->eu[e], D, INTER, &ms); mk_qw(&p->ed[e], INTER, D, &ms); }
+    p->pend = falloc(D);
+    memset(&g_q36_mc, 0, sizeof g_q36_mc);
+}
+
+#ifdef _WIN32
+/* --probe S (--probe-cpu S): a prompt of S rows through step_ex, the MTP head on (the chain's, or the
+ * CPU's), and the process's commit around it: its private bytes before and after, their peak, and the
+ * fake card's bytes (host memory here, apart). One prompt a process: the peak is the process's. */
+static int probe(int S, int cpu) {
+    setenv("Q36_KV", "f32", 1); setenv("COLI_CUDA", "1", 1); setenv("COLI_GPUS", "0", 1); setenv("QT_NO_WARMSTART", "1", 1);
+    setenv("COLI_LMHEAD_GPU", "0", 1); setenv("COLI_DENSE_IDOT", "0", 1); setenv("COLI_CUDA_CHAIN", "1", 1);
+    fake_ndev = 1; fake_dense_compute = 1; fake_chain_table.size = sizeof(ColiCudaChainOps);
+    g_cap = S + 16;
+    Weights w; make_weights(&w);
+    if (!qt_init(NL, E, D, INTER, E, TOPK, 0, 0)) return 1;
+    Model m; build_model(&m, &w); place_trunk(&m, &w);
+    if (!q36cc_setup(&m, 1)) return 1;
+    g_cuda_chain = !cpu;
+    mtp_head();
+    int *tk = malloc((size_t)S * sizeof(int));
+    for (int s = 0; s < S; s++) tk[s] = (s * 7 + 3) % V;
+    PROCESS_MEMORY_COUNTERS_EX a, b;
+    memset(&a, 0, sizeof a); memset(&b, 0, sizeof b); a.cb = b.cb = sizeof a;
+    GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&a, sizeof a);
+    size_t dev0 = fake_chain_dev_bytes;
+    free(step_ex(&m, tk, S, 0, 1));
+    GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&b, sizeof b);
+    printf("PROBE %s S=%d private_before=%zu private_after=%zu peak=%zu peak_rise=%zu dev_before=%zu dev_after=%zu "
+           "head_dev_rows=%zu last_n=%d\n", cpu ? "cpu" : "chain", S, (size_t)a.PrivateUsage, (size_t)b.PrivateUsage,
+           (size_t)b.PeakPagefileUsage, (size_t)(b.PeakPagefileUsage - a.PrivateUsage), dev0, fake_chain_dev_bytes,
+           g_q36_mc.emb ? cc_bytes(g_q36_mc.emb) / (D * sizeof(float)) : (size_t)0, g_q36_mtp.last_n);
+    return 0;
+}
+#endif
 
 /* The lm_head computes on the card and one copy takes its logits to the host's buffer: no matmul of
  * the chain's steps stores through the bus, and the logits equal the CPU path's after a prompt read
@@ -232,7 +434,44 @@ static void head_logits_on_the_card(Weights *w, const Model *shared, const int *
     g_cuda_chain = 0;
 }
 
-int main(void) {
+/* a short prompt chunk's copies for one layer (q36cc_routed_fetches): the experts its rows route
+ * to that have regions in the staged table, two regions each, in the table's order. Only the
+ * list is tested here: the copy itself runs on a card (the T4 bench of the experiment record). */
+static void test_routed_fetches(void) {
+    enum { RE = 8 };
+    CcFetch fr[8], out[2 * RE]; uint8_t used[RE];
+    memset(used, 1, sizeof used);   /* the scratch as the layer before left it */
+    for (int k = 0; k < 8; k++) fr[k] = (CcFetch){(const void *)(uintptr_t)(0x1000 + k), (size_t)k, (size_t)(100 + k)};
+    const int frx[RE] = {-1, 0, -1, 2, 4, -1, 6, -1};   /* 1, 3, 4 and 6 in the pool; the rest resident */
+    const int ids[6] = {6, 0, 1, 6, -1, 9};              /* two rows of three: 6 twice, a resident, an empty slot, an id past E */
+    int k = q36cc_routed_fetches(ids, 6, RE, frx, fr, used, out);
+    ck(k == 4 && out[0].src == fr[0].src && out[1].src == fr[1].src && out[2].src == fr[6].src && out[3].src == fr[7].src,
+       "the routed experts in the pool, each once, in the table's order: weights, then scales");
+    const int res[3] = {0, 2, 5};
+    ck(q36cc_routed_fetches(res, 3, RE, frx, fr, used, out) == 0, "routes only to residents: nothing to copy (the scratch starts clean)");
+    const int all[RE] = {7, 6, 5, 4, 3, 2, 1, 0};
+    k = q36cc_routed_fetches(all, RE, RE, frx, fr, used, out);
+    int whole = k == 8;
+    for (int j = 0; j < 8 && whole; j++) whole = out[j].src == fr[j].src && out[j].dst == fr[j].dst && out[j].bytes == fr[j].bytes;
+    ck(whole, "routes to every expert: the layer's whole copy, as a longer chunk makes it");
+    ck(Q36CC_ROUTED_ROWS > Q36CC_STAGE_ROWS, "a chunk the staging takes can be short enough to copy only its routes");
+    ck(q36cc_routes_only(Q36CC_STAGE_ROWS + 1, 4) && q36cc_routes_only(Q36CC_ROUTED_ROWS, 4) &&
+       !q36cc_routes_only(Q36CC_ROUTED_ROWS + 1, 4), "an int4 per group chunk copies only its routes up to Q36CC_ROUTED_ROWS rows");
+    ck(q36cc_routes_only(Q36CC_STAGE_ROWS + 1, 2), "so does a per-row int4's (the same two regions an expert, planar blocks or pairs)");
+    ck(!q36cc_routes_only(Q36CC_STAGE_ROWS + 1, 100) && !q36cc_routes_only(Q36CC_STAGE_ROWS + 1, 142),
+       "a GGUF's chunk copies whole layers: no list of its experts' regions");
+    ck(!q36cc_routes_only(Q36CC_STAGE_ROWS + 1, 1) && !q36cc_routes_only(Q36CC_STAGE_ROWS + 1, 8),
+       "the formats with no staged table (int8, fp8) take no such list either");
+    ck(Q36CC_DM_ROWS <= Q36CC_STAGE_ROWS,
+       "no staged chunk has a layer the host serves inside the frame: the wait for the routes cannot block");
+}
+
+int main(int argc, char **argv) {
+#ifdef _WIN32
+    if (argc == 3 && !strcmp(argv[1], "--probe")) return probe(atoi(argv[2]), 0);
+    if (argc == 3 && !strcmp(argv[1], "--probe-cpu")) return probe(atoi(argv[2]), 1);
+#endif
+    (void)argc; (void)argv;
     setenv("Q36_KV", "f32", 1);   /* the host's K/V rows compared below as floats */
     setenv("COLI_CUDA", "1", 1); setenv("COLI_GPUS", "0", 1); setenv("QT_NO_WARMSTART", "1", 1);
     unsetenv("HEAT_FILE");                      /* G: the tier starts without a history */
@@ -244,6 +483,15 @@ int main(void) {
     const int ids[12] = {3, 17, 42, 9, 21, 60, 5, 33, 12, 48, 7, 29};   /* the verify reads three from index 6 */
 
     ck(qt_init(NL, E, D, INTER, E, TOPK, 0, 0), "the tier is up");
+    /* the staging's second bank: only where both fit in the 256 experts q36cc_rows_max sets aside for it
+     * (a Colab T4 with the residents spread, 91 a layer: two; whole layers, 256: one; 190 a layer: one) */
+    ck(q36cc_stage_banks(91, 256) == 2 && q36cc_stage_banks(128, 256) == 2 && q36cc_stage_banks(129, 256) == 1 &&
+       q36cc_stage_banks(190, 256) == 1 && q36cc_stage_banks(256, 256) == 1 && q36cc_stage_banks(0, 256) == 1,
+       "the staging has two banks where two layers' worth fit in a layer's, else one");
+    static Q36CChain zp;   /* zeroed, as a staged table that writes no banks leaves it */
+    ck(q36cc_banks(&zp) == 1, "a staged table that sets no banks copies its layers in one");
+    zp.dm_banks = 2; ck(q36cc_banks(&zp) == 2, "two banks stay two");
+    zp.dm_banks = 1; ck(q36cc_banks(&zp) == 1, "one bank stays one");
     Model ref; build_model(&ref, &w);
     place_trunk(&ref, &w);        /* the reference uses the same resident copies, matrix by matrix */
     Model m; build_model(&m, &w);
@@ -601,7 +849,150 @@ int main(void) {
         qt_shutdown();
     }
     remove(heat);
+
+    printf(" M. a short prompt chunk copies only the experts its rows route to\n");
+    test_routed_fetches();
+    printf(" N. the staged table follows the residents when every expert is pooled\n");
+    {   /* the ops through dev_addr: the fake's table, tensor_dev and the staging's address, no copy (fetch is not there) */
+        fake_chain_table.size = offsetof(ColiCudaChainOps, dev_addr) + sizeof fake_chain_table.dev_addr;
+        for (int all = 1; all >= 0; all--) {
+            char w[160];
+            int regs0 = fake_host_regs, unregs0 = fake_host_unregs;
+            qt_source_planar(1);
+            ck(qt_init(NL, HE, D, HI, HE, TOPK, 64, 1), "a planar tier");
+            for (int e = 0; e < HE; e++) for (int i = 0; i < NL; i++) hp_note(i, e, 0);
+            qt_fill_wait();
+            for (int i = 0; i < NL; i++) for (int e = 0; e < HE; e++) if (!qt_is_resident(i, e)) hp_note(i, e, 1);
+            if (all) qt_chain_host_all();
+            Model km; memset(&km, 0, sizeof km);   /* the chunk's dimensions, as the tier's */
+            km.c.hidden = D; km.c.inter = HI; km.c.n_layers = NL; km.c.n_experts = HE; km.c.topk = TOPK;
+            Q36CChain fc; memset(&fc, 0, sizeof fc);
+            fc.rows = 64;
+            ck(qt_chain_format(&fc.dm_fmt, &fc.dm_gs) && fc.dm_fmt == 4 && qt_chain_devices() == 1, "the chain reads the tier's format");
+            ck(q36cc_dm_begin(&fc, &km, 40), "a chunk of 40 rows: the table built before anything moved");
+            q36cc_dm_end(&fc);
+            int clean = 1;
+            for (int i = 0; i < NL; i++) clean = clean && !fc.dm_partb[i];
+            ck(clean && fc.dm_staged == 0 && !fc.dm_stage_off, "before the moves: no layer goes to the host's step");
+            for (int t = 0; t < 3; t++) { hp_route(0, 4, 5); hp_route(1, 0, 5); }
+            QtPromo pr[8];
+            int np = qt_chain_promote(8, pr);
+            for (int k = 0; k < np; k++) qt_chain_promote_done(pr[k].ci, pr[k].vi, 1);
+            int moved = np > 0;
+            for (int round = 0; round < 2; round++) {   /* after the promotions, then after the KV mirrors' give-back */
+                if (round) qt_chain_give_back(2 * G.exp_bytes - 1, NULL);
+                ck(q36cc_dm_begin(&fc, &km, 40), "a chunk of 40 rows after the moves");
+                q36cc_dm_end(&fc);
+                int agrees = 1, hostl = 0;   /* the table says what the tier says: resident, staged, or the host's */
+                for (int i = 0; i < NL; i++) {
+                    hostl += fc.dm_partb[i];
+                    for (int e = 0; e < HE; e++) {
+                        const int res = qt_is_resident(i, e), pool = hp_pooled(i, e), j = i * HE + e;
+                        agrees = agrees && fc.dm_res[j] == res && (fc.dm_hostb[j].g != NULL) == (res || pool);
+                    }
+                }
+                if (all) {
+                    snprintf(w, sizeof w, "every expert pooled, %s: the staged table equals the residents, every expert off the card staged, no layer to the host", round ? "after the give-back" : "after the promotions");
+                    ck(moved && agrees && hostl == 0 && fc.hp_follows == 0, w);
+                } else if (!round) {
+                    ck(moved && agrees && hostl > 0 && fc.hp_follows == 0,
+                       "the non-residents only (a 40-row chunk does not follow): a layer holding a victim goes to the host's step whole");
+                }
+            }
+            if (all) {
+                ck(q36cc_dm_begin(&fc, &km, Q36CC_FOLLOW_ROWS), "a chunk of Q36CC_FOLLOW_ROWS rows");
+                q36cc_dm_end(&fc);
+                ck(fc.hp_follows == 0 && !fc.dm_partb[0] && !fc.dm_partb[1], "every expert pooled: the follow did nothing, the layers stay on the device");
+            }
+            cc_free(fc.dm_stage); cc_free(fc.dm_tabb);
+            qt_source_planar(0);
+            qt_shutdown();
+            ck(fake_host_regs - regs0 == fake_host_unregs - unregs0, "the exit releases every page-lock the pool took");
+        }
+        fake_chain_table.size = CC_OPS_BASE_SIZE;
+    }
+    printf(" O. a prompt longer than Q36_MTP_FEED_ROWS: the MTP head holds a chunk's rows, its K/V rows as before\n");
+    {
+        unsetenv("CUDA_EXPERT_GB"); unsetenv("COLI_PLACE"); fake_planar_rows = 0;
+        fake_chain_table.size = sizeof(ColiCudaChainOps);
+        const int S = Q36_MTP_FEED_ROWS + 300;
+        g_cap = S + 16;
+        ck(qt_init(NL, E, D, INTER, E, TOPK, 0, 0), "the tier is up for a long context");
+        Model mm; build_model(&mm, &w); place_trunk(&mm, &w);
+        Q36CChain *cm = q36cc_setup(&mm, 1);
+        ck(cm != NULL && cm->ok, "a chain for the long context");
+        g_cuda_chain = 1;
+        mtp_head();
+        Q36Mtp *p = &g_q36_mtp;
+        int *tk = malloc((size_t)S * sizeof(int));
+        for (int s = 0; s < S; s++) tk[s] = (s * 7 + 3) % V;
+        uint32_t hs = 5;
+        float *res = fvec(S * D, &hs, 0.5f, 0.f), *hid = falloc((int64_t)S * D);
+        for (int s = 0; s < S; s++) rmsnorm_row(hid + (size_t)s * D, res + (size_t)s * D, mm.final_norm, D, mm.c.eps);
+        q36_mtp_feed(&mm, tk, S, 0, res);   /* a forward's residual rows */
+        cc_finish();
+        ck(g_q36_mc.on && cc_bytes(g_q36_mc.emb) <= (size_t)Q36_MTP_FEED_ROWS * D * sizeof(float),
+           "the head's rows on the card: a chunk's, not the prompt's");
+        ck(p->last_n == Q36_MTP_FEED_ROWS && p->last_base == S - Q36_MTP_FEED_ROWS && p->has_pend && p->len == S - 1 &&
+           !memcmp(p->pend, hid + (size_t)(S - 1) * D, D * sizeof(float)), "the forward's last rows kept, the last one pending");
+        ck(q36_mtp_ready(S) && q36_mtp_ready(S - 100) && !q36_mtp_ready(S - Q36_MTP_FEED_ROWS - 10),
+           "a later forward from inside the kept rows finds its row there; one from further back waits");
+        const size_t kvn = (size_t)KV * g_q36_mc.cap * HD, cut = (size_t)(S - 1) * HD;
+        float *kc = malloc(kvn * sizeof(float)), *vc = malloc(kvn * sizeof(float));
+        memcpy(kc, g_q36_mc.kc->d, kvn * sizeof(float)); memcpy(vc, g_q36_mc.vc->d, kvn * sizeof(float));
+        memset(g_q36_mc.kc->d, 0, kvn * sizeof(float)); memset(g_q36_mc.vc->d, 0, kvn * sizeof(float));
+        q36_mtp_rows(&mm, tk + 1, hid, S - 1, 1, NULL, NULL);   /* the prompt's rows in one call, as before */
+        cc_finish();
+        int same = 0;   /* and not zeros on both sides */
+        for (size_t i = 0; i < cut; i++) same |= kc[i] != 0.f;
+        for (int h = 0; h < KV; h++) {
+            const size_t o = (size_t)h * g_q36_mc.cap * HD;
+            same &= !memcmp(kc + o, g_q36_mc.kc->d + o, cut * sizeof(float)) && !memcmp(vc + o, g_q36_mc.vc->d + o, cut * sizeof(float));
+        }
+        ck(same, "the head's K/V rows of the prompt, a chunk at a time, equal one call's over the whole prompt (bits)");
+        free(kc); free(vc); free(res); free(hid); free(tk);
+
+        fake_chain_dev_cap = fake_chain_dev_bytes;   /* the card full: no room for a verify's copies */
+        const int slots0 = cm->snap_slots;
+        ck(!q36_spec_alloc(&mm, 3) && cm->snap_slots == slots0 && !cm->failed && g_cuda_chain,
+           "a full card refuses a verify's copies: no drafts (a plain step on the chain), not a verify on the CPU");
+        fake_chain_dev_cap = 0;
+        ck(q36_spec_alloc(&mm, 3) && cm->snap_slots >= 3, "with room the copies are made before the drafts");
+
+        /* the CPU's layers (a chain off or lost): a prompt longer than Q36_CPU_ROWS a chunk at a time */
+        p->on = 0; g_cuda_chain = 0;
+        const int SC = Q36_CPU_ROWS + 300;
+        Model ma, mb; build_model(&ma, &w); place_trunk(&ma, &w); build_model(&mb, &w); place_trunk(&mb, &w);
+        int *tc = malloc((size_t)SC * sizeof(int));
+        for (int s = 0; s < SC; s++) tc[s] = (s * 5 + 1) % V;
+        float *la = step_ex(&ma, tc, SC, 0, 1);
+        float *xb = falloc((int64_t)SC * D), last[D], lb[V];
+        for (int s = 0; s < SC; s++) q36_embed_row(&mb, tc[s], s, xb + (size_t)s * D);
+        layers_forward_range(&mb, xb, SC, 0, 0, NL, 1, NULL);   /* the prompt whole, as before */
+        rmsnorm_row(last, xb + (size_t)(SC - 1) * D, mb.final_norm, D, mb.c.eps);
+        if (!qt_lmhead_matmul(lb, last, D, V)) matmul_d(lb, last, &mb.lm_head, 1, D, V);
+        q36_logits_out(&mb.c, lb, V);
+        int kv_same = ma.kv_cap == mb.kv_cap;   /* a head's rows start kv_cap rows apart (ensure_kv rounds it up from g_cap) */
+        for (int h = 0; kv_same && h < KV; h++) {
+            const size_t o = (size_t)h * ma.kv_cap * HD, n = (size_t)SC * HD * sizeof(float);
+            kv_same &= !memcmp((float *)ma.K[1] + o, (float *)mb.K[1] + o, n) && !memcmp((float *)ma.V[1] + o, (float *)mb.V[1] + o, n);
+        }
+        ck(!memcmp(la, lb, sizeof lb) && kv_same && !memcmp(ma.DN_rec[0], mb.DN_rec[0], (size_t)VH * KD * VD * sizeof(float)) &&
+           !memcmp(ma.DN_conv[0], mb.DN_conv[0], (size_t)CD * (CONVK - 1) * sizeof(float)),
+           "the CPU's layers a chunk at a time: the prompt's last logits, K/V rows and DeltaNet state as one pass's (bits)");
+        free(la); free(xb); free(tc);
+        g_cap = CAP;
+        fake_chain_table.size = CC_OPS_BASE_SIZE;
+        qt_shutdown();
+    }
+    printf(" P. the staged table: the host pool's experts in the staging's banks\n");
+    stage_table_case(4, 1, -1, 0, 1, 2, "planar, half the experts in the pool (two layers' worth fit in a layer's)");
+    stage_table_case(4, 0, -1, 0, 1, 2, "the residents' pairs, the same");
+    stage_table_case(4, 1, 2, 0, 1, 2, "planar, a layer with an expert in neither");
+    stage_table_case(3, 1, -1, 0, 1, 1, "planar, five of eight in the pool (two would not fit in a layer's)");
+    stage_table_case(4, 1, -1, 40000, 1, 1, "planar, room for one bank only");
+    stage_table_case(4, 1, -1, 0, 0, 1, "planar, a backend whose table ends before the banks' ops");
     if (fails) { printf("test_qwen36_cuda_chain: %d failure(s)\n", fails); return 1; }
-    printf("OK test_qwen36_cuda_chain: the CUDA chain gives the CPU path's logits; host and device state agree; a lost device rebuilds; the host pool follows before a large prompt chunk only; the promotions' brake only with a history\n");
+    printf("OK test_qwen36_cuda_chain: the CUDA chain gives the CPU path's logits; host and device state agree; a lost device rebuilds; the host pool follows before a large prompt chunk only; the promotions' brake only with a history; the MTP head and the CPU's layers read a long prompt a chunk at a time\n");
     return 0;
 }

@@ -1,0 +1,319 @@
+/sys/kernel/tracing/instances/colimodel-2098073/per_cpu/cpu31/stats
+entries: 0
+overrun: 0
+commit overrun: 0
+bytes: 0
+oldest event ts:     0.000000
+now ts: 202108.615609
+dropped events: 0
+read events: 0
+
+/sys/kernel/tracing/instances/colimodel-2098073/per_cpu/cpu30/stats
+entries: 0
+overrun: 0
+commit overrun: 0
+bytes: 0
+oldest event ts:     0.000000
+now ts: 202108.615655
+dropped events: 0
+read events: 0
+
+/sys/kernel/tracing/instances/colimodel-2098073/per_cpu/cpu29/stats
+entries: 0
+overrun: 0
+commit overrun: 0
+bytes: 0
+oldest event ts: 202054.998154
+now ts: 202108.615678
+dropped events: 0
+read events: 3
+
+/sys/kernel/tracing/instances/colimodel-2098073/per_cpu/cpu28/stats
+entries: 0
+overrun: 0
+commit overrun: 0
+bytes: 0
+oldest event ts: 202108.247079
+now ts: 202108.615698
+dropped events: 0
+read events: 22289
+
+/sys/kernel/tracing/instances/colimodel-2098073/per_cpu/cpu27/stats
+entries: 0
+overrun: 0
+commit overrun: 0
+bytes: 0
+oldest event ts:     0.000000
+now ts: 202108.615750
+dropped events: 0
+read events: 0
+
+/sys/kernel/tracing/instances/colimodel-2098073/per_cpu/cpu26/stats
+entries: 0
+overrun: 0
+commit overrun: 0
+bytes: 0
+oldest event ts:     0.000000
+now ts: 202108.615770
+dropped events: 0
+read events: 0
+
+/sys/kernel/tracing/instances/colimodel-2098073/per_cpu/cpu25/stats
+entries: 0
+overrun: 0
+commit overrun: 0
+bytes: 0
+oldest event ts:     0.000000
+now ts: 202108.615789
+dropped events: 0
+read events: 0
+
+/sys/kernel/tracing/instances/colimodel-2098073/per_cpu/cpu24/stats
+entries: 0
+overrun: 0
+commit overrun: 0
+bytes: 0
+oldest event ts:     0.000000
+now ts: 202108.615808
+dropped events: 0
+read events: 0
+
+/sys/kernel/tracing/instances/colimodel-2098073/per_cpu/cpu23/stats
+entries: 0
+overrun: 0
+commit overrun: 0
+bytes: 0
+oldest event ts:     0.000000
+now ts: 202108.615827
+dropped events: 0
+read events: 0
+
+/sys/kernel/tracing/instances/colimodel-2098073/per_cpu/cpu22/stats
+entries: 0
+overrun: 0
+commit overrun: 0
+bytes: 0
+oldest event ts:     0.000000
+now ts: 202108.615846
+dropped events: 0
+read events: 0
+
+/sys/kernel/tracing/instances/colimodel-2098073/per_cpu/cpu21/stats
+entries: 0
+overrun: 0
+commit overrun: 0
+bytes: 0
+oldest event ts:     0.000000
+now ts: 202108.615865
+dropped events: 0
+read events: 0
+
+/sys/kernel/tracing/instances/colimodel-2098073/per_cpu/cpu20/stats
+entries: 0
+overrun: 0
+commit overrun: 0
+bytes: 0
+oldest event ts:     0.000000
+now ts: 202108.615883
+dropped events: 0
+read events: 0
+
+/sys/kernel/tracing/instances/colimodel-2098073/per_cpu/cpu19/stats
+entries: 0
+overrun: 0
+commit overrun: 0
+bytes: 0
+oldest event ts:     0.000000
+now ts: 202108.615901
+dropped events: 0
+read events: 0
+
+/sys/kernel/tracing/instances/colimodel-2098073/per_cpu/cpu18/stats
+entries: 0
+overrun: 0
+commit overrun: 0
+bytes: 0
+oldest event ts:     0.000000
+now ts: 202108.615919
+dropped events: 0
+read events: 0
+
+/sys/kernel/tracing/instances/colimodel-2098073/per_cpu/cpu17/stats
+entries: 0
+overrun: 0
+commit overrun: 0
+bytes: 0
+oldest event ts:     0.000000
+now ts: 202108.615938
+dropped events: 0
+read events: 0
+
+/sys/kernel/tracing/instances/colimodel-2098073/per_cpu/cpu16/stats
+entries: 0
+overrun: 0
+commit overrun: 0
+bytes: 0
+oldest event ts: 202108.355076
+now ts: 202108.615957
+dropped events: 0
+read events: 22157
+
+/sys/kernel/tracing/instances/colimodel-2098073/per_cpu/cpu15/stats
+entries: 0
+overrun: 0
+commit overrun: 0
+bytes: 0
+oldest event ts:     0.000000
+now ts: 202108.615976
+dropped events: 0
+read events: 0
+
+/sys/kernel/tracing/instances/colimodel-2098073/per_cpu/cpu14/stats
+entries: 0
+overrun: 0
+commit overrun: 0
+bytes: 0
+oldest event ts:     0.000000
+now ts: 202108.616017
+dropped events: 0
+read events: 0
+
+/sys/kernel/tracing/instances/colimodel-2098073/per_cpu/cpu13/stats
+entries: 0
+overrun: 0
+commit overrun: 0
+bytes: 0
+oldest event ts:     0.000000
+now ts: 202108.616041
+dropped events: 0
+read events: 0
+
+/sys/kernel/tracing/instances/colimodel-2098073/per_cpu/cpu12/stats
+entries: 0
+overrun: 0
+commit overrun: 0
+bytes: 0
+oldest event ts: 202079.610152
+now ts: 202108.616060
+dropped events: 0
+read events: 64
+
+/sys/kernel/tracing/instances/colimodel-2098073/per_cpu/cpu11/stats
+entries: 0
+overrun: 0
+commit overrun: 0
+bytes: 0
+oldest event ts:     0.000000
+now ts: 202108.616078
+dropped events: 0
+read events: 0
+
+/sys/kernel/tracing/instances/colimodel-2098073/per_cpu/cpu10/stats
+entries: 0
+overrun: 0
+commit overrun: 0
+bytes: 0
+oldest event ts:     0.000000
+now ts: 202108.616096
+dropped events: 0
+read events: 0
+
+/sys/kernel/tracing/instances/colimodel-2098073/per_cpu/cpu9/stats
+entries: 0
+overrun: 0
+commit overrun: 0
+bytes: 0
+oldest event ts:     0.000000
+now ts: 202108.616114
+dropped events: 0
+read events: 0
+
+/sys/kernel/tracing/instances/colimodel-2098073/per_cpu/cpu8/stats
+entries: 0
+overrun: 0
+commit overrun: 0
+bytes: 0
+oldest event ts:     0.000000
+now ts: 202108.616133
+dropped events: 0
+read events: 0
+
+/sys/kernel/tracing/instances/colimodel-2098073/per_cpu/cpu7/stats
+entries: 0
+overrun: 0
+commit overrun: 0
+bytes: 0
+oldest event ts:     0.000000
+now ts: 202108.616151
+dropped events: 0
+read events: 0
+
+/sys/kernel/tracing/instances/colimodel-2098073/per_cpu/cpu6/stats
+entries: 0
+overrun: 0
+commit overrun: 0
+bytes: 0
+oldest event ts:     0.000000
+now ts: 202108.616169
+dropped events: 0
+read events: 0
+
+/sys/kernel/tracing/instances/colimodel-2098073/per_cpu/cpu5/stats
+entries: 0
+overrun: 0
+commit overrun: 0
+bytes: 0
+oldest event ts: 202107.735620
+now ts: 202108.616188
+dropped events: 0
+read events: 990
+
+/sys/kernel/tracing/instances/colimodel-2098073/per_cpu/cpu4/stats
+entries: 0
+overrun: 0
+commit overrun: 0
+bytes: 0
+oldest event ts: 202107.714642
+now ts: 202108.616207
+dropped events: 0
+read events: 1847
+
+/sys/kernel/tracing/instances/colimodel-2098073/per_cpu/cpu3/stats
+entries: 0
+overrun: 0
+commit overrun: 0
+bytes: 0
+oldest event ts: 202108.315521
+now ts: 202108.616225
+dropped events: 0
+read events: 5210
+
+/sys/kernel/tracing/instances/colimodel-2098073/per_cpu/cpu2/stats
+entries: 0
+overrun: 0
+commit overrun: 0
+bytes: 0
+oldest event ts: 202105.199277
+now ts: 202108.616243
+dropped events: 0
+read events: 7468
+
+/sys/kernel/tracing/instances/colimodel-2098073/per_cpu/cpu1/stats
+entries: 0
+overrun: 0
+commit overrun: 0
+bytes: 0
+oldest event ts: 202103.762793
+now ts: 202108.616261
+dropped events: 0
+read events: 4202
+
+/sys/kernel/tracing/instances/colimodel-2098073/per_cpu/cpu0/stats
+entries: 0
+overrun: 0
+commit overrun: 0
+bytes: 0
+oldest event ts: 202104.095276
+now ts: 202108.616283
+dropped events: 0
+read events: 2241

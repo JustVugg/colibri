@@ -35,9 +35,12 @@
  *
  * Header-only, all static, pure compute: no Model, no I/O, no allocation
  * beyond what the caller hands in. AVX2/FMA, AVX-VNNI or AVX512-VNNI where built,
- * with a scalar fallback that defines the numerics every SIMD path must
- * reproduce (f32 paths: same per-lane accumulation order; i8 paths: exact
- * integer sums, so identical by construction). */
+ * an SSE2 i8 kernel where AVX2+FMA are not, an AArch64 dotprod i8 kernel,
+ * with a scalar fallback that defines
+ * the numerics every SIMD path must reproduce (f32 paths: same per-lane
+ * accumulation order; i8 paths: exact integer sums and the same fmaf per lane
+ * and block, so identical by construction; the SSE2 one makes that fmaf in
+ * double, see its comment). */
 #ifndef COLI_EXPERT_FFN_H
 #define COLI_EXPERT_FFN_H
 
@@ -45,6 +48,7 @@
 #include <stddef.h>
 #include <string.h>
 #include <math.h>
+#include "fma_compat.h"
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
 #include <immintrin.h>
@@ -65,10 +69,33 @@ static inline size_t xf_row_bytes(int I) { return (size_t)I / 2; }
 static inline int    xf_groups(int I)    { return I / XF_BLOCK; }
 static inline int    xf_layout_ok(int I) { return I > 0 && (I % XF_BLOCK) == 0; }
 
+/* Blocks b..n-1 of a row through the scalar loop, in the layout of
+ * xf_repack_row_pairs_signed below: the blocks its SIMD paths do not take, or
+ * all of them without SIMD; tests/test_expert_ffn.c checks it on every host.
+ * src and dst may be identical (in-place), otherwise they may not overlap. */
+static inline void xf_repack_blocks_scalar(uint8_t *dst, const uint8_t *src, int b, int n) {
+    for (; b < n; b++) {
+        const uint8_t *s = src + (size_t)b * XF_BLOCK_BYTES;
+        uint8_t *d = dst + (size_t)b * XF_BLOCK_BYTES;
+        /* In-place output byte k can overwrite a pair needed by a later k.
+         * Preserve this one block; no expert-sized temporary is necessary. */
+        uint8_t saved[XF_BLOCK_BYTES];
+        if (d == s) { memcpy(saved, s, sizeof saved); s = saved; }
+        for (int k = 0; k < 32; k++) {
+            /* element k of the block: byte k/2, nibble k&1; element k+32: byte 16 + k/2 */
+            unsigned lo = (unsigned)(s[k >> 1]      >> ((k & 1) * 4)) & 0xF;
+            unsigned hi = (unsigned)(s[16 + (k >> 1)] >> ((k & 1) * 4)) & 0xF;
+            /* signed 4-bit -> v+8 is the nibble xor 8 */
+            d[k] = (uint8_t)((lo ^ 8u) | ((hi ^ 8u) << 4));
+        }
+    }
+}
+
 /* Repack one row from the "signed pairs" container layout (byte j = element
  * 2j in the low nibble, 2j+1 in the high nibble, two's-complement 4-bit — the
- * qwen36 converter's pack_int4) into planar unsigned. src and dst may not
- * overlap. I % 64 == 0. */
+ * qwen36 converter's pack_int4) into planar unsigned. src and dst may be
+ * identical (in-place), otherwise they may not overlap. I % 64 == 0.
+ * SIMD paths load each complete 32-byte block before storing it. */
 static inline void xf_repack_row_pairs_signed(uint8_t *dst, const uint8_t *src, int I) {
     int b = 0;
 #if defined(__AVX2__)
@@ -106,17 +133,7 @@ static inline void xf_repack_row_pairs_signed(uint8_t *dst, const uint8_t *src, 
         vst1q_u8(d + 16, veorq_u8(vzip2q_u8(even, odd), e8));
     }
 #endif
-    for (; b < I / XF_BLOCK; b++) {
-        const uint8_t *s = src + (size_t)b * XF_BLOCK_BYTES;
-        uint8_t *d = dst + (size_t)b * XF_BLOCK_BYTES;
-        for (int k = 0; k < 32; k++) {
-            /* element k of the block: byte k/2, nibble k&1; element k+32: byte 16 + k/2 */
-            unsigned lo = (unsigned)(s[k >> 1]      >> ((k & 1) * 4)) & 0xF;
-            unsigned hi = (unsigned)(s[16 + (k >> 1)] >> ((k & 1) * 4)) & 0xF;
-            /* signed 4-bit -> v+8 is the nibble xor 8 */
-            d[k] = (uint8_t)((lo ^ 8u) | ((hi ^ 8u) << 4));
-        }
-    }
+    xf_repack_blocks_scalar(dst, src, b, I / XF_BLOCK);
 }
 static inline void xf_repack_pairs_signed(uint8_t *dst, const uint8_t *src, int O, int I) {
     for (int o = 0; o < O; o++)
@@ -152,7 +169,12 @@ static inline float xf_act_i8(const float *x, int I, int8_t *xq, float *xsum) {
 /* f32: per block, 8 lanes l=0..7 accumulate elements l, l+8, ..., l+56 in
  * order with fma; the 8 lane sums are scaled by the block scale into 8 lane
  * accumulators; the row ends with the fixed 8->1 tree of xf_hsum8. The SIMD
- * paths reproduce exactly this. */
+ * paths reproduce exactly this. The fma is coli_fmaf (fma_compat.h): fmaf where
+ * the CPU fuses, the build the AVX2 path needs; without FMA (QWEN_EXPERT_ACT=f32,
+ * Qwen3.8's int4 experts) fmaf is glibc's software emulation, one call an
+ * element, where coli_fmaf rounds the exact double sum (#2606): Qwen3.6 with
+ * QWEN_EXPERT_ACT=f32 built for Sandy Bridge, glibc's fmaf in software, 0.59 ->
+ * 2.9 tok/s. There xf_dot_f32_dbl_rows below makes those operations in vectors. */
 static inline float xf_hsum8_scalar(const float *l) {
     float a0 = l[0] + l[4], a1 = l[1] + l[5], a2 = l[2] + l[6], a3 = l[3] + l[7];
     float b0 = a0 + a2, b1 = a1 + a3;
@@ -166,9 +188,9 @@ static inline float xf_dot_f32_ref(const uint8_t *w, const float *sc, const floa
         float lane[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         for (int i = 0; i < XF_BLOCK; i++) {
             int v = (i < 32 ? (blk[i] & 0xF) : (blk[i - 32] >> 4)) - 8;
-            lane[i & 7] = fmaf((float)v, xb[i], lane[i & 7]);
+            lane[i & 7] = coli_fmaf((float)v, xb[i], lane[i & 7]);
         }
-        for (int l = 0; l < 8; l++) acc[l] = fmaf(lane[l], sc[g], acc[l]);
+        for (int l = 0; l < 8; l++) acc[l] = coli_fmaf(lane[l], sc[g], acc[l]);
     }
     return xf_hsum8_scalar(acc);
 }
@@ -187,8 +209,8 @@ static inline float xf_dot_i8_ref(const uint8_t *w, const float *sc, const int8_
             lane[k >> 2] += (int32_t)(blk[k] & 0xF) * xb[k];
             lane[k >> 2] += (int32_t)(blk[k] >> 4)  * xb[k + 32];
         }
-        for (int l = 0; l < 8; l++) acc[l] = fmaf((float)lane[l], sc[g], acc[l]);
-        corr = fmaf(sc[g], xsum[g], corr);
+        for (int l = 0; l < 8; l++) acc[l] = coli_fmaf_exact((float)lane[l], sc[g], acc[l]);   /* fmaf's bits, inline without FMA */
+        corr = coli_fmaf_exact(sc[g], xsum[g], corr);
     }
     return (xf_hsum8_scalar(acc) - 8.f * corr) * sx;
 }
@@ -269,11 +291,285 @@ static inline float xf_dot_i8_avx2(const uint8_t *w, const float *sc, const int8
 }
 #endif /* AVX2 */
 
+#if !defined(XF_HAVE_AVX2) && defined(__ARM_NEON) && defined(__aarch64__) && defined(__ARM_FEATURE_DOTPROD)
+#define XF_HAVE_NEON_DOT 1
+/* i8 row dot with SDOT (Apple silicon, Armv8.2+ dotprod). A nibble (<= 15) is
+ * a valid int8, so vdotq_s32 of nibbles and activations gives the reference's
+ * integer lane sums exactly: lanes 0-3 from bytes 0..15 (elements 4l..4l+3
+ * and 32+4l..32+4l+3), lanes 4-7 from bytes 16..31. The f32 part is the
+ * reference's per-lane fma, its correction and its 8->1 tree, in the same
+ * order, so the result is the same bits as xf_dot_i8_ref. */
+static inline float xf_dot_i8_neon(const uint8_t *w, const float *sc, const int8_t *xq, const float *xsum, float sx, int I) {
+    const uint8x16_t m4 = vdupq_n_u8(0x0F);
+    const int32x4_t z = vdupq_n_s32(0);
+    float32x4_t acc0 = vdupq_n_f32(0.f), acc1 = vdupq_n_f32(0.f);
+    int ng = I / XF_BLOCK, g = 0;
+    for (; g < ng; g++) {
+        const uint8_t *blk = w + (size_t)g * XF_BLOCK_BYTES;
+        const int8_t *xb = xq + g * XF_BLOCK;
+        uint8x16_t b0 = vld1q_u8(blk), b1 = vld1q_u8(blk + 16);
+        int8x16_t lo0 = vreinterpretq_s8_u8(vandq_u8(b0, m4)), hi0 = vreinterpretq_s8_u8(vshrq_n_u8(b0, 4));
+        int8x16_t lo1 = vreinterpretq_s8_u8(vandq_u8(b1, m4)), hi1 = vreinterpretq_s8_u8(vshrq_n_u8(b1, 4));
+        int32x4_t d0 = vdotq_s32(vdotq_s32(z, lo0, vld1q_s8(xb)),      hi0, vld1q_s8(xb + 32));
+        int32x4_t d1 = vdotq_s32(vdotq_s32(z, lo1, vld1q_s8(xb + 16)), hi1, vld1q_s8(xb + 48));
+        float32x4_t s = vdupq_n_f32(sc[g]);
+        acc0 = vfmaq_f32(acc0, vcvtq_f32_s32(d0), s);
+        acc1 = vfmaq_f32(acc1, vcvtq_f32_s32(d1), s);
+    }
+    /* corr = sum_g sc[g]*xsum[g] in the scalar reference's order (sequential fma) */
+    float c = 0.f;
+    for (g = 0; g < ng; g++) c = fmaf(sc[g], xsum[g], c);
+    float32x4_t a = vaddq_f32(acc0, acc1);                         /* l+l+4 */
+    float32x2_t b = vadd_f32(vget_low_f32(a), vget_high_f32(a));   /* (0+4)+(2+6), (1+5)+(3+7) */
+    float h = vget_lane_f32(b, 0) + vget_lane_f32(b, 1);
+    return (h - 8.f * c) * sx;
+}
+#endif /* NEON dotprod */
+
+/* ---- SSE2 i8 kernel (PMADDWD, exact fmaf emulation) -----------------------
+ * Builds without AVX2+FMA on x86-64 (no -mavx2 -mfma: Ivy Bridge, Sandy Bridge, a
+ * plain -march=x86-64): the numbers of xf_dot_i8_ref, bit for bit, at SSE2.
+ *
+ * The integer part. A block's nibbles are widened to int16 (0..15) and meet the
+ * activations through PMADDWD, int16 x int16 pairs summed into int32. The int8
+ * activations are widened by unpacking them into the HIGH byte of each int16
+ * (x << 8, no sign-extension instruction); every product is then 256 times the
+ * true one, so the 4-element lane sums come out x256 and one arithmetic shift
+ * by 8 is exact. Worst case |x| = 128: 15 * 32768 per product, 8 per lane,
+ * 3.9e6 < 2^31. A lane l = 0..7 sums elements 4l..4l+3 and 32+4l..32+4l+3 of the
+ * block, as in xf_dot_i8_ref.
+ *
+ * The float part. The reference ends every lane of every block with
+ * fmaf(lane, sc, acc): a correctly rounded float result of lane*sc + acc, which
+ * without hardware FMA is a libm call that spends most of the row's time in
+ * fenv. Here it is made exactly, two lanes to an SSE register, in double:
+ *   - lane*sc is exact in a double (|lane| < 2^14, sc has 24 bits: 38 bits);
+ *   - s = p + acc and the exact error e of that sum (Knuth's TwoSum);
+ *   - the exact sum p + acc is rounded TO ODD at double precision, which is
+ *     s itself if e == 0, else the neighbour of the exact value that has an odd
+ *     last bit: s | 1 when e has the sign of s (the exact value is farther from
+ *     zero than s), (s - 1) | 1 when it is nearer (integers on the bit patterns);
+ *   - rounding to odd at 53 bits and then to nearest-even at 24 is the
+ *     correctly rounded float result (Boldo and Melquiond, Theorem 3: at least
+ *     two extra precision bits and two extra bits below the smallest float
+ *     subnormal). Both a float*float product (at most 48 significant bits) and
+ *     the TwoSum residual fit exactly in double, without double overflow or
+ *     underflow. This includes the correction product sc*xsum, not just lanes.
+ *     The result is the one fmaf returns, subnormal results and ties included.
+ * Between blocks the accumulators stay doubles holding exact float values. The
+ * order of every operation is the reference's: eight lane accumulators, the
+ * correction sum_g fmaf(sc, xsum, .) in block order, xf_hsum8_scalar's tree,
+ * (hsum - 8 corr) * sx. Only a non-finite sc or xsum can differ (the NaN payload
+ * and sign, not that the result is a NaN); real scales and sums are finite.
+ * No hardware FMA, no -ffast-math, no libm call. Needs round-to-nearest with
+ * gradual underflow; dispatch falls back for other MXCSR modes. Do not select
+ * this emulation when the compiler can contract its TwoSum operations into FMA.
+ * See Boldo and Melquiond, doi:10.1109/TC.2007.70819. */
+#if !defined(XF_HAVE_AVX2) && !defined(__FMA__) && !defined(__FAST_MATH__) && defined(__SSE2__) && (defined(__x86_64__) || defined(__SSE2_MATH__))
+#define XF_HAVE_SSE2_INT16 1
+
+/* fmaf(a, b, c) in both lanes: p = a*b EXACT in double (the caller's guarantee),
+ * c a float held in a double; the result is the float fmaf returns, held in a double */
+static inline __m128d xf_fmaf2_sse2(__m128d p, __m128d c) {
+    const __m128d sign = _mm_set1_pd(-0.0);
+    __m128d s  = _mm_add_pd(p, c);
+    __m128d bb = _mm_sub_pd(s, p);
+    __m128d e  = _mm_add_pd(_mm_sub_pd(p, _mm_sub_pd(s, bb)), _mm_sub_pd(c, bb));
+    __m128i m  = _mm_castpd_si128(_mm_cmplt_pd(_mm_setzero_pd(), _mm_andnot_pd(sign, e)));    /* |e| > 0 (false for NaN) */
+    __m128i nearer = _mm_srai_epi32(_mm_castpd_si128(_mm_xor_pd(e, s)), 31);                  /* sign(e) != sign(s), high dwords */
+    nearer = _mm_shuffle_epi32(nearer, _MM_SHUFFLE(3, 3, 1, 1));
+    __m128i si = _mm_add_epi64(_mm_castpd_si128(s), _mm_and_si128(nearer, m));                /* s - 1 when nearer and inexact */
+    si = _mm_or_si128(si, _mm_and_si128(m, _mm_set_epi32(0, 1, 0, 1)));                       /* | 1 when inexact */
+    return _mm_cvtps_pd(_mm_cvtpd_ps(_mm_castsi128_pd(si)));
+}
+
+/* x[0..7] of an activation block as int16, each in the high byte: x * 256 */
+static inline __m128i xf_x8_hi_sse2(const int8_t *p) {
+    return _mm_unpacklo_epi8(_mm_setzero_si128(), _mm_loadl_epi64((const __m128i *)p));
+}
+/* eight int32 lane sums of a block from the pair sums (times 256) of its four 8-byte groups */
+static inline void xf_lanes_sse2(__m128i q0, __m128i q1, __m128i q2, __m128i q3, __m128i *l03, __m128i *l47) {
+    __m128 a = _mm_castsi128_ps(q0), b = _mm_castsi128_ps(q1), c = _mm_castsi128_ps(q2), d = _mm_castsi128_ps(q3);
+    *l03 = _mm_srai_epi32(_mm_add_epi32(_mm_castps_si128(_mm_shuffle_ps(a, b, _MM_SHUFFLE(2, 0, 2, 0))),
+                                        _mm_castps_si128(_mm_shuffle_ps(a, b, _MM_SHUFFLE(3, 1, 3, 1)))), 8);
+    *l47 = _mm_srai_epi32(_mm_add_epi32(_mm_castps_si128(_mm_shuffle_ps(c, d, _MM_SHUFFLE(2, 0, 2, 0))),
+                                        _mm_castps_si128(_mm_shuffle_ps(c, d, _MM_SHUFFLE(3, 1, 3, 1)))), 8);
+}
+
+static inline float xf_dot_i8_sse2_int16(const uint8_t *w, const float *sc, const int8_t *xq, const float *xsum, float sx, int I) {
+    const int ng = I / XF_BLOCK;
+    const __m128i m4 = _mm_set1_epi8(0x0F), zero = _mm_setzero_si128();
+    __m128d a01 = _mm_setzero_pd(), a23 = a01, a45 = a01, a67 = a01, cr = a01;   /* lanes 0..7 and the correction */
+
+    for (int g = 0; g < ng; g++) {
+        const uint8_t *blk = w + (size_t)g * XF_BLOCK_BYTES;
+        const int8_t *xb = xq + (size_t)g * XF_BLOCK;
+        const __m128i b0 = _mm_loadu_si128((const __m128i *)blk), b1 = _mm_loadu_si128((const __m128i *)(blk + 16));
+        const __m128i lo0 = _mm_and_si128(b0, m4), lo1 = _mm_and_si128(b1, m4);                       /* elements 0..15, 16..31 */
+        const __m128i hi0 = _mm_and_si128(_mm_srli_epi16(b0, 4), m4), hi1 = _mm_and_si128(_mm_srli_epi16(b1, 4), m4);   /* 32..47, 48..63 */
+        __m128i q0 = _mm_add_epi32(_mm_madd_epi16(_mm_unpacklo_epi8(lo0, zero), xf_x8_hi_sse2(xb)),
+                                   _mm_madd_epi16(_mm_unpacklo_epi8(hi0, zero), xf_x8_hi_sse2(xb + 32)));
+        __m128i q1 = _mm_add_epi32(_mm_madd_epi16(_mm_unpackhi_epi8(lo0, zero), xf_x8_hi_sse2(xb + 8)),
+                                   _mm_madd_epi16(_mm_unpackhi_epi8(hi0, zero), xf_x8_hi_sse2(xb + 40)));
+        __m128i q2 = _mm_add_epi32(_mm_madd_epi16(_mm_unpacklo_epi8(lo1, zero), xf_x8_hi_sse2(xb + 16)),
+                                   _mm_madd_epi16(_mm_unpacklo_epi8(hi1, zero), xf_x8_hi_sse2(xb + 48)));
+        __m128i q3 = _mm_add_epi32(_mm_madd_epi16(_mm_unpackhi_epi8(lo1, zero), xf_x8_hi_sse2(xb + 24)),
+                                   _mm_madd_epi16(_mm_unpackhi_epi8(hi1, zero), xf_x8_hi_sse2(xb + 56)));
+        __m128i l03, l47;
+        xf_lanes_sse2(q0, q1, q2, q3, &l03, &l47);
+
+        const __m128d s = _mm_set1_pd((double)sc[g]);
+        a01 = xf_fmaf2_sse2(_mm_mul_pd(_mm_cvtepi32_pd(l03), s), a01);
+        a23 = xf_fmaf2_sse2(_mm_mul_pd(_mm_cvtepi32_pd(_mm_shuffle_epi32(l03, _MM_SHUFFLE(1, 0, 3, 2))), s), a23);
+        a45 = xf_fmaf2_sse2(_mm_mul_pd(_mm_cvtepi32_pd(l47), s), a45);
+        a67 = xf_fmaf2_sse2(_mm_mul_pd(_mm_cvtepi32_pd(_mm_shuffle_epi32(l47, _MM_SHUFFLE(1, 0, 3, 2))), s), a67);
+        cr  = xf_fmaf2_sse2(_mm_mul_pd(s, _mm_set1_pd((double)xsum[g])), cr);
+    }
+    float acc[8];
+    _mm_storeu_ps(acc,     _mm_movelh_ps(_mm_cvtpd_ps(a01), _mm_cvtpd_ps(a23)));
+    _mm_storeu_ps(acc + 4, _mm_movelh_ps(_mm_cvtpd_ps(a45), _mm_cvtpd_ps(a67)));
+    return (xf_hsum8_scalar(acc) - 8.f * _mm_cvtss_f32(_mm_cvtpd_ps(cr))) * sx;
+}
+#endif /* SSE2 i8 */
+
+/* f32, x86 without FMA (Sandy Bridge, Ivy Bridge, the x86-64 baseline and v2). There coli_fmaf is
+ * (float)((double)a * b + c) (fma_compat.h): the product is exact in double, the sum rounds once in
+ * double and once to float. The reference makes that one element at a time, a code widened to float
+ * and the operation in scalar registers; this kernel makes the very same operations lane by lane,
+ * the 8 lanes of a block in two AVX double vectors (four SSE2 ones without AVX), the 64 codes of a
+ * block widened once for every activation row it serves, so its bits are xf_dot_f32_ref's
+ * (tests/test_xf_f32_nofma). Qwen3.8's int4-g64 experts on a Xeon E5-2690 v1 took 427 ms a forward
+ * in the reference against 173 for the FP8 experts they replace, though they read 44% fewer bytes
+ * (#2715). */
+#if !defined(XF_HAVE_AVX2) && !defined(__FMA__) && !defined(__FAST_MATH__) && defined(__SSE2__) && \
+    (defined(__x86_64__) || defined(__SSE2_MATH__)) && !defined(FP_FAST_FMAF) && !defined(__FP_FAST_FMAF)
+#define XF_HAVE_F32_DBL 1
+#define XF_F32_ROWS_DBL 4   /* rows a call: xf_dot_f32_rows' chunk */
+/* the 64 codes of a block as int32 v - 8, element order: e[j] holds elements 4j..4j+3 */
+static inline void xf_blk_i32_sse2(const uint8_t *blk, __m128i e[16]) {
+    const __m128i m4 = _mm_set1_epi8(0x0F), e8 = _mm_set1_epi16(8), z = _mm_setzero_si128();
+    const __m128i b0 = _mm_loadu_si128((const __m128i *)blk), b1 = _mm_loadu_si128((const __m128i *)(blk + 16));
+    const __m128i n[4] = { _mm_and_si128(b0, m4), _mm_and_si128(b1, m4),                        /* elements 0..15, 16..31 */
+                           _mm_and_si128(_mm_srli_epi16(b0, 4), m4), _mm_and_si128(_mm_srli_epi16(b1, 4), m4) };   /* 32..63 */
+    for (int q = 0; q < 4; q++) {
+        const __m128i lo = _mm_sub_epi16(_mm_unpacklo_epi8(n[q], z), e8), hi = _mm_sub_epi16(_mm_unpackhi_epi8(n[q], z), e8);
+        e[4 * q + 0] = _mm_srai_epi32(_mm_unpacklo_epi16(lo, lo), 16);
+        e[4 * q + 1] = _mm_srai_epi32(_mm_unpackhi_epi16(lo, lo), 16);
+        e[4 * q + 2] = _mm_srai_epi32(_mm_unpacklo_epi16(hi, hi), 16);
+        e[4 * q + 3] = _mm_srai_epi32(_mm_unpackhi_epi16(hi, hi), 16);
+    }
+}
+#ifdef __AVX__
+/* coli_fmaf in four lanes: p exact (a product of two floats), c a float held in a double */
+#define XF_DFMA4(p, c) _mm256_cvtps_pd(_mm256_cvtpd_ps(_mm256_add_pd((p), (c))))
+/* one block's step k for one row: lanes 0..3 and 4..7 (wd its 16 code vectors, xb its 64 activations) */
+#define XF_DSTEP4(l0, l1, wd, xb, k) \
+    (l0 = XF_DFMA4(_mm256_mul_pd((wd)[2 * (k)],     _mm256_cvtps_pd(_mm_loadu_ps((xb) + 8 * (k)))),     l0), \
+     l1 = XF_DFMA4(_mm256_mul_pd((wd)[2 * (k) + 1], _mm256_cvtps_pd(_mm_loadu_ps((xb) + 8 * (k) + 4))), l1))
+static inline void xf_blk_dbl_avx(const uint8_t *blk, __m256d wd[16]) {
+    __m128i e[16]; xf_blk_i32_sse2(blk, e);
+    for (int j = 0; j < 16; j++) wd[j] = _mm256_cvtepi32_pd(e[j]);
+}
+static inline void xf_dot_f32_dbl_rows(float *y, int ystride, const uint8_t *w, const float *sc,
+                                       const float *const *x, int I, int S) {
+    __m256d acc[XF_F32_ROWS_DBL][2];
+    for (int s = 0; s < S; s++) acc[s][0] = acc[s][1] = _mm256_setzero_pd();
+    const int ng = I / XF_BLOCK;
+    int g = 0;
+    /* Four blocks at a time: a block's lanes start from zero, so the four are independent chains
+     * (each rounds to float at every step, the latency the single chain waited on) until each joins
+     * the row's accumulators, in block order. */
+    for (; g + 4 <= ng; g += 4) {
+        __m256d wd[4][16];
+        for (int b = 0; b < 4; b++) xf_blk_dbl_avx(w + (size_t)(g + b) * XF_BLOCK_BYTES, wd[b]);
+        for (int s = 0; s < S; s++) {
+            const float *xb = x[s] + g * XF_BLOCK;
+            __m256d a0 = _mm256_setzero_pd(), a1 = a0, b0 = a0, b1 = a0, c0 = a0, c1 = a0, d0 = a0, d1 = a0;
+            for (int k = 0; k < 8; k++) {
+                XF_DSTEP4(a0, a1, wd[0], xb, k);
+                XF_DSTEP4(b0, b1, wd[1], xb + XF_BLOCK, k);
+                XF_DSTEP4(c0, c1, wd[2], xb + 2 * XF_BLOCK, k);
+                XF_DSTEP4(d0, d1, wd[3], xb + 3 * XF_BLOCK, k);
+            }
+            __m256d sd = _mm256_set1_pd((double)sc[g]);
+            acc[s][0] = XF_DFMA4(_mm256_mul_pd(a0, sd), acc[s][0]); acc[s][1] = XF_DFMA4(_mm256_mul_pd(a1, sd), acc[s][1]);
+            sd = _mm256_set1_pd((double)sc[g + 1]);
+            acc[s][0] = XF_DFMA4(_mm256_mul_pd(b0, sd), acc[s][0]); acc[s][1] = XF_DFMA4(_mm256_mul_pd(b1, sd), acc[s][1]);
+            sd = _mm256_set1_pd((double)sc[g + 2]);
+            acc[s][0] = XF_DFMA4(_mm256_mul_pd(c0, sd), acc[s][0]); acc[s][1] = XF_DFMA4(_mm256_mul_pd(c1, sd), acc[s][1]);
+            sd = _mm256_set1_pd((double)sc[g + 3]);
+            acc[s][0] = XF_DFMA4(_mm256_mul_pd(d0, sd), acc[s][0]); acc[s][1] = XF_DFMA4(_mm256_mul_pd(d1, sd), acc[s][1]);
+        }
+    }
+    for (; g < ng; g++) {
+        __m256d wd[16]; xf_blk_dbl_avx(w + (size_t)g * XF_BLOCK_BYTES, wd);
+        const __m256d scd = _mm256_set1_pd((double)sc[g]);
+        for (int s = 0; s < S; s++) {
+            const float *xb = x[s] + g * XF_BLOCK;
+            __m256d l0 = _mm256_setzero_pd(), l1 = _mm256_setzero_pd();   /* lanes 0..3, 4..7 */
+            for (int k = 0; k < 8; k++) XF_DSTEP4(l0, l1, wd, xb, k);
+            acc[s][0] = XF_DFMA4(_mm256_mul_pd(l0, scd), acc[s][0]);
+            acc[s][1] = XF_DFMA4(_mm256_mul_pd(l1, scd), acc[s][1]);
+        }
+    }
+    for (int s = 0; s < S; s++) {
+        float a[8];
+        _mm_storeu_ps(a, _mm256_cvtpd_ps(acc[s][0])); _mm_storeu_ps(a + 4, _mm256_cvtpd_ps(acc[s][1]));
+        y[(size_t)s * ystride] = xf_hsum8_scalar(a);
+    }
+}
+#else
+#define XF_DFMA2(p, c) _mm_cvtps_pd(_mm_cvtpd_ps(_mm_add_pd((p), (c))))
+static inline void xf_dot_f32_dbl_rows(float *y, int ystride, const uint8_t *w, const float *sc,
+                                       const float *const *x, int I, int S) {
+    __m128d acc[XF_F32_ROWS_DBL][4];
+    for (int s = 0; s < S; s++) acc[s][0] = acc[s][1] = acc[s][2] = acc[s][3] = _mm_setzero_pd();
+    const int ng = I / XF_BLOCK;
+    /* two blocks at a time, as the AVX form's four: independent chains until each joins acc in block order */
+    for (int g = 0; g < ng; g += 2) {
+        const int nb = ng - g < 2 ? ng - g : 2;
+        __m128d wd[2][32];   /* elements 2j, 2j+1 */
+        for (int b = 0; b < nb; b++) {
+            __m128i e[16]; xf_blk_i32_sse2(w + (size_t)(g + b) * XF_BLOCK_BYTES, e);
+            for (int j = 0; j < 16; j++) { wd[b][2 * j] = _mm_cvtepi32_pd(e[j]); wd[b][2 * j + 1] = _mm_cvtepi32_pd(_mm_shuffle_epi32(e[j], _MM_SHUFFLE(1, 0, 3, 2))); }
+        }
+        for (int s = 0; s < S; s++) {
+            __m128d l[2][4];   /* a block's lanes 0-1, 2-3, 4-5, 6-7 */
+            for (int b = 0; b < 2; b++) for (int q = 0; q < 4; q++) l[b][q] = _mm_setzero_pd();
+            for (int k = 0; k < 8; k++)
+                for (int b = 0; b < nb; b++) {
+                    const float *xb = x[s] + (g + b) * XF_BLOCK;
+                    const __m128 x0 = _mm_loadu_ps(xb + 8 * k), x1 = _mm_loadu_ps(xb + 8 * k + 4);
+                    l[b][0] = XF_DFMA2(_mm_mul_pd(wd[b][4 * k],     _mm_cvtps_pd(x0)),                    l[b][0]);
+                    l[b][1] = XF_DFMA2(_mm_mul_pd(wd[b][4 * k + 1], _mm_cvtps_pd(_mm_movehl_ps(x0, x0))), l[b][1]);
+                    l[b][2] = XF_DFMA2(_mm_mul_pd(wd[b][4 * k + 2], _mm_cvtps_pd(x1)),                    l[b][2]);
+                    l[b][3] = XF_DFMA2(_mm_mul_pd(wd[b][4 * k + 3], _mm_cvtps_pd(_mm_movehl_ps(x1, x1))), l[b][3]);
+                }
+            for (int b = 0; b < nb; b++) {
+                const __m128d scd = _mm_set1_pd((double)sc[g + b]);
+                for (int q = 0; q < 4; q++) acc[s][q] = XF_DFMA2(_mm_mul_pd(l[b][q], scd), acc[s][q]);
+            }
+        }
+    }
+    for (int s = 0; s < S; s++) {
+        float a[8];
+        _mm_storeu_ps(a,     _mm_movelh_ps(_mm_cvtpd_ps(acc[s][0]), _mm_cvtpd_ps(acc[s][1])));
+        _mm_storeu_ps(a + 4, _mm_movelh_ps(_mm_cvtpd_ps(acc[s][2]), _mm_cvtpd_ps(acc[s][3])));
+        y[(size_t)s * ystride] = xf_hsum8_scalar(a);
+    }
+}
+#endif
+#endif /* f32 without FMA */
+
 /* ---- dispatch -------------------------------------------------------------- */
 
 static inline float xf_dot_f32(const uint8_t *w, const float *sc, const float *x, int I) {
 #ifdef XF_HAVE_AVX2
     return xf_dot_f32_avx2(w, sc, x, I);
+#elif defined(XF_HAVE_F32_DBL)
+    float y; const float *xs[1] = { x };
+    xf_dot_f32_dbl_rows(&y, 1, w, sc, xs, I, 1);
+    return y;
 #else
     return xf_dot_f32_ref(w, sc, x, I);
 #endif
@@ -319,6 +615,8 @@ static inline void xf_dot_f32_rows(float *y, int ystride, const uint8_t *w, cons
         case 3: xf_dot_f32_rows_body(y + (size_t)s0 * ystride, ystride, w, sc, x + s0, I, 3); break;
         default: xf_dot_f32_rows_body(y + (size_t)s0 * ystride, ystride, w, sc, x + s0, I, 4); break;
         }
+#elif defined(XF_HAVE_F32_DBL)
+        xf_dot_f32_dbl_rows(y + (size_t)s0 * ystride, ystride, w, sc, x + s0, I, n);
 #else
         for (int s = 0; s < n; s++) y[(size_t)(s0 + s) * ystride] = xf_dot_f32_ref(w, sc, x[s0 + s], I);
 #endif
@@ -327,6 +625,14 @@ static inline void xf_dot_f32_rows(float *y, int ystride, const uint8_t *w, cons
 static inline float xf_dot_i8(const uint8_t *w, const float *sc, const int8_t *xq, const float *xsum, float sx, int I) {
 #ifdef XF_HAVE_AVX2
     return xf_dot_i8_avx2(w, sc, xq, xsum, sx, I);
+#elif defined(XF_HAVE_NEON_DOT)
+    return xf_dot_i8_neon(w, sc, xq, xsum, sx, I);
+#elif defined(XF_HAVE_SSE2_INT16)
+    /* RC (rounding control), FTZ (flush to zero), DAZ (denormals are zero).
+     * Preserve the reference's behavior outside the emulation's assumptions. */
+    if (_mm_getcsr() & (_MM_ROUND_MASK | _MM_FLUSH_ZERO_MASK | 0x0040))
+        return xf_dot_i8_ref(w, sc, xq, xsum, sx, I);
+    return xf_dot_i8_sse2_int16(w, sc, xq, xsum, sx, I);
 #else
     return xf_dot_i8_ref(w, sc, xq, xsum, sx, I);
 #endif
@@ -374,7 +680,7 @@ static inline void xf_dot_i8_rows(float *y, int ystride, const uint8_t *w, const
     }
 #else
     for (int r = 0; r < n; r++)
-        y[(size_t)r * ystride] = xf_dot_i8_ref(w, sc, xq + (size_t)r * I, xsum + (size_t)r * (I / XF_BLOCK), sx[r], I);
+        y[(size_t)r * ystride] = xf_dot_i8(w, sc, xq + (size_t)r * I, xsum + (size_t)r * (I / XF_BLOCK), sx[r], I);
 #endif
 }
 

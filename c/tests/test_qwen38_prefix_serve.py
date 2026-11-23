@@ -30,7 +30,8 @@ from prefix_serve_harness import PromptCancelContract, ServeEngine  # noqa: E402
 HERE = Path(__file__).resolve().parent.parent
 ENGINE = Path(os.environ.get("QWEN38_BINARY", HERE / ("qwen38.exe" if sys.platform == "win32" else "qwen38")))
 FIXTURE = Path(os.environ.get("QWEN38_TINY", HERE / "qwen38_tiny"))
-REUSED = re.compile(r"\[PREFIX\] reusing (\d+) of (\d+) prompt tokens \(\d+%\) from (.+)")
+# Windows: the engine's stderr lines end in \r\n, and the harness keeps the \r
+REUSED = re.compile(r"\[PREFIX\] reusing (\d+) of (\d+) prompt tokens \(\d+%\) from ([^\r\n]+)")
 
 
 @unittest.skipUnless(ENGINE.exists(), "qwen38 is not built")
@@ -152,6 +153,54 @@ class Qwen38PrefixServeTest(PromptCancelContract, unittest.TestCase):
         n, total, source = self.reuses(log)[-1]
         self.assertEqual((total, source), (len(second), "the live state"), log)
         self.assertGreater(n, len(self.OPENING), "the parked conversation's answer was read again\n" + log)
+
+    def test_a_new_shorter_conversation_keeps_its_own_state(self):
+        """#2703: a new conversation shorter than the last parked the old one at every turn and
+        got it back after every turn, so each of its turns read everything again. The next
+        request decides instead: from its second turn on it continues from its own state, and
+        answers as a cold engine does."""
+        new = b"5*5=25; 6*6="
+        with mock.patch.dict(os.environ, {"COLI_PARK_MIN": "16"}):
+            warm = self.spawn()
+        warm.ask("1", self.OPENING, max_tok=8)
+        reply = warm.ask("2", new, max_tok=8)
+        second = new + reply + b" 7*7="
+        got = warm.ask("3", second, max_tok=8)
+        log = warm.close()
+        self.assertIn("conversation parked for a %d-token request" % len(new), log)
+        self.assertNotIn("conversation is back", log, "the old conversation came back after the new one's turn:\n" + log)
+        self.assertEqual(got, self.cold(second), "the new conversation's second turn answered otherwise")
+        n, total, source = self.reuses(log)[-1]
+        self.assertEqual((total, source), (len(second), "the live state"), log)
+        self.assertGreater(n, len(new), "the new conversation's first turn was read again\n" + log)
+
+    # a system prompt of the fixture's bytes, its markers set by Q38_HEAD_PIN_MARKS
+    SYSTEM = b"(" + b"12+34=46; 7*8=56; 9-3=6; 5*5=25; 3+3=6; " * 2 + b")"
+    HEAD_PIN = {"COLI_HEAD_PIN_MIN": "8", "Q38_HEAD_PIN_MARKS": "(|)"}
+
+    def test_a_new_conversation_reuses_the_system_prompt(self):
+        """An agent's conversations share a long system prompt and part right after it (Hermes:
+        14,500 tokens, read again for every new conversation). The first leaves a pin at the
+        system prompt's end; the second restores it, reads only its own text and answers as a
+        cold engine does."""
+        with mock.patch.dict(os.environ, self.HEAD_PIN):
+            warm = self.spawn()
+        first, second = self.SYSTEM + b"1+1=", self.SYSTEM + b"2+2="
+        warm.ask("1", first, max_tok=8)
+        got = warm.ask("2", second, max_tok=8)
+        log = warm.close()
+        self.assertIn("[PREFIX] the %d-token system prompt pinned" % len(self.SYSTEM), log)
+        self.assertEqual(self.reuses(log)[-1], (len(self.SYSTEM), len(second), "a pin"), log)
+        self.assertEqual(got, self.cold(second), "the conversation answered otherwise from the system prompt's pin")
+
+    def test_no_system_prompt_pin_when_off(self):
+        with mock.patch.dict(os.environ, dict(self.HEAD_PIN, COLI_HEAD_PIN_MIN="0")):
+            warm = self.spawn()
+        warm.ask("1", self.SYSTEM + b"1+1=", max_tok=8)
+        warm.ask("2", self.SYSTEM + b"2+2=", max_tok=8)
+        log = warm.close()
+        self.assertNotIn("system prompt pinned", log)
+        self.assertNotIn("from a pin", log)
 
     def test_a_diverging_prompt_starts_over(self):
         warm = self.spawn()

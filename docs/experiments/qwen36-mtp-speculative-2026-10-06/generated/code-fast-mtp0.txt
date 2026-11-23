@@ -1,0 +1,15 @@
+_tensor *router_logits;
+    q36_tensor *x;                 /* input/output tensor */
+    q36_tensor *shared_expert;                 /* shared expert weights */
+    q36_tensor *router;                 /* router weights */
+    q36_tensor *router_topk;                 /* top-k indices */
+    q36_tensor *router_topk_scores;             /* top-k scores */
+    q36 CPU_MM_ROUTER router_mm;                /* CPU-side router state */
+    q36_layer_loader loader;                 /* loader state */
+    q36_advice_schedule advice;                 /* advice schedule */
+    q36_advice_schedule advice_shared;          /* shared expert advice schedule */
+    q36_advice_schedule advice_routed;          /* routed expert advice schedule */
+    q36_advice_schedule advice_routed_expert;   /* per-expert advice schedule */
+    q36_advice_schedule advice_routed_expert_sort; /* per-expert sort advice schedule */
+    q36_advice_schedule advice_routed_expert_add; /* per-expert add advice schedule */
+    q36_advice_schedule advice_routed_expert_add_final; /*

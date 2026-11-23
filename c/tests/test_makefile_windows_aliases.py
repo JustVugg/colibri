@@ -12,7 +12,8 @@ import unittest
 from pathlib import Path
 
 C_DIR = Path(__file__).resolve().parents[1]
-MAKE = shutil.which("make")
+# GNU make: the BSDs' own make cannot read this Makefile, and they install GNU make as gmake.
+MAKE = shutil.which("gmake" if sys.platform.startswith(("freebsd", "openbsd", "netbsd", "dragonfly")) else "make")
 sys.path.insert(0, str(C_DIR))
 import family_registry  # noqa: E402
 

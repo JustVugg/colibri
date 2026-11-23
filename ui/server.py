@@ -14,18 +14,30 @@ the Responses API over the gateway's chat API, for agents that speak only that).
 this machine, else a models service on the engine's machine (--models-backend);
 with neither it answers 404 and the page says the feature is not available.
 
-Streams (chat in SSE) are passed through chunk by chunk; when the browser goes
-away the upstream connection is closed, so the gateway stops the engine."""
-import argparse, http.client, json, os, sys, urllib.parse
+Streams (chat in SSE) are passed through chunk by chunk. A confirmed client reset
+or failed response write closes upstream. A client that only closes its request
+write side can still read its response."""
+import argparse, json, os, sys, time, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import agents, responses_shim, web   # noqa: E402
+import agents, docs, responses_shim, web   # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-PROXIED = ("/v1/", "/health", "/profile", "/experts")
+PROXIED = ("/v1/", "/health", "/profile", "/experts", "/power")
 MODELS = "/models/"   # the Models page: what fits this machine, search, download and switch models
 HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authorization", "proxy-authenticate", "host", "content-length"}
+LOOPBACK = ("127.0.0.1", "localhost", "::1")
+
+
+def host_name(value):
+    """the name in a Host header, lower case: `name`, `name:port`, `ipv4:port` or `[ipv6]:port`"""
+    value = (value or "").strip().lower()
+    if value.startswith("["):
+        return value[1:].split("]", 1)[0]
+    if value.count(":") == 1:
+        return value.rsplit(":", 1)[0]
+    return value
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -34,6 +46,8 @@ class Handler(BaseHTTPRequestHandler):
     models_backend = None   # a models service elsewhere (--models-backend)
     models = None           # ui/models.py in this process (the gateway is on this machine)
     port = 8790
+    bind_host = "127.0.0.1"  # what this server listens on (--host)
+    allowed_hosts = ()       # more Host names the API paths accept (--allowed-host)
 
     def _json(self, code, obj):
         b = json.dumps(obj).encode()
@@ -57,6 +71,25 @@ class Handler(BaseHTTPRequestHandler):
         if post and (self.headers.get("X-Colibri-UI") != "1" or not (self.headers.get("Content-Type") or "").startswith("application/json")):
             return False
         return True
+
+    def _api_host_ok(self):
+        """DNS-rebinding guard for the paths this server passes on to the gateway. The gateway
+        refuses a Host that is not loopback, but it sees only the Host this proxy writes (the
+        client's is dropped, see HOP), so without this a page on another site that re-points its
+        name at 127.0.0.1 reaches the gateway through the UI port. Applies only to a server bound
+        to this machine: once it listens on 0.0.0.0 or a LAN address the exposure is already
+        chosen, as in the gateway's own guard."""
+        if (self.bind_host or "").strip("[]").lower() not in LOOPBACK:
+            return True
+        name = host_name(self.headers.get("Host"))
+        return name in LOOPBACK or name in self.allowed_hosts or "*" in self.allowed_hosts
+
+    def _host_refused(self):
+        name = host_name(self.headers.get("Host"))
+        self.close_connection = True   # a body may be unread
+        self._json(403, {"error": "Host header %r not allowed. Add it with --allowed-host %s (or COLI_ALLOWED_HOSTS), "
+                                  "or --allowed-host '*' to accept any host when the UI is reached by a name it "
+                                  "cannot predict." % (name, name)})
 
     def _agents(self, path):
         post = self.command == "POST"
@@ -104,38 +137,51 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length) if length else None
         headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP and k.lower() != "origin"}
-        conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=3600)
-        try:
-            conn.request(self.command, self.path, body=body, headers=headers)
-            resp = conn.getresponse()
-        except OSError as e:
-            msg = ('{"error":{"message":"colibri non risponde su %s: %s"}}' % (u.netloc, e)).encode()
+        conn = responses_shim.gateway_connection(u)
+
+        def unavailable(error):
+            msg = ('{"error":{"message":"colibri non risponde su %s: %s"}}' % (u.netloc, error)).encode()
             self.send_response(502)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(msg)))
             self.end_headers()
             self.wfile.write(msg)
-            return
-        self.send_response(resp.status, resp.reason)
-        for k, v in resp.getheaders():
-            if k.lower() not in HOP:
-                self.send_header(k, v)
-        self.send_header("Transfer-Encoding", "chunked")
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
+
         try:
-            while True:
-                chunk = resp.read1(65536)
-                if not chunk:
-                    break
-                self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
-                self.wfile.flush()
-            self.wfile.write(b"0\r\n\r\n")
-            self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            pass  # the page stopped the request: closing upstream cancels the engine
-        finally:
+            conn.request(self.command, self.path, body=body, headers=headers)
+        except OSError as error:
             conn.close()
+            return unavailable(error)
+        with responses_shim._cancel_on_disconnect(self, conn) as disconnected:
+            try:
+                resp = conn.getresponse()
+            except OSError as error:
+                if disconnected.is_set():
+                    self.close_connection = True
+                    return
+                return unavailable(error)
+            try:
+                self.send_response(resp.status, resp.reason)
+                for k, v in resp.getheaders():
+                    if k.lower() not in HOP:
+                        self.send_header(k, v)
+                self.send_header("Transfer-Encoding", "chunked")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                while True:
+                    chunk = resp.read1(65536)
+                    if not chunk:
+                        break
+                    self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
+                    self.wfile.flush()
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                self.close_connection = True
+            finally:
+                resp.close()
+        if disconnected.is_set():
+            self.close_connection = True
 
     def _web(self, path):
         """the chat's web search: /web/status, /web/search?q=&n=, /web/page?url=&max="""
@@ -171,9 +217,31 @@ class Handler(BaseHTTPRequestHandler):
         code, obj = self.models.handle(self.command, u.path, u.query, self.rfile.read(n) if n else b"")
         return self._json(code, obj)
 
+    def _doc(self):
+        """a document's text for the chat (docs.py): only this page, which sends X-Colibri-UI (a
+        page elsewhere cannot without a CORS preflight this server never grants)"""
+        if not self._local_ok(False) or self.headers.get("X-Colibri-UI") != "1":
+            return self._json(403, {"error": "solo dalla pagina di colibri su questa macchina"})
+        n = int(self.headers.get("Content-Length") or 0)
+        if n <= 0:
+            return self._json(400, {"error": "file vuoto"})
+        if n > docs.MAX_BYTES:
+            self.close_connection = True   # the body stays unread
+            return self._json(413, {"error": "file troppo grande (al massimo %d MB)" % (docs.MAX_BYTES >> 20)})
+        data = self.rfile.read(n)
+        name = urllib.parse.unquote(self.headers.get("X-File-Name") or "documento")
+        try:
+            return self._json(200, docs.extract(name, data))
+        except Exception as e:   # noqa: BLE001 - a file it cannot read, said to the page
+            return self._json(400, {"error": str(e) or type(e).__name__})
+
     def _route(self):
         path = urllib.parse.urlparse(self.path).path
-        if path.startswith("/web/") and self.command == "GET":
+        if (path.startswith(PROXIED) or path == "/v1/responses") and not self._api_host_ok():
+            return self._host_refused()
+        if path == "/doc/extract" and self.command == "POST":
+            self._doc()
+        elif path.startswith("/web/") and self.command == "GET":
             self._web(path)
         elif path == "/v1/responses" and self.command == "POST":
             responses_shim.serve(self, self.backend)   # Codex: the Responses API over colibri's chat API
@@ -196,6 +264,19 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
 
+def _alive(pid):
+    """a process that runs: the gateway a model switch started is this process's child, and once
+    it exits it stays in /proc as a zombie until reaped"""
+    try:
+        if os.waitpid(pid, os.WNOHANG)[0] == pid:
+            return False
+    except ChildProcessError:
+        pass
+    except OSError:
+        return False
+    return os.path.exists("/proc/%d" % pid)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8790)
@@ -209,11 +290,40 @@ def main():
                     help="where models are, for the Models page (default: colibri's own folder)")
     ap.add_argument("--searx", default=os.environ.get("COLIBRI_SEARX", ""),
                     help="a SearXNG instance for web search (default: DuckDuckGo's HTML results)")
+    ap.add_argument("--allowed-host", action="append",
+                    default=[h.strip() for h in os.environ.get("COLI_ALLOWED_HOSTS", "").split(",") if h.strip()],
+                    help="a Host name the gateway's API paths accept besides loopback, for a UI reached through a "
+                         "reverse proxy or a tunnel name (repeatable; or COLI_ALLOWED_HOSTS; '*' accepts any)")
+    ap.add_argument("--exit-with-stdin", action="store_true",
+                    help="exit when stdin closes: `coli web` holds it open, so the UI ends with the launcher "
+                         "however that ends (coli stop, Ctrl-C, a crash)")
     a = ap.parse_args()
+    if a.exit_with_stdin:
+        import threading
+
+        def watch():
+            try:
+                while sys.stdin.read(4096):
+                    pass
+            except (OSError, ValueError):
+                pass
+            # `coli web` is gone. The Models page may have stopped it to start the gateway on
+            # another model (models.LIFE): then this UI follows the new gateway's process instead
+            life = getattr(Handler.models, "LIFE", None) or {}
+            while life.get("switching") or life.get("pid"):
+                if not life.get("switching") and not _alive(life["pid"]):
+                    break
+                time.sleep(1)
+            os._exit(0)
+        threading.Thread(target=watch, daemon=True).start()
     web.SEARX = a.searx
     Handler.backend = urllib.parse.urlparse(a.backend)
     Handler.models_backend = urllib.parse.urlparse(a.models_backend) if a.models_backend else None
     Handler.port = a.port
+    Handler.bind_host = a.host
+    Handler.allowed_hosts = tuple(h.strip().lower() for h in a.allowed_host if h and h.strip())
+    if "*" in Handler.allowed_hosts:
+        print("WARNING: --allowed-host '*' accepts ANY Host header (DNS-rebinding guard disabled)", file=sys.stderr)
     if not a.models_backend and Handler.backend.hostname in ("127.0.0.1", "localhost", "::1"):
         try:   # the gateway is on this machine: the Models page is served from here
             import models

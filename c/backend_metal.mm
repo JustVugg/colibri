@@ -329,13 +329,24 @@ kernel void moe_gemv(device const ulong* waddr [[buffer(0)]], device const ulong
       acc+=dot(w0*float4(sr[g0],sr[g1],sr[g2],sr[g3]),x4[2*c])
           +dot(w1*float4(sr[g4],sr[g5],sr[g6],sr[g7]),x4[2*c+1]); }
     for(int i=K8*8+slane;i<K;i+=32){ uchar b=w[i>>1]; int v=(i&1)?(b>>4):(b&0xF); acc+=float(v-8)*xr[i]*sr[i/qgs]; }
+  } else if (fmt == 9) {                            // int4 g64 planar (expert_ffn.h): a 64-block is
+    // 32 bytes, byte k holds element k (low nibble) and k+32 (high), both as v+8; one f32
+    // scale per (row, block), [O][K/64]. Host guards K%64==0, so 8 elements never straddle
+    // a block and each lane's 8 sit in one half of it.
+    device const uchar* w=(device const uchar*)(waddr[e])+(long)o*(K/2);
+    device const float* sr=sc+(long)o*(K/64);
+    for(int c=slane;c<K/8;c+=32){ int i0=8*c, blk=i0>>6, k=i0&63, sh=(k>=32)?4:0;
+      device const uchar4* b4=(device const uchar4*)(w+(long)blk*32+(k&31)); uchar4 a=b4[0], b=b4[1];
+      float4 w0=float4(float(int((a.x>>sh)&0xF)-8),float(int((a.y>>sh)&0xF)-8),float(int((a.z>>sh)&0xF)-8),float(int((a.w>>sh)&0xF)-8));
+      float4 w1=float4(float(int((b.x>>sh)&0xF)-8),float(int((b.y>>sh)&0xF)-8),float(int((b.z>>sh)&0xF)-8),float(int((b.w>>sh)&0xF)-8));
+      acc+=(dot(w0,x4[2*c])+dot(w1,x4[2*c+1]))*sr[blk]; }
   } else { device const char* w=(device const char*)(waddr[e])+(long)o*K;
     device const char4* w4=(device const char4*)w;
     for(int c=slane;c<K8;c+=32) acc+=dot(float4(w4[2*c]),x4[2*c])+dot(float4(w4[2*c+1]),x4[2*c+1]);
     for(int i=K8*8+slane;i<K;i+=32) acc+=float(w[i])*xr[i];
   }
   acc=simd_sum(acc);
-  if(slane==0) yout[row] = (fmt==4 || fmt==5 || fmt==6) ? acc : acc*sc[o];   // fmt4 grouped / fmt6 in-block scales folded; fmt5 none
+  if(slane==0) yout[row] = (fmt==4 || fmt==5 || fmt==6 || fmt==9) ? acc : acc*sc[o];   // fmt4/9 grouped / fmt6 in-block scales folded; fmt5 none
 }
 
 // fmt=6 activation rotation for the GPU-resident down-projection input: one FWHT
@@ -370,6 +381,14 @@ kernel void moe_silu_clamped(device float* g [[buffer(0)]], device const float* 
   float v=min(g[i], limit);
   float uv=clamp(u[i], -limit, limit);
   g[i]=(v/(1.0f+exp(-v)))*uv;
+}
+// Inkling-2's routed experts (inkling.c ink_glu): softcap(g, gc) * sigmoid(g) * softcap(u, uc),
+// the sigmoid on the raw gate, softcap(x, c) = tanh(x / c) * c.
+kernel void moe_glu_ink2(device float* g [[buffer(0)]], device const float* u [[buffer(1)]],
+                         constant float& gc [[buffer(2)]], constant float& uc [[buffer(3)]],
+                         uint i [[thread_position_in_grid]]) {
+  float v=g[i], uv=u[i];
+  g[i]=(tanh(v/gc)*gc)*(1.0f/(1.0f+exp(-v)))*(tanh(uv/uc)*uc);
 }
 
 // ===== Fused decode attention (GLM-5.2 dims, S=1) =====
@@ -788,7 +807,7 @@ static void tensor_destroy(ColiMetalTensor *t) {
 
 static id<MTLDevice> g_dev;
 static id<MTLCommandQueue> g_queue;
-static id<MTLComputePipelineState> g_gemv, g_moe_gemv, g_moe_silu, g_moe_silu_clamped, g_moe_fwht;
+static id<MTLComputePipelineState> g_gemv, g_moe_gemv, g_moe_silu, g_moe_silu_clamped, g_moe_glu_ink2, g_moe_fwht;
 static id<MTLComputePipelineState> g_affine_q4, g_affine_q8;
 static int g_affine_width_ok;
 
@@ -1036,6 +1055,7 @@ extern "C" int coli_metal_init(void) {
     g_moe_fwht = [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"moe_fwht"] error:&err];
     auto P=[&](const char*n){ return [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@(n)] error:&err]; };
     g_moe_silu_clamped=P("moe_silu_clamped");
+    g_moe_glu_ink2=P("moe_glu_ink2");   /* only Inkling-2's blocks ask for it (act 2): nil refuses those */
     g_affine_q4=P("mm_affine_q4"); g_affine_q8=P("mm_affine_q8");
     g_a_rms=P("a_rmsnorm"); g_a_rope=P("a_rope"); g_a_copy=P("a_copy");
     g_a_qabs=P("a_qabs"); g_a_score=P("a_score"); g_a_smax=P("a_smax"); g_a_clat=P("a_clat"); g_a_ctx=P("a_ctx");
@@ -1946,13 +1966,18 @@ extern "C" size_t coli_metal_tensor_bytes(const ColiMetalTensor *t) { return t ?
 // if Metal is off or any expert pointer is not in a registered slab.
 // Encode + commit a MoE block (no wait). Writes hh[R,D] into hh_buf. Returns nil on
 // unresolved slab / bad fmt (caller falls back to CPU).
+// act: 0 SwiGLU, 1 GLM-5.3's clamped SwiGLU (a0 the limit), 2 Inkling-2's softcapped one (a0
+// the gate's cap, a1 the up's). fmt 9: int4 g64 planar (expert_ffn.h), D and Iinter multiples of 64.
 static id<MTLCommandBuffer> moe_submit_impl(int nb, int D, int Iinter, int fmt, int qgs,
-                         int clamped, float swiglu_limit,
+                         int act, float a0, float a1,
                          const void *const *g, const void *const *u, const void *const *d,
                          const float *const *gs, const float *const *us, const float *const *ds,
                          const float *xg, const int *xoff, const int *nr, int R,
                          id<MTLBuffer> xg_buf, id<MTLBuffer> gg_buf, id<MTLBuffer> uu_buf, id<MTLBuffer> hh_buf) {
-  if (!g_dev || (fmt != 1 && fmt != 2 && fmt != 4 && fmt != 5 && fmt != 6)) return nil;
+  if (!g_dev || (fmt != 1 && fmt != 2 && fmt != 4 && fmt != 5 && fmt != 6 && fmt != 9)) return nil;
+  if (fmt == 9 && ((D & 63) || (Iinter & 63))) return nil;
+  if (act < 0 || act > 2 || (act == 1 && !(a0 > 0.0f)) || (act == 2 && (!(a0 > 0.0f) || !(a1 > 0.0f) || !g_moe_glu_ink2)))
+    return nil;
   if (fmt == 6) {   /* e8 kernel assumes clean block tiling, and every FWHT tile of the
                      * down input (CPU tiling rule, e8_rot_rows) must fit threadgroup mem */
     if ((D & 255) || (Iinter & 31)) return nil;
@@ -2022,9 +2047,10 @@ static id<MTLCommandBuffer> moe_submit_impl(int nb, int D, int Iinter, int fmt, 
   gemv(bag,bsg,xg_buf,gg_buf,Iinter,D,D);                     // gate
   gemv(bau,bsu,xg_buf,uu_buf,Iinter,D,D);                     // up
   [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
-  [e setComputePipelineState:clamped ? g_moe_silu_clamped : g_moe_silu];
+  [e setComputePipelineState:act == 2 ? g_moe_glu_ink2 : act == 1 ? g_moe_silu_clamped : g_moe_silu];
   [e setBuffer:gg_buf offset:0 atIndex:0];[e setBuffer:uu_buf offset:0 atIndex:1];
-  if (clamped) [e setBytes:&swiglu_limit length:sizeof(float) atIndex:2];
+  if (act >= 1) [e setBytes:&a0 length:sizeof(float) atIndex:2];
+  if (act == 2) [e setBytes:&a1 length:sizeof(float) atIndex:3];
   [e dispatchThreads:MTLSizeMake((size_t)R*Iinter,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
   [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
   if (fmt == 6) {   /* rotate the down-projection input in place: same block-diagonal
@@ -2070,12 +2096,11 @@ static int moe_finish(id<MTLCommandBuffer> cb, id<MTLBuffer> hh_buf, int nb, int
   return 1;
 }
 
-extern "C" int coli_metal_moe_block(int nb, int D, int Iinter, int fmt, int qgs,
+static int moe_block_sync(int nb, int D, int Iinter, int fmt, int qgs, int act, float a0, float a1,
                          const void *const *g, const void *const *u, const void *const *d,
                          const float *const *gs, const float *const *us, const float *const *ds,
                          const float *xg, const int *xoff, const int *nr,
-                         const int *rows, const float *rw, float *out, int S) {
-  (void)S;
+                         const int *rows, const float *rw, float *out) {
   @autoreleasepool {
     int R = 0; for (int e=0;e<nb;e++) R += nr[e];
     if (R == 0) return 1;
@@ -2083,10 +2108,28 @@ extern "C" int coli_metal_moe_block(int nb, int D, int Iinter, int fmt, int qgs,
     g_gg = ensure(g_gg,&g_gg_cap,(size_t)R*Iinter*4);
     g_uu = ensure(g_uu,&g_uu_cap,(size_t)R*Iinter*4);
     g_hh = ensure(g_hh,&g_hh_cap,(size_t)R*D*4);
-    id<MTLCommandBuffer> cb = moe_submit_impl(nb,D,Iinter,fmt,qgs,0,0.0f,g,u,d,gs,us,ds,xg,xoff,nr,R,g_xg,g_gg,g_uu,g_hh);
+    id<MTLCommandBuffer> cb = moe_submit_impl(nb,D,Iinter,fmt,qgs,act,a0,a1,g,u,d,gs,us,ds,xg,xoff,nr,R,g_xg,g_gg,g_uu,g_hh);
     if (!cb) return 0;
     return moe_finish(cb,g_hh,nb,R,D,rows,rw,out);
   }
+}
+
+extern "C" int coli_metal_moe_block(int nb, int D, int Iinter, int fmt, int qgs,
+                         const void *const *g, const void *const *u, const void *const *d,
+                         const float *const *gs, const float *const *us, const float *const *ds,
+                         const float *xg, const int *xoff, const int *nr,
+                         const int *rows, const float *rw, float *out, int S) {
+  (void)S;
+  return moe_block_sync(nb,D,Iinter,fmt,qgs,0,0.0f,0.0f,g,u,d,gs,us,ds,xg,xoff,nr,rows,rw,out);
+}
+
+extern "C" int coli_metal_moe_block_act(int nb, int D, int Iinter, int fmt, int qgs,
+                         int act, float a0, float a1,
+                         const void *const *g, const void *const *u, const void *const *d,
+                         const float *const *gs, const float *const *us, const float *const *ds,
+                         const float *xg, const int *xoff, const int *nr,
+                         const int *rows, const float *rw, float *out) {
+  return moe_block_sync(nb,D,Iinter,fmt,qgs,act,a0,a1,g,u,d,gs,us,ds,xg,xoff,nr,rows,rw,out);
 }
 
 extern "C" int coli_metal_moe_block_clamped(int nb, int D, int Iinter, int fmt, int qgs,
@@ -2097,18 +2140,7 @@ extern "C" int coli_metal_moe_block_clamped(int nb, int D, int Iinter, int fmt, 
                          float swiglu_limit) {
   (void)S;
   if (!(swiglu_limit > 0.0f)) return 0;
-  @autoreleasepool {
-    int R = 0; for (int e=0;e<nb;e++) R += nr[e];
-    if (R == 0) return 1;
-    g_xg = ensure(g_xg,&g_xg_cap,(size_t)R*D*4);
-    g_gg = ensure(g_gg,&g_gg_cap,(size_t)R*Iinter*4);
-    g_uu = ensure(g_uu,&g_uu_cap,(size_t)R*Iinter*4);
-    g_hh = ensure(g_hh,&g_hh_cap,(size_t)R*D*4);
-    id<MTLCommandBuffer> cb = moe_submit_impl(nb,D,Iinter,fmt,qgs,1,swiglu_limit,
-        g,u,d,gs,us,ds,xg,xoff,nr,R,g_xg,g_gg,g_uu,g_hh);
-    if (!cb) return 0;
-    return moe_finish(cb,g_hh,nb,R,D,rows,rw,out);
-  }
+  return moe_block_sync(nb,D,Iinter,fmt,qgs,1,swiglu_limit,0.0f,g,u,d,gs,us,ds,xg,xoff,nr,rows,rw,out);
 }
 
 // Async two-phase API: begin submits the block (own scratch, no wait) so the CPU can
@@ -2123,6 +2155,14 @@ extern "C" ColiMetalMoeHandle* coli_metal_moe_block_begin(int nb, int D, int Iin
                          const float *const *gs, const float *const *us, const float *const *ds,
                          const float *xg, const int *xoff, const int *nr,
                          const int *rows, const float *rw) {
+  return coli_metal_moe_block_begin_act(nb,D,Iinter,fmt,qgs,0,0.0f,0.0f,g,u,d,gs,us,ds,xg,xoff,nr,rows,rw);
+}
+extern "C" ColiMetalMoeHandle* coli_metal_moe_block_begin_act(int nb, int D, int Iinter, int fmt, int qgs,
+                         int act, float a0, float a1,
+                         const void *const *g, const void *const *u, const void *const *d,
+                         const float *const *gs, const float *const *us, const float *const *ds,
+                         const float *xg, const int *xoff, const int *nr,
+                         const int *rows, const float *rw) {
   @autoreleasepool {
     int R = 0; for (int e=0;e<nb;e++) R += nr[e];
     if (R == 0 || !g_dev) return nullptr;
@@ -2130,7 +2170,7 @@ extern "C" ColiMetalMoeHandle* coli_metal_moe_block_begin(int nb, int D, int Iin
     id<MTLBuffer> bgg=[g_dev newBufferWithLength:(size_t)R*Iinter*4 options:g_res_opts];
     id<MTLBuffer> buu=[g_dev newBufferWithLength:(size_t)R*Iinter*4 options:g_res_opts];
     id<MTLBuffer> bhh=[g_dev newBufferWithLength:(size_t)R*D*4 options:g_res_opts];
-    id<MTLCommandBuffer> cb = moe_submit_impl(nb,D,Iinter,fmt,qgs,0,0.0f,g,u,d,gs,us,ds,xg,xoff,nr,R,bxg,bgg,buu,bhh);
+    id<MTLCommandBuffer> cb = moe_submit_impl(nb,D,Iinter,fmt,qgs,act,a0,a1,g,u,d,gs,us,ds,xg,xoff,nr,R,bxg,bgg,buu,bhh);
     if (!cb) return nullptr;
     ColiMetalMoeHandle *h = new ColiMetalMoeHandle();
     h->cb=cb; h->hh=bhh; h->rows.assign(rows,rows+R); h->rwv.assign(rw,rw+R);

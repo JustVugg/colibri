@@ -159,6 +159,37 @@ class DoctorTest(unittest.TestCase):
         report = self.report(gpu_indices=None, linkage={"linked": False, "missing": True, "vulkan": True})
         self.assertEqual(self.checks_by_id(report)["accelerator.gpu"]["status"], "fail")
 
+    def test_vulkan_engine_gpu_index_is_the_vulkan_device(self):
+        """#2127: on a Vulkan build --gpu 1 is Vulkan device 1, the one COLI_VK_DEV=1
+        opens. doctor checked it against the CUDA inventory and sized the plan from the
+        first discrete card (an RTX 3050 beside the RTX 5060 Ti the engine ran on)."""
+        small = {"name": "RTX 3050", "type": "discrete"}
+        large = {"name": "RTX 5060 Ti", "type": "discrete"}
+        vulkan = {"linked": True, "missing": False, "vulkan": True}
+        from resource_plan import format_plan
+        with mock.patch("setup_hw.detect_vulkan", return_value={"devices": [small, large]}), \
+                mock.patch.dict(os.environ, {"COLI_VK_DEV": ""}):
+            report = self.report(gpu_indices=[1], linkage=vulkan)
+            check = self.checks_by_id(report)["accelerator.gpu"]
+            self.assertEqual(check["status"], "pass")
+            self.assertEqual(check["details"]["devices"], [1])
+            self.assertEqual(report["plan"]["vulkan"], large)
+            self.assertIn("VRAM   Vulkan · RTX 5060 Ti (discrete)", format_plan(report["plan"]))
+            check = self.checks_by_id(self.report(gpu_indices=[2], linkage=vulkan))["accelerator.gpu"]
+            self.assertEqual(check["status"], "fail")
+            self.assertEqual(check["details"], {"requested": [2], "detected": [0, 1]})
+            # coli refuses the same device twice, and more than two, on a Vulkan build
+            for indices in ([1, 1], [0, 1, 0], [0, 1, 2]):
+                check = self.checks_by_id(self.report(gpu_indices=indices, linkage=vulkan))["accelerator.gpu"]
+                self.assertEqual(check["status"], "fail", indices)
+                self.assertIn("two different ones", check["summary"])
+            self.assertEqual(self.checks_by_id(self.report(gpu_indices=[1, 0], linkage=vulkan))
+                             ["accelerator.gpu"]["status"], "pass")
+            # COLI_VK_DEV set by hand, no --gpu: the same device
+            with mock.patch.dict(os.environ, {"COLI_VK_DEV": "1"}):
+                self.assertEqual(self.report(gpu_indices=None, linkage=vulkan)["plan"]["vulkan"], large)
+            self.assertEqual(self.report(gpu_indices=None, linkage=vulkan)["plan"]["vulkan"], small)
+
     def test_vulkan_plan_respects_explicit_cpu_selection(self):
         device = {'name': 'Fixture GPU', 'type': 'discrete'}
         with mock.patch('setup_hw.detect_vulkan', return_value={'devices': [device]}):

@@ -1,0 +1,87 @@
+{
+  "version": 1,
+  "hypothesis": "Vectorizing exact MXFP4 integer unpack reduces the sampled CPU hotspot and accelerates hybrid decode.",
+  "commit": "e24cd51afd44b480c1e41ba82e20a28bac76c34f",
+  "model": "DeepSeek-V4-Flash-REAP, native MXFP4 experts, FP8 dense, safetensors",
+  "command": "make -C c deepseek-v4 VK=1 ARCH=x86-64-v3 -j8; start a fresh GPU1 engine with provenance.json configuration; python3 docs/experiments/vulkan-mxfp4-host-unpack-2026-11-08/replay.py --output NEW-ARM.json",
+  "prompt_hash": "b0366c8716cc90e70ff6c1fec2f25309044b8cd74bbc4745ea37b693cf842345",
+  "hardware": {
+    "cpu": "Xeon Gold 6254 @ 3.10GHz; guest 32 vCPU; experiment CPUs 16-31, OMP16",
+    "ram": "247.37 GiB guest, RAM_GB=128, container limit 180 GiB",
+    "storage": "Local /dev/sda2, 1 TiB QEMU HARDDISK, virtio-scsi, ext4 rw,relatime; SHA256 verified model copy",
+    "os": "Ubuntu 26.04.1, kernel 7.0.0-42-generic; GCC x86-64-v3; Mesa 26.2.6; Arc Pro B60 24GB SR-IOV VF, PCIe Gen3 x8"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "fp4_unpack"
+  ],
+  "outcome": "improvement",
+  "provenance": "commit is the measured runtime base; runtime-base.patch is shared by both arms; trial adds this PR dev_codes_fp4 change. Current publication base differs; see provenance.json.",
+  "baseline": {
+    "config": {
+      "fp4_unpack": "scalar",
+      "cpu_set": "16-31",
+      "OMP_NUM_THREADS": 16,
+      "COLI_VK_TIER_SYNC": 1,
+      "COLI_VK_TIER_BALANCE": 0,
+      "COLI_VK_HYBRID_BIG_ROWS": 2,
+      "COLI_VK_CHAIN_ROWS": "auto",
+      "RAM_GB": 128,
+      "CTX": 65536,
+      "GPU": "one B60 VF",
+      "Mesa": "26.2.6",
+      "request_tag": "f6734185f687174a"
+    },
+    "samples": {
+      "tok_s": [
+        1.8735325995345193,
+        2.063554836031104,
+        2.225329643098312,
+        1.8338106868517314,
+        2.1246460083914043,
+        2.235572081259412
+      ]
+    },
+    "median_tok_s": 2.094100422211254,
+    "quality": {
+      "method": "All 3 fixed reference answers and 7 matched benchmark outputs identical across A/B/A; exhaustive integer-unpack probes. This is output parity, not a semantic-quality benchmark.",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "end-to-end-audit.json",
+      "sha256": "80a42ed8b31dbff56c057e0b639e611049ae3d68869d5f317c16be86d552a451"
+    }
+  },
+  "trial": {
+    "config": {
+      "fp4_unpack": "AVX2-guarded byte shuffles",
+      "cpu_set": "16-31",
+      "OMP_NUM_THREADS": 16,
+      "COLI_VK_TIER_SYNC": 1,
+      "COLI_VK_TIER_BALANCE": 0,
+      "COLI_VK_HYBRID_BIG_ROWS": 2,
+      "COLI_VK_CHAIN_ROWS": "auto",
+      "RAM_GB": 128,
+      "CTX": 65536,
+      "GPU": "one B60 VF",
+      "Mesa": "26.2.6",
+      "request_tag": "f6734185f687174a"
+    },
+    "samples": {
+      "tok_s": [
+        3.0317376037588746,
+        3.267190135549336,
+        3.261262830529385
+      ]
+    },
+    "median_tok_s": 3.261262830529385,
+    "quality": {
+      "method": "All 3 fixed reference answers and 7 matched benchmark outputs identical across A/B/A; exhaustive integer-unpack probes. This is output parity, not a semantic-quality benchmark.",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "end-to-end-audit.json",
+      "sha256": "80a42ed8b31dbff56c057e0b639e611049ae3d68869d5f317c16be86d552a451"
+    }
+  }
+}

@@ -137,6 +137,33 @@ static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *
             y[(int64_t)s*O+o]=a*sc; } }
 }
 
+/* One step of the grouped-int4 kernels' scalar loop: matmul_i4_grouped below and
+ * matmul_i4_grouped_pair in colibri.c, so the fused pair rounds as two single calls
+ * do. Pinned in the SOURCE, like the AVX2 path's fmaf: left to -ffp-contract, which
+ * multiply-adds the compiler fused followed the code around them, not the code
+ * itself. GCC 16 on aarch64 fused fma(x1,w1,x0*w0) in one kernel and fma(x0,w0,x1*w1)
+ * in the other within one build, and test_i4_grouped's fused == unfused gate failed;
+ * built inside another file, the same source fused the second way in both. Where the
+ * CPU has a fused multiply-add the step is two explicit fmaf calls, in the order Apple
+ * clang already fuses it, so arm64 macOS keeps its bits; where it has none, nothing
+ * can be fused and the step is the plain expression, the scalar operation tree the
+ * forced-SSE gates compare against. */
+#if defined(FP_FAST_FMAF) || defined(__FP_FAST_FMAF) || defined(__FMA__) || defined(__aarch64__)
+static inline float i4g_step2(float a, float x0, float w0, float x1, float w1, float sc){
+    return fmaf(fmaf(x0,w0,x1*w1),sc,a);
+}
+static inline float i4g_step1(float a, float x0, float w0, float sc){
+    return fmaf(x0*w0,sc,a);
+}
+#else
+static inline float i4g_step2(float a, float x0, float w0, float x1, float w1, float sc){
+    return a+(x0*w0+x1*w1)*sc;
+}
+static inline float i4g_step1(float a, float x0, float w0, float sc){
+    return a+x0*w0*sc;
+}
+#endif
+
 /* ---- y[S,O] = x[S,I] @ W^T, W int4 packed + per-GROUP scales (fmt=4) ----- */
 static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const float *scale,
                               int S, int I, int O, int gs){
@@ -180,9 +207,9 @@ static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const
                 a=fmaf(hsum256(acc),sc,a);
 #endif
                 for(; i<base+glen; i+=2){
-                    if(i+1<base+glen){ uint8_t byte=w[i>>1];
-                        a+=(xs[i]*(float)((int)(byte&0xF)-8)+xs[i+1]*(float)((int)(byte>>4)-8))*sc; }
-                    else { uint8_t byte=w[i>>1]; a+=xs[i]*(float)((int)(byte&0xF)-8)*sc; }
+                    uint8_t byte=w[i>>1];
+                    if(i+1<base+glen) a=i4g_step2(a,xs[i],(float)((int)(byte&0xF)-8),xs[i+1],(float)((int)(byte>>4)-8),sc);
+                    else a=i4g_step1(a,xs[i],(float)((int)(byte&0xF)-8),sc);
                 }
             }
             y[(int64_t)s*O+o]=a;
@@ -711,10 +738,152 @@ static void matmul_fp8_neon(float *y, const float *x, const uint8_t *q8, const f
 }
 #endif
 
+/* x86 without FMA (Sandy Bridge, Ivy Bridge, a build for the x86-64 baseline or v2). There no
+   compiler can fuse matmul_fp8_scalar's multiply-add: a row's block sum is a multiply and an add,
+   each rounded, one weight after the other, and the kernels below do exactly those operations
+   in that order, so their bits are matmul_fp8_scalar's (tests/test_fp8_nofma). That kernel decoded
+   every weight again for every row and waited on one chain of adds: a Xeon E5-2690 v1 spent
+   ~150 ms a prompt token in Qwen3.8's FP8 experts, about what a decode step costs (#2715).
+     - one row (decode): four output rows a pass, each its own chain, as the clang form above;
+     - two rows or more (a prompt, a verify): the rows go into the lanes of a vector, 8 with AVX
+       and 4 with SSE2 (the activations laid out row-interleaved once a call), and four output
+       rows a pass share each load. Lane r of output o adds w[o][i] * x[r][i] for i in order:
+       the scalar kernel's sum for that row, a weight now read once for every 8 (or 4) rows;
+     - matmul_fp8_nofma_part: the same two passes for a range of output rows of rows given by
+       pointers, with no parallel region of its own (qwen38's grouped MoE). */
+#if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__)) && defined(__SSE2__) && !defined(__FMA__) && \
+    !defined(__FAST_MATH__) && (defined(__x86_64__) || defined(__SSE2_MATH__))
+#define COLI_FP8_NOFMA_LANES 1
+#include <immintrin.h>
+#ifdef __AVX__
+#define FP8L 8
+typedef __m256 fp8v;
+#define FP8V_ZERO()     _mm256_setzero_ps()
+#define FP8V_BC(p)      _mm256_broadcast_ss(p)
+#define FP8V_LD(p)      _mm256_loadu_ps(p)
+#define FP8V_MAC(c,w,x) _mm256_add_ps((c), _mm256_mul_ps((w), (x)))
+#define FP8V_ST(p,v)    _mm256_storeu_ps((p), (v))
+#else
+#define FP8L 4
+typedef __m128 fp8v;
+#define FP8V_ZERO()     _mm_setzero_ps()
+#define FP8V_BC(p)      _mm_load1_ps(p)
+#define FP8V_LD(p)      _mm_loadu_ps(p)
+#define FP8V_MAC(c,w,x) _mm_add_ps((c), _mm_mul_ps((w), (x)))
+#define FP8V_ST(p,v)    _mm_storeu_ps((p), (v))
+#endif
+/* outputs o..o+on-1 (on <= 4) of one activation row x */
+static inline void fp8_nofma_s1_4(float *y, const float *x, const uint8_t *q8, const float *bscale,
+                                  int64_t nblkI, int I, int o, int on){
+    int o1=on>1 ? o+1 : o, o2=on>2 ? o+2 : o, o3=on>3 ? o+3 : o;
+    const uint8_t *w0=q8+(int64_t)o*I,  *w1=q8+(int64_t)o1*I;
+    const uint8_t *w2=q8+(int64_t)o2*I, *w3=q8+(int64_t)o3*I;
+    const float *scl0=bscale+((int64_t)o /FP8_BLOCK)*nblkI, *scl1=bscale+((int64_t)o1/FP8_BLOCK)*nblkI;
+    const float *scl2=bscale+((int64_t)o2/FP8_BLOCK)*nblkI, *scl3=bscale+((int64_t)o3/FP8_BLOCK)*nblkI;
+    double a0=0,a1=0,a2=0,a3=0;
+    for(int64_t bi=0; bi*FP8_BLOCK<I; bi++){
+        int base=(int)(bi*FP8_BLOCK); int blen=FP8_BLOCK; if(base+blen>I) blen=I-base;
+        float acc0=0,acc1=0,acc2=0,acc3=0;
+        for(int i=base;i<base+blen;i++){
+            float xv=x[i];
+            acc0 += e4m3_decode(w0[i])*xv; acc1 += e4m3_decode(w1[i])*xv;
+            acc2 += e4m3_decode(w2[i])*xv; acc3 += e4m3_decode(w3[i])*xv;
+        }
+        a0 += (double)acc0*scl0[bi]; a1 += (double)acc1*scl1[bi];
+        a2 += (double)acc2*scl2[bi]; a3 += (double)acc3*scl3[bi];
+    }
+    y[o]=(float)a0;
+    if(o1!=o) y[o1]=(float)a1;
+    if(o2!=o) y[o2]=(float)a2;
+    if(o3!=o) y[o3]=(float)a3;
+}
+static void matmul_fp8_nofma_s1(float *y, const float *x, const uint8_t *q8, const float *bscale, int I, int O){
+    int64_t nblkI = fp8_nblk(I);
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o+=4) fp8_nofma_s1_4(y,x,q8,bscale,nblkI,I,o,O-o<4 ? O-o : 4);
+}
+/* xt[i*FP8L + r] = xr[r][i] for the n (<= FP8L) rows; lanes past n are zero: summed, never stored */
+static inline void fp8_nofma_interleave(float *xt, const float *const *xr, int n, int I){
+    for(int r=0;r<FP8L;r++){
+        if(r<n){ const float *xs = xr[r]; for(int i=0;i<I;i++) xt[(size_t)i*FP8L+r] = xs[i]; }
+        else for(int i=0;i<I;i++) xt[(size_t)i*FP8L+r] = 0.f;
+    }
+}
+/* outputs o..o+on-1 (on <= 4) of the S rows interleaved in xt (groups of FP8L): y[s*ys + o + k] */
+static inline void fp8_nofma_lanes_4(float *y, int64_t ys, int S, const uint8_t *q8, const float *bscale,
+                                     int64_t nblkI, int I, int o, int on, const float *xt){
+    const int G = (S + FP8L - 1) / FP8L;
+    const uint8_t *w[4]; const float *scl[4];
+    for(int k=0;k<4;k++){ int ok = o + (k<on ? k : on-1); w[k] = q8 + (int64_t)ok*I; scl[k] = bscale + ((int64_t)ok/FP8_BLOCK)*nblkI; }
+    for(int g=0;g<G;g++){
+        const float *xg = xt + (size_t)g*(size_t)I*FP8L;
+        double a[4][FP8L];
+        memset(a, 0, sizeof a);
+        for(int64_t bi=0; bi*FP8_BLOCK<I; bi++){
+            int base=(int)(bi*FP8_BLOCK); int blen=FP8_BLOCK; if(base+blen>I) blen=I-base;
+            const uint8_t *w0=w[0]+base, *w1=w[1]+base, *w2=w[2]+base, *w3=w[3]+base;
+            const float *xb = xg + (size_t)base*FP8L;
+            fp8v c0=FP8V_ZERO(), c1=FP8V_ZERO(), c2=FP8V_ZERO(), c3=FP8V_ZERO();
+            for(int i=0;i<blen;i++){
+                const fp8v xv = FP8V_LD(xb + (size_t)i*FP8L);
+                c0 = FP8V_MAC(c0, FP8V_BC(&E4M3_LUT[w0[i]]), xv);
+                c1 = FP8V_MAC(c1, FP8V_BC(&E4M3_LUT[w1[i]]), xv);
+                c2 = FP8V_MAC(c2, FP8V_BC(&E4M3_LUT[w2[i]]), xv);
+                c3 = FP8V_MAC(c3, FP8V_BC(&E4M3_LUT[w3[i]]), xv);
+            }
+            float p[4][FP8L];
+            FP8V_ST(p[0], c0); FP8V_ST(p[1], c1); FP8V_ST(p[2], c2); FP8V_ST(p[3], c3);
+            for(int k=0;k<4;k++){ const float sc = scl[k][bi]; for(int r=0;r<FP8L;r++) a[k][r] += (double)p[k][r]*sc; }
+        }
+        for(int k=0;k<on;k++) for(int r=0;r<FP8L;r++){
+            int s = g*FP8L + r;
+            if(s<S) y[(int64_t)s*ys + o + k] = (float)a[k][r];
+        }
+    }
+}
+static void matmul_fp8_nofma_rows(float *y, const float *x, const uint8_t *q8, const float *bscale,
+                                  int S, int I, int O){
+    int64_t nblkI = fp8_nblk(I);
+    const int G = (S + FP8L - 1) / FP8L;
+    float *xt = (float*)malloc((size_t)G*(size_t)I*FP8L*sizeof(float));   /* xt[g][i][r] = x[g*FP8L+r][i] */
+    if(!xt){ matmul_fp8_scalar(y,x,q8,bscale,S,I,O); return; }
+    #pragma omp parallel for schedule(static)
+    for(int g=0;g<G;g++){
+        const int n = S-g*FP8L<FP8L ? S-g*FP8L : FP8L;
+        const float *xr[FP8L];
+        for(int r=0;r<n;r++) xr[r] = x + (int64_t)(g*FP8L+r)*I;
+        fp8_nofma_interleave(xt + (size_t)g*(size_t)I*FP8L, xr, n, I);
+    }
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o+=4) fp8_nofma_lanes_4(y,O,S,q8,bscale,nblkI,I,o,O-o<4 ? O-o : 4,xt);
+    free(xt);
+}
+/* Output rows [r0,r1) for n activation rows given by pointers, y[a*ys + o], with no parallel region of
+   its own: qwen38's grouped MoE runs every expert's rows from one region (#2715). Each output is
+   matmul_fp8_scalar's, as above: one row the four-row pass, two or more the rows in lanes. */
+static void matmul_fp8_nofma_part(float *y, int64_t ys, const uint8_t *q8, const float *bscale, int I,
+                                  int r0, int r1, const float *const *xr, int n){
+    const int64_t nblkI = fp8_nblk(I);
+    const int G = (n + FP8L - 1) / FP8L;
+    float *xt = n>1 ? (float*)malloc((size_t)G*(size_t)I*FP8L*sizeof(float)) : NULL;
+    if(!xt){   /* one row, or no memory: a row at a time, the same bits */
+        for(int a=0;a<n;a++) for(int o=r0;o<r1;o+=4) fp8_nofma_s1_4(y+(int64_t)a*ys,xr[a],q8,bscale,nblkI,I,o,r1-o<4 ? r1-o : 4);
+        return;
+    }
+    for(int g=0;g<G;g++) fp8_nofma_interleave(xt + (size_t)g*(size_t)I*FP8L, xr + g*FP8L, n-g*FP8L<FP8L ? n-g*FP8L : FP8L, I);
+    for(int o=r0;o<r1;o+=4) fp8_nofma_lanes_4(y,ys,n,q8,bscale,nblkI,I,o,r1-o<4 ? r1-o : 4,xt);
+    free(xt);
+}
+#endif
+
 static void matmul_fp8(float *y, const float *x, const uint8_t *q8, const float *bscale,
                        int S, int I, int O){
 #ifdef __ARM_NEON
     if(S>=4){ matmul_fp8_neon(y,x,q8,bscale,S,I,O); return; }
+#endif
+#ifdef COLI_FP8_NOFMA_LANES
+    if(S==1){ matmul_fp8_nofma_s1(y,x,q8,bscale,I,O); return; }
+    if(S>=2){ matmul_fp8_nofma_rows(y,x,q8,bscale,S,I,O); return; }
 #endif
     matmul_fp8_scalar(y,x,q8,bscale,S,I,O);
 }

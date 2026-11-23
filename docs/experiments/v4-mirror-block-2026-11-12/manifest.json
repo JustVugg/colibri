@@ -1,0 +1,93 @@
+{
+  "version": 1,
+  "hypothesis": "A routed expert's mirror uploaded as two copies (its record's scale run and weight run into two device allocations) instead of six (three tensors, weights and scales each) costs less per upload, four enqueued copies fewer, and so decodes faster where the decode mirror cache uploads.",
+  "commit": "823560b2fcb41f7d59a21a05db0ce9e9f8a55657",
+  "model": "DeepSeek-V4-Flash-0731 architecture, abliterated weights (same shapes), safetensors, native FP8/FP4",
+  "command": "make -C c cuda-dsv4-dg-dll cuda-dsv4-dll && make -C c -f Makefile.deepseek-v4 ARCH=native CUDA=1 deepseek-v4; deepseek_v4 <model> --prompt-file prompt3k.txt --max-tokens 36 --memory-gb 16 with the environment in config; tok_s = 35 / after_first from the engine's `timing` line (decode throughput after the first token)",
+  "prompt_hash": "3def6f25ca23ac992efe343ea4eec2c4a71ffe48dc66a95c93de91014b6923da",
+  "hardware": {
+    "cpu": "AMD Ryzen 9 5950X, 16 cores / 32 threads",
+    "ram": "32 GB DDR4-3600 (--memory-gb 16)",
+    "storage": "Samsung 9100 PRO 4TB NVMe (model) + Samsung 990 PRO 1TB NVMe (COLI_MODEL_MIRROR), NTFS, direct aligned reads",
+    "os": "Windows 11 Pro 10.0.26300, MSYS2 UCRT64 gcc 16.1.0, CUDA 13.3, driver 621.14, RTX 5080 16 GB (device 0; an RTX 3080 is present and unused)"
+  },
+  "warmup_runs": 1,
+  "changed_variables": [
+    "V4_MIRROR_BLOCK"
+  ],
+  "baseline": {
+    "config": {
+      "binary": "deepseek_v4 CUDA=1 ARCH=native, coli_cuda_dsv4_dg.dll (DeepGEMM sm_120)",
+      "args": "--prompt-file prompt3k.txt --max-tokens 36 --memory-gb 16",
+      "COLI_CUDA": "1",
+      "COLI_GPU": "0",
+      "CUDA_DENSE": "1",
+      "COLI_CUDA_PIPE": "2",
+      "COLI_CUDA_ATTN_BATCH": "1",
+      "COLI_CUDA_MOE_BATCH": "1",
+      "COLI_CUDA_MOE_DOUBLE": "1",
+      "V4_MOE_REFILL_GROUP": "12",
+      "V4_LOADER_LANES": "3",
+      "V4_PREFIX_CKPT": "0",
+      "COLI_V4_SAVE_USAGE": "0",
+      "DSV4_DECODE_PROF": "1",
+      "COLI_MODEL_MIRROR": "set (second NVMe)",
+      "DSV4_CUDA_VRAM_RESERVE_MB": "600",
+      "V4_MIRROR_BLOCK": "unset"
+    },
+    "samples": {
+      "tok_s": [
+        1.6357,
+        1.6297,
+        1.6341
+      ]
+    },
+    "median_tok_s": 1.6341,
+    "quality": {
+      "method": "greedy text identical across the arm's runs and identical to the trial's (md5 of stdout)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/v4-mirror-block-2026-11-12/baseline_runs.txt",
+      "sha256": "663281855d5855b8532fba9aca3e8feb51d5f866ec82e2eb79cfdae6d93800d9"
+    }
+  },
+  "trial": {
+    "config": {
+      "binary": "deepseek_v4 CUDA=1 ARCH=native, coli_cuda_dsv4_dg.dll (DeepGEMM sm_120)",
+      "args": "--prompt-file prompt3k.txt --max-tokens 36 --memory-gb 16",
+      "COLI_CUDA": "1",
+      "COLI_GPU": "0",
+      "CUDA_DENSE": "1",
+      "COLI_CUDA_PIPE": "2",
+      "COLI_CUDA_ATTN_BATCH": "1",
+      "COLI_CUDA_MOE_BATCH": "1",
+      "COLI_CUDA_MOE_DOUBLE": "1",
+      "V4_MOE_REFILL_GROUP": "12",
+      "V4_LOADER_LANES": "3",
+      "V4_PREFIX_CKPT": "0",
+      "COLI_V4_SAVE_USAGE": "0",
+      "DSV4_DECODE_PROF": "1",
+      "COLI_MODEL_MIRROR": "set (second NVMe)",
+      "DSV4_CUDA_VRAM_RESERVE_MB": "600",
+      "V4_MIRROR_BLOCK": "1"
+    },
+    "samples": {
+      "tok_s": [
+        1.6586,
+        1.6625,
+        1.6667
+      ]
+    },
+    "median_tok_s": 1.6625,
+    "quality": {
+      "method": "greedy text identical across the arm's runs and identical to the baseline's (md5 of stdout); V4_MIRROR_BLOCK_VERIFY=1 read every fill back against the host bytes: no difference (verify_runs.txt)",
+      "passed": true
+    },
+    "evidence": {
+      "uri": "docs/experiments/v4-mirror-block-2026-11-12/trial_runs.txt",
+      "sha256": "1882abfd22d9681f819b242b70c99da9ac3eb3e91d64a5448ff63a76e6a41023"
+    }
+  },
+  "outcome": "improvement"
+}
