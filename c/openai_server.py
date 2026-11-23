@@ -10776,13 +10776,12 @@ class APIHandler(BaseHTTPRequestHandler):
         if not isinstance(stream, bool):
             raise APIError(400, "`stream` must be a boolean.", "stream")
         message_id = "msg_" + uuid.uuid4().hex[:24]
-        # GLM-5.3 opens <think> in the prompt even with thinking off (#1278), so its reply
-        # starts with reasoning either way. Split it off so the answer never carries the
-        # reasoning or a literal </think>, but only return it as a thinking block when the
+        # GLM-5.3 opens <think> in the prompt even with thinking off (#1278), and Flint,
+        # Muse Spark and Mistral-Large-4 open it themselves, so a reply can carry reasoning
+        # either way. It is always split off, as on the OpenAI path, so the answer never
+        # carries the reasoning or a marker, but only returned as a thinking block when the
         # client asked for thinking: the real API never sends one otherwise, and clients
         # read the answer from content[0].
-        split_reasoning = enable_thinking or starts_in_reasoning(enable_thinking,
-                                                                 add_generation_prompt)
 
         def blocks_and_stop(text, stats, tool_reply=None, matched=None):
             """Split a finished reply into Anthropic content blocks, stop_reason and
@@ -10791,7 +10790,7 @@ class APIHandler(BaseHTTPRequestHandler):
             reasoning = ""
             if ARCH == "inkling":
                 text, reasoning = ink_split(text, tools)
-            elif split_reasoning:
+            else:
                 reasoning, text = split_thinking_reply(text, enable_thinking,
                                                        add_generation_prompt)
             if enable_thinking:
@@ -10892,7 +10891,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0}}})
             text_index = 1 if enable_thinking else 0
             stream_state = {"thinking_closed": not enable_thinking,
-                            "text_started": not enable_thinking}
+                            "text_started": not enable_thinking, "blank": ""}
             if enable_thinking:
                 send_event("content_block_start", {"type": "content_block_start", "index": 0,
                     "content_block": {"type": "thinking", "thinking": "", "signature": ""}})
@@ -10913,6 +10912,14 @@ class APIHandler(BaseHTTPRequestHandler):
             def emit_text(chunk):
                 if not chunk:
                     return
+                if not stream_state["thinking_closed"]:
+                    # The thinking block ends before the text block starts. Blank text ahead
+                    # of it waits: a model that opens <think> itself may write a newline first.
+                    stream_state["blank"] += chunk
+                    if not stream_state["blank"].strip():
+                        return
+                    chunk, stream_state["blank"] = stream_state["blank"], ""
+                    close_thinking()
                 if not stream_state["text_started"]:
                     stream_state["text_started"] = True
                     send_event("content_block_start", {"type": "content_block_start",
@@ -10949,8 +10956,8 @@ class APIHandler(BaseHTTPRequestHandler):
                            ("qwen36", "qwen38", "qwen3_coder", "lfm3") else None)
 
             def emit_thinking(chunk):
-                if not enable_thinking:
-                    return                       # reasoning the client did not ask for
+                if stream_state["thinking_closed"]:
+                    return                       # not asked for, or after the answer began
                 send_event("content_block_delta", {"type": "content_block_delta", "index": 0,
                     "delta": {"type": "thinking_delta", "thinking": chunk}})
 
@@ -10970,10 +10977,11 @@ class APIHandler(BaseHTTPRequestHandler):
             else:
                 # Anche qui: su GLM-5.3 il blocco e' aperto dal prompt, quindi
                 # lo splitter serve pure col ragionamento "spento", o il
-                # pensiero finisce incollato davanti alla risposta.
-                split = (ThinkingStreamSplit(emit_thinking, emit_answer, close_thinking)
-                         if starts_in_reasoning(enable_thinking, add_generation_prompt)
-                         else None)
+                # pensiero finisce incollato davanti alla risposta. Flint, Muse Spark and
+                # Mistral-Large-4 open the block themselves: the splitter starts in text.
+                split = ThinkingStreamSplit(
+                    emit_thinking, emit_answer, close_thinking,
+                    initial_thinking=starts_in_reasoning(enable_thinking, add_generation_prompt))
 
             def on_text(chunk):
                 raw.append(chunk)
