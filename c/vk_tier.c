@@ -3121,7 +3121,8 @@ size_t vkt_give_back(size_t bytes) {
     const int nb = coli_vk_tier_pool_blocks(NULL, 0);
     if (nb <= 0) return 0;
     uint64_t *bb = calloc((size_t)nb, sizeof *bb); double *hp = calloc((size_t)nb, 2 * sizeof *hp); uint8_t *pick = calloc((size_t)nb, 1);
-    if (!bb || !hp || !pick) { free(bb); free(hp); free(pick); return 0; }
+    int *left = calloc((size_t)nb, sizeof *left);   /* the experts that left each block */
+    if (!bb || !hp || !pick || !left) { free(bb); free(hp); free(pick); free(left); return 0; }
     coli_vk_tier_pool_blocks(bb, nb);
     const size_t n = (size_t)T.c.layers * T.c.experts;
     for (int k = 0; k < nb; k++) { hp[2 * k] = 0; hp[2 * k + 1] = k; }
@@ -3162,6 +3163,7 @@ size_t vkt_give_back(size_t bytes) {
         }
         T.evictions++;
         note_change((int)i);
+        for (int j = 0; j < m; j++) if (blk[j] >= 0 && blk[j] < nb && pick[blk[j]]) { left[blk[j]]++; break; }
     }
     free(hp);
     const int drop = T.dmax[0] - (T.dres[0] + T.dque[0]);
@@ -3172,8 +3174,22 @@ size_t vkt_give_back(size_t bytes) {
     const uint64_t base = st.limit ? st.limit : st.total;
     coli_vk_tier_pool_limit(base > got + 4096 ? (size_t)(base - got) : 4096);   /* releases the emptied blocks */
     uint64_t *now = calloc((size_t)nb, sizeof *now), gave = 0;
-    if (now) { coli_vk_tier_pool_blocks(now, nb); for (int k = 0; k < nb; k++) if (pick[k] && !now[k]) gave += bb[k]; }
-    free(now); free(pick); free(bb);
+    int stay = 0;
+    if (now) { coli_vk_tier_pool_blocks(now, nb); for (int k = 0; k < nb; k++) if (pick[k]) { if (!now[k]) gave += bb[k]; else stay += left[k]; } }
+    else for (int k = 0; k < nb; k++) stay += left[k];
+    free(now); free(pick); free(bb); free(left);
+    /* A picked block that did not empty (the streaming slots are in it: the pool's, and in no
+     * expert's place) is still the tier's. Its bytes go back under the limit and its experts'
+     * places back to the tier; they are neither given nor owed. Before, the limit kept the cut
+     * for every block picked and vkt_take_back gave back only what was released, so each such
+     * give-back cost the tier that block and its places for the rest of the process. */
+    if (gave < got) coli_vk_tier_pool_limit(base > gave + 4096 ? (size_t)(base - gave) : 4096);
+    if (stay > drop) stay = drop > 0 ? drop : 0;
+    if (stay > 0) {
+        pthread_mutex_lock(&T.mx);
+        T.dmax[0] += stay; T.max_resident += stay; T.gb_owed -= stay;
+        pthread_mutex_unlock(&T.mx);
+    }
     T.budget = T.budget > gave ? T.budget - (size_t)gave : 0;
     T.gb_owed_bytes += (size_t)gave;
     coli_vk_pool_stats(1, &st);
