@@ -47,6 +47,7 @@ static inline int q36_cuda_device_profile(int major, int minor, const char *name
         {Q36_GPU_L4, 8, 9, "NVIDIA L4", "L4", 0, 0},
         {Q36_GPU_A100, 8, 0, "NVIDIA A100-SXM4-40GB", NULL, UINT64_C(38) << 30, UINT64_C(42) << 30},
         {Q36_GPU_3090, 8, 6, "NVIDIA GeForce RTX 3090", NULL, 0, 0},
+        {Q36_GPU_PRO4000, 12, 0, "NVIDIA RTX PRO 4000 Blackwell", NULL, 0, 0},
     };
 
     if (!name) return Q36_GPU_NONE;
@@ -77,6 +78,9 @@ static inline unsigned q36_device_features(int profile) {
     case Q36_GPU_3090:
         return Q36_AVAILABLE_FEATURES & ~(Q36_EXPERT_ROUTE | Q36_SHARED_SWIGLU |
                                        Q36_FUSED_NORM | Q36_LONG_ATTN);
+    case Q36_GPU_PRO4000:
+        return Q36_AVAILABLE_FEATURES & ~(Q36_ACTIVATION_CACHE | Q36_DNCONV |
+                                       Q36_DNREC | Q36_LONG_ATTN);
     default:
         return 0;
     }
