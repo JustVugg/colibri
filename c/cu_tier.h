@@ -5,8 +5,9 @@
  * vk_tier.h says, with cut_ for vkt_ and its CUDA device open (coli_cuda_init) in place of
  * the Vulkan one. The declarations below are vk_tier.h's (cu_tier.c checks them against the
  * definitions); without COLI_CUDA they are stubs and the tier is off. The tier reads the
- * same COLI_VK_TIER* settings. Not on CUDA yet: the dense chain's expert table, a second
- * device, streaming and the low-bit formats (fmt 200-203). */
+ * same COLI_VK_TIER* settings. The dense chain's expert table (cut_dev_table) holds CUDA's
+ * CcExpert entries (cu_xb.cu: cu_xb_expert_entry). Not on CUDA yet: a second device, streaming
+ * and the low-bit formats (fmt 200-203). */
 #ifndef COLI_CU_TIER_H
 #define COLI_CU_TIER_H
 #include "vk_tier.h"   /* the types: VktConfig, VktExpertSrc, VktHostExpert */

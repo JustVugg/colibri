@@ -8,7 +8,7 @@ the expert map reads `/experts`.
 <p align="center">
   <img src="media/tui/tui-chat.png" width="900" alt="the terminal UI: a conversation on the left, a question, the reasoning folded, the answer, its speed, and the hummingbird sitting on the input box">
 </p>
-<p align="center"><em>Qwen3.8-Flash-Next on an RTX PRO 4000 through <code>coli serve</code>, at a 256K context.</em></p>
+<p align="center"><em>Qwen3.8-Flash-Next on an RTX PRO 4000 through <code>coli serve</code>, at a 64K context.</em></p>
 
 ## Start it
 
@@ -58,12 +58,12 @@ The release archives carry it next to `coli`.
 <p align="center">
   <img src="media/tui/tui-monitor.png" width="900" alt="the monitor: the model's state, the live numbers, the engine's CPU and RAM, the GPU and its VRAM, the tok/s chart, the last turn's cards">
 </p>
-<p align="center"><em>The monitor on the same server: 20 cores, 39.7 GB of engine RAM, 19.8 of 23.9 GB of VRAM.</em></p>
+<p align="center"><em>The monitor on the same server: 20 cores, 45.5 GB of engine RAM, 21.9 of 23.9 GB of VRAM.</em></p>
 
 <p align="center">
   <img src="media/tui/tui-map.png" width="900" alt="the chat with the expert map open: 48 layers of 512 experts, the ones the last turn used lit">
 </p>
-<p align="center"><em>The expert map: 10,831 of Qwen3.8's 24,576 experts in the last answer.</em></p>
+<p align="center"><em>The expert map: Qwen3.8's 48 layers of 512 experts, those the last answer used lit; 29% of them on the card, 71% in RAM.</em></p>
 
 ## The hummingbird
 
@@ -95,8 +95,26 @@ choose by hand.
 | ctrl+r | shows or hides the reasoning |
 | ctrl+b | hides the conversations |
 | esc | stops the answer |
+| ctrl+x | drops the files the next message would take |
+| a drag over the text | selects it; the release copies it |
 | page up, page down, the wheel | scroll |
 | ctrl+q | quits |
+
+## Files and copying
+
+Drop a file on the terminal, or paste or type its full path, and it goes with
+the next message, as on the chat page: a picture as a picture, for a model that
+reads them; a PDF, Word, OpenDocument, PowerPoint, HTML or text file as its
+text, read by the chat page's reader (`ui/docs.py`, which `coli tui` hands to
+the TUI). The files waiting are listed above the input, and the message shows
+their names. Without `coli tui` (`colibri-tui` on its own) plain text files and
+pictures still go; the other documents need the reader.
+
+A drag over the text selects it and the release copies it: to the clipboard on
+Windows; elsewhere through the terminal (OSC 52, which most terminals and tmux
+take) and through `wl-copy`, `xclip` or `xsel` where one runs, `pbcopy` on
+macOS. On a POSIX terminal shift and a drag still make the terminal's own
+selection.
 
 ## Terminals
 
@@ -106,6 +124,6 @@ from 90 columns. The mouse picks a conversation and plays with the bird.
 
 ## Not yet
 
-Pictures, System One, tools and agents, conversations saved to disk, and
+Generated pictures, System One, tools and agents, conversations saved to disk, and
 languages besides English and Italian (`--lang it|en`; the default is the
 system's).

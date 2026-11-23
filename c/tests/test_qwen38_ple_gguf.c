@@ -1,5 +1,6 @@
 /* GGUF PLE loading: an unscaled table is read unchanged; an external scale
- * must be refused by name, since q38_ple_row does not apply one. */
+ * must be refused by name, since q38_ple_row does not apply one; and a head
+ * range q38_hash_row cannot use is refused at load, as for safetensors. */
 #define _GNU_SOURCE
 #define QWEN38_NO_MAIN
 #include "../qwen38.c"
@@ -30,7 +31,7 @@ static int load_ple(void){
 }
 
 #ifndef _WIN32
-static int expect_scale_refusal(void){
+static int expect_refusal(const char *what){
     int pipefd[2];CHECK(pipe(pipefd)==0);
     pid_t child=fork();CHECK(child>=0);
     if(!child){
@@ -45,8 +46,8 @@ static int expect_scale_refusal(void){
     error[used]=0;close(pipefd[0]);
     int status=0;CHECK(waitpid(child,&status,0)==child);
     if(!WIFEXITED(status)||WEXITSTATUS(status)!=1||
-       !strstr(error,"per_layer_token_embd.scale")||!strstr(error,"refusing")){
-        fprintf(stderr,"expected per_layer_token_embd.scale refusal, status=%d, stderr: %s\n",status,error);
+       !strstr(error,what)||!strstr(error,"refusing")){
+        fprintf(stderr,"expected a refusal naming \"%s\", status=%d, stderr: %s\n",what,status,error);
         return 1;
     }
     return 0;
@@ -93,18 +94,27 @@ int main(void){
     CHECK(fflush(file)==0);g_q38_gguf=1;
     int failed=load_ple();
 #ifndef _WIN32
+    /* A head's rows are [offset, offset+vocab): q38_hash_row takes a remainder
+     * by the vocab size and adds the offset. A size of zero, a negative offset
+     * and a U64 at 2^63 (the reader takes I64 or U64) are refused when the file
+     * is opened, not met at the first token. */
+    vocab[1]=0;failed|=expect_refusal("invalid PLE head range 1");vocab[1]=3;
+    offsets[1]=-1;failed|=expect_refusal("invalid PLE head range 1");offsets[1]=2;
+    metadata[1].atype=GGUF_T_U64;vocab[1]=INT64_MIN;
+    failed|=expect_refusal("invalid PLE head range 1");
+    metadata[1].atype=GGUF_T_I64;vocab[1]=3;
     /* Even an identity scale is unsupported: refuse its presence, without
      * guessing whether the table's type or the scale's value makes it safe. */
     int slot=(int)(gguf_hash(tensors[7].name)%32);
     while(index[slot]>=0)slot=(slot+1)%32;
     index[slot]=7;g_q38gg.n_tensors=8;
-    failed|=expect_scale_refusal();
+    failed|=expect_refusal("per_layer_token_embd.scale");
 #else
-    puts("test_qwen38_ple_gguf: scale refusal subtest skipped on Windows");
+    puts("test_qwen38_ple_gguf: refusal subtests skipped on Windows");
 #endif
     g_q38_gguf=0;memset(&g_q38gg,0,sizeof g_q38gg);
     CHECK(fclose(file)==0);CHECK(remove(path)==0);
     if(failed)return 1;
-    puts("test_qwen38_ple_gguf: unscaled PLE rows and named scale refusal: ok");
+    puts("test_qwen38_ple_gguf: unscaled PLE rows, head range and scale refusals: ok");
     return 0;
 }

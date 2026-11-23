@@ -28,14 +28,17 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 | `chat` | Interactive REPL chat. |
 | `serve` | Start the OpenAI-compatible HTTP server. |
 | `web` | `serve`, and the chat UI in front of it (`ui/server.py`, on the API's port + 790), opened in the browser. |
+| `ui` | The chat UI alone, against a `coli serve` that is already running (`--backend`, default `$COLIBRI_BACKEND` or `http://127.0.0.1:8000`; `--port`, default `8790`). See [ui/README.md](../ui/README.md). |
+| `tui` | The chat in the terminal (`colibri-tui`), on a running `coli serve` (`--attach URL`) or on one it starts for `--model`. See [tui.md](tui.md). |
 | `stop` | Shut down a running `coli serve` and its engine (default port: the one `coli setup` configured, else `8000`). |
 | `setup` | One step: detect the hardware, recommend a model, build or fetch the engine (Vulkan/CUDA when usable), download with resume, write the run configuration, start. A rerun starts directly, once `make` has brought the engine up to date with the sources (a rebuild only when they changed, as after `git pull`). See [AI_SETUP.md](AI_SETUP.md). |
-| `start` | Start what `coli setup` configured (`--background`, `--no-browser`, `--json`). |
+| `start` | Start what `coli setup` configured (`--background`, `--no-browser`, `--no-ui`: the API without the chat UI, `--json`). |
 | `status` | What is set up, install progress, server state, URLs, API model id, tok/s of the last answer (`--json`). |
 | `logs` | Tail of the background server log (`-n N`, `--install` for the install log). |
 | `mcp` | Model Context Protocol server on stdio for AI coding assistants. See [MCP_SERVER.md](MCP_SERVER.md). |
 | `cluster coordinator` / `cluster worker` | Run the local-cluster control plane, or an expert worker that serves experts to it. |
 | `bench [tasks]` | Run benchmark tasks (`--limit`, `--data`). |
+| `import <gguf>` | Make a colibrì model directory from a GGUF you already have (`--out`, `--mode link\|copy`). See [gguf.md](gguf.md). |
 | `convert` | Convert an FP8 repo to a colibrì int4 snapshot. |
 
 ### Common flags (all subcommands)
@@ -70,7 +73,7 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 |---|---|---|
 | `--host` | `127.0.0.1` | Bind address. |
 | `--port` | `8000` | Port. |
-| `--model-id` | `$COLI_MODEL_ID` or `glm-5.2-colibri` | Model id reported by the API. |
+| `--model-id` | `$COLI_MODEL_ID`, else the loaded model's id (`glm-5.2-colibri` for GLM-5.2) | Model id reported by the API. |
 | `--api-key` | `$COLI_API_KEY` | Require this bearer token. |
 | `--cors-origin` | none (repeatable) | Allowed CORS origin(s). A plain value replaces the default list; `+ORIGIN` adds to it. |
 | `--allowed-host` | `$COLI_ALLOWED_HOSTS` or none (repeatable) | Additional Host header accepted by the DNS-rebinding guard. |
@@ -111,7 +114,7 @@ catalog entries (a mirror or a private repository); `HF_ENDPOINT` and
 | `--repo` | `zai-org/GLM-5.2-FP8` | Source FP8 repo. |
 | `--ebits` | `4` | Streamed-expert bit width. |
 | `--io-bits` | `8` | Resident (attention/dense/embed) bit width. |
-| `--xbits` | `0` | Extra/override bit width. |
+| `--xbits` | `0` (= `--ebits`) | Bit width of the streamed (routed) experts, when it differs from `--ebits`. |
 | `--no-mtp` | off | Skip the MTP speculative-draft head. |
 
 **`bench`**: `[tasks...]` (positional), `--limit 40`, `--data <bench dir>`.
@@ -140,7 +143,7 @@ Run directly (or via `coli serve`). OpenAI-compatible `/v1/chat/completions`.
 | `--engine` | `./glm` | Path to the engine binary. |
 | `--host` | `127.0.0.1` | Bind address. |
 | `--port` | `8000` | Port. |
-| `--model-id` | `$COLI_MODEL_ID` or `glm-5.2-colibri` | Model id in API responses. |
+| `--model-id` | `$COLI_MODEL_ID`, else the loaded model's id (`glm-5.2-colibri` for GLM-5.2) | Model id in API responses. |
 | `--api-key` | `$COLI_API_KEY` | Required bearer token. |
 | `--cors-origin` | none (repeatable) | Allowed CORS origin(s). A plain value replaces the default list; `+ORIGIN` adds to it. |
 | `--allowed-host` | `$COLI_ALLOWED_HOSTS` or none (repeatable) | Additional Host header accepted by the DNS-rebinding guard. |

@@ -40,6 +40,7 @@
 #include "backend_cuda.h"
 #include "cuda_chain.h"   /* the dense chain's table (one optional export) */
 #include "cu_tier_ops.h"   /* the routed-expert tier's table (one optional export) */
+#include "backend_cuda_ink.h"   /* inkling's bf16 matrices (one optional export) */
 
 /* Which backend DLL this host looks for, and how it labels its own messages.
  * The Makefile defines COLI_HIP_DLL for a HIP_DLL=1 host and leaves it undefined
@@ -110,8 +111,10 @@ typedef int            (*fn_block_elems)(int fmt);
 typedef int            (*fn_tensor_upload_at)(ColiCudaTensor **tensor, void *dev, size_t cap, const void *weights, int fmt, int I, int O, int device);
 typedef const ColiCudaChainOps *(*fn_chain_ops)(void);
 typedef const CuTierOps *(*fn_tier_ops)(void);
+typedef const ColiInkCudaOps *(*fn_ink_ops)(void);
 typedef int            (*fn_e8_set_grid)(const void *grid);
 typedef int            (*fn_fp8_set_lut)(const float *lut);
+typedef int            (*fn_vision_attention)(int device, float *out, const float *qkv, int n, int heads, int D, float scale);
 typedef int            (*fn_matmul)(ColiCudaTensor **tensor, float *y, const float *x,
                                     const void *weights, const float *scales,
                                     int fmt, int S, int I, int O, int device, int gs);
@@ -202,10 +205,12 @@ static struct {
     fn_tensor_upload_at tensor_upload_at;   /* optional: a block-format tensor in an arena's slot */
     fn_chain_ops chain_ops;                 /* optional: the dense chain (cuda_chain.h); NULL = none */
     fn_tier_ops tier_ops;                   /* optional: the routed-expert tier (cu_tier_ops.h); NULL = none */
+    fn_ink_ops ink_ops;                     /* optional: inkling's bf16 matrices (backend_cuda_ink.h); NULL = none */
     fn_e8_set_grid     e8_set_grid;
     fn_fp8_set_lut     fp8_set_lut;
     fn_matmul          matmul;
     fn_matmul_mxfp4    matmul_mxfp4;
+    fn_vision_attention vision_attention;
     fn_expert_mxfp4    expert_mxfp4;
     fn_tensor_free     tensor_free;
     fn_tensor_bytes    tensor_bytes;
@@ -1466,6 +1471,7 @@ static int coli_cuda_load(void){
     RESOLVE_OPT(tensor_upload_at, fn_tensor_upload_at)
     RESOLVE_OPT(chain_ops, fn_chain_ops)
     RESOLVE_OPT(tier_ops, fn_tier_ops)
+    RESOLVE_OPT(ink_ops, fn_ink_ops)
     RESOLVE_OPT(e8_set_grid, fn_e8_set_grid)
     RESOLVE_OPT(fp8_set_lut, fn_fp8_set_lut)
     RESOLVE(matmul,         fn_matmul)
@@ -1473,6 +1479,7 @@ static int coli_cuda_load(void){
      * nothing by this name, and the wrapper's 0 is the engine's own "fall back
      * to CPU" result, so an older DLL still serves GLM and Qwen3.6 (#1405). */
     RESOLVE_OPT(matmul_mxfp4,   fn_matmul_mxfp4)
+    RESOLVE_OPT(vision_attention, fn_vision_attention)
     RESOLVE_OPT(expert_mxfp4,   fn_expert_mxfp4)
     RESOLVE_OPT(available_device_count, fn_available_device_count)   /* older DLLs still support explicit device selection */
     RESOLVE(tensor_free,    fn_tensor_free)
@@ -1716,12 +1723,32 @@ int coli_cuda_block_elems(int fmt){
 }
 
 const ColiCudaChainOps *coli_cuda_chain_ops(void){
+    /* asked before any device (qwen38's chain reserve on an FP8 snapshot): the DLL loads here, or the
+     * caller would keep "no chain" (cuda_chain.h's cc_ops) for the whole run */
+    if(!coli_cuda_load()) return NULL;
     if(!g_cuda.available || !g_cuda.chain_ops) return NULL;   /* older DLL: no chain, the per-matrix path */
     return g_cuda.chain_ops();
 }
 const CuTierOps *coli_cuda_tier_ops(void){
+    if(!coli_cuda_load()) return NULL;   /* the same: the tier's table asked before any device */
     if(!g_cuda.available || !g_cuda.tier_ops) return NULL;   /* older DLL: no CUDA tier, the experts on the CPU */
     return g_cuda.tier_ops();
+}
+
+/* inkling's six (backend_cuda_ink.h) through the DLL's table. ink_cuda_init comes before any
+ * coli_cuda_init, so the table loads the DLL itself; a DLL without it (or no DLL) says no to
+ * each, and inkling runs on Vulkan or the CPU. */
+const ColiInkCudaOps *coli_cuda_ink_ops(void){
+    if(!coli_cuda_load() || !g_cuda.ink_ops) return NULL;
+    return g_cuda.ink_ops();
+}
+int ink_cuda_init(int dev){ const ColiInkCudaOps *o = coli_cuda_ink_ops(); return o ? o->init(dev) : -1; }
+size_t ink_cuda_free_bytes(void){ const ColiInkCudaOps *o = coli_cuda_ink_ops(); return o ? o->free_bytes() : 0; }
+void *ink_cuda_upload(const void *h, size_t n){ const ColiInkCudaOps *o = coli_cuda_ink_ops(); return o ? o->upload(h, n) : NULL; }
+int ink_cuda_download(void *h, const void *d, size_t n){ const ColiInkCudaOps *o = coli_cuda_ink_ops(); return o ? o->download(h, d, n) : -1; }
+void ink_cuda_free(void *d){ const ColiInkCudaOps *o = coli_cuda_ink_ops(); if(o) o->free(d); }
+int ink_cuda_matmul_bf16(float *y, const float *x, const void *W, int S, int I, int O){
+    const ColiInkCudaOps *o = coli_cuda_ink_ops(); return o ? o->matmul_bf16(y, x, W, S, I, O) : -1;
 }
 
 int coli_cuda_e8_set_grid(const void *grid){
@@ -1739,6 +1766,11 @@ int coli_cuda_matmul(ColiCudaTensor **tensor, float *y, const float *x,
                      int fmt, int S, int I, int O, int device, int gs){
     if(!g_cuda.available) return 0;
     return g_cuda.matmul(tensor, y, x, weights, scales, fmt, S, I, O, device, gs);
+}
+
+int coli_cuda_vision_attention(int device, float *out, const float *qkv, int n, int heads, int D, float scale){
+    if(!g_cuda.available || !g_cuda.vision_attention) return 0;   /* an older backend: the CPU's */
+    return g_cuda.vision_attention(device, out, qkv, n, heads, D, scale);
 }
 
 int coli_cuda_matmul_mxfp4(float *y, const float *x, const unsigned char *q4,

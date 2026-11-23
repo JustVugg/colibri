@@ -522,13 +522,21 @@ def _cuda_probe_inprocess():
         # CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75, _MINOR = 76 (cuda.h)
         lib.cuDeviceGetAttribute(ctypes.byref(major), 75, device)
         lib.cuDeviceGetAttribute(ctypes.byref(minor), 76, device)
+        # CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE = 36 (kHz), _GLOBAL_MEMORY_BUS_WIDTH = 37 (bits):
+        # the card's peak memory bandwidth, for the model choice (model_fit.driver_gbs)
+        clock, bits = c_int(0), c_int(0)
+        if lib.cuDeviceGetAttribute(ctypes.byref(clock), 36, device) != 0:
+            clock.value = 0
+        if lib.cuDeviceGetAttribute(ctypes.byref(bits), 37, device) != 0:
+            bits.value = 0
         bus = ctypes.create_string_buffer(64)
         name = ctypes.create_string_buffer(256)
         lib.cuDeviceGetPCIBusId(bus, 64, device)
         lib.cuDeviceGetName(name, 256, device)
         devices.append({"name": name.value.decode("utf-8", "replace"),
                         "pci_bus_id": bus.value.decode("ascii", "replace"),
-                        "compute_cap": f"{major.value}.{minor.value}" if major.value else None})
+                        "compute_cap": f"{major.value}.{minor.value}" if major.value else None,
+                        "memory_clock_khz": clock.value or None, "memory_bus_bits": bits.value or None})
     return {"driver": True, "devices": devices}
 
 

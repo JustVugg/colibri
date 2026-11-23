@@ -130,7 +130,20 @@ typedef struct {
     int v2, res_block;                    /* layers per block of the attention residuals */
     float qk_clip, rel_clip;              /* L2 clips of q and k, of the relative states */
     float gate_cap, up_cap, logit_cap;    /* the experts' and the logits' softcaps */
+    /* Inkling-2-Mini (inkling2_loop): layers [loop_s, loop_e) run loop_p passes with their weights
+     * shared, each pass with key/value and convolution states of its own, and from the second pass
+     * on take messages from the previous one through gates of rank loop_r. n_state counts the
+     * layers that keep state: n_layers, then (loop_p - 1) passes of the loop's layers after them
+     * (ink_wl gives a state layer's weight layer). Without a loop: loop_p 1, n_state n_layers. */
+    int loop_s, loop_e, loop_p, loop_r, n_state;
 } Cfg;
+/* the weight layer of state layer v, and the state layer of weight layer i in pass p */
+static inline int ink_wl(const Cfg *c, int v) {
+    return v < c->n_layers ? v : c->loop_s + (v - c->n_layers) % (c->loop_e - c->loop_s);
+}
+static inline int ink_sl(const Cfg *c, int p, int i) {
+    return p == 0 ? i : c->n_layers + (p - 1) * (c->loop_e - c->loop_s) + (i - c->loop_s);
+}
 
 /* per-layer dims that depend on the attention type */
 #define L_HEADS(c,i) ((c)->local[i] ? (c)->swa_heads : (c)->n_heads)
@@ -229,6 +242,7 @@ typedef struct {
     Wt embed, lm_head;
     float *embed_norm, *final_norm;
     float *x2_out_query;                  /* Inkling-2: the output's attention residual query [D] */
+    float *x2_loopq;                      /* Inkling-2-Mini: each loop layer's message queries [loop layers][4][D]: q, k, v, mlp */
     int x2_names;                         /* Inkling-2's routed experts: 1 gate_up_proj/down_proj (a container),
                                            * 2 the checkpoint's w13_weight/w2_weight, w13's gate and up rows
                                            * interleaved (even = gate) */
@@ -1027,6 +1041,29 @@ static void load_cfg(Cfg *c, const char *snap) {
         }
     }
     if (c->n_layers > MAXL) { fprintf(stderr,"n_layers %d > MAXL\n", c->n_layers); exit(1); }
+    /* Inkling-2-Mini's loop: the checkpoint's text_config.loop_config (core_start, core_end,
+     * num_passes, gate_rank), or a saved snapshot's flat loop_layer_index_start/_end,
+     * loop_num_passes and loop_gate_rank */
+    c->loop_p = 1; c->loop_s = c->loop_e = c->loop_r = 0;
+    if (c->v2) {
+        jval *lc = json_get(r, "loop_config");
+        if (lc && lc->t == J_OBJ) {
+            c->loop_s = (int)jnum(lc, "core_start", 0); c->loop_e = (int)jnum(lc, "core_end", 0);
+            c->loop_p = (int)jnum(lc, "num_passes", 1); c->loop_r = (int)jnum(lc, "gate_rank", 0);
+        } else if (json_get(r, "loop_num_passes")) {
+            c->loop_s = (int)jnum(r, "loop_layer_index_start", 0); c->loop_e = (int)jnum(r, "loop_layer_index_end", 0);
+            c->loop_p = (int)jnum(r, "loop_num_passes", 1); c->loop_r = (int)jnum(r, "loop_gate_rank", 0);
+        }
+        if (c->loop_p != 1 && (c->loop_p < 1 || c->loop_p > 16 || c->loop_s <= 0 || c->loop_e <= c->loop_s ||
+                               c->loop_e > c->n_layers || c->loop_s % c->res_block || c->loop_e % c->res_block ||
+                               c->loop_r < 1 || c->loop_r > 4096)) {
+            fprintf(stderr, "inkling2: loop out of range (layers %d..%d of %d, %d passes, gate rank %d, blocks of %d)\n",
+                    c->loop_s, c->loop_e, c->n_layers, c->loop_p, c->loop_r, c->res_block);
+            exit(1);
+        }
+    }
+    c->n_state = c->n_layers + (c->loop_p > 1 ? (c->loop_p - 1) * (c->loop_e - c->loop_s) : 0);
+    if (c->n_state > MAXL) { fprintf(stderr, "inkling2: %d layers with the loop's passes > MAXL\n", c->n_state); exit(1); }
 
     /* SEC: these loops run to n_layers -- a number from config.json, up to
      * MAXL -- while indexing a JSON array whose length is a different, equally
@@ -1063,6 +1100,9 @@ static void load_cfg(Cfg *c, const char *snap) {
         const char *mtype = LT_STR(mt, i);
         if (mtype) c->sparse[i] = (strcmp(mtype,"sparse")==0);
         else c->sparse[i] = (i >= dense_idx);
+    }
+    for (int v = c->n_layers; v < c->n_state; v++) {   /* a loop pass's layers: their weight layer's types */
+        c->local[v] = c->local[ink_wl(c, v)]; c->sparse[v] = c->sparse[ink_wl(c, v)];
     }
     #undef LT_STR
     free(buf); free(arena);
@@ -1625,7 +1665,8 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     }
 #endif
 #ifdef COLI_CUDA
-    if (!getenv("NOGPU") && !cuda_off) {
+    /* COLI_CUDA=0 (coli's --gpu none) keeps the card unused, as COLI_VULKAN=0 does Vulkan's */
+    if (!getenv("NOGPU") && !cuda_off && !(getenv("COLI_CUDA") && *getenv("COLI_CUDA") == '0')) {
         int dev = getenv("GPU_DEV") ? atoi(getenv("GPU_DEV")) : 0;
         if (ink_cuda_init(dev) == 0) {
             g_cuda = 1; g_ink_cuda_dev = dev;
@@ -1654,6 +1695,41 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         m->final_norm = load_t(m, "model.llm.norm.weight");
         m->lm_head    = load_w(m, "model.llm.unembed.weight", 1);
         m->x2_out_query = load_t(m, "model.llm.attn_res.output_query");
+        char mq[96] = "";
+        if (m->c.loop_p > 1) snprintf(mq, sizeof mq, "model.llm.layers.%d.loop_msg_query", m->c.loop_s);
+        if (m->c.loop_p > 1 && st_has(&m->S, mq)) {
+            /* mainline llama.cpp's inkling2_loop files: a loop layer's four queries in a tensor of its own,
+             * [q, k, v, mlp] (st_gguf.h) */
+            const int nl = m->c.loop_e - m->c.loop_s; const int64_t D = m->c.hidden;
+            m->x2_loopq = falloc((int64_t)nl * 4 * D);
+            for (int j = 0; j < nl; j++) {
+                snprintf(mq, sizeof mq, "model.llm.layers.%d.loop_msg_query", m->c.loop_s + j);
+                if (st_numel(&m->S, mq) != 4 * D) {
+                    fprintf(stderr, "inkling2: %s has %lld values, not 4 x %lld\n", mq,
+                            (long long)st_numel(&m->S, mq), (long long)D);
+                    exit(1);
+                }
+                float *t = load_t(m, mq);
+                memcpy(m->x2_loopq + (int64_t)j * 4 * D, t, 4 * D * sizeof(float));
+                free(t);
+            }
+        } else if (m->c.loop_p > 1) {   /* the checkpoint's two [2 x loop layers, D]: [q, mlp] and [k, v] of each loop layer */
+            const int nl = m->c.loop_e - m->c.loop_s; const int64_t D = m->c.hidden;
+            const char *qn = "model.llm.middle_cycle_cross_pass_queries", *kvn = "model.llm.middle_cycle_cross_pass_kv_queries";
+            if (st_numel(&m->S, qn) != 2 * nl * D || st_numel(&m->S, kvn) != 2 * nl * D) {
+                fprintf(stderr, "inkling2: the loop's message queries are not 2 x %d x %lld values\n", nl, (long long)D);
+                exit(1);
+            }
+            float *q = load_t(m, qn), *kv = load_t(m, kvn);
+            m->x2_loopq = falloc((int64_t)nl * 4 * D);
+            for (int j = 0; j < nl; j++) {
+                float *o = m->x2_loopq + (int64_t)j * 4 * D;
+                memcpy(o, q + (int64_t)(2 * j) * D, D * sizeof(float));               /* q */
+                memcpy(o + D, kv + (int64_t)(2 * j) * D, 2 * D * sizeof(float));      /* k, v */
+                memcpy(o + 3 * D, q + (int64_t)(2 * j + 1) * D, D * sizeof(float));   /* mlp */
+            }
+            free(q); free(kv);
+        }
         m->vis = ink2_vision_load(m, snap);
         if (ink2m_wanted()) m->mtp = ink2m_load(m, snap);
     } else if (load_boundaries) {
@@ -1689,7 +1765,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     }
     m->L = calloc(c->n_layers, sizeof(Layer));
     for (int j = 0; j < 4; j++)
-        m->cs[j] = calloc(c->n_layers, sizeof(float*));
+        m->cs[j] = calloc(c->n_state, sizeof(float*));   /* a loop pass's layers keep convolution states of their own */
     char nm[320];
     for (int i = layer_begin; i < layer_end; i++) {
         Layer *l = &m->L[i];
@@ -1750,6 +1826,11 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
             int C = (j < 2) ? kvdim : D;
             m->cs[j][i] = calloc((int64_t)C * (K-1), sizeof(float));
         }
+    }
+    for (int v = c->n_layers; v < c->n_state; v++) {   /* the loop's later passes, as their weight layers */
+        const int w = ink_wl(c, v), kvdim = L_KV(c, w) * L_HD(c, w);
+        if (allocate_state && w >= layer_begin && w < layer_end)
+            for (int j = 0; j < 4; j++) m->cs[j][v] = calloc((int64_t)((j < 2) ? kvdim : D) * (K-1), sizeof(float));
     }
     /* container detection: converted snapshots store experts as U8 + .qs.
      * rb13/rb2 = bytes per packed row (D/2|D and I/2|I for int4|int8) */
@@ -2728,7 +2809,7 @@ static size_t ink_kv_later(const Model *m) {
     const Cfg *c = &m->c;
     int t = ink_ctx_max() + 8;
     size_t b = 0;
-    for (int i = 0; i < c->n_layers; i++)
+    for (int i = 0; i < c->n_state; i++)   /* the loop's later passes keep their own (Inkling-2-Mini) */
         b += 2 * (size_t)L_KV(c, i) * (size_t)kv_ring_rows(c, i, t) * (size_t)L_HD(c, i) * sizeof(float);
     return b * (size_t)(g_ink_mux_slots > 1 ? g_ink_mux_slots : 1);
 }
@@ -2851,6 +2932,11 @@ static void ink_vk_tier_start(Model *m) {
         if (!m->gx) fd = f;
         g_ink_vk_slot_bytes = (size_t)slotb;
         ink2_host_pool_default(c);
+        if (g_ink2c_want)
+            fprintf(stderr, "[VK] inkling2 chain: %.2f GiB left beside the tier (the dense matrices %.2f, the chain's own "
+                            "buffers %.2f: K/V mirrors of %d state layers at %d tokens, CTX_MAX)\n",
+                    ink_vk_dense_bytes(m) / 1073741824.0, ink_vk_dense_bytes_mats(m) / 1073741824.0,
+                    ink2c_plan_bytes(m) / 1073741824.0, c->n_state, ink_ctx_max());
         VktConfig vc = {.engine = "inkling", .layers = c->n_layers, .experts = c->n_experts,
                         .hidden = c->hidden, .inter = c->moe_inter, .topk = c->topk,
                         .gate_up = f, .down = fd, .layer_gate_up = lgu, .layer_down = ldn,
@@ -2886,6 +2972,7 @@ static void ink_vk_tier_start(Model *m) {
  * holds there (load_w), whose memory the budget it reads leaves them. Inkling keeps the
  * backend alone, as before: its experts on the CPU. */
 static size_t ink2cc_plan_bytes(const Model *m);   /* inkling2_cuchain.h */
+static int ink2cc_wanted(const Cfg *c);             /* inkling2_cuchain.h */
 static ColiCudaTensor *ink2cc_mat(Wt *w, int I, int O);   /* inkling2_cuchain.h */
 /* Inkling-2 from a GGUF on the CUDA build: the attention's block-format matrices and the head on
  * the device as the file has them (cuda_bd.cuh; matmul_w reads W.cut), before the tier measures
@@ -2922,11 +3009,11 @@ static void ink2_cuda_gguf_dense(Model *m) {
 static void ink_cu_tier_start(Model *m) {
     Cfg *c = &m->c;
     if (c->v2 && g_cuda && !XT(ready)()) ink2_cuda_gguf_dense(m);
-    /* Inkling-2's CUDA chain (COLI_CUDA_CHAIN=1 or 2, inkling2_cuchain.h; off by default: it measured
-     * no faster than the matrices a call at a time) planned here, before the tier sizes itself: the
-     * tier leaves its buffers and K/V mirrors */
-    { const char *e = getenv("COLI_CUDA_CHAIN");
-      g_ink2cc_want = c->v2 && g_cuda && !XT(ready)() && e && (*e == '1' || *e == '2') && g_ink_mux_slots <= 1; }
+    /* Inkling-2's CUDA chain (COLI_CUDA_CHAIN=1 or 2, inkling2_cuchain.h; unset, on for Inkling-2-Mini,
+     * whose experts it runs in the frame, and off for the others: there it measured no faster than the
+     * matrices a call at a time) planned here, before the tier sizes itself: the tier leaves its
+     * buffers and K/V mirrors */
+    g_ink2cc_want = c->v2 && g_cuda && !XT(ready)() && g_ink_mux_slots <= 1 && ink2cc_wanted(c);
     if (!c->v2 || !g_cuda || XT(ready)() || !cut_wanted()) return;   /* cut_wanted: COLI_VK_TIER=0 keeps it off */
     int dev = getenv("GPU_DEV") ? atoi(getenv("GPU_DEV")) : 0;
     if (!coli_cuda_init(&dev, 1)) { fprintf(stderr, "[CUDA] tier inkling: device %d unavailable; the experts stay on the CPU\n", dev); return; }
@@ -3643,22 +3730,22 @@ static void ink_pin_state_free(void *v){
 static InkPinState *ink_pin_state_save(Model *m, InkPinState *reuse){
     Cfg *c = &m->c;
     InkPinState *st = reuse;
-    if (st && st->n_layers != c->n_layers) { ink_pin_state_free(st); st = NULL; }
+    if (st && st->n_layers != c->n_state) { ink_pin_state_free(st); st = NULL; }
     if (!st){
         st = (InkPinState *)calloc(1, sizeof(*st));
         if (!st) return NULL;
-        st->n_layers = c->n_layers;
+        st->n_layers = c->n_state;
         for (int j = 0; j < 4; j++){
-            st->cs[j] = (float**)calloc((size_t)c->n_layers, sizeof(float*));
+            st->cs[j] = (float**)calloc((size_t)c->n_state, sizeof(float*));
             if (!st->cs[j]){ ink_pin_state_free(st); return NULL; }
-            for (int i = 0; i < c->n_layers; i++){
+            for (int i = 0; i < c->n_state; i++){
                 st->cs[j][i] = (float*)malloc((size_t)ink_cs_cells(c,j,i) * sizeof(float));
                 if (!st->cs[j][i]){ ink_pin_state_free(st); return NULL; }
             }
         }
     }
     for (int j = 0; j < 4; j++)
-        for (int i = 0; i < c->n_layers; i++)
+        for (int i = 0; i < c->n_state; i++)
             memcpy(st->cs[j][i], m->cs[j][i],
                    (size_t)ink_cs_cells(c,j,i) * sizeof(float));
     return st;
@@ -3668,7 +3755,7 @@ static void ink_pin_state_restore(Model *m, const InkPinState *st){
     Cfg *c = &m->c;
     if (!st) return;
     for (int j = 0; j < 4; j++)
-        for (int i = 0; i < c->n_layers; i++)
+        for (int i = 0; i < c->n_state; i++)
             memcpy(m->cs[j][i], st->cs[j][i],
                    (size_t)ink_cs_cells(c,j,i) * sizeof(float));
 #ifdef COLI_VULKAN
@@ -3825,9 +3912,9 @@ static void ink_seq_swap(Model *m, InkSeq *q) {
 static void ink_seq_alloc(Model *m, InkSeq *q) {
     Cfg *c = &m->c;
     memset(q, 0, sizeof *q);
-    q->K = calloc(c->n_layers, sizeof(float*)); q->V = calloc(c->n_layers, sizeof(float*));
-    for (int j = 0; j < 4; j++) q->cs[j] = calloc(c->n_layers, sizeof(float*));
-    for (int i = 0; i < c->n_layers; i++) {
+    q->K = calloc(c->n_state, sizeof(float*)); q->V = calloc(c->n_state, sizeof(float*));
+    for (int j = 0; j < 4; j++) q->cs[j] = calloc(c->n_state, sizeof(float*));
+    for (int i = 0; i < c->n_state; i++) {
         int kv = L_KV(c,i), hd = L_HD(c,i);
         int64_t rows = kv_ring_rows(c, i, m->max_t);
         q->K[i] = falloc((int64_t)kv * rows * hd);
@@ -3874,7 +3961,7 @@ static void state_reset(Model *m) {
     Cfg *c = &m->c;
     m->kv_len = 0;
     kv_prefix_clear(&m->kvp);
-    for (int i = 0; i < c->n_layers; i++) {
+    for (int i = 0; i < c->n_state; i++) {
         int kvdim = L_KV(c,i) * L_HD(c,i);
         for (int j = 0; j < 4; j++)
             memset(m->cs[j][i], 0, (int64_t)((j < 2) ? kvdim : c->hidden) * (c->conv_k-1) * sizeof(float));
@@ -3919,9 +4006,9 @@ static void kv_alloc(Model *m, int max_t) {
     int keep = (m->K && m->kv_len > 0 && m->kv_len <= max_t) ? m->kv_len : 0;
 
     m->max_t = max_t;
-    m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
+    m->K = calloc(c->n_state, sizeof(float*)); m->V = calloc(c->n_state, sizeof(float*));
     int64_t ring = 0, full = 0;
-    for (int i = 0; i < c->n_layers; i++) {
+    for (int i = 0; i < c->n_state; i++) {
         int kv = L_KV(c,i), hd = L_HD(c,i);
         int64_t rows     = kv_ring_rows(c, i, max_t);
         int64_t old_rows = oldK ? kv_ring_rows(c, i, old_max) : 0;
@@ -3941,7 +4028,7 @@ static void kv_alloc(Model *m, int max_t) {
         ring += 2 * (int64_t)kv * rows  * hd * (int64_t)sizeof(float);
         full += 2 * (int64_t)kv * max_t * hd * (int64_t)sizeof(float);
     }
-    if (oldK) for (int i = 0; i < c->n_layers; i++) { free(oldK[i]); free(oldV[i]); }
+    if (oldK) for (int i = 0; i < c->n_state; i++) { free(oldK[i]); free(oldV[i]); }
     free(oldK); free(oldV);
     if (ring < full)
         fprintf(stderr, "[kv] %.1f MiB (ring buffers on sliding layers; full cache would be %.1f MiB)\n",
@@ -4337,9 +4424,9 @@ static int ink_prompt_poll(ColiPromptBreak *b) {
 static ColiPark g_ink_park;
 static ColiParkPart *ink_park_parts(Model *m, int *n_out) {
     Cfg *c = &m->c; int n = 0;
-    ColiParkPart *p = malloc(sizeof *p * ((size_t)c->n_layers * 6));
+    ColiParkPart *p = malloc(sizeof *p * ((size_t)c->n_state * 6));
     if (!p) { *n_out = 0; return NULL; }
-    for (int i = 0; i < c->n_layers; i++) {
+    for (int i = 0; i < c->n_state; i++) {
         int kv = L_KV(c,i), hd = L_HD(c,i), rows = (int)kv_ring_rows(c, i, m->max_t);
         size_t row = (size_t)hd * sizeof(float), hs = (size_t)rows * row;
         p[n++] = coli_park_heads(m->K ? m->K[i] : NULL, row, rows, kv, hs);
@@ -4409,7 +4496,7 @@ static size_t ink_ps_plan(void) { ink_ps_on(); return g_ink_ps.on ? g_ink_ps.bud
 /* the global layers' K and V rows, head by head */
 static int ink_ps_parts(Model *m, ColiPsPart *parts) {
     Cfg *c = &m->c; int n = 0;
-    for (int i = 0; i < c->n_layers; i++) {
+    for (int i = 0; i < c->n_state; i++) {
         const int rows = kv_ring_rows(c, i, m->max_t);
         if (!m->K || !m->V || rows != m->max_t) continue;   /* a ring: the checkpoint's */
         const int kv = L_KV(c, i), hd = L_HD(c, i);
@@ -4429,7 +4516,7 @@ static void ink_ps_state_free(void *v) {
 }
 /* the convolution banks (a pin's state) and the sliding layers' rings */
 static InkPsState *ink_ps_state_save(Model *m, size_t *bytes) {
-    Cfg *c = &m->c; const int L = c->n_layers;
+    Cfg *c = &m->c; const int L = c->n_state;
     InkPsState *x = (InkPsState *)calloc(1, sizeof *x);
     if (!x) return NULL;
     x->n_layers = L;
@@ -4453,7 +4540,7 @@ static InkPsState *ink_ps_state_save(Model *m, size_t *bytes) {
  * host too) */
 static void ink_ps_save(Model *m, const int *ids, int P) {
     if (!ink_ps_on() || P < g_ink_ps.B || m->kvp.tainted || m->kv_len != P || !m->K) return;
-    ColiPsPart *parts = (ColiPsPart *)malloc((size_t)2 * m->c.n_layers * sizeof *parts + 1);
+    ColiPsPart *parts = (ColiPsPart *)malloc((size_t)2 * m->c.n_state * sizeof *parts + 1);
     if (!parts) return;
     const int np = ink_ps_parts(m, parts);
     size_t sb = 0;
@@ -4466,20 +4553,20 @@ static void ink_ps_save(Model *m, const int *ids, int P) {
 static int ink_ps_take(Model *m, const int *ids, int np, int held) {
     if (!ink_ps_on() || np < 2 || !m->K) return 0;
     Cfg *c = &m->c;
-    ColiPsPart *parts = (ColiPsPart *)malloc((size_t)2 * c->n_layers * sizeof *parts + 1);
+    ColiPsPart *parts = (ColiPsPart *)malloc((size_t)2 * c->n_state * sizeof *parts + 1);
     if (!parts) return 0;
     const int nparts = ink_ps_parts(m, parts);
     if (!coli_ps_layout(&g_ink_ps, parts, nparts)) { free(parts); return 0; }
     ColiPsHit h;
     const int P = coli_ps_lookup(&g_ink_ps, ids, np, np - 1, 1, &h);
     const InkPsState *x = P > 0 && h.ck >= 0 ? (const InkPsState *)g_ink_ps.ck[h.ck].state : NULL;
-    if (P <= held + coli_ps_min_gain(&g_ink_ps) || !x || x->n_layers != c->n_layers || !coli_ps_parts_hold(parts, nparts, P)) {
+    if (P <= held + coli_ps_min_gain(&g_ink_ps) || !x || x->n_layers != c->n_state || !coli_ps_parts_hold(parts, nparts, P)) {
         coli_ps_hit_free(&h); free(parts); return 0;
     }
     coli_ps_load(&g_ink_ps, &h, parts, nparts);
     free(parts);
     ink_pin_state_restore(m, x->cs);
-    for (int i = 0; i < c->n_layers; i++) {
+    for (int i = 0; i < c->n_state; i++) {
         const int rows = kv_ring_rows(c, i, m->max_t);
         if (rows == m->max_t || !x->rk[i]) continue;
         const size_t rb = (size_t)L_KV(c, i) * rows * L_HD(c, i) * sizeof(float);

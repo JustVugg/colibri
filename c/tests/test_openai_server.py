@@ -1681,6 +1681,43 @@ class ProtocolTest(unittest.TestCase):
             listener.close()
 
 
+class ChatRedirectTest(unittest.TestCase):
+    """The API's own address, where the dashboard was before the chat UI, sends a browser on to
+    `coli web`'s chat: at the host the browser used, the UI's port. A plain `coli serve`, or
+    `coli web --no-ui`, has no chat to send it to: a 404 as before."""
+
+    def _get(self, chat_port, host):
+        server = APIServer(("127.0.0.1", 0), FakeEngine(), "test")
+        server.chat_port = chat_port
+        thread = threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, timeout=2)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.scheduler.close)
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+        conn.request("GET", "/", headers={"Host": host % server.server_port})
+        response = conn.getresponse()
+        response.read()
+        conn.close()
+        return response.status, response.getheader("Location")
+
+    def test_the_root_sends_a_browser_to_the_chat(self):
+        self.assertEqual(self._get(8790, "127.0.0.1:%d"), (302, "http://127.0.0.1:8790/"))
+        self.assertEqual(self._get(8790, "localhost:%d"), (302, "http://localhost:8790/"))
+        self.assertEqual(self._get(9001, "[::1]:%d"), (302, "http://[::1]:9001/"))
+
+    def test_without_a_chat_the_root_is_not_found(self):
+        self.assertEqual(self._get(None, "127.0.0.1:%d")[0], 404)
+
+    def test_the_chat_location_keeps_the_host(self):
+        for host, want in (("192.168.1.20:8000", "http://192.168.1.20:8790/"), ("box.lan:8000", "http://box.lan:8790/"),
+                           ("[fe80::1]:8000", "http://[fe80::1]:8790/"), ("::1", "http://[::1]:8790/"),
+                           ("example", "http://example:8790/"), ("", "http://127.0.0.1:8790/"), (None, "http://127.0.0.1:8790/")):
+            with self.subTest(host=host):
+                self.assertEqual(openai_server.chat_location(host, 8790), want)
+
+
 class GenerationMetricsTest(unittest.TestCase):
     def setUp(self):
         self.server = APIServer(("127.0.0.1", 0), FakeEngine(), "test")
@@ -3062,6 +3099,21 @@ class CapSentinelShimTest(unittest.TestCase):
             with self.subTest(arch=arch, cap="explicit"), patch("resource_plan.build_plan") as planner:
                 self.assertEqual(cap_for_arch(arch, 2, {}, model=model), 2)
                 planner.assert_not_called()
+
+    def test_inkling_ram_plan_sizes_the_expert_cache(self):
+        # Inkling's eight legacy slots read nearly every routed expert of a step from the page
+        # cache (Inkling-2 routes eight): Inkling-2-Mini, whole in RAM, decoded at 4.3 tok/s on
+        # the CPU. The plan's slots instead, never below the legacy eight
+        model = self._model("inkling2_loop_text")
+        for planned, expected in ((0, 8), (3, 8), (128, 128)):
+            with self.subTest(planned=planned), patch("resource_plan.build_plan", return_value={
+                    "tiers": {"ram": {"cache_slots_per_layer": planned}}}):
+                self.assertEqual(cap_for_arch("inkling", None, {}, model=model), expected)
+        with patch("resource_plan.build_plan", side_effect=ValueError("no safetensors shards")):
+            self.assertEqual(cap_for_arch("inkling", None, {}, model=model), 8)
+        with patch("resource_plan.build_plan") as planner:
+            self.assertEqual(cap_for_arch("inkling", 3, {}, model=model), 3)
+            planner.assert_not_called()
 
     def test_v41_explicit_and_calibrated_caps_bypass_planning(self):
         for cap, env, expected in ((7, {}, 7), (0, {}, 0),
@@ -6002,6 +6054,46 @@ class ImageUrlPathGuard(unittest.TestCase):
         with self.assertRaises(APIError) as caught:
             _image_bytes_from_url("/no/such/secret-name.png")
         self.assertNotIn("secret-name", str(caught.exception))
+
+
+def _png_header(width, height):
+    """a PNG's signature, IHDR and a few bytes of IDAT: Pillow reads its size from the header
+    and decodes nothing until asked"""
+    import zlib
+
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(b"\x00" * 16)) + chunk(b"IEND", b"")
+
+
+class ImagePixelCeiling(unittest.TestCase):
+    """A request's picture past MAX_IMAGE_PIXELS is refused from its header, before a
+    preprocessor decodes it whole: a few KB of PNG can name 10000 x 10000 pixels."""
+
+    def setUp(self):
+        try:
+            import PIL  # noqa: F401
+        except ImportError:
+            self.skipTest("Pillow is not installed")
+
+    def uri(self, data):
+        import base64
+        return "data:image/png;base64," + base64.b64encode(data).decode()
+
+    def test_a_picture_past_the_ceiling_is_refused(self):
+        big = _png_header(10000, 10000)
+        self.assertLess(len(big), 200)
+        with self.assertRaises(APIError) as caught:
+            _image_bytes_from_url(self.uri(big))
+        self.assertEqual(caught.exception.status, 400)
+        self.assertIn("10000x10000", str(caught.exception))
+
+    def test_a_picture_at_the_ceiling_passes(self):
+        side = _png_header(8192, 8192)
+        self.assertEqual(_image_bytes_from_url(self.uri(side)), side)
+        small = _png_header(640, 480)
+        self.assertEqual(_image_bytes_from_url(self.uri(small)), small)
 
 
 class ContextExceededMessageTest(unittest.TestCase):

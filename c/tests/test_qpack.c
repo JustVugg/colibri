@@ -466,6 +466,73 @@ static void test_eager_layer_validation_cleanup(void) {
     cleanup(root);
 }
 
+/* A directory that is not a container has neither JSON file. The message names
+ * the first one missing, manifest.json, which is what says a directory is a
+ * container: not layout.json, read second into the same buffer. */
+static void test_missing_manifest_is_the_error_reported(void) {
+    char root[] = "test_qpack_empty_XXXXXX";
+    CHECK(mkdtemp(root) != NULL);
+    ColiQpackReader reader;
+    char error[512] = {0};
+    CHECK(coli_qpack_open(&reader, root, error, sizeof(error)) != 0);
+    CHECK(strstr(error, "manifest.json") != NULL);
+    CHECK(strstr(error, "layout.json") == NULL);
+    CHECK(reader.layer_fds == NULL && reader.layout.sections == NULL);
+    remove_dir(root);
+}
+
+#ifndef _WIN32
+/* A model directory usually comes from a download, so a FIFO may sit under any
+ * of the container's names. Opening one to read waits for a writer (the alarm
+ * turns that wait into a failure): the reader must get to the refusal it
+ * already has for a file that is not a regular one. */
+static void expect_fifo_refusal(const char *name, const char *message) {
+    char root[] = "test_qpack_fifo_XXXXXX";
+    CHECK(mkdtemp(root) != NULL);
+    write_fixture(root, valid_layout_bf16, "QPACK", 32768, 4, 8,
+                  COLI_AFFINE_SCALAR_BF16);
+    char path[1024];
+    make_path(path, sizeof(path), root, name);
+    CHECK(remove(path) == 0);
+    CHECK(mkfifo(path, 0600) == 0);
+    ColiQpackReader reader;
+    char error[512] = {0};
+    alarm(5);
+    int status = coli_qpack_open(&reader, root, error, sizeof(error));
+    alarm(0);
+    CHECK(status != 0);
+    CHECK(strstr(error, message) != NULL);
+    CHECK(reader.layer_fds == NULL && reader.layout.sections == NULL);
+    cleanup(root);
+}
+
+/* A container's files may be symlinks (a Hugging Face cache snapshot is made
+ * of them): such a container still opens, and the layer descriptors the
+ * reader keeps are blocking ones. */
+static void test_symlinked_layer_opens_blocking(void) {
+    char root[] = "test_qpack_link_XXXXXX";
+    CHECK(mkdtemp(root) != NULL);
+    write_fixture(root, valid_layout_bf16, "QPACK", 32768, 4, 8,
+                  COLI_AFFINE_SCALAR_BF16);
+    char layer[1024], blob[1024];
+    make_path(layer, sizeof(layer), root, "packed_experts/layer_00.bin");
+    make_path(blob, sizeof(blob), root, "blob");
+    CHECK(rename(layer, blob) == 0);
+    CHECK(symlink("../blob", layer) == 0);
+    ColiQpackReader reader;
+    char error[512] = {0};
+    CHECK(coli_qpack_open(&reader, root, error, sizeof(error)) == 0);
+    for (size_t layer_index = 0; layer_index < reader.layout.layer_count;
+         layer_index++) {
+        int flags = fcntl(reader.layer_fds[layer_index], F_GETFL);
+        CHECK(flags != -1 && !(flags & O_NONBLOCK));
+    }
+    coli_qpack_close(&reader);
+    CHECK(remove(blob) == 0);
+    cleanup(root);
+}
+#endif
+
 static void test_embedded_nul_metadata(void) {
     char root[] = "test_qpack_nul_XXXXXX";
     CHECK(mkdtemp(root) != NULL);
@@ -746,6 +813,14 @@ int main(void) {
     test_two_modules_open();
     test_affine_shape_refusal();
     test_eager_layer_validation_cleanup();
+    test_missing_manifest_is_the_error_reported();
+#ifndef _WIN32
+    expect_fifo_refusal("manifest.json", "is not a bounded regular JSON file");
+    expect_fifo_refusal("packed_experts/layout.json",
+                        "is not a bounded regular JSON file");
+    expect_fifo_refusal("packed_experts/layer_00.bin", "has unexpected size");
+    test_symlinked_layer_opens_blocking();
+#endif
     test_embedded_nul_metadata();
     test_section_token_rules();
     test_section_name_cap();

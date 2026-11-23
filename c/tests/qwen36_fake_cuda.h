@@ -153,6 +153,13 @@ void coli_cuda_stats(int device, size_t *count, size_t *bytes) {
     (void)device; if (count) *count = 0; if (bytes) *bytes = 0;
 }
 
+/* the vision tower's attention (qwen38_vision.h): refused, so the tower takes the CPU's,
+ * as a card without the kernel would. */
+int coli_cuda_vision_attention(int device, float *out, const float *qkv, int n, int heads, int D, float scale) {
+    (void)device; (void)out; (void)qkv; (void)n; (void)heads; (void)D; (void)scale;
+    return 0;
+}
+
 /* dense GEMV on a resident tensor (lm_head / DeltaNet projections placed on a
  * device). Counted, never computed: the placement tests check WHERE work
  * went; the arithmetic has its own oracle in the CUDA build. Parameters are

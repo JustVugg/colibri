@@ -408,8 +408,8 @@ TEXT_HINTS = {
     "cuda": "install the CUDA Toolkit from https://developer.nvidia.com/cuda-downloads",
     "cuda-win32": "the Windows CUDA build needs the CUDA Toolkit and MSVC: see docs/windows.md",
     "cuda-win32-release": ("unpack the release's windows-x86_64-cuda.zip next to the engines "
-                           "(coli_cuda.dll and the CUDA builds of colibri, glm53, qwen36, qwen38 "
-                           "and kimi_k3)"),
+                           "(coli_cuda.dll and the CUDA builds of colibri, glm53, qwen36, qwen38, "
+                           "kimi_k3, deepseek_v41, mimo, inkling, olmoe, laya and gliner_decide)"),
     "build-other": "install gcc (with OpenMP) and make from your distribution",
     "vulkan-other": ("install the Vulkan loader development files, glslc (shaderc) and the "
                      "Mesa Vulkan drivers from your distribution"),
@@ -479,8 +479,14 @@ VULKAN_IGPU_MEASURED = frozenset({"qwen36", "qwen38"})
 #:     device (cu_tier.h). A build with Vulkan too runs on Vulkan unless
 #:     COLI_VULKAN=0 (CUDA_WITH_VULKAN), whose dense chain puts the trunk on the card.
 #:
-#: The remaining engines are CPU-only: none of them is here, so none of them is
-#: built with CUDA.
+#:   backend_cuda.o through the dense chain alone (olmoe, laya, gliner_decide:
+#:     CHAIN_CUDA_OBJ): OLMoE's every layer and expert on the card as one frame
+#:     (olmoe_cuda_chain.h), the decision engines' encoder forward (decide_cuda.h);
+#:     docs/cuda.md measures them (OLMoE 316 tok/s of decode against 32.5 on the CPU,
+#:     Laya 0.69 s a request against 11.4-13.0).
+#:
+#: The remaining engine, qwenimage, has no CUDA path (Vulkan and the CPU): it is not
+#: here, so it is not built with CUDA.
 CUDA_ENGINES = {
     "qwen36": {"object": "backend_cuda.o"},
     "qwen38": {"object": "backend_cuda.o"},
@@ -490,6 +496,9 @@ CUDA_ENGINES = {
     "deepseek_v41": {"object": "backend_cuda.o"},
     "mimo": {"object": "backend_cuda.o"},
     "inkling": {"object": "backend_cuda_ink.o"},
+    "olmoe": {"object": "backend_cuda.o"},
+    "laya": {"object": "backend_cuda.o"},
+    "gliner_decide": {"object": "backend_cuda.o"},
     "deepseek_v4": {"object": "backend_cuda_dsv4.o", "min_compute": 60,
                     "min_toolkit": (12, 0), "no_tc_below": (12, 8)},
 }
@@ -757,15 +766,20 @@ def prebuilt_runs(family, backend, directory=None):
 #: The release archives whose engines are built with Vulkan (release.yml, VK=1).
 RELEASE_VULKAN = ("linux-x86_64.tar.gz", "windows-x86_64.zip")
 #: The engines the release's windows-x86_64-cuda.zip (RELEASE_CUDA_WIN32) carries, built against
-#: coli_cuda.dll (release.yml, the cuda-windows job), and the oldest card its DLL
-#: runs on: CUDA_ARCH=portable is SASS for sm_80 and newer plus compute_120 PTX.
-WINDOWS_CUDA_ENGINES = ("glm", "glm53", "qwen36", "qwen38", "kimi")
+#: coli_cuda.dll (release.yml, the cuda-windows job): every engine of CUDA_ENGINES but
+#: deepseek_v4, whose DLLs are their own (inkling's bf16 matrices come through the DLL's
+#: ink_ops table), and the oldest card its DLL runs on: CUDA_ARCH=portable is SASS for sm_80
+#: and newer plus compute_120 PTX.
+WINDOWS_CUDA_ENGINES = ("glm", "glm53", "qwen36", "qwen38", "kimi", "deepseek_v41", "mimo", "inkling",
+                        "olmoe", "laya", "gliner_decide")
 WINDOWS_CUDA_FLOOR = 80
 RELEASE_CUDA_WIN32 = "windows-x86_64-cuda.zip"
 #: The engines the package got later, each with the last release whose package lacks it:
-#: v2.1.0's has no glm53.exe (#2541) and no qwen38.exe (#2846). With such a release the
+#: v2.1.0's has no glm53.exe (#2541), no qwen38.exe (#2846) and none of deepseek_v41.exe,
+#: mimo.exe, inkling.exe, olmoe.exe, laya.exe and gliner_decide.exe. With such a release the
 #: engine stays on Vulkan.
-WINDOWS_CUDA_LATER = {"glm53": "2.1.0", "qwen38": "2.1.0"}
+WINDOWS_CUDA_LATER = {"glm53": "2.1.0", "qwen38": "2.1.0", "deepseek_v41": "2.1.0", "mimo": "2.1.0",
+                      "inkling": "2.1.0", "olmoe": "2.1.0", "laya": "2.1.0", "gliner_decide": "2.1.0"}
 
 
 def prebuilt_vulkan(family, tc):
@@ -1522,9 +1536,10 @@ def server_status(cfg):
     return out
 
 
-def start_server(cfg, *, background=False, open_browser=True, out=print, wait=5.0):
+def start_server(cfg, *, background=False, open_browser=True, out=print, wait=5.0, ui=True):
     """Start what the configuration describes. Foreground returns the server's
-    exit code; background returns the status after `wait` seconds."""
+    exit code; background returns the status after `wait` seconds. ui=False: the
+    API alone (`coli web --no-ui`), for the desktop app, which shows its own UI."""
     status = server_status(cfg)
     if status["state"] in ("ready", "loading"):
         out(f"  colibri is already running ({status['state']}) on port {cfg['port']}")
@@ -1549,11 +1564,13 @@ def start_server(cfg, *, background=False, open_browser=True, out=print, wait=5.
     cmd = [sys.executable, launcher] + args
     if not open_browser and "--no-browser" not in cmd:
         cmd.append("--no-browser")
+    if not ui and "--no-ui" not in cmd:
+        cmd.append("--no-ui")
     env = dict(cfg.get("env") or {})
     env.update(os.environ)          # what the user sets explicitly wins
     env["PYTHONUNBUFFERED"] = "1"
     if not background:
-        print_urls(cfg, out)
+        print_urls(cfg, out, ui)
         out("  stop: press Ctrl+C here (or close this window)\n")
         sys.stdout.flush()      # ours before the server's, when the output is a file
         process = subprocess.Popen(cmd, env=env)
@@ -1596,7 +1613,7 @@ def start_server(cfg, *, background=False, open_browser=True, out=print, wait=5.
     out(f"  started in the background (pid {process.pid}); "
         + ("ready. " if status["state"] == "ready" else "the model is loading (`coli status` "
            "says when it is ready). ") + f"Log: {log}")
-    print_urls(cfg, out)
+    print_urls(cfg, out, ui)
     return status
 
 
@@ -1636,12 +1653,13 @@ def _replace_arg(args, flag, value):
     return args
 
 
-def print_urls(cfg, out=print):
+def print_urls(cfg, out=print, ui=True):
     # from the host and port, not the saved "urls": a setup from before the chat UI
     # saved the API's port as the browser's address (a setup with no port keeps its own)
     port = cfg.get("port")
     link = urls(cfg.get("host", DEFAULT_HOST), port) if port else cfg["urls"]
-    out(f"  Browser:             {link['browser']}")
+    if ui:
+        out(f"  Browser:             {link['browser']}")
     out(f"  OpenAI base URL:     {link['openai_base_url']}")
     out(f"  Anthropic base URL:  {link['anthropic_base_url']}")
 
@@ -1777,15 +1795,22 @@ def choose_model(ui, rows, wanted=None, show_all=False):
         raise SetupError("no model in the catalog fits this machine:\n" +
                          "\n".join(f"    {r['entry'].name}: {r['reason']}" for r in rows))
     ui.say("Models that fit this machine")
-    ui.say(f"  ({setup_catalog.FITS_EXPLAINED})")
+    measured = any(r.get("est") for r in fitting)
+    if measured:
+        ui.say("  (the speed is an estimate of decode here: the bytes a token reads over the "
+               "bandwidth that serves them, as measured on this machine)")
+    else:
+        ui.say(f"  ({setup_catalog.FITS_EXPLAINED})")
     for number, row in enumerate(fitting, 1):
-        entry = row["entry"]
+        entry, est = row["entry"], row.get("est")
         runs = "runs from RAM" if entry.size_class == "small" else "streams from the SSD"
+        if est:
+            runs = f"~{est['tok_s']:g} tok/s, {BACKEND_NAME[est['backend']]}"
         if entry.modality == "image":
             runs = "makes images"
         tag = "  [recommended]" if row["recommended"] else ""
-        ui.say(f"  {number:>2}) {entry.name:<28} {entry.disk_gb:>7.0f} GB   {runs:<20}{tag}".rstrip())
-        ui.say(f"      {entry.summary}; {row['reason']}"
+        ui.say(f"  {number:>2}) {entry.name:<32} {entry.disk_gb:>7.0f} GB   {runs:<22}{tag}".rstrip())
+        ui.say(f"      {entry.summary}; {est['where'] if est else row['reason']}"
                + (f"; {entry.license_note}" if entry.license_note else ""))
     hidden = [r for r in rows if not r["fits"]]
     if more:
@@ -2131,15 +2156,18 @@ def cmd_setup(a, ui=None):
     requested_ctx = getattr(a, "ctx", None)
 
     if a.list:
-        hw = setup_hw.detect(models_root_for(None, a.dir), probe_gpu=False)
-        rows = _recommend_for(hw, a.dir)
+        hw = setup_hw.detect(models_root_for(None, a.dir))
+        rows = _recommend_for(hw, a.dir, "cpu" if a.no_gpu else (a.backend or "auto"))
         if a.json:
             print(json.dumps([setup_catalog.as_dict(r) for r in rows], indent=2))
         else:
             for row in rows:
                 entry = row["entry"]
                 mark = "*" if row["recommended"] else " "
-                ui.say(f" {mark} {entry.id:<24} {entry.disk_gb:>7.0f} GB  {row['status']:<10} {row['reason']}")
+                est = row.get("est")
+                speed = f"~{est['tok_s']:g} tok/s {BACKEND_NAME[est['backend']]}" if est else row["status"]
+                ui.say(f" {mark} {entry.id:<26} {entry.disk_gb:>7.0f} GB  {speed:<20} "
+                       f"{est['where'] if est else row['reason']}")
         return 0
 
     write_state("starting")
@@ -2211,7 +2239,10 @@ def cmd_setup(a, ui=None):
                                  "the catalog any more: run `coli setup --reconfigure`")
             ui.say(f"Resuming the setup of {entry.name}.")
         else:
-            rows = _recommend_for(hw, a.dir)
+            import model_fit
+            fit = machine_fit(hw, models_root_for(None, a.dir))
+            ui.say(f"Measured: {model_fit.describe(fit)}\n")
+            rows = _recommend_for(hw, a.dir, "cpu" if a.no_gpu else (a.backend or "auto"), fit=fit)
             entry = choose_model(ui, rows, wanted=a.pick, show_all=a.all)
         family = family_by_id(entry.family)
         root = models_root_for(entry, a.dir) if not resume else os.path.dirname(resume["model_dir"])
@@ -2310,7 +2341,19 @@ def cmd_setup(a, ui=None):
     return _finish(ui, cfg, a)
 
 
-def _recommend_for(hw, explicit_dir):
+def machine_fit(hw, root):
+    """The machine as model_fit's estimates read it: setup_hw's report, the RAM's bandwidth
+    measured now (about two seconds), the cards' from the CUDA driver, the disk under `root`."""
+    import model_fit
+    probe = setup_hw._probe_cuda_child() if (hw.get("gpu") or {}).get("nvidia") else None
+    return model_fit.machine_from_hw(
+        hw, model_fit.measure_ram_bandwidth(avail_bytes=(hw.get("memory") or {}).get("available")),
+        model_fit.disk_kind(root), (probe or {}).get("devices"))
+
+
+def _recommend_for(hw, explicit_dir, requested="auto", tc=None, fit=None):
+    """The catalog for this machine: each model with its estimated speed on the backend the
+    setup would give its engine here (choose_backend), the best one marked."""
     root = models_root_for(None, explicit_dir)
     free = setup_hw.disk_free(root)
     downloaded = {}
@@ -2320,8 +2363,18 @@ def _recommend_for(hw, explicit_dir):
             downloaded[entry.id] = setup_download.bytes_present(os.path.join(root, entry.id),
                                                                 manifest.get("files", []),
                                                                 extra_shard_dirs(entry.family))
+    if fit is None:
+        fit = machine_fit(hw, root)
+    tc = tc if tc is not None else toolchain()
+    backends = {}
+    for family_id in {e.family for e in setup_catalog.catalog()}:
+        try:
+            backends[family_id] = choose_backend(hw, family_by_id(family_id), tc, requested)["backend"]
+        except Exception:   # a family the registry does not know: the CPU's estimate
+            backends[family_id] = "cpu"
     return setup_catalog.recommend(hw["memory"].get("total"), free, os_name=host_os(),
-                                   machine=hw["os"].get("machine"), downloaded=downloaded)
+                                   machine=hw["os"].get("machine"), downloaded=downloaded,
+                                   fit=fit, backends=backends)
 
 
 def _finish(ui, cfg, a):
@@ -2356,15 +2409,16 @@ def cmd_start(a):
     if reason:
         cfg = use_cuda(cfg, reason, out=say)
     refresh_configured(cfg, out=say)
+    ui = not getattr(a, "no_ui", False)
     if getattr(a, "json", False):
         print(json.dumps(start_server(cfg, background=True, open_browser=not a.no_browser,
-                                      out=lambda *_: None), indent=2))
+                                      out=lambda *_: None, ui=ui), indent=2))
         return 0
     if a.background:
-        start_server(cfg, background=True, open_browser=not a.no_browser)
+        start_server(cfg, background=True, open_browser=not a.no_browser, ui=ui)
         print("  stop: coli stop")
         return 0
-    return start_server(cfg, background=False, open_browser=not a.no_browser)
+    return start_server(cfg, background=False, open_browser=not a.no_browser, ui=ui)
 
 
 def status_report():

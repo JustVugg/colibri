@@ -26,7 +26,8 @@ import qwen36_mtp_ref as reference
 import spec_drafts_harness as spec
 import qwen38_mtp_harness as wire
 
-ENV = {"COLI_VULKAN": "0", "COLI_CUDA": "0", "COLI_LOOKUP": "0", "Q36_MTP": "0",
+ENV = {"SEED": os.environ.get("SEED", "1"),   # both arms sample the same draws (#2949)
+       "COLI_VULKAN": "0", "COLI_CUDA": "0", "COLI_LOOKUP": "0", "Q36_MTP": "0",
        "OMP_NUM_THREADS": "2", "COLI_NO_OMP_TUNE": "1", "USAGE_SAVE": "0", "NOSTREAM": "1",
        "COLI_DENSE_I8": "0", "COLI_DENSE_IDOT": "0", "QWEN_EXPERT_ACT": "f32", "Q36_MAXT": "256"}
 KEYS = tuple(k for k in os.environ if k.startswith(("Q36_MTP", "COLI_", "QWEN_"))) + (

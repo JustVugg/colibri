@@ -6,8 +6,9 @@ dense weights resident (RAM or VRAM), routed experts streamed from disk with an
 LRU + pinned cache. Audio input is supported when the audio tensors are present
 (see [Audio input](#audio-input-dmel) below); the vision encoder and the MTP
 head are not loaded. The same engine runs
-[Inkling-2-Small](#inkling-2-small) (594B total / 17B active), from its GGUFs or
-from the official checkpoint converted to int4 g64.
+[Inkling-2-Small](#inkling-2-small) (594B total / 17B active) and
+[Inkling-2-Mini](#inkling-2-mini) (26.4B total / 3.4B active, its middle layers run three
+times), from their GGUFs or from the official checkpoints converted to int4 g64.
 
 ## Quickstart
 
@@ -166,8 +167,9 @@ On a GPU, the CUDA build (`CUDA=1`) or the Vulkan one (`VK=1`, `COLI_VULKAN=1`):
   a discrete GPU, [vulkan.md](vulkan.md#inkling-2-on-the-chain)): the attention, the residual
   mixes and the convolutions on the device, one frame a layer, the routed experts on the host;
   with CUDA, or `COLI_VK_CHAIN=0`, the matrices go a call at a time and the rest runs on the CPU
-  (a CUDA build has the same chain with `COLI_CUDA_CHAIN=1`, off by default: it measured no
-  faster there, [cuda.md](cuda.md#inkling-2-on-cuda-inkling2_cuchainh)).
+  (a CUDA build has the same chain, on by default for Inkling-2-Mini with its experts in the
+  frame, and with `COLI_CUDA_CHAIN=1` for the Small, where it measured no faster:
+  [cuda.md](cuda.md#inkling-2-on-cuda-inkling2_cuchainh)).
 - the RAM cache's pinned experts that the tier holds go back to its LRU after the warm start,
   so that RAM and VRAM hold different experts. The tier's host pool is off for Inkling-2
   (`COLI_VK_TIER_HOST=1` turns it on): the RAM it takes from the expert cache cost more than
@@ -300,6 +302,99 @@ kernels to their references. The gateway's renderer matches the official chat te
 picture among the prompt's tokens; the engine's generation matches transformers' token for token
 (CI runs it), and the last prompt position's logits agree to 3e-6. `tests/test_inkling2_chat.py`
 holds the picture preparation to the processor's rules.
+
+## Inkling-2-Mini
+
+[thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)
+(26.4B total / 3.4B active, Apache 2.0) is Inkling-2 at a smaller width (2304, 24 layers of 128
+routed experts, top 8, four global layers) with a loop: layers 6-17 run three passes with their
+weights shared, so a token goes through 48 layers (5.4B effective active parameters a token, the
+model card says). In the engine (`c/inkling2.h`, `ink2_layers_forward`):
+
+- every pass starts from the stream that entered the loop and keeps K/V rows and convolution
+  states of its own: the engine counts 48 *state layers*, the checkpoint's 24 and the loop's
+  layers twice more (`n_state`, `ink_sl`), and every cache, ring, prefix-store part and
+  snapshot runs over them;
+- from the second pass each loop layer takes four messages, the mixes (with its four queries,
+  `middle_cycle_cross_pass_queries` and `_kv_queries`) of the previous pass's block states, its
+  first one left out, and of its output;
+- a low-rank gate (`controllers.{attn,k,v,mlp}`, rank 64) mixes each message into an input:
+  `z = W [unorm(h); unorm(m)]`, `(1 - tanh(F z)) h + tanh(G z) m`. A sliding layer gates its one
+  attention-residual mix three ways (q, k and v, then each normed on its own), a global layer
+  its three mixes, and the MLP's input mix before its norm.
+
+Two ways to run it, as for the Small:
+
+- **A GGUF.** unsloth's files ([unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF),
+  UD-IQ2_XXS 8.5 GB to UD-Q4_K_XL 17.6 GB) use llama.cpp's later `inkling2` names: the short
+  convolutions as the checkpoint has them (a global layer's static taps in convolution order),
+  the relative bias transposed, an expert's gate and up rows in one tensor, the loop's gates under
+  `blk.N.loop_*`, and a `block_count` of 48 that counts the passes. `coli import` writes the 24
+  layers and the loop; UD-Q4_K_XL keeps the release's NVFP4 experts byte for byte (layers 0-19)
+  and holds 20-23 as Q8_0. `mmproj-F16.gguf` next to it (projector `inkling2v`) brings the
+  pictures:
+
+  ```sh
+  ./coli import ~/models/Inkling-2-Mini-UD-Q4_K_XL.gguf      # mmproj-F16.gguf next to it
+  ```
+
+  The repo's `Mainline_Support/*.gguf_file` hold the same tensors byte for byte in mainline
+  llama.cpp's `inkling2_loop` layout, and import the same way (renamed to `.gguf`, or as they
+  are): the metadata under `inkling2_loop.*` with a `block_count` of 24 and the loop as
+  `loop.count/start/end`, the gates as `blk.N.loop_{q,k,v,ffn}_ctrl_*` (the checkpoint's attn, k,
+  v and mlp) and a loop layer's four message queries in `blk.N.loop_msg_query`. Either file of a
+  quant gives the same `config.json` and the same answers: UD-IQ3_XXS decoded 100 tokens at
+  43.9-44.0 tok/s on CUDA from both (machine D, below), 42.3 on Vulkan.
+
+- **The official checkpoint as int4 g64**: `c/tools/convert_inkling2_int4.py` as for the Small
+  (19 GB of NVFP4 and MXFP8 experts in, 18 GB out, 9.6-10.0% relative error on every layer; the
+  loop's tensors and the drafter pass as they are).
+
+Measured on machine D (an i5-13500 with 62 GB and an RTX PRO 4000 Blackwell, 24 GB) through
+`coli serve`, prompt in tok/s at about 570 tokens, then 100 tokens of decode, two runs each; every
+expert of the model fits on the card:
+
+| Model | CUDA | Vulkan | CPU (6 threads) |
+|---|---|---|---|
+| UD-IQ2_XXS (8.5 GB) | 310.6-316.9, 46.3-46.5 | 275.3-284.0, 46.0-46.2 | 16.3-16.4, 8.4 |
+| UD-Q4_K_XL (17.6 GB) | 285.4-289.3, 40.9-41.1 | 270.1-276.5, 39.2-39.4 | 18.2-18.8, 8.0-8.1 |
+| int4 g64 (18 GB) | 130.9-132.1, 36.0-36.1 | 314.6-327.6, 36.3-36.4 | 14.6-14.7, 6.1-6.2 |
+
+Vulkan runs the dense chain with the loop (`c/inkling2_chain.h`: the passes' own K/V mirrors and
+convolution states on the device, the messages through `chain_ink2`'s mix and the gates through
+`chain_ew`'s `LOOPGATE`), and a decode step is one frame: every layer routes and runs its experts
+on the device (`vk_dmoe.h`; a GGUF's NVFP4 experts with their global scales in the table's entries
+and through the block step decoder), and the attention splits its positions over workgroups. Before
+those three the same decode was 19.7-20.3, 14.8-15.2 and 18.1-18.5 tok/s. A prompt's experts are
+the tier's, through its grouped GEMMs (SiTU-GLU on the block formats' too, NVFP4 among their
+types): the GGUFs' prompts read at 51.5-54.2 and 32.2-32.9 tok/s before. On the CPU a GGUF's NVFP4
+experts are held in the 16-row interleaved form (`GQ_NVFP4_R16`): UD-Q4_K_XL went from 10.9 and 6.4
+to the line above. CUDA runs the same chain (`c/inkling2_cuchain.h`, on by default for the Mini):
+the loop, the experts in the frame from the CUDA tier's table (SiTU-GLU, NVFP4 through an integer
+step of its own) and the split attention; the per-matrix path it replaced measured 109.5-114.0 and
+20.2-20.5, 107.7-108.2 and 18.3-18.6, 64.4-65.4 and 16.0-16.3 ([cuda.md](cuda.md#inkling-2-on-cuda-inkling2_cuchainh)). Every answer above was the same: "The train arrives at 17:25.", then a palindrome
+check in Python. A picture (64 x 48, red on the left, blue on the right) with each of the three:
+"The picture has red and blue. Red is on the left." (UD-Q4_K_XL), "The picture has two colors:
+red and blue. The red color is on the left." (UD-IQ2_XXS and int4 g64).
+
+The drafter (`INK2_MTP=1`, the container's `mtp/`) counts its target layers over the passes
+(5, 23, 41 and 48 of 48). Its drafts are good: on a code prompt it kept 60 of 68 with one draft
+a step and 86 of 126 with three (3.05 tokens a verify), with the same text as without it. But a
+verify of n rows costs nearly n decode steps here too, so the CLI (CUDA, 128 tokens) decoded the
+code at 20.95 tok/s without it, 20.36 with one draft and 18.24 with three, and a paragraph of
+prose at 19.49, 14.93 and 10.73; there the text took another word at a near tie after 686
+characters ("the human eye is less sensitive" for "our eyes are less sensitive"), as the
+Small's verify can on a GPU. It stays off.
+
+Validation: `c/tools/make_tiny_inkling2_loop.py` builds a random Inkling2LoopForCausalLM
+(transformers' pull request 51050: twelve layers in blocks of three, the loop over layers 3-8
+for three passes with a global layer inside it, every gate and query drawn at random) and its
+oracle; the engine reproduces it token for token on the CPU, on CUDA and on Vulkan's tier and
+chain, plain and through the converter (`inkling2-loop-oracle` in CI,
+`tests/vulkan_engines.sh inkling2`). `tests/test_gguf_import.py` writes a tiny Mini as unsloth's
+files lay it out and reads it back as the checkpoint it came from, tokens and logits, and checks
+that one pass instead of three answers otherwise; the same model in the `inkling2_loop` layout
+gives the same config and, bit for bit, the same logits.
 
 ## Modes
 

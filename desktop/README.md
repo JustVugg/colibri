@@ -21,8 +21,9 @@ put it: the window starts and stops colibri's server, it does not carry one.
 3. It finds the colibri server:
    - one that runs already, the one `coli setup` configured or one on
      `127.0.0.1:8000`, is used as it is;
-   - otherwise it runs `coli start`, waits for the model to load and shows how
-     long it has been loading;
+   - otherwise it runs `coli start --no-ui` (the API alone: this window shows
+     the chat, so the server starts no chat UI of its own on port + 790), waits
+     for the model to load and shows how long it has been loading;
    - with nothing set up it says so, with the command that sets a model up
      (`coli setup`), and a Retry button.
 4. It serves the chat page with `ui/server.py` on `127.0.0.1:18790` (the next

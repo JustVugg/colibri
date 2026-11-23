@@ -3502,6 +3502,25 @@ static void moe_gate(Model *m, Layer *l, int E, int topk, float *scores,
  * stay a plausible working set for the cache. */
 #define MOE_ROW_CHUNK 32
 
+/* Positions of a prompt routed together on the CPU path (V41_MOE_BLOCK). The experts a block
+ * asks for are read once for all of its rows, so a bigger block re-reads fewer experts across a
+ * prompt: on unsloth's V4.1-Flash UD-Q2_K_XL, in a build without a GPU backend, a 650-token
+ * prompt read 885 GB from the NVMe in blocks of 32 and 164 GB in one block, and prefilled in
+ * 82 s instead of 250 s. The CUDA and Vulkan tiers take a streamed prompt's whole step at once
+ * already (XT(step_rows) below). The scratch is (n_activated + 2) x dim floats a row: about
+ * 170 MB at 1024 rows on V4.1. */
+#define MOE_BLOCK_DEFAULT 1024
+#define MOE_BLOCK_MAX 16384
+static int moe_block_rows(void) {
+    static int rows = 0;
+    if (!rows) {
+        const char *e = getenv("V41_MOE_BLOCK");
+        long v = e && *e ? strtol(e, NULL, 10) : MOE_BLOCK_DEFAULT;
+        rows = v < 1 ? 1 : v > MOE_BLOCK_MAX ? MOE_BLOCK_MAX : (int)v;
+    }
+    return rows;
+}
+
 #if defined(COLI_VULKAN) || defined(COLI_CUDA)
 /* ---- the Vulkan routed-expert tier (vk_tier.c) ---------------------------------
  * One block of positions of a backbone layer with the tier on. The block's resident
@@ -3947,12 +3966,14 @@ static void moe_run_at(Model *m, Layer *l, LCache *cache, const char *kind, int 
     }
 #endif
 
-    for (int r0 = 0; r0 < n; r0 += MOE_ROW_CHUNK) {
-        int rows = n - r0 < MOE_ROW_CHUNK ? n - r0 : MOE_ROW_CHUNK;
+    const int block = moe_block_rows();
+    const int most = n < block ? n : block;
+    int *chosen = xmalloc((size_t)most * topk * sizeof(int), "routing");
+    float *weights = xmalloc((size_t)most * topk * sizeof(float), "routing weights");
+    for (int r0 = 0; r0 < n; r0 += block) {
+        int rows = n - r0 < block ? n - r0 : block;
         const float *xc = x + (size_t)r0 * dim;
         float *outc = out + (size_t)r0 * dim;
-        int chosen[MOE_ROW_CHUNK * MOE_TOPK_MAX];
-        float weights[MOE_ROW_CHUNK * MOE_TOPK_MAX];
         float *scores = xmalloc((size_t)rows * E * sizeof(float), "gate scores");
         mvb_rows(scores, E, &l->gate_w, xc, dim, rows);   /* the chunk's gate logits at once */
         for (int r = 0; r < rows; r++)
@@ -3961,7 +3982,12 @@ static void moe_run_at(Model *m, Layer *l, LCache *cache, const char *kind, int 
         free(scores);
 #if defined(COLI_VULKAN) || defined(COLI_CUDA)
         if (XT(ready)() && v41_tier_layer(m, kind, layer) < XT(layers)()) {   /* the backbone, a stage the tier took */
-            moe_vk_block(m, l, cache, kind, layer, topk, xc, rows, outc, chosen, weights, with_shared);
+            /* in MOE_ROW_CHUNK pieces, as before: the tier's buffers are sized for that many */
+            for (int s0 = 0; s0 < rows; s0 += MOE_ROW_CHUNK) {
+                int sr = rows - s0 < MOE_ROW_CHUNK ? rows - s0 : MOE_ROW_CHUNK;
+                moe_vk_block(m, l, cache, kind, layer, topk, xc + (size_t)s0 * dim, sr,
+                             outc + (size_t)s0 * dim, chosen + s0 * topk, weights + s0 * topk, with_shared);
+            }
             continue;
         }
 #endif
@@ -4070,6 +4096,7 @@ static void moe_run_at(Model *m, Layer *l, LCache *cache, const char *kind, int 
         free(down); free(gathered); free(contrib);
         free(next); free(count); free(tail); free(head); free(uniq);
     }
+    free(chosen); free(weights);
 }
 
 /* The rows a block of positions will look up asked of the OS before engram_row reads them

@@ -22,7 +22,7 @@ class WebUrlTest(unittest.TestCase):
         cls.coli = importlib.util.module_from_spec(spec)
         loader.exec_module(cls.coli)
 
-    def _run(self, host, port=8123, ui_port=None, free=True, server="/x/ui/server.py"):
+    def _run(self, host, port=8123, ui_port=None, free=True, server="/x/ui/server.py", no_ui=False):
         coli = self.coli
         polled, opened, started = [], [], []
 
@@ -44,7 +44,8 @@ class WebUrlTest(unittest.TestCase):
             def terminate(self):
                 self.terminated = True
 
-        args = types.SimpleNamespace(model="/m", host=host, port=port, ui_port=ui_port, no_browser=False)
+        args = types.SimpleNamespace(model="/m", host=host, port=port, ui_port=ui_port, no_browser=False, no_ui=no_ui)
+        self.args = args
         with mock.patch.object(coli, "need_model"), \
                 mock.patch.object(coli, "cmd_serve") as serve, \
                 mock.patch.object(coli, "ui_server", return_value=server), \
@@ -85,6 +86,18 @@ class WebUrlTest(unittest.TestCase):
     def test_no_ui_in_the_tree_serves_the_api_alone(self):
         polled, opened, started = self._run("127.0.0.1", server=None)
         self.assertEqual((polled, opened, started), ([], [], []))
+        self.assertIsNone(self.args.chat_port)
+
+    def test_no_ui_serves_the_api_alone(self):
+        # the desktop app (`coli start --no-ui`): its window shows the chat, no second UI on port + 790
+        polled, opened, started = self._run("127.0.0.1", no_ui=True)
+        self.assertEqual((polled, opened, started), ([], [], []))
+        self.assertIsNone(self.args.chat_port)
+
+    def test_the_gateway_learns_the_chat_port(self):
+        # its own address (the dashboard's, before the chat) sends a browser to the chat
+        self._run("127.0.0.1", port=8000)
+        self.assertEqual(self.args.chat_port, 8790)
 
 
 if __name__ == "__main__":

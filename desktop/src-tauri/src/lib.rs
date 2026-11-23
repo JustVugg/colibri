@@ -342,8 +342,14 @@ fn backend(state: &State, py: &Path, coli: &Path) -> Result<(String, bool), Fail
     );
     // recorded before the start: a window closed meanwhile still stops it
     state.lock().unwrap().started = port_of(&base);
-    let (ok, text) = coli_run(state, py, coli, &["start", "--json", "--no-browser"])
-        .ok_or(("start_failed", String::new()))?;
+    // the API alone: this window shows its own UI. A coli from before --no-ui refuses the
+    // flag (argparse: "unrecognized arguments: --no-ui"), and starts as it did then, its own
+    // chat UI beside this one; any other failure is the start's own.
+    let mut run = coli_run(state, py, coli, &["start", "--json", "--no-browser", "--no-ui"]);
+    if matches!(&run, Some((false, out)) if out.contains("unrecognized arguments") && out.contains("--no-ui")) {
+        run = coli_run(state, py, coli, &["start", "--json", "--no-browser"]);
+    }
+    let (ok, text) = run.ok_or(("start_failed", String::new()))?;
     match json_in(&text).as_ref().and_then(base_of) {
         Some(base) if ok => {
             // `coli start` moves to the next port when another program holds this one
@@ -554,8 +560,13 @@ fn retry(app: AppHandle, state: tauri::State<'_, State>) {
     thread::spawn(move || start(app, state));
 }
 
-/// A link that leaves colibri opens in the system's browser, not in this window.
+/// A link that leaves colibri opens in the system's browser, not in this window: http and https
+/// only. The system's opener runs what it is given (a file: link to a program starts it, other
+/// schemes start their own handlers), and a link in an answer is the model's to write.
 fn open_outside(url: &Url) {
+    if !matches!(url.scheme(), "http" | "https") {
+        return;
+    }
     let u = url.as_str();
     let _ = if cfg!(windows) {
         hidden(Command::new("rundll32").args(["url.dll,FileProtocolHandler", u])).spawn()

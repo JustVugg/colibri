@@ -1013,6 +1013,26 @@ class Qwen36GraphTest(GraphRuns):
         gap = relative_gap(flayers, layers)
         self.assertLess(gap, 1e-4, f"fast serve turn and a fresh one: layers differ by {gap:.3g}")
 
+    def test_a_control_at_the_prompts_end_keeps_the_copy(self):
+        """A STOP or CANCEL that arrives while the graph reads a prompt is taken once the prompt is
+        read. That forward wrote the copy of the state where the turn opens, so the conversation
+        sent again starts from it, with the layers and text of an engine that reads it all."""
+        self.graph()
+        prompt = PROMPT + "Fox<|im_end|>\n" + chat(("user", "And the dog?"))
+        fresh = Serve(self, EXACT)
+        flayers, ftext = fresh.ask("f", prompt, 3)
+        fresh.close()
+        late = {"COLI_PROMPT_BREAK_AFTER": "1000"}   # only the check after the forward reads stdin
+        for control, frame in (("CANCEL", "ERROR a CANCELLED"), ("STOP", "DONE a ")):
+            with self.subTest(control=control):
+                session = Serve(self, EXACT, late)
+                ended = session.ask_ended("a", prompt, 3, control)
+                layers, text = session.ask("b", prompt, 3)
+                log = session.close()
+                self.assertTrue(ended.startswith(frame), ended)
+                self.assertIn("from the previous turn", log)
+                self.assertEqual(layers, flayers)
+                self.assertEqual(text, ftext)
     def assert_drafts(self, run, right, wrong):
         r, v = drafts(run)
         self.assertGreaterEqual(r, right, run["stderr"][-3000:])
@@ -1407,6 +1427,17 @@ class Qwen36GgufGraphTest(GraphRuns):
         self.assertEqual(layers, flayers)
         self.assertEqual(text, ftext)
 
+    def test_a_control_at_the_prompts_end_unlocks_the_dense_matrices(self):
+        """A prompt ended by a CANCEL taken once it is read has no decode step: the dense matrices
+        locked for it go back at the request's end, as for a turn of one token."""
+        self.graph()
+        session = Serve(self, EXACT, G_SMALL_CACHE, {"COLI_PROMPT_BREAK_AFTER": "1000"})
+        ended = session.ask_ended("a", PROMPT, 3, "CANCEL")
+        log = session.close()
+        self.assertEqual(ended, "ERROR a CANCELLED")
+        m = G_COUNTS.search(log)   # prompts locked, unlocked after a step, at a request's end, still locked
+        self.assertTrue(m, log[-3000:])
+        self.assertEqual(tuple(int(x) for x in m.groups()), (1, 0, 1, 0), log[-3000:])
     def test_forced_drafts(self):
         """A verify on a GGUF. Nothing drafts there (no MTP head), so in ref.json mode the reference's own tokens are
         forced as drafts (COLI_LOOKUP_FORCE=mixed: every other verify with a wrong one): the layers, logits and
@@ -1564,6 +1595,25 @@ class Serve:
             elif parts and parts[0] == b"DONE":
                 break
         return floats_of(self.dump), text
+
+    def ask_ended(self, rid, prompt, max_tokens, control):
+        """SUBMIT with its STOP or CANCEL in the same write; the frame that ended the request."""
+        body = prompt.encode()
+        self.p.stdin.write(f"SUBMIT {rid} 0 {len(body)} {max_tokens} 0 1\n".encode() + body + b"\n"
+                           + f"{control} {rid}\n".encode())
+        self.p.stdin.flush()
+        while True:
+            line = self.p.stdout.readline()
+            if not line:
+                raise AssertionError("the serve engine ended: " + self.log()[-3000:])
+            parts = line.split()
+            if parts and parts[0] == b"DATA":
+                self.p.stdout.read(int(parts[2]))
+                self.p.stdout.readline()
+            elif parts and parts[0] == b"EMAP" and len(parts) == 4:
+                self.emap = parts[3]
+            elif parts and parts[0] in (b"ERROR", b"DONE"):
+                return line.decode(errors="replace").strip()
 
     def close(self):
         self.p.stdin.close()

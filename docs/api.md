@@ -782,7 +782,10 @@ it, then opens your browser on the chat when the engine is ready:
 
 `coli web` is `coli serve` plus the chat UI (`ui/server.py`, Python's standard
 library, no build step) on the API's port + 790 (`--ui-port` picks another); the
-UI stops with it. `coli serve` serves the API alone, and `coli ui` starts the
+UI stops with it. The API's own address (`http://HOST:8000/`, where the dashboard
+was before the chat) sends a browser on to the chat at the same host;
+`coli web --no-ui` serves the API alone, as the desktop app runs it.
+`coli serve` serves the API alone too, and `coli ui` starts the
 chat next to a `coli serve` that already runs, on this machine or another
 (`--backend http://HOST:PORT`). On a headless host use `coli serve` or
 `coli web --no-browser` and point a browser at it from another machine.

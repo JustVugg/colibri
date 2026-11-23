@@ -194,5 +194,79 @@ class TuiScreenTest(unittest.TestCase):
             httpd.server_close()
 
 
+    def test_dropped_files_go_with_the_message(self):
+        # a terminal drops files as their paths, pasted: a text file read directly, a Word file through
+        # the chat page's reader (COLI_DOCS), a picture as an image_url; one more path typed by hand
+        import base64
+        import sys
+        import zipfile
+        FakeServer.seen = []
+        with tempfile.TemporaryDirectory() as d:
+            note = os.path.join(d, "note.txt")
+            with open(note, "w") as f:
+                f.write("hello from the file")
+            pic = os.path.join(d, "my pic.png")
+            png = b"\x89PNG\r\n\x1a\n" + bytes(range(64))
+            with open(pic, "wb") as f:
+                f.write(png)
+            word = os.path.join(d, "report.docx")
+            with zipfile.ZipFile(word, "w") as z:
+                z.writestr("word/document.xml",
+                           '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+                           "<w:body><w:p><w:r><w:t>Words of the report</w:t></w:r></w:p></w:body></w:document>")
+            later = os.path.join(d, "later.md")
+            with open(later, "w") as f:
+                f.write("# typed later")
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), FakeServer)
+            url = "http://127.0.0.1:%d" % httpd.server_address[1]
+            docs = os.path.join(os.path.dirname(C_DIR), "ui", "docs.py")
+            s = Screen(self.exe, ["--server", url, "--lang", "en", "--no-sixel"],
+                       {"COLI_DOCS": docs, "COLI_PYTHON": sys.executable})
+            threading.Thread(target=httpd.serve_forever, daemon=True).start()
+            try:
+                self.assertTrue(s.wait_for("tiny-model"), s.out[-400:])
+                s.type("\x1b[200~%s '%s' %s\x1b[201~" % (note, pic, word.replace(" ", "\\ ")))
+                self.assertTrue(s.wait_for("Attached: note.txt"), s.out[-600:])
+                s.type("what are these? " + later)
+                s.type("\r")
+                self.assertTrue(s.wait_for("fake server"), s.out[-600:])
+                posts = [x for x in FakeServer.seen if x[0] == "POST"]
+                self.assertEqual(len(posts), 1)
+                content = json.loads(posts[0][3])["messages"][0]["content"]
+                self.assertEqual(content[0]["type"], "text")
+                text = content[0]["text"]
+                for part in ('Attached document "note.txt"', "hello from the file", 'Attached document "report.docx"',
+                             "Words of the report", 'Attached document "later.md"', "# typed later"):
+                    self.assertIn(part, text)
+                self.assertTrue(text.endswith("---\n\nwhat are these?"), text[-80:])
+                self.assertNotIn(d, text)                       # the paths left the message
+                self.assertEqual(len(content), 2)
+                self.assertEqual(content[1]["type"], "image_url")
+                head, data = content[1]["image_url"]["url"].split(",", 1)
+                self.assertEqual(head, "data:image/png;base64")
+                self.assertEqual(base64.b64decode(data), png)
+                s.type("\x11")
+                self.assertEqual(s.close(), 0)
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+
+    def test_a_drag_copies_the_text(self):
+        # the terminal's selection does not reach a program that reads the mouse: a drag selects here,
+        # the release copies (OSC 52 on a terminal without a desktop's clipboard tool)
+        import base64
+        s = Screen(self.exe, ["--demo", "--lang", "en", "--no-sixel"], {"DISPLAY": "", "WAYLAND_DISPLAY": ""})
+        self.assertTrue(s.wait_for("Ask anything"), s.out[-400:])
+        s.type("\x1b[<0;1;1M\x1b[<32;60;3M\x1b[<32;140;40M\x1b[<0;140;40m")
+        self.assertTrue(s.wait_for("characters copied"), s.out[-600:])
+        start = s.out.index(b"\x1b]52;c;") + 7
+        copied = base64.b64decode(s.out[start:s.out.index(b"\x07", start)]).decode()
+        self.assertIn("colibri", copied)
+        self.assertIn("Ask anything", copied)
+        self.assertFalse(any(line != line.rstrip() for line in copied.split("\n")))   # no trailing blanks
+        s.type("\x11")
+        self.assertEqual(s.close(), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

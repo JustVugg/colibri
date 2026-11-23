@@ -8,8 +8,11 @@ import os
 import re
 import zipfile
 import xml.etree.ElementTree as ET
+import xml.parsers.expat
 
 MAX_BYTES = 80 << 20
+PART_MAX = 64 << 20       # an Office part's text once unpacked, and all of a file's parts together
+ARCHIVE_MAX = 256 << 20
 SCAN_PAGES = 6
 SCAN_SIDE = 1280          # the longer side of a scanned page's picture, as the page shrinks a photo
 TEXT_MIN = 20             # a PDF page with fewer characters than this is read as a scan
@@ -65,9 +68,39 @@ def _local(tag):
     return tag.rsplit("}", 1)[-1]
 
 
+class _Parts:
+    """an Office file's zip, its parts read whole up to PART_MAX each and ARCHIVE_MAX in all: the
+    sizes the archive declares are what zipfile unpacks at most"""
+    def __init__(self, data):
+        self.z = zipfile.ZipFile(io.BytesIO(data))
+        self.left = ARCHIVE_MAX
+
+    def namelist(self):
+        return self.z.namelist()
+
+    def read(self, name):
+        info = self.z.getinfo(name)
+        if info.file_size > PART_MAX or info.file_size > self.left:
+            raise ValueError("documento troppo grande una volta decompresso (%s: %d MB)" % (name, info.file_size >> 20))
+        self.left -= info.file_size
+        return self.z.read(info)
+
+
+def _xml(data):
+    """an Office XML part as ElementTree's: a document type (which Office XML never has) is
+    refused first, so no entity of one is ever expanded"""
+    def refuse(*_):
+        raise ValueError("documento non valido (una DTD nel suo XML)")
+    check = xml.parsers.expat.ParserCreate()
+    check.StartDoctypeDeclHandler = refuse
+    check.EntityDeclHandler = refuse
+    check.Parse(data, True)
+    return ET.fromstring(data)
+
+
 def _xml_text(data, para_tags, text_tags, tab_tags=(), br_tags=(), cell_tags=(), row_tags=()):
     """the paragraphs of an Office XML part in document order, a table row on one line"""
-    root = ET.fromstring(data)
+    root = _xml(data)
     out = []
 
     def collect(node, sep):
@@ -100,14 +133,14 @@ def _xml_text(data, para_tags, text_tags, tab_tags=(), br_tags=(), cell_tags=(),
 
 
 def _docx(data):
-    z = zipfile.ZipFile(io.BytesIO(data))
+    z = _Parts(data)
     text = _xml_text(z.read("word/document.xml"), {"p"}, {"t"}, {"tab"}, {"br", "cr"}, {"tc"}, {"tr"})
     return {"kind": "docx", "pages": 0, "text": text, "images": [], "note": ""}
 
 
 def _odt(data):
-    z = zipfile.ZipFile(io.BytesIO(data))
-    root = ET.fromstring(z.read("content.xml"))
+    z = _Parts(data)
+    root = _xml(z.read("content.xml"))
     lines = []
     for node in root.iter():
         name = _local(node.tag)
@@ -117,7 +150,7 @@ def _odt(data):
 
 
 def _pptx(data):
-    z = zipfile.ZipFile(io.BytesIO(data))
+    z = _Parts(data)
     names = sorted((n for n in z.namelist() if re.fullmatch(r"ppt/slides/slide\d+\.xml", n)),
                    key=lambda n: int(re.search(r"(\d+)", n.rsplit("/", 1)[-1]).group(1)))
     parts = []
@@ -190,3 +223,18 @@ def extract(name, data):
     if not out["text"].strip() and not out["images"]:
         raise ValueError("nel file non c'e testo da leggere")
     return out
+
+
+if __name__ == "__main__":
+    # `python docs.py FILE`: the reader for colibri-tui (c/tui.c), one JSON object on stdout,
+    # ASCII only (a Windows console's code page cannot garble it): extract()'s, or {"error": ...}
+    import json
+    import sys
+    if len(sys.argv) != 2:
+        sys.exit("usage: docs.py FILE")
+    try:
+        with open(sys.argv[1], "rb") as f:
+            print(json.dumps(extract(os.path.basename(sys.argv[1]), f.read())))
+    except Exception as error:   # the reader's own refusals and an unreadable file alike
+        print(json.dumps({"error": str(error)}))
+        sys.exit(1)

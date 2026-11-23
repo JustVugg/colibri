@@ -51,6 +51,10 @@ def default_engine(family=None):
 END = b"\x01\x01END\x01\x01\n"
 READY = b"\x01\x01READY\x01\x01\n"
 MAX_BODY = 4 << 20
+#: The most pixels a request's picture may have (8192 x 8192): every image preprocessor decodes a
+#: picture whole before it scales it down, and a few MB of PNG can describe far more pixels than
+#: that, gigabytes once decoded. Read from the file's header, before anything decodes it.
+MAX_IMAGE_PIXELS = 8192 * 8192
 PROFILE_TURNS = 120           # rolling window of per-turn PROF snapshots kept for /profile
 DEFAULT_CORS_ORIGINS = (
     "http://127.0.0.1:8000",
@@ -632,6 +636,21 @@ def _tool_function(tool):
     """
     fn = tool.get("function", tool) if isinstance(tool, dict) else {}
     return fn if isinstance(fn, dict) else {}
+
+
+def _forced_tools(tools, tool_choice):
+    """(tools, name) for a dict `tool_choice` that forces one function: the tools narrowed to
+    that function, as GLM-5.2 and DeepSeek V4 render them; (tools, None) otherwise. A renderer
+    that also has prose around its tool block names the function with forced_tool_instruction."""
+    forced = _tool_choice_name(tool_choice) if isinstance(tool_choice, dict) else None
+    if forced:
+        tools = [t for t in (tools or []) if _tool_function(t).get("name") == forced]
+    return tools, forced
+
+
+def forced_tool_instruction(name):
+    """The line DeepSeek V4 puts after its tool block when `tool_choice` names a function."""
+    return f"\n\nYou must call the function `{name}`. Do not answer directly."
 
 
 def _tool_param_order(tools):
@@ -2220,6 +2239,7 @@ def render_chat_qwen(messages, enable_thinking=False, reasoning_effort=None, too
         tools = None
     if tools is not None and not isinstance(tools, list):
         raise APIError(400, "`tools` must be an array.", "tools")
+    tools, forced = _forced_tools(tools, tool_choice)
     # The template's last_query_index: the last user turn that is a real query and not a
     # tool result riding in as one. An assistant turn after it keeps its <think> block
     # with or without preserve_thinking. With no query at all the template raises; here
@@ -2247,7 +2267,9 @@ def render_chat_qwen(messages, enable_thinking=False, reasoning_effort=None, too
         start = 1
     if tools:
         block = _qwen_tool_block(tools)
-        if tool_choice == "required":
+        if forced:
+            block += forced_tool_instruction(forced)
+        elif tool_choice == "required":
             block += TOOL_CHOICE_REQUIRED_INSTRUCTION
         if system_text:
             block += "\n\n" + system_text
@@ -3454,13 +3476,16 @@ def render_chat_mimo(messages, enable_thinking=True, reasoning_effort=None, tool
         tools = None
     if tools is not None and not isinstance(tools, list):
         raise APIError(400, "`tools` must be an array.", "tools")
+    tools, forced = _forced_tools(tools, tool_choice)
     parts = []
     if tools:
         tools_text = _mimo_tools(tools)
         # In the tool turn, after </tools> and before its <|im_end|>: "the functions
         # above" has to be true, and MiMo's declaration block is a whole system turn
         # of its own, so there is nothing to put the line outside of but the frame.
-        if tool_choice == "required":
+        if forced:
+            tools_text += forced_tool_instruction(forced)
+        elif tool_choice == "required":
             tools_text += TOOL_CHOICE_REQUIRED_INSTRUCTION
         parts.append(f"<|im_start|>system\n{tools_text}<|im_end|>")
     last = len(messages) - 1
@@ -3596,6 +3621,7 @@ def render_chat_qwen38(messages, enable_thinking=True, reasoning_effort=None, to
         tools = None                              # the client forbade them: do not offer any
     if tools is not None and not isinstance(tools, list):
         raise APIError(400, "`tools` must be an array.", "tools")
+    tools, forced = _forced_tools(tools, tool_choice)
 
     instruction = ""
     if enable_thinking:
@@ -3634,7 +3660,9 @@ def render_chat_qwen38(messages, enable_thinking=True, reasoning_effort=None, to
         # text last -- not the other way round.
         head = (instruction + "\n\n") if instruction else ""
         block = head + _qwen_tool_block(tools)
-        if tool_choice == "required":
+        if forced:
+            block += forced_tool_instruction(forced)
+        elif tool_choice == "required":
             block += TOOL_CHOICE_REQUIRED_INSTRUCTION
         if system_text:
             block += "\n\n" + system_text
@@ -4101,6 +4129,24 @@ def _image_part_url(part, kind):
 
 
 def _image_bytes_from_url(url):
+    """_image_source_bytes's picture, refused past MAX_IMAGE_PIXELS (its header's size, read
+    by Pillow without decoding it). A file Pillow does not read passes: the preprocessor that
+    needs it says so."""
+    data = _image_source_bytes(url)
+    try:
+        import io
+        from PIL import Image
+        with Image.open(io.BytesIO(data)) as img:
+            width, height = img.size
+    except Exception:   # noqa: BLE001 - no Pillow, or not a picture it reads
+        return data
+    if width * height > MAX_IMAGE_PIXELS:
+        raise APIError(400, f"the image is {width}x{height} pixels; at most {MAX_IMAGE_PIXELS} "
+                            "pixels (8192 x 8192) are accepted.", "messages")
+    return data
+
+
+def _image_source_bytes(url):
     """data: URI, file:// o percorso sul disco -> i byte dell'immagine.
 
     A local path is read with the server process's own permissions, and an
@@ -4630,7 +4676,9 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
         # Fuori dal blocco, non dentro: il blocco e' confrontato byte a byte con
         # jinja2 (glm53_chat_template_harness.py) e l'istruzione non c'e' nel
         # template, quindi va dopo -- come fa render_chat per GLM-5.2.
-        if tool_choice == "required":
+        if forced:
+            prompt.append(forced_tool_instruction(forced))
+        elif tool_choice == "required":
             prompt.append(TOOL_CHOICE_REQUIRED_INSTRUCTION)
 
     for index, message in enumerate(messages):
@@ -4942,6 +4990,11 @@ def render_chat_mistral_large4(messages, enable_thinking=True, reasoning_effort=
         elif kind == "json_object":
             schema = {"anyOf": [{"type": "object"}, {"type": "array"}]}
     settings = ([f'"json_schema": {_ml4_json(schema)}'] if schema is not None else []) + [f'"reasoning_effort": "{effort}"']
+    # As every other renderer: "none" offers no tools (generation() does not parse calls then, so
+    # a declared tool would come back as raw [TOOL_CALLS] text), a forced function only itself.
+    if tool_choice == "none":
+        tools = None
+    tools, _ = _forced_tools(tools, tool_choice)
     preamble = (f"[AVAILABLE_TOOLS]{_ml4_json(tools)}[/AVAILABLE_TOOLS]" if tools else "") + \
         "[MODEL_SETTINGS]{" + ", ".join(settings) + "}[/MODEL_SETTINGS]"
     turns = _ml4_merge(messages)
@@ -7065,7 +7118,10 @@ def cap_for_arch(arch, cap, env=None, model=None):
         # argv cap turns both off (#2785).
         if planned >= 1 and arch != "olmoe":
             return planned
-    if arch in ("deepseek_v41", "mimo", "qwen36", "qwen38") and model is not None:
+    # Inkling the same: its eight legacy slots read nearly every routed expert of a step
+    # (Inkling-2 routes eight) from the page cache on a model the RAM holds whole (Inkling-2-Mini
+    # at 17.6 GB: 4.3 tok/s of decode on the CPU, 28% of the time in the copies)
+    if arch in ("deepseek_v41", "mimo", "qwen36", "qwen38", "inkling") and model is not None:
         # V4.1, MiMo, Qwen3.6 and Qwen3.8 only read their argv cap, not RAM_GB.
         # Without --auto-tier the legacy eight slots silently discarded both --ram
         # and RAM_GB (#1666), and Qwen3.8's implicit one slot, Qwen3.6's eight, left
@@ -7096,9 +7152,9 @@ def cap_for_arch(arch, cap, env=None, model=None):
         # from the disk at every step: Qwen3.8's implicit cap is 1 and its route
         # 10, and a Windows box whose free RAM made the plan come out empty
         # decoded at 0.03 tok/s while the engine measured room for 99 (#2031).
-        floor = max(limits.implicit_cap, _route_top_k(model)) if arch in ("qwen36", "qwen38") else 1
+        floor = max(limits.implicit_cap, _route_top_k(model)) if arch in ("qwen36", "qwen38", "inkling") else 1
         if slots < floor:
-            if arch in ("qwen36", "qwen38"):
+            if arch in ("qwen36", "qwen38", "inkling"):
                 print(f"[{arch}] RAM plan: {max(slots, 0)} expert cache slots/layer, below one "
                       f"token's route; starting at {floor} (--cap or --ram sets more)", file=sys.stderr)
                 return floor
@@ -9131,6 +9187,13 @@ class APIHandler(BaseHTTPRequestHandler):
                                request_id)
             elif path.startswith("/v1/models/") and unquote(path[11:]) == self.server.model_id:
                 self.send_json(200, self.server.model_entry(), request_id)
+            elif path in ("/", "/index.html") and getattr(self.server, "chat_port", None):
+                # the dashboard was here before the chat UI: a bookmark of it opens the chat
+                self.send_response(302)
+                self.send_header("Location", chat_location(self.headers.get("Host"), self.server.chat_port))
+                self.send_header("Content-Length", "0")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
             else:
                 raise APIError(404, "Not found.", None, "not_found")
         except APIError as error:
@@ -10662,7 +10725,7 @@ class APIHandler(BaseHTTPRequestHandler):
                                       default_effort if enable_thinking else None,
                                       tools, tool_choice,
                                       add_generation_prompt=add_generation_prompt,
-                                      preserve_thinking=not enable_thinking)
+                                      preserve_thinking=preserve_thinking_default(messages, enable_thinking))
         return translated, prompt, tools, enable_thinking, add_generation_prompt, image
 
     def anthropic_generation(self, body, prompt, request_id, tools, enable_thinking,
@@ -11032,9 +11095,22 @@ def keep_engine(server, start, stopping, watch=ENGINE_WATCH_S, delays=ENGINE_RES
               file=sys.stderr)
 
 
+def chat_location(host_header, port):
+    """The chat UI's address as the browser reached the API: the same host (a name, an
+    IPv4 address or a bracketed IPv6 one), the UI's port."""
+    host = (host_header or "").strip() or "127.0.0.1"
+    if host.startswith("["):
+        host = host[:host.find("]") + 1] if "]" in host else host
+    elif host.count(":") == 1:
+        host = host.split(":", 1)[0]
+    elif ":" in host:
+        host = f"[{host}]"   # a bare IPv6 address, as _check_host reads one
+    return f"http://{host}:{int(port)}/"
+
+
 def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
           cap=None, max_tokens=1024, engine=None, env=None, cors_origins=None,
-          max_queue=8, queue_timeout=300, kv_slots=1, allowed_hosts=(), family=None):
+          max_queue=8, queue_timeout=300, kv_slots=1, allowed_hosts=(), family=None, chat_port=None):
     if not 0 <= max_tokens:
         raise ValueError("max_tokens cannot be negative (0: the context the engine holds)")
     if not 1 <= port <= 65535:
@@ -11085,6 +11161,7 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
                 pending_model_id = family.default_model_id
         model_id = pending_model_id
         server.model_id = model_id
+        server.chat_port = chat_port   # `coli web`'s chat UI: the API's own address sends a browser there
         try:          # what the checkpoint on disk is called (a Clef, a 27B), for the Jev card
             server.display_name = display_for(resolve_model(model))[0]
         except Exception:

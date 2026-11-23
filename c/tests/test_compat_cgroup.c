@@ -63,6 +63,18 @@ static void cg(int n, const char *dir, const char *limit_name, const char *limit
 #define V2(n, dir, lim, cur, stat) cg(n, dir, "memory.max", lim, "memory.current", cur, stat)
 #define V1(n, dir, lim, cur, stat) cg(n, dir, "memory.limit_in_bytes", lim, "memory.usage_in_bytes", cur, stat)
 
+static void cg_cpu_v2(int n, const char *dir, const char *max_val) {
+    char r[256];
+    snprintf(r, sizeof r, "t%d/%s", n, dir); if (*dir) dir_(r);
+    snprintf(r, sizeof r, "t%d/%s%scpu.max", n, dir, *dir ? "/" : ""); put(r, max_val);
+}
+static void cg_cpu_v1(int n, const char *dir, const char *quota, const char *period) {
+    char r[256];
+    snprintf(r, sizeof r, "t%d/%s", n, dir); if (*dir) dir_(r);
+    if (quota) { snprintf(r, sizeof r, "t%d/%s%scpu.cfs_quota_us", n, dir, *dir ? "/" : ""); put(r, quota); }
+    if (period) { snprintf(r, sizeof r, "t%d/%s%scpu.cfs_period_us", n, dir, *dir ? "/" : ""); put(r, period); }
+}
+
 int main(void) {
     snprintf(base, sizeof base, "test_compat_cgroup_XXXXXX");
     if (!mkdtemp(base)) { perror("mkdtemp"); return 1; }
@@ -184,6 +196,46 @@ int main(void) {
     { double t = 0, a = 0;
       compat_cg_bound(&t, &a, 5000000000ull, 4000000000ull);
       check(t == 5.0 && a == 4.0, "what the machine did not give comes from the cgroup"); }
+
+    /* --- cgroup CPU quota tests (#2914) --- */
+    double q = 0.0;
+    tree(30, "0::/\n");
+    cg_cpu_v2(30, "", "765000 100000\n");
+    check(compat_cgroup_cpu_quota(root, proc, &q) && q > 7.64 && q < 7.66,
+          "v2 cpu.max: 7.65 cores (765000 / 100000)");
+    check((int)q == 7, "7.65 quota yields 7 threads without CFS throttle (#2914)");
+
+    tree(31, "0::/\n");
+    cg_cpu_v2(31, "", "max 100000\n");
+    check(!compat_cgroup_cpu_quota(root, proc, &q), "v2 cpu.max max: no quota");
+
+    tree(32, "0::/a/b\n");
+    cg_cpu_v2(32, "a", "400000 100000\n");
+    cg_cpu_v2(32, "a/b", "800000 100000\n");
+    check(compat_cgroup_cpu_quota(root, proc, &q) && q > 3.99 && q < 4.01,
+          "v2 leaf and parent: parent tighter quota bounds the container");
+
+    tree(33, "5:cpu,cpuacct:/docker/x\n");
+    cg_cpu_v1(33, "cpu", "400000\n", "100000\n");
+    check(compat_cgroup_cpu_quota(root, proc, &q) && q > 3.99 && q < 4.01,
+          "v1 cpu.cfs_quota_us: 4 cores");
+
+    tree(34, "5:cpu,cpuacct:/docker/x\n");
+    cg_cpu_v1(34, "cpu", "-1\n", "100000\n");
+    check(!compat_cgroup_cpu_quota(root, proc, &q), "v1 unlimited quota (-1): no quota");
+
+    tree(35, "0::/../t35x\n");
+    cg_cpu_v2(35, "", "400000 100000\n");
+    check(!compat_cgroup_cpu_quota(root, proc, &q), "cgroup outside namespace (..): ignored");
+
+    tree(36, "0::/\n");
+    cg_cpu_v2(36, "", "bad_data 100000\n");
+    check(!compat_cgroup_cpu_quota(root, proc, &q), "malformed cpu.max: no quota");
+
+    tree(37, "0::/\n");
+    cg_cpu_v2(37, "", "50000 100000\n");
+    check(compat_cgroup_cpu_quota(root, proc, &q) && q > 0.49 && q < 0.51,
+          "sub-core quota 0.5 cores");
 
     clean();
     rmdir(base);

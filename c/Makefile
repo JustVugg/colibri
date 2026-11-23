@@ -614,6 +614,8 @@ ifneq ($(IS_WIN),)
 ifeq ($(CUDA_DLL),1)
 CFLAGS  += -DCOLI_CUDA
 CUDA_OBJ = backend_loader.o cu_tier.o
+# inkling's bf16 matrices (backend_cuda_ink.cu) are in coli_cuda.dll too: the loader's ink_cuda_*
+INK_CUDA_OBJ = $(CUDA_OBJ)
 endif
 ifeq ($(HIP_DLL),1)
 # -DCOLI_CUDA keeps the existing shared GPU ABI (Linux HIP already reuses the
@@ -622,6 +624,8 @@ ifeq ($(HIP_DLL),1)
 # amdhip64 into the MinGW host is exactly what the DLL split exists to avoid.
 CFLAGS  += -DCOLI_CUDA -DCOLI_HIP_DLL
 CUDA_OBJ = backend_loader.o cu_tier.o
+# coli_hip.dll has no ink_ops: inkling's ink_cuda_* say no, and it runs on Vulkan or the CPU
+INK_CUDA_OBJ = $(CUDA_OBJ)
 endif
 endif
 
@@ -1113,14 +1117,14 @@ libcoli_xdna.so: backend_xdna_helper.cpp
 # shell that has the MSVC environment set (e.g. after vcvars64.bat, or from a
 # "x64 Native Tools Command Prompt"). COLI_CUDA_BUILDING_DLL enables
 # __declspec(dllexport) so the 15 API symbols are exported.
-cuda-dll: backend_cuda.cu cuda_chain.cu cu_xb.cu backend_cuda.h cuda_chain.h cu_tier_ops.h fp8_format.h
+cuda-dll: backend_cuda.cu cuda_chain.cu cu_xb.cu backend_cuda_ink.cu backend_cuda.h cuda_chain.h cu_tier_ops.h fp8_format.h backend_cuda_ink.h
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
 	# The banner is localized ("for x64" / "per x64" / "pour x64"): match the arch token only (#1531).
 	@cl 2>&1 | grep -qE "x64|AMD64" || { echo "cl.exe is the 32-bit (x86) compiler: nvcc then fails inside cuda_fp16.hpp with 'asm operand type size(8)'. Open 'x64 Native Tools Command Prompt for VS 2022' (or run vcvars64.bat), not the generic Developer Command Prompt (#1405)" >&2; exit 1; }
 	"$(NVCC)" $(NVCCFLAGS) -shared -DCOLI_CUDA_BUILDING_DLL \
 		-L"$(CUDA_HOME)/lib/x64" -lcudart \
-		backend_cuda.cu cuda_chain.cu cu_xb.cu -o coli_cuda.dll
+		backend_cuda.cu cuda_chain.cu cu_xb.cu backend_cuda_ink.cu -o coli_cuda.dll
 
 # Windows HIP DLL: the AMD sibling of cuda-dll above. hipcc compiles the SAME
 # backend_cuda.cu (through backend_gpu_compat.h) into coli_hip.dll, exporting
@@ -1174,7 +1178,7 @@ cuda_chain.o: cuda_chain.cu cuda_chain.h cuda_dsv4c.cuh cuda_glm53c.cuh cuda_k3c
 
 # The routed-expert tier on a CUDA device: vk_tier.c's logic (cu_tier.c compiles it again,
 # cu_tier.h) over the device side in cu_xb.cu (cu_tier_ops.h).
-cu_xb.o: cu_xb.cu cu_tier_ops.h cuda_bd.cuh vk_alloc.h backend_cuda.h backend_gpu_compat.h .build-config
+cu_xb.o: cu_xb.cu cu_tier_ops.h cuda_bd.cuh cuda_chain.h vk_alloc.h backend_cuda.h backend_gpu_compat.h .build-config
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) -c cu_xb.cu -o $@
 cu_tier.o: cu_tier.c vk_tier.c vk_tier.h cu_tier.h cu_tier_ops.h .build-config
@@ -1362,7 +1366,7 @@ expert-group-rows-test: tests/test_expert_group_rows_cuda.cu backend_cuda.cu bac
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_expert_group_rows_cuda.cu -o expert_group_rows_test$(EXE) $(GPU_TEST_LIBS)
 	./expert_group_rows_test$(EXE)
 
-cuda-test: tests/test_mxfp4_expert_cuda.cu tests/test_mxfp4_group_cuda.cu backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu tests/test_cuda_fmt_trap_cuda.cu tests/test_alloc_footprint_cuda.cu tests/test_cuda_init_failure.cu tests/test_expert_group_rows_cuda.cu
+cuda-test: tests/test_mxfp4_expert_cuda.cu tests/test_mxfp4_group_cuda.cu backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu tests/test_cuda_fmt_trap_cuda.cu tests/test_alloc_footprint_cuda.cu tests/test_cuda_init_failure.cu tests/test_expert_group_rows_cuda.cu tests/test_vision_attention_cuda.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	./backend_cuda_test$(EXE)
@@ -1372,6 +1376,9 @@ cuda-test: tests/test_mxfp4_expert_cuda.cu tests/test_mxfp4_group_cuda.cu backen
 	./cuda_init_failure_test$(EXE)
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_ragged_attention.cu -o ragged_attention_test$(EXE) $(GPU_TEST_LIBS)
 	./ragged_attention_test$(EXE)
+	# the Qwen vision tower's attention on the card against double precision, and its bits launch to launch
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_vision_attention_cuda.cu -o vision_attention_test$(EXE) $(GPU_TEST_LIBS)
+	./vision_attention_test$(EXE)
 	# weight_at's device-side refusal (the __trap()) on real silicon. The
 	# host-side half is tests/test_cuda_fmt_guard.c, which runs in the CPU
 	# suite and cannot execute device code. Includes backend_cuda.cu itself:
@@ -1566,7 +1573,7 @@ hip-test:
 # host code. An ARM host with a card (DGX Spark, GH200, Jetson) builds it without the x86
 # SIMD kernels, so a name those alone define breaks only there; CI runs this at
 # ARCH=x86-64 (no AVX2) to see it on an x86 runner.
-CUDA_HOST_SRC = qwen38.c qwen36.c olmoe.c qwen36_tier.c backend_loader.c glm53.c deepseek_v41.c colibri.c kimi_k3.c
+CUDA_HOST_SRC = qwen38.c qwen36.c olmoe.c qwen36_tier.c backend_loader.c glm53.c deepseek_v41.c colibri.c kimi_k3.c inkling.c
 cuda-host-syntax:
 	for f in $(CUDA_HOST_SRC); do $(CC) $(filter-out -MMD -MP,$(CFLAGS)) -fsyntax-only -DCOLI_CUDA $$f || exit 1; done
 
@@ -2045,7 +2052,7 @@ qwen36-tiny-mtp-check: qwen36-tiny-mtp-generate qwen36$(EXE)
 # vocabulary (--vocab 128), so a reply resent as text reads back as the ids the
 # engine generated. SPEC_ENV passes more settings to every run (the Vulkan family
 # in tests/vulkan_engines.sh runs the same gates in the dense chain).
-.PHONY: qwen36-tiny-v128-generate spec-drafts-check spec-drafts-run
+.PHONY: qwen36-tiny-v128-generate qwen36-seed-check spec-drafts-check spec-drafts-run
 qwen36-tiny-v128-generate:
 	$(PYTHON) tools/make_qwen36_tiny.py --out ./qwen36_tiny_v128 --ref-mode full --vocab 128 \
 		--emit-ref ./qwen36_tiny_v128/ref_full.json
@@ -2057,6 +2064,9 @@ qwen36-tiny-v128-generate:
 # The prompt echo's completeness on this engine (scoring gate): a client that asks for
 # the numeric channel reads one ECHO frame per prompt position, starting at 0. Fails on
 # a read-out that starts at 1, and on a live prefix resumed while the channel is on.
+qwen36-seed-check: qwen36-tiny-v128-generate qwen36$(EXE)
+	QWEN36_TINY=./qwen36_tiny_v128_c QWEN36_TINY_REQUIRED=1 $(PYTHON) -m unittest -v tests.test_qwen36_seed
+
 qwen36-echo-serve-check: qwen36-tiny-v128-generate qwen36$(EXE)
 	$(PYTHON) tests/qwen36_echo_serve_harness.py ./qwen36_tiny_v128_c
 	$(PYTHON) tests/qwen36_echo_serve_harness.py ./qwen36_tiny64_v128_c
@@ -2507,6 +2517,9 @@ tests/test_st$(EXE): tests/test_st.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_st_mirror$(EXE): tests/test_st_mirror.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_st_mirror_gguf$(EXE): tests/test_st_mirror_gguf.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_st_overlay$(EXE): tests/test_st_overlay.c
@@ -3891,7 +3904,7 @@ install: colibri-tui$(EXE) colibri$(EXE) glm53$(EXE) inkling$(EXE) kimi_k3$(EXE)
 	$(INSTALL) -m 644 family_registry.py resource_plan.py doctor.py autotune.py \
 		openai_server.py cluster.py v4_dsml.py v41_dsml.py version.py \
 		image_engine.py term_image.py setup_flow.py setup_hw.py setup_catalog.py \
-		setup_download.py mcp_server.py power.py $(DESTDIR)$(LIBEXECDIR)/
+		setup_download.py mcp_server.py power.py model_fit.py $(DESTDIR)$(LIBEXECDIR)/
 	$(INSTALL) -m 644 tools/*.py tools/iq3xxs_grid.json $(DESTDIR)$(LIBEXECDIR)/tools/
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)/ui
 	$(INSTALL) -m 644 ../ui/*.py ../ui/index.html $(DESTDIR)$(LIBEXECDIR)/ui/

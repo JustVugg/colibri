@@ -206,8 +206,10 @@ class ModelsServiceTest(unittest.TestCase):
         t = self.m.tiers_for(self.geo(dense=4, experts=40), 0, have=True, family="qwen36")
         self.assertFalse(t["ram"]["fits"])          # 44 GB, 26.8 GB of usable RAM
         self.assertTrue(t["gpu"]["fits"])           # with 24 GB of VRAM
-        self.assertIsNone(t["gpu"]["est"])          # measured on first use, never guessed
-        self.assertIn("primo uso", t["gpu"]["est_note"])
+        # coli setup's estimate (model_fit, fitted to measured runs): the dense part and part of
+        # the experts on the card, the rest from RAM; a card the page cannot size says so instead
+        self.assertGreater(t["gpu"]["est"], 0)
+        self.assertIsNone(t["gpu"]["est_note"])
 
     def test_an_integrated_gpu_claims_only_what_was_measured(self):
         g, fam = self.geo(), "qwen36"

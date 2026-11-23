@@ -122,6 +122,7 @@ typedef struct {
     double host_ms, wait_ms, dec_wait_ms, dec_host_ms;
     /* the routed experts in the frame (q38cc_dm_*) */
     int dm_on, dm_fmt, dm_gs, dm_read, dm_held;
+    int *dm_cap0;   /* the layers' RAM cache slots before q38cc_dm_recheck gave them more (q38cc_dm_caps_back) */
     unsigned dm_epoch, dm_seq;
     CcExpert *dm_host; uint8_t *dm_res, *dm_ran, *dm_dev; int *dm_part;   /* dm_ran: the step's layers that ran so */
     CcBuf *dm_ids, *dm_w, *dm_idsd, *dm_wd, *dm_hid, *dm_y, *dm_hy, *dm_dfl, *dm_hfl, *dm_tab;
@@ -748,6 +749,15 @@ static int q38cc_scratch(Q38CChain *ch, Model *m, int rows) {
 static void q38_layer_forward(Model *m,int i,float *hyper,const int *ids,int S,int pos_base,
                               float *mixed,float *inject,float *block);
 static void q38_embed_row(Model *m,int id,int abs_pos,float *out);
+/* The slots q38cc_dm_recheck gave the layers' RAM caches, taken back where the host computes routed experts
+ * again (the frame's buffers refused, the device lost): the gateway's plan sized the caches for the RAM, and
+ * with every expert on the card nothing has filled them. A cache with experts in it keeps its slots. */
+static void q38cc_dm_caps_back(Q38CChain *ch, Model *m) {
+    if (!ch || !ch->dm_cap0) return;
+    for (int i = 0; i < m->c.layers; i++)
+        if (m->cache[i].cap != ch->dm_cap0[i] && !m->cache[i].n) (void)q38_cache_slots_set(&m->cache[i], ch->dm_cap0[i]);
+    free(ch->dm_cap0); ch->dm_cap0 = NULL;
+}
 /* The device was lost with the newest DeltaNet state, conv rings and PLE ring on it.
  * The host's K/V/index rows are canonical, those are not: rebuild them on the CPU by
  * running the `upto` positions the prefix record names (the PLE n-gram history replayed
@@ -757,7 +767,7 @@ static void q38cc_recover(Model *m, int upto) {
     Cfg *c = &m->c; int H = c->hidden, W = c->hc_width, C = c->hc_count, nl = c->layers;
     int ple = c->ple_layer >= 0 && c->ple_layer < nl;
     g_cuda_chain = 0;
-    if (ch) { ch->failed = 1; ch->dn_where = Q38CC_HOST; ch->host_zero = 0; ch->snap_valid = 0; }
+    if (ch) { ch->failed = 1; ch->dn_where = Q38CC_HOST; ch->host_zero = 0; ch->snap_valid = 0; q38cc_dm_caps_back(ch, m); }
     for (int i = 0; i < nl; i++) {
         if (c->is_attn[i]) continue;
         memset(m->DN_rec[i], 0, (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim * sizeof(float));
@@ -1779,7 +1789,7 @@ static void q38cc_pool_init(Model *m) {
         int teams[2] = {0, 0}, nt = 1;
 #ifdef _OPENMP
         teams[0] = omp_get_max_threads();
-        if (omp_get_num_procs() > teams[0]) teams[nt++] = omp_get_num_procs();
+        if (coli_cpu_budget() > teams[0]) teams[nt++] = coli_cpu_budget();   /* never past a container's CPU quota (#2914) */
 #endif
         for (int ti = 0; ti < nt; ti++) {
             g_q38cc_pg_team = teams[ti];
@@ -1854,6 +1864,39 @@ static int q38cc_dm_able(Q38CChain *ch, Model *m) {
             return 0;
     }
     return 1;
+}
+/* After the tier's warm start (q38_tier_warm): q38cc_setup turned a decode step's routed experts in the frame off
+ * when a layer's RAM cache had fewer slots than a step's distinct experts (q38cc_dm_able), before anything was on
+ * the card. With every routed expert on the card the host computes none, so the cache needs those slots but none
+ * of their memory: empty caches are given them and the frame takes the experts. An A/B on an RTX 5090 (a
+ * 256-expert GGUF, every expert in VRAM) with `--ram 16`: 54 slots a layer, every expert on the host, 30-32 tok/s
+ * and 8.5-10.3 GB read a request; with 80 slots 47-48 tok/s and nothing read. */
+static void q38cc_dm_recheck(Model *m) {
+    Q38CChain *ch = q38cc_of(m);
+    if (!ch || !ch->ok || ch->dm_on) return;
+    Cfg *c = &m->c; int L = c->layers, E = c->experts, K = c->topk;
+    const int need = Q38CC_DM_ROWS * K < E ? Q38CC_DM_ROWS * K : E;
+    int short_slots = 0;
+    for (int i = 0; i < L; i++) {
+        if (m->cache[i].cap >= need) continue;
+        if (m->cache[i].n) return;   /* experts already in it: its table stays */
+        short_slots = 1;
+    }
+    if (!short_slots) return;   /* q38cc_dm_able said no for another reason */
+    for (int i = 0; i < L; i++)
+        for (int e = 0; e < E; e++) {
+            ColiCudaTensor *g, *u, *d;
+            if (!qt_chain_resident(i, e, ch->dev, &g, &u, &d)) return;   /* the host would compute some */
+        }
+    if (!(ch->dm_cap0 = malloc((size_t)L * sizeof(int)))) return;
+    for (int i = 0; i < L; i++) ch->dm_cap0[i] = m->cache[i].cap;
+    for (int i = 0; i < L; i++)
+        if (m->cache[i].cap < need && q38_cache_slots_set(&m->cache[i], need)) { q38cc_dm_caps_back(ch, m); return; }
+    ch->dm_on = q38cc_dm_able(ch, m);
+    if (!ch->dm_on) { q38cc_dm_caps_back(ch, m); return; }
+    q38cc_head_card(ch, m);
+    fprintf(stderr, "[chain] qwen38: every routed expert on the card: the layers' RAM caches take %d slots (none of them "
+                    "filled) and a decode step's routed experts run in the frame\n", need);
 }
 static int q38cc_stage_table(Q38CChain *ch, Model *m);
 /* the step's buffers, and the table when the tier's residents moved (the tier held) */
@@ -2107,7 +2150,7 @@ static int q38cc_dm_card(Q38CChain *ch, Model *m, int i, int n) {
     Cfg *c = &m->c; int H = c->hidden, E = c->experts, K = c->topk, io = i * ch->rows * K;
     CcBuf *tab = q38cc_dm_tab(ch, n);
     int stg = tab == ch->dm_tabb && ch->dm_frn[i] > 0;   /* this layer's copy to wait for */
-    CcMoe mp = {n, K, H, c->inter, ch->dm_fmt, ch->dm_gs, 0, 1, i * E, 0, H, io, K, io, K, 0, H, -1, E, 0, 0, 0, 0};
+    CcMoe mp = {n, K, H, c->inter, ch->dm_fmt, ch->dm_gs, 0, 1, i * E, 0, H, io, K, io, K, 0, H, -1, E, 0, 0, 0, 0, 0, 0.f, 0.f};
     if (ch->dm_fmt >= 100) qt_chain_layer_format(i, &mp.fmt, &mp.fmt_d);   /* a GGUF's types change from layer to layer */
     int ok = (!stg || cc_fetch_wait()) && cc_moe(tab, ch->mixed, ch->dm_ids, ch->dm_w, ch->dm_hid, ch->dm_y, NULL, &mp);
     if (ok && stg) ok = cc_fetch_done() && q38cc_stage_from(ch, m, i + 1);   /* the sum below reads no weights */
@@ -2122,7 +2165,7 @@ static int q38cc_dm_layer_a(Q38CChain *ch, Model *m, Layer *l, int i, int n, uns
 static int q38cc_dm_sum(Q38CChain *ch, Model *m, int i, int n, unsigned v, CcBuf *hid, int lay_S, int lay_s0) {
     Cfg *c = &m->c; int H = c->hidden, E = c->experts, K = c->topk, io = i * ch->rows * K;
     CcBuf *tab = q38cc_dm_tab(ch, n);
-    CcMoe ms = {n, K, H, c->inter, ch->dm_fmt, ch->dm_gs, 0, 2, i * E, 0, H, io, K, io, K, 0, H, v ? 0 : -1, E, 0, 0, lay_S, lay_s0};
+    CcMoe ms = {n, K, H, c->inter, ch->dm_fmt, ch->dm_gs, 0, 2, i * E, 0, H, io, K, io, K, 0, H, v ? 0 : -1, E, 0, 0, lay_S, lay_s0, 0, 0.f, 0.f};
     if (ch->dm_fmt >= 100) qt_chain_layer_format(i, &ms.fmt, &ms.fmt_d);
     int ok = !v || (q38cc_dm_skips(ch, n, lay_S) ? cc_wait_host_if(ch->dm_hfl, 0, v, tab, (size_t)i * E, ch->dm_ids, (size_t)io, n * K, E,
                                                                     ch->dm_hy, (size_t)n * H)
@@ -2738,7 +2781,8 @@ static const uint8_t *q38cc_srv_where(void *ctx, int k) {
     if (ch->hd_base && k >= ch->hd_k0) return ch->hd_base + (size_t)(k - ch->hd_k0) * ch->hd_stride;   /* the MTP head's */
     return (const uint8_t *)q38cc_pool_host(ch, k);
 }
-/* COLI_CUDA_CHAIN_SERVE_THREADS, else the logical CPUs less four (the recording thread, the
+/* COLI_CUDA_CHAIN_SERVE_THREADS, else the logical CPUs (no more than a container's CPU quota
+ * lets run, coli_cpu_budget) less four (the recording thread, the
  * driver's, the system's), at most 16, none below two: on an i5-13500 (20 logical CPUs) a decode
  * after a 452-token prompt took 49.7-50.2 tok/s on the recording thread, 52.4-52.7 with 12
  * threads, 52.3-52.9 with 16 and 46.1-46.9 with 20 */
@@ -2746,7 +2790,7 @@ static int q38cc_srv_threads(void) {
     const char *e = getenv("COLI_CUDA_CHAIN_SERVE_THREADS");
     if (e && *e) return atoi(e) > 0 ? atoi(e) : 0;
 #ifdef _OPENMP
-    const int n = omp_get_num_procs() - 4;
+    const int n = coli_cpu_budget() - 4;
     return n < 2 ? 0 : n > 16 ? 16 : n;
 #else
     return 0;
@@ -2829,10 +2873,12 @@ static int q38cc_head_card(Q38CChain *ch, Model *m) {
     uint8_t *hb = base ? (uint8_t *)malloc((size_t)B * stride) : NULL;
     CcExpert *tab = hb ? (CcExpert *)calloc((size_t)E, sizeof *tab) : NULL;
     int ok = tab != NULL;
+    const int nthr = coli_cpu_budget();   /* the CPUs, no more than a container's quota lets run (#2914) */
+    (void)nthr;   /* a build without OpenMP ignores the pragma */
     for (int e0 = 0; e0 < E && ok; e0 += B) {
         const int ne = E - e0 < B ? E - e0 : B;
         int bad = 0;
-        #pragma omp parallel for schedule(dynamic, 1) reduction(| : bad) num_threads(omp_get_num_procs())
+        #pragma omp parallel for schedule(dynamic, 1) reduction(| : bad) num_threads(nthr)
         for (int k = 0; k < ne * 3; k++) {   /* an expert's matrix */
             const int x = k / 3, q = k % 3, rows = q < 2 ? I : H, cols = q < 2 ? H : I;
             const int64_t rb = gq_row_bytes(t[q]->type, cols), qb = q < 2 ? qg : qd;
@@ -2979,7 +3025,7 @@ static int q38cc_dm_layer_lm(Q38CChain *ch, Model *m, Layer *l, int i, int n, in
     CcBuf *tab = ch->dm_tabb;
     int stg = ch->dm_frn[i] > 0;
     CcRoute rp = {n, E, K, 0, 0, E, 0, 0, io, K, io, K, 1, 1, c->norm_topk ? 1 : 0, 1.f, 1.f, 0.f};
-    CcMoe mp = {n, K, H, c->inter, ch->dm_fmt, ch->dm_gs, 0, 1, i * E, 0, H, io, K, io, K, 0, H, -1, E, 0, 0, 0, 0};
+    CcMoe mp = {n, K, H, c->inter, ch->dm_fmt, ch->dm_gs, 0, 1, i * E, 0, H, io, K, io, K, 0, H, -1, E, 0, 0, 0, 0, 0, 0.f, 0.f};
     if (ch->dm_fmt >= 100) qt_chain_layer_format(i, &mp.fmt, &mp.fmt_d);
     int ok = cc_matmul(q38cc_t(ch, &l->router), ch->mixed, 0, ch->lg, 0, n) && cc_route(ch->lg, NULL, ch->dm_ids, ch->dm_w, &rp) &&
              cc_copy(ch->dm_idsd, io, ch->dm_ids, io, (size_t)n * K) && cc_copy(ch->dm_wd, io, ch->dm_w, io, (size_t)n * K);
@@ -3044,7 +3090,7 @@ static int q38cc_moe_group(Q38CChain *ch, Model *m, Layer *l, int i, int c0, int
                  cc_matmul(q38cc_t(ch, &l->router), ch->mixed, 0, ch->lg, 0, n) && cc_route(ch->lg, NULL, ch->mg_ids, ch->mg_w, &rp);
         if (!ok || !cc_submit(0)) return 0;
     }
-    CcMoe mp = {G, K, H, c->inter, ch->dm_fmt, ch->dm_gs, 0, 3, i * E, 0, H, 0, K, 0, K, 0, H, -1, E, 0, 0, 0, 0};
+    CcMoe mp = {G, K, H, c->inter, ch->dm_fmt, ch->dm_gs, 0, 3, i * E, 0, H, 0, K, 0, K, 0, H, -1, E, 0, 0, 0, 0, 0, 0.f, 0.f};
     if (ch->dm_fmt >= 100) qt_chain_layer_format(i, &mp.fmt, &mp.fmt_d);
     const int stg = ch->dm_frn[i] > 0;
     if (!q38cc_frame_begin(ch) || (stg && first && !cc_fetch_wait())) return 0;
@@ -3587,6 +3633,7 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
             if (cc_lost()) goto lost;
             fprintf(stderr, "[chain] qwen38: the routed experts' buffers or table refused; the host's step from here on\n");
             q38cc_dm_end(ch); ch->dm_on = dm = 0;
+            q38cc_dm_caps_back(ch, m);
         }
         if (dm) memset(ch->dm_ran, 0, (size_t)L);
         /* a short prompt's chunk with the pool's slots on the CPU: two lanes (q38cc_chunk_lanes) */
@@ -3789,7 +3836,7 @@ static int q38cc_mtp_rows(Model *m, const float *streams, const int *next, int S
         const int hyb = !card && ch->hd_base && ch->srv && ch->dm_dfl && n <= Q38CC_DM_ROWS;   /* on the pool's server */
         if (card) {   /* routed, computed and summed on the card, in Q2_0 (q38cc_head_card) */
             CcRoute rp = {n, E, c->topk, 0, 0, E, 0, 0, 0, c->topk, 0, c->topk, 1, 1, c->norm_topk ? 1 : 0, 1.f, 1.f, 0.f};
-            CcMoe mp = {n, c->topk, H, c->inter, 100 + GQ_Q2_0, 0, 0, 3, 0, 0, H, 0, c->topk, 0, c->topk, 0, H, -1, E, 0, 100 + GQ_Q2_0, 0, 0};
+            CcMoe mp = {n, c->topk, H, c->inter, 100 + GQ_Q2_0, 0, 0, 3, 0, 0, H, 0, c->topk, 0, c->topk, 0, H, -1, E, 0, 100 + GQ_Q2_0, 0, 0, 0, 0.f, 0.f};
             ok = ok && cc_matmul(q38cc_t(ch, &l->router), ch->mixed, 0, ch->lg, 0, n) && cc_route(ch->lg, NULL, ch->hd_ids, ch->hd_w, &rp) &&
                  q38cc_shared(ch, m, l, L, n) && cc_moe(ch->hd_tab, ch->mixed, ch->hd_ids, ch->hd_w, ch->dm_hid, ch->dm_y, NULL, &mp) &&
                  q38cc_moe_apply(ch, m, n, ch->dm_y);

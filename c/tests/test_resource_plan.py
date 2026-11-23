@@ -16,6 +16,7 @@ from resource_plan import (
     CgroupFormatError,
     analyze_model,
     build_plan,
+    chat_context,
     cpu_socket_count,
     darwin_available_bytes,
     discover_gpus,
@@ -28,6 +29,7 @@ from resource_plan import (
     physical_cpu_count,
     read_ssd_probe,
     ssd_probe_state,
+    team_cpu_count,
 )
 
 
@@ -1262,6 +1264,8 @@ memInfo.free:                     23.50 GB (97%)
             with mock.patch("resource_plan.subprocess.run",
                             return_value=lscpu(blob)), \
                  mock.patch("resource_plan.performance_core_count", return_value=None), \
+                 mock.patch("resource_plan.cgroup_cpu_quota", return_value=None), \
+                 mock.patch("resource_plan.allowed_cpu_count", return_value=None), \
                  mock.patch.object(sys, "platform", "linux"):
                 plan = build_plan(self.model, available_memory=16 * GB,
                                   available_disk=1, gpus=[])
@@ -1271,12 +1275,42 @@ memInfo.free:                     23.50 GB (97%)
         # a hybrid CPU: the team is its performance cores, the physical count stays
         with mock.patch("resource_plan.subprocess.run", return_value=lscpu(layouts["2-col (-p=core,socket)"])), \
              mock.patch("resource_plan.performance_core_count", return_value=4), \
+             mock.patch("resource_plan.cgroup_cpu_quota", return_value=None), \
+             mock.patch("resource_plan.allowed_cpu_count", return_value=None), \
              mock.patch.object(sys, "platform", "linux"):
             plan = build_plan(self.model, available_memory=16 * GB, available_disk=1, gpus=[])
             env = environment_for_plan(plan)
         self.assertEqual((plan["cpu"]["physical_cores"], plan["cpu"]["team_threads"]), (12, 4))
         self.assertEqual(plan["cpu"]["thread_policy"], "performance-cores")
         self.assertEqual(env["OMP_NUM_THREADS"], "4")
+
+    def test_auto_tier_thread_count_stays_within_a_cpu_quota_and_the_affinity_mask(self):
+        # #2914: the launcher's default team sees a container's CPU quota and its
+        # cpuset (team_cpu_count). The plan's team is that default too: 48 cores
+        # under a cpu.max of 7.65 CPUs plan 7 threads, and the count of cores stays
+        # the hardware's.
+        def planned(quota, allowed, **named):
+            with mock.patch("resource_plan.physical_cpu_count", return_value=48), \
+                 mock.patch("resource_plan.performance_core_count", return_value=None), \
+                 mock.patch("resource_plan.cgroup_cpu_quota", return_value=quota), \
+                 mock.patch("resource_plan.allowed_cpu_count", return_value=allowed):
+                plan = build_plan(self.model, available_memory=16 * GB, available_disk=1,
+                                  gpus=[], cpu_sockets=1, **named)
+                return plan["cpu"], environment_for_plan(plan)["OMP_NUM_THREADS"], team_cpu_count()
+        cpu, threads, launcher_default = planned(7.65, None)
+        self.assertEqual((cpu["physical_cores"], cpu["team_threads"], cpu.get("limit_threads")), (48, 7, 7))
+        self.assertEqual((threads, launcher_default), ("7", 7))
+        cpu, threads, launcher_default = planned(None, 8)
+        self.assertEqual((cpu["team_threads"], cpu.get("limit_threads")), (8, 8))
+        self.assertEqual((threads, launcher_default), ("8", 8))
+        # no limit, or one looser than the cores: the block is the one it was, so the
+        # fingerprint of a tuning profile saved on such a machine does not move
+        unlimited = {"physical_cores": 48, "sockets": 1, "team_threads": 48,
+                     "thread_policy": "physical-cores"}
+        for quota, allowed in ((None, None), (64.0, None), (None, 96)):
+            self.assertEqual(planned(quota, allowed)[0], unlimited, (quota, allowed))
+        # a caller that names the cores is not probed, as for the performance cores
+        self.assertEqual(planned(7.65, 8, physical_cpus=48)[0], unlimited)
 
     def test_plan_does_not_set_omp_affinity_vars(self):
         # The real #325 regression: --auto-tier set OMP_PROC_BIND=spread +
@@ -1643,9 +1677,11 @@ memInfo.free:                     23.50 GB (97%)
         kwargs = dict(context=32, available_memory=16 * GB, available_disk=16 * GB, gpus=[],
                       vulkan={"type": "discrete", "budget_bytes": 16 * GB})
         on = {"COLI_VULKAN": "1", "COLI_VK_DENSE_HOST": "0"}
-        host = build_plan(model, env=dict(on, COLI_VK_DENSE_HOST="1"), **kwargs)["tiers"]["ram"]
         for bits, credit in (("8", 4096), ("4", 2048), ("16", 0)):
             with self.subTest(bits=bits):
+                # the host copy at the same width (_q36_dense_tensors prices the int8 trunk's)
+                host = build_plan(model, env=dict(on, COLI_VK_DENSE_HOST="1", COLI_DENSE_BITS=bits),
+                                  **kwargs)["tiers"]["ram"]
                 ram = build_plan(model, env=dict(on, COLI_DENSE_BITS=bits), **kwargs)["tiers"]["ram"]
                 self.assertEqual(ram["dense_on_device_bytes"], credit)
                 self.assertEqual(ram["dense_bytes"], host["dense_bytes"] - credit)
@@ -1879,6 +1915,28 @@ memInfo.free:                     23.50 GB (97%)
                 json.dumps(dict(geometry, format="colibri.qwen38.experts-int2g32", record_bytes=60, complete=False)))
             plan = build_plan(self.model, context=64, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
             self.assertEqual(plan["model"]["per_cap_bytes"], 384)
+
+    def test_qwen38_sidecar_only_checkpoint_prices_every_layer(self):
+        # A checkpoint whose shards carry no routed experts, the sidecar being their only copy:
+        # its layers come from the index. Priced by the shards' layers (none) the cap came out
+        # 0 with the MTP head off, and with the head on it was the head's record alone.
+        self.write_qwen38()
+        write_shard(self.model / "model.safetensors",
+                    [("model.embed_tokens.weight", 256, "BF16", [16, 8]),
+                     ("model.layers.0.mlp.gate.weight", 1024, "BF16", [2, 256])])
+        geometry = {"version": 1, "complete": True, "layers": 2, "experts": 2,
+                    "hidden_size": 8, "moe_intermediate_size": 4, "record_bytes": 53}
+        (self.model / "experts-vq2g32").mkdir()
+        (self.model / "experts-vq2g32" / "index.json").write_text(
+            json.dumps(dict(geometry, format="colibri.qwen38.experts-vq2g32")))
+        with mock.patch.dict(os.environ, {"Q38_EXPERT_LOWBIT": "vq2g32", "Q38_MTP": "0"}):
+            os.environ.pop("Q38_EXPERT_INT4", None)
+            plan = build_plan(self.model, context=64, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+        model = plan["model"]
+        self.assertTrue(model["qwen38_int4_experts"])
+        self.assertEqual((model["per_cap_bytes"], model["expert_bytes"]), (106, 212))
+        self.assertEqual(plan["tiers"]["ram"]["cache_slots_per_layer"], 2)
+        self.assertNotIn("RAM budget cannot hold one expert slot per sparse layer", plan["warnings"])
 
     def test_cli_emits_versioned_json(self):
         cli = Path(__file__).parents[1] / "coli"
@@ -2394,6 +2452,51 @@ class VulkanPartialChainQwenOlmoeTest(unittest.TestCase):
                 tensors.append((p + f"mlp.experts.{e}.qs", (2 * 32 + 64) * 4, "F32", [2 * 32 + 64]))
         write_shard(self.model / "model.safetensors", tensors, f32_fill=f32_fill)
         return analyze_model(self.model)
+
+    def test_qwen36_dense_weights_priced_as_the_engine_holds_them(self):
+        # qwen36.c's int8 trunk: load_tq's matrices as int8 rows and a float32 scale a row,
+        # the vectors and the small matrices (in_proj_a/b, conv taps, the shared expert's
+        # gate) in float32, the embedding read in place; the fixture is F16
+        import resource_plan
+        on_linux = mock.patch.object(resource_plan.sys, "platform", "linux")   # macOS keeps the old pricing (below)
+        on_linux.start()
+        self.addCleanup(on_linux.stop)
+        info = self.write_qwen36()
+        attention = (8192 + 512) + 2 * (2048 + 128) + (4096 + 256) + 2 * 16 * 4   # q, k, v, o, q/k norms
+        deltanet = (2 * 8 + 512 + 2 * 512 + 8) * 4 + (8192 + 512) + 2 * (4096 + 256)   # vectors, taps, a/b; qkv, z, out
+        mlp = (512 + 32) + 2 * (2048 + 128) + (2048 + 256) + 64 * 4   # router, shared gate/up/down, its gate
+        held = (20480 + 1280) + 64 * 4 + 8 * 2 * 64 * 4 + 2 * attention + 6 * deltanet + 8 * mlp
+        kwargs = dict(context=64, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+        cpu = build_plan(self.model, env={}, **kwargs)
+        self.assertEqual(cpu["model"]["dense_bytes"], held)
+        self.assertEqual(cpu["model"]["embed_bytes"], 0)
+        self.assertLess(held, info["dense_disk_bytes"])
+        # a Vulkan run keeps the float32 table; another trunk keeps the checkpoint's bytes
+        vk = build_plan(self.model, env={"COLI_VULKAN": "1", "COLI_VK_DENSE_HOST": "1"}, **kwargs)
+        self.assertEqual(vk["model"]["embed_bytes"], 320 * 64 * 4)
+        for env in ({"COLI_DENSE_I8": "0"}, {"COLI_DENSE_BITS": "16"}, {"COLI_KEEP_F32": "1"}):
+            with self.subTest(env=env):
+                self.assertEqual(build_plan(self.model, env=env, **kwargs)["model"]["dense_bytes"],
+                                 info["dense_bytes"])
+        # the Metal graph reads the checkpoint's dense weights in place: macOS keeps the checkpoint's bytes
+        with mock.patch.object(resource_plan.sys, "platform", "darwin"):
+            self.assertEqual(build_plan(self.model, env={}, **kwargs)["model"]["dense_bytes"], info["dense_bytes"])
+        # what the held bytes give back goes to the experts' cache
+        f32 = build_plan(self.model, env={"COLI_DENSE_I8": "0"}, **kwargs)
+        self.assertEqual(cpu["tiers"]["ram"]["expert_cache_bytes"] - f32["tiers"]["ram"]["expert_cache_bytes"],
+                         info["dense_bytes"] - held)
+
+    def test_qwen36_kv_priced_as_float16_unless_q36_kv_f32(self):
+        # kv16.h: K and V as float16 by default; the default context keeps its float32 steps
+        self.write_qwen36()
+        kwargs = dict(context=4096, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+        half = build_plan(self.model, env={}, **kwargs)["tiers"]["ram"]
+        full = build_plan(self.model, env={"Q36_KV": "f32"}, **kwargs)["tiers"]["ram"]
+        self.assertEqual(2 * half["sequence_state_bytes"], full["sequence_state_bytes"])
+        self.assertEqual(full["runtime_bytes"] - half["runtime_bytes"], half["sequence_state_bytes"])
+        for avail in (8 * GB, 32 * GB):
+            self.assertEqual(chat_context(self.model, env={}, available=avail),
+                             chat_context(self.model, env={"Q36_KV": "f32"}, available=avail))
 
     def test_cuda_plan_leaves_qwen36_tier_to_size_each_card(self):
         # qwen36_tier.c reads CUDA_EXPERT_GB as GiB for each card: the plan's GB
@@ -3326,10 +3429,14 @@ class PerformanceCoreCountTest(unittest.TestCase):
     def test_team_falls_back_to_the_physical_cores(self):
         import resource_plan
         with mock.patch("resource_plan.performance_core_count", return_value=None), \
-             mock.patch("resource_plan.physical_cpu_count", return_value=8):
+             mock.patch("resource_plan.physical_cpu_count", return_value=8), \
+             mock.patch("resource_plan.cgroup_cpu_quota", return_value=None), \
+             mock.patch("resource_plan.allowed_cpu_count", return_value=None):
             self.assertEqual(resource_plan.team_cpu_count(), 8)
         with mock.patch("resource_plan.performance_core_count", return_value=6), \
-             mock.patch("resource_plan.physical_cpu_count", return_value=14):
+             mock.patch("resource_plan.physical_cpu_count", return_value=14), \
+             mock.patch("resource_plan.cgroup_cpu_quota", return_value=None), \
+             mock.patch("resource_plan.allowed_cpu_count", return_value=None):
             self.assertEqual(resource_plan.team_cpu_count(), 6)
 
 

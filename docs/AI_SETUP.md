@@ -69,13 +69,15 @@ for example `7.0`, or null when nothing reported it).
 | `status` | `good`, `tight`, `needs-ram`, `needs-disk` or `unsupported` |
 | `fits`, `reason` | whether it can be installed here, and why |
 | `recommended` | exactly one model is the default |
+| `estimate` | for a text model that fits: `backend` (cuda, vulkan, cpu), `tier` (`gpu` every weight on the card, `hybrid` half on the card and half in RAM, `ram`, `ssd` experts streamed from the disk), `tok_s` the estimated decode speed, `where` in words |
 
 "Fits" means: the dense part, which always stays in RAM, plus a minimum
 expert cache fit in RAM, and the download fits on the disk.
 
 Tell the user the recommendation and the alternatives that fit, with their
-sizes. Large models stream from the SSD and are much slower than the small
-ones that run from RAM.
+sizes and estimated speeds. The recommendation is the most capable model whose
+estimate reaches 20 tok/s here, a slower one discounted by how far it falls
+short; a model that streams from the SSD counts at half its estimate.
 
 ## 2. Install
 

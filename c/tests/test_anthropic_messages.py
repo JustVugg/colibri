@@ -21,7 +21,7 @@ from urllib.request import Request, urlopen
 
 from openai_server import (APIServer, anthropic_to_openai, anthropic_tools, APIError,
                            render_chat, render_chat_glm53, render_chat_inkling,
-                           render_chat_kimi, render_chat_v4)
+                           render_chat_for_arch, render_chat_kimi, render_chat_v4)
 
 
 class FakeEngine:
@@ -286,6 +286,28 @@ class MessagesHTTPTest(unittest.TestCase):
                 self.assertEqual(self.engine.prompts[-1],
                                  render_chat_glm53(messages, add_generation_prompt=False))
                 self.assertTrue(self.engine.prompts[-1].endswith("The capital is"))
+
+    def test_qwen36_resent_thinking_is_kept_with_thinking_on(self):
+        """A client that sends its thinking blocks back (Claude Code) must get them rendered
+        back in place, as the OpenAI path does when reasoning_content is resent (#1759):
+        Qwen3.6's reuse is all or nothing, so a history stripped of the reasoning the engine
+        generated re-prefills the whole conversation on every turn."""
+        messages = [
+            {"role": "user", "content": "Find the bug."},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "The divisor can be zero.", "signature": ""},
+                {"type": "text", "text": "Empty input divides by zero."}]},
+            {"role": "user", "content": "Fix it."},
+        ]
+        body = self.base_body(messages=messages, thinking={"type": "enabled", "budget_tokens": 64})
+        with patch("openai_server.ARCH", "qwen36"):
+            with self.post(body) as response:
+                self.assertEqual(response.status, 200)
+            prompt = self.engine.prompts[-1]
+            openai_messages = anthropic_to_openai(body)
+            self.assertEqual(prompt, render_chat_for_arch(openai_messages, True, "high",
+                                                          preserve_thinking=True))
+        self.assertIn("The divisor can be zero.", prompt)
 
     def test_each_architecture_receives_its_native_chat_prompt(self):
         messages = [{"role": "user", "content": "Hi"}]

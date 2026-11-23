@@ -125,6 +125,24 @@ def setup_args(**overrides):
     return argparse.Namespace(**values)
 
 
+
+@contextlib.contextmanager
+def no_cuda_path(family_id):
+    """family_id as an engine with no CUDA path, on Linux and in the Windows package: every
+    engine with an accelerator has one now, and the setup's answer for one without is kept"""
+    engines = {k: v for k, v in setup_flow.CUDA_ENGINES.items() if k != family_id}
+    windows = tuple(f for f in setup_flow.WINDOWS_CUDA_ENGINES if f != family_id)
+    with mock.patch.object(setup_flow, "CUDA_ENGINES", engines), \
+            mock.patch.object(setup_flow, "WINDOWS_CUDA_ENGINES", windows):
+        yield
+
+
+def cpu_fit(hw, root):
+    """setup_flow.machine_fit for the tests: the machine's RAM read at 40 GB/s, no card counted,
+    nothing measured (the real probe takes seconds and answers per machine)"""
+    return {"ram": (hw.get("memory") or {}).get("total") or 0, "ram_avail": None, "ram_gbs": 40.0,
+            "cards": [], "integrated": None, "disk": "nvme", "disk_gbs": 2.0}
+
 class HomeTestCase(unittest.TestCase):
     """Each test gets its own setup folder."""
 
@@ -171,7 +189,8 @@ class BackendChoice(unittest.TestCase):
     def test_engine_without_cuda_path_uses_vulkan(self):
         rtx_vk = {"name": RTX["name"], "type": "discrete", "api_version": "1.3.289",
                   "api_version_raw": (1 << 22) | (3 << 12) | 289}
-        decision = self.choose(hw_report(vulkan=rtx_vk, nvidia=[RTX]), family="olmoe")
+        with no_cuda_path("olmoe"):
+            decision = self.choose(hw_report(vulkan=rtx_vk, nvidia=[RTX]), family="olmoe")
         self.assertEqual(decision["backend"], "vulkan")
 
     def test_integrated_gpu_only_for_engines_measured_faster_there(self):
@@ -267,8 +286,9 @@ class BackendChoice(unittest.TestCase):
                                    here=here, requested="cuda")
             self.assertEqual(decision["backend"], "cuda")
             # an engine without a CUDA path in that archive: Vulkan
-            decision = self.choose(hw_report(vulkan=rtx_vk, nvidia=[card]), family="mimo", tc=tc,
-                                   platform="win32", here=here)
+            with no_cuda_path("olmoe"):
+                decision = self.choose(hw_report(vulkan=rtx_vk, nvidia=[card]), family="olmoe", tc=tc,
+                                       platform="win32", here=here)
             self.assertNotEqual(decision["backend"], "cuda")
         with tempfile.TemporaryDirectory() as here:   # the engines without the DLL
             self.windows_cuda_here(here, dll=False)
@@ -302,7 +322,8 @@ class BackendChoice(unittest.TestCase):
         self.assertEqual(decision["backend"], "vulkan")
         self.assertIn("the release's coli_cuda.dll runs on compute 8.0", decision["reason"])
         # an engine the release carries no CUDA build of, or a compiler here: as before
-        decision = self.choose(hw_report(vulkan=DGPU, nvidia=[card]), family="mimo", tc=tc, platform="win32")
+        with no_cuda_path("olmoe"):
+            decision = self.choose(hw_report(vulkan=DGPU, nvidia=[card]), family="olmoe", tc=tc, platform="win32")
         self.assertEqual(decision["backend"], "vulkan")
         decision = self.choose(hw_report(vulkan=DGPU, nvidia=[card]), family="kimi", platform="win32")
         self.assertEqual(decision["backend"], "vulkan")
@@ -352,11 +373,12 @@ class BackendChoice(unittest.TestCase):
             self.assertEqual(decision["backend"], "cuda")
             self.assertIn("the release's CUDA backend (windows-x86_64-cuda.zip)", decision["reason"])
             self.assertNotIn("gpu_unused", decision)
-            decision = self.choose(hw, family="mimo", tc=tc, platform="win32")
+            with no_cuda_path("olmoe"):
+                decision = self.choose(hw, family="olmoe", tc=tc, platform="win32")
             self.assertEqual(decision["backend"], "cpu")
             self.assertEqual(decision["gpu_unused"], a100["name"])
             self.assertEqual(decision["reason"],
-                             "NVIDIA A100-PCIE-40GB found, but MiMo-V2.6 Flash has no CUDA build for "
+                             "NVIDIA A100-PCIE-40GB found, but OLMoE has no CUDA build for "
                              "Windows and no Vulkan device answered (the NVIDIA card runs in TCC mode, "
                              "where Windows offers no Vulkan device): the engine runs on the CPU")
         with mock.patch.object(setup_flow, "current_version", return_value="2.1.0"):
@@ -365,10 +387,12 @@ class BackendChoice(unittest.TestCase):
         self.assertEqual(decision["missing"], [])
         self.assertIn("the windows-x86_64-cuda.zip of release 2.1.0 has no qwen38.exe", decision["reason"])
         # a driver model that was not read, or Linux: no word on TCC
-        decision = self.choose(hw_report(nvidia=[dict(a100, driver_model=None)]), family="mimo", tc=tc,
-                               platform="win32")
+        with no_cuda_path("olmoe"):
+            decision = self.choose(hw_report(nvidia=[dict(a100, driver_model=None)]), family="olmoe", tc=tc,
+                                   platform="win32")
         self.assertIn("and no Vulkan device answered: the engine runs on the CPU", decision["reason"])
-        decision = self.choose(hw_report(nvidia=[a100]), family="olmoe")
+        with no_cuda_path("olmoe"):
+            decision = self.choose(hw_report(nvidia=[a100]), family="olmoe")
         self.assertEqual(decision["reason"],
                          "NVIDIA A100-PCIE-40GB found, but OLMoE has no CUDA path and no Vulkan "
                          "device answered: the engine runs on the CPU")
@@ -670,7 +694,8 @@ class CudaEngineTable(unittest.TestCase):
     """CUDA_ENGINES says what each engine's CUDA build is and needs; this reads
     the same facts from the Makefiles and the sources."""
 
-    OBJECTS = {"CUDA_OBJ": "backend_cuda.o", "INK_CUDA_OBJ": "backend_cuda_ink.o"}
+    OBJECTS = {"CUDA_OBJ": "backend_cuda.o", "INK_CUDA_OBJ": "backend_cuda_ink.o",
+               "CHAIN_CUDA_OBJ": "backend_cuda.o"}   # the dense chain's objects of CUDA_OBJ
 
     def rule(self, artifact):
         makefile = (C_DIR / "Makefile").read_text(encoding="utf-8")
@@ -732,8 +757,13 @@ class WindowsCudaPackage(unittest.TestCase):
         expected = {family_by_id(fid).engine_artifact for fid in setup_flow.WINDOWS_CUDA_ENGINES}
         self.assertIn("glm53", expected)
         self.assertIn("qwen38", expected)       # #2846
-        for fid in setup_flow.WINDOWS_CUDA_ENGINES:      # the tier coli_cuda.dll's loader serves
-            self.assertEqual(setup_flow.CUDA_ENGINES[fid]["object"], "backend_cuda.o", fid)
+        self.assertIn("inkling", expected)
+        # what coli_cuda.dll's loader serves: the tier (backend_cuda.o) and inkling's bf16
+        # matrices (backend_cuda_ink.o, its ink_ops table); every engine of CUDA_ENGINES but
+        # deepseek_v4, whose DLLs are their own
+        for fid in setup_flow.WINDOWS_CUDA_ENGINES:
+            self.assertIn(setup_flow.CUDA_ENGINES[fid]["object"], ("backend_cuda.o", "backend_cuda_ink.o"), fid)
+        self.assertEqual(set(setup_flow.WINDOWS_CUDA_ENGINES), set(setup_flow.CUDA_ENGINES) - {"deepseek_v4"})
         def exes(text):
             return {name[:-len(".exe")] for name in re.findall(r"[a-z0-9_]+\.exe", text)}
 
@@ -1384,6 +1414,7 @@ class WholeSetup(HomeTestCase):
                 mock.patch.dict(os.environ, {"HF_ENDPOINT": self.hub.base,
                                              "COLI_SETUP_CATALOG": catalog}),
                 mock.patch.object(setup_flow, "HERE", self.engines),
+                mock.patch.object(setup_flow, "machine_fit", cpu_fit),
                 mock.patch.object(setup_hw, "detect",
                                   return_value=hw_report(vulkan=IGPU, icd="/home/u/dzn.json")),
                 mock.patch.object(setup_hw, "is_wsl", return_value=False),
@@ -1538,6 +1569,13 @@ class WholeSetup(HomeTestCase):
             Path(current["model_dir"], "model-00000.safetensors").read_bytes(),
             self.shard,
         )
+
+    def test_no_ui_prints_no_browser_address(self):
+        cfg = {"host": "127.0.0.1", "port": 8000, "urls": setup_flow.urls("127.0.0.1", 8000)}
+        lines = []
+        setup_flow.print_urls(cfg, lines.append, ui=False)
+        self.assertEqual(lines, ["  OpenAI base URL:     http://127.0.0.1:8000/v1",
+                                 "  Anthropic base URL:  http://127.0.0.1:8000"])
 
     def test_printed_browser_address_is_the_chat_for_an_older_setup(self):
         # a setup from before the chat UI saved the API's port as the browser's address
@@ -1890,7 +1928,8 @@ class WholeSetup(HomeTestCase):
         self.assertEqual(second.id, [r for r in rows if r["fits"]][1]["entry"].id)
         menu = out.getvalue()
         self.assertIn("[recommended]", menu)
-        self.assertIn(setup_catalog.FITS_EXPLAINED, menu)
+        self.assertIn("the speed is an estimate of decode here", menu)
+        self.assertIn("tok/s, CPU", menu)
         self.assertIn("type a number from 1", menu)
 
     def test_json_mode_prints_the_configuration(self):
@@ -2061,6 +2100,15 @@ class ServerControl(HomeTestCase):
         result = setup_flow.stop_server(self.cfg, out=lambda *_: None)
         self.assertTrue(result["stopped"], result)
         self.assertEqual(self.wait_state(self.cfg, "stopped")["state"], "stopped")
+
+    def test_no_ui_reaches_the_launcher(self):
+        # `coli start --no-ui` (the desktop app): `coli web --no-ui`, the API without the chat UI
+        status = setup_flow.start_server(self.cfg, background=True, open_browser=False,
+                                         out=lambda *_: None, wait=10, ui=False)
+        self.pids.append(status["pid"])
+        self.wait_state(self.cfg, "ready")
+        seen = json.loads(Path(self.env_out).read_text())
+        self.assertIn("--no-ui", seen["argv"])
 
     def test_a_taken_port_moves_to_the_next_free_one(self):
         self.port = quiet_port_pair()      # pick_port tries the next one: keep it out of reach

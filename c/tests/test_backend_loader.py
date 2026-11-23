@@ -918,7 +918,7 @@ class LoaderStubFixtureTest(unittest.TestCase):
             cls.fixture = None
 
     def test_abi_is_derived_from_the_loader_source(self):
-        """47 mandatory + 22 optional, parsed from backend_loader.c.
+        """47 mandatory + 24 optional, parsed from backend_loader.c.
 
         The counts are a deliberate tripwire: adding a RESOLVE to the loader
         widens the ABI every Windows DLL must satisfy, and that should be a
@@ -929,8 +929,8 @@ class LoaderStubFixtureTest(unittest.TestCase):
         """
         f = self.fixture
         self.assertEqual(len(f.mandatory), 47)
-        self.assertEqual(len(f.optional), 22)  # +expert_mxfp4: optional Kimi SiTU pipeline; +dn_create/free/set_state/get_state/step; +tensor_overwrite; +chain_ops (the dense chain's table); +host_register/host_unregister/planar_rows (the qwen36 tier's host pool); +block_elems/tensor_upload_at (a GGUF's block formats, the tier's arena); +tier_ops (the routed-expert tier's table, cu_tier_ops.h)
-        self.assertEqual(len(f.exports), 69)
+        self.assertEqual(len(f.optional), 24)  # +ink_ops (inkling's bf16 matrices, backend_cuda_ink.h); +expert_mxfp4: optional Kimi SiTU pipeline; +dn_create/free/set_state/get_state/step; +tensor_overwrite; +chain_ops (the dense chain's table); +host_register/host_unregister/planar_rows (the qwen36 tier's host pool); +block_elems/tensor_upload_at (a GGUF's block formats, the tier's arena); +tier_ops (the routed-expert tier's table, cu_tier_ops.h); +vision_attention (the Qwen vision tower's attention)
+        self.assertEqual(len(f.exports), 71)
         self.assertEqual(len(f.exports), len(f.mandatory) + len(f.optional))
         self.assertIn("coli_cuda_init", f.mandatory)
         self.assertIn("coli_cuda_e8_set_grid", f.optional)
@@ -941,7 +941,13 @@ class LoaderStubFixtureTest(unittest.TestCase):
         # tier_ops: the engines' routed-expert tier on the device (cu_tier.c); a DLL predating
         # it answers NULL and the tier stays off.
         self.assertIn("coli_cuda_tier_ops", f.optional)
+        # ink_ops: inkling's bf16 matrices on the card (backend_cuda_ink.h); a DLL predating it
+        # answers NULL and inkling.exe runs on Vulkan or the CPU.
+        self.assertIn("coli_cuda_ink_ops", f.optional)
         self.assertIn("coli_cuda_tensor_upload_at", f.optional)
+        # vision_attention: the Qwen vision tower's attention on the card (qwen38_vision.h); a DLL
+        # predating it answers 0 and the tower keeps the CPU's.
+        self.assertIn("coli_cuda_vision_attention", f.optional)
         # attention_project_ragged: paged ragged KV runtime (#795).
         self.assertIn("coli_cuda_attention_project_ragged", f.mandatory)
         # fp8_set_lut: fmt=8 e4m3 dense/expert kernels (#817).
