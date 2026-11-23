@@ -15,6 +15,27 @@ more GPUs and computed there through the existing shared CUDA backend
 > Everything below describes the Qwen3.6 modes unless it says otherwise.
 
 
+## CUDA kernel profiles for the INT4 checkpoint
+
+The Qwen3.6 CUDA chain can select a device-specific profile for the
+`Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64` checkpoint at revision
+`c619aa594ad1e70af82168fb6b4878427896e21c`. It checks the model layout
+and the device before reading checkpoint contents. Verification covers the
+41 weight files (23.0 GB), configuration, tokenizer and model metadata.
+On supported local filesystems the chain can reuse the hashes of unchanged
+files through `.colibri-qwen36-cuda-checkpoint-v1` in the model directory.
+
+The profile applies to a single conversation slot with an empty or unset
+`COLI_DFLASH` and `Q36_MTP` other than `1`. Other checkpoints and devices
+continue through the ordinary CUDA chain. The following names and compute
+capabilities match the device reported by CUDA.
+
+| Device | Compute capability |
+|---|---|
+| NVIDIA L4 (also reported as `L4`) | 8.9 |
+
+See the [kernel controls](ENVIRONMENT.md#qwen36-cuda-kernel-controls) for individual overrides.
+
 ## How it works
 
 - **Home device:** expert `eid` lives on GPU `eid % n_gpus`; no duplicates.

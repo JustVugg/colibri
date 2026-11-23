@@ -110,6 +110,9 @@ typedef struct {
     float *dx, *dy; size_t dx_cap, dy_cap;
     uint8_t *qx; float *qscale;
     size_t qx_cap, qscale_cap;
+    int qwen36_active, l2_fetch_changed;
+    size_t saved_l2_fetch_limit;
+    unsigned kernel_mask;
     float *host_x,*host_y,*host_kv; size_t host_x_cap,host_y_cap,host_kv_cap;
     float *aq,*al,*ar,*ac; size_t aq_cap,al_cap,ar_cap,ac_cap;
     float *pipe_buf[27]; size_t pipe_cap[27];   /* scratch persistenti del resident pipeline */
@@ -185,10 +188,13 @@ static DeviceContext *find_ctx(int device) {
  * runtime, so a thread-local cache skips the redundant switches. */
 static thread_local int g_current_device = -1;
 
-static int select_ctx(DeviceContext *ctx) {
+static int select_ctx(DeviceContext *ctx, bool force = false) {
     if (!ctx) return 0;
-    if (g_current_device == ctx->device) return 1;
-    if (!cuda_ok(cudaSetDevice(ctx->device), "select device")) return 0;
+    if (!force && g_current_device == ctx->device) return 1;
+    if (!cuda_ok(cudaSetDevice(ctx->device), "select device")) {
+        g_current_device = -1;
+        return 0;
+    }
     g_current_device = ctx->device;
     return 1;
 }
@@ -682,6 +688,65 @@ static int e8_rot_rows_dev(float *rows, int nr, int dim, cudaStream_t stream){
         off += b;
     }
     return 1;
+}
+
+#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+/* The caller must have selected ctx's device. */
+static void apply_l2_fetch_limit(DeviceContext *ctx, int enabled) {
+    if (enabled && !ctx->l2_fetch_changed) {
+        const char *val = getenv("COLI_CUDA_L2_GRAN");
+        int gran = val && *val ? atoi(val) : 128;
+        if (gran > 0 && cudaDeviceGetLimit(&ctx->saved_l2_fetch_limit, cudaLimitMaxL2FetchGranularity) == cudaSuccess)
+            ctx->l2_fetch_changed = cudaDeviceSetLimit(cudaLimitMaxL2FetchGranularity, (size_t)gran) == cudaSuccess;
+    } else if (!enabled && ctx->l2_fetch_changed) {
+        if (cudaDeviceSetLimit(cudaLimitMaxL2FetchGranularity, ctx->saved_l2_fetch_limit) == cudaSuccess)
+            ctx->l2_fetch_changed = 0;
+    }
+    (void)cudaGetLastError();
+}
+#endif
+
+/* Apply the L2 fetch limit when the request enables prompt caching. */
+extern "C" void coli_cuda_set_l2_fetch(int device, int enabled) {
+#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
+    (void)device; (void)enabled;
+#else
+    DeviceContext *ctx = find_ctx(device);
+    // The chain can switch devices independently of the backend's cached selection.
+    if (select_ctx(ctx, true)) apply_l2_fetch_limit(ctx, enabled);
+#endif
+}
+
+extern "C" void coli_cuda_set_qwen36_mask(int device, unsigned mask) {
+    DeviceContext *ctx = find_ctx(device);
+    if (ctx) ctx->kernel_mask = mask;
+}
+
+/* Both the device and the selected fatbinary image must support the native INT8 tiles.
+ * A driver can JIT an older compute_75 PTX image on an sm_89 device. */
+extern "C" int coli_cuda_enable_qwen36(int device, int enabled) {
+#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
+    (void)device;
+    return !enabled;
+#else
+    DeviceContext *ctx = find_ctx(device);
+    if (!ctx) return !enabled;
+    const bool selected = ctx->compute_major >= 8 && select_ctx(ctx, true);
+    if (enabled) {
+        if (!selected) return 0;
+        cudaFuncAttributes attr;
+        if (cudaFuncGetAttributes(&attr, (const void *)quant_matmul) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return 0;
+        }
+        if (attr.ptxVersion < 80) return 0;
+    }
+    // Discard software state on disable even when the CUDA context is unavailable.
+    ctx->qwen36_active = enabled != 0;
+    if (!enabled) ctx->kernel_mask = 0;
+    if (selected) apply_l2_fetch_limit(ctx, enabled);
+    return 1;
+#endif
 }
 
 __global__ static void silu_mul(float *gate, const float *up, size_t n) {
@@ -1686,7 +1751,7 @@ extern "C" int coli_cuda_available_device_count(void) {
 extern "C" void coli_cuda_shutdown(void) {
     for (int i = 0; i < g_nctx; i++) {
         DeviceContext *ctx = &g_ctx[i];
-        if (!select_ctx(ctx)) continue;
+        if (!select_ctx(ctx, true)) continue;
         if (ctx->bdtab) cudaFree(ctx->bdtab);
         if (ctx->mxfp4_weights) cudaFree(ctx->mxfp4_weights);
         if (ctx->mxfp4_scales) cudaFree(ctx->mxfp4_scales);
@@ -1700,6 +1765,9 @@ extern "C" void coli_cuda_shutdown(void) {
         if (ctx->up) cudaFree(ctx->up);
         if (ctx->qx) cudaFree(ctx->qx);
         if (ctx->qscale) cudaFree(ctx->qscale);
+#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+        if (ctx->qwen36_active || ctx->l2_fetch_changed) apply_l2_fetch_limit(ctx, 0);
+#endif
         if(ctx->aq)cudaFree(ctx->aq);if(ctx->al)cudaFree(ctx->al);if(ctx->ar)cudaFree(ctx->ar);if(ctx->ac)cudaFree(ctx->ac);
         for(int b=0;b<27;b++) if(ctx->pipe_buf[b]) cudaFree(ctx->pipe_buf[b]);
         for(int b=0;b<8;b++) if(ctx->skp[b].p) cudaFree(ctx->skp[b].p);
