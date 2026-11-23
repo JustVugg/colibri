@@ -974,6 +974,20 @@ static void test_request_kernel_mask(void) {
        !(fake_kernel_mask & Q36_DNREC),
        "A100 subsequent 64-token prompt leaves cold DeltaNet scheduling disabled");
     q36cc_end_request(&a100);
+    fake_device_profile = Q36_GPU_3090;
+    Q36CChain rtx3090 = {0};
+    rtx3090.device_profile = cc_select_qwen36_profile(1);
+    q36cc_end_request(&rtx3090);
+    q36cc_begin_request(&rtx3090, 5785, 1298, 1);
+    ck(rtx3090.request_phase && !(fake_kernel_mask & Q36_PROMPT_CACHE) &&
+       !(rtx3090.decode_permissions & Q36_PROMPT_CACHE),
+       "RTX 3090 live prefix selects ordinary cache for prompt and decode");
+    q36cc_end_request(&rtx3090);
+    q36cc_begin_request(&rtx3090, 5785, 1298, 0);
+    ck(rtx3090.request_phase && (fake_kernel_mask & Q36_PROMPT_CACHE) &&
+       (rtx3090.decode_permissions & Q36_PROMPT_CACHE),
+       "RTX 3090 resumes the growable cache when the same prefix is not live");
+    q36cc_end_request(&rtx3090);
     ck(cc_select_qwen36_profile(0) == Q36_GPU_NONE && !fake_kernel_mask,
        "disabling the device profile clears backend request permissions");
     fake_device_profile = saved_profile;
