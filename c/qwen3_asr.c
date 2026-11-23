@@ -753,6 +753,7 @@ static void conv2d_f32(float *out, const float *in, const Conv2d *C, int H, int 
     /* in: [C.in,H,W], out: [C.out,H2,W2] */
     int H2 = (H + 2*C->pad - C->kh) / C->stride + 1;
     int W2 = (W + 2*C->pad - C->kw) / C->stride + 1;
+    #pragma omp parallel for collapse(3) schedule(static) if(C->out*H2*W2 > 4096)
     for (int oc=0; oc<C->out; oc++) {
         for (int oh=0; oh<H2; oh++) {
             for (int ow=0; ow<W2; ow++) {
@@ -1184,7 +1185,21 @@ static int transcribe_audio(Qwen3Asr *m, const unsigned char *wav, size_t wav_n,
     if (rc != 0) { if (cap) text_out[0]=0; return -4; }
     double t1=now_ms();
     float *audio_emb=NULL; int audio_n=0;
-    rc = audio_encoder_forward(m, mel.mel, mel.n_mels, mel.n_frames, &audio_emb, &audio_n);
+    const char *emb_path = getenv("QWEN3_ASR_AUDIO_EMB");
+    if (emb_path && emb_path[0]) {
+        FILE *ef = fopen(emb_path, "rb");
+        if (ef) {
+            fseek(ef, 0, SEEK_END); long sz = ftell(ef); fseek(ef, 0, SEEK_SET);
+            int dim = m->audio.output_dim;
+            audio_n = (int)(sz / (long)(sizeof(float)*dim));
+            audio_emb = (float*)xmalloc((size_t)audio_n*dim*sizeof(float));
+            fread(audio_emb, sizeof(float), (size_t)audio_n*dim, ef); fclose(ef);
+            rc = 0;
+            fprintf(stderr, "[qwen3_asr] loaded audio_emb override %s (%d tokens)\n", emb_path, audio_n);
+        } else { rc = audio_encoder_forward(m, mel.mel, mel.n_mels, mel.n_frames, &audio_emb, &audio_n); }
+    } else {
+        rc = audio_encoder_forward(m, mel.mel, mel.n_mels, mel.n_frames, &audio_emb, &audio_n);
+    }
     const char *dump_dir = getenv("QWEN3_ASR_DUMP");
     if (dump_dir && dump_dir[0]) {
         char dp[4096]; FILE *df;
