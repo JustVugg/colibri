@@ -1139,9 +1139,19 @@ static int greedy_decode(Qwen3Asr *m, const int *prompt, int n_prompt, const flo
     double t_prefill=now_ms();
     int out_len = 0; out[0]=0;
     int steps=0;
+    const char *dbg_topk = getenv("QWEN3_ASR_DEBUG_TOPK");
+    int dbg_topk_n = dbg_topk ? atoi(dbg_topk) : 0;
     for (int step=0; step<max_new; step++) {
         int best=0; float bestv=logits[0];
         for(int i=1;i<t->vocab;i++) if(logits[i]>bestv){bestv=logits[i]; best=i;}
+        if (dbg_topk_n > 0 && step < dbg_topk_n) {
+            int kN = 5;
+            int topi[5]={0,0,0,0,0}; float topv[5]={-1e30f,-1e30f,-1e30f,-1e30f,-1e30f};
+            for(int i=0;i<t->vocab;i++){float v=logits[i]; for(int k2=0;k2<kN;k2++){if(v>topv[k2]){for(int j=kN-1;j>k2;j--){topv[j]=topv[j-1];topi[j]=topi[j-1];} topv[k2]=v; topi[k2]=i; break;}}}
+            fprintf(stderr,"[qwen3_asr] topk step=%d", step);
+            for(int k2=0;k2<kN;k2++){char d2[64];int dn2=tok_decode(&m->tok,&topi[k2],1,d2,63);d2[dn2>0?dn2:0]=0; fprintf(stderr," %d:%.4f:%s", topi[k2], topv[k2], d2);} 
+            fprintf(stderr,"\n"); fflush(stderr);
+        }
         if (best == eos) break;
         if (n < max_seq) seq[n++] = best;
         char piece[256];
