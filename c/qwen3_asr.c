@@ -347,8 +347,12 @@ static int load_config(Qwen3Asr *m) {
     t->vocab = json_get_int(tc, "vocab_size", 151936);
     t->max_pos = json_get_int(tc, "max_position_embeddings", 65536);
     t->rms_eps = json_get_float(tc, "rms_norm_eps", 1e-6f);
-    t->rope_theta = json_get_float(tc, "rope_theta", 1000000.0f);
     jval *rope = json_get(tc, "rope_scaling");
+    float rs_theta = rope ? json_get_float(rope, "rope_theta", -1.0f) : -1.0f;
+    if (rs_theta > 0) t->rope_theta = rs_theta;
+    else if (rope) t->rope_theta = 10000.0f; /* transformers 5.x default when rope_scaling present without rope_theta */
+    else t->rope_theta = json_get_float(tc, "rope_theta", 10000.0f);
+    if(getenv("QWEN3_ASR_ROPE_THETA")) t->rope_theta = (float)atof(getenv("QWEN3_ASR_ROPE_THETA"));
     jval *mrs = rope ? json_get(rope, "mrope_section") : NULL;
     for (int i=0;i<4;i++) t->mrope_section[i] = 0;
     if (mrs && mrs->t == J_ARR) {
@@ -1030,6 +1034,8 @@ static int text_forward(Qwen3Asr *m, const int *tokens, const float *audio_emb, 
             for (int d=0; d<D; d++) dst[d] = bf16w_to_f32(src[d]);
         }
     }
+    const char *dump_layers = getenv("QWEN3_ASR_DUMP_LAYERS");
+    if (dump_layers && dump_layers[0]) { FILE *df=fopen(dump_layers,"ab"); if(df){fwrite(x+(size_t)(S-1)*D,sizeof(float),D,df); fclose(df);} }
     float *xb  = (float*)xcalloc((size_t)S*D,sizeof(float));
     float *q   = (float*)xcalloc((size_t)S*H*HD,sizeof(float));
     float *k   = (float*)xcalloc((size_t)S*KVH*HD,sizeof(float));
@@ -1040,11 +1046,15 @@ static int text_forward(Qwen3Asr *m, const int *tokens, const float *audio_emb, 
     float *att = (float*)xcalloc((size_t)H*(start_pos+S),sizeof(float));
     for (int li=0; li<t->n_layers; li++) {
         TextLayer *L = &t->layers[li];
+        const char *dbg_l0 = getenv("QWEN3_ASR_DEBUG_LAYER0");
+        int do_l0 = (li==0 && dbg_l0 && dbg_l0[0] && S>1);
         /* batch rmsnorm + QKV projections */
         for (int si=0; si<S; si++) rmsnorm(xb + (size_t)si*D, x + (size_t)si*D, L->ln1.w, D, t->rms_eps);
+        if (do_l0) { FILE *df=fopen(dbg_l0,"ab"); if(df){fwrite(xb+(size_t)(S-1)*D,sizeof(float),D,df); fclose(df);} }
         matmul_linear(q, xb, &L->q, S);
         matmul_linear(k, xb, &L->k, S);
         matmul_linear(v, xb, &L->v, S);
+        if (do_l0) { FILE *df=fopen(dbg_l0,"ab"); if(df){fwrite(q+(size_t)(S-1)*H*HD,sizeof(float),H*HD,df); fwrite(k+(size_t)(S-1)*KVH*HD,sizeof(float),KVH*HD,df); fwrite(v+(size_t)(S-1)*KVH*HD,sizeof(float),KVH*HD,df); fclose(df);} }
         /* per-token q/k norm, rope, kv store, attention */
         for (int si=0; si<S; si++) {
             int pos = start_pos + si;
@@ -1053,9 +1063,11 @@ static int text_forward(Qwen3Asr *m, const int *tokens, const float *audio_emb, 
             float *vs = v + (size_t)si*KVH*HD;
             if (L->q_norm) for(int h=0;h<H;h++){ float ss=0; for(int d=0;d<HD;d++){float vv=qs[h*HD+d]; ss+=vv*vv;} ss=1.0f/sqrtf(ss/HD+1e-6f); for(int d=0;d<HD;d++) qs[h*HD+d]=qs[h*HD+d]*ss*L->q_norm[d]; }
             if (L->k_norm) for(int h=0;h<KVH;h++){ float ss=0; for(int d=0;d<HD;d++){float vv=ks[h*HD+d]; ss+=vv*vv;} ss=1.0f/sqrtf(ss/HD+1e-6f); for(int d=0;d<HD;d++) ks[h*HD+d]=ks[h*HD+d]*ss*L->k_norm[d]; }
+            if (do_l0 && si==S-1) { FILE *df=fopen(dbg_l0,"ab"); if(df){fwrite(qs,sizeof(float),H*HD,df); fwrite(ks,sizeof(float),KVH*HD,df); fclose(df);} }
             int mpos[3] = {pos, pos, pos};
             mrope(qs, H, HD, mpos, t->rope_theta, t->mrope_section);
             mrope(ks, KVH, HD, mpos, t->rope_theta, t->mrope_section);
+            if (do_l0 && si==S-1) { FILE *df=fopen(dbg_l0,"ab"); if(df){fwrite(qs,sizeof(float),H*HD,df); fwrite(ks,sizeof(float),KVH*HD,df); fclose(df);} }
             KVCache *kc = &cache[li];
             if (pos < kc->cap) {
                 memcpy(kc->k + (size_t)pos*KVdim, ks, (size_t)KVdim*sizeof(float));
@@ -1086,20 +1098,28 @@ static int text_forward(Qwen3Asr *m, const int *tokens, const float *audio_emb, 
                 }
             }
         }
+        if (do_l0) { FILE *df=fopen(dbg_l0,"ab"); if(df){fwrite(xb2+(size_t)(S-1)*D,sizeof(float),D,df); fclose(df);} }
         /* batch output proj + residual */
         matmul_linear(xb, xb2, &L->o, S);
         for (size_t i=0;i<(size_t)S*D;i++) x[i] += xb[i];
+        if (do_l0) { FILE *df=fopen(dbg_l0,"ab"); if(df){fwrite(x+(size_t)(S-1)*D,sizeof(float),D,df); fclose(df);} }
         /* batch ffn */
         for (int si=0; si<S; si++) rmsnorm(xb + (size_t)si*D, x + (size_t)si*D, L->ln2.w, D, t->rms_eps);
+        if (do_l0) { FILE *df=fopen(dbg_l0,"ab"); if(df){fwrite(xb+(size_t)(S-1)*D,sizeof(float),D,df); fclose(df);} }
         matmul_linear(ff1, xb, &L->gate, S);
         matmul_linear(ff2, xb, &L->up, S);
+        if (do_l0) { FILE *df=fopen(dbg_l0,"ab"); if(df){fwrite(ff1+(size_t)(S-1)*t->inter,sizeof(float),t->inter,df); fwrite(ff2+(size_t)(S-1)*t->inter,sizeof(float),t->inter,df); fclose(df);} }
         for (size_t i=0;i<(size_t)S*t->inter;i++) ff1[i] = silu(ff1[i]) * ff2[i];
         matmul_linear(xb, ff1, &L->down, S);
         for (size_t i=0;i<(size_t)S*D;i++) x[i] += xb[i];
+        if (do_l0) { FILE *df=fopen(dbg_l0,"ab"); if(df){fwrite(x+(size_t)(S-1)*D,sizeof(float),D,df); fclose(df);} }
+        if (dump_layers && dump_layers[0]) { FILE *df=fopen(dump_layers,"ab"); if(df){fwrite(x+(size_t)(S-1)*D,sizeof(float),D,df); fclose(df);} }
     }
     /* logits for last token */
     float *last = x + (size_t)(S-1)*D;
     rmsnorm(xb, last, t->final_norm, D, t->rms_eps);
+    const char *dump_lh = getenv("QWEN3_ASR_DUMP_LAST_HIDDEN");
+    if (dump_lh && dump_lh[0]) { FILE *df=fopen(dump_lh,"ab"); if(df){fwrite(xb,sizeof(float),D,df); fclose(df);} }
     if (t->lm_head_ggml) {
         ColiTensorView lv; memset(&lv,0,sizeof(lv));
         lv.format = COLI_TENSOR_GGML; lv.data = t->lm_head_ggml;
