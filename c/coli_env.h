@@ -230,6 +230,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_CUDA_ROUTER",                 CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_CUDA_SHARED_W4A16",           CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_CUDA_SHARED_W4A16_MIN_ROWS",  CE_INT   , CE_COLIBRI                                      , 0             , NULL},
+    {"COLI_CUDA_SK_PART", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_TC_F16", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_TC_GEMM", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_TC_INT4", CE_INT, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
