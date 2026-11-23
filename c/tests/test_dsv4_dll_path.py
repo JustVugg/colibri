@@ -71,7 +71,7 @@ class Dsv4DllPath(unittest.TestCase):
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
-    def run_engine(self, dll=None, binary=None, path=None, cwd=None):
+    def run_engine(self, dll=None, binary=None, path=None, cwd=None, extra=None, code=0):
         # this test's own DSV4_TEST_* would be "[env] unknown variable" lines
         env = {k: v for k, v in os.environ.items()
                if k.upper() not in ("COLI_DSV4_DLL", "DSV4_CUDA") and not k.upper().startswith("DSV4_TEST_")}
@@ -79,10 +79,14 @@ class Dsv4DllPath(unittest.TestCase):
             env["COLI_DSV4_DLL"] = str(dll)
         if path is not None:
             env["PATH"] = path
+        env.update(extra or {})
         args = [str(binary or BINARY), str(self.fixture), "<t001><t002><t003>", "--raw-prompt", "--max-tokens", "2"]
         result = subprocess.run(args, env=env, cwd=cwd or self.cwd, capture_output=True, text=True,
                                 encoding="utf-8", errors="replace", timeout=300, stdin=subprocess.DEVNULL)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        if code == 0:
+            self.assertEqual(result.returncode, 0, result.stderr)
+        else:
+            self.assertNotEqual(result.returncode, 0, result.stderr)
         return result.stderr
 
     def test_runtime_only_on_path(self):
@@ -107,6 +111,14 @@ class Dsv4DllPath(unittest.TestCase):
         log = self.run_engine(self.dll.as_posix(), path=path)
         self.assertIn("present, but a DLL it needs is missing (the CUDA runtime cudart64_*.dll", log)
         self.assertIn(f"tried {self.dll}, Windows error 126", log)
+        self.assertIn("v4_gpu warning=backend-unavailable; continuing-CPU", log)
+
+    def test_require_stops_the_cpu_fallback(self):
+        bogus = Path(self.tmp.name) / "missing" / self.dll.name
+        log = self.run_engine(bogus.as_posix(), extra={"DSV4_CUDA_REQUIRE": "1"}, code=1)
+        self.assertIn("v4_gpu error=gpu-required (backend-unavailable)", log)
+        # the same DLL without the switch falls back and runs, as before
+        log = self.run_engine(bogus.as_posix())
         self.assertIn("v4_gpu warning=backend-unavailable; continuing-CPU", log)
 
     def test_too_long_path_is_named(self):

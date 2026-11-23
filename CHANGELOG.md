@@ -5,6 +5,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### New
+
+- **`DSV4_CUDA_REQUIRE=1` makes DeepSeek V4 exit when its GPU tier does not start** (missing
+  backend DLL or CUDA runtime, init failure, unsupported device), with the cause on stderr,
+  instead of running the whole model on the CPU at a fraction of the speed. Default off.
+
 ## [2.2.0] - 2026-11-21
 
 ### New

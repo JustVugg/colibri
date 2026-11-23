@@ -569,6 +569,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"DSV4_CUDA_PIN_HOST",               CE_STR   , CE_DSV4                                         , 0             , NULL},
     {"DSV4_CUDA_QKV_FUSED",              CE_STR   , CE_DSV4                                         , 0             , NULL},
     {"DSV4_CUDA_REPLICATED_TP2",         CE_STR   , CE_DSV4                                         , 0             , NULL},
+    {"DSV4_CUDA_REQUIRE", CE_BOOL, CE_DSV4, 0, NULL},
     {"DSV4_CUDA_RESIDENT_EXPERTS", CE_STR, CE_DSV4, 0, NULL},
     {"DSV4_CUDA_RESIDENT_INDEXER", CE_BOOL, CE_DSV4, 0, NULL},
     {"DSV4_CUDA_RESIDENT_RESERVE_MB", CE_INT, CE_DSV4, 0, NULL},

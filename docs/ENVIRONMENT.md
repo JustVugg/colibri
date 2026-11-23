@@ -795,6 +795,7 @@ chunks, prefix checkpoints, expert I/O, speculative decoding, profilers). It is
 documented with defaults in
 [deepseek-v4.md — Environment reference](deepseek-v4.md#environment-reference-v4-engine);
 the ones you are most likely to set: `DSV4_CUDA` (GPU tier on/off),
+`DSV4_CUDA_REQUIRE=1` (exit 1 instead of a silent CPU fallback),
 `COLI_CUDA_ATTN_BATCH=1`, `COLI_CUDA_MOE_BATCH=1`, `DSV4_CUDA_EXPERT_MIRRORS`,
 `V4_MOE_REFILL_GROUP`, `V4_PREFILL_SEGMENT`, `V4_PREFIX_CKPT*`, `CTX`.
 `COLI_V4_SAVE_USAGE=0` is an engine-specific alias that disables only V4's
