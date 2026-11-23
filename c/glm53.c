@@ -4512,10 +4512,7 @@ __attribute__((noinline)) static double now_s(void) {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
     return t.tv_sec + t.tv_nsec * 1e-9;
 }
-static double rss_gb(void) {
-    struct rusage r; getrusage(RUSAGE_SELF, &r);
-    return r.ru_maxrss / 1e6;             /* ru_maxrss e' in KB anche su Windows */
-}
+static double rss_gb(void) { return compat_rss_gb(); }
 
 static float g_temp = 0.0f, g_topp = 1.0f;
 

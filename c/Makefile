@@ -2528,6 +2528,9 @@ tests/test_st_overlay$(EXE): tests/test_st_overlay.c
 tests/test_compat_mem$(EXE): tests/test_compat_mem.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_compat_rss$(EXE): tests/test_compat_rss.c compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_compat_cgroup$(EXE): tests/test_compat_cgroup.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
