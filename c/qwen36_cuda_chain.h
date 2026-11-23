@@ -308,6 +308,14 @@ static int q36cc_kvh(void) {
     if (on < 0) { const char *e = getenv("COLI_CUDA_KV16"); on = !(e && *e == '0'); }
     return on && q36_kv16() && cc_kvh_ready();
 }
+static int q36cc_swiglu_override(void) {
+    const char *e = getenv("COLI_CUDA_FUSED_SWIGLU");
+    return e ? *e != '0' : -1;
+}
+static int q36cc_shared_swiglu(const Q36CChain *ch) {
+    int override = q36cc_swiglu_override();
+    return (override < 0 ? q36cc_permits(ch, Q36_SHARED_SWIGLU) : override) && cc_matmul_swiglu_ready();
+}
 static size_t q36cc_kves(void) { return q36cc_kvh() ? 2 : sizeof(float); }   /* a mirror's element */
 /* a step's float32 K or V rows into a mirror */
 static int q36cc_kv_put(CcBuf *dst, CcBuf *src, const CcRegion *r, int n) {
@@ -600,6 +608,8 @@ static Q36CChain *q36cc_setup(Model *m, int mux_slots, const Q36Checkpoint *chec
                     "%.1f MiB of router, b|a and gate rows, %.0f MB of DeltaNet state\n",
             L, ch->dev, ch->n_attn, np * 4 / 1048576.0, own / 1048576.0,
             (double)(L - ch->n_attn) * ((double)vh * c->dn_kdim * c->dn_vdim + (double)conv_dim * (convk - 1)) * 4 / 1e6);
+    if (ch->device_profile && !q36_has_request_rules(ch->device_profile)) fprintf(stderr, "[chain] qwen36: %s\n", q36cc_shared_swiglu(ch) ? "the shared expert's gate, up and SwiGLU in one launch (matmul_swiglu)"
+                                                                  : "the shared expert's gate, up and SwiGLU in three launches");
     return ch;
 }
 
@@ -1441,7 +1451,11 @@ static int q36cc_shared(Q36CChain *ch, Model *m, Layer *l, int i, int n) {
     int ok = 1, SI = l->sh_I; (void)m;   /* shared_inter, or a Flint dense layer's MLP width */
     if (SI > 0) {
         CcEw p = {CC_EW_SWIGLU, n * SI, SI, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
-        int glu = cc_matmul_glu(ch->t_shg[i], ch->t_shu[i], ch->h2, ch->hs, n);   /* the gate's and up's sums in one pass */
+        int glu = -1;
+        if (!ch->device_profile || (q36_has_request_rules(ch->device_profile) && !q36cc_permits(ch, Q36_SHARED_SWIGLU) && q36cc_swiglu_override() < 0))
+            glu = cc_matmul_glu(ch->t_shg[i], ch->t_shu[i], ch->h2, ch->hs, n);
+        else if (q36cc_shared_swiglu(ch) && !l->sh_g.gq && !l->sh_u.gq)
+            glu = cc_matmul_swiglu(ch->t_shg[i], ch->t_shu[i], ch->h2, 0, ch->hs, 0, n);
         ok = glu > 0 || (glu < 0 && cc_matmul(ch->t_shg[i], ch->h2, 0, ch->gs, 0, n) &&
                                     cc_matmul(ch->t_shu[i], ch->h2, 0, ch->us, 0, n) &&
                                     cc_ew(ch->hs, ch->gs, ch->us, NULL, NULL, &p));

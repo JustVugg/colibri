@@ -762,6 +762,38 @@ static void test_routed_fetches(void) {
        "no staged chunk has a layer the host serves inside the frame: the wait for the routes cannot block");
 }
 
+/* The shared expert takes one fused operation per layer on prompt and decode rows. */
+static void shared_swiglu_steps(Weights *w, Model *ref, const int *ids) {
+    Model r4, m4; build_model(&r4, w); build_model(&m4, w);
+    share_trunk(&r4, ref); share_trunk(&m4, ref);
+    fake_chain_table.size = sizeof(ColiCudaChainOps);
+    Q36CChain *c4 = q36cc_setup(&m4, 1, NULL);
+    ck(c4 != NULL && c4->ok && cc_matmul_swiglu_ready(), "a backend with matmul_swiglu: the chain set up");
+    ck(c4 && !c4->device_profile && !fake_active_profile, "the tiny int8 fixture uses normal dispatch after setup");
+    c4->device_profile = cc_select_qwen36_profile(1);   /* exercise the device profile on the small host reference */
+    ck(c4->device_profile && fake_active_profile, "the extended table selects the device profile for the fusion checks");
+    g_cuda_chain = 1;
+    int sw0 = fake_matmul_swiglus;
+    float *lr = step_ex(&r4, ids, 3, 0, 1); r4.kv_len = 3;
+    float *lc = step_ex(&m4, ids, 3, 0, 1); m4.kv_len = 3;
+    same_logits(lc, lr, V, "matmul_swiglu: three prompt rows");
+    free(lr); free(lc);
+    ck(fake_matmul_swiglus - sw0 == NL, "matmul_swiglu: a step's shared expert gate, up and SwiGLU in one op per layer");
+    for (int t = 3; t < 6; t++) {
+        int sw1 = fake_matmul_swiglus;
+        lr = step_ex(&r4, ids + t, 1, t, 1); r4.kv_len = t + 1;
+        lc = step_ex(&m4, ids + t, 1, t, 1); m4.kv_len = t + 1;
+        same_logits(lc, lr, V, "matmul_swiglu: a decode row");
+        ck(fake_matmul_swiglus - sw1 == NL, "matmul_swiglu: one fused op per layer on decode");
+        free(lr); free(lc);
+    }
+    g_cuda_chain = 0;
+    ck(!cc_select_qwen36_profile(0) && !fake_active_profile, "disabling the device profile restores normal dispatch");
+    fake_chain_table.size = offsetof(ColiCudaChainOps, select_qwen36_profile);
+    ck(!cc_select_qwen36_profile(1) && !fake_active_profile, "a table ending before select_qwen36_profile cannot select it");
+    fake_chain_table.size = CC_OPS_BASE_SIZE;
+}
+
 /* Make new mirror storage distinguishable from an explicitly zeroed attention ring. */
 static CcBuf *mirror_marked_buf(size_t bytes, int kind) {
     CcBuf *b = fcc_buf(bytes, kind);
@@ -1131,6 +1163,9 @@ int main(int argc, char **argv) {
         g_cuda_chain = 0;
     }
     fake_chain_table.size = CC_OPS_BASE_SIZE;
+
+    printf(" G2. the shared expert in one op (matmul_swiglu)\n");
+    shared_swiglu_steps(&w, &ref, ids);
 
     printf(" H. the MTP head on the CUDA chain: its drafts picked on the device\n");
     /* the whole vocabulary or the adaptive list: picked on the device; a listed vocabulary, or a

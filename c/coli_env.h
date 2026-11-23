@@ -203,6 +203,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_CUDA_F32T", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_F8_WARP", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_FLUSH", CE_BOOL, CE_QWEN | CE_QWEN38, 0, NULL},
+    {"COLI_CUDA_FUSED_SWIGLU", CE_BOOL, CE_QWEN, 0, NULL}, /* Fuse shared-expert projections with SwiGLU where supported. Defaults to the active profile. */
     {"COLI_CUDA_G53_ROWS", CE_INT, CE_GLM53, 0, NULL},
     {"COLI_CUDA_GEMV_I2F", CE_INT, CE_QWEN, 0, NULL}, /* Integer-to-float GEMV kernel mode. Default 1. */
     {"COLI_CUDA_GEMV_NR", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
