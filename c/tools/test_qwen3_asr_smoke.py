@@ -14,6 +14,15 @@ def main():
     ap.add_argument("--oracle", default="c/testdata/qwen3_asr_hello/transcript.txt")
     ap.add_argument("--timeout", type=int, default=300)
     args = ap.parse_args()
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(os.path.dirname(here))
+    def R(p):
+        if os.path.isabs(p): return p
+        if os.path.exists(p): return os.path.abspath(p)
+        return os.path.join(repo, p)
+    args.engine = R(args.engine)
+    args.wav = R(args.wav)
+    args.oracle = R(args.oracle)
     expected = open(args.oracle).read().strip() if os.path.exists(args.oracle) else None
     cmd = [args.engine, "--model", args.model, "--serve"]
     t0 = time.time()

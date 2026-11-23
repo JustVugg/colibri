@@ -1479,6 +1479,12 @@ endif
 qwen3_asr$(EXE): qwen3_asr.c $(VK_OBJ) $(VK_SPV) .build-config
 	$(CC) $(CFLAGS) qwen3_asr.c $(VK_OBJ) -o qwen3_asr$(EXE) $(LDFLAGS)
 
+QWEN3_ASR_MODEL ?= $(HOME)/.cache/huggingface/hub/models--Qwen--Qwen3-ASR-1.7B/snapshots/7278e1e70fe206f11671096ffdd38061171dd6e5
+.PHONY: test-qwen3-asr
+test-qwen3-asr: qwen3_asr$(EXE)
+	@if [ ! -d "$(QWEN3_ASR_MODEL)" ]; then echo "skip: QWEN3_ASR_MODEL not found: $(QWEN3_ASR_MODEL)"; exit 0; fi
+	python3 tools/test_qwen3_asr_smoke.py --engine ./qwen3_asr$(EXE) --model "$(QWEN3_ASR_MODEL)"
+
 # Tiny Laya checkpoint + the laya package's own answers on it. The generator is
 # numpy and deterministic; laya_tiny/ref.json is committed and comes from the
 # `laya` package (tools/make_laya_ref.py, maintainer-run, fixture SHA-256
