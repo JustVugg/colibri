@@ -5,6 +5,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed
+
+- **qwen38: a RAM expert cache smaller than a decode step's distinct experts no longer turns
+  off the grouped decode and the CUDA chain's in-frame experts.** `q38_moe_decode_grouped`
+  takes the distinct experts in waves of at most the cache's slots (each wave loaded, computed
+  and noted to the tier before the next recycles its slots), so `q38cc_dm_able` needs one slot
+  a layer instead of `Q38CC_DM_ROWS` x top-k. With the cache large enough it is one wave, as
+  before; the arithmetic per assignment is unchanged.
+
 ## [2.2.0] - 2026-11-21
 
 ### New
