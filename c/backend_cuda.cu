@@ -5287,6 +5287,9 @@ static void *gemv_sk_part(DeviceContext *ctx, cudaStream_t st, size_t bytes) {
     if (k >= 0) return ctx->skp[k].cap >= bytes ? ctx->skp[k].p : NULL;
     for (int i = 0; i < 8 && k < 0; i++) if (!ctx->skp[i].p) k = i;
     if (k < 0) return NULL;
+    /* a stream being captured takes the allocator's nodes: a cudaMalloc there would end the capture */
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(st, &cs) != cudaSuccess || cs != cudaStreamCaptureStatusNone) { (void)cudaGetLastError(); return NULL; }
     size_t cap = bytes < ((size_t)8 << 20) ? ((size_t)8 << 20) : bytes;   /* 8 MiB: 8 splits x 8 rows x 32768 outputs */
     void *p = NULL;
     if (cudaMalloc(&p, cap) != cudaSuccess) { (void)cudaGetLastError(); return NULL; }

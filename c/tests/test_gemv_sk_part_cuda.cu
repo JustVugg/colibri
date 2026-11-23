@@ -18,7 +18,9 @@
  *      them; the test lowers the recorded capacity (this file includes backend_cuda.cu) and
  *      checks the call takes the allocator, leaves the buffer where it was and gives the same y;
  *   4. the call captured in a CUDA graph and replayed twice: the same y as the eager call (with
- *      the switch on the graph keeps the buffer's address; off, it holds the allocator's nodes).
+ *      the switch on the graph keeps the buffer's address; off, it holds the allocator's nodes);
+ *   5. a stream's first call made while the stream is captured: no buffer then (a cudaMalloc would
+ *      end the capture), the allocator's nodes, the eager call's bits; the next eager call makes it.
  * With the switch on the child also checks that every buffer stays at its first address; off,
  * that no buffer was made.
  *
@@ -215,6 +217,40 @@ static int sk_child(const char *path) {
         if (on) SK_CHECK(ctx->skp[sk_slot(ctx, gs)].p == p, "the stream's buffer moved under the graph");
         if (ge) cudaGraphExecDestroy(ge);
         if (g) cudaGraphDestroy(g);
+
+        /* 5. the first call on a stream made while that stream is captured (thread-local mode, as the
+         * engine's captures): no buffer may be made then (a cudaMalloc would end the capture), the
+         * call takes the allocator's nodes; the next eager call makes the buffer. One slot is
+         * emptied first so the stream could get one. */
+        if (on) {
+            int k = sk_slot(ctx, ss[6]);
+            SK_CHECK(k >= 0, "the seventh stream has no buffer");
+            if (k >= 0) { cudaDeviceSynchronize(); cudaFree(ctx->skp[k].p); ctx->skp[k].p = nullptr; ctx->skp[k].cap = 0; ctx->skp[k].st = nullptr; }
+        }
+        cudaStream_t cs;
+        if (cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking) != cudaSuccess) return 2;
+        g = nullptr; ge = nullptr;
+        ok = cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal) == cudaSuccess;
+        launched = ok && coli_cuda_tensor_gemm_async(hc.t, y_dev, x_dev, 3, cs);
+        ok = cudaStreamEndCapture(cs, &g) == cudaSuccess && ok && launched;
+        ok = ok && cudaGraphInstantiate(&ge, g, 0) == cudaSuccess;
+        SK_CHECK(ok, "graph capture of a stream's first call: %s", cudaGetErrorString(cudaGetLastError()));
+        (void)cudaGetLastError();
+        SK_CHECK(sk_slot(ctx, cs) < 0, "a buffer was made while the stream was captured");
+        std::vector<float> y(eager.size());
+        int rok = ok && cudaMemsetAsync(y_dev, 0xff, y.size() * sizeof(float), cs) == cudaSuccess &&
+                  cudaGraphLaunch(ge, cs) == cudaSuccess &&
+                  cudaMemcpyAsync(y.data(), y_dev, y.size() * sizeof(float), cudaMemcpyDeviceToHost, cs) == cudaSuccess &&
+                  cudaStreamSynchronize(cs) == cudaSuccess;
+        SK_CHECK(rok, "replay of the graph of a stream's first call: %s", cudaGetErrorString(cudaGetLastError()));
+        SK_CHECK(!rok || y == eager, "the graph of a stream's first call: not the eager call's bits");
+        out.insert(out.end(), y.begin(), y.end());
+        if (ge) cudaGraphExecDestroy(ge);
+        if (g) cudaGraphDestroy(g);
+        std::vector<float> y3; sk_run("10240 x 320, 3 rows, after the capture", hc, x_dev, xs, y_dev, 3, cs, y3);
+        SK_CHECK(y3 == eager, "the call after the capture: not the eager call's bits");
+        if (on) SK_CHECK(sk_slot(ctx, cs) >= 0, "no buffer for the stream after an eager call");
+        cudaStreamDestroy(cs);
     }
 
     coli_cuda_tensor_free(hc.t);
