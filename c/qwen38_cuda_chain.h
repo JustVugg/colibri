@@ -3621,8 +3621,9 @@ static void q38cc_pd_end(Q38CChain *ch, int S, int pd, double sec) {
  * as by the ops. With the switch a verify's rollback copies the DeltaNet copies' bits into the
  * live buffers instead of swapping them (the graphs hold their addresses). A capture an op broke
  * or the stream refused turns the switch off and frees every graph: the ops run one by one. Not
- * with the routed experts in the frame (a GGUF's), DFlash2's drafter or a prompt's rows. The
- * [chain] line's ops and matmuls count a graph's ops once, when it was captured. */
+ * with the routed experts in the frame (a GGUF's), DFlash2's drafter or a prompt of more than
+ * Q38_SPEC_ROWS rows. The [chain] line's ops and matmuls count a graph's ops once, when it was
+ * captured. */
 static unsigned long long q38g_mix(unsigned long long h, const void *p) {   /* FNV-1a over the address */
     uintptr_t v = (uintptr_t)p;
     for (size_t k = 0; k < sizeof v; k++) { h ^= (unsigned char)(v >> (8 * k)); h *= 0x100000001b3ULL; }

@@ -896,10 +896,12 @@ the second and replayed after; a capture that breaks turns the switch off for th
 runs the same kernels with the same arguments in the same order: the bits of the ops. Measured
 on an RTX 5090 (Windows, Qwen3.8-Flash-Next FP8, RAM cache 4/layer, uploads synchronous so the
 residency is a function of the routes), 64 greedy tokens, off/on/on/off: the decode step's time
-outside the routed experts 43.9 / 26.4 / 27.3 / 40.8 ms, the last logits byte-identical in all
-four runs. On this machine the FP8 decode is bound by the expert reads (about 350 ms a step), so
-the served decode moved 1-5 % (2.35-4.48 -> 2.36-4.67 tok/s, the same text and the same expert
-hits); with the experts mostly in VRAM the dense part is a larger share of the step.
+outside the routed experts (a lab-only timer, not in the tree) 43.9 / 26.4 / 27.3 / 40.8 ms,
+the last logits byte-identical in all four runs. On this machine the FP8 decode is bound by
+the expert reads (about 350 ms a step), so the whole step is within noise (421.9 / 395.8 /
+391.6 / 392.4 ms), and the served decode, one session per arm and so indicative, moved 1-5 %
+(2.35-4.48 -> 2.36-4.67 tok/s, the same text and the same expert hits); with the experts mostly
+in VRAM the dense part is a larger share of the step.
 
 `tests/test_qwen38_cuda_chain.c` (`make qwen38-cuda-chain-check`, in CI beside
 `qwen38-dn-gpu-check`) runs the tiny FP8 fixture's oracle on the fake tier with the
