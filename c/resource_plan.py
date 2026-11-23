@@ -2292,7 +2292,7 @@ def _cgroup_file_cache(directory, v1=False):
     return cache
 
 
-def _cgroup_pair_remaining(directory, limit_name, current_name, v1=False):
+def _cgroup_pair_remaining(directory, limit_name, current_name, v1=False, whole=False):
     """Return ``(controls_present, finite_remaining_or_none)`` for one cgroup.
 
     Present controls with ``None`` remaining are the kernel's unlimited value
@@ -2301,6 +2301,7 @@ def _cgroup_pair_remaining(directory, limit_name, current_name, v1=False):
     refusal, never something a looser ancestor may mask. Headroom is measured
     against the working set, charged usage less reclaimable file cache
     (inactive and active), so cached model pages do not read as spent budget.
+    ``whole`` returns the limit itself, not what is left of it.
     """
     directory = Path(directory)
     limit_path = directory / limit_name
@@ -2324,6 +2325,8 @@ def _cgroup_pair_remaining(directory, limit_name, current_name, v1=False):
         raise CgroupFormatError(f"malformed cgroup memory limit: {limit_path}")
     if v1 and limit >= _CGROUP_V1_UNLIMITED_MIN:
         return (True, None)
+    if whole:
+        return (True, limit)
     working_set = max(0, current - _cgroup_file_cache(directory, v1=v1))
     return (True, max(0, limit - working_set))
 
@@ -2454,7 +2457,7 @@ def _resolve_cgroup_hierarchy(mounts, member, *, v1=False, controller="memory"):
     return sorted(views, key=lambda mount: len(mount.root))
 
 
-def _cgroup_hierarchy_remaining(views, member, limit_name, current_name, v1=False):
+def _cgroup_hierarchy_remaining(views, member, limit_name, current_name, v1=False, whole=False):
     """Return ``(controls_seen, tightest finite headroom)`` across every view.
 
     Each view is walked from the membership leaf up to and including its mount
@@ -2468,7 +2471,7 @@ def _cgroup_hierarchy_remaining(views, member, limit_name, current_name, v1=Fals
         for depth in range(len(suffix), -1, -1):
             directory = mount.mount_point.joinpath(*suffix[:depth])
             present, candidate = _cgroup_pair_remaining(
-                directory, limit_name, current_name, v1=v1)
+                directory, limit_name, current_name, v1=v1, whole=whole)
             seen = seen or present
             if candidate is not None:
                 remaining = candidate if remaining is None else min(remaining, candidate)
@@ -2488,7 +2491,7 @@ def _fixed_root_view(root, v1=False):
 
 def _cgroup_memory_remaining(cgroup_root=Path("/sys/fs/cgroup"),
                              proc_cgroup_path=Path("/proc/self/cgroup"),
-                             proc_mountinfo_path=Path("/proc/self/mountinfo")):
+                             proc_mountinfo_path=Path("/proc/self/mountinfo"), whole=False):
     """Return this process's tightest finite cgroup memory headroom, or ``None``.
 
     Cgroup v2 is authoritative when its memory controls are visible; v1 is
@@ -2497,6 +2500,7 @@ def _cgroup_memory_remaining(cgroup_root=Path("/sys/fs/cgroup"),
     all). Present but malformed, incomplete or unreadable inputs raise
     ``CgroupError`` instead of reading as unconstrained. ``cgroup_root`` is
     consulted only by the fixed-layout probe used when mountinfo is absent.
+    ``whole`` gives the tightest finite limit itself, not the headroom under it.
     """
     memberships = _read_cgroup_memberships(proc_cgroup_path)
     mounts = _read_cgroup_mounts(proc_mountinfo_path)
@@ -2511,7 +2515,7 @@ def _cgroup_memory_remaining(cgroup_root=Path("/sys/fs/cgroup"),
                   (cgroup_root, v1_member, _CGROUP_V1_CONTROLS, True))
         for root, member, controls, v1 in probes:
             seen, remaining = _cgroup_hierarchy_remaining(
-                [_fixed_root_view(root, v1=v1)], member or (), *controls, v1=v1)
+                [_fixed_root_view(root, v1=v1)], member or (), *controls, v1=v1, whole=whole)
             if seen:
                 return remaining
         return None
@@ -2535,7 +2539,8 @@ def _cgroup_memory_remaining(cgroup_root=Path("/sys/fs/cgroup"),
         if not views:
             raise CgroupAccessError(
                 f"no visible cgroup2 mount exposes cgroup /{'/'.join(v2_member)}")
-        seen, remaining = _cgroup_hierarchy_remaining(views, v2_member, *_CGROUP_V2_CONTROLS)
+        seen, remaining = _cgroup_hierarchy_remaining(
+            views, v2_member, *_CGROUP_V2_CONTROLS, whole=whole)
         if seen:
             return remaining
     if has_v1_memory_mount:
@@ -2544,7 +2549,7 @@ def _cgroup_memory_remaining(cgroup_root=Path("/sys/fs/cgroup"),
             raise CgroupAccessError(
                 f"no visible cgroup v1 memory mount exposes cgroup /{'/'.join(v1_member)}")
         seen, remaining = _cgroup_hierarchy_remaining(
-            views, v1_member, *_CGROUP_V1_CONTROLS, v1=True)
+            views, v1_member, *_CGROUP_V1_CONTROLS, v1=True, whole=whole)
         if not seen:
             raise CgroupAccessError("cgroup v1 memory mount exposes no memory control files")
         return remaining
@@ -2686,6 +2691,23 @@ def memory_available(*, meminfo_path=Path("/proc/meminfo"),
         except (OSError, subprocess.SubprocessError):
             pass
     return None
+
+
+def memory_limit(*, cgroup_root=Path("/sys/fs/cgroup"),
+                 proc_cgroup_path=Path("/proc/self/cgroup"),
+                 proc_mountinfo_path=Path("/proc/self/mountinfo")):
+    """The memory this process is confined to, in bytes; ``None`` when nothing confines it.
+
+    The tightest finite cgroup memory limit on Linux (a container's ``--memory``), read
+    through the same hierarchy walk as ``memory_available``, whose refusals
+    (``CgroupError``) it shares. What a machine "has" for a caller that sizes a model
+    choice by total RAM: MemTotal is the host's, and the limit is where this process is
+    killed.
+    """
+    if not sys.platform.startswith("linux"):
+        return None
+    return _cgroup_memory_remaining(cgroup_root=cgroup_root, proc_cgroup_path=proc_cgroup_path,
+                                    proc_mountinfo_path=proc_mountinfo_path, whole=True)
 
 
 def _host_unified_memory():
