@@ -667,6 +667,44 @@ def _tool_param_order(tools):
     return out
 
 
+def _declared_kinds(declared, root, depth=8):
+    """The JSON types a tool parameter's schema declares, or None when it declares none.
+
+    One reader for every family's tool-call parser. Besides `type` (a name or a list), the
+    spellings pydantic and FastMCP write: `anyOf`/`oneOf` (Optional[int] is
+    {"anyOf": [{"type": "integer"}, {"type": "null"}]}) as the union of their branches, a
+    branch that declares nothing as None in the list; `allOf` as its first typed branch; and
+    a `$ref` into the tool's own parameters (a nested model is {"$ref": "#/$defs/Filters"}),
+    `root` being those parameters."""
+    if not isinstance(declared, dict) or depth <= 0:
+        return None
+    kind = declared.get("type")
+    if kind is not None:
+        return kind if isinstance(kind, list) else [kind]
+    ref = declared.get("$ref")
+    if isinstance(ref, str) and ref.startswith("#/"):
+        node = root
+        for part in ref[2:].split("/"):
+            node = node.get(part.replace("~1", "/").replace("~0", "~")) if isinstance(node, dict) else None
+        return _declared_kinds(node, root, depth - 1)
+    for key in ("anyOf", "oneOf"):
+        branches = declared.get(key)
+        if isinstance(branches, list) and branches:
+            return [kind for branch in branches
+                    for kind in (_declared_kinds(branch, root, depth - 1) or [None])]
+    branches = declared.get("allOf")
+    for branch in branches if isinstance(branches, list) else ():
+        kinds = _declared_kinds(branch, root, depth - 1)
+        if kinds:
+            return kinds
+    return None
+
+
+def _declared_type(declared, root):
+    """The one type the GLM-form parsers coerce to: the first declared that is not null."""
+    return next((kind for kind in _declared_kinds(declared, root) or () if kind != "null"), None)
+
+
 def _tool_param_types(tools):
     """name -> {param: declared JSON-schema type}. The model emits every argument as text;
     without the schema a string-typed value that happens to look numeric ("12345" for an
@@ -682,14 +720,7 @@ def _tool_param_types(tools):
         types = {}
         for key, spec in props.items():
             if isinstance(spec, dict):
-                t = spec.get("type")
-                branches = spec.get("anyOf", spec.get("oneOf"))
-                if t is None and isinstance(branches, list):
-                    # pydantic's Optional[str]: {"anyOf": [{"type": "string"}, {"type": "null"}]}
-                    t = [b.get("type") for b in branches if isinstance(b, dict)]
-                if isinstance(t, list):          # {"type": ["string", "null"]}
-                    t = next((x for x in t if x != "null"), None)
-                types[key] = t
+                types[key] = _declared_type(spec, fn.get("parameters"))
         out[name] = types
     return out
 
@@ -887,10 +918,7 @@ def parse_glm_tool_calls_strict(reply, tools):
             key, value = match.groups()
             if key not in properties or key in args or re.search(r"</?arg_(?:key|value)|</?tool_call", value):
                 invalid("unknown, duplicate, or malformed argument")
-            spec = properties[key] if isinstance(properties[key], dict) else {}
-            declared_type = spec.get("type")
-            if isinstance(declared_type, list):
-                declared_type = next((item for item in declared_type if item != "null"), None)
+            declared_type = _declared_type(properties[key], params)
             parsed = _coerce_arg(value, declared_type, literal=False)
             valid = (declared_type in (None, "string") or
                      (declared_type == "integer" and type(parsed) is int) or
@@ -2943,10 +2971,9 @@ def _muse_unattr(text):
             .replace("&quot;", '"').replace("&amp;", "&"))
 
 
-def _muse_value(raw, schema):
+def _muse_value(raw, schema, root=None):
     """A parameter's text as its schema types it: strings as written, JSON for the rest."""
-    kind = schema.get("type") if isinstance(schema, dict) else None
-    kinds = kind if isinstance(kind, list) else [kind]
+    kinds = _declared_kinds(schema, root) or [None]
     if "string" in kinds:
         # the template writes None as `null`, and every string as is
         return None if raw == "null" and "null" in kinds else raw
@@ -2967,10 +2994,12 @@ def parse_muse_tool_calls(reply, tools):
     tool's schema. Returns (content, tool_calls); the content is the text outside the blocks,
     an unfinished block cut off."""
     schemas = {}
+    roots = {}
     for tool in tools or []:
         fn = tool.get("function", tool) if isinstance(tool, dict) else {}
         if isinstance(fn, dict) and isinstance(fn.get("name"), str):
             schemas[fn["name"]] = ((fn.get("parameters") or {}).get("properties") or {})
+            roots[fn["name"]] = fn.get("parameters")
     calls, content, rest = [], [], reply
     while True:
         start = rest.find(MUSE_ATEM_OPEN)
@@ -2988,7 +3017,7 @@ def parse_muse_tool_calls(reply, tools):
             args = {}
             for key, raw in _MUSE_PARAM.findall(body):
                 key = _muse_unattr(key)
-                args[key] = _muse_value(raw, props.get(key))
+                args[key] = _muse_value(raw, props.get(key), roots.get(name))
             calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
                           "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
         rest = rest[end + len(MUSE_ATEM_CLOSE):]
@@ -3236,38 +3265,6 @@ QWEN_FUNCTION_RE = re.compile(r"<function=([^>\n]+)>\s*(.*?)</function>", re.S)
 QWEN_PARAM_RE = re.compile(r"<parameter=([^>\n]+)>\n(.*?)\n</parameter>", re.S)
 
 
-def _qwen_kinds(declared, root, depth=8):
-    """The JSON types a parameter's schema declares, or None when it declares none.
-
-    Besides `type`, the spellings pydantic and FastMCP write: `anyOf`/`oneOf` (Optional[int]
-    is {"anyOf": [{"type": "integer"}, {"type": "null"}]}) as the union of their branches,
-    `allOf` as its first typed branch, and a `$ref` into the tool's own parameters
-    (a nested model is {"$ref": "#/$defs/Filters"})."""
-    if not isinstance(declared, dict) or depth <= 0:
-        return None
-    kind = declared.get("type")
-    if kind is not None:
-        return kind if isinstance(kind, list) else [kind]
-    ref = declared.get("$ref")
-    if isinstance(ref, str) and ref.startswith("#/"):
-        node = root
-        for part in ref[2:].split("/"):
-            node = node.get(part.replace("~1", "/").replace("~0", "~")) if isinstance(node, dict) else None
-        return _qwen_kinds(node, root, depth - 1)
-    for key in ("anyOf", "oneOf"):
-        branches = declared.get(key)
-        if isinstance(branches, list) and branches:
-            kinds = [_qwen_kinds(branch, root, depth - 1) for branch in branches]
-            # one branch that declares nothing takes any value: the parameter is untyped
-            return None if None in kinds else [k for found in kinds for k in found]
-    branches = declared.get("allOf")
-    for branch in branches if isinstance(branches, list) else ():
-        kinds = _qwen_kinds(branch, root, depth - 1)
-        if kinds:
-            return kinds
-    return None
-
-
 def _qwen_argument(raw, declared, root=None):
     """Restore declared JSON types, including the template's True/False/None.
 
@@ -3275,8 +3272,8 @@ def _qwen_argument(raw, declared, root=None):
     An untyped parameter stays text, as it did before tool-call recovery. `root` is the
     tool's `parameters`, where a `$ref` is looked up.
     """
-    kinds = _qwen_kinds(declared, root)
-    if kinds is None:
+    kinds = _declared_kinds(declared, root)
+    if kinds is None or None in kinds:   # nothing declared, or a branch that takes any value
         return raw
     value = raw.strip()
     if "null" in kinds and value in ("null", "None"):
