@@ -23,6 +23,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 - **`COLI_MAX_BODY` sets the gateway's request-body cap** (default 4 MiB, as before), for requests
   with several base64 images. **`COLI_BODY_LINGER_S`** (default off) lets a client that is still
   uploading a body over the cap read the 400 instead of a connection reset.
+### New
+
+- **`DSV4_CUDA_REQUIRE=1` makes DeepSeek V4 exit when its GPU tier does not start** (missing
+  backend DLL or CUDA runtime, init failure, unsupported device), with the cause on stderr,
+  instead of running the whole model on the CPU at a fraction of the speed. Default off.
 
 ## [2.2.0] - 2026-11-21
 

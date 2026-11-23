@@ -1060,6 +1060,12 @@ extern unsigned long long g_v4_dec_calls, g_v4_dec_uploads;
 extern double g_v4_dec_total_s, g_v4_dec_fetch_s, g_v4_dec_attach_s, g_v4_dec_gpu_s;
 extern unsigned long long g_v4_gpu_first_hits, g_v4_dec_store_fetches;
 
+/* DSV4_CUDA_REQUIRE: nonzero turns every CPU fallback of the GPU tier's open into an error */
+static inline int coli_v4_gpu_required(void) {
+    const char *s = getenv("DSV4_CUDA_REQUIRE");
+    return s && atoi(s) != 0;
+}
+
 #ifdef COLI_V4_GPU_TIER
 /* Provided by the COLI_V4_UNIT_GPU translation unit. Compiled in only on the
  * Windows CUDA build; every call site elsewhere is guarded by COLI_V4_GPU_TIER
