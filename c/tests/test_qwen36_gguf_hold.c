@@ -1,6 +1,7 @@
 /* Model-free regression: the GGUF CPU MoE (moe_gq_decode, moe_gq_run) holds the
  * slots it computes from, so the PILOT worker's loads cannot evict them and
- * write another expert's bytes under the matmul. */
+ * write another expert's bytes under the matmul. It takes them as ExpertStore
+ * leases: the facade's views and lease rules are checked here too. */
 #define COLI_CACHE_INDEX_TEST 1
 #define main qwen36_main_unused
 #include "../qwen36.c"
@@ -104,6 +105,46 @@ static int differing(int S, const float *x) {
     return bad;
 }
 
+#define CHECK(cond) do { if (!(cond)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); exit(1); } } while (0)
+
+/* the ExpertStore facade: what a view says, and what a lease keeps */
+static void check_store(void) {
+    ColiExpertStore store = q36_gq_expert_store(&M);
+    const GqExp *gx = &M.gqx[0]; LCache *lc = &M.cache[0];
+    ColiExpertView a, b, bad;
+    CHECK(!coli_expert_lookup(&store, (ColiExpertKey){ 0, 1 }, &a));
+    Slot *s = a.lease;
+    CHECK(s->eid == 1 && slot_busy(s) && a.key.layer == 0 && a.key.expert == 1);
+    CHECK(a.gate.format == COLI_TENSOR_GGML && a.gate.block_columns == (uint32_t)gx->hg && a.gate.rows == I && a.gate.columns == D);
+    CHECK(a.up.block_columns == (uint32_t)gx->hu && a.up.rows == I && a.up.columns == D);
+    CHECK(a.down.block_columns == (uint32_t)gx->hd && a.down.rows == D && a.down.columns == I);
+    CHECK(a.gate.data == s->gqe && a.up.data == s->gqe + gx->hb_g && a.down.data == s->gqe + gx->hb_g + gx->hb_u);
+    CHECK((int64_t)a.gate.data_bytes == gx->hb_g && (int64_t)a.up.data_bytes == gx->hb_u && (int64_t)a.down.data_bytes == gx->hb_d);
+    /* a second lease on the same expert is its own: one release leaves the other */
+    CHECK(!coli_expert_lookup(&store, (ColiExpertKey){ 0, 1 }, &b) && b.lease == s);
+    coli_expert_release(&store, &b);
+    CHECK(!b.lease && !b.gate.data && slot_busy(s));
+    coli_expert_release(&store, &b);   /* a cleared view: nothing */
+    CHECK(slot_busy(s));
+    /* the PILOT load takes every other slot of a full cache and never the leased one */
+    for (int round = 0; round < 3; round++) for (int e = 0; e < E; e++) {
+        if (e == 1) continue;
+        pthread_mutex_lock(&g_pilot_mx); M.is_queued[e] = 1; pthread_mutex_unlock(&g_pilot_mx);
+        pilot_realload(&M, 0, e);
+        CHECK(s->eid == 1 && a.gate.data == s->gqe);
+    }
+    CHECK(lc->n == CAP);
+    coli_expert_release(&store, &a);
+    CHECK(!a.lease && !slot_busy(s));
+    /* a key outside the model: no view, no lease */
+    for (int k = 0; k < 4; k++) {
+        memset(&bad, 0xff, sizeof bad);
+        CHECK(coli_expert_lookup(&store, (ColiExpertKey){ k == 0 ? -1 : k == 1 ? 1 : 0, k == 2 ? -1 : k == 3 ? E : 0 }, &bad) != 0);
+        CHECK(!bad.lease && !bad.gate.data);
+    }
+    for (int i = 0; i < lc->n; i++) CHECK(!slot_busy(&lc->slots[i]));
+}
+
 int main(void) {
 #ifdef _OPENMP
     omp_set_num_threads(4);   /* a team of every core fights the loader's thread for them */
@@ -115,6 +156,7 @@ int main(void) {
     setup(path);
     float *x = falloc((int64_t)WIDE * D);
     for (int i = 0; i < WIDE * D; i++) x[i] = sinf(0.37f * (float)i);
+    check_store();
     const int one = differing(1, x), rows = differing(ROWS, x), wide = differing(WIDE, x);
     int busy = 0;
     for (int i = 0; i < M.cache[0].n; i++) busy += slot_busy(&M.cache[0].slots[i]);

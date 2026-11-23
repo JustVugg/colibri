@@ -87,6 +87,7 @@ static int qwen36_max_ctx(void) {
 #include "route_trace.h"   /* the tier's expert history (.coli_usage), kept only while the tier is on */
 #include "draft_vocab.h"   /* the tokens the MTP head scores for a draft (Q36_MTP_VOCAB) */
 #include "expert_ffn.h"    /* routed experts: planar int4 kernel + layer runner */
+#include "expert_store.h"  /* leases on the GGUF experts the CPU MoE reads */
 #include "idot.h"          /* integer dot kernels for the dense trunk (COLI_DENSE_IDOT, COLI_DENSE_BITS) */
 #include "qwen38_vision.h" /* the ViT: the same tower in Qwen3.5/3.6/3.8 (#1757) */
 #include "lfm3_vision.h"   /* LFM3-VL's tower and projector */
@@ -5871,6 +5872,46 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) { expert_fetch(
  * it stays resident until slot_release. */
 static Slot *expert_hold(Model *m, int layer, int eid) { Slot *s; expert_fetch(m, layer, eid, &s, 1); return s; }
 
+/* Borrowed ExpertStore facade over a GGUF model's expert cache: the Model owns the cache and
+ * outlives every facade and lease. A lookup is expert_hold and a release slot_release, so the
+ * PILOT worker cannot evict an expert a view still reads; allocation, the PILOT policy and the
+ * GPU tiers stay with the engine. The views are the three matrices as the slot holds them
+ * (hg/hu/hd, GQ_*_R16 where the rows are interleaved). */
+static ColiTensorView q36_gq_tensor(const uint8_t *data, int type, int rows, int cols) {
+    return (ColiTensorView){ .format = COLI_TENSOR_GGML, .data = data, .rows = rows, .columns = cols,
+                             .block_columns = (uint32_t)type,
+                             .data_bytes = (size_t)rows * (size_t)gq_row_bytes(type, cols) };
+}
+static int q36_gq_store_lookup(ColiExpertStore *store, ColiExpertKey key, ColiExpertView *view) {
+    Model *m = store->state;
+    if (!view) return -1;
+    memset(view, 0, sizeof(*view));
+    if (!m || !m->cache || !m->gqx || key.layer < 0 || key.layer >= m->c.n_layers ||
+        key.expert < 0 || key.expert >= m->c.n_experts) return -1;
+    const GqExp *gx = &m->gqx[key.layer]; const int D = q36_eh(&m->c), I = m->c.inter;
+    Slot *s = expert_hold(m, key.layer, key.expert);
+    view->key = key;
+    view->lease = s;
+    view->gate = q36_gq_tensor(s->gqe, gx->hg, I, D);
+    view->up = q36_gq_tensor(s->gqe + gx->hb_g, gx->hu, I, D);
+    view->down = q36_gq_tensor(s->gqe + gx->hb_g + gx->hb_u, gx->hd, D, I);
+    return 0;
+}
+static void q36_gq_store_release(ColiExpertStore *store, ColiExpertView *view) {
+    (void)store;
+    if (view && view->lease) slot_release(view->lease);
+    if (view) memset(view, 0, sizeof(*view));
+}
+static ColiExpertStore q36_gq_expert_store(Model *m) {
+    static const ColiExpertStoreOps ops = { .lookup = q36_gq_store_lookup, .release = q36_gq_store_release };
+    return (ColiExpertStore){ .ops = &ops, .state = m };
+}
+static void q36_gq_expert_acquire(ColiExpertStore *store, int layer, int expert, ColiExpertView *view) {
+    if (coli_expert_lookup(store, (ColiExpertKey){ layer, expert }, view)) {
+        fprintf(stderr, "qwen36: invalid expert key %d/%d\n", layer, expert); exit(1);
+    }
+}
+
 static void pin_hot_experts(Model *m) {
     Cfg *c = &m->c;
     if (m->hot_n <= 0 || m->hot_pinned) return;
@@ -6712,7 +6753,8 @@ static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const 
     if (m->cache[layer].cap < K || K > 64 || !gq_int_ok(gx->hg, D) || !gq_int_ok(gx->hu, D) || !gq_int_ok(gx->hd, I)) return -1;
     const int u = moe_gq_unit(gx, D, I);
     if (u == 16 && (I % 16 || D % 16)) return -1;
-    Slot *sl[64]; int ids[64]; float w[64]; int n = 0;
+    ColiExpertStore store = q36_gq_expert_store(m);
+    ColiExpertView ev[64]; int ids[64]; float w[64]; int n = 0;
     for (int k = 0; k < K; k++) if (idx[k] >= 0) { ids[n] = idx[k]; w[n] = val[k]; n++; }
     /* moe() runs on the engine's thread; the worker threads get these through
      * the local pointers below (thread-local storage here would hand each
@@ -6727,13 +6769,13 @@ static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const 
     if (gq_act_set(pax, x, 1, D)) return -1;
     const int64_t rbg = gq_row_bytes(gx->hg, D), rbu = gq_row_bytes(gx->hu, D), rbd = gq_row_bytes(gx->hd, I);
     const int gI = I / u, gD = D / u;
-    for (int k = 0; k < n; k++) sl[k] = expert_hold(m, layer, ids[k]);   /* the PILOT worker may not evict them mid-matmul */
+    for (int k = 0; k < n; k++) q36_gq_expert_acquire(&store, layer, ids[k], &ev[k]);   /* leased: the PILOT worker may not evict them mid-matmul */
     #pragma omp parallel for schedule(static)
     for (int r = 0; r < n * 2 * gI; r++) {
         int k = r / (2 * gI), rr = (r % (2 * gI)) * u;
-        const uint8_t *base = sl[k]->gqe;
-        if (rr < I) gq_rows_u(GU + (int64_t)k * 2 * I + rr, u, pax, base + (int64_t)rr * rbg, gx->hg, D);
-        else        gq_rows_u(GU + (int64_t)k * 2 * I + rr, u, pax, base + gx->hb_g + (int64_t)(rr - I) * rbu, gx->hu, D);
+        const uint8_t *wg = ev[k].gate.data, *wu = ev[k].up.data;
+        if (rr < I) gq_rows_u(GU + (int64_t)k * 2 * I + rr, u, pax, wg + (int64_t)rr * rbg, gx->hg, D);
+        else        gq_rows_u(GU + (int64_t)k * 2 * I + rr, u, pax, wu + (int64_t)(rr - I) * rbu, gx->hu, D);
     }
     for (int k = 0; k < n; k++) {
         float *g = GU + (int64_t)k * 2 * I, *u = g + I; float *h = H + (int64_t)k * I;
@@ -6741,15 +6783,15 @@ static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const 
         if (gx->su) for (int i = 0; i < I; i++) u[i] *= gx->su[ids[k]];
         for (int i = 0; i < I; i++) { float gv = g[i]; h[i] = (gv / (1.f + expf(-gv))) * u[i]; }
     }
-    if (gq_act_set(pah, H, n, I)) { for (int k = 0; k < n; k++) slot_release(sl[k]); return -1; }   /* row k of ah is expert k's hidden */
+    if (gq_act_set(pah, H, n, I)) { for (int k = 0; k < n; k++) coli_expert_release(&store, &ev[k]); return -1; }   /* row k of ah is expert k's hidden */
     #pragma omp parallel for schedule(static)
     for (int r = 0; r < n * gD; r++) {
         int k = r / gD, o = (r % gD) * u;
         gq_act one = *pah; one.S = 1; one.q = pah->q + (int64_t)k * I; one.d = pah->d + (int64_t)k * (I / 32); one.s = pah->s + (int64_t)k * (I / 16);
         one.l4 = pah->l4 ? pah->l4 + (int64_t)k * (I / 4) : NULL;
-        gq_rows_u(Y + (int64_t)k * D + o, u, &one, sl[k]->gqe + gx->hb_g + gx->hb_u + (int64_t)o * rbd, gx->hd, I);
+        gq_rows_u(Y + (int64_t)k * D + o, u, &one, (const uint8_t *)ev[k].down.data + (int64_t)o * rbd, gx->hd, I);
     }
-    for (int k = 0; k < n; k++) slot_release(sl[k]);
+    for (int k = 0; k < n; k++) coli_expert_release(&store, &ev[k]);
     /* accumulate in expert-id order, as the general path does: same sums, same bits */
     int ord[64]; for (int k = 0; k < n; k++) ord[k] = k;
     for (int a = 1; a < n; a++) { int v = ord[a], b = a; while (b > 0 && ids[ord[b - 1]] > ids[v]) { ord[b] = ord[b - 1]; b--; } ord[b] = v; }
@@ -6779,14 +6821,15 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
     /* a speculative verify's rows (S <= GQ_EXACT_ROWS) read the experts as a decode step does, the
      * file's rows by eight where moe_gq_decode does: a row's bits are then a plain step's (#2874) */
     const int f8 = S <= GQ_EXACT_ROWS && moe_gq_unit(gx, D, I) == 8;
+    ColiExpertStore store = q36_gq_expert_store(m);
     for (int e = 0; e < E; e++) {
         int n = cnt[e + 1] - cnt[e]; if (!n) continue;
         const int *tl = tok + cnt[e]; const float *wl = wt + cnt[e];
-        Slot *sl = expert_hold(m, layer, e);   /* as moe_gq_decode */
+        ColiExpertView ev; q36_gq_expert_acquire(&store, layer, e, &ev);   /* as moe_gq_decode */
+        const uint8_t *wg = ev.gate.data, *wu = ev.up.data, *wd = ev.down.data;
         for (int r = 0; r < n; r++) memcpy(X + (int64_t)r * D, x + (int64_t)tl[r] * D, sizeof(float) * (size_t)D);
         const int ex = f8 && !gq_act_set(&act, X, n, D);
         if (ex) {
-            const uint8_t *wg = sl->gqe, *wu = sl->gqe + gx->hb_g;
             const int64_t rbg = gq_row_bytes(gx->hg, D), rbu = gq_row_bytes(gx->hu, D);
             #pragma omp parallel for schedule(static)
             for (int r = 0; r < 2 * (I / 8); r++) {
@@ -6794,21 +6837,21 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
                 else gq_rows_f8(U + 8 * (r - I / 8), I, &act, wu + (int64_t)8 * (r - I / 8) * rbu, rbu, gx->hu, D, 8);
             }
         } else if (gq_int_ok(gx->hg, D) && gq_int_ok(gx->hu, D) && !gq_act_set(&act, X, n, D))
-            gq_matmul2_act(G, sl->gqe, gx->hg, U, sl->gqe + gx->hb_g, gx->hu, &act, I);   /* x quantized once */
+            gq_matmul2_act(G, wg, gx->hg, U, wu, gx->hu, &act, I);   /* x quantized once */
         else {
-            gq_matmul(G, X, sl->gqe, gx->hg, n, D, I);
-            gq_matmul(U, X, sl->gqe + gx->hb_g, gx->hu, n, D, I);
+            gq_matmul(G, X, wg, gx->hg, n, D, I);
+            gq_matmul(U, X, wu, gx->hu, n, D, I);
         }
         if (gx->sg) for (int64_t q = 0; q < (int64_t)n * I; q++) G[q] *= gx->sg[e];
         if (gx->su) for (int64_t q = 0; q < (int64_t)n * I; q++) U[q] *= gx->su[e];
         for (int64_t q = 0; q < (int64_t)n * I; q++) { float gv = G[q]; G[q] = (gv / (1.f + expf(-gv))) * U[q]; }
         if (ex && !gq_act_set(&ah, G, n, I)) {
-            const uint8_t *wd = sl->gqe + gx->hb_g + gx->hb_u; const int64_t rbd = gq_row_bytes(gx->hd, I);
+            const int64_t rbd = gq_row_bytes(gx->hd, I);
             #pragma omp parallel for schedule(static)
             for (int r = 0; r < D / 8; r++) gq_rows_f8(Y + 8 * r, D, &ah, wd + (int64_t)8 * r * rbd, rbd, gx->hd, I, 8);
         } else
-        gq_matmul(Y, G, sl->gqe + gx->hb_g + gx->hb_u, gx->hd, n, I, D);
-        slot_release(sl);
+        gq_matmul(Y, G, wd, gx->hd, n, I, D);
+        coli_expert_release(&store, &ev);
         if (gx->sd) for (int64_t q = 0; q < (int64_t)n * D; q++) Y[q] *= gx->sd[e];
         if (m->L[layer].post_en)   /* Muse Spark: every expert's output scaled, then normalised */
             for (int r = 0; r < n; r++) rmsnorm_scaled(Y + (int64_t)r * D, Y + (int64_t)r * D, m->L[layer].post_en, D, c->post_eps);
