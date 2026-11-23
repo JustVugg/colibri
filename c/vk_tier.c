@@ -201,6 +201,7 @@ static struct {
     unsigned long long rep_routed, rep_served;
     /* streaming (big prefill steps; see "streaming" below) */
     int st_ok, st_slots, st_n, st_per, st_half, st_rows_env, gemm_rows, st_par;
+    int st_half_cap;                      /* sub-batch rows a refused scratch left (0: none refused) */
     VStage *st;
     double bw_up, cpu_row_ms;             /* measured: bytes per ms into a slot; CPU ms per (row, expert) */
     int big, big_fail, big_n, big_taken, said_fwd;
@@ -1396,9 +1397,22 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
     if (ndev || nst) {
         size_t ram = (size_t)(compat_mem_available_gb() * 1e9);
         half = coli_vk_xb_sub_fit(half, E + 1, ram ? ram / 2 : SIZE_MAX);
-        if (half < 1 || !coli_vk_xb_sub_reserve(half, E + 1)) {
+        if (T.st_half_cap && half > T.st_half_cap) half = T.st_half_cap;
+        /* The fit reads the driver's budget, which can show room an allocation is then refused: on a Windows
+         * desktop's RTX PRO 4500 (Qwen3.8 Q4_K_M, 2.2.0) every prompt step's 290 MiB of scratch was, and the whole
+         * step went to the CPU while the batch still held the scratch of the step before. Fewer rows a sub-batch
+         * instead, down to what the scratch already holds: the step's experts stay on the device. */
+        const int want = half;
+        while (half >= 1 && !coli_vk_xb_sub_reserve(half, E + 1)) half /= 2;
+        if (half < 1) {
             fprintf(stderr, VKT_TAG " tier %s: no scratch for a step of %d rows, its experts stay on the CPU\n", T.engine, S);
             return 0;
+        }
+        if (half < want) {
+            if (!T.st_half_cap)
+                fprintf(stderr, VKT_TAG " tier %s: a prompt step's scratch for sub-batches of %d rows was refused; "
+                        "sub-batches of %d rows from here on, on the device\n", T.engine, want, half);
+            T.st_half_cap = half;
         }
     }
     if ((size_t)n * H > T.csy) {
