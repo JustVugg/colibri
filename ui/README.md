@@ -47,6 +47,7 @@ and when the page stops a request the upstream connection closes, which stops th
   `--mcp-config` (default `~/colibri-mcp.json`, Bionic's `ng-mcp.json` shape). Add or edit one
   as JSON, switch it on/off, connect it to list its tools, or import Bionic's `ng-mcp.json` or any
   `mcpServers` file. stdio servers (npm shims included) and streamable HTTP; no OAuth sign-in.
+  Blender: see `docs/MCP_BLENDER.md` (bridge in `mcp-servers/blender/`).
   A server starts on first use; the model sees its tools as `<server>__<tool>`; a result is cut to
   6,000 characters and images are described, not sent. Every tool's schema goes into every
   prompt, so switch on only the servers a task needs. On/off for the chat in the **+** menu.
