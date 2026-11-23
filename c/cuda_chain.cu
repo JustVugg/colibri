@@ -1764,6 +1764,57 @@ __global__ static void cc_ew_k(float *__restrict__ y, const float *__restrict__ 
 __device__ __forceinline__ float cc_wmax(float v) { for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, cc_shfl_xor(v, o)); return v; }
 __device__ __forceinline__ float cc_wsum(float v) { for (int o = 16; o > 0; o >>= 1) v += cc_shfl_xor(v, o); return v; }
 __device__ __forceinline__ int cc_wmin(int v) { for (int o = 16; o > 0; o >>= 1) v = min(v, cc_shfl_xor(v, o)); return v; }
+__global__ static void __launch_bounds__(256) cc_route_256_k(const float *__restrict__ l,
+                                                             int *__restrict__ ids, float *__restrict__ w, CcRoute p) {
+    const float NEG = -3.402823466e38f;
+    __shared__ float rv[16];
+    __shared__ int keepi[16];
+    int s = blockIdx.x;
+    if (s >= p.S) return;
+    int tid = threadIdx.x, lane = tid & 31, sg = tid >> 5;
+    float lv = l[p.l_off + s * p.l_row + tid] / p.temp;
+    float m = cc_wmax(lv);
+    if (lane == 0) rv[sg] = m;
+    __syncthreads();
+    float mx = NEG;
+    #pragma unroll
+    for (int g = 0; g < 8; g++) mx = fmaxf(mx, rv[g]);
+    float v = expf(lv - mx);
+    float acc = cc_wsum(v);
+    if (lane == 0) rv[8 + sg] = acc;
+    __syncthreads();
+    float sum = 0.f;
+    #pragma unroll
+    for (int g = 0; g < 8; g++) sum += rv[8 + g];
+    float sc = v / sum;
+    float pk = isnan(sc) ? NEG : sc;
+    int my_id = -1;
+    float my_w = 0.f, wsum = 0.f;
+    for (int k = 0; k < p.K; k++) {
+        float wm = cc_wmax(pk);
+        int we = cc_wmin(pk == wm && wm > NEG ? tid : 0x7fffffff);
+        int h = (k & 1) * 8;
+        if (lane == 0) { rv[h + sg] = wm; keepi[h + sg] = we; }
+        __syncthreads();
+        float b = NEG; int c = -1;
+        #pragma unroll
+        for (int g = 0; g < 8; g++) {
+            float u = rv[h + g]; int ie = keepi[h + g];
+            if (u > NEG && ie != 0x7fffffff && (u > b || (u == b && ie < c))) { b = u; c = ie; }
+        }
+        float wk = c >= 0 ? b : 0.f;
+        wsum += wk;
+        if (tid == k) { my_id = c; my_w = wk; }
+        if (c == tid) pk = NEG;
+    }
+    if (tid < p.K) {
+        float div = wsum + p.norm_eps;
+        bool norm = (p.norm == 1 || (p.norm == 2 && p.K > 1)) && div > 0.f;
+        float x = norm ? my_w / div : my_w;
+        ids[p.i_off + s * p.i_row + tid] = my_id;
+        w[p.w_off + s * p.w_row + tid] = x * p.scale;
+    }
+}
 __global__ static void __launch_bounds__(256) cc_route_k(const float *__restrict__ l, const float *__restrict__ bias,
                                                          int *__restrict__ ids, float *__restrict__ w, CcRoute p) {
     COLI_PDL_WAIT();
@@ -3045,7 +3096,15 @@ static int cc_route(CcBuf *l, CcBuf *bias, CcBuf *ids, CcBuf *w, const CcRoute *
         (p->n_group > 1 && (p->n_group > 64 || p->E % p->n_group || p->topk_group < 1 || p->topk_group > p->n_group))) return 0;
     if ((size_t)(p->l_off + (p->S - 1) * p->l_row + p->E) * 4 > l->bytes || (size_t)(p->i_off + (p->S - 1) * p->i_row + p->K) * 4 > ids->bytes ||
         (size_t)(p->w_off + (p->S - 1) * p->w_row + p->K) * 4 > w->bytes) return 0;
-    coli_launch(cc_route_k, (unsigned)p->S, 256, 0, c->stream, fp(l), fp(bias), (int *)ids->d, fpw(w), *p);
+    if (c->device_profile && p->E == 256 && p->K <= 32 && p->kind == 0 && p->has_bias == 0 && p->n_group <= 1) {
+        const char *e = getenv("COLI_CUDA_ROUTE_FAST");
+        const bool fast = e ? *e != '0' : (c->kernel_mask & Q36_EXPERT_ROUTE) != 0;
+        if (fast) {
+            cc_route_256_k<<<(unsigned)p->S, 256, 0, c->stream>>>(fp(l), (int *)fpw(ids), fpw(w), *p);
+            return launched(c, "route");
+        }
+    }
+    coli_launch(cc_route_k, (unsigned)p->S, 256, 0, c->stream, fp(l), fp(bias), (int *)fpw(ids), fpw(w), *p);
     return launched(c, "route");
 }
 static int cc_moe(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf *y, CcBuf *hy, const CcMoe *p) {

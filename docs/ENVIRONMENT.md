@@ -536,6 +536,7 @@ These backend settings are for kernel testing and tuning. A profile default foll
 | Variable | Default | Effect |
 |---|---|---|
 | `COLI_CUDA_L2_GRAN` | 128 bytes on the prompt-cache path | Set the CUDA L2 fetch granularity. Zero leaves the device limit alone. |
+| `COLI_CUDA_ROUTE_FAST` | profile | Select the specialized unbiased softmax router for 256 experts and at most 32 selected experts per token. Zero selects the general router. |
 
 ## GLM-5.3-Flash engine (`glm53`)
 
