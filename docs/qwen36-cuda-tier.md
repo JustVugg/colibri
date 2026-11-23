@@ -38,6 +38,7 @@ capabilities match the device reported by CUDA.
 | NVIDIA RTX PRO 4000 Blackwell | 12.0 |
 | NVIDIA GeForce RTX 4090 | 8.9 |
 | NVIDIA GeForce RTX 5090 | 12.0 |
+| NVIDIA RTX PRO 6000 Blackwell Server Edition | 12.0 |
 
 The A100 profile also checks for at least 38 GiB and less than 42 GiB of device memory.
 The active kernels can depend on prefill or decode, cached prefix length, new token count and cold state.

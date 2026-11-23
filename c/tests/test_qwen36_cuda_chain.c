@@ -988,6 +988,18 @@ static void test_request_kernel_mask(void) {
        (rtx3090.decode_permissions & Q36_PROMPT_CACHE),
        "RTX 3090 resumes the growable cache when the same prefix is not live");
     q36cc_end_request(&rtx3090);
+    fake_device_profile = Q36_GPU_PRO6000;
+    Q36CChain pro6000 = {0};
+    pro6000.device_profile = cc_select_qwen36_profile(1);
+    q36cc_end_request(&pro6000);
+    q36cc_begin_request(&pro6000, 720, 1234, 0);
+    ck(pro6000.request_phase && (fake_kernel_mask & Q36_SHARED_SWIGLU) &&
+       pro6000.swiglu_pair_rows == 1234, "PRO 6000 enables grouped SwiGLU for the qualified extension");
+    q36cc_end_request(&pro6000);
+    q36cc_begin_request(&pro6000, 720, 1235, 0);
+    ck(pro6000.request_phase && !pro6000.swiglu_pair_rows,
+       "PRO 6000 clears grouped SwiGLU rows after changing the extension length");
+    q36cc_end_request(&pro6000);
     ck(cc_select_qwen36_profile(0) == Q36_GPU_NONE && !fake_kernel_mask,
        "disabling the device profile clears backend request permissions");
     fake_device_profile = saved_profile;

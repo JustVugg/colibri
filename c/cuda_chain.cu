@@ -52,6 +52,8 @@ extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float 
 extern "C" int coli_cuda_qwen36_gemm_async(ColiCudaTensor *t, float *y_dev, const float *x_dev, int S, void *stream);
 extern "C" int coli_cuda_swiglu_formats_supported(const ColiCudaTensor *g, const ColiCudaTensor *u);
 extern "C" int coli_cuda_tensor_swiglu_async(ColiCudaTensor *tg, ColiCudaTensor *tu, float *y_dev, const float *x_dev, int S, void *stream);
+extern "C" int coli_cuda_tensor_swiglu_weights_async(ColiCudaTensor *tg, ColiCudaTensor *tu, float *y_dev,
+                                                    const float *x_dev, int S, void *stream, int pair_codes);
 extern "C" int coli_cuda_qwen36_moe_async(int device, const CcExpert *tab, const float *x, const int *ids, const float *w,
                                    float *hid, float *y, const float *hy, const CcMoe *p, void *stream, size_t hid_floats);
 extern "C" void coli_cuda_qx_invalidate(int device, const float *y_dev, size_t n_floats);
@@ -1379,13 +1381,15 @@ __global__ static void __launch_bounds__(32 * NW) cc_tiled_attn_f2(const float *
     #pragma unroll
     for (int dt = 0; dt < NDT; dt++) oa[dt][0] = oa[dt][1] = oa[dt][2] = oa[dt][3] = 0.f;
     const int kb_lo = win > 0 && pb + t0 - win + 1 > 0 ? (pb + t0 - win + 1) / BC : 0, kb_hi = (pb + tlast) / BC;
-    const bool pipe_kv16 = QREG && SV_SEP && CP_ASYNC && sizeof(KT) == 2 && HD == 256 && BC == 32 && NT == 128 && !ring &&
+    constexpr int async_rows = NT / 32;  /* 32 lanes copy a key row in aligned groups of eight halves */
+    const bool pipe_kv16 = QREG && SV_SEP && CP_ASYNC && sizeof(KT) == 2 && HD == 256 && BC == 32 &&
+                           (NT == 64 || NT == 128) && !ring &&
                            ((p.k_off | p.v_off) & 7) == 0 && (((uintptr_t)kc | (uintptr_t)vc) & 15) == 0;
     if (pipe_kv16 && kb_lo <= kb_hi && kb_lo * BC + BC <= nt) {
         const int kl8 = tid >> 5, d8 = (tid & 31) << 3;
         size_t at = (size_t)(g * p.cap + kb_lo * BC + kl8) * 256 + d8;
-        for (int s = 0; s < 8; s++, at += 1024)
-            cc_cp_async_16(sK + cc_f2_swz<256>(kl8 + s * 4, d8), kc + p.k_off + at);
+        for (int s = 0; s < BC / async_rows; s++, at += async_rows * HD)
+            cc_cp_async_16(sK + cc_f2_swz<256>(kl8 + s * async_rows, d8), kc + p.k_off + at);
         cc_cp_async_commit();
     }
     for (int kb = kb_lo; kb <= kb_hi; kb++) {
@@ -1395,8 +1399,8 @@ __global__ static void __launch_bounds__(32 * NW) cc_tiled_attn_f2(const float *
         if (pipe_kv16 && k0 + BC <= nt) {
             const int kl8 = tid >> 5, d8 = (tid & 31) << 3;
             size_t at = (size_t)(g * p.cap + k0 + kl8) * 256 + d8;
-            for (int s = 0; s < 8; s++, at += 1024)
-                cc_cp_async_16(sV + cc_f2_swz<256>(kl8 + s * 4, d8), vc + p.v_off + at);
+            for (int s = 0; s < BC / async_rows; s++, at += async_rows * HD)
+                cc_cp_async_16(sV + cc_f2_swz<256>(kl8 + s * async_rows, d8), vc + p.v_off + at);
             cc_cp_async_commit();
             cc_cp_async_wait_1();
         } else if (fast_kv16) {
@@ -1528,8 +1532,8 @@ __global__ static void __launch_bounds__(32 * NW) cc_tiled_attn_f2(const float *
             if (kb + 1 <= kb_hi && (kb + 1) * BC + BC <= nt) {
                 const int kl8 = tid >> 5, d8 = (tid & 31) << 3;
                 size_t at = (size_t)(g * p.cap + (kb + 1) * BC + kl8) * 256 + d8;
-                for (int s = 0; s < 8; s++, at += 1024)
-                    cc_cp_async_16(sK + cc_f2_swz<256>(kl8 + s * 4, d8), kc + p.k_off + at);
+                for (int s = 0; s < BC / async_rows; s++, at += async_rows * HD)
+                    cc_cp_async_16(sK + cc_f2_swz<256>(kl8 + s * async_rows, d8), kc + p.k_off + at);
                 cc_cp_async_commit();
             }
         } else if (!SV_SEP) {
@@ -1601,7 +1605,7 @@ __global__ static void __launch_bounds__(32 * NW) cc_tiled_attn_f2(const float *
  * COLI_CUDA_CHAIN_FLASH2=0 keeps cc_attn_fk */
 template <typename KT>
 static int cc_tiled_attn_f2_go(CcCtx *c, CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, const CcAttn *p, int G,
-                         int win, const float *sk, int so, int ring) {
+                         int win, const float *sk, int so, int ring, bool use_two_warps) {
 #if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
     static int on = -1, f2m = -1, bench = -1;
     if (bench < 0) bench = getenv("COLI_CUDA_CHAIN_BENCH") != nullptr || getenv("COLI_CUDA_CHAIN_TEST") != nullptr;
@@ -1626,6 +1630,16 @@ static int cc_tiled_attn_f2_go(CcCtx *c, CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *
          * - mode 4: NW = 4, SV_SEP = true (66 KiB smem, 1 block/SM) */
         int m = f2m ? f2m : 6;
         if (m == 6 || m == 7 || m == 8) {
+            if constexpr (sizeof(KT) == 2) {
+                if (use_two_warps && m == 6 && ((p->k_off | p->v_off) & 7) == 0 &&
+                    (((uintptr_t)kc->d | (uintptr_t)vc->d) & 15) == 0) {
+                    dim3 fg2((unsigned)((p->S + 32 / G - 1) / (32 / G)), (unsigned)p->KVH);
+                    const size_t sm2 = cc_tiled_f2_smem_bytes<256, 2, 32, true, true>();
+                    cc_tiled_attn_f2<256, 2, 32, true, KT, true, true><<<fg2, 64, sm2, c->stream>>>(
+                        fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring);
+                    return 1;
+                }
+            }
             const size_t sm6 = cc_tiled_f2_smem_bytes<256, 4, 32, true, true>();
             cc_tiled_attn_f2<256, 4, 32, true, KT, true, true><<<fg, 128, sm6, c->stream>>>(
                 fp(q), kvp<KT>(kc), kvp<KT>(vc), fpw(o), fp(gate), *p, G, win, sk, so, ring);
@@ -1670,7 +1684,7 @@ static int cc_tiled_attn_f2_go(CcCtx *c, CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *
     }
     return 1;
 #else
-    (void)c; (void)q; (void)kc; (void)vc; (void)o; (void)gate; (void)p; (void)G; (void)win; (void)sk; (void)so; (void)ring;
+    (void)c; (void)q; (void)kc; (void)vc; (void)o; (void)gate; (void)p; (void)G; (void)win; (void)sk; (void)so; (void)ring; (void)use_two_warps;
     return 0;
 #endif
 }
@@ -1680,10 +1694,10 @@ static int cc_tiled_attn_f2_go(CcCtx *c, CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *
  * row (QSA; NULL none, head dim 256 only). COLI_CUDA_CHAIN_FLASH2=0 keeps cc_attn_fk */
 template <typename KT>
 static int cc_attn_f2_go(CcCtx *c, CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, const CcAttn *p, int G,
-                         int win, const float *sk, int so, int ring, const int *sel = nullptr) {
+                         int win, const float *sk, int so, int ring, const int *sel = nullptr, bool use_two_warps = false) {
 #if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
     if (cc_uses_feature(c, Q36_FLASH_ATTN) && !sel && !win && !sk && !ring && 64 % G == 0)
-        return cc_tiled_attn_f2_go<KT>(c, q, kc, vc, o, gate, p, G, win, sk, so, ring);
+        return cc_tiled_attn_f2_go<KT>(c, q, kc, vc, o, gate, p, G, win, sk, so, ring, use_two_warps);
     static int on = -1;
     if (on < 0) { const char *e = getenv("COLI_CUDA_CHAIN_FLASH2"); on = !(e && *e == '0'); }
     if (!on || c->major * 10 + c->minor < 75 || (p->hd != 64 && p->hd != 128 && p->hd != 256) ||
@@ -1719,7 +1733,7 @@ static int cc_attn_f2_go(CcCtx *c, CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcB
     }
     return 1;
 #else
-    (void)c; (void)q; (void)kc; (void)vc; (void)o; (void)gate; (void)p; (void)G; (void)win; (void)sk; (void)so; (void)ring; (void)sel;
+    (void)c; (void)q; (void)kc; (void)vc; (void)o; (void)gate; (void)p; (void)G; (void)win; (void)sk; (void)so; (void)ring; (void)sel; (void)use_two_warps;
     return 0;
 #endif
 }
@@ -3678,7 +3692,7 @@ static int cc_matmul(ColiCudaTensor *t, CcBuf *x, size_t xo, CcBuf *y, size_t yo
     g_st.matmuls++; g_st.ops++;
     if (c->device_profile && fmt < 100) {
         int ok;
-        if (c->device_profile == Q36_GPU_PRO4000) {
+        if (c->device_profile == Q36_GPU_PRO4000 || c->device_profile == Q36_GPU_PRO6000) {
             ok = coli_cuda_qwen36_gemm_async(t, y->d + yo, x->d + xo, S, (void *)c->stream);
         } else {
             const uint64_t seq = c->in_frame && x->kind == CC_DEV && x != y ? t_cc_seq : 0;
@@ -3724,7 +3738,7 @@ static int cc_matmul_glu(ColiCudaTensor *wg, ColiCudaTensor *wu, CcBuf *x, CcBuf
     g_st.matmuls += 2; g_st.ops++;
     return 1;
 }
-static int cc_matmul_swiglu(ColiCudaTensor *tg, ColiCudaTensor *tu, CcBuf *x, size_t xo, CcBuf *y, size_t yo, int S) {
+static int cc_swiglu_impl(ColiCudaTensor *tg, ColiCudaTensor *tu, CcBuf *x, size_t xo, CcBuf *y, size_t yo, int S, bool pair_codes) {
     CcCtx *c = live(CC_OVERLAP_DOWN);
     if (!c || !tg || !tu || !x || !y || S < 1) return 0;
     int fmtg, Ig, Og, fmtu, Iu, Ou;
@@ -3742,11 +3756,19 @@ static int cc_matmul_swiglu(ColiCudaTensor *tg, ColiCudaTensor *tu, CcBuf *x, si
     cc_down_access(y);
     (void)fp(x);
     if (c->lost) return 0;
-    const int rc = coli_cuda_tensor_swiglu_async(tg, tu, y->d + yo, x->d + xo, S, (void *)c->stream);
+    const int rc = pair_codes && c->device_profile == Q36_GPU_PRO6000 && cc_uses_feature(c, Q36_SHARED_SWIGLU)
+        ? coli_cuda_tensor_swiglu_weights_async(tg, tu, y->d + yo, x->d + xo, S, (void *)c->stream, 1)
+        : coli_cuda_tensor_swiglu_async(tg, tu, y->d + yo, x->d + xo, S, (void *)c->stream);
     if (rc < 0) return -1;   /* No fused output was enqueued. */
     g_st.matmuls += 2; g_st.ops++;
     if (!rc) { c->lost = 1; return 0; }
     return 1;
+}
+static int cc_matmul_swiglu(ColiCudaTensor *tg, ColiCudaTensor *tu, CcBuf *x, size_t xo, CcBuf *y, size_t yo, int S) {
+    return cc_swiglu_impl(tg, tu, x, xo, y, yo, S, false);
+}
+static int cc_swiglu_pair_codes(ColiCudaTensor *tg, ColiCudaTensor *tu, CcBuf *x, CcBuf *y, int S) {
+    return cc_swiglu_impl(tg, tu, x, 0, y, 0, S, true);
 }
 namespace {
 static int cc_flush_norm(CcCtx *c) {
@@ -4210,17 +4232,19 @@ static int cc_attn_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBu
 #if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
     const bool ordered_profile = c->device_profile == Q36_GPU_L4 ||
                                  c->device_profile == Q36_GPU_4090 ||
-                                 c->device_profile == Q36_GPU_5090;
+                                 c->device_profile == Q36_GPU_5090 ||
+                                 c->device_profile == Q36_GPU_PRO6000;
     ordered_long = ordered_profile && dec && long_turn && p->S > CC_ATTN_DEC_ROWS && p->S <= 64 && p->H == 16 &&
                    p->KVH == 2 && p->hd == 256 && c->major >= 8 && !getenv("COLI_CUDA_F2_MODE");
     /* This FP16 continuation uses the profile's one-pass Flash path with default settings. */
     const bool flash_profile = c->device_profile == Q36_GPU_5090 ||
+                               c->device_profile == Q36_GPU_PRO6000 ||
                                c->device_profile == Q36_GPU_4090;
     const bool use_one_pass = flash_profile && sizeof(KT) == 2 && ordered_long && p->pos_base == 8880 && p->S == 35 &&
         !getenv("COLI_CUDA_PR13_FLASH_DEV") && !getenv("COLI_CUDA_ATTN_LONG_PLAIN") &&
         !getenv("COLI_CUDA_ATTN_DEC") && !getenv("COLI_CUDA_ATTN_DEC_GQA") && !getenv("COLI_CUDA_ATTN_DEC_TPP") &&
         !getenv("COLI_CUDA_CHAIN_FLASH") && !getenv("COLI_CUDA_CHAIN_FLASH2");
-    const bool skip_ordered = use_one_pass && (c->device_profile == Q36_GPU_5090);
+    const bool skip_ordered = use_one_pass && (c->device_profile == Q36_GPU_5090 || c->device_profile == Q36_GPU_PRO6000);
     if (ordered_long && !skip_ordered && fl > 0 && p->S >= fl && cc_attn_f2_fits(c, p, G)) {
         if (c->device_profile == Q36_GPU_4090 && use_one_pass && cc_uses_feature(c, Q36_FLASH_ATTN) &&
             p->has_gate && q == gate && cc_attn_f2_go<KT>(c, q, kc, vc, o, gate, p, G, 0, nullptr, 0, 0))
@@ -4232,7 +4256,9 @@ static int cc_attn_t(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBu
     const int max_dec_rows = long_turn && !ordered_long ? 64 : CC_ATTN_DEC_ROWS;
     const bool dec_long = dec && long_turn && !ordered_long && p->S <= max_dec_rows;
 #if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
-    if (fl > 0 && p->S >= fl && !dec_long && p->sel_row <= 0 && cc_attn_f2_go<KT>(c, q, kc, vc, o, gate, p, G, 0, nullptr, 0, 0))
+    const bool use_two_warps = c->device_profile == Q36_GPU_PRO6000 && skip_ordered;
+    if (fl > 0 && p->S >= fl && !dec_long && p->sel_row <= 0 &&
+        cc_attn_f2_go<KT>(c, q, kc, vc, o, gate, p, G, 0, nullptr, 0, 0, nullptr, use_two_warps))
         return launched(c, "attn (tensor cores, one pass)");
     if (fl > 0 && p->S >= fl && !dec_long && c->major >= 7 && p->sel_row <= 0 && 16 % G == 0 && (p->hd == 64 || p->hd == 128 || p->hd == 256)) {
         dim3 fg((unsigned)((p->S + 16 / G - 1) / (16 / G)), (unsigned)p->KVH);
@@ -5356,8 +5382,7 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_sconv, cc_relattn, cc_ink2_mix, cc_ink2_clip, cc_ink2_dconv,
     cc_fetch_at, cc_fetch_wait_at, cc_fetch_done_at,
     cc_ink2_caps_,
-    cc_ew_norm, cc_matmul_swiglu, cc_select_qwen36_profile, cc_set_kernel_mask_,
-    nullptr, /* packed native INT8 operation */
+    cc_ew_norm, cc_matmul_swiglu, cc_select_qwen36_profile, cc_set_kernel_mask_, cc_swiglu_pair_codes,
     cc_probe_qwen36_profile_,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }
