@@ -108,6 +108,31 @@ class ExtractTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "troppo grande"):
             docs.extract("a.txt", b"x" * (docs.MAX_BYTES + 1))
 
+    def test_a_part_past_its_unpacked_size_is_refused(self):
+        """a part is unpacked up to PART_MAX, and a file's parts up to ARCHIVE_MAX together:
+        a few hundred KB of zip can hold far more"""
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("word/document.xml", f"<w:document {W}><w:body>" + " " * (docs.PART_MAX + 1) + "</w:body></w:document>")
+        self.assertLess(len(buf.getvalue()), 1 << 20)
+        with self.assertRaisesRegex(ValueError, "troppo grande una volta decompresso"):
+            docs.extract("a.docx", buf.getvalue())
+        with unittest.mock.patch.object(docs, "ARCHIVE_MAX", 100):   # two slides past the whole file's
+            with self.assertRaisesRegex(ValueError, "troppo grande una volta decompresso"):
+                docs.extract("a.pptx", PPTX)
+
+    def test_a_document_type_is_refused(self):
+        """Office XML has none: a part with one (its entities could expand without bound) is
+        refused before ElementTree reads it, in UTF-8 and in UTF-16 alike"""
+        xml = ('<?xml version="1.0" encoding="%s"?><!DOCTYPE d [<!ENTITY a "aaaa"><!ENTITY b "&a;&a;&a;&a;">]>'
+               f'<w:document {W}><w:body><w:p><w:r><w:t>&b;</w:t></w:r></w:p></w:body></w:document>')
+        for enc in ("UTF-8", "UTF-16"):
+            with self.subTest(encoding=enc):
+                with self.assertRaisesRegex(ValueError, "DTD"):
+                    docs.extract("a.docx", office({"word/document.xml": (xml % enc).encode(enc.lower())}))
+        with self.assertRaisesRegex(ValueError, "DTD"):
+            docs.extract("a.odt", office({"content.xml": '<!DOCTYPE x [<!ENTITY e "e">]><x>&e;</x>'}))
+
     @unittest.skipUnless(has_pdf_reader(), "neither pypdf nor PyMuPDF is installed")
     def test_pdf_text_by_page(self):
         d = docs.extract("a.pdf", tiny_pdf("Ciao colibri, questa e una pagina di prova"))

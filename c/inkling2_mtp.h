@@ -101,7 +101,8 @@ static Ink2Mtp *ink2m_load(Model *m, const char *snap) {
             mt->nt = tl->len;
             for (int j = 0; j < mt->nt; j++) {
                 mt->tl[j] = (int)tl->kids[j]->num;
-                if (mt->tl[j] < 0 || mt->tl[j] > c->n_layers) why = "a target layer past the model's";
+                /* counted over the layers as they run: a loop's passes each (Inkling-2-Mini: 5, 23, 41, 48 of 48) */
+                if (mt->tl[j] < 0 || mt->tl[j] > c->n_state) why = "a target layer past the model's";
             }
             for (int i = 0; i < mt->L; i++) mt->l[i].local = 0;
             for (int j = 0; ll && ll->t == J_ARR && j < ll->len; j++) {
@@ -380,12 +381,12 @@ static int ink2m_step(Model *m, int tok, int t, int *out) {
     static InkPinState *snap;
     snap = ink_pin_state_save(m, snap);
     size_t ringn = 0;
-    for (int i = 0; i < c->n_layers; i++) {
+    for (int i = 0; i < c->n_state; i++) {   /* a loop pass's layers have rings of their own */
         const int win = kv_ring_rows(c, i, m->max_t);
         if (win < m->max_t) ringn += (size_t)2 * L_KV(c, i) * (K + 1) * L_HD(c, i);
     }
     float *ring = ringn ? falloc((int64_t)ringn) : NULL, *rp = ring;
-    for (int i = 0; i < c->n_layers; i++) {
+    for (int i = 0; i < c->n_state; i++) {
         const int win = kv_ring_rows(c, i, m->max_t), hd = L_HD(c, i);
         if (win >= m->max_t) continue;
         for (int j = 0; j <= K; j++)
@@ -410,7 +411,7 @@ static int ink2m_step(Model *m, int tok, int t, int *out) {
         double t1 = now_s();
         ink_pin_state_restore(m, snap);
         rp = ring;
-        for (int i = 0; i < c->n_layers; i++) {
+        for (int i = 0; i < c->n_state; i++) {
             const int win = kv_ring_rows(c, i, m->max_t), hd = L_HD(c, i);
             if (win >= m->max_t) continue;
             /* every row: the forward again reads the older positions there before it writes the

@@ -9,7 +9,8 @@
  *     group dx * (sw * sum(w8 * xq) - mw * xs). The same integers and scales as the CPU's:
  *     the two differ only in the order of the float sums. Types 6 Q5_0, 7 Q5_1, 8 Q8_0,
  *     10 Q2_K, 11 Q3_K, 12 Q4_K, 13 Q5_K, 14 Q6_K, 16 IQ2_XXS, 17 IQ2_XS, 18 IQ3_XXS,
- *     19 IQ1_S, 20 IQ4_NL, 21 IQ3_S, 22 IQ2_S, 23 IQ4_XS, 29 IQ1_M, 42 Q2_0 (bdi_has).
+ *     19 IQ1_S, 20 IQ4_NL, 21 IQ3_S, 22 IQ2_S, 23 IQ4_XS, 29 IQ1_M, 42 Q2_0 (bdi_has); 40 NVFP4 for the
+ *     routed experts' GEMVs only (bdi_moe_has).
  *   - bdf_decode: shaders/blockdec.glsl's general path, every block type, a 32-weight unit
  *     as int weights with a scale and a min per 16, in floats (the other types: Q4_0, Q4_1,
  *     TQ1_0, TQ2_0, MXFP4, NVFP4, Q1_0).
@@ -54,13 +55,16 @@ __host__ __device__ constexpr bool bdi_has(int t) {
     return t == 6 || t == 7 || t == 8 || t == 10 || t == 11 || t == 12 || t == 13 || t == 14 || t == 16 || t == 17 || t == 18 || t == 19 || t == 20 ||
            t == 21 || t == 22 || t == 23 || t == 29 || t == 42;
 }
+/* bdi_has's types and NVFP4 (40): the routed experts' GEMVs (backend_cuda.cu's moe_bd_*) take its step;
+ * the dense matrices' kernels keep its float form */
+__host__ __device__ constexpr bool bdi_moe_has(int t) { return bdi_has(t) || t == 40; }
 /* the type's tables in shared memory, in words: its grid, ksigns, kvalues */
 __host__ __device__ constexpr int bd_grid_words(int t) { return t == 22 ? 2048 : t == 17 ? 1024 : t == 21 || t == 16 ? 512 : t == 18 ? 256 : 0; }
 __host__ __device__ constexpr int bd_grid_base(int t) {
     return t == 22 ? BDT_IQ2S : t == 21 ? BDT_IQ3S : t == 17 ? BDT_IQ2XS : t == 18 ? BDT_IQ3XXS : BDT_IQ2XXS;
 }
 __host__ __device__ constexpr int bd_ks_words(int t) { return t == 16 || t == 17 || t == 18 ? 128 : 0; }
-__host__ __device__ constexpr int bd_kv_words(int t) { return 0; }   /* IQ4's values in registers (bdi_kv4) */
+__host__ __device__ constexpr int bd_kv_words(int) { return 0; }   /* IQ4's values in registers (bdi_kv4) */
 __host__ __device__ constexpr int bd_tab_words(int t) { return (bd_grid_words(t) + bd_ks_words(t) + bd_kv_words(t) + 3) & ~3; }
 
 /* ksm (bd_mmg_k's): ksigns' sign masks, entry i's bdi_smask of its low and high 4 bits at 2i, 2i + 1 */
@@ -158,12 +162,28 @@ __device__ __forceinline__ bd_u32 bdi_neg(bd_u32 g, bd_u32 b4) { bd_u32 m = bdi_
  * the words above, no table in memory), its fourth bit which of the two. The kernel spent its
  * time on the four table reads a word (an IQ4_XS GEMV at 54-83 % of the SM's issue, 26-44 % of
  * the DRAM's bandwidth, an RTX PRO 4000); the values are the table's. */
-__device__ __forceinline__ int bdi_kv4(bd_u32 w, int sh) {
+template <bd_u32 K0, bd_u32 K1, bd_u32 K2, bd_u32 K3>
+__device__ __forceinline__ int bdi_kv4t(bd_u32 w, int sh) {
     const bd_u32 v = (w >> sh) & 0x0F0F0F0Fu, x = v & 0x07070707u, y = x | (x >> 4);
     const bd_u32 sel = __byte_perm(y, 0u, 0x0020u);   /* nibble i: index i's low three bits */
-    const bd_u32 lo = __byte_perm(BD_KV4_0, BD_KV4_1, sel), hi = __byte_perm(BD_KV4_2, BD_KV4_3, sel);
+    const bd_u32 lo = __byte_perm(K0, K1, sel), hi = __byte_perm(K2, K3, sel);
     const bd_u32 m = ((v >> 3) & 0x01010101u) * 0xFFu;   /* 0xFF in each byte whose index is 8 or more */
     return (int)((lo & ~m) | (hi & m));
+}
+__device__ __forceinline__ int bdi_kv4(bd_u32 w, int sh) { return bdi_kv4t<BD_KV4_0, BD_KV4_1, BD_KV4_2, BD_KV4_3>(w, sh); }
+/* MXFP4's and NVFP4's sixteen values (GGML_KVALUES_MXFP4: e2m1 doubled), the same packing */
+#define BD_KM4_0 0x03020100u   /*   0   1   2   3 */
+#define BD_KM4_1 0x0C080604u   /*   4   6   8  12 */
+#define BD_KM4_2 0xFDFEFF00u   /*   0  -1  -2  -3 */
+#define BD_KM4_3 0xF4F8FAFCu   /*  -4  -6  -8 -12 */
+__device__ __forceinline__ int bdi_km4(bd_u32 w, int sh) { return bdi_kv4t<BD_KM4_0, BD_KM4_1, BD_KM4_2, BD_KM4_3>(w, sh); }
+/* NVFP4's scale byte: unsigned E4M3 halved, as the CPU's gq_ue4m3_half (the same bits, 0 and 0x7F
+ * nothing) */
+__device__ __forceinline__ float bdi_ue4m3h(bd_u32 x) {
+    if (x == 0u || x == 0x7Fu) return 0.f;
+    const bd_u32 e = (x >> 3) & 15u, m = x & 7u;
+    if (e == 0u) return (float)m * (1.f / 1024.f);
+    return __uint_as_float(((e - 8u + 127u) << 23) | (m << 20));
 }
 /* Q4_K / Q5_K: byte j of the block's 12 scale bytes (words 1..3), the 6-bit scale and min of group g */
 __device__ __forceinline__ bd_u32 bdi_kb(uint4 hd, bd_u32 j) { bd_u32 w = j < 4u ? hd.y : j < 8u ? hd.z : hd.w; return (w >> (8u * (j & 3u))) & 255u; }
@@ -226,6 +246,23 @@ __device__ __forceinline__ void bdi_step(const bd_u32 *__restrict__ W, bd_u32 q,
             for (int k = 0; k < 4; k++) { sl = bd_dp4a(wl[k], xl[k], sl); sh = bd_dp4a(wh[k], xh[k], sh); }
             const float *dx = X.dx + r * X.nb; const int *xs = X.xs + r * 2 * X.nb;
             acc[r] = bdi_upd_k45(acc[r], dx[gl >> 1], dx[gh >> 1], sl0, ml0, sh0, mh0, sl, sh, xs[gl], xs[gh]);
+        }
+        return;
+    }
+    if (T == 40) {   /* NVFP4 (bdi_moe_has): blocks of 64 weights, two steps; four E4M3 scale bytes, a group of 16
+                      * each, then group g's 8 bytes: byte j its weights 16g + j (low nibble) and 16g + 8 + j (high) */
+        bd_u32 b = q >> 1, h = q & 1u, base = b * 36u, qw = (base + 4u + 16u * h) >> 2;
+        bd_u32 sc = bd_w(W, base >> 2), w0 = bd_w(W, qw), w1 = bd_w(W, qw + 1u), w2 = bd_w(W, qw + 2u), w3 = bd_w(W, qw + 3u);
+        int wv[8] = {bdi_km4(w0, 0), bdi_km4(w1, 0), bdi_km4(w0, 4), bdi_km4(w1, 4),
+                     bdi_km4(w2, 0), bdi_km4(w3, 0), bdi_km4(w2, 4), bdi_km4(w3, 4)};
+        float c0 = bdi_ue4m3h((sc >> (16u * h)) & 255u), c1 = bdi_ue4m3h((sc >> (16u * h + 8u)) & 255u);
+        #pragma unroll
+        for (int r = 0; r < NR; r++) if (r < nrow) {
+            int xw[8]; bdx_step8(X, r, q, xw);
+            int s0 = 0, s1 = 0;
+            #pragma unroll
+            for (int k = 0; k < 4; k++) { s0 = bd_dp4a(wv[k], xw[k], s0); s1 = bd_dp4a(wv[k + 4], xw[k + 4], s1); }
+            acc[r] = bdi_upd_2(acc[r], X.dx[r * X.nb + q], c0, c1, s0, s1);
         }
         return;
     }
@@ -1708,7 +1745,7 @@ static thread_local int g_bd_x_same = 0;
 /* the stream's records forgotten on whatever device: a stream is one device's, and a record forgotten
  * costs no more than its x quantized again. So a matmul does not ask for the device (cudaGetDevice
  * every matmul: an R9700's runtime went from 2898 calls to 37989 in a 64-token request, #2757) */
-static void bd_xq_forget(cudaStream_t st) {
+static inline void bd_xq_forget(cudaStream_t st) {
     std::lock_guard<std::mutex> lk(g_bd_xq_mu);
     for (int i = 0; i < g_bd_xq_n; i++) if (g_bd_xq[i].st == st) g_bd_xq[i].h = {nullptr, 0, 0};
 }
@@ -1864,8 +1901,8 @@ static inline int bd_fmt_ok(int fmt) {
 }
 /* the rows ids[0..n) of a block-format matrix against one row of x (bd_gemv_rows_i8_k): the types
  * with the integer form; 0 for the others */
-static int bd_gemv_rows_launch(float *y, const float *x, const bd_u32 *W, const bd_u32 *tab, const int *ids, int fmt, int I, int O,
-                               int rowWords, int n, size_t smem_max, cudaStream_t st) {
+static inline int bd_gemv_rows_launch(float *y, const float *x, const bd_u32 *W, const bd_u32 *tab, const int *ids, int fmt, int I, int O,
+                                      int rowWords, int n, size_t smem_max, cudaStream_t st) {
     if (!bd_fmt_ok(fmt) || I % 32 || I % BD_BLK[fmt - 100]) return 0;
     switch (fmt - 100) {
 #define BD_R8_CASE(t) case t: return bd_gemv_rows_i8_launch<t>(y, x, W, tab, ids, I, O, rowWords, n, smem_max, st);
@@ -1877,8 +1914,8 @@ static int bd_gemv_rows_launch(float *y, const float *x, const bd_u32 *W, const 
 }
 /* y = silu(x Wg^T) * (x Wu^T) for up to BD_GEMV_MAX_S rows, Wg and Wu of one type and shape (bd_gemv_i8_k's
  * GLU): the types with the integer form; 0 for the others (the caller's two GEMVs and its SwiGLU then) */
-static int bd_glu_launch(float *y, const float *x, const bd_u32 *Wg, const bd_u32 *Wu, const bd_u32 *tab, int fmt, int I, int O,
-                         int rowWords, int S, size_t smem_max, cudaStream_t st) {
+static inline int bd_glu_launch(float *y, const float *x, const bd_u32 *Wg, const bd_u32 *Wu, const bd_u32 *tab, int fmt, int I, int O,
+                                int rowWords, int S, size_t smem_max, cudaStream_t st) {
     if (!bd_fmt_ok(fmt) || I % 32 || I % BD_BLK[fmt - 100] || !Wu) return 0;
     switch (fmt - 100) {
 #define BD_G8_CASE(t) case t: return bd_gemv_i8_launch<t>(y, x, Wg, tab, I, O, rowWords, S, smem_max, st, Wu);

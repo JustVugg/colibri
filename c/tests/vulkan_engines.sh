@@ -636,6 +636,37 @@ PY
     SNAP=ink2_ggufd/gg -- 8 0 ink2_ggufd/ref.json
   CHAINNAME=inkling2 chain_gate inkling "chain inkling2 GGUF Q8_0 dense, tiled GEMM" 0 COLI_VK_DENSE=1 GQ_EXACT=1 COLI_VK_IDOT=0 \
     SNAP=ink2_ggufd/gg -- 8 0 ink2_ggufd/ref.json
+  # Inkling-2-Mini's loop (tools/make_tiny_inkling2_loop.py, transformers' Inkling2LoopForCausalLM:
+  # tools/oracle-inkling2-loop-requirements.txt): the tier with the layers on the CPU, then the
+  # chain with the passes on the device (their own K/V mirrors and convolution states, the
+  # messages and their gates), and prompts only
+  if $PY -c "import transformers; transformers.Inkling2LoopForCausalLM" 2>/dev/null; then
+    $PY tools/make_tiny_inkling2_loop.py tiny_loop
+    local RL=tiny_loop/ref_inkling2.json
+    for cap in 1 8; do
+      tier_gate inkling "inkling2 loop tier f32 cap=$cap" SNAP=tiny_loop -- $cap 0 $RL
+      CHAINNAME=inkling2 chain_gate inkling "chain inkling2 loop f32 cap=$cap" 1 COLI_VK_DENSE=1 SNAP=tiny_loop -- $cap 0 $RL
+    done
+    CHAINMODE=2 CHAINNAME=inkling2 chain_gate inkling "chain inkling2 loop prompts only" 1 COLI_VK_DENSE=1 SNAP=tiny_loop -- 8 0 $RL
+  else
+    echo "  skip: the Inkling-2-Mini loop gates need transformers with Inkling2LoopForCausalLM (tools/oracle-inkling2-loop-requirements.txt)"
+  fi
+  # a tiny Inkling-2-Mini GGUF as UD-Q4_K_XL lays it out (tests/test_gguf_import.py: NVFP4 experts
+  # with their global scales outside the blocks, Q8_0 ones elsewhere): the chain's experts in the
+  # frame (the scales in the table's entries, NVFP4 through the block step) against the CPU's
+  if [ ! -d ink2m_nv/gg ]; then
+    rm -rf ink2m_nv && mkdir ink2m_nv
+    $PY - <<'PY' || fail "gguf-py (pip install gguf) is needed for the Inkling-2-Mini GGUF gate"
+import json, sys
+sys.path.insert(0, "tests")
+from test_gguf_import import write_inkling2_mini_pair
+write_inkling2_mini_pair("ink2m_nv", experts="NVFP4")
+p = [5, 77, 13, 201, 42, 9, 150, 33, 61, 18, 240, 7]
+json.dump({"prompt_ids": p, "full_ids": p + [0] * 16}, open("ink2m_nv/ref.json", "w"))
+PY
+  fi
+  CHAINNAME=inkling2 chain_gate inkling "chain inkling2 loop GGUF NVFP4 experts in the frame" 1 COLI_VK_DENSE=1 GQ_EXACT=1 COLI_VK_IDOT=0 \
+    COLI_VK_CHAIN_GEMM=0 SNAP=ink2m_nv/gg -- 8 0 ink2m_nv/ref.json
 }
 
 family_inkling_olmoe() {
@@ -2320,7 +2351,7 @@ spec_fixtures() {
   $PY tools/make_qwen38_tiny.py --out qwen38_tiny_mtp --mtp
   $PY tools/make_edge_tiny_tokenizer.py --vocab-size 64 ./qwen38_tiny_mtp   # serve speaks text
   $PY tools/make_qwen38_tiny.py --out qwen38_tiny_int4_mtp --fp8-experts --int4-experts --expert-gain 3 --mtp
-  make qwen36-tiny-v128-generate
+  make -j1 qwen36-tiny-v128-generate
 }
 family_qwen_spec() {
   make qwen36 qwen38 tests/test_spec_draft VK=1
@@ -2339,7 +2370,7 @@ family_qwen_spec() {
   # device (one frame a draft), every depth's tokens and last logits those of plain decoding
   # in the same chain, serve with prefix reuse and pins. Its draft logits against the
   # reference within the device's roundings (make qwen36-tiny-mtp-check holds the CPU's to 1e-6).
-  make qwen36-tiny-mtp-generate
+  make -j1 qwen36-tiny-mtp-generate
   $PY tests/qwen36_mtp_harness.py --engine ./qwen36 --source ./qwen36_tiny_mtp --model ./qwen36_tiny_mtp_i8 \
     --model ./qwen36_tiny_mtp_i4 --quick --device --head-tol 2e-2 $chain
   # A six-row verify crosses several one-row KV chunks. Rollback must lower both
@@ -4955,7 +4986,7 @@ family_decide() {
   make laya gliner_decide qwen36 tests/test_qwen36_weight_alloc VK=1 EXTRA_CFLAGS="$SANF"
   COLI_VULKAN=0 ./tests/test_qwen36_weight_alloc
   COLI_VULKAN=1 ./tests/test_qwen36_weight_alloc
-  make laya-tiny-generate gliner-decide-tiny-generate clef-tiny-generate
+  make -j1 laya-tiny-generate gliner-decide-tiny-generate clef-tiny-generate   # one generator at a time
   export OMP_NUM_THREADS=2
   local c e
   local -a cmp=(
@@ -4991,7 +5022,7 @@ family_decide() {
   decide_vk_lines serve.log "decide serve"
   echo "OK decide: the serve tests (tests.test_decision_serve) through the device: $(tail -1 serve.log)"
   if [ -z "${SAN:-}" ] && $PY -c "import typesafe_sdk" 2>/dev/null && [ -d "${JEV_TS_SDK_DIR:-tools/jev-sdk}/node_modules" ]; then
-    make mimo VK=1 mimo-tiny-generate
+    make -j1 mimo VK=1 mimo-tiny-generate   # the generator after the engine
     rm -f sdk-serve.log
     COLI_VULKAN=1 COLI_VK_CHAIN=1 JEV_SDK_REQUIRED=1 JEV_SDK_SERVE_LOG=sdk-serve.log \
       $PY -m unittest tests.test_jev_sdk > sdk.log 2>&1 || { tail -80 sdk.log; fail "decide: TypeSafe's SDKs through the device"; }

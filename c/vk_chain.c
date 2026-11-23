@@ -2830,7 +2830,7 @@ int vkc_prewarm(const VkcPrewarm *pw) {
         uint32_t et[16] = {0};
         et[14] = (uint32_t)ta; et[15] = (uint32_t)(ta >> 32);
         ok = ok && vkc_zero(w, 0, 4) && vkc_write(tab, 0, et, sizeof et);
-        struct { int I, O; float limit; int ibase, kgat, rpw; } gp = {0, 1, 0.f, 0, 0, 0};
+        struct { int I, O; float limit; int ibase, kgat, rpw; int act; float a, b; } gp = {0, 1, 0.f, 0, 0, 0, 0, 1.f, 1.f};   /* a prewarm: no rows, any activation */
         VkcBind gb[5] = {B(x, 0), B(w, 0), B(tab, 0), B(hid, 1), B(ids, 0)};
         for (int t = 0; t < 64 && ok; t++)
             for (int v = 0; v < 2 && ok; v++) {
@@ -3167,7 +3167,7 @@ int vkc_moe_rows(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcMoeRows *r
     pc.mode = 1; ok = ok && record(KC.rows, sb, 7, &pc, sizeof pc, 1, 1, 1);
     pc.mode = 2; ok = ok && record(KC.rows, sb, 7, &pc, sizeof pc, gp, 1, 1);
     /* gate+up: the tokens' rows gathered by amap into the packed hidden rows */
-    struct { int I, O; float limit; int ibase, kgat, rpw; } pg = {p->D, p->I, p->limit, 0, p->K, 0};
+    struct { int I, O; float limit; int ibase, kgat, rpw; int act; float a, b; } pg = {p->D, p->I, p->limit, 0, p->K, 0, p->act, p->a, p->b};
     size_t eb0 = (size_t)16 * E * 4;   /* the down pass's table */
     VkcBind gb[5] = {B(x, 0), B(r->items, 0), {r->etab->buf, 0, eb0, 0}, B(r->hid, 1), B(r->amap, 0)};
     r->etab->last_frame = KC.serial;
@@ -3177,7 +3177,7 @@ int vkc_moe_rows(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcMoeRows *r
                pdn = wide ? grpw_pipe(0, p->dfmt - 100) : rows_pipe(0, p->dfmt, !p->floats);
     ok = ok && record_indirect(pgu, gb, 5, &pg, sizeof pg, r->aux, 0);
     /* down: the packed hidden rows into the pairs' rows (amap) */
-    struct { int I, O; float limit; int ibase, kgat, rpw; } pd = {p->I, p->D, 0.f, (int)imax, p->K, 0};
+    struct { int I, O; float limit; int ibase, kgat, rpw; int act; float a, b; } pd = {p->I, p->D, 0.f, (int)imax, p->K, 0, p->act, p->a, p->b};
     VkcBind db[5] = {B(r->hid, 0), B(r->items, 0), {r->etab->buf, eb0, eb0, 0}, B(r->yk, 1), B(r->amap, 0)};
     ok = ok && record_indirect(pdn, db, 5, &pd, sizeof pd, r->aux, 16);
     if (ok) KC.st.grp_coop += wide ? 2 : rows_coop(1, p->gfmt, pgu) + rows_coop(0, p->dfmt, pdn);
@@ -3387,17 +3387,41 @@ int vkc_sconv(VkcBuf *x, VkcBuf *w, VkcBuf *ring, const VkcSconv *p) {
     grid(((uint64_t)p->n + 63) / 64, &gx, &gy);
     return record(pipe, bd, 1, p, sizeof *p, gx, gy, 1);
 }
+/* the split decode's partials (chain_relattn.comp modes 1 and 2), the engine's buffer: sized by it
+ * for its most rows and positions, so no call grows it inside a frame; NULL: no split */
+static VkcBuf *g_relattn_part;
+void vkc_relattn_part(VkcBuf *part) { g_relattn_part = part; }
+static int relattn_split_wanted(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_RELATTN_SPLIT"); on = !(e && *e == '0'); }
+    return on;
+}
 int vkc_relattn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *kvs, VkcBuf *r, VkcBuf *relp, VkcBuf *tau,
                 const VkcRelAttn *p) {
     VkPipeline pipe = kx_pipe(1);
     if (!pipe || p->hd > 256 || p->d_rel > 64 || p->d_rel < 0 || p->KVH < 1 || p->H % p->KVH || p->cap < 1) return 0;
     KC.kind = PK_ATTN;
+    /* a decode step over many positions: its positions over workgroups, then their combine */
+    {
+        int nmax = p->pos_base + p->S;
+        if (p->window > 0 && nmax > p->window) nmax = p->window;
+        const int nc = (nmax + 127) / 128;
+        const size_t need = (size_t)p->S * p->H * nc * (p->hd + 2) * sizeof(float);
+        if (p->S <= 8 && nc >= 2 && g_relattn_part && need <= g_relattn_part->bytes && relattn_split_wanted()) {
+            struct { VkcRelAttn a; int s0, mode, nc; } x = {*p, 0, 1, nc};
+            VkcBind b1[8] = {B(q, 0), B(kc, 0), B(vc, 0), B(g_relattn_part, 1), B(kvs, 0), B(r, 0), B(relp, 0), B(tau, 0)};
+            VkcBind b2[8] = {B(q, 0), B(kc, 0), B(vc, 0), B(o, 1), B(g_relattn_part, 0), B(r, 0), B(relp, 0), B(tau, 0)};
+            if (!record(pipe, b1, 8, &x, sizeof x, (uint32_t)p->H, (uint32_t)p->S, (uint32_t)nc)) return 0;
+            x.mode = 2;
+            return record(pipe, b2, 8, &x, sizeof x, (uint32_t)p->H, (uint32_t)p->S, 1);
+        }
+    }
     VkcBind bd[8] = {B(q, 0), B(kc, 0), B(vc, 0), B(o, 1), B(kvs, 0), B(r, 0), B(relp, 0), B(tau, 0)};
     /* a long prompt chunk in slices of rows, a submission each (attn_slice_rows): the
      * shader's s0 is the slice's first row, pos_base stays the step's */
     int S = p->S, rr = attn_slice_rows(S, p->pos_base, (double)p->H * p->hd, 1, p->H), ok = 1;
     for (int r0 = 0; ok && r0 < S; r0 += rr) {
-        struct { VkcRelAttn a; int s0; } x = {*p, r0};
+        struct { VkcRelAttn a; int s0, mode, nc; } x = {*p, r0, 0, 0};
         x.a.S = S - r0 < rr ? S - r0 : rr;
         x.a.q_off += r0 * p->q_row; x.a.o_off += r0 * p->o_row; x.a.r_off += r0 * p->r_row; x.a.tau_off += r0;
         if (p->has_sink) x.a.sink_off += r0 * p->H;

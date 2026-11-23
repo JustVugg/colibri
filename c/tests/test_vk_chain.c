@@ -741,7 +741,7 @@ static void test_ew(void) {
         {VKC_EW_ADD, 0, R * D, "add"}, {VKC_EW_COMBINE, 1 | 2 | 4, R * D, "combine"}, {VKC_EW_COMBINE, 2 | 8, R * D, "combine-noresid"},
         {VKC_EW_COMBINE, 1, R * D, "combine-routed"}, {VKC_EW_SWIGLU, 0, R * D, "swiglu"}, {VKC_EW_HC_LOW, 0, R * D, "hc-low"},
         {VKC_EW_HC_MIX, 0, R * D, "hc-mix"}, {VKC_EW_HC_INJ, 0, R * C, "hc-inj"}, {VKC_EW_HC_APPLY, 0, R * W, "hc-apply"},
-        {VKC_EW_SCALE, 0, R * D, "scale"}, {VKC_EW_HEADGATE, 0, R * D, "headgate"}};
+        {VKC_EW_SCALE, 0, R * D, "scale"}, {VKC_EW_HEADGATE, 0, R * D, "headgate"}, {VKC_EW_LOOPGATE, 0, R * D, "loopgate"}};
     for (size_t k = 0; k < sizeof ops / sizeof *ops; k++) {
         int n = ops[k].n, op = ops[k].op, f = ops[k].flags;
         for (int i = 0; i < n; i++) {
@@ -759,11 +759,14 @@ static void test_ew(void) {
                 ref[i] = c[i] + a[rr * C + s] * b[rr * D + dd]; break; }
             case VKC_EW_SCALE: ref[i] = a[i] * (float)C; break;
             case VKC_EW_HEADGATE: ref[i] = a[i] * sigm(b[i / D]); break;
+            /* Inkling-2-Mini's gate, the message from a here: tanh as the shader writes it */
+            case VKC_EW_LOOPGATE: { float tf = 1.f - 2.f / (expf(2.f * a[i]) + 1.f), tg = 1.f - 2.f / (expf(2.f * b[i]) + 1.f);
+                ref[i] = (1.f - tf) * c[i] + tg * a[i]; break; }
             }
         }
         if (op == VKC_EW_HC_APPLY) { vkc_begin(); vkc_write(yb, 0, c, nw * 4); vkc_submit(1); }
         VkcEw p = {op, n, D, C, f, 1, 0, 0, 0, 0, 0, (float)C};
-        vkc_begin(); int ok = vkc_ew(yb, ab, bb, cb, eb, &p); vkc_submit(1);
+        vkc_begin(); int ok = vkc_ew(yb, ab, bb, cb, op == VKC_EW_LOOPGATE ? ab : eb, &p); vkc_submit(1);
         float *y = down(yb, 0, n);
         double err = relerr(y, ref, n, 1e-3);
         CHECK(ok && err < 1e-6, "ew %s: err %.2e", ops[k].name, err);

@@ -247,7 +247,8 @@ The card holds the 12.5 GiB of dense matrices and the chain's 3.1 GiB, and the t
 ## OLMoE on the card (`olmoe_cuda_chain.h`)
 
 OLMoE-1B-7B is small enough to hold whole on a card (Q4_K_M: 3.9 GiB of experts and 0.6 GiB of
-the rest), so a CUDA build (`make olmoe CUDA=1`) with `COLI_CUDA=1` (`coli serve --gpu`) puts
+the rest), so a CUDA build (`make olmoe CUDA=1`, which `coli setup` makes on an NVIDIA card, and
+`olmoe.exe` of the Windows CUDA package) with `COLI_CUDA=1` (`coli serve --gpu`) puts
 every layer, every routed expert and lm_head on the device and runs a step of any rows as one
 frame: the norms, q/k/v (one matrix where their forms agree), OLMoE's q and k norms over the
 whole projection, RoPE, the new K/V rows into a float16 mirror, the attention, o_proj, the router,
@@ -296,18 +297,55 @@ them to the CPU's arithmetic). The chain needs the backend's own tensors: at its
 each bf16 matrix is read back once, freed and uploaded as a GGUF's BF16 rows (the same bytes);
 the per-matrix path then runs through those tensors where the chain declines a step.
 
-It is off by default because it measured no faster. On an RTX PRO 4000 with Inkling-2-Small int4
-g64 (62 GB of RAM, the experts from RAM and disk), 64 tokens on three prompts in the same session:
-1.24-1.27 tok/s with it against 1.26-1.29 without, the same text. The dense part of a run went
-from 4.7 to 3.4 s, but the routed experts and the reads took about as much back (the chain and
-the expert tier share the card), and the first prompt pays about 4.5 s to move the matrices. The
-tiny oracles match token for token with it, their logits within 1e-5 of the CPU's.
+For Inkling-2-Mini it is on by default (`COLI_CUDA_CHAIN` unset; `0` turns it off), with three
+things the Small's runs did not have:
+
+- the loop: layers 6-17 run three passes, each with its own K/V mirror and convolution states,
+  the messages through the residual mix and the gates through `cc_ew`'s `CC_EW_LOOPGATE`, in the
+  CPU's order (`ink2_layers_forward`);
+- the routed experts in the frame: a decode step's rows (up to 8) route on the card (`cc_route`)
+  and run the CUDA tier's residents there (`cc_moe` with SiTU-GLU, `CcMoe.act` 1), by address
+  from the tier's table (`cut_dev_table`: `cu_xb.cu` writes each resident's `CcExpert`), so a
+  decode step whose layers all have every expert on the card is one frame. A GGUF's NVFP4 experts
+  keep each expert's global scale beside the table (`CcMoe.esc_off`) and go through an integer
+  step of their own (`cuda_bd.cuh`'s `bdi_moe_has`); the int4 g64 container's rows are the tier's
+  (`CcExpert.planar` 2, nibbles stored as v + 8). A layer with an expert elsewhere takes the
+  host's step, as do TOPP and `ROUTE_TRACE`; `COLI_CUDA_CHAIN_MOE=0` sends every layer there;
+- the attention of a decode step split over its positions (`COLI_CUDA_RELATTN_SPLIT`, on): a
+  block a tile of 128 positions for each (head, row), then a join in tile order. A block a head
+  walked every tile alone before, with only the heads' blocks on the card.
+
+A backend from before these ops (`cc_ink2_caps`) leaves the Mini on the per-matrix path. Measured
+on an RTX PRO 4000 Blackwell (24 GB, every expert of the model on the card), `coli serve`, about
+570 tokens of prompt then 100 of decode, tok/s:
+
+| Mini file | per-matrix | chain, experts on the host | chain, experts in the frame | + split attention |
+|---|---|---|---|---|
+| UD-Q4_K_XL | 106-107, 17.8-18.1 | 283-286, 20.0-20.6 | 283-286, 25.8-26.6 | 285-289, 40.9-41.1 |
+| UD-IQ2_XXS | 110-114, 20.2-20.5 | | 305-312, 27.8-28.8 | 311-317, 46.3-46.5 |
+| int4 g64 | 64-65, 16.0-16.3 | | 129-131, 23.7-24.4 | 131-132, 36.0-36.1 |
+
+The short answers were the same text on every arm; on a 300-token code answer the split moves a
+near tie 45 tokens in (the tiles' sums join in another order), as the per-matrix path and the
+chain without it part after about 240. The tiny Mini fixtures match the CPU token for token on the
+chain, the float ones' logits within 5e-5 and the int4 g64 container's within 2e-4; a GGUF's
+experts in the frame quantize the activations as the CPU's integer form does, and against it
+(`GQ_EXACT=0`) their logits stay within 2e-6 until a near tie parts the runs.
+
+For the Small it stays off by default because it measured no faster there. On an RTX PRO 4000
+with Inkling-2-Small int4 g64 (62 GB of RAM, the experts from RAM and disk), 64 tokens on three
+prompts in the same session: 1.24-1.27 tok/s with it against 1.26-1.29 without, the same text.
+The dense part of a run went from 4.7 to 3.4 s, but the routed experts and the reads took about
+as much back (the chain and the expert tier share the card), and the first prompt pays about
+4.5 s to move the matrices. The tiny oracles match token for token with it, their logits within
+1e-5 of the CPU's.
 
 ## The decision engines
 
 Laya (`laya.c`) and GLiNER2.5-Decide (`gliner_decide.c`) answer a decision with one forward
 over the request's rows and generate no text ([systemone.md](systemone.md#decision-engines)).
-In a CUDA build (`make laya gliner_decide CUDA=1`) with `COLI_CUDA=1` (`coli serve --gpu`),
+In a CUDA build (`make laya gliner_decide CUDA=1`, which `coli setup` makes on an NVIDIA card, and
+the Windows CUDA package's `laya.exe` and `gliner_decide.exe`) with `COLI_CUDA=1` (`coli serve --gpu`),
 `decide_cuda.h` opens the device once the weights are loaded, uploads every matrix of the
 encoder and of Laya's head as f32 (the checkpoint's values), and runs each forward as frames
 of the CUDA chain, one submission a forward: the embedding rows go up, the activations stay on

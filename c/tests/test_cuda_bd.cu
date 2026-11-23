@@ -6,7 +6,8 @@
  *   - a verify's 2, 3 and 4 rows, sharing every weight load, each with the bits of the
  *     same row alone (a decode step's);
  *   - the routed experts of the dense chain (coli_cuda_moe_async, CcMoe.fmt >= 100) against
- *     the CPU's integer form, a row and a verify's; with some of them in page-locked host
+ *     the CPU's integer form, a row and a verify's; Inkling-2's (SiTU-GLU, NVFP4's integer step,
+ *     each expert's scales outside its blocks) too; with some of them in page-locked host
  *     memory (a host pool), read over the bus or staged, the same bits;
  *   - the backend's path: coli_cuda_tensor_upload of the file's rows (padded to words on the
  *     device where a row is not), the dense chain's matmul, the same bits as the kernel's;
@@ -466,6 +467,99 @@ static void check_moe(int tg, int td, int S, int K, int E, int D, int I) {
     free(tt); free(tab); free(G); free(U); free(Dn); free(x); free(w); free(y); free(ids);
 }
 
+/* Inkling-2's experts in the chain's frame (cuda_chain.h's CC_INK2_MOE): SiTU-GLU (CcMoe.act 1, caps act_a
+ * and act_b) and each expert's scales outside its blocks (esc_off: a GGUF's NVFP4 layers, gate's and up's one
+ * number, down's), a decode step's S rows, against the CPU's integer form with those scales applied as
+ * ink_vk_moe applies them (gate and up's outputs times the first, down's times the second); NVFP4 (40) through
+ * its integer step (bdi_moe_has). The same call without act 1 and with a step's rows past CC_MOE_FRAME_ROWS
+ * is refused, not computed. */
+static void check_moe_ink2(int tg, int td, int S, int K, int E, int D, int I, int esc) {
+    long rg = ref_row_bytes(tg, D), rd = ref_row_bytes(td, I);
+    if (rg <= 0 || rd <= 0) return;
+    int bg = ref_block_bytes(tg), bdb = ref_block_bytes(td);
+    size_t gb = (size_t)rg * I, db = (size_t)rd * D;
+    uint8_t *G = (uint8_t *)malloc(gb * E), *U = (uint8_t *)malloc(gb * E), *Dn = (uint8_t *)malloc(db * E);
+    for (size_t i = 0; i < gb * E; i++) { G[i] = (uint8_t)rnd(); U[i] = (uint8_t)rnd(); }
+    for (size_t i = 0; i < db * E; i++) Dn[i] = (uint8_t)rnd();
+    /* NVFP4's scale bytes held to E4M3 exponents 2..4 (about 0.016 to 0.12): random ones up to 240 saturate the caps */
+    auto fixb = [&](int t, uint8_t *b) { bd_fix(t, b); if (t == 40) for (int j = 0; j < 4; j++) b[j] = (uint8_t)(((2 + rnd() % 3) << 3) | (rnd() & 7)); };
+    for (int e = 0; e < E; e++) {
+        for (int o = 0; o < I; o++) for (long b = 0; b + bg <= rg; b += bg) { fixb(tg, G + e * gb + o * rg + b); fixb(tg, U + e * gb + o * rg + b); }
+        for (int o = 0; o < D; o++) for (long b = 0; b + bdb <= rd; b += bdb) fixb(td, Dn + e * db + o * rd + b);
+    }
+    ColiCudaTensor **tt = (ColiCudaTensor **)calloc((size_t)3 * E, sizeof *tt);
+    const size_t esc_off = ((size_t)E * sizeof(CcExpert) + 255) / 256 * 256;
+    char *htab = (char *)calloc(esc_off + (size_t)E * 8, 1);
+    CcExpert *tab = (CcExpert *)htab;
+    float *es = (float *)(htab + esc_off);
+    int ok = htab != NULL;
+    for (int e = 0; e < E && ok; e++) {
+        ok = coli_cuda_tensor_upload(&tt[3 * e], G + e * gb, NULL, 100 + tg, D, I, 0) && coli_cuda_tensor_upload(&tt[3 * e + 1], U + e * gb, NULL, 100 + tg, D, I, 0) &&
+             coli_cuda_tensor_upload(&tt[3 * e + 2], Dn + e * db, NULL, 100 + td, I, D, 0);
+        const float *sc; int gsz;
+        ok = ok && coli_cuda_tensor_dev(tt[3 * e], &tab[e].g, &sc, &gsz) && coli_cuda_tensor_dev(tt[3 * e + 1], &tab[e].u, &sc, &gsz) &&
+             coli_cuda_tensor_dev(tt[3 * e + 2], &tab[e].d, &sc, &gsz);
+        es[2 * e] = esc ? 0.5f + (float)(rnd() % 1000) / 1000.f : 1.f; es[2 * e + 1] = esc ? 0.5f + (float)(rnd() % 1000) / 1000.f : 1.f;
+    }
+    const float ca = 7.f, cb = 9.f;   /* the caps: in reach of these rows' gate and up */
+    float *x = (float *)malloc((size_t)S * D * 4), *w = (float *)malloc((size_t)S * K * 4), *y = (float *)malloc((size_t)S * D * 4);
+    int *ids = (int *)malloc((size_t)S * K * 4);
+    for (int i = 0; i < S * D; i++) x[i] = ((int)(rnd() % 20001) - 10000) * 1e-4f;
+    for (int s = 0; s < S; s++)
+        for (int k = 0; k < K; k++) {
+            int e;
+            do { e = (int)(rnd() % E); int dup = 0; for (int j = 0; j < k; j++) dup |= ids[s * K + j] == e; if (!dup) break; } while (1);
+            ids[s * K + k] = e; w[s * K + k] = (float)(1 + rnd() % 100) / 100.f;
+        }
+    if (S > 1) ids[K + 1] = -1;
+    char *dtab; float *dx_, *dw, *dy, *dh; int *di;
+    size_t hf = cc_moe_hid_floats(S, K, D, I, E);
+    cudaMalloc(&dtab, esc_off + (size_t)E * 8); cudaMalloc(&dx_, (size_t)S * D * 4); cudaMalloc(&dw, (size_t)S * K * 4);
+    cudaMalloc(&dy, (size_t)S * D * 4); cudaMalloc(&dh, hf * 4); cudaMalloc(&di, (size_t)S * K * 4);
+    cudaMemcpy(dtab, htab, esc_off + (size_t)E * 8, cudaMemcpyHostToDevice); cudaMemcpy(dx_, x, (size_t)S * D * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(dw, w, (size_t)S * K * 4, cudaMemcpyHostToDevice); cudaMemcpy(di, ids, (size_t)S * K * 4, cudaMemcpyHostToDevice);
+    CcMoe mp = {};
+    mp.S = S; mp.K = K; mp.D = D; mp.I = I; mp.fmt = 100 + tg; mp.fmt_d = 100 + td; mp.parts = 3; mp.E = E; mp.act = 1;
+    mp.x_row = D; mp.i_row = K; mp.w_row = K; mp.y_row = D; mp.h_off = -1; mp.esc_off = esc ? (int)esc_off : 0; mp.act_a = ca; mp.act_b = cb;
+    ok = ok && coli_cuda_moe_async(0, (const CcExpert *)dtab, dx_, di, dw, dh, dy, NULL, &mp, NULL) && cudaDeviceSynchronize() == cudaSuccess;
+    cudaMemcpy(y, dy, (size_t)S * D * 4, cudaMemcpyDeviceToHost);
+    double worst = 0;
+    if (ok) {
+        int8_t *xq = (int8_t *)malloc(16384); float *dxs = (float *)malloc(4096), *h = (float *)malloc((size_t)I * 4); int32_t *xss = (int32_t *)malloc(4096);
+        for (int s = 0; s < S; s++) {
+            double *ref = (double *)calloc((size_t)D, sizeof(double)), *mag = (double *)calloc((size_t)D, sizeof(double));
+            for (int k = 0; k < K; k++) {
+                int e = ids[s * K + k];
+                if (e < 0) continue;
+                ref_quant(x + (size_t)s * D, D, xq, dxs, xss);
+                for (int o = 0; o < I; o++) {
+                    double g = es[2 * e] * ref_dot(tg, G + e * gb + o * rg, D, xq, dxs, xss), u = es[2 * e] * ref_dot(tg, U + e * gb + o * rg, D, xq, dxs, xss);
+                    h[o] = (float)(ca * tanh(g / ca) / (1 + exp(-g)) * cb * tanh(u / cb));
+                }
+                ref_quant(h, I, xq, dxs, xss);
+                for (int o = 0; o < D; o++) {
+                    double v = es[2 * e + 1] * ref_dot(td, Dn + e * db + o * rd, I, xq, dxs, xss);
+                    ref[o] += w[s * K + k] * v; mag[o] += fabs(w[s * K + k] * v);
+                }
+            }
+            for (int o = 0; o < D; o++) { double e = fabs(y[(size_t)s * D + o] - ref[o]) / (mag[o] + 1e-3); if (!(e <= worst)) worst = e; }
+            free(ref); free(mag);
+        }
+        free(xq); free(dxs); free(h); free(xss);
+    }
+    /* refused: act 1 or the scales past a decode step's rows (the prompt paths keep SiTU-GLU's caps out) */
+    CcMoe big = mp; big.S = CC_MOE_FRAME_ROWS + 1;
+    int refused = !coli_cuda_moe_async(0, (const CcExpert *)dtab, dx_, di, dw, dh, dy, NULL, &big, NULL);
+    if (!ok || !(worst <= 2e-3) || !refused)
+        { printf("FAIL moe SiTU %s/%s S %d%s: %s %.3g%s\n", ref_name(tg), ref_name(td), S, esc ? " with scales" : "", ok ? "off by" : "the call failed", worst,
+                 refused ? "" : ", a prompt's rows taken"); fails++; }
+    else printf("moe SiTU %-7s/%-7s S %d K %d%s: within %.2g of the CPU's integer form\n", ref_name(tg), ref_name(td), S, K,
+                esc ? ", the scales outside the blocks" : "", worst);
+    cudaFree(dtab); cudaFree(dx_); cudaFree(dw); cudaFree(dy); cudaFree(dh); cudaFree(di);
+    for (int i = 0; i < 3 * E; i++) if (tt[i]) coli_cuda_tensor_free(tt[i]);
+    free(tt); free(htab); free(G); free(U); free(Dn); free(x); free(w); free(y); free(ids);
+}
+
 /* BENCH_MOE: a prompt chunk's routed experts through the f16 tiles, timed: E experts of tg/tg/td with
  * random blocks, S rows of K distinct routes, parts 1 and 2 (the tiles and the sum), ms a call */
 static void check_ok(int ok, const char *what) { if (ok) printf("  %s\n", what); else { printf("FAIL %s\n", what); fails++; } }
@@ -718,6 +812,8 @@ int main(void) {
         check_moe(pairs[i][0], pairs[i][1], 40, 8, 16, 1024, 768);
     }
     for (int g : {22, 16, 29}) for (int S : {2, 4}) check_moe(g, 42, S, 10, 24, 2560, 640);   /* Qwen3.8-Flash-Next IQ2_XS's experts, a verify's rows */
+    /* Inkling-2-Mini's experts in the frame: UD-Q4_K_XL's NVFP4 with their global scales, its UD-IQ2_XXS layers, Q8_0 */
+    for (int S : {1, 3}) { check_moe_ink2(40, 40, S, 8, 16, 2048, 768, 1); check_moe_ink2(16, 16, S, 8, 16, 2048, 768, 0); check_moe_ink2(8, 8, S, 8, 16, 1024, 512, 1); }
     /* a prompt's rows of a layer in one call, down by slices (coli_cuda_moe_cols_async): Qwen3.8's shape, 40 experts,
      * the 64-row tiles (S 100) and the 128-row ones (S 2100), against one call of every output */
     for (int g : {42, 16}) for (int S : {100, 2100}) bench_moe(g, 42, S, 10, 40, 2560, 640, 0, 1);

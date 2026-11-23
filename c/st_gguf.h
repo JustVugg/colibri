@@ -215,7 +215,17 @@ static const st_gg_name st_gg_ink2_glob[] = {
     {"token_embd.weight", "model.llm.embed.weight"}, {"token_embd_norm.weight", "model.llm.embed_norm.weight"},
     {"output_norm.weight", "model.llm.norm.weight"}, {"output.weight", "model.llm.unembed.weight"},
     {"output_res_score.weight", "model.llm.attn_res.output_query"},
+    /* llama.cpp's later inkling2 names (unsloth's Inkling-2-Mini files) and Inkling-2-Mini's loop */
+    {"output_res_query.weight", "model.llm.attn_res.output_query"},
+    {"loop_res_query.weight", "model.llm.middle_cycle_cross_pass_queries"},
+    {"loop_kv_res_query.weight", "model.llm.middle_cycle_cross_pass_kv_queries"},
     {NULL, NULL}};
+/* Two generations of names. The first (Inkling-2-Small's files) folds the short convolutions as
+ * above. The later one (Inkling-2-Mini's) keeps them as the checkpoint has them, but for a global
+ * layer's static taps, in convolution order ([C, K], k_sconv.ggufn: inkling2.h tells the two
+ * kinds of layer apart), and holds the relative bias transposed ([ext, d_rel], .gguf_t), and an
+ * expert's gate and up rows in one tensor, the gate's first ("a+b" per expert); checked against
+ * the official checkpoint, the NVFP4 blocks byte for byte. */
 static const st_gg_name st_gg_ink2_layer[] = {
     {"attn_norm.weight", "attn_norm.weight"}, {"ffn_norm.weight", "mlp_norm.weight"},
     {"attn_q_in_norm.weight", "q_input_norm.weight"}, {"attn_k_in_norm.weight", "k_input_norm.weight"},
@@ -235,6 +245,37 @@ static const st_gg_name st_gg_ink2_layer[] = {
     {"ffn_down_exps.weight", "mlp.experts.%d.down_proj"},
     {"ffn_gate_exps.scale", "mlp.experts.gate_scale"}, {"ffn_up_exps.scale", "mlp.experts.up_scale"},
     {"ffn_down_exps.scale", "mlp.experts.down_scale"},
+    {"attn_q_inp_norm.weight", "q_input_norm.weight"}, {"attn_k_inp_norm.weight", "k_input_norm.weight"},
+    {"attn_v_inp_norm.weight", "v_input_norm.weight"},
+    {"attn_rel.weight", "attn.wr_du.weight"}, {"attn_rel_clip.weight", "attn.rel_l2_clip.scale"},
+    {"attn_rel_bias.weight", "attn.rel_logits_proj.gguf_t"},
+    {"attn_k_conv.weight", "attn.k_sconv.ggufn"}, {"attn_v_conv.weight", "attn.v_sconv.ggufn"},
+    {"attn_k_conv_proj.weight", "attn.k_sconv.weight_proj"}, {"attn_v_conv_proj.weight", "attn.v_sconv.weight_proj"},
+    {"attn_post_conv.weight", "attn_sconv.weight"}, {"ffn_post_conv.weight", "mlp_sconv.weight"},
+    {"attn_res_query.weight", "attn_res.attn_query"}, {"ffn_res_query.weight", "attn_res.mlp_query"},
+    {"ffn_gate_up_exps.weight", "mlp.experts.%d.gate_proj+mlp.experts.%d.up_proj"},
+    {"ffn_gate_up_exps.scale", "mlp.experts.gate_scale|mlp.experts.up_scale"},
+    {"loop_attn_down.weight", "controllers.attn.down_weight"}, {"loop_attn_forget.weight", "controllers.attn.forget_weight"},
+    {"loop_attn_gain.weight", "controllers.attn.gain_weight"},
+    {"loop_k_down.weight", "controllers.k.down_weight"}, {"loop_k_forget.weight", "controllers.k.forget_weight"},
+    {"loop_k_gain.weight", "controllers.k.gain_weight"},
+    {"loop_v_down.weight", "controllers.v.down_weight"}, {"loop_v_forget.weight", "controllers.v.forget_weight"},
+    {"loop_v_gain.weight", "controllers.v.gain_weight"},
+    {"loop_mlp_down.weight", "controllers.mlp.down_weight"}, {"loop_mlp_forget.weight", "controllers.mlp.forget_weight"},
+    {"loop_mlp_gain.weight", "controllers.mlp.gain_weight"},
+    /* mainline llama.cpp's inkling2_loop (unsloth's Mainline_Support files): the same gates as
+     * loop_{q,k,v,ffn}_ctrl_* (the checkpoint's attn, k, v and mlp, matched byte for byte), and a
+     * loop layer's four message queries in one [4, D] tensor, [q, k, v, mlp] as inkling.c lays the
+     * checkpoint's middle_cycle_cross_pass_(kv_)queries out */
+    {"loop_q_ctrl_down.weight", "controllers.attn.down_weight"}, {"loop_q_ctrl_forget.weight", "controllers.attn.forget_weight"},
+    {"loop_q_ctrl_gain.weight", "controllers.attn.gain_weight"},
+    {"loop_k_ctrl_down.weight", "controllers.k.down_weight"}, {"loop_k_ctrl_forget.weight", "controllers.k.forget_weight"},
+    {"loop_k_ctrl_gain.weight", "controllers.k.gain_weight"},
+    {"loop_v_ctrl_down.weight", "controllers.v.down_weight"}, {"loop_v_ctrl_forget.weight", "controllers.v.forget_weight"},
+    {"loop_v_ctrl_gain.weight", "controllers.v.gain_weight"},
+    {"loop_ffn_ctrl_down.weight", "controllers.mlp.down_weight"}, {"loop_ffn_ctrl_forget.weight", "controllers.mlp.forget_weight"},
+    {"loop_ffn_ctrl_gain.weight", "controllers.mlp.gain_weight"},
+    {"loop_msg_query.weight", "loop_msg_query"},
     {NULL, NULL}};
 /* Inkling-2's vision tower from its own GGUF (unsloth's mmproj-*.gguf: architecture clip,
  * projector inkling2, gguf.json "mmproj"), under the checkpoint's model.visual.* names. The same
@@ -248,6 +289,9 @@ static const st_gg_name st_gg_ink2v_glob[] = {
     {"v.position_embd.weight", "model.visual.backbone.embeddings.position_embedding"},
     {"v.pre_ln.weight", "model.visual.backbone.ln_pre.weight"}, {"v.pre_ln.bias", "model.visual.backbone.ln_pre.bias"},
     {"mm.up.weight", "model.visual.proj_in.weight"}, {"mm.down.weight", "model.visual.proj_out.weight"},
+    /* the later names (Inkling-2-Mini's mmproj, projector inkling2v) */
+    {"v.class_position_embd.weight", "model.visual.backbone.embeddings.cls_position_embedding"},
+    {"mm.1.weight", "model.visual.proj_in.weight"}, {"mm.2.weight", "model.visual.proj_out.weight"},
     {NULL, NULL}};
 static const st_gg_name st_gg_ink2v_layer[] = {
     {"ln1.weight", "ln_1.weight"}, {"ln1.bias", "ln_1.bias"}, {"ln2.weight", "ln_2.weight"}, {"ln2.bias", "ln_2.bias"},
@@ -426,6 +470,7 @@ static const st_gg_map st_gguf_maps[] = {
     {"kimi-k3", "model.layers.%d.", st_gg_k3_glob, st_gg_k3_layer, NULL, NULL},
     {"inkling", "model.layers.%d.", st_gg_ink_glob, st_gg_ink_layer, NULL, NULL},
     {"inkling2", "model.llm.layers.%d.", st_gg_ink2_glob, st_gg_ink2_layer, NULL, NULL},
+    {"inkling2_loop", "model.llm.layers.%d.", st_gg_ink2_glob, st_gg_ink2_layer, NULL, NULL},
     {"inkling2_clip", "model.visual.backbone.layers.%d.", st_gg_ink2v_glob, st_gg_ink2v_layer, NULL, "v.blk.%d.%n"},
     {"qwen_image", "transformer_blocks.%d.", st_gg_qimg_glob, st_gg_qimg_layer,
      "model.diffusion_model.", "transformer_blocks.%d.%n"},
@@ -546,21 +591,29 @@ static int st_gguf_index(shards *S, const gguf_ctx *G, const st_gg_map *map, con
              * ggml type is whole blocks) */
             char parts[256]; snprintf(parts, sizeof parts, "%s", hf);
             int k = 1; for (const char *c = parts; *c; c++) k += *c == '+';
-            if (t->n_dims != 2 || t->ne[1] % k || t->nbytes % k)
+            /* with "%d" (a+b per expert): [experts][rows][cols], each expert's slice cut the same way */
+            const int pex = strstr(parts, "%d") != NULL;
+            if ((pex ? t->n_dims != 3 || t->ne[2] < 1 || t->ne[2] > INT_MAX || t->nbytes % t->ne[2] : t->n_dims != 2) ||
+                t->ne[1] % k || t->nbytes % k)
                 coli_load_fail(COLI_LOAD_FAIL_FORMAT, "GGUF %s: %lld rows do not split in %d", t->name, (long long)t->ne[1], k);
-            const int64_t slice = t->nbytes / k, rows = t->ne[1] / k;
-            char *p = parts;
-            for (int x = 0; x < k; x++) {
-                char *plus = strchr(p, '+'); if (plus) *plus = 0;
-                if (L >= 0) { char pre[64]; snprintf(pre, sizeof pre, map->layer_fmt, L); snprintf(nm, sizeof nm, "%s%s", pre, p); }
-                else snprintf(nm, sizeof nm, "%s", p);
-                st_tensor *s = st_gguf_add(S, nm);
-                s->fd = fds[t->file]; s->off = (int64_t)t->off + slice * x; s->nbytes = slice;
-                s->dtype = st_gguf_dtype(t->type);
-                s->rank = 2; s->shape[0] = rows; s->shape[1] = t->ne[0]; s->numel = rows * t->ne[0];
-                p = plus ? plus + 1 : p;
+            const int NE = pex ? (int)t->ne[2] : 1;
+            const int64_t eb = t->nbytes / NE, slice = eb / k, rows = t->ne[1] / k;
+            if (eb % k) coli_load_fail(COLI_LOAD_FAIL_FORMAT, "GGUF %s: an expert's rows do not split in %d", t->name, k);
+            for (int ex = 0; ex < NE; ex++) {
+                char *p = parts;
+                for (int x = 0; x < k; x++) {
+                    char *plus = strchr(p, '+'); if (plus) *plus = 0;
+                    char one[256]; if (pex) snprintf(one, sizeof one, p, ex); else snprintf(one, sizeof one, "%s", p);
+                    if (L >= 0) { char pre[64]; snprintf(pre, sizeof pre, map->layer_fmt, L); snprintf(nm, sizeof nm, "%s%s", pre, one); }
+                    else snprintf(nm, sizeof nm, "%s", one);
+                    st_tensor *s = st_gguf_add(S, nm);
+                    s->fd = fds[t->file]; s->off = (int64_t)t->off + eb * ex + slice * x; s->nbytes = slice;
+                    s->dtype = st_gguf_dtype(t->type);
+                    s->rank = 2; s->shape[0] = rows; s->shape[1] = t->ne[0]; s->numel = rows * t->ne[0];
+                    if (plus) { *plus = '+'; p = plus + 1; }
+                }
             }
-            renamed++;
+            if (pex) experts++; else renamed++;
             continue;
         }
         char alias[256];   /* "a|b": the tensor under each name (st_gg_ink_layer's ffn_gscale) */
@@ -650,11 +703,13 @@ static int st_init_gguf(shards *S, const char *snap_dir) {
         head = S->n - was;
     }
     int vis = 0;
-    if (mpath[0] && arch && !strcmp(arch, "inkling2")) {   /* the vision tower's own file (the other engines read theirs) */
+    if (mpath[0] && arch && (!strcmp(arch, "inkling2") || !strcmp(arch, "inkling2_loop"))) {   /* the vision tower's own file (the other engines read theirs) */
         gguf_ctx *V = &st_gguf_vis;
         if (gguf_open(V, mpath)) coli_load_fail(COLI_LOAD_FAIL_FORMAT, "GGUF %s: %s", mpath, V->err);
+        /* Inkling-2-Mini's names it clip.vision.projector_type inkling2v (llama.cpp's later names) */
         const char *va = gguf_get_str(V, "general.architecture"), *vp = gguf_get_str(V, "clip.projector_type");
-        if (!va || strcmp(va, "clip") || !vp || strcmp(vp, "inkling2"))
+        if (!vp) vp = gguf_get_str(V, "clip.vision.projector_type");
+        if (!va || strcmp(va, "clip") || !vp || (strcmp(vp, "inkling2") && strcmp(vp, "inkling2v")))
             coli_load_fail(COLI_LOAD_FAIL_FORMAT, "%s: not Inkling-2's vision tower (architecture '%s', projector '%s')", mpath,
                            va ? va : "?", vp ? vp : "?");
         const int was = S->n;

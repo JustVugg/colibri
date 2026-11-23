@@ -229,19 +229,31 @@ static int q38c_mirror(Q38Chain *ch, Model *m) {
     int nbmax = m->kv_cap / (c->idx_ratio > 0 ? c->idx_ratio : 1) + 1;
     if (ch->cap != m->kv_cap) {   /* the host cache is new: mirror it again (K/V whole, or split past the budget) */
         size_t row = (size_t)kvo * 2 * 4;
+        /* The index keys and the pooled keys are sized by the cache's capacity and take no
+         * part in the split, so they go up before the plan: vkc_kv_plan budgets K/V from the
+         * device memory that is left, and its margin (a fifth) stays free for the prompt
+         * chunk's scratch. Planned first, K/V took four fifths of the memory these buffers
+         * were about to need too: at 60000 positions they are 439 MiB, the whole margin, and
+         * vkc_chunk_rows then found nothing and cut the prompt into chunks of one row. */
+        for (int i = ch->lo; i < ch->lo + ch->nl + (ch->mtp_on ? 1 : 0); i++) {
+            if (!q38c_attn_at(c, i)) continue;
+            vkc_free(ch->ik[i]); vkc_free(ch->pk[i]);
+            ch->kv_valid[i] = ch->pk_valid[i] = 0;
+            ch->ik[i] = vkc_buf((size_t)c->idx_dim * m->kv_cap * 4, VKC_DEV);
+            ch->pk[i] = vkc_buf((size_t)c->idx_dim * nbmax * 4, VKC_DEV);
+            if (!ch->ik[i] || !ch->pk[i]) { ch->cap = 0; return 0; }
+        }
         int plan = ch->n_attn ? vkc_kv_plan(&ch->ks, q38c_name(ch), ch->n_attn, row, m->kv_cap, 1, 1,
                                             (size_t)ch->n_attn * ch->dev_rows * row) : 1;
         if (!plan) { ch->cap = 0; return 0; }
         ch->dev_rows = ch->ks.on ? ch->ks.rows : m->kv_cap;
         for (int i = ch->lo; i < ch->lo + ch->nl + (ch->mtp_on ? 1 : 0); i++) {
             if (!q38c_attn_at(c, i)) continue;
-            vkc_free(ch->kc[i]); vkc_free(ch->vc[i]); vkc_free(ch->ik[i]); vkc_free(ch->pk[i]);
-            ch->kv_valid[i] = ch->pk_valid[i] = 0;
+            vkc_free(ch->kc[i]); vkc_free(ch->vc[i]);
+            ch->kv_valid[i] = 0;
             ch->kc[i] = vkc_buf((size_t)kvo * ch->dev_rows * 4, VKC_DEV);
             ch->vc[i] = vkc_buf((size_t)kvo * ch->dev_rows * 4, VKC_DEV);
-            ch->ik[i] = vkc_buf((size_t)c->idx_dim * m->kv_cap * 4, VKC_DEV);
-            ch->pk[i] = vkc_buf((size_t)c->idx_dim * nbmax * 4, VKC_DEV);
-            if (!ch->kc[i] || !ch->vc[i] || !ch->ik[i] || !ch->pk[i]) { ch->cap = 0; return 0; }
+            if (!ch->kc[i] || !ch->vc[i]) { ch->cap = 0; return 0; }
         }
         ch->cap = m->kv_cap;
     }

@@ -3100,6 +3100,21 @@ class CapSentinelShimTest(unittest.TestCase):
                 self.assertEqual(cap_for_arch(arch, 2, {}, model=model), 2)
                 planner.assert_not_called()
 
+    def test_inkling_ram_plan_sizes_the_expert_cache(self):
+        # Inkling's eight legacy slots read nearly every routed expert of a step from the page
+        # cache (Inkling-2 routes eight): Inkling-2-Mini, whole in RAM, decoded at 4.3 tok/s on
+        # the CPU. The plan's slots instead, never below the legacy eight
+        model = self._model("inkling2_loop_text")
+        for planned, expected in ((0, 8), (3, 8), (128, 128)):
+            with self.subTest(planned=planned), patch("resource_plan.build_plan", return_value={
+                    "tiers": {"ram": {"cache_slots_per_layer": planned}}}):
+                self.assertEqual(cap_for_arch("inkling", None, {}, model=model), expected)
+        with patch("resource_plan.build_plan", side_effect=ValueError("no safetensors shards")):
+            self.assertEqual(cap_for_arch("inkling", None, {}, model=model), 8)
+        with patch("resource_plan.build_plan") as planner:
+            self.assertEqual(cap_for_arch("inkling", 3, {}, model=model), 3)
+            planner.assert_not_called()
+
     def test_v41_explicit_and_calibrated_caps_bypass_planning(self):
         for cap, env, expected in ((7, {}, 7), (0, {}, 0),
                                    (None, {"COLI_PROFILE_CAP": "12"}, 12),
@@ -6019,6 +6034,46 @@ class ImageUrlPathGuard(unittest.TestCase):
         with self.assertRaises(APIError) as caught:
             _image_bytes_from_url("/no/such/secret-name.png")
         self.assertNotIn("secret-name", str(caught.exception))
+
+
+def _png_header(width, height):
+    """a PNG's signature, IHDR and a few bytes of IDAT: Pillow reads its size from the header
+    and decodes nothing until asked"""
+    import zlib
+
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(b"\x00" * 16)) + chunk(b"IEND", b"")
+
+
+class ImagePixelCeiling(unittest.TestCase):
+    """A request's picture past MAX_IMAGE_PIXELS is refused from its header, before a
+    preprocessor decodes it whole: a few KB of PNG can name 10000 x 10000 pixels."""
+
+    def setUp(self):
+        try:
+            import PIL  # noqa: F401
+        except ImportError:
+            self.skipTest("Pillow is not installed")
+
+    def uri(self, data):
+        import base64
+        return "data:image/png;base64," + base64.b64encode(data).decode()
+
+    def test_a_picture_past_the_ceiling_is_refused(self):
+        big = _png_header(10000, 10000)
+        self.assertLess(len(big), 200)
+        with self.assertRaises(APIError) as caught:
+            _image_bytes_from_url(self.uri(big))
+        self.assertEqual(caught.exception.status, 400)
+        self.assertIn("10000x10000", str(caught.exception))
+
+    def test_a_picture_at_the_ceiling_passes(self):
+        side = _png_header(8192, 8192)
+        self.assertEqual(_image_bytes_from_url(self.uri(side)), side)
+        small = _png_header(640, 480)
+        self.assertEqual(_image_bytes_from_url(self.uri(small)), small)
 
 
 class ContextExceededMessageTest(unittest.TestCase):

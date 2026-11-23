@@ -1686,7 +1686,7 @@ def _gguf_sources(model_dir):
 
 # The routed experts _gguf_tensor_sizes names, one entry per expert whatever the family
 # (analyze_model counts them as experts without the family's checkpoint names).
-_GGUF_EXPERT = re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(?:(?:gate|up|down)_proj\.weight|gguf)$")
+_GGUF_EXPERT = re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(?:(?:gate_up|gate|up|down)_proj\.weight|gguf)$")
 
 
 def _gguf_tensor_sizes(parts, layers=None):
@@ -1700,7 +1700,8 @@ def _gguf_tensor_sizes(parts, layers=None):
     import importlib.util
     spec = importlib.util.spec_from_file_location("gguf_reader", Path(__file__).resolve().parent / "tools" / "gguf_reader.py")
     gr = importlib.util.module_from_spec(spec); spec.loader.exec_module(gr)
-    fused = re.compile(r"^blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$")
+    # gate_up: one tensor of both, an expert's gate rows then its up rows (Inkling-2-Mini's files)
+    fused = re.compile(r"^blk\.(\d+)\.ffn_(gate_up|gate|up|down)_exps\.weight$")
     packed = re.compile(r"^blk\.(\d+)\.ffn_exps_colibri$")
     last = None
     for part in parts:
@@ -1989,6 +1990,10 @@ def qwen38_int4_sidecar(info):
     2.01 MB at 3, 1.32 MB vq2, 0.82 MB vq1 on the release), priced the same way: by the
     record its index states, whatever the name, so a format this list does not know yet is
     never priced with the FP8 bytes (a 188-expert cap where RAM held 512, 2026-10-14).
+    A checkpoint whose shards carry no routed experts, the sidecar being their only copy,
+    takes its sparse layers from the index (which states the config's): priced by the
+    shards' layers it had none, a cap of 0 slots, or with the MTP head on one made of the
+    head's record alone (512 slots of 30 GiB on a 25 GiB budget, Qwen3.8 Flash Next on vq2g32).
     """
     resolved = info["resolved_family"]
     lowbit = (os.environ.get("Q38_EXPERT_LOWBIT") or "").strip()
@@ -2012,7 +2017,8 @@ def qwen38_int4_sidecar(info):
     if (any(index.get(key) != value for key, value in want.items()) or
             isinstance(record, bool) or not isinstance(record, int) or record < 1):
         return info
-    per_layer = {layer: record for layer in info["expert_bytes_by_layer"]}
+    layers = info["expert_bytes_by_layer"] or (range(want["layers"]) if isinstance(want["layers"], int) else ())
+    per_layer = {layer: record for layer in layers}
     return dict(info,
                 expert_bytes=record * want["experts"] * len(per_layer),
                 typical_expert_bytes=record, max_expert_bytes=record,
@@ -3730,8 +3736,11 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                           if (vulkan or {}).get("type") in ("integrated", "cpu")
                           and _vk_dense_active(family_id, env_now, vulkan) else 0)
     # the team a launch defaults to (environment_for_plan): a hybrid CPU's performance
-    # cores, probed only when the caller did not name a count
+    # cores, and no more than a container's CPU quota or the affinity mask lets run at
+    # once (#2914, as team_cpu_count); probed only when the caller did not name a count
     team_cpus = (performance_core_count() if physical_cpus is None else None)
+    cpu_limits = ((cgroup_cpu_quota(), allowed_cpu_count()) if physical_cpus is None
+                  else (None, None))
     physical_cpus = physical_cpu_count() if physical_cpus is None else physical_cpus
     cpu_sockets = cpu_socket_count() if cpu_sockets is None else cpu_sockets
     resolved = info["resolved_family"]
@@ -3968,6 +3977,17 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     probe_state, probe_gbs = ssd_probe_state(info["path"])
     actions = _next_actions(bottleneck_class, projected_hit, probe_state,
                             probe_gbs, planning_gpus)
+    cpu = {"physical_cores": _resolve_physical_cores(physical_cpus),
+           "sockets": max(1, int(cpu_sockets)),
+           "team_threads": bound_team(_resolve_physical_cores(team_cpus or physical_cpus),
+                                      *cpu_limits),
+           "thread_policy": "performance-cores" if team_cpus else "physical-cores"}
+    # The most threads those limits let run at once, for a tuning sweep to stay within.
+    # Named only when that is fewer than the cores: a machine without limits keeps the
+    # block it had, and with it the fingerprint of its tuning profiles, which hashes it.
+    limit_threads = bound_team(cpu["physical_cores"], *cpu_limits)
+    if limit_threads < cpu["physical_cores"]:
+        cpu["limit_threads"] = limit_threads
 
     return {
         "version": 2,
@@ -3978,10 +3998,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                   "family_id": resolved.descriptor.id,
                   "model_type": resolved.model_type,
                   "configured_experts": configured_experts},
-        "cpu": {"physical_cores": _resolve_physical_cores(physical_cpus),
-                 "sockets": max(1, int(cpu_sockets)),
-                 "team_threads": _resolve_physical_cores(team_cpus or physical_cpus),
-                 "thread_policy": "performance-cores" if team_cpus else "physical-cores"},
+        "cpu": cpu,
         "memory": {"unified": unified, "available_bytes": available_memory},
         # the Vulkan device a COLI_VULKAN=1 run opens (its expert tier and dense chain
         # size themselves from its free memory at start)

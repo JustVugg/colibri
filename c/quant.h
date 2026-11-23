@@ -137,6 +137,33 @@ static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *
             y[(int64_t)s*O+o]=a*sc; } }
 }
 
+/* One step of the grouped-int4 kernels' scalar loop: matmul_i4_grouped below and
+ * matmul_i4_grouped_pair in colibri.c, so the fused pair rounds as two single calls
+ * do. Pinned in the SOURCE, like the AVX2 path's fmaf: left to -ffp-contract, which
+ * multiply-adds the compiler fused followed the code around them, not the code
+ * itself. GCC 16 on aarch64 fused fma(x1,w1,x0*w0) in one kernel and fma(x0,w0,x1*w1)
+ * in the other within one build, and test_i4_grouped's fused == unfused gate failed;
+ * built inside another file, the same source fused the second way in both. Where the
+ * CPU has a fused multiply-add the step is two explicit fmaf calls, in the order Apple
+ * clang already fuses it, so arm64 macOS keeps its bits; where it has none, nothing
+ * can be fused and the step is the plain expression, the scalar operation tree the
+ * forced-SSE gates compare against. */
+#if defined(FP_FAST_FMAF) || defined(__FP_FAST_FMAF) || defined(__FMA__) || defined(__aarch64__)
+static inline float i4g_step2(float a, float x0, float w0, float x1, float w1, float sc){
+    return fmaf(fmaf(x0,w0,x1*w1),sc,a);
+}
+static inline float i4g_step1(float a, float x0, float w0, float sc){
+    return fmaf(x0*w0,sc,a);
+}
+#else
+static inline float i4g_step2(float a, float x0, float w0, float x1, float w1, float sc){
+    return a+(x0*w0+x1*w1)*sc;
+}
+static inline float i4g_step1(float a, float x0, float w0, float sc){
+    return a+x0*w0*sc;
+}
+#endif
+
 /* ---- y[S,O] = x[S,I] @ W^T, W int4 packed + per-GROUP scales (fmt=4) ----- */
 static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const float *scale,
                               int S, int I, int O, int gs){
@@ -180,9 +207,9 @@ static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const
                 a=fmaf(hsum256(acc),sc,a);
 #endif
                 for(; i<base+glen; i+=2){
-                    if(i+1<base+glen){ uint8_t byte=w[i>>1];
-                        a+=(xs[i]*(float)((int)(byte&0xF)-8)+xs[i+1]*(float)((int)(byte>>4)-8))*sc; }
-                    else { uint8_t byte=w[i>>1]; a+=xs[i]*(float)((int)(byte&0xF)-8)*sc; }
+                    uint8_t byte=w[i>>1];
+                    if(i+1<base+glen) a=i4g_step2(a,xs[i],(float)((int)(byte&0xF)-8),xs[i+1],(float)((int)(byte>>4)-8),sc);
+                    else a=i4g_step1(a,xs[i],(float)((int)(byte&0xF)-8),sc);
                 }
             }
             y[(int64_t)s*O+o]=a;

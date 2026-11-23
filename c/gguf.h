@@ -59,6 +59,9 @@ typedef struct {
 typedef struct {
     int n_files;
     int *fds;
+#ifdef _WIN32
+    HANDLE *wh;               /* each part opened again overlapped: reads that do not queue (gguf_read) */
+#endif
     char **paths;
     int n_kv; gguf_kv *kv;
     int n_tensors; gguf_tensor *t;
@@ -292,6 +295,10 @@ static void gguf_close(gguf_ctx *g) {
     if (!g) return;
     for (int i = 0; i < g->n_files; i++) { if (g->fds && g->fds[i] >= 0) close(g->fds[i]); if (g->paths) free(g->paths[i]); }
     free(g->fds); free(g->paths);
+#ifdef _WIN32
+    for (int i = 0; g->wh && i < g->n_files; i++) if (g->wh[i] && g->wh[i] != INVALID_HANDLE_VALUE) CloseHandle(g->wh[i]);
+    free(g->wh);
+#endif
     for (int i = 0; i < g->n_kv; i++) {
         gguf_kv *k = &g->kv[i]; free(k->key); free(k->s); free(k->arr);
         if (k->strs) { for (uint64_t j = 0; j < k->n; j++) free(k->strs[j]); free(k->strs); }
@@ -335,6 +342,9 @@ static int gguf_open(gguf_ctx *g, const char *path) {
     g->paths = (char **)calloc((size_t)parts, sizeof(char *));
     if (!g->fds || !g->paths) { snprintf(g->err, sizeof g->err, "out of memory"); gguf_close(g); return -1; }
     for (int p = 0; p < parts; p++) g->fds[p] = -1;
+#ifdef _WIN32
+    g->wh = (HANDLE *)calloc((size_t)parts, sizeof(HANDLE));   /* NULL entries: gguf_read keeps fds[] */
+#endif
     for (int p = 0; p < parts; p++) {
         char *pp = strdup(path);
         if (!pp) { snprintf(g->err, sizeof g->err, "out of memory"); gguf_close(g); return -1; }
@@ -347,6 +357,16 @@ static int gguf_open(gguf_ctx *g, const char *path) {
         g->fds[p] = open(pp, O_RDONLY);
 #endif
         if (g->fds[p] < 0) { snprintf(g->err, sizeof g->err, "%s: %s", pp, strerror(errno)); gguf_close(g); return -1; }
+#ifdef _WIN32
+        /* A handle from open() is synchronous, and Windows runs one I/O at a time on a synchronous
+         * file object: an OpenMP team reading a GGUF's rows through fds[] reads them one after
+         * the other. An overlapped handle does not queue them. No such handle: fds[] as before. */
+        if (g->wh) {
+            HANDLE h = CreateFileA(pp, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, NULL);
+            g->wh[p] = h == INVALID_HANDLE_VALUE ? NULL : h;
+        }
+#endif
     }
     g->idx_cap = g->n_tensors * 2 + 1;
     g->idx = (int *)malloc(sizeof(int) * (size_t)g->idx_cap);
@@ -366,12 +386,20 @@ static int gguf_read(const gguf_ctx *g, const gguf_tensor *t, void *dst, int64_t
     uint8_t *p = (uint8_t *)dst; uint64_t pos = t->off + (uint64_t)off; int64_t left = n;
     while (left > 0) {
 #ifdef _WIN32   /* positional, as compat_pread: _lseeki64 + _read share the seek and race between threads */
-        HANDLE h = (HANDLE)_get_osfhandle(g->fds[t->file]);
+        HANDLE wh = g->wh ? g->wh[t->file] : NULL;
+        HANDLE h = wh ? wh : (HANDLE)_get_osfhandle(g->fds[t->file]);
         if (h == INVALID_HANDLE_VALUE) return -1;
         DWORD want = left > (1 << 30) ? (DWORD)(1 << 30) : (DWORD)left, got = 0;
         OVERLAPPED ov; memset(&ov, 0, sizeof ov);
         ov.Offset = (DWORD)(pos & 0xFFFFFFFFu); ov.OffsetHigh = (DWORD)(pos >> 32);
-        if (!ReadFile(h, p, want, &got, &ov)) return -1;
+        if (wh) {   /* overlapped: an event of this read's own, waited on here */
+            ov.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
+            if (!ov.hEvent) return -1;
+            BOOL ok = ReadFile(h, p, want, NULL, &ov) || GetLastError() == ERROR_IO_PENDING;
+            ok = ok && GetOverlappedResult(h, &ov, &got, TRUE);
+            CloseHandle(ov.hEvent);
+            if (!ok) return -1;
+        } else if (!ReadFile(h, p, want, &got, &ov)) return -1;
         int64_t r = (int64_t)got;
 #else
         ssize_t r = pread(g->fds[t->file], p, (size_t)(left > (1 << 30) ? (1 << 30) : left), (off_t)pos);

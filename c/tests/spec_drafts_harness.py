@@ -48,7 +48,9 @@ FAILS = []
 SANITIZE = False   # --sanitize: every run's stderr is checked for an ASan or UBSan report
 REQUIRE_KV_SPLIT = False
 SAN_RE = re.compile(rb"ERROR: AddressSanitizer|runtime error:")
-BASE_ENV = {"OMP_NUM_THREADS": "2", "COLI_NO_OMP_TUNE": "1", "COLI_CUDA": "0", "Q38_TRUNK_GPU": "0",
+# SEED: both arms of a comparison sample the same draws (#2949: an unset SEED seeds the sampler
+# from the clock and the pid)
+BASE_ENV = {"SEED": os.environ.get("SEED", "1"), "OMP_NUM_THREADS": "2", "COLI_NO_OMP_TUNE": "1", "COLI_CUDA": "0", "Q38_TRUNK_GPU": "0",
             "NOSTREAM": "1", "USAGE_SAVE": "0",
             # plain decoding is the reference, and both draft sources are on by default since
             # 1.13.0: every run starts from them off, and a case turns on what it checks

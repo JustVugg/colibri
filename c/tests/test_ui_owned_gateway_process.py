@@ -250,7 +250,11 @@ class OwnedGatewayProcessTests(unittest.TestCase):
                                     time.sleep(120)
                                 finally:
                                     os._exit(0)
-                            identity.write_text(str(target))
+                            # the name appears with the pid in it: the parent reads it as
+                            # soon as it exists, and a file being written exists empty first
+                            unfinished = root / 'pid.unfinished'
+                            unfinished.write_text(str(target))
+                            os.replace(unfinished, identity)
                         while target is not None and not stopping[0]:
                             reaped, _ = os.waitpid(target, os.WNOHANG)
                             if reaped:

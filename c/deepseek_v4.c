@@ -13932,6 +13932,15 @@ int coli_v4_gpu_experts_preload(ColiV4Engine *engine, char *error, size_t size) 
                                   "below 10 GiB (use --vram 10 or more)");
         return 1;
     }
+    if (coli_v4_index_gguf(engine->target_index)) {
+        /* a GGUF's routed experts are ggml blocks, not the FP4 records the mirrors take, and its
+         * dense matrices (the shared experts with them) stay on the CPU: nothing to preload, and
+         * under auto the cache serves them as before (the missing shared mirror refused the engine) */
+        if (error && size)
+            snprintf(error, size, "a GGUF's routed experts are ggml blocks, not the FP4 records "
+                                  "the resident mirrors take");
+        return 1;
+    }
     if (layers < 1 || layers > COLI_V4_RESIDENT_MAX_LAYERS ||
         engine->gpu.device_count < 1 || engine->gpu.device_count > layers ||
         experts < 1 || hidden < 1 || intermediate < 1) return -1;
