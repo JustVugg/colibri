@@ -2722,6 +2722,10 @@ tests/test_olmoe_load_diagnostic$(EXE): tests/test_olmoe_load_diagnostic.c olmoe
 tests/test_qwen36_cache_index$(EXE): tests/test_qwen36_cache_index.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
+# The GGUF CPU MoE against the PILOT worker's loads: it computes from held slots.
+tests/test_qwen36_gguf_hold$(EXE): tests/test_qwen36_gguf_hold.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
 # The qwen36 embedding read in place (qwen36_embedding.h): rows, errors and the
 # mapping's lifetime, on synthetic files.
 tests/test_qwen36_embedding$(EXE): tests/test_qwen36_embedding.c

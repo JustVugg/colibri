@@ -6714,12 +6714,6 @@ static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const 
     if (u == 16 && (I % 16 || D % 16)) return -1;
     Slot *sl[64]; int ids[64]; float w[64]; int n = 0;
     for (int k = 0; k < K; k++) if (idx[k] >= 0) { ids[n] = idx[k]; w[n] = val[k]; n++; }
-    for (int k = 0; k < n; k++) expert_get(m, layer, ids[k], &sl[k]);
-    for (int k = 0; k < n; k++) if (sl[k]->eid != ids[k]) {   /* evicted while fetching the others */
-        for (int j = 0; j < n; j++) expert_get(m, layer, ids[j], &sl[j]);
-        for (int j = 0; j < n; j++) if (sl[j]->eid != ids[j]) return -1;
-        break;
-    }
     /* moe() runs on the engine's thread; the worker threads get these through
      * the local pointers below (thread-local storage here would hand each
      * worker its own empty copy) */
@@ -6733,6 +6727,7 @@ static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const 
     if (gq_act_set(pax, x, 1, D)) return -1;
     const int64_t rbg = gq_row_bytes(gx->hg, D), rbu = gq_row_bytes(gx->hu, D), rbd = gq_row_bytes(gx->hd, I);
     const int gI = I / u, gD = D / u;
+    for (int k = 0; k < n; k++) sl[k] = expert_hold(m, layer, ids[k]);   /* the PILOT worker may not evict them mid-matmul */
     #pragma omp parallel for schedule(static)
     for (int r = 0; r < n * 2 * gI; r++) {
         int k = r / (2 * gI), rr = (r % (2 * gI)) * u;
@@ -6746,7 +6741,7 @@ static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const 
         if (gx->su) for (int i = 0; i < I; i++) u[i] *= gx->su[ids[k]];
         for (int i = 0; i < I; i++) { float gv = g[i]; h[i] = (gv / (1.f + expf(-gv))) * u[i]; }
     }
-    if (gq_act_set(pah, H, n, I)) return -1;   /* row k of ah is expert k's hidden */
+    if (gq_act_set(pah, H, n, I)) { for (int k = 0; k < n; k++) slot_release(sl[k]); return -1; }   /* row k of ah is expert k's hidden */
     #pragma omp parallel for schedule(static)
     for (int r = 0; r < n * gD; r++) {
         int k = r / gD, o = (r % gD) * u;
@@ -6754,6 +6749,7 @@ static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const 
         one.l4 = pah->l4 ? pah->l4 + (int64_t)k * (I / 4) : NULL;
         gq_rows_u(Y + (int64_t)k * D + o, u, &one, sl[k]->gqe + gx->hb_g + gx->hb_u + (int64_t)o * rbd, gx->hd, I);
     }
+    for (int k = 0; k < n; k++) slot_release(sl[k]);
     /* accumulate in expert-id order, as the general path does: same sums, same bits */
     int ord[64]; for (int k = 0; k < n; k++) ord[k] = k;
     for (int a = 1; a < n; a++) { int v = ord[a], b = a; while (b > 0 && ids[ord[b - 1]] > ids[v]) { ord[b] = ord[b - 1]; b--; } ord[b] = v; }
@@ -6786,7 +6782,7 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
     for (int e = 0; e < E; e++) {
         int n = cnt[e + 1] - cnt[e]; if (!n) continue;
         const int *tl = tok + cnt[e]; const float *wl = wt + cnt[e];
-        Slot *sl; expert_get(m, layer, e, &sl);
+        Slot *sl = expert_hold(m, layer, e);   /* as moe_gq_decode */
         for (int r = 0; r < n; r++) memcpy(X + (int64_t)r * D, x + (int64_t)tl[r] * D, sizeof(float) * (size_t)D);
         const int ex = f8 && !gq_act_set(&act, X, n, D);
         if (ex) {
@@ -6812,6 +6808,7 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
             for (int r = 0; r < D / 8; r++) gq_rows_f8(Y + 8 * r, D, &ah, wd + (int64_t)8 * r * rbd, rbd, gx->hd, I, 8);
         } else
         gq_matmul(Y, G, sl->gqe + gx->hb_g + gx->hb_u, gx->hd, n, I, D);
+        slot_release(sl);
         if (gx->sd) for (int64_t q = 0; q < (int64_t)n * D; q++) Y[q] *= gx->sd[e];
         if (m->L[layer].post_en)   /* Muse Spark: every expert's output scaled, then normalised */
             for (int r = 0; r < n; r++) rmsnorm_scaled(Y + (int64_t)r * D, Y + (int64_t)r * D, m->L[layer].post_en, D, c->post_eps);
