@@ -6,7 +6,7 @@
 #include "../qwen36.c"
 #undef main
 
-enum { D = 256, I = 512, E = 6, K = 2, CAP = 3, STEPS = 400, ROWS = 3 };
+enum { D = 256, I = 512, E = 6, K = 2, CAP = 3, STEPS = 400, ROWS = 3, WIDE = 12 };
 
 static Model M;
 static volatile int stop_worker;
@@ -74,9 +74,10 @@ static void *worker(void *arg) {
     return NULL;
 }
 
-/* step `it` with S rows: S = 1 is moe_gq_decode, more is moe_gq_run's own loop */
+/* step `it` with S rows: S = 1 is moe_gq_decode, more is moe_gq_run's own loop (a verify's
+ * rows up to GQ_EXACT_ROWS, a prompt's above) */
 static void moe_step(int it, int S, const float *x, float *out) {
-    int idx[ROWS * K]; float val[ROWS * K];
+    int idx[WIDE * K]; float val[WIDE * K];
     for (int s = 0; s < S; s++) for (int k = 0; k < K; k++) { idx[s * K + k] = (it + s + k * 2) % E; val[s * K + k] = 1.f / (float)(k + 1); }
     memset(out, 0, sizeof(float) * (size_t)S * D);
     moe_gq_run(&M, 0, x, S, out, idx, val);
@@ -85,6 +86,12 @@ static void moe_step(int it, int S, const float *x, float *out) {
 static int differing(int S, const float *x) {
     float *ref = falloc((int64_t)STEPS * S * D), *out = falloc((int64_t)S * D);
     for (int it = 0; it < STEPS; it++) moe_step(it, S, x, ref + (int64_t)it * S * D);
+    /* QWEN36_TEST_OUTPUT: the reference appended to a file, to compare two revisions with cmp */
+    const char *keep = getenv("QWEN36_TEST_OUTPUT");
+    if (keep && *keep) {
+        FILE *f = fopen(keep, "ab"); if (!f) { perror(keep); exit(1); }
+        put(f, ref, sizeof(float) * (size_t)STEPS * S * D); fclose(f);
+    }
     stop_worker = 0;
     pthread_t th; pthread_create(&th, NULL, worker, NULL);
     int bad = 0;
@@ -106,15 +113,15 @@ int main(void) {
     close(fd);
     write_gguf(path);
     setup(path);
-    float *x = falloc((int64_t)ROWS * D);
-    for (int i = 0; i < ROWS * D; i++) x[i] = sinf(0.37f * (float)i);
-    const int one = differing(1, x), rows = differing(ROWS, x);
+    float *x = falloc((int64_t)WIDE * D);
+    for (int i = 0; i < WIDE * D; i++) x[i] = sinf(0.37f * (float)i);
+    const int one = differing(1, x), rows = differing(ROWS, x), wide = differing(WIDE, x);
     int busy = 0;
     for (int i = 0; i < M.cache[0].n; i++) busy += slot_busy(&M.cache[0].slots[i]);
     gguf_close(&g_gg); unlink(path);
-    if (one || rows || busy) {
-        fprintf(stderr, "FAIL: with the PILOT load running, %d of %d decode steps and %d of %d %d-row steps differ; %d slots still held\n",
-                one, STEPS, rows, STEPS, ROWS, busy);
+    if (one || rows || wide || busy) {
+        fprintf(stderr, "FAIL: with the PILOT load running, %d of %d decode steps, %d of %d %d-row steps and %d of %d %d-row steps differ; %d slots still held\n",
+                one, STEPS, rows, STEPS, ROWS, wide, STEPS, WIDE, busy);
         return 1;
     }
     puts("qwen36 GGUF expert hold OK");
