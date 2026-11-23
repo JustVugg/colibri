@@ -96,20 +96,37 @@ class Qwen38PrefixServeTest(PromptCancelContract, unittest.TestCase):
             engine.close()
         self.assertEqual(got, self.cold(prompt))
 
-    def test_ple_rows_read_ahead_answer_as_in_line(self):
-        """Q38_PLE_AHEAD=1: the PLE rows of a prompt read in segments come from a thread
-        that reads them ahead of the forwards (a first forward of one row, then pieces of
-        one row, at most a segment ahead), hashed with the same history: the same answer."""
-        prompt = self.OPENING + self.CANCEL_MORE
-        with mock.patch.dict(os.environ, {"COLI_PROMPT_SEGMENT": "3", "Q38_PLE_AHEAD": "1"}):
+    def ple_trace_run(self, ahead, trace):
+        """Two turns (the second from the live state, from > 0) with five-row segments, so the
+        thread's two-row pieces straddle the forwards; Q38_PLE_TRACE writes each forward's
+        first position and rows and a hash of the PLE rows each reader took."""
+        # one token a turn, the prompt's own: a decode's forwards (one row, or two where a step
+        # verifies a draft) vary run to run whatever the switch, a prompt's do not
+        with mock.patch.dict(os.environ, {"COLI_PROMPT_SEGMENT": "5", "Q38_PLE_AHEAD": ahead,
+                                          "Q38_PLE_TRACE": str(trace)}):
             engine = self.spawn(log_prefix=False)
         try:
-            got = engine.ask("1", prompt, max_tok=8)
+            first = self.OPENING + self.CANCEL_MORE
+            reply = engine.ask("1", first, max_tok=1)
+            second = engine.ask("2", first + reply + self.QUESTION + self.CANCEL_MORE, max_tok=1)
         finally:
             engine.close()
-        with mock.patch.dict(os.environ, {"Q38_PLE_AHEAD": "0"}):
-            want = self.cold(prompt)
-        self.assertEqual(got, want)
+        return reply, second, trace.read_text()
+
+    def test_ple_rows_read_ahead_are_the_in_line_forwards(self):
+        """Q38_PLE_AHEAD=1: the PLE rows of a prompt read in segments come from a thread that
+        reads them ahead of the forwards, hashed with the same history. The forwards must be
+        the ones Q38_PLE_AHEAD=0 runs (a forward's row count picks the CUDA chain's path, so a
+        different split changes its arithmetic even where the CPU's answer cannot change), and
+        every reader must take the same rows: the trace byte for byte, then the answers."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            on = self.ple_trace_run("1", Path(tmp) / "on.txt")
+            off = self.ple_trace_run("0", Path(tmp) / "off.txt")
+        self.assertIn("FWD ", off[2])
+        self.assertGreater(off[2].count("FWD "), 4, "expected the prompts read in several forwards:\n" + off[2])
+        self.assertEqual(on[2], off[2], "Q38_PLE_AHEAD=1 ran other forwards or read other PLE rows")
+        self.assertEqual(on[:2], off[:2])
 
     def test_three_turns_keep_reusing(self):
         warm = self.spawn()

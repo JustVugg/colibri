@@ -817,6 +817,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"Q38_PLE_ADVISE", CE_STR, CE_QWEN38, 0, NULL},
     {"Q38_PLE_AHEAD", CE_STR, CE_QWEN38, 0, NULL},
     {"Q38_PLE_PREFETCH",                 CE_BOOL  , CE_QWEN38                                       , 0             , NULL},
+    {"Q38_PLE_TRACE", CE_STR, CE_QWEN38, 0, NULL},
     {"Q38_PREFILL_BATCH",                CE_BOOL  , CE_QWEN38                                       , 0             , NULL},
     {"Q38_PREFILL_BATCH_ROWS", CE_INT, CE_QWEN38, 0, NULL},
     {"Q38_PREFILL_WORKSPACE_MIB", CE_INT, CE_QWEN38, 0, NULL},
