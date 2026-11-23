@@ -8633,6 +8633,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 return
             # A client written for Jev sends "jev-latest": on that route the
             # served model answers whatever name was asked for.
+            # Transcription clients (OpenAI Whisper API, local-speech-llama, etc.)
+            # often send model="asr"/"whisper-1"; accept common aliases.
+            if path in AUDIO_TRANSCRIPTION_ENDPOINTS:
+                m = body.get("model")
+                if m in (None, "", "asr", "whisper-1", "whisper"):
+                    body["model"] = self.server.model_id
             if path != "/v1/systemone":
                 self.check_model(body)
             if is_image_engine(self.server.engine) and path in (*TEXT_ENDPOINTS, *AUDIO_TRANSCRIPTION_ENDPOINTS):
