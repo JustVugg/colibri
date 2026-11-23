@@ -103,6 +103,25 @@ class Calibration(unittest.TestCase):
         self.assertEqual((m["cards"][0]["gbs"], m["cards"][0]["source"]), (432.0, "name"))
         self.assertEqual(m["disk_gbs"], model_fit.DISK_GBS["nvme"])
 
+    def test_a_block_devices_kind(self):
+        def device(root, name, rotational=None, model=None):
+            d = os.path.join(root, name)
+            os.makedirs(os.path.join(d, "queue")); os.makedirs(os.path.join(d, "device"))
+            for rel, text in (("queue/rotational", rotational), ("device/model", model)):
+                if text is not None:
+                    with open(os.path.join(d, rel), "w") as f:
+                        f.write(text + "\n")
+            return d
+        with tempfile.TemporaryDirectory() as root:
+            self.assertEqual(model_fit._block_kind(device(root, "nvme0n1", "0")), "nvme")
+            self.assertEqual(model_fit._block_kind(device(root, "sda", "0", "Samsung SSD 870")), "ssd")
+            self.assertEqual(model_fit._block_kind(device(root, "sdb", "1", "ST8000DM004-2CX1")), "hdd")
+            self.assertEqual(model_fit._block_kind(device(root, "sdc", "1")), "hdd")
+            self.assertIsNone(model_fit._block_kind(device(root, "sdd")))
+            # WSL2's disk: Hyper-V says rotational for a file on any drive
+            self.assertIsNone(model_fit._block_kind(device(root, "sde", "1", "Virtual Disk    ")))
+            self.assertEqual(model_fit._block_kind(device(root, "sdf", "0", "Virtual Disk")), "ssd")
+
 
 class TheMeasurements(unittest.TestCase):
     def test_the_ram_probe_answers(self):
