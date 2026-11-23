@@ -554,6 +554,7 @@ These backend settings are for kernel testing and tuning. A profile default foll
 | `COLI_CUDA_NORM256_FAST` | 1 | Select the 256-wide normalization kernel mode for eligible attention heads. |
 | `COLI_CUDA_NORM_PLAIN` | profile | A value of 1 selects ordinary normalization. |
 | `COLI_CUDA_NORM_SKIP_Y` | on when eligible | Allow normalization to omit its FP32 output when the caller requests packed INT8 output only. |
+| `COLI_CUDA_PR13_FLASH_DEV` | unset | A value beginning with 1 selects direct Flash attention for eligible long prefixes. |
 | `COLI_CUDA_QX_CACHE` | profile | Reuse packed INT8 activations across eligible projections. Zero disables reuse. |
 | `COLI_CUDA_ROUTE_FAST` | profile | Select the specialized unbiased softmax router for 256 experts and at most 32 selected experts per token. Zero selects the general router. |
 
