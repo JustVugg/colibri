@@ -50,7 +50,7 @@ def default_engine(family=None):
     return HERE / family.engine_artifact
 END = b"\x01\x01END\x01\x01\n"
 READY = b"\x01\x01READY\x01\x01\n"
-MAX_BODY = 4 << 20
+MAX_BODY = 4 << 20            # the default; COLI_MAX_BODY replaces it (after _positive_env, below)
 #: The most pixels a request's picture may have (8192 x 8192): every image preprocessor decodes a
 #: picture whole before it scales it down, and a few MB of PNG can describe far more pixels than
 #: that, gigabytes once decoded. Read from the file's header, before anything decodes it.
@@ -8511,6 +8511,10 @@ def _positive_env(name, default):
     return value if value > 0 else default
 
 
+# a picture travels as a base64 data: URI, 4/3 of its size: a few of them pass 4 MiB
+MAX_BODY = _positive_env("COLI_MAX_BODY", MAX_BODY)
+
+
 class APIServer(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -8824,6 +8828,7 @@ class APIHandler(BaseHTTPRequestHandler):
                    # it restarts on every byte received, so a drip renews it forever.
                    # READ_DEADLINE below is the cumulative bound that actually does.
     READ_DEADLINE = _positive_env("COLI_READ_DEADLINE", 30)  # accept -> request read
+    BODY_LINGER_S = _positive_env("COLI_BODY_LINGER_S", 0)   # _linger_close; 0 = off, as before
     server_version = "colibri"
     _committed = False    # status line already on the wire; reset per request below
     _body_read = False    # request body fully consumed, so nothing is left to drain
@@ -8859,8 +8864,13 @@ class APIHandler(BaseHTTPRequestHandler):
                                      self.timeout, self.READ_DEADLINE)
         try:
             super().handle_one_request()
+            unread = not self._body_read
             if not self.close_connection:
                 self._drain_request_body()
+            # only after an answer: an idle keep-alive timeout or a body-read deadline sent none,
+            # and their headers may be the previous request's
+            if self.close_connection and unread and self._committed and self.BODY_LINGER_S:
+                self._linger_close()
         except TimeoutError:
             # The read budget ran out. Say so and close; do not answer, because
             # we never received a complete request to answer.
@@ -8929,6 +8939,27 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.close_connection = True
                 return
             remaining -= len(chunk)
+
+    def _linger_close(self):
+        """The connection closes with the request body unread: over the cap, badly framed, or
+        refused on a Connection: close request. Closing over unread data sends an RST, and the
+        client then never reads the answer: an image upload of 4.08 MiB got ConnectionAbortedError
+        10053 (a .NET HttpClient: HttpRequestException) instead of the 400. So send our FIN, then
+        read and drop what the client still sends until it closes, for BODY_LINGER_S at most."""
+        headers = getattr(self, "headers", None)
+        if headers is None or (headers.get("Content-Length", "0").strip() in ("", "0")
+                               and not headers.get_all("Transfer-Encoding")):
+            return   # nothing follows the headers
+        deadline = time.monotonic() + self.BODY_LINGER_S
+        try:
+            self.wfile.flush()
+            self.connection.shutdown(socket.SHUT_WR)
+            while (left := deadline - time.monotonic()) > 0:
+                self.connection.settimeout(left)
+                if not self.connection.recv(1 << 16):
+                    break
+        except OSError:
+            pass   # the client went first, or the bound ran out: the close follows either way
 
     def send_json(self, status, body, request_id=None, headers=None):
         data = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode()

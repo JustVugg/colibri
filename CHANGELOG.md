@@ -5,6 +5,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### New
+
+- **`COLI_MAX_BODY` sets the gateway's request-body cap** (default 4 MiB, as before), for requests
+  with several base64 images. **`COLI_BODY_LINGER_S`** (default off) lets a client that is still
+  uploading a body over the cap read the 400 instead of a connection reset.
+
 ## [2.2.0] - 2026-11-21
 
 ### New

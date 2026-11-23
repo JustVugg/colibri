@@ -920,6 +920,8 @@ These are read by the Python programs (not the `glm` engine), so they don't appe
 | `COLI_API_KEY` | unset | Required bearer token for the server. |
 | `COLI_IMAGE_ROOT` | unset (local paths denied) | Directory under which an `image_url.url` naming a local path or `file://` URI may be read. Unset, the server refuses local paths: a client sends images as base64 `data:` URIs (`coli chat` and `coli web` do), because a file read here happens with the server's own rights and an inference client is not the operator. Set it to allow paths under one directory only; symlinks are resolved before the check. |
 | `COLI_ALLOWED_HOSTS` | unset | Comma-separated hostnames or IP addresses accepted by the DNS-rebinding guard in addition to loopback and the bind address. Equivalent to repeating `--allowed-host`. |
+| `COLI_MAX_BODY` | `4194304` (4 MiB) | Largest request body the gateway reads, in bytes; a larger one gets 400. Raise it for requests that carry images as base64 `data:` URIs (4/3 of the image size each). A bad or non-positive value keeps the default. |
+| `COLI_BODY_LINGER_S` | `0` (off) | When the gateway answers and closes a connection whose request body it did not read (over `COLI_MAX_BODY`, badly framed), send the FIN and drop what the client still sends for up to this many seconds before closing. Without it the close over unread data is a TCP RST, and a client still uploading never reads the 400 (Windows: `ConnectionAbortedError` 10053). |
 | `COLI_MAX_QUEUE` | `8` | Max queued requests. |
 | `COLI_QUEUE_TIMEOUT` | `300` | Seconds a request may wait in the queue. |
 | `COLI_KV_SLOTS` | `1` | Independent KV conversation slots (→ engine `KV_SLOTS`). |
