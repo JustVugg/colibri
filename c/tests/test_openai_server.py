@@ -5733,6 +5733,45 @@ class KeepAliveFramingTest(unittest.TestCase):
         self.assertIn("400", raw.splitlines()[0])
         self.assertNotIn("<STILL-OPEN>", raw)
 
+    def test_body_over_the_cap_reads_its_400_with_linger(self):
+        """COLI_BODY_LINGER_S: a client still sending a body over the cap reads the 400, on a
+        kept-alive connection and with Connection: close. Off, the close over the unread body
+        is an RST, and an image upload of 4.08 MiB saw ConnectionAbortedError 10053 instead."""
+        server = self._server()
+        payload = b"x" * (16 << 20)   # far past the loopback buffers: the client is still sending
+        for connection in (b"keep-alive", b"close"):
+            with patch.object(openai_server, "MAX_BODY", 1024), \
+                    patch.object(APIHandler, "BODY_LINGER_S", 5):
+                sock = socket.create_connection(("127.0.0.1", server.server_port), timeout=10)
+                self.addCleanup(sock.close)
+                sock.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                             b"Content-Type: application/json\r\nConnection: " + connection +
+                             b"\r\nContent-Length: %d\r\n\r\n" % len(payload) + payload)
+                raw = b""
+                while chunk := sock.recv(65536):
+                    raw += chunk
+            self.assertIn(b" 400 ", raw.split(b"\r\n", 1)[0], connection)
+            self.assertIn(b"Request body must be between 1 and 1024 bytes.", raw, connection)
+
+    def test_idle_keep_alive_timeout_does_not_linger(self):
+        """The read deadline closing an idle kept-alive connection answered nothing: no linger, even
+        though the previous (fully read) request's headers still carry a Content-Length."""
+        server = self._server()
+        with patch.object(APIHandler, "BODY_LINGER_S", 5), patch.object(APIHandler, "READ_DEADLINE", 1), \
+                patch.object(APIHandler, "_linger_close") as linger:
+            raw = self._raw(server, self._request_bytes(self.CHAT))   # reads to the server's close
+        self.assertIn("200", raw.splitlines()[0])
+        self.assertNotIn("<STILL-OPEN>", raw)
+        linger.assert_not_called()
+
+    def test_body_under_a_raised_cap_is_read(self):
+        """A body over the 4 MiB default but under a raised MAX_BODY gets past the size check."""
+        server = self._server()
+        body = dict(self.CHAT, model="other", pad="x" * (5 << 20))
+        with patch.object(openai_server, "MAX_BODY", 8 << 20):
+            status, _ = self._post(self._conn(server), body)
+        self.assertEqual(status, 404)   # the model check, after the body was read
+
     # --- a streaming 200 is close-framed, and says so ------------------------------------
 
     def test_streaming_response_announces_close_framing(self):
