@@ -102,7 +102,8 @@ def bench_colibri(args, samples, env):
                 if line.startswith(f"ERROR r{rep}_{si} ".encode()): err = line.decode(errors="ignore").strip(); break
             dt = time.time() - t0; dur = wav_dur(wav)
             we, wn = wer(ref, text); ce, cn = cer(ref, text)
-            rows.append({"engine":"colibri","sample":name,"rep":rep,"cold":rep==0 and si==0,"wer":f"{we}/{wn}","cer":f"{ce}/{cn}","rtf":round(dt/dur,4),"wall_s":round(dt,4),"audio_s":round(dur,4),"load_s":round(load_s,4),"rss_peak_kb":proc_rss_kb(p.pid),"text":text,"error":err})
+            engine_name = "colibri-gguf" if args.gguf else "colibri"
+            rows.append({"engine":engine_name,"sample":name,"rep":rep,"cold":rep==0 and si==0,"wer":f"{we}/{wn}","cer":f"{ce}/{cn}","rtf":round(dt/dur,4),"wall_s":round(dt,4),"audio_s":round(dur,4),"load_s":round(load_s,4),"rss_peak_kb":proc_rss_kb(p.pid),"text":text,"error":err})
     p.terminate()
     try: p.wait(timeout=5)
     except Exception: p.kill()
