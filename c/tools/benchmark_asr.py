@@ -154,7 +154,8 @@ def main():
     c_mmproj = args.colibri_mmproj or args.mmproj
     meta = {"platform": platform.platform(), "python": sys.version.split()[0], "machine": platform.machine(), "processor": platform.processor(),
             "omp_num_threads": env.get("OMP_NUM_THREADS"), "cpu_count": os.cpu_count(), "repeats": args.repeats,
-            "model": args.model, "gguf": args.gguf, "mmproj": args.mmproj, "colibri_gguf": c_gguf, "colibri_mmproj": c_mmproj}
+            "model": args.model, "gguf": args.gguf, "mmproj": args.mmproj, "colibri_gguf": c_gguf, "colibri_mmproj": c_mmproj,
+            "omp_guidance": "Set OMP_NUM_THREADS or --omp-threads. Start near physical cores or nproc-2/4; returns diminish past a reasonable core count."}
     colibri_rows, colibri_cmd = bench_colibri(args, samples, env, gguf=None, mmproj=None, engine_name="colibri-bf16")
     colibri_gguf_rows, colibri_gguf_cmd = ([], None)
     if c_gguf:
