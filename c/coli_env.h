@@ -788,6 +788,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"Q38_ACT_DUMP", CE_STR, CE_QWEN38, 0, NULL},
     {"Q38_ACT_DUMP_LAYERS", CE_STR, CE_QWEN38, 0, NULL},
     {"Q38_ACT_STATS", CE_STR, CE_QWEN38, 0, NULL},
+    {"Q38_CC_GRAPH", CE_BOOL, CE_QWEN38, 0, NULL},
     {"Q38_DN_GPU", CE_STR, CE_QWEN38, 0, NULL},
     {"Q38_DRAFT_HEAD", CE_STR, CE_QWEN38, 0, NULL},
     {"Q38_EOS",                          CE_INT   , CE_QWEN38                                       , 0             , NULL},

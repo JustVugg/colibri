@@ -71,6 +71,7 @@ struct CcCtx {
     /* the scratch a resize retired: freed once a later frame has been waited for (a stream
      * sync here could wait on a cc_wait_host kernel whose host side comes after this frame) */
     float *adec_old[4]; int adec_n_old;
+    int capturing, cap_broke;   /* graph_begin..graph_end: the stream records; an error then breaks the capture, not the device */
 };
 CcCtx g_cc[COLI_CUDA_MAX_DEVICES];
 /* the retired attention scratches, after the stream was seen to pass the frames that read them */
@@ -100,6 +101,12 @@ CcCtx *live(void) {
 }
 int cc_ok(CcCtx *c, cudaError_t e, const char *what) {
     if (e == cudaSuccess) return 1;
+    if (c && c->capturing) {   /* graph_end reports it; the caller runs the ops again without a graph */
+        std::fprintf(stderr, "[CUDA] chain: %s: %s -- during a graph capture\n", what, cudaGetErrorString(e));
+        (void)cudaGetLastError();
+        c->cap_broke = 1;
+        return 0;
+    }
     std::fprintf(stderr, "[CUDA] chain: %s: %s -- the device is lost to the chain\n", what, cudaGetErrorString(e));
     (void)cudaGetLastError();
     if (c) c->lost = 1;
@@ -2139,6 +2146,61 @@ static int cc_submit(int wait) {
     if (ok) cc_adec_reap(c);
     return ok;
 }
+/* graphs: the ops between graph_begin and graph_end recorded on the stream, instantiated once and
+ * replayed with one launch (cuda_chain.h's contract). Relaxed mode: the capture refuses only what
+ * would touch the stream being captured, not this thread's other calls. A replay runs the same
+ * kernels with the same arguments in the same order: the bits of running the ops.
+ * HIP: backend_gpu_compat.h has no relaxed capture mode, and this was not run there: the table's
+ * entries are NULL. */
+#if !(defined(__HIP__) || defined(__HIP_PLATFORM_AMD__))
+static int cc_graph_begin(void) {
+    CcCtx *c = live();
+    if (!c || c->capturing) return 0;
+    if (cudaStreamBeginCapture(c->stream, cudaStreamCaptureModeRelaxed) != cudaSuccess) {   /* refused: the device is not lost */
+        (void)cudaGetLastError();
+        return 0;
+    }
+    c->capturing = 1; c->cap_broke = 0;
+    return 1;
+}
+static void *cc_graph_end(int *broke) {
+    *broke = 0;
+    CcCtx *c = cur();   /* not live(): a capture an op broke still ends here */
+    if (!c || !c->up || !c->capturing) return nullptr;
+    if (cudaSetDevice(c->device) != cudaSuccess) { c->capturing = 0; c->lost = 1; (void)cudaGetLastError(); return nullptr; }
+    cudaGraph_t g = nullptr;
+    cudaError_t e = cudaStreamEndCapture(c->stream, &g);
+    c->capturing = 0;
+    cudaGraphExec_t x = nullptr;
+    if (e == cudaSuccess && !c->cap_broke && g) e = cudaGraphInstantiate(&x, g, 0);
+    if (g) cudaGraphDestroy(g);
+    if (e == cudaSuccess && !c->cap_broke && x) return (void *)x;
+    std::fprintf(stderr, "[CUDA] chain: graph capture: %s%s -- the ops run without a graph\n",
+                 c->cap_broke ? "an op broke it" : cudaGetErrorString(e), c->lost ? " (a failure inside it)" : "");
+    (void)cudaGetLastError();
+    if (x) cudaGraphExecDestroy(x);
+    *broke = !c->lost;
+    c->cap_broke = 0;
+    return nullptr;
+}
+static int cc_graph_launch(void *g) {
+    CcCtx *c = live();   /* live(): t_cc_seq moves, so the next matmul quantizes its input again */
+    if (!c || !g || c->capturing) return 0;
+    return cc_ok(c, cudaGraphLaunch((cudaGraphExec_t)g, c->stream), "graph launch");
+}
+static void cc_graph_free(void *g) {
+    if (!g) return;
+    CcCtx *c = cur();
+    if (c && c->up && cudaSetDevice(c->device) == cudaSuccess) {
+        if (!c->lost) cudaStreamSynchronize(c->stream);   /* a launch of it may still run */
+        cudaGraphExecDestroy((cudaGraphExec_t)g);
+    }
+    (void)cudaGetLastError();
+}
+#define CC_GRAPH_OPS cc_graph_begin, cc_graph_end, cc_graph_launch, cc_graph_free
+#else
+#define CC_GRAPH_OPS nullptr, nullptr, nullptr, nullptr
+#endif
 static int cc_finish(void) {
     CcCtx *c = live();
     if (!c) return 0;
@@ -2335,7 +2397,7 @@ static int cc_matmul(ColiCudaTensor *t, CcBuf *x, size_t xo, CcBuf *y, size_t yo
     const int ok = coli_cuda_tensor_gemm_async(t, y->d + yo, xp, S, (void *)c->stream);
     coli_cuda_bd_x_same(0);
     last = {xp, S, I, t_cc_seq, c->stream};
-    if (!ok) { c->lost = 1; last.x = nullptr; return 0; }
+    if (!ok) { if (c->capturing) c->cap_broke = 1; else c->lost = 1; last.x = nullptr; return 0; }   /* in a capture: graph_end says broke */
     return 1;
 }
 static int cc_addnorm(CcBuf *x, CcBuf *t, CcBuf *w, CcBuf *y, const CcAddNorm *p) {
@@ -3011,7 +3073,7 @@ static int cc_matmul_hcmix(ColiCudaTensor *t, CcBuf *x, size_t x_off, CcBuf *hn,
         (x_off + (size_t)n * I) * 4 > x->bytes || (size_t)n * O * 4 > hn->bytes || (size_t)n * H * 4 > y->bytes) return -1;
     const int r = coli_cuda_tensor_gemm_hcmix_async(t, fpw(y), fp(x) + x_off, fp(hn), n, H, C, fc, (void *)c->stream);
     if (r > 0) { g_st.ops++; g_st.matmuls++; return 1; }
-    if (r == 0) c->lost = 1;
+    if (r == 0) { if (c->capturing) c->cap_broke = 1; else c->lost = 1; }
     return r;
 }
 /* moe's parts 3 with down and the sums by slices of cols outputs (coli_cuda_moe_cols_async): -1 not
@@ -3745,5 +3807,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_sconv, cc_relattn, cc_ink2_mix, cc_ink2_clip, cc_ink2_dconv,
     cc_fetch_at, cc_fetch_wait_at, cc_fetch_done_at,
     cc_ink2_caps_,
+    CC_GRAPH_OPS,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }

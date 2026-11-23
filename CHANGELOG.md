@@ -5,6 +5,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### New
+
+- **qwen38: `Q38_CC_GRAPH=1` replays a decode step's chain segments as CUDA graphs** (default
+  off). With the CUDA chain on and the routed experts on the host's step (FP8 or MXFP4 experts),
+  a decode step or a verify launched about forty ops a layer one by one; the ops whose arguments
+  are a function of the layer and the rows alone (the hyper-connection reads, the projections,
+  the DeltaNet block, the router and its copies, the shared expert) are now captured on a
+  segment's second sight and replayed with one launch each, keyed by the rows and a fingerprint
+  of every device address they touch. The tokens and the logits are the ops' own, bit for bit;
+  the position's ops (K/V rows, QSA, the attention, the PLE layer) still run one by one. A
+  verify's rollback copies the DeltaNet copies into the live state instead of swapping buffers
+  while graphs are on. New optional ops in `cuda_chain.h` (`graph_begin`, `graph_end`,
+  `graph_launch`, `graph_free`; absent on HIP). A capture an op breaks turns the switch off for
+  the run.
+
 ## [2.2.0] - 2026-11-21
 
 ### New

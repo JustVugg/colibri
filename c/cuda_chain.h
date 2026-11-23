@@ -493,6 +493,18 @@ typedef struct ColiCudaChainOps {
     int  (*fetch_done_at)(int bank);
     /* ink2_caps: what the backend takes of Inkling-2-Mini's chain (CC_INK2_*) */
     int  (*ink2_caps)(void);
+    /* graphs (Qwen3.8's Q38_CC_GRAPH): graph_begin starts capturing the chain's stream (relaxed
+     * mode): the ops that follow are recorded, not run, until graph_end ends the capture and
+     * instantiates them. graph_end gives the executable graph, or NULL: *broke 1 when the
+     * capture broke (an op the capture refused; nothing ran, the device is not lost: the caller
+     * runs the ops again without a graph), 0 a device failure. graph_launch runs a graph on the
+     * stream (the frame's next op after it, as the ops it holds would); graph_free drops one.
+     * A replay is one launch: the stats count its ops once, when captured. graph_begin 0 with
+     * the device not lost (cc_lost): the stream would not capture. NULL entries on HIP. */
+    int  (*graph_begin)(void);
+    void *(*graph_end)(int *broke);
+    int  (*graph_launch)(void *g);
+    void (*graph_free)(void *g);
 } ColiCudaChainOps;
 #define CC_INK2_MOE      1   /* cc_moe's act 1, esc_off, planar 2 entries and NVFP4 (fmt 140) in a decode step's rows */
 #define CC_INK2_LOOPGATE 2   /* cc_ew's CC_EW_LOOPGATE */
@@ -816,6 +828,16 @@ static inline int cc_ink2_caps(void) {
     const ColiCudaChainOps *t = cc_ops();
     return t && t->size >= offsetof(ColiCudaChainOps, ink2_caps) + sizeof t->ink2_caps && t->ink2_caps ? t->ink2_caps() : 0;
 }
+/* the graph ops (graph_begin .. graph_free): 0 from a backend before them or without them (HIP) */
+static inline int cc_graph_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, graph_free) + sizeof t->graph_free && t->graph_begin && t->graph_end &&
+           t->graph_launch && t->graph_free;
+}
+static inline int cc_graph_begin(void) { return cc_graph_ready() ? cc_ops()->graph_begin() : 0; }
+static inline void *cc_graph_end(int *broke) { *broke = 0; return cc_graph_ready() ? cc_ops()->graph_end(broke) : NULL; }
+static inline int cc_graph_launch(void *g) { return cc_graph_ready() && g ? cc_ops()->graph_launch(g) : 0; }
+static inline void cc_graph_free(void *g) { if (g && cc_graph_ready()) cc_ops()->graph_free(g); }
 static inline int cc_fetch_wait_at(int bank) { return cc_fetch_at_ready() ? cc_ops()->fetch_wait_at(bank) : 0; }
 static inline int cc_fetch_done_at(int bank) { return cc_fetch_at_ready() ? cc_ops()->fetch_done_at(bank) : 0; }
 #endif
