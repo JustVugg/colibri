@@ -757,24 +757,31 @@ static void conv2d_f32(float *out, const float *in, const Conv2d *C, int H, int 
     /* in: [C.in,H,W], out: [C.out,H2,W2] */
     int H2 = (H + 2*C->pad - C->kh) / C->stride + 1;
     int W2 = (W + 2*C->pad - C->kw) / C->stride + 1;
-    #pragma omp parallel for collapse(3) schedule(static) if(C->out*H2*W2 > 4096)
+    #pragma omp parallel for schedule(static) if(C->out > 1)
     for (int oc=0; oc<C->out; oc++) {
-        for (int oh=0; oh<H2; oh++) {
-            for (int ow=0; ow<W2; ow++) {
-                float acc = C->b ? C->b[oc] : 0.0f;
-                for (int ic=0; ic<C->in; ic++) {
-                    for (int kh=0; kh<C->kh; kh++) {
-                        for (int kw=0; kw<C->kw; kw++) {
-                            int ih = oh*C->stride - C->pad + kh;
-                            int iw = ow*C->stride - C->pad + kw;
-                            if (ih<0||ih>=H||iw<0||iw>=W) continue;
-                            size_t in_idx = ((size_t)ic*H + ih)*W + iw;
-                            size_t w_idx = (((size_t)oc*C->in + ic)*C->kh + kh)*C->kw + kw;
-                            acc += in[in_idx] * C->w[w_idx];
+        float *ooc = out + (size_t)oc*H2*W2;
+        float bias = C->b ? C->b[oc] : 0.0f;
+        for (int i=0;i<H2*W2;i++) ooc[i] = bias;
+        for (int ic=0; ic<C->in; ic++) {
+            const float *wic = C->w + ((size_t)oc*C->in + ic)*C->kh*C->kw;
+            const float *iic = in + (size_t)ic*H*W;
+            for (int kh=0; kh<C->kh; kh++) {
+                int ih0 = kh - C->pad;
+                for (int kw=0; kw<C->kw; kw++) {
+                    float ww = wic[(size_t)kh*C->kw + kw];
+                    if (ww == 0.0f) continue;
+                    int iw0 = kw - C->pad;
+                    for (int oh=0; oh<H2; oh++) {
+                        int ih = oh*C->stride + ih0;
+                        if ((unsigned)ih >= (unsigned)H) continue;
+                        float *orow = ooc + (size_t)oh*W2;
+                        const float *irow = iic + (size_t)ih*W;
+                        for (int ow=0; ow<W2; ow++) {
+                            int iw = ow*C->stride + iw0;
+                            if ((unsigned)iw < (unsigned)W) orow[ow] += irow[iw] * ww;
                         }
                     }
                 }
-                out[((size_t)oc*H2 + oh)*W2 + ow] = acc;
             }
         }
     }
@@ -782,6 +789,7 @@ static void conv2d_f32(float *out, const float *in, const Conv2d *C, int H, int 
 
 static void apply_gelu(float *x, size_t n) { for (size_t i=0;i<n;i++) x[i]=gelu(x[i]); }
 
+static double now_ms(void);
 static int audio_encoder_forward(Qwen3Asr *m, const float *mel, int n_mels, int n_frames, float **out_emb, int *out_n) {
     /* MVP: single-chunk simplified path for short audio. TODO: full chunk/window packing. */
     AudioTower *a = &m->audio;
@@ -824,6 +832,7 @@ static int audio_encoder_forward(Qwen3Asr *m, const float *mel, int n_mels, int 
     }
     if (total_tokens <= 0) { free(padded); free(tok_per_chunk); return -1; }
     float *hidden = (float*)xcalloc((size_t)total_tokens * a->d_model, sizeof(float));
+    double t_conv0 = now_ms();
     int out_pos = 0;
     for (int c=0;c<num_chunks;c++) {
         /* extract chunk [1,n_mels,chunk_len] */
@@ -857,6 +866,7 @@ static int audio_encoder_forward(Qwen3Asr *m, const float *mel, int n_mels, int 
     }
     int max_chunk_aftercnn = 0;
     for (int c=0;c<num_chunks;c++) if (tok_per_chunk[c] > max_chunk_aftercnn) max_chunk_aftercnn = tok_per_chunk[c];
+    double t_conv1 = now_ms();
     free(padded); free(tok_per_chunk);
 
     /* Transformer encoder layers */
@@ -884,6 +894,7 @@ static int audio_encoder_forward(Qwen3Asr *m, const float *mel, int n_mels, int 
     float *qkv_out=(float*)xcalloc((size_t)T*3*D,sizeof(float));
     float *att=(float*)xcalloc((size_t)Hh*T*T,sizeof(float));
     float *tmp=(float*)xcalloc((size_t)T*D,sizeof(float));
+    double t_layers0 = now_ms();
     for (int li=0; li<a->n_layers; li++) {
         AsrEncLayer *L = &a->layers[li];
         /* self attn */
@@ -938,6 +949,7 @@ static int audio_encoder_forward(Qwen3Asr *m, const float *mel, int n_mels, int 
         for (size_t i=0;i<(size_t)T*D;i++) hidden[i]+=buf[i];
         free(ff);
     }
+    double t_layers1 = now_ms();
     /* ln_post */
     for (int t=0;t<T;t++) layernorm(buf + (size_t)t*D, hidden + (size_t)t*D, a->ln_post.w, a->ln_post.b, D);
     memcpy(hidden, buf, (size_t)T*D*sizeof(float));
@@ -947,6 +959,8 @@ static int audio_encoder_forward(Qwen3Asr *m, const float *mel, int n_mels, int 
     for (size_t i=0;i<(size_t)T*a->d_model;i++) p1[i]=gelu(p1[i]);
     float *p2=(float*)xcalloc((size_t)T*a->output_dim,sizeof(float));
     matmul_linear(p2, p1, &a->proj2, T);
+    double t_proj1 = now_ms();
+    if (getenv("QWEN3_ASR_DEBUG_TIMING")) fprintf(stderr,"[qwen3_asr] audio_enc_breakdown conv=%.1fms layers=%.1fms proj=%.1fms T=%d\n", t_conv1-t_conv0, t_layers1-t_layers0, t_proj1-t_layers1, T);
     free(p1); free(buf); free(q); free(k); free(v); free(qkv_out); free(att); free(tmp); free(hidden); free(cu);
     *out_emb = p2; *out_n = T;
     return 0;
