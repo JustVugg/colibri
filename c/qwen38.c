@@ -2036,6 +2036,7 @@ static int q38_serve_budget(int np, int max_tok, int max_ctx, int read_only){
 typedef struct {
     double started; uint64_t hits, misses; Q38Timers timers; QtCounters qt;
     uint64_t prefill_hits, prefill_misses; Q38Timers prefill_timers; QtCounters prefill_qt;
+    uint64_t npf[7];   /* Q38_NEXT_PREFETCH's counters (qwen38_cuda_chain.h) */
 } Q38ReqClock;
 
 static QtCounters q38_qt_delta(const QtCounters *after,const QtCounters *before){
@@ -2079,8 +2080,18 @@ static void q38_report_request_split(const Model *m,const Q38ReqClock *clk,const
     tier[0]=q38_qt_delta(&clk->prefill_qt,&clk->qt);tier[1]=q38_qt_delta(&now,&clk->prefill_qt);
     uint64_t ram_hits[2]={clk->prefill_hits-clk->hits,m->hits-clk->prefill_hits};
     uint64_t ram_misses[2]={clk->prefill_misses-clk->misses,m->miss-clk->prefill_misses};
-    char line[512];
-    if(q38_format_expert_split(line,sizeof line,id,ram_hits,ram_misses,tier_on,tier)>0)fputs(line,stderr);
+    char line[768];
+    int sn=q38_format_expert_split(line,512,id,ram_hits,ram_misses,tier_on,tier);
+    uint64_t g=m->npf_guess-clk->npf[0],h=m->npf_hit-clk->npf[1],r=m->npf_routed-clk->npf[2],rd=m->npf_issued-clk->npf[3],u=m->npf_used-clk->npf[4];
+    if(sn>0&&g){   /* Q38_NEXT_PREFETCH: the guess's hits, the reads it started and how many a route used */
+        char more[96]="";   /* =2: the records a join cancelled, the layers held behind demand reads */
+        if(m->npf_mode==2)snprintf(more,sizeof more,", cancelled %llu, held %llu",(unsigned long long)(m->npf_cancel-clk->npf[5]),
+                                   (unsigned long long)(m->npf_held-clk->npf[6]));
+        snprintf(line+sn-1,sizeof line-(size_t)(sn-1)," | next-layer guess %llu, hit %llu (%.1f %%, %.1f %% of %llu routed), "
+                 "read ahead %llu, used %llu, wasted %llu%s\n",(unsigned long long)g,(unsigned long long)h,100.0*h/g,
+                 r?100.0*h/r:0.0,(unsigned long long)r,(unsigned long long)rd,(unsigned long long)u,(unsigned long long)(rd-u),more);
+    }
+    if(sn>0)fputs(line,stderr);
 }
 
 /* A request's prompt into the conversation the Model holds: its tokens and image,
@@ -3048,6 +3059,8 @@ static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     printf("ACCEPT %s %d\n",q->id,np); fflush(stdout);
     if(lone)q38_park_decide(m,ids,np,q->max_tok);   /* a conversation parked by the last request: back, kept or dropped */
     clk->started=now_s(); clk->hits=m->hits; clk->misses=m->miss; clk->timers=m->timers; qt_counters(&clk->qt);
+    clk->npf[0]=m->npf_guess; clk->npf[1]=m->npf_hit; clk->npf[2]=m->npf_routed; clk->npf[3]=m->npf_issued; clk->npf[4]=m->npf_used;
+    clk->npf[5]=m->npf_cancel; clk->npf[6]=m->npf_held;
     /* Prima gli scatti CHIESTI, e il piu profondo: sono punti di ritorno che
      * il client ha dichiarato, e battono la cache automatica, che insegue solo
      * l'ultimo prompt. Se nessuno serve, si ricade su quella. */

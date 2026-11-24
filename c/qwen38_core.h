@@ -258,6 +258,9 @@ typedef struct {
     uint64_t clock, hits, miss;
     uint64_t expert_weight_reads, expert_scale_reads, expert_pair_reads;
     uint64_t expert_prefetch_ranges, expert_parallel_batches;
+    uint64_t npf_guess, npf_hit, npf_routed, npf_issued, npf_used;   /* Q38_NEXT_PREFETCH (qwen38_cuda_chain.h) */
+    uint64_t npf_cancel, npf_held;   /* =2: records cancelled before they started, layers whose read waited for demand reads */
+    int npf_mode, npf_max; float npf_minp;   /* Q38_NEXT_PREFETCH, Q38_NPF_MAX, Q38_NPF_MIN_P, read at open (q38_npf_settings) */
     uint64_t expert_scale_bytes;
     float **DN_rec, **DN_conv;
     /* Q38_DN_GPU=1 (qt_dn_gpu_*): the host arrays above stay canonical; per
@@ -1742,10 +1745,12 @@ static int q38_cache_slots_set(LCache *cache,int cap){
     return 0;
 }
 
+static void q38_npf_settings(Model *m);
 static void model_init_range(Model *m,const char *snap,int cap,int bits,
                              int layer_begin,int layer_end,int load_boundaries,
                              int allocate_state) {
     (void)bits; memset(m,0,sizeof(*m)); double t0=now_s();
+    q38_npf_settings(m);
     m->native_fp8=q38_env_bool("Q38_NATIVE_FP8",1);
     m->native_bf16=q38_env_bool("Q38_NATIVE_BF16",1);
     m->expert_prefetch=q38_env_bool("Q38_EXPERT_PREFETCH",1);
@@ -2803,6 +2808,32 @@ static int q38_victim(const LCache *lc,int layer,const uint8_t *protect){
     if(dev>=0){vkt_ram_gave();return dev;}
     return lru;
 }
+/* Q38_NEXT_PREFETCH (qwen38_cuda_chain.h): one thread that reads a layer's guessed experts
+ * into its RAM cache while the main thread computes the layer before. It lives as long as the
+ * process and keeps one OpenMP team of a fixed size (workers: the main thread's), as the
+ * demand reads do (#2592). Unused, and never started, with the switch off.
+ * =2 (pf: the request is a prefetch): a record starts only while no demand read runs (demand
+ * > 0 holds it) and never once stop is set (the guessed layer's join cancels the records not
+ * yet started). */
+static struct {
+    pthread_mutex_t mx; pthread_cond_t cv; pthread_t th;
+    int started,busy,workers,layer,n,pf,stop,demand; Model *m; struct Q38ExpertLoadJob *jobs; double secs;
+} g_q38_ld={.mx=PTHREAD_MUTEX_INITIALIZER,.cv=PTHREAD_COND_INITIALIZER};
+static int g_q38_npf_prio;   /* Q38_NEXT_PREFETCH=2 seen: demand reads are counted */
+static void q38_npf_demand(int d) {   /* a demand read starts (+1) or ends (-1) */
+    if(!g_q38_npf_prio)return;
+    pthread_mutex_lock(&g_q38_ld.mx);
+    g_q38_ld.demand+=d;if(!g_q38_ld.demand)pthread_cond_broadcast(&g_q38_ld.cv);
+    pthread_mutex_unlock(&g_q38_ld.mx);
+}
+static int q38_npf_turn(void) {   /* a prefetch record's turn, after every demand read: 0 = cancelled */
+    pthread_mutex_lock(&g_q38_ld.mx);
+    while(g_q38_ld.demand&&!g_q38_ld.stop)pthread_cond_wait(&g_q38_ld.cv,&g_q38_ld.mx);
+    int go=!g_q38_ld.stop;
+    pthread_mutex_unlock(&g_q38_ld.mx);
+    return go;
+}
+
 static Slot *q38_expert_get(Model *m,int layer,int eid) {
     q38_ehit_mark(m,layer,eid);
     LCache *lc=&m->cache[layer]; int si=lc->by_expert[eid];
@@ -2813,13 +2844,17 @@ static Slot *q38_expert_get(Model *m,int layer,int eid) {
         int victim=q38_victim(lc,layer,NULL);
         s=&lc->slots[victim];if(s->eid>=0)lc->by_expert[s->eid]=-1;
     }
-    s->eid=-1;q38_load_expert(m,layer,eid,s);s->eid=eid;s->used=++m->clock;lc->by_expert[eid]=(int)(s-lc->slots);return s;
+    s->eid=-1;q38_npf_demand(1);q38_load_expert(m,layer,eid,s);q38_npf_demand(-1);
+    s->eid=eid;s->used=++m->clock;lc->by_expert[eid]=(int)(s-lc->slots);return s;
 }
 
-typedef struct {
+typedef struct Q38ExpertLoadJob {
     int expert;
     Slot *slot;
     st_tensor *weight[3];
+    int done;   /* read (a cancelled Q38_NEXT_PREFETCH=2 record stays 0) */
+    int victim;   /* Q38_NEXT_PREFETCH: the expert the slot held (-1 none) and its LRU stamp, */
+    uint64_t victim_used;   /* which a record cancelled before its read gives the slot back to */
 } Q38ExpertLoadJob;
 
 /* Reserve an entire routed demand set on the main thread, fill distinct slots
@@ -2851,6 +2886,48 @@ static int q38_expert_batch_fallback(Model *m,Q38ExpertBatchFallback reason,
     }
     fprintf(stderr,"; using serial expert reads\n");
     return 0;
+}
+
+/* The team of an expert read wave: the matmuls' team, whatever the wave's record count
+ * (a team as large as the jobs changed size from batch to batch, and libgomp ended and
+ * started threads at each change, #2592). The loader thread takes the main thread's. */
+static int q38_read_team(void) {
+#ifdef _OPENMP
+    return omp_get_max_threads();
+#else
+    return 1;
+#endif
+}
+/* The reserved jobs' reads, on any thread: every job owns a distinct slot.
+ * pf: a Q38_NEXT_PREFETCH=2 read (each record waits for its turn, q38_npf_turn). */
+static void q38_expert_batch_load(Model *m,int layer,Q38ExpertLoadJob *jobs,int job_count,int workers,int pf) {
+    int x4=q38_layer_int4(m,layer),gg=g_q38_gguf;
+    const gguf_tensor *ggt[3]={0};
+    if(gg)q38_gg_expert_tensors(m,layer,ggt);
+#ifndef _OPENMP
+    (void)workers;   /* only the pragma below reads it */
+#endif
+    #pragma omp parallel for schedule(static) num_threads(workers) if(job_count>1)
+    for(int job=0;job<job_count;job++){
+        jobs[job].done=0;
+        if(pf&&!q38_npf_turn())continue;
+        if(gg)q38_gg_read_expert(m,ggt,jobs[job].expert,jobs[job].slot);
+        else if(x4)q38_load_int4_record(m,layer,jobs[job].expert,jobs[job].slot);
+        else q38_load_native_fp8_ranges(m,layer,jobs[job].expert,jobs[job].slot,
+                                        jobs[job].weight);
+        jobs[job].done=1;
+    }
+}
+/* The read jobs' cache entries, on the main thread */
+static void q38_expert_batch_publish(Model *m,int layer,Q38ExpertLoadJob *jobs,int job_count) {
+    LCache *cache=&m->cache[layer];int x4=q38_layer_int4(m,layer),gg=g_q38_gguf;
+    m->expert_weight_reads+=(uint64_t)job_count*(gg?3:x4?1:2);
+    if(!x4&&!gg)m->expert_pair_reads+=(uint64_t)job_count;
+    if(job_count>1)m->expert_parallel_batches++;
+    for(int job=0;job<job_count;job++){
+        Slot *slot=jobs[job].slot;slot->eid=jobs[job].expert;
+        cache->by_expert[jobs[job].expert]=(int)(slot-cache->slots);
+    }
 }
 
 static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
@@ -2933,25 +3010,42 @@ static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
     free(protected_slots);
     if(job_count){
         double started=now_s();
-        /* the default team, whatever the jobs: one as large as the jobs changed size from
-         * batch to batch, and libgomp ended and started threads at each change (#2592) */
-        #pragma omp parallel for schedule(static) if(job_count>1)
-        for(int job=0;job<job_count;job++){
-            if(gg)q38_gg_read_expert(m,ggt,jobs[job].expert,jobs[job].slot);
-            else if(x4)q38_load_int4_record(m,layer,jobs[job].expert,jobs[job].slot);
-            else q38_load_native_fp8_ranges(m,layer,jobs[job].expert,jobs[job].slot,
-                                            jobs[job].weight);
-        }
+        q38_npf_demand(1);q38_expert_batch_load(m,layer,jobs,job_count,q38_read_team(),0);q38_npf_demand(-1);
         q38_tm_add(m,Q38_TM_EXPERT_READ,started);
-        m->expert_weight_reads+=(uint64_t)job_count*(gg?3:x4?1:2);
-        if(!x4&&!gg)m->expert_pair_reads+=(uint64_t)job_count;
-        if(job_count>1)m->expert_parallel_batches++;
-        for(int job=0;job<job_count;job++){
-            Slot *slot=jobs[job].slot;slot->eid=jobs[job].expert;
-            cache->by_expert[jobs[job].expert]=(int)(slot-cache->slots);
-        }
+        q38_expert_batch_publish(m,layer,jobs,job_count);
     }
     free(jobs);
+    return 1;
+}
+
+static void *q38_loader_main(void *arg) {
+    (void)arg;
+    pthread_mutex_lock(&g_q38_ld.mx);
+    for(;;){
+        while(!g_q38_ld.busy)pthread_cond_wait(&g_q38_ld.cv,&g_q38_ld.mx);
+        int pf=g_q38_ld.pf;
+        pthread_mutex_unlock(&g_q38_ld.mx);
+        double started=now_s();
+        q38_expert_batch_load(g_q38_ld.m,g_q38_ld.layer,g_q38_ld.jobs,g_q38_ld.n,g_q38_ld.workers,pf);
+        double secs=now_s()-started;
+        pthread_mutex_lock(&g_q38_ld.mx);
+        g_q38_ld.secs=secs;g_q38_ld.busy=0;pthread_cond_broadcast(&g_q38_ld.cv);
+    }
+    return NULL;
+}
+/* The jobs' reads started on the loader thread; 0: no loader thread (the caller reads in
+ * line). pf: a Q38_NEXT_PREFETCH=2 read. A read still in flight ends first. */
+static int q38_loader_start(Model *m,int layer,Q38ExpertLoadJob *jobs,int n,int pf) {
+    pthread_mutex_lock(&g_q38_ld.mx);
+    if(!g_q38_ld.started){
+        g_q38_ld.workers=q38_read_team();   /* the main thread's sizing (coli_omp_tune_threads): a new thread has the defaults */
+        if(pthread_create(&g_q38_ld.th,NULL,q38_loader_main,NULL)){pthread_mutex_unlock(&g_q38_ld.mx);return 0;}
+        pthread_detach(g_q38_ld.th);g_q38_ld.started=1;
+    }
+    while(g_q38_ld.busy)pthread_cond_wait(&g_q38_ld.cv,&g_q38_ld.mx);
+    g_q38_ld.m=m;g_q38_ld.layer=layer;g_q38_ld.jobs=jobs;g_q38_ld.n=n;g_q38_ld.pf=pf;g_q38_ld.stop=0;g_q38_ld.busy=1;
+    pthread_cond_broadcast(&g_q38_ld.cv);
+    pthread_mutex_unlock(&g_q38_ld.mx);
     return 1;
 }
 
@@ -3179,6 +3273,23 @@ static int q38_env_int_in_range(const char *name,int default_value,int min_value
 static int q38_env_positive_int(const char *name,int default_value,
                                 int max_value) {
     return q38_env_int_in_range(name,default_value,1,max_value);
+}
+/* Q38_NEXT_PREFETCH (qwen38_cuda_chain.h): 0 off, 1 every guess, 2 the confident ones, after
+ * the demand reads; for 2 also Q38_NPF_MIN_P (0.10) and Q38_NPF_MAX (4). Read once at open,
+ * so a bad value stops the engine at start, not in the middle of a request. */
+static void q38_npf_settings(Model *m) {
+    const char *v=getenv("Q38_NEXT_PREFETCH");
+    m->npf_mode=0;
+    if(!v||!*v||(v[0]=='0'&&!v[1]))return;
+    if((v[0]!='1'&&v[0]!='2')||v[1]){fprintf(stderr,"Q38_NEXT_PREFETCH must be 0, 1 or 2\n");exit(1);}
+    m->npf_mode=v[0]-'0';
+    if(m->npf_mode==2){
+        const char *p=getenv("Q38_NPF_MIN_P");char *end=NULL;
+        double mp=p&&*p?strtod(p,&end):0.10;
+        if(p&&*p&&(*end||!(mp>=0))){fprintf(stderr,"Q38_NPF_MIN_P must be a probability\n");exit(1);}
+        m->npf_minp=(float)mp;
+        m->npf_max=q38_env_positive_int("Q38_NPF_MAX",4,1<<16);
+    }
 }
 
 static int q38_prefill_batch_rows(void) {

@@ -40,6 +40,146 @@ struct SrvCtx { uint8_t *pool; size_t st; int ne; };
 static const uint8_t *t_srv_where(void *ctx, int k) { const struct SrvCtx *c = ctx; return c->pool + (size_t)(k % c->ne) * c->st; }
 static int brake_frame(Q38CChain *b, unsigned routes, unsigned miss) { b->routes += routes; b->pool_reads += miss; return q38cc_braked(b); }
 
+/* ---- Q38_NEXT_PREFETCH: the next layer's router on this layer's MoE input guesses its route,
+ * the loader thread reads the guesses ahead into the RAM cache. The run must print what the
+ * switch-off run prints (tokens, the oracle's cosine) and dump its last logits bit for bit, and
+ * the guesses must have been counted and some read ahead (RAM cap 1, no warmstart: misses). */
+static char *npf_slurp(const char *path, size_t *n) {
+    *n = 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    char *b = sz >= 0 ? (char *)malloc((size_t)sz + 1) : NULL;
+    if (b) { *n = fread(b, 1, (size_t)sz, f); b[*n] = 0; }
+    fclose(f);
+    return b;
+}
+static int npf_run(char **argv, const char *out, const char *err) {
+    fflush(stdout); fflush(stderr);
+    int so = dup(1), se = dup(2), rc = -1;
+    if (freopen(out, "wb", stdout) && freopen(err, "wb", stderr)) rc = qwen38_main_unused(4, argv);
+    fflush(stdout); fflush(stderr); dup2(so, 1); dup2(se, 2); close(so); close(se);
+    qt_shutdown();
+    return rc;
+}
+/* mode "2": only confident guesses (minp: Q38_NPF_MIN_P, NULL = 0.10), behind the demand reads */
+static void t_next_prefetch(char **argv, const char *what, const char *mode, const char *minp) {
+    printf(" Q38_NEXT_PREFETCH=%s%s%s on the chain (%s)\n", mode, minp ? " Q38_NPF_MIN_P=" : "", minp ? minp : "", what);
+    setenv("COLI_CUDA_CHAIN", "1", 1);
+    fake_chain_frames = 0; fake_chain_fail_at = 0;
+    setenv("DUMP", "q38npf_off.f32", 1);
+    int rc0 = npf_run(argv, "q38npf_off.out", "q38npf_off.err");
+    setenv("Q38_NEXT_PREFETCH", mode, 1); setenv("DUMP", "q38npf_on.f32", 1);
+    if (minp) setenv("Q38_NPF_MIN_P", minp, 1);
+    int rc1 = npf_run(argv, "q38npf_on.out", "q38npf_on.err");
+    unsetenv("Q38_NEXT_PREFETCH"); unsetenv("DUMP"); unsetenv("Q38_NPF_MIN_P");
+    size_t n0, n1, l0, l1, ne;
+    char *o0 = npf_slurp("q38npf_off.out", &n0), *o1 = npf_slurp("q38npf_on.out", &n1);
+    char *d0 = npf_slurp("q38npf_off.f32", &l0), *d1 = npf_slurp("q38npf_on.f32", &l1), *e = npf_slurp("q38npf_on.err", &ne);
+    char *e0 = npf_slurp("q38npf_off.err", &ne);
+    tk(rc0 == 0 && rc1 == 0 && fake_chain_frames > 8, "both runs on the chain within the oracle's limits");
+    tk(o0 && o1 && n0 == n1 && n0 > 0 && !memcmp(o0, o1, n0), "the switch on prints the switch-off run's tokens and cosine");
+    tk(d0 && d1 && l0 == l1 && l0 > 0 && !memcmp(d0, d1, l0), "the last logits are the switch-off run's bit for bit");
+    unsigned long long g = 0, h = 0, r = 0, rd = 0, u = 0, w = 0;
+    const char *p = e ? strstr(e, "Q38_NEXT_PREFETCH guessed ") : NULL;
+    int got = p && sscanf(p, "Q38_NEXT_PREFETCH guessed %llu experts, %llu routed (%*f %% of the guesses, %*f %% of %llu routed); "
+                             "read ahead %llu, used %llu, wasted %llu", &g, &h, &r, &rd, &u, &w) == 6;
+    if (got) printf("  guessed %llu, hit %llu, routed %llu, read ahead %llu, used %llu, wasted %llu\n", g, h, r, rd, u, w);
+    tk(got && g > 0 && h <= g && h <= r && u <= rd && u <= h && w == rd - u, "the guesses were counted at exit");
+    if (mode[0] == '1') tk(got && rd > 0, "guessed experts outside VRAM and RAM were read ahead");
+    else {
+        unsigned long long cn = 0, hl = 0;
+        const char *q = e ? strstr(e, "Q38_NEXT_PREFETCH=2 cancelled ") : NULL;
+        int got2 = q && sscanf(q, "Q38_NEXT_PREFETCH=2 cancelled %llu records before they started, %llu layers", &cn, &hl) == 2;
+        if (got2) printf("  cancelled %llu, held behind demand reads %llu\n", cn, hl);
+        if (minp) tk(got && got2 && rd == 0 && cn == 0 && hl == 0, "no guess reaches Q38_NPF_MIN_P: nothing read ahead");
+        else tk(got && got2 && rd + cn > 0 && hl > 0, "confident guesses were read ahead or cancelled, some held behind demand reads");
+    }
+    tk(e0 && !strstr(e0, "Q38_NEXT_PREFETCH"), "the switch off says nothing about it");
+    free(o0); free(o1); free(d0); free(d1); free(e); free(e0);
+    const char *tmp[] = {"q38npf_off.out", "q38npf_on.out", "q38npf_off.err", "q38npf_on.err", "q38npf_off.f32", "q38npf_on.f32"};
+    for (size_t i = 0; i < sizeof tmp / sizeof *tmp; i++) remove(tmp[i]);
+}
+
+/* ---- Q38_NEXT_PREFETCH=2's pieces: the confidence gate, and a prefetch record's turn ---- */
+static void t_npf_confident(void) {
+    printf(" Q38_NEXT_PREFETCH=2: the confident guesses\n");
+    /* two rows over 6 experts: row 0 p = softmax(4,3,0,0,0,0), row 1 p = softmax(0,0,0,0,0,5) */
+    float lg[12] = {4, 3, 0, 0, 0, 0,  0, 0, 0, 0, 0, 5}, p[6];
+    uint8_t mk[6] = {1, 1, 1, 0, 0, 1};   /* guesses 0, 1, 2, 5 */
+    int k = q38cc_npf_confident(lg, 2, 6, 0.10f, 4, mk, p);
+    tk(k == 3 && (mk[0] & 8) && (mk[1] & 8) && (mk[5] & 8) && !(mk[2] & 8) && !(mk[3] & 8),
+       "every guess at or over 0.10 (the rows' highest probability), none under it, none not guessed");
+    memset(mk, 0, sizeof mk); mk[0] = mk[1] = mk[5] = 1;
+    k = q38cc_npf_confident(lg, 2, 6, 0.10f, 2, mk, p);
+    tk(k == 2 && (mk[5] & 8) && (mk[0] & 8) && !(mk[1] & 8), "Q38_NPF_MAX keeps the most probable");
+    memset(mk, 0, sizeof mk); mk[0] = 1 | 16; mk[5] = 1;
+    k = q38cc_npf_confident(lg, 2, 6, 0.10f, 4, mk, p);
+    tk(k == 1 && (mk[5] & 8) && !(mk[0] & 8), "a guess already in VRAM or RAM takes no read");
+    memset(mk, 0, sizeof mk); mk[5] = 1;
+    tk(q38cc_npf_confident(lg, 2, 6, 1.01f, 4, mk, p) == 0 && !(mk[5] & 8), "a threshold over 1 reads nothing");
+}
+static volatile int t_turn_got = -1;
+static void *t_turn_main(void *a) { (void)a; t_turn_got = q38_npf_turn(); return NULL; }
+static void t_turn_wait(double s) { double t = now_s(); while (now_s() - t < s) { } }
+static void t_npf_turn(void) {
+    printf(" Q38_NEXT_PREFETCH=2: a prefetch record waits for the demand reads\n");
+    g_q38_npf_prio = 1;
+    pthread_t th;
+    q38_npf_demand(1); t_turn_got = -1;
+    pthread_create(&th, NULL, t_turn_main, NULL);
+    t_turn_wait(0.05);
+    tk(t_turn_got == -1, "a demand read in flight holds the record");
+    q38_npf_demand(-1);
+    pthread_join(th, NULL);
+    tk(t_turn_got == 1, "the record goes once the demand read ends");
+    q38_npf_demand(1); t_turn_got = -1;
+    pthread_create(&th, NULL, t_turn_main, NULL);
+    t_turn_wait(0.05);
+    pthread_mutex_lock(&g_q38_ld.mx); g_q38_ld.stop = 1; pthread_cond_broadcast(&g_q38_ld.cv); pthread_mutex_unlock(&g_q38_ld.mx);
+    pthread_join(th, NULL);
+    tk(t_turn_got == 0, "the next layer's join cancels a held record");
+    q38_npf_demand(-1);
+    g_q38_ld.stop = 0;
+    tk(g_q38_ld.demand == 0, "the demand count is back to 0");
+    g_q38_npf_prio = 0;
+    q38_npf_demand(1);
+    tk(g_q38_ld.demand == 0, "the switch off counts nothing");
+}
+/* the join of a read with a cancelled record: the read one published, the other's slot empty
+ * and the first victim, its "read ahead" mark dropped, counted as cancelled; a cancelled record
+ * that displaced an expert gives the slot back to it */
+static void t_npf_join_cancel(void) {
+    printf(" Q38_NEXT_PREFETCH=2: the join of a read cancelled in part\n");
+    Model *m = (Model *)calloc(1, sizeof *m);
+    Q38CChain *ch = (Q38CChain *)calloc(1, sizeof *ch);
+    LCache lc = {0};
+    Slot sl[2]; memset(sl, 0, sizeof sl); sl[0].eid = sl[1].eid = -1; sl[0].used = sl[1].used = 7;
+    int by[8]; for (int e = 0; e < 8; e++) by[e] = -1;
+    uint8_t mk[8] = {0};
+    lc.slots = sl; lc.by_expert = by; lc.n = lc.cap = 2;
+    m->cache = &lc; m->c.layers = 2; m->c.experts = 8;
+    Q38ExpertLoadJob *jobs = (Q38ExpertLoadJob *)calloc(2, sizeof *jobs);
+    jobs[0].expert = 3; jobs[0].slot = &sl[0]; jobs[0].done = 1;
+    jobs[1].expert = 5; jobs[1].slot = &sl[1]; jobs[1].done = 0; jobs[1].victim = -1;
+    mk[3] = mk[5] = 1 | 2 | 8;
+    ch->npf_mark = mk; ch->npf_jobs = jobs; ch->npf_jobs_n = 2; ch->npf_at = 1;
+    q38cc_npf_join(m, ch);
+    tk(by[3] == 0 && sl[0].eid == 3 && by[5] == -1 && sl[1].eid == -1, "the read record is published, the cancelled one is not");
+    tk(sl[1].used == 0 && q38_victim(&lc, 0, NULL) == 1, "the cancelled record's slot is the first victim");
+    tk((mk[3] & 2) && !(mk[5] & 2) && m->npf_cancel == 1 && !ch->npf_jobs && !ch->npf_jobs_n, "counted as cancelled, not as read ahead");
+    /* issue took slot 1 from expert 6 (stamp 5) for a guess of expert 4, then the record was cancelled */
+    sl[1].eid = -1; sl[1].used = 9;
+    jobs = (Q38ExpertLoadJob *)calloc(1, sizeof *jobs);
+    jobs[0].expert = 4; jobs[0].slot = &sl[1]; jobs[0].done = 0; jobs[0].victim = 6; jobs[0].victim_used = 5;
+    mk[4] = 1 | 2 | 8;
+    ch->npf_jobs = jobs; ch->npf_jobs_n = 1; ch->npf_at = 1;
+    q38cc_npf_join(m, ch);
+    tk(sl[1].eid == 6 && by[6] == 1 && sl[1].used == 5 && by[4] == -1, "the displaced expert is published again with its LRU stamp");
+    tk(!(mk[4] & 2) && m->npf_cancel == 2 && by[3] == 0 && sl[0].eid == 3, "counted as cancelled, the other slot unchanged");
+    free(ch); free(m);
+}
+
 int main(void) {
     setenv("SNAP", "./qwen38_tiny_fp8", 1);
     setenv("OMP_NUM_THREADS", "2", 1);
@@ -56,6 +196,9 @@ int main(void) {
     setenv("CUDA_EXPERT_GB", "0.5", 1);
     setenv("Q38_MTP", "0", 1);                     /* no draft: the run stays plain */
     fake_dense_compute = 1;
+    t_npf_confident();
+    t_npf_turn();
+    t_npf_join_cancel();
     char *argv[] = { (char *)"qwen38", (char *)"1", (char *)"8", (char *)"./qwen38_tiny_fp8/ref.json" };
 
     printf(" a prompt chunk's rows\n");
@@ -85,6 +228,10 @@ int main(void) {
     fake_chain_fail_at = 0;
     qt_shutdown();
 
+    t_next_prefetch(argv, "decode", "1", NULL);
+    t_next_prefetch(argv, "decode", "2", NULL);
+    t_next_prefetch(argv, "decode", "2", "1.01");
+
     printf(" the same without the chain\n");
     setenv("COLI_CUDA_CHAIN", "0", 1);
     fake_chain_frames = 0;
@@ -106,6 +253,8 @@ int main(void) {
     tk(fake_dn_snapshots > 0, "MTP verification wrote DeltaNet chain snapshots");
     tk(g_q38cc_mtp_rows > 0, "the MTP head's layer ran on the card");
     qt_shutdown();
+    t_next_prefetch(argv, "rejected MTP verify rows", "1", NULL);
+    t_next_prefetch(argv, "rejected MTP verify rows", "2", NULL);
     printf(" the MTP head on the CPU beside the chain (Q38_MTP_CHAIN=0)\n");
     setenv("Q38_MTP_CHAIN", "0", 1);
     fake_chain_frames = 0; g_q38cc_mtp_rows = 0;
