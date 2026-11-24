@@ -225,6 +225,10 @@ int qt_take_scaled(uint32_t mask, const float *val, int K, float *out, const flo
 int  qt_plan_fill(int *layers, int *eids, int max);
 /* A layer that routes nothing (Flint's dense layers): qt_plan_fill skips it. */
 void qt_layer_off(int layer);
+/* allow: n_layers x n_experts bytes, 1 = may be planned (qt_plan_fill, qt_fill_next keep
+ * their heat order over the allowed ones); NULL = every expert (the default). The caller
+ * keeps the table alive while the tier plans (qwen38's Q38_EXPERT_MASK). */
+void qt_plan_allow(const uint8_t *allow);
 void qt_note_planned(int layer, int eid,
              const uint8_t *g4, const uint8_t *u4, const uint8_t *d4,
              const float *gs, const float *us, const float *ds);
@@ -425,6 +429,7 @@ static inline int qt_take(uint32_t a,const float*b,int c,float*d){(void)b;(void)
 static inline int qt_take_scaled(uint32_t a,const float*b,int c,float*d,const float*s,float e){(void)b;(void)c;(void)d;(void)s;(void)e;return a==0;}
 static inline int  qt_plan_fill(int*a,int*b,int c){(void)a;(void)b;(void)c;return 0;}
 static inline void qt_layer_off(int a){(void)a;}
+static inline void qt_plan_allow(const uint8_t*a){(void)a;}
 static inline void qt_note_planned(int a,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;}
 static inline int  qt_fill_next(int*a,int*b){(void)a;(void)b;return 0;}
 static inline void qt_note_block(int a,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;}
