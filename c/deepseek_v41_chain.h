@@ -112,7 +112,6 @@ static VkcFit g_v41c_fit2;
 static int g_v41c_fit2_on;
 static V41Chain *v41c_of(int d) { return d ? g_v41c2 : g_v41c; }
 static const char *v41c_name(const V41Chain *ch) { return ch && ch->d ? "deepseek_v41 dev2" : "deepseek_v41"; }
-static int v41c_dev2_wanted(void) { const char *e = getenv("COLI_VK_CHAIN_DEV2"); return !(e && *e == '0'); }
 static int v41c_own(const V41Chain *ch, int i) { return i >= ch->lo && i < ch->lo + ch->n; }
 
 /* The window ring's extra rows at setup: COLI_VK_CHAIN_ROWS when set, else 512; a forward
@@ -491,7 +490,7 @@ static int v41c_fit_now(Model *m) {
      * layers' own set: no device-only placement there, the head on the host), its
      * pipelines up now */
     int n0 = g_v41_fit.n;
-    if (g_v41_partial && n0 > 0 && n0 < L && v41c_dev2_wanted() && getenv("COLI_VK_DEV2") && coli_vk_dev2_open_env()) {
+    if (g_v41_partial && n0 > 0 && n0 < L && vkc_dev2_wanted() && getenv("COLI_VK_DEV2") && coli_vk_dev2_open_env()) {
         int b = n0;
         while (b > 0 && !v41c_clean_at(m, b)) b--;
         if (b != n0 && g_v41_fit.forced) {
