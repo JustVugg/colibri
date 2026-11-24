@@ -284,12 +284,8 @@ typedef struct {
 } Model;
 
 /* ---------- utility ---------- */
-static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec*1e-9; }
-#if defined(__APPLE__)
-static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0*1024.0); }
-#else
-static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0); }
-#endif
+static double now_s(void) { return compat_now_s(); }
+static double rss_gb(void) { return compat_rss_gb(); }
 static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
 static float sigmoidf(float x) { return 1.f / (1.f + expf(-x)); }
 static float siluf(float x) { return x / (1.f + expf(-x)); }
@@ -1124,6 +1120,23 @@ static float *load_t(Model *m, const char *name) {
     int64_t n = st_numel(&m->S, name);
     if (n < 0) { fprintf(stderr, "missing %s\n", name); exit(1); }
     float *p = falloc(n);
+    st_tensor *t = st_find(&m->S, name);
+    if (st_is_ggml(t->dtype)) {   /* a GGUF's small tensor in a block type (AtomicChat's Inkling-2-Mini
+                                   * files hold attn_sink_proj and the conv projections in Q8_0): its rows dequantized */
+        const int type = st_ggml_type(t->dtype);
+        const int64_t cols = t->shape[t->rank - 1], rows = n / cols, rb = gq_row_bytes(type, cols);
+        if (rb < 0 || t->nbytes != rb * rows) {
+            fprintf(stderr, "%s: not %lld rows of %lld in ggml type %s, refusing\n",
+                    name, (long long)rows, (long long)cols, gq_type_name(type)); exit(1); }
+        uint8_t *raw = malloc((size_t)t->nbytes);
+        if (!raw) { fprintf(stderr, "OOM reading %s\n", name); exit(1); }
+        st_pread_full(t->fd, raw, t->nbytes, t->off, name);
+        for (int64_t r = 0; r < rows; r++)
+            if (gq_dequant_row(type, raw + r * rb, p + r * cols, cols)) {
+                fprintf(stderr, "%s: cannot read %s rows\n", name, gq_type_name(type)); exit(1); }
+        free(raw);
+        return p;
+    }
     st_read_f32(&m->S, name, p, 0);
     return p;
 }

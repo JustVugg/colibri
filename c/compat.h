@@ -1043,5 +1043,26 @@ static inline double compat_mem_available_gb(void){
     return avail;
 }
 
+/* --- the monotonic clock and the peak resident set, one definition for the engines ---
+ * Each engine had its own copy, and the copies of rss_gb had come to disagree: GiB in most,
+ * GB in DeepSeek V4.1 and MiMo, and GLM-5.3 divided macOS's bytes as if they were KB (a
+ * resident set a thousand times too large). ru_maxrss is in bytes on macOS and in KB on
+ * Linux and in the Windows shim above; the answer is GiB, as `resident` is everywhere else. */
+#include <time.h>
+#ifndef _WIN32
+#include <sys/resource.h>
+#endif
+static inline double compat_now_s(void){
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
+}
+static inline double compat_rss_gb(void){
+    struct rusage r; getrusage(RUSAGE_SELF, &r);
+#ifdef __APPLE__
+    return r.ru_maxrss / (1024.0 * 1024.0 * 1024.0);
+#else
+    return r.ru_maxrss / (1024.0 * 1024.0);
+#endif
+}
 
 #endif /* COMPAT_H */

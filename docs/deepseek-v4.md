@@ -971,6 +971,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 |---|---|
 | `DSV4_CUDA` (1) | master switch for the V4 GPU tier; `0` = CPU only |
 | `DSV4_CUDA_DEVICE` (0) | single CUDA device ordinal, used when `DSV4_CUDA_DEVICES` is unset |
+| `DSV4_CUDA_REQUIRE` (0) | `1` = the GPU tier must start: where it would fall back to the CPU (no backend DLL or a dependency of it, init failure, a device the build cannot run, `DSV4_CUDA=0`) the engine prints `v4_gpu error=gpu-required (<cause>)` and exits 1 instead of running the model on the CPU. A build without the tier refuses before reading any weight |
 | `DSV4_CUDA_DEVICES` (unset) | ordered comma-separated distinct CUDA ordinals; split contiguous layers across these devices |
 | `COLI_DSV4_DLL` | Windows: force a backend DLL, by file name or relative path (engine's folder) or absolute path (loader) |
 | `COLI_CUDA_ATTN_BATCH` (0; 1 for a GGUF on the CUDA expert tier) | `1` = GPU batched prefill attention block + GPU decode attention/indexer; unset, it is on for a GGUF whose dense matrices the CUDA expert tier's device holds (`COLI_CUDA=1`, `COLI_CUDA_DENSE`), `0` keeps it on the CPU |

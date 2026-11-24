@@ -585,6 +585,8 @@ TEST_EXCLUDE += test_vk_chain test_vk_memtype test_glm53_vk_f32 test_vk_dev2_win
 TEST_EXCLUDE += test_cu_tier
 # takes a fixture and the CPU build's logits on its command line (ci.yml, the int4 gs64 A/B step)
 TEST_EXCLUDE += test_qwen36_tier_stream_engine
+# runs qwen36.c's main on a GGUF named on its command line: tests/test_qwen36_gguf_hostdrop.py drives it
+TEST_EXCLUDE += test_qwen36_gguf_hostdrop
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
@@ -1366,10 +1368,15 @@ expert-group-rows-test: tests/test_expert_group_rows_cuda.cu backend_cuda.cu bac
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_expert_group_rows_cuda.cu -o expert_group_rows_test$(EXE) $(GPU_TEST_LIBS)
 	./expert_group_rows_test$(EXE)
 
-cuda-test: tests/test_mxfp4_expert_cuda.cu tests/test_mxfp4_group_cuda.cu backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu tests/test_cuda_fmt_trap_cuda.cu tests/test_alloc_footprint_cuda.cu tests/test_cuda_init_failure.cu tests/test_expert_group_rows_cuda.cu tests/test_vision_attention_cuda.cu
+cuda-test: tests/test_mxfp4_expert_cuda.cu tests/test_mxfp4_group_cuda.cu backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu tests/test_cuda_fmt_trap_cuda.cu tests/test_alloc_footprint_cuda.cu tests/test_cuda_init_failure.cu tests/test_expert_group_rows_cuda.cu tests/test_vision_attention_cuda.cu tests/test_gemv_sk_part_cuda.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	./backend_cuda_test$(EXE)
+	# gemv_i8_w4's split partials with COLI_CUDA_SK_PART=0 and =1, each in its own process (the
+	# switch is read once): the same bits, the buffers a stream, a call past its buffer, a graph.
+	# Includes backend_cuda.cu itself, so only the test file is compiled.
+	"$(GPUCC)" $(GPUFLAGS) tests/test_gemv_sk_part_cuda.cu -o gemv_sk_part_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	./gemv_sk_part_test$(EXE)
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_expert_group_rows_cuda.cu -o expert_group_rows_test$(EXE) $(GPU_TEST_LIBS)
 	./expert_group_rows_test$(EXE)
 	"$(GPUCC)" $(GPUFLAGS) tests/test_cuda_init_failure.cu -o cuda_init_failure_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
@@ -1594,6 +1601,7 @@ gpu-compile: backend_cuda.o cuda_chain.o
 	"$(GPUCC)" $(GPUFLAGS) tests/test_fp8_warp_cuda.cu -o fp8_warp_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) tests/test_weights_owned_cuda.cu -o weights_owned_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) tests/test_cuda_fmt_trap_cuda.cu -o cuda_fmt_trap_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) tests/test_gemv_sk_part_cuda.cu -o gemv_sk_part_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 
 cuda-bench: backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h tests/bench_tensor_core.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
@@ -1937,6 +1945,25 @@ qwen38-tiny-int4-check: qwen38-tiny-int4-generate qwen38-tiny-fp8-generate qwen3
 	done; \
 	echo "qwen38 int4-g64 experts: ref_int4.json reproduced in $$n configurations, last logits identical across paths; FP8 control ok"
 	./tests/test_qwen38_tier_engine$(EXE) ./qwen38_tiny_int4
+
+# The grouped decode (q38_moe_decode_grouped) with a RAM cache smaller than a step's distinct
+# experts: it takes them in waves of the cache's slots. The int4 fixture in the gguf-256 geometry
+# (the grouped path needs dims % 32; the default fixture's are 8) at caps 1, 2 and 8, the prompt
+# through the decode rows (Q38_PREFILL_BATCH=0: up to 8 distinct experts a step): the grouped path
+# runs at every cap and the last logits are identical to the bit (cap 8 is one wave). The run's
+# own oracle is not the gate: ref_int4.json is the small geometry's.
+.PHONY: qwen38-grouped-waves-check
+qwen38-grouped-waves-check: qwen38$(EXE)
+	$(PYTHON) tools/make_qwen38_tiny.py --out ./qwen38_tiny_g256_int4 --fp8-experts --int4-experts --expert-gain 3 --geometry gguf-256
+	@d=./qwen38_tiny_g256_int4/logits; rm -rf $$d; mkdir -p $$d; \
+	for cap in 1 2 8; do \
+		Q38_EXPERT_INT4=1 Q38_PREFILL_BATCH=0 DUMP=$$d/c$$cap.f32 OMP_NUM_THREADS=2 SNAP=./qwen38_tiny_g256_int4 \
+			./qwen38$(EXE) $$cap 8 ./qwen38_tiny_g256_int4/ref_int4.json > $$d/c$$cap.log 2>&1; \
+		grep -q '^C engine' $$d/c$$cap.log && [ -s $$d/c$$cap.f32 ] || { cat $$d/c$$cap.log; echo "FAIL cap=$$cap: no run"; exit 1; }; \
+		grep -q 'grouped by expert' $$d/c$$cap.log || { cat $$d/c$$cap.log; echo "FAIL cap=$$cap: the grouped decode did not run"; exit 1; }; \
+	done; \
+	for cap in 1 2; do cmp -s $$d/c$$cap.f32 $$d/c8.f32 || { echo "FAIL cap=$$cap: last logits differ from one wave (cap 8)"; exit 1; }; done; \
+	echo "qwen38 grouped decode in waves: caps 1, 2 and 8 give the same last logits"
 
 # The routed experts as AMD's Quark checkpoint ships them in MXFP4 (e2m1 nibbles, one E8M0
 # exponent per 32 inputs): --mxfp4-experts rounds the fixture's experts (scaled by 3, as the
@@ -2528,6 +2555,9 @@ tests/test_st_overlay$(EXE): tests/test_st_overlay.c
 tests/test_compat_mem$(EXE): tests/test_compat_mem.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_compat_rss$(EXE): tests/test_compat_rss.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_compat_cgroup$(EXE): tests/test_compat_cgroup.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -2720,6 +2750,10 @@ tests/test_olmoe_load_diagnostic$(EXE): tests/test_olmoe_load_diagnostic.c olmoe
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_qwen36_cache_index$(EXE): tests/test_qwen36_cache_index.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
+# The GGUF CPU MoE against the PILOT worker's loads: it computes from held slots.
+tests/test_qwen36_gguf_hold$(EXE): tests/test_qwen36_gguf_hold.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
 # The qwen36 embedding read in place (qwen36_embedding.h): rows, errors and the
@@ -3505,6 +3539,11 @@ tests/test_qwen36_cuda_chain$(EXE): tests/test_qwen36_cuda_chain.c qwen36.c qwen
 tests/test_qwen36_trunk_dense$(EXE): tests/test_qwen36_trunk_dense.c qwen36.c qwen36_tier.c $(VK_OBJ)
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
+# A GGUF's placed matrices give their host rows back and the CPU reads them back exactly
+# (the whole engine on the fake backend; tests/test_qwen36_gguf_hostdrop.py drives it).
+tests/test_qwen36_gguf_hostdrop$(EXE): tests/test_qwen36_gguf_hostdrop.c qwen36.c qwen36_tier.c $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
 # #1391: il decode path deve offrire gli esperti int8 al tier, non solo il warmstart
 tests/test_qwen36_tier_int8_decode$(EXE): tests/test_qwen36_tier_int8_decode.c qwen36.c qwen36_tier.c $(VK_OBJ)
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
@@ -3775,7 +3814,7 @@ test-c: $(TEST_BINS)
 # itself (the test ALSO skips loudly if the library is somehow still absent,
 # e.g. when invoked via unittest directly — but a green `make test` must mean
 # the pin was actually checked).
-test-python: $(RANSLIB) tests/test_ggml_quants$(EXE) tests/test_gguf_c$(EXE) tests/test_gq_dot$(EXE)
+test-python: $(RANSLIB) tests/test_ggml_quants$(EXE) tests/test_gguf_c$(EXE) tests/test_gq_dot$(EXE) tests/test_qwen36_gguf_hostdrop$(EXE)
 	$(PYTHON) -m unittest discover -s tests -p 'test_*.py'
 
 # One after the other, also under -j: the C binaries build in parallel, then run, and only

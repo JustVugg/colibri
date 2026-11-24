@@ -193,11 +193,14 @@ def _content_range_start(value):
 
 
 def download_file(url, dest, spec, *, token=None, progress=None, opener=None,
-                  retries=5, timeout=60, verify=True, backoff=(1, 2, 4, 8, 15)):
+                  retries=5, timeout=60, verify=True, backoff=(1, 2, 4, 8, 15), notify=None):
     """Fetch one file to `dest`, resuming `dest.part`. Returns "present" when it
     was already complete, "downloaded" otherwise. `progress(done, total, fresh)`
     is called as bytes land: `done` is the file offset, `fresh` is how many of
-    those bytes were received in this call (the prefix already on disk is not)."""
+    those bytes were received in this call (the prefix already on disk is not).
+    `notify(text)` hears each failed attempt before the wait for the next one:
+    without it a network that does not answer kept the setup silent for minutes
+    (#2970)."""
     opener = opener or urllib.request.urlopen
     size = int(spec["size"])
     if (os.path.exists(dest) and os.path.getsize(dest) == size
@@ -259,16 +262,22 @@ def download_file(url, dest, spec, *, token=None, progress=None, opener=None,
                 raise DownloadError(f"{url}: HTTP {error.code}")
             if attempt >= retries:
                 raise DownloadError(f"{url}: HTTP {error.code} after {attempt + 1} attempts")
+            failure = f"HTTP {error.code}"
         except DownloadError:
             raise
         except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError) as error:
             if attempt >= retries:
                 raise DownloadError(f"{os.path.basename(dest)}: {error} (rerun to continue "
                                     f"from {have} of {size} bytes)")
+            failure = str(getattr(error, "reason", None) or error)
         else:
             continue
         attempt += 1
-        time.sleep(backoff[min(attempt - 1, len(backoff) - 1)])
+        delay = backoff[min(attempt - 1, len(backoff) - 1)]
+        if notify:
+            notify(f"{os.path.basename(dest)}: {failure}; trying again in {delay} s "
+                   f"(attempt {attempt + 1} of {retries + 1})")
+        time.sleep(delay)
         have = os.path.getsize(part) if os.path.exists(part) else 0
         if hasher is not None:
             hasher, expected = _hasher(spec)
@@ -486,7 +495,8 @@ def bytes_present(model_dir, files, extra_dirs=()):
 
 
 def download_repo(repo, revision, model_dir, files, *, token=None, progress=None,
-                  base=None, opener=None, curl=None, retries=5, verify=True, extra_dirs=()):
+                  base=None, opener=None, curl=None, retries=5, verify=True, extra_dirs=(),
+                  notify=None):
     """Every listed file into model_dir, small files first (so config.json and the
     tokenizer are there early), then the shards by size. `progress(event)` gets
     dicts with file, file_done, file_total, done, total, and fresh. `done` is the
@@ -538,7 +548,7 @@ def download_repo(repo, revision, model_dir, files, *, token=None, progress=None
             download_file_windows(url, dest, spec, curl, token=token, progress=on_bytes, verify=verify)
         else:
             download_file(url, dest, spec, token=token, progress=on_bytes, opener=opener,
-                          retries=retries, verify=verify)
+                          retries=retries, verify=verify, notify=notify)
         gained = reported["fresh"] if reported["fresh"] is not None else max(0, size - kept)
         session_before += gained
         done_before += size

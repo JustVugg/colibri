@@ -10,6 +10,12 @@ Run it with `make -C c check-env`. It fails when:
     a name that does nothing);
   - the table is not sorted by name, which silently breaks the binary search in
     coli_env_find(), or contains a duplicate name.
+  - a variable in the registry is described nowhere in the reference docs
+    (docs/*.md, docs/api-reference/*.md, README.md, GPU_BACKENDS.md) and is not
+    in tools/env_undocumented.txt, the list of those that had no description
+    when this check began. A new variable needs its line in docs/ENVIRONMENT.md
+    (or its engine's page); the list only shrinks: a name in it that is now
+    described, or that no longer exists, has to leave it.
 
 c/tests/ is excluded: fixtures read their own variables (EXPERT_RAW, TMPDIR)
 which are not part of the engines' surface.
@@ -78,6 +84,58 @@ def scan_registry():
     return rows
 
 
+def doc_files():
+    """The reference docs: the pages a user reads to learn what a variable does."""
+    root = os.path.dirname(C_DIR)
+    files = [os.path.join(root, name) for name in ("README.md", "GPU_BACKENDS.md")]
+    for folder in ("docs", os.path.join("docs", "api-reference")):
+        folder = os.path.join(root, folder)
+        if os.path.isdir(folder):
+            files += [os.path.join(folder, name) for name in sorted(os.listdir(folder))
+                      if name.endswith(".md")]
+    return [path for path in files if os.path.isfile(path)]
+
+
+def scan_docs():
+    """Every name-shaped word in the reference docs, or None when there are no docs here."""
+    files = doc_files()
+    if not files:
+        return None
+    words = set()
+    for path in files:
+        with open(path, errors="replace") as fh:
+            words.update(re.findall(r"(?<![A-Za-z0-9_])[A-Z][A-Z0-9_]+(?![A-Za-z0-9_])", fh.read()))
+    return words
+
+
+def scan_undocumented():
+    """tools/env_undocumented.txt: one name a line, `#` comments."""
+    path = os.path.join(C_DIR, "tools", "env_undocumented.txt")
+    if not os.path.isfile(path):
+        return []
+    with open(path, errors="replace") as fh:
+        return [line.split("#")[0].strip() for line in fh if line.split("#")[0].strip()]
+
+
+def doc_problems(rows):
+    described = scan_docs()
+    if described is None:
+        return []
+    owed = scan_undocumented()
+    problems = []
+    if owed != sorted(set(owed)):
+        problems.append("tools/env_undocumented.txt is not sorted, or repeats a name")
+    for v in sorted(set(rows) - described - set(owed)):
+        problems.append("in coli_env.h but described in no reference doc: %s "
+                        "(add its line to docs/ENVIRONMENT.md)" % v)
+    for v in sorted(set(owed) & described):
+        problems.append("described in the docs now, remove it from "
+                        "tools/env_undocumented.txt: %s" % v)
+    for v in sorted(set(owed) - set(rows)):
+        problems.append("in tools/env_undocumented.txt but not in coli_env.h: %s" % v)
+    return problems
+
+
 def main():
     code = scan_sources()
     rows = scan_registry()
@@ -117,7 +175,16 @@ def main():
             "matches what the engines read.\n")
         return 1
 
-    print("check-env: %d variables, registry matches the sources" % len(rows))
+    problems = doc_problems(rows)
+    if problems:
+        sys.stderr.write("the reference docs are out of sync with coli_env.h:\n")
+        for p in problems:
+            sys.stderr.write("  - %s\n" % p)
+        return 1
+
+    owed = len(scan_undocumented())
+    print("check-env: %d variables, registry matches the sources%s" % (
+        len(rows), "; %d still to describe (tools/env_undocumented.txt)" % owed if owed else ""))
     return 0
 
 

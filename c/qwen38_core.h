@@ -350,11 +350,7 @@ static int g_capture_last_logit;
  * get the bits a decode step gives them, see q38_weight_matmul and q38_moe. */
 static int g_q38_rowwise;
 
-static double now_s(void) {
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
-}
+static double now_s(void) { return compat_now_s(); }
 
 static inline void q38_tm_add(Model *m,Q38Timer timer,double started) {
     m->timers.seconds[timer] += now_s() - started;
@@ -368,11 +364,7 @@ static Q38Timers q38_tm_delta(const Q38Timers *after,const Q38Timers *before) {
     return delta;
 }
 
-#if defined(__APPLE__)
-static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF,&r); return r.ru_maxrss/1073741824.0; }
-#else
-static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF,&r); return r.ru_maxrss/1048576.0; }
-#endif
+static double rss_gb(void) { return compat_rss_gb(); }
 
 static float *falloc(int64_t n) {
     if (n < 0 || (uint64_t)n > SIZE_MAX / sizeof(float)) {
@@ -4112,7 +4104,7 @@ static void q38_trunk_place_all(Model *m) {
                 if(!rows){fprintf(stderr,"OOM GGUF trunk matrix for the device\n");exit(1);}
                 gq_r16_unpack(w->gq_type,rows,(const uint8_t*)w->data,O,I);
             }
-            int h=qt_dense_init_fmt(rows?(const void*)rows:w->data,NULL,fmt,I,O,dev);
+            int h=qt_dense_init_fmt(rows?(const void*)rows:w->data,NULL,NULL,fmt,I,O,dev);
             free(rows);
             if(h>=0){ w->gpu=h+1; placed++; placed_bytes+=(size_t)O*gq_row_bytes(fmt-100,I); }
             continue;
@@ -4768,8 +4760,6 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
     if(on<0){const char *e=getenv("Q38_MOE_GROUPED");on=!(e&&e[0]=='0');}
     Cfg *c=&m->c;const int H=c->hidden,E=c->experts,K=c->topk,I=c->inter,SI=c->shared_inter;
     if(!on||S<1||S>Q38_GROUPED_ROWS||!(q38_layer_int4(m,layer)||g_q38_gguf||q38_layer_fp8_rows(m,layer))||H%32||I%32)return 0;
-    /* every distinct expert of the rows in the cache at once, or the per-expert paths */
-    if((S*K<E?S*K:E)>m->cache[layer].cap)return 0;   /* at most E distinct, however many rows */
     /* the device tiers take experts per row; the statistics hooks keep the loop's order. The
      * CUDA tier: a decode row's residents go to the device (qt_issue) and the rest are
      * grouped here, as without it; more rows keep the loop. */
@@ -4839,12 +4829,19 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
         q38_tm_add(m,Q38_TM_SHARED_EXPERT,started);
     }
     started=now_s();
-    int loaded=nu>=2?q38_expert_get_batch(m,layer,uniq,nu,slot):0;
-    if(nu==1){slot[0]=q38_expert_get(m,layer,uniq[0]);loaded=1;}
-    int kin=Q38_ROWS_NONE,kdn=Q38_ROWS_NONE;
+    /* the distinct experts in waves of at most the RAM cache's slots, each wave loaded (its
+     * misses read from the disk) and computed before the next recycles its slots: a cache
+     * smaller than a step's distinct experts still serves the rows. One wave when they fit. */
+    const int wcap=m->cache[layer].cap<1?1:m->cache[layer].cap;
+    int kin=Q38_ROWS_NONE,kdn=Q38_ROWS_NONE,loaded=0,x2_done=0;
+    for(int j0=0;j0<nu;j0+=wcap){
+    const int nw=nu-j0<wcap?nu-j0:wcap,j1=j0+nw,pa=start[j0],pb=start[j1-1]+cnt[j1-1];
+    loaded=nw>=2?q38_expert_get_batch(m,layer,uniq+j0,nw,slot+j0):0;
+    if(nw==1){slot[j0]=q38_expert_get(m,layer,uniq[j0]);loaded=1;}
+    kin=kdn=Q38_ROWS_NONE;
     if(loaded){
-        kin=q38_rows_kind(&slot[0]->gate);kdn=q38_rows_kind(&slot[0]->down);
-        for(int j=0;j<nu;j++)
+        kin=q38_rows_kind(&slot[j0]->gate);kdn=q38_rows_kind(&slot[j0]->down);
+        for(int j=j0;j<j1;j++)
             if(q38_rows_kind(&slot[j]->gate)!=kin||q38_rows_kind(&slot[j]->up)!=kin||q38_rows_kind(&slot[j]->down)!=kdn)kin=Q38_ROWS_NONE;
     }
     if(!loaded||kin==Q38_ROWS_NONE||kdn==Q38_ROWS_NONE){
@@ -4852,8 +4849,8 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
          * soon as it is loaded, as the decode loop does */
         for(int i=0;i<np;i++){
             int p=pos[i];Slot *ex=NULL;
-            if(p<0)continue;   /* the device's */
-            if(loaded){for(int j=0;j<nu;j++)if(uniq[j]==idx[i])ex=slot[j];}
+            if(p<pa||p>=pb)continue;   /* the device's, or another wave's */
+            if(loaded){for(int j=j0;j<j1;j++)if(uniq[j]==idx[i])ex=slot[j];}
             else ex=q38_expert_get(m,layer,idx[i]);
             const float *xs=x+(int64_t)(i/K)*H;float *g=eg+(int64_t)p*I,*u=eu+(int64_t)p*I,*h=ehf+(int64_t)p*I;
             q38_weight_matmul(g,xs,&ex->gate,1,H,I);q38_weight_matmul(u,xs,&ex->up,1,H,I);
@@ -4862,20 +4859,21 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
         }
     } else {
         /* the inputs: f32 row pointers, or int8 per 32 once per row, gathered per assignment */
-        for(int p=0;p<nc;p++){xr[p]=x+(int64_t)(who[p]/K)*H;hr[p]=ehf+(int64_t)p*I;}
-        if(kin==Q38_ROWS_GQ){   /* gq_matmul's quantization, once per row, then each assignment its row's copy */
+        for(int p=pa;p<pb;p++){xr[p]=x+(int64_t)(who[p]/K)*H;hr[p]=ehf+(int64_t)p*I;}
+        if(kin==Q38_ROWS_GQ&&!gin.q){   /* at the first wave, for every assignment: gq_matmul's quantization, once per row, then each assignment its row's copy */
             gq_act gx;memset(&gx,0,sizeof gx);
             for(int p=0;p<nc;p++)pos_row[p]=who[p]/K;
             if(gq_act_set(&gx,x,S,H)||gq_act_gather(&gin,&gx,pos_row,nc)){fprintf(stderr,"OOM grouped MoE\n");exit(1);}
             gq_act_free(&gx);
         }
-        if(kdn==Q38_ROWS_GQ){
+        if(kdn==Q38_ROWS_GQ&&!gh.q){
             gh.q=(int8_t*)malloc((size_t)np*I);gh.d=falloc((int64_t)np*(I/32));gh.s=(int32_t*)malloc((size_t)np*(I/16)*sizeof(int32_t));
             gh.l4=(int32_t*)malloc((size_t)np*(I/4)*sizeof(int32_t));
             if(!gh.q||!gh.d||!gh.s||!gh.l4){fprintf(stderr,"OOM grouped MoE\n");exit(1);}
             gh.S=nc;gh.I=I;gh.cap=np*I;
         }
-        if(kin==Q38_ROWS_X2){
+        if(kin==Q38_ROWS_X2&&!x2_done){
+            x2_done=1;
             for(int s=0;s<S;s++)x2_quant_act(x+(int64_t)s*H,H,xqt+(int64_t)s*H,dxt+(int64_t)s*(H/32));
             for(int p=0;p<nc;p++){
                 int s=who[p]/K;
@@ -4888,8 +4886,8 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
         T=omp_get_max_threads();
 #endif
         /* (expert, row block) items: enough for every thread, blocks of 8 rows or more */
-        int cF=(4*T+nu-1)/nu;if(cF>I/8)cF=I/8;if(cF<1)cF=1;
-        int cH=(4*T+nu-1)/nu;if(cH>H/8)cH=H/8;if(cH<1)cH=1;
+        int cF=(4*T+nw-1)/nw;if(cF>I/8)cF=I/8;if(cF<1)cF=1;
+        int cH=(4*T+nw-1)/nw;if(cH>H/8)cH=H/8;if(cH<1)cH=1;
         int rF=(I+cF-1)/cF,rH=(H+cH-1)/cH;
         if(I%16==0&&rF%16)rF+=16-rF%16;   /* whole groups of 16 rows (GQ_*_R16) */
         if(H%16==0&&rH%16)rH+=16-rH%16;
@@ -4897,15 +4895,15 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
         #pragma omp parallel
         {
             #pragma omp for schedule(dynamic,1)
-            for(int it=0;it<nu*cF;it++){
-                const int j=it/cF,r0=(it%cF)*rF,r1=r0+rF<I?r0+rF:I,p0=start[j],n=cnt[j];
+            for(int it=0;it<nw*cF;it++){
+                const int j=j0+it/cF,r0=(it%cF)*rF,r1=r0+rF<I?r0+rF:I,p0=start[j],n=cnt[j];
                 const gq_act ga={gin.q+(int64_t)p0*H,gin.d+(int64_t)p0*(H/32),gin.s+(int64_t)p0*(H/16),n,H,0,
                                  gin.l4?gin.l4+(int64_t)p0*(H/4):NULL};
                 q38_rows(eg+(int64_t)p0*I,I,&slot[j]->gate,H,r0,r1,xr+p0,xg+(int64_t)p0*H,dxg+(int64_t)p0*(H/32),&ga,n);
                 q38_rows(eu+(int64_t)p0*I,I,&slot[j]->up,H,r0,r1,xr+p0,xg+(int64_t)p0*H,dxg+(int64_t)p0*(H/32),&ga,n);
             }
             #pragma omp for schedule(static)
-            for(int p=0;p<nc;p++){
+            for(int p=pa;p<pb;p++){
                 const float *g=eg+(int64_t)p*I,*u=eu+(int64_t)p*I;float *h=ehf+(int64_t)p*I;
                 for(int j=0;j<I;j++)h[j]=q38_silu(g[j])*u[j];
                 if(kdn==Q38_ROWS_X2)x2_quant_act(h,I,ehq+(int64_t)p*I,ehdx+(int64_t)p*(I/32));
@@ -4915,13 +4913,17 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
                 }
             }
             #pragma omp for schedule(dynamic,1)
-            for(int it=0;it<nu*cH;it++){
-                const int j=it/cH,r0=(it%cH)*rH,r1=r0+rH<H?r0+rH:H,p0=start[j],n=cnt[j];
+            for(int it=0;it<nw*cH;it++){
+                const int j=j0+it/cH,r0=(it%cH)*rH,r1=r0+rH<H?r0+rH:H,p0=start[j],n=cnt[j];
                 const gq_act ga={gh.q+(int64_t)p0*I,gh.d+(int64_t)p0*(I/32),gh.s+(int64_t)p0*(I/16),n,I,0,
                                  gh.l4?gh.l4+(int64_t)p0*(I/4):NULL};
                 q38_rows(eo+(int64_t)p0*H,H,&slot[j]->down,I,r0,r1,hr+p0,ehq+(int64_t)p0*I,ehdx+(int64_t)p0*(I/32),&ga,n);
             }
         }
+    }
+    /* the tier promotes what the CPU computed (it copies the rows before qt_note returns;
+     * the next wave may recycle this one's slots) */
+    if(cuda&&loaded)for(int j=j0;j<j1;j++)q38_tier_note(layer,uniq[j],slot[j]);
     }
     q38_tm_add(m,Q38_TM_ROUTED_EXPERT,started);
     static int said;
@@ -4930,8 +4932,6 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
         fprintf(stderr,"[qwen38] decode rows' routed experts grouped by expert, one parallel region a layer "
                        "(Q38_MOE_GROUPED=0: one expert at a time)\n");
     }
-    /* the tier promotes what the CPU computed (it copies the rows before qt_note returns) */
-    if(cuda&&loaded)for(int j=0;j<nu;j++)q38_tier_note(layer,uniq[j],slot[j]);
     /* each row: its experts' outputs in rank order (the CPU's, then the device's: qt_take),
      * then the shared expert */
     for(int s=0;s<S;s++){

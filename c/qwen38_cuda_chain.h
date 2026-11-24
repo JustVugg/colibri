@@ -1856,9 +1856,10 @@ static int q38cc_dm_able(Q38CChain *ch, Model *m) {
         g_q38_act || g_q38_dump || g_q38_cov || (g && g[0] == '0') || !qt_experts_on() || qt_chain_devices() != 1) return 0;
     if (c->hidden % 32 || c->inter % 32 || c->hidden > CC_MOE_DIM_MAX || c->inter > CC_MOE_DIM_MAX) return 0;
     if (!qt_chain_format(&ch->dm_fmt, &ch->dm_gs) || (ch->dm_fmt == 4 && (ch->dm_gs < 16 || ch->dm_gs % 16))) return 0;
-    int need = Q38CC_DM_ROWS * K < E ? Q38CC_DM_ROWS * K : E;   /* the host's step: a step's distinct experts in the RAM cache at once */
+    /* the host's share of a step takes its distinct experts in waves of the RAM cache's slots
+     * (q38_moe_decode_grouped), so a cache of one slot or more serves it */
     for (int i = 0; i < L; i++) {
-        if (!(q38_layer_int4(m, i) || g_q38_gguf) || m->cache[i].cap < need) return 0;
+        if (!(q38_layer_int4(m, i) || g_q38_gguf) || m->cache[i].cap < 1) return 0;
         int fg, fd;
         if (ch->dm_fmt >= 100 && (!qt_chain_layer_format(i, &fg, &fd) || !cc_moe_block_type(fg - 100) || !cc_moe_block_type(fd - 100)))
             return 0;

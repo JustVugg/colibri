@@ -184,6 +184,26 @@ def measure_ram_bandwidth(cpus=None, avail_bytes=None, mb=128, seconds=0.6, runs
 
 # ---------------------------------------------------------------- the disk
 
+def _block_kind(d):
+    """One block device's kind, from its sysfs folder."""
+    if os.path.basename(d).startswith("nvme"):
+        return "nvme"
+    try:
+        with open(os.path.join(d, "queue", "rotational")) as f:
+            rot = f.read().strip() == "1"
+    except OSError:
+        return None
+    if not rot:
+        return "ssd"
+    try:
+        with open(os.path.join(d, "device", "model")) as f:
+            model = f.read().strip()
+    except OSError:
+        model = ""
+    # Hyper-V's virtual disk reads rotational whatever holds it: WSL2's own disk on an NVMe drive
+    return None if model == "Virtual Disk" else "hdd"
+
+
 def _linux_disk_kind(path):
     try:
         st = os.stat(path)
@@ -200,15 +220,7 @@ def _linux_disk_kind(path):
         for s in os.listdir(slaves):
             m = os.path.realpath(os.path.join(slaves, s))
             members.append(m if os.path.exists(os.path.join(m, "queue")) else os.path.dirname(m))
-    kinds = []
-    for d in members or [disk]:
-        name = os.path.basename(d)
-        try:
-            with open(os.path.join(d, "queue", "rotational")) as f:
-                rot = f.read().strip() == "1"
-        except OSError:
-            rot = None
-        kinds.append("nvme" if name.startswith("nvme") else "hdd" if rot else "ssd" if rot is False else None)
+    kinds = [_block_kind(d) for d in members or [disk]]
     for k in ("hdd", "ssd", None, "nvme"):   # the slowest member sets the pace
         if k in kinds:
             return k
@@ -234,7 +246,8 @@ def _windows_disk_kind(path):
 
 
 def disk_kind(path):
-    """nvme, ssd, hdd or None (unknown: a network share, WSL's view of a Windows drive)."""
+    """nvme, ssd, hdd or None (unknown: a network share, WSL's view of a Windows drive or its
+    own virtual disk)."""
     path = path or "."
     while path and not os.path.exists(path):
         parent = os.path.dirname(path)

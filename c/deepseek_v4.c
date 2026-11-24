@@ -12521,6 +12521,14 @@ int coli_v4_engine_open(ColiV4Engine **output,
         goto fail;
     }
     engine->runtime.target_model_dir = engine->owned_target_model_dir;
+#ifndef COLI_V4_GPU_TIER
+    if (coli_v4_gpu_required()) {   /* before any weight is read: nothing here can start a GPU */
+        if (error && error_size)
+            snprintf(error, error_size, "DSV4_CUDA_REQUIRE=1: this build has no CUDA tier "
+                                        "(build with CUDA=1 or HIP=1)");
+        goto fail;
+    }
+#endif
     engine->runtime.memory_limit_bytes = options->memory_limit_bytes;
     engine->runtime.context_tokens =
         options->context_tokens > 0 ? options->context_tokens : 4096;
@@ -12661,6 +12669,14 @@ fail:
  * batched attention's helpers take it where a layer has no FP8 mirror to find it by (a GGUF) */
 static int g_v4_gpu_open_device = -1;
 
+/* DSV4_CUDA_REQUIRE=1: a tier that does not start fails the open instead of running the
+ * whole model on the CPU at a fraction of the speed. Returns what the open returns. */
+static int v4_gpu_fallback(const char *why) {
+    if (!coli_v4_gpu_required()) return 0;
+    fprintf(stderr, "v4_gpu error=gpu-required (%s); DSV4_CUDA_REQUIRE=1 stops the CPU fallback\n", why);
+    return -1;
+}
+
 static int v4_gpu_wanted(void) {
     const char *setting = getenv("DSV4_CUDA");
     if (setting && atoi(setting) == 0) return 0;
@@ -12738,7 +12754,7 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     if (!engine) return -1;
     engine->gpu.enabled = 0;
     engine->gpu.device = 0;
-    if (!v4_gpu_wanted()) return 0;
+    if (!v4_gpu_wanted()) return v4_gpu_fallback("DSV4_CUDA=0");
 #ifdef COLI_VULKAN
     {   /* This path mirrors native FP4 experts and FP8 and bf16 matrices only
          * (v4_gpu_expert_attach_cached_ex): a GGUF's experts and dense part stayed on the CPU
@@ -12831,7 +12847,7 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     }
     if (count == 1 && ndevices == 1 && !dsv4_cuda_init(&device, 1)) {
         fprintf(stderr, "v4_gpu warning=backend-unavailable; continuing-CPU\n");
-        return 0;
+        return v4_gpu_fallback("backend-unavailable");
     }
     if (count > 1) {
         dsv4_cuda_set_peer_best_effort(1);
@@ -12851,7 +12867,7 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
                             "continuing-CPU (rebuild without DEEPGEMM for sm_80+)\n",
                     dsv4_cuda_backend_name(), engine->gpu.devices[i]);
             dsv4_cuda_shutdown();
-            return count > 1 ? -1 : 0;
+            return count > 1 ? -1 : v4_gpu_fallback("unsupported device");
         }
     }
     engine->gpu.device_count = count;
