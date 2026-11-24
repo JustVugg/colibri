@@ -815,7 +815,9 @@ def _coerce_arg(value, declared, literal=True):
     if declared == "string":
         return value
     try:
-        parsed = json.loads(value)
+        # NaN and Infinity are Python's, not JSON: such a value stays the text it was, so the
+        # call's `arguments` (dumped with allow_nan=False) is always JSON
+        parsed = json.loads(value, parse_constant=_reject_json_constant)
     except (json.JSONDecodeError, TypeError):
         container = _literal_container(value, (declared,)) if literal else None
         return value if container is None else container
@@ -1005,7 +1007,7 @@ def _parse_tool_calls(reply, tools, track_spans):
             if payload:
                 key = (param_order.get(name) or ["input"])[0]
                 try:
-                    payload = json.loads(payload)
+                    payload = json.loads(payload, parse_constant=_reject_json_constant)
                 except (json.JSONDecodeError, TypeError, ValueError):
                     pass
                 args = {key: payload}
@@ -5010,7 +5012,7 @@ def parse_mistral_tool_calls(reply, tools=None):
     if first < 0:
         return reply.strip(), []
     names = {(t.get("function") or t).get("name") for t in (tools or []) if isinstance(t, dict)}
-    calls, decoder = [], json.JSONDecoder()
+    calls, decoder = [], json.JSONDecoder(parse_constant=_reject_json_constant)   # NaN: not JSON, not a call
     for block in reply[first:].split(ML4_CALLS)[1:]:
         name, sep, rest = block.partition(ML4_ARGS)
         name = name.strip()
