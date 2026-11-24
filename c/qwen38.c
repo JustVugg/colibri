@@ -42,7 +42,7 @@
  * buffer, so a longer prompt overran the stack instead of being refused.
  * Context costs 54 KB/token in KV/index state (12 QSA layers, f32) -- 128k is 6.75 GiB
  * -- which is why Q38_MAXT still defaults far below this. */
-#define QWEN38_ATTN_MAX_CTX 262144
+#define QWEN38_ATTN_MAX_CTX 524288
 #define QWEN38_DEFAULT_MAX_CTX 8192
 
 /* Effective ceiling: Q38_MAXT if set and sane, the conservative default
@@ -1065,8 +1065,7 @@ static void q38_vocab_report(const Model *m, const char *scope) {
 
 static int q38_context_total(const Cfg *c, int prompt_tokens, int new_tokens,
                              const char *operation) {
-    int limit = c->max_positions < QWEN38_ATTN_MAX_CTX
-              ? c->max_positions : QWEN38_ATTN_MAX_CTX;
+    int limit = QWEN38_ATTN_MAX_CTX;
     if (prompt_tokens < 1 || new_tokens < 1 || prompt_tokens > limit ||
         new_tokens > limit - prompt_tokens) {
         fprintf(stderr, "[ctx] %s requires prompt=%d + new=%d tokens, capacity=%d\n",
