@@ -4205,23 +4205,8 @@ static int pi_desc(const void *a, const void *b) {
     float d = ((const PI*)b)->p - ((const PI*)a)->p;
     return d > 0 ? 1 : d < 0 ? -1 : 0;
 }
-/* COLI_LOGIT_DUMP=1: each served step's top five id:logit to stderr, as sample.h's pick_tok writes them
- * (comparing two configurations on the same context: a stored prefix against a fresh read) */
-static void serve_logit_dump(const float *lo, int V) {
-    static int dump = -1;
-    if (dump < 0) dump = getenv("COLI_LOGIT_DUMP") ? 1 : 0;
-    if (!dump) return;
-    int id[5] = {-1, -1, -1, -1, -1}; float v[5] = {-3e38f, -3e38f, -3e38f, -3e38f, -3e38f};
-    for (int t = 0; t < V; t++) {
-        const float x = lo[t];
-        for (int k = 0; k < 5; k++) if (x > v[k]) { for (int j = 4; j > k; j--) { v[j] = v[j - 1]; id[j] = id[j - 1]; } v[k] = x; id[k] = t; break; }
-    }
-    fprintf(stderr, "[LOGITS]");
-    for (int k = 0; k < 5; k++) fprintf(stderr, " %d:%.6f", id[k], v[k]);
-    fprintf(stderr, "\n");
-}
 static int sample_logits(const float *logit, int n, float temp, float top_p) {
-    serve_logit_dump(logit, n);
+    coli_logit_dump(logit, n);
     int best = 0;
     for (int i = 1; i < n; i++) if (logit[i] > logit[best]) best = i;
     if (temp <= 0.f) return best;
