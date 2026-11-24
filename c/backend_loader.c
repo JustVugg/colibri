@@ -113,6 +113,7 @@ typedef const ColiCudaChainOps *(*fn_chain_ops)(void);
 typedef const CuTierOps *(*fn_tier_ops)(void);
 typedef const ColiInkCudaOps *(*fn_ink_ops)(void);
 typedef int            (*fn_e8_set_grid)(const void *grid);
+typedef int            (*fn_tensor_upload_rows)(ColiCudaTensor **tensor, const void *weights, int fmt, int I, int O, int device, int row0, int n);
 typedef int            (*fn_fp8_set_lut)(const float *lut);
 typedef int            (*fn_vision_attention)(int device, float *out, const float *qkv, int n, int heads, int D, float scale);
 typedef int            (*fn_matmul)(ColiCudaTensor **tensor, float *y, const float *x,
@@ -208,6 +209,7 @@ static struct {
     fn_ink_ops ink_ops;                     /* optional: inkling's bf16 matrices (backend_cuda_ink.h); NULL = none */
     fn_e8_set_grid     e8_set_grid;
     fn_fp8_set_lut     fp8_set_lut;
+    fn_tensor_upload_rows tensor_upload_rows;     /* optional: a block-format tensor a range of rows at a time */
     fn_matmul          matmul;
     fn_matmul_mxfp4    matmul_mxfp4;
     fn_vision_attention vision_attention;
@@ -1479,6 +1481,7 @@ static int coli_cuda_load(void){
      * nothing by this name, and the wrapper's 0 is the engine's own "fall back
      * to CPU" result, so an older DLL still serves GLM and Qwen3.6 (#1405). */
     RESOLVE_OPT(matmul_mxfp4,   fn_matmul_mxfp4)
+    RESOLVE_OPT(tensor_upload_rows, fn_tensor_upload_rows)
     RESOLVE_OPT(vision_attention, fn_vision_attention)
     RESOLVE_OPT(expert_mxfp4,   fn_expert_mxfp4)
     RESOLVE_OPT(available_device_count, fn_available_device_count)   /* older DLLs still support explicit device selection */
@@ -1733,6 +1736,9 @@ const CuTierOps *coli_cuda_tier_ops(void){
     if(!coli_cuda_load()) return NULL;   /* the same: the tier's table asked before any device */
     if(!g_cuda.available || !g_cuda.tier_ops) return NULL;   /* older DLL: no CUDA tier, the experts on the CPU */
     return g_cuda.tier_ops();
+}
+int coli_cuda_tensor_upload_rows(ColiCudaTensor **tensor, const void *weights, int fmt, int I, int O, int device, int row0, int n){
+    return g_cuda.available && g_cuda.tensor_upload_rows ? g_cuda.tensor_upload_rows(tensor, weights, fmt, I, O, device, row0, n) : 0;
 }
 
 /* inkling's six (backend_cuda_ink.h) through the DLL's table. ink_cuda_init comes before any

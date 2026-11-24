@@ -201,6 +201,32 @@ class DownloadTest(unittest.TestCase):
         self.assertEqual(Path(dest).read_bytes(), self.files[name])
         self.assertEqual(self.ranges(name), [None, "bytes=50000-"])
 
+    def test_each_failed_attempt_is_said_before_the_next(self):
+        # #2970: a network that does not answer kept coli setup silent for minutes
+        name = "model-00001.safetensors"
+        self.hub.cut_after[name] = 50_000
+        dest = os.path.join(self.dst, name)
+        heard = []
+        setup_download.download_file(self.url(name), dest, self.spec(name), retries=2,
+                                     backoff=(0,), notify=heard.append)
+        self.assertEqual(Path(dest).read_bytes(), self.files[name])
+        self.assertEqual(len(heard), 1, heard)
+        for part in (name, "connection closed at 50000", "trying again in 0 s", "attempt 2 of 3"):
+            self.assertIn(part, heard[0])
+
+    def test_an_unreachable_host_is_said_on_every_attempt(self):
+        name = "config.json"
+        dest = os.path.join(self.dst, name)
+        heard = []
+        opener = mock.Mock(side_effect=setup_download.urllib.error.URLError(
+            "Temporary failure in name resolution"))
+        with self.assertRaises(setup_download.DownloadError) as caught:
+            setup_download.download_file(self.url(name), dest, self.spec(name), retries=2,
+                                         backoff=(0,), opener=opener, notify=heard.append)
+        self.assertIn("rerun to continue", str(caught.exception))
+        self.assertEqual([h.split("(")[-1] for h in heard], ["attempt 2 of 3)", "attempt 3 of 3)"])
+        self.assertTrue(all("Temporary failure in name resolution" in h for h in heard), heard)
+
     def test_server_ignoring_range_restarts_instead_of_appending(self):
         name = "model-00001.safetensors"
         dest = os.path.join(self.dst, name)

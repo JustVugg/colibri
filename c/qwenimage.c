@@ -67,10 +67,7 @@
 static int g_vk_ready, g_vk_tried;
 #endif
 
-static double now_s(void){
-    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
-    return t.tv_sec + t.tv_nsec * 1e-9;
-}
+static double now_s(void) { return compat_now_s(); }
 static void *xmalloc(size_t n){
     void *p = malloc(n ? n : 1);
     if (!p) { fprintf(stderr, "[qwenimage] out of memory (%zu bytes)\n", n); exit(1); }

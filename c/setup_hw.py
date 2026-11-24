@@ -125,13 +125,17 @@ def detect_memory():
             mem = memory_from_meminfo(handle.read(256 * 1024))
     except OSError:
         mem = {"total": None, "available": None}
-    # A container limit is what kills the process, whatever the host has free:
-    # resource_plan already knows how to read it.
+    # A container limit is what kills the process, whatever the host has: resource_plan
+    # already knows how to read it. It bounds the total too, which is what the model
+    # choice is sized by: 16 GB of a 256 GB host is a 16 GB machine.
     try:
-        from resource_plan import memory_available
+        from resource_plan import memory_available, memory_limit
         budget = memory_available()
         if budget is not None:
             mem["available"] = budget if mem["available"] is None else min(mem["available"], budget)
+        limit = memory_limit()
+        if limit is not None:
+            mem["total"] = limit if mem["total"] is None else min(mem["total"], limit)
     except Exception:  # a malformed cgroup is reported by `coli plan`, not here
         pass
     return mem

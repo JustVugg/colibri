@@ -110,6 +110,22 @@ def check_prefix_is_rejected(
     print("PASS target greedy: truncated prefix rejected")
 
 
+def check_gpu_required(binary: Path, model: Path) -> None:
+    """DSV4_CUDA_REQUIRE=1: a GPU tier that does not start is an error, not a CPU run. With
+    DSV4_CUDA=0 it never starts, on every build, so this needs no GPU."""
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith("DSV4_CUDA")}
+    command = [binary.as_posix(), model.as_posix(), "<t001><t002>", "--raw-prompt",
+               "--max-tokens", "1"]
+    result = subprocess.run(command, text=True, encoding="utf-8", errors="replace",
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180,
+                            env=dict(env, DSV4_CUDA="0", DSV4_CUDA_REQUIRE="1"))
+    if result.returncode == 0 or "DSV4_CUDA_REQUIRE=1" not in result.stderr:
+        raise AssertionError("DSV4_CUDA_REQUIRE=1 with DSV4_CUDA=0 did not fail\n"
+                             f"stderr:\n{result.stderr}")
+    run("DSV4_CUDA_REQUIRE=0", command, env=dict(env, DSV4_CUDA="0", DSV4_CUDA_REQUIRE="0"))
+    print("PASS DSV4_CUDA_REQUIRE: no GPU tier fails the open")
+
+
 def token_prompt(ids: list[int]) -> str:
     return "".join(f"<t{token:03d}>" for token in ids)
 
@@ -379,6 +395,7 @@ def main() -> int:
         check_mtp_draft(binary, fixture, cases["short"], temporary, gpu=False)
         check_mtp_draft(binary, fixture, cases["short"], temporary, gpu=True)
         check_serve(binary, fixture, cases["short"])
+        check_gpu_required(binary, fixture)
 
     print("PASS tiny DeepSeek V4 target oracle: all checks completed")
     return 0

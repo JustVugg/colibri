@@ -36,6 +36,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 
@@ -1850,6 +1851,9 @@ def download_model(ui, entry, model_dir, *, via_windows="auto", verify=True, ext
     whole in extra_dirs (a model split across drives) are neither counted as missing
     nor fetched again."""
     token = setup_download.hf_token()
+    # said before the first request, so a network that does not answer is not a blank
+    # screen (#2970)
+    ui.say(f"  listing the files on {urllib.parse.urlsplit(setup_download.endpoint()).hostname}")
     files = setup_download.list_repo_files(entry.repo, entry.revision, include=entry.include,
                                            exclude=entry.exclude, token=token)
     if not files:
@@ -1904,7 +1908,8 @@ def download_model(ui, entry, model_dir, *, via_windows="auto", verify=True, ext
 
     write_state("download", model=entry.id, done=have, total=total, model_dir=model_dir)
     setup_download.download_repo(entry.repo, entry.revision, model_dir, files, token=token,
-                                 progress=progress, curl=curl, verify=verify, extra_dirs=extra_dirs)
+                                 progress=progress, curl=curl, verify=verify, extra_dirs=extra_dirs,
+                                 notify=lambda text: ui.say(f"  {text}"))
     ui.progress(f"  [{'#' * 24}] 100.0%  {human_size(total)}  done", force=True)
     ui.say("")
     return total

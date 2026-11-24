@@ -87,6 +87,7 @@ static int qwen36_max_ctx(void) {
 #include "route_trace.h"   /* the tier's expert history (.coli_usage), kept only while the tier is on */
 #include "draft_vocab.h"   /* the tokens the MTP head scores for a draft (Q36_MTP_VOCAB) */
 #include "expert_ffn.h"    /* routed experts: planar int4 kernel + layer runner */
+#include "expert_store.h"  /* leases on the GGUF experts the CPU MoE reads */
 #include "idot.h"          /* integer dot kernels for the dense trunk (COLI_DENSE_IDOT, COLI_DENSE_BITS) */
 #include "qwen38_vision.h" /* the ViT: the same tower in Qwen3.5/3.6/3.8 (#1757) */
 #include "lfm3_vision.h"   /* LFM3-VL's tower and projector */
@@ -1142,11 +1143,14 @@ static inline int q36_eh(const Cfg *c) { return c->ehid > 0 ? c->ehid : c->hidde
  * get the file's 16-bit rows back from w (q36_wf16_rows, exact) as block format 100 + wf16. */
 /* vk_name, vk_tag, vk_quant: what load_tq read it with, to read it back from disk
  * (q36_dho_reload); vk_fmt, vk_gone: with the dense weights on the device only
- * (COLI_VK_DENSE_HOST), the device copy's format and 1 while no host copy is kept. */
+ * (COLI_VK_DENSE_HOST), the device copy's format and 1 while no host copy is kept.
+ * gq_gone: 1 while the CUDA tier holds this GGUF matrix alone (q36_gq_drop), 2 while the loader
+ * has read its header only (load_tq_noted under the CUDA tier, q36_gq_settle): no gq, gq_type
+ * what load_tq gives it; matmul_d reads the rows from the file first (q36_gq_reload). */
 typedef struct { const float *w; int8_t *q; float *sc; int I, O; uint8_t *q4; float *sg; int ng;
                  void *vk; int vk_off; uint16_t *h;
                  char *vk_name; const char *vk_tag; int vk_quant, vk_fmt, vk_gone, vk_imported;
-                 uint8_t *gq; int gq_type; float gs; int wf16;
+                 uint8_t *gq; int gq_type; float gs; int wf16; int gq_gone;
                  int mapped; /* q/sc are canonical.qc's pages (qwen_dense_mapped), or gq the GGUF's
                               * (the Metal graph, qwen_gguf_map): never freed */
                  int q8r16, q4r16; } QW;   /* q8r16: q's rows interleaved by 16 (idot.h i8r16_*, q36_trunk_q8_interleave);
@@ -1155,8 +1159,9 @@ static void qw_free(QW *w) {
 #ifdef COLI_VULKAN
     if (w->vk) coli_vk_tensor_free((ColiVkTensor *)w->vk);
     w->vk = NULL; w->vk_off = 0; w->vk_imported = 0;
-    free(w->vk_name); w->vk_name = NULL; w->vk_gone = 0;
+    w->vk_gone = 0;
 #endif
+    free(w->vk_name); w->vk_name = NULL; w->gq_gone = 0;
     if (!w->mapped) { q36_wfree(w->q); free(w->sc); free(w->gq); }
     free((void*)w->w); free(w->q4); free(w->sg); q36_wfree(w->h);
     w->w = NULL; w->q = NULL; w->sc = NULL; w->q4 = NULL; w->sg = NULL; w->ng = 0; w->h = NULL; w->gq = NULL; w->mapped = 0;
@@ -1534,12 +1539,8 @@ static void ensure_pilot_worker_started(Model *m) {
 }
 
 /* ---------- utility ---------- */
-static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec*1e-9; }
-#if defined(__APPLE__)
-static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0*1024.0); }
-#else
-static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0); }
-#endif
+static double now_s(void) { return compat_now_s(); }
+static double rss_gb(void) { return compat_rss_gb(); }
 /* same wrapper convention as colibri.c/olmoe.c/inkling.c/kimi_k3.c/deepseek_v4.c */
 static double mem_available_gb(void) { return compat_mem_available_gb(); }
 
@@ -2234,10 +2235,13 @@ static int g_q36_cap_arg;              /* the cache size asked for (argv[1], 0 =
 static long long g_q36_exp_codes;
 static double g_q36_exp_bytes __attribute__((unused));   /* read only where GQ_R16_ON (AVX2, AVX-512) */
 static void q36_codes_now(QW *w);
+static void q36_gq_reload(QW *w);
+static void q36_gq_drop(QW *w);
 static void matmul_d(float *y, const float *x, const QW *w, int S, int I, int O){
 #ifdef COLI_QWEN_BATCH_TEST
     g_qwen_matmul_d_calls++;
 #endif
+    if (__atomic_load_n(&w->gq_gone, __ATOMIC_ACQUIRE)) q36_gq_reload((QW *)w);
     if (w->gq) {
         if (gq_r16_of_grown(w->gq_type) >= 0 && __atomic_load_n(&g_q36_codes, __ATOMIC_ACQUIRE) != 0) q36_codes_now((QW *)w);
         if (gq_matmul(y, x, w->gq, w->gq_type, S, I, O)) {
@@ -2389,14 +2393,21 @@ static inline int qtd(int hp1, float *y, const float *x, int I, int O){
  * backend does not take the type or the tensor carries a scale the kernels lack. */
 #ifdef COLI_CUDA
 int coli_cuda_block_elems(int fmt);
+struct ColiCudaTensor;
+int coli_cuda_tensor_upload_rows(struct ColiCudaTensor **tensor, const void *weights, int fmt, int I, int O, int device, int row0, int n);
+int coli_cuda_host_register(void *p, size_t bytes);
+void coli_cuda_host_unregister(void *p);
 #endif
+/* a GGUF matrix the loader left in the file (gq_gone 2), read as the tier uploads it (q36_gq_stream) */
+typedef struct { QtRows r; const QW *w[2]; int O0; } Q36Rows;   /* rows [0, O0) of w[0], then w[1]'s */
+static const QtRows *q36_gq_stream(Q36Rows *s, const QW *a, const QW *b, int fmt);
 static int qdw_gq_fmt(const QW *w) {
 #ifdef COLI_CUDA
     if (g_gguf && !w->gq && w->wf16 && w->w) {   /* F16, BF16: blocks of 32 of their 16 bits (q36_wf16_rows) */
         const int be = coli_cuda_block_elems(100 + w->wf16);
         return be > 0 && w->I % be == 0 && w->I % 32 == 0 ? 100 + w->wf16 : 0;
     }
-    if (!g_gguf || !w->gq || w->gs != 1.f) return 0;
+    if (!g_gguf || !(w->gq || w->gq_gone) || w->gs != 1.f) return 0;
     const int r = gq_r16_base(w->gq_type), t = r >= 0 ? r : w->gq_type, be = coli_cuda_block_elems(100 + t);
     return be > 0 && w->I % be == 0 && w->I % 32 == 0 ? 100 + t : 0;
 #else
@@ -2411,6 +2422,7 @@ static size_t qdw_gq_bytes(const QW *w) {
  * *rows (free it after the upload); NULL when out of memory */
 static const void *qdw_gq_rows(const QW *w, int fmt, uint8_t **rows) {
     *rows = NULL;
+    if (__atomic_load_n(&w->gq_gone, __ATOMIC_ACQUIRE)) q36_gq_reload((QW *)w);
     if (!w->gq) return *rows = (uint8_t *)q36_wf16_rows(w);   /* F16, BF16 */
     if (gq_r16_base(w->gq_type) < 0) return w->gq;
     if (!(*rows = malloc((size_t)gq_row_bytes(fmt - 100, w->I) * w->O))) return NULL;
@@ -2425,9 +2437,11 @@ static int qdw_place(const QW *w, int dev){
     if (dev == QT_PLACE_CPU) return 0;
     if (!w->q) {
         const int fmt = qdw_gq_fmt(w);
-        uint8_t *rows; const void *src = fmt ? qdw_gq_rows(w, fmt, &rows) : NULL;
-        int h = src ? qt_dense_init_fmt(src, NULL, fmt, w->I, w->O, dev) : -1;
-        if (src) free(rows);
+        Q36Rows s; const QtRows *r = fmt ? q36_gq_stream(&s, w, NULL, fmt) : NULL;
+        uint8_t *rows = NULL; const void *src = fmt && !r ? qdw_gq_rows(w, fmt, &rows) : NULL;
+        int h = src || r ? qt_dense_init_fmt(src, r, NULL, fmt, w->I, w->O, dev) : -1;
+        free(rows);
+        if (h >= 0) q36_gq_drop((QW *)w);   /* the device's copy is the one read from here on */
         return h >= 0 ? h + 1 : 0;
     }
     int h = qt_dense_init(w->q, w->sc, w->I, w->O, dev);
@@ -3386,6 +3400,9 @@ static int qwen_dense_mapped(Model *m, const char *name, int I, int O, QW *out) 
  * load (rows are whole blocks: a byte copy), every kernel then rotates the halves as for every
  * other model. q36_gguf_rope_perm: 1 for such a file (muse-spark, Q36_GGUF_ROPE_PERM=0/1 sets it). */
 static int g_q36_rope_perm = 0;
+/* g_q36_gq_defer: main's GGUF run under the CUDA tier, whose loader reads a matrix's header only
+ * (load_tq_noted: g_q36_gq_defer_one, gq_gone 2) and the tier's upload its rows (q36_gq_settle) */
+static int g_q36_gq_defer, g_q36_gq_defer_one;
 static int q36_rope_heads(const Model *m, const char *name) {
     if (!g_q36_rope_perm || !name) return 0;
     size_t L = strlen(name);
@@ -3428,6 +3445,7 @@ static void load_tq(Model *m, const char *name, int I, int O, int quantize, cons
         if (!gq_blk_decoder(t->type)) { fprintf(stderr, "GGUF %s: type %s is not supported\n", t->name, gq_type_name(t->type)); exit(1); }
         if (!gg_scale(t, 1, &out->gs)) out->gs = 1.f;
         if (g_gguf_dry) { out->gq_type = t->type; return; }
+        if (g_q36_gq_defer_one) { out->gq_type = q36_gq_held(t->type, O, I); out->gq_gone = 2; return; }   /* q36_gq_settle */
 #ifdef QWEN36_METAL_GRAPH
         if (QWEN_GRAPH(m) && g_gg_map) {   /* the Metal graph reads the file's blocks in place (qg_dense) */
             out->gq = (uint8_t *)g_gg_map[t->file] + t->off; out->gq_type = t->type; out->mapped = 1;
@@ -3467,15 +3485,136 @@ static void load_tq(Model *m, const char *name, int I, int O, int quantize, cons
     qw_quantize(p, I, O, tag, out);
     if (getenv("COLI_KEEP_F32")) out->w = p; else { free(p); out->w = NULL; }
 }
-/* load_tq, and under COLI_VULKAN a note of what it read (name, tag, whether it was
- * quantized) for q36_dho_reload. Every resident dense matrix of the model loads here. */
+/* load_tq, and under COLI_VULKAN or COLI_CUDA a note of what it read (name, tag, whether it was
+ * quantized) for q36_dho_reload and q36_gq_reload. Every resident dense matrix of the model loads here.
+ * With g_q36_gq_defer, a GGUF matrix's header only: g_q36_gq_left lists it for q36_gq_settle. */
+static QW **g_q36_gq_left;
+static int g_q36_gq_nleft;
 static void load_tq_noted(Model *m, const char *name, int I, int O, int quantize, const char *tag, QW *out) {
+    g_q36_gq_defer_one = g_q36_gq_defer;
     load_tq(m, name, I, O, quantize, tag, out);
-#ifdef COLI_VULKAN
+    g_q36_gq_defer_one = 0;
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
     out->vk_name = strdup(name); out->vk_tag = tag; out->vk_quant = quantize;
     out->vk_fmt = 0; out->vk_gone = 0;
     if (!out->vk_name) { fprintf(stderr, "OOM dense matrix name\n"); exit(1); }
 #endif
+    if (out->gq_gone == 2) {
+        QW **l = realloc(g_q36_gq_left, (size_t)(g_q36_gq_nleft + 1) * sizeof *l);
+        if (!l) { fprintf(stderr, "OOM dense matrix list\n"); exit(1); }
+        (g_q36_gq_left = l)[g_q36_gq_nleft++] = out;
+    }
+}
+/* ---- GGUF matrices the CUDA tier holds alone --------------------------------------
+ * A GGUF matrix the CUDA tier took (qdw_place, the DeltaNet projections, lm_head) gives its
+ * host rows back right after its upload: the device's copy is the one read from then on. The
+ * CPU multiplies by it again only after a lost device or a handle the tier turned off, and
+ * matmul_d first reads it back here, through load_tq with what it was loaded with (the same
+ * bytes: the file's rows, un-permuted and interleaved as at load). Before, every placed matrix
+ * kept its host rows: Qwen3.8-27B Q4_K_M, the trunk on a 32 GB card, gave back 14.0 GB of RAM
+ * it held beside its VRAM copy for the whole run. g_q36_gq_model: set by main where the CUDA tier
+ * places the trunk; NULL (every other path) keeps the host rows.
+ * Nor does the loader read them first: under the CUDA tier it reads a GGUF matrix's header only
+ * (gq_gone 2), the tier's upload reads its rows from the file a range at a time through one
+ * staging buffer (q36_gq_stream: Q36_GGUF_STAGE_KB, 64 MiB, pinned where the backend gives it),
+ * and q36_gq_settle reads the matrices the tier did not take, as load_tq would have at load.
+ * Before, the loader read all of them into RAM first: that model passed 19 GB of RAM during the
+ * load and a 32 GB PC with 22 GB free ran out of memory; streamed, it runs in about 8 GB. */
+static Model *g_q36_gq_model;
+static pthread_mutex_t g_q36_gq_mx = PTHREAD_MUTEX_INITIALIZER;
+static size_t g_q36_gq_dropped;
+static int g_q36_gq_ndrop, g_q36_gq_nreload;
+static void q36_gq_drop(QW *w) {
+    if (!g_q36_gq_model || !(w->gq || w->gq_gone == 2) || w->mapped || !w->vk_name) return;   /* not noted (an MTP head's): its rows stay */
+    g_q36_gq_dropped += (size_t)gq_row_bytes(w->gq_type, w->I) * w->O; g_q36_gq_ndrop++;
+    free(w->gq); w->gq = NULL;
+    __atomic_store_n(&w->gq_gone, 1, __ATOMIC_RELEASE);
+}
+/* load_tq with what w was noted with: the same bytes, the file's rows un-permuted and interleaved as at load */
+static void q36_gq_read(QW *w) {
+    QW t; memset(&t, 0, sizeof t);
+    load_tq(g_q36_gq_model, w->vk_name, w->I, w->O, w->vk_quant, w->vk_tag, &t);
+    w->gq_type = t.gq_type; w->gq = t.gq;
+    __atomic_store_n(&w->gq_gone, 0, __ATOMIC_RELEASE);
+}
+static void q36_gq_reload(QW *w) {
+    pthread_mutex_lock(&g_q36_gq_mx);
+    if (w->gq_gone) {
+        const int back = w->gq_gone == 1;   /* 2: the first read of a matrix the loader left in the file */
+        q36_gq_read(w);
+        if (back && !g_q36_gq_nreload++)
+            fprintf(stderr, "[gguf] the CPU multiplies by a matrix the CUDA tier held alone (%s): its rows read back from the file\n", w->vk_name);
+    }
+    pthread_mutex_unlock(&g_q36_gq_mx);
+}
+static uint8_t *g_q36_stage;
+static size_t g_q36_stage_cap;
+static int g_q36_stage_pinned;
+/* QtRows.read: rows [row0, row0 + n) of s's matrices from the file, un-permuted as load_tq reads
+ * them before it interleaves them for the CPU: the rows qdw_gq_rows gives the device, byte for byte */
+static int q36_gq_file_rows(void *ctx, int row0, int n, void *buf) {
+    const Q36Rows *s = ctx; uint8_t *dst = buf;
+    while (n > 0) {
+        const int k = row0 >= s->O0, r = row0 - (k ? s->O0 : 0), c = k || row0 + n <= s->O0 ? n : s->O0 - row0;
+        const QW *w = s->w[k];
+        const gguf_tensor *t = gg_tensor(w->vk_name);
+        const size_t rb = (size_t)gq_row_bytes(t->type, w->I);
+        const int rh = q36_rope_heads(g_q36_gq_model, w->vk_name);
+        if (gguf_read(gg_ctx_of(t), t, dst, (int64_t)r * rb, (int64_t)c * rb)) { fprintf(stderr, "GGUF %s: read failed\n", t->name); exit(1); }
+        if (rh) q36_rope_unpermute(dst, rb, c / (w->O / rh), w->O / rh);   /* whole heads: QtRows.align */
+        dst += (size_t)c * rb; row0 += c; n -= c;
+    }
+    return 1;
+}
+/* What the tier's upload of a (then b: a DeltaNet's qkv ++ z) reads, when the loader left both
+ * in the file and the backend takes a range of rows; NULL: the caller hands the rows whole */
+static const QtRows *q36_gq_stream(Q36Rows *s, const QW *a, const QW *b, int fmt) {
+#ifdef COLI_CUDA
+    if (a->gq_gone != 2 || (b && b->gq_gone != 2) || !coli_cuda_tensor_upload_rows(NULL, NULL, 0, 0, 0, 0, 0, 0)) return NULL;
+    const gguf_tensor *ta = gg_tensor(a->vk_name), *tb = b ? gg_tensor(b->vk_name) : NULL;
+    if (!ta || ta->type != fmt - 100 || (b && (!tb || tb->type != fmt - 100 || b->I != a->I))) return NULL;
+    const int rh = b ? 0 : q36_rope_heads(g_q36_gq_model, a->vk_name), align = rh ? a->O / rh : 1;
+    const size_t rb = (size_t)gq_row_bytes(fmt - 100, a->I);
+    if (!g_q36_stage) {
+        const char *e = getenv("Q36_GGUF_STAGE_KB");
+        g_q36_stage_cap = (size_t)(e && atol(e) > 0 ? atol(e) : 65536) << 10;
+        if (!(g_q36_stage = malloc(g_q36_stage_cap))) return NULL;
+        g_q36_stage_pinned = coli_cuda_host_register(g_q36_stage, g_q36_stage_cap);   /* the copies DMA */
+    }
+    if (rb * (size_t)align > g_q36_stage_cap) return NULL;   /* not one range fits */
+    s->w[0] = a; s->w[1] = b; s->O0 = a->O;
+    s->r = (QtRows){ q36_gq_file_rows, s, g_q36_stage, g_q36_stage_cap, rb, align };
+    return &s->r;
+#else
+    (void)s; (void)a; (void)b; (void)fmt;
+    return NULL;
+#endif
+}
+/* After the tier's placement, or where none came: the matrices it did not take read now, as
+ * load_tq would have at load; the staging buffer goes */
+static void q36_gq_settle(void) {
+    if (!g_q36_gq_defer) return;
+    int n = 0; double bytes = 0;
+    pthread_mutex_lock(&g_q36_gq_mx);
+    for (int i = 0; i < g_q36_gq_nleft; i++) {
+        QW *w = g_q36_gq_left[i];
+        if (w->gq_gone != 2) continue;
+        q36_gq_read(w);
+        n++; bytes += (double)gq_row_bytes(w->gq_type, w->I) * w->O;
+    }
+    pthread_mutex_unlock(&g_q36_gq_mx);
+    if (g_q36_stage)
+        fprintf(stderr, "[gguf] the CUDA tier's matrices went from the file to the device through a %zu MiB staging buffer (%s); "
+                        "%d for the CPU read after them (%.2f GB)\n", g_q36_stage_cap >> 20, g_q36_stage_pinned ? "pinned" : "pageable",
+                n, bytes / 1073741824.0);
+    else if (n) fprintf(stderr, "[gguf] %d matrices for the CPU read after the placement (%.2f GB)\n", n, bytes / 1073741824.0);
+#ifdef COLI_CUDA
+    if (g_q36_stage_pinned) coli_cuda_host_unregister(g_q36_stage);
+#endif
+    free(g_q36_stage);
+    g_q36_stage = NULL; g_q36_stage_pinned = 0;
+    free(g_q36_gq_left); g_q36_gq_left = NULL; g_q36_gq_nleft = 0;
+    g_q36_gq_defer = 0;
 }
 #ifdef COLI_VULKAN
 /* ---- dense weights on the device only (COLI_VK_DENSE_HOST) ------------------------
@@ -4753,6 +4892,8 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
          * pre-existing, unrelated bug if this process ever builds two models
          * with different container formats (out of scope here). */
         double resident = rss_gb();
+        for (int i = 0; i < g_q36_gq_nleft; i++)   /* left in the file (q36_gq_settle): counted as read, as before */
+            resident += (double)gq_row_bytes(g_q36_gq_left[i]->gq_type, g_q36_gq_left[i]->I) * g_q36_gq_left[i]->O / 1073741824.0;
         double avail = mem_available_gb();
         const char *ram_env = getenv("RAM_GB");
         double ram_override = ram_env ? atof(ram_env) : 0.0;
@@ -5871,6 +6012,46 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) { expert_fetch(
  * it stays resident until slot_release. */
 static Slot *expert_hold(Model *m, int layer, int eid) { Slot *s; expert_fetch(m, layer, eid, &s, 1); return s; }
 
+/* Borrowed ExpertStore facade over a GGUF model's expert cache: the Model owns the cache and
+ * outlives every facade and lease. A lookup is expert_hold and a release slot_release, so the
+ * PILOT worker cannot evict an expert a view still reads; allocation, the PILOT policy and the
+ * GPU tiers stay with the engine. The views are the three matrices as the slot holds them
+ * (hg/hu/hd, GQ_*_R16 where the rows are interleaved). */
+static ColiTensorView q36_gq_tensor(const uint8_t *data, int type, int rows, int cols) {
+    return (ColiTensorView){ .format = COLI_TENSOR_GGML, .data = data, .rows = rows, .columns = cols,
+                             .block_columns = (uint32_t)type,
+                             .data_bytes = (size_t)rows * (size_t)gq_row_bytes(type, cols) };
+}
+static int q36_gq_store_lookup(ColiExpertStore *store, ColiExpertKey key, ColiExpertView *view) {
+    Model *m = store->state;
+    if (!view) return -1;
+    memset(view, 0, sizeof(*view));
+    if (!m || !m->cache || !m->gqx || key.layer < 0 || key.layer >= m->c.n_layers ||
+        key.expert < 0 || key.expert >= m->c.n_experts) return -1;
+    const GqExp *gx = &m->gqx[key.layer]; const int D = q36_eh(&m->c), I = m->c.inter;
+    Slot *s = expert_hold(m, key.layer, key.expert);
+    view->key = key;
+    view->lease = s;
+    view->gate = q36_gq_tensor(s->gqe, gx->hg, I, D);
+    view->up = q36_gq_tensor(s->gqe + gx->hb_g, gx->hu, I, D);
+    view->down = q36_gq_tensor(s->gqe + gx->hb_g + gx->hb_u, gx->hd, D, I);
+    return 0;
+}
+static void q36_gq_store_release(ColiExpertStore *store, ColiExpertView *view) {
+    (void)store;
+    if (view && view->lease) slot_release(view->lease);
+    if (view) memset(view, 0, sizeof(*view));
+}
+static ColiExpertStore q36_gq_expert_store(Model *m) {
+    static const ColiExpertStoreOps ops = { .lookup = q36_gq_store_lookup, .release = q36_gq_store_release };
+    return (ColiExpertStore){ .ops = &ops, .state = m };
+}
+static void q36_gq_expert_acquire(ColiExpertStore *store, int layer, int expert, ColiExpertView *view) {
+    if (coli_expert_lookup(store, (ColiExpertKey){ layer, expert }, view)) {
+        fprintf(stderr, "qwen36: invalid expert key %d/%d\n", layer, expert); exit(1);
+    }
+}
+
 static void pin_hot_experts(Model *m) {
     Cfg *c = &m->c;
     if (m->hot_n <= 0 || m->hot_pinned) return;
@@ -6712,14 +6893,9 @@ static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const 
     if (m->cache[layer].cap < K || K > 64 || !gq_int_ok(gx->hg, D) || !gq_int_ok(gx->hu, D) || !gq_int_ok(gx->hd, I)) return -1;
     const int u = moe_gq_unit(gx, D, I);
     if (u == 16 && (I % 16 || D % 16)) return -1;
-    Slot *sl[64]; int ids[64]; float w[64]; int n = 0;
+    ColiExpertStore store = q36_gq_expert_store(m);
+    ColiExpertView ev[64]; int ids[64]; float w[64]; int n = 0;
     for (int k = 0; k < K; k++) if (idx[k] >= 0) { ids[n] = idx[k]; w[n] = val[k]; n++; }
-    for (int k = 0; k < n; k++) expert_get(m, layer, ids[k], &sl[k]);
-    for (int k = 0; k < n; k++) if (sl[k]->eid != ids[k]) {   /* evicted while fetching the others */
-        for (int j = 0; j < n; j++) expert_get(m, layer, ids[j], &sl[j]);
-        for (int j = 0; j < n; j++) if (sl[j]->eid != ids[j]) return -1;
-        break;
-    }
     /* moe() runs on the engine's thread; the worker threads get these through
      * the local pointers below (thread-local storage here would hand each
      * worker its own empty copy) */
@@ -6733,12 +6909,13 @@ static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const 
     if (gq_act_set(pax, x, 1, D)) return -1;
     const int64_t rbg = gq_row_bytes(gx->hg, D), rbu = gq_row_bytes(gx->hu, D), rbd = gq_row_bytes(gx->hd, I);
     const int gI = I / u, gD = D / u;
+    for (int k = 0; k < n; k++) q36_gq_expert_acquire(&store, layer, ids[k], &ev[k]);   /* leased: the PILOT worker may not evict them mid-matmul */
     #pragma omp parallel for schedule(static)
     for (int r = 0; r < n * 2 * gI; r++) {
         int k = r / (2 * gI), rr = (r % (2 * gI)) * u;
-        const uint8_t *base = sl[k]->gqe;
-        if (rr < I) gq_rows_u(GU + (int64_t)k * 2 * I + rr, u, pax, base + (int64_t)rr * rbg, gx->hg, D);
-        else        gq_rows_u(GU + (int64_t)k * 2 * I + rr, u, pax, base + gx->hb_g + (int64_t)(rr - I) * rbu, gx->hu, D);
+        const uint8_t *wg = ev[k].gate.data, *wu = ev[k].up.data;
+        if (rr < I) gq_rows_u(GU + (int64_t)k * 2 * I + rr, u, pax, wg + (int64_t)rr * rbg, gx->hg, D);
+        else        gq_rows_u(GU + (int64_t)k * 2 * I + rr, u, pax, wu + (int64_t)(rr - I) * rbu, gx->hu, D);
     }
     for (int k = 0; k < n; k++) {
         float *g = GU + (int64_t)k * 2 * I, *u = g + I; float *h = H + (int64_t)k * I;
@@ -6746,14 +6923,15 @@ static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const 
         if (gx->su) for (int i = 0; i < I; i++) u[i] *= gx->su[ids[k]];
         for (int i = 0; i < I; i++) { float gv = g[i]; h[i] = (gv / (1.f + expf(-gv))) * u[i]; }
     }
-    if (gq_act_set(pah, H, n, I)) return -1;   /* row k of ah is expert k's hidden */
+    if (gq_act_set(pah, H, n, I)) { for (int k = 0; k < n; k++) coli_expert_release(&store, &ev[k]); return -1; }   /* row k of ah is expert k's hidden */
     #pragma omp parallel for schedule(static)
     for (int r = 0; r < n * gD; r++) {
         int k = r / gD, o = (r % gD) * u;
         gq_act one = *pah; one.S = 1; one.q = pah->q + (int64_t)k * I; one.d = pah->d + (int64_t)k * (I / 32); one.s = pah->s + (int64_t)k * (I / 16);
         one.l4 = pah->l4 ? pah->l4 + (int64_t)k * (I / 4) : NULL;
-        gq_rows_u(Y + (int64_t)k * D + o, u, &one, sl[k]->gqe + gx->hb_g + gx->hb_u + (int64_t)o * rbd, gx->hd, I);
+        gq_rows_u(Y + (int64_t)k * D + o, u, &one, (const uint8_t *)ev[k].down.data + (int64_t)o * rbd, gx->hd, I);
     }
+    for (int k = 0; k < n; k++) coli_expert_release(&store, &ev[k]);
     /* accumulate in expert-id order, as the general path does: same sums, same bits */
     int ord[64]; for (int k = 0; k < n; k++) ord[k] = k;
     for (int a = 1; a < n; a++) { int v = ord[a], b = a; while (b > 0 && ids[ord[b - 1]] > ids[v]) { ord[b] = ord[b - 1]; b--; } ord[b] = v; }
@@ -6783,14 +6961,15 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
     /* a speculative verify's rows (S <= GQ_EXACT_ROWS) read the experts as a decode step does, the
      * file's rows by eight where moe_gq_decode does: a row's bits are then a plain step's (#2874) */
     const int f8 = S <= GQ_EXACT_ROWS && moe_gq_unit(gx, D, I) == 8;
+    ColiExpertStore store = q36_gq_expert_store(m);
     for (int e = 0; e < E; e++) {
         int n = cnt[e + 1] - cnt[e]; if (!n) continue;
         const int *tl = tok + cnt[e]; const float *wl = wt + cnt[e];
-        Slot *sl; expert_get(m, layer, e, &sl);
+        ColiExpertView ev; q36_gq_expert_acquire(&store, layer, e, &ev);   /* as moe_gq_decode */
+        const uint8_t *wg = ev.gate.data, *wu = ev.up.data, *wd = ev.down.data;
         for (int r = 0; r < n; r++) memcpy(X + (int64_t)r * D, x + (int64_t)tl[r] * D, sizeof(float) * (size_t)D);
         const int ex = f8 && !gq_act_set(&act, X, n, D);
         if (ex) {
-            const uint8_t *wg = sl->gqe, *wu = sl->gqe + gx->hb_g;
             const int64_t rbg = gq_row_bytes(gx->hg, D), rbu = gq_row_bytes(gx->hu, D);
             #pragma omp parallel for schedule(static)
             for (int r = 0; r < 2 * (I / 8); r++) {
@@ -6798,20 +6977,21 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
                 else gq_rows_f8(U + 8 * (r - I / 8), I, &act, wu + (int64_t)8 * (r - I / 8) * rbu, rbu, gx->hu, D, 8);
             }
         } else if (gq_int_ok(gx->hg, D) && gq_int_ok(gx->hu, D) && !gq_act_set(&act, X, n, D))
-            gq_matmul2_act(G, sl->gqe, gx->hg, U, sl->gqe + gx->hb_g, gx->hu, &act, I);   /* x quantized once */
+            gq_matmul2_act(G, wg, gx->hg, U, wu, gx->hu, &act, I);   /* x quantized once */
         else {
-            gq_matmul(G, X, sl->gqe, gx->hg, n, D, I);
-            gq_matmul(U, X, sl->gqe + gx->hb_g, gx->hu, n, D, I);
+            gq_matmul(G, X, wg, gx->hg, n, D, I);
+            gq_matmul(U, X, wu, gx->hu, n, D, I);
         }
         if (gx->sg) for (int64_t q = 0; q < (int64_t)n * I; q++) G[q] *= gx->sg[e];
         if (gx->su) for (int64_t q = 0; q < (int64_t)n * I; q++) U[q] *= gx->su[e];
         for (int64_t q = 0; q < (int64_t)n * I; q++) { float gv = G[q]; G[q] = (gv / (1.f + expf(-gv))) * U[q]; }
         if (ex && !gq_act_set(&ah, G, n, I)) {
-            const uint8_t *wd = sl->gqe + gx->hb_g + gx->hb_u; const int64_t rbd = gq_row_bytes(gx->hd, I);
+            const int64_t rbd = gq_row_bytes(gx->hd, I);
             #pragma omp parallel for schedule(static)
             for (int r = 0; r < D / 8; r++) gq_rows_f8(Y + 8 * r, D, &ah, wd + (int64_t)8 * r * rbd, rbd, gx->hd, I, 8);
         } else
-        gq_matmul(Y, G, sl->gqe + gx->hb_g + gx->hb_u, gx->hd, n, I, D);
+        gq_matmul(Y, G, wd, gx->hd, n, I, D);
+        coli_expert_release(&store, &ev);
         if (gx->sd) for (int64_t q = 0; q < (int64_t)n * D; q++) Y[q] *= gx->sd[e];
         if (m->L[layer].post_en)   /* Muse Spark: every expert's output scaled, then normalised */
             for (int r = 0; r < n; r++) rmsnorm_scaled(Y + (int64_t)r * D, Y + (int64_t)r * D, m->L[layer].post_en, D, c->post_eps);
@@ -11735,7 +11915,16 @@ int main(int argc, char **argv) {
      * it -- ASan: stack-use-after-return, READ of size 8, in a worker thread,
      * with the run's tokens already correct (#1262). Static storage outlives
      * every thread, so the pointer the worker holds stays valid. */
-    static Model m; model_init(&m, snap, cap, bits);
+    static Model m;
+#ifdef COLI_CUDA
+    /* a GGUF under the CUDA tier: the loader reads each matrix's header, the tier's upload its rows
+     * (Q36_GGUF_STAGE_KB=0: every matrix read at load, as before; the placed ones still give theirs back) */
+    const char *stage_kb = getenv("Q36_GGUF_STAGE_KB");
+    if (g_gguf && getenv("COLI_CUDA") && getenv("COLI_CUDA")[0] == '1' && !(stage_kb && !strcmp(stage_kb, "0"))) {
+        g_q36_gq_defer = 1; g_q36_gq_model = &m;
+    }
+#endif
+    model_init(&m, snap, cap, bits);
     if (g_tok_exact) q36_clef_load(&m, snap);
     g_expert_gs = m.c.expert_gs;
     if (g_expert_gs) fprintf(stderr, "[qwen36] group-scaled experts: gs=%d\n", g_expert_gs);
@@ -11964,13 +12153,16 @@ int main(int argc, char **argv) {
         /* R4 role split: park the dense-i8 lm_head on COLI_LMHEAD_GPU. The
          * QW struct on m.lm_head holds the int8 rows + per-row scales the
          * CPU path uses; the GPU applies the identical semantics. */
+        if (g_gguf) g_q36_gq_model = &m;   /* a GGUF matrix placed from here on gives its host rows back (q36_gq_drop) */
         if (m.lm_head.q)
             qt_lmhead_init(m.lm_head.q, m.lm_head.sc, m.lm_head.I, m.lm_head.O);
         else if (qdw_gq_fmt(&m.lm_head)) {   /* a GGUF's blocks */
             const int fmt = qdw_gq_fmt(&m.lm_head);
-            uint8_t *rows; const void *src = qdw_gq_rows(&m.lm_head, fmt, &rows);
-            if (src) qt_lmhead_init_fmt(src, NULL, fmt, m.lm_head.I, m.lm_head.O);
+            Q36Rows s; const QtRows *r = q36_gq_stream(&s, &m.lm_head, NULL, fmt);
+            uint8_t *rows = NULL; const void *src = r ? NULL : qdw_gq_rows(&m.lm_head, fmt, &rows);
+            const int up = (src || r) && qt_lmhead_init_fmt(src, r, NULL, fmt, m.lm_head.I, m.lm_head.O);
             free(rows);
+            if (up) q36_gq_drop(&m.lm_head);
         }
         /* R4 step 2: DeltaNet input projections, per layer, wherever
          * COLI_PLACE puts them. qkv and z are both [O_x, hidden] int8 with
@@ -11990,22 +12182,29 @@ int main(int argc, char **argv) {
                 const int gf = qdw_gq_fmt(&m.L[i].dn_qkv), gz = qdw_gq_fmt(&m.L[i].dn_z);
                 if (!q1 && gf && gf == gz) {   /* a GGUF's blocks: qkv's rows, then z's */
                     const size_t rb = (size_t)gq_row_bytes(gf - 100, Hd);
-                    uint8_t *ra, *rz, *cat = malloc(rb * Of);
-                    const void *a = qdw_gq_rows(&m.L[i].dn_qkv, gf, &ra), *z = qdw_gq_rows(&m.L[i].dn_z, gf, &rz);
-                    if (cat && a && z) {
-                        memcpy(cat, a, rb * O_qkv); memcpy(cat + rb * O_qkv, z, rb * O_z);
-                        if (qt_dnproj_init_fmt(i, cat, NULL, gf, Hd, Of, dev)) { placed++; vram += (double)rb * Of; }
+                    Q36Rows s; const QtRows *r = q36_gq_stream(&s, &m.L[i].dn_qkv, &m.L[i].dn_z, gf);
+                    uint8_t *ra = NULL, *rz = NULL, *cat = r ? NULL : malloc(rb * Of);
+                    const void *a = r ? NULL : qdw_gq_rows(&m.L[i].dn_qkv, gf, &ra), *z = r ? NULL : qdw_gq_rows(&m.L[i].dn_z, gf, &rz);
+                    int up = 0;
+                    if (r || (cat && a && z)) {
+                        if (!r) { memcpy(cat, a, rb * O_qkv); memcpy(cat + rb * O_qkv, z, rb * O_z); }
+                        if ((up = qt_dnproj_init_fmt(i, cat, r, NULL, gf, Hd, Of, dev))) { placed++; vram += (double)rb * Of; }
                     }
                     free(ra); free(rz); free(cat);
+                    if (up) { q36_gq_drop(&m.L[i].dn_qkv); q36_gq_drop(&m.L[i].dn_z); }
                     continue;
                 }
                 if (!q1 && gf && gz) {   /* two types (unsloth's mixes): two tensors, each the file's blocks */
                     const size_t rq = (size_t)gq_row_bytes(gf - 100, Hd), rzb = (size_t)gq_row_bytes(gz - 100, Hd);
-                    uint8_t *ra, *rz;
-                    const void *a = qdw_gq_rows(&m.L[i].dn_qkv, gf, &ra), *z = qdw_gq_rows(&m.L[i].dn_z, gz, &rz);
-                    if (a && z && qt_dnproj_init_fmt(i, a, NULL, gf, Hd, O_qkv, dev) &&
-                        qt_dnproj_z_init_fmt(i, z, gz, Hd, O_z, dev)) { placed++; split++; vram += (double)rq * O_qkv + (double)rzb * O_z; }
+                    Q36Rows s, sz;
+                    const QtRows *r = q36_gq_stream(&s, &m.L[i].dn_qkv, NULL, gf), *rzs = q36_gq_stream(&sz, &m.L[i].dn_z, NULL, gz);
+                    uint8_t *ra = NULL, *rz = NULL;
+                    const void *a = r ? NULL : qdw_gq_rows(&m.L[i].dn_qkv, gf, &ra), *z = rzs ? NULL : qdw_gq_rows(&m.L[i].dn_z, gz, &rz);
+                    const int up = (a || r) && (z || rzs) && qt_dnproj_init_fmt(i, a, r, NULL, gf, Hd, O_qkv, dev) &&
+                                   qt_dnproj_z_init_fmt(i, z, rzs, gz, Hd, O_z, dev);
+                    if (up) { placed++; split++; vram += (double)rq * O_qkv + (double)rzb * O_z; }
                     free(ra); free(rz);
+                    if (up) { q36_gq_drop(&m.L[i].dn_qkv); q36_gq_drop(&m.L[i].dn_z); }
                     continue;
                 }
                 if (!q1 || !q2) continue;      /* dense-i8 off: CPU path stands */
@@ -12036,6 +12235,11 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "[dense] %d trunk matrices on GPU (%d dnout, %d attnproj, %d shexp; %.2f GB VRAM)\n",
                         placed, kinds[0], kinds[1], kinds[2], vram / 1073741824.0);
         }
+        if (g_q36_gq_ndrop)
+            fprintf(stderr, "[gguf] %d matrices on the CUDA tier gave their host rows back: %.2f GB of RAM "
+                            "(the CPU reads one back from the file only if it needs it)\n",
+                    g_q36_gq_ndrop, g_q36_gq_dropped / 1073741824.0);
+        q36_gq_settle();   /* what the tier did not take, before the chain and the rest read it */
         /* Q36_DN_GPU=1: where the in_proj and the out_proj of a DeltaNet layer
          * both sit on one card, the conv ring, the recurrence and the gated
          * norm go there too, and a decode token runs the layer end to end on
@@ -12073,6 +12277,7 @@ int main(int argc, char **argv) {
         const char *nws = getenv("QT_NO_WARMSTART");
         if (!(nws && *nws=='1') && qt_experts_on()) tier_warmstart(&m, expert_is_int4);
     }
+    q36_gq_settle();   /* no tier: every matrix the loader left in the file */
 
 #ifdef COLI_VULKAN
     q36c_start(&m);      /* COLI_VK_CHAIN: how many layers the chain places (vkc_fit), before any upload */

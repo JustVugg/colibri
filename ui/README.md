@@ -21,6 +21,14 @@ page on another site cannot reach the gateway through a name it re-points here. 
 reached through a reverse proxy or a tunnel name, add that name with `--allowed-host NAME`
 (repeatable, or `COLI_ALLOWED_HOSTS=a,b`). A UI bound to `0.0.0.0` or a LAN address is unchanged.
 
+The page-only routes (`/agents`, `/models/`, `/web/`, `/doc/extract`, which download and switch
+models, open agents and fetch pages) answer only a caller on this machine: their `Host`, `Origin` and
+`X-Colibri-UI` checks are headers the caller writes, so they also check the caller's address. On a UI
+bound to `0.0.0.0` or a LAN address a request from another machine gets 403. Docker's port mapping and a
+reverse proxy show a peer that is not loopback; there, and only if you want the Models page and the rest
+reachable that way, start the UI with `--allow-remote-ui` (or `COLI_UI_ALLOW_REMOTE=1`, which `coli serve`
+passes on). That gives anyone who can reach the port those routes, with no key.
+
 ## What it does
 
 - **Chat**: streaming, the reasoning in its own block (open or closed while it streams, the

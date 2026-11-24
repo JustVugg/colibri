@@ -1289,10 +1289,27 @@ int qt_experts_on(void){
     return 0;
 }
 
-int qt_lmhead_init_fmt(const void *w, const float *sc, int fmt, int I, int O){
-    if(!G_lmh.dev_ok||!G.on||!w||(fmt<100&&!sc)) return 0;
+/* coli_cuda_tensor_upload, or with rows (qwen36_tier.h) a block format a range of rows at a time
+ * through rows' buffer: the host never holds the whole matrix */
+static int qt_upload(ColiCudaTensor **t, const void *w, const QtRows *rows, const float *sc, int fmt, int I, int O, int dev){
+    if(!rows) return coli_cuda_tensor_upload(t, w, sc, fmt, I, O, dev);
+    int step = rows->row_bytes ? (int)(rows->cap / rows->row_bytes) : 0;
+    if(rows->align > 1) step -= step % rows->align;
+    if(fmt < 100 || step < 1) return 0;
+    for(int r0 = 0; r0 < O; r0 += step){
+        const int n = O - r0 < step ? O - r0 : step;
+        if(!rows->read(rows->ctx, r0, n, rows->buf) || !coli_cuda_tensor_upload_rows(t, rows->buf, fmt, I, O, dev, r0, n)){
+            coli_cuda_tensor_free(*t); *t = NULL;
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int qt_lmhead_init_fmt(const void *w, const QtRows *rows, const float *sc, int fmt, int I, int O){
+    if(!G_lmh.dev_ok||!G.on||!(w||rows)||(fmt<100&&!sc)) return 0;
     int dev=G_lmh.dev;
-    if(!coli_cuda_tensor_upload(&G_lmh.t,w,sc,fmt,I,O,dev)){
+    if(!qt_upload(&G_lmh.t,w,rows,sc,fmt,I,O,dev)){
         fprintf(stderr,"[lmh] lm_head upload failed -> stays on CPU\n");
         return 0;
     }
@@ -1301,24 +1318,24 @@ int qt_lmhead_init_fmt(const void *w, const float *sc, int fmt, int I, int O){
             O,I,fmt>=100?"the GGUF's blocks":"int8",dev,coli_cuda_tensor_bytes(G_lmh.t)/1073741824.0);
     return 1;
 }
-int qt_lmhead_init(const int8_t *q, const float *sc, int I, int O){ return qt_lmhead_init_fmt(q, sc, 1, I, O); }
+int qt_lmhead_init(const int8_t *q, const float *sc, int I, int O){ return qt_lmhead_init_fmt(q, NULL, sc, 1, I, O); }
 
-int qt_dnproj_init_fmt(int layer, const void *w, const float *sc, int fmt,
+int qt_dnproj_init_fmt(int layer, const void *w, const QtRows *rows, const float *sc, int fmt,
                        int I, int O, int device){
     if(layer < 0 || layer >= QT_DN_MAX_LAYERS) return 0;
-    if(device == QT_PLACE_CPU || !w || (fmt < 100 && !sc)) return 0;
+    if(device == QT_PLACE_CPU || !(w || rows) || (fmt < 100 && !sc)) return 0;
     /* No G.on requirement: the projections are independent of the expert tier,
      * so they can be measured on a card that holds no experts at all. */
-    if(!coli_cuda_tensor_upload(&G_dnp[layer].t, w, sc, fmt, I, O, device)){
+    if(!qt_upload(&G_dnp[layer].t, w, rows, sc, fmt, I, O, device)){
         fprintf(stderr,"[dnp] layer %d upload failed -> stays on CPU\n", layer);
         return 0;
     }
     G_dnp[layer].dev = device; G_dnp[layer].on = 1; G_dnp[layer].fmt = fmt; G_dnp[layer].O = O;
     return 1;
 }
-int qt_dnproj_z_init_fmt(int layer, const void *w, int fmt, int I, int O, int device){
-    if(layer < 0 || layer >= QT_DN_MAX_LAYERS || !G_dnp[layer].on || G_dnp[layer].dev != device || !w || fmt < 100) return 0;
-    if(!coli_cuda_tensor_upload(&G_dnz[layer].t, w, NULL, fmt, I, O, device)){
+int qt_dnproj_z_init_fmt(int layer, const void *w, const QtRows *rows, int fmt, int I, int O, int device){
+    if(layer < 0 || layer >= QT_DN_MAX_LAYERS || !G_dnp[layer].on || G_dnp[layer].dev != device || !(w || rows) || fmt < 100) return 0;
+    if(!qt_upload(&G_dnz[layer].t, w, rows, NULL, fmt, I, O, device)){
         fprintf(stderr,"[dnp] layer %d: z's upload failed -> the in_proj stays on CPU\n", layer);
         coli_cuda_tensor_free(G_dnp[layer].t); G_dnp[layer].t = NULL; G_dnp[layer].on = 0;
         return 0;
@@ -1332,7 +1349,7 @@ ColiCudaTensor *qt_dnproj_z_tensor(int layer, int *dev){
     return G_dnz[layer].t;
 }
 int qt_dnproj_init(int layer, const int8_t *q, const float *sc,
-                   int I, int O, int device){ return qt_dnproj_init_fmt(layer, q, sc, 1, I, O, device); }
+                   int I, int O, int device){ return qt_dnproj_init_fmt(layer, q, NULL, sc, 1, I, O, device); }
 
 /* ---- generic resident dense matrices (Qwen3.8 trunk) -----------------------
  * Same mechanism as lmhead/dnproj -- an int8 per-row tensor resident on one
@@ -1343,11 +1360,11 @@ int qt_dnproj_init(int layer, const int8_t *q, const float *sc,
 #define QT_DENSE_MAX 1024
 static struct { ColiCudaTensor *t; int dev, on, fmt; size_t bytes; } G_dense[QT_DENSE_MAX];
 static int G_dense_n;
-int qt_dense_init_fmt(const void *w, const float *sc, int fmt, int I, int O, int device){
-    if(device == QT_PLACE_CPU || !w || (fmt < 100 && !sc) || I <= 0 || O <= 0) return -1;
+int qt_dense_init_fmt(const void *w, const QtRows *rows, const float *sc, int fmt, int I, int O, int device){
+    if(device == QT_PLACE_CPU || !(w || rows) || (fmt < 100 && !sc) || I <= 0 || O <= 0) return -1;
     if(G_dense_n >= QT_DENSE_MAX) return -1;
     int h = G_dense_n;
-    if(!coli_cuda_tensor_upload(&G_dense[h].t, w, sc, fmt, I, O, device)){
+    if(!qt_upload(&G_dense[h].t, w, rows, sc, fmt, I, O, device)){
         fprintf(stderr,"[dense] upload [%d x %d] to dev %d failed -> stays on CPU\n", O, I, device);
         return -1;
     }
@@ -1355,7 +1372,7 @@ int qt_dense_init_fmt(const void *w, const float *sc, int fmt, int I, int O, int
     G_dense_n++;
     return h;
 }
-int qt_dense_init(const int8_t *q, const float *sc, int I, int O, int device){ return qt_dense_init_fmt(q, sc, 1, I, O, device); }
+int qt_dense_init(const int8_t *q, const float *sc, int I, int O, int device){ return qt_dense_init_fmt(q, NULL, sc, 1, I, O, device); }
 int qt_dense_matmul_batch(int h, float *y, const float *x, int S, int I, int O){
     if(h < 0 || h >= G_dense_n || !G_dense[h].on || S <= 0) return 0;
     if(coli_cuda_matmul(&G_dense[h].t, y, x, NULL, NULL, G_dense[h].fmt, S, I, O, G_dense[h].dev, 0)) return 1;

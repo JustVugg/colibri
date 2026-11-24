@@ -344,6 +344,11 @@ enabled by default. Repeat `--cors-origin https://your-ui.example` to allow
 another exact origin, or use `--cors-origin '*'` only on a trusted local
 network.
 
+A POST that names an `Origin` runs only for an origin on that list or this server's own;
+any other gets 403. A page on another site can send a POST without a preflight, and CORS
+only decides whether it may read the reply, so without this the request would still run on
+the engine. A script or an SDK sends no `Origin` and is not affected.
+
 The engine owns its KV contexts, so HTTP generation uses a bounded FIFO
 admission queue instead of pretending to run unsafe parallel sequences.
 Configure it with `--max-queue N` (default 8) and `--queue-timeout SECONDS`
