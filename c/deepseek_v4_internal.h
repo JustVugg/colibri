@@ -207,6 +207,8 @@ int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
                        const uint16_t *gate, const float *bias,
                        const int *forced_indices, int experts, int dimension,
                        int topk, float route_scale);
+/* Re-read V4_ROUTE_FORCED_ONLY (the router reads it once; tests change it). */
+int coli_v4_route_forced_only_reload(void);
 
 int coli_v4_swiglu(float *output, const float *gate, const float *up,
                    int dimension, float limit);
