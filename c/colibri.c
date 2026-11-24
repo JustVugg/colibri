@@ -1158,11 +1158,7 @@ static void cluster_stat_suffix(const ProfBase *b, double dt, int ntok){
            g, g>t?g-t:0.0, t, (double)tx/1e3/n, (double)rx/1e3/n);
 }
 
-static float *falloc(int64_t n){
-    /* guardia anti-wrap (report PR #25): n assurdo da file modello ostili non deve
-     * diventare una malloc piccola. Niente calloc: il memset nel percorso caldo costa. */
-    if(n<0 || (uint64_t)n > SIZE_MAX/sizeof(float)){ fprintf(stderr,"falloc: n=%lld is out of range\n",(long long)n); exit(1); }
-    float *p=malloc((size_t)n*sizeof(float)); if(!p){fprintf(stderr,"OOM\n");exit(1);} return p; }
+static inline float *falloc(int64_t n){ return coli_falloc(n); }
 
 /* Come falloc, per i buffer non-float del percorso caldo. moe() e' la funzione piu'
  * chiamata del motore e girare al soffitto di RAM e' la premessa del progetto: e'

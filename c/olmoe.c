@@ -371,7 +371,7 @@ static double mem_available_gb(void) {
     }
     return avail;
 }
-static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
+static inline float *falloc(int64_t n) { return coli_falloc(n); }
 
 /* chat mode only (main()'s CHAT=1 path): sampling temperature/top-p and the
  * tokenizer + stop-set machinery. g_temp<=0 -> greedy (sample.h's pick_tok).
