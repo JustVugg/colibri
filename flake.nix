@@ -109,6 +109,8 @@
               install -m 644 c/v41_dsml.py "$out/lib/colibri/"
             [ -e "$out/lib/colibri/audio_dmel.py" ] || \
               install -m 644 c/audio_dmel.py "$out/lib/colibri/"
+            [ -e "$out/lib/colibri/compaction.py" ] || \
+              install -m 644 c/compaction.py "$out/lib/colibri/"
             [ -e "$out/lib/colibri/tools/iq3xxs_grid.json" ] || \
               install -m 644 c/tools/iq3xxs_grid.json "$out/lib/colibri/tools/"
 
