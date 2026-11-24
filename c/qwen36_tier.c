@@ -1991,6 +1991,15 @@ int qt_is_resident(int layer,int eid){
     return r;
 }
 
+/* out[e] = 1 for every expert of `layer` resident now, under one lock; 0 = no tier for this layer */
+int qt_resident_row(int layer,uint8_t *out){
+    if(!G.on || layer<0 || layer>=G.nl) return 0;
+    pthread_mutex_lock(&G.mx);
+    for(int e=0;e<G.ne;e++) out[e]=(uint8_t)(qs(layer,e)->resident!=0);
+    pthread_mutex_unlock(&G.mx);
+    return 1;
+}
+
 /* internal, G.mx held: enqueue one upload. victim=-1: plain upload (budget is
  * reserved here); victim>=0: LFRU swap (budget neutral). */
 static int enqueue_locked(int layer,int eid,int v_layer,int v_eid,int reserved){
@@ -2123,6 +2132,8 @@ static int cmp_heat_desc(const void *a,const void *b){
     uint32_t ha=g_sort_heat[*(const int*)a], hb=g_sort_heat[*(const int*)b];
     return ha<hb ? 1 : ha>hb ? -1 : 0;
 }
+static const uint8_t *G_allow;   /* qt_plan_allow: nl x ne, 1 = may be planned; NULL = all */
+void qt_plan_allow(const uint8_t *allow){ G_allow = allow; }
 static int fill_order_make(void){
     size_t n=(size_t)G.nl*G.ne;
     G.fill_order=malloc(n*sizeof(int));
@@ -2146,7 +2157,7 @@ int qt_fill_next(int *layer,int *eid){
         int full=1; for(int i=0;i<G.ndev;i++) if(G.used[i]+qt_ebytes_min()<=G.budget[i]) full=0;
         if(full){ pthread_mutex_unlock(&G.mx); return 0; }
         G.fill_cur++;
-        if(s->resident||s->queued) continue;
+        if(s->resident||s->queued||(G_allow&&!G_allow[gi])) continue;
         if(G.used[hd]+qt_ebytes(l)>G.budget[hd]) continue;   /* dieses Device voll */
         *layer=l; *eid=e;
         pthread_mutex_unlock(&G.mx);
@@ -2181,7 +2192,7 @@ int qt_plan_fill(int *layers,int *eids,int max){
         int l=gi/G.ne, e=gi%G.ne, hd=home2(l,e);
         if(G.off && G.off[l]) continue;   /* a layer with no experts (Flint's dense ones) */
         QSlot *s=qs(l,e);
-        if(s->resident||s->queued||s->planned) continue;
+        if(s->resident||s->queued||s->planned||(G_allow&&!G_allow[gi])) continue;
         if(G.used[hd]+qt_ebytes(l)>G.budget[hd]) continue;
         G.used[hd]+=qt_ebytes(l);         /* reserve */
         s->planned=1;

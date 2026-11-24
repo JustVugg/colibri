@@ -42,7 +42,7 @@
  * buffer, so a longer prompt overran the stack instead of being refused.
  * Context costs 54 KB/token in KV/index state (12 QSA layers, f32) -- 128k is 6.75 GiB
  * -- which is why Q38_MAXT still defaults far below this. */
-#define QWEN38_ATTN_MAX_CTX 262144
+#define QWEN38_ATTN_MAX_CTX 524288
 #define QWEN38_DEFAULT_MAX_CTX 8192
 
 /* Effective ceiling: Q38_MAXT if set and sane, the conservative default
@@ -2036,7 +2036,20 @@ static int q38_serve_budget(int np, int max_tok, int max_ctx, int read_only){
 typedef struct {
     double started; uint64_t hits, misses; Q38Timers timers; QtCounters qt;
     uint64_t prefill_hits, prefill_misses; Q38Timers prefill_timers; QtCounters prefill_qt;
+    unsigned long long mask[3], prefill_mask[3];   /* Q38_EXPERT_MASK's counters (q38_mask_snap) */
 } Q38ReqClock;
+
+/* Q38_EXPERT_MASK: a request's routed picks of masked layers, those outside the mask (they miss
+ * when every allowed expert is resident) and TAU's replacements, prefill and decode;
+ * Q38_ROUTE_TAU: the picks VRAM did not hold and it kept, and those it replaced */
+static void q38_mask_request(const Q38ReqClock *clk,const char *id){
+    if(!g_q38_mask&&!(g_q38_route_tau>0))return;
+    unsigned long long now[3];q38_mask_snap(now);
+    const unsigned long long *b=clk->mask,*p=clk->prefill_mask;
+    fprintf(stderr,"%s request %s: routed prefill %llu, decode %llu | %s prefill %llu, decode %llu | "
+            "replaced prefill %llu, decode %llu\n",g_q38_mask?"[mask]":"[route-tau]",id,p[0]-b[0],now[0]-p[0],
+            g_q38_mask?"outside the mask":"not in VRAM, kept",p[1]-b[1],now[1]-p[1],p[2]-b[2],now[2]-p[2]);
+}
 
 static QtCounters q38_qt_delta(const QtCounters *after,const QtCounters *before){
     QtCounters d={after->hits-before->hits,after->miss-before->miss,after->uploads-before->uploads,
@@ -2556,6 +2569,18 @@ static int q38_psd_on(Model *m){
         }
         { unsigned char kv=(unsigned char)q38_kv16(); h=q38_psd_fnv(h,&kv,1); }   /* Q38_KV unset follows SERVE: hash what the rows hold */
         h=q38_psd_fnv(h,__DATE__ " " __TIME__,sizeof(__DATE__ " " __TIME__));   /* this build: a kernel change changes a state's bits */
+        /* Q38_EXPERT_MASK routes differently: its allow table (not its path) in the identity; unset adds nothing */
+        if(g_q38_mask)h=q38_psd_fnv(h,g_q38_mask,(size_t)g_q38_mask_layers*g_q38_mask_experts);
+        if(g_q38_mask&&g_q38_mask_from){   /* a soft variant routes differently again */
+            h=q38_psd_fnv(h,&g_q38_mask_from,sizeof g_q38_mask_from);h=q38_psd_fnv(h,&g_q38_mask_tau,sizeof g_q38_mask_tau);
+        }
+        if(g_q38_route_tau>0){   /* Q38_ROUTE_TAU routes differently too; unset adds nothing */
+            h=q38_psd_fnv(h,"route-tau",10);h=q38_psd_fnv(h,&g_q38_route_tau,sizeof g_q38_route_tau);
+        }
+        if(g_q38_route_bias>0||g_q38_route_bias_file>0){   /* Q38_ROUTE_BIAS(_FILE) route differently as well; unset adds nothing */
+            h=q38_psd_fnv(h,"route-bias",11);h=q38_psd_fnv(h,&g_q38_route_bias,sizeof g_q38_route_bias);
+            h=q38_psd_fnv(h,&g_q38_route_bias_file,sizeof g_q38_route_bias_file);
+        }
         g_q38_psd_id=h;
     }
     return g_q38_psd_dir[0]!='-';
@@ -3047,7 +3072,7 @@ static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     }
     printf("ACCEPT %s %d\n",q->id,np); fflush(stdout);
     if(lone)q38_park_decide(m,ids,np,q->max_tok);   /* a conversation parked by the last request: back, kept or dropped */
-    clk->started=now_s(); clk->hits=m->hits; clk->misses=m->miss; clk->timers=m->timers; qt_counters(&clk->qt);
+    clk->started=now_s(); clk->hits=m->hits; clk->misses=m->miss; clk->timers=m->timers; qt_counters(&clk->qt); q38_mask_snap(clk->mask);
     /* Prima gli scatti CHIESTI, e il piu profondo: sono punti di ritorno che
      * il client ha dichiarato, e battono la cache automatica, che insegue solo
      * l'ultimo prompt. Se nessuno serve, si ricade su quella. */
@@ -3177,7 +3202,7 @@ static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     if(m->draft_vocab)draft_vocab_begin(m->draft_vocab,ids,np,reuse);
     /* the prompt has been read: what follows is the decode's share of the request */
     clk->prefill_hits=m->hits; clk->prefill_misses=m->miss; clk->prefill_timers=m->timers;
-    qt_counters(&clk->prefill_qt);
+    qt_counters(&clk->prefill_qt); q38_mask_snap(clk->prefill_mask);
     *ids_out=ids; *np_out=np; *lo_out=lo;
     return 1;
 }
@@ -3287,6 +3312,7 @@ static int serve_one_turn(Model *m, ServeReq *q){
     serve_hits(m);
     q38_tm_report_bank(&timers,"request");
     q38_report_request_split(m,&clk,q->id);
+    q38_mask_request(&clk,q->id);
     {char scope[96];snprintf(scope,sizeof scope,"turn %s",q->id);q38_spec_report(m,&spec,scope);q38_vocab_report(m,scope);}
     q38_spec_free(&spec);
     return input_eof?-1:0;
@@ -3390,6 +3416,7 @@ static void q38_mux_finish(Model *m,Q38MuxReq *r){
     serve_hits(m);
     q38_tm_report_bank(&timers,"request");
     q38_report_request_split(m,&r->clk,r->q.id);
+    q38_mask_request(&r->clk,r->q.id);
     /* the slot's conversation as the turn left it, for its next turn on another slot (one as long
      * as a parked one at least: COLI_PARK_MIN) */
     q38_psd_flush(m);
@@ -3808,6 +3835,9 @@ int main(int argc, char **argv) {
         if (head) fprintf(stderr, "[gguf] the MTP head's %d tensors (%s*) stay unread: it is not attached\n", head, hp);
         if (unused && getenv("GGUF_STRICT") && getenv("GGUF_STRICT")[0] == '1') return 3;
     }
+    /* Q38_EXPERT_MASK: route among a per-layer allow-list only (qwen38_core.h), before the
+     * tier starts so its warm start plans the allowed experts and nothing else */
+    if (!q38_mask_load(&m.c) || !q38_route_tau_load(&m.c) || !q38_route_bias_load(&m.c)) { q38_model_free(&m); free_tokenizer(); return 1; }
     q38_tier_start(&m, cap);   /* COLI_CUDA=1: hot experts stream to VRAM (qwen36_tier.c) */
     if (g_q38_mux_slots>1 && m.dn_dev) {
         m.dn_dev=0;
@@ -3839,6 +3869,7 @@ int main(int argc, char **argv) {
         if(!g_q38_mtp_dump){perror(getenv("Q38_MTP_DUMP"));return 1;}
     }
     q38_vocab_decide(&m, snap);   /* the draft list or the whole vocabulary, before COLI_VK_DENSE_HOST releases the lm_head rows */
+    q38_mask_tier_report(&m.c);         /* Q38_EXPERT_MASK: did every allowed expert fit */
     q38_expert_report(&m, cap);         /* expert format, bytes per expert, what the cache costs */
 #ifdef COLI_VULKAN
     /* After the trunk is int8: those rows upload at their first matmul. No
@@ -3893,6 +3924,7 @@ int main(int argc, char **argv) {
             q38_model_free(&m); rt_destroy(); return 1; }
         coli_rt_term_arm();   /* SIGTERM must reach the save below (#1629) */
         serve_loop(&m);
+        q38_mask_report();
         rt_save(g_q38_usage, 0);
         q38_vocab_save(&m);
         q38_prefix_cache_release(&m);
@@ -3907,6 +3939,7 @@ int main(int argc, char **argv) {
         double tot = m.hits + m.miss;
         printf("TF-NLL: %.4f nats/token over %d tokens | ppl = %.2f\n", nll, scored, exp(nll));
         qt_stats();   /* VRAM tier hits/misses/swaps, if on */
+        q38_mask_report();
         printf("Expert cache hit rate: %.1f%% (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
                (unsigned long long)m.hits, (unsigned long long)m.miss);
         printf("Speed: %.2f tok/s (%.1fs for %d tokens) | PEAK RSS: %.2f GB\n", scored/dt, dt, scored, rss_gb());
@@ -3997,6 +4030,7 @@ int main(int argc, char **argv) {
     tm_report(&m);
     fprintf(stderr, "\nPEAK RSS: %.2f GB\n", rss_gb());
     qt_stats();   /* VRAM tier hits/misses/swaps, if on */
+    q38_mask_report();
     fprintf(stderr, "Expert cache hit rate: %.1f%% (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
            (unsigned long long)m.hits, (unsigned long long)m.miss);
     fprintf(stderr, "Speed: %.2f tok/s (%.1fs for %d tokens)\n", n_new/dt, dt, n_new);
