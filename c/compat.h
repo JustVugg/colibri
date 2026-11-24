@@ -537,7 +537,9 @@ static inline int coli_stdin_readable(void)
     DWORD avail = 0;
     if (ih == INVALID_HANDLE_VALUE) return 0;
     if (PeekNamedPipe(ih, NULL, 0, NULL, &avail, NULL)) return avail > 0;
-    return 0;   /* console/file: nessun poll non bloccante, meglio "niente" che bloccare */
+    /* A broken pipe (gateway closed stdin) fails PeekNamedPipe while POSIX select()
+     * reports readable so the caller observes EOF instead of stalling until end-of-turn. */
+    return GetLastError() == ERROR_BROKEN_PIPE ? 1 : 0;
 }
 #else
 static inline int coli_stdin_readable(void)

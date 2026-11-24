@@ -4312,12 +4312,6 @@ static void ink_image_attach(SReq *q) {
     g_ink_img.pix = NULL;
 }
 
-static int stdin_readable(void) {
-    /* Windows non ha fd_set/select in questa forma: la build falliva del tutto.
-     * La versione portabile (con i fix #139/#195) vive in compat.h, incluso via st.h. */
-    return coli_stdin_readable();
-}
-
 /* read one control line (+ payload for SUBMIT). cur_id: request in flight;
  * returns 1 if that request was cancelled, 0 otherwise, -1 on stdin EOF. */
 static int serve_read_cmd(FILE *input, FILE *output, const char *cur_id) {
@@ -4407,7 +4401,7 @@ typedef struct { double t0, f0, e0, s0, a0; uint64_t h0, m0; } InkReqClock;
  * (prompt_break.h), with the reader its decode loop uses. The multiplexed loop owns its
  * command stream and reads it between steps. */
 static int ink_prompt_poll(ColiPromptBreak *b) {
-    while (!b->control && !b->eof && stdin_readable()) {
+    while (!b->control && !b->eof && coli_stdin_readable()) {
         int r = serve_read_cmd(stdin, stdout, b->id);
         if (r < 0) b->eof = 1;   /* as the decode loop: it stops at its next read */
         else if (r > 0) b->control = 1;
@@ -4831,7 +4825,7 @@ static int serve_one(Model *m, Tok *T, SReq *q) {
                 int nb = tok_decode(T, &tk, 1, buf, sizeof(buf)-1);
                 coli_serve_write_data(stdout,q->id,buf,(size_t)nb);
                 gen++; len++;
-                while (stdin_readable()) {
+                while (coli_stdin_readable()) {
                     int r = serve_read_cmd(stdin, stdout, q->id);
                     if (r < 0) { free(ids); return -1; }
                     if (r > 0) { cancelled = 1; limited = 0; }
@@ -4856,7 +4850,7 @@ static int serve_one(Model *m, Tok *T, SReq *q) {
         if (q->logprobs > 0) coli_serve_write_data_lp(stdout,q->id,buf,(size_t)nb,lptail);
         else coli_serve_write_data(stdout,q->id,buf,(size_t)nb);
         gen++; len++;
-        while (stdin_readable()) {
+        while (coli_stdin_readable()) {
             int r = serve_read_cmd(stdin, stdout, q->id);
             if (r < 0) { free(ids); return -1; }
             if (r > 0) { cancelled = 1; limited = 0; }
@@ -5056,7 +5050,7 @@ static void serve_mux(Model *m, Tok *T) {
     for (;;) {
         int active = 0; for (int i = 0; i < n; i++) active += rq[i].active;
         /* idle: wait for a command; decoding: take one only when one is there */
-        if (!input_eof && (!active || stdin_readable())) {
+        if (!input_eof && (!active || coli_stdin_readable())) {
             ColiServeCommand command;
             ColiServeReadResult result = coli_serve_read_command(stdin, &inkling_wire, &command);
             if (result == COLI_SERVE_READ_EOF || result == COLI_SERVE_READ_BAD_FRAME) input_eof = 1;
