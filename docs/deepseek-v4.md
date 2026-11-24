@@ -186,6 +186,12 @@ make deepseek-v4 HIP=1 HIP_ARCH=gfx1102   # ROCM_HOME=/usr when ROCm is not in /
 The same `backend_cuda_dsv4.cu`, compiled by `hipcc` (ROCm 6.3 or newer: the
 OCP fp8 type in `<hip/hip_fp8.h>`) and linked into the engine like `CUDA=1`.
 The cooperative fused-MoE kernel is CUDA-only and compiled out on HIP.
+For an RDNA3 card (`HIP_ARCH=gfx11…`) the kernels are built as 64-lane waves
+(`-mwavefrontsize64`, `HIP_WAVE64=1`): on a gfx1102 the decode's FP4 expert
+group runs 37-39 % faster so, with the same results, and the GPU tier's
+decode with `--vram 5` from 1.67 to 1.88 tok/s (+12.6 %, three runs per arm,
+the same text; `docs/experiments/v4-hip-wave64-2026-11-19/`). `HIP_WAVE64=0`
+builds 32-lane waves, the RDNA default; `HIP_ARCH=native` leaves it off.
 
 ### Linux CUDA tier
 
