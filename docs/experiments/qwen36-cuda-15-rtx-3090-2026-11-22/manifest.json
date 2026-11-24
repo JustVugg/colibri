@@ -1,0 +1,84 @@
+{
+  "version": 1,
+  "hypothesis": "The selected full CUDA stack changes prompt throughput on NVIDIA GeForce RTX 3090 at 16,384 tokens while preserving dev logits.",
+  "commit": "05245ef45048b837fee5ed7b5b1ab2e59161fb80",
+  "commit_role": "Dev reference at the start of the measured campaign.",
+  "model": "Kreuzzelg/qwen36-35b-a3b-colibri-i4-gs64@c619aa594ad1e70af82168fb6b4878427896e21c",
+  "command": "COLI_CUDA=1 COLI_GPUS=0 CUDA_EXPERT_GB=auto OMP_WAIT_POLICY=ACTIVE OMP_PROC_BIND=close OMP_NUM_THREADS=8 OMP_DISPLAY_AFFINITY=TRUE OMP_AFFINITY_FORMAT=omp-thread:%n:cpus:%A /usr/bin/time -v ./qwen36-bench --model \"$MODEL_DIR\" --steps steps.tsv --text promessi_sposi.txt --lengths 2048,4096,8192,16384 --gen 128 --teacher",
+  "prompt_hash": "f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f",
+  "hardware": {
+    "gpu": "NVIDIA GeForce RTX 3090",
+    "vram_mib": 24576,
+    "cuda_arch": "sm_86",
+    "cpu": "AMD EPYC 7452 32-Core Processor",
+    "threads": 8,
+    "ram": "28.9 GiB available to the workload",
+    "storage": "Model directory on overlay. Visible host disks: Micron_7450_MTFDKCB7T6TFR nvme 7T, Patriot M.2 P300 128GB nvme 119.2G",
+    "os": "Linux 6.8.0-60-generic x86_64, CUDA 12.4.131, NVIDIA driver 580.95.05"
+  },
+  "metric": "Prefill tok/s at 16,384 tokens, the fourth row of the 2,048 to 16,384 sequence.",
+  "warmup_runs": 1,
+  "warmup_policy": "One excluded warm-up per build and workload group.",
+  "changed_variables": [
+    "engine_build"
+  ],
+  "baseline": {
+    "config": {
+      "engine_build": "dev (source 05245ef45048b837fee5ed7b5b1ab2e59161fb80, compiled c/ tree 34355d8f798ffb5fdf6c1330d14f592cb5909205)"
+    },
+    "samples": {
+      "tok_s": [
+        3289.17,
+        3250.62,
+        3188.6
+      ],
+      "steady_decode_tok_s": [
+        140.185,
+        140.596,
+        140.063
+      ]
+    },
+    "median_tok_s": 3250.62,
+    "quality": {
+      "method": "Byte comparison of full FP32 outputs with the dev reference at every measured step.",
+      "passed": true,
+      "uri": "docs/experiments/qwen36-cuda-15-rtx-3090-2026-11-22/correctness.txt",
+      "sha256": "82d56e9df9ba10ce0ca1005cf2dd0b3d127d4d52be4bbd7e3d75c3ef186a4a46"
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-cuda-15-rtx-3090-2026-11-22/base.md",
+      "sha256": "d7c65f227ccce0175300254d2b4462b526e1a5f2e9adb3ad40261f3a0ca232d9"
+    }
+  },
+  "trial": {
+    "config": {
+      "engine_build": "full stack (source da49a1611a76bfdf840b07cd326c31c4733c0e18, compiled c/ tree e7cb67d79e678045d4f9aaeb9fa9f745e1d5443b)"
+    },
+    "samples": {
+      "tok_s": [
+        6153.86,
+        6250.74,
+        6208.8
+      ],
+      "steady_decode_tok_s": [
+        148.326,
+        148.506,
+        147.842
+      ]
+    },
+    "median_tok_s": 6208.8,
+    "quality": {
+      "method": "Byte comparison of full FP32 outputs with the dev reference at every measured step.",
+      "passed": true,
+      "uri": "docs/experiments/qwen36-cuda-15-rtx-3090-2026-11-22/correctness.txt",
+      "sha256": "82d56e9df9ba10ce0ca1005cf2dd0b3d127d4d52be4bbd7e3d75c3ef186a4a46"
+    },
+    "evidence": {
+      "uri": "docs/experiments/qwen36-cuda-15-rtx-3090-2026-11-22/base.md",
+      "sha256": "d7c65f227ccce0175300254d2b4462b526e1a5f2e9adb3ad40261f3a0ca232d9"
+    }
+  },
+  "outcome": "improvement",
+  "change_pct": 92.29377780238848,
+  "change_method": "Median of three paired percentage changes"
+}

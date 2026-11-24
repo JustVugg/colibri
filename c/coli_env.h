@@ -136,6 +136,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_CUDA", CE_INT, CE_COLIBRI | CE_QWEN | CE_QWEN38 | CE_OLMOE | CE_DSV4 | CE_GLM53 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, CE_LAUNCHER, NULL},
     {"COLI_CUDA_ADDNORM", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_ASYNC", CE_INT, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
+    {"COLI_CUDA_ASYNC_DOWN", CE_BOOL, CE_QWEN, 0, NULL}, /* Large device-to-host copies on the copy stream. Default on. */
     {"COLI_CUDA_ATTN",                   CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_CUDA_ATTN_BATCH",             CE_STR   , CE_DSV4                                         , 0             , NULL},
     {"COLI_CUDA_ATTN_DEC", CE_INT, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
@@ -144,6 +145,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_CUDA_ATTN_DEC_TPP", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_ATTN_F2_WARPS", CE_INT, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_ATTN_GROUPED", CE_INT, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
+    {"COLI_CUDA_ATTN_LONG_PLAIN", CE_STR, CE_QWEN, 0, NULL}, /* When set, bypass the one-pass long-prefix specialization. */
     {"COLI_CUDA_ATTN_PREFIX",            CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_CUDA_ATTN_SEL_TC", CE_BOOL, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_ATTN_SHARD",             CE_INT   , CE_COLIBRI                                      , 0             , NULL},
@@ -153,6 +155,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_CUDA_BD_TILE2", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_BD_TILES", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_CHAIN", CE_INT, CE_COLIBRI | CE_INKLING | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_LAYA | CE_GLINER | CE_KIMI | CE_DSV41, 0, NULL},
+    {"COLI_CUDA_CHAIN_BENCH", CE_STR, CE_QWEN, 0, NULL}, /* Selects a CUDA chain benchmark. Its presence makes the CUDA kernels reread kernel settings. Default unset. */
     {"COLI_CUDA_CHAIN_FAULT", CE_INT, CE_OLMOE | CE_QWEN | CE_QWEN38 | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_CHAIN_FLASH", CE_INT, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_CHAIN_FLASH2", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
@@ -184,19 +187,27 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_CUDA_CHAIN_ROWS", CE_INT, CE_OLMOE | CE_QWEN | CE_QWEN38, 0, NULL},
     {"COLI_CUDA_CHAIN_SERVE_THREADS", CE_STR, CE_QWEN38, 0, NULL},
     {"COLI_CUDA_CHAIN_STAGE_RING", CE_BOOL, CE_QWEN38, 0, NULL},
+    {"COLI_CUDA_CHAIN_TEST", CE_BOOL, CE_QWEN, 0, NULL}, /* Presence enables test-mode kernel settings, including when set to 0. Default unset. */
     {"COLI_CUDA_COPY_K", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_DENSE", CE_INT, CE_COLIBRI | CE_KIMI | CE_DSV4 | CE_GLM53 | CE_DSV41 | CE_MIMO, 0, NULL},
+    {"COLI_CUDA_DENSE_BM", CE_INT, CE_QWEN, 0, NULL}, /* Dense tensor-core tile or kernel mode. Default automatic. */
     {"COLI_CUDA_DENSE_GB", CE_INT, CE_COLIBRI | CE_KIMI | CE_DSV4 | CE_GLM53 | CE_DSV41 | CE_MIMO, 0, NULL},
+    {"COLI_CUDA_DENSE_I8", CE_BOOL, CE_QWEN, 0, NULL}, /* INT8 dense Tensor Core dispatch. Defaults to the active profile, or off in test mode without a benchmark. */
+    {"COLI_CUDA_DNCONV_FAST", CE_INT, CE_QWEN, 0, NULL}, /* DeltaNet convolution mode. Default 1 enables the tiled long-prompt path. */
     {"COLI_CUDA_DNREC_CFG", CE_INT, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_DNREC_ROWS", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_DNREC_SPLIT", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_DN_SNAP_ONE", CE_BOOL, CE_QWEN | CE_QWEN38, 0, NULL},
     {"COLI_CUDA_DUAL_PROJ", CE_INT, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_EXACT_SLOTS", CE_STR, CE_QWEN, 0, NULL},
+    {"COLI_CUDA_F2_MODE", CE_INT, CE_QWEN, 0, NULL}, /* Prompt attention kernel variant for head dimension 256. Default 0. */
+    {"COLI_CUDA_F32G_FAST", CE_INT, CE_QWEN, 0, NULL}, /* FP32 GEMM tile selection for narrow outputs. Default 1. */
     {"COLI_CUDA_F32T", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_F8_WARP", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_FLUSH", CE_BOOL, CE_QWEN | CE_QWEN38, 0, NULL},
+    {"COLI_CUDA_FUSED_SWIGLU", CE_BOOL, CE_QWEN, 0, NULL}, /* Fuse shared-expert projections with SwiGLU where supported. Defaults to the active profile. */
     {"COLI_CUDA_G53_ROWS", CE_INT, CE_GLM53, 0, NULL},
+    {"COLI_CUDA_GEMV_I2F", CE_INT, CE_QWEN, 0, NULL}, /* Integer-to-float GEMV kernel mode. Default 1. */
     {"COLI_CUDA_GEMV_NR", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_GEMV_SK", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_GEMV_W4", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
@@ -212,22 +223,34 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_CUDA_HOST_WAIT_S", CE_FLOAT, CE_QWEN | CE_QWEN38, 0, NULL},
     {"COLI_CUDA_K3_ROWS", CE_INT, CE_KIMI, 0, NULL},
     {"COLI_CUDA_KV16", CE_STR, CE_QWEN, 0, NULL},
+    {"COLI_CUDA_L2_GRAN", CE_INT, CE_QWEN, 0, NULL}, /* L2 fetch granularity in bytes. Default 128. Zero leaves the device limit alone. */
     {"COLI_CUDA_MOE_BATCH",              CE_STR   , CE_DSV4                                         , 0             , NULL},
     {"COLI_CUDA_MOE_BATCH_MIN",          CE_STR   , CE_DSV4                                         , 0             , NULL},
+    {"COLI_CUDA_MOE_BM", CE_INT, CE_QWEN, 0, NULL}, /* Routed-expert tensor-core tile or kernel mode. Default 0 selects automatically. */
+    {"COLI_CUDA_MOE_DN_I8", CE_INT, CE_QWEN, 0, NULL}, /* INT8 expert down-projection mode. Inherits MOE_I8 when unset. */
     {"COLI_CUDA_MOE_DOUBLE",             CE_STR   , CE_DSV4                                         , 0             , NULL},
+    {"COLI_CUDA_MOE_FUSED", CE_BOOL, CE_QWEN, 0, NULL}, /* Set to 1 to enable experimental fused routed-expert down sums. Default off. */
     {"COLI_CUDA_MOE_GV", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_MOE_HCM", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
+    {"COLI_CUDA_MOE_I8", CE_BOOL, CE_QWEN, 0, NULL}, /* INT8 routed-expert gate and up projections. Default on except in a test without a benchmark. */
+    {"COLI_CUDA_MOE_STRIP", CE_INT, CE_QWEN, 0, NULL}, /* Down-projection strip width in columns. Requires a multiple of 256 below D. Default 0 disables strips. */
     {"COLI_CUDA_MOE_TILE128", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_MTP",                    CE_INT   , CE_COLIBRI                                      , 0             , NULL},
+    {"COLI_CUDA_NORM256_FAST", CE_INT, CE_QWEN, 0, NULL}, /* In-place 256-wide normalization and RoPE fusion mode. Default 1. */
+    {"COLI_CUDA_NORM_PLAIN", CE_STR, CE_QWEN, 0, NULL}, /* Use the ordinary normalization kernel when set to 1. */
+    {"COLI_CUDA_NORM_SKIP_Y", CE_BOOL, CE_QWEN, 0, NULL}, /* Allows normalization to omit the float output when the caller requests quantized output only. Default on. */
     {"COLI_CUDA_PDL", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_PIPE",                   CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_CUDA_PIPE_SHARD",             CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_CUDA_PIPE_S_MIN",             CE_INT   , CE_COLIBRI                                      , 0             , NULL},
+    {"COLI_CUDA_PR13_FLASH_DEV", CE_STR, CE_QWEN, 0, NULL}, /* Use direct Flash attention for a long prefix when set to 1. */
     {"COLI_CUDA_PROFILE", CE_INT, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
     {"COLI_CUDA_QSA_TILES", CE_BOOL, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},
+    {"COLI_CUDA_QX_CACHE", CE_BOOL, CE_QWEN, 0, NULL}, /* Reuse quantized activations across eligible projections. Defaults to the active profile. */
     {"COLI_CUDA_RELATTN_SPLIT", CE_BOOL, CE_INKLING, 0, NULL},
     {"COLI_CUDA_RESID",                  CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_CUDA_ROUTER",                 CE_INT   , CE_COLIBRI                                      , 0             , NULL},
+    {"COLI_CUDA_ROUTE_FAST", CE_BOOL, CE_QWEN, 0, NULL}, /* Specialized router for 256 experts. Defaults to the active profile. */
     {"COLI_CUDA_SHARED_W4A16",           CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_CUDA_SHARED_W4A16_MIN_ROWS",  CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_CUDA_SK_PART", CE_STR, CE_COLIBRI | CE_KIMI | CE_OLMOE | CE_QWEN | CE_GLM53 | CE_QWEN38 | CE_DSV41 | CE_MIMO | CE_LAYA | CE_GLINER, 0, NULL},

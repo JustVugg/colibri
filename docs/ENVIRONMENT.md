@@ -531,6 +531,36 @@ These are for testing, benchmarking, or internal use — not part of the everyda
 
 ---
 
+### Qwen3.6 CUDA kernel controls
+
+These backend settings are for kernel testing and tuning. A profile default follows the selected device and request. Kernel shape and format checks still apply.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `COLI_CUDA_ASYNC_DOWN` | on when eligible | Allow large device-to-host copies on the copy stream. Zero disables this path. |
+| `COLI_CUDA_ATTN_LONG_PLAIN` | unset | Setting this variable, even to zero, bypasses the one-pass specialization for short continuations at long prefixes. |
+| `COLI_CUDA_CHAIN_BENCH` | unset | Select a CUDA chain benchmark. Its presence also makes several kernel settings refresh between calls. |
+| `COLI_CUDA_CHAIN_TEST` | unset | Its presence, including a value of zero, enables test-mode kernel selection. |
+| `COLI_CUDA_DENSE_BM` | automatic | Override the tile size or kernel mode of eligible dense Tensor Core projections. |
+| `COLI_CUDA_DENSE_I8` | profile | Allow INT8 dense Tensor Core projection. A chain test without a benchmark defaults to off. |
+| `COLI_CUDA_DNCONV_FAST` | 1 | Select the DeltaNet convolution kernel mode. Mode 1 enables tiling on eligible long prompts. |
+| `COLI_CUDA_F2_MODE` | 0 | Select the prompt Flash attention variant for a head dimension of 256. |
+| `COLI_CUDA_F32G_FAST` | 1 | Select the narrow-output FP32 projection kernel. |
+| `COLI_CUDA_FUSED_SWIGLU` | profile | Allow supported shared-expert gate and up projections to fuse with SwiGLU. Zero selects separate projections for the profile. |
+| `COLI_CUDA_GEMV_I2F` | 1 | Select the integer-to-float kernel mode for short matrix-vector projections. |
+| `COLI_CUDA_L2_GRAN` | 128 bytes on the prompt-cache path | Set the CUDA L2 fetch granularity. Zero leaves the device limit alone. |
+| `COLI_CUDA_MOE_BM` | 0 (automatic) | Select the routed-expert tile size or kernel mode. |
+| `COLI_CUDA_MOE_DN_I8` | inherits `COLI_CUDA_MOE_I8` | Select the INT8 mode for routed-expert down projections. |
+| `COLI_CUDA_MOE_FUSED` | off | A value of 1 enables experimental atomic down-projection sums. Their floating-point accumulation order can change. |
+| `COLI_CUDA_MOE_I8` | on when eligible | Allow INT8 gate and up projections for routed experts. A chain test without a benchmark defaults to off. |
+| `COLI_CUDA_MOE_STRIP` | 0 (off) | Set the down-projection strip width in columns to a multiple of 256 smaller than the output width. |
+| `COLI_CUDA_NORM256_FAST` | 1 | Select the 256-wide normalization kernel mode for eligible attention heads. |
+| `COLI_CUDA_NORM_PLAIN` | profile | A value of 1 selects ordinary normalization. |
+| `COLI_CUDA_NORM_SKIP_Y` | on when eligible | Allow normalization to omit its FP32 output when the caller requests packed INT8 output only. |
+| `COLI_CUDA_PR13_FLASH_DEV` | unset | A value beginning with 1 selects direct Flash attention for eligible long prefixes. Any value also bypasses the separate one-pass specialization. |
+| `COLI_CUDA_QX_CACHE` | profile | Reuse packed INT8 activations across eligible projections. Zero disables reuse. |
+| `COLI_CUDA_ROUTE_FAST` | profile | Select the specialized unbiased softmax router for 256 experts and at most 32 selected experts per token. Zero selects the general router. |
+
 ## GLM-5.3-Flash engine (`glm53`)
 
 Read **only** by `c/glm53.c`. Like the other siblings it has its own loader,
