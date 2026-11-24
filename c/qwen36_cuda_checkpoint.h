@@ -103,6 +103,11 @@ static long q36_checkpoint_ctime_ns(const struct stat *st) {
 }
 
 static int q36_checkpoint_same_file(const struct stat *a, const struct stat *b) {
+#ifdef _WIN32
+    /* Windows' CRT has no inode numbers (st_ino 0) and its fstat leaves st_dev 0 where stat
+     * gives the drive's number: there the same file is the same size and the same times */
+    return a->st_size == b->st_size && a->st_mtime == b->st_mtime && a->st_ctime == b->st_ctime;
+#endif
     return a->st_dev == b->st_dev && a->st_ino == b->st_ino && a->st_size == b->st_size &&
         a->st_mtime == b->st_mtime && q36_checkpoint_mtime_ns(a) == q36_checkpoint_mtime_ns(b) &&
         a->st_ctime == b->st_ctime && q36_checkpoint_ctime_ns(a) == q36_checkpoint_ctime_ns(b);
