@@ -1793,6 +1793,7 @@ memInfo.free:                     23.50 GB (97%)
         self.assertEqual(env["COLI_GPUS"], "1")
         # the plan's team: the physical cores, a hybrid CPU's performance cores
         self.assertEqual(env["OMP_NUM_THREADS"], str(plan["cpu"]["team_threads"]))
+        self.assertEqual(env["COLI_OMP_TEAM_AUTO"], "1")   # ours, so the engine's team probe may lower it
         self.assertLessEqual(plan["cpu"]["team_threads"], plan["cpu"]["physical_cores"])
         # The plan must NOT set OMP_PROC_BIND / OMP_PLACES on any platform:
         # the engine's own hot-thread tuning owns affinity (it prefers
@@ -1813,6 +1814,7 @@ memInfo.free:                     23.50 GB (97%)
         explicit_threads = environment_for_plan(plan, {"OMP_NUM_THREADS": "7",
                                                         "OMP_PROC_BIND": "close"})
         self.assertEqual(explicit_threads["OMP_NUM_THREADS"], "7")
+        self.assertNotIn("COLI_OMP_TEAM_AUTO", explicit_threads)   # the user's: left alone
         self.assertEqual(explicit_threads["OMP_PROC_BIND"], "close")
 
         if sys.platform.startswith("linux"):

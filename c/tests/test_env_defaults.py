@@ -410,6 +410,21 @@ class Dsv4CudaDetectTest(unittest.TestCase):
             self.assertNotIn("CUDA=1", hint)
 
 
+
+class DefaultOmpTeamTest(unittest.TestCase):
+    """The launcher's OMP_NUM_THREADS is a default the engine may still lower (omp_tune.h's team
+    probe), and says so; a user's is left alone and unmarked."""
+
+    def test_the_default_is_marked_and_a_users_team_is_not(self):
+        import resource_plan
+        env = {}
+        resource_plan.default_omp_team(env, 24)
+        self.assertEqual(env, {"OMP_NUM_THREADS": "24", "COLI_OMP_TEAM_AUTO": "1"})
+        env = {"OMP_NUM_THREADS": "8"}
+        resource_plan.default_omp_team(env, 24)
+        self.assertEqual(env, {"OMP_NUM_THREADS": "8"})
+
+
 if __name__ == "__main__":
     unittest.main()
 
