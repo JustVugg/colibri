@@ -4020,12 +4020,6 @@ static int prepare_request_state(Model *m, const int *ids, int np, int max_t){
     return reuse;
 }
 
-static int serve_stdin_readable(void){
-    /* Windows non ha fd_set/select in questa forma: la build falliva del tutto.
-     * La versione portabile (con i fix #139/#195) vive in compat.h, incluso via st.h. */
-    return coli_stdin_readable();
-}
-
 static int serve_read_req(FILE *in, FILE *out, ServeReq *q, const char *active){
     ColiServeCommand command;
     ColiServeReadResult result=coli_serve_read_command(in,&kimi_wire,&command);
@@ -4067,7 +4061,7 @@ typedef struct { const char *active; int fatal; } K3ServePoll;
 static int k3_serve_poll_cancel(void *context){
     K3ServePoll *poll=context;
     int cancelled=0;
-    while(serve_stdin_readable()){
+    while(coli_stdin_readable()){
         ServeReq queued={0}; int r=serve_read_req(stdin,stdout,&queued,poll->active);
         if(r<0){ if(r==-2) poll->fatal=1; return 1; }
         if(r==1) cancelled=1;
@@ -4490,7 +4484,7 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
             else serve_data_maybe_lp(q->id,buf,nb);
         }
         if(!eos) gen++;
-        while(serve_stdin_readable()){
+        while(coli_stdin_readable()){
             ServeReq queued={0};
             int r=serve_read_req(stdin,stdout,&queued,q->id);
             if(r==-2){ poll.fatal=1; cancelled=1; break; }
@@ -4649,7 +4643,7 @@ static void serve_mux(Model *m, Tok *T){
     for(;;){
         int active=0; for(int i=0;i<n;i++) active+=rq[i].active;
         /* idle: wait for a command; decoding: take one only when one is there */
-        if(!input_eof&&(!active||serve_stdin_readable())){
+        if(!input_eof&&(!active||coli_stdin_readable())){
             ColiServeCommand command;
             ColiServeReadResult result=coli_serve_read_command(stdin,&kimi_wire,&command);
             if(result==COLI_SERVE_READ_EOF||result==COLI_SERVE_READ_BAD_FRAME) input_eof=1;
