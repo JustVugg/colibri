@@ -1506,6 +1506,7 @@ jobs:
           DSV41_TINY=dsv41_tiny python3 -m unittest -v tests.test_dsv41_prefix_serve
           DSV41_TINY=dsv41_tiny python3 -m unittest -v tests.test_dsv41_prefill_tail
           DSV41_TINY=dsv41_tiny python3 -m unittest -v tests.test_dsv41_prompt_block
+          DSV41_TINY=dsv41_tiny python3 -m unittest -v tests.test_dsv41_prefetch
           DSV41_TINY=dsv41_tiny python3 -m unittest -v tests.test_dsv41_dspark_gate
           # The prefix store: what a prompt read is kept by content, and a new conversation
           # on the same system prompt or a conversation's next turn takes it with the
