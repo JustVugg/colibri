@@ -5160,11 +5160,7 @@ static void serve_loop(Model *m, Tok *T) {
 
 /* ---------- ref_inkling.json harness ---------- */
 static int *read_int_array(jval *o, const char *key, int *n_out) {
-    jval *a = json_get(o, key);
-    if (!a || a->t != J_ARR) { *n_out = 0; return NULL; }
-    int *r = malloc(a->len * sizeof(int));
-    for (int i = 0; i < a->len; i++) r[i] = (int)a->kids[i]->num;
-    *n_out = a->len; return r;
+    return json_read_int_array(o, key, n_out, 0, 0, INT_MIN);
 }
 
 #ifndef INKLING_NO_MAIN

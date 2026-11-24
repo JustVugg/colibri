@@ -9702,11 +9702,7 @@ static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out)
 }
 
 static int *read_int_array(jval *o, const char *key, int *n_out) {
-    jval *a = json_get(o, key);
-    if (!a || a->t != J_ARR) { fprintf(stderr, "ref.json: missing array \"%s\"\n", key); exit(1); }
-    int *r = malloc(a->len * sizeof(int));
-    for (int i = 0; i < a->len; i++) r[i] = (int)a->kids[i]->num;
-    *n_out = a->len; return r;
+    return json_read_int_array(o, key, n_out, 1, 0, INT_MIN);
 }
 
 #ifndef QWEN36_NO_MAIN
