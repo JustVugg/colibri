@@ -210,6 +210,11 @@ int dsv4_cuda_activation_device(const Dsv4CudaActivation *a);
 int dsv4_cuda_decode_state_set(int device,int token,int position);
 void dsv4_cuda_profiler_start(void);
 void dsv4_cuda_profiler_stop(void);
+/* Ledger (ledger_map.h; no effect without LEDGER_OUT): what the engine calls its next
+ * allocations on this thread (kind "weight", "cache" or "buffer"; a NULL name: the
+ * backend's own), and the end of a decode step (COLI_LEDGER_WINDOW=<skip>:<take>). */
+void dsv4_cuda_ledger_label(const char *kind,const char *name);
+void dsv4_cuda_ledger_step(void);
 int dsv4_cuda_graph_begin(int device);
 Dsv4CudaGraph *dsv4_cuda_graph_end(int device);
 int dsv4_cuda_graph_end_pair(int primary,int peer,Dsv4CudaGraph **primary_graph,Dsv4CudaGraph **peer_graph);

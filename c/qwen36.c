@@ -2397,6 +2397,11 @@ struct ColiCudaTensor;
 int coli_cuda_tensor_upload_rows(struct ColiCudaTensor **tensor, const void *weights, int fmt, int I, int O, int device, int row0, int n);
 int coli_cuda_host_register(void *p, size_t bytes);
 void coli_cuda_host_unregister(void *p);
+void coli_cuda_ledger_step(void);
+/* Ledger (ledger_map.h): one generated token; inert without LEDGER_OUT */
+static void q36_ledger_token(void) { coli_cuda_ledger_step(); }
+#else
+static void q36_ledger_token(void) {}
 #endif
 /* a GGUF matrix the loader left in the file (gq_gone 2), read as the tier uploads it (q36_gq_stream) */
 typedef struct { QtRows r; const QW *w[2]; int O0; } Q36Rows;   /* rows [0, O0) of w[0], then w[1]'s */
@@ -10664,7 +10669,7 @@ static void serve_one_turn(Model *m, ServeReq *q){
             unsigned char chunk[256]; int cn=0; utf8_drain(sbuf,&sbn,tmp,tn,chunk,&cn);
             if(cn>0) serve_data(q->id,(char*)chunk,cn);
         }
-        gen++;
+        gen++; q36_ledger_token();
         if(s == 0) q36_pes_commit(m);   /* the first token is out; the state is still the prompt's end */
         /* #1332: una guardata a stdin per token. Il costo e' una select con
          * timeout zero; il guadagno e' che il gateway smette di aspettare un
@@ -11161,7 +11166,7 @@ static int q36_mux_pick(Model *m, Q36MuxReq *r, const int *eos_ids, int n_eos, i
         unsigned char chunk[256]; int cn = 0; utf8_drain(r->sbuf, &r->sbn, tmp, tn, chunk, &cn);
         if (cn > 0) serve_data(r->q.id, (char *)chunk, cn);
     }
-    r->gen++;
+    r->gen++; q36_ledger_token();
 #ifdef COLI_CUDA
     if (g_q36_mcv) q36_mtp_vocab_step(tk);   /* the draft vocabulary counts it, as a lone request's */
 #endif

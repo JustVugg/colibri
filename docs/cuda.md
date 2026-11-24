@@ -407,6 +407,35 @@ each (OLMoE: prompts of 1K and 3.4K tokens; Qwen3.6: 1K and 4.4K). Letting each 
 the next one at its start (`griddepcontrol.launch_dependents`) measured slower: Qwen3.6
 103.3 / 102.7 tok/s after 1K against 104.8 / 103.9 with the wait alone.
 
+## Per-launch accounting with Ledger (`LEDGER_OUT`)
+
+[Ledger](https://github.com/sec4si/ledger) is an `LD_PRELOAD` CUPTI library that records the
+parameters of every kernel launch and every memory copy in a window and resolves their pointers
+against the program's memory map: which launch read which weight, which copy carried which
+expert, how much copy time no kernel ran alongside. The CUDA backends write that memory map, and
+open the window, when `LEDGER_OUT` is set; without it nothing is recorded and nothing changes.
+
+```sh
+LD_PRELOAD=<ledger>/capture/libledger.so LEDGER_OUT=out COLI_LEDGER_WINDOW=8:32 ./colibri ...
+python -m ledger.transfers out --steps 32        # copies by region and direction
+python -m ledger.analyze out --steps 32 --ceiling-gbps <measured>
+```
+
+- Each backend writes `$LEDGER_OUT/regions-<pid>-cuda.json` (`backend_cuda.cu`) or
+  `-dsv4.json` (`backend_cuda_dsv4.cu`) after a generated token whenever its allocations changed:
+  weights and scales, expert slots, KV and recurrent state, the pipe's buffers and the scratch the
+  copies stage through. Names carry the layer (`layers.12.experts.40.weight`,
+  `layers.3.kv_ring`) where the engine or the backend knows it; a slot whose expert changes with
+  each refill is named as the slot (`experts.dev0.slot.17.weights`); a tensor no engine named yet
+  is `tensor.<n>`, with its shape and dtype.
+- `COLI_LEDGER_WINDOW=<skip>:<take>` brackets `take` generated tokens after the first `skip`
+  with `cudaProfilerStart`/`cudaProfilerStop`, which is Ledger's window. A token is counted
+  where the engine emits it, and the map is written there too: GLM (`colibri.c`), Qwen3.6 and
+  DeepSeek V4 do it; the other CUDA engines do not call the backend's step yet, so they write
+  neither.
+- The map is off under HIP. Kernels that take their pointers from a table in device memory (the
+  routed-expert kernels of the CUDA chains) are not resolved by Ledger; their copies are.
+
 ## Notes and limitations
 
 - Text-mode timing reports prefill separately from decode.
