@@ -602,8 +602,26 @@ static void gq_rows_i8(int t, const uint8_t *src, int rows, int cols, float mul,
 }
 static int gq_dequant_row(int t, const uint8_t *src, float *dst, int64_t n) {
     if (t == GQ_F32) { memcpy(dst, src, (size_t)n * 4); return 0; }
-    if (t == GQ_F16) { for (int64_t i = 0; i < n; i++) dst[i] = gq_f16(gq_rd16(src + 2 * i)); return 0; }
-    if (t == GQ_BF16) { for (int64_t i = 0; i < n; i++) dst[i] = gq_bf16(gq_rd16(src + 2 * i)); return 0; }
+    if (t == GQ_F16) {
+        int64_t i = 0;
+#if defined(__AVX2__) && defined(__F16C__)
+        for (; i + 8 <= n; i += 8)
+            _mm256_storeu_ps(dst + i, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(src + 2 * i))));
+#endif
+        for (; i < n; i++) dst[i] = gq_f16(gq_rd16(src + 2 * i));
+        return 0;
+    }
+    if (t == GQ_BF16) {
+        int64_t i = 0;
+#if defined(__AVX2__)
+        for (; i + 8 <= n; i += 8) {
+            __m256i u = _mm256_slli_epi32(_mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)(src + 2 * i))), 16);
+            _mm256_storeu_ps(dst + i, _mm256_castsi256_ps(u));
+        }
+#endif
+        for (; i < n; i++) dst[i] = gq_bf16(gq_rd16(src + 2 * i));
+        return 0;
+    }
     gq_blk_fn f = gq_blk_decoder(t);
     if (!f || n % GQ_TYPES[t].blck) return -1;
     const int bl = GQ_TYPES[t].blck, by = GQ_TYPES[t].bytes;
@@ -636,20 +654,141 @@ static inline float gq_dot_f32(const float *a, const float *b, int64_t n) {
 #endif
 }
 
+/* Two activation rows against one float weight row: exact same s0/s1 FMA chains
+ * and horizontal reduction order as gq_dot_f32, bit-identical, halving weight loads. */
+static inline void gq_dot_f32_x2(float out[2], const float *a, const float *b0, const float *b1, int64_t n) {
+#if defined(__AVX2__) && defined(__FMA__)
+    __m256 s00 = _mm256_setzero_ps(), s01 = _mm256_setzero_ps();
+    __m256 s10 = _mm256_setzero_ps(), s11 = _mm256_setzero_ps();
+    int64_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m256 w0 = _mm256_loadu_ps(a + i);
+        __m256 w1 = _mm256_loadu_ps(a + i + 8);
+        s00 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(b0 + i), s00);
+        s01 = _mm256_fmadd_ps(w1, _mm256_loadu_ps(b0 + i + 8), s01);
+        s10 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(b1 + i), s10);
+        s11 = _mm256_fmadd_ps(w1, _mm256_loadu_ps(b1 + i + 8), s11);
+    }
+    s00 = _mm256_add_ps(s00, s01);
+    __m128 h0 = _mm_add_ps(_mm256_castps256_ps128(s00), _mm256_extractf128_ps(s00, 1));
+    h0 = _mm_add_ps(h0, _mm_movehl_ps(h0, h0)); h0 = _mm_add_ss(h0, _mm_movehdup_ps(h0));
+    float r0 = _mm_cvtss_f32(h0);
+    s10 = _mm256_add_ps(s10, s11);
+    __m128 h1 = _mm_add_ps(_mm256_castps256_ps128(s10), _mm256_extractf128_ps(s10, 1));
+    h1 = _mm_add_ps(h1, _mm_movehl_ps(h1, h1)); h1 = _mm_add_ss(h1, _mm_movehdup_ps(h1));
+    float r1 = _mm_cvtss_f32(h1);
+    for (; i < n; i++) { float w = a[i]; r0 += w * b0[i]; r1 += w * b1[i]; }
+    out[0] = r0; out[1] = r1;
+#else
+    float r0 = 0.f, r1 = 0.f;
+    for (int64_t i = 0; i < n; i++) { float w = a[i]; r0 += w * b0[i]; r1 += w * b1[i]; }
+    out[0] = r0; out[1] = r1;
+#endif
+}
+
+/* Fused F16 / BF16 weight row dot float activation: identical FMA chains and
+ * reduction tree to gq_dequant_row + gq_dot_f32, without a staging buffer. */
+static inline float gq_dot_f16_f32(const uint8_t *w, const float *b, int64_t n) {
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+    __m256 s0 = _mm256_setzero_ps(), s1 = _mm256_setzero_ps();
+    int64_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m256 w0 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(w + 2 * i)));
+        __m256 w1 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(w + 2 * (i + 8))));
+        s0 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(b + i), s0);
+        s1 = _mm256_fmadd_ps(w1, _mm256_loadu_ps(b + i + 8), s1);
+    }
+    s0 = _mm256_add_ps(s0, s1);
+    __m128 h = _mm_add_ps(_mm256_castps256_ps128(s0), _mm256_extractf128_ps(s0, 1));
+    h = _mm_add_ps(h, _mm_movehl_ps(h, h)); h = _mm_add_ss(h, _mm_movehdup_ps(h));
+    float r = _mm_cvtss_f32(h);
+    if (i < n) {
+        float tail[16];
+        int64_t m = n - i;
+        for (int64_t k = 0; k < m; k++) tail[k] = gq_f16(gq_rd16(w + 2 * (i + k)));
+        for (int64_t k = 0; k < m; k++) r += tail[k] * b[i + k];
+    }
+    return r;
+#else
+    float r = 0.f; for (int64_t i = 0; i < n; i++) r += gq_f16(gq_rd16(w + 2 * i)) * b[i]; return r;
+#endif
+}
+
+static inline float gq_dot_bf16_f32(const uint8_t *w, const float *b, int64_t n) {
+#if defined(__AVX2__) && defined(__FMA__)
+    __m256 s0 = _mm256_setzero_ps(), s1 = _mm256_setzero_ps();
+    int64_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m256 w0 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)(w + 2 * i))), 16));
+        __m256 w1 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)(w + 2 * (i + 8)))), 16));
+        s0 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(b + i), s0);
+        s1 = _mm256_fmadd_ps(w1, _mm256_loadu_ps(b + i + 8), s1);
+    }
+    s0 = _mm256_add_ps(s0, s1);
+    __m128 h = _mm_add_ps(_mm256_castps256_ps128(s0), _mm256_extractf128_ps(s0, 1));
+    h = _mm_add_ps(h, _mm_movehl_ps(h, h)); h = _mm_add_ss(h, _mm_movehdup_ps(h));
+    float r = _mm_cvtss_f32(h);
+    if (i < n) {
+        float tail[16];
+        int64_t m = n - i;
+        for (int64_t k = 0; k < m; k++) tail[k] = gq_bf16(gq_rd16(w + 2 * (i + k)));
+        for (int64_t k = 0; k < m; k++) r += tail[k] * b[i + k];
+    }
+    return r;
+#else
+    float r = 0.f; for (int64_t i = 0; i < n; i++) r += gq_bf16(gq_rd16(w + 2 * i)) * b[i]; return r;
+#endif
+}
+
 /* Returns 0, or -1 for an unsupported type / shape (nothing written). */
 static int gq_matmul_f32(float *y, const float *x, const uint8_t *W, int t, int S, int I, int O) {
     const int64_t rb = gq_row_bytes(t, I);
     if (rb < 0 || (t != GQ_F32 && t != GQ_F16 && t != GQ_BF16 && !gq_blk_decoder(t))) return -1;
+    /* Direct paths without per-thread malloc or staging copies for F32 (all S,
+     * when 4-byte aligned) and single-row F16/BF16 decode. */
+    if (t == GQ_F32 && ((uintptr_t)W & 3u) == 0) {
+        #pragma omp parallel for schedule(static)
+        for (int o = 0; o < O; o++) {
+            const float *wr = (const float *)(W + (int64_t)o * rb);
+            int s = 0;
+            for (; s + 1 < S; s += 2) {
+                float d2[2];
+                gq_dot_f32_x2(d2, wr, x + (int64_t)s * I, x + (int64_t)(s + 1) * I, I);
+                y[(int64_t)s * O + o]       = d2[0];
+                y[(int64_t)(s + 1) * O + o] = d2[1];
+            }
+            if (s < S) y[(int64_t)s * O + o] = gq_dot_f32(wr, x + (int64_t)s * I, I);
+        }
+        return 0;
+    }
+    if (S == 1 && (t == GQ_F16 || t == GQ_BF16)) {
+        if (t == GQ_F16) {
+            #pragma omp parallel for schedule(static)
+            for (int o = 0; o < O; o++) y[o] = gq_dot_f16_f32(W + (int64_t)o * rb, x, I);
+        } else {
+            #pragma omp parallel for schedule(static)
+            for (int o = 0; o < O; o++) y[o] = gq_dot_bf16_f32(W + (int64_t)o * rb, x, I);
+        }
+        return 0;
+    }
     #pragma omp parallel
     {
-        float *row = (float *)malloc((size_t)I * sizeof(float));
+        float stack_row[8192];
+        float *row = I <= 8192 ? stack_row : (float *)malloc((size_t)I * sizeof(float));
         #pragma omp for schedule(static)
         for (int o = 0; o < O; o++) {
             if (!row) continue;
             gq_dequant_row(t, W + (int64_t)o * rb, row, I);
-            for (int s = 0; s < S; s++) y[(int64_t)s * O + o] = gq_dot_f32(row, x + (int64_t)s * I, I);
+            int s = 0;
+            for (; s + 1 < S; s += 2) {
+                float d2[2];
+                gq_dot_f32_x2(d2, row, x + (int64_t)s * I, x + (int64_t)(s + 1) * I, I);
+                y[(int64_t)s * O + o]       = d2[0];
+                y[(int64_t)(s + 1) * O + o] = d2[1];
+            }
+            if (s < S) y[(int64_t)s * O + o] = gq_dot_f32(row, x + (int64_t)s * I, I);
         }
-        free(row);
+        if (I > 8192) free(row);
     }
     return 0;
 }
