@@ -101,7 +101,7 @@ int main(void) {
 #ifdef _OPENMP
     omp_set_num_threads(4);   /* a team of every core fights the loader's thread for them */
 #endif
-    char path[] = "/tmp/qwen36-gguf-hold-XXXXXX";
+    char path[] = "qwen36-gguf-hold-XXXXXX";   /* here: Windows has no /tmp */
     int fd = mkstemp(path); if (fd < 0) { perror("mkstemp"); return 1; }
     close(fd);
     write_gguf(path);
