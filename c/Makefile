@@ -2593,7 +2593,7 @@ tests/test_gq_rows_exact$(EXE): tests/test_gq_rows_exact.c
 tests/test_gq_q2_k$(EXE): tests/test_gq_q2_k.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 # Fused F32/F16/BF16 paths in gq_matmul_f32 and vectorized gq_dequant_row, to the bit
-tests/test_gq_f32_fused$(EXE): tests/test_gq_f32_fused.c ggml_quants.h
+tests/test_gq_f32_fused$(EXE): tests/test_gq_f32_fused.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 # The grid types' and Q2_K's row kernels (AVX-512's on a VNNI build, AVX2's otherwise) against
 # the unpack + gq_dot_i8 path, to the bit, one to eight activation rows
