@@ -865,6 +865,9 @@ Read **only** by `c/mimo.c` (and `MIMO_MAX_IMAGE_TOKENS` by the gateway). See [m
 | `MIMO_STATS` | unset | MiMo: report the vision tower's time per picture. |
 | `COLI_VULKAN` | `0` | MiMo, `VK=1` build: the routed experts on the shared expert tier (`COLI_VK_TIER*`, see [Vulkan](#vulkan-any-gpu-with-a-vulkan-12-driver)) as the release's MXFP4, and the dense matrices of the trunk and of the vision tower on the device where `COLI_VK_DENSE` puts them, in their `MIMO_DENSE_BITS` form (FP8 and BF16, int8 or f32). The router stays on the CPU. MiMo keeps no expert history: the tier fills as experts pass by. |
 | `MIMO_VK_EXPERTS` | unset | MiMo, with `COLI_VULKAN=1`: the switch of the engine's own tier before the shared one, kept as an alias. `0` keeps the routed experts on the CPU (no tier); `N` sizes the shared tier's budget at N experts (`COLI_VK_TIER_GB`, which wins when set); the tier then evicts as the routing moves, where the old one stopped at N and never let go. Unset: the shared tier with its own budget. |
+| `PF_CHUNK` | `8` | qwen36 with a GGUF, a prompt step's routed experts: the cache misses of the next `PF_CHUNK` experts are read from the disk at once, a queue depth of up to `PF_CHUNK` (clamped to [1, 64] and to half a layer's cache, so nothing read ahead is evicted before it is used). A decode step's misses are read at once the same way. The output does not change, only the order the reads are served in. `PAR_LOAD=0` reads them one at a time, as before. |
+| `PF_AHEAD` | on | qwen36 with a GGUF: while a prompt step computes a chunk of experts, the PILOT pool reads the next chunk's misses (`PF_CHUNK`). `0`: off. |
+| `PILOT_THREADS` | `1` | qwen36: the threads of the PILOT prefetch pool, which share its queue (clamped to [1, 16]). |
 
 ## OLMoE engine (`olmoe`)
 
