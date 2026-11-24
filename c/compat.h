@@ -1043,5 +1043,25 @@ static inline double compat_mem_available_gb(void){
     return avail;
 }
 
+/* COLI_LOGIT_DUMP=1: print each step's top-5 id:logit to stderr for backend
+ * exactness and prefix-reuse triage. Shared across all engines. */
+static inline void coli_logit_dump(const float *lo, int V){
+    static int dump = -1;
+    if(dump < 0) dump = getenv("COLI_LOGIT_DUMP") ? 1 : 0;
+    if(!dump) return;
+    int id[5] = {-1, -1, -1, -1, -1};
+    float v[5] = {-3e38f, -3e38f, -3e38f, -3e38f, -3e38f};
+    for(int t = 0; t < V; t++){
+        const float x = lo[t];
+        for(int k = 0; k < 5; k++) if(x > v[k]){
+            for(int j = 4; j > k; j--){ v[j] = v[j - 1]; id[j] = id[j - 1]; }
+            v[k] = x; id[k] = t; break;
+        }
+    }
+    fprintf(stderr, "[LOGITS]");
+    for(int k = 0; k < 5; k++) fprintf(stderr, " %d:%.6f", id[k], v[k]);
+    fprintf(stderr, "\n");
+}
+
 
 #endif /* COMPAT_H */
