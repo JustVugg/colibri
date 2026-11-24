@@ -4296,10 +4296,85 @@ static void gq_matmul_act(float *y, const gq_act *a, const uint8_t *W, int t, in
 static void gq_matmul2_act(float *y1, const uint8_t *W1, int t1, float *y2, const uint8_t *W2, int t2, const gq_act *a, int O) {
     const int I = a->I; const int64_t rb1 = gq_row_bytes(t1, I), rb2 = gq_row_bytes(t2, I);
 #ifdef GQ_R16_ON
+    if (gq_r16_base(t1) >= 0 && gq_r16_base(t2) >= 0) {
+        const int G = O / 16, tail = O % 16;
+        if (a->S > GQ_FUSED_ROWS) {
+            #pragma omp parallel for schedule(dynamic, 1)
+            for (int g = 0; g < 2 * G; g++) {
+                if (g < G) gq_r16_rows(t1, y1 + 16 * g, O, W1 + (int64_t)16 * g * rb1, a, I);
+                else       gq_r16_rows(t2, y2 + 16 * (g - G), O, W2 + (int64_t)16 * (g - G) * rb2, a, I);
+            }
+        } else {
+            #pragma omp parallel for schedule(static)
+            for (int g = 0; g < 2 * G; g++) {
+                if (g < G) gq_r16_rows(t1, y1 + 16 * g, O, W1 + (int64_t)16 * g * rb1, a, I);
+                else       gq_r16_rows(t2, y2 + 16 * (g - G), O, W2 + (int64_t)16 * (g - G) * rb2, a, I);
+            }
+        }
+        if (tail) {
+            float *y16 = (float *)malloc((size_t)a->S * 16 * sizeof(float));
+            if (!y16) abort();
+            gq_r16_rows(t1, y16, 16, W1 + (int64_t)16 * G * rb1, a, I);
+            for (int r = 0; r < a->S; r++) memcpy(y1 + (int64_t)r * O + 16 * G, y16 + 16 * r, (size_t)tail * sizeof(float));
+            gq_r16_rows(t2, y16, 16, W2 + (int64_t)16 * G * rb2, a, I);
+            for (int r = 0; r < a->S; r++) memcpy(y2 + (int64_t)r * O + 16 * G, y16 + 16 * r, (size_t)tail * sizeof(float));
+            free(y16);
+        }
+        return;
+    }
     if (gq_r16_base(t1) >= 0 || gq_r16_base(t2) >= 0) { gq_matmul_act(y1, a, W1, t1, O); gq_matmul_act(y2, a, W2, t2, O); return; }
 #endif
+#ifdef GQ_TILE16_BIAS
+    if (a->S >= GQ_TILE16_MIN_S && O >= 16) {
+        const int ok1 = gq_tile16_ok(t1, I), ok2 = gq_tile16_ok(t2, I);
+        if (ok1 && ok2) {
+            const int G = O / 16;
+            #pragma omp parallel
+            {
+                uint8_t *tile = (uint8_t *)malloc(gq_tile16_bytes(I));
+                int8_t *w8 = (int8_t *)malloc((size_t)I);
+                float *sw = (float *)malloc((size_t)(I / 16) * 2 * sizeof(float)), *mw = sw ? sw + I / 16 : NULL;
+                if (!tile || !w8 || !sw) abort();
+                #pragma omp for schedule(dynamic, 1)
+                for (int g = 0; g < 2 * G; g++) {
+                    if (g < G) {
+                        gq_tile16_pack(tile, W1 + (int64_t)16 * g * rb1, rb1, t1, I, w8, sw, mw);
+                        gq_tile16_rows(y1 + 16 * g, O, tile, a, I);
+                    } else {
+                        int g2 = g - G;
+                        gq_tile16_pack(tile, W2 + (int64_t)16 * g2 * rb2, rb2, t2, I, w8, sw, mw);
+                        gq_tile16_rows(y2 + 16 * g2, O, tile, a, I);
+                    }
+                }
+                free(tile); free(w8); free(sw);
+            }
+            for (int o = 16 * G; o < O; o++) {
+                gq_row_all(y1 + o, O, a, W1 + (int64_t)o * rb1, t1, I);
+                gq_row_all(y2 + o, O, a, W2 + (int64_t)o * rb2, t2, I);
+            }
+            return;
+        }
+        if (ok1 || ok2) { gq_matmul_act(y1, a, W1, t1, O); gq_matmul_act(y2, a, W2, t2, O); return; }
+    }
+#endif
 #ifdef GQ_F8_ON
-    if (a->S > GQ_EXACT_ROWS && (gq_f8_ok(t1, I) || gq_f8_ok(t2, I))) { gq_matmul_act(y1, a, W1, t1, O); gq_matmul_act(y2, a, W2, t2, O); return; }
+    if (a->S > GQ_EXACT_ROWS) {
+        const int ok1 = gq_f8_ok(t1, I), ok2 = gq_f8_ok(t2, I);
+        if (ok1 && ok2) {
+            const int G8 = O / 8;
+            #pragma omp parallel for schedule(dynamic, 1)
+            for (int g = 0; g < 2 * G8; g++) {
+                if (g < G8) gq_rows_f8(y1 + 8 * g, O, a, W1 + (int64_t)8 * g * rb1, rb1, t1, I, 8);
+                else        gq_rows_f8(y2 + 8 * (g - G8), O, a, W2 + (int64_t)8 * (g - G8) * rb2, rb2, t2, I, 8);
+            }
+            for (int o = 8 * G8; o < O; o++) {
+                gq_row_all(y1 + o, O, a, W1 + (int64_t)o * rb1, t1, I);
+                gq_row_all(y2 + o, O, a, W2 + (int64_t)o * rb2, t2, I);
+            }
+            return;
+        }
+        if (ok1 || ok2) { gq_matmul_act(y1, a, W1, t1, O); gq_matmul_act(y2, a, W2, t2, O); return; }
+    }
 #endif
     #pragma omp parallel for schedule(static)
     for (int r = 0; r < 2 * O; r++) {
