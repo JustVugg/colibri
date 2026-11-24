@@ -8,6 +8,10 @@
  *    counts, prompt rows batched or not;
  *  - unset, and a mask that allows every expert: the same logits to the bit and the same
  *    history, both passing the oracle;
+ *  - the soft variants (Q38_EXPERT_MASK_FROM_RANK / _TAU): q38_mask_pick's picks and
+ *    counters on a made-up row; on the engine, FROM_RANK=top-k and a tiny TAU give the
+ *    unset run's bits, TAU near 1 keeps the history inside the mask (CPU and chain), bad
+ *    values stop it;
  *  - malformed masks stop the engine;
  *  - on the fake tier only allowed experts reach VRAM, each misses at most once (its first
  *    route) and none routes outside the mask; with room for fewer, the rest miss as usual;
@@ -127,6 +131,7 @@ int main(int argc, char **argv) {
            batch ? "Q38_PREFILL_BATCH=1: every pick inside the mask (the run's history)"
                  : "Q38_PREFILL_BATCH=0: every pick inside the mask (the run's history)");
         tk(g_q38_mask_outside == 0, "no route outside the mask counted");
+        tk(g_q38_mask_routed == 2ULL * rows && g_q38_mask_replaced == 0, "every pick counted as routed, none replaced");
     }
     unsetenv("Q38_PREFILL_BATCH");
     remove(FX "/mask_hist.txt");
@@ -143,6 +148,72 @@ int main(int argc, char **argv) {
     long s0 = fx_slurp(FX "/mask_hist0.txt", t0, sizeof t0), s1 = fx_slurp(FX "/mask_hist1.txt", t1, sizeof t1);
     tk(s0 > 0 && s0 == s1 && !memcmp(t0, t1, (size_t)s0), "allow-all: the same picks (the run's history, byte for byte)");
     remove(FX "/mask_hist0.txt"); remove(FX "/mask_hist1.txt"); remove(FX "/mask_all.txt");
+
+    printf(" soft variants: q38_mask_pick on a made-up router row (6 experts, top-3, 2 3 4 allowed)\n");
+    {
+        static const uint8_t al[6] = {0, 0, 1, 1, 1, 0};
+        static const float p[6] = {.30f, .25f, .05f, .20f, .10f, .10f};   /* sums to 1: `all` */
+        struct { int from; double tau; int norm; int want[3]; unsigned long long out, rep; const char *what; } cs[] = {
+            {0, 0, 1, {3, 4, 2}, 0, 0, "hard: the allowed top-3"},
+            {1, 0, 1, {0, 3, 4}, 1, 0, "FROM_RANK=1: rank 0 over every expert, then the best allowed"},
+            {2, 0, 1, {0, 1, 3}, 2, 0, "FROM_RANK=2"},
+            {3, 0, 1, {0, 1, 3}, 2, 0, "FROM_RANK=3 (the top-k): the unmasked top-3"},
+            {3, .35, 1, {0, 4, 3}, 1, 1, "TAU=0.35, norm_topk: gate .333 gives its slot to 4, gate .40 stays"},
+            {3, .28, 0, {0, 4, 3}, 1, 1, "TAU=0.28, softmax gates: .25 replaced, .30 stays"},
+            {3, .05, 1, {0, 1, 3}, 2, 0, "TAU=0.05: every outside gate above it, none replaced"},
+            {1, .9, 1, {2, 3, 4}, 0, 1, "FROM_RANK=1 and TAU=0.9: rank 0's gate .50 replaced by 2"},
+        };
+        for (size_t i = 0; i < sizeof cs / sizeof *cs; i++) {
+            int idx[3]; float val[3];
+            g_q38_mask_from = cs[i].from; g_q38_mask_tau = cs[i].tau;
+            g_q38_mask_routed = g_q38_mask_outside = g_q38_mask_replaced = 0;
+            q38_mask_pick(al, p, 6, 3, 0, cs[i].norm, 1.0, idx, val);
+            int ok = g_q38_mask_routed == 3 && g_q38_mask_outside == cs[i].out && g_q38_mask_replaced == cs[i].rep;
+            for (int z = 0; z < 3; z++) ok &= idx[z] == cs[i].want[z] && val[z] == p[idx[z]];
+            tk(ok, cs[i].what);
+        }
+        int idx[3]; float val[3];
+        g_q38_mask_routed = 0;
+        q38_mask_pick(NULL, p, 6, 3, 0, 1, 1.0, idx, val);
+        tk(idx[0] == 0 && idx[1] == 1 && idx[2] == 3 && g_q38_mask_routed == 0, "an unmasked layer: the plain top-3, not counted");
+        g_q38_mask_from = 0; g_q38_mask_tau = 0;
+    }
+
+    printf(" soft variants on the engine (tool mask, CPU)\n");
+    struct { const char *rank, *tau; int same; const char *what; } sa[] = {
+        {"2", NULL, 1, "FROM_RANK=2 (the top-k): the unset run's last logits to the bit"},
+        {NULL, "0.000000001", 1, "TAU=1e-9: nothing replaced, the unset run's last logits to the bit"},
+        {NULL, "0.999999", 0, "TAU=0.999999: every outside pick replaced, the history inside the mask"},
+        {"1", NULL, 0, "FROM_RANK=1: at most rank 0 outside the mask, nothing replaced"},
+    };
+    for (int i = 0; i < 4; i++) {
+        if (sa[i].rank) setenv("Q38_EXPERT_MASK_FROM_RANK", sa[i].rank, 1);
+        if (sa[i].tau) setenv("Q38_EXPERT_MASK_TAU", sa[i].tau, 1);
+        fx_run(tool_mask, NULL, sa[i].same ? NULL : FX "/mask_hist.txt", l1, &n1);
+        unsetenv("Q38_EXPERT_MASK_FROM_RANK"); unsetenv("Q38_EXPERT_MASK_TAU");
+        printf("  routed %llu, outside %llu, replaced %llu\n", g_q38_mask_routed, g_q38_mask_outside, g_q38_mask_replaced);
+        if (sa[i].same)
+            tk(n1 == n0 && !memcmp(l0, l1, (size_t)n0 * sizeof(float)) && g_q38_mask_routed > 0 && g_q38_mask_replaced == 0, sa[i].what);
+        else if (i == 2)
+            tk(g_q38_mask_replaced > 0 && g_q38_mask_outside == 0 && fx_history_obeys(FX "/mask_hist.txt", &picks)
+               && picks == (long)g_q38_mask_routed, sa[i].what);
+        else
+            tk(g_q38_mask_replaced == 0 && g_q38_mask_routed > 0 && 2 * g_q38_mask_outside <= g_q38_mask_routed, sa[i].what);
+        remove(FX "/mask_hist.txt");
+    }
+    setenv("Q38_EXPERT_MASK_FROM_RANK", "1", 1);
+    fx_run(NULL, NULL, NULL, l1, &n1);
+    unsetenv("Q38_EXPERT_MASK_FROM_RANK");
+    tk(g_q38_mask == NULL && n1 == n0 && !memcmp(l0, l1, (size_t)n0 * sizeof(float)), "FROM_RANK without a mask: ignored, the unset run's bits");
+    const char *bad_env[][2] = {{"Q38_EXPERT_MASK_FROM_RANK", "0"}, {"Q38_EXPERT_MASK_FROM_RANK", "3"},
+                                {"Q38_EXPERT_MASK_FROM_RANK", "1x"}, {"Q38_EXPERT_MASK_TAU", "0"},
+                                {"Q38_EXPERT_MASK_TAU", "1"}, {"Q38_EXPERT_MASK_TAU", "abc"}};
+    for (int i = 0; i < 6; i++) {
+        setenv(bad_env[i][0], bad_env[i][1], 1);
+        char what[96]; snprintf(what, sizeof what, "refused: %s=%s", bad_env[i][0], bad_env[i][1]);
+        tk(fx_run(tool_mask, NULL, NULL, l2, &n2) != 0 && n2 == 0, what);
+        unsetenv(bad_env[i][0]);
+    }
 
     printf(" malformed masks stop the engine\n");
     const char *bad[] = { "0 1\n", "0 1 1\n", "0 1 9\n", "7 0 1\n", "0 0 1\n0 2 3\n", "0 0 x\n", "layer 0 1\n" };
@@ -206,6 +277,14 @@ int main(int argc, char **argv) {
     tk(fake_chain_frames > 8, "the forwards ran through the chain's frames");
     tk(fx_history_obeys(FX "/mask_hist.txt", &picks), "every pick inside the mask (the run's history)");
     tk(g_q38_mask_outside == 0 && chits > 0 && G.miss <= 8, "no route outside the mask, routed experts hit VRAM, each allowed one missed at most once");
+    qt_shutdown(); remove(FX "/mask_hist.txt");
+    /* a soft variant: the chain's device route knows the hard mask only, so the host routes */
+    setenv("Q38_EXPERT_MASK_TAU", "0.999999", 1);
+    fake_chain_frames = 0;
+    fx_run(tool_mask, NULL, FX "/mask_hist.txt", l2, &n2);
+    unsetenv("Q38_EXPERT_MASK_TAU");
+    tk(fake_chain_frames > 8 && g_q38_mask_replaced > 0 && g_q38_mask_outside == 0 && fx_history_obeys(FX "/mask_hist.txt", &picks),
+       "chain, TAU=0.999999: every outside pick replaced, the history inside the mask");
     qt_shutdown(); remove(FX "/mask_hist.txt");
     fake_chain_frames = 0;
     fx_run(NULL, NULL, NULL, l0, &n0); qt_shutdown();

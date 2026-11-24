@@ -4616,26 +4616,99 @@ static void q38_expert_row(Model *m,int layer,int eid,const float *xs,float *eg,
  *     <layer> <expert> <expert> ...
  * A layer without a line, and the MTP head's layer, keeps all of its experts. A listed
  * layer needs at least num_experts_per_tok distinct ids, each listed once.
- * tools/q38_expert_mask.py builds one from the .coli_usage history. */
+ * tools/q38_expert_mask.py builds one from the .coli_usage history.
+ * Two soft variants (default off; both may be set, then FROM_RANK picks and TAU replaces):
+ *   Q38_EXPERT_MASK_FROM_RANK=r (1..top-k): ranks 0..r-1 come from every expert as without
+ *     the mask (they may miss VRAM), ranks r.. from the allowed experts not yet picked;
+ *   Q38_EXPERT_MASK_TAU=t (0<t<1): the normal top-k, then every pick outside the mask whose
+ *     gate (as the model normalises it) is below t gives its slot to the best allowed expert
+ *     not yet picked; a pick at or above t stays and may miss.
+ * Soft gates: the model's softmax over the ORIGINAL logits (no -inf), then the model's own
+ * normalisation over the k experts finally picked (norm_topk_prob: their sum; else the
+ * softmax over every expert), so the gates of a soft route sum to 1 as the model's do.
+ * Under a soft variant the CUDA chain routes on the host (its device route knows the hard
+ * mask only). The counters (exit report, per-request [mask] line) say how many routed picks
+ * of masked layers fell outside the mask and how many TAU replaced. */
 static uint8_t *g_q38_mask;                    /* layers x experts, 1 = allowed; NULL = off */
 static int g_q38_mask_layers,g_q38_mask_experts;
-static unsigned long long g_q38_mask_outside;  /* routes outside the list: rt_router_pick's NaN fallback only */
+static unsigned long long g_q38_mask_outside;  /* picks outside the list: hard mask, rt_router_pick's NaN fallback only */
+static unsigned long long g_q38_mask_routed,g_q38_mask_replaced;   /* picks in masked layers; TAU's replacements */
+static int g_q38_mask_from;     /* 0 hard mask; FROM_RANK r: ranks >= r restricted; topk: TAU alone (no rank restricted) */
+static double g_q38_mask_tau;   /* 0 off */
 /* the layer's allow row, NULL when the layer routes over every expert */
 static const uint8_t *q38_mask_row(int layer) {
     if(!g_q38_mask||layer<0||layer>=g_q38_mask_layers)return NULL;
     return g_q38_mask+(size_t)layer*g_q38_mask_experts;
 }
-static void q38_mask_logits(const uint8_t *allow,float *logits,int E) {
-    if(allow)for(int e=0;e<E;e++)if(!allow[e])logits[e]=-INFINITY;
+static void q38_mask_logits(const uint8_t *allow,float *logits,int E) {   /* the hard mask only */
+    if(allow&&!g_q38_mask_from)for(int e=0;e<E;e++)if(!allow[e])logits[e]=-INFINITY;
 }
-static void q38_mask_count(const uint8_t *allow,const int *idx,int K) {
-    if(allow)for(int z=0;z<K;z++)if(!allow[idx[z]])__atomic_fetch_add(&g_q38_mask_outside,1ULL,__ATOMIC_RELAXED);
+/* The router's top-k of p (the softmax's exp terms, `all` their sum): strict >, the lower id
+ * on a tie, rt_router_pick's fallback; ranks >= g_q38_mask_from skip experts outside allow
+ * (allow NULL: none skipped, the plain top-k), then TAU's replacements and the counters.
+ * val[z] = p[idx[z]]. */
+static void q38_mask_pick(const uint8_t *allow,const float *p,int E,int K,int layer,int norm_topk,double all,
+                          int *idx,float *val) {
+    for(int z=0;z<K;z++){
+        int best=-1;float bv=-1.f;
+        for(int e=0;e<E;e++){
+            int used=allow&&z>=g_q38_mask_from&&!allow[e];
+            for(int j=0;j<z;j++)if(idx[j]==e){used=1;break;}
+            if(!used&&p[e]>bv){bv=p[e];best=e;}
+        }
+        idx[z]=rt_router_pick(best,z,E,layer);val[z]=p[idx[z]];
+    }
+    if(!allow)return;
+    unsigned long long out=0,rep=0;
+    if(g_q38_mask_tau>0){
+        double den=all;   /* the gates as the model normalises the original top-k */
+        if(norm_topk){den=0;for(int z=0;z<K;z++)den+=val[z];}
+        for(int z=0;z<K;z++){
+            if(allow[idx[z]]||!(val[z]<g_q38_mask_tau*den))continue;
+            int best=-1;float bv=-1.f;
+            for(int e=0;e<E;e++){
+                int used=!allow[e];
+                for(int j=0;j<K;j++)if(idx[j]==e){used=1;break;}
+                if(!used&&p[e]>bv){bv=p[e];best=e;}
+            }
+            if(best<0)continue;   /* every allowed expert already picked: the pick stays */
+            idx[z]=best;val[z]=p[best];rep++;
+        }
+    }
+    for(int z=0;z<K;z++)out+=!allow[idx[z]];
+    __atomic_fetch_add(&g_q38_mask_routed,(unsigned long long)K,__ATOMIC_RELAXED);
+    if(out)__atomic_fetch_add(&g_q38_mask_outside,out,__ATOMIC_RELAXED);
+    if(rep)__atomic_fetch_add(&g_q38_mask_replaced,rep,__ATOMIC_RELAXED);
+}
+/* routed picks of masked layers, outside the mask, replaced by TAU (the per-request line) */
+static void q38_mask_snap(unsigned long long s[3]) {
+    s[0]=__atomic_load_n(&g_q38_mask_routed,__ATOMIC_RELAXED);
+    s[1]=__atomic_load_n(&g_q38_mask_outside,__ATOMIC_RELAXED);
+    s[2]=__atomic_load_n(&g_q38_mask_replaced,__ATOMIC_RELAXED);
 }
 /* Reads Q38_EXPERT_MASK (unset: off). Returns 0 on a bad file (the engine stops). */
 static int q38_mask_load(const Cfg *c) {
     free(g_q38_mask);g_q38_mask=NULL;g_q38_mask_outside=0;qt_plan_allow(NULL);
+    g_q38_mask_routed=g_q38_mask_replaced=0;g_q38_mask_from=0;g_q38_mask_tau=0;
     const char *path=getenv("Q38_EXPERT_MASK");
-    if(!path||!*path)return 1;
+    const char *rs=getenv("Q38_EXPERT_MASK_FROM_RANK"),*ts=getenv("Q38_EXPERT_MASK_TAU");
+    if(rs&&!*rs)rs=NULL;
+    if(ts&&!*ts)ts=NULL;
+    if(!path||!*path){
+        if(rs||ts)fprintf(stderr,"[mask] Q38_EXPERT_MASK_FROM_RANK / _TAU ignored: no Q38_EXPERT_MASK\n");
+        return 1;
+    }
+    if(rs){
+        char *end;long r=strtol(rs,&end,10);
+        if(*end||r<1||r>c->topk){fprintf(stderr,"[mask] Q38_EXPERT_MASK_FROM_RANK=%s refused (1..%d)\n",rs,c->topk);return 0;}
+        g_q38_mask_from=(int)r;
+    }
+    if(ts){
+        char *end;double t=strtod(ts,&end);
+        if(*end||!(t>0&&t<1)){fprintf(stderr,"[mask] Q38_EXPERT_MASK_TAU=%s refused (0 < t < 1)\n",ts);return 0;}
+        g_q38_mask_tau=t;
+        if(!g_q38_mask_from)g_q38_mask_from=c->topk;   /* TAU alone: the normal top-k first */
+    }
     int L=c->layers,E=c->experts,ok=1,listed=0,lineno=0;
     FILE *f=fopen(path,"r");
     if(!f){fprintf(stderr,"[mask] Q38_EXPERT_MASK: cannot open %s\n",path);return 0;}
@@ -4676,6 +4749,8 @@ static int q38_mask_load(const Cfg *c) {
     qt_plan_allow(mask);
     fprintf(stderr,"[mask] Q38_EXPERT_MASK=%s: %d of %d layers masked (%d-%d of %d experts allowed), %lld routed experts allowed in all\n",
             path,listed,L,listed?lo:E,listed?hi:E,E,allowed);
+    if(g_q38_mask_from)fprintf(stderr,"[mask] soft: ranks 0-%d over every expert%s, TAU %s (picks outside the mask may miss VRAM; the routes on the host)\n",
+                               g_q38_mask_from-1,g_q38_mask_from<c->topk?", the rest allowed only":"",ts?ts:"off");
     /* saved, a masked run's picks would teach the history (the masks' and the placer's source) its own mask */
     if(!getenv("USAGE_SAVE")){setenv("USAGE_SAVE","0",1);fprintf(stderr,"[mask] the routing history stays as it was (USAGE_SAVE=1 saves it)\n");}
     return 1;
@@ -4687,16 +4762,18 @@ static void q38_mask_tier_report(const Cfg *c) {
     for(int l=0;l<c->layers;l++)for(int e=0;e<c->experts;e++)
         if(g_q38_mask[(size_t)l*c->experts+e]){allowed++;resident+=qt_is_resident(l,e);}
     fprintf(stderr,"[mask] VRAM: %lld of %lld allowed experts resident at start: %s\n",resident,allowed,
-            resident==allowed?"all of them, no routed expert can miss":
+            resident==allowed?(g_q38_mask_from?"all of them, only the soft variant's picks outside the mask can miss":
+                                               "all of them, no routed expert can miss"):
             "the rest reach VRAM at their first route while the tier's budget lasts (none outside the mask is planned)");
 }
-/* At exit: routes outside the list (must be 0) and the tier's misses (0 when all fit). */
+/* At exit: routes outside the list (0 with the hard mask), TAU's replacements, the tier's misses. */
 static void q38_mask_report(void) {
     if(!g_q38_mask)return;
     QtCounters q;int on=qt_counters(&q);
-    if(on)fprintf(stderr,"[mask] routes outside the mask: %llu; VRAM tier hits %llu, misses %llu\n",
-                  g_q38_mask_outside,(unsigned long long)q.hits,(unsigned long long)q.miss);
-    else fprintf(stderr,"[mask] routes outside the mask: %llu (no VRAM tier)\n",g_q38_mask_outside);
+    char tier[96]="(no VRAM tier)";
+    if(on)snprintf(tier,sizeof tier,"VRAM tier hits %llu, misses %llu",(unsigned long long)q.hits,(unsigned long long)q.miss);
+    fprintf(stderr,"[mask] routes outside the mask: %llu of %llu routed (%.2f %%), replaced %llu; %s\n",g_q38_mask_outside,
+            g_q38_mask_routed,g_q38_mask_routed?100.0*g_q38_mask_outside/g_q38_mask_routed:0.0,g_q38_mask_replaced,tier);
 }
 
 /* ---- decode rows grouped by expert --------------------------------------------
@@ -4890,8 +4967,7 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
         float mx=lg[0];for(int e=1;e<E;e++)if(lg[e]>mx)mx=lg[e];
         double all=0;for(int e=0;e<E;e++){lg[e]=expf(lg[e]-mx);all+=lg[e];}
         int *ix=idx+(int64_t)s*K;float val[Q38_MAX_TOPK];
-        for(int z=0;z<K;z++){int best=-1;float bv=-1.f;for(int e=0;e<E;e++){int used=allow&&!allow[e];for(int j=0;j<z;j++)if(ix[j]==e)used=1;if(!used&&lg[e]>bv){bv=lg[e];best=e;}}ix[z]=rt_router_pick(best,z,E,layer);val[z]=lg[ix[z]];}
-        q38_mask_count(allow,ix,K);
+        q38_mask_pick(allow,lg,E,K,layer,c->norm_topk,all,ix,val);
         double top=0;for(int z=0;z<K;z++)top+=val[z];double den=c->norm_topk?top:all;
         for(int z=0;z<K;z++)gates[s*K+z]=(float)(val[z]/den);
         rt_route(layer,row0+s,ix,gates+(int64_t)s*K,K);
@@ -5077,8 +5153,7 @@ static void q38_moe_decode_ex(Model *m,Layer *l,int layer,const float *x,int S,f
         float mx=logits[0];for(int e=1;e<E;e++)if(logits[e]>mx)mx=logits[e];
         double all=0;for(int e=0;e<E;e++){logits[e]=expf(logits[e]-mx);all+=logits[e];}
         int idx[Q38_MAX_TOPK];float val[Q38_MAX_TOPK];
-        for(int z=0;z<K;z++){int best=-1;float bv=-1.f;for(int e=0;e<E;e++){int used=allow&&!allow[e];for(int j=0;j<z;j++)if(idx[j]==e)used=1;if(!used&&logits[e]>bv){bv=logits[e];best=e;}}idx[z]=rt_router_pick(best,z,E,layer);val[z]=logits[idx[z]];}
-        q38_mask_count(allow,idx,K);
+        q38_mask_pick(allow,logits,E,K,layer,c->norm_topk,all,idx,val);
         double top=0;for(int z=0;z<K;z++)top+=val[z];double den=c->norm_topk?top:all;
         float route_gates[Q38_MAX_TOPK];
         for(int z=0;z<K;z++) route_gates[z]=(float)(val[z]/den);
@@ -5267,20 +5342,7 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
             }
             int selected[Q38_MAX_TOPK];
             float selected_probability[Q38_MAX_TOPK];
-            for(int rank=0;rank<K;rank++) {
-                int best=-1;float best_value=-1.f;
-                for(int e=0;e<E;e++) {
-                    int used=allow&&!allow[e];
-                    for(int previous=0;previous<rank;previous++)
-                        if(selected[previous]==e){used=1;break;}
-                    if(!used&&probabilities[e]>best_value){
-                        best_value=probabilities[e];best=e;
-                    }
-                }
-                selected[rank]=rt_router_pick(best,rank,E,layer);
-                selected_probability[rank]=probabilities[selected[rank]];
-            }
-            q38_mask_count(allow,selected,K);
+            q38_mask_pick(allow,probabilities,E,K,layer,c->norm_topk,total,selected,selected_probability);
             double top=0.0;
             for(int rank=0;rank<K;rank++)top+=selected_probability[rank];
             double denominator=c->norm_topk?top:total;
