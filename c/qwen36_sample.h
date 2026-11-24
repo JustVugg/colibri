@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "argmax_first.h"
+#include "compat.h"       /* coli_logit_dump (#3059) */
 
 /* temperature + top-p sampler. The probabilities and their sum are taken as
  * before, one pass over the vocabulary; the nucleus is then found without

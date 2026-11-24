@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "tok.h"
+#include "compat.h"       /* coli_logit_dump (#3059) */
 
 /* ---- RNG (xorshift64*) -------------------------------------------------- */
 static uint64_t g_rng = 0x9E3779B97F4A7C15ULL;
