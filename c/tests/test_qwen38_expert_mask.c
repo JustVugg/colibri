@@ -54,7 +54,7 @@ static void fx_write(const char *path, const char *text) {
 /* one run: rc, last logits (n); trace: ROUTE_TRACE (the process's first run only: the
  * engine opens the stream once); history: the run's routing counts (COLI_USAGE) */
 static int fx_run(const char *mask, const char *trace, const char *history, float *logits, int *n) {
-    char *argv[] = { (char *)"qwen38", (char *)"4", (char *)"8", (char *)FX "/ref.json" };
+    char *argv[] = { (char *)"qwen38", (char *)"4", (char *)"8", (char *)FX "/ref.json", NULL };
     if (mask) setenv("Q38_EXPERT_MASK", mask, 1); else unsetenv("Q38_EXPERT_MASK");
     if (trace) setenv("ROUTE_TRACE", trace, 1);
     if (history) { remove(history); setenv("COLI_USAGE", history, 1); setenv("USAGE_SAVE", "1", 1); }
@@ -101,6 +101,9 @@ int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s <mask from tools/q38_expert_mask.py>\n", argv[0]); return 2; }
     const char *tool_mask = argv[1];
     setenv("SNAP", FX, 1);
+    /* the engine's main would re-exec this process once for the OpenMP hot team (omp_tune.h,
+     * Linux, CUDA off): the test's own argv would come back as the engine's */
+    setenv("COLI_NO_OMP_TUNE", "1", 1);
     setenv("OMP_NUM_THREADS", "2", 1);
     setenv("NOSTREAM", "1", 1);
     setenv("USAGE_SAVE", "0", 1);
