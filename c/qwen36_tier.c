@@ -1991,6 +1991,15 @@ int qt_is_resident(int layer,int eid){
     return r;
 }
 
+/* out[e] = 1 for every expert of `layer` resident now, under one lock; 0 = no tier for this layer */
+int qt_resident_row(int layer,uint8_t *out){
+    if(!G.on || layer<0 || layer>=G.nl) return 0;
+    pthread_mutex_lock(&G.mx);
+    for(int e=0;e<G.ne;e++) out[e]=(uint8_t)(qs(layer,e)->resident!=0);
+    pthread_mutex_unlock(&G.mx);
+    return 1;
+}
+
 /* internal, G.mx held: enqueue one upload. victim=-1: plain upload (budget is
  * reserved here); victim>=0: LFRU swap (budget neutral). */
 static int enqueue_locked(int layer,int eid,int v_layer,int v_eid,int reserved){

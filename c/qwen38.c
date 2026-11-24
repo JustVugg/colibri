@@ -2040,13 +2040,15 @@ typedef struct {
 } Q38ReqClock;
 
 /* Q38_EXPERT_MASK: a request's routed picks of masked layers, those outside the mask (they miss
- * when every allowed expert is resident) and TAU's replacements, prefill and decode */
+ * when every allowed expert is resident) and TAU's replacements, prefill and decode;
+ * Q38_ROUTE_TAU: the picks VRAM did not hold and it kept, and those it replaced */
 static void q38_mask_request(const Q38ReqClock *clk,const char *id){
-    if(!g_q38_mask)return;
+    if(!g_q38_mask&&!(g_q38_route_tau>0))return;
     unsigned long long now[3];q38_mask_snap(now);
     const unsigned long long *b=clk->mask,*p=clk->prefill_mask;
-    fprintf(stderr,"[mask] request %s: routed prefill %llu, decode %llu | outside the mask prefill %llu, decode %llu | "
-            "replaced prefill %llu, decode %llu\n",id,p[0]-b[0],now[0]-p[0],p[1]-b[1],now[1]-p[1],p[2]-b[2],now[2]-p[2]);
+    fprintf(stderr,"%s request %s: routed prefill %llu, decode %llu | %s prefill %llu, decode %llu | "
+            "replaced prefill %llu, decode %llu\n",g_q38_mask?"[mask]":"[route-tau]",id,p[0]-b[0],now[0]-p[0],
+            g_q38_mask?"outside the mask":"not in VRAM, kept",p[1]-b[1],now[1]-p[1],p[2]-b[2],now[2]-p[2]);
 }
 
 static QtCounters q38_qt_delta(const QtCounters *after,const QtCounters *before){
@@ -2571,6 +2573,9 @@ static int q38_psd_on(Model *m){
         if(g_q38_mask)h=q38_psd_fnv(h,g_q38_mask,(size_t)g_q38_mask_layers*g_q38_mask_experts);
         if(g_q38_mask&&g_q38_mask_from){   /* a soft variant routes differently again */
             h=q38_psd_fnv(h,&g_q38_mask_from,sizeof g_q38_mask_from);h=q38_psd_fnv(h,&g_q38_mask_tau,sizeof g_q38_mask_tau);
+        }
+        if(g_q38_route_tau>0){   /* Q38_ROUTE_TAU routes differently too; unset adds nothing */
+            h=q38_psd_fnv(h,"route-tau",10);h=q38_psd_fnv(h,&g_q38_route_tau,sizeof g_q38_route_tau);
         }
         g_q38_psd_id=h;
     }
@@ -3828,7 +3833,7 @@ int main(int argc, char **argv) {
     }
     /* Q38_EXPERT_MASK: route among a per-layer allow-list only (qwen38_core.h), before the
      * tier starts so its warm start plans the allowed experts and nothing else */
-    if (!q38_mask_load(&m.c)) { q38_model_free(&m); free_tokenizer(); return 1; }
+    if (!q38_mask_load(&m.c) || !q38_route_tau_load(&m.c)) { q38_model_free(&m); free_tokenizer(); return 1; }
     q38_tier_start(&m, cap);   /* COLI_CUDA=1: hot experts stream to VRAM (qwen36_tier.c) */
     if (g_q38_mux_slots>1 && m.dn_dev) {
         m.dn_dev=0;

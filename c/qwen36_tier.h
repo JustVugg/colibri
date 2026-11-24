@@ -195,6 +195,8 @@ int  qt_vision_attention(float *out, const float *qkv, int n, int heads, int D, 
 int  qt_streaming(void);   /* copy mode: no pointer into the engine's slots is kept */
 int  qt_experts_on(void);  /* some device has room for experts (not trunk-only) */
 int  qt_is_resident(int layer, int eid);
+/* A layer's residency in one call: out[e] = 1 per resident expert (n_experts bytes); 0 = no tier for it. */
+int  qt_resident_row(int layer, uint8_t *out);
 void qt_shutdown(void);
 
 /* Call for each routed expert the CPU computes (pointers to the RAM slot:
@@ -422,6 +424,7 @@ static inline int  qt_streaming(void){return 0;}
 static inline int  qt_experts_on(void){return 0;}
 static inline void qt_source_planar(int a){(void)a;}
 static inline int  qt_is_resident(int a,int b){(void)a;(void)b;return 0;}
+static inline int  qt_resident_row(int a,uint8_t *b){(void)a;(void)b;return 0;}
 static inline void qt_shutdown(void){}
 static inline void qt_note(int a,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;}
 static inline uint32_t qt_issue(int a,const int*b,int c,const float*d){(void)a;(void)b;(void)c;(void)d;return 0;}

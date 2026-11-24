@@ -1870,7 +1870,7 @@ static int q38cc_dm_able(Q38CChain *ch, Model *m) {
     const char *g = getenv("Q38_MOE_GROUPED");
     if (!q38cc_dm_wanted() || !cc_moe_ready() || E <= 0 || E > CC_ROUTE_EMAX || K < 1 || K > 32 || rt_fp ||
         g_q38_act || g_q38_dump || g_q38_cov || (g && g[0] == '0') || !qt_experts_on() || qt_chain_devices() != 1 ||
-        (g_q38_mask && g_q38_mask_from)) return 0;   /* Q38_EXPERT_MASK's soft variants route on the host (q38_mask_pick) */
+        (g_q38_mask && g_q38_mask_from) || g_q38_route_tau > 0) return 0;   /* Q38_EXPERT_MASK's soft variants, Q38_ROUTE_TAU: the host routes (q38_mask_pick) */
     if (c->hidden % 32 || c->inter % 32 || c->hidden > CC_MOE_DIM_MAX || c->inter > CC_MOE_DIM_MAX) return 0;
     if (!qt_chain_format(&ch->dm_fmt, &ch->dm_gs) || (ch->dm_fmt == 4 && (ch->dm_gs < 16 || ch->dm_gs % 16))) return 0;
     /* the host's share of a step takes its distinct experts in waves of the RAM cache's slots

@@ -262,6 +262,35 @@ int main(int argc, char **argv) {
         }
         qt_shutdown();
     }
+    /* Q38_ROUTE_TAU=t (NOT exact, default off), on the same tier with room for 6 of the 16 experts
+     * and no mask: unset and 0 are the same run to the bit; a high t (top-2 gates sum to 1, so
+     * nearly every non-resident pick qualifies) replaces picks by residents and leaves the tier
+     * fewer misses; with a mask, or outside [0, 1), the engine stops */
+    printf(" Q38_ROUTE_TAU on the fake tier (room for 6 of 16 experts)\n");
+    {
+        static const char *val[3] = { NULL, "0", "0.999" };
+        float lt[3][256]; int nt[3], rct[3]; unsigned long long rep[3], routed[3], kept[3], miss[3];
+        for (int a = 0; a < 3; a++) {
+            if (val[a]) setenv("Q38_ROUTE_TAU", val[a], 1); else unsetenv("Q38_ROUTE_TAU");
+            fake_ndev = 1;
+            rct[a] = fx_run(NULL, NULL, NULL, lt[a], &nt[a]);
+            rep[a] = g_q38_mask_replaced; routed[a] = g_q38_mask_routed; kept[a] = g_q38_mask_outside; miss[a] = G.miss;
+            tk(a == 2 ? g_q38_route_tau > 0 && !g_q38_mask : g_q38_route_tau == 0, a == 2 ? "0.999: on, no mask" : "unset / 0: off");
+            qt_shutdown();
+        }
+        unsetenv("Q38_ROUTE_TAU");
+        printf("  t 0.999: %llu picks routed, %llu replaced, %llu kept though not in VRAM; tier misses %llu (off %llu)\n",
+               routed[2], rep[2], kept[2], miss[2], miss[0]);
+        tk(nt[0] > 0 && nt[0] == nt[1] && rct[0] == rct[1] && !memcmp(lt[0], lt[1], (size_t)nt[0] * sizeof(float)) && rep[0] == 0 && rep[1] == 0,
+           "Q38_ROUTE_TAU=0 is the unset run to the bit, nothing replaced");
+        tk(rep[2] > 0 && routed[2] > 0 && miss[2] < miss[0] && miss[2] <= kept[2],
+           "on: picks were replaced by residents; the tier misses fewer, at most the picks it kept");
+        setenv("Q38_ROUTE_TAU", "1.5", 1);
+        tk(fx_run(NULL, NULL, NULL, lt[0], &nt[0]) != 0 && nt[0] == 0, "Q38_ROUTE_TAU=1.5: refused, the engine stops");
+        setenv("Q38_ROUTE_TAU", "0.5", 1);
+        tk(fx_run(tool_mask, NULL, NULL, lt[0], &nt[0]) != 0 && nt[0] == 0, "Q38_ROUTE_TAU with Q38_EXPERT_MASK: refused");
+        unsetenv("Q38_ROUTE_TAU"); qt_shutdown();
+    }
     /* the installed path: every layer on the CUDA chain, which routes on the card through the
      * mask's bias row (or hands the host the device's router logits) */
     printf(" fake CUDA chain (COLI_CUDA_CHAIN=1)\n");

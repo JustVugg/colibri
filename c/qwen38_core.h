@@ -4755,6 +4755,40 @@ static int q38_mask_load(const Cfg *c) {
     if(!getenv("USAGE_SAVE")){setenv("USAGE_SAVE","0",1);fprintf(stderr,"[mask] the routing history stays as it was (USAGE_SAVE=1 saves it)\n");}
     return 1;
 }
+/* ---- Q38_ROUTE_TAU=t: residency-aware routing on the CUDA tier (default off; NOT exact) ----
+ * After the model's normal top-k, a pick the tier does not hold in VRAM at that moment whose
+ * gate (as the model normalises it) is below t gives its slot to the best expert the tier does
+ * hold that is not picked yet; a pick at or above t stays, misses, and earns the heat that
+ * promotes it. It is Q38_EXPERT_MASK_TAU's rule (q38_mask_pick) with "allowed" = "resident
+ * now" (qt_resident_row, one lock a row), so there is no mask file and nothing goes stale.
+ * It changes WHICH experts compute a token: the output is not the model's, and because
+ * residency depends on what ran before and on upload timing, two runs of one prompt can
+ * differ; judge it with a teacher-forced NLL comparison, not text. Refused together with
+ * Q38_EXPERT_MASK; the CUDA chain routes on the host under it (its device route knows no
+ * residency rule). The routing history is not saved under it (USAGE_SAVE=1 saves it): a
+ * replaced pick would teach the history its own residents. */
+static double g_q38_route_tau;   /* 0 off */
+/* Reads Q38_ROUTE_TAU after q38_mask_load (unset, empty or 0: off). 0 = refused (the engine stops). */
+static int q38_route_tau_load(const Cfg *c) {
+    g_q38_route_tau=0;
+    const char *ts=getenv("Q38_ROUTE_TAU");
+    if(!ts||!*ts)return 1;
+    char *end;double t=strtod(ts,&end);
+    if(*end||!(t>=0&&t<1)){fprintf(stderr,"[route-tau] Q38_ROUTE_TAU=%s refused (0 <= t < 1; 0 = off)\n",ts);return 0;}
+    if(!(t>0))return 1;
+    if(g_q38_mask){fprintf(stderr,"[route-tau] Q38_ROUTE_TAU refused together with Q38_EXPERT_MASK\n");return 0;}
+    g_q38_route_tau=t;g_q38_mask_from=c->topk;g_q38_mask_tau=t;   /* q38_mask_pick: the normal top-k, then TAU against the resident row */
+    g_q38_mask_routed=g_q38_mask_outside=g_q38_mask_replaced=0;
+    fprintf(stderr,"[route-tau] Q38_ROUTE_TAU=%s: NOT EXACT: a routed pick VRAM does not hold with gate below %s goes to the best resident "
+                   "expert not picked (the CUDA tier's layers only); the output depends on residency\n",ts,ts);
+    if(!getenv("USAGE_SAVE")){setenv("USAGE_SAVE","0",1);fprintf(stderr,"[route-tau] the routing history stays as it was (USAGE_SAVE=1 saves it)\n");}
+    return 1;
+}
+/* The layer's resident row as q38_mask_pick's allow (res: E bytes of scratch); NULL when the
+ * switch is off or the tier does not hold this layer (the MTP head's, no tier). */
+static const uint8_t *q38_route_tau_row(int layer,uint8_t *res) {
+    return g_q38_route_tau>0&&qt_resident_row(layer,res)?res:NULL;
+}
 /* After the tier's start (a GGUF's warm start): how many allowed experts it holds. */
 static void q38_mask_tier_report(const Cfg *c) {
     if(!g_q38_mask||!qt_ready())return;
@@ -4768,11 +4802,12 @@ static void q38_mask_tier_report(const Cfg *c) {
 }
 /* At exit: routes outside the list (0 with the hard mask), TAU's replacements, the tier's misses. */
 static void q38_mask_report(void) {
-    if(!g_q38_mask)return;
+    if(!g_q38_mask&&!(g_q38_route_tau>0))return;
     QtCounters q;int on=qt_counters(&q);
     char tier[96]="(no VRAM tier)";
     if(on)snprintf(tier,sizeof tier,"VRAM tier hits %llu, misses %llu",(unsigned long long)q.hits,(unsigned long long)q.miss);
-    fprintf(stderr,"[mask] routes outside the mask: %llu of %llu routed (%.2f %%), replaced %llu; %s\n",g_q38_mask_outside,
+    fprintf(stderr,"%s: %llu of %llu routed (%.2f %%), replaced %llu; %s\n",
+            g_q38_mask?"[mask] routes outside the mask":"[route-tau] routes VRAM did not hold, kept (gate >= t)",g_q38_mask_outside,
             g_q38_mask_routed,g_q38_mask_routed?100.0*g_q38_mask_outside/g_q38_mask_routed:0.0,g_q38_mask_replaced,tier);
 }
 
@@ -4961,6 +4996,8 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
     else if(logits_in)memcpy(logits,logits_in,(size_t)S*E*sizeof(float));
     else q38_dense_matmul(m,logits,x,&l->router,S,H,E);
     const uint8_t *allow=q38_mask_row(layer);   /* Q38_EXPERT_MASK */
+    uint8_t resident[Q38_MAX_EXPERTS];
+    if(!allow&&!idx_in)allow=q38_route_tau_row(layer,resident);   /* Q38_ROUTE_TAU: what VRAM holds now (never with a mask) */
     for(int s=0;s<S&&!idx_in;s++){
         float *lg=logits+(int64_t)s*E;
         q38_mask_logits(allow,lg,E);
@@ -5149,6 +5186,8 @@ static void q38_moe_decode_ex(Model *m,Layer *l,int layer,const float *x,int S,f
         if(logits_in)memcpy(logits,logits_in+(int64_t)s*E,(size_t)E*sizeof(float));
         else q38_dense_matmul(m,logits,xs,&l->router,1,H,E);
         const uint8_t *allow=q38_mask_row(layer);   /* Q38_EXPERT_MASK */
+        uint8_t resident[Q38_MAX_EXPERTS];
+        if(!allow)allow=q38_route_tau_row(layer,resident);   /* Q38_ROUTE_TAU: what VRAM holds now, a row at a time */
         q38_mask_logits(allow,logits,E);
         float mx=logits[0];for(int e=1;e<E;e++)if(logits[e]>mx)mx=logits[e];
         double all=0;for(int e=0;e<E;e++){logits[e]=expf(logits[e]-mx);all+=logits[e];}
@@ -5330,6 +5369,8 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
         if(logits_in)memcpy(logits,logits_in+(int64_t)base*E,(size_t)rows*E*sizeof(float));
         else q38_dense_matmul(m,logits,x+(int64_t)base*H,&l->router,rows,H,E);
         const uint8_t *allow=q38_mask_row(layer);   /* Q38_EXPERT_MASK, as the decode route */
+        uint8_t resident[Q38_MAX_EXPERTS];
+        if(!allow)allow=q38_route_tau_row(layer,resident);   /* Q38_ROUTE_TAU, once a chunk */
         for(int s=0;s<rows;s++) {
             float *probabilities=logits+(int64_t)s*E;
             q38_mask_logits(allow,probabilities,E);
