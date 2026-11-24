@@ -3843,9 +3843,11 @@ extern "C" int dsv4_cuda_mirror_refill(Dsv4CudaTensor*g,Dsv4CudaTensor*u,Dsv4Cud
         if(soff[k]<0||soff[k]+sb>S||woff[k]<0||woff[k]+wb>Wb||(woff[k]&15))return 0;}
     Dev*c=ctx(g->device);if(!c||!ok(cudaSetDevice(g->device),"select mirror refill device"))return 0;
     if(host_pinned(w,(size_t)Wb))host_pinned(sc,(size_t)S);
-    if(!ok(cudaMemcpyAsync(g->block,w,(size_t)Wb,cudaMemcpyHostToDevice,c->stream),"mirror weights upload")||
-       !ok(cudaMemcpyAsync(g->block2,sc,(size_t)S,cudaMemcpyHostToDevice,c->stream),"mirror scales upload"))return 0;
-    if(sync&&!ok(cudaStreamSynchronize(c->stream),"mirror refill drain"))return 0;
+    cudaStream_t cs=sync>=2?c->aux:c->stream;   /* 2 and 3: the uploader thread's, as in dsv4_cuda_tensor_refill_fp4 */
+    if(!ok(cudaMemcpyAsync(g->block,w,(size_t)Wb,cudaMemcpyHostToDevice,cs),"mirror weights upload")||
+       !ok(cudaMemcpyAsync(g->block2,sc,(size_t)S,cudaMemcpyHostToDevice,cs),"mirror scales upload"))return 0;
+    if(sync==3)upload_submit(c);
+    else if(sync&&!ok(cudaStreamSynchronize(cs),"mirror refill drain"))return 0;
     for(int k=0;k<3;k++){t[k]->scale=(uint8_t*)g->block2+soff[k];t[k]->w=(uint8_t*)g->block+woff[k];}
     return 1;}
 /* V4_MIRROR_BLOCK_VERIFY: a run of a block mirror (0 the scales, 1 the
