@@ -2626,7 +2626,7 @@ tests/test_gq_q2_k$(EXE): tests/test_gq_q2_k.c
 tests/test_qwen36_attn_grouped$(EXE): tests/test_qwen36_attn_grouped.c $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 # Fused F32/F16/BF16 paths in gq_matmul_f32 and vectorized gq_dequant_row, to the bit
-tests/test_gq_f32_fused$(EXE): tests/test_gq_f32_fused.c ggml_quants.h
+tests/test_gq_f32_fused$(EXE): tests/test_gq_f32_fused.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 # Single-region gq_matmul2_act (R16, TILE16_BIAS, F8) against two gq_matmul_act calls, to the bit
 tests/test_gq_matmul2$(EXE): tests/test_gq_matmul2.c ggml_quants.h
